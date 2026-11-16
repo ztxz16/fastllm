@@ -10,23 +10,26 @@ template <int Queries> struct SwaQueryStorage {
     BF prob[Queries][8][136];
     int selected[128 + Queries - 1];
 };
-template <int Width, int Pitch, int Rows, class KV>
+template <int Width, int Pitch, int Rows, int Threads = 256, bool Wait = true, class KV>
 __device__ void LoadSwaUnion(BF (*dst)[Pitch], int *selected, KV kv, int first, int keys, int stride,
                              int head) {
     int t = threadIdx.x;
-    if (t < Rows) {
-        int logical = first + t;
-        selected[t] = logical >= 0 && logical < keys ? kv.PhysicalRow(logical) : -1;
+    for (int row = t; row < Rows; row += Threads) {
+        int logical = first + row;
+        selected[row] = logical >= 0 && logical < keys ? kv.PhysicalRow(logical) : -1;
     }
     __syncthreads();
-    for (int i = t; i < Rows * (Width / 8); i += 256) {
+    for (int i = t; i < Rows * (Width / 8); i += Threads) {
         int row = i / (Width / 8), d = i % (Width / 8) * 8, k = selected[row];
         naive_dsa_decode::Copy<true>(
             &dst[row][d],
             FastllmNaiveKVRow(kv.base, kv.fp8) + ((size_t)max(0, k) * stride + kv.offset + head * Width + d), k >= 0);
     }
-    asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
-    __syncthreads();
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    if constexpr (Wait) {
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+        __syncthreads();
+    }
 }
 template <int Queries>
 __device__ __forceinline__ void SwaQueryScores(SwaQueryStorage<Queries> &s, const int *offsets,
@@ -109,6 +112,102 @@ __global__ __launch_bounds__(256) void SwaQueryTile(const BF *q, FastllmNaiveKV 
     LoadSwaUnion<128, 136, 128 + Queries - 1>(s.tile.v, s.selected, value, past + row + 1 - 128, keys, kvHeads * 128,
                                               kh);
     SwaQueryValues(s, offsets, out, row, min(Queries, rows - row), heads, head, w, l);
+#endif
+}
+// One warp owns a query. Keep its Q fragments in registers across all key
+// tiles and reuse each probability fragment across all output columns. The
+// Q/K and P/V MMA order and BF16 boundaries match SwaQueryTile. Once Q is in
+// registers, its shared storage becomes K/V storage; prefetch V while the
+// unchanged softmax runs. The existing kernel remains the small-shape fallback.
+template <int Queries> struct SwaRegisterStorage {
+    union {
+        BF q[Queries][8][200];
+        BF k[128 + Queries - 1][200];
+        BF v[128 + Queries - 1][136];
+    } tile;
+    BF prob[Queries][8][136];
+    int selected[128 + Queries - 1];
+};
+template <int Queries>
+__global__ __launch_bounds__(Queries * 32) void SwaRegisterTile(const BF *q, FastllmNaiveKV key,
+                                                                FastllmNaiveKV value, const float *sink,
+                                                                BF *out, int rows, int heads, int kvHeads,
+                                                                int stride, int keys, int past) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace naive_attention_bulk;
+    constexpr int Threads = Queries * 32;
+    extern __shared__ __align__(16) char memory[];
+    auto &s = *(SwaRegisterStorage<Queries> *)memory;
+    const int row = blockIdx.x * Queries, head = blockIdx.y * 8, kh = head / (heads / kvHeads), t = threadIdx.x,
+              l = t % 32, r = t / 32;
+    for (int i = t; i < Queries * 8 * 24; i += Threads) {
+        int rr = i / (8 * 24), h = i / 24 % 8, d = i % 24 * 8;
+        *(uint4 *)&s.tile.q[rr][h][d] =
+            row + rr < rows ? *(const uint4 *)(q + ((size_t)(row + rr) * heads + head + h) * 192 + d)
+                            : make_uint4(0, 0, 0, 0);
+    }
+    __syncthreads();
+    uint32_t query[12][2];
+#pragma unroll
+    for (int d = 0; d < 12; ++d)
+        ld2(query[d], &s.tile.q[r][l & 7][d * 16 + ((l >> 3) & 1) * 8]);
+    __syncthreads();
+    LoadSwaUnion<192, 200, 128 + Queries - 1, Threads, true>(s.tile.k, s.selected, key, past + row + 1 - 128,
+                                                             keys, stride, kh);
+    const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
+    if (row + r < rows) {
+#pragma unroll
+        for (int kb = 0; kb < 8; ++kb) {
+            float scores[4] = {};
+#pragma unroll
+            for (int d = 0; d < 12; ++d) {
+                uint32_t a[4];
+                ld4(a, &s.tile.k[r + kb * 16 + ar][d * 16 + ac]);
+                mma(scores, a, query[d]);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                int h = (l % 4) * 2 + i % 2, k = kb * 16 + l / 4 + (i / 2) * 8;
+                s.prob[r][h][k] = __float2bfloat16(
+                    s.selected[r + k] >= 0
+                        ? naive_dsa_decode::Round(naive_dsa_decode::Round(scores[i]) * rsqrtf(192.f))
+                        : -INFINITY);
+            }
+        }
+    }
+    __syncthreads();
+    LoadSwaUnion<128, 136, 128 + Queries - 1, Threads, false>(s.tile.v, s.selected, value, past + row + 1 - 128,
+                                                              keys, kvHeads * 128, kh);
+    for (int h = r; h < 8; h += Queries) {
+#pragma unroll
+        for (int rr = 0; rr < Queries; ++rr)
+            if (row + rr < rows)
+                Normalize<128, false>(&s.prob[rr][0][0], sink, head, 128, h, l);
+    }
+    __syncthreads();
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    if (row + r < rows) {
+        float acc[8][4] = {};
+#pragma unroll
+        for (int k = 0; k < 128; k += 16) {
+            uint32_t b[2];
+            ld2(b, &s.prob[r][l & 7][k + ((l >> 3) & 1) * 8]);
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                uint32_t a[4];
+                ldt4(a, &s.tile.v[r + k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
+                mma(acc[w], a, b);
+            }
+        }
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                out[((size_t)(row + r) * heads + head + (l % 4) * 2 + i % 2) * 128 + w * 16 + l / 4 +
+                    (i / 2) * 8] = __float2bfloat16(acc[w][i]);
+        }
+    }
 #endif
 }
 // Verification keeps committed keys in the ring and candidates after slot128.

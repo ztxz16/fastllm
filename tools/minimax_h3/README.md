@@ -1,5 +1,7 @@
 # MiniMax-H3 原生推理
 
+[图片与视频使用指南](../../docs/image-video.md) · [English user guide](../../docs/image-video_en.md)
+
 面向 Linux + NVIDIA GPU 的纯 C++17 / CUDA 音视频推理，使用 CUDA Runtime、cuBLAS/cuBLASLt 和仓库已有的
 FlashInfer、json11、cpp-httplib。推理服务不加载 Python、PyTorch、Diffusers、Triton
 或 cuDNN；多卡通信使用仓库已有的 NCCL。媒体编解码调用已有的 FFmpeg / ffprobe，不参与模型计算。

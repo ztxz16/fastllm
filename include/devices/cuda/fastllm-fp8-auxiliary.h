@@ -25,3 +25,12 @@ extern "C" bool FastllmCudaPrepareMarlinBFloat16FP8(fastllm::Data &weight,
 
 // Immutable, exactly representable FP32 gate copy; source Data owns its lifetime.
 fastllm::Data *FastllmCudaExactRouterBFloat16Weight(fastllm::Data &weight);
+
+// Hopper W8A16 decode. Layouts/scratch are prepared only in synchronized model
+// warmup; unsupported shapes, devices and unprepared workers use the generic path.
+bool FastllmCudaPerChannelW8A16(const void *input, fastllm::Data &weight, void *output,
+                              int rows, int inner, int channels);
+void FastllmCudaReleasePerChannelW8A16(fastllm::Data &weight);
+// Reserve the owned layout and one unbound worker scratch slot before KV sizing.
+// Unsupported architectures/formats are a no-op and keep their generic fallback.
+bool FastllmCudaPreparePerChannelW8A16(fastllm::Data &weight);

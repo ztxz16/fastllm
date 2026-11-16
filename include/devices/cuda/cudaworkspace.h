@@ -59,6 +59,25 @@ bool IsCudaWorkspacePointer(void *pointer);
 bool TryFreeCudaWorkspace(void *pointer);
 bool TryFreeCudaWorkspaceAfterStream(void *pointer, void *stream);
 
+// Device-wide backing storage for the ordinary CUDA allocator. Unlike a
+// WorkspaceScope, this sits below the cache/graph pool: graph pins and deferred
+// reuse keep their existing semantics. No driver allocation is attempted when
+// the reservation is exhausted. Destroying the reservation disables admission;
+// outstanding cached blocks retain the backing storage until their last free.
+class CudaMemoryReservation {
+public:
+    CudaMemoryReservation(int device, size_t bytes);
+    ~CudaMemoryReservation();
+    CudaMemoryReservation(const CudaMemoryReservation&) = delete;
+    CudaMemoryReservation &operator=(const CudaMemoryReservation&) = delete;
+private:
+    std::shared_ptr<CudaWorkspace> workspace;
+};
+bool TryAllocateCudaReservation(int device, size_t bytes, void **pointer);
+bool IsCudaReservationPointer(void *pointer);
+// Caller provides cudaFree-equivalent completion ordering before release.
+bool TryFreeCudaReservation(void *pointer);
+
 class CudaWorkspaceScope {
 public:
     explicit CudaWorkspaceScope(std::shared_ptr<CudaWorkspace> workspace)

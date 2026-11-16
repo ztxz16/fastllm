@@ -10,6 +10,7 @@ struct CompactBatch {
     CompactRow rows[CompactLimit];
     const unsigned *merged;
     int total, first, page;
+    int ranks = 4;
 };
 static_assert(sizeof(CompactBatch) + 128 <= ArgumentBytes);
 __device__ __forceinline__ Row MergeRow(const Batch &batch, int index) {
@@ -19,7 +20,7 @@ __device__ __forceinline__ Row MergeRow(const CompactBatch &batch, int index) {
     Row row{};
     row.live = batch.rows[index].live; row.indices = batch.rows[index].indices;
     row.merged = batch.merged; row.mergedRows = batch.total; row.mergedRow = batch.first + index;
-    row.cpRanks = 4; row.contextPageLen = batch.page;
+    row.cpRanks = batch.ranks; row.contextPageLen = batch.page;
     return row;
 }
 
@@ -56,32 +57,39 @@ __device__ __forceinline__ void MergeInterval(
     }
 }
 
-template<int Threads, int Items, class Rows = Batch>
-__global__ __launch_bounds__(Threads) void MergeFourChunked(Rows batch) {
-    static_assert(K % Items == 0);
+template<int Threads, int Items, class Rows = Batch, int Ranks = 4>
+__global__ __launch_bounds__(Threads) void MergeChunked(Rows batch) {
+    static_assert(K % Items == 0 && (Ranks == 2 || Ranks == 4 || Ranks == 8));
     const Row row = MergeRow(batch, blockIdx.x);
     extern __shared__ __align__(16) Key storage[];
-    Key *pairs = storage + 4 * K;
-    int count[4];
+    Key *input = storage, *output = storage + Ranks * K;
+    int count[Ranks];
 #pragma unroll
-    for (int rank = 0; rank < 4; ++rank)
+    for (int rank = 0; rank < Ranks; ++rank)
         count[rank] = min(K, row.LocalCount(rank));
-    for (int i = threadIdx.x; i < 4 * K; i += Threads) {
+    for (int i = threadIdx.x; i < Ranks * K; i += Threads) {
         const int owner = i / K, local = i % K;
         merge_screen::GlobalList list{
             row.merged + ((size_t)owner * row.mergedRows + row.mergedRow) * K * 2};
-        storage[i] = local < count[owner] ? list[local] : 0;
+        input[i] = local < count[owner] ? list[local] : 0;
     }
     __syncthreads();
-    for (int chunk = threadIdx.x; chunk < 2 * K / Items; chunk += Threads) {
-        const int pair = chunk / (K / Items), rank = chunk % (K / Items) * Items;
-        const int owner = pair * 2;
-        MergeInterval<Items, false>(storage + owner * K, storage + (owner + 1) * K,
-            count[owner], count[owner + 1], rank, pairs + pair * K, nullptr);
+    // Merge a tree of sorted lists, retaining only the first K entries at
+    // each level. Ping-pong storage is bounded by Ranks + Ranks/2 lists.
+#pragma unroll
+    for (int lists = Ranks; lists > 2; lists /= 2) {
+        for (int chunk = threadIdx.x; chunk < lists / 2 * K / Items; chunk += Threads) {
+            const int pair = chunk / (K / Items), rank = chunk % (K / Items) * Items;
+            const int owner = pair * 2;
+            MergeInterval<Items, false>(input + owner * K, input + (owner + 1) * K,
+                count[owner], count[owner + 1], rank, output + pair * K, nullptr);
+        }
+        __syncthreads();
+        for (int pair = 0; pair < lists / 2; ++pair)
+            count[pair] = min(K, count[pair * 2] + count[pair * 2 + 1]);
+        Key *previous = input; input = output; output = previous;
     }
-    __syncthreads();
-    const int na = min(K, count[0] + count[1]), nb = min(K, count[2] + count[3]);
     for (int chunk = threadIdx.x; chunk < K / Items; chunk += Threads)
-        MergeInterval<Items, true>(pairs, pairs + K, na, nb, chunk * Items, nullptr, row.indices);
+        MergeInterval<Items, true>(input, input + K, count[0], count[1], chunk * Items, nullptr, row.indices);
 }
 } // namespace merge_chunk_screen

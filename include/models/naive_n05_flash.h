@@ -2,6 +2,7 @@
 #define FASTLLM_NAIVE_N05_FLASH_H
 
 #include "basellm.h"
+#include "parallel/model.h"
 #include <algorithm>
 #include <atomic>
 #include <memory>
@@ -15,7 +16,7 @@ namespace fastllm {
     class CudaWorkspace;
     class PDStateWriter;
     class PDStateReader;
-    class NaiveN05FlashModel : public basellm {
+    class NaiveN05FlashModel : public basellm, public parallel::AttentionParallelModel {
     protected:
         static constexpr int MaxTPDecodeBatch = 512;
         struct TargetCapture;
@@ -25,7 +26,9 @@ namespace fastllm {
         NaiveN05FlashModel();
         ~NaiveN05FlashModel() override;
         void InitParams() override;
+        void ConfigureAttentionParallel(int attentionDP) override;
         void SetIndexerDataType(DataType dataType) override;
+        void SetIndexerComputeFP8(bool enabled);
         void SetKVCacheDataType(DataType dataType) override;
         void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
@@ -52,6 +55,9 @@ namespace fastllm {
                                      int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
+        int GetPrefillBatchGroups() const override { return attentionDP; }
+        bool SupportsChunkedPrefillScheduling() const override { return SupportsPrefillBatching(); }
+        int GetPrefillBatchGroup(const ResponseContext *context) const override;
         // Bound idle TP prefill workspace with the shared pressure-aware pool.
         bool RetainCudaWorkspace() const override { return tpDevices.size() > 1; }
         // Prefix reuse requires both resident full-attention pages and a GPU SWA checkpoint.
@@ -59,6 +65,9 @@ namespace fastllm {
         bool TryRestoreHistoryCache(std::vector<int> &tokens, int &cacheLen) override;
         bool DeferHistoryCacheRestore() const override { return !tpPagedCaches.empty(); }
         PagedCacheManager *GetPagedKVCacheManager(int layer, bool key) const override;
+        PagedCacheManager *GetPagedKVCacheBudgetManager(const ResponseContext *context) const override;
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+            int layer, bool key, const ResponseContext *context) const override;
         std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override;
         bool TryRecordPagedPrefixCacheExtra(ResponseContext *context) override;
         int QueryPagedPrefixCacheExtra(ResponseContext *context, int length) const override;
@@ -145,6 +154,7 @@ namespace fastllm {
         struct PrefixSnapshot {
             std::shared_ptr<PrefixPool> pool;
             int slot = -1, length = 0;
+            int ownerDevice = -1;
             bool draftReady = false;
             std::vector<int> tokens;
             uint64_t tokenHash = 0; // Immutable with tokens after publication.
@@ -382,8 +392,17 @@ namespace fastllm {
                                    std::vector<std::pair<Data, Data>> &kv,
                                    const GenerationConfig &config, TargetCapture *capture = nullptr,
                                    LogitsSelection *selection = nullptr, const TargetBatch *batch = nullptr);
+        struct AttentionParallelState;
+        std::shared_ptr<AttentionParallelState> attentionParallel;
+        int attentionDP = 1;
+        void InitAttentionParallelCache(const std::vector<std::pair<Data *, Data *>> &roots, int group = -1);
+        int AttentionTPSize() const { return tpDevices.size() / attentionDP; }
+        Data ForwardAttentionParallel(const Data &inputIds, const Data &positions,
+            std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
+            TargetCapture *capture, LogitsSelection *selection, const TargetBatch *batch);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;
+        int tpSwaCacheCapacity = 0;
         // Separate equal-sized request allocations so prefix restore and cold
         // prefill cannot fragment each other's page tables and SWA windows.
         std::map<std::pair<int, size_t>, std::shared_ptr<CudaWorkspace>> tpRequestKVPool;
@@ -412,6 +431,9 @@ namespace fastllm {
         std::vector<std::vector<std::vector<Data *>>> tpMoeWeights, tpMoeBiases;
         std::vector<std::pair<int, int>> tpVocabRanges;
         struct ActivePrefixes {
+            // One immutable SWA/draft checkpoint for a bounded queued hit.
+            // This never owns full KV pages or request-private GPU storage.
+            std::shared_ptr<PrefixSnapshot> queued;
             PrefixSnapshots prefill;
             std::shared_ptr<PrefixSnapshot> decode;
         };
@@ -430,6 +452,7 @@ namespace fastllm {
         float partialRotary = 0.334f, valueScale = 0.707f;
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
+        bool indexerComputeFP8 = false;
         bool indexerLayerSharding = false;
         bool indexerContextSharding = false;
         bool tpIndexerPeerAccess = false;

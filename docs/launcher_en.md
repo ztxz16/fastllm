@@ -14,9 +14,11 @@ Add a profile → select a model → choose Automatic configuration → save and
 
 `ftllm` (or `ftllm launch`) listens only on `127.0.0.1:8000` by default and opens the browser after the service is ready; use `ftllm launch --no-browser` to disable automatic opening. The page can download models from ModelScope, save and preview launch profiles, and run either `ftllm server` or the chat-oriented `ftllm webui`. For a new profile, select a local model and Automatic configuration; `--auto` plans inference settings when the service starts. Expand Resource limits or Model parameters to override individual options. Leave Chunk and Maximum concurrency blank to restore automatic planning. See the [`--auto` tuning guide](auto_en.md#launcher-automatic-mode). Custom configuration remains available. Its interface supports Simplified Chinese and English, preferring the last selection and otherwise following the browser language; terminal output from `ftllm launch` always uses English. To access it from the LAN, run `ftllm launch --host 0.0.0.0`; the terminal and Launcher page then list loopback, LAN, and directly assigned public-interface addresses when available. Public access also requires the host firewall and cloud security group to allow the port, plus port forwarding when behind NAT; Launcher does not discover NAT public mappings. Non-loopback access uses unencrypted HTTP and should only be enabled on a trusted network. It shares profiles with the terminal wizard and stops its managed download and model processes when the launcher exits. Run `ftllm launch --help` for other options.
 
-## Concurrent models, GPUs and video generation
+<a id="concurrent-models-gpus-and-video-generation"></a>
 
-Each profile selects a backend: LLM or **MiniMax H3 / Pika H3 video**. Services
+## Concurrent models, GPUs, and image/video generation
+
+Each profile selects a backend: LLM, **MiniMax H3 / Pika H3 video**, or **MiniMax H3 Image**. See the [image and video guide](image-video_en.md) for model preparation, quantization, parallelism, and APIs. Qwen-Image-2.1 currently uses its dedicated CLI/demo instead of these profiles. Services
 can run concurrently on different ports. The top service selector controls API
 information and Stop; profile cards can also manage or stop an individual service.
 Stopping one model leaves other services running. Exiting Launcher stops all of them.
@@ -28,7 +30,7 @@ it for another model stops its previous instance. Workspace Pi tasks run per con
 Select GPUs using the checkboxes or a comma-separated list of launcher-visible
 indices / UUIDs. Each child receives its own `CUDA_VISIBLE_DEVICES`; its device
 indices become `0,1,…`. For example, choose GPU `0` for the LLM and `1` for video.
-Video uses all explicitly selected GPUs for tensor parallelism; without a selection
+Video/image backends use all explicitly selected GPUs; TP versus SP depends on the mode, format, and budget. Without a selection,
 it uses logical GPU 0. Manual LLM CUDA/TP settings use the **remapped indices**.
 Automatic planning sees only the selected GPUs. An inherited GPU mask is respected;
 this setting cannot widen it. Visibility restrictions do not reserve GPUs exclusively.
@@ -55,8 +57,11 @@ To launch video:
    the system, runtime and media processing.
 4. Studio → Video generation provides prompts, resolution, duration, seed and optional
    first/last frames, with progress, cancellation, preview and MP4 download. Pika uses
-   six steps; H3 defaults to 50. Reference uploads total at most 31 MiB; Studio downloads
-   are limited to 256 MiB per result. Refreshing reloads the service's job list.
+   six steps; H3 defaults to 50. Reference-media mode accepts ordered images, videos,
+   and audio, with a 255 MiB Studio upload limit; see [H3 API constraints](../tools/minimax_h3/README.md#http-与-demo).
+   Studio downloads are limited to 256 MiB per result. Refreshing reloads the service's job list.
+
+For images, select **Image · MiniMax H3 Image**, set the full model directory or supported quantized file, port, and GPUs, then start. Quantized files still need a matching original base. Open **Studio → Image generation** or the standalone demo to generate, edit, upload references, and download PNGs. Release packages discover `minimax_h3_image_server` automatically. See [H3 Image usage](image-video_en.md#images-minimax-h3-image).
 
 Studio has an independent chat model selector. Opening a video service or demo
 does not disconnect chat. Start an LLM and video service, install Pi and create a
@@ -70,9 +75,9 @@ in the demo if an Agent reaches its own time/turn limit.
 Backend contracts live in `service_backends.py`; `launcher_services.py` owns process
 isolation, discovery and authenticated proxying, and `media_agent.py` exposes the
 per-turn local bridge without revealing service keys or the launcher control token.
-Future image/audio/world backends can add contracts, protocol adapters and Studio
-components while reusing this infrastructure. The currently implemented generation
-capability is `video.generate`.
+Other backends can add contracts, protocol adapters, and Studio components while
+reusing this infrastructure. Registered generation capabilities are `video.generate`,
+`image.generate`, and `image.edit`; the workspace Agent's existing generation bridge targets video.
 
 ## Launch settings and model downloads
 

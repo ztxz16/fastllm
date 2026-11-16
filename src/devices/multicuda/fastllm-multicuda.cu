@@ -1458,10 +1458,10 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                     int copyLen = it.second - it.first;
                     state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + dstOffsetBytes,
                                                 dstRowBytes,
-                                                (uint8_t*)weight.cudaData + it.first,
+                                                (uint8_t*)sourceWeightData + it.first,
                                                 srcRowBytes,
                                                 (size_t)copyLen,
-                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                                                kSize, GetCudaMemcpyType(mallocType, sourceWeightType), deviceId, rootDevice);
                     if (state != cudaSuccess) {
                         break;
                     }
@@ -1471,10 +1471,10 @@ bool SplitMultiCudaWeight(fastllm::Data &weight, fastllm::Data &bias,
                 if (state == cudaSuccess) {
                     state = FastllmCudaMemcpy2D((uint8_t*)deviceWeightData + len,
                                                 dstRowBytes,
-                                                (uint8_t*)weight.cudaData + m,
+                                                (uint8_t*)sourceWeightData + m,
                                                 srcRowBytes,
                                                 sizeof(float),
-                                                k, GetCudaMemcpyType(mallocType, 1), deviceId, rootDevice);
+                                                kSize, GetCudaMemcpyType(mallocType, sourceWeightType), deviceId, rootDevice);
                 }
             } else if ((weight.dataType == fastllm::DataType::NVFP4 &&
                         weight.scales.empty() && weight.blockK > 0 && weight.blockM > 0) ||

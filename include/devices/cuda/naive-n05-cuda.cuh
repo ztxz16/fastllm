@@ -222,7 +222,7 @@ bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
 // Output is [front, back] for one rank. Unsupported layouts return false untouched.
 bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
     const fastllm::Data &keys, int past, int rank, int ranks,
-    bool fp8Query, bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch = nullptr);
+    bool fp8Query, bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
 // All items use the same rank/layout, but query and context lengths may differ.
 // At most eight requests and 512 MiB of scores; rejection leaves outputs untouched.
 struct FastllmNaivePrefillIndexerItem {
@@ -231,13 +231,13 @@ struct FastllmNaivePrefillIndexerItem {
     int past;
 };
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
-    int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch = nullptr);
+    int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
-                            bool fp8Query, fastllm::Data &indices, bool peerKeys = false, fastllm::Data *scoreScratch = nullptr);
+                            bool fp8Query, fastllm::Data &indices, bool peerKeys = false, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
 // Restore front/back-paired query shards after AllGather, in the same allocation.
 void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks);
 // Consume front/back-paired Indexer rows directly. False leaves all inputs
@@ -254,6 +254,17 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               int heads, int kvHeads, int dim, int valueDim,
                               int pastLength, int window,
                               fastllm::Data &output, bool causal = true);
+
+// Reuse already reserved per-rank prefill scratch for an exact FP8 KV expansion.
+// The caller must keep this scratch independent of the inputs and output.
+void FastllmCudaNaiveAttention(const fastllm::Data &query,
+                              const fastllm::Data &key,
+                              const fastllm::Data &value,
+                              const fastllm::Data &indices,
+                              const fastllm::Data &sink,
+                              int heads, int kvHeads, int dim, int valueDim,
+                              int pastLength, int window,
+                              fastllm::Data &output, bool causal, const fastllm::Data *prefillScratch);
 
 // Small speculative blocks use the same per-position arithmetic as decode.
 // The temporary KV suffix is visible only through each row's causal prefix.
@@ -426,6 +437,8 @@ void FastllmCudaNaiveClearExpertPrefill();
 // BF16 input, FP32 4096-column router, including sigmoid. Small batches
 // share weights and retain exact single-row arithmetic when requested by the
 // linear precision policy. Unsupported layouts return false without mutation.
+bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
 

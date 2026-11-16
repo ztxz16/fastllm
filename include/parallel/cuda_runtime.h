@@ -56,6 +56,9 @@ public:
     void Reset(RowPartition rows);
     // Coordinator call at a drained plan boundary, before Collect on any rank.
     void Reserve(size_t maxRowBytes);
+    // Reserve the worst DP skew before graph capture/serving. Later layouts
+    // must stay within these bounds; their buffer addresses never change.
+    void ReserveFixed(size_t maxRows, size_t maxRowBytes);
     void Select(int rank, const void *global, void *local, size_t rowBytes);
     void Collect(int rank, const void *local, void *global, size_t rowBytes);
     struct Field { const void *local; void *global; size_t rowBytes; };

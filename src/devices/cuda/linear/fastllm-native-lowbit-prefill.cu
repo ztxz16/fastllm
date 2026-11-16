@@ -56,7 +56,7 @@ struct State {
     std::map<std::tuple<int, int, int, int>, std::unique_ptr<Plan>> plans;
     bool initialized = false;
 };
-inline State *GetState() {
+inline State *GetState(bool initialize = true) {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess)
         return nullptr;
@@ -65,6 +65,7 @@ inline State *GetState() {
     State *s;
     {
         std::lock_guard<std::mutex> lock(mutex);
+        if (!initialize && states.find(dev) == states.end()) return nullptr;
         auto &v = states[dev];
         if (!v)
             v = std::make_unique<State>();
@@ -74,7 +75,7 @@ inline State *GetState() {
     if (s->initialized)
         return s;
     // Reserve before KV budget calibration. Serving never grows this allocation.
-    if (!FastllmCudaGetNcclForceSync())
+    if (!initialize || !FastllmCudaGetNcclForceSync())
         return nullptr;
     if (cudaMalloc(&s->workspace, State::workspaceBytes + State::capacity) != cudaSuccess) {
         cudaGetLastError();
@@ -93,6 +94,19 @@ inline State *GetState() {
     CheckCuda(cudaEventRecord(s->ready, cudaStreamPerThread), "native prefill init event");
     s->initialized = true;
     return s;
+}
+// A different output tile may improve FP32 throughput without changing its
+// K partition or reduction order. Keep all other algorithm settings fixed.
+inline bool SameReduction(const cublasLtMatmulAlgo_t &a, const cublasLtMatmulAlgo_t &b) {
+    for (auto attribute : {CUBLASLT_ALGO_CONFIG_ID, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+            CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, CUBLASLT_ALGO_CONFIG_STAGES_ID,
+            CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION}) {
+        int x = -1, y = -2; size_t written = 0;
+        if (cublasLtMatmulAlgoConfigGetAttribute(&a, attribute, &x, sizeof(x), &written) != CUBLAS_STATUS_SUCCESS ||
+            cublasLtMatmulAlgoConfigGetAttribute(&b, attribute, &y, sizeof(y), &written) != CUBLAS_STATUS_SUCCESS ||
+            x != y) return false;
+    }
+    return true;
 }
 inline Plan *GetPlan(State &s, int bits, int M, int N, int K) {
     auto key = std::make_tuple(bits, M, N, K);
@@ -126,7 +140,7 @@ inline Plan *GetPlan(State &s, int bits, int M, int N, int K) {
                 CUBLAS_STATUS_SUCCESS)
             return nullptr;
     }
-    auto type = bits == 8 ? CUDA_R_8F_E4M3 : CUDA_R_4F_E2M1;
+    auto type = bits == 32 ? CUDA_R_32F : bits == 8 ? CUDA_R_8F_E4M3 : CUDA_R_4F_E2M1;
     if (cublasLtMatrixLayoutCreate(&p->a, type, K, N, K) != CUBLAS_STATUS_SUCCESS ||
         cublasLtMatrixLayoutCreate(&p->b, type, K, M, K) != CUBLAS_STATUS_SUCCESS ||
         cublasLtMatrixLayoutCreate(&p->c, CUDA_R_32F, N, M, N) != CUBLAS_STATUS_SUCCESS)
@@ -145,7 +159,8 @@ inline Plan *GetPlan(State &s, int bits, int M, int N, int K) {
     if (status != CUBLAS_STATUS_SUCCESS || count == 0)
         return nullptr;
     for (int i = 0; i < count; i++)
-        if (h[i].state == CUBLAS_STATUS_SUCCESS)
+        if (h[i].state == CUBLAS_STATUS_SUCCESS &&
+            (bits != 32 || p->candidates.empty() || SameReduction(p->candidates.front(), h[i].algo)))
             p->candidates.push_back(h[i].algo);
     if (p->candidates.empty())
         return nullptr;
@@ -192,6 +207,27 @@ inline void Tune(State &s, Plan &p, const void *a, const void *b, float *c) {
     cudaEventDestroy(end);
     if (best == 1.e30f)
         p.valid = false;
+}
+bool Fp32(const float *input, const float *weight, float *output, int M, int N, int K) {
+    if (FastllmCudaRuntimeArch() != 90 || M < 128 || N <= 0 || K <= 0 || N % 16 || K % 16 ||
+        !input || !weight || !output || uintptr_t(input) % 16 || uintptr_t(weight) % 16 ||
+        uintptr_t(output) % 16 || FastllmCudaGraphIsCapturingFast()) return false;
+    // Borrow the arena already reserved by native prefill before KV sizing.
+    // Enabling this path never creates an additional serving allocation.
+    State *s = GetState(false);
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    Plan *p = GetPlan(*s, 32, M, N, K);
+    if (!p) return false;
+    CheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, s->ready, 0), "FP32 prefill scratch dependency");
+    Tune(*s, *p, weight, input, output);
+    const float alpha = 1, beta = 0;
+    bool ok = p->valid && cublasLtMatmul(s->handle, p->op, &alpha, weight, p->a, input, p->b,
+        &beta, output, p->c, output, p->c, &p->algo, s->workspace, State::workspaceBytes,
+        cudaStreamPerThread) == CUBLAS_STATUS_SUCCESS;
+    CheckCuda(cudaGetLastError(), "FP32 prefill output");
+    CheckCuda(cudaEventRecord(s->ready, cudaStreamPerThread), "FP32 prefill completion");
+    return ok;
 }
 __device__ inline float RowMax(float value) {
     for (int d = 16; d; d >>= 1)
@@ -309,6 +345,102 @@ bool Fp8(const half *input, const uint8_t *weight, const float *scales, const ha
     CheckCuda(cudaGetLastError(), "native prefill output");
     CheckCuda(cudaEventRecord(s->ready, cudaStreamPerThread), "native prefill completion event");
     return status == CUBLAS_STATUS_SUCCESS;
+}
+// Repack existing per-channel weights without changing their values/scales.
+// This bounded scratch shares the existing prefill arena; no weight cache or
+// allocations are added after serving warmup.
+__global__ void UnpackFp8Channels(const uint8_t *source, uint8_t *weight,
+                                 float *scales, int N, int K) {
+    const int row = blockIdx.x;
+    const auto *input = reinterpret_cast<const unsigned *>(source + size_t(row) * (K + 4));
+    auto *output = reinterpret_cast<uint4 *>(weight + size_t(row) * K);
+    // Packed rows are only four-byte aligned. Keep scalar source loads, but
+    // write four words together into the aligned GEMM buffer.
+    for (int i = threadIdx.x; i < K / 16; i += blockDim.x)
+        output[i] = make_uint4(input[i * 4], input[i * 4 + 1], input[i * 4 + 2], input[i * 4 + 3]);
+    if (!threadIdx.x) scales[row] = *(const float *)(source + size_t(row) * (K + 4) + K);
+}
+__global__ void QuantFp8BFloat16(const __nv_bfloat16 *input, uint8_t *output, float *scales, int K) {
+    const int row = blockIdx.x, t = threadIdx.x;
+    const auto *source = reinterpret_cast<const __nv_bfloat162 *>(input + size_t(row) * K);
+    auto *target = reinterpret_cast<uint16_t *>(output + size_t(row) * K);
+    float maxv = 0;
+    for (int col = t; col < K / 2; col += 256) {
+        const float2 v = __bfloat1622float2(source[col]);
+        maxv = fmaxf(maxv, fmaxf(fabsf(v.x), fabsf(v.y)));
+    }
+    float scale = fmaxf(RowMax(maxv) / 448.f, 1.e-12f);
+    if (!t) scales[row] = scale;
+    for (int col = t; col < K / 2; col += 256) {
+        const float2 v = __bfloat1622float2(source[col]);
+        target[col] = __nv_cvt_float2_to_fp8x2(make_float2(v.x / scale, v.y / scale), __NV_SATFINITE, __NV_E4M3);
+    }
+}
+template<int Vectors>
+__global__ void ScaleFp8BFloat16(const float *input, __nv_bfloat16 *output,
+                                const float *xs, const float *ws, const float *bias, int N) {
+    const int row = blockIdx.y;
+    const float x = xs[row];
+#pragma unroll
+    for (int i = 0; i < Vectors; ++i) {
+        const int col = (blockIdx.x * blockDim.x * Vectors + threadIdx.x + i * blockDim.x) * 4;
+        if (col >= N) continue;
+        const float4 v = *reinterpret_cast<const float4 *>(input + size_t(row) * N + col);
+        const float4 w = *reinterpret_cast<const float4 *>(ws + col);
+        const float4 b = bias ? make_float4(bias[col], bias[col + 1], bias[col + 2], bias[col + 3])
+                              : make_float4(0, 0, 0, 0);
+        // Preserve the original multiplication and BF16 rounding order.
+        const __nv_bfloat162 lo = __floats2bfloat162_rn((v.x * x) * w.x + b.x, (v.y * x) * w.y + b.y);
+        const __nv_bfloat162 hi = __floats2bfloat162_rn((v.z * x) * w.z + b.z, (v.w * x) * w.w + b.w);
+        *reinterpret_cast<uint2 *>(output + size_t(row) * N + col) =
+            make_uint2(*reinterpret_cast<const unsigned *>(&lo), *reinterpret_cast<const unsigned *>(&hi));
+    }
+}
+bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float *bias,
+                __nv_bfloat16 *output, int M, int N, int K) {
+    // Reuse the existing opt-in for activation quantization. Weight-only FP8
+    // and all existing BF16 defaults retain their original arithmetic.
+    if (!Enabled("FASTLLM_CUDA_NATIVE_FP8_PREFILL")) return false;
+    // One-token warmup must reserve the arena before KV sizing, even though
+    // decode itself retains its weight-only kernel.
+    if (FastllmCudaGetNcclForceSync() && !FastllmCudaGraphIsCapturingFast() && Supported(8)) GetState();
+    if (M < std::max(128, fastllm::FastllmCudaGetLinearExactBatchThreshold()) || M > 4096 ||
+        N <= 0 || K <= 0 || N % 16 || K % 16 || !input || !weight || !output ||
+        uintptr_t(weight) % 4 || uintptr_t(input) % 16 || uintptr_t(output) % 16 || !Supported(8)) return false;
+    cudaStreamCaptureStatus capture;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) return false;
+    auto align = [](size_t n) { return (n + 255) & ~size_t(255); };
+    const size_t wb = align(size_t(N) * K), xb = align(size_t(M) * K),
+        swb = align(size_t(N) * 4), sxb = align(size_t(M) * 4), ob = size_t(M) * N * 4;
+    if (wb + xb + swb + sxb + ob > State::capacity) return false;
+    State *s = GetState();
+    if (!s) return false;
+    std::lock_guard<std::mutex> lock(s->mutex);
+    Plan *p = GetPlan(*s, 8, M, N, K);
+    if (!p) return false;
+    CheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, s->ready, 0), "FP8 BF16 scratch dependency");
+    uint8_t *w = s->scratch, *x = w + wb;
+    float *sw = (float *)(x + xb), *sx = (float *)((uint8_t *)sw + swb),
+          *tmp = (float *)((uint8_t *)sx + sxb);
+    UnpackFp8Channels<<<N,256,0,cudaStreamPerThread>>>(weight,w,sw,N,K);
+    QuantFp8BFloat16<<<M,256,0,cudaStreamPerThread>>>(input,x,sx,K);
+    CheckCuda(cudaGetLastError(), "FP8 BF16 preparation");
+    Tune(*s,*p,w,x,tmp);
+    const float alpha = 1, beta = 0;
+    bool ok = p->valid && cublasLtMatmul(s->handle,p->op,&alpha,w,p->a,x,p->b,&beta,tmp,p->c,tmp,p->c,
+        &p->algo,s->workspace,State::workspaceBytes,cudaStreamPerThread) == CUBLAS_STATUS_SUCCESS;
+    if (ok) {
+        // Keep coalesced float4 access while amortizing scheduling for wide rows.
+        // Small shapes and unmeasured architectures retain the original launch.
+        if (FastllmCudaRuntimeArch() == 90 && M >= 1024 && N >= 4096)
+            ScaleFp8BFloat16<4><<<dim3((N+4095)/4096,M),256,0,cudaStreamPerThread>>>(tmp,output,sx,sw,bias,N);
+        else
+            ScaleFp8BFloat16<1><<<dim3((N+1023)/1024,M),256,0,cudaStreamPerThread>>>(tmp,output,sx,sw,bias,N);
+    }
+    CheckCuda(cudaGetLastError(), "FP8 BF16 output");
+    CheckCuda(cudaEventRecord(s->ready,cudaStreamPerThread), "FP8 BF16 completion");
+    return ok;
 }
 __device__ inline size_t ScaleIndex(int row, int group, int groups) {
     return (size_t(row / 128) * (groups / 4) + group / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 +
@@ -552,6 +684,10 @@ bool Supported(int bits) {
 namespace fastllm_native_prefill {
 bool Enabled(const char *) { return false; }
 bool Supported(int) { return false; }
+bool Fp32(const float *, const float *, float *, int, int, int) { return false; }
+bool Fp8BFloat16(const __nv_bfloat16 *, const uint8_t *, const float *, __nv_bfloat16 *, int, int, int) {
+    return false;
+}
 bool Fp8(const half *, const uint8_t *, const float *, const half *, half *, int, int, int, int) {
     return false;
 }

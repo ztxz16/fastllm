@@ -2,6 +2,7 @@
 #include "fastllm.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -75,12 +76,87 @@ static void CheckPeerLogitGather(const std::vector<int> &devices) {
     }
     std::cout << "PASS cross-thread pitched peer logits gather" << std::endl;
 }
+static void CheckTransferReservation(const std::vector<int> &devices) {
+    constexpr size_t MiB = 1024 * 1024;
+    constexpr int maxRows = 65536, width = 64;
+    FastllmCudaClearBigBufferAll();
+    CudaRuntime runtime(Topology(devices, 8, 8));
+    std::vector<std::unique_ptr<fastllm::CudaMemoryReservation>> arenas;
+    for (int device : devices)
+        arenas.emplace_back(new fastllm::CudaMemoryReservation(device, 64 * MiB));
+    std::vector<void *> guards(8);
+    runtime.Run([&](int r, int) {
+        guards[r] = FastllmCudaDirectMalloc(8 * MiB);
+        Cuda(cudaMemsetAsync(guards[r], 0xa5, 8 * MiB, cudaStreamPerThread));
+        void *idle = FastllmCudaMalloc(48 * MiB);
+        Require(fastllm::IsCudaReservationPointer(guards[r]) && fastllm::IsCudaReservationPointer(idle),
+                "pressure fixture escaped the bounded arena");
+        Require(FastllmCudaFreeAfterCurrentThreadStream(idle), "cache retirement failed");
+    });
+    runtime.Run([&](int, int device) {
+        void *probe = nullptr;
+        // Probe the arena before the public allocator reclaims idle cache.
+        Require(fastllm::TryAllocateCudaReservation(device, 32 * MiB, &probe) && !probe,
+                "pressure fixture did not exhaust the backing arena");
+    });
+    {
+        // Only 8 MiB is free below the ordinary cache. Both dynamic and fixed
+        // transfer growth must reclaim its idle blocks without touching live KV.
+        CudaRowTransfer transfer(runtime, RowPartition(8, {}));
+        transfer.Reset(RowPartition(8, std::vector<int>(maxRows, 2)));
+        transfer.Reserve(width);
+        transfer.ReserveFixed(maxRows, width);
+        std::vector<unsigned char *> input(8), local(8), output(8);
+        std::vector<unsigned char> expected(size_t(maxRows) * width);
+        for (size_t i = 0; i < expected.size(); ++i) expected[i] = (i * 31 + 7) % 251;
+        runtime.Run([&](int r, int) {
+            Cuda(cudaMalloc(&input[r], expected.size()));
+            Cuda(cudaMalloc(&local[r], expected.size()));
+            Cuda(cudaMalloc(&output[r], expected.size()));
+            Cuda(cudaMemcpyAsync(input[r], expected.data(), expected.size(), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        });
+        for (int n : {1, 9884, maxRows, 32, maxRows}) {
+            std::vector<int> owners(n, 2);
+            if (n == 9884) std::fill(owners.begin() + 8472, owners.end(), 6);
+            transfer.Reset(RowPartition(8, owners));
+            transfer.Reserve(width);
+            runtime.Run([&](int r, int) {
+                transfer.Select(r, input[r], local[r], width);
+                transfer.Collect(r, local[r], output[r], width);
+            });
+            runtime.Run([&](int r, int) {
+                std::vector<unsigned char> result(size_t(n) * width), guard(4096);
+                Cuda(cudaMemcpy(result.data(), output[r], result.size(), cudaMemcpyDeviceToHost));
+                Cuda(cudaMemcpy(guard.data(), guards[r], guard.size(), cudaMemcpyDeviceToHost));
+                Require(std::equal(result.begin(), result.end(), expected.begin()), "reserved transfer changed bytes");
+                Require(guard == std::vector<unsigned char>(guard.size(), 0xa5), "reclaim damaged live storage");
+            });
+        }
+        bool rejected = false;
+        try { transfer.Reset(RowPartition(8, std::vector<int>(maxRows + 1, 0))); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        Require(rejected, "fixed row capacity overflow accepted");
+        rejected = false;
+        try { transfer.Reserve(width + 1); }
+        catch (const std::invalid_argument &) { rejected = true; }
+        Require(rejected, "fixed row width overflow accepted");
+        runtime.Run([&](int r, int) {
+            Cuda(FastllmCudaCheckedFree(input[r]));
+            Cuda(FastllmCudaCheckedFree(local[r]));
+            Cuda(FastllmCudaCheckedFree(output[r]));
+        });
+    }
+    runtime.Run([&](int r, int) { FastllmCudaDirectFree(guards[r]); });
+    FastllmCudaClearBigBufferAll();
+    std::cout << "PASS reserved row transfer, cache reclaim and skewed DP layouts" << std::endl;
+}
 int main() {
     int count = 0;
     Cuda(cudaGetDeviceCount(&count));
     if (count < 8) { std::cout << "SKIP: requires eight CUDA devices\n"; return 77; }
     std::vector<int> devices{6, 2, 7, 0, 5, 1, 4, 3};
     CheckPeerLogitGather(devices);
+    CheckTransferReservation(devices);
     for (auto type : {fastllm::FLOAT32, fastllm::FLOAT16, fastllm::BFLOAT16, fastllm::FP8_E4M3})
         for (int axis : {0, 1}) {
             fastllm::Data weight(type, {256, 256}), bias;
@@ -176,6 +252,7 @@ int main() {
             });
         }
         CudaRowTransfer transfer(runtime, RowPartition(dp, {}));
+        if (dp >= 4) transfer.ReserveFixed(513, 37);
         for (int n : {0, 1, 2, 7, 8, 9, 32, 129, 513, 2, 0, 9}) for (bool skew : {false, true}) {
             std::vector<int> owners(n);
             for (int i = 0; i < n; ++i) owners[i] = skew ? dp - 1 : (i * 7) % dp;

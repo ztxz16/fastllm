@@ -7,6 +7,7 @@
 #include <nccl.h>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <exception>
 #include <limits>
 #include <mutex>
@@ -140,6 +141,7 @@ struct CudaRuntime::Impl {
     std::vector<cudaEvent_t> handoff, completion;
     std::mutex submitMutex, errorMutex;
     std::exception_ptr firstError;
+    std::vector<std::thread> aborts;
     bool lease = false;
 
     explicit Impl(Topology topology) : topology(std::move(topology)) {
@@ -159,14 +161,16 @@ struct CudaRuntime::Impl {
             if (rank < int(handoff.size()) && handoff[rank]) cudaEventDestroy(handoff[rank]);
             if (rank < int(completion.size()) && completion[rank]) cudaEventDestroy(completion[rank]);
         });
+        for (auto &thread : aborts) thread.join();
         if (lease) {
             std::lock_guard<std::mutex> lock(leaseMutex);
             for (int device : topology.devices) leasedDevices.erase(device);
         }
     }
     void Release(const std::function<void(int,int)> &callback) noexcept {
-        // Cleanup is still dispatched after a failed step. Collectives were
-        // aborted before that error escaped; do not submit any new collective.
+        // Cleanup is still dispatched after a failed step. Collectives
+        // have started aborting; do not submit any new collective. Graphs must
+        // be destroyed before this runtime, including on the failure path.
         try {
             if (MultiCudaRunDeviceCallbacksEnqueueOnly(topology.devices, callback))
                 MultiCudaSynchronizeDeviceCallbacks(topology.devices);
@@ -176,6 +180,14 @@ struct CudaRuntime::Impl {
         std::lock_guard<std::mutex> lock(errorMutex);
         if (firstError) return;
         firstError = error;
+        // Preserve the first failure before any potentially blocking teardown.
+        try { std::rethrow_exception(error); }
+        catch (const std::exception &e) {
+            fprintf(stderr, "[Fastllm] parallel GPU rank %d failed: %s\n", activeRank, e.what());
+        } catch (...) {
+            fprintf(stderr, "[Fastllm] parallel GPU rank %d failed: unknown exception\n", activeRank);
+        }
+        fflush(stderr);
         for (auto &state : groups) if (state.rendezvous)
             state.rendezvous->Abort("parallel runtime participant failed");
         // Do not destroy handles here: other ranks may be unwinding a call.
@@ -218,7 +230,12 @@ struct CudaRuntime::Impl {
         if (!ok) throw std::runtime_error("persistent MultiCUDA workers unavailable");
         if (firstError) {
             for (auto &group : groups) for (auto &comm : group.comms) if (comm) {
-                ncclCommAbort(comm); comm = nullptr;
+                // Abort may wait for CUDA graph user-object references. The
+                // caller must receive the error before it can destroy those
+                // graphs. Start every rank's abort independently, then join
+                // at runtime destruction after graph owners have unwound.
+                aborts.emplace_back([handle = comm] { ncclCommAbort(handle); });
+                comm = nullptr;
             }
             std::rethrow_exception(firstError);
         }
@@ -325,6 +342,7 @@ struct CudaRowTransfer::Impl {
     RowPartition rows;
     std::vector<Scratch> scratch;
     size_t reserved = 0;
+    size_t fixedRows = 0, fixedRowBytes = 0;
     Impl(CudaRuntime &runtime, RowPartition rows)
         : runtime(runtime), rows(std::move(rows)), scratch(runtime.Layout().Size()) {
         if (this->rows.localToGlobal.size() != size_t(runtime.Layout().attentionDP))
@@ -336,16 +354,16 @@ struct CudaRowTransfer::Impl {
             const auto &indices = this->rows.localToGlobal[runtime.Layout().AttentionOwner(rank)];
             if (!indices.empty()) {
                 if (s.selectCapacity < indices.size()) {
-                    Check(cudaFree(s.select)); s.select = nullptr; s.selectCapacity = 0;
-                    Check(cudaMalloc(&s.select, indices.size() * sizeof(int)));
+                    FastllmCudaDirectFree(s.select); s.select = nullptr; s.selectCapacity = 0;
+                    Check(FastllmCudaCheckedMalloc((void **)&s.select, indices.size() * sizeof(int), __FILE__, __LINE__));
                     s.selectCapacity = indices.size();
                 }
                 Check(cudaMemcpyAsync(s.select, indices.data(), indices.size() * sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
             }
             if (this->rows.Rows()) {
                 if (s.unpackCapacity < size_t(this->rows.Rows())) {
-                    Check(cudaFree(s.unpack)); s.unpack = nullptr; s.unpackCapacity = 0;
-                    Check(cudaMalloc(&s.unpack, this->rows.Rows() * sizeof(int)));
+                    FastllmCudaDirectFree(s.unpack); s.unpack = nullptr; s.unpackCapacity = 0;
+                    Check(FastllmCudaCheckedMalloc((void **)&s.unpack, this->rows.Rows() * sizeof(int), __FILE__, __LINE__));
                     s.unpackCapacity = this->rows.Rows();
                 }
                 Check(cudaMemcpyAsync(s.unpack, this->rows.globalToPadded.data(), this->rows.Rows() * sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -355,7 +373,8 @@ struct CudaRowTransfer::Impl {
     ~Impl() {
         runtime.impl->Release([&](int rank, int) {
             auto &s = scratch[rank];
-            cudaFree(s.select); cudaFree(s.unpack); cudaFree(s.send); cudaFree(s.gather);
+            FastllmCudaDirectFree(s.select); FastllmCudaDirectFree(s.unpack);
+            FastllmCudaDirectFree(s.send); FastllmCudaDirectFree(s.gather);
         });
     }
 };
@@ -366,23 +385,57 @@ CudaRowTransfer::~CudaRowTransfer() = default;
 void CudaRowTransfer::Reset(RowPartition rows) {
     if (rows.localToGlobal.size() != size_t(impl->runtime.Layout().attentionDP))
         throw std::invalid_argument("row partition does not match topology");
+    if (impl->fixedRows && size_t(rows.Rows()) > impl->fixedRows)
+        throw std::invalid_argument("row partition exceeds fixed transfer capacity");
     if (rows.localToGlobal == impl->rows.localToGlobal) return;
     impl->rows = std::move(rows);
     impl->Initialize();
 }
 void CudaRowTransfer::Reserve(size_t maxRowBytes) {
+    if (impl->fixedRows && maxRowBytes > impl->fixedRowBytes)
+        throw std::invalid_argument("row width exceeds fixed transfer capacity");
     const size_t capacity = Bytes(impl->rows.PaddedRows(), maxRowBytes);
     if (impl->reserved >= capacity) return;
     impl->runtime.Run([&](int rank, int) {
         auto &s = impl->scratch[rank];
         if (s.capacity >= capacity) return;
-        Check(cudaFree(s.send)); Check(cudaFree(s.gather));
+        FastllmCudaDirectFree(s.send); FastllmCudaDirectFree(s.gather);
         s.send = s.gather = nullptr; s.capacity = 0;
-        Check(cudaMalloc(&s.send, Bytes(impl->rows.bucket, maxRowBytes)));
-        Check(cudaMalloc(&s.gather, capacity));
+        Check(FastllmCudaCheckedMalloc((void **)&s.send, Bytes(impl->rows.bucket, maxRowBytes), __FILE__, __LINE__));
+        Check(FastllmCudaCheckedMalloc((void **)&s.gather, capacity, __FILE__, __LINE__));
         s.capacity = capacity;
     });
     impl->reserved = capacity;
+}
+void CudaRowTransfer::ReserveFixed(size_t maxRows, size_t maxRowBytes) {
+    if (!maxRows || !maxRowBytes || size_t(impl->rows.Rows()) > maxRows)
+        throw std::invalid_argument("invalid fixed transfer capacity");
+    if (impl->fixedRows) {
+        if (maxRows > impl->fixedRows || maxRowBytes > impl->fixedRowBytes)
+            throw std::invalid_argument("cannot grow a fixed row transfer");
+        return;
+    }
+    const size_t sendBytes = Bytes(maxRows, maxRowBytes);
+    const size_t capacity = Bytes(sendBytes, impl->runtime.Layout().attentionDP);
+    const size_t indexBytes = Bytes(maxRows, sizeof(int));
+    impl->runtime.Run([&](int rank, int) {
+        auto &s = impl->scratch[rank];
+        if (s.capacity < capacity) {
+            FastllmCudaDirectFree(s.send); FastllmCudaDirectFree(s.gather);
+            s.send = s.gather = nullptr; s.capacity = 0;
+            Check(FastllmCudaCheckedMalloc((void **)&s.send, sendBytes, __FILE__, __LINE__)); Check(FastllmCudaCheckedMalloc((void **)&s.gather, capacity, __FILE__, __LINE__));
+            s.capacity = capacity;
+        }
+        for (auto entry : {std::make_pair(&s.select, &s.selectCapacity),
+                           std::make_pair(&s.unpack, &s.unpackCapacity)}) {
+            if (*entry.second >= maxRows) continue;
+            FastllmCudaDirectFree(*entry.first); *entry.first = nullptr; *entry.second = 0;
+            Check(FastllmCudaCheckedMalloc((void **)entry.first, indexBytes, __FILE__, __LINE__)); *entry.second = maxRows;
+        }
+    });
+    impl->reserved = capacity;
+    impl->fixedRows = maxRows; impl->fixedRowBytes = maxRowBytes;
+    impl->Initialize();
 }
 void CudaRowTransfer::Select(int rank, const void *global, void *local, size_t rowBytes) {
     if (activeRuntime != impl->runtime.impl.get() || activeRank != rank)

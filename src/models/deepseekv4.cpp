@@ -6900,7 +6900,7 @@ namespace fastllm {
                         genTokens = 0;
                     }
                 }
-                model->dictCV.notify_all();
+                model->NotifyResponseReady();
             } else {
                 int maxLen = -1, select = -1;
                 for (auto &it : model->responseContextDict.dicts) {

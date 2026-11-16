@@ -2,15 +2,18 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-v41-full-decode.h"
+#include "devices/cuda/cudaworkspace.h"
 #define REQUIRE(x) do { if (!(x)) { fprintf(stderr, "Requirement failed at %s:%d: %s\n", __FILE__, __LINE__, #x); return 1; } } while (0)
 #include <cstdio>
 #include <vector>
 #include <algorithm>
 #define CHECK(x) do { auto err=(x); if(err!=cudaSuccess) { fprintf(stderr,"%s: %s\n",#x,cudaGetErrorString(err)); return 1; } } while(0)
-int main() {
+int main(int argc, char **) {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || devices==0) { puts("SKIP: CUDA unavailable"); return 77; }
     CHECK(cudaSetDevice(0));
+    std::unique_ptr<fastllm::CudaMemoryReservation> reservation;
+    if (argc > 1) reservation.reset(new fastllm::CudaMemoryReservation(0, size_t(2) << 30));
     std::vector<size_t> outer,inner;
     {
         FastllmCudaAllocationRecorder record(&outer);

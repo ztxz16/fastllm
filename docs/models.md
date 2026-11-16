@@ -79,17 +79,39 @@
 
 ### DeepSeek系列
 
+DeepSeek-V4 / V4.1 使用原生加载入口，当前推荐的格式与部署方式如下，不需要先经 `from_hf()` 或转换成 `.flm`：
+
+| 模型 | 权重与部署方式 | 文档 |
+| --- | --- | --- |
+| DeepSeek-V4 / V4-Flash | 支持的原始 checkpoint；手动部署，尚未接入运行时 `--auto` | [V4 部署](deepseek.md) |
+| DeepSeek-V4.1-Flash 1017 | 原始 HF Safetensors（FP8 / FP4），支持 `--auto`、混合推理、多卡和 DSpark | [V4.1 部署](deepseek_v41.md) |
+| DeepSeek-V4.1-Flash GGUF | GSQ-RCO、Unsloth 系列；传入完整分片集的第一片，保留匹配的 Engram | [GGUF 与 Engram](deepseek_v41.md#模型与权重格式) |
+| DeepSeek-V4.1-Flash EXL3 | 直接读取带 EXL3 配置的 Safetensors 目录，支持 CPU/NUMA 与 GPU 专家缓存 | [EXL3 部署](deepseek_v41.md#exl3-模型) |
+
+量化文件未必包含草稿和视觉模块；DSpark、图像输入需要匹配权重。格式支持不代表任意架构或任意第三方导出都已适配，具体范围见对应指南。
+
+早期 DeepSeek 模型的加载方式：
+
 |                                       模型  | 加载后转换 |  离线转换  |  直接读取  |
 |-------------------------------------------: |------------|------------|------------|
 | deepseek-ai/Deepseek-Coder-1.3B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/Deepseek-Coder-6.7B-Instruct    | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/Deepseek-Coder-7B-Instruct v1.5 | [✔](llama_cookbook.md#deepseek-coder) | [✔](llama_cookbook.md#deepseek-coder) | ✔ |
 | deepseek-ai/deepseek-coder-33b-instruct     | [√](llama_cookbook.md#deepseek-coder) | [√](llama_cookbook.md#deepseek-coder) | ✔ |
-| deepseek-ai/DeepSeek-V4.1-Flash（[说明](deepseek_v41.md)） | ✔ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-V2-Chat                | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-V2-Lite-Chat           | √ | ✔ | ✔ |
 | deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct | √ | ✔ | ✔ |
+
+### 图片与视频生成模型
+
+这些模型使用专用原生后端，入口、量化范围和多卡限制见[图片与视频生成指南](image-video.md)，不使用 LLM 的 `ftllm server` 命令。
+
+| 模型 | 能力 | 启动入口 |
+| --- | --- | --- |
+| MiniMax-H3 / Pika H3 Flex | 音视频生成、首尾帧、图片/视频/音频参考；Pika 固定六步 | 启动器视频后端或 `minimax_h3_server` |
+| MiniMax-H3-Image | 图片生成、单图编辑、多图参考 | 启动器图像后端或 `minimax_h3_image_server` |
+| Qwen-Image-2.1 | 图片生成、单图/多图编辑 | `ftllm qwen-image server` / `generate` |
 
 ### LLaMA类模型
 

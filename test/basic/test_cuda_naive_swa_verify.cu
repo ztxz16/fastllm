@@ -49,17 +49,20 @@ static double HostKV(const unsigned char *data, size_t i, bool fp8) {
 }
 static double Rounded(double x) { return __bfloat162float(__float2bfloat16_rn(float(x))); }
 static void CheckSwaOracle(const Data &q, const Data &key, const Data &value, const Data &sink,
-        const std::vector<unsigned char> &output, int requests, int rows, int heads, int past) {
-    const auto query = Read(q), keys = Read(key, (size_t)256 * 192 * key.unitSize),
-        values = Read(value, (size_t)256 * 128 * value.unitSize), bias = Read(sink);
+        const std::vector<unsigned char> &output, int requests, int rows, int heads, int past, int kvHeads = 1, bool verify = true) {
+    const auto query = Read(q), keys = Read(key, (size_t)256 * kvHeads * 192 * key.unitSize),
+        values = Read(value, (size_t)256 * kvHeads * 128 * value.unitSize), bias = Read(sink);
     const bool fp8 = key.dataType == FP8_E4M3;
     double error = 0, norm = 0;
-    for (int request : {0, requests - 1}) for (int row : {0, rows - 1}) for (int head : {0, heads - 1}) {
+    for (int request : {0, requests - 1}) for (int row : {0, rows - 1}) for (int head : {0, heads / 2, heads - 1}) {
         const int length = past + row + 1, start = std::max(0, length - 128);
         std::vector<double> scores(length - start), probabilities(scores.size());
         float sinkValue; memcpy(&sinkValue, bias.data() + head * sizeof(float), sizeof(float));
         double maximum = sinkValue;
-        auto physical = [&](int logical) { return logical >= past ? 128 + logical - past : logical & 127; };
+        auto physical = [&](int logical) {
+            const int token = verify && logical >= past ? 128 + logical - past : logical & 127;
+            return token * kvHeads + head / (heads / kvHeads);
+        };
         for (int logical = start; logical < length; ++logical) {
             double dot = 0;
             for (int d = 0; d < 192; ++d)
@@ -108,12 +111,73 @@ static void BatchCommit(int requests, DataType type) {
         Require(Read(values[i], (size_t)144 * values[i].dims[2] * values[i].unitSize) == Read(rv[i], (size_t)144 * rv[i].dims[2] * rv[i].unitSize), "batch SWA value commit differs");
     }
 }
-int main() {
+
+// Attention DP can retain all 64 query / 8 KV heads on one GPU. Cover the
+// bulk threshold, descriptor chunks and both decode/verification layouts.
+static void DPHeads(int requests, int rows, int heads, DataType type, int past) {
+    const int kvHeads = heads / 8, count = requests * rows;
+    Data q(BFLOAT16), key(type), value(type), sink(FLOAT32), output, empty;
+    Init(q, {1, count, heads * 192}); Fill(q, 793 + count);
+    Init(key, {1, 256, kvHeads * 192}); Init(value, {1, 256, kvHeads * 128});
+    for (Data *d : {&key, &value}) {
+        if (type == BFLOAT16) Fill(*d, 117 + d->dims[2]);
+        else {
+            std::vector<unsigned char> bytes(d->GetBytes());
+            for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = 0x20 + (i * 13 + i / 127) % 40;
+            Write(*d, bytes);
+        }
+    }
+    Init(sink, {heads}); std::vector<float> bias(heads);
+    for (int h = 0; h < heads; ++h) bias[h] = h == 0 ? .1f : h == heads - 1 ? -.2f : h % 3 == 0 ? 80.f : h % 3 == 1 ? -80.f : .1f;
+    Check(cudaMemcpy(sink.cudaData, bias.data(), heads * sizeof(float), cudaMemcpyHostToDevice));
+    std::vector<FastllmNaiveSWARow> descriptors(count);
+    for (int i = 0; i < count; ++i) {
+        auto &d = descriptors[i]; d.key = key.cudaData; d.value = value.cudaData;
+        d.fp8 = type == FP8_E4M3; d.ring = true;
+        d.length = past + i % rows + 1; d.verifyOffset = rows > 1 ? i % rows : -1;
+    }
+    auto run = [&] { FastllmCudaNaiveBatchSWADecode(q, sink, descriptors, empty, heads, kvHeads, output); };
+    run(); auto expected = Read(output);
+    if (count < 32) {
+        // One-row calls retain the previous scalar path. Check every output
+        // bit when sharing KV across heads, including all verification rows.
+        for (int i = 0; i < count; ++i) {
+            Data query(BFLOAT16, {1, 1, heads * 192}), reference;
+            query.FakeFrom(q, (size_t)i * heads * 192 * sizeof(uint16_t));
+            FastllmCudaNaiveBatchSWADecode(query, sink, {descriptors[i]}, empty, heads, kvHeads, reference);
+            const auto bytes = Read(reference);
+            Require(std::equal(bytes.begin(), bytes.end(), expected.begin() + (size_t)i * heads * 128 * sizeof(uint16_t)),
+                "shared-head SWA changed scalar output bits");
+        }
+    }
+    CheckSwaOracle(q, key, value, sink, expected, requests, rows, heads, past, kvHeads, rows > 1);
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    run(); Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&exec, graph, 0)); Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+    Require(expected == Read(output), "DP-head SWA Graph replay differs");
+    Check(cudaGraphExecDestroy(exec)); Check(cudaGraphDestroy(graph));
+}
+
+int main(int argc, char **argv) {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
             return 77;
         Check(cudaSetDevice(0));
+        if (argc > 1) {
+            int checks = 0;
+            for (DataType type : {BFLOAT16, FP8_E4M3})
+                for (int heads : {16, 32, 64})
+                    for (int rows : {1, 3, 5, 6, 8})
+                        for (int requests : {1, 3, 4, 7, 8, 16, 31, 32, 33}) {
+                            DPHeads(requests, rows, heads, type, requests < 8 ? 127 : 200003);
+                            ++checks;
+                        }
+            printf("DP HEADS SWA PASS checks=%d; double oracle and exact Graph replay\n", checks);
+            return 0;
+        }
+
         for (int n : {2, 8, 80, 112, 113, 380, 1025})
             for (DataType type : {BFLOAT16, FP8_E4M3}) BatchCommit(n, type);
         int checks = 0;

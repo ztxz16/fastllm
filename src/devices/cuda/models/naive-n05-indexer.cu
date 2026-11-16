@@ -141,4 +141,4 @@ void Launch(const BF *q, FastllmNaiveKV keys, const float *scales, const BF *wei
 }
 } // namespace naive_indexer
 
-#include "naive-n05-indexer-experimental.cuh"
+#include "naive-n05-indexer-fp8.cuh"

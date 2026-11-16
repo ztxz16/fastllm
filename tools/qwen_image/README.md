@@ -1,10 +1,26 @@
 # Qwen-Image-2.1 原生 C++ / CUDA
 
+[图片与视频使用指南](../../docs/image-video.md) · [English user guide](../../docs/image-video_en.md)
+
 支持文生图、单张/多张参考图编辑、RGBA PNG、前缀 KV cache、同步 Images API 和带进度/取消的异步任务。推理与 HTTP 服务均为 C++，不调用 Python、PyTorch、Diffusers 或 Triton。
 
 默认使用 BF16 激活，自动识别 BF16、逐行缩放的 E4M3 FP8、ConvRot INT8 或 GGUF DiT 权重。BF16 矩阵乘在块内使用 FP32 累加，大尺寸降维投影允许 BF16 split-K 部分和；归一化归约仍为 FP32。FP8 投影在 GEMM 前动态逐行量化输入，行缩放值按 TorchAO 的 BF16 舍入边界计算，输出恢复 BF16；文本/视觉编码器与 VAE 保持 BF16。权重直接读取发布的 safetensors / GGUF，无需转换。每次请求根据空闲显存、输出尺寸和参考图数量估算空间：充足时常驻权重并复用完整 KV 缓冲，不足时按文本编码、DiT、VAE 阶段加载/释放，保留较小的前缀缓存。HTTP 和命令行自动选择，无需精度或显存策略参数。
 
 常驻只复用模型权重；提示词、参考图和噪声仍逐请求计算。KV、RoPE 和临时张量在请求结束释放；取消或异常同时卸载权重，下一请求重新评估。临时张量在请求内通过有界显存池复用。常驻速度需要预热，不应将热启动耗时当作包含首次权重加载的耗时。
+
+## Wheel 和绿色包
+
+Linux CUDA Wheel 和绿色包内置原生后端，无需安装 PyTorch 或 Diffusers：
+
+```bash
+ftllm qwen-image server --model /path/to/Qwen-Image-2.1 --devices 0 --port 8008
+ftllm qwen-image generate --model /path/to/Qwen-Image-2.1 --devices 0 \
+  --prompt 'A red apple on a wooden table.' --output apple.png
+```
+
+服务自动使用包内的 demo 和 OpenAPI 文件，浏览器打开 `http://127.0.0.1:8008/demo`。
+`ftllm qwen-image server --help` 和 `ftllm qwen-image generate --help` 查看原生参数；
+`--devices 0,1` 开启双卡 DiT 张量并行。模型权重需另行准备，精度与硬件限制见下文。
 
 ## 构建
 

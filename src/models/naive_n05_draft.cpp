@@ -824,6 +824,7 @@ void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &k
         int past, int count, bool ringVerify) {
 #ifdef USE_CUDA
     auto commit = [&](int device) {
+        if (device >= 0 && !kv.front().first.multiDeviceDatas.count(device)) return;
         for (int layer = 0; layer < block_cnt; ++layer) {
             const int length = (slidingLayers[layer] ? std::min(past, window - 1) : past) + count;
             auto &pair = kv[layer];
@@ -879,6 +880,7 @@ void NaiveN05FlashModel::CommitTargetCaches(const std::vector<std::vector<std::p
         std::map<int, std::vector<FastllmNaiveCacheCommit>> updates;
         for (size_t i = 0; i < caches.size(); ++i) for (int layer = 0; layer < block_cnt; ++layer) {
             auto &pair = caches[i]->at(layer);
+            if (device >= 0 && !pair.first.multiDeviceDatas.count(device)) continue;
             Data &key = device < 0 ? pair.first : *pair.first.multiDeviceDatas.at(device);
             Data &value = device < 0 ? pair.second : *pair.second.multiDeviceDatas.at(device);
             if (slidingLayers[layer]) updates[key.dataDeviceIds.at(0)].push_back({&key, &value, past[i], counts[i]});
@@ -2493,7 +2495,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             AssertInFastLLM(pastKeyValues[i * block_cnt + layer].first == &(*caches[i])[layer].first &&
                 pastKeyValues[i * block_cnt + layer].second == &(*caches[i])[layer].second,
                 "DSpark batch mixed request KV descriptors.");
-        prefill |= seqLens[i] != 1 || owners[i]->committed == 0 || owners[i]->kv.empty();
+        prefill |= configs[i].prefill_chunk_remaining >= 0 || seqLens[i] != 1 || owners[i]->committed == 0 || owners[i]->kv.empty();
     }
     if (prefill) {
         // Preserve the scheduler's coalescing target while reusing KVMem's
@@ -2810,7 +2812,7 @@ int NaiveN05FlashModel::ForwardDraft(
     int limit = std::min(draftTokens, max_positions - oldLength - 1);
     if (config.output_token_limit > 0)
         limit = std::min(limit, config.output_token_limit - (oldLength - config.input_token_length) - 1);
-    if (isIntermediateChunkedPrefill || context.committed == 0 || context.kv.empty() ||
+    if (isIntermediateChunkedPrefill || config.prefill_chunk_remaining >= 0 || context.committed == 0 || context.kv.empty() ||
         inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
         // Only the final draft window is used; there is no CPU prefix archive.
@@ -2827,7 +2829,7 @@ int NaiveN05FlashModel::ForwardDraft(
             context.committed += inputIds.dims[1];
             ClearDraftPrefixHidden(context.prefixHidden);
         }
-        if (isIntermediateChunkedPrefill) return 0;
+        if (isIntermediateChunkedPrefill || config.prefill_chunk_remaining > 0) return 0;
         return SampleTarget(logits, kv, config, lastTokens, retLogits, &selection);
     }
     LastTokensUnit history = lastTokens.units.empty() ? LastTokensUnit(config.last_n) : lastTokens.units[0];

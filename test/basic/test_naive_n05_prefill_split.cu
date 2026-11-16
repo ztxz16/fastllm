@@ -28,7 +28,7 @@ static void Case(int rows, int past, int heads, bool causal, bool withSink, int 
     const int kvHeads = heads / 16, keys = past + rows, count = 2048;
     const size_t outputs = (size_t)rows * heads * 128;
     Buffer<BF> q((size_t)rows * heads * 192), k((size_t)keys * kvHeads * 192), v((size_t)keys * kvHeads * 128),
-        reference(outputs), actual(outputs), probabilities((size_t)rows * heads * 2056);
+        reference(outputs), actual(outputs), probabilities((size_t)std::min(rows, 257) * heads * 2056);
     Buffer<int> ids((size_t)rows * count);
     Buffer<float> bias(heads);
     Fill(q.data, (size_t)rows * heads * 192, 53);
@@ -58,11 +58,14 @@ static void Case(int rows, int past, int heads, bool causal, bool withSink, int 
     const dim3 grid(rows, heads / 16);
     fused<<<grid, 256, sizeof(Storage<2048, 2>)>>>(q.data, key, value, ids.data, s, reference.data, heads, kvHeads,
                                                    kvHeads * 192, keys, count, past, causal, indexTile);
-    SplitQK<2048, 0, 2><<<grid, 256, sizeof(QKStorage<2>)>>>(q.data, key, ids.data, probabilities.data, heads, kvHeads,
-                                                             kvHeads * 192, keys, count, past, causal, indexTile);
-    SplitNormalize<2048><<<dim3(rows, heads / 8), 256>>>(probabilities.data, s, heads, count);
-    SplitPV<2048, 0, 2><<<grid, 256, sizeof(PVStorage<2>)>>>(probabilities.data, value, ids.data, actual.data, heads,
-                                                             kvHeads, keys, count, past, causal, indexTile);
+    for(int first=0;first<rows;first+=257) {
+        int tile=std::min(257,rows-first);
+        SplitQK<2048,0,2><<<dim3(tile,heads/16),256,sizeof(QKStorage<2>)>>>(q.data,key,ids.data,
+            probabilities.data,heads,kvHeads,kvHeads*192,keys,count,past,causal,indexTile,first,rows);
+        SplitNormalize<2048><<<dim3(tile,heads/8),256>>>(probabilities.data,s,heads,count);
+        SplitPV<2048,0,2><<<dim3(tile,heads/16),256,sizeof(PVStorage<2>)>>>(probabilities.data,value,ids.data,
+            actual.data,heads,kvHeads,keys,count,past,causal,indexTile,first,rows);
+    }
     Check(cudaGetLastError());
     Check(cudaDeviceSynchronize());
     std::vector<unsigned short> a(outputs), b(outputs);
@@ -85,6 +88,7 @@ int main() {
         Case(2053, 8192, 32, false, true, 0);
         Case(2048, 77952, 16, true, true, 256);
         Case(65, 198975, 16, true, false, 0);
+        Case(4096, 65536, 64, true, false, 0);
         std::puts("PASS: split prefill attention matches fused output exactly");
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());

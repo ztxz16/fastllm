@@ -1019,6 +1019,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
+    parser.add_argument('--indexer_compute_dtype', choices=['auto', 'fp8'], default='auto',
+                        help='Naive Indexer prefill 计算类型；fp8 启用原生 Hopper FP8 打分，需 FP8 Q/K；不支持的设备、形状及解码保持原路径，auto 保持默认计算精度')
     parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
                         help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 按上下文分片并合并全局 TopK，支持纯显存 KV 和 KVMem；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA、DeepSeek-V4.1，或 Naive TP KVMem 的 DSA KV；Naive SWA/Indexer 保持 FP8）')
@@ -1042,6 +1044,16 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='单批 prefill 请求数上限，0仅受模型剩余请求槽位限制')
     parser.add_argument('--prefill_min_decode_requests', type=int, default=0,
                         help='只有活跃 decode 请求数达到此值才等待攒批；空闲时始终立即放行')
+    parser.add_argument('--prefill_dp_balance', choices=['true', 'false'], default='false',
+                        help='按 attention DP 协同攒批；token/请求目标仍按整个副本配置，再均分到各 DP，需各组同时达到')
+    parser.add_argument('--prefill_adaptive_requests', type=int, default=0,
+                        help='自适应攒批的整副本参考并发，0关闭；缩放放行目标和等待时间，不改变内存预算')
+    parser.add_argument('--prefill_chunked', choices=['true', 'false'], default='false',
+                        help='每个文本 prefill chunk 后返回调度器；支持 Naive TP/attention-DP 和 DSpark')
+    parser.add_argument('--prefill_chunk_max_wait_ms', type=int, default=0,
+                        help='已有 prefill chunk 等待其他请求合批的上限，0立即继续；需 prefill_chunked')
+    parser.add_argument('--prefill_fairness_ms', type=int, default=0,
+                        help='繁忙时连续 prefill 达此毫秒后安排等长 decode 时间，0关闭；需 prefill_chunked')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
                              help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
@@ -1055,7 +1067,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
     parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
     parser.add_argument('--attn-dp-size', type=int, default=1,
-                        help='Attention DP组数；组内TP宽度为--tp总卡数/此值，当前支持DeepSeek V4.1纯GPU路径')
+                        help='Attention DP组数；组内TP宽度为--tp总卡数/此值，支持DeepSeek V4.1及Naive/MiMo GPU路径')
     parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
                         help = '专家并行数；1为原MoE TP路径（默认），4/8为MiMo FP8/H20的专家并行，使用内置MegaMoE W8A8；需配合相同大小的--tp')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
@@ -1153,6 +1165,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')
     parser.add_argument('--cache_dir', type = str, default = "", help = '指定缓存模型文件的路径')
     parser.add_argument('--dtype_config', type = str, default = "", help = '指定权重类型配置文件')
+    parser.add_argument('--fp8_prefill', choices=['auto', 'true', 'false'], default='auto',
+                        help='FP8 权重的 prefill 激活量化开关；true 启用 W8A8，false 保持权重量化路径，auto 沿用默认策略')
     parser.add_argument('--ori', type = str, default = "", help = '原始模型权重，读取GGUF文件时可以使用')
     parser.add_argument('--mmproj', type = str, default = "", help = '多模态投影GGUF文件（仅在读取GGUF主模型时有效）')
 
@@ -1265,6 +1279,21 @@ def make_normal_llm_model(args, startup_progress = None):
             or (prefill_batch_tokens == 0 and any(prefill_values[1:]))
             or (prefill_max_requests > 0 and prefill_batch_requests > prefill_max_requests)):
         raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and batch_requests <= max_requests when capped")
+    prefill_scheduling = {}
+    for name in ('prefill_dp_balance', 'prefill_chunked'):
+        value = getattr(args, name, False)
+        if not isinstance(value, bool) and value not in ('true', 'false'):
+            raise ValueError(name + ' must be true or false')
+        prefill_scheduling[name] = value is True or value == 'true'
+    for name in ('prefill_adaptive_requests', 'prefill_chunk_max_wait_ms', 'prefill_fairness_ms'):
+        value = getattr(args, name, 0)
+        if type(value) is not int or not 0 <= value <= 2147483647:
+            raise ValueError(name + ' must be a non-negative int32')
+        prefill_scheduling[name] = value
+    if ((any(prefill_scheduling.values()) and prefill_batch_tokens == 0)
+            or (not prefill_scheduling['prefill_chunked'] and
+                (prefill_scheduling['prefill_chunk_max_wait_ms'] or prefill_scheduling['prefill_fairness_ms']))):
+        raise ValueError('prefill scheduling requires batching; chunk timing requires prefill_chunked')
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     # Resolve this after loading a saved JSON configuration. An explicit zero
     # must remain an opt-out, including when another model previously used slabs.
@@ -2062,8 +2091,12 @@ def make_normal_llm_model(args, startup_progress = None):
     if attention_dp < 1:
         raise ValueError("--attn-dp-size must be positive")
     if attention_dp > 1:
-        if not is_deepseek_v41_model:
-            raise ValueError("Attention DP currently requires the DeepSeek V4.1 adapter")
+        if not (is_deepseek_v41_model or is_naive_n05_model):
+            raise ValueError("Attention DP requires a DeepSeek V4.1 or Naive/MiMo adapter")
+        if is_naive_n05_model and indexer_storage == "layer_shard":
+            raise ValueError("Naive Attention DP supports replicated or context_shard Indexer storage")
+        if is_naive_n05_model and args.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise ValueError("Naive Attention DP supports BF16 or FP8 KV")
         world = _thread_tp_cuda_device_count(getattr(args, "tp", ""))
         if world < attention_dp or world % attention_dp:
             raise ValueError("--attn-dp-size must divide the total --tp device count")
@@ -2160,6 +2193,11 @@ def make_normal_llm_model(args, startup_progress = None):
     apply_page_size_default(args)
     if (args.page_size > 0):
         llm.set_page_size(args.page_size)
+    fp8_prefill = str(getattr(args, "fp8_prefill", "auto")).lower()
+    if fp8_prefill not in ("auto", "true", "false"):
+        raise ValueError("fp8_prefill must be auto, true or false")
+    if fp8_prefill != "auto":
+        os.environ["FASTLLM_CUDA_NATIVE_FP8_PREFILL"] = "1" if fp8_prefill == "true" else "0"
     apply_prefix_cache_env(args)
     apply_image_embedding_cache_env(args)
     apply_vision_device_env(args)
@@ -2223,6 +2261,7 @@ def make_normal_llm_model(args, startup_progress = None):
                             max_context_length = -1 if legacy_context_limit else max_context_length,
                             rope_scaling = rope_scaling,
                             indexer_dtype = getattr(args, "indexer_dtype", "auto"),
+                            indexer_compute_dtype = getattr(args, "indexer_compute_dtype", "auto"),
                             indexer_tp_storage = indexer_storage)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
@@ -2277,6 +2316,12 @@ def make_normal_llm_model(args, startup_progress = None):
                                           min_decode_requests=prefill_min_decode_requests)
             else:
                 model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+        if any(prefill_scheduling.values()):
+            model.set_prefill_scheduling(balance_dp=prefill_scheduling['prefill_dp_balance'],
+                adaptive_requests=prefill_scheduling['prefill_adaptive_requests'],
+                chunked=prefill_scheduling['prefill_chunked'],
+                chunk_max_wait_ms=prefill_scheduling['prefill_chunk_max_wait_ms'],
+                fairness_ms=prefill_scheduling['prefill_fairness_ms'])
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()

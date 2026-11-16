@@ -6,6 +6,8 @@
 #include <cmath>
 #include <fstream>
 #include <future>
+#include <chrono>
+#include <thread>
 #include <iostream>
 #include <stdexcept>
 using namespace fastllm;
@@ -21,7 +23,14 @@ struct Access : DeepSeekV41Model {
     using DeepSeekV41Model::SnapshotState;
     using DeepSeekV41Model::RestoreState;
     using DeepSeekV41Model::GetOrCreateState;
+    using DeepSeekV41Model::GetStateByFirstKey;
+    using DeepSeekV41Model::responseContextDict;
+    using DeepSeekV41Model::RemoveResponseContext;
+    using DeepSeekV41Model::dictLocker;
+    using DeepSeekV41Model::ShutdownRuntime;
     using DeepSeekV41Model::BuildFullDecodeGraph;
+    using DeepSeekV41Model::PrepareServingMemory;
+    using DeepSeekV41Model::PrepareAttentionState;
     static void WarmGraphs(DeepSeekV41Model &model, bool enabled) {
         model.*(&Access::v41CudaGraphWarmingUp) = enabled;
     }
@@ -87,6 +96,9 @@ static void CheckOwnership(const DeepSeekV41RequestState &state, int dp) {
             Require(layer.windowKV.cudaData != nullptr, "missing owner KV allocation");
             for (const Data *data : {&layer.windowKV, &layer.compressedKV, &layer.indexK}) {
                 if (data->dims.empty() || !data->cudaData) continue;
+                if (local.storageLease)
+                    Require(data->isFake && data->isKVCache && data->expansionDims.size() == 3 &&
+                            data->dims[1] <= data->expansionDims[1], "KV detached from its fixed slot");
                 cudaPointerAttributes attrs{};
                 Require(cudaPointerGetAttributes(&attrs, data->cudaData) == cudaSuccess, "invalid KV pointer");
                 Require(attrs.device == device && !data->multiDeviceData, "KV on nonowner GPU");
@@ -163,17 +175,175 @@ static void VerifyRequests(DeepSeekV41Model &model, int dp, std::ofstream &file)
         std::cout << "PASS verify owner=" << owner << " widths=2..8, all accepted prefixes, wrap and snapshots\n";
     }
 }
+static void RequestSlotLifecycle(DeepSeekV41Model &model) {
+    auto &dict = model.*(&Access::responseContextDict);
+    auto context = [&](int id) { return dict.GetHandle(id); };
+    auto state = [&](int id) {
+        return (model.*(&Access::GetStateByFirstKey))(&context(id)->pastKeyValues[0].first);
+    };
+    auto create = [&] {
+        int id = dict.CreateHandle();
+        auto *ctx = context(id);
+        ctx->Init(model.block_cnt, model.dataType, model.kvCacheDataType);
+        ctx->inputTokens = 33; ctx->cacheLen = 16; ctx->curTokens = 2;
+        ctx->resultTokenQueue.push(7); ctx->resultTokenQueue.push(8);
+        model.OnResponseContextCreated(ctx);
+        return id;
+    };
+    auto prepare = [&](int id) {
+        auto s = state(id);
+        (model.*(&Access::PrepareAttentionState))(s);
+        Require(!s->storageLease && s->attentionRanks[0]->storageLease,
+                "admission lease was not transferred to local KV");
+    };
+    auto finish = [&](int id) {
+        auto *ctx = context(id);
+        ctx->isEnding = true;
+        model.OnResponseContextFinished(ctx);
+        model.OnResponseContextFinished(ctx);
+        Require(!state(id), "finished request retained fixed slots");
+        Require(ctx->inputTokens == 33 && ctx->cacheLen == 16 && ctx->curTokens == 2,
+                "retirement changed output statistics");
+    };
+    auto drain = [&](int id) {
+        Require(model.FetchResponseTokens(id) == 7 && model.FetchResponseTokens(id) == 8 &&
+                model.FetchResponseTokens(id) == -1, "retirement lost queued output");
+        Require(!context(id), "drained handle was not removed");
+    };
+    std::vector<int> active;
+    for (int i = 0; i < model.maxBatch; ++i) {
+        int id = create();
+        Require(model.TryAdmitResponseContext(context(id)), "initial slot admission failed");
+        auto reserved = state(id)->storageLease;
+        Require(reserved && model.TryAdmitResponseContext(context(id)) &&
+                reserved == state(id)->storageLease, "admission is not idempotent");
+        auto reset = (model.*(&Access::GetOrCreateState))(context(id)->pastKeyValues, true);
+        Require(reset->storageLease == reserved && reset->attentionGroup >= 0,
+                "fresh prompt reset discarded admission reservation");
+        active.push_back(id);
+    }
+    int pending = create();
+    for (int i = 0; i < 16; ++i)
+        Require(!model.TryAdmitResponseContext(context(pending)), "reserved slots overcommitted");
+    Require(state(pending)->attentionGroup == -1 && !state(pending)->storageLease,
+            "deferred admission changed request ownership");
+    for (int id : active) prepare(id);
+    Require(!model.TryAdmitResponseContext(context(pending)), "materialized slots overcommitted");
+
+    // Reproduce 63 running + one finished-but-undrained + one replacement.
+    finish(active[0]);
+    Require(model.TryAdmitResponseContext(context(pending)), "finished slot was not reusable");
+    prepare(pending); drain(active[0]); active[0] = pending;
+    std::cout << "PASS finished-but-undrained replacement and output preservation\n";
+
+    // An outstanding owner may legitimately retain storage. Admission must
+    // defer rather than trust the number of running requests or abort workers.
+    auto held = state(active[1]);
+    finish(active[1]); pending = create();
+    Require(!model.TryAdmitResponseContext(context(pending)), "outstanding slot owner was ignored");
+    held.reset();
+    Require(model.TryAdmitResponseContext(context(pending)), "released slot remained unavailable");
+    prepare(pending); drain(active[1]); active[1] = pending;
+    std::cout << "PASS physical slot backpressure and retry\n";
+
+    // Cancel a reservation before any GPU materialization; repeated finish
+    // and output-drain callbacks must not double-return its slot.
+    finish(active[2]); drain(active[2]); pending = create();
+    Require(model.TryAdmitResponseContext(context(pending)), "cancel reservation setup");
+    context(pending)->isAbort = true;
+    (model.*(&Access::RemoveResponseContext))(pending);
+    active[2] = create();
+    Require(model.TryAdmitResponseContext(context(active[2])), "cancelled reservation leaked");
+    prepare(active[2]);
+    for (int i = 0; i < 256; ++i) {
+        int &old = active[i % active.size()];
+        finish(old);
+        int next = create();
+        Require(model.TryAdmitResponseContext(context(next)), "rolling admission exhausted slots");
+        prepare(next); drain(old); old = next;
+    }
+    for (int id : active) { finish(id); drain(id); }
+    std::cout << "PASS cancellation and 256 rolling replacements\n";
+
+    // Save the final live prefix before retirement. Reuse the returned slot
+    // and restore that prefix, then compare continuation logits exactly.
+    model.SetSaveHistoryChat(true);
+    int original = create();
+    auto *ctx = context(original);
+    for (int j = 0; j < 33; ++j) ctx->allTokens.push_back((j + 3) * 17 % 123 + 3);
+    Require(model.TryAdmitResponseContext(ctx), "prefix admission failed");
+    auto s = state(original);
+    Step(model, {s}, {33}, 3);
+    model.TryRecordResponseContext(ctx);
+    auto expected = Step(model, {s}, {1}, 77);
+    s.reset();
+    auto prompt = ctx->allTokens; prompt.push_back(999);
+    finish(original); drain(original);
+    int cached = 0;
+    Require(model.TryRestoreHistoryCache(prompt, cached) && cached == 33,
+            "finished request lost its prefix snapshot");
+    int restored = create();
+    Require(model.TryAdmitResponseContext(context(restored)), "restored prefix admission failed");
+    auto actual = Step(model, {state(restored)}, {1}, 77);
+    Require(actual == expected, "retirement or slot reuse changed continuation logits");
+    finish(restored); drain(restored);
+    Require(dict.dicts.empty(), "lifecycle regression left request handles");
+    std::cout << "PASS retired prefix restore: bitwise identical continuation logits\n";
+
+    // Exercise the actual scheduler/consumer boundary, not just callbacks.
+    // Keep all finished handles undrained across four full-capacity waves.
+    model.tokensLimit = 32768;
+    model.eos_token_id = -100;
+    model.eos_token_ids.clear();
+    GenerationConfig config;
+    config.output_token_limit = 2; config.top_k = 1;
+    config.add_special_tokens = false;
+    std::vector<int> undrained;
+    for (int wave = 0; wave < 4; ++wave) {
+        std::vector<int> handles;
+        for (int i = 0; i < model.maxBatch; ++i) {
+            std::vector<int> prompt(33, 3 + i);
+            prompt.back() = 80 + wave;
+            handles.push_back(model.LaunchResponseTokens(prompt, config));
+        }
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        for (;;) {
+            bool done = true;
+            {
+                std::lock_guard<std::mutex> lock(model.*(&Access::dictLocker));
+                for (int id : handles) {
+                    auto *ctx = context(id);
+                    Require(ctx && ctx->error == ResponseContextErrorNone, "scheduler request failed");
+                    done &= ctx->isEnding;
+                }
+            }
+            if (done) break;
+            Require(std::chrono::steady_clock::now() < deadline, "undrained outputs stalled admission");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        undrained.insert(undrained.end(), handles.begin(), handles.end());
+    }
+    for (int id : undrained) {
+        Require(model.FetchResponseTokens(id) >= 0 && model.FetchResponseTokens(id) >= 0 &&
+                model.FetchResponseTokens(id) == -1, "scheduler lost deferred output");
+    }
+    (model.*(&Access::ShutdownRuntime))();
+    std::cout << "PASS real scheduler: 4 x C64 waves, 256 undrained handles, 512 output tokens\n";
+}
+
 int main(int argc, char **argv) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 8) return 77;
     try {
-        Require(argc >= 4 && argc <= 11, "usage: regression FIXTURE_DIR ATTENTION_DP OUTPUT [fp4|fp8] [single-group] [reorder] [sampling] [graph|full-graph] [large-batch] [verify|verify-run]");
+        Require(argc >= 4 && argc <= 11, "usage: regression FIXTURE_DIR ATTENTION_DP OUTPUT [fp4|fp8] [single-group] [reorder] [sampling] [graph|full-graph] [large-batch] [verify|verify-run|reserved|slot-lifecycle]");
         const int dp = std::stoi(argv[2]);
         bool fp4 = false, fp8 = false, singleGroup = false, reorder = false, graph = false, full = false;
-        bool sampling = false, largeBatch = false, verify = false, verifyRun = false;
+        bool sampling = false, largeBatch = false, verify = false, verifyRun = false, reserved = false, lifecycle = false;
         for (int i = 4; i < argc; ++i) {
             const std::string option = argv[i];
-            if (option == "graph") graph = true;
+            if (option == "reserved") reserved = true;
+            else if (option == "slot-lifecycle") lifecycle = reserved = true;
+            else if (option == "graph") graph = true;
             else if (option == "full-graph") full = graph = true;
             else if (option == "fp4") fp4 = true;
             else if (option == "fp8") fp8 = true;
@@ -194,7 +364,56 @@ int main(int argc, char **argv) {
         if (fp4) model.kvCacheDataType = FP4_E2M1;
         if (fp8) model.kvCacheDataType = FP8_E4M3;
         model.ConfigureAttentionParallel(dp);
-        Access::WarmGraphs(model, graph);
+        const std::vector<int> batches = largeBatch ? std::vector<int>{17, 32, 64, 128} :
+                                                     std::vector<int>{1, 3, 9, 32};
+        auto warmFullGraph = [&](int batch) {
+                // Compose only against disposable warmup KV. The real requests
+                // below have different addresses, lengths, and ownership.
+                Access::WarmGraphs(model, true);
+                std::vector<std::shared_ptr<DeepSeekV41RequestState>> warm(batch);
+                for (auto &state : warm) {
+                    state = std::make_shared<DeepSeekV41RequestState>();
+                    if (singleGroup && dp > 1) {
+                        state->attentionGroup = 0;
+                        state->attentionRanks.resize(8 / dp);
+                    }
+                    state->layers.resize(model.block_cnt);
+                }
+                Step(model, warm, std::vector<int>(batch, 33), 0, sampling ? 0 : -1);
+                for (int i = 0; i < 4; ++i) Step(model, warm, std::vector<int>(batch, 1), i, sampling ? 0 : -1);
+                std::vector<DeepSeekV41Segment> segments(batch);
+                for (int i = 0; i < batch; ++i) {
+                    segments[i].state = warm[i]; segments[i].startPos = warm[i]->totalLen;
+                    segments[i].seqlen = 1; segments[i].offset = i;
+                }
+                (model.*(&Access::BuildFullDecodeGraph))(batch, segments, -1, -1);
+                Access::WarmGraphs(model, false);
+        };
+        if (reserved) {
+            Require(dp == 8 && !verify, "reservation fixture requires DP8 without verification");
+            model.maxBatch = 64; model.max_positions = 512;
+            // Direct fixture forwards coalesce several requests beyond the
+            // per-request execution chunk, just like the serving scheduler.
+            Require(model.SetPrefillBatching(8192, 0), "fixture prefill budget");
+            SetGpuMemRatio(.05);
+            {
+                auto warm = std::make_shared<DeepSeekV41RequestState>();
+                warm->layers.resize(model.block_cnt);
+                Step(model, {warm}, {33}, 0);
+            }
+            // Match serving: graph padding is private startup storage, and
+            // must not consume the live request slots installed afterward.
+            if (full) {
+                if (lifecycle) warmFullGraph(model.maxBatch);
+                else for (int batch : batches) warmFullGraph(batch);
+            }
+            (model.*(&Access::PrepareServingMemory))();
+        }
+        Access::WarmGraphs(model, graph && !full);
+        if (lifecycle) {
+            RequestSlotLifecycle(model);
+            return 0;
+        }
         std::ofstream file(argv[3], std::ios::binary);
         if (verify) {
             // Initialize CUDA libraries with the requested graph policy, as
@@ -221,32 +440,8 @@ int main(int argc, char **argv) {
             }
             return 0;
         }
-        const std::vector<int> batches = largeBatch ? std::vector<int>{17, 32, 64, 128} :
-                                                     std::vector<int>{1, 3, 9, 32};
         for (int batch : batches) {
-            if (full) {
-                // Compose only against disposable warmup KV. The real requests
-                // below have different addresses, lengths, and ownership.
-                Access::WarmGraphs(model, true);
-                std::vector<std::shared_ptr<DeepSeekV41RequestState>> warm(batch);
-                for (auto &state : warm) {
-                    state = std::make_shared<DeepSeekV41RequestState>();
-                    if (singleGroup && dp > 1) {
-                        state->attentionGroup = 0;
-                        state->attentionRanks.resize(8 / dp);
-                    }
-                    state->layers.resize(model.block_cnt);
-                }
-                Step(model, warm, std::vector<int>(batch, 33), 0, sampling ? 0 : -1);
-                for (int i = 0; i < 4; ++i) Step(model, warm, std::vector<int>(batch, 1), i, sampling ? 0 : -1);
-                std::vector<DeepSeekV41Segment> segments(batch);
-                for (int i = 0; i < batch; ++i) {
-                    segments[i].state = warm[i]; segments[i].startPos = warm[i]->totalLen;
-                    segments[i].seqlen = 1; segments[i].offset = i;
-                }
-                (model.*(&Access::BuildFullDecodeGraph))(batch, segments, -1, -1);
-                Access::WarmGraphs(model, false);
-            }
+            if (full && !reserved) warmFullGraph(batch);
             // Service warmup and serving run on different host threads. The
             // sampling mode also avoids priming a full-logit gather in warmup.
             auto exerciseRequests = [&] {

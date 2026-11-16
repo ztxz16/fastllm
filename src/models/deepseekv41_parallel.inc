@@ -21,6 +21,7 @@ struct DeepSeekV41Model::AttentionParallel {
         if (local) return local;
         auto restored = std::make_shared<DeepSeekV41RequestState>();
         restored->layers.resize(models[rank]->block_cnt);
+        models[rank]->PrepareRequestStorage(restored, std::move(state->storageLease));
         restored->totalLen = state->totalLen;
         if (state->totalLen) {
             for (int layer = 0; layer < models[rank]->block_cnt; ++layer) {
@@ -30,6 +31,10 @@ struct DeepSeekV41Model::AttentionParallel {
                 dest.compressedBlocks = source.compressedBlocks;
                 dest.rawTail = source.rawTail;
                 auto restore = [&](Data &target, const Data &value) {
+                    if (target.isFake) {
+                        if (!value.dims.empty() && value.Count(0)) V41Assign(target, value, {});
+                        return;
+                    }
                     V41RestoreTensor(target, value);
                     if (!target.dims.empty() && target.Count(0))
                         target.ToDevice(CUDA, std::vector<int>{device});
@@ -44,8 +49,17 @@ struct DeepSeekV41Model::AttentionParallel {
         local = std::move(restored);
         return local;
     }
-    int Place(const std::shared_ptr<DeepSeekV41RequestState> &state, int maxPerGroup = 0) {
-        if (state->attentionGroup >= 0) return state->attentionGroup;
+    int Place(const std::shared_ptr<DeepSeekV41RequestState> &state, int maxPerGroup = 0,
+              bool reserveSlot = false) {
+        if (state->attentionGroup >= 0) {
+            if (reserveSlot && !state->storageLease &&
+                std::none_of(state->attentionRanks.begin(), state->attentionRanks.end(),
+                    [](const auto &rank) { return bool(rank); })) {
+                state->storageLease = models[state->attentionGroup * runtime.Layout().attentionTP]->ReserveRequestStorage();
+                if (!state->storageLease) return -1;
+            }
+            return state->attentionGroup;
+        }
         const int groups = runtime.Layout().attentionDP;
         std::vector<uint64_t> loads(groups, 0);
         std::vector<int> counts(groups, 0);
@@ -60,11 +74,18 @@ struct DeepSeekV41Model::AttentionParallel {
         // Context-length balancing alone can pack many short requests into
         // one group, exceeding the warmed local graph's row capacity. Prefer
         // groups within the serving row budget, then balance their KV load.
-        int owner = 0;
-        for (int group = 1; group < groups; ++group) {
+        int owner = -1;
+        for (int group = 0; group < groups; ++group) {
+            if (reserveSlot && !models[group * runtime.Layout().attentionTP]->HasFreeRequestStorage()) continue;
+            if (owner < 0) { owner = group; continue; }
             const bool full = maxPerGroup > 0 && counts[group] >= maxPerGroup;
             const bool ownerFull = maxPerGroup > 0 && counts[owner] >= maxPerGroup;
             if (full != ownerFull ? !full : loads[group] < loads[owner]) owner = group;
+        }
+        if (owner < 0) return -1;
+        if (reserveSlot) {
+            state->storageLease = models[owner * runtime.Layout().attentionTP]->ReserveRequestStorage();
+            if (!state->storageLease) return -1;
         }
         state->attentionGroup = owner;
         state->attentionRanks.resize(runtime.Layout().attentionTP);
@@ -281,6 +302,14 @@ void DeepSeekV41Model::PrepareAttentionParallel() {
         // splitter replicas would duplicate every attention weight on GPU.
         V41ResetMultiDevice(source);
         source.FreeSpace();
+    }
+    if (!v41DsparkEnabled && topology.attentionTP == 1 && maxBatch > 0 && max_positions > 0) {
+        // Fixed-count AllGather pads every DP group to the busiest group.
+        // Prefill rows may all belong to one owner, even with balanced decode.
+        // Reserve before warmup captures addresses and before budgeting KV.
+        const size_t rows = std::max(maxBatch, GetBatchedPrefillTokenLimit());
+        const size_t rowBytes = size_t(embed_dim) * 2 + (2 * hc_mult + hc_mult * hc_mult) * 4;
+        state->Transfer(parallel::RowPartition(topology.attentionDP, {})).ReserveFixed(rows, rowBytes);
     }
     printf("[parallel] world=%d attention_dp=%d attention_tp=%d moe_ep=%d moe_tp=1; fixed GPU workers\n",
         topology.Size(), topology.attentionDP, topology.attentionTP, topology.Size());

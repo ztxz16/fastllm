@@ -66,17 +66,26 @@ static void Case(int rows, int past, int heads, bool fp8, int pageLen, bool sink
     original<<<dim3(rows, heads / 8), 256, sizeof(Storage<128>)>>>(q.data, key, value, nullptr,
                                                                    sink ? bias.data : nullptr, a.data, heads, kvHeads,
                                                                    stride, keys, 128, past, true, 0);
-    SwaQueryTile<Q><<<dim3((rows + Q - 1) / Q, heads / 8), 256, sizeof(SwaQueryStorage<Q>)>>>(
-        q.data, key, value, sink ? bias.data : nullptr, b.data, rows, heads, kvHeads, stride, keys, past);
-    Check(cudaGetLastError());
-    Check(cudaDeviceSynchronize());
-    std::vector<unsigned short> ref(n), actual(n);
-    Check(cudaMemcpy(ref.data(), a.data, n * 2, cudaMemcpyDeviceToHost));
-    Check(cudaMemcpy(actual.data(), b.data, n * 2, cudaMemcpyDeviceToHost));
-    if (ref != actual)
-        throw std::runtime_error("SWA query reuse differs from original BF16 output");
-    printf("rows=%d past=%d heads=%d fp8=%d page=%d sink=%d offset=%d exact=%zu\n", rows, past, heads, fp8, pageLen,
-           sink, offset, n);
+    for (bool registers : {false, true}) {
+        if (registers) {
+            Check(cudaFuncSetAttribute(SwaRegisterTile<8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       sizeof(SwaRegisterStorage<8>)));
+            SwaRegisterTile<8><<<dim3((rows + 7) / 8, heads / 8), 256, sizeof(SwaRegisterStorage<8>)>>>(
+                q.data, key, value, sink ? bias.data : nullptr, b.data, rows, heads, kvHeads, stride, keys, past);
+        } else {
+            SwaQueryTile<Q><<<dim3((rows + Q - 1) / Q, heads / 8), 256, sizeof(SwaQueryStorage<Q>)>>>(
+                q.data, key, value, sink ? bias.data : nullptr, b.data, rows, heads, kvHeads, stride, keys, past);
+        }
+        Check(cudaGetLastError());
+        Check(cudaDeviceSynchronize());
+        std::vector<unsigned short> ref(n), actual(n);
+        Check(cudaMemcpy(ref.data(), a.data, n * 2, cudaMemcpyDeviceToHost));
+        Check(cudaMemcpy(actual.data(), b.data, n * 2, cudaMemcpyDeviceToHost));
+        if (ref != actual)
+            throw std::runtime_error("SWA query reuse differs from original BF16 output");
+        printf("rows=%d past=%d heads=%d fp8=%d page=%d sink=%d offset=%d exact=%zu\n", rows, past, heads, fp8, pageLen,
+               sink, offset, n);
+    }
 }
 template<bool FP8> static void RingCase(int requests, int width, int heads) {
     using namespace naive_prefill_mma;
@@ -198,6 +207,7 @@ int main() {
             Case(129, 198975, 16, fp8, 128, true, false);
             Case(1025, 77952, 16, fp8, 64, false, true);
             Case(4147, 82944, 16, fp8, 0, true, false);
+            Case(2051, 127, 32, fp8, 30, true, true);
         }
         puts("PASS: exact SWA query reuse");
         return 0;

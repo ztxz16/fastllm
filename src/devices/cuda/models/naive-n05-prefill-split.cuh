@@ -21,25 +21,27 @@ template <int Max> __global__ void SplitNormalize(BF *prob, const float *sink, i
 template <int Max, int Window, int Groups>
 __global__ __launch_bounds__(256) void SplitQK(const BF *q, FastllmNaiveKV key, const int *indices, BF *out, int heads,
                                                int kvHeads, int stride, int keys, int count, int past, bool causal,
-                                               int indexTile = 0) {
+                                               int indexTile = 0, int queryOffset = 0, int queryRows = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_attention_bulk;
     constexpr int Tile = QKStorage<Groups>::Tile, Threads = 256;
     extern __shared__ __align__(16) char buffer[];
     auto &s = *(QKStorage<Groups> *)buffer;
     int row = blockIdx.x, head = blockIdx.y * (Groups * 8), kh = head / (heads / kvHeads);
-    int indexRow = row;
+    const int globalRow = row + queryOffset;
+    const int totalRows = queryRows ? queryRows : gridDim.x;
+    int indexRow = globalRow;
     if (indexTile) {
-        int rank = min(row, (int)gridDim.x - 1 - row) / indexTile;
-        indexRow = (2 * rank + (row >= gridDim.x / 2)) * indexTile + row % indexTile;
+        int rank = min(globalRow, totalRows - 1 - globalRow) / indexTile;
+        indexRow = (2 * rank + (globalRow >= totalRows / 2)) * indexTile + globalRow % indexTile;
     }
     int t = threadIdx.x, l = t % 32, w = t / 32;
     for (int i = t; i < Groups * 8 * 24; i += Threads)
         *(uint4 *)&s.qs[i / 24][i % 24 * 8] =
-            *(const uint4 *)(q + ((size_t)row * heads + head + i / 24) * 192 + i % 24 * 8);
+            *(const uint4 *)(q + ((size_t)globalRow * heads + head + i / 24) * 192 + i % 24 * 8);
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
     for (int first = 0; first < count; first += Tile) {
-        Load<192, 200, Tile, Threads, Window>(s.keys, s.selected, key, indices, row, first, count, keys, past, causal,
+        Load<192, 200, Tile, Threads, Window>(s.keys, s.selected, key, indices, globalRow, first, count, keys, past, causal,
                                               stride, kh, indexRow);
         asm volatile("cp.async.wait_group 0;" ::: "memory");
         __syncthreads();
@@ -71,22 +73,24 @@ __global__ __launch_bounds__(256) void SplitQK(const BF *q, FastllmNaiveKV key, 
 template <int Max, int Window, int Groups>
 __global__ __launch_bounds__(256) void SplitPV(const BF *probabilities, FastllmNaiveKV value, const int *indices,
                                                BF *out, int heads, int kvHeads, int keys, int count, int past,
-                                               bool causal, int indexTile = 0) {
+                                               bool causal, int indexTile = 0, int queryOffset = 0, int queryRows = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_attention_bulk;
     constexpr int Tile = PVStorage<Groups>::Tile, Threads = 256;
     extern __shared__ __align__(16) char buffer[];
     auto &s = *(PVStorage<Groups> *)buffer;
     int row = blockIdx.x, head = blockIdx.y * (Groups * 8), kh = head / (heads / kvHeads);
-    int indexRow = row;
+    const int globalRow = row + queryOffset;
+    const int totalRows = queryRows ? queryRows : gridDim.x;
+    int indexRow = globalRow;
     if (indexTile) {
-        int rank = min(row, (int)gridDim.x - 1 - row) / indexTile;
-        indexRow = (2 * rank + (row >= gridDim.x / 2)) * indexTile + row % indexTile;
+        int rank = min(globalRow, totalRows - 1 - globalRow) / indexTile;
+        indexRow = (2 * rank + (globalRow >= totalRows / 2)) * indexTile + globalRow % indexTile;
     }
     int t = threadIdx.x, l = t % 32, w = t / 32;
     float acc[Groups][4] = {};
     for (int first = 0; first < count; first += Tile) {
-        Load<128, 136, Tile, Threads, Window>(s.values, s.selected, value, indices, row, first, count, keys, past,
+        Load<128, 136, Tile, Threads, Window>(s.values, s.selected, value, indices, globalRow, first, count, keys, past,
                                               causal, kvHeads * 128, kh, indexRow);
         // Keep the normalized BF16 values produced by SplitNormalize.
         for (int i = t; i < Groups * 8 * (Tile / 8); i += Threads) {
@@ -113,7 +117,7 @@ __global__ __launch_bounds__(256) void SplitPV(const BF *probabilities, FastllmN
     for (int g = 0; g < Groups; ++g) {
 #pragma unroll
         for (int i = 0; i < 4; ++i)
-            out[((size_t)row * heads + head + g * 8 + (l % 4) * 2 + i % 2) * 128 + w * 16 + l / 4 + (i / 2) * 8] =
+            out[((size_t)globalRow * heads + head + g * 8 + (l % 4) * 2 + i % 2) * 128 + w * 16 + l / 4 + (i / 2) * 8] =
                 __float2bfloat16(acc[g][i]);
     }
 #endif

@@ -7,6 +7,63 @@
 
 面向自动化 agent 的 `--auto` 启动、参数覆盖和验收流程见 [模型部署速查](model-deployment-agent.md)。
 
+## 模型与权重格式
+
+本页覆盖 DeepSeek-V4.1-Flash 1017。DeepSeek-V4 / V4-Flash 使用[单独的部署路径](deepseek.md)，其参数不能直接照搬。
+
+| 模型 / 格式 | 传给 `ftllm server` 的路径 | 必须保留的文件 |
+| --- | --- | --- |
+| 原始 HF checkpoint | 模型目录 | 配置、分词器、Safetensors 索引与全部权重分片；原始权重已包含 FP8 / FP4 |
+| GSQ-RCO GGUF | 单文件或第一分片 `.gguf` | 同一导出的完整主干与匹配 Engram；内置配置和分词器时不需要 `--ori` |
+| Unsloth GGUF 系列 | 所选量化版本的第一分片 `.gguf` | 全部分片，包括 Engram 所在分片；外置 DSpark / mmproj 按需另行准备 |
+| EXL3 | 模型目录 | EXL3 配置、分词器、Safetensors 索引与全套量化 / 非量化权重 |
+
+这些格式可沿用 `--auto` 进行设备与内存规划。CPU/NUMA 专家、GPU 专家缓存和多卡的具体路径由模型、格式、硬件与预算决定；自动规划不保证任何机器都能装下模型。Engram 的存储与专家设备分开配置，量化主干文件大小不能直接当作整机内存需求。
+
+### Unsloth GGUF 模型
+
+当前支持的 Dynamic V3.1 系列包括 IQ1_S、IQ1_M、IQ2_XXS、Q2_K_XL、IQ3_XXS、IQ3_S、Q3_K_XL、Q4_K_XL、Q8_K_XL。这里的名称表示整套混合量化方案，各张量与 Engram 可以使用不同格式。下载时应保留同一版本的所有分片，不要混用不同量化仓库的 Engram 或只取专家权重。
+
+```sh
+ftllm server /path/to/DeepSeek-V4.1-Flash-1017-IQ2_XXS-00001-of-00004.gguf \
+  --auto --model_name deepseek-v4.1-flash --port 8080
+```
+
+文件名和分片数以实际下载内容为准。需要推测解码时加入同版本草稿：
+
+```sh
+ftllm server /path/to/model-00001-of-00004.gguf --auto \
+  --draft /path/to/dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf --dspark 5
+```
+
+图像输入另需匹配的 `--mmproj` 和视觉路由偏置；仅加载文本 GGUF 不会自动获得视觉或草稿能力。见[外置 GGUF 草稿与视觉模块](#外置-gguf-草稿与视觉模块)。
+
+### EXL3 模型
+
+EXL3 是压缩权重格式，直接选择已经量化好的模型目录，无需额外安装 ExLlamaV3 或 Maya 运行时，也不需要先转成 GGUF：
+
+```sh
+ftllm server /path/to/DeepSeek-V4.1-Flash-EXL3 --auto \
+  --model_name deepseek-v4.1-flash --port 8080
+```
+
+保留发布仓库中的 EXL3 量化配置和全套文件；不要通过改名或添加配置把普通 Safetensors 当作 EXL3。加载器校验 trellis、缩放和码本标记，拒绝不支持的布局。启动日志中的 `EXL3: ... logical projections` 表示已识别压缩投影。
+
+EXL3 支持 CPU/NUMA 专家、GPU 专家缓存及已适配的 CUDA 投影 / MoE 路径，保留通用回退。`--kernel-tune` 沿用统一算子选择，见[EXL3 算子策略](kernel-policy.md#exl3-投影)。本格式接入不代表所有 EXL3 模型架构均已支持；也不代表在加载时将原始模型量化成 EXL3。
+
+### 功能与可选权重
+
+| 功能 | 条件与入口 |
+| --- | --- |
+| 文本对话、工具调用、前缀复用 | 使用模型原始配置、分词器与自动 parser；前缀缓存见[多请求与前缀缓存](#多请求与前缀缓存) |
+| 单卡混合推理与专家缓存 | 从 `--auto` 开始；显式预算、chunk 和 `--moe_cuda_cache` 可覆盖自动值 |
+| 多卡 TP | `--tp 2` / `4` / `8`，设备布局与限制见[张量并行](#张量并行) |
+| DSpark | 内置 `mtp.*` 或匹配外置草稿；`--dspark N` 控制候选数，非所有 GGUF 都自带草稿 |
+| 多请求 DSpark | 支持合批验证；草稿合批需满足设备、采样和后端条件，见[多请求草稿合批](#多请求草稿合批) |
+| 图像理解 | 原始视觉组件或匹配 `--mmproj`，并保留视觉路由偏置；图文请求当前不投机 |
+
+DeepSeek 的图像输入用于理解图片。生成图片 / 视频请使用[专用生成模型](image-video.md)。
+
 ## 自动配置（推荐）
 
 Linux NVIDIA CUDA 环境下，完整 HF 目录直接使用：
@@ -111,10 +168,7 @@ GGUF Engram 支持 `IQ4_NL`、`Q5_K`、`Q6_K` 和 `MXFP8` 压缩行；加载时�
 - DSpark 投机解码（`mtp.*` 草稿层），详见下文"DSpark 投机解码"。
 - 张量并行（`--tp 2`、`--tp 4`、`--tp 8`），详见下文"张量并行"。
 
-尚未实现：
-
-- 视觉编码器与 DSpark 草稿层的张量并行及 CUDA Graph；主干 decode / DSpark 校验已支持分段图；
-- DSpark 与批量 decode 的组合（批内不产生候选，只保持草稿缓存同步）、DSpark 与图文请求的组合。
+多请求支持 DSpark 合批验证；单 CUDA 设备上的兼容请求还支持合批草稿与完整草稿图。TP 草稿保留独立执行路径，完整图支持按布局、形状和后端能力判断，不支持时回退；详见[草稿合批](#多请求草稿合批)和[限制](#限制)。视觉编码器尚未接入张量并行及 CUDA Graph，图文请求不使用推测解码。
 
 ## Engram 元数据
 

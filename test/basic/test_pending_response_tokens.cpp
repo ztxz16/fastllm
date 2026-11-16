@@ -90,7 +90,7 @@ public:
 int main() {
     try {
         SetDeviceMap({{"cpu", 1}}); SetMaxTokens(0); SetThreads(2);
-        for (bool fastInput : {false, true}) for (int width : {1, 3, 5, 7})
+        for (bool batchOutput : {false, true}) for (bool fastInput : {false, true}) for (int width : {1, 3, 5, 7})
         for (int concurrency : {1, 4, 16, 128}) {
             Fixture model(width, fastInput, concurrency);
             for (int mode : {0, 1, 2}) {
@@ -108,9 +108,29 @@ int main() {
                 }
                 auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
                 int remaining = concurrency;
+                uint64_t outputVersion = 0;
+                std::vector<uint64_t> generations;
+                for (int handle : handles) generations.push_back(model.GetResponseGeneration(handle));
+                std::vector<int> batchTokens(concurrency * 3), batchRecords(concurrency * 7);
                 while (remaining) {
                     Check(std::chrono::steady_clock::now() < deadline, "scheduler stalled");
-                    for (int i = 0; i < concurrency; ++i) if (!done[i] && model.CanFetchResponse(handles[i])) {
+                    if (batchOutput) {
+                        int ready = model.FetchResponses(handles.data(), generations.data(), concurrency, 3,
+                            batchTokens.data(), batchTokens.size(), batchRecords.data(), concurrency, 0, outputVersion);
+                        Check(ready >= 0, "batch output failed");
+                        for (int r = 0; r < ready; ++r) {
+                            const int *record = batchRecords.data() + r * 7;
+                            const int i = record[0];
+                            if (done[i]) continue;
+                            for (int j = 0; j < record[2]; ++j)
+                                Check(batchTokens[record[1]+j] == 10 + counts[i]++, "batch output sequence differs");
+                            if (record[3]) {
+                                Check(record[3] == -1 && counts[i] == limits[i], "batch output stop/limit differs");
+                                Check(record[6] == limits[i], "batch terminal statistics differ");
+                                done[i] = 1; --remaining;
+                            }
+                        }
+                    } else for (int i = 0; i < concurrency; ++i) if (!done[i] && model.CanFetchResponse(handles[i])) {
                         int tokens[64], statistics[3];
                         int count = model.FetchResponseTokensBatch(handles[i], tokens, 64, statistics);
                         for (int j = 0; j < count; ++j) Check(tokens[j] == 10 + counts[i]++, "emitted token sequence differs");

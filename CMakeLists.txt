@@ -5,6 +5,7 @@ project(fastllm LANGUAGES CXX)
 option(USE_NUMAS "use numas" ON)
 
 option(USE_CUDA "use CUDA" OFF)
+option(FASTLLM_LLM_CUDA_PTX "Include PTX fallback in LLM CUDA targets" ON)
 option(CUDA_NO_TENSOR_CORE "Optimize for legacy CUDA GPUs which has Tensor Core." OFF)
 option(CUDA_MEM_DEBUG "Enable CUDA memory pool debug logging" OFF)
 
@@ -286,19 +287,20 @@ if (USE_CUDA)
     add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
     if (CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
         # Preserve legacy compression for normal builds; wheel releases opt in
-        # to CUDA 12.4+ compression. All cubins and PTX are retained.
+        # to CUDA 12.4+ compression. Compression itself retains all images.
         set(FASTLLM_CUDA_COMPRESSION "legacy" CACHE STRING "CUDA fatbinary compression mode")
         set_property(CACHE FASTLLM_CUDA_COMPRESSION PROPERTY STRINGS legacy size speed balance default none)
         if (FASTLLM_CUDA_COMPRESSION STREQUAL "legacy")
-            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xfatbin=-compress-all>)
+            set(FASTLLM_CUDA_COMPRESSION_OPTION "-Xfatbin=-compress-all")
         elseif (FASTLLM_CUDA_COMPRESSION MATCHES "^(size|speed|balance|default|none)$")
             if (CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
                 message(FATAL_ERROR "FASTLLM_CUDA_COMPRESSION requires CUDA 12.8+; use legacy with older compilers")
             endif()
-            add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--compress-mode=${FASTLLM_CUDA_COMPRESSION}>)
+            set(FASTLLM_CUDA_COMPRESSION_OPTION "--compress-mode=${FASTLLM_CUDA_COMPRESSION}")
         else()
             message(FATAL_ERROR "Unknown FASTLLM_CUDA_COMPRESSION: ${FASTLLM_CUDA_COMPRESSION}")
         endif()
+        add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:${FASTLLM_CUDA_COMPRESSION_OPTION}>)
     endif()
     set(FASTLLM_CUDA_ARCHITECTURES ${CUDA_ARCH})
     if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
@@ -517,8 +519,10 @@ if (USE_CUDA)
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
         set(FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/linear/fastllm-linear-fp8-sm90.cu
-            src/devices/cuda/linear/fastllm-linear-fp8-decode-sm90.cu)
+            src/devices/cuda/linear/fastllm-linear-fp8-decode-sm90.cu
+            src/devices/cuda/linear/fastllm-linear-fp8-perchannel-sm90.cu)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
+            src/devices/cuda/linear/fastllm-linear-fp8.cu
             src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DEEPGEMM_FP8_SM90)
         message(STATUS "Hopper SM90 DeepGEMM FP8 linear: ON")
@@ -692,6 +696,22 @@ if(BUILD_MINIMAX_H3)
     add_subdirectory(src/models/minimax_h3)
 endif()
 
+# Media targets above keep their own PTX policy: some use PTX to cover GPUs
+# beyond their single native target. Only the LLM targets below opt out.
+set(FASTLLM_LLM_CUDA_ARCH_SUFFIX "")
+if(USE_CUDA AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND NOT FASTLLM_LLM_CUDA_PTX)
+    set(CMAKE_CUDA_ARCHITECTURES "")
+    foreach(arch IN LISTS FASTLLM_CUDA_ARCHITECTURES)
+        if(NOT arch MATCHES "^([0-9]+[af]?)(-real)?$")
+            message(FATAL_ERROR
+                "FASTLLM_LLM_CUDA_PTX=OFF requires explicit native architectures; "
+                "enable PTX for '${arch}'")
+        endif()
+        list(APPEND CMAKE_CUDA_ARCHITECTURES "${CMAKE_MATCH_1}-real")
+    endforeach()
+    set(FASTLLM_LLM_CUDA_ARCH_SUFFIX "-real")
+endif()
+
 if(USE_ROCM)
     list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/third_party/hipify_torch/cmake")
     include(Hipify)
@@ -791,7 +811,7 @@ endif()
 if (FASTLLM_CUDA_SM90_SOURCES)
     add_library(fastllm_cuda_sm90 OBJECT ${FASTLLM_CUDA_SM90_SOURCES})
     set_target_properties(fastllm_cuda_sm90 PROPERTIES
-        CUDA_ARCHITECTURES "90a" POSITION_INDEPENDENT_CODE ON)
+        CUDA_ARCHITECTURES "90a${FASTLLM_LLM_CUDA_ARCH_SUFFIX}" POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_cuda_sm90 BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/trtllm_deep_gemm/include"
@@ -806,7 +826,7 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     # object target so nvcc sees only compute_120f for these translation units.
     add_library(fastllm_cuda_sm120 OBJECT ${FASTLLM_CUDA_SM120_SOURCES})
     set_target_properties(fastllm_cuda_sm120 PROPERTIES
-        CUDA_ARCHITECTURES "120f"
+        CUDA_ARCHITECTURES "120f${FASTLLM_LLM_CUDA_ARCH_SUFFIX}"
         POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_cuda_sm120 BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
@@ -818,7 +838,7 @@ if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     add_library(fastllm_mimo_ep8_mega OBJECT
         src/devices/cuda/moe/fastllm-mimo-ep8-mega.cu)
     set_target_properties(fastllm_mimo_ep8_mega PROPERTIES
-        CUDA_ARCHITECTURES "90a" CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+        CUDA_ARCHITECTURES "90a${FASTLLM_LLM_CUDA_ARCH_SUFFIX}" CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_mimo_ep8_mega BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_ep8/include"
         "${FASTLLM_CUTLASS_DIR}/include")
@@ -967,6 +987,11 @@ if (UNIT_TEST)
     target_link_libraries(alive_thread_pool_test PRIVATE Threads::Threads)
     add_test(NAME alive_thread_pool COMMAND alive_thread_pool_test)
     set_tests_properties(alive_thread_pool PROPERTIES TIMEOUT 30)
+    add_executable(response_output_batch_test test/basic/test_response_output_batch.cpp)
+    target_link_libraries(response_output_batch_test PRIVATE fastllm)
+    add_test(NAME response_output_batch COMMAND response_output_batch_test)
+    set_tests_properties(response_output_batch PROPERTIES TIMEOUT 30)
+
     add_executable(response_statistics_test test/basic/test_response_statistics.cpp)
     target_link_libraries(response_statistics_test PRIVATE fastllm)
     add_test(NAME response_statistics COMMAND response_statistics_test)
@@ -1451,6 +1476,11 @@ if (UNIT_TEST)
     target_link_libraries(prefill_batch_scheduler_test PRIVATE fastllm)
     fastllm_add_checked_test(prefill_batch_scheduler prefill_batch_scheduler_test "ALL_PASS" 30)
     set_tests_properties(prefill_batch_scheduler PROPERTIES RUN_SERIAL TRUE)
+
+    add_executable(naive_prefix_queue_test test/basic/test_naive_prefix_queue.cpp)
+    target_link_libraries(naive_prefix_queue_test PRIVATE fastllm)
+    fastllm_add_checked_test(naive_prefix_queue naive_prefix_queue_test "ALL_PASS" 30)
+    set_tests_properties(naive_prefix_queue PROPERTIES RUN_SERIAL TRUE)
 
     add_executable(pending_response_tokens_test test/basic/test_pending_response_tokens.cpp)
     target_link_libraries(pending_response_tokens_test PRIVATE fastllm)
@@ -2219,6 +2249,21 @@ if (UNIT_TEST)
             endif()
         endif()
 
+        if (FASTLLM_CUDA_SM90_SOURCES)
+            add_executable(naive_n05_indexer_fp8_test test/basic/test_naive_n05_indexer_fp8.cu)
+            target_link_libraries(naive_n05_indexer_fp8_test PRIVATE fastllm)
+            add_test(NAME naive_n05_indexer_fp8 COMMAND naive_n05_indexer_fp8_test)
+            set_tests_properties(naive_n05_indexer_fp8 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
+
+        # The native BF16-input FP8 backend is compiled with CUDA 12.8+.
+        if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+            add_executable(cuda_fp8_bf16_prefill_test test/basic/test_cuda_fp8_bf16_prefill.cu)
+            target_link_libraries(cuda_fp8_bf16_prefill_test PRIVATE fastllm)
+            add_test(NAME cuda_fp8_bf16_prefill COMMAND cuda_fp8_bf16_prefill_test)
+            set_tests_properties(cuda_fp8_bf16_prefill PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        endif()
+
         add_executable(cuda_fp8_cache_tp_test test/basic/test_cuda_fp8_cache_tp.cpp)
         target_link_libraries(cuda_fp8_cache_tp_test PRIVATE fastllm Threads::Threads)
         target_include_directories(cuda_fp8_cache_tp_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2294,11 +2339,28 @@ if (UNIT_TEST)
                                  LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
         endif()
 
+        add_executable(cuda_memory_reservation_test test/basic/test_cuda_memory_reservation.cpp)
+        target_link_libraries(cuda_memory_reservation_test PRIVATE fastllm)
+        target_include_directories(cuda_memory_reservation_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(cuda_memory_reservation cuda_memory_reservation_test "PASS: CUDA memory reservation" 180)
+        set_tests_properties(cuda_memory_reservation PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
         add_executable(cuda_graph_workspace_test test/basic/test_cuda_graph_workspace.cpp)
         target_link_libraries(cuda_graph_workspace_test PRIVATE fastllm)
         target_include_directories(cuda_graph_workspace_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         fastllm_add_checked_test(cuda_graph_workspace cuda_graph_workspace_test "PASS: graph workspace" 180)
         set_tests_properties(cuda_graph_workspace PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+        fastllm_add_checked_test(cuda_graph_workspace_reserved cuda_graph_workspace_test "PASS: graph workspace" 180 --reservation)
+        set_tests_properties(cuda_graph_workspace_reserved PROPERTIES LABELS cuda RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+
+        if (UNIX AND NOT APPLE AND NOT USE_ROCM)
+            add_executable(cuda_graph_oom_test test/basic/test_cuda_graph_oom.cpp)
+            target_link_libraries(cuda_graph_oom_test PRIVATE fastllm)
+            target_include_directories(cuda_graph_oom_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_link_options(cuda_graph_oom_test PRIVATE "-Wl,--wrap=cudaGraphInstantiate")
+            fastllm_add_checked_test(cuda_graph_oom cuda_graph_oom_test "PASS: graph OOM" 180)
+            set_tests_properties(cuda_graph_oom PROPERTIES LABELS "cuda;multigpu" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+        endif()
 
         add_executable(cuda_masked_attention_test test/basic/test_cuda_masked_attention.cpp)
         target_link_libraries(cuda_masked_attention_test PRIVATE fastllm)
@@ -2413,6 +2475,57 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_tp_model COMMAND naive_n05_tp_model_test)
         add_test(NAME naive_n05_tp_model_2 COMMAND naive_n05_tp_model_test 2)
         add_test(NAME naive_n05_tp_model_4 COMMAND naive_n05_tp_model_test 4)
+        foreach(NAIVE_DP_WORLD 4 8)
+            foreach(NAIVE_DP_GROUPS 2 4)
+                foreach(NAIVE_DP_KV bf16 fp8)
+                    foreach(NAIVE_DP_MODE attention_dp attention_dp_verify attention_dp_pool)
+                        add_test(NAME naive_n05_${NAIVE_DP_MODE}_${NAIVE_DP_WORLD}_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                            COMMAND naive_n05_tp_model_test ${NAIVE_DP_WORLD} ${NAIVE_DP_MODE} ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})
+                        set_tests_properties(naive_n05_${NAIVE_DP_MODE}_${NAIVE_DP_WORLD}_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                            PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+                    endforeach()
+                endforeach()
+            endforeach()
+        endforeach()
+        foreach(NAIVE_RESTART_DP 1 2 8)
+            foreach(NAIVE_RESTART_KV bf16 fp8)
+                add_test(NAME naive_n05_paged_cache_restart_${NAIVE_RESTART_DP}_${NAIVE_RESTART_KV}
+                    COMMAND naive_n05_tp_model_test 8 paged_cache_restart ${NAIVE_RESTART_DP} ${NAIVE_RESTART_KV})
+                set_tests_properties(naive_n05_paged_cache_restart_${NAIVE_RESTART_DP}_${NAIVE_RESTART_KV}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "PAGED CACHE RESTART PASS")
+            endforeach()
+        endforeach()
+        foreach(NAIVE_DP_EXTRA indexer kvmem admission prefix)
+            if(NAIVE_DP_EXTRA STREQUAL "indexer" OR NAIVE_DP_EXTRA STREQUAL "kvmem")
+                set(NAIVE_DP_VARIANTS eager graph)
+            elseif(NAIVE_DP_EXTRA STREQUAL "admission")
+                set(NAIVE_DP_VARIANTS single batch chunked)
+            else()
+                set(NAIVE_DP_VARIANTS plain draft)
+            endif()
+            foreach(NAIVE_DP_VARIANT ${NAIVE_DP_VARIANTS})
+                add_test(NAME naive_n05_attention_dp_${NAIVE_DP_EXTRA}_${NAIVE_DP_VARIANT}
+                    COMMAND naive_n05_tp_model_test 8 attention_dp_${NAIVE_DP_EXTRA} 2 ${NAIVE_DP_VARIANT})
+                set_tests_properties(naive_n05_attention_dp_${NAIVE_DP_EXTRA}_${NAIVE_DP_VARIANT}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+            endforeach()
+        endforeach()
+        add_test(NAME naive_n05_attention_dp_8_8 COMMAND naive_n05_tp_model_test 8 attention_dp 8 fp8)
+        set_tests_properties(naive_n05_attention_dp_8_8
+            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+        foreach(NAIVE_DP_DRAFT 3 5 7)
+            foreach(NAIVE_DP_SAMPLING greedy sample)
+                add_test(NAME naive_n05_attention_dp_dspark_${NAIVE_DP_DRAFT}_${NAIVE_DP_SAMPLING}
+                    COMMAND naive_n05_tp_model_test 8 attention_dp_dspark 2 ${NAIVE_DP_DRAFT} ${NAIVE_DP_SAMPLING})
+                set_tests_properties(naive_n05_attention_dp_dspark_${NAIVE_DP_DRAFT}_${NAIVE_DP_SAMPLING}
+                    PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP DSPARK PASS")
+            endforeach()
+        endforeach()
         set_tests_properties(naive_n05_tp_model naive_n05_tp_model_2 naive_n05_tp_model_4
             PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "MODEL SMOKE PASS")
@@ -2460,6 +2573,32 @@ if (UNIT_TEST)
         if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             add_executable(naive_n05_verify_graph_test test/basic/test_naive_n05_tp_model.cpp)
             target_compile_definitions(naive_n05_verify_graph_test PRIVATE FASTLLM_TEST_VERIFY_GRAPH_HOOKS)
+            add_test(NAME naive_n05_scheduled_draft_prefill
+                COMMAND naive_n05_verify_graph_test 2 draft_prefill_batch fp8 gpu_context chunked)
+            set_tests_properties(naive_n05_scheduled_draft_prefill
+                PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "DSPARK PREFIX PASS")
+            foreach(NAIVE_DP_GRAPH_MODE indexer kvmem)
+                add_test(NAME naive_n05_attention_dp_capture_${NAIVE_DP_GRAPH_MODE}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_${NAIVE_DP_GRAPH_MODE} 2 graph)
+                set_tests_properties(naive_n05_attention_dp_capture_${NAIVE_DP_GRAPH_MODE}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+            endforeach()
+            add_test(NAME naive_n05_attention_dp_capture_prefix
+                COMMAND naive_n05_verify_graph_test 8 attention_dp_prefix 2 draft kvmem)
+            set_tests_properties(naive_n05_attention_dp_capture_prefix
+                PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP.*PASS")
+
+            foreach(NAIVE_DP_REJECTION_MODE sample sample_topk)
+                add_test(NAME naive_n05_attention_dp_rejection_${NAIVE_DP_REJECTION_MODE}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_dspark 2 3 ${NAIVE_DP_REJECTION_MODE})
+                set_tests_properties(naive_n05_attention_dp_rejection_${NAIVE_DP_REJECTION_MODE}
+                    PROPERTIES LABELS cuda RUN_SERIAL TRUE TIMEOUT 180 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP DSPARK PASS")
+            endforeach()
+
             add_executable(naive_n05_tp_graph_test test/basic/test_naive_n05_tp_graph.cpp)
             find_library(NAIVE_TP_GRAPH_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
             target_link_libraries(naive_n05_tp_graph_test PRIVATE
@@ -2864,6 +3003,22 @@ if (UNIT_TEST)
             endforeach()
             add_test(NAME naive_n05_serving_invalidation
                 COMMAND naive_n05_verify_graph_test 2 serving_invalidation)
+            add_test(NAME naive_n05_swa_dp_heads COMMAND naive_n05_swa_verify_test dp_heads)
+            set_tests_properties(naive_n05_swa_dp_heads PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+            foreach(NAIVE_DP_GROUPS 2 4 8)
+                foreach(NAIVE_DP_KV bf16 fp8)
+                    add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                        COMMAND naive_n05_verify_graph_test 8 attention_dp_ring ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})
+                    set_tests_properties(naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                        PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+                endforeach()
+            endforeach()
+            foreach(NAIVE_DP_CASE kvmem failbegin failinstantiate)
+                add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_CASE}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_ring 8 fp8 ${NAIVE_DP_CASE})
+                set_tests_properties(naive_n05_attention_dp_ring_${NAIVE_DP_CASE}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+            endforeach()
             add_test(NAME naive_n05_serving_padding COMMAND naive_n05_verify_graph_test 8 serving_padding)
             set_tests_properties(naive_n05_serving_padding PROPERTIES
                 LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600
@@ -2965,6 +3120,9 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_dsa_batch COMMAND naive_n05_dsa_batch_test)
         set_tests_properties(naive_n05_dsa_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "BATCH DSA PASS")
+        add_test(NAME naive_n05_dsa_wide_heads COMMAND naive_n05_dsa_batch_test wide_heads)
+        set_tests_properties(naive_n05_dsa_wide_heads PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "WIDE HEAD DSA PASS")
 
         add_executable(naive_n05_fp4_vector_test test/basic/test_naive_n05_fp4_vector.cu)
         target_link_libraries(naive_n05_fp4_vector_test PRIVATE fastllm)
@@ -2984,12 +3142,19 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_fp8_kv COMMAND naive_n05_fp8_kv_test)
         set_tests_properties(naive_n05_fp8_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ALL FP8 CHECKS PASSED")
+        add_test(NAME naive_n05_fp8_dsa_wide_heads COMMAND naive_n05_fp8_kv_test wide_heads)
+        set_tests_properties(naive_n05_fp8_dsa_wide_heads PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "WIDE HEAD FP8 DSA PASS")
 
         add_executable(naive_n05_indexer_context_test test/basic/test_naive_n05_indexer_context.cpp)
         target_link_libraries(naive_n05_indexer_context_test PRIVATE fastllm)
         target_include_directories(naive_n05_indexer_context_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_indexer_context COMMAND naive_n05_indexer_context_test)
         set_tests_properties(naive_n05_indexer_context PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "PASS [0-9]+ context-shard checks")
+
+        add_test(NAME naive_n05_indexer_context_tree COMMAND naive_n05_indexer_context_test tree)
+        set_tests_properties(naive_n05_indexer_context_tree PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300
             PASS_REGULAR_EXPRESSION "PASS [0-9]+ context-shard checks")
 
         add_executable(naive_n05_fp8_conversion_test test/basic/test_naive_n05_fp8_conversion.cu)
@@ -3441,6 +3606,19 @@ if (UNIT_TEST)
         endif()
 
 
+
+        if ("src/devices/cuda/linear/fastllm-linear-fp8-perchannel-sm90.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES)
+            add_executable(cuda_fp8_perchannel_w8a16_test test/basic/test_cuda_fp8_perchannel_w8a16.cu)
+            target_link_libraries(cuda_fp8_perchannel_w8a16_test PRIVATE fastllm Threads::Threads)
+            add_test(NAME cuda_fp8_perchannel_w8a16 COMMAND cuda_fp8_perchannel_w8a16_test)
+            set_tests_properties(cuda_fp8_perchannel_w8a16 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
+
+        add_executable(cuda_fp8_perchannel_test test/basic/test_cuda_fp8_perchannel.cu)
+        target_link_libraries(cuda_fp8_perchannel_test PRIVATE fastllm)
+        set_target_properties(cuda_fp8_perchannel_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_fp8_perchannel COMMAND cuda_fp8_perchannel_test)
+        set_tests_properties(cuda_fp8_perchannel PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         add_executable(cuda_fp8_row_test test/basic/test_cuda_fp8_row.cu)
         target_link_libraries(cuda_fp8_row_test PRIVATE fastllm)

@@ -144,8 +144,8 @@ static void Near(const Data &a, const Data &b, const char *name) {
     ++checks;
 }
 static void FP8DSA(int batch, int length, bool sparse, bool paged, int heads = 8, int dim = 192,
-                   int vd = 128, int padding = 0) {
-    const int width = dim + 128 + padding;
+                   int vd = 128, int padding = 0, int kvHeads = 1) {
+    const int width = kvHeads * dim + 128 + padding;
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), a, b;
     Upload(q, {1, batch, heads * dim}, 31);
     Upload(sink, {heads}, 51);
@@ -159,7 +159,7 @@ static void FP8DSA(int batch, int length, bool sparse, bool paged, int heads = 8
     std::vector<FastllmNaiveDSARow> fp(batch), bf(batch);
     for (int i = 0; i < batch; ++i) {
         k.emplace_back(new FP8Tensor(length, width, 7 + i, paged));
-        v.emplace_back(new FP8Tensor(length, vd, 19 + i, paged));
+        v.emplace_back(new FP8Tensor(length, kvHeads * vd, 19 + i, paged));
         auto &r = fp[i];
         r.key = paged ? k.back()->pool.cudaData : k.back()->encoded.cudaData;
         r.value = paged ? v.back()->pool.cudaData : v.back()->encoded.cudaData;
@@ -191,13 +191,13 @@ static void FP8DSA(int batch, int length, bool sparse, bool paged, int heads = 8
     }
     FastllmNaiveDecodeScratch sa, sb;
     Graph graph;
-    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(q, sink, fp, heads, 1, dim, vd, sa, a); });
+    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(q, sink, fp, heads, kvHeads, dim, vd, sa, a); });
     for (int pass = 0; pass < 2; ++pass) {
         for (int i = 0; i < batch; ++i)
             ((int *)live.cpuData)[i] = pass ? std::max(1, length / 2 - i % 7) : length - i % 7;
         Cuda(cudaMemcpy(live.cudaData, live.cpuData, batch * 4, cudaMemcpyHostToDevice));
         graph.Run();
-        FastllmCudaNaiveBatchDSADecode(q, sink, bf, heads, 1, dim, vd, sb, b);
+        FastllmCudaNaiveBatchDSADecode(q, sink, bf, heads, kvHeads, dim, vd, sb, b);
         Near(a, b, "DSA");
     }
     printf("FP8 DSA PASS batch=%d length=%d sparse=%d paged=%d stride=%d\n", batch, length, sparse, paged, width);
@@ -699,12 +699,22 @@ static void FP8Rope(bool paged, int window) {
     printf("FP8 ROPE/HISTORY PASS paged=%d window=%d\n", paged, window);
     fflush(stdout);
 }
-int main() {
+int main(int argc, char **argv) {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        if (argc > 1 && std::strcmp(argv[1], "wide_heads") == 0) {
+            for (bool paged : {false, true})
+                for (int heads : {16, 32, 64})
+                    for (int batch : {1, 3, 4, 8, 16, 31, 32, 33})
+                        FP8DSA(batch, 4097, true, paged, heads, 192, 128, 0, heads / 16);
+            FP8DSA(16, 2047, false, true, 64, 192, 128, 0, 4);
+            FP8DSA(16, 4097, true, true, 64, 192, 128, 1, 4);
+            std::printf("WIDE HEAD FP8 DSA PASS %d checks\n", checks);
+            return 0;
+        }
         int peerAccess = 0;
         if (devices > 1) {
             Cuda(cudaDeviceCanAccessPeer(&peerAccess, 1, 0));

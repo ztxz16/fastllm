@@ -47,6 +47,7 @@ def args_parser():
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
     subparsers.add_parser('ops', help='List registered kernel families, capabilities and parameters')
+    subparsers.add_parser('qwen-image', help='Native Qwen-Image-2.1 generation and HTTP service')
 
     # 创建共享的解析器
     shared_parser = make_normal_parser("fastllm", add_help = False)
@@ -146,6 +147,9 @@ def main(argv=None):
         parser = argparse.ArgumentParser(prog='ftllm router')
         add_router_args(parser)
         raise SystemExit(router_main(parser.parse_args(raw_argv[1:])))
+    if raw_argv and raw_argv[0] == 'qwen-image':
+        from .qwen_image import main as qwen_image_main
+        return qwen_image_main(raw_argv[1:])
     if not raw_argv:
         raw_argv = ["launch"]
     args = args_parser().parse_args(raw_argv)

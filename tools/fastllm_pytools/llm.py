@@ -566,6 +566,15 @@ if hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
     fastllm_lib.set_prefill_coalescing_llm_model.argtypes = [ctypes.c_int] * 6
     fastllm_lib.set_prefill_coalescing_llm_model.restype = ctypes.c_bool
 
+if hasattr(fastllm_lib, "set_prefill_scheduling_llm_model"):
+    fastllm_lib.set_prefill_scheduling_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool,
+        ctypes.c_int, ctypes.c_bool, ctypes.c_int, ctypes.c_int]
+    fastllm_lib.set_prefill_scheduling_llm_model.restype = ctypes.c_bool
+
+if hasattr(fastllm_lib, "set_model_indexer_compute_dtype"):
+    fastllm_lib.set_model_indexer_compute_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.set_model_indexer_compute_dtype.restype = ctypes.c_char_p
+
 fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 fastllm_lib.set_model_indexer_dtype.restype = None
 if hasattr(fastllm_lib, "set_model_indexer_tp_storage"):
@@ -1473,7 +1482,12 @@ class model:
                   max_context_length: int = -1,
                   rope_scaling = None,
                   indexer_dtype: str = "auto",
-                  indexer_tp_storage: str = "replicated"):
+                  indexer_tp_storage: str = "replicated",
+                  indexer_compute_dtype: str = "auto"):
+        if indexer_compute_dtype not in ("auto", "fp8"):
+            raise ValueError("indexer_compute_dtype must be auto or fp8")
+        if indexer_compute_dtype != "auto" and not hasattr(fastllm_lib, "set_model_indexer_compute_dtype"):
+            raise RuntimeError("The loaded FastLLM library does not support FP8 Indexer compute; rebuild FastLLM.")
         if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
             raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
         if indexer_tp_storage not in ("replicated", "layer_shard", "context_shard"):
@@ -1776,6 +1790,10 @@ class model:
             self.set_kv_cache_dtype(kv_cache_dtype)
         if indexer_dtype != "auto":
             fastllm_lib.set_model_indexer_dtype(self.model, indexer_dtype.encode())
+        if indexer_compute_dtype != "auto":
+            error = fastllm_lib.set_model_indexer_compute_dtype(self.model, indexer_compute_dtype.encode())
+            if error:
+                raise ValueError(error.decode("utf-8"))
         if indexer_tp_storage != "replicated":
             fastllm_lib.set_model_indexer_tp_storage(self.model, indexer_tp_storage.encode())
         self._refresh_context_config()
@@ -3295,6 +3313,19 @@ class model:
                 yield cur
 
     async def stream_response_handle_async(self, handle, response_statistics = None):
+        try:
+            from .async_output import open_output_stream
+        except ImportError:
+            from async_output import open_output_stream
+        source = open_output_stream(fastllm_lib, self.model, handle)
+        try:
+            async for text in self._stream_response_handle_async(handle, response_statistics, source):
+                yield text
+        finally:
+            if source is not None:
+                source.close()
+
+    async def _stream_response_handle_async(self, handle, response_statistics, source):
         import time
         is_prefill = True
         start_time = time.time()
@@ -3304,7 +3335,7 @@ class model:
         # Drain a generous bounded batch through one C call and one scheduler
         # mutex acquisition.
         fetch_batch_capacity = 64
-        fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+        fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)() if source is None else None
         fetch_statistics = (ctypes.c_int * 3)()
 
         def fetch_ready_tokens():
@@ -3314,6 +3345,14 @@ class model:
             if count <= 0:
                 return count, []
             return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        async def fetch_tokens():
+            if source is None:
+                return await asyncio.to_thread(fetch_ready_tokens)
+            count, tokens, statistics = await source.read()
+            for i, value in enumerate(statistics):
+                fetch_statistics[i] = value
+            return count, tokens
 
         def capture_response_statistics():
             # The terminal fetch releases the handle. Only use the snapshot
@@ -3329,7 +3368,7 @@ class model:
             tokens = []
             finished = False
             while not finished:
-                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                count, ready_tokens = await fetch_tokens()
                 if count == 0:
                     if (is_prefill and time.time() - start_time > 5):
                         start_time = time.time()
@@ -3377,7 +3416,7 @@ class model:
             pending_tokens = []
             fail_cnt = 0
             while True:
-                count, ready_tokens = await asyncio.to_thread(fetch_ready_tokens)
+                count, ready_tokens = await fetch_tokens()
                 if count == 0:
                     continue
                 capture_response_statistics()
@@ -3525,6 +3564,11 @@ class model:
         fastllm_lib.disable_adapter(self.model)
     
     def release_memory(self):
+        try:
+            from .async_output import close_output_reader
+        except ImportError:
+            from async_output import close_output_reader
+        close_output_reader(fastllm_lib, self.model)
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
@@ -3684,6 +3728,28 @@ class model:
         self.prefill_batching = dict(tokens=tokens, max_wait_ms=max_wait_ms,
                                     target_requests=target_requests, max_requests=max_requests,
                                     min_decode_requests=min_decode_requests)
+
+    def set_prefill_scheduling(self, *, balance_dp=False, adaptive_requests=0,
+                              chunked=False, chunk_max_wait_ms=0, fairness_ms=0):
+        """Opt in to DP coalescing and yielding text chunks before serving.
+
+        Targets/reference concurrency use whole-replica units. DP targets are
+        divided between owners and must both be met on every available owner.
+        Fairness reserves a decode time slice after a prefill slice of the same
+        duration; individual forwards are not preempted.
+        """
+        values = (adaptive_requests, chunk_max_wait_ms, fairness_ms)
+        if (not isinstance(balance_dp, bool) or not isinstance(chunked, bool)
+                or not all(type(v) is int and 0 <= v <= 2147483647 for v in values)
+                or (not chunked and any(values[1:]))):
+            raise ValueError("Invalid prefill scheduling options; chunk timing requires chunked=True")
+        if not hasattr(fastllm_lib, "set_prefill_scheduling_llm_model"):
+            raise RuntimeError("This FastLLM library does not support prefill scheduling")
+        if not fastllm_lib.set_prefill_scheduling_llm_model(self.model, balance_dp,
+                adaptive_requests, chunked, chunk_max_wait_ms, fairness_ms):
+            raise ValueError("Configure prefill batching before scheduling; yielding chunks require a supported model and configuration before serving")
+        self.prefill_scheduling = dict(balance_dp=balance_dp, adaptive_requests=adaptive_requests,
+            chunked=chunked, chunk_max_wait_ms=chunk_max_wait_ms, fairness_ms=fairness_ms)
 
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)

@@ -1,5 +1,7 @@
 # MiniMax-H3-Image native generation and editing
 
+[图片与视频使用指南](../../docs/image-video.md) · [English user guide](../../docs/image-video_en.md)
+
 This backend loads the original [MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image) weights directly. It runs the image model's six distilled PDD steps in C++/CUDA and writes a PNG. No Torch, Diffusers, Python inference runtime or converted transformer checkpoint is required. The Python launcher manages processes and HTTP proxying only. PNG decoding is native C++; JPEG/WebP decoding uses FFmpeg/ffprobe executables, without invoking Python.
 
 The independent model implementation is `include/models/minimax_h3_image/model.h` and `src/models/minimax_h3_image/model.cpp`. It reuses the H3 CUDA runtime and Qwen3-VL text encoder, with a separate image transformer, 2D ViT VAE and sampling pipeline. The shared H3 VAE encoder accepts the image checkpoint’s key names while preserving the video checkpoint path.
@@ -263,7 +265,7 @@ The launcher locates `minimax_h3_image_server` from the profile's binary field, 
 FTLLM_H3_IMAGE_SERVER=/absolute/build/src/models/minimax_h3/minimax_h3_image_server ftllm launch
 ```
 
-GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. Select 1, 2, 4 or 8 GPUs; two-device inference has been validated. The image profile exposes the same auto/TP/SP selector as video. BF16 auto selects SP or streamed TP from the per-device memory budget; quantized auto keeps SP. Select TP explicitly to shard quantized weights. CUDA wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets. A full release wheel has not been built in this experiment.
+GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. Select 1, 2, 4 or 8 GPUs; two-device inference has been validated. The image profile exposes the same auto/TP/SP selector as video. BF16 auto selects SP or streamed TP from the per-device memory budget; quantized auto keeps SP. Select TP explicitly to shard quantized weights. CUDA release wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets; model weights are separate downloads.
 
 ## Numerical validation
 

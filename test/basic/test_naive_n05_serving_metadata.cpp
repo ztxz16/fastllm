@@ -1,6 +1,7 @@
 // Host-only descriptor regression. Fake device addresses are never submitted
 // to CUDA; exercise the real validation, rebinding and request lifecycle code.
 #include "naive_n05_tp.h"
+#include "naive_n05_parallel.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include <future>
 #include <iostream>
@@ -14,6 +15,46 @@ static void Check(bool ok, const char *message) {
 
 namespace fastllm {
 struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
+    static void CheckAttentionPlan() {
+        // Host-only: also cover sizes beyond the CUDA Graph limit. The plan has
+        // no batch cap; unsupported graph shapes retain the normal eager path.
+        for (int count : {1, 256, 512, 513, 1024}) {
+            std::vector<Data> roots(count);
+            std::vector<std::pair<Data *, Data *>> kv;
+            std::vector<GenerationConfig> configs(count);
+            std::vector<int> lengths(count, 1);
+            std::unordered_map<const Data *, uint64_t> live;
+            for (int row = 0; row < count; ++row) {
+                roots[row].Resize({1, 4096 + row, 16});
+                kv.emplace_back(&roots[row], &roots[row]);
+                live[&roots[row]] = row + 1;
+            }
+            TargetBatch batch{kv, configs, lengths, 1};
+            AttentionParallelState::RequestPlan plan;
+            Check(plan.Remember(batch, 7, live), "DP plan capture failed");
+            Check(plan.Matches(batch, 7, live), "stable DP plan rejected");
+            Check(!plan.Matches(batch, 8, live), "DP global invalidation missed");
+            const Data *last = &roots.back();
+            ++live[last];
+            Check(!plan.Matches(batch, 7, live), "DP cache mutation/ABA missed");
+            --live[last];
+            live.erase(last);
+            Check(!plan.Matches(batch, 7, live), "DP removed request reused");
+            live[last] = count;
+            ++roots.back().dims[1];
+            Check(!plan.Matches(batch, 7, live), "DP length/rollback mismatch missed");
+            --roots.back().dims[1];
+            if (count > 1) {
+                std::swap(kv.front(), kv.back());
+                Check(!plan.Matches(batch, 7, live), "DP reorder missed");
+                std::swap(kv.front(), kv.back());
+            }
+            kv.pop_back(); lengths.pop_back(); configs.pop_back();
+            Check(!plan.Matches(batch, 7, live), "DP compaction missed");
+            Check(plan.Remember(batch, 7, live) && plan.Matches(batch, 7, live),
+                "DP compacted plan not reusable");
+        }
+    }
     std::vector<std::unique_ptr<ResponseContext>> contexts;
     std::vector<std::shared_ptr<TPDecodeState::Storage>> storage;
     NaiveN05PrefixCacheTestAccess() {
@@ -263,6 +304,7 @@ int main() {
     try {
         SetDeviceMap({{"cpu", 1}});
         SetThreads(1);
+        NaiveN05PrefixCacheTestAccess::CheckAttentionPlan();
         NaiveN05PrefixCacheTestAccess model;
         std::promise<void> ready;
         auto readyFuture = ready.get_future();

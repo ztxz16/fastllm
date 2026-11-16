@@ -2,7 +2,7 @@
 
 状态：已接通运行时、DeepSeek V4.1 适配器、bounded prefill、DSpark 及普通 decode / 验证整轮 CUDA Graph。下节描述当前实现；其余章节保留完整目标设计，不能视为所有阶段均已交付。
 
-## 当前实现
+## 当前 DeepSeek V4.1 实现
 
 新增 `--attn-dp-size`，默认 1 保留原 TP 路径。八卡实例支持 DP2/TP4、DP4/TP2、DP8/TP1，MoE 保持原 EP8 后端。例如：
 
@@ -43,6 +43,37 @@ Attention TP 宽度变化仍会改变 `W_oB` 局部矩阵乘法的 BF16 舍入�
 追加 `--fast-prefill` 检查 bounded / cache-only prefill。原生程序的 `FIXTURE DP OUTPUT verify graph [fp4|fp8]` 模式逐字节比较 eager 与验证图的 token、主干特征和提交后的 KV，覆盖 2～8 行、各接受长度、滑窗环绕和请求组切换。单算子 `deepseekV41FullVerify`、`deepseekV41FullVerifyFP8`、`deepseekV41FullVerifyFP4` 覆盖动态 attention 的因果性、压缩边界和缓存地址变化。
 
 实际宽度可用 `verify-run graph` 在两个独立进程中比较：一侧将已有 `FASTLLM_DSV41_CUDA_GRAPH_WARMUP` 设为大于测试轮数，另一侧保留默认预热轮数。这样两边采用相同的融合算子，只改变是否捕图，避免把合并 QKV 等算子的舍入差异误判为回放错误。
+
+## Naive / MiMo（Exp18）适配
+
+Naive N0.5 使用同一分组运行时，`--tp 8 --ep 8 --attn-dp-size 2` 表示单实例 Attention DP2×TP4、全局 EP8，`--max_batch` 是整个实例的并发上限。普通推理和批量 DSpark 共用请求归属；通用桥接在各组完成 attention 后恢复全局行序，再执行原有 FFN/MoE 和输出头。主模型 KV 只存在于请求所属组，草稿继续使用原全局 TP。模型训练的 block size 不随 `--dspark` 候选数量变化。
+
+```sh
+FASTLLM_CUDA_GRAPH=1 ftllm server MODEL --tp 8 --ep 8 --attn-dp-size 2 \
+  --atype bfloat16 --kv_cache_dtype fp8_e4m3 --indexer_dtype fp8 \
+  --indexer_tp_storage context_shard --max_batch 8 --tokens 65536 \
+  --chunked_prefill_size 1024 --cache_history true --dspark 3 --draft DRAFT
+```
+
+对于 Attention TP1、现有 H20 EP4/EP8 后端，以及首层 dense、后续连续 MoE 的结构，普通 decode 图保留组内 hidden、归一化结果和 MoE 输出。每个逻辑 token 从所属组路由一次，所有 EP rank 使用同一最大局部行数确定 arena 与分块轮数；空组也参与专家计算和同步。只在 dense 首层、最终输出头及草稿特征收集边界恢复全局行序。Attention TP>1、验证和 eager 阶段保留原桥接，不改变 KV 归属或残差/归一化的累加顺序。
+
+支持 BF16 计算、BF16/FP8 KV，以及原模型已有的 GPU MoE 后端；EP4/EP8 的硬件和权重格式约束保持不变。Indexer 可以复制或在 Attention TP 组内按上下文分片；组内 TP1 自动使用普通读写路径。`layer_shard`、FP4 KV 和 CPU KV 暂不接入此适配器，配置时明确报错。
+
+GPU paged KV 和 KVMem 按组内 head 数分配。调度器为请求选择所属组的物理页池，分别预留剩余输出页；同组不足时排队，其他组仍可准入。当前 `--tokens` / `tokensLimit` 保留单组预算口径，不能把打印值直接当作全实例的已验证容量；还需计入 SWA、Indexer、页表、Graph 和草稿。KVMem 的热缓存槽保留全局请求编号，采用保守的每卡预留，不以平均分布假设缩减启动预算。
+
+前缀缓存的 full KV 页、SWA 快照和草稿检查点一起校验。新请求优先留在最长驻留前缀所在的组；活动请求不迁移，不借用另一组的页号。恢复失败沿用原有的请求级错误隔离，后续请求可重新命中或 prefill。
+
+目标模型复用现有 CUDA Graph 路径，输入行置换、局部位置和长度逐轮刷新，KV 指针和容量参与验证。当前保留一个布局变体；布局变化会失效并重新预热/捕获。捕获开始或实例化失败时，各 rank 一致回退 eager。此实现不承诺任意高并发下零工作区增长，也不意味着 DP 比原 TP 更快，需要对实际输入、并发及接受率测量。
+
+标准 128-token SWA 窗口在开启 Graph 时复用环形 KV 和现有合批 attention 算子，按请求所属组生成描述符，普通 decode 不再逐请求移动滑窗。前缀快照、续写 prefill、验证候选及接受回滚使用一致的环形位置；不满足专用算子条件时保留通用合批或原有 eager 回退。Graph 重放直接核对所属组的 KV 地址、布局、容量和通信代次，非所属卡的空槽位不视作缺失 KV。
+
+组内 attention 输出以 FP32 归约后转回 BF16。不同 TP 宽度或局部 batch 大小仍可能改变 GEMM 舍入及 FP8 路由结果；正确性检查应区分相同布局的 Graph/eager 对照与不同布局的数值误差，不能要求跨布局逐位一致。
+
+回归入口为 `naive_n05_tp_model_test WORLD MODE DP ...`，模式包括 `attention_dp`、`attention_dp_verify`、`attention_dp_dspark`、`attention_dp_pool`、`attention_dp_indexer`、`attention_dp_kvmem`、`attention_dp_admission`、`attention_dp_prefix`。`naive_n05_verify_graph_test 8 attention_dp_ring DP bf16|fp8 [kvmem|failbegin|failinstantiate]` 另覆盖环形缓存与 Graph 绑定失效。CTest 的 `naive_n05_attention_dp_` 前缀覆盖相关组合。采样测试在原生接口明确设置 `top_k > 1`；原生 `GenerationConfig::IsSimpleGreedy()` 将 `top_k <= 1` 视为贪婪，不能直接用 HTTP 接口的 `top_k=0` 习惯替代。
+
+采样沿用 Naive 原有能力：全词表 top-p（HTTP 默认 `top_k=-1`）支持批量 reject sampling；有限 top-k 保留逐请求回退，可能明显降低并发吞吐。
+
+## 完整目标设计
 
 目标是在同一模型实例内组合 Attention DP、Attention TP 和 MoE EP/TP，并让每张 GPU 始终由一个固定工作线程负责。DeepSeek V4.1 是首个接入模型；分组、通信、张量布局、请求归属和生命周期管理不依赖其层数、head 数、KV 格式或推测解码算法。
 

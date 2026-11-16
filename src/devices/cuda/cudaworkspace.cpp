@@ -33,6 +33,83 @@ WorkspaceOwners &Owners(const void *pointer) {
 thread_local std::shared_ptr<CudaWorkspace> currentWorkspace;
 std::atomic<size_t> workspacePointers{0};
 constexpr size_t alignment = 256;
+
+struct Reservations {
+    std::mutex mutex;
+    std::map<int, std::weak_ptr<CudaWorkspace>> devices;
+    std::unordered_map<void *, std::shared_ptr<CudaWorkspace>> allocations;
+    std::atomic<size_t> count{0};
+};
+Reservations &Reserved() {
+    static auto *state = new Reservations;
+    return *state;
+}
+}
+
+CudaMemoryReservation::CudaMemoryReservation(int device, size_t bytes) {
+    auto &state = Reserved();
+    {
+        std::lock_guard<std::mutex> guard(state.mutex);
+        if (!state.devices[device].expired())
+            throw std::runtime_error("CUDA device already has a serving reservation");
+    }
+    // Allocate before publication so the reservation cannot allocate from itself.
+    workspace = std::make_shared<CudaWorkspace>(device, bytes);
+    std::lock_guard<std::mutex> guard(state.mutex);
+    if (!state.devices[device].expired())
+        throw std::runtime_error("Concurrent CUDA serving reservation");
+    state.devices[device] = workspace;
+}
+
+CudaMemoryReservation::~CudaMemoryReservation() {
+    auto &state = Reserved();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    auto it = state.devices.find(workspace->Device());
+    if (it != state.devices.end() && it->second.lock() == workspace)
+        state.devices.erase(it);
+}
+
+bool TryAllocateCudaReservation(int device, size_t bytes, void **pointer) {
+    auto &state = Reserved();
+    std::shared_ptr<CudaWorkspace> owner;
+    {
+        std::lock_guard<std::mutex> guard(state.mutex);
+        auto it = state.devices.find(device);
+        if (it != state.devices.end()) owner = it->second.lock();
+    }
+    if (!owner) return false;
+    *pointer = owner->Allocate(bytes);
+    if (*pointer) {
+        std::lock_guard<std::mutex> guard(state.mutex);
+        state.allocations.emplace(*pointer, std::move(owner));
+        state.count.fetch_add(1, std::memory_order_release);
+    }
+    // The caller may reclaim idle cache and retry. Only its final failure is
+    // an allocation error; a first-attempt arena miss is normal backpressure.
+    return true;
+}
+
+bool IsCudaReservationPointer(void *pointer) {
+    auto &state = Reserved();
+    if (!state.count.load(std::memory_order_acquire)) return false;
+    std::lock_guard<std::mutex> guard(state.mutex);
+    return state.allocations.count(pointer) != 0;
+}
+
+bool TryFreeCudaReservation(void *pointer) {
+    auto &state = Reserved();
+    if (!state.count.load(std::memory_order_acquire)) return false;
+    std::shared_ptr<CudaWorkspace> owner;
+    {
+        std::lock_guard<std::mutex> guard(state.mutex);
+        auto it = state.allocations.find(pointer);
+        if (it == state.allocations.end()) return false;
+        owner = std::move(it->second);
+        state.allocations.erase(it);
+        state.count.fetch_sub(1, std::memory_order_release);
+    }
+    owner->Free(pointer);
+    return true;
 }
 
 CudaWorkspace::CudaWorkspace(int device, size_t bytes)

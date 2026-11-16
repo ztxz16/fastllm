@@ -256,12 +256,56 @@ static void TestIndexerRaggedShards() {
     }
 }
 
+// Compare the scratch-backed FP8 expansion with direct FP8 attention exactly.
+// Insufficient workspace must retain the same result without resizing storage.
+static void TestSwaPrefillScratch() {
+    for (auto shape : {std::vector<int>{1025, 127, 16}, {4096, 65536, 64}}) {
+        const int rows=shape[0], past=shape[1], heads=shape[2], kvHeads=heads/8, keys=past+rows;
+        const int keyStride=kvHeads*192+16, valueStride=kvHeads*128;
+        Data q(BFLOAT16), key(FP8_E4M3), value(FP8_E4M3), sink(FLOAT32), indices(INT32), reference, actual;
+        Upload(q,{1,rows,heads*192},53); Upload(sink,{heads},71);
+        auto uploadFp8 = [&](Data &data, int width, unsigned seed) {
+            data.Resize({1,keys,width}); data.Allocate();
+            for (uint64_t i=0;i<data.Count(0);++i) {
+                seed=seed*1664525u+1013904223u;
+                data.cpuData[i]=__nv_fp8_e4m3(((int)(seed>>16)-32768)/16384.f).__x;
+            }
+            data.ToDevice(DataDevice::CUDA,{0},true);
+        };
+        uploadFp8(key,keyStride,113); uploadFp8(value,valueStride,139);
+        FastllmCudaNaiveAttention(q,key,value,indices,sink,heads,kvHeads,192,128,past,128,reference);
+        const auto expected=Read<uint16_t>(reference);
+        for (auto type : {FLOAT32, BFLOAT16}) {
+            const size_t bytes=(size_t)(rows+127)*(keyStride+valueStride)*2;
+            const size_t elements=bytes/(type==FLOAT32?4:2);
+            Data storage(type,{(int)elements+32}), scratch(type,{(int)elements});
+            storage.ToDevice(DataDevice::CUDA,{0},false); storage.Allocate(false);
+            // A per-request slice must not overwrite neighboring requests.
+            cudaMemset(storage.cudaData,0xa5,storage.GetBytes());
+            scratch.FakeFrom(storage,16*storage.unitSize);
+            const auto pointer=scratch.cudaData;
+            for (bool full : {true,false}) {
+                scratch.Resize({(int)(full?elements:elements-1)});
+                FastllmCudaNaiveAttention(q,key,value,indices,sink,heads,kvHeads,192,128,past,128,actual,true,&scratch);
+                Require(Read<uint16_t>(actual)==expected,"SWA prefill scratch changed BF16 output bits");
+                Require(scratch.cudaData==pointer && scratch.Count(0)==(full?elements:elements-1),"SWA scratch was resized");
+                ++checks;
+            }
+            std::vector<unsigned char> copy(storage.GetBytes());
+            cudaMemcpy(copy.data(),storage.cudaData,copy.size(),cudaMemcpyDeviceToHost);
+            const size_t guard=16*storage.unitSize;
+            for (size_t i=0;i<guard;++i)
+                Require(copy[i]==0xa5 && copy[guard+bytes+i]==0xa5,"SWA scratch crossed request boundary");
+        }
+    }
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
-        TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();
+        TestSwaPrefillScratch(); TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();
         Require(cudaDeviceSynchronize()==cudaSuccess,"prefill CUDA synchronization failed");
         std::printf("Naive prefill regression passed: %d cases\n",checks);
     } catch (const std::exception &e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }

@@ -1235,7 +1235,7 @@ bool basellm::PollPD(ResponseContext *context) {
     }
     if (context->isEnding)
         context->pdPending.reset();
-    dictCV.notify_all();
+    NotifyResponseReady();
     return !context->isEnding;
 }
 } // namespace fastllm

@@ -64,42 +64,56 @@ class CompletionTokenLimitTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()['choices'][0]['finish_reason'], 'length')
 
-    def test_unlimited_legacy_budget_reports_natural_chat_completion(self):
+    def test_default_and_unlimited_budgets_report_natural_chat_completion(self):
+        self.model.get_response_statistics = lambda handle: {"output_tokens": 32769}
         for stream in (False, True):
-            with self.subTest(stream=stream):
-                response = self.request(max_tokens=-1, stream=stream)
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual(self.model.captured_launch_kwargs['max_length'], -1)
-                if stream:
-                    events = [json.loads(line[6:]) for line in response.text.splitlines()
-                              if line.startswith('data: ') and line != 'data: [DONE]']
-                    reasons = [c['finish_reason'] for event in events
-                               for c in event.get('choices', []) if c.get('finish_reason')]
-                    self.assertEqual(reasons, ['stop'])
-                    self.assertIn('data: [DONE]', response.text)
-                else:
-                    self.assertEqual(response.json()['choices'][0]['finish_reason'], 'stop')
+            for fields in ({}, {"max_tokens": None}, {"max_tokens": 0}, {"max_tokens": -1},
+                           {"max_completion_tokens": None}):
+                with self.subTest(stream=stream, fields=fields):
+                    self._check_unlimited_chat(stream, fields)
 
-    def test_unlimited_responses_budget_is_not_reported_incomplete(self):
+    def _check_unlimited_chat(self, stream, fields):
+        response = self.request(stream=stream, **fields)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.model.captured_launch_kwargs['max_length'], -1)
+        if stream:
+            events = [json.loads(line[6:]) for line in response.text.splitlines()
+                      if line.startswith('data: ') and line != 'data: [DONE]']
+            reasons = [c['finish_reason'] for event in events
+                       for c in event.get('choices', []) if c.get('finish_reason')]
+            self.assertEqual(reasons, ['stop'])
+            usage = [event['usage'] for event in events if event.get('usage')][-1]
+            self.assertEqual(usage['completion_tokens'], 32769)
+            self.assertIn('data: [DONE]', response.text)
+        else:
+            self.assertEqual(response.json()['choices'][0]['finish_reason'], 'stop')
+            self.assertEqual(response.json()['usage']['completion_tokens'], 32769)
+
+    def test_default_and_unlimited_responses_budgets_are_not_incomplete(self):
+        self.model.get_response_statistics = lambda handle: {"output_tokens": 32769}
         for stream in (False, True):
-            with self.subTest(stream=stream):
-                response = self.client.post('/v1/responses', json={
-                    'model': 'qwen3.5', 'input': 'hello',
-                    'max_output_tokens': -1, 'stream': stream})
-                self.assertEqual(response.status_code, 200, response.text)
-                self.assertEqual(self.model.captured_launch_kwargs['max_length'], -1)
-                if stream:
-                    events = [json.loads(line[6:]) for line in response.text.splitlines()
-                              if line.startswith('data: ')]
-                    terminal = [event for event in events
-                                if event['type'] in ('response.completed', 'response.incomplete')]
-                    self.assertEqual(len(terminal), 1)
-                    self.assertEqual(terminal[0]['type'], 'response.completed')
-                    result = terminal[0]['response']
-                else:
-                    result = response.json()
-                self.assertEqual(result['status'], 'completed')
-                self.assertIsNone(result.get('incomplete_details'))
+            for fields in ({}, {"max_output_tokens": None}, {"max_output_tokens": -1}):
+                with self.subTest(stream=stream, fields=fields):
+                    self._check_unlimited_responses(stream, fields)
+
+    def _check_unlimited_responses(self, stream, fields):
+        response = self.client.post('/v1/responses', json={
+            'model': 'qwen3.5', 'input': 'hello', 'stream': stream, **fields})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.model.captured_launch_kwargs['max_length'], -1)
+        if stream:
+            events = [json.loads(line[6:]) for line in response.text.splitlines()
+                      if line.startswith('data: ')]
+            terminal = [event for event in events
+                        if event['type'] in ('response.completed', 'response.incomplete')]
+            self.assertEqual(len(terminal), 1)
+            self.assertEqual(terminal[0]['type'], 'response.completed')
+            result = terminal[0]['response']
+        else:
+            result = response.json()
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['usage']['output_tokens'], 32769)
+        self.assertIsNone(result.get('incomplete_details'))
 
     def test_unlimited_anthropic_budget_reports_end_turn(self):
         for stream in (False, True):
@@ -123,8 +137,8 @@ class CompletionTokenLimitTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.model.captured_launch_kwargs['max_length'], 64)
 
-    def test_null_or_missing_modern_field_preserves_existing_default(self):
-        for fields, expected in [({}, 32768), ({'max_completion_tokens': None}, 32768),
+    def test_null_or_missing_modern_field_uses_unlimited_or_legacy_budget(self):
+        for fields, expected in [({}, -1), ({'max_completion_tokens': None}, -1),
                                  ({'max_completion_tokens': None, 'max_tokens': 128}, 128)]:
             with self.subTest(fields=fields):
                 response = self.request(**fields)

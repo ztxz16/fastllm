@@ -59,6 +59,17 @@ extern "C" bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         dlsym(RTLD_NEXT, "FastllmCudaTopKTopPSampling");
     return fn(logits, temperatures, topKs, topPs, output, batch, vocab);
 }
+static int batchedRejectionCalls = 0;
+extern "C" bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+        const float *temperatures, const int *topKs, const float *topPs,
+        const int *draftTokenIds, int *output, int *acceptedDraftTokens,
+        int batch, int draftTokens, int vocabSize) {
+    if (batch > 1) ++batchedRejectionCalls;
+    static auto fn = (bool (*)(float *, float *, const float *, const int *, const float *,
+        const int *, int *, int *, int, int, int))dlsym(RTLD_NEXT, "FastllmCudaMtpRejectionSampling");
+    return fn(logits, proposalProbs, temperatures, topKs, topPs, draftTokenIds,
+              output, acceptedDraftTokens, batch, draftTokens, vocabSize);
+}
 static bool failVerifyBegin = false, failVerifyInstantiate = false, expectVerifyGraph = true;
 static int failGraphDevice = 3;
 extern "C" bool FastllmCudaGraphLaunch(void *exec) {
@@ -104,6 +115,36 @@ struct NaiveN05PrefixCacheTestAccess {
 #endif
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
+    static bool SwaRing(const NaiveN05FlashModel &model) { return model.tpSwaRingCache; }
+    static void CheckDPBindings(NaiveN05FlashModel &model, const Data &ids,
+            const NaiveN05FlashModel::TargetBatch &batch, int mutation) {
+        auto &state = model.tpDecodeState;
+        if (!state || !state->captured) throw std::runtime_error("DP binding test needs a captured graph");
+        NaiveN05FlashModel::LogitsSelection selection;
+        std::vector<std::pair<Data, Data>> unused;
+        std::vector<int *> lengths;
+        const bool hidden = state->collectHidden;
+        auto prepare = [&] { return model.PrepareTensorParallelDecode(ids, unused, false,
+            selection, lengths, &batch, hidden); };
+        const size_t slots = size_t(batch.Size()) * model.block_cnt * model.tpDevices.size() * 2;
+        if (!prepare() || lengths.size() != slots + size_t(batch.Size()) * model.block_cnt * 2)
+            throw std::runtime_error("DP did not use the in-place Graph binding check");
+        if (!mutation) return;
+        Data &local = *batch.Key(0, 1).multiDeviceDatas.begin()->second;
+        struct Restore {
+            Data &data; void *pointer; bool packed;
+            ~Restore() { data.cudaData = pointer; data.kvCacheFp8Indexer = packed; }
+        } restore{local, local.cudaData, local.kvCacheFp8Indexer};
+        if (mutation == 1) local.cudaData = (char *)local.cudaData + 16;
+        else if (mutation == 2) local.kvCacheFp8Indexer = !local.kvCacheFp8Indexer;
+        else --state->ncclGeneration;
+        // Eligibility may prepare a replacement, but must never replay the
+        // captured addresses/layout or an obsolete collective generation.
+        prepare();
+        if (state->captured) throw std::runtime_error("DP replay accepted changed Graph bindings");
+    }
+
+    static auto &PrefixHistory(NaiveN05FlashModel &model) { return model.prefixHistory; }
     static auto &DraftPrefixPool(NaiveN05FlashModel &model) { return model.prefixPool; }
     static void CheckHeadReturn(const NaiveN05FlashModel &model, const Data &output, bool deviceInput) {
         const bool borrowed = deviceInput && !model.tpDevices.empty() && FastllmCudaPeerAccessInit(model.tpDevices);
@@ -312,7 +353,8 @@ class Fixture : public NaiveN05FlashModel {
             std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
             const LastTokensManager &tokens = LastTokensManager(), std::vector<std::vector<float> *> *logits = nullptr) override {
         batchedPrefills += batch > 1 && std::any_of(lengths.begin(), lengths.end(), [](int n) { return n > 1; });
-        if (std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; }))
+        if (std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; }) &&
+            std::all_of(configs.begin(), configs.end(), [](const auto &c) { return c.prefill_chunk_remaining < 0; }))
             largestDecodeBatch = std::max(largestDecodeBatch.load(), batch);
         return NaiveN05FlashModel::ForwardBatch(batch, ids, masks, positions, lengths, kv, configs, tokens, logits);
     }
@@ -1229,7 +1271,7 @@ class Fixture : public NaiveN05FlashModel {
                   << " max_relative=" << largestLogitRelative << " max_abs=" << largestLogitAbsolute << std::endl;
     }
 
-    void DraftPrefixChecks(bool sparse = false, bool batching = false) {
+    void DraftPrefixChecks(bool sparse = false, bool batching = false, bool scheduled = false) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         inspectDraftPrefixAllocations = true;
 #endif
@@ -1239,8 +1281,11 @@ class Fixture : public NaiveN05FlashModel {
         draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
         maxBatch = batching ? 48 : 16; SetMaxTokens(131072); SetChunkedPrefillSize(batching ? 8192 : 1024);
+        if (scheduled) SetChunkedPrefillSize(1024);
         if (batching && !SetPrefillBatching(4096, 20, 4, 24, 1))
             throw std::runtime_error("DSpark rejected existing prefill options");
+        if (scheduled && !SetPrefillScheduling(false, 48, true, 1, 1))
+            throw std::runtime_error("DSpark rejected scheduled chunks");
         if (sparse) {
             KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
@@ -2587,6 +2632,549 @@ class Fixture : public NaiveN05FlashModel {
     }
 #endif
 
+    void PagedCacheRestartChecks(int groups) {
+        ConfigureAttentionParallel(groups);
+        SetIndexerDataType(FP8_E4M3); SetIndexerTPStorage(false, true);
+        maxBatch = 4; max_positions = 4096;
+        SetMaxTokens(32768); SetChunkedPrefillSize(128); WarmUp();
+        GenerationConfig config;
+        config.top_k = 1; config.output_logits = true;
+        config.input_token_length = 2048; config.output_token_limit = 16;
+        auto forward = [&](std::vector<std::pair<Data, Data>> &kv, int length, int past, int salt) {
+            std::vector<float> tokens(length), positions(length), logits;
+            for (int i = 0; i < length; ++i) {
+                tokens[i] = (i + past + salt) * 7 % 251;
+                positions[i] = past + i;
+            }
+            Data input(FLOAT32, {1, length}, tokens), pos(FLOAT32, {1, length}, positions);
+            Forward(input, Data(), pos, kv, config, LastTokensManager(), &logits);
+            return logits;
+        };
+        int checks = 0;
+        for (int previous : {128, 1024, 129}) {
+            std::vector<std::pair<Data, Data>> reused(block_cnt), fresh(block_cnt);
+            forward(reused, previous, 0, 3);
+            std::vector<void *> tables;
+            // ReleasePagedCachePages(..., true) drops each physical reference
+            // once and clears root/local shapes, retaining reusable tables.
+            for (auto &layer : reused) for (Data *root : {&layer.first, &layer.second}) {
+                for (auto &entry : root->multiDeviceDatas) {
+                    Data &local = *entry.second;
+                    if (local.isPagedKVCache) {
+                        local.pagedKVCacheData->ReleasePageIndices(local.pageIndex);
+                        local.pageIndex.clear(); local.lastPageLen = 0;
+                        tables.push_back(local.cudaData);
+                    }
+                    local.dims.clear();
+                }
+                root->pageIndex.clear(); root->lastPageLen = 0; root->dims.clear();
+            }
+            int past = 0;
+            for (int length : {64, 193, 1, 1}) {
+                auto expected = forward(fresh, length, past, 11);
+                auto actual = forward(reused, length, past, 11);
+                if (actual.size() != expected.size()) throw std::runtime_error("re-admission logits shape");
+                RequireCloseLogits(actual.data(), expected, "re-admission cold/warm logits");
+                ++checks; past += length;
+            }
+            size_t table = 0;
+            for (const auto &layer : reused) for (const Data *root : {&layer.first, &layer.second})
+                for (const auto &entry : root->multiDeviceDatas) if (entry.second->isPagedKVCache) {
+                    if (entry.second->cudaData != tables.at(table++) ||
+                        entry.second->dims[1] != past || entry.second->pageIndex.size() != 3)
+                        throw std::runtime_error("re-admission changed table allocation or cache length");
+                }
+        }
+        std::cout << "PAGED CACHE RESTART PASS dp=" << groups << " checks=" << checks
+                  << " relative=" << largestLogitRelative << std::endl;
+    }
+
+    void AttentionDPPrefix(int groups, bool draft, bool sparse = false) {
+        ConfigureAttentionParallel(groups);
+        if (draft) {
+            draftEnabled = canDoConcurrentForward = true;
+            draftLayers=2; draftBlock=7; draftTokens=3;
+            draftHeads=8; draftKvHeads=2; draftHeadDim=32; draftWindow=1024;
+            draftConfidenceThreshold=0; draftTargetLayers={0,1};
+            AddDraftTestWeights(weight,draftLayers,draftKvHeads,256,true);
+        }
+        maxBatch=4; max_positions=4096; SetMaxTokens(8192); SetChunkedPrefillSize(128);
+        if (sparse) {
+            KvMemConfig cfg; cfg.enabled=true; cfg.maxTokens=4096; cfg.residentTokens=2048;
+            cfg.prefillTokens=128; cfg.hostBytes=1ULL<<30; ConfigureKvMem(cfg);
+        }
+        SetSaveHistoryChat(true); WarmUp();
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        const int graphLaunches = verifyGraphLaunches;
+#endif
+        useRealScheduler=true; eos_token_id=-1; eos_token_ids.clear();
+        SetPrefillBatching(1024, 10);
+        auto run = [&](const std::vector<std::vector<int>> &prompts, int count) {
+            std::vector<int> handles;
+            for (const auto &prompt : prompts) {
+                GenerationConfig cfg; cfg.top_k=1; cfg.input_token_length=prompt.size(); cfg.output_token_limit=count;
+                handles.push_back(LaunchResponseTokens(prompt,cfg));
+            }
+            std::vector<std::vector<int>> result(prompts.size());
+            for (size_t i=0;i<handles.size();++i) {
+                for (int n=0;n<count;++n) {
+                    int token=FetchResponseTokens(handles[i]);
+                    if(token<0) throw std::runtime_error("DP prefix response truncated");
+                    result[i].push_back(token);
+                }
+                if(FetchResponseTokens(handles[i])!=-1) throw std::runtime_error("DP prefix output count");
+            }
+            return result;
+        };
+        std::vector<std::vector<int>> prompts(groups,std::vector<int>(263));
+        for(int row=0;row<groups;++row) for(int n=0;n<263;++n) prompts[row][n]=(n*7+row*31)%251;
+        run(prompts,4);
+        {
+            std::set<int> owners;
+            for(const auto &entry:NaiveN05GraphTestAccess::PrefixHistory(*this)) owners.insert(entry->ownerDevice);
+            if(owners.size()!=size_t(groups)) throw std::runtime_error("DP prefix failed to publish both groups");
+        }
+        const int before=pagedRestores;
+        for(int row=0;row<groups;++row) prompts[row].push_back(220+row);
+        auto warm=run(prompts,136);
+        if(pagedRestores-before!=groups || lastPrefixLength<256)
+            throw std::runtime_error("DP prefix did not restore each owner group");
+        SetSaveHistoryChat(false);
+        auto cold=run(prompts,136);
+        if(warm!=cold) throw std::runtime_error("DP prefix cold/warm token mismatch");
+        // Allocation failure stays isolated to the failed request; the next
+        // request must restore normally without leaked pages or stale state.
+        SetSaveHistoryChat(true); run(prompts,1);
+        failPrefixRestore=true;
+        GenerationConfig failed; failed.top_k=1; failed.output_token_limit=1;
+        int handle=LaunchResponseTokens(prompts.front(),failed);
+        if(FetchResponseTokens(handle)!=-2 || failPrefixRestore)
+            throw std::runtime_error("DP prefix allocation failure was not isolated");
+        auto recovered=run({prompts.front()},16);
+        SetSaveHistoryChat(false);
+        if(recovered!=run({prompts.front()},16)) throw std::runtime_error("DP prefix failure recovery mismatch");
+        ShutdownRuntime();
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (verifyGraphLaunches <= graphLaunches) throw std::runtime_error("DP prefix did not replay Graph");
+#endif
+        std::cout<<"ATTENTION DP PREFIX PASS draft="<<draft<<" restored="<<pagedRestores<<std::endl;
+    }
+
+
+    std::vector<std::vector<float>> AttentionDPRing(int groups, bool optimized, bool sparse) {
+        ConfigureAttentionParallel(groups);
+        SetIndexerDataType(FP8_E4M3); SetIndexerTPStorage(false, true);
+        maxBatch = 8; SetMaxTokens(32768); SetChunkedPrefillSize(512);
+        if (sparse) {
+            KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 4096;
+            cfg.residentTokens = 2048; cfg.prefillTokens = 512; cfg.hostBytes = 1ULL << 30;
+            ConfigureKvMem(cfg);
+        }
+        SetCudaGraph(optimized);
+        if (sparse) WarmUp();
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        const int launches = verifyGraphLaunches;
+#endif
+        using Cache = std::vector<std::pair<Data, Data>>;
+        std::vector<Cache> caches(8); std::vector<int> past(8);
+        for (auto &cache : caches) cache.resize(block_cnt);
+        GenerationConfig config; config.input_token_length = 512; config.output_token_limit = 512;
+        LogitsSelection selection; selection.cudaLogits = true;
+        draftTargetLayers = {0, 1};
+        std::vector<std::vector<float>> result;
+        for (int turn = 0; turn < 30; ++turn) {
+            // Ring wrap, resumed prefill, graph/eager switching, candidate
+            // rollback (including zero acceptance), reordered and empty groups.
+            SetCudaGraph(optimized && turn != 8 && turn != 15);
+            bool verify = !sparse && turn >= 12 && turn < 18;
+            std::vector<int> order, lengths, before, kept;
+            std::vector<float> ids, positions;
+            std::vector<std::pair<Data *, Data *>> pointers;
+            std::vector<Cache *> roots;
+            for (int i = 0; i < 8; ++i) {
+                if (turn >= 20 && i % groups != 0) continue;
+                int owner = turn >= 19 && turn < 20 ? 7 - i : i;
+                int count = turn == 0 ? 129 + owner * 19 : turn == 6 ? 9 + owner : verify ? 3 : 1;
+                order.push_back(owner); lengths.push_back(count); before.push_back(past[owner]);
+                kept.push_back(verify ? (turn + owner) % (count + 1) : count);
+                roots.push_back(&caches[owner]);
+                for (int j = 0; j < count; ++j) {
+                    positions.push_back(past[owner] + j);
+                    ids.push_back((past[owner] + j + owner * 17) % 251);
+                }
+                for (auto &layer : caches[owner]) pointers.emplace_back(&layer.first, &layer.second);
+            }
+            std::vector<GenerationConfig> configs(order.size(), config);
+            TargetBatch batch{pointers, configs, lengths, block_cnt};
+            TargetCapture capture; capture.selection = &selection; capture.verifying = verify;
+            Cache unused;
+            auto logits = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
+                Data(FLOAT32, {1, (int)positions.size()}, positions), unused, config, capture, &batch);
+            if (NaiveN05GraphTestAccess::SwaRing(*this) != optimized)
+                throw std::runtime_error("DP SWA ring eligibility mismatch");
+            logits.ToDevice(CPU);
+            result.emplace_back((float *)logits.cpuData, (float *)logits.cpuData + logits.Count(0));
+            for (auto &entry : capture.hidden) {
+                Data h(entry.second); ToDataType(h, FLOAT32); h.ToDevice(CPU);
+                result.emplace_back((float *)h.cpuData, (float *)h.cpuData + h.Count(0));
+            }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            if (optimized && !failVerifyBegin && !failVerifyInstantiate &&
+                (turn == 5 || turn == 11 || turn == 23 || turn == 26))
+                NaiveN05GraphTestAccess::CheckDPBindings(*this,
+                    Data(FLOAT32, {1, (int)ids.size()}, ids), batch,
+                    turn == 11 ? 1 : turn == 23 ? 2 : turn == 26 ? 3 : 0);
+#endif
+            if (verify) {
+                if (optimized && !capture.ringVerify) throw std::runtime_error("DP verification missed ring candidates");
+                CommitTargetCaches(roots, before, kept, capture.ringVerify);
+            }
+            for (size_t i = 0; i < order.size(); ++i) {
+                past[order[i]] += kept[i];
+                for (int layer = 0; layer < block_cnt; ++layer)
+                    for (Data *root : {&caches[order[i]][layer].first, &caches[order[i]][layer].second}) {
+                        if (root->multiDeviceDatas.size() != size_t(ranks / groups) ||
+                            root->dims[1] != (layer == 1 ? std::min(past[order[i]], 127) : past[order[i]]))
+                            throw std::runtime_error("DP ring changed KV ownership/length");
+                    }
+            }
+        }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (optimized && !failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches <= launches)
+            throw std::runtime_error("DP ring did not replay Graph");
+#endif
+        return result;
+    }
+
+    void AttentionDPAdmission(int groups, bool batchPrefill, bool scheduled = false) {
+        ConfigureAttentionParallel(groups);
+        SetSaveHistoryChat(false); maxBatch = groups * 2; max_positions = 512;
+        SetMaxTokens(512); SetChunkedPrefillSize(128); WarmUp();
+        useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
+        if (batchPrefill) SetPrefillBatching(1024, 10);
+        if (scheduled && !SetPrefillScheduling(true, groups * 2, true, 1, 1))
+            throw std::runtime_error("DP chunk policy rejected");
+        // Each group can fit only one 512-token request. The second wave
+        // must queue, while the other group continues to make progress.
+        std::vector<int> handles;
+        std::vector<std::vector<int>> prompts(groups * 3, std::vector<int>(448));
+        if (scheduled) for (size_t row = 0; row < prompts.size(); ++row) prompts[row].resize(385 + 32 * (row % 2));
+        for (size_t row = 0; row < prompts.size(); ++row) {
+            for (size_t i = 0; i < prompts[row].size(); ++i) prompts[row][i] = (i * 7 + row) % 251;
+            GenerationConfig config; config.top_k = 1; config.output_logits = true;
+            config.input_token_length = prompts[row].size(); config.output_token_limit = 64;
+            handles.push_back(LaunchResponseTokens(prompts[row], config));
+        }
+        std::vector<std::vector<float>> finalLogits(handles.size());
+        for (size_t row = 0; row < handles.size(); ++row) {
+            for (int step = 0; step < 64; ++step) {
+                std::vector<float> logits;
+                int token = FetchResponseLogits(handles[row], logits);
+                if (token < 0) throw std::runtime_error("DP pool pressure truncated response");
+                if (step < 63) prompts[row].push_back(token);
+                else finalLogits[row] = std::move(logits);
+            }
+            std::vector<float> unused;
+            if (FetchResponseLogits(handles[row], unused) != -1)
+                throw std::runtime_error("DP pool completion did not finish");
+        }
+        ShutdownRuntime();
+        // Physical pools include the reserved partial page per request. At
+        // larger DP counts this can fit more than the nominal 512 tokens.
+        const auto *pool = GetPagedKVCacheManager(0, true);
+        const int pagesPerRequest = (prompts.front().size() + pool->pageLen - 1) / pool->pageLen;
+        const int capacity = std::min(maxBatch, groups * (pool->maxPages / pagesPerRequest));
+        if (largestDecodeBatch > capacity) throw std::runtime_error("DP pool over-admitted requests");
+        for (size_t row = 0; row < prompts.size(); ++row) {
+            std::vector<float> ids(prompts[row].begin(), prompts[row].end()), pos(ids.size()), logits;
+            std::iota(pos.begin(), pos.end(), 0.f);
+            std::vector<std::pair<Data, Data>> cache(block_cnt);
+            GenerationConfig config; config.output_logits = true; config.output_token_limit = 1;
+            config.input_token_length = ids.size();
+            Forward(Data(FLOAT32, {1, (int)ids.size()}, ids), Data(),
+                Data(FLOAT32, {1, (int)pos.size()}, pos), cache, config, LastTokensManager(), &logits);
+            RequireCloseLogits(finalLogits[row].data(), logits, "DP physical admission logits");
+        }
+        std::cout << "ATTENTION DP ADMISSION PASS batch_prefill=" << batchPrefill
+                  << " max_decode_batch=" << largestDecodeBatch << std::endl;
+    }
+
+    std::vector<std::vector<float>> AttentionDPIndexer(int groups, bool sharded, bool graph, bool sparse = false) {
+        ConfigureAttentionParallel(groups);
+        SetIndexerTPStorage(false, sharded); SetIndexerDataType(FP8_E4M3);
+        maxBatch = groups + 1; SetMaxTokens(32768); SetChunkedPrefillSize(2304);
+        if (sparse) {
+            KvMemConfig cfg; cfg.enabled=true; cfg.maxTokens=4096; cfg.residentTokens=2048;
+            cfg.prefillTokens=2304; cfg.hostBytes=1ULL<<30; ConfigureKvMem(cfg);
+        }
+        SetSaveHistoryChat(false); WarmUp(); SetCudaGraph(graph);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        const int graphLaunches = verifyGraphLaunches;
+#endif
+        using Cache = std::vector<std::pair<Data, Data>>;
+        std::vector<Cache> caches(maxBatch); std::vector<int> past(maxBatch, 0);
+        for (auto &cache : caches) cache.resize(block_cnt);
+        GenerationConfig config; config.input_token_length = 2304; config.output_token_limit = 128;
+        std::vector<std::vector<float>> result;
+        LogitsSelection selection; selection.cudaLogits = true;
+        draftTargetLayers = {0, 1};
+        for (int turn = 0; turn < 7; ++turn) {
+            std::vector<int> order, lengths;
+            std::vector<float> ids, positions;
+            std::vector<std::pair<Data *, Data *>> pointers;
+            for (int i = 0; i < maxBatch; ++i) if (turn != 4 || i % groups == 0)
+                order.push_back(turn == 4 ? i : maxBatch - i - 1);
+            for (int owner : order) {
+                int count = turn ? 1 : 2051 + owner * 13;
+                lengths.push_back(count);
+                for (int i = 0; i < count; ++i) {
+                    positions.push_back(past[owner] + i);
+                    ids.push_back((past[owner] + i + owner * 17) % 251);
+                }
+                for (auto &layer : caches[owner]) pointers.emplace_back(&layer.first, &layer.second);
+            }
+            std::vector<GenerationConfig> configs(order.size(), config);
+            TargetBatch batch{pointers, configs, lengths, block_cnt};
+            TargetCapture capture; capture.selection = &selection;
+            Cache unused;
+            auto logits = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
+                Data(FLOAT32, {1, (int)positions.size()}, positions), unused, config, capture, &batch);
+            logits.ToDevice(CPU);
+            result.emplace_back((float *)logits.cpuData, (float *)logits.cpuData + logits.Count(0));
+            for (size_t i = 0; i < order.size(); ++i) past[order[i]] += lengths[i];
+        }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (graph && verifyGraphLaunches <= graphLaunches) throw std::runtime_error("DP Indexer/KVMem did not replay Graph");
+#endif
+        return result;
+    }
+
+    void AttentionDPSpark(int groups, int candidates, bool sample, bool finiteTopK = false) {
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        const int rejectionCalls = batchedRejectionCalls;
+#endif
+        ConfigureAttentionParallel(groups);
+        draftEnabled = canDoConcurrentForward = true;
+        draftLayers=2; draftBlock=7; draftTokens=candidates;
+        draftHeads=8; draftKvHeads=2; draftHeadDim=32; draftWindow=1024;
+        draftConfidenceThreshold=0; draftTargetLayers={0,1};
+        AddDraftTestWeights(weight,draftLayers,draftKvHeads,256,true);
+        const int requests=groups+1;
+        using Cache=std::vector<std::pair<Data,Data>>;
+        std::vector<Cache> caches(requests), reference(requests);
+        std::vector<int> anchors(requests), expected(requests);
+        std::vector<GenerationConfig> configs(requests);
+        for(int i=0;i<requests;++i) {
+            caches[i].resize(block_cnt); reference[i].resize(block_cnt);
+            auto &cfg=configs[i]; cfg.input_token_length=19+i; cfg.output_token_limit=64;
+            cfg.top_k=sample ? (finiteTopK ? 50 : weight["lm_head.weight"].dims[0]) : 1; cfg.top_p=sample ? .95f : 1.f; cfg.temperature=sample ? 1.f : 0.f;
+            if (cfg.IsSimpleGreedy() == sample) throw std::runtime_error("DP test sampling mode");
+            std::vector<float> ids(19+i), pos(19+i); std::iota(pos.begin(),pos.end(),0.f);
+            for(size_t j=0;j<ids.size();++j) ids[j]=(j+i*19)%251;
+            Data input(FLOAT32,{1,(int)ids.size()},ids), positions(FLOAT32,{1,(int)ids.size()},pos);
+            anchors[i]=Forward(input,Data(),positions,caches[i],cfg);
+            if(!sample) {
+                draftEnabled=false; expected[i]=Forward(input,Data(),positions,reference[i],cfg); draftEnabled=true;
+                if(anchors[i]!=expected[i]) throw std::runtime_error("DP draft prefill token mismatch");
+            }
+        }
+        for(int turn=0;turn<24;++turn) {
+            std::vector<Data> positions;
+            std::vector<Data*> pos;
+            std::vector<float> ids(anchors.begin(),anchors.end());
+            std::vector<std::pair<Data*,Data*>> kv;
+            for(int i=0;i<requests;++i) {
+                positions.emplace_back(FLOAT32,std::vector<int>{1,1},std::vector<float>{float(configs[i].input_token_length+turn)});
+                for(auto &layer:caches[i]) kv.emplace_back(&layer.first,&layer.second);
+            }
+            for(auto &p:positions) pos.push_back(&p);
+            auto tokens=ForwardBatch(requests,Data(FLOAT32,{1,requests},ids),{},pos,
+                std::vector<int>(requests,1),kv,configs,LastTokensManager());
+            if(tokens.size()!=size_t(requests)) throw std::runtime_error("DP DSpark missing output");
+            for(int i=0;i<requests;++i) {
+                if(tokens[i]<0 || tokens[i]>=256) throw std::runtime_error("DP DSpark invalid token");
+                if(!sample) {
+                    draftEnabled=false;
+                    expected[i]=Forward(Data(FLOAT32,{1,1},{float(expected[i])}),Data(),positions[i],reference[i],configs[i]);
+                    draftEnabled=true;
+                    if(tokens[i]!=expected[i]) throw std::runtime_error("DP DSpark greedy oracle mismatch turn="+std::to_string(turn));
+                }
+                auto &ctx=*draftContexts.at(&caches[i]);
+                if(ctx.committed!=caches[i][0].first.dims[1]) throw std::runtime_error("DP draft/target commit mismatch");
+            }
+            anchors=tokens;
+        }
+        uint64_t rounds=0,proposed=0,accepted=0;
+        for(auto &cache:caches) {
+            const auto &ctx=*draftContexts.at(&cache);
+            if(!ctx.rounds || !ctx.proposed) throw std::runtime_error("DP DSpark silently disabled");
+            rounds+=ctx.rounds;proposed+=ctx.proposed;accepted+=ctx.accepted;
+            draftContexts.erase(&cache);
+        }
+        if(draftBlock!=7 || draftTokens!=candidates) throw std::runtime_error("DP draft block size changed");
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (sample && !finiteTopK && batchedRejectionCalls <= rejectionCalls)
+            throw std::runtime_error("DP rejection sampling did not batch requests");
+#endif
+        std::cout<<"ATTENTION DP DSPARK PASS dp="<<groups<<" candidates="<<candidates
+                 <<" sample="<<sample<<" finite_top_k="<<finiteTopK<<" rounds="<<rounds<<" proposed="<<proposed<<" accepted="<<accepted<<std::endl;
+    }
+
+    std::vector<std::vector<float>> AttentionDPVerification(int groups, bool batched) {
+        ConfigureAttentionParallel(groups);
+        draftTargetLayers = {0, 1};
+        using Cache = std::vector<std::pair<Data, Data>>;
+        const int requests = groups * 2 + 1;
+        std::vector<Cache> cache(requests);
+        std::vector<int> past(requests);
+        GenerationConfig config; config.output_token_limit = 128; config.input_token_length = 64;
+        LogitsSelection selection; selection.cudaLogits = true;
+        auto values = [](int owner, int start, int rows, bool positions) {
+            std::vector<float> out(rows);
+            for (int i = 0; i < rows; ++i) out[i] = positions ? start + i : (start + i + owner * 19) % 251;
+            return Data(FLOAT32, {1, rows}, out);
+        };
+        auto host = [](const Data &source) {
+            Data data(source); ToDataType(data, FLOAT32); data.ToDevice(CPU);
+            return std::vector<float>((float *)data.cpuData, (float *)data.cpuData + data.Count(0));
+        };
+        for (int owner = 0; owner < requests; ++owner) {
+            cache[owner].resize(block_cnt); past[owner] = 19 + owner;
+            TargetCapture capture; capture.selection = &selection;
+            RunDraftTarget(values(owner, 0, past[owner], false), values(owner, 0, past[owner], true),
+                cache[owner], config, capture);
+        }
+        std::vector<std::vector<float>> result;
+        for (int turn = 0; turn < 5; ++turn) {
+            std::vector<int> order, lengths, before, kept;
+            for (int i = 0; i < requests; ++i) if (turn != 3 || i % groups == 0)
+                order.push_back(turn % 2 ? requests - 1 - i : i);
+            std::vector<float> ids, positions;
+            std::vector<std::pair<Data *, Data *>> kv;
+            std::vector<Cache *> roots;
+            for (size_t i = 0; i < order.size(); ++i) {
+                const int owner = order[i], rows = 1 + (turn * 3 + i) % 8;
+                lengths.push_back(rows); before.push_back(past[owner]); kept.push_back((turn + i) % (rows + 1));
+                roots.push_back(&cache[owner]);
+                auto input = values(owner, past[owner], rows, false), pos = values(owner, past[owner], rows, true);
+                ids.insert(ids.end(), (float *)input.cpuData, (float *)input.cpuData + rows);
+                positions.insert(positions.end(), (float *)pos.cpuData, (float *)pos.cpuData + rows);
+                for (auto &pair : cache[owner]) kv.emplace_back(&pair.first, &pair.second);
+            }
+            std::vector<GenerationConfig> configs(order.size(), config);
+            TargetBatch batch{kv, configs, lengths, block_cnt};
+            std::vector<std::vector<float>> logits(order.size());
+            std::vector<std::vector<std::vector<float>>> features(order.size());
+            if (batched) {
+                Cache unused; TargetCapture capture; capture.verifying = true; capture.selection = &selection;
+                auto output = RunDraftTarget(Data(FLOAT32,{1,(int)ids.size()},ids),
+                    Data(FLOAT32,{1,(int)positions.size()},positions),unused,config,capture,&batch);
+                auto all = host(output);
+                int offset = 0;
+                for (size_t i = 0; i < order.size(); ++i) {
+                    logits[i].assign(all.begin()+offset*256, all.begin()+(offset+lengths[i])*256);
+                    for (const auto &feature : capture.hidden) {
+                        auto data = host(feature.second);
+                        features[i].emplace_back(data.begin()+offset*256, data.begin()+(offset+lengths[i])*256);
+                    }
+                    offset += lengths[i];
+                }
+                CommitTargetCaches(roots, before, kept, capture.ringVerify);
+            } else for (size_t i = 0; i < order.size(); ++i) {
+                const int owner=order[i]; TargetCapture capture; capture.verifying=true; capture.selection=&selection;
+                auto output = RunDraftTarget(values(owner,past[owner],lengths[i],false),
+                    values(owner,past[owner],lengths[i],true),cache[owner],config,capture);
+                logits[i]=host(output);
+                for(const auto &feature:capture.hidden) features[i].push_back(host(feature.second));
+                CommitTargetCache(cache[owner], before[i], kept[i], capture.ringVerify);
+            }
+            for (size_t i = 0; i < order.size(); ++i) {
+                past[order[i]] += kept[i]; result.push_back(logits[i]);
+                if (features[i].size()!=2) throw std::runtime_error("DP missing draft target features");
+                for (auto &feature:features[i]) result.push_back(std::move(feature));
+                for (int layer=0;layer<block_cnt;++layer) {
+                    int expected=layer ? std::min(past[order[i]],7):past[order[i]];
+                    if(cache[order[i]][layer].first.dims[1]!=expected)
+                        throw std::runtime_error("DP verification rollback mismatch");
+                }
+            }
+        }
+        return result;
+    }
+
+    std::vector<std::vector<float>> AttentionDPChecks(int groups, bool batched, bool worldReference = false, bool pooled = false) {
+        ConfigureAttentionParallel(worldReference ? 1 : groups);
+        const int layoutGroups = worldReference ? 1 : groups;
+        if (pooled) {
+            SetSaveHistoryChat(false); maxBatch = groups * 2 + 1;
+            SetMaxTokens(8192); SetChunkedPrefillSize(128); WarmUp();
+        }
+        using Cache = std::vector<std::pair<Data, Data>>;
+        const int requests = groups * 2 + 1;
+        std::vector<Cache> caches(requests);
+        std::vector<int> past(requests, 0);
+        for (auto &cache : caches) for (int layer = 0; layer < block_cnt; ++layer)
+            cache.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+        std::vector<std::vector<float>> results;
+        GenerationConfig config; config.output_logits = true; config.output_token_limit = 256;
+        for (int turn = 0; turn < 5; ++turn) {
+            // Different lengths, reordered requests and a group with no rows.
+            std::vector<int> order;
+            for (int i = 0; i < requests; ++i)
+                if (turn != 3 || i % groups == 0) order.push_back(turn % 2 ? requests - i - 1 : i);
+            std::vector<float> ids;
+            std::vector<Data> positions;
+            std::vector<int> lengths;
+            std::vector<std::pair<Data *, Data *>> pointers;
+            for (int owner : order) {
+                const int count = turn == 0 ? 3 + owner : turn == 1 ? 17 + owner : 1;
+                lengths.push_back(count);
+                std::vector<float> pos(count);
+                for (int i = 0; i < count; ++i) {
+                    ids.push_back((past[owner] + i + owner * 19) % 251);
+                    pos[i] = past[owner] + i;
+                }
+                positions.emplace_back(FLOAT32, std::vector<int>{1, count}, pos);
+                for (auto &layer : caches[owner]) pointers.emplace_back(&layer.first, &layer.second);
+            }
+            std::vector<std::vector<float>> logits(order.size());
+            if (batched) {
+                std::vector<Data *> pos;
+                std::vector<std::vector<float> *> output;
+                for (size_t i = 0; i < order.size(); ++i) { pos.push_back(&positions[i]); output.push_back(&logits[i]); }
+                ForwardBatch(order.size(), Data(FLOAT32, {1, (int)ids.size()}, ids), {}, pos, lengths,
+                    pointers, std::vector<GenerationConfig>(order.size(), config), LastTokensManager(), &output);
+            } else {
+                size_t offset = 0;
+                for (size_t i = 0; i < order.size(); ++i) {
+                    std::vector<float> row(ids.begin() + offset, ids.begin() + offset + lengths[i]);
+                    Forward(Data(FLOAT32, {1, lengths[i]}, row), Data(), positions[i], caches[order[i]],
+                        config, LastTokensManager(), &logits[i]);
+                    offset += lengths[i];
+                }
+            }
+            for (size_t i = 0; i < order.size(); ++i) {
+                const int owner = order[i]; past[owner] += lengths[i];
+                results.push_back(logits[i]);
+                for (int layer = 0; layer < block_cnt; ++layer)
+                    for (Data *root : {&caches[owner][layer].first, &caches[owner][layer].second}) {
+                        if (root->multiDeviceDatas.size() != size_t(ranks / layoutGroups) ||
+                            root->dataDeviceIds.size() != size_t(ranks / layoutGroups))
+                            throw std::runtime_error("DP KV replicated outside its group");
+                        const int expected = layer ? std::min(past[owner], 7) : past[owner];
+                        if (root->dims[1] != expected) throw std::runtime_error("DP root cache length mismatch");
+                        for (const auto &part : root->multiDeviceDatas) {
+                            if (part.second->dims[1] != expected)
+                                throw std::runtime_error("DP local cache length mismatch");
+                            if (pooled && layer == 0 && !part.second->isPagedKVCache)
+                                throw std::runtime_error("DP full KV did not use the bounded page pool");
+                        }
+                    }
+            }
+        }
+        return results;
+    }
+
     std::vector<std::vector<float>> Run() {
         if (RetainCudaWorkspace() != (ranks > 1))
             throw std::runtime_error("unexpected serial/TP workspace policy");
@@ -3781,6 +4369,145 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "attention_dp_ring") {
+            SetCudaEmbedding(true);
+            const int groups = argc > 3 ? std::stoi(argv[3]) : 8;
+            const bool fp8 = argc > 4 && std::string(argv[4]) == "fp8";
+            const bool sparse = argc > 5 && std::string(argv[5]) == "kvmem";
+            std::vector<std::vector<float>> expected;
+            {
+                Fixture fixture(ranks, false, true, true, true);
+                if (fp8) fixture.SetKVCacheDataType(FP8_E4M3);
+                expected = fixture.AttentionDPRing(groups, false, sparse);
+            }
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            failGraphDevice = ranks - 1;
+            failVerifyBegin = argc > 5 && std::string(argv[5]) == "failbegin";
+            failVerifyInstantiate = argc > 5 && std::string(argv[5]) == "failinstantiate";
+#endif
+            Fixture fixture(ranks, false, true, true, true);
+            if (fp8) fixture.SetKVCacheDataType(FP8_E4M3);
+            auto actual = fixture.AttentionDPRing(groups, true, sparse);
+            if (actual.size() != expected.size()) throw std::runtime_error("DP ring output count mismatch");
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (actual[i].size() != expected[i].size()) throw std::runtime_error("DP ring output shape mismatch");
+                RequireCloseLogits(actual[i].data(), expected[i], "DP ring logits/hidden i=" + std::to_string(i));
+            }
+            std::cout << "ATTENTION DP RING PASS dp=" << groups << " outputs=" << actual.size()
+                      << " relative=" << largestLogitRelative << std::endl;
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "paged_cache_restart") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true);
+            if (argc > 4 && std::string(argv[4]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.PagedCacheRestartChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "attention_dp_prefix") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks, false, true, true, true); fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.AttentionDPPrefix(argc > 3 ? std::stoi(argv[3]) : 2,
+                argc > 4 && std::string(argv[4]) == "draft",
+                argc > 5 && std::string(argv[5]) == "kvmem");
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "attention_dp_admission") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            Fixture fixture(ranks); fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.AttentionDPAdmission(argc > 3 ? std::stoi(argv[3]) : 2,
+                argc > 4 && (std::string(argv[4]) == "batch" || std::string(argv[4]) == "chunked"),
+                argc > 4 && std::string(argv[4]) == "chunked");
+            return 0;
+        }
+        if (argc > 2 && (std::string(argv[2]) == "attention_dp_indexer" || std::string(argv[2]) == "attention_dp_kvmem")) {
+            SetCudaEmbedding(true); SetCudaGraph(false);
+            const int groups = argc > 3 ? std::stoi(argv[3]) : 2;
+            const bool graph = argc > 4 && std::string(argv[4]) == "graph";
+            std::vector<std::vector<float>> expected;
+            { Fixture fixture(ranks, false, true, true, true); fixture.SetKVCacheDataType(FP8_E4M3);
+              expected = fixture.AttentionDPIndexer(groups, false, false); }
+            Fixture fixture(ranks, false, true, true, true); fixture.SetKVCacheDataType(FP8_E4M3);
+            auto actual = fixture.AttentionDPIndexer(groups, true, graph, std::string(argv[2]) == "attention_dp_kvmem");
+            if (actual.size() != expected.size()) throw std::runtime_error("DP Indexer output count mismatch");
+            for (size_t i = 0; i < actual.size(); ++i)
+                RequireCloseLogits(actual[i].data(), expected[i], "DP Indexer i=" + std::to_string(i));
+            std::cout << "ATTENTION DP INDEXER PASS relative=" << largestLogitRelative << std::endl;
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "attention_dp_pool") {
+            SetCudaGraph(false); SetCudaEmbedding(true);
+            const int groups = argc > 3 ? std::stoi(argv[3]) : 2;
+            const bool fp8 = argc > 4 && std::string(argv[4]) == "fp8";
+            std::vector<std::vector<float>> expected;
+            { Fixture fixture(ranks); if (fp8) fixture.SetKVCacheDataType(FP8_E4M3);
+              expected = fixture.AttentionDPChecks(groups, true); }
+            Fixture fixture(ranks); if (fp8) fixture.SetKVCacheDataType(FP8_E4M3);
+            auto actual = fixture.AttentionDPChecks(groups, true, false, true);
+            if (actual.size() != expected.size()) throw std::runtime_error("DP pool output count mismatch");
+            for (size_t i = 0; i < actual.size(); ++i)
+                RequireCloseLogits(actual[i].data(), expected[i], "DP pool i=" + std::to_string(i));
+            std::cout << "ATTENTION DP POOL PASS relative=" << largestLogitRelative << std::endl;
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "attention_dp_dspark") {
+            SetCudaGraph(false); SetCudaEmbedding(true);
+            const int groups=argc>3 ? std::stoi(argv[3]) : 2;
+            const int candidates=argc>4 ? std::stoi(argv[4]) : 3;
+            const bool finiteTopK=argc>5 && std::string(argv[5])=="sample_topk";
+            const bool sample=finiteTopK || (argc>5 && std::string(argv[5])=="sample");
+            Fixture fixture(ranks); fixture.SetKVCacheDataType(FP8_E4M3);
+            fixture.AttentionDPSpark(groups,candidates,sample,finiteTopK);
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "attention_dp_verify") {
+            SetCudaGraph(false); SetCudaEmbedding(true);
+            const int groups = argc > 3 ? std::stoi(argv[3]) : 2;
+            const bool fp8 = argc > 4 && std::string(argv[4]) == "fp8";
+            std::vector<std::vector<float>> expected;
+            { Fixture fixture(ranks); if(fp8) fixture.SetKVCacheDataType(FP8_E4M3);
+              expected=fixture.AttentionDPVerification(groups,false); }
+            Fixture fixture(ranks); if(fp8) fixture.SetKVCacheDataType(FP8_E4M3);
+            auto actual=fixture.AttentionDPVerification(groups,true);
+            if(actual.size()!=expected.size()) throw std::runtime_error("DP verify count mismatch");
+            for(size_t i=0;i<actual.size();++i) {
+                if(actual[i].size()!=expected[i].size()) throw std::runtime_error("DP verify shape mismatch");
+                RequireCloseLogits(actual[i].data(),expected[i],"DP verify logits/hidden i="+std::to_string(i));
+            }
+            std::cout<<"ATTENTION DP VERIFY PASS world="<<ranks<<" dp="<<groups
+                     <<" outputs="<<actual.size()<<" relative="<<largestLogitRelative<<std::endl;
+            return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "attention_dp") {
+            SetCudaGraph(false); SetCudaEmbedding(true);
+            const int groups = argc > 3 ? std::stoi(argv[3]) : 2;
+            const bool fp8 = argc > 4 && std::string(argv[4]) == "fp8";
+            std::vector<std::vector<float>> expected;
+            {
+                Fixture independent(ranks);
+                if (fp8) independent.SetKVCacheDataType(FP8_E4M3);
+                expected = independent.AttentionDPChecks(groups, false);
+            }
+            {
+                Fixture world(ranks);
+                if (fp8) world.SetKVCacheDataType(FP8_E4M3);
+                auto oracle = world.AttentionDPChecks(groups, false, true);
+                for (size_t i = 0; i < oracle.size(); ++i)
+                    RequireCloseLogits(expected[i].data(), oracle[i], "DP vs world-TP logits");
+            }
+            Fixture combined(ranks);
+            if (fp8) combined.SetKVCacheDataType(FP8_E4M3);
+            auto actual = combined.AttentionDPChecks(groups, true);
+            if (actual.size() != expected.size()) throw std::runtime_error("DP output count mismatch");
+            for (size_t i = 0; i < actual.size(); ++i) {
+                if (actual[i].size() != expected[i].size() || actual[i].empty())
+                    throw std::runtime_error("DP logits shape mismatch");
+                RequireCloseLogits(actual[i].data(), expected[i], "DP combined vs independent logits");
+            }
+            std::cout << "ATTENTION DP PASS world=" << ranks << " dp=" << groups
+                      << " outputs=" << actual.size() << " relative=" << largestLogitRelative << std::endl;
+            return 0;
+        }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (argc > 2 && (std::string(argv[2]) == "kvmem_fp4" || std::string(argv[2]) == "gpu_fp4")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
@@ -3914,7 +4641,7 @@ int main(int argc, char **argv) {
             fixture.SetIndexerTPStorage(!sparse && !context, sparse || context);
             fixture.SetIndexerDataType(FP8_E4M3);
             if (argc > 3 && std::string(argv[3]) == "fp8") fixture.SetKVCacheDataType(FP8_E4M3);
-            fixture.DraftPrefixChecks(sparse, true); unsetenv("FASTLLM_DSPARK_TP"); return 0;
+            fixture.DraftPrefixChecks(sparse, true, argc > 5 && std::string(argv[5]) == "chunked"); unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "kvmem_draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(true);

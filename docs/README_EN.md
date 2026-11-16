@@ -5,9 +5,10 @@
 - [Quick start](../README_EN.md)
 - [Model deployment guides](../README_EN.md#model-deployment-guides)
 - [`--auto` tuning and Launcher controls](auto_en.md): common options, effects, examples, and startup logs
-- [Launcher and Studio](launcher_en.md): profiles, chat, and agents
+- [Launcher and Studio](launcher_en.md): profiles, chat, image/video generation, and agents
 - [Manual deployment and option reference](deployment_en.md): device layouts, formats, download/export, and source builds
-- [DeepSeek-V4.1 deployment](deepseek_v41_en.md)
+- [DeepSeek-V4.1 deployment](deepseek_v41_en.md): original checkpoints, Unsloth / GSQ-RCO GGUF, EXL3, hybrid inference, and DSpark
+- [Image and video generation](image-video_en.md): models, launcher, quantization, multi-GPU use, HTTP APIs, and Studio
 - [Benchmarks](benchmark_en.md): measured results and their scope by model
 - [Changelog](version_en.md)
 

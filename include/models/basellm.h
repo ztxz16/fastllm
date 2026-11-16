@@ -106,6 +106,9 @@ namespace fastllm {
         uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
+        // Consumed tokens in currentTokens while yielding between prefill chunks.
+        int prefillOffset = 0;
+        PrefillBatchPolicy::Clock::time_point prefillQueuedAt = queuedAt;
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
         
@@ -455,6 +458,19 @@ namespace fastllm {
         int FetchResponseTokensBatch(int handleId, int *output,
                                      int maxTokens, int *statistics);
 
+        // Cross-request output drain. Each record contains seven ints:
+        // {request index, token offset, token count, status, cached, missed, generated}.
+        // status is 0 while running, or the same negative terminal code as FetchResponseTokensBatch.
+        // A terminal record may also contain the last tokens. Callers retain no context pointers.
+        uint64_t GetResponseGeneration(int handleId);
+        void AbortResponse(int handleId, uint64_t generation);
+        int FetchResponses(const int *handles, const uint64_t *generations, int requests,
+                           int maxTokensPerRequest, int *tokens, int tokenCapacity,
+                           int *records, int recordCapacity, int timeoutMs, uint64_t &version);
+        // Output/control notifications are separate from the legacy scheduler CV.
+        void WakeResponseOutput();
+        void NotifyResponseReady();
+
         virtual int FetchResponseLogits(int handleId, std::vector <float> &logits); // 获取指定handle的输出Logits
 
         virtual bool GetResponseStatistics(int handleId, int &cachedInputTokens,
@@ -568,7 +584,16 @@ namespace fastllm {
         virtual void TryRecordResponseContext(ResponseContext *context);
 
         virtual PagedCacheManager* GetPagedKVCacheManager(int layerIndex, bool isKey) const;
+        // Physical admission domain for one request. TP models share a domain;
+        // attention DP models select the request's owning group.
+        virtual PagedCacheManager *GetPagedKVCacheBudgetManager(const ResponseContext *) const {
+            return GetPagedKVCacheManager(kvCacheId, true);
+        }
         virtual std::vector<std::pair<int, PagedCacheManager*> > GetPagedKVCacheManagers(int layerIndex, bool isKey) const;
+        virtual std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+                int layer, bool key, const ResponseContext *) const {
+            return GetPagedKVCacheManagers(layer, key);
+        }
         virtual bool TryRecordPagedPrefixCacheExtra(ResponseContext *context);
         virtual int QueryPagedPrefixCacheExtra(ResponseContext *context, int maxCachedLen) const;
         virtual bool RestorePagedPrefixCacheExtra(ResponseContext *context, int cachedLen) const;
@@ -593,6 +618,10 @@ namespace fastllm {
         // Called under dictLocker after the final forward, before admitting
         // another request. Output queues remain available to slow consumers.
         virtual void OnResponseContextFinished(ResponseContext *context) {}
+
+        // Called by the scheduler before consuming a selected prompt. Models
+        // with fixed request storage reserve it here; false leaves work queued.
+        virtual bool TryAdmitResponseContext(ResponseContext *context) { return true; }
 
         virtual bool UseGenericHistoryCache() const { return true; }
 
@@ -623,6 +652,14 @@ namespace fastllm {
         // target preserves the existing scheduler, and zero wait batches only
         // requests already queued. Unsupported models keep their old policy.
         virtual bool SupportsPrefillBatching() const { return false; }
+        // Stable attention owner while queued; cache ownership is not migrated
+        // by the scheduler. Models without DP keep the single FIFO group.
+        virtual int GetPrefillBatchGroup(const ResponseContext *) const { return 0; }
+        virtual int GetPrefillBatchGroups() const { return 1; }
+        // Requires absolute text positions and suppression of intermediate sampling.
+        virtual bool SupportsChunkedPrefillScheduling() const { return false; }
+        bool SetPrefillScheduling(bool balanceDP, int adaptiveRequests, bool chunked,
+                                  int chunkWaitMs, int fairnessMs);
         bool SetPrefillBatching(int targetTokens, int maxWaitMs, int targetRequests = 0,
                                int maxRequests = 0, int minDecodeRequests = 0);
         virtual int PreviewPagedPrefixCacheExtra(ResponseContext *context, int length,
@@ -742,6 +779,9 @@ namespace fastllm {
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker, forwardLocker;
         std::condition_variable dictCV;
+        std::mutex responseOutputMutex;
+        std::condition_variable responseOutputCV;
+        uint64_t responseOutputVersion = 0;
 
         std::map <std::string, int> deviceMap;
         std::map <std::string, int> moeDeviceMap;
@@ -802,6 +842,7 @@ namespace fastllm {
         // 分块 prefill 的切片大小（首块与后续块相同）；-1 表示使用模型默认
         int chunkedPrefillSize = -1;
         PrefillBatchPolicy prefillBatchPolicy;
+        PrefillSchedulingOptions prefillScheduling;
 
         // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
         // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。

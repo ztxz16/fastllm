@@ -14,6 +14,7 @@
 #include "deepseekv41_execution.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-v41-full-decode.h"
+#include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #endif
 #include "utils/hybrid_moe.h"
@@ -1892,6 +1893,8 @@ namespace fastllm {
             // 越界读——读到的垃圾值偏大时就不扩容，CatDirect 直接写出界。
             const int haveRows = cache.dims.size() >= 2 ? cache.dims[1] : 0;
             const int needRows = haveRows + rows.dims[1];
+            AssertInFastLLM(!cache.isFake || V41CacheRowCapacity(cache) >= needRows,
+                "DeepSeekV41 fixed KV context capacity exceeded");
             while (V41CacheRowCapacity(cache) < needRows) {
                 std::vector<int> newDims;
                 if (cache.Count(0) == 0 || cache.dims.size() == 0) {
@@ -2486,6 +2489,7 @@ namespace fastllm {
         v41DsparkFreeStates.clear();
         v41CudaGraphSlots.clear();
         v41AttentionParallel.reset();
+        v41ServingReservations.clear();
         ReleaseMoeCudaCache(weights);
         ReleaseMoeCudaCache(v41DsparkMoeWeights);
         engramTables.clear();
@@ -3942,8 +3946,12 @@ namespace fastllm {
         }
 
         void V41ResetState(DeepSeekV41RequestState &state, int blockCnt) {
-            state.attentionRanks.clear();
-            state.attentionGroup = -1;
+            // A fresh prompt may already own an admission reservation. It has
+            // no materialized rank KV yet; keep its chosen owner and slot.
+            if (!state.storageLease) {
+                state.attentionRanks.clear();
+                state.attentionGroup = -1;
+            }
             state.layers.clear();
             state.layers.resize(blockCnt);
             state.engramPrefetch.reset();
@@ -4066,6 +4074,13 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::OnResponseContextFinished(ResponseContext *context) {
+        // History and outputs are already saved. Reclaim fixed slots before
+        // admitting replacements, including states deferred by API removal.
+        if (!v41ServingReservations.empty()) {
+            OnResponseContextRemoved(context);
+            ReleaseRetiredStates();
+            return;
+        }
         ReleaseRetiredStates();
         std::shared_ptr<DeepSeekV41DsparkState> draft;
         if (context) {
@@ -4105,6 +4120,22 @@ namespace fastllm {
                 return;
             }
 #ifdef USE_CUDA
+            if (src.isFake && src.isKVCache && src.dataDevice == DataDevice::CUDA &&
+                !src.multiDeviceData) {
+                // A fixed slot can be much larger than the live prefix. Copy
+                // only live rows directly to CPU, without a second GPU slot.
+                const int previous = FastllmCudaGetDevice();
+                FastllmCudaSetDevice(src.dataDeviceIds.at(0));
+                dst.ToDevice(DataDevice::CPU, false);
+                dst.dataType = src.dataType; dst.UpdateUnitSize();
+                dst.Resize(src.dims); dst.Allocate(false);
+                size_t liveElements = 1;
+                for (int dim : src.dims) liveElements *= dim;
+                if (liveElements) FastllmCudaCopyFromDeviceToHost(dst.cpuData, src.cudaData,
+                    liveElements * src.unitSize / src.unitSizeDiv);
+                FastllmCudaSetDevice(previous);
+                return;
+            }
             // 张量并行下缓存是每卡一份，root 只保留形状；快照必须从某张卡的副本上取。
             if (src.multiDeviceData && src.IsTensorParallelReplicated()) {
                 for (const auto &it : src.multiDeviceDatas) {
@@ -5363,6 +5394,7 @@ namespace fastllm {
           : model(model), inputSegments(inputSegments), inputIds(inputIds), inputEmbeds(inputEmbeds), imageMask(imageMask), generationConfigsIn(generationConfigsIn), lastTokens(lastTokens), retLogits(retLogits), samplingPastKeyValues(samplingPastKeyValues) {}
     };
 #include "deepseekv41_parallel.inc"
+#include "deepseekv41_memory.inc"
 
     DeepSeekV41Model::ForwardState::ForwardState(DeepSeekV41Model &model, const std::vector<DeepSeekV41Segment> &inputSegments,
                                                        const Data &inputIds,

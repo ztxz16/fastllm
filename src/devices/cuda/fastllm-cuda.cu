@@ -455,11 +455,33 @@ static void FastllmCudaPrintMallocStack(size_t size, const char *file, int line,
     fflush(stderr);
 }
 
+// Reservations back both direct allocations and ordinary cached blocks. Only
+// physical releases come here; pool busy/graph pins/event handling stays intact.
+cudaError_t FastllmCudaCheckedFree(void *pointer) {
+    if (!fastllm::IsCudaReservationPointer(pointer)) return cudaFree(pointer);
+    cudaPointerAttributes attr{};
+    cudaError_t state = cudaPointerGetAttributes(&attr, pointer);
+    if (state != cudaSuccess) return state;
+    int original = 0;
+    cudaGetDevice(&original);
+    state = cudaSetDevice(attr.device);
+    if (state == cudaSuccess) state = cudaDeviceSynchronize();
+    if (state == cudaSuccess) fastllm::TryFreeCudaReservation(pointer);
+    cudaError_t restored = cudaSetDevice(original);
+    return state == cudaSuccess ? restored : state;
+}
+
 // Pool internals already hold their device lock and perform their own recovery.
 static cudaError_t FastllmCudaCheckedMallocRaw(void **ret, size_t size, const char *file, int line) {
-    if (ret != nullptr) {
-        *ret = nullptr;
-    }
+    if (ret == nullptr) return cudaErrorInvalidValue;
+    *ret = nullptr;
+    if (size == 0) return cudaSuccess;
+    int device = -1;
+    cudaError_t deviceState = cudaGetDevice(&device);
+    if (deviceState != cudaSuccess) return deviceState;
+    if (FastllmCudaGraphIsCapturingFast()) return cudaErrorStreamCaptureUnsupported;
+    if (fastllm::TryAllocateCudaReservation(device, size, ret))
+        return *ret ? cudaSuccess : cudaErrorMemoryAllocation;
     bool rejected = fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
     int rejectLogIndex = rejected ?
         fastllmCudaMallocRejectLogCount.fetch_add(1, std::memory_order_relaxed) : -1;
@@ -760,7 +782,7 @@ CudaInfos::CudaInfos() {
     cudaArch = infosInCpu[0];
     hasTensorCore = cudaArch >= 700;
 
-    cudaFree(infos);
+    FastllmCudaCheckedFree(infos);
     delete[] infosInCpu;
 
     printf("CUDA_ARCH: %d\n", cudaArch);
@@ -1698,9 +1720,23 @@ bool FastllmCudaGraphEndCapture(void **graph) {
 bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
     cudaGraphExec_t cudaExec = nullptr;
     cudaError_t state = cudaGraphInstantiate(&cudaExec, (cudaGraph_t)graph, nullptr, nullptr, 0);
+    if (state == cudaErrorMemoryAllocation && !FastllmCudaGraphIsCapturingFast()) {
+        // Driver-owned graph storage cannot reuse our idle tensor blocks.
+        // Reclaim only unpinned, completed allocations on this device; live
+        // tensors and addresses retained by any captured graph stay intact.
+        cudaGetLastError();
+        FastllmCudaReleaseIdleCachedBuffers(FastllmCudaGetDevice());
+        if (!FastllmCudaGetThreadError()) {
+            state = cudaGraphInstantiate(&cudaExec, (cudaGraph_t)graph, nullptr, nullptr, 0);
+        }
+    }
     if (exec != nullptr) {
         *exec = (void*)cudaExec;
     }
+    // Instantiation is optional. Its caller owns graph cleanup and eager
+    // fallback; a stale OOM must not poison the parallel runtime's next check
+    // and enter communicator abort while these graphs still retain NCCL refs.
+    if (state == cudaErrorMemoryAllocation) cudaGetLastError();
     return FastllmCudaGraphSetError("cudaGraphInstantiate", state);
 }
 
@@ -4800,7 +4836,7 @@ static void FastllmCudaPinGraphBuffer(CudaMemoryBuffer &buffer) {
 }
 
 static bool FastllmCudaBufferReadyForReuseLocked(
-        CudaMemoryBuffer &buffer, bool synchronizedGraphCapture = false) {
+        CudaMemoryBuffer &buffer, bool synchronizedGraphCapture = false, bool waitForRelease = false) {
     if (!buffer.reusePending) {
         return true;
     }
@@ -4814,7 +4850,11 @@ static bool FastllmCudaBufferReadyForReuseLocked(
         buffer.reusePending = false;
         return true;
     }
-    cudaError_t state = cudaEventQuery(buffer.reuseReadyEvent);
+    // A bounded backing pool cannot rely on a driver allocation's implicit
+    // synchronization. On pressure, wait only for already-retired storage;
+    // ordinary allocation scans remain nonblocking.
+    cudaError_t state = waitForRelease && fastllm::IsCudaReservationPointer(buffer.data)
+        ? cudaEventSynchronize(buffer.reuseReadyEvent) : cudaEventQuery(buffer.reuseReadyEvent);
     if (state == cudaSuccess) {
         buffer.reusePending = false;
         return true;
@@ -4936,13 +4976,13 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
     }
     for (auto &buffer : bigBuffers) {
         if (buffer.busy || buffer.graphPins > 0 ||
-            !FastllmCudaBufferReadyForReuseLocked(buffer) ||
+            !FastllmCudaBufferReadyForReuseLocked(buffer, false, true) ||
             FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
             keep.push_back(buffer);
             continue;
         }
         FastllmCudaDestroyReuseEventLocked(buffer);
-        state = cudaFree(buffer.data);
+        state = FastllmCudaCheckedFree(buffer.data);
         if (cudaSuccess == state) {
             released += buffer.size;
         } else {
@@ -5146,7 +5186,7 @@ static bool FastllmCudaTryFreeWeightSlabPtr(void *ret) {
                     int oriId = -1;
                     cudaGetDevice(&oriId);
                     cudaSetDevice(id);
-                    cudaError_t state = cudaFree(slabs[i].base);
+                    cudaError_t state = FastllmCudaCheckedFree(slabs[i].base);
                     if (oriId >= 0 && oriId != id) {
                         cudaSetDevice(oriId);
                     }
@@ -5426,7 +5466,7 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
         return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
     }
     if (*ret != nullptr) {
-        cudaFree(*ret);
+        FastllmCudaCheckedFree(*ret);
         *ret = nullptr;
     }
     if (state == cudaSuccess && !FastllmCudaGetThreadError()) {
@@ -5444,7 +5484,7 @@ void FastllmCudaDirectFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
-    cudaError_t state = cudaFree(ret);
+    cudaError_t state = FastllmCudaCheckedFree(ret);
     //checkCudaErrors("Error: CUDA error when release memory!", state);
 }
 
@@ -5565,12 +5605,12 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         busyBuffers.reserve(bigBuffers.size());
         for (auto &buffer : bigBuffers) {
             if (buffer.busy || buffer.graphPins > 0 ||
-                !FastllmCudaBufferReadyForReuseLocked(buffer) ||
+                !FastllmCudaBufferReadyForReuseLocked(buffer, false, true) ||
                 FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
                 FastllmCudaDestroyReuseEventLocked(buffer);
-                state = cudaFree(buffer.data);
+                state = FastllmCudaCheckedFree(buffer.data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle big buffer on device %d!", id);
                     checkCudaErrors("", state);
@@ -5587,12 +5627,12 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         busyBuffers.reserve(cudaBuffers.size());
         for (auto &buffer : cudaBuffers) {
             if (buffer.busy || buffer.graphPins > 0 ||
-                !FastllmCudaBufferReadyForReuseLocked(buffer) ||
+                !FastllmCudaBufferReadyForReuseLocked(buffer, false, true) ||
                 FastllmCudaGraphPoolPointerProtectedLocked(buffer.data)) {
                 busyBuffers.push_back(buffer);
             } else {
                 FastllmCudaDestroyReuseEventLocked(buffer);
-                state = cudaFree(buffer.data);
+                state = FastllmCudaCheckedFree(buffer.data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle buffer on device %d!", id);
                     checkCudaErrors("", state);
@@ -6163,7 +6203,7 @@ void FastllmCudaForceFree(void *ret) {
                 }
                 state = cudaSetDevice(view.device);
                 FastllmCudaDestroyReuseEventLocked(cudaBuffers[i]);
-                state = cudaFree(cudaBuffers[i].data);
+                state = FastllmCudaCheckedFree(cudaBuffers[i].data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when force releasing memory on device %d!", view.device);
                 }
@@ -6197,7 +6237,7 @@ void FastllmCudaForceFree(void *ret) {
                 }
                 state = cudaSetDevice(view.device);
                 FastllmCudaDestroyReuseEventLocked(bigBuffers[i]);
-                state = cudaFree(bigBuffers[i].data);
+                state = FastllmCudaCheckedFree(bigBuffers[i].data);
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when force releasing big memory on device %d!", view.device);
                 }
@@ -6214,7 +6254,7 @@ void FastllmCudaForceFree(void *ret) {
 #ifdef CUDA_MEM_DEBUG
     CudaMemDebugRemove(ret);
 #endif
-    state = cudaFree(ret);
+    state = FastllmCudaCheckedFree(ret);
     FastllmCudaSetDevice(oriId);
     checkCudaErrors("CUDA error when force releasing uncached memory!", state);
 }
@@ -6419,7 +6459,7 @@ void FastllmCudaFree(void *ret) {
         cudaError_t syncState = cudaDeviceSynchronize();
         checkCudaErrors("CUDA error when synchronizing before release!", syncState);
     }
-    cudaError_t state = cudaFree(ret);
+    cudaError_t state = FastllmCudaCheckedFree(ret);
     cudaError_t restoreState = cudaSetDevice(oriId);
     checkCudaErrors("CUDA error when release memory!", state);
     checkCudaErrors("CUDA error when restoring device after release!", restoreState);
@@ -6452,7 +6492,7 @@ int FastllmCudaTryMallocBigBuffers(size_t size, int count) {
         }
         if (state != cudaSuccess || ret == nullptr) {
             if (ret != nullptr) {
-                cudaFree(ret);
+                FastllmCudaCheckedFree(ret);
                 ret = nullptr;
             }
             size_t freeMem = 0, totalMem = 0;
@@ -6568,7 +6608,7 @@ static void FastllmCudaClearBigBufferWithRetain(
                     bigBuffers[i].data)) {
                 state = cudaSetDevice(view.device);
                 FastllmCudaDestroyReuseEventLocked(bigBuffers[i]);
-                state = cudaFree(bigBuffers[i].data);
+                state = FastllmCudaCheckedFree(bigBuffers[i].data);
                 if (cudaSuccess != state)
                     printf("Error: CUDA error when release memory on device %d!", view.device);
                 checkCudaErrors("", state);
@@ -13644,7 +13684,7 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
         FastllmSelectExpertFixedTopKKernel<false, 384, 6><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
-    } else if (n <= 8 && numExperts == 256 && topk == 8) {
+    } else if (numExperts == 256 && topk == 8) {
         FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
@@ -17946,7 +17986,7 @@ struct FastllmMtpSamplingWorkspace {
         }
     }
     ~FastllmMtpSamplingWorkspace() {
-        if (dedicated || resident) cudaFree(scratch);
+        if (dedicated || resident) FastllmCudaCheckedFree(scratch);
         else FastllmReleaseDequantScratch(scratch, own);
         cudaFreeHost(pinnedParameters);
     }

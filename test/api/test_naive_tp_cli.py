@@ -40,6 +40,32 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
             self.model_options = fake.llm.model.call_args.kwargs
             return args
 
+    def test_fp8_compute_cli_and_saved_settings(self):
+        self.configure([])
+        self.assertEqual(self.model_options['indexer_compute_dtype'], 'auto')
+        self.assertNotIn('FASTLLM_CUDA_NATIVE_FP8_PREFILL', self.native_env)
+        for saved in (False, True):
+            settings = {'indexer_compute_dtype': 'fp8', 'fp8_prefill': 'true'}
+            options = [] if saved else [part for k, v in settings.items() for part in ('--' + k, v)]
+            self.configure(options, saved=settings if saved else None)
+            self.assertEqual(self.model_options['indexer_compute_dtype'], 'fp8')
+            self.assertEqual(self.native_env['FASTLLM_CUDA_NATIVE_FP8_PREFILL'], '1')
+
+    def test_fp8_prefill_environment_and_saved_booleans(self):
+        name = 'FASTLLM_CUDA_NATIVE_FP8_PREFILL'
+        self.configure(['--fp8_prefill', 'auto'], environment={name: '1'})
+        self.assertEqual(self.native_env[name], '1')
+        for value in ('true', 'false', True, False):
+            with self.subTest(value=value):
+                self.configure([], saved={'fp8_prefill': value}, environment={name: '1'})
+                self.assertEqual(self.native_env[name], '1' if str(value).lower() == 'true' else '0')
+        self.configure(['--fp8_prefill', 'false'], environment={name: '1'})
+        self.assertEqual(self.native_env[name], '0')
+
+    def test_fp8_prefill_rejects_invalid_saved_value(self):
+        with self.assertRaisesRegex(ValueError, 'fp8_prefill'):
+            self.configure([], saved={'fp8_prefill': 'invalid'})
+
     def test_indexer_tp_storage(self):
         self.configure(['--tp', '8'])
         self.assertEqual(self.model_options['indexer_tp_storage'], 'replicated')
@@ -104,6 +130,23 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         for changes in ({'prefill_batch_requests': -1}, {'prefill_max_requests': 15},
                         {'prefill_min_decode_requests': -1}, {'prefill_batch_tokens': 0},
                         {'prefill_max_requests': 2147483648}):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'prefill'):
+                self.configure([], saved={**values, **changes})
+
+    def test_prefill_scheduling_cli_and_saved_settings(self):
+        values = dict(prefill_batch_tokens=32768, prefill_dp_balance='true',
+                      prefill_adaptive_requests=256, prefill_chunked='true',
+                      prefill_chunk_max_wait_ms=1000, prefill_fairness_ms=1000)
+        for saved in (False, True):
+            options = [] if saved else [p for k, v in values.items() for p in ('--' + k, str(v))]
+            self.configure(options, saved=values if saved else None)
+            self.loaded_model.set_prefill_scheduling.assert_called_once_with(balance_dp=True,
+                adaptive_requests=256, chunked=True, chunk_max_wait_ms=1000, fairness_ms=1000)
+        self.configure([])
+        self.loaded_model.set_prefill_scheduling.assert_not_called()
+        for changes in ({'prefill_batch_tokens': 0}, {'prefill_chunked': 'false'},
+                        {'prefill_adaptive_requests': -1}, {'prefill_dp_balance': 'invalid'},
+                        {'prefill_chunk_max_wait_ms': True}, {'prefill_fairness_ms': 2147483648}):
             with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, 'prefill'):
                 self.configure([], saved={**values, **changes})
 

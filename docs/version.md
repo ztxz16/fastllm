@@ -2,6 +2,14 @@
 
 [English](version_en.md)
 
+## V1.9.2
+
+- 新增 DeepSeek-V4.1-Flash 的 Unsloth 系列量化模型支持，新增 EXL3 格式模型支持
+- 完善 MiniMax-H3、MiniMax-H3-Image 和 Qwen-Image-2.1 模型支持，提供 BF16、FP8、FP4（NVFP4）、INT8、GGUF 等精度及张量并行能力（支持范围因模型而异，Qwen-Image-2.1 量化支持为实验性）
+- 优化推测解码、并发和混合推理等场景的性能
+- 初步支持部分模型的 Attention DP
+- 初步支持部分模型的 PD 分离部署
+
 ## V1.9.1
 
 - 新增 Clover、Qwen-Image、HY-Nomas、LingBot World、MiniMax-H3 和 Pika-H3-Flex 模型支持

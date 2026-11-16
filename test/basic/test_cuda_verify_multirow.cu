@@ -62,8 +62,7 @@ static void Linear(int rows, int m, int k, bool bias, int pattern) {
     ++checks;
 }
 static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
-    // At least two rows force the original generic SelectExpert reference.
-    int n = std::max(rows, 2);
+    int n = rows;
     Data x(FLOAT32, {n, 256}), p(FLOAT32, {n, 256}), b(FLOAT32, {256});
     Data i(INT32, {n, 8}), s(FLOAT32, {n, 8}), ri(INT32, {n, 8}), rs(FLOAT32, {n, 8});
     for (Data *d : {&x, &p, &b, &i, &s, &ri, &rs})
@@ -94,7 +93,19 @@ static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
     Cuda(cudaMemcpy(x.cudaData, v.data(), x.GetBytes(), cudaMemcpyHostToDevice));
     Cuda(cudaMemcpy(b.cudaData, bv.data(), b.GetBytes(), cudaMemcpyHostToDevice));
     Check(FastllmCudaSigmoid(x, p), "sigmoid reference failed");
-    Check(FastllmCudaSelectExpert(p, bias ? &b : nullptr, ri, rs, 8, norm, scale), "router reference failed");
+    // A padded, never-selected expert forces the unchanged generic selector.
+    // Row count alone no longer selects that implementation. Every pattern
+    // has at least eight finite keys above the padding key, including ties.
+    Data referenceP(FLOAT32, {n, 257}), referenceBias(FLOAT32, {257});
+    Allocate(referenceP); Allocate(referenceBias);
+    Cuda(cudaMemset(referenceP.cudaData, 0, referenceP.GetBytes()));
+    Cuda(cudaMemcpy2D(referenceP.cudaData, 257 * sizeof(float), p.cudaData, 256 * sizeof(float),
+        256 * sizeof(float), n, cudaMemcpyDeviceToDevice));
+    std::vector<float> referenceB(257, 0.f);
+    if (bias) std::copy(bv.begin(), bv.end(), referenceB.begin());
+    referenceB.back() = -std::numeric_limits<float>::max();
+    Cuda(cudaMemcpy(referenceBias.cudaData, referenceB.data(), referenceBias.GetBytes(), cudaMemcpyHostToDevice));
+    Check(FastllmCudaSelectExpert(referenceP, &referenceBias, ri, rs, 8, norm, scale), "router reference failed");
     // The fused kernel uses the requested row count, including the one-row case.
     x.Resize({rows, 256});
     i.Resize({rows, 8});
@@ -111,6 +122,13 @@ static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
     sc = Read<unsigned>(s);
     Check(std::equal(a.begin(), a.end(), ref.begin()), "unfused router indices differ");
     Check(std::equal(sc.begin(), sc.end(), sr.begin()), "unfused router scores differ bitwise");
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Check(FastllmCudaSelectExpert(p, bias ? &b : nullptr, i, s, 8, norm, scale), "captured router failed");
+    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Cuda(cudaGraphInstantiate(&exec, graph, 0)); Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+    Check(Read<int>(i) == a && Read<unsigned>(s) == sc, "captured router changed output");
+    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
     ++checks;
 }
 int main() {
@@ -130,6 +148,12 @@ int main() {
                         for (float scale : {1.f, 2.5f})
                             Router(rows, pattern, bias, norm, scale);
         }
+        for (int rows : {9, 16, 32, 64, 128, 256, 1024})
+            for (int pattern = 0; pattern < 7; ++pattern)
+                for (bool bias : {false, true})
+                    for (bool norm : {false, true})
+                        for (float scale : {1.f, 2.5f})
+                            Router(rows, pattern, bias, norm, scale);
         Cuda(cudaDeviceSynchronize());
         printf("VERIFY MULTIROW PASS checks=%d\n", checks);
         return 0;
