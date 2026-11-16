@@ -61,6 +61,68 @@ class StateModel : public basellm {
     }
 };
 
+// Exercise the actual chunked serving loop after transfer, rather than only
+// calling ImportPDState and supplying correct positions directly to Forward.
+static void TestChunkedDecodeHandoff() {
+    class ScheduledModel final : public StateModel {
+      public:
+        std::atomic<int> positionErrors{0};
+        ScheduledModel() {
+            use_new_engine = false; canDoBatchForward = true; eos_token_id = -100;
+            dataType = kvCacheDataType = FLOAT32;
+        }
+        ~ScheduledModel() override { ShutdownRuntime(); }
+        void Stop() { ShutdownRuntime(); }
+        bool SupportsPrefillBatching() const override { return true; }
+        bool SupportsChunkedPrefillScheduling() const override { return true; }
+        bool NeedAttentionMask(int, int) override { return false; }
+        bool UseGenericHistoryCache() const override { return false; }
+        bool RetainCudaWorkspace() const override { return true; }
+        void ImportPDState(ResponseContext &context, const fastkv::Message &state) override {
+            StateModel::ImportPDState(context, state);
+            context.pastKeyValues[0].second.CopyFrom(context.pastKeyValues[0].first);
+            for (Data *cache : {&context.pastKeyValues[0].first, &context.pastKeyValues[0].second})
+                cache->expansionDims = cache->dims;
+        }
+        int Forward(const Data &ids, const Data &, const Data &positions,
+                    std::vector<std::pair<Data,Data>> &kv, const GenerationConfig &,
+                    const LastTokensManager &, std::vector<float> *) override {
+            const int past = kv[0].first.dims.empty() ? 0 : kv[0].first.dims[1];
+            for (size_t i = 0; i < ids.Count(0); ++i)
+                if (((float *)positions.cpuData)[i] != past + i) ++positionErrors;
+            const int length = past + ids.Count(0);
+            for (Data *cache : {&kv[0].first,&kv[0].second}) {
+                cache->CopyFrom(Data(FLOAT32,{1,length,1},std::vector<float>(length,1)));
+                cache->expansionDims = cache->dims;
+            }
+            return 42;
+        }
+    } prefill, decode;
+    fastkv::Service port; port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    auto endpoint = port.Address(); port.Stop();
+    SetMaxTokens(4096);
+    Check(decode.SetPrefillBatching(16,0) && decode.SetPrefillScheduling(false,0,true,0,0),
+          "chunked decode policy rejected");
+    prefill.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","positions"},
+        {"transport","tcp"},{"listen",endpoint},{"chunk_tokens",2}});
+    decode.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","positions"},
+        {"transport","tcp"},{"prefill",json11::Json::array{endpoint}}});
+    GenerationConfig config; config.output_token_limit = 3; config.top_k = 1; config.add_special_tokens = false;
+    int handle = decode.LaunchResponseTokens({3,7,11,19,23,29},config);
+    for (int step = 0; step < 3; ++step) {
+        for (int i = 0; i < 5000 && !decode.CanFetchResponse(handle); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(decode.CanFetchResponse(handle), "chunked PD scheduler stalled");
+        int token;
+        Check(decode.FetchResponseTokensBatch(handle,&token,1) == 1 && token == 42,
+              "chunked PD continuation failed");
+    }
+    Check(prefill.positionErrors == 0 && decode.positionErrors == 0,
+          "PD handoff reset prompt/decode positions");
+    decode.Stop(); prefill.StopPD();
+    std::cout << "PASS PD chunked serving positions after handoff\n";
+}
+
 static void TestAdmissionLifetime() {
     class DecodeModel final : public StateModel {
       public:
@@ -851,6 +913,7 @@ int main() {
         TestPreparedPrefill();
         TestQueuedTransfers();
         TestLoadAwareRouting();
+        TestChunkedDecodeHandoff();
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "
                      "and cancellation\n";
     } catch (const std::exception &error) {

@@ -3716,9 +3716,15 @@ namespace fastllm {
                                 handles.push_back(it.first);
                                 selectedContexts.push_back(it.second);
 
+                                // A PD handoff leaves one prompt token. Its
+                                // imported prefix advances positions, but is
+                                // not a local cache hit in usage statistics.
+                                const int prefillBase = it.second->pdPending
+                                    ? it.second->inputTokens - int(it.second->currentTokens.size())
+                                    : it.second->cacheLen;
                                 if (scheduledPrefill || it.second->preTokens == 0) {
                                     it.second->intParams["add_special_tokens"] = it.second->cacheLen > 0 ? false : it.second->generationConfig.add_special_tokens;
-                                    it.second->intParams["promptLen"] = it.second->cacheLen + it.second->currentTokens.size();
+                                    it.second->intParams["promptLen"] = prefillBase + it.second->currentTokens.size();
                                     it.second->intParams["index"] = 0;
                                 } else {
                                     it.second->intParams["index"]++;
@@ -3727,7 +3733,7 @@ namespace fastllm {
                                     std::vector<float> positions(chunkTokens);
                                     for (int j = 0; j < chunkTokens; ++j) {
                                         ids.push_back(it.second->currentTokens[it.second->prefillOffset + j]);
-                                        positions[j] = it.second->cacheLen + it.second->prefillOffset + j;
+                                        positions[j] = prefillBase + it.second->prefillOffset + j;
                                     }
                                     seqLens.push_back(chunkTokens);
                                     prefillTokens += chunkTokens;
