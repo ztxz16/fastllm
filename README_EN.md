@@ -2,12 +2,13 @@
 
 [中文](README.md) · [Quick start](#quick-start) · [`--auto` tuning](docs/auto_en.md) · [Documentation](docs/README_EN.md) · [Benchmarks](docs/benchmark_en.md) · [Changelog](docs/version_en.md)
 
-FastLLM is an inference engine for running and serving language models locally. Its C++ runtime does not depend on PyTorch. It supports dense and MoE models, GPU/CPU/NUMA/disk hybrid inference, and multi-GPU deployment.
+FastLLM is an inference engine for running and serving language, image-generation, and video-generation models locally. Its C++ runtime does not depend on PyTorch. It supports dense and MoE models, GPU/CPU/NUMA/disk hybrid inference, and multi-GPU deployment.
 
 - **Automatic deployment:** `--auto` plans devices, memory, expert caches, and context capacity, with optional overrides.
 - **Browser launcher:** download models, save profiles, inspect logs, and use chat or agents in Studio.
 - **Compatible APIs:** OpenAI Chat Completions, Responses, and Anthropic Messages.
 - **Multiple weight formats:** Safetensors, FastLLM, AWQ, supported GGUF models, and EXL3. DeepSeek-V4.1-Flash supports original checkpoints and Unsloth / GSQ-RCO quantizations; see [formats and deployment](docs/deepseek_v41_en.md#models-and-weight-formats).
+- **Image and video generation:** MiniMax-H3, Pika H3 Flex, MiniMax-H3-Image, and Qwen-Image-2.1 have native inference and HTTP APIs. See the [image and video guide](docs/image-video_en.md) for launchers, quantization, multi-GPU use, and API examples.
 
 ## Quick start
 
@@ -101,6 +102,9 @@ For standalone chat, run `ftllm webui --api_base http://127.0.0.1:8080/v1 --api_
 | Kimi-K3 | [Kimi-K3 guide](docs/kimi_k3_en.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 guide](docs/glm5_en.md) |
 | Dots3-Note / Laguna | [Dots3-Note](docs/dots3_note_en.md) · [Laguna](docs/laguna_en.md) |
+| MiniMax-H3 / Pika H3 Flex | [Video generation, keyframes, and references](docs/image-video_en.md#video-minimax-h3--pika-h3-flex) |
+| MiniMax-H3-Image | [Image generation and reference editing](docs/image-video_en.md#images-minimax-h3-image) |
+| Qwen-Image-2.1 | [Image generation, editing, and HTTP service](docs/image-video_en.md#images-qwen-image-21) |
 
 Other models are listed in the [support list (Chinese)](docs/models.md). For agent-assisted deployment, provide the [model and option reference (Chinese)](docs/model-deployment-agent.md). Measured speed depends on hardware, workload, and quantization; see the [benchmarks](docs/benchmark_en.md).
 

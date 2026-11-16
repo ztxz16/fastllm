@@ -5,11 +5,12 @@
 - [快速开始](../README.md)
 - [模型部署指南](../README.md#模型部署指南)
 - [DeepSeek-V4.1-Flash](deepseek_v41.md)：原版、Unsloth / GSQ-RCO GGUF、EXL3、混合推理与 DSpark
+- [图片与视频生成](image-video.md)：支持模型、启动器、量化、多卡、HTTP API 与工作室联动
 - [HY-Nomas 世界模型与 HTTP Demo](hy_nomas.md)：原生库构建、权重准备和服务启动
 - [LingBot World 2.0 世界模型与 HTTP Demo](lingbot_world.md)：权重转换、原生推理和世界会话接口
 - [MiniMax-H3 原生音视频生成](../tools/minimax_h3/README.md)：T2VA、单卡 BF16、FP32 对比、HTTP API 与 Demo
 - [`--auto` 参数调节与启动器](auto.md)：常用参数的影响、命令示例和日志检查
-- [启动器与工作室](launcher.md)：配置管理、聊天和 Agent
+- [启动器与工作室](launcher.md)：配置管理、聊天、图片 / 视频生成和 Agent
 - [手动部署与完整参数参考](deployment.md)：设备配置、模型格式、下载导出和源码安装
 - [自动规划原理与模型默认值](hybrid-auto.md)
 - [Benchmark](benchmark.md)：按模型保存最终结果及测量范围

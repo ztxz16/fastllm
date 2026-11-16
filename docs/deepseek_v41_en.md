@@ -40,7 +40,7 @@ Keep the repository's EXL3 configuration and complete weight set. The loader val
 
 Text, tool calling, prefix reuse, hybrid inference, and TP use the model-specific deployment paths below. DSpark requires embedded `mtp.*` weights or a matching external draft. Multiple requests can batch target verification; compatible single-CUDA requests can also batch drafts and replay a full draft graph. TP drafts and unsupported combinations retain independent execution. See [draft batching and limits (Chinese)](deepseek_v41.md#多请求草稿合批).
 
-Image understanding requires original vision components or a matching `--mmproj` plus vision routing biases. Image requests currently do not speculate.
+Image understanding requires original vision components or a matching `--mmproj` plus vision routing biases. Image requests currently do not speculate. To **generate** images or videos, use the [dedicated generation models](image-video_en.md).
 
 ## Automatic configuration (recommended)
 

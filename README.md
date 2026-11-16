@@ -2,12 +2,13 @@
 
 [English](README_EN.md) · [快速开始](#快速开始) · [`--auto` 调节指南](docs/auto.md) · [文档](docs/README.md) · [Benchmark](docs/benchmark.md) · [版本日志](docs/version.md)
 
-FastLLM 是用于本地运行和服务部署的大模型推理引擎，核心运行时使用 C++，不依赖 PyTorch。支持稠密与 MoE 模型、GPU/CPU/NUMA/磁盘混合推理，以及多卡部署。
+FastLLM 是用于本地运行和服务部署的大模型推理引擎，支持语言模型、图片生成和视频生成。核心运行时使用 C++，不依赖 PyTorch；支持稠密与 MoE 模型、GPU/CPU/NUMA/磁盘混合推理，以及多卡部署。
 
 - **自动部署**：使用 `--auto` 规划设备、内存、专家缓存和上下文，也可覆盖常用参数。
 - **浏览器启动器**：下载模型、保存配置、查看日志，直接在工作室中对话或使用 Agent。
 - **兼容 API**：提供 OpenAI Chat Completions、Responses 和 Anthropic Messages 接口。
 - **多种权重格式**：支持 Safetensors、FastLLM、AWQ、已适配的 GGUF 和 EXL3；DeepSeek-V4.1-Flash 支持原版、Unsloth 与 GSQ-RCO 量化模型，见[支持范围与部署](docs/deepseek_v41.md#模型与权重格式)。
+- **图片与视频生成**：支持 MiniMax-H3、Pika H3 Flex、MiniMax-H3-Image 和 Qwen-Image-2.1，提供原生推理与 HTTP 接口。启动器、量化、多卡和 API 用法见[图片与视频生成指南](docs/image-video.md)。
 
 ## 快速开始
 
@@ -103,7 +104,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | Dots3-Note / Laguna | [Dots3-Note](docs/dots3_note.md) · [Laguna](docs/laguna.md) |
 | HY-Nomas | [世界模型与 HTTP Demo 部署](docs/hy_nomas.md) |
 | LingBot World 2.0 1.3B | [原生推理、世界会话与 HTTP Demo](docs/lingbot_world.md) |
-| MiniMax-H3（T2VA） | [原生音视频生成与 HTTP Demo](tools/minimax_h3/README.md) |
+| MiniMax-H3 / Pika H3 Flex | [视频生成、首尾帧与参考素材](docs/image-video.md#视频生成minimax-h3--pika-h3-flex) |
+| MiniMax-H3-Image | [图片生成与参考图编辑](docs/image-video.md#图片生成minimax-h3-image) |
+| Qwen-Image-2.1 | [图片生成、编辑与 HTTP 服务](docs/image-video.md#图片生成qwen-image-21) |
 
 其他模型见[支持列表](docs/models.md)。让 Agent 帮忙部署时，可先提供[模型与参数速查](docs/model-deployment-agent.md)。实测速度与硬件、请求和量化格式有关，见 [Benchmark](docs/benchmark.md)。
 

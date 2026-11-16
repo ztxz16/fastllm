@@ -103,6 +103,16 @@ DeepSeek-V4 / V4.1 使用原生加载入口，当前推荐的格式与部署方�
 | deepseek-ai/DeepSeek-Coder-V2-Instruct      | √ | ✔ | √ |
 | deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct | √ | ✔ | ✔ |
 
+### 图片与视频生成模型
+
+这些模型使用专用原生后端，入口、量化范围和多卡限制见[图片与视频生成指南](image-video.md)，不使用 LLM 的 `ftllm server` 命令。
+
+| 模型 | 能力 | 启动入口 |
+| --- | --- | --- |
+| MiniMax-H3 / Pika H3 Flex | 音视频生成、首尾帧、图片/视频/音频参考；Pika 固定六步 | 启动器视频后端或 `minimax_h3_server` |
+| MiniMax-H3-Image | 图片生成、单图编辑、多图参考 | 启动器图像后端或 `minimax_h3_image_server` |
+| Qwen-Image-2.1 | 图片生成、单图/多图编辑 | `ftllm qwen-image server` / `generate` |
+
 ### LLaMA类模型
 
 |              模型  | 加载后转换 |  离线转换  |  直接读取  |
