@@ -1503,6 +1503,10 @@ extern "C" {
         return fastllm::GetMaxTokens();
     }
 
+    DLL_EXPORT int get_chunked_prefill_size_llm_model(int modelId) {
+        return models.GetModel(modelId)->GetChunkedPrefillSize();
+    }
+
     DLL_EXPORT void set_chunked_prefill_size_llm_model(int modelId, int size) {
         auto model = models.GetModel(modelId);
         model->SetChunkedPrefillSize(size);

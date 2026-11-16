@@ -1034,8 +1034,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--kernel-profile', default='', help='Read/write measured kernel profile JSON')
     parser.add_argument('--max_batch', type = int, default = -1,  help = '每次最多同时推理的询问数量')
     parser.add_argument('--chunked_prefill_size', type = _integer_or_auto, default = -1, help = '分块 prefill 的切片大小（首块与后续块相同），如8192；auto按混推内存预算选择')
-    parser.add_argument('--prefill_batch_tokens', type=int, default=0,
-                        help='prefill 攒批的未缓存 token 目标，0关闭；支持 Naive TP GPU 推理及 DSpark；批量总预算至少为 chunked_prefill_size')
+    parser.add_argument('--prefill_batch_tokens', type=int, default=None,
+                        help='prefill 合批的未缓存 token 预算；attention-DP默认每组一个chunk、零等待，0显式关闭；支持 Naive/DeepSeek V4.1 GPU 路径及 DSpark')
     parser.add_argument('--prefill_max_wait_ms', type=int, default=0,
                         help='prefill 攒批最长等待毫秒数，0不等待；需设置 prefill_batch_tokens；等待期间继续 decode')
     parser.add_argument('--prefill_batch_requests', type=int, default=0,
@@ -1268,7 +1268,9 @@ def make_normal_llm_model(args, startup_progress = None):
                                if name not in ("device", "moe_device") or getattr(args, name, None)]
 
     user_set_device = bool(args.device and args.device != "")
-    prefill_batch_tokens = getattr(args, 'prefill_batch_tokens', 0)
+    prefill_batch_auto = getattr(args, 'prefill_batch_tokens', None) is None
+    prefill_batch_tokens = 0 if prefill_batch_auto else args.prefill_batch_tokens
+    args.prefill_batch_tokens = prefill_batch_tokens
     prefill_max_wait_ms = getattr(args, 'prefill_max_wait_ms', 0)
     prefill_batch_requests = getattr(args, 'prefill_batch_requests', 0)
     prefill_max_requests = getattr(args, 'prefill_max_requests', 0)
@@ -1276,7 +1278,6 @@ def make_normal_llm_model(args, startup_progress = None):
     prefill_values = (prefill_batch_tokens, prefill_max_wait_ms, prefill_batch_requests,
                       prefill_max_requests, prefill_min_decode_requests)
     if (not all(isinstance(value, int) and 0 <= value <= 2147483647 for value in prefill_values)
-            or (prefill_batch_tokens == 0 and any(prefill_values[1:]))
             or (prefill_max_requests > 0 and prefill_batch_requests > prefill_max_requests)):
         raise ValueError("prefill coalescing requires non-negative int32 values, a positive token target, and batch_requests <= max_requests when capped")
     prefill_scheduling = {}
@@ -1290,10 +1291,9 @@ def make_normal_llm_model(args, startup_progress = None):
         if type(value) is not int or not 0 <= value <= 2147483647:
             raise ValueError(name + ' must be a non-negative int32')
         prefill_scheduling[name] = value
-    if ((any(prefill_scheduling.values()) and prefill_batch_tokens == 0)
-            or (not prefill_scheduling['prefill_chunked'] and
-                (prefill_scheduling['prefill_chunk_max_wait_ms'] or prefill_scheduling['prefill_fairness_ms']))):
-        raise ValueError('prefill scheduling requires batching; chunk timing requires prefill_chunked')
+    if (not prefill_scheduling['prefill_chunked'] and
+            (prefill_scheduling['prefill_chunk_max_wait_ms'] or prefill_scheduling['prefill_fairness_ms'])):
+        raise ValueError('prefill chunk timing requires prefill_chunked')
     user_set_moe_device = bool(args.moe_device and args.moe_device != "")
     # Resolve this after loading a saved JSON configuration. An explicit zero
     # must remain an opt-out, including when another model previously used slabs.
@@ -2102,6 +2102,9 @@ def make_normal_llm_model(args, startup_progress = None):
             raise ValueError("--attn-dp-size must divide the total --tp device count")
         if speculative_algorithm not in ("", "none", "dspark"):
             raise ValueError("Attention DP currently supports DSpark or ordinary decoding")
+    if (prefill_batch_tokens == 0 and not (prefill_batch_auto and attention_dp > 1) and
+            (any(prefill_values[1:]) or any(prefill_scheduling.values()))):
+        raise ValueError("prefill coalescing and scheduling require a positive token budget")
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
@@ -2308,6 +2311,17 @@ def make_normal_llm_model(args, startup_progress = None):
             if args.chunked_prefill_size > 0:
                 kvmem_options.setdefault("prefill_tokens", args.chunked_prefill_size)
             model.set_kvmem(**kvmem_options)
+        if prefill_batch_auto and attention_dp > 1:
+            # Resolve from the native model after chunk/KVMem configuration and
+            # before warmup reserves workspaces and the remaining KV capacity.
+            chunks = min(attention_dp, args.max_batch) if args.max_batch > 0 else attention_dp
+            prefill_batch_tokens = model.get_chunked_prefill_size() * chunks
+            if not 0 < prefill_batch_tokens <= 2147483647:
+                raise ValueError("Default attention-DP prefill budget must fit a positive int32")
+            args.prefill_batch_tokens = prefill_batch_tokens
+            print("[Fastllm] Attention DP prefill batching: %d tokens, max wait %d ms "
+                  "(default budget; --prefill_batch_tokens 0 disables it)." %
+                  (prefill_batch_tokens, prefill_max_wait_ms))
         if prefill_batch_tokens > 0:
             if any(prefill_values[2:]):
                 model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms,

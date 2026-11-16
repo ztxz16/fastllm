@@ -14,7 +14,7 @@ from fastllm_pytools.util import make_normal_llm_model, make_normal_parser, _is_
 
 
 class NaiveTensorParallelCliTest(unittest.TestCase):
-    def configure(self, options, model_type="naive_n05_flash", saved=None, config=None, environment=None):
+    def configure(self, options, model_type="naive_n05_flash", saved=None, config=None, environment=None, native_chunk=8192):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "config.json").write_text(json.dumps(
@@ -29,6 +29,7 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
             fake.llm = MagicMock()
             fake.llm.model.return_value.get_max_input_len.return_value = 4096
             fake.llm.model.return_value.get_max_batch.return_value = 1
+            fake.llm.model.return_value.get_chunked_prefill_size.return_value = native_chunk
             with patch.dict(os.environ, environment or {}, clear=True), \
                     patch.dict(sys.modules, {"ftllm": fake}), \
                     patch("fastllm_pytools.util._has_cuda_device", return_value=True), \
@@ -117,6 +118,68 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 self.configure(options)
         with self.assertRaisesRegex(ValueError, 'prefill'):
             self.configure([], saved={'prefill_batch_tokens': 2147483648})
+
+    def test_attention_dp_default_budget_and_wait(self):
+        for world, dp, chunk, limit, wait, expected in (
+                (4, 4, 4096, 32, 0, 16384), (8, 8, 4096, 64, 0, 32768),
+                (8, 4, 8192, -1, 0, 32768), (8, 8, 4096, 2, 0, 8192),
+                (8, 8, 4096, 64, 2000, 32768)):
+            with self.subTest(world=world, dp=dp, chunk=chunk, limit=limit, wait=wait):
+                args = self.configure(['--tp', str(world), '--attn-dp-size', str(dp),
+                                       '--max_batch', str(limit), '--chunked_prefill_size', str(chunk),
+                                       '--prefill_max_wait_ms', str(wait)],
+                                      native_chunk=chunk)
+                self.assertEqual(args.prefill_batch_tokens, expected)
+                self.loaded_model.set_prefill_batching.assert_called_once_with(expected, wait)
+                names = [call[0] for call in self.loaded_model.mock_calls]
+                self.assertLess(names.index('set_chunked_prefill_size'), names.index('get_chunked_prefill_size'))
+                self.assertLess(names.index('set_prefill_batching'), names.index('warmup'))
+
+    def test_attention_dp_preserves_explicit_batch_budget(self):
+        for budget in (0, 8192):
+            for saved in (False, True):
+                with self.subTest(budget=budget, saved=saved):
+                    settings = dict(tp='4', attn_dp_size=4, prefill_batch_tokens=budget)
+                    options = ['--tp', '4', '--attn-dp-size', '4', '--prefill_batch_tokens', str(budget)]
+                    args = self.configure([] if saved else options, saved=settings if saved else None)
+                    self.assertEqual(args.prefill_batch_tokens, budget)
+                    self.loaded_model.get_chunked_prefill_size.assert_not_called()
+                    if budget:
+                        self.loaded_model.set_prefill_batching.assert_called_once_with(budget, 0)
+                    else:
+                        self.loaded_model.set_prefill_batching.assert_not_called()
+
+    def test_attention_dp_default_budget_with_scheduling(self):
+        settings = dict(tp='4', attn_dp_size=4, prefill_batch_requests=8,
+                        prefill_max_requests=16, prefill_max_wait_ms=2000,
+                        prefill_dp_balance=True, prefill_chunked=True,
+                        prefill_chunk_max_wait_ms=100, prefill_fairness_ms=100)
+        self.configure([], saved=settings)
+        self.loaded_model.set_prefill_batching.assert_called_once_with(
+            32768, 2000, target_requests=8, max_requests=16, min_decode_requests=0)
+        self.loaded_model.set_prefill_scheduling.assert_called_once_with(
+            balance_dp=True, adaptive_requests=0, chunked=True,
+            chunk_max_wait_ms=100, fairness_ms=100)
+        for override in ({'prefill_batch_tokens': 0}, {'attn_dp_size': 1}):
+            with self.subTest(override=override), self.assertRaisesRegex(ValueError, 'prefill'):
+                self.configure([], saved={**settings, **override})
+
+    def test_attention_dp_saved_default_and_kvmem_chunk(self):
+        args = self.configure([], saved=dict(tp='4', attn_dp_size=4,
+                              kvmem='{"prefill_tokens": 2048}'), native_chunk=2048)
+        self.assertEqual(args.prefill_batch_tokens, 8192)
+        self.loaded_model.set_prefill_batching.assert_called_once_with(8192, 0)
+        names = [call[0] for call in self.loaded_model.mock_calls]
+        self.assertLess(names.index('set_kvmem'), names.index('get_chunked_prefill_size'))
+
+    def test_deepseek_attention_dp_uses_native_chunk(self):
+        self.configure(['--tp', '8', '--attn-dp-size', '8'],
+                       model_type='deepseek_v41', native_chunk=4096)
+        self.loaded_model.set_prefill_batching.assert_called_once_with(32768, 0)
+
+    def test_attention_dp_default_budget_rejects_overflow(self):
+        with self.assertRaisesRegex(ValueError, 'prefill budget'):
+            self.configure(['--tp', '8', '--attn-dp-size', '8'], native_chunk=2147483647)
 
     def test_prefill_coalescing_targets_and_caps(self):
         values = {'prefill_batch_tokens': 16384, 'prefill_max_wait_ms': 20000,

@@ -559,6 +559,9 @@ fastllm_lib.set_max_context_length_llm_model.restype = ctypes.c_int
 fastllm_lib.get_kv_cache_token_limit_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "get_chunked_prefill_size_llm_model"):
+    fastllm_lib.get_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int]
+    fastllm_lib.get_chunked_prefill_size_llm_model.restype = ctypes.c_int
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
 fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
@@ -3698,6 +3701,13 @@ class model:
     def get_kv_cache_token_limit(self):
         """返回所有并发会话共享的 KV Cache token 总容量。"""
         return fastllm_lib.get_kv_cache_token_limit_llm_model(self.model)
+
+    def get_chunked_prefill_size(self):
+        """Return the effective native chunk size, including KVMem's budget."""
+        getter = getattr(fastllm_lib, "get_chunked_prefill_size_llm_model", None)
+        if getter is None:
+            raise RuntimeError("Native library does not expose the prefill chunk size; rebuild it first")
+        return getter(self.model)
 
     def set_chunked_prefill_size(self, size: int):
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""

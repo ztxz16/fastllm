@@ -1,11 +1,20 @@
 Prefill 攒批与分块调度
 ====================
 
-默认关闭。适用于 Naive GPU TP/attention-DP，可配合 DSpark；其他模型需要实现
-相应的模型能力接口，未支持时明确拒绝配置，保持原有执行路径。
+ftllm server/cli 在 Naive/MiMo、DeepSeek V4.1 的 attention-DP（--attn-dp-size > 1）
+部署中默认开启零等待合批，不需要 --auto。队列里已有的 prefill 一起执行，不主动
+等待新请求。默认整副本预算为“原生实际 chunk × DP 组数”；显式 max_batch 小于
+DP 组数时按 max_batch 限制。chunk 读取模型的实际配置，包括 KVMem 的 prefill_tokens。
+预算在 warmup 之前生效，参与工作区和剩余 KV 容量规划，增加预算可能减少 KV 容量。
+
+例如 chunk4096 时，DP4 默认16384、DP8 默认32768 token。显式传入
+--prefill_batch_tokens 0 可关闭；指定正数或保存的 JSON 预算均优先于默认值。
+纯 TP/单卡及其他路径仍需显式配置；支持 Naive GPU TP 和 DeepSeek V4.1 GPU，可配合
+DSpark。其他模型需要实现相应能力接口，未支持时明确拒绝配置。
+直接使用 Python model 时仍通过 set_prefill_batching(...) 手动配置。
 
 原有参数的 token、请求数和最小 decode 数均使用整个副本口径：
-  --prefill_batch_tokens N          未缓存 token 放行目标，0关闭
+  --prefill_batch_tokens N          未缓存 token 预算/放行目标；省略按上述默认，0关闭
   --prefill_batch_requests N        请求数目标，0不设目标
   --prefill_max_wait_ms N           最老请求的最长攒批等待，0不等待
   --prefill_max_requests N          单批 prefill 请求上限，0只受模型并发限制
@@ -32,7 +41,8 @@ Prefill 攒批与分块调度
     活跃decode达到最小数量时，累计prefill执行N毫秒后为decode保留N毫秒执行
     时间；0关闭。只在forward边界切换，单个不可拆分forward可以超过此时间。
 
-两个chunk时间参数要求prefill_chunked=true。所有新增选项要求正的batch_tokens。
+两个chunk时间参数要求prefill_chunked=true。所有新增选项要求正的batch_tokens，
+可使用 attention-DP 的自动预算；显式设置 batch_tokens=0 时不能启用等待或调度选项。
 通过启动参数、保存的JSON配置或Python model.set_prefill_scheduling(...) 设置，
 须在第一个推理请求之前完成。参数不会热修改正在执行的请求。
 

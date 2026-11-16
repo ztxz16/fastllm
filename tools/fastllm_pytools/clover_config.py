@@ -78,7 +78,7 @@ def prepare(args, config):
         raise ValueError("Clover requires original weights and no external draft/adapter/KVMem")
     if args.speculative_algorithm not in ("", "clover"):
         raise ValueError("Clover supports --speculative_algorithm clover or off")
-    if args.low_gpu_mem or args.moe_experts > 0 or args.prefill_batch_tokens > 0:
+    if args.low_gpu_mem or args.moe_experts > 0 or (args.prefill_batch_tokens or 0) > 0:
         raise ValueError("Clover requires resident weights, the checkpoint expert count and serial prefill")
     if args.max_batch > 256:
         raise ValueError("Clover currently supports --max_batch up to 256")
