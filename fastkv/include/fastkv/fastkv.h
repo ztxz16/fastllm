@@ -114,6 +114,10 @@ struct Message {
     std::vector<Buffer> buffers;
 };
 
+// Per-call receiver-owned placement; immutable request metadata only. The
+// service still owns allocation, budgets and transport lifetime.
+using ReceivePlacement = std::function<std::vector<int>(const Bytes &, const std::vector<size_t> &)>;
+
 // Optional reply placement into caller-reserved storage. Each outer entry
 // corresponds to one wire buffer; its ordered spans must cover exactly that
 // buffer. Spans own leases and must be private until the returned future is
@@ -147,7 +151,7 @@ struct Options {
     // Receiver-owned placement, resolved from bounded logical metadata. The
     // callback never allocates or mutates live model state; an empty result
     // uses receiveDevice. One destination per nonempty wire buffer.
-    std::function<std::vector<int>(const Bytes &, const std::vector<size_t> &)> receivePlacement;
+    ReceivePlacement receivePlacement;
     // Physical pool bounds, including idle registered buffers. Omitted devices
     // use maxInflightBytes. Model integration derives these from free memory.
     std::map<int, size_t> deviceBufferBytes;
@@ -203,7 +207,7 @@ class Service {
     // even if the caller drops its future. Cancel explicitly before dropping.
     bool TrySubmit(const std::string &peer, Message &request, std::future<Message> &result,
                    std::shared_ptr<Cancellation> cancellation = {}, std::shared_ptr<void> lifetime = {},
-                   ReceiveTarget target = {});
+                   ReceiveTarget target = {}, ReceivePlacement placement = {});
     Metrics Stats() const;
     static bool HasRdma();
     static bool HasCuda();

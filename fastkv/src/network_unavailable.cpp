@@ -28,7 +28,7 @@ std::future<Message> Service::Submit(const std::string &, Message) {
     throw std::runtime_error("FastKV transport unavailable");
 }
 bool Service::TrySubmit(const std::string &, Message &, std::future<Message> &,
-                        std::shared_ptr<Cancellation>, std::shared_ptr<void>, ReceiveTarget) {
+                        std::shared_ptr<Cancellation>, std::shared_ptr<void>, ReceiveTarget, ReceivePlacement) {
     throw std::runtime_error("FastKV transport unavailable");
 }
 Metrics Service::Stats() const {

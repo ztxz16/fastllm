@@ -284,6 +284,7 @@ struct Service::Impl {
         std::shared_ptr<Cancellation> cancellation = std::make_shared<Cancellation>();
         Message request;
         ReceiveTarget target;
+        ReceivePlacement placement;
         std::future<Message> result;
         std::promise<Message> completion;
         std::string peer;
@@ -445,7 +446,8 @@ struct Service::Impl {
         done.End();
         if (rdma) rdma->Complete();
     }
-    Message ReceiveMessage(const Socket &s, RdmaConnection *rdma, Deadline deadline, const ReceiveTarget &target = {}) {
+    Message ReceiveMessage(const Socket &s, RdmaConnection *rdma, Deadline deadline, const ReceiveTarget &target = {},
+                           const ReceivePlacement &placement = {}) {
         auto b = s.ReceiveFrame(
             CheckedAdd(options.maxMetadataBytes, CheckedAdd(16, options.maxBuffers * 8)), deadline);
         Reader r(b);
@@ -495,8 +497,8 @@ struct Service::Impl {
                     Require(bytes == sizes[i], "FastKV: receive target size mismatch");
                 }
             } else {
-                auto devices = options.receivePlacement ? options.receivePlacement(m.metadata, sizes)
-                                                        : std::vector<int>{};
+                const auto &resolve = placement ? placement : options.receivePlacement;
+                auto devices = resolve ? resolve(m.metadata, sizes) : std::vector<int>{};
                 if (devices.empty()) devices.assign(sizes.size(), options.receiveDevice);
                 Require(devices.size() == sizes.size(), "FastKV: invalid receive placement count");
                 for (int device : devices) Require(device >= -1, "FastKV: invalid receive device");
@@ -701,7 +703,7 @@ struct Service::Impl {
     }
     void ReceiveReply(const std::shared_ptr<Exchange> &c) {
         try {
-            auto reply = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline, c->target);
+            auto reply = ReceiveMessage(c->channel->socket, c->channel->rdma.get(), c->deadline, c->target, c->placement);
             ++calls;
             c->channel->socket.cancellation.reset();
             if (c->channel->reusable) {
@@ -892,7 +894,8 @@ std::future<Message> Service::Submit(const std::string &peer, Message m) {
     return result;
 }
 bool Service::TrySubmit(const std::string &peer, Message &request, std::future<Message> &result,
-                        std::shared_ptr<Cancellation> cancellation, std::shared_ptr<void> lifetime, ReceiveTarget target) {
+                        std::shared_ptr<Cancellation> cancellation, std::shared_ptr<void> lifetime, ReceiveTarget target,
+                        ReceivePlacement placement) {
     Require(!impl->stopped, "FastKV: service stopped");
     Require(!result.valid(), "FastKV: result already holds a submission");
     std::shared_ptr<void> slot;
@@ -902,6 +905,7 @@ bool Service::TrySubmit(const std::string &peer, Message &request, std::future<M
     if (cancellation) c->cancellation = std::move(cancellation);
     c->lifetime = std::move(lifetime);
     c->target = std::move(target);
+    c->placement = std::move(placement);
     c->peer = peer;
     auto future = c->completion.get_future();
     {

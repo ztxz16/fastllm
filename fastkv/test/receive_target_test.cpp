@@ -47,6 +47,25 @@ int main(int argc, char **argv) {
         bool rejected = false; try { (void)failed.get(); } catch (const std::exception &) { rejected = true; }
         Check(rejected, "invalid target was accepted");
         Check(client.Call(server.Address(),{}).buffers.size() == 2, "default receive regressed");
+        // Per-request maps must survive asynchronous submission independently
+        // of the service default and other in-flight requests.
+        std::atomic<int> placements{0};
+        std::vector<std::future<Message>> placed(8);
+        for (int i = 0; i < 8; ++i) {
+            Message request;
+            Check(client.TrySubmit(server.Address(), request, placed[i], {}, {}, {},
+                [&, destination = i % 2 ? gpu : -1](const Bytes &metadata, const std::vector<size_t> &sizes) {
+                    Check(metadata == Bytes{19} && sizes.size() == 2, "per-call placement metadata");
+                    ++placements; return std::vector<int>(sizes.size(), destination);
+                }), "per-call placement submit");
+        }
+        for (int i = 0; i < 8; ++i) {
+            auto value = placed[i].get();
+            Check(value.buffers[0].Device() == (i % 2 ? gpu : -1), "per-call placement device");
+            std::vector<unsigned char> got(bytes.size()); value.buffers[0].Read(got.data(), 0, got.size());
+            Check(got == bytes, "per-call placement bytes");
+        }
+        Check(placements == 8, "per-call placement lost or reused");
         reply = {};
         Message empty{{0}, {}}; std::future<Message> emptyResult;
         Check(client.TrySubmit(server.Address(),empty,emptyResult,{}, {},[](const Bytes &,const std::vector<size_t> &sizes) {
