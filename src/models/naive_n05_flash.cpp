@@ -854,7 +854,7 @@ Data NaiveN05FlashModel::RunTarget(
     const bool fusePrefillNorm = tensorParallel && !decodeWorkspace && !verifying && length > 1;
     bool prefillNormReady = false, prefillResidualSharded = false;
     // Fully data-parallel attention can keep activations local through the
-    // consecutive MoE layers, for both decode and prefill. Hybrid attention-TP
+    // consecutive MoE layers, including graph verification. Hybrid attention-TP
     // and unsupported layer layouts retain the existing world-row path.
     // Preserve prefill router/MoE arithmetic: its existing EP path routes
     // equal contiguous world-row shards. Unequal DP rows (or replicated small
@@ -864,7 +864,7 @@ Data NaiveN05FlashModel::RunTarget(
         std::all_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
             [&](const auto &rows) { return rows.size() == attentionParallel->rows.localToGlobal.front().size(); });
     const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
-        tpEp8MegaState && (decodeWorkspace || localPrefillRows) && !verifying && block_cnt > 1 && !moeLayers[0] &&
+        tpEp8MegaState && (decodeWorkspace || localPrefillRows) && block_cnt > 1 && !moeLayers[0] &&
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
     int maxLocalRows = 0;
     if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
