@@ -368,7 +368,7 @@ int main(int argc, char **argv) {
             const std::string key = argv[i];
             if (i + 1 == argc || (key != "--worker" && key != "--model" && key != "--request" &&
                 key != "--devices" && key != "--trace-logits" && key != "--session-fd" &&
-                key != "--cancel-fd" && key != "--cuda-graph" && key != "--custom-allreduce" && key != "--prefix-cache") || !args.emplace(key, argv[i+1]).second) {
+                key != "--cancel-fd" && key != "--cuda-graph" && key != "--custom-allreduce" && key != "--prefix-cache" && key != "--page-size" && key != "--tokens") || !args.emplace(key, argv[i+1]).second) {
                 throw std::runtime_error("invalid/duplicate generation argument");
             }
         }
@@ -406,6 +406,8 @@ int main(int argc, char **argv) {
         options.cudaGraph = args.count("--cuda-graph") && ParseCudaGraph(args.at("--cuda-graph"));
         options.customAllReduce = args.count("--custom-allreduce") && ParseCustomAllReduce(args.at("--custom-allreduce"));
         options.prefixCache = args.count("--prefix-cache") && ParsePrefixCache(args.at("--prefix-cache"));
+        options.pageSize = ParsePagedSize(args, "--page-size");
+        options.cacheTokens = ParsePagedSize(args, "--tokens");
         report["execution"] = options.cudaGraph ? "decode_cuda_graph" : "eager";
         options.workerPath = fs::absolute(args.at("--worker")).string();
         options.operationTimeoutMs = options.shutdownTimeoutMs = 30000;

@@ -5,6 +5,7 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include <memory>
 
 #include "executor.h"
 
@@ -5413,10 +5414,76 @@ namespace fastllm {
 #endif
     }
 
-    PagedCacheManager* AllocatePagedCacheManager(int layerIndex, 
-        PagedCacheManager::PagedCacheManagerType type, 
-        const Data &cacheData, 
-        int pageLen, 
+    /** 创建独立页池，复用全局页池的布局、容量解析和设备分配规则。 */
+    PagedCacheManager* CreatePagedCacheManager(PagedCacheManager::PagedCacheManagerType type,
+            const Data &cacheData, int pageLen, int maxPages) {
+        if (pageLen <= 0) pageLen = GetPageLen();
+        AssertInFastLLM(pageLen > 0, "paged cache pageLen must be positive.\n");
+#ifdef USE_CUDA
+        struct RestoreDevice {
+            int original = -1;
+            ~RestoreDevice() { if (original >= 0) FastllmCudaSetDevice(original); }
+        } restoreDevice;
+        if (cacheData.dataDevice == DataDevice::CUDA && !cacheData.dataDeviceIds.empty()) {
+            int current = FastllmCudaGetDevice();
+            if (current != cacheData.dataDeviceIds.front()) {
+                restoreDevice.original = current;
+                FastllmCudaSetDevice(cacheData.dataDeviceIds.front());
+            }
+        }
+#endif
+
+        const bool metadataOnlyMultiCudaRoot = IsMultiCudaShardedPagedCacheDesc(cacheData);
+        // 创建新的 PagedCacheManager
+        std::unique_ptr<PagedCacheManager> owned(new PagedCacheManager());
+        PagedCacheManager *manager = owned.get();
+
+        // 设置基本属性
+        manager->type = type;
+
+        // 从 cacheData 中提取信息
+        // cacheData 的尺寸应该是 [numHeads, seqLen, headDim] 或类似的形状
+        AssertInFastLLM(cacheData.dims.size() >= 2, 
+            "AllocatePagedCacheManager: cacheData should have at least 2 dimensions.\n");
+        int numHeads = cacheData.dims[0];
+        int headDim = cacheData.dims.back();
+        DataType dataType = cacheData.dataType;
+
+        // 设置 Data 的基本属性（PagedCacheManager 继承自 Data）
+        ((Data*)manager)->dataType = dataType;
+        ((Data*)manager)->UpdateUnitSize();
+
+        // 根据设备类型设置默认 maxPages
+        if (maxPages <= 0) {
+            int globalMaxTokens = GetMaxTokens();
+            if (globalMaxTokens > 0 && pageLen > 0) {
+                maxPages = int((int64_t(globalMaxTokens) + pageLen - 1) / pageLen);
+            } else {
+                maxPages = 300;
+            }
+        }
+
+        // 初始化 pagedKVCacheData
+        ((Data*)manager)->directMemory = true;
+        ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
+
+        // Resize manager: [maxPages, pageLen, numHeads, headDim]
+        ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
+        if (!metadataOnlyMultiCudaRoot) {
+            ((Data*)manager)->Allocate();
+        }
+
+        // 初始化 pageLen 和 unusedPageIndex
+        manager->pageLen = pageLen;
+        manager->SetMaxPages(maxPages);
+
+        return owned.release();
+    }
+
+    PagedCacheManager* AllocatePagedCacheManager(int layerIndex,
+        PagedCacheManager::PagedCacheManagerType type,
+        const Data &cacheData,
+        int pageLen,
         int maxPages) {
         int oriDevice = -1;
         int targetDevice = -1;
@@ -5453,47 +5520,7 @@ namespace fastllm {
             }
         }
 
-        // 创建新的 PagedCacheManager
-        PagedCacheManager *manager = new PagedCacheManager();
-
-        // 设置基本属性
-        manager->type = type;
-
-        // 从 cacheData 中提取信息
-        // cacheData 的尺寸应该是 [numHeads, seqLen, headDim] 或类似的形状
-        AssertInFastLLM(cacheData.dims.size() >= 2, 
-            "AllocatePagedCacheManager: cacheData should have at least 2 dimensions.\n");
-        int numHeads = cacheData.dims[0];
-        int headDim = cacheData.dims.back();
-        DataType dataType = cacheData.dataType;
-
-        // 设置 Data 的基本属性（PagedCacheManager 继承自 Data）
-        ((Data*)manager)->dataType = dataType;
-        ((Data*)manager)->UpdateUnitSize();
-
-        // 根据设备类型设置默认 maxPages
-        if (maxPages <= 0) {
-            int globalMaxTokens = GetMaxTokens();
-            if (globalMaxTokens > 0 && pageLen > 0) {
-                maxPages = (globalMaxTokens + pageLen - 1) / pageLen;
-            } else {
-                maxPages = 300;
-            }
-        }
-
-        // 初始化 pagedKVCacheData
-        ((Data*)manager)->directMemory = true;
-        ((Data*)manager)->ToDevice(cacheData.dataDevice, cacheData.dataDeviceIds, false);
-
-        // Resize manager: [maxPages, pageLen, numHeads, headDim]
-        ((Data*)manager)->Resize({maxPages, pageLen, numHeads, headDim});
-        if (!metadataOnlyMultiCudaRoot) {
-            ((Data*)manager)->Allocate();
-        }
-
-        // 初始化 pageLen 和 unusedPageIndex
-        manager->pageLen = pageLen;
-        manager->SetMaxPages(maxPages);
+        PagedCacheManager *manager = CreatePagedCacheManager(type, cacheData, pageLen, maxPages);
 
         // 记录到静态 map 中
         {
@@ -5766,6 +5793,112 @@ namespace fastllm {
         return defaultMoeDeviceLayers;
     }
 
+    /** 释放页索引，避免多设备根描述符与子描述符重复归还同一页。 */
+    void ReleasePagedCacheReferences(Data &cache, bool clearDims) {
+        std::set<std::pair<PagedCacheManager*, int>> released;
+        auto release = [&](auto &&self, Data &item) -> void {
+            if (item.isPagedKVCache && item.pagedKVCacheData) {
+                std::vector<int> pages;
+                for (int page : item.pageIndex) {
+                    if (released.emplace(item.pagedKVCacheData, page).second) pages.push_back(page);
+                }
+                if (!pages.empty()) item.pagedKVCacheData->ReleasePageIndices(pages);
+                item.pageIndex.clear();
+                item.lastPageLen = 0;
+            }
+            for (auto &local : item.multiDeviceDatas) if (local.second) self(self, *local.second);
+            if (clearDims) item.dims.clear();
+        };
+        release(release, cache);
+    }
+
+    /** 将完整前缀页绑定到请求；只增加页引用，不复制KV数据。 */
+    void RestorePagedCachePages(Data &cache, PagedCacheManager &manager,
+            const std::vector<int> &pages, int pageCount) {
+        AssertInFastLLM(pageCount >= 0 && size_t(pageCount) <= pages.size() && manager.dims.size() == 4,
+                       "invalid paged prefix restore.\n");
+        ReleasePagedCacheReferences(cache, true);
+        cache.isKVCache = cache.isPagedKVCache = true;
+        cache.pagedKVCacheData = &manager;
+        cache.pageLen = manager.pageLen;
+        cache.pageIndex.assign(pages.begin(), pages.begin() + pageCount);
+        manager.Pick(cache.pageIndex);
+        cache.lastPageLen = pageCount ? manager.pageLen : 0;
+        cache.dataType = manager.dataType;
+        cache.UpdateUnitSize();
+        cache.dataDevice = manager.dataDevice;
+        cache.dataDeviceIds = manager.dataDeviceIds;
+        cache.Resize({manager.dims[2], pageCount * manager.pageLen, manager.dims[3]});
+    }
+
+    /** 按有效KV长度登记完整页，排除未计算token和可继续追加的末尾半页。 */
+    void RecordPagedCachePrefix(Data &cache, const std::vector<int> &tokens, uint32_t position) {
+        if (!cache.pagedKVCacheData || cache.pageIndex.empty() || cache.pageLen <= 0) return;
+        size_t valid = (cache.pageIndex.size() - 1) * cache.pageLen + cache.lastPageLen;
+        size_t length = std::min(valid, tokens.size()) / cache.pageLen * cache.pageLen;
+        cache.pagedKVCacheData->Record(std::vector<int>(tokens.begin(), tokens.begin() + length), cache.pageIndex, position);
+    }
+
+    /** 查询各层K/V共同可用的完整页；描述符缺失或页长不一致时不复用。 */
+    int QueryPagedCachePrefix(const std::vector<Data*> &caches, const std::vector<int> &tokens,
+            uint32_t position) {
+        if (tokens.empty() || caches.empty() || !caches.front() || !caches.front()->pagedKVCacheData) return 0;
+        int pageLen = caches.front()->pagedKVCacheData->pageLen;
+        if (pageLen <= 0) return 0;
+        size_t count = (tokens.size() - 1) / pageLen;
+        for (auto *cache : caches) {
+            if (!cache || !cache->pagedKVCacheData || cache->pagedKVCacheData->pageLen != pageLen) return 0;
+            std::vector<int> pages;
+            cache->pagedKVCacheData->Query(tokens, pages, position);
+            count = std::min(count, pages.size());
+        }
+        return int(count * pageLen);
+    }
+
+    /** 清除全部索引节点；活动页面仍由请求持有，后续释放时才回到空闲池。 */
+    void PagedCacheManager::ClearPrefix() {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        const auto oldEvictions = evictedPages;
+        if (trieRoot) EvictTrieSubtree(trieRoot);
+        for (auto &root : positionRoots) EvictTrieSubtree(root.second);
+        evictedPages = oldEvictions;
+        positionRoots.clear();
+        trieRoot = nullptr;
+        pageToTrieNode.clear();
+        triePages.clear();
+        triePagesSet.clear();
+    }
+
+    /** 销毁索引节点；GPU存储由Data析构释放。 */
+    PagedCacheManager::~PagedCacheManager() {
+        ClearPrefix();
+    }
+
+    /** 导出有效索引的叶路径；页面被覆盖或上级前缀失效时不导出。 */
+    std::vector<std::pair<uint32_t, std::vector<int>>> PagedCacheManager::PrefixDirectory() {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        std::vector<std::pair<uint32_t, std::vector<int>>> result;
+        std::vector<int> ids;
+        auto visit = [&](auto &&self, CacheTrieNode *node, uint32_t position) -> void {
+            if (!node) return;
+            bool validChild = false;
+            for (auto &edge : node->children) {
+                auto *child = edge.second;
+                if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) continue;
+                validChild = true;
+                size_t old = ids.size();
+                ids.insert(ids.end(), child->tokenIds.begin(), child->tokenIds.end());
+                self(self, child, position);
+                ids.resize(old);
+            }
+            if (!validChild && !ids.empty()) result.emplace_back(position, ids);
+        };
+        visit(visit, trieRoot, 0);
+        for (auto &root : positionRoots) visit(visit, root.second, root.first);
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+
     void PagedCacheManager::SetMaxPages(int maxPages) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         this->maxPages = maxPages;
@@ -5783,10 +5916,16 @@ namespace fastllm {
         this->pageRefCount.assign(maxPages, 0);
         this->currentTimestamp = 0;
         this->pageToTrieNode.clear();
-        if (this->trieRoot) {
-            // 简单起见，不递归删除旧树节点（在生命周期内 SetMaxPages 通常只调用一次）
-        }
+        auto destroy = [&](auto &&self, CacheTrieNode *node) -> void {
+            if (!node) return;
+            for (auto &edge : node->children) self(self, edge.second);
+            delete node;
+        };
+        destroy(destroy, trieRoot);
+        for (auto &root : positionRoots) destroy(destroy, root.second);
+        positionRoots.clear();
         this->trieRoot = new CacheTrieNode();
+        evictedPages = 0;
     }
 
     // 从 Trie 中移除一个叶子节点，断开父子关系并清理映射
@@ -5807,6 +5946,7 @@ namespace fastllm {
         }
         int pid = node->pageId;
         if (pid >= 0) {
+            ++evictedPages;
             this->pageToTrieNode.erase(pid);
             // 如果页面空闲（在 triePagesSet 中），迁移到 freePages
             if (this->triePagesSet.erase(pid)) {
@@ -5885,6 +6025,7 @@ namespace fastllm {
                 this->triePages[i] = this->triePages.back();
                 this->triePages.pop_back();
                 this->triePagesSet.erase(pageIndex);
+                ++evictedPages;
                 RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
                 break;
             }
@@ -5906,6 +6047,7 @@ namespace fastllm {
                     node->parent->children.erase(node->edgeHash);
                 }
                 this->pageToTrieNode.erase(it);
+                ++evictedPages;
                 delete node;
             }
             // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
@@ -6003,7 +6145,7 @@ namespace fastllm {
         return hash;
     }
 
-    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages) {
+    void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages, uint32_t position) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         this->currentTimestamp++;
         long long ts = this->currentTimestamp;
@@ -6013,17 +6155,26 @@ namespace fastllm {
             numPages = (int)pages.size();
         }
 
-        CacheTrieNode *cur = this->trieRoot;
+        CacheTrieNode *&root = position == 0 ? trieRoot : positionRoots[position];
+        if (!root) root = new CacheTrieNode();
+        CacheTrieNode *cur = root;
         for (int i = 0; i < numPages; i++) {
             uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
             int pid = pages[i];
 
             auto it = cur->children.find(h);
+            if (it != cur->children.end() &&
+                (it->second->tokenIds.size() != size_t(pageLen) ||
+                 !std::equal(it->second->tokenIds.begin(), it->second->tokenIds.end(), tokens.begin() + i * pageLen))) {
+                // 哈希冲突只放弃登记，保留旧索引及其活动引用；查询仍比较完整token页。
+                return;
+            }
             CacheTrieNode *child;
             if (it == cur->children.end()) {
                 child = new CacheTrieNode();
                 child->parent = cur;
                 child->edgeHash = h;
+                child->tokenIds.assign(tokens.begin() + i * pageLen, tokens.begin() + (i + 1) * pageLen);
                 cur->children[h] = child;
             } else {
                 child = it->second;
@@ -6071,12 +6222,14 @@ namespace fastllm {
         }
     }
 
-    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
+    void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds, uint32_t position) {
         std::lock_guard<std::mutex> guard(this->pageIndexLocker);
         cachedPageIds.clear();
 
         int numPages = (int)tokens.size() / this->pageLen;
-        CacheTrieNode *cur = this->trieRoot;
+        auto found = positionRoots.find(position);
+        CacheTrieNode *cur = position == 0 ? trieRoot : found == positionRoots.end() ? nullptr : found->second;
+        if (!cur) return;
 
         for (int i = 0; i < numPages; i++) {
             uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
@@ -6087,6 +6240,7 @@ namespace fastllm {
             }
 
             CacheTrieNode *child = it->second;
+            if (!std::equal(child->tokenIds.begin(), child->tokenIds.end(), tokens.begin() + i * pageLen)) break;
             if (child->pageId == -1) {
                 break;
             }

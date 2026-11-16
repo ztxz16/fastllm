@@ -17,6 +17,7 @@
 #include <nccl.h>
 #include "distributed/qwen3_device_weights.h"
 #include "distributed/qwen3_layer.h"
+#include "fastllm.h"
 #include "distributed/process_allreduce.h"
 #endif
 
@@ -62,7 +63,7 @@ struct DeviceRuntime {
         }
 #ifdef FASTLLM_PROCESS_TP_CUDA
         CheckCuda(cudaSetDevice(device));
-        CheckCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        stream = cudaStreamPerThread;
 #else
         throw std::runtime_error("worker built without CUDA/NCCL; use control-only for transport checks");
 #endif
@@ -136,7 +137,7 @@ struct DeviceRuntime {
             allReduce.reset();
             CheckNccl(ncclCommDestroy(comm));
             comm = nullptr;
-            CheckCuda(cudaStreamDestroy(stream));
+            // 线程默认流由CUDA运行时管理，不调用cudaStreamDestroy。
             stream = nullptr;
         }
 #endif
@@ -425,19 +426,19 @@ struct DeviceRuntime {
     }
 
     /** 查询或同步释放唯一请求 KV；未加载模型也返回全零状态，禁止 control-only。 */
-    std::vector<uint8_t> RequestState(bool end, bool clearPrefix = false) {
+    std::vector<uint8_t> RequestState(bool end, bool clearPrefix = false, int clearLayer = -1, bool preparePrefix = false) {
         if (controlOnly) {
             throw std::runtime_error("Qwen3 request requires CUDA");
         }
 #ifdef FASTLLM_PROCESS_TP_CUDA
-        if (clearPrefix && prefixCache && weights && !layerExecutor) {
+        if ((clearPrefix || preparePrefix) && prefixCache && weights && !layerExecutor) {
             layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(
                 *weights, stream, comm, *allReduce, cudaGraph, prefixCache);
         }
         if (end && layerExecutor) {
             layerExecutor->EndRequest();
         }
-        if (clearPrefix && layerExecutor) layerExecutor->ClearPrefixCache();
+        if (clearPrefix && layerExecutor) layerExecutor->ClearPrefixCache(clearLayer);
         auto info = layerExecutor ? layerExecutor->RequestInfo() : fastllm::distributed::Qwen3RequestInfo{};
         if (!layerExecutor) info.graph.enabled = cudaGraph;
         if (!layerExecutor) info.prefix.enabled = prefixCache;
@@ -470,7 +471,7 @@ struct DeviceRuntime {
         Put64(result, info.prefix.lastComputedTokens);
         Put64(result, info.prefix.evictions);
         Put64(result, info.prefix.clears);
-        Put32(result, 1); // 前缀目录协议版本；必须与协调器一起更新。
+        Put32(result, info.prefix.directoryVersion); // v2为FT分页缓存。
         Put32(result, info.prefix.snapshots.size());
         for (const auto &snapshot : info.prefix.snapshots) {
             Put32(result, snapshot.first);
@@ -478,6 +479,12 @@ struct DeviceRuntime {
             for (auto token : snapshot.second) Put32(result, token);
         }
         Put64(result, info.reservedKVBytes);
+        if (info.prefix.directoryVersion == 2) {
+            Put32(result, info.prefix.pageLen); Put32(result, info.prefix.maxPages);
+            Put64(result, info.prefix.poolBytes); Put64(result, info.prefix.activePages); Put64(result, info.prefix.cachedPages);
+            Put32(result, info.prefix.backend.size());
+            result.insert(result.end(), info.prefix.backend.begin(), info.prefix.backend.end());
+        }
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -517,7 +524,7 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("invalid/duplicate worker arguments");
             }
         }
-        if (args.size() != 10 || args.at("--control-fd") != uint64_t(kWorkerFd) ||
+        if (args.size() != 10 + args.count("--page-size") + args.count("--tokens") || args.at("--control-fd") != uint64_t(kWorkerFd) ||
             args.at("--world-size") == 0 || args.at("--world-size") > 1024 ||
             args.at("--rank") >= args.at("--world-size") || args.at("--device") > INT_MAX ||
             args.at("--control-only") > 1 || args.at("--cuda-graph") > 1 || args.at("--custom-allreduce") > 1 ||
@@ -561,6 +568,14 @@ int main(int argc, char **argv) {
         int device = static_cast<int>(args.at("--device"));
         DeviceRuntime runtime{args.at("--control-only") != 0, args.at("--cuda-graph") != 0,
                               args.at("--custom-allreduce") != 0, args.at("--prefix-cache") != 0};
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        for (const auto &name : {"--page-size", "--tokens"}) {
+            if (args.count(name) && (!args.at(name) || args.at(name) > INT_MAX))
+                throw std::runtime_error("invalid paged cache size");
+        }
+        if (args.count("--page-size")) fastllm::SetPageLen(args.at("--page-size"));
+        if (args.count("--tokens")) fastllm::SetMaxTokens(args.at("--tokens"));
+#endif
         phase = "device_bind";
         runtime.Bind(device);
 
@@ -622,7 +637,20 @@ int main(int argc, char **argv) {
                     if (!initialized) {
                         throw std::runtime_error("Qwen3 request state before Initialize");
                     }
-                    payload = runtime.RequestState(message.kind == Kind::EndQwen3Request, message.kind == Kind::ClearQwen3Prefix);
+                    {
+                        bool clear = message.kind == Kind::ClearQwen3Prefix;
+                        int layer = -1;
+                        if (!message.payload.empty()) {
+                            if (!clear || message.payload.size() != 8) throw std::runtime_error("invalid prefix clear payload");
+                            uint32_t target = Get32(message.payload, 0), selected = Get32(message.payload, 4);
+                            if (target != UINT32_MAX && target >= uint32_t(world)) throw std::runtime_error("invalid prefix clear rank");
+                            if (selected != UINT32_MAX && selected > INT_MAX) throw std::runtime_error("invalid prefix clear layer");
+                            clear = target == UINT32_MAX || target == uint32_t(rank);
+                            layer = selected == UINT32_MAX ? -1 : int(selected);
+                        }
+                        payload = runtime.RequestState(message.kind == Kind::EndQwen3Request, clear, layer,
+                                                       message.kind == Kind::ClearQwen3Prefix);
+                    }
                     response = message.kind == Kind::ClearQwen3Prefix ? Kind::Qwen3PrefixCleared :
                         message.kind == Kind::EndQwen3Request ? Kind::Qwen3RequestEnded : Kind::Qwen3RequestState;
                     break;

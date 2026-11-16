@@ -9884,7 +9884,7 @@ total += weights[nextExpert * 2 + 1]->GetBytes();
                 *invocation.output, invocation.group, invocation.scale,
                 invocation.attentionType, invocation.inited, invocation.sync,
                 invocation.enableCudaGraph, invocation.flashInferCudaGraph,
-                invocation.windowLeft);
+                invocation.windowLeft, invocation.graphResourceOwner);
         }
     }
 

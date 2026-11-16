@@ -61,9 +61,13 @@ def validate_prefix_directory(prefix, *, required=False):
     if not required and 'directory_version' not in prefix and 'snapshots' not in prefix:
         return None
     snapshots = prefix.get('snapshots')
-    if (type(prefix.get('directory_version')) is not int or prefix['directory_version'] != 1 or
+    if (type(prefix.get('directory_version')) is not int or prefix['directory_version'] not in (1, 2) or
             not isinstance(snapshots, list) or len(snapshots) != prefix['entries']):
         raise RuntimeError('missing/invalid prefix directory; rebuild native generate and worker binaries')
+    paged = prefix['directory_version'] == 2
+    page = prefix.get('page_len', 0)
+    if paged and (type(page) is not int or page <= 0):
+        raise RuntimeError('invalid paged prefix page size')
     seen = set()
     for entry in snapshots:
         if not isinstance(entry, dict) or set(entry) != {'position_begin', 'token_ids'}:
@@ -73,6 +77,8 @@ def validate_prefix_directory(prefix, *, required=False):
                 not 1 <= len(ids) <= MAX_PROMPT_TOKENS or position + len(ids) - 1 > 1048576 or
                 any(type(token) is not int or not 0 <= token <= 4294967295 for token in ids)):
             raise RuntimeError('invalid prefix directory tokens/position')
+        if paged and len(ids) % page:
+            raise RuntimeError('paged prefix contains a partial page')
         key = (position, tuple(ids))
         if key in seen:
             raise RuntimeError('duplicate prefix directory entry')
@@ -92,22 +98,42 @@ def validate_prefix(states, world, enabled, *, previous=None, reset=False, clear
         if (not isinstance(p, dict) or p.get('enabled') is not enabled or
                 any(type(p.get(k)) is not int or p[k] < 0 for k in integers)):
             raise RuntimeError('invalid prefix cache diagnostics')
-        if (p['entries'] > 8 or p['device_bytes'] > 64 * 1024 * 1024 or
-                bool(p['entries']) != bool(p['device_bytes']) or p['hits'] > p['lookups'] or
+        if observed and any(p.get(k) != observed[0].get(k) for k in ('directory_version', 'page_len', 'max_pages')):
+            raise RuntimeError('inconsistent prefix directory version/page configuration')
+        paged = p.get('directory_version') == 2
+        if paged:
+            resources = ('page_len', 'max_pages', 'pool_bytes', 'active_pages', 'cached_pages')
+            if (p.get('cache_layout') != 'paged' or any(type(p.get(k)) is not int or p[k] < 0 for k in resources) or
+                    not p['page_len'] or not p['max_pages'] or p['device_bytes'] > p['pool_bytes'] or
+                    p['last_reused_tokens'] % p['page_len'] or
+                    (reset and any(p[k] for k in ('pool_bytes', 'active_pages', 'cached_pages'))) or
+                    (cleared and p['cached_pages']) or
+                    (p['lookups'] and p.get('attention_backend') not in ('native_paged', 'flashinfer_paged'))):
+                raise RuntimeError('invalid FT paged prefix cache resources/backend')
+        if ((not paged and (p['entries'] > 8 or p['device_bytes'] > 64 * 1024 * 1024 or
+                bool(p['entries']) != bool(p['device_bytes']))) or p['hits'] > p['lookups'] or
                 p['reused_tokens'] < p['hits'] or p['last_reused_tokens'] >= MAX_PROMPT_TOKENS or
                 p['last_computed_tokens'] > MAX_PROMPT_TOKENS or p['last_reused_tokens'] + p['last_computed_tokens'] > MAX_PROMPT_TOKENS or
                 (p['lookups'] and not p['last_computed_tokens']) or
                 ((reset or not enabled) and any(p[k] for k in integers)) or
                 (cleared and (p['entries'] or p['device_bytes']))):
             raise RuntimeError('prefix cache fallback, invalid counters or leaked snapshots')
-        if observed and any(p[k] != observed[0][k] for k in integers if k != 'device_bytes'):
+        if observed and any(p[k] != observed[0][k] for k in integers if k not in (('device_bytes', 'evictions', 'clears') if paged else ('device_bytes',))):
+            raise RuntimeError('inconsistent prefix cache ranks')
+        if observed and not paged and p['evictions'] != observed[0]['evictions']:
             raise RuntimeError('inconsistent prefix cache ranks')
         directory = validate_prefix_directory(p)
         if observed and directory != observed[0].get('snapshots'):
             raise RuntimeError('inconsistent prefix directory ranks')
         observed.append(p)
     if previous is not None and not reset:
-        old = validate_prefix(previous, world, enabled)[0]
+        prior = validate_prefix(previous, world, enabled)
+        for current, earlier in zip(observed, prior):
+            if any(current[k] < earlier[k] for k in counters):
+                raise RuntimeError('prefix cache counters regressed')
+            if cleared and current['clears'] != earlier['clears'] + int(enabled):
+                raise RuntimeError('prefix cache clear counter mismatch')
+        old = prior[0]
         p = observed[0]
         if 'snapshots' in old:
             validate_prefix_directory(p, required=True)

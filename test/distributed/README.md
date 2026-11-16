@@ -980,79 +980,29 @@ python3 -m ftllm.cli run /home/models/Qwen3-1.7B \
 设计依据：[CUDA 12.6.3 IPC](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#interprocess-communication)、
 [PTX 系统作用域内存序](https://docs.nvidia.com/cuda/parallel-thread-execution/#memory-consistency-model)。
 
-## 跨请求前缀缓存（第 4 项，待服务器验收）
+## Qwen3进程TP复用FT分页缓存（待服务器编译与GPU验收）
 
-正式工厂/CLI 使用 `--prefix-cache true`，默认关闭；可以同时开启 `--cuda-graph --custom-allreduce`。
-原生生成/Decode 检查器使用 `--prefix-cache 0|1`，Python `Qwen3ProcessSession` 使用布尔参数 `prefix_cache`。
-前缀匹配、LRU、KV 复制/释放和后缀计算均在 C++/CUDA worker，Python 只传参并检查实际执行证据。
-旧线程环境变量 `FASTLLM_PREFIX_CACHE` 及分页快照参数不控制此实现，显式使用会被拒绝。
+Dense Qwen3使用FT正式页管理器、分页追加算子与分页Attention后端。每个worker按本rank的KV头数持有各层K/V页池；命中只增加页引用，不复制Prompt快照。MoE保留原有连续缓存和v1目录。
 
-- 模型执行器内按 token ID 的最长公共前缀匹配，同时要求相同 RoPE 起点。
-  模型、rank、FP16 KV 布局由执行器生命周期隔离；卸载/重载清空，不能复用旧模型快照。
-- 完全相同、扩展、缩短或部分相同的 Prompt 都可命中，但至少重算最后一个 token 取得 logits。
-  单 token Prompt 不复用。无状态 `PrefillQwen3` 不读写跨请求缓存。
-- 成功 Prefill 后复制全部 Prompt 的各层 FP16 KV，生成的 Decode token 不写入快照。
-  快照不可变，命中后拷贝到独立请求 KV；Graph 仍只绑定本请求的 KV/工作区。
-  请求结束释放请求 KV/Graph，保留快照；清快照不改变活动请求 KV/Graph。
-- 最多 8 条 LRU 记录；采用全局 KV 头数计算 64 MiB 的保守预算，确保各 rank 淘汰决策一致。
-  实际单卡占用不超过该预算，TP 分片可能让实际占用更低。单条超过预算就不插入，下一次仍全量计算。
-  内存不足或 CUDA/NCCL 失败终止整组，不单 rank 降级。进入后缀计算前通过 NCCL 核对各 rank 复用长度。
-- 取消发生在 Prefill 完成之后时，已完成的 Prompt 快照保留；取消前生成的 token 不会成为新快照。
-  未执行 Prefill 的取消/非法长度不会改变缓存。非法 token ID 仍先验证，不能因命中跳过检查。
-- 正式模型 `model.clear_prefix_cache()` 或会话同名方法等待当前请求完成后清空快照，权重继续驻留。
-  原生 `ProcessGroup::ClearQwen3PrefixCache()` 也支持活动请求期间清理，因快照与请求内存互不别名。
-  正常模型关闭释放快照、请求资源及权重；worker 失败由整组进程回收 CUDA 上下文。
-- 每 rank 的 `graph` 诊断新增 `prefix_cache`：enabled、entries、device_bytes、lookups、hits、
-  reused_tokens、last_reused_tokens、last_computed_tokens、evictions、clears。计数是整数；
-  显式清缓存只增加 clears 并清空资源，不清零历史计数；卸载模型全部清零。
-  各卡 KV 头数可以不同，因此资源字节不强制相等，匹配/淘汰/执行长度必须一致。
-- 原限制保持：未量化稠密 Qwen3，FP16 计算/KV，Prompt 最长 2048 token，总请求容量最多 2048，
-  单活动请求；没有分页缓存、跨模型/跨进程组共享或连续批处理。命中只减少 Prefill 后缀工作量，
-  复制及一致性检查有开销；尚未做吞吐/延迟基准，不据此宣称加速比。
+- `--prefix-cache true` 控制跨请求索引；关闭后仍使用分页KV处理当前请求。
+- 正式入口的 `--kv-cache-layout auto/paged` 使用分页；显式 `continuous` 拒绝。`--page_size` 和 `--tokens` 沿用FT页大小与页池容量含义；原生命令使用 `--page-size` 和 `--tokens`。未设置时每worker沿用FT默认值，不再限制8条/64 MiB快照。
+- 页池物理形状为 `[maxPages,pageLen,localKVHeads,headDim]`，K与V分开。缓存键包含token内容和RoPE起点，模型生命周期隔离。
+- 查询各层K/V后，以NCCL取全组共同可用长度。完整命中仍至少留一个token重算，因此页长128时，相同257-token请求复用256个，相同256-token请求复用128个。
+- Prefill成功只登记已计算的完整Prompt页；末尾半页与Decode内容不登记。页池满时沿用FT淘汰规则，活动页不得被重用。
+- 请求结束释放引用；清空索引不破坏活动请求。卸载模型释放页池与索引；请求Graph及其私有计划随请求结束释放，FT算子的共享工作区沿用原生命周期。
+- Graph的页分配与元数据更新在捕获之外执行；固定地址页表允许跨页重放。默认流、正式后端选择和同步边界与FT算子保持一致。
+- v2报告提供页大小、每池页数、总页池字节、活动页、缓存页和实际Attention后端。`device_bytes`是前缀页占用，`pool_bytes`是保留的整池显存，不能相加当作总显存。`active_pages`与`cached_pages`也可能重叠：已登记的前缀页可以同时被当前请求引用。
+- DP使用整个TP组共同有效的v2目录，路由评分按整页截断。v1仍供MoE和旧诊断数据读取。
 
-控制协议升级 **v4**，请一起重建 coordinator、worker、检查器及正式 Python 包。
-在远端 master 合并 sk 后，仅在服务器执行：
+### 验收入口
 
-```bash
-(
-set -euo pipefail
-cd /home/project/vllm_fastllm
-git fetch origin
-git switch master
-git pull --ff-only origin master
-bash test/distributed/run_qwen3_prefix_cache_v100.sh /home/models/Qwen3-1.7B
-)
-```
+`run_ft_paged_cache.py`调用已有的`fastllm_tp_paged_cache_check`，验证真正的公共页管理器：完整页与实际数据、位置隔离、成员命中不同、活动引用清理、页池淘汰。加`--cuda`后还通过原FT公开分页追加、恢复和Attention入口，比较FP16/BF16输出与独立CPU均值。它不编译。
 
-脚本沿用 CUDA 12.6 / SM70 / 双 V100，先重建并跑原十四组，再跑十一组新增验收，总计 **25 组**：
+`run_qwen3_prefix_cache.py`通过正式worker验证F16/BF16/F32源权重、有无bias、共享embedding、MHA/GQA、KV复制、页边界、页池压力、重载、活动请求清理和无状态Prefill交错。`uneven_hits`经原生选择性清理接口清除rank 1的一层索引，再验证共同命中降为零、重新建立缓存及后续命中，实际执行跨rank协商。
 
-1. Eager/Graph × NCCL/自定义规约四种组合，每种各跑合成 10 项、真实模型 1 项，共八组。
-   覆盖 F16/BF16/F32 源权重、bias、tied embedding、KV 头复制和不均匀分片；逐步对照
-   关闭前缀缓存的 NCCL Eager TP、单卡，以及六种普通合成配置的独立 CPU 数学参考。
-   验证冷/完全/部分/更短/扩展命中、不同 RoPE 起点、8 条 LRU 淘汰、活动 Graph 中清理、
-   无状态 Prefill 交错、1/128 token 边界、模型重载隔离及缓存驻留时非法后缀导致整组回收。
-   三个较大合成配置另验 64 MiB 保守预算下/上/超界、单条超预算不插入，以及命中后规约从
-   大消息 NCCL 转入小消息自定义路径；这三项用 NCCL TP/单卡数值参考，不执行昂贵 CPU 重算。
-2. 前缀缓存 + Graph + 自定义规约的合成常驻会话 96 项、真实模型 16 项，共两组；含拒绝、EOS、
-   采样、流式、提前取消和 Graph 运行后取消恢复，检查真实 logits 和 Token ID。
-3. 同样组合的正式工厂/CLI/HTTP/SSE 13 项，包含实际前缀命中、公开清缓存接口和清理后冷启动。
+所有数值输出与禁用前缀的TP、单卡和独立CPU参考比较；Graph开关×自定义AllReduce开关四种组合由`run_qwen3_prefix_cache_v100.sh`运行。该服务器脚本还运行原FT分页数值检查、会话、公开工厂、HTTP、DP前缀路由以及MoE的Eager/Graph前缀回归。默认DP2×TP1使用两张卡；四卡验收设置`CUDA_VISIBLE_DEVICES=0,1,2,3 TP_PREFIX_DP_TP=2`，覆盖DP2×TP2与自定义AllReduce。
 
-每组唯一结果目录在 `test/distributed/results`，包含 JSON/Markdown/CSV/XLSX。
-报告记录最大/平均绝对误差、失败元素、完整命令、GPU/CUDA/架构/Git、逐任务复用长度和显存字节；
-功能测试 warmup/iterations/repeats 为 0/1/1（Graph 另有每请求一次内部 warmup），不包含性能计时。
-任何失败返回非零且保留已经完成的报告。本地只做纯 Python/静态检查，未编译、未运行 GPU。
-
-服务器脚本完成构建后，正式入口示例：
-
-```bash
-export CUDA_HOME=/usr/local/cuda-12.6
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export CUDA_VISIBLE_DEVICES=0,1 USE_TORCH=0
-export PYTHONPATH="$PWD/build-process-tp-cu126/process-tp-python${PYTHONPATH:+:$PYTHONPATH}"
-python3 -m ftllm.cli chat /home/models/Qwen3-1.7B \
-  --tp_backend process --tp 2 --prefix-cache true --cuda-graph --custom-allreduce \
-  --max-new-tokens 32
-```
+报告输出XLSX、Markdown、CSV、JSON及原始日志，保留误差、失败元素、GPU/CUDA、编译架构、Git与完整执行命令。任一用例失败返回非零。
 
 ## DP 参数与 GPU 分配（第一步）
 
@@ -1345,10 +1295,10 @@ GPU利用率有自己的采样周期，时间窗口重叠和相关性不能单�
 2. 匹配长度相同或全部未命中时，保持轮转顺序；至少保留最后一个 Prompt Token 重算。
 3. 持有缓存的副本正忙时，使用其他空闲副本；全部忙时沿用可取消、可超时的等待。
 
-路由依据 worker 实际保留的快照目录，不把历史请求当作仍存在的缓存。原生反馈新增
-`prefix_cache.directory_version=1` 和 `snapshots`；每个快照只有 RoPE 起点与 Token ID，
-没有 GPU 指针。协调器检查各 TP rank 的目录一致性，Python 在请求完成、取消及清理后更新记录。
-取消可能保留已完成 Prefill 的有效快照，因此由原生目录决定能否复用。淘汰、清空、关闭与故障均会
+路由依据worker实际保留的前缀目录，不把历史请求当作仍存在的缓存。Dense Qwen3的
+`prefix_cache.directory_version=2`返回整个TP组共同有效的完整页前缀；`snapshots`保留原字段名，
+内容只有RoPE起点与Token ID，没有GPU指针。匹配分数按页长截断；MoE保持v1快照目录。
+Python在请求完成、取消及清理后更新目录。取消可保留已完成Prefill的有效前缀，因此由原生目录决定能否复用。淘汰、清空、关闭与故障均会
 更新或作废对应记录；部分副本清缓存失败会停止新分发，等待超时且尚未开始清理时保留原状态。
 
 文本和流式入口在分配前分词一次，复用正式 TP 请求构造与执行流程；HTTP 走同一模型工厂。
@@ -1466,8 +1416,8 @@ bash test/distributed/run_qwen3_dp_service_v100.sh /home/models/Qwen3-1.7B
 进程后端现在统一接受包含聊天模板在内的 1..2048 个 Prompt Token，并继续要求
 `prompt_tokens + max_new_tokens - 1 <= 2048`。2048 Token 输入最多生成一个输出 Token；
 最后输出不再送入 KV。Python、协调器、worker、Attention 和 Prefix Cache 目录使用相同上限。
-这仍是有限容量的完整 Prefill，不是分块 Prefill 或无限上下文；原有工作区、请求 KV 各
-256 MiB 和 Prefix Cache 64 MiB 预算不变，较大模型可能先触发显存预算拒绝。
+这仍是有限容量的完整 Prefill，不是分块 Prefill 或无限上下文；Dense Qwen3的KV与前缀容量改由FT页池控制；
+原有临时计算工作区仍受256 MiB预算约束。
 **必须重新构建协调器、worker 和进程 Python 包。**
 
 `diagnose_qwen3_dp_lengths_v100.sh` 依次执行 Python 回归、服务器编译、三组独立数值/边界验证，

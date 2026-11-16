@@ -80,39 +80,7 @@ namespace fastllm {
         }
 
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
-            std::set<std::pair<PagedCacheManager*, int> > releasedPages;
-            auto releaseUnique = [&](Data &pagedCache) {
-                if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
-                    pagedCache.pageIndex.empty()) {
-                    return;
-                }
-                std::vector<int> uniquePages;
-                for (int page : pagedCache.pageIndex) {
-                    std::pair<PagedCacheManager*, int> key = {pagedCache.pagedKVCacheData, page};
-                    if (releasedPages.insert(key).second) {
-                        uniquePages.push_back(page);
-                    }
-                }
-                if (!uniquePages.empty()) {
-                    pagedCache.pagedKVCacheData->ReleasePageIndices(uniquePages);
-                }
-                pagedCache.pageIndex.clear();
-                pagedCache.lastPageLen = 0;
-            };
-            releaseUnique(cache);
-            if (cache.multiDeviceData) {
-                for (auto &it : cache.multiDeviceDatas) {
-                    if (it.second != nullptr) {
-                        releaseUnique(*it.second);
-                        if (clearDims) {
-                            it.second->dims.clear();
-                        }
-                    }
-                }
-            }
-            if (clearDims) {
-                cache.dims.clear();
-            }
+            ReleasePagedCacheReferences(cache, clearDims);
         }
 
         static bool ToolCallConstraintStartsWith(const std::string &text, const std::string &prefix) {
@@ -708,7 +676,7 @@ namespace fastllm {
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
-                cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                RecordPagedCachePrefix(cache, this->allTokens);
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -2045,34 +2013,7 @@ namespace fastllm {
                                         if (managerData->dims.size() < 4) {
                                             return;
                                         }
-                                        // Model-specific extra state may have
-                                        // restored a bounded fallback tail before
-                                        // this generic full-prefix restore. Drop
-                                        // that cache-owned reference before
-                                        // replacing its page chain; the snapshot
-                                        // keeps its own independent references.
-                                        if (cache.isPagedKVCache &&
-                                            cache.pagedKVCacheData != nullptr &&
-                                            !cache.pageIndex.empty()) {
-                                            cache.pagedKVCacheData->ReleasePageIndices(
-                                                cache.pageIndex);
-                                            cache.pageIndex.clear();
-                                            cache.lastPageLen = 0;
-                                        }
-                                        cache.isKVCache = true;
-                                        cache.isPagedKVCache = true;
-                                        cache.pagedKVCacheData = manager;
-                                        cache.pageLen = manager->pageLen;
-                                        cache.pageIndex.assign(pages.begin(), pages.begin() + minCachedPages);
-                                        manager->Pick(cache.pageIndex);
-                                        cache.lastPageLen = manager->pageLen;
-                                        cache.dataType = managerData->dataType;
-                                        cache.UpdateUnitSize();
-                                        cache.dataDevice = managerData->dataDevice;
-                                        cache.dataDeviceIds = managerData->dataDeviceIds;
-                                        int numHeads = managerData->dims[2];
-                                        int headDim = managerData->dims[3];
-                                        cache.Resize({numHeads, minCachedPages * manager->pageLen, headDim});
+                                        RestorePagedCachePages(cache, *manager, pages, minCachedPages);
                                     };
 
                                     struct PagedCacheRestorePlan {

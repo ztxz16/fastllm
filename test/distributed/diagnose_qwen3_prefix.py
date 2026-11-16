@@ -29,6 +29,8 @@ def validate_trace(report, request, vocab, graph, reused):
         raise RuntimeError('execution mode mismatch')
     states = validate_graph(report.get('graph'), 1, graph)
     prefix = validate_prefix(states, 1, True)[0]
+    if prefix.get('directory_version') == 2:
+        reused = reused // prefix['page_len'] * prefix['page_len']
     if (prefix['last_reused_tokens'] != reused or
             prefix['last_computed_tokens'] != len(request['token_ids']) - reused):
         raise RuntimeError(f'expected reused_tokens={reused}, observed {prefix}')

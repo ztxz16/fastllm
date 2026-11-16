@@ -1,4 +1,5 @@
 #pragma once
+#include <map>
 
 #include "distributed/process_group.h"
 #include "json11.hpp"
@@ -40,7 +41,13 @@ inline json11::Json::array GraphState(const std::vector<fastllm::distributed::Qw
                 {"last_computed_tokens", static_cast<long long>(info.prefix.lastComputedTokens)},
                 {"evictions", static_cast<long long>(info.prefix.evictions)},
                 {"clears", static_cast<long long>(info.prefix.clears)},
-                {"directory_version", 1}, {"snapshots", snapshots}}}});
+                {"directory_version", int(info.prefix.directoryVersion)}, {"snapshots", snapshots},
+                {"cache_layout", info.prefix.directoryVersion == 2 ? "paged" : "continuous"},
+                {"page_len", int(info.prefix.pageLen)}, {"max_pages", int(info.prefix.maxPages)},
+                {"pool_bytes", static_cast<long long>(info.prefix.poolBytes)},
+                {"active_pages", static_cast<long long>(info.prefix.activePages)},
+                {"cached_pages", static_cast<long long>(info.prefix.cachedPages)},
+                {"attention_backend", info.prefix.backend}}}});
     }
     return states;
 }
@@ -70,4 +77,16 @@ inline bool ParseCustomAllReduce(const std::string &value) {
 inline bool ParsePrefixCache(const std::string &value) {
     if (value != "0" && value != "1") throw std::invalid_argument("prefix-cache must be 0 or 1");
     return value == "1";
+}
+
+/** 解析分页容量，0表示沿用FT默认值；显式配置必须是正的int32。 */
+inline uint32_t ParsePagedSize(const std::map<std::string, std::string> &args, const std::string &key) {
+    auto found = args.find(key);
+    if (found == args.end()) return 0;
+    const auto &text = found->second;
+    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos)
+        throw std::invalid_argument("invalid paged size: " + key);
+    auto value = std::stoull(text);
+    if (!value || value > 2147483647) throw std::invalid_argument("paged size outside int32: " + key);
+    return uint32_t(value);
 }

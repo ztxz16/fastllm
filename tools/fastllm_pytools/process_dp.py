@@ -124,7 +124,10 @@ class ProcessDPModel:
                     break
                 common += 1
             best = max(best, common)
-        return best
+        states = getattr(self.replicas[rank].session, '_graph_state', None)
+        prefix = states[0].get('prefix_cache', {}) if states else {}
+        page = prefix.get('page_len', 1) if prefix.get('directory_version') == 2 else 1
+        return best // page * page
 
     @contextmanager
     def _lease(self, cancel_event=None, request=None):

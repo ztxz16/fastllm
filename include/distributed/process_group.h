@@ -24,7 +24,8 @@ struct ProcessGroupOptions {
     // 组内全部 worker 使用相同 Decode Graph 模式；不支持与 controlOnly 组合。
     bool cudaGraph = false;
     bool customAllReduce = false; // 严格要求双卡 P2P；大消息显式走 NCCL。
-    bool prefixCache = false; // 至多 8 条快照；dense TP 每 rank 64 MiB，MoE 每 rank 512 MiB。
+    bool prefixCache = false; // Dense复用FT分页前缀；MoE保留原有快照。
+    uint32_t pageSize = 0, cacheTokens = 0; // 0沿用FT默认页大小/页池容量。
 };
 
 struct ProcessWorkerInfo {
@@ -54,14 +55,17 @@ struct ProcessAllReduceInfo {
     uint64_t customCalls = 0, ncclCalls = 0, workspaceBytes = 0;
 };
 
-/** 模型生命周期的前缀缓存证据；清空快照保留计数，卸载模型全部清零。 */
+/** 模型生命周期的前缀缓存证据；清空索引保留计数，卸载模型全部清零。 */
 struct Qwen3PrefixInfo {
     bool enabled = false;
     uint32_t entries = 0;
     uint64_t deviceBytes = 0, lookups = 0, hits = 0, reusedTokens = 0;
     uint64_t lastReusedTokens = 0, lastComputedTokens = 0, evictions = 0, clears = 0;
-    // 原生实际保留的快照目录：(RoPE起点, Prompt Token ID)。不暴露或共享GPU指针。
+    // 原生实际有效的前缀目录（v1快照，v2完整页）：(RoPE起点, Prompt Token ID)。不暴露或共享GPU指针。
     std::vector<std::pair<uint32_t, std::vector<uint32_t>>> snapshots;
+    uint32_t directoryVersion = 1, pageLen = 0, maxPages = 0;
+    uint64_t poolBytes = 0, activePages = 0, cachedPages = 0;
+    std::string backend;
 };
 
 struct Qwen3RequestInfo {
@@ -257,8 +261,12 @@ public:
     /** 同步释放活动请求的全部 KV，允许重复调用；失败终止整组。 */
     void EndQwen3Request();
 
-    /** 同步清空模型的前缀快照，保留累计计数；不改变活动请求 KV 或 Graph，失败终止整组。 */
-    void ClearQwen3PrefixCache();
+    /**
+     * 同步清空前缀索引，保留累计计数及活动请求KV；worker失败时终止整组。
+     * @param rank -1清理全部rank；其他值只使指定rank的索引失效，适用于dense分页缓存。
+     * @param layer -1清理全部层；其他值只使指定层K/V索引失效，保留活动页面引用。
+     */
+    void ClearQwen3PrefixCache(int rank = -1, int layer = -1);
 
     /** @return 各 rank 的请求 KV、Graph、规约和前缀快照证据；无活动请求时仅请求 KV 为零。失败终止整组。 */
     std::vector<Qwen3RequestInfo> Qwen3Requests();
