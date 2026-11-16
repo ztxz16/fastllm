@@ -14,6 +14,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-token-constraint.h"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -2207,7 +2208,8 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits) {
 #ifdef USE_CUDA
     const int count = rounds.size(), steps = rounds.front()->limit, vocab = baseLogits.dims.back();
-    if (!GetFastllmEnv().cudaGraph || steps < 1 || baseLogits.dims[1] != count * steps || vocab >= (1 << 24)) return false;
+    if (!GetFastllmEnv().cudaGraph || steps < 1 || vocab <= 0 || steps > INT_MAX / vocab ||
+        baseLogits.dims[1] != count * steps || vocab >= (1 << 24)) return false;
     std::vector<float> temperatures;
     bool constrained = false;
     for (auto &owner : rounds) {
@@ -2248,7 +2250,6 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         };
         view(p.ids, shared.ids, {steps + 1, count});
         view(p.probabilities, shared.probabilities, {count, steps, vocab});
-        view(p.stepProbabilities, shared.stepProbabilities, {count, vocab});
         view(p.logits, shared.logits, {count, vocab});
         view(p.bias, shared.bias, {1, count, vocab});
         view(p.latent, shared.latent, {1, count, w1.dims.back()});
@@ -2292,20 +2293,17 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
             Data ids(FLOAT32, {1, count}); ids.FakeFrom(p.ids, (size_t)step * count * sizeof(float));
             EmbeddingDirect(ids, w1, p.latent); DraftLinear(p.latent, w2, p.bias);
             if (p.constrained) FastllmCudaTokenConstraintMask(p.constraints.get(), step, (uint32_t *)p.mask.cudaData);
-            FastllmCudaNaiveBatchDraftSamplingLogits(p.base, p.bias, p.mask, p.logits, step, steps);
-            AssertInFastLLM(FastllmCudaMtpDraftSamplerRunBatch(p.sampler, (float *)p.logits.cudaData,
-                (float *)p.stepProbabilities.cudaData, (float *)p.ids.cudaData + (size_t)(step + 1) * count,
-                (uint64_t)step * 4), "Graph batch draft sampling failed.");
-            if (p.constrained) FastllmCudaTokenConstraintAdvance(p.constraints.get(), step,
-                (float *)p.ids.cudaData + (size_t)(step + 1) * count, step == steps - 1);
-            std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
-            for (int row = 0; row < count; ++row) {
-                dst.push_back((float *)p.probabilities.cudaData + (size_t)(row * steps + step) * vocab);
-                src.push_back((float *)p.stepProbabilities.cudaData + (size_t)row * vocab);
-                bytes.push_back((size_t)vocab * sizeof(float));
+            float *probabilities = (float *)p.probabilities.cudaData + (size_t)step * vocab;
+            float *idsOut = (float *)p.ids.cudaData + (size_t)(step + 1) * count;
+            if (!FastllmCudaMtpDraftSamplerRunBF16BiasBatch(p.sampler, p.base.cudaData, p.bias.cudaData,
+                    (const uint32_t *)p.mask.cudaData, step, steps, probabilities, idsOut,
+                    (uint64_t)step * 4, steps * vocab)) {
+                FastllmCudaNaiveBatchDraftSamplingLogits(p.base, p.bias, p.mask, p.logits, step, steps);
+                AssertInFastLLM(FastllmCudaMtpDraftSamplerRunBatchStrided(p.sampler, (float *)p.logits.cudaData,
+                    probabilities, idsOut, (uint64_t)step * 4, steps * vocab), "Graph batch draft sampling failed.");
             }
-            AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(dst.data(), src.data(), bytes.data(), count),
-                "Cannot retain graph proposal probabilities.");
+            if (p.constrained) FastllmCudaTokenConstraintAdvance(p.constraints.get(), step,
+                idsOut, step == steps - 1);
         }
     };
     auto &graph = p.graphs.front();

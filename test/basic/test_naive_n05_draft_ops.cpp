@@ -3,6 +3,7 @@
 #include "utils/utils.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include <cuda_runtime_api.h>
 #include <cmath>
 #include <cstring>
@@ -115,11 +116,19 @@ static void LargeBatchTopP(int count, int vocab) {
     void *sampler = FastllmCudaMtpCreateDraftSamplerBatch(count, vocab, temp.data(), ks.data(), ps.data());
     Require(sampler, "persistent batch sampler creation failed");
     Data ids(FLOAT32, {2, count}); ids.ToDevice(DataDevice::CUDA, std::vector<int>{0}, false); ids.Allocate(false);
+    Data chain(FLOAT32, {count, 3, vocab}), chainIds(FLOAT32, {2, count});
+    chain.ToDevice(DataDevice::CUDA, {0}, false); chain.Allocate(true);
+    chainIds.ToDevice(DataDevice::CUDA, {0}, false); chainIds.Allocate(false);
     auto sample = [&]() {
-        for (int step = 0; step < 2; ++step)
+        for (int step = 0; step < 2; ++step) {
             Require(FastllmCudaMtpDraftSamplerRunBatch(sampler, (float *)logits.cudaData,
                 (float *)probs.cudaData, (float *)ids.cudaData + step * count, step * 4),
                 "persistent batch sample failed");
+            Require(FastllmCudaMtpDraftSamplerRunBatchStrided(sampler, (float *)logits.cudaData,
+                (float *)chain.cudaData + size_t(step) * vocab,
+                (float *)chainIds.cudaData + step * count, step * 4, 3 * vocab),
+                "strided batch sample failed");
+        }
     };
     Require(FastllmCudaMtpDraftSamplerSetSeed(sampler), "persistent seed upload failed");
     sample();
@@ -134,6 +143,10 @@ static void LargeBatchTopP(int count, int vocab) {
         Require(FastllmCudaMtpDraftSamplerSetSeed(sampler), "replay seed upload failed");
         Require(cudaGraphLaunch(exec, cudaStreamPerThread) == cudaSuccess, "sampler graph replay");
         Require(cudaMemcpy(latest.data(), ids.cudaData, latest.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess, "sampler IDs download");
+        std::vector<float> stridedIds(latest.size());
+        Require(cudaMemcpy(stridedIds.data(), chainIds.cudaData, latest.size() * sizeof(float),
+                           cudaMemcpyDeviceToHost) == cudaSuccess, "strided IDs download");
+        Require(stridedIds == latest, "strided probability storage changed RNG draws");
         for (int row = 0; row < count; ++row) for (int step = 0; step < 2; ++step) {
             int id = (int)latest[step * count + row];
             Require(id >= 0 && id < vocab && ((float *)host.cpuData)[(size_t)row * vocab + id] > 0,
@@ -145,10 +158,73 @@ static void LargeBatchTopP(int count, int vocab) {
     }
     Require(changed && independent, "graph captured a constant seed or reused draw offsets");
     Data replay(probs); replay.ToDevice(DataDevice::CPU);
+    Data chainHost(chain); chainHost.ToDevice(DataDevice::CPU);
+    for (int row = 0; row < count; ++row) for (int step = 0; step < 3; ++step)
+        for (int id = 0; id < vocab; ++id) {
+            float want = step < 2 ? ((float *)replay.cpuData)[size_t(row) * vocab + id] : 0;
+            Require(((float *)chainHost.cpuData)[(size_t(row) * 3 + step) * vocab + id] == want,
+                    "strided q differs or overwrote adjacent chain storage");
+        }
     for (size_t i = 0; i < input.size(); ++i)
         Require(std::abs(((float *)replay.cpuData)[i] - ((float *)host.cpuData)[i]) < 2e-6,
             "graph proposal distribution differs");
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaMtpDestroyDraftSampler(sampler);
+}
+static void FusedBatchSampling(int count, int vocab, int steps) {
+    const int words = (vocab + 31) / 32, stride = (steps + 1) * vocab;
+    Data base = BF({1, count * steps, vocab}, 93), bias = BF({1, count, vocab}, 31);
+    Data mask(INT32, {count, words}); mask.Allocate();
+    for (int i = 0; i < count * words; ++i) ((uint32_t *)mask.cpuData)[i] = 0xeeeeeeeeu;
+    mask.ToDevice(DataDevice::CUDA, {0});
+    auto allocate = [&](Data &data, const std::vector<int> &dims) {
+        data.dataType = FLOAT32; data.Resize(dims); data.ToDevice(DataDevice::CUDA, {0}); data.Allocate(true);
+    };
+    Data reference, fused, referenceIds, fusedIds, logits;
+    allocate(reference, {count, steps + 1, vocab}); allocate(fused, reference.dims);
+    allocate(referenceIds, {steps, count}); allocate(fusedIds, referenceIds.dims);
+    std::vector<float> temperatures(count, 1.f), ps(count, 1.f);
+    std::vector<int> ks(count, 0);
+    void *sampler = FastllmCudaMtpCreateDraftSamplerBatch(count, vocab, temperatures.data(), ks.data(), ps.data());
+    Require(sampler && FastllmCudaMtpDraftSamplerSetSeed(sampler), "fused sampler initialization");
+    auto body = [&]() {
+        for (int step = 0; step < steps; ++step) {
+            FastllmCudaNaiveBatchDraftSamplingLogits(base, bias, mask, logits, step, steps);
+            Require(FastllmCudaMtpDraftSamplerRunBatchStrided(sampler, (float *)logits.cudaData,
+                (float *)reference.cudaData + size_t(step) * vocab,
+                (float *)referenceIds.cudaData + size_t(step) * count, step * 4, stride), "reference sampler");
+            Require(FastllmCudaMtpDraftSamplerRunBF16BiasBatch(sampler, base.cudaData, bias.cudaData,
+                (const uint32_t *)mask.cudaData, step, steps, (float *)fused.cudaData + size_t(step) * vocab,
+                (float *)fusedIds.cudaData + size_t(step) * count, step * 4, stride), "fused sampler");
+        }
+    };
+    body();
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    Require(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess, "fused capture begin");
+    body();
+    Require(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "fused capture end");
+    Require(cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess, "fused graph instantiate");
+    for (int replay = 0; replay < 3; ++replay) {
+        for (int row = 0; row < count; ++row) temperatures[row] = .3f + .2f * ((row + replay) % 6);
+        Require(FastllmCudaMtpDraftSamplerSetParameters(sampler, count, temperatures.data(), ks.data(), ps.data()) &&
+                FastllmCudaMtpDraftSamplerSetSeed(sampler), "fused replay parameters");
+        Require(cudaGraphLaunch(exec, cudaStreamPerThread) == cudaSuccess, "fused graph replay");
+        Data a(reference), b(fused), ai(referenceIds), bi(fusedIds);
+        a.ToDevice(DataDevice::CPU); b.ToDevice(DataDevice::CPU);
+        ai.ToDevice(DataDevice::CPU); bi.ToDevice(DataDevice::CPU);
+        Require(std::memcmp(a.cpuData, b.cpuData, a.GetBytes()) == 0, "fused softmax changed proposal probabilities");
+        Require(std::memcmp(ai.cpuData, bi.cpuData, ai.GetBytes()) == 0, "fused softmax changed RNG draws");
+        for (int row = 0; row < count; ++row) for (int i = 0; i < vocab; ++i)
+            Require(((float *)b.cpuData)[(size_t(row) * (steps + 1) + steps) * vocab + i] == 0,
+                    "fused probability storage overwrote chain padding");
+    }
+    // Filtered and invalid calls preserve the existing generic path.
+    std::fill(ps.begin(), ps.end(), .95f);
+    Require(FastllmCudaMtpDraftSamplerSetParameters(sampler, count, temperatures.data(), ks.data(), ps.data()), "fused fallback parameters");
+    Require(!FastllmCudaMtpDraftSamplerRunBF16BiasBatch(sampler, base.cudaData, bias.cudaData,
+        (const uint32_t *)mask.cudaData, 0, steps, (float *)fused.cudaData,
+        (float *)fusedIds.cudaData, 0, stride), "fused sampler accepted filtered distribution");
+    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaMtpDestroyDraftSampler(sampler);
+    std::cout << "FUSED PROPOSAL PASS rows=" << count << " vocab=" << vocab << " steps=" << steps << std::endl;
 }
 int main() {
     try {
@@ -158,6 +234,9 @@ int main() {
         for (int count : {1, 3, 8, 40, 65}) LargeBatchTopP(count, 65536);
         LargeBatchTopP(8, 152576);
         for (int count : {2, 8, 40}) for (int vocab : {7, 257, 16385}) BatchSampling(count, vocab);
+        for (int steps : {1, 3, 5, 7}) FusedBatchSampling(33, 257, steps);
+        FusedBatchSampling(65, 16385, 3);
+        FusedBatchSampling(256, 152576, 3);
         int checks = 0;
         // The unchanged two-row GEMV is an exact oracle for the new one-row
         // layout, including bias conversion, tail output tiles and cancellation.

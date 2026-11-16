@@ -1,4 +1,16 @@
 #pragma once
+#include <cstdint>
+
+// Persist q directly into per-request chain storage. A zero stride selects
+// contiguous vocabulary rows. Sampling uses identical probabilities and RNG.
+bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits,
+    float *proposalProbs, float *deviceTokens, uint64_t offset, int probabilityStride);
+
+// Fuse BF16 base+bias (with BF16 rounding) and temperature softmax for large
+// unfiltered draft batches. Unsupported cases return false before writing.
+bool FastllmCudaMtpDraftSamplerRunBF16BiasBatch(void *sampler, const void *base, const void *bias,
+    const uint32_t *mask, int step, int steps, float *proposalProbs,
+    float *deviceTokens, uint64_t offset, int probabilityStride);
 
 // Host descriptors; pointed-to storage remains on the current CUDA device.
 // Batch APIs stage only these descriptors, never the full-vocabulary caches.

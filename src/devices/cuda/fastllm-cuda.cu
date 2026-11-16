@@ -16194,11 +16194,30 @@ bool FastllmCudaRepeatPenalty (fastllm::Data &input, fastllm::Data &penalty, fas
     return true;
 }
 
-template <int BLOCK_THREADS>
-__global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, float *temperatures, int vocabSize) {
+struct FastllmFloatSoftmaxInput {
+    const float *data;
+    __device__ float operator()(int row, int index, int vocab) const {
+        return data[(size_t)row * vocab + index];
+    }
+};
+struct FastllmBF16BiasSoftmaxInput {
+    const __nv_bfloat16 *base, *bias;
+    const uint32_t *mask;
+    int step, steps;
+    __device__ float operator()(int row, int index, int vocab) const {
+        if (!(mask[(size_t)row * ((vocab + 31) / 32) + index / 32] & (uint32_t(1) << (index % 32))))
+            return -INFINITY;
+        float value = __bfloat162float(base[((size_t)row * steps + step) * vocab + index]) +
+                      __bfloat162float(bias[(size_t)row * vocab + index]);
+        // Preserve the existing BF16 bias addition before FP32 temperature softmax.
+        return __bfloat162float(__float2bfloat16_rn(value));
+    }
+};
+template <int BLOCK_THREADS, typename Input>
+__device__ void FastllmTemperatureSoftmaxBody(Input input, float *probs,
+                                            const float *temperatures, int vocabSize) {
     int bid = blockIdx.x;
     float invTemp = 1.0f / temperatures[bid];
-    float *input = logits + (long long)bid * vocabSize;
     float *output = probs + (long long)bid * vocabSize;
 
     __shared__ float sMaxVal;
@@ -16206,7 +16225,7 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
 
     float localMax = -1e30f;
     for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
-        localMax = fmaxf(localMax, input[i] * invTemp);
+        localMax = fmaxf(localMax, input(bid, i, vocabSize) * invTemp);
     }
     typedef cub::BlockReduce<float, BLOCK_THREADS> BlockReduce;
     __shared__ typename BlockReduce::TempStorage tempStorage;
@@ -16217,7 +16236,7 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
 
     float localSum = 0.0f;
     for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
-        localSum += expf(input[i] * invTemp - maxVal);
+        localSum += expf(input(bid, i, vocabSize) * invTemp - maxVal);
     }
     __syncthreads();
     float blockSum = BlockReduce(tempStorage).Sum(localSum);
@@ -16227,8 +16246,16 @@ __global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, flo
 
     float invSum = 1.0f / sumExp;
     for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
-        output[i] = expf(input[i] * invTemp - maxVal) * invSum;
+        output[i] = expf(input(bid, i, vocabSize) * invTemp - maxVal) * invSum;
     }
+}
+template <int BLOCK_THREADS>
+__global__ void FastllmTemperatureSoftmaxKernel(float *logits, float *probs, float *temperatures, int vocabSize) {
+    FastllmTemperatureSoftmaxBody<BLOCK_THREADS>(FastllmFloatSoftmaxInput{logits}, probs, temperatures, vocabSize);
+}
+__global__ void FastllmBF16BiasTemperatureSoftmaxKernel(FastllmBF16BiasSoftmaxInput input,
+        float *probs, const float *temperatures, int vocabSize) {
+    FastllmTemperatureSoftmaxBody<1024>(input, probs, temperatures, vocabSize);
 }
 
 // Small decode batches cannot fill the GPU with one CTA per vocabulary row.
@@ -18139,19 +18166,47 @@ bool FastllmCudaMtpDraftSamplerRun(void *sampler, float *logits, float *proposal
 }
 bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *proposalProbs,
                                       float *deviceToken, uint64_t offset) {
-    if (!sampler || !logits || !proposalProbs || !deviceToken) return false;
-    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
-    if (!ws.Normalize(logits, ws.rows, ws.vocab)) return false;
+    return FastllmCudaMtpDraftSamplerRunBatchStrided(sampler, logits, proposalProbs, deviceToken, offset, 0);
+}
+static bool FastllmMtpRetainAndSample(FastllmMtpSamplingWorkspace &ws, float *proposalProbs,
+        float *deviceToken, uint64_t offset, int probabilityStride) {
     cudaStream_t stream = cudaStreamPerThread;
-    cudaError_t result = cudaMemcpyAsync(proposalProbs, ws.a, (size_t)ws.rows * ws.vocab * sizeof(float),
-                                         cudaMemcpyDeviceToDevice, stream);
+    cudaError_t result = cudaMemcpy2DAsync(proposalProbs, size_t(probabilityStride) * sizeof(float),
+        ws.a, size_t(ws.vocab) * sizeof(float), size_t(ws.vocab) * sizeof(float),
+        ws.rows, cudaMemcpyDeviceToDevice, stream);
     if (result == cudaSuccess)
         result = flashinfer::sampling::SamplingFromProb<float, int, 1>(
-            proposalProbs, ws.output, ws.valid, nullptr, ws.rows, ws.vocab, true,
+            ws.a, ws.output, ws.valid, nullptr, ws.rows, ws.vocab, true,
             ws.seed, 0, nullptr, offset, stream);
     if (result != cudaSuccess) return false;
     FastllmMtpSampleIdToFloat<<<(ws.rows + 127) / 128, 128, 0, stream>>>(ws.output, deviceToken, ws.rows);
     return cudaGetLastError() == cudaSuccess;
+}
+bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits, float *proposalProbs,
+                                      float *deviceToken, uint64_t offset, int probabilityStride) {
+    if (!sampler || !logits || !proposalProbs || !deviceToken) return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
+    if (!probabilityStride) probabilityStride = ws.vocab;
+    if (probabilityStride < ws.vocab || !ws.Normalize(logits, ws.rows, ws.vocab)) return false;
+    return FastllmMtpRetainAndSample(ws, proposalProbs, deviceToken, offset, probabilityStride);
+}
+bool FastllmCudaMtpDraftSamplerRunBF16BiasBatch(void *sampler, const void *base, const void *bias,
+        const uint32_t *mask, int step, int steps, float *proposalProbs,
+        float *deviceToken, uint64_t offset, int probabilityStride) {
+    if (!sampler || !base || !bias || !mask || !proposalProbs || !deviceToken ||
+        steps <= 0 || step < 0 || step >= steps) return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
+    // Keep the existing small-batch/tiled and filtered-distribution fallbacks.
+    // This path fuses only the same one-CTA temperature-softmax computation.
+    if (ws.rows <= 32 || ws.needTopK || ws.needTopP) return false;
+    if (!probabilityStride) probabilityStride = ws.vocab;
+    if (probabilityStride < ws.vocab) return false;
+    ws.a = ws.bufferA;
+    FastllmBF16BiasTemperatureSoftmaxKernel<<<ws.rows, 1024, 0, cudaStreamPerThread>>>(
+        {(const __nv_bfloat16 *)base, (const __nv_bfloat16 *)bias, mask, step, steps},
+        ws.a, ws.temperatures, ws.vocab);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    return FastllmMtpRetainAndSample(ws, proposalProbs, deviceToken, offset, probabilityStride);
 }
 
 bool FastllmCudaMtpSampleDraft(float *logits, float *proposalProbs,
