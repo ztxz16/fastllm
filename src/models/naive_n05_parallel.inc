@@ -81,6 +81,9 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         if (ForwardAttentionParallelServing(inputIds, positions, kv, config, selection, batch, servingOutput))
             return servingOutput;
     }
+    // An intervening prefill, verification or eager fallback may change cache
+    // descriptors or shared graph storage. Revalidate on the next serving step.
+    if (!state.servingPadded) state.servingPlan.valid = false;
     const auto &topology = state.runtime.Layout();
     const int sequences = batch ? batch->Size() : 1;
     const int total = inputIds.dims.at(1);
@@ -92,16 +95,19 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     Data hostPositions(positions); hostPositions.ToDevice(CPU);
     AssertInFastLLM(hostPositions.dataType == FLOAT32 && hostPositions.Count(0) == (size_t)total,
         "Naive attention DP requires one position per input row");
-    const bool ownedDecode = !state.servingPadded && batch && batch->Decode() && !verifying && !sparseKv &&
+    const int liveRows = state.servingPadded ? state.servingLiveRows : sequences;
+    const bool ownedDecode = batch && batch->Decode() && !verifying && !sparseKv &&
+        !(tpServingState && tpServingState->preparing) &&
         mainLoop && mainLoop->get_id() == std::this_thread::get_id();
     auto matchesPlan = [&] {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
-        return state.plan.Matches(*batch, tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds);
+        return state.plan.Matches(*batch, tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds, liveRows);
     };
-    const bool reusePlan = ownedDecode && state.planValid &&
-        state.planKVType == kvCacheDataType && matchesPlan();
+    const bool reusePlan = ownedDecode && state.plan.valid &&
+        state.plan.kvType == kvCacheDataType &&
+        (!state.servingPadded || state.plan.graph.lock() == tpDecodeState) && matchesPlan();
     // Do not publish a partially rebuilt plan after an exception.
-    state.planValid = false;
+    state.plan.valid = false;
     state.reuseBindings = false;
     if (reusePlan) {
         AssertInFastLLM(total == sequences, "Naive attention DP decode row count changed");
@@ -405,14 +411,14 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             FastllmCudaSyncCurrentThreadStream();
         });
     }
-    if (recording) for (int seq = 0; seq < (state.servingPadded ? state.servingLiveRows : sequences); ++seq)
+    if (recording) for (int seq = 0; seq < liveRows; ++seq)
         FinishPrefixSnapshots(key(seq, 0), prefixes[seq], (batch ? batch->lengths[seq] : total) > 1);
     if (ownedDecode) {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
-        state.planKVType = kvCacheDataType;
-        state.planValid = state.plan.Remember(*batch,
-            tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds);
-        state.validatedGraph = graphDecode && tpDecodeState->captured && !tpDecodeState->disabled
+        state.plan.kvType = kvCacheDataType;
+        state.plan.valid = state.plan.Remember(*batch,
+            tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds, liveRows);
+        state.plan.graph = graphDecode && tpDecodeState->captured && !tpDecodeState->disabled
             ? tpDecodeState : std::shared_ptr<TPDecodeState>();
     }
     if (capture) {

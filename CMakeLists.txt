@@ -3010,7 +3010,7 @@ if (UNIT_TEST)
                     COMMAND naive_n05_verify_graph_test 8 attention_dp_serving ${NAIVE_DP_GROUPS})
                 set_tests_properties(naive_n05_attention_dp_serving_${NAIVE_DP_GROUPS}
                     PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
-                    PASS_REGULAR_EXPRESSION "ATTENTION DP SERVING PASS")
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP SERVING PLAN PASS")
                 foreach(NAIVE_DP_KV bf16 fp8)
                     add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
                         COMMAND naive_n05_verify_graph_test 8 attention_dp_ring ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})

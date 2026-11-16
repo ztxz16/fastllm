@@ -76,15 +76,18 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
     struct Scope {
         AttentionParallelState &dp;
         std::shared_ptr<TPDecodeState> &current, previous;
+        void SwapScratch() {
+            dp.ranks.swap(dp.servingRanks); dp.transfer.swap(dp.servingTransfer);
+            dp.groups.swap(dp.servingGroups); std::swap(dp.rows, dp.servingRows);
+            std::swap(dp.plan, dp.servingPlan);
+        }
         Scope(AttentionParallelState &dp, std::shared_ptr<TPDecodeState> &current, int live)
             : dp(dp), current(current), previous(current) {
             dp.servingPadded = true; dp.servingLiveRows = live;
-            dp.ranks.swap(dp.servingRanks); dp.transfer.swap(dp.servingTransfer);
-            std::swap(dp.rows, dp.servingRows); dp.planValid = false;
+            SwapScratch();
         }
         ~Scope() {
-            dp.ranks.swap(dp.servingRanks); dp.transfer.swap(dp.servingTransfer);
-            std::swap(dp.rows, dp.servingRows); dp.planValid = false;
+            SwapScratch(); dp.reuseBindings = false;
             dp.servingPadded = false; current = previous;
         }
     } scope(dp, tpDecodeState, batch->Size());
@@ -117,6 +120,11 @@ bool NaiveN05FlashModel::PrepareAttentionParallelServingDecode(const TargetBatch
     if (!dp.servingPadded || !batch || !tpDecodeState) return false;
     auto &graph = *tpDecodeState;
     const bool preparing = tpServingState->preparing;
+    // The owned scheduler already checked live request identities, order and
+    // lengths both before and after page reservation. A graph change, COW or
+    // allocation invalidates this path; padding has no independent KV state.
+    if (!preparing && dp.reuseBindings && dp.plan.graph.lock() == tpDecodeState)
+        return graph.active = true;
     for (int rank = 0; rank < (int)tpDevices.size(); ++rank) {
         const auto &group = dp.groups[dp.runtime.Layout().AttentionOwner(rank)];
         auto &storage = *graph.ranks[rank]->storage;

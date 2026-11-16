@@ -9,6 +9,9 @@ struct NaiveN05FlashModel::AttentionParallelState {
     // Only the owned scheduler may reuse descriptors. Identities change before
     // cache mutation and on request recycling, including reuse of the same address.
     struct RequestPlan {
+        bool valid = false;
+        DataType kvType = DATA_AUTO_NONE;
+        std::weak_ptr<TPDecodeState> graph;
         uint64_t epoch = 0;
         struct Request {
             const Data *key;
@@ -17,8 +20,8 @@ struct NaiveN05FlashModel::AttentionParallelState {
         };
         std::vector<Request> requests;
         bool Matches(const TargetBatch &batch, uint64_t currentEpoch,
-                const std::unordered_map<const Data *, uint64_t> &live) const {
-            if (epoch != currentEpoch || requests.size() != (size_t)batch.Size()) return false;
+                const std::unordered_map<const Data *, uint64_t> &live, int liveRows) const {
+            if (epoch != currentEpoch || requests.size() != (size_t)liveRows) return false;
             for (size_t row = 0; row < requests.size(); ++row) {
                 const Data &root = batch.Key(row, 0);
                 auto id = live.find(&root);
@@ -29,9 +32,9 @@ struct NaiveN05FlashModel::AttentionParallelState {
             return true;
         }
         bool Remember(const TargetBatch &batch, uint64_t currentEpoch,
-                const std::unordered_map<const Data *, uint64_t> &live) {
+                const std::unordered_map<const Data *, uint64_t> &live, int liveRows) {
             epoch = currentEpoch;
-            requests.resize(batch.Size());
+            requests.resize(liveRows);
             for (size_t row = 0; row < requests.size(); ++row) {
                 const Data &root = batch.Key(row, 0);
                 auto id = live.find(&root);
@@ -42,8 +45,7 @@ struct NaiveN05FlashModel::AttentionParallelState {
         }
     };
     RequestPlan plan;
-    bool planValid = false, reuseBindings = false;
-    std::weak_ptr<TPDecodeState> validatedGraph;
+    bool reuseBindings = false;
     struct GroupBatch {
         std::vector<std::pair<Data *, Data *>> kv;
         std::vector<GenerationConfig> configs;
@@ -64,17 +66,18 @@ struct NaiveN05FlashModel::AttentionParallelState {
     // Serving graphs own separate DP scratch: a large prefill must not move
     // buffers retained by a decode graph. All serving shapes share this arena.
     std::unique_ptr<parallel::CudaRowTransfer> servingTransfer;
+    std::vector<GroupBatch> servingGroups;
     std::vector<Rank> servingRanks;
     parallel::RowPartition servingRows;
+    RequestPlan servingPlan;
     std::vector<std::pair<Data, Data>> padding;
     bool servingPadded = false;
     int servingLiveRows = 0;
     struct UnsupportedServingLayout {};
     std::atomic<size_t> nextGroup{0};
-    DataType planKVType = DATA_AUTO_NONE;
     explicit AttentionParallelState(parallel::Topology topology)
         : runtime(topology), groups(topology.attentionDP), ranks(topology.Size()),
-          rows(topology.attentionDP, {}), servingRanks(topology.Size()),
+          rows(topology.attentionDP, {}), servingGroups(topology.attentionDP), servingRanks(topology.Size()),
           servingRows(topology.attentionDP, {}) {}
 };
 }

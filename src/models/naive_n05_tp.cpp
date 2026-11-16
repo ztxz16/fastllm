@@ -1313,7 +1313,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         // boundary remains dynamic. Direct forwards retain the full scan below.
         // DP commits metadata itself and does not consume cacheLengths.
         if (attentionParallel && attentionParallel->reuseBindings &&
-            attentionParallel->validatedGraph.lock() == tpDecodeState &&
+            attentionParallel->plan.graph.lock() == tpDecodeState &&
             state.sequenceCapacities.size() == (size_t)sequences) {
             bool fits = true;
             for (int sequence = 0; sequence < sequences; ++sequence)

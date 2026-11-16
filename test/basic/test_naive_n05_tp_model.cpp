@@ -5,6 +5,7 @@
 #include "pd.h"
 #include "fastkv/host_cache.h"
 #include "../../src/models/naive_n05_tp.h"
+#include "../../src/models/naive_n05_parallel.h"
 #include "models/speculative_sampling.h"
 #include "utils/utils.h"
 #include <cmath>
@@ -101,7 +102,6 @@ using namespace fastllm;
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
 namespace fastllm {
 struct NaiveN05PrefixCacheTestAccess {
-    static void InvalidateAll(NaiveN05FlashModel &model) { model.InvalidateTensorParallelCache(); }
     static int RetainedRows(NaiveN05FlashModel &model,
             std::vector<std::pair<Data *, Data *>> &kv,
             const std::vector<GenerationConfig> &configs, const std::vector<int> &lengths) {
@@ -118,6 +118,11 @@ struct NaiveN05GraphTestAccess {
     static void SetDraftDevices(NaiveN05FlashModel &model, int ranks) {
         model.tpDevices.resize(ranks);
         std::iota(model.tpDevices.begin(), model.tpDevices.end(), 0);
+    }
+    static void InvalidateAll(NaiveN05FlashModel &model) { model.InvalidateTensorParallelCache(); }
+    static bool HasDPServingPlan(NaiveN05FlashModel &model) {
+        const auto &dp = *model.attentionParallel;
+        return dp.servingPlan.valid && !dp.servingPlan.graph.expired();
     }
     static void InitDPCache(NaiveN05FlashModel &model,
             const std::vector<std::pair<Data *, Data *>> &roots, int group) {
@@ -2012,7 +2017,7 @@ class Fixture : public NaiveN05FlashModel {
                             pos.push_back(&positions[row]); output.push_back(&logits[row]);
                             for (auto &layer : contexts[sequence]->pastKeyValues) kv.emplace_back(&layer.first, &layer.second);
                         }
-                        if (forceValidation) NaiveN05PrefixCacheTestAccess::InvalidateAll(*this);
+                        if (forceValidation) NaiveN05GraphTestAccess::InvalidateAll(*this);
                         else {
                             bool growing = false;
                             for (int row : order) {
@@ -2944,6 +2949,108 @@ class Fixture : public NaiveN05FlashModel {
         }
         std::cout << "ATTENTION DP SERVING PASS dp=" << groups << " replayed=" << replayed
                   << " relative=" << largestLogitRelative << std::endl;
+    }
+
+    void AttentionDPServingPlanChecks(int groups) {
+        // Called after the direct-forward serving checks. Exercise the trusted
+        // scheduler path against identical graphs with full validation forced.
+        std::vector<float> reference;
+        std::exception_ptr error;
+        std::atomic<bool> ready{false};
+        int plans = 0, growth = 0, cow = 0;
+        mainLoop = new std::thread([&] {
+            while (!ready.load()) std::this_thread::yield();
+            try {
+                for (bool forceValidation : {true, false}) {
+                    const int count = groups * 2;
+                    std::vector<std::unique_ptr<ResponseContext>> contexts(count);
+                    std::vector<int> past(count);
+                    GenerationConfig config; config.top_k = 1; config.repeat_penalty = 1;
+                    config.output_logits = true; config.output_token_limit = 128;
+                    auto append = [&](int row, int tokens) {
+                        std::vector<float> ids(tokens), pos(tokens);
+                        for (int i = 0; i < tokens; ++i) {
+                            pos[i] = past[row] + i; ids[i] = ((int)pos[i] * 7 + row) % 251;
+                        }
+                        Forward(Data(FLOAT32, {1, tokens}, ids), Data(), Data(FLOAT32, {1, tokens}, pos),
+                            contexts[row]->pastKeyValues, config);
+                        past[row] += tokens;
+                    };
+                    auto create = [&](int row) {
+                        contexts[row].reset(new ResponseContext());
+                        contexts[row]->Init(block_cnt, dataType, kvCacheDataType);
+                        std::vector<std::pair<Data *, Data *>> roots;
+                        for (auto &pair : contexts[row]->pastKeyValues) roots.emplace_back(&pair.first, &pair.second);
+                        NaiveN05GraphTestAccess::InitDPCache(*this, roots, row % groups);
+                        OnResponseContextCreated(contexts[row].get());
+                        past[row] = 0; append(row, 4089 + row % 3);
+                    };
+                    for (int row = 0; row < count; ++row) create(row);
+                    size_t offset = 0;
+                    for (int step = 0; step < 80; ++step) {
+                        if (step == 16) {
+                            OnResponseContextRemoved(contexts[1].get()); contexts[1].reset();
+                        }
+                        if (step == 24) create(1);
+                        if (step == 40) append(0, 17);
+                        std::vector<int> order;
+                        for (int row = 0; row < count; ++row)
+                            if (contexts[row] && (step < 48 || step >= 64 || row % groups == 0)) order.push_back(row);
+                        if (step >= 32) std::reverse(order.begin(), order.end());
+                        std::vector<float> ids(order.size());
+                        std::vector<Data> positions(order.size());
+                        std::vector<Data *> pos;
+                        std::vector<std::pair<Data *, Data *>> kv;
+                        std::vector<GenerationConfig> configs(order.size(), config);
+                        std::vector<int> lengths(order.size(), 1);
+                        std::vector<std::vector<float>> logits(order.size());
+                        std::vector<std::vector<float> *> outputs;
+                        std::vector<std::pair<Data *, int>> shared;
+                        for (size_t i = 0; i < order.size(); ++i) {
+                            int row = order[i]; ids[i] = (past[row] * 7 + row) % 251;
+                            positions[i].CopyFrom(Data(FLOAT32, {1, 1}, {(float)past[row]}));
+                            pos.push_back(&positions[i]); outputs.push_back(&logits[i]);
+                            for (auto &pair : contexts[row]->pastKeyValues) kv.emplace_back(&pair.first, &pair.second);
+                            const auto &local = *contexts[row]->pastKeyValues[0].first.multiDeviceDatas.begin()->second;
+                            if (!forceValidation && past[row] >= (int)local.pageIndex.size() * local.pageLen) ++growth;
+                            if (step == 72) for (Data *root : {&contexts[row]->pastKeyValues[0].first,
+                                                            &contexts[row]->pastKeyValues[0].second})
+                                for (auto &entry : root->multiDeviceDatas) {
+                                    Data &cache = *entry.second;
+                                    if (past[row] % cache.pageLen) {
+                                        int page = cache.pageIndex[(past[row] - 1) / cache.pageLen];
+                                        std::vector<int> pages{page}; cache.pagedKVCacheData->Pick(pages);
+                                        shared.emplace_back(&cache, page);
+                                    }
+                                }
+                        }
+                        if (forceValidation || step == 76) NaiveN05GraphTestAccess::InvalidateAll(*this);
+                        ForwardBatch(order.size(), Data(FLOAT32, {1, (int)order.size()}, ids), {}, pos,
+                            lengths, kv, configs, LastTokensManager(), &outputs);
+                        if (!forceValidation && NaiveN05GraphTestAccess::HasDPServingPlan(*this)) ++plans;
+                        for (auto entry : shared) {
+                            Data &cache = *entry.first;
+                            if (cache.pageIndex[(cache.dims[1] - 2) / cache.pageLen] == entry.second)
+                                throw std::runtime_error("DP serving did not copy shared tail");
+                            cache.pagedKVCacheData->ReleasePageIndex(entry.second);
+                            if (!forceValidation) ++cow;
+                        }
+                        for (size_t i = 0; i < order.size(); ++i) {
+                            if (forceValidation) reference.insert(reference.end(), logits[i].begin(), logits[i].end());
+                            else for (float value : logits[i]) if (value != reference.at(offset++))
+                                throw std::runtime_error("DP serving binding reuse changed logits");
+                            ++past[order[i]];
+                        }
+                    }
+                    for (auto &context : contexts) if (context) OnResponseContextRemoved(context.get());
+                }
+            } catch (...) { error = std::current_exception(); }
+        });
+        ready.store(true); mainLoop->join(); delete mainLoop; mainLoop = nullptr;
+        if (error) std::rethrow_exception(error);
+        if (plans < 64 || !growth || !cow) throw std::runtime_error("DP serving plan coverage missing");
+        std::cout << "ATTENTION DP SERVING PLAN PASS exact_logits=" << reference.size()
+                  << " plans=" << plans << " growth=" << growth << " cow=" << cow << std::endl;
     }
 
     void AttentionDPAdmission(int groups, bool batchPrefill, bool scheduled = false) {
@@ -4584,6 +4691,10 @@ int main(int argc, char **argv) {
             Fixture fixture(ranks, false, true, true, true);
             fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.AttentionDPServingChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+            if (!failVerifyInstantiate)
+#endif
+                fixture.AttentionDPServingPlanChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_ring") {
