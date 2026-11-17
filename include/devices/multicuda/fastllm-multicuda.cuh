@@ -114,6 +114,9 @@ void FastllmNcclAllReduceNoCustomWithSpin(void* data, void* dest, int count, int
                                        int deviceId, int hostSpinMicroseconds);
 // Requires an initialized TP communicator and matching submissions on every rank.
 bool FastllmNcclAllGather(const void* data, void* dest, int count, int dataType, int deviceId);
+// Variable counts in communicator-rank order, identical on every rank. Each
+// source already occupies its final slice in data; zero-row ranks participate.
+bool FastllmNcclAllGatherVInplace(void *data, const std::vector<int> &counts, int dataType, int deviceId);
 // count is the number of output elements per rank. As with AllGather, the
 // caller coordinates matching submissions on the initialized communicator.
 bool FastllmNcclReduceScatter(const void* data, void* dest, int count, int dataType, int deviceId);

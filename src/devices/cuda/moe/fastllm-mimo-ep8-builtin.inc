@@ -17,7 +17,7 @@ struct FastllmCudaMimoEp8BuiltinMega {
         fastllm::Data workspace{fastllm::INT8};
         std::vector<std::unique_ptr<fastllm::Data>> scales;
         std::vector<void *> layers;
-        void *output = nullptr; // Borrowed only during the prefill exchange.
+        void *output = nullptr; // Borrowed during the EP4 prefill exchange.
         void *prefillScratch = nullptr;
         void *prefillReady = nullptr;
         ~Rank() {
@@ -31,7 +31,7 @@ struct FastllmCudaMimoEp8BuiltinMega {
     std::vector<int> devices;
     bool mxfp4 = false;
     std::vector<std::unique_ptr<Rank>> ranks;
-    // Publish completed outputs, then keep them alive until all peers finish.
+    // Coordinate matching communication/workspace submissions on all ranks.
     std::mutex outputMutex;
     std::condition_variable outputReady;
     int arrivals = 0;
@@ -180,16 +180,15 @@ void FastllmCudaMimoEp8BuiltinPrefillReduceScatter(FastllmCudaMimoEp8BuiltinMega
 }
 void FastllmCudaMimoEp8BuiltinPrefillAllGather(FastllmCudaMimoEp8BuiltinMega &state, int rank,
                                       fastllm::Data &output) {
-    // Publish completed shards, then gather directly into the existing output.
-    // All sources stay alive until every peer finishes reading them. This
-    // eager-only path needs neither zero padding nor another collective arena.
+    // Gather in place on each worker's compute stream. This eager-only path
+    // needs neither zero padding nor another collective arena.
     using namespace fastllm;
     const int ranks = (int)state.devices.size();
     AssertInFastLLM(rank >= 0 && rank < ranks && output.dims.size() == 2 &&
         output.dims[0] > 0 && output.dims[1] > 0 && output.cudaData &&
         output.dataDevice == DataDevice::CUDA &&
         output.dataDeviceIds == std::vector<int>{state.devices[rank]} &&
-        (output.dataType == BFLOAT16 || output.dataType == INT32),
+        (output.dataType == BFLOAT16 || output.dataType == INT32 || output.dataType == FLOAT32),
         "Invalid MiMo EP prefill AllGather tensor.");
     const int total = output.dims[0];
     const size_t rowBytes = (size_t)output.dims[1] * output.unitSize;
@@ -205,6 +204,19 @@ void FastllmCudaMimoEp8BuiltinPrefillAllGather(FastllmCudaMimoEp8BuiltinMega &st
         state.WaitForOutputs();
         return;
     }
+    if (ranks == 8) {
+        std::vector<int> counts(ranks);
+        for (int peer = 0; peer < ranks; ++peer) {
+            const int64_t rows = (int64_t)total * (peer + 1) / ranks - (int64_t)total * peer / ranks;
+            AssertInFastLLM(rows * output.dims[1] <= std::numeric_limits<int>::max(),
+                "MiMo EP prefill AllGather shard is too large.");
+            counts[peer] = rows * output.dims[1];
+        }
+        AssertInFastLLM(FastllmNcclAllGatherVInplace(output.cudaData, counts,
+            output.dataType, state.devices[rank]), "MiMo EP prefill AllGatherV failed.");
+        return;
+    }
+    // Four-rank direct copies retain better large-shard bandwidth on H20.
     state.ranks[rank]->output = output.cudaData;
     FastllmCudaSyncCurrentThreadStream();
     state.WaitForOutputs();
@@ -212,6 +224,7 @@ void FastllmCudaMimoEp8BuiltinPrefillAllGather(FastllmCudaMimoEp8BuiltinMega &st
         const int peer = (rank + step) % ranks;
         const size_t first = (int64_t)total * peer / ranks;
         const size_t rows = (int64_t)total * (peer + 1) / ranks - first;
+        if (!rows) continue;
         AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(state.devices[rank],
             (uint8_t *)output.cudaData + first * rowBytes, state.devices[peer],
             (const uint8_t *)state.ranks[peer]->output + first * rowBytes,

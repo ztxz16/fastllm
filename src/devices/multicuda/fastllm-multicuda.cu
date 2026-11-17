@@ -21,6 +21,7 @@
 #include <cstring>
 #include <atomic>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -3713,6 +3714,53 @@ bool FastllmNcclAllGather(const void* data, void* dest, int count,
     }
     return FastllmNcclSubmitGatherScatter("AllGather", count, dataType, deviceId,
         [&](cudaStream_t stream) { return ncclAllGather(data, dest, count, type, comm, stream); });
+}
+
+bool FastllmNcclAllGatherVInplace(void *data, const std::vector<int> &counts,
+                                int dataType, int deviceId) {
+    ncclComm_t comm = FindNcclCommNoLog(deviceId);
+    ncclDataType_t type = ncclFloat;
+    auto owner = g_ncclRanks.find(deviceId);
+    size_t total = 0;
+    bool valid = data && comm && owner != g_ncclRanks.end() &&
+        counts.size() == (size_t)g_ncclWorldSize;
+    for (int count : counts) {
+        valid = valid && count >= 0;
+        if (count > 0) total += count;
+    }
+    if (!valid || total == 0 || total > (size_t)std::numeric_limits<int>::max() ||
+        !FastllmNcclResolveDataType(dataType, type, "AllGatherV")) {
+        if (g_ncclSubmitRendezvous) g_ncclSubmitRendezvous->Abort("invalid AllGatherV arguments");
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    const int rank = owner->second;
+    const size_t unit = FastllmNcclDataTypeBytes(dataType);
+    size_t localOffset = 0;
+    for (int peer = 0; peer < rank; ++peer) localOffset += counts[peer];
+    const void *source = (const uint8_t *)data + localOffset * unit;
+    return FastllmNcclSubmitGatherScatter("AllGatherV", (int)total, dataType, deviceId,
+        [&](cudaStream_t stream) {
+            ncclResult_t result = ncclGroupStart();
+            if (result != ncclSuccess) return result;
+            size_t offset = 0;
+            for (int peer = 0; peer < (int)counts.size(); ++peer) {
+                if (peer != rank) {
+                    if (counts[rank]) {
+                        auto status = ncclSend(source, counts[rank], type, peer, comm, stream);
+                        if (status != ncclSuccess) result = status;
+                    }
+                    if (counts[peer]) {
+                        auto status = ncclRecv((uint8_t *)data + offset * unit,
+                            counts[peer], type, peer, comm, stream);
+                        if (status != ncclSuccess) result = status;
+                    }
+                }
+                offset += counts[peer];
+            }
+            auto status = ncclGroupEnd();
+            return result == ncclSuccess ? status : result;
+        });
 }
 
 bool FastllmNcclReduceScatter(const void* data, void* dest, int count,

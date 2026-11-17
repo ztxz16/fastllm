@@ -3696,6 +3696,15 @@ if (UNIT_TEST)
         add_test(NAME cuda_fp8_perchannel COMMAND cuda_fp8_perchannel_test)
         set_tests_properties(cuda_fp8_perchannel PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(nccl_allgatherv_test test/basic/test_nccl_allgatherv.cu)
+        target_link_libraries(nccl_allgatherv_test PRIVATE fastllm Threads::Threads)
+        set_target_properties(nccl_allgatherv_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        foreach(ALLGATHERV_RANKS 2 4 8)
+            add_test(NAME nccl_allgatherv_${ALLGATHERV_RANKS} COMMAND nccl_allgatherv_test ${ALLGATHERV_RANKS})
+            set_tests_properties(nccl_allgatherv_${ALLGATHERV_RANKS}
+                PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endforeach()
+
         add_executable(cuda_fp8_row_test test/basic/test_cuda_fp8_row.cu)
         target_link_libraries(cuda_fp8_row_test PRIVATE fastllm)
         set_target_properties(cuda_fp8_row_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
