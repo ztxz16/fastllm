@@ -710,6 +710,10 @@ int main() {
                 TestAttention(heads, 192, 128, 0, 896,
                               {1, 63, 64, 65, 707, 748, 895, 896, 257}, true, sink);
         TestAttention(8, 192, 128, 0, 2048, {257, 1024, 2047, 2048, 513}, true);
+        // DP attention retains all heads on one device. Exercise the wide
+        // SWA output tile across live-length growth and rollback in one graph.
+        for (bool sink : {false, true})
+            TestAttention(64, 192, 128, 128, 256, {1, 63, 127, 128, 129, 256, 3}, false, sink);
         for (int heads : {2, 4, 8, 16}) {
             for (bool sink : {false, true})
                 TestAttention(heads, 192, 128, 0, 256, {1, 2, 127, 128, 129, 255, 256, 3}, true,
@@ -733,6 +737,8 @@ int main() {
 
         for (int w : {8, 128})
             TestVerifyGraph(w, 256, {3, 120, 127, 128, 32768, 7}, true);
+        for (int rows : {1, 3, 8, 11})
+            TestVerifyGraph(128, 256, {3, 120, 127, 128, 32768, 7}, true, rows, 64);
         for (bool fp8 : {false, true})
             TestVerifyGraph(0, 131072, {2048, 4095, 32768, 131064, 2049}, fp8);
         for (int rows : {1, 7, 8})

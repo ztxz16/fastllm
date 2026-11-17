@@ -44,15 +44,15 @@ inline cudaError_t RunWindow(Params p, cudaStream_t stream) {
 }
 inline cudaError_t Run(const BF16 *q, const BF16 *k, const BF16 *v, const float *sink,
                        BF16 *out, int queries, int keys, int heads, int kvHeads,
-                       int keyStride, cudaStream_t stream = cudaStreamPerThread, bool hopper = false) {
+                       int keyStride, cudaStream_t stream = cudaStreamPerThread, int arch = 0) {
     Params p(const_cast<BF16 *>(q), const_cast<BF16 *>(k), const_cast<BF16 *>(v), nullptr,
              out, nullptr, nullptr, heads, kvHeads, queries, keys,
              heads * 192, 192, keyStride, 192, 192, 127, 0.0f, 1.0f / sqrtf(192.0f), 1.0f, 10000.0f);
     p.v_stride_n = kvHeads * 128;
     p.v_stride_h = 128;
     p.sink = sink;
-    if (hopper && queries >= 32 && heads == kvHeads * 8)
-        return queries < 8192 ? RunWindow<64>(p, stream) : RunWindow<128>(p, stream);
+    if ((arch == 90 || arch == 120) && queries >= 32 && heads == kvHeads * 8)
+        return arch == 90 && queries >= 8192 ? RunWindow<128>(p, stream) : RunWindow<64>(p, stream);
     // A null scratch pointer disables split-KV so the sink is counted once.
     return flashinfer::SinglePrefillWithKVCacheDispatched<192, 128,
         flashinfer::PosEncodingMode::kNone, false, flashinfer::MaskMode::kCausal, Attention, Params, false>(p, nullptr, stream);

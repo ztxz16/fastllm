@@ -1982,6 +1982,11 @@ __global__ void GroupedSwaDecode(const BF16 *q, const float *sink, BF16 *out,
 
 // Dispatch by workload shape, independent of TP rank count. All variants retain
 // the same QK/softmax/PV arithmetic; only the work assigned to each CTA changes.
+static bool WideSwaOutputTile(int64_t work) {
+    const int arch = FastllmCudaRuntimeArch();
+    return (arch == 90 || arch == 120) && work >= 48;
+}
+
 template <bool Verify>
 void LaunchShortAttention(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
         const float *bias, BF16 *out, int rows, int heads, int kvHeads,
@@ -2021,6 +2026,18 @@ void LaunchShortAttention(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
         if (ring) kernel = threads == 1024
             ? AttentionShortDecode<kSwaWindow, DecodeKeys, false, 1024, kSwaOutputTile, true>
             : AttentionShortDecode<kSwaWindow, DecodeKeys, false, kSwaThreads, kSwaOutputTile, true>;
+    }
+    if (sliding && WideSwaOutputTile((int64_t)rows * heads)) {
+        // One CTA computes all V columns, avoiding four copies of QK and
+        // softmax. Keep the same live-length and staged verification mapping.
+        tile = kSwaValueDim;
+        threads = (int64_t)rows * heads > 128 ? 512 : 1024;
+        if (threads == 512)
+            kernel = ring ? AttentionShortDecode<kSwaWindow, DecodeKeys, Verify, 512, 128, true>
+                          : AttentionShortDecode<kSwaWindow, DecodeKeys, Verify, 512, 128>;
+        else
+            kernel = ring ? AttentionShortDecode<kSwaWindow, DecodeKeys, Verify, 1024, 128, true>
+                          : AttentionShortDecode<kSwaWindow, DecodeKeys, Verify, 1024, 128>;
     }
     kernel<<<dim3(heads, rows, kSwaValueDim / tile), threads>>>(
         q, k, v, bias, out, heads, kvHeads, keyStride, keys);
@@ -3903,8 +3920,10 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
     const int queries = query.dims[1], keys = key.dims[1];
     const int count = indices.dims.empty() ? keys : indices.dims[1];
     if (count <= 0 || count > 2048 || (size_t)query.cudaData % 16 != 0) return false;
-    if (heads == kvHeads * 16 && (queries < (key.dataType == FP8_E4M3 ? 2048 : 1024) ||
-        count != 2048 || FastllmCudaRuntimeArch() != 90 ||
+    const int arch = FastllmCudaRuntimeArch();
+    const bool blackwellBF16 = arch == 120 && key.dataType == BFLOAT16;
+    if (heads == kvHeads * 16 && (queries < (blackwellBF16 ? 32 : (key.dataType == FP8_E4M3 ? 2048 : 1024)) ||
+        count != 2048 || (arch != 90 && !blackwellBF16) ||
         key.dataType != value.dataType || !FastllmNaiveAttentionKVType(key.dataType) ||
         key.kvCacheFp8Indexer || value.kvCacheFp8Indexer)) return false;
     auto kernel = mma::Generic<2048>;
@@ -3921,7 +3940,16 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
         kernel = mma::Hopper;
         shared = sizeof(mma::HopperStorage);
     }
-    if (!BulkKernelSupported(kernel, shared, 80)) return false;
+    const size_t probabilityRowBytes = size_t(heads) * 2056 * sizeof(BF16);
+    const int tileRows = std::min<size_t>(queries, (size_t(512) << 20) / probabilityRowBytes);
+    const bool split = groupedHeads == 16 && count == 2048 && tileRows > 0;
+    // Check the kernels actually launched. Split QK/PV need 32/39 KiB,
+    // rather than the fused kernel's 96 KiB shared-memory allocation.
+    if (split) {
+        if (!BulkKernelSupported(mma::SplitQK<2048,0,2,mma::SplitBF16KV>, sizeof(mma::QKStorage<2>), 80) ||
+            !BulkKernelSupported(mma::SplitNormalize<2048>, 0, 80) ||
+            !BulkKernelSupported(mma::SplitPV<2048,0,2,mma::SplitBF16KV>, sizeof(mma::PVStorage<2>), 80)) return false;
+    } else if (!BulkKernelSupported(kernel, shared, 80)) return false;
     Data stagedKey, stagedValue;
     const Data *readKey = &key, *readValue = &value;
     if (groupedHeads == 16 && key.dataType != BFLOAT16) {
@@ -3936,9 +3964,7 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
     Output(output, BFLOAT16, {1, queries, heads * 128});
     // Split the long sparse case to keep full probabilities out of CTA
     // shared memory. Preserve the exact normalized BF16 values and PV order.
-    const size_t probabilityRowBytes = size_t(heads) * 2056 * sizeof(BF16);
-    const int tileRows = std::min<size_t>(queries, (size_t(512) << 20) / probabilityRowBytes);
-    if (groupedHeads == 16 && count == 2048 && tileRows > 0) {
+    if (split) {
         Data probabilities;
         Output(probabilities, BFLOAT16, {tileRows, heads, 2056});
         auto *p = (BF16 *)probabilities.cudaData;
@@ -4099,7 +4125,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
             (BF16 *)output.cudaData, queries, keys, heads, kvHeads, key.dims[2],
-            cudaStreamPerThread, FastllmCudaRuntimeArch() == 90);
+            cudaStreamPerThread, FastllmCudaRuntimeArch());
         AssertInFastLLM(status == cudaSuccess,
             std::string("Naive SWA FlashInfer: ") + cudaGetErrorString(status));
         CheckLaunch();
@@ -6134,12 +6160,11 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     // softmax for four column tiles. Arithmetic within each output is unchanged.
     // Select by the work in one descriptor chunk, not request count or draft
     // length. Keep narrow tiles when too few query/head pairs can fill the GPU.
-    const bool hopper = FastllmCudaRuntimeArch() == 90;
     const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
     for (int first = 0; first < (int)rows.size(); first += kSwaBatchLimit) {
         const int count = std::min(kSwaBatchLimit, (int)rows.size() - first);
         const int64_t work = (int64_t)heads * count;
-        const bool wideTile = hopper && work >= 48;
+        const bool wideTile = WideSwaOutputTile(work);
         const int outputTile = wideTile ? 128 : kSwaOutputTile;
         const int threads = wideTile ? (work > 128 ? 512 : 1024)
             : (heads == 8 || heads == 16 ? 1024 : kSwaThreads);

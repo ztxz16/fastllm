@@ -36,7 +36,7 @@ static void TestAttentionGroupedScores() {
     for (auto s : {Shape{32,8,1,192,128,513,0}, Shape{33,16,2,192,128,2113,2051},
                    Shape{33,16,2,192,128,2113,2047},
                    Shape{32,16,1,192,128,2305,2048}, Shape{33,32,2,192,128,2305,2047},
-                   Shape{257,16,1,192,128,2305,2048},
+                   Shape{257,16,1,192,128,2305,2048}, Shape{65,64,4,192,128,2305,2048},
                    Shape{257,8,1,192,128,2305,2048}, Shape{31,8,1,192,128,513,512}})
     for (bool causal : {false, true}) for (bool withSink : {false, true}) {
         Data query(BFLOAT16),key(BFLOAT16),value(BFLOAT16),sink(FLOAT32),indices(INT32),output;
@@ -113,7 +113,8 @@ static void TestAttentionSwa() {
     };
     for (auto s : {Shape{1, 127, 0, 1, 1}, Shape{257, 7935, 0, 1, 1, 8, 1}, Shape{257, 7935, 0, 0, 1, 8, 1},
                    Shape{1024, 127, 0, 1, 1, 8, 1}, Shape{471, 127, 0, 2, 1}, Shape{512, 127, 0, 3, 1},
-                   Shape{33, 127, 0, 1, 4}}) {
+                   Shape{33, 127, 0, 1, 4}, Shape{65, 0, 16, 1, 1},
+                   Shape{2049, 127, 0, 1, 1}}) {
     const int heads = s.heads, kvHeads = s.kvHeads;
     constexpr int dim = 192, valueDim = 128;
     int keys = s.past + s.queries, stride = kvHeads * dim + s.padding;
