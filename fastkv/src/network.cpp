@@ -251,7 +251,6 @@ struct Service::Impl {
     Options options;
     Budget budget, clientSlots, serverSlots, handlerSlots;
     BufferPool receiveBuffers, sendBuffers;
-    std::timed_mutex receiveAllocationMutex;
     // Separate request and reply lanes: a new request handshake must never
     // wait behind a reply whose receiver is occupied sending that request.
     Pool servers, clients, sendReplies, receiveReplies;
@@ -502,7 +501,7 @@ struct Service::Impl {
                 if (devices.empty()) devices.assign(sizes.size(), options.receiveDevice);
                 Require(devices.size() == sizes.size(), "FastKV: invalid receive placement count");
                 for (int device : devices) Require(device >= -1, "FastKV: invalid receive device");
-                struct Arena { size_t begin, end, bytes; int device; };
+                struct Arena { size_t begin, end; };
                 std::vector<Arena> plan;
                 std::vector<std::pair<int, size_t>> allocations;
                 for (size_t start = 0; start < sizes.size();) {
@@ -513,21 +512,20 @@ struct Service::Impl {
                                             bytes >= arenaBytes || sizes[end] > arenaBytes - bytes)) break;
                         bytes = CheckedAdd(bytes, sizes[end++]);
                     }
-                    plan.push_back({start, end, bytes, devices[start]});
+                    plan.push_back({start, end});
                     allocations.emplace_back(devices[start], bytes);
                     start = end;
                 }
-                receiveBuffers.CheckCapacity(allocations);
-                // Reserve a complete message, not competing partial messages. Only
-                // transfer workers wait here; the model can consume earlier replies.
-                std::unique_lock<std::timed_mutex> allocationLock(receiveAllocationMutex, std::defer_lock);
-                while (!allocationLock.try_lock_for(std::chrono::milliseconds(5))) s.CheckRunning(deadline);
+                // The pool reserves every arena atomically. CUDA allocations
+                // and MR retirement can proceed independently on other GPUs.
                 for (;;) {
                     s.CheckRunning(deadline);
                     try {
                         auto credit = budget.Reserve(total);
-                        for (const auto &part : plan) {
-                            auto arena = receiveBuffers.Acquire(part.bytes, part.device, credit);
+                        auto arenas = receiveBuffers.AcquireBatch(allocations, credit);
+                        for (size_t partIndex = 0; partIndex < plan.size(); ++partIndex) {
+                            const auto &part = plan[partIndex];
+                            const auto &arena = arenas[partIndex];
                             size_t offset = 0;
                             for (size_t i = part.begin; i < part.end; ++i) {
                                 m.buffers.push_back(arena.Slice(offset, sizes[i]));

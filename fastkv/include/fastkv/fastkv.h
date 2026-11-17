@@ -100,6 +100,10 @@ class BufferPool {
     explicit BufferPool(size_t limit, std::map<int, size_t> deviceLimits = {});
     ~BufferPool();
     Buffer Acquire(size_t bytes, int device, std::shared_ptr<void> credit = {});
+    // Reserve the complete message atomically; no caller holds partial leases
+    // while waiting for another message to release capacity.
+    std::vector<Buffer> AcquireBatch(const std::vector<std::pair<int, size_t>> &allocations,
+                                    std::shared_ptr<void> credit = {});
     void Clear();
     size_t Limit(int device) const;
     void CheckCapacity(const std::vector<std::pair<int, size_t>> &allocations) const;

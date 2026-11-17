@@ -37,6 +37,44 @@ int main() {
         c = {};
         Fails([&] { pool.Acquire(1024, -1); });
 
+        BufferPool messages(16384);
+        auto heldPart = messages.Acquire(8192, -1);
+        Fails([&] { messages.AcquireBatch({{-1, 4096}, {-1, 8192}}); });
+        auto remaining = messages.Acquire(8192, -1);
+        Check(remaining.Size() == 8192, "failed message retained a partial reservation");
+        const auto largeId = remaining.Id();
+        remaining.Attachment("retained-mr", [](void *, size_t) { return std::make_shared<int>(1); });
+        remaining = {};
+        auto smaller = messages.Acquire(4096, -1);
+        Check(smaller.Id() == largeId && smaller.HasAttachment("retained-mr"), "larger registered arena was not reused");
+        heldPart = {}; smaller = {};
+        auto whole = messages.AcquireBatch({{-1, 4096}, {-1, 4096}, {-1, 8192}});
+        Check(whole.size() == 3, "oversized reuse prevented feasible batch allocation");
+        whole.clear();
+
+        // Retiring an MR may block. An independent cached allocation must
+        // remain usable, and physical capacity stays charged until retirement.
+        BufferPool retiring(16384);
+        auto old = retiring.Acquire(8192, -1);
+        auto cached = retiring.Acquire(4096, -1);
+        const auto cachedId = cached.Id();
+        std::promise<void> entered, release;
+        auto released = release.get_future().share();
+        old.Attachment("slow-mr", [&](void *, size_t) {
+            return std::shared_ptr<int>(new int(0), [&](int *p) {
+                entered.set_value(); released.wait(); delete p;
+            });
+        });
+        old = {}; cached = {};
+        auto allocation = std::async(std::launch::async, [&] { return retiring.Acquire(12288, -1); });
+        const bool retiringStarted = entered.get_future().wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        auto reuse = std::async(std::launch::async, [&] { return retiring.Acquire(4096, -1); });
+        const bool independent = reuse.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        release.set_value();
+        Check(retiringStarted && independent, "MR retirement held the allocation mutex");
+        Check(reuse.get().Id() == cachedId, "independent cached arena lost its registration identity");
+        Check(allocation.get().Size() == 12288, "retirement failed to release physical capacity");
+
         Options options; options.workers = 1; options.queueDepth = 16;
         options.maxInflightBytes = 8 << 20;
         Service server(options), client(options);
