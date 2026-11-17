@@ -201,7 +201,13 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             maxRows = std::max(maxRows, (int)local.size());
         FastllmCudaPrepareMimoEp8Mega(*tpEp8MegaState, maxRows);
     }
-    if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing)) {
+    // Stable owned requests reuse physical capacity after checking shared tails.
+    // Identity/epoch checks cover rebinding and rollback; capacity bounds cover
+    // page growth. History and direct forwards retain full reservation checks.
+    const bool reserveCached = reusePlan && state.servingPadded && !saveHistoryChat &&
+        state.plan.CanAppend();
+    std::vector<int> reservationLimits;
+    if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing) && !reserveCached) {
         // Reserve on every owner before any attention/world collective. Pool
         // exhaustion must fail the step before peers enter NCCL.
         std::vector<std::exception_ptr> errors(tpDevices.size());
@@ -235,6 +241,22 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             UploadPagedCacheTables(pending);
         }, errors);
         for (auto error : errors) if (error) std::rethrow_exception(error);
+        if (ownedDecode && state.servingPadded && !saveHistoryChat) {
+            reservationLimits.assign(liveRows, max_positions);
+            state.plan.pageTails.clear();
+            for (int seq = 0; seq < liveRows; ++seq)
+                for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
+                    for (const Data *root : {&key(seq, layer), &value(seq, layer)})
+                        for (const auto &entry : root->multiDeviceDatas) {
+                            const auto &local = *entry.second;
+                            const int64_t capacity = local.isPagedKVCache ?
+                                int64_t(local.pageIndex.size()) * local.pageLen : 0;
+                            reservationLimits[seq] = std::min<int64_t>(reservationLimits[seq],
+                                std::min<int64_t>(capacity, local.expansionDims.at(1)));
+                            if (local.isPagedKVCache)
+                                state.plan.pageTails[local.pagedKVCacheData].emplace_back(&local, seq);
+                        }
+        }
     }
     if (!tpSwaPrefillWorkspaces.empty() && (!batch || !batch->Decode())) {
         const int length = batch ? *std::max_element(batch->lengths.begin(), batch->lengths.end()) : total;
@@ -444,7 +466,9 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     // Commit local and root metadata together, before recording prefix windows.
     // Each worker owns whole requests; no root can race another rank's update.
-    ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
+    const bool committedMetadata = graphDecode && bindingsUnchanged &&
+        state.plan.AdvanceMetadata(window);
+    if (!committedMetadata) ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
         for (int seq = begin; seq < end; ++seq) {
             if (state.servingPadded && seq >= state.servingLiveRows) continue;
             const int oldLength = graphDecode ? key(seq, 0).dims[1] : 0;
@@ -497,10 +521,30 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (recording) for (int seq = 0; seq < liveRows; ++seq)
         FinishPrefixSnapshots(key(seq, 0), prefixes[seq], (batch ? batch->lengths[seq] : total) > 1);
     if (ownedDecode) {
+        if (!bindingsUnchanged || !graphDecode) state.plan.lengthFields.clear();
+        if (graphDecode && state.plan.lengthFields.empty()) {
+            state.plan.lengthFields.resize(liveRows);
+            bool safe = true;
+            for (int seq = 0; seq < liveRows; ++seq)
+                for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
+                    for (Data *root : {&key(seq, layer), &value(seq, layer)}) {
+                        auto remember = [&](Data &data) {
+                            if (data.dims.size() != 3 ||
+                                !FastllmNaiveCanResizeKVLength(data, data.dims[1], data.dims[2]) ||
+                                (data.isPagedKVCache && data.pageLen <= 0)) { safe = false; return; }
+                            state.plan.lengthFields[seq].push_back({&data.dims[1],
+                                data.isPagedKVCache ? &data.lastPageLen : nullptr, data.pageLen});
+                        };
+                        remember(*root);
+                        for (auto &entry : root->multiDeviceDatas) remember(*entry.second);
+                    }
+            if (!safe) state.plan.lengthFields.clear();
+        }
         std::lock_guard<std::mutex> guard(tpRequestMutex);
         state.plan.kvType = kvCacheDataType;
         state.plan.valid = state.plan.Remember(*batch,
-            tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds, liveRows);
+            tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds, liveRows,
+            reservationLimits.empty() ? nullptr : &reservationLimits);
         state.plan.graph = graphDecode && tpDecodeState->captured && !tpDecodeState->disabled
             ? tpDecodeState : std::shared_ptr<TPDecodeState>();
     }

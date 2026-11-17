@@ -3236,9 +3236,7 @@ class Fixture : public NaiveN05FlashModel {
                     auto create = [&](int row) {
                         contexts[row].reset(new ResponseContext());
                         contexts[row]->Init(block_cnt, dataType, kvCacheDataType);
-                        std::vector<std::pair<Data *, Data *>> roots;
-                        for (auto &pair : contexts[row]->pastKeyValues) roots.emplace_back(&pair.first, &pair.second);
-                        NaiveN05GraphTestAccess::InitDPCache(*this, roots, row % groups);
+                        // Request creation assigns DP ownership through the scheduler.
                         OnResponseContextCreated(contexts[row].get());
                         past[row] = 0; append(row, 4089 + row % 3);
                     };

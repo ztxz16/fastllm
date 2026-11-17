@@ -31,28 +31,53 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
             }
             TargetBatch batch{kv, configs, lengths, 1};
             AttentionParallelState::RequestPlan plan;
-            Check(plan.Remember(batch, 7, live), "DP plan capture failed");
-            Check(plan.Matches(batch, 7, live), "stable DP plan rejected");
-            Check(!plan.Matches(batch, 8, live), "DP global invalidation missed");
+            Check(plan.Remember(batch, 7, live, batch.Size()), "DP plan capture failed");
+            Check(plan.Matches(batch, 7, live, batch.Size()), "stable DP plan rejected");
+            Check(!plan.CanAppend(), "unreserved DP plan allowed append");
+            std::vector<int> limits;
+            for (auto &root : roots) limits.push_back(root.dims[1] + 1);
+            Check(plan.Remember(batch, 7, live, batch.Size(), &limits) && plan.CanAppend(),
+                  "reserved DP plan rejected");
+            ++roots.back().dims[1];
+            Check(plan.Remember(batch, 7, live, batch.Size()) && !plan.CanAppend(),
+                  "DP physical capacity boundary missed");
+            --roots.back().dims[1];
+            Check(plan.Remember(batch, 8, live, batch.Size()) && !plan.CanAppend(),
+                  "DP epoch change retained stale capacity");
+            Check(plan.Remember(batch, 7, live, batch.Size(), &limits) && plan.CanAppend(),
+                  "DP capacity rebind failed");
+            Check(!plan.Matches(batch, 8, live, batch.Size()), "DP global invalidation missed");
             const Data *last = &roots.back();
             ++live[last];
-            Check(!plan.Matches(batch, 7, live), "DP cache mutation/ABA missed");
+            Check(!plan.Matches(batch, 7, live, batch.Size()), "DP cache mutation/ABA missed");
             --live[last];
             live.erase(last);
-            Check(!plan.Matches(batch, 7, live), "DP removed request reused");
+            Check(!plan.Matches(batch, 7, live, batch.Size()), "DP removed request reused");
             live[last] = count;
             ++roots.back().dims[1];
-            Check(!plan.Matches(batch, 7, live), "DP length/rollback mismatch missed");
+            Check(!plan.Matches(batch, 7, live, batch.Size()), "DP length/rollback mismatch missed");
             --roots.back().dims[1];
             if (count > 1) {
                 std::swap(kv.front(), kv.back());
-                Check(!plan.Matches(batch, 7, live), "DP reorder missed");
+                Check(!plan.Matches(batch, 7, live, batch.Size()), "DP reorder missed");
                 std::swap(kv.front(), kv.back());
             }
             kv.pop_back(); lengths.pop_back(); configs.pop_back();
-            Check(!plan.Matches(batch, 7, live), "DP compaction missed");
-            Check(plan.Remember(batch, 7, live) && plan.Matches(batch, 7, live),
+            Check(!plan.Matches(batch, 7, live, batch.Size()), "DP compaction missed");
+            Check(plan.Remember(batch, 7, live, batch.Size()) && plan.Matches(batch, 7, live, batch.Size()),
                 "DP compacted plan not reusable");
+            if (batch.Size()) {
+                plan.lengthFields.resize(batch.Size());
+                for (int row = 0; row < batch.Size(); ++row)
+                    plan.lengthFields[row].push_back({&roots[row].dims[1], &roots[row].lastPageLen, 128});
+                Check(plan.AdvanceMetadata(128), "DP cached metadata update rejected");
+                for (int row = 0; row < batch.Size(); ++row) {
+                    Check(roots[row].dims[1] == plan.requests[row].length + 1,
+                          "DP cached metadata length mismatch");
+                    Check(roots[row].lastPageLen == plan.requests[row].length % 128 + 1,
+                          "DP cached metadata page boundary mismatch");
+                }
+            }
         }
     }
     std::vector<std::unique_ptr<ResponseContext>> contexts;
