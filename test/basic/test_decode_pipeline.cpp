@@ -6,7 +6,7 @@ static void Check(bool ok, const char *message) { if (!ok) throw std::runtime_er
 struct Model : basellm {
     int submits = 0, collects = 0, outstanding = 0, failAt = -1, eosAt = -1, cancelAt = -1;
     int invalidResultAt = -1;
-    bool supported = true;
+    bool supported = true, historySupported = false;
     std::vector<std::string> events;
     Model(int rows, int limit) {
         saveHistoryChat = false; max_positions = 100; eos_token_id = 99;
@@ -49,6 +49,7 @@ struct Model : basellm {
         }
     };
     bool SupportsDecodePipeline() const override { return supported; }
+    bool SupportsDecodePipelineHistory() const override { return historySupported; }
     std::unique_ptr<DecodePipeline> CreateDecodePipeline(const std::vector<ResponseContext *> &c) override {
         if (!supported) return nullptr;
         return std::unique_ptr<DecodePipeline>(new Pipe(*this,c));
@@ -62,8 +63,9 @@ struct Model : basellm {
     }
 };
 int main() {
-    for (int batch : {1,2,3,5,8,17}) for (int limit : {2,3,7}) {
-        Model m(batch,limit); Check(m.Run(), "pipeline not selected");
+    for (bool history : {false, true}) for (int batch : {1,2,3,5,8,17}) for (int limit : {2,3,7}) {
+        Model m(batch,limit); m.saveHistoryChat = history; m.historySupported = true;
+        Check(m.Run(), "pipeline not selected");
         Check(m.OutputVersion() > 0, "pipeline tokens did not wake batched response readers");
         Check(m.submits == limit-1 && m.collects == m.submits, "wrong forward count");
         for (auto &entry : m.responseContextDict.dicts) {
@@ -73,8 +75,9 @@ int main() {
         }
         if(limit>2) Check(m.events[0]=="submit" && m.events[1]=="submit" && m.events[2]=="collect", "host wait before next submit");
     }
-    for(int stop : {1,2,3}) {
-        Model m(3,8); m.eosAt=stop; Check(m.Run(), "EOS pipeline");
+    for (bool history : {false, true}) for (int stop : {1,2,3}) {
+        Model m(3,8); m.saveHistoryChat = history; m.historySupported = true;
+        m.eosAt=stop; Check(m.Run(), "EOS pipeline");
         Check(m.outstanding==0, "EOS did not drain");
         Check(m.responseContextDict.dicts[0]->isEnding, "EOS ignored");
         Check(m.responseContextDict.dicts[0]->resultTokenQueue.size()==size_t(stop-1), "post-EOS token exposed");

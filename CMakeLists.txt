@@ -3057,6 +3057,11 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                     PASS_REGULAR_EXPRESSION "ATTENTION DP PIPELINE PASS")
                 foreach(NAIVE_DP_KV bf16 fp8)
+                    add_test(NAME naive_n05_attention_dp_pipeline_history_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                        COMMAND naive_n05_verify_graph_test 8 attention_dp_pipeline ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV} history)
+                    set_tests_properties(naive_n05_attention_dp_pipeline_history_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
+                        PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                        PASS_REGULAR_EXPRESSION "ATTENTION DP PIPELINE PASS")
                     add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
                         COMMAND naive_n05_verify_graph_test 8 attention_dp_ring ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})
                     set_tests_properties(naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}

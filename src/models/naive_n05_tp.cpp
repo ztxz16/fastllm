@@ -813,7 +813,7 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
         auto &dp = *model.attentionParallel;
         auto &plan = dp.servingPlan;
         if (!serving || !serving->sealed || !plan.valid ||
-            plan.kvType != model.kvCacheDataType || model.saveHistoryChat ||
+            plan.kvType != model.kvCacheDataType ||
             serving->generation != FastllmGetNcclGeneration()) return false;
         {
             std::lock_guard<std::mutex> guard(model.tpRequestMutex);
@@ -826,10 +826,12 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
         for (const auto &rank : graph->ranks)
             if (!rank->exec || !rank->storage->decodeTokenRows[0].cudaData ||
                 !rank->storage->decodeTokenRows[1].cudaData) return false;
-        // Cross-page and graph-region changes leave the chain. The ordinary
-        // serving path reserves/rebinds an existing graph, never recaptures.
+        // Drain before a page boundary so the ordinary forward can save its
+        // immutable SWA checkpoint before later steps overwrite the ring.
+        // Page growth and graph-region changes also use the ordinary path.
         for (const auto &request : plan.requests) {
             const int next = request.length + 1;
+            if (model.saveHistoryChat && next % GetPageLen() == 0) return false;
             if (next > graph->capacity || next == 2048 ||
                 (next <= 256) != (graph->capacity <= 256) ||
                 (next < 2048) != (graph->capacity < 2048)) return false;
@@ -911,7 +913,7 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
 
 bool NaiveN05FlashModel::SupportsDecodePipeline() const {
 #ifdef USE_CUDA
-    return attentionParallel && GetFastllmEnv().cudaGraph && !draftEnabled && !saveHistoryChat &&
+    return attentionParallel && GetFastllmEnv().cudaGraph && !draftEnabled &&
         tpServingState && tpServingState->sealed && tpServingState->pipelineReady &&
         attentionParallel->sampling.size() == (size_t)attentionDP &&
             std::all_of(attentionParallel->sampling.begin(), attentionParallel->sampling.end(),

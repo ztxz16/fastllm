@@ -96,6 +96,7 @@ namespace fastllm {
         int GetKVCacheRetainedTokens(int layer) const override;
         void WarmUp() override;
         bool SupportsDecodePipeline() const override;
+        bool SupportsDecodePipelineHistory() const override { return true; }
         std::unique_ptr<DecodePipeline> CreateDecodePipeline(
             const std::vector<ResponseContext *> &contexts) override;
         void ConfigureKvMem(const KvMemConfig &config) override;

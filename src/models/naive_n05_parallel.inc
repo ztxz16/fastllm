@@ -205,8 +205,9 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     // Stable owned requests reuse physical capacity after checking shared tails.
     // Identity/epoch checks cover rebinding and rollback; capacity bounds cover
-    // page growth. History and direct forwards retain full reservation checks.
-    const bool reserveCached = reusePlan && state.servingPadded && !saveHistoryChat &&
+    // page growth. Shared history tails still trigger copy-on-write; direct
+    // forwards retain full reservation checks.
+    const bool reserveCached = reusePlan && state.servingPadded &&
         state.plan.CanAppend();
     std::vector<int> reservationLimits;
     if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing) && !reserveCached) {
@@ -243,7 +244,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             UploadPagedCacheTables(pending);
         }, errors);
         for (auto error : errors) if (error) std::rethrow_exception(error);
-        if (ownedDecode && state.servingPadded && !saveHistoryChat) {
+        if (ownedDecode && state.servingPadded) {
             reservationLimits.assign(liveRows, max_positions);
             state.plan.pageTails.clear();
             for (int seq = 0; seq < liveRows; ++seq)
@@ -327,7 +328,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (!graphDecode && tpServingState && tpServingState->preparing) return Data();
     std::vector<std::vector<CudaDecodeSampling::Request>> samplingRequests;
     bool asyncSampling = graphDecode && state.servingPadded && ownedDecode &&
-        distributedSampling && !saveHistoryChat && tpServingState && tpServingState->pipelineReady &&
+        distributedSampling && tpServingState && tpServingState->pipelineReady &&
         state.sampling.size() == (size_t)attentionDP;
     if (asyncSampling) {
         samplingRequests.resize(attentionDP);
@@ -351,7 +352,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     const int samplingSlot = std::max(0, tpServingState ? tpServingState->pipelineOutputSlot : -1);
     const bool pipelined = tpServingState && tpServingState->pipelineOutputSlot >= 0;
-    AssertInFastLLM(!pipelined || asyncSampling, "Naive DP pipeline sampling admission changed");
+    AssertInFastLLM(!pipelined || (asyncSampling && !recording),
+        "Naive DP pipeline sampling or snapshot admission changed");
     // Ring candidates use the same batched SWA/commit kernels as world TP.
     // A cache without the candidate tail retains chronological verification;
     // CommitTargetCaches restores its ring after accepting the chosen rows.

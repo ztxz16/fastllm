@@ -450,6 +450,8 @@ namespace fastllm {
             virtual void Drain() = 0;
         };
         virtual bool SupportsDecodePipeline() const { return false; }
+        // Adapters opting in must drain before cache snapshots or publication.
+        virtual bool SupportsDecodePipelineHistory() const { return false; }
         virtual std::unique_ptr<DecodePipeline> CreateDecodePipeline(
             const std::vector<ResponseContext *> &) { return nullptr; }
         bool RunDecodePipeline(std::unique_lock<std::mutex> &dictLock, int batchLimit, int totalLimit);

@@ -3058,9 +3058,10 @@ namespace fastllm {
 
     bool basellm::RunDecodePipeline(std::unique_lock<std::mutex> &dictLock,
                                     int batchLimit, int totalLimit) {
-        // An adapter must preserve the normal per-token semantics. History and
-        // constrained sampling need their CPU result before the next forward.
-        if (!SupportsDecodePipeline() || saveHistoryChat || isFree) return false;
+        // Cache snapshots require an explicit adapter contract. Sampling that
+        // depends on published CPU history still uses the ordinary path below.
+        if (!SupportsDecodePipeline() || isFree ||
+            (saveHistoryChat && !SupportsDecodePipelineHistory())) return false;
         std::vector<ResponseContext *> contexts;
         std::vector<int> handles;
         for (auto &entry : responseContextDict.dicts) {

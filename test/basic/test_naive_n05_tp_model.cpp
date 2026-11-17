@@ -3213,10 +3213,11 @@ class Fixture : public NaiveN05FlashModel {
     }
 
     void AttentionDPPipelineChecks(int groups) {
+        const bool history = saveHistoryChat;
         if (!SupportsDecodePipeline()) throw std::runtime_error("DP pipeline not prepared");
         std::exception_ptr error;
         std::atomic<bool> ready{false};
-        std::vector<std::vector<int>> reference;
+        std::vector<std::vector<int>> reference, restorePrompts;
         int pipelined = 0;
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         const int captures = verifyGraphCaptures;
@@ -3225,6 +3226,7 @@ class Fixture : public NaiveN05FlashModel {
             while (!ready.load()) std::this_thread::yield();
             try {
                 for (bool overlap : {false, true}) {
+                    if (history) { SetSaveHistoryChat(false); SetSaveHistoryChat(true); }
                     const int count = groups * 2 + 1;
                     std::vector<std::unique_ptr<ResponseContext>> contexts(count);
                     GenerationConfig cfg;
@@ -3244,6 +3246,7 @@ class Fixture : public NaiveN05FlashModel {
                         Forward(Data(FLOAT32, {1, past}, ids), Data(), Data(FLOAT32, {1, past}, positions),
                             c->pastKeyValues, cfg);
                         c->generationConfig = cfg; c->currentTokens = {1};
+                        c->allTokens.assign(ids.begin(), ids.end()); c->allTokens.push_back(1);
                         c->intParams["promptLen"] = past; c->intParams["index"] = 0;
                     };
                     for (int row = 0; row < count; ++row) create(row);
@@ -3263,6 +3266,7 @@ class Fixture : public NaiveN05FlashModel {
                             ++result; ++step;
                             for (size_t row = 0; row < active.size(); ++row) {
                                 auto *c = active[row]; c->currentTokens[0] = tokens[row]; ++c->intParams["index"];
+                                c->allTokens.push_back(tokens[row]);
                             }
                         };
                         while (step < 20) {
@@ -3305,7 +3309,16 @@ class Fixture : public NaiveN05FlashModel {
                             }
                         }
                     }
-                    for (auto &c : contexts) if (c) OnResponseContextRemoved(c.get());
+                    for (auto &c : contexts) if (c) {
+                        if (history && overlap) {
+                            c->TryRecord(this);
+                            restorePrompts.push_back(c->allTokens);
+                            restorePrompts.push_back(c->allTokens);
+                            auto &fork = restorePrompts.back();
+                            fork.back() = (fork.back() + 1) % 251;
+                        }
+                        OnResponseContextRemoved(c.get());
+                    }
                 }
             } catch (...) { error = std::current_exception(); }
         });
@@ -3315,7 +3328,33 @@ class Fixture : public NaiveN05FlashModel {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (verifyGraphCaptures != captures) throw std::runtime_error("DP pipeline recaptured during churn");
 #endif
+        if (history) {
+            // Restore checkpoints produced by pipelined decode, including forks
+            // with a changed suffix. Compare logits against cold recomputation.
+            useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
+            auto infer = [&](const std::vector<int> &prompt) {
+                GenerationConfig cfg; cfg.top_k = 1; cfg.output_logits = true;
+                cfg.input_token_length = prompt.size(); cfg.output_token_limit = 1;
+                int handle = LaunchResponseTokens(prompt, cfg);
+                std::vector<float> logits, unused;
+                if (FetchResponseLogits(handle, logits) < 0 || FetchResponseLogits(handle, unused) != -1)
+                    throw std::runtime_error("pipeline checkpoint restore truncated response");
+                return logits;
+            };
+            std::vector<std::vector<float>> hot;
+            const int before = pagedRestores;
+            for (const auto &prompt : restorePrompts) {
+                hot.push_back(infer(prompt));
+                if (lastPrefixLength < 4096) throw std::runtime_error("pipeline decode checkpoint lost");
+            }
+            if (pagedRestores - before != (int)restorePrompts.size() || hostRestores)
+                throw std::runtime_error("pipeline checkpoint did not restore resident GPU state");
+            SetSaveHistoryChat(false);
+            for (size_t row = 0; row < restorePrompts.size(); ++row)
+                RequireCloseLogits(infer(restorePrompts[row]).data(), hot[row], "pipeline checkpoint/fork logits");
+        }
         std::cout << "ATTENTION DP PIPELINE PASS dp=" << groups << " pipelined=" << pipelined
+                  << " history=" << history << " restored=" << restorePrompts.size()
                   << " exact_steps=" << reference.size() << std::endl;
     }
 
@@ -5122,6 +5161,8 @@ int main(int argc, char **argv) {
             if (kvType != "bf16" && kvType != "fp8")
                 throw std::invalid_argument("DP pipeline KV type must be bf16 or fp8");
             fixture.SetKVCacheDataType(kvType == "bf16" ? BFLOAT16 : FP8_E4M3);
+            const bool history = pipeline && argc > 5 && std::string(argv[5]) == "history";
+            fixture.SetSaveHistoryChat(history);
             fixture.AttentionDPServingChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
             if (!failVerifyInstantiate)
