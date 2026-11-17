@@ -19,6 +19,22 @@ def configuration(directory):
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_buffer_budgets_are_per_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = configuration(directory)
+            config['transport'] = {'type': 'tcp', 'max_inflight_bytes': 8 << 30}
+            config['prefill'][0]['max_inflight_bytes'] = 16 << 30
+            path = Path(directory) / 'config.json'
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+            self.assertEqual(json.loads(loaded['prefill'][0]['command'][-1])['max_inflight_bytes'], 16 << 30)
+            self.assertEqual(json.loads(loaded['decode'][0]['command'][-1])['max_inflight_bytes'], 8 << 30)
+            for invalid in (True, 0, -1, 1 << 41, 1.5, '4096'):
+                config['prefill'][0]['max_inflight_bytes'] = invalid
+                path.write_text(json.dumps(config))
+                with self.assertRaisesRegex(ValueError, 'max_inflight_bytes'):
+                    load_config(path)
+
     def test_transfer_queues_cover_dependent_decode_groups(self):
         with tempfile.TemporaryDirectory() as directory:
             config = configuration(directory)

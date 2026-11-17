@@ -55,7 +55,10 @@ def load_config(path):
             pd = {'role': role, 'model_id': config['model_id'],
                   'transport': transport.get('type', 'tcp'),
                   'rdma_devices': group.get('rdma_devices', transport.get('rdma_devices', [])),
-                  'max_inflight_bytes': transport.get('max_inflight_bytes', 8 << 30)}
+                  'max_inflight_bytes': group.get('max_inflight_bytes', transport.get('max_inflight_bytes', 8 << 30))}
+            limit = pd['max_inflight_bytes']
+            if type(limit) is not int or not 1 << 20 <= limit <= 1 << 40:
+                raise ValueError('max_inflight_bytes must be an integer in [1 MiB, 1 TiB]')
             workers = group.get('transfer_workers', transport.get('transfer_workers'))
             if workers is not None:
                 if type(workers) is not int or not 1 <= workers <= 64:

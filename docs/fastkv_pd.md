@@ -48,6 +48,8 @@ cp example/pd/deepseek_v41.json pd.json
 
 `env` 可以给每个执行组设置 `CUDA_VISIBLE_DEVICES`、`PYTHONPATH` 等已有运行参数。`state_dir` 可以单独覆盖。没有 `ssh` 的执行组在控制机本地启动；进程管理目前要求 Linux。SSH 私钥留在控制机，不复制到服务节点。`ingress` 用来指定 HTTP router 所在机器；不配置时在控制机运行。
 
+`transport.max_inflight_bytes` 是传输池的默认字节预算，P/D 执行组可用同名字段分别覆盖。P 导出暂存与 D 接收暂存的需求不同，尤其 D 直收最终 KV 页时，不必随 P 一起扩大预算。预算包含池内空闲物理缓冲，不是每卡数值，也不代表立即分配；配置时应留足 KV、graph 和算子工作区显存。
+
 ```bash
 ftllm router render --config pd.json
 ftllm router start --config pd.json
