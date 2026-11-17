@@ -150,7 +150,8 @@ def _cuda_bytes(pointer, count, device):
 
 
 class GraphProvider:
-    def __init__(self, devices, layers, hidden=4096, intermediate=2048, experts=256, topk=8):
+    def __init__(self, devices, layers, hidden=4096, intermediate=2048, experts=256, topk=8,
+                 rank_local_combine=False):
         import torch
         from cuda.bindings import runtime as cuda
         # cuda.core chooses its CUDA-major namespace lazily. Resolve it before
@@ -160,6 +161,7 @@ class GraphProvider:
         self.devices = list(devices)
         self.layers = layers
         self.hidden, self.intermediate, self.experts, self.topk = hidden, intermediate, experts, topk
+        self.rank_local_combine = rank_local_combine
         self.arena = _PeerArena(self.devices)
         self.barrier = threading.Barrier(len(self.devices))
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.devices))
@@ -218,7 +220,14 @@ class GraphProvider:
                 cfg = runtime.MegaMoESm120W4A8Config(
                     rank=rank, world_size=len(self.devices), max_tokens_per_rank=bucket,
                     num_topk=self.topk, num_total_experts=self.experts, hidden=self.hidden,
-                    intermediate=self.intermediate, tensor_parallel_size=len(self.devices))
+                    # Every owner holds complete experts. EP size is not the
+                    # tensor-parallel width of an expert's GEMMs.
+                    intermediate=self.intermediate, tensor_parallel_size=1,
+                    knobs={'rank_local_combine': self.rank_local_combine,
+                           'dispatch_rank_cache': False,
+                           # Preserve the established K2 arithmetic/scheduling
+                           # family while comparing output-combine strategies.
+                           'k2_warps': 8, 'k2_tail_reclaim': False})
                 plan_workspace = types.SimpleNamespace(config=cfg, _execution_plans={})
                 planner = runtime.MegaMoESm120W4A8Frontend(plan_workspace, compile_bucket=bucket)
                 spec, bundle = planner._ensure_plan(bucket)
@@ -239,6 +248,14 @@ class GraphProvider:
             weight = self._weights(rank, layer)
             x, ids, scores, stream = self.inputs[rank][bucket]
             def run():
+                if not self.rank_local_combine:
+                    # Direct return folds routing scores into expert stores.
+                    # Invalid routes perform no store; clear their old slots
+                    # before the collective's start barrier and final reduction.
+                    # The first eager call uses a newly zeroed allocation.
+                    for frontend in workspace._frontends.values():
+                        if frontend._compiled is not None:
+                            frontend._compiled.execution.combine_output.view(torch.uint8).zero_()
                 self.staging.stage_inputs(x, scores, ids, workspace.x, workspace.x_scale,
                                           workspace.topk_ids, workspace.topk_weights, quantize_input=True, scales=None)
                 return runtime.run_split_mega_moe(workspace, weight)

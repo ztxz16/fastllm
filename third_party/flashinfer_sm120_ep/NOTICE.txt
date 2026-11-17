@@ -14,8 +14,10 @@ package is embedded in the deployed CUBIN package.
 
 FastLLM additions: same-process peer allocation for build-time export; graph
 serialization with pointer/TMA/peer-offset relocation; native CUDA graph loading;
-weight packing; and native FastLLM graph integration. The compiled GPU arithmetic
-kernels retain the upstream implementation. Native weight packing follows the
+weight packing; build-time benchmark selection between upstream direct return
+and rank-local combine; and native FastLLM graph integration. The compiled GPU
+arithmetic kernels retain the upstream implementation. Native weight packing
+follows the
 upstream interleave and scale-swizzle layouts. Graph integration follows the
 upstream Green Context dependency protocol and preserves CUDA edge ports.
 

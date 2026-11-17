@@ -8,6 +8,7 @@ from pathlib import Path
 import torch
 from cuda.bindings import driver as cuda
 from prepare import GraphProvider
+from benchmark import benchmark, select_combine
 
 def check(result):
     if int(result[0]): raise RuntimeError(str(result))
@@ -212,6 +213,8 @@ def main():
     ap.add_argument('--intermediate',type=int,default=2048)
     ap.add_argument('--experts',type=int,default=256)
     ap.add_argument('--topk',type=int,default=8)
+    ap.add_argument('--combine',choices=['auto','direct','local'],default='auto',
+                    help='Build-time output-combine selection; auto benchmarks each capacity and deploys only the winner')
     args=ap.parse_args()
     h,mid=args.hidden,args.intermediate
     if h<=0 or mid<=0 or h%128 or mid%64 or args.experts%args.ep or not 0<args.topk<=args.experts:
@@ -223,21 +226,54 @@ def main():
         with torch.cuda.device(rank):
             local=[]
             for n,k in ((2*mid,h),(h,mid)):
-                value=torch.zeros((args.experts//args.ep,n*k//32*17),dtype=torch.uint8,device='cuda')
-                value[:,n*k//2:].fill_(127);holders.append(value)
+                generator=torch.Generator(device='cuda').manual_seed(1927+rank+k)
+                value=torch.randint(0,256,(args.experts//args.ep,n*k//32*17),dtype=torch.uint8,device='cuda',generator=generator)
+                value[:,n*k//2:].fill_(122);holders.append(value)
                 local.append([value[e].data_ptr() for e in range(args.experts//args.ep)])
             layers.append([list(map(list,zip(*local)))])
-    provider=GraphProvider(list(range(args.ep)),layers,hidden=h,intermediate=mid,experts=args.experts,topk=args.topk)
-    exporter=Exporter(provider,args.output)
+    exporter=Exporter(None,args.output)
     manifest=dict(version=1,sm=120,sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
                   hidden=h,intermediate=mid,experts=args.experts,topk=args.topk,ep=args.ep,buckets=[],
                   source='FlashInfer SM120 split CuTeDSL MegaMoE, flashinfer-python 0.7.2, Apache-2.0')
-    for cap in args.capacities:
-        meta=provider.prepare(0,cap)
-        manifest['buckets'].append(exporter.bucket(cap,meta))
-        manifest['binaries']=exporter.binaries
-        (args.output/'manifest.json').write_text(json.dumps(manifest,indent=2))
-        print('EXPORTED',cap,'binary_count',len(exporter.binaries),flush=True)
-    provider.close()
+    for cap in sorted(args.capacities):
+        providers=[]
+        def prepare(local):
+            provider=GraphProvider(list(range(args.ep)),layers,hidden=h,intermediate=mid,
+                                   experts=args.experts,topk=args.topk,rank_local_combine=local)
+            providers.append(provider)
+            return provider,provider.prepare(0,cap)
+        try:
+            selected,meta=prepare(args.combine=='local')
+            selection={'mode':'local' if args.combine=='local' else 'direct'}
+            if args.combine=='auto':
+                direct=benchmark(selected,cap)
+                try:
+                    candidate,candidate_meta=prepare(True)
+                except ValueError as error:
+                    # Unsupported upstream combinations retain the direct graph.
+                    selection['reason']=str(error)
+                else:
+                    use_local,comparison=select_combine(direct,benchmark(candidate,cap))
+                    selection['benchmark']=comparison
+                    if use_local:
+                        selected,meta=candidate,candidate_meta
+                        selection['mode']='local'
+                    else:
+                        selection['reason']='Requires L2 <= 0.005, >= 5% aggregate gain and <= 5% regression per workload'
+            exporter.provider=selected
+            bucket=exporter.bucket(cap,meta)
+            bucket['selection']=selection
+            manifest['buckets'].append(bucket)
+            manifest['binaries']=exporter.binaries
+            (args.output/'manifest.json').write_text(json.dumps(manifest,indent=2))
+            print('EXPORTED',cap,json.dumps(selection),'binary_count',len(exporter.binaries),flush=True)
+        finally:
+            for provider in reversed(providers):provider.close()
+    # A regenerated package keeps only artifacts selected by this manifest.
+    # Restrict cleanup to the exporter's SHA256-named CUDA binaries.
+    for path in args.output.glob('*.cubin'):
+        key=path.stem
+        if len(key)==64 and all(c in '0123456789abcdef' for c in key) and key not in exporter.binaries:
+            path.unlink()
 
 if __name__=='__main__':main()
