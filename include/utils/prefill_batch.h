@@ -2,10 +2,26 @@
 
 #include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
 #include <map>
+#include <stdexcept>
 #include <vector>
 
 namespace fastllm {
+// Placement is independent of batching and KV layout. The caller supplies a
+// valid resident/session owner and retains the result for the request's life.
+// Affinity never consumes a round-robin turn or migrates an existing cache.
+class PrefillDPAllocator {
+    std::atomic<uint64_t> next{0};
+public:
+    int Assign(int groups, int affinity = -1) {
+        if (groups <= 0 || affinity < -1 || affinity >= groups)
+            throw std::invalid_argument("invalid prefill DP affinity or group count");
+        return affinity >= 0 ? affinity : next.fetch_add(1, std::memory_order_relaxed) % groups;
+    }
+};
+
 // Per-replica admission policy. Resource accounting and cache ownership stay
 // in the scheduler; deadlines belong to requests, never to a sliding batch.
 struct PrefillBatchPolicy {

@@ -55,7 +55,7 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
         std::vector<std::pair<Data *, Data *>> roots;
         for (auto &layer : context->pastKeyValues) roots.emplace_back(&layer.first, &layer.second);
         // Keep continuations on their longest resident prefix; ties prefer RR.
-        InitAttentionParallelCache(roots, group);
+        InitAttentionParallelCache(roots, AllocatePrefillGroup(group));
     }
     if (!context->pastKeyValues.empty()) {
         std::lock_guard<std::mutex> guard(tpRequestMutex);

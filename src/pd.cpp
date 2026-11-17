@@ -800,12 +800,26 @@ void PDRuntime::RunPrefill(basellm &model) {
 
             std::vector<Request> selected;
             std::vector<int> lengths;
+            // Placement is fixed by the model's cache/session affinity. Plan
+            // across those owners, just like the ordinary prefill scheduler;
+            // FIFO RPC arrival order need not be balanced across DP groups.
+            const bool balanceDP = model.prefillScheduling.balanceDP;
+            const int groupBudget = std::max(1, batchTokens / std::max(1, model.GetPrefillBatchGroups()));
+            PrefillBatchQueue queue;
+            std::map<int, int> groupTokens;
+            for (int i = 0; i < (int)active.size(); ++i)
+                queue.Push(i, balanceDP ? model.GetPrefillBatchGroup(active[i]->context.get()) : 0);
             int budget = batchTokens;
-            for (const auto &request : active) {
-                if (!budget) break;
-                const int count = std::min({chunk, budget,
+            for (int index; budget && (index = queue.Pop()) >= 0;) {
+                const auto &request = active[index];
+                const int group = balanceDP ? model.GetPrefillBatchGroup(request->context.get()) : 0;
+                const int available = balanceDP ? groupBudget - groupTokens[group] : budget;
+                const int count = std::min({chunk, budget, available,
                     int(request->input.size()) - request->context->preTokens});
+                if (count <= 0) continue;
                 selected.push_back(request); lengths.push_back(count); budget -= count;
+                groupTokens[group] += count;
+                queue.AddTokens(count);
             }
             const int batch = selected.size();
             std::vector<Data> ids(batch), masks(batch), positions(batch);
@@ -870,7 +884,8 @@ void PDRuntime::RunPrefill(basellm &model) {
                           << " prepared_tokens=" << preparedTokens << std::endl;
             }
             for (int i = 0; i < batch; ++i) {
-                auto request = active.front(); active.pop_front();
+                auto request = selected[i];
+                active.erase(std::find(active.begin(), active.end(), request));
                 request->context->preTokens += lengths[i];
                 request->SetRemaining(request->input.size() - request->context->preTokens);
                 if (request->cancellation->Cancelled()) {

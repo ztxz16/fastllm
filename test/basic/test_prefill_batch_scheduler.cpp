@@ -197,6 +197,26 @@ static std::vector<SchedulerModel::Event> Prefills(SchedulerModel &model, size_t
 
 int main() {
     try {
+        {
+            PrefillDPAllocator allocator;
+            for (int i = 0; i < 32; ++i) {
+                Check(allocator.Assign(4, 3) == 3, "resident prefix lost affinity");
+                Check(allocator.Assign(4) == i % 4, "affinity consumed a new-request turn");
+            }
+            std::vector<int> assigned(256);
+            std::vector<std::thread> workers;
+            for (int t = 0; t < 8; ++t) workers.emplace_back([&, t] {
+                for (int i = t; i < 256; i += 8) assigned[i] = allocator.Assign(4);
+            });
+            for (auto &worker : workers) worker.join();
+            for (int group = 0; group < 4; ++group)
+                Check(std::count(assigned.begin(), assigned.end(), group) == 64,
+                      "concurrent new requests lost RR balance");
+            Check(allocator.Assign(1) == 0 && allocator.Assign(1, 0) == 0, "single-group placement");
+            bool rejected = false;
+            try { allocator.Assign(4, 4); } catch (const std::invalid_argument &) { rejected = true; }
+            Check(rejected, "invalid cache owner was silently migrated");
+        }
 #ifdef USE_CUDA
         FastllmCudaGetFreeSizes();
         FastllmCudaTrimBigBuffer();

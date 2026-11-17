@@ -31,7 +31,7 @@ void NaiveN05FlashModel::InitAttentionParallelCache(
         "Naive attention DP cache requires initialized topology");
     if (group < 0) {
         if (roots.front().first->multiDeviceData) return;
-        group = attentionParallel->nextGroup++ % attentionDP;
+        group = AllocatePrefillGroup();
     }
     const auto &topology = attentionParallel->runtime.Layout();
     std::vector<int> devices;
@@ -161,7 +161,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 group = topology.AttentionOwner(it - tpDevices.begin());
             } else {
                 AssertInFastLLM(first.dims.empty(), "Naive attention DP cannot import an unpartitioned cache");
-                group = state.nextGroup++ % attentionDP;
+                group = AllocatePrefillGroup();
             }
             std::vector<std::pair<Data *, Data *>> roots;
             for (int layer = 0; layer < block_cnt; ++layer) roots.emplace_back(&key(seq, layer), &value(seq, layer));

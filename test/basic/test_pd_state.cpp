@@ -505,6 +505,94 @@ static void TestPrefillBatch() {
     std::cout << "PASS PD real prefill batching, ragged chunks, prefix reuse, token credits and shutdown\n";
 }
 
+static void TestPrefillDPBatch() {
+    class GroupedModel final : public BatchStateModel {
+        int created = 0;
+        std::map<const Data *, int> owners;
+      public:
+        int balancedBatches = 0;
+        int GetPrefillBatchGroups() const override { return 2; }
+        int GetPrefillBatchGroup(const ResponseContext *context) const override {
+            return context->intParams.at("owner");
+        }
+        void OnResponseContextCreated(ResponseContext *context) override {
+            BatchStateModel::OnResponseContextCreated(context);
+            // Deliberately skew arrival order: 0,0,1,1. Each request retains
+            // that resident owner through every subsequent prefill chunk.
+            const int owner = AllocatePrefillGroup((created++ / 2) % 2);
+            context->intParams["owner"] = owner;
+            owners[&context->pastKeyValues[0].first] = owner;
+        }
+        void OnResponseContextRemoved(ResponseContext *context) override {
+            owners.erase(&context->pastKeyValues[0].first);
+            BatchStateModel::OnResponseContextRemoved(context);
+        }
+        std::vector<int> ForwardBatch(int batch, const Data &ids, const std::vector<Data *> &masks,
+                const std::vector<Data *> &positions, const std::vector<int> &lengths,
+                std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
+                const LastTokensManager &last, std::vector<std::vector<float> *> *logits) override {
+            int tokens[2] = {};
+            for (int i = 0; i < batch; ++i) tokens[owners.at(kv[i].first)] += lengths[i];
+            Check(tokens[0] <= 2 && tokens[1] <= 2, "PD ignored per-DP token budget");
+            if (tokens[0] == 2 && tokens[1] == 2) ++balancedBatches;
+            return BatchStateModel::ForwardBatch(batch, ids, masks, positions, lengths, kv, configs, last, logits);
+        }
+    } model;
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    SetMaxTokens(64);
+    model.SetChunkedPrefillSize(2);
+    Check(model.SetPrefillBatching(4, 5000, 4, 4) && model.SetPrefillScheduling(true, 0, false, 0, 0),
+          "configure DP prefill policy");
+    model.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "dp-batch"},
+        {"transport", "tcp"}, {"listen", endpoint}, {"chunk_tokens", 2}, {"device_cache_bytes", 0}});
+    fastkv::Options options; options.transport = fastkv::Transport::Tcp; options.workers = 8;
+    fastkv::Service client(options);
+    for (bool fail : {false, true}) {
+        model.fail = fail;
+        std::vector<std::future<fastkv::Message>> calls;
+        // Hold model execution until all four RPCs are queued. Otherwise a
+        // fast CPU can finish both owner-0 requests before owner-1 arrives,
+        // making this a network timing test instead of a DP selection test.
+        std::unique_lock<std::mutex> forwardGuard(model.forwardLocker);
+        for (int i = 0; i < 4; ++i) calls.push_back(std::async(std::launch::async, [&, i] {
+            fastkv::Writer writer;
+            writer.U32(1); writer.String("dp-batch:gpu-state-v2:test-recurrent-state-v1");
+            writer.Ints(std::vector<int>(3 + i, 11 + i));
+            return client.Call(endpoint, {std::move(writer.bytes), {}});
+        }));
+        fastkv::Writer query;
+        query.U32(2); query.String("dp-batch:gpu-state-v2:test-recurrent-state-v1"); query.Ints({1});
+        bool queued = false;
+        for (int i = 0; i < 3000 && !queued; ++i) {
+            const auto reply = client.Call(endpoint,{query.bytes,{}});
+            fastkv::Reader reader(reply.metadata); reader.U32(); reader.U64(); queued = reader.U64() == 18;
+            if (!queued) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        forwardGuard.unlock();
+        Check(queued,"DP fixture did not queue all owners");
+        for (int i = 0; i < 4; ++i) {
+            Check(calls[i].wait_for(std::chrono::seconds(10)) == std::future_status::ready,
+                  "DP selection stranded a request");
+            fastkv::Message reply;
+            try { reply = calls[i].get(); }
+            catch (const std::exception &) { if (!fail) throw; continue; }
+            Check(!fail, "DP forward error was hidden");
+            PDStateReader reader(reply);
+            const int length = 3 + i;
+            Check(reader.metadata.U32() == length, "DP reordered handoff length");
+            Data state; reader.Tensor(state); reader.End();
+            Check(((float *)state.cpuData)[0] == (11 + i) * length * (length + 1) / 2,
+                  "DP selection mixed request state or chunk positions");
+        }
+        Check(model.live == 0 && model.liveTokens == 0, "DP selection leaked request/credit");
+    }
+    Check(model.balancedBatches >= 2, "PD did not select across nonadjacent owners");
+    model.StopPD();
+    std::cout << "PASS PD balanced owner selection, ragged chunks, exact state and failure cleanup\n";
+}
+
 static void TestQueuedTransfers() {
     fastkv::Service port;
     port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
@@ -954,6 +1042,7 @@ int main() {
         prefill.StopPD();
         TestGPUState();
         TestPrefillBatch();
+        TestPrefillDPBatch();
         TestPreparedPrefill();
         TestQueuedTransfers();
         TestLoadAwareRouting();

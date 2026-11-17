@@ -119,7 +119,7 @@ P 只打包请求所属 Attention 组的主 KV、Indexer 和 SWA。D 在发起 P
 
 PD token 额度按组核算，`--tokens` / 模型计算出的 `tokensLimit` 仍是单组容量。全局请求槽与传输预算独立；未准入且没有活动 KV 的请求可以在原组不足时选择其他有容量的组。已准入请求不迁移，额度持有到 KV 和在途传输释放。P 的前缀亲和性保留；L2 恢复也使用请求所属组映射，远端页号和原始 GPU 编号不能当作当前落点。
 
-当前还有两项性能限制：GPU 常驻前缀的预览尚未按 DP 组分别查询，启用 L2 时可能触发本可避免的主存恢复；PD prefill 合批仅受全局 token 预算限制，尚未按 DP 组均衡分配，组间不均衡时可能无法使用模型的本地 MoE prefill 快路径。状态传输与续写正确性已覆盖，吞吐仍需单独评估。
+GPU 常驻前缀的预览尚未按 DP 组分别查询，启用 L2 时可能触发本可避免的主存恢复。PD prefill 可用 `--prefill_dp_balance true` 按 DP 组分配 token 预算，并保留请求的前缀/会话亲和性。
 
 回归入口 `naive_n05_pd_group_*` 覆盖 DP2/4/8、跨 DP4/DP8、页边界、滑窗回绕、状态字节与 eager/Graph 续写。`pd_state_test` 检查独立组准入与额度释放；`fastkv_receive_target_test` 检查并发请求的独立接收映射及原有接收目标协议。
 

@@ -78,7 +78,6 @@ struct NaiveN05FlashModel::AttentionParallelState {
     bool servingPadded = false;
     int servingLiveRows = 0;
     struct UnsupportedServingLayout {};
-    std::atomic<size_t> nextGroup{0};
     explicit AttentionParallelState(parallel::Topology topology)
         : runtime(topology), groups(topology.attentionDP), ranks(topology.Size()),
           rows(topology.attentionDP, {}), servingGroups(topology.attentionDP), servingRanks(topology.Size()),

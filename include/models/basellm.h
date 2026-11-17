@@ -656,6 +656,12 @@ namespace fastllm {
         // by the scheduler. Models without DP keep the single FIFO group.
         virtual int GetPrefillBatchGroup(const ResponseContext *) const { return 0; }
         virtual int GetPrefillBatchGroups() const { return 1; }
+        // Models resolve resident/session affinity, then bind KV to this group.
+        // The allocator itself owns no request, cache, or device resources.
+        PrefillDPAllocator prefillDPAllocator;
+        int AllocatePrefillGroup(int affinity = -1) {
+            return prefillDPAllocator.Assign(GetPrefillBatchGroups(), affinity);
+        }
         // Requires absolute text positions and suppression of intermediate sampling.
         virtual bool SupportsChunkedPrefillScheduling() const { return false; }
         bool SetPrefillScheduling(bool balanceDP, int adaptiveRequests, bool chunked,
