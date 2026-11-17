@@ -93,6 +93,14 @@ class Exporter:
                 size=t.numel()*t.element_size();ptr=t.data_ptr()
                 self.buffers.append((ptr,size,rank,name))
                 spec[name]={'bytes':size,'init':'float_one' if name.startswith('alpha') else 'zero'}
+            # Upstream deliberately preserves this phase counter across
+            # invocations; it pairs with private peer barrier signals in heap.
+            # Other local regions are reset or produced within an invocation.
+            kernel=e.bundle.k1
+            name='nvlink_barrier_counter'
+            spec['local']['private_ranges']=[dict(
+                offset=int(kernel._local_offsets[name]),
+                bytes=int(kernel._local_region_by_name[name].nbytes))]
             self.specs.append(spec)
             # TMA descriptors can point to interior views of the heap.
             for t in [w.x,w.x_scale,w.topk_ids,w.topk_weights,w.output,e.combine_output,

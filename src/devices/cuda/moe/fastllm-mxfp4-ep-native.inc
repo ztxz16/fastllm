@@ -17,11 +17,12 @@
 
 namespace {
 using J = json11::Json;
-static void ck(CUresult r) {
+static void ck(CUresult r, const char *operation = nullptr) {
     if (r != CUDA_SUCCESS) {
         const char *s = nullptr;
         cuGetErrorString(r, &s);
-        throw std::runtime_error(s ? s : "CUDA driver failure");
+        throw std::runtime_error((operation ? std::string(operation) + ": " : std::string()) +
+                                 (s ? s : "CUDA driver failure"));
     }
 }
 static void rt(cudaError_t r) {
@@ -62,9 +63,50 @@ struct DeviceRestore {
     ~DeviceRestore() { cudaSetDevice(device); }
 };
 
+// Buckets of one EP state execute serially (layers already share their bucket
+// workspace). Keep each bucket's VA and persistent communication pages private,
+// but map transient pages to the same physical storage. Physical growth only
+// appends handles: existing graph/TMA addresses and mappings never change.
+struct ScratchPool {
+    CUmemAllocationProp prop{};
+    size_t granularity = 0;
+    std::vector<CUmemGenericAllocationHandle> pages;
+    explicit ScratchPool(int device) {
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device;
+        ck(cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+           "EP workspace granularity");
+    }
+    ~ScratchPool() {
+        for (auto page : pages) cuMemRelease(page);
+    }
+    size_t aligned(size_t n) const {
+        if (n > SIZE_MAX - (granularity - 1))
+            throw std::runtime_error("EP workspace size overflow");
+        return (n + granularity - 1) / granularity * granularity;
+    }
+    void reserve(size_t n) {
+        // CUDA 12.x requires cuMemMap's handle offset to be zero. Independent
+        // granules can be reused at arbitrary bucket offsets without remapping.
+        const size_t count = aligned(n) / granularity;
+        pages.reserve(count);
+        while (pages.size() < count) {
+            CUmemGenericAllocationHandle page = 0;
+            ck(cuMemCreate(&page, granularity, &prop, 0), "EP shared physical page");
+            pages.push_back(page);
+        }
+    }
+};
+
 struct Allocation {
     void *ptr = nullptr;
     size_t size = 0;
+    std::shared_ptr<ScratchPool> pool;
+    CUdeviceptr reservation = 0;
+    size_t reservedBytes = 0;
+    std::vector<std::pair<CUdeviceptr, size_t>> mappings;
+    std::vector<CUmemGenericAllocationHandle> privateHandles;
     Allocation(size_t n, bool ones = false) : size(n) {
         if (!n || (ones && n % sizeof(float)))
             throw std::runtime_error("Invalid EP allocation size");
@@ -81,9 +123,71 @@ struct Allocation {
             throw;
         }
     }
+    Allocation(size_t n, const J &privateRanges, std::shared_ptr<ScratchPool> shared)
+        : size(n), pool(std::move(shared)) {
+        if (!n || !privateRanges.is_array())
+            throw std::runtime_error("Invalid EP workspace sharing metadata");
+        reservedBytes = pool->aligned(n);
+        const size_t gran = pool->granularity;
+        std::vector<bool> privatePages(reservedBytes / gran, false);
+        for (const auto &range : privateRanges.array_items()) {
+            size_t first = number(range["offset"]), count = number(range["bytes"]);
+            if (!count || first >= n || count > n - first)
+                throw std::runtime_error("EP persistent region exceeds workspace");
+            for (size_t page = first / gran; page < pool->aligned(first + count) / gran; page++)
+                privatePages[page] = true;
+        }
+        size_t privateCount = 0;
+        for (bool p : privatePages) privateCount += p;
+        pool->reserve(reservedBytes - privateCount * gran);
+        // Reserve bookkeeping before acquiring mappings/handles so exception
+        // cleanup cannot lose ownership after a successful CUDA call.
+        mappings.reserve(privatePages.size());
+        privateHandles.reserve(privateCount);
+        try {
+            ck(cuMemAddressReserve(&reservation, reservedBytes, gran, 0, 0), "EP workspace VA reservation");
+            size_t sharedPage = 0;
+            for (size_t page = 0; page < privatePages.size();) {
+                size_t end = page + 1;
+                while (end < privatePages.size() && privatePages[end] == privatePages[page]) end++;
+                size_t count = (end - page) * gran;
+                CUdeviceptr address = reservation + page * gran;
+                if (privatePages[page]) {
+                    CUmemGenericAllocationHandle h = 0;
+                    ck(cuMemCreate(&h, count, &pool->prop, 0), "EP private communication pages");
+                    privateHandles.push_back(h);
+                    ck(cuMemMap(address, count, 0, h, 0), "EP private workspace mapping");
+                    mappings.emplace_back(address, count);
+                } else {
+                    for (size_t i = page; i < end; ++i) {
+                        ck(cuMemMap(address, gran, 0, pool->pages.at(sharedPage++), 0),
+                           "EP shared workspace mapping");
+                        mappings.emplace_back(address, gran);
+                        address += gran;
+                    }
+                }
+                page = end;
+            }
+            CUmemAccessDesc access{};
+            access.location = pool->prop.location;
+            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            ck(cuMemSetAccess(reservation, reservedBytes, &access, 1), "EP workspace access");
+            ptr = (void *)reservation;
+            // Bucket creation runs on the coordinator before peer work starts.
+            rt(cudaMemset(ptr, 0, n));
+        } catch (...) { releaseVirtual(); throw; }
+    }
+    void releaseVirtual() noexcept {
+        for (const auto &m : mappings) cuMemUnmap(m.first, m.second);
+        mappings.clear();
+        if (reservation) cuMemAddressFree(reservation, reservedBytes);
+        reservation = 0; ptr = nullptr;
+        for (auto h : privateHandles) cuMemRelease(h);
+        privateHandles.clear();
+    }
     ~Allocation() {
-        if (ptr)
-            cudaFree(ptr);
+        if (pool) releaseVirtual();
+        else if (ptr) cudaFree(ptr);
     }
 };
 using Buffers = std::map<std::string, std::shared_ptr<Allocation>>;
@@ -114,6 +218,8 @@ struct NativeEp {
         CUcontext primary = nullptr;
         std::map<std::string, CUmodule> modules;
         std::map<int, Buffers> weights;
+        std::shared_ptr<ScratchPool> scratch;
+        bool vmmSupported = false;
         ~Rank() {
             cudaSetDevice(device);
             for (auto &x : modules)
@@ -167,6 +273,9 @@ struct NativeEp {
             r->device = dev;
             rt(cudaFree(nullptr));
             ck(cuCtxGetCurrent(&r->primary));
+            int vmm = 0;
+            ck(cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, dev));
+            r->vmmSupported = vmm != 0;
             for (int peer : devices)
                 if (peer != dev) {
                     int access = 0;
@@ -225,8 +334,17 @@ struct NativeEp {
             for (const auto &v : entry["buffers"].object_items()) {
                 if (v.first == "w13" || v.first == "w2" || v.first == "s13" || v.first == "s2")
                     continue;
-                b->buffers[v.first] = std::make_shared<Allocation>(
-                    number(v.second["bytes"]), v.second["init"].string_value() == "float_one");
+                if (v.first == "local" && v.second["private_ranges"].is_array() && ranks[rank]->vmmSupported) {
+                    auto &pool = ranks[rank]->scratch;
+                    if (!pool) pool = std::make_shared<ScratchPool>(ranks[rank]->device);
+                    b->buffers[v.first] = std::make_shared<Allocation>(
+                        number(v.second["bytes"]), v.second["private_ranges"], pool);
+                } else {
+                    // Older packages and devices without VMM retain dedicated
+                    // allocations, with the same fixed-address graph contract.
+                    b->buffers[v.first] = std::make_shared<Allocation>(
+                        number(v.second["bytes"]), v.second["init"].string_value() == "float_one");
+                }
             }
             CUdevResource sm{}, group{}, remainder{};
             unsigned count = 1;

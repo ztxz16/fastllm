@@ -78,7 +78,7 @@
     64,
     128
   ],
-  "manifest_sha256": "e133989fce84566403cdc3f81869dd7b1ae02fd44f197c0c7cb94bb0beab7fc2",
+  "manifest_sha256": "f7bf100f86be30adea25ad7a5c43a011aa4f19644e31ddceca9806e17f30a2b2",
   "binaries_sha256": [
     "0139d1b040c7f431d2fee6d81f7405eb7bf1333ab6e14aa97bf3c03563d8f839",
     "025cd6781e34350390af921c130817a201831d0e260b3a7cdcab2b5fc24be120",
@@ -197,7 +197,7 @@
         1024,
         2048
       ],
-      "manifest_sha256": "d1bc199ee89e4a555db5d4d388bfa4e007b352f79317a43b92a4346119d69fc1",
+      "manifest_sha256": "fc47cbf58935e8189248171cb383efcd0640b435c9b9a9ca2bf7ba2be7980e9d",
       "binaries_sha256": [
         "0087bc58ef34197270677f176856e049ad93ffd2bbaac30132d109d13ae9e46a",
         "00ae75e222dcee7681372163b0fae6c3cd1b40e474c4b6c1a01032521af94c2b",
@@ -301,7 +301,8 @@
   "export_selection": "Build-time direct versus rank-local combine; deterministic balanced/skewed routes; L2 <= 0.005, >= 5% summed latency gain, <= 5% per-workload regression. Only selected artifacts are deployed.",
   "export_tools_sha256": {
     "prepare.py": "6b439241131ba96eca9da4e398884953943d15d9ce1e2799cb5bf2951ed56355",
-    "export.py": "1831ed60a2ad7ad951e8a8129d0e4846903778bc3c4f340eb391e43a2fd8623e",
+    "export.py": "a588ae8f4edded359f539f5779d0b5cbaeeebe43774dd0626b6bd5d2483c45b0",
     "benchmark.py": "1d433977c118d995fc6ee4fc3067dc5653594230ec27cb565c3fa1ba5b18f8e4"
-  }
+  },
+  "workspace_lifetime": "Optional private_ranges preserve persistent local communication state; transient local pages alias stable bucket virtual addresses. Peer heaps remain private. Ordered invocations required; native loader falls back for missing metadata or unsupported VMM."
 }
