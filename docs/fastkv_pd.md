@@ -114,9 +114,11 @@ Naive 传统 TP 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两�
 
 纯 GPU、无草稿部署支持 P/D 使用不同的实例数量、Attention DP 数和 EP 数，要求两端的 **Attention TP**（`tp / attn-dp-size`）与 KV 表示相同。例如 `--tp 4 --ep 4 --attn-dp-size 4` 的两个 P 实例，可以连接 `--tp 8 --ep 8 --attn-dp-size 8` 的一个 D 实例；反向部署及两端均为 DP8/EP8 也使用同一协议。实例列表沿用 router 的 `prefill` / `decode` 数组，每个实例使用独立端口和互不重叠的 `CUDA_VISIBLE_DEVICES`。`--max_batch`、`max_inflight` 是每实例上限，不是每个 DP 组的上限。
 
-两端使用 BF16 计算、BF16/FP8 KV、`--indexer_tp_storage replicated --dspark 0`，并保持量化与窗口配置一致。DP 使用独立的 `naive-n05-group-state-v1` 布局，明确区分传统 TP 协议；布局检查保留组内 Attention TP、KV 几何及编码，不包含全局卡数和请求的物理 GPU 编号。不同 Attention TP 的重分片、DP PD 草稿、DP PD KVMem、context/layer-sharded Indexer 和 KV 精度转换尚未接入，不能靠修改 rank 数绕过兼容性检查。
+两端使用 BF16 计算、BF16/FP8 KV、`--indexer_tp_storage replicated --dspark 0`，并保持量化与窗口配置一致。DP 使用独立的 `naive-n05-group-state-v2` 布局，明确区分传统 TP 协议；布局检查保留组内 Attention TP、KV 几何及编码，不包含全局卡数和请求的物理 GPU 编号。v2 将本地 packed K/Indexer 按完整行传输，不重新量化。P/D 必须同时升级，旧 v1 节点会在布局检查时拒绝交接。不同 Attention TP 的重分片、DP PD 草稿、DP PD KVMem、context/layer-sharded Indexer 和 KV 精度转换尚未接入，不能靠修改 rank 数绕过兼容性检查。
 
-P 只打包请求所属 Attention 组的主 KV、Indexer 和 SWA。D 在发起 P 工作前确定请求组并取得该组 token 额度；网络按每请求的不可变设备映射接收到目标组的 GPU 暂存区，再由既有持久 GPU worker 批量恢复本地页和滑窗。当前保留 GPU staging → 页池的复制，不宣称零拷贝。RDMA 路径不经主存中转，TCP 保留通用分块中转。
+P 只打包请求所属 Attention 组的主 KV、Indexer 和 SWA。D 在发起 P 工作前确定请求组并取得该组 token 额度，复用 `ReceiveTarget` 在模型线程预留私有 KV 页。网络按每请求的不可变设备映射直接写最终页，固定页池的 MR 跨请求复用；SWA 小窗口使用有界暂存区，由既有持久 GPU worker 恢复环形次序。接收完成前不发布活动 KV，取消或失败后也须等网络操作结束才回收预留页。完整 KV 不再做 staging → 页池复制，P 端打包和 SWA 提交仍有复制成本。RDMA 不经主存中转，TCP 保留通用分块中转。
+
+`receive_prepare_ms` 包含预留页、页表和窗口的准备工作；`import_ms` 是传输完成后的提交工作，应一起评估 D 端调度开销。
 
 PD token 额度按组核算，`--tokens` / 模型计算出的 `tokensLimit` 仍是单组容量。全局请求槽与传输预算独立；未准入且没有活动 KV 的请求可以在原组不足时选择其他有容量的组。已准入请求不迁移，额度持有到 KV 和在途传输释放。P 的前缀亲和性保留；L2 恢复也使用请求所属组映射，远端页号和原始 GPU 编号不能当作当前落点。
 
@@ -154,7 +156,7 @@ Naive 纯 GPU PD 支持 DSpark，包括单卡草稿、完整草稿 TP 和仅 MLP
 
 草稿状态使用 `draft-v2` 布局：按逻辑 rank 传输已提交窗口的 K/V 和前缀检查点所需的归一化输入尾部。D 复用本地草稿缓冲区，预留候选空间后才允许执行；采样队列和 Graph 不跨节点传输。两端草稿结构、TP 大小及分片策略必须一致，旧草稿布局或不兼容配置会在交接前被拒绝。不启用 DSpark 时不附加草稿状态。
 
-GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网络线程只写私有 staging 或接收端预留的目标区，完成 RDMA 可见性处理后交给模型拥有者。Naive 在拥有者 stream 上批量整理/恢复页和滑窗，避免逐页 CUDA API 调用以及额外的导入副本。小 buffer 合并到有界 arena，复用内存、MR 和连接。纯 GPU 的 RDMA 路径不经主存 KV；KVMem 定向接收按上述规则直达预留页，TCP 兼容路径仍经主存分块搬运。普通 GPU 接收仍需从 staging 恢复到本地页池；当前各路径仍有状态整理、完整状态传输和导入结束同步，尚不支持增量交接。
+GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网络线程只写私有 staging 或接收端预留的目标区，完成 RDMA 可见性处理后交给模型拥有者。Naive 在拥有者 stream 上批量整理/恢复页和滑窗，避免逐页 CUDA API 调用以及额外的导入副本。小 buffer 合并到有界 arena，复用内存、MR 和连接。纯 GPU 的 RDMA 路径不经主存 KV；KVMem 和普通 GPU DP 的完整 KV 可直达预留页，传统 TP 的 GPU 接收仍从 staging 恢复到本地页池。TCP 兼容路径仍经主存分块搬运。各路径仍有源端状态整理、完整状态传输和导入结束同步，尚不支持增量交接。
 
 新增模型需要实现 `PDLayout`、`ExportPDState`、`ImportPDState`；多 GPU adapter 用 `PDDevices` 声明逻辑 rank 的设备顺序。可选的 `HasPDResidentPrefixCache` 只应用于确实支持 GPU 常驻恢复的模型，未实现时使用通用检查点缓存。接入测试应覆盖全量交接、前缀续接、页边界、并发、取消和错误布局测试。逻辑分片规划独立于通信后端；未来多机 wide-EP 的进程组与 collective 属于计算层，需要单独接入，不能仅靠增加 router 的 D 节点来替代。
 

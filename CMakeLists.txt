@@ -2478,18 +2478,6 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_tp_model COMMAND naive_n05_tp_model_test)
         add_test(NAME naive_n05_tp_model_2 COMMAND naive_n05_tp_model_test 2)
         add_test(NAME naive_n05_tp_model_4 COMMAND naive_n05_tp_model_test 4)
-        foreach(NAIVE_PD_GROUPS 2 4 8)
-            add_test(NAME naive_n05_pd_group_${NAIVE_PD_GROUPS}
-                COMMAND naive_n05_verify_graph_test 8 pd_group ${NAIVE_PD_GROUPS})
-            set_tests_properties(naive_n05_pd_group_${NAIVE_PD_GROUPS}
-                PROPERTIES LABELS "cuda;naive;pd" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
-                PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
-        endforeach()
-        add_test(NAME naive_n05_pd_group_4_to_8 COMMAND naive_n05_verify_graph_test 4 pd_group 4 fp8 8)
-        add_test(NAME naive_n05_pd_group_8_to_4 COMMAND naive_n05_verify_graph_test 8 pd_group 8 fp8 4)
-        set_tests_properties(naive_n05_pd_group_4_to_8 naive_n05_pd_group_8_to_4
-            PROPERTIES LABELS "cuda;naive;pd" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
-            PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
         foreach(NAIVE_DP_WORLD 4 8)
             foreach(NAIVE_DP_GROUPS 2 4)
                 foreach(NAIVE_DP_KV bf16 fp8)
@@ -3020,6 +3008,18 @@ if (UNIT_TEST)
                 COMMAND naive_n05_verify_graph_test 2 serving_invalidation)
             add_test(NAME naive_n05_swa_dp_heads COMMAND naive_n05_swa_verify_test dp_heads)
             set_tests_properties(naive_n05_swa_dp_heads PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
+            foreach(NAIVE_PD_GROUPS 2 4 8)
+                add_test(NAME naive_n05_pd_group_${NAIVE_PD_GROUPS}
+                    COMMAND naive_n05_verify_graph_test 8 pd_group ${NAIVE_PD_GROUPS})
+                set_tests_properties(naive_n05_pd_group_${NAIVE_PD_GROUPS}
+                    PROPERTIES LABELS "cuda;naive;pd" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
+            endforeach()
+            add_test(NAME naive_n05_pd_group_4_to_8 COMMAND naive_n05_verify_graph_test 4 pd_group 4 fp8 8)
+            add_test(NAME naive_n05_pd_group_8_to_4 COMMAND naive_n05_verify_graph_test 8 pd_group 8 fp8 4)
+            set_tests_properties(naive_n05_pd_group_4_to_8 naive_n05_pd_group_8_to_4
+                PROPERTIES LABELS "cuda;naive;pd" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
             foreach(NAIVE_DP_GROUPS 2 4 8)
                 add_test(NAME naive_n05_attention_dp_sampling_${NAIVE_DP_GROUPS}
                     COMMAND naive_n05_verify_graph_test 8 attention_dp_sampling ${NAIVE_DP_GROUPS})

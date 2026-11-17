@@ -1282,7 +1282,11 @@ bool basellm::PollPD(ResponseContext *context) {
             if (!pdRuntime->SelectPeer(*pending, verbose)) return false;
             if (!pending->receiver) {
                 std::lock_guard<std::mutex> lock(forwardLocker);
+                const auto begin = std::chrono::steady_clock::now();
                 pending->receiver = PreparePDReceive(*context);
+                if (pending->receiver && verbose) std::cout << "[FastKV PD timing] receive_prepare_ms="
+                    << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count()
+                    << std::endl;
             }
             fastkv::ReceiveTarget target;
             if (pending->receiver) target = [receiver = pending->receiver](const fastkv::Bytes &metadata,

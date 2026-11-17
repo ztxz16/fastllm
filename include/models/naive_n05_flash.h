@@ -349,6 +349,7 @@ namespace fastllm {
         void RecycleTensorParallelCache(ResponseContext *context);
         struct SparseKvState;
         struct SparsePDReceive;
+        struct GpuPDReceive;
         std::shared_ptr<SparseKvState> sparseKv;
         void InitSparseKv();
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
@@ -429,6 +430,10 @@ namespace fastllm {
         std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpPagedCaches;
         std::vector<std::vector<std::unique_ptr<PagedCacheManager>>> tpIndexerCaches;
         std::map<PagedCacheManager *, PagedCacheManager *> tpIndexerSidecars;
+        // Stable registrations borrow fixed pool storage; request leases own
+        // the individual pages until transfer completion or cancellation.
+        struct GpuPDPools;
+        std::shared_ptr<GpuPDPools> pdReceivePools;
         bool tpPrepared = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
         // layout. Prefill/eager fallback temporarily uses chronological rows.

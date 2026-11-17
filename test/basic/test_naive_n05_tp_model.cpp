@@ -871,7 +871,28 @@ class Fixture : public NaiveN05FlashModel {
             if (!SelectPDRequestGroup(context, available, length + 8)) throw std::runtime_error("PD group selection failed");
             const auto devices = PDRequestDevices(context); wire = record.state;
             fastkv::Message request; std::future<fastkv::Message> future;
-            if (!client.TrySubmit(server.Address(), request, future, {}, {}, {},
+            if (length == 129) {
+                // Cancel before submission: the private final pages and SWA
+                // allocations must return. Cumulative reservations exceed the
+                // fixture's entire 16K pool, so leaked pages cannot hide here.
+                for (int cancelled = 0; cancelled < 130; ++cancelled) {
+                    auto abandoned = PreparePDReceive(context);
+                }
+            }
+            auto receiver = length == 257 ? std::shared_ptr<PDReceiveState>{} : PreparePDReceive(context);
+            if (length != 257 && !receiver) throw std::runtime_error("missing direct GPU PD receiver");
+            if (receiver && length == 129) {
+                std::vector<size_t> sizes;
+                for (const auto &buffer : wire.buffers) sizes.push_back(buffer.Size());
+                bool rejected = false;
+                try { receiver->Targets({},sizes); } catch (const std::exception &) { rejected = true; }
+                if (!rejected) throw std::runtime_error("GPU receiver accepted invalid metadata");
+            }
+            fastkv::ReceiveTarget target;
+            if (receiver) target = [receiver](const fastkv::Bytes &metadata,const std::vector<size_t> &sizes) {
+                return receiver->Targets(metadata,sizes);
+            };
+            if (!client.TrySubmit(server.Address(), request, future, {}, {}, target,
                 [devices](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
                     return PDReceivePlacement(metadata, sizes.size(), devices);
                 })) throw std::runtime_error("PD cross-topology submit failed");
@@ -896,9 +917,11 @@ class Fixture : public NaiveN05FlashModel {
                 arrived = restored.get();
             }
             const auto locations = PDReceivePlacement(wire.metadata, wire.buffers.size(), devices);
-            for (size_t i = 0; i < arrived.buffers.size(); ++i)
+            for (size_t i = 0; !receiver && i < arrived.buffers.size(); ++i)
                 if (arrived.buffers[i].Device() != locations[i]) throw std::runtime_error("PD cross-topology landing differs");
-            ImportPDState(context, arrived); context.preTokens = length;
+            if (receiver) { receiver->Commit(context); receiver.reset(); arrived = {}; }
+            else ImportPDState(context, arrived);
+            context.preTokens = length;
             auto exported = ExportPDState(context);
             if (exported.metadata != wire.metadata || exported.buffers.size() != wire.buffers.size())
                 throw std::runtime_error("PD cross-topology schema differs");
