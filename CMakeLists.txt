@@ -1485,6 +1485,10 @@ if (UNIT_TEST)
     fastllm_add_checked_test(naive_prefix_queue naive_prefix_queue_test "ALL_PASS" 30)
     set_tests_properties(naive_prefix_queue PROPERTIES RUN_SERIAL TRUE)
 
+    add_executable(decode_pipeline_test test/basic/test_decode_pipeline.cpp)
+    target_link_libraries(decode_pipeline_test PRIVATE fastllm)
+    fastllm_add_checked_test(decode_pipeline decode_pipeline_test "DECODE PIPELINE PASS" 30)
+
     add_executable(pending_response_tokens_test test/basic/test_pending_response_tokens.cpp)
     target_link_libraries(pending_response_tokens_test PRIVATE fastllm)
     fastllm_add_checked_test(pending_response_tokens pending_response_tokens_test "ALL_PASS" 60)

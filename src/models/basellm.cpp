@@ -2321,6 +2321,7 @@ namespace fastllm {
             // Pair the shutdown check with the condition variable's lock so
             // its notification cannot be lost before an idle wait.
             if (model->isFree) break;
+            if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens)) continue;
             auto &forwardLocker = model->forwardLocker;
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
@@ -3055,6 +3056,115 @@ namespace fastllm {
         }
     }
 
+    bool basellm::RunDecodePipeline(std::unique_lock<std::mutex> &dictLock,
+                                    int batchLimit, int totalLimit) {
+        // An adapter must preserve the normal per-token semantics. History and
+        // constrained sampling need their CPU result before the next forward.
+        if (!SupportsDecodePipeline() || saveHistoryChat || isFree) return false;
+        std::vector<ResponseContext *> contexts;
+        std::vector<int> handles;
+        for (auto &entry : responseContextDict.dicts) {
+            auto *c = entry.second;
+            if (c->isEnding) continue;
+            if (c->isAbort || c->curTokens == 0 || c->currentTokens.size() != 1 ||
+                c->generationConfig.NeedsTokenHistory() || c->generationConfig.output_logits ||
+                !c->multimodalInput.empty() || c->pdPending) return false;
+            contexts.push_back(c); handles.push_back(entry.first);
+        }
+        if (contexts.empty() || contexts.size() > (size_t)batchLimit) return false;
+        auto pipeline = CreateDecodePipeline(contexts);
+        if (!pipeline) return false;
+        const std::set<int> admittedHandles(handles.begin(), handles.end());
+        auto stopToken = [&](ResponseContext *c, int token) {
+            return token == eos_token_id || eos_token_ids.count(token) ||
+                c->generationConfig.stop_token_ids.count(token);
+        };
+        auto reachesLimit = [&](ResponseContext *c, int additional) {
+            return (c->generationConfig.output_token_limit > 0 &&
+                    c->curTokens + additional >= c->generationConfig.output_token_limit) ||
+                (totalLimit > 0 && c->allTokens.size() + additional >= (size_t)totalLimit) ||
+                c->allTokens.size() + additional >= (size_t)max_positions;
+        };
+        auto collect = [&](int slot) {
+            auto tokens = pipeline->Collect(slot);
+            if (tokens.size() != contexts.size())
+                throw std::runtime_error("Invalid decode pipeline result size.");
+            return tokens;
+        };
+        auto publish = [&](const std::vector<int> &tokens) {
+            for (size_t row = 0; row < contexts.size(); ++row) {
+                auto *c = contexts[row];
+                if (c->isEnding || c->isAbort) continue;
+                ++c->intParams["index"]; ++c->preTokens;
+                const int token = tokens[row];
+                if (stopToken(c, token)) {
+                    c->isEnding = true; c->TryRecord(this); continue;
+                }
+                UpdateToolCallConstraintState(c, token);
+                c->currentTokens[0] = token;
+                c->resultTokenQueue.push(token);
+                c->allTokens.push_back(token);
+                ++c->curTokens;
+                if (reachesLimit(c, 0)) {
+                    c->isEnding = true; c->TryRecord(this);
+                }
+            }
+            NotifyResponseReady();
+        };
+        dictLock.unlock();
+        std::unique_lock<std::mutex> forwardLock(forwardLocker);
+        try {
+            int slot = 0;
+            const bool submitted = pipeline->Submit(slot);
+            dictLock.lock();
+            if (!submitted) return false;
+            for (;;) {
+                // New work, cancellation, limits and config-sensitive requests
+                // break the chain. Drain the already submitted token first.
+                bool chain = !isFree;
+                for (auto *c : contexts) {
+                    chain = chain && !c->isAbort && !c->isEnding &&
+                        (c->generationConfig.output_token_limit <= 0 ||
+                         c->curTokens + 2 <= c->generationConfig.output_token_limit) &&
+                        (totalLimit <= 0 || c->allTokens.size() + 2 <= (size_t)totalLimit) &&
+                        c->allTokens.size() + 2 <= (size_t)max_positions;
+                }
+                for (auto &entry : responseContextDict.dicts)
+                    if (!entry.second->isEnding &&
+                        !admittedHandles.count(entry.first)) chain = false;
+                dictLock.unlock();
+                const bool next = chain && pipeline->Submit(1 - slot, slot);
+                auto tokens = collect(slot);
+                dictLock.lock();
+                bool stop = isFree;
+                for (size_t row = 0; row < contexts.size(); ++row) {
+                    auto *c = contexts[row];
+                    stop = stop || c->isAbort || c->isEnding || stopToken(c, tokens[row]) || reachesLimit(c, 1);
+                }
+                if (stop && next) {
+                    // No request can be published as terminal (and freed by a
+                    // consumer) while the lookahead still owns its KV pointers.
+                    auto tail = collect(1 - slot);
+                    pipeline->Drain();
+                    publish(tokens);
+                    publish(tail); // Ended/aborted rows are discarded; survivors commit once.
+                    return true;
+                }
+                publish(tokens);
+                if (!next) { pipeline->Drain(); return true; }
+                slot = 1 - slot;
+            }
+        } catch (const std::exception &error) {
+            // Never retry a possibly submitted collective or reuse its cache.
+            pipeline->Drain();
+            if (!dictLock.owns_lock()) dictLock.lock();
+            fprintf(stderr, "[Fastllm] decode pipeline failed: %s\n", error.what());
+            for (auto *c : contexts) { c->isEnding = true; c->error = ResponseContextErrorRuntime; }
+            NotifyResponseReady();
+            return true;
+        }
+    }
+
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
                                       const fastllm::GenerationConfig &generationConfig,
                                       const std::map <std::string, std::vector <Data*> > &multimodalInput,
@@ -3211,6 +3321,7 @@ namespace fastllm {
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
                         if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
+                        if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens)) continue;
                         auto &forwardLocker = model->forwardLocker;
 
                         inference_trace::DetailRegion retireRegion("retire_requests");

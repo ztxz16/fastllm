@@ -441,6 +441,19 @@ namespace fastllm {
         virtual bool PopPendingResponseToken(ResponseContext *context, int previousToken,
                                               int &token) { return false; }
 
+        // Submit may overlap the next GPU step with collection of the prior
+        // token. A false submission must leave model/cache state untouched.
+        struct DecodePipeline {
+            virtual ~DecodePipeline() = default;
+            virtual bool Submit(int outputSlot, int inputSlot = -1) = 0;
+            virtual std::vector<int> Collect(int slot) = 0;
+            virtual void Drain() = 0;
+        };
+        virtual bool SupportsDecodePipeline() const { return false; }
+        virtual std::unique_ptr<DecodePipeline> CreateDecodePipeline(
+            const std::vector<ResponseContext *> &) { return nullptr; }
+        bool RunDecodePipeline(std::unique_lock<std::mutex> &dictLock, int batchLimit, int totalLimit);
+
         virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 
         virtual int FetchResponseTokens(int handleId); // 获取指定handle的输出, -1代表输出结束了 
