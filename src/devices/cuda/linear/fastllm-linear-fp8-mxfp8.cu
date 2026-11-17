@@ -1,8 +1,8 @@
 /*
- * SM120 MXFP8 W8A8 linear for DeepSeek V4.1.
+ * SM120 MXFP8 W8A8 linear.
  *
- * The V4.1 checkpoint stores E4M3 weights with one exact UE8M0 scale per
- * 32x32 block.  CUTLASS's SM120 MXFP8 kernels consume row-major FP8 A,
+ * E4M3 weights retain exact UE8M0 scales per 1x32 or 32x32 block.
+ * CUTLASS's SM120 MXFP8 kernels consume row-major FP8 A,
  * column-major FP8 B, and the FlashInfer 128x4 swizzled E8M0 layout.  This
  * adapter keeps the checkpoint bytes untouched, expands the compact weight
  * scales once, and quantizes each BF16 activation block online.
@@ -81,6 +81,22 @@ bool Mxfp8EnvEnabled() {
            value[0] != 'f' && value[0] != 'F';
 }
 
+bool Mxfp8Dense(const fastllm::Data &data) {
+    if (data.strides.size() != data.dims.size()) return false;
+    uint64_t stride = 1;
+    for (int i = int(data.dims.size()) - 1; i >= 0; --i) {
+        if (data.dims[i] <= 0 || data.strides[i] != stride) return false;
+        stride *= data.dims[i];
+    }
+    return true;
+}
+
+bool Mxfp8Overlaps(const fastllm::Data &a, const fastllm::Data &b) {
+    if (!a.cudaData || !b.cudaData) return false;
+    const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
+    return x < y + b.GetBytes() && y < x + a.GetBytes();
+}
+
 bool Mxfp8ScaleByte(float scale, uint8_t *encoded) {
     if (encoded == nullptr || !std::isfinite(scale) || scale <= 0.0f) return false;
     int exponent = 0;
@@ -97,8 +113,8 @@ bool Mxfp8ScaleByte(float scale, uint8_t *encoded) {
 bool BuildMxfp8WeightScales(const fastllm::Data &weight, int rows, int cols,
                             std::vector<uint8_t> &swizzled) {
     if (rows <= 0 || cols <= 0 || rows % 32 != 0 || cols % 32 != 0 ||
-        weight.blockK != 32 || weight.blockM != 32 ||
-        weight.scales.size() != static_cast<size_t>(rows / 32) * (cols / 32)) {
+        (weight.blockK != 1 && weight.blockK != 32) || weight.blockM != 32 ||
+        weight.scales.size() != static_cast<size_t>(rows / weight.blockK) * (cols / 32)) {
         return false;
     }
     const int mTiles = (rows + 127) / 128;
@@ -122,7 +138,7 @@ bool BuildMxfp8WeightScales(const fastllm::Data &weight, int rows, int cols,
                             ((static_cast<size_t>(mt) * kTiles + kt) * 512 +
                              m32 * 16 + m4 * 4 + k4);
                         if (row < rows && scaleCol < scaleCols) {
-                            swizzled[dst] = compact[(row / 32) * scaleCols + scaleCol];
+                            swizzled[dst] = compact[(row / weight.blockK) * scaleCols + scaleCol];
                         }
                     }
                 }
@@ -136,16 +152,21 @@ bool EnsureMxfp8WeightScales(const fastllm::Data &weight, int rows, int cols,
                              const uint8_t *&deviceScales) {
     const int device = FastllmCudaGetDevice();
     auto &registry = Mxfp8Registry();
-    // Serialize first-use publication so concurrent readers cannot replace and
-    // free a scale buffer that another reader is about to submit to CUDA.
-    std::lock_guard<std::mutex> lock(registry.mutex);
-    auto cached = registry.entries.find(&weight);
-    if (cached != registry.entries.end() && cached->second.device == device &&
-        cached->second.rows == rows && cached->second.cols == cols && cached->second.scales) {
-        deviceScales = cached->second.scales;
-        return true;
+    auto matches = [&](const Mxfp8WeightCache &entry) {
+        return entry.device == device && entry.rows == rows && entry.cols == cols && entry.scales;
+    };
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto cached = registry.entries.find(&weight);
+        if (cached != registry.entries.end() && matches(cached->second)) {
+            deviceScales = cached->second.scales;
+            return true;
+        }
     }
 
+    // A capture may only consume an immutable scale layout prepared earlier.
+    // Preparation itself is allowed to allocate and publish the cache entry.
+    if (FastllmCudaGraphIsCapturingFast()) return false;
     std::vector<uint8_t> hostScales;
     if (!BuildMxfp8WeightScales(weight, rows, cols, hostScales)) return false;
     void *storage = nullptr;
@@ -159,14 +180,24 @@ bool EnsureMxfp8WeightScales(const fastllm::Data &weight, int rows, int cols,
         return false;
     }
 
-    // A Data object is not moved while a linear call is in flight.  Replace a
-    // stale entry only after the new copy has completed so a failed allocation
-    // never destroys the old usable cache.
+    // CUDA allocation/copies can synchronize with peer collectives. Never hold
+    // the cross-device registry lock while waiting for GPU work. If another
+    // caller published first, keep its immutable buffer and discard our copy.
     Mxfp8WeightCache old;
-    if (cached != registry.entries.end()) old = cached->second;
-    registry.entries[&weight] = {device, rows, cols, allocated};
-    deviceScales = allocated;
-
+    bool duplicate = false;
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto cached = registry.entries.find(&weight);
+        if (cached != registry.entries.end() && matches(cached->second)) {
+            deviceScales = cached->second.scales;
+            duplicate = true;
+        } else {
+            if (cached != registry.entries.end()) old = cached->second;
+            registry.entries[&weight] = {device, rows, cols, allocated};
+            deviceScales = allocated;
+        }
+    }
+    if (duplicate) FastllmCudaDirectFree(allocated);
     if (old.scales != nullptr) {
         const int previous = FastllmCudaGetDevice();
         FastllmCudaSetDevice(old.device);
@@ -352,22 +383,8 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
     const uint64_t rows = input.Count(0) / k;
     if (rows < 1 || rows * uint64_t(k) > INT_MAX || rows * uint64_t(n) > INT_MAX ||
         weight.Count(0) > INT_MAX) return false;
-    auto dense = [](const Data &d) {
-        if (d.strides.size() != d.dims.size()) return false;
-        uint64_t stride = 1;
-        for (int i = int(d.dims.size()) - 1; i >= 0; --i) {
-            if (d.dims[i] <= 0 || d.strides[i] != stride) return false;
-            stride *= d.dims[i];
-        }
-        return true;
-    };
-    if (!dense(input) || !dense(weight)) return false;
-    auto overlap = [](const Data &a, const Data &b) {
-        if (!a.cudaData || !b.cudaData) return false;
-        const uintptr_t x = reinterpret_cast<uintptr_t>(a.cudaData), y = reinterpret_cast<uintptr_t>(b.cudaData);
-        return x < y + b.GetBytes() && y < x + a.GetBytes();
-    };
-    if (overlap(output, input) || overlap(output, weight)) return false;
+    if (!Mxfp8Dense(input) || !Mxfp8Dense(weight) ||
+        Mxfp8Overlaps(output, input) || Mxfp8Overlaps(output, weight)) return false;
     const uint8_t *w = nullptr, *sw = nullptr;
     if (!EnsureMxfp8Weight(weight, n, k, w, sw, true)) return false;
     const auto config = MakeMxfp8Config();
@@ -403,88 +420,65 @@ extern "C" bool FastllmCudaTryFp8DraftHead(const fastllm::Data &input,
 
 extern "C" bool FastllmCudaTryMxfp8QuantizedLinear(const fastllm::Data &input,
         fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
     if (!Mxfp8EnvEnabled() || &input == &output || &weight == &output ||
-        (FastllmCudaGraphIsCapturingFast() || FastllmCudaGraphPreparationActive()) ||
         FastllmCudaRuntimeArch() < 120 || FastllmCudaRuntimeArch() > 121 ||
         input.multiDeviceData || weight.multiDeviceData || output.multiDeviceData ||
-        input.dataType != fastllm::DataType::BFLOAT16 || input.dims.empty() ||
-        input.dataDevice != fastllm::DataDevice::CUDA || !input.cudaData ||
+        input.dataType != BFLOAT16 || input.dims.empty() ||
+        input.dataDevice != CUDA || !input.cudaData ||
         (reinterpret_cast<uintptr_t>(input.cudaData) & 15) ||
-        weight.dataDevice != fastllm::DataDevice::CUDA || !weight.cudaData ||
-        weight.dataType != fastllm::DataType::FP8_E4M3 || weight.dims.size() != 2 ||
-        weight.isFake || weight.blockM != 32 || weight.blockK != 32 ||
+        weight.dataDevice != CUDA || !weight.cudaData ||
+        (reinterpret_cast<uintptr_t>(weight.cudaData) & 15) ||
+        weight.dataType != FP8_E4M3 || weight.dims.size() != 2 ||
+        weight.isFake || weight.IsRepacked || weight.blockM != 32 ||
+        (weight.blockK != 1 && weight.blockK != 32) ||
         input.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
         weight.dataDeviceIds != input.dataDeviceIds ||
         weight.dims[1] != input.dims.back() || input.dims.back() <= 0 ||
         input.dims.back() % 32 || weight.dims[0] <= 0 || weight.dims[0] % 32) return false;
-    const int rows = input.Count(0) / input.dims.back();
-    if (rows < 128) return false;
-    const int m = rows, n = weight.dims[0], k = input.dims.back();
+    const int n = weight.dims[0], k = weight.dims[1];
+    const uint64_t rows = input.Count(0) / k;
+    // Preserve the low-latency small-M path. All larger row counts, including
+    // tails not divisible by the 128-row tile, use the same masked GEMM.
+    if (rows < 128 || rows * uint64_t(k) > INT_MAX || rows * uint64_t(n) > INT_MAX ||
+        weight.Count(0) > INT_MAX) return false;
+    if (!Mxfp8Dense(input) || !Mxfp8Dense(weight) ||
+        Mxfp8Overlaps(output, input) || Mxfp8Overlaps(output, weight)) return false;
 
     const uint8_t *weightScales = nullptr;
-    const uint8_t *weightData = static_cast<const uint8_t *>(weight.cudaData);
     if (!EnsureMxfp8WeightScales(weight, n, k, weightScales)) return false;
-
-    auto dims = input.dims;
-    dims.back() = weight.dims[0];
-    output.dataType = fastllm::DataType::BFLOAT16;
-    output.UpdateUnitSize();
-    output.Resize(dims);
-    output.ToDevice(fastllm::DataDevice::CUDA, input.dataDeviceIds);
-    output.Allocate();
-    void *inputData = input.cudaData;
-    void *outputData = output.cudaData;
-    if (!outputData) return false;
-
-    const int mTiles = (m + 127) / 128;
-    const int kTiles = (k + 127) / 128;
-    const size_t quantBytes = static_cast<size_t>(m) * k;
-    const size_t scaleBytes = static_cast<size_t>(mTiles) * 128 * kTiles * 4;
     const auto config = MakeMxfp8Config();
     size_t workspaceBytes = 0;
-    try {
-        workspaceBytes = Mxfp8DispatchWorkspace(config, m, n, k);
-    } catch (...) {
-        FastllmCudaClearThreadError();
-        return false;
-    }
-    size_t borrowedBytes = 0;
-    bool ownWorkspace = false;
+    try { workspaceBytes = Mxfp8DispatchWorkspace(config, int(rows), n, k); }
+    catch (...) { FastllmCudaClearThreadError(); return false; }
+    // Align both following regions even when rows and K are partial tiles.
+    const size_t quantBytes = (size_t(rows) * k + 255) & ~size_t(255);
+    const size_t scaleBytes = size_t((rows + 127) / 128) * size_t((k + 127) / 128) * 512;
     const size_t totalBytes = quantBytes + scaleBytes + workspaceBytes;
-    uint8_t *scratch = static_cast<uint8_t *>(
-        FastllmBorrowCudaTempBuffer(totalBytes, &borrowedBytes, &ownWorkspace));
-    if (scratch == nullptr || borrowedBytes < totalBytes) {
-        FastllmReleaseCudaTempBuffer(scratch, ownWorkspace);
-        return false;
-    }
-
+    if (totalBytes > INT_MAX) return false;
+    // Data allocations belong to the capture's memory pool. A growable shared
+    // scratch buffer could instead invalidate addresses retained by a graph.
+    Data scratchData(INT8, {int(totalBytes)});
+    scratchData.ToDevice(CUDA, input.dataDeviceIds, false);
+    scratchData.Allocate(false);
+    auto *scratch = static_cast<uint8_t *>(scratchData.cudaData);
+    if (!scratch) return false;
+    auto dims = input.dims; dims.back() = n;
+    output.dataType = BFLOAT16; output.UpdateUnitSize(); output.Resize(dims);
+    output.ToDevice(CUDA, input.dataDeviceIds); output.Allocate();
+    if (!output.cudaData) return false;
     cudaStream_t stream = cudaStreamPerThread;
-    uint8_t *quantInput = scratch;
-    uint8_t *inputScales = scratch + quantBytes;
-    char *workspace = reinterpret_cast<char *>(scratch + quantBytes + scaleBytes);
-    if (m % 128 || k % 128) cudaMemsetAsync(inputScales, 0, scaleBytes, stream);
-    const int scaleCols = k / 32;
-    const int tasks = m * scaleCols;
-    QuantizeToMxfp8Kernel<<<(tasks + 63) / 64, 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16 *>(inputData), quantInput, inputScales,
-        m, k, 1, scaleBytes);
-
+    if (rows % 128 || k % 128) cudaMemsetAsync(scratch + quantBytes, 0, scaleBytes, stream);
+    QuantizeToMxfp8Kernel<<<(int(rows) * (k / 32) + 63) / 64, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16 *>(input.cudaData), scratch, scratch + quantBytes,
+        int(rows), k, 1, scaleBytes);
     bool ok = cudaGetLastError() == cudaSuccess;
-    if (ok) {
-        try {
-            Mxfp8DispatchGemm(config, outputData, quantInput, weightData,
-                              inputScales, weightScales, m, n, k, workspace,
-                              workspaceBytes, stream);
-            ok = cudaGetLastError() == cudaSuccess;
-        } catch (const std::exception &error) {
-            if (std::getenv("FASTLLM_CUDA_LINEAR_FP8_TRACE"))
-                std::fprintf(stderr, "MXFP8 fallback: %s\n", error.what());
-            ok = false;
-            FastllmCudaClearThreadError();
-        }
-    }
-    FastllmReleaseCudaTempBuffer(scratch, ownWorkspace);
-    DeviceSync();
+    if (ok) try {
+        Mxfp8DispatchGemm(config, output.cudaData, scratch, weight.cudaData,
+            scratch + quantBytes, weightScales, int(rows), n, k,
+            reinterpret_cast<char *>(scratch + quantBytes + scaleBytes), workspaceBytes, stream);
+        ok = cudaGetLastError() == cudaSuccess;
+    } catch (...) { FastllmCudaClearThreadError(); ok = false; }
     return ok;
 }
 

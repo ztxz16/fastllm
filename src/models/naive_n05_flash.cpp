@@ -505,6 +505,7 @@ void NaiveN05FlashModel::InitParams() {
 std::map<std::string, std::vector<std::pair<std::string, DataType>>>
 NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
     auto result = basellm::GetTensorMap(names);
+    const std::set<std::string> sourceNames(names.begin(), names.end());
     const bool compactNvfp4 = std::any_of(names.begin(), names.end(), [](const std::string &name) {
         return name.find(".mlp.experts.") != std::string::npos &&
                (StringEndWith(name, ".weight_scale") || StringEndWith(name, ".weight_scale_2"));
@@ -538,7 +539,11 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
         } else if (name.find(".mlp.experts.") == std::string::npos &&
                    (weight.GetWeightType(name) == WeightType::LINEAR ||
                     weight.GetWeightType(name) == WeightType::EMBEDDING)) {
-            result[name] = {{name, DataType::BFLOAT16}};
+            // Preserve serialized FP8 projections and their scales. Unquantized
+            // matrices and embeddings retain the established BF16 storage.
+            const bool scaledLinear = weight.GetWeightType(name) == WeightType::LINEAR &&
+                sourceNames.count(name + "_scale_inv");
+            result[name] = {{name, scaledLinear ? DataType::DATA_AUTO_LINEAR : DataType::BFLOAT16}};
         }
     }
     return result;

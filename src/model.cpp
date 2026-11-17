@@ -1747,14 +1747,14 @@ namespace fastllm {
                 }
             } else if (this->dtype == "F8_E8M0" ||
                        (this->dtype == "U8" &&
-                        StringEndWith(this->tensorName, ".weight_scale"))) {
+                        (StringEndWith(this->tensorName, ".weight_scale") ||
+                         StringEndWith(this->tensorName, ".weight_scale_inv")))) {
                 if (dstType != DataType::FLOAT32) {
                     ErrorInFastLLM("SafeTensorItem.CreateBuffer: E8M0 tensor " + this->tensorName + " should be loaded as float32.\n");
                 }
-                // compressed-tensors serializes MXFP4 E8M0 scales as plain U8.
-                // Restrict the U8 interpretation to compressed-tensors'
-                // weight_scale convention; unrelated U8 tensors remain plain
-                // integer data.
+                // MXFP4 and MXFP8 checkpoints can serialize E8M0 scales as
+                // plain U8. Restrict this interpretation to their weight-scale
+                // names; unrelated U8 tensors are not floating-point weights.
                 ClearBuffer();
                 buffer = new uint8_t[(size_t)len * sizeof(float)];
                 std::vector<uint8_t> ori(len);
@@ -1780,7 +1780,8 @@ namespace fastllm {
                 fclose(fi);
                 return;
             } else {
-                ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupport src dtype " + this->dtype + "\n");
+                ErrorInFastLLM("SafeTensorItem.CreateBuffer: unsupported src dtype " + this->dtype +
+                              " for " + this->tensorName + "\n");
             }
             
             int unitSize = 4;
