@@ -7,6 +7,7 @@
 #include "blocks/baseblock.h"
 #include "utils/utils.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cuda_runtime_api.h>
@@ -62,6 +63,81 @@ struct Graph {
         FastllmCudaGraphMemoryPoolRelease(reserved);
     }
 };
+// One long-capacity graph must also handle shorter requests, padding, and
+// dense/sparse transitions. Compare every live row to ordinary eager attention.
+static void TestMixedRegionAttention() {
+    constexpr int rows = 4, heads = 64, kvHeads = 4, capacity = 8192, stride = kvHeads * 192 + 128;
+    Data q(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), live(INT32), sink(FLOAT32), actual;
+    Upload(q, {1, rows, heads * 192}, 73);
+    Upload(iq, {1, rows, 16 * 128}, 79);
+    Upload(iw, {1, rows, 16}, 83);
+    Upload(sink, {heads}, 89);
+    live.Resize({rows}); live.Allocate();
+    std::fill_n((int *)live.cpuData, rows, 3);
+    live.ToDevice(CUDA, {0}, true);
+    std::vector<Data> keys(rows), values(rows), indices(rows);
+    std::vector<FastllmNaiveDecodeScratch> indexScratch(rows);
+    FastllmNaiveDecodeScratch attentionScratch;
+    std::vector<FastllmNaiveIndexerRow> indexRows;
+    for (int i = 0; i < rows; ++i) {
+        keys[i].dataType = values[i].dataType = BFLOAT16;
+        keys[i].UpdateUnitSize(); values[i].UpdateUnitSize();
+        Upload(keys[i], {1, capacity, stride}, 101 + i);
+        Upload(values[i], {1, capacity, kvHeads * 128}, 131 + i);
+        indexRows.push_back({&keys[i], &indexScratch[i], &indices[i], i, capacity});
+    }
+    auto body = [&] {
+        Require(FastllmCudaNaiveBatchDecodeIndexer(iq, iw, live, indexRows, true), "mixed-region Indexer unsupported");
+        std::vector<FastllmNaiveDSARow> descriptors(rows);
+        for (int i = 0; i < rows; ++i) {
+            auto &d = descriptors[i];
+            d.key = keys[i].cudaData; d.value = values[i].cudaData;
+            d.indices = (const int *)indices[i].cudaData;
+            d.liveKeys = (const int *)live.cudaData + i;
+            d.capacity = capacity; d.selectedCount = 2048; d.keyStride = stride;
+        }
+        FastllmCudaNaiveBatchDSADecode(q, sink, descriptors, heads, kvHeads, 192, 128, attentionScratch, actual);
+    };
+    Graph graph; graph.Capture(body);
+    const void *outputPointer = actual.cudaData;
+    double maximumL2 = 0;
+    for (const auto &lengths : {std::vector<int>{1, 255, 2047, 8192}, {2, 256, 2048, 4096},
+                                {0, 257, 2049, 4097}, {8192, 2048, 3, 0}, {255, 1, 2047, 8192}}) {
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), rows * sizeof(int), cudaMemcpyHostToDevice));
+        graph.Run(); const auto got = Read<uint16_t>(actual);
+        Require(actual.cudaData == outputPointer, "mixed-region graph output moved");
+        for (int i = 0; i < rows; ++i) {
+            if (!lengths[i]) {
+                for (int j = 0; j < heads * 128; ++j)
+                    Require(got[(size_t)i * heads * 128 + j] == 0, "inactive graph row was not zero");
+                ++checks; continue;
+            }
+            Data query(BFLOAT16, {1, 1, heads * 192}), indexQuery(BFLOAT16, {1, 1, 16 * 128}),
+                weights(BFLOAT16, {1, 1, 16}), selected, expected;
+            query.FakeFrom(q, (size_t)i * heads * 192 * 2);
+            indexQuery.FakeFrom(iq, (size_t)i * 16 * 128 * 2);
+            weights.FakeFrom(iw, (size_t)i * 16 * 2);
+            keys[i].Resize({1, lengths[i], stride}); values[i].Resize({1, lengths[i], kvHeads * 128});
+            if (lengths[i] > 2048)
+                FastllmCudaNaiveIndexer(indexQuery, weights, keys[i], 16, 128, lengths[i] - 1, 2048, true, selected);
+            FastllmCudaNaiveAttention(query, keys[i], values[i], selected, sink, heads, kvHeads,
+                192, 128, lengths[i] - 1, 0, expected);
+            const auto ref = Read<uint16_t>(expected);
+            double error = 0, norm = 0;
+            for (size_t j = 0; j < ref.size(); ++j) {
+                uint32_t aBits = uint32_t(got[(size_t)i * heads * 128 + j]) << 16, bBits = uint32_t(ref[j]) << 16;
+                float a, b; std::memcpy(&a, &aBits, sizeof(a)); std::memcpy(&b, &bBits, sizeof(b));
+                Require(std::isfinite(a) && std::abs(a - b) <= .004f + .02f * std::abs(b), "mixed-region attention element error");
+                error += double(a - b) * (a - b); norm += double(b) * b;
+            }
+            const double l2 = std::sqrt(error / std::max(norm, 1e-30));
+            Require(l2 < .01, "mixed-region attention L2 error");
+            maximumL2 = std::max(maximumL2, l2); ++checks;
+        }
+    }
+    std::printf("MIXED REGION GRAPH PASS max_l2=%.9g\n", maximumL2);
+}
+
 static void TestAttention(int heads, int dim, int vd, int window, int capacity,
                           const std::vector<int> &lengths, bool fp8, bool withSink = true) {
     Data q(BFLOAT16), iq(BFLOAT16), iw(BFLOAT16), key(BFLOAT16), value(BFLOAT16), sink(FLOAT32),
@@ -681,6 +757,7 @@ int main() {
         for (int rows : {1, 2, 3, 4, 8, 33}) TestIndexerKeyNorm(rows);
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
+        TestMixedRegionAttention();
         for (int batch : {8, 40})
         for (bool sparse : {false, true})
         for (bool fp8 : {false, true}) {

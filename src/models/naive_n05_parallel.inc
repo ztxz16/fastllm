@@ -499,6 +499,11 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         throw AttentionParallelState::UnsupportedServingLayout{};
     if (graphDecode)
         tpDecodeState->mode = tpDecodeState->captured ? TPDecodeState::Replay : TPDecodeState::Warm;
+    if (auto *trace = inference_trace::CurrentForward()) {
+        trace->mode = graphDecode && !tpDecodeState->preparedEager
+            ? (tpDecodeState->captured ? "cuda_graph" : "graph_warmup") : "eager";
+        trace->Mark("graph_capture_reserve_ms");
+    }
     struct PendingSampling {
         const std::vector<int> &devices;
         const std::vector<std::shared_ptr<CudaDecodeSampling>> &samplers;
