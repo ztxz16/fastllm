@@ -104,6 +104,11 @@ class BufferPool {
     // while waiting for another message to release capacity.
     std::vector<Buffer> AcquireBatch(const std::vector<std::pair<int, size_t>> &allocations,
                                     std::shared_ptr<void> credit = {});
+    // Pack one message into a contiguous arena per device. Returned slices
+    // preserve input order, align offsets within the arena, and share its
+    // registration identity and lifetime. No model or tensor layout is assumed.
+    std::vector<Buffer> AcquirePacked(const std::vector<std::pair<int, size_t>> &allocations,
+                                     size_t alignment = 256, std::shared_ptr<void> credit = {});
     void Clear();
     size_t Limit(int device) const;
     void CheckCapacity(const std::vector<std::pair<int, size_t>> &allocations) const;

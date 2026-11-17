@@ -78,6 +78,31 @@ Buffer BufferPool::Acquire(size_t bytes, int device, std::shared_ptr<void> credi
     if (!bytes) return Buffer::Allocate(0, device);
     return std::move(AcquireBatch({{device, bytes}}, std::move(credit)).front());
 }
+std::vector<Buffer> BufferPool::AcquirePacked(const std::vector<std::pair<int, size_t>> &allocations,
+                                             size_t alignment, std::shared_ptr<void> credit) {
+    Require(alignment && !(alignment & (alignment - 1)), "FastKV: invalid buffer alignment");
+    std::vector<std::pair<int, size_t>> plan;
+    std::map<int, size_t> devices;
+    std::vector<std::pair<size_t, size_t>> slices(allocations.size());
+    for (size_t i = 0; i < allocations.size(); ++i) {
+        const auto &item = allocations[i];
+        if (!item.second) continue;
+        auto found = devices.emplace(item.first, plan.size());
+        if (found.second) plan.emplace_back(item.first, 0);
+        const size_t index = found.first->second;
+        const size_t offset = CheckedAdd(plan[index].second, alignment - 1) & ~(alignment - 1);
+        plan[index].second = CheckedAdd(offset, item.second);
+        slices[i] = {index, offset};
+    }
+    // Reserve every device together: callers never hold partial message
+    // allocations while waiting for another message's lease to retire.
+    auto arenas = AcquireBatch(plan, std::move(credit));
+    std::vector<Buffer> result(allocations.size());
+    for (size_t i = 0; i < allocations.size(); ++i)
+        if (allocations[i].second)
+            result[i] = arenas[slices[i].first].Slice(slices[i].second, allocations[i].second);
+    return result;
+}
 std::vector<Buffer> BufferPool::AcquireBatch(const std::vector<std::pair<int, size_t>> &allocations,
                                             std::shared_ptr<void> credit) {
     CheckCapacity(allocations);

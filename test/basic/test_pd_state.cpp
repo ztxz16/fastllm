@@ -854,6 +854,28 @@ static void TestGPUState() {
         catch (const std::runtime_error &) { rejected = true; }
         Check(rejected, "rank writers must reject an oversized message instead of deadlocking");
     }
+    {
+        // A planned export must fit by actual tensor bytes, including across
+        // forked writers. The legacy 64 MiB fallback above remains unchanged.
+        fastkv::BufferPool compactPool(2 << 20);
+        PDStateWriter first(&compactPool), second = first.Fork();
+        Data a(FP4_E2M1, {1, 17, 192}), b(BFLOAT16, {1, 19, 256});
+        for (Data *tensor : {&a, &b}) {
+            tensor->dataDevice = CUDA; tensor->dataDeviceIds = {devices[0]};
+        }
+        first.PlanTensor(a); second.PlanTensor(b); first.Reserve();
+        first.AllocateTensor(a); second.AllocateTensor(b);
+        Check(first.buffers[0].Id() == second.buffers[0].Id() &&
+              second.buffers[0].Offset() >= first.buffers[0].Size(), "planned rank slices overlap");
+        std::vector<uint8_t> source(a.GetBytes(), 0x63), actual(source.size());
+        first.buffers[0].Write(source.data(), 0, source.size());
+        first.buffers[0].Read(actual.data(), 0, actual.size());
+        Check(actual == source, "compact export changed FP4 bytes");
+        source.assign(b.GetBytes(), 0x29); actual.resize(source.size());
+        second.buffers[0].Write(source.data(), 0, source.size());
+        second.buffers[0].Read(actual.data(), 0, actual.size());
+        Check(actual == source, "compact export changed BF16 bytes");
+    }
     fastkv::PrefixCache cache(256 << 20, 0, -2);
     cache.Publish("gpu", {1,2,3}, received);
     auto hit = cache.Find("gpu", {1,2,3,4}, 4);

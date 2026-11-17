@@ -84,44 +84,36 @@ void PDStateWriter::PlanTensor(const Data &data) {
           "invalid export allocation plan");
     const size_t bytes = TensorBytes(data);
     if (!bytes) return;
-    const int device = data.dataDeviceIds.front();
-    const size_t aligned = (plannedOffset + 255) / 256 * 256;
-    if (plannedDevice != device || aligned > plannedCapacity || bytes > plannedCapacity - aligned) {
-        plannedCapacity = std::max(bytes, PDTransferArenaBytes);
-        plannedDevice = device; plannedOffset = 0;
-        plannedArenas.push_back(allocations->plan.size());
-        allocations->plan.emplace_back(device, plannedCapacity);
-    } else plannedOffset = aligned;
-    plannedOffset += bytes;
+    plannedTensors.push_back(allocations->plan.size());
+    allocations->plan.emplace_back(data.dataDeviceIds.front(), bytes);
 }
 void PDStateWriter::Reserve() {
     Check(!allocations->prepared, "export plan already reserved");
-    if (pool) allocations->reserved = pool->AcquireBatch(allocations->plan);
+    if (pool) allocations->reserved = pool->AcquirePacked(allocations->plan);
     else for (const auto &item : allocations->plan)
         allocations->reserved.push_back(fastkv::Buffer::Allocate(item.second, item.first));
     allocations->prepared = true;
 }
 fastkv::Buffer PDStateWriter::Allocate(size_t bytes, int device) {
-    if (!pool && !allocations->prepared) return fastkv::Buffer::Allocate(bytes, device);
+    if (allocations->prepared) {
+        Check(nextTensor < plannedTensors.size(), "unplanned export allocation");
+        auto &reserved = allocations->reserved.at(plannedTensors[nextTensor++]);
+        Check(reserved.Device() == device && reserved.Size() == bytes, "export plan changed");
+        return std::move(reserved);
+    }
+    if (!pool) return fastkv::Buffer::Allocate(bytes, device);
     const size_t aligned = (arenaOffset + 255) / 256 * 256;
     if (!arena.Size() || arena.Device() != device || aligned > arena.Size() || bytes > arena.Size() - aligned) {
         const size_t capacity = std::max(bytes, PDTransferArenaBytes);
-        if (allocations->prepared) {
-            Check(nextArena < plannedArenas.size(), "unplanned export allocation");
-            auto &reserved = allocations->reserved.at(plannedArenas[nextArena++]);
-            Check(reserved.Device() == device && reserved.Size() == capacity, "export plan changed");
-            arena = std::move(reserved);
-        } else {
-            {
-                std::lock_guard<std::mutex> lock(allocations->mutex);
-                allocations->plan.emplace_back(device, capacity);
-                try { pool->CheckCapacity(allocations->plan); }
-                catch (...) { allocations->plan.pop_back(); throw; }
-            }
-            for (;;) {
-                try { arena = pool->Acquire(capacity, device); break; }
-                catch (const fastkv::CapacityBusy &) { pool->WaitForRelease(); }
-            }
+        {
+            std::lock_guard<std::mutex> lock(allocations->mutex);
+            allocations->plan.emplace_back(device, capacity);
+            try { pool->CheckCapacity(allocations->plan); }
+            catch (...) { allocations->plan.pop_back(); throw; }
+        }
+        for (;;) {
+            try { arena = pool->Acquire(capacity, device); break; }
+            catch (const fastkv::CapacityBusy &) { pool->WaitForRelease(); }
         }
         arenaOffset = 0;
     } else arenaOffset = aligned;

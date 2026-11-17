@@ -93,6 +93,8 @@ RDMA 使用 RC QP。Host 数据跨配置的 NIC 分条发送；GPU 数据优先�
 
 `BufferPool::AcquireBatch` 对整条消息的设备/字节计划一次性预留容量，失败不留下部分 lease，避免多个接收互相持有部分缓冲等待。池优先复用同设备上可容纳请求的最小空闲 arena；CUDA 分配、释放和 MR 注销均在池锁之外执行，释放完成之前仍计入物理容量。网络接收复用这个接口，不再用全局分配锁串行执行 CUDA 操作。
 
+`BufferPool::AcquirePacked` 将一条消息的同设备区域紧凑放入一个 arena，按指定对齐设置切片偏移，并按原顺序返回；底层地址对齐沿用 `Buffer::Allocate`。切片共享物理内存、MR 和使用租约，最后一个切片释放后才归还池；不需要知道模型、数据类型或张量布局。不同长度的后续消息可复用同设备上足够大的空闲 arena。物理容量仍包括对齐及空闲 arena，GPU 传输池会占用 KV 池之外的显存；预算是上限，不是预分配量。
+
 `rdma` 模式不可静默降级。`auto` 允许握手双方协商 TCP/RDMA，但不会在传输中途重放失败的操作。TCP 同时支持 Host 和 CUDA buffer，CUDA 当前经主存分块搬运。RDMA GPU 内存需要驱动提供可用的 peer-memory/GPUDirect 支持；它不是单纯安装 libibverbs 就能保证的能力。
 
 `Service::StartAsync()` 的 handler 只负责提交计算，立即返回由 `std::promise<Message>` 驱动的 future。组件的进度线程检查完成状态，计算等待期间不占用通信 worker；生产者拥有自己的执行线程和停止逻辑。不要返回析构时可能等待线程的 `std::async` future。普通 `Start()` 保留同步 handler 语义。

@@ -30,8 +30,9 @@ class PDStateWriter {
     fastkv::Writer metadata;
     std::vector<fastkv::Buffer> buffers;
     void Tensor(const Data &tensor);
-    // Optional two-pass export: plan every rank before reserving the complete
-    // message on the model lane. CapacityBusy must never escape a GPU worker.
+    // Optional two-pass export: compact every rank's tensors into one arena
+    // per device and reserve the complete message on the model lane.
+    // CapacityBusy must never escape a GPU worker.
     void PlanTensor(const Data &tensor);
     void Reserve();
     // Allocate a compact GPU payload directly in an owned transport arena.
@@ -43,9 +44,8 @@ class PDStateWriter {
     fastkv::BufferPool *pool;
     fastkv::Buffer arena;
     size_t arenaOffset = 0;
-    int plannedDevice = -2;
-    size_t plannedCapacity = 0, plannedOffset = 0, nextArena = 0;
-    std::vector<size_t> plannedArenas;
+    size_t nextTensor = 0;
+    std::vector<size_t> plannedTensors;
     struct Allocations;
     std::shared_ptr<Allocations> allocations;
 };

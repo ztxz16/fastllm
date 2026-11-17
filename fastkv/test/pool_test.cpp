@@ -52,6 +52,43 @@ int main() {
         Check(whole.size() == 3, "oversized reuse prevented feasible batch allocation");
         whole.clear();
 
+        // A message shares one registration and allocation, without per-tensor
+        // page rounding. Every slice must retain its credit and private bytes.
+        BufferPool packedPool(12288);
+        Budget packedBudget(12288);
+        auto packed = packedPool.AcquirePacked({{-1, 4097}, {-1, 4097}, {-1, 0}},
+                                               256, packedBudget.Reserve(8194));
+        Check(packed.size() == 3 && !packed[2].Size() && packed[0].Id() == packed[1].Id(),
+              "packed message lost ordering or shared allocation identity");
+        Check(packed[1].Offset() % 256 == 0 && packed[1].Offset() >= packed[0].Size(),
+              "packed message slices overlap or are misaligned");
+        std::memset(packed[0].MutableData(), 0x35, packed[0].Size());
+        std::memset(packed[1].MutableData(), 0x57, packed[1].Size());
+        packed[0].Attachment("packed-mr", [](void *, size_t bytes) {
+            Check(bytes == 12288, "registration must cover the complete physical arena");
+            return std::make_shared<int>(1);
+        });
+        const auto packedId = packed[0].Id();
+        auto retained = packed[1].Slice(3, 37);
+        packed.clear();
+        Fails([&] { packedPool.AcquirePacked({{-1, 1}}); });
+        Check(packedBudget.Used() == 8194 && retained.HasAttachment("packed-mr"),
+              "packed slice lost credit or registration");
+        for (size_t i = 0; i < retained.Size(); ++i)
+            Check(((const uint8_t *)retained.Data())[i] == 0x57, "packed slice was overwritten");
+        retained = {};
+        Check(!packedBudget.Used(), "packed arena retained message credit after retirement");
+        Fails([&] { packedPool.AcquirePacked({{-1, 8193}, {-1, 8193}}); });
+        Fails([&] { packedPool.AcquirePacked({{-1, SIZE_MAX}, {-1, 1}}); });
+        Fails([&] { packedPool.AcquirePacked({{-1, 1}}, 3); });
+        auto reusedPacked = packedPool.AcquirePacked({{-1, 4096}, {-1, 4096}});
+        Check(reusedPacked[0].Id() == packedId && reusedPacked[1].HasAttachment("packed-mr"),
+              "packed arena or MR was not reused after a failed reservation");
+        packedPool.Clear();
+        Check(((const uint8_t *)reusedPacked[0].Data())[0] == 0x35,
+              "pool shutdown invalidated a packed lease");
+        reusedPacked.clear();
+
         // Retiring an MR may block. An independent cached allocation must
         // remain usable, and physical capacity stays charged until retirement.
         BufferPool retiring(16384);
