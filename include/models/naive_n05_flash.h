@@ -263,6 +263,8 @@ namespace fastllm {
             const std::vector<int> &seqLens, std::vector<std::pair<Data *, Data *>> &pastKeyValues,
             const std::vector<GenerationConfig> &configs, const LastTokensManager &lastTokens,
             std::vector<std::vector<float> *> *retLogits, TargetCapture *capture = nullptr);
+        static void RunLocalPrefillRouter(Data &input, Data &weight,
+            const std::vector<int> &rows, int worldRows, int ranks, Data &scratch, Data &output);
         Data RunTarget(const Data &inputIds, const Data &positions,
                        std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,

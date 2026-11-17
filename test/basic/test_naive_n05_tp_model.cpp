@@ -1,4 +1,5 @@
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "models/naive_n05_flash.h"
@@ -10,6 +11,7 @@
 #include "models/mimo_tool_grammar.h"
 #include "utils/utils.h"
 #include <cmath>
+#include <cstring>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
@@ -399,6 +401,64 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
         merge({"mlp.gate_proj.weight", "mlp.up_proj.weight"}, "mlp.gateup_proj.weight");
     }
 }
+// The router is sensitive to GEMM shape: tiny FP32 changes can alter top-k.
+// Compare owner-local routing with the previous world-shard arithmetic,
+// including empty owners, one-row owners, gaps and non-divisible shard sizes.
+struct LocalRouterFixture : NaiveN05FlashModel {
+    using NaiveN05FlashModel::RunLocalPrefillRouter;
+};
+static void VerifyLocalPrefillRouter() {
+    constexpr int width = 4096, experts = 256;
+    std::mt19937 rng(719);
+    std::uniform_real_distribution<float> distribution(-.1f, .1f);
+    std::vector<float> weights(width * experts);
+    for (float &value : weights) value = distribution(rng);
+    Data weight(FLOAT32, {experts, width}, weights);
+    weight.ToDevice(CUDA, {0});
+    int checks = 0;
+    for (auto shape : {std::pair<int, int>{65, 4}, {67, 8}, {513, 4}, {1539, 4}, {6144, 4}}) {
+        const int count = shape.first, ranks = shape.second;
+        std::vector<float> values(size_t(count) * width), reference(size_t(count) * experts);
+        for (float &value : values) value = distribution(rng);
+        Data world(FLOAT32, {count, width}, values);
+        world.ToDevice(CUDA, {0}); ToDataType(world, BFLOAT16);
+        for (int rank = 0; rank < ranks; ++rank) {
+            int first = int64_t(count) * rank / ranks, end = int64_t(count) * (rank + 1) / ranks;
+            Data input(BFLOAT16, {end - first, width}), fp32, result;
+            input.FakeFrom(world, size_t(first) * width * sizeof(uint16_t));
+            ToDataType(input, fp32, FLOAT32);
+            if (!FastllmCudaNaiveRouterFP32(fp32, weight, result)) Linear(fp32, weight, Data(), result);
+            result.ToDevice(CPU);
+            std::memcpy(reference.data() + size_t(first) * experts, result.cpuData, result.GetBytes());
+        }
+        Data scratch(FLOAT32, {(count + ranks - 1) / ranks, width});
+        scratch.ToDevice(CUDA, {0}, false); scratch.Allocate(false);
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            std::vector<int> owners(count);
+            for (int row = 0; row < count; ++row)
+                owners[row] = pattern == 0 ? ranks - 1 : pattern == 1 ? int(row != 0) : (row / 13) % ranks;
+            parallel::RowPartition partition(ranks, owners);
+            for (const auto &rows : partition.localToGlobal) {
+                if (rows.empty()) continue;
+                std::vector<float> selected;
+                for (int row : rows)
+                    selected.insert(selected.end(), values.begin() + size_t(row) * width,
+                                    values.begin() + size_t(row + 1) * width);
+                Data input(FLOAT32, {(int)rows.size(), width}, selected), result;
+                input.ToDevice(CUDA, {0}); ToDataType(input, BFLOAT16);
+                LocalRouterFixture::RunLocalPrefillRouter(input, weight, rows, count, ranks, scratch, result);
+                result.ToDevice(CPU);
+                for (size_t row = 0; row < rows.size(); ++row)
+                    if (std::memcmp(result.cpuData + row * experts * sizeof(float),
+                            reference.data() + size_t(rows[row]) * experts, experts * sizeof(float)))
+                        throw std::runtime_error("local prefill router changed world-shard logits");
+                ++checks;
+            }
+        }
+    }
+    std::cout << "LOCAL PREFILL ROUTER PASS exact checks=" << checks << std::endl;
+}
+
 struct PDGroupRecord {
     fastkv::Message state;
     std::vector<int> tokens;
@@ -5178,6 +5238,9 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
+        if (argc > 2 && std::string(argv[2]) == "local_prefill_router") {
+            VerifyLocalPrefillRouter(); return 0;
+        }
         if (argc > 2 && (std::string(argv[2]) == "attention_dp_serving" ||
                          std::string(argv[2]) == "attention_dp_pipeline")) {
             SetCudaEmbedding(true); SetCudaGraph(true);

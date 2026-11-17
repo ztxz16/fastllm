@@ -700,6 +700,54 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
     return tokens;
 }
 
+void NaiveN05FlashModel::RunLocalPrefillRouter(Data &normed, Data &routerWeight,
+        const std::vector<int> &rows, int worldRows, int epRanks, Data &routerInput, Data &router) {
+#ifdef USE_CUDA
+    const int length = rows.size(), embed_dim = normed.dims.back();
+    const int gpu = normed.dataDeviceIds.at(0);
+    // Keep the existing world-shard GEMM shapes and row positions:
+    // changing FP32 reduction order can change discrete expert routing.
+    // Only this owner's rows are populated/read; no activation gather.
+    const int experts = routerWeight.dims[0];
+    router.dataType = FLOAT32; router.UpdateUnitSize();
+    router.Resize({length, experts}); router.ToDevice(CUDA, {gpu}, false); router.Allocate(false);
+    Data projectedRouter;
+    for (int shard = 0; shard < epRanks; ++shard) {
+        const int first = (int)((int64_t)worldRows * shard / epRanks);
+        const int end = (int)((int64_t)worldRows * (shard + 1) / epRanks);
+        auto begin = std::lower_bound(rows.begin(), rows.end(), first);
+        auto finish = std::lower_bound(begin, rows.end(), end);
+        if (begin == finish) continue;
+        Data input(FLOAT32, {end - first, embed_dim});
+        input.FakeFrom(routerInput, 0);
+        // Fully owned shards are overwritten below; only holes need clearing.
+        if (finish - begin != end - first) FastllmCudaMemset0(input.cudaData, input.GetBytes());
+        auto forEachSpan = [&](auto copy) {
+            for (auto at = begin; at != finish;) {
+                auto next = at + 1;
+                while (next != finish && *next == *(next - 1) + 1) ++next;
+                copy(size_t(at - rows.begin()), size_t(*at - first), (int)(next - at));
+                at = next;
+            }
+        };
+        forEachSpan([&](size_t localRow, size_t shardRow, int count) {
+            Data source(BFLOAT16, {count, embed_dim}), destination;
+            source.FakeFrom(normed, localRow * embed_dim * sizeof(uint16_t));
+            destination.FakeFrom(input, shardRow * embed_dim * sizeof(float));
+            ToDataType(source, destination, FLOAT32);
+        });
+        if (!FastllmCudaNaiveRouterFP32(input, routerWeight, projectedRouter))
+            Linear(input, routerWeight, Data(), projectedRouter);
+        forEachSpan([&](size_t localRow, size_t shardRow, int count) {
+            FastllmCudaCopyFromDeviceToDevice((float *)router.cudaData + localRow * experts,
+                (float *)projectedRouter.cudaData + shardRow * experts, size_t(count) * experts * sizeof(float));
+        });
+    }
+#else
+    throw std::runtime_error("Local prefill routing requires CUDA.");
+#endif
+}
+
 Data NaiveN05FlashModel::RunTarget(
         const Data &inputIds, const Data &positionIds,
         std::vector<std::pair<Data, Data>> &pastKeyValues, const GenerationConfig &config,
@@ -871,19 +919,18 @@ Data NaiveN05FlashModel::RunTarget(
     // Fully data-parallel attention can keep activations local through the
     // consecutive MoE layers, including graph verification. Hybrid attention-TP
     // and unsupported layer layouts retain the existing world-row path.
-    // Uneven prefill retains the original world-shard router GEMM shapes:
-    // changing FP32 reduction order can change discrete expert selection.
-    // Only compact routes return to their attention owners; MoE outputs and
-    // residuals remain local. Empty sources still join the EP dispatch rounds.
-    const bool localPrefillRows = attentionParallel && shardPrefillRouter;
+    // Each owner keeps its real rows, including empty owners. The shared EP
+    // arena and dispatch rounds use the maximum local row count on every rank.
+    const bool localPrefillRows = attentionParallel && fusePrefillNorm && shardPrefillRouter;
     const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
         tpEp8MegaState && (decodeWorkspace || localPrefillRows) && block_cnt > 1 && !moeLayers[0] &&
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
+    const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace &&
+        std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
+            [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
     int maxLocalRows = 0;
     if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
         maxLocalRows = std::max(maxLocalRows, (int)rows.size());
-    const bool redistributePrefillRoutes = localMoeRows && localPrefillRows &&
-        (int64_t)maxLocalRows * epRanks != length;
     bool localHiddenReady = false;
     for (int layer = 0; layer < block_cnt; layer++) {
         const bool localMoe = localMoeRows && moeLayers[layer];
@@ -895,8 +942,7 @@ Data NaiveN05FlashModel::RunTarget(
         // World-row decode reuses the registered attention projection buffer;
         // local EP output needs no peer AllGather registration.
         Data &moeOutput = !localMoe && shardMoe ? buf.projected : buf.moeOutput;
-        const bool worldPrefillRouter = localMoe && redistributePrefillRoutes;
-        const bool shardRouter = worldPrefillRouter || (!localMoe && (shardMoe || shardPrefillRouter));
+        const bool shardRouter = !localMoe && (shardMoe || shardPrefillRouter);
         if (localMoe && !localHiddenReady) {
             for (Data *data : {&hidden, &normed}) {
                 data->dataType = BFLOAT16; data->UpdateUnitSize();
@@ -1980,29 +2026,22 @@ Data NaiveN05FlashModel::RunTarget(
                 routerInput.Resize({rows, embed_dim});
             };
             if (localMoe && !decodeWorkspace) reservePrefillArena();
-            if (worldPrefillRouter) {
-                buf.normed.dataType = BFLOAT16; buf.normed.UpdateUnitSize();
-                buf.normed.Resize({inputIds.dims[1], embed_dim});
-                buf.normed.ToDevice(CUDA, {gpu}, false); buf.normed.Allocate(false);
-                attentionParallel->transfer->Collect(tpRank, normed.cudaData, buf.normed.cudaData,
-                    size_t(embed_dim) * sizeof(uint16_t));
-            }
-            if (!localMoe || length || worldPrefillRouter) {
+            if (!localMoe || length) {
                 Data routedInput;
                 if (shardRouter) {
-                    const int rows = worldPrefillRouter ? inputIds.dims[1] : length;
-                    const int first = (int)((int64_t)rows * tpRank / epRanks);
-                    const int end = (int)((int64_t)rows * (tpRank + 1) / epRanks);
+                    const int first = (int)((int64_t)length * tpRank / epRanks);
+                    const int end = (int)((int64_t)length * (tpRank + 1) / epRanks);
                     routedInput.Resize({end - first, embed_dim});
-                    routedInput.FakeFrom(worldPrefillRouter ? buf.normed : normed,
-                        (size_t)first * embed_dim * normed.unitSize);
+                    routedInput.FakeFrom(normed, (size_t)first * embed_dim * normed.unitSize);
                 }
                 Data &routerSource = shardRouter ? routedInput : normed;
-                const int routerRows = routerSource.Count(0) / embed_dim;
                 Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
+                if (canonicalPrefillRouter)
+                    RunLocalPrefillRouter(normed, routerWeight, attentionParallel->rows.localToGlobal[tpRank],
+                        inputIds.dims[1], epRanks, routerInput, router);
                 hasRouterProbabilities =
-                    FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
-                if (!hasRouterProbabilities) {
+                    !canonicalPrefillRouter && FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
+                if (!canonicalPrefillRouter && !hasRouterProbabilities) {
                     Data localRouterInput;
                     if (shardPrefillRouter) {
                         // Share one backing allocation with the prefill arena;
@@ -2012,7 +2051,7 @@ Data NaiveN05FlashModel::RunTarget(
                     }
                     Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
                     ToDataType(routerSource, fp32Input, DataType::FLOAT32);
-                    const bool prefillRouter = !verifying && !decodeWorkspace && routerRows > 1 &&
+                    const bool prefillRouter = !verifying && !decodeWorkspace && length > 1 &&
                         (!batch || !batch->Decode());
                     if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router))
                         Linear(fp32Input, routerWeight, Data(), router);
@@ -2021,7 +2060,7 @@ Data NaiveN05FlashModel::RunTarget(
                 bool fusedRouter = false;
                 // Small decode/verify batches already include sigmoid in their shared
                 // router projection. Other multi-row paths fuse it with selection.
-                if (!hasRouterProbabilities && routerRows > 1 && router.dataDevice == DataDevice::CUDA) {
+                if (!hasRouterProbabilities && (length > 1 || canonicalPrefillRouter) && router.dataDevice == DataDevice::CUDA) {
                     DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
                                            {"score", &expertScore}, {"gateBias", &routerBias}};
                     FloatDict routerFloats = {{"routeScale", routed_scaling_factor}};
@@ -2039,28 +2078,6 @@ Data NaiveN05FlashModel::RunTarget(
             } else {
                 expertIndex.dataType = INT32; expertIndex.UpdateUnitSize(); expertIndex.Resize({0, num_experts_per_tok});
                 expertScore.dataType = FLOAT32; expertScore.UpdateUnitSize(); expertScore.Resize({0, num_experts_per_tok});
-            }
-            if (worldPrefillRouter) {
-                auto collectRoutes = [&](Data &routes, Data &worldRoutes) {
-                    const int total = inputIds.dims[1];
-                    const size_t first = (int64_t)total * tpRank / epRanks;
-                    const size_t rowBytes = size_t(num_experts_per_tok) * routes.unitSize;
-                    worldRoutes.dataType = routes.dataType; worldRoutes.UpdateUnitSize();
-                    worldRoutes.Resize({total, num_experts_per_tok});
-                    worldRoutes.ToDevice(CUDA, {gpu}, false); worldRoutes.Allocate(false);
-                    AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
-                        (uint8_t *)worldRoutes.cudaData + first * rowBytes, routes.cudaData,
-                        routes.dims[0] * rowBytes), "Naive prefill route copy failed.");
-                    FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, worldRoutes);
-                    routes.Resize({length, num_experts_per_tok});
-                    if (length) {
-                        routes.Allocate(false);
-                        attentionParallel->transfer->Select(tpRank, worldRoutes.cudaData, routes.cudaData, rowBytes);
-                    }
-                };
-                // Reuse generic MoE temporaries, unused by the EP backend.
-                collectRoutes(expertIndex, moeInputTemp);
-                collectRoutes(expertScore, moeOutputTemp);
             }
             normed.Reshape({length, embed_dim});
             if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
