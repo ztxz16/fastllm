@@ -56,15 +56,16 @@ NaiveN05FlashModel::SparseKvState::~SparseKvState() {
 #endif
 
 void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
-    if (!sparseKv || !context->isEnding || context->pastKeyValues.empty() ||
-        !context->pastKeyValues.front().first.kvStorageOwner) return;
+    if (!context->isEnding || context->pastKeyValues.empty()) return;
+    const auto &first = context->pastKeyValues.front().first;
+    if (sparseKv ? !first.kvStorageOwner : (tpPagedCaches.empty() || !first.multiDeviceData)) return;
     auto *detail = inference_trace::CurrentDetail();
     if (detail) detail->Count("finish.layers", context->pastKeyValues.size());
-    inference_trace::DetailSpan finishTrace("finish.request_id_lock", detail);
-    {
-        std::lock_guard<std::mutex> guard(tpRequestMutex);
-        tpRequestIds.erase(&context->pastKeyValues.front().first);
-    }
+    inference_trace::DetailSpan finishTrace("finish.request_state", detail);
+    // History was published before marking the request finished. Retire its
+    // private state now; output queues and statistics outlive the GPU cache.
+    // The later client-side removal can repeat this cleanup safely.
+    OnResponseContextRemoved(context);
     finishTrace.Next("finish.detach_descriptors");
     // Retain the lease until all borrowed descriptors are detached. Forward
     // completion already synchronized the rank streams before publication.

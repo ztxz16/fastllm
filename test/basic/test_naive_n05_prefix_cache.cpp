@@ -65,6 +65,54 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         prefixHistory.clear();
     }
 
+    static void FinishBeforeDrain() {
+        NaiveN05PrefixCacheTestAccess model(4);
+        auto c = model.Request(0);
+        model.Checkpoint(*c, 0, 8192); model.Publish(*c);
+        const int hit = model.WindowHit(*c);
+        Require(hit > 0, "finish fixture has no resident prefix");
+        auto &root = c->pastKeyValues.front().first;
+        auto *pool = model.GetPagedKVCacheManager(0, true);
+        const int sharedPage = root.pageIndex.front();
+        std::vector<int> borrowed{sharedPage};
+        pool->Pick(borrowed); // Another request still borrows this page.
+        auto *leaf = new Data();
+        leaf->isPagedKVCache = true; leaf->pagedKVCacheData = pool;
+        leaf->pageIndex = root.pageIndex;
+        leaf->Resize({1, 8448, 1});
+        root.multiDeviceData = true; root.multiDeviceDatas[0] = leaf;
+        root.dataDeviceIds = {0}; root.isPagedKVCache = true;
+        root.pagedKVCacheData = pool; // Non-owning TP root mirrors the leaf.
+        root.Resize({1, 8448, 1});
+        model.tpRequestIds[&root] = 77;
+        c->inputTokens = 8448; c->cacheLen = 128; c->curTokens = 2;
+        c->resultTokenQueue.push(11); c->resultTokenQueue.push(12);
+        c->resultLogits.push(new std::vector<float>{.25f, .75f});
+        const int free = pool->FreePageCount();
+        model.OnResponseContextFinished(c.get());
+        Require(pool->FreePageCount() == free && root.multiDeviceData,
+                "unfinished request released its KV");
+        c->isEnding = true;
+        model.OnResponseContextFinished(c.get());
+        Require(pool->FreePageCount() == pool->maxPages - 1 && pool->pageRefCount[sharedPage] == 1,
+                "finished request pinned pages or released a shared prefix twice");
+        Require(!root.multiDeviceData && root.multiDeviceDatas.empty() && root.pageIndex.empty() && root.dims.empty(),
+                "finished request retained stale cache descriptors");
+        Require(!model.tpRequestIds.count(&root) && !model.activePrefixes.count(&root),
+                "finished request retained private state");
+        Require(model.WindowHit(*c) == hit, "finish discarded published prefix history");
+        Require(c->inputTokens == 8448 && c->cacheLen == 128 && c->curTokens == 2 &&
+                c->resultTokenQueue.size() == 2 && c->resultTokenQueue.front() == 11 &&
+                c->resultLogits.size() == 1 && c->resultLogits.front()->at(1) == .75f,
+                "finish changed pending output or statistics");
+        model.OnResponseContextFinished(c.get());
+        model.OnResponseContextRemoved(c.get());
+        c.reset();
+        Require(pool->pageRefCount[sharedPage] == 1, "client drain released a shared page twice");
+        pool->ReleasePageIndex(sharedPage);
+        Require(pool->FreePageCount() == pool->maxPages, "finish/drain leaked pages");
+    }
+
     static void BudgetPreviewOwnership() {
         NaiveN05PrefixCacheTestAccess model(4);
         auto c = model.Request(0);
@@ -418,6 +466,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
 
 int main() {
     try {
+        fastllm::NaiveN05PrefixCacheTestAccess::FinishBeforeDrain();
         fastllm::NaiveN05PrefixCacheTestAccess::BudgetPreviewOwnership();
         fastllm::NaiveN05PrefixCacheTestAccess::PublicationHashCollision();
         fastllm::NaiveN05PrefixCacheTestAccess::PreviewHashCollision();
