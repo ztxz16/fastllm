@@ -156,6 +156,10 @@ struct NaiveN05PrefixCacheTestAccess {
 #endif
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
+    static void SamplingIdentity(NaiveN05FlashModel &model, const Data *root, uint64_t identity) {
+        std::lock_guard<std::mutex> guard(model.tpRequestMutex);
+        model.tpSamplingRequestIds[root] = identity;
+    }
     static void SetDraftDevices(NaiveN05FlashModel &model, int ranks) {
         model.tpDevices.resize(ranks);
         std::iota(model.tpDevices.begin(), model.tpDevices.end(), 0);
@@ -3208,6 +3212,113 @@ class Fixture : public NaiveN05FlashModel {
                   << " relative=" << largestLogitRelative << std::endl;
     }
 
+    void AttentionDPPipelineChecks(int groups) {
+        if (!SupportsDecodePipeline()) throw std::runtime_error("DP pipeline not prepared");
+        std::exception_ptr error;
+        std::atomic<bool> ready{false};
+        std::vector<std::vector<int>> reference;
+        int pipelined = 0;
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        const int captures = verifyGraphCaptures;
+#endif
+        mainLoop = new std::thread([&] {
+            while (!ready.load()) std::this_thread::yield();
+            try {
+                for (bool overlap : {false, true}) {
+                    const int count = groups * 2 + 1;
+                    std::vector<std::unique_ptr<ResponseContext>> contexts(count);
+                    GenerationConfig cfg;
+                    cfg.top_k = weight["lm_head.weight"].dims[0]; cfg.top_p = .95f;
+                    cfg.temperature = .4f; cfg.repeat_penalty = 1; cfg.output_token_limit = 256;
+                    auto create = [&](int row) {
+                        auto &c = contexts[row]; c.reset(new ResponseContext());
+                        c->Init(block_cnt, dataType, kvCacheDataType);
+                        // Use the normal admission allocator while keeping the
+                        // owner (and its sampler salt) identical in both passes.
+                        while (AllocatePrefillGroup() != (row + groups - 1) % groups) {}
+                        OnResponseContextCreated(c.get());
+                        NaiveN05GraphTestAccess::SamplingIdentity(*this, &c->pastKeyValues[0].first, row + 1);
+                        const int past = 4088 + row % 3;
+                        std::vector<float> ids(past), positions(past);
+                        for (int i = 0; i < past; ++i) { ids[i] = (i * 7 + row) % 251; positions[i] = i; }
+                        Forward(Data(FLOAT32, {1, past}, ids), Data(), Data(FLOAT32, {1, past}, positions),
+                            c->pastKeyValues, cfg);
+                        c->generationConfig = cfg; c->currentTokens = {1};
+                        c->intParams["promptLen"] = past; c->intParams["index"] = 0;
+                    };
+                    for (int row = 0; row < count; ++row) create(row);
+                    size_t result = 0;
+                    for (int segment = 0; segment < 6; ++segment) {
+                        if (segment == 2) { OnResponseContextRemoved(contexts[1].get()); contexts[1].reset(); }
+                        if (segment == 3) create(1);
+                        std::vector<ResponseContext *> active;
+                        for (int row = 0; row < count; ++row)
+                            if (contexts[row] && (segment != 4 || row % groups == 0)) active.push_back(contexts[row].get());
+                        if (segment % 2) std::reverse(active.begin(), active.end());
+                        int step = 0;
+                        auto publish = [&](const std::vector<int> &tokens) {
+                            if (tokens.size() != active.size()) throw std::runtime_error("DP pipeline token count");
+                            if (!overlap) reference.push_back(tokens);
+                            else if (tokens != reference.at(result)) throw std::runtime_error("DP pipeline changed sampled tokens");
+                            ++result; ++step;
+                            for (size_t row = 0; row < active.size(); ++row) {
+                                auto *c = active[row]; c->currentTokens[0] = tokens[row]; ++c->intParams["index"];
+                            }
+                        };
+                        while (step < 20) {
+                            auto pipeline = overlap ? CreateDecodePipeline(active) : nullptr;
+                            if (pipeline && pipeline->Submit(0)) {
+                                int slot = 0;
+                                for (;;) {
+                                    const bool next = step + 1 < 20 && pipeline->Submit(1 - slot, slot);
+                                    publish(pipeline->Collect(slot)); ++pipelined;
+                                    if (!next) { pipeline->Drain(); break; }
+                                    slot = 1 - slot;
+                                }
+                            } else {
+                                std::vector<float> ids;
+                                std::vector<Data> positions;
+                                std::vector<Data *> pos;
+                                std::vector<std::pair<Data *, Data *>> kv;
+                                std::vector<GenerationConfig> configs(active.size(), cfg);
+                                std::vector<int> lengths(active.size(), 1);
+                                for (auto *c : active) {
+                                    ids.push_back(c->currentTokens[0]);
+                                    positions.emplace_back(FLOAT32, std::vector<int>{1, 1},
+                                        std::vector<float>{float(c->intParams["promptLen"] + c->intParams["index"])});
+                                    for (auto &pair : c->pastKeyValues) kv.emplace_back(&pair.first, &pair.second);
+                                }
+                                for (auto &position : positions) pos.push_back(&position);
+                                publish(ForwardBatch(active.size(), Data(FLOAT32, {1, int(ids.size())}, ids), {}, pos,
+                                    lengths, kv, configs, LastTokensManager()));
+                            }
+                            // At a drained boundary both root and local descriptors
+                            // must describe exactly the published history.
+                            for (auto *c : active) for (int layer = 0; layer < block_cnt; ++layer) {
+                                const int past = c->intParams["promptLen"] + c->intParams["index"];
+                                const int length = layer == 1 ? std::min(past, 127) : past;
+                                for (Data *root : {&c->pastKeyValues[layer].first, &c->pastKeyValues[layer].second}) {
+                                    if (root->dims[1] != length) throw std::runtime_error("DP pipeline root length");
+                                    for (auto &local : root->multiDeviceDatas)
+                                        if (local.second->dims[1] != length) throw std::runtime_error("DP pipeline local length");
+                                }
+                            }
+                        }
+                    }
+                    for (auto &c : contexts) if (c) OnResponseContextRemoved(c.get());
+                }
+            } catch (...) { error = std::current_exception(); }
+        });
+        ready.store(true); mainLoop->join(); delete mainLoop; mainLoop = nullptr;
+        if (error) std::rethrow_exception(error);
+        if (pipelined < 80) throw std::runtime_error("DP pipeline coverage missing");
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+        if (verifyGraphCaptures != captures) throw std::runtime_error("DP pipeline recaptured during churn");
+#endif
+        std::cout << "ATTENTION DP PIPELINE PASS dp=" << groups << " pipelined=" << pipelined
+                  << " exact_steps=" << reference.size() << std::endl;
+    }
+
     void AttentionDPServingPlanChecks(int groups) {
         // Called after the direct-forward serving checks. Exercise the trusted
         // scheduler path against identical graphs with full validation forced.
@@ -4998,19 +5109,26 @@ int main(int argc, char **argv) {
         SetThreads(4);
         SetDeviceMap({{"cuda:0", 1}});
         FastllmCudaSetDevice(0);
-        if (argc > 2 && std::string(argv[2]) == "attention_dp_serving") {
+        if (argc > 2 && (std::string(argv[2]) == "attention_dp_serving" ||
+                         std::string(argv[2]) == "attention_dp_pipeline")) {
             SetCudaEmbedding(true); SetCudaGraph(true);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
             failGraphDevice = ranks - 1;
             failVerifyInstantiate = argc > 4 && std::string(argv[4]) == "failinstantiate";
 #endif
             Fixture fixture(ranks, false, true, true, true);
-            fixture.SetKVCacheDataType(FP8_E4M3);
+            const bool pipeline = std::string(argv[2]) == "attention_dp_pipeline";
+            const std::string kvType = pipeline && argc > 4 ? argv[4] : "fp8";
+            if (kvType != "bf16" && kvType != "fp8")
+                throw std::invalid_argument("DP pipeline KV type must be bf16 or fp8");
+            fixture.SetKVCacheDataType(kvType == "bf16" ? BFLOAT16 : FP8_E4M3);
             fixture.AttentionDPServingChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
             if (!failVerifyInstantiate)
 #endif
                 fixture.AttentionDPServingPlanChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
+            if (pipeline)
+                fixture.AttentionDPPipelineChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_ring") {

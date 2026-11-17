@@ -17770,18 +17770,53 @@ __global__ void FastllmSamplingIdsToFloatKernel(
     }
 }
 
-bool FastllmCudaTopKTopPSamplingToDevice(
+__global__ void FastllmAdvanceMappedDecodeInputKernel(float *storage, int stride, int rows,
+        const float *const *tokenRows, float *localPositions, int *localLengths, int localRows) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    auto *lengths = (int *)(storage + 2 * stride);
+    if (row < rows && lengths[row] > 0) {
+        storage[row] = *tokenRows[row];
+        storage[stride + row] += 1.0f;
+        ++lengths[row];
+    }
+    if (row < localRows && localLengths[row] > 0) {
+        localPositions[row] += 1.0f;
+        ++localLengths[row];
+    }
+}
+bool FastllmCudaAdvanceMappedDecodeInput(void *storage, int stride, int rows,
+        const float *const *tokenRows, float *localPositions, int *localLengths, int localRows) {
+    if (!storage || !tokenRows || !localPositions || !localLengths ||
+        rows <= 0 || stride < rows || localRows <= 0 || localRows > rows) return false;
+    FastllmAdvanceMappedDecodeInputKernel<<<(rows + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (float *)storage, stride, rows, tokenRows, localPositions, localLengths, localRows);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// Reserve a disjoint Philox interval for each token; rejection sampling may
+// consume several draws. Request counters live on device and advance on replay.
+__global__ void FastllmSamplingCommitKernel(const int *input, float *output,
+                                           uint64_t *offsets, int batch) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < batch) {
+        output[row] = (float)input[row];
+        offsets[row] += uint64_t(1) << 32;
+    }
+}
+
+bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,
                                   float *topPArr,
                                   int *penaltyIds, float *penaltyFactors,
                                   int penaltyTokens,
                                   int *output, float *floatOutput,
-                                  int batch, int vocabSize) {
+                                  int batch, int vocabSize,
+                                  uint64_t *requestSeeds, uint64_t *requestOffsets) {
     if (logits == nullptr || probs == nullptr || temperatures == nullptr ||
         topKArr == nullptr || topPArr == nullptr || output == nullptr ||
         floatOutput == nullptr || batch <= 0 || vocabSize <= 0 ||
-        penaltyTokens < 0 ||
+        penaltyTokens < 0 || (bool(requestSeeds) != bool(requestOffsets)) ||
         (penaltyTokens > 0 &&
          (penaltyIds == nullptr || penaltyFactors == nullptr))) {
         return false;
@@ -17795,17 +17830,19 @@ bool FastllmCudaTopKTopPSamplingToDevice(
     FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(
         logits, probs, temperatures, vocabSize);
 
-    static thread_local std::mt19937 rng(std::random_device{}());
-    uint64_t seed = rng();
-    cudaError_t samplingState =
-        flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
-        probs, topKArr, topPArr, output,
-        (bool *)floatOutput,
-        (int *)nullptr,
-        (uint32_t)batch, (int)0, 0.0f,
-        (uint32_t)vocabSize, false,
-        (uint64_t *)nullptr, seed,
-        (uint64_t *)nullptr, 0, 0);
+    cudaError_t samplingState;
+    if (requestSeeds) {
+        samplingState = flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0, true>(
+            probs, topKArr, topPArr, output, (bool *)floatOutput, (int *)nullptr,
+            (uint32_t)batch, 0, 0.0f, (uint32_t)vocabSize, false,
+            requestSeeds, 0, requestOffsets, 0, 0);
+    } else {
+        static thread_local std::mt19937 rng(std::random_device{}());
+        samplingState = flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0>(
+            probs, topKArr, topPArr, output, (bool *)floatOutput, (int *)nullptr,
+            (uint32_t)batch, 0, 0.0f, (uint32_t)vocabSize, false,
+            (uint64_t *)nullptr, rng(), (uint64_t *)nullptr, 0, 0);
+    }
     if (samplingState != cudaSuccess) {
         printf("FastllmCudaTopKTopPSamplingToDevice: launch failed: %s\n",
                cudaGetErrorString(samplingState));
@@ -17814,9 +17851,11 @@ bool FastllmCudaTopKTopPSamplingToDevice(
     }
 
     int threads = 256;
-    FastllmSamplingIdsToFloatKernel<<<(batch + threads - 1) / threads,
-                                      threads>>>(
-        output, floatOutput, batch);
+    if (requestOffsets)
+        FastllmSamplingCommitKernel<<<(batch + threads - 1) / threads, threads>>>(
+            output, floatOutput, requestOffsets, batch);
+    else FastllmSamplingIdsToFloatKernel<<<(batch + threads - 1) / threads, threads>>>(
+            output, floatOutput, batch);
     cudaError_t state = cudaGetLastError();
     if (state != cudaSuccess) {
         printf("FastllmCudaTopKTopPSamplingToDevice: launch failed: %s\n",
@@ -17825,6 +17864,15 @@ bool FastllmCudaTopKTopPSamplingToDevice(
         return false;
     }
     return true;
+}
+
+bool FastllmCudaTopKTopPSamplingToDevice(float *logits, float *probs,
+        float *temperatures, int *topKArr, float *topPArr,
+        int *penaltyIds, float *penaltyFactors, int penaltyTokens,
+        int *output, float *floatOutput, int batch, int vocabSize) {
+    return FastllmCudaTopKTopPSamplingToDeviceWithRng(logits, probs, temperatures,
+        topKArr, topPArr, penaltyIds, penaltyFactors, penaltyTokens,
+        output, floatOutput, batch, vocabSize, nullptr, nullptr);
 }
 
 bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,

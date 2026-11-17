@@ -104,6 +104,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         Data servingOutput;
         if (ForwardAttentionParallelServing(inputIds, positions, kv, config, selection, batch, servingOutput))
             return servingOutput;
+        AssertInFastLLM(state.servingPadded || !tpServingState || tpServingState->pipelineOutputSlot < 0,
+            "Naive DP pipeline lost its admitted serving graph");
     }
     // An intervening prefill, verification or eager fallback may change cache
     // descriptors or shared graph storage. Revalidate on the next serving step.
@@ -323,6 +325,33 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (state.servingPadded && !graphDecode)
         throw AttentionParallelState::UnsupportedServingLayout{};
     if (!graphDecode && tpServingState && tpServingState->preparing) return Data();
+    std::vector<std::vector<CudaDecodeSampling::Request>> samplingRequests;
+    bool asyncSampling = graphDecode && state.servingPadded && ownedDecode &&
+        distributedSampling && !saveHistoryChat && tpServingState && tpServingState->pipelineReady &&
+        state.sampling.size() == (size_t)attentionDP;
+    if (asyncSampling) {
+        samplingRequests.resize(attentionDP);
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        for (int group = 0; group < attentionDP && asyncSampling; ++group) {
+            if (samplingRows[group].empty()) continue;
+            if (!state.sampling[group] || !state.sampling[group]->Supports(samplingRows[group].size())) {
+                asyncSampling = false; break;
+            }
+            for (int seq : samplingRows[group]) {
+                const auto &cfg = batch->configs[seq];
+                auto identity = tpSamplingRequestIds.find(&key(seq, 0));
+                if (identity == tpSamplingRequestIds.end() || cfg.tool_call_token_mask ||
+                    cfg.tool_call_grammar || !cfg.tool_call_allowed_token_ids.empty()) {
+                    asyncSampling = false; break;
+                }
+                samplingRequests[group].push_back({identity->second, (uint64_t)key(seq, 0).dims[1] + 1,
+                    cfg.temperature, cfg.top_p, std::max(1, cfg.top_k)});
+            }
+        }
+    }
+    const int samplingSlot = std::max(0, tpServingState ? tpServingState->pipelineOutputSlot : -1);
+    const bool pipelined = tpServingState && tpServingState->pipelineOutputSlot >= 0;
+    AssertInFastLLM(!pipelined || asyncSampling, "Naive DP pipeline sampling admission changed");
     // Ring candidates use the same batched SWA/commit kernels as world TP.
     // A cache without the candidate tail retains chronological verification;
     // CommitTargetCaches restores its ring after accepting the chosen rows.
@@ -398,7 +427,9 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                     (float *)joined.cudaData + range.first, size_t(vocab) * sizeof(float),
                     logits.cudaData, bytes, bytes, outputRows), "Naive attention DP logits gather failed");
             }
-            FastllmCudaSyncCurrentThreadStream();
+            if (asyncSampling)
+                FastllmCudaEventRecordCurrentThread(tpDecodeState->ranks[rank]->storage->gatherReady);
+            else FastllmCudaSyncCurrentThreadStream();
         }
     };
     if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured && !tpDecodeState->disabled &&
@@ -458,7 +489,34 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         throw AttentionParallelState::UnsupportedServingLayout{};
     if (graphDecode)
         tpDecodeState->mode = tpDecodeState->captured ? TPDecodeState::Replay : TPDecodeState::Warm;
-    state.runtime.Run(forwardRank);
+    struct PendingSampling {
+        const std::vector<int> &devices;
+        const std::vector<std::shared_ptr<CudaDecodeSampling>> &samplers;
+        bool active = false;
+        ~PendingSampling() {
+            // A partially submitted forward must finish before the scheduler
+            // can retire its KV or reuse logits after an exception.
+            if (active) {
+                for (int device : devices) { FastllmCudaSetDevice(device); ForceDeviceSync(); }
+                for (const auto &sampler : samplers) if (sampler) sampler->Discard();
+            }
+        }
+    } pendingSampling{tpDevices, state.sampling};
+    if (asyncSampling) {
+        pendingSampling.active = true;
+        state.runtime.Enqueue(forwardRank);
+        state.runtime.Enqueue([&](int rank, int) {
+            if (topology.AttentionRank(rank) != 0) return;
+            const int group = topology.AttentionOwner(rank);
+            if (samplingRows[group].empty()) return;
+            // Every rank writes vocabulary columns into every sampling owner.
+            // Waiting only for this owner's model would race peer stores.
+            for (const auto &producer : tpDecodeState->ranks)
+                FastllmCudaCurrentThreadStreamWaitEvent(producer->storage->gatherReady);
+            AssertInFastLLM(state.sampling[group]->Submit(samplingRequests[group], samplingSlot),
+                "Naive attention DP sampling admission changed after submission");
+        });
+    } else state.runtime.Run(forwardRank);
     if (graphDecode) {
         tpDecodeState->warmed = true;
         if (!std::all_of(tpDecodeState->ranks.begin(), tpDecodeState->ranks.end(),
@@ -555,6 +613,21 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     if (isIntermediateChunkedPrefill || distributedVerification) return Data();
     if (distributedSampling) {
+        if (asyncSampling) {
+            if (!pipelined) {
+                selection->sampledTokens.resize(liveRows);
+                for (int group = 0; group < attentionDP; ++group) {
+                    if (samplingRows[group].empty()) continue;
+                    auto tokens = state.sampling[group]->Collect(samplingSlot);
+                    for (size_t row = 0; row < tokens.size(); ++row)
+                        selection->sampledTokens[samplingRows[group][row]] = tokens[row];
+                }
+            }
+            // In pipeline mode TargetDecodePipeline owns collection/draining;
+            // do not allocate an unused host result on each submitted step.
+            pendingSampling.active = false;
+            return Data();
+        }
         selection->sampledTokens.resize(liveRows);
         state.runtime.Run([&](int rank, int) {
             if (topology.AttentionRank(rank) != 0) return;

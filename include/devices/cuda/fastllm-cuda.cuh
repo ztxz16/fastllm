@@ -1946,6 +1946,19 @@ bool FastllmCudaDFlashMergeTopK(
                                   int ranks, int localRows,
                                   int firstRow, int outputRows,
                                   int topk);
+// Token rows point to local/UVA peer results. Zero live lengths mark padding.
+bool FastllmCudaAdvanceMappedDecodeInput(void *storage, int stride, int rows,
+        const float *const *tokenRows, float *localPositions, int *localLengths, int localRows);
+// Per-request seeds/counters preserve sampling across batch reorder and replay.
+bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr,
+                                  float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors,
+                                  int penaltyTokens,
+                                  int *output, float *floatOutput,
+                                  int batch, int vocabSize,
+                                  uint64_t *requestSeeds, uint64_t *requestOffsets);
 bool FastllmCudaTopKTopPSamplingToDevice(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,

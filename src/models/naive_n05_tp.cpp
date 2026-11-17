@@ -590,6 +590,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         if (!FastllmCudaNaiveDecodeGraphSupported()) return;
         auto storage = std::make_shared<TPDecodeState::Storage>();
         storage->maxRows = maxRows;
+        if (attentionParallel) storage->gatherReady = FastllmCudaEventCreate();
         storage->hostCache.resize((size_t)block_cnt * maxLocalRows * (HasSeparateIndexer() ? 8 : 4));
         auto allocate = [&](Data &data, DataType type, int elements) {
             data.dataType = type;
@@ -736,9 +737,203 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         state.active = false;
         if (state.captured && !state.disabled) ++captured;
     }
+    bool dpPipelineReady = false;
+    if (captured && attentionParallel && attentionParallel->samplingCapacity) {
+        auto &dp = *attentionParallel;
+        dp.sampling.resize(attentionDP);
+        std::vector<int> buckets;
+        for (int rows : serving->batchBuckets) buckets.push_back(rows / attentionDP);
+        dp.runtime.Run([&](int rank, int) {
+            if (dp.runtime.Layout().AttentionRank(rank) != 0) return;
+            const int group = dp.runtime.Layout().AttentionOwner(rank);
+            auto &logits = dp.samplingLogits[group];
+            logits.Resize({dp.samplingCapacity, weight["lm_head.weight"].dims[0]});
+            auto sampler = std::make_shared<CudaDecodeSampling>();
+            if (sampler->Prepare(logits, buckets, 0, true)) dp.sampling[group] = std::move(sampler);
+        });
+        dpPipelineReady = std::all_of(dp.sampling.begin(), dp.sampling.end(),
+            [](const auto &sampler) { return bool(sampler); });
+        if (dpPipelineReady) dp.runtime.Run([&](int rank, int device) {
+            auto &storage = *serving->graphs.begin()->second->ranks[rank]->storage;
+            for (auto &table : storage.decodeTokenRows) {
+                table.dataType = INT32; table.Resize({int(maxRows * sizeof(void *) / sizeof(int))});
+                table.ToDevice(CUDA, {device}, false); table.Allocate(true);
+            }
+        });
+        // Both token slots reuse the original model graph. Only their small
+        // input pointer tables differ; no duplicate model graph is retained.
+    }
+    size_t pipelineShapes = 0;
+    for (const auto &entry : serving->graphs) {
+        const auto &state = *entry.second;
+        bool ready = dpPipelineReady && state.captured && !state.disabled;
+        for (const auto &rank : state.ranks)
+            ready = ready && rank->exec && rank->storage->gatherReady;
+        pipelineShapes += ready;
+    }
+    serving->pipelineReady = pipelineShapes != 0;
+    if (attentionParallel) printf("[Naive decode pipeline] prepared %zu/%zu shapes across all DP ranks; unavailable shapes use ordinary decoding.\n",
+           pipelineShapes, serving->graphs.size());
     printf("[Naive CUDA Graph] prepared %zu/%zu shapes, batch <= %d, shared Indexer scratch %.2f MiB/GPU. Serving only replays prepared shapes.\n",
         captured, serving->graphs.size(), maxRows, scoreElements * 4 / 1048576.0);
     fflush(stdout);
+#endif
+}
+
+#ifdef USE_CUDA
+struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
+    NaiveN05FlashModel &model;
+    std::vector<std::pair<Data *, Data *>> caches;
+    std::vector<GenerationConfig> configs;
+    std::vector<int> lengths, handles;
+    TargetBatch batch;
+    Data ids, positions;
+    std::shared_ptr<TPServingState> serving;
+    std::vector<std::vector<int>> samplingRows;
+    bool failedSubmission = false;
+    TargetDecodePipeline(NaiveN05FlashModel &m, const std::vector<ResponseContext *> &contexts)
+        : model(m), lengths(contexts.size(), 1), batch{caches, configs, lengths, m.block_cnt},
+          ids(FLOAT32, {1, (int)contexts.size()}), positions(FLOAT32, {1, (int)contexts.size()}),
+          serving(m.tpServingState) {
+        ids.Allocate(); positions.Allocate();
+        for (size_t row = 0; row < contexts.size(); ++row) {
+            auto *c = contexts[row];
+            configs.push_back(c->generationConfig);
+            if (inference_trace::Enabled()) {
+                for (const auto &entry : m.responseContextDict.dicts)
+                    if (entry.second == c) { handles.push_back(entry.first); break; }
+            }
+            ((float *)ids.cpuData)[row] = (float)c->currentTokens[0];
+            ((float *)positions.cpuData)[row] = (float)(c->intParams.at("promptLen") + c->intParams.at("index"));
+            for (auto &pair : c->pastKeyValues) caches.emplace_back(&pair.first, &pair.second);
+        }
+    }
+    ~TargetDecodePipeline() override { Drain(); }
+    bool PrepareAttention(int inputSlot) {
+        auto &dp = *model.attentionParallel;
+        auto &plan = dp.servingPlan;
+        if (!serving || !serving->sealed || !plan.valid ||
+            plan.kvType != model.kvCacheDataType || model.saveHistoryChat ||
+            serving->generation != FastllmGetNcclGeneration()) return false;
+        {
+            std::lock_guard<std::mutex> guard(model.tpRequestMutex);
+            if (!plan.Matches(batch, model.tpCacheEpoch.load(std::memory_order_relaxed),
+                    model.tpRequestIds, batch.Size())) return false;
+        }
+        if (!plan.CanAppend()) return false;
+        auto graph = plan.graph.lock();
+        if (!graph || !graph->captured || graph->disabled) return false;
+        for (const auto &rank : graph->ranks)
+            if (!rank->exec || !rank->storage->decodeTokenRows[0].cudaData ||
+                !rank->storage->decodeTokenRows[1].cudaData) return false;
+        // Cross-page and graph-region changes leave the chain. The ordinary
+        // serving path reserves/rebinds an existing graph, never recaptures.
+        for (const auto &request : plan.requests) {
+            const int next = request.length + 1;
+            if (next > graph->capacity || next == 2048 ||
+                (next <= 256) != (graph->capacity <= 256) ||
+                (next < 2048) != (graph->capacity < 2048)) return false;
+        }
+        if (inputSlot < 0) {
+            samplingRows.assign(model.attentionDP, {});
+            for (int group = 0; group < model.attentionDP; ++group) {
+                for (int seq : dp.servingGroups[group].sequenceIndices)
+                    if (seq < batch.Size()) samplingRows[group].push_back(seq);
+                if (!samplingRows[group].empty() &&
+                    (!dp.sampling[group] || !dp.sampling[group]->Supports(samplingRows[group].size()))) return false;
+            }
+            std::vector<const float *> pointers[2];
+            const int capacity = graph->ranks.front()->storage->maxRows;
+            for (int slot = 0; slot < 2; ++slot) {
+                pointers[slot].resize(capacity);
+                for (int group = 0; group < model.attentionDP; ++group)
+                    for (size_t row = 0; row < samplingRows[group].size(); ++row)
+                        pointers[slot][samplingRows[group][row]] = dp.sampling[group]->DeviceTokens(slot) + row;
+            }
+            // Rebinding happens only at a drained chain boundary. Tables have
+            // startup-owned addresses shared by all prepared model shapes.
+            dp.runtime.Run([&](int rank, int) {
+                for (int slot = 0; slot < 2; ++slot)
+                    FastllmCudaCopyFromHostToDevice(graph->ranks[rank]->storage->decodeTokenRows[slot].cudaData,
+                        pointers[slot].data(), capacity * sizeof(void *));
+            });
+        }
+        return true;
+    }
+    bool Submit(int outputSlot, int inputSlot = -1) override {
+        LogitsSelection selection;
+        selection.cudaSampling = true;
+        if (!PrepareAttention(inputSlot)) return false;
+        // All admission precedes the first CUDA submission. From here an error
+        // is fatal to the request; replaying eager could duplicate a KV write.
+        serving->pipelineInputSlot = inputSlot;
+        serving->pipelineOutputSlot = outputSlot;
+        struct Reset {
+            TPServingState &s;
+            ~Reset() { s.pipelineInputSlot = s.pipelineOutputSlot = -1; }
+        } reset{*serving};
+        std::unique_ptr<inference_trace::Step> step;
+        std::unique_ptr<inference_trace::Forward> trace;
+        if (inference_trace::Enabled()) {
+            step.reset(new inference_trace::Step());
+            step->submitted = true; step->phase = "decode";
+            step->handles = handles; step->lengths = lengths;
+            for (int row = 0; row < batch.Size(); ++row) step->contextBefore.push_back(batch.Key(row, 0).dims[1]);
+            trace.reset(new inference_trace::Forward(*step, lengths, step->contextBefore));
+        }
+        std::vector<std::pair<Data, Data>> unused;
+        failedSubmission = true;
+        model.ForwardTensorParallel(ids, positions, unused, configs[0], nullptr, &selection, &batch);
+        failedSubmission = false;
+        for (int row = 0; row < batch.Size(); ++row) ++((float *)positions.cpuData)[row];
+        return true;
+    }
+    std::vector<int> Collect(int slot) override {
+        std::vector<int> tokens(batch.Size());
+        for (int group = 0; group < model.attentionDP; ++group) {
+            if (samplingRows[group].empty()) continue;
+            auto local = model.attentionParallel->sampling[group]->Collect(slot);
+            AssertInFastLLM(local.size() == samplingRows[group].size(), "DP sampling result shape changed");
+            for (size_t row = 0; row < local.size(); ++row) tokens[samplingRows[group][row]] = local[row];
+        }
+        return tokens;
+    }
+    void Drain() override {
+        if (failedSubmission) {
+            for (int device : model.tpDevices) { FastllmCudaSetDevice(device); ForceDeviceSync(); }
+            failedSubmission = false;
+        }
+        if (model.attentionParallel)
+            for (const auto &sampler : model.attentionParallel->sampling) if (sampler) sampler->Discard();
+    }
+};
+#endif
+
+bool NaiveN05FlashModel::SupportsDecodePipeline() const {
+#ifdef USE_CUDA
+    return attentionParallel && GetFastllmEnv().cudaGraph && !draftEnabled && !saveHistoryChat &&
+        tpServingState && tpServingState->sealed && tpServingState->pipelineReady &&
+        attentionParallel->sampling.size() == (size_t)attentionDP &&
+            std::all_of(attentionParallel->sampling.begin(), attentionParallel->sampling.end(),
+                [](const auto &sampler) { return bool(sampler); });
+#else
+    return false;
+#endif
+}
+
+std::unique_ptr<basellm::DecodePipeline> NaiveN05FlashModel::CreateDecodePipeline(
+        const std::vector<ResponseContext *> &contexts) {
+#ifdef USE_CUDA
+    if (!SupportsDecodePipeline() || contexts.empty()) return nullptr;
+    for (auto *c : contexts) {
+        const auto &config = c->generationConfig;
+        if (!SelectLogits(config).cudaSampling || config.tool_call_token_mask || config.tool_call_grammar ||
+            !config.tool_call_allowed_token_ids.empty() || c->pastKeyValues.size() != (size_t)block_cnt ||
+            !c->intParams.count("promptLen") || !c->intParams.count("index")) return nullptr;
+    }
+    return std::unique_ptr<DecodePipeline>(new TargetDecodePipeline(*this, contexts));
+#else
+    return nullptr;
 #endif
 }
 
@@ -1705,7 +1900,22 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             buf.liveKeys.dataType = INT32;
             buf.liveKeys.Resize({state.rows});
         }
-        if (hostInputs && !storage.inputStorage.dims.empty()) {
+        const int inputSlot = tpServingState ? tpServingState->pipelineInputSlot : -1;
+        if (inputSlot >= 0 && state.mode == TPDecodeState::Replay) {
+            // The input table gathers global token rows from all owners.
+            // Empty owners have no sampled token/event in this iteration.
+            auto &dp = *attentionParallel;
+            for (int group = 0; group < attentionDP; ++group)
+                if (std::any_of(dp.groups[group].sequenceIndices.begin(), dp.groups[group].sequenceIndices.end(),
+                    [&](int seq) { return seq < dp.servingLiveRows; }))
+                    FastllmCudaCurrentThreadStreamWaitEvent(dp.sampling[group]->Ready(inputSlot));
+            auto &local = dp.ranks[rank];
+            AssertInFastLLM(FastllmCudaAdvanceMappedDecodeInput(storage.inputStorage.cudaData,
+                storage.maxRows, state.rows,
+                (const float *const *)storage.decodeTokenRows[inputSlot].cudaData,
+                (float *)local.positions.cudaData, (int *)local.liveKeys.cudaData, state.rows / attentionDP),
+                "Cannot advance attention DP pipeline inputs");
+        } else if (hostInputs && !storage.inputStorage.dims.empty()) {
             // Copy integer lengths as bytes, preserving their representation.
             buf.inputIds.Resize({1, state.rows});
             buf.positions.Resize({1, state.rows});
@@ -1754,7 +1964,7 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             }
             FastllmCudaCopyFromHostToDevice(buf.liveKeys.cudaData, lengths.data(), state.rows * sizeof(int));
         }
-        if (attentionParallel) {
+        if (attentionParallel && inputSlot < 0) {
             auto &local = attentionParallel->ranks[rank];
             auto &group = attentionParallel->groups[attentionParallel->runtime.Layout().AttentionOwner(rank)];
             if (!group.positions.empty()) {

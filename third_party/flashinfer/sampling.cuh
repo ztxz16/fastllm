@@ -1212,7 +1212,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
 
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
-          typename DType, typename IdType>
+          typename DType, typename IdType, bool PER_REQUEST_RNG = false>
 __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
     DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
     IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
@@ -1220,12 +1220,12 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplin
   const uint32_t batch_size = gridDim.x;
   const uint32_t bx = blockIdx.x, tx = threadIdx.x;
 
-  // Resolve seed/offset from tensor or scalar
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  // Optional request-owned RNG stays stable across batch compaction.
+  uint64_t philox_seed = seed_arr ? seed_arr[PER_REQUEST_RNG ? bx : 0] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[PER_REQUEST_RNG ? bx : 0] : offset_val;
 
   curandStatePhilox4_32_10_t state;
-  curand_init(philox_seed, bx, philox_offset, &state);
+  curand_init(philox_seed, PER_REQUEST_RNG ? 0 : bx, philox_offset, &state);
   const uint32_t row_idx = indices == nullptr ? bx : indices[bx];
   const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
   const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
@@ -1628,7 +1628,7 @@ cudaError_t MinPSamplingFromProb(T* probs, T* min_p_arr, IdType* output, bool* v
   });
 }
 
-template <typename T, typename IdType, int DETERMINISTIC_POLICY = -1>
+template <typename T, typename IdType, int DETERMINISTIC_POLICY = -1, bool PER_REQUEST_RNG = false>
 cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, IdType* output,
                                      bool* valid, IdType* indices, uint32_t batch_size,
                                      IdType top_k_val, T top_p_val, uint32_t d, bool deterministic,
@@ -1649,7 +1649,7 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
       return DispatchSamplingBool<DETERMINISTIC_POLICY>(deterministic, [&](auto policy) {
         constexpr bool DETERMINISTIC = decltype(policy)::value;
         auto kernel = TopKTopPSamplingFromProbKernel<BLOCK_THREADS, SCAN_ALGO, REDUCE_ALGO,
-                                                     VEC_SIZE, DETERMINISTIC, T, IdType>;
+                                                     VEC_SIZE, DETERMINISTIC, T, IdType, PER_REQUEST_RNG>;
         FLASHINFER_CUDA_CALL(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         FLASHINFER_CUDA_CALL(

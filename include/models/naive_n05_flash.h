@@ -95,6 +95,9 @@ namespace fastllm {
         void AddPromptCache(const std::vector<int> &tokens) override;
         int GetKVCacheRetainedTokens(int layer) const override;
         void WarmUp() override;
+        bool SupportsDecodePipeline() const override;
+        std::unique_ptr<DecodePipeline> CreateDecodePipeline(
+            const std::vector<ResponseContext *> &contexts) override;
         void ConfigureKvMem(const KvMemConfig &config) override;
         bool SupportsKvMem() const override { return true; }
         bool SupportsKvMemBatch() const override { return true; }
@@ -373,6 +376,7 @@ namespace fastllm {
         std::vector<std::shared_ptr<TPDecodeState>> tpBatchVerifyGraphs;
         std::shared_ptr<TPDecodeState> tpBatchVerifyStorage;
         Data tpSamplingLogits{FLOAT32};
+        struct TargetDecodePipeline;
         struct TPServingState;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
@@ -380,6 +384,8 @@ namespace fastllm {
         // Unknown/global changes still invalidate every plan through tpCacheEpoch.
         mutable std::mutex tpRequestMutex;
         std::unordered_map<const Data *, uint64_t> tpRequestIds;
+        // Sampling identity survives KV rebinding and lasts until request removal.
+        std::unordered_map<const Data *, uint64_t> tpSamplingRequestIds;
         uint64_t tpNextRequestId = 0;
         void InvalidateTensorParallelCache(const Data *requestKey = nullptr);
         bool CanReuseTensorParallelServingCache(const TargetBatch *batch, bool checkCapacity = true) const;

@@ -2470,6 +2470,21 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_prefix_cache PROPERTIES TIMEOUT 60
             PASS_REGULAR_EXPRESSION "PREFIX CACHE PASS")
 
+        add_executable(cuda_decode_sampling_test test/basic/test_cuda_decode_sampling.cpp)
+        find_library(FASTLLM_TEST_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+        target_link_libraries(cuda_decode_sampling_test PRIVATE fastllm_tools ${FASTLLM_TEST_CUDART})
+        target_include_directories(cuda_decode_sampling_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            target_compile_definitions(cuda_decode_sampling_test PRIVATE FASTLLM_TEST_DECODE_SAMPLING_HOOKS)
+            target_link_libraries(cuda_decode_sampling_test PRIVATE ${CMAKE_DL_LIBS})
+            set_target_properties(cuda_decode_sampling_test PROPERTIES ENABLE_EXPORTS ON)
+        endif()
+        fastllm_add_checked_test(cuda_decode_sampling cuda_decode_sampling_test "CUDA DECODE SAMPLING PASS" 120)
+        set_tests_properties(cuda_decode_sampling PROPERTIES RUN_SERIAL TRUE)
+        fastllm_add_checked_test(cuda_decode_sampling_large_vocab cuda_decode_sampling_test
+            "CUDA DECODE SAMPLING PASS" 120 152577)
+        set_tests_properties(cuda_decode_sampling_large_vocab PROPERTIES RUN_SERIAL TRUE)
+
         add_executable(naive_n05_serving_metadata_test test/basic/test_naive_n05_serving_metadata.cpp)
         target_link_libraries(naive_n05_serving_metadata_test PRIVATE fastllm_tools)
         target_include_directories(naive_n05_serving_metadata_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -3035,6 +3050,11 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_attention_dp_serving_${NAIVE_DP_GROUPS}
                     PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                     PASS_REGULAR_EXPRESSION "ATTENTION DP SERVING PLAN PASS")
+                add_test(NAME naive_n05_attention_dp_pipeline_${NAIVE_DP_GROUPS}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_pipeline ${NAIVE_DP_GROUPS})
+                set_tests_properties(naive_n05_attention_dp_pipeline_${NAIVE_DP_GROUPS}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP PIPELINE PASS")
                 foreach(NAIVE_DP_KV bf16 fp8)
                     add_test(NAME naive_n05_attention_dp_ring_${NAIVE_DP_GROUPS}_${NAIVE_DP_KV}
                         COMMAND naive_n05_verify_graph_test 8 attention_dp_ring ${NAIVE_DP_GROUPS} ${NAIVE_DP_KV})
@@ -3042,6 +3062,11 @@ if (UNIT_TEST)
                         PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77)
                 endforeach()
             endforeach()
+            add_test(NAME naive_n05_attention_dp_pipeline_8_bf16
+                COMMAND naive_n05_verify_graph_test 8 attention_dp_pipeline 8 bf16)
+            set_tests_properties(naive_n05_attention_dp_pipeline_8_bf16
+                PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "ATTENTION DP PIPELINE PASS")
             add_test(NAME naive_n05_attention_dp_serving_fallback
                 COMMAND naive_n05_verify_graph_test 8 attention_dp_serving 8 failinstantiate)
             set_tests_properties(naive_n05_attention_dp_serving_fallback

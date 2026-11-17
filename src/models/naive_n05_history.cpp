@@ -59,7 +59,9 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     }
     if (!context->pastKeyValues.empty()) {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
-        tpRequestIds[&context->pastKeyValues.front().first] = ++tpNextRequestId;
+        const Data *key = &context->pastKeyValues.front().first;
+        tpRequestIds[key] = ++tpNextRequestId;
+        tpSamplingRequestIds[key] = tpNextRequestId;
     }
     std::lock_guard<std::mutex> guard(historyMutex);
     // Register ownership without touching CUDA. Batched prefill initializes
@@ -79,6 +81,7 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
     {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
         tpRequestIds.erase(key);
+        tpSamplingRequestIds.erase(key);
     }
     RecycleTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);

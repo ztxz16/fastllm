@@ -2,6 +2,7 @@
 #include "models/naive_n05_flash.h"
 #ifdef USE_CUDA
 #include "parallel/cuda_runtime.h"
+#include "utils/cuda_decode_sampling.h"
 #include <algorithm>
 #include <condition_variable>
 
@@ -107,6 +108,7 @@ struct NaiveN05FlashModel::AttentionParallelState {
     // Outside the captured model graph. Only each attention group's leader
     // owns full-vocabulary logits; peers write their disjoint vocab columns.
     std::vector<Data> samplingLogits;
+    std::vector<std::shared_ptr<CudaDecodeSampling>> sampling;
     int samplingCapacity = 0;
     // Serving graphs own separate DP scratch: a large prefill must not move
     // buffers retained by a decode graph. All serving shapes share this arena.

@@ -2,6 +2,7 @@
 #include "models/naive_n05_flash.h"
 #include "utils/decode_graph.h"
 #ifdef USE_CUDA
+#include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 
 namespace fastllm {
@@ -42,6 +43,9 @@ struct NaiveN05FlashModel::TPDecodeState {
         // All pre-captured shapes share these allocations. Inputs and the KV
         // table keep their maximum-batch strides even for smaller graphs.
         Data inputStorage, cacheTable, cacheMaps, indexScores, indexExchange;
+        Data decodeTokenRows[2];
+        void *gatherReady = nullptr;
+        ~Storage() { if (gatherReady) FastllmCudaEventDestroy(gatherReady); }
         std::shared_ptr<void> linearGraphWorkspace;
         std::vector<unsigned char> hostInput;
         std::vector<void *> hostCache;
@@ -86,7 +90,8 @@ struct NaiveN05FlashModel::TPDecodeState {
     ~TPDecodeState();
 };
 struct NaiveN05FlashModel::TPServingState {
-    bool preparing = false, capturing = false, sealed = false;
+    int pipelineInputSlot = -1, pipelineOutputSlot = -1;
+    bool preparing = false, capturing = false, sealed = false, pipelineReady = false;
     int prepareCapacity = 0;
     DataType moeType = BFLOAT16, kvType = BFLOAT16;
     uint64_t generation = 0, cacheEpoch = UINT64_MAX;
