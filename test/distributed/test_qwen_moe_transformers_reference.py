@@ -125,7 +125,8 @@ class ReferenceFailureReportTests(unittest.TestCase):
             cache.write_text('CUDA_ARCH:STRING=70\n')
             requests.write_text(json.dumps(dict(messages=[], max_new_tokens=1)) + '\n')
             argv = ['runner', '--binary', '/unused', '--worker', '/unused', '--model', str(root),
-                    '--build-cache', str(cache), '--requests', str(requests), '--output', str(root / 'reports')]
+                    '--build-cache', str(cache), '--requests', str(requests), '--output', str(root / 'reports'),
+                    '--alignment-policy', 'numeric']
             transformers = SimpleNamespace(AutoTokenizer=mock.Mock())
             traces = [dict(request=dict(token_ids=[1]), steps=[dict(token_id=2)])]
             stderr = io.StringIO()

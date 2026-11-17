@@ -21,6 +21,7 @@ from run_process_tp import ROOT, capture, save_report, case_process, wait_case, 
 from qwen_moe_reference import fixture, full_logits
 from fastllm_pytools.qwen_moe_process_session import QwenMoeProcessSession, BACKEND
 from fastllm_pytools.qwen3_process_session import GenerationCancelled, GenerationObserverError
+from generation_alignment import POLICY_SOURCE, compare_generation, validate_policy
 
 
 SYNTHETIC_FIXTURES = {
@@ -36,6 +37,8 @@ SYNTHETIC_CASES = {
     for name in SYNTHETIC_FIXTURES for world in (1, 2, 4)
     for graph in (False, True) for prefix in (False, True)
 }
+PERFORMANCE_CASES = tuple((graph, cache, concurrency) for graph in (False, True)
+                          for cache in ('off', 'cold', 'hot') for concurrency in (1, 4, 8))
 
 
 def require(value, message):
@@ -167,6 +170,10 @@ class Suite:
             self.rows.append(row)
             save_report(self.output, self.rows, self.metadata)
             print(f'{row["status"]}: {name} {row["reason"]}', flush=True)
+            if row.get('logit_diagnostic_status') == 'WARNING':
+                print(f'WARNING: {name} logits数值超差（不影响生成验收判定）; '
+                      f'max_abs={row["max_abs_error"]:.3f} mean_abs={row["mean_abs_error"]:.3f} '
+                      f'exceeded_elements={row["logit_failed_elements"]}', flush=True)
         return row['status'] == 'PASS'
 
     def session(self, model, world, graph=False, prefix=False, trace=True, routing='round_robin'):
@@ -176,6 +183,104 @@ class Suite:
             ','.join(map(str, range(world))), self.output / f'session-{self.counter:04d}',
             cuda_graph=graph, prefix_cache=prefix, routing=routing, timeout=self.args.timeout,
             trace=trace, request_log=trace, queue_size=16)
+
+    def generation_alignment(self, model, requests, tokenizer):
+        """/**
+         * 使用双方公开生成入口进行独立贪心验收，原逐层数值检查由numeric模式保留。
+         * HF先单独运行并释放显存；FT共同配置为Eager/无Prefix/串行请求，再独立报告
+         * Graph与Prefix生产配置。每请求保存选定策略结论、严格一致性及原始误差诊断；
+         * 预登记全部生成及可选性能用例，未完成的汇总不得显示通过。
+         * @param model 同一份本地FP16权重目录。
+         * @param requests 已统一聊天模板、Prompt Token ID、生成长度和EOS策略的请求。
+         * @param tokenizer 用于FT输出文本解码的同一模型tokenizer。
+         * @return 无；任一请求或执行路径失败均保留FAIL行，并由main返回非零。
+         */"""
+        require(requests, 'empty generation request set')
+        # 四种模式各两轮请求、四次执行检查、两次Prefix路由；性能使用同一配置表计数。
+        expected_cases = len(self.rows) + 8 * len(requests) + 6
+        if self.args.performance:
+            expected_cases += len(PERFORMANCE_CASES)
+        self.metadata.update(
+            expected_case_count=expected_cases,
+            correctness='independent greedy generation; selected policy decides PASS/FAIL',
+            alignment_policy=self.args.alignment_policy, alignment_topk=self.args.alignment_topk,
+            near_tie_tol=self.args.near_tie_tol, policy_source=POLICY_SOURCE,
+            model_path=str(model.resolve()), dtype='float16', kv_dtype='float16',
+            eos_policy='disabled; fixed max_new_tokens; no penalties or filtering',
+            shared_configuration='FT and HF eager, prefix off, one request at a time, FP16 KV enabled',
+            additional_configurations='FT Graph/Prefix and concurrent requests vs HF eager serial reference; correctness only',
+            report_description='生成验收：failed_elements只统计选定策略失败；logit_failed_elements及logit_diagnostic_status保留同历史全词表误差。'
+                               '数值超差只记录并提示WARNING，不影响生成验收判定。'
+                               '首次分歧后不比较logits，uncompared_steps明确标记未比较尾部。严格数值验收请另跑numeric。',
+            report_title='FT vs HF generation alignment')
+        save_report(self.output, self.rows, self.metadata)
+        reference_path = self.output / 'transformers-generation.json'
+        command = [self.args.reference_python, str(ROOT / 'test/distributed/qwen_moe_transformers_reference.py'),
+                   '--model', str(model.resolve()), '--generation-requests', str(self.output / 'requests.json'),
+                   '--output', str(reference_path)]
+        (self.output / 'reference.command.txt').write_text(shlex.join(command))
+        with (self.output / 'reference.log').open('wb') as log, case_process(command, stdout=log, stderr=log) as process:
+            code = wait_case(process, self.args.timeout)
+            require(code == 0, f'Transformers reference exited {code}; inspect {self.output / "reference.log"}')
+        reference = json.loads(reference_path.read_text())
+        expected = reference['reports']
+        require(len(expected) == len(requests), 'missing HF generation reports')
+        self.metadata['reference'] = reference['metadata']
+
+        for graph in (False, True):
+            for prefix in (False, True):
+                mode = f'real_ep4_graph{int(graph)}_prefix{int(prefix)}'
+
+                def check_reports(reports, phase):
+                    """/** 每请求独立判定，失败不阻止其余请求保存报告或覆盖原结论。 */"""
+                    require(len(reports) == len(requests), 'missing FT generation reports')
+                    for index, report in enumerate(reports):
+                        def compare(_):
+                            """/** 输出生成门禁与独立数值诊断，数值超差只警告，不覆盖候选级结论。 */"""
+                            require(report['request'] == requests[index], 'FT prompt or sampling configuration changed')
+                            report['text'] = tokenizer.decode(report['token_ids'], skip_special_tokens=False,
+                                                              clean_up_tokenization_spaces=False)
+                            result = compare_generation(report, expected[index], policy=self.args.alignment_policy,
+                                topk=self.args.alignment_topk, near_tie_tol=self.args.near_tie_tol)
+                            summary = {key: value for key, value in result.items()
+                                       if key not in ('candidate_checks', 'logit_diagnostics')}
+                            summary['configuration_scope'] = 'shared_eager' if not graph and not prefix else 'ft_production_vs_hf_eager'
+                            return dict(summary=summary, comparison=result, actual=report,
+                                        reference_file=str(reference_path), reference_request=index)
+                        self.case(f'{mode}_{phase}_request{index:03d}', compare)
+
+                def run(_):
+                    """/** 运行同一公开会话的首次、重复及前缀命中请求，并核对执行路径。 */"""
+                    with self.session(model, 4, graph, prefix) as session:
+                        self.metadata['workers'] = session.ready['workers']
+                        for phase in ('cold', 'warm'):
+                            reports = ([session.generate(r) for r in requests] if not graph and not prefix
+                                       else batch(session, requests))
+                            check_reports(reports, phase)
+                        if graph:
+                            require(all(state['captures'] == 1 and state['replays'] > 0 for state in session._states),
+                                    'Graph capture/replay evidence missing')
+                        if prefix:
+                            session.routing = 'prefix'
+                            hot = session.generate(requests[0])
+                            require(hot['states'][hot['dp_rank']]['prefix_cache']['last_reused_tokens'] > 0,
+                                    'prefix route request did not reuse cached tokens')
+                            # 再次生成也不使用教师强制；候选验收仍使用相同HF独立参考。
+                            def hot_check(_):
+                                """/** 对缓存命中的自由生成使用同一HF参考，保留首个分歧证据。 */"""
+                                hot['text'] = tokenizer.decode(hot['token_ids'], skip_special_tokens=False,
+                                                              clean_up_tokenization_spaces=False)
+                                result = compare_generation(hot, expected[0], policy=self.args.alignment_policy,
+                                    topk=self.args.alignment_topk, near_tie_tol=self.args.near_tie_tol)
+                                summary = {key: value for key, value in result.items()
+                                           if key not in ('candidate_checks', 'logit_diagnostics')}
+                                summary['configuration_scope'] = 'ft_production_vs_hf_eager'
+                                return dict(summary=summary, comparison=result, actual=hot,
+                                            reference_file=str(reference_path), reference_request=0)
+                            self.case(mode + '_prefix_route', hot_check)
+                            session.clear_prefix_cache()
+                    return dict(shutdown=session.shutdown)
+                self.case(mode + '_execution', run)
 
     def correctness(self, model, world, reference, real=False, baseline=None, requests=None,
                     modes=None, case_suffix=''):
@@ -384,8 +489,7 @@ class Suite:
     def performance(self, model):
         """/** 两种正式执行模式统一工作量；每轮同步结果后停止计时，校验和落盘在计时区外。 */"""
         baseline, tokens, cache_histories = {}, {}, {}
-        for graph, cache, concurrency in ((g, c, n) for g in (False, True)
-                                         for c in ('off', 'cold', 'hot') for n in (1, 4, 8)):
+        for graph, cache, concurrency in PERFORMANCE_CASES:
             def run(_):
                 key = (cache, concurrency)
                 jobs = [request([1, 2, 3, 4] * 8, 16) for _ in range(concurrency)]
@@ -449,6 +553,10 @@ def main():
     parser.add_argument('--model', type=Path, help='真实Qwen1.5-MoE目录；省略则运行小模型及生命周期')
     parser.add_argument('--requests', type=Path, default=ROOT / 'test/distributed/data/qwen_moe_requests.jsonl')
     parser.add_argument('--reference-python', default=sys.executable, help='独立Transformers参考环境的Python路径')
+    parser.add_argument('--alignment-policy', choices=('topk', 'exact', 'numeric'), default='topk',
+                        help='真实模型验收：默认Top-K候选；exact为完整Token/文本一致；numeric保留原逐层与logits门禁')
+    parser.add_argument('--alignment-topk', type=int, default=5, help='生成验收候选数，不改变实际采样')
+    parser.add_argument('--near-tie-tol', type=float, default=0.1, help='候选边界logprob容差；0为严格双向Top-K包含')
     parser.add_argument('--performance', action='store_true')
     parser.add_argument('--synthetic-case', choices=sorted(SYNTHETIC_CASES),
                         help='只复现指定小模型用例；不代表完整验收通过')
@@ -460,18 +568,15 @@ def main():
         parser.error('--repeat必须为正整数，重复执行必须指定--synthetic-case')
     if args.synthetic_case and (args.model or args.performance):
         parser.error('--synthetic-case不能与--model或--performance混用')
+    try:
+        validate_policy('topk' if args.alignment_policy == 'numeric' else args.alignment_policy,
+                        args.alignment_topk, args.near_tie_tol)
+    except ValueError as error:
+        parser.error(str(error))
     suite = Suite(args)
     try:
         if args.model:
-            # 先在CPU保存请求，再分开加载两个后端，避免彼此争用显存。
-            # 真实参考使用显式按层分布的FP16模型，仅在FastLLM会话关闭后运行。
-            cached = {}
-            def record(ids):
-                key = tuple(ids)
-                if key not in cached:
-                    raise RuntimeError('reference cache must be prepared before comparison')
-                return cached[key]
-            # 先采集正式Eager的真实Token历史，再由Transformers独立计算完整logits。
+            # 在CPU统一Prompt ID；两种验收模式均分开加载后端，避免显存争用。
             from transformers import AutoTokenizer
             from fastllm_pytools.qwen3_process_chat import prepare_request
             tokenizer = AutoTokenizer.from_pretrained(str(args.model), local_files_only=True, trust_remote_code=False)
@@ -480,27 +585,10 @@ def main():
                        for row in (json.loads(line) for line in args.requests.read_text().splitlines() if line.strip())]
             require(prompts, 'empty JSONL request set')
             (suite.output / 'requests.json').write_text(json.dumps(prompts, ensure_ascii=False, indent=2))
-            with suite.session(args.model, 4, trace=True) as session:
-                traces = batch(session, prompts)
-            histories = []
-            for report in traces:
-                ids = list(report['request']['token_ids'])
-                for step in report['steps']:
-                    histories.append(tuple(ids))
-                    ids.append(step['token_id'])
-            inputs, reference_path = suite.output / 'histories.json', suite.output / 'transformers-reference.json'
-            inputs.write_text(json.dumps(list(dict.fromkeys(histories))))
-            command = [args.reference_python, str(ROOT / 'test/distributed/qwen_moe_transformers_reference.py'),
-                       '--model', str(args.model.resolve()), '--inputs', str(inputs), '--output', str(reference_path)]
-            (suite.output / 'reference.command.txt').write_text(shlex.join(command))
-            with (suite.output / 'reference.log').open('wb') as log, case_process(command, stdout=log, stderr=log) as process:
-                code = wait_case(process, args.timeout)
-                require(code == 0, f'Transformers reference exited {code}; inspect {suite.output / "reference.log"}')
-            reference = json.loads(reference_path.read_text())
-            cached.update({tuple(row['ids']): row['logits'] for row in reference['rows']})
-            suite.metadata['reference'] = reference['metadata']
-            suite.real_layers(args.model, reference['layers'])
-            suite.correctness(args.model, 4, record, real=True, baseline=[r['token_ids'] for r in traces], requests=prompts)
+            if args.alignment_policy != 'numeric':
+                suite.generation_alignment(args.model, prompts, tokenizer)
+            else:
+                run_numeric_reference(suite, args, prompts)
         else:
             suite.synthetic()
         if args.performance:
@@ -515,6 +603,40 @@ def main():
         status = save_report(suite.output, suite.rows, suite.metadata)
         print(f'{status}: {suite.output}', flush=True)
     return 0 if status == 'PASS' else 1
+
+
+def run_numeric_reference(suite, args, prompts):
+    """/** 保留原教师强制全logits与逐层严格门禁，使用独立运行目录和非零失败退出码。 */"""
+    cached = {}
+
+    def record(ids):
+        """/** 只返回同一真实历史的独立HF结果，缺失历史必须失败。 */"""
+        key = tuple(ids)
+        if key not in cached:
+            raise RuntimeError('reference cache must be prepared before comparison')
+        return cached[key]
+
+    with suite.session(args.model, 4, trace=True) as session:
+        traces = batch(session, prompts)
+    histories = []
+    for report in traces:
+        ids = list(report['request']['token_ids'])
+        for step in report['steps']:
+            histories.append(tuple(ids))
+            ids.append(step['token_id'])
+    inputs, reference_path = suite.output / 'histories.json', suite.output / 'transformers-reference.json'
+    inputs.write_text(json.dumps(list(dict.fromkeys(histories))))
+    command = [args.reference_python, str(ROOT / 'test/distributed/qwen_moe_transformers_reference.py'),
+               '--model', str(args.model.resolve()), '--inputs', str(inputs), '--output', str(reference_path)]
+    (suite.output / 'reference.command.txt').write_text(shlex.join(command))
+    with (suite.output / 'reference.log').open('wb') as log, case_process(command, stdout=log, stderr=log) as process:
+        code = wait_case(process, args.timeout)
+        require(code == 0, f'Transformers reference exited {code}; inspect {suite.output / "reference.log"}')
+    reference = json.loads(reference_path.read_text())
+    cached.update({tuple(row['ids']): row['logits'] for row in reference['rows']})
+    suite.metadata['reference'] = reference['metadata']
+    suite.real_layers(args.model, reference['layers'])
+    suite.correctness(args.model, 4, record, real=True, baseline=[r['token_ids'] for r in traces], requests=prompts)
 
 
 if __name__ == '__main__':
