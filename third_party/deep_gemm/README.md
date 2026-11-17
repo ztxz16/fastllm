@@ -41,3 +41,22 @@ zero inputs, M tails, graph replay after buffer growth, and rejection of
 unsupported shapes/layouts. Model accuracy evaluation is separate.
 
 DeepGEMM is distributed under the MIT license; see `LICENSE`.
+
+The native SM90 row-wise 1x32 projection is implemented in
+`impls/sm90_fp8_gemm_block32.cuh`, adapted from the SM90 DeepGEMM mainloop
+(SGLang/DeepGEMM dev commit `4dc4be548445a465e56ffb85baf1c7280d2c8cf9`, MIT).
+It reuses this directory's common headers, with no runtime package dependency.
+FP8 weights and FP32 scales retain their original row-major layout. Activations
+use per-32 power-of-two FP8 scaling; FP32 partial products are scaled every K32.
+Small batches swap operands, with two-way split-K for narrow output projections;
+large batches use 32/64/128 by 64 tiles, chunked to fit the existing 8 MiB
+Linear workspace. CUDA Graphs retain that shared lease; there is no private
+weight expansion or growing cache. Non-SM90, bias, packed weights
+and unsupported alignment retain the existing dispatch.
+Keeping the original weight scales avoids additional weight quantization;
+FP8 activation quantization still changes results relative to the W8A16 path.
+Kernel reference tests do not replace model-level accuracy evaluation.
+
+Run `python test/ops/check_fp8_block32_sm90.py --lib /path/to/libfastllm_tools.so`
+for independent FP32 references, arbitrary FP32 scales, biased fallback, M/N
+tails, arena-scoped capture and graph replay after larger workspace use.

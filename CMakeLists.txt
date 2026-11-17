@@ -521,7 +521,8 @@ if (USE_CUDA)
         set(FASTLLM_CUDA_SM90_SOURCES
             src/devices/cuda/linear/fastllm-linear-fp8-sm90.cu
             src/devices/cuda/linear/fastllm-linear-fp8-decode-sm90.cu
-            src/devices/cuda/linear/fastllm-linear-fp8-perchannel-sm90.cu)
+            src/devices/cuda/linear/fastllm-linear-fp8-perchannel-sm90.cu
+            src/devices/cuda/linear/fastllm-linear-fp8-block32-sm90.cu)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
             src/devices/cuda/linear/fastllm-linear-fp8.cu
             src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu

@@ -34,3 +34,9 @@ void FastllmCudaReleasePerChannelW8A16(fastllm::Data &weight);
 // Reserve the owned layout and one unbound worker scratch slot before KV sizing.
 // Unsupported architectures/formats are a no-op and keep their generic fallback.
 bool FastllmCudaPreparePerChannelW8A16(fastllm::Data &weight);
+
+// Hopper native row-wise block32 W8A8, keeping original FP32 weight scales.
+// Unsupported devices/alignment return false without writing output. Scratch
+// reuses the existing bounded Linear lease, retained by captured graphs.
+bool FastllmCudaBlock32W8A8SM90(const void *input, const void *weight, const float *scales,
+                              void *output, int rows, int inner, int channels);

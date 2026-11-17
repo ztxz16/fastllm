@@ -2855,6 +2855,17 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
+#ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
+    // Preserve the original 1x32 weight/scales. Unlike the legacy SIMT and
+    // expanded-BF16 paths, this computes with FP8 Tensor Cores at every batch.
+    if (bias.dims.empty() && !weight.IsRepacked && weight.blockM == 32 && weight.blockK == 1 &&
+        FastllmCudaBlock32W8A8SM90(cudaInput, weight.cudaData, cudaScales, cudaOutput, n, m, k)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+#endif
+
     if (fastllm::kernels::Enabled() && bias.dims.empty() && weight.blockM == 32 && weight.blockK == 32 &&
             input.cudaData == cudaInput && output.cudaData == cudaOutput && !weight.IsRepacked) {
         struct Context { const fastllm::Data &input; fastllm::Data &weight; const fastllm::Data &bias;
