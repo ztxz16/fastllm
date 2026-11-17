@@ -911,7 +911,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
     }
     if (!batch || !batch->Decode() || !GetFastllmEnv().cudaGraph || isIntermediateChunkedPrefill ||
         inputIds.dataType != FLOAT32 || inputIds.dims != std::vector<int>({1, batch->Size()}) ||
-        collectHidden || (selection.count && (!selection.greedy || selection.count != 1))) return false;
+        collectHidden) return false;
     const int rows = batch->Size(), ranks = tpDevices.size();
     int capacity = serving.prepareCapacity;
     if (!serving.preparing) {
@@ -1848,10 +1848,30 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
         ~RestoreExecutor() { SetCurrentThreadExecutor(previous); }
     } restore{GetExecutor()};
     SetCurrentThreadExecutor(executor.get());
+    auto selectCandidates = [&](Data &logits) {
+        Data partial, top;
+        FastllmCudaNaiveLogitsSelect(logits, tpVocabRanges[rank].first,
+            selection->count, selection->greedy, selection->invTemperature, partial, top);
+        FastllmCudaCopyFromDeviceToHost(candidateResult, top.cudaData, top.GetBytes());
+        ForceDeviceSync();
+        return Data();
+    };
     if (tpDecodeState && tpDecodeState->active &&
-        (!tpDecodeState->disabled || tpDecodeState->preparedEager))
-        return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture,
-            candidateResult, batch, selection && (selection->cudaSampling || selection->cudaLogits));
+        (!tpDecodeState->disabled || tpDecodeState->preparedEager)) {
+        const auto &prepared = tpDecodeState->selection;
+        const bool preparedSelection = !candidateResult || (selection &&
+            prepared.count == selection->count && prepared.greedy == selection->greedy &&
+            prepared.invTemperature == selection->invTemperature);
+        if (preparedSelection)
+            return ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding, capture,
+                candidateResult, batch, selection && (selection->cudaSampling || selection->cudaLogits));
+        // Serving graphs retain full logits even when they include Top1.
+        // Reuse that model graph for other sampling settings and select the
+        // requested candidates outside capture, without resizing its buffers.
+        Data logits = ForwardTensorParallelDecode(rank, inputIds, positions, kv, config, embedding,
+            capture, nullptr, batch, true);
+        return selectCandidates(logits);
+    }
     // Generic operators can move their inputs. Give every worker its own IDs.
     Data localIds(inputIds), localPositions(positions);
     // Single and ragged prefills never overlap. Share their largest tensors;
@@ -1862,12 +1882,7 @@ Data NaiveN05FlashModel::ForwardSingleGPU(int rank, const Data &inputIds, const 
         : tpPrefillWorkspaces.at(rank).get();
     Data logits = RunTarget(localIds, localPositions, kv, config, capture, rank, embedding, workspace, batch);
     if (candidateResult && !isIntermediateChunkedPrefill) {
-        Data partial, top;
-        FastllmCudaNaiveLogitsSelect(logits, tpVocabRanges[rank].first,
-            selection->count, selection->greedy, selection->invTemperature, partial, top);
-        FastllmCudaCopyFromDeviceToHost(candidateResult, top.cudaData, top.GetBytes());
-        ForceDeviceSync();
-        return Data();
+        return selectCandidates(logits);
     }
     if (!isIntermediateChunkedPrefill && !(selection && (selection->cudaSampling || selection->cudaLogits)))
         logits.ToDevice(DataDevice::CPU);
