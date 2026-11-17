@@ -7,6 +7,7 @@ struct Model : basellm {
     int submits = 0, collects = 0, outstanding = 0, failAt = -1, eosAt = -1, cancelAt = -1;
     int invalidResultAt = -1;
     bool supported = true, historySupported = false;
+    long long generated = 0;
     std::vector<std::string> events;
     Model(int rows, int limit) {
         saveHistoryChat = false; max_positions = 100; eos_token_id = 99;
@@ -54,7 +55,14 @@ struct Model : basellm {
         if (!supported) return nullptr;
         return std::unique_ptr<DecodePipeline>(new Pipe(*this,c));
     }
-    bool Run() { std::unique_lock<std::mutex> lock(dictLocker); return RunDecodePipeline(lock, 64, 100); }
+    bool Run() {
+        std::unique_lock<std::mutex> lock(dictLocker);
+        const bool ran = RunDecodePipeline(lock, 64, 100, &generated);
+        size_t published = 0;
+        for (auto &entry : responseContextDict.dicts) published += entry.second->resultTokenQueue.size();
+        Check(generated == (long long)published, "decode speed counter includes missing/discarded tokens");
+        return ran;
+    }
     uint64_t OutputVersion() {
         uint64_t version = 0;
         Check(FetchResponses(nullptr, nullptr, 0, 1, nullptr, 0, nullptr, 0, 0, version) == 0,

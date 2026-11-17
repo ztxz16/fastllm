@@ -454,7 +454,8 @@ namespace fastllm {
         virtual bool SupportsDecodePipelineHistory() const { return false; }
         virtual std::unique_ptr<DecodePipeline> CreateDecodePipeline(
             const std::vector<ResponseContext *> &) { return nullptr; }
-        bool RunDecodePipeline(std::unique_lock<std::mutex> &dictLock, int batchLimit, int totalLimit);
+        bool RunDecodePipeline(std::unique_lock<std::mutex> &dictLock, int batchLimit, int totalLimit,
+                               long long *generatedTokens = nullptr);
 
         virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 

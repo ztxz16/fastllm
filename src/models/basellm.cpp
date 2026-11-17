@@ -2321,7 +2321,7 @@ namespace fastllm {
             // Pair the shutdown check with the condition variable's lock so
             // its notification cannot be lost before an idle wait.
             if (model->isFree) break;
-            if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens)) continue;
+            if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens)) continue;
             auto &forwardLocker = model->forwardLocker;
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
@@ -3057,7 +3057,7 @@ namespace fastllm {
     }
 
     bool basellm::RunDecodePipeline(std::unique_lock<std::mutex> &dictLock,
-                                    int batchLimit, int totalLimit) {
+                                    int batchLimit, int totalLimit, long long *generatedTokens) {
         // Cache snapshots require an explicit adapter contract. Sampling that
         // depends on published CPU history still uses the ordinary path below.
         if (!SupportsDecodePipeline() || isFree ||
@@ -3106,6 +3106,7 @@ namespace fastllm {
                 c->resultTokenQueue.push(token);
                 c->allTokens.push_back(token);
                 ++c->curTokens;
+                if (generatedTokens) ++*generatedTokens;
                 if (reachesLimit(c, 0)) {
                     c->isEnding = true; c->TryRecord(this);
                 }
@@ -3322,7 +3323,7 @@ namespace fastllm {
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
                         if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
-                        if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens)) continue;
+                        if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens)) continue;
                         auto &forwardLocker = model->forwardLocker;
 
                         inference_trace::DetailRegion retireRegion("retire_requests");
