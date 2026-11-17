@@ -2,9 +2,9 @@
 #include "fastllm.h"
 #include <memory>
 
-// Opt-in MiMo complete-expert EP8 backend. All handles and symmetric buffers
+// MiMo complete-expert EP4/EP8 backend. All handles and symmetric buffers
 // for decode are prepared before worker execution / CUDA Graph capture.
-// Legacy type name; the state supports matching TP/EP groups of four or eight H20 GPUs.
+// Legacy type name; supports built-in SM90 FP8 and packaged SM120 MXFP4 kernels.
 struct FastllmCudaMimoEp8Mega;
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices);
 // Required backing for an eligible eager prefill chunk, or zero for the
@@ -13,6 +13,9 @@ size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows, int ranks);
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     const std::vector<int> &devices,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights);
+// Coordinator only, before rank workers submit collectives. Prepare native
+// graph capacities up to the requested per-rank row bound; cached calls are cheap.
+void FastllmCudaPrepareMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int maxRows);
 // Eager-only, in-place gather of contiguous row shards. Reuses the existing
 // EP8 peer publication barriers; all data stays on GPUs, with no extra arena.
 void FastllmCudaMimoEp8PrefillAllGather(FastllmCudaMimoEp8Mega &state, int rank,

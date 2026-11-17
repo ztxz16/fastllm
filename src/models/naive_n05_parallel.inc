@@ -194,6 +194,13 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         for (auto &group : state.groups)
             group.batch = std::make_unique<TargetBatch>(TargetBatch{group.kv, group.configs, group.lengths, block_cnt});
     }
+    if (tpEp8MegaState) {
+        const int ranks = tpDevices.size();
+        int maxRows = total < ranks ? total : int((int64_t(total) + ranks - 1) / ranks);
+        for (const auto &local : state.rows.localToGlobal)
+            maxRows = std::max(maxRows, (int)local.size());
+        FastllmCudaPrepareMimoEp8Mega(*tpEp8MegaState, maxRows);
+    }
     if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing)) {
         // Reserve on every owner before any attention/world collective. Pool
         // exhaustion must fail the step before peers enter NCCL.

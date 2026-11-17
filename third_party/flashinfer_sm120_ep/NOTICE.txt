@@ -1,0 +1,24 @@
+FlashInfer SM120 MXFP4/MXFP8 split MegaMoE
+========================================
+
+The CUBINs in tools/fastllm_pytools/kernels/mxfp4_ep are compiled from the
+FlashInfer 0.7.2 SM120 split CuTeDSL MegaMoE kernels and its Triton input-staging
+kernel. The upstream implementation is not claimed as original FastLLM code.
+
+Upstream source:
+https://github.com/flashinfer-ai/flashinfer/tree/main/flashinfer/moe_ep/kernel_src/sm120/split_cutedsl_megakernel
+FlashInfer is provided under the Apache License 2.0. See LICENSE.flashinfer.
+Compiler-package notices are retained as LICENSE.cutlass-dsl and LICENSE.triton.
+No CUTLASS DSL host runtime, Torch library, Triton runtime, or FlashInfer Python
+package is embedded in the deployed CUBIN package.
+
+FastLLM additions: same-process peer allocation for build-time export; graph
+serialization with pointer/TMA/peer-offset relocation; native CUDA graph loading;
+weight packing; and native FastLLM graph integration. The compiled GPU arithmetic
+kernels retain the upstream implementation. Native weight packing follows the
+upstream interleave and scale-swizzle layouts. Graph integration follows the
+upstream Green Context dependency protocol and preserves CUDA edge ports.
+
+UPSTREAM.json records source-file hashes, compiler versions, target dimensions,
+and binary hashes. Runtime contains no compiler. Re-exporting for another target
+requires the build-only tools/mega_moe_sm120/export.py dependencies; see USAGE.txt.

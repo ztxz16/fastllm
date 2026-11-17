@@ -550,10 +550,10 @@ def _configure_expert_parallel(args, is_naive_n05_model):
     ep = int(value)
     if ep in (4, 8):
         if not is_naive_n05_model:
-            raise ValueError("--ep 4/8 currently supports MiMo DSA / Naive-N0.5 FP8 models")
+            raise ValueError("--ep 4/8 currently supports MiMo DSA / Naive-N0.5 FP8 or MXFP4 models")
         if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != ep:
             raise ValueError(f"--ep {ep} requires exactly {ep} TP devices")
-        print(f"[ep] --ep {ep}: {256 // ep} complete experts/GPU; built-in MegaMoE W8A8")
+        print(f"[ep] --ep {ep}: {256 // ep} complete experts/GPU; MegaMoE backend selected by GPU and weight format")
     os.environ["FASTLLM_EP"] = str(ep)
     args.ep = ep
 
@@ -1069,7 +1069,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--attn-dp-size', type=int, default=1,
                         help='Attention DP组数；组内TP宽度为--tp总卡数/此值，支持DeepSeek V4.1及Naive/MiMo GPU路径')
     parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
-                        help = '专家并行数；1为原MoE TP路径（默认），4/8为MiMo FP8/H20的专家并行，使用内置MegaMoE W8A8；需配合相同大小的--tp')
+                        help = '专家并行数；1为原MoE TP路径（默认），4/8支持MiMo FP8/H20内置MegaMoE或MXFP4/SM120预编译原生后端；需配合相同大小的--tp')
     parser.add_argument('--moe_device', type = str, default = "", help = 'moe使用的设备')
     parser.add_argument('--moe_device_layers', type = _integer_or_auto, default = -1, help = '后面多少层moe使用moe_device，-1表示全部；auto在混推加载前规划GPU驻留前缀')
     parser.add_argument('--moe_cuda_cache', '--moe-cuda-cache',

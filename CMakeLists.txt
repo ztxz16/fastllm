@@ -413,6 +413,7 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-kvmem.cu
         src/devices/cuda/fastllm-kvmem-sparse.cu
         src/devices/cuda/fastllm-triton-cuda.cu
+        src/devices/cuda/moe/fastllm-mxfp4-ep-graph.cu
         src/devices/cuda/fastllm-ggml-cuda.cu
         src/devices/cuda/fastllm-gguf-mmvq-q.cu
         src/devices/cuda/fastllm-gguf-mmvq-k.cu
@@ -4170,6 +4171,14 @@ else()
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
+endif()
+
+if (USE_CUDA AND NOT USE_ROCM)
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/flashinfer_sm120_ep
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_sm120_ep
+            ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/flashinfer_sm120_ep)
 endif()
 
 if (USE_CUDA AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE)

@@ -192,7 +192,7 @@ bool NaiveN05FlashModel::InitTensorParallel() {
     // Resolve once, before weight registration/loading.
     tpEp8Mega = explicitEp && FastllmCudaMimoEp8MegaSupported(tpDevices);
     AssertInFastLLM(!explicitEp || tpEp8Mega,
-        "MiMo --ep 4/8 requires four/eight H20 SM90/78-SM GPUs and a FastLLM build with built-in SM90 MegaMoE.");
+        "MiMo --ep 4/8 requires H20 SM90 FP8 MegaMoE or SM120 MXFP4 with a matching native MegaMoE kernel package and all-pair CUDA peer access.");
     AssertInFastLLM(!tpEp8Mega || (embed_dim == 4096 && num_experts == 256 &&
                    num_experts_per_tok == 8 && block_cnt <= 48),
                    "MiMo EP8 requires hidden=4096, experts=256, topk=8 and at most 48 layers.");
@@ -215,9 +215,10 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
                 for (auto part : {std::make_pair("gateup_proj.weight", std::vector<int>{4096,4096}),
                                   std::make_pair("down_proj.weight", std::vector<int>{4096,2048})}) {
                     auto it = weight.weight.find(base + part.first);
-                    AssertInFastLLM(it != weight.weight.end() && it->second.dataType == FP8_E4M3 &&
-                        it->second.dims == part.second && it->second.blockM == 128 && it->second.blockK == 128,
-                        "MiMo EP8 MegaMoE requires original complete FP8 expert weights.");
+                    AssertInFastLLM(it != weight.weight.end() && it->second.dims == part.second &&
+                        ((it->second.dataType == FP8_E4M3 && it->second.blockM == 128 && it->second.blockK == 128) ||
+                         it->second.dataType == NVFP4),
+                        "MiMo EP MegaMoE requires complete FP8 block128 or MXFP4 block32 expert weights.");
                 }
             }
         }
@@ -1886,6 +1887,11 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     PrepareTensorParallel();
     if (attentionDP > 1)
         return ForwardAttentionParallel(inputIds, positions, kv, config, capture, selection, batch);
+    if (tpEp8MegaState) {
+        const int total = inputIds.dims.at(1), ranks = tpDevices.size();
+        FastllmCudaPrepareMimoEp8Mega(*tpEp8MegaState,
+            total < ranks ? total : int((int64_t(total) + ranks - 1) / ranks));
+    }
     if (tpPrefillWorkspaces.empty())
         for (size_t rank = 0; rank < tpDevices.size(); ++rank)
             tpPrefillWorkspaces.emplace_back(new TargetWorkspace());
