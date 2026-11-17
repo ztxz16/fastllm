@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import os
 
+from generation_alignment import validate_request
+
 
 def reference_device_map(config):
     """/**
@@ -210,15 +212,55 @@ def layer_reference(model, torch, sequences=None, split_stages=False):
     return tasks
 
 
+def generation_reference(model, tokenizer, torch, transformers, requests):
+    """/**
+     * 通过HF公开generate独立贪心生成，保留原始logits与实际Token，不沿FT历史重放。
+     * 每请求独立动态FP16 KV，禁用EOS与生成惩罚；显式关闭模型默认生成参数回填，
+     * 避免保存过的采样/惩罚配置覆盖贪心约定。不安装路由观察器或替换算子。
+     * @param model 已按正式参考设备映射加载的FP16模型。
+     * @param tokenizer 同一模型本地tokenizer，仅用于解码；输入直接使用保存的Token ID。
+     * @param torch 参考环境PyTorch模块。
+     * @param transformers 参考环境Transformers模块。
+     * @param requests 固定长度、禁用EOS的贪心请求列表。
+     * @return 逐请求产出自由生成报告，缺失原始logits或输出长度不符立即失败。
+     */"""
+    for index, request in enumerate(requests):
+        validate_request(request)
+        torch.manual_seed(request['seed'])
+        ids = torch.tensor([request['token_ids']], device=model.get_input_embeddings().weight.device)
+        generation = transformers.GenerationConfig(
+            max_new_tokens=request['max_new_tokens'], do_sample=False, num_beams=1,
+            use_cache=True, cache_implementation='dynamic', disable_compile=True,
+            eos_token_id=[], pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0,
+            repetition_penalty=1.0, no_repeat_ngram_size=0,
+            return_dict_in_generate=True, output_logits=True)
+        with torch.inference_mode():
+            result = model.generate(input_ids=ids, attention_mask=torch.ones_like(ids),
+                                    generation_config=generation, use_model_defaults=False, eos_token_id=[])
+            tokens = result.sequences[0, ids.shape[1]:].tolist()
+            if len(tokens) != request['max_new_tokens'] or len(result.logits) != len(tokens):
+                raise RuntimeError(f'reference request={index}: incomplete generation or raw logits')
+            steps = [dict(token_id=token, logits=logits[0].float().cpu().tolist(), execution='hf_eager_cached')
+                     for token, logits in zip(tokens, result.logits)]
+        text = tokenizer.decode(tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        del result
+        yield dict(status='PASS', finish_reason='length', request=request, token_ids=tokens,
+                   text=text, steps=steps, teacher_forced_tokens=None)
+
+
 def main():
     """/** 在参考环境重算完整历史最后位置logits，输出原始精度和运行版本。 */"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True)
-    parser.add_argument('--inputs', type=Path, required=True)
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument('--inputs', type=Path, help='数值诊断：指定完整教师强制历史')
+    inputs.add_argument('--generation-requests', type=Path, help='生成验收：双方共享的固定Token请求')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--layer-inputs', type=Path,
                         help='可选的四rank Token列表；启用同输入Attention/MoE/完整层定位')
     args = parser.parse_args()
+    if args.generation_requests and args.layer_inputs:
+        parser.error('--layer-inputs only applies to numerical diagnostics')
     os.environ.pop('USE_TORCH', None)
     import torch
     import transformers
@@ -235,6 +277,25 @@ def main():
         raise RuntimeError('reference must fit on four GPUs without CPU/disk offload')
     devices = check_reference_placement(model, placement)
     print('PASS: reference weights/buffers/execution hooks agree on all four GPUs', flush=True)
+
+    if args.generation_requests:
+        requests = json.loads(args.generation_requests.read_text())
+        if not requests:
+            raise ValueError('empty generation request set')
+        tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, local_files_only=True, trust_remote_code=False)
+        metadata = dict(torch=torch.__version__, transformers=transformers.__version__, dtype='float16',
+                        attention='eager', use_cache=True, kv_dtype='float16', prefix_cache=False,
+                        cache_implementation='dynamic', cuda_graph=False, batch_size=1,
+                        use_model_defaults=False,
+                        device_map=model.hf_device_map, checked_devices=devices,
+                        model_path=str(Path(args.model).resolve()), generation='independent greedy; EOS disabled',
+                        logit_source='generate(output_logits=True); raw pre-processor logits')
+        reports = []
+        for report in generation_reference(model, tokenizer, torch, transformers, requests):
+            reports.append(report)
+            args.output.write_text(json.dumps(dict(reports=reports, metadata=metadata), allow_nan=False))
+            print(f'Reference generation {len(reports)}/{len(requests)}', flush=True)
+        return
 
     rows = []
     histories = json.loads(args.inputs.read_text())

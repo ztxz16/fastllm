@@ -44,6 +44,9 @@ def save_report(output, rows, metadata):
     fields = ["case", "backend", "status", "max_abs_error", "mean_abs_error", "failed_elements", "reason"]
     for key in ('custom_calls', 'nccl_calls', 'prefix_hits', 'reused_tokens', 'evictions', 'prefix_bytes',
                 'token_mismatches', 'compared_steps', 'first_divergence_token_1based',
+                'alignment_policy', 'configuration_scope', 'topk', 'near_tie_tol', 'exact_match',
+                'token_match', 'text_match', 'candidate_match', 'near_tie_accepted_directions',
+                'uncompared_steps', 'logit_diagnostic_status', 'logit_failed_elements',
                 'requests', 'generated_tokens', 'elapsed_s', 'http_requests', 'sse_requests', 'reaped_processes',
                 'operation_timeout_ms', 'failure_return_ms', 'failure_phase', 'fault_rank',
                 'heartbeat_interval_ms', 'stop_return_ms', 'restarts', 'fd_count_before', 'fd_count_after',

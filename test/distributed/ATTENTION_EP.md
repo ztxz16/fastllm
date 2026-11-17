@@ -6,6 +6,11 @@
 代码已接入；本地禁止编译，GPU 功能和性能必须以服务器本次报告为准。
 下面的命令由用户在 **Vast 的 Linux 终端**执行，不在 Windows PowerShell 执行。
 
+2026-11-17起，真实模型的默认`real`改为下文“生成级HF对齐”，默认Top-5、
+候选门槛容差0.1。此前全量logits和逐层/路由的严格检查保留为`real-numeric`，
+阈值与历史FAIL不改写。本文历史实验中的“阈值保持不变”仍指严格数值诊断。
+本次修改只调整测试及报告；不修改正式推理计算，不代表真实GPU验收已经通过。
+
 ## 实现与生命周期
 
 - Python 单个调度线程负责队列和 rank 准入，一个原生协调器驱动整个 EP 组。
@@ -103,6 +108,56 @@ Transformers 4.57.6、Accelerate 1.12.0。主环境仅用于分词，不能用�
 
 `regression` 会在独立结果目录生成稠密小模型和 tokenizer，然后调用原有 DP2×TP1、DP4×TP1、
 DP2×TP2 验收以及 TP Decode Eager/Graph 验收，不需要另下载稠密模型。
+
+## 生成级HF对齐（2026-11-17）
+
+`real`默认采用`--alignment-policy topk --alignment-topk 5 --near-tie-tol 0.1`。
+规则参考vLLM的[生成模型测试说明](https://docs.vllm.ai/en/latest/contributing/model/tests/)
+及`tests/models/utils.py`中生成Token的双向候选检查。上游已查阅文件的Git blob为
+`0bec9ca9bec88f10d61770d821143f3528dbfdfe`，通用测试文件blob为
+`07585525e9151e815106ea27bc2b4c55cfee0075`；这不是所有vLLM模型统一的精度保证。
+
+- 同一份本地模型、相同Prompt Token ID、FP16权重/KV、贪心、无采样过滤或惩罚、
+  相同每请求生成长度、禁用EOS提前停止。HF直接使用保存的Token ID，不重新套聊天模板。
+- HF通过公开`generate`独立生成，动态KV、Eager、逐请求运行；FT通过正式会话独立生成。
+  显式设置`use_model_defaults=False`，防止模型保存的采样/惩罚默认值覆盖验收参数。
+  主比较不使用教师强制。两个后端分开驻留，参考进程不安装MoE观察器或更改HF计算。
+- `exact`要求完整生成Token和解码文本均一致；`topk`默认在首次Token分歧处双向检查，
+  每个选中Token须在对方Top-K，或满足`本侧logprob >= 对方Top-K末位logprob - 容差`。
+  容差为0时只允许集合互包含。首次分歧之后不沿不同历史比较logits。
+- 这个跨侧门槛不约束同一Token两侧的logprob差值，也不证明只是微小浮点扰动；
+  两边选词明显不同时仍可能通过。因此候选级PASS不能标成全量数值对齐或严格输出一致。
+  判定器双方使用相同的Python float64稳定log-softmax，Top-K同分按Token ID升序，
+  不宣称逐位复刻上游GPU归一化/Top-K的同分次序。保存原始logits供复算。
+- 共同配置单独标记`shared_eager`：FT/HF均Eager、无Prefix、串行请求；FT的
+  Graph、Prefix及并发配置单独标记`ft_production_vs_hf_eager`，仍核对实际路径和命中。
+  Prefix路由检查当前请求实际复用的Token数，不能用历史累计命中替代本次命中。
+  后者是生产配置的输出验收，不是相同运行模式的速度对比。
+- 每行报告记录选定策略、`exact_match`、`candidate_match`、首次分歧、比较步数与
+  `uncompared_steps`。`failed_elements`表示当前生成门禁失败；同历史全词表的
+  max/mean误差、`logit_failed_elements`与`logit_diagnostic_status`另外保留，绝不清零。
+  数值超差在报告和终端中只提示WARNING，不影响生成验收判定；终端保留最大/平均误差
+  与超差元素数。任一生成case或执行路径失败仍返回非零。
+- 启动前登记预期用例数，只有全部完成且通过才汇总为PASS；中途报告包含`complete=false`。
+  若同时启用性能测试，其用例也计入总数，不能把尚未执行的性能测试当成通过。
+- 严格数值验收独立运行，继续检查教师强制完整历史的每步logits与实际专家集合，
+  失败仍返回非零。合成小模型、算子、生命周期以及性能公平性检查不放宽。
+
+保持前文参考环境设置，使用已有原生产物即可；这些命令不会编译：
+
+```bash
+# 默认候选级验收：Top-5，边界容差0.1
+bash test/distributed/run_attention_ep_v100.sh real
+# 严格Token和文本一致
+bash test/distributed/run_attention_ep_v100.sh real-exact
+# 只允许互在Top-5，不启用额外边界容差
+ATTENTION_EP_NEAR_TIE_TOL=0 bash test/distributed/run_attention_ep_v100.sh real
+# 原来的逐层/路由/全量logits严格数值诊断
+bash test/distributed/run_attention_ep_v100.sh real-numeric
+```
+
+各命令新建独立目录并生成JSON/Markdown/CSV/XLSX。历史报告继续按原规则解释，
+不得把旧FAIL改写成PASS；新规则需重新运行并标明策略后才能得出新结论。
 
 ## 失败历史的分层定位
 
@@ -511,7 +566,8 @@ HTTP 将 `run` 改为 `serve`，去掉 `--prompt`、`--max-new-tokens`，添加
   `qkv_bias_rounding`继续拒绝点积先转FP16再加bias的重复舍入；`mixed_qkv_bias`首层无QKV bias、
   第二层有bias，通过正式单层与EP1/2/4、Graph/Prefix组合检查逐层后端选择、GQA不等宽布局、
   变长/空rank及缓存复用。CPU检查只验证用例的参考语义和检错能力，不代替服务器GPU执行。
-- 真实权重使用固定中文 JSONL 请求，独立 Transformers FP16 重算完整历史的末位置 logits。
+- 真实权重默认使用固定中文JSONL、独立贪心生成及上述候选级对齐；严格Token/文本结果另列。
+  `real-numeric`保留独立Transformers FP16重算完整历史末位置logits的旧数值验收。
   另外使用四个固定短序列记录全部层的真实输入、Router、共享/路由专家贡献和层输出，
   经正式单层接口进行四 rank 对照；单层检查关闭权重落盘，避免再次输出几十 GB 权重。
   专家ID、路由权重和路由累加值直接观察HF实际Top-K、dtype转换与index_add_的返回值，
@@ -537,5 +593,6 @@ HTTP 将 `run` 改为 `serve`，去掉 `--prompt`、`--max-new-tokens`，添加
 - 每组结果写入唯一时间戳目录，生成 `summary.md/csv/json/xlsx`，失败返回非零。
   JSON 保留原始浮点精度，表格浮点显示 3 位。原始 trace、采样和命令同目录保存。
 
-阶段 6 尚需服务器报告才能验收完成。逐层中间量检查使用固定短序列；中文 JSONL 全模型
-检查比较每个生成位置的完整 logits。两者应分别报告覆盖范围。
+阶段6尚需服务器报告才能验收完成。生成级报告只承诺所选策略及实际配置覆盖；
+`real-numeric`中的逐层中间量使用固定短序列，中文JSONL诊断比较每个生成位置完整logits。
+生成级PASS、严格输出一致和内部数值诊断须分别报告。
