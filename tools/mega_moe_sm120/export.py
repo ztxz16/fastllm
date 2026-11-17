@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from cuda.bindings import driver as cuda
 from prepare import GraphProvider
-from benchmark import benchmark, select_combine
+from benchmark import benchmark, select_candidate
 
 def check(result):
     if int(result[0]): raise RuntimeError(str(result))
@@ -245,29 +245,47 @@ def main():
                   source='FlashInfer SM120 split CuTeDSL MegaMoE, flashinfer-python 0.7.2, Apache-2.0')
     for cap in sorted(args.capacities):
         providers=[]
-        def prepare(local):
+        def prepare(local, cache=False):
             provider=GraphProvider(list(range(args.ep)),layers,hidden=h,intermediate=mid,
-                                   experts=args.experts,topk=args.topk,rank_local_combine=local)
+                                   experts=args.experts,topk=args.topk,rank_local_combine=local,
+                                   dispatch_rank_cache=cache)
             providers.append(provider)
             return provider,provider.prepare(0,cap)
         try:
             selected,meta=prepare(args.combine=='local')
-            selection={'mode':'local' if args.combine=='local' else 'direct'}
+            selection={'mode':'local' if args.combine=='local' else 'direct','dispatch_rank_cache':False}
+            measured=benchmark(selected,cap)
             if args.combine=='auto':
-                direct=benchmark(selected,cap)
                 try:
                     candidate,candidate_meta=prepare(True)
                 except ValueError as error:
                     # Unsupported upstream combinations retain the direct graph.
                     selection['reason']=str(error)
                 else:
-                    use_local,comparison=select_combine(direct,benchmark(candidate,cap))
+                    candidate_measurement=benchmark(candidate,cap)
+                    use_local,comparison=select_candidate(measured,candidate_measurement)
                     selection['benchmark']=comparison
                     if use_local:
                         selected,meta=candidate,candidate_meta
+                        measured=candidate_measurement
                         selection['mode']='local'
                     else:
                         selection['reason']='Requires L2 <= 0.005, >= 5% aggregate gain and <= 5% regression per workload'
+            # Reuse one token's activation on this owner across its experts.
+            # Cache state is reset by each captured graph, never across tokens.
+            # Select independently for every capacity; no serving row threshold.
+            try:
+                candidate,candidate_meta=prepare(selection['mode']=='local',cache=True)
+            except ValueError as error:
+                selection['dispatch_cache_reason']=str(error)
+            else:
+                use_cache,comparison=select_candidate(measured,benchmark(candidate,cap),exact=True)
+                selection['dispatch_cache_benchmark']=comparison
+                if use_cache:
+                    selected,meta=candidate,candidate_meta
+                    selection['dispatch_rank_cache']=True
+                else:
+                    selection['dispatch_cache_reason']='Requires exact output, >= 5% aggregate gain and <= 5% regression per workload'
             exporter.provider=selected
             bucket=exporter.bucket(cap,meta)
             bucket['selection']=selection

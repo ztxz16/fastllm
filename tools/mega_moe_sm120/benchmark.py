@@ -81,16 +81,21 @@ def benchmark(provider, capacity):
     return results
 
 
-def select_combine(direct, local):
-    """Require a reproducible margin and no workload regression to replace direct."""
+def select_candidate(baseline, candidate, exact=False):
+    """Select a faster recipe; data-movement changes must preserve exact output."""
     comparison = {}
-    for pattern in direct:
+    for pattern in baseline:
         errors = []
-        for expected, actual in zip(direct[pattern]['outputs'], local[pattern]['outputs']):
-            errors.append(float((actual - expected).norm() / expected.norm().clamp_min(1e-12)))
-        comparison[pattern] = dict(direct_ms=direct[pattern]['milliseconds'],
-                                   local_ms=local[pattern]['milliseconds'], max_relative_l2=max(errors))
-    valid = all(v['max_relative_l2'] <= .005 for v in comparison.values())
-    no_regression = all(v['local_ms'] <= v['direct_ms'] * 1.05 for v in comparison.values())
-    gain = sum(v['local_ms'] for v in comparison.values()) <= .95 * sum(v['direct_ms'] for v in comparison.values())
+        bitwise_equal = True
+        for expected, actual in zip(baseline[pattern]['outputs'], candidate[pattern]['outputs']):
+            equal = torch.equal(expected, actual)
+            bitwise_equal = bitwise_equal and equal
+            # Exact data-movement candidates need no second scan for an L2 norm.
+            errors.append(0.0 if equal else float((actual - expected).norm() / expected.norm().clamp_min(1e-12)))
+        comparison[pattern] = dict(baseline_ms=baseline[pattern]['milliseconds'],
+                                   candidate_ms=candidate[pattern]['milliseconds'],
+                                   max_relative_l2=max(errors), bitwise_equal=bitwise_equal)
+    valid = all(v['bitwise_equal'] if exact else v['max_relative_l2'] <= .005 for v in comparison.values())
+    no_regression = all(v['candidate_ms'] <= v['baseline_ms'] * 1.05 for v in comparison.values())
+    gain = sum(v['candidate_ms'] for v in comparison.values()) <= .95 * sum(v['baseline_ms'] for v in comparison.values())
     return valid and no_regression and gain, comparison

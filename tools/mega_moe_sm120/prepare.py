@@ -151,7 +151,7 @@ def _cuda_bytes(pointer, count, device):
 
 class GraphProvider:
     def __init__(self, devices, layers, hidden=4096, intermediate=2048, experts=256, topk=8,
-                 rank_local_combine=False):
+                 rank_local_combine=False, dispatch_rank_cache=False):
         import torch
         from cuda.bindings import runtime as cuda
         # cuda.core chooses its CUDA-major namespace lazily. Resolve it before
@@ -162,6 +162,7 @@ class GraphProvider:
         self.layers = layers
         self.hidden, self.intermediate, self.experts, self.topk = hidden, intermediate, experts, topk
         self.rank_local_combine = rank_local_combine
+        self.dispatch_rank_cache = dispatch_rank_cache
         self.arena = _PeerArena(self.devices)
         self.barrier = threading.Barrier(len(self.devices))
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.devices))
@@ -224,9 +225,9 @@ class GraphProvider:
                     # tensor-parallel width of an expert's GEMMs.
                     intermediate=self.intermediate, tensor_parallel_size=1,
                     knobs={'rank_local_combine': self.rank_local_combine,
-                           'dispatch_rank_cache': False,
+                           'dispatch_rank_cache': self.dispatch_rank_cache,
                            # Preserve the established K2 arithmetic/scheduling
-                           # family while comparing output-combine strategies.
+                           # family while comparing communication strategies.
                            'k2_warps': 8, 'k2_tail_reclaim': False})
                 plan_workspace = types.SimpleNamespace(config=cfg, _execution_plans={})
                 planner = runtime.MegaMoESm120W4A8Frontend(plan_workspace, compile_bucket=bucket)

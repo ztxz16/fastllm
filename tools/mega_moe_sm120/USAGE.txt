@@ -112,7 +112,7 @@ For each capacity, the default --combine auto benchmarks both combine strategies
 with deterministic nonzero weights/inputs and balanced/skewed routing. Repeated
 child graphs exclude Python submission gaps. The measured time is the slowest
 EP rank; both strategies use the established eight-warp K2 family without tail
-reclaim or dispatch-rank caching, so only output combination is being compared.
+reclaim. Output combination is compared with input caching disabled first.
 Local combine must pass relative L2 <= 0.005, improve summed workload latency by
 at least 5%, and regress neither workload by more than 5%. An unsupported or
 slower local strategy retains direct return. Each bucket's selection field logs
@@ -120,16 +120,28 @@ the choice, measured times, numerical error and fallback reason. Only the winner
 is deployed. --combine direct/local are build-time overrides for investigation;
 they do not add inference options or dependencies. Calibration is specific to
 the export GPUs and peer topology; re-export when that topology changes.
+After selecting the combine strategy, the exporter benchmarks owner input
+caching against that winner. This reuses a completed local activation copy when
+the same source token visits another expert on the same GPU. An unfinished cache
+entry falls back to a peer read instead of waiting, avoiding dispatch deadlocks.
+Caching must preserve exact output and meet the same performance margin; each
+bucket records dispatch_rank_cache, comparison timings and fallback reasons.
+The captured recipe resets the transient cache before every replay. This is
+per-invocation input reuse, not a cache across requests or decoding steps.
 Local combine adds BF16 rounding of each owner's partial sum; it is L2-validated,
 not bitwise equivalent to direct return. The shipped EP4 package selects local
 combine for 512/1024/2048 rows and direct return for 1 through 256. These are
 measured package choices, not hard-coded row thresholds in the loader.
-The shipped EP8 capacities retain direct return; their kernels are unchanged.
+Owner input caching is selected for EP4 capacities 256, 1024 and 2048; it reuses
+existing local activation storage and adds no physical workspace pages at the
+2 MiB allocation granularity used above. Smaller capacities and capacity 512
+retain their previous kernels because caching did not meet the gain margin.
+The shipped EP8 capacities retain direct return. Input caching is selected only
+for capacity 128; capacities 1 through 64 retain their previous kernels.
 Direct recipes clear the combine buffer before the collective start barrier,
 so masked or invalid routes cannot reuse results from a previous replay. This
 uses a CUDA memset graph node and does not add a compiled arithmetic kernel.
-The shipped manifests note that their original direct calibration timings
-precede this clearing fix; local-combine recipes and timings are unchanged.
+The regenerated calibration includes this clearing operation in direct recipes.
 Update third_party/flashinfer_sm120_ep/UPSTREAM.json when regenerating artifacts.
 Retain the associated notices and licenses in redistributed packages.
 
