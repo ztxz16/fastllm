@@ -837,11 +837,13 @@ endif()
 
 if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     add_library(fastllm_mimo_ep8_mega OBJECT
-        src/devices/cuda/moe/fastllm-mimo-ep8-mega.cu)
+        src/devices/cuda/moe/fastllm-mimo-ep8-mega.cu
+        src/devices/cuda/moe/fastllm-mxfp4-ep.cu)
     set_target_properties(fastllm_mimo_ep8_mega PROPERTIES
         CUDA_ARCHITECTURES "90a${FASTLLM_LLM_CUDA_ARCH_SUFFIX}" CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_mimo_ep8_mega BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_ep8/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_mxfp4/include"
         "${FASTLLM_CUTLASS_DIR}/include")
     target_compile_options(fastllm_mimo_ep8_mega PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10>)

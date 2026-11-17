@@ -5,6 +5,7 @@
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega-kernel.h"
 #if defined(FASTLLM_ENABLE_MIMO_EP8_MEGA) && !defined(_WIN32) && !defined(USE_ROCM)
+#include "devices/cuda/fastllm-mxfp4-ep.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <mutex>
 struct FastllmCudaMimoEp8BuiltinMega {
     struct Rank {
+        bool mxfp4 = false;
         fastllm::Data workspace{fastllm::INT8};
         std::vector<std::unique_ptr<fastllm::Data>> scales;
         std::vector<void *> layers;
@@ -19,11 +21,15 @@ struct FastllmCudaMimoEp8BuiltinMega {
         void *prefillScratch = nullptr;
         void *prefillReady = nullptr;
         ~Rank() {
-            for (void *layer : layers) if (layer) fastllm_ep8_mega_moe_destroy(layer);
+            for (void *layer : layers) if (layer) {
+                if (mxfp4) fastllm_mxfp4_ep_destroy(layer);
+                else fastllm_ep8_mega_moe_destroy(layer);
+            }
             if (prefillReady) FastllmCudaEventDestroy(prefillReady);
         }
     };
     std::vector<int> devices;
+    bool mxfp4 = false;
     std::vector<std::unique_ptr<Rank>> ranks;
     // Publish completed outputs, then keep them alive until all peers finish.
     std::mutex outputMutex;
@@ -66,24 +72,49 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
     using namespace fastllm;
     AssertInFastLLM(FastllmCudaMimoEp8BuiltinMegaSupported(devices) && weights.size() == devices.size(),
                    "MiMo EP MegaMoE requires four or eight H20 GPUs.");
-    const size_t bytes = fastllm_ep8_mega_moe_workspace_bytes(devices.size());
+    int format = -1;
+    // Validate the format across all resident experts before allocating arenas.
+    // Dense layers have empty tables; experts on other ranks may be null.
+    for (const auto &rank : weights) for (const auto &layer : rank) {
+        if (layer.empty()) continue;
+        AssertInFastLLM(layer.size() == 514, "Invalid MiMo EP expert table.");
+        for (size_t i = 2; i < layer.size(); ++i) if (layer[i]) {
+            const auto &w = *layer[i];
+            const bool fp8 = w.dataType == FP8_E4M3 && w.blockM == 128 && w.blockK == 128;
+            const bool mxfp4 = w.dataType == NVFP4 && w.blockM == 32 && w.blockK == 1;
+            AssertInFastLLM((fp8 || mxfp4) && (format < 0 || format == (int)mxfp4),
+                "MiMo EP requires uniformly FP8 or block-32 UE8M0 MXFP4 experts.");
+            format = (int)mxfp4;
+        }
+    }
+    AssertInFastLLM(format >= 0, "MiMo EP has no experts.");
+    const bool mxfp4 = format == 1;
+    const size_t bytes = mxfp4 ? fastllm_mxfp4_ep_workspace_bytes(devices.size())
+                              : fastllm_ep8_mega_moe_workspace_bytes(devices.size());
     // Dedicated control storage must survive attention/cuBLAS calls. Sharing
     // the old transient scratch would race remote dispatch writes against a
     // later rank's memset. Bound it; retain no duplicate/repacked FP8 weights.
-    AssertInFastLLM(bytes > 0 && bytes <= 512 * 1024 * 1024,
+    // MXFP4 reserves independent decode and prefill arenas before serving.
+    const size_t budget = (mxfp4 ? 768ull : 512ull) * 1024 * 1024;
+    AssertInFastLLM(bytes > 0 && bytes <= budget,
                    "MiMo EP symmetric workspace exceeds its memory budget.");
     auto state = std::make_shared<FastllmCudaMimoEp8BuiltinMega>();
     state->devices = devices;
+    state->mxfp4 = mxfp4;
     std::vector<const void *> peers;
     int previous = FastllmCudaGetDevice();
     for (int r = 0; r < (int)devices.size(); ++r) {
         FastllmCudaSetDevice(devices[r]);
         auto rank = std::make_unique<FastllmCudaMimoEp8BuiltinMega::Rank>();
-        rank->prefillReady = FastllmCudaEventCreate();
+        rank->mxfp4 = mxfp4;
+        if (!mxfp4) rank->prefillReady = FastllmCudaEventCreate();
         rank->workspace.Resize({(int)bytes});
         rank->workspace.ToDevice(DataDevice::CUDA, {devices[r]}, false);
         rank->workspace.Allocate(false);
-        AssertInFastLLM(fastllm_ep8_mega_moe_init_workspace(rank->workspace.cudaData, bytes, devices.data(), r, devices.size()), fastllm_ep8_mega_moe_error());
+        const int initialized = mxfp4
+            ? fastllm_mxfp4_ep_init(rank->workspace.cudaData, bytes, devices.data(), r, devices.size())
+            : fastllm_ep8_mega_moe_init_workspace(rank->workspace.cudaData, bytes, devices.data(), r, devices.size());
+        AssertInFastLLM(initialized, mxfp4 ? fastllm_mxfp4_ep_error() : fastllm_ep8_mega_moe_error());
         peers.push_back(rank->workspace.cudaData);
         state->ranks.push_back(std::move(rank));
     }
@@ -93,33 +124,37 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
         rank.layers.resize(weights[r].size(), nullptr);
         for (size_t l = 0; l < weights[r].size(); ++l) {
             if (weights[r][l].empty()) continue;
-            AssertInFastLLM(weights[r][l].size() == 514, "Invalid MiMo EP expert table.");
             std::vector<const void *> gate, down, gs, ds;
             for (int e = r * (256 / devices.size()); e < (r + 1) * (256 / devices.size()); ++e) {
                 for (int part = 0; part < 2; ++part) {
                     Data *w = weights[r][l][2 + e * 2 + part];
                     const std::vector<int> shape = part ? std::vector<int>{4096, 2048} : std::vector<int>{4096, 4096};
-                    AssertInFastLLM(w && w->dataType == FP8_E4M3 && w->dims == shape &&
-                        w->blockM == 128 && w->blockK == 128 && w->cudaData &&
-                        w->dataDeviceIds == std::vector<int>{devices[r]} &&
-                        w->scales.size() == (size_t)shape[0] * shape[1] / (128 * 128),
-                        "MiMo EP requires complete native FP8 experts with 128x128 scales.");
+                    AssertInFastLLM(w && w->dims == shape && w->cudaData &&
+                        w->dataDeviceIds == std::vector<int>{devices[r]},
+                        "MiMo EP requires complete experts on their assigned device.");
+                    (part ? down : gate).push_back(w->cudaData);
+                    if (mxfp4) continue;
+                    AssertInFastLLM(w->scales.size() == (size_t)shape[0] * shape[1] / (128 * 128),
+                        "MiMo EP requires complete 128x128 FP8 scales.");
                     // Native MergeMOE creates scales plus an unused zero-bias
                     // allocation for every TP shard. EP8 needs only the scales.
                     auto scale = std::make_unique<Data>(FLOAT32, std::vector<int>{(int)w->scales.size()}, w->scales);
                     scale->ToDevice(DataDevice::CUDA, {devices[r]}, true);
-                    (part ? down : gate).push_back(w->cudaData);
                     (part ? ds : gs).push_back(scale->cudaData);
                     rank.scales.push_back(std::move(scale));
                 }
             }
-            rank.layers[l] = fastllm_ep8_mega_moe_create(gate.data(), down.data(), gs.data(), ds.data(),
-                rank.workspace.cudaData, bytes, peers.data(), r, l, devices.size());
-            AssertInFastLLM(rank.layers[l] != nullptr, fastllm_ep8_mega_moe_error());
+            rank.layers[l] = mxfp4
+                ? fastllm_mxfp4_ep_create(gate.data(), down.data(), rank.workspace.cudaData,
+                    bytes, peers.data(), r, devices.size())
+                : fastllm_ep8_mega_moe_create(gate.data(), down.data(), gs.data(), ds.data(),
+                    rank.workspace.cudaData, bytes, peers.data(), r, l, devices.size());
+            AssertInFastLLM(rank.layers[l] != nullptr,
+                mxfp4 ? fastllm_mxfp4_ep_error() : fastllm_ep8_mega_moe_error());
         }
-        printf("MIMO_EP_MEGA ranks=%d gpu=%d experts=%d inter=2048 W8A8 workspace=%zu max_rows=%d Graph-ready backend=builtin\n",
-               (int)devices.size(), devices[r], (int)(256 / devices.size()), bytes,
-               fastllm_ep8_mega_moe_decode_capacity(4096, (int)devices.size()));
+        printf("MIMO_EP_MEGA ranks=%d gpu=%d experts=%d inter=2048 %s workspace=%zu max_rows=%d Graph-ready backend=builtin\n",
+               (int)devices.size(), devices[r], (int)(256 / devices.size()), mxfp4 ? "MXFP4-W4A8" : "W8A8", bytes,
+               mxfp4 ? fastllm_mxfp4_ep_capacity() : fastllm_ep8_mega_moe_decode_capacity(4096, (int)devices.size()));
     }
     FastllmCudaSetDevice(previous);
     return state;
@@ -246,9 +281,11 @@ void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &state,
     output.Resize(input.dims);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing local MiMo EP layer handle.");
-    int capacity = fastllm_ep8_mega_moe_decode_capacity(maxRows * state.devices.size(), state.devices.size());
+    int capacity = state.mxfp4 ? (maxRows > fastllm_mxfp4_ep_capacity()
+        ? fastllm_mxfp4_ep_prefill_capacity() : fastllm_mxfp4_ep_capacity())
+        : fastllm_ep8_mega_moe_decode_capacity(maxRows * state.devices.size(), state.devices.size());
     const void *prefillPeers[8]{};
-    if (prefillScratch) {
+    if (prefillScratch && !state.mxfp4) {
         // Use a common maximum, including idle sources and unequal DP loads.
         // Decode/Graph calls never enter these eager workspace rendezvous.
         const int prefillCapacity = PrepareMimoEpPrefill(state, rank, handle,
@@ -261,12 +298,16 @@ void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &state,
         void *y = (uint16_t *)output.cudaData + (size_t)start * 4096;
         const int32_t *idx = rows ? (const int32_t *)index.cudaData + start * 8 : (const int32_t *)output.cudaData;
         const float *scores = rows ? (const float *)score.cudaData + start * 8 : (const float *)output.cudaData;
-        const int ok = prefillPeers[0]
+        const int ok = state.mxfp4
+            ? fastllm_mxfp4_ep_run(handle, x, y, idx, scores, count, std::min(capacity, maxRows - first),
+                liveKeys ? liveKeys + start : nullptr)
+            : prefillPeers[0]
             ? fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, count)
             : fastllm_ep8_mega_moe_run_batched(handle, x, y, idx, scores, count, capacity,
                 liveKeys ? liveKeys + start : nullptr);
         if (!ok)
-            throw std::runtime_error(std::string("Local MiMo EP launch failed: ") + fastllm_ep8_mega_moe_error());
+            throw std::runtime_error(std::string("Local MiMo EP launch failed: ") +
+                (state.mxfp4 ? fastllm_mxfp4_ep_error() : fastllm_ep8_mega_moe_error()));
     }
     if (prefillPeers[0]) {
         // The next layer overwrites borrowed router scratch and resets EP
@@ -300,27 +341,32 @@ bool FastllmCudaRunMimoEp8BuiltinMega(FastllmCudaMimoEp8BuiltinMega &state, int 
     output.Allocate(false);
     void *handle = state.ranks.at(rank)->layers.at(layer);
     AssertInFastLLM(handle != nullptr, "Missing MiMo EP layer handle.");
-    int capacity = fastllm_ep8_mega_moe_decode_capacity(total, ranks);
+    int capacity = state.mxfp4 ? (graphDecode ? fastllm_mxfp4_ep_capacity() : fastllm_mxfp4_ep_prefill_capacity())
+        : fastllm_ep8_mega_moe_decode_capacity(total, ranks);
     const void *prefillPeers[8]{};
-    if (!graphDecode) {
+    if (!graphDecode && !state.mxfp4) {
         const int prefillCapacity = PrepareMimoEpPrefill(state, rank, handle,
             total, prefillScratch, input, prefillPeers);
         if (prefillCapacity) capacity = prefillCapacity;
     }
-    auto run = [&](int start, int rows) {
+    auto run = [&](int start, int rows, int commonRows) {
         const int routeStart = localRouting ? start - begin : start;
         const void *x = (const uint16_t *)input.cudaData + (size_t)start * 4096;
         void *y = (uint16_t *)output.cudaData + (size_t)start * 4096;
         const int32_t *idx = (const int32_t *)index.cudaData + routeStart * 8;
         const float *scores = (const float *)score.cudaData + routeStart * 8;
-        const int ok = !prefillPeers[0] ?
+        const int ok = state.mxfp4 ?
+            fastllm_mxfp4_ep_run(handle, x, y, idx, scores, rows, commonRows, liveKeys ? liveKeys + start : nullptr) :
+            !prefillPeers[0] ?
             fastllm_ep8_mega_moe_run_batched(handle, x, y, idx, scores, rows, capacity, liveKeys ? liveKeys + start : nullptr) :
             fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, rows);
         if (!ok)
-            throw std::runtime_error(std::string("MiMo EP launch failed: ") + fastllm_ep8_mega_moe_error());
+            throw std::runtime_error(std::string("MiMo EP launch failed: ") +
+                (state.mxfp4 ? fastllm_mxfp4_ep_error() : fastllm_ep8_mega_moe_error()));
     };
-    if (total <= capacity && !localRouting) {
-        run(0, total);
+    const int replicatedCapacity = state.mxfp4 ? fastllm_mxfp4_ep_capacity() : capacity;
+    if (total <= replicatedCapacity && !localRouting) {
+        run(0, total, total);
         return false;
     }
 
@@ -329,7 +375,8 @@ bool FastllmCudaRunMimoEp8BuiltinMega(FastllmCudaMimoEp8BuiltinMega &state, int 
     const int rounds = (int)(((int64_t)total + ranks * capacity - 1) / (ranks * capacity));
     for (int round = 0; round < rounds; ++round) {
         const int start = round * capacity;
-        run(begin + std::min(start, shard), std::max(0, std::min(capacity, shard - start)));
+        const int commonRows = std::min(capacity, (total + ranks - 1) / ranks - start);
+        run(begin + std::min(start, shard), std::max(0, std::min(capacity, shard - start)), commonRows);
     }
     if (graphDecode) {
         if (localRouting && residual && normWeight && normOutput) {

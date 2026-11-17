@@ -1,5 +1,22 @@
 MiMo EP8 with built-in MegaMoE
 
+MXFP4 addition:
+  --ep 4/8 also supports block-32 UE8M0 MXFP4 experts on H20, using a
+  built-in W4A8 backend. See third_party/flashinfer_mxfp4/README.md for its
+  limits, workspace and extra packed-weight memory. The FP8 backend's
+  no-duplicate-weight memory figures below do not apply to MXFP4.
+  Independent real-weight W4A8 check (PyTorch + safetensors, test only):
+    python3 tools/mega_moe_sm90/check_mxfp4.py --ranks 8 \
+      --lib /absolute/path/build/tools/ftllm/libfastllm_tools.so \
+      --model /path/to/MXFP4/checkpoint --out mxfp4_check.json
+  The check covers spread/hot routing, idle ranks, masked rows, untouched
+  output guards, 128/512-row arena transitions, partial chunks, repeatability
+  and changed-input CUDA Graph replay. It also reports drift against a
+  reference without FP8 activation quantization.
+  Ordinary projections retain their native FP8 weights/scales by default
+  when the checkpoint supplies weight_scale_inv. Forcing block-32 MXFP8
+  projections to fp8_e4m3_perchannel via --dtype_config is not supported yet.
+
 Start through the standard FastLLM CLI (chat/run/server/benchmark):
   ftllm server MODEL --tp 8 --ep 8 [other existing options]
 

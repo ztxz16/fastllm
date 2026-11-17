@@ -1,0 +1,24 @@
+{
+  "tag": "v0.7.4",
+  "url": "https://raw.githubusercontent.com/flashinfer-ai/flashinfer/v0.7.4/",
+  "files": {
+    "include/flashinfer/megamoe/sm90_mxfp4_mega_moe_fused.cuh": "828af95b543b04ef01c15bb0c791dcd2dac44651f74a5f3a91efa7ac71fecba5",
+    "include/flashinfer/megamoe/layout.cuh": "2a9fa03b4e5128923f6225bfcacb71f02094c148c97dc205ae9481f38b9deff9",
+    "include/flashinfer/megamoe/detail/ptx.cuh": "ff11dbd2e83c10009c7bbf4c4aa9d5da5fbb55683c22d3af903065d28ecbecc5",
+    "include/flashinfer/megamoe/scheduler.cuh": "ea9b0208499e284c3ee707c830de9242601abaf6de83c92d66306d2da01dfc9a",
+    "include/flashinfer/megamoe/detail/common.cuh": "6589c251bf9a48e94d7529e8c2848355952454d2ed5a7f71f8207fdc37c76331",
+    "include/flashinfer/megamoe/barrier.cuh": "72172576b865a0849617c514507d156e7e4efca41ad79167e406554070717106",
+    "include/flashinfer/megamoe/mxfp4_dequant.cuh": "e2851df1669649e3b35009fee31480484e32e753d95024ac76dade19456eaca3",
+    "include/flashinfer/megamoe/detail/mma_sm90.cuh": "2ce7a21c920e844ec7e31d2ccbc5602e9f917407507e62ffbeee393d6b247dc2",
+    "include/flashinfer/megamoe/sym_buffer.cuh": "bf7e924901557dcd170c36d4b3a3d1b9b6b9c78d50531ce45c901f1f818bbec7",
+    "include/flashinfer/megamoe/detail/tma_copy.cuh": "37278e156a8661f678d929ed6f48932e09971c8716d2250db5e2a0aef1306f08",
+    "include/flashinfer/megamoe/sm90_mxfp4_mega_moe_fused_body.inl": "46cb484ebceed892e68b9f106b6b23b1fd5dfa9f4d93e366236bb1e4f1602fc4",
+    "include/flashinfer/megamoe/detail/dispatch_rank_selection.inl": "b2deed3d433f9905200b97320de952999d8cba0b3aa96054a128c8317667da98",
+    "include/flashinfer/megamoe/detail/combine.inl": "ac679e9cfb15cf5cd95f01e862cc398c231535508c720f0f9651d9e3309d4971",
+    "include/flashinfer/megamoe/detail/buffers.inl": "29a7689324e237cb336b5760909c44d5113623dcb1f28072e09f90b24a5cf212",
+    "include/flashinfer/megamoe/detail/combine_config.inl": "d0665668bd2e711835a3fa07c48bec0b3025d72a8b9410ccfea56ee222b3a4ac",
+    "include/flashinfer/megamoe/detail/fp4_decode.cuh": "83a7a32123dc1a5bfa44c8733d7c49dc86e8fa5bb56cc717fd501911d27a4f53",
+    "include/flashinfer/megamoe/detail/fused_epilogue.inl": "05dc12c805c4ccc8067e630756b12d951a66e656dc91725aabdf69e7843d4407",
+    "LICENSE": "cb67c224f503e0a063908950b12f89a7280c6e527dcffac972aa114e4bf3c5de"
+  }
+}
