@@ -373,8 +373,8 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
             writer.metadata.Ints(root->dims);
     std::vector<PDStateWriter> ranks;
     for (size_t i = 0; i < devices.size(); ++i) ranks.push_back(writer.Fork());
-    auto pack = [&](int rank) {
-        FastllmCudaSetDevice(devices[rank]);
+    auto pack = [&](int rank, bool planning) {
+        if (!planning) FastllmCudaSetDevice(devices[rank]);
         const int worldRank = std::find(tpDevices.begin(), tpDevices.end(), devices[rank]) - tpDevices.begin();
         auto &output = ranks[rank];
         StateCopies copies;
@@ -395,6 +395,7 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
                 compact.dataDevice = CUDA;
                 compact.dataDeviceIds = {devices[rank]};
                 compact.kvCacheFp8Indexer = !tp && cache.kvCacheFp8Indexer;
+                if (planning) { output.PlanTensor(compact); continue; }
                 output.AllocateTensor(compact);
                 const size_t rowBytes = GetDataBytes(cache.dataType, 1, width);
                 if (cache.isPagedKVCache) {
@@ -420,14 +421,22 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
                 compact.dataDevice = CUDA;
                 compact.dataDeviceIds = {devices[rank]};
                 compact.kvCacheFp8Indexer = fp8IndexerCache;
-                output.AllocateTensor(compact);
-                CopyPagedRows(compact, key, pool, false, copies, HasSeparateIndexer() ? 0 :
-                    std::max(1, full.kvHeads / int(devices.size())) * full.headDim);
+                if (planning) output.PlanTensor(compact);
+                else {
+                    output.AllocateTensor(compact);
+                    CopyPagedRows(compact, key, pool, false, copies, HasSeparateIndexer() ? 0 :
+                        std::max(1, full.kvHeads / int(devices.size())) * full.headDim);
+                }
             }
         }
-        copies.Submit();
+        if (!planning) copies.Submit();
     };
-    RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices, pack);
+    if (!draftEnabled) {
+        for (int rank = 0; rank < int(devices.size()); ++rank) pack(rank, true);
+        writer.Reserve();
+    }
+    RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices,
+                 [&](int rank) { pack(rank, false); });
     for (auto &rank : ranks) {
         writer.metadata.Blob(rank.metadata.bytes.data(), rank.metadata.bytes.size());
         writer.metadata.U32(rank.buffers.size());

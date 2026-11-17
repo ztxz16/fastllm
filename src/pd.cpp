@@ -33,6 +33,7 @@ uint64_t TensorBytes(const Data &data) {
     return elements * data.unitSize;
 }
 constexpr uint32_t PDWireMagic = 0x32564450;
+constexpr size_t PDTransferArenaBytes = size_t(64) << 20;
 bool HasPDEnvelope(const fastkv::Bytes &bytes) {
     if (bytes.size() < 4) return false;
     fastkv::Reader reader(bytes);
@@ -68,6 +69,8 @@ std::vector<int> PDReceivePlacement(const fastkv::Bytes &metadata,
 struct PDStateWriter::Allocations {
     std::mutex mutex;
     std::vector<std::pair<int, size_t>> plan;
+    std::vector<fastkv::Buffer> reserved;
+    bool prepared = false;
 };
 PDStateWriter::PDStateWriter(fastkv::BufferPool *pool)
     : pool(pool), allocations(std::make_shared<Allocations>()) {}
@@ -76,20 +79,49 @@ PDStateWriter PDStateWriter::Fork() const {
     child.allocations = allocations;
     return child;
 }
+void PDStateWriter::PlanTensor(const Data &data) {
+    Check(!allocations->prepared && data.dataDevice == CUDA && data.dataDeviceIds.size() == 1,
+          "invalid export allocation plan");
+    const size_t bytes = TensorBytes(data);
+    if (!bytes) return;
+    const int device = data.dataDeviceIds.front();
+    const size_t aligned = (plannedOffset + 255) / 256 * 256;
+    if (plannedDevice != device || aligned > plannedCapacity || bytes > plannedCapacity - aligned) {
+        plannedCapacity = std::max(bytes, PDTransferArenaBytes);
+        plannedDevice = device; plannedOffset = 0;
+        plannedArenas.push_back(allocations->plan.size());
+        allocations->plan.emplace_back(device, plannedCapacity);
+    } else plannedOffset = aligned;
+    plannedOffset += bytes;
+}
+void PDStateWriter::Reserve() {
+    Check(!allocations->prepared, "export plan already reserved");
+    if (pool) allocations->reserved = pool->AcquireBatch(allocations->plan);
+    else for (const auto &item : allocations->plan)
+        allocations->reserved.push_back(fastkv::Buffer::Allocate(item.second, item.first));
+    allocations->prepared = true;
+}
 fastkv::Buffer PDStateWriter::Allocate(size_t bytes, int device) {
-    if (!pool) return fastkv::Buffer::Allocate(bytes, device);
+    if (!pool && !allocations->prepared) return fastkv::Buffer::Allocate(bytes, device);
     const size_t aligned = (arenaOffset + 255) / 256 * 256;
     if (!arena.Size() || arena.Device() != device || aligned > arena.Size() || bytes > arena.Size() - aligned) {
-        const size_t capacity = std::max(bytes, size_t(64) << 20);
-        {
-            std::lock_guard<std::mutex> lock(allocations->mutex);
-            allocations->plan.emplace_back(device, capacity);
-            try { pool->CheckCapacity(allocations->plan); }
-            catch (...) { allocations->plan.pop_back(); throw; }
-        }
-        for (;;) {
-            try { arena = pool->Acquire(capacity, device); break; }
-            catch (const fastkv::CapacityBusy &) { pool->WaitForRelease(); }
+        const size_t capacity = std::max(bytes, PDTransferArenaBytes);
+        if (allocations->prepared) {
+            Check(nextArena < plannedArenas.size(), "unplanned export allocation");
+            auto &reserved = allocations->reserved.at(plannedArenas[nextArena++]);
+            Check(reserved.Device() == device && reserved.Size() == capacity, "export plan changed");
+            arena = std::move(reserved);
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(allocations->mutex);
+                allocations->plan.emplace_back(device, capacity);
+                try { pool->CheckCapacity(allocations->plan); }
+                catch (...) { allocations->plan.pop_back(); throw; }
+            }
+            for (;;) {
+                try { arena = pool->Acquire(capacity, device); break; }
+                catch (const fastkv::CapacityBusy &) { pool->WaitForRelease(); }
+            }
         }
         arenaOffset = 0;
     } else arenaOffset = aligned;
@@ -287,6 +319,8 @@ struct PDRuntime {
         std::future<fastkv::Message> hostRestore;
         std::chrono::steady_clock::time_point restoreBegin;
         bool restoring = false;
+        bool prefixRecorded = false;
+        std::chrono::steady_clock::time_point exportQueued;
         size_t reservation = 0;
         std::shared_ptr<Workload> work;
         size_t remaining = 0, restoreBytes = 0;
@@ -536,7 +570,7 @@ void PDRuntime::RunPrefill(basellm &model) {
     // Raw RPCs own no cache. Prepared contexts own the same immutable page
     // references and private companion state as active contexts, but have not
     // entered forward yet. Both use one token budget and one retirement path.
-    std::deque<Request> active, prepared;
+    std::deque<Request> active, prepared, exporting;
     size_t reserved = 0, preparedTokens = 0;
     const size_t prepareBudget = totalTokenCapacity / 2;
     const size_t page = residentPrefix ? std::max(1, GetPageLen()) : 1;
@@ -562,7 +596,10 @@ void PDRuntime::RunPrefill(basellm &model) {
     const auto cancelled = std::make_exception_ptr(std::runtime_error("FastKV PD: request cancelled"));
     auto complete = [&](const Request &request, fastkv::Message *restored) {
         const auto exportBegin = std::chrono::steady_clock::now();
-        if (residentPrefix) request->context->TryRecordPagedCache(&model);
+        if (residentPrefix && !request->prefixRecorded) {
+            request->context->TryRecordPagedCache(&model);
+            request->prefixRecorded = true;
+        }
         const auto recorded = std::chrono::steady_clock::now();
         auto reply = restored ? std::move(*restored) : model.ExportPDState(*request->context);
         const auto exported = std::chrono::steady_clock::now();
@@ -593,6 +630,8 @@ void PDRuntime::RunPrefill(basellm &model) {
             const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
             std::cout << "[FastKV PD timing] record_ms=" << ms(exportBegin, recorded)
                       << " export_ms=" << ms(recorded, exported)
+                      << " export_wait_ms=" << (request->exportQueued.time_since_epoch().count() ?
+                          ms(request->exportQueued, exportBegin) : 0.0)
                       << " publish_ms=" << ms(exported, published)
                       << " retire_ms=" << ms(published, std::chrono::steady_clock::now())
                       << " kv_d2h_bytes=" << fastkv::Buffer::Traffic().deviceToHost
@@ -604,7 +643,7 @@ void PDRuntime::RunPrefill(basellm &model) {
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(prefillMutex);
-                if (active.empty() && prepared.empty()) {
+                if (active.empty() && prepared.empty() && exporting.empty()) {
                     prefillCV.wait(lock, [&] { return stopping || !waiting.empty(); });
                     if (!stopping && waitMs > 0) {
                         const auto deadline = waiting.front()->queued + std::chrono::milliseconds(waitMs);
@@ -628,6 +667,21 @@ void PDRuntime::RunPrefill(basellm &model) {
             // RPC handlers return futures immediately; network workers never
             // wait for the model or hold forwardLocker.
             std::unique_lock<std::mutex> lock(model.forwardLocker);
+            // Completed contexts retain their pages and admission while waiting
+            // for a whole-message export reservation. Other requests can still
+            // forward; no owner worker waits on a transport buffer lease.
+            for (auto it = exporting.begin(); it != exporting.end();) {
+                const auto request = *it;
+                try {
+                    if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
+                    complete(request, nullptr);
+                } catch (const fastkv::CapacityBusy &) { ++it; continue; }
+                catch (...) {
+                    auto error = std::current_exception();
+                    retire(request); request->result.set_exception(error);
+                }
+                it = exporting.erase(it);
+            }
             // Cancellation touches model state only on its execution lane,
             // between completed forward calls. The service drains the future.
             for (auto it = active.begin(); it != active.end();) {
@@ -690,7 +744,7 @@ void PDRuntime::RunPrefill(basellm &model) {
             }
             size_t scanned = 0;
             { std::lock_guard<std::mutex> queueLock(prefillMutex); scanned = waiting.size(); }
-            for (; scanned > 0 && active.size() + prepared.size() < contextLimit; --scanned) {
+            for (; scanned > 0 && active.size() + prepared.size() + exporting.size() < contextLimit; --scanned) {
                 const bool lookahead = int(active.size()) >= batchRequests;
                 if (lookahead && !residentPrefix) break;
                 Request request;
@@ -880,6 +934,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                 std::cout << "[FastKV PD] prefill_batch=" << batch << " tokens=" << batchTokens - budget
                           << " forward_ms=" << seconds * 1000
                           << " active=" << active.size() << " prepared=" << prepared.size()
+                          << " exporting=" << exporting.size()
                           << " queued=" << queued << " reserved_tokens=" << reserved
                           << " prepared_tokens=" << preparedTokens << std::endl;
             }
@@ -899,6 +954,9 @@ void PDRuntime::RunPrefill(basellm &model) {
                 }
                 try {
                     complete(request, nullptr);
+                } catch (const fastkv::CapacityBusy &) {
+                    request->exportQueued = std::chrono::steady_clock::now();
+                    exporting.push_back(request);
                 } catch (...) {
                     auto error = std::current_exception();
                     retire(request);
@@ -921,6 +979,10 @@ void PDRuntime::RunPrefill(basellm &model) {
             request->result.set_exception(error);
         }
         for (const auto &request : prepared) {
+            retire(request);
+            request->result.set_exception(error);
+        }
+        for (const auto &request : exporting) {
             retire(request);
             request->result.set_exception(error);
         }

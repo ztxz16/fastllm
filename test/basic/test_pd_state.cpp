@@ -414,6 +414,70 @@ static void TestPreparedPrefill() {
     std::cout << "PASS PD bounded prepared queue, page credits, cancellation and exact state\n";
 }
 
+static void TestExportBackpressure() {
+    class BusyModel : public StateModel {
+      public:
+        std::atomic<int> blocked{0}, live{0};
+        std::atomic<bool> freeze{false};
+        void OnResponseContextCreated(ResponseContext *) override { ++live; }
+        void OnResponseContextRemoved(ResponseContext *) override { --live; }
+        fastkv::Message ExportPDState(ResponseContext &context) override {
+            if (freeze || forwards < 2) {
+                ++blocked;
+                throw fastkv::CapacityBusy("test export lease held by another transfer");
+            }
+            return StateModel::ExportPDState(context);
+        }
+    } model;
+    SetMaxTokens(4096);
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    model.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","pressure"},
+        {"transport","tcp"},{"listen",endpoint},{"chunk_tokens",64},{"transfer_workers",2}});
+    fastkv::Options options; options.transport = fastkv::Transport::Tcp; options.workers = 2;
+    fastkv::Service client(options);
+    auto submit = [&](int token, std::shared_ptr<fastkv::Cancellation> cancellation = {}) {
+        fastkv::Writer writer;
+        writer.U32(1); writer.String("pressure:gpu-state-v2:test-recurrent-state-v1");
+        writer.Ints({token}); fastkv::Message request{std::move(writer.bytes),{}};
+        std::future<fastkv::Message> result;
+        Check(client.TrySubmit(endpoint,request,result,std::move(cancellation)),"export fixture admission failed");
+        return result;
+    };
+    auto first = submit(3);
+    for (int i = 0; i < 3000 && !model.blocked; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(model.blocked > 0, "export backpressure fixture did not block");
+    auto second = submit(7);
+    for (auto *result : {&first, &second})
+        Check(result->wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+              "busy export blocked the next prefill");
+    int token = 3;
+    for (auto *result : {&first, &second}) {
+        PDStateReader reader(result->get()); Check(reader.metadata.U32() == 1,"busy export length");
+        Data state; reader.Tensor(state); reader.End();
+        Check(((float *)state.cpuData)[0] == token,"busy export changed state"); token = 7;
+    }
+    Check(model.forwards == 2,"busy export recomputed a completed prefix");
+    model.freeze = true;
+    for (bool shutdown : {false,true}) {
+        const int blocked = model.blocked;
+        auto cancellation = std::make_shared<fastkv::Cancellation>();
+        auto pending = submit(shutdown ? 19 : 11,cancellation);
+        for (int i = 0; i < 3000 && model.blocked == blocked; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(model.blocked > blocked && model.live == 1,"missing queued export context");
+        if (shutdown) model.StopPD(); else cancellation->Cancel();
+        Check(pending.wait_for(std::chrono::seconds(5)) == std::future_status::ready,"queued export cancellation stalled");
+        bool rejected = false; try { pending.get(); } catch (const std::exception &) { rejected = true; }
+        Check(rejected,"cancelled export succeeded");
+        for (int i = 0; i < 3000 && model.live; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(model.live == 0,"queued export leaked its context");
+    }
+    std::cout << "PASS PD export pressure: forward progress, exact state, cancellation and shutdown\n";
+}
+
 static void TestPrefillBatch() {
     auto endpoint = [] {
         fastkv::Service port;
@@ -1041,6 +1105,7 @@ int main() {
         mismatch.StopPD();
         prefill.StopPD();
         TestGPUState();
+        TestExportBackpressure();
         TestPrefillBatch();
         TestPrefillDPBatch();
         TestPreparedPrefill();
