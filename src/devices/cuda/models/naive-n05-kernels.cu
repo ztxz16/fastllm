@@ -3869,7 +3869,7 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
             mma::SplitQK<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::QKStorage<2>)>>>(
                 (const BF16 *)query.cudaData, FastllmNaiveKV(*readKey),
                 ids, p, heads, kvHeads, key.dims[2], keys, count, pastLength, causal, indexTile, first, queries);
-            mma::SplitNormalize<2048><<<dim3(rows,heads/8),256>>>(p,bias,heads,count);
+            mma::SplitNormalize<2048><<<dim3(rows,heads),256>>>(p,bias,heads,count);
             mma::SplitPV<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::PVStorage<2>)>>>(
                 p, FastllmNaiveKV(*readValue), ids,
                 (BF16 *)output.cudaData, heads, kvHeads, keys, count,

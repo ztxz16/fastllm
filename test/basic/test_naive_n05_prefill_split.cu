@@ -62,7 +62,7 @@ static void Case(int rows, int past, int heads, bool causal, bool withSink, int 
         int tile=std::min(257,rows-first);
         SplitQK<2048,0,2><<<dim3(tile,heads/16),256,sizeof(QKStorage<2>)>>>(q.data,key,ids.data,
             probabilities.data,heads,kvHeads,kvHeads*192,keys,count,past,causal,indexTile,first,rows);
-        SplitNormalize<2048><<<dim3(tile,heads/8),256>>>(probabilities.data,s,heads,count);
+        SplitNormalize<2048><<<dim3(tile,heads),256>>>(probabilities.data,s,heads,count);
         SplitPV<2048,0,2><<<dim3(tile,heads/16),256,sizeof(PVStorage<2>)>>>(probabilities.data,value,ids.data,
             actual.data,heads,kvHeads,keys,count,past,causal,indexTile,first,rows);
     }
@@ -84,6 +84,10 @@ int main() {
     if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major < 8)
         return 77;
     try {
+        Case(65, 0, 16, true, false, 0);
+        Case(2048, 0, 64, true, false, 0);
+        Case(2053, 0, 16, false, true, 0);
+        Case(4096, 0, 64, true, true, 256);
         Case(2048, 8192, 16, true, false, 0);
         Case(2053, 8192, 32, false, true, 0);
         Case(2048, 77952, 16, true, true, 256);
