@@ -1163,7 +1163,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "Naive/MiMo 外置 DSpark 草稿 DP 副本数；按完整请求分摊计算，增加 BF16 权重副本，KV 按请求分配；与草稿 TP 参数互斥")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、clover")
+                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、dfly2、clover")
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
@@ -1174,7 +1174,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help="DeepSeek-V4.1 DSpark 草稿专家显存策略：1 要求全驻留，0 关闭全驻留优先；未指定保持现有策略。支持单卡/PP/TP，需 MXFP4 草稿；--auto 会检查预算，显存不足时报错")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
                         dest = "speculative_num_draft_tokens", type = int, default = -1,
-                        help = "DFlash/Clover 每轮 block token 数（含 anchor）")
+                        help = "DFlash/DFly2/Clover 每轮 block token 数（含 anchor）")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
                         help = "外置 DSpark 的训练 block size 校验值；必须与 draft config 一致，候选数使用 --draft_tokens")
@@ -1433,6 +1433,7 @@ def make_normal_llm_model(args, startup_progress = None):
     if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash", "clover", "dfly2"):
         raise ValueError(
             "--speculative_algorithm currently supports off, mtp, dspark, dflash, dfly2 or clover")
+    dfly2_block_size = 0
     if speculative_algorithm == "dfly2":
         if mtp or dspark_tokens or speculative_draft_path:
             raise ValueError("HY4-Flash DFly2 uses the checkpoint's embedded draft weights")
@@ -1440,9 +1441,7 @@ def make_normal_llm_model(args, startup_progress = None):
         width = width if width > 0 else (draft_tokens + 1 if draft_tokens > 0 else 4)
         if not 2 <= width <= 16 or (draft_tokens > 0 and draft_tokens + 1 != width):
             raise ValueError("DFly2 requires 2–16 verification rows, including the anchor")
-        os.environ["FASTLLM_DFLY2_BLOCK_SIZE"] = str(width)
-    else:
-        os.environ.pop("FASTLLM_DFLY2_BLOCK_SIZE", None)
+        dfly2_block_size = width
     if speculative_algorithm == "clover" and (mtp or dspark_tokens or speculative_draft_path or draft_tokens > 0):
         raise ValueError("Clover shares the target model; use --speculative_num_draft_tokens for its block width")
     if speculative_algorithm == "dspark" and mtp > 0:
@@ -1640,6 +1639,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_deepseek_v4_model = False
     is_dots3_note_model = False
     is_clover_model = False
+    is_hy4_flash_model = False
     if (os.path.exists(config_path) or gguf_config is not None):
         try:
             if gguf_config is None:
@@ -1656,6 +1656,7 @@ def make_normal_llm_model(args, startup_progress = None):
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
             is_clover_model = model_type == "clover_moe"
+            is_hy4_flash_model = model_type == "hy_v4_flash"
             is_naive_n05_model = _is_naive_n05_family(config)
             if is_naive_n05_model:
                 is_thread_tp_moe_model = True
@@ -1916,7 +1917,7 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm:
                 raise
             pass
-    if speculative_algorithm == "dfly2" and config.get("model_type") != "hy_v4_flash":
+    if dfly2_block_size and not is_hy4_flash_model:
         raise ValueError("--speculative_algorithm dfly2 requires a HY4-Flash checkpoint")
     if is_clover_model:
         from .clover_config import prepare as prepare_clover
@@ -2328,7 +2329,8 @@ def make_normal_llm_model(args, startup_progress = None):
                             indexer_dtype = getattr(args, "indexer_dtype", "auto"),
                             indexer_compute_dtype = getattr(args, "indexer_compute_dtype", "auto"),
                             indexer_tp_storage = indexer_storage,
-                            pd_prefill = pd_prefill)
+                            pd_prefill = pd_prefill,
+                            **({"dfly2_block_size": dfly2_block_size} if dfly2_block_size else {}))
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
         if is_clover_model:

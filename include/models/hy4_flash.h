@@ -47,6 +47,8 @@ class Hy4FlashModel final : public basellm {
     struct Weights;
     void AddSource(const std::string &name, const std::string &file, const std::string &dtype,
                    const std::vector<int> &dims, uint64_t offset, uint64_t bytes);
+    // Enable the embedded draft before creating response contexts.
+    bool EnableDFly2(int width);
     void SetConfig(const json11::Json &config);
 
   private:

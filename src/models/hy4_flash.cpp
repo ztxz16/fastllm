@@ -47,25 +47,37 @@ void Hy4FlashModel::InitParams() {
 }
 void Hy4FlashModel::SetConfig(const json11::Json &root) {
     const auto &cfg = root["text_config"];
-    if (const char *value = std::getenv("FASTLLM_DFLY2_BLOCK_SIZE"))
-        draftWidth = std::stoi(value);
-    if (draftWidth) {
-        AssertInFastLLM(draftWidth >= 2 && draftWidth <= 16 &&
-                            root["dfly_num_hidden_layers"].int_value() == 5 &&
-                            root["dfly_enable_hidden_correction"].bool_value() &&
-                            root["dfly_mtp_fusion"].string_value() == "slot0" &&
-                            root["dfly_target_kv_layers"] == root["dfly_target_index_layer"],
-                        "Invalid HY4-Flash DFly configuration.");
-        draftMask = root["dfly_mask_token_id"].int_value();
-        for (const auto &n : root["dfly_target_kv_layers"].array_items())
-            draftProviders.push_back(n.int_value());
-        AssertInFastLLM(draftProviders.size() == 5, "Invalid DFly provider count.");
+    // Keep only the draft metadata here. Its tensors are loaded lazily if this
+    // model instance enables DFly2 before serving requests.
+    const auto &providers = root["dfly_target_kv_layers"].array_items();
+    if (providers.size() == 5 && root["dfly_num_hidden_layers"].int_value() == 5 &&
+        root["dfly_enable_hidden_correction"].bool_value() &&
+        root["dfly_mtp_fusion"].string_value() == "slot0" &&
+        root["dfly_target_kv_layers"] == root["dfly_target_index_layer"] &&
+        root["dfly_mask_token_id"].is_number()) {
+        std::vector<int> layers;
+        for (const auto &provider : providers)
+            layers.push_back(provider.int_value());
+        if (std::all_of(layers.begin(), layers.end(),
+                        [this](int layer) { return layer >= 0 && layer < block_cnt; }) &&
+            std::set<int>(layers.begin(), layers.end()).size() == layers.size()) {
+            draftProviders = std::move(layers);
+            draftMask = root["dfly_mask_token_id"].int_value();
+        }
     }
     source->config = cfg;
     AssertInFastLLM(cfg["hidden_size"].int_value() == 3072 && cfg["num_hidden_layers"].int_value() == 42 &&
                         cfg["hc_mult"].int_value() == 4 && cfg["num_experts_per_tok"].int_value() == 16 &&
-                        cfg["routed_expert_hidden_size"].int_value() == 1536,
+                        cfg["routed_expert_hidden_size"].int_value() == 1536 &&
+                        cfg["n_routed_experts"].int_value() == 512 &&
+                        cfg["moe_intermediate_size"].int_value() == 1536,
                     "Unsupported HY4-Flash geometry.");
+}
+bool Hy4FlashModel::EnableDFly2(int width) {
+    if (width < 2 || width > 16 || draftProviders.size() != 5)
+        return false;
+    draftWidth = width;
+    return true;
 }
 void Hy4FlashModel::OnResponseContextCreated(ResponseContext *context) {
 #ifdef FASTLLM_ENABLE_HY4_CUDA
@@ -78,7 +90,7 @@ void Hy4FlashModel::OnResponseContextCreated(ResponseContext *context) {
 }
 bool Hy4FlashModel::PopPendingResponseToken(ResponseContext *context, int previous, int &token) {
 #ifdef FASTLLM_ENABLE_HY4_CUDA
-    if (!context || context->pastKeyValues.empty())
+    if (!draftWidth || !context || context->pastKeyValues.empty())
         return false;
     auto state =
         std::static_pointer_cast<hy4::DraftRequest>(context->pastKeyValues.front().first.kvStorageOwner);
@@ -94,7 +106,7 @@ bool Hy4FlashModel::PopPendingResponseToken(ResponseContext *context, int previo
 }
 void Hy4FlashModel::AddSource(const std::string &name, const std::string &file, const std::string &dtype,
                               const std::vector<int> &dims, uint64_t offset, uint64_t bytes) {
-    if (name.rfind("vit.", 0) == 0 || (!draftWidth && name.rfind("model.dfly_layers.", 0) == 0))
+    if (name.rfind("vit.", 0) == 0)
         return;
     source->meta.emplace(name, Hy4Source{file, dtype, offset, bytes, dims});
 }
