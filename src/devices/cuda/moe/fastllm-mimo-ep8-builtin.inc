@@ -8,6 +8,7 @@
 #include "devices/cuda/fastllm-mxfp4-ep.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/fastllm-moe-weight-owner.h"
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -52,13 +53,27 @@ struct FastllmCudaMimoEp8BuiltinMega {
         if (exchangeFailed) throw std::runtime_error("MiMo EP output exchange timed out.");
     }
 };
+bool FastllmCudaMimoEp8BuiltinMegaWeights(FastllmCudaMimoEp8BuiltinMega &state, int rank, int layer, const void **out) {
+    return !state.mxfp4 && fastllm_ep8_mega_moe_weights(state.ranks.at(rank)->layers.at(layer), out);
+}
+bool FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(int device) {
+    const int previous = FastllmCudaGetDevice();
+    FastllmCudaSetDevice(device);
+    const bool packed = fastllm_ep8_mega_moe_owns_packed_weights();
+    FastllmCudaSetDevice(previous);
+    return packed;
+}
 bool FastllmCudaMimoEp8BuiltinMegaSupported(const std::vector<int> &devices) {
-    if (devices.size() != 4 && devices.size() != 8) return false;
+    if ((devices.size() != 4 && devices.size() != 8) ||
+        !fastllm_ep8_mega_moe_group_supported(devices.data(), devices.size())) return false;
     int previous = FastllmCudaGetDevice();
     bool ok = true;
+    std::string backend;
     for (int device : devices) {
         FastllmCudaSetDevice(device);
-        ok = fastllm_ep8_mega_moe_supported() && ok;
+        const std::string selected = fastllm_ep8_mega_moe_backend_name();
+        if (backend.empty()) backend = selected;
+        ok = fastllm_ep8_mega_moe_supported() && selected == backend && ok;
     }
     FastllmCudaSetDevice(previous);
     return ok;
@@ -71,7 +86,7 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
         const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights) {
     using namespace fastllm;
     AssertInFastLLM(FastllmCudaMimoEp8BuiltinMegaSupported(devices) && weights.size() == devices.size(),
-                   "MiMo EP MegaMoE requires four or eight H20 GPUs.");
+                   "MiMo EP MegaMoE requires matching supported SM90 or SM100/103 GPUs.");
     int format = -1;
     // Validate the format across all resident experts before allocating arenas.
     // Dense layers have empty tables; experts on other ranks may be null.
@@ -121,6 +136,8 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
     for (int r = 0; r < (int)devices.size(); ++r) {
         FastllmCudaSetDevice(devices[r]);
         auto &rank = *state->ranks[r];
+        const bool ownsPacked = !mxfp4 && fastllm_ep8_mega_moe_owns_packed_weights();
+        size_t released = 0;
         rank.layers.resize(weights[r].size(), nullptr);
         for (size_t l = 0; l < weights[r].size(); ++l) {
             if (weights[r][l].empty()) continue;
@@ -151,7 +168,15 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
                     rank.workspace.cudaData, bytes, peers.data(), r, l, devices.size());
             AssertInFastLLM(rank.layers[l] != nullptr,
                 mxfp4 ? fastllm_mxfp4_ep_error() : fastllm_ep8_mega_moe_error());
+            // create() completes packing before the source layer is retired.
+            // Both decode tiles and Flex borrow this single owned representation.
+            if (ownsPacked) {
+                for (Data *w : weights[r][l]) if (w) released += ReleasePackedMoeSource(*w);
+                rank.scales.clear();
         }
+        }
+        fprintf(stderr, "[MegaMoE] gpu=%d original_bytes_released=%zu packed_owner=%d\n",
+            devices[r], released, ownsPacked ? 1 : 0);
         printf("MIMO_EP_MEGA ranks=%d gpu=%d experts=%d inter=2048 %s workspace=%zu max_rows=%d Graph-ready backend=builtin\n",
                (int)devices.size(), devices[r], (int)(256 / devices.size()), mxfp4 ? "MXFP4-W4A8" : "W8A8", bytes,
                mxfp4 ? fastllm_mxfp4_ep_capacity() : fastllm_ep8_mega_moe_decode_capacity(4096, (int)devices.size()));
@@ -450,6 +475,8 @@ bool FastllmCudaRunMimoEp8BuiltinMega(FastllmCudaMimoEp8BuiltinMega &state, int 
 }
 #else
 struct FastllmCudaMimoEp8BuiltinMega {};
+bool FastllmCudaMimoEp8BuiltinMegaWeights(FastllmCudaMimoEp8BuiltinMega &, int, int, const void **) { return false; }
+bool FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(int) { return false; }
 void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &, int, int, const fastllm::Data &,
     const fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, const int *, fastllm::Data *) {
     throw std::runtime_error("MiMo EP MegaMoE local rows require the SM90 backend.");

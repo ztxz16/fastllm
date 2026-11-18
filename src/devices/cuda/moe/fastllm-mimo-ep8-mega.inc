@@ -44,6 +44,13 @@ struct FastllmCudaMimoEp8Mega {
     }
 };
 
+bool FastllmCudaMimoEp8MegaWeights(FastllmCudaMimoEp8Mega &state, int rank, int layer, const void **out) {
+    return state.builtin && FastllmCudaMimoEp8BuiltinMegaWeights(*state.builtin, rank, layer, out);
+}
+bool FastllmCudaMimoEp8MegaOwnsPackedWeights(int device) {
+    return FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(device);
+}
+
 void FastllmCudaPrepareMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int maxRows) {
     if (!state.native || maxRows <= state.preparedRows) return;
     int capacity = 1;

@@ -546,17 +546,30 @@ if (USE_CUDA)
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MOE16_SM90)
     endif()
 
-    # EP4/EP8 uses an isolated, pinned DeepGEMM source subset. Compile the kernel
-    # directly into FastLLM; no Python package or external adapter is needed.
+    # Embed only the pinned kernel headers; no Python/JIT/runtime dependency.
+    set(FASTLLM_MIMO_MEGA_ARCHS "")
     if (UNIX AND NOT APPLE AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE AND
-        CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
-        (FASTLLM_DEEPGEMM_FP8_SM90_ENABLED OR
-         ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES AND
-          "90" IN_LIST CMAKE_CUDA_ARCHITECTURES_NATIVE)))
+        EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
+        set(FASTLLM_MIMO_MEGA_REQUESTED_ARCHS ${FASTLLM_CUDA_ARCHITECTURES})
+        if ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES)
+            list(APPEND FASTLLM_MIMO_MEGA_REQUESTED_ARCHS ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+        endif()
+        foreach(arch IN LISTS FASTLLM_MIMO_MEGA_REQUESTED_ARCHS)
+            string(REGEX MATCH "^[0-9]+" number "${arch}")
+            if (number STREQUAL "90" AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+                list(APPEND FASTLLM_MIMO_MEGA_ARCHS 90)
+            elseif ((number STREQUAL "100" OR number STREQUAL "103") AND
+                    CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+                list(APPEND FASTLLM_MIMO_MEGA_ARCHS ${number})
+            endif()
+        endforeach()
+    endif()
+    if (FASTLLM_MIMO_MEGA_ARCHS)
+        list(REMOVE_DUPLICATES FASTLLM_MIMO_MEGA_ARCHS)
         set(FASTLLM_MIMO_EP8_MEGA_ENABLED ON)
         set_property(SOURCE src/devices/cuda/cudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MIMO_EP8_MEGA)
-        message(STATUS "MiMo H20 EP4/EP8 MegaMoE: built-in")
+        message(STATUS "MiMo EP4/EP8 built-in MegaMoE architectures: ${FASTLLM_MIMO_MEGA_ARCHS}")
     endif()
 
     # FlashInfer's DeepSeek-V4 sparse MLA decode kernel uses SM120-only
@@ -837,18 +850,44 @@ if (FASTLLM_CUDA_SM120_SOURCES)
 endif()
 
 if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
-    add_library(fastllm_mimo_ep8_mega OBJECT
-        src/devices/cuda/moe/fastllm-mimo-ep8-mega.cu
-        src/devices/cuda/moe/fastllm-mxfp4-ep.cu)
-    set_target_properties(fastllm_mimo_ep8_mega PROPERTIES
-        CUDA_ARCHITECTURES "90a${FASTLLM_LLM_CUDA_ARCH_SUFFIX}" CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(fastllm_mimo_ep8_mega BEFORE PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_ep8/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_mxfp4/include"
-        "${FASTLLM_CUTLASS_DIR}/include")
-    target_compile_options(fastllm_mimo_ep8_mega PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--register-usage-level=10>)
-    set(FASTLLM_MIMO_EP8_MEGA_OBJECTS $<TARGET_OBJECTS:fastllm_mimo_ep8_mega>)
+    add_library(fastllm_mimo_mega_dispatch OBJECT
+        src/devices/cuda/moe/fastllm-mimo-mega-dispatch.cu)
+    set_target_properties(fastllm_mimo_mega_dispatch PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    set(FASTLLM_MIMO_EP8_MEGA_OBJECTS $<TARGET_OBJECTS:fastllm_mimo_mega_dispatch>)
+    if ("90" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+        add_library(fastllm_mimo_ep8_mega OBJECT src/devices/cuda/moe/fastllm-mimo-ep8-mega.cu
+            src/devices/cuda/moe/fastllm-mxfp4-ep.cu)
+        set_target_properties(fastllm_mimo_ep8_mega PROPERTIES
+            CUDA_ARCHITECTURES OFF CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(fastllm_mimo_ep8_mega BEFORE PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_ep8/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_mxfp4/include"
+            "${FASTLLM_CUTLASS_DIR}/include")
+        target_compile_options(fastllm_mimo_ep8_mega PRIVATE
+            "--generate-code=arch=compute_90a,code=sm_90a"
+            "--ptxas-options=--register-usage-level=10")
+        target_compile_definitions(fastllm_mimo_mega_dispatch PRIVATE FASTLLM_MIMO_MEGA_SM90)
+        list(APPEND FASTLLM_MIMO_EP8_MEGA_OBJECTS $<TARGET_OBJECTS:fastllm_mimo_ep8_mega>)
+    endif()
+    if ("100" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+        add_library(fastllm_mimo_mega_sm100 OBJECT src/devices/cuda/moe/fastllm-mimo-mega-sm100.cu)
+        set_target_properties(fastllm_mimo_mega_sm100 PROPERTIES
+            CUDA_ARCHITECTURES OFF CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(fastllm_mimo_mega_sm100 BEFORE PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_blackwell/include"
+            "${FASTLLM_CUTLASS_DIR}/include")
+        # Avoid nvcc -arch shorthand: its generic PTX cannot encode tcgen05.
+        foreach(arch IN ITEMS 100 103)
+            if ("${arch}" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+                target_compile_options(fastllm_mimo_mega_sm100 PRIVATE
+                    "--generate-code=arch=compute_${arch}a,code=sm_${arch}a")
+                target_compile_definitions(fastllm_mimo_mega_sm100 PRIVATE FASTLLM_MIMO_MEGA_ARCH${arch})
+            endif()
+        endforeach()
+        target_compile_options(fastllm_mimo_mega_sm100 PRIVATE "--expt-relaxed-constexpr")
+        target_compile_definitions(fastllm_mimo_mega_dispatch PRIVATE FASTLLM_MIMO_MEGA_SM100)
+        list(APPEND FASTLLM_MIMO_EP8_MEGA_OBJECTS $<TARGET_OBJECTS:fastllm_mimo_mega_sm100>)
+    endif()
 endif()
 
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
@@ -4262,6 +4301,15 @@ else()
             COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/tools/scripts ${CMAKE_BINARY_DIR}/tools/.
             COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/build_info.json ${CMAKE_BINARY_DIR}/tools/ftllm/.
     )
+endif()
+
+if (FASTLLM_MIMO_EP8_MEGA_ENABLED AND ("100" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS))
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/deep_gemm_blackwell
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_blackwell/LICENSE
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_blackwell/UPSTREAM.json
+            ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/deep_gemm_blackwell)
 endif()
 
 if (USE_CUDA AND NOT USE_ROCM)

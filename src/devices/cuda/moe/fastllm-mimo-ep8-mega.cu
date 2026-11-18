@@ -2,7 +2,8 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
-#include "devices/cuda/fastllm-mimo-ep8-mega-kernel.h"
+#define FASTLLM_MIMO_MEGA_SM90
+#include "devices/cuda/fastllm-mimo-mega-backends.h"
 #include <deep_gemm/impls/sm90_fp8_mega_moe_fastllm.cuh>
 #include <fastllm_tile_sg/impls/sm90_fp8_mega_moe_fastllm.cuh>
 #include <deep_gemm/impls/sm90_mega_moe_pre_dispatch.cuh>
@@ -188,7 +189,7 @@ static void *Create(const void *const *gate, const void *const *down,
                                          const void *const *gs, const void *const *ds, void *workspace,
                                          size_t workspaceBytes, const void *const *peers, int rank, int slot) {
     try {
-        if (!fastllm_ep8_mega_moe_supported())
+        if (!fastllm_sm90_mega_moe_supported())
             throw std::runtime_error("MegaMoE requires H20 SM90 with 78 SMs");
         if (!workspace || reinterpret_cast<uintptr_t>(workspace) % 256 ||
             workspaceBytes < WorkspaceBytes())
@@ -341,7 +342,7 @@ static void Destroy(void *handle) {
 };
 } // namespace
 
-extern "C" int fastllm_ep8_mega_moe_supported() {
+extern "C" int fastllm_sm90_mega_moe_supported() {
     int device;
     if (cudaGetDevice(&device) != cudaSuccess)
         return 0;
@@ -360,62 +361,62 @@ extern "C" int fastllm_ep8_mega_moe_supported() {
 
 // The EP8-prefixed symbols are internal legacy names. Rank selection is explicit
 // at creation; all subsequent launches use the immutable handle specialization.
-extern "C" const char *fastllm_ep8_mega_moe_error() { return error.c_str(); }
-extern "C" int fastllm_ep8_mega_moe_max_rows() { return CAP; }
-extern "C" int fastllm_ep8_mega_moe_decode_capacity(int inputRows, int ranks) {
+extern "C" const char *fastllm_sm90_mega_moe_error() { return error.c_str(); }
+extern "C" int fastllm_sm90_mega_moe_max_rows() { return CAP; }
+extern "C" int fastllm_sm90_mega_moe_decode_capacity(int inputRows, int ranks) {
     // Select from the common shape, never rank-local rows: all peers must
     // enter the same arena, including idle/uneven source ranks.
     return (ranks == 4 || ranks == 8) && inputRows > ranks * CAP ? BATCH_CAP : CAP;
 }
-extern "C" size_t fastllm_ep8_mega_moe_workspace_bytes(int ranks) {
+extern "C" size_t fastllm_sm90_mega_moe_workspace_bytes(int ranks) {
     return ranks == 4 ? Mega<4>::WorkspaceBytes() : ranks == 8 ? Mega<8>::WorkspaceBytes() : 0;
 }
-extern "C" size_t fastllm_ep8_mega_moe_prefill_workspace_bytes(int rows, int ranks) {
+extern "C" size_t fastllm_sm90_mega_moe_prefill_workspace_bytes(int rows, int ranks) {
     return ranks == 4 ? Mega<4>::PrefillWorkspaceBytes(rows) : ranks == 8 ? Mega<8>::PrefillWorkspaceBytes(rows) : 0;
 }
-extern "C" int fastllm_ep8_mega_moe_init_workspace(void *workspace, size_t bytes,
+extern "C" int fastllm_sm90_mega_moe_init_workspace(void *workspace, size_t bytes,
         const int *devices, int rank, int ranks) {
     if (ranks == 4) return Mega<4>::InitWorkspace(workspace, bytes, devices, rank);
     if (ranks == 8) return Mega<8>::InitWorkspace(workspace, bytes, devices, rank);
     error = "MegaMoE requires 4 or 8 ranks"; return 0;
 }
-extern "C" void *fastllm_ep8_mega_moe_create(const void *const *gate, const void *const *down,
+extern "C" void *fastllm_sm90_mega_moe_create(const void *const *gate, const void *const *down,
         const void *const *gs, const void *const *ds, void *workspace, size_t bytes,
         const void *const *peers, int rank, int slot, int ranks) {
     if (ranks == 4) return Mega<4>::Create(gate, down, gs, ds, workspace, bytes, peers, rank, slot);
     if (ranks == 8) return Mega<8>::Create(gate, down, gs, ds, workspace, bytes, peers, rank, slot);
     error = "MegaMoE requires 4 or 8 ranks"; return nullptr;
 }
-extern "C" int fastllm_ep8_mega_moe_prepare_prefill(void *handle, void *workspace, size_t bytes, int rows) {
+extern "C" int fastllm_sm90_mega_moe_prepare_prefill(void *handle, void *workspace, size_t bytes, int rows) {
     if (!handle) { error = "Missing MegaMoE handle"; return -1; }
     return static_cast<LayerBase *>(handle)->ranks == 4 ? Mega<4>::PreparePrefill(handle, workspace, bytes, rows)
                                                       : Mega<8>::PreparePrefill(handle, workspace, bytes, rows);
 }
-extern "C" int fastllm_ep8_mega_moe_run_masked(void *handle, const void *x, void *y,
+extern "C" int fastllm_sm90_mega_moe_run_masked(void *handle, const void *x, void *y,
         const int32_t *idx, const float *scores, int rows, const int *liveKeys) {
     if (!handle) { error = "Missing MegaMoE handle"; return 0; }
     return static_cast<LayerBase *>(handle)->ranks == 4 ? Mega<4>::Run<CAP>(handle, x, y, idx, scores, rows, nullptr, liveKeys)
                                                       : Mega<8>::Run<CAP>(handle, x, y, idx, scores, rows, nullptr, liveKeys);
 }
-extern "C" int fastllm_ep8_mega_moe_run(void *handle, const void *x, void *y,
+extern "C" int fastllm_sm90_mega_moe_run(void *handle, const void *x, void *y,
         const int32_t *idx, const float *scores, int rows) {
-    return fastllm_ep8_mega_moe_run_masked(handle, x, y, idx, scores, rows, nullptr);
+    return fastllm_sm90_mega_moe_run_masked(handle, x, y, idx, scores, rows, nullptr);
 }
-extern "C" int fastllm_ep8_mega_moe_run_batched(void *handle, const void *x, void *y,
+extern "C" int fastllm_sm90_mega_moe_run_batched(void *handle, const void *x, void *y,
         const int32_t *idx, const float *scores, int rows, int capacity, const int *liveKeys) {
     if (capacity == CAP)
-        return fastllm_ep8_mega_moe_run_masked(handle, x, y, idx, scores, rows, liveKeys);
+        return fastllm_sm90_mega_moe_run_masked(handle, x, y, idx, scores, rows, liveKeys);
     if (!handle || capacity != BATCH_CAP) { error = "Invalid MegaMoE decode capacity"; return 0; }
     return static_cast<LayerBase *>(handle)->ranks == 4 ? Mega<4>::Run<BATCH_CAP>(handle, x, y, idx, scores, rows, nullptr, liveKeys)
                                                       : Mega<8>::Run<BATCH_CAP>(handle, x, y, idx, scores, rows, nullptr, liveKeys);
 }
-extern "C" int fastllm_ep8_mega_moe_run_prefill(void *handle, const void *const *peers,
+extern "C" int fastllm_sm90_mega_moe_run_prefill(void *handle, const void *const *peers,
         const void *x, void *y, const int32_t *idx, const float *scores, int rows) {
     if (!handle) { error = "Missing MegaMoE handle"; return 0; }
     return static_cast<LayerBase *>(handle)->ranks == 4 ? Mega<4>::RunPrefill(handle, peers, x, y, idx, scores, rows)
                                                       : Mega<8>::RunPrefill(handle, peers, x, y, idx, scores, rows);
 }
-extern "C" void fastllm_ep8_mega_moe_destroy(void *handle) {
+extern "C" void fastllm_sm90_mega_moe_destroy(void *handle) {
     if (!handle) return;
     if (static_cast<LayerBase *>(handle)->ranks == 4) Mega<4>::Destroy(handle);
     else Mega<8>::Destroy(handle);

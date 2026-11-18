@@ -7,6 +7,8 @@
 // Legacy type name; supports built-in SM90 FP8 and packaged SM120 MXFP4 kernels.
 struct FastllmCudaMimoEp8Mega;
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices);
+// Query only after group admission; preserves the calling CUDA device.
+bool FastllmCudaMimoEp8MegaOwnsPackedWeights(int device);
 // Required backing for an eligible eager prefill chunk, or zero for the
 // existing small-chunk path / builds without the SM90 backend.
 size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows, int ranks);
@@ -34,6 +36,8 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     fastllm::Data &output, bool graphDecode, fastllm::Data *residual = nullptr,
     const fastllm::Data *normWeight = nullptr, fastllm::Data *normOutput = nullptr, float eps = 0,
     fastllm::Data *prefillScratch = nullptr, const int *liveKeys = nullptr);
+
+bool FastllmCudaMimoEp8MegaWeights(FastllmCudaMimoEp8Mega&,int,int,const void**);
 // Dispatch rank-local token rows and return them in the same local order,
 // without an output AllGather. Every EP rank must pass the same maxRows;
 // local row counts may differ, including zero. Existing world-row dispatch

@@ -104,6 +104,7 @@ namespace fastllm {
         bool SupportsKvMemBatch() const override { return true; }
         bool SupportsKvMemPrefixCache() const override { return true; }
         bool SupportsSharedPagedKVPool() const override { return !tpPagedCaches.empty(); }
+        bool UsesPackedMoeSource() const { return tpPackedMoeSources; }
         int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
             AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
                            "MiMo EP8 expert loading must use the same ordered devices as TP.");
@@ -367,6 +368,7 @@ namespace fastllm {
         DataType AuxiliaryKVType() const { return kvCacheDataType == FP4_E2M1 ? FP8_E4M3 : kvCacheDataType; }
         DataType LayerKVType(int layer) const { return slidingLayers[layer] ? AuxiliaryKVType() : kvCacheDataType; }
         int PackedIndexerWidth() const { return HasSeparateIndexer() ? 0 : IndexerCacheWidth(AuxiliaryKVType()); }
+        bool ResidentMoePlacement() const;
         bool InitTensorParallel();
         void PrepareTensorParallel();
         void InitTensorParallelKVPool();
@@ -442,6 +444,8 @@ namespace fastllm {
         struct GpuPDPools;
         std::shared_ptr<GpuPDPools> pdReceivePools;
         bool tpPrepared = false;
+        bool tpMoePreparationFailed = false;
+        bool tpPackedMoeSources = false;
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
         // layout. Prefill/eager fallback temporarily uses chronological rows.
         bool tpSwaRingCache = false;

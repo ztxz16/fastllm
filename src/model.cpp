@@ -517,10 +517,10 @@ namespace fastllm {
             const auto *mimo = dynamic_cast<const NaiveN05FlashModel *>(model);
             const std::string marker = ".mlp.experts.";
             const auto start = weightName.find(marker);
-            AssertInFastLLM(mimo && start != std::string::npos &&
-                           ((data.dataType == FP8_E4M3 && data.blockM == 128 && data.blockK == 128) ||
-                            data.dataType == NVFP4),
-                           "MiMo EP loader requires original FP8 block128 or MXFP4 block32 experts.");
+            AssertInFastLLM(mimo && start != std::string::npos, "Invalid MiMo EP expert name.");
+            // Actual dtype/shape is validated as a group before packing.
+            // Unsupported formats can be resharded through the legacy path.
+            if (mimo->UsesPackedMoeSource()) data.directMemory = true;
             const int expert = std::stoi(weightName.substr(start + marker.size()));
             return PlaceMultiCudaWeightOnDevice(data, devices, mimo->Ep8ExpertDevice(expert, devices));
         }

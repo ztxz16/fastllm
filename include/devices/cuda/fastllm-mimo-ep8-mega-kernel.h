@@ -2,8 +2,9 @@
 #include <cstddef>
 #include <cstdint>
 
-// Compiled into FastLLM by the SM90 object target. No external adapter is loaded.
+// Built-in architecture-dispatched backends. No external adapter is loaded.
 extern "C" {
+const char *fastllm_ep8_mega_moe_backend_name();
 const char *fastllm_ep8_mega_moe_error();
 int fastllm_ep8_mega_moe_max_rows();
 size_t fastllm_ep8_mega_moe_workspace_bytes(int ranks);
@@ -33,3 +34,8 @@ int fastllm_ep8_mega_moe_run_prefill(void *, const void *const *, const void *, 
     const int32_t *, const float *, int);
 void fastllm_ep8_mega_moe_destroy(void *);
 }
+
+extern "C" int fastllm_ep8_mega_moe_weights(void*,const void**);
+
+extern "C" int fastllm_ep8_mega_moe_group_supported(const int*,int);
+extern "C" int fastllm_ep8_mega_moe_owns_packed_weights();
