@@ -20,7 +20,7 @@ class FakeTransport:
     def __init__(self, binary, worker, model, devices, output, **options):
         self.devices = list(map(int, devices.split(',')))
         self.graph = options['cuda_graph']
-        self.history, self.fail, self.delay = [], False, 0.003
+        self.history, self.trace_flags, self.fail, self.delay = [], [], False, 0.003
         self.states = [dict(request_active=False, request_tokens=0, request_capacity=0, request_kv_bytes=0,
                             reserved_kv_bytes=0, workspace_bytes=0, captures=0, replays=0,
                             prefix_cache=dict(snapshots=[], entries=0, device_bytes=0)) for _ in self.devices]
@@ -42,6 +42,7 @@ class FakeTransport:
             return dict(states=copy.deepcopy(self.states))
         steps = fields['steps']
         self.history.append(copy.deepcopy(steps))
+        self.trace_flags.append(fields['trace'])
         graph = self.graph and not any(s['action'] == 1 for s in steps) and any(s['action'] == 2 for s in steps)
         tokens = []
         for i, (step, state) in enumerate(zip(steps, self.states)):
@@ -124,6 +125,39 @@ class MoeSessionTests(unittest.TestCase):
         with self.session(trace=False) as session:
             result = session.generate(request())
             self.assertTrue(all('joint_round' not in step for step in result['steps']))
+
+    def test_selected_trace_only_requests_logits_at_chosen_positions(self):
+        """/** 只在目标位置取回logits，全程记录真实联合调度，输出和原生输入保持不变。 */"""
+        with self.session(trace=True, trace_token_positions=[2, 4]) as session:
+            result = session.generate(request())
+            self.assertEqual(session._transport.trace_flags, [False, True, False, True, False])
+            self.assertEqual(result['token_ids'], [1] * 4)
+            self.assertEqual([i for i, s in enumerate(result['steps'], 1) if 'logits' in s], [2, 4])
+            for i, step in enumerate(result['steps'], 1):
+                self.assertEqual(step['trace_schedule']['token_positions_1based'], [i, None, None, None])
+                self.assertEqual(step['trace_schedule']['input_lengths'], [i+2, None, None, None])
+                self.assertEqual(step['trace_schedule']['request_ids'], [result['id'], None, None, None])
+                self.assertEqual(step['trace_schedule']['round_1based'], i)
+            self.assertEqual([r[0]['token_ids'] for r in session._transport.history], [[1, 2, 3], [1], [1], [1], []])
+
+    def test_selected_trace_in_concurrent_mixed_rounds(self):
+        """/** 并发请求输出位置不齐时按各请求位置取证，不把其他rank的同轮位置误标为目标。 */"""
+        with self.session(trace=True, trace_token_positions=[2], cuda_graph=True) as session, ThreadPoolExecutor(4) as pool:
+            reports = list(pool.map(lambda i: session.generate(request(i+1, i+3)), range(4)))
+            for report in reports:
+                self.assertEqual([i for i, s in enumerate(report['steps'], 1) if 'logits' in s], [2])
+                for i, step in enumerate(report['steps'], 1):
+                    self.assertEqual(step['trace_schedule']['token_positions_1based'][report['dp_rank']], i)
+                    self.assertEqual(step['trace_schedule']['request_ids'][report['dp_rank']], report['id'])
+
+    def test_invalid_selected_trace_rejected_before_transport(self):
+        """/** 拒绝未启用trace、重复、空或非法位置，防止无效诊断启动原生进程。 */"""
+        for trace, positions in [(False, [2]), (True, []), (True, [0]), (True, [True]),
+                                 (True, [2, 2]), (True, '2')]:
+            with self.subTest(trace=trace, positions=positions), patch.object(moe, 'RoundTransport') as transport:
+                with self.assertRaises(ValueError):
+                    self.session(trace=trace, trace_token_positions=positions)
+                transport.assert_not_called()
 
     def test_eos_and_callback_cancel_do_not_poison_peers(self):
         with self.session() as session, ThreadPoolExecutor(2) as pool:
