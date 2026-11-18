@@ -21,7 +21,7 @@ from run_process_tp import ROOT, capture, save_report, case_process, wait_case, 
 from qwen_moe_reference import fixture, full_logits
 from fastllm_pytools.qwen_moe_process_session import QwenMoeProcessSession, BACKEND
 from fastllm_pytools.qwen3_process_session import GenerationCancelled, GenerationObserverError
-from generation_alignment import POLICY_SOURCE, compare_generation, validate_policy
+from generation_alignment import POLICY_SOURCE, compare_generation, compare_generation_all, validate_policy
 
 
 SYNTHETIC_FIXTURES = {
@@ -137,9 +137,10 @@ def align_tied_routing(actual, expected, tokens, experts, topk):
 class Suite:
     """/** 每case保存原始证据，即使中途失败也生成四种汇总格式。 */"""
 
-    def __init__(self, args):
+    def __init__(self, args, *, output=None):
         self.args = args
-        self.output = args.output.resolve() / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_moe_full_' + uuid.uuid4().hex[:8])
+        self.output = output if output is not None else args.output.resolve() / (
+            datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_moe_full_' + uuid.uuid4().hex[:8])
         self.output.mkdir(parents=True)
         self.rows, self.counter = [], 0
         self.metadata = dict(command=shlex.join([sys.executable, *sys.argv]), git=capture(['git', 'rev-parse', 'HEAD']),
@@ -170,11 +171,38 @@ class Suite:
             self.rows.append(row)
             save_report(self.output, self.rows, self.metadata)
             print(f'{row["status"]}: {name} {row["reason"]}', flush=True)
+            if row.get('alignment_policy') == 'all':
+                print(f'ALIGNMENT: {name} exact={row["exact_status"]} '
+                      f'top5={row["top5_status"]} top5+0.1={row["top5_near_tie_status"]}', flush=True)
             if row.get('logit_diagnostic_status') == 'WARNING':
                 print(f'WARNING: {name} logits数值超差（不影响生成验收判定）; '
                       f'max_abs={row["max_abs_error"]:.3f} mean_abs={row["mean_abs_error"]:.3f} '
                       f'exceeded_elements={row["logit_failed_elements"]}', flush=True)
         return row['status'] == 'PASS'
+
+    def compare_generation_report(self, report, expected, tokenizer, reference_path, index, scope):
+        """/**
+         * 从同一份自由生成输出计算选定规则或全部三种生成规则，并保存一次原始证据。
+         * @param report FT正式会话输出，不触发额外生成或教师强制。
+         * @param expected 对应请求的独立HF生成输出。
+         * @param tokenizer 与参考相同的文本解码器。
+         * @param reference_path HF原始证据路径。
+         * @param index HF请求索引。
+         * @param scope 共同Eager配置或FT生产扩展配置。
+         * @return 独立策略结论、共同数值诊断及原始输出；规则失败由case保留为FAIL。
+         */"""
+        report['text'] = tokenizer.decode(report['token_ids'], skip_special_tokens=False,
+                                          clean_up_tokenization_spaces=False)
+        if self.args.alignment_policy == 'all':
+            result = compare_generation_all(report, expected)
+        else:
+            result = compare_generation(report, expected, policy=self.args.alignment_policy,
+                topk=self.args.alignment_topk, near_tie_tol=self.args.near_tie_tol)
+        summary = {key: value for key, value in result.items()
+                   if key not in ('candidate_checks', 'logit_diagnostics', 'comparisons')}
+        summary['configuration_scope'] = scope
+        return dict(summary=summary, comparison=result, actual=report,
+                    reference_file=str(reference_path), reference_request=index)
 
     def session(self, model, world, graph=False, prefix=False, trace=True, routing='round_robin'):
         """/** 新建独立权重生命周期，不复用旧结果目录；不自动编译或下载。 */"""
@@ -238,15 +266,9 @@ class Suite:
                         def compare(_):
                             """/** 输出生成门禁与独立数值诊断，数值超差只警告，不覆盖候选级结论。 */"""
                             require(report['request'] == requests[index], 'FT prompt or sampling configuration changed')
-                            report['text'] = tokenizer.decode(report['token_ids'], skip_special_tokens=False,
-                                                              clean_up_tokenization_spaces=False)
-                            result = compare_generation(report, expected[index], policy=self.args.alignment_policy,
-                                topk=self.args.alignment_topk, near_tie_tol=self.args.near_tie_tol)
-                            summary = {key: value for key, value in result.items()
-                                       if key not in ('candidate_checks', 'logit_diagnostics')}
-                            summary['configuration_scope'] = 'shared_eager' if not graph and not prefix else 'ft_production_vs_hf_eager'
-                            return dict(summary=summary, comparison=result, actual=report,
-                                        reference_file=str(reference_path), reference_request=index)
+                            scope = 'shared_eager' if not graph and not prefix else 'ft_production_vs_hf_eager'
+                            return self.compare_generation_report(report, expected[index], tokenizer,
+                                                                  reference_path, index, scope)
                         self.case(f'{mode}_{phase}_request{index:03d}', compare)
 
                 def run(_):
@@ -268,15 +290,9 @@ class Suite:
                             # 再次生成也不使用教师强制；候选验收仍使用相同HF独立参考。
                             def hot_check(_):
                                 """/** 对缓存命中的自由生成使用同一HF参考，保留首个分歧证据。 */"""
-                                hot['text'] = tokenizer.decode(hot['token_ids'], skip_special_tokens=False,
-                                                              clean_up_tokenization_spaces=False)
-                                result = compare_generation(hot, expected[0], policy=self.args.alignment_policy,
-                                    topk=self.args.alignment_topk, near_tie_tol=self.args.near_tie_tol)
-                                summary = {key: value for key, value in result.items()
-                                           if key not in ('candidate_checks', 'logit_diagnostics')}
-                                summary['configuration_scope'] = 'ft_production_vs_hf_eager'
-                                return dict(summary=summary, comparison=result, actual=hot,
-                                            reference_file=str(reference_path), reference_request=0)
+                                require(hot['request'] == requests[0], 'FT prefix prompt or sampling configuration changed')
+                                return self.compare_generation_report(hot, expected[0], tokenizer,
+                                    reference_path, 0, 'ft_production_vs_hf_eager')
                             self.case(mode + '_prefix_route', hot_check)
                             session.clear_prefix_cache()
                     return dict(shutdown=session.shutdown)
@@ -545,6 +561,95 @@ class Suite:
             self.case(f'perf_graph{int(graph)}_cache_{cache}_concurrency{concurrency}', run)
 
 
+def summarize_alignment_stage(stage, phase):
+    """/**
+     * 将阶段明细归并成独立策略结论，运行失败及缺失用例对所有受影响策略生效。
+     * 宽松候选通过不能覆盖exact或严格Top-5失败；均值保留在逐case明细，避免
+     * 混合不同张量大小的不加权均值。根报告failed_elements表示失败case数。
+     * @param stage 已保存四格式报告的阶段Suite。
+     * @param phase generation或numeric。
+     * @return 三条生成策略汇总或一条numeric汇总；未完成的阶段均标记FAIL。
+     */"""
+    report = json.loads((stage.output / 'summary.json').read_text())
+    policies = ('exact', 'top5', 'top5_near_tie') if phase == 'generation' else ('numeric',)
+    rows = []
+    for policy in policies:
+        failures = []
+        for case in report['cases']:
+            if case.get(policy + '_status', case['status']) != 'PASS':
+                reason = case.get(policy + '_reason', case.get('reason', ''))
+                failures.append(f'{case["case"]}: {reason}')
+        if not report['complete']:
+            failures.append(f'incomplete stage: {report["completed_case_count"]}/{report["expected_case_count"]} cases')
+        errors = [case['max_abs_error'] for case in report['cases'] if case.get('max_abs_error') is not None]
+        row = dict(case=policy, alignment_policy=policy, backend=BACKEND,
+                   status='FAIL' if failures else 'PASS', complete=report['complete'],
+                   completed_case_count=report['completed_case_count'], expected_case_count=report['expected_case_count'],
+                   max_abs_error=max(errors) if errors else None, mean_abs_error=None,
+                   failed_elements=len(failures), reason='; '.join(failures),
+                   detail_report=str(stage.output / 'summary.json'))
+        if phase == 'generation':
+            compared = [case for case in report['cases'] if 'exact_status' in case]
+            row.update(topk=5, near_tie_tol=0.0 if policy == 'top5' else 0.1,
+                       token_match=all(case['token_match'] for case in compared) if compared else None,
+                       text_match=all(case['text_match'] for case in compared) if compared else None)
+        rows.append(row)
+    return rows
+
+
+def run_all_alignment(suite, args, prompts, tokenizer):
+    """/**
+     * 顺序执行一套自由生成和独立numeric验收，并逐阶段保存四项汇总。
+     * 普通失败保留后继续下一阶段；用户中断会保存部分报告并立即停止。
+     * 两阶段使用独立输出目录和显存生命周期，不复用教师强制数据作生成证据。
+     * @param suite 根报告Suite，统一保存命令、硬件及Git元信息。
+     * @param args 已校验的all模式参数；固定K=5、宽松容差0.1。
+     * @param prompts 双方共用的Prompt ID和生成配置。
+     * @param tokenizer 生成文本解码器。
+     * @return 无；四项状态写入suite.rows，最终任一失败返回非零。
+     */"""
+    suite.metadata.update(alignment_policy='all', expected_case_count=4, execution_complete=False,
+        correctness='exact + strict Top-5 + Top-5/0.1 on shared independent generation; separate strict numeric',
+        model_path=str(args.model.resolve()), policy_source=POLICY_SOURCE, stages={},
+        report_title='FT vs HF: four alignment checks',
+        report_description='前三项复用同一批独立生成；numeric单独运行。每项结论均保留，任一失败则总体FAIL。'
+                           '根报告failed_elements统计失败case及未完成标记；最大误差取阶段case最大值，'
+                           '均值和元素级失败数见各阶段明细。生成数值诊断只警告，numeric仍严格失败。')
+    save_report(suite.output, suite.rows, suite.metadata)
+
+    for phase in ('generation', 'numeric'):
+        stage_args = argparse.Namespace(**vars(args))
+        stage_args.alignment_policy = 'all' if phase == 'generation' else 'numeric'
+        stage = Suite(stage_args, output=suite.output / phase)
+        stage.metadata.update(expected_case_count=8 * len(prompts) + 6 if phase == 'generation' else 5,
+                              execution_complete=False, alignment_stage=phase,
+                              parent_report=str(suite.output / 'summary.json'))
+        (stage.output / 'requests.json').write_text(json.dumps(prompts, ensure_ascii=False, indent=2))
+        suite.metadata['stages'][phase] = str(stage.output / 'summary.json')
+        save_report(stage.output, stage.rows, stage.metadata)
+        try:
+            if phase == 'generation':
+                stage.generation_alignment(args.model, prompts, tokenizer)
+            else:
+                run_numeric_reference(stage, stage_args, prompts)
+            stage.metadata['execution_complete'] = True
+        except BaseException as error:
+            (stage.output / 'setup.traceback.log').write_text(traceback.format_exc())
+            stage.rows.append(dict(case=phase + '_setup', backend=BACKEND, status='FAIL',
+                                   failed_elements=1, reason=f'{type(error).__name__}: {error}'))
+            print(f'FAIL: {phase}: {error}', file=sys.stderr, flush=True)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+        finally:
+            save_report(stage.output, stage.rows, stage.metadata)
+            rows = summarize_alignment_stage(stage, phase)
+            suite.rows.extend(rows)
+            suite.metadata['execution_complete'] = len(suite.rows) == 4 and all(row['complete'] for row in suite.rows)
+            save_report(suite.output, suite.rows, suite.metadata)
+            for row in rows:
+                print(f'{row["status"]}: alignment/{row["case"]}; details: {row["detail_report"]}', flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
@@ -553,8 +658,8 @@ def main():
     parser.add_argument('--model', type=Path, help='真实Qwen1.5-MoE目录；省略则运行小模型及生命周期')
     parser.add_argument('--requests', type=Path, default=ROOT / 'test/distributed/data/qwen_moe_requests.jsonl')
     parser.add_argument('--reference-python', default=sys.executable, help='独立Transformers参考环境的Python路径')
-    parser.add_argument('--alignment-policy', choices=('topk', 'exact', 'numeric'), default='topk',
-                        help='真实模型验收：默认Top-K候选；exact为完整Token/文本一致；numeric保留原逐层与logits门禁')
+    parser.add_argument('--alignment-policy', choices=('topk', 'exact', 'numeric', 'all'), default='topk',
+                        help='默认Top-K；exact严格输出；numeric严格数值；all共用生成检查三种规则后独立运行numeric')
     parser.add_argument('--alignment-topk', type=int, default=5, help='生成验收候选数，不改变实际采样')
     parser.add_argument('--near-tie-tol', type=float, default=0.1, help='候选边界logprob容差；0为严格双向Top-K包含')
     parser.add_argument('--performance', action='store_true')
@@ -568,8 +673,13 @@ def main():
         parser.error('--repeat必须为正整数，重复执行必须指定--synthetic-case')
     if args.synthetic_case and (args.model or args.performance):
         parser.error('--synthetic-case不能与--model或--performance混用')
+    if args.alignment_policy == 'all':
+        if not args.model or args.performance:
+            parser.error('all仅用于真实模型功能验收，需要--model，不能与--performance混用')
+        if args.alignment_topk != 5 or args.near_tie_tol != 0.1:
+            parser.error('all固定比较exact、Top-5/0、Top-5/0.1及numeric，不能覆盖K或宽松容差')
     try:
-        validate_policy('topk' if args.alignment_policy == 'numeric' else args.alignment_policy,
+        validate_policy('topk' if args.alignment_policy in ('numeric', 'all') else args.alignment_policy,
                         args.alignment_topk, args.near_tie_tol)
     except ValueError as error:
         parser.error(str(error))
@@ -585,7 +695,9 @@ def main():
                        for row in (json.loads(line) for line in args.requests.read_text().splitlines() if line.strip())]
             require(prompts, 'empty JSONL request set')
             (suite.output / 'requests.json').write_text(json.dumps(prompts, ensure_ascii=False, indent=2))
-            if args.alignment_policy != 'numeric':
+            if args.alignment_policy == 'all':
+                run_all_alignment(suite, args, prompts, tokenizer)
+            elif args.alignment_policy != 'numeric':
                 suite.generation_alignment(args.model, prompts, tokenizer)
             else:
                 run_numeric_reference(suite, args, prompts)

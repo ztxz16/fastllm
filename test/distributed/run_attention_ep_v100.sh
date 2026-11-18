@@ -49,10 +49,11 @@ PY
         "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" \
             --synthetic-case "$2" --repeat "${3:-10}"
         ;;
-    real|real-exact|real-numeric)
+    real|real-exact|real-numeric|real-all)
         moe_alignment="${ATTENTION_EP_ALIGNMENT_POLICY:-topk}"
         [[ "$moe_stage" != real-exact ]] || moe_alignment=exact
         [[ "$moe_stage" != real-numeric ]] || moe_alignment=numeric
+        [[ "$moe_stage" != real-all ]] || moe_alignment=all
         "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" --model "$moe_model" \
             --reference-python "${ATTENTION_EP_REFERENCE_PYTHON:-$moe_python}" \
             --alignment-policy "$moe_alignment" --alignment-topk "${ATTENTION_EP_ALIGNMENT_TOPK:-5}" \
@@ -71,7 +72,7 @@ PY
         "$moe_python" test/distributed/run_qwen3_decode.py --check "$moe_build/fastllm_tp_decode_check" "${moe_dense[@]}" --cuda-graph
         "$moe_python" test/distributed/run_attention_ep_dense_regression.py --build "$moe_build"
         ;;
-    *) echo 'usage: bash test/distributed/run_attention_ep_v100.sh {build|synthetic|reproduce CASE [REPEAT]|real|real-exact|real-numeric|http|performance|regression}' >&2; exit 2 ;;
+    *) echo 'usage: bash test/distributed/run_attention_ep_v100.sh {build|synthetic|reproduce CASE [REPEAT]|real|real-exact|real-numeric|real-all|http|performance|regression}' >&2; exit 2 ;;
 esac
 if [[ "$moe_stage" == reproduce ]]; then
     echo 'PASS: reproduce（仅定向复现，不代表完整验收通过）；结果见本次summary.json。'

@@ -159,3 +159,39 @@ def compare_generation(actual, expected, *, policy='topk', topk=5, near_tie_tol=
                 failed_elements=int(not passed), logit_failed_elements=bad_logits,
                 logit_diagnostic_status='WARNING' if bad_logits else 'PASS', reason=reason,
                 candidate_checks=checks, logit_diagnostics=diagnostics)
+
+
+def compare_generation_all(actual, expected):
+    """/**
+     * 对同一份独立生成证据同时给出exact、严格Top-5及Top-5+0.1结论。
+     * 完整输入验证、同历史logits诊断和Top-K计算仅执行一次。严格候选规则
+     * 只读取真实集合成员关系，不能沿用宽松门槛的通过结果；数值诊断仍只警告。
+     * @param actual FT公开会话保存的完整生成报告。
+     * @param expected HF公开generate保存的独立生成报告。
+     * @return 含三项独立结论及共同证据的报告；任一项失败则总体失败。
+     */"""
+    relaxed = compare_generation(actual, expected, policy='topk', topk=5, near_tie_tol=0.1)
+    strict_checks = [dict(check, accepted=check['in_other_topk'], near_tie_accepted=False,
+                          relaxed_cutoff_logprob=check['other_cutoff_logprob'])
+                     for check in relaxed['candidate_checks']]
+    strict_pass = all(check['accepted'] for check in strict_checks)
+    strict = dict(relaxed, near_tie_tol=0.0, candidate_checks=strict_checks,
+                  near_tie_accepted_directions=0, candidate_match=strict_pass,
+                  status='PASS' if strict_pass else 'FAIL', failed_elements=int(not strict_pass),
+                  reason='' if strict_pass else
+                  f'first divergence at token {relaxed["first_divergence_token_1based"]}: mutual candidate check failed')
+    exact = dict(relaxed, alignment_policy='exact',
+                 status='PASS' if relaxed['exact_match'] else 'FAIL',
+                 failed_elements=int(not relaxed['exact_match']),
+                 reason='' if relaxed['exact_match'] else 'generated token IDs or text differ')
+    comparisons = dict(exact=exact, top5=strict, top5_near_tie=relaxed)
+
+    failures = [f'{name}: {result["reason"]}' for name, result in comparisons.items()
+                if result['status'] != 'PASS']
+    result = dict(relaxed, alignment_policy='all', comparisons=comparisons,
+                  status='FAIL' if failures else 'PASS', failed_elements=int(bool(failures)),
+                  reason='; '.join(failures))
+    for name, comparison in comparisons.items():
+        result[name + '_status'] = comparison['status']
+        result[name + '_reason'] = comparison['reason']
+    return result

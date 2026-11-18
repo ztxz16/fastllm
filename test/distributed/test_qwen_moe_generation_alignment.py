@@ -54,7 +54,7 @@ class RunnerTests(unittest.TestCase):
             session = Session(actual, calls, prefix_reused)
             tokenizer = SimpleNamespace(decode=lambda tokens, **kwargs: str(tokens))
             console = io.StringIO()
-            with mock.patch.object(runner, 'case_process', return_value=nullcontext()), \
+            with mock.patch.object(runner, 'case_process', return_value=nullcontext()) as reference_process, \
                     mock.patch.object(runner, 'wait_case', return_value=reference_exit), \
                     mock.patch.object(suite, 'session', side_effect=lambda *a: nullcontext(session)), \
                     redirect_stdout(console):
@@ -67,7 +67,31 @@ class RunnerTests(unittest.TestCase):
             self.assertIn('exact_match', csv)
             self.assertTrue(calls)
             self.assertTrue(all(value is None for value in calls))
+            if policy == 'all':
+                reference_process.assert_called_once()
+                self.assertEqual(len(calls), 10)
+                evidence = json.loads((root / 'real_ep4_graph0_prefix0_cold_request000.json').read_text())
+                self.assertEqual(evidence['actual']['token_ids'], actual['token_ids'])
+                self.assertEqual(set(evidence['comparison']['comparisons']), {'exact', 'top5', 'top5_near_tie'})
+                self.assertEqual(evidence['reference_request'], 0)
+                for field in ('exact_status', 'top5_status', 'top5_near_tie_status'):
+                    self.assertIn(field, csv)
             return summary, console.getvalue()
+
+    def test_all_reuses_generation_and_keeps_independent_conclusions(self):
+        """/** exact和严格候选失败后仍完成全部模式，只生成一次且三项结论分别保存。 */"""
+        actual, expected = report([[10., 0., -1., -2., -3., -4.]]), report([[-4., 0., -1., -2., -3., 10.]])
+        result, console = self.run_suite(actual, expected, policy='all')
+        self.assertEqual(result['status'], 'FAIL')
+        self.assertTrue(result['complete'])
+        cases = [row for row in result['cases'] if 'alignment_policy' in row]
+        self.assertEqual(len(cases), 10)
+        self.assertTrue(all(row['exact_status'] == row['top5_status'] == 'FAIL' and
+                            row['top5_near_tie_status'] == 'PASS' for row in cases))
+        self.assertEqual(console.count('ALIGNMENT:'), 10)
+
+        result, _ = self.run_suite(actual, actual, policy='all')
+        self.assertEqual(result['status'], 'PASS')
 
     def test_default_policy_warns_without_failing_for_numeric_error(self):
         """/** 数值超差保留误差并输出警告，阈值内不警告；共同配置与生产扩展分开标记。 */"""

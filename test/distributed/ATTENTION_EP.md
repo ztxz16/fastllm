@@ -10,6 +10,8 @@
 候选门槛容差0.1。此前全量logits和逐层/路由的严格检查保留为`real-numeric`，
 阈值与历史FAIL不改写。本文历史实验中的“阈值保持不变”仍指严格数值诊断。
 本次修改只调整测试及报告；不修改正式推理计算，不代表真实GPU验收已经通过。
+需要一次查看四项结论时使用`real-all`：exact、严格Top-5和Top-5+0.1共用一次生成矩阵，
+随后独立运行numeric。旧的单策略入口及默认值保持不变。
 
 ## 实现与生命周期
 
@@ -154,10 +156,40 @@ bash test/distributed/run_attention_ep_v100.sh real-exact
 ATTENTION_EP_NEAR_TIE_TOL=0 bash test/distributed/run_attention_ep_v100.sh real
 # 原来的逐层/路由/全量logits严格数值诊断
 bash test/distributed/run_attention_ep_v100.sh real-numeric
+# 一套自由生成同时判定三种规则，再单独运行numeric；不编译
+bash test/distributed/run_attention_ep_v100.sh real-all
 ```
 
 各命令新建独立目录并生成JSON/Markdown/CSV/XLSX。历史报告继续按原规则解释，
 不得把旧FAIL改写成PASS；新规则需重新运行并标明策略后才能得出新结论。
+
+### 四项联合验收
+
+`real-all`等价于真实模型入口的`--alignment-policy all`。固定比较exact、K=5/容差0、
+K=5/容差0.1和numeric；若环境覆盖了K或宽松容差，入口会拒绝运行，避免报告名称与实际
+规则不符。该模式不与`--performance`混用；性能测试继续使用独立入口。
+
+- HF自由生成参考只运行一次；FT只运行原有Graph/Prefix、cold/warm及前缀路由矩阵。
+  每个请求的三种判定共用同一份Token、文本和原始logits，不为切换规则重新生成。
+- 三种结论分别保存。exact失败或严格Top-5失败后，仍完成其他请求和numeric。
+  模型执行、输入验证、Graph/Prefix路径检查失败会使对应生成策略全部失败。
+- numeric使用独立参考进程及教师强制历史，继续执行逐层/专家路由和四组Graph/Prefix
+  数值检查；不能把生成报告中的数值WARNING当作numeric PASS。
+- 普通阶段异常会保存部分报告并继续下一阶段；Ctrl+C保存部分报告后停止，不启动下一阶段。
+  阶段缺失、少跑用例或中途退出均标记`complete=false`。四项任一失败时最终返回非零。
+
+每次运行创建新的`时间戳_moe_full_随机号/`目录：
+
+- 根目录`summary.json/md/csv/xlsx`：exact、top5、top5_near_tie、numeric四行独立结论，
+  包含阶段完成状态及明细报告路径。根报告失败数统计失败case及未完成标记；最大误差取
+  阶段case最大值，平均误差不跨不同大小的张量直接平均，应查看逐case报告。
+- `generation/summary.json/md/csv/xlsx`：逐请求的三种状态、Token/文本一致性、首次分歧、
+  已比较与未比较步数、数值误差及WARNING。每个case JSON仅保存一份FT原始生成数据，
+  三套候选/严格判定放在`comparison.comparisons`，HF原始结果保存在同目录参考文件中。
+- `numeric/summary.json/md/csv/xlsx`：原严格数值检查的独立明细与失败原因。
+
+JSON保留原始数值精度，其余表格浮点显示三位小数。根报告只有四项全部完成并通过才为PASS，
+不能用宽松策略的通过覆盖严格策略的失败；已有历史报告不修改。
 
 ## 失败历史的分层定位
 

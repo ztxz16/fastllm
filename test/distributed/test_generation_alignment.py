@@ -3,8 +3,9 @@
 import copy
 import math
 import unittest
+from unittest import mock
 
-from generation_alignment import candidate_check, compare_generation, top_logprobs, validate_policy
+from generation_alignment import candidate_check, compare_generation, compare_generation_all, top_logprobs, validate_policy
 
 
 def report(vectors, tokens=None):
@@ -18,6 +19,53 @@ def report(vectors, tokens=None):
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_all_matches_individual_policies_on_the_same_evidence(self):
+        """/** 同一数据的三项结论必须等于独立判定，且不修改原始生成证据。 */"""
+        same = report([[5., 4., 3., 2., 1., 0.]])
+        changed_text = copy.deepcopy(same)
+        changed_text['text'] = 'different decoder'
+        pairs = [(same, same), (same, changed_text),
+                 (report([[2., 1., 0., -1., -2., -3.]]), report([[1., 2., 0., -1., -2., -3.]])),
+                 (report([[10., 0., -1., -2., -3., -4.]]), report([[-4., 0., -1., -2., -3., 10.]])),
+                 (report([[.01, 0., 0., 0., 0., 0.]]), report([[-100., -10., -20., -30., -40., 10.]]))]
+        for actual, expected in pairs:
+            before = copy.deepcopy((actual, expected))
+            result = compare_generation_all(actual, expected)
+            for name, policy, tolerance in (('exact', 'exact', .1), ('top5', 'topk', 0.),
+                                            ('top5_near_tie', 'topk', .1)):
+                with self.subTest(name=name, tokens=(actual['token_ids'], expected['token_ids'])):
+                    individual = compare_generation(actual, expected, policy=policy, near_tie_tol=tolerance)
+                    self.assertEqual(result['comparisons'][name], individual)
+                    self.assertEqual(result[name + '_status'], individual['status'])
+            self.assertEqual(result['status'], 'PASS' if result['exact_match'] else 'FAIL')
+            self.assertEqual((actual, expected), before)
+
+    def test_all_normalizes_only_once_and_does_not_hide_strict_failure(self):
+        """/** 三项判定共用一次双侧Top-K计算，宽松通过仍保留严格失败与数值警告。 */"""
+        actual = report([[10., 0., -1., -2., -3., -4.]])
+        expected = report([[-4., 0., -1., -2., -3., 10.]])
+        with mock.patch('generation_alignment.top_logprobs', wraps=top_logprobs) as normalize:
+            result = compare_generation_all(actual, expected)
+        self.assertEqual(normalize.call_count, 2)
+        self.assertEqual([result[key + '_status'] for key in ('exact', 'top5', 'top5_near_tie')],
+                         ['FAIL', 'FAIL', 'PASS'])
+        self.assertEqual(result['status'], 'FAIL')
+        self.assertEqual(result['logit_diagnostic_status'], 'WARNING')
+        self.assertEqual(result['max_abs_error'], 14.)
+
+    def test_all_rejects_missing_or_invalid_evidence_after_divergence(self):
+        """/** 全策略入口仍校验整个生成序列，不能利用首次分歧后的短路掩盖缺失数据。 */"""
+        actual = report([[2., 1., 0., -1., -2., -3.]] * 2)
+        expected = report([[1., 2., 0., -1., -2., -3.]] * 2)
+        for invalid in ('missing', 'nan'):
+            broken = copy.deepcopy(actual)
+            if invalid == 'missing':
+                broken['steps'].pop()
+            else:
+                broken['steps'][-1]['logits'][0] = float('nan')
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                compare_generation_all(broken, expected)
+
     def test_same_output_can_pass_generation_with_numeric_diagnostic_warning(self):
         """/** 相同Token/文本可通过两个生成等级，数值超差只记录WARNING并保留误差。 */"""
         actual, expected = report([[9., 2., 1., 0., -1., -2.]]), report([[5., 1., 0., -1., -2., -3.]])
