@@ -39,7 +39,7 @@ PY
             fastllm_tp_shard_check -j "${ATTENTION_EP_JOBS:-4}"
         ;;
     synthetic)
-        "$moe_python" test/distributed/run_parallel_config.py --execution-tests --benchmark-tests
+        "${ATTENTION_EP_REFERENCE_PYTHON:-$moe_python}" test/distributed/run_parallel_config.py --execution-tests --benchmark-tests
         "$moe_python" test/distributed/run_qwen_moe_layer.py --check "$moe_build/fastllm_moe_layer_check" \
             --worker "$moe_build/fastllm_tp_worker" --devices 0,1,2,3 --build-cache "$moe_build/CMakeCache.txt"
         "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}"

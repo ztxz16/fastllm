@@ -100,6 +100,8 @@ bash test/distributed/run_attention_ep_v100.sh performance
 真实模型参考在独立进程加载 Transformers FP16 权重，按层分布至四卡；不会与 FastLLM 同时驻留。
 参考进程需要已安装支持该模型的 PyTorch、Transformers、Accelerate；脚本不安装、不下载。
 如另有参考虚拟环境，设置 `ATTENTION_EP_REFERENCE_PYTHON=/该环境/bin/python3`。
+`synthetic` 阶段的 Python 回归检查也优先使用该参考环境，以满足其中 CPU PyTorch
+参考用例的依赖；变量未设置或为空时使用主 Python 环境。后续 GPU 验收仍使用主环境。
 参考模型按连续层显式分配到四卡，避免自动放置把权重全部放在一张 32 GiB 卡上。
 Embedding与RoPE在GPU 0，最终Norm在GPU 3，绑定的LM Head与Embedding同卡。
 设备映射不包含根模块兜底，首次前向前检查全部参数、buffer和子模块执行hook是否同卡。
