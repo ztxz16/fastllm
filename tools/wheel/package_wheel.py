@@ -50,6 +50,8 @@ def main():
         # copy command. Always stage current Python sources, not that old copy.
         shutil.copytree(source / 'tools/fastllm_pytools', package,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        shutil.copytree(source / 'third_party/flashinfer_sm120_ep',
+                        package / 'licenses/flashinfer_sm120_ep')
         shutil.copy2(source / 'tools/fastllm_triton_server.py', package / 'fastllm_triton_server.py')
         shutil.copy2(source / 'tools/scripts/setup.py', stage / 'setup.py')
         shutil.copy2(build / 'cuda/build_info.json', package / 'build_info.json')
@@ -78,7 +80,8 @@ def main():
         shutil.copy2(numa.resolve(), package / 'libnuma.so.1')
         libraries = []
         for path in sorted(package.rglob('*')):
-            if not path.is_file():
+            # CUBINs are device ELF files whose exact bytes are pinned by the manifest.
+            if not path.is_file() or path.suffix == '.cubin':
                 continue
             with path.open('rb') as f:
                 is_elf = f.read(4) == b'\x7fELF'

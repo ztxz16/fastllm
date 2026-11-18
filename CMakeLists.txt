@@ -4313,6 +4313,10 @@ if (FASTLLM_MIMO_EP8_MEGA_ENABLED AND ("100" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR 
 endif()
 
 if (USE_CUDA AND NOT USE_ROCM)
+    # A package-only update must refresh the POST_BUILD copy as well.
+    file(GLOB sm120_ep_manifests "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/kernels/mxfp4_ep/*/manifest.json")
+    set_property(TARGET fastllm_tools APPEND PROPERTY LINK_DEPENDS
+        ${sm120_ep_manifests} "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_sm120_ep/UPSTREAM.json")
     add_custom_command(TARGET fastllm_tools POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/flashinfer_sm120_ep
         COMMAND ${CMAKE_COMMAND} -E copy_directory
