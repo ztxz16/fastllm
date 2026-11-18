@@ -3499,8 +3499,8 @@ class Fixture : public NaiveN05FlashModel {
         });
         ready.store(true); mainLoop->join(); delete mainLoop; mainLoop = nullptr;
         if (error) std::rethrow_exception(error);
-        if (pipelined < 6 * (stepsPerSegment - 1))
-            throw std::runtime_error("DP pipeline lost steps outside batch admission");
+        if (pipelined != 6 * stepsPerSegment)
+            throw std::runtime_error("DP pipeline lost steps at batch admission or during decode");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (verifyGraphCaptures != captures) throw std::runtime_error("DP pipeline recaptured during churn");
 #endif

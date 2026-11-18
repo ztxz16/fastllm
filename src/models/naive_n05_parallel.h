@@ -25,18 +25,24 @@ struct NaiveN05FlashModel::AttentionParallelState {
         std::map<PagedCacheManager *, std::vector<std::pair<const Data *, int>>> pageTails;
         struct LengthField { int *length, *lastPage; int pageLen; };
         std::vector<std::vector<LengthField>> lengthFields;
+        void AdvanceRow(size_t row) const {
+            const int length = requests[row].length + 1;
+            for (const auto &field : lengthFields[row]) {
+                *field.length = length;
+                if (field.lastPage) *field.lastPage = (length - 1) % field.pageLen + 1;
+            }
+        }
         bool AdvanceMetadata(int window) const {
             if (lengthFields.size() != requests.size() || lengthFields.empty() ||
                 std::any_of(requests.begin(), requests.end(),
                     [window](const Request &r) { return r.length < window - 1; })) return false;
-            for (size_t row = 0; row < requests.size(); ++row) {
-                const int length = requests[row].length + 1;
-                for (const auto &field : lengthFields[row]) {
-                    *field.length = length;
-                    if (field.lastPage) *field.lastPage = (length - 1) % field.pageLen + 1;
-                }
-            }
+            for (size_t row = 0; row < requests.size(); ++row) AdvanceRow(row);
             return true;
+        }
+        // Caller holds the page pool's lock.
+        static bool HasSharedTail(const Data &cache, int length) {
+            return length > 0 && length % cache.pageLen &&
+                cache.pagedKVCacheData->pageRefCount[cache.pageIndex[(length - 1) / cache.pageLen]] > 1;
         }
         bool CanAppend() const {
             if (requests.empty() || !std::all_of(requests.begin(), requests.end(),
@@ -46,14 +52,55 @@ struct NaiveN05FlashModel::AttentionParallelState {
             // lock, once per pool rather than once per request/layer.
             for (const auto &group : pageTails) {
                 std::lock_guard<std::mutex> guard(group.first->pageIndexLocker);
-                for (const auto &entry : group.second) {
-                    const auto &cache = *entry.first;
-                    const int length = requests[entry.second].length;
-                    if (length && length % cache.pageLen &&
-                        group.first->pageRefCount[cache.pageIndex[(length - 1) / cache.pageLen]] > 1) return false;
-                }
+                for (const auto &entry : group.second)
+                    if (HasSharedTail(*entry.first, requests[entry.second].length)) return false;
             }
             return true;
+        }
+        // Move surviving request metadata into the new batch order. Old roots
+        // may have been freed or recycled, so only inspect live batch roots.
+        std::vector<int> Reorder(const TargetBatch &batch, int count,
+                const std::unordered_map<const Data *, uint64_t> &live) {
+            std::unordered_map<const Data *, int> oldRows;
+            for (size_t i = 0; i < requests.size(); ++i) oldRows.emplace(requests[i].key, i);
+            std::vector<int> source(count, -1), destination(requests.size(), -1);
+            std::vector<Request> next(count);
+            std::vector<std::vector<LengthField>> fields(count);
+            for (int row = 0; row < count; ++row) {
+                const Data &key = batch.Key(row, 0);
+                auto old = oldRows.find(&key);
+                auto id = live.find(&key);
+                if (old == oldRows.end() || id == live.end() || key.dims.size() != 3) continue;
+                const int index = old->second;
+                const auto &request = requests[index];
+                if (request.identity != id->second || request.length != key.dims[1] ||
+                    request.length >= request.reservedUntil) continue;
+                source[row] = index;
+                destination[index] = row;
+                next[row] = request;
+                if (!lengthFields.empty()) fields[row] = std::move(lengthFields[index]);
+            }
+            // Another request may have acquired a reference to our last page
+            // without changing the descriptor. Only that row needs reservation.
+            for (auto &group : pageTails) {
+                std::lock_guard<std::mutex> guard(group.first->pageIndexLocker);
+                for (auto &tail : group.second) {
+                    const int row = destination[tail.second];
+                    tail.second = row;
+                    if (row >= 0 && source[row] >= 0 && HasSharedTail(*tail.first, next[row].length))
+                        source[row] = -1;
+                }
+            }
+            for (auto &group : pageTails) {
+                auto &tails = group.second;
+                tails.erase(std::remove_if(tails.begin(), tails.end(),
+                    [&](const auto &tail) { return tail.second < 0 || source[tail.second] < 0; }), tails.end());
+            }
+            requests.swap(next);
+            lengthFields.swap(fields);
+            for (int row = 0; row < count; ++row)
+                if (source[row] < 0) lengthFields[row].clear();
+            return source;
         }
         bool Matches(const TargetBatch &batch, uint64_t currentEpoch,
                 const std::unordered_map<const Data *, uint64_t> &live, int liveRows) const {
@@ -88,6 +135,8 @@ struct NaiveN05FlashModel::AttentionParallelState {
     };
     RequestPlan plan;
     bool reuseBindings = false;
+    // Previous physical row on the same attention owner, or -1 to validate.
+    std::vector<int> previousBindingRows;
     struct GroupBatch {
         std::vector<std::pair<Data *, Data *>> kv;
         std::vector<GenerationConfig> configs;

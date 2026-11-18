@@ -912,29 +912,41 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
     bool PrepareAttention(int inputSlot) {
         auto &dp = *model.attentionParallel;
         auto &plan = dp.servingPlan;
-        if (!serving || !serving->sealed || !plan.valid ||
-            plan.kvType != model.kvCacheDataType ||
-            serving->generation != FastllmGetNcclGeneration()) return false;
-        {
+        if (!serving || !serving->sealed || serving->generation != FastllmGetNcclGeneration()) return false;
+        std::shared_ptr<TPDecodeState> graph;
+        bool boundary = false;
+        if (inputSlot < 0) {
+            // A new chain starts from the published CPU token for each live
+            // request. Its graph and sampler rows need no previous batch plan.
+            std::vector<int> counts;
+            graph = model.SelectAttentionServingGraph(batch, counts, &samplingRows);
+            if (!graph || batch.Size() > dp.samplingCapacity) return false;
             std::lock_guard<std::mutex> guard(model.tpRequestMutex);
-            if (!plan.Matches(batch, model.tpCacheEpoch.load(std::memory_order_relaxed),
-                    model.tpRequestIds, batch.Size())) return false;
+            for (int row = 0; row < batch.Size(); ++row)
+                if (!model.tpSamplingRequestIds.count(&batch.Key(row, 0))) return false;
+        } else {
+            // Device feedback uses the prior step's row mapping and positions.
+            auto previous = plan.graph.lock();
+            if (!plan.valid || !previous || plan.kvType != model.kvCacheDataType) return false;
+            {
+                std::lock_guard<std::mutex> guard(model.tpRequestMutex);
+                if (!plan.Matches(batch, model.tpCacheEpoch.load(std::memory_order_relaxed),
+                        model.tpRequestIds, batch.Size())) return false;
+            }
+            int longest = 0;
+            boundary = !plan.CanAppend();
+            for (const auto &request : plan.requests) {
+                const int next = request.length + 1;
+                if (next > model.max_positions) return false;
+                longest = std::max(longest, next);
+                boundary |= model.saveHistoryChat && next % GetPageLen() == 0;
+            }
+            auto found = serving->graphs.lower_bound({previous->rows, longest});
+            if (found == serving->graphs.end() || found->first.first != previous->rows) return false;
+            graph = found->second;
+            if (!graph->captured || graph->disabled) return false;
+            boundary |= graph != previous;
         }
-        auto previous = plan.graph.lock();
-        if (!previous || !previous->captured || previous->disabled) return false;
-        int longest = 0;
-        bool boundary = !plan.CanAppend();
-        for (const auto &request : plan.requests) {
-            const int next = request.length + 1;
-            if (next > model.max_positions) return false;
-            longest = std::max(longest, next);
-            boundary |= model.saveHistoryChat && next % GetPageLen() == 0;
-        }
-        auto found = serving->graphs.lower_bound({previous->rows, longest});
-        if (found == serving->graphs.end() || found->first.first != previous->rows) return false;
-        auto graph = found->second;
-        if (!graph->captured || graph->disabled) return false;
-        boundary |= graph != previous;
         for (const auto &rank : graph->ranks)
             if (!rank->exec || !rank->storage->decodeTokenRows[0].cudaData ||
                 !rank->storage->decodeTokenRows[1].cudaData) return false;
@@ -945,10 +957,7 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
         if (boundary && inputSlot >= 0)
             for (const auto &sampler : dp.sampling) if (sampler) sampler->Drain();
         if (inputSlot < 0) {
-            samplingRows.assign(model.attentionDP, {});
             for (int group = 0; group < model.attentionDP; ++group) {
-                for (int seq : dp.servingGroups[group].sequenceIndices)
-                    if (seq < batch.Size()) samplingRows[group].push_back(seq);
                 const bool constrained = std::any_of(samplingRows[group].begin(), samplingRows[group].end(),
                     [&](int row) { return bool(configs[row].tool_call_grammar); });
                 if (!samplingRows[group].empty() &&
@@ -962,6 +971,8 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
                     for (size_t row = 0; row < samplingRows[group].size(); ++row)
                         pointers[slot][samplingRows[group][row]] = dp.sampling[group]->DeviceTokens(slot) + row;
             }
+            if (pointers[0] == serving->feedbackRows[0] && pointers[1] == serving->feedbackRows[1])
+                return true;
             // Rebinding happens only at a drained chain boundary. Tables have
             // startup-owned addresses shared by all prepared model shapes.
             dp.runtime.Run([&](int rank, int) {
@@ -969,6 +980,7 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
                     FastllmCudaCopyFromHostToDevice(graph->ranks[rank]->storage->decodeTokenRows[slot].cudaData,
                         pointers[slot].data(), capacity * sizeof(void *));
             });
+            for (int slot = 0; slot < 2; ++slot) serving->feedbackRows[slot].swap(pointers[slot]);
         }
         return true;
     }
@@ -995,8 +1007,11 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
         }
         std::vector<std::pair<Data, Data>> unused;
         failedSubmission = true;
-        model.ForwardTensorParallel(ids, positions, unused, configs[0], nullptr, &selection, &batch);
+        Data output;
+        bool replayed = model.ForwardAttentionParallelServing(ids, positions, unused, configs[0],
+            &selection, &batch, output);
         failedSubmission = false;
+        if (!replayed) return false;
         for (int row = 0; row < batch.Size(); ++row) ++((float *)positions.cpuData)[row];
         return true;
     }
@@ -1009,6 +1024,24 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
             for (size_t row = 0; row < local.size(); ++row) tokens[samplingRows[group][row]] = local[row];
         }
         return tokens;
+    }
+    bool CanPreparePDReceive() const override {
+        return !model.sparseKv && !model.tpPagedCaches.empty();
+    }
+    bool WaitForRetiringRows(const std::vector<int> &rows) override {
+        auto &dp = *model.attentionParallel;
+        auto graph = dp.servingPlan.graph.lock();
+        if (!graph) return false;
+        std::vector<char> retiring(batch.Size()), owners(model.attentionDP);
+        for (int row : rows) retiring.at(row) = true;
+        for (int owner = 0; owner < model.attentionDP; ++owner)
+            for (int row : samplingRows[owner]) owners[owner] |= retiring[row];
+        // gatherReady follows the model graph and its last KV access. From
+        // this point sampling reads logits / grammar storage, never request KV.
+        for (size_t rank = 0; rank < graph->ranks.size(); ++rank)
+            if (owners[dp.runtime.Layout().AttentionOwner(rank)])
+                FastllmCudaEventSynchronize(graph->ranks[rank]->storage->gatherReady);
+        return true;
     }
     void Drain() override {
         if (failedSubmission) {

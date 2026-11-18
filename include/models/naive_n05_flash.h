@@ -489,6 +489,8 @@ namespace fastllm {
         Data ForwardAttentionParallel(const Data &inputIds, const Data &positions,
             std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
             TargetCapture *capture, LogitsSelection *selection, const TargetBatch *batch);
+        std::shared_ptr<TPDecodeState> SelectAttentionServingGraph(const TargetBatch &batch,
+            std::vector<int> &counts, std::vector<std::vector<int>> *samplingRows = nullptr) const;
         bool ForwardAttentionParallelServing(const Data &inputIds, const Data &positions,
             std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
             LogitsSelection *selection, const TargetBatch *batch, Data &output);

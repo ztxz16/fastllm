@@ -153,11 +153,28 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         std::lock_guard<std::mutex> guard(tpRequestMutex);
         return state.plan.Matches(*batch, tpCacheEpoch.load(std::memory_order_relaxed), tpRequestIds, liveRows);
     };
-    const bool reusePlan = ownedDecode && state.plan.valid &&
-        state.plan.kvType == kvCacheDataType &&
-        (!state.servingPadded || state.plan.graph.lock() == tpDecodeState) && matchesPlan();
+    const bool compatiblePlan = ownedDecode && state.plan.valid && state.plan.kvType == kvCacheDataType &&
+        (!state.servingPadded || state.plan.graph.lock() == tpDecodeState);
+    const bool reusePlan = compatiblePlan && matchesPlan();
+    const bool reserveCached = reusePlan && state.servingPadded && state.plan.CanAppend();
     // Do not publish a partially rebuilt plan after an exception.
     state.plan.valid = false;
+    std::vector<int> retained;
+    state.previousBindingRows.clear();
+    if (compatiblePlan && state.servingPadded && !reserveCached) {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        if (state.plan.epoch == tpCacheEpoch.load(std::memory_order_relaxed)) {
+            std::vector<int> localRows(state.plan.requests.size(), -1);
+            for (const auto &group : state.groups)
+                for (size_t i = 0; i < group.sequenceIndices.size(); ++i) {
+                    const int seq = group.sequenceIndices[i];
+                    if (seq < (int)localRows.size()) localRows[seq] = i;
+                }
+            retained = state.plan.Reorder(*batch, liveRows, tpRequestIds);
+            state.previousBindingRows = retained;
+            for (int &row : state.previousBindingRows) if (row >= 0) row = localRows[row];
+        }
+    }
     state.reuseBindings = false;
     if (reusePlan) {
         AssertInFastLLM(total == sequences, "Naive attention DP decode row count changed");
@@ -189,12 +206,17 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 AssertInFastLLM(first.dims.empty(), "Naive attention DP cannot import an unpartitioned cache");
                 group = AllocatePrefillGroup();
             }
-            std::vector<std::pair<Data *, Data *>> roots;
-            for (int layer = 0; layer < block_cnt; ++layer) roots.emplace_back(&key(seq, layer), &value(seq, layer));
-            InitAttentionParallelCache(roots, group);
-            if (sparseKv) AttachSparseKv(roots);
             auto &local = state.groups[group];
-            local.kv.insert(local.kv.end(), roots.begin(), roots.end());
+            if (!retained.empty() && (seq >= liveRows || retained[seq] >= 0)) {
+                auto begin = batch->kv.begin() + (size_t)seq * block_cnt;
+                local.kv.insert(local.kv.end(), begin, begin + block_cnt);
+            } else {
+                std::vector<std::pair<Data *, Data *>> roots;
+                for (int layer = 0; layer < block_cnt; ++layer) roots.emplace_back(&key(seq, layer), &value(seq, layer));
+                InitAttentionParallelCache(roots, group);
+                if (sparseKv) AttachSparseKv(roots);
+                local.kv.insert(local.kv.end(), roots.begin(), roots.end());
+            }
             local.lengths.push_back(count);
             local.sequenceIndices.push_back(seq);
             local.configs.push_back(batch ? batch->configs[seq] : config);
@@ -231,8 +253,6 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     // Identity/epoch checks cover rebinding and rollback; capacity bounds cover
     // page growth. Shared history tails still trigger copy-on-write; direct
     // forwards retain full reservation checks.
-    const bool reserveCached = reusePlan && state.servingPadded &&
-        state.plan.CanAppend();
     std::vector<int> reservationLimits;
     if (!tpPagedCaches.empty() && !(tpServingState && tpServingState->preparing) && !reserveCached) {
         // Reserve on every owner before any attention/world collective. Pool
@@ -245,7 +265,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             try {
                 for (size_t row = 0; row < group.lengths.size(); ++row) {
                     const int seq = group.sequenceIndices[row], count = group.lengths[row];
-                    if (state.servingPadded && seq >= state.servingLiveRows) continue;
+                    if ((state.servingPadded && seq >= liveRows) ||
+                        (!retained.empty() && retained[seq] >= 0)) continue;
                     for (int layer = 0; layer < block_cnt; ++layer) {
                         const auto &cfg = slidingLayers[layer] ? sliding : full;
                         for (int part = 0; part < 2; ++part) {
@@ -270,8 +291,12 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         for (auto error : errors) if (error) std::rethrow_exception(error);
         if (ownedDecode && state.servingPadded) {
             reservationLimits.assign(liveRows, max_positions);
-            state.plan.pageTails.clear();
-            for (int seq = 0; seq < liveRows; ++seq)
+            if (retained.empty()) state.plan.pageTails.clear();
+            for (int seq = 0; seq < liveRows; ++seq) {
+                if (!retained.empty() && retained[seq] >= 0) {
+                    reservationLimits[seq] = state.plan.requests[seq].reservedUntil;
+                    continue;
+                }
                 for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
                     for (const Data *root : {&key(seq, layer), &value(seq, layer)})
                         for (const auto &entry : root->multiDeviceDatas) {
@@ -283,6 +308,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                             if (local.isPagedKVCache)
                                 state.plan.pageTails[local.pagedKVCacheData].emplace_back(&local, seq);
                         }
+            }
         }
     }
     if (!tpSwaPrefillWorkspaces.empty() && (!batch || !batch->Decode())) {
@@ -344,6 +370,18 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     // row partition was reusable. Check identities again after reservation.
     const bool bindingsUnchanged = reusePlan && matchesPlan();
     state.reuseBindings = bindingsUnchanged;
+    // Other rows can grow/COW during reservation. Never reuse a descriptor
+    // whose request identity was invalidated while reserving those rows.
+    if (!retained.empty()) {
+        std::lock_guard<std::mutex> guard(tpRequestMutex);
+        for (int seq = 0; seq < liveRows; ++seq) if (retained[seq] >= 0) {
+            const auto &r = state.plan.requests[seq];
+            auto id = tpRequestIds.find(r.key);
+            if (state.plan.epoch != tpCacheEpoch.load(std::memory_order_relaxed) ||
+                id == tpRequestIds.end() || id->second != r.identity)
+                throw AttentionParallelState::UnsupportedServingLayout{};
+        }
+    }
     bool graphDecode = PrepareTensorParallelDecode(inputIds, kv, verifying, fullLogits,
         cacheLengths, batch, capture && capture->collectHidden);
     state.reuseBindings = false;
@@ -595,6 +633,11 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (!committedMetadata) ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
         for (int seq = begin; seq < end; ++seq) {
             if (state.servingPadded && seq >= state.servingLiveRows) continue;
+            if (graphDecode && !retained.empty() && retained[seq] >= 0 &&
+                state.plan.requests[seq].length >= window - 1 && !state.plan.lengthFields[seq].empty()) {
+                state.plan.AdvanceRow(seq);
+                continue;
+            }
             const int oldLength = graphDecode ? key(seq, 0).dims[1] : 0;
             const int count = batch ? batch->lengths[seq] : total;
             for (int layer = 0; layer < block_cnt; ++layer) {
@@ -645,11 +688,12 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (recording) for (int seq = 0; seq < liveRows; ++seq)
         FinishPrefixSnapshots(key(seq, 0), prefixes[seq], (batch ? batch->lengths[seq] : total) > 1);
     if (ownedDecode) {
-        if (!bindingsUnchanged || !graphDecode) state.plan.lengthFields.clear();
-        if (graphDecode && state.plan.lengthFields.empty()) {
+        if ((!bindingsUnchanged && retained.empty()) || !graphDecode) state.plan.lengthFields.clear();
+        if (graphDecode && (state.plan.lengthFields.empty() || !retained.empty())) {
             state.plan.lengthFields.resize(liveRows);
             bool safe = true;
-            for (int seq = 0; seq < liveRows; ++seq)
+            for (int seq = 0; seq < liveRows; ++seq) {
+                if (!state.plan.lengthFields[seq].empty()) continue;
                 for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
                     for (Data *root : {&key(seq, layer), &value(seq, layer)}) {
                         auto remember = [&](Data &data) {
@@ -662,6 +706,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                         remember(*root);
                         for (auto &entry : root->multiDeviceDatas) remember(*entry.second);
                     }
+            }
             if (!safe) state.plan.lengthFields.clear();
         }
         std::lock_guard<std::mutex> guard(tpRequestMutex);

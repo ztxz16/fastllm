@@ -91,6 +91,7 @@ struct NaiveN05FlashModel::TPDecodeState {
 };
 struct NaiveN05FlashModel::TPServingState {
     int pipelineInputSlot = -1, pipelineOutputSlot = -1;
+    std::vector<const float *> feedbackRows[2];
     bool preparing = false, capturing = false, sealed = false, pipelineReady = false;
     int prepareCapacity = 0;
     DataType moeType = BFLOAT16, kvType = BFLOAT16;

@@ -18,6 +18,7 @@
 #include <exception>
 #include <set>
 #include <tuple>
+#include <unordered_set>
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
@@ -3068,28 +3069,46 @@ namespace fastllm {
 
     bool basellm::RunDecodePipeline(std::unique_lock<std::mutex> &dictLock,
                                     int batchLimit, int totalLimit, long long *generatedTokens,
-                                    std::chrono::system_clock::time_point *lastRecordTime) {
+                                    std::chrono::system_clock::time_point *lastRecordTime,
+                                    const std::set<int> *admittedPD, const std::set<int> *waitingPD) {
         // Cache snapshots require an explicit adapter contract. Sampling that
         // depends on published CPU history still uses the ordinary path below.
         if (!SupportsDecodePipeline() || isFree ||
             (saveHistoryChat && !SupportsDecodePipelineHistory())) return false;
         std::vector<ResponseContext *> contexts;
-        std::vector<int> handles;
+        bool preparePD = false;
         for (auto &entry : responseContextDict.dicts) {
             auto *c = entry.second;
             if (c->isEnding) continue;
             // Network I/O owns only reserved receive storage. Keep decoding
             // ready requests until admission/import needs the model thread.
-            if (!c->isAbort && c->IsPDTransferPending()) continue;
-            if (c->isAbort || c->curTokens == 0 || c->currentTokens.size() != 1 ||
+            if (!c->isAbort && (c->IsPDTransferPending() || (waitingPD && waitingPD->count(entry.first))))
+                continue;
+            if (!c->isAbort && c->NeedsPDSubmission()) {
+                preparePD = true;
+                continue;
+            }
+            const bool first = c->curTokens == 0 && admittedPD && admittedPD->count(entry.first) &&
+                c->pdPending && !c->HasPendingPD() && c->preTokens > 0;
+            if (c->isAbort || (!first && c->curTokens == 0) || c->currentTokens.size() != 1 ||
                 c->generationConfig.NeedsTokenHistory() || c->generationConfig.output_logits ||
                 !c->multimodalInput.empty() || c->HasPendingPD()) return false;
-            contexts.push_back(c); handles.push_back(entry.first);
+            // Bind the first grammar state before the sampler compiles it. Use
+            // a copy just as the ordinary scheduler does for per-step masks.
+            if (first && c->generationConfig.tool_call_grammar) {
+                auto config = c->generationConfig;
+                PrepareToolCallConstraint(c, config);
+            }
+            contexts.push_back(c);
         }
         if (contexts.empty() || contexts.size() > (size_t)batchLimit) return false;
         auto pipeline = CreateDecodePipeline(contexts);
-        if (!pipeline) return false;
-        const std::set<int> admittedHandles(handles.begin(), handles.end());
+        if (!pipeline || (preparePD && !pipeline->CanPreparePDReceive())) return false;
+        std::unordered_set<ResponseContext *> admitted(contexts.begin(), contexts.end());
+        auto needsScheduler = [&](ResponseContext *c) {
+            return c->isAbort || (!c->IsPDTransferPending() &&
+                !(c->NeedsPDSubmission() && pipeline->CanPreparePDReceive()));
+        };
         auto stopToken = [&](ResponseContext *c, int token) {
             return token == eos_token_id || eos_token_ids.count(token) ||
                 c->generationConfig.stop_token_ids.count(token);
@@ -3108,22 +3127,25 @@ namespace fastllm {
         };
         auto publish = [&](const std::vector<int> &tokens) {
             for (size_t row = 0; row < contexts.size(); ++row) {
-                auto *c = contexts[row];
-                if (c->isEnding || c->isAbort) continue;
-                ++c->intParams["index"]; ++c->preTokens;
-                const int token = tokens[row];
-                if (stopToken(c, token)) {
-                    c->isEnding = true; c->TryRecord(this); continue;
+                auto *&c = contexts[row];
+                if (!c) continue;
+                if (!c->isEnding && !c->isAbort) {
+                    ++c->intParams["index"]; ++c->preTokens;
+                    const int token = tokens[row];
+                    if (!stopToken(c, token)) {
+                        UpdateToolCallConstraintState(c, token);
+                        c->currentTokens[0] = token;
+                        c->resultTokenQueue.push(token);
+                        c->allTokens.push_back(token);
+                        ++c->curTokens;
+                        if (generatedTokens) ++*generatedTokens;
+                        if (!reachesLimit(c, 0)) continue;
+                    }
+                    c->isEnding = true;
+                    c->TryRecord(this);
                 }
-                UpdateToolCallConstraintState(c, token);
-                c->currentTokens[0] = token;
-                c->resultTokenQueue.push(token);
-                c->allTokens.push_back(token);
-                ++c->curTokens;
-                if (generatedTokens) ++*generatedTokens;
-                if (reachesLimit(c, 0)) {
-                    c->isEnding = true; c->TryRecord(this);
-                }
+                admitted.erase(c);
+                c = nullptr;
             }
             NotifyResponseReady();
             // A continuous chain need not visit the ordinary scheduler for
@@ -3165,37 +3187,83 @@ namespace fastllm {
                         (totalLimit <= 0 || c->allTokens.size() + 2 <= (size_t)totalLimit) &&
                         c->allTokens.size() + 2 <= (size_t)max_positions;
                 }
-                for (auto &entry : responseContextDict.dicts)
-                    if (!entry.second->isEnding && !admittedHandles.count(entry.first) &&
-                        (entry.second->isAbort || !entry.second->IsPDTransferPending())) chain = false;
+                for (auto &entry : responseContextDict.dicts) {
+                    auto *c = entry.second;
+                    if (c->isEnding || admitted.count(c)) continue;
+                    if (needsScheduler(c)) chain = false;
+                    else if (!isFree && c->NeedsPDSubmission()) PreparePendingPD(c);
+                }
                 dictLock.unlock();
                 const bool next = chain && pipeline->Submit(1 - slot, slot);
                 auto tokens = collect(slot);
                 dictLock.lock();
-                bool stop = isFree;
-                for (size_t row = 0; row < contexts.size(); ++row) {
-                    auto *c = contexts[row];
-                    stop = stop || c->isAbort || c->isEnding || stopToken(c, tokens[row]) || reachesLimit(c, 1);
-                }
-                if (stop && next) {
-                    // No request can be published as terminal (and freed by a
-                    // consumer) while the lookahead still owns its KV pointers.
-                    auto tail = collect(1 - slot);
-                    pipeline->Drain();
+                if (!next) {
                     publish(tokens);
-                    publish(tail); // Ended/aborted rows are discarded; survivors commit once.
+                    pipeline->Drain();
                     return true;
                 }
+                std::vector<int> retiring;
+                for (size_t row = 0; row < contexts.size(); ++row) {
+                    auto *c = contexts[row];
+                    if (c->isAbort || c->isEnding || stopToken(c, tokens[row]) || reachesLimit(c, 1))
+                        retiring.push_back(row);
+                }
+                if (isFree || !retiring.empty()) {
+                    bool rowFence = false;
+                    if (!isFree) {
+                        dictLock.unlock();
+                        rowFence = pipeline->WaitForRetiringRows(retiring);
+                        dictLock.lock();
+                    }
+                    if (rowFence) {
+                        // Consumers can now remove terminal contexts. publish
+                        // clears their pointers before releasing dictLocker.
+                        publish(tokens);
+                        dictLock.unlock();
+                    }
+                    auto tail = collect(1 - slot);
+                    if (rowFence) dictLock.lock();
+                    if (!rowFence) {
+                        pipeline->Drain();
+                        publish(tokens);
+                    }
+                    publish(tail);
+                    if (!rowFence || isFree) return true;
+
+                    // The old tickets are both consumed. Continue with the
+                    // survivors directly unless another request needs admission.
+                    contexts.erase(std::remove(contexts.begin(), contexts.end(), nullptr), contexts.end());
+                    if (contexts.empty()) return true;
+                    for (const auto &entry : responseContextDict.dicts) {
+                        auto *c = entry.second;
+                        if (c->isEnding) {
+                            // A slow client may keep the response queue for the
+                            // entire next chain. Retire its physical KV now.
+                            c->pdPending.reset();
+                            OnResponseContextFinished(c);
+                        } else if (!admitted.count(c) && needsScheduler(c)) {
+                            return true;
+                        }
+                    }
+                    pipeline.reset();
+                    pipeline = CreateDecodePipeline(contexts);
+                    if (!pipeline) return true;
+                    dictLock.unlock();
+                    slot = 0;
+                    const bool restarted = pipeline->Submit(slot);
+                    dictLock.lock();
+                    if (!restarted) return true;
+                    continue;
+                }
                 publish(tokens);
-                if (!next) { pipeline->Drain(); return true; }
                 slot = 1 - slot;
             }
         } catch (const std::exception &error) {
             // Never retry a possibly submitted collective or reuse its cache.
-            pipeline->Drain();
+            if (pipeline) pipeline->Drain();
             if (!dictLock.owns_lock()) dictLock.lock();
             fprintf(stderr, "[Fastllm] decode pipeline failed: %s\n", error.what());
-            for (auto *c : contexts) { c->isEnding = true; c->error = ResponseContextErrorRuntime; }
+            for (auto *c : contexts) if (c) { c->isEnding = true; c->error = ResponseContextErrorRuntime; }
             NotifyResponseReady();
             return true;
         }
@@ -3713,6 +3781,12 @@ namespace fastllm {
                         }
 
                         if (trace) trace->Mark("prefix_restore_plan_ms");
+                        // PD has already reserved these requests' KV and installed
+                        // their positions. A changed batch can start an asynchronous
+                        // chain directly from the D-side last prompt tokens.
+                        if (fastDecodeInput && sharedKvPool && (!plannedPrefills.empty() || !waitingPD.empty()) &&
+                            model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens,
+                                &lastRecordTime, &plannedPrefills, &waitingPD)) continue;
                         bool requestStorageBlocked = false;
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
@@ -3735,8 +3809,15 @@ namespace fastllm {
                                 if (it.second->isEnding) {
                                     continue;
                                 }
-                                const bool pendingPrefill = (batchPrefill || sharedKvPool)
-                                    ? it.second->curTokens == 0 : it.second->preTokens == 0;
+                                // PollPD has already installed the prefix and set index=-1.
+                                // Keep physical admission in the prefill planner, then consume
+                                // the remaining prompt token alongside the other decode rows.
+                                const bool pdFirst = fastDecodeInput && it.second->pdPending &&
+                                    it.second->curTokens == 0 && it.second->preTokens > 0 &&
+                                    it.second->currentTokens.size() == 1 &&
+                                    plannedPrefills.count(it.first) && model->SupportsDecodePipeline();
+                                const bool pendingPrefill = !pdFirst && ((batchPrefill || sharedKvPool)
+                                    ? it.second->curTokens == 0 : it.second->preTokens == 0);
                                 if (isPrompt && !pendingPrefill) {
                                     continue;
                                 }

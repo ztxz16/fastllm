@@ -109,6 +109,7 @@ namespace fastllm {
         // An admitted transfer can progress independently of the model thread.
         // A ready result must return to the scheduler for atomic state import.
         bool IsPDTransferPending() const;
+        bool NeedsPDSubmission() const;
         uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
@@ -454,6 +455,10 @@ namespace fastllm {
             virtual bool Submit(int outputSlot, int inputSlot = -1) = 0;
             virtual std::vector<int> Collect(int slot) = 0;
             virtual void Drain() = 0;
+            // True once the last submitted model work that can read these
+            // rows' KV has finished. Other rows may still be sampling.
+            virtual bool WaitForRetiringRows(const std::vector<int> &) { return false; }
+            virtual bool CanPreparePDReceive() const { return false; }
         };
         virtual bool SupportsDecodePipeline() const { return false; }
         // Adapters opting in must drain before cache snapshots or publication.
@@ -462,7 +467,9 @@ namespace fastllm {
             const std::vector<ResponseContext *> &) { return nullptr; }
         bool RunDecodePipeline(std::unique_lock<std::mutex> &dictLock, int batchLimit, int totalLimit,
                                long long *generatedTokens = nullptr,
-                               std::chrono::system_clock::time_point *lastRecordTime = nullptr);
+                               std::chrono::system_clock::time_point *lastRecordTime = nullptr,
+                               const std::set<int> *admittedPD = nullptr,
+                               const std::set<int> *waitingPD = nullptr);
 
         virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 
@@ -789,6 +796,9 @@ namespace fastllm {
         bool IsPDDecode() const;
         void BeginPD(ResponseContext *context);
         bool PollPD(ResponseContext *context);
+        // Submit an unstarted transfer under dictLocker and forwardLocker.
+        // PollPD imports its result before admission to decode.
+        void PreparePendingPD(ResponseContext *context);
         virtual std::string PDLayout() const;
         virtual bool SupportsPDKvMemDecode() const { return false; }
         virtual std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) { return {}; }

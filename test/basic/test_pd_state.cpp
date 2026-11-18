@@ -220,6 +220,7 @@ static void TestDecodeDuringPDTransfer() {
     } prefill;
     struct Consumer : StateModel {
         int submits = 0;
+        bool prepareDuringDecode = false;
         std::function<void(int)> onSubmit;
         bool SupportsDecodePipeline() const override { return true; }
         bool SupportsDecodePipelineHistory() const override { return true; }
@@ -237,6 +238,7 @@ static void TestDecodeDuringPDTransfer() {
             std::vector<int> Collect(int slot) override {
                 Check(queued[slot], "PD pipeline missing result"); queued[slot] = false; return {42};
             }
+            bool CanPreparePDReceive() const override { return model.prepareDuringDecode; }
             void Drain() override { queued[0] = queued[1] = false; }
         };
         std::unique_ptr<DecodePipeline> CreateDecodePipeline(
@@ -264,6 +266,18 @@ static void TestDecodeDuringPDTransfer() {
     ready->curTokens = 1; ready->preTokens = 2;
     waiting->currentTokens = waiting->allTokens = {3, 7, 11}; waiting->inputTokens = 3;
     waiting->generationConfig.output_token_limit = 1; decode.BeginPD(waiting);
+    {
+        std::unique_lock<std::mutex> lock(decode.dictLocker);
+        Check(waiting->NeedsPDSubmission() && !decode.RunDecodePipeline(lock, 2, 4096) &&
+              !waiting->pdAdmission, "unsupported adapter bypassed ordinary PD admission");
+        decode.prepareDuringDecode = true;
+        ready->generationConfig.output_token_limit = 2;
+        Check(decode.RunDecodePipeline(lock, 2, 4096) && decode.submits == 1 && waiting->pdAdmission &&
+              waiting->HasPendingPD() && !waiting->preTokens, "pending PD preparation did not overlap live decode");
+    }
+    ready->isEnding = false; ready->curTokens = 1; decode.submits = 0;
+    ready->generationConfig.output_token_limit = 5;
+    decode.prepareDuringDecode = false;
     for (int i = 0; i < 3000 && !prefill.entered; ++i) {
         decode.PollPD(waiting); std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }

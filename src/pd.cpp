@@ -300,6 +300,10 @@ bool ResponseContext::HasPendingPD() const {
     return pdPending && !pdPending->committed;
 }
 
+bool ResponseContext::NeedsPDSubmission() const {
+    return HasPendingPD() && !pdPending->result.valid();
+}
+
 bool ResponseContext::IsPDTransferPending() const {
     return HasPendingPD() && pdPending->result.valid() &&
         pdPending->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
@@ -1287,6 +1291,53 @@ void basellm::BeginPD(ResponseContext *context) {
     context->pdPending = std::move(pending);
 }
 
+void basellm::PreparePendingPD(ResponseContext *context) {
+    auto pending = context->pdPending;
+    // Admission precedes P work and receive allocation. Waiting requests
+    // do not consume model pages or block the scheduler on a network call.
+    try {
+        if (!pending->admission) {
+            auto admission = std::make_shared<PDPending::Admission>();
+            admission->slot = pdRuntime->slots->Reserve(1);
+            admission->tokens = pdRuntime->ReserveGroup(*this, *context, pending->reservation);
+            context->pdAdmission = admission;
+            pending->admission = std::move(admission);
+        }
+        if (!pdRuntime->SelectPeer(*pending, verbose)) return;
+        if (!pending->receiver) {
+            const auto begin = std::chrono::steady_clock::now();
+            pending->receiver = PreparePDReceive(*context);
+            if (pending->receiver && verbose) std::cout << "[FastKV PD timing] receive_prepare_ms="
+                << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count()
+                << std::endl;
+        }
+        fastkv::ReceiveTarget target;
+        if (pending->receiver) target = [receiver = pending->receiver](const fastkv::Bytes &metadata,
+                                                                      const std::vector<size_t> &sizes) {
+            return receiver->Targets(metadata, sizes);
+        };
+        // Transient transport pressure must preserve the prompt for retry.
+        // The Exchange also holds admission until cancellation/I/O drains.
+        auto lifetime = std::make_shared<std::pair<std::shared_ptr<PDPending::Admission>,
+                                                   std::shared_ptr<void>>>(pending->admission, pending->route);
+        const auto devices = PDRequestDevices(*context);
+        fastkv::ReceivePlacement placement = [devices](const fastkv::Bytes &metadata,
+                                                      const std::vector<size_t> &sizes) {
+            return PDReceivePlacement(metadata, sizes.size(), devices);
+        };
+        pdRuntime->service->TrySubmit(pending->peer, pending->request, pending->result,
+            pending->cancellation, std::move(lifetime), std::move(target), std::move(placement));
+    } catch (const fastkv::CapacityBusy &) {
+        return;
+    } catch (const std::exception &error) {
+        std::cerr << "[FastKV PD] admission failed: " << error.what() << std::endl;
+        context->error = ResponseContextErrorRuntime;
+        context->isEnding = true;
+        context->pdPending.reset();
+        NotifyResponseReady();
+    }
+}
+
 bool basellm::PollPD(ResponseContext *context) {
     if (pdRuntime) pdRuntime->FlushAnnouncements();
     if (!context->pdPending)
@@ -1295,56 +1346,8 @@ bool basellm::PollPD(ResponseContext *context) {
     if (pending->committed)
         return true;
     if (!pending->result.valid()) {
-        // Admission precedes P work and receive allocation. Waiting requests
-        // do not consume model pages or block the scheduler on a network call.
-        try {
-            if (!pending->admission) {
-                auto admission = std::make_shared<PDPending::Admission>();
-                admission->slot = pdRuntime->slots->Reserve(1);
-                {
-                    std::lock_guard<std::mutex> lock(forwardLocker);
-                    admission->tokens = pdRuntime->ReserveGroup(*this, *context, pending->reservation);
-                }
-                context->pdAdmission = admission;
-                pending->admission = std::move(admission);
-            }
-        } catch (const fastkv::CapacityBusy &) {
-            return false;
-        }
-        try {
-            if (!pdRuntime->SelectPeer(*pending, verbose)) return false;
-            if (!pending->receiver) {
-                std::lock_guard<std::mutex> lock(forwardLocker);
-                const auto begin = std::chrono::steady_clock::now();
-                pending->receiver = PreparePDReceive(*context);
-                if (pending->receiver && verbose) std::cout << "[FastKV PD timing] receive_prepare_ms="
-                    << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count()
-                    << std::endl;
-            }
-            fastkv::ReceiveTarget target;
-            if (pending->receiver) target = [receiver = pending->receiver](const fastkv::Bytes &metadata,
-                                                                          const std::vector<size_t> &sizes) {
-                return receiver->Targets(metadata, sizes);
-            };
-            // Transient transport pressure must preserve the prompt for retry.
-            // The Exchange also holds admission until cancellation/I/O drains.
-            auto lifetime = std::make_shared<std::pair<std::shared_ptr<PDPending::Admission>,
-                                                       std::shared_ptr<void>>>(pending->admission, pending->route);
-            const auto devices = PDRequestDevices(*context);
-            fastkv::ReceivePlacement placement = [devices](const fastkv::Bytes &metadata,
-                                                          const std::vector<size_t> &sizes) {
-                return PDReceivePlacement(metadata, sizes.size(), devices);
-            };
-            pdRuntime->service->TrySubmit(pending->peer, pending->request, pending->result,
-                pending->cancellation, std::move(lifetime), std::move(target), std::move(placement));
-        } catch (const fastkv::CapacityBusy &) {
-            return false;
-        } catch (const std::exception &error) {
-            std::cerr << "[FastKV PD] admission failed: " << error.what() << std::endl;
-            context->error = ResponseContextErrorRuntime;
-            context->isEnding = true;
-            context->pdPending.reset();
-        }
+        std::lock_guard<std::mutex> lock(forwardLocker);
+        PreparePendingPD(context);
         return false;
     }
     if (pending->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready)

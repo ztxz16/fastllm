@@ -445,6 +445,7 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
             for (const auto &local : root->multiDeviceDatas)
                 CheckPD(local.second->dims.empty() && local.second->pageIndex.empty(), "GPU receive overwrites state");
         }
+        model.InvalidateTensorParallelCache(model.attentionParallel ? &context.pastKeyValues.front().first : nullptr);
         for (int layer = 0; layer < model.block_cnt; ++layer) for (int part = 0; part < 2; ++part) {
             auto &source = part ? reservation->pastKeyValues[layer].second : reservation->pastKeyValues[layer].first;
             auto &target = part ? context.pastKeyValues[layer].second : context.pastKeyValues[layer].first;
@@ -471,7 +472,7 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
                 }
             copies.Submit();
         });
-        model.tpCacheEpoch.fetch_add(1,std::memory_order_relaxed); committed = true;
+        committed = true;
     }
 };
 #endif
@@ -725,6 +726,7 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
     const int length = metadata.U32();
     CheckPD(length > 0 && length == int(context.allTokens.size()) - 1, "prompt length mismatch");
     const auto devices = PDRequestDevices(context);
+    InvalidateTensorParallelCache(attentionParallel ? &context.pastKeyValues.front().first : nullptr);
     const bool tp = tpDevices.size() > 1;
     for (int layer = 0; layer < block_cnt; ++layer) {
         for (int part = 0; part < 2; ++part) {
@@ -862,7 +864,6 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
         metadata.End();
         CheckPD(offset == message.buffers.size(), "unclaimed state payload");
     }
-    tpCacheEpoch.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
 } // namespace fastllm

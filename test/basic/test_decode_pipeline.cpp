@@ -6,7 +6,9 @@ static void Check(bool ok, const char *message) { if (!ok) throw std::runtime_er
 struct Model : basellm {
     int submits = 0, collects = 0, outstanding = 0, failAt = -1, eosAt = -1, cancelAt = -1;
     int invalidResultAt = -1;
-    bool supported = true, historySupported = false;
+    bool supported = true, historySupported = false, rowFence = false, consumedTerminal = false;
+    bool consumeEarly = true, retired = false;
+    std::vector<ResponseContext *> fenced;
     long long generated = 0;
     std::vector<std::string> events;
     Model(int rows, int limit) {
@@ -23,8 +25,12 @@ struct Model : basellm {
     }
     std::string MakeInput(const std::string &, int, const std::string &) override { return {}; }
     std::string MakeHistory(const std::string &, int, const std::string &, const std::string &) override { return {}; }
-    void TryRecordResponseContext(ResponseContext *) override {
-        Check(outstanding == 0, "terminal request published before pipeline drained");
+    void TryRecordResponseContext(ResponseContext *c) override {
+        Check(outstanding == 0 || std::find(fenced.begin(), fenced.end(), c) != fenced.end(), "terminal request published before pipeline drained");
+    }
+    void OnResponseContextFinished(ResponseContext *c) override {
+        Check(c->isEnding && outstanding == 0, "slow consumer KV retired before safe boundary");
+        retired = true;
     }
     struct Pipe : DecodePipeline {
         Model &m; std::vector<ResponseContext *> contexts; int tickets[2]{-1,-1};
@@ -39,11 +45,21 @@ struct Model : basellm {
         std::vector<int> Collect(int slot) override {
             Check(tickets[slot] > 0, "invalid result slot");
             const int step = tickets[slot]; tickets[slot] = -1; --m.outstanding; ++m.collects;
+            if (m.rowFence && m.consumeEarly && !m.fenced.empty() && !m.consumedTerminal) {
+                int token;
+                Check(m.FetchResponseTokensBatch(0, &token, 1) == -1, "retired row still waits for peer sampling");
+                m.consumedTerminal = true;
+            }
             if (step == m.cancelAt) contexts[0]->isAbort = true;
             std::vector<int> result(contexts.size(), 10 + step);
             if (step == m.eosAt) result[0] = 99;
             if (step == m.invalidResultAt) result.clear();
             m.events.push_back("collect"); return result;
+        }
+        bool WaitForRetiringRows(const std::vector<int> &rows) override {
+            if (!m.rowFence) return false;
+            for (int row : rows) m.fenced.push_back(contexts.at(row));
+            return true;
         }
         void Drain() override {
             for (int &ticket : tickets) if (ticket >= 0) { ticket = -1; --m.outstanding; }
@@ -90,6 +106,21 @@ int main() {
         Check(m.responseContextDict.dicts[0]->isEnding, "EOS ignored");
         Check(m.responseContextDict.dicts[0]->resultTokenQueue.size()==size_t(stop-1), "post-EOS token exposed");
         Check(m.responseContextDict.dicts[1]->curTokens==stop+2, "survivor lookahead lost");
+    }
+    {
+        Model m(3,8); m.historySupported=true; m.saveHistoryChat=true; m.rowFence=true;
+        m.eosAt=1;
+        Check(m.Run() && m.consumedTerminal && m.responseContextDict.dicts.count(0)==0,
+              "consumer could not free the fenced request during lookahead");
+        for (auto &entry : m.responseContextDict.dicts)
+            Check(entry.second->curTokens==8 && entry.second->resultTokenQueue.size()==7,
+                  "survivors lost or duplicated a token after compaction");
+        Check(m.outstanding==0, "survivor tickets leaked");
+    }
+    {
+        Model m(3,8); m.rowFence = true; m.consumeEarly = false; m.eosAt = 1;
+        Check(m.Run() && m.retired && m.responseContextDict.dicts.at(0)->isEnding &&
+              m.responseContextDict.dicts.at(1)->curTokens == 8, "slow consumer delayed KV retirement");
     }
     { Model m(3,8); m.cancelAt=1; Check(m.Run(),"cancel"); Check(m.responseContextDict.dicts[0]->resultTokenQueue.empty(),"post-cancel output"); }
     { Model m(2,8); m.failAt=0; Check(!m.Run() && m.submits==0,"initial admission mutated state"); }
