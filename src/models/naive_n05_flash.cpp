@@ -1410,6 +1410,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
         }
         std::vector<FastllmNaivePrefillAttentionItem> prefillAttention;
+        bool pairedPrefill = false;
         int attendPhase = 0;
         std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
         std::vector<std::unique_ptr<Data>> prefillViews;
@@ -1914,9 +1915,16 @@ Data NaiveN05FlashModel::RunTarget(
                         FastllmNcclBroadcast(buf.indexBroadcast.cudaData, buf.indexBroadcast.Count(0), INT32,
                             tpDevices[IndexerOwnerRank(layer)], gpu);
                 }
-                if (dpPrefill && phase == 0)
-                    FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
-                        indexFp8, prefillScores, indexerComputeFP8);
+                if (dpPrefill && phase == 0) {
+                    pairedPrefill = FastllmCudaHasBlackwellIndexerAttention() && !packedIndices.empty() &&
+                        prefillItems.size() == packedIndices.size();
+                    for (size_t i = 0; pairedPrefill && i < prefillItems.size(); ++i)
+                        pairedPrefill = prefillItems[i].indices == &packedIndices[i] &&
+                            prefillItems[i].keys->dims[1] <= 8192;
+                    if (!pairedPrefill)
+                        FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
+                            indexFp8, prefillScores, indexerComputeFP8);
+                }
                 if (batchPrefillIndex && phase == 0) {
                     AssertInFastLLM((int)prefillItems.size() == batch->Size(), "Incomplete prefill Indexer batch.");
                     if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores, indexerComputeFP8)) {
@@ -1945,9 +1953,15 @@ Data NaiveN05FlashModel::RunTarget(
             auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
             attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, pastLength, reserveCapacity, attn);
         }
-        // Indexer has published all TopK rows. Its rank-local workspace can
-        // be overwritten until the next projection on this same stream.
-        if (dpPrefill)
+        // A paired Indexer hands its scores directly to attention on this stream.
+        // The other paths have already published their ordered TopK rows.
+        if (pairedPrefill) {
+            for (size_t i = 0; i < prefillItems.size(); ++i)
+                FastllmCudaNaivePrefillIndexedAttention(prefillItems[i], prefillAttention.at(i),
+                    localWeight(ap + "attention_sink_bias"), indexHeads, indexDim, indexTopK,
+                    indexFp8, indexerComputeFP8, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    prefillScores, prefillScores ? *prefillScores : normed);
+        } else if (dpPrefill)
             FastllmCudaNaiveBatchIndexerAttention(prefillAttention, localWeight(ap + "attention_sink_bias"),
                 cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, prefillScores ? *prefillScores : normed);
         if (batchedDSA && sparseLayer) {

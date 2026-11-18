@@ -11,3 +11,11 @@ bool FastllmCudaTryNaiveIndexerAttention(const FastllmNaivePrefillAttentionItem 
     const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim, const fastllm::Data &scratch);
 void FastllmCudaNaiveBatchIndexerAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
     const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim, const fastllm::Data &scratch);
+
+// The paired model path lends its private index buffer. If fused attention
+// declines the score matrix, normal ordered TopK and attention are executed.
+void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerItem &index,
+    const FastllmNaivePrefillAttentionItem &attention, const fastllm::Data &sink,
+    int indexHeads, int indexDim, int topK, bool fp8Query, bool fp8Compute,
+    int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
+    const fastllm::Data &attentionScratch);

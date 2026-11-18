@@ -519,12 +519,38 @@ static void TestBlackwellLocalRouter() {
     ++checks;
 }
 
+static void TestPairedPrefillAttention() {
+    if (!FastllmCudaHasBlackwellIndexerAttention()) return;
+    constexpr int rows = 257, keys = 2017, keep = 512, heads = 16, past = keys - rows;
+    Data iq(BFLOAT16), weights(BFLOAT16), ik(BFLOAT16), q(BFLOAT16), k(BFLOAT16), v(BFLOAT16);
+    Data ordered(INT32), privateIds(INT32, {rows, keep}), sink, expected, actual;
+    Upload(iq, {1, rows, 2048}, 43); Upload(weights, {1, rows, 16}, 53); Upload(ik, {1, keys, 128}, 59);
+    Upload(q, {1, rows, heads * 192}, 67); Upload(k, {1, keys, 192}, 71); Upload(v, {1, keys, 128}, 73);
+    privateIds.ToDevice(DataDevice::CUDA, {0}, false); privateIds.Allocate(false);
+    Data loan(FLOAT32, {4 * 1024 * 1024});
+    loan.ToDevice(DataDevice::CUDA, {0}, false); loan.Allocate(false);
+    for (bool tied : {false, true}) {
+        if (tied) Require(cudaMemset(weights.cudaData, 0, weights.GetBytes()) == cudaSuccess, "zero Indexer weights");
+        FastllmCudaNaiveIndexer(iq, weights, ik, 16, 128, past, keep, true, ordered);
+        FastllmNaivePrefillAttentionItem reference{&q, &k, &v, &ordered, &expected, past};
+        Require(FastllmCudaTryNaiveIndexerAttention(reference, sink, heads, 1, 192, 128, loan),
+                "ordered Blackwell attention declined reference");
+        FastllmNaivePrefillIndexerItem index{&iq, &weights, &ik, &privateIds, past};
+        FastllmNaivePrefillAttentionItem attention{&q, &k, &v, &privateIds, &actual, past};
+        FastllmCudaNaivePrefillIndexedAttention(index, attention, sink, 16, 128, keep, true,
+            false, heads, 1, 192, 128, &loan, loan);
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "score bitmap changed ordered TopK attention");
+        ++checks;
+    }
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
         TestBlackwellLocalRouter();
+        TestPairedPrefillAttention();
         TestBlackwellIndexerAttention();
         TestLocalPrefillBatch();
         TestSwaPrefillScratch(); TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();

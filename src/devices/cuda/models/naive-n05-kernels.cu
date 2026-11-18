@@ -3433,9 +3433,22 @@ static unsigned LaunchFP8ShortlistIndexer(const naive_indexer::FP8Entry *entries
 }
 #endif
 
-void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+#ifdef FASTLLM_ENABLE_BLACKWELL_DSA
+bool FastllmCudaTryBlackwellScoreAttention(const FastllmNaivePrefillAttentionItem &, const fastllm::Data &,
+    int, int, int, int, const fastllm::Data &, const fastllm::Data &);
+#endif
+namespace {
+struct PairedIndexerAttention {
+    const FastllmNaivePrefillAttentionItem &item;
+    const fastllm::Data &sink, &scratch;
+    int heads, kvHeads, dim, valueDim;
+};
+}
+
+static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
-                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute) {
+                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute,
+        const PairedIndexerAttention *paired) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
     // has a general head-count path, but a different block width is unsupported.
@@ -3472,7 +3485,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
                 queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch, fp8Compute);
             first += count;
         }
-        return;
+        return false;
     }
     int stride = packedKeys.dims[2];
     bool fp8IndicesReady = false;
@@ -3524,7 +3537,9 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         else {
             // TopK consumes only each row's causal prefix. Blocks beyond
             // the final query's prefix cannot contribute any selected key.
-            const bool pipeline = FastllmCudaRuntimeArch() == 90;
+            const int arch = FastllmCudaRuntimeArch();
+            const bool pipeline = arch == 90 || (!peerKeys && (arch == 100 || arch == 103) &&
+                queries >= 4096 && keys >= 4096 && packedKeys.dataType == FP8_E4M3);
             const int rows = pipeline ? 32 : 64;
             auto kernel = pipeline ? naive_dsa_mma::IndexerScores<true> : naive_dsa_mma::IndexerScores<false>;
             kernel<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
@@ -3569,11 +3584,15 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         }
     }
     CheckLaunch();
-    if (fp8IndicesReady) return;
+    if (fp8IndicesReady) return false;
+#ifdef FASTLLM_ENABLE_BLACKWELL_DSA
+    if (paired && FastllmCudaTryBlackwellScoreAttention(paired->item, paired->sink, paired->heads,
+            paired->kvHeads, paired->dim, paired->valueDim, paired->scratch, scores)) return true;
+#endif
     // The selector derives positions directly; CUB's fallback uses emitted positions.
     if (selectBlocks) {
         CooperativeTopK((const unsigned *)scores.cudaData, queryStart + 1, selectBlocks, indices);
-        return;
+        return false;
     }
     if (decodeTopK) {
         SortTopKPairs((const unsigned *)scores.cudaData, (const int *)positions.cudaData,
@@ -3582,7 +3601,26 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
     } else {
         FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
     }
+    return false;
 }
+
+void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+        const fastllm::Data &keys, int heads, int dim, int past, int topK, bool fp8Query,
+        fastllm::Data &indices, bool peer, fastllm::Data *scratch, bool fp8Compute) {
+    NaiveIndexer(query, weights, keys, heads, dim, past, topK, fp8Query, indices, peer, scratch, fp8Compute, nullptr);
+}
+
+void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerItem &index,
+        const FastllmNaivePrefillAttentionItem &attention, const fastllm::Data &sink,
+        int indexHeads, int indexDim, int topK, bool fp8Query, bool fp8Compute,
+        int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
+        const fastllm::Data &attentionScratch) {
+    const PairedIndexerAttention paired{attention, sink, attentionScratch, heads, kvHeads, dim, valueDim};
+    const bool consumed = NaiveIndexer(*index.query, *index.weights, *index.keys, indexHeads, indexDim,
+        index.past, topK, fp8Query, *index.indices, false, scoreScratch, fp8Compute, &paired);
+    if (!consumed) FastllmCudaNaiveBatchIndexerAttention({attention}, sink, heads, kvHeads, dim, valueDim, attentionScratch);
+}
+
 
 #ifdef FASTLLM_NAIVE_DSA_MMA
 static bool BalancedIndexerSupported(const fastllm::Data &query, const fastllm::Data &weights,
