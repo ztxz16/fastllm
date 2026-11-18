@@ -1581,8 +1581,8 @@ class Fixture : public NaiveN05FlashModel {
             PrefixSnapshots snapshots;
             for (int rank = 0; rank < ranks; ++rank) {
                 auto snapshot = std::make_shared<PrefixSnapshot>();
-                snapshot->pool = prefixPool; snapshot->slot = prefixPool->freeSlots.back();
-                prefixPool->freeSlots.pop_back(); snapshots.push_back(snapshot);
+                snapshot->pool = prefixPool; snapshot->slot = prefixPool->slots.Take(0);
+                if (snapshot->slot < 0) throw std::runtime_error("draft checkpoint slots exhausted"); snapshots.push_back(snapshot);
                 const int rows = std::min(length, draftWindow - 1);
                 std::vector<uint16_t> expected(size_t(rows) * embed_dim), actual(expected.size());
                 for (size_t i = 0; i < expected.size(); ++i)
@@ -3073,6 +3073,16 @@ class Fixture : public NaiveN05FlashModel {
             cfg.prefillTokens=128; cfg.hostBytes=1ULL<<30; ConfigureKvMem(cfg);
         }
         SetSaveHistoryChat(true); WarmUp();
+        {
+            ResponseContext pending;
+            pending.Init(block_cnt, dataType, kvCacheDataType);
+            OnResponseContextCreated(&pending);
+            if (!TryAdmitResponseContext(&pending)) throw std::runtime_error("window admission failed");
+            std::weak_ptr<void> grant = pending.pastKeyValues.front().first.kvStorageOwner;
+            pending.cacheLen = 128;
+            OnResponseContextRemoved(&pending);
+            if (!grant.expired()) throw std::runtime_error("rolled-back prefix retained its owner window");
+        }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         const int graphLaunches = verifyGraphLaunches;
 #endif

@@ -67,6 +67,10 @@ void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
     // The later client-side removal can repeat this cleanup safely.
     OnResponseContextRemoved(context);
     finishTrace.Next("finish.detach_descriptors");
+    ReleaseRequestWindowStorage(context);
+}
+
+void NaiveN05FlashModel::ReleaseRequestWindowStorage(ResponseContext *context) {
     // Retain the lease until all borrowed descriptors are detached. Forward
     // completion already synchronized the rank streams before publication.
     std::vector<Data *> leaves;
@@ -82,7 +86,6 @@ void NaiveN05FlashModel::OnResponseContextFinished(ResponseContext *context) {
         root->dims.clear(); root->expansionDims.clear(); root->strides.clear();
         root->expansionSize = root->expansionBytes = 0;
     }
-    finishTrace.Next("finish.release_lease");
 }
 
 void NaiveN05FlashModel::InitSparseKv() {
@@ -114,18 +117,20 @@ void NaiveN05FlashModel::InitSparseKv() {
         const int64_t reserve = totalBytes.at(device) * (1.0 - GetGpuMemRatio());
         prefixBudget = std::min<int64_t>(prefixBudget, (int64_t)freeBytes.at(device) - reserve);
     }
-    const int prefixSlots = prefixes->SlotCount(owners, prefixBudget);
+    const int localOwners = WindowRequestsPerGroup(owners);
+    const int prefixSlots = reserveWindowHistory ? prefixes->SlotCount(localOwners, prefixBudget) : 0;
+    const int totalSlots = prefixSlots * attentionDP;
     prefixes->storage.resize(ranks);
     tpPagedCaches.resize(ranks);
     size_t hostBytes = 0;
     for (int rank = 0; rank < ranks; ++rank) {
         size_t deviceBytes = size_t(prefixSlots) * prefixes->slotBytes +
-            size_t(PrefixPool::DraftShardSlots(prefixSlots, rank, ranks)) * prefixes->draftSlotBytes;
+            size_t(PrefixPool::DraftShardSlots(totalSlots, rank, ranks)) * prefixes->draftSlotBytes;
         for (int layer = 0; layer < block_cnt; ++layer) {
             const auto &cfg = slidingLayers[layer] ? sliding : full;
             const size_t width = GetDataBytes(LayerKVType(layer), 1,
                 std::max(1, cfg.kvHeads / AttentionTPSize()) * (cfg.headDim + cfg.valueDim));
-            if (slidingLayers[layer]) deviceBytes += size_t(owners) * windowCapacity * width;
+            if (slidingLayers[layer]) deviceBytes += size_t(localOwners) * windowCapacity * width;
             else {
                 // Sparse storage: hot KV, bidirectional maps, eviction workspace,
                 // selected indices and metadata. Charge graph padding as owners.
@@ -152,7 +157,7 @@ void NaiveN05FlashModel::InitSparseKv() {
         managers.resize(block_cnt * 2);
         auto allocate = [&](Data &data, int count, int width) {
             data.dataType = AuxiliaryKVType(); data.UpdateUnitSize();
-            data.Resize({owners, count, width});
+            data.Resize({localOwners, count, width});
             data.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false);
             data.Allocate(false);
         };
@@ -219,14 +224,15 @@ void NaiveN05FlashModel::InitSparseKv() {
             tpDevices[rank], measured / 1048576.0);
         state->ranks.push_back(std::move(r));
     }
-    for (int slot = owners - 1; slot >= 0; --slot) state->free.push_back(slot);
+    activeWindowSlots = std::make_shared<WindowSlots>();
+    activeWindowSlots->Init(attentionDP, localOwners);
     state->queries = queries;
     sparseKv = std::move(state);
     if (prefixSlots) {
         if (prefixes->draftSlotBytes) {
             prefixes->draftStorage.resize(ranks);
             for (int rank = 0; rank < ranks; ++rank) {
-                const int slots = PrefixPool::DraftShardSlots(prefixSlots, rank, ranks);
+                const int slots = PrefixPool::DraftShardSlots(totalSlots, rank, ranks);
                 if (!slots) continue;
                 FastllmCudaSetDevice(tpDevices[rank]);
                 auto &storage = prefixes->draftStorage[rank];
@@ -235,7 +241,7 @@ void NaiveN05FlashModel::InitSparseKv() {
                 storage.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); storage.Allocate(false);
             }
         }
-        for (int slot = 0; slot < prefixSlots; ++slot) prefixes->freeSlots.push_back(slot);
+        prefixes->slots.Init(attentionDP, prefixSlots);
         prefixPool = std::move(prefixes);
         printf("[MiMo KVMem prefix cache] %d window slots, %d reserved per request, %.2f MiB/GPU within KV budget.\n",
             prefixSlots, PrefixSnapshotsPerRequest, prefixPool->slotBytes * prefixSlots / 1048576.0);
@@ -253,18 +259,13 @@ void NaiveN05FlashModel::InitSparseKv() {
 void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots) {
 #ifdef USE_CUDA
     if (!sparseKv) return;
-    auto lease = std::static_pointer_cast<SparseKvState::Lease>(roots.front().first->kvStorageOwner);
-    if (lease) return;
-    InvalidateTensorParallelCache(roots.front().first);
-    {
-        lease = std::make_shared<SparseKvState::Lease>();
-        lease->storage = sparseKv;
-        std::lock_guard<std::mutex> lock(sparseKv->mutex);
-        if (sparseKv->free.empty()) { lease->storage.reset(); throw std::runtime_error("MiMo KVMem request slots exhausted"); }
-        lease->slot = sparseKv->free.back(); sparseKv->free.pop_back();
-        roots.front().first->kvStorageOwner = lease;
-    }
-    const int slot = lease->slot, ranks = tpDevices.size();
+    Data &key = *roots.front().first;
+    if (!ReserveWindow(key)) throw std::runtime_error("MiMo KVMem request slots exhausted");
+    auto lease = std::static_pointer_cast<WindowLease>(key.kvStorageOwner);
+    if (lease->sparse) return;
+    lease->sparse = sparseKv;
+    InvalidateTensorParallelCache(&key);
+    const int slot = lease->slots->Row(lease->id), ranks = tpDevices.size();
     const auto devices = attentionDP > 1 ? roots.front().first->dataDeviceIds : tpDevices;
     std::shared_ptr<PrefixSnapshot> snapshot;
     {
@@ -313,7 +314,7 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
                         const size_t rowBytes = size_t(width) * local.unitSize;
                         if (snapshot) {
                             auto *source = (char *)snapshot->pool->storage.at(rank).cudaData +
-                                size_t(snapshot->slot) * snapshot->pool->slotBytes + snapshot->pool->offsets[layer * 2 + part];
+                                size_t(snapshot->pool->slots.Row(snapshot->slot)) * snapshot->pool->slotBytes + snapshot->pool->offsets[layer * 2 + part];
                             const int first = tpSwaRingCache ? (snapshot->length - past) % window : 0;
                             const int count = tpSwaRingCache ? std::min(past, window - first) : past;
                             FastllmCudaCopyFromDeviceToDevice((char *)local.cudaData + first * rowBytes, source, count * rowBytes);

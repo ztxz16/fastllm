@@ -75,6 +75,8 @@ namespace fastllm {
                                          PrefillPrefixPreview &preview) const override;
         bool RestorePagedPrefixCacheExtra(ResponseContext *context, int length) const override;
         void TryRecordResponseContext(ResponseContext *context) override;
+        bool CanAdmitResponseContext(const ResponseContext *context) const override;
+        bool TryAdmitResponseContext(ResponseContext *context) override;
         void OnResponseContextCreated(ResponseContext *context) override;
         void OnResponseContextRemoved(ResponseContext *context) override;
         void OnResponseContextFinished(ResponseContext *context) override;
@@ -134,9 +136,38 @@ namespace fastllm {
         // Only window payloads live here; full DSA/indexer KV stays in the page pool.
         static constexpr int MaxPrefillSnapshots = 3;
         static constexpr int PrefixSnapshotsPerRequest = MaxPrefillSnapshots + 1;
-        struct PrefixPool {
+        // Interleaved logical IDs keep draft sharding stable. Only the local row
+        // is materialized on the attention group's devices.
+        struct WindowSlots {
             std::mutex mutex;
-            std::vector<int> freeSlots;
+            std::vector<std::vector<int>> free;
+            void Init(int groups, int perGroup) {
+                free.resize(groups);
+                for (int group = 0; group < groups; ++group) {
+                    free[group].reserve(perGroup);
+                    for (int row = perGroup - 1; row >= 0; --row)
+                        free[group].push_back(row * groups + group);
+                }
+            }
+            int Take(int group) {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto &slots = free.at(group);
+                if (slots.empty()) return -1;
+                int slot = slots.back(); slots.pop_back();
+                return slot;
+            }
+            void Return(int slot) {
+                std::lock_guard<std::mutex> lock(mutex);
+                free.at(slot % free.size()).push_back(slot);
+            }
+            bool Available(int group) {
+                std::lock_guard<std::mutex> lock(mutex);
+                return !free.at(group).empty();
+            }
+            int Row(int slot) const { return slot / int(free.size()); }
+        };
+        struct PrefixPool {
+            WindowSlots slots;
             std::vector<Data> storage;
             std::vector<size_t> offsets;
             size_t slotBytes = 0;
@@ -187,12 +218,14 @@ namespace fastllm {
                 for (const auto &entry : checkpointPages)
                     entry.pool->ReleasePrefixCheckpoint(entry.page, entry.generation);
                 if (pool && slot >= 0) {
-                    std::lock_guard<std::mutex> lock(pool->mutex);
-                    pool->freeSlots.push_back(slot);
+                    pool->slots.Return(slot);
                 }
             }
         };
         using PrefixSnapshots = std::vector<std::shared_ptr<PrefixSnapshot>>;
+        void ReleaseRequestWindowStorage(ResponseContext *context);
+        bool RestorePrefixWindow(ResponseContext *context, const std::shared_ptr<PrefixSnapshot> &snapshot) const;
+        int TakeHistorySlot(int group);
         void RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &snapshot);
         PrefixSnapshots BeginPrefixSnapshots(const Data &key, int past, int length);
         void FinishPrefixSnapshots(const Data &key, const PrefixSnapshots &snapshots, bool prefill);
@@ -360,6 +393,22 @@ namespace fastllm {
         struct SparsePDReceive;
         struct GpuPDReceive;
         std::shared_ptr<SparseKvState> sparseKv;
+        struct WindowLease {
+            std::shared_ptr<WindowSlots> slots;
+            std::shared_ptr<SparseKvState> sparse; // Keeps borrowed sparse buffers alive after binding.
+            int id = -1;
+            ~WindowLease() { if (id >= 0) slots->Return(id); }
+        };
+        // Unconfigured library users may enable history after warmup. An explicit
+        // startup opt-out gives that memory back to the fixed token pool.
+        bool reserveWindowHistory = true;
+        std::shared_ptr<WindowSlots> activeWindowSlots;
+        int WindowRequestsPerGroup(int batch) const {
+            const int mean = (batch + attentionDP - 1) / attentionDP;
+            return std::min(batch, mean + (mean + 3) / 4);
+        }
+        int WindowGroup(const Data &key) const;
+        bool ReserveWindow(Data &key) const;
         void InitSparseKv();
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
         Data SeparateIndexer(int layer, int rank, const Data &key) const;

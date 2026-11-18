@@ -2516,6 +2516,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     const int ranks = tpDevices.size();
     const int batch = maxBatch > 0 ? maxBatch : 512;
     const int chunk = std::max(1, GetChunkedPrefillSize());
+    const int localBatch = WindowRequestsPerGroup(batch);
     const int64_t swaCapacity = ((int64_t)window + (draftEnabled ? draftBlock : 0) + 127) / 128 * 128;
     if (std::count(slidingLayers.begin(), slidingLayers.end(), 1)) {
         tpSwaPrefillWorkspaces.resize(ranks);
@@ -2530,7 +2531,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         if (slidingLayers[layer]) {
             for (int dim : {cfg.headDim, cfg.valueDim}) {
                 const int64_t size = std::max(1, cfg.kvHeads / AttentionTPSize()) * dim * kvBytes * swaCapacity;
-                fixedBytes += (size + 255) / 256 * 256 * batch;
+                fixedBytes += (size + 255) / 256 * 256 * localBatch;
             }
         }
         else for (int rank = 0; rank < ranks; ++rank) {
@@ -2601,9 +2602,10 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     }
     prefixes->slotBytes = (prefixes->slotBytes + 255) / 256 * 256;
     if (draftEnabled) prefixes->draftSlotBytes = (size_t)(draftWindow - 1) * embed_dim * sizeof(uint16_t);
-    const int prefixSlots = prefixes->SlotCount(batch, budget);
+    const int prefixSlots = reserveWindowHistory ? prefixes->SlotCount(localBatch, budget) : 0;
+    const int totalSlots = prefixSlots * attentionDP;
     const int64_t prefixBytes = (int64_t)prefixSlots * prefixes->slotBytes +
-        (int64_t)PrefixPool::DraftShardSlots(prefixSlots, 0, ranks) * prefixes->draftSlotBytes;
+        (int64_t)PrefixPool::DraftShardSlots(totalSlots, 0, ranks) * prefixes->draftSlotBytes;
     fixedBytes += prefixBytes;
     int64_t tokens = GetMaxTokens() > 0 ? GetMaxTokens() :
         std::min<int64_t>((int64_t)max_positions * batch,
@@ -2634,7 +2636,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                   (int64_t)fullLayers * 2 * batch);
     for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer]) {
         for (int dim : {sliding.headDim, sliding.valueDim})
-            reserveBlocks(swaCapacity * std::max(1, sliding.kvHeads / AttentionTPSize()) * dim * kvBytes, batch);
+            reserveBlocks(swaCapacity * std::max(1, sliding.kvHeads / AttentionTPSize()) * dim * kvBytes, localBatch);
     }
     int64_t requestBytes = 0;
     for (const auto &entry : requestBlocks) requestBytes += entry.first * entry.second;
@@ -2660,6 +2662,10 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     }
     tpKVPool.swap(pools);
     tpSwaCacheCapacity = swaCapacity;
+    if (attentionDP > 1) {
+        activeWindowSlots = std::make_shared<WindowSlots>();
+        activeWindowSlots->Init(attentionDP, localBatch);
+    }
     tpRequestKVPool.swap(requestPools);
     if (prefixSlots > 0) {
         prefixes->storage.resize(ranks);
@@ -2677,7 +2683,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         if (prefixes->draftSlotBytes) {
             prefixes->draftStorage.resize(ranks);
             for (int rank = 0; rank < ranks; ++rank) {
-                const int slots = PrefixPool::DraftShardSlots(prefixSlots, rank, ranks);
+                const int slots = PrefixPool::DraftShardSlots(totalSlots, rank, ranks);
                 if (!slots) continue;
                 FastllmCudaSetDevice(tpDevices[rank]);
                 Data &storage = prefixes->draftStorage[rank];
@@ -2690,7 +2696,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                 storage.directMemory = true;
             }
         }
-        for (int slot = 0; slot < prefixSlots; ++slot) prefixes->freeSlots.push_back(slot);
+        prefixes->slots.Init(attentionDP, prefixSlots);
         prefixPool = std::move(prefixes);
         printf("[Naive GPU prefix cache] %d window slots, %.2f MiB/GPU within KV budget; no CPU KV archive.\n",
                prefixSlots, prefixBytes / 1048576.0);
@@ -2747,8 +2753,8 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     // uses each owner's physical pool; total capacity reporting must also
     // account for SWA, Indexer, graph and draft storage before scaling by DP.
     tokensLimit = (int)tokens;
-    printf("[Naive KV pool] preallocated %.2f MiB/GPU, %lld total tokens, batch %d, SWA capacity %lld rows/request. No serving-time KV cudaMalloc.\n",
-        bytes / 1048576.0, (long long)tokens, batch, (long long)swaCapacity);
+    printf("[Naive KV pool] preallocated %.2f MiB/GPU, %lld total tokens, batch %d, SWA %d requests/group, capacity %lld rows/request. No serving-time KV cudaMalloc.\n",
+        bytes / 1048576.0, (long long)tokens, batch, localBatch, (long long)swaCapacity);
     fflush(stdout);
 #endif
 }

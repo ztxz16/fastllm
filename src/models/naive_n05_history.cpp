@@ -12,6 +12,8 @@ namespace fastllm {
 bool NaiveN05FlashModel::SetSaveHistoryChat(bool save) {
     std::lock_guard<std::mutex> contextGuard(dictLocker);
     std::lock_guard<std::mutex> guard(historyMutex);
+    if (tpPagedCaches.empty()) reserveWindowHistory = save;
+    else if (save && !reserveWindowHistory) return false;
     saveHistoryChat = save;
     if (!save) {
         prefixHistory.clear();
@@ -26,6 +28,34 @@ bool NaiveN05FlashModel::SetSaveHistoryChat(bool save) {
 bool NaiveN05FlashModel::TryRestoreHistoryCache(std::vector<int> &, int &cacheLen) {
     cacheLen = 0;
     return false;
+}
+
+int NaiveN05FlashModel::WindowGroup(const Data &key) const {
+    if (attentionDP == 1) return 0;
+    AssertInFastLLM(!key.dataDeviceIds.empty(), "Missing attention DP window owner.");
+    auto owner = std::find(tpDevices.begin(), tpDevices.end(), key.dataDeviceIds.front());
+    AssertInFastLLM(owner != tpDevices.end(), "Invalid attention DP window owner.");
+    return (owner - tpDevices.begin()) / AttentionTPSize();
+}
+
+bool NaiveN05FlashModel::CanAdmitResponseContext(const ResponseContext *context) const {
+    if (!activeWindowSlots) return true;
+    const Data &key = context->pastKeyValues.front().first;
+    return key.kvStorageOwner || activeWindowSlots->Available(WindowGroup(key));
+}
+
+bool NaiveN05FlashModel::ReserveWindow(Data &key) const {
+    if (!activeWindowSlots || key.kvStorageOwner) return true;
+    auto lease = std::make_shared<WindowLease>();
+    lease->slots = activeWindowSlots;
+    lease->id = lease->slots->Take(WindowGroup(key));
+    if (lease->id < 0) return false;
+    key.kvStorageOwner = std::move(lease);
+    return true;
+}
+
+bool NaiveN05FlashModel::TryAdmitResponseContext(ResponseContext *context) {
+    return !activeWindowSlots || ReserveWindow(context->pastKeyValues.front().first);
 }
 
 void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
@@ -55,7 +85,10 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
         std::vector<std::pair<Data *, Data *>> roots;
         for (auto &layer : context->pastKeyValues) roots.emplace_back(&layer.first, &layer.second);
         // Keep continuations on their longest resident prefix; ties prefer RR.
-        InitAttentionParallelCache(roots, AllocatePrefillGroup(group));
+        if (!roots.front().first->multiDeviceData)
+            InitAttentionParallelCache(roots, AllocatePrefillGroup(group));
+        else if (queuedPrefix && queuedPrefix->ownerDevice != roots.front().first->dataDeviceIds.front())
+            queuedPrefix.reset();
     }
     if (!context->pastKeyValues.empty()) {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
@@ -83,6 +116,10 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
         tpRequestIds.erase(key);
         tpSamplingRequestIds.erase(key);
     }
+    // A tentative prefix can be returned to the queue before its first forward.
+    // Release its local SWA allocation and admission grant together.
+    if (key && key->kvStorageOwner && context->cacheLen && !context->isEnding && !context->isAbort)
+        ReleaseRequestWindowStorage(context);
     RecycleTensorParallelCache(context);
     std::lock_guard<std::mutex> guard(historyMutex);
     activePrefixes.erase(key);
@@ -120,6 +157,22 @@ void NaiveN05FlashModel::RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &s
     snapshot.reset();
 }
 
+// Caller holds historyMutex. A checkpoint with another reader cannot free its slot.
+int NaiveN05FlashModel::TakeHistorySlot(int group) {
+    int slot = prefixPool->slots.Take(group);
+    for (auto it = prefixHistory.begin(); slot < 0 && it != prefixHistory.end();) {
+        if (it->use_count() != 1 || (*it)->slot % attentionDP != group) {
+            ++it;
+            continue;
+        }
+        it = prefixHistory.erase(it);
+        ++prefixPool->evictedWindows;
+        ++prefixPool->historyVersion;
+        slot = prefixPool->slots.Take(group);
+    }
+    return slot;
+}
+
 NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
         const Data &key, int past, int length) {
     PrefixSnapshots result;
@@ -134,6 +187,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
     // Admission either restored this checkpoint into active.prefill or fell
     // back to recomputation. Neither path needs the waiting guard anymore.
     active->second.queued.reset();
+    const int group = WindowGroup(key);
     std::vector<int> boundaries;
     const int last = end / page * page;
     if (length > 1 && last == end && last - page >= past && last > page)
@@ -179,19 +233,12 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
             if (replaceList) replaceList->erase(replaceList->begin() + replaceIndex);
             replace = nullptr;
         };
-        auto takeSlot = [&]() {
-            std::lock_guard<std::mutex> lock(prefixPool->mutex);
-            if (prefixPool->freeSlots.empty()) return -1;
-            int slot = prefixPool->freeSlots.back();
-            prefixPool->freeSlots.pop_back();
-            return slot;
-        };
-        int slot = takeSlot();
+        int slot = prefixPool->slots.Take(group);
         if (slot < 0 && replace && *replace) {
             const bool published = std::find(prefixHistory.begin(), prefixHistory.end(), *replace) != prefixHistory.end();
             if (replace->use_count() == 1 + (int)published) {
                 retire();
-                slot = takeSlot();
+                slot = prefixPool->slots.Take(group);
             }
         }
         if (slot < 0) {
@@ -204,7 +251,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
                     ++prefixPool->orphanWindows;
                     return true;
                 }), prefixHistory.end());
-            slot = takeSlot();
+            slot = prefixPool->slots.Take(group);
         }
         // A continuation pins one checkpoint, but its previous request may
         // have left several more in history. Reuse those slots before LRU
@@ -222,19 +269,12 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
                    overlaps(active->second.decode);
         };
         for (auto it = prefixHistory.begin(); slot < 0 && it != prefixHistory.end();) {
-            if (it->use_count() != 1 || !overlapsActivePrefix(*it)) { ++it; continue; }
+            if ((*it)->slot % attentionDP != group || it->use_count() != 1 || !overlapsActivePrefix(*it)) { ++it; continue; }
             ++prefixPool->recycledWindows;
             it = prefixHistory.erase(it);
-            slot = takeSlot();
+            slot = prefixPool->slots.Take(group);
         }
-        for (auto it = prefixHistory.begin(); slot < 0 && it != prefixHistory.end();) {
-            // Evict only entries whose history reference owns the slot alone.
-            // Erasing pinned entries loses valid hits without freeing memory.
-            if (it->use_count() != 1) { ++it; continue; }
-            ++prefixPool->evictedWindows;
-            it = prefixHistory.erase(it);
-            slot = takeSlot();
-        }
+        if (slot < 0) slot = TakeHistorySlot(group);
         if (slot < 0) { ++prefixPool->noWindowSlots; break; }
         // Keep a shared old checkpoint if no replacement could be allocated.
         retire();
@@ -272,7 +312,7 @@ void NaiveN05FlashModel::AppendPrefixWindowCopies(PrefixWindowCopies &copies, co
         int rank, int layer, const Data &key, const Data &value, int first, bool ring) {
 #ifdef USE_CUDA
     const int rows = std::min(snapshot.length, window - 1);
-    const size_t base = (size_t)snapshot.slot * snapshot.pool->slotBytes;
+    const size_t base = (size_t)snapshot.pool->slots.Row(snapshot.slot) * snapshot.pool->slotBytes;
     for (int part = 0; part < 2; ++part) {
         const Data &cache = part ? value : key;
         AssertInFastLLM(cache.dataDevice == DataDevice::CUDA && !cache.isPagedKVCache &&
@@ -544,10 +584,21 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
             }
         }
     }
-    if (!snapshot) return false;
-    self->InvalidateTensorParallelCache(&context->pastKeyValues.front().first);
+    return snapshot && RestorePrefixWindow(context, snapshot);
+#else
+    return false;
+#endif
+}
+
+bool NaiveN05FlashModel::RestorePrefixWindow(ResponseContext *context,
+        const std::shared_ptr<PrefixSnapshot> &snapshot) const {
+#ifdef USE_CUDA
+    auto *self = const_cast<NaiveN05FlashModel *>(this);
+    const int length = snapshot->length;
     // A queued hit pins only the immutable checkpoint and page references.
     // Its private hot/SWA slot is attached when the scheduler admits it.
+    if (!ReserveWindow(context->pastKeyValues.front().first)) return false;
+    self->InvalidateTensorParallelCache(&context->pastKeyValues.front().first);
     if (!sparseKv) {
         const int rows = std::min(length, window - 1), ranks = tpDevices.size();
         const int capacity = tpSwaCacheCapacity ? tpSwaCacheCapacity :
@@ -593,7 +644,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
                     cache->Resize({1, rows, width});
                     const size_t rowBytes = (size_t)width * cache->unitSize;
                     auto *source = (uint8_t *)snapshot->pool->storage.at(rank).cudaData +
-                        (size_t)snapshot->slot * snapshot->pool->slotBytes + snapshot->pool->offsets.at(layer * 2 + part);
+                        (size_t)snapshot->pool->slots.Row(snapshot->slot) * snapshot->pool->slotBytes + snapshot->pool->offsets.at(layer * 2 + part);
                     const int first = tpSwaRingCache ? (length - rows) % window : 0;
                     const int count = tpSwaRingCache ? std::min(rows, window - first) : rows;
                     dsts.push_back((uint8_t *)cache->cudaData + first * rowBytes);

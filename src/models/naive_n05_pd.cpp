@@ -301,6 +301,10 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
         if (!model.pdReceivePools) model.pdReceivePools = std::make_shared<GpuPDPools>();
         const int rows = std::min(length, model.window - 1), ranks = devices.size();
         reservation->Init(model.block_cnt, model.dataType, model.kvCacheDataType);
+        // Direct DMA can outlive a cancelled request. Keep the window grant
+        // with the receive buffers until their last transport lease retires.
+        if (!model.TryAdmitResponseContext(&context)) throw fastkv::CapacityBusy("PD window slots exhausted");
+        reservation->pastKeyValues.front().first.kvStorageOwner = context.pastKeyValues.front().first.kvStorageOwner;
         fastkv::Writer metadata;
         metadata.String(model.PDLayout()); metadata.U32(length);
         for (int layer = 0; layer < model.block_cnt; ++layer) for (int part = 0; part < 2; ++part) {
@@ -489,9 +493,13 @@ bool NaiveN05FlashModel::SelectPDRequestGroup(ResponseContext &context,
         const std::vector<size_t> &available, size_t required) {
     CheckPD(available.size() == size_t(attentionDP), "invalid PD group budgets");
     const int previous = PDRequestGroup(context);
-    if (available.at(previous) >= required) return true;
-    const int group = std::max_element(available.begin(), available.end()) - available.begin();
-    if (available[group] < required) return false;
+    if (available.at(previous) >= required && TryAdmitResponseContext(&context)) return true;
+    if (!context.pastKeyValues.empty() && context.pastKeyValues.front().first.kvStorageOwner) return false;
+    int group = -1;
+    for (int g = 0; g < attentionDP; ++g)
+        if (available[g] >= required && (!activeWindowSlots || activeWindowSlots->Available(g)) &&
+            (group < 0 || available[g] > available[group])) group = g;
+    if (group < 0) return false;
     // Only an unadmitted, empty context can change owner. Drop the queued
     // prefix hint; no page or cached SWA state has been borrowed yet.
     for (const auto &pair : context.pastKeyValues)
@@ -514,7 +522,7 @@ bool NaiveN05FlashModel::SelectPDRequestGroup(ResponseContext &context,
     std::lock_guard<std::mutex> lock(historyMutex);
     auto it = activePrefixes.find(&context.pastKeyValues.front().first);
     if (it != activePrefixes.end()) it->second.queued.reset();
-    return true;
+    return TryAdmitResponseContext(&context);
 }
 
 std::string NaiveN05FlashModel::PDLayout() const {

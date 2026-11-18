@@ -15,7 +15,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         slidingLayers = {0, 1};
         tpDevices = {0};
         prefixPool = std::make_shared<PrefixPool>();
-        for (int i = 0; i < slots; ++i) prefixPool->freeSlots.push_back(i);
+        prefixPool->slots.Init(1, slots);
         tpPagedCaches.resize(1);
         tpPagedCaches[0].resize(4);
         auto pool = std::make_unique<PagedCacheManager>();
@@ -63,6 +63,31 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     ~NaiveN05PrefixCacheTestAccess() {
         activePrefixes.clear();
         prefixHistory.clear();
+    }
+
+    static void WindowOwnership() {
+        NaiveN05PrefixCacheTestAccess model(2);
+        model.attentionDP = 2;
+        model.tpDevices = {5, 3, 7, 1};
+        Require(model.WindowRequestsPerGroup(5) == 4, "incorrect uneven DP window capacity");
+        model.activeWindowSlots = std::make_shared<WindowSlots>();
+        model.activeWindowSlots->Init(2, 1);
+        ResponseContext a, b, queued;
+        for (auto *ctx : {&a, &b, &queued}) ctx->pastKeyValues.resize(2);
+        a.pastKeyValues[0].first.dataDeviceIds = queued.pastKeyValues[0].first.dataDeviceIds = {5, 3};
+        b.pastKeyValues[0].first.dataDeviceIds = {7, 1};
+        Require(model.TryAdmitResponseContext(&a) && model.TryAdmitResponseContext(&a) &&
+                !model.CanAdmitResponseContext(&queued) && !model.TryAdmitResponseContext(&queued) &&
+                model.TryAdmitResponseContext(&b), "owner-local admission overcommitted or blocked a peer");
+        a.pastKeyValues[0].first.kvStorageOwner.reset();
+        Require(model.TryAdmitResponseContext(&queued), "owner slot leaked across retirement");
+        WindowSlots history;
+        history.Init(2, 2);
+        const int a0 = history.Take(0), a1 = history.Take(0), b0 = history.Take(1);
+        Require(a0 != b0 && history.Row(a0) == history.Row(b0) && history.Row(a0) != history.Row(a1) &&
+                history.Take(0) == -1, "logical checkpoint aliases a physical row in its group");
+        history.Return(a0);
+        Require(history.Take(0) == a0 && history.Take(1) >= 0, "checkpoint returned to wrong owner");
     }
 
     static void FinishBeforeDrain() {
@@ -141,7 +166,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         held.reset();
         // Weak metadata must not keep the four checkpoint slots alive.
         model.prefixHistory.clear();
-        Require(model.prefixPool->freeSlots.size() == 4, "preview pinned an SWA checkpoint");
+        Require(model.prefixPool->slots.free[0].size() == 4, "preview pinned an SWA checkpoint");
         Require(model.PreviewPagedPrefixCacheExtra(c.get(), 8448, preview) == 0,
                 "preview resurrected removed SWA checkpoint");
         auto other = model.Request(1); model.Checkpoint(*other, 0, 8192);
@@ -277,7 +302,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
             Require(model.Checkpoint(c, 8447, 1) == 1, "missing decode checkpoint");
             model.Publish(c);
         }
-        Require(model.prefixHistory.size() == 1600 && model.prefixPool->freeSlots.empty(),
+        Require(model.prefixHistory.size() == 1600 && model.prefixPool->slots.free[0].empty(),
                 "four-checkpoint setup did not fill pool");
         auto &last = *requests.back();
         auto &active = model.activePrefixes.at(&last.pastKeyValues[0].first);
@@ -466,6 +491,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
 
 int main() {
     try {
+        fastllm::NaiveN05PrefixCacheTestAccess::WindowOwnership();
         fastllm::NaiveN05PrefixCacheTestAccess::FinishBeforeDrain();
         fastllm::NaiveN05PrefixCacheTestAccess::BudgetPreviewOwnership();
         fastllm::NaiveN05PrefixCacheTestAccess::PublicationHashCollision();

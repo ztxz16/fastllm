@@ -642,8 +642,8 @@ namespace fastllm {
         // another request. Output queues remain available to slow consumers.
         virtual void OnResponseContextFinished(ResponseContext *context) {}
 
-        // Called by the scheduler before consuming a selected prompt. Models
-        // with fixed request storage reserve it here; false leaves work queued.
+        // Check admission before touching cached state; reserve only for a selected request.
+        virtual bool CanAdmitResponseContext(const ResponseContext *) const { return true; }
         virtual bool TryAdmitResponseContext(ResponseContext *context) { return true; }
 
         virtual bool UseGenericHistoryCache() const { return true; }

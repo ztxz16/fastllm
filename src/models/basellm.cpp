@@ -2532,6 +2532,7 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
+                        if (!model->CanAdmitResponseContext(ctx)) continue;
                         if (auto *manager = RestoreResidentPrefix(model, ctx)) {
                             std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
                             curBusyPages = manager->maxPages - manager->FreePageCount() + pendingNewPages;
@@ -3574,6 +3575,7 @@ namespace fastllm {
                                     const int group = model->GetPrefillBatchGroup(ctx);
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
+                                    if (!model->CanAdmitResponseContext(ctx)) continue;
                                     if (candidates >= requestLimit) { batchFull = capacityLimited = true; break; }
                                     if (!ctx->prefillOffset && newCandidates >= slots) {
                                         capacityLimited = true; continue;
@@ -3665,7 +3667,7 @@ namespace fastllm {
                                     auto *ctx = order.context;
                                     if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
                                         ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxPromptTokens) continue;
-                                    if (!ctx->prefillOffset && admitted >= slots) continue;
+                                    if (!ctx->prefillOffset && (admitted >= slots || !model->CanAdmitResponseContext(ctx))) continue;
                                     if (!ctx->prefillOffset && model->DeferHistoryCacheRestore()) {
                                         const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
                                         const long long before = allocatedTokens(cache);
@@ -3776,6 +3778,7 @@ namespace fastllm {
                                     continue;
                                 }
 
+                                if (isPrompt && !model->CanAdmitResponseContext(it.second)) continue;
                                 if (isPrompt && !batchPrefill && model->DeferHistoryCacheRestore()) {
                                     const auto &cache = it.second->pastKeyValues[model->kvCacheId].first;
                                     const long long before = allocatedTokens(cache);

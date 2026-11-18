@@ -2116,6 +2116,9 @@ def make_normal_llm_model(args, startup_progress = None):
     if (prefill_batch_tokens == 0 and not (prefill_batch_auto and attention_dp > 1) and
             (any(prefill_values[1:]) or any(prefill_scheduling.values()))):
         raise ValueError("prefill coalescing and scheduling require a positive token budget")
+    history_explicit = args.cache_history not in ("", None)
+    history_enabled = _arg_enabled(args.cache_history)
+    pd_options = json.loads(args.pd) if getattr(args, "pd", "") else None
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
@@ -2291,9 +2294,15 @@ def make_normal_llm_model(args, startup_progress = None):
             model.configure_attention_parallel(attention_dp)
         if (args.moe_atype != ""):
             model.set_moe_atype(args.moe_atype)
-        if (args.cache_history.lower() not in ["", "false", "0", "off"]):
+        if is_naive_n05_model:
+            role = pd_options.get("role") if pd_options is not None else None
+            # D receives complete state from P. Configure its pool before warmup.
+            if not history_explicit:
+                history_enabled = _uses_thread_tp(getattr(args, "tp", ""))
+            model.set_save_history(history_enabled and role != "decode")
+        elif history_enabled:
             model.set_save_history(True)
-            if (args.cache_fast in ["", "false", "0", "off"]):
+            if args.cache_fast in ["", "false", "0", "off"]:
                 llm.set_cpu_historycache(True)
         if (args.moe_experts > 0):
             model.set_moe_experts(args.moe_experts)
@@ -2364,8 +2373,8 @@ def make_normal_llm_model(args, startup_progress = None):
                 "to %d or less, reduce --mtp, or use GPUs with more memory."
                 % (args.max_batch, effective_max_batch, effective_max_batch)
             )
-        if getattr(args, "pd", ""):
-            model.configure_pd(**json.loads(args.pd))
+        if pd_options is not None:
+            model.configure_pd(**pd_options)
         return model
     except Exception:
         if kernel_policy is not None:

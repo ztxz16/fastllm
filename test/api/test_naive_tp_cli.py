@@ -41,6 +41,11 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
             self.model_options = fake.llm.model.call_args.kwargs
             return args
 
+    def test_saved_history_booleans(self):
+        for value in (True, False):
+            self.configure([], saved=dict(tp='8', cache_history=value))
+            self.loaded_model.set_save_history.assert_called_once_with(value)
+
     def test_fp8_compute_cli_and_saved_settings(self):
         self.configure([])
         self.assertEqual(self.model_options['indexer_compute_dtype'], 'auto')

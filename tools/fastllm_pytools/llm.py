@@ -3578,8 +3578,15 @@ class model:
         if (getattr(self, "kvmem_enabled", False) and save and
                 not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model)):
             raise ValueError("This model's KVMem backend does not support history caching")
+        if hasattr(fastllm_lib, "try_set_save_history"):
+            setter = fastllm_lib.try_set_save_history
+            setter.argtypes = [ctypes.c_int, ctypes.c_bool]
+            setter.restype = ctypes.c_bool
+            if not setter(self.model, save):
+                raise ValueError("Enable history before warmup to reserve GPU window slots")
+        else:
+            fastllm_lib.set_save_history(self.model, save)
         self.save_history = bool(save)
-        fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
         if self._is_clover() and atype not in ("bf16", "bfloat16", "fp16", "float16"):

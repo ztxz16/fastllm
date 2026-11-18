@@ -800,10 +800,12 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT bool try_set_save_history(int modelId, bool save) {
+        return models.GetModel(modelId)->SetSaveHistoryChat(save);
+    }
+
     DLL_EXPORT void set_save_history(int modelId, bool save) {
-        auto model = models.GetModel(modelId);
-        model->SetSaveHistoryChat(save);
-        return;
+        try_set_save_history(modelId, save);
     }
 
     DLL_EXPORT void set_moe_experts(int modelId, int moe_experts) {
