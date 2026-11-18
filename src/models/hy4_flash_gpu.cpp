@@ -1,6 +1,79 @@
 #include "hy4_flash_ops.h"
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+#include "hy4_flash_gpu_graph.h"
+#endif
 
 namespace fastllm {
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+Hy4FlashModel::Logits Hy4FlashModel::ProposeGpu(const std::vector<int> &anchors, Cache &past,
+                                                const std::vector<GenerationConfig> &configs,
+                                                const std::vector<hy4::DraftRequest *> &states) {
+    auto &w = *source;
+    auto &arenas = gpuArenas;
+    std::vector<int> expanded;
+    std::vector<int> bases;
+    for (size_t i = 0; i < states.size(); ++i) {
+        auto &state = *states[i];
+        const int base = past[i * block_cnt].first->cpuIntDatas.size();
+        bases.push_back(base);
+        auto target =
+            static_cast<const float *>(state.hidden.cudaData) + size_t((base - 1) % (draftWidth + 1)) * 3072;
+        size_t deviceIndex = arenas.size() - 1;
+        hy4::Select(devices[deviceIndex]);
+        auto block = arenas[deviceIndex]->Get("draftBlock", draftWidth * 3072);
+        hy4::DraftEmbed(w, *arenas[deviceIndex], anchors[i], draftWidth, draftMask, target, block);
+        for (size_t k = 0; k < draftProviders.size(); ++k) {
+            size_t index = size_t(draftProviders[k]) * devices.size() / block_cnt;
+            if (index != deviceIndex) {
+                hy4::Select(devices[index]);
+                auto next = arenas[index]->Get("draftBlock", draftWidth * 3072);
+                hy4::CopyStage(next, devices[index], block, devices[deviceIndex], size_t(draftWidth) * 3072);
+                block = next;
+                deviceIndex = index;
+            }
+            hy4::DraftLayer(w, *arenas[index], k, base, draftWidth, state.providers[k], block);
+        }
+        auto candidates = hy4::DraftReadout(w, *arenas[deviceIndex], anchors[i], draftWidth, block);
+        expanded.push_back(anchors[i]);
+        expanded.insert(expanded.end(), candidates.begin(), candidates.end());
+    }
+    auto verified = ForwardGpu(expanded, std::vector<int>(states.size(), draftWidth), past, configs, true);
+    Logits output;
+    for (size_t i = 0; i < states.size(); ++i) {
+        auto &state = *states[i];
+        const size_t first = i * draftWidth;
+        int accepted = 0;
+        for (int j = 0; j < draftWidth; ++j) {
+            const auto &row = verified[first + j];
+            int next = std::max_element(row.begin(), row.end()) - row.begin();
+            if (j)
+                state.pending.push_back(next);
+            else
+                state.expected = next;
+            if (next == eos_token_id || eos_token_ids.count(next) || configs[i].stop_token_ids.count(next) ||
+                j + 1 == draftWidth || next != expanded[first + j + 1])
+                break;
+            ++accepted;
+        }
+        const int committed = bases[i] + 1 + accepted;
+        past[i * block_cnt].first->cpuIntDatas.resize(committed);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            auto &kv = past[i * block_cnt + layer];
+            for (auto *data : {kv.first, kv.second}) {
+                auto dims = data->dims;
+                dims[1] = std::min(committed, dims[1]);
+                data->Resize(dims);
+            }
+        }
+        if (GetFastllmEnv().printProfile)
+            fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i, bases[i],
+                    draftWidth - 1, accepted);
+        output.emplace_back(std::move(verified[first]));
+    }
+    return output;
+}
+#endif
+
 Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
                                                 const std::vector<int> &lengths, Cache &past,
                                                 const std::vector<GenerationConfig> &configs, bool verify) {
@@ -15,7 +88,9 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
     std::vector<hy4::DraftRequest *> states;
     bool propose = draftWidth && !verify && tokens.size() == lengths.size();
     for (size_t i = 0; i < lengths.size(); ++i) {
-        auto *state = static_cast<hy4::DraftRequest *>(past[i * block_cnt].first->kvStorageOwner.get());
+        auto *state = draftWidth
+                          ? static_cast<hy4::DraftRequest *>(past[i * block_cnt].first->kvStorageOwner.get())
+                          : nullptr;
         states.push_back(state);
         const auto &cfg = configs[i];
         const int base = past[i * block_cnt].first->cpuIntDatas.size();
@@ -24,74 +99,10 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
                   !cfg.output_logits && !cfg.tool_call_grammar && !cfg.tool_call_name_constraint_enabled &&
                   !cfg.tool_call_parameter_name_constraint_enabled && cfg.prefill_chunk_remaining < 0;
     }
-    if (propose) {
-        std::vector<int> expanded;
-        std::vector<int> bases;
-        for (size_t i = 0; i < states.size(); ++i) {
-            auto &state = *states[i];
-            const int base = past[i * block_cnt].first->cpuIntDatas.size();
-            bases.push_back(base);
-            auto target = static_cast<const float *>(state.hidden.cudaData) +
-                          size_t((base - 1) % (draftWidth + 1)) * 3072;
-            size_t deviceIndex = arenas.size() - 1;
-            hy4::Select(devices[deviceIndex]);
-            auto block = arenas[deviceIndex]->Get("draftBlock", draftWidth * 3072);
-            hy4::DraftEmbed(w, *arenas[deviceIndex], tokens[i], draftWidth, draftMask, target, block);
-            for (size_t k = 0; k < draftProviders.size(); ++k) {
-                size_t index = size_t(draftProviders[k]) * devices.size() / block_cnt;
-                if (index != deviceIndex) {
-                    hy4::Select(devices[index]);
-                    auto next = arenas[index]->Get("draftBlock", draftWidth * 3072);
-                    hy4::CopyStage(next, devices[index], block, devices[deviceIndex],
-                                   size_t(draftWidth) * 3072);
-                    block = next;
-                    deviceIndex = index;
-                }
-                hy4::DraftLayer(w, *arenas[index], k, base, draftWidth, state.providers[k], block);
-            }
-            auto candidates = hy4::DraftReadout(w, *arenas[deviceIndex], tokens[i], draftWidth, block);
-            expanded.push_back(tokens[i]);
-            expanded.insert(expanded.end(), candidates.begin(), candidates.end());
-        }
-        auto verified =
-            ForwardGpu(expanded, std::vector<int>(lengths.size(), draftWidth), past, configs, true);
-        Logits output;
-        for (size_t i = 0; i < states.size(); ++i) {
-            auto &state = *states[i];
-            const size_t first = i * draftWidth;
-            int accepted = 0;
-            for (int j = 0; j < draftWidth; ++j) {
-                const auto &row = verified[first + j];
-                int next = std::max_element(row.begin(), row.end()) - row.begin();
-                if (j)
-                    state.pending.push_back(next);
-                else
-                    state.expected = next;
-                if (next == eos_token_id || eos_token_ids.count(next) ||
-                    configs[i].stop_token_ids.count(next) || j + 1 == draftWidth ||
-                    next != expanded[first + j + 1])
-                    break;
-                ++accepted;
-            }
-            const int committed = bases[i] + 1 + accepted;
-            past[i * block_cnt].first->cpuIntDatas.resize(committed);
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                auto &kv = past[i * block_cnt + layer];
-                for (auto *data : {kv.first, kv.second}) {
-                    auto dims = data->dims;
-                    dims[1] = std::min(committed, dims[1]);
-                    data->Resize(dims);
-                }
-            }
-            if (std::getenv("FASTLLM_DFLY2_TRACE"))
-                fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i,
-                        bases[i], draftWidth - 1, accepted);
-            output.emplace_back(std::move(verified[first]));
-        }
-        return output;
-    }
+    if (propose)
+        return ProposeGpu(tokens, past, configs, states);
     const int rows = tokens.size();
-    if (std::getenv("FASTLLM_HY4_BATCH_TRACE"))
+    if (GetFastllmEnv().printProfile)
         fprintf(stderr, "[HY4 gpu] requests=%zu tokens=%d verify=%d\n", lengths.size(), rows, int(verify));
     std::vector<int> owners(rows), positions(rows), lastRows;
     std::vector<std::array<int, 3>> grams(rows);
@@ -113,15 +124,13 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
         }
         lastRows.push_back(offset - 1);
     }
-    const char *graphFlag = std::getenv("FASTLLM_HY4_GPU_GRAPH");
-    const bool graphEnabled = graphFlag ? std::string(graphFlag) == "1" : GetFastllmEnv().cudaGraph;
+    const bool graphEnabled = GetFastllmEnv().cudaGraph;
     if (graphEnabled && !gpuGraphs->peerChecked) {
         gpuGraphs->peerReady = hy4::EnableGraphPeers(devices);
         gpuGraphs->peerChecked = true;
     }
-    bool capture = gpuGraphs->peerReady && graphEnabled &&
-                   (verify || rows == int(lengths.size())) && gpuGraphs->warmedRows >= size_t(rows) &&
-                   (rows != 1 || gpuGraphs->warmedSingle);
+    bool capture = gpuGraphs->peerReady && graphEnabled && (verify || rows == int(lengths.size())) &&
+                   gpuGraphs->warmedRows >= size_t(rows) && (rows != 1 || gpuGraphs->warmedSingle);
     for (size_t i = 0; i < lengths.size() && capture; ++i) {
         int end = positions[lastRows[i]] + 1;
         const auto firstPos = positions[lastRows[i]] + 1 - lengths[i];
@@ -196,8 +205,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
         }
     } else {
         hy4::Select(devices.front());
-        hy4::GraphCapture graph(capture ? gpuGraphs.get() : nullptr);
-        graph.key = key;
+        hy4::GpuGraphCapture graph(capture ? gpuGraphs.get() : nullptr);
         graph.Start(devices.front());
         auto streams = arenas.front()->Get("streams", size_t(rows) * 4 * 3072);
         for (int row = 0; row < rows; ++row) {
@@ -214,7 +222,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
                 auto next = s.Get("streams", size_t(rows) * 4 * 3072);
                 graph.Start(s.device);
                 if (capture)
-                    hy4::CopyStageCaptured(next, s.device, streams, devices[stage], size_t(rows) * 4 * 3072);
+                    hy4::CopyStageCaptured(next, streams, size_t(rows) * 4 * 3072);
                 else
                     hy4::CopyStage(next, s.device, streams, devices[stage], size_t(rows) * 4 * 3072);
                 stage = owner;
@@ -280,7 +288,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
             }
             offset += lengths[i];
         }
-        graph.Finish(verify, rows);
+        graph.Finish(key, verify, rows);
         for (auto &arena : arenas)
             arena->step = nullptr;
     }

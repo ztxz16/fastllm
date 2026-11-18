@@ -3,6 +3,7 @@
 #include "devices/disk/diskdevice.h"
 #include <cstring>
 #ifdef FASTLLM_ENABLE_HY4_CUDA
+#include "hy4_flash_hybrid_graph.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #endif
@@ -12,7 +13,12 @@ void Hy4FlashModel::OnModelWeightsLoaded() {
     if (!hybrid)
         return;
     hostExperts.resize(block_cnt);
+    bool allDisk = true, allCpu = true, allNuma = true;
     for (int layer = 1; layer < block_cnt; layer++) {
+        const auto device = SelectMoeDeviceForLayer(layer);
+        allDisk &= device == "disk";
+        allCpu &= device == "cpu";
+        allNuma &= device == "numa" || device.rfind("numa:", 0) == 0;
         auto &table = hostExperts[layer];
         table.resize(2 + 2 * 512, nullptr);
         for (int id = 0; id < 512; id++) {
@@ -21,9 +27,12 @@ void Hy4FlashModel::OnModelWeightsLoaded() {
             table[3 + 2 * id] = &weight.weight.at(p + "down_proj.weight");
         }
     }
-    if (SelectMoeDeviceForLayer(1) == "disk")
-        diskGraphReady = std::all_of(hostExperts.begin() + 1, hostExperts.end(), DiskMoeV41Graph::RegisterStandardFp8);
-    if (MoeCudaCacheRequested() && SelectMoeDeviceForLayer(1) != "disk") {
+    if (allDisk)
+        diskGraphReady =
+            std::all_of(hostExperts.begin() + 1, hostExperts.end(), DiskMoeV41Graph::RegisterStandardFp8);
+    // A complete graph requires one expert backend across the routed layers.
+    // Heterogeneous placements dispatch each layer through its assigned device.
+    if (MoeCudaCacheRequested() && (allCpu || allNuma)) {
         HybridMoeCachePlan plan(HybridMoeMath::Hy4Flash, 10.f);
         for (int layer = 1; layer < block_cnt; layer++)
             plan.Add(hostExperts[layer], SelectMoeDeviceForLayer(layer), devices.front());
@@ -31,6 +40,65 @@ void Hy4FlashModel::OnModelWeightsLoaded() {
         AssertInFastLLM(hostCacheReady, "Failed to register HY4-Flash expert weights with the CUDA cache.");
     }
 }
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+Hy4FlashModel::Logits Hy4FlashModel::ProposeHybrid(const std::vector<int> &anchors, Cache &past,
+                                                   const std::vector<GenerationConfig> &configs,
+                                                   const std::vector<hy4::DraftRequest *> &states) {
+    auto &w = *source;
+    auto &s = *hybridArena;
+    std::vector<int> expanded;
+    std::vector<int> bases;
+    for (size_t i = 0; i < states.size(); ++i) {
+        auto &state = *states[i];
+        const int base = past[i * block_cnt].first->cpuIntDatas.size();
+        bases.push_back(base);
+        auto target =
+            static_cast<const float *>(state.hidden.cudaData) + size_t((base - 1) % (draftWidth + 1)) * 3072;
+        auto block = s.Get("draftBlock", draftWidth * 3072);
+        hy4::DraftEmbed(w, s, anchors[i], draftWidth, draftMask, target, block);
+        for (size_t k = 0; k < draftProviders.size(); ++k)
+            hy4::DraftLayer(w, s, k, base, draftWidth, state.providers[k], block);
+        auto candidates = hy4::DraftReadout(w, s, anchors[i], draftWidth, block);
+        expanded.push_back(anchors[i]);
+        expanded.insert(expanded.end(), candidates.begin(), candidates.end());
+    }
+    auto verified = ForwardHybrid(expanded, std::vector<int>(states.size(), draftWidth), past, configs, true);
+    Logits output;
+    for (size_t i = 0; i < states.size(); ++i) {
+        auto &state = *states[i];
+        const size_t first = i * draftWidth;
+        int accepted = 0;
+        for (int j = 0; j < draftWidth; ++j) {
+            const auto &row = verified[first + j];
+            int next = std::max_element(row.begin(), row.end()) - row.begin();
+            if (j)
+                state.pending.push_back(next);
+            else
+                state.expected = next;
+            if (next == eos_token_id || eos_token_ids.count(next) || configs[i].stop_token_ids.count(next) ||
+                j + 1 == draftWidth || next != expanded[first + j + 1])
+                break;
+            ++accepted;
+        }
+        const int committed = bases[i] + 1 + accepted;
+        past[i * block_cnt].first->cpuIntDatas.resize(committed);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            auto &kv = past[i * block_cnt + layer];
+            for (auto *data : {kv.first, kv.second}) {
+                auto dims = data->dims;
+                dims[1] = std::min(committed, dims[1]);
+                data->Resize(dims);
+            }
+        }
+        if (GetFastllmEnv().printProfile)
+            fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i, bases[i],
+                    draftWidth - 1, accepted);
+        output.emplace_back(std::move(verified[first]));
+    }
+    return output;
+}
+#endif
+
 Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &tokens,
                                                    const std::vector<int> &lengths, Cache &past,
                                                    const std::vector<GenerationConfig> &configs,
@@ -41,14 +109,16 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
     if (!hybridArena)
         hybridArena = std::make_shared<hy4::Scratch>(device);
     if (!hybridGraphs)
-        hybridGraphs = std::make_shared<hy4::GpuGraphs>();
+        hybridGraphs = std::make_shared<hy4::HybridGraphs>();
     auto &s = *hybridArena;
     std::vector<Data *> biases(2 + 2 * 512, nullptr);
     auto &w = *source;
     std::vector<hy4::DraftRequest *> states;
     bool propose = draftWidth && !verify && tokens.size() == lengths.size();
     for (size_t i = 0; i < lengths.size(); ++i) {
-        auto *state = static_cast<hy4::DraftRequest *>(past[i * block_cnt].first->kvStorageOwner.get());
+        auto *state = draftWidth
+                          ? static_cast<hy4::DraftRequest *>(past[i * block_cnt].first->kvStorageOwner.get())
+                          : nullptr;
         states.push_back(state);
         const auto &cfg = configs[i];
         const int base = past[i * block_cnt].first->cpuIntDatas.size();
@@ -57,62 +127,10 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                   !cfg.output_logits && !cfg.tool_call_grammar && !cfg.tool_call_name_constraint_enabled &&
                   !cfg.tool_call_parameter_name_constraint_enabled && cfg.prefill_chunk_remaining < 0;
     }
-    if (propose) {
-        std::vector<int> expanded;
-        std::vector<int> bases;
-        for (size_t i = 0; i < states.size(); ++i) {
-            auto &state = *states[i];
-            const int base = past[i * block_cnt].first->cpuIntDatas.size();
-            bases.push_back(base);
-            auto target = static_cast<const float *>(state.hidden.cudaData) +
-                          size_t((base - 1) % (draftWidth + 1)) * 3072;
-            auto block = s.Get("draftBlock", draftWidth * 3072);
-            hy4::DraftEmbed(w, s, tokens[i], draftWidth, draftMask, target, block);
-            for (size_t k = 0; k < draftProviders.size(); ++k)
-                hy4::DraftLayer(w, s, k, base, draftWidth, state.providers[k], block);
-            auto candidates = hy4::DraftReadout(w, s, tokens[i], draftWidth, block);
-            expanded.push_back(tokens[i]);
-            expanded.insert(expanded.end(), candidates.begin(), candidates.end());
-        }
-        auto verified =
-            ForwardHybrid(expanded, std::vector<int>(lengths.size(), draftWidth), past, configs, true);
-        Logits output;
-        for (size_t i = 0; i < states.size(); ++i) {
-            auto &state = *states[i];
-            const size_t first = i * draftWidth;
-            int accepted = 0;
-            for (int j = 0; j < draftWidth; ++j) {
-                const auto &row = verified[first + j];
-                int next = std::max_element(row.begin(), row.end()) - row.begin();
-                if (j)
-                    state.pending.push_back(next);
-                else
-                    state.expected = next;
-                if (next == eos_token_id || eos_token_ids.count(next) ||
-                    configs[i].stop_token_ids.count(next) || j + 1 == draftWidth ||
-                    next != expanded[first + j + 1])
-                    break;
-                ++accepted;
-            }
-            const int committed = bases[i] + 1 + accepted;
-            past[i * block_cnt].first->cpuIntDatas.resize(committed);
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                auto &kv = past[i * block_cnt + layer];
-                for (auto *data : {kv.first, kv.second}) {
-                    auto dims = data->dims;
-                    dims[1] = std::min(committed, dims[1]);
-                    data->Resize(dims);
-                }
-            }
-            if (std::getenv("FASTLLM_DFLY2_TRACE"))
-                fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i,
-                        bases[i], draftWidth - 1, accepted);
-            output.emplace_back(std::move(verified[first]));
-        }
-        return output;
-    }
+    if (propose)
+        return ProposeHybrid(tokens, past, configs, states);
     const int rows = tokens.size();
-    if (std::getenv("FASTLLM_HY4_BATCH_TRACE"))
+    if (GetFastllmEnv().printProfile)
         fprintf(stderr, "[HY4 hybrid] requests=%zu tokens=%d verify=%d\n", lengths.size(), rows, int(verify));
     std::vector<int> owners(rows), positions(rows), lastRows;
     std::vector<std::array<int, 3>> grams(rows);
@@ -141,10 +159,8 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
     HybridMoeDecodeStep step;
     if (hostCacheReady && decode)
         step.Begin(hostExperts[1].data(), hostExperts[1].size(), 16);
-    const char *flag = std::getenv("FASTLLM_HY4_HYBRID_GRAPH");
-    const bool graphEnabled = flag ? std::string(flag) == "1" : GetFastllmEnv().cudaGraph;
-    bool capture = graphEnabled && decode &&
-                   (bool(step) || (diskGraphReady && rows <= 32)) &&
+    const bool graphEnabled = GetFastllmEnv().cudaGraph;
+    bool capture = graphEnabled && decode && (bool(step) || (diskGraphReady && rows <= 32)) &&
                    hybridGraphs->warmedRows >= size_t(rows) && (rows != 1 || hybridGraphs->warmedSingle) &&
                    (diskGraphReady ||
                     FastllmCudaNativeMoeGraphOwner(hostExperts[1].data(), hostExperts[1].size(), rows));
@@ -176,12 +192,12 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
     auto projected = s.Get("batchedLogits", outputs * vocab);
 
     std::vector<uintptr_t> key;
-    std::vector<const hy4::StepInput *> stepInputs;
+    const hy4::StepInput *stepInputs = nullptr;
     if (capture) {
         std::vector<hy4::StepInput> params;
         for (int row = 0; row < rows; ++row)
             params.push_back({tokens[row], grams[row][1], grams[row][2], positions[row]});
-        stepInputs.push_back(hy4::UploadStep(s, params));
+        stepInputs = hy4::UploadStep(s, params);
         key = {uintptr_t(verify), uintptr_t(rows), uintptr_t(lengths.size()), uintptr_t(projected)};
         for (int row = 0; row < rows; ++row) {
             const bool skip = tokens[row] == w.config["engram_pad_id"].int_value() || tokens[row] == 120120 ||
@@ -224,14 +240,11 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
         }
     } else {
 
-        hy4::GraphCapture graph(capture ? hybridGraphs.get() : nullptr);
-        if (capture && diskGraphReady)
-            graph.disk = std::make_shared<DiskMoeV41Graph>();
-        graph.key = key;
+        hy4::HybridGraphCapture graph(capture ? hybridGraphs.get() : nullptr, diskGraphReady);
         graph.Start(device);
         auto streams = s.Get("streams", size_t(rows) * 4 * 3072);
         for (int row = 0; row < rows; ++row) {
-            s.step = capture ? stepInputs.front() + row : nullptr;
+            s.step = capture ? stepInputs + row : nullptr;
             hy4::Embed(w, s, tokens[row], streams + size_t(row) * 4 * 3072);
         }
         for (int layer = 0; layer < block_cnt; ++layer) {
@@ -246,7 +259,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
             attentionRows.reserve(rows);
             auto attnOutput = s.Get("attentionOutput", size_t(rows) * 3072);
             for (int row = 0; row < rows; ++row) {
-                s.step = capture ? stepInputs[0] + row : nullptr;
+                s.step = capture ? stepInputs + row : nullptr;
                 float *h = streams + size_t(row) * 4 * 3072;
                 float *x = inputs + size_t(row) * 3072, *post = posts + row * 4;
                 auto &cache = past[owners[row] * block_cnt + layer];
@@ -297,24 +310,8 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 Data output;
                 input.dataDeviceIds = index.dataDeviceIds = score.dataDeviceIds = {device};
                 if (capture) {
-                    graph.Close();
-                    void *child = nullptr;
-                    graph.outputs.push_back(std::make_shared<Data>());
-                    auto &out = *graph.outputs.back();
-                    if (graph.disk) {
-                        child = graph.disk->Add(input, index, score, out, hostExperts[layer], 10.f);
-                        AssertInFastLLM(child, "HY4-Flash failed to prepare a disk FP8 expert graph.");
-                        graph.hybridChildren.push_back(child);
-                    } else {
-                        auto *handle = FastllmCudaCreateNativeMoeFullGraph(
-                            input, index, score, out, hostExperts[layer].data(), hostExperts[layer].size(),
-                            layer, nullptr, &child);
-                        AssertInFastLLM(handle && child,
-                                        "HY4-Flash failed to prepare a native FP8 expert graph.");
-                        graph.AddNative(child, handle);
-                    }
-                    graph.Start(device);
-                    hy4::CopyStageCaptured(routed, device, static_cast<const float *>(out.cudaData), device,
+                    const auto &out = graph.AddExperts(input, index, score, hostExperts[layer], layer);
+                    hy4::CopyStageCaptured(routed, static_cast<const float *>(out.cudaData),
                                            size_t(rows) * 1536);
                     dispatched = true;
                 } else {
@@ -351,13 +348,13 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
         offset = 0;
         for (size_t i = 0; i < lengths.size(); ++i) {
             for (int row = verify ? offset : lastRows[i]; row <= lastRows[i]; ++row, ++output) {
-                s.step = capture ? stepInputs.back() + row : nullptr;
+                s.step = capture ? stepInputs + row : nullptr;
                 hy4::ProjectHead(w, s, streams + size_t(row) * 4 * 3072, projected + output * vocab,
                                  states[i] ? &states[i]->hidden : nullptr, positions[row], draftWidth);
             }
             offset += lengths[i];
         }
-        graph.FinishHybrid(verify, rows);
+        graph.Finish(key, verify, rows);
         s.step = nullptr;
     }
     Logits result(outputs, std::vector<float>(vocab));

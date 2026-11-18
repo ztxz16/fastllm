@@ -4,7 +4,6 @@
 #include <deque>
 
 namespace fastllm {
-class DiskMoeV41Graph;
 // A projection can consume an ordinary matrix or the contiguous matrix of a
 // selected expert. Scale blocks use the checkpoint's original storage type.
 struct Hy4View {
@@ -54,40 +53,9 @@ struct Scratch {
     float *Get(const std::string &name, size_t count);
 };
 using Weights = Hy4FlashModel::Weights;
-struct GpuGraphs {
-    struct Replay {
-        std::shared_ptr<void> executable;
-        std::vector<std::shared_ptr<Data>> outputs;
-    };
-    std::map<std::vector<uintptr_t>, Replay> replays;
-    size_t launches = 0;
-    size_t warmedRows = 0;
-    bool warmedSingle = false;
-    bool peerChecked = false, peerReady = false;
-};
-struct GraphCapture {
-    explicit GraphCapture(GpuGraphs *graphs) : graphs(graphs) {}
-    std::shared_ptr<DiskMoeV41Graph> disk;
-    std::vector<uintptr_t> key;
-    std::vector<std::shared_ptr<Data>> outputs;
-    ~GraphCapture();
-    void Start(int device);
-    void Close();
-    void Finish(int kind, int rows);
-    void AddNative(void *child, void *handle);
-    void FinishHybrid(int kind, int rows);
-    std::vector<void *> handles;
-    std::vector<const void *> hybridChildren;
-    GpuGraphs *graphs;
-    int activeDevice = -1;
-    std::vector<void *> children;
-};
 const StepInput *UploadStep(Scratch &, const std::vector<StepInput> &);
-bool ReplayGpu(GpuGraphs &, const std::vector<uintptr_t> &, int kind, int rows);
-bool ReplayHybrid(GpuGraphs &, const std::vector<uintptr_t> &, int kind, int rows);
 void AdvanceKV(Data &, int end);
-bool EnableGraphPeers(const std::vector<int> &devices);
-void CopyStageCaptured(float *dst, int dstDevice, const float *src, int srcDevice, size_t count);
+void CopyStageCaptured(float *dst, const float *src, size_t count);
 void ProjectHead(Weights &, Scratch &, float *streams, float *logits, Data *hidden, int pos, int width);
 struct DraftMemory {
     Data keys, values, recalled;
@@ -130,13 +98,8 @@ void Attention(Weights &, Scratch &, int layer, int position, const float *input
 void DenseMlpBatch(Weights &, Scratch &, const std::string &, const float *, float *, int rows);
 void RouteBatch(Weights &, Scratch &, int layer, const float *, int *, float *, float *, int rows);
 void CombineExpertsBatch(Weights &, Scratch &, int layer, const float *, const float *, float *, int rows);
-void DenseMlp(Weights &, Scratch &, const std::string &prefix, const float *input, float *output);
-void Route(Weights &, Scratch &, int layer, const float *input, int *ids, float *scores, float *latent);
 void ResidentExperts(Weights &, Scratch &, int layer, const float *latent, const int *ids,
                      const float *scores, float *result, int rows);
-void CombineExperts(Weights &, Scratch &, int layer, const float *input, const float *routed, float *out);
-std::vector<float> Head(Weights &, Scratch &, float *streams, Data *draftHidden = nullptr, int position = 0,
-                        int draftWidth = 0);
 void *Allocate(int device, size_t bytes);
 void Free(int device, void *ptr);
 void Select(int device);

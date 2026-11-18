@@ -509,9 +509,11 @@ if (USE_CUDA)
 
     # The published E4M3 checkpoint uses cuda_fp8.h from CUDA 11.8.
     if (NOT USE_ROCM AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
-        list(APPEND FASTLLM_CUDA_SOURCES src/devices/cuda/models/hy4-flash.cu)
+        set(HY4_CUDA_SOURCES src/devices/cuda/models/hy4-flash.cu
+            src/devices/cuda/models/hy4-flash-gpu-graph.cu src/devices/cuda/models/hy4-flash-hybrid-graph.cu)
+        list(APPEND FASTLLM_CUDA_SOURCES ${HY4_CUDA_SOURCES})
         set_property(SOURCE src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp
-            src/models/hy4_flash_hybrid.cpp src/devices/cuda/models/hy4-flash.cu
+            src/models/hy4_flash_hybrid.cpp ${HY4_CUDA_SOURCES}
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_HY4_CUDA)
     endif()
 
@@ -1334,6 +1336,10 @@ if (UNIT_TEST)
         set_target_properties(hybrid_moe_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
         fastllm_add_checked_test(hybrid_moe hybrid_moe_test "ALL_PASS" 60)
     endif()
+
+    add_executable(hy4_flash_placement_test test/basic/test_hy4_flash_placement.cpp)
+    target_link_libraries(hy4_flash_placement_test PRIVATE fastllm)
+    fastllm_add_checked_test(hy4_flash_placement hy4_flash_placement_test "ALL_PASS" 60)
 
     add_executable(moe_decode_policy_test test/basic/test_moe_decode_policy.cpp)
     target_include_directories(moe_decode_policy_test PRIVATE include)

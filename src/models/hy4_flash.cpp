@@ -15,7 +15,8 @@ Hy4FlashModel::~Hy4FlashModel() {
     hybridGraphs.reset();
     gpuGraphs.reset();
 #endif
-    ReleaseMoeCudaCache(hostExperts);
+    if (!hostExperts.empty())
+        ReleaseMoeCudaCache(hostExperts);
 }
 void Hy4FlashModel::InitParams() {
     for (const char *key :
@@ -39,11 +40,13 @@ void Hy4FlashModel::InitParams() {
             if (std::find(devices.begin(), devices.end(), id) == devices.end())
                 devices.push_back(id);
     }
-    hybrid =
-        !moeDeviceMap.empty() && std::any_of(moeDeviceMap.begin(), moeDeviceMap.end(), [](const auto &p) {
-            return p.first == "cpu" || p.first.find("numa") == 0 || p.first == "disk";
-        });
-    AssertInFastLLM(!hybrid || devices.size() == 1, "HY4-Flash hybrid bring-up requires one dense GPU.");
+    hybrid = false;
+    for (int layer = 1; layer < block_cnt && !hybrid; ++layer) {
+        const auto placement = SelectMoeDeviceForLayer(layer);
+        hybrid = placement == "cpu" || placement == "disk" || placement == "numa" ||
+                 placement.rfind("numa:", 0) == 0;
+    }
+    AssertInFastLLM(!hybrid || devices.size() == 1, "HY4-Flash hybrid inference requires one dense GPU.");
 }
 void Hy4FlashModel::SetConfig(const json11::Json &root) {
     const auto &cfg = root["text_config"];
@@ -185,13 +188,13 @@ Hy4View Hy4FlashModel::Weights::View(const std::string &name, int device) {
     const auto &s = meta.at(name);
     Hy4View v;
     v.type = type(s.dtype);
-    v.data = device < 0 ? Host(name) : Device(name, device);
+    v.data = Device(name, device);
     v.cols = s.dims.empty() ? 1 : s.dims.back();
     v.rows = s.dims.size() < 2 ? 1 : s.dims[s.dims.size() - 2];
     if (v.type == 2) {
         auto n = name + "_scale_inv";
         v.scaleType = type(meta.at(n).dtype);
-        v.scale = device < 0 ? Host(n) : Device(n, device);
+        v.scale = Device(n, device);
     }
     return v;
 }

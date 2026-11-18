@@ -5,6 +5,8 @@ namespace fastllm {
 namespace hy4 {
 struct Scratch;
 struct GpuGraphs;
+struct HybridGraphs;
+struct DraftRequest;
 } // namespace hy4
 class Hy4FlashModel final : public basellm {
   public:
@@ -55,7 +57,8 @@ class Hy4FlashModel final : public basellm {
     std::unique_ptr<Weights> source;
     std::vector<std::vector<Data *>> hostExperts;
     std::vector<std::shared_ptr<hy4::Scratch>> gpuArenas;
-    std::shared_ptr<hy4::GpuGraphs> gpuGraphs, hybridGraphs;
+    std::shared_ptr<hy4::GpuGraphs> gpuGraphs;
+    std::shared_ptr<hy4::HybridGraphs> hybridGraphs;
     std::shared_ptr<hy4::Scratch> hybridArena;
     int draftWidth = 0, draftMask = 0;
     std::vector<int> draftProviders;
@@ -64,6 +67,12 @@ class Hy4FlashModel final : public basellm {
     std::vector<int> devices;
     using Cache = std::vector<std::pair<Data *, Data *>>;
     using Logits = std::vector<std::vector<float>>;
+    Logits ProposeGpu(const std::vector<int> &anchors, Cache &past,
+                      const std::vector<GenerationConfig> &configs,
+                      const std::vector<hy4::DraftRequest *> &states);
+    Logits ProposeHybrid(const std::vector<int> &anchors, Cache &past,
+                         const std::vector<GenerationConfig> &configs,
+                         const std::vector<hy4::DraftRequest *> &states);
     Logits ForwardGpu(const std::vector<int> &tokens, const std::vector<int> &lengths, Cache &past,
                       const std::vector<GenerationConfig> &configs, bool verify = false);
     Logits ForwardHybrid(const std::vector<int> &tokens, const std::vector<int> &lengths, Cache &past,

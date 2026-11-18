@@ -5,17 +5,10 @@
 #include <cub/block/block_radix_sort.cuh>
 #include <cmath>
 #include <stdexcept>
-#include "utils/hybrid_moe.h"
-#include "devices/disk/diskdevice.h"
-#include "devices/cuda/fastllm-cuda.cuh"
+#include "hy4-flash-cuda.cuh"
+#include "../../../models/hy4_flash_capture.h"
 
 namespace fastllm::hy4 {
-static void CheckAt(cudaError_t err, int line, const char *operation) {
-    if (err != cudaSuccess)
-        throw std::runtime_error(std::string("HY4 CUDA line ") + std::to_string(line) + " " + operation +
-                                 ": " + cudaGetErrorString(err));
-}
-#define Check(operation) CheckAt((operation), __LINE__, #operation)
 void Select(int d) {
     Check(cudaSetDevice(d));
 }
@@ -53,147 +46,47 @@ void AdvanceKV(Data &data, int end) {
     dims[1] = std::min(data.expansionDims[1], end);
     data.Resize(dims);
 }
-bool ReplayGpu(GpuGraphs &graphs, const std::vector<uintptr_t> &key, int kind, int rows) {
-    auto found = graphs.replays.find(key);
-    if (found == graphs.replays.end())
-        return false;
-    Check(cudaGraphLaunch(static_cast<cudaGraphExec_t>(found->second.executable.get()), cudaStreamPerThread));
-    if (std::getenv("FASTLLM_HY4_BATCH_TRACE"))
-        fprintf(stderr, "[HY4 GPU replay] verify=%d rows=%d launch=%zu\n", kind, rows, ++graphs.launches);
-    return true;
+__global__ static void copyPeerStreams(float *dst, const float *src, size_t count) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count)
+        dst[i] = src[i];
 }
-struct HybridExecutable {
-    std::shared_ptr<DiskMoeV41Graph> disk;
-    HybridMoeGraph graph;
-    bool Launch() {
-        return disk ? disk->Launch([this] { return graph.Launch(); }) : graph.Launch();
-    }
-};
-bool ReplayHybrid(GpuGraphs &graphs, const std::vector<uintptr_t> &key, int kind, int rows) {
-    auto found = graphs.replays.find(key);
-    if (found == graphs.replays.end())
-        return false;
-    if (!static_cast<HybridExecutable *>(found->second.executable.get())->Launch())
-        throw std::runtime_error("HY4 native MoE graph replay failed");
-    Check(cudaStreamSynchronize(cudaStreamPerThread));
-    if (std::getenv("FASTLLM_HY4_BATCH_TRACE"))
-        fprintf(stderr, "[HY4 hybrid replay] verify=%d rows=%d launch=%zu\n", kind, rows, ++graphs.launches);
-    return true;
+void CopyStageCaptured(float *dst, const float *src, size_t count) {
+    copyPeerStreams<<<(count + 255) / 256, 256>>>(dst, src, count);
 }
-void GraphCapture::Start(int device) {
-    if (!graphs)
+void CaptureSegments::Start(int device) {
+    if (!enabled)
         return;
     Select(device);
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
     activeDevice = device;
 }
-void GraphCapture::Close() {
+void *CaptureSegments::Close() {
     if (activeDevice < 0)
-        return;
+        return nullptr;
     Select(activeDevice);
     activeDevice = -1;
     cudaGraph_t graph = nullptr;
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
     children.push_back(graph);
-    hybridChildren.push_back(graph);
+    return graph;
 }
-GraphCapture::~GraphCapture() {
+void CaptureSegments::Abort() {
     if (activeDevice >= 0) {
         cudaSetDevice(activeDevice);
         cudaGraph_t unfinished = nullptr;
         cudaStreamEndCapture(cudaStreamPerThread, &unfinished);
         if (unfinished)
             cudaGraphDestroy(unfinished);
+        activeDevice = -1;
     }
-    for (void *h : handles)
-        FastllmCudaReleaseNativeMoeFullGraph(h);
+}
+CaptureSegments::~CaptureSegments() {
+    Abort();
     for (void *g : children)
         cudaGraphDestroy(static_cast<cudaGraph_t>(g));
 }
-void GraphCapture::AddNative(void *child, void *handle) {
-    hybridChildren.push_back(child);
-    handles.push_back(handle);
-}
-void GraphCapture::FinishHybrid(int kind, int rows) {
-    if (!graphs)
-        return;
-    Close();
-    auto compiled = std::make_shared<HybridExecutable>();
-    compiled->disk = std::move(disk);
-    const size_t count = compiled->disk ? (hybridChildren.size() - 1) / 2 : handles.size();
-    if (!compiled->graph.Compose(hybridChildren, std::move(handles)) || !compiled->Launch())
-        throw std::runtime_error("HY4-Flash hybrid graph composition or launch failed");
-    Check(cudaStreamSynchronize(cudaStreamPerThread));
-    if (!key.empty()) {
-        if (graphs->replays.size() >= 16)
-            graphs->replays.clear();
-        graphs->replays[key] = {compiled, std::move(outputs)};
-    }
-    if (std::getenv("FASTLLM_HY4_BATCH_TRACE"))
-        fprintf(stderr,
-                "[HY4 hybrid full graph] verify=%d rows=%d children=%zu expert_layers=%zu launch=%zu\n", kind,
-                rows, hybridChildren.size(), count, ++graphs->launches);
-}
-void GraphCapture::Finish(int kind, int rows) {
-    if (!graphs)
-        return;
-    Close();
-    cudaGraph_t parent = nullptr;
-    Check(cudaGraphCreate(&parent, 0));
-    struct Owner {
-        cudaGraph_t graph;
-        ~Owner() {
-            cudaGraphDestroy(graph);
-        }
-    } owner{parent};
-    cudaGraphNode_t prior = nullptr;
-    size_t nodes = 0;
-    for (void *c : children) {
-        cudaGraphNode_t next = nullptr;
-        auto child = static_cast<cudaGraph_t>(c);
-        size_t count = 0;
-        Check(cudaGraphGetNodes(child, nullptr, &count));
-        nodes += count;
-        Check(cudaGraphAddChildGraphNode(&next, parent, prior ? &prior : nullptr, prior ? 1 : 0, child));
-        prior = next;
-    }
-    cudaGraphExec_t executable = nullptr;
-    Check(cudaGraphInstantiate(&executable, parent, nullptr, nullptr, 0));
-    auto ownerExec = std::shared_ptr<void>(
-        executable, [](void *p) { cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(p)); });
-    if (graphs->replays.size() >= 16)
-        graphs->replays.clear();
-    graphs->replays[key] = {std::move(ownerExec), {}};
-    Check(cudaGraphLaunch(executable, cudaStreamPerThread));
-    // Consumers can use the resulting CUDA tensors immediately on this stream.
-    if (std::getenv("FASTLLM_HY4_BATCH_TRACE"))
-        fprintf(stderr, "[HY4 full graph] verify=%d rows=%d stages=%zu nodes=%zu capture=1 launch=%zu\n",
-                kind, rows, children.size(), nodes, ++graphs->launches);
-}
 
-bool EnableGraphPeers(const std::vector<int> &devices) {
-    for (size_t i = 1; i < devices.size(); ++i) {
-        Select(devices[i]);
-        int supported = 0;
-        Check(cudaDeviceCanAccessPeer(&supported, devices[i], devices[i - 1]));
-        if (!supported)
-            return false;
-        auto err = cudaDeviceEnablePeerAccess(devices[i - 1], 0);
-        if (err == cudaErrorPeerAccessAlreadyEnabled)
-            cudaGetLastError();
-        else
-            Check(err);
-    }
-    return true;
-}
-__global__ static void copyPeerStreams(float *dst, const float *src, size_t count) {
-    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count)
-        dst[i] = src[i];
-}
-void CopyStageCaptured(float *dst, int dd, const float *src, int sd, size_t count) {
-    copyPeerStreams<<<(count + 255) / 256, 256>>>(dst, src, count);
-}
 Scratch::~Scratch() {
     for (auto &p : buffers)
         Free(device, p.second.ptr);
@@ -497,7 +390,7 @@ __global__ static void activate(const float *gate, const float *up, float *out, 
     float a = routed ? fminf(g[i], 10.f) : g[i], b = up ? up[i] : fminf(10.f, fmaxf(-10.f, g[width + i]));
     out[size_t(slot) * width + i] = bf(bf(a * sigmoid(a)) * b);
 }
-void DenseMlp(Weights &w, Scratch &s, const std::string &p, const float *x, float *out) {
+static void DenseMlp(Weights &w, Scratch &s, const std::string &p, const float *x, float *out) {
     const int width = w.meta.at(p + "gate_proj.weight").dims[0];
     auto a = s.Get("denseGate", width), b = s.Get("denseUp", width), mid = s.Get("denseMid", width);
     Linear(w, s, p + "gate_proj.weight", x, a);
@@ -562,7 +455,7 @@ __global__ static void pick(const float *logits, Hy4View bias, int *id, float *s
         score[threadIdx.x] = probabilities[threadIdx.x] / sum * scale;
     }
 }
-void Route(Weights &w, Scratch &s, int layer, const float *x, int *ids, float *scores, float *latent) {
+static void Route(Weights &w, Scratch &s, int layer, const float *x, int *ids, float *scores, float *latent) {
     auto p = "model.layers." + std::to_string(layer) + ".mlp.";
     auto logits = s.Get("router", 512);
     Linear(w, s, p + "gate.weight", x, logits, false);
@@ -631,7 +524,8 @@ __global__ static void add(float *x, const float *y, int n) {
     if (i < n)
         x[i] = bf(x[i] + y[i]);
 }
-void CombineExperts(Weights &w, Scratch &s, int layer, const float *x, const float *routed, float *out) {
+static void CombineExperts(Weights &w, Scratch &s, int layer, const float *x, const float *routed,
+                           float *out) {
     auto p = "model.layers." + std::to_string(layer) + ".mlp.";
     float *shared = s.Get("shared", 3072);
     DenseMlp(w, s, p + "shared_experts.", x, shared);
@@ -660,16 +554,7 @@ void ProjectHead(Weights &w, Scratch &s, float *h, float *values, Data *draftHid
     Norm(w, s, "model.norm.weight", x, x, 3072);
     if (draftHidden)
         SaveDraftHidden(*draftHidden, s.device, position, draftWidth, x, s.step);
-    int n = w.meta.at("lm_head.weight").dims[0];
     Linear(w, s, "lm_head.weight", x, values);
-}
-std::vector<float> Head(Weights &w, Scratch &s, float *h, Data *draftHidden, int position, int draftWidth) {
-    int n = w.meta.at("lm_head.weight").dims[0];
-    auto values = s.Get("logits", n);
-    ProjectHead(w, s, h, values, draftHidden, position, draftWidth);
-    std::vector<float> result(n);
-    CopyToHost(result.data(), values, n * sizeof(float));
-    return result;
 }
 
 __device__ static float rope(float a, float b, int j, int pos, float theta) {
@@ -1057,7 +942,7 @@ void AttentionBatch(Weights &w, Scratch &s, int layer, const std::vector<Attenti
         for (int i = 0; i < n; ++i) {
             Norm(w, s, p + "q_a_layernorm.weight", qr + i * 1024, qr + i * 1024, 1024);
             Norm(w, s, p + "kv_a_layernorm.weight", kv + i * 576, kv + i * 576, 512);
-            CopyStageCaptured(normKv + i * 512, s.device, kv + i * 576, s.device, 512);
+            CopyStageCaptured(normKv + i * 512, kv + i * 576, 512);
         }
         LinearBatch(w, s, p + "q_b_proj.weight", qr, q, n);
         LinearBatch(w, s, p + "kv_b_proj.weight", normKv, expanded, n);
