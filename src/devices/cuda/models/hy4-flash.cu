@@ -331,10 +331,7 @@ static void LinearBatch(Weights &w, Scratch &s, const std::string &name, const f
     else
         batchGemv<1><<<grid, 128>>>(v, x, y, rows, roundOutput);
 }
-__global__ static void norm(const float *x, Hy4View w, float *y, int width, float eps, bool roundFirst,
-                            const StepInput *groupEnd = nullptr) {
-    if (groupEnd && (groupEnd->position & 3) != 3)
-        return;
+__device__ static void normRow(const float *x, Hy4View w, float *y, int width, float eps, bool roundFirst) {
     float sum = 0;
     for (int i = threadIdx.x; i < width; i += blockDim.x)
         sum = fmaf(x[i], x[i], sum);
@@ -343,6 +340,18 @@ __global__ static void norm(const float *x, Hy4View w, float *y, int width, floa
         float v = x[i] * inv;
         y[i] = bf((roundFirst ? bf(v) : v) * (w.data ? read(w.data, w.type, i) : 1.f));
     }
+}
+__global__ static void norm(const float *x, Hy4View w, float *y, int width, float eps, bool roundFirst,
+                            const StepInput *groupEnd = nullptr) {
+    if (!groupEnd || (groupEnd->position & 3) == 3)
+        normRow(x, w, y, width, eps, roundFirst);
+}
+struct EngramNormWeights {
+    Hy4View head[16];
+};
+__global__ static void normEngramHeads(float *embedding, EngramNormWeights weights) {
+    float *row = embedding + blockIdx.x * 96;
+    normRow(row, weights.head[blockIdx.x], row, 96, 1.1920929e-7f, false);
 }
 void Norm(Weights &w, Scratch &s, const std::string &name, const float *x, float *y, int width) {
     norm<<<1, 256>>>(x, w.View(name, s.device), y, width, 1e-5f, true);
@@ -1116,10 +1125,10 @@ void Engram(Weights &w, Scratch &s, int layer, const std::array<int, 3> &ids, fl
         table = (const __nv_bfloat16 *)w.Device(p + "multi_head_embedding.embedding.weight", s.device);
     }
     gather<<<16, 128>>>(table, map, m, ids[0], ids[1], ids[2], hostRows != nullptr, emb, s.step);
+    EngramNormWeights norms;
     for (int j = 0; j < 16; j++)
-        norm<<<1, 128>>>(emb + j * 96,
-                         w.View(p + "lookup_per_head_norms." + std::to_string(j) + ".weight", s.device),
-                         emb + j * 96, 96, 1.1920929e-7f, false);
+        norms.head[j] = w.View(p + "lookup_per_head_norms." + std::to_string(j) + ".weight", s.device);
+    normEngramHeads<<<16, 128>>>(emb, norms);
     auto signal = s.Get("engramValue", 3072), gates = s.Get("engramGates", 4);
     Linear(w, s, p + "value_proj.weight", emb, signal, true, nullptr, 1, false, p + "value_proj.bias");
     norm<<<1, 256>>>(signal, {}, signal, 3072, 1.1920929e-7f, false);
