@@ -259,7 +259,8 @@ static void TestIndexerRaggedShards() {
 // Compare the scratch-backed FP8 expansion with direct FP8 attention exactly.
 // Insufficient workspace must retain the same result without resizing storage.
 static void TestSwaPrefillScratch() {
-    for (auto shape : {std::vector<int>{1025, 127, 16}, {4096, 65536, 64}}) {
+    for (auto shape : {std::vector<int>{1025, 127, 16}, {4096, 65536, 64},
+                       {1025, 64, 16}, {4096, 0, 64}}) {
         const int rows=shape[0], past=shape[1], heads=shape[2], kvHeads=heads/8, keys=past+rows;
         const int keyStride=kvHeads*192+16, valueStride=kvHeads*128;
         Data q(BFLOAT16), key(FP8_E4M3), value(FP8_E4M3), sink(FLOAT32), indices(INT32), reference, actual;
@@ -276,7 +277,7 @@ static void TestSwaPrefillScratch() {
         FastllmCudaNaiveAttention(q,key,value,indices,sink,heads,kvHeads,192,128,past,128,reference);
         const auto expected=Read<uint16_t>(reference);
         for (auto type : {FLOAT32, BFLOAT16}) {
-            const size_t bytes=(size_t)(rows+127)*(keyStride+valueStride)*2;
+            const size_t bytes=(size_t)(rows+std::min(past,127))*(keyStride+valueStride)*2;
             const size_t elements=bytes/(type==FLOAT32?4:2);
             Data storage(type,{(int)elements+32}), scratch(type,{(int)elements});
             storage.ToDevice(DataDevice::CUDA,{0},false); storage.Allocate(false);

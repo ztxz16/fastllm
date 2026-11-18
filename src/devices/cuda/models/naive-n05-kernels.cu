@@ -3958,7 +3958,7 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0) {
         // Neighboring causal windows overlap. Share their cache reads while
         // retaining each query's original MMA order and BF16 rounding.
-        if (queries >= 1024 && pastLength >= 127 && count == 128 &&
+        if (queries >= 1024 && pastLength >= 0 && count == 128 &&
             (int64_t)pastLength + queries <= keys) {
             auto grouped = naive_prefill_mma::SwaQueryTile<4>;
             size_t bytes = sizeof(naive_prefill_mma::SwaQueryStorage<4>);
@@ -3970,11 +3970,17 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                     grouped = registers; bytes = registerBytes; queryTile = 8;
                 }
             }
-            if (BulkKernelSupported(grouped, bytes, 80)) {
+            // Keep incomplete initial windows on the original kernel so the
+            // softmax tree and BF16 rounding do not shift with left padding.
+            const int initialQueries = std::min(queries, std::max(0, kSwaWindow - 1 - pastLength));
+            auto initial = naive_prefill_mma::Generic<128, 128>;
+            const size_t initialBytes = sizeof(naive_prefill_mma::Storage<128>);
+            if (BulkKernelSupported(grouped, bytes, 80) &&
+                (!initialQueries || BulkKernelSupported(initial, initialBytes, 80))) {
                 FastllmNaiveKV readKey(key), readValue(value);
                 int readKeys = keys, readPast = pastLength;
-                const int first = pastLength - (kSwaWindow - 1);
-                const int rows = queries + kSwaWindow - 1;
+                const int first = std::max(0, pastLength - (kSwaWindow - 1));
+                const int rows = pastLength + queries - first;
                 const uint64_t stagingBytes = (uint64_t)rows * (key.dims[2] + value.dims[2]) * sizeof(BF16);
                 // The caller can lend a dead activation or reserved scratch.
                 // Its logical size bounds the write; no allocation or resize.
@@ -3994,12 +4000,20 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                                              {&value, stagedValue, first, rows}});
                     readKey = FastllmNaiveKV(stagedKey);
                     readValue = FastllmNaiveKV(stagedValue);
-                    readKeys = rows; readPast = kSwaWindow - 1;
+                    readKeys = rows; readPast = pastLength - first;
                 }
-                grouped<<<dim3((queries + queryTile - 1) / queryTile, heads / 8), 256, bytes>>>(
-                    (const BF16 *)query.cudaData, readKey, readValue,
-                    sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-                    (BF16 *)output.cudaData, queries, heads, kvHeads, key.dims[2], readKeys, readPast);
+                const auto *q = (const BF16 *)query.cudaData;
+                auto *out = (BF16 *)output.cudaData;
+                const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+                if (initialQueries)
+                    initial<<<dim3(initialQueries, heads / 8), 256, initialBytes>>>(
+                        q, readKey, readValue, nullptr, bias, out, heads, kvHeads,
+                        key.dims[2], readKeys, count, readPast, true, 0);
+                const int fullQueries = queries - initialQueries;
+                grouped<<<dim3((fullQueries + queryTile - 1) / queryTile, heads / 8), 256, bytes>>>(
+                    q + (size_t)initialQueries * heads * kSwaQkDim, readKey, readValue, bias,
+                    out + (size_t)initialQueries * heads * kSwaValueDim,
+                    fullQueries, heads, kvHeads, key.dims[2], readKeys, readPast + initialQueries);
                 CheckLaunch();
                 return;
             }

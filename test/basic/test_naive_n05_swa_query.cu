@@ -66,15 +66,25 @@ static void Case(int rows, int past, int heads, bool fp8, int pageLen, bool sink
     original<<<dim3(rows, heads / 8), 256, sizeof(Storage<128>)>>>(q.data, key, value, nullptr,
                                                                    sink ? bias.data : nullptr, a.data, heads, kvHeads,
                                                                    stride, keys, 128, past, true, 0);
+    const int initialRows = std::min(rows, std::max(0, 127 - past));
+    const int fullRows = rows - initialRows;
+    if (initialRows)
+        original<<<dim3(initialRows, heads / 8), 256, sizeof(Storage<128>)>>>(
+            q.data, key, value, nullptr, sink ? bias.data : nullptr, b.data,
+            heads, kvHeads, stride, keys, 128, past, true, 0);
+    const BF *query = q.data + (size_t)initialRows * heads * 192;
+    BF *output = b.data + (size_t)initialRows * heads * 128;
     for (bool registers : {false, true}) {
-        if (registers) {
+        if (fullRows && registers) {
             Check(cudaFuncSetAttribute(SwaRegisterTile<8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        sizeof(SwaRegisterStorage<8>)));
-            SwaRegisterTile<8><<<dim3((rows + 7) / 8, heads / 8), 256, sizeof(SwaRegisterStorage<8>)>>>(
-                q.data, key, value, sink ? bias.data : nullptr, b.data, rows, heads, kvHeads, stride, keys, past);
-        } else {
-            SwaQueryTile<Q><<<dim3((rows + Q - 1) / Q, heads / 8), 256, sizeof(SwaQueryStorage<Q>)>>>(
-                q.data, key, value, sink ? bias.data : nullptr, b.data, rows, heads, kvHeads, stride, keys, past);
+            SwaRegisterTile<8><<<dim3((fullRows + 7) / 8, heads / 8), 256, sizeof(SwaRegisterStorage<8>)>>>(
+                query, key, value, sink ? bias.data : nullptr, output, fullRows,
+                heads, kvHeads, stride, keys, past + initialRows);
+        } else if (fullRows) {
+            SwaQueryTile<Q><<<dim3((fullRows + Q - 1) / Q, heads / 8), 256, sizeof(SwaQueryStorage<Q>)>>>(
+                query, key, value, sink ? bias.data : nullptr, output, fullRows,
+                heads, kvHeads, stride, keys, past + initialRows);
         }
         Check(cudaGetLastError());
         Check(cudaDeviceSynchronize());
@@ -201,6 +211,11 @@ int main() {
         RingCase<false>(128, 11, 16);
         RingCase<true>(128, 11, 16);
         for (bool fp8 : {false, true}) {
+            Case(128, 0, 8, fp8, 0, false, false);
+            Case(129, 1, 16, fp8, 30, true, true);
+            Case(1025, 64, 16, fp8, 64, true, true);
+            Case(4096, 0, 64, fp8, 0, false, false);
+            Case(1024, 126, 64, fp8, 128, true, false);
             Case(1, 127, 8, fp8, 0, false, false);
             Case(5, 128, 16, fp8, 64, true, true);
             Case(65, 77952, 32, fp8, 30, false, true);
