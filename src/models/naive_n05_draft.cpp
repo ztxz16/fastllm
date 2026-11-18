@@ -2077,7 +2077,7 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
     // Grammar masks are applied per verification row. Greedy verification also
     // keeps full logits on the device, then transfers only the masked argmax.
     if (baseLogits.dataDevice == DataDevice::CUDA &&
-        ((greedy && config.tool_call_grammar) || (!greedy && SelectLogits(config).cudaSampling))) {
+        ((greedy && config.tool_call_grammar) || (!greedy && SupportsCudaRejectionSampling(config)))) {
         if (!greedy) {
             context.proposalProbs.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds, false);
             context.proposalProbs.Resize({limit, vocab});
@@ -2229,7 +2229,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         auto samplingConfig = r.config; samplingConfig.tool_call_token_mask.reset();
         if (r.limit != steps || samplingConfig.IsSimpleGreedy() || r.config.output_token_least > 0 ||
             (r.config.tool_call_token_mask && !r.config.tool_call_grammar) ||
-            !SelectLogits(r.config).cudaSampling) return false;
+            !SupportsCudaRejectionSampling(r.config)) return false;
         temperatures.push_back(r.config.temperature);
         constrained |= bool(r.config.tool_call_grammar);
     }
@@ -2365,7 +2365,7 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
         distributed = distributed && round->context.deviceRank >= 0 &&
             round->context.deviceRank < (int)draftTP->devices.size() && round->limit > 0 &&
             config.output_token_least == 0 &&
-            (config.IsSimpleGreedy() || SelectLogits(round->config).cudaSampling);
+            (config.IsSimpleGreedy() || SupportsCudaRejectionSampling(round->config));
         total += round->limit; steps = std::max(steps, round->limit);
     }
     if (distributed && total == baseLogits.dims[1]) {
@@ -2449,7 +2449,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchLocal(const std::vector<DraftRound *> 
     for (auto &owner : rounds) {
         auto &r = *owner; auto config = r.config; config.tool_call_token_mask.reset();
         if (r.limit < 1 || r.config.output_token_least > 0 ||
-            (!config.IsSimpleGreedy() && !SelectLogits(r.config).cudaSampling)) return false;
+            (!config.IsSimpleGreedy() && !SupportsCudaRejectionSampling(r.config))) return false;
         offsets.push_back(total); total += r.limit; steps = std::max(steps, r.limit);
         configs.push_back(r.config);
     }
@@ -2963,7 +2963,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
                     config.tool_call_name_constraint_enabled ||
                     config.tool_call_parameter_name_constraint_enabled ||
                     config.tool_call_content_sampling_enabled)) ||
-                (!sampling.IsSimpleGreedy() && !SelectLogits(config).cudaSampling)) continue;
+                (!sampling.IsSimpleGreedy() && !SupportsCudaRejectionSampling(config))) continue;
             int limit = std::min(draftTokens, max_positions - context.committed - 1);
             if (config.output_token_limit > 0)
                 limit = std::min(limit, config.output_token_limit -

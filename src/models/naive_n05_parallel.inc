@@ -349,7 +349,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                     asyncSampling = false; break;
                 }
                 samplingRequests[group].push_back({identity->second, (uint64_t)key(seq, 0).dims[1] + 1,
-                    cfg.temperature, cfg.top_p, std::max(1, cfg.top_k)});
+                    cfg.top_k <= 1 ? 1.0f : cfg.temperature, cfg.top_p, std::max(1, cfg.top_k)});
                 if (cfg.tool_call_grammar) {
                     const auto compiled = cfg.tool_call_grammar->Compile(cfg.tool_call_grammar_state);
                     samplingRequests[group].back().constraint = compiled.first;

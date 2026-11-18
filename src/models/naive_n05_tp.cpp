@@ -840,7 +840,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             auto &logits = dp.samplingLogits[group];
             logits.Resize({dp.samplingCapacity, weight["lm_head.weight"].dims[0]});
             auto sampler = std::make_shared<CudaDecodeSampling>();
-            if (sampler->Prepare(logits, buckets, 0, true)) dp.sampling[group] = std::move(sampler);
+            if (sampler->Prepare(logits, buckets, 0, true, true)) dp.sampling[group] = std::move(sampler);
         });
         dpPipelineReady = std::all_of(dp.sampling.begin(), dp.sampling.end(),
             [](const auto &sampler) { return bool(sampler); });

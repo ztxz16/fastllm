@@ -218,8 +218,10 @@ namespace fastllm {
             std::vector<int> sampledTokens;
         };
         LogitsSelection SelectLogits(const GenerationConfig &config, bool speculative = false) const;
+        bool SupportsCudaRejectionSampling(const GenerationConfig &config) const;
         std::vector<int> SampleCudaLogits(Data &logits,
-                                        const std::vector<GenerationConfig> &configs);
+                                        const std::vector<GenerationConfig> &configs,
+                                        const LastTokensManager *lastTokens = nullptr);
         struct TargetCapture {
             LogitsSelection *selection = nullptr;
             bool verifying = false;

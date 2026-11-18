@@ -51,7 +51,7 @@ static bool inspectGpuSampling = false;
 static std::mutex sampledGpuMutex;
 static std::map<int, std::vector<float>> sampledGpuLogitsByDevice;
 static std::atomic<int> gpuSamplingCalls{0};
-extern "C" bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
+extern "C" bool FastllmCudaTopKFirstSampling(float *logits, float *temperatures,
         int *topKs, float *topPs, int *output, int batch, int vocab) {
     ++gpuSamplingCalls;
     if (inspectGpuSampling) {
@@ -63,7 +63,7 @@ extern "C" bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
     }
     static auto fn = (bool (*)(float *, float *, int *, float *, int *, int, int))
-        dlsym(RTLD_NEXT, "FastllmCudaTopKTopPSampling");
+        dlsym(RTLD_NEXT, "FastllmCudaTopKFirstSampling");
     return fn(logits, temperatures, topKs, topPs, output, batch, vocab);
 }
 static std::atomic<int> batchedRejectionCalls{0};
@@ -1939,6 +1939,36 @@ class Fixture : public NaiveN05FlashModel {
     }
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
     void CudaSamplingChecks(int dp = 1) {
+        {
+            const int rows = 6, vocab = 257;
+            std::vector<float> values(rows * vocab, -20.f);
+            std::vector<GenerationConfig> cs(rows);
+            LastTokensManager history(rows, 64);
+            for (int row = 0; row < rows; ++row) {
+                values[row * vocab + 3] = 10.f;
+                values[row * vocab + 7] = row == 0 ? 8.f : 4.f;
+                values[row * vocab + 9] = 2.f;
+                cs[row].top_k = 1; cs[row].temperature = 0;
+            }
+            for (int row = 0; row < 3; ++row) {
+                cs[row].repeat_penalty = 2.f; history.units[row].Push(3);
+                if (row) history.units[row].Push(3);
+                if (row == 2) cs[row].last_n = 0;
+                if (!SelectLogits(cs[row]).cudaLogits)
+                    throw std::runtime_error("penalty requested host logits");
+            }
+            cs[3].top_k = 50; cs[3].temperature = .8f; cs[3].tool_call_allowed_token_ids = {9};
+            cs[4].tool_call_allowed_token_ids = {3,9};
+            auto mask = std::make_shared<std::vector<uint32_t>>((vocab+31)/32,0);
+            (*mask)[0]=(1u<<7)|(1u<<9);cs[4].tool_call_token_mask=mask;
+            auto minimum=cs[5];minimum.output_token_least=8;
+            if (!SelectLogits(minimum).cudaLogits || !SelectLogits(cs[3]).cudaLogits)
+                throw std::runtime_error("constraint requested host logits");
+            Data logits(FLOAT32,{rows,vocab},values);logits.ToDevice(CUDA,std::vector<int>{0},true);
+            auto actual=SampleCudaLogits(logits,cs,&history);
+            if (actual!=std::vector<int>({7,7,3,9,9,3}) || logits.dataDevice!=CUDA)
+                throw std::runtime_error("GPU penalty/allow-list/greedy semantics");
+        }
         // Exercise partial mask words and mixed masked/unmasked rows without
         // involving sampling (an empty support is valid for this mask API).
         {
@@ -2000,13 +2030,18 @@ class Fixture : public NaiveN05FlashModel {
                     throw std::runtime_error("GPU sampling frequency differs from CPU distribution");
         }
         GenerationConfig cfg; cfg.top_k = vocab; cfg.top_p = .95f;
-        if (!SelectLogits(cfg).cudaSampling || SelectLogits(cfg, true).cudaSampling)
+        if (!SelectLogits(cfg).cudaSampling || SelectLogits(cfg, true).cudaSampling ||
+            !SupportsCudaRejectionSampling(cfg))
             throw std::runtime_error("incorrect ordinary/speculative sampling selection");
         for (int k : {1, 4, 50}) {
             cfg.top_k = k;
-            if (SelectLogits(cfg).cudaSampling) throw std::runtime_error("finite top-k distribution changed");
+            if (!SelectLogits(cfg).cudaSampling || SelectLogits(cfg, true).cudaSampling ||
+                SupportsCudaRejectionSampling(cfg))
+                throw std::runtime_error("finite top-k GPU selection unavailable");
         }
-        cfg.top_k = vocab; cfg.output_token_limit = 32; cfg.input_token_length = 3;
+        cfg.top_k = vocab;
+        if (!SupportsCudaRejectionSampling(cfg)) throw std::runtime_error("unrestricted GPU rejection sampling disabled");
+        cfg.output_token_limit = 32; cfg.input_token_length = 3;
         maxBatch = 128; SetMaxTokens(131072);
         if (dp > 1) ConfigureAttentionParallel(dp);
         WarmUp();
@@ -3314,7 +3349,10 @@ class Fixture : public NaiveN05FlashModel {
                         for (int i = 0; i < past; ++i) { ids[i] = (i * 7 + row) % 251; positions[i] = i; }
                         Forward(Data(FLOAT32, {1, past}, ids), Data(), Data(FLOAT32, {1, past}, positions),
                             c->pastKeyValues, cfg);
-                        c->generationConfig = cfg; c->currentTokens = {1};
+                        c->generationConfig = cfg;
+                        c->generationConfig.top_k = row % 4 == 0 ? 1 : row % 4 == 1 ? 4 : row % 4 == 2 ? 50 : cfg.top_k;
+                        if (c->generationConfig.top_k == 1) c->generationConfig.temperature = 0;
+                        c->currentTokens = {1};
                         if (constrained && row % 3 != 2) {
                             auto &config = c->generationConfig;
                             config.tool_call_grammar = std::make_shared<MimoToolGrammar>(

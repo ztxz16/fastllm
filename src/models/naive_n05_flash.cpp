@@ -650,12 +650,16 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
         }
         auto other = SelectLogits(configs[b]);
         selection.cudaSampling = selection.cudaSampling && other.cudaSampling;
+        selection.cudaLogits = selection.cudaLogits || other.cudaLogits;
         if (selection.count != other.count || selection.greedy != other.greedy ||
             selection.invTemperature != other.invTemperature) selection.count = 0;
     }
     AssertInFastLLM(inputIds.dims == std::vector<int>({1, (int)packedPositions.size()}) &&
         inputIds.dataType == FLOAT32, "Naive batch input must pack the unpadded sequences in order.");
     Data positions(FLOAT32, inputIds.dims, DataDevice::CPU, packedPositions.data());
+    if (std::any_of(configs.begin(), configs.end(), [](const GenerationConfig &cfg) { return cfg.output_logits; })) {
+        selection.cudaLogits = false; selection.cudaSampling = false;
+    } else if (selection.cudaLogits) selection.cudaSampling = false;
     // The batch descriptor references response-owned KV. No KV payload or
     // ownership is copied into the legacy single-sequence argument.
     std::vector<std::pair<Data, Data>> unused;
@@ -671,6 +675,13 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
                 ? (int)((float *)selection.candidates.cpuData)[b * 2]
                 : LLMSamplingOnly(selection.candidates, b, configs[b]);
         return tokens;
+    }
+    if (logits.dataDevice == CUDA) {
+        ResetLogitsOfEOS(batch, &logits, pastKeyValues, configs);
+        auto sampled = SampleCudaLogits(logits, configs, &lastTokens);
+        for (int row = 0; row < batch; ++row)
+            if (configs[row].prefill_chunk_remaining > 0) sampled[row] = 0;
+        return sampled;
     }
     const int vocab = logits.dims.back();
     for (int b = 0; b < batch; ++b)
@@ -2233,23 +2244,23 @@ Data NaiveN05FlashModel::RunTarget(
 NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
         const GenerationConfig &config, bool speculative) const {
     LogitsSelection selection;
-    // These transforms must happen before selection. Keep the established
-    // full-logits path until their branch-local GPU equivalents are available.
-    if (config.prefill_chunk_remaining > 0 || config.output_logits || config.output_token_least > 0 ||
-        std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
-        !config.tool_call_allowed_token_ids.empty()) return selection;
+    // Stateful transforms need the request's history/cache lengths, but the
+    // logits remain on GPU. Only explicit logits output retains host transfer.
+    if (config.prefill_chunk_remaining > 0 || config.output_logits) return selection;
+    if (config.output_token_least > 0 || std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
+        !config.tool_call_allowed_token_ids.empty()) {
+        selection.cudaLogits = !speculative;
+        return selection;
+    }
     selection.greedy = config.IsSimpleGreedy();
     // Grammar masks require full logits before sampling. The continuous DP
     // sampler applies compiled masks inside its startup-captured graph.
     if (config.tool_call_token_mask && config.top_k <= 1) selection.greedy = true;
-    // Full-vocabulary top-p matches the shared CUDA sampler's distribution.
-    // Finite top-k keeps its existing top-k-then-top-p semantics, as does
-    // speculative verification, which needs probabilities rather than a draw.
-    if (!speculative && ((!selection.greedy &&
-        config.top_k >= weight.weight.at("lm_head.weight").dims[0]) ||
-        (selection.greedy && config.tool_call_token_mask)) &&
-        std::isfinite(config.temperature) && config.temperature > 0 &&
-        std::isfinite(1.0f / config.temperature) &&
+    // The shared FlashInfer path preserves top-k-then-top-p, including finite
+    // k and stable boundary ties. Verification still needs probabilities.
+    if (!speculative && (selection.greedy ||
+        (std::isfinite(config.temperature) && config.temperature > 0 &&
+         std::isfinite(1.0f / config.temperature))) &&
         std::isfinite(config.top_p) && config.top_p > 0 && config.top_p <= 1) {
         selection.cudaSampling = true;
         return selection;
@@ -2267,8 +2278,15 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
     return selection;
 }
 
+bool NaiveN05FlashModel::SupportsCudaRejectionSampling(const GenerationConfig &config) const {
+    // Rejection p/q uses the existing joint-filter probability builder. Ordinary
+    // sampling's new sequential finite-k support must not change that contract.
+    return config.top_k >= weight.weight.at("lm_head.weight").dims[0] &&
+           SelectLogits(config).cudaSampling;
+}
+
 std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
-        Data &logits, const std::vector<GenerationConfig> &configs) {
+        Data &logits, const std::vector<GenerationConfig> &configs, const LastTokensManager *lastTokens) {
 #ifdef USE_CUDA
     AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
         logits.Count(0) / logits.dims.back() == configs.size(), "Naive CUDA sampling: invalid logits.");
@@ -2277,12 +2295,73 @@ std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
     std::vector<float> temperatures(rows), topPs(rows);
     std::vector<int> topKs(rows, vocab), tokens(rows);
     for (int row = 0; row < rows; ++row) {
-        temperatures[row] = configs[row].temperature;
+        temperatures[row] = configs[row].top_k <= 1 ? 1.0f : configs[row].temperature;
         topPs[row] = configs[row].top_p;
         topKs[row] = std::max(1, configs[row].top_k);
     }
-    ApplyToolTokenMasks(logits, configs);
-    AssertInFastLLM(FastllmCudaTopKTopPSampling((float *)logits.cudaData,
+    // Combine explicit allow-lists with grammar masks before GPU selection.
+    // An empty standalone allow-list intersection keeps the established
+    // unconstrained fallback; an impossible grammar remains an error.
+    std::vector<GenerationConfig> masked(configs);
+    for (int row = 0; row < rows; ++row) if (!configs[row].tool_call_allowed_token_ids.empty()) {
+        auto mask = std::make_shared<std::vector<uint32_t>>((vocab + 31) / 32, 0);
+        bool any = false;
+        for (int id : configs[row].tool_call_allowed_token_ids)
+            if (id >= 0 && id < vocab && configs[row].AllowsToolToken(id)) {
+                (*mask)[id / 32] |= uint32_t(1) << (id % 32); any = true;
+            }
+        AssertInFastLLM(any || !configs[row].tool_call_token_mask, "Empty tool grammar sampling support.");
+        if (any) masked[row].tool_call_token_mask = std::move(mask);
+    }
+    ApplyToolTokenMasks(logits, masked);
+    std::vector<std::vector<std::pair<int, float>>> penalties(rows);
+    size_t maxPenalty = 0;
+    if (lastTokens) for (int row = 0; row < rows && row < (int)lastTokens->units.size(); ++row) {
+        if (std::abs(configs[row].repeat_penalty - 1.0f) <= 1e-8f) continue;
+        std::map<int, int> counts;
+        for (int id : lastTokens->units[row].tokenSet) if (id >= 0 && id < vocab) ++counts[id];
+        for (auto entry : counts) penalties[row].push_back({entry.first,
+            std::pow(configs[row].repeat_penalty, configs[row].last_n <= 0 ? 1 : entry.second)});
+        maxPenalty = std::max(maxPenalty, penalties[row].size());
+    }
+    if (maxPenalty) {
+        // Reuse GPU buffers; only small request parameters cross from the CPU.
+        struct Workspace { Data probs, params, output, floatOutput, topK; };
+        static thread_local std::map<int, Workspace> workspaces;
+        const int device = logits.dataDeviceIds.front(); FastllmCudaSetDevice(device);
+        auto &w = workspaces[device];
+        const size_t fields = size_t(rows) * (3 + 2 * maxPenalty);
+        AssertInFastLLM(fields <= INT_MAX, "Sampling parameter buffer too large.");
+        auto prepare = [&](Data &data, DataType type, std::vector<int> dims) {
+            data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
+            data.ToDevice(CUDA, {device}, false); data.Allocate();
+        };
+        prepare(w.probs, FLOAT32, {rows, vocab}); prepare(w.params, INT32, {int(fields)});
+        prepare(w.output, INT32, {rows}); prepare(w.floatOutput, FLOAT32, {rows});
+        prepare(w.topK, INT8, {int(FastllmCudaTopKFirstSamplingWorkspaceBytes(rows))});
+        std::vector<uint32_t> params(fields, 0);
+        std::memcpy(params.data(), temperatures.data(), rows * sizeof(float));
+        std::memcpy(params.data() + rows, topKs.data(), rows * sizeof(int));
+        std::memcpy(params.data() + 2 * rows, topPs.data(), rows * sizeof(float));
+        int *ids = (int *)(params.data() + 3 * rows);
+        float *factors = (float *)(ids + rows * maxPenalty);
+        std::fill(ids, ids + rows * maxPenalty, -1);
+        std::fill(factors, factors + rows * maxPenalty, 1.f);
+        for (int row = 0; row < rows; ++row) for (size_t j = 0; j < penalties[row].size(); ++j) {
+            ids[row * maxPenalty + j] = penalties[row][j].first;
+            factors[row * maxPenalty + j] = penalties[row][j].second;
+        }
+        FastllmCudaCopyFromHostToDevice(w.params.cudaData, params.data(), fields * sizeof(uint32_t));
+        auto *gpu = (uint32_t *)w.params.cudaData;
+        AssertInFastLLM(FastllmCudaTopKFirstSamplingToDeviceWithRng((float *)logits.cudaData,
+            (float *)w.probs.cudaData, (float *)gpu, (int *)gpu + rows, (float *)gpu + 2 * rows,
+            (int *)gpu + 3 * rows, (float *)gpu + 3 * rows + rows * maxPenalty, int(maxPenalty),
+            (int *)w.output.cudaData, (float *)w.floatOutput.cudaData, rows, vocab,
+            nullptr, nullptr, w.topK.cudaData, w.topK.GetBytes()), "GPU penalized sampling failed.");
+        FastllmCudaCopyFromDeviceToHost(tokens.data(), w.output.cudaData, rows * sizeof(int));
+        return tokens;
+    }
+    AssertInFastLLM(FastllmCudaTopKFirstSampling((float *)logits.cudaData,
         temperatures.data(), topKs.data(), topPs.data(), tokens.data(), rows, vocab),
         "Naive CUDA top-p sampling failed.");
     return tokens;
@@ -2309,6 +2388,8 @@ int NaiveN05FlashModel::SampleTarget(
         retLogits->assign((float *)logits.cpuData, (float *)logits.cpuData + logits.Count(0));
     }
     ResetLogitsOfEOS(1, &logits, pastKeyValues, generationConfig);
+    if (logits.dataDevice == CUDA)
+        return SampleCudaLogits(logits, {generationConfig}, &lastTokens)[0];
     if (generationConfig.IsSimpleGreedy()) {
         TopK(logits, top, 1);
         top.ToDevice(DataDevice::CPU);
