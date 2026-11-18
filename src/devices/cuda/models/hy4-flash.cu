@@ -116,21 +116,22 @@ __device__ static float read(const void *p, int type, size_t i) {
 __device__ static float sigmoid(float x) {
     return 1.f / (1.f + expf(-x));
 }
-template <bool Maximum = false> __device__ static float reduce(float x) {
-    __shared__ float warp[32];
+template <bool Maximum = false> __device__ static float warpReduce(float x) {
     for (int delta = 16; delta; delta /= 2) {
         float v = __shfl_down_sync(~0U, x, delta);
         x = Maximum ? fmaxf(x, v) : x + v;
     }
+    return x;
+}
+template <bool Maximum = false> __device__ static float reduce(float x) {
+    __shared__ float warp[32];
+    x = warpReduce<Maximum>(x);
     if ((threadIdx.x & 31) == 0)
         warp[threadIdx.x >> 5] = x;
     __syncthreads();
     if (threadIdx.x < 32) {
         x = threadIdx.x < (blockDim.x + 31) / 32 ? warp[threadIdx.x] : 0.f;
-        for (int delta = 16; delta; delta /= 2) {
-            float v = __shfl_down_sync(~0U, x, delta);
-            x = Maximum ? fmaxf(x, v) : x + v;
-        }
+        x = warpReduce<Maximum>(x);
         if (threadIdx.x == 0)
             warp[0] = x;
     }
@@ -207,8 +208,7 @@ __global__ static void warpGemv(Hy4View w, const float *input, float *out, const
         else
             sum += dot;
     }
-    for (int delta = 16; delta; delta /= 2)
-        sum += __shfl_down_sync(~0U, sum, delta);
+    sum = warpReduce(sum);
     if (!lane) {
         if constexpr (Dense)
             out[row] = bf(sum + 0.f);
@@ -218,27 +218,6 @@ __global__ static void warpGemv(Hy4View w, const float *input, float *out, const
         }
     }
 }
-// The iHC mixing matrix has only four or eight rows, each 12,288 elements
-// wide. Split K so the GPU can read it with many independent thread blocks.
-__global__ static void partialMix(Hy4View w, const float *input, float *partial, int tiles) {
-    int row = blockIdx.y, tile = blockIdx.x, col = tile * 512 + threadIdx.x;
-    const float *weight = static_cast<const float *>(w.data) + size_t(row) * w.cols;
-    float sum = 0;
-    for (int i = col; i < min((tile + 1) * 512, w.cols); i += blockDim.x)
-        sum = fmaf(weight[i], input[i], sum);
-    sum = reduce(sum);
-    if (!threadIdx.x)
-        partial[row * tiles + tile] = sum;
-}
-__global__ static void finishMix(const float *partial, float *out, int tiles) {
-    int row = blockIdx.x, lane = threadIdx.x;
-    float sum = lane < tiles ? partial[row * tiles + lane] : 0;
-    for (int delta = 16; delta; delta /= 2)
-        sum += __shfl_down_sync(~0u, sum, delta);
-    if (!lane)
-        out[row] = sum;
-}
-
 static void Linear(Weights &w, Scratch &s, const std::string &name, const float *x, float *y,
                    bool roundOutput = true, const int *ids = nullptr, int slots = 1, int routesPerInput = 0,
                    const std::string &biasName = {}) {
@@ -250,12 +229,7 @@ static void Linear(Weights &w, Scratch &s, const std::string &name, const float 
         x = qx;
     }
     Hy4View bias = biasName.empty() ? Hy4View{} : w.View(biasName, s.device);
-    if (v.type == 1 && v.rows <= 8 && v.cols == 12288 && !ids && !roundOutput && !bias.data && slots == 1) {
-        const int tiles = v.cols / 512;
-        auto partial = s.Get("hcPartials", v.rows * tiles);
-        partialMix<<<dim3(tiles, v.rows), 128>>>(v, x, partial, tiles);
-        finishMix<<<v.rows, 32>>>(partial, y, tiles);
-    } else if (v.cols % 4 == 0 && (v.type != 2 || v.scale)) {
+    if (v.cols % 4 == 0 && (v.type != 2 || v.scale)) {
         dim3 grid((v.rows + 3) / 4, slots);
         const bool dense = !ids && slots == 1 && !routesPerInput && roundOutput && !bias.data;
         if (dense && v.type == 2 && v.scaleType == 0)
@@ -305,8 +279,7 @@ __global__ static void batchGemv(Hy4View w, const float *x, float *out, int coun
 #pragma unroll
     for (int r = 0; r < 4; ++r)
         if (first + r < count) {
-            for (int delta = 16; delta; delta /= 2)
-                sum[r] += __shfl_down_sync(~0u, sum[r], delta);
+            sum[r] = warpReduce(sum[r]);
             if (!lane)
                 out[size_t(first + r) * w.rows + row] = roundOutput ? bf(sum[r]) : sum[r];
         }
@@ -391,11 +364,70 @@ __global__ static void hc(const float *h, const float *mix, Hy4View bias, Hy4Vie
         out[i] = bf(v);
     }
 }
+constexpr int HcWidth = 3072, HcInputs = 4 * HcWidth, HcTiles = HcInputs / 512;
+__global__ static void hcPartials(const float *weight, const float *h, int rows, float *partial) {
+    int block = blockIdx.x;
+    if (block < rows * HcTiles) {
+        int row = block / HcTiles, start = (block % HcTiles) * 512 + threadIdx.x;
+        float sum = 0;
+#pragma unroll
+        for (int i = 0; i < 512; i += 128)
+            sum = fmaf(weight[row * HcInputs + start + i], h[start + i], sum);
+        sum = reduce(sum);
+        if (threadIdx.x == 0)
+            partial[block] = sum;
+    } else if (threadIdx.x < 32) {
+        // Each of the original eight warps keeps its 48-term FMA chain.
+        int warp = block - rows * HcTiles, start = warp * 32 + threadIdx.x;
+        float square = 0;
+#pragma unroll
+        for (int i = 0; i < HcInputs; i += 256) {
+            float v = h[start + i];
+            square = fmaf(v, v, square);
+        }
+        square = warpReduce(square);
+        if (threadIdx.x == 0)
+            partial[block] = square;
+    }
+}
+__global__ static void hcMixOutput(const float *h, const float *partial, int rows, Hy4View bias,
+                                   Hy4View scale, float *out, float *post) {
+    __shared__ float pre[4];
+    int row = threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row < rows) {
+        float dot = warpReduce(lane < HcTiles ? partial[row * HcTiles + lane] : 0.f);
+        float square = warpReduce(lane < 8 ? partial[rows * HcTiles + lane] : 0.f);
+        if (lane == 0) {
+            float inv = rsqrtf(square / HcInputs + 1.e-5f);
+            float gate = sigmoid(dot * inv * read(scale.data, scale.type, row / 4) +
+                                 read(bias.data, bias.type, row));
+            if (row < 4)
+                pre[row] = gate + 1.e-6f;
+            else if (blockIdx.x == 0)
+                post[row - 4] = 2.f * gate + 1.e-6f;
+        }
+    }
+    __syncthreads();
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    float value = 0;
+    for (int j = 0; j < 4; j++)
+        value += h[j * HcWidth + col] * pre[j];
+    out[col] = bf(value);
+}
 void HyperPre(Weights &w, Scratch &s, const std::string &prefix, float *h, float *x, float *post, bool head) {
-    float *mix = s.Get("hcMix", 8);
-    Linear(w, s, prefix + (head ? "hc_head_fn" : "hc_fn"), h, mix, false);
+    auto name = prefix + (head ? "hc_head_fn" : "hc_fn");
+    auto weight = w.View(name, s.device);
     auto bias = w.View(prefix + (head ? "hc_head_base" : "hc_base"), s.device),
          scale = w.View(prefix + (head ? "hc_head_scale" : "hc_scale"), s.device);
+    if (weight.type == 1 && weight.cols == HcInputs && weight.rows == (head ? 4 : 8)) {
+        int blocks = weight.rows * HcTiles + 8;
+        float *partial = s.Get("hcPartials", blocks);
+        hcPartials<<<blocks, 128>>>(static_cast<const float *>(weight.data), h, weight.rows, partial);
+        hcMixOutput<<<HcWidth / 256, 256>>>(h, partial, weight.rows, bias, scale, x, post);
+        return;
+    }
+    float *mix = s.Get("hcMix", 8);
+    Linear(w, s, name, h, mix, false);
     hc<<<1, 256>>>(h, mix, bias, scale, x, post, 3072, head);
 }
 __global__ static void hcPost(float *h, const float *x, const float *post, int width) {
