@@ -50,7 +50,7 @@ public:
     // all reduction reads before writing probabilities; the next model must
     // wait for Ready before overwriting this storage. No second vocab buffer.
     bool Prepare(Data &logits, const std::vector<int> &shapes, uint64_t salt = 0,
-                 bool consumeLogits = false) {
+                 bool consumeLogits = false, bool sequentialTopK = false) {
         if (device >= 0 || shapes.empty() || logits.dataDevice != DataDevice::CUDA ||
             logits.dataType != FLOAT32 || logits.dataDeviceIds.size() != 1 || !logits.cudaData ||
             logits.dims.size() != 2 || logits.dims[1] <= 0 ||
@@ -60,6 +60,7 @@ public:
         device = logits.dataDeviceIds.at(0);
         FastllmCudaSetDevice(device);
         maxRows = shapes.back(); vocab = logits.dims.back(); buckets = shapes;
+        topKFirst = sequentialTopK;
         cudaLogits = (float *)logits.cudaData;
         nonce = salt ? salt : ((uint64_t)std::random_device{}() << 32) ^ std::random_device{}();
         auto allocate = [&](Data &data, DataType type, std::vector<int> dims) {
@@ -67,6 +68,7 @@ public:
             data.ToDevice(DataDevice::CUDA, {device}, false); data.Allocate(true);
         };
         if (!consumeLogits) allocate(probs, FLOAT32, {maxRows, vocab});
+        if (topKFirst) allocate(topKWorkspace, INT8, {int(FastllmCudaTopKFirstSamplingWorkspaceBytes(maxRows))});
         cudaProbs = consumeLogits ? cudaLogits : (float *)probs.cudaData;
         allocate(params, INT32, {8, maxRows});
         allocate(tokens, INT32, {2, maxRows});
@@ -193,7 +195,14 @@ private:
     bool Run(int rows, int slot, bool constrained) {
         auto *p = (uint32_t *)params.cudaData;
         if (constrained) FastllmCudaTokenConstraintApplyRows(constraints.get(), cudaLogits, rows);
-        const bool ok = FastllmCudaTopKTopPSamplingToDeviceWithRng(cudaLogits, cudaProbs,
+        const bool ok = topKFirst
+            ? FastllmCudaTopKFirstSamplingToDeviceWithRng(cudaLogits, cudaProbs,
+            (float *)p, (int *)p + maxRows, (float *)p + 2 * maxRows,
+            nullptr, nullptr, 0, (int *)tokens.cudaData + slot * maxRows,
+            (float *)floatTokens.cudaData + slot * maxRows, rows, vocab,
+            (uint64_t *)(p + 4 * maxRows), (uint64_t *)(p + 6 * maxRows),
+            topKWorkspace.cudaData, topKWorkspace.GetBytes())
+            : FastllmCudaTopKTopPSamplingToDeviceWithRng(cudaLogits, cudaProbs,
             (float *)p, (int *)p + maxRows, (float *)p + 2 * maxRows,
             nullptr, nullptr, 0, (int *)tokens.cudaData + slot * maxRows,
             (float *)floatTokens.cudaData + slot * maxRows, rows, vocab,
@@ -205,7 +214,8 @@ private:
     int device = -1, maxRows = 0, vocab = 0;
     uint64_t nonce = 0;
     float *cudaLogits = nullptr, *cudaProbs = nullptr;
-    Data probs, params, tokens, floatTokens;
+    bool topKFirst = false;
+    Data probs, params, tokens, floatTokens, topKWorkspace;
     std::shared_ptr<void> constraints;
     void *hostParams = nullptr, *ready[2]{}, *hostReady[2]{};
     int *hostTokens[2]{};

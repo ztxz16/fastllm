@@ -57,7 +57,7 @@ static void ConcurrentSamplers(int vocab) {
     std::thread a(run,0),b(run,1);a.join();b.join();
     for(auto e:failures) if(e) std::rethrow_exception(e);
 }
-static void ConstraintSamplingChecks() {
+static void ConstraintSamplingChecks(bool sequentialTopK) {
     constexpr int capacity = 4, vocab = 513;
     auto words = std::make_shared<std::vector<std::string>>(vocab, "z");
     for (int i = 0; i < 256; ++i) (*words)[i] = std::string(1, char(i));
@@ -74,8 +74,8 @@ static void ConstraintSamplingChecks() {
     actual.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     reference.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     CudaDecodeSampling gpu, cpu;
-    Check(gpu.Prepare(actual, {1, 2, capacity}, 853) &&
-          cpu.Prepare(reference, {1, 2, capacity}, 853), "grammar sampler prepare");
+    Check(gpu.Prepare(actual, {1, 2, capacity}, 853, false, sequentialTopK) &&
+          cpu.Prepare(reference, {1, 2, capacity}, 853, false, sequentialTopK), "grammar sampler prepare");
 #ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
     const int captures = captureCalls;
 #endif
@@ -141,8 +141,8 @@ static void InPlaceSamplingChecks() {
     input.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     reference.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     CudaDecodeSampling consumed, preserved;
-    Check(consumed.Prepare(input, {1, 3, capacity}, 4321, true) &&
-          preserved.Prepare(reference, {1, 3, capacity}, 4321), "in-place sampler prepare");
+    Check(consumed.Prepare(input, {1, 3, capacity}, 4321, true, true) &&
+          preserved.Prepare(reference, {1, 3, capacity}, 4321, false, true), "in-place sampler prepare");
 #ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
     const int captures = captureCalls;
 #endif
@@ -151,7 +151,7 @@ static void InPlaceSamplingChecks() {
         FastllmCudaCopyFromHostToDevice(input.cudaData, values.data(), values.size() * sizeof(float));
         std::vector<CudaDecodeSampling::Request> requests;
         for (int row = 0; row < rows; ++row)
-            requests.push_back({uint64_t(1000 + rows - row), uint64_t(step), .4f, .95f, vocab});
+            requests.push_back({uint64_t(1000 + rows - row), uint64_t(step), .4f, .95f, row % 3 == 0 ? 1 : row % 3 == 1 ? 50 : vocab});
         const int slot = step++ % 2;
         Check(consumed.Submit(requests, slot) && preserved.Submit(requests, slot), "in-place sampler submit");
         Check(consumed.Collect(slot) == preserved.Collect(slot), "in-place sampling changed token/RNG");
@@ -159,6 +159,73 @@ static void InPlaceSamplingChecks() {
 #ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
     Check(captureCalls == captures, "in-place sampler recaptured on batch change");
 #endif
+}
+
+static void SequentialSamplingChecks(int vocab) {
+    const int rows = 8;
+    std::vector<float> raw(size_t(rows) * vocab), ts(rows), ps(rows);
+    std::vector<int> ks{1, 4, 50, 129, vocab, 1, 50, vocab};
+    for (int row=0; row<rows; ++row) {
+        ts[row]=.7f + row*.1f; ps[row]=row>=5 ? 1.f : .83f;
+        for (int id=0; id<vocab; ++id)
+            raw[size_t(row)*vocab+id]=row>=5 ? 0.f : -.017f * ((int64_t(id)*73)%vocab);
+    }
+    Data input(FLOAT32,{rows,vocab},raw), probs(FLOAT32,{rows,vocab});
+    Data temps(FLOAT32,{rows},ts), topPs(FLOAT32,{rows},ps), topKs(INT32,{rows});
+    topKs.Allocate();std::memcpy(topKs.cpuData,ks.data(),rows*sizeof(int));
+    Data output(INT32,{rows}), floats(FLOAT32,{rows});
+    Data scratch(INT8,{int(FastllmCudaTopKFirstSamplingWorkspaceBytes(rows))});
+    for(auto *d:{&input,&probs,&temps,&topPs,&topKs,&output,&floats,&scratch}) {
+        d->ToDevice(CUDA,std::vector<int>{0},true);d->Allocate();
+    }
+    Check(FastllmCudaTopKFirstSamplingToDeviceWithRng((float*)input.cudaData,(float*)probs.cudaData,
+        (float*)temps.cudaData,(int*)topKs.cudaData,(float*)topPs.cudaData,nullptr,nullptr,0,
+        (int*)output.cudaData,(float*)floats.cudaData,rows,vocab,nullptr,nullptr,
+        scratch.cudaData,scratch.GetBytes()),"sequential device sampler");
+    std::vector<float> actual(size_t(rows)*vocab), preserved(actual.size());
+    FastllmCudaCopyFromDeviceToHost(actual.data(),probs.cudaData,actual.size()*sizeof(float));
+    FastllmCudaCopyFromDeviceToHost(preserved.data(),input.cudaData,preserved.size()*sizeof(float));
+    Check(preserved==raw,"out-of-place sampler mutated logits");
+    for(int row=0;row<rows;++row) {
+        std::vector<std::pair<float,int>> ranked;
+        for(int id=0;id<vocab;++id)ranked.push_back({raw[size_t(row)*vocab+id]*(1.f/ts[row]),id});
+        std::sort(ranked.begin(),ranked.end(),[](auto a,auto b){return a.first>b.first || (a.first==b.first&&a.second<b.second);});
+        std::vector<float> expected(vocab,0);double sum=0;
+        for(int j=0;j<ks[row];++j)sum+=std::exp(ranked[j].first-ranked[0].first);
+        for(int j=0;j<ks[row];++j)expected[ranked[j].second]=std::exp(ranked[j].first-ranked[0].first)/sum;
+        for(int id=0;id<vocab;++id)Check(std::abs(actual[size_t(row)*vocab+id]-expected[id])<3e-6,"top-k normalized probabilities/tie ordering differ");
+    }
+    // Empirical top-k-then-top-p support, using a CPU sorting oracle and many
+    // independent rows. No changing sampler parameters to hide finite-k cases.
+    constexpr int repeats=4096, width=257, groups=5;
+    std::vector<float> batch(size_t(repeats)*groups*width), temperatures(repeats*groups), topP(repeats*groups);
+    std::vector<int> topK(repeats*groups), tokens(repeats*groups);
+    std::vector<std::vector<float>> expected(groups,std::vector<float>(width));
+    for(int group=0;group<groups;++group) {
+        const int k=group==0?1:group==1?4:group==2?50:group==3?129:width;
+        const float temp=.5f+.2f*group,p=group%2?.91f:1.f;
+        std::vector<std::pair<float,int>> ranked;
+        for(int id=0;id<width;++id)ranked.push_back({-.035f*((id*73)%width)*(1.f/temp),id});
+        std::sort(ranked.begin(),ranked.end(),[](auto a,auto b){return a.first>b.first;});
+        double total=0;for(int i=0;i<k;++i)total+=std::exp(ranked[i].first-ranked[0].first);
+        double mass=0;int keep=0;
+        do {mass+=std::exp(ranked[keep].first-ranked[0].first)/total;++keep;} while(keep<k&&mass<=p);
+        for(int i=0;i<keep;++i)expected[group][ranked[i].second]=std::exp(ranked[i].first-ranked[0].first)/total/mass;
+        for(int i=0;i<repeats;++i) {
+            const int row=group*repeats+i;temperatures[row]=temp;topP[row]=p;topK[row]=k;
+            for(int id=0;id<width;++id)batch[size_t(row)*width+id]=-.035f*((id*73)%width);
+        }
+    }
+    Data all(FLOAT32,{groups*repeats,width},batch);all.ToDevice(CUDA,std::vector<int>{0},true);
+    Check(FastllmCudaTopKFirstSampling((float*)all.cudaData,temperatures.data(),topK.data(),topP.data(),tokens.data(),groups*repeats,width),"batched sequential host sampler");
+    for(int group=0;group<groups;++group) {
+        std::vector<int> count(width);
+        for(int i=0;i<repeats;++i) {
+            int token=tokens[group*repeats+i];Check(token>=0&&token<width&&expected[group][token]>0,"draw outside sequential nucleus");++count[token];
+        }
+        for(int id=0;id<width;++id)Check(std::abs(double(count[id])/repeats-expected[group][id])<.035,"sequential sampling distribution mismatch");
+    }
+    std::cout<<"TOP-K-FIRST SAMPLING PASS vocab="<<vocab<<"\n";
 }
 
 int main(int argc, char **argv) {
@@ -170,7 +237,9 @@ int main(int argc, char **argv) {
     logits.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     if(vocab>4096) ConcurrentSamplers(vocab);
     InPlaceSamplingChecks();
-    ConstraintSamplingChecks();
+    ConstraintSamplingChecks(false);
+    ConstraintSamplingChecks(true);
+    SequentialSamplingChecks(vocab);
     CudaDecodeSampling a,b,invalid;
     Check(!invalid.Prepare(logits,{0,8}) && !invalid.Prepare(logits,{4,2}) &&
           !invalid.Prepare(logits,{1,1}) && !invalid.Prepare(logits,{1,16}), "invalid startup buckets");

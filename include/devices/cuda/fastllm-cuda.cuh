@@ -1829,6 +1829,16 @@ bool FastllmCudaTopKTopPSampling(float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
                                   int batch, int vocabSize);
+// Sequential top-k then top-p, with stable token-ID ties. The device API
+// borrows startup-owned scratch and may consume logits in place; no allocation.
+size_t FastllmCudaTopKFirstSamplingWorkspaceBytes(int batch);
+bool FastllmCudaTopKFirstSampling(float *logits, float *temperatures,
+    int *topKs, float *topPs, int *output, int batch, int vocab);
+bool FastllmCudaTopKFirstSamplingToDeviceWithRng(
+    float *logits, float *probs, float *temperatures, int *topKs, float *topPs,
+    int *penaltyIds, float *penaltyFactors, int penaltyTokens,
+    int *output, float *floatOutput, int batch, int vocab,
+    uint64_t *requestSeeds, uint64_t *requestOffsets, void *workspace, size_t workspaceBytes);
 // Request-owned sampling workspace for CUDA Graph capture. Parameters are fixed
 // at creation; SetSeed runs outside capture before every execution. Run only
 // enqueues device work and writes both the actual q distribution and sampled ID.

@@ -16225,7 +16225,7 @@ template <int BLOCK_THREADS, typename Input>
 __device__ void FastllmTemperatureSoftmaxBody(Input input, float *probs,
                                             const float *temperatures, int vocabSize) {
     int bid = blockIdx.x;
-    float invTemp = 1.0f / temperatures[bid];
+    float invTemp = temperatures ? 1.0f / temperatures[bid] : 1.0f;
     float *output = probs + (long long)bid * vocabSize;
 
     __shared__ float sMaxVal;
@@ -16458,7 +16458,86 @@ __global__ void FastllmTypicalAcceptanceKernel(
     }
 }
 
-bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+
+// FlashInfer supplies radix top-k and nucleus sampling. Preserve FastLLM's
+// finite-top-k ordering (scaled score, then token ID) at equal-score boundaries.
+size_t FastllmCudaTopKFirstSamplingWorkspaceBytes(int batch) {
+    if (batch <= 0) return 0;
+    return FastllmCudaAlignBytes(size_t(batch) * sizeof(float), 256) +
+           FastllmCudaAlignBytes(size_t(batch) * sizeof(flashinfer::sampling::RadixRowState), 256);
+}
+namespace {
+__global__ void ScaleTopKFirstLogits(const float *input, float *output,
+        const float *temperatures, float *ones, int vocab) {
+    const int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col == 0) ones[row] = 1.f;
+    if (col < vocab) output[size_t(row) * vocab + col] =
+        input[size_t(row) * vocab + col] * (1.f / temperatures[row]);
+}
+__global__ void TrimTopKBoundaryTies(float *logits, const int *topKs, int vocab) {
+    constexpr int Threads = 256;
+    const int row = blockIdx.x, k = topKs[row];
+    if (k <= 0 || k >= vocab) return;
+    float *values = logits + size_t(row) * vocab;
+    using Min = cub::BlockReduce<float, Threads>;
+    using Sum = cub::BlockReduce<int, Threads>;
+    using Scan = cub::BlockScan<int, Threads>;
+    __shared__ union { typename Min::TempStorage min; typename Sum::TempStorage sum;
+                       typename Scan::TempStorage scan; } scratch;
+    __shared__ float pivot;
+    __shared__ int retained, needed, preceding;
+    float minimum = INFINITY; int count = 0;
+    for (int id = threadIdx.x; id < vocab; id += Threads) {
+        const float x = values[id];
+        if (isfinite(x)) { minimum = fminf(minimum, x); ++count; }
+    }
+    float m = Min(scratch.min).Reduce(minimum, cub::Min());
+    if (threadIdx.x == 0) pivot = m;
+    __syncthreads();
+    int n = Sum(scratch.sum).Sum(count);
+    if (threadIdx.x == 0) retained = n;
+    __syncthreads();
+    if (retained <= k) return;
+    count = 0;
+    for (int id = threadIdx.x; id < vocab; id += Threads) count += values[id] > pivot;
+    n = Sum(scratch.sum).Sum(count);
+    if (threadIdx.x == 0) { needed = k - n; preceding = 0; }
+    __syncthreads();
+    // Rare exact ties only: scan IDs in order, retaining exactly k entries.
+    // This also makes greedy/top_k=1 deterministic without another CPU path.
+    for (int first = 0; first < vocab; first += Threads) {
+        const int id = first + threadIdx.x;
+        const int equal = id < vocab && values[id] == pivot;
+        int before, total;
+        Scan(scratch.scan).ExclusiveSum(equal, before, total);
+        if (equal && preceding + before >= needed) values[id] = -INFINITY;
+        __syncthreads();
+        if (threadIdx.x == 0) preceding += total;
+        __syncthreads();
+    }
+}
+bool PrepareTopKFirstLogits(float *logits, float *filtered, float *temperatures,
+        int *topKs, int batch, int vocab, void *workspace, size_t bytes) {
+    const size_t required = FastllmCudaTopKFirstSamplingWorkspaceBytes(batch);
+    if (!logits || !filtered || !temperatures || !topKs || !workspace ||
+        !required || bytes < required || vocab <= 0) return false;
+    auto *ones = static_cast<float *>(workspace);
+    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(
+        static_cast<uint8_t *>(workspace) + FastllmCudaAlignBytes(size_t(batch) * sizeof(float), 256));
+    cudaStream_t stream = cudaStreamPerThread;
+    ScaleTopKFirstLogits<<<dim3((vocab + 255) / 256, batch), 256, 0, stream>>>(
+        logits, filtered, temperatures, ones, vocab);
+    cudaError_t status = cudaMemsetAsync(states, 0, size_t(batch) * sizeof(*states), stream);
+    if (status == cudaSuccess)
+        status = flashinfer::sampling::RadixTopKMaskLogitsMultiCTA<float, int>(
+            filtered, filtered, topKs, batch, 0, vocab, states, stream);
+    if (status != cudaSuccess) return false;
+    TrimTopKBoundaryTies<<<batch, 256, 0, stream>>>(filtered, topKs, vocab);
+    return cudaGetLastError() == cudaSuccess;
+}
+}
+
+static bool FastllmCudaTopKTopPSamplingImpl(
                                   float *logits, float *temperatures,
                                   int *topKArr, float *topPArr,
                                   int *output,
@@ -16469,7 +16548,8 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   int *typicalRecoveredIds,
                                   int typicalCount,
                                   float typicalPosteriorThreshold,
-                                  float typicalPosteriorAlpha) {
+                                  float typicalPosteriorAlpha, bool topKFirst) {
+    if (topKFirst && typicalCount > 0) return false;
     size_t probsBytes = (size_t)batch * vocabSize * sizeof(float);
     int actualTypicalCount = typicalCandidateIds != nullptr &&
                              typicalAccepted != nullptr &&
@@ -16490,6 +16570,9 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                         actualTypicalCount * (sizeof(int) + sizeof(int) + sizeof(int) +
                                               sizeof(unsigned char)) +
                         batch * sizeof(bool);
+    const size_t topKWorkspaceBytes = topKFirst ? FastllmCudaTopKFirstSamplingWorkspaceBytes(batch) : 0;
+    const size_t topKWorkspaceOffset = FastllmCudaAlignBytes(paramBytes, 256);
+    if (topKFirst) paramBytes = topKWorkspaceOffset + topKWorkspaceBytes;
     size_t alignedProbsBytes = FastllmCudaAlignBytes(probsBytes, 256);
     size_t alignedParamBytes = FastllmCudaAlignBytes(paramBytes, 256);
     size_t scratchBytes = 0;
@@ -16542,7 +16625,16 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
         }
     }
 
-    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(logits, cudaProbs, cudaTemperatures, vocabSize);
+    if (topKFirst) {
+        if (!PrepareTopKFirstLogits(logits, cudaProbs, cudaTemperatures, cudaTopKArr,
+                batch, vocabSize, cudaParamBuf + topKWorkspaceOffset, topKWorkspaceBytes)) {
+            FastllmReleaseDequantScratch(scratch, scratchOwn);
+            return false;
+        }
+        FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(cudaProbs, cudaProbs, nullptr, vocabSize);
+    } else {
+        FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(logits, cudaProbs, cudaTemperatures, vocabSize);
+    }
     if (actualTypicalCount > 0) {
         FastllmTypicalAcceptanceKernel<1024><<<actualTypicalCount, 1024>>>(
             cudaProbs, cudaTypicalCandidates, cudaTypicalRows,
@@ -16583,6 +16675,22 @@ bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
 
     FastllmReleaseDequantScratch(scratch, scratchOwn);
     return true;
+}
+
+bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
+        float *logits, float *temperatures, int *topKArr, float *topPArr, int *output,
+        int batch, int vocabSize, const int *typicalCandidateIds, const int *typicalCandidateRows,
+        unsigned char *typicalAccepted, int *typicalRecoveredIds, int typicalCount,
+        float typicalPosteriorThreshold, float typicalPosteriorAlpha) {
+    return FastllmCudaTopKTopPSamplingImpl(logits, temperatures, topKArr, topPArr, output,
+        batch, vocabSize, typicalCandidateIds, typicalCandidateRows, typicalAccepted,
+        typicalRecoveredIds, typicalCount, typicalPosteriorThreshold, typicalPosteriorAlpha, false);
+}
+
+bool FastllmCudaTopKFirstSampling(float *logits, float *temperatures,
+        int *topKs, float *topPs, int *output, int batch, int vocab) {
+    return FastllmCudaTopKTopPSamplingImpl(logits, temperatures, topKs, topPs, output,
+        batch, vocab, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, true);
 }
 
 __global__ void FastllmDFlashScatterDraftProbsKernel(
@@ -17872,6 +17980,25 @@ bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
         return false;
     }
     return true;
+}
+
+bool FastllmCudaTopKFirstSamplingToDeviceWithRng(
+        float *logits, float *probs, float *temperatures, int *topKs, float *topPs,
+        int *penaltyIds, float *penaltyFactors, int penaltyTokens,
+        int *output, float *floatOutput, int batch, int vocab,
+        uint64_t *requestSeeds, uint64_t *requestOffsets, void *workspace, size_t workspaceBytes) {
+    if (!logits || !probs || !temperatures || !topKs || !topPs || !output || !floatOutput ||
+        batch <= 0 || vocab <= 0 || penaltyTokens < 0 || bool(requestSeeds) != bool(requestOffsets) ||
+        (penaltyTokens && (!penaltyIds || !penaltyFactors)) || !workspace ||
+        workspaceBytes < FastllmCudaTopKFirstSamplingWorkspaceBytes(batch)) return false;
+    if (penaltyTokens)
+        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
+            logits, penaltyIds, penaltyFactors, penaltyTokens, vocab);
+    if (!PrepareTopKFirstLogits(logits, probs, temperatures, topKs, batch, vocab,
+                               workspace, workspaceBytes)) return false;
+    return FastllmCudaTopKTopPSamplingToDeviceWithRng(probs, probs, static_cast<float *>(workspace),
+        topKs, topPs, nullptr, nullptr, 0, output, floatOutput, batch, vocab,
+        requestSeeds, requestOffsets);
 }
 
 bool FastllmCudaTopKTopPSamplingToDevice(float *logits, float *probs,
