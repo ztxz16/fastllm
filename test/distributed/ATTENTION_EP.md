@@ -320,6 +320,39 @@ cmake --build "$ATTENTION_EP_BUILD" --target fastllm_process_tp_package -j 4
 构建缓存、硬件信息和四格式汇总。零容差阶段FAIL表示定位到数值差异；原有生成、numeric与
 性能验收结论不变。异常或中断仍保存部分报告并返回非零。
 
+若首个差异已经定位到`layer_0_moe`，使用下一步内部诊断：
+
+```bash
+cmake --build "$ATTENTION_EP_BUILD" --target fastllm_process_tp_package -j 4
+"$ATTENTION_EP_PYTHON" test/distributed/probe_qwen_moe_block_batches.py \
+  --build "$ATTENTION_EP_BUILD" --model "$ATTENTION_EP_MODEL" \
+  --baseline /绝对路径/时间戳_moe_prefill_batches_随机号
+```
+
+基准必须是已完成、归因有效且rank 0/1首个差异都在第0层MoE的完整逐层报告。
+入口检查模型config/index及历史快照SHA256，沿用原Prompt、capacity、采样和正式
+Eager/Prefix-off路径。两请求和四请求各做一次Prefill warmup与一次正式采集，
+每次End并核验KV释放，不执行后续Decode、HF对齐或性能测试。
+
+只向本次子进程设置`FASTLLM_MOE_BLOCK_TRACE_DIR`，与完整逐层快照互斥。
+观察器在第0层原有路由计数同步后，按实际专家行数预建空间；GPU快照最多256 MiB，
+仍计入原512 MiB总工作区预算。之后只在原stream追加D2D复制，最终统一读回；
+不更换GEMM、路由、累加精度、NCCL调用或同步位置。含warmup共16份rank快照，
+实际文件量取决于路由行数，可能达到数GiB；使用独立结果目录，不覆盖旧基准。
+
+四个rank都记录内部张量：无本地请求的rank也负责自己的专家，不能省略。阶段包含
+输入、归一化、router logits、专家ID/权重、全组AllGather、每专家实际槽位索引、
+Pack、Gate/Up、激活、Down、ReduceScatter后的逐槽贡献、有序累加、共享专家及
+最终输出。原始FP16/FP32/int32值按连续小端二进制保存；warmup和正式快照均校验
+布局、完整性和有限值，正式轮次还检查跨rank通信、padding、专家计数及Pack槽位。
+
+必须先通过18项精确重放：6个活动请求的完整logits/采样Token、第0层输入和输出。
+失败时`trace_attribution_valid=false`，拒绝将观察器造成的输出变化用于原问题归因。
+通过后按相同请求/Token/路由槽位配对专家矩阵；记录两边完整矩阵行数，但只比较
+共同请求对应的行。路由ID不同则停止专家内部配对，保留最早路由差异，不误比不同专家。
+最终报告`first_different_stage`与每个专家的首个差异，并保存JSON/Markdown/CSV/XLSX。
+零容差FAIL表示观测到差异，不等于已证明算子错误；该诊断不自动放宽原验收标准。
+
 ### 四项联合验收
 
 `real-all`等价于真实模型入口的`--alignment-policy all`。固定比较exact、K=5/容差0、

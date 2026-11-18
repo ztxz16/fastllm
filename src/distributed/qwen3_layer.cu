@@ -3,6 +3,7 @@
 #include "process_protocol.h"
 #include "qwen_moe_qkv.cuh"
 #include "qwen_moe_trace.cuh"
+#include "qwen_moe_block_trace.cuh"
 
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
@@ -277,6 +278,9 @@ struct Qwen3LayerExecutor::Impl {
     std::string forwardTraceDirectory;
     std::unique_ptr<detail::MoeForwardTrace> forwardTrace;
     uint64_t forwardTraceRound = 0;
+    std::string blockTraceDirectory;
+    std::unique_ptr<detail::MoeBlockTrace> blockTrace;
+    uint64_t blockTraceRound = 0;
     std::vector<void*> buffers;
     size_t allocated = 0;
     std::vector<half*> kvCache; // MoE保留原有连续缓存。
@@ -668,10 +672,12 @@ struct Qwen3LayerExecutor::Impl {
      * @param x FP16 [tokens,hidden] 隐藏状态，原地加残差。
      * @param prepared 可空的预分配空间；单层诊断为空时分配临时空间。
      * @param meta 可空的设备 [past,position,active]，用于 Graph 动态路由。
+     * @param traceBlock 仅正式Eager Prefill第0层采集内部张量；不改变计算或通信。
      * @return 工作区视图；CUDA/NCCL 失败须退出 worker。
      */
     MoeWorkspace RunMoe(uint32_t layer, int tokens, int capacity, half *x,
-                        const MoeWorkspace *prepared = nullptr, const uint32_t *meta = nullptr) {
+                        const MoeWorkspace *prepared = nullptr, const uint32_t *meta = nullptr,
+                        bool traceBlock = false) {
         const auto &p = weights.Plan();
         const int h = p.hiddenSize, e = p.expertCount, k = p.expertsPerToken;
         const int m = p.intermediateCount, sharedWidth = p.sharedIntermediateSize;
@@ -705,6 +711,25 @@ struct Qwen3LayerExecutor::Impl {
             Cuda(cudaMemcpyAsync(hostCounts.data(), counts, e * sizeof(int), cudaMemcpyDeviceToHost, stream));
             Synchronize();
         }
+        detail::MoeBlockTrace *trace = nullptr;
+        if (traceBlock) {
+            if (layer != 0 || meta || capacity <= 1 || blockTraceDirectory.empty())
+                throw std::runtime_error("MoE block trace requires layer zero Eager Prefill");
+            blockTrace.reset(new detail::MoeBlockTrace(blockTraceDirectory, tokens, capacity, h, m,
+                sharedWidth, e, k, p.rank, p.worldSize, hostCounts));
+            blockTrace->Attach(Allocate(blockTrace->Bytes()));
+            trace = blockTrace.get();
+            if (tokens) trace->Capture("input", x, stream);
+            trace->Capture("norm", norm, stream);
+            trace->Capture("router_logits", logits, stream);
+            trace->Capture("selected_experts", ids, stream);
+            trace->Capture("routing_weights", prob, stream);
+            trace->Capture("gathered_norm", gathered, stream);
+            trace->Capture("gathered_experts", allIds, stream);
+            trace->Capture("gathered_weights", allProb, stream);
+            trace->Capture("expert_counts", counts, stream);
+        }
+
         for (int expert = p.rank; expert < e; expert += p.worldSize) {
             std::string name = prefix + "mlp.experts." + std::to_string(expert) + ".";
             auto gate = Weight(name + "gateup_proj.weight", {uint64_t(2*m), p.hiddenSize});
@@ -715,26 +740,40 @@ struct Qwen3LayerExecutor::Impl {
             } else if (hostCounts[expert]) {
                 int count = hostCounts[expert];
                 const int *indices = map + expert * rows;
+                const std::string entry = trace ? "expert_" + std::to_string(expert) + "_" : "";
+                if (trace) trace->Capture(entry + "indices", indices, stream);
                 moe::Pack<<<(count*h+255)/256,256,0,stream>>>(gathered, indices, packed, count, h, k);
+                if (trace) trace->Capture(entry + "packed", packed, stream);
                 Linear(packed, gate, gateup, count, 2*m, h, false);
+                if (trace) trace->Capture(entry + "gateup", gateup, stream);
                 Swiglu<<<(count*m+255)/256,256,0,stream>>>(gateup, activated, count*m, m);
+                if (trace) trace->Capture(entry + "activated", activated, stream);
                 Linear(activated, down, expertOutput, count, h, m, false);
+                if (trace) trace->Capture(entry + "down", expertOutput, stream);
                 moe::Scatter<<<(count*h+255)/256,256,0,stream>>>(expertOutput, indices, allProb, contributions, count, h);
             }
         }
         // 每槽位仅一个 rank 写入有效值，通信不进行跨专家的浮点求和。
         Nccl(ncclReduceScatter(contributions, localContributions, size_t(capacity) * k * h,
                                ncclHalf, ncclSum, comm, stream));
+        if (trace) trace->Capture("local_contributions", localContributions, stream);
         moe::OrderedSum<<<capacity,256,0,stream>>>(localContributions, ids, routed, h, k);
+        if (trace) trace->Capture("routed", routed, stream);
         if (tokens) {
             std::string name = prefix + "mlp.shared_expert.";
             Linear(norm, Weight(name + "gateup_proj.weight", {uint64_t(2*sharedWidth), p.hiddenSize}),
                 gateup, tokens, 2*sharedWidth, h, false);
+            if (trace) trace->Capture("shared_gateup", gateup, stream);
             Swiglu<<<(tokens*sharedWidth+255)/256,256,0,stream>>>(gateup, activated, tokens*sharedWidth, sharedWidth);
+            if (trace) trace->Capture("shared_activated", activated, stream);
             Linear(activated, Weight(name + "down_proj.weight", {p.hiddenSize, uint64_t(sharedWidth)}),
                 shared, tokens, h, sharedWidth, false);
+            if (trace) trace->Capture("shared_down", shared, stream);
             Linear(norm, Weight(prefix + "mlp.shared_expert_gate.weight", {1, p.hiddenSize}), sharedGate, tokens, 1, h, false);
+            if (trace) trace->Capture("shared_gate", sharedGate, stream);
             moe::Finish<<<(tokens*h+255)/256,256,0,stream>>>(x, sharedGate, shared, routed, tokens*h, h, prob, k);
+            if (trace) trace->Capture("shared_weighted", shared, stream);
+            if (trace) trace->Capture("output", x, stream);
         }
         Cuda(cudaGetLastError());
         return w;
@@ -839,7 +878,7 @@ struct Qwen3LayerExecutor::Impl {
         for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
             if (t) RunLayer(layer, t, position, Qwen3LayerStage::Attention, x, attention, true, meta);
             if (trace) trace->Capture(x, size_t(t)*h, stream);
-            RunMoe(layer, t, capacity, x, &experts, meta);
+            RunMoe(layer, t, capacity, x, &experts, meta, layer == 0 && !blockTraceDirectory.empty());
             if (trace) trace->Capture(x, size_t(t)*h, stream);
         }
         if (t) {
@@ -937,6 +976,7 @@ struct Qwen3LayerExecutor::Impl {
     void ReleaseBuffers() {
         Cuda(cudaStreamSynchronize(stream));
         forwardTrace.reset();
+        blockTrace.reset();
         qkvPlans.clear();
         for (auto &buffer : buffers) {
             Cuda(cudaFree(buffer));
@@ -966,6 +1006,15 @@ Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaSt
                 throw std::runtime_error("MoE forward trace requires Eager with Prefix disabled");
             }
             impl->forwardTraceDirectory = trace;
+        }
+    }
+    if (const char *trace = std::getenv("FASTLLM_MOE_BLOCK_TRACE_DIR")) {
+        if (*trace) {
+            if (weights.Plan().model != ShardModel::Qwen2Moe || cudaGraph || prefixCache ||
+                !impl->forwardTraceDirectory.empty()) {
+                throw std::runtime_error("MoE block trace requires Eager, no Prefix and no forward trace");
+            }
+            impl->blockTraceDirectory = trace;
         }
     }
     Blas(cublasCreate(&impl->blas));
@@ -1263,7 +1312,8 @@ std::vector<float> Qwen3LayerExecutor::StepMoe(const QwenMoeStep &step, bool gra
     const auto &p = r.weights.Plan();
     const bool begin = step.action == QwenMoeAction::Begin;
     const bool decode = step.action == QwenMoeAction::Decode;
-    if (!r.forwardTraceDirectory.empty() && (decode || graph || (begin && step.positionBegin != 0))) {
+    if ((!r.forwardTraceDirectory.empty() || !r.blockTraceDirectory.empty()) &&
+        (decode || graph || (begin && step.positionBegin != 0))) {
         throw std::runtime_error("MoE forward trace supports only fresh Eager Begin at position zero");
     }
     if (p.model != ShardModel::Qwen2Moe || uint32_t(step.action) > 3 ||
@@ -1372,8 +1422,10 @@ std::vector<float> Qwen3LayerExecutor::StepMoe(const QwenMoeStep &step, bool gra
         r.EnqueueMoe(input, x, attention, experts, logits, local, capacity, position, nullptr, r.forwardTrace.get());
         if (local) Cuda(cudaMemcpyAsync(result.data(), logits, result.size() * sizeof(float), cudaMemcpyDeviceToHost, r.stream));
         if (r.forwardTrace) r.forwardTrace->Readback(r.stream);
+        if (r.blockTrace) r.blockTrace->Readback(r.stream);
         r.Synchronize();
         if (r.forwardTrace) r.forwardTrace->Save(++r.forwardTraceRound);
+        if (r.blockTrace) r.blockTrace->Save(++r.blockTraceRound);
         r.ReleaseBuffers();
         if (decode) ++r.graphInfo.eagerDecodes;
     }
