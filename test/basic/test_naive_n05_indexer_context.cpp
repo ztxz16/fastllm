@@ -128,7 +128,10 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         Cuda(cudaMemcpy(bindings[rank].cudaData, table, sizeof(table), cudaMemcpyHostToDevice));
     }
     Data candidates;
-    Device(candidates, INT32, {ranks * batch * 4096});
+    const int directWidth = !verifyBlock && batch < 16
+        ? std::min(2048, ((capacity + page - 1) / page) * (page / ranks)) : 0;
+    // The same tensor shape also exercises legacy verification with a full-width exchange.
+    Device(candidates, INT32, {ranks, batch, directWidth ? directWidth : 2048, 2});
     for (int rank = 0; rank < ranks; rank++) {
         scratch[rank].resize(batch);
         localIndices[rank].resize(batch);
@@ -166,9 +169,9 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         }
         for (int rank = 0; rank < ranks; rank++)
             Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, localRows[rank], true, rank, ranks,
-                                                       &candidates, page),
+                                                       &candidates, page, directWidth),
                     "context dispatch");
-        FastllmCudaNaiveMergeDecodeIndexer(live, merged, candidates, ranks, page);
+        FastllmCudaNaiveMergeDecodeIndexer(live, merged, candidates, ranks, page, directWidth);
     };
     Graph captured;
     if (graph)
@@ -413,6 +416,11 @@ int main(int argc, char **argv) {
                         ContextCase(n, page, ranks, 4, kind, false, true);
                     ContextCase(32769, page, ranks, 16, kind, true, true);
                 }
+        // Equal scores must keep logical token order across interleaved shards.
+        for (int ranks : {2, 4, 6, 8})
+            for (int capacity : {129, 4097, 32769})
+                ContextCase(capacity, 96, ranks, 1, 1, true, true);
+        ContextCase(32769, 96, 6, 3, 1, false, true);
         // Cross common batch sizes and the large-batch descriptor grouping.
         for (int batch : {15, 16, 17, 31, 32, 33, 63, 64, 65, 129, 256, 384})
             ContextCase(8193, 128, 4, batch, 1, false, true);

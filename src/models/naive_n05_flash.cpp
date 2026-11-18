@@ -47,9 +47,9 @@ namespace {
 #ifdef USE_CUDA
     using IndexerGather = std::function<void(const void *, void *, size_t)>;
     void GatherContextCandidates(Data &exchange, int part, int rank, int ranks, int gpu,
-            const IndexerGather &gather = {}) {
+            const IndexerGather &gather, int rowWords = 4096) {
         if (gather) { gather((int *)exchange.cudaData + rank * part, exchange.cudaData, part); return; }
-        if (!FastllmCudaCustomAllGatherRows(exchange.cudaData, ranks * part, 4096, FLOAT32, gpu))
+        if (!FastllmCudaCustomAllGatherRows(exchange.cudaData, ranks * part, rowWords, FLOAT32, gpu))
             AssertInFastLLM(FastllmNcclAllGather((int *)exchange.cudaData + rank * part,
                 exchange.cudaData, part, INT32, gpu), "Indexer context all-gather failed.");
     }
@@ -69,15 +69,24 @@ namespace {
     void RunContextDecodeIndexer(const Data &query, const Data &weights, const Data &live,
             const std::vector<FastllmNaiveIndexerRow> &rows, Data &exchange,
             int rank, int ranks, int page, int gpu, bool fp8Query, const IndexerGather &gather = {}) {
-        const int part = rows.size() * 2048 * 2;
+        // A graph replays different live lengths within this capacity. Size the
+        // dedicated exchange for the largest possible shard on any rank.
+        int directWidth = 0;
+        if (!rows.empty() && rows.size() < 16) {
+            int capacity = 0;
+            for (const auto &row : rows) capacity = std::max(capacity, row.capacity);
+            directWidth = std::min(2048, ((capacity + page - 1) / page) * (page / ranks));
+        }
+        const int rowWords = (directWidth ? directWidth : 2048) * 2;
+        const int part = rows.size() * rowWords;
         exchange.dataType = INT32;
         exchange.Resize({ranks * part});
         exchange.ToDevice(query.dataDevice, query.dataDeviceIds, false);
         exchange.Allocate(false);
         AssertInFastLLM(FastllmCudaNaiveBatchDecodeIndexer(query, weights, live, rows, fp8Query,
-            rank, ranks, &exchange, page), "Unsupported context-sharded decode Indexer layout.");
-        GatherContextCandidates(exchange, part, rank, ranks, gpu, gather);
-        FastllmCudaNaiveMergeDecodeIndexer(live, rows, exchange, ranks, page);
+            rank, ranks, &exchange, page, directWidth), "Unsupported context-sharded decode Indexer layout.");
+        GatherContextCandidates(exchange, part, rank, ranks, gpu, gather, rowWords);
+        FastllmCudaNaiveMergeDecodeIndexer(live, rows, exchange, ranks, page, directWidth);
     }
     // Copy stored KV bits between a request's window and chronological scratch.
     // At most one side wraps; copies are ordered with attention on the rank stream.

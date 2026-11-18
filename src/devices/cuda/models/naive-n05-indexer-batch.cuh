@@ -507,6 +507,99 @@ __global__ void Sort(Batch batch) {
             row.indices[i] = i < n ? row.Position<Merge>(i, width) : -1;
     } else naive_topk::SortRow(&row.workspace->candidates, &row.workspace->state, row.indices);
 }
+// Sort a bounded shard or tile directly. For larger shards the threshold
+// selector supplies the candidates. Equal scores retain logical token order.
+template<int Items, bool Tiled = false>
+__global__ void SortContextPairs(Batch batch, uint2 *out, int width) {
+    const Row &r = batch.rows[Tiled ? blockIdx.y : blockIdx.x];
+    const int n = r.Count();
+    const int first = Tiled ? blockIdx.x * width : 0;
+    if constexpr (Tiled) out = reinterpret_cast<uint2 *>(r.workspace->partials) + first;
+    else out += (size_t)blockIdx.x * width;
+    if constexpr (Items > 0) {
+        constexpr int threads = 128;
+        using Sort = cub::BlockRadixSort<unsigned, threads, Items, int>;
+        __shared__ typename Sort::TempStorage storage;
+        unsigned bits[Items];
+        int positions[Items];
+#pragma unroll
+        for (int j = 0; j < Items; ++j) {
+            const int i = first + threadIdx.x * Items + j;
+            bits[j] = i < n ? r.scores[i] : 0;
+            positions[j] = i < n ? r.LogicalPosition(i) : -1;
+        }
+        Sort(storage).SortDescendingBlockedToStriped(bits, positions);
+#pragma unroll
+        for (int j = 0; j < Items; ++j) {
+            const int i = threadIdx.x + j * threads;
+            if (i < width) out[i] = make_uint2(bits[j], positions[j]);
+        }
+    } else {
+        naive_topk::SortRow(&r.workspace->candidates, &r.workspace->state, r.indices);
+        __syncthreads();
+        for (int i = threadIdx.x; i < width; i += blockDim.x) {
+            const int pos = r.indices[i];
+            out[i] = pos < 0 ? make_uint2(0, ~0u) : make_uint2(r.scores[pos], r.LogicalPosition(pos));
+        }
+    }
+}
+
+// Insertion rank in a list ordered by descending score, then ascending token position.
+__device__ __forceinline__ int ContextInsertionRank(const unsigned *pairs, int count, uint2 key) {
+    int first = 0;
+    while (first < count) {
+        const int mid = (first + count) / 2;
+        const unsigned score = pairs[2 * mid];
+        const unsigned position = pairs[2 * mid + 1];
+        if (score > key.x || (score == key.x && position < key.y)) first = mid + 1;
+        else count = mid;
+    }
+    return first;
+}
+
+// Lanes in a subgroup search different sorted shards or tiles for the same key.
+// Summing their insertion positions gives the exact global rank, including ties.
+template<int Ranks, bool Tiled = false>
+__global__ void MergeContextPairs(Batch batch, int width, uint2 *out) {
+    const Row &r = batch.rows[blockIdx.y];
+    const uint2 *lists;
+    size_t stride;
+    int live;
+    if constexpr (Tiled) {
+        live = r.LocalCount(r.cpRank);
+        lists = reinterpret_cast<const uint2 *>(r.workspace->partials);
+        stride = width;
+        out += (size_t)blockIdx.y * naive_topk::kTopK;
+    } else {
+        live = *r.live;
+        lists = reinterpret_cast<const uint2 *>(r.merged) + (size_t)r.mergedRow * width;
+        stride = (size_t)r.mergedRows * width;
+    }
+    auto count = [&](int rank) {
+        if constexpr (Tiled) return min(width, max(0, live - rank * width));
+        else return min(width, r.LocalCount(rank));
+    };
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int slot = t / Ranks, owner = slot / width, i = slot % width;
+    const int peer = threadIdx.x % Ranks;
+    for (int j = live + t; j < naive_topk::kTopK; j += blockDim.x * gridDim.x) {
+        if constexpr (Tiled) out[j] = make_uint2(0, ~0u);
+        else r.indices[j] = -1;
+    }
+    const bool valid = owner < Ranks && i < count(owner);
+    const unsigned mask = __ballot_sync(0xffffffffu, valid);
+    if (!valid) return;
+    const uint2 key = lists[owner * stride + i];
+    const uint2 *list = lists + peer * stride;
+    int rank = peer == owner ? i : ContextInsertionRank(reinterpret_cast<const unsigned *>(list), count(peer), key);
+    for (int offset = Ranks / 2; offset; offset /= 2)
+        rank += __shfl_down_sync(mask, rank, offset, Ranks);
+    if (peer == 0 && rank < naive_topk::kTopK) {
+        if constexpr (Tiled) out[rank] = key;
+        else r.indices[rank] = key.y;
+    }
+}
+
 // Preserve the selected scores before the shared score arena is reused for
 // exchange. No KV copies or additional per-request score allocations.
 __global__ void PackLocal(Batch batch) {
@@ -538,27 +631,20 @@ __global__ void ClearContextIndices(Batch batch) {
 // Every local list is sorted by (score descending, logical position ascending).
 // Binary-search the other lists to obtain each candidate's exact global rank.
 // The unique logical position breaks ties across interleaved context shards.
-__global__ void MergeContextCandidates(Batch batch) {
+__global__ void MergeContextCandidates(Batch batch, int width) {
     const Row &r = batch.rows[blockIdx.y];
     constexpr int K = naive_topk::kTopK;
-    int i = blockIdx.x * blockDim.x + threadIdx.x, owner = i / K, local = i % K;
+    int i = blockIdx.x * blockDim.x + threadIdx.x, owner = i / width, local = i % width;
     if (owner >= r.cpRanks || local >= min(K, r.LocalCount(owner))) return;
-    const unsigned *source = r.merged + ((size_t)owner * r.mergedRows + r.mergedRow) * K * 2;
-    unsigned score = source[local * 2]; int position = source[local * 2 + 1];
+    const unsigned *source = r.merged + ((size_t)owner * r.mergedRows + r.mergedRow) * width * 2;
+    const uint2 key = make_uint2(source[2 * local], source[2 * local + 1]);
     int global = local;
     for (int peer = 0; peer < r.cpRanks; ++peer) if (peer != owner) {
-        const unsigned *list = r.merged + ((size_t)peer * r.mergedRows + r.mergedRow) * K * 2;
-        int lo = 0, hi = min(K, r.LocalCount(peer));
-        while (lo < hi) {
-            int mid = (lo + hi) / 2; unsigned other = list[mid * 2];
-            int otherPosition = list[mid * 2 + 1];
-            if (other > score || (other == score && otherPosition < position)) lo = mid + 1;
-            else hi = mid;
-        }
-        global += lo;
+        const unsigned *list = r.merged + ((size_t)peer * r.mergedRows + r.mergedRow) * width * 2;
+        global += ContextInsertionRank(list, min(width, r.LocalCount(peer)), key);
         if (global >= K) return;
     }
-    r.indices[global] = position;
+    r.indices[global] = key.y;
 }
 
 } // namespace naive_indexer_batch

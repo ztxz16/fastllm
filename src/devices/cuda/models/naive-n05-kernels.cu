@@ -4888,7 +4888,15 @@ static bool ScalarBatchDecodeIndexer(const fastllm::Data &query, const fastllm::
 bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &liveKeys,
         const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
-    int contextRank, int contextRanks, fastllm::Data *exchange, int contextPageLen) {
+        int contextRank, int contextRanks, fastllm::Data *exchange, int contextPageLen) {
+    return FastllmCudaNaiveBatchDecodeIndexer(query, weights, liveKeys, rows, fp8Query,
+        contextRank, contextRanks, exchange, contextPageLen, 0);
+}
+
+bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
+        const fastllm::Data &weights, const fastllm::Data &liveKeys,
+        const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
+        int contextRank, int contextRanks, fastllm::Data *exchange, int contextPageLen, int directWidth) {
 #ifdef FASTLLM_NAIVE_BATCH_INDEXER
 #ifdef FASTLLM_NAIVE_DSA_MMA
     if (!fp8Query || !FastllmCudaFlashInferDataTypeSupported(fastllm::BFLOAT16))
@@ -4908,12 +4916,18 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         weights.dims.empty() || weights.dims.back() != heads) return false;
     const bool cp = contextRanks > 1;
     if (contextPageLen && (!cp || contextPageLen < contextRanks || contextPageLen % contextRanks)) return false;
+    const bool direct = directWidth != 0;
+    const int width = direct ? directWidth : naive_topk::kTopK;
+    if (direct && (!contextPageLen || rows.size() >= 16 || width < 1 || width > naive_topk::kTopK)) return false;
     if (contextRanks < 1 || contextRank < 0 || contextRank >= contextRanks ||
         (cp && (!exchange || exchange->dataType != INT32 ||
-         exchange->Count(0) < (size_t)contextRanks * rows.size() * naive_topk::kTopK * 2))) return false;
+         exchange->Count(0) < (size_t)contextRanks * rows.size() * width * 2))) return false;
     std::vector<batch::Batch> packedBatches;
     std::vector<int> packedStarts;
-    if (cp) packedBatches.reserve((rows.size() + batch::BatchLimit - 1) / batch::BatchLimit);
+    if (cp && !direct) packedBatches.reserve((rows.size() + batch::BatchLimit - 1) / batch::BatchLimit);
+    auto pagedShardCapacity = [&](int capacity) {
+        return ((capacity + contextPageLen - 1) / contextPageLen) * (contextPageLen / contextRanks);
+    };
     bool hopper = FastllmCudaRuntimeArch() == 90;
     const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
     for (const auto &row : rows) {
@@ -4925,6 +4939,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             row.sequence < 0 || row.sequence >= liveKeys.Count(0) ||
             (size_t)(row.sequence + 1) * heads * dim > query.Count(0) ||
             (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
+        if (direct && width < std::min(naive_topk::kTopK, pagedShardCapacity(row.capacity))) return false;
         // cp.async copies 16 bytes; FP8 therefore needs twice as many elements.
         hopper = hopper && row.key->dataType == cacheType &&
             row.key->kvCacheFp8Indexer == rows.front().key->kvCacheFp8Indexer &&
@@ -4983,8 +4998,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             }
             capacity = std::max(capacity, rows[i].capacity);
         }
-        capacity = ((capacity + contextPageLen - 1) / contextPageLen) *
-            (contextPageLen / contextRanks);
+        capacity = pagedShardCapacity(capacity);
         compact::QuantizeCompact<<<dim3(heads, rows.size()), dim>>>(
             (const BF16 *)query.cudaData, descriptors);
         const int blocks = DecodeIndexerScoreBlocks(rows.size(),
@@ -5005,8 +5019,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     // pointers per row. Keep its batch size independent of score chunking.
     int localCapacity = 0;
     for (const auto &row : rows) localCapacity = std::max(localCapacity, row.capacity);
-    if (contextPageLen) localCapacity = ((localCapacity + contextPageLen - 1) / contextPageLen) *
-        (contextPageLen / contextRanks);
+    if (contextPageLen) localCapacity = pagedShardCapacity(localCapacity);
     constexpr size_t localSortBytes = naive_indexer_sortpack::SortBytes<256, 5, true>();
     const bool compactTopK = hopper && contextRanks == 4 && contextPageLen && rows.size() >= 128 &&
         localCapacity > 16384 && localCapacity <= 65536 &&
@@ -5076,7 +5089,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
 #endif
             capacity = std::max(capacity, row.capacity);
         }
-        if (contextPageLen) capacity = ((capacity + contextPageLen - 1) / contextPageLen) * (contextPageLen / contextRanks);
+        if (contextPageLen) capacity = pagedShardCapacity(capacity);
         else if (cp) capacity = ((capacity + contextRanks * 64 - 1) / (contextRanks * 64)) * 64;
         if (!compactScores) {
             batch::Quantize<<<dim3(heads, count), dim>>>((const BF16 *)query.cudaData, descriptors);
@@ -5113,6 +5126,27 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             continue;
         }
 #endif
+        uint2 *pairs = direct ? (uint2 *)exchange->cudaData + ((size_t)contextRank * rows.size() + first) * width : nullptr;
+        if (direct && capacity <= naive_topk::kTopK) {
+            auto kernel = capacity <= 512 ? batch::SortContextPairs<4> :
+                          capacity <= 1024 ? batch::SortContextPairs<8> : batch::SortContextPairs<16>;
+            kernel<<<count, 128>>>(descriptors, pairs, width);
+            first += count;
+            continue;
+        }
+        // Sort independent 1K tiles in parallel, then keep the first K across
+        // the tiles. The idle histogram storage holds all intermediate pairs.
+        constexpr int tile = 1024, maxTiles = 8;
+        static_assert(sizeof(naive_topk::Workspace::partials) >= tile * maxTiles * sizeof(uint2));
+        if (direct && capacity <= tile * maxTiles) {
+            const int tiles = (capacity + tile - 1) / tile;
+            batch::SortContextPairs<8, true><<<dim3(tiles, count), 128>>>(descriptors, nullptr, tile);
+            const int lanes = tiles <= 4 ? 4 : 8;
+            auto kernel = tiles <= 4 ? batch::MergeContextPairs<4, true> : batch::MergeContextPairs<8, true>;
+            kernel<<<dim3((tiles * tile * lanes + 255) / 256, count), 256>>>(descriptors, tile, pairs);
+            first += count;
+            continue;
+        }
         // Fuse exact threshold selection and stable sorting. Refining to 2048
         // candidates pays off for short contexts; longer rows keep 4096 slots.
         // CP layouts, long contexts and unsupported images retain their paths.
@@ -5143,6 +5177,11 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             }
             batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
         } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
+        if (direct) {
+            batch::SortContextPairs<0><<<count, naive_topk::kThreads>>>(descriptors, pairs, width);
+            first += count;
+            continue;
+        }
         bool packed = false;
         if (cp && contextRanks == 4 && contextPageLen && hopper && rows.size() >= 16) {
             namespace sortpack = naive_indexer_sortpack;
@@ -5358,6 +5397,12 @@ bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices) {
 void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
         const std::vector<FastllmNaiveIndexerRow> &rows,
         const fastllm::Data &exchange, int contextRanks, int contextPageLen) {
+    FastllmCudaNaiveMergeDecodeIndexer(liveKeys, rows, exchange, contextRanks, contextPageLen, 0);
+}
+
+void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
+        const std::vector<FastllmNaiveIndexerRow> &rows,
+        const fastllm::Data &exchange, int contextRanks, int contextPageLen, int directWidth) {
 #if defined(FASTLLM_NAIVE_DSA_MMA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     namespace batch = naive_indexer_batch;
     // Merge uses only live lengths and output pointers. Compact those fields
@@ -5400,9 +5445,16 @@ void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
             r.mergedRows = rows.size(); r.mergedRow = first + i;
         }
         if (contextPageLen) {
+            const int width = directWidth ? directWidth : naive_topk::kTopK;
             constexpr size_t mergeSharedBytes = 6 * naive_topk::kTopK * sizeof(unsigned long long);
             bool merged = false;
-            if (contextRanks == 4 && count >= 64) {
+            if (directWidth && (contextRanks == 2 || contextRanks == 4 || contextRanks == 8)) {
+                auto kernel = contextRanks == 2 ? batch::MergeContextPairs<2> :
+                              contextRanks == 4 ? batch::MergeContextPairs<4> : batch::MergeContextPairs<8>;
+                const int blocks = (contextRanks * width * contextRanks + 255) / 256;
+                kernel<<<dim3(blocks, count), 256>>>(descriptors, width, nullptr);
+                merged = true;
+            } else if (contextRanks == 4 && count >= 64) {
                 // Locate one interval per thread, then merge four adjacent
                 // keys in the same score/position order. Larger descriptor
                 // batches benefit from more independently active warps.
@@ -5419,7 +5471,7 @@ void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
             }
             if (!merged) {
                 batch::ClearContextIndices<<<count, 256>>>(descriptors);
-                batch::MergeContextCandidates<<<dim3((contextRanks * naive_topk::kTopK + 255) / 256, count), 256>>>(descriptors);
+                batch::MergeContextCandidates<<<dim3((contextRanks * width + 255) / 256, count), 256>>>(descriptors, width);
             }
         } else {
             batch::Select<true><<<count, naive_topk::kThreads>>>(descriptors);

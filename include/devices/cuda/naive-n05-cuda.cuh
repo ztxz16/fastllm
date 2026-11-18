@@ -351,6 +351,12 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     const fastllm::Data &weights, const fastllm::Data &liveKeys,
     const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
     int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr, int contextPageLen = 0);
+// A positive width opts into a dedicated rank-major (score, position) exchange
+// disjoint from score scratch. Zero keeps the existing alias-safe layout.
+bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
+    const fastllm::Data &weights, const fastllm::Data &liveKeys,
+    const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query,
+    int contextRank, int contextRanks, fastllm::Data *exchange, int contextPageLen, int directWidth);
 // Causal blocks from independent requests share the normal decode Indexer.
 // Query offsets address the packed Q/weight/position rows; output stays private.
 struct FastllmNaiveVerifyIndexerItem {
@@ -380,6 +386,9 @@ bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices);
 void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
     const std::vector<FastllmNaiveIndexerRow> &rows, const fastllm::Data &exchange,
     int contextRanks, int contextPageLen = 0);
+void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
+    const std::vector<FastllmNaiveIndexerRow> &rows, const fastllm::Data &exchange,
+    int contextRanks, int contextPageLen, int directWidth);
 void FastllmCudaNaiveContextIndexerWrite(fastllm::Data &cache, const fastllm::Data &input,
     int start, const fastllm::Data *live, int rank, int ranks);
 void FastllmCudaNaiveContextIndexerGather(const fastllm::Data &cache, int keys,
