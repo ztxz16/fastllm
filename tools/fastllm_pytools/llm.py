@@ -3574,6 +3574,24 @@ class model:
         close_output_reader(fastllm_lib, self.model)
         fastllm_lib.release_memory(self.model)
     
+    def configure_host_prefix_cache(self, size_bytes: int = 0, *, kv_bytes=None, swa_bytes=None):
+        if __package__:
+            from .util import prefix_cache_budget
+        else:
+            from util import prefix_cache_budget
+        prefix_cache_budget(size_bytes, kv_bytes, swa_bytes)
+        args = [self.model, size_bytes]
+        if kv_bytes is None and swa_bytes is None:
+            configure = fastllm_lib.configure_host_prefix_cache
+            configure.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        else:
+            configure = fastllm_lib.configure_host_prefix_cache_budgets
+            configure.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_int64, ctypes.c_int64]
+            args.extend(-1 if n is None else n for n in (kv_bytes, swa_bytes))
+        configure.restype = ctypes.c_bool
+        if not configure(*args):
+            raise ValueError("Local FastKV L2 needs a warmed Naive paged GPU model with history enabled")
+
     def set_save_history(self, save: bool):
         if (getattr(self, "kvmem_enabled", False) and save and
                 not fastllm_lib.supports_kvmem_prefix_cache_llm_model(self.model)):

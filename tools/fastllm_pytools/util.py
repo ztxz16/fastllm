@@ -1117,6 +1117,10 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         choices = ['cpu', 'disk', 'cuda'], default = 'cpu',
                         help = 'ngram表存放位置；cpu常驻内存（默认），disk按行读取，cuda为V4.1多卡GPU分片（容量/拓扑不支持时回退CPU）')
     parser.add_argument('--moe_experts', type = int, default = -1, help = 'moe使用的专家数')
+    parser.add_argument("--prefix_cache_l2_bytes", type=int, default=0,
+                        help="Naive 单实例 FastKV CPU 前缀缓存字节预算，0 关闭")
+    parser.add_argument("--prefix_cache_l2_kv_bytes", type=int, help="单实例 L2 的完整 KV、Indexer 和目录预算（字节）")
+    parser.add_argument("--prefix_cache_l2_swa_bytes", type=int, help="单实例 L2 的 SWA 和草稿检查点预算（字节）")
     parser.add_argument("--cache_history", type = str, default = "", help = "缓存历史对话")
     parser.add_argument("--cache_fast", type = str, default = "", help = "是否启用快速缓存（会消耗一定显存）")
     parser.add_argument("--enable_thinking", type = str, default = "", help = "是否开启硬思考开关（需要模型支持）")
@@ -2131,6 +2135,14 @@ def make_normal_llm_model(args, startup_progress = None):
     history_explicit = args.cache_history not in ("", None)
     history_enabled = _arg_enabled(args.cache_history)
     pd_options = json.loads(args.pd) if getattr(args, "pd", "") else None
+    l2_bytes = getattr(args, "prefix_cache_l2_bytes", 0)
+    kv_bytes = getattr(args, "prefix_cache_l2_kv_bytes", None)
+    swa_bytes = getattr(args, "prefix_cache_l2_swa_bytes", None)
+    split_limits = {} if kv_bytes is None and swa_bytes is None else dict(kv_bytes=kv_bytes, swa_bytes=swa_bytes)
+    l2_enabled = prefix_cache_budget(l2_bytes, kv_bytes, swa_bytes) > 0
+    if l2_enabled and (not is_naive_n05_model or pd_options is not None or
+                       (history_explicit and not history_enabled)):
+        raise ValueError("L2 prefix cache requires a standalone Naive model with GPU history enabled")
     _configure_qwen35_auto_fast_paths(args, is_qwen35_model, mtp)
     os.environ["FASTLLM_DSV41_DECODER_SWA_BOUNDED_REPLAY"] = (
         "1" if _arg_enabled(getattr(args, "fast_prefill", False)) else "0")
@@ -2371,6 +2383,8 @@ def make_normal_llm_model(args, startup_progress = None):
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
         model.warmup()
+        if l2_enabled:
+            model.configure_host_prefix_cache(l2_bytes, **split_limits)
         if kernel_policy is not None:
             model.kernel_policy = kernel_policy
             kernel_policy.save()

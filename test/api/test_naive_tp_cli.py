@@ -37,14 +37,43 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 make_normal_llm_model(args)
                 self.native_env = dict(os.environ)
             fake.llm.set_cuda_slab.assert_called_once_with(args.cuda_slab)
+            self.native = fake.llm
             self.loaded_model = fake.llm.model.return_value
             self.model_options = fake.llm.model.call_args.kwargs
             return args
+
+    def test_naive_host_prefix_cache(self):
+        self.configure(['--tp', '8'])
+        self.loaded_model.set_save_history.assert_called_once_with(True)
+        self.loaded_model.configure_host_prefix_cache.assert_not_called()
+        self.native.set_cpu_historycache.assert_not_called()
+        self.configure(['--tp', '8', '--prefix_cache_l2_bytes', '8589934592'])
+        self.loaded_model.configure_host_prefix_cache.assert_called_once_with(8589934592)
+        names = [call[0] for call in self.loaded_model.mock_calls]
+        self.assertLess(names.index('set_save_history'), names.index('warmup'))
+        self.assertLess(names.index('warmup'), names.index('configure_host_prefix_cache'))
+        with self.assertRaisesRegex(ValueError, 'L2|l2'):
+            self.configure(['--tp', '8', '--cache_history', 'false', '--prefix_cache_l2_bytes', '1'])
 
     def test_saved_history_booleans(self):
         for value in (True, False):
             self.configure([], saved=dict(tp='8', cache_history=value))
             self.loaded_model.set_save_history.assert_called_once_with(value)
+        with self.assertRaisesRegex(ValueError, 'L2'):
+            self.configure([], saved=dict(tp='8', cache_history=False, prefix_cache_l2_bytes=4096))
+
+    def test_split_host_prefix_budget(self):
+        self.configure(['--tp', '8', '--prefix_cache_l2_kv_bytes', '8192', '--prefix_cache_l2_swa_bytes', '4096'])
+        self.loaded_model.configure_host_prefix_cache.assert_called_once_with(0, kv_bytes=8192, swa_bytes=4096)
+        self.configure([], saved=dict(tp='8', prefix_cache_l2_bytes=8192, prefix_cache_l2_swa_bytes=0))
+        self.loaded_model.configure_host_prefix_cache.assert_called_once_with(8192, kv_bytes=None, swa_bytes=0)
+        self.configure([], saved=dict(tp='8', cache_history=False, prefix_cache_l2_bytes=8192,
+                                      prefix_cache_l2_swa_bytes=0, prefix_cache_l2_kv_bytes=0))
+        self.loaded_model.configure_host_prefix_cache.assert_not_called()
+        for opts in (['--prefix_cache_l2_swa_bytes', '-1'],
+                     ['--prefix_cache_l2_bytes', '4', '--prefix_cache_l2_kv_bytes', '5']):
+            with self.assertRaisesRegex(ValueError, 'L2'):
+                self.configure(['--tp', '8', *opts])
 
     def test_fp8_compute_cli_and_saved_settings(self):
         self.configure([])

@@ -415,6 +415,7 @@ NaiveN05FlashModel::NaiveN05FlashModel() {
 
 NaiveN05FlashModel::~NaiveN05FlashModel() {
     ShutdownRuntime();
+    hostPrefixCache.reset(); // Drain async readers before retiring the page managers.
     activePrefixes.clear();
     prefixHistory.clear();
     prefixPool.reset();

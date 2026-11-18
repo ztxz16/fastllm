@@ -11,6 +11,7 @@
 #include "utils/persistent_worker_group.h"
 
 struct FastllmCudaMimoEp8Mega;
+namespace fastkv { class HostCache; }
 
 namespace fastllm {
     class CudaWorkspace;
@@ -81,6 +82,8 @@ namespace fastllm {
         void OnResponseContextRemoved(ResponseContext *context) override;
         void OnResponseContextFinished(ResponseContext *context) override;
         bool SetSaveHistoryChat(bool save) override;
+        void ConfigureHostPrefixCache(size_t bytes, int64_t kvBytes = -1, int64_t swaBytes = -1);
+        bool TryRestoreHostPrefix(ResponseContext &context, int gpuTokens, bool &requery) override;
         std::string PDLayout() const override;
         bool SupportsPDKvMemDecode() const override { return true; }
         std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) override;
@@ -224,6 +227,11 @@ namespace fastllm {
         };
         using PrefixSnapshots = std::vector<std::shared_ptr<PrefixSnapshot>>;
         void ReleaseRequestWindowStorage(ResponseContext *context);
+        struct HostPrefixTransfer;
+        size_t hostPrefixBytes = 0;
+        int64_t hostPrefixSwaBytes = -1;
+        std::shared_ptr<fastkv::HostCache> hostPrefixCache;
+        void PublishHostPrefix(ResponseContext &context, const std::shared_ptr<PrefixSnapshot> &snapshot);
         bool RestorePrefixWindow(ResponseContext *context, const std::shared_ptr<PrefixSnapshot> &snapshot) const;
         int TakeHistorySlot(int group);
         void RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &snapshot);

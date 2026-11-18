@@ -1550,7 +1550,7 @@ namespace fastllm {
 
     // Both schedulers restore the same page references and model-specific
     // companion state. Called while scheduling is locked, between forwards.
-    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx) {
+    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx, bool tryHost = true) {
         if ((model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
             ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
         PagedCacheManager *probeManager = nullptr;
@@ -1626,6 +1626,15 @@ namespace fastllm {
                 int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
                 extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
                 minCachedPages = extraCachedLen / probeManager->pageLen;
+            }
+            bool requery = false;
+            if (tryHost && model->TryRestoreHostPrefix(*ctx, minCachedPages * probeManager->pageLen, requery))
+                return probeManager;
+            if (requery) {
+                // Optional L2 staging may have recycled unreferenced GPU pages.
+                // Never apply the directory entries observed before that attempt.
+                ctx->prefillPreview.reset();
+                return RestoreResidentPrefixImpl(model, ctx, false);
             }
             if (minCachedPages > 0) {
                 int cachedLen = minCachedPages * probeManager->pageLen;

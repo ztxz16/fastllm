@@ -642,6 +642,9 @@ namespace fastllm {
         // another request. Output queues remain available to slow consumers.
         virtual void OnResponseContextFinished(ResponseContext *context) {}
 
+        // On a miss, requery is set if staging may have recycled pages in the GPU preview.
+        virtual bool TryRestoreHostPrefix(ResponseContext &, int gpuTokens, bool &requery) { return false; }
+
         // Check admission before touching cached state; reserve only for a selected request.
         virtual bool CanAdmitResponseContext(const ResponseContext *) const { return true; }
         virtual bool TryAdmitResponseContext(ResponseContext *context) { return true; }

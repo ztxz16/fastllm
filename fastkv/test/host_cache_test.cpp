@@ -104,6 +104,15 @@ int main(int argc, char **argv) {
         auto hit = cache.Find("model/layout", {1, 2, 3});
         Check(hit.Tokens() == 2 && hit.Bytes() == 8705, "complete prefix match");
         Equal(a.state, Restore(cache, hit, device));
+        std::vector<Buffer> targets;
+        for (const auto &source : a.state.buffers)
+            targets.push_back(source.Size() ? Buffer::Allocate(source.Size() + 8, device).Slice(4, source.Size()) : Buffer{});
+        std::future<Message> direct;
+        Fails([&] { cache.RestoreIntoAsync(hit, {targets.front()}, direct); });
+        Check(cache.RestoreIntoAsync(hit, targets, direct), "direct restore queue");
+        auto restored = direct.get();
+        Equal(a.state, restored);
+        for (size_t i=0; i<targets.size(); ++i) Check(targets[i].Data()==restored.buffers[i].Data(), "direct target replaced");
         Check(cache.ProbeTokens("other/layout", {1, 2}) == 0, "namespace isolation");
         Check(cache.ProbeTokens("model/layout", {1, 9}) == 0, "token isolation");
         auto b = State(3, device);

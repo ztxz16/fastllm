@@ -800,6 +800,17 @@ extern "C" {
         return;
     }
 
+    DLL_EXPORT bool configure_host_prefix_cache_budgets(int modelId, uint64_t bytes, int64_t kvBytes, int64_t swaBytes) {
+        auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
+        if (!model) return false;
+        try { model->ConfigureHostPrefixCache(bytes, kvBytes, swaBytes); return true; }
+        catch (const std::exception &e) { fprintf(stderr, "FastKV L2: %s\n", e.what()); return false; }
+    }
+
+    DLL_EXPORT bool configure_host_prefix_cache(int modelId, uint64_t bytes) {
+        return configure_host_prefix_cache_budgets(modelId, bytes, -1, -1);
+    }
+
     DLL_EXPORT bool try_set_save_history(int modelId, bool save) {
         return models.GetModel(modelId)->SetSaveHistoryChat(save);
     }

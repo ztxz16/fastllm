@@ -1,6 +1,7 @@
 #include "models/naive_n05_flash.h"
 #include <algorithm>
 #include <climits>
+#include "fastkv/host_cache.h"
 #include "utils/inference_trace.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -9,13 +10,25 @@
 
 namespace fastllm {
 
+static std::shared_ptr<fastkv::HostCache> MakeHostPrefixCache(size_t bytes, int64_t swaBytes) {
+    fastkv::HostCache::Options options;
+    options.bytes = bytes;
+    options.swaBytes = swaBytes;
+    options.inflightBytes = std::min(bytes, options.inflightBytes);
+    return std::make_shared<fastkv::HostCache>(options);
+}
+
 bool NaiveN05FlashModel::SetSaveHistoryChat(bool save) {
     std::lock_guard<std::mutex> contextGuard(dictLocker);
     std::lock_guard<std::mutex> guard(historyMutex);
     if (tpPagedCaches.empty()) reserveWindowHistory = save;
     else if (save && !reserveWindowHistory) return false;
+    if (save && hostPrefixBytes && !hostPrefixCache) {
+        hostPrefixCache = MakeHostPrefixCache(hostPrefixBytes, hostPrefixSwaBytes);
+    }
     saveHistoryChat = save;
     if (!save) {
+        hostPrefixCache.reset();
         prefixHistory.clear();
         if (prefixPool) ++prefixPool->historyVersion;
         activePrefixes.clear();
@@ -425,6 +438,12 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
                                          entry->tokens == snapshot->tokens);
         }), prefixHistory.end());
         prefixHistory.push_back(snapshot);
+        if (hostPrefixCache && (snapshot == active->second.decode ||
+            (!active->second.prefill.empty() && snapshot == active->second.prefill.back()) ||
+            (snapshot->length < context->inputTokens && snapshot->length + GetPageLen() == context->inputTokens))) {
+            try { PublishHostPrefix(*context, snapshot); }
+            catch (const std::exception &e) { fprintf(stderr, "[FastKV L2] optional backup skipped: %s\n", e.what()); }
+        }
     }
     if (verbose) {
         PagedCacheManager::CacheStatistics stats;
@@ -701,3 +720,5 @@ void NaiveN05FlashModel::AddPromptCache(const std::vector<int> &tokens) {
     while (FetchResponseTokens(handle) >= 0) {}
 }
 }
+
+#include "naive_n05_host_prefix.inc"

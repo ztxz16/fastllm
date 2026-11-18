@@ -72,9 +72,14 @@ class HostCache {
     // model lane. The future owns buffers through completion even if dropped.
     bool RestoreAsync(Hit hit, std::vector<int> devices, std::future<Message> &result,
                       std::shared_ptr<Cancellation> cancellation = {});
+    // Targets are private, writable, lifetime-owned spans. Success is published only
+    // after all DMA has completed. A busy return leaves targets untouched.
+    bool RestoreIntoAsync(Hit hit, std::vector<Buffer> targets, std::future<Message> &result);
     Statistics Stats() const;
     void Drain();
   private:
+    bool Restore(Hit hit, std::vector<int> devices, std::vector<Buffer> targets,
+                 std::future<Message> &result, std::shared_ptr<Cancellation> cancellation);
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

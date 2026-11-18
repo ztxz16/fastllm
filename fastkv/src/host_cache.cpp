@@ -535,6 +535,22 @@ bool HostCache::PublishAsync(const std::string &name, std::vector<int> tokens, C
 }
 bool HostCache::RestoreAsync(Hit hit, std::vector<int> devices, std::future<Message> &result,
                              std::shared_ptr<Cancellation> cancellation) {
+    return Restore(std::move(hit), std::move(devices), {}, result, std::move(cancellation));
+}
+bool HostCache::RestoreIntoAsync(Hit hit, std::vector<Buffer> targets, std::future<Message> &result) {
+    Require(bool(hit) && targets.size() == hit.entry->payloads.size(), "FastKV: invalid target count");
+    std::vector<int> devices;
+    devices.reserve(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const size_t bytes = hit.entry->payloads[i].bytes;
+        Require(targets[i].Size() == bytes && (!bytes || targets[i].MutableData()),
+                "FastKV: incomplete restore target");
+        devices.push_back(targets[i].Device());
+    }
+    return Restore(std::move(hit), std::move(devices), std::move(targets), result, {});
+}
+bool HostCache::Restore(Hit hit, std::vector<int> devices, std::vector<Buffer> targets,
+                        std::future<Message> &result, std::shared_ptr<Cancellation> cancellation) {
     Require(bool(hit) && devices.size() == hit.entry->payloads.size(), "FastKV: invalid restore placement");
     Require(!result.valid(), "FastKV: restore future is already in use");
     auto destinationCredit = std::make_shared<std::vector<std::shared_ptr<void>>>();
@@ -553,7 +569,7 @@ bool HostCache::RestoreAsync(Hit hit, std::vector<int> devices, std::future<Mess
     auto promise = std::make_shared<std::promise<Message>>();
     const size_t bytes = hit.Bytes();
     const bool submitted = impl->Enqueue(bytes, true,
-        [p = impl.get(), hit = std::move(hit), devices = std::move(devices), promise, cancellation, destinationCredit](Copier &copier, std::shared_ptr<void> credit) {
+        [p = impl.get(), hit = std::move(hit), devices = std::move(devices), targets = std::move(targets), promise, cancellation, destinationCredit](Copier &copier, std::shared_ptr<void> credit) {
             try {
                 if (cancellation && cancellation->Cancelled()) throw std::runtime_error("FastKV: restore cancelled");
                 Message message{hit.entry->metadata, {}};
@@ -563,7 +579,7 @@ bool HostCache::RestoreAsync(Hit hit, std::vector<int> devices, std::future<Mess
                 Buffer arena; size_t used = 0;
                 for (size_t i = 0; i < devices.size(); ++i) {
                     const auto &payload = hit.entry->payloads[i];
-                    if (arena.Device() != devices[i] || payload.bytes > arena.Size() - used) {
+                    if (targets.empty() && (arena.Device() != devices[i] || payload.bytes > arena.Size() - used)) {
                         size_t capacity = payload.bytes;
                         for (size_t j = i + 1; j < devices.size() && devices[j] == devices[i] && capacity < (64 << 20); ++j) {
                             if (hit.entry->payloads[j].bytes > (64 << 20) - capacity) break;
@@ -575,7 +591,8 @@ bool HostCache::RestoreAsync(Hit hit, std::vector<int> devices, std::future<Mess
                         arena = Buffer::Borrow(owner->buffer.MutableData(), capacity, owner->buffer.Kind(), devices[i], owner);
                         used = 0;
                     }
-                    auto target = arena.Slice(used, payload.bytes); used += payload.bytes;
+                    auto target = targets.empty() ? arena.Slice(used, payload.bytes) : targets[i].WithLease(lease);
+                    if (targets.empty()) used += payload.bytes;
                     for (const auto &region : payload.regions)
                         AddCopy(copies, region.block->data, target.Slice(region.offset, region.block->data.Size()));
                     message.buffers.push_back(target.ReadOnly());

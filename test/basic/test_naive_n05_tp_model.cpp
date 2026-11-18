@@ -205,6 +205,19 @@ struct NaiveN05GraphTestAccess {
         if (state->captured) throw std::runtime_error("DP replay accepted changed Graph bindings");
     }
 
+    static void EvictGpuPrefixes(NaiveN05FlashModel &model) {
+        {
+            std::lock_guard<std::mutex> lock(model.historyMutex);
+            model.prefixHistory.clear();
+            ++model.prefixPool->historyVersion;
+        }
+        for (auto &rank : model.tpPagedCaches) for (auto &pool : rank) if (pool) {
+            std::vector<int> recycled;
+            const int count = pool->FreePageCount();
+            for (int i = 0; i < count; ++i) recycled.push_back(pool->GetUnusedPageIndex(true));
+            pool->ReleasePageIndices(recycled);
+        }
+    }
     static auto &PrefixHistory(NaiveN05FlashModel &model) { return model.prefixHistory; }
     static auto &DraftPrefixPool(NaiveN05FlashModel &model) { return model.prefixPool; }
     static void CheckHeadReturn(const NaiveN05FlashModel &model, const Data &output, bool deviceInput) {
@@ -3065,7 +3078,7 @@ class Fixture : public NaiveN05FlashModel {
                   << " relative=" << largestLogitRelative << std::endl;
     }
 
-    void AttentionDPPrefix(int groups, bool draft, bool sparse = false) {
+    void AttentionDPPrefix(int groups, bool draft, bool sparse = false, bool l2 = false) {
         ConfigureAttentionParallel(groups);
         if (draft) {
             draftEnabled = canDoConcurrentForward = true;
@@ -3080,6 +3093,7 @@ class Fixture : public NaiveN05FlashModel {
             cfg.prefillTokens=128; cfg.hostBytes=1ULL<<30; ConfigureKvMem(cfg);
         }
         SetSaveHistoryChat(true); WarmUp();
+        if (l2) ConfigureHostPrefixCache(0, 192LL << 20, 64LL << 20);
         {
             ResponseContext pending;
             pending.Init(block_cnt, dataType, kvCacheDataType);
@@ -3125,6 +3139,16 @@ class Fixture : public NaiveN05FlashModel {
         auto warm=run(prompts,136);
         if(pagedRestores-before!=groups || lastPrefixLength<256)
             throw std::runtime_error("DP prefix did not restore each owner group");
+        if (l2) {
+            hostPrefixCache->Drain();
+            NaiveN05GraphTestAccess::EvictGpuPrefixes(*this);
+            const auto usage = hostPrefixCache->Stats();
+            if (!usage.kvBytes || usage.kvBytes > (192ULL << 20) || !usage.swaBytes || usage.swaBytes > (64ULL << 20))
+                throw std::runtime_error("DP L2 did not charge both pools");
+            auto beforeL2 = usage.restores;
+            if (run(prompts,136) != warm || hostPrefixCache->Stats().restores-beforeL2 != size_t(groups))
+                throw std::runtime_error("L2 failed to recover evicted GPU state or changed output");
+        }
         SetSaveHistoryChat(false);
         auto cold=run(prompts,136);
         if(warm!=cold) throw std::runtime_error("DP prefix cold/warm token mismatch");
@@ -5361,7 +5385,8 @@ int main(int argc, char **argv) {
             Fixture fixture(ranks, false, true, true, true); fixture.SetKVCacheDataType(FP8_E4M3);
             fixture.AttentionDPPrefix(argc > 3 ? std::stoi(argv[3]) : 2,
                 argc > 4 && std::string(argv[4]) == "draft",
-                argc > 5 && std::string(argv[5]) == "kvmem");
+                argc > 5 && std::string(argv[5]) == "kvmem",
+                argc > 5 && std::string(argv[5]) == "l2");
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_admission") {
