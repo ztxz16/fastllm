@@ -62,13 +62,21 @@ class ProcessDPModel:
                 replica_args.dp_routing = 'round_robin'
                 replica_args.tp_output = str(self.output / f"replica-{assignment['dp_rank']}")
                 devices = [device['logical_id'] for device in assignment['devices']]
-                replica = ProcessTPModel(replica_args, _device_ids=devices, _environment=environment)
+                replica = ProcessTPModel(replica_args, _device_ids=devices, _environment=environment,
+                                         _defer_startup=True)
                 self.replicas.append(replica)
-                if self.routing == 'prefix':
-                    self._refresh_prefixes(len(self.replicas) - 1)
+                replica.session.start()
+
+            # 先让全部原生进程开始加载，再按固定 rank 收集 ready；完成顺序不改变设备映射。
+            for replica in self.replicas:
+                replica.session.wait_ready()
                 if (replica.ready.get('cancellation') != 'request_id_datagram' or
                         replica.ready.get('token_events') is not True):
                     raise RuntimeError('all DP replicas require cancellation and token events')
+
+            if self.routing == 'prefix':
+                for rank in range(self.dp_size):
+                    self._refresh_prefixes(rank)
 
             first = self.replicas[0]
             self.model_path, self.config, self.hf_tokenizer = first.model_path, first.config, first.hf_tokenizer

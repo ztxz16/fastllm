@@ -139,7 +139,7 @@ class ProcessTPModel:
     tp_backend = 'process'
     backend = BACKEND
 
-    def __init__(self, args, *, _device_ids=None, _environment=None):
+    def __init__(self, args, *, _device_ids=None, _environment=None, _defer_startup=False):
         from .util import load_model_args
         from .parallel_config import is_attention_ep
 
@@ -148,6 +148,8 @@ class ProcessTPModel:
         moe = self.backend == 'qwen_moe_attention_dp_ep'
         if is_attention_ep(args) != moe:
             raise ValueError('Attention DP/EP requires ProcessMoeModel through the model factory')
+        if _defer_startup and moe:
+            raise ValueError('deferred startup is only supported for ordinary DP replicas')
         self.devices = process_devices(getattr(args, 'tp', ''))
         if _device_ids is not None:
             # DP 内部分配传递逻辑编号，不能重新按裸数字卡数解析单卡编号 1。
@@ -194,7 +196,9 @@ class ProcessTPModel:
                                           prefix_cache=getattr(args, 'prefix_cache', '') == 'true',
                                           request_log=getattr(args, 'tp_request_log', 'on') == 'on',
                                           environment=_environment, **session_options)
-        self.session.__enter__()
+        # 普通 DP 先登记副本的资源所有权，再显式启动和等待；单副本仍同步加载。
+        if not _defer_startup:
+            self.session.__enter__()
         args.path = str(self.model_path)
 
     @property

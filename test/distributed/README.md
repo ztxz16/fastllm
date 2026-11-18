@@ -1082,7 +1082,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python3 test/distributed/run_parallel_config.py --r
 仍由既有 C++/CUDA 路径执行；Python 仅负责 tokenizer、生命周期和分发。
 GPU 编号是 CUDA 可见逻辑编号；子进程继承启动时的环境快照，不修改父进程的可见设备列表。
 
-- 全部副本就绪后才接受请求，启动期间任一失败都会回收已成功启动的副本。
+- 先启动全部副本的原生进程，再按 DP rank 等待 ready，让各副本的权重加载可以重叠。
+  Python 参数检查和 tokenizer 初始化仍串行；每副本的就绪超时从开始等待该副本时计时。
+  全部副本就绪并校验通过后才接受请求；完成顺序不改变 rank 和设备对应关系。
+  启动失败或中断会回收全部已登记副本，包括仍在加载、尚未 ready 的进程组。
 - 默认按空闲副本轮转，一次请求只提交到一个副本，不重试、不复制请求。
   每副本一次处理一个请求，多个副本可以同时运行；不包含 continuous batching。
   可选的前缀感知策略见文末“DP 空闲优先与前缀缓存路由”。
@@ -1124,6 +1127,9 @@ python3 test/distributed/run_parallel_config.py --execution-tests
 
 覆盖 DP1 兼容、DP2/4 单卡副本、DP2×TP2、真实子进程协议并发、启动回滚、运行故障、取消、
 流式关闭、SIGTERM 清理、HTTP 多请求、Graph/IPC/Prefix 组合，以及验收器成功与部分失败报告。
+启动测试使用可控 ready 闸门：首个副本未就绪时其它副本必须已启动，乱序就绪不能提前开放请求；
+另覆盖进程创建失败、部分 ready 时加载失败、加载超时，以及全部加载期间 Ctrl-C/SIGTERM 的整池回收。
+这些是协议和生命周期检查，不代表真实 GPU 加载速度或内存峰值的测量。
 
 新的 Ubuntu 24.04 / 四卡 V100 服务器（Vast 镜像已配置 NVIDIA apt 仓库）执行：
 
