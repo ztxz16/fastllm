@@ -217,17 +217,15 @@ class Suite:
          * 使用双方公开生成入口进行独立贪心验收，原逐层数值检查由numeric模式保留。
          * HF先单独运行并释放显存；FT共同配置为Eager/无Prefix/串行请求，再独立报告
          * Graph与Prefix生产配置。每请求保存选定策略结论、严格一致性及原始误差诊断；
-         * 预登记全部生成及可选性能用例，未完成的汇总不得显示通过。
+         * 预登记全部生成用例，未完成的汇总不得显示通过；性能由独立入口执行。
          * @param model 同一份本地FP16权重目录。
          * @param requests 已统一聊天模板、Prompt Token ID、生成长度和EOS策略的请求。
          * @param tokenizer 用于FT输出文本解码的同一模型tokenizer。
          * @return 无；任一请求或执行路径失败均保留FAIL行，并由main返回非零。
          */"""
         require(requests, 'empty generation request set')
-        # 四种模式各两轮请求、四次执行检查、两次Prefix路由；性能使用同一配置表计数。
+        # 四种模式各两轮请求、四次执行检查、两次Prefix路由。
         expected_cases = len(self.rows) + 8 * len(requests) + 6
-        if self.args.performance:
-            expected_cases += len(PERFORMANCE_CASES)
         self.metadata.update(
             expected_case_count=expected_cases,
             correctness='independent greedy generation; selected policy decides PASS/FAIL',
@@ -503,7 +501,25 @@ class Suite:
         self.case('real_all_layers_router_experts_outputs', run)
 
     def performance(self, model):
-        """/** 两种正式执行模式统一工作量；每轮同步结果后停止计时，校验和落盘在计时区外。 */"""
+        """/**
+         * 独立比较正式Eager/Graph性能，不运行HF生成或数值对齐。
+         * 两种模式统一工作量；每轮同步结果后停止计时，输出历史、缓存复用和
+         * Graph路径检查及落盘在计时区外。预登记全部用例，保留失败及中断报告。
+         * @param model 同一份本地FP16真实模型或合成小模型目录。
+         * @return 无；任一性能用例失败保留FAIL行，并由main返回非零。
+         */"""
+        self.metadata.update(
+            scope='performance', expected_case_count=len(self.rows) + len(PERFORMANCE_CASES),
+            model_path=str(model.resolve()), dtype='float16', kv_dtype='float16',
+            warmup=1, iterations=1, repeats=5, hot_cache_preparation_requests=4,
+            prompt_token_ids=[1, 2, 3, 4] * 8, max_new_tokens=16,
+            eos_policy='disabled; fixed max_new_tokens; no penalties or filtering',
+            correctness='FT Eager/Graph output histories, prefix reuse and Graph execution evidence',
+            report_description='独立性能测试：不运行HF对齐；保留Eager/Graph输出历史、缓存及执行路径检查。'
+                               '加速比为同配置Eager耗时/当前模式耗时，不代表相对HF或vLLM的速度。',
+            report_title='Attention DP + EP Eager/Graph performance')
+        save_report(self.output, self.rows, self.metadata)
+
         baseline, tokens, cache_histories = {}, {}, {}
         for graph, cache, concurrency in PERFORMANCE_CASES:
             def run(_):
@@ -662,7 +678,8 @@ def main():
                         help='默认Top-K；exact严格输出；numeric严格数值；all共用生成检查三种规则后独立运行numeric')
     parser.add_argument('--alignment-topk', type=int, default=5, help='生成验收候选数，不改变实际采样')
     parser.add_argument('--near-tie-tol', type=float, default=0.1, help='候选边界logprob容差；0为严格双向Top-K包含')
-    parser.add_argument('--performance', action='store_true')
+    parser.add_argument('--performance', action='store_true',
+                        help='仅运行Eager/Graph性能矩阵，不附带对齐或合成验收；省略--model只准备性能小模型')
     parser.add_argument('--synthetic-case', choices=sorted(SYNTHETIC_CASES),
                         help='只复现指定小模型用例；不代表完整验收通过')
     parser.add_argument('--repeat', type=int, default=1, help='定向用例独立执行次数；任何一轮失败则总体失败')
@@ -673,6 +690,8 @@ def main():
         parser.error('--repeat必须为正整数，重复执行必须指定--synthetic-case')
     if args.synthetic_case and (args.model or args.performance):
         parser.error('--synthetic-case不能与--model或--performance混用')
+    if args.performance and (args.alignment_policy != 'topk' or args.alignment_topk != 5 or args.near_tie_tol != 0.1):
+        parser.error('--performance独立测速，不能同时指定其他对齐策略或候选阈值')
     if args.alignment_policy == 'all':
         if not args.model or args.performance:
             parser.error('all仅用于真实模型功能验收，需要--model，不能与--performance混用')
@@ -685,7 +704,12 @@ def main():
         parser.error(str(error))
     suite = Suite(args)
     try:
-        if args.model:
+        if args.performance:
+            model = args.model or suite.output / 'f16_bias'
+            if not args.model:
+                fixture(model, **SYNTHETIC_FIXTURES['f16_bias'])
+            suite.performance(model)
+        elif args.model:
             # 在CPU统一Prompt ID；两种验收模式均分开加载后端，避免显存争用。
             from transformers import AutoTokenizer
             from fastllm_pytools.qwen3_process_chat import prepare_request
@@ -703,8 +727,6 @@ def main():
                 run_numeric_reference(suite, args, prompts)
         else:
             suite.synthetic()
-        if args.performance:
-            suite.performance(args.model or suite.output / 'f16_bias')
     except BaseException as error:
         (suite.output / 'setup.traceback.log').write_text(traceback.format_exc())
         suite.rows.append(dict(case='suite_setup', backend=BACKEND, status='FAIL', reason=str(error), failed_elements=1))
