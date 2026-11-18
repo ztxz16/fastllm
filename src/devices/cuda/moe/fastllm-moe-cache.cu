@@ -5918,15 +5918,18 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
     // Tile the eager adapter's bounded math workspace without imposing a
     // scheduling limit on the logical batch. Full graphs group all rows once
     // through their dynamically sized mailbox and tile only GPU computation.
+    const bool standardFp8Verify = routePhase == FastllmMoeRoutePhase::Verify &&
+        input.dataType == fastllm::FLOAT32 && weights && weightsBatch >= 4 && weights[2] &&
+        (weights[2]->dataType == fastllm::FP8_E4M3 || weights[2]->dataType == fastllm::FP8_E4M3_BLOCK_128);
     if (input.dims.size() == 2 && input.dims[0] > 8 &&
         !FastllmCudaMoeCacheFullyResident(weights, weightsBatch) &&
         input.dataDevice == fastllm::DataDevice::CUDA && index.dataDevice == fastllm::DataDevice::CUDA &&
-        score.dataDevice == fastllm::DataDevice::CUDA && input.dataType == fastllm::BFLOAT16 &&
+        score.dataDevice == fastllm::DataDevice::CUDA && (input.dataType == fastllm::BFLOAT16 || standardFp8Verify) &&
         index.dims.size() == 2 && index.dims == score.dims && index.dims[0] == input.dims[0] &&
         FastllmCudaCanRunMoeHybrid(weights, weightsBatch)) {
         cudaStreamCaptureStatus capture;
         auto *group = FindHybridGroup(weights, weightsBatch);
-        if (!group || !group->layout.deepSeekV41 || input.dims[1] != group->layout.hidden ||
+        if (!group || (!standardFp8Verify && !group->layout.deepSeekV41) || input.dims[1] != group->layout.hidden ||
             !input.cudaData || !index.cudaData || !score.cudaData ||
             !PackedCacheRows(input) || !PackedCacheRows(index) || !PackedCacheRows(score) ||
             index.dataType != fastllm::INT32 || score.dataType != fastllm::FLOAT32 || index.dims[1] < 1 || index.dims[1] > kMaxTopK ||

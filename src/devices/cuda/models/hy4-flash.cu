@@ -423,7 +423,10 @@ static void LinearBatch(Weights &w, Scratch &s, const std::string &name, const f
     else
         batchGemv<1><<<grid, 128>>>(v, x, y, rows, roundOutput);
 }
-__global__ static void norm(const float *x, Hy4View w, float *y, int width, float eps, bool roundFirst) {
+__global__ static void norm(const float *x, Hy4View w, float *y, int width, float eps, bool roundFirst,
+                            const StepInput *groupEnd = nullptr) {
+    if (groupEnd && (groupEnd->position & 3) != 3)
+        return;
     float sum = 0;
     for (int i = threadIdx.x; i < width; i += blockDim.x)
         sum = fmaf(x[i], x[i], sum);
@@ -685,6 +688,8 @@ __global__ static void poolIndexKey(const __nv_bfloat16 *cache, int stride, int 
                                     Hy4View gate, Hy4View ape, float *pooled, const StepInput *step) {
     if (step)
         pos = step->position;
+    if ((pos & 3) != 3)
+        return;
     const int channel = blockIdx.x, col = threadIdx.x;
     float values[4], gates[4];
     for (int slot = 0; slot < 4; ++slot) {
@@ -708,6 +713,8 @@ __global__ static void storeGroupKey(const float *pooled, __nv_bfloat16 *cache, 
                                      const StepInput *step) {
     if (step)
         pos = step->position;
+    if ((pos & 3) != 3)
+        return;
     int i = threadIdx.x;
     float x = i < 64 ? pooled[i] : rope(pooled[i], pooled[i ^ 1], i - 64, pos - 3, 10000000.f);
     cache[size_t(pos) * stride + stride - 128 + i] = __float2bfloat16(x);
@@ -804,19 +811,19 @@ static int *IndexPool(Weights &w, Scratch &s, const std::string &attn, const flo
     Linear(w, s, p + "token_key_projection.weight", hidden, key);
     Norm(w, s, p + "token_key_norm.weight", key, key, 128);
     storeIndexKey<<<1, 128>>>(key, keyCache, stride, pos, s.step);
-    if ((pos & 3) == 3) {
+    if (s.step || (pos & 3) == 3) {
         auto value = w.View(p + "key_value_projection.weight", s.device);
         auto gate = w.View(p + "key_gate_projection.weight", s.device);
         auto ape = w.View(p + "intra_group_ape", s.device);
         auto pooled = s.Get("indexPooled", 128);
         poolIndexKey<<<128, 128>>>(keyCache, stride, pos, value, gate, ape, pooled, s.step);
-        norm<<<1, 128>>>(pooled, w.View(p + "key_norm.weight", s.device), pooled, 128, 1.e-5f, false);
+        norm<<<1, 128>>>(pooled, w.View(p + "key_norm.weight", s.device), pooled, 128, 1.e-5f, false, s.step);
         storeGroupKey<<<1, 128>>>(pooled, keyCache, stride, pos, s.step);
     }
     if (pos < 2048)
         return nullptr;
     const int closedGroups = pos / 4;
-    const int groupCapacity = ((pos / 32 * 32 + 31) / 4 + 31) / 32 * 32;
+    const int groupCapacity = ((pos / KVPageTokens * KVPageTokens + KVPageTokens - 1) / 4 + 31) / 32 * 32;
     auto query = s.Get("indexQuery", 16 * 128), rotated = s.Get("indexRotaryQuery", 16 * 128);
     auto weights = s.Get("indexHeadWeights", 16), scores = s.Get("indexGroupScores", groupCapacity);
     auto chosen = reinterpret_cast<int *>(s.Get("indexChosen", 512));
@@ -920,7 +927,8 @@ static void ReserveKV(Data &data, int device, int seq, int width, int retained) 
         data.dataDeviceIds = {device};
     }
     if (data.expansionDims.empty() || data.expansionDims[1] < size)
-        data.Expansion({1, std::min(retained, (size + 31) / 32 * 32), width});
+        data.Expansion(
+            {1, std::min(retained, (size + KVPageTokens - 1) / KVPageTokens * KVPageTokens), width});
     data.Resize({1, size, width});
 }
 __global__ static void saveChosenRing(int *ring, const int *chosen, const StepInput *step, int slots) {
@@ -1001,7 +1009,7 @@ static void AttentionRowForward(Weights &w, Scratch &s, int layer, int position,
         length = 511 * 4 + (position % 4) + 1;
     auto scores = s.Get("attScores", size_t(heads) * ((length + 127) / 128 * 128)),
          mix = batch ? batch->mix : s.Get("attMix", width);
-    int launchLength = s.step ? (length + 31) / 32 * 32 : length;
+    int launchLength = s.step ? (length + KVPageTokens - 1) / KVPageTokens * KVPageTokens : length;
     scoreKV<<<dim3(launchLength, heads), 256>>>(rq, key, scores, start, length, heads, keep, keyStride,
                                                 chosen, false, s.step,
                                                 chosen    ? -1
@@ -1293,8 +1301,11 @@ void DraftLayer(Weights &w, Scratch &s, int layer, int base, int width, DraftMem
     auto gate = s.Get("draftAttGate", 8192), mix = s.Get("draftMix", 8192),
          branch = s.Get("draftBranch", 3072);
     const int history = base <= 2048 ? base : 511 * 4 + (base - 1) % 4 + 1;
-    auto scores = s.Get("draftScores", size_t(32) * (history + width));
-    auto slots = reinterpret_cast<int *>(s.Get("draftSlots", history + width));
+    // Growing draft-only buffers every proposal would invalidate target graphs
+    // that share this arena even though their own operands never moved.
+    const int capacity = (history + width + KVPageTokens - 1) / KVPageTokens * KVPageTokens;
+    auto scores = s.Get("draftScores", size_t(32) * capacity);
+    auto slots = reinterpret_cast<int *>(s.Get("draftSlots", capacity));
     auto previous = base <= 2048 ? nullptr
                                  : static_cast<const int *>(memory.recalled.cudaData) +
                                        size_t((base - 1) % memory.recalled.dims[0]) * 512;

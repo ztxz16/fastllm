@@ -32,6 +32,7 @@ struct Hy4FlashModel::Weights {
 };
 #ifdef FASTLLM_ENABLE_HY4_CUDA
 namespace hy4 {
+inline constexpr int KVPageTokens = 128;
 // Updated once per step and GPU, before launching a reusable decode graph.
 struct StepInput {
     int token, previous, older, position;

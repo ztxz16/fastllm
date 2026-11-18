@@ -151,7 +151,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
     for (size_t i = 0; i < lengths.size() && capture; ++i) {
         int end = positions[lastRows[i]] + 1;
         const auto firstPos = positions[lastRows[i]] + 1 - lengths[i];
-        if (firstPos <= 2048 && end > 2048) {
+        if (firstPos < 4 || (firstPos <= 2048 && end > 2048)) {
             capture = false;
             break;
         }
@@ -186,7 +186,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
         for (int row = 0; row < rows; ++row) {
             const bool skip = tokens[row] == w.config["engram_pad_id"].int_value() || tokens[row] == 120120 ||
                               tokens[row] == 120124;
-            key.push_back((positions[row] / 32) * 4 + 2 * ((positions[row] & 3) == 3) + int(skip));
+            key.push_back((positions[row] / hy4::KVPageTokens) * 2 + int(skip));
         }
         for (size_t i = 0; i < lengths.size(); ++i) {
             key.push_back(lengths[i]);
