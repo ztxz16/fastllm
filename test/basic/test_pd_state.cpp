@@ -61,6 +61,45 @@ class StateModel : public basellm {
     }
 };
 
+// Opt-in: this test deliberately fills one GPU. It uses the production PD
+// allocator to recover idle engine memory that raw FastKV CUDA cannot reclaim.
+static void TestGPUAllocatorPressure() {
+#ifdef USE_CUDA
+    FastllmCudaSetDevice(0);
+    StateModel model;
+    model.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","pressure"},
+        {"transport","tcp"},{"listen","127.0.0.1:0"},{"chunk_tokens",2},
+        {"max_inflight_bytes",double(size_t(512) << 20)}});
+    auto live = FastllmCudaMalloc(size_t(4) << 20);
+    Check(live, "live allocation");
+    FastllmCudaMemset0(live, size_t(4) << 20);
+    auto idle = FastllmCudaMalloc(size_t(512) << 20);
+    Check(idle, "idle allocation");
+    FastllmCudaFree(idle);
+    uint64_t freeBytes = 0, totalBytes = 0;
+    Check(FastllmCudaGetMemoryInfo(0, freeBytes, totalBytes) && freeBytes > (size_t(1) << 30),
+          "pressure test requires an otherwise idle GPU");
+    void *filler = nullptr;
+    Check(FastllmCudaTryDirectMalloc(&filler, freeBytes - (size_t(64) << 20)) ==
+          FASTLLM_CUDA_TRY_MALLOC_SUCCESS, "pressure filler allocation");
+    auto held = std::shared_ptr<void>(filler, FastllmCudaDirectFree);
+    bool pressure = false;
+    try { fastkv::Buffer::Allocate(size_t(256) << 20, 0); }
+    catch (const fastkv::CapacityBusy &) { pressure = true; }
+    Check(pressure, "raw CUDA allocator did not reproduce pressure");
+    auto recovered = model.PDExportPool()->Acquire(size_t(256) << 20, 0);
+    std::vector<uint8_t> bytes(4096, 1);
+    FastllmCudaCopyFromDeviceToHost(bytes.data(), live, bytes.size());
+    Check(std::all_of(bytes.begin(),bytes.end(),[](uint8_t x) { return x == 0; }),
+          "PD recovery modified live engine memory");
+    Check(!FastllmCudaGetThreadError(), "recoverable pressure poisoned CUDA state");
+    held.reset(); recovered = {}; FastllmCudaFree(live); model.StopPD();
+    std::cout << "PASS PD GPU pressure recovery preserves live engine allocations\n";
+#else
+    throw std::runtime_error("GPU pressure test requires CUDA");
+#endif
+}
+
 // Exercise the actual chunked serving loop after transfer, rather than only
 // calling ImportPDState and supplying correct positions directly to Forward.
 static void TestChunkedDecodeHandoff() {
@@ -928,8 +967,12 @@ static void CheckLegacySessionPeer(bool sessionProtocol = false) {
     decode.StopPD(); legacy.Stop();
 }
 
-int main() {
+int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "gpu_pressure") {
+            TestGPUAllocatorPressure();
+            return 0;
+        }
         TestAdmissionLifetime();
         CheckLegacySessionPeer();
         CheckLegacySessionPeer(true);

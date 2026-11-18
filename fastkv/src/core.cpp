@@ -148,7 +148,12 @@ Buffer Buffer::Allocate(size_t n, int device) {
 #ifdef FASTKV_CUDA
     DeviceScope scope(device);
     void *p = nullptr;
-    CudaCheck(cudaMalloc(&p, std::max(size_t(1), n)));
+    const auto error = cudaMalloc(&p, std::max(size_t(1), n));
+    if (error == cudaErrorMemoryAllocation) {
+        cudaGetLastError();
+        throw CapacityBusy("FastKV: CUDA allocation pressure");
+    }
+    CudaCheck(error);
     auto owner = std::shared_ptr<void>(p, [device](void *p) {
         int old = 0;
         cudaGetDevice(&old);

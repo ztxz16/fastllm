@@ -7,9 +7,29 @@ struct BufferPool::State {
     std::vector<Buffer> idle;
     std::condition_variable changed;
     size_t limit, allocated = 0;
+    BufferAllocator allocator;
     std::map<int, size_t> deviceLimits, deviceAllocated;
     bool closed = false;
     explicit State(size_t bytes) : limit(bytes) {}
+    void TrimIdle() {
+        std::vector<Buffer> released;
+        std::map<int, size_t> bytes;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto &buffer : idle) bytes[buffer.Device()] += buffer.Size();
+            released.swap(idle);
+        }
+        // Keep capacity charged until CUDA storage and MR attachments retire.
+        released.clear();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto &item : bytes) {
+                allocated -= item.second;
+                deviceAllocated[item.first] -= item.second;
+            }
+        }
+        changed.notify_all();
+    }
     void Recycle(Buffer buffer) noexcept {
         const size_t bytes = buffer.Size();
         const int device = buffer.Device();
@@ -34,8 +54,10 @@ struct BufferPool::State {
         changed.notify_all();
     }
 };
-BufferPool::BufferPool(size_t limit, std::map<int, size_t> limits) : state(std::make_shared<State>(limit)) {
+BufferPool::BufferPool(size_t limit, std::map<int, size_t> limits, BufferAllocator allocator)
+    : state(std::make_shared<State>(limit)) {
     state->deviceLimits = std::move(limits);
+    state->allocator = allocator ? std::move(allocator) : Buffer::Allocate;
 }
 size_t BufferPool::Limit(int device) const {
     auto found = state->deviceLimits.find(device);
@@ -182,10 +204,7 @@ std::vector<Buffer> BufferPool::AcquireBatch(const std::vector<std::pair<int, si
         }
         state->changed.notify_all();
     }
-    try {
-        for (size_t i = 0; i < arenas.size(); ++i)
-            if (fresh[i]) arenas[i] = Buffer::Allocate(capacities[i], allocations[i].first);
-    } catch (...) {
+    auto rollback = [&] {
         for (size_t i = 0; i < arenas.size(); ++i) {
             if (arenas[i].Size()) state->Recycle(std::move(arenas[i]));
             else if (fresh[i]) {
@@ -195,6 +214,26 @@ std::vector<Buffer> BufferPool::AcquireBatch(const std::vector<std::pair<int, si
             }
         }
         state->changed.notify_all();
+    };
+    try {
+        for (size_t i = 0; i < arenas.size(); ++i) if (fresh[i]) {
+            auto buffer = state->allocator(capacities[i], allocations[i].first);
+            Require(buffer.Size() == capacities[i] && buffer.Data() &&
+                        buffer.Device() == allocations[i].first && !buffer.PoolBacked() &&
+                        buffer.Kind() == (allocations[i].first < 0 ? MemoryKind::Host : MemoryKind::Cuda),
+                    "FastKV: allocator returned an incompatible buffer");
+            arenas[i] = std::move(buffer);
+        }
+    } catch (const CapacityBusy &) {
+        rollback();
+        // A budget is an upper bound, not a reservation in the embedding
+        // process. Retire idle size classes on physical pressure too. The
+        // scheduler/transport retries with cancellation and deadline checks;
+        // never wait here while holding part of a multi-device message.
+        state->TrimIdle();
+        throw;
+    } catch (...) {
+        rollback();
         throw;
     }
     try {

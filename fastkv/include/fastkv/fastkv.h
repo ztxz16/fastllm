@@ -95,9 +95,14 @@ class Buffer {
 class CapacityBusy : public std::runtime_error {
   public: using std::runtime_error::runtime_error;
 };
+// Optional embedding allocator. Return an owning buffer on the requested
+// device; throw CapacityBusy for recoverable pressure, other exceptions for
+// permanent failures. Calls and allocation destruction run outside pool locks.
+using BufferAllocator = std::function<Buffer(size_t, int)>;
 class BufferPool {
   public:
-    explicit BufferPool(size_t limit, std::map<int, size_t> deviceLimits = {});
+    explicit BufferPool(size_t limit, std::map<int, size_t> deviceLimits = {},
+                        BufferAllocator allocator = {});
     ~BufferPool();
     Buffer Acquire(size_t bytes, int device, std::shared_ptr<void> credit = {});
     // Reserve the complete message atomically; no caller holds partial leases
@@ -164,6 +169,7 @@ struct Options {
     // Physical pool bounds, including idle registered buffers. Omitted devices
     // use maxInflightBytes. Model integration derives these from free memory.
     std::map<int, size_t> deviceBufferBytes;
+    BufferAllocator allocateBuffer;
     size_t maxPayloadBytes = size_t(4) << 30;
     size_t maxInflightBytes = size_t(8) << 30;
     size_t maxMetadataBytes = 64 << 20;

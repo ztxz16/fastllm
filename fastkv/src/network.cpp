@@ -310,8 +310,9 @@ struct Service::Impl {
           clientSlots(size_t(options.queueDepth) + options.workers, "client request slots"),
           serverSlots(size_t(options.queueDepth) + ActiveLimit(options), "server connection slots"),
           handlerSlots(ActiveLimit(options), "handler slots"),
-          receiveBuffers(options.maxInflightBytes, options.deviceBufferBytes),
-          sendBuffers(std::min(options.maxInflightBytes, size_t(options.workers) * (size_t(512) << 20))),
+          receiveBuffers(options.maxInflightBytes, options.deviceBufferBytes, options.allocateBuffer),
+          sendBuffers(std::min(options.maxInflightBytes, size_t(options.workers) * (size_t(512) << 20)),
+                      options.deviceBufferBytes, options.allocateBuffer),
           servers(options.workers, options.queueDepth), clients(options.workers, options.queueDepth),
           sendReplies(options.workers, options.queueDepth), receiveReplies(options.workers, options.queueDepth) {
         Require(options.timeoutMs > 0 && options.maxPayloadBytes && options.maxMetadataBytes &&

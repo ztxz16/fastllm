@@ -52,6 +52,54 @@ int main() {
         Check(whole.size() == 3, "oversized reuse prevented feasible batch allocation");
         whole.clear();
 
+        // Physical pressure can occur below the configured pool budget when
+        // another component owns memory. Recover idle arenas, preserve live
+        // slices/MRs, and roll back an entire partially allocated message.
+        size_t physicalBytes = 0, physicalLimit = 12288;
+        bool failSecond = false;
+        int allocationCalls = 0;
+        BufferAllocator allocator = [&](size_t bytes, int device) {
+            ++allocationCalls;
+            if ((failSecond && allocationCalls == 2) || bytes > physicalLimit - physicalBytes)
+                throw CapacityBusy("injected physical allocation pressure");
+            auto owner = std::shared_ptr<uint8_t>(new uint8_t[bytes], [&, bytes](uint8_t *p) {
+                physicalBytes -= bytes; delete[] p;
+            });
+            physicalBytes += bytes;
+            return Buffer::Borrow(owner.get(), bytes, MemoryKind::Host, device, owner);
+        };
+        BufferPool physical(32768, {}, allocator);
+        auto pinnedPhysical = physical.Acquire(4096, -1);
+        std::memset(pinnedPhysical.MutableData(), 0x61, 4096);
+        physical.Acquire(4096, -1); // An incompatible idle arena holds physical memory.
+        bool pressure = false;
+        try { physical.Acquire(8192, -1); } catch (const CapacityBusy &) { pressure = true; }
+        Check(pressure && physicalBytes == 4096, "physical pressure did not release idle arenas");
+        auto recovered = physical.Acquire(8192, -1);
+        Check(physicalBytes == 12288 && ((const uint8_t *)pinnedPhysical.Data())[0] == 0x61,
+              "pressure recovery changed a live lease");
+        recovered = {}; pinnedPhysical = {}; physical.Clear();
+        Check(physicalBytes == 0, "physical pool leaked allocations");
+        BufferPool partial(32768, {}, allocator);
+        allocationCalls = 0; failSecond = true;
+        pressure = false;
+        try { partial.AcquireBatch({{-1,4096},{-1,4096}}); }
+        catch (const CapacityBusy &) { pressure = true; }
+        Check(pressure && !physicalBytes, "failed batch retained partial physical allocations");
+        failSecond = false;
+        auto retry = partial.AcquireBatch({{-1,4096},{-1,8192}});
+        Check(physicalBytes == 12288, "failed batch retained budget charges");
+        retry.clear(); partial.Clear();
+
+        BufferPool broken(8192, {}, [](size_t, int) -> Buffer {
+            throw std::runtime_error("permanent allocator failure");
+        });
+        bool permanent = false;
+        try { broken.Acquire(4096, -1); }
+        catch (const CapacityBusy &) { throw std::runtime_error("permanent failure became retryable"); }
+        catch (const std::runtime_error &) { permanent = true; }
+        Check(permanent, "permanent allocator failure was hidden");
+
         // A message shares one registration and allocation, without per-tensor
         // page rounding. Every slice must retain its credit and private bytes.
         BufferPool packedPool(12288);
@@ -147,13 +195,26 @@ int main() {
         Options bounded;
         bounded.workers = 2; bounded.maxInflightBytes = 8192;
         bounded.deviceBufferBytes[-1] = 4096; bounded.timeoutMs = 3000;
+        std::atomic<bool> externalPressure{true};
+        std::atomic<int> allocationAttempts{0};
+        bounded.allocateBuffer = [&](size_t bytes, int device) {
+            ++allocationAttempts;
+            if (externalPressure) throw CapacityBusy("external pressure");
+            return Buffer::Allocate(bytes, device);
+        };
         Service responder, receiver(bounded);
         responder.Start("127.0.0.1:0", [](const Message &) {
             auto b = Buffer::Allocate(1024);
             std::memset(b.MutableData(), 73, b.Size());
             return Message{{}, {b}};
         });
-        auto first = receiver.Call(responder.Address(), {});
+        auto initial = receiver.Submit(responder.Address(), {});
+        Check(initial.wait_for(std::chrono::milliseconds(80)) == std::future_status::timeout && allocationAttempts > 0,
+              "physical pressure did not defer receive");
+        externalPressure = false;
+        Check(initial.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+              "receive did not retry after external pressure cleared");
+        auto first = initial.get();
         auto second = receiver.Submit(responder.Address(), {});
         Check(second.wait_for(std::chrono::milliseconds(80)) == std::future_status::timeout,
               "device pressure must queue instead of allocate or fail");

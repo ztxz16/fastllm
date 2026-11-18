@@ -1080,6 +1080,28 @@ void basellm::ConfigurePD(const json11::Json &config) {
         options.maxPayloadBytes = size_t(limit);
     }
 #ifdef USE_CUDA
+    options.allocateBuffer = [](size_t bytes, int device) {
+        if (device < 0) return fastkv::Buffer::Allocate(bytes, device);
+        struct RestoreDevice {
+            int previous = FastllmCudaGetDevice();
+            ~RestoreDevice() { FastllmCudaSetDevice(previous); }
+        } restore;
+        FastllmCudaSetDevice(device);
+        void *data = nullptr;
+        // Reuse the engine's pressure recovery. It protects live/graph-owned
+        // allocations and reclaims only idle eager scratch before retrying.
+        const auto result = FastllmCudaTryDirectMalloc(&data, std::max(size_t(1), bytes));
+        if (result == FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE)
+            throw fastkv::CapacityBusy("FastKV: engine GPU allocation pressure");
+        Check(result == FASTLLM_CUDA_TRY_MALLOC_SUCCESS && data, "GPU buffer allocation failed");
+        auto owner = std::shared_ptr<void>(data, [device](void *pointer) {
+            const int previous = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(device);
+            FastllmCudaDirectFree(pointer);
+            FastllmCudaSetDevice(previous);
+        });
+        return fastkv::Buffer::Borrow(data, bytes, fastkv::MemoryKind::Cuda, device, std::move(owner));
+    };
     size_t stagingCapacity = 0;
     for (int device : devices) {
         uint64_t freeBytes = 0, totalBytes = 0;
@@ -1095,7 +1117,8 @@ void basellm::ConfigurePD(const json11::Json &config) {
         options.maxInflightBytes = std::min(options.maxInflightBytes, stagingCapacity);
 #endif
     runtime->service.reset(new fastkv::Service(options));
-    runtime->exportPool.reset(new fastkv::BufferPool(options.maxInflightBytes, options.deviceBufferBytes));
+    runtime->exportPool.reset(new fastkv::BufferPool(options.maxInflightBytes,
+        options.deviceBufferBytes, options.allocateBuffer));
     runtime->residentPrefix = HasPDResidentPrefixCache();
     for (const auto &peer : config["prefill"].array_items()) {
         Check(peer.is_string() && !peer.string_value().empty(), "invalid prefill endpoint");
