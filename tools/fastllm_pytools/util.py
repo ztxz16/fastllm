@@ -505,8 +505,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='Attention请求rank数；Qwen MoE进程模式要求与ep相等，支持1/2/4')
     parser.add_argument('--ep', type=_positive_int, default=1,
                         help='专家分片数；与attention-dp共用GPU，要求dp=tp=1')
-    parser.add_argument('--dp-routing', choices=['round_robin', 'prefix'], default='round_robin',
-                        help='空闲副本或Attention rank分发策略；prefix要求进程并行及--prefix-cache true')
+    parser.add_argument('--dp-routing', choices=['round_robin', 'prefix', 'load'], default=None,
+                        help='普通进程DP默认load：按请求数和KV压力排队；其它模式默认round_robin；prefix要求前缀缓存')
     parser.add_argument('--parallel-plan', action='store_true',
                         help='仅输出DP/TP或Attention DP/EP的CUDA设备分配JSON，不加载模型或启动worker')
     parser.add_argument('--tp', type = str, default = "", help = '张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')

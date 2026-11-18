@@ -104,6 +104,7 @@ class Job:
     enqueued_at: float | None = None
     dequeued_at: float | None = None
     events: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=64))
+    reservation: dict | None = None
 
 
 class IncrementalTextDecoder:
@@ -151,13 +152,18 @@ class ChatService:
         self.failure = None
         self._threads = []
         self._remaining = 0
+        self._load_routing = getattr(session, 'routing', None) == 'load'
+        self._deadline_thread = None
         try:
             with self._condition:
                 for rank in range(getattr(session, 'concurrency', 1)):
-                    thread = threading.Thread(target=self._run, name=f"qwen3-http-scheduler-{rank}")
+                    thread = threading.Thread(target=self._run, args=(rank,), name=f"qwen3-http-scheduler-{rank}")
                     thread.start()
                     self._threads.append(thread)
                     self._remaining += 1
+                if self._load_routing:
+                    self._deadline_thread = threading.Thread(target=self._expire, name='qwen3-http-deadlines')
+                    self._deadline_thread.start()
         except BaseException:
             self.close()
             raise
@@ -174,17 +180,42 @@ class ChatService:
                 raise HTTPError(503, "model service unavailable")
             if request_id in self._jobs:
                 raise HTTPError(409, "request ID is already active or queued")
-            if len(self._queue) >= self.queue_size:
+            waiting = sum(job.reservation['state'] == 'queued' for job in self._jobs.values()) if self._load_routing else len(self._queue)
+            if waiting >= self.queue_size:
                 raise HTTPError(429, "request queue is full")
+            if self._load_routing:
+                job.reservation = self.session._reserve(job.cancel, job.deadline)
+                job.dp_rank, job.dp_request_id = job.reservation['rank'], job.reservation['id']
             self._jobs[request_id] = job
             job.enqueued_at = time.monotonic()
             self._queue.append(job)
-            self._condition.notify()
+            self._condition.notify_all()
         return job
+
+    def _expire(self):
+        """/** 一个截止时间线程覆盖整池排队及生成；取消固定预约，不为每个等待请求创建线程。 */"""
+        with self._condition:
+            while not self._stopping:
+                now = time.monotonic()
+                if self._jobs and self.session.state != 'ready':
+                    self.failure = 'DP pool unavailable'
+                    self._stopping = True
+                    for job in list(self._jobs.values()):
+                        self.cancel(job.id, 503, self.failure, expected_job=job)
+                    self._condition.notify_all()
+                    break
+                for job in list(self._jobs.values()):
+                    if job.deadline <= now and not job.cancel.is_set():
+                        self.cancel(job.id, 504, 'request deadline exceeded', expected_job=job)
+                pending = [job.deadline for job in self._jobs.values() if not job.cancel.is_set()]
+                delay = min(0.05, max(0, min(pending) - time.monotonic())) if pending else (0.05 if self._jobs else None)
+                self._condition.wait(delay)
 
     def _finish(self, job, status, response):
         # 调用者持有 condition；先落盘再唤醒 HTTP，不能将日志失败伪装为成功。
         try:
+            if job.reservation is not None:
+                self.session._withdraw(job.reservation)
             finished = time.monotonic()
             queue_end = finished if job.dequeued_at is None else job.dequeued_at
             timing = dict(enqueued_at=job.enqueued_at, dequeued_at=job.dequeued_at, finished_at=finished,
@@ -201,6 +232,7 @@ class ChatService:
         job.status, job.response = status, response
         self._jobs.pop(job.id, None)
         job.done.set()
+        self._condition.notify_all()
 
     def cancel(self, request_id, status=499, reason="request cancelled", *, expected_job=None):
         with self._condition:
@@ -210,6 +242,8 @@ class ChatService:
             if not job.cancel.is_set():
                 job.cancel_status, job.cancel_reason = status, reason
                 job.cancel.set()
+            if job.reservation is not None:
+                self.session._withdraw(job.reservation)
             if self._active.get(job.id) is not job:
                 self._queue.remove(job)
                 self._finish(job, job.cancel_status, error_body(job.cancel_reason))
@@ -226,7 +260,8 @@ class ChatService:
                         attention_dp_size=getattr(self.session, 'attention_dp_size', 1),
                         ep_size=getattr(self.session, 'ep_size', 1),
                         dp_routing=getattr(self.session, 'routing', 'round_robin'),
-                        replicas=self.session.ready.get('replicas', []))
+                        replicas=self.session.ready.get('replicas', []),
+                        replica_load=self.session.load_snapshot() if self._load_routing else [])
 
     def _emit(self, job, text):
         # 回调不能阻塞原生事件读取；慢客户端取消当前请求并继续读取原生取消确认。
@@ -255,19 +290,26 @@ class ChatService:
                 text = decoder.push(token)
             self._emit(job, text)
 
-        timer.start()
+        if not self._load_routing:
+            timer.start()
         try:
-            report = self.session.generate(request, cancel_event=job.cancel,
-                on_token=on_token if decoder else None)
+            if job.reservation is not None:
+                report = self.session._generate_reserved(job.reservation, request, cancel_event=job.cancel,
+                    on_token=on_token if decoder else None)
+            else:
+                report = self.session.generate(request, cancel_event=job.cancel,
+                    on_token=on_token if decoder else None)
             job.native_id = report["id"]
             job.dp_rank, job.dp_request_id = report.get('dp_rank'), report.get('dp_request_id')
         except (GenerationRejected, GenerationObserverError) as error:
             job.native_id = error.report["id"]
-            job.dp_rank, job.dp_request_id = error.report.get('dp_rank'), error.report.get('dp_request_id')
+            job.dp_rank = error.report.get('dp_rank', job.dp_rank)
+            job.dp_request_id = error.report.get('dp_request_id', job.dp_request_id)
             raise
         finally:
-            timer.cancel()
-            timer.join()
+            if not self._load_routing:
+                timer.cancel()
+                timer.join()
         if decoder:
             try:
                 with self._tokenizer_lock:
@@ -288,15 +330,17 @@ class ChatService:
                     usage=dict(prompt_tokens=len(request["token_ids"]), completion_tokens=len(report["token_ids"]),
                                total_tokens=len(request["token_ids"]) + len(report["token_ids"])))
 
-    def _run(self):
+    def _run(self, rank=0):
         job = None
         try:
             while True:
                 with self._condition:
-                    self._condition.wait_for(lambda: self._queue or self._stopping)
+                    self._condition.wait_for(lambda: self._stopping or any(
+                        not self._load_routing or item.dp_rank == rank for item in self._queue))
                     if self._stopping:
                         break
-                    job = self._queue.popleft()
+                    job = next(item for item in self._queue if not self._load_routing or item.dp_rank == rank)
+                    self._queue.remove(job)
                     job.dequeued_at = time.monotonic()
                     self._active[job.id] = job
                 try:
@@ -311,6 +355,11 @@ class ChatService:
                     status, response = 500, error_body(error)
                 except HTTPError as error:
                     status, response = error.status, error_body(error)
+                except TimeoutError as error:
+                    status, response = 504, error_body(error)
+                    if self.session.state != 'ready':
+                        self.failure = str(error)
+                        status = 503
                 except (GenerationRejected, ValueError) as error:
                     if self.session.state != "ready":
                         self.failure = str(error)
@@ -321,6 +370,11 @@ class ChatService:
                     self.failure = str(error)
                     status, response = 503, error_body("generation failed; inspect server logs")
                 with self._condition:
+                    if self._load_routing and status == 200:
+                        if job.cancel.is_set():
+                            status, response = job.cancel_status, error_body(job.cancel_reason)
+                        elif time.monotonic() >= job.deadline:
+                            status, response = 504, error_body('request deadline exceeded')
                     self._finish(job, status, response)
                     self._active.pop(job.id, None)
                     job = None
@@ -355,6 +409,8 @@ class ChatService:
         deadline = time.monotonic() + self.session.timeout + 40
         for thread in self._threads:
             thread.join(max(0, deadline - time.monotonic()))
+        if self._deadline_thread is not None and self._deadline_thread.ident is not None:
+            self._deadline_thread.join(max(0, deadline - time.monotonic()))
         if any(thread.is_alive() for thread in self._threads):
             raise RuntimeError("scheduler did not stop within session timeout")
         if not self._threads:

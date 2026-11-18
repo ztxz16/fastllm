@@ -165,7 +165,7 @@ class RoutingTests(unittest.TestCase):
 
     def test_cli_json_and_factory_reject_conflicts_before_start(self):
         args = self.args()
-        for changes in (dict(dp_routing=None), dict(dp_routing=True), dict(dp_routing=[]),
+        for changes in (dict(dp_routing=True), dict(dp_routing=[]),
                         dict(dp_routing='invalid'), dict(dp=1), dict(tp_backend='thread'), dict(prefix_cache='false')):
             with self.subTest(changes=changes):
                 values = dict(vars(args), **changes)

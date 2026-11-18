@@ -458,7 +458,7 @@ class ProcessDPTests(unittest.TestCase):
                 redirect_stdout(io.StringIO()):
             self.assertEqual(runner.main(), 1)
         reports = [json.loads(p.read_text()) for p in (self.root / 'acceptance').glob('*/summary.json')]
-        self.assertEqual(sum(s['status'] == 'PASS' and s['completed_case_count'] == 10 for s in reports), 2)
+        self.assertEqual(sum(s['status'] == 'PASS' and s['completed_case_count'] == 12 for s in reports), 2)
         failed = next(s for s in reports if s['status'] == 'FAIL')
         self.assertFalse(failed['complete'])
         self.assertIn('startup failed', failed['cases'][0]['reason'])

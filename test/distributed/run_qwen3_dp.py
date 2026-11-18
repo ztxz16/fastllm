@@ -52,7 +52,7 @@ def main():
     parser.add_argument('--cuda-graph', action='store_true')
     parser.add_argument('--custom-allreduce', action='store_true')
     parser.add_argument('--prefix-cache', action='store_true')
-    parser.add_argument('--dp-routing', choices=('round_robin', 'prefix'), default='round_robin')
+    parser.add_argument('--dp-routing', choices=('round_robin', 'prefix', 'load'), default='load')
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
     if args.dp_routing == 'prefix' and not args.prefix_cache:
@@ -66,7 +66,7 @@ def main():
                     cuda=capture(['nvcc', '--version']), cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
                     seed=0, warmup=0, iterations=1, repeats=1, dp=args.dp, tp=args.tp,
                     cuda_graph=args.cuda_graph, custom_allreduce=args.custom_allreduce, prefix_cache=args.prefix_cache,
-                    expected_case_count=11 if args.dp_routing == 'prefix' else 10, dp_routing=args.dp_routing, report_title='Process DP public entrypoint',
+                    expected_case_count=12 if args.dp_routing == 'load' else (11 if args.dp_routing == 'prefix' else 10), dp_routing=args.dp_routing, report_title='Process DP public entrypoint',
                     report_description='同一正式工厂 DP=1 与多副本输出精确对照；固定 Token ID、EOS、采样和执行设置。'
                                        '生命周期检查误差为 n/a，不提供性能或独立数学精度结论。')
     rows = []
@@ -97,8 +97,13 @@ def main():
             flags += ['--custom-allreduce']
         if args.prefix_cache:
             flags += ['--prefix-cache', 'true', '--page_size', '4']
+        if args.dp_routing == 'load':
+            # 同一真实页池容量用于单副本基准及DP，稳定覆盖50%压力阈值两侧。
+            flags += ['--page_size', '16', '--tokens', '512']
+            metadata.update(page_size=16, cache_tokens=512)
         prompt = '请用一句话介绍你自己。'
         reference = request = expected_text = None
+        pressure_requests, pressure_references = {}, {}
 
         def baseline():
             nonlocal reference, request, expected_text
@@ -109,6 +114,12 @@ def main():
                                                            clean_up_tokenization_spaces=False)
                 metadata['request'] = request
                 (output / 'reference.json').write_text(json.dumps(reference, ensure_ascii=False, indent=2))
+                if args.dp_routing == 'load':
+                    for name, length in (('high', 384), ('low', 32)):
+                        ids = (request['token_ids'] * (length // len(request['token_ids']) + 1))[:length]
+                        pressure_requests[name] = dict(request, token_ids=ids, max_new_tokens=4, eos_token_ids=[])
+                        pressure_references[name] = model.generate(pressure_requests[name])
+                        (output / f'reference-{name}.json').write_text(json.dumps(pressure_references[name], indent=2))
                 return verify_native(reference, reference)
         case('single_replica_reference', baseline)
 
@@ -130,7 +141,8 @@ def main():
             def sequential():
                 reports = [model.generate(request) for _ in range(2 * args.dp)]
                 for i, report in enumerate(reports):
-                    require(report['dp_rank'] == i % args.dp, 'idle replica rotation mismatch')
+                    if args.dp_routing != 'prefix':
+                        require(report['dp_rank'] == i % args.dp, 'idle replica rotation mismatch')
                     verify_native(report, reference)
                 return dict(max_abs_error=0.0, mean_abs_error=0.0, failed_elements=0,
                             dp_ranks=[r['dp_rank'] for r in reports])
@@ -150,6 +162,41 @@ def main():
                 return dict(max_abs_error=0.0, mean_abs_error=0.0, failed_elements=0,
                             dp_ranks=[r['dp_rank'] for r in reports])
             case('concurrent_outputs', concurrent)
+
+            if args.dp_routing == 'load':
+                def pressure_case(name):
+                    barrier = threading.Barrier(args.dp * 2, timeout=30)
+                    def generate():
+                        barrier.wait()
+                        return model.generate(pressure_requests[name])
+                    with ThreadPoolExecutor(args.dp * 2) as pool:
+                        reports = list(pool.map(lambda _: generate(), range(args.dp * 2)))
+                    for report in reports:
+                        verify_native(report, pressure_references[name])
+                        samples = report.get('load_samples', [])
+                        require(len(samples) >= 2 and samples[-1]['phase'] == 'complete', 'missing live KV evidence')
+                        require(samples[-1]['kv_cache_usage'] == 0, 'KV pressure did not reset after cleanup')
+                        peak = max(sample['kv_cache_usage'] for sample in samples)
+                        require(peak > 0.5 if name == 'high' else 0 < peak <= 0.5, f'{name} KV threshold not exercised: {peak}')
+                        for sample in samples:
+                            workers = sample['workers']
+                            require(len(workers) == args.tp, 'KV sample missing TP rank')
+                            expected = max(1-w['free_pages']/w['total_pages'] if w['total_pages'] else 0 for w in workers)
+                            require(abs(expected-sample['kv_cache_usage']) < 1e-9, 'KV usage differs from actual worker pages')
+                        decision = report['dp_routing']
+                        for snapshot in decision['replicas']:
+                            w, r, u = snapshot['waiting'], snapshot['running'], snapshot['kv_cache_usage']
+                            require(abs(snapshot['score']-(w+r+w*6*max(0, u-0.5))) < 1e-9, 'routing score mismatch')
+                        require(decision['replicas'][report['dp_rank']]['score'] ==
+                                min(s['score'] for s in decision['replicas']), 'request was not routed to minimum load')
+                    require(all(s['waiting'] == s['running'] == 0 for s in model.load_snapshot()), 'request accounting leaked')
+                    return dict(max_abs_error=0.0, mean_abs_error=0.0, failed_elements=0,
+                                prompt_tokens=len(pressure_requests[name]['token_ids']),
+                                reports=[dict(dp_rank=r['dp_rank'], token_ids=r['token_ids'],
+                                              decision=r['dp_routing'], load_samples=r['load_samples']) for r in reports])
+                # 高压后再测低压，同时验证可回收的前缀页不被误计为占用。
+                case('live_kv_high_pressure', lambda: pressure_case('high'))
+                case('live_kv_low_pressure', lambda: pressure_case('low'))
 
             if args.dp_routing == 'prefix':
                 def prefix_route():

@@ -425,6 +425,20 @@ struct DeviceRuntime {
 #endif
     }
 
+    /** 只查询真实页池CPU计数；未建立执行器时返回0，不为统计提前分配GPU资源。 */
+    std::vector<uint8_t> KVUsage() {
+        if (controlOnly) throw std::runtime_error("KV pressure requires CUDA");
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        auto info = layerExecutor ? layerExecutor->KVUsage() : fastllm::distributed::Qwen3KVUsage{};
+        std::vector<uint8_t> result;
+        Put32(result, info.totalPages);
+        Put32(result, info.freePages);
+        return result;
+#else
+        throw std::runtime_error("worker was built without CUDA");
+#endif
+    }
+
     /** 查询或同步释放唯一请求 KV；未加载模型也返回全零状态，禁止 control-only。 */
     std::vector<uint8_t> RequestState(bool end, bool clearPrefix = false, int clearLayer = -1, bool preparePrefix = false) {
         if (controlOnly) {
@@ -630,6 +644,11 @@ int main(int argc, char **argv) {
                     if (!initialized) throw std::runtime_error("MoE round before Initialize");
                     payload = runtime.StepMoe(rank, world, message.payload);
                     response = Kind::MoeLogits;
+                    break;
+                case Kind::QueryQwen3KVUsage:
+                    if (!initialized || !message.payload.empty()) throw std::runtime_error("invalid KV pressure query");
+                    payload = runtime.KVUsage();
+                    response = Kind::Qwen3KVUsageState;
                     break;
                 case Kind::EndQwen3Request:
                 case Kind::QueryQwen3Request:

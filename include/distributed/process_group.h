@@ -43,6 +43,11 @@ struct ProcessModelInfo {
     uint64_t sourceBytesRead = 0;
 };
 
+/** 最紧张的单层K/V页池；尚未建立页池时两项均为0，不包含可回收前缀页。 */
+struct Qwen3KVUsage {
+    uint32_t totalPages = 0, freePages = 0;
+};
+
 /** 单模型执行证据；dense 请求结束释放图，MoE 图跨请求复用，卸载模型清零。 */
 struct Qwen3GraphInfo {
     bool enabled = false, active = false;
@@ -270,6 +275,9 @@ public:
 
     /** @return 各 rank 的请求 KV、Graph、规约和前缀快照证据；无活动请求时仅请求 KV 为零。失败终止整组。 */
     std::vector<Qwen3RequestInfo> Qwen3Requests();
+
+    /** 查询各worker的真实页池压力；仅读CPU计数，不同步GPU或枚举前缀目录。 */
+    std::vector<Qwen3KVUsage> Qwen3KVUsages();
 
     /**
      * 停止监控、请求正常退出并回收全部 worker。

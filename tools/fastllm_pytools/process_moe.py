@@ -18,7 +18,7 @@ class ProcessMoeModel(ProcessTPModel):
             raise ValueError('ProcessMoeModel requires --attention-dp')
         self.plan = build_parallel_plan(args)
         self.concurrency = self.attention_dp_size = self.ep_size = self.plan['ep_size']
-        self.routing = getattr(args, 'dp_routing', 'round_robin')
+        self.routing = getattr(args, 'dp_routing', None) or 'round_robin'
         devices = [rank['device']['logical_id'] for rank in self.plan['ranks']]
         super().__init__(args, _device_ids=devices)
 

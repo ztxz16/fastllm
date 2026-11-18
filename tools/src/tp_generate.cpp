@@ -2,7 +2,9 @@
 #include "json11.hpp"
 #include "tp_graph_report.h"
 
+#include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cerrno>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -251,6 +253,20 @@ public:
     }
 };
 
+/** 汇总各worker最紧张页池的计数；计算步外仅读CPU状态，不触发GPU同步。 */
+Json::object LoadState(ProcessGroup &group) {
+    Json::array workers;
+    double usage = 0;
+    auto states = group.Qwen3KVUsages();
+    for (size_t rank = 0; rank < states.size(); ++rank) {
+        const auto &state = states[rank];
+        if (state.totalPages) usage = std::max(usage, 1.0 - double(state.freePages) / state.totalPages);
+        workers.push_back(Json::object{{"rank", int(rank)}, {"total_pages", int(state.totalPages)},
+                                      {"free_pages", int(state.freePages)}});
+    }
+    return {{"workers", workers}, {"kv_cache_usage", usage}};
+}
+
 /**
  * 在同一进程组串行处理多次生成；权重只加载一次，每次生成独立释放 KV。
  * @param group 已加载模型的进程组；退出时卸载并停止。
@@ -271,6 +287,8 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
     ready["graph"] = GraphState(group);
     ready["cancellation"] = cancellation ? "request_id_datagram" : "none";
     ready["token_events"] = true;
+    ready["load_stats"] = 1;
+    ready["load"] = LoadState(group);
     socket.Write(ready);
     uint64_t expected = 1;
     bool shutdown = false;
@@ -280,7 +298,7 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
         if (id != expected++) throw std::runtime_error("out-of-order session request id");
         const auto op = message["op"].string_value();
         const std::set<std::string> fields = op == "generate" ?
-            std::set<std::string>{"id", "op", "request", "stream_tokens"} : std::set<std::string>{"id", "op"};
+            std::set<std::string>{"id", "op", "request", "stream_tokens", "stream_load"} : std::set<std::string>{"id", "op"};
         for (const auto &item : message.object_items()) {
             if (!fields.count(item.first)) throw std::runtime_error("unknown session field");
         }
@@ -297,7 +315,24 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
             throw std::runtime_error("stream_tokens must be boolean");
         }
         bool streamTokens = message["stream_tokens"].bool_value();
+        if (message.object_items().count("stream_load") && !message["stream_load"].is_bool())
+            throw std::runtime_error("stream_load must be boolean");
+        const bool streamLoad = message["stream_load"].bool_value();
         uint32_t tokenIndex = 0;
+        uint32_t loadSequence = 0;
+        auto lastLoad = std::chrono::steady_clock::time_point{};
+        auto emitLoad = [&](bool complete) {
+            if (!streamLoad) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (!complete && loadSequence && now - lastLoad < std::chrono::milliseconds(100)) return;
+            auto event = LoadState(group);
+            event["event"] = "load";
+            event["id"] = static_cast<long long>(id);
+            event["sequence"] = static_cast<long long>(loadSequence++);
+            event["phase"] = complete ? "complete" : "running";
+            socket.Write(event);
+            lastLoad = now;
+        };
 
         Json::object result{{"event", "result"}, {"id", static_cast<long long>(id)},
             {"status", "FAIL"}, {"backend", report["backend"]}, {"workers", report["workers"]},
@@ -307,6 +342,7 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
                 if (socket.Disconnected()) throw std::runtime_error("session client disconnected");
                 return cancellation && cancellation->Requested(id);
             }, [&](uint32_t token) {
+                emitLoad(false);
                 if (streamTokens) {
                     socket.Write(Json::object{{"event", "token"}, {"id", static_cast<long long>(id)},
                         {"index", static_cast<long long>(tokenIndex++)}, {"token_id", static_cast<long long>(token)}});
@@ -326,10 +362,12 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
                 } catch (...) {}
             }
             result["reusable"] = reusable;
+            if (reusable) emitLoad(true);
             socket.Write(result);
             if (!reusable) throw;
             continue;
         }
+        emitLoad(true);
         socket.Write(result);
     }
 

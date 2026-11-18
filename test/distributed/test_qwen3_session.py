@@ -58,6 +58,12 @@ def fixture():
     saved_prompt = []
     snapshots = []
 
+    def load_state(free=100):
+        total = int(args['--tokens']) // int(args['--page-size']) if '--tokens' in args and '--page-size' in args else 100
+        available = round(total*free/100)
+        return dict(workers=[dict(rank=rank, total_pages=total, free_pages=available) for rank in range(len(devices))],
+                    kv_cache_usage=1.0-available/total)
+
     def cache_request(request):
         nonlocal snapshots
         ids = request['token_ids']
@@ -85,7 +91,9 @@ def fixture():
 
     def send(value):
         nonlocal saved_prompt
-        if value['event'] != 'token' and mode != 'graph_missing':
+        if value['event'] == 'ready' and mode != 'load_legacy':
+            value.update(load_stats=1, load=load_state())
+        if value['event'] not in ('token', 'load') and mode != 'graph_missing':
             event = value['event']
             if event == 'result' and value['status'] == 'PASS':
                 if prefix_enabled and not mode.startswith('dp_routing'):
@@ -148,8 +156,10 @@ def fixture():
         data = json.dumps(value, indent=2).encode()
         framed = struct.pack("!I", len(data)) + data
         # 验证读取可以正确组装分段 header/body，多行 JSON 不依赖 stdout。
-        for offset in range(0, len(framed), 7):
-            channel.sendall(framed[offset:offset+7])
+        # 启动测试刻意暂停rank0读取；扩大分段避免TP2 ready的逐7字节send耗尽socket元数据缓冲。
+        chunk = 64 if mode.startswith('dp_startup_gate') else 7
+        for offset in range(0, len(framed), chunk):
+            channel.sendall(framed[offset:offset+chunk])
 
     def read(size):
         result = b""
@@ -197,6 +207,55 @@ def fixture():
             send(dict(event='prefix_cache_cleared', id=message['id'], status='PASS', cache=cache))
             continue
         request = message["request"]
+        load_sequence = 0
+
+        def emit_load(complete=False):
+            nonlocal load_sequence
+            if not message.get('stream_load'):
+                return
+            pressure = Path(args['--model']) / f'pressure-{devices[0]}.json'
+            state = load_state() if complete else (json.loads(pressure.read_text()) if pressure.exists() else load_state(25))
+            if not complete and not pressure.exists() and '--tokens' in args and '--page-size' in args:
+                page = int(args['--page-size'])
+                total = int(args['--tokens']) // page
+                state = load_state(100 * (total - (len(request['token_ids'])+page-1)//page) / total)
+            event = dict(state, event='load', id=message['id'], sequence=load_sequence,
+                         phase='complete' if complete else 'running')
+            load_sequence += 1
+            if mode == 'load_bad_id':
+                event['id'] += 1
+            if mode == 'load_bad_seq':
+                event['sequence'] += 1
+            if mode == 'load_bad_pages':
+                event['workers'][0]['free_pages'] = -1
+            if mode == 'load_bad_usage':
+                event['kv_cache_usage'] = 2.0
+            if mode == 'load_dirty_final' and complete:
+                event.update(load_state(50))
+            if not (complete and mode == 'load_missing_final'):
+                send(event)
+            if complete and mode == 'load_duplicate_final':
+                send(event)
+
+        if request.get('max_new_tokens', 1) > 0:
+            emit_load()
+        if mode.startswith('dp_load_gate'):
+            model = Path(args['--model'])
+            (model / f'begin-{devices[0]}-{message["id"]}').touch()
+            gate_deadline = time.monotonic() + 10
+            gate_cancelled = False
+            while not (model / f'release-{devices[0]}-{message["id"]}').exists():
+                if select.select([cancellation], [], [], 0.01)[0]:
+                    if struct.unpack('!I', cancellation.recv(4))[0] == message['id']:
+                        gate_cancelled = True
+                        break
+                if time.monotonic() >= gate_deadline:
+                    raise RuntimeError('load gate not released')
+            if gate_cancelled:
+                emit_load(True)
+                send(dict(event='result', id=message['id'], status='FAIL', backend=BACKEND, workers=workers,
+                          reusable=True, cancelled=True, error='cancelled at gate', cache_after_error=cache, steps=[]))
+                continue
         if mode.startswith('dp_routing') and prefix_enabled and request.get('max_new_tokens', 0) > 0:
             cache_request(request)
         if mode == 'dp_overlap':
@@ -223,7 +282,7 @@ def fixture():
                       workers=workers, reusable=True, request=request, token_ids=[request["token_ids"][0]],
                       finish_reason="eos" if request["token_ids"][0] in request.get("eos_token_ids", []) else "length",
                       cache_after_generate=cache)
-        if (mode in ('graph_normal', 'graph_stale', 'dp_smoke') or mode.startswith(('ar_', 'prefix_', 'dp_routing'))) and request.get('max_new_tokens', 0) > 0:
+        if (mode in ('graph_normal', 'graph_stale', 'dp_smoke') or mode.startswith(('ar_', 'prefix_', 'dp_routing', 'dp_load'))) and request.get('max_new_tokens', 0) > 0:
             result['token_ids'] *= request['max_new_tokens']
             result['steps'] = [dict(token_id=token) for token in result['token_ids']]
         if message.get("stream_tokens"):
@@ -242,7 +301,7 @@ def fixture():
                 result["token_ids"] = [token+1]
             if mode == "stream_error_float":
                 result.update(status="FAIL", steps=[dict(token_id=float(token))], cache_after_error=cache)
-            if mode in ("stream_burst", "stream_eos", "dp_smoke") or (mode.startswith('dp_routing') and request.get('max_new_tokens', 1) < 128):
+            if mode in ("stream_burst", "stream_eos", "dp_smoke") or mode.startswith('dp_load') or (mode.startswith('dp_routing') and request.get('max_new_tokens', 1) < 128):
                 count = request.get("max_new_tokens", 1)
                 if mode == "stream_eos":
                     count = 1
@@ -270,6 +329,7 @@ def fixture():
             result["token_ids"] = [1.0]
         if mode == "fatal":
             result.update(status="FAIL", error="worker failed", reusable=False)
+        emit_load(True)
         send(result)
 
 

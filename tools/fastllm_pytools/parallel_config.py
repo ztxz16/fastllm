@@ -36,6 +36,15 @@ def is_attention_ep(args):
     return value.get('model_type') == 'qwen2_moe'
 
 
+def resolve_dp_routing(args):
+    """/** 未指定策略时仅普通进程DP使用load；保留单副本和Attention DP/EP默认行为。 */"""
+    value = getattr(args, 'dp_routing', None)
+    if value is not None:
+        return value
+    return 'load' if (getattr(args, 'dp', 1) > 1 and getattr(args, 'tp_backend', 'thread') == 'process'
+                      and not is_attention_ep(args)) else 'round_robin'
+
+
 def cuda_inventory():
     """/**
      * 查询当前进程实际可见的 CUDA 设备，不创建或保留 CUDA context。
@@ -113,9 +122,11 @@ def validate_parallel_options(args, *, planning=False):
     backend = getattr(args, 'tp_backend', 'thread')
     if backend not in ('thread', 'process'):
         raise ValueError('tp_backend must be thread or process')
-    routing = getattr(args, 'dp_routing', 'round_robin')
-    if type(routing) is not str or routing not in ('round_robin', 'prefix'):
-        raise ValueError('--dp-routing must be round_robin or prefix')
+    routing = resolve_dp_routing(args)
+    if type(routing) is not str or routing not in ('round_robin', 'prefix', 'load'):
+        raise ValueError('--dp-routing must be round_robin, prefix or load')
+    if routing == 'load' and (dp <= 1 or attention_ep or backend != 'process'):
+        raise ValueError('--dp-routing load requires ordinary DP>1 and --tp-backend process')
     if routing == 'prefix' and ((dp <= 1 and not attention_ep) or backend != 'process' or getattr(args, 'prefix_cache', '') != 'true'):
         raise ValueError('--dp-routing prefix requires DP>1 or Attention DP/EP, --tp-backend process and --prefix-cache true')
     request_log = getattr(args, 'tp_request_log', 'on')
@@ -224,7 +235,7 @@ def build_parallel_plan(args):
                   'device': device} for rank, device in enumerate(selected)]
         return {'mode': 'attention_dp_ep', 'dp_size': 1, 'tp_size': 1,
                 'attention_dp_size': count, 'ep_size': count, 'total_gpus': count,
-                'tp_backend': 'process', 'dp_routing': getattr(args, 'dp_routing', 'round_robin'),
+                'tp_backend': 'process', 'dp_routing': resolve_dp_routing(args),
                 'preview_only': True, 'attention_ep_execution_available': True,
                 'cuda_visible_devices': visible, 'driver_cuda_version': inventory['driver_cuda_version'],
                 'visible_device_count': available, 'ranks': ranks,
@@ -249,7 +260,7 @@ def build_parallel_plan(args):
 
     return {'mode': 'replica_dp_tp', 'attention_dp_size': 1, 'ep_size': 1,
             'dp_size': dp, 'tp_size': tp, 'total_gpus': dp * tp, 'tp_backend': getattr(args, 'tp_backend', 'thread'),
-            'dp_routing': getattr(args, 'dp_routing', 'round_robin'),
+            'dp_routing': resolve_dp_routing(args),
             'preview_only': True, 'multi_replica_execution_available': True,
             'cuda_visible_devices': visible, 'driver_cuda_version': inventory['driver_cuda_version'],
             'visible_device_count': available,
