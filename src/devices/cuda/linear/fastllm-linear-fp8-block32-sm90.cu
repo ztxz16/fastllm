@@ -62,7 +62,7 @@ struct Projection {
     static bool Configure() {
         return cudaFuncSetAttribute(Kernel(), cudaFuncAttributeMaxDynamicSharedMemorySize, Shared) == cudaSuccess;
     }
-    static bool Run(void *a, void *b, float *sa, float *sb, void *out,
+    static bool Run(void *a, void *b, float *sa, float *sb, __nv_bfloat16 *out, float *partial,
                     int rows, int inner, int channels, int paddedRows) {
         cute::TmaDescriptor ta, tb, td, tsa, tsb;
         int m = rows, n = channels;
@@ -80,11 +80,16 @@ struct Projection {
                 !MakeTma(tsb, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sb, inner / 32, channels, inner / 8, 4, BN) ||
                 !MakeTma(td, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, out, channels, rows, channels * 2, 64, BM, CU_TENSOR_MAP_SWIZZLE_128B)) return false;
         }
+        void *result = Split ? static_cast<void *>(partial) : static_cast<void *>(out);
         auto kernel = Kernel();
         kernel<<<dim3(kWorkers, Split ? 2 : 1), 128 + (BM <= 64 ? 128 : 256), Shared, cudaStreamPerThread>>>(
-            out, rows, m, n, inner, ta, tb, td, tsa, tsb);
+            result, rows, m, n, inner, ta, tb, td, tsa, tsb);
         auto error = cudaGetLastError();
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+        if constexpr (Split) {
+            const size_t length = size_t(rows) * channels;
+            ReduceSplit<<<(length + 255) / 256, 256, 0, cudaStreamPerThread>>>(partial, out, length);
+        }
         return true;
     }
 };
@@ -95,9 +100,35 @@ using Small8 = Projection<256, 8, 6, true, false>;
 using Small16 = Projection<256, 16, 5, true, false>;
 using Split8 = Projection<128, 8, 6, true, true>;
 using Split16 = Projection<128, 16, 6, true, true>;
+using Swapped32 = Projection<128, 32, 6, true, false>;
+using Swapped64 = Projection<128, 64, 4, true, false>;
+using Split32 = Projection<128, 32, 4, true, true>;
+using Split64 = Projection<128, 64, 4, true, true>;
 using Medium32 = Projection<32, 64, 4, false, false>;
 using Medium64 = Projection<64, 64, 4, false, false>;
 using Large = Projection<128, 64, 6, false, false>;
+
+auto SelectProjection(int rows, int inner, int channels, bool splitFits) {
+    const bool canSplit = splitFits && inner >= 2048 && inner % 256 == 0;
+    if (rows <= 16) {
+        if (canSplit && channels <= 8192)
+            return rows <= 8 ? Split8::Run : Split16::Run;
+        return rows <= 8 ? Small8::Run : Small16::Run;
+    }
+    if (inner >= 2048 && channels >= 4096) {
+        // Put the short token dimension on WGMMA N. Narrow, long-K
+        // outputs also benefit from two CTAs working on the same tile.
+        if (rows <= 64) {
+            if (canSplit && channels == 4096 && inner >= (rows <= 32 ? 4096 : 8192))
+                return rows <= 32 ? Split32::Run : Split64::Run;
+            return Swapped32::Run;
+        }
+        // A second 128-row M tile would be at most half full.
+        if (rows > 128 && rows <= 192 && channels >= 8192)
+            return Swapped64::Run;
+    }
+    return rows <= 32 ? Medium32::Run : rows <= 64 ? Medium64::Run : Large::Run;
+}
 
 bool PrepareKernels() {
     static thread_local std::map<int, bool> ready;
@@ -106,7 +137,9 @@ bool PrepareKernels() {
     if (found != ready.end()) return found->second;
     if (FastllmCudaGraphIsCapturingFast()) return false;
     const bool ok = Small8::Configure() && Small16::Configure() && Split8::Configure() &&
-        Split16::Configure() && Medium32::Configure() && Medium64::Configure() && Large::Configure();
+        Split16::Configure() && Swapped32::Configure() && Swapped64::Configure() &&
+        Split32::Configure() && Split64::Configure() && Medium32::Configure() &&
+        Medium64::Configure() && Large::Configure();
     if (!ok) cudaGetLastError();
     ready.emplace(device, ok);
     return ok;
@@ -131,11 +164,10 @@ bool FastllmCudaBlock32W8A8SM90(const void *input, const void *weight, const flo
     rowLimit = rowLimit / rowAlignment * rowAlignment;
     if (!rowLimit) return false;
     const int chunk = std::min(rows, rowLimit), padded = (chunk + 7) / 8 * 8;
-    const bool split = chunk <= 16 && channels <= 8192 && inner >= 2048 && inner % 256 == 0;
     const size_t inputBytes = (size_t(padded) * inner + 255) / 256 * 256;
     const size_t scaleBytes = (size_t(padded) * (inner / 32) * sizeof(float) + 255) / 256 * 256;
-    const size_t partialBytes = split ? size_t(chunk) * channels * 2 * sizeof(float) : 0;
-    if (inputBytes + scaleBytes + partialBytes > capacity) return false;
+    if (inputBytes + scaleBytes > capacity) return false;
+    const size_t partialCapacity = capacity - inputBytes - scaleBytes;
     const bool capturing = FastllmCudaGraphIsCapturingFast();
     auto state = fastllm_bf16_lt::GetState(FastllmCudaGetDevice(), capturing);
     if (!state) return false;
@@ -150,19 +182,11 @@ bool FastllmCudaBlock32W8A8SM90(const void *input, const void *weight, const flo
         auto dst = static_cast<__nv_bfloat16 *>(output) + size_t(offset) * channels;
         QuantizeBlock32<<<(size_t(scaleRows) * inner / 8 + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             src, quantized, activationScales, count, inner, scaleRows);
-        // A final tail of a large call uses the ordinary orientation; workspace
-        // sizing never depends on an unallocated split-K tail buffer.
-        void *result = split ? static_cast<void *>(partial) : dst;
-        const auto run = split ? (count <= 8 ? Split8::Run : Split16::Run) :
-            chunk <= 16 ? (count <= 8 ? Small8::Run : Small16::Run) :
-            count <= 32 ? Medium32::Run : count <= 64 ? Medium64::Run : Large::Run;
+        const bool splitFits = size_t(count) * channels * 2 * sizeof(float) <= partialCapacity;
+        const auto run = SelectProjection(count, inner, channels, splitFits);
         const bool ok = run(quantized, const_cast<void *>(weight), activationScales,
-            const_cast<float *>(scales), result, count, inner, channels, scaleRows);
+            const_cast<float *>(scales), dst, partial, count, inner, channels, scaleRows);
         if (!ok) throw std::runtime_error("SM90 block32 FP8 TMA descriptor rejected");
-        if (split) {
-            const size_t length = size_t(count) * channels;
-            ReduceSplit<<<(length + 255) / 256, 256, 0, cudaStreamPerThread>>>(partial, dst, length);
-        }
     }
     return true;
 }

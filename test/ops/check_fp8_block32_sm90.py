@@ -54,7 +54,9 @@ def main():
         for name in ['FastllmCudaGraphDestroy', 'FastllmCudaGraphExecDestroy']:
             getattr(lib, name).argtypes = [p]
         shapes = [(320, 384), (4096, 8192), (14848, 4096)]
-        sizes = [1, 3, 8, 9, 16, 17, 32, 33, 64, 65, 128, 4096, 4097]
+        # At K=8192 the 8 MiB arena fits an 896-row chunk. Its 32-row tail
+        # would normally split K, but the remaining scratch cannot hold both partials.
+        sizes = [1, 3, 8, 9, 16, 17, 31, 32, 33, 63, 64, 65, 128, 129, 192, 193, 928, 4096, 4097]
         if args.smoke: shapes, sizes = shapes[:1], [1, 17, 4097]
         graphs = []
         for n, k in shapes:
