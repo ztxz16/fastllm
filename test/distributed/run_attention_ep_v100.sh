@@ -61,9 +61,13 @@ PY
         ;;
     performance)
         read -r -a moe_perf_lengths <<< "${ATTENTION_EP_PERF_PROMPT_LENGTHS:-32}"
+        read -r -a moe_perf_caches <<< "${ATTENTION_EP_PERF_CACHE_STATES:-off cold hot}"
+        read -r -a moe_perf_concurrencies <<< "${ATTENTION_EP_PERF_CONCURRENCIES:-1 4 8}"
         "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" --model "$moe_model" --performance \
             --performance-prompt-lengths "${moe_perf_lengths[@]}" \
-            --performance-output-tokens "${ATTENTION_EP_PERF_OUTPUT_TOKENS:-16}"
+            --performance-output-tokens "${ATTENTION_EP_PERF_OUTPUT_TOKENS:-16}" \
+            --performance-cache-states "${moe_perf_caches[@]}" \
+            --performance-concurrencies "${moe_perf_concurrencies[@]}"
         ;;
     http)
         "$moe_python" test/distributed/run_qwen_moe_http.py "${moe_common[@]}" --model "$moe_model"
