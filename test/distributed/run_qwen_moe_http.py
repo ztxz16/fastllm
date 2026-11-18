@@ -73,7 +73,9 @@ def main():
                     idle()
                     status, events = stream_call(address, dict(payload, stream=True, stream_options=dict(include_usage=True)),
                                                  'sse', suite.output)
-                    require(status == 200 and events[-1] == '[DONE]', 'SSE missing DONE')
+                    require(status == 200, f'SSE HTTP {status}: {events}')
+                    require(events and events[-1] == '[DONE]',
+                            f'SSE missing DONE; last event: {events[-1] if events else None}')
                     text = ''.join(e['choices'][0]['delta'].get('content', '') for e in events if isinstance(e, dict) and e.get('choices'))
                     require(text == baseline['choices'][0]['message']['content'], 'HTTP/SSE output differs')
                     return dict(events=events)

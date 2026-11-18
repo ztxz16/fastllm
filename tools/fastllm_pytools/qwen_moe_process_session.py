@@ -128,6 +128,7 @@ class QwenMoeProcessSession:
     def generate(self, request, *, cancel_event=None, on_token=None, teacher_forced_tokens=None):
         """/**
          * 入队并在调用线程消费token；完成通知仅在rank已释放后发出。
+         * 正常结束保留共享取消标志；调用线程提前退出且请求未完成时才发出清理取消。
          * @param teacher_forced_tokens 仅trace诊断允许的后续输入ID，长度为max_new_tokens-1。
          *        它替换下一步输入而不替换采样结果，复用正式KV/算子/通信路径；HTTP不暴露此参数。
          * @return 实际采样结果和可选logits；教师强制报告同时保留真正使用的输入历史。
@@ -174,7 +175,8 @@ class QwenMoeProcessSession:
                 raise job['error']
             return job['report']
         finally:
-            job['cancel'].set()
+            if not job['done'].is_set():
+                job['cancel'].set()
 
     def _finish(self, job):
         """/** 保存请求级证据再通知调用方；失败报告仍保留已完成 token。 */"""
