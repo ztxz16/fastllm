@@ -301,11 +301,99 @@ static void TestSwaPrefillScratch() {
     }
 }
 
+static void TestLocalPrefillBatch() {
+    for (bool fp8Compute : {false, true}) {
+        struct Item { Data q{BFLOAT16}, w{BFLOAT16}, k{BFLOAT16}, packed, reference, actual; };
+        std::vector<std::unique_ptr<Item>> storage;
+        std::vector<FastllmNaivePrefillIndexerItem> items;
+        // Include a short fallback, ragged score sizes requiring aligned FP8 refinement
+        // scratch, >8 items, and bounded long-context tiles.
+        for (int i = 0; i < 10; ++i) {
+            auto item = std::make_unique<Item>();
+            const int rows = i == 0 ? 1 : i == 9 ? 1153 : 65 + i * 17;
+            const int keys = i == 9 ? 131075 : 8193 + i * 131;
+            Upload(item->q, {1, rows, 2048}, 53 + i);
+            Upload(item->w, {1, rows, 16}, 71 + i);
+            Upload(item->k, {1, keys, 128}, 113 + i);
+            if (fp8Compute || i % 2) FastllmCudaNaivePackIndexer(item->k, item->packed);
+            Data &key = fp8Compute || i % 2 ? item->packed : item->k;
+            FastllmCudaNaiveIndexer(item->q, item->w, key, 16, 128, keys-rows, 2048, true,
+                item->reference, false, nullptr, fp8Compute);
+            items.push_back({&item->q, &item->w, &key, &item->actual, keys-rows});
+            storage.push_back(std::move(item));
+        }
+        FastllmCudaNaiveBatchIndexer(items, 16, 128, 2048, true, nullptr, fp8Compute);
+        for (const auto &item : storage)
+            Require(Read<int>(item->reference) == Read<int>(item->actual), "DP Indexer batch changed exact indices");
+        ++checks;
+    }
+    for (bool fp8 : {false, true}) {
+        struct Item {
+            Data q{BFLOAT16}, k{BFLOAT16}, v{BFLOAT16}, ids{INT32}, reference, actual;
+            PagedCacheManager keyPool, valuePool;
+            Data keyTable{INT32}, valueTable{INT32}, pagedKey{FP8_E4M3}, pagedValue{FP8_E4M3};
+        };
+        std::vector<std::unique_ptr<Item>> storage;
+        std::vector<FastllmNaivePrefillAttentionItem> items;
+        const int heads = fp8 ? 128 : 32, kvHeads = fp8 ? 4 : 2;
+        Data sink(FLOAT32); Upload(sink, {heads}, 171);
+        for (int i = 0; i < 4; ++i) {
+            auto item = std::make_unique<Item>();
+            const int rows = i == 0 ? 1 : fp8 ? 2110 + i : 257 + i * 137, keys = 65536 + rows;
+            Upload(item->q, {1, rows, heads*192}, 53+i);
+            auto fill = [&](Data &data, int width, unsigned seed) {
+                if (!fp8) { Upload(data, {1, keys, width}, seed); return; }
+                data.dataType = FP8_E4M3; data.UpdateUnitSize();
+                data.Resize({1, keys, width}); data.Allocate();
+                for (uint64_t j=0;j<data.Count(0);++j) {
+                    seed=seed*1664525u+1013904223u;
+                    data.cpuData[j]=__nv_fp8_e4m3(((int)(seed>>16)-32768)/32768.f).__x;
+                }
+                data.ToDevice(DataDevice::CUDA,{0},true);
+            };
+            fill(item->k, kvHeads*192, 71+i); fill(item->v, kvHeads*128, 113+i);
+            auto &ids=item->ids; ids.Resize({rows,2048}); ids.Allocate();
+            for (int row=0;row<rows;++row) for(int j=0;j<2048;++j)
+                ((int *)ids.cpuData)[size_t(row)*2048+j] = row==0 || j%97==0 ? -1 : (j*137+row*13)%keys;
+            ids.ToDevice(DataDevice::CUDA,{0},true);
+            auto page = [&](const Data &src, Data &view, Data &table, PagedCacheManager &pool) {
+                const int pages = (keys + 127) / 128, width = src.dims[2];
+                pool.dataType = FP8_E4M3; pool.UpdateUnitSize(); pool.pageLen = 128;
+                pool.Resize({pages,128,1,width}); pool.ToDevice(DataDevice::CUDA,{0},false);
+                pool.Allocate(false); pool.SetMaxPages(pages);
+                table.Resize({pages}); table.Allocate();
+                for (int j=0;j<pages;++j) ((int *)table.cpuData)[j]=pages-1-j;
+                table.ToDevice(DataDevice::CUDA,{0},true);
+                for (int first=0;first<keys;first+=128)
+                    Require(cudaMemcpyAsync((uint8_t *)pool.cudaData+size_t(pages-1-first/128)*128*width,
+                        (const uint8_t *)src.cudaData+size_t(first)*width,size_t(std::min(128,keys-first))*width,
+                        cudaMemcpyDeviceToDevice,cudaStreamPerThread)==cudaSuccess,"paged Attention setup");
+                view.FakeFrom(table,0); view.dataType=FP8_E4M3; view.UpdateUnitSize(); view.Resize(src.dims);
+                view.isPagedKVCache=true; view.pagedKVCacheData=&pool; view.pageLen=128;
+                view.expansionDims={1,pages*128,width};
+            };
+            if (fp8 && i%2) {
+                page(item->k,item->pagedKey,item->keyTable,item->keyPool);
+                page(item->v,item->pagedValue,item->valueTable,item->valuePool);
+            }
+            Data &key=fp8 && i%2?item->pagedKey:item->k, &value=fp8 && i%2?item->pagedValue:item->v;
+            FastllmCudaNaiveAttention(item->q,key,value,ids,sink,heads,kvHeads,192,128,keys-rows,0,item->reference);
+            items.push_back({&item->q,&key,&value,&ids,&item->actual,keys-rows});
+            storage.push_back(std::move(item));
+        }
+        FastllmCudaNaiveBatchAttention(items, sink, heads, kvHeads, 192, 128);
+        for (const auto &item : storage)
+            Require(Read<uint16_t>(item->reference) == Read<uint16_t>(item->actual), "DP Attention batch changed BF16 output bits");
+        ++checks;
+    }
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
+        TestLocalPrefillBatch();
         TestSwaPrefillScratch(); TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();
         Require(cudaDeviceSynchronize()==cudaSuccess,"prefill CUDA synchronization failed");
         std::printf("Naive prefill regression passed: %d cases\n",checks);

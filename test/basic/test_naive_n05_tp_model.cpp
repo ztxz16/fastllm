@@ -3519,7 +3519,8 @@ class Fixture : public NaiveN05FlashModel {
             KvMemConfig cfg; cfg.enabled=true; cfg.maxTokens=4096; cfg.residentTokens=2048;
             cfg.prefillTokens=2304; cfg.hostBytes=1ULL<<30; ConfigureKvMem(cfg);
         }
-        SetSaveHistoryChat(false); WarmUp(); SetCudaGraph(graph);
+        // Decode may only replay shapes prepared during warmup.
+        SetSaveHistoryChat(false); SetCudaGraph(graph); WarmUp();
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         const int graphLaunches = verifyGraphLaunches;
 #endif
@@ -3529,7 +3530,6 @@ class Fixture : public NaiveN05FlashModel {
         GenerationConfig config; config.input_token_length = 2304; config.output_token_limit = 128;
         std::vector<std::vector<float>> result;
         LogitsSelection selection; selection.cudaLogits = true;
-        draftTargetLayers = {0, 1};
         for (int turn = 0; turn < 7; ++turn) {
             std::vector<int> order, lengths;
             std::vector<float> ids, positions;
@@ -3547,7 +3547,7 @@ class Fixture : public NaiveN05FlashModel {
             }
             std::vector<GenerationConfig> configs(order.size(), config);
             TargetBatch batch{pointers, configs, lengths, block_cnt};
-            TargetCapture capture; capture.selection = &selection;
+            TargetCapture capture; capture.collectHidden = false; capture.selection = &selection;
             Cache unused;
             auto logits = RunDraftTarget(Data(FLOAT32, {1, (int)ids.size()}, ids),
                 Data(FLOAT32, {1, (int)positions.size()}, positions), unused, config, capture, &batch);

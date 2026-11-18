@@ -42,15 +42,16 @@ __device__ __forceinline__ int SelectedKey(const int *indices, int query, int sl
 }
 #endif
 
-__global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, FastllmNaiveKV k,
-        const int *indices, float *scores, int heads, int kvHeads, int keyStride,
-        int keys, int count, int past, bool causal) {
+template<class Score>
+__device__ __forceinline__ void ScoresBody(const BF16 *q, FastllmNaiveKV k,
+        const int *indices, Score *scores, int heads, int kvHeads, int keyStride,
+        int keys, int count, int past, bool causal, int query, int headBlock, int keyBlock) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ __align__(16) BF16 qs[kHeads][kQkDim + 8];
     __shared__ __align__(16) BF16 ks[kKeys][kQkDim + 8];
     __shared__ int valid[kKeys];
-    const int query = blockIdx.x, h0 = blockIdx.y * kHeads;
-    const int kvHead = h0 / (heads / kvHeads), first = blockIdx.z * kKeys;
+    const int h0 = headBlock * kHeads;
+    const int kvHead = h0 / (heads / kvHeads), first = keyBlock * kKeys;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     for (int i = threadIdx.x; i < kHeads * (kQkDim / 8); i += kThreads) {
         int h = i / (kQkDim / 8), col = i % (kQkDim / 8) * 8;
@@ -89,14 +90,15 @@ __global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, FastllmNaiveKV
 #endif
 }
 
-__global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNaiveKV v,
+template<class Score>
+__device__ __forceinline__ void ValuesBody(const Score *prob, FastllmNaiveKV v,
         const int *indices, BF16 *out, int heads, int kvHeads,
-        int keys, int count, int past, bool causal) {
+        int keys, int count, int past, bool causal, int query, int headBlock) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     __shared__ __align__(16) BF16 ps[kHeads][kKeys + 8];
     __shared__ __align__(16) BF16 vs[kKeys][kValueDim + 8];
     __shared__ int selected[kKeys];
-    const int query = blockIdx.x, h0 = blockIdx.y * kHeads;
+    const int h0 = headBlock * kHeads;
     const int kvHead = h0 / (heads / kvHeads);
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int aRow = (lane & 7) + ((lane >> 3) & 1) * 8, aCol = (lane >> 4) * 8;
@@ -109,7 +111,7 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNai
         for (int i = threadIdx.x; i < kHeads * kKeys; i += kThreads) {
             int h = i / kKeys, slot = i % kKeys;
             ps[h][slot] = __float2bfloat16(selected[slot] >= 0
-                ? prob[((size_t)query * heads + h0 + h) * count + first + slot] : 0.f);
+                ? float(prob[((size_t)query * heads + h0 + h) * count + first + slot]) : 0.f);
         }
         for (int i = threadIdx.x; i < kKeys * (kValueDim / 8); i += kThreads) {
             int slot = i / (kValueDim / 8), col = i % (kValueDim / 8) * 8;
@@ -140,6 +142,91 @@ __global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNai
                 __float2bfloat16(acc[n][i]);
     }
 #endif
+}
+
+__global__ __launch_bounds__(kThreads) void Scores(const BF16 *q, FastllmNaiveKV k,
+        const int *indices, float *scores, int heads, int kvHeads, int stride,
+        int keys, int count, int past, bool causal) {
+    ScoresBody(q, k, indices, scores, heads, kvHeads, stride, keys, count, past, causal,
+        blockIdx.x, blockIdx.y, blockIdx.z);
+}
+__global__ __launch_bounds__(kThreads) void Values(const float *prob, FastllmNaiveKV v,
+        const int *indices, BF16 *out, int heads, int kvHeads,
+        int keys, int count, int past, bool causal) {
+    ValuesBody(prob, v, indices, out, heads, kvHeads, keys, count, past, causal, blockIdx.x, blockIdx.y);
+}
+struct PrefillAttentionEntry {
+    const BF16 *query;
+    FastllmNaiveKV key, value;
+    const int *indices;
+    BF16 *output;
+    int rowOffset, keys, past, stride;
+};
+struct PrefillAttentionBatch {
+    PrefillAttentionEntry entries[8];
+    int count = 0, rows = 0;
+    __device__ __forceinline__ const PrefillAttentionEntry &Find(int row) const {
+        int i = 0;
+        while (i + 1 < count && row >= entries[i + 1].rowOffset) ++i;
+        return entries[i];
+    }
+};
+__global__ __launch_bounds__(kThreads) void BatchScores(PrefillAttentionBatch batch, BF16 *scores,
+                                                       int heads, int kvHeads) {
+    const auto &e = batch.Find(blockIdx.x);
+    ScoresBody(e.query, e.key, e.indices, scores + size_t(e.rowOffset) * heads * 2048,
+        heads, kvHeads, e.stride, e.keys, 2048, e.past, true,
+        blockIdx.x - e.rowOffset, blockIdx.y, blockIdx.z);
+}
+// Retain the serial PV kernel's occupancy despite the additional request descriptor.
+__global__ __launch_bounds__(kThreads, 5) void BatchValues(PrefillAttentionBatch batch, const BF16 *scores,
+                                                       int heads, int kvHeads) {
+    const auto &e = batch.Find(blockIdx.x);
+    ValuesBody(scores + size_t(e.rowOffset) * heads * 2048, e.value, e.indices, e.output,
+        heads, kvHeads, e.keys, 2048, e.past, true, blockIdx.x - e.rowOffset, blockIdx.y);
+}
+
+// Scores and final probabilities are already BF16-rounded in the original
+// materialized path. Keep exponentials in FP32 registers until normalization,
+// with the same 256-lane reductions; only the backing storage changes.
+__global__ void BatchSoftmax(BF16 *scores, const float *sink, int heads) {
+    __shared__ float scratch[256];
+    const int row = blockIdx.x, t = threadIdx.x;
+    BF16 *values = scores + size_t(row) * 2048;
+    float maximum = sink ? sink[row % heads] : -INFINITY;
+    for (int i = t; i < 2048; i += 256) maximum = fmaxf(maximum, float(values[i]));
+    scratch[t] = maximum;
+    __syncthreads();
+    for (int step = 128; step; step >>= 1) {
+        if (t < step) scratch[t] = fmaxf(scratch[t], scratch[t + step]);
+        __syncthreads();
+    }
+    maximum = scratch[0];
+    float exps[8], sum = 0;
+    for (int i = 0; i < 8; ++i) {
+        exps[i] = expf(float(values[t + i * 256]) - maximum);
+        sum += exps[i];
+    }
+    if (t == 0 && sink) sum += expf(sink[row % heads] - maximum);
+    __syncthreads();
+    scratch[t] = sum;
+    __syncthreads();
+    for (int step = 128; step; step >>= 1) {
+        if (t < step) scratch[t] += scratch[t + step];
+        __syncthreads();
+    }
+    sum = scratch[0];
+    for (int i = 0; i < 8; ++i)
+        values[t + i * 256] = __float2bfloat16(sum > 0 ? exps[i] / sum : 0);
+}
+__global__ __launch_bounds__(kThreads) void ScoresBF16(const BF16 *q, FastllmNaiveKV key,
+        const int *indices, BF16 *scores, int heads, int kvHeads, int stride, int keys, int past) {
+    ScoresBody(q, key, indices, scores, heads, kvHeads, stride, keys, 2048, past, true,
+        blockIdx.x, blockIdx.y, blockIdx.z);
+}
+__global__ __launch_bounds__(kThreads) void ValuesBF16(const BF16 *scores, FastllmNaiveKV value,
+        const int *indices, BF16 *out, int heads, int kvHeads, int keys, int past) {
+    ValuesBody(scores, value, indices, out, heads, kvHeads, keys, 2048, past, true, blockIdx.x, blockIdx.y);
 }
 
 // Store the original E4M3 quantization result exactly in BF16, with its FP32
@@ -190,7 +277,7 @@ __global__ void QuantizeBatchIndexer(PrefillIndexerBatch batch, BF16 *q, float *
     const auto &entry = batch.Find(row);
     const int local = row - entry.rowOffset;
     const int source =
-        (local < entry.part ? entry.first + local : entry.second + local - entry.part) * 16 + headRow % 16;
+        (!entry.part || local < entry.part ? entry.first + local : entry.second + local - entry.part) * 16 + headRow % 16;
     QuantizeIndexerRow(entry.query, q, scales, 128, 0, false, source);
     if (threadIdx.x == 0)
         weights[headRow] = entry.weights[source];
@@ -410,7 +497,7 @@ __global__ __launch_bounds__(Pipeline ? 128 : 256) void IndexerScores(const BF16
 __global__ __launch_bounds__(128) void BatchIndexerScores(PrefillIndexerBatch batch, const BF16 *q, const float *scales,
                                                           const BF16 *weights, float *scores) {
     const auto &e = batch.entries[blockIdx.z];
-    if (blockIdx.y * 32 >= e.rows || blockIdx.x * 64 >= e.past + e.second + e.part)
+    if (blockIdx.y * 32 >= e.rows || blockIdx.x * 64 >= e.past + (e.part ? e.second + e.part : e.rows))
         return;
     IndexerScoresTile<true>(q + (size_t)e.rowOffset * 2048, e.key, scales + e.rowOffset * 16,
                             weights + e.rowOffset * 16, scores + e.scoreOffset, e.rows, e.keys, e.past + e.first,

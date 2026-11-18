@@ -1256,9 +1256,31 @@ Data NaiveN05FlashModel::RunTarget(
             prefillScoreBytes += (size_t)(count / prefillRanks) * keys * sizeof(float);
             if (prefillScoreBytes > (size_t(512) << 20)) { batchPrefillIndex = false; break; }
         }
+        // DP owns independent histories on this GPU. Prepare all local full-attention
+        // requests before bounded Indexer/Attention batches; SWA retains its shared
+        // rolling workspace and existing specialized kernels.
+        const bool dpPrefill = attentionParallel && AttentionTPSize() == 1 && batch &&
+            !batch->Decode() && !decodeWorkspace && !verifying && !sparseLayer &&
+            !slidingLayers[layer];
+        std::vector<FastllmNaivePrefillAttentionItem> prefillAttention;
         int attendPhase = 0;
         std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
         std::vector<std::unique_ptr<Data>> prefillViews;
+        // Retain non-owning metadata until both deferred launches have consumed it.
+        auto retainPrefillView = [&](const Data &data) {
+            auto view = std::make_unique<Data>(data.dataType);
+            if (!data.dims.empty()) {
+                view->Resize(data.dims);
+                view->FakeFrom(data, 0);
+                view->isPagedKVCache = data.isPagedKVCache;
+                view->pageLen = data.pageLen;
+                view->pagedKVCacheData = data.pagedKVCacheData;
+                view->kvCacheFp8Indexer = data.kvCacheFp8Indexer;
+            }
+            auto *result = view.get();
+            prefillViews.push_back(std::move(view));
+            return result;
+        };
         // Sequential prefill reuses one chronological history per rank. A deferred
         // batch retains its bounded per-request histories until the scoring launch.
         Data &contextGather = buf.indexContextGather;
@@ -1279,7 +1301,7 @@ Data NaiveN05FlashModel::RunTarget(
             Data noIndices;
             Data *selected = attendPhase == 2 &&
                 (decodeWorkspace ? buf.capacity : localPast + length) > indexTopK ? &indices : &noIndices;
-            int balancedIndexRanks = attendPhase == 2 ? prefillRanks : 0;
+            int balancedIndexRanks = attendPhase == 2 && batchPrefillIndex ? prefillRanks : 0;
             if (attendPhase != 2) {
                 if (sparseLayer && !batchedDSA)
                     sparseKv->ranks[tpRank]->layers[layer]->InvalidateTail(cacheKey.cudaData, localPast, cudaStreamPerThread);
@@ -1534,6 +1556,11 @@ Data NaiveN05FlashModel::RunTarget(
                                     "Ragged Indexer AllGather failed.");
                                 if (length % ranks) CompactRaggedIndexer(gathered, length, ranks, indices);
                             }
+                            else if (dpPrefill && attendPhase == 1) {
+                                prefillItems.push_back({retainPrefillView(indexQ), retainPrefillView(indexWeights),
+                                    retainPrefillView(*scoreKey), &indices, localPast});
+                                return;
+                            }
                             else FastllmCudaNaiveIndexer(indexQ, indexWeights, *scoreKey, indexHeads, indexDim,
                                                         localPast, indexTopK, indexFp8, indices, false, prefillScores, indexerComputeFP8);
                         }
@@ -1558,7 +1585,7 @@ Data NaiveN05FlashModel::RunTarget(
                     selected = &indices;
                 }
             }
-            if (batchVerifyIndex && attendPhase == 1) return;
+            if ((batchVerifyIndex || dpPrefill) && attendPhase == 1) return;
             Data stagedKey, stagedValue;
             if (sparseLayer && !batchedDSA) StageSparseKv(tpRank, layer, pastKey, pastValue, stagedKey, stagedValue);
             Data &attentionKey = sparseLayer && !batchedDSA ? stagedKey : pastKey;
@@ -1567,6 +1594,11 @@ Data NaiveN05FlashModel::RunTarget(
             if (!sink.dims.empty()) {
                 ToDataType(sink, DataType::FLOAT32);
                 sink.ToDevice(q.dataDevice, q.dataDeviceIds);
+            }
+            if (dpPrefill) {
+                prefillAttention.push_back({retainPrefillView(q), &attentionKey, &attentionValue,
+                    retainPrefillView(*selected), retainPrefillView(attn), localPast});
+                return;
             }
             if (batchedDSA) {
                 FastllmNaiveDSARow row;
@@ -1666,8 +1698,8 @@ Data NaiveN05FlashModel::RunTarget(
             attn.Resize({1, length, cfg.heads * cfg.valueDim});
             attn.ToDevice(q.dataDevice, q.dataDeviceIds, false);
             attn.Allocate(false);
-            for (int phase = 0; phase < (batchPrefillIndex || batchVerifyIndex ? 2 : 1); ++phase) {
-                attendPhase = batchPrefillIndex || batchVerifyIndex ? phase + 1 : 0;
+            for (int phase = 0; phase < (batchPrefillIndex || batchVerifyIndex || dpPrefill ? 2 : 1); ++phase) {
+                attendPhase = batchPrefillIndex || batchVerifyIndex || dpPrefill ? phase + 1 : 0;
                 int offset = 0;
                 for (int sequence = 0; sequence < batch->Size(); ++sequence) {
                     const int count = batch->lengths[sequence];
@@ -1688,7 +1720,7 @@ Data NaiveN05FlashModel::RunTarget(
                     // buffer, regardless of the number of admitted requests.
                     // Deferred Indexer scoring and decode keep independent rows.
                     const bool sharedPrefill = !batch->Decode() && !decodeWorkspace &&
-                        !verifying && !batchPrefillIndex;
+                        !verifying && !batchPrefillIndex && !dpPrefill;
                     auto &part = sharedPrefill ? buf : *buf.sequences[sequence];
                     if (decodeWorkspace || (capture && capture->ringVerify)) {
                         part.liveKeys.Resize({count});
@@ -1730,6 +1762,9 @@ Data NaiveN05FlashModel::RunTarget(
                         FastllmNcclBroadcast(buf.indexBroadcast.cudaData, buf.indexBroadcast.Count(0), INT32,
                             tpDevices[IndexerOwnerRank(layer)], gpu);
                 }
+                if (dpPrefill && phase == 0)
+                    FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
+                        indexFp8, prefillScores, indexerComputeFP8);
                 if (batchPrefillIndex && phase == 0) {
                     AssertInFastLLM((int)prefillItems.size() == batch->Size(), "Incomplete prefill Indexer batch.");
                     if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores, indexerComputeFP8)) {
@@ -1758,6 +1793,9 @@ Data NaiveN05FlashModel::RunTarget(
             auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
             attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, pastLength, reserveCapacity, attn);
         }
+        if (dpPrefill)
+            FastllmCudaNaiveBatchAttention(prefillAttention, localWeight(ap + "attention_sink_bias"),
+                cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim);
         if (batchedDSA && sparseLayer) {
             auto &cache = *sparseKv->ranks[tpRank]->layers[layer];
             // Each group contains at most the configured number of queries per

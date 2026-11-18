@@ -637,7 +637,7 @@ __global__ void SelectBatchTopK(naive_dsa_mma::PrefillIndexerBatch batch, const 
     int row = blockIdx.x;
     const auto &e = batch.Find(row);
     int local = row - e.rowOffset;
-    int count = e.past + (local < e.part ? e.first + local : e.second + local - e.part) + 1;
+    int count = e.past + (!e.part || local < e.part ? e.first + local : e.second + local - e.part) + 1;
     SelectTopKCompactRow<false>(scores + e.scoreOffset + (size_t)local * e.keys, selected, offsets, batch.rows, count, 2048,
                          4096);
 }
@@ -3636,7 +3636,24 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
 #endif
 }
 
-bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items, int rank, int ranks,
+#ifdef FASTLLM_NAIVE_DSA_MMA
+static bool LocalPrefillIndexerSupported(const fastllm::Data &q, const fastllm::Data &w,
+                                         const fastllm::Data &k, int past, bool fp8Query) {
+    using namespace fastllm;
+    return fp8Query && FastllmCudaRuntimeArch() == 90 && q.dataType == BFLOAT16 && w.dataType == BFLOAT16 &&
+        FastllmNaiveKVType(k.dataType) && q.dataDevice == DataDevice::CUDA &&
+        k.dataDevice == DataDevice::CUDA && w.dataDevice == DataDevice::CUDA &&
+        q.dataDeviceIds == k.dataDeviceIds && q.dataDeviceIds == w.dataDeviceIds &&
+        q.cudaData && w.cudaData && k.cudaData && q.dims.size() == 3 && q.dims[0] == 1 &&
+        q.dims[1] >= 32 && q.dims[2] == 2048 && w.Count(0) == (size_t)q.dims[1] * 16 &&
+        k.dims.size() == 3 && k.dims[0] == 1 &&
+        k.dims[2] >= (k.kvCacheFp8Indexer ? FastllmNaiveIndexerBytes / k.unitSize : 128) &&
+        past >= 0 && (int64_t)past + q.dims[1] <= k.dims[1] &&
+        (int64_t)q.dims[1] * k.dims[1] >= 1024 * 1024;
+}
+#endif
+
+static bool BatchPrefillIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items, int rank, int ranks,
                                           bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
@@ -3649,22 +3666,26 @@ bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillI
     // Validate the entire batch before allocating or writing any output.
     for (const auto &item : items) {
         if (!item.query || !item.weights || !item.keys || !item.indices ||
-            !BalancedIndexerSupported(*item.query, *item.weights, *item.keys, item.past, rank, ranks, fp8Query,
-                                      peerKeys) ||
+            !(ranks == 1
+                ? LocalPrefillIndexerSupported(*item.query, *item.weights, *item.keys, item.past, fp8Query)
+                : BalancedIndexerSupported(*item.query, *item.weights, *item.keys, item.past, rank, ranks, fp8Query, peerKeys)) ||
             item.query->dataDeviceIds != items[0].query->dataDeviceIds)
             return false;
         const auto &q = *item.query, &key = *item.keys;
-        int rows = q.dims[1] / ranks, part = rows / 2;
+        int rows = q.dims[1] / ranks, part = ranks == 1 ? 0 : rows / 2;
         auto &e = batch.entries[batch.count++];
         e.query = (const BF16 *)q.cudaData;
         e.weights = (const BF16 *)item.weights->cudaData;
         e.key = FastllmNaiveKV(key);
+        // FP8 refinement reuses consumed scores for 16-byte BF16 vector loads/stores.
+        // Ragged request lengths must preserve that alignment between entries.
+        scoreCount = (scoreCount + 3) & ~size_t(3);
         e.scoreOffset = scoreCount;
         e.rowOffset = batch.rows;
         e.rows = rows;
         e.part = part;
         e.first = rank * part;
-        e.second = q.dims[1] - (rank + 1) * part;
+        e.second = ranks == 1 ? 0 : q.dims[1] - (rank + 1) * part;
         e.past = item.past;
         e.keys = key.dims[1];
         e.stride = key.dims[2];
@@ -3673,7 +3694,7 @@ bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillI
             return false;
         batch.rows += rows;
         maxRows = std::max(maxRows, rows);
-        maxKeys = std::max(maxKeys, e.past + e.second + part);
+        maxKeys = std::max(maxKeys, e.past + (part ? e.second + part : rows));
     }
     for (int i = 0; i < batch.count; ++i) {
         Output(*items[i].indices, INT32, {batch.entries[i].rows, 2048});
@@ -3703,9 +3724,14 @@ bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillI
     for (int i = 0; i < batch.count; ++i) outputs[i] = batch.entries[i].output;
     if (fp8Compute) fp8Mask = LaunchFP8ShortlistIndexer(fp8Entries, batch.count, outputs);
 #endif
-    if (fp8Mask) {
+    if (fp8Mask || ranks == 1) {
         for (int i = 0; i < batch.count; ++i) if (!(fp8Mask & (1u << i))) {
             const auto &item = items[i];
+            if (ranks == 1) {
+                FastllmCudaNaiveIndexer(*item.query, *item.weights, *item.keys, 16, 128,
+                    item.past, 2048, fp8Query, *item.indices, false, scoreScratch, fp8Compute);
+                continue;
+            }
             AssertInFastLLM(FastllmCudaNaiveBalancedIndexer(*item.query, *item.weights, *item.keys,
                 item.past, rank, ranks, fp8Query, peerKeys, *item.indices, scoreScratch, false),
                 "Validated Indexer batch fallback failed.");
@@ -3726,6 +3752,62 @@ bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillI
     return false;
 #endif
 }
+bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+        int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scratch, bool fp8Compute) {
+    if (ranks != 2 && ranks != 4 && ranks != 8) return false;
+    return BatchPrefillIndexer(items, rank, ranks, fp8Query, peerKeys, scratch, fp8Compute);
+}
+
+void FastllmCudaNaiveBatchIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+        int heads, int dim, int topK, bool fp8Query, fastllm::Data *scratch, bool fp8Compute) {
+    using namespace fastllm;
+    std::vector<FastllmNaivePrefillIndexerItem> tiles;
+    std::vector<std::unique_ptr<Data>> views;
+    size_t bytes = 0;
+    auto flush = [&] {
+        if (tiles.empty()) return;
+        if (tiles.size() == 1 || !BatchPrefillIndexer(tiles, 0, 1, fp8Query, false, scratch, fp8Compute))
+            for (const auto &item : tiles)
+                FastllmCudaNaiveIndexer(*item.query, *item.weights, *item.keys, heads, dim,
+                    item.past, topK, fp8Query, *item.indices, false, scratch, fp8Compute);
+        tiles.clear(); views.clear(); bytes = 0;
+    };
+    for (const auto &item : items) {
+        bool supported = false;
+#ifdef FASTLLM_NAIVE_DSA_MMA
+        supported = heads == 16 && dim == 128 && topK == 2048 && fp8Compute &&
+            (item.keys->dataType == FP8_E4M3 || item.keys->kvCacheFp8Indexer) &&
+            LocalPrefillIndexerSupported(*item.query, *item.weights, *item.keys, item.past, fp8Query);
+#endif
+        if (!supported) {
+            flush();
+            FastllmCudaNaiveIndexer(*item.query, *item.weights, *item.keys, heads, dim,
+                item.past, topK, fp8Query, *item.indices, false, scratch, fp8Compute);
+            continue;
+        }
+        const int rows = item.query->dims[1], keys = item.keys->dims[1];
+        // Match the ordinary Indexer's tile boundaries and its merged short tail.
+        const int step = std::max<size_t>(64, (size_t(256) << 20) / (size_t(keys) * 4) / 64 * 64);
+        Output(*item.indices, INT32, {rows, topK});
+        for (int first = 0; first < rows;) {
+            int count = std::min(step, rows - first);
+            if (rows - first - count < 64) count = rows - first;
+            const size_t tileBytes = size_t(count) * keys * 4;
+            if (tiles.size() == 8 || bytes + tileBytes > (size_t(512) << 20)) flush();
+            auto q = std::make_unique<Data>(BFLOAT16, std::vector<int>{1, count, heads * dim});
+            auto w = std::make_unique<Data>(BFLOAT16, std::vector<int>{1, count, heads});
+            auto out = std::make_unique<Data>(INT32, std::vector<int>{count, topK});
+            q->FakeFrom(*item.query, size_t(first) * heads * dim * item.query->unitSize);
+            w->FakeFrom(*item.weights, size_t(first) * heads * item.weights->unitSize);
+            out->FakeFrom(*item.indices, size_t(first) * topK * sizeof(int));
+            tiles.push_back({q.get(), w.get(), item.keys, out.get(), item.past + first});
+            views.push_back(std::move(q)); views.push_back(std::move(w)); views.push_back(std::move(out));
+            bytes += tileBytes; first += count;
+        }
+    }
+    flush();
+}
+
 void FastllmCudaNaiveVerifyIndexer(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &packedKeys,
         int heads, int dim, int queryStart, int topK, bool fp8Query,
@@ -3906,6 +3988,81 @@ bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
         (size_t)key.cudaData % 16 != 0 || (size_t)value.cudaData % 16 != 0) return false;
     return LaunchNaivePrefillAttention(query, key, value, indices, sink,
         heads, kvHeads, pastLength, true, query.dims[1] / (2 * ranks), output);
+}
+
+void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim) {
+    using namespace fastllm;
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    naive_dsa_mma::PrefillAttentionBatch batch{};
+    Data scores;
+    const int tileRows = heads > 0 ? std::max<size_t>(1, (size_t(1) << 30) / (size_t(heads) * 2048 * sizeof(BF16))) : 1;
+    auto flush = [&] {
+        if (!batch.count) return;
+        Output(scores, BFLOAT16, {batch.rows, heads, 2048});
+        if (batch.count == 1) {
+            const auto &e = batch.entries[0];
+            naive_dsa_mma::ScoresBF16<<<dim3(batch.rows, heads / 16, 32), 256>>>(e.query, e.key, e.indices,
+                (BF16 *)scores.cudaData, heads, kvHeads, e.stride, e.keys, e.past);
+        } else naive_dsa_mma::BatchScores<<<dim3(batch.rows, heads / 16, 32), 256>>>(
+            batch, (BF16 *)scores.cudaData, heads, kvHeads);
+        naive_dsa_mma::BatchSoftmax<<<batch.rows * heads, 256>>>((BF16 *)scores.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads);
+        if (batch.count == 1) {
+            const auto &e = batch.entries[0];
+            naive_dsa_mma::ValuesBF16<<<dim3(batch.rows, heads / 16), 256>>>((const BF16 *)scores.cudaData,
+                e.value, e.indices, e.output, heads, kvHeads, e.keys, e.past);
+        } else naive_dsa_mma::BatchValues<<<dim3(batch.rows, heads / 16), 256>>>(
+            batch, (const BF16 *)scores.cudaData, heads, kvHeads);
+        CheckLaunch();
+        batch.count = batch.rows = 0;
+    };
+#endif
+    for (const auto &item : items) {
+#ifdef FASTLLM_NAIVE_DSA_MMA
+        const auto &q = *item.query, &k = *item.key, &v = *item.value, &ids = *item.indices;
+        const int rows = q.dims[1], keys = k.dims[1];
+        bool supported = rows >= 32 && (size_t)rows * heads >= 2048 && heads > 0 && kvHeads > 0 &&
+            heads % kvHeads == 0 && (heads / kvHeads) % 16 == 0 && dim == 192 && valueDim == 128 &&
+            q.dataType == BFLOAT16 && FastllmNaiveKVType(k.dataType) && FastllmNaiveKVType(v.dataType) &&
+            q.dataDevice == DataDevice::CUDA && k.dataDevice == DataDevice::CUDA && v.dataDevice == DataDevice::CUDA &&
+            q.dataDeviceIds == k.dataDeviceIds && q.dataDeviceIds == v.dataDeviceIds &&
+            q.cudaData && k.cudaData && v.cudaData && (size_t)q.cudaData % 16 == 0 &&
+            (size_t)k.cudaData % 16 == 0 && (size_t)v.cudaData % 16 == 0 && k.dims[2] % 8 == 0 &&
+            ids.dataType == INT32 && ids.dims == std::vector<int>({rows, 2048}) &&
+            ids.dataDevice == DataDevice::CUDA && ids.dataDeviceIds == q.dataDeviceIds && ids.cudaData &&
+            FastllmCudaFlashInferDataTypeSupported(BFLOAT16);
+        // Do not replace the faster fused/split dispatch or change its arithmetic.
+        const bool canStage = k.dataType == BFLOAT16 ||
+            (uint64_t)keys * (k.dims[2] + v.dims[2]) * sizeof(BF16) <= (size_t(256) << 20);
+        if (heads == kvHeads * 16 && rows >= (k.dataType == FP8_E4M3 ? 2048 : 1024) &&
+            FastllmCudaRuntimeArch() == 90 && k.dataType == v.dataType &&
+            FastllmNaiveAttentionKVType(k.dataType) && !k.kvCacheFp8Indexer && !v.kvCacheFp8Indexer && canStage)
+            supported = false;
+        if (supported) {
+            Output(*item.output, BFLOAT16, {1, rows, heads * valueDim});
+            for (int first = 0; first < rows;) {
+                if (batch.count == 8 || batch.rows == tileRows) flush();
+                const int count = std::min(rows - first, tileRows - batch.rows);
+                auto &e = batch.entries[batch.count++];
+                e.query = (const BF16 *)q.cudaData + size_t(first) * heads * dim;
+                e.key = FastllmNaiveKV(k); e.value = FastllmNaiveKV(v);
+                e.indices = (const int *)ids.cudaData + size_t(first) * 2048;
+                e.output = (BF16 *)item.output->cudaData + size_t(first) * heads * valueDim;
+                e.rowOffset = batch.rows; e.keys = keys;
+                e.past = item.past + first; e.stride = k.dims[2];
+                batch.rows += count; first += count;
+            }
+            continue;
+        }
+        flush();
+#endif
+        FastllmCudaNaiveAttention(*item.query, *item.key, *item.value, *item.indices, sink,
+            heads, kvHeads, dim, valueDim, item.past, 0, *item.output);
+    }
+#ifdef FASTLLM_NAIVE_DSA_MMA
+    flush();
+#endif
 }
 
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,

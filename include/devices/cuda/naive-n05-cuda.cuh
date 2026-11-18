@@ -233,6 +233,10 @@ struct FastllmNaivePrefillIndexerItem {
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
     int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
 
+// Local request batches use bounded score tiles and preserve serial fallback dispatch.
+void FastllmCudaNaiveBatchIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+    int heads, int dim, int topK, bool fp8Query, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
+
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
@@ -246,6 +250,16 @@ bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
     const fastllm::Data &key, const fastllm::Data &value,
     const fastllm::Data &indices, const fastllm::Data &sink,
     int heads, int kvHeads, int pastLength, int ranks, fastllm::Data &output);
+struct FastllmNaivePrefillAttentionItem {
+    const fastllm::Data *query, *key, *value, *indices;
+    fastllm::Data *output;
+    int past;
+};
+// Causal full-attention batches. Existing specialized kernels remain preferred;
+// the materialized MMA path shares a bounded workspace across request tiles.
+void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+    const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim);
+
 void FastllmCudaNaiveAttention(const fastllm::Data &query,
                               const fastllm::Data &key,
                               const fastllm::Data &value,
