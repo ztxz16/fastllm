@@ -17,6 +17,9 @@ struct ProjectionOptions {
     // Optional signed INT32 TP reduction, followed by scaling/rounding once.
     std::function<void(const minimax_h3::Tensor &, const minimax_h3::Tensor &,
                        const minimax_h3::Tensor &, minimax_h3::Tensor &)> rowReduction;
+    // Validated ModelOpt readers use .weight/.weight_scale with one FP32
+    // scale per output row and unrounded FP32 activation scales.
+    bool modelopt = false;
 };
 // One instance belongs to one runtime/stream. QKV is always [all Q, all K, all
 // V]. Allocations follow the caller's TensorPool and release with the model.

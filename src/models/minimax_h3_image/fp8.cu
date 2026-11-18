@@ -240,8 +240,9 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         std::vector<json11::Json> matrices;
         std::vector<float> scales;
         for (auto &key : keys) {
-            bool rowScaled = direct ? header[key + "._weight_qdata"].is_object() : unsloth;
-            auto matrix = descriptor(key + (rowScaled ? "._weight_qdata" : ".weight"), "F8_E4M3");
+            const bool torchao = !options.modelopt && (direct ? header[key + "._weight_qdata"].is_object() : unsloth);
+            const bool rowScaled = torchao || options.modelopt;
+            auto matrix = descriptor(key + (torchao ? "._weight_qdata" : ".weight"), "F8_E4M3");
             auto shape = matrix["shape"].array_items();
             require(shape.size() == 2 && shape[0].int_value() > 0 && shape[1].int_value() > 0,
                     "FP8 matrix shape");
@@ -250,7 +251,7 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
             w.cols = cols;
             w.rows += rows;
             matrices.push_back(matrix);
-            auto sd = descriptor(key + (rowScaled ? "._weight_scale" : ".weight_scale"), "F32");
+            auto sd = descriptor(key + (torchao ? "._weight_scale" : ".weight_scale"), "F32");
             std::vector<float> part(rowScaled ? rows : 1);
             read(sd, part.data(), part.size() * 4);
             for (float v : part)
@@ -322,25 +323,26 @@ struct Fp8Weights::Impl : detail::QuantizedCheckpoint {
         auto *input = reinterpret_cast<const B *>(x.data);
         auto *quantized = reinterpret_cast<uint8_t *>(q.data);
         auto *scales = reinterpret_cast<float *>(scale.data);
+        const bool bf16Scale = direct != nullptr && !options.modelopt;
         // H3's callback calibrates NVFP4; shared FP8 scales are Qwen-specific.
         if (w.rowParallel && options.qwenImage && options.activationMaximum) {
             quantize<<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols,
-                                                         direct != nullptr,true);
+                                                         bf16Scale,true);
             ck(cudaGetLastError());
             options.activationMaximum(scale);
             quantizeShared<<<padded,256,0,cudaStreamPerThread>>>(input,quantized,scales,x.rows,x.cols);
         } else if (x.cols == 4096)
-            quantizeVector<4096><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
+            quantizeVector<4096><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, bf16Scale);
         else if (x.cols == 12288)
-            quantizeVector<12288><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
+            quantizeVector<12288><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, bf16Scale);
         else if (x.cols == 5376)
-            quantizeVector<5376><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
+            quantizeVector<5376><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, bf16Scale);
         else if (x.cols == 7168)
-            quantizeVector<7168><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
+            quantizeVector<7168><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, bf16Scale);
         else if (x.cols == 14336)
-            quantizeVector<14336><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, direct != nullptr);
+            quantizeVector<14336><<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, bf16Scale);
         else
-            quantize<<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols, direct != nullptr);
+            quantize<<<padded, 256, 0, cudaStreamPerThread>>>(input, quantized, scales, x.rows, x.cols, bf16Scale);
         ck(cudaGetLastError());
 #ifdef FASTLLM_IMAGE_FP8_SM120
         if (scaledSm120) {

@@ -20,7 +20,8 @@ class Runtime : public nomas::Runtime {
     explicit Runtime(int device, bool fp32 = false)
         : Runtime(device, fp32 ? DType::FP32 : DType::BF16) {}
     // H3 sums rounded exponentials in FP32 and keeps LayerNorm affine separate.
-    Runtime(int device, DType dtype) : nomas::Runtime(device, dtype, {false, false}) {}
+    Runtime(int device, DType dtype, Numerics numerics = {false, false})
+        : nomas::Runtime(device, dtype, numerics) {}
     Tensor rms(const Tensor &, const Tensor &weight, float eps, int width = 0);
     Tensor rmsModulateRows(const Tensor &, const Tensor &weight, float eps, const Tensor &table,
                            const Tensor &indices, int shift, int scale);

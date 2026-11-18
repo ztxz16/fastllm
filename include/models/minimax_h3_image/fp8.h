@@ -18,8 +18,8 @@ class Fp8Weights final : public QuantizedWeights {
                               minimax_h3::Tensor *output = nullptr) override;
     // Validated adapters can concatenate checkpoint rows without H3 name/layout
     // conversion. Payloads and scales stay packed; activation is quantized once.
-    // These TorchAO adapters use BF16-rounded activation scales; linear() keeps
-    // the existing H3 FP32-scale policy.
+    // TorchAO adapters round activation scales to BF16. ModelOpt and H3 linear()
+    // use FP32 scales.
     minimax_h3::Tensor linearPacked(const minimax_h3::Tensor &, const std::vector<std::string> &prefixes,
                                   minimax_h3::Tensor *output = nullptr) override;
     size_t loadedBytes() const override;

@@ -141,7 +141,7 @@ float roundE4m3(float x) {
 // Exercise the actual vectorized input widths against an independent CPU
 // E4M3 reference, including partial tiles, zero/tiny rows and nonuniform
 // scales.
-void checkProjection(const fs::path &path, Runtime &rt, int cols) {
+void checkProjection(const fs::path &path, Runtime &rt, int cols, bool modelopt) {
     constexpr int outputs = 32;
     std::vector<uint8_t> w(outputs * cols);
     std::vector<float> scale(outputs), decoded(outputs * cols);
@@ -155,18 +155,19 @@ void checkProjection(const fs::path &path, Runtime &rt, int cols) {
             decoded[n * cols + k] = std::ldexp((h & 1) ? -1.f : 1.f, exponent - 1);
         }
     }
-    const std::string key = "transformer_blocks.0.ff.net.2";
+    const std::string key = modelopt ? "blocks.0.mlp.fc2" : "transformer_blocks.0.ff.net.2";
     json11::Json::object header{
-        {"transformer_blocks.0.attn.to_q._weight_qdata", json11::Json::object{}},
-        {key + "._weight_qdata",
+        {key + (modelopt ? ".weight" : "._weight_qdata"),
          json11::Json::object{{"dtype", "F8_E4M3"},
                               {"shape", json11::Json::array{outputs, cols}},
                               {"data_offsets", json11::Json::array{0, double(w.size())}}}},
-        {key + "._weight_scale",
+        {key + (modelopt ? ".weight_scale" : "._weight_scale"),
          json11::Json::object{
              {"dtype", "F32"},
              {"shape", json11::Json::array{outputs}},
              {"data_offsets", json11::Json::array{double(w.size()), double(w.size() + scale.size() * 4)}}}}};
+    if (!modelopt)
+        header["transformer_blocks.0.attn.to_q._weight_qdata"] = json11::Json::object{};
     {
         std::string text = json11::Json(header).dump();
         uint64_t size = text.size();
@@ -176,7 +177,9 @@ void checkProjection(const fs::path &path, Runtime &rt, int cols) {
         file.write(reinterpret_cast<char *>(w.data()), w.size());
         file.write(reinterpret_cast<char *>(scale.data()), scale.size() * 4);
     }
-    Fp8Weights weights(path.string());
+    fastllm::minimax_h3_image::ProjectionOptions options;
+    options.modelopt = modelopt;
+    Fp8Weights weights(path.string(), options);
     for (int rows : {1, 29, 129}) {
         std::vector<float> x(rows * cols);
         for (int r = 0; r < rows; ++r)
@@ -184,9 +187,16 @@ void checkProjection(const fs::path &path, Runtime &rt, int cols) {
                 x[r * cols + k] = r % 7 == 3 ? 0.f
                                              : std::sin(float(r * 37 + k) * .137f) *
                                                    (r % 7 == 2 ? 1e-9f : float(r % 5 + 1));
+        if (modelopt) {
+            // With a row max of 1, this BF16 input quantizes to E4M3 352.
+            // Rounding the activation scale to BF16 first would produce 384.
+            std::fill_n(x.begin(), cols, .8203125f);
+            x[0] = 1.f;
+        }
         auto input = rt.upload(x.data(), rows, cols);
         x = rt.download(input);
-        auto actual = rt.download(weights.linear(input, "blocks.0.mlp.fc2"));
+        auto actual = rt.download(modelopt ? weights.linearPacked(input, {key})
+                                          : weights.linear(input, "blocks.0.mlp.fc2"));
         double error = 0, norm = 0;
         std::vector<float> quantized(cols);
         for (int r = 0; r < rows; ++r) {
@@ -207,7 +217,8 @@ void checkProjection(const fs::path &path, Runtime &rt, int cols) {
             }
         }
         double l2 = std::sqrt(error / std::max(norm, 1e-30));
-        std::cout << "FP8 CPU oracle " << rows << 'x' << cols << " relative_l2=" << l2 << '\n';
+        std::cout << (modelopt ? "ModelOpt FP8" : "FP8") << " CPU oracle " << rows << 'x' << cols
+                  << " relative_l2=" << l2 << '\n';
         require(l2 < .01);
     }
 }
@@ -282,7 +293,9 @@ int main() {
         for (int layout : {0, 1, 2})
             checkQkvLayout(root / "qkv.safetensors", rt, layout);
         for (int cols : {4096, 5376, 7168, 12288, 14336})
-            checkProjection(root / "projection.safetensors", rt, cols);
+            checkProjection(root / "projection.safetensors", rt, cols, false);
+        for (int cols : {256, 5376, 7168, 14336})
+            checkProjection(root / "projection.safetensors", rt, cols, true);
         fixture(root / "bad.safetensors", false, 1, true);
         Fp8Weights bad((root / "bad.safetensors").string());
         std::vector<float> x(32, 1);
