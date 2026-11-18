@@ -1086,7 +1086,7 @@ GPU 编号是 CUDA 可见逻辑编号；子进程继承启动时的环境快照�
   Python 参数检查和 tokenizer 初始化仍串行；每副本的就绪超时从开始等待该副本时计时。
   全部副本就绪并校验通过后才接受请求；完成顺序不改变 rank 和设备对应关系。
   启动失败或中断会回收全部已登记副本，包括仍在加载、尚未 ready 的进程组。
-- 默认按空闲副本轮转，一次请求只提交到一个副本，不重试、不复制请求。
+- 默认按请求数和真实KV压力选择副本，固定归属后FIFO排队；一次请求只提交到一个副本，不重试、不复制请求。
   每副本一次处理一个请求，多个副本可以同时运行；不包含 continuous batching。
   可选的前缀感知策略见文末“DP 空闲优先与前缀缓存路由”。
 - 模型工厂的 `generate` 返回 `dp_rank` 和池内唯一的 `dp_request_id`；原生 `id` 仍属于该副本自己的会话。
@@ -1293,7 +1293,7 @@ GPU利用率有自己的采样周期，时间窗口重叠和相关性不能单�
 
 ## DP 空闲优先与前缀缓存路由（第四步）
 
-新增 `--dp-routing round_robin|prefix`，默认仍为 `round_robin`。`prefix` 要求
+`--dp-routing round_robin|prefix` 保留原有空闲副本策略；普通进程DP当前默认是文末的 `load`。`prefix` 要求
 `DP>1`、`--tp-backend process` 和 `--prefix-cache true`；CLI、JSON 配置和模型工厂统一校验。
 纯 DP 和 DP+TP 使用同一分发规则：
 
@@ -1747,3 +1747,57 @@ GPU 上传、单层计算，最后执行 MoE
 保留原始精度，记录误差、失败元素、GPU/CUDA/NCCL、架构、Git、命令和原始样本。
 本阶段是功能检查（warmup=0、iterations=1、repeats=1），不报告性能加速比。
 任一 case 失败返回非零，已执行部分仍生成报告。服务器全部通过后才推进阶段 3。
+
+## 普通 DP 负载与 KV 压力路由
+
+普通进程 DP>1 未指定 `--dp-routing` 时使用 `load`；显式 `round_robin`、`prefix`
+保留旧的空闲副本策略。DP=1 和 Attention DP/EP 不支持显式 `load`，默认行为保持不变。
+
+每个已就绪副本（包括忙副本）的分数为：
+
+```text
+W = 等待执行的请求数；R = 占用执行位的请求数（0或1）
+U = 最近一次真实KV页池占用率
+score = W + R + W * 6 * max(0, U - 0.5)
+```
+
+选最低分，同分轮换扫描起点；入队立即计数。请求固定在选定副本的 FIFO 队列中，
+每副本仍串行执行，不迁移，不做连续批处理。Python、文本流及 HTTP 共用预约机制；
+HTTP 接收时预约，每副本一个执行线程，整池共享等待容量，排队和生成共用绝对截止时间。
+取消排队请求立即撤销预约；运行请求必须完成原生取消和清理后才能归还执行位。
+
+KV 统计取每个 worker 最紧张的层/K/V 页池，再取 TP 组最大值。占用率为
+`1 - FreePageCount / maxPages`；无引用、可回收的前缀页仍是可用页。
+尚未创建页池时 `total_pages=free_pages=0`，占用率为0，不为统计提前分配GPU资源。
+查询只读取 CPU 页面计数，不枚举前缀目录或额外同步GPU。
+启动、prefill完成、请求清理后上报；decode在计算步边界最多每100ms上报一次。
+长计算步期间保留最近值，事件只更新KV统计，不覆盖Python的精确请求计数。
+
+原生 ready 声明 `load_stats=1`，会话按需发送 `stream_load` 并接收带请求ID、序号和
+worker页面计数的 `load` 事件；普通非流式生成也接收这些事件。
+Python返回和逐请求日志中的 `load_samples` 保存运行及清理证据；健康接口的
+`replica_load` 和分发日志记录等待数、运行数、KV占用率、采样时间和分数。
+旧原生程序缺少能力时，`load` 启动明确失败；可显式选择旧策略使用旧的配套产物。
+worker控制协议版本为6，新协调器和worker须配套重建。
+
+纯 Python 验收（协议模拟，不代表GPU数值或性能验证）：
+
+```bash
+python3 test/distributed/run_parallel_config.py --execution-tests
+```
+
+服务器完整验收（会编译；不要在禁止编译的本地工作区运行）：
+
+```bash
+cd /home/project/vllm_fastllm
+bash test/distributed/run_qwen3_dp_load_server.sh
+```
+
+可通过 `DP_PYTHON`、`DP_BUILD_DIR`、`DP_MODEL_DIR` 覆盖脚本中的服务器路径。
+脚本使用现有构建目录的CUDA配置，重建协调器和worker，覆盖 DP2×TP1、DP4×TP1、
+DP2×TP2 的 Eager 与 Graph+Prefix，以及轮询、前缀旧策略。
+真实负载用例使用同样的512 Token页池、固定Token输入和采样配置，对照同TP大小的
+单副本Token输出；384/32 Token Prompt分别覆盖KV压力50%阈值两侧，并核对实际worker
+页面计数、路由打分及请求清理。每组包含HTTP、取消、流式和设备映射检查。
+报告按独立目录生成Markdown、CSV、JSON、XLSX；失败返回非零并保留部分结果。
+本次修改的本地验收不执行编译或真实GPU推理；服务器结果需另行取得。
