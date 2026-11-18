@@ -2840,11 +2840,12 @@ const bool fp8ProjectionRegistered=[] {fastllm::kernels::Register(&fp8Projection
 
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
-    // Native row-wise MXFP8 projections use W8A8 for prefill. Other scale
-    // layouts retain their existing activation-quantization policy; e.g.
+    // Native row-wise MXFP8 projections use W8A8 for batched decode/prefill.
+    // One-row GEMV retains better weight bandwidth and avoids activation quantization.
+    // Other scale layouts retain their existing activation-quantization policy; e.g.
     // DeepSeek's block32x32 caller supplies its explicit quantization boundary.
-    // Unsupported devices, small batches and non-E8M0 scales fall through.
-    if (bias.dims.empty() && weight.blockK == 1 &&
+    // Unsupported devices/layouts and non-E8M0 scales fall through.
+    if (n > 1 && bias.dims.empty() && weight.blockK == 1 &&
         FastllmCudaTryMxfp8QuantizedLinear(input, weight, output)) return true;
 #endif
     FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);

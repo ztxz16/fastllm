@@ -2,7 +2,7 @@
  * SM120 MXFP8 W8A8 linear.
  *
  * E4M3 weights retain exact UE8M0 scales per 1x32 or 32x32 block.
- * CUTLASS's SM120 MXFP8 kernels consume row-major FP8 A,
+ * cuBLASLt and CUTLASS SM120 MXFP8 kernels consume row-major FP8 A,
  * column-major FP8 B, and the FlashInfer 128x4 swizzled E8M0 layout.  This
  * adapter keeps the checkpoint bytes untouched, expands the compact weight
  * scales once, and quantizes each BF16 activation block online.
@@ -29,6 +29,9 @@
 #include <vector>
 
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
+
+#include "fastllm-mxfp8-lt.cuh"
+#include "fastllm-bf16-lt.cuh"
 
 // FlashInfer uses this guard to expose the BF16 output specialization.
 #ifndef ENABLE_BF16
@@ -438,45 +441,68 @@ extern "C" bool FastllmCudaTryMxfp8QuantizedLinear(const fastllm::Data &input,
         input.dims.back() % 32 || weight.dims[0] <= 0 || weight.dims[0] % 32) return false;
     const int n = weight.dims[0], k = weight.dims[1];
     const uint64_t rows = input.Count(0) / k;
-    // Preserve the low-latency small-M path. All larger row counts, including
-    // tails not divisible by the 128-row tile, use the same masked GEMM.
-    if (rows < 128 || rows * uint64_t(k) > INT_MAX || rows * uint64_t(n) > INT_MAX ||
+    // cuBLASLt accepts all row counts; unsupported layouts retain the previous fallback.
+    if (rows < 1 || rows * uint64_t(k) > INT_MAX || rows * uint64_t(n) > INT_MAX ||
         weight.Count(0) > INT_MAX) return false;
     if (!Mxfp8Dense(input) || !Mxfp8Dense(weight) ||
         Mxfp8Overlaps(output, input) || Mxfp8Overlaps(output, weight)) return false;
 
     const uint8_t *weightScales = nullptr;
     if (!EnsureMxfp8WeightScales(weight, n, k, weightScales)) return false;
-    const auto config = MakeMxfp8Config();
-    size_t workspaceBytes = 0;
-    try { workspaceBytes = Mxfp8DispatchWorkspace(config, int(rows), n, k); }
-    catch (...) { FastllmCudaClearThreadError(); return false; }
-    // Align both following regions even when rows and K are partial tiles.
     const size_t quantBytes = (size_t(rows) * k + 255) & ~size_t(255);
     const size_t scaleBytes = size_t((rows + 127) / 128) * size_t((k + 127) / 128) * 512;
+    const bool capturing = FastllmCudaGraphIsCapturingFast();
+    auto *lt = fastllm_mxfp8_lt::GetState(FastllmCudaGetDevice(), capturing);
+    // Heuristic lookup reads layouts/alignment, not scale contents. Use the
+    // immutable aligned weight scales until Run binds the activation scales.
+    auto *plan = lt ? fastllm_mxfp8_lt::GetPlan(*lt, int(rows), n, k,
+        weightScales, weightScales, capturing) : nullptr;
+    const auto config = MakeMxfp8Config();
+    size_t workspaceBytes = plan ? plan->workspaceBytes : 0;
+    if (!plan) {
+        if (rows < 128) return false;
+        try { workspaceBytes = Mxfp8DispatchWorkspace(config, int(rows), n, k); }
+        catch (...) { FastllmCudaClearThreadError(); return false; }
+    }
     const size_t totalBytes = quantBytes + scaleBytes + workspaceBytes;
     if (totalBytes > INT_MAX) return false;
-    // Data allocations belong to the capture's memory pool. A growable shared
-    // scratch buffer could instead invalidate addresses retained by a graph.
-    Data scratchData(INT8, {int(totalBytes)});
-    scratchData.ToDevice(CUDA, input.dataDeviceIds, false);
-    scratchData.Allocate(false);
-    auto *scratch = static_cast<uint8_t *>(scratchData.cudaData);
-    if (!scratch) return false;
     auto dims = input.dims; dims.back() = n;
     output.dataType = BFLOAT16; output.UpdateUnitSize(); output.Resize(dims);
     output.ToDevice(CUDA, input.dataDeviceIds); output.Allocate();
-    if (!output.cudaData) return false;
+    if (!output.cudaData || (reinterpret_cast<uintptr_t>(output.cudaData) & 15)) return false;
+
+    uint8_t *scratch = nullptr;
+    // Reuse Linear's existing graph-retained lease. Eager temporaries can be
+    // consumed by later persistent model allocations before capture begins;
+    // the lease remains reserved and serial graph variants can share it.
+    // Its capacity is a storage choice, not a batch limit: larger operations
+    // retain the general graph-owned allocation path below.
+    if (totalBytes <= fastllm_bf16_lt::workspaceBytes) {
+        auto *storage = fastllm_bf16_lt::GetState(FastllmCudaGetDevice(), capturing);
+        if (storage) scratch = static_cast<uint8_t *>(capturing ?
+            fastllm_bf16_lt::CaptureWorkspace(*storage) : storage->eager->data);
+    }
+    Data scratchData(INT8, {int(totalBytes)});
+    if (!scratch) {
+        scratchData.ToDevice(CUDA, input.dataDeviceIds, false);
+        scratchData.Allocate(false);
+        scratch = static_cast<uint8_t *>(scratchData.cudaData);
+    }
+    if (!scratch) return false;
+    void *workspace = scratch + quantBytes + scaleBytes;
     cudaStream_t stream = cudaStreamPerThread;
     if (rows % 128 || k % 128) cudaMemsetAsync(scratch + quantBytes, 0, scaleBytes, stream);
     QuantizeToMxfp8Kernel<<<(int(rows) * (k / 32) + 63) / 64, 256, 0, stream>>>(
         static_cast<const __nv_bfloat16 *>(input.cudaData), scratch, scratch + quantBytes,
         int(rows), k, 1, scaleBytes);
     bool ok = cudaGetLastError() == cudaSuccess;
-    if (ok) try {
+    if (ok && plan) {
+        ok = fastllm_mxfp8_lt::Run(*lt, *plan, weight.cudaData, scratch, output.cudaData,
+            weightScales, scratch + quantBytes, workspace, stream);
+    } else if (ok) try {
         Mxfp8DispatchGemm(config, output.cudaData, scratch, weight.cudaData,
             scratch + quantBytes, weightScales, int(rows), n, k,
-            reinterpret_cast<char *>(scratch + quantBytes + scaleBytes), workspaceBytes, stream);
+            static_cast<char *>(workspace), workspaceBytes, stream);
         ok = cudaGetLastError() == cudaSuccess;
     } catch (...) { FastllmCudaClearThreadError(); ok = false; }
     return ok;
