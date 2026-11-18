@@ -143,7 +143,7 @@ DP2×TP2 验收以及 TP Decode Eager/Graph 验收，不需要另下载稠密模
   数值超差在报告和终端中只提示WARNING，不影响生成验收判定；终端保留最大/平均误差
   与超差元素数。任一生成case或执行路径失败仍返回非零。
 - 启动前登记预期用例数，只有全部完成且通过才汇总为PASS；中途报告包含`complete=false`。
-  若同时启用性能测试，其用例也计入总数，不能把尚未执行的性能测试当成通过。
+  对齐与性能分别登记、分别汇总；对齐报告不包含性能用例。
 - 严格数值验收独立运行，继续检查教师强制完整历史的每步logits与实际专家集合，
   失败仍返回非零。合成小模型、算子、生命周期以及性能公平性检查不放宽。
 
@@ -164,6 +164,26 @@ bash test/distributed/run_attention_ep_v100.sh real-all
 
 各命令新建独立目录并生成JSON/Markdown/CSV/XLSX。历史报告继续按原规则解释，
 不得把旧FAIL改写成PASS；新规则需重新运行并标明策略后才能得出新结论。
+
+### 独立性能测试
+
+`performance`只运行性能矩阵，不运行HF生成对齐、numeric或完整合成验收，也不读取
+对齐请求集或使用参考Python环境。`real`、`real-exact`、`real-numeric`和`real-all`
+继续独立进行对齐；`http`只验证服务功能。已经完成的阶段无需因测速再次执行。
+
+```bash
+bash test/distributed/run_attention_ep_v100.sh performance
+```
+
+性能矩阵为Eager/Graph × Prefix off/cold/hot × 并发1/4/8，共18项。保持原有
+32个Prompt Token、16个输出Token、禁用EOS、一次warmup和5轮计时；hot模式另在
+计时前提交4个请求准备缓存。输出历史、缓存复用及Graph路径检查在计时区外执行，
+检查失败仍返回非零。加速比是同配置Eager耗时/当前模式耗时，不是相对HF或vLLM。
+
+性能报告单独登记18项，保存原始样本及JSON/Markdown/CSV/XLSX汇总；中途停止保留
+部分结果并标记未完成。目录仍使用`时间戳_moe_full_随机号/`，不会覆盖历史结果。
+直接使用Python入口的`--performance`具有相同语义；省略`--model`时只准备一个
+FP16合成小模型供测速，不附带完整合成验收。非默认对齐策略或候选阈值不能与测速混用。
 
 ### 四项联合验收
 

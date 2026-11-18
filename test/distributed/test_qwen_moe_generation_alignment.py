@@ -150,9 +150,9 @@ class RunnerTests(unittest.TestCase):
                             for count, complete, status in snapshots[:-1]))
 
         result, _ = self.run_suite(values, values, performance=True)
-        self.assertEqual(result['expected_case_count'], 14 + len(runner.PERFORMANCE_CASES))
-        self.assertFalse(result['complete'])
-        self.assertEqual(result['status'], 'FAIL')
+        self.assertEqual(result['expected_case_count'], 14)
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['status'], 'PASS')
 
     def test_old_prefix_hits_do_not_prove_current_request_reuse(self):
         """/** 累计命中不代表本次命中；当前请求没有复用Token时执行检查必须失败。 */"""

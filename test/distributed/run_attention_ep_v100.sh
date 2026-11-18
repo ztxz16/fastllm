@@ -60,8 +60,7 @@ PY
             --near-tie-tol "${ATTENTION_EP_NEAR_TIE_TOL:-0.1}"
         ;;
     performance)
-        "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" --model "$moe_model" \
-            --reference-python "${ATTENTION_EP_REFERENCE_PYTHON:-$moe_python}" --performance
+        "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" --model "$moe_model" --performance
         ;;
     http)
         "$moe_python" test/distributed/run_qwen_moe_http.py "${moe_common[@]}" --model "$moe_model"
