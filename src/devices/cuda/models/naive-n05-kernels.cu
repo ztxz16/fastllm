@@ -228,6 +228,43 @@ __global__ void BatchRouterSigmoid4096Vector(const BF16 *input, const float *wei
             1.0 / (1.0 + expf(-(total + 0.0f)));
 }
 
+// Each lane owns two adjacent partials of the reference GEMV. Combining the
+// pair before the warp reduction preserves every FP32 accumulation and tie.
+template<int Rows> __global__ void RouterPairs4096(const BF16 *input, const float *weight,
+                                                    float *output, int rows, int experts) {
+    const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
+    __shared__ float sums[Rows][8];
+    float partial[Rows][2]{};
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int col = t * 2 + i * 256;
+        const float2 w = *reinterpret_cast<const float2 *>(weight + size_t(expert) * 4096 + col);
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            const auto *x = reinterpret_cast<const __nv_bfloat162 *>(
+                input + size_t(min(first + r, rows - 1)) * 4096 + col);
+            const float2 v = __bfloat1622float2(*x);
+            partial[r][0] = fmaf(v.x, w.x, partial[r][0]);
+            partial[r][1] = fmaf(v.y, w.y, partial[r][1]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+        float value = partial[r][0] + partial[r][1];
+#pragma unroll
+        for (int d = 1; d < 16; d *= 2) value += __shfl_down_sync(~0u, value, d);
+        if (t % 16 == 0) sums[r][t / 16] = value;
+    }
+    __syncthreads();
+    const int r = t / 32, lane = t % 32;
+    if (r >= Rows) return;
+    float value = lane < 8 ? sums[r][lane] : 0.f;
+#pragma unroll
+    for (int d = 1; d < 8; d *= 2) value += __shfl_down_sync(~0u, value, d);
+    if (lane == 0 && first + r < rows)
+        output[size_t(first + r) * experts + expert] = 1.0 / (1.0 + expf(-(value + 0.0f)));
+}
+
 // Keep the full argument block below the legacy 4 KiB CUDA limit.
 constexpr int kDraftKVLayersPerLaunch = 80;
 struct DraftKVWeights { const void *data[kDraftKVLayersPerLaunch]; };
@@ -4669,10 +4706,19 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     dims.back() = weight.dims[0];
     Output(output, FLOAT32, dims);
     const int experts = weight.dims[0];
-    if (rows == 1)
+    const int arch = FastllmCudaRuntimeArch();
+    const bool blackwell = arch == 100 || arch == 103;
+    if (blackwell && rows >= 2 && ((uintptr_t(input.cudaData) | uintptr_t(weight.cudaData)) & 7) == 0) {
+        auto kernel = rows <= 4 ? RouterPairs4096<1> : RouterPairs4096<2>;
+        const int tile = rows <= 4 ? 1 : 2;
+        kernel<<<dim3(experts, (rows + tile - 1) / tile), 128>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
+            (float *)output.cudaData, rows, experts);
+    }
+    else if (rows == 1)
         RouterSigmoid4096<<<experts, 256>>>((const BF16 *)input.cudaData,
             (const float *)weight.cudaData, (float *)output.cudaData);
-    else if (rows >= 3 && FastllmCudaRuntimeArch() == 90 &&
+    else if (rows >= 3 && arch == 90 &&
              (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0)
         BatchRouterSigmoid4096Vector<<<dim3(experts, (rows + 3) / 4), 128>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
