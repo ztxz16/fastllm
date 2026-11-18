@@ -457,11 +457,15 @@ bool FastllmCudaNaiveExpertPrefill(int device, const uint16_t *input,
     const float *siluLookup, float *perRouteOutput);
 void FastllmCudaNaiveClearExpertPrefill();
 
+// Return FP32 logits for a local BF16 prefill projection. The caller lends
+// an independent, dead MoE arena until expert dispatch on this stream.
+bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Data &weight,
+    fastllm::Data &scratch, fastllm::Data &output);
+bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output);
 // BF16 input, FP32 4096-column router, including sigmoid. Small batches
 // share weights and retain exact single-row arithmetic when requested by the
 // linear precision policy. Unsupported layouts return false without mutation.
-bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
-        const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
 

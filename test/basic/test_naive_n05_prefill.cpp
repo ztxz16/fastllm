@@ -487,11 +487,44 @@ static void TestBlackwellIndexerAttention() {
     }
 }
 
+static void TestBlackwellLocalRouter() {
+    if (!FastllmCudaHasBlackwellIndexerAttention()) return;
+    constexpr int rows = 257, channels = 4096, experts = 64, top = 8;
+    Data x(BFLOAT16), w(FLOAT32), out, scratch(FLOAT32, {rows, channels});
+    Upload(x, {rows, channels}, 71);
+    Upload(w, {experts, channels}, 113);
+    scratch.ToDevice(DataDevice::CUDA, {0}, false); scratch.Allocate(false);
+    Require(FastllmCudaNaivePrefillRouter(x, w, scratch, out), "compact router did not dispatch");
+    auto a = Read<uint16_t>(x);
+    auto b = Read<float>(w), actual = Read<float>(out);
+    double error = 0, magnitude = 0;
+    for (int i = 0; i < rows; ++i) {
+        std::vector<double> ref(experts);
+        std::vector<int> expected(experts), routed(experts);
+        for (int e = 0; e < experts; ++e) {
+            for (int k = 0; k < channels; ++k)
+                ref[e] += double(FromBits(a[i * channels + k])) * b[e * channels + k];
+            expected[e] = routed[e] = e;
+            double diff = actual[i * experts + e] - ref[e];
+            error += diff * diff; magnitude += ref[e] * ref[e];
+        }
+        std::partial_sort(expected.begin(), expected.begin()+top, expected.end(), [&](int u,int v){return ref[u]>ref[v];});
+        std::partial_sort(routed.begin(), routed.begin()+top, routed.end(), [&](int u,int v){return actual[i*experts+u]>actual[i*experts+v];});
+        std::sort(expected.begin(),expected.begin()+top); std::sort(routed.begin(),routed.begin()+top);
+        Require(std::equal(expected.begin(),expected.begin()+top,routed.begin()), "router expert set mismatch");
+    }
+    double l2 = std::sqrt(error / magnitude);
+    std::printf("Local router FP64 reference: relL2 %.9g, %d exact top-%d sets\n", l2, rows, top);
+    Require(l2 < 2e-5, "router exceeds FP32 error budget");
+    ++checks;
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
+        TestBlackwellLocalRouter();
         TestBlackwellIndexerAttention();
         TestLocalPrefillBatch();
         TestSwaPrefillScratch(); TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();

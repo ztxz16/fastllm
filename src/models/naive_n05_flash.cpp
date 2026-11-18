@@ -2134,12 +2134,14 @@ Data NaiveN05FlashModel::RunTarget(
                 }
                 Data &routerSource = shardRouter ? routedInput : normed;
                 Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
-                if (canonicalPrefillRouter)
+                const bool localRouter = localMoe && !decodeWorkspace && !verifying &&
+                    FastllmCudaNaivePrefillRouter(routerSource, routerWeight, routerInput, router);
+                if (!localRouter && canonicalPrefillRouter)
                     RunLocalPrefillRouter(normed, routerWeight, attentionParallel->rows.localToGlobal[tpRank],
                         inputIds.dims[1], epRanks, routerInput, router);
-                hasRouterProbabilities =
-                    !canonicalPrefillRouter && FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
-                if (!canonicalPrefillRouter && !hasRouterProbabilities) {
+                hasRouterProbabilities = !localRouter && !canonicalPrefillRouter &&
+                    FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
+                if (!localRouter && !canonicalPrefillRouter && !hasRouterProbabilities) {
                     Data localRouterInput;
                     if (shardPrefillRouter) {
                         // Share one backing allocation with the prefill arena;
