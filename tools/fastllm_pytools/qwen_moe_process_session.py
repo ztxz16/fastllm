@@ -89,7 +89,13 @@ class QwenMoeProcessSession:
 
     def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False,
                  cuda_graph=False, prefix_cache=False, routing='round_robin', queue_size=8,
-                 request_log=True, environment=None):
+                 request_log=True, environment=None, trace_token_positions=None):
+        if trace_token_positions is not None:
+            if (not trace or not isinstance(trace_token_positions, (list, tuple)) or
+                    not trace_token_positions or any(type(x) is not int or x < 1 for x in trace_token_positions) or
+                    len(set(trace_token_positions)) != len(trace_token_positions)):
+                raise ValueError('trace_token_positions requires trace and unique positive 1-based positions')
+            trace_token_positions = frozenset(trace_token_positions)
         if routing not in ('round_robin', 'prefix') or (routing == 'prefix' and not prefix_cache):
             raise ValueError('prefix routing requires prefix cache')
         if type(queue_size) is not int or queue_size < 1:
@@ -101,6 +107,7 @@ class QwenMoeProcessSession:
             raise ValueError('Attention DP/EP requires 1, 2 or 4 ranks')
         self.config = json.loads((Path(model) / 'config.json').read_text())
         self.output, self.timeout, self.trace = Path(output), timeout, trace
+        self.trace_token_positions, self._trace_round = trace_token_positions, 0
         self.cuda_graph, self.prefix_cache = cuda_graph, prefix_cache
         self.routing, self.queue_size, self.request_log = routing, queue_size, request_log
         self._condition = threading.Condition()
@@ -229,7 +236,12 @@ class QwenMoeProcessSession:
         return rank
 
     def _round(self):
-        """/** 锁内构造准入/结束动作，锁外驱动整个通信组，最后核验并提交各 rank 输出。 */"""
+        """/**
+         * 锁内构造准入/结束动作，锁外驱动通信组，再核验并提交各rank输出。
+         * 可选trace_token_positions按请求内1-based输出位置筛选logits，只控制诊断取回；
+         * 不改变请求准入、输入、KV、算子、Graph选择或采样。选择性trace仍记录所有
+         * 活动轮次的联合动作和请求位置；未选择的位置不伪造logits，默认行为保持不变。
+         */"""
         with self._condition:
             steps = [dict(action=0, token_ids=[]) for _ in self._slots]
             for rank, job in enumerate(self._slots):
@@ -253,9 +265,19 @@ class QwenMoeProcessSession:
                 steps[rank] = dict(action=1, token_ids=r['token_ids'], position_begin=0,
                                    capacity=len(r['token_ids']) + r['max_new_tokens'] - 1,
                                    sampling={k: r[k] for k in ('seed', 'top_k', 'top_p', 'temperature')})
+            round_trace, schedule = self.trace, None
+            if self.trace_token_positions is not None:
+                positions = [len(job['tokens']) + 1 if job is not None and step['action'] in (1, 2) else None
+                             for job, step in zip(self._slots, steps)]
+                round_trace = any(position in self.trace_token_positions for position in positions)
+                self._trace_round += 1
+                schedule = dict(round_1based=self._trace_round, token_positions_1based=positions,
+                    request_ids=[job['id'] if job is not None else None for job in self._slots],
+                    input_lengths=[len(job['request']['token_ids']) + position - 1 if position is not None else None
+                                   for job, position in zip(self._slots, positions)])
         if not any(s['action'] for s in steps):
             return
-        result = self._transport.exchange('step', steps=steps, trace=self.trace)
+        result = self._transport.exchange('step', steps=steps, trace=round_trace)
         states, tokens = result['states'], result['token_ids']
         if len(states) != self.concurrency or len(tokens) != self.concurrency:
             raise RuntimeError('MoE round rank count mismatch')
@@ -281,15 +303,18 @@ class QwenMoeProcessSession:
                     job['tokens'].append(token)
                     item = dict(token_id=token, round_ms=result['round_ms'], execution=result['execution'],
                                 elapsed_ms=(time.monotonic() - job['start']) * 1000)
-                    if self.trace:
+                    if round_trace and (self.trace_token_positions is None or len(job['tokens']) in self.trace_token_positions):
                         values = result['logits'][rank]
                         if len(values) != self.config['vocab_size'] or not all(math.isfinite(x) for x in values):
                             raise RuntimeError('invalid MoE trace logits')
                         item['logits'] = values
+                    if self.trace:
                         # 记录正式调度提交的联合轮次；Begin长度尚未扣除原生Prefix命中。
                         item['joint_round'] = dict(
                             actions=[s['action'] for s in steps],
                             submitted_token_counts=[len(s['token_ids']) for s in steps])
+                        if schedule is not None:
+                            item['trace_schedule'] = schedule
                     job['steps'].append(item)
                     try:
                         job['events'].put_nowait(token)

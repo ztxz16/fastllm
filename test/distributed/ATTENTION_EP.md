@@ -227,6 +227,39 @@ bash test/distributed/run_attention_ep_v100.sh performance
 用例数，`performance_matrix_complete=false`表示仅覆盖子集；子集PASS不能替代完整矩阵，
 复测未重现也不能覆盖历史失败。复测保持原请求、调度、缓存和路径规则，不自动重试。
 
+### 并发输出波动的独立诊断
+
+若Eager和Graph各自重复运行也出现不同Token序列，不能只凭跨模式FAIL归因于Graph。
+下面入口单独调用正式会话，沿用性能case的循环Prompt Token、禁用EOS、贪心采样、
+关闭Prefix Cache、轮转路由和线程池并发提交方式；不运行HF、教师强制或性能计时：
+
+```bash
+"$ATTENTION_EP_PYTHON" test/distributed/probe_qwen_moe_concurrency.py \
+  --build "$ATTENTION_EP_BUILD" --model "$ATTENTION_EP_MODEL" \
+  --prompt-length 1024 --output-tokens 128 --concurrency 4 \
+  --repeats 5 --trace-tokens 78 79 80
+```
+
+每种模式独立加载一次模型、warmup一个并发批次，再运行5轮。选择性trace只在所列
+1-based输出位置取回完整logits，各活动轮次仍记录实际联合动作、提交Token数、
+请求ID、输出位置和输入历史长度。原生协议已有trace开关，本次Python诊断不要求重编译。
+诊断取回、Python记录和落盘可能影响运行时序；相同准入代码不保证复现原执行时间表。
+
+结果目录为`时间戳_moe_concurrency_probe_随机号/`，包含：
+
+- `eager/`与`graph/`中的启动、每请求原始Token/选择性logits/完整调度及关闭记录。
+- `*_vs_first.json`：各请求与本模式首个正式请求比较；`*_vs_eager.json`：Graph与同轮次、
+  同提交序号Eager比较。不同输出变体数量相同不豁免逐请求失败。
+- `summary.json/md/csv/xlsx`：默认60项比较，失败及中断仍保存部分汇总并返回非零。
+  `failed_elements`表示不同Token位置数量；max/mean绝对误差仅覆盖同输入历史的已采集logits，
+  不设新的数值阈值，分叉后的logits明确跳过数值比较。候选分数与分差只作为诊断证据。
+
+首次Token分歧在采集窗口内时打印双方Top-5、选词分差及执行/调度证据；不在窗口内则
+明确报告未采集，下一次调整`--trace-tokens`，不推断为近似同分。`OBSERVED_TOKEN_DIVERGENCE`
+表示本次观察到输出差异；`NOT_OBSERVED`仅表示本次未观察到，不能宣称原问题已修复。
+V编号只在本次运行内比较。换服务器后先检查GPU/CPU、编译缓存和二进制SHA256等元数据，
+新机器上的诊断不能代替旧机器的故障复现。本报告不输出吞吐或加速比，不覆盖历史验收结果。
+
 ### 四项联合验收
 
 `real-all`等价于真实模型入口的`--alignment-policy all`。固定比较exact、K=5/容差0、
