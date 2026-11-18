@@ -169,20 +169,24 @@ __global__ static void gemv(Hy4View w, const float *input, float *out, const int
 }
 // Each warp owns one output channel. Four adjacent values per lane cover a
 // complete 128-column FP8 scale block, with one coalesced matrix transaction.
-template <int Type, bool Scaled>
+template <int Type, bool Scaled, bool Dense = false>
 __global__ static void warpGemv(Hy4View w, const float *input, float *out, const int *ids, int routesPerInput,
                                 bool roundOutput, Hy4View bias) {
     const int lane = threadIdx.x & 31, row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5),
               slot = blockIdx.y;
     if (row >= w.rows)
         return;
-    const int expert = ids ? ids[slot] : 0;
+    const int expert = !Dense && ids ? ids[slot] : 0;
     const size_t k0 = (size_t(expert) * w.rows + row) * w.cols;
-    if (routesPerInput)
+    if (!Dense && routesPerInput)
         input += size_t(slot / routesPerInput) * w.cols;
     const int blocks = (w.cols + 127) / 128;
     const size_t plane = (size_t(expert) * ((w.rows + 127) / 128) + row / 128) * blocks;
     float sum = 0;
+    // Unroll independent weight loads on dense projections. Keep the
+    // four-value dot products and their accumulation order unchanged.
+    constexpr int unroll = Dense ? 4 : 1;
+#pragma unroll (unroll)
     for (int col = 4 * lane; col < w.cols; col += 128) {
         const float4 x = *reinterpret_cast<const float4 *>(input + col);
         float4 weights;
@@ -196,7 +200,9 @@ __global__ static void warpGemv(Hy4View w, const float *input, float *out, const
         } else
             weights = reinterpret_cast<const float4 *>(w.data)[(k0 + col) / 4];
         float dot = fmaf(weights.w, x.w, fmaf(weights.z, x.z, fmaf(weights.y, x.y, weights.x * x.x)));
-        if constexpr (Scaled)
+        if constexpr (Dense && Scaled)
+            sum = fmaf(dot, __bfloat162float(static_cast<const __nv_bfloat16 *>(w.scale)[plane + col / 128]), sum);
+        else if constexpr (Scaled)
             sum = fmaf(dot, read(w.scale, w.scaleType, plane + col / 128), sum);
         else
             sum += dot;
@@ -204,8 +210,12 @@ __global__ static void warpGemv(Hy4View w, const float *input, float *out, const
     for (int delta = 16; delta; delta /= 2)
         sum += __shfl_down_sync(~0U, sum, delta);
     if (!lane) {
-        sum += bias.data ? read(bias.data, bias.type, row) : 0.f;
-        out[size_t(slot) * w.rows + row] = roundOutput ? bf(sum) : sum;
+        if constexpr (Dense)
+            out[row] = bf(sum + 0.f);
+        else {
+            sum += bias.data ? read(bias.data, bias.type, row) : 0.f;
+            out[size_t(slot) * w.rows + row] = roundOutput ? bf(sum) : sum;
+        }
     }
 }
 // The iHC mixing matrix has only four or eight rows, each 12,288 elements
@@ -247,7 +257,12 @@ static void Linear(Weights &w, Scratch &s, const std::string &name, const float 
         finishMix<<<v.rows, 32>>>(partial, y, tiles);
     } else if (v.cols % 4 == 0 && (v.type != 2 || v.scale)) {
         dim3 grid((v.rows + 3) / 4, slots);
-        if (v.type == 2)
+        const bool dense = !ids && slots == 1 && !routesPerInput && roundOutput && !bias.data;
+        if (dense && v.type == 2 && v.scaleType == 0)
+            warpGemv<2, true, true><<<grid, 128>>>(v, x, y, nullptr, 0, true, {});
+        else if (dense && v.type == 0)
+            warpGemv<0, false, true><<<grid, 128>>>(v, x, y, nullptr, 0, true, {});
+        else if (v.type == 2)
             warpGemv<2, true><<<grid, 128>>>(v, x, y, ids, routesPerInput, roundOutput, bias);
         else if (v.type == 0)
             warpGemv<0, false><<<grid, 128>>>(v, x, y, ids, routesPerInput, roundOutput, bias);
