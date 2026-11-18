@@ -10,7 +10,7 @@ MXFP4 addition:
       --lib /absolute/path/build/tools/ftllm/libfastllm_tools.so \
       --model /path/to/MXFP4/checkpoint --out mxfp4_check.json
   The check covers spread/hot routing, idle ranks, masked rows, untouched
-  output guards, 128/512-row arena transitions, partial chunks, repeatability
+  output guards, decode/prefill arena transitions, multi-chunk and uneven tails, repeatability
   and changed-input CUDA Graph replay. It also reports drift against a
   reference without FP8 activation quantization.
   Ordinary projections retain their native FP8 weights/scales by default

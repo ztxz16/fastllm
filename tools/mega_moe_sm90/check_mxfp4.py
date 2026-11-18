@@ -121,7 +121,14 @@ def reference(xs, idxs, ss, lives, fp8=True):
         out[row, slot] = (v @ w2.T).bfloat16().float()
     return out.sum(1).bfloat16()
 pool = ThreadPoolExecutor(R)
-for (ci, (n, pattern)) in enumerate([(1, 'spread'), (4, 'hot'), (16, 'spread'), (17, 'spread'), (32, 'uniform'), (33, 'spread'), (128, 'spread'), (129, 'spread'), (3, 'idle'), (192, 'spread'), (193, 'idle'), (512, 'uniform'), (97, 'spread'), (512, 'hot'), (513, 'idle'), (16, 'spread')]):
+cases = [(1, 'spread'), (4, 'hot'), (16, 'spread'), (17, 'spread'),
+         (32, 'uniform'), (33, 'spread'), (128, 'spread'), (129, 'spread'),
+         (3, 'idle'), (192, 'spread'), (193, 'idle'), (512, 'uniform'),
+         (97, 'spread'), (512, 'hot'), (513, 'idle'),
+         (chunk_capacity, 'uniform'), (chunk_capacity, 'hot'),
+         (chunk_capacity, 'empty'), (chunk_capacity + 1, 'ragged'),
+         (2 * chunk_capacity + 1, 'idle'), (16, 'spread')]
+for (ci, (n, pattern)) in enumerate(cases):
     torch.manual_seed(101 + ci)
     xs = []
     idxs = []
@@ -130,7 +137,8 @@ for (ci, (n, pattern)) in enumerate([(1, 'spread'), (4, 'hot'), (16, 'spread'), 
     lives = []
     for rank in range(R):
         torch.cuda.set_device(rank)
-        rows = 0 if pattern == 'idle' and rank % 2 else n
+        rows = (0 if rank % 2 else n) if pattern == 'idle' else (
+            n // (rank + 1) if pattern == 'ragged' else n)
         x = (torch.randn((rows, 4096), device='cuda') * (3 if ci == 1 else 0.4)).bfloat16()
         ids = torch.arange(8, device='cuda').repeat(rows, 1)
         if pattern == 'uniform':
@@ -139,7 +147,9 @@ for (ci, (n, pattern)) in enumerate([(1, 'spread'), (4, 'hot'), (16, 'spread'), 
             ids = (ids * LE + rank + torch.arange(rows, device='cuda')[:, None] % 4) % 256
         s = torch.softmax(torch.randn((rows, 8), device='cuda'), -1)
         live = torch.ones(rows, device='cuda', dtype=torch.int32)
-        if rows > 2:
+        if pattern == 'empty':
+            live.zero_()
+        elif rows > 2:
             live[-1] = 0
         xs.append(x)
         idxs.append(ids.int())

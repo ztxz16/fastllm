@@ -19,7 +19,7 @@
 static constexpr float inf = __builtin_inff();
 namespace {
 namespace fm = flashinfer::megamoe;
-constexpr int H = 4096, I = 2048, E = 256, K = 8, DECODE_CAP = 128, PREFILL_CAP = 512, SMS = 78;
+constexpr int H = 4096, I = 2048, E = 256, K = 8, DECODE_CAP = 128, PREFILL_CAP = 2048, SMS = 78;
 constexpr int SMEM = 232448;
 thread_local std::string error;
 void check(cudaError_t s) {
@@ -106,7 +106,10 @@ template<int R> struct Mega {
     using Buffers = fm::layout::MegaMoEBuffers;
     template<int CAP> struct Plan {
         static constexpr int POOL = fm::layout::get_num_max_pool_tokens(R, CAP, K, LE);
-        static constexpr int SFPOOL = POOL / 8 * 128;
+        // Decode includes 8-row tiles; prefill only uses 24/64 (EP4)
+        // or 64 (EP8). Each tile owns 128 scaling-factor rows.
+        static constexpr int MIN_BM = CAP == DECODE_CAP ? 8 : (R == 4 ? 24 : 64);
+        static constexpr int SFPOOL = POOL / MIN_BM * 128;
         static Buffers buffers(void *p) { return Buffers(p, R, E, CAP, K, H, I, POOL, SFPOOL); }
         static size_t outputOffset() {
             auto b = buffers(nullptr);

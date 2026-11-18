@@ -95,7 +95,7 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
     // the old transient scratch would race remote dispatch writes against a
     // later rank's memset. Bound it; retain no duplicate/repacked FP8 weights.
     // MXFP4 reserves independent decode and prefill arenas before serving.
-    const size_t budget = (mxfp4 ? 768ull : 512ull) * 1024 * 1024;
+    const size_t budget = (mxfp4 ? 1280ull : 512ull) * 1024 * 1024;
     AssertInFastLLM(bytes > 0 && bytes <= budget,
                    "MiMo EP symmetric workspace exceeds its memory budget.");
     auto state = std::make_shared<FastllmCudaMimoEp8BuiltinMega>();
