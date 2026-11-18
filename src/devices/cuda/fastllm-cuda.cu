@@ -26141,6 +26141,11 @@ struct TokenConstraintBatch {
     int capacity, steps, count = 0, vocab = 0, device;
     fastllm::Data descriptors, states;
     std::vector<std::shared_ptr<TokenConstraintDeviceProgram>> leases;
+    struct Upload {
+        void *host = nullptr;
+        std::vector<std::shared_ptr<TokenConstraintDeviceProgram>> previous;
+        ~Upload() { if (host) FastllmCudaHostFree(host); }
+    } uploads[2];
     TokenConstraintBatch(int capacity, int steps) : capacity(capacity), steps(steps), device(FastllmCudaGetDevice()) {
         fastllm::AssertInFastLLM(capacity > 0 && steps > 0, "Invalid constraint batch capacity.");
         auto allocate = [&](fastllm::Data &data, size_t bytes) {
@@ -26208,37 +26213,99 @@ __global__ void TokenConstraintApplyKernel(const TokenConstraintDeviceView *prog
 std::shared_ptr<void> FastllmCudaCreateTokenConstraintBatch(int capacity, int steps) {
     return std::make_shared<TokenConstraintBatch>(capacity, steps);
 }
-void FastllmCudaPrepareTokenConstraintBatch(void *handle,
+void FastllmCudaInitTokenConstraintUploads(void *handle) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    for (auto &upload : b.uploads) {
+        upload.host = FastllmCudaHostMalloc(size_t(b.capacity) * (sizeof(TokenConstraintDeviceView) + sizeof(int)));
+        fastllm::AssertInFastLLM(upload.host != nullptr, "Cannot reserve constraint upload staging");
+    }
+}
+
+static void PrepareTokenConstraintRows(void *handle,
         const std::vector<std::shared_ptr<const fastllm::TokenConstraintProgram>> &programs,
-        const std::vector<int> &states, int vocab) {
+        const std::vector<int> &states, int vocab, int slot, const std::vector<char> *retain) {
     auto &b = *static_cast<TokenConstraintBatch *>(handle);
     fastllm::AssertInFastLLM(FastllmCudaGetDevice() == b.device && !programs.empty() &&
         programs.size() == states.size() && programs.size() <= (size_t)b.capacity && vocab > 0,
         "Invalid constraint batch inputs.");
-    // Per-worker/device bounded cache. Active descriptors retain their own
-    // leases, so eviction cannot invalidate captured graph inputs.
+    auto *upload = slot < 0 ? nullptr : &b.uploads[slot];
+    if (upload) {
+        fastllm::AssertInFastLLM(upload->host && retain && retain->size() == programs.size(),
+            "Invalid constraint upload ticket");
+        // Even an evicted program can be referenced by an older queued graph.
+        // This ticket completes after that graph on the same owner stream.
+        upload->previous = b.leases;
+    }
+    b.leases.resize(programs.size());
+    b.count = programs.size(); b.vocab = vocab;
     static thread_local std::map<int, std::vector<std::shared_ptr<TokenConstraintDeviceProgram>>> caches;
     auto &cache = caches[b.device];
-    b.leases.clear(); b.count = programs.size(); b.vocab = vocab;
-    std::vector<TokenConstraintDeviceView> views;
-    for (size_t row = 0; row < programs.size(); ++row) {
+    std::vector<TokenConstraintDeviceView> synchronousViews(upload ? 0 : programs.size());
+    auto *views = upload ? static_cast<TokenConstraintDeviceView *>(upload->host) : synchronousViews.data();
+    int *pinnedStates = upload ? reinterpret_cast<int *>(views + b.capacity) : nullptr;
+    if (pinnedStates) std::copy(states.begin(), states.end(), pinnedStates);
+    // Submit contiguous runs only. An unchanged row's GPU cursor may already
+    // be one sample ahead of the host because of decode lookahead.
+    int first = -1;
+    auto flush = [&](int end) {
+        if (first < 0) return;
+        size_t count = end - first;
+        bool ok = FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+            static_cast<TokenConstraintDeviceView *>(b.descriptors.cudaData) + first,
+            views + first, count * sizeof(*views)) &&
+            FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                static_cast<int *>(b.states.cudaData) + first, pinnedStates + first, count * sizeof(int));
+        fastllm::AssertInFastLLM(ok, "Constraint row upload failed");
+        first = -1;
+    };
+    for (int row = 0; row < b.count; ++row) {
         const auto &source = programs[row];
-        if (!source) { views.emplace_back(); continue; }
+        auto &lease = b.leases[row];
+        if (upload && (*retain)[row] && (lease ? lease->source : nullptr) == source) {
+            flush(row);
+            continue;
+        }
+        if (first < 0) first = row;
+        if (!source) {
+            lease.reset();
+            views[row] = {};
+            continue;
+        }
         fastllm::AssertInFastLLM(source->vocab == vocab && states[row] >= 0 &&
             states[row] < (int)source->maskIds.size(), "Invalid compiled constraint state.");
-        auto it = std::find_if(cache.begin(), cache.end(), [&](const auto &p) { return p->source == source; });
-        std::shared_ptr<TokenConstraintDeviceProgram> program;
-        if (it == cache.end()) program = std::make_shared<TokenConstraintDeviceProgram>(source);
-        else { program = *it; cache.erase(it); }
-        cache.push_back(program); b.leases.push_back(program); views.push_back(program->view);
+        if (!lease || lease->source != source) {
+            auto it = std::find_if(cache.begin(), cache.end(), [&](const auto &p) { return p->source == source; });
+            if (it == cache.end()) lease = std::make_shared<TokenConstraintDeviceProgram>(source);
+            else { lease = *it; cache.erase(it); }
+            cache.push_back(lease);
+        }
+        views[row] = lease->view;
     }
     size_t bytes = 0;
     for (const auto &p : cache) bytes += p->source->Bytes();
     while (cache.size() > 1 && bytes > 128 * 1024 * 1024) {
         bytes -= cache.front()->source->Bytes(); cache.erase(cache.begin());
     }
-    FastllmCudaCopyFromHostToDevice(b.descriptors.cudaData, views.data(), views.size() * sizeof(views[0]));
-    FastllmCudaCopyFromHostToDevice(b.states.cudaData, const_cast<int *>(states.data()), states.size() * sizeof(int));
+    if (upload) flush(b.count);
+    else {
+        FastllmCudaCopyFromHostToDevice(b.descriptors.cudaData, views, programs.size() * sizeof(*views));
+        FastllmCudaCopyFromHostToDevice(b.states.cudaData, const_cast<int *>(states.data()), states.size() * sizeof(int));
+    }
+}
+void FastllmCudaPrepareTokenConstraintBatch(void *handle,
+        const std::vector<std::shared_ptr<const fastllm::TokenConstraintProgram>> &programs,
+        const std::vector<int> &states, int vocab) {
+    PrepareTokenConstraintRows(handle, programs, states, vocab, -1, nullptr);
+}
+void FastllmCudaUpdateTokenConstraintRows(void *handle, int slot,
+        const std::vector<std::shared_ptr<const fastllm::TokenConstraintProgram>> &programs,
+        const std::vector<int> &states, const std::vector<char> &retain, int vocab) {
+    fastllm::AssertInFastLLM(slot == 0 || slot == 1, "Invalid constraint upload slot");
+    PrepareTokenConstraintRows(handle, programs, states, vocab, slot, &retain);
+}
+void FastllmCudaReleaseTokenConstraintUpload(void *handle, int slot) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    b.uploads[slot].previous.clear();
 }
 void FastllmCudaTokenConstraintMask(void *handle, int step, uint32_t *mask) {
     auto &b = *static_cast<TokenConstraintBatch *>(handle);

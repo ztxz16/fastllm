@@ -111,6 +111,9 @@ static void ConstraintSamplingChecks(bool sequentialTopK) {
             }
             FastllmCudaCopyFromHostToDevice(actual.cudaData, values.data(), values.size() * sizeof(float));
             FastllmCudaCopyFromHostToDevice(reference.cudaData, masked.data(), masked.size() * sizeof(float));
+            // Change sampling parameters with the first GPU ticket still outstanding.
+            // The constrained survivors must keep their device-advanced cursors.
+            if (slot == 1) for (auto &request : requests) request.temperature = .4f;
             auto oracle = requests;
             for (auto &r : oracle) r.constraint.reset();
             Check(gpu.Submit(requests, slot) && cpu.Submit(oracle, slot), "grammar lookahead submit");

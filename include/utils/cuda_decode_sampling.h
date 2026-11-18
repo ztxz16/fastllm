@@ -28,9 +28,11 @@ public:
         // Used on admission/reorder/rewind. Consecutive steps advance their
         // private GPU cursor, independently of CPU publication/lookahead.
         int constraintState = 0;
+        bool HasSameCursor(const Request &r) const {
+            return identity == r.identity && step == r.step && constraint == r.constraint;
+        }
         bool operator==(const Request &r) const {
-            return identity == r.identity && step == r.step && temperature == r.temperature &&
-                   topP == r.topP && topK == r.topK && constraint == r.constraint;
+            return HasSameCursor(r) && temperature == r.temperature && topP == r.topP && topK == r.topK;
         }
     };
     CudaDecodeSampling() = default;
@@ -44,9 +46,9 @@ public:
         for (int slot = 0; slot < 2; ++slot) {
             if (ready[slot]) FastllmCudaEventDestroy(ready[slot]);
             if (hostReady[slot]) FastllmCudaEventDestroy(hostReady[slot]);
+            if (hostParams[slot]) FastllmCudaHostFree(hostParams[slot]);
             if (hostTokens[slot]) FastllmCudaHostFree(hostTokens[slot]);
         }
-        if (hostParams) FastllmCudaHostFree(hostParams);
     }
     // A sampling-only owner may consume its logits in place. Softmax finishes
     // all reduction reads before writing probabilities; the next model must
@@ -81,16 +83,17 @@ public:
         constraints = FastllmCudaCreateTokenConstraintBatch(maxRows, 1);
         FastllmCudaPrepareTokenConstraintBatch(constraints.get(),
             std::vector<std::shared_ptr<const TokenConstraintProgram>>(maxRows), std::vector<int>(maxRows), vocab);
-        hostParams = FastllmCudaHostMalloc(params.GetBytes());
+        FastllmCudaInitTokenConstraintUploads(constraints.get());
         for (int slot = 0; slot < 2; ++slot) {
+            hostParams[slot] = FastllmCudaHostMalloc(params.GetBytes());
             hostTokens[slot] = (int *)FastllmCudaHostMalloc(maxRows * sizeof(int));
             ready[slot] = FastllmCudaEventCreate();
             hostReady[slot] = FastllmCudaEventCreate();
         }
-        if (!hostParams || !hostTokens[0] || !hostTokens[1] || !ready[0] || !ready[1] ||
+        if (!hostParams[0] || !hostParams[1] || !hostTokens[0] || !hostTokens[1] || !ready[0] || !ready[1] ||
             !hostReady[0] || !hostReady[1]) return false;
         std::vector<Request> initial(maxRows, {0, 0, 1.0f, 1.0f, vocab});
-        Upload(initial);
+        Upload(initial, 0, false);
         // Warm every shape before capturing startup-only sampling graphs.
         std::vector<Input> inputs{Input::Dense, Input::Constrained};
         for (Input input : inputs) for (int rows : buckets) {
@@ -140,29 +143,38 @@ public:
         const Input input = constrained ? Input::Constrained : sharded ? Input::ShardedTopK : Input::Dense;
         if (slot < 0 || slot > 1 || queued[slot] || !SupportsInput(requests.size(), input)) return false;
         FastllmCudaSetDevice(device);
-        if (requests != expected) {
-            // Rare rebind (admission, reorder, changed params or fallback): the
-            // single pinned staging buffer cannot be overwritten while in use.
-            Drain();
-            Upload(requests);
+        try {
+            if (requests != expected) {
+                // queued[slot] is clear only after collection/discard. Both host
+                // uploads can overlap the other ticket's graph and readback.
+                Upload(requests, slot, constrained);
+            }
+            const int rows = DecodeGraphBatch::Select(requests.size(), buckets).graphRows;
+            AssertInFastLLM(FastllmCudaGraphLaunch(graphs.at({rows, slot, input})), "Decode sampling graph launch failed.");
+            // The next model depends on the GPU result, not its host readback.
+            FastllmCudaEventRecordCurrentThread(ready[slot]);
+            AssertInFastLLM(FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(hostTokens[slot],
+                (int *)tokens.cudaData + slot * maxRows, requests.size() * sizeof(int)),
+                "Decode token readback failed.");
+            FastllmCudaEventRecordCurrentThread(hostReady[slot]);
+            expected = requests;
+            for (auto &request : expected) ++request.step;
+        } catch (...) {
+            // An upload or launch may already own the pinned slot. Complete it
+            // before a retry, and rebuild every cursor from its request.
+            FastllmCudaSyncCurrentThreadStream();
+            FastllmCudaReleaseTokenConstraintUpload(constraints.get(), slot);
+            expected.clear();
+            throw;
         }
-        const int rows = DecodeGraphBatch::Select(requests.size(), buckets).graphRows;
-        AssertInFastLLM(FastllmCudaGraphLaunch(graphs.at({rows, slot, input})), "Decode sampling graph launch failed.");
-        // The next model depends on the GPU result, not its host readback.
-        FastllmCudaEventRecordCurrentThread(ready[slot]);
-        AssertInFastLLM(FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(hostTokens[slot],
-            (int *)tokens.cudaData + slot * maxRows, requests.size() * sizeof(int)),
-            "Decode token readback failed.");
-        FastllmCudaEventRecordCurrentThread(hostReady[slot]);
         queued[slot] = true; counts[slot] = requests.size();
-        expected = requests;
-        for (auto &request : expected) ++request.step;
         return true;
     }
     std::vector<int> Collect(int slot) {
         AssertInFastLLM(slot >= 0 && slot < 2 && queued[slot], "Invalid decode result ticket.");
         FastllmCudaSetDevice(device);
         FastllmCudaEventSynchronize(hostReady[slot]);
+        FastllmCudaReleaseTokenConstraintUpload(constraints.get(), slot);
         queued[slot] = false;
         for (int row = 0; row < counts[slot]; ++row)
             AssertInFastLLM(hostTokens[slot][row] >= 0 && hostTokens[slot][row] < vocab,
@@ -176,7 +188,10 @@ public:
     // Owner-only cancellation/error boundary; no consumer retains these tickets.
     void Discard() {
         Drain();
-        queued[0] = queued[1] = false;
+        for (int slot = 0; slot < 2; ++slot) if (queued[slot]) {
+            FastllmCudaReleaseTokenConstraintUpload(constraints.get(), slot);
+            queued[slot] = false;
+        }
     }
     void *Ready(int slot) const { return ready[slot]; }
     const float *DeviceTokens(int slot) const { return (float *)floatTokens.cudaData + slot * maxRows; }
@@ -187,8 +202,8 @@ private:
         x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
         return x ^ (x >> 31);
     }
-    void Upload(const std::vector<Request> &requests) {
-        auto *p = (uint32_t *)hostParams;
+    void Upload(const std::vector<Request> &requests, int slot, bool constrained) {
+        auto *p = (uint32_t *)hostParams[slot];
         std::memset(p, 0, params.GetBytes());
         for (int row = 0; row < maxRows; ++row) {
             Request r = row < (int)requests.size() ? requests[row] : Request{0, 0, 1, 1, 1};
@@ -198,16 +213,18 @@ private:
             ((uint64_t *)(p + 4 * maxRows))[row] = Mix(nonce + r.identity);
             ((uint64_t *)(p + 6 * maxRows))[row] = r.step << 32;
         }
-        if (std::any_of(requests.begin(), requests.end(), [](const Request &r) { return bool(r.constraint); })) {
+        if (constrained) {
             std::vector<std::shared_ptr<const TokenConstraintProgram>> programs(maxRows);
             std::vector<int> states(maxRows, 0);
+            std::vector<char> retain(maxRows, false);
             for (size_t row = 0; row < requests.size(); ++row) {
                 programs[row] = requests[row].constraint; states[row] = requests[row].constraintState;
+                retain[row] = row < expected.size() && requests[row].HasSameCursor(expected[row]);
             }
-            FastllmCudaPrepareTokenConstraintBatch(constraints.get(), programs, states, vocab);
+            FastllmCudaUpdateTokenConstraintRows(constraints.get(), slot, programs, states, retain, vocab);
         }
         AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
-            params.cudaData, hostParams, params.GetBytes()), "Decode sampling parameters upload failed.");
+            params.cudaData, hostParams[slot], params.GetBytes()), "Decode sampling parameters upload failed.");
     }
     bool SupportsInput(int rows, Input input) const {
         auto shape = DecodeGraphBatch::Select(rows, buckets);
@@ -247,7 +264,7 @@ private:
     bool topKFirst = false;
     Data probs, params, tokens, floatTokens, topKWorkspace;
     std::shared_ptr<void> constraints;
-    void *hostParams = nullptr, *ready[2]{}, *hostReady[2]{};
+    void *hostParams[2]{}, *ready[2]{}, *hostReady[2]{};
     int *hostTokens[2]{};
     bool queued[2]{};
     int counts[2]{};
