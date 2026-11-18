@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" /><meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+  />
+  <title>Duo · 音视频对话</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      background: #f4f3ef;
+      color: #222a27;
+      font-family: Inter, "PingFang SC", sans-serif;
+    }
+    main {
+      max-width: 1040px;
+      margin: auto;
+      padding: 32px 24px;
+    }
+    header,
+    .bar,
+    .controls {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    header {
+      border-bottom: 1px solid #cccfc7;
+      padding-bottom: 18px;
+    }
+    h1 {
+      font-size: 26px;
+      letter-spacing: -1px;
+      margin: 0;
+    }
+    h1 strong {
+      font-size: 34px;
+      margin-right: 12px;
+    }
+    #status {
+      font-size: 14px;
+      color: #285843;
+    }
+    section {
+      margin: 24px 0;
+    }
+    .views {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      align-items: start;
+      gap: 16px;
+    }
+    figure {
+      margin: 0;
+    }
+    video[hidden], canvas[hidden] { display: none; }
+    canvas { width: 100%; height: auto; }
+    video {
+      width: 100%;
+      display: block;
+      background: #202825;
+      border-radius: 12px;
+      aspect-ratio: 4/3;
+      object-fit: contain;
+    }
+    figcaption {
+      padding: 9px 1px;
+      font-size: 14px;
+    }
+    button,
+    select,
+    a {
+      font: inherit;
+    }
+    button,
+    select {
+      border: 1px solid #bbc3ba;
+      border-radius: 8px;
+      padding: 10px 16px;
+      background: white;
+      color: inherit;
+      cursor: pointer;
+    }
+    button:disabled,
+    .disabled {
+      opacity: 0.45;
+      cursor: default;
+    }
+    .primary {
+      background: #245440;
+      color: white;
+      border-color: #245440;
+    }
+    .controls {
+      justify-content: flex-start;
+    }
+    a {
+      color: #225d43;
+    }
+    #log {
+      white-space: pre-wrap;
+      line-height: 1.7;
+      min-height: 28px;
+    }
+    .bar {
+      border-bottom: 1px solid #c9cdc4;
+      padding: 12px 0;
+    }
+    .bar h2 {
+      font-size: 17px;
+      margin: 0;
+    }
+    small {
+      color: #576359;
+    }
+    button:focus-visible,
+    select:focus-visible {
+      outline: 3px solid #64a483;
+    }
+    @media (max-width: 600px) {
+      main {
+        padding: 16px;
+      }
+      .views {
+        grid-template-columns: 1fr;
+      }
+      .views figure + figure {
+        max-width: 180px;
+      }
+      h1 {
+        font-size: 19px;
+      }
+    }
+  </style>
+  <main>
+    <header>
+      <h1><strong>Duo</strong>音视频对话</h1>
+      <span id="status" role="status">准备就绪</span>
+    </header>
+    <section class="views">
+      <figure>
+        <video id="reply" playsinline controls></video>
+        <canvas id="livePicture" hidden></canvas>
+        <figcaption>助手</figcaption>
+      </figure>
+      <figure>
+        <video id="preview" muted playsinline autoplay></video>
+        <figcaption>我的画面</figcaption>
+      </figure>
+    </section>
+    <div class="controls">
+      <button class="primary" id="record">开始录制</button
+      ><button id="upload">上传视频</button
+      ><input type="file" id="file" hidden accept="video/*" /><button
+        id="stop"
+        disabled
+      >
+        结束会话
+      </button>
+      <label>回复分辨率 <select id="resolution"><option value="">服务默认</option></select></label>
+    </div>
+    <section>
+      <small>录制或上传一段有声视频，最长 30 秒。回复按片段播放。</small>
+    </section>
+    <section>
+      <div class="bar">
+        <h2>对话记录</h2>
+        <a hidden id="download" download="duo-reply.mp4">下载完整回复</a>
+      </div>
+      <div id="log" aria-live="polite"></div>
+    </section>
+  </main>
+  <script src="/avc-player.js"></script>
+  <script>
+    let avcPlayer, audioClock;
+    const el = (id) => document.getElementById(id);
+    let session = null,
+      epoch = 0,
+      recorder,
+      stream,
+      recordTimer,
+      busy = false,
+      queue = [],
+      playing = false,
+      inputURL,
+      assistantLine;
+    function status(text) {
+      el("status").textContent = text;
+    }
+    function controls() {
+      el("resolution").disabled = !!session || busy || !!recorder;
+      el("record").disabled = busy;
+      el("upload").disabled = busy || !!recorder;
+      el("stop").disabled = !session && !busy && !recorder;
+    }
+    function note(text) {
+      const line = document.createElement("div");
+      line.textContent = text;
+      el("log").append(line);
+      return line;
+    }
+    async function api(path, options) {
+      const res = await fetch(path, options);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw Error(err.detail || res.statusText);
+      }
+      return res.json();
+    }
+    api("/resolutions").then(sizes => {
+      el("resolution").replaceChildren(...sizes.map(size => new Option(size.replace("x", " × "), size)));
+    }).catch(e => status(e.message));
+    function clearPlayer() {
+      avcPlayer?.close();
+      avcPlayer = null;
+      el("livePicture").hidden = true;
+      el("reply").hidden = false;
+      queue = [];
+      playing = false;
+      el("reply").pause();
+      el("reply").removeAttribute("src");
+      el("reply").load();
+    }
+    function next() {
+      if (!queue.length) {
+        playing = false;
+        return;
+      }
+      playing = true;
+      el("reply").src = queue.shift();
+      el("reply")
+        .play()
+        .catch(() => status("请点击播放"));
+    }
+    el("reply").onended = next;
+    function releaseCamera() {
+      clearTimeout(recordTimer);
+      stream?.getTracks().forEach((t) => t.stop());
+      stream = null;
+      el("preview").srcObject = null;
+    }
+    async function end() {
+      const old = session;
+      ++epoch;
+      session = null;
+      busy = false;
+      if (recorder) {
+        recorder.onstop = null;
+        if (recorder.state !== "inactive") recorder.stop();
+        recorder = null;
+      }
+      releaseCamera();
+      el("record").textContent = "开始录制";
+      clearPlayer();
+      controls();
+      if (old) await api("/sessions/" + old, { method: "DELETE" });
+      status("会话已结束");
+    }
+    el("stop").onclick = () => end().catch((e) => status(e.message));
+    async function listen(id, version) {
+      let cursor = 0;
+      try {
+        while (version === epoch) {
+          const data = await api("/sessions/" + id + "/events?after=" + cursor);
+          if (version !== epoch) return;
+          cursor = data.cursor;
+          for (const e of data.events) {
+            if (e.type === "stage") status(e.name);
+            if (e.type === "transcript") note("我　" + e.text);
+            if (e.type === "plan" && e.action === "speak") {
+              if (!assistantLine) assistantLine = note("助手　");
+              assistantLine.append(document.createTextNode(e.text.replace(/<[^>]*>/g, "")));
+            }
+            if (e.type === "chunk") {
+              if (e.url.endsWith(".mp4")) {
+                queue.push(e.url);
+                if (!playing) next();
+              }
+            }
+            if (e.type === "done") {
+              busy = false;
+              status("回复已生成");
+              el("download").href = e.url;
+              el("download").hidden = false;
+              controls();
+            }
+            if (e.type === "input_error") {
+              busy = false;
+              status(e.text);
+              controls();
+            }
+            if (e.type === "error") {
+              status(e.text);
+              note(e.text);
+              busy = false;
+              session = null;
+              controls();
+            }
+          }
+          if (data.closed) {
+            if (session) status("会话已结束");
+            session = null;
+            busy = false;
+            controls();
+            return;
+          }
+        }
+      } catch (e) {
+        if (version === epoch) {
+          status(e.message);
+          busy = false;
+          controls();
+        }
+      }
+    }
+    async function send(blob) {
+      if (!blob || !blob.size) return;
+      busy = true;
+      controls();
+      el("download").hidden = true;
+      assistantLine = null;
+      clearPlayer();
+      const version = epoch;
+      try {
+        if (!session) {
+          const resolution = encodeURIComponent(el("resolution").value);
+          if (await DuoAvcPlayer.supported()) {
+            audioClock ??= new AudioContext();
+            await audioClock.resume();
+          }
+          const created = await api("/sessions?resolution=" + resolution + (audioClock ? "&playback=avc" : ""), { method: "POST" });
+          if (version !== epoch) {
+            await api("/sessions/" + created.id, { method: "DELETE" });
+            return;
+          }
+          session = created.id;
+          listen(session, version);
+        }
+        status("上传视频");
+        const accepted = await api("/sessions/" + session + "/turns", {
+          method: "POST",
+          body: blob,
+        });
+        if (version !== epoch) return;
+        if (audioClock) {
+          el("reply").hidden = true;
+          el("livePicture").hidden = false;
+          const active = avcPlayer = new DuoAvcPlayer(el("livePicture"), audioClock);
+          active.play(accepted.stream).catch(error => {
+            if (active === avcPlayer && error.name !== "AbortError") {
+              active.close(); status(error.message);
+            }
+          });
+        }
+        status("正在处理输入");
+      } catch (e) {
+        if (version === epoch) {
+          busy = false;
+          status(e.message);
+          controls();
+        }
+      }
+    }
+    function preview(blob) {
+      if (inputURL) URL.revokeObjectURL(inputURL);
+      inputURL = URL.createObjectURL(blob);
+      el("preview").src = inputURL;
+    }
+    el("file").onchange = (e) => {
+      const file = e.target.files[0];
+      e.target.value = "";
+      if (file) {
+        preview(file);
+        send(file);
+      }
+    };
+    el("upload").onclick = () => el("file").click();
+    el("record").onclick = async () => {
+      if (recorder) {
+        clearTimeout(recordTimer);
+        if (recorder.state !== "inactive") recorder.stop();
+        return;
+      }
+      try {
+        const version = epoch;
+        busy = true;
+        controls();
+        const devices = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        });
+        if (version !== epoch) {
+          devices.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        stream = devices;
+        el("preview").srcObject = stream;
+        recorder = new MediaRecorder(stream);
+        const chunks = [];
+        recorder.ondataavailable = (e) => {
+          if (e.data.size) chunks.push(e.data);
+        };
+        recorder.onstop = () => {
+          const blob = new Blob(chunks, { type: recorder.mimeType });
+          recorder = null;
+          releaseCamera();
+          el("record").textContent = "开始录制";
+          preview(blob);
+          send(blob);
+        };
+        recorder.start();
+        busy = false;
+        el("record").textContent = "发送录制";
+        status("录制中");
+        controls();
+        recordTimer = setTimeout(() => recorder?.stop(), 30000);
+      } catch (e) {
+        releaseCamera();
+        busy = false;
+        status(e.message);
+        controls();
+      }
+    };
+    window.addEventListener("pagehide", () => {
+      if (session)
+        fetch("/sessions/" + session, { method: "DELETE", keepalive: true });
+      releaseCamera();
+    });
+  </script>
+</html>
