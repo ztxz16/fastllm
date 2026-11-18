@@ -1,0 +1,99 @@
+{
+  "repository": "https://github.com/deepseek-ai/DeepGEMM",
+  "commit": "5081f8513af57e61696de4f4f04b0e707ffb503e",
+  "changes": "C++ namespace isolation and trailing whitespace cleanup; numerical kernel is unmodified.",
+  "headers": {
+    "deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh": {
+      "original_sha256": "9d577f200e482fb2deed3e9d8a8b6ec0f71d15df2782d4b8f0a5321102ccc970",
+      "installed_sha256": "4eb3dcd342da0619a8c9c10f174dd83a05de1c122bc6bf07d84ee50780cd3616",
+      "adapted": true
+    },
+    "deep_gemm/ptx/utils.cuh": {
+      "original_sha256": "8a9d5e03afdeb20f53b1027e9f6f3a2ef45bb33152dba2b61d778684e1716412",
+      "installed_sha256": "4f785ca1d0ce3cc3cdae2b7ea176ab71cfb00e1f2c43a5bbe9b9fce3118fa9ba",
+      "adapted": true
+    },
+    "deep_gemm/common/exception.cuh": {
+      "original_sha256": "ab6b2bd75c06c054fbbe97d5897efa7909d380ad531620770c031b3debdf2123",
+      "installed_sha256": "ab6b2bd75c06c054fbbe97d5897efa7909d380ad531620770c031b3debdf2123",
+      "adapted": false
+    },
+    "deep_gemm/common/compile.cuh": {
+      "original_sha256": "a13373053608b286c1ac39ce771cdd6ab133f44ec4f016bd6fcbc5032132a1a9",
+      "installed_sha256": "a13373053608b286c1ac39ce771cdd6ab133f44ec4f016bd6fcbc5032132a1a9",
+      "adapted": false
+    },
+    "deep_gemm/ptx/tma.cuh": {
+      "original_sha256": "519bf2f4c26ef7368e6cd239027061ee2725fbb3efc89b7574233037de228d4a",
+      "installed_sha256": "e223baceac1cd31a79d2487b4d46d16152c04b0b0c7734ee67d2a5390cb3bb0e",
+      "adapted": true
+    },
+    "deep_gemm/ptx/tcgen05.cuh": {
+      "original_sha256": "7760eef80c6a38ee424974f6f48f8923a56465326c159c8a795e6e8f4fa76b42",
+      "installed_sha256": "b6ea02d848a70b0faf6ebcbc790c008962a6c8aec56b87b54eec3caee4a41d56",
+      "adapted": true
+    },
+    "deep_gemm/scheduler/mega_moe.cuh": {
+      "original_sha256": "1bf76529e321bd546216ba700ac5e8ca2f321b40486d134ef8465e223b117573",
+      "installed_sha256": "de64384ec9a748583ca5a85ba6ec94947d1140ce4ffe4cff75b4c513c80ade74",
+      "adapted": true
+    },
+    "deep_gemm/ptx/ld_st.cuh": {
+      "original_sha256": "21ba6d6284af47edb713ee9e925665fc732704b763613c1ce0cb7300a70fd755",
+      "installed_sha256": "cea7078b6f0d8104685688c1c2273cd66e9f8cc6ef15143e91ecf1f0b9a58eb0",
+      "adapted": true
+    },
+    "deep_gemm/layout/mega_moe.cuh": {
+      "original_sha256": "53008d96b7eeaeec35af54e1400a9a3149625bc39b385611fe544b08c5084b50",
+      "installed_sha256": "4c4ca902cd133657f6c7f2f294c417e651efd779eb1871f1a2879e008c1455b4",
+      "adapted": true
+    },
+    "deep_gemm/layout/sym_buffer.cuh": {
+      "original_sha256": "b157512fd62a20bf09a8fab489d4dc209751d0560c1343829e78374dbf6578cb",
+      "installed_sha256": "dc06cc46fc632134208f6fe4ce85c415f9e371612d3e1a6e8e47e82a8c46bf99",
+      "adapted": true
+    },
+    "deep_gemm/common/types.cuh": {
+      "original_sha256": "0382bf27efb6deea5dc21a4f8ae21296494e513166c2682c63e498c70cefa6b2",
+      "installed_sha256": "39f4484c538b25f10be507c498bf55940e43f69058a0cb393cbefdefbffa46d9",
+      "adapted": true
+    },
+    "deep_gemm/common/math.cuh": {
+      "original_sha256": "65aef0dbff42f066d2715c33b632f452cb4e21503fe168be0dca55aed0af9262",
+      "installed_sha256": "6e597fdf6fbc9ead1958760a9361d987a98d258874c48c06871808d02dab0191",
+      "adapted": true
+    },
+    "deep_gemm/common/cute_tie.cuh": {
+      "original_sha256": "872af0b873a9b367c01eaf68c321ddcd9d0f3c26ce7b8d3abfc8a66d89b8ad65",
+      "installed_sha256": "872af0b873a9b367c01eaf68c321ddcd9d0f3c26ce7b8d3abfc8a66d89b8ad65",
+      "adapted": false
+    },
+    "deep_gemm/mma/sm100.cuh": {
+      "original_sha256": "439c57d8aa4914c01dcb55a874ace4fdaecec4682ea1099ba36e3cb8b23f41ab",
+      "installed_sha256": "ded4f810fe2f131b140a3f3c6826528894514295aede1de09655b9ff7821de2d",
+      "adapted": true
+    },
+    "deep_gemm/common/tma_copy.cuh": {
+      "original_sha256": "fc70f7a6548720e9e3f04355f1c54184658685297a20270f3ff559fff9ece5d9",
+      "installed_sha256": "ff06165b2dc2edef1d0a646e4d481ec3a8957bb59fdf1bcf7ecf9ee8d3a34684",
+      "adapted": true
+    },
+    "deep_gemm/common/packing.cuh": {
+      "original_sha256": "7b216c4a4f94e6691e2f553b204f697257eac1312b71fd7d24e7b420815c67b8",
+      "installed_sha256": "3068b21b5b6593467a32a69a181d3c54d59025cccf1b4255f1379bb76104c466",
+      "adapted": true
+    },
+    "deep_gemm/comm/barrier.cuh": {
+      "original_sha256": "ef2906925dc5ab5178df4ba6a9a41da74270cebecd892d5a7a01dbdeab5dfd69",
+      "installed_sha256": "193061777e29d19c2c815d727721fa9a976270b7186568faeffd972dd80b9bfa",
+      "adapted": true
+    },
+    "deep_gemm/common/utils.cuh": {
+      "original_sha256": "9fd0fdb872bb1d037370cab53918535c5e049b2936dd5e8b8af51648dfb843f2",
+      "installed_sha256": "d897bba98f06355bc8be34448c6b8c4baf8769bb03cc7d9cc05552f664371cfb",
+      "adapted": true
+    }
+  },
+  "local_patch": "PATCHES.diff",
+  "scope": "Vendored C++/CUDA header subset only; no upstream Python package, JIT service, or shared library."
+}

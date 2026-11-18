@@ -1,0 +1,266 @@
+--- a/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
++++ b/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh
+@@ -16,7 +16,7 @@
+ #include <deep_gemm/ptx/tma.cuh>
+ #include <deep_gemm/ptx/utils.cuh>
+ 
+-namespace deep_gemm {
++namespace fastllm_blackwell_mega {
+ 
+ template <
+     uint32_t kNumMaxTokensPerRank,
+@@ -611,7 +611,7 @@
+                 issue_and_wait_pull_store(kNumChunks - 1);
+                 const bool is_last_token = (token_idx == expert_end_idx - 1);
+                 ptx::red_add_rel(
+-                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks), 
++                    workspace.get_l1_full_count_ptr(pool_block_idx % kNumRingBlocks),
+                     is_last_token ? BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u
+                 );
+             }
+@@ -1525,4 +1525,4 @@
+ #endif
+ }
+ 
+-} // namespace deep_gemm
++} // namespace fastllm_blackwell_mega
+--- a/deep_gemm/ptx/utils.cuh
++++ b/deep_gemm/ptx/utils.cuh
+@@ -6,7 +6,7 @@
+ #include <deep_gemm/common/exception.cuh>
+ 
+ #if defined(DG_IN_CUDA_COMPILATION)
+-namespace deep_gemm::ptx {
++namespace fastllm_blackwell_mega::ptx {
+ 
+ CUTLASS_DEVICE uint32_t get_sm_idx() {
+     uint32_t sm_idx;
+@@ -85,5 +85,5 @@
+ #endif
+ }
+ 
+-} // namespace deep_gemm::ptx
++} // namespace fastllm_blackwell_mega::ptx
+ #endif
+--- a/deep_gemm/ptx/tma.cuh
++++ b/deep_gemm/ptx/tma.cuh
+@@ -3,7 +3,7 @@
+ #include <cutlass/arch/barrier.h>
+ #include <cute/arch/copy_sm90_desc.hpp>
+ 
+-namespace deep_gemm::ptx {
++namespace fastllm_blackwell_mega::ptx {
+ 
+ // Tensor-map instructions
+ CUTLASS_DEVICE void tensor_map_release_gpu() {
+@@ -152,4 +152,4 @@
+     );
+ }
+ 
+-} // namespace deep_gemm::ptx
++} // namespace fastllm_blackwell_mega::ptx
+--- a/deep_gemm/ptx/tcgen05.cuh
++++ b/deep_gemm/ptx/tcgen05.cuh
+@@ -6,7 +6,7 @@
+ 
+ #include <deep_gemm/common/exception.cuh>
+ 
+-namespace deep_gemm::ptx {
++namespace fastllm_blackwell_mega::ptx {
+ 
+ /// UMMA versions with relaxed assertions
+ struct SM100_MMA_F16BF16_SS {
+@@ -216,4 +216,4 @@
+     asm volatile("tcgen05.fence::after_thread_sync;");
+ }
+ 
+-} // namespace deep_gemm::ptx
++} // namespace fastllm_blackwell_mega::ptx
+--- a/deep_gemm/scheduler/mega_moe.cuh
++++ b/deep_gemm/scheduler/mega_moe.cuh
+@@ -10,7 +10,7 @@
+ #include <deep_gemm/ptx/utils.cuh>
+ 
+ // TODO: add MegaMoE namespace
+-namespace deep_gemm::sched {
++namespace fastllm_blackwell_mega::sched {
+ 
+ // Get minimal L1 warmup waves to ensure no L1 -> L2 deadlock
+ // constexpr func, no runtime overhead in kernel
+@@ -478,4 +478,4 @@
+ 
+ #endif
+ 
+-} // namespace deep_gemm::sched
++} // namespace fastllm_blackwell_mega::sched
+--- a/deep_gemm/ptx/ld_st.cuh
++++ b/deep_gemm/ptx/ld_st.cuh
+@@ -6,7 +6,7 @@
+ #include <deep_gemm/common/exception.cuh>
+ 
+ #if defined(DG_IN_CUDA_COMPILATION)
+-namespace deep_gemm::ptx {
++namespace fastllm_blackwell_mega::ptx {
+ 
+ CUTLASS_DEVICE uint32_t cvt_rs_bf16x2_f32(const float& lower, const float& upper,
+                                           const uint32_t& random_bits) {
+@@ -393,5 +393,5 @@
+     asm volatile("prefetch.global.L1 [%0];" :: "l"(ptr));
+ }
+ 
+-} // namespace deep_gemm::ptx
++} // namespace fastllm_blackwell_mega::ptx
+ #endif
+--- a/deep_gemm/layout/mega_moe.cuh
++++ b/deep_gemm/layout/mega_moe.cuh
+@@ -8,7 +8,7 @@
+ #include <deep_gemm/common/types.cuh>
+ #include <deep_gemm/layout/sym_buffer.cuh>
+ 
+-namespace deep_gemm::layout {
++namespace fastllm_blackwell_mega::layout {
+ 
+ static constexpr int kNumCandidateBlockMs = 8;
+ static constexpr int kCandidateBlockM[kNumCandidateBlockMs] = {8, 16, 32, 64, 96, 128, 192, 240};
+@@ -456,4 +456,4 @@
+     }
+ };
+ 
+-} // namespace deep_gemm::layout
++} // namespace fastllm_blackwell_mega::layout
+--- a/deep_gemm/layout/sym_buffer.cuh
++++ b/deep_gemm/layout/sym_buffer.cuh
+@@ -2,7 +2,7 @@
+ 
+ #include <deep_gemm/common/exception.cuh>
+ 
+-namespace deep_gemm::layout {
++namespace fastllm_blackwell_mega::layout {
+ 
+ constexpr static uint32_t kNumMaxRanks = 72;
+ 
+@@ -41,4 +41,4 @@
+ #endif
+ };
+ 
+-} // namespace deep_gemm::layout
++} // namespace fastllm_blackwell_mega::layout
+--- a/deep_gemm/common/types.cuh
++++ b/deep_gemm/common/types.cuh
+@@ -2,7 +2,7 @@
+ 
+ #include <cute/arch/mma_sm100_desc.hpp>
+ 
+-namespace deep_gemm {
++namespace fastllm_blackwell_mega {
+ 
+ enum class MmaKind {
+     BF16        = 0,
+@@ -56,4 +56,4 @@
+ 
+ static constexpr uint32_t kNumDeviceLocalityDomains = 2;
+ 
+-} // namespace deep_gemm
++} // namespace fastllm_blackwell_mega
+--- a/deep_gemm/common/math.cuh
++++ b/deep_gemm/common/math.cuh
+@@ -7,7 +7,7 @@
+ #include <deep_gemm/common/exception.cuh>
+ #include <deep_gemm/ptx/utils.cuh>
+ 
+-namespace deep_gemm::math {
++namespace fastllm_blackwell_mega::math {
+ 
+ /// Pointer operations
+ template <typename dtype_t = void>
+@@ -239,4 +239,4 @@
+ 
+ #endif
+ 
+-} // namespace deep_gemm
++} // namespace fastllm_blackwell_mega
+--- a/deep_gemm/mma/sm100.cuh
++++ b/deep_gemm/mma/sm100.cuh
+@@ -8,7 +8,7 @@
+ #include <deep_gemm/common/packing.cuh>
+ #include <deep_gemm/common/tma_copy.cuh>
+ 
+-namespace deep_gemm::mma::sm100 {
++namespace fastllm_blackwell_mega::mma::sm100 {
+ 
+ /// Shared memory descriptor
+ CUTLASS_DEVICE
+@@ -157,4 +157,4 @@
+     desc.n_dim_ = umma_n >> 3;
+ }
+ 
+-} // namespace deep_gemm::mma::sm100
++} // namespace fastllm_blackwell_mega::mma::sm100
+--- a/deep_gemm/common/tma_copy.cuh
++++ b/deep_gemm/common/tma_copy.cuh
+@@ -7,7 +7,7 @@
+ #include <deep_gemm/common/exception.cuh>
+ #include <deep_gemm/common/packing.cuh>
+ 
+-namespace deep_gemm::tma {
++namespace fastllm_blackwell_mega::tma {
+ 
+ template <uint32_t BLOCK_INNER, uint32_t kSwizzleMode, uint32_t kPackFactor, typename dtype_t>
+ constexpr uint32_t get_inner_block_atom_size() {
+@@ -103,4 +103,4 @@
+     }
+ }
+ 
+-} // namespace deep_gemm::tma
++} // namespace fastllm_blackwell_mega::tma
+--- a/deep_gemm/common/packing.cuh
++++ b/deep_gemm/common/packing.cuh
+@@ -3,7 +3,7 @@
+ #include <cute/util/type_traits.hpp>
+ #include <cutlass/float_subbyte.h>
+ 
+-namespace deep_gemm {
++namespace fastllm_blackwell_mega {
+ 
+ template <typename dtype_t>
+ constexpr CUTLASS_HOST_DEVICE uint32_t get_smem_pack_factor() {
+@@ -11,4 +11,4 @@
+     return cute::is_same_v<dtype_t, cutlass::float_e2m1_t> ? 2 : 1;
+ }
+ 
+-} // namespace deep_gemm
++} // namespace fastllm_blackwell_mega
+--- a/deep_gemm/comm/barrier.cuh
++++ b/deep_gemm/comm/barrier.cuh
+@@ -6,7 +6,7 @@
+ #include <deep_gemm/layout/sym_buffer.cuh>
+ #include <deep_gemm/layout/mega_moe.cuh>
+ 
+-namespace deep_gemm::comm {
++namespace fastllm_blackwell_mega::comm {
+ 
+ // 60s timeout, at 2 GHz
+ constexpr int64_t kNumTimeoutCycles = 60ll * 2000000000ll;
+@@ -91,4 +91,4 @@
+         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
+ }
+ 
+-} // namespace deep_gemm::comm
++} // namespace fastllm_blackwell_mega::comm
+--- a/deep_gemm/common/utils.cuh
++++ b/deep_gemm/common/utils.cuh
+@@ -6,7 +6,7 @@
+ 
+ #include <deep_gemm/common/exception.cuh>
+ 
+-namespace deep_gemm::utils {
++namespace fastllm_blackwell_mega::utils {
+ 
+ template <typename FuncT>
+ struct PatternVisitor {
+@@ -49,4 +49,4 @@
+     return 512;
+ }
+ 
+-} // namespace deep_gemm::utils
++} // namespace fastllm_blackwell_mega::utils
