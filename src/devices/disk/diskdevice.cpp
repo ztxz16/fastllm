@@ -2181,6 +2181,7 @@ namespace fastllm {
     };
 
     struct DiskExpertEntry {
+        bool standardFp8 = false; // Registered model weights can return packed GPU records to the RAM tier.
         std::unique_ptr<DiskCachedExpert> cpu;
         std::map<int, std::unique_ptr<DiskCachedExpert>> cuda;
         uint64_t lastUse = 0, epoch = 0;
@@ -2323,7 +2324,9 @@ namespace fastllm {
     static uint64_t DemotedHostBytes(const DiskCachedExpert &expert) {
         uint64_t bytes = 0;
         for (const Data *w : {expert.gate.get(), expert.down.get()}) {
-            bytes += expert.restoreFp8 ? uint64_t(w->dims[0]) * w->dims[1] + uint64_t((w->dims[0] + w->blockK - 1) / w->blockK) * (w->dims[1] / 128) * sizeof(float)
+            bytes += expert.restoreFp8 ? uint64_t(w->dims[0]) * w->dims[1] +
+                                             uint64_t((w->dims[0] + w->blockK - 1) / w->blockK) *
+                                                 (w->dims[1] / 128) * sizeof(float)
                                        : DiskGGUFAllocationBytes(w->GetBytes());
         }
         return bytes;
@@ -2343,7 +2346,8 @@ namespace fastllm {
         for (int first = 0; first < rows; first += tile) {
             const int count = std::min(tile, rows - first);
             FastllmCudaCopyFromDeviceToHost(packed.data(),
-                static_cast<uint8_t *>(src.cudaData) + size_t(first) * pitch, size_t(count) * pitch);
+                                            static_cast<uint8_t *>(src.cudaData) + size_t(first) * pitch,
+                                            size_t(count) * pitch);
             for (int i = 0; i < count; ++i) {
                 const int row = first + i;
                 const int original = interleaved ? row / 2 + (row % 2) * (rows / 2) : row;
@@ -2352,7 +2356,8 @@ namespace fastllm {
                 for (int col = 0; col < columns; col += 128, from += 128 + sizeof(float)) {
                     memcpy(to + col, from, 128);
                     if (original % src.blockK == 0)
-                        memcpy(&dst->scales[size_t(original / src.blockK)*scaleCols + col/128], from+128, sizeof(float));
+                        memcpy(&dst->scales[size_t(original / src.blockK) * scaleCols + col / 128],
+                               from + 128, sizeof(float));
                 }
             }
         }
@@ -3181,9 +3186,9 @@ namespace fastllm {
     }
 
     static std::unique_ptr<DiskCachedExpert> DiskCudaExpert(const DiskCachedExpert &host,
-                                                          MoeGateType gateType, bool canonicalGGUF = false) {
+                                                          MoeGateType gateType, bool canonicalGGUF = false, bool restoreFp8 = false) {
         std::unique_ptr<DiskCachedExpert> gpu(new DiskCachedExpert);
-        gpu->restoreFp8 = host.gate->dataType == FP8_E4M3 && host.down->dataType == FP8_E4M3 &&
+        gpu->restoreFp8 = restoreFp8 && host.gate->dataType == FP8_E4M3 && host.down->dataType == FP8_E4M3 &&
                           host.gate->blockM == 128 && host.down->blockM == 128 && host.gate->blockK > 0 && host.down->blockK > 0 &&
                           host.gate->dims[1] % 128 == 0 && host.down->dims[1] % 128 == 0;
         gpu->interleavedGate = !canonicalGGUF && gateType != MoeGateGeglu;
@@ -5197,7 +5202,7 @@ namespace fastllm {
                 if (offloadRam && mxfp4) transientGpu = uploader.Upload(*host, reusableGpu);
 #endif
                 if (!transientGpu) {
-                    transientGpu = DiskCudaExpert(*host, gateType, canonicalGGUF);
+                    transientGpu = DiskCudaExpert(*host, gateType, canonicalGGUF, entry && entry->standardFp8);
                     if (transientGpu) {
                         transientGpu->packedCuda = ordinaryCanonical;
                         bool uploaded;
@@ -5335,7 +5340,7 @@ namespace fastllm {
                     promotion->packedCuda = ordinaryCanonical;
                     return promotion;
                 }
-                return DiskCudaExpert(*host, gateType, canonicalGGUF);
+                return DiskCudaExpert(*host, gateType, canonicalGGUF, entry && entry->standardFp8);
             };
             // Limit transfer churn to the hottest eligible expert per invocation.
             // A promoted expert no longer needs to occupy the RAM tier too.

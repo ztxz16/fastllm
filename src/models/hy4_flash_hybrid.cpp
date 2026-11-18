@@ -22,9 +22,9 @@ void Hy4FlashModel::OnModelWeightsLoaded() {
         }
     }
     if (SelectMoeDeviceForLayer(1) == "disk")
-        diskGraphReady = std::all_of(hostExperts.begin() + 1, hostExperts.end(), DiskMoeV41Graph::Supports);
+        diskGraphReady = std::all_of(hostExperts.begin() + 1, hostExperts.end(), DiskMoeV41Graph::RegisterStandardFp8);
     if (MoeCudaCacheRequested() && SelectMoeDeviceForLayer(1) != "disk") {
-        HybridMoeCachePlan plan(HybridMoeMath::Standard, 10.f);
+        HybridMoeCachePlan plan(HybridMoeMath::Hy4Flash, 10.f);
         for (int layer = 1; layer < block_cnt; layer++)
             plan.Add(hostExperts[layer], SelectMoeDeviceForLayer(layer), devices.front());
         hostCacheReady = plan.Prepare([this] { WarmupNumaMoeWeights(true); }, true);

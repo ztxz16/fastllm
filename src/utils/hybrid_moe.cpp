@@ -197,7 +197,7 @@ bool HybridMoeCachePlan::Prepare(const std::function<void()> &registerNumaWeight
     for (const auto &layer : layers) {
         cacheLayers.push_back({layer.weights, layer.count,
             math == HybridMoeMath::DeepSeekV41, swigluLimit, math == HybridMoeMath::Glm5,
-            layer.cacheDevice, math == HybridMoeMath::Qwen38FlashNext});
+            layer.cacheDevice, math == HybridMoeMath::Qwen38FlashNext, math == HybridMoeMath::Hy4Flash});
     }
     // One cache group owns one storage backend. Keep native FP4/FP8 kernels
     // when other layers use GGUF, rather than rejecting the whole model or

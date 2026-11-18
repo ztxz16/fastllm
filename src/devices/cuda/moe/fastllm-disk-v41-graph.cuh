@@ -11,7 +11,7 @@ struct alignas(64) Control {
     unsigned published;
     alignas(64) unsigned completed;
 };
-template<class T>
+template <class T>
 __global__ void Publish(Control *box, float *host, int *hostIds, float *hostScores, int *hostResident,
                         int *slots, const uint8_t *const *records, const T *input, const int *ids,
                         const float *scores, int rows, int hidden, int topk, int experts) {
@@ -40,9 +40,9 @@ __global__ void Wait(const Control *box) {
     } while (!done);
 #endif
 }
-template<class T>
-__global__ void Reduce(const float *gpu, const float *host, const int *slots, const int *ids,
-                       T *out, int hidden, int topk) {
+template <class T>
+__global__ void Reduce(const float *gpu, const float *host, const int *slots, const int *ids, T *out,
+                       int hidden, int topk) {
     __shared__ int order[16];
     const int row = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
     if (!threadIdx.x)
@@ -67,40 +67,47 @@ __global__ void Reduce(const float *gpu, const float *host, const int *slots, co
 #if CUDART_VERSION >= 11080
 // Disk FP8 uses interleaved gate/up rows and appends its float scale to each
 // 128 weight bytes. Only the worker changes these leased device pointers.
-__device__ float PackedFp8Dot(const uint8_t *row,const float *x,int width) {
-    int lane=threadIdx.x&31;
-    float sum=0;
-    for(int i=0;i<width;i+=128) {
-        auto tile=row+(i/128)*132;
-        auto w=static_cast<float4>(*reinterpret_cast<const __nv_fp8x4_e4m3 *>(tile+lane*4));
-        auto v=*reinterpret_cast<const float4 *>(x+i+lane*4);
-        float dot=fmaf(w.w,v.w,fmaf(w.z,v.z,fmaf(w.y,v.y,w.x*v.x)));
-        sum=fmaf(dot,*reinterpret_cast<const float *>(tile+128),sum);
+__device__ float PackedFp8Dot(const uint8_t *row, const float *x, int width) {
+    int lane = threadIdx.x & 31;
+    float sum = 0;
+    for (int i = 0; i < width; i += 128) {
+        auto tile = row + (i / 128) * 132;
+        auto w = static_cast<float4>(*reinterpret_cast<const __nv_fp8x4_e4m3 *>(tile + lane * 4));
+        auto v = *reinterpret_cast<const float4 *>(x + i + lane * 4);
+        float dot = fmaf(w.w, v.w, fmaf(w.z, v.z, fmaf(w.y, v.y, w.x * v.x)));
+        sum = fmaf(dot, *reinterpret_cast<const float *>(tile + 128), sum);
     }
-    for(int delta=16;delta;delta/=2) sum+=__shfl_down_sync(~0u,sum,delta);
+    for (int delta = 16; delta; delta /= 2)
+        sum += __shfl_down_sync(~0u, sum, delta);
     return sum;
 }
-__global__ void PackedFp8Gate(const float *x,const int *slots,const uint8_t *const *records,
-                              float *act,int topk,int hidden,int inter,float limit) {
-    int r=blockIdx.y,e=slots[r],j=blockIdx.x*4+threadIdx.x/32;
-    if(e<0 || j>=inter) return;
-    size_t pitch=hidden/128*132;
-    auto w=records[e]+2*j*pitch;
-    auto in=x+size_t(r/topk)*hidden;
-    float gate=PackedFp8Dot(w,in,hidden),up=PackedFp8Dot(w+pitch,in,hidden);
-    if(!(threadIdx.x&31)) {
-        gate=__bfloat162float(__float2bfloat16_rn(gate));
-        up=__bfloat162float(__float2bfloat16_rn(up));
-        if(limit>0) {gate=fminf(gate,limit);up=fminf(limit,fmaxf(-limit,up));}
-        act[size_t(r)*inter+j]=__bfloat162float(__float2bfloat16_rn(gate/(1.f+expf(-gate))*up));
+__global__ void PackedFp8Gate(const float *x, const int *slots, const uint8_t *const *records, float *act,
+                              int topk, int hidden, int inter, float limit) {
+    int r = blockIdx.y, e = slots[r], j = blockIdx.x * 4 + threadIdx.x / 32;
+    if (e < 0 || j >= inter)
+        return;
+    size_t pitch = hidden / 128 * 132;
+    auto w = records[e] + 2 * j * pitch;
+    auto in = x + size_t(r / topk) * hidden;
+    float gate = PackedFp8Dot(w, in, hidden), up = PackedFp8Dot(w + pitch, in, hidden);
+    if (!(threadIdx.x & 31)) {
+        gate = __bfloat162float(__float2bfloat16_rn(gate));
+        up = __bfloat162float(__float2bfloat16_rn(up));
+        if (limit > 0) {
+            gate = fminf(gate, limit);
+            up = fminf(limit, fmaxf(-limit, up));
+        }
+        act[size_t(r) * inter + j] = __bfloat162float(__float2bfloat16_rn(gate / (1.f + expf(-gate)) * up));
     }
 }
-__global__ void PackedFp8Down(const float *act,const int *slots,const uint8_t *const *records,
-                              const float *scores,float *out,int hidden,int inter) {
-    int r=blockIdx.y,e=slots[r],j=blockIdx.x*4+threadIdx.x/32;
-    if(e<0 || j>=hidden) return;
-    float sum=PackedFp8Dot(records[e]+size_t(j)*(inter/128*132),act+size_t(r)*inter,inter);
-    if(!(threadIdx.x&31)) out[size_t(r)*hidden+j]=scores[r]*__bfloat162float(__float2bfloat16_rn(sum));
+__global__ void PackedFp8Down(const float *act, const int *slots, const uint8_t *const *records,
+                              const float *scores, float *out, int hidden, int inter) {
+    int r = blockIdx.y, e = slots[r], j = blockIdx.x * 4 + threadIdx.x / 32;
+    if (e < 0 || j >= hidden)
+        return;
+    float sum = PackedFp8Dot(records[e] + size_t(j) * (inter / 128 * 132), act + size_t(r) * inter, inter);
+    if (!(threadIdx.x & 31))
+        out[size_t(r) * hidden + j] = scores[r] * __bfloat162float(__float2bfloat16_rn(sum));
 }
 #endif
 } // namespace disk_v41_graph
@@ -127,9 +134,13 @@ struct FastllmCudaDiskV41Graph::Impl {
     }
     Host View(bool gpu = false) const {
         auto *p = static_cast<uint8_t *>(gpu ? mapped : host);
-        return {reinterpret_cast<float *>(p + inputAt),  reinterpret_cast<float *>(p + outputAt),
-                reinterpret_cast<int32_t *>(p + idsAt),  reinterpret_cast<int32_t *>(p + residentAt),
-                reinterpret_cast<float *>(p + scoresAt), reinterpret_cast<const uint8_t **>(p + recordsAt),reinterpret_cast<const uint8_t **>(p + downRecordsAt)};
+        return {reinterpret_cast<float *>(p + inputAt),
+                reinterpret_cast<float *>(p + outputAt),
+                reinterpret_cast<int32_t *>(p + idsAt),
+                reinterpret_cast<int32_t *>(p + residentAt),
+                reinterpret_cast<float *>(p + scoresAt),
+                reinterpret_cast<const uint8_t **>(p + recordsAt),
+                reinterpret_cast<const uint8_t **>(p + downRecordsAt)};
     }
 };
 FastllmCudaDiskV41Graph::FastllmCudaDiskV41Graph(std::unique_ptr<Impl> p) : impl(std::move(p)) {}
@@ -160,19 +171,22 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
     using namespace fastllm;
     const int device = FastllmCudaGetDevice();
     const bool native = weightType == NVFP4;
-    const bool fp8=weightType==FP8_E4M3;
+    const bool fp8 = weightType == FP8_E4M3;
 #if CUDART_VERSION < 11080
-    if(fp8) return {};
+    if (fp8)
+        return {};
 #endif
     if (weightType != DATA_GGUF_FORMAT && !native && !fp8)
         return {};
-    if (input.dataType != (fp8?FLOAT32:BFLOAT16) || input.dims.size() != 2 || input.dims[0] < 1 || input.dims[0] > 32 ||
-        index.dataType != INT32 || score.dataType != FLOAT32 || index.dims != score.dims ||
-        index.dims.size() != 2 || index.dims[0] != input.dims[0] || index.dims[1] < 1 || index.dims[1] > 16 ||
+    if (input.dataType != (fp8 ? FLOAT32 : BFLOAT16) || input.dims.size() != 2 || input.dims[0] < 1 ||
+        input.dims[0] > 32 || index.dataType != INT32 || score.dataType != FLOAT32 ||
+        index.dims != score.dims || index.dims.size() != 2 || index.dims[0] != input.dims[0] ||
+        index.dims[1] < 1 || index.dims[1] > 16 ||
         (!native && !fp8 && !FastllmCudaV41GGUFSupported(gateType, downType)) || experts < 1 || inter < 1 ||
         input.dims[1] < 1 || input.dims[1] % 32 || inter % 32 || FastllmCudaGraphIsCapturingFast())
         return {};
-    if(fp8 && (input.dims[1]%128 || inter%128)) return {};
+    if (fp8 && (input.dims[1] % 128 || inter % 128))
+        return {};
     for (const Data *d : {&input, &index, &score})
         if (d->multiDeviceData || d->dataDevice != CUDA || !d->cudaData ||
             d->dataDeviceIds != std::vector<int>{device})
@@ -201,7 +215,7 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
     p->scoresAt = take(p->rows * p->topk * 4);
     p->residentAt = take(p->rows * p->topk * 4);
     p->recordsAt = take(experts * sizeof(void *));
-    p->downRecordsAt=fp8?take(experts*sizeof(void*)):p->recordsAt;
+    p->downRecordsAt = fp8 ? take(experts * sizeof(void *)) : p->recordsAt;
     if (cudaHostAlloc(&p->host, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
         cudaGetLastError();
         return {};
@@ -213,11 +227,11 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
     memset(p->host, 0, bytes);
     p->slots.Resize({p->rows, p->topk});
     p->partial.Resize({p->rows, p->topk, p->hidden});
-    if(fp8) {
-        p->activation.dataType=FLOAT32;
+    if (fp8) {
+        p->activation.dataType = FLOAT32;
         p->activation.UpdateUnitSize();
-        p->activation.Resize({p->rows*p->topk,inter});
-        p->activation.ToDevice(CUDA,{device},false);
+        p->activation.Resize({p->rows * p->topk, inter});
+        p->activation.ToDevice(CUDA, {device}, false);
         p->activation.Allocate(false);
     } else if (native) {
         p->activation.dataType = BFLOAT16;
@@ -258,29 +272,34 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
                                      p->scratch.GetBytes()};
     view.recordPointers = host.records;
     auto launch = [&] {
-        if(fp8)
-        disk_v41_graph::Publish<<<1, 256, 0, cudaStreamPerThread>>>(
-            static_cast<disk_v41_graph::Control *>(p->mapped), host.input, host.ids, host.scores,
-            host.resident, static_cast<int *>(p->slots.cudaData), host.records,
-            static_cast<const float *>(input.cudaData), static_cast<const int *>(index.cudaData),
-            static_cast<const float *>(score.cudaData), p->rows, p->hidden, p->topk, experts);
+        if (fp8)
+            disk_v41_graph::Publish<<<1, 256, 0, cudaStreamPerThread>>>(
+                static_cast<disk_v41_graph::Control *>(p->mapped), host.input, host.ids, host.scores,
+                host.resident, static_cast<int *>(p->slots.cudaData), host.records,
+                static_cast<const float *>(input.cudaData), static_cast<const int *>(index.cudaData),
+                static_cast<const float *>(score.cudaData), p->rows, p->hidden, p->topk, experts);
         else
-        disk_v41_graph::Publish<<<1, 256, 0, cudaStreamPerThread>>>(
-            static_cast<disk_v41_graph::Control *>(p->mapped), host.input, host.ids, host.scores,
-            host.resident, static_cast<int *>(p->slots.cudaData), host.records,
-            static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const int *>(index.cudaData),
-            static_cast<const float *>(score.cudaData), p->rows, p->hidden, p->topk, experts);
+            disk_v41_graph::Publish<<<1, 256, 0, cudaStreamPerThread>>>(
+                static_cast<disk_v41_graph::Control *>(p->mapped), host.input, host.ids, host.scores,
+                host.resident, static_cast<int *>(p->slots.cudaData), host.records,
+                static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const int *>(index.cudaData),
+                static_cast<const float *>(score.cudaData), p->rows, p->hidden, p->topk, experts);
 #if CUDART_VERSION >= 11080
-        if(fp8) {
-            disk_v41_graph::PackedFp8Gate<<<dim3(inter/4,p->rows*p->topk),128,0,cudaStreamPerThread>>>(
-                static_cast<const float *>(input.cudaData),static_cast<const int *>(p->slots.cudaData),
-                host.records,static_cast<float *>(p->activation.cudaData),p->topk,p->hidden,inter,limit);
-            disk_v41_graph::PackedFp8Down<<<dim3(p->hidden/4,p->rows*p->topk),128,0,cudaStreamPerThread>>>(
-                static_cast<const float *>(p->activation.cudaData),static_cast<const int *>(p->slots.cudaData),
-                host.downRecords,static_cast<const float *>(score.cudaData),static_cast<float *>(p->partial.cudaData),p->hidden,inter);
+        if (fp8) {
+            disk_v41_graph::
+                PackedFp8Gate<<<dim3(inter / 4, p->rows * p->topk), 128, 0, cudaStreamPerThread>>>(
+                    static_cast<const float *>(input.cudaData), static_cast<const int *>(p->slots.cudaData),
+                    host.records, static_cast<float *>(p->activation.cudaData), p->topk, p->hidden, inter,
+                    limit);
+            disk_v41_graph::
+                PackedFp8Down<<<dim3(p->hidden / 4, p->rows * p->topk), 128, 0, cudaStreamPerThread>>>(
+                    static_cast<const float *>(p->activation.cudaData),
+                    static_cast<const int *>(p->slots.cudaData), host.downRecords,
+                    static_cast<const float *>(score.cudaData), static_cast<float *>(p->partial.cudaData),
+                    p->hidden, inter);
         } else
 #endif
-        if (native) {
+            if (native) {
             // Preserve the eager block-32 FP8 activation boundary. Disk GPU
             // records have interleaved Gate/Up rows and native 17-byte blocks.
             if (!FastllmCudaDeepSeekV41QuantizeActivation(input, p->quantized))
@@ -313,16 +332,16 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
             }
         disk_v41_graph::Wait<<<1, 1, 0, cudaStreamPerThread>>>(
             static_cast<disk_v41_graph::Control *>(p->mapped));
-        if(fp8)
-        disk_v41_graph::Reduce<<<dim3((p->hidden + 255) / 256, p->rows), 256, 0, cudaStreamPerThread>>>(
-            static_cast<const float *>(p->partial.cudaData), host.output,
-            static_cast<const int *>(p->slots.cudaData), host.ids,
-            static_cast<float *>(output.cudaData), p->hidden, p->topk);
+        if (fp8)
+            disk_v41_graph::Reduce<<<dim3((p->hidden + 255) / 256, p->rows), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const float *>(p->partial.cudaData), host.output,
+                static_cast<const int *>(p->slots.cudaData), host.ids, static_cast<float *>(output.cudaData),
+                p->hidden, p->topk);
         else
-        disk_v41_graph::Reduce<<<dim3((p->hidden + 255) / 256, p->rows), 256, 0, cudaStreamPerThread>>>(
-            static_cast<const float *>(p->partial.cudaData), host.output,
-            static_cast<const int *>(p->slots.cudaData), host.ids,
-            static_cast<__nv_bfloat16 *>(output.cudaData), p->hidden, p->topk);
+            disk_v41_graph::Reduce<<<dim3((p->hidden + 255) / 256, p->rows), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const float *>(p->partial.cudaData), host.output,
+                static_cast<const int *>(p->slots.cudaData), host.ids,
+                static_cast<__nv_bfloat16 *>(output.cudaData), p->hidden, p->topk);
         return cudaGetLastError() == cudaSuccess;
     };
     // Warm all dynamic allocations and lazy kernels before capture. Empty

@@ -102,6 +102,7 @@ struct OffloadLayout {
     bool planarMxfp4 = false;
     bool glm5 = false;
     float swigluLimit = 0.0f;
+    bool standardFp8Graph = false;
     fastllm::DataType weightType = fastllm::DataType::NVFP4_BLOCK_16_E4M3;
     int gateGgmlType = -1, downGgmlType = -1;
     int experts = 0;
@@ -2319,6 +2320,7 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
             layers[layer].deepSeekV41 != layers[0].deepSeekV41 ||
             layers[layer].glm5 != layers[0].glm5 ||
             layers[layer].qwen38FlashNext != layers[0].qwen38FlashNext ||
+            layers[layer].standardFp8Graph != layers[0].standardFp8Graph ||
             layers[layer].swigluLimit != layers[0].swigluLimit) {
             return false;
         }
@@ -2365,12 +2367,14 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
                 layerLayout.deepSeekV41 = layers[0].deepSeekV41;
                 layerLayout.glm5 = layers[0].glm5;
                 layerLayout.swigluLimit = layers[0].swigluLimit;
+                layerLayout.standardFp8Graph = layers[0].standardFp8Graph;
             }
             if (first) {
                 observed.experts = experts;
                 observed.deepSeekV41 = layers[0].deepSeekV41;
                 observed.glm5 = layers[0].glm5;
                 observed.swigluLimit = layers[0].swigluLimit;
+                observed.standardFp8Graph = layers[0].standardFp8Graph;
                 layout = observed;
                 first = false;
             } else if (opaqueFormat || (observed.weightType == fastllm::DataType::DATA_GGUF_FORMAT &&
@@ -2885,7 +2889,7 @@ bool ComputeFP8Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
         return ComputeScoredFP8Experts(input, gateOutput, layout, cache.records,
             cache.routeSlots, scores, topk, perExpert);
     return FastllmCudaMoeFP8CacheComputeLimited(input, gateOutput, output, FP8CacheView(layout, cache),
-        cache.routeSlots, scores, topk, perExpert, {},layout.swigluLimit);
+        cache.routeSlots, scores, topk, perExpert, {}, layout.standardFp8Graph ? layout.swigluLimit : 0.f);
 }
 
 bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
@@ -2918,7 +2922,7 @@ bool ComputeStagedNativeExpert(const fastllm::Data &input, fastllm::Data &gate,
     if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3)
         return LaunchNVFP4Cache<float>(input, gateRow, output, layout, temporary, score, 1, perExpert, events);
     return FastllmCudaMoeFP8CacheComputeLimited(input, gateRow, output, FP8CacheView(layout, temporary),
-        slot, score, 1, perExpert, events,layout.swigluLimit);
+        slot, score, 1, perExpert, events, layout.standardFp8Graph ? layout.swigluLimit : 0.f);
 }
 
 bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
@@ -5918,9 +5922,12 @@ bool FastllmCudaMergeMOEHybrid(const fastllm::Data &input,
     // Tile the eager adapter's bounded math workspace without imposing a
     // scheduling limit on the logical batch. Full graphs group all rows once
     // through their dynamically sized mailbox and tile only GPU computation.
-    const bool standardFp8Verify = routePhase == FastllmMoeRoutePhase::Verify &&
+    const bool fp8Verify = routePhase == FastllmMoeRoutePhase::Verify &&
         input.dataType == fastllm::FLOAT32 && weights && weightsBatch >= 4 && weights[2] &&
         (weights[2]->dataType == fastllm::FP8_E4M3 || weights[2]->dataType == fastllm::FP8_E4M3_BLOCK_128);
+    const auto *fp8Group = fp8Verify && input.dims.size() == 2 && input.dims[0] > 8
+        ? FindHybridGroup(weights, weightsBatch) : nullptr;
+    const bool standardFp8Verify = fp8Group && fp8Group->layout.standardFp8Graph;
     if (input.dims.size() == 2 && input.dims[0] > 8 &&
         !FastllmCudaMoeCacheFullyResident(weights, weightsBatch) &&
         input.dataDevice == fastllm::DataDevice::CUDA && index.dataDevice == fastllm::DataDevice::CUDA &&
@@ -6197,7 +6204,7 @@ void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, 
     const bool supportedGGUF = layout.weightType == fastllm::DATA_GGUF_FORMAT &&
         FastllmCudaV41GGUFSupported(layout.gateGgmlType, layout.downGgmlType) &&
         FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
-    const bool standardFp8 = !layout.deepSeekV41 && !layout.glm5 &&
+    const bool standardFp8 = layout.standardFp8Graph &&
         (layout.weightType == fastllm::FP8_E4M3 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128);
     const bool standard = standardFp8 || (group->qwen38FlashNext && !layout.deepSeekV41 && !layout.glm5 &&
         ((layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3 && SupportsNVFP4WideDecode(layout)) ||

@@ -2151,6 +2151,7 @@ struct FastllmCudaMoeCacheLayer {
     // execution supplies its own ownership and does not use this restriction.
     int cacheDevice = -1;
     bool qwen38FlashNext = false; // Explicit caller profile; Standard arithmetic.
+    bool standardFp8Graph = false; // Opt in to FP32 routed FP8 decode and verification.
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.

@@ -11,7 +11,7 @@
 namespace fastllm {
 // Numerical semantics belong to the expert layout, not to the storage tier.
 // Keep score placement, projection rounding and activation quantization distinct.
-enum class HybridMoeMath { Standard, Glm5, DeepSeekV41, Qwen38FlashNext };
+enum class HybridMoeMath { Standard, Glm5, DeepSeekV41, Qwen38FlashNext, Hy4Flash };
 
 #ifdef USE_CUDA
 // Own a composition of CUDA segments and optional host-expert mailbox
