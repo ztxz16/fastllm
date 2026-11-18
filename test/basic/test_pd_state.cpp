@@ -102,10 +102,12 @@ static void TestGPUAllocatorPressure() {
 
 // Exercise the actual chunked serving loop after transfer, rather than only
 // calling ImportPDState and supplying correct positions directly to Forward.
-static void TestChunkedDecodeHandoff() {
+static void TestChunkedDecodeHandoff(bool pipeline) {
     class ScheduledModel final : public StateModel {
       public:
         std::atomic<int> positionErrors{0};
+        std::atomic<int> pipelineSubmits{0};
+        bool pipelineEnabled = false;
         ScheduledModel() {
             use_new_engine = false; canDoBatchForward = true; eos_token_id = -100;
             dataType = kvCacheDataType = FLOAT32;
@@ -117,7 +119,47 @@ static void TestChunkedDecodeHandoff() {
         bool NeedAttentionMask(int, int) override { return false; }
         bool UseGenericHistoryCache() const override { return false; }
         bool RetainCudaWorkspace() const override { return true; }
+        bool SupportsDecodePipeline() const override { return pipelineEnabled; }
+        bool SupportsDecodePipelineHistory() const override { return true; }
+        struct Pipe : DecodePipeline {
+            ScheduledModel &model;
+            std::vector<ResponseContext *> contexts;
+            std::vector<int> positions, results[2];
+            Pipe(ScheduledModel &model, const std::vector<ResponseContext *> &contexts)
+                : model(model), contexts(contexts) {
+                for (auto *context : contexts) {
+                    Check(context->curTokens > 0 && context->pdPending &&
+                              !context->HasPendingPD() && context->pdAdmission,
+                          "pipeline entered before PD commit/first token or lost its lease");
+                    positions.push_back(context->preTokens);
+                }
+            }
+            bool Submit(int slot, int input = -1) override {
+                Check(results[slot].empty(), "PD pipeline overwrote a result slot");
+                for (size_t row = 0; row < contexts.size(); ++row) {
+                    auto *context = contexts[row];
+                    const int token = input < 0 ? context->currentTokens[0] : results[input].at(row);
+                    Data ids(FLOAT32, {1,1}, std::vector<float>{float(token)});
+                    Data position(FLOAT32, {1,1}, std::vector<float>{float(positions[row]++)});
+                    results[slot].push_back(model.Forward(ids, Data(), position,
+                        context->pastKeyValues, context->generationConfig, LastTokensManager(), nullptr));
+                }
+                ++model.pipelineSubmits;
+                return true;
+            }
+            std::vector<int> Collect(int slot) override {
+                std::vector<int> result;
+                result.swap(results[slot]);
+                return result;
+            }
+            void Drain() override { results[0].clear(); results[1].clear(); }
+        };
+        std::unique_ptr<DecodePipeline> CreateDecodePipeline(
+                const std::vector<ResponseContext *> &contexts) override {
+            return std::make_unique<Pipe>(*this, contexts);
+        }
         void ImportPDState(ResponseContext &context, const fastkv::Message &state) override {
+            Check(context.HasPendingPD(), "PD reported ready before state import");
             StateModel::ImportPDState(context, state);
             context.pastKeyValues[0].second.CopyFrom(context.pastKeyValues[0].first);
             for (Data *cache : {&context.pastKeyValues[0].first, &context.pastKeyValues[0].second})
@@ -137,6 +179,7 @@ static void TestChunkedDecodeHandoff() {
             return 42;
         }
     } prefill, decode;
+    decode.pipelineEnabled = pipeline;
     fastkv::Service port; port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
     auto endpoint = port.Address(); port.Stop();
     SetMaxTokens(4096);
@@ -158,8 +201,103 @@ static void TestChunkedDecodeHandoff() {
     }
     Check(prefill.positionErrors == 0 && decode.positionErrors == 0,
           "PD handoff reset prompt/decode positions");
+    Check(decode.pipelineSubmits == (pipeline ? 2 : 0),
+          "committed PD request did not enter the decode pipeline");
     decode.Stop(); prefill.StopPD();
-    std::cout << "PASS PD chunked serving positions after handoff\n";
+    std::cout << "PASS PD chunked serving positions after handoff, pipeline=" << pipeline << "\n";
+}
+
+static void TestDecodeDuringPDTransfer() {
+    struct Producer : StateModel {
+        std::atomic<bool> hold{true}, entered{false};
+        int Forward(const Data &ids, const Data &mask, const Data &positions,
+                std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &cfg,
+                const LastTokensManager &last, std::vector<float> *logits) override {
+            entered = true;
+            while (hold) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return StateModel::Forward(ids, mask, positions, kv, cfg, last, logits);
+        }
+    } prefill;
+    struct Consumer : StateModel {
+        int submits = 0;
+        std::function<void(int)> onSubmit;
+        bool SupportsDecodePipeline() const override { return true; }
+        bool SupportsDecodePipelineHistory() const override { return true; }
+        struct Pipe : DecodePipeline {
+            Consumer &model;
+            bool queued[2]{};
+            explicit Pipe(Consumer &model) : model(model) {}
+            bool Submit(int slot, int input = -1) override {
+                Check(!queued[slot] && (input < 0 || queued[input]), "PD pipeline ticket reuse");
+                queued[slot] = true;
+                if (model.onSubmit) model.onSubmit(++model.submits);
+                else ++model.submits;
+                return true;
+            }
+            std::vector<int> Collect(int slot) override {
+                Check(queued[slot], "PD pipeline missing result"); queued[slot] = false; return {42};
+            }
+            void Drain() override { queued[0] = queued[1] = false; }
+        };
+        std::unique_ptr<DecodePipeline> CreateDecodePipeline(
+                const std::vector<ResponseContext *> &contexts) override {
+            Check(contexts.size() == 1 && contexts[0]->curTokens > 0 && !contexts[0]->HasPendingPD(),
+                  "pipeline admitted an unfinished PD transfer");
+            return std::make_unique<Pipe>(*this);
+        }
+    } decode;
+    // Release P before either runtime's destructor, including failed assertions.
+    struct Release { Producer &p; ~Release() { p.hold = false; } } release{prefill};
+    fastkv::Service port; port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop(); SetMaxTokens(65536);
+    prefill.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","overlap"},
+        {"transport","tcp"},{"listen",endpoint},{"chunk_tokens",2}});
+    decode.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","overlap"},
+        {"transport","tcp"},{"prefill",json11::Json::array{endpoint}}});
+    const int readyHandle = decode.responseContextDict.CreateHandle();
+    const int waitingHandle = decode.responseContextDict.CreateHandle();
+    auto *ready = decode.responseContextDict.GetHandle(readyHandle);
+    auto *waiting = decode.responseContextDict.GetHandle(waitingHandle);
+    ready->Init(1, FLOAT32, FLOAT32); waiting->Init(1, FLOAT32, FLOAT32);
+    ready->generationConfig.output_token_limit = 5;
+    ready->currentTokens = {42}; ready->allTokens = {1, 2, 42};
+    ready->curTokens = 1; ready->preTokens = 2;
+    waiting->currentTokens = waiting->allTokens = {3, 7, 11}; waiting->inputTokens = 3;
+    waiting->generationConfig.output_token_limit = 1; decode.BeginPD(waiting);
+    for (int i = 0; i < 3000 && !prefill.entered; ++i) {
+        decode.PollPD(waiting); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Check(prefill.entered && waiting->IsPDTransferPending(), "missing in-flight PD fixture");
+    decode.verbose = true;
+    long long published = 0;
+    const auto oldReport = std::chrono::system_clock::now() - std::chrono::seconds(2);
+    auto reportTime = oldReport;
+    auto run = [&] {
+        std::unique_lock<std::mutex> lock(decode.dictLocker);
+        return decode.RunDecodePipeline(lock, 2, 4096, &published, &reportTime);
+    };
+    Check(run() && decode.submits == 4 && ready->curTokens == 5 && waiting->preTokens == 0,
+          "network wait stopped ready decode or exposed uncommitted KV");
+    Check(reportTime > oldReport && published == 3, "continuous pipeline did not report/reset token statistics");
+    ready->isEnding = false; ready->curTokens = 1; decode.submits = 0;
+    ready->generationConfig.output_token_limit = 10;
+    waiting->isAbort = true;
+    Check(!run(), "pending cancellation was starved by decode"); waiting->isAbort = false;
+    decode.onSubmit = [&](int step) {
+        if (step != 2) return;
+        prefill.hold = false;
+        for (int i = 0; i < 3000 && waiting->IsPDTransferPending(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(!waiting->IsPDTransferPending(), "PD result did not arrive");
+    };
+    Check(run() && decode.submits == 2 && ready->curTokens == 3,
+          "completed transfer did not drain the lookahead for import");
+    Check(waiting->HasPendingPD() && !run() && decode.PollPD(waiting) &&
+          !waiting->HasPendingPD() && waiting->preTokens == 2,
+          "ready PD result was starved or committed inside the pipeline");
+    decode.RemoveResponseContext(readyHandle); decode.RemoveResponseContext(waitingHandle);
+    decode.StopPD(); prefill.StopPD();
+    std::cout << "PASS PD transfer overlap, import boundary and cancellation fairness\n";
 }
 
 static void TestGroupAdmission() {
@@ -213,6 +351,7 @@ static void TestAdmissionLifetime() {
         bool stateReleasedBeforeAdmission = true;
         std::weak_ptr<void> stateOwner;
         void ImportPDState(ResponseContext &context, const fastkv::Message &message) override {
+            Check(context.HasPendingPD(), "PD readiness published before import");
             StateModel::ImportPDState(context, message);
             std::weak_ptr<void> admission = context.pdAdmission;
             auto owner = std::shared_ptr<int>(new int(1), [this, admission](int *value) {
@@ -240,6 +379,7 @@ static void TestAdmissionLifetime() {
         context.inputTokens = 3;
         context.generationConfig.output_token_limit = 1;
         decode.BeginPD(&context);
+        Check(context.HasPendingPD(), "new PD request already ready");
     };
     auto imported = [&](ResponseContext &context) {
         for (int i = 0; i < 3000 && !context.isEnding && !decode.PollPD(&context); ++i)
@@ -256,6 +396,8 @@ static void TestAdmissionLifetime() {
         Check(!owner.expired(), "lifetime fixture did not import state");
         Check(context->error == (mode == 1 ? ResponseContextErrorRuntime : ResponseContextErrorNone),
               "unexpected admission fixture import failure");
+        Check(!context->HasPendingPD() && (mode == 1 || context->pdPending),
+              "committed PD readiness lost its retained marker");
         context->isEnding = true;
         context->resultTokenQueue.push(42);
         context->pdPending.reset();
@@ -1177,7 +1319,9 @@ int main(int argc, char **argv) {
         TestQueuedTransfers();
         TestLoadAwareRouting();
         TestGroupAdmission();
-        TestChunkedDecodeHandoff();
+        TestDecodeDuringPDTransfer();
+        TestChunkedDecodeHandoff(false);
+        TestChunkedDecodeHandoff(true);
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "
                      "and cancellation\n";
     } catch (const std::exception &error) {

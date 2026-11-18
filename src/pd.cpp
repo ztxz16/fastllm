@@ -295,6 +295,16 @@ struct PDPending {
         for (const auto &probe : probeCancellations) if (probe) probe->Cancel();
     }
 };
+
+bool ResponseContext::HasPendingPD() const {
+    return pdPending && !pdPending->committed;
+}
+
+bool ResponseContext::IsPDTransferPending() const {
+    return HasPendingPD() && pdPending->result.valid() &&
+        pdPending->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+}
+
 struct PDRuntime {
     struct Workload {
         std::atomic<uint64_t> tokens{0}, restoreBytes{0};

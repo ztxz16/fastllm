@@ -103,6 +103,12 @@ namespace fastllm {
         // destroyed before returning slot/token credits to another request.
         std::shared_ptr<void> pdAdmission;
         std::shared_ptr<PDPending> pdPending;
+        // A committed handoff retains its PD marker and leases for the request
+        // lifetime, but no longer blocks decoding. Read under the context lock.
+        bool HasPendingPD() const;
+        // An admitted transfer can progress independently of the model thread.
+        // A ready result must return to the scheduler for atomic state import.
+        bool IsPDTransferPending() const;
         uint64_t generation = 0; // Distinguish a reused handle while a consumer waits.
         std::unique_ptr<PrefillPrefixPreview> prefillPreview;
         PrefillBatchPolicy::Clock::time_point queuedAt = PrefillBatchPolicy::Clock::now();
@@ -455,7 +461,8 @@ namespace fastllm {
         virtual std::unique_ptr<DecodePipeline> CreateDecodePipeline(
             const std::vector<ResponseContext *> &) { return nullptr; }
         bool RunDecodePipeline(std::unique_lock<std::mutex> &dictLock, int batchLimit, int totalLimit,
-                               long long *generatedTokens = nullptr);
+                               long long *generatedTokens = nullptr,
+                               std::chrono::system_clock::time_point *lastRecordTime = nullptr);
 
         virtual bool CanFetchResponse(int handleId); // 判断当前是否能fetch到，用于异步操作
 

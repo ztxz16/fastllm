@@ -2321,7 +2321,7 @@ namespace fastllm {
             // Pair the shutdown check with the condition variable's lock so
             // its notification cannot be lost before an idle wait.
             if (model->isFree) break;
-            if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens)) continue;
+            if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens, &lastRecordTime)) continue;
             auto &forwardLocker = model->forwardLocker;
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
@@ -3057,7 +3057,8 @@ namespace fastllm {
     }
 
     bool basellm::RunDecodePipeline(std::unique_lock<std::mutex> &dictLock,
-                                    int batchLimit, int totalLimit, long long *generatedTokens) {
+                                    int batchLimit, int totalLimit, long long *generatedTokens,
+                                    std::chrono::system_clock::time_point *lastRecordTime) {
         // Cache snapshots require an explicit adapter contract. Sampling that
         // depends on published CPU history still uses the ordinary path below.
         if (!SupportsDecodePipeline() || isFree ||
@@ -3067,9 +3068,12 @@ namespace fastllm {
         for (auto &entry : responseContextDict.dicts) {
             auto *c = entry.second;
             if (c->isEnding) continue;
+            // Network I/O owns only reserved receive storage. Keep decoding
+            // ready requests until admission/import needs the model thread.
+            if (!c->isAbort && c->IsPDTransferPending()) continue;
             if (c->isAbort || c->curTokens == 0 || c->currentTokens.size() != 1 ||
                 c->generationConfig.NeedsTokenHistory() || c->generationConfig.output_logits ||
-                !c->multimodalInput.empty() || c->pdPending) return false;
+                !c->multimodalInput.empty() || c->HasPendingPD()) return false;
             contexts.push_back(c); handles.push_back(entry.first);
         }
         if (contexts.empty() || contexts.size() > (size_t)batchLimit) return false;
@@ -3112,6 +3116,26 @@ namespace fastllm {
                 }
             }
             NotifyResponseReady();
+            // A continuous chain need not visit the ordinary scheduler for
+            // seconds. Report its published tokens without breaking GPU overlap.
+            if (verbose && generatedTokens && lastRecordTime) {
+                const auto now = std::chrono::system_clock::now();
+                const float seconds = GetSpan(*lastRecordTime, now);
+                if (seconds > 1) {
+                    int alive = 0, pending = 0;
+                    long long contextLength = 0;
+                    for (const auto &entry : responseContextDict.dicts) {
+                        const auto *c = entry.second;
+                        if (c->isEnding) continue;
+                        if (c->curTokens > 0 && !c->HasPendingPD()) {
+                            ++alive; contextLength += c->allTokens.size();
+                        } else ++pending;
+                    }
+                    printf("[Decode] alive = %d, pending = %d, contextLen = %lld, Speed: %f tokens / s.\n",
+                           alive, pending, contextLength, (float)*generatedTokens / seconds);
+                    *lastRecordTime = now; *generatedTokens = 0;
+                }
+            }
         };
         dictLock.unlock();
         std::unique_lock<std::mutex> forwardLock(forwardLocker);
@@ -3132,8 +3156,8 @@ namespace fastllm {
                         c->allTokens.size() + 2 <= (size_t)max_positions;
                 }
                 for (auto &entry : responseContextDict.dicts)
-                    if (!entry.second->isEnding &&
-                        !admittedHandles.count(entry.first)) chain = false;
+                    if (!entry.second->isEnding && !admittedHandles.count(entry.first) &&
+                        (entry.second->isAbort || !entry.second->IsPDTransferPending())) chain = false;
                 dictLock.unlock();
                 const bool next = chain && pipeline->Submit(1 - slot, slot);
                 auto tokens = collect(slot);
@@ -3323,7 +3347,7 @@ namespace fastllm {
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
                         if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
-                        if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens)) continue;
+                        if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens, &lastRecordTime)) continue;
                         auto &forwardLocker = model->forwardLocker;
 
                         inference_trace::DetailRegion retireRegion("retire_requests");
