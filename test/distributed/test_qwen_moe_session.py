@@ -223,6 +223,8 @@ class MoeSessionTests(unittest.TestCase):
     def test_factory_text_and_service_use_joint_session(self):
         from fastllm_pytools.util import make_normal_parser, make_normal_llm_model
         from fastllm_pytools.qwen3_process_server import ChatService
+        # 在 sys.modules 快照前导入，避免恢复快照后包属性仍引用已移除的模块。
+        from fastllm_pytools.process_moe import ProcessMoeModel
         from test_parallel_config import inventory
 
         (self.root / 'config.json').write_text(json.dumps(dict(model_type='qwen2_moe', vocab_size=13)))
@@ -239,6 +241,7 @@ class MoeSessionTests(unittest.TestCase):
                 patch('fastllm_pytools.process_tp.native_binary', return_value=Path(sys.executable)), \
                 patch.dict('os.environ', {'CUDA_VISIBLE_DEVICES': '0,1,2,3'}):
             with make_normal_llm_model(args) as model, ThreadPoolExecutor(4) as pool:
+                self.assertIsInstance(model, ProcessMoeModel)
                 self.assertEqual(model.concurrency, 4)
                 results = list(pool.map(lambda _: model.response('你好', max_length=6), range(4)))
                 self.assertEqual(results, ['答'*6]*4)
