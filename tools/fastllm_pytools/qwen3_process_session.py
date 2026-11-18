@@ -14,6 +14,7 @@ import time
 
 from .tp_process_utils import isolated_process, wait_case
 from .tp_graph import validate_graph, validate_allreduce, validate_prefix, validate_prefix_directory
+from .tp_load import validate_load
 
 BACKEND = "qwen3_process_generate_cublas_nccl"
 EMPTY = dict(active=False, tokens=0, capacity=0, device_bytes=0)
@@ -110,7 +111,7 @@ class Qwen3ProcessSession:
             raise RuntimeError("session response must be object")
         return result
 
-    def _exchange(self, message, on_event=None):
+    def _exchange(self, message, on_event=None, on_load=None):
         data = json.dumps(message, ensure_ascii=False, allow_nan=False).encode("utf-8")
         if len(data) > 1024 * 1024:
             raise ValueError("session request exceeds 1 MiB")
@@ -122,6 +123,11 @@ class Qwen3ProcessSession:
             result = self._read(deadline)
             if type(result.get("id")) is not int or result["id"] != message["id"]:
                 raise RuntimeError("session response ID mismatch")
+            if result.get('event') == 'load':
+                if on_load is None:
+                    raise RuntimeError('unexpected KV load event')
+                on_load(result)
+                continue
             if result.get("event") != "token":
                 break
             if on_event is None:
@@ -251,6 +257,10 @@ class Qwen3ProcessSession:
                 self._workers = copy.deepcopy(workers)
                 self._empty(self.ready.get("cache"))
                 self._check_graph(self.ready)
+                self.load_state = None
+                self.load_observer = None
+                if type(self.ready.get('load_stats')) is int and self.ready['load_stats'] == 1:
+                    self.load_state = validate_load(self.ready.get('load'), len(self.devices), idle=True)
                 (self.output / "ready.json").write_text(json.dumps(self.ready, ensure_ascii=False, indent=2))
                 self.state = "ready"
                 return self
@@ -277,6 +287,9 @@ class Qwen3ProcessSession:
             # 先检查本地序列化；尚未提交的非法输入不能破坏正在复用的会话。
             request = json.loads(json.dumps(request, allow_nan=False))
             message = dict(id=self._next_id, op="generate", request=request)
+            observer = self.load_observer
+            if observer is not None:
+                message['stream_load'] = True
             if on_token is not None:
                 message["stream_tokens"] = True
             if len(json.dumps(message, ensure_ascii=False).encode("utf-8")) > 1024 * 1024:
@@ -285,8 +298,22 @@ class Qwen3ProcessSession:
             if self.request_log:
                 path.with_suffix(".json").write_text(json.dumps(request, ensure_ascii=False, indent=2))
             tokens = []
+            loads = []
+
+            def on_load(event):
+                if (type(event.get('sequence')) is not int or event['sequence'] != len(loads) or
+                        len(loads) >= 4096 or event.get('phase') not in ('running', 'complete') or
+                        (loads and loads[-1]['phase'] == 'complete')):
+                    raise RuntimeError('invalid or out-of-order KV load event')
+                state = validate_load(event, len(self.devices), idle=event['phase'] == 'complete',
+                                      running=event['phase'] == 'running', previous=self.load_state)
+                self.load_state = state
+                loads.append(dict(state, sequence=event['sequence'], phase=event['phase']))
+                observer(copy.deepcopy(state))
 
             def on_event(event):
+                if observer is not None and (not loads or loads[-1]['phase'] != 'running'):
+                    raise RuntimeError('token event outside running KV load phase')
                 token = event.get("token_id")
                 if (type(event.get("index")) is not int or event["index"] != len(tokens) or
                         type(token) is not int or not 0 <= token <= 4294967295 or
@@ -303,7 +330,13 @@ class Qwen3ProcessSession:
 
             try:
                 self._cancel_event, self._cancel_sent = cancel_event, False
-                result = self._exchange(message, on_event if on_token is not None else None)
+                result = self._exchange(message, on_event if on_token is not None else None,
+                                        on_load if observer is not None else None)
+                if observer is not None:
+                    if (not loads or loads[-1]['phase'] != 'complete' or
+                            (result.get('status') == 'PASS' and len(loads) < 2)):
+                        raise RuntimeError(f'missing final KV load statistics: {result.get("error", "invalid report")}')
+                    result['load_samples'] = loads
                 if self.request_log:
                     path.with_suffix(".response.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
                 if (result.get("event") != "result" or result.get("backend") != BACKEND or

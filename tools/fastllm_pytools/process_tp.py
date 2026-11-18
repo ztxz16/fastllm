@@ -187,7 +187,7 @@ class ProcessTPModel:
             from contextlib import nullcontext
             from .qwen_moe_process_session import QwenMoeProcessSession
             session_class = QwenMoeProcessSession
-            session_options = dict(routing=getattr(args, 'dp_routing', 'round_robin'),
+            session_options = dict(routing=getattr(args, 'dp_routing', None) or 'round_robin',
                                    queue_size=getattr(args, 'tp_queue_size', 8))
             self._stream_lock = nullcontext()
         self.session = session_class(binary, worker, self.model_path, self.devices,
