@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 #define FI_MEGAMOE_NVLINK_BARRIER_TRAP_ONLY_TIMEOUT 1
 #include <flashinfer/megamoe/sm90_mxfp4_mega_moe_fused.cuh>
+#include <deep_gemm/impls/sm90_mega_moe_pre_dispatch.cuh>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -70,32 +71,6 @@ __global__ void pack(const uint8_t *src, uint8_t *dst, int n, int k, int shift, 
         if (gateup) row = row / 16 * 8 + row % 8 + (row % 16 >= 8 ? n / 2 : 0);
         int value = src[(size_t)n * k / 2 + (size_t)row * (k / 32) + col];
         dst[i] = value + shift;
-    }
-}
-
-__global__ void stage(const __nv_bfloat16 *x, const int32_t *idx, const float *scores,
-        __nv_fp8_e4m3 *out, float *sf, int64_t *routes, float *weights,
-        int rows, const int *live) {
-    int row = blockIdx.x, lane = threadIdx.x;
-    bool valid = row < rows && (!live || live[row] > 0);
-    if (lane < K) {
-        routes[row * K + lane] = valid ? idx[row * K + lane] : -1;
-        weights[row * K + lane] = valid ? scores[row * K + lane] : 0;
-    }
-    // Uniform across this CTA. Invalid routes never read token/scaling data.
-    if (!valid) return;
-    for (int block = 0; block < H / 128; ++block) {
-        float v = __bfloat162float(x[row * H + block * 128 + lane]);
-        float a = fabsf(v);
-        for (int d = 16; d; d >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, d));
-        __shared__ float warpMax[4];
-        if (lane % 32 == 0) warpMax[lane / 32] = a;
-        __syncthreads();
-        a = fmaxf(fmaxf(warpMax[0], warpMax[1]), fmaxf(warpMax[2], warpMax[3]));
-        float scale = exp2f(ceilf(log2f(fmaxf(a / 448.0f, 0x1p-126f))));
-        if (lane == 0) sf[row * (H / 128) + block] = scale;
-        out[row * H + block * 128 + lane] = __nv_fp8_e4m3(v / scale);
-        __syncthreads();
     }
 }
 
@@ -200,13 +175,12 @@ template<int R> struct Mega {
         return l.release();
     }
     template<int CAP, int BM, int STAGES, bool SWAP, bool RS>
-    static void launch(Layer &l, int rows, int di) {
+    static void launch(Layer &l, void *y, int rows, int di) {
         const size_t offset = CAP == DECODE_CAP ? 0 : Decode::bytes();
         const auto &d = (CAP == DECODE_CAP ? l.decodeDescriptors : l.prefillDescriptors)[di];
         auto peers = l.peers;
         for (auto &p : peers) p += offset;
         auto sym = fm::layout::SymBuffer<R>(peers, l.rank);
-        void *y = (char *)l.workspace + offset + Plan<CAP>::outputOffset();
         Plan<CAP>::template kernel<BM, STAGES, SWAP, RS>()<<<SMS, fm::sm90_mxfp4_num_threads(SWAP, RS, BM), SMEM, cudaStreamPerThread>>>(
             y, nullptr, rows, sym, d.a1, d.s1, d.out, d.a2, d.s2,
             (const uint8_t *)l.gate.p, (const uint8_t *)l.down.p,
@@ -217,24 +191,34 @@ template<int R> struct Mega {
         const size_t offset = CAP == DECODE_CAP ? 0 : Decode::bytes();
         auto b = Plan<CAP>::buffers((char *)l.workspace + offset);
         // Clear the entire selected arena's route table, including idle sources.
-        stage<<<CAP, 128, 0, cudaStreamPerThread>>>((const __nv_bfloat16 *)x, idx, scores,
-            (__nv_fp8_e4m3 *)b.input_token_buffer.base, (float *)b.input_sf_buffer.base,
-            (int64_t *)b.input_topk_idx_buffer.base, (float *)b.input_topk_weights_buffer.base, rows, live);
+        constexpr int threads = H / 8;
+        const int paddingBlocks = ((CAP - rows) * K + threads - 1) / threads;
+        fastllm_ep8_deep_gemm::sm90_mega_moe_pre_dispatch_kernel<128, false, true>
+            <<<rows + paddingBlocks, threads, 0, cudaStreamPerThread>>>(
+                static_cast<const __nv_bfloat16 *>(x), idx, scores,
+                static_cast<__nv_fp8_e4m3 *>(b.input_token_buffer.base),
+                static_cast<float *>(b.input_sf_buffer.base),
+                static_cast<int64_t *>(b.input_topk_idx_buffer.base),
+                static_cast<float *>(b.input_topk_weights_buffer.base),
+                rows, CAP, H, H / 128, K, 1.0f, live);
+        // The fused combine writes commonRows via 16-byte-aligned TMA stores.
+        // Stage short or unaligned output views to preserve their bounds.
+        void *dst = y;
+        if (rows < commonRows || reinterpret_cast<uintptr_t>(y) % alignof(uint4) != 0)
+            dst = static_cast<char *>(l.workspace) + offset + Plan<CAP>::outputOffset();
         const int routedRows = commonRows * R * K;
         if constexpr (CAP == DECODE_CAP) {
             // Keep the register-source tile for tiny local batches. Wider
             // tiles use EP-wide density to avoid padding twice as many experts.
-            if (commonRows <= 16) launch<CAP, 8, 8, true, true>(l, commonRows, 0);
-            else if (routedRows <= 24 * E) launch<CAP, 24, DecodeStages, true, false>(l, commonRows, 1);
-            else launch<CAP, 64, 3, false, false>(l, commonRows, 2);
-        } else {
-            if constexpr (R == 4) {
-                if (routedRows <= 24 * E) launch<CAP, 24, 3, true, false>(l, commonRows, 1);
-                else launch<CAP, 64, 3, false, false>(l, commonRows, 2);
-            } else launch<CAP, 64, 3, false, false>(l, commonRows, 2);
-        }
+            if (commonRows <= 16) launch<CAP, 8, 8, true, true>(l, dst, commonRows, 0);
+            else if (routedRows <= 24 * E) launch<CAP, 24, DecodeStages, true, false>(l, dst, commonRows, 1);
+            else launch<CAP, 64, 3, false, false>(l, dst, commonRows, 2);
+        } else if constexpr (R == 4) {
+            if (routedRows <= 24 * E) launch<CAP, 24, 3, true, false>(l, dst, commonRows, 1);
+            else launch<CAP, 64, 3, false, false>(l, dst, commonRows, 2);
+        } else launch<CAP, 64, 3, false, false>(l, dst, commonRows, 2);
         check(cudaGetLastError());
-        if (rows) check(cudaMemcpyAsync(y, (char *)l.workspace + offset + Plan<CAP>::outputOffset(),
+        if (rows && dst != y) check(cudaMemcpyAsync(y, dst,
             (size_t)rows * H * 2, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
     }
     static void run(Layer &l, const void *x, void *y, const int32_t *idx,

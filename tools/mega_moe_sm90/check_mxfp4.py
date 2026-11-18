@@ -139,7 +139,10 @@ for (ci, (n, pattern)) in enumerate(cases):
         torch.cuda.set_device(rank)
         rows = (0 if rank % 2 else n) if pattern == 'idle' else (
             n // (rank + 1) if pattern == 'ragged' else n)
-        x = (torch.randn((rows, 4096), device='cuda') * (3 if ci == 1 else 0.4)).bfloat16()
+        # Mix aligned and unaligned BF16 inputs and outputs within one collective.
+        offset = int(n == 33 and rank % 2 == 1)
+        x = torch.randn(rows * 4096 + offset, device='cuda')
+        x = (x * (3 if ci == 1 else 0.4)).bfloat16()[offset:].view(rows, 4096)
         ids = torch.arange(8, device='cuda').repeat(rows, 1)
         if pattern == 'uniform':
             ids = ((rank * n + torch.arange(rows, device='cuda'))[:, None] * 8 + ids) % 256
@@ -155,7 +158,9 @@ for (ci, (n, pattern)) in enumerate(cases):
         idxs.append(ids.int())
         ss.append(s)
         lives.append(live)
-        ys.append(torch.full((max(1, rows) + 1, 4096), 77.0, device='cuda', dtype=torch.bfloat16))
+        elements = (max(1, rows) + 1) * 4096
+        storage = torch.full((offset + elements,), 77.0, device='cuda', dtype=torch.bfloat16)
+        ys.append(storage[offset:].view(-1, 4096))
         torch.cuda.synchronize()
     expected = reference(xs, idxs, ss, lives)
     torch.cuda.synchronize(0)

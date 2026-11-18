@@ -9,7 +9,7 @@
 
 namespace fastllm_ep8_deep_gemm {
 
-template <uint32_t kGroupSize, bool kUsePDL>
+template <uint32_t kGroupSize, bool kUsePDL, bool kPowerOfTwoScale = false>
 __launch_bounds__(1024, 2)
 __global__ void sm90_mega_moe_pre_dispatch_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -53,7 +53,16 @@ __global__ void sm90_mega_moe_pre_dispatch_kernel(
         }
         const auto* token_in = x + static_cast<uint64_t>(token_id) * hidden;
 
-        uint4 in_bits = reinterpret_cast<const uint4*>(token_in)[tid];
+        uint4 in_bits;
+        if (kPowerOfTwoScale && (reinterpret_cast<uintptr_t>(token_in) % alignof(uint4)) != 0) {
+            // The MXFP4 adapter also accepts BF16 views with an unaligned first row.
+            auto* values = reinterpret_cast<__nv_bfloat16*>(&in_bits);
+            #pragma unroll
+            for (uint32_t i = 0; i < kVecElems; ++i)
+                values[i] = token_in[tid * kVecElems + i];
+        } else {
+            in_bits = reinterpret_cast<const uint4*>(token_in)[tid];
+        }
         const auto* bf16_pairs = reinterpret_cast<const __nv_bfloat162*>(&in_bits);
 
         float vals[kVecElems];
@@ -69,8 +78,9 @@ __global__ void sm90_mega_moe_pre_dispatch_kernel(
         local_max = math::warp_reduce<kThreadsPerGroup, false>(
             local_max, math::ReduceMax<float>{});
 
-        const float absmax = fmaxf(local_max, 1e-10f);
-        const float raw_scale = absmax / 448.0f;
+        const float raw_scale = kPowerOfTwoScale
+            ? exp2f(ceilf(log2f(fmaxf(local_max / 448.0f, 0x1p-126f))))
+            : fmaxf(local_max, 1e-10f) / 448.0f;
         const float inv_scale = 1.0f / raw_scale;
 
         uint64_t packed = 0;
