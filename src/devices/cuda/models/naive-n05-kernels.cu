@@ -11,6 +11,7 @@
 #include "naive-n05-attention-small.cuh"
 #include "naive-n05-attention-prefetch.cuh"
 #include "naive-n05-attention-hopper.cuh"
+#include "naive-n05-decode-blackwell.cuh"
 #include "naive-n05-prefill.cuh"
 #include "naive-n05-prefill-hopper.cuh"
 #include "naive-n05-prefill-split.cuh"
@@ -5741,7 +5742,6 @@ template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, i
     return found->second;
 }
 
-
 // Overlap the next packed FP8 tile load with current BF16 MMA. The kernel
 // retains the original QK/PV reduction order and global softmax tree.
 bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
@@ -6057,6 +6057,56 @@ bool FastllmCudaNaiveEncodeDSAMaps(void *host, const void *key, const void *valu
     CUtensorMap maps[2];
     if (!naive_attention_bulk::EncodeMaps(maps, key, value, capacity, keyStride)) return false;
     std::memcpy(host, maps, sizeof(maps));
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+    using namespace fastllm;
+    namespace bw = blackwell_decode;
+    const int arch = FastllmCudaRuntimeArch();
+    if ((arch != 100 && arch != 103) || rows.empty() || kvHeads <= 0 ||
+        heads != kvHeads * 16 || dim != 192 || valueDim != 128 || query.dataType != BFLOAT16)
+        return false;
+    for (const auto &row : rows) {
+        if (!row.fp8 || row.fp4 || !row.indices || row.selectedCount != 2048 ||
+            !row.key || !row.value || row.capacity < 0 || row.keyStride < kvHeads * dim ||
+            row.keyStride % 16 || ((uintptr_t(row.key) | uintptr_t(row.value)) & 15))
+            return false;
+    }
+    const auto *bias = sink.dims.empty() ? nullptr : static_cast<const float *>(sink.cudaData);
+    const int total = static_cast<int>(rows.size());
+    const bool split = total < 32;
+    auto kernel = split ? bw::Decode<true> : bw::Decode<false>;
+    if (!BulkKernelSupported(kernel, bw::SMEM_BYTES, 100)) return false;
+    Output(output, BFLOAT16, {1, total, heads * 128});
+    const int groups = total * kvHeads;
+    const int splits = split ? (groups <= 16 ? 16 : groups <= 32 ? 8 : 4) : 1;
+    float *parts = nullptr;
+    float2 *stats = nullptr;
+    if (split) {
+        Output(scratch.attentionPartial, FLOAT32, {total, heads, splits, 128});
+        Output(scratch.attentionScores, FLOAT32, {total, heads, splits, 2});
+        parts = static_cast<float *>(scratch.attentionPartial.cudaData);
+        stats = static_cast<float2 *>(scratch.attentionScores.cudaData);
+    }
+    for (int first = 0; first < total; first += naive_attention_bulk::BatchLimit) {
+        const int count = std::min(total - first, int(naive_attention_bulk::BatchLimit));
+        naive_attention_bulk::Batch batch{};
+        std::copy_n(rows.begin() + first, count, batch.rows);
+        auto *out = static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128;
+        kernel<<<dim3(count, kvHeads, splits), (bw::NCW + bw::NP) * 32, bw::SMEM_BYTES>>>(
+            static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, bias,
+            out, heads, parts, stats);
+        // All split rows fit a single descriptor batch.
+        if (split) bw::Merge<<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, splits);
+    }
+    CheckLaunch();
     return true;
 #else
     return false;

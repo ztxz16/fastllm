@@ -305,6 +305,10 @@ struct FastllmNaiveDecodeScratch {
 // and optional KV/TMA tables. Preserve BF16 score/probability rounding. Large
 // batches use Tensor Cores with FP32 accumulation; unsupported shapes retain
 // the existing CUDA kernels.
+// Ordinary decode may use online softmax; verification retains its original rounding.
+bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
     int heads, int kvHeads, int dim, int valueDim,
