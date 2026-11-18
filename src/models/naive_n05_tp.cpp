@@ -1,6 +1,7 @@
 #include "models/naive_n05_flash.h"
 #include "naive_n05_tp.h"
 #include "naive_n05_parallel.h"
+#include "models/mimo_tool_grammar.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "executor.h"
 #include "utils.h"
@@ -849,8 +850,10 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
             for (int group = 0; group < model.attentionDP; ++group) {
                 for (int seq : dp.servingGroups[group].sequenceIndices)
                     if (seq < batch.Size()) samplingRows[group].push_back(seq);
+                const bool constrained = std::any_of(samplingRows[group].begin(), samplingRows[group].end(),
+                    [&](int row) { return bool(configs[row].tool_call_grammar); });
                 if (!samplingRows[group].empty() &&
-                    (!dp.sampling[group] || !dp.sampling[group]->Supports(samplingRows[group].size()))) return false;
+                    (!dp.sampling[group] || !dp.sampling[group]->Supports(samplingRows[group].size(), constrained))) return false;
             }
             std::vector<const float *> pointers[2];
             const int capacity = graph->ranks.front()->storage->maxRows;
@@ -936,8 +939,11 @@ std::unique_ptr<basellm::DecodePipeline> NaiveN05FlashModel::CreateDecodePipelin
 #ifdef USE_CUDA
     if (!SupportsDecodePipeline() || contexts.empty()) return nullptr;
     for (auto *c : contexts) {
-        const auto &config = c->generationConfig;
-        if (!SelectLogits(config).cudaSampling || config.tool_call_token_mask || config.tool_call_grammar ||
+        auto config = c->generationConfig;
+        if (config.tool_call_grammar)
+            config.tool_call_token_mask = config.tool_call_grammar->Mask(config.tool_call_grammar_state);
+        if (!SelectLogits(config).cudaSampling || (config.tool_call_token_mask && !config.tool_call_grammar) ||
+            config.tool_call_name_constraint_enabled || config.tool_call_parameter_name_constraint_enabled ||
             !config.tool_call_allowed_token_ids.empty() || c->pastKeyValues.size() != (size_t)block_cnt ||
             !c->intParams.count("promptLen") || !c->intParams.count("index")) return nullptr;
     }

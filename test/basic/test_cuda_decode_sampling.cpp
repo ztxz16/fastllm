@@ -2,12 +2,14 @@
 #define CUDA_API_PER_THREAD_DEFAULT_STREAM 1
 #endif
 #include "utils/cuda_decode_sampling.h"
+#include "models/mimo_tool_grammar.h"
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <set>
 #include <cmath>
 #include <thread>
 #include <stdexcept>
+#include <limits>
 #ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
 #include <dlfcn.h>
 #include <atomic>
@@ -55,6 +57,82 @@ static void ConcurrentSamplers(int vocab) {
     std::thread a(run,0),b(run,1);a.join();b.join();
     for(auto e:failures) if(e) std::rethrow_exception(e);
 }
+static void ConstraintSamplingChecks() {
+    constexpr int capacity = 4, vocab = 513;
+    auto words = std::make_shared<std::vector<std::string>>(vocab, "z");
+    for (int i = 0; i < 256; ++i) (*words)[i] = std::string(1, char(i));
+    const std::vector<std::string> extra = {"<tool_call>", "<function=A>", "<parameter=x>",
+        "</parameter></function></tool_call>", "<eos>", "<think>", "</think>", "<function=B>", ""};
+    std::copy(extra.begin(), extra.end(), words->begin() + 256);
+    auto vocabulary = std::make_shared<MimoToolVocabulary>(words);
+    MimoToolGrammar a({{"A", {"x"}}}, false, true), b({{"B", {"x"}}}, false, true);
+    a.Bind(vocabulary, {260}); b.Bind(vocabulary, {260});
+    std::vector<MimoToolGrammar *> grammars{&a, &b, nullptr};
+    std::vector<int> states(3, 0);
+    std::vector<uint64_t> steps(3, 0);
+    Data actual(FLOAT32, {capacity, vocab}, std::vector<float>(capacity * vocab, 0)), reference(actual);
+    actual.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
+    reference.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
+    CudaDecodeSampling gpu, cpu;
+    Check(gpu.Prepare(actual, {1, 2, capacity}, 853) &&
+          cpu.Prepare(reference, {1, 2, capacity}, 853), "grammar sampler prepare");
+#ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
+    const int captures = captureCalls;
+#endif
+    // Each pair is submitted before publishing either result. The reference
+    // applies CPU grammar masks and advances only its own committed states.
+    for (int pair = 0; pair < 24; ++pair) {
+        std::vector<int> order = pair < 8 ? std::vector<int>{0, 1, 2} :
+            pair < 16 ? std::vector<int>{2, 1, 0} : std::vector<int>{1};
+        if (pair == 20) { states[1] = b.Advance(0, "<tool_call><function="); steps[1] = 0; }
+        std::vector<CudaDecodeSampling::Request> requests;
+        for (int id : order) {
+            auto p = grammars[id] ? grammars[id]->Compile(states[id]) :
+                std::make_pair(std::shared_ptr<const TokenConstraintProgram>(), 0);
+            requests.push_back({uint64_t(100 + id), steps[id], .7f, .95f, vocab, p.first, p.second});
+        }
+        std::vector<int> expected[2];
+        for (int slot = 0; slot < 2; ++slot) {
+            std::vector<float> values(capacity * vocab), masked;
+            for (int i = 0; i < capacity * vocab; ++i) values[i] = std::sin(i * .071f + pair);
+            for (size_t row = 0; row < order.size(); ++row) {
+                const int id = order[row], path[] = {256, id == 0 ? 257 : 263, 258, int('x'), 259, 260, 261, 262};
+                values[row * vocab + path[(pair * 2 + slot) % 8]] = 10;
+                values[row * vocab + 264] = 20; // Empty token: illegal only in constrained rows.
+            }
+            masked = values;
+            for (size_t row = 0; row < order.size(); ++row) {
+                const int id = order[row];
+                if (!grammars[id]) continue;
+                const auto mask = grammars[id]->Mask(states[id]);
+                for (int token = 0; token < vocab; ++token)
+                    if (!((*mask)[token / 32] & (uint32_t(1) << (token % 32))))
+                        masked[row * vocab + token] = -std::numeric_limits<float>::infinity();
+            }
+            FastllmCudaCopyFromHostToDevice(actual.cudaData, values.data(), values.size() * sizeof(float));
+            FastllmCudaCopyFromHostToDevice(reference.cudaData, masked.data(), masked.size() * sizeof(float));
+            auto oracle = requests;
+            for (auto &r : oracle) r.constraint.reset();
+            Check(gpu.Submit(requests, slot) && cpu.Submit(oracle, slot), "grammar lookahead submit");
+            expected[slot] = cpu.Collect(slot);
+            for (size_t row = 0; row < order.size(); ++row) {
+                const int id = order[row];
+                if (grammars[id]) {
+                    states[id] = grammars[id]->AdvanceToken(states[id], expected[slot][row]);
+                    Check(states[id] >= 0, "CPU oracle selected illegal grammar token");
+                }
+                ++steps[id]; ++requests[row].step;
+                // Deliberately leave the GPU request's CPU cursor behind.
+            }
+        }
+        for (int slot = 0; slot < 2; ++slot)
+            Check(gpu.Collect(slot) == expected[slot], "GPU grammar changed sampled token/RNG/state");
+    }
+#ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
+    Check(captureCalls == captures, "grammar sampler captured at runtime");
+#endif
+}
+
 static void InPlaceSamplingChecks() {
     constexpr int capacity = 65, vocab = 65536;
     std::vector<float> values((size_t)capacity * vocab);
@@ -92,6 +170,7 @@ int main(int argc, char **argv) {
     logits.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     if(vocab>4096) ConcurrentSamplers(vocab);
     InPlaceSamplingChecks();
+    ConstraintSamplingChecks();
     CudaDecodeSampling a,b,invalid;
     Check(!invalid.Prepare(logits,{0,8}) && !invalid.Prepare(logits,{4,2}) &&
           !invalid.Prepare(logits,{1,1}) && !invalid.Prepare(logits,{1,16}), "invalid startup buckets");

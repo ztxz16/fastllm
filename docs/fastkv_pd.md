@@ -120,7 +120,7 @@ Naive 传统 TP 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两�
 
 Naive 的普通 DP 解码流水支持已提交的 PD 请求，并保留其 admission/传输租约；已预留接收空间、仍等待异步结果的请求不阻塞其他已就绪请求。结果就绪或请求取消时，流水先收齐在途输出，再由模型调度线程提交导入或释放资源，未提交的 KV 不进入前向。
 
-KV 扩页、共享尾页写时复制和 SWA 检查点在流水内部同步并完成；上下文容量变化选择已预热图，不在请求中重新抓图。任意自定义 CPU 约束、依赖完整 token 历史的采样和未预热图仍使用原安全路径。
+该流水复用 GPU token-constraint 状态机执行 MiMo 工具 grammar 的 mask 与采样状态推进；CPU 只推进已发布 token 的请求状态。请求重排、参数变化或位置回退时重新绑定状态，稳定批次无需逐 token 上传 mask。KV 扩页、共享尾页写时复制和 SWA 检查点在流水内部同步并完成；上下文容量变化选择已预热图，不在请求中重新抓图。任意自定义 CPU 约束、依赖完整 token 历史的采样和未预热图仍使用原安全路径。
 
 纯 GPU、无草稿部署支持 P/D 使用不同的实例数量、Attention DP 数和 EP 数，要求两端的 **Attention TP**（`tp / attn-dp-size`）与 KV 表示相同。例如 `--tp 4 --ep 4 --attn-dp-size 4` 的两个 P 实例，可以连接 `--tp 8 --ep 8 --attn-dp-size 8` 的一个 D 实例；反向部署及两端均为 DP8/EP8 也使用同一协议。实例列表沿用 router 的 `prefill` / `decode` 数组，每个实例使用独立端口和互不重叠的 `CUDA_VISIBLE_DEVICES`。`--max_batch`、`max_inflight` 是每实例上限，不是每个 DP 组的上限。
 

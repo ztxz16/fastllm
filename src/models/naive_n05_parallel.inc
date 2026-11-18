@@ -335,18 +335,26 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         std::lock_guard<std::mutex> guard(tpRequestMutex);
         for (int group = 0; group < attentionDP && asyncSampling; ++group) {
             if (samplingRows[group].empty()) continue;
-            if (!state.sampling[group] || !state.sampling[group]->Supports(samplingRows[group].size())) {
+            const bool constrained = std::any_of(samplingRows[group].begin(), samplingRows[group].end(),
+                [&](int seq) { return bool(batch->configs[seq].tool_call_grammar); });
+            if (!state.sampling[group] || !state.sampling[group]->Supports(samplingRows[group].size(), constrained)) {
                 asyncSampling = false; break;
             }
             for (int seq : samplingRows[group]) {
                 const auto &cfg = batch->configs[seq];
                 auto identity = tpSamplingRequestIds.find(&key(seq, 0));
-                if (identity == tpSamplingRequestIds.end() || cfg.tool_call_token_mask ||
-                    cfg.tool_call_grammar || !cfg.tool_call_allowed_token_ids.empty()) {
+                if (identity == tpSamplingRequestIds.end() || (cfg.tool_call_token_mask && !cfg.tool_call_grammar) ||
+                    cfg.tool_call_name_constraint_enabled || cfg.tool_call_parameter_name_constraint_enabled ||
+                    !cfg.tool_call_allowed_token_ids.empty()) {
                     asyncSampling = false; break;
                 }
                 samplingRequests[group].push_back({identity->second, (uint64_t)key(seq, 0).dims[1] + 1,
                     cfg.temperature, cfg.top_p, std::max(1, cfg.top_k)});
+                if (cfg.tool_call_grammar) {
+                    const auto compiled = cfg.tool_call_grammar->Compile(cfg.tool_call_grammar_state);
+                    samplingRequests[group].back().constraint = compiled.first;
+                    samplingRequests[group].back().constraintState = compiled.second;
+                }
             }
         }
     }

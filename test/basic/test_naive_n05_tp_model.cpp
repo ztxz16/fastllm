@@ -3216,7 +3216,7 @@ class Fixture : public NaiveN05FlashModel {
                   << " relative=" << largestLogitRelative << std::endl;
     }
 
-    void AttentionDPPipelineChecks(int groups, int startPast = 4088) {
+    void AttentionDPPipelineChecks(int groups, bool constrained = false, int startPast = 4088) {
         const bool history = saveHistoryChat;
         // Cover repeated SWA wraps and more than one page/checkpoint boundary.
         constexpr int stepsPerSegment = 96;
@@ -3238,6 +3238,9 @@ class Fixture : public NaiveN05FlashModel {
                     GenerationConfig cfg;
                     cfg.top_k = weight["lm_head.weight"].dims[0]; cfg.top_p = .95f;
                     cfg.temperature = .4f; cfg.repeat_penalty = 1; cfg.output_token_limit = 256;
+                    auto words = std::make_shared<std::vector<std::string>>(cfg.top_k, "z");
+                    for (int i = 0; i < 256; ++i) (*words)[i] = std::string(1, char(i));
+                    auto vocabulary = std::make_shared<MimoToolVocabulary>(words);
                     auto create = [&](int row) {
                         auto &c = contexts[row]; c.reset(new ResponseContext());
                         c->Init(block_cnt, dataType, kvCacheDataType);
@@ -3252,6 +3255,14 @@ class Fixture : public NaiveN05FlashModel {
                         Forward(Data(FLOAT32, {1, past}, ids), Data(), Data(FLOAT32, {1, past}, positions),
                             c->pastKeyValues, cfg);
                         c->generationConfig = cfg; c->currentTokens = {1};
+                        if (constrained && row % 3 != 2) {
+                            auto &config = c->generationConfig;
+                            config.tool_call_grammar = std::make_shared<MimoToolGrammar>(
+                                std::map<std::string, std::vector<std::string>>{{row % 2 ? "toolB" : "toolA", {"x"}}});
+                            config.tool_call_grammar->Bind(vocabulary, {});
+                            config.tool_call_grammar_state = config.tool_call_grammar->Advance(0, "<tool_call><function=");
+                            config.tool_call_token_mask = config.tool_call_grammar->Mask(config.tool_call_grammar_state);
+                        }
                         c->allTokens.assign(ids.begin(), ids.end()); c->allTokens.push_back(1);
                         c->intParams["promptLen"] = past; c->intParams["index"] = 0;
                     };
@@ -3273,6 +3284,14 @@ class Fixture : public NaiveN05FlashModel {
                             for (size_t row = 0; row < active.size(); ++row) {
                                 auto *c = active[row]; c->currentTokens[0] = tokens[row]; ++c->intParams["index"];
                                 c->allTokens.push_back(tokens[row]);
+                                auto &config = c->generationConfig;
+                                if (config.tool_call_grammar) {
+                                    config.tool_call_grammar_state = config.tool_call_grammar->AdvanceToken(
+                                        config.tool_call_grammar_state, tokens[row]);
+                                    if (config.tool_call_grammar_state < 0)
+                                        throw std::runtime_error("DP pipeline emitted an illegal grammar token");
+                                    config.tool_call_token_mask = config.tool_call_grammar->Mask(config.tool_call_grammar_state);
+                                }
                             }
                         };
                         while (step < stepsPerSegment) {
@@ -3292,9 +3311,10 @@ class Fixture : public NaiveN05FlashModel {
                                 std::vector<Data> positions;
                                 std::vector<Data *> pos;
                                 std::vector<std::pair<Data *, Data *>> kv;
-                                std::vector<GenerationConfig> configs(active.size(), cfg);
+                                std::vector<GenerationConfig> configs;
                                 std::vector<int> lengths(active.size(), 1);
                                 for (auto *c : active) {
+                                    configs.push_back(c->generationConfig);
                                     ids.push_back(c->currentTokens[0]);
                                     positions.emplace_back(FLOAT32, std::vector<int>{1, 1},
                                         std::vector<float>{float(c->intParams["promptLen"] + c->intParams["index"])});
@@ -3364,7 +3384,7 @@ class Fixture : public NaiveN05FlashModel {
                 RequireCloseLogits(infer(restorePrompts[row]).data(), hot[row], "pipeline checkpoint/fork logits");
         }
         std::cout << "ATTENTION DP PIPELINE PASS dp=" << groups << " pipelined=" << pipelined
-                  << " history=" << history << " restored=" << restorePrompts.size()
+                  << " history=" << history << " grammar=" << constrained << " restored=" << restorePrompts.size()
                   << " exact_steps=" << reference.size() << std::endl;
     }
 
@@ -5180,7 +5200,7 @@ int main(int argc, char **argv) {
                 fixture.AttentionDPServingPlanChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
             if (pipeline)
                 fixture.AttentionDPPipelineChecks(argc > 3 ? std::stoi(argv[3]) : ranks,
-                    argc > 6 ? std::stoi(argv[6]) : 4088);
+                    argc > 6 && std::string(argv[6]) == "grammar", argc > 7 ? std::stoi(argv[7]) : 4088);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_ring") {

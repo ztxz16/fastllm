@@ -1,6 +1,7 @@
 #include "naive_n05_flash.h"
 #include "naive_n05_tp.h"
 #include "naive_n05_parallel.h"
+#include "models/mimo_tool_grammar.h"
 #include "naive_n05_kvmem.h"
 #include "blocks/baseblock.h"
 #include "executor.h"
@@ -2212,8 +2213,8 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
         std::abs(config.repeat_penalty - 1.0f) > 1e-8f ||
         !config.tool_call_allowed_token_ids.empty()) return selection;
     selection.greedy = config.IsSimpleGreedy();
-    // Grammar masks are applied to the full logits before sampling, outside
-    // CUDA Graphs. Compact shard top-k cannot select before a branch-local mask.
+    // Grammar masks require full logits before sampling. The continuous DP
+    // sampler applies compiled masks inside its startup-captured graph.
     if (config.tool_call_token_mask && config.top_k <= 1) selection.greedy = true;
     // Full-vocabulary top-p matches the shared CUDA sampler's distribution.
     // Finite top-k keeps its existing top-k-then-top-p semantics, as does

@@ -26028,7 +26028,8 @@ __global__ void TokenConstraintMaskKernel(const TokenConstraintDeviceView *progr
         TokenConstraintWord(programs[row], states[row], word, words);
 }
 __global__ void TokenConstraintAdvanceKernel(const TokenConstraintDeviceView *programs,
-        const int *before, int *after, float *tokens, int rows, int vocab, bool finalStep) {
+        const int *before, int *after, float *tokens, int rows, int vocab, bool finalStep,
+        int *sampledTokens = nullptr) {
     int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     auto p = programs[row]; int state = before[row];
@@ -26043,7 +26044,10 @@ __global__ void TokenConstraintAdvanceKernel(const TokenConstraintDeviceView *pr
     after[row] = state;
     // Do not feed an invalid sampled ID to a later embedding in this graph.
     // The terminal sentinel is checked by the existing bulk result readback.
-    if (state < 0) tokens[row] = finalStep ? -1.f : 0.f;
+    if (state < 0) {
+        tokens[row] = finalStep ? -1.f : 0.f;
+        if (sampledTokens) sampledTokens[row] = -1;
+    }
 }
 __global__ void TokenConstraintApplyKernel(const TokenConstraintDeviceView *programs,
         const int *states, float *logits, int rows, int steps, int stride, int vocab) {
@@ -26125,6 +26129,25 @@ void FastllmCudaTokenConstraintApply(void *handle, float *logits, int steps) {
         (TokenConstraintDeviceView *)b.descriptors.cudaData, (int *)b.states.cudaData,
         logits, b.count, steps, b.capacity, b.vocab);
     checkCudaErrors("Constraint verification mask", cudaGetLastError());
+}
+
+void FastllmCudaTokenConstraintApplyRows(void *handle, float *logits, int rows) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    fastllm::AssertInFastLLM(rows > 0 && rows <= b.capacity, "Invalid constraint decode rows.");
+    TokenConstraintApplyKernel<<<dim3(((b.vocab + 31) / 32 + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+        (TokenConstraintDeviceView *)b.descriptors.cudaData, (int *)b.states.cudaData,
+        logits, rows, 0, b.capacity, b.vocab);
+    checkCudaErrors("Constraint decode mask", cudaGetLastError());
+}
+
+void FastllmCudaTokenConstraintAdvanceInPlace(void *handle, int *tokens,
+                                           float *embeddingTokens, int rows) {
+    auto &b = *static_cast<TokenConstraintBatch *>(handle);
+    fastllm::AssertInFastLLM(rows > 0 && rows <= b.capacity, "Invalid constraint decode rows.");
+    TokenConstraintAdvanceKernel<<<(rows + 127) / 128, 128, 0, cudaStreamPerThread>>>(
+        (TokenConstraintDeviceView *)b.descriptors.cudaData, (int *)b.states.cudaData,
+        (int *)b.states.cudaData, embeddingTokens, rows, b.vocab, false, tokens);
+    checkCudaErrors("Constraint decode advance", cudaGetLastError());
 }
 
 #ifndef USE_ROCM
