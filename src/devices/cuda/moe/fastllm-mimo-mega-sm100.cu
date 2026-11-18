@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <algorithm>
 #include <array>
 #include <map>
 #include <memory>
@@ -25,14 +26,19 @@ constexpr int BN=128, BK=128, SMS=148, SMALL_CAP=32;
 // scale-ring stride. Both variants reuse the existing arena and packed weights.
 constexpr int RING=1920, SFRING=RING/16*128;
 template<int BM> struct Tile {
-    static_assert(BM==16 || BM==32);
-    static constexpr int STORE=BM/2, STAGES=BM==16 ? 11 : 10;
-    static constexpr int SMEM = 1024 + 4*H + STORE*128*4 + 8*STORE*4 +
-        2*sizeof(dg::sched::TaskInfo<true>) + (4+4+16+4)*8 + 4 +
-        STAGES*(BM/2*128 + 128*128 + 128*4*2 + 16);
+    static constexpr int STORE = BM <= 16 ? 8 : BM <= 64 ? 16 : BM <= 192 ? 32 : 24;
+    static constexpr int STORE_L2 = BM == 240 ? 8 : STORE;
+    static constexpr int SF_M = (BM + 127) / 128 * 128;
+    static constexpr int CD = std::max(2 * STORE * 64 * 2, 2 * STORE_L2 * 128 * 2);
+    static constexpr int FIXED = 1024 + 4*H + ((CD+1023)/1024)*1024 + 8*STORE*4 +
+        2*sizeof(dg::sched::TaskInfo<true>) + (4+4+16+4)*8 + 4;
+    static constexpr int PER_STAGE = BM/2*128 + 128*128 + (SF_M+128)*4 + 16;
+    static constexpr int STAGES = (232448-FIXED)/PER_STAGE;
+    static constexpr int SMEM = FIXED + STAGES*PER_STAGE;
+    static_assert(STAGES >= 2);
     static_assert(SMEM <= 232448);
 };
-static_assert(Tile<32>::SMEM <= Tile<16>::SMEM);
+static_assert(Tile<16>::STAGES == 11 && Tile<32>::STAGES == 10);
 thread_local std::string error;
 void check(cudaError_t s) { if (s != cudaSuccess) throw std::runtime_error(cudaGetErrorString(s)); }
 void *allocate(size_t bytes) { void *p=nullptr; check(cudaMalloc(&p,bytes)); return p; }
@@ -118,20 +124,32 @@ __global__ void prepare(const __nv_bfloat16 *x,const int32_t *idx,const float *s
         qs[row*K+lane]=valid ? score[row*K+lane] : 0.f;
     }
 }
+// Each large prefill tile borrows the dead FP32 router tensor. Its capacity,
+// token-ring geometry and TMA descriptors must agree on all participants.
+template<int R, int Capacity, int BM> struct Geometry {
+    static constexpr int maxBlocks = (Capacity*R*K+BM-1)/BM + E/R;
+    static constexpr int ring = Capacity == CAP ? RING :
+        BM * dg::sched::get_num_max_live_pool_blocks(maxBlocks, SMS, H, I);
+    static constexpr int sfRing = Capacity == CAP ? SFRING :
+        dg::layout::get_num_sf_ring_tokens(ring,BM);
+    static dg::layout::MegaMoEBuffer buffer(void *p) { return {p,H,I,R,E,Capacity,K,ring,sfRing,true,0}; }
+};
 struct LayerBase { int ranks; };
 template<int R> struct Mega {
     static_assert(R==4 || R==8);
     static constexpr int LE=E/R;
     static dg::layout::MegaMoEBuffer buffer(void *p) { return {p,H,I,R,E,CAP,K,RING,SFRING,true,0}; }
     static size_t bytes() { return buffer(nullptr).get_num_bytes(); }
-    template<int BM=16,typename Weight=cutlass::float_e4m3_t> static auto kernel() {
-        return &dg::sm100_fp8_fp4_mega_moe_impl<CAP,H,I,E,0,K,BM,BN,BK,
-            Tile<BM>::STORE,Tile<BM>::STORE,128,128,RING,SFRING,Tile<BM>::STAGES,H,128,128,256,SMS,R,
+    template<int BM=16,typename Weight=cutlass::float_e4m3_t,int Capacity=CAP> static auto kernel() {
+        using G = Geometry<R,Capacity,BM>;
+        return &dg::sm100_fp8_fp4_mega_moe_impl<Capacity,H,I,E,0,K,BM,BN,BK,
+            Tile<BM>::STORE,Tile<BM>::STORE_L2,Tile<BM>::SF_M,128,G::ring,G::sfRing,Tile<BM>::STAGES,H,128,128,256,SMS,R,
             cute::numeric_limits<float>::infinity(),true,Weight>;
     }
-    template<int BM> static auto selectKernel(bool mxfp4) {
-        return mxfp4 ? kernel<BM,cutlass::detail::float_e2m1_unpacksmem_t>() : kernel<BM>();
+    template<int BM,int Capacity=CAP> static auto selectKernel(bool mxfp4) {
+        return mxfp4 ? kernel<BM,cutlass::detail::float_e2m1_unpacksmem_t,Capacity>() : kernel<BM,cutlass::float_e4m3_t,Capacity>();
     }
+    struct PrefillPlan;
     struct Layer:LayerBase {
         Layer():LayerBase{R} {}
         int device=-1,rank=-1;
@@ -141,6 +159,9 @@ template<int R> struct Mega {
         std::array<int64_t,R> peers{};
         Desc a1,s1,w1,ws1,d1,a2,s2,w2,ws2;
         Desc batchA1,batchD1,batchA2;
+        Desc preA1,preD1,preA2,preS1,preS2;
+        void *prefillBase=nullptr;
+        const PrefillPlan *preparedPrefill=nullptr;
         ~Layer() {
             int previous=0; cudaGetDevice(&previous);
             if (device>=0) cudaSetDevice(device);
@@ -217,13 +238,85 @@ template<int R> struct Mega {
             return l.release();
         } catch (const std::exception &e) { error=e.what(); return nullptr; }
     }
-    template<int BM=16> static int run(void *p,const void *x,void *y,const int32_t *idx,const float *scores,int rows,const int *live) {
+    struct PrefillPlan {
+        int capacity;
+        int smallerCapacity;
+        size_t bytes;
+        bool (*bind)(Layer &, void *);
+        int (*launch)(void *, const void *, void *, const int32_t *, const float *,
+                      int, const int *, const void *const *);
+    };
+    template<int BM,int Capacity>
+    static PrefillPlan makePrefillPlan(int smallerCapacity) {
+        return {Capacity, smallerCapacity, Geometry<R,Capacity,BM>::buffer(nullptr).get_num_bytes(),
+                &bindPrefill<BM,Capacity>, &run<BM,Capacity>};
+    }
+    static const PrefillPlan *prefillPlan(int total) {
+        if (total<=CAP*R) return nullptr;
+        // The 512-row tile fits the 64 MiB router tensor at EP8. Larger
+        // tiles amortize weight loads across tokens routed to the same expert.
+        static const PrefillPlan plans[] = {
+            makePrefillPlan<240,32768>(16384), makePrefillPlan<240,16384>(8192),
+            makePrefillPlan<240,8192>(4096), makePrefillPlan<R==8 ? 240 : 192,4096>(2048),
+            makePrefillPlan<192,2048>(512), makePrefillPlan<R==8 ? 64 : 128,512>(CAP)
+        };
+        const size_t available = size_t(total)*H*sizeof(float);
+        for (const auto &plan : plans) {
+            if (total>plan.smallerCapacity*R && plan.bytes<=available) return &plan;
+        }
+        return nullptr;
+    }
+    static size_t prefillBytes(int total) {
+        const auto *plan=prefillPlan(total);
+        return plan ? plan->bytes : 0;
+    }
+    template<int BM,int Capacity>
+    static bool bindPrefill(Layer &l, void *workspace) {
+        using G=Geometry<R,Capacity,BM>;
+        auto b=G::buffer(workspace);
+        if (l.prefillBase!=workspace || !l.preparedPrefill || l.preparedPrefill->capacity!=Capacity) {
+            auto status=cudaFuncSetAttribute(selectKernel<BM,Capacity>(l.mxfp4),
+                cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<BM>::SMEM);
+            if (status==cudaErrorInvalidValue || status==cudaErrorInvalidDeviceFunction ||
+                    status==cudaErrorNoKernelImageForDevice) {
+                cudaGetLastError();
+                return false;
+            }
+            check(status);
+            desc2(l.preA1,b.l1_token_buffer.base,H,G::ring,BK,BM/2,1,128);
+            desc2(l.preD1,b.l2_token_buffer.base,I,G::ring,64,Tile<BM>::STORE,1,64);
+            desc2(l.preA2,b.l2_token_buffer.base,I,G::ring,BK,BM/2,1,128);
+            desc2(l.preS1,b.l1_sf_buffer.base,G::sfRing,H/128,Tile<BM>::SF_M,1,4,0);
+            desc2(l.preS2,b.l2_sf_buffer.base,G::sfRing,I/128,Tile<BM>::SF_M,1,4,0);
+            l.prefillBase=workspace;
+        }
+        // Router activations overwrite the borrowed control words between layers.
+        // The caller publishes an event after this reset on every EP rank.
+        check(cudaMemsetAsync(workspace,0,b.workspace.get_num_bytes(),cudaStreamPerThread));
+        return true;
+    }
+    static int preparePrefill(void *p,void *workspace,size_t bytes,int total) {
         try {
-            if (!p || !x || !y || !idx || !scores || rows<0 || rows>CAP)
+            const auto *plan=prefillPlan(total);
+            if (!plan || !workspace || uintptr_t(workspace)%256 || bytes<plan->bytes) return 0;
+            auto &l=*static_cast<Layer *>(p);
+            if (!plan->bind(l, workspace)) return 0;
+            l.preparedPrefill=plan;
+            return plan->capacity;
+        } catch (const std::exception &e) { error=e.what(); return -1; }
+    }
+    template<int BM=16,int Capacity=CAP> static int run(void *p,const void *x,void *y,const int32_t *idx,const float *scores,int rows,const int *live,const void *const *peers=nullptr) {
+        try {
+            if (!p || !x || !y || !idx || !scores || rows<0 || rows>Capacity)
                 throw std::runtime_error("Invalid Blackwell MegaMoE pointers/row count");
             auto &l=*static_cast<Layer *>(p); int device=-1; check(cudaGetDevice(&device));
             if (device!=l.device) throw std::runtime_error("MegaMoE device mismatch");
-            auto b=buffer(l.workspace); auto stream=cudaStreamPerThread;
+            using G=Geometry<R,Capacity,BM>;
+            constexpr bool prefill = Capacity!=CAP;
+            auto b=G::buffer(prefill ? l.prefillBase : l.workspace);
+            auto addresses=l.peers;
+            if (prefill) for (int r=0;r<R;++r) addresses[r]=reinterpret_cast<int64_t>(peers[r]);
+            auto stream=cudaStreamPerThread;
             prepare<<<rows ? (rows*H+127)/128 : 1,128,0,stream>>>((const __nv_bfloat16 *)x,idx,scores,
                 b.input_token_buffer.template get_base_ptr<uint8_t>(),b.input_sf_buffer.template get_base_ptr<uint8_t>(),
                 b.input_topk_idx_buffer.template get_base_ptr<int64_t>(),b.input_topk_weights_buffer.template get_base_ptr<float>(),rows,live,
@@ -231,15 +324,23 @@ template<int R> struct Mega {
             cudaLaunchAttribute attr{}; attr.id=cudaLaunchAttributeClusterDimension; attr.val.clusterDim={2,1,1};
             cudaLaunchConfig_t config{}; config.gridDim=dim3(SMS); config.blockDim=dim3(512);
             config.dynamicSmemBytes=Tile<BM>::SMEM; config.stream=stream; config.attrs=&attr; config.numAttrs=1;
-            const auto &a1=BM==32 ? l.batchA1 : l.a1;
-            const auto &d1=BM==32 ? l.batchD1 : l.d1;
-            const auto &a2=BM==32 ? l.batchA2 : l.a2;
-            check(cudaLaunchKernelEx(&config,selectKernel<BM>(l.mxfp4),y,(int *)nullptr,(uint32_t)rows,
-                dg::layout::SymBuffer<R>(l.peers,l.rank),
-                a1,l.s1,l.w1,l.ws1,d1,a2,l.s2,l.w2,l.ws2,
-                a1,l.s1,l.w1,l.ws1,d1,a2,l.s2,l.w2,l.ws2,(const uint8_t *)l.domains));
+            const auto &a1=prefill ? l.preA1 : BM==32 ? l.batchA1 : l.a1;
+            const auto &d1=prefill ? l.preD1 : BM==32 ? l.batchD1 : l.d1;
+            const auto &a2=prefill ? l.preA2 : BM==32 ? l.batchA2 : l.a2;
+            const auto &s1=prefill ? l.preS1 : l.s1;
+            const auto &s2=prefill ? l.preS2 : l.s2;
+            check(cudaLaunchKernelEx(&config,selectKernel<BM,Capacity>(l.mxfp4),y,(int *)nullptr,(uint32_t)rows,
+                dg::layout::SymBuffer<R>(addresses,l.rank),
+                a1,s1,l.w1,l.ws1,d1,a2,s2,l.w2,l.ws2,
+                a1,s1,l.w1,l.ws1,d1,a2,s2,l.w2,l.ws2,(const uint8_t *)l.domains));
             check(cudaGetLastError()); return 1;
         } catch (const std::exception &e) { error=e.what(); return 0; }
+    }
+    static int runPrefill(void *p,const void *const *peers,const void *x,void *y,
+            const int32_t *idx,const float *scores,int rows) {
+        const auto *plan=static_cast<Layer *>(p)->preparedPrefill;
+        if (!plan) { error="Unprepared Blackwell MegaMoE prefill"; return 0; }
+        return plan->launch(p,x,y,idx,scores,rows,nullptr,peers);
     }
 };
 }
@@ -301,12 +402,19 @@ extern "C" int fastllm_sm100_mega_moe_run_batched(void *p,const void *x,void *y,
     return static_cast<LayerBase *>(p)->ranks==4 ? Mega<4>::run<32>(p,x,y,i,s,rows,live)
                                                : Mega<8>::run<32>(p,x,y,i,s,rows,live);
 }
-// Reuse the same bounded persistent ring for arbitrary prefill sizes. The
-// caller already synchronizes equal-count chunks across every EP rank.
-extern "C" size_t fastllm_sm100_mega_moe_prefill_workspace_bytes(int,int) { return 0; }
-extern "C" int fastllm_sm100_mega_moe_prepare_prefill(void *,void *,size_t,int) { return 0; }
-extern "C" int fastllm_sm100_mega_moe_run_prefill(void *,const void *const *,const void *,void *,const int32_t *,const float *,int) {
-    error="Blackwell MegaMoE uses the persistent bounded arena"; return 0;
+extern "C" size_t fastllm_sm100_mega_moe_prefill_workspace_bytes(int total,int ranks) {
+    return ranks==8 ? Mega<8>::prefillBytes(total) : ranks==4 ? Mega<4>::prefillBytes(total) : 0;
+}
+extern "C" int fastllm_sm100_mega_moe_prepare_prefill(void *p,void *w,size_t bytes,int total) {
+    if (!p) return 0;
+    return static_cast<LayerBase *>(p)->ranks==8 ? Mega<8>::preparePrefill(p,w,bytes,total) :
+            Mega<4>::preparePrefill(p,w,bytes,total);
+}
+extern "C" int fastllm_sm100_mega_moe_run_prefill(void *p,const void *const *peers,const void *x,
+        void *y,const int32_t *idx,const float *scores,int rows) {
+    if (!p || !peers) { error="Invalid Blackwell MegaMoE prefill handle or peers"; return 0; }
+    return static_cast<LayerBase *>(p)->ranks==8 ? Mega<8>::runPrefill(p,peers,x,y,idx,scores,rows) :
+            Mega<4>::runPrefill(p,peers,x,y,idx,scores,rows);
 }
 extern "C" void fastllm_sm100_mega_moe_destroy(void *p) {
     if (!p) return;

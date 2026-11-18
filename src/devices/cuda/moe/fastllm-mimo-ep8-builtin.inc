@@ -128,8 +128,8 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
         FastllmCudaSetDevice(devices[r]);
         auto rank = std::make_unique<FastllmCudaMimoEp8BuiltinMega::Rank>();
         rank->hopperMxfp4 = hopperMxfp4;
-        // Only Hopper FP8 prefill borrows scratch from peer ranks.
-        if (hopper && !mxfp4) rank->prefillReady = FastllmCudaEventCreate();
+        // The builtin MegaMoE prefill path borrows scratch from peer ranks.
+        if (!hopperMxfp4) rank->prefillReady = FastllmCudaEventCreate();
         rank->workspace.Resize({(int)bytes});
         rank->workspace.ToDevice(DataDevice::CUDA, {devices[r]}, false);
         rank->workspace.Allocate(false);
