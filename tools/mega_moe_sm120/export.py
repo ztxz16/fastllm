@@ -215,7 +215,9 @@ class Exporter:
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path,required=True)
-    ap.add_argument('--capacities',type=int,nargs='+',default=[1,2,4,8,16,32,64,128])
+    ap.add_argument('--capacities', type=int, nargs='+',
+                    default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+                    help='Row capacities per rank to compile (default: %(default)s)')
     ap.add_argument('--ep',type=int,choices=[4,8],default=8)
     ap.add_argument('--hidden',type=int,default=4096)
     ap.add_argument('--intermediate',type=int,default=2048)

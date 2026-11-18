@@ -15,16 +15,14 @@ Currently shipped and tested:
   SM120, 110 SMs/GPU, EP4 and EP8, hidden=4096, intermediate=2048,
   256 experts, top-k=8, MXFP4 weights with block-32 E8M0 scales,
   BF16 input/output, MXFP8 internal activations.
-  EP4 capacity buckets per rank: 1,2,4,8,16,32,64,128,256,512,1024,2048.
-  EP8 capacity buckets per rank: 1,2,4,8,16,32,64,128.
+  The default export covers powers of two from 1 through 2048 rows per rank.
 
 Smaller row counts are masked to the next available bucket. Above the largest
 bucket, all ranks execute the same number of chunks, including ranks with empty
 local chunks. The largest bucket is a per-round capacity, not a maximum
 inference batch size. Chunking also works within a captured parent CUDA graph.
-The larger EP4 buckets improve expert weight reuse during prefill and reduce
-repeated chunk dispatch. Each owner holds complete experts: expert tensor
-parallelism is 1, independent of the number of EP ranks and attention TP size.
+Larger buckets reuse expert weights across more rows per dispatch. Each owner
+holds complete experts. Expert tensor parallelism is 1 for both EP sizes.
 The exporter compares direct return with rank-local combine, which sums local
 expert contributions before returning them to the requesting rank. No runtime
 tuning switch is required.
@@ -58,11 +56,10 @@ Python runtime, or new environment option is needed for sharing. Older manifests
 without lifetime metadata and devices without VMM retain dedicated allocations.
 
 With the shipped packages and a 2 MiB allocation granularity, local workspace
-backing across all buckets is 998 MiB/rank for EP4 (previously 2019.7 MiB) and
-78 MiB/rank for EP8 (previously 166.0 MiB), excluding the unchanged peer heaps,
-weights and other buffers. EP4's 998 MiB consists of 974 MiB shared storage and
-24 MiB private pages. Small-only workloads allocate only the backing they need;
-they do not eagerly allocate the largest package capacity.
+backing across all buckets is 998 MiB/rank for EP4 and 1890 MiB/rank for EP8,
+excluding peer heaps, weights and other buffers. EP4 uses 974 MiB shared and
+24 MiB private. EP8 uses 1866 MiB shared and 24 MiB private. Storage grows
+as larger buckets are prepared.
 
 Architecture scope
 ------------------
@@ -100,8 +97,10 @@ Build-only environment used for export:
 From the repository root, in that compiler environment:
   python tools/mega_moe_sm120/export.py \
     --ep 8 --hidden 4096 --intermediate 2048 --experts 256 --topk 8 \
-    --capacities 1 2 4 8 16 32 64 128 \
     --output tools/fastllm_pytools/kernels/mxfp4_ep/sm120_sms110_ep8_h4096_i2048_e256_k8
+
+Use --capacities to export a subset or an alternative set of row counts.
+To regenerate EP4, use --ep 4 and its matching output directory.
 
 The exporter reads compiled kernel objects and captured CUDA graph metadata.
 It strips process addresses, emits explicit pointer/TMA/peer-offset relocations,
@@ -128,31 +127,19 @@ Caching must preserve exact output and meet the same performance margin; each
 bucket records dispatch_rank_cache, comparison timings and fallback reasons.
 The captured recipe resets the transient cache before every replay. This is
 per-invocation input reuse, not a cache across requests or decoding steps.
-Local combine adds BF16 rounding of each owner's partial sum; it is L2-validated,
-not bitwise equivalent to direct return. The shipped EP4 package selects local
-combine for 512/1024/2048 rows and direct return for 1 through 256. These are
-measured package choices, not hard-coded row thresholds in the loader.
-Owner input caching is selected for EP4 capacities 256, 1024 and 2048; it reuses
-existing local activation storage and adds no physical workspace pages at the
-2 MiB allocation granularity used above. Smaller capacities and capacity 512
-retain their previous kernels because caching did not meet the gain margin.
-The shipped EP8 capacities retain direct return. Input caching is selected only
-for capacity 128; capacities 1 through 64 retain their previous kernels.
+Local combine rounds each owner's partial sum to BF16. The shipped EP4 package
+uses local combine for 512, 1024 and 2048 rows. Its owner input cache is enabled
+for 256, 1024 and 2048 rows. EP8 uses local combine and the owner input cache
+for 256, 512, 1024 and 2048 rows. It also caches owner inputs at 128 rows.
 Direct recipes clear the combine buffer before the collective start barrier,
 so masked or invalid routes cannot reuse results from a previous replay. This
 uses a CUDA memset graph node and does not add a compiled arithmetic kernel.
 The regenerated calibration includes this clearing operation in direct recipes.
-Update third_party/flashinfer_sm120_ep/UPSTREAM.json when regenerating artifacts.
-Retain the associated notices and licenses in redistributed packages.
+When regenerating artifacts, record the export tool revision and hashes in
+third_party/flashinfer_sm120_ep/UPSTREAM.json. Retain the associated notices and
+licenses when redistributing the packages.
 
-For EP4, use --ep 4, --capacities 1 2 4 8 16 32 64 128 256 512 1024 2048,
-and an output directory containing ep4. The shipped EP4 package has
-94 deduplicated binaries (8.1 MiB), plus its manifest. The native replay
-checks include uneven rank lengths, empty ranks, and rows above 2048.
-
-Four arithmetic kernel families are in the EP8 package: BF16->MXFP8 staging,
-FC1/activation/partial FC2, FC2/combine, and top-k reduction. Across all eight
-capacities and ranks, the current package has 91 deduplicated binaries (9.2 MiB),
-plus the graph manifest (4.0 MiB). These are compiled variants, not 91 handwritten
-operators. Different configurations may also select upstream drain/finalizer
-variants. Do not assume a fixed number of binaries for all model dimensions.
+The EP4 package contains 94 deduplicated binaries (8.1 MiB). EP8 contains
+191 binaries (18.0 MiB) and a 7.1 MiB graph manifest. These include
+BF16-to-MXFP8 staging, expert projection, FC2/combine and reduction kernels.
+Rank-local combine uses an additional finalizer and rank-partial reduction.
