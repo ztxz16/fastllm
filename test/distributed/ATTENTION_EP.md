@@ -288,6 +288,38 @@ V编号只在本次运行内比较。换服务器后先检查GPU/CPU、编译缓
 缺失logits、错误路径、Graph计数不符或KV未释放均返回非零；中断保留部分结果。
 `NOT_OBSERVED`仅表示本次固定组合未复现，不会覆盖历史性能FAIL。
 
+### Prefill组合的逐层定位
+
+若固定准入报告已采集第1步logits，且两请求与四请求在Prefill结束时已不同，使用
+`probe_qwen_moe_prefill_batches.py`比较rank 0、1的完整Prompt中间张量。该入口只比较
+首轮`[Begin,Begin,Idle,Idle]`与`[Begin,Begin,Begin,Begin]`，不包含后加入的rank 2、3，
+也不包含混合Decode轮次；不能把结果推广为后加入请求的完整根因。
+
+需要先在GPU服务器重编译worker；保留已有CMake缓存、CPU/CUDA架构与依赖配置：
+
+```bash
+cmake --build "$ATTENTION_EP_BUILD" --target fastllm_process_tp_package -j 4
+"$ATTENTION_EP_PYTHON" test/distributed/probe_qwen_moe_prefill_batches.py \
+  --build "$ATTENTION_EP_BUILD" --model "$ATTENTION_EP_MODEL" \
+  --baseline /绝对路径/时间戳_moe_admission_probe_随机号
+```
+
+每组合独立加载模型，warmup一次Prefill，再采集一次Prefill；两次都End并核验活动KV
+释放。Prompt、采样参数、capacity沿用基准报告，后续128步生成不执行。每个活动rank的
+采集logits和首Token必须精确复现基准`eager_firstN_thenM/repeat01/rankR.json`；不一致时
+报告`trace_attribution_valid=false`并拒绝逐层归因，不调整容差。通过后比较embedding、
+每层Attention/MoE输出、final norm和logits，记录完整张量与末Token各自的max/mean误差、
+不同元素数及首个差异位置。最早不同阶段是观测到的计算边界，不等于已证明具体算子错误。
+
+完整FP16轨迹默认仍限制32 MiB。本入口只向子进程设置`FASTLLM_MOE_TRACE_MAX_MIB=256`，
+该变量只接受32或256，且仍计入原有512 MiB总工作区预算。长Prompt的二进制文件按块比较，
+不展开为全部Python浮点对象。以1024-token、2048隐藏宽度、24层为例，每rank每次快照约
+196 MiB；两组合含warmup共约2.3 GiB文件。仅诊断需要这些快照，不输出性能结果。
+
+结果保存在`时间戳_moe_prefill_batches_随机号/`，含原始快照、协议结果、SHA256、执行命令、
+构建缓存、硬件信息和四格式汇总。零容差阶段FAIL表示定位到数值差异；原有生成、numeric与
+性能验收结论不变。异常或中断仍保存部分报告并返回非零。
+
 ### 四项联合验收
 
 `real-all`等价于真实模型入口的`--alignment-policy all`。固定比较exact、K=5/容差0、

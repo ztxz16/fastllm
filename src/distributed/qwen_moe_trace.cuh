@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fcntl.h>
 #include <stdexcept>
 #include <string>
@@ -34,6 +35,7 @@ class MoeForwardTrace {
     std::string directory;
     uint32_t hidden, layers, rank;
     size_t next = 0;
+    size_t limitMiB = 32;
     bool readback = false;
 
     /** CUDA 失败立即抛出，不改变正式后端或重试计算。 */
@@ -59,7 +61,9 @@ class MoeForwardTrace {
 
 public:
     /**
-     * 预建连续 FP16 快照布局，最多使用 32 MiB GPU 和等量 CPU 存储。
+     * 预建连续 FP16 快照布局，默认最多使用 32 MiB GPU 和等量 CPU 存储。
+     * 独立长Prompt诊断可设置FASTLLM_MOE_TRACE_MAX_MIB=256；只接受32或256，
+     * 不改变执行器已有的512 MiB总工作区限制，也不改变正常推理的分配或计算。
      * @param directory 已创建的独立目录，保存时只新增文件。
      * @param ids 当前完整历史 Token ID，非空且从位置零开始。
      * @param hidden 每个 Token 的隐藏宽度。
@@ -69,7 +73,14 @@ public:
     MoeForwardTrace(const std::string &directory, const std::vector<uint32_t> &ids,
                     uint32_t hidden, uint32_t layers, uint32_t rank)
         : ids(ids), directory(directory), hidden(hidden), layers(layers), rank(rank) {
-        constexpr size_t limit = 32ULL * 1024 * 1024 / sizeof(half);
+        if (const char *value = std::getenv("FASTLLM_MOE_TRACE_MAX_MIB")) {
+            const std::string setting(value);
+            if (setting != "32" && setting != "256") {
+                throw std::runtime_error("FASTLLM_MOE_TRACE_MAX_MIB must be 32 or 256");
+            }
+            limitMiB = setting == "256" ? 256 : 32;
+        }
+        const size_t limit = limitMiB * 1024 * 1024 / sizeof(half);
         const uint16_t endian = 1;
         if (!*reinterpret_cast<const uint8_t*>(&endian) || ids.empty() || !hidden || !layers ||
             hidden > limit || ids.size() > limit / hidden) {
@@ -78,7 +89,7 @@ public:
         const size_t rows = ids.size() * hidden;
         const uint64_t stages = uint64_t(layers) * 2 + 1;
         if (stages > (limit - hidden) / rows) {
-            throw std::runtime_error("MoE forward trace exceeds 32 MiB");
+            throw std::runtime_error("MoE forward trace exceeds " + std::to_string(limitMiB) + " MiB");
         }
         entries.push_back({"embedding", 0, rows});
         for (uint32_t layer = 0; layer < layers; ++layer) {
@@ -135,7 +146,8 @@ public:
             std::to_string(rank) + ",\"tokens\":" + std::to_string(ids.size()) + ",\"hidden\":" +
             std::to_string(hidden) + ",\"layers\":" + std::to_string(layers) + ",\"ids\":[";
         for (size_t i = 0; i < ids.size(); ++i) json += (i ? "," : "") + std::to_string(ids[i]);
-        json += "],\"binary\":\"" + binary + "\",\"snapshots\":[";
+        json += "],\"round\":" + std::to_string(round) + ",\"max_mib\":" + std::to_string(limitMiB) +
+                ",\"binary\":\"" + binary + "\",\"snapshots\":[";
         for (size_t i = 0; i < entries.size(); ++i) {
             const auto &entry = entries[i];
             json += std::string(i ? "," : "") + "{\"name\":\"" + entry.name + "\",\"offset\":" +
