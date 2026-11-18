@@ -177,7 +177,13 @@ class Qwen3ProcessSession:
             raise
         self.state = state
 
-    def __enter__(self):
+    def start(self):
+        """/**
+         * 创建原生进程并立即返回，让多个 DP 副本的权重加载可以重叠。
+         * 会话持有进程组和通信资源；调用者随后必须等待就绪或关闭会话。
+         * 仅允许从 new 启动一次，启动异常会回收已创建的资源。
+         * @return 处于 starting 状态的当前会话；失败通过异常报告。
+         */"""
         with self._lock:
             if self.state != "new":
                 raise RuntimeError("session cannot be restarted")
@@ -215,6 +221,21 @@ class Qwen3ProcessSession:
                     env=self.environment))
                 child.close()
                 cancel_child.close()
+                return self
+            except BaseException:
+                self._dispose("failed")
+                raise
+
+    def wait_ready(self):
+        """/**
+         * 等待并校验原生加载结果，确认 worker、KV 和执行后端后开放请求。
+         * 仅接受 starting 状态；超时从本次等待开始计时，异常会回收整组进程。
+         * @return 处于 ready 状态的当前会话；失败通过异常报告。
+         */"""
+        with self._lock:
+            if self.state != "starting":
+                raise RuntimeError(f"cannot wait for startup: session is {self.state}")
+            try:
                 self.ready = self._read(time.monotonic() + self.timeout)
                 if (self.ready.get("event") != "ready" or self.ready.get("status") != "PASS" or
                     self.ready.get("protocol") != 1 or self.ready.get("backend") != BACKEND or
@@ -236,6 +257,10 @@ class Qwen3ProcessSession:
             except BaseException:
                 self._dispose("failed")
                 raise
+
+    def __enter__(self):
+        self.start()
+        return self.wait_ready()
 
     def generate(self, request, *, cancel_event=None, on_token=None):
         """同步生成；on_token 必须快速返回，回调异常会取消并排空结果后保留已清理的会话。"""
@@ -354,7 +379,8 @@ class Qwen3ProcessSession:
         with self._lock:
             if self.state in ("closed", "failed"):
                 return
-            if self.state == "new":
+            if self.state in ("new", "starting"):
+                # 尚未完成 ready 握手，不能发送 shutdown 或继续等待权重加载。
                 self._dispose("closed")
                 return
             try:

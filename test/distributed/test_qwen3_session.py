@@ -160,10 +160,27 @@ def fixture():
             result += part
         return result
 
+    # 启动闸门由正式工厂的 DP 测试控制；发送 ready 前登记真实进程，验证加载重叠及回收。
+    if mode.startswith('dp_startup_gate'):
+        model = Path(args['--model'])
+        launch = model / f'launch-{devices[0]}.json'
+        pending = launch.with_suffix('.tmp')
+        pending.write_text(json.dumps(workers))
+        pending.replace(launch)
+        deadline = time.monotonic() + 15
+        while not (model / f'release-{devices[0]}').exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError('startup gate was not released')
+            time.sleep(0.01)
+        if (model / f'fail-{devices[0]}').exists():
+            return
+
     print("NCCL INFO simulated noisy stdout", flush=True)
     send(dict(event="ready", status="PASS", protocol=1, backend=BACKEND,
               model_load_count=1, workers=workers, cache=cache, cancellation="request_id_datagram", token_events=True,
               visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES')))
+    if mode.startswith('dp_startup_gate'):
+        (model / f'ready-{devices[0]}').touch()
     while True:
         try:
             message = json.loads(read(struct.unpack("!I", read(4))[0]))

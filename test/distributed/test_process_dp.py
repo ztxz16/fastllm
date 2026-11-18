@@ -1,7 +1,7 @@
 """正式工厂的多副本生命周期与并发回归；只替换 CUDA 枚举、tokenizer 和原生协议。"""
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout, redirect_stderr
+from contextlib import ExitStack, contextmanager, redirect_stdout, redirect_stderr
 import io
 import json
 import os
@@ -15,7 +15,7 @@ from unittest import mock
 
 from test_parallel_config import inventory
 import test_process_tp_entrypoint as entry_tests
-from fastllm_pytools import cli, parallel_config, process_tp
+from fastllm_pytools import cli, parallel_config, process_tp, qwen3_process_session
 from fastllm_pytools.process_dp import ProcessDPModel
 from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
 from fastllm_pytools.qwen3_process_session import GenerationCancelled, GenerationObserverError
@@ -46,6 +46,157 @@ class ProcessDPTests(unittest.TestCase):
     def assert_reaped(self, workers):
         for worker in workers:
             self.assertFalse(Path(f"/proc/{worker['pid']}").exists(), worker)
+
+    def prepare_startup_gate(self, name):
+        """/** 为每次启动建立独立的协议模型目录，避免前一个 case 的闸门标记串入。 */"""
+        previous = self.model
+        self.model = self.root / f'dp_startup_gate-{name}'
+        self.model.mkdir()
+        (self.model / 'config.json').write_bytes((previous / 'config.json').read_bytes())
+        self.fixture.model = self.model
+        self.fixture.base[0] = str(self.model)
+
+    def wait_paths(self, paths):
+        """/** 有界等待原生替身发布标记；失败显示具体缺失路径，不依赖加载耗时比。 */"""
+        deadline = time.monotonic() + 5
+        while not all(path.is_file() for path in paths):
+            if time.monotonic() >= deadline:
+                self.fail(f'missing startup markers: {[str(path) for path in paths if not path.is_file()]}')
+            time.sleep(0.01)
+
+    @contextmanager
+    def gated_startup(self, dp, tp, *flags):
+        """/**
+         * 通过正式工厂启动受控的原生协议子进程，要求所有副本先抵达 ready 闸门。
+         * 测试失败也会释放闸门并关闭成功返回的模型，防止测试遗留进程。
+         * @param dp 完整副本数量。
+         * @param tp 每副本的 worker 数量。
+         * @param flags 传给正式参数解析器的附加 CLI 选项。
+         * @return 依次产出工厂 future、原生 worker 记录和本次池的报告目录。
+         */"""
+        self._gate_id = getattr(self, '_gate_id', 0) + 1
+        self.prepare_startup_gate(str(self._gate_id))
+        devices = list(range(0, dp * tp, tp))
+        outputs = set((self.root / 'output').glob('*'))
+        args = self.args('--dp', str(dp), '--tp', str(tp), *flags)
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(make_normal_llm_model, args)
+            try:
+                paths = [self.model / f'launch-{device}.json' for device in devices]
+                self.wait_paths(paths)
+                workers = [worker for path in paths for worker in json.loads(path.read_text())]
+                created = set((self.root / 'output').glob('*')) - outputs
+                self.assertEqual(len(created), 1)
+                yield future, workers, created.pop()
+            finally:
+                for device in devices:
+                    (self.model / f'release-{device}').touch()
+                try:
+                    model = future.result(timeout=20)
+                except (Exception, KeyboardInterrupt, SystemExit):
+                    pass  # 异常由测试主体断言；工厂负责失败路径的回收。
+                else:
+                    model.close()
+
+    def test_startup_overlaps_and_out_of_order_ready_preserves_ranks(self):
+        for dp, tp in ((2, 1), (4, 1), (2, 2)):
+            with self.subTest(dp=dp, tp=tp), self.gated_startup(dp, tp) as (future, workers, output):
+                self.assertFalse(future.done())
+                self.assertFalse(list(self.model.glob('ready-*')))
+                for device in reversed(range(tp, dp * tp, tp)):
+                    (self.model / f'release-{device}').touch()
+                    self.wait_paths([self.model / f'ready-{device}'])
+                self.assertFalse(future.done(), 'factory returned while replica 0 was still loading')
+                self.assertFalse((output / 'replicas.ready.json').exists())
+
+                (self.model / 'release-0').touch()
+                model = future.result(timeout=6)
+                self.assertEqual([replica.session.devices for replica in model.replicas],
+                                 [list(range(rank * tp, (rank + 1) * tp)) for rank in range(dp)])
+                self.assertEqual(model.ready['workers'],
+                                 [dict(worker, dp_rank=index // tp) for index, worker in enumerate(workers)])
+                self.assertEqual(model.ready['model_load_count'], dp)
+                for index in range(2 * dp):
+                    result = model.generate(dict(self.request, token_ids=[index + 1]))
+                    self.assertEqual((result['dp_rank'], result['token_ids']), (index % dp, [index + 1]))
+                model.close()
+                model.close()
+                self.assert_reaped(workers)
+
+    def test_startup_failure_reaps_ready_and_loading_replicas(self):
+        for dp, tp, failed_rank in ((4, 1, 1), (2, 2, 0)):
+            with self.subTest(dp=dp, tp=tp), self.gated_startup(dp, tp) as (future, workers, output):
+                if failed_rank:
+                    (self.model / 'release-0').touch()
+                    self.wait_paths([self.model / 'ready-0'])
+                (self.model / f'fail-{failed_rank * tp}').touch()
+                (self.model / f'release-{failed_rank * tp}').touch()
+                with self.assertRaisesRegex(RuntimeError, 'disconnected'):
+                    future.result(timeout=6)
+                self.assert_reaped(workers)
+                failure = json.loads((output / 'startup.failure.json').read_text())
+                self.assertIn('disconnected', failure['error'])
+                self.assertFalse((output / 'replicas.ready.json').exists())
+                shutdown = json.loads((output / 'replicas.shutdown.json').read_text())
+                self.assertEqual(shutdown['status'], 'PASS')
+                self.assertEqual([r['state'] for r in shutdown['replicas']],
+                                 ['failed' if rank == failed_rank else 'closed' for rank in range(dp)])
+                if failed_rank:
+                    self.assertTrue(list((output / 'replica-0').glob('*/session/shutdown.json')))
+
+    def test_startup_timeout_reaps_all_loading_tp_workers(self):
+        with self.gated_startup(2, 2, '--tp-timeout', '2') as (future, workers, output):
+            with self.assertRaisesRegex(TimeoutError, 'deadline'):
+                future.result(timeout=6)
+            self.assert_reaped(workers)
+            self.assertIn('TimeoutError', (output / 'startup.failure.json').read_text())
+            self.assertFalse((output / 'replicas.ready.json').exists())
+
+    def test_startup_spawn_failure_reaps_registered_replicas(self):
+        self.prepare_startup_gate('spawn')
+        original = qwen3_process_session.isolated_process
+        launched = []
+
+        def spawn(*args, **kwargs):
+            if launched:
+                self.wait_paths([self.model / 'launch-0.json'])
+                raise OSError('fixture launch failure')
+            launched.append(True)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(qwen3_process_session, 'isolated_process', side_effect=spawn), \
+                self.assertRaisesRegex(OSError, 'fixture launch failure'):
+            make_normal_llm_model(self.args('--tp', '2'))
+        self.assert_reaped(json.loads((self.model / 'launch-0.json').read_text()))
+        output = next((self.root / 'output').iterdir())
+        shutdown = json.loads((output / 'replicas.shutdown.json').read_text())
+        self.assertEqual(shutdown['replicas'], [dict(dp_rank=0, state='closed'), dict(dp_rank=1, state='failed')])
+        self.assertIn('fixture launch failure', (output / 'startup.failure.json').read_text())
+
+    def test_cli_interrupt_while_waiting_ready_reaps_all_loading_workers(self):
+        for signum, exception in ((signal.SIGTERM, SystemExit), (signal.SIGINT, KeyboardInterrupt)):
+            self.prepare_startup_gate(f'interrupt-{signum}')
+            previous = signal.getsignal(signal.SIGTERM)
+            workers = []
+
+            def interrupt_read(session, deadline):
+                paths = [self.model / f'launch-{device}.json' for device in (0, 2)]
+                self.wait_paths(paths)
+                workers.extend(worker for path in paths for worker in json.loads(path.read_text()))
+                if signum == signal.SIGINT:
+                    raise KeyboardInterrupt()
+                signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+            with self.subTest(signal=signum), \
+                    mock.patch.object(qwen3_process_session.Qwen3ProcessSession, '_read', interrupt_read), \
+                    mock.patch.object(sys, 'argv', ['ftllm', 'run', *self.fixture.base, '--dp', '2', '--tp', '2']), \
+                    self.assertRaises(exception) as error:
+                cli.main()
+            if signum == signal.SIGTERM:
+                self.assertEqual(error.exception.code, 128 + signal.SIGTERM)
+            self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+            self.assertEqual(len(workers), 4)
+            self.assert_reaped(workers)
 
     def test_pure_dp_defaults_and_tp_replica_groups(self):
         for dp, tp in ((2, ''), (2, '1'), (2, '2'), (4, '1')):
@@ -182,6 +333,7 @@ class ProcessDPTests(unittest.TestCase):
         previous = signal.getsignal(signal.SIGTERM)
         def start(*args, **kwargs):
             if created:
+                self.assertEqual(created[0].state, 'starting')
                 handler = signal.getsignal(signal.SIGTERM)
                 self.assertTrue(callable(handler))
                 handler(signal.SIGTERM, None)
@@ -195,7 +347,7 @@ class ProcessDPTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 128 + signal.SIGTERM)
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
         self.assertEqual(created[0].state, 'closed')
-        self.assert_reaped(created[0].ready['workers'])
+        self.assert_reaped([dict(pid=created[0].session._process.pid)])
 
     def test_invalid_request_and_observer_failure_preserve_replicas(self):
         with make_normal_llm_model(self.args()) as model:
