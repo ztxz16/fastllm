@@ -897,6 +897,22 @@ if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     endif()
 endif()
 
+# The dense projection has its own SM103a cubin, including in mixed SM100/103 builds.
+if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+    add_library(fastllm_mxfp8_linear_sm103 OBJECT src/devices/cuda/linear/fastllm-linear-mxfp8-sm103.cu)
+    set_target_properties(fastllm_mxfp8_linear_sm103 PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_mxfp8_linear_sm103 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_blackwell/include"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_mxfp8_linear_sm103 PRIVATE
+        "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr")
+    set_property(SOURCE src/devices/cuda/linear/fastllm-linear-fp8.cu
+        src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
+    set(FASTLLM_MXFP8_LINEAR_OBJECTS $<TARGET_OBJECTS:fastllm_mxfp8_linear_sm103>)
+endif()
+
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     add_library(fastllm_glm53_flashinfer_sm120 OBJECT
         src/devices/cuda/models/glm5-next-dsa-sm120.cu)
@@ -950,7 +966,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MXFP8_LINEAR_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -965,6 +981,9 @@ add_library(fastllm OBJECT
 # Compile the core once for executables and the Python shared library.
 set_target_properties(fastllm PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
+if (TARGET fastllm_mxfp8_linear_sm103)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_MXFP8_LINEAR_OBJECTS})
+endif()
 if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_MIMO_EP8_MEGA_OBJECTS})
 endif()
@@ -1773,6 +1792,13 @@ if (UNIT_TEST)
         "Queued multimodal/text request isolation: PASS" 60)
     if (USE_CUDA)
         target_include_directories(deepseekV41PrecisionRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        if (TARGET fastllm_mxfp8_linear_sm103)
+            add_executable(cuda_blackwell_mxfp8_linear_test test/basic/test_cuda_blackwell_mxfp8_linear.cpp)
+            target_link_libraries(cuda_blackwell_mxfp8_linear_test PRIVATE fastllm)
+            target_include_directories(cuda_blackwell_mxfp8_linear_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME cuda_blackwell_mxfp8_linear COMMAND cuda_blackwell_mxfp8_linear_test)
+            set_tests_properties(cuda_blackwell_mxfp8_linear PROPERTIES LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endif()
         if (FASTLLM_CUDA_SM120_SOURCES)
             add_executable(cuda_v41_mxfp4_test test/basic/test_cuda_v41_mxfp4.cpp)
             target_link_libraries(cuda_v41_mxfp4_test PRIVATE fastllm)

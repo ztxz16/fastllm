@@ -92,6 +92,36 @@
       "original_sha256": "9fd0fdb872bb1d037370cab53918535c5e049b2936dd5e8b8af51648dfb843f2",
       "installed_sha256": "d897bba98f06355bc8be34448c6b8c4baf8769bb03cc7d9cc05552f664371cfb",
       "adapted": true
+    },
+    "deep_gemm/epilogue/operators.cuh": {
+      "original_sha256": "4e916eab753dcc06eee8fe8664a8f1ba412a4724119cdbb04de52e01c12f7bf3",
+      "installed_sha256": "6cde31e93d8702c8cadf5fa84f74afa397b75aa330b6b59221b22e7beee68ea6",
+      "adapted": true
+    },
+    "deep_gemm/epilogue/sm100_store_cd.cuh": {
+      "original_sha256": "f90b1baca0b88bad39cd84a3634447e2a4f24c249ab067bfa6afb7eed5979aea",
+      "installed_sha256": "bd4f63f22144317eec8fb6f50c58574ee59a01ea7d8c417bbd57d3afde470c84",
+      "adapted": true
+    },
+    "deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh": {
+      "original_sha256": "23cf25fed0aa5bcc26465a88cb3b11144d236f9697458d072dbb9171ad1edd8d",
+      "installed_sha256": "3b1f540e98182affff6a66c4ae3f3433f2c5cd8c183db0ffda8fa2ba505f3282",
+      "adapted": true
+    },
+    "deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh": {
+      "original_sha256": "f567031e4f6e2b86b0ee99560c3eaff0160623a82e01aff0559fbeb3c2ec17b4",
+      "installed_sha256": "22b48f7b20d024615cb27898821467ab48ab8b60ee79e10c0a984f4d4577c70b",
+      "adapted": true
+    },
+    "deep_gemm/layout/gemm.cuh": {
+      "original_sha256": "b692f024495a4160dc65a8094bb13eae65be4c902d10436fce6446e6919d2b57",
+      "installed_sha256": "44f3e539fe98be61a6d9691963f9231a6afcfcaf56429aaecd6ab89fe7abcb12",
+      "adapted": true
+    },
+    "deep_gemm/scheduler/gemm.cuh": {
+      "original_sha256": "f48dfef610affd81d1cae7798bdf602d0e2c3b9aa7cc2c0df0376370eea97ed6",
+      "installed_sha256": "6d664486a56df776a97af6bfd373440dd4a0125d722618fc40d9fb7db8023048",
+      "adapted": true
     }
   },
   "local_patch": "PATCHES.diff",
