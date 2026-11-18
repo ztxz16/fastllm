@@ -86,7 +86,8 @@ struct CollectiveBuilder<
   using ElementA = typename detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairA>::data_type;
   using ElementB = typename detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairB>::data_type;
   using ElementSF = ElementSFA;
-  static constexpr auto SFVectorSize = detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairA>::SfVectorSize;
+  // Use the signed CuTe extent type in both the host stub and device kernel signature.
+  static constexpr int SFVectorSize = detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairA>::SfVectorSize;
   static_assert((SFVectorSize == detail::blockscaled::blockscaled_type<BuilderScheduleTag, ElementPairB>::SfVectorSize),  
                 "Scale factor vector size for A and B must be the same.");
 
