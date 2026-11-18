@@ -21,6 +21,7 @@ from fastllm_pytools.qwen_moe_process_session import RoundTransport
 
 TRACE_ENV = 'FASTLLM_MOE_TRACE_DIR'
 LIMIT_ENV = 'FASTLLM_MOE_TRACE_MAX_MIB'
+BLOCK_ENV = 'FASTLLM_MOE_BLOCK_TRACE_DIR'
 
 
 def stage_names(layers):
@@ -101,16 +102,20 @@ def load_traces(directory, ranks, ids, hidden, layers):
     return result
 
 
-def prefill(args, output, job, active_ranks, vocab):
+def prefill(args, output, job, active_ranks, vocab, *, block_trace=False):
     """/**
      * 经正式联合协议执行一次warmup及一次Prefill，随后End并核验KV释放。
      * 保留原请求capacity/Prompt/采样参数；只运行首步，不执行后续Decode或混合准入。
      * 快照环境只传给本次子进程；既有原生算子、通信和总工作区预算保持正式配置。
+     * @param block_trace true只采集第0层MoE内部；false保持原完整逐层快照。
      * @return 第2次Begin的原始报告、两轮快照目录及关闭确认；异常由transport回收整组进程。
      */"""
     traces = output / 'trace'
     traces.mkdir(parents=True, exist_ok=False)
-    environment = dict(os.environ, **{TRACE_ENV: str(traces), LIMIT_ENV: '256'})
+    environment = dict(os.environ)
+    for key in (TRACE_ENV, LIMIT_ENV, BLOCK_ENV):
+        environment.pop(key, None)
+    environment.update({BLOCK_ENV: str(traces)} if block_trace else {TRACE_ENV: str(traces), LIMIT_ENV: '256'})
     with RoundTransport(args.build / 'fastllm_moe_generate', args.build / 'fastllm_tp_worker',
             args.model, '0,1,2,3', output / 'native', timeout=args.timeout,
             cuda_graph=False, prefix_cache=False, environment=environment) as session:
