@@ -138,6 +138,40 @@ class MoeSessionTests(unittest.TestCase):
             self.assertEqual(b.result(5)['token_ids'], [3]*6)
             self.assertEqual(session.generate(request())['status'], 'PASS')
 
+    def test_success_preserves_caller_cancel_event_for_reuse(self):
+        """/** 正常长度与EOS结束保留调用方取消状态，重复生成仍返回完整Token并释放rank。 */"""
+        with self.session() as session:
+            for finish in ('length', 'eos'):
+                for streaming in (False, True):
+                    with self.subTest(finish=finish, streaming=streaming):
+                        cancel = threading.Event()
+                        payload = request(5, 4)
+                        payload['eos_token_ids'] = [5] if finish == 'eos' else []
+                        expected = [5] if finish == 'eos' else [5] * 4
+                        for _ in range(2):
+                            observed = []
+                            result = session.generate(payload, cancel_event=cancel,
+                                on_token=observed.append if streaming else None)
+                            self.assertEqual(result['status'], 'PASS')
+                            self.assertEqual(result['finish_reason'], finish)
+                            self.assertEqual(result['token_ids'], expected)
+                            self.assertEqual(observed, expected if streaming else [])
+                            self.assertFalse(result['states'][result['dp_rank']]['request_active'])
+                            self.assertFalse(cancel.is_set(), 'successful generation marked caller cancelled')
+
+    def test_interrupted_consumer_still_requests_cancellation(self):
+        """/** 调用线程在生成中被中断时仍发出取消，后续请求可继续使用会话。 */"""
+        with self.session() as session:
+            cancel = threading.Event()
+
+            def interrupt(_):
+                raise KeyboardInterrupt()
+
+            with self.assertRaises(KeyboardInterrupt):
+                session.generate(request(length=1000), cancel_event=cancel, on_token=interrupt)
+            self.assertTrue(cancel.is_set())
+            self.assertEqual(session.generate(request(2))['token_ids'], [2] * 4)
+
     def test_observer_exception_is_request_local(self):
         with self.session() as session:
             def fail(_):
@@ -222,7 +256,8 @@ class MoeSessionTests(unittest.TestCase):
 
     def test_factory_text_and_service_use_joint_session(self):
         from fastllm_pytools.util import make_normal_parser, make_normal_llm_model
-        from fastllm_pytools.qwen3_process_server import ChatService
+        from fastllm_pytools.qwen3_process_server import ChatHTTPServer, ChatService
+        from run_qwen3_http import stream_call
         # 在 sys.modules 快照前导入，避免恢复快照后包属性仍引用已移除的模块。
         from fastllm_pytools.process_moe import ProcessMoeModel
         from test_parallel_config import inventory
@@ -254,6 +289,34 @@ class MoeSessionTests(unittest.TestCase):
                     self.assertTrue(job.done.wait(3))
                     self.assertEqual(job.status, 200)
                     self.assertEqual(job.response['choices'][0]['message']['content'], '答'*4)
+
+                    server = ChatHTTPServer(('127.0.0.1', 0), service)
+                    thread = threading.Thread(target=server.serve_forever, kwargs=dict(poll_interval=0.02))
+                    thread.start()
+                    try:
+                        for repeat in range(2):
+                            request_id = f'moe-sse-{repeat}'
+                            payload = dict(job.payload, stream=True, stream_options=dict(include_usage=True))
+                            status, events = stream_call(server.server_address, payload, request_id, self.root)
+                            self.assertEqual(status, 200)
+                            errors = [e['error'] for e in events if isinstance(e, dict) and 'error' in e]
+                            self.assertEqual(errors, [], f'successful MoE stream returned errors: {errors}')
+                            self.assertEqual(events[-1], '[DONE]')
+                            self.assertEqual(events.count('[DONE]'), 1)
+                            choices = [e['choices'][0] for e in events if isinstance(e, dict) and e.get('choices')]
+                            text = ''.join(c['delta'].get('content', '') for c in choices)
+                            self.assertEqual(text, job.response['choices'][0]['message']['content'])
+                            self.assertEqual(choices[-1]['finish_reason'], 'length')
+                            usage = [e['usage'] for e in events if isinstance(e, dict) and 'usage' in e]
+                            self.assertEqual(usage, [job.response['usage']])
+                            audits = [json.loads(p.read_text()) for p in model.output.glob('http-*.json')]
+                            record = next(r for r in audits if r['id'] == request_id)
+                            self.assertEqual(record['status'], 200)
+                            self.assertEqual(record['response']['choices'][0]['message']['content'], text)
+                    finally:
+                        server.shutdown()
+                        thread.join(3)
+                        server.server_close()
                 finally:
                     service.close()
 
