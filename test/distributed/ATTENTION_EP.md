@@ -175,15 +175,32 @@ bash test/distributed/run_attention_ep_v100.sh real-all
 bash test/distributed/run_attention_ep_v100.sh performance
 ```
 
-性能矩阵为Eager/Graph × Prefix off/cold/hot × 并发1/4/8，共18项。保持原有
+默认性能矩阵为Eager/Graph × Prefix off/cold/hot × 并发1/4/8，共18项。保持原有
 32个Prompt Token、16个输出Token、禁用EOS、一次warmup和5轮计时；hot模式另在
 计时前提交4个请求准备缓存。输出历史、缓存复用及Graph路径检查在计时区外执行，
 检查失败仍返回非零。加速比是同配置Eager耗时/当前模式耗时，不是相对HF或vLLM。
 
-性能报告单独登记18项，保存原始样本及JSON/Markdown/CSV/XLSX汇总；中途停止保留
+每个输入长度单独登记18项，保存原始样本及JSON/Markdown/CSV/XLSX汇总；中途停止保留
 部分结果并标记未完成。目录仍使用`时间戳_moe_full_随机号/`，不会覆盖历史结果。
 直接使用Python入口的`--performance`具有相同语义；省略`--model`时只准备一个
 FP16合成小模型供测速，不附带完整合成验收。非默认对齐策略或候选阈值不能与测速混用。
+
+长上下文使用同一个性能入口，显式设置输入长度列表及固定输出长度：
+
+```bash
+ATTENTION_EP_PERF_PROMPT_LENGTHS="512 1024 1792" \
+ATTENTION_EP_PERF_OUTPUT_TOKENS=128 \
+bash test/distributed/run_attention_ep_v100.sh performance
+```
+
+该命令运行54项，每项5轮，仅做长上下文性能与自身输出/路径检查，不自动运行持续压测
+或HF对齐。仍使用固定的`1,2,3,4`循环Token序列控制请求形状和缓存；实际权重由
+`ATTENTION_EP_MODEL`指定。输入长度、输出长度及原始Token记录在报告中；吞吐量按
+实际配置的输出长度计算，Eager/Graph只比较同长度、同缓存和同并发的结果。
+非默认长度的case名称包含`prompt长度_output长度`，目录命名与历史结果保持一致。
+Python入口对应`--performance-prompt-lengths 512 1024 1792 --performance-output-tokens 128`。
+输入长度必须为正且不重复，输出至少2个Token；输入长度+输出长度-1必须不超过正式
+入口的2048容量限制。未满足这些条件会在加载模型前拒绝。
 
 ### 四项联合验收
 

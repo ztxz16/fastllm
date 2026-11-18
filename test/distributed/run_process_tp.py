@@ -53,7 +53,7 @@ def save_report(output, rows, metadata):
                 'operation_timeout_ms', 'failure_return_ms', 'failure_phase', 'fault_rank',
                 'heartbeat_interval_ms', 'stop_return_ms', 'restarts', 'fd_count_before', 'fd_count_after',
                 'workers_reaped', 'observed_error', 'median_ms', 'p95_ms', 'cv', 'tokens_per_second',
-                'speedup', 'concurrency', 'repeats', 'ttft_median_ms', 'itl_median_ms', 'queue_median_ms',
+                'speedup', 'prompt_length', 'output_tokens', 'concurrency', 'repeats', 'ttft_median_ms', 'itl_median_ms', 'queue_median_ms',
                 'reserved_kv_bytes', 'graph_workspace_bytes'):
         if any(key in row for row in rows):
             fields.append(key)

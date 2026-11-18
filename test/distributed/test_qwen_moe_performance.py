@@ -13,7 +13,7 @@ import run_qwen_moe_full as runner
 
 
 class PerformanceTests(unittest.TestCase):
-    def run_performance(self, *, synthetic=False, fault=None):
+    def run_performance(self, *, synthetic=False, fault=None, prompt_lengths=None, output_tokens=None):
         """/** 走真实CLI、测速循环和四格式报告，只替换GPU会话及外部环境探测。 */"""
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -24,6 +24,11 @@ class PerformanceTests(unittest.TestCase):
                     '--reference-python', '/missing/reference/python']
             if not synthetic:
                 argv += ['--model', str(root / 'model')]
+            if prompt_lengths is not None:
+                argv += ['--performance-prompt-lengths', *map(str, prompt_lengths)]
+            if output_tokens is not None:
+                argv += ['--performance-output-tokens', str(output_tokens)]
+            lengths, generated = prompt_lengths or [32], output_tokens or 16
             sessions, snapshots = [], []
             original_save = runner.save_report
 
@@ -42,14 +47,19 @@ class PerformanceTests(unittest.TestCase):
                 def generate(request, teacher_forced_tokens=None):
                     """/** 返回固定长度的生成结果，不提供HF参考或logits。 */"""
                     self.assertIsNone(teacher_forced_tokens)
-                    self.assertEqual(request, runner.request([1, 2, 3, 4] * 8, 16))
-                    reused = 31 if prefix else 0
+                    length = len(request['token_ids'])
+                    self.assertIn(length, lengths)
+                    expected_prompt = [index % 4 + 1 for index in range(length)]
+                    self.assertEqual(request, runner.request(expected_prompt, generated))
+                    reused = length - 1 if prefix else 0
                     if graph and fault == 'cache':
                         reused = 1
-                    return dict(token_ids=[2 if graph and fault == 'output' else 1] * 16,
+                    count = generated - 1 if fault == 'length' else generated
+                    token = length % 5 + int(graph and fault == 'output')
+                    return dict(token_ids=[token] * count,
                                 dp_rank=0, queue_ms=.01,
                                 states=[dict(prefix_cache=dict(last_reused_tokens=reused))],
-                                steps=[dict(elapsed_ms=index + .1) for index in range(16)])
+                                steps=[dict(elapsed_ms=index + .1) for index in range(count)])
 
                 return nullcontext(SimpleNamespace(generate=generate, _states=states,
                                                     clear_prefix_cache=mock.Mock()))
@@ -81,6 +91,16 @@ class PerformanceTests(unittest.TestCase):
             output, = (root / 'out').iterdir()
             for suffix in ('json', 'md', 'csv', 'xlsx'):
                 self.assertTrue((output / f'summary.{suffix}').is_file())
+            if fault is None:
+                csv = (output / 'summary.csv').read_text()
+                self.assertIn('prompt_length', csv)
+                self.assertIn('output_tokens', csv)
+                for row in snapshots[-1]['cases']:
+                    evidence = json.loads((output / (row['case'] + '.json')).read_text())
+                    self.assertEqual(len(evidence['samples_ms']), 5)
+                    self.assertEqual(row['output_tokens'], generated)
+                    self.assertAlmostEqual(row['tokens_per_second'] * row['median_ms'] / 1000,
+                                           row['concurrency'] * generated)
             if synthetic:
                 fixture.assert_called_once_with(output / 'f16_bias', **runner.SYNTHETIC_FIXTURES['f16_bias'])
                 self.assertTrue(all(model == output / 'f16_bias' for model, _, _ in sessions))
@@ -115,9 +135,27 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(snapshots[-1]['completed_case_count'], 18)
 
+    def test_long_context_matrix_counts_each_length_and_uses_matching_baselines(self):
+        """/** 三个长输入各跑18项，吞吐量按128输出计数，Eager/Graph只比较同长度基线。 */"""
+        lengths = [512, 1024, 1792]
+        code, snapshots, _ = self.run_performance(prompt_lengths=lengths, output_tokens=128)
+        self.assertEqual(code, 0)
+        result = snapshots[-1]
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['expected_case_count'], 54)
+        self.assertEqual(result['completed_case_count'], 54)
+        self.assertEqual(result['metadata']['prompt_lengths'], lengths)
+        self.assertEqual(result['metadata']['max_new_tokens'], 128)
+        for length in lengths:
+            rows = [row for row in result['cases'] if row['prompt_length'] == length]
+            self.assertEqual(len(rows), 18)
+            self.assertTrue(all(row['case'].startswith(f'perf_prompt{length}_output128_') for row in rows))
+            self.assertEqual(len(result['metadata']['prompt_token_ids_by_length'][str(length)]), length)
+
     def test_output_cache_and_graph_validation_still_fail(self):
         """/** 独立测速仍校验输出、缓存复用和实际Graph路径，失败返回非零。 */"""
         for fault, reason in (('output', 'different output histories'), ('cache', 'cache'),
+                              ('length', 'output length differs'),
                               ('graph', 'missed Graph')):
             with self.subTest(fault=fault):
                 code, snapshots, _ = self.run_performance(fault=fault)
@@ -146,6 +184,27 @@ class PerformanceTests(unittest.TestCase):
                     runner.main()
                 self.assertEqual(error.exception.code, 2)
                 suite.assert_not_called()
+
+    def test_invalid_lengths_rejected_before_model_load(self):
+        """/** 长度为零、重复、超上下文和误用于对齐时必须在启动GPU前拒绝。 */"""
+        base = ['runner', '--binary', '/unused', '--worker', '/unused', '--build-cache', '/unused']
+        for extra in (['--performance', '--performance-prompt-lengths', '0'],
+                      ['--performance', '--performance-prompt-lengths', '32', '32'],
+                      ['--performance', '--performance-output-tokens', '1'],
+                      ['--performance', '--performance-output-tokens', '0'],
+                      ['--performance', '--performance-prompt-lengths', '1922', '--performance-output-tokens', '128'],
+                      ['--performance-prompt-lengths', '512'], ['--performance-output-tokens', '128']):
+            with self.subTest(extra=extra), mock.patch('sys.argv', base + extra), \
+                    mock.patch.object(runner, 'Suite') as suite, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    runner.main()
+                self.assertEqual(error.exception.code, 2)
+                suite.assert_not_called()
+
+        argv = base + ['--performance', '--performance-prompt-lengths', '1921', '--performance-output-tokens', '128']
+        with mock.patch('sys.argv', argv), mock.patch.object(runner, 'Suite', side_effect=RuntimeError('validated')):
+            with self.assertRaisesRegex(RuntimeError, 'validated'):
+                runner.main()
 
 
 if __name__ == '__main__':
