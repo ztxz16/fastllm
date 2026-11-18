@@ -19,26 +19,29 @@ constexpr size_t kWorkspace = fastllm_bf16_lt::workspaceBytes;
 
 // Copy four consecutive K32 exponents per word; transpose the row and K128
 // indices with a bank-conflict-free shared tile. No persistent packed copy.
+template <int TileRows, int TileGroups, int Threads>
 __global__ void PrepareOperands(const float4 *src, uint32_t *dst, const __nv_bfloat16 *x, uint8_t *q,
                                 uint8_t *s, int rows, int n, int k, int pitch, int tilesPerRow,
                                 int weightTiles) {
     const unsigned thread = threadIdx.x;
     if (blockIdx.x < weightTiles) {
-        __shared__ uint32_t tile[32][33];
-        const int lane = thread % 32, warp = thread / 32, groups = k / 128;
-        const int groupTile = blockIdx.x % tilesPerRow * 32;
-        const int rowTile = blockIdx.x / tilesPerRow * 32;
-        for (int r = warp; r < 32; r += 8) {
-            if (groupTile + lane < groups && rowTile + r < n) {
-                const float4 v = src[size_t(rowTile + r) * groups + groupTile + lane];
-                tile[r][lane] = (__float_as_uint(v.x) >> 23) | ((__float_as_uint(v.y) >> 23) << 8) |
-                                ((__float_as_uint(v.z) >> 23) << 16) | ((__float_as_uint(v.w) >> 23) << 24);
+        __shared__ uint32_t tile[TileRows][TileGroups + 1];
+        const int groups = k / 128, firstGroup = blockIdx.x % tilesPerRow * TileGroups,
+                  firstRow = blockIdx.x / tilesPerRow * TileRows;
+        for (int i = thread; i < TileRows * TileGroups; i += Threads) {
+            const int r = i / TileGroups, g = i % TileGroups;
+            if (firstRow + r < n && firstGroup + g < groups) {
+                const float4 v = src[size_t(firstRow + r) * groups + firstGroup + g];
+                tile[r][g] = (__float_as_uint(v.x) >> 23) | ((__float_as_uint(v.y) >> 23) << 8) |
+                             ((__float_as_uint(v.z) >> 23) << 16) | ((__float_as_uint(v.w) >> 23) << 24);
             }
         }
         __syncthreads();
-        for (int r = warp; r < 32; r += 8)
-            if (rowTile + lane < n && groupTile + r < groups)
-                dst[size_t(groupTile + r) * n + rowTile + lane] = tile[lane][r];
+        for (int i = thread; i < TileGroups * TileRows; i += Threads) {
+            const int g = i / TileRows, r = i % TileRows;
+            if (firstRow + r < n && firstGroup + g < groups)
+                dst[size_t(firstGroup + g) * n + firstRow + r] = tile[r][g];
+        }
         return;
     }
 
@@ -47,21 +50,30 @@ __global__ void PrepareOperands(const float4 *src, uint32_t *dst, const __nv_bfl
     if (row >= rows) return;
     alignas(16) __nv_bfloat16 v[8];
     *reinterpret_cast<uint4 *>(v) = *reinterpret_cast<const uint4 *>(x + size_t(row) * k + col);
-    float maximum = 0.f;
+    __nv_bfloat162 maxPair = __habs2(*reinterpret_cast<const __nv_bfloat162 *>(v));
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-        maximum = fmaxf(maximum, fabsf(float(v[i])));
+    for (int i = 1; i < 4; ++i)
+        maxPair = __hmax2(maxPair, __habs2(reinterpret_cast<const __nv_bfloat162 *>(v)[i]));
+    const float2 pair = __bfloat1622float2(maxPair);
+    float maximum = fmaxf(0.f, fmaxf(pair.x, pair.y));
     unsigned mask = __activemask();
     maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 1, 4));
     maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 2, 4));
     uint32_t bits = __float_as_uint(maximum / 448.f);
     uint32_t exponent = min(254u, max(1u, (bits >> 23) + ((bits & 0x7fffffu) != 0)));
-    float inv = ldexpf(1.f, 127 - int(exponent));
-    alignas(8) __nv_fp8_e4m3 encoded[8];
+    float inv = __uint_as_float(exponent == 254 ? 0x00400000u : (254u - exponent) << 23);
+    union {
+        uint2 word;
+        __nv_fp8x2_storage_t pair[4];
+    } encoded;
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-        encoded[i] = __nv_fp8_e4m3(float(v[i]) * inv);
-    *reinterpret_cast<uint2 *>(q + size_t(row) * k + col) = *reinterpret_cast<uint2 *>(encoded);
+    for (int i = 0; i < 4; ++i) {
+        float2 f = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 *>(v)[i]);
+        f.x *= inv;
+        f.y *= inv;
+        encoded.pair[i] = __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+    }
+    *reinterpret_cast<uint2 *>(q + size_t(row) * k + col) = encoded.word;
     if (!(item & 3)) s[(size_t(col / 128) * pitch + row) * 4 + (col / 32) % 4] = exponent;
 }
 
@@ -180,7 +192,12 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     auto *packed = reinterpret_cast<uint32_t *>(base);
     auto *qx = base + scaleArea;
     auto *sx = qx + ((size_t(limit) + 3) / 4 * 4) * k;
-    const int tilesPerRow = (k / 128 + 31) / 32;
+    // Narrower tiles expose more parallel copies for wide projections.
+    const bool wideK = k >= 8192;
+    const int tile = wideK ? 16 : 32;
+    const int threads = wideK ? 128 : 256;
+    const int tilesPerRow = (k / 128 + tile - 1) / tile;
+    auto prepare = wideK ? PrepareOperands<16, 16, 128> : PrepareOperands<32, 32, 256>;
     // A pair of CTAs must cover two complete N tiles. A trailing odd tile
     // needs a single-CTA kernel or the multicast barrier cannot complete.
     bool paired = ((n + 127) / 128) % 2 == 0;
@@ -197,9 +214,9 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
         const bool largeTile = prefill && count >= 256 && (pairedM || fullWave);
         if (largeTile && !pairedM) count = count / 256 * 256;
         const int pitch = (count + 3) / 4 * 4;
-        const int weightTiles = start == 0 ? tilesPerRow * ((n + 31) / 32) : 0;
-        const int activationTiles = (size_t(count) * k / 8 + 255) / 256;
-        PrepareOperands<<<weightTiles + activationTiles, 256, 0, cudaStreamPerThread>>>(
+        const int weightTiles = start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;
+        const int activationTiles = (size_t(count) * k / 8 + threads - 1) / threads;
+        prepare<<<weightTiles + activationTiles, threads, 0, cudaStreamPerThread>>>(
             static_cast<const float4 *>(w.extraCudaData[0]), packed,
             static_cast<const __nv_bfloat16 *>(x) + size_t(start) * k, qx, sx, count, n, k, pitch, tilesPerRow,
             weightTiles);
