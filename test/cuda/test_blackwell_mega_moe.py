@@ -18,6 +18,7 @@ def main():
     p.add_argument("--lib", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--ranks", type=int, default=8, choices=(4, 8))
+    p.add_argument("--mxfp4", action="store_true", help="Use native block-32 E2M1 experts")
     p.add_argument("--checkpoint")
     p.add_argument("--layer", type=int, default=3)
     a = p.parse_args()
@@ -58,8 +59,8 @@ def main():
         ],
     )
     create = bind(
-        "create",
-        [P] * 4 + [ptr, ctypes.c_size_t, P, ctypes.c_int, ctypes.c_int, ctypes.c_int],
+        "create_mxfp4" if a.mxfp4 else "create",
+        [P] * (2 if a.mxfp4 else 4) + [ptr, ctypes.c_size_t, P, ctypes.c_int, ctypes.c_int, ctypes.c_int],
         ptr,
     )
     run = bind("run_masked", [ptr] * 5 + [ctypes.c_int, ptr])
@@ -106,6 +107,15 @@ def main():
             q.shape
         )
 
+    def unpack_mxfp4(packed, scales):
+        magnitudes = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6], device=packed.device)
+        lut = torch.cat((magnitudes, -magnitudes))
+        b = packed.view(torch.uint8)
+        i = torch.stack((b & 15, b >> 4), dim=-1).long()
+        n = b.shape[0]
+        exponent = scales.view(torch.uint8).int() - 127
+        return torch.ldexp(lut[i].reshape(n, -1, 32), exponent[..., None]).reshape(n, -1)
+
     def original(w, s):
         n, k = w.shape
         return (
@@ -135,7 +145,7 @@ def main():
 
     assert size == {4: 45220224, 8: 45174144}[R], ("workspace size changed", size)
     print("WORKSPACE", size, flush=True)
-    # Three distinct native FP8 experts per owner, aliased across its expert IDs.
+    # Three distinct native experts per owner, aliased across its expert IDs.
     # Reference copies stay on GPU0 and the tested packed representation stays local.
     reference = []
     ranks = []
@@ -157,6 +167,7 @@ def main():
 
     for r in range(R):
         torch.cuda.set_device(0)
+        expected = ()
         refs = []
         src = []
         for j in range(3):
@@ -166,13 +177,19 @@ def main():
                     [load_weight(expert, k, "weight") for k in ("gate_proj", "up_proj")]
                 )
                 w2 = load_weight(expert, "down_proj", "weight")
+                scale_key = "weight_scale" if a.mxfp4 else "weight_scale_inv"
                 s1 = torch.cat(
                     [
-                        load_weight(expert, k, "weight_scale_inv")
+                        load_weight(expert, k, scale_key)
                         for k in ("gate_proj", "up_proj")
                     ]
                 )
-                s2 = load_weight(expert, "down_proj", "weight_scale_inv")
+                s2 = load_weight(expert, "down_proj", scale_key)
+            elif a.mxfp4:
+                w1 = torch.randint(256, (2 * I, H // 2), dtype=torch.uint8, device=0)
+                w2 = torch.randint(256, (H, I // 2), dtype=torch.uint8, device=0)
+                s1 = torch.randint(116, 122, (2 * I, H // 32), dtype=torch.uint8, device=0)
+                s2 = torch.randint(116, 122, (H, I // 32), dtype=torch.uint8, device=0)
             else:
                 w1 = (
                     torch.randn(2 * I, H, device="cuda", dtype=torch.bfloat16) * 0.7
@@ -182,6 +199,12 @@ def main():
                 )
                 s1 = torch.rand(2 * I // 128, H // 128, device="cuda") * 0.012 + 0.005
                 s2 = torch.rand(H // 128, I // 128, device="cuda") * 0.012 + 0.005
+            if a.mxfp4:
+                dw1, dw2 = unpack_mxfp4(w1, s1), unpack_mxfp4(w2, s2)
+                refs.append((dw1, dw2, dw1, dw2) if a.checkpoint else (dw1, dw2))
+                src.append(tuple(torch.cat((w.view(torch.uint8).flatten(), scale.view(torch.uint8).flatten())).to(r)
+                                 for w, scale in ((w1, s1), (w2, s2))))
+                continue
             orig1 = original(w1, s1)
             orig2 = original(w2, s2)
             q1, qs1 = quant(orig1)
@@ -213,11 +236,13 @@ def main():
         torch.cuda.set_device(r)
         arrays = [
             (ptr * (E // R))(*[v["src"][e % 3][part].data_ptr() for e in range(E // R)])
-            for part in range(4)
+            for part in range(len(v["src"][0]))
         ]
         v["handle"] = create(*arrays, v["allocation"].data_ptr(), size, peers, r, 0, R)
         assert v["handle"], err()
-        if R == 8:
+        if a.mxfp4:
+            assert not weights(v["handle"], (ptr * 4)()), "FP4 exposed as borrowed FP8 weights"
+        elif R == 8:
             addresses = (ptr * 4)()
             assert weights(v["handle"], addresses)
             for i, expected in enumerate(v["expected"]):
@@ -479,6 +504,7 @@ def main():
             json.dumps(
                 dict(
                     ranks=R,
+                    weight_format="mxfp4" if a.mxfp4 else "fp8",
                     workspace_bytes=size,
                     reports=reports,
                     checkpoint_quality=quality,

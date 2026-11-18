@@ -19,6 +19,7 @@ extern "C" decltype(fastllm_ep8_mega_moe_destroy) fastllm_sm90_mega_moe_destroy;
 #endif
 
 #ifdef FASTLLM_MIMO_MEGA_SM100
+extern "C" decltype(fastllm_ep8_mega_moe_create_mxfp4) fastllm_sm100_mega_moe_create_mxfp4;
 extern "C" decltype(fastllm_ep8_mega_moe_error) fastllm_sm100_mega_moe_error;
 extern "C" decltype(fastllm_ep8_mega_moe_max_rows) fastllm_sm100_mega_moe_max_rows;
 extern "C" decltype(fastllm_ep8_mega_moe_workspace_bytes) fastllm_sm100_mega_moe_workspace_bytes;

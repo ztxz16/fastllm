@@ -241,7 +241,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     int expertFormat = -1;
     auto nativeFormat = [&](const Data &w) {
         return (!mxfp4Only && w.dataType == FP8_E4M3 && w.blockM == 128 && w.blockK == 128) ||
-            (tpEp8Mega && !UsesPackedMoeSource() && w.dataType == NVFP4 && w.blockM == 32 && w.blockK == 1);
+            FastllmCudaMimoIsMxfp4Expert(w);
     };
     for (int layer = 0; tpEp8Mega && native && layer < block_cnt; ++layer) if (moeLayers[layer]) {
         for (int e = 0; native && e < num_experts; ++e) {

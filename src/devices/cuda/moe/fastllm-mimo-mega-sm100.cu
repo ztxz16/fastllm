@@ -1,4 +1,4 @@
-// Blackwell MiMo EP4/EP8: pinned upstream W8A8 MegaMoE, no Python/JIT dependency.
+// Blackwell MiMo EP4/EP8: pinned upstream FP8/MXFP4 MegaMoE, no Python/JIT dependency.
 // FP8/FP32 block128 source weights are explicitly requantized on load to the
 // FP8/UE8M0-per32 format used by the historical NaiveSglang SM103 adapter.
 #ifndef FASTLLM_MIMO_MEGA_SM100
@@ -53,11 +53,29 @@ void desc2(Desc &out,void *p,int inner,int outer,int bi,int bo,int bytes,int swi
     descriptor(out,bytes==4 ? CU_TENSOR_MAP_DATA_TYPE_INT32 : CU_TENSOR_MAP_DATA_TYPE_UINT8,
         p,2,dims,strides,box,swizzle);
 }
-void descWeight(Desc &out,void *p,int n,int k,int localExperts) {
+void descWeight(Desc &out,void *p,int n,int k,int localExperts,bool mxfp4) {
     cuuint64_t dims[]={(uint64_t)k,(uint64_t)n/2,2,(uint64_t)localExperts};
-    cuuint64_t strides[]={(uint64_t)k,(uint64_t)n*k/2,(uint64_t)n*k};
+    const cuuint64_t rowBytes=mxfp4 ? k/2 : k;
+    cuuint64_t strides[]={rowBytes,n*rowBytes/2,n*rowBytes};
     cuuint32_t box[]={BK,BN,1,1};
-    descriptor(out,CU_TENSOR_MAP_DATA_TYPE_UINT8,p,4,dims,strides,box,128);
+    descriptor(out,mxfp4 ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B : CU_TENSOR_MAP_DATA_TYPE_UINT8,p,4,dims,strides,box,128);
+}
+__device__ int sourceRow(int row,int n,bool gate) {
+    return gate ? row/16*8+row%8+(row%16>=8 ? n/2 : 0) : row;
+}
+__device__ size_t scaleOffset(int row,int col,int n) {
+    int transposed=(row&~127)+(row%32)*4+(row%128)/32;
+    return ((size_t)(col/4)*n+transposed)*4+col%4;
+}
+// Native E2M1 nibbles and K32 UE8M0 exponents arrive in one allocation.
+// Only permute rows and scales; TMA unpacks the weights into shared memory.
+__global__ void packMxfp4(const uint8_t *src,uint8_t *dst,uint8_t *sf,int n,int k,bool gate) {
+    int group=blockIdx.x*blockDim.x+threadIdx.x;
+    if (group>=n*(k/32)) return;
+    int row=group/(k/32), col=group%(k/32);
+    int source=sourceRow(row,n,gate)*(k/32)+col;
+    reinterpret_cast<uint4 *>(dst)[group]=reinterpret_cast<const uint4 *>(src)[source];
+    sf[scaleOffset(row,col,n)]=src[(size_t)n*k/2+source];
 }
 // One warp per 32 source weights. Combine requantization, gate/up gran8
 // interleave and UTCCP scale transpose in one load-time pass.
@@ -66,7 +84,7 @@ __global__ void pack(const uint8_t *src,const float *scales,uint8_t *dst,uint8_t
     int group=(blockIdx.x*blockDim.x+threadIdx.x)/32;
     if (group>=n*(k/32)) return;
     int lane=threadIdx.x%32, row=group/(k/32), col=group%(k/32);
-    int source=gate ? row/16*8+row%8+(row%16>=8 ? n/2 : 0) : row;
+    int source=sourceRow(row,n,gate);
     __nv_fp8_e4m3 q; q.__x=src[(size_t)source*k+col*32+lane];
     float value=float(q)*scales[(source/128)*(k/128)+col/4];
     float amax=fabsf(value);
@@ -74,10 +92,7 @@ __global__ void pack(const uint8_t *src,const float *scales,uint8_t *dst,uint8_t
     uint32_t exponent=dg::math::get_ue8m0_sf_exp(amax);
     float inverse=dg::math::get_ue8m0_sf_inv<float>(exponent);
     dst[(size_t)row*k+col*32+lane]=__nv_fp8_e4m3(value*inverse).__x;
-    if (lane==0) {
-        int transposed=(row&~127)+(row%32)*4+(row%128)/32;
-        sf[((size_t)(col/4)*n+transposed)*4+col%4]=exponent;
-    }
+    if (lane==0) sf[scaleOffset(row,col,n)]=exponent;
 }
 __global__ void prepare(const __nv_bfloat16 *x,const int32_t *idx,const float *score,
     uint8_t *qx,uint8_t *sf,int64_t *qi,float *qs,int rows,const int *live,
@@ -109,14 +124,18 @@ template<int R> struct Mega {
     static constexpr int LE=E/R;
     static dg::layout::MegaMoEBuffer buffer(void *p) { return {p,H,I,R,E,CAP,K,RING,SFRING,true,0}; }
     static size_t bytes() { return buffer(nullptr).get_num_bytes(); }
-    template<int BM=16> static auto kernel() {
+    template<int BM=16,typename Weight=cutlass::float_e4m3_t> static auto kernel() {
         return &dg::sm100_fp8_fp4_mega_moe_impl<CAP,H,I,E,0,K,BM,BN,BK,
             Tile<BM>::STORE,Tile<BM>::STORE,128,128,RING,SFRING,Tile<BM>::STAGES,H,128,128,256,SMS,R,
-            cute::numeric_limits<float>::infinity(),true,cutlass::float_e4m3_t>;
+            cute::numeric_limits<float>::infinity(),true,Weight>;
+    }
+    template<int BM> static auto selectKernel(bool mxfp4) {
+        return mxfp4 ? kernel<BM,cutlass::detail::float_e2m1_unpacksmem_t>() : kernel<BM>();
     }
     struct Layer:LayerBase {
         Layer():LayerBase{R} {}
         int device=-1,rank=-1;
+        bool mxfp4=false;
         void *workspace=nullptr,*gate=nullptr,*down=nullptr,*gateSf=nullptr,*downSf=nullptr;
         uint8_t *domains=nullptr;
         std::array<int64_t,R> peers{};
@@ -144,49 +163,57 @@ template<int R> struct Mega {
         } catch (const std::exception &e) { error=e.what(); return 0; }
     }
     static void *create(const void *const *g,const void *const *d,const void *const *gs,const void *const *ds,
-        void *w,size_t size,const void *const *peers,int rank,int slot) {
+        void *w,size_t size,const void *const *peers,int rank,int slot,bool mxfp4=false) {
         try {
             if (!fastllm_sm100_mega_moe_supported() || !w || size<bytes() ||
-                !g || !d || !gs || !ds || !peers || rank<0 || rank>=R ||
+                !g || !d || (!mxfp4 && (!gs || !ds)) || !peers || rank<0 || rank>=R ||
                 peers[rank]!=w || slot<0 || slot>=48 || (uintptr_t)w%256)
                 throw std::runtime_error("Invalid Blackwell MegaMoE layer configuration");
             auto l=std::make_unique<Layer>(); check(cudaGetDevice(&l->device));
-            l->rank=rank; l->workspace=w;
+            l->rank=rank; l->workspace=w; l->mxfp4=mxfp4;
             for (int r=0;r<R;++r) {
                 if (!peers[r]) throw std::runtime_error("Missing MegaMoE peer workspace");
                 l->peers[r]=reinterpret_cast<int64_t>(peers[r]);
             }
-            l->gate=allocate((size_t)LE*2*I*H); l->down=allocate((size_t)LE*H*I);
+            const size_t downBytes=(size_t)H*I/(mxfp4 ? 2 : 1);
+            l->gate=allocate(LE*2*downBytes); l->down=allocate(LE*downBytes);
             l->gateSf=allocate((size_t)LE*2*I*H/32); l->downSf=allocate((size_t)LE*H*I/32);
             l->domains=static_cast<uint8_t *>(allocate(2048));
             std::array<uint8_t,2048> domains{};
             for (size_t j=0;j<domains.size();++j) domains[j]=(j/2)%2;
             check(cudaMemcpy(l->domains,domains.data(),domains.size(),cudaMemcpyHostToDevice));
             for (int e=0;e<LE;++e) {
-                if (!g[e] || !d[e] || !gs[e] || !ds[e]) throw std::runtime_error("Missing native FP8 expert");
-                pack<<<(2*I*H+127)/128,128,0,cudaStreamPerThread>>>(
-                    (const uint8_t *)g[e],(const float *)gs[e],(uint8_t *)l->gate+(size_t)e*2*I*H,
-                    (uint8_t *)l->gateSf+(size_t)e*2*I*H/32,2*I,H,true);
-                pack<<<(H*I+127)/128,128,0,cudaStreamPerThread>>>(
-                    (const uint8_t *)d[e],(const float *)ds[e],(uint8_t *)l->down+(size_t)e*H*I,
-                    (uint8_t *)l->downSf+(size_t)e*H*I/32,H,I,false);
+                if (!g[e] || !d[e] || (!mxfp4 && (!gs[e] || !ds[e])))
+                    throw std::runtime_error("Missing MegaMoE expert weights or scales");
+                auto packExpert=[&](const void *src,const void *scale,void *dst,void *sf,int n,int k,bool gate) {
+                    auto *values=(uint8_t *)dst+(size_t)e*n*k/(mxfp4 ? 2 : 1);
+                    auto *exponents=(uint8_t *)sf+(size_t)e*n*k/32;
+                    if (mxfp4)
+                        packMxfp4<<<(n*k/32+127)/128,128,0,cudaStreamPerThread>>>(
+                            (const uint8_t *)src,values,exponents,n,k,gate);
+                    else
+                        pack<<<(n*k+127)/128,128,0,cudaStreamPerThread>>>(
+                            (const uint8_t *)src,(const float *)scale,values,exponents,n,k,gate);
+                };
+                packExpert(g[e],mxfp4 ? nullptr : gs[e],l->gate,l->gateSf,2*I,H,true);
+                packExpert(d[e],mxfp4 ? nullptr : ds[e],l->down,l->downSf,H,I,false);
             }
             check(cudaGetLastError()); check(cudaDeviceSynchronize());
             auto b=buffer(w);
             desc2(l->a1,b.l1_token_buffer.base,H,RING,BK,8,1,128);
             desc2(l->s1,b.l1_sf_buffer.base,SFRING,H/128,128,1,4,0);
-            descWeight(l->w1,l->gate,2*I,H,LE);
+            descWeight(l->w1,l->gate,2*I,H,LE,mxfp4);
             desc2(l->ws1,l->gateSf,2*I,H/128*LE,128,1,4,0);
             desc2(l->d1,b.l2_token_buffer.base,I,RING,64,8,1,64);
             desc2(l->a2,b.l2_token_buffer.base,I,RING,BK,8,1,128);
             desc2(l->s2,b.l2_sf_buffer.base,SFRING,I/128,128,1,4,0);
-            descWeight(l->w2,l->down,H,I,LE);
+            descWeight(l->w2,l->down,H,I,LE,mxfp4);
             desc2(l->ws2,l->downSf,H,I/128*LE,128,1,4,0);
             desc2(l->batchA1,b.l1_token_buffer.base,H,RING,BK,16,1,128);
             desc2(l->batchD1,b.l2_token_buffer.base,I,RING,64,16,1,64);
             desc2(l->batchA2,b.l2_token_buffer.base,I,RING,BK,16,1,128);
-            check(cudaFuncSetAttribute(kernel<16>(),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<16>::SMEM));
-            check(cudaFuncSetAttribute(kernel<32>(),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<32>::SMEM));
+            check(cudaFuncSetAttribute(selectKernel<16>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<16>::SMEM));
+            check(cudaFuncSetAttribute(selectKernel<32>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<32>::SMEM));
             return l.release();
         } catch (const std::exception &e) { error=e.what(); return nullptr; }
     }
@@ -207,7 +234,7 @@ template<int R> struct Mega {
             const auto &a1=BM==32 ? l.batchA1 : l.a1;
             const auto &d1=BM==32 ? l.batchD1 : l.d1;
             const auto &a2=BM==32 ? l.batchA2 : l.a2;
-            check(cudaLaunchKernelEx(&config,kernel<BM>(),y,(int *)nullptr,(uint32_t)rows,
+            check(cudaLaunchKernelEx(&config,selectKernel<BM>(l.mxfp4),y,(int *)nullptr,(uint32_t)rows,
                 dg::layout::SymBuffer<R>(l.peers,l.rank),
                 a1,l.s1,l.w1,l.ws1,d1,a2,l.s2,l.w2,l.ws2,
                 a1,l.s1,l.w1,l.ws1,d1,a2,l.s2,l.w2,l.ws2,(const uint8_t *)l.domains));
@@ -252,6 +279,12 @@ extern "C" void *fastllm_sm100_mega_moe_create(const void *const *g,const void *
     if (n==8) return Mega<8>::create(g,d,gs,ds,w,b,p,r,s);
     error="MegaMoE requires 4 or 8 ranks"; return nullptr;
 }
+extern "C" void *fastllm_sm100_mega_moe_create_mxfp4(const void *const *g,const void *const *d,
+    void *w,size_t b,const void *const *p,int r,int s,int n) {
+    if (n==4) return Mega<4>::create(g,d,nullptr,nullptr,w,b,p,r,s,true);
+    if (n==8) return Mega<8>::create(g,d,nullptr,nullptr,w,b,p,r,s,true);
+    error="MegaMoE requires 4 or 8 ranks"; return nullptr;
+}
 extern "C" int fastllm_sm100_mega_moe_run_masked(void *p,const void *x,void *y,const int32_t *i,const float *s,int rows,const int *live) {
     if (!p) { error="Missing MegaMoE handle"; return 0; }
     return static_cast<LayerBase *>(p)->ranks==4 ? Mega<4>::run(p,x,y,i,s,rows,live) : Mega<8>::run(p,x,y,i,s,rows,live);
@@ -284,5 +317,6 @@ extern "C" void fastllm_sm100_mega_moe_destroy(void *p) {
 extern "C" int fastllm_sm100_mega_moe_weights(void*p,const void**out){
  if(!p||!out||static_cast<LayerBase*>(p)->ranks!=8)return 0;
  auto*l=static_cast<Mega<8>::Layer*>(p);
+ if(l->mxfp4)return 0; // Flex consumes FP8 weight views.
  out[0]=l->gate;out[1]=l->down;out[2]=l->gateSf;out[3]=l->downSf;return 1;
 }
