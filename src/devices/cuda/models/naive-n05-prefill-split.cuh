@@ -1,6 +1,15 @@
 #pragma once
 #include "naive-n05-prefill-mma.cuh"
 namespace naive_prefill_mma {
+// Split prefill stages packed KV to BF16 before launch. Keep page lookup and
+// offset semantics while issuing native 16-byte copies in the gather loop.
+struct SplitBF16KV : FastllmNaiveKV {
+    using FastllmNaiveKV::FastllmNaiveKV;
+    __device__ __forceinline__ const BF *RowAtPhysicalIndex(int row, int stride) const {
+        return base + (size_t)row * stride + offset;
+    }
+};
+
 // A selected list can contain gaps, duplicates and unsorted indices. Skip
 // only a trailing span with no valid keys, preserving the original PV order.
 __device__ inline int SplitActiveCount(const int *indices, int indexRow, int count,
@@ -81,8 +90,8 @@ template <int Max> __global__ void SplitNormalize(BF *prob, const float *sink, i
             p[t + i * 256] = __float2bfloat16(denominator > 0 ? values[i] / denominator : 0);
 }
 
-template <int Max, int Window, int Groups>
-__global__ __launch_bounds__(256) void SplitQK(const BF *q, FastllmNaiveKV key, const int *indices, BF *out, int heads,
+template <int Max, int Window, int Groups, class KV>
+__global__ __launch_bounds__(256) void SplitQK(const BF *q, KV key, const int *indices, BF *out, int heads,
                                                int kvHeads, int stride, int keys, int count, int past, bool causal,
                                                int indexTile = 0, int queryOffset = 0, int queryRows = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -144,8 +153,8 @@ __global__ __launch_bounds__(256) void SplitQK(const BF *q, FastllmNaiveKV key, 
 
 #endif
 }
-template <int Max, int Window, int Groups>
-__global__ __launch_bounds__(256) void SplitPV(const BF *probabilities, FastllmNaiveKV value, const int *indices,
+template <int Max, int Window, int Groups, class KV>
+__global__ __launch_bounds__(256) void SplitPV(const BF *probabilities, KV value, const int *indices,
                                                BF *out, int heads, int kvHeads, int keys, int count, int past,
                                                bool causal, int indexTile = 0, int queryOffset = 0, int queryRows = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800

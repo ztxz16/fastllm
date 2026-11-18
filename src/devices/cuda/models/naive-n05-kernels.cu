@@ -3862,16 +3862,17 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
         auto *p = (BF16 *)probabilities.cudaData;
         const auto *ids = indices.dims.empty() ? nullptr : (const int *)indices.cudaData;
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        const mma::SplitBF16KV splitKey(*readKey), splitValue(*readValue);
         // KV is staged once above. Keep absolute query/index positions while
         // reusing a bounded probability tile on the same CUDA stream.
         for (int first = 0; first < queries; first += tileRows) {
             const int rows = std::min(tileRows, queries - first);
             mma::SplitQK<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::QKStorage<2>)>>>(
-                (const BF16 *)query.cudaData, FastllmNaiveKV(*readKey),
+                (const BF16 *)query.cudaData, splitKey,
                 ids, p, heads, kvHeads, key.dims[2], keys, count, pastLength, causal, indexTile, first, queries);
             mma::SplitNormalize<2048><<<dim3(rows,heads),256>>>(p,bias,heads,count);
             mma::SplitPV<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::PVStorage<2>)>>>(
-                p, FastllmNaiveKV(*readValue), ids,
+                p, splitValue, ids,
                 (BF16 *)output.cudaData, heads, kvHeads, keys, count,
                 pastLength, causal, indexTile, first, queries);
         }

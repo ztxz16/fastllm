@@ -19,8 +19,8 @@ template <int Max, int Groups = 1> struct Storage {
     BF prob[Groups * 8][Max + 8];
     int selected[Tile];
 };
-template<int Width, int Pitch, int Tile, int Threads, int Window = 0>
-__device__ inline void Load(BF (*dst)[Pitch], int *selected, FastllmNaiveKV kv,
+template<int Width, int Pitch, int Tile, int Threads, int Window = 0, class KV>
+__device__ inline void Load(BF (*dst)[Pitch], int *selected, KV kv,
         const int *indices, int query, int first, int count, int keys,
         int past, bool causal, int stride, int head, int indexRow) {
     int t = threadIdx.x;

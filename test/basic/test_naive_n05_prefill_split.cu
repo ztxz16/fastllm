@@ -12,7 +12,9 @@ static void Check(cudaError_t error) {
 }
 template <class T> struct Buffer {
     T *data = nullptr;
-    explicit Buffer(size_t count) { Check(cudaMalloc(&data, count * sizeof(T))); }
+    explicit Buffer(size_t count) {
+        if (count) Check(cudaMalloc(&data, count * sizeof(T)));
+    }
     ~Buffer() { cudaFree(data); }
 };
 static void Fill(BF *dst, size_t count, unsigned seed) {
@@ -23,17 +25,23 @@ static void Fill(BF *dst, size_t count, unsigned seed) {
     }
     Check(cudaMemcpy(dst, values.data(), count * sizeof(BF), cudaMemcpyHostToDevice));
 }
-static void Case(int rows, int past, int heads, bool causal, bool withSink, int indexTile) {
+static void Case(int rows, int past, int heads, bool causal, bool withSink, int indexTile, bool paged = false) {
     using namespace naive_prefill_mma;
     const int kvHeads = heads / 16, keys = past + rows, count = 2048;
+    constexpr int pageSize = 32;
+    const int pageCount = paged ? (keys + pageSize - 1) / pageSize : 0;
+    const int storageRows = paged ? pageCount * pageSize : keys;
+    const size_t offset = paged ? 8 : 0;
+    const size_t keyElements = (size_t)storageRows * kvHeads * 192 + offset;
+    const size_t valueElements = (size_t)storageRows * kvHeads * 128 + offset;
     const size_t outputs = (size_t)rows * heads * 128;
-    Buffer<BF> q((size_t)rows * heads * 192), k((size_t)keys * kvHeads * 192), v((size_t)keys * kvHeads * 128),
+    Buffer<BF> q((size_t)rows * heads * 192), k(keyElements), v(valueElements),
         reference(outputs), actual(outputs), probabilities((size_t)std::min(rows, 257) * heads * 2056);
     Buffer<int> ids((size_t)rows * count);
     Buffer<float> bias(heads);
     Fill(q.data, (size_t)rows * heads * 192, 53);
-    Fill(k.data, (size_t)keys * kvHeads * 192, 71);
-    Fill(v.data, (size_t)keys * kvHeads * 128, 113);
+    Fill(k.data, keyElements, 71);
+    Fill(v.data, valueElements, 113);
     std::vector<int> selected((size_t)rows * count);
     for (int row = 0; row < rows; ++row)
         for (int col = 0; col < count; ++col) {
@@ -50,9 +58,14 @@ static void Case(int rows, int past, int heads, bool causal, bool withSink, int 
     Check(cudaMemcpy(ids.data, selected.data(), selected.size() * sizeof(int), cudaMemcpyHostToDevice));
     Check(cudaMemcpy(bias.data, sink.data(), heads * sizeof(float), cudaMemcpyHostToDevice));
     const float *s = withSink ? bias.data : nullptr;
-    FastllmNaiveKV key{}, value{};
-    key.base = k.data;
-    value.base = v.data;
+    Buffer<int> pages(pageCount);
+    if (paged) {
+        std::vector<int> table(pageCount);
+        for (int i = 0; i < pageCount; ++i) table[i] = pageCount - i - 1;
+        Check(cudaMemcpy(pages.data, table.data(), pageCount * sizeof(int), cudaMemcpyHostToDevice));
+    }
+    SplitBF16KV key(k.data, pages.data, pageSize), value(v.data, pages.data, pageSize);
+    key.offset = value.offset = offset;
     auto fused = Generic<2048, 0, 2>;
     Check(cudaFuncSetAttribute(fused, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Storage<2048, 2>)));
     const dim3 grid(rows, heads / 16);
@@ -85,6 +98,7 @@ int main() {
         return 77;
     try {
         Case(65, 0, 16, true, false, 0);
+        Case(257, 8192, 32, true, true, 0, true);
         Case(2048, 0, 64, true, false, 0);
         Case(2053, 0, 16, false, true, 0);
         Case(4096, 0, 64, true, true, 256);
