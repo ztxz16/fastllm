@@ -13,6 +13,11 @@ import shlex
 import subprocess
 import sys
 
+if __package__:
+    from .util import prefix_cache_budget
+else:
+    from util import prefix_cache_budget
+
 
 def add_router_args(parser):
     parser.add_argument('action', choices=('render', 'start', 'status', 'stop', 'serve'))
@@ -69,7 +74,16 @@ def load_config(path):
                     if group['endpoint'] in node.get('prefill', peers)))
                 pd['listen'] = group.get('listen', group['endpoint'])
                 pd['chunk_tokens'] = group.get('chunk_tokens', 2048)
-                pd['cache_bytes'] = group.get('cache_bytes', 0)
+                total = group.get('cache_bytes')
+                pd['cache_bytes'] = 0 if total is None else total
+                kv, swa = group.get('cache_kv_bytes'), group.get('cache_swa_bytes')
+                effective = prefix_cache_budget(pd['cache_bytes'], kv, swa)
+                if max(effective, pd['cache_bytes']) > 1 << 40:
+                    raise ValueError('L2 cache budget exceeds 1 TiB')
+                if kv is not None:
+                    pd['cache_kv_bytes'] = kv
+                if swa is not None:
+                    pd['cache_swa_bytes'] = swa
                 if 'cache_workers' in group:
                     if type(group['cache_workers']) is not int or not 1 <= group['cache_workers'] <= 64:
                         raise ValueError('cache_workers must be an integer in [1, 64]')

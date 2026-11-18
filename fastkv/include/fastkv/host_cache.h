@@ -10,11 +10,13 @@ struct CacheRegion {
     size_t offset = 0, bytes = 0;
     std::string identity;
 };
+enum class CacheStorage { KV, Window };
 struct CachePayload {
     // A range payload may reuse a prefix from a checkpoint actually restored
     // by this request. Boundary payloads never inherit bytes from a parent.
     bool prefixRange = false;
     std::vector<CacheRegion> regions;
+    CacheStorage storage = CacheStorage::KV;
 };
 struct CacheSnapshot {
     Message state;
@@ -31,6 +33,10 @@ class HostCache {
         unsigned workers = 2;
         // Optional physical destination limits; held through consumer release.
         std::map<int, size_t> restoreDeviceBytes;
+        // A negative window limit selects the historical shared pool. In split
+        // mode the rest of bytes covers KV, Indexer and directory metadata.
+        int64_t swaBytes = -1;
+        void SetBudgets(size_t total, int64_t kv = -1, int64_t swa = -1);
     };
     struct Entry;
     class Hit {
@@ -46,6 +52,7 @@ class HostCache {
     };
     struct Statistics {
         size_t bytes = 0, entries = 0, inflightBytes = 0, queued = 0;
+        size_t kvBytes = 0, swaBytes = 0; // Physical usage when split.
         uint64_t publications = 0, evictions = 0, skipped = 0, failures = 0;
         uint64_t copiedToHost = 0, reusedBytes = 0, restoredBytes = 0, restores = 0;
         uint64_t restoreMicroseconds = 0;

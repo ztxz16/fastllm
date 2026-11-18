@@ -20,7 +20,7 @@ static CacheSnapshot State(int pages, int device, const std::string &version = "
     }
     Bytes bytes(513, uint8_t(pages)); window.Write(bytes.data(), 0, bytes.size());
     s.state.buffers = {range.ReadOnly(), window.ReadOnly(), Buffer::Allocate(0, device)};
-    s.payloads = {ranges, {false, {{0, 513, {}}}}, {}};
+    s.payloads = {ranges, {false, {{0, 513, {}}}, CacheStorage::Window}, {}};
     return s;
 }
 static Message Restore(HostCache &cache, HostCache::Hit hit, int device) {
@@ -37,9 +37,67 @@ static void Equal(const Message &a, const Message &b) {
         Check(x == y, "payload bytes");
     }
 }
+static void TestSplitBudgets(int device) {
+    HostCache::Options options;
+    options.SetBudgets(20000, 18000);
+    Check(options.bytes == 20000 && options.swaBytes == 2000, "window remainder");
+    options.SetBudgets(20000, -1, 3000);
+    Check(options.bytes == 20000 && options.swaBytes == 3000, "KV remainder");
+    Fails([&] { options.SetBudgets(20000, 18000, 3000); });
+    Fails([&] { options.SetBudgets(0, -2, 3000); });
+    Check(options.bytes == 20000 && options.swaBytes == 3000, "invalid budget changed configuration");
+
+    for (bool windowPressure : {true, false}) {
+        const size_t kvLimit = windowPressure ? 1 << 20 : 16000;
+        const size_t windowLimit = windowPressure ? 513 : 1 << 16;
+        options.SetBudgets(0, kvLimit, windowLimit);
+        HostCache cache(options);
+        auto first = State(2, device);
+        auto next = State(2, device, "other");
+        auto publish = [&](int token, const CacheSnapshot &state) {
+            Check(cache.PublishAsync("split", {token}, state), "split publication not queued");
+            cache.Drain();
+        };
+        publish(1, first);
+        auto pinned = cache.Find("split", {1});
+        Check(bool(pinned), "first split entry missing");
+        publish(2, next);
+        Check(!cache.Find("split", {2}), "pinned entry let another class fund a partial hit");
+        Equal(first.state, Restore(cache, pinned, device));
+        pinned = {};
+        publish(2, next);
+        auto hit = cache.Find("split", {2});
+        Check(hit && !cache.Find("split", {1}), "budget pressure did not evict the old checkpoint");
+        Equal(next.state, Restore(cache, hit, device));
+        const auto stats = cache.Stats();
+        Check(stats.kvBytes > 8192 && stats.kvBytes <= kvLimit && stats.swaBytes >= 513 &&
+              stats.swaBytes <= windowLimit && stats.bytes == stats.kvBytes + stats.swaBytes,
+              "physical per-class limit exceeded");
+        hit = {};
+        auto tooBig = State(windowPressure ? 2 : 5, device);
+        if (windowPressure) {
+            tooBig.state.buffers[1] = Buffer::Allocate(514, device);
+            tooBig.payloads[1].regions[0].bytes = 514;
+        }
+        publish(3, tooBig);
+        Check(!cache.Find("split", {3}) && cache.Find("split", {2}) &&
+              cache.Stats().evictions == stats.evictions, "oversize entry displaced a usable checkpoint");
+    }
+    options.SetBudgets(0, 1 << 20, 0);
+    HostCache noWindows(options);
+    noWindows.PublishAsync("mixed", {1}, State(1, device));
+    noWindows.Drain();
+    Check(!noWindows.Find("mixed", {1}), "zero SWA cap admitted incomplete mixed state");
+    auto kvOnly = State(2, device);
+    kvOnly.state.buffers.resize(1); kvOnly.payloads.resize(1);
+    noWindows.PublishAsync("kv", {2}, kvOnly); noWindows.Drain();
+    Check(noWindows.Find("kv", {2}).Bytes() == 8192 && !noWindows.Stats().swaBytes, "KV-only hit");
+}
+
 int main(int argc, char **argv) {
     try {
         const int device = argc > 1 ? std::stoi(argv[1]) : -1;
+        TestSplitBudgets(device);
         HostCache cache({1 << 20, 1 << 20, 8192, 16, 2});
         auto a = State(2, device);
         Check(cache.PublishAsync("model/layout", {1, 2}, a), "publish"); cache.Drain();

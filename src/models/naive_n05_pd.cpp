@@ -655,6 +655,7 @@ fastkv::CacheSnapshot NaiveN05FlashModel::DescribePDCache(ResponseContext &conte
     size_t index = 0;
     auto describe = [&](const Data &key, const Data &storage, int rows, bool range, int width) {
         auto &payload = snapshot.payloads.at(index++);
+        payload.storage = range ? fastkv::CacheStorage::KV : fastkv::CacheStorage::Window;
         if (!range || !key.isPagedKVCache || !key.pagedKVCacheData) return;
         auto &owner = *key.pagedKVCacheData;
         const size_t rowBytes = GetDataBytes(storage.dataType, 1, width);
@@ -692,7 +693,9 @@ fastkv::CacheSnapshot NaiveN05FlashModel::DescribePDCache(ResponseContext &conte
             }
         }
     }
-    // Optional draft/recurrent state keeps the generic boundary-local descriptor.
+    // Draft checkpoints are boundary-local, like the SWA state.
+    for (; index < snapshot.payloads.size(); ++index)
+        snapshot.payloads[index].storage = fastkv::CacheStorage::Window;
 #endif
     return snapshot;
 }

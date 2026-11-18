@@ -1058,6 +1058,13 @@ class Fixture : public NaiveN05FlashModel {
                 context.preTokens = end;
                 auto state = ExportPDState(context);
                 auto snapshot = DescribePDCache(context,state);
+                const auto windows = std::count_if(snapshot.payloads.begin(), snapshot.payloads.end(),
+                    [](const auto &p) { return p.storage == fastkv::CacheStorage::Window; });
+                size_t swaTensors = 0;
+                for (int layer = 0; layer < block_cnt; ++layer)
+                    if (GetKVCacheRetainedTokens(layer) >= 0) swaTensors += 2 * PDRequestDevices(context).size();
+                if (draft ? size_t(windows) <= swaTensors : size_t(windows) != swaTensors)
+                    throw std::runtime_error("PD L2 window classification mismatch");
                 for (size_t i = 0; i < snapshot.payloads.size(); ++i)
                     for (const auto &region : snapshot.payloads[i].regions) if (!region.identity.empty()) {
                         auto entry = identities.emplace(region.identity,i);

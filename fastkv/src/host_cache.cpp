@@ -213,6 +213,22 @@ class Copier {
 };
 } // namespace
 
+void HostCache::Options::SetBudgets(size_t total, int64_t kv, int64_t swa) {
+    Require(kv >= -1 && swa >= -1, "FastKV: negative L2 budget");
+    if (kv < 0 && swa < 0) {
+        bytes = total;
+        swaBytes = -1;
+        return;
+    }
+    const size_t specified = CheckedAdd(size_t(std::max<int64_t>(0, kv)), size_t(std::max<int64_t>(0, swa)));
+    Require(!total || specified <= total, "FastKV: split L2 budgets exceed the total");
+    const size_t effective = (kv >= 0 && swa >= 0) || !total ? specified : total;
+    const size_t window = swa >= 0 ? size_t(swa) : effective - size_t(kv);
+    Require(window <= INT64_MAX, "FastKV: window budget out of range");
+    bytes = effective;
+    swaBytes = int64_t(window);
+}
+
 struct HostBlock { Buffer data; };
 struct HostIndex {
     struct Record { std::weak_ptr<HostBlock> block; size_t users = 0; };
@@ -234,14 +250,14 @@ struct HostIndexLease {
 };
 struct HostCache::Entry {
     struct Region { size_t offset; std::shared_ptr<HostBlock> block; };
-    struct Payload { size_t bytes; bool prefixRange; std::vector<Region> regions; };
+    struct Payload { size_t bytes; bool prefixRange; CacheStorage storage; std::vector<Region> regions; };
     std::shared_ptr<void> credit;
     std::unique_ptr<HostIndexLease> indexLease;
     std::string name;
     std::vector<int> tokens;
     Bytes metadata;
     std::vector<Payload> payloads;
-    size_t bytes = 0;
+    size_t bytes = 0, windowBytes = 0;
     uint64_t accessed = 0, hash = 0;
 };
 size_t HostCache::Hit::Tokens() const { return entry ? entry->tokens.size() : 0; }
@@ -253,8 +269,14 @@ size_t HostCache::Hit::Payloads() const { return entry ? entry->payloads.size() 
 
 struct HostCache::Impl {
     Options options;
-    Budget budget, inflight;
-    HostPool hostPool;
+    struct ResidentPool {
+        size_t limit;
+        Budget budget;
+        HostPool slabs;
+        explicit ResidentPool(size_t limit) : limit(limit), budget(limit, "host cache") {}
+    };
+    ResidentPool kv, window;
+    Budget inflight;
     std::mutex allocationMutex;
     std::map<int, std::unique_ptr<Budget>> destinationBudgets;
     mutable std::mutex mutex;
@@ -268,9 +290,11 @@ struct HostCache::Impl {
     std::map<size_t, std::unordered_multimap<uint64_t, std::shared_ptr<Entry>>> entries;
     // The index owns no data and is safe to outlive the cache through a Hit.
     std::shared_ptr<HostIndex> index = std::make_shared<HostIndex>();
-    explicit Impl(Options options) : options(options), budget(options.bytes, "host cache"),
+    explicit Impl(Options options) : options(options),
+                                    kv(options.bytes - size_t(std::max<int64_t>(0, options.swaBytes))),
+                                    window(size_t(std::max<int64_t>(0, options.swaBytes))),
                                     inflight(options.inflightBytes, "host cache transfers") {
-        Require(options.bytes && options.inflightBytes && options.stagingBytes && options.queueDepth &&
+        Require(options.swaBytes >= -1 && window.limit <= options.bytes && options.bytes && options.inflightBytes && options.stagingBytes && options.queueDepth &&
                     options.workers > 0 && options.workers <= 64, "FastKV: invalid host cache options");
         for (const auto &limit : options.restoreDeviceBytes) {
             Require(limit.first >= -1, "FastKV: invalid restore device");
@@ -318,10 +342,10 @@ struct HostCache::Impl {
         }
         return best;
     }
-    bool Evict() {
+    bool Evict(bool windowOnly = false) {
         std::shared_ptr<Entry> *victim = nullptr;
         for (auto &length : entries) for (auto &item : length.second)
-            if (item.second.use_count() == 1 && (!victim || item.second->accessed < (*victim)->accessed)) victim = &item.second;
+            if ((!windowOnly || item.second->windowBytes) && item.second.use_count() == 1 && (!victim || item.second->accessed < (*victim)->accessed)) victim = &item.second;
         if (!victim) return false;
         const size_t length = (*victim)->tokens.size();
         auto &bucket = entries.at(length);
@@ -332,32 +356,36 @@ struct HostCache::Impl {
     }
     std::shared_ptr<void> Reserve(size_t bytes) {
         std::lock_guard<std::mutex> lock(mutex);
-        while (bytes > options.bytes - budget.Used())
+        if (bytes > kv.limit) throw CapacityBusy("FastKV: metadata exceeds KV budget");
+        while (bytes > kv.limit - kv.budget.Used())
             if (!Evict()) throw CapacityBusy("FastKV: host cache pinned or full");
-        return budget.Reserve(bytes);
+        return kv.budget.Reserve(bytes);
     }
-    Buffer Allocate(size_t bytes, int device) {
+    Buffer Allocate(size_t bytes, int device, CacheStorage storage) {
+        const bool windowOnly = options.swaBytes >= 0 && storage == CacheStorage::Window;
+        auto &pool = windowOnly ? window : kv;
+        if (bytes > pool.limit) throw CapacityBusy("FastKV: payload exceeds its cache budget");
         // Serialize growth, not copying or lease release. Eviction may free
         // holes in an existing slab, so retry reuse after each evicted entry.
         std::lock_guard<std::mutex> allocationLock(allocationMutex);
         const auto &numa = NumaForDevice(device);
-        const size_t preferred = std::max(bytes, std::min(size_t(64) << 20, options.bytes / 16));
+        const size_t preferred = std::max(bytes, std::min(size_t(64) << 20, pool.limit / 16));
         for (;;) {
-            auto reused = hostPool.TryAllocate(bytes, numa.node);
+            auto reused = pool.slabs.TryAllocate(bytes, numa.node);
             if (reused.Size()) return reused;
             std::shared_ptr<void> credit;
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                const size_t available = options.bytes - budget.Used();
+                const size_t available = pool.limit - pool.budget.Used();
                 // Do not shrink new slabs to the last few free bytes: that
                 // would recreate unbounded small mappings near a full cache.
                 if (available >= preferred) {
-                    credit = budget.Reserve(preferred);
-                } else if (!Evict()) {
+                    credit = pool.budget.Reserve(preferred);
+                } else if (!Evict(windowOnly)) {
                     throw CapacityBusy("FastKV: host cache pinned or full");
                 }
             }
-            if (credit) return hostPool.Add(AllocateNumaHost(preferred, numa), std::move(credit), numa.node, bytes);
+            if (credit) return pool.slabs.Add(AllocateNumaHost(preferred, numa), std::move(credit), numa.node, bytes);
         }
     }
     bool Enqueue(size_t bytes, bool priority, std::function<void(Copier &, std::shared_ptr<void>)> job) {
@@ -377,9 +405,20 @@ struct HostCache::Impl {
         entry->hash = Namespace(name);
         for (int token : tokens) entry->hash = Hash(entry->hash, uint32_t(token));
         size_t metadata = sizeof(Entry) + sizeof(HostIndexLease) + name.size() + snapshot.state.metadata.size() + CheckedMul(tokens.size(), sizeof(int));
-        for (const auto &payload : snapshot.payloads) {
+        for (size_t i = 0; i < snapshot.payloads.size(); ++i) {
+            const auto &payload = snapshot.payloads[i];
+            const size_t bytes = snapshot.state.buffers[i].Size();
+            entry->bytes = CheckedAdd(entry->bytes, bytes);
+            if (payload.storage == CacheStorage::Window)
+                entry->windowBytes = CheckedAdd(entry->windowBytes, bytes);
             metadata = CheckedAdd(metadata, sizeof(Entry::Payload) + CheckedMul(payload.regions.size(), sizeof(Entry::Region) + sizeof(HostBlock) + 128));
             for (const auto &region : payload.regions) metadata = CheckedAdd(metadata, CheckedMul(region.identity.size() + name.size(), 2));
+        }
+        // An impossible checkpoint must not evict an otherwise reusable one.
+        if (options.swaBytes >= 0) {
+            const size_t kvBytes = CheckedAdd(metadata, entry->bytes - entry->windowBytes);
+            if (kvBytes > kv.limit || entry->windowBytes > window.limit)
+                throw CapacityBusy("FastKV: checkpoint exceeds its KV or SWA budget");
         }
         entry->credit = Reserve(metadata);
         std::vector<Copy> copies;
@@ -389,18 +428,19 @@ struct HostCache::Impl {
             std::equal(parent->tokens.begin(), parent->tokens.end(), tokens.begin()) && parent->payloads.size() == snapshot.payloads.size();
         for (size_t i = 0; i < snapshot.payloads.size(); ++i) {
             const auto &description = snapshot.payloads[i]; const auto &source = snapshot.state.buffers[i];
-            Entry::Payload payload{source.Size(), description.prefixRange, {}};
+            Entry::Payload payload{source.Size(), description.prefixRange, description.storage, {}};
             Buffer arena; size_t used = 0;
             for (size_t r = 0; r < description.regions.size(); ++r) {
                 const auto &region = description.regions[r];
                 std::shared_ptr<HostBlock> block;
-                const std::string key = region.identity.empty() ? std::string() : std::to_string(name.size()) + ":" + name + region.identity;
+                const std::string key = region.identity.empty() ? std::string() : std::to_string(name.size()) + ":" + name + (description.storage == CacheStorage::Window ? "W" : "K") + region.identity;
                 if (!key.empty()) {
                     std::lock_guard<std::mutex> lock(index->mutex);
                     auto found = index->blocks.find(key); if (found != index->blocks.end()) block = found->second.block.lock();
                     Require(!block || block->data.Size() == region.bytes, "FastKV: immutable region changed size");
                 }
-                if (!block && inherit && description.prefixRange && parent->payloads[i].prefixRange) {
+                if (!block && inherit && description.prefixRange && parent->payloads[i].prefixRange &&
+                    parent->payloads[i].storage == description.storage) {
                     const auto &old = parent->payloads[i].regions;
                     auto it = std::lower_bound(old.begin(), old.end(), region.offset,
                         [](const Entry::Region &v, size_t at) { return v.offset < at; });
@@ -415,7 +455,7 @@ struct HostCache::Impl {
                             if (description.regions[j].bytes > (2 << 20) - bytes) break;
                             bytes += description.regions[j].bytes;
                         }
-                        arena = Allocate(bytes, source.Device()); used = 0;
+                        arena = Allocate(bytes, source.Device(), description.storage); used = 0;
                     }
                     auto target = arena.Slice(used, region.bytes); used += region.bytes;
                     AddCopy(copies, source.Slice(region.offset, region.bytes), target);
@@ -424,7 +464,6 @@ struct HostCache::Impl {
                 payload.regions.push_back({region.offset, block});
                 if (!key.empty()) newBlocks.emplace_back(key, block);
             }
-            entry->bytes = CheckedAdd(entry->bytes, payload.bytes);
             entry->payloads.push_back(std::move(payload));
         }
         copier.Run(copies);
@@ -560,7 +599,11 @@ bool HostCache::RestoreAsync(Hit hit, std::vector<int> devices, std::future<Mess
 }
 HostCache::Statistics HostCache::Stats() const {
     std::lock_guard<std::mutex> lock(impl->mutex);
-    auto stats = impl->stats; stats.bytes = impl->budget.Used(); stats.inflightBytes = impl->inflight.Used();
+    auto stats = impl->stats;
+    const size_t kv = impl->kv.budget.Used(), window = impl->window.budget.Used();
+    stats.bytes = kv + window;
+    if (impl->options.swaBytes >= 0) { stats.kvBytes = kv; stats.swaBytes = window; }
+    stats.inflightBytes = impl->inflight.Used();
     stats.queued = impl->queue.size() + impl->restores.size() + impl->running;
     for (const auto &bucket : impl->entries) stats.entries += bucket.second.size();
     return stats;

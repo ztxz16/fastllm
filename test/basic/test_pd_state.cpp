@@ -669,7 +669,7 @@ static void TestPrefillBatch() {
     BatchStateModel model;
     Check(model.SetPrefillBatching(4, 50, 4), "configure PD batch policy");
     model.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "test"},
-        {"transport", "tcp"}, {"listen", endpoint}, {"cache_bytes", 65536}, {"chunk_tokens", 2}, {"transfer_workers", 1}});
+        {"transport", "tcp"}, {"listen", endpoint}, {"cache_kv_bytes", 65536}, {"cache_swa_bytes", 0}, {"chunk_tokens", 2}, {"transfer_workers", 1}});
     fastkv::Options options; options.transport = fastkv::Transport::Tcp; options.workers = 8;
     fastkv::Service client(options);
     auto call = [&](const std::vector<int> &tokens) {

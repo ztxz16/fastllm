@@ -1147,11 +1147,19 @@ void basellm::ConfigurePD(const json11::Json &config) {
         if (config["chunk_tokens"].is_number())
             runtime->chunk = config["chunk_tokens"].int_value();
         Check(runtime->chunk > 0 && runtime->chunk <= max_positions, "invalid prefill chunk size");
-        const double cacheBytes = config["cache_bytes"].number_value();
-        Check(cacheBytes >= 0 && cacheBytes <= double(size_t(1) << 40), "invalid prefix cache byte limit");
-        if (cacheBytes > 0) {
-            fastkv::HostCache::Options host;
-            host.bytes = size_t(cacheBytes);
+        auto cacheLimit = [&](const char *key, int64_t fallback) -> int64_t {
+            const auto &value = config[key];
+            if (value.is_null()) return fallback;
+            const double n = value.number_value();
+            Check(value.is_number() && n >= 0 && n <= double(1ULL << 40) && n == int64_t(n),
+                  "prefix cache budgets must be integer byte counts in [0, 1 TiB]");
+            return int64_t(n);
+        };
+        fastkv::HostCache::Options host;
+        host.SetBudgets(cacheLimit("cache_bytes", 0), cacheLimit("cache_kv_bytes", -1),
+                        cacheLimit("cache_swa_bytes", -1));
+        Check(host.bytes <= (1ULL << 40), "total prefix cache budget exceeds 1 TiB");
+        if (host.bytes) {
             host.inflightBytes = options.maxInflightBytes / 2;
             for (const auto &limit : options.deviceBufferBytes) host.restoreDeviceBytes[limit.first] = limit.second / 2;
             if (!config["cache_workers"].is_null()) {

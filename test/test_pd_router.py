@@ -103,7 +103,8 @@ class ConfigurationTest(unittest.TestCase):
     def test_host_cache_configuration_is_prefill_only(self):
         with tempfile.TemporaryDirectory() as directory:
             config = configuration(directory)
-            config['prefill'][0].update(cache_bytes=16 << 30, cache_workers=3)
+            config['prefill'][0].update(cache_bytes=16 << 30, cache_workers=3,
+                                        cache_kv_bytes=12 << 30, cache_swa_bytes=4 << 30)
             path = Path(directory) / 'config.json'
             path.write_text(json.dumps(config))
             loaded = load_config(path)
@@ -111,8 +112,16 @@ class ConfigurationTest(unittest.TestCase):
             decode = json.loads(loaded['decode'][0]['command'][-1])
             self.assertEqual(prefill['cache_bytes'], 16 << 30)
             self.assertEqual(prefill['cache_workers'], 3)
+            for key, limit in [('cache_kv_bytes', 12 << 30), ('cache_swa_bytes', 4 << 30)]:
+                self.assertEqual(prefill[key], limit)
+                self.assertNotIn(key, decode)
             self.assertNotIn('cache_bytes', decode)
             self.assertNotIn('cache_workers', decode)
+            config['prefill'][0]['cache_kv_bytes'] += 1
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(ValueError, 'exceed'):
+                load_config(path)
+            config['prefill'][0]['cache_kv_bytes'] -= 1
             for invalid in (True, 0, -1, 65, 1.5, '4'):
                 config['prefill'][0]['cache_workers'] = invalid
                 path.write_text(json.dumps(config))

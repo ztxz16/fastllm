@@ -226,6 +226,18 @@ def _arg_enabled(value) -> bool:
         return False
     return str(value).strip().lower() not in ["", "false", "0", "off", "none", "disable"]
 
+def prefix_cache_budget(total, kv=None, swa=None):
+    """Validate public byte counts and return the effective resident L2 limit."""
+    limits = [total] + [limit for limit in (kv, swa) if limit is not None]
+    if any(type(limit) is not int or not 0 <= limit < (1 << 63) for limit in limits):
+        raise ValueError("L2 budgets must be nonnegative integer byte counts")
+    specified = (kv or 0) + (swa or 0)
+    if total and specified > total:
+        raise ValueError("KV and SWA L2 budgets exceed the total")
+    if kv is not None and swa is not None:
+        return specified
+    return total or specified
+
 def _cuda_device_count() -> int:
     try:
         result = subprocess.run(["nvidia-smi", "-L"],
