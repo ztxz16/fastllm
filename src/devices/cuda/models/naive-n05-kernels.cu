@@ -57,6 +57,9 @@
 #include "naive-n05-dsa-mma.cuh"
 #ifdef FASTLLM_NAIVE_BATCH_INDEXER
 #include "naive-n05-indexer-staged.cuh"
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
+#include "naive-n05-indexer-sm100.cuh"
+#endif
 #if CUDART_VERSION >= 12040
 #include "naive-n05-indexer-compact.cuh"
 #endif
@@ -5171,8 +5174,12 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     auto pagedShardCapacity = [&](int capacity) {
         return ((capacity + contextPageLen - 1) / contextPageLen) * (contextPageLen / contextRanks);
     };
-    bool hopper = FastllmCudaRuntimeArch() == 90;
+    const int arch = FastllmCudaRuntimeArch();
+    const bool blackwell = !cp && (arch == 100 || arch == 103);
     const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
+    bool nativeScores = arch == 90 || (blackwell && rows.size() >= 8 &&
+        (cacheType == BFLOAT16 || cacheType == FP8_E4M3) &&
+        BulkKernelSupported(batch::HopperScores<false>, 0, 80));
     for (const auto &row : rows) {
         if (!row.key || !row.scratch || !row.indices || !FastllmNaiveKVType(row.key->dataType) ||
             row.key->dims.size() != 3 || row.key->dims[2] <
@@ -5184,10 +5191,10 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
         if (direct && width < std::min(naive_topk::kTopK, pagedShardCapacity(row.capacity))) return false;
         // cp.async copies 16 bytes; FP8 therefore needs twice as many elements.
-        hopper = hopper && row.key->dataType == cacheType &&
+        nativeScores = nativeScores && row.key->dataType == cacheType &&
             row.key->kvCacheFp8Indexer == rows.front().key->kvCacheFp8Indexer &&
             row.key->dims[2] % (cacheType == FP8_E4M3 ? 16 : 8) == 0 &&
-            (uintptr_t)row.key->cudaData % 16 == 0;
+            (uintptr_t)FastllmNaiveKV(*row.key).base % 16 == 0;
     }
 
     auto prepareRow = [&](int index) {
@@ -5213,7 +5220,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
 #if CUDART_VERSION >= 12040
     // Only combine descriptor chunks for the validated large Hopper CP4
     // paged-FP8 layout. Small batches and other layouts keep their old path.
-    compactScores = hopper && cacheType == FP8_E4M3 && cp && contextRanks == 4 &&
+    compactScores = nativeScores && cacheType == FP8_E4M3 && cp && contextRanks == 4 &&
         contextPageLen == 128 && rows.size() > batch::BatchLimit &&
         rows.size() <= naive_indexer_compact::CompactLimit;
     for (const auto &row : rows)
@@ -5264,7 +5271,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     for (const auto &row : rows) localCapacity = std::max(localCapacity, row.capacity);
     if (contextPageLen) localCapacity = pagedShardCapacity(localCapacity);
     constexpr size_t localSortBytes = naive_indexer_sortpack::SortBytes<256, 5, true>();
-    const bool compactTopK = hopper && contextRanks == 4 && contextPageLen && rows.size() >= 128 &&
+    const bool compactTopK = nativeScores && contextRanks == 4 && contextPageLen && rows.size() >= 128 &&
         localCapacity > 16384 && localCapacity <= 65536 &&
         BulkKernelSupported(naive_indexer_wide_select::SelectWide<batch::LocalTopKBatch>, 0, 90) &&
         BulkKernelSupported(naive_indexer_sortpack::SortPack<256, 5, true, true, batch::LocalTopKBatch>,
@@ -5275,7 +5282,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
 
     std::vector<int> rowOrder;
     int pairedRows = 0;
-    if (!cp && hopper && cacheType == BFLOAT16 &&
+    if (!cp && arch == 90 && cacheType == BFLOAT16 &&
             !rows.front().key->kvCacheFp8Indexer && rows.size() >= 16) {
         std::vector<int> singles;
         rowOrder.reserve(rows.size());
@@ -5297,13 +5304,14 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         const bool pairChunk = first < pairedRows;
         int count = std::min(pairChunk ? (batch::BatchLimit / 2) * 2 : batch::BatchLimit,
             (pairChunk ? pairedRows : (int)rows.size()) - first);
+        if (blackwell) count = std::min(count, 128);
         int sharedQueries = 1;
 #if CUDART_VERSION >= 12040
         // Reuse one K tile across adjacent verification queries. Keep row
         // order intact for CP exchange; ragged groups and other layouts fall
         // back to the single-query kernel. Paged CP has a common local origin;
         // contiguous CP can change Begin() with each device length.
-        if (!compactScores && hopper && cacheType == FP8_E4M3 && rows.size() >= 16 &&
+        if (!compactScores && nativeScores && (cacheType == FP8_E4M3 || (blackwell && rows.front().key->kvCacheFp8Indexer)) && rows.size() >= 16 &&
                 (!cp || contextPageLen) && rowOrder.empty()) {
             for (int queries : {4, 2}) {
                 const int aligned = count / queries * queries;
@@ -5342,26 +5350,42 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             bool paired = pairChunk && count >= 16;
             paired = paired && BulkKernelSupported(pairedKernel, 0, 90);
             const int scoreBlocks = DecodeIndexerScoreBlocks(paired ? count / 2 : count / sharedQueries,
-                (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, hopper && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
+                (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, blackwell && nativeScores ? 7 :
+                    nativeScores && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
             const dim3 grid(scoreBlocks, paired ? count / 2 : count / sharedQueries);
-            if (paired) {
-                pairedKernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
-            } else
-    #if CUDART_VERSION >= 12040
-            // Check the compiled PTX image as well as the runtime GPU: an SM80
-            // image JITed on Hopper must retain the original compatible path.
-            if (hopper && cacheType == FP8_E4M3 && rows.size() >= 16 &&
-                BulkKernelSupported(batch::HopperScoresSharedHead<>, 0, 90)) {
-                auto kernel = sharedQueries == 4 ? batch::HopperScoresSharedHead<4> :
-                    sharedQueries == 2 ? batch::HopperScoresSharedHead<2> : batch::HopperScoresSharedHead<>;
-                kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
-            } else
-    #endif
-            if (hopper) {
-                auto kernel = fp8Keys ? batch::HopperScores<true, (CUDART_VERSION >= 12040)> : batch::HopperScores<false>;
-                kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+            bool blackwellScores = false;
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
+            if (blackwell && nativeScores && sharedQueries == 1) {
+                naive_indexer_sm100::Row entries[naive_indexer_sm100::BatchLimit];
+                for (int i = 0; i < count; ++i) {
+                    const auto &r = descriptors.rows[i];
+                    entries[i] = {r.key, r.live, r.query, r.scale, r.scores, r.sequence, r.stride, r.cache};
+                }
+                blackwellScores = FastllmCudaNaiveIndexerSm100(entries, count, capacity,
+                    (const BF16 *)weights.cudaData, cudaStreamPerThread);
             }
-            else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
+#endif
+            if (!blackwellScores) {
+                if (paired) {
+                    pairedKernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+                } else
+#if CUDART_VERSION >= 12040
+                // Check the compiled PTX image as well as the runtime GPU: an SM80
+                // image JITed on Hopper must retain the original compatible path.
+                if (nativeScores && (cacheType == FP8_E4M3 || (blackwell && fp8Keys)) && (rows.size() >= 16 || blackwell) &&
+                    BulkKernelSupported(batch::HopperScoresSharedHead<>, 0, 90)) {
+                    auto kernel = sharedQueries == 4 ? batch::HopperScoresSharedHead<4> :
+                        sharedQueries == 2 ? batch::HopperScoresSharedHead<2> : batch::HopperScoresSharedHead<>;
+                    kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+                } else
+#endif
+                if (nativeScores) {
+                    auto kernel = fp8Keys ? batch::HopperScores<true, (CUDART_VERSION >= 12040)> : batch::HopperScores<false>;
+                    kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+                } else {
+                    batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
+                }
+            }
         }
 #if CUDART_VERSION >= 12040
         if (compactTopK) {
@@ -5393,9 +5417,10 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         // Fuse exact threshold selection and stable sorting. Refining to 2048
         // candidates pays off for short contexts; longer rows keep 4096 slots.
         // CP layouts, long contexts and unsupported images retain their paths.
-        if (!cp && hopper && rows.size() >= 16 && capacity <= 16384) {
+        if (!cp && (blackwell || (nativeScores && rows.size() >= 16)) && capacity <= 16384) {
             namespace sortpack = naive_indexer_sortpack;
-            auto kernel = capacity <= 4096 ? sortpack::SelectSort<2048> : sortpack::SelectSort<4096>;
+            auto kernel = capacity <= 4096 ? sortpack::SelectSort<2048> :
+                blackwell ? sortpack::SelectSort<4096, true> : sortpack::SelectSort<4096>;
             const size_t bytes = capacity <= 4096 ? sortpack::SortBytes<256, 5, true, false, 2048>()
                                                   : sortpack::SortBytes<256, 5, true, false, 4096>();
             if (BulkKernelSupported(kernel, bytes, 90)) {
@@ -5426,7 +5451,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             continue;
         }
         bool packed = false;
-        if (cp && contextRanks == 4 && contextPageLen && hopper && rows.size() >= 16) {
+        if (cp && contextRanks == 4 && contextPageLen && nativeScores && rows.size() >= 16) {
             namespace sortpack = naive_indexer_sortpack;
             if (rows.size() >= 128) {
                 constexpr size_t bytes = sortpack::SortBytes<256, 5, true>();
@@ -5445,7 +5470,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         // Independent verification rows need only the sorted indices. Reuse
         // the stable cooperative sort without CP packing; unsupported images
         // and small batches keep the existing generic implementation.
-        if (!cp && hopper && rows.size() >= 16) {
+        if (!cp && nativeScores && rows.size() >= 16) {
             namespace sortpack = naive_indexer_sortpack;
             constexpr size_t bytes = sortpack::SortBytes<256, 5, true, false>();
             if (BulkKernelSupported(sortpack::SortPack<256, 5, true, false>, bytes, 90)) {

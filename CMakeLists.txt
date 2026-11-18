@@ -897,7 +897,22 @@ if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     endif()
 endif()
 
+# Native Blackwell Indexer; no Python compiler or additional runtime library.
 if ("100" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+    add_library(fastllm_naive_indexer_sm100 OBJECT src/devices/cuda/models/naive-n05-indexer-sm100.cu)
+    set_target_properties(fastllm_naive_indexer_sm100 PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_naive_indexer_sm100 BEFORE PRIVATE "${FASTLLM_CUTLASS_DIR}/include")
+    foreach(arch IN ITEMS 100 103)
+        if ("${arch}" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+            target_compile_options(fastllm_naive_indexer_sm100 PRIVATE "--generate-code=arch=compute_${arch}a,code=sm_${arch}a")
+        endif()
+    endforeach()
+    target_compile_options(fastllm_naive_indexer_sm100 PRIVATE "--expt-relaxed-constexpr")
+    set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_INDEXER_SM100)
+    set(FASTLLM_NAIVE_INDEXER_OBJECTS $<TARGET_OBJECTS:fastllm_naive_indexer_sm100>)
+
     add_library(fastllm_dsa_blackwell OBJECT src/devices/cuda/models/naive-n05-dsa-blackwell.cu)
     set_target_properties(fastllm_dsa_blackwell PROPERTIES
         CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
@@ -986,7 +1001,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_DSA_BLACKWELL_OBJECTS} ${FASTLLM_MXFP8_LINEAR_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_DSA_BLACKWELL_OBJECTS} ${FASTLLM_NAIVE_INDEXER_OBJECTS} ${FASTLLM_MXFP8_LINEAR_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -1001,6 +1016,9 @@ add_library(fastllm OBJECT
 # Compile the core once for executables and the Python shared library.
 set_target_properties(fastllm PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
+if (TARGET fastllm_naive_indexer_sm100)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_NAIVE_INDEXER_OBJECTS})
+endif()
 if (TARGET fastllm_dsa_blackwell)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_DSA_BLACKWELL_OBJECTS})
 endif()
@@ -2350,6 +2368,16 @@ if (UNIT_TEST)
                 add_test(NAME cuda_fp8_perchannel_dispatch COMMAND cuda_fp8_perchannel_dispatch_test)
                 set_tests_properties(cuda_fp8_perchannel_dispatch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77)
             endif()
+        endif()
+
+        if (TARGET fastllm_naive_indexer_sm100)
+            add_executable(naive_n05_indexer_sm100_test test/basic/test_naive_n05_indexer_sm100.cu
+                ${FASTLLM_NAIVE_INDEXER_OBJECTS})
+            set_target_properties(naive_n05_indexer_sm100_test PROPERTIES CUDA_STANDARD 17)
+            target_link_libraries(naive_n05_indexer_sm100_test PRIVATE cuda)
+            add_test(NAME naive_n05_indexer_sm100 COMMAND naive_n05_indexer_sm100_test)
+            set_tests_properties(naive_n05_indexer_sm100 PROPERTIES LABELS cuda
+                SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         endif()
 
         if (FASTLLM_CUDA_SM90_SOURCES)
