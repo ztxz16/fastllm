@@ -180,7 +180,7 @@ bash test/distributed/run_attention_ep_v100.sh performance
 计时前提交4个请求准备缓存。输出历史、缓存复用及Graph路径检查在计时区外执行，
 检查失败仍返回非零。加速比是同配置Eager耗时/当前模式耗时，不是相对HF或vLLM。
 
-每个输入长度单独登记18项，保存原始样本及JSON/Markdown/CSV/XLSX汇总；中途停止保留
+默认每个输入长度单独登记18项，保存原始样本及JSON/Markdown/CSV/XLSX汇总；中途停止保留
 部分结果并标记未完成。目录仍使用`时间戳_moe_full_随机号/`，不会覆盖历史结果。
 直接使用Python入口的`--performance`具有相同语义；省略`--model`时只准备一个
 FP16合成小模型供测速，不附带完整合成验收。非默认对齐策略或候选阈值不能与测速混用。
@@ -201,6 +201,31 @@ bash test/distributed/run_attention_ep_v100.sh performance
 Python入口对应`--performance-prompt-lengths 512 1024 1792 --performance-output-tokens 128`。
 输入长度必须为正且不重复，输出至少2个Token；输入长度+输出长度-1必须不超过正式
 入口的2048容量限制。未满足这些条件会在加载模型前拒绝。
+
+若性能用例提示`benchmark modes used different output histories`，比较的是FastLLM
+Eager与Graph的实际生成Token，不是HF对齐，也不能直接认定为可接受的近似同分。
+失败用例仍保存`case名称.json`：包含已完成轮次的原始Token、每Token执行路径、rank、
+耗时样本及错误原因；`comparison.first_divergence`定位轮次/提交序号/Token位置（均从1开始）。
+`eager_reference_file`指向同配置Eager证据，`output_variant_count`和
+`within_mode_vs_first_request`观察相同请求在本模式内是否产生不同输出，仅作诊断。
+分歧后的不同Token位置也计入数量，不代表逐位置同历史数值差异。
+原始证据在计时结束或异常清理后落盘，不启用计时区内trace；校验失败仍返回非零，
+不输出该失败case的有效加速比。旧版本未保存的失败输出无法事后恢复，原FAIL报告保留。
+
+可先定向复测一组配置，自动包含对应的Eager与Graph各一项、各5轮：
+
+```bash
+ATTENTION_EP_PERF_PROMPT_LENGTHS=1024 \
+ATTENTION_EP_PERF_OUTPUT_TOKENS=128 \
+ATTENTION_EP_PERF_CACHE_STATES=off \
+ATTENTION_EP_PERF_CONCURRENCIES=4 \
+bash test/distributed/run_attention_ep_v100.sh performance
+```
+
+缓存筛选默认`off cold hot`，并发筛选默认`1 4 8`；Python入口对应
+`--performance-cache-states off --performance-concurrencies 4`。报告登记所选范围和预期
+用例数，`performance_matrix_complete=false`表示仅覆盖子集；子集PASS不能替代完整矩阵，
+复测未重现也不能覆盖历史失败。复测保持原请求、调度、缓存和路径规则，不自动重试。
 
 ### 四项联合验收
 

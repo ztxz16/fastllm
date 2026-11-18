@@ -13,7 +13,8 @@ import run_qwen_moe_full as runner
 
 
 class PerformanceTests(unittest.TestCase):
-    def run_performance(self, *, synthetic=False, fault=None, prompt_lengths=None, output_tokens=None):
+    def run_performance(self, *, synthetic=False, fault=None, prompt_lengths=None, output_tokens=None,
+                        cache_states=None, concurrencies=None):
         """/** 走真实CLI、测速循环和四格式报告，只替换GPU会话及外部环境探测。 */"""
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -28,6 +29,10 @@ class PerformanceTests(unittest.TestCase):
                 argv += ['--performance-prompt-lengths', *map(str, prompt_lengths)]
             if output_tokens is not None:
                 argv += ['--performance-output-tokens', str(output_tokens)]
+            if cache_states is not None:
+                argv += ['--performance-cache-states', *cache_states]
+            if concurrencies is not None:
+                argv += ['--performance-concurrencies', *map(str, concurrencies)]
             lengths, generated = prompt_lengths or [32], output_tokens or 16
             sessions, snapshots = [], []
             original_save = runner.save_report
@@ -43,9 +48,13 @@ class PerformanceTests(unittest.TestCase):
                 states = [dict(captures=int(graph), replays=int(graph and fault != 'graph'),
                                reserved_kv_bytes=128, workspace_bytes=64,
                                prefix_cache=dict(device_bytes=32)) for _ in range(4)]
+                calls = []
 
                 def generate(request, teacher_forced_tokens=None):
                     """/** 返回固定长度的生成结果，不提供HF参考或logits。 */"""
+                    calls.append(request)
+                    if fault == 'generation' and not graph and len(calls) == 4:
+                        raise RuntimeError('injected generation failure')
                     self.assertIsNone(teacher_forced_tokens)
                     length = len(request['token_ids'])
                     self.assertIn(length, lengths)
@@ -59,9 +68,12 @@ class PerformanceTests(unittest.TestCase):
                     return dict(token_ids=[token] * count,
                                 dp_rank=0, queue_ms=.01,
                                 states=[dict(prefix_cache=dict(last_reused_tokens=reused))],
-                                steps=[dict(elapsed_ms=index + .1) for index in range(count)])
+                                steps=[dict(elapsed_ms=index + .1, execution='decode_cuda_graph' if graph else 'eager')
+                                       for index in range(count)])
 
                 return nullcontext(SimpleNamespace(generate=generate, _states=states,
+                                                    output=root / f'mock-session-{len(sessions)}',
+                                                    shutdown=dict(shutdown_complete=True),
                                                     clear_prefix_cache=mock.Mock()))
 
             def save(output, rows, metadata):
@@ -91,6 +103,12 @@ class PerformanceTests(unittest.TestCase):
             output, = (root / 'out').iterdir()
             for suffix in ('json', 'md', 'csv', 'xlsx'):
                 self.assertTrue((output / f'summary.{suffix}').is_file())
+            self.evidence = {}
+            for row in snapshots[-1]['cases']:
+                if row['case'].startswith('perf_'):
+                    path = output / (row['case'] + '.json')
+                    self.assertTrue(path.is_file(), row['case'])
+                    self.evidence[row['case']] = json.loads(path.read_text())
             if fault is None:
                 csv = (output / 'summary.csv').read_text()
                 self.assertIn('prompt_length', csv)
@@ -172,6 +190,59 @@ class PerformanceTests(unittest.TestCase):
         self.assertFalse(snapshots[-1]['complete'])
         self.assertEqual(snapshots[-1]['expected_case_count'], 18)
         self.assertEqual(snapshots[-1]['cases'][0]['status'], 'PASS')
+        interrupted = self.evidence[snapshots[-1]['cases'][1]['case']]
+        self.assertIn('interrupted', interrupted['error'])
+
+    def test_targeted_recheck_keeps_both_modes_and_saves_first_divergence(self):
+        """/** 定向复测只运行匹配的两种模式，失败Token及完整五轮证据仍写盘且无有效加速比。 */"""
+        code, snapshots, console = self.run_performance(
+            prompt_lengths=[1024], output_tokens=128, cache_states=['off'], concurrencies=[4], fault='output')
+        self.assertEqual(code, 1)
+        result = snapshots[-1]
+        self.assertTrue(result['complete'])
+        self.assertEqual(result['expected_case_count'], 2)
+        self.assertFalse(result['metadata']['performance_matrix_complete'])
+        self.assertEqual([row['status'] for row in result['cases']], ['PASS', 'FAIL'])
+        eager, graph = [self.evidence[row['case']] for row in result['cases']]
+        self.assertEqual(len(graph['samples_ms']), 5)
+        self.assertEqual([len(batch) for batch in graph['responses']], [4] * 5)
+        self.assertEqual(Path(graph['eager_reference_file']).name, result['cases'][0]['case'] + '.json')
+        comparison = graph['comparison']
+        self.assertFalse(comparison['match'])
+        self.assertEqual(comparison['mismatched_requests'], 20)
+        self.assertEqual(comparison['token_mismatches'], 20 * 128)
+        first = comparison['first_divergence']
+        self.assertEqual((first['repeat_1based'], first['request_1based'], first['first_token_1based']), (1, 1, 1))
+        self.assertEqual(first['expected_token'], eager['responses'][0][0]['token_ids'][0])
+        self.assertEqual(first['actual_token'], graph['responses'][0][0]['token_ids'][0])
+        self.assertEqual(first['actual_execution'], 'decode_cuda_graph')
+        self.assertEqual(first['expected_execution'], 'eager')
+        self.assertNotIn('summary', graph)
+        self.assertIn('first_divergence=', console)
+
+    def test_generation_failure_preserves_completed_batches(self):
+        """/** 原生调用中途失败仍保存此前完成的轮次，Graph不能把失败Eager当有效基线。 */"""
+        code, snapshots, _ = self.run_performance(cache_states=['off'], concurrencies=[1], fault='generation')
+        self.assertEqual(code, 1)
+        rows = snapshots[-1]['cases']
+        eager = self.evidence[rows[0]['case']]
+        self.assertEqual(len(eager['samples_ms']), 2)
+        self.assertEqual(len(eager['responses']), 2)
+        self.assertIn('injected generation failure', eager['error'])
+        self.assertIn('Eager baseline failed or is missing', rows[1]['reason'])
+
+    def test_differences_preserve_submission_order_and_length_mismatches(self):
+        """/** 比较不按rank或Token排序掩盖差异；缺失轮次和截断输出均保持失败。 */"""
+        reference = dict(token_ids=[10, 20, 30], dp_rank=2, steps=[dict(execution='eager')] * 3)
+        actual = dict(token_ids=[10, 21], dp_rank=1, steps=[dict(execution='decode_cuda_graph')] * 2)
+        comparison = runner.performance_token_differences([[reference], [reference, actual]],
+                                                          [[reference], [reference, reference]])
+        first = comparison['first_divergence']
+        self.assertEqual((first['repeat_1based'], first['request_1based'], first['first_token_1based']), (2, 2, 2))
+        self.assertEqual((first['actual_rank'], first['expected_rank']), (1, 2))
+        self.assertEqual(comparison['token_mismatches'], 2)
+        self.assertFalse(comparison['match'])
+        self.assertFalse(runner.performance_token_differences([[]], [])['match'])
 
     def test_alignment_options_are_rejected_with_performance(self):
         """/** 显式非默认对齐选项不能在性能模式中被忽略或触发隐藏的对齐阶段。 */"""
@@ -193,7 +264,12 @@ class PerformanceTests(unittest.TestCase):
                       ['--performance', '--performance-output-tokens', '1'],
                       ['--performance', '--performance-output-tokens', '0'],
                       ['--performance', '--performance-prompt-lengths', '1922', '--performance-output-tokens', '128'],
-                      ['--performance-prompt-lengths', '512'], ['--performance-output-tokens', '128']):
+                      ['--performance-prompt-lengths', '512'], ['--performance-output-tokens', '128'],
+                      ['--performance-cache-states', 'off'], ['--performance-concurrencies', '4'],
+                      ['--performance', '--performance-cache-states', 'off', 'off'],
+                      ['--performance', '--performance-concurrencies', '4', '4'],
+                      ['--performance', '--performance-concurrencies', '0'],
+                      ['--performance', '--performance-cache-states', 'invalid']):
             with self.subTest(extra=extra), mock.patch('sys.argv', base + extra), \
                     mock.patch.object(runner, 'Suite') as suite, redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as error:

@@ -4,6 +4,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from itertools import zip_longest
 import json
 import math
 import os
@@ -60,6 +61,39 @@ def batch(session, requests, forced=None):
         futures = [pool.submit(session.generate, r, teacher_forced_tokens=None if forced is None else forced[i][:-1])
                    for i, r in enumerate(requests)]
         return [f.result() for f in futures]
+
+
+def performance_token_differences(actual, expected):
+    """/**
+     * 按提交顺序比较测速输出，记录每个请求的首次分歧，不重排请求或放宽Token判定。
+     * 分歧后的不一致位置也计入数量，但不解释为同历史数值误差；本函数不运行推理。
+     * @param actual 待检查模式的多轮请求报告，形状为[轮次][提交序号]。
+     * @param expected 同工作量的参考模式报告，或用于观察模式内波动的首请求副本。
+     * @return 严格匹配状态、不同请求/Token位置数量，以及Token、rank和执行路径证据。
+     */"""
+    differences = []
+    same_shape = len(actual) == len(expected)
+    for repeat, (got_batch, ref_batch) in enumerate(zip_longest(actual, expected, fillvalue=[]), 1):
+        same_shape = same_shape and len(got_batch) == len(ref_batch)
+        for index, (got, ref) in enumerate(zip_longest(got_batch, ref_batch, fillvalue={}), 1):
+            got_ids, ref_ids = got.get('token_ids'), ref.get('token_ids')
+            if got_ids == ref_ids:
+                continue
+            mismatch = [i for i, (a, b) in enumerate(zip_longest(got_ids or [], ref_ids or [])) if a != b]
+            first = mismatch[0] if mismatch else None
+            item = dict(repeat_1based=repeat, request_1based=index,
+                        first_token_1based=None if first is None else first + 1,
+                        token_mismatches=len(mismatch), actual_length=None if got_ids is None else len(got_ids),
+                        expected_length=None if ref_ids is None else len(ref_ids))
+            for side, report in (('actual', got), ('expected', ref)):
+                ids, steps = report.get('token_ids', []), report.get('steps', [])
+                item[side + '_token'] = ids[first] if first is not None and first < len(ids) else None
+                item[side + '_rank'] = report.get('dp_rank')
+                item[side + '_execution'] = steps[first].get('execution') if first is not None and first < len(steps) else None
+            differences.append(item)
+    return dict(match=same_shape and not differences, same_shape=same_shape,
+                mismatched_requests=len(differences), token_mismatches=sum(d['token_mismatches'] for d in differences),
+                first_divergence=differences[0] if differences else None, differences=differences)
 
 
 def compare_trace(report, reference, metrics, atol, rtol, label):
@@ -152,8 +186,8 @@ class Suite:
             performance='end-to-end concurrent batch including admission and KV release; no token logs/trace; Eager/Graph use identical requests and EOS policy',
             report_title='Attention DP + EP full model')
 
-    def case(self, name, action):
-        """/** action共享误差累计器；异常和已完成输出保留在独立case文件内。 */"""
+    def case(self, name, action, *, failure_evidence=None):
+        """/** action共享误差累计器；可选failure_evidence在异常或中断后保存已采集证据。 */"""
         row = dict(case=name, backend=BACKEND, status='FAIL', max_abs_error=None, mean_abs_error=None,
                    failed_elements=0, reason='')
         metrics = dict(max=0.0, sum=0.0, count=0, failed=0)
@@ -166,6 +200,9 @@ class Suite:
         except Exception as error:
             row['reason'] = f'{type(error).__name__}: {error}'
         finally:
+            if row['status'] == 'FAIL' and failure_evidence is not None:
+                failure_evidence['error'] = row['reason'] or 'case interrupted before completion'
+                (self.output / (name + '.json')).write_text(json.dumps(failure_evidence, indent=2, allow_nan=False))
             if metrics['count']:
                 row.update(max_abs_error=metrics['max'], mean_abs_error=metrics['sum']/metrics['count'])
             row['failed_elements'] = metrics['failed'] or int(row['status'] == 'FAIL')
@@ -510,31 +547,48 @@ class Suite:
          * @return 无；任一性能用例失败保留FAIL行，并由main返回非零。
          */"""
         lengths, output_tokens = self.args.performance_prompt_lengths, self.args.performance_output_tokens
+        modes = [mode for mode in PERFORMANCE_CASES if mode[1] in self.args.performance_cache_states
+                 and mode[2] in self.args.performance_concurrencies]
         prompts = {length: ([1, 2, 3, 4] * ((length + 3) // 4))[:length] for length in lengths}
         self.metadata.update(
-            scope='performance', expected_case_count=len(self.rows) + len(lengths) * len(PERFORMANCE_CASES),
+            scope='performance', expected_case_count=len(self.rows) + len(lengths) * len(modes),
+            selected_cache_states=self.args.performance_cache_states,
+            selected_concurrencies=self.args.performance_concurrencies,
+            performance_matrix_complete=len(modes) == len(PERFORMANCE_CASES),
             model_path=str(model.resolve()), dtype='float16', kv_dtype='float16',
             warmup=1, iterations=1, repeats=5, hot_cache_preparation_requests=4,
             prompt_lengths=lengths, prompt_token_ids_by_length=prompts, max_new_tokens=output_tokens,
             eos_policy='disabled; fixed max_new_tokens; no penalties or filtering',
             correctness='FT Eager/Graph output histories, prefix reuse and Graph execution evidence',
             report_description='独立性能测试：不运行HF对齐；保留Eager/Graph输出历史、缓存及执行路径检查。'
+                               '只覆盖本次所选长度、缓存和并发组合。'
                                '加速比为同配置Eager耗时/当前模式耗时，不代表相对HF或vLLM的速度。',
             report_title='Attention DP + EP Eager/Graph performance')
         save_report(self.output, self.rows, self.metadata)
 
-        baseline, tokens, cache_histories = {}, {}, {}
-        cases = ((length, *mode) for length in lengths for mode in PERFORMANCE_CASES)
+        baseline, reference_responses, cache_histories = {}, {}, {}
+        cases = ((length, *mode) for length in lengths for mode in modes)
         for prompt_length, graph, cache, concurrency in cases:
+            prefix = 'perf' if lengths == [32] and output_tokens == 16 else f'perf_prompt{prompt_length}_output{output_tokens}'
+            name = f'{prefix}_graph{int(graph)}_cache_{cache}_concurrency{concurrency}'
+            record = dict(samples_ms=[], responses=[], warmup=1, iterations=1, repeats=5,
+                          prompt_length=prompt_length, output_tokens=output_tokens, concurrency=concurrency,
+                          cuda_graph=graph, cache_state=cache)
+            if graph:
+                record['eager_reference_file'] = str(self.output / f'{prefix}_graph0_cache_{cache}_concurrency{concurrency}.json')
+
             def run(_):
                 key = (prompt_length, cache, concurrency)
                 jobs = [request(prompts[prompt_length], output_tokens) for _ in range(concurrency)]
-                raw, responses = [], []
+                raw, responses = record['samples_ms'], record['responses']
+                record['requests'] = jobs
                 with self.session(model, 4, graph, cache != 'off', trace=False, routing='prefix' if cache != 'off' else 'round_robin') as session:
+                    record['session_output'] = str(session.output)
                     batch(session, jobs)  # 一次相同工作量warmup。
                     if cache == 'hot':
                         batch(session, [jobs[0]] * 4)
                     memory = capture(['nvidia-smi', '--query-gpu=uuid,memory.used', '--format=csv'])
+                    record['memory_used_after_warmup'] = memory
                     with ThreadPoolExecutor(concurrency) as pool:
                         for repeat in range(5):
                             if cache == 'cold':
@@ -545,22 +599,33 @@ class Suite:
                             elapsed = (time.perf_counter() - start) * 1000
                             raw.append(elapsed)
                             responses.append(result)
+                    record['states'] = session._states
                     if graph:
                         require(all(s['replays'] > 0 and s['captures'] == 1 for s in session._states), 'benchmark missed Graph')
                     evidence = session._states
+                record['shutdown'] = session.shutdown
                 all_tokens = [[r['token_ids'] for r in run] for run in responses]
+                record['output_variant_count'] = len({tuple(ids) for run in all_tokens for ids in run})
+                record['within_mode_vs_first_request'] = performance_token_differences(
+                    responses, [[responses[0][0]] * len(run) for run in responses])
+                if graph and key in reference_responses:
+                    record['comparison'] = performance_token_differences(responses, reference_responses[key])
                 require(all(len(ids) == output_tokens for run in all_tokens for ids in run),
                         'benchmark output length differs from requested workload')
                 reuse = [sorted(r['states'][r['dp_rank']]['prefix_cache']['last_reused_tokens'] for r in run) for run in responses]
+                record['reused_tokens'] = reuse
                 if cache == 'hot':
                     require(all(value == len(jobs[0]['token_ids'])-1 for run in reuse for value in run), 'hot benchmark did not hit warm cache')
                 if cache == 'off':
                     require(not any(value for run in reuse for value in run), 'disabled cache reused tokens')
                 if graph:
-                    require(all_tokens == tokens[key], 'benchmark modes used different output histories')
+                    require(key in baseline and key in reference_responses, 'benchmark Eager baseline failed or is missing')
+                    comparison = record['comparison']
+                    require(comparison['match'], 'benchmark modes used different output histories; '
+                            f'first_divergence={json.dumps(comparison["first_divergence"])}; evidence={self.output / (name + ".json")}')
                     require(reuse == cache_histories[key], 'benchmark modes had different prefix reuse')
                 else:
-                    tokens[key] = all_tokens
+                    reference_responses[key] = responses
                     cache_histories[key] = reuse
                 ttft = [r['steps'][0]['elapsed_ms'] for run in responses for r in run]
                 itl = [b['elapsed_ms']-a['elapsed_ms'] for run in responses for r in run for a, b in zip(r['steps'], r['steps'][1:])]
@@ -568,9 +633,7 @@ class Suite:
                 median = statistics.median(raw)
                 if not graph:
                     baseline[key] = median
-                return dict(samples_ms=raw, responses=responses, states=evidence, memory_used_after_warmup=memory,
-                    warmup=1, iterations=1, repeats=5,
-                    cache_state=cache, reused_tokens=reuse,
+                record.update(
                     ttft_samples_ms=ttft, itl_samples_ms=itl, queue_samples_ms=queued,
                     summary=dict(prompt_length=prompt_length, output_tokens=output_tokens,
                                  median_ms=median, p95_ms=sorted(raw)[math.ceil(.95*len(raw))-1],
@@ -581,8 +644,8 @@ class Suite:
                                  reserved_kv_bytes=sum(s['reserved_kv_bytes'] for s in evidence),
                                  prefix_bytes=sum(s['prefix_cache']['device_bytes'] for s in evidence),
                                  graph_workspace_bytes=sum(s['workspace_bytes'] for s in evidence)))
-            prefix = 'perf' if lengths == [32] and output_tokens == 16 else f'perf_prompt{prompt_length}_output{output_tokens}'
-            self.case(f'{prefix}_graph{int(graph)}_cache_{cache}_concurrency{concurrency}', run)
+                return record
+            self.case(name, run, failure_evidence=record)
 
 
 def summarize_alignment_stage(stage, phase):
@@ -689,20 +752,30 @@ def main():
     parser.add_argument('--performance', action='store_true',
                         help='仅运行Eager/Graph性能矩阵，不附带对齐或合成验收；省略--model只准备性能小模型')
     parser.add_argument('--performance-prompt-lengths', type=int, nargs='+',
-                        help='性能输入Token长度列表，每个长度独立运行18项；默认32')
+                        help='性能输入Token长度列表，每个长度默认运行18项；默认32')
     parser.add_argument('--performance-output-tokens', type=int,
                         help='性能每请求固定输出Token数，至少2；默认16')
+    parser.add_argument('--performance-cache-states', nargs='+', choices=('off', 'cold', 'hot'),
+                        help='定向性能复测的缓存状态；默认全部，始终同时测试Eager/Graph')
+    parser.add_argument('--performance-concurrencies', type=int, nargs='+', choices=(1, 4, 8),
+                        help='定向性能复测的并发数；默认1/4/8，始终同时测试Eager/Graph')
     parser.add_argument('--synthetic-case', choices=sorted(SYNTHETIC_CASES),
                         help='只复现指定小模型用例；不代表完整验收通过')
     parser.add_argument('--repeat', type=int, default=1, help='定向用例独立执行次数；任何一轮失败则总体失败')
     parser.add_argument('--timeout', type=float, default=1800)
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
-    if not args.performance and (args.performance_prompt_lengths is not None or args.performance_output_tokens is not None):
-        parser.error('性能长度参数必须与--performance一起使用')
+    performance_options = (args.performance_prompt_lengths, args.performance_output_tokens,
+                           args.performance_cache_states, args.performance_concurrencies)
+    if not args.performance and any(option is not None for option in performance_options):
+        parser.error('性能参数必须与--performance一起使用')
     args.performance_prompt_lengths = args.performance_prompt_lengths or [32]
     args.performance_output_tokens = 16 if args.performance_output_tokens is None else args.performance_output_tokens
+    args.performance_cache_states = args.performance_cache_states or ['off', 'cold', 'hot']
+    args.performance_concurrencies = args.performance_concurrencies or [1, 4, 8]
     if args.performance:
+        if any(len(set(values)) != len(values) for values in (args.performance_cache_states, args.performance_concurrencies)):
+            parser.error('性能缓存状态和并发数不能重复')
         if args.performance_output_tokens < 2:
             parser.error('性能输出至少2个Token，以检查Graph Decode路径并计算ITL')
         if len(set(args.performance_prompt_lengths)) != len(args.performance_prompt_lengths):
