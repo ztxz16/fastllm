@@ -190,7 +190,7 @@ int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) con
     return (int)std::min<int64_t>(capacity, limit);
 }
 
-void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity, bool usePool) {
+void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity, bool usePool, bool expandFP8) {
     int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
     int length = oldLength + input.dims[1];
     cache.dataType = cacheType;
@@ -209,7 +209,8 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     if (cache.isPagedKVCache || cache.dataType == FP8_E4M3 || cache.dataType == FP4_E2M1 || cache.kvCacheFp8Indexer ||
         (sparseKv && cache.cudaDataBorrowed)) {
 #ifdef USE_CUDA
-        FastllmCudaNaivePagedWrite(cache, input, oldLength);
+        if (expandFP8) FastllmCudaNaiveWriteAndExpandFP8(cache, input, oldLength);
+        else FastllmCudaNaivePagedWrite(cache, input, oldLength);
 #endif
         cache.Resize({1, length, width});
         if (cache.isPagedKVCache) cache.lastPageLen = (length - 1) % cache.pageLen + 1;
@@ -1447,6 +1448,7 @@ Data NaiveN05FlashModel::RunTarget(
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
             const bool ringDecode = ringCache && decodeWorkspace && !graphVerify;
             const bool ringVerify = ringCache && capture && capture->ringVerify;
+            bool coldSwa = false;
             Data noIndices;
             Data *selected = attendPhase == 2 &&
                 (decodeWorkspace ? buf.capacity : localPast + length) > indexTopK ? &indices : &noIndices;
@@ -1514,15 +1516,14 @@ Data NaiveN05FlashModel::RunTarget(
                 if (!fusedCache) {
                     FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
                         cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
+                    Data *cacheInput = &k;
                     if (localIndexer && !separateIndex) {
                         FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
                         Cat(k, indexKey, 2, packed);
-                    } else {
-                        packed.CopyFrom(k);
+                        cacheInput = &packed;
                     }
-                    Data *cacheInput = &packed;
                     if (pastKey.kvCacheFp8Indexer) {
-                        FastllmCudaNaivePackIndexer(packed, buf.packedIndexer);
+                        FastllmCudaNaivePackIndexer(*cacheInput, buf.packedIndexer);
                         cacheInput = &buf.packedIndexer;
                     }
                     if (decodeWorkspace || ringVerify) {
@@ -1535,8 +1536,16 @@ Data NaiveN05FlashModel::RunTarget(
                             pastValue.Resize({1, localPast + length, pastValue.dims[2]});
                         }
                     } else {
-                        AppendCache(pastKey, *cacheInput, LayerKVType(layer), layerCapacity);
-                        AppendCache(pastValue, v, LayerKVType(layer), layerCapacity);
+                        const auto type = LayerKVType(layer);
+                        // On a cold SWA chunk every visible KV row belongs to this projection.
+                        // Quantize once at the cache write and feed the same values to attention.
+                        coldSwa = slidingLayers[layer] && !verifying && localPast == 0 && length >= 1024 &&
+                            window == 128 && cfg.headDim == 192 && cfg.valueDim == 128 &&
+                            cfg.heads == cfg.kvHeads * 8 && type == FP8_E4M3 && cacheInput == &k &&
+                            !pastKey.kvCacheFp8Indexer && !FastllmCudaGraphIsCapturingFast() &&
+                            (FastllmCudaRuntimeArch() == 100 || FastllmCudaRuntimeArch() == 103);
+                        AppendCache(pastKey, *cacheInput, type, layerCapacity, true, coldSwa);
+                        AppendCache(pastValue, v, type, layerCapacity, true, coldSwa);
                     }
                 }
                 if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
@@ -1737,8 +1746,8 @@ Data NaiveN05FlashModel::RunTarget(
             if ((batchVerifyIndex || dpPrefill) && attendPhase == 1) return;
             Data stagedKey, stagedValue;
             if (sparseLayer && !batchedDSA) StageSparseKv(tpRank, layer, pastKey, pastValue, stagedKey, stagedValue);
-            Data &attentionKey = sparseLayer && !batchedDSA ? stagedKey : pastKey;
-            Data &attentionValue = sparseLayer && !batchedDSA ? stagedValue : pastValue;
+            Data &attentionKey = coldSwa ? k : (sparseLayer && !batchedDSA ? stagedKey : pastKey);
+            Data &attentionValue = coldSwa ? v : (sparseLayer && !batchedDSA ? stagedValue : pastValue);
             Data &sink = localWeight(ap + "attention_sink_bias");
             if (!sink.dims.empty()) {
                 ToDataType(sink, DataType::FLOAT32);

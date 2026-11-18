@@ -131,6 +131,8 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
 void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &output);
 void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
     const fastllm::Data *liveKeys = nullptr);
+// Write FP8 KV and return the same values expanded into the BF16 input rows.
+void FastllmCudaNaiveWriteAndExpandFP8(fastllm::Data &cache, fastllm::Data &input, int start);
 // Read logical cache slices into an existing BF16 staging allocation. Used by
 // history recording; no full-cache dequantization is needed for attention.
 struct FastllmNaiveKVRead {

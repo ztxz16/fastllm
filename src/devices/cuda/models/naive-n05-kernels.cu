@@ -793,6 +793,54 @@ __global__ void RopeQKScaleVToken(BF16 *q, BF16 *k, BF16 *v, const float *positi
     }
 }
 
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+// Packed 192/128 projection with a 64-column split-half RoPE. Eight
+// consecutive vector lanes cover both rotary halves of each Q/K head.
+__global__ void RopePackedPrefill(BF16 *q, BF16 *k, BF16 *v, const float *positions,
+        int heads, int kvHeads, float theta, BF16 scale, const BF16 *packed) {
+    __shared__ __align__(16) BF16 cosine[32], sine[32];
+    int token = blockIdx.x, t = threadIdx.x;
+    if (t < 32) {
+        float angle = positions[token] * powf(theta, -2.f * t / 64);
+        cosine[t] = __float2bfloat16_rn(cosf(angle));
+        sine[t] = __float2bfloat16_rn(sinf(angle));
+    }
+    __syncthreads();
+    const int qWidth = heads * 24, kWidth = kvHeads * 24, vWidth = kvHeads * 16;
+    const int width = qWidth + kWidth + vWidth;
+    int col = blockIdx.y * blockDim.x + t;
+    if (col >= width) return;
+    uint4 data = ((const uint4 *)packed)[size_t(token) * width + col];
+    auto *a = reinterpret_cast<__nv_bfloat162 *>(&data);
+    uint4 *dst;
+    if (col < qWidth + kWidth) {
+        int inHead = col % 24;
+        if (inHead < 8) {
+            // A 24-vector head starts on an eight-lane boundary.
+            unsigned active = 0xffu << (t % 32 / 8 * 8);
+            uint4 other = make_uint4(__shfl_xor_sync(active, data.x, 4, 8), __shfl_xor_sync(active, data.y, 4, 8),
+                                      __shfl_xor_sync(active, data.z, 4, 8), __shfl_xor_sync(active, data.w, 4, 8));
+            const auto *b = reinterpret_cast<const __nv_bfloat162 *>(&other);
+            uint4 cv = ((const uint4 *)cosine)[inHead % 4], sv = ((const uint4 *)sine)[inHead % 4];
+            const auto *c = reinterpret_cast<const __nv_bfloat162 *>(&cv);
+            const auto *s = reinterpret_cast<const __nv_bfloat162 *>(&sv);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                auto x = __hmul2_rn(a[j], c[j]), y = __hmul2_rn(b[j], s[j]);
+                a[j] = inHead < 4 ? __hsub2_rn(x, y) : __hadd2_rn(x, y);
+            }
+        }
+        dst = col < qWidth ? (uint4 *)q + size_t(token) * qWidth + col
+                           : (uint4 *)k + size_t(token) * kWidth + col - qWidth;
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) a[j] = __hmul2_rn(a[j], __halves2bfloat162(scale, scale));
+        dst = (uint4 *)v + size_t(token) * vWidth + col - qWidth - kWidth;
+    }
+    *dst = data;
+}
+#endif
+
 struct RopeCacheRow {
     BF16 *q, *key, *value;
     const BF16 *k, *v, *indexKey, *qkv;
@@ -2997,6 +3045,17 @@ void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
     }
     const uintptr_t addresses = (uintptr_t)q.cudaData | (uintptr_t)k.cudaData |
         (uintptr_t)v.cudaData | (packedQkv ? (uintptr_t)packedQkv->cudaData : 0);
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+    if (packedQkv && dim == 192 && valueDim == 128 && rotaryDim == 64 && q.dims[1] >= 1024 &&
+        addresses % 16 == 0 && (FastllmCudaRuntimeArch() == 100 || FastllmCudaRuntimeArch() == 103)) {
+        const int vectors = (heads + kvHeads) * 24 + kvHeads * 16;
+        RopePackedPrefill<<<dim3(q.dims[1], (vectors + 127) / 128), 128>>>(
+            (BF16 *)q.cudaData, (BF16 *)k.cudaData, (BF16 *)v.cudaData, (const float *)positions.cudaData,
+            heads, kvHeads, theta, __float2bfloat16_rn(valueScale), (const BF16 *)packedQkv->cudaData);
+        CheckLaunch();
+        return;
+    }
+#endif
     const bool tokenRope = q.dims[1] >= 1024 && rotaryDim <= 256 &&
         dim % 2 == 0 && valueDim % 2 == 0 && addresses % alignof(__nv_bfloat162) == 0;
     auto kernel = tokenRope ? (packedQkv ? RopeQKScaleVToken<true> : RopeQKScaleVToken<false>)
@@ -4752,8 +4811,30 @@ __global__ void PagedWriteFP4(uint8_t *pool, const int *pages, const BF16 *input
         input + (size_t)token * width + column, column, width);
 }
 }
-void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
-        const fastllm::Data *liveKeys) {
+// Write eight contiguous FP8 values per lane and reuse the converted bytes
+// when cold-window attention needs BF16 K/V in the original activation.
+template<bool Expand>
+__global__ void WriteFP8Rows(uint2 *cache, const int *pages, const uint4 *input,
+        uint4 *expanded, int first, int rows, int width, int pageLen) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(rows) * width) return;
+    int row = first + i / width;
+    size_t physical = pages ? size_t(pages[row / pageLen]) * pageLen + row % pageLen : row;
+    uint4 values = input[i];
+    unsigned short pairs[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        pairs[j] = __nv_cvt_bfloat16raw2_to_fp8x2(reinterpret_cast<__nv_bfloat162 *>(&values)[j],
+            __NV_SATFINITE, __NV_E4M3);
+    cache[physical * width + i % width] = make_uint2(
+        unsigned(pairs[0]) | (unsigned(pairs[1]) << 16),
+        unsigned(pairs[2]) | (unsigned(pairs[3]) << 16));
+    if constexpr (Expand)
+        expanded[i] = make_uint4(FastllmNaiveKVRow::ConvertPair(pairs[0]), FastllmNaiveKVRow::ConvertPair(pairs[1]),
+                                 FastllmNaiveKVRow::ConvertPair(pairs[2]), FastllmNaiveKVRow::ConvertPair(pairs[3]));
+}
+static void NaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
+        const fastllm::Data *liveKeys, void *expanded) {
     using namespace fastllm;
     AssertInFastLLM(FastllmNaiveAttentionKVType(cache.dataType) && input.dataType == BFLOAT16 &&
         cache.dataDevice == DataDevice::CUDA && input.dataDevice == DataDevice::CUDA &&
@@ -4786,12 +4867,34 @@ void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input
     }
     FastllmNaiveKVWriteRow destination{cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData,
                                      cache.dataType == FP8_E4M3};
+    if (destination.fp8 && !liveKeys && input.dims[1] >= 128 && input.dims[2] % 8 == 0 &&
+        (uintptr_t(destination.data) % 8) == 0 && (uintptr_t(input.cudaData) % 16) == 0) {
+        auto kernel = expanded ? WriteFP8Rows<true> : WriteFP8Rows<false>;
+        kernel<<<(input.Count(0) / 8 + 255) / 256, 256>>>((uint2 *)destination.data,
+            cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr, (const uint4 *)input.cudaData,
+            (uint4 *)expanded, start, input.dims[1], input.dims[2] / 8, cache.pageLen);
+        CheckLaunch();
+        return;
+    }
     PagedWrite<<<(input.Count(0) + 255) / 256, 256>>>(destination,
         cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr, (const BF16 *)input.cudaData,
         start, input.dims[1], input.dims[2], cache.pageLen,
         liveKeys ? (const int *)liveKeys->cudaData : nullptr,
         cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1]);
     CheckLaunch();
+    if (expanded) FastllmCudaNaiveReadCache({{&cache, expanded, start, input.dims[1]}});
+}
+
+void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
+        const fastllm::Data *liveKeys) {
+    NaivePagedWrite(cache, input, start, liveKeys, nullptr);
+}
+
+void FastllmCudaNaiveWriteAndExpandFP8(fastllm::Data &cache, fastllm::Data &input, int start) {
+    fastllm::AssertInFastLLM(cache.dataType == fastllm::FP8_E4M3 && !cache.kvCacheFp8Indexer,
+                            "Expected an unscaled FP8 attention cache.");
+    NaivePagedWrite(cache, input, start, nullptr, input.cudaData);
+
 }
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,

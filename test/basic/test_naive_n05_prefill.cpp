@@ -487,6 +487,99 @@ static void TestBlackwellIndexerAttention() {
     }
 }
 
+static void TestPackedPrefillRope() {
+    constexpr int rows = 1025, heads = 16, kvHeads = 2;
+    constexpr int widths[] = {heads * 192, kvHeads * 192, kvHeads * 128};
+    constexpr int stride = widths[0] + widths[1] + widths[2];
+    Data packed(BFLOAT16), positions(FLOAT32);
+    Upload(packed, {1, rows, stride}, 43); Upload(positions, {rows}, 53);
+    Data actual[3], expected[3];
+    int offset = 0;
+    for (int j = 0; j < 3; ++j) {
+        for (Data *d : {actual + j, expected + j}) {
+            d->dataType = BFLOAT16; d->UpdateUnitSize(); d->Resize({1, rows, widths[j]});
+            d->ToDevice(DataDevice::CUDA, {0}, false); d->Allocate(false);
+        }
+        Require(cudaMemcpy2DAsync(expected[j].cudaData, widths[j] * 2,
+            (const uint16_t *)packed.cudaData + offset, stride * 2, widths[j] * 2, rows,
+            cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess, "unpack RoPE reference");
+        offset += widths[j];
+    }
+    FastllmCudaNaiveRopeQKScaleV(expected[0], expected[1], expected[2], positions,
+        heads, kvHeads, 192, 128, 64, 300000.f, 1.543f);
+    FastllmCudaNaiveRopeQKScaleV(actual[0], actual[1], actual[2], positions,
+        heads, kvHeads, 192, 128, 64, 300000.f, 1.543f, &packed);
+    for (int j = 0; j < 3; ++j)
+        Require(Read<uint16_t>(actual[j]) == Read<uint16_t>(expected[j]), "packed RoPE changed BF16 output bits");
+    ++checks;
+}
+
+static void TestColdWindowCacheWrite() {
+    constexpr int rows = 1025, heads = 16, kvHeads = 2, past = 7;
+    Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), key(FP8_E4M3), value(FP8_E4M3);
+    Data selected, sink(FLOAT32), actual, expected;
+    Upload(q, {1, rows, heads * 192}, 67);
+    Upload(sink, {heads}, 47);
+    auto write = [&](Data &cache, Data &input, int width, int seed) {
+        Upload(input, {1, rows, width}, seed);
+        auto original = Read<uint16_t>(input);
+        cache.Resize({1, rows + past, width});
+        cache.ToDevice(DataDevice::CUDA, {0}, false); cache.Allocate(false);
+        Require(cudaMemset(cache.cudaData, 0, cache.GetBytes()) == cudaSuccess, "FP8 cache initialization");
+        FastllmCudaNaiveWriteAndExpandFP8(cache, input, past);
+        auto stored = Read<unsigned char>(cache);
+        auto expanded = Read<uint16_t>(input);
+        for (size_t i = 0; i < original.size(); ++i) {
+            __nv_fp8_e4m3 fp8(FromBits(original[i]));
+            Require(stored[size_t(past) * width + i] == fp8.__x, "FP8 cache write changed bytes");
+            Require(expanded[i] == Float32ToBFloat16RNEBits(float(fp8)), "FP8 expansion changed values");
+        }
+        ++checks;
+    };
+    write(key, k, kvHeads * 192, 73);
+    write(value, v, kvHeads * 128, 79);
+    // Skip the prefix used to exercise the nonzero cache write offset.
+    Data kd(FP8_E4M3, k.dims), vd(FP8_E4M3, v.dims);
+    kd.FakeFrom(key, past * kvHeads * 192); vd.FakeFrom(value, past * kvHeads * 128);
+    FastllmCudaNaiveAttention(q, kd, vd, selected, sink, heads, kvHeads, 192, 128, 0, 128, expected);
+    FastllmCudaNaiveAttention(q, k, v, selected, sink, heads, kvHeads, 192, 128, 0, 128, actual);
+    auto a = Read<uint16_t>(actual), b = Read<uint16_t>(expected);
+    double error = 0, magnitude = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        double delta = FromBits(a[i]) - FromBits(b[i]);
+        error += delta * delta; magnitude += double(FromBits(b[i])) * FromBits(b[i]);
+    }
+    double l2 = std::sqrt(error / magnitude);
+    std::printf("Cold SWA vs FP8 cache attention: relL2 %.7f\n", l2);
+    Require(l2 < .008, "Cold SWA exceeds BF16 error budget");
+    ++checks;
+}
+
+static void TestPairedPrefillAttention() {
+    if (!FastllmCudaHasBlackwellIndexerAttention()) return;
+    constexpr int rows = 257, keys = 2017, keep = 512, heads = 16, past = keys - rows;
+    Data iq(BFLOAT16), weights(BFLOAT16), ik(BFLOAT16), q(BFLOAT16), k(BFLOAT16), v(BFLOAT16);
+    Data ordered(INT32), privateIds(INT32, {rows, keep}), sink, expected, actual;
+    Upload(iq, {1, rows, 2048}, 43); Upload(weights, {1, rows, 16}, 53); Upload(ik, {1, keys, 128}, 59);
+    Upload(q, {1, rows, heads * 192}, 67); Upload(k, {1, keys, 192}, 71); Upload(v, {1, keys, 128}, 73);
+    privateIds.ToDevice(DataDevice::CUDA, {0}, false); privateIds.Allocate(false);
+    Data loan(FLOAT32, {4 * 1024 * 1024});
+    loan.ToDevice(DataDevice::CUDA, {0}, false); loan.Allocate(false);
+    for (bool tied : {false, true}) {
+        if (tied) Require(cudaMemset(weights.cudaData, 0, weights.GetBytes()) == cudaSuccess, "zero Indexer weights");
+        FastllmCudaNaiveIndexer(iq, weights, ik, 16, 128, past, keep, true, ordered);
+        FastllmNaivePrefillAttentionItem reference{&q, &k, &v, &ordered, &expected, past};
+        Require(FastllmCudaTryNaiveIndexerAttention(reference, sink, heads, 1, 192, 128, loan),
+                "ordered Blackwell attention declined reference");
+        FastllmNaivePrefillIndexerItem index{&iq, &weights, &ik, &privateIds, past};
+        FastllmNaivePrefillAttentionItem attention{&q, &k, &v, &privateIds, &actual, past};
+        FastllmCudaNaivePrefillIndexedAttention(index, attention, sink, 16, 128, keep, true,
+            false, heads, 1, 192, 128, &loan, loan);
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "score bitmap changed ordered TopK attention");
+        ++checks;
+    }
+}
+
 static void TestBlackwellLocalRouter() {
     if (!FastllmCudaHasBlackwellIndexerAttention()) return;
     constexpr int rows = 257, channels = 4096, experts = 64, top = 8;
@@ -519,38 +612,15 @@ static void TestBlackwellLocalRouter() {
     ++checks;
 }
 
-static void TestPairedPrefillAttention() {
-    if (!FastllmCudaHasBlackwellIndexerAttention()) return;
-    constexpr int rows = 257, keys = 2017, keep = 512, heads = 16, past = keys - rows;
-    Data iq(BFLOAT16), weights(BFLOAT16), ik(BFLOAT16), q(BFLOAT16), k(BFLOAT16), v(BFLOAT16);
-    Data ordered(INT32), privateIds(INT32, {rows, keep}), sink, expected, actual;
-    Upload(iq, {1, rows, 2048}, 43); Upload(weights, {1, rows, 16}, 53); Upload(ik, {1, keys, 128}, 59);
-    Upload(q, {1, rows, heads * 192}, 67); Upload(k, {1, keys, 192}, 71); Upload(v, {1, keys, 128}, 73);
-    privateIds.ToDevice(DataDevice::CUDA, {0}, false); privateIds.Allocate(false);
-    Data loan(FLOAT32, {4 * 1024 * 1024});
-    loan.ToDevice(DataDevice::CUDA, {0}, false); loan.Allocate(false);
-    for (bool tied : {false, true}) {
-        if (tied) Require(cudaMemset(weights.cudaData, 0, weights.GetBytes()) == cudaSuccess, "zero Indexer weights");
-        FastllmCudaNaiveIndexer(iq, weights, ik, 16, 128, past, keep, true, ordered);
-        FastllmNaivePrefillAttentionItem reference{&q, &k, &v, &ordered, &expected, past};
-        Require(FastllmCudaTryNaiveIndexerAttention(reference, sink, heads, 1, 192, 128, loan),
-                "ordered Blackwell attention declined reference");
-        FastllmNaivePrefillIndexerItem index{&iq, &weights, &ik, &privateIds, past};
-        FastllmNaivePrefillAttentionItem attention{&q, &k, &v, &privateIds, &actual, past};
-        FastllmCudaNaivePrefillIndexedAttention(index, attention, sink, 16, 128, keep, true,
-            false, heads, 1, 192, 128, &loan, loan);
-        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "score bitmap changed ordered TopK attention");
-        ++checks;
-    }
-}
-
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
-        TestBlackwellLocalRouter();
+        TestPackedPrefillRope();
+        TestColdWindowCacheWrite();
         TestPairedPrefillAttention();
+        TestBlackwellLocalRouter();
         TestBlackwellIndexerAttention();
         TestLocalPrefillBatch();
         TestSwaPrefillScratch(); TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();
