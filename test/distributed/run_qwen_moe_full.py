@@ -21,6 +21,7 @@ from run_process_tp import ROOT, capture, save_report, case_process, wait_case, 
 from qwen_moe_reference import fixture, full_logits
 from fastllm_pytools.qwen_moe_process_session import QwenMoeProcessSession, BACKEND
 from fastllm_pytools.qwen3_process_session import GenerationCancelled, GenerationObserverError
+from fastllm_pytools.qwen3_process_chat import MAX_CONTEXT_TOKENS
 from generation_alignment import POLICY_SOURCE, compare_generation, compare_generation_all, validate_policy
 
 
@@ -503,16 +504,18 @@ class Suite:
     def performance(self, model):
         """/**
          * 独立比较正式Eager/Graph性能，不运行HF生成或数值对齐。
-         * 两种模式统一工作量；每轮同步结果后停止计时，输出历史、缓存复用和
+         * 每种输入长度内的两种模式统一工作量；每轮同步结果后停止计时，输出历史、缓存复用和
          * Graph路径检查及落盘在计时区外。预登记全部用例，保留失败及中断报告。
          * @param model 同一份本地FP16真实模型或合成小模型目录。
          * @return 无；任一性能用例失败保留FAIL行，并由main返回非零。
          */"""
+        lengths, output_tokens = self.args.performance_prompt_lengths, self.args.performance_output_tokens
+        prompts = {length: ([1, 2, 3, 4] * ((length + 3) // 4))[:length] for length in lengths}
         self.metadata.update(
-            scope='performance', expected_case_count=len(self.rows) + len(PERFORMANCE_CASES),
+            scope='performance', expected_case_count=len(self.rows) + len(lengths) * len(PERFORMANCE_CASES),
             model_path=str(model.resolve()), dtype='float16', kv_dtype='float16',
             warmup=1, iterations=1, repeats=5, hot_cache_preparation_requests=4,
-            prompt_token_ids=[1, 2, 3, 4] * 8, max_new_tokens=16,
+            prompt_lengths=lengths, prompt_token_ids_by_length=prompts, max_new_tokens=output_tokens,
             eos_policy='disabled; fixed max_new_tokens; no penalties or filtering',
             correctness='FT Eager/Graph output histories, prefix reuse and Graph execution evidence',
             report_description='独立性能测试：不运行HF对齐；保留Eager/Graph输出历史、缓存及执行路径检查。'
@@ -521,10 +524,11 @@ class Suite:
         save_report(self.output, self.rows, self.metadata)
 
         baseline, tokens, cache_histories = {}, {}, {}
-        for graph, cache, concurrency in PERFORMANCE_CASES:
+        cases = ((length, *mode) for length in lengths for mode in PERFORMANCE_CASES)
+        for prompt_length, graph, cache, concurrency in cases:
             def run(_):
-                key = (cache, concurrency)
-                jobs = [request([1, 2, 3, 4] * 8, 16) for _ in range(concurrency)]
+                key = (prompt_length, cache, concurrency)
+                jobs = [request(prompts[prompt_length], output_tokens) for _ in range(concurrency)]
                 raw, responses = [], []
                 with self.session(model, 4, graph, cache != 'off', trace=False, routing='prefix' if cache != 'off' else 'round_robin') as session:
                     batch(session, jobs)  # 一次相同工作量warmup。
@@ -545,6 +549,8 @@ class Suite:
                         require(all(s['replays'] > 0 and s['captures'] == 1 for s in session._states), 'benchmark missed Graph')
                     evidence = session._states
                 all_tokens = [[r['token_ids'] for r in run] for run in responses]
+                require(all(len(ids) == output_tokens for run in all_tokens for ids in run),
+                        'benchmark output length differs from requested workload')
                 reuse = [sorted(r['states'][r['dp_rank']]['prefix_cache']['last_reused_tokens'] for r in run) for run in responses]
                 if cache == 'hot':
                     require(all(value == len(jobs[0]['token_ids'])-1 for run in reuse for value in run), 'hot benchmark did not hit warm cache')
@@ -566,15 +572,17 @@ class Suite:
                     warmup=1, iterations=1, repeats=5,
                     cache_state=cache, reused_tokens=reuse,
                     ttft_samples_ms=ttft, itl_samples_ms=itl, queue_samples_ms=queued,
-                    summary=dict(median_ms=median, p95_ms=sorted(raw)[math.ceil(.95*len(raw))-1],
-                                 cv=statistics.pstdev(raw)/statistics.mean(raw), tokens_per_second=concurrency*16*1000/median,
+                    summary=dict(prompt_length=prompt_length, output_tokens=output_tokens,
+                                 median_ms=median, p95_ms=sorted(raw)[math.ceil(.95*len(raw))-1],
+                                 cv=statistics.pstdev(raw)/statistics.mean(raw), tokens_per_second=concurrency*output_tokens*1000/median,
                                  speedup=baseline[key]/median, concurrency=concurrency, repeats=5,
                                  ttft_median_ms=statistics.median(ttft), itl_median_ms=statistics.median(itl),
                                  queue_median_ms=statistics.median(queued),
                                  reserved_kv_bytes=sum(s['reserved_kv_bytes'] for s in evidence),
                                  prefix_bytes=sum(s['prefix_cache']['device_bytes'] for s in evidence),
                                  graph_workspace_bytes=sum(s['workspace_bytes'] for s in evidence)))
-            self.case(f'perf_graph{int(graph)}_cache_{cache}_concurrency{concurrency}', run)
+            prefix = 'perf' if lengths == [32] and output_tokens == 16 else f'perf_prompt{prompt_length}_output{output_tokens}'
+            self.case(f'{prefix}_graph{int(graph)}_cache_{cache}_concurrency{concurrency}', run)
 
 
 def summarize_alignment_stage(stage, phase):
@@ -680,12 +688,29 @@ def main():
     parser.add_argument('--near-tie-tol', type=float, default=0.1, help='候选边界logprob容差；0为严格双向Top-K包含')
     parser.add_argument('--performance', action='store_true',
                         help='仅运行Eager/Graph性能矩阵，不附带对齐或合成验收；省略--model只准备性能小模型')
+    parser.add_argument('--performance-prompt-lengths', type=int, nargs='+',
+                        help='性能输入Token长度列表，每个长度独立运行18项；默认32')
+    parser.add_argument('--performance-output-tokens', type=int,
+                        help='性能每请求固定输出Token数，至少2；默认16')
     parser.add_argument('--synthetic-case', choices=sorted(SYNTHETIC_CASES),
                         help='只复现指定小模型用例；不代表完整验收通过')
     parser.add_argument('--repeat', type=int, default=1, help='定向用例独立执行次数；任何一轮失败则总体失败')
     parser.add_argument('--timeout', type=float, default=1800)
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
+    if not args.performance and (args.performance_prompt_lengths is not None or args.performance_output_tokens is not None):
+        parser.error('性能长度参数必须与--performance一起使用')
+    args.performance_prompt_lengths = args.performance_prompt_lengths or [32]
+    args.performance_output_tokens = 16 if args.performance_output_tokens is None else args.performance_output_tokens
+    if args.performance:
+        if args.performance_output_tokens < 2:
+            parser.error('性能输出至少2个Token，以检查Graph Decode路径并计算ITL')
+        if len(set(args.performance_prompt_lengths)) != len(args.performance_prompt_lengths):
+            parser.error('性能输入长度不能重复')
+        if any(length < 1 or length + args.performance_output_tokens - 1 > MAX_CONTEXT_TOKENS
+               for length in args.performance_prompt_lengths):
+            parser.error(f'性能输入长度必须为正，输入长度+输出长度-1不得超过{MAX_CONTEXT_TOKENS}')
+
     if args.repeat < 1 or (args.repeat != 1 and not args.synthetic_case):
         parser.error('--repeat必须为正整数，重复执行必须指定--synthetic-case')
     if args.synthetic_case and (args.model or args.performance):

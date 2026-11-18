@@ -60,7 +60,10 @@ PY
             --near-tie-tol "${ATTENTION_EP_NEAR_TIE_TOL:-0.1}"
         ;;
     performance)
-        "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" --model "$moe_model" --performance
+        read -r -a moe_perf_lengths <<< "${ATTENTION_EP_PERF_PROMPT_LENGTHS:-32}"
+        "$moe_python" test/distributed/run_qwen_moe_full.py "${moe_common[@]}" --model "$moe_model" --performance \
+            --performance-prompt-lengths "${moe_perf_lengths[@]}" \
+            --performance-output-tokens "${ATTENTION_EP_PERF_OUTPUT_TOKENS:-16}"
         ;;
     http)
         "$moe_python" test/distributed/run_qwen_moe_http.py "${moe_common[@]}" --model "$moe_model"
