@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
+#include "devices/cuda/fastllm-linear-scratch.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -42,7 +43,7 @@ static float RoundE4M3(float x) {
     return std::copysign(codes[i], x);
 }
 
-static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false) {
+static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false, bool borrowScratch = false) {
     std::mt19937 rng(24816);
     std::vector<float> values(size_t(m) * k);
     // All inputs are exactly representable in BF16; ranges differ by both row and K32 block.
@@ -69,11 +70,23 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
     auto call = [&] {
         Require(FastllmCudaBFloat16MatMulFP8E4M3(x, w, bias, y, m, k, n), "public entry failed");
     };
+    Data scratch;
+    if (borrowScratch) {
+        scratch.Resize({3 << 20});
+        scratch.ToDevice(CUDA, {0}, false);
+        scratch.Allocate(false);
+    }
+    CudaLinearScratchScope loan(borrowScratch ? &scratch : nullptr);
     call(); // upload legacy scales and validate metadata before capture
     bool supported = FastllmCudaMxfp8LinearSM103(x.cudaData, w, y.cudaData, m, k, n);
     const bool quantized = !invalid && (m > 1 || wideGemv);
     Require(supported == quantized, "backend eligibility mismatch");
     Check(cudaDeviceSynchronize());
+    std::vector<uint16_t> eager;
+    if (m >= 1024 && n % 256 == 0) {
+        eager.resize(size_t(m) * n);
+        Check(cudaMemcpy(eager.data(), y.cudaData, eager.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    }
     cudaGraph_t graph;
     cudaGraphExec_t exec;
     Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
@@ -93,6 +106,18 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
         Check(cudaStreamSynchronize(cudaStreamPerThread));
         std::vector<uint16_t> output(size_t(m) * n);
         Check(cudaMemcpy(output.data(), y.cudaData, output.size() * 2, cudaMemcpyDeviceToHost));
+        if (!eager.empty() && !iteration) {
+            double diff = 0, reference = 0;
+            for (size_t j = 0; j < eager.size(); ++j) {
+                const double expected = BFloat16(output[j]);
+                const double delta = BFloat16(eager[j]) - expected;
+                diff += delta * delta;
+                reference += expected * expected;
+            }
+            const double relative = std::sqrt(diff / std::max(reference, 1e-30));
+            std::printf("prefill versus graph, full output rel_l2=%.8f\n", relative);
+            Require(relative < 0.004, "eager prefill output disagrees with captured projection");
+        }
         double error = 0, norm = 0, bf16Error = 0, bf16Norm = 0;
         for (int row : {0, m / 2, m - 1}) {
             std::vector<float> a(values.begin() + size_t(row) * k, values.begin() + size_t(row + 1) * k);
@@ -177,6 +202,9 @@ int main() {
         Run(8, 1856, 4096);
         Run(32, 4096, 1024);
         Run(33, 320, 512);
+        Run(1933, 512, 512); // partially filled second M tile
+        Run(2061, 4096, 4096); // bounded lease needs multiple GEMMs
+        Run(2061, 4096, 4096, false, false, true); // bulk clusters plus a short tail
         Run(2053, 64, 4096); // crosses the workspace chunk boundary
         Run(2, 256, 256, true);
         std::puts("PASS Blackwell MXFP8 Linear and graph replay");

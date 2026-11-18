@@ -18,6 +18,7 @@
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
+#include "devices/cuda/fastllm-linear-scratch.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -909,6 +910,19 @@ Data NaiveN05FlashModel::RunTarget(
         EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     else Embedding(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, DataType::BFLOAT16);
+    // The score and router arenas are both dead during QKV/O projection. Some
+    // serving layouts allocate only the latter. Borrow existing storage only.
+    auto projectAttention = [&](Data &input, Data &weight, const Data &bias, Data &output) {
+        if (!decodeWorkspace && !verifying && length >= 1024) {
+            const Data *scratch = &routerInput;
+            if (prefillScores && prefillScores->expansionBytes > routerInput.expansionBytes)
+                scratch = prefillScores;
+            CudaLinearScratchScope loan(scratch);
+            Linear(input, weight, bias, output);
+        } else {
+            Linear(input, weight, bias, output);
+        }
+    };
     auto norm = [&](Data &input, Data &weight, Data &output) {
         if (!decodeWorkspace) {
             KimiK3RMSNorm(input, weight, rms_norm_eps, output);
@@ -1062,7 +1076,7 @@ Data NaiveN05FlashModel::RunTarget(
         }
         if (mergedQkv) {
             if (!batchRope)
-                Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+                projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
             // Q/K and V have different head widths. Read packed projection rows
             // directly in the RoPE/cache kernel instead of launching three Splits.
             for (auto item : {std::make_pair(&q, cfg.heads * cfg.headDim),
@@ -1074,9 +1088,9 @@ Data NaiveN05FlashModel::RunTarget(
                 item.first->Allocate(false);
             }
         } else {
-            Linear(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
-            Linear(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
-            Linear(normed, localWeight(ap + "v_proj.weight"), localWeight(ap + "v_proj.bias"), v);
+            projectAttention(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
+            projectAttention(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
+            projectAttention(normed, localWeight(ap + "v_proj.weight"), localWeight(ap + "v_proj.bias"), v);
         }
         const bool reuseAttention = reusePrefillQkv && qkv.dataType == BFLOAT16 && qkv.dims.size() == 3 &&
             qkv.dims.back() >= cfg.heads * cfg.valueDim;
@@ -1201,7 +1215,7 @@ Data NaiveN05FlashModel::RunTarget(
 #endif
             if (!batchRopePrepared) {
                 if (mergedQkv)
-                    Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+                    projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
                 batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
                     caches, liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
@@ -2011,7 +2025,7 @@ Data NaiveN05FlashModel::RunTarget(
             FastllmCudaNaiveBatchSWADecode(q, localWeight(ap + "attention_sink_bias"), swaRows,
                 verifySWA && !graphVerify ? eagerLengths : liveKeys, cfg.heads, cfg.kvHeads, attn);
         }
-        Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
+        projectAttention(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         if (attentionParallel && AttentionTPSize() > 1) {
             auto &runtime = attentionParallel->runtime;
             // Match the existing TP reduction: sum BF16 partials in FP32,
