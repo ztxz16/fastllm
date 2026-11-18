@@ -124,7 +124,7 @@ pool = ThreadPoolExecutor(R)
 cases = [(1, 'spread'), (4, 'hot'), (16, 'spread'), (17, 'spread'),
          (32, 'uniform'), (33, 'spread'), (128, 'spread'), (129, 'spread'),
          (3, 'idle'), (192, 'spread'), (193, 'idle'), (512, 'uniform'),
-         (97, 'spread'), (512, 'hot'), (513, 'idle'),
+         (96, 'spread'), (97, 'spread'), (512, 'hot'), (513, 'idle'),
          (chunk_capacity, 'uniform'), (chunk_capacity, 'hot'),
          (chunk_capacity, 'empty'), (chunk_capacity + 1, 'ragged'),
          (2 * chunk_capacity + 1, 'idle'), (16, 'spread')]

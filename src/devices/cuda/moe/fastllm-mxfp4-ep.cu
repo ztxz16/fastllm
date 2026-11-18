@@ -77,6 +77,7 @@ __global__ void pack(const uint8_t *src, uint8_t *dst, int n, int k, int shift, 
 struct Base { int ranks, device; virtual ~Base() = default; };
 template<int R> struct Mega {
     static constexpr int LE = E / R;
+    static constexpr int DecodeBlock = R == 8 ? 32 : 24;
     static constexpr int DecodeStages = R == 4 ? 4 : 3;
     using Buffers = fm::layout::MegaMoEBuffers;
     template<int CAP> struct Plan {
@@ -160,14 +161,14 @@ template<int R> struct Mega {
         check(cudaStreamSynchronize(cudaStreamPerThread));
         auto decode = Decode::buffers(workspace);
         prepareDescriptors<DECODE_CAP>(l->decodeDescriptors[0], decode, 8);
-        prepareDescriptors<DECODE_CAP>(l->decodeDescriptors[1], decode, 24);
+        prepareDescriptors<DECODE_CAP>(l->decodeDescriptors[1], decode, DecodeBlock);
         prepareDescriptors<DECODE_CAP>(l->decodeDescriptors[2], decode, 64);
         auto prefill = Prefill::buffers((char *)workspace + Decode::bytes());
         if constexpr (R == 4)
             prepareDescriptors<PREFILL_CAP>(l->prefillDescriptors[1], prefill, 24);
         prepareDescriptors<PREFILL_CAP>(l->prefillDescriptors[2], prefill, 64);
         check(cudaFuncSetAttribute(Decode::template kernel<8, 8, true, true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
-        check(cudaFuncSetAttribute(Decode::template kernel<24, DecodeStages, true, false>(), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+        check(cudaFuncSetAttribute(Decode::template kernel<DecodeBlock, DecodeStages, true, false>(), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
         check(cudaFuncSetAttribute(Decode::template kernel<64, 3, false, false>(), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
         if constexpr (R == 4)
             check(cudaFuncSetAttribute(Prefill::template kernel<24, 3, true, false>(), cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
@@ -208,10 +209,9 @@ template<int R> struct Mega {
             dst = static_cast<char *>(l.workspace) + offset + Plan<CAP>::outputOffset();
         const int routedRows = commonRows * R * K;
         if constexpr (CAP == DECODE_CAP) {
-            // Keep the register-source tile for tiny local batches. Wider
-            // tiles use EP-wide density to avoid padding twice as many experts.
+            // The cutoff is 24 routed rows per expert for both EP4 and EP8.
             if (commonRows <= 16) launch<CAP, 8, 8, true, true>(l, dst, commonRows, 0);
-            else if (routedRows <= 24 * E) launch<CAP, 24, DecodeStages, true, false>(l, dst, commonRows, 1);
+            else if (routedRows <= 24 * E) launch<CAP, DecodeBlock, DecodeStages, true, false>(l, dst, commonRows, 1);
             else launch<CAP, 64, 3, false, false>(l, dst, commonRows, 2);
         } else if constexpr (R == 4) {
             if (routedRows <= 24 * E) launch<CAP, 24, 3, true, false>(l, dst, commonRows, 1);
