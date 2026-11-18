@@ -1400,6 +1400,11 @@ void Qwen3LayerExecutor::EndRequest() {
     r.request = {};
 }
 
+Qwen3KVUsage Qwen3LayerExecutor::KVUsage() const {
+    if (!impl->paged) throw std::runtime_error("KV pressure requires dense paged cache");
+    return impl->paged->Usage();
+}
+
 Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
     auto info = impl->request;
     info.graph = impl->graphInfo;

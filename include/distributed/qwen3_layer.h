@@ -96,6 +96,9 @@ public:
     /** @return 请求KV、Graph计数/工作区、前缀目录及分页资源统计。 */
     Qwen3RequestInfo RequestInfo() const;
 
+    /** 返回最紧张的分页池计数；不修改缓存、执行GPU操作或扫描前缀目录。 */
+    Qwen3KVUsage KVUsage() const;
+
     /** 同步释放请求KV、前缀索引/页池、Graph私有计划、工作区和cuBLAS handle；必须在权重卸载前调用，失败须终止 worker。 */
     void Clear();
 

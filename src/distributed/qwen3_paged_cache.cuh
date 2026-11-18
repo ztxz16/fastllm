@@ -117,6 +117,21 @@ public:
     int PageLen() const { return layers.front()->km->pageLen; }
     int MaxPages() const { return layers.front()->km->maxPages; }
 
+    /** 读取各层K/V池可用页计数，返回占用率最高者；可淘汰前缀页仍可分配。 */
+    Qwen3KVUsage Usage() const {
+        Qwen3KVUsage result;
+        for (const auto &layer : layers) for (auto *manager : {layer->km.get(), layer->vm.get()}) {
+            const int total = manager->maxPages, available = manager->FreePageCount();
+            if (total <= 0 || available < 0 || available > total)
+                throw std::runtime_error("invalid FT paged free-page count");
+            if (!result.totalPages || uint64_t(available) * result.totalPages < uint64_t(result.freePages) * total) {
+                result.totalPages = uint32_t(total);
+                result.freePages = uint32_t(available);
+            }
+        }
+        return result;
+    }
+
     /** 查询所有层K/V的共同完整前缀；至少留一个输入token重算输出。 */
     uint32_t Query(const std::vector<int> &ids, uint32_t position) {
         std::vector<Data*> caches;

@@ -1280,6 +1280,29 @@ std::vector<Qwen3RequestInfo> ProcessGroup::Qwen3Requests() {
     return impl->RequestStates(false);
 }
 
+std::vector<Qwen3KVUsage> ProcessGroup::Qwen3KVUsages() {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly || impl->moeModel)
+        throw std::runtime_error("KV pressure requires a ready dense CUDA group");
+    try {
+        auto replies = impl->Exchange(Kind::QueryQwen3KVUsage, Kind::Qwen3KVUsageState, {},
+            Clock::now() + std::chrono::milliseconds(impl->options.operationTimeoutMs));
+        std::vector<Qwen3KVUsage> result;
+        for (const auto &reply : replies) {
+            if (reply.payload.size() != 8) throw std::runtime_error("invalid KV pressure payload");
+            Qwen3KVUsage usage;
+            usage.totalPages = Get32(reply.payload, 0);
+            usage.freePages = Get32(reply.payload, 4);
+            if (usage.freePages > usage.totalPages) throw std::runtime_error("invalid KV pressure pages");
+            result.push_back(usage);
+        }
+        return result;
+    } catch (const std::exception &failure) {
+        impl->Fail(failure.what());
+        throw;
+    }
+}
+
 void ProcessGroup::Stop() {
     std::lock_guard<std::mutex> lifecycleLock(impl->lifecycle);
     {
