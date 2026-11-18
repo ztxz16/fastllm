@@ -1,6 +1,6 @@
 #include "fastllm.h"
 #include "../../src/models/naive_n05_indexer_tp.h"
-#include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "utils/utils.h"
 #include <cuda_runtime_api.h>
 #include <cuda_fp8.h>
@@ -389,11 +389,110 @@ static void TestLocalPrefillBatch() {
     }
 }
 
+// Exercise the Indexer contract separately from arbitrary index lists. Tail
+// rows, empty/future selections, and shuffled KV pages must survive packing.
+static void TestBlackwellIndexerAttention() {
+    for (bool paged : {false, true}) {
+        const int rows = paged ? 2051 : 149, keys = paged ? 2305 : 1181;
+        const int kvHeads = paged ? 2 : 1, heads = 16 * kvHeads, topK = 512, pageLen = 64;
+        Data query(BFLOAT16), key(BFLOAT16), value(BFLOAT16), indices(INT32), sink, actual, reference;
+        Upload(query, {1, rows, heads * 192}, 31);
+        Data kTable(INT32), vTable(INT32);
+        PagedCacheManager kPool, vPool;
+        auto fillCache = [&](Data &cache, Data &table, PagedCacheManager &pool, int width, int seed) {
+            if (!paged) {
+                Upload(cache, {1, keys, width}, seed);
+                return;
+            }
+            int pages = (keys + pageLen - 1) / pageLen;
+            pool.dataType = FP8_E4M3;
+            pool.UpdateUnitSize();
+            pool.pageLen = pageLen;
+            pool.Resize({pages, pageLen, 1, width});
+            pool.Allocate();
+            unsigned x = seed;
+            for (size_t i = 0; i < pool.Count(0); ++i) {
+                x = x * 1664525u + 1013904223u;
+                pool.cpuData[i] = __nv_fp8_e4m3((int(x >> 16) - 32768) / 32768.f).__x;
+            }
+            pool.ToDevice(DataDevice::CUDA, {0}, true);
+            pool.SetMaxPages(pages);
+            table.Resize({pages});
+            table.Allocate();
+            for (int i = 0; i < pages; ++i) ((int *)table.cpuData)[i] = (pages - 1 - i + seed) % pages;
+            table.ToDevice(DataDevice::CUDA, {0}, true);
+            cache.FakeFrom(table, 0);
+            cache.dataType = FP8_E4M3;
+            cache.UpdateUnitSize();
+            cache.Resize({1, keys, width});
+            cache.isPagedKVCache = true;
+            cache.pagedKVCacheData = &pool;
+            cache.pageLen = pageLen;
+        };
+        fillCache(key, kTable, kPool, kvHeads * 192 + 128, 71);
+        fillCache(value, vTable, vPool, kvHeads * 128, 113);
+        indices.Resize({rows, topK});
+        indices.Allocate();
+        for (int r = 0; r < rows; ++r) for (int j = 0; j < topK; ++j) {
+            int k = (j * 97 + r * 37) % keys;
+            int id = k;
+            if (r % 101 == 0) id = -1;  // Empty selection.
+            else if (r % 11 == 0) id = j == 0 ? keys - rows + r : -1;
+            else if (r % 13 == 0) id = k > 511 ? k : -1;
+            else if (j % 37 == 0) id = -1;
+            else if (j % 31 == 0) id = keys;  // Out of range.
+            ((int *)indices.cpuData)[size_t(r) * topK + j] = id;
+        }
+        indices.ToDevice(DataDevice::CUDA, {0}, true);
+        FastllmNaivePrefillAttentionItem item{&query, &key, &value, &indices, &actual, keys - rows};
+        FastllmCudaNaiveAttention(query, key, value, indices, sink, heads, kvHeads,
+            192, 128, item.past, 0, reference);
+        // Use a bounded view inside a larger allocation to exercise chunking
+        // and catch writes beyond the logical loan.
+        constexpr int guard = 256, bytes = 12 << 20;
+        Data storage(BFLOAT16, {(bytes + 2 * guard) / 2}), scratch(BFLOAT16, {bytes / 2});
+        storage.ToDevice(DataDevice::CUDA, {0}, false);
+        storage.Allocate(false);
+        Require(cudaMemset(storage.cudaData, 0xa5, bytes + 2 * guard) == cudaSuccess, "scratch guard setup");
+        scratch.FakeFrom(storage, guard);
+        if (FastllmCudaHasBlackwellIndexerAttention()) {
+            Data tiny(BFLOAT16, {32});
+            tiny.FakeFrom(storage, guard);
+            Require(!FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, tiny),
+                    "insufficient scratch must fall back");
+            Require(!FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, query),
+                    "overlapping scratch must fall back");
+            Require(FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, scratch),
+                    "supported Blackwell prefill did not use the fused kernel");
+        } else {
+            FastllmCudaNaiveBatchIndexerAttention({item}, sink, heads, kvHeads, 192, 128, scratch);
+        }
+        auto guards = Read<uint16_t>(storage);
+        for (int i = 0; i < guard / 2; ++i)
+            Require(guards[i] == 0xa5a5 && guards[(bytes + guard) / 2 + i] == 0xa5a5, "DSA scratch overrun");
+        auto got = Read<uint16_t>(actual), expected = Read<uint16_t>(reference);
+        double error = 0, norm = 0, maxAbs = 0;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            double a = FromBits(got[i]), b = FromBits(expected[i]);
+            Require(std::isfinite(a), "Indexer attention produced a nonfinite value");
+            if (i / (heads * 128) % 101 == 0) Require(a == 0, "nonzero empty TopK row");
+            error += (a - b) * (a - b);
+            norm += b * b;
+            maxAbs = std::max(maxAbs, std::abs(a - b));
+        }
+        double l2 = std::sqrt(error / std::max(norm, 1e-30));
+        std::printf("Indexer prefill %s: relL2 %.6f, maxAbs %.6f\n", paged ? "paged FP8" : "BF16", l2, maxAbs);
+        Require(l2 < .01 && maxAbs < .01, "Indexer attention exceeds BF16 error budget");
+        ++checks;
+    }
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
+        TestBlackwellIndexerAttention();
         TestLocalPrefillBatch();
         TestSwaPrefillScratch(); TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();
         Require(cudaDeviceSynchronize()==cudaSuccess,"prefill CUDA synchronization failed");

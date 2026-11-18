@@ -1,5 +1,5 @@
 #include "devices/cuda/fastllm-cuda-norm.cuh"
-#include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
 #include "naive-n05-topk.cuh"
@@ -4016,8 +4016,16 @@ bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
         heads, kvHeads, pastLength, true, query.dims[1] / (2 * ranks), output);
 }
 
-void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
-        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim) {
+#ifndef FASTLLM_ENABLE_BLACKWELL_DSA
+bool FastllmCudaHasBlackwellIndexerAttention() { return false; }
+bool FastllmCudaTryNaiveIndexerAttention(const FastllmNaivePrefillAttentionItem &,
+        const fastllm::Data &, int, int, int, int, const fastllm::Data &) {
+    return false;
+}
+#endif
+
+static void NaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim, const fastllm::Data *indexerScratch) {
     using namespace fastllm;
 #ifdef FASTLLM_NAIVE_DSA_MMA
     naive_dsa_mma::PrefillAttentionBatch batch{};
@@ -4045,6 +4053,8 @@ void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttenti
     };
 #endif
     for (const auto &item : items) {
+        if (indexerScratch && FastllmCudaTryNaiveIndexerAttention(item, sink, heads,
+                kvHeads, dim, valueDim, *indexerScratch)) continue;
 #ifdef FASTLLM_NAIVE_DSA_MMA
         const auto &q = *item.query, &k = *item.key, &v = *item.value, &ids = *item.indices;
         const int rows = q.dims[1], keys = k.dims[1];
@@ -4089,6 +4099,16 @@ void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttenti
 #ifdef FASTLLM_NAIVE_DSA_MMA
     flush();
 #endif
+}
+
+void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim) {
+    NaiveBatchAttention(items, sink, heads, kvHeads, dim, valueDim, nullptr);
+}
+
+void FastllmCudaNaiveBatchIndexerAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim, const fastllm::Data &scratch) {
+    NaiveBatchAttention(items, sink, heads, kvHeads, dim, valueDim, &scratch);
 }
 
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,

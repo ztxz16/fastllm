@@ -1,0 +1,267 @@
+// Blackwell DSA prefill. Fold the 16 GQA heads sharing K/V into the MMA M
+// dimension. Each row's TopK bitmap masks logits before online softmax and PV.
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "utils/utils.h"
+#include "devices/cuda/naive-n05-kv.cuh"
+#include "attention/blackwell/collective/fmha_fusion.hpp"
+
+namespace blackwell_dsa {
+struct Length {
+    struct Offsets {
+        int length;
+        CUTE_HOST_DEVICE int operator[](int batch) const { return batch * length; }
+    } segment_offsets;
+};
+struct Membership {
+    const uint32_t *bits;
+    int stride, past;
+};
+}
+namespace cutlass::fmha::collective {
+template<> struct is_variable_length<blackwell_dsa::Length> : std::true_type {};
+}
+namespace cute {
+template<> struct is_integral<blackwell_dsa::Length> : true_type {};
+}
+#include "attention/blackwell/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
+#include "attention/blackwell/collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
+#include "attention/blackwell/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
+#include "attention/blackwell/device/fmha.hpp"
+
+namespace blackwell_dsa {
+using namespace cute;
+using namespace cutlass::fmha::collective;
+constexpr int Group = 16, QKDim = 192, ValueDim = 128;
+using BF16 = __nv_bfloat16;
+using Element = cutlass::bfloat16_t;
+
+struct TopKMask {
+    template<class Coord, class Tile, class Problem>
+    CUTLASS_DEVICE int get_trip_count(const Coord &coord, const Tile &tile, const Problem &p) {
+        int end = get<4>(p).past + (int(get<0>(coord)) + 1) * int(get<0>(tile)) / Group;
+        return ceil_div(min(get<1>(p), end), int(get<1>(tile)));
+    }
+    template<class Coord, class Tile, class Problem>
+    CUTLASS_DEVICE int get_unmasked_trip_count(const Coord &, const Tile &, const Problem &) { return 0; }
+    template<class Coord, class Tile, class Problem>
+    CUTLASS_DEVICE int get_masked_trip_count(const Coord &c, const Tile &t, const Problem &p) {
+        return get_trip_count(c, t, p);
+    }
+    template<class Accumulator, class Coordinates, class Problem>
+    CUTLASS_DEVICE void apply_mask(Accumulator &acc, const Coordinates &coords, const Problem &p) {
+        const auto &mask = get<4>(p);
+        // Each TMEM fragment holds consecutive keys from one packed query
+        // head. One bitmap load masks 32 scores (the FA4 vector mask contract).
+        int q = get<0>(coords(0));
+        CUTLASS_PRAGMA_UNROLL
+        for (int base = 0; base < size(acc); base += 32) {
+            int first = get<1>(coords(base));
+            uint32_t word = q < get<0>(p) && first < get<1>(p)
+                ? mask.bits[(q / Group) * mask.stride + first / 32] : 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int j = 0; j < 32; ++j)
+                if (!(word & (1u << j))) acc(base + j) = -INFINITY;
+        }
+    }
+};
+
+struct TileScheduler {
+    struct Arguments { int tiles, heads; };
+    struct Params { int tiles, work, grid; };
+    Params params;
+    int index;
+    CUTLASS_DEVICE TileScheduler(const Params &p) : params(p), index(blockIdx.x) {}
+    static Params to_underlying_arguments(const Arguments &args, cutlass::KernelHardwareInfo hw) {
+        int work = args.tiles * args.heads;
+        return {args.tiles, work, std::min(work, hw.sm_count)};
+    }
+    static dim3 get_grid_shape(const Params &p) { return dim3(p.grid); }
+    CUTLASS_DEVICE bool is_valid() const { return index < params.work; }
+    CUTLASS_DEVICE auto get_block_coord() const {
+        return make_coord(index % params.tiles, _0{}, make_coord(index / params.tiles, 0));
+    }
+    CUTLASS_DEVICE TileScheduler &operator++() { index += params.grid; return *this; }
+};
+
+using Problem = tuple<Length, Length, int, tuple<tuple<int, int>, int>, Membership>;
+using StrideQ = tuple<int, _1, tuple<int, int>>;
+using StrideK = tuple<int, _1, tuple<_0, int>>;
+using StrideV = tuple<_1, int, tuple<_0, int>>;
+using Mainloop = Sm100FmhaFwdMainloopTmaWarpspecialized<Element, float, float,
+    Shape<_256,_128,_192>, Shape<_256,_128,_128>, StrideQ, StrideK, StrideV, TopKMask>;
+using Epilogue = Sm100FmhaFwdEpilogueTmaWarpspecialized<Element, float, typename Mainloop::TileShapePV>;
+using Kernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<Problem, Mainloop, Epilogue, TileScheduler>;
+using Operation = cutlass::fmha::device::FMHA<Kernel>;
+static_assert(Kernel::SharedStorageSize <= 232448);
+
+cudaError_t Attention(BF16 *q, BF16 *k, BF16 *v, BF16 *out, const uint32_t *bits,
+        int rows, int keys, int kvHeads, int past, int maskStride, int sms, cudaStream_t stream) {
+    int m = rows * Group;
+    Problem p = make_tuple(Length{{m}}, Length{{keys}}, QKDim, make_tuple(make_tuple(1, kvHeads), 1),
+                           Membership{bits, maskStride, past});
+    auto lq = make_layout(make_shape(m, QKDim, make_shape(1, kvHeads)),
+                          StrideQ{kvHeads * QKDim, _1{}, {QKDim, QKDim}});
+    auto lk = make_layout(make_shape(keys, QKDim, make_shape(1, kvHeads)),
+                          StrideK{kvHeads * QKDim, _1{}, {_0{}, QKDim}});
+    auto lv = make_layout(make_shape(ValueDim, keys, make_shape(1, kvHeads)),
+                          StrideV{_1{}, kvHeads * ValueDim, {_0{}, ValueDim}});
+    auto lo = make_layout(make_shape(m, ValueDim, make_shape(make_shape(1, kvHeads), 2 * m)),
+        make_stride(kvHeads * ValueDim, _1{}, make_stride(make_stride(ValueDim, ValueDim), kvHeads * ValueDim)));
+    auto ll = make_layout(make_shape(m, make_shape(1, kvHeads)), make_stride(kvHeads, make_stride(_1{}, 1)));
+    cutlass::KernelHardwareInfo hw{};
+    hw.sm_count = sms;
+    // The ragged epilogue adds m to its segment coordinate. Packed Q precedes
+    // packed O in the same allocation and spans at least this prefix.
+    Element *outputBase = (Element *)out - size_t(m) * kvHeads * ValueDim;
+    Operation::Arguments args{p, {(Element *)q, lq, (Element *)k, lk, (Element *)v, lv,
+        1.f / sqrtf(float(QKDim)), 1.f, 1.f, 1.f, 1.f}, {outputBase, lo, nullptr, ll, m},
+        {(m + 255) / 256, kvHeads}, hw};
+    auto params = Kernel::to_underlying_arguments(args, nullptr);
+    return Operation::run(params, stream, false) == cutlass::Status::kSuccess ? cudaSuccess : cudaErrorLaunchFailure;
+}
+
+__global__ void GatherKV(FastllmNaiveKV key, FastllmNaiveKV value, BF16 *k, BF16 *v,
+        int kvHeads, int keyStride) {
+    int row = blockIdx.x;
+    int keyWidth = kvHeads * QKDim, valueWidth = kvHeads * ValueDim;
+    auto keyRow = key.Row(row, keyStride), valueRow = value.Row(row, valueWidth);
+    for (int i = threadIdx.x * 8; i < keyWidth; i += blockDim.x * 8)
+        *(uint4 *)(k + size_t(row) * keyWidth + i) = (keyRow + i).Load8();
+    for (int i = threadIdx.x * 8; i < valueWidth; i += blockDim.x * 8)
+        *(uint4 *)(v + size_t(row) * valueWidth + i) = (valueRow + i).Load8();
+}
+
+__global__ void BuildTopKMask(const int *indices, uint32_t *bits, int keys, int count, int past, int stride) {
+    extern __shared__ uint32_t mask[];
+    int row = blockIdx.x;
+    for (int i = threadIdx.x; i < stride - 1; i += blockDim.x) mask[i] = 0;
+    __syncthreads();
+    bool any = false;
+    for (int i = threadIdx.x; i < count; i += blockDim.x) {
+        int key = indices[size_t(row) * count + i];
+        if (key >= 0 && key < keys && key <= past + row) {
+            atomicOr(mask + key / 32, 1u << (key % 32));
+            any = true;
+        }
+    }
+    int nonempty = __syncthreads_or(any);
+    uint32_t *dst = bits + row * stride;
+    for (int i = threadIdx.x; i < stride - 1; i += blockDim.x) dst[i] = mask[i];
+    if (!threadIdx.x) dst[stride - 1] = nonempty;
+}
+
+// Model layout [row, KV head, group, dim]; FMHA layout [row, group, KV head, dim].
+template<bool Output>
+__global__ void ReorderHeads(const BF16 *src, BF16 *dst, const uint32_t *bits, int stride, int kvHeads) {
+    constexpr int dim = Output ? ValueDim : QKDim;
+    int row = blockIdx.x, kv = blockIdx.y;
+    bool valid = !Output || bits[row * stride + stride - 1] != 0;
+    for (int i = threadIdx.x; i < Group * dim / 8; i += blockDim.x) {
+        int group = i / (dim / 8), col = i % (dim / 8);
+        size_t native = ((size_t(row) * kvHeads + kv) * Group + group) * (dim / 8) + col;
+        size_t packed = ((size_t(row) * Group + group) * kvHeads + kv) * (dim / 8) + col;
+        ((uint4 *)dst)[Output ? native : packed] = valid
+            ? ((const uint4 *)src)[Output ? packed : native] : make_uint4(0,0,0,0);
+    }
+}
+
+} // namespace blackwell_dsa
+
+bool FastllmCudaHasBlackwellIndexerAttention() {
+    const int arch = FastllmCudaRuntimeArch();
+#ifdef FASTLLM_DSA_ARCH100
+    if (arch == 100) return true;
+#endif
+#ifdef FASTLLM_DSA_ARCH103
+    if (arch == 103) return true;
+#endif
+    return false;
+}
+
+bool FastllmCudaTryNaiveIndexerAttention(const FastllmNaivePrefillAttentionItem &item,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim,
+        const fastllm::Data &scratch) {
+    using namespace fastllm;
+    using namespace blackwell_dsa;
+    if (FastllmCudaGraphIsCapturingFast() || !FastllmCudaHasBlackwellIndexerAttention() || !sink.dims.empty() || kvHeads <= 0 || kvHeads > 64 ||
+        heads != kvHeads * Group || dim != QKDim || valueDim != ValueDim || item.past < 0) return false;
+    const auto &q = *item.query, &k = *item.key, &v = *item.value, &ids = *item.indices;
+    if (q.dims.size() != 3 || q.dims[0] != 1 || q.dims[2] != heads * dim ||
+        k.dims.size() != 3 || k.dims[0] != 1 || k.dims[2] < kvHeads * dim || k.dims[2] % 8 ||
+        v.dims.size() != 3 || v.dims[0] != 1 || v.dims[1] != k.dims[1] || v.dims[2] != kvHeads * valueDim ||
+        q.dataType != BFLOAT16 || k.dataType != v.dataType || (k.dataType != FP8_E4M3 && k.dataType != BFLOAT16))
+        return false;
+    int rows = q.dims[1], keys = k.dims[1];
+    // Scanning logical tiles is efficient while the causal span is comparable
+    // to TopK. Long sparse histories retain the gathered sparse implementation.
+    if (rows < 128 || int64_t(item.past) + rows > keys || ids.dataType != INT32 || ids.dims.size() != 2 ||
+        ids.dims[0] != rows || ids.dims[1] <= 0 || keys > 16384 || keys > int64_t(ids.dims[1]) * 8) return false;
+    const int device = FastllmCudaGetDevice();
+    auto resident = [device](const Data &d) {
+        return d.dataDevice == DataDevice::CUDA && d.dataDeviceIds.size() == 1 && d.dataDeviceIds[0] == device &&
+               d.cudaData && (uintptr_t(d.cudaData) % 16 == 0);
+    };
+    if (!resident(q) || !resident(k) || !resident(v) || !resident(ids)) return false;
+    if (!resident(scratch) || (scratch.dataType != BFLOAT16 && scratch.dataType != FLOAT32) ||
+        scratch.isPagedKVCache || (&scratch == item.output)) return false;
+    // Never grow the caller's storage. A view lends only its logical slice.
+    size_t bytes = scratch.isFake || scratch.cudaDataBorrowed ? scratch.GetBytes() : scratch.expansionBytes;
+    bytes = std::min(bytes, size_t(256) << 20);
+    int maskStride = (keys + 31) / 32 + 1;
+    size_t kvElems = size_t(keys) * kvHeads * (dim + valueDim);
+    size_t rowBytes = size_t(heads) * (dim + valueDim) * sizeof(BF16) + maskStride * sizeof(uint32_t);
+    if (bytes <= kvElems * sizeof(BF16)) return false;
+    int chunk = std::min<size_t>(std::min(rows, 2048), (bytes - kvElems * sizeof(BF16)) / rowBytes);
+    if (chunk < 128) return false;
+    if (chunk < rows) chunk -= chunk % Group;
+    size_t qElems = size_t(chunk) * heads * dim, outElems = size_t(chunk) * heads * valueDim;
+    size_t used = kvElems * sizeof(BF16) + chunk * rowBytes;
+    uintptr_t start = uintptr_t(scratch.cudaData);
+    auto overlaps = [start, used](const void *ptr, size_t count) {
+        if (!ptr || !count) return false;
+        uintptr_t addr = uintptr_t(ptr);
+        return addr < start ? start - addr < count : addr - start < used;
+    };
+    auto overlapsKV = [&](const Data &cache) {
+        if (!cache.isPagedKVCache) return overlaps(cache.cudaData, cache.GetBytes());
+        return cache.pageLen <= 0 || !cache.pagedKVCacheData || !resident(*cache.pagedKVCacheData) ||
+            overlaps(cache.cudaData, ((keys + cache.pageLen - 1) / cache.pageLen) * sizeof(int)) ||
+            overlaps(cache.pagedKVCacheData->cudaData, cache.pagedKVCacheData->GetBytes());
+    };
+    if (overlaps(q.cudaData, q.GetBytes()) || overlapsKV(k) || overlapsKV(v) ||
+        overlaps(ids.cudaData, ids.GetBytes()) || overlaps(item.output->cudaData,
+            size_t(rows) * heads * valueDim * sizeof(BF16)) ||
+        (uintptr_t(item.output->cudaData) % 16)) return false;
+    int sms = 0;
+    auto status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) return false;
+    status = cudaFuncSetAttribute(cutlass::device_kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  Kernel::SharedStorageSize);
+    if (status != cudaSuccess) { cudaGetLastError(); return false; }
+    auto &output = *item.output;
+    output.dataType = BFLOAT16;
+    output.Resize({1, rows, heads * valueDim});
+    output.ToDevice(DataDevice::CUDA, {device}, false);
+    output.Allocate(false);
+    BF16 *key = (BF16 *)scratch.cudaData, *value = key + size_t(keys) * kvHeads * dim;
+    BF16 *query = key + kvElems, *out = query + qElems;
+    uint32_t *mask = (uint32_t *)(out + outElems);
+    cudaStream_t stream = cudaStreamPerThread;
+    GatherKV<<<keys,128,0,stream>>>(FastllmNaiveKV(k), FastllmNaiveKV(v), key, value, kvHeads, k.dims[2]);
+    for (int first = 0; first < rows; first += chunk) {
+        int count = std::min(chunk, rows - first);
+        BuildTopKMask<<<count,256,(maskStride - 1) * sizeof(uint32_t),stream>>>(
+            (const int *)ids.cudaData + size_t(first) * ids.dims[1], mask, keys, ids.dims[1], item.past + first, maskStride);
+        dim3 grid(count, kvHeads);
+        ReorderHeads<false><<<grid,128,0,stream>>>((const BF16 *)q.cudaData + size_t(first) * heads * dim,
+            query, nullptr, 0, kvHeads);
+        status = Attention(query, key, value, out, mask, count, keys, kvHeads, item.past + first, maskStride, sms, stream);
+        AssertInFastLLM(status == cudaSuccess, std::string("DSA Blackwell prefill: ") + cudaGetErrorString(status));
+        ReorderHeads<true><<<grid,128,0,stream>>>(out, (BF16 *)item.output->cudaData + size_t(first) * heads * valueDim,
+            mask, maskStride, kvHeads);
+    }
+    status = cudaGetLastError();
+    AssertInFastLLM(status == cudaSuccess, std::string("DSA Blackwell prefill: ") + cudaGetErrorString(status));
+    return true;
+}

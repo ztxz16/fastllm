@@ -897,6 +897,26 @@ if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     endif()
 endif()
 
+if ("100" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+    add_library(fastllm_dsa_blackwell OBJECT src/devices/cuda/models/naive-n05-dsa-blackwell.cu)
+    set_target_properties(fastllm_dsa_blackwell PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_dsa_blackwell BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer"
+        "${FASTLLM_CUTLASS_DIR}/include" "${FASTLLM_CUTLASS_DIR}/tools/util/include")
+    target_compile_options(fastllm_dsa_blackwell PRIVATE "--expt-relaxed-constexpr" "--expt-extended-lambda")
+    foreach(arch IN ITEMS 100 103)
+        if ("${arch}" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+            target_compile_options(fastllm_dsa_blackwell PRIVATE
+                "--generate-code=arch=compute_${arch}a,code=sm_${arch}a")
+            target_compile_definitions(fastllm_dsa_blackwell PRIVATE FASTLLM_DSA_ARCH${arch})
+        endif()
+    endforeach()
+    set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_BLACKWELL_DSA)
+    set(FASTLLM_DSA_BLACKWELL_OBJECTS $<TARGET_OBJECTS:fastllm_dsa_blackwell>)
+endif()
+
 # The dense projection has its own SM103a cubin, including in mixed SM100/103 builds.
 if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     add_library(fastllm_mxfp8_linear_sm103 OBJECT src/devices/cuda/linear/fastllm-linear-mxfp8-sm103.cu)
@@ -966,7 +986,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_MXFP8_LINEAR_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_DSA_BLACKWELL_OBJECTS} ${FASTLLM_MXFP8_LINEAR_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -981,6 +1001,9 @@ add_library(fastllm OBJECT
 # Compile the core once for executables and the Python shared library.
 set_target_properties(fastllm PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(fastllm PUBLIC ${FASTLLM_LINKED_LIBS})
+if (TARGET fastllm_dsa_blackwell)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_DSA_BLACKWELL_OBJECTS})
+endif()
 if (TARGET fastllm_mxfp8_linear_sm103)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_MXFP8_LINEAR_OBJECTS})
 endif()
