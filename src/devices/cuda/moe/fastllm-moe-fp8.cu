@@ -5571,6 +5571,60 @@ static bool FastllmCudaTypedMergeMOEFP8E4M3Batch1Indexed(const fastllm::Data &in
 }
 
 #ifndef USE_ROCM
+// One warp per output channel, with all verifier routes in the same grid.
+// Keep the two halves of the original 64-thread reduction independent until
+// their first addition. Missing routes are never consumed by the mailbox join.
+template <bool Gate>
+__global__ static void Fp8VerifyProjection(const float *inputs, float *outputs, const int32_t *slots,
+        uint8_t *const *weights, float *const *scales, int topk, int columns, int channels, float limit) {
+    const int route = blockIdx.y, slot = slots[route];
+    const int channel = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (slot < 0 || channel >= channels) return;
+    const float *x = inputs + size_t(Gate ? route / topk : route) * columns;
+    const uint8_t *w = weights[slot] + size_t(channel) * columns;
+    const int blocks = columns / 128;
+    const float *scale = scales[slot] + size_t(channel / 128) * blocks;
+    float a[2] = {}, b[2] = {};
+    for (int first = lane * 4; first < columns; first += 256) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int c = first + h * 128;
+            FastllmMoeFp8Accumulate4(x, c, *reinterpret_cast<const uint32_t *>(w + c), scale[c / 128], a[h]);
+            if constexpr (Gate) {
+                const auto *up = w + size_t(channels) * columns;
+                FastllmMoeFp8Accumulate4(x, c, *reinterpret_cast<const uint32_t *>(up + c),
+                    scale[(channels / 128) * blocks + c / 128], b[h]);
+            }
+        }
+    }
+    float v = a[0] + a[1], u = b[0] + b[1];
+#pragma unroll
+    for (int offset = 16; offset; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffff, v, offset);
+        if constexpr (Gate) u += __shfl_down_sync(0xffffffff, u, offset);
+    }
+    if (lane == 0) {
+        v *= FastllmMoeFp8Traits<float>::magicScale();
+        if constexpr (Gate) {
+            v = fminf(v, limit);
+            u = fmaxf(-limit, fminf(u * FastllmMoeFp8Traits<float>::magicScale(), limit));
+            v = (v / (1.0f + expf(-v))) * u;
+        }
+        outputs[size_t(route) * channels + channel] = v;
+    }
+}
+
+bool FastllmCudaMoeFP8VerifyProjections(const float *input, float *gate, float *partial,
+        const FastllmCudaMoeFP8CacheView &view, const int32_t *slots, int rows, int topk,
+        int hidden, int inter, float limit) {
+    const int routes = rows * topk;
+    Fp8VerifyProjection<true><<<dim3(inter / 4, routes), 128, 0, cudaStreamPerThread>>>(
+        input, gate, slots, view.gateWeights, view.gateScales, topk, hidden, inter, limit);
+    Fp8VerifyProjection<false><<<dim3(hidden / 4, routes), 128, 0, cudaStreamPerThread>>>(
+        gate, partial, slots, view.downWeights, view.downScales, topk, inter, hidden, limit);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 template <typename T, bool SeparateExperts = false, bool Clip = false>
 static bool LaunchMoeFP8Cache(const fastllm::Data &inputData, fastllm::Data &gateData,
                               fastllm::Data &outputData, const FastllmCudaMoeFP8CacheView &view,

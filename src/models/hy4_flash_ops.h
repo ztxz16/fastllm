@@ -56,7 +56,8 @@ using Weights = Hy4FlashModel::Weights;
 const StepInput *UploadStep(Scratch &, const std::vector<StepInput> &);
 void AdvanceKV(Data &, int end);
 void CopyStageCaptured(float *dst, const float *src, size_t count);
-void ProjectHead(Weights &, Scratch &, float *streams, float *logits, Data *hidden, int pos, int width);
+void ProjectHead(Weights &, Scratch &, float *streams, float *logits, Data *hidden, int pos, int width,
+                 int rows = 1);
 struct DraftMemory {
     Data keys, values, recalled;
 };
@@ -77,6 +78,7 @@ void HyperPre(Weights &, Scratch &, const std::string &prefix, float *streams, f
               bool finalHead = false);
 void HyperPost(float *streams, const float *branch, const float *post, int width);
 void Norm(Weights &, Scratch &, const std::string &name, const float *input, float *output, int width);
+void NormBatch(Weights &, Scratch &, const std::string &name, float *data, int rows, int width, int stride = 0);
 void Engram(Weights &, Scratch &, int layer, const std::array<int, 3> &ids, float *streams,
             const uint16_t *hostRows = nullptr, bool asyncCopy = false);
 void PrepareEngramInput(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids);

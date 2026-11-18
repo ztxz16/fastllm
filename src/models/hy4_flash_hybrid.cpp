@@ -190,6 +190,9 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
     const int vocab = w.meta.at("lm_head.weight").dims[0];
     const size_t outputs = verify ? rows : lengths.size();
     auto projected = s.Get("batchedLogits", outputs * vocab);
+    // Reserve the widest request before recording the scratch generation in the graph key.
+    if (capture && verify)
+        s.Get("headX", size_t(*std::max_element(lengths.begin(), lengths.end())) * 3072);
 
     std::vector<uintptr_t> key;
     const hy4::StepInput *stepInputs = nullptr;
@@ -278,7 +281,6 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                     }
                 }
                 hy4::HyperPre(w, s, p + "hc_attn_layer.hc_pre.", h, x, post);
-                hy4::Norm(w, s, p + "input_layernorm.weight", x, x, 3072);
                 auto provider = std::find(draftProviders.begin(), draftProviders.end(), layer);
                 auto *state = states[owners[row]];
                 auto index = provider - draftProviders.begin();
@@ -286,6 +288,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 attentionRows.push_back({positions[row], cache.first, cache.second, state ? draftWidth : 0,
                                          memory, int(index), s.step});
             }
+            hy4::NormBatch(w, s, p + "input_layernorm.weight", inputs, rows, 3072);
             hy4::AttentionBatch(w, s, layer, attentionRows, inputs, attnOutput);
             for (int row = 0; row < rows; ++row) {
                 auto h = streams + size_t(row) * 4 * 3072;
@@ -293,8 +296,8 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 auto post = posts + row * 4;
                 hy4::HyperPost(h, attnOutput + size_t(row) * 3072, post, 3072);
                 hy4::HyperPre(w, s, p + "hc_mlp_layer.hc_pre.", h, x, post);
-                hy4::Norm(w, s, p + "post_attention_layernorm.weight", x, x, 3072);
             }
+            hy4::NormBatch(w, s, p + "post_attention_layernorm.weight", inputs, rows, 3072);
             if (!layer) {
                 hy4::DenseMlpBatch(w, s, p + "mlp.", inputs, branch, rows);
                 for (int row = 0; row < rows; ++row)
@@ -344,15 +347,13 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 hy4::HyperPost(streams + size_t(row) * 4 * 3072, branch + size_t(row) * 3072, posts + row * 4,
                                3072);
         }
-        size_t output = 0;
-        offset = 0;
         for (size_t i = 0; i < lengths.size(); ++i) {
-            for (int row = verify ? offset : lastRows[i]; row <= lastRows[i]; ++row, ++output) {
-                s.step = capture ? stepInputs + row : nullptr;
-                hy4::ProjectHead(w, s, streams + size_t(row) * 4 * 3072, projected + output * vocab,
-                                 states[i] ? &states[i]->hidden : nullptr, positions[row], draftWidth);
-            }
-            offset += lengths[i];
+            const int count = verify ? lengths[i] : 1;
+            const int first = lastRows[i] + 1 - count;
+            const size_t output = verify ? size_t(first) : i;
+            s.step = capture ? stepInputs + first : nullptr;
+            hy4::ProjectHead(w, s, streams + size_t(first) * 4 * 3072, projected + output * vocab,
+                             states[i] ? &states[i]->hidden : nullptr, positions[first], draftWidth, count);
         }
         graph.Finish(key, verify, rows);
         s.step = nullptr;

@@ -615,7 +615,10 @@ struct NativeMoeMailbox {
             // Cache preparation already validated every immutable weight.
             // Reuse that result, as the segmented verifier does, instead of
             // scanning every expert again on each layer's critical path.
-            if (w.standard) fastllm::NumasMoeDecodeExpertsBatch(w.hostData,
+            if (layout.standardFp8Graph && w.rows == 4)
+                fastllm::NumasMoeGroupedExpertsBatch(w.hostData, w.hostData + w.rows * w.hidden,
+                    w.rows, w.weights.data(), box.ids(), box.gpu(), w.topk, w.modelLayer);
+            else if (w.standard) fastllm::NumasMoeDecodeExpertsBatch(w.hostData,
                 w.hostData + w.rows * w.hidden, w.rows, w.weights.data(), w.weights.size(),
                 box.ids(), box.gpu(), box.scores(), w.topk, w.modelLayer);
             else fastllm::NumasMoeVerifyExpertsWithOverlap(
@@ -636,6 +639,19 @@ struct NativeMoeMailbox {
     bool ComputeStandard(Layer &w, const OffloadLayout &layout, const uint8_t *records,
             const int32_t *slots, const float *scores, bool resident) {
         const int branch = resident ? 0 : 1;
+        if (w.rows == 4 && layout.standardFp8Graph && layout.weightType == fastllm::FP8_E4M3 &&
+            layout.swigluLimit > 0 && layout.gateBlockM == 128 && layout.gateBlockK == 128 &&
+            layout.downBlockM == 128 && layout.downBlockK == 128 &&
+            w.hidden % 256 == 0 && layout.inter % 256 == 0) {
+            const auto view = resident ? FP8CacheView(layout, cache.fp8Pointers, cache.slots)
+                                       : FP8CacheView(layout, fullCopy->fp8Pointers, fullCopy->expertReady.size());
+            const size_t offset = size_t(branch) * w.routes;
+            return FastllmCudaMoeFP8VerifyProjections(
+                static_cast<const float *>(w.compute->quantized.cudaData),
+                static_cast<float *>(w.compute->gate.cudaData) + offset * layout.inter,
+                w.compute->partial + offset * w.hidden, view, slots,
+                w.rows, w.topk, w.hidden, layout.inter, layout.swigluLimit);
+        }
         if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3 && w.rows > 1 &&
                 SupportsNVFP4WideDecode(layout)) {
             fastllm::Data gate;
@@ -1263,8 +1279,7 @@ bool TryNativeMoeMailbox(OffloadGroup &group, DeviceCache &cache, int table,
         !layout.deepSeekV41 || layout.weightType != fastllm::NVFP4_BLOCK_32_E8M0 ||
         input.dataType != fastllm::BFLOAT16 || input.dims[0] != 1 ||
         (routePhase != FastllmMoeRoutePhase::Decode && routePhase != FastllmMoeRoutePhase::Unspecified)) return false;
-    const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
-    if (mode && std::strcmp(mode, "gpu") == 0) return false;
+    if (Dsv41GpuCacheRequested()) return false;
     if (!cache.nativeMailbox) cache.nativeMailbox = std::make_shared<NativeMoeMailbox>(group, cache);
     return cache.nativeMailbox->Submit(table, input, index, score, output, weights, weightsBatch, layer, parallel);
 }

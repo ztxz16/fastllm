@@ -8571,7 +8571,7 @@ namespace fastllm {
     }
 #endif
 
-    static void NumasMoeGGUFExpertsBatch(const float *input, float *output, int rows,
+    void NumasMoeGroupedExpertsBatch(const float *input, float *output, int rows,
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
         int topk, int layer, const std::function<void()> *submitGpu, double *cpuElapsedUs) {
         HostMoePlacementScope placement(weights[2]);
@@ -8584,6 +8584,7 @@ namespace fastllm {
         for (int r = 0; r < rows * topk; ++r)
             if (gpuIndices[r] < 0) routes.push_back(r);
         if (routes.empty()) {
+            if (cpuElapsedUs) *cpuElapsedUs = 0;
             if (submitGpu) (*submitGpu)();
             return;
         }
@@ -8611,6 +8612,8 @@ namespace fastllm {
         work.downOutput.resize((size_t)count * hidden);
         auto *pool = GetHostMoePool();
         auto *config = GetNumaConfig();
+        const auto interval = pool->curActivateThreadInterval;
+        const int workers = interval.first == 0 && interval.second >= config->threads ? config->threads : 0;
         // Retain the single-token activation encoding. Group only the rows
         // owned by the CPU, including repeated experts and sparse GPU masks.
         RunMultiThreadConvertFromFloat32(work.realInput.data(), gateAct, input, rows, hidden, pool);
@@ -8638,27 +8641,35 @@ namespace fastllm {
                 auto &q = *work.hybridDecodeQueues[node];
                 q.phase = phase;
                 q.units = groups.size() * (phase == 0 ? 2 * inter : hidden) / config->numaCnt / 4;
-                q.tasks = std::min(q.units, 3 * (int)config->numaToCpuDict[node].size());
+                q.tasks = workers ? std::min(q.units, 3 * (int)config->numaToCpuDict[node].size()) : 1;
                 q.next.store(0, std::memory_order_relaxed);
             }
             const double start = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
             if (cpuElapsedUs) cpuWorkUs += start - cpuHostStart;
-            for (auto &worker : work.hybridDecodeWorkers) worker.measureTime = cpuElapsedUs != nullptr;
-            for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &work.hybridDecodeWorkers[t]);
+            for (int t = 0; t < workers; ++t) {
+                auto &worker = work.hybridDecodeWorkers[t];
+                worker.measureTime = cpuElapsedUs != nullptr;
+                pool->PushOp(t, &worker);
+            }
+            if (!workers) {
+                // A restricted pool can exclude workers that own weight shards.
+                for (int node = 0; node < config->numaCnt; ++node)
+                    work.hybridDecodeQueues[node]->RunBatch(0);
+            }
+            double completed = cpuElapsedUs && !workers ? NumasProfileNowMs() * 1000 : start;
             try {
                 // Start PCIe/GPU work while all grouped CPU gate/up jobs run.
                 if (phase == 0 && submitGpu) (*submitGpu)();
             } catch (...) {
-                for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+                for (int t = 0; t < workers; ++t) pool->Wait(t);
                 throw;
             }
-            for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+            for (int t = 0; t < workers; ++t) pool->Wait(t);
             if (cpuElapsedUs) {
                 // Match single-row timing: count worker completion, excluding
                 // a slower GPU submission callback or host-side wait tail.
-                double completed = start;
-                for (const auto &worker : work.hybridDecodeWorkers)
-                    completed = std::max(completed, worker.completedUs);
+                for (int t = 0; t < workers; ++t)
+                    completed = std::max(completed, work.hybridDecodeWorkers[t].completedUs);
                 cpuWorkUs += completed - start;
                 cpuHostStart = NumasProfileNowMs() * 1000;
             }
@@ -8680,7 +8691,7 @@ namespace fastllm {
         const int hidden = weights[2]->dims[1];
         if (rows > 1 &&
             weights[2]->dataType == DATA_GGUF_FORMAT && weights[3]->dataType == DATA_GGUF_FORMAT) {
-            NumasMoeGGUFExpertsBatch(input, output, rows, weights, indices, gpuIndices,
+            NumasMoeGroupedExpertsBatch(input, output, rows, weights, indices, gpuIndices,
                                     topk, layer, submitGpu, cpuElapsedUs);
             return;
         }

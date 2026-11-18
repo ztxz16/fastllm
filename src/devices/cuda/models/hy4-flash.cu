@@ -329,6 +329,18 @@ __global__ static void normEngramHeads(float *embedding, EngramNormWeights weigh
 void Norm(Weights &w, Scratch &s, const std::string &name, const float *x, float *y, int width) {
     norm<<<1, 256>>>(x, w.View(name, s.device), y, width, 1e-5f, true);
 }
+__global__ static void normBatch(float *data, Hy4View weight, int width, int stride) {
+    float *row = data + size_t(blockIdx.x) * stride;
+    normRow(row, weight, row, width, 1e-5f, true);
+}
+void NormBatch(Weights &w, Scratch &s, const std::string &name, float *data, int rows, int width,
+               int stride) {
+    if (rows == 1) {
+        Norm(w, s, name, data, data, width);
+        return;
+    }
+    normBatch<<<rows, 256>>>(data, w.View(name, s.device), width, stride ? stride : width);
+}
 __global__ static void embed(Hy4View w, int token, float *h, const StepInput *step) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (step)
@@ -479,8 +491,7 @@ void DenseMlpBatch(Weights &w, Scratch &s, const std::string &p, const float *in
         denseBatchActivation<<<(size + 255) / 256, 256>>>(gate, up, mid, size);
         LinearBatch(w, s, p + "down_proj.weight", mid, out, n);
         if (w.meta.count(p + "post_fc2_norm.weight"))
-            for (int r = 0; r < n; ++r)
-                Norm(w, s, p + "post_fc2_norm.weight", out + r * 3072, out + r * 3072, 3072);
+            NormBatch(w, s, p + "post_fc2_norm.weight", out, n, 3072);
     }
 }
 __global__ static void pick(const float *logits, Hy4View bias, int *id, float *score, float scale) {
@@ -600,17 +611,21 @@ void CombineExpertsBatch(Weights &w, Scratch &s, int layer, const float *input, 
     DenseMlpBatch(w, s, p + "shared_experts.", input, shared, rows);
     LinearBatch(w, s, p + "routed_expert_up_proj.weight", routed, out, rows);
     add<<<rows * 12, 256>>>(out, shared, rows * 3072);
-    for (int i = 0; i < rows; ++i)
-        Norm(w, s, p + "combine_output_norm.weight", out + i * 3072, out + i * 3072, 3072);
+    NormBatch(w, s, p + "combine_output_norm.weight", out, rows, 3072);
 }
 void ProjectHead(Weights &w, Scratch &s, float *h, float *values, Data *draftHidden, int position,
-                 int draftWidth) {
-    auto x = s.Get("headX", 3072);
-    HyperPre(w, s, "model.hc_head.", h, x, nullptr, true);
-    Norm(w, s, "model.norm.weight", x, x, 3072);
+                 int draftWidth, int rows) {
+    auto x = s.Get("headX", size_t(rows) * 3072);
+    for (int row = 0; row < rows; ++row) {
+        float *hidden = x + size_t(row) * 3072;
+        HyperPre(w, s, "model.hc_head.", h + size_t(row) * 4 * 3072, hidden, nullptr, true);
+    }
+    NormBatch(w, s, "model.norm.weight", x, rows, 3072);
     if (draftHidden)
-        SaveDraftHidden(*draftHidden, s.device, position, draftWidth, x, s.step);
-    Linear(w, s, "lm_head.weight", x, values);
+        for (int row = 0; row < rows; ++row)
+            SaveDraftHidden(*draftHidden, s.device, position + row, draftWidth, x + size_t(row) * 3072,
+                            s.step ? s.step + row : nullptr);
+    LinearBatch(w, s, "lm_head.weight", x, values, rows);
 }
 
 __device__ static float rope(float a, float b, int j, int pos, float theta) {
@@ -995,11 +1010,10 @@ void AttentionBatch(Weights &w, Scratch &s, int layer, const std::vector<Attenti
         LinearBatch(w, s, p + "kv_a_proj_with_mqa.weight", x, kv, n);
         // kv_a begins with 512 normalized channels followed by 64 rotary channels.
         auto normKv = s.Get("batchKvLatent", n * 512);
-        for (int i = 0; i < n; ++i) {
-            Norm(w, s, p + "q_a_layernorm.weight", qr + i * 1024, qr + i * 1024, 1024);
-            Norm(w, s, p + "kv_a_layernorm.weight", kv + i * 576, kv + i * 576, 512);
+        NormBatch(w, s, p + "q_a_layernorm.weight", qr, n, 1024);
+        NormBatch(w, s, p + "kv_a_layernorm.weight", kv, n, 512, 576);
+        for (int i = 0; i < n; ++i)
             CopyStageCaptured(normKv + i * 512, kv + i * 576, 512);
-        }
         LinearBatch(w, s, p + "q_b_proj.weight", qr, q, n);
         LinearBatch(w, s, p + "kv_b_proj.weight", normKv, expanded, n);
         LinearBatch(w, s, p + "linear_gate.weight", x, gate, n);
@@ -1013,8 +1027,7 @@ void AttentionBatch(Weights &w, Scratch &s, int layer, const std::vector<Attenti
                                 r.draftWidth, r.draft, r.draftLayer, &projections);
         }
         LinearBatch(w, s, p + "o_proj.weight", mix, y, n);
-        for (int i = 0; i < n; ++i)
-            Norm(w, s, p + "post_proj_norm.weight", y + i * 3072, y + i * 3072, 3072);
+        NormBatch(w, s, p + "post_proj_norm.weight", y, n, 3072);
     }
 }
 

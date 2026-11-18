@@ -77,6 +77,11 @@ constexpr size_t kMinDeviceMemoryReserveBytes = 256ULL << 20;
 constexpr size_t kMaxDeviceMemoryReserveBytes = 2ULL << 30;
 constexpr size_t kDeviceMemoryReserveDivisor = 16;
 
+bool Dsv41GpuCacheRequested() {
+    const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+    return mode && std::strcmp(mode, "gpu") == 0;
+}
+
 bool PackedCacheRows(const fastllm::Data &data) {
     return data.dims.size() == 2 && data.strides.size() == 2 &&
            data.strides[1] == 1 &&
@@ -1475,10 +1480,9 @@ DeviceCache *GetDeviceCache(OffloadGroup &group, bool waitForAdmission = true) {
     const bool ppPlacement = group.expertDevices.empty() &&
         std::any_of(group.cacheDevices.begin(), group.cacheDevices.end(), [](int d) { return d >= 0; });
     // Hybrid V4.1 has independent CPU/staging paths for every cache miss.
-    const char *requestedMode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
     const bool smallHybridCache = group.layout.deepSeekV41 && group.cpuDecodeReady &&
         group.expertDevices.empty() && !group.tensorParallelRequested &&
-        !(requestedMode && std::strcmp(requestedMode, "gpu") == 0);
+        !Dsv41GpuCacheRequested();
     // A small draft share can be below one expert record. Keep its mailbox
     // and staging metadata without allocating any resident payload.
     bool streamOnly = budgetBytes == 0 && group.cpuDecodeReady &&
@@ -2868,18 +2872,16 @@ bool ComputeNVFP4Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
     }
 }
 
-FastllmCudaMoeFP8CacheView FP8CacheView(const OffloadLayout &layout, const DeviceCache &cache) {
-    const size_t slots = cache.slots;
+FastllmCudaMoeFP8CacheView FP8CacheView(const OffloadLayout &layout, void **pointers, size_t slots) {
     const bool externalScales = layout.weightType == fastllm::DataType::FP8_E4M3;
-    const FastllmCudaMoeFP8CacheView view{
+    return {
         layout.weightType,
-        reinterpret_cast<uint8_t **>(cache.fp8Pointers),
-        reinterpret_cast<uint8_t **>(cache.fp8Pointers + slots),
-        externalScales ? reinterpret_cast<float **>(cache.fp8Pointers + 2 * slots) : nullptr,
-        externalScales ? reinterpret_cast<float **>(cache.fp8Pointers + 3 * slots) : nullptr,
+        reinterpret_cast<uint8_t **>(pointers),
+        reinterpret_cast<uint8_t **>(pointers + slots),
+        externalScales ? reinterpret_cast<float **>(pointers + 2 * slots) : nullptr,
+        externalScales ? reinterpret_cast<float **>(pointers + 3 * slots) : nullptr,
         layout.gateBlockM, layout.gateBlockK,
         layout.downBlockM, layout.downBlockK};
-    return view;
 }
 
 bool ComputeFP8Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
@@ -2888,8 +2890,9 @@ bool ComputeFP8Cache(const fastllm::Data &input, fastllm::Data &gateOutput,
     if (layout.glm5 || layout.deepSeekV41)
         return ComputeScoredFP8Experts(input, gateOutput, layout, cache.records,
             cache.routeSlots, scores, topk, perExpert);
-    return FastllmCudaMoeFP8CacheComputeLimited(input, gateOutput, output, FP8CacheView(layout, cache),
-        cache.routeSlots, scores, topk, perExpert, {}, layout.standardFp8Graph ? layout.swigluLimit : 0.f);
+    const auto view = FP8CacheView(layout, cache.fp8Pointers, cache.slots);
+    return FastllmCudaMoeFP8CacheComputeLimited(input, gateOutput, output, view, cache.routeSlots,
+        scores, topk, perExpert, {}, layout.standardFp8Graph ? layout.swigluLimit : 0.f);
 }
 
 bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
@@ -2908,21 +2911,23 @@ bool ComputeStagedNativeExpert(const fastllm::Data &input, fastllm::Data &gate,
     const bool scoredFp8 = (layout.glm5 || layout.deepSeekV41) &&
         layout.weightType == fastllm::FP8_E4M3_BLOCK_128 && input.dataType == fastllm::BFLOAT16;
     if (!v41 && !scoredFp8 && input.dataType != fastllm::FLOAT32) return false;
-    DeviceCache temporary;
-    temporary.slots = work.expertReady.size(); temporary.records = work.records;
-    temporary.fp8Pointers = work.fp8Pointers; temporary.routeSlots = slot;
     fastllm::Data gateRow;
     gateRow.FakeFrom(gate, 0); gateRow.Resize({1, layout.inter});
     gateRow.dataDeviceIds = gate.dataDeviceIds;
     // The caller supplies the same block32-quantized BF16 activation used by
     // resident V4.1 experts. Temporary records must keep that arithmetic too.
-    if (v41) return ComputeV41Cache(input, gateRow, output, layout, temporary, score, 1, perExpert);
     if (scoredFp8) return ComputeScoredFP8Experts(input, gateRow, layout, work.records,
         slot, score, 1, perExpert);
-    if (layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3)
+    if (v41 || layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3) {
+        DeviceCache temporary;
+        temporary.slots = work.expertReady.size(); temporary.records = work.records;
+        temporary.routeSlots = slot;
+        if (v41) return ComputeV41Cache(input, gateRow, output, layout, temporary, score, 1, perExpert);
         return LaunchNVFP4Cache<float>(input, gateRow, output, layout, temporary, score, 1, perExpert, events);
-    return FastllmCudaMoeFP8CacheComputeLimited(input, gateRow, output, FP8CacheView(layout, temporary),
-        slot, score, 1, perExpert, events, layout.standardFp8Graph ? layout.swigluLimit : 0.f);
+    }
+    const auto view = FP8CacheView(layout, work.fp8Pointers, work.expertReady.size());
+    return FastllmCudaMoeFP8CacheComputeLimited(input, gateRow, output, view, slot, score, 1,
+        perExpert, events, layout.standardFp8Graph ? layout.swigluLimit : 0.f);
 }
 
 bool ComputeV41Cache(const fastllm::Data &input, fastllm::Data &activation,
@@ -5500,8 +5505,7 @@ static bool MergeMOEHybrid(const fastllm::Data &input,
         cache->hybrid = std::move(work);
     }
     auto &work = *cache->hybrid;
-    const char *cacheMode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
-    if (layout.deepSeekV41 && cacheMode && std::strcmp(cacheMode, "gpu") == 0) {
+    if (layout.deepSeekV41 && Dsv41GpuCacheRequested()) {
         // Keep routing, demand refill and expert execution on the same CUDA
         // stream. In particular, do not copy activations/routes to NUMA or
         // synchronize each layer merely to decide a CPU/GPU split.
@@ -6189,8 +6193,7 @@ extern "C" bool fastllm_moe_cuda_cache_prefill_stats(int device, uint64_t *value
 
 void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, int rows) {
 #if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
-    const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
-    if ((mode && std::strcmp(mode, "gpu") == 0) || rows < 1 || rows > std::numeric_limits<int>::max() / kMaxTopK ||
+    if (rows < 1 || rows > std::numeric_limits<int>::max() / kMaxTopK ||
         FastllmCudaGraphIsCapturingFast()) return nullptr;
     int table = -1;
     auto *group = FindHybridGroup(weights, weightsBatch, &table);
@@ -6206,6 +6209,8 @@ void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, 
         FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
     const bool standardFp8 = layout.standardFp8Graph &&
         (layout.weightType == fastllm::FP8_E4M3 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128);
+    // The standard FP8 graph follows its registered placement independently of the V4.1 cache override.
+    if (!standardFp8 && Dsv41GpuCacheRequested()) return nullptr;
     const bool standard = standardFp8 || (group->qwen38FlashNext && !layout.deepSeekV41 && !layout.glm5 &&
         ((layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3 && SupportsNVFP4WideDecode(layout)) ||
          (layout.weightType == fastllm::DATA_GGUF_FORMAT && GGUFHybridShape(layout))));
@@ -6255,10 +6260,6 @@ void *FastllmCudaCreateNativeMoeFullGraph(const fastllm::Data &input, const fast
 #if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
     if (!graph) return nullptr;
     *graph = nullptr;
-    // An explicit pure-GPU request must retain its refill policy instead of
-    // silently switching back to the hybrid CPU/GPU scheduler during capture.
-    const char *mode = std::getenv("FASTLLM_DSV41_MOE_CACHE_MODE");
-    if (mode && std::strcmp(mode, "gpu") == 0) return nullptr;
     const std::vector<int> device{FastllmCudaGetDevice()};
     if (FastllmCudaGraphIsCapturingFast() ||
         !PackedCacheRows(input) || !PackedCacheRows(index) || !PackedCacheRows(score) ||

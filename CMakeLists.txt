@@ -3503,7 +3503,7 @@ if (UNIT_TEST)
             fastllm_add_checked_test(cuda_standard_moe_mailbox cuda_standard_moe_mailbox_test "ALL_PASS" 240)
             fastllm_add_checked_test(cuda_standard_moe_numa_block128 cuda_standard_moe_mailbox_test "ALL_PASS" 120 --numa-block128)
             set_tests_properties(cuda_standard_moe_numa_block128 PROPERTIES LABELS "cuda;moe;numa"
-                ENVIRONMENT "FT_THREADS=4" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+                ENVIRONMENT "FT_THREADS=4;FASTLLM_DSV41_MOE_CACHE_MODE=gpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             set_tests_properties(cuda_standard_moe_mailbox PROPERTIES LABELS cuda
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
             fastllm_add_checked_test(cuda_standard_moe_pageable cuda_standard_moe_mailbox_test "ALL_PASS" 360)
