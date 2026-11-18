@@ -16491,7 +16491,7 @@ __global__ void TrimTopKBoundaryTies(float *logits, const int *topKs, int vocab)
         const float x = values[id];
         if (isfinite(x)) { minimum = fminf(minimum, x); ++count; }
     }
-    float m = Min(scratch.min).Reduce(minimum, cub::Min());
+    float m = Min(scratch.min).Reduce(minimum, [](float a, float b) { return fminf(a, b); });
     if (threadIdx.x == 0) pivot = m;
     __syncthreads();
     int n = Sum(scratch.sum).Sum(count);
