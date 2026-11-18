@@ -5088,8 +5088,15 @@ void *FastllmCudaMallocModelWeight(size_t size, const std::string &name) {
     return FastllmCudaMallocModelWeightGrouped(size, name, false);
 }
 
-void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name, bool transientExpert) {
-    size_t slabBytes = FastllmCudaGetWeightSlabBytes();
+void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name,
+                                        bool transientExpert, bool releasableSource) {
+    // A repack source must be independently reclaimable even when the ordinary
+    // model-weight slab option is disabled. Reuse the existing refcounted slab
+    // allocator, with bounded groups instead of one cudaMalloc per TP expert.
+    constexpr size_t repackSlabBytes = 64ULL * 1024ULL * 1024ULL;
+    size_t slabBytes = releasableSource
+        ? std::max(repackSlabBytes, FastllmCudaAlignBytes(size * 2, repackSlabBytes))
+        : FastllmCudaGetWeightSlabBytes();
     if (slabBytes == 0 || size == 0 || size > slabBytes / 2) {
         return FastllmCudaMalloc(size);
     }
@@ -5101,6 +5108,7 @@ void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name, 
     const size_t align = 256;
     size_t aligned = FastllmCudaAlignBytes(size, align);
     std::string group = FastllmCudaWeightSlabGroup(name, transientExpert);
+    if (releasableSource) group = "repack:" + group;
     std::lock_guard<std::mutex> lock(fastllmCudaWeightSlabMutex);
 
     auto &slabs = fastllmCudaWeightSlabs[id];

@@ -3287,6 +3287,13 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_fp8_conversion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
             PASS_REGULAR_EXPRESSION "FP8 CONVERSION PASS")
 
+        add_executable(moe_source_ownership_test test/basic/test_cuda_moe_source_ownership.cpp)
+        target_include_directories(moe_source_ownership_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(moe_source_ownership_test PRIVATE fastllm)
+        add_test(NAME cuda_moe_source_ownership COMMAND moe_source_ownership_test)
+        set_tests_properties(cuda_moe_source_ownership PROPERTIES RUN_SERIAL TRUE TIMEOUT 120
+            SKIP_RETURN_CODE 77 PASS_REGULAR_EXPRESSION "SOURCE_SLAB_PASS gpu=7")
+
         add_executable(cuda_verify_multirow_test test/basic/test_cuda_verify_multirow.cu)
         target_link_libraries(cuda_verify_multirow_test PRIVATE fastllm)
         set_target_properties(cuda_verify_multirow_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

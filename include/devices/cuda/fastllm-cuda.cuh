@@ -383,7 +383,8 @@ bool FastllmCudaGetNcclForceSync();
 void FastllmCudaSetWeightSlabBytes(size_t bytes);
 size_t FastllmCudaGetWeightSlabBytes();
 void *FastllmCudaMallocModelWeight(size_t size, const std::string &name);
-void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name, bool transientExpert);
+void *FastllmCudaMallocModelWeightGrouped(size_t size, const std::string &name,
+    bool transientExpert, bool releasableSource = false);
 bool FastllmCudaIsWeightSlabPointer(const void *pointer);
 void FastllmCudaMemPoolStats();
 void * FastllmCudaDirectMalloc(size_t size);

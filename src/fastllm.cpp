@@ -135,7 +135,8 @@ namespace fastllm {
                 // TP NVFP4 sources are retired after each layer is repacked.
                 bool transientExpert = data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
                     (data.tpLinearType == TP_LINEAR_ROW || data.tpLinearType == TP_LINEAR_COLUMN);
-                return FastllmCudaMallocModelWeightGrouped(bytes, data.name, transientExpert);
+                return FastllmCudaMallocModelWeightGrouped(bytes, data.name,
+                    transientExpert || data.cudaRepackSource, data.cudaRepackSource);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }

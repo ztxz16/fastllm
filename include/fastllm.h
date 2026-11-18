@@ -608,6 +608,9 @@ namespace fastllm {
         std::vector <DiskWeightPart> diskWeightParts;
 
         bool directMemory = false; // 直接分配/释放Memory，不经过缓存
+        // Original model weights consumed by a packed backend. Group source
+        // allocations by layer so retiring the last source returns its slab.
+        bool cudaRepackSource = false;
 
         bool multiDeviceData = false;
         std::map <int, Data*> multiDeviceDatas;
