@@ -3,6 +3,7 @@
 #include "naive_n05_kvmem.h"
 #include "fastkv/host_cache.h"
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 #ifdef USE_CUDA
 #include "naive_n05_tp.h"
@@ -21,6 +22,18 @@ struct RestorePDDevice {
     int previous = FastllmCudaGetDevice();
     ~RestorePDDevice() { FastllmCudaSetDevice(previous); }
 };
+
+void SyncImportedDPCapacity(Data &root) {
+    // The wire shape only describes valid tokens. The metadata-only DP root
+    // can grow as far as every owning shard allows; physical pages are still
+    // reserved separately before each decode.
+    int rows = std::numeric_limits<int>::max();
+    for (const auto &entry : root.multiDeviceDatas)
+        rows = std::min(rows, entry.second->expansionDims.at(1));
+    root.expansionDims = root.dims;
+    root.expansionDims[1] = rows;
+}
+
 template <class Task>
 void RunPDWorkers(parallel::CudaRuntime *runtime, PersistentWorkerGroup &workers,
         const std::vector<int> &devices, const Task &task) {
@@ -439,7 +452,8 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
             target.multiDeviceDatas.clear(); target.multiDeviceDatas.swap(source.multiDeviceDatas);
             source.multiDeviceData = false;
             target.dataType = source.dataType; target.UpdateUnitSize(); target.Resize(source.dims);
-            target.expansionDims = target.dims; target.dataDevice = CUDA; target.dataDeviceIds = devices;
+            SyncImportedDPCapacity(target);
+            target.dataDevice = CUDA; target.dataDeviceIds = devices;
             target.multiDeviceData = true;
         }
         RunPDWorkers(model.attentionParallel ? &model.attentionParallel->runtime : nullptr,model.tpWorkers,devices,[&](int rank) {
@@ -827,6 +841,12 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
         copies.Submit();
     };
     RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices, unpack);
+    if (attentionDP > 1) {
+        for (auto &layer : context.pastKeyValues) {
+            SyncImportedDPCapacity(layer.first);
+            SyncImportedDPCapacity(layer.second);
+        }
+    }
     const bool hasDraft = metadata.U32();
     CheckPD(hasDraft == draftEnabled, "draft mode mismatch");
     if (hasDraft) {

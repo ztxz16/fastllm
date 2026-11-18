@@ -903,7 +903,7 @@ class Fixture : public NaiveN05FlashModel {
     }
     std::vector<PDGroupRecord> ExportPDGroupFixture() {
         std::vector<PDGroupRecord> records;
-        for (int length : {1, 127, 129, 257, 3073, 4097}) {
+        for (int length : {1, 127, 128, 129, 257, 3073, 4097}) {
             ResponseContext context; context.Init(block_cnt, dataType, kvCacheDataType);
             context.generationConfig.top_k = 1; context.generationConfig.input_token_length = length + 1;
             context.generationConfig.output_token_limit = 8;
@@ -1007,10 +1007,18 @@ class Fixture : public NaiveN05FlashModel {
                 wire.buffers[i].Read(a.data(),0,a.size()); exported.buffers[i].Read(b.data(),0,b.size());
                 if (a != b) throw std::runtime_error("PD cross-topology state bytes differ");
             }
+            SetCudaGraph(true);
             for (int step = 0; step < 3; ++step) {
-                SetCudaGraph(step != 0); std::vector<float> actual;
+                std::vector<float> actual;
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                const int before = verifyGraphLaunches.load();
+#endif
                 Forward(Data(FLOAT32,{1,1},{float(42+step)}),Data(),Data(FLOAT32,{1,1},{float(length+step)}),
                         context.pastKeyValues,context.generationConfig,LastTokensManager(),&actual);
+#ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
+                if (verifyGraphLaunches.load() - before != ranks)
+                    throw std::runtime_error("PD decode did not replay the graph on every rank");
+#endif
                 if (actual.size() != record.logits[step].size()) throw std::runtime_error("PD logits missing");
                 RequireCloseLogits(actual.data(), record.logits[step], "PD cross-topology logits");
             }
