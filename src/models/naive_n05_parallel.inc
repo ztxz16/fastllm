@@ -352,8 +352,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     const int samplingSlot = std::max(0, tpServingState ? tpServingState->pipelineOutputSlot : -1);
     const bool pipelined = tpServingState && tpServingState->pipelineOutputSlot >= 0;
-    AssertInFastLLM(!pipelined || (asyncSampling && !recording),
-        "Naive DP pipeline sampling or snapshot admission changed");
+    AssertInFastLLM(!pipelined || asyncSampling,
+        "Naive DP pipeline sampling admission changed");
     // Ring candidates use the same batched SWA/commit kernels as world TP.
     // A cache without the candidate tail retains chronological verification;
     // CommitTargetCaches restores its ring after accepting the chosen rows.

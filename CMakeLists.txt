@@ -3070,6 +3070,13 @@ if (UNIT_TEST)
             endforeach()
             add_test(NAME naive_n05_attention_dp_pipeline_8_bf16
                 COMMAND naive_n05_verify_graph_test 8 attention_dp_pipeline 8 bf16)
+            foreach(NAIVE_DP_BOUNDARY 248 2038)
+                add_test(NAME naive_n05_attention_dp_pipeline_boundary_${NAIVE_DP_BOUNDARY}
+                    COMMAND naive_n05_verify_graph_test 8 attention_dp_pipeline 8 fp8 history ${NAIVE_DP_BOUNDARY})
+                set_tests_properties(naive_n05_attention_dp_pipeline_boundary_${NAIVE_DP_BOUNDARY}
+                    PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                    PASS_REGULAR_EXPRESSION "ATTENTION DP PIPELINE PASS")
+            endforeach()
             set_tests_properties(naive_n05_attention_dp_pipeline_8_bf16
                 PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "ATTENTION DP PIPELINE PASS")

@@ -3136,7 +3136,11 @@ class Fixture : public NaiveN05FlashModel {
             SetCudaGraph(graph);
             const int requests = groups * 2;
             std::vector<Cache> caches(requests);
-            std::vector<int> past(requests, 2052);
+            std::vector<int> past(requests);
+            for (int row = 0; row < requests; ++row) {
+                const int boundaries[] = {248, 2044, 2052, 4088};
+                past[row] = boundaries[row % 4];
+            }
             GenerationConfig config; config.top_k = 1; config.repeat_penalty = 1;
             config.input_token_length = 4096; config.output_token_limit = 128;
             auto prefill = [&](int row, int count) {
@@ -3212,8 +3216,10 @@ class Fixture : public NaiveN05FlashModel {
                   << " relative=" << largestLogitRelative << std::endl;
     }
 
-    void AttentionDPPipelineChecks(int groups) {
+    void AttentionDPPipelineChecks(int groups, int startPast = 4088) {
         const bool history = saveHistoryChat;
+        // Cover repeated SWA wraps and more than one page/checkpoint boundary.
+        constexpr int stepsPerSegment = 96;
         if (!SupportsDecodePipeline()) throw std::runtime_error("DP pipeline not prepared");
         std::exception_ptr error;
         std::atomic<bool> ready{false};
@@ -3240,7 +3246,7 @@ class Fixture : public NaiveN05FlashModel {
                         while (AllocatePrefillGroup() != (row + groups - 1) % groups) {}
                         OnResponseContextCreated(c.get());
                         NaiveN05GraphTestAccess::SamplingIdentity(*this, &c->pastKeyValues[0].first, row + 1);
-                        const int past = 4088 + row % 3;
+                        const int past = startPast + row % 3;
                         std::vector<float> ids(past), positions(past);
                         for (int i = 0; i < past; ++i) { ids[i] = (i * 7 + row) % 251; positions[i] = i; }
                         Forward(Data(FLOAT32, {1, past}, ids), Data(), Data(FLOAT32, {1, past}, positions),
@@ -3269,12 +3275,14 @@ class Fixture : public NaiveN05FlashModel {
                                 c->allTokens.push_back(tokens[row]);
                             }
                         };
-                        while (step < 20) {
+                        while (step < stepsPerSegment) {
                             auto pipeline = overlap ? CreateDecodePipeline(active) : nullptr;
                             if (pipeline && pipeline->Submit(0)) {
                                 int slot = 0;
                                 for (;;) {
-                                    const bool next = step + 1 < 20 && pipeline->Submit(1 - slot, slot);
+                                    const bool next = step + 1 < stepsPerSegment && pipeline->Submit(1 - slot, slot);
+                                    if (step + 1 < stepsPerSegment && !next)
+                                        throw std::runtime_error("DP pipeline stopped at a page/checkpoint boundary");
                                     publish(pipeline->Collect(slot)); ++pipelined;
                                     if (!next) { pipeline->Drain(); break; }
                                     slot = 1 - slot;
@@ -3324,7 +3332,8 @@ class Fixture : public NaiveN05FlashModel {
         });
         ready.store(true); mainLoop->join(); delete mainLoop; mainLoop = nullptr;
         if (error) std::rethrow_exception(error);
-        if (pipelined < 80) throw std::runtime_error("DP pipeline coverage missing");
+        if (pipelined < 6 * (stepsPerSegment - 1))
+            throw std::runtime_error("DP pipeline lost steps outside batch admission");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         if (verifyGraphCaptures != captures) throw std::runtime_error("DP pipeline recaptured during churn");
 #endif
@@ -3345,7 +3354,8 @@ class Fixture : public NaiveN05FlashModel {
             const int before = pagedRestores;
             for (const auto &prompt : restorePrompts) {
                 hot.push_back(infer(prompt));
-                if (lastPrefixLength < 4096) throw std::runtime_error("pipeline decode checkpoint lost");
+                if (lastPrefixLength < (startPast / GetPageLen()) * GetPageLen())
+                    throw std::runtime_error("pipeline decode checkpoint lost");
             }
             if (pagedRestores - before != (int)restorePrompts.size() || hostRestores)
                 throw std::runtime_error("pipeline checkpoint did not restore resident GPU state");
@@ -5169,7 +5179,8 @@ int main(int argc, char **argv) {
 #endif
                 fixture.AttentionDPServingPlanChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
             if (pipeline)
-                fixture.AttentionDPPipelineChecks(argc > 3 ? std::stoi(argv[3]) : ranks);
+                fixture.AttentionDPPipelineChecks(argc > 3 ? std::stoi(argv[3]) : ranks,
+                    argc > 6 ? std::stoi(argv[6]) : 4088);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "attention_dp_ring") {

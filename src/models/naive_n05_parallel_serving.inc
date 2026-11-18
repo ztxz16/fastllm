@@ -22,7 +22,7 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
     if (!serving.preparing && (!serving.sealed || (maxBatch > 0 && batch->Size() > maxBatch))) return false;
     const auto &topology = dp.runtime.Layout();
     std::vector<int> counts(attentionDP);
-    int region = -1, longest = 0;
+    int longest = 0;
     for (int row = 0; row < batch->Size(); ++row) {
         const Data &key = batch->Key(row, 0);
         if (key.dims.size() != 3 || !key.multiDeviceData || key.dataDeviceIds.empty()) return false;
@@ -30,15 +30,16 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
         if (device == tpDevices.end()) return false;
         ++counts[topology.AttentionOwner(device - tpDevices.begin())];
         const int length = key.dims[1] + 1;
-        if (length <= 1 || length > max_positions || length == 2048) return false;
-        const int current = length <= 256 ? 0 : length < 2048 ? 1 : 2;
-        if (region >= 0 && current != region && !serving.preparing) return false;
-        region = current; longest = std::max(longest, length);
+        if (length <= 1 || length > max_positions) return false;
+        longest = std::max(longest, length);
     }
     const auto shape = DecodeGraphBatch::Select(
         *std::max_element(counts.begin(), counts.end()) * attentionDP, serving.batchBuckets);
     if (!shape) return false;
-    int capacity = region == 0 ? 256 : region == 1 ? 2047 : 4096;
+    // Captured kernels read each row's live length. A long-capacity graph also
+    // handles shorter rows (Indexer selects all valid keys when length <= K),
+    // including the exact dense-to-sparse boundary and mixed-length batches.
+    int capacity = longest <= 256 ? 256 : longest < 2048 ? 2047 : 4096;
     while (capacity < longest && capacity < max_positions)
         capacity = (int)std::min<int64_t>((int64_t)capacity * 2, max_positions);
     if (serving.preparing) capacity = serving.prepareCapacity;

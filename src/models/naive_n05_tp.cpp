@@ -820,22 +820,30 @@ struct NaiveN05FlashModel::TargetDecodePipeline : basellm::DecodePipeline {
             if (!plan.Matches(batch, model.tpCacheEpoch.load(std::memory_order_relaxed),
                     model.tpRequestIds, batch.Size())) return false;
         }
-        if (!plan.CanAppend()) return false;
-        auto graph = plan.graph.lock();
-        if (!graph || !graph->captured || graph->disabled) return false;
+        auto previous = plan.graph.lock();
+        if (!previous || !previous->captured || previous->disabled) return false;
+        int longest = 0;
+        bool boundary = !plan.CanAppend();
+        for (const auto &request : plan.requests) {
+            const int next = request.length + 1;
+            if (next > model.max_positions) return false;
+            longest = std::max(longest, next);
+            boundary |= model.saveHistoryChat && next % GetPageLen() == 0;
+        }
+        auto found = serving->graphs.lower_bound({previous->rows, longest});
+        if (found == serving->graphs.end() || found->first.first != previous->rows) return false;
+        auto graph = found->second;
+        if (!graph->captured || graph->disabled) return false;
+        boundary |= graph != previous;
         for (const auto &rank : graph->ranks)
             if (!rank->exec || !rank->storage->decodeTokenRows[0].cudaData ||
                 !rank->storage->decodeTokenRows[1].cudaData) return false;
-        // Drain before a page boundary so the ordinary forward can save its
-        // immutable SWA checkpoint before later steps overwrite the ring.
-        // Page growth and graph-region changes also use the ordinary path.
-        for (const auto &request : plan.requests) {
-            const int next = request.length + 1;
-            if (model.saveHistoryChat && next % GetPageLen() == 0) return false;
-            if (next > graph->capacity || next == 2048 ||
-                (next <= 256) != (graph->capacity <= 256) ||
-                (next < 2048) != (graph->capacity < 2048)) return false;
-        }
+        // Reservation/COW and SWA checkpoints may touch storage owned by the
+        // prior submission. Keep its token ticket, but finish its GPU work
+        // before rebinding. Forward still replays a prewarmed model graph and
+        // records the checkpoint before another step can overwrite the ring.
+        if (boundary && inputSlot >= 0)
+            for (const auto &sampler : dp.sampling) if (sampler) sampler->Drain();
         if (inputSlot < 0) {
             samplingRows.assign(model.attentionDP, {});
             for (int group = 0; group < model.attentionDP; ++group) {
