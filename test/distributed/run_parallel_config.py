@@ -168,7 +168,7 @@ def main():
         if args.execution_tests:
             modules += ['test_qwen3_shard_runner', 'test_qwen3_device_weights_runner', 'test_qwen3_layer_runner',
                         'test_generation_alignment', 'test_qwen_moe_generation_alignment', 'test_qwen_moe_alignment_all',
-                        'test_qwen_moe_performance',
+                        'test_qwen_moe_performance', 'test_qwen_moe_concurrency_probe', 'test_qwen_moe_admission_probe',
                         'test_process_dp', 'test_dp_routing', 'test_dp_service_stability', 'test_qwen3_session',
                         'test_qwen3_http', 'test_qwen3_generation', 'test_qwen3_prefix_cache', 'test_qwen3_decode_runner']
         if args.benchmark_tests:

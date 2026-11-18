@@ -260,6 +260,34 @@ bash test/distributed/run_attention_ep_v100.sh performance
 V编号只在本次运行内比较。换服务器后先检查GPU/CPU、编译缓存和二进制SHA256等元数据，
 新机器上的诊断不能代替旧机器的故障复现。本报告不输出吞吐或加速比，不覆盖历史验收结果。
 
+### 固定准入轮次的归因诊断
+
+若额外Eager步骤与输出变体相关，但随机入队难以稳定复现，可固定联合轮次：
+
+```bash
+"$ATTENTION_EP_PYTHON" test/distributed/probe_qwen_moe_admission.py \
+  --build "$ATTENTION_EP_BUILD" --model "$ATTENTION_EP_MODEL" \
+  --prompt-length 1024 --output-tokens 128 --first-wave 4 2 \
+  --repeats 5 --trace-tokens 2 79
+```
+
+`first-wave=4`让四rank同时Begin；`first-wave=2`让rank 0、1先Begin，下一轮
+它们Decode而rank 2、3 Begin。也可显式选择`--first-wave 4 1 2 3`补充1+3和3+1。
+这是直接使用正式`RoundTransport`协议的独立归因诊断，仅规定准入轮次，不运行Python
+异步准入队列，不能作为正式队列/HTTP/性能验收。原生前向、算子选择、KV生命周期、
+通信同步、Graph回退和实际采样沿用正式实现；每步输入实际采样Token，无教师强制。
+诊断不改变生产调度、不合入性能入口、不要求重编译，也不自动放宽原有失败标准。
+
+每种模式/组合独立加载，warmup一批，再执行5批四请求。默认共80个请求比较项，分别
+比较同组合/同rank首次结果、同模式全4准入结果、Graph对应的Eager结果；全4准入还
+比较同批rank 0，避免漏掉rank之间的差异。完整logits只在指定位置保存，数值误差只
+比较相同输入历史；第79步分歧之前的logits差异只能缩小定位范围，不能单独证明根因。
+
+结果保存在`时间戳_moe_admission_probe_随机号/`：每批含`rounds.jsonl`与`rank0.json`
+等实际输出，根目录含逐请求比较证据和`summary.json/md/csv/xlsx`。任一Token差异、
+缺失logits、错误路径、Graph计数不符或KV未释放均返回非零；中断保留部分结果。
+`NOT_OBSERVED`仅表示本次固定组合未复现，不会覆盖历史性能FAIL。
+
 ### 四项联合验收
 
 `real-all`等价于真实模型入口的`--alignment-policy all`。固定比较exact、K=5/容差0、
