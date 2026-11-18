@@ -227,7 +227,7 @@ set(FASTLLM_CXX_SOURCES src/exl3.cpp src/fastllm.cpp src/pd.cpp src/models/naive
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/sensenova_loop.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/sensenova_loop.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp src/models/hy4_flash_hybrid.cpp src/models/qwen3_next.cpp
         src/models/qwen4_exp.cpp src/models/qwen4_exp_moe.cpp src/models/qwen4_exp_gpu.cpp
         src/models/qwen4_exp_graph.cpp src/models/qwen4_exp_gpu_graph.cpp src/models/qwen4_exp_hybrid_graph.cpp
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
@@ -506,6 +506,14 @@ if (USE_CUDA)
         src/devices/cuda/models/clover-kernels.cu
         src/devices/cuda/models/clover-attention.cu
         src/devices/cuda/models/qwen4-kernels.cu)
+
+    # The published E4M3 checkpoint uses cuda_fp8.h from CUDA 11.8.
+    if (NOT USE_ROCM AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
+        list(APPEND FASTLLM_CUDA_SOURCES src/devices/cuda/models/hy4-flash.cu)
+        set_property(SOURCE src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp
+            src/models/hy4_flash_hybrid.cpp src/devices/cuda/models/hy4-flash.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_HY4_CUDA)
+    endif()
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
@@ -3487,6 +3495,8 @@ if (UNIT_TEST)
             target_link_libraries(cuda_standard_moe_mailbox_test PRIVATE fastllm)
             target_include_directories(cuda_standard_moe_mailbox_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(cuda_standard_moe_mailbox cuda_standard_moe_mailbox_test "ALL_PASS" 240)
+            fastllm_add_checked_test(cuda_standard_moe_numa_block128 cuda_standard_moe_mailbox_test "ALL_PASS" 120 --numa-block128)
+            set_tests_properties(cuda_standard_moe_numa_block128 PROPERTIES LABELS "cuda;moe;numa" RUN_SERIAL TRUE)
             set_tests_properties(cuda_standard_moe_mailbox PROPERTIES LABELS cuda
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
             fastllm_add_checked_test(cuda_standard_moe_pageable cuda_standard_moe_mailbox_test "ALL_PASS" 360)

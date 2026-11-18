@@ -4,6 +4,7 @@
 #include "model.h"
 #include "fastllm.h"
 #include "weights/safetensors_source.h"
+#include "weights/hy4_flash_experts.h"
 #include "weights/row_concat.h"
 #include "executor.h"
 #ifdef USE_NUMAS
@@ -34,6 +35,7 @@
 #include "qwen3.h"
 #include "qwen3_moe.h"
 #include "hy_v3.h"
+#include "hy4_flash.h"
 #include "qwen3_next.h"
 #include "qwen4_exp.h"
 #include "kimi_k3.h"
@@ -977,6 +979,8 @@ namespace fastllm {
             model = (basellm*)(new MoeModel());
         } else if (modelType == "qwen3_moe") {
             model = (basellm*)(new Qwen3MOEModel());
+        } else if (modelType == "hy_v4_flash") {
+            model = new Hy4FlashModel();
         } else if (modelType == "hy_v3" || modelType == "HYV3ForCausalLM") {
             model = (basellm*)(new HyV3Model());
             model->model_type = "hy_v3";
@@ -5346,13 +5350,30 @@ namespace fastllm {
                 safeTensors.itmeDict[item.first] = item.second;
         }
         NormalizeSafeTensorSources(config["quantization_config"]["quant_method"].string_value(), safeTensors.itmeDict);
-        {
+        if (config["model_type"].string_value() == "hy_v4_flash") {
+            const auto &text = config["text_config"];
+            for (const auto &layer : text["engram_layer_ids"].array_items()) {
+                const std::string name = "model.layers." + std::to_string(layer.int_value() - 1) +
+                                         ".engram_layer.";
+                AssertInFastLLM(safeTensors.itmeDict.count(name + "multi_head_embedding.embedding.weight") &&
+                                safeTensors.itmeDict.count(name + "lookup_table"),
+                                "Missing HY4-Flash Engram tensors at " + name);
+            }
+        } else {
             const auto &textConfig = config["text_config"].is_object() ? config["text_config"] : config;
             for (const auto &layer : textConfig["engram_layer_ids"].array_items()) {
                 const std::string name = "layers." + std::to_string(layer.int_value()) + ".engram.embed.";
                 AssertInFastLLM(safeTensors.itmeDict.count(name + "weight") && safeTensors.itmeDict.count(name + "scale"),
                     "Checkpoint is missing Engram tables; supply --engram-path or FASTLLM_DSV41_ENGRAM_PATH.");
             }
+        }
+        if (auto *hy = dynamic_cast<Hy4FlashModel *>(model)) {
+            hy->SetConfig(config);
+            for (const auto &entry : safeTensors.itmeDict) {
+                const auto &t = entry.second;
+                hy->AddSource(entry.first, t.fileName, t.dtype, t.intShape, t.data_offsets.at(0), t.bytes);
+            }
+            if (hy->UsesHostExperts()) SplitHy4FlashExperts(safeTensors.itmeDict, config["text_config"]);
         }
         auto tensors = safeTensors.GetSortedItemNames();
         

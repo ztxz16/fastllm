@@ -1430,9 +1430,19 @@ def make_normal_llm_model(args, startup_progress = None):
                 "--draft_tokens and --dspark specify different token counts")
         dspark_tokens = draft_tokens
         args.dspark = dspark_tokens
-    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash", "clover"):
+    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash", "clover", "dfly2"):
         raise ValueError(
-            "--speculative_algorithm currently supports off, mtp, dspark, dflash or clover")
+            "--speculative_algorithm currently supports off, mtp, dspark, dflash, dfly2 or clover")
+    if speculative_algorithm == "dfly2":
+        if mtp or dspark_tokens or speculative_draft_path:
+            raise ValueError("HY4-Flash DFly2 uses the checkpoint's embedded draft weights")
+        width = int(getattr(args, "speculative_num_draft_tokens", -1))
+        width = width if width > 0 else (draft_tokens + 1 if draft_tokens > 0 else 4)
+        if not 2 <= width <= 16 or (draft_tokens > 0 and draft_tokens + 1 != width):
+            raise ValueError("DFly2 requires 2–16 verification rows, including the anchor")
+        os.environ["FASTLLM_DFLY2_BLOCK_SIZE"] = str(width)
+    else:
+        os.environ.pop("FASTLLM_DFLY2_BLOCK_SIZE", None)
     if speculative_algorithm == "clover" and (mtp or dspark_tokens or speculative_draft_path or draft_tokens > 0):
         raise ValueError("Clover shares the target model; use --speculative_num_draft_tokens for its block width")
     if speculative_algorithm == "dspark" and mtp > 0:
@@ -1906,6 +1916,8 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm:
                 raise
             pass
+    if speculative_algorithm == "dfly2" and config.get("model_type") != "hy_v4_flash":
+        raise ValueError("--speculative_algorithm dfly2 requires a HY4-Flash checkpoint")
     if is_clover_model:
         from .clover_config import prepare as prepare_clover
         prepare_clover(args, config)

@@ -686,7 +686,14 @@ struct NativeMoeMailbox {
             } else {
                 DeviceCache view;
                 view.records = const_cast<uint8_t *>(records); view.routeSlots = const_cast<int32_t *>(slots + row * w.topk);
-                if (!ComputeNVFP4Cache(input, gate, dummy, layout, view,
+                if (layout.weightType == fastllm::FP8_E4M3 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128) {
+                    const auto *staging = resident ? nullptr : fullCopy.get();
+                    view.slots = resident ? cache.slots : staging->expertReady.size();
+                    view.fp8Pointers = resident ? cache.fp8Pointers : staging->fp8Pointers;
+                    fastllm::Data output(fastllm::FLOAT32,{1,w.hidden},fastllm::CUDA,partial);
+                    if (!ComputeFP8Cache(input,gate,output,layout,view,scores+row*w.topk,w.topk,partial))
+                        return false;
+                } else if (!ComputeNVFP4Cache(input, gate, dummy, layout, view,
                         scores + row * w.topk, w.topk, partial)) return false;
             }
         }

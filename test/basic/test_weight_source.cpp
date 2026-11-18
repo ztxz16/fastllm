@@ -1,6 +1,7 @@
 #include "utils.h"
 #include "../../src/weights/safetensors_source.h"
 #include "../../src/weights/row_concat.h"
+#include "../../src/weights/hy4_flash_experts.h"
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -18,7 +19,44 @@ struct Item {
 static void Check(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
 }
+static void TestHy4ExpertSlices() {
+    const json11::Json config = json11::Json::object{
+        {"n_routed_experts", 3}, {"routed_expert_hidden_size", 256}, {"moe_intermediate_size", 192},
+        {"mlp_layer_types", json11::Json::array{"dense", "sparse"}},
+        {"quantization_config", json11::Json::object{{"weight_block_size", json11::Json::array{128, 128}}}}};
+    const std::string prefix = "model.layers.1.mlp.experts.";
+    std::map<std::string, Item> items;
+    std::map<std::string, Item> originals;
+    uint64_t start = 1ULL << 34;
+    for (bool gate : {true, false}) {
+        for (bool scale : {false, true}) {
+            const int rows = gate ? 384 : 256, columns = gate ? 256 : 192;
+            auto &source = items[prefix + (gate ? "gate_up_proj" : "down_proj") + (scale ? "_scale_inv" : "")];
+            source.fileName = gate ? "gate.safetensors" : "down.safetensors";
+            source.dtype = scale ? "BF16" : "F8_E4M3";
+            source.intShape = {3, scale ? (rows + 127) / 128 : rows, scale ? (columns + 127) / 128 : columns};
+            source.bytes = 3ULL * source.intShape[1] * source.intShape[2] * (scale ? 2 : 1);
+            source.data_offsets = {start, start + source.bytes};
+            originals[(gate ? "gateup_proj.weight" : "down_proj.weight") +
+                      std::string(scale ? "_scale_inv" : "")] = source;
+            start += source.bytes;
+        }
+    }
+    SplitHy4FlashExperts(items, config);
+    Check(items.size() == 12, "HY4 stacked expert or scale was not split");
+    for (const auto &entry : originals) {
+        const auto &src = entry.second;
+        for (int expert = 0; expert < 3; ++expert) {
+            const auto &v = items.at(prefix + std::to_string(expert) + "." + entry.first);
+            const uint64_t first = src.data_offsets[0] + expert * (src.bytes / 3);
+            Check(v.data_offsets == std::vector<uint64_t>{first, first + src.bytes / 3} &&
+                  v.intShape == std::vector<int>{src.intShape[1], src.intShape[2]} &&
+                  v.dtype == src.dtype && v.fileName == src.fileName, "Invalid HY4 expert or scale range");
+        }
+    }
+}
 int main() {
+    TestHy4ExpertSlices();
     const auto root = std::filesystem::temp_directory_path() /
         ("fastllm-weight-source-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(root);

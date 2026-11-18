@@ -389,10 +389,75 @@ static void Run(int gateKind, int downKind, int hidden = 256, int inter = 128, i
     std::printf("PASS Standard mailbox gate=%d down=%d device=%d owned_pp=%d topk=%d checks=%d worst_mixture_L2=%.8g\n",
         gateKind,downKind,device,int(ownedPp),topk,checks,worstL2);
 }
+// NUMA registration stores packed block128 FP8. HY4 exercises 16 routed
+// experts for both a single decode token and up to 16 batched verify rows.
+static void CheckBlock128NumaGraph() {
+    constexpr int width=128, experts=48, topk=16, pitch=132;
+    std::vector<std::unique_ptr<Data>> owned;
+    std::vector<Data *> weights(2+experts*2,nullptr);
+    std::vector<std::pair<Data *,std::string>> registration;
+    for(int e=0;e<experts;++e) for(int part=0;part<2;++part) {
+        const int rows=part?width:2*width;
+        auto w=std::make_unique<Data>(FP8_E4M3_BLOCK_128,std::vector<int>{rows,width});
+        w->blockK=1;w->blockM=128;w->Allocate();
+        for(int row=0;row<rows;++row){
+            auto tile=w->cpuData+row*pitch;
+            memset(tile,0,width);
+            tile[row%width]=0x38;
+            const float scale=part && (e&1)?.5f:1.f;
+            memcpy(tile+width,&scale,sizeof(scale));
+        }
+        weights[2+e*2+part]=w.get();
+        registration.emplace_back(w.get(),part?"linear":"linearSwiglu");
+        owned.push_back(std::move(w));
+    }
+    SetMoeCudaCacheBytes(32ULL*width*pitch*3);
+    HybridMoeCachePlan plan(HybridMoeMath::Standard,10.f);
+    plan.Add(weights,"numa",0);
+    Require(plan.Prepare([&]{RegisterNumasMoeWeightBatch(registration);},true),"register NUMA FP8");
+    for(int rows:{1,4,16}){
+        Data x(FLOAT32,{rows,width}), ids(INT32,{rows,topk}), scores(FLOAT32,{rows,topk}), out;
+        Gpu(x);Gpu(ids);Gpu(scores);
+        HybridMoeDecodeStep step;
+        step.Begin(weights.data(),weights.size(),topk);
+        void *child=nullptr;
+        auto handle=FastllmCudaCreateNativeMoeFullGraph(x,ids,scores,out,weights.data(),weights.size(),1,nullptr,&child);
+        Require(handle && child,"create NUMA block128 FP8 child");
+        HybridMoeGraph graph;
+        Require(graph.Compose({child},{handle}),"compose NUMA block128 FP8");
+        for(int pass=0;pass<4;++pass) {
+            std::vector<float> values(rows*width),scale(rows*topk,1.f/topk),actual(rows*width);
+            std::vector<int> routed(rows*topk);
+            for(int r=0;r<rows;++r){
+                for(int j=0;j<width;++j) values[r*width+j]=float(1+(r+j+pass)%6)/8.f;
+                for(int j=0;j<topk;++j) routed[r*topk+j]=(r*3+j+pass)%experts;
+            }
+            Cuda(cudaMemcpy(x.cudaData,values.data(),values.size()*4,cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(ids.cudaData,routed.data(),routed.size()*4,cudaMemcpyHostToDevice));
+            Cuda(cudaMemcpy(scores.cudaData,scale.data(),scale.size()*4,cudaMemcpyHostToDevice));
+            Require(graph.Launch(),"launch NUMA block128 FP8 graph");
+            Cuda(cudaMemcpy(actual.data(),out.cudaData,actual.size()*4,cudaMemcpyDeviceToHost));
+            for(size_t i=0;i<actual.size();++i){
+                const float v=values[i];
+                Require(std::abs(actual[i]-.75f*v*v/(1.f+std::exp(-v)))<.012f,"NUMA block128 result mismatch");
+            }
+            step.Finish();
+            if(pass<3)step.Begin(weights.data(),weights.size(),topk);
+        }
+    }
+    FastllmCudaReleaseMoeCache(weights.data(),weights.size());
+    ClearNumasMoeRuntimeCache();
+    for(auto &w:owned) ReleaseNumasMoeWeightArena(w.get());
+}
 int main(int argc, char **argv) {
     try {
         if (!FastllmCudaGetDeviceCount()) return 77;
         SetThreads(4); SetCudaGraph(true);
+        if(argc>1 && std::strcmp(argv[1],"--numa-block128")==0){
+            CheckBlock128NumaGraph();
+            std::puts("ALL_PASS");
+            return 0;
+        }
         const bool batchEntry = argc > 1 && std::strcmp(argv[1], "--batch-entry") == 0;
         const bool groupedFormats = argc > 1 && std::strcmp(argv[1], "--grouped-formats") == 0;
         const bool largePrefill = argc > 1 && std::strcmp(argv[1], "--large-prefill") == 0;

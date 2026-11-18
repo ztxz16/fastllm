@@ -9,7 +9,7 @@ namespace fastllm {
 // Reuse disk's compact CPU kernel, including BF16 and block-32 FP8 boundaries.
 static void DiskGraphNativeCpu(const std::vector<float> &input, std::vector<float> &output,
                                const std::vector<Data *> &table, const std::vector<int32_t> &indices,
-                               const std::vector<float> &scores, int hidden, bool singleRow, float limit) {
+                               const std::vector<float> &scores, int hidden, bool singleRow, float limit,bool v41) {
     const int rows = indices.size();
     Data x(BFLOAT16, {rows, hidden}), y(BFLOAT16, {rows, hidden}), ids(INT32PARAM, {rows, 1}),
         scale(FLOAT32, {rows, 1}), a, b, c;
@@ -34,9 +34,9 @@ static void DiskGraphNativeCpu(const std::vector<float> &input, std::vector<floa
                      {"w3", &c}};
     IntDict params = {{"weights___batch", int(table.size())},
                       {"biass___batch", int(table.size())},
-                      {"deepSeekV4Mode", 1},
-                      {"activationQuantBlock", 32},
+
                       {"diskMoeDecode", 1}};
+    if(v41){ params["deepSeekV4Mode"]=1;params["activationQuantBlock"]=32; }
     struct Cpu : CpuMergeMOE {
         using CpuMergeMOE::Run;
     };
@@ -46,8 +46,12 @@ static void DiskGraphNativeCpu(const std::vector<float> &input, std::vector<floa
         output[i] = BFloat16BitsToFloat32(reinterpret_cast<uint16_t *>(y.cpuData)[i]);
 }
 static bool DiskGraphNativePair(const Data &gate, const Data &down) {
-    return gate.dataType == NVFP4 && down.dataType == NVFP4 && gate.scales.empty() && down.scales.empty() &&
-           gate.blockK == 1 && down.blockK == 1 && gate.blockM == 32 && down.blockM == 32 &&
+    const bool fp4=gate.dataType==NVFP4 && down.dataType==NVFP4 && gate.scales.empty() && down.scales.empty() &&
+            gate.blockK==1 && down.blockK==1 && gate.blockM==32 && down.blockM==32;
+    const bool fp8=gate.dataType==FP8_E4M3 && down.dataType==FP8_E4M3 && gate.blockK>0 && down.blockK>0 &&
+            gate.blockM==128 && down.blockM==128 && gate.dims.size()==2 && down.dims.size()==2 &&
+            gate.dims[1]%128==0 && down.dims[1]%128==0;
+    return (fp4 || fp8) &&
            gate.dims.size() == 2 && down.dims.size() == 2 && gate.dims[0] == 2 * down.dims[1] &&
            gate.dims[1] == down.dims[0] && gate.dims[1] > 0 && gate.dims[1] <= 24576 && down.dims[1] > 0 &&
            down.dims[1] <= 24576 && gate.dims[1] % 32 == 0 && down.dims[1] % 32 == 0;
@@ -177,9 +181,9 @@ struct DiskMoeV41Graph::Impl {
                 continue;
             }
             std::vector<float> output(size_t(ids.size()) * l.hidden);
-            const bool native = l.weights[2]->dataType == NVFP4;
+            const bool native = l.weights[2]->dataType == NVFP4 || l.weights[2]->dataType == FP8_E4M3;
             if (native)
-                DiskGraphNativeCpu(input, output, table, ids, scores, l.hidden, l.rows == 1, l.limit);
+                DiskGraphNativeCpu(input, output, table, ids, scores, l.hidden, l.rows == 1, l.limit,l.weights[2]->dataType==NVFP4);
             const bool ok =
                 native ||
                 (l.rows == 1
@@ -233,7 +237,11 @@ struct DiskMoeV41Graph::Impl {
                             FastllmCudaSetDiskMxfp4MarlinLayout(*gpu->gate, false);
                             FastllmCudaSetDiskMxfp4MarlinLayout(*gpu->down, false);
                         }
-                        request.records[e] = gpu ? static_cast<const uint8_t *>(gpu->cudaRecord) : nullptr;
+                        if(l.weights[2]->dataType==FP8_E4M3) {
+                            const bool ready=gpu && gpu->restoreFp8 && gpu->interleavedGate;
+                            request.records[e]=ready?static_cast<const uint8_t *>(gpu->gate->cudaData):nullptr;
+                            request.downRecords[e]=ready?static_cast<const uint8_t *>(gpu->down->cudaData):nullptr;
+                        } else request.records[e] = gpu ? static_cast<const uint8_t *>(gpu->cudaRecord) : nullptr;
                     }
                 }
                 {
@@ -283,7 +291,7 @@ struct DiskMoeV41Graph::Impl {
                             std::unique_ptr<DiskCachedExpert> recycled;
                             if (!cache.MakeRoom(&entry, device, bytes, GetMoeCudaCacheBytes(), &recycled))
                                 continue;
-                            const bool native = l.weights[2]->dataType == NVFP4;
+                            const bool native = l.weights[2]->dataType == NVFP4 || l.weights[2]->dataType == FP8_E4M3;
                             auto candidate =
                                 native ? DiskCudaExpert(*entry.cpu, MoeGateSwiglu) : cache.TakeCpu(entry);
                             AssertInFastLLM(bool(candidate), "Disk graph cache conversion rejected");

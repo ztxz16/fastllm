@@ -588,7 +588,7 @@ template <int THREAD_PER_BLOCK>
 __global__ void FastllmGemvHalfFP8E4M3TopKSwigluIndexedKernel(half *A, const int32_t *indices,
                                                               uint8_t **weights, float **scalesPtrs,
                                                               half *C, int topk, int m, int k,
-                                                              int blockM, int blockK) {
+                                                              int blockM, int blockK,float limit=0.f) {
     __shared__ float sdataGate[THREAD_PER_BLOCK];
     __shared__ float sdataUp[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
@@ -672,6 +672,10 @@ __global__ void FastllmGemvHalfFP8E4M3TopKSwigluIndexedKernel(half *A, const int
     if (tid == 0) {
         float gate = (float)(half)(sdataGate[0] * magicScaleConstant);
         float up = (float)(half)(sdataUp[0] * magicScaleConstant);
+        if(limit>0.f) {
+            gate=fminf(gate,limit);
+            up=fmaxf(-limit,fminf(up,limit));
+        }
         C[(size_t)topkSlot * k + p] = (half)((gate / (1.0f + expf(-gate))) * up);
     }
 }
@@ -1593,7 +1597,7 @@ template <typename T, int THREAD_PER_BLOCK>
 __global__ void FastllmGemvTypedFP8E4M3TopKSwigluIndexedKernel(T *A, const int32_t *indices,
                                                                uint8_t **weights, float **scalesPtrs,
                                                                T *C, int topk, int m, int k,
-                                                               int blockM, int blockK) {
+                                                               int blockM, int blockK,float limit=0.f) {
     __shared__ float sdataGate[THREAD_PER_BLOCK];
     __shared__ float sdataUp[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
@@ -1640,6 +1644,10 @@ __global__ void FastllmGemvTypedFP8E4M3TopKSwigluIndexedKernel(T *A, const int32
     if (tid == 0) {
         float gate = FastllmMoeFp8Round<T>(sdataGate[0] * magicScaleConstant);
         float up = FastllmMoeFp8Round<T>(sdataUp[0] * magicScaleConstant);
+        if(limit>0.f) {
+            gate=fminf(gate,limit);
+            up=fmaxf(-limit,fminf(up,limit));
+        }
         C[(size_t)topkSlot * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
     }
 }
@@ -3261,7 +3269,7 @@ __global__ void FastllmGemvTypedFP8E4M3Block128AddToKernel(T *A, uint8_t *B, T *
 template <typename T, int THREAD_PER_BLOCK>
 __global__ void FastllmGemvTypedFP8E4M3Block128TopKSwigluIndexedKernel(
         T *A, const int32_t *indices, uint8_t **weights, T *C,
-        int topk, int m, int k, int perRow) {
+        int topk, int m, int k, int perRow, float limit=0.f) {
     __shared__ float sdataGate[THREAD_PER_BLOCK];
     __shared__ float sdataUp[THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
@@ -3320,6 +3328,7 @@ __global__ void FastllmGemvTypedFP8E4M3Block128TopKSwigluIndexedKernel(
     if (tid == 0) {
         float gate = FastllmMoeFp8Round<T>(sdataGate[0] * magicScaleConstant);
         float up = FastllmMoeFp8Round<T>(sdataUp[0] * magicScaleConstant);
+        if(limit>0.f) {gate=fminf(gate,limit);up=fmaxf(-limit,fminf(up,limit));}
         C[(size_t)topkSlot * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
     }
 }
@@ -5566,7 +5575,7 @@ template <typename T, bool SeparateExperts = false>
 static bool LaunchMoeFP8Cache(
         const fastllm::Data &inputData, fastllm::Data &gateData,
         fastllm::Data &outputData, const FastllmCudaMoeFP8CacheView &view,
-        const int32_t *slots, const float *scores, int topk, float *perExpert, const FastllmCudaMoeStageEvents &events) {
+        const int32_t *slots, const float *scores, int topk, float *perExpert, const FastllmCudaMoeStageEvents &events,float limit) {
     T *input = static_cast<T *>(inputData.cudaData);
     T *gate = static_cast<T *>(gateData.cudaData);
     T *output = static_cast<T *>(outputData.cudaData);
@@ -5578,7 +5587,7 @@ static bool LaunchMoeFP8Cache(
         const int downPitch = inter + ((inter - 1) / 128 + 1) * sizeof(float);
         FastllmGemvTypedFP8E4M3Block128TopKSwigluIndexedKernel<T, 64>
             <<<grid, 64, 0, cudaStreamPerThread>>>(
-                input, slots, view.gateWeights, gate, topk, hidden, inter, gatePitch);
+                input, slots, view.gateWeights, gate, topk, hidden, inter, gatePitch,limit);
         if (!FastllmMoeWaitDown(events)) return false;
         FastllmGemvTypedFP8E4M3Block128TopKDownReduceIndexedKernel<T, 64, SeparateExperts>
             <<<downGrid, 64, 0, cudaStreamPerThread>>>(
@@ -5587,7 +5596,7 @@ static bool LaunchMoeFP8Cache(
         FastllmGemvHalfFP8E4M3TopKSwigluIndexedKernel<64>
             <<<grid, 64, 0, cudaStreamPerThread>>>(
                 input, slots, view.gateWeights, view.gateScales, gate,
-                topk, hidden, inter, view.gateBlockM, view.gateBlockK);
+                topk, hidden, inter, view.gateBlockM, view.gateBlockK,limit);
         if (!FastllmMoeWaitDown(events)) return false;
         FastllmGemvHalfFP8E4M3TopKDownReduceIndexedKernel<64>
             <<<downGrid, 64, 0, cudaStreamPerThread>>>(
@@ -5597,7 +5606,7 @@ static bool LaunchMoeFP8Cache(
         FastllmGemvTypedFP8E4M3TopKSwigluIndexedKernel<T, 64>
             <<<grid, 64, 0, cudaStreamPerThread>>>(
                 input, slots, view.gateWeights, view.gateScales, gate,
-                topk, hidden, inter, view.gateBlockM, view.gateBlockK);
+                topk, hidden, inter, view.gateBlockM, view.gateBlockK,limit);
         if (!FastllmMoeWaitDown(events)) return false;
         FastllmGemvTypedFP8E4M3TopKDownReduceIndexedKernel<T, 64, SeparateExperts>
             <<<downGrid, 64, 0, cudaStreamPerThread>>>(
@@ -5607,10 +5616,10 @@ static bool LaunchMoeFP8Cache(
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool FastllmCudaMoeFP8CacheComputeStaged(
+bool FastllmCudaMoeFP8CacheComputeLimited(
         const fastllm::Data &input, fastllm::Data &gateOutput,
         fastllm::Data &output, const FastllmCudaMoeFP8CacheView &view,
-        const int32_t *slots, const float *scores, int topk, float *perExpert, const FastllmCudaMoeStageEvents &events) {
+        const int32_t *slots, const float *scores, int topk, float *perExpert, const FastllmCudaMoeStageEvents &events,float limit) {
     if ((view.weightType != fastllm::DataType::FP8_E4M3 &&
          view.weightType != fastllm::DataType::FP8_E4M3_BLOCK_128) ||
         !view.gateWeights || !view.downWeights || !slots || !scores || topk <= 0 ||
@@ -5625,18 +5634,24 @@ bool FastllmCudaMoeFP8CacheComputeStaged(
          view.gateBlockK <= 0 || view.downBlockM <= 0 || view.downBlockK <= 0)) return false;
     if (perExpert) {
         return input.dataType == fastllm::DataType::FLOAT32 &&
-            LaunchMoeFP8Cache<float, true>(input, gateOutput, output, view, slots, scores, topk, perExpert, events);
+            LaunchMoeFP8Cache<float, true>(input, gateOutput, output, view, slots, scores, topk, perExpert, events,limit);
     }
     switch (input.dataType) {
         case fastllm::DataType::FLOAT32:
-            return LaunchMoeFP8Cache<float>(input, gateOutput, output, view, slots, scores, topk, nullptr, events);
+            return LaunchMoeFP8Cache<float>(input, gateOutput, output, view, slots, scores, topk, nullptr, events,limit);
         case fastllm::DataType::FLOAT16:
-            return LaunchMoeFP8Cache<half>(input, gateOutput, output, view, slots, scores, topk, nullptr, events);
+            return LaunchMoeFP8Cache<half>(input, gateOutput, output, view, slots, scores, topk, nullptr, events,limit);
         case fastllm::DataType::BFLOAT16:
-            return LaunchMoeFP8Cache<__nv_bfloat16>(input, gateOutput, output, view, slots, scores, topk, nullptr, events);
+            return LaunchMoeFP8Cache<__nv_bfloat16>(input, gateOutput, output, view, slots, scores, topk, nullptr, events,limit);
         default:
             return false;
     }
+}
+bool FastllmCudaMoeFP8CacheComputeStaged(
+        const fastllm::Data &input, fastllm::Data &gateOutput,
+        fastllm::Data &output,const FastllmCudaMoeFP8CacheView &view,
+        const int32_t *slots,const float *scores,int topk,float *perExpert,const FastllmCudaMoeStageEvents &events) {
+    return FastllmCudaMoeFP8CacheComputeLimited(input,gateOutput,output,view,slots,scores,topk,perExpert,events,0.f);
 }
 bool FastllmCudaMoeFP8CacheCompute(
         const fastllm::Data &input, fastllm::Data &gateOutput,
