@@ -136,7 +136,7 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
     for (int r = 0; r < (int)devices.size(); ++r) {
         FastllmCudaSetDevice(devices[r]);
         auto &rank = *state->ranks[r];
-        const bool ownsPacked = !mxfp4 && fastllm_ep8_mega_moe_owns_packed_weights();
+        const bool ownsPacked = mxfp4 || fastllm_ep8_mega_moe_owns_packed_weights();
         size_t released = 0;
         rank.layers.resize(weights[r].size(), nullptr);
         for (size_t l = 0; l < weights[r].size(); ++l) {
@@ -169,11 +169,11 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
             AssertInFastLLM(rank.layers[l] != nullptr,
                 mxfp4 ? fastllm_mxfp4_ep_error() : fastllm_ep8_mega_moe_error());
             // create() completes packing before the source layer is retired.
-            // Both decode tiles and Flex borrow this single owned representation.
+            // After packing, both prefill and decode use the backend-owned representation.
             if (ownsPacked) {
                 for (Data *w : weights[r][l]) if (w) released += ReleasePackedMoeSource(*w);
                 rank.scales.clear();
-        }
+            }
         }
         fprintf(stderr, "[MegaMoE] gpu=%d original_bytes_released=%zu packed_owner=%d\n",
             devices[r], released, ownsPacked ? 1 : 0);

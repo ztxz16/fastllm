@@ -233,6 +233,11 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     bool native = dataType == BFLOAT16 && moeAtype == BFLOAT16 && norm_topk_prob &&
         routed_scaling_factor == 1.0f && tpEp8Mega && ResidentMoePlacement();
     const bool mxfp4Only = tpEp8Mega && FastllmCudaMxfp4EpGraphSupported(tpDevices);
+    // The built-in H20 adapter owns its MXFP4 layout. Its FP8 adapter borrows
+    // weights, while SM120 manages MXFP4 source retirement separately.
+    auto packsSource = [&](int format) {
+        return UsesPackedMoeSource() || (!mxfp4Only && format == NVFP4);
+    };
     int expertFormat = -1;
     auto nativeFormat = [&](const Data &w) {
         return (!mxfp4Only && w.dataType == FP8_E4M3 && w.blockM == 128 && w.blockK == 128) ||
@@ -263,13 +268,14 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
                         source->dims == part.second && nativeFormat(*source) &&
                         (source->dataType == NVFP4 || source->scales.size() ==
                          (size_t)part.second[0] * part.second[1] / (128 * 128)) &&
-                        ((source->cudaData && (!UsesPackedMoeSource() || source->directMemory) &&
+                        ((source->cudaData && (!packsSource(source->dataType) || source->directMemory) &&
                           source->dataDeviceIds == std::vector<int>{owner}) ||
                          (!root.multiDeviceData && source->cpuData));
                 }
             }
         }
     }
+    const bool releaseSources = native && packsSource(expertFormat);
     const bool restoreEpSources = tpEp8Mega && !native;
     if (restoreEpSources) {
         tpEp8Mega = false;
@@ -411,7 +417,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
                 if (tpEp8Mega) {
                     const int owner = tpDevices[e / (num_experts / ranks)];
                     for (const char *name : {"gateup_proj.weight", "down_proj.weight"}) {
-                        if (UsesPackedMoeSource() && !weight[base + name].multiDeviceData)
+                        if (releaseSources && !weight[base + name].multiDeviceData)
                             weight[base + name].directMemory = true;
                         AssertInFastLLM(PlaceMultiCudaWeightOnDevice(weight[base + name], tpDevices, owner),
                                        "MiMo EP8 expert placement failed.");
@@ -460,9 +466,9 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
             tpMoeBiases[r][layer].resize(weights.size(), nullptr);
         }
     }
-    tpMoePreparationFailed = UsesPackedMoeSource();
+    tpMoePreparationFailed = releaseSources;
     if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights);
-    if (UsesPackedMoeSource()) {
+    if (releaseSources) {
         for (int layer = 0; layer < block_cnt; ++layer) if (moeLayers[layer]) {
             for (int e = 0; e < num_experts; ++e) {
                 const std::string base = "model.layers." + std::to_string(layer) + ".mlp.experts." + std::to_string(e) + ".";

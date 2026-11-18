@@ -74,6 +74,12 @@ for rank in range(R):
     h = create(gate, down, address(arenas[rank]), arenas[rank].numel(), peers, rank, R)
     assert h, error()
     handles.append(h)
+    # Production releases the sources here. Poison their E2M1 payloads so a
+    # stale read fails deterministically, keeping the scales for the error tests.
+    for pair in weights[rank]:
+        for source in pair:
+            source[:source.numel() // 17 * 16].zero_()
+    torch.cuda.synchronize()
 print('prepared', time.time() - started, 'workspace', workspace_bytes(R), flush=True)
 cache = {}
 lattice = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device='cuda:0')
