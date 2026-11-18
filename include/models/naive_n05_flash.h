@@ -144,7 +144,9 @@ namespace fastllm {
         struct WindowSlots {
             std::mutex mutex;
             std::vector<std::vector<int>> free;
-            void Init(int groups, int perGroup) {
+            int spareRows = 0;
+            void Init(int groups, int perGroup, int spare = 0) {
+                spareRows = spare;
                 free.resize(groups);
                 for (int group = 0; group < groups; ++group) {
                     free[group].reserve(perGroup);
@@ -152,10 +154,10 @@ namespace fastllm {
                         free[group].push_back(row * groups + group);
                 }
             }
-            int Take(int group) {
+            int Take(int group, bool request = true) {
                 std::lock_guard<std::mutex> lock(mutex);
                 auto &slots = free.at(group);
-                if (slots.empty()) return -1;
+                if ((int)slots.size() <= (request ? spareRows : 0)) return -1;
                 int slot = slots.back(); slots.pop_back();
                 return slot;
             }
@@ -165,7 +167,7 @@ namespace fastllm {
             }
             bool Available(int group) {
                 std::lock_guard<std::mutex> lock(mutex);
-                return !free.at(group).empty();
+                return (int)free.at(group).size() > spareRows;
             }
             int Row(int slot) const { return slot / int(free.size()); }
         };
@@ -411,12 +413,15 @@ namespace fastllm {
         // startup opt-out gives that memory back to the fixed token pool.
         bool reserveWindowHistory = true;
         std::shared_ptr<WindowSlots> activeWindowSlots;
+        // Affinity fixes the KV owner before admission. The global scheduler caps
+        // total requests when the batch is not divisible by the number of groups.
+        int RunningRequestsPerGroup(int batch) const { return 1 + (batch - 1) / attentionDP; }
         int WindowRequestsPerGroup(int batch) const {
-            const int mean = (batch + attentionDP - 1) / attentionDP;
+            const int mean = RunningRequestsPerGroup(batch);
             return std::min(batch, mean + (mean + 3) / 4);
         }
         int WindowGroup(const Data &key) const;
-        bool ReserveWindow(Data &key) const;
+        bool ReserveWindow(Data &key, bool request = true) const;
         void InitSparseKv();
         void AttachSparseKv(const std::vector<std::pair<Data *, Data *>> &roots);
         Data SeparateIndexer(int layer, int rank, const Data &key) const;

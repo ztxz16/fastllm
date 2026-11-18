@@ -57,11 +57,11 @@ bool NaiveN05FlashModel::CanAdmitResponseContext(const ResponseContext *context)
     return key.kvStorageOwner || activeWindowSlots->Available(WindowGroup(key));
 }
 
-bool NaiveN05FlashModel::ReserveWindow(Data &key) const {
+bool NaiveN05FlashModel::ReserveWindow(Data &key, bool request) const {
     if (!activeWindowSlots || key.kvStorageOwner) return true;
     auto lease = std::make_shared<WindowLease>();
     lease->slots = activeWindowSlots;
-    lease->id = lease->slots->Take(WindowGroup(key));
+    lease->id = lease->slots->Take(WindowGroup(key), request);
     if (lease->id < 0) return false;
     key.kvStorageOwner = std::move(lease);
     return true;

@@ -71,7 +71,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         model.tpDevices = {5, 3, 7, 1};
         Require(model.WindowRequestsPerGroup(5) == 4, "incorrect uneven DP window capacity");
         model.activeWindowSlots = std::make_shared<WindowSlots>();
-        model.activeWindowSlots->Init(2, 1);
+        model.activeWindowSlots->Init(2, 2, 1);
         ResponseContext a, b, queued;
         for (auto *ctx : {&a, &b, &queued}) ctx->pastKeyValues.resize(2);
         a.pastKeyValues[0].first.dataDeviceIds = queued.pastKeyValues[0].first.dataDeviceIds = {5, 3};
@@ -81,6 +81,22 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
                 model.TryAdmitResponseContext(&b), "owner-local admission overcommitted or blocked a peer");
         a.pastKeyValues[0].first.kvStorageOwner.reset();
         Require(model.TryAdmitResponseContext(&queued), "owner slot leaked across retirement");
+        Require(model.RunningRequestsPerGroup(5) == 3 && model.RunningRequestsPerGroup(1) == 1,
+                "uneven batches must permit queued work on any owner");
+        model.attentionDP = 8;
+        const int active = model.RunningRequestsPerGroup(512), physical = model.WindowRequestsPerGroup(512);
+        WindowSlots slots;
+        slots.Init(8, physical, physical - active);
+        for (int owner = 0; owner < 8; ++owner) {
+            for (int i = 0; i < 64; ++i) Require(slots.Take(owner) >= 0, "lost active DP capacity");
+            Require(!slots.Available(owner) && slots.Take(owner) < 0, "65th request exceeded DP budget");
+        }
+        const int padding = slots.Take(0, false);
+        Require(padding >= 0, "graph padding lost its physical slot");
+        slots.Return(padding);
+        Require(!slots.Available(0), "padding row became eligible for request admission");
+        slots.Return(0);
+        Require(slots.Take(0) == 0 && !slots.Available(1), "retirement must unblock only its owner");
         WindowSlots history;
         history.Init(2, 2);
         const int a0 = history.Take(0), a1 = history.Take(0), b0 = history.Take(1);

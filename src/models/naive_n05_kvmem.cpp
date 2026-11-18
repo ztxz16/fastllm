@@ -225,7 +225,7 @@ void NaiveN05FlashModel::InitSparseKv() {
         state->ranks.push_back(std::move(r));
     }
     activeWindowSlots = std::make_shared<WindowSlots>();
-    activeWindowSlots->Init(attentionDP, localOwners);
+    activeWindowSlots->Init(attentionDP, localOwners, attentionDP > 1 ? localOwners - RunningRequestsPerGroup(maxBatch) : 0);
     state->queries = queries;
     sparseKv = std::move(state);
     if (prefixSlots) {
@@ -260,7 +260,9 @@ void NaiveN05FlashModel::AttachSparseKv(const std::vector<std::pair<Data *, Data
 #ifdef USE_CUDA
     if (!sparseKv) return;
     Data &key = *roots.front().first;
-    if (!ReserveWindow(key)) throw std::runtime_error("MiMo KVMem request slots exhausted");
+    // Scheduled requests already hold a lease. Direct forwards and graph capture
+    // also bind padding rows, using the remaining physical window storage.
+    if (!ReserveWindow(key, false)) throw std::runtime_error("MiMo KVMem request slots exhausted");
     auto lease = std::static_pointer_cast<WindowLease>(key.kvStorageOwner);
     if (lease->sparse) return;
     lease->sparse = sparseKv;

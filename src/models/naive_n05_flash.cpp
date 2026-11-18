@@ -2665,7 +2665,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     tpSwaCacheCapacity = swaCapacity;
     if (attentionDP > 1) {
         activeWindowSlots = std::make_shared<WindowSlots>();
-        activeWindowSlots->Init(attentionDP, localBatch);
+        activeWindowSlots->Init(attentionDP, localBatch, localBatch - RunningRequestsPerGroup(batch));
     }
     tpRequestKVPool.swap(requestPools);
     if (prefixSlots > 0) {
