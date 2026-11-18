@@ -6,6 +6,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-token-constraint.h"
 #include "utils/decode_graph.h"
+#include "devices/cuda/fastllm-cuda-sampling.h"
 #include <cstring>
 #include <map>
 #include <random>
@@ -17,6 +18,7 @@ namespace fastllm {
 // and two result slots. No weights, device allocation or capture on Submit().
 // The owner serializes submission and drains before releasing logits/storage.
 class CudaDecodeSampling {
+    enum class Input { Dense, Constrained, ShardedTopK };
 public:
     struct Request {
         uint64_t identity, step;
@@ -50,7 +52,8 @@ public:
     // all reduction reads before writing probabilities; the next model must
     // wait for Ready before overwriting this storage. No second vocab buffer.
     bool Prepare(Data &logits, const std::vector<int> &shapes, uint64_t salt = 0,
-                 bool consumeLogits = false, bool sequentialTopK = false) {
+                 bool consumeLogits = false, bool sequentialTopK = false,
+                 const FastllmCudaTopKShard *candidates = nullptr, int shards = 0) {
         if (device >= 0 || shapes.empty() || logits.dataDevice != DataDevice::CUDA ||
             logits.dataType != FLOAT32 || logits.dataDeviceIds.size() != 1 || !logits.cudaData ||
             logits.dims.size() != 2 || logits.dims[1] <= 0 ||
@@ -61,6 +64,8 @@ public:
         FastllmCudaSetDevice(device);
         maxRows = shapes.back(); vocab = logits.dims.back(); buckets = shapes;
         topKFirst = sequentialTopK;
+        shardCandidates = candidates;
+        shardCount = shards;
         cudaLogits = (float *)logits.cudaData;
         nonce = salt ? salt : ((uint64_t)std::random_device{}() << 32) ^ std::random_device{}();
         auto allocate = [&](Data &data, DataType type, std::vector<int> dims) {
@@ -87,25 +92,32 @@ public:
         std::vector<Request> initial(maxRows, {0, 0, 1.0f, 1.0f, vocab});
         Upload(initial);
         // Warm every shape before capturing startup-only sampling graphs.
-        for (bool constrained : {false, true}) for (int rows : buckets) {
-            if (!Run(rows, 0, constrained)) {
+        std::vector<Input> inputs{Input::Dense, Input::Constrained};
+        for (Input input : inputs) for (int rows : buckets) {
+            if (!Run(rows, 0, input)) {
                 FastllmCudaClearLastError();
                 FastllmCudaSyncCurrentThreadStream();
                 return false;
             }
         }
+        if (consumeLogits && topKFirst && shardCandidates && shards > 0 &&
+            (int64_t(shards) + 1) * FastllmCudaLogitsTopKCapacity < vocab) {
+            if (std::all_of(buckets.begin(), buckets.end(), [&](int rows) { return Run(rows, 0, Input::ShardedTopK); }))
+                inputs.push_back(Input::ShardedTopK);
+            else FastllmCudaClearLastError();
+        }
         FastllmCudaSyncCurrentThreadStream();
-        for (bool constrained : {false, true}) for (int rows : buckets) for (int slot = 0; slot < 2; ++slot) {
+        for (Input input : inputs) for (int rows : buckets) for (int slot = 0; slot < 2; ++slot) {
             void *graph = nullptr, *exec = nullptr;
             if (!FastllmCudaGraphPrepareCaptureDevice() || !FastllmCudaGraphBeginCapture()) {
                 FastllmCudaClearLastError();
                 continue;
             }
-            bool ok = Run(rows, slot, constrained);
+            bool ok = Run(rows, slot, input);
             ok = FastllmCudaGraphEndCapture(&graph) && ok;
             if (ok) ok = FastllmCudaGraphInstantiate(graph, &exec);
             if (graph) FastllmCudaGraphDestroy(graph);
-            if (ok) graphs[{rows, slot, constrained}] = exec;
+            if (ok) graphs[{rows, slot, input}] = exec;
             else if (exec) FastllmCudaGraphExecDestroy(exec);
             FastllmCudaClearLastError(); // Optional capture failures must not poison the fallback.
         }
@@ -113,15 +125,20 @@ public:
         return std::any_of(buckets.begin(), buckets.end(), [this](int rows) { return Supports(rows); });
     }
     bool Supports(int rows, bool constrained = false) const {
-        auto shape = DecodeGraphBatch::Select(rows, buckets);
-        return shape && graphs.count({shape.graphRows, 0, constrained}) &&
-            graphs.count({shape.graphRows, 1, constrained});
+        return SupportsInput(rows, constrained ? Input::Constrained : Input::Dense);
+    }
+    bool SupportsShardedTopK(int rows) const {
+        return SupportsInput(rows, Input::ShardedTopK);
     }
     // A false result has submitted no work. Runtime misses never capture.
-    bool Submit(const std::vector<Request> &requests, int slot) {
+    bool Submit(const std::vector<Request> &requests, int slot, bool sharded = false) {
         const bool constrained = std::any_of(requests.begin(), requests.end(),
             [](const Request &r) { return bool(r.constraint); });
-        if (slot < 0 || slot > 1 || queued[slot] || !Supports(requests.size(), constrained)) return false;
+        if (sharded && (constrained || std::any_of(requests.begin(), requests.end(), [](const Request &r) {
+                return r.topK <= 0 || r.topK > FastllmCudaLogitsTopKCapacity;
+            }))) return false;
+        const Input input = constrained ? Input::Constrained : sharded ? Input::ShardedTopK : Input::Dense;
+        if (slot < 0 || slot > 1 || queued[slot] || !SupportsInput(requests.size(), input)) return false;
         FastllmCudaSetDevice(device);
         if (requests != expected) {
             // Rare rebind (admission, reorder, changed params or fallback): the
@@ -130,7 +147,7 @@ public:
             Upload(requests);
         }
         const int rows = DecodeGraphBatch::Select(requests.size(), buckets).graphRows;
-        AssertInFastLLM(FastllmCudaGraphLaunch(graphs.at({rows, slot, constrained})), "Decode sampling graph launch failed.");
+        AssertInFastLLM(FastllmCudaGraphLaunch(graphs.at({rows, slot, input})), "Decode sampling graph launch failed.");
         // The next model depends on the GPU result, not its host readback.
         FastllmCudaEventRecordCurrentThread(ready[slot]);
         AssertInFastLLM(FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(hostTokens[slot],
@@ -192,21 +209,32 @@ private:
         AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
             params.cudaData, hostParams, params.GetBytes()), "Decode sampling parameters upload failed.");
     }
-    bool Run(int rows, int slot, bool constrained) {
+    bool SupportsInput(int rows, Input input) const {
+        auto shape = DecodeGraphBatch::Select(rows, buckets);
+        return shape && graphs.count({shape.graphRows, 0, input}) && graphs.count({shape.graphRows, 1, input});
+    }
+    bool Run(int rows, int slot, Input input) {
+        const bool constrained = input == Input::Constrained;
+        const bool sharded = input == Input::ShardedTopK;
+        const int width = sharded ? (shardCount + 1) * FastllmCudaLogitsTopKCapacity : vocab;
+        if (sharded && !FastllmCudaUnpackLogitsTopK(shardCandidates, cudaLogits, rows, shardCount)) return false;
         auto *p = (uint32_t *)params.cudaData;
         if (constrained) FastllmCudaTokenConstraintApplyRows(constraints.get(), cudaLogits, rows);
         const bool ok = topKFirst
             ? FastllmCudaTopKFirstSamplingToDeviceWithRng(cudaLogits, cudaProbs,
             (float *)p, (int *)p + maxRows, (float *)p + 2 * maxRows,
             nullptr, nullptr, 0, (int *)tokens.cudaData + slot * maxRows,
-            (float *)floatTokens.cudaData + slot * maxRows, rows, vocab,
+            (float *)floatTokens.cudaData + slot * maxRows, rows, width,
             (uint64_t *)(p + 4 * maxRows), (uint64_t *)(p + 6 * maxRows),
             topKWorkspace.cudaData, topKWorkspace.GetBytes())
             : FastllmCudaTopKTopPSamplingToDeviceWithRng(cudaLogits, cudaProbs,
             (float *)p, (int *)p + maxRows, (float *)p + 2 * maxRows,
             nullptr, nullptr, 0, (int *)tokens.cudaData + slot * maxRows,
-            (float *)floatTokens.cudaData + slot * maxRows, rows, vocab,
+            (float *)floatTokens.cudaData + slot * maxRows, rows, width,
             (uint64_t *)(p + 4 * maxRows), (uint64_t *)(p + 6 * maxRows));
+        if (ok && sharded) return FastllmCudaRemapTopKTokens(shardCandidates, cudaProbs,
+            (int *)tokens.cudaData + slot * maxRows, (float *)floatTokens.cudaData + slot * maxRows,
+            rows, shardCount);
         if (ok && constrained) FastllmCudaTokenConstraintAdvanceInPlace(constraints.get(),
             (int *)tokens.cudaData + slot * maxRows, (float *)floatTokens.cudaData + slot * maxRows, rows);
         return ok;
@@ -214,6 +242,8 @@ private:
     int device = -1, maxRows = 0, vocab = 0;
     uint64_t nonce = 0;
     float *cudaLogits = nullptr, *cudaProbs = nullptr;
+    const FastllmCudaTopKShard *shardCandidates = nullptr;
+    int shardCount = 0;
     bool topKFirst = false;
     Data probs, params, tokens, floatTokens, topKWorkspace;
     std::shared_ptr<void> constraints;
@@ -223,7 +253,7 @@ private:
     int counts[2]{};
     std::vector<int> buckets;
     std::vector<Request> expected;
-    std::map<std::tuple<int, int, bool>, void *> graphs;
+    std::map<std::tuple<int, int, Input>, void *> graphs;
 };
 }
 #endif

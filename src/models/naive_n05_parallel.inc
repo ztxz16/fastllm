@@ -66,7 +66,31 @@ void NaiveN05FlashModel::PrepareAttentionParallelSampling() {
     const auto &topology = state.runtime.Layout();
     const int rows = maxBatch > 0 ? maxBatch : 256;
     state.samplingLogits.resize(attentionDP);
+    const int shards = tpDevices.size();
+    constexpr int shardWords = sizeof(FastllmCudaTopKShard) / sizeof(int);
+    size_t scratch = 0;
+#ifndef USE_ROCM
+    scratch = FastllmCudaLogitsTopKWorkspaceBytes(rows,
+        (weight["lm_head.weight"].dims[0] + int64_t(shards) - 1) / shards);
+    if (scratch && scratch <= INT_MAX && int64_t(rows) * shards * shardWords <= INT_MAX &&
+        weight["lm_head.weight"].dims[0] / shards > 2 * FastllmCudaLogitsTopKCapacity)
+        state.samplingShards.resize(shards);
+#endif
     state.runtime.Run([&](int rank, int device) {
+        if (!state.samplingShards.empty()) {
+            auto &s = state.samplingShards[rank];
+            auto reserve = [&](Data &d, DataType type, std::vector<int> dims) {
+                d.dataType = type; d.UpdateUnitSize(); d.Resize(dims);
+                d.ToDevice(CUDA, {device}, false); d.Allocate(false);
+            };
+            reserve(s.workspace, INT8, {int(scratch)});
+            reserve(s.selected, INT32, {rows, shardWords});
+            if (topology.AttentionRank(rank) == 0) {
+                reserve(s.received, INT32, {rows, shards, shardWords});
+                // Padding rows initially map to token zero and have no NaNs.
+                FastllmCudaMemset0(s.received.cudaData, s.received.GetBytes());
+            }
+        }
         if (topology.AttentionRank(rank) != 0) return;
         auto &logits = state.samplingLogits[topology.AttentionOwner(rank)];
         logits.dataType = FLOAT32; logits.Resize({rows, weight["lm_head.weight"].dims[0]});
@@ -358,6 +382,15 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             }
         }
     }
+    bool shardedSampling = asyncSampling && !state.samplingShards.empty();
+    for (int group = 0; group < attentionDP && shardedSampling; ++group) {
+        const auto &requests = samplingRequests[group];
+        if (!requests.empty()) shardedSampling = state.sampling[group]->SupportsShardedTopK(requests.size()) &&
+            std::all_of(requests.begin(), requests.end(), [](const CudaDecodeSampling::Request &r) {
+                return !r.constraint && r.topK > 0 && r.topK <= FastllmCudaLogitsTopKCapacity &&
+                    r.temperature > 0.f && std::isfinite(1.f / r.temperature);
+            });
+    }
     const int samplingSlot = std::max(0, tpServingState ? tpServingState->pipelineOutputSlot : -1);
     const bool pipelined = tpServingState && tpServingState->pipelineOutputSlot >= 0;
     AssertInFastLLM(!pipelined || asyncSampling,
@@ -419,6 +452,24 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 AssertInFastLLM(FastllmCudaBatchCopy2DAsyncCurrentThread(dst.data(), src.data(),
                     dstPitch.data(), srcPitch.data(), widths.data(), heights.data(), dst.size()),
                     "Naive verification logits redistribution failed");
+            } else if (shardedSampling) {
+                const int shards = tpDevices.size();
+                std::vector<FastllmCudaTopKRow> inputs;
+                std::vector<FastllmCudaTopKShard *> destinations;
+                inputs.reserve(liveRows); destinations.reserve(liveRows);
+                for (int owner = 0; owner < attentionDP; ++owner) {
+                    const int leader = topology.groups[topology.attention.at(owner)].ranks.front();
+                    auto *inbox = (FastllmCudaTopKShard *)state.samplingShards[leader].received.cudaData;
+                    for (size_t row = 0; row < samplingRows[owner].size(); ++row) {
+                        inputs.push_back({(float *)logits.cudaData + size_t(samplingRows[owner][row]) *
+                            (range.second - range.first), 1.f / samplingRequests[owner][row].temperature});
+                        destinations.push_back(inbox + row * shards + rank);
+                    }
+                }
+                auto &s = state.samplingShards[rank];
+                AssertInFastLLM(FastllmCudaDispatchLogitsTopK(inputs.data(), destinations.data(), inputs.size(),
+                    range.second - range.first, range.first, (FastllmCudaTopKShard *)s.selected.cudaData,
+                    s.workspace.cudaData, s.workspace.GetBytes()), "Naive sharded top-k dispatch failed");
             } else if (distributedSampling) {
                 std::vector<void *> destinations;
                 std::vector<const void *> sources;
@@ -524,11 +575,11 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             if (topology.AttentionRank(rank) != 0) return;
             const int group = topology.AttentionOwner(rank);
             if (samplingRows[group].empty()) return;
-            // Every rank writes vocabulary columns into every sampling owner.
+            // All producers must finish their dense or candidate writes before the owner samples.
             // Waiting only for this owner's model would race peer stores.
             for (const auto &producer : tpDecodeState->ranks)
                 FastllmCudaCurrentThreadStreamWaitEvent(producer->storage->gatherReady);
-            AssertInFastLLM(state.sampling[group]->Submit(samplingRequests[group], samplingSlot),
+            AssertInFastLLM(state.sampling[group]->Submit(samplingRequests[group], samplingSlot, shardedSampling),
                 "Naive attention DP sampling admission changed after submission");
         });
     } else state.runtime.Run(forwardRank);

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include "sampling/fastllm-topk-logits.cuh"
+#include "sampling/fastllm-sharded-logits.cuh"
 
 namespace {
 constexpr int Threads = 256, Items = 4, Tile = Threads * Items;

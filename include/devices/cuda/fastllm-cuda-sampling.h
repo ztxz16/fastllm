@@ -35,6 +35,28 @@ bool FastllmCudaLogitsTopK(const FastllmCudaTopKRow *rows, int batch, int vocab,
     FastllmCudaTopKCandidate *output, void *workspace, std::size_t workspaceBytes,
     void *stream = nullptr);
 
+// Each source row writes exact local candidates into its owner's peer-accessible
+// inbox. Keep original FP32 values for the owner's ordinary temperature/RNG path.
+struct alignas(8) FastllmCudaTopKShard {
+    FastllmCudaTopKCandidate candidates[FastllmCudaLogitsTopKCapacity];
+    int nanCount;
+};
+#ifndef USE_ROCM
+bool FastllmCudaDispatchLogitsTopK(const FastllmCudaTopKRow *rows,
+    FastllmCudaTopKShard *const *destinations, int batch, int vocab, int vocabStart,
+    FastllmCudaTopKShard *selected, void *workspace, std::size_t workspaceBytes);
+bool FastllmCudaUnpackLogitsTopK(const FastllmCudaTopKShard *candidates,
+    float *logits, int rows, int shards);
+bool FastllmCudaRemapTopKTokens(const FastllmCudaTopKShard *candidates,
+    const float *probs, int *tokens, float *floatTokens, int rows, int shards);
+
+#else
+inline bool FastllmCudaDispatchLogitsTopK(const FastllmCudaTopKRow *, FastllmCudaTopKShard *const *,
+    int, int, int, FastllmCudaTopKShard *, void *, std::size_t) { return false; }
+inline bool FastllmCudaUnpackLogitsTopK(const FastllmCudaTopKShard *, float *, int, int) { return false; }
+inline bool FastllmCudaRemapTopKTokens(const FastllmCudaTopKShard *, const float *, int *, float *, int, int) { return false; }
+#endif
+
 // Stable descending score order, ascending token-id ties. Apply top-k first
 // (optionally retaining cutoff ties), then top-p, retaining its boundary token. Logits
 // remain unchanged. Invalid logits produce error=1, token=-1 for that row.

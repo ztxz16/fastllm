@@ -161,6 +161,92 @@ static void InPlaceSamplingChecks() {
 #endif
 }
 
+static void ShardedSamplingChecks(bool exceptional = false) {
+    constexpr int cap = FastllmCudaLogitsTopKCapacity, batch = 7, vocab = 4099, shards = 3;
+    const std::vector<int> split{0, 511, 2537, vocab};
+    std::vector<float> score(batch * vocab);
+    for (int row = 0; row < batch; ++row) for (int id = 0; id < vocab; ++id) {
+        score[row * vocab + id] = row == 0 ? 3.f : float((id * 77 + row * 13) % 193) * .017f;
+        if (row == 1 && id < split[1]) score[row * vocab + id] = -INFINITY;
+    }
+    if (exceptional) {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        std::fill(score.begin(), score.end(), -1.f);
+        // Invalid compact column zero must map to global zero. A single NaN
+        // can also leave a sampleable distribution when k exceeds its count.
+        score[3] = nan;
+        score[39] = 60.f;
+        score[45] = 100.f;
+        score[vocab + split[2] + 39] = 20.f;
+        score[vocab + split[2] + 45] = 100.f; // overflows only after scaling
+        std::fill_n(score.begin() + 2 * vocab, vocab, -INFINITY);
+        score[3 * vocab + split[2]] = INFINITY;
+        // Preserve enough tied numeric candidates even when NaNs also occupy
+        // the radix top-k. Exercise both local and cross-shard NaN counts.
+        std::fill_n(score.begin() + 4 * vocab + split[1], cap - 1, nan);
+        std::fill_n(score.begin() + 4 * vocab + split[1] + cap, 2 * cap, 4.f);
+        score[5 * vocab + 5] = nan;
+        score[5 * vocab + split[1] + 10] = -nan;
+        score[5 * vocab + split[2] + 20] = 50.f;
+        std::fill_n(score.begin() + 6 * vocab, vocab, nan);
+    }
+    Data dense(FLOAT32, {batch, vocab}, score), expanded(dense);
+    constexpr int shardWords = sizeof(FastllmCudaTopKShard) / sizeof(int);
+    Data packed(INT32, {batch, shards, shardWords}), selected(INT32, {batch, shardWords});
+    Data scratch(INT8, {int(FastllmCudaLogitsTopKWorkspaceBytes(batch, 2026))});
+    for (Data *d : {&dense, &expanded, &packed, &selected, &scratch}) {
+        d->ToDevice(CUDA, {0}, true); d->Allocate();
+    }
+    FastllmCudaMemset0(packed.cudaData, packed.GetBytes());
+    auto *inbox = (FastllmCudaTopKShard *)packed.cudaData;
+    CudaDecodeSampling full, compact;
+    Check(full.Prepare(dense, {3, batch}, 971, false, true) &&
+          compact.Prepare(expanded, {3, batch}, 971, true, true, inbox, shards), "sharded sampler prepare");
+#ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
+    const int captures = captureCalls;
+#endif
+    for (int step = 0; step < 20; ++step) {
+        constexpr int ks[] = {1, 3, 17, 50, cap};
+        const int rows = step % 3 ? batch : 2;
+        std::vector<CudaDecodeSampling::Request> requests;
+        for (int row = 0; row < rows; ++row)
+            requests.push_back({uint64_t(row), uint64_t(step), .5f + .127f * row,
+                                row % 2 ? 1.f : .83f, ks[(row + step) % 5]});
+        if (exceptional) {
+            requests[1].temperature = 1e-37f;
+            requests[1].topK = 2;
+            if (rows == batch) requests[4].topK = cap;
+        }
+        for (int rank = 0; rank < shards; ++rank) {
+            std::vector<FastllmCudaTopKRow> inputs;
+            std::vector<FastllmCudaTopKShard *> destinations;
+            for (int row = 0; row < rows; ++row) {
+                inputs.push_back({(float *)dense.cudaData + row * vocab + split[rank], 1.f / requests[row].temperature});
+                destinations.push_back(inbox + row * shards + rank);
+            }
+            Check(FastllmCudaDispatchLogitsTopK(inputs.data(), destinations.data(), rows, split[rank+1]-split[rank],
+                split[rank], (FastllmCudaTopKShard *)selected.cudaData, scratch.cudaData, scratch.GetBytes()),
+                "shard top-k dispatch");
+        }
+        const bool useShards = step % 5 != 4;
+        if (!useShards) {
+            requests[0].topK = cap + 1;
+            Check(!compact.Submit(requests, step % 2, true), "unsupported sharded top-k advanced sampling");
+            FastllmCudaCopyFromHostToDevice(expanded.cudaData, score.data(), score.size() * sizeof(float));
+        }
+        Check(full.Submit(requests, step % 2) && compact.Submit(requests, step % 2, useShards), "sharded sampler submit");
+        const auto reference = full.Collect(step % 2);
+        Check(reference == compact.Collect(step % 2), "sharded sampler changed seeded tokens");
+        if (exceptional && useShards) {
+            Check(reference[1] == 0, "expected no sampleable mass after temperature overflow");
+            if (requests[0].topK == 1) Check(reference[0] == 0, "expected NaN radix cutoff");
+            if (requests[0].topK == 3) Check(reference[0] == 45, "valid candidate after NaN cutoff");
+        }
+    }
+#ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
+    Check(captureCalls == captures, "sharded sampler recaptured on input change");
+#endif
+}
 static void SequentialSamplingChecks(int vocab) {
     const int rows = 8;
     std::vector<float> raw(size_t(rows) * vocab), ts(rows), ps(rows);
@@ -240,6 +326,8 @@ int main(int argc, char **argv) {
     ConstraintSamplingChecks(false);
     ConstraintSamplingChecks(true);
     SequentialSamplingChecks(vocab);
+    ShardedSamplingChecks();
+    ShardedSamplingChecks(true);
     CudaDecodeSampling a,b,invalid;
     Check(!invalid.Prepare(logits,{0,8}) && !invalid.Prepare(logits,{4,2}) &&
           !invalid.Prepare(logits,{1,1}) && !invalid.Prepare(logits,{1,16}), "invalid startup buckets");

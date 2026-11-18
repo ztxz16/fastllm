@@ -108,6 +108,10 @@ struct NaiveN05FlashModel::AttentionParallelState {
     // Outside the captured model graph. Only each attention group's leader
     // owns full-vocabulary logits; peers write their disjoint vocab columns.
     std::vector<Data> samplingLogits;
+    struct SamplingShard {
+        Data workspace, selected, received;
+    };
+    std::vector<SamplingShard> samplingShards;
     std::vector<std::shared_ptr<CudaDecodeSampling>> sampling;
     int samplingCapacity = 0;
     // Serving graphs own separate DP scratch: a large prefill must not move
