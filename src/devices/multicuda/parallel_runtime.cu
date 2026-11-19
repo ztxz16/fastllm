@@ -50,10 +50,39 @@ __global__ void CopyRowField(const unsigned char *source, unsigned char *dest,
         dest[row * destStride + column] = source[size_t(indices ? indices[row] : row) * sourceStride + column];
     }
 }
+// Each warp copies a contiguous piece of one row. Strides are in uint4s.
+__global__ void CopyRowFieldAligned(const uint4 *source, uint4 *dest, const int *indices,
+        int rows, size_t width, size_t sourceStride, size_t destStride) {
+    const size_t first = size_t(blockIdx.x) * 128 + threadIdx.x;
+    for (size_t row = size_t(blockIdx.y) * blockDim.y + threadIdx.y; row < size_t(rows);
+         row += size_t(gridDim.y) * blockDim.y) {
+        const size_t srcRow = indices ? indices[row] : row;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const size_t col = first + i * 32;
+            if (col < width)
+                dest[row * destStride + col] = source[srcRow * sourceStride + col];
+        }
+    }
+}
 void CopyField(const void *source, void *dest, const int *indices, int rows,
                size_t width, size_t sourceStride, size_t destStride) {
     const size_t bytes = Bytes(rows, width);
     if (!bytes) return;
+    if (!indices && width == sourceStride && width == destStride) {
+        Check(cudaMemcpyAsync(dest, source, bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        return;
+    }
+    if (width >= 256 && width <= size_t(std::numeric_limits<int>::max()) &&
+        ((uintptr_t(source) | uintptr_t(dest) | width | sourceStride | destStride) & 15) == 0) {
+        const size_t vectors = width / sizeof(uint4);
+        dim3 grid((vectors + 127) / 128, std::min<size_t>((size_t(rows) + 3) / 4, 65535));
+        CopyRowFieldAligned<<<grid, dim3(32, 4), 0, cudaStreamPerThread>>>(
+            static_cast<const uint4 *>(source), static_cast<uint4 *>(dest), indices, rows,
+            vectors, sourceStride / sizeof(uint4), destStride / sizeof(uint4));
+        Check(cudaGetLastError());
+        return;
+    }
     CopyRowField<<<std::min<size_t>((bytes + 255) / 256, 4096), 256, 0, cudaStreamPerThread>>>(
         static_cast<const unsigned char *>(source), static_cast<unsigned char *>(dest),
         indices, rows, width, sourceStride, destStride);
