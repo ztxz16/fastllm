@@ -191,6 +191,16 @@ struct Allocation {
     }
 };
 using Buffers = std::map<std::string, std::shared_ptr<Allocation>>;
+// A barrier-only manifest predates scale isolation and needs dedicated backing.
+static bool canShareLocalWorkspace(const J &buffer) {
+    bool barrier = false, scales = false;
+    for (const auto &range : buffer["private_ranges"].array_items()) {
+        const auto &name = range["name"].string_value();
+        barrier |= name == "nvlink_barrier_counter";
+        scales |= name == "fc1_output_sf";
+    }
+    return barrier && scales;
+}
 __global__ void transformWeight(const unsigned char *input, unsigned char *weight, unsigned char *scale,
                                 int n, int k, bool gate) {
     size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -334,7 +344,7 @@ struct NativeEp {
             for (const auto &v : entry["buffers"].object_items()) {
                 if (v.first == "w13" || v.first == "w2" || v.first == "s13" || v.first == "s2")
                     continue;
-                if (v.first == "local" && v.second["private_ranges"].is_array() && ranks[rank]->vmmSupported) {
+                if (v.first == "local" && ranks[rank]->vmmSupported && canShareLocalWorkspace(v.second)) {
                     auto &pool = ranks[rank]->scratch;
                     if (!pool) pool = std::make_shared<ScratchPool>(ranks[rank]->device);
                     b->buffers[v.first] = std::make_shared<Allocation>(

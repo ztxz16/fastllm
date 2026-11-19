@@ -31,6 +31,14 @@ class Sm120EpPrefillPackagesTest(unittest.TestCase):
                 for bucket in buckets:
                     self.assertEqual(len(bucket["ranks"]), ep)
                     for rank in bucket["ranks"]:
+                        local = rank["buffers"]["local"]
+                        ranges = local["private_ranges"]
+                        self.assertTrue({"nvlink_barrier_counter", "fc1_output_sf"} <=
+                                        {region["name"] for region in ranges})
+                        for region in ranges:
+                            self.assertGreaterEqual(region["offset"], 0)
+                            self.assertGreater(region["bytes"], 0)
+                            self.assertLessEqual(region["offset"] + region["bytes"], local["bytes"])
                         binaries = set(kernel_binaries(rank["nodes"]))
                         self.assertTrue(binaries, f"Empty graph in {bucket['capacity']}-row bucket")
                         referenced.update(binaries)

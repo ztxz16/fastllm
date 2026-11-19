@@ -33,11 +33,12 @@ Local workspace sharing
 -----------------------
 Each bucket keeps its own CUDA virtual address range for its entire lifetime.
 On devices with CUDA VMM support, transient local pages alias a per-rank physical
-scratch pool. The exporter's private_ranges metadata identifies the persistent
-nvlink_barrier_counter, whose phase must remain paired with that bucket's peer
-signals. Every page intersecting this counter remains private; the peer heap is
-also private. Other local regions are reset or produced within each invocation.
-This lifetime contract is specific to the pinned upstream implementation.
+scratch pool. The exporter records two named private_ranges from the compiled
+kernel layout. The nvlink_barrier_counter tracks the phase of the bucket's peer
+signals. FC1 writes the block scales for FC2 into fc1_output_sf. Sharing the
+pages covering those scales across bucket layouts caused corrupt MoE outputs
+during speculative verification. Both ranges use private pages for the lifetime
+of the bucket. The peer heap also remains private.
 
 The pool belongs to one NativeEp instance, not to all models on a device. As with
 the existing cross-layer bucket sharing, its invocations must be ordered. K1/K2
@@ -52,13 +53,13 @@ move, so earlier graph executables and TMA descriptors stay valid. Preparation
 must precede capture. Serving reuses prepared graphs without allocation,
 remapping, recapture, or graph-executable updates. CUDA 12.x mapping offsets must
 be zero, so each shared physical block is independently mappable. No compiler,
-Python runtime, or new environment option is needed for sharing. Older manifests
-without lifetime metadata and devices without VMM retain dedicated allocations.
+Python runtime, or new environment option is needed for sharing. Manifests
+missing either named range and devices without VMM use dedicated allocations.
 
 With the shipped packages and a 2 MiB allocation granularity, local workspace
-backing across all buckets is 998 MiB/rank for EP4 and 1890 MiB/rank for EP8,
-excluding peer heaps, weights and other buffers. EP4 uses 974 MiB shared and
-24 MiB private. EP8 uses 1866 MiB shared and 24 MiB private. Storage grows
+backing across all buckets is 1030 MiB/rank for EP4 and 1922 MiB/rank for EP8,
+excluding peer heaps, weights and other buffers. EP4 uses 966 MiB shared and
+64 MiB private. EP8 uses 1856 MiB shared and 66 MiB private. Storage grows
 as larger buckets are prepared.
 
 Architecture scope

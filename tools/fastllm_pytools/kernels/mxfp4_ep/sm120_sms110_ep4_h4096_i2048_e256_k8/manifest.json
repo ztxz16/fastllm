@@ -22,8 +22,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9316496,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13445376,
+                  "bytes": 653312
                 }
               ]
             },
@@ -1795,8 +1801,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9316496,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13445376,
+                  "bytes": 653312
                 }
               ]
             },
@@ -3568,8 +3580,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9316496,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13445376,
+                  "bytes": 653312
                 }
               ]
             },
@@ -5341,8 +5359,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9316496,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13445376,
+                  "bytes": 653312
                 }
               ]
             },
@@ -7153,8 +7177,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9464336,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13658752,
+                  "bytes": 655360
                 }
               ]
             },
@@ -8930,8 +8960,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9464336,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13658752,
+                  "bytes": 655360
                 }
               ]
             },
@@ -10707,8 +10743,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9464336,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13658752,
+                  "bytes": 655360
                 }
               ]
             },
@@ -12484,8 +12526,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9464336,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 13658752,
+                  "bytes": 655360
                 }
               ]
             },
@@ -14300,8 +14348,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9760144,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14085632,
+                  "bytes": 659456
                 }
               ]
             },
@@ -16077,8 +16131,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9760144,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14085632,
+                  "bytes": 659456
                 }
               ]
             },
@@ -17854,8 +17914,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9760144,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14085632,
+                  "bytes": 659456
                 }
               ]
             },
@@ -19631,8 +19697,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 9760144,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14085632,
+                  "bytes": 659456
                 }
               ]
             },
@@ -21447,8 +21519,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 10351504,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14939136,
+                  "bytes": 667648
                 }
               ]
             },
@@ -23224,8 +23302,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 10351504,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14939136,
+                  "bytes": 667648
                 }
               ]
             },
@@ -25001,8 +25085,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 10351504,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14939136,
+                  "bytes": 667648
                 }
               ]
             },
@@ -26778,8 +26868,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 10351504,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 14939136,
+                  "bytes": 667648
                 }
               ]
             },
@@ -28594,8 +28690,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 11534224,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 16646144,
+                  "bytes": 684032
                 }
               ]
             },
@@ -30371,8 +30473,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 11534224,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 16646144,
+                  "bytes": 684032
                 }
               ]
             },
@@ -32148,8 +32256,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 11534224,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 16646144,
+                  "bytes": 684032
                 }
               ]
             },
@@ -33925,8 +34039,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 11534224,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 16646144,
+                  "bytes": 684032
                 }
               ]
             },
@@ -35741,8 +35861,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 13899664,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 20060160,
+                  "bytes": 716800
                 }
               ]
             },
@@ -37518,8 +37644,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 13899664,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 20060160,
+                  "bytes": 716800
                 }
               ]
             },
@@ -39295,8 +39427,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 13899664,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 20060160,
+                  "bytes": 716800
                 }
               ]
             },
@@ -41072,8 +41210,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 13899664,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 20060160,
+                  "bytes": 716800
                 }
               ]
             },
@@ -42888,8 +43032,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 18630672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 26888320,
+                  "bytes": 782336
                 }
               ]
             },
@@ -44665,8 +44815,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 18630672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 26888320,
+                  "bytes": 782336
                 }
               ]
             },
@@ -46442,8 +46598,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 18630672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 26888320,
+                  "bytes": 782336
                 }
               ]
             },
@@ -48219,8 +48381,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 18630672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 26888320,
+                  "bytes": 782336
                 }
               ]
             },
@@ -50035,8 +50203,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 28092688,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 40544640,
+                  "bytes": 913408
                 }
               ]
             },
@@ -51812,8 +51986,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 28092688,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 40544640,
+                  "bytes": 913408
                 }
               ]
             },
@@ -53589,8 +53769,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 28092688,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 40544640,
+                  "bytes": 913408
                 }
               ]
             },
@@ -55366,8 +55552,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 28092688,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 40544640,
+                  "bytes": 913408
                 }
               ]
             },
@@ -57182,8 +57374,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 53348624,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 78383488,
+                  "bytes": 1306624
                 }
               ]
             },
@@ -58991,8 +59189,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 53348624,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 78383488,
+                  "bytes": 1306624
                 }
               ]
             },
@@ -60800,8 +61004,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 53348624,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 78383488,
+                  "bytes": 1306624
                 }
               ]
             },
@@ -62609,8 +62819,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 53348624,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 78383488,
+                  "bytes": 1306624
                 }
               ]
             },
@@ -64456,8 +64672,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 89098384,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 130910464,
+                  "bytes": 1830912
                 }
               ]
             },
@@ -67069,8 +67291,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 89098384,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 130910464,
+                  "bytes": 1830912
                 }
               ]
             },
@@ -69682,8 +69910,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 89098384,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 130910464,
+                  "bytes": 1830912
                 }
               ]
             },
@@ -72295,8 +72529,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 89098384,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 130910464,
+                  "bytes": 1830912
                 }
               ]
             },
@@ -74946,8 +75186,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 160598672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 235965184,
+                  "bytes": 2879488
                 }
               ]
             },
@@ -77657,8 +77903,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 160598672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 235965184,
+                  "bytes": 2879488
                 }
               ]
             },
@@ -80368,8 +80620,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 160598672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 235965184,
+                  "bytes": 2879488
                 }
               ]
             },
@@ -83079,8 +83337,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 160598672,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 235965184,
+                  "bytes": 2879488
                 }
               ]
             },
@@ -85827,8 +86091,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 303599248,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 446074624,
+                  "bytes": 4976640
                 }
               ]
             },
@@ -88538,8 +88808,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 303599248,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 446074624,
+                  "bytes": 4976640
                 }
               ]
             },
@@ -91249,8 +91525,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 303599248,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 446074624,
+                  "bytes": 4976640
                 }
               ]
             },
@@ -93960,8 +94242,14 @@
               "init": "zero",
               "private_ranges": [
                 {
+                  "name": "nvlink_barrier_counter",
                   "offset": 303599248,
                   "bytes": 8
+                },
+                {
+                  "name": "fc1_output_sf",
+                  "offset": 446074624,
+                  "bytes": 4976640
                 }
               ]
             },
