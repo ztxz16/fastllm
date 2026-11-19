@@ -951,6 +951,8 @@ Data NaiveN05FlashModel::RunTarget(
     const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
         tpEp8MegaState && (decodeWorkspace || localPrefillRows) && block_cnt > 1 && !moeLayers[0] &&
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
+    const bool compactPrefillHead = localMoeRows && !decodeWorkspace && !verifying &&
+        (!capture || !capture->collectHidden);
     const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace &&
         std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
             [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
@@ -2308,10 +2310,9 @@ Data NaiveN05FlashModel::RunTarget(
                 buf.last.ToDevice(CUDA, {gpu}, false); buf.last.Allocate(false);
                 attentionParallel->transfer->Collect(tpRank, normed.cudaData, buf.last.cudaData, size_t(embed_dim) * 2);
             }
-            // Prefill selects each request's last row, then applies model.norm
-            // below. Keep unnormalized hidden rows for that existing contract
-            // and for intermediate DSpark feature capture.
-            if (captureHidden || (layer + 1 == block_cnt && !decodeWorkspace))
+            // Feature capture needs every row. Ordinary prefill passes only
+            // the last local row of each sequence to the vocabulary head.
+            if (captureHidden || (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead))
                 attentionParallel->transfer->Collect(tpRank, hidden.cudaData, buf.hidden.cudaData, size_t(embed_dim) * 2);
         }
         if (captureHidden && tpRank <= 0) {
@@ -2330,17 +2331,37 @@ Data NaiveN05FlashModel::RunTarget(
     Data localLogits;
     Data &last = buf.last, &logits = decodeWorkspace ? buf.logits : localLogits;
     if (!decodeWorkspace) {
-        if (capture && capture->verifying) Copy(hidden, last);
-        else if (batch) {
+        if (verifying) Copy(hidden, last);
+        else if (compactPrefillHead || batch) {
+            const int sequences = batch ? batch->Size() : 1;
             last.dataType = BFLOAT16;
-            last.Resize({1, batch->Size(), embed_dim});
+            last.Resize({1, sequences, embed_dim});
             last.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false);
             last.Allocate(false);
-            int offset = 0;
-            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
-                offset += batch->lengths[sequence];
-                FastllmCudaCopyFromDeviceToDevice((uint16_t *)last.cudaData + (size_t)sequence * embed_dim,
-                    (uint16_t *)hidden.cudaData + (size_t)(offset - 1) * embed_dim, (size_t)embed_dim * sizeof(uint16_t));
+            if (compactPrefillHead) {
+                const auto &group = attentionParallel->groups[tpRank];
+                const auto &local = attentionParallel->ranks[tpRank].hidden;
+                FastllmCudaMemset0(last.cudaData, last.GetBytes());
+                int end = 0;
+                for (size_t i = 0; i < group.lengths.size(); ++i) {
+                    end += group.lengths[i];
+                    auto *dest = static_cast<uint16_t *>(last.cudaData) + size_t(group.sequenceIndices[i]) * embed_dim;
+                    auto *source = static_cast<const uint16_t *>(local.cudaData) + size_t(end - 1) * embed_dim;
+                    AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(dest, source,
+                        size_t(embed_dim) * sizeof(uint16_t)), "Failed to select the last local prefill row");
+                }
+                // Every owner is a group leader. Summing bytes with zeros from
+                // the other ranks preserves the selected BF16 rows bit for bit.
+                auto &runtime = attentionParallel->runtime;
+                runtime.AllReduce(runtime.Layout().leaders, tpRank, last.cudaData, last.GetBytes(),
+                    parallel::ScalarType::Byte);
+            } else {
+                int offset = 0;
+                for (int sequence = 0; sequence < sequences; ++sequence) {
+                    offset += batch->lengths[sequence];
+                    FastllmCudaCopyFromDeviceToDevice((uint16_t *)last.cudaData + (size_t)sequence * embed_dim,
+                        (uint16_t *)hidden.cudaData + (size_t)(offset - 1) * embed_dim, (size_t)embed_dim * sizeof(uint16_t));
+                }
             }
         } else Split(hidden, 1, length - 1, length, last);
         norm(last, localWeight("model.norm.weight"), last);
