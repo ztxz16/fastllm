@@ -2,6 +2,9 @@
 #include "models/hy4_flash.h"
 #include <array>
 #include <deque>
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+#include "devices/cuda/fastllm-mla-plan.h"
+#endif
 
 namespace fastllm {
 // A projection can consume an ordinary matrix or the contiguous matrix of a
@@ -36,6 +39,10 @@ inline constexpr int KVPageTokens = 128;
 struct StepInput {
     int token, previous, older, position;
 };
+class KVPagePool;
+struct KVPools {
+    std::map<std::pair<int, int>, std::shared_ptr<KVPagePool>> layouts;
+};
 struct Scratch {
     const StepInput *step = nullptr;
     size_t generation = 0;
@@ -47,14 +54,17 @@ struct Scratch {
         size_t count = 0;
     };
     std::map<std::string, Buffer> buffers;
+    KVPools kvPools;
+    const bool mlaSupported;
+    std::map<std::pair<int, int>, std::shared_ptr<FastllmCudaMLAPlan>> mlaPlans; // (heads, query rows)
+
     std::map<std::pair<int, int>, std::shared_ptr<void>> engramInputs;
-    explicit Scratch(int device) : device(device) {}
+    explicit Scratch(int device) : device(device), mlaSupported(FastllmCudaMLAPagedPlanSupported(device)) {}
     ~Scratch();
     float *Get(const std::string &name, size_t count);
 };
 using Weights = Hy4FlashModel::Weights;
 const StepInput *UploadStep(Scratch &, const std::vector<StepInput> &);
-void AdvanceKV(Data &, int end);
 void CopyStageCaptured(float *dst, const float *src, size_t count);
 void ProjectHead(Weights &, Scratch &, float *streams, float *logits, Data *hidden, int pos, int width,
                  int rows = 1);
@@ -69,7 +79,9 @@ struct DraftRequest {
 };
 void DraftEmbed(Weights &, Scratch &, int anchor, int width, int mask, const float *targetHidden,
                 float *block);
-void DraftLayer(Weights &, Scratch &, int draftLayer, int base, int width, DraftMemory &, float *block);
+struct KVPage;
+void DraftLayer(Weights &, Scratch &, int draftLayer, int base, int width, DraftMemory &, float *block,
+                const KVPage *const *pages);
 std::vector<int> DraftReadout(Weights &, Scratch &, int anchor, int width, float *block);
 void SaveDraftHidden(Data &ring, int device, int position, int width, const float *hidden,
                      const StepInput *step = nullptr);
@@ -84,19 +96,31 @@ void Engram(Weights &, Scratch &, int layer, const std::array<int, 3> &ids, floa
 void PrepareEngramInput(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids);
 void RunPreparedEngram(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids,
                        float *streams);
+struct KVPage {
+    void *key, *value;
+};
+struct AttentionCache {
+    const KVPage *target, *draft;
+};
+void TruncateKV(Data &key, Data &value, int end);
+const KVPage *ReservePages(KVPools &, int device, Data &key, Data &value, int end, int retained, int keyWidth,
+                           int valueWidth);
+const AttentionCache *PrepareAttentionCaches(Weights &w, Scratch &s, int firstLayer, int endLayer,
+                                             int blockCount, const std::vector<int> &lengths,
+                                             const std::vector<std::pair<Data *, Data *>> &past,
+                                             const std::vector<int> &providers,
+                                             const std::vector<DraftRequest *> &states, int draftWidth);
+const AttentionCache *UploadAttentionCaches(Scratch &, const std::vector<AttentionCache> &);
 struct AttentionRow {
     int position;
-    Data *key, *value;
     int draftWidth;
     DraftMemory *draft;
     int draftLayer;
     const StepInput *step;
+    const AttentionCache *cache;
 };
-void AttentionBatch(Weights &, Scratch &, int layer, const std::vector<AttentionRow> &, const float *inputs,
-                    float *outputs);
-void Attention(Weights &, Scratch &, int layer, int position, const float *input, float *output,
-               Data &keyCache, Data &valueCache, int draftWidth = 0, DraftMemory *draft = nullptr,
-               int draftLayer = -1);
+void PagedAttentionBatch(Weights &, Scratch &, int layer, const std::vector<AttentionRow> &, const float *,
+                         float *);
 void DenseMlpBatch(Weights &, Scratch &, const std::string &, const float *, float *, int rows);
 void RouteBatch(Weights &, Scratch &, int layer, const float *, int *, float *, float *, int rows);
 void CombineExpertsBatch(Weights &, Scratch &, int layer, const float *, const float *, float *, int rows);

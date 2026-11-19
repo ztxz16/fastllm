@@ -56,8 +56,16 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeHybrid(const std::vector<int> &ancho
             static_cast<const float *>(state.hidden.cudaData) + size_t((base - 1) % (draftWidth + 1)) * 3072;
         auto block = s.Get("draftBlock", draftWidth * 3072);
         hy4::DraftEmbed(w, s, anchors[i], draftWidth, draftMask, target, block);
+        std::vector<hy4::AttentionCache> caches;
+        const int limit = w.config["max_position_embeddings"].int_value();
+        for (auto &provider : state.providers) {
+            auto pages = hy4::ReservePages(s.kvPools, s.device, provider.keys, provider.values,
+                                           base + draftWidth, limit, 8192, 8192);
+            caches.push_back({nullptr, pages});
+        }
+        auto draftCaches = hy4::UploadAttentionCaches(s, caches);
         for (size_t k = 0; k < draftProviders.size(); ++k)
-            hy4::DraftLayer(w, s, k, base, draftWidth, state.providers[k], block);
+            hy4::DraftLayer(w, s, k, base, draftWidth, state.providers[k], block, &draftCaches[k].draft);
         auto candidates = hy4::DraftReadout(w, s, anchors[i], draftWidth, block);
         expanded.push_back(anchors[i]);
         expanded.insert(expanded.end(), candidates.begin(), candidates.end());
@@ -84,12 +92,10 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeHybrid(const std::vector<int> &ancho
         past[i * block_cnt].first->cpuIntDatas.resize(committed);
         for (int layer = 0; layer < block_cnt; ++layer) {
             auto &kv = past[i * block_cnt + layer];
-            for (auto *data : {kv.first, kv.second}) {
-                auto dims = data->dims;
-                dims[1] = std::min(committed, dims[1]);
-                data->Resize(dims);
-            }
+            hy4::TruncateKV(*kv.first, *kv.second, committed);
         }
+        for (auto &provider : state.providers)
+            hy4::TruncateKV(provider.keys, provider.values, committed);
         if (GetFastllmEnv().printProfile)
             fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i, bases[i],
                     draftWidth - 1, accepted);
@@ -164,24 +170,10 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                    hybridGraphs->warmedRows >= size_t(rows) && (rows != 1 || hybridGraphs->warmedSingle) &&
                    (diskGraphReady ||
                     FastllmCudaNativeMoeGraphOwner(hostExperts[1].data(), hostExperts[1].size(), rows));
-    for (size_t i = 0; i < lengths.size() && capture; ++i) {
-        int end = positions[lastRows[i]] + 1;
-        const auto firstPos = positions[lastRows[i]] + 1 - lengths[i];
-        if (firstPos < 4 || (firstPos <= 2048 && end > 2048)) {
-            capture = false;
-            break;
-        }
-        if (states[i] && end > 2048)
-            for (const auto &memory : states[i]->providers)
-                if (!memory.recalled.cudaData)
-                    capture = false;
-        for (int layer = 0; layer < block_cnt && capture; ++layer) {
-            auto &kc = *past[i * block_cnt + layer].first;
-            bool sliding = w.config["layer_types"][layer].string_value() == "sliding_attention";
-            int wanted = sliding ? std::min(end, 512 + (states[i] ? draftWidth : 0)) : end;
-            capture = !kc.expansionDims.empty() && kc.expansionDims[1] >= wanted;
-        }
-    }
+    for (size_t i = 0; i < lengths.size() && capture; ++i)
+        capture = positions[lastRows[i]] + 1 - lengths[i] >= 4;
+    auto attentionCaches = hy4::PrepareAttentionCaches(w, s, 0, block_cnt, block_cnt, lengths, past,
+                                                       draftProviders, states, draftWidth);
     if (capture)
         for (int layer = 0; layer < block_cnt; ++layer)
             if (w.meta.count("model.layers." + std::to_string(layer) + ".engram_layer.lookup_table"))
@@ -205,44 +197,23 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
         for (int row = 0; row < rows; ++row) {
             const bool skip = tokens[row] == w.config["engram_pad_id"].int_value() || tokens[row] == 120120 ||
                               tokens[row] == 120124;
-            key.push_back((positions[row] / hy4::KVPageTokens) * 2 + int(skip));
+            // Sparse attention selects recalled groups starting at position 2048.
+            key.push_back(2 * int(positions[row] >= 2048) + int(skip));
         }
         for (size_t i = 0; i < lengths.size(); ++i) {
             key.push_back(lengths[i]);
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                auto &kv = past[i * block_cnt + layer];
-                key.push_back(uintptr_t(kv.first->cudaData));
-                key.push_back(uintptr_t(kv.second->cudaData));
-            }
+            key.push_back(states[i] ? draftWidth : 0);
             if (states[i]) {
                 key.push_back(uintptr_t(states[i]->hidden.cudaData));
-                for (const auto &mem : states[i]->providers) {
-                    key.push_back(uintptr_t(mem.keys.cudaData));
-                    key.push_back(uintptr_t(mem.values.cudaData));
+                for (const auto &mem : states[i]->providers)
                     key.push_back(uintptr_t(mem.recalled.cudaData));
-                }
             }
         }
         key.push_back(s.generation);
     }
 
     bool replay = capture && hy4::ReplayHybrid(*hybridGraphs, key, verify, rows);
-    if (replay) {
-        for (size_t i = 0; i < lengths.size(); ++i) {
-            const int end = positions[lastRows[i]] + 1;
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                auto &kv = past[i * block_cnt + layer];
-                hy4::AdvanceKV(*kv.first, end);
-                hy4::AdvanceKV(*kv.second, end);
-            }
-            if (states[i])
-                for (auto &mem : states[i]->providers) {
-                    hy4::AdvanceKV(mem.keys, end);
-                    hy4::AdvanceKV(mem.values, end);
-                }
-        }
-    } else {
-
+    if (!replay) {
         hy4::HybridGraphCapture graph(capture ? hybridGraphs.get() : nullptr, diskGraphReady);
         graph.Start(device);
         auto streams = s.Get("streams", size_t(rows) * 4 * 3072);
@@ -265,7 +236,6 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 s.step = capture ? stepInputs + row : nullptr;
                 float *h = streams + size_t(row) * 4 * 3072;
                 float *x = inputs + size_t(row) * 3072, *post = posts + row * 4;
-                auto &cache = past[owners[row] * block_cnt + layer];
                 if (w.meta.count(p + "engram_layer.lookup_table")) {
                     if (capture)
                         hy4::RunPreparedEngram(w, s, layer, row, grams[row], h);
@@ -285,11 +255,11 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 auto *state = states[owners[row]];
                 auto index = provider - draftProviders.begin();
                 auto *memory = state && provider != draftProviders.end() ? &state->providers[index] : nullptr;
-                attentionRows.push_back({positions[row], cache.first, cache.second, state ? draftWidth : 0,
-                                         memory, int(index), s.step});
+                attentionRows.push_back({positions[row], state ? draftWidth : 0, memory, int(index), s.step,
+                                         attentionCaches + layer * lengths.size() + owners[row]});
             }
             hy4::NormBatch(w, s, p + "input_layernorm.weight", inputs, rows, 3072);
-            hy4::AttentionBatch(w, s, layer, attentionRows, inputs, attnOutput);
+            hy4::PagedAttentionBatch(w, s, layer, attentionRows, inputs, attnOutput);
             for (int row = 0; row < rows; ++row) {
                 auto h = streams + size_t(row) * 4 * 3072;
                 auto x = inputs + size_t(row) * 3072;

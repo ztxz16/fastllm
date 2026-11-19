@@ -31,7 +31,12 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeGpu(const std::vector<int> &anchors,
                 block = next;
                 deviceIndex = index;
             }
-            hy4::DraftLayer(w, *arenas[index], k, base, draftWidth, state.providers[k], block);
+            auto &s = *arenas[index];
+            auto &provider = state.providers[k];
+            auto table = hy4::ReservePages(s.kvPools, s.device, provider.keys, provider.values,
+                                           base + draftWidth, max_positions, 8192, 8192);
+            auto cache = hy4::UploadAttentionCaches(s, {{nullptr, table}});
+            hy4::DraftLayer(w, s, k, base, draftWidth, provider, block, &cache->draft);
         }
         auto candidates = hy4::DraftReadout(w, *arenas[deviceIndex], anchors[i], draftWidth, block);
         expanded.push_back(anchors[i]);
@@ -59,12 +64,10 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeGpu(const std::vector<int> &anchors,
         past[i * block_cnt].first->cpuIntDatas.resize(committed);
         for (int layer = 0; layer < block_cnt; ++layer) {
             auto &kv = past[i * block_cnt + layer];
-            for (auto *data : {kv.first, kv.second}) {
-                auto dims = data->dims;
-                dims[1] = std::min(committed, dims[1]);
-                data->Resize(dims);
-            }
+            hy4::TruncateKV(*kv.first, *kv.second, committed);
         }
+        for (auto &provider : state.providers)
+            hy4::TruncateKV(provider.keys, provider.values, committed);
         if (GetFastllmEnv().printProfile)
             fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i, bases[i],
                     draftWidth - 1, accepted);
@@ -131,23 +134,21 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
     }
     bool capture = gpuGraphs->peerReady && graphEnabled && (verify || rows == int(lengths.size())) &&
                    gpuGraphs->warmedRows >= size_t(rows) && (rows != 1 || gpuGraphs->warmedSingle);
-    for (size_t i = 0; i < lengths.size() && capture; ++i) {
-        int end = positions[lastRows[i]] + 1;
-        const auto firstPos = positions[lastRows[i]] + 1 - lengths[i];
-        if (firstPos < 4 || (firstPos <= 2048 && end > 2048)) {
-            capture = false;
-            break;
+    for (size_t i = 0; i < lengths.size() && capture; ++i)
+        capture = positions[lastRows[i]] + 1 - lengths[i] >= 4;
+    std::vector<const hy4::AttentionCache *> layerCaches(block_cnt);
+    int firstLayer = 0;
+    for (size_t stage = 0; stage < arenas.size(); ++stage) {
+        int endLayer = firstLayer;
+        while (endLayer < block_cnt && size_t(endLayer) * arenas.size() / block_cnt == stage)
+            ++endLayer;
+        if (firstLayer < endLayer) {
+            auto table = hy4::PrepareAttentionCaches(w, *arenas[stage], firstLayer, endLayer, block_cnt,
+                                                     lengths, past, draftProviders, states, draftWidth);
+            for (int layer = firstLayer; layer < endLayer; ++layer)
+                layerCaches[layer] = table + (layer - firstLayer) * lengths.size();
         }
-        if (states[i] && end > 2048)
-            for (const auto &memory : states[i]->providers)
-                if (!memory.recalled.cudaData)
-                    capture = false;
-        for (int layer = 0; layer < block_cnt && capture; ++layer) {
-            auto &kc = *past[i * block_cnt + layer].first;
-            bool sliding = w.config["layer_types"][layer].string_value() == "sliding_attention";
-            int wanted = sliding ? std::min(end, 512 + (states[i] ? draftWidth : 0)) : end;
-            capture = !kc.expansionDims.empty() && kc.expansionDims[1] >= wanted;
-        }
+        firstLayer = endLayer;
     }
     const int vocab = w.meta.at("lm_head.weight").dims[0];
     const size_t outputs = verify ? rows : lengths.size();
@@ -166,20 +167,14 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
         for (int row = 0; row < rows; ++row) {
             const bool skip = tokens[row] == w.config["engram_pad_id"].int_value() || tokens[row] == 120120 ||
                               tokens[row] == 120124;
-            key.push_back((positions[row] / hy4::KVPageTokens) * 2 + int(skip));
+            key.push_back(int(positions[row] >= 2048) * 2 + int(skip));
         }
         for (size_t i = 0; i < lengths.size(); ++i) {
             key.push_back(lengths[i]);
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                auto &kv = past[i * block_cnt + layer];
-                key.push_back(uintptr_t(kv.first->cudaData));
-                key.push_back(uintptr_t(kv.second->cudaData));
-            }
+            key.push_back(states[i] ? draftWidth : 0);
             if (states[i]) {
                 key.push_back(uintptr_t(states[i]->hidden.cudaData));
                 for (const auto &mem : states[i]->providers) {
-                    key.push_back(uintptr_t(mem.keys.cudaData));
-                    key.push_back(uintptr_t(mem.values.cudaData));
                     key.push_back(uintptr_t(mem.recalled.cudaData));
                 }
             }
@@ -189,21 +184,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
     }
     hy4::Select(devices.back());
     bool replay = capture && hy4::ReplayGpu(*gpuGraphs, key, verify, rows);
-    if (replay) {
-        for (size_t i = 0; i < lengths.size(); ++i) {
-            const int end = positions[lastRows[i]] + 1;
-            for (int layer = 0; layer < block_cnt; ++layer) {
-                auto &kv = past[i * block_cnt + layer];
-                hy4::AdvanceKV(*kv.first, end);
-                hy4::AdvanceKV(*kv.second, end);
-            }
-            if (states[i])
-                for (auto &mem : states[i]->providers) {
-                    hy4::AdvanceKV(mem.keys, end);
-                    hy4::AdvanceKV(mem.values, end);
-                }
-        }
-    } else {
+    if (!replay) {
         hy4::Select(devices.front());
         hy4::GpuGraphCapture graph(capture ? gpuGraphs.get() : nullptr);
         graph.Start(devices.front());
@@ -242,7 +223,6 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
                 s.step = capture ? stepInputs[owner] + row : nullptr;
                 float *h = streams + size_t(row) * 4 * 3072;
                 float *x = inputs + size_t(row) * 3072, *post = posts + row * 4;
-                auto &cache = past[owners[row] * block_cnt + layer];
                 if (w.meta.count(p + "engram_layer.lookup_table"))
                     hy4::Engram(w, s, layer, grams[row], h);
                 hy4::HyperPre(w, s, p + "hc_attn_layer.hc_pre.", h, x, post);
@@ -251,10 +231,10 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
                 auto *state = states[owners[row]];
                 auto index = provider - draftProviders.begin();
                 auto *memory = state && provider != draftProviders.end() ? &state->providers[index] : nullptr;
-                attentionRows.push_back({positions[row], cache.first, cache.second, state ? draftWidth : 0,
-                                         memory, int(index), s.step});
+                attentionRows.push_back({positions[row], state ? draftWidth : 0, memory, int(index), s.step,
+                                         layerCaches[layer] + owners[row]});
             }
-            hy4::AttentionBatch(w, s, layer, attentionRows, inputs, attnOutput);
+            hy4::PagedAttentionBatch(w, s, layer, attentionRows, inputs, attnOutput);
             for (int row = 0; row < rows; ++row) {
                 auto h = streams + size_t(row) * 4 * 3072;
                 auto x = inputs + size_t(row) * 3072;

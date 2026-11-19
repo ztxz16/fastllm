@@ -2,8 +2,11 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cublas_v2.h>
+extern "C" cublasHandle_t getFastllmCublasHandle();
 #include <cub/block/block_radix_sort.cuh>
 #include <cmath>
+#include <numeric>
 #include <stdexcept>
 #include "hy4-flash-cuda.cuh"
 #include "../../../models/hy4_flash_capture.h"
@@ -40,11 +43,6 @@ const StepInput *UploadStep(Scratch &s, const std::vector<StepInput> &input) {
         reinterpret_cast<StepInput *>(s.Get("stepInputs", input.size() * sizeof(StepInput) / sizeof(float)));
     CopyToGPU(dst, input.data(), input.size() * sizeof(StepInput));
     return dst;
-}
-void AdvanceKV(Data &data, int end) {
-    auto dims = data.dims;
-    dims[1] = std::min(data.expansionDims[1], end);
-    data.Resize(dims);
 }
 __global__ static void copyPeerStreams(float *dst, const float *src, size_t count) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -245,6 +243,20 @@ static void Linear(Weights &w, Scratch &s, const std::string &name, const float 
     } else
         gemv<<<dim3(v.rows, slots), 128>>>(v, x, y, ids, routesPerInput, roundOutput, bias);
 }
+template <int Type> __device__ static float4 loadWeight4(const void *weight, size_t index) {
+    if constexpr (Type == 2)
+        return static_cast<float4>(reinterpret_cast<const __nv_fp8x4_e4m3 *>(weight)[index]);
+    else if constexpr (Type == 0) {
+        const uint2 packed = reinterpret_cast<const uint2 *>(weight)[index];
+        auto lo = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&packed.x));
+        auto hi = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&packed.y));
+        return make_float4(lo.x, lo.y, hi.x, hi.y);
+    } else
+        return reinterpret_cast<const float4 *>(weight)[index];
+}
+__device__ static float dot4(float4 weights, float4 input) {
+    return fmaf(weights.w, input.w, fmaf(weights.z, input.z, fmaf(weights.y, input.y, weights.x * input.x)));
+}
 // Four token vectors share a single read of each weight and scale block.
 template <int Type>
 __global__ static void batchGemv(Hy4View w, const float *x, float *out, int count, bool roundOutput) {
@@ -255,16 +267,7 @@ __global__ static void batchGemv(Hy4View w, const float *x, float *out, int coun
     int width = w.cols;
     size_t base = size_t(row) * width;
     for (int col = lane * 4; col < width; col += 128) {
-        float4 a;
-        if constexpr (Type == 2)
-            a = static_cast<float4>(reinterpret_cast<const __nv_fp8x4_e4m3 *>(w.data)[(base + col) / 4]);
-        else if constexpr (Type == 0) {
-            auto bits = reinterpret_cast<const uint2 *>(w.data)[(base + col) / 4];
-            auto lo = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&bits.x));
-            auto hi = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&bits.y));
-            a = make_float4(lo.x, lo.y, hi.x, hi.y);
-        } else
-            a = reinterpret_cast<const float4 *>(w.data)[(base + col) / 4];
+        auto a = loadWeight4<Type>(w.data, (base + col) / 4);
         float scale = 1.f;
         if constexpr (Type == 2)
             scale = read(w.scale, w.scaleType, size_t(row / 128) * ((width + 127) / 128) + col / 128);
@@ -272,7 +275,7 @@ __global__ static void batchGemv(Hy4View w, const float *x, float *out, int coun
         for (int r = 0; r < 4; ++r)
             if (first + r < count) {
                 auto v = *reinterpret_cast<const float4 *>(x + size_t(first + r) * width + col);
-                float dot = fmaf(a.w, v.w, fmaf(a.z, v.z, fmaf(a.y, v.y, a.x * v.x)));
+                float dot = dot4(a, v);
                 sum[r] = fmaf(dot, scale, sum[r]);
             }
     }
@@ -284,6 +287,11 @@ __global__ static void batchGemv(Hy4View w, const float *x, float *out, int coun
                 out[size_t(first + r) * w.rows + row] = roundOutput ? bf(sum[r]) : sum[r];
         }
 }
+static const float *QuantizeRows(Scratch &s, const float *x, int rows, int cols) {
+    auto q = s.Get("batchQuant", size_t(rows) * cols);
+    quantAct<<<dim3((cols + 127) / 128, rows), 128>>>(x, q, cols);
+    return q;
+}
 static void LinearBatch(Weights &w, Scratch &s, const std::string &name, const float *x, float *y, int rows,
                         bool roundOutput = true) {
     if (rows == 1) {
@@ -291,11 +299,8 @@ static void LinearBatch(Weights &w, Scratch &s, const std::string &name, const f
         return;
     }
     auto v = w.View(name, s.device);
-    if (v.type == 2) {
-        auto q = s.Get("batchQuant", size_t(rows) * v.cols);
-        quantAct<<<dim3((v.cols + 127) / 128, rows), 128>>>(x, q, v.cols);
-        x = q;
-    }
+    if (v.type == 2)
+        x = QuantizeRows(s, x, rows, v.cols);
     dim3 grid((v.rows + 3) / 4, (rows + 3) / 4);
     if (v.type == 2)
         batchGemv<2><<<grid, 128>>>(v, x, y, rows, roundOutput);
@@ -303,6 +308,68 @@ static void LinearBatch(Weights &w, Scratch &s, const std::string &name, const f
         batchGemv<0><<<grid, 128>>>(v, x, y, rows, roundOutput);
     else
         batchGemv<1><<<grid, 128>>>(v, x, y, rows, roundOutput);
+}
+// Each warp projects both FFN matrices from the same activation tile and preserves each BF16 rounding.
+template <int Type, int Rows>
+__global__ static void pairedDraftGemv(Hy4View g, Hy4View u, const float *x, float *gate, float *up) {
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= g.rows)
+        return;
+    const size_t offset = size_t(row) * g.cols;
+    const int first = blockIdx.y * Rows;
+    float gs[Rows] = {}, us[Rows] = {};
+    constexpr int unroll = Rows == 1 ? 4 : 1;
+#pragma unroll(unroll)
+    for (int col = lane * 4; col < g.cols; col += 128) {
+        auto gw = loadWeight4<Type>(g.data, (offset + col) / 4);
+        auto uw = loadWeight4<Type>(u.data, (offset + col) / 4);
+        float gscale = 1.f, uscale = 1.f;
+        if constexpr (Type == 2) {
+            auto i = (row / 128) * ((g.cols + 127) / 128) + col / 128;
+            gscale = __bfloat162float(static_cast<const __nv_bfloat16 *>(g.scale)[i]);
+            uscale = __bfloat162float(static_cast<const __nv_bfloat16 *>(u.scale)[i]);
+        }
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            auto v = *reinterpret_cast<const float4 *>(x + size_t(first + r) * g.cols + col);
+            gs[r] = fmaf(dot4(gw, v), gscale, gs[r]);
+            us[r] = fmaf(dot4(uw, v), uscale, us[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+        auto a = warpReduce(gs[r]), b = warpReduce(us[r]);
+        if (!lane) {
+            auto index = size_t(first + r) * g.rows + row;
+            gate[index] = bf(a);
+            up[index] = bf(b);
+        }
+    }
+}
+template <int Type>
+static void LaunchGateUp(Hy4View g, Hy4View u, const float *x, float *gate, float *up, int rows) {
+    const int blocks = (g.rows + 3) / 4, full = rows / 4 * 4;
+    if (full)
+        pairedDraftGemv<Type, 4><<<dim3(blocks, full / 4), 128>>>(g, u, x, gate, up);
+    if (rows > full)
+        pairedDraftGemv<Type, 1><<<dim3(blocks, rows - full), 128>>>(
+            g, u, x + size_t(full) * g.cols, gate + size_t(full) * g.rows, up + size_t(full) * g.rows);
+}
+static void DraftGateUp(Weights &w, Scratch &s, const std::string &prefix, const float *x, float *gate,
+                        float *up, int rows) {
+    auto g = w.View(prefix + "gate_proj.weight", s.device), u = w.View(prefix + "up_proj.weight", s.device);
+    if (g.rows == u.rows && g.cols == u.cols && g.cols % 4 == 0 && g.type == u.type) {
+        if (g.type == 2 && g.scaleType == 0 && u.scaleType == 0) {
+            LaunchGateUp<2>(g, u, QuantizeRows(s, x, rows, g.cols), gate, up, rows);
+            return;
+        }
+        if (g.type == 0) {
+            LaunchGateUp<0>(g, u, x, gate, up, rows);
+            return;
+        }
+    }
+    LinearBatch(w, s, prefix + "gate_proj.weight", x, gate, rows);
+    LinearBatch(w, s, prefix + "up_proj.weight", x, up, rows);
 }
 __device__ static void normRow(const float *x, Hy4View w, float *y, int width, float eps, bool roundFirst) {
     float sum = 0;
@@ -329,17 +396,22 @@ __global__ static void normEngramHeads(float *embedding, EngramNormWeights weigh
 void Norm(Weights &w, Scratch &s, const std::string &name, const float *x, float *y, int width) {
     norm<<<1, 256>>>(x, w.View(name, s.device), y, width, 1e-5f, true);
 }
-__global__ static void normBatch(float *data, Hy4View weight, int width, int stride) {
-    float *row = data + size_t(blockIdx.x) * stride;
-    normRow(row, weight, row, width, 1e-5f, true);
+__global__ static void normBatch(const float *input, Hy4View weight, float *output, int width,
+                                 int inputStride, int outputStride) {
+    normRow(input + size_t(blockIdx.x) * inputStride, weight, output + size_t(blockIdx.x) * outputStride,
+            width, 1e-5f, true);
+}
+static void NormRows(Weights &w, Scratch &s, const std::string &name, const float *input, float *output,
+                     int rows, int width, int inputStride, int outputStride) {
+    if (rows == 1) {
+        Norm(w, s, name, input, output, width);
+        return;
+    }
+    normBatch<<<rows, 256>>>(input, w.View(name, s.device), output, width, inputStride, outputStride);
 }
 void NormBatch(Weights &w, Scratch &s, const std::string &name, float *data, int rows, int width,
                int stride) {
-    if (rows == 1) {
-        Norm(w, s, name, data, data, width);
-        return;
-    }
-    normBatch<<<rows, 256>>>(data, w.View(name, s.device), width, stride ? stride : width);
+    NormRows(w, s, name, data, data, rows, width, stride ? stride : width, stride ? stride : width);
 }
 __global__ static void embed(Hy4View w, int token, float *h, const StepInput *step) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -473,8 +545,9 @@ __global__ static void denseBatchActivation(const float *gate, const float *up, 
     if (i < size)
         out[i] = bf(bf(gate[i] * sigmoid(gate[i])) * up[i]);
 }
-void DenseMlpBatch(Weights &w, Scratch &s, const std::string &p, const float *input, float *output,
-                   int rows) {
+template <bool Draft>
+static void DenseMlpRows(Weights &w, Scratch &s, const std::string &p, const float *input, float *output,
+                         int rows) {
     if (rows == 1) {
         DenseMlp(w, s, p, input, output);
         return;
@@ -486,13 +559,21 @@ void DenseMlpBatch(Weights &w, Scratch &s, const std::string &p, const float *in
         auto out = output + size_t(first) * 3072;
         auto gate = s.Get("batchDenseGate", size), up = s.Get("batchDenseUp", size),
              mid = s.Get("batchDenseMid", size);
-        LinearBatch(w, s, p + "gate_proj.weight", x, gate, n);
-        LinearBatch(w, s, p + "up_proj.weight", x, up, n);
+        if constexpr (Draft) {
+            DraftGateUp(w, s, p, x, gate, up, n);
+        } else {
+            LinearBatch(w, s, p + "gate_proj.weight", x, gate, n);
+            LinearBatch(w, s, p + "up_proj.weight", x, up, n);
+        }
         denseBatchActivation<<<(size + 255) / 256, 256>>>(gate, up, mid, size);
         LinearBatch(w, s, p + "down_proj.weight", mid, out, n);
         if (w.meta.count(p + "post_fc2_norm.weight"))
             NormBatch(w, s, p + "post_fc2_norm.weight", out, n, 3072);
     }
+}
+void DenseMlpBatch(Weights &w, Scratch &s, const std::string &p, const float *input, float *output,
+                   int rows) {
+    DenseMlpRows<false>(w, s, p, input, output, rows);
 }
 __global__ static void pick(const float *logits, Hy4View bias, int *id, float *score, float scale) {
     // Stable sorting retains the lower expert ID on tied corrected scores.
@@ -634,14 +715,19 @@ __device__ static float rope(float a, float b, int j, int pos, float theta) {
 }
 // Indexed layers retain one normalized token key per slot. The final slot of a
 // closed group also owns its pooled, rotated key. Both travel with the request KV.
-__global__ static void storeIndexKey(const float *input, __nv_bfloat16 *cache, int stride, int pos,
-                                     const StepInput *step) {
+template <bool Value = false>
+__device__ static __nv_bfloat16 *kvRow(const KVPage *const *pages, int slot, int stride) {
+    const auto &page = (*pages)[slot / KVPageTokens];
+    return static_cast<__nv_bfloat16 *>(Value ? page.value : page.key) + size_t(slot % KVPageTokens) * stride;
+}
+__global__ static void storeIndexKey(const float *input, int stride, int pos, const StepInput *step,
+                                     const KVPage *const *pages) {
     if (step)
         pos = step->position;
-    cache[size_t(pos) * stride + stride - 256 + threadIdx.x] = __float2bfloat16(input[threadIdx.x]);
+    kvRow(pages, pos, stride)[stride - 256 + threadIdx.x] = __float2bfloat16(input[threadIdx.x]);
 }
-__global__ static void poolIndexKey(const __nv_bfloat16 *cache, int stride, int pos, Hy4View value,
-                                    Hy4View gate, Hy4View ape, float *pooled, const StepInput *step) {
+__global__ static void poolIndexKey(int stride, int pos, Hy4View value, Hy4View gate, Hy4View ape,
+                                    float *pooled, const StepInput *step, const KVPage *const *pages) {
     if (step)
         pos = step->position;
     if ((pos & 3) != 3)
@@ -649,7 +735,7 @@ __global__ static void poolIndexKey(const __nv_bfloat16 *cache, int stride, int 
     const int channel = blockIdx.x, col = threadIdx.x;
     float values[4], gates[4];
     for (int slot = 0; slot < 4; ++slot) {
-        float x = __bfloat162float(cache[size_t(pos - 3 + slot) * stride + stride - 256 + col]);
+        float x = __bfloat162float(kvRow(pages, pos - 3 + slot, stride)[stride - 256 + col]);
         values[slot] = reduce(x * read(value.data, value.type, channel * 128 + col));
         gates[slot] = reduce(x * read(gate.data, gate.type, channel * 128 + col)) +
                       read(ape.data, ape.type, slot * 128 + channel);
@@ -665,15 +751,15 @@ __global__ static void poolIndexKey(const __nv_bfloat16 *cache, int stride, int 
         pooled[channel] = numerator / denominator;
     }
 }
-__global__ static void storeGroupKey(const float *pooled, __nv_bfloat16 *cache, int stride, int pos,
-                                     const StepInput *step) {
+__global__ static void storeGroupKey(const float *pooled, int stride, int pos, const StepInput *step,
+                                     const KVPage *const *pages) {
     if (step)
         pos = step->position;
     if ((pos & 3) != 3)
         return;
     int i = threadIdx.x;
     float x = i < 64 ? pooled[i] : rope(pooled[i], pooled[i ^ 1], i - 64, pos - 3, 10000000.f);
-    cache[size_t(pos) * stride + stride - 128 + i] = __float2bfloat16(x);
+    kvRow(pages, pos, stride)[stride - 128 + i] = __float2bfloat16(x);
 }
 __global__ static void rotateIndexQuery(const float *input, float *output, int pos, const StepInput *step) {
     if (step)
@@ -681,19 +767,20 @@ __global__ static void rotateIndexQuery(const float *input, float *output, int p
     int i = blockIdx.x * 128 + threadIdx.x, d = threadIdx.x;
     output[i] = d < 64 ? input[i] : rope(input[i], input[i ^ 1], d - 64, pos, 10000000.f);
 }
-__global__ static void scoreIndexGroups(const float *query, const float *weights, const __nv_bfloat16 *cache,
-                                        int stride, float *scores, const StepInput *step) {
-    if (step && blockIdx.x >= step->position / 4)
-        return;
-    int group = blockIdx.x, col = threadIdx.x;
-    float key = __bfloat162float(cache[(size_t(group) * 4 + 3) * stride + stride - 128 + col]);
-    float score = 0;
-    for (int head = 0; head < 16; ++head) {
-        float dot = reduce(query[head * 128 + col] * key);
-        score += fmaxf(dot, 0.f) * weights[head] * 0.0220970869f;
+__global__ static void scoreIndexGroups(const float *query, const float *weights, int stride, float *scores,
+                                        const StepInput *step, const KVPage *const *pages) {
+    int groups = step ? step->position / 4 : gridDim.x;
+    for (int group = blockIdx.x; group < groups; group += gridDim.x) {
+        const int col = threadIdx.x;
+        float key = __bfloat162float(kvRow(pages, group * 4 + 3, stride)[stride - 128 + col]);
+        float score = 0;
+        for (int head = 0; head < 16; ++head) {
+            float dot = reduce(query[head * 128 + col] * key);
+            score += fmaxf(dot, 0.f) * weights[head] * 0.0220970869f;
+        }
+        if (!col)
+            scores[group] = score;
     }
-    if (!col)
-        scores[group] = score;
 }
 __device__ static unsigned orderedScore(float score) {
     unsigned bits = __float_as_uint(score == 0.f ? 0.f : score);
@@ -761,20 +848,20 @@ __global__ static void selectIndexGroups(const float *scores, int groups, int *c
         chosen[count] = groups;
 }
 static int *IndexPool(Weights &w, Scratch &s, const std::string &attn, const float *hidden,
-                      const float *residual, __nv_bfloat16 *keyCache, int stride, int pos) {
+                      const float *residual, int stride, int pos, const KVPage *const *pages) {
     const auto p = attn + "compressed_indexer.";
     auto key = s.Get("indexTokenKey", 128);
     Linear(w, s, p + "token_key_projection.weight", hidden, key);
     Norm(w, s, p + "token_key_norm.weight", key, key, 128);
-    storeIndexKey<<<1, 128>>>(key, keyCache, stride, pos, s.step);
+    storeIndexKey<<<1, 128>>>(key, stride, pos, s.step, pages);
     if (s.step || (pos & 3) == 3) {
         auto value = w.View(p + "key_value_projection.weight", s.device);
         auto gate = w.View(p + "key_gate_projection.weight", s.device);
         auto ape = w.View(p + "intra_group_ape", s.device);
         auto pooled = s.Get("indexPooled", 128);
-        poolIndexKey<<<128, 128>>>(keyCache, stride, pos, value, gate, ape, pooled, s.step);
+        poolIndexKey<<<128, 128>>>(stride, pos, value, gate, ape, pooled, s.step, pages);
         norm<<<1, 128>>>(pooled, w.View(p + "key_norm.weight", s.device), pooled, 128, 1.e-5f, false, s.step);
-        storeGroupKey<<<1, 128>>>(pooled, keyCache, stride, pos, s.step);
+        storeGroupKey<<<1, 128>>>(pooled, stride, pos, s.step, pages);
     }
     if (pos < 2048)
         return nullptr;
@@ -786,15 +873,22 @@ static int *IndexPool(Weights &w, Scratch &s, const std::string &attn, const flo
     Linear(w, s, p + "query_projection.weight", residual, query);
     rotateIndexQuery<<<16, 128>>>(query, rotated, pos, s.step);
     Linear(w, s, p + "head_weight_projection.weight", hidden, weights);
-    scoreIndexGroups<<<s.step ? groupCapacity : closedGroups, 128>>>(rotated, weights, keyCache, stride,
-                                                                     scores, s.step);
+    const int grid = s.step ? 512 : closedGroups;
+    scoreIndexGroups<<<grid, 128>>>(rotated, weights, stride, scores, s.step, pages);
     selectIndexGroups<<<1, 256>>>(scores, closedGroups, chosen, s.step);
     return chosen;
 }
 
-__global__ static void packKV(const float *kv, const float *rot, float *q, __nv_bfloat16 *key,
-                              __nv_bfloat16 *val, int heads, int pos, int slot, float theta, int keyStride,
-                              const StepInput *step = nullptr, int keep = 1) {
+template <bool DraftRows = false>
+__global__ static void packKV(const float *kv, const float *rot, int heads, int pos, int slot, float theta,
+                              int keyStride, const StepInput *step, int keep, const KVPage *const *pages) {
+    if constexpr (DraftRows) {
+        const int row = blockIdx.y;
+        kv += size_t(row) * heads * 448;
+        rot += size_t(row) * 576;
+        pos += row;
+        slot += row;
+    }
     if (step) {
         pos = step->position;
         slot = pos % keep;
@@ -804,11 +898,18 @@ __global__ static void packKV(const float *kv, const float *rot, float *q, __nv_
         return;
     int h = i / 256, d = i % 256;
     float k = d < 192 ? kv[h * 448 + d] : rope(rot[d - 192], rot[(d - 192) ^ 1], d - 192, pos, theta);
-    key[size_t(slot) * keyStride + i] = __float2bfloat16(k);
-    val[size_t(slot) * heads * 256 + i] = __float2bfloat16(kv[h * 448 + 192 + d]);
+    kvRow(pages, slot, keyStride)[i] = __float2bfloat16(k);
+    kvRow<true>(pages, slot, heads * 256)[i] = __float2bfloat16(kv[h * 448 + 192 + d]);
 }
+template <bool DraftRows = false>
 __global__ static void rotQ(const float *input, float *query, int size, int pos, float theta,
                             const StepInput *step = nullptr) {
+    if constexpr (DraftRows) {
+        const int row = blockIdx.y;
+        input += size_t(row) * size;
+        query += size_t(row) * size;
+        pos += row;
+    }
     if (step)
         pos = step->position;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -817,26 +918,39 @@ __global__ static void rotQ(const float *input, float *query, int size, int pos,
     int d = i % 256;
     query[i] = d < 192 ? input[i] : rope(input[i], input[i ^ 1], d - 192, pos, theta);
 }
-__global__ static void scoreKV(const float *q, const __nv_bfloat16 *key, float *score, int start, int length,
-                               int heads, int capacity, int keyStride, const int *chosen, bool direct = false,
-                               const StepInput *step = nullptr, int window = 0) {
+template <bool DraftRows = false>
+__global__ static void scoreKV(const float *q, float *score, int start, int length, int heads, int capacity,
+                               int keyStride, const int *chosen, bool direct, const StepInput *step,
+                               int window, const KVPage *const *pages) {
+    if constexpr (DraftRows) {
+        const int row = blockIdx.z;
+        q += size_t(row) * heads * 256;
+        score += size_t(row) * heads * gridDim.x;
+        length += row;
+    }
     if (step) {
         length = window < 0 ? 2045 + (step->position & 3)
                  : window   ? min(window, step->position + 1)
                             : step->position + 1;
         start = step->position + 1 - length;
     }
-    if (blockIdx.x >= length)
-        return;
-    int h = blockIdx.y, t = blockIdx.x, i = threadIdx.x,
-        slot = chosen ? (direct ? chosen[t] : chosen[t / 4] * 4 + t % 4) : (start + t) % capacity;
-    const auto *k = key + size_t(slot) * keyStride + h * 256;
-    float dot = reduce(q[h * 256 + i] * __bfloat162float(k[i]));
-    if (!i)
-        score[h * length + t] = bf(bf(dot) * 0.0625f);
+    const int h = blockIdx.y, i = threadIdx.x;
+    for (int t = blockIdx.x; t < length; t += gridDim.x) {
+        int slot = chosen ? (direct ? chosen[t] : chosen[t / 4] * 4 + t % 4) : (start + t) % capacity;
+        const auto *k = kvRow(pages, slot, keyStride) + h * 256;
+        float dot = reduce(q[h * 256 + i] * __bfloat162float(k[i]));
+        if (!i)
+            score[h * length + t] = bf(bf(dot) * 0.0625f);
+    }
 }
+template <bool DraftRows = false>
 __global__ static void probKV(float *scores, Hy4View sink, int length, const StepInput *step = nullptr,
                               int window = 0) {
+    if constexpr (DraftRows) {
+        const int row = blockIdx.y;
+        scores += size_t(row) * gridDim.x * (length + gridDim.y - 1);
+        length += row;
+    }
     if (step)
         length = window < 0 ? 2045 + (step->position & 3)
                  : window   ? min(window, step->position + 1)
@@ -857,9 +971,17 @@ __global__ static void probKV(float *scores, Hy4View sink, int length, const Ste
     for (int i = threadIdx.x; i < length; i += blockDim.x)
         p[i] = bf(p[i] / sum);
 }
-__global__ static void applyKV(const float *scores, const __nv_bfloat16 *val, const float *gate, float *out,
-                               int start, int length, int heads, int cap, const int *chosen,
-                               bool direct = false, const StepInput *step = nullptr, int window = 0) {
+template <bool DraftRows = false>
+__global__ static void applyKV(const float *scores, const float *gate, float *out, int start, int length,
+                               int heads, int cap, const int *chosen, bool direct, const StepInput *step,
+                               int window, const KVPage *const *pages) {
+    if constexpr (DraftRows) {
+        const int row = blockIdx.y;
+        scores += size_t(row) * heads * (length + gridDim.y - 1);
+        gate += size_t(row) * heads * 256;
+        out += size_t(row) * heads * 256;
+        length += row;
+    }
     if (step) {
         length = window < 0 ? 2045 + (step->position & 3)
                  : window   ? min(window, step->position + 1)
@@ -870,165 +992,150 @@ __global__ static void applyKV(const float *scores, const __nv_bfloat16 *val, co
     float sum = 0;
     for (int t = 0; t < length; t++) {
         int slot = chosen ? (direct ? chosen[t] : chosen[t / 4] * 4 + t % 4) : (start + t) % cap;
-        sum = fmaf(scores[h * length + t], __bfloat162float(val[(size_t(slot) * heads + h) * 256 + j]), sum);
+        sum = fmaf(scores[h * length + t],
+                   __bfloat162float(kvRow<true>(pages, slot, heads * 256)[h * 256 + j]), sum);
     }
     out[h * 256 + j] = bf(bf(sum) * bf(sigmoid(gate[h * 256 + j])));
 }
-static void ReserveKV(Data &data, int device, int seq, int width, int retained) {
-    const int size = std::min(seq, retained);
-    if (data.dims.empty()) {
-        data.dataType = BFLOAT16;
-        data.UpdateUnitSize();
-        data.dataDevice = CUDA;
-        data.dataDeviceIds = {device};
+static void ReserveRecallRing(DraftMemory &draft, int device, int slots) {
+    if (draft.recalled.dims.empty()) {
+        draft.recalled.dataType = INT32;
+        draft.recalled.UpdateUnitSize();
+        draft.recalled.dataDevice = CUDA;
+        draft.recalled.dataDeviceIds = {device};
+        draft.recalled.Resize({slots, 512});
+        draft.recalled.Allocate(false);
     }
-    if (data.expansionDims.empty() || data.expansionDims[1] < size)
-        data.Expansion(
-            {1, std::min(retained, (size + KVPageTokens - 1) / KVPageTokens * KVPageTokens), width});
-    data.Resize({1, size, width});
+}
+static bool UsesPagedMla(const Weights &w, const Scratch &s, const std::string &prefix) {
+    return s.mlaSupported && w.meta.at(prefix + "kv_b_proj.weight").dtype == "BF16";
+}
+
+static AttentionCache PrepareAttentionCache(Weights &w, Scratch &s, int layer, int end, Data &key,
+                                            Data &value, int draftWidth, DraftMemory *draft) {
+    const bool sliding = w.config["layer_types"][layer].string_value() == "sliding_attention";
+    const int limit = w.config["max_position_embeddings"].int_value();
+    const bool mla = UsesPagedMla(w, s, "model.layers." + std::to_string(layer) + ".self_attn.");
+    // An entire MLA query tile appends before attention reads its windows.
+    const int keep = sliding ? 512 + (mla ? std::max(15, draftWidth) : draftWidth) : limit;
+    const int width = (sliding ? 64 : 32) * 256;
+    const int keyWidth = (mla ? 64 : width) + (sliding ? 0 : 256);
+    if (!mla)
+        s.Get("attScores", 32 * 2048);
+    AttentionCache result{
+        ReservePages(s.kvPools, s.device, key, value, end, keep, keyWidth, mla ? 512 : width), nullptr};
+    if (draft)
+        result.draft = ReservePages(s.kvPools, s.device, draft->keys, draft->values, end, keep, 8192, 8192);
+    if (!sliding && end > 2048) {
+        if (draft)
+            ReserveRecallRing(*draft, s.device, draftWidth + 1);
+        // The indexer starts using these weights at position 2048. Materialize them before capture.
+        const auto p = "model.layers." + std::to_string(layer) + ".self_attn.compressed_indexer.";
+        w.View(p + "query_projection.weight", s.device);
+        w.View(p + "head_weight_projection.weight", s.device);
+        s.Get("indexQuery", 16 * 128);
+        s.Get("indexRotaryQuery", 16 * 128);
+        s.Get("indexHeadWeights", 16);
+        s.Get("indexGroupScores", ((size_t(limit) + 127) / 128) * 32);
+        s.Get("indexChosen", 512);
+    }
+    return result;
+}
+const AttentionCache *UploadAttentionCaches(Scratch &s, const std::vector<AttentionCache> &caches) {
+    // Graph nodes index this stable array by request and layer, including when requests are replaced.
+    const size_t bytes = caches.size() * sizeof(AttentionCache);
+    auto dst = reinterpret_cast<AttentionCache *>(s.Get("graphAttentionCaches", bytes / sizeof(float)));
+    CopyToGPU(dst, caches.data(), bytes);
+    return dst;
 }
 __global__ static void saveChosenRing(int *ring, const int *chosen, const StepInput *step, int slots) {
     int i = blockIdx.x * 256 + threadIdx.x;
     ring[(step->position % slots) * 512 + i] = chosen[i];
 }
-struct ProjectedAttention {
-    float *qr, *q, *kv, *expanded, *gate, *mix;
-};
-static void AttentionRowForward(Weights &w, Scratch &s, int layer, int position, const float *x, float *out,
-                                Data &kc, Data &vc, int draftWidth, DraftMemory *draft, int draftLayer,
-                                const ProjectedAttention *batch) {
-    const std::string p = "model.layers." + std::to_string(layer) + ".self_attn.";
-    bool sliding = w.config["layer_types"][layer].string_value() == "sliding_attention";
-    int heads = sliding ? 64 : 32, width = heads * 256;
-    const int keep = sliding ? 512 + draftWidth : w.config["max_position_embeddings"].int_value();
-    const int keyStride = width + (sliding ? 0 : 256);
-    float *qr, *q, *kv, *expanded, *gate;
-    auto rq = s.Get("rotQ", width);
-    if (batch) {
-        qr = batch->qr;
-        q = batch->q;
-        kv = batch->kv;
-        expanded = batch->expanded;
-        gate = batch->gate;
-    } else {
-        qr = s.Get("qResid", 1024);
-        q = s.Get("q", width);
-        kv = s.Get("kvA", 576);
-        expanded = s.Get("kvB", heads * 448);
-        gate = s.Get("attGate", width);
-        Linear(w, s, p + "q_a_proj.weight", x, qr);
-        Norm(w, s, p + "q_a_layernorm.weight", qr, qr, 1024);
-        Linear(w, s, p + "q_b_proj.weight", qr, q);
-        Linear(w, s, p + "kv_a_proj_with_mqa.weight", x, kv);
-        Norm(w, s, p + "kv_a_layernorm.weight", kv, kv, 512);
-        Linear(w, s, p + "kv_b_proj.weight", kv, expanded);
-        Linear(w, s, p + "linear_gate.weight", x, gate);
-    }
-    int length = sliding ? std::min(position + 1, 512) : position + 1, start = position + 1 - length;
-    ReserveKV(kc, s.device, position + 1, keyStride, keep);
-    ReserveKV(vc, s.device, position + 1, width, keep);
-    auto key = (__nv_bfloat16 *)kc.cudaData, val = (__nv_bfloat16 *)vc.cudaData;
-    float theta = sliding ? 10000.f : 10000000.f;
-    packKV<<<width / 256, 256>>>(expanded, kv + 512, q, key, val, heads, position, position % keep, theta,
-                                 keyStride, s.step, keep);
-    rotQ<<<width / 256, 256>>>(q, rq, width, position, theta, s.step);
-    const int *chosen = sliding ? nullptr : IndexPool(w, s, p, x, qr, key, keyStride, position);
-    if (draft) {
-        const auto prefix = "model.dfly_layers." + std::to_string(draftLayer) + ".self_attn.";
-        auto projected = s.Get("draftHistoricalKV", 32 * 448);
-        Linear(w, s, prefix + "kv_b_proj.weight", kv, projected);
-        ReserveKV(draft->keys, s.device, position + 1, 32 * 256, keep);
-        ReserveKV(draft->values, s.device, position + 1, 32 * 256, keep);
-        packKV<<<32, 256>>>(projected, kv + 512, nullptr, static_cast<__nv_bfloat16 *>(draft->keys.cudaData),
-                            static_cast<__nv_bfloat16 *>(draft->values.cudaData), 32, position, position,
-                            theta, 32 * 256, s.step, keep);
-        if (chosen) {
-            if (draft->recalled.dims.empty()) {
-                draft->recalled.dataType = INT32;
-                draft->recalled.UpdateUnitSize();
-                draft->recalled.dataDevice = CUDA;
-                draft->recalled.dataDeviceIds = {s.device};
-                draft->recalled.Resize({draftWidth + 1, 512});
-                draft->recalled.Allocate(false);
-            }
-            auto dst =
-                static_cast<int *>(draft->recalled.cudaData) + size_t(position % (draftWidth + 1)) * 512;
-            if (s.step)
-                saveChosenRing<<<2, 256>>>(static_cast<int *>(draft->recalled.cudaData), chosen, s.step,
-                                           draftWidth + 1);
-            else
-                Check(cudaMemcpyAsync(dst, chosen, 512 * sizeof(int), cudaMemcpyDeviceToDevice,
-                                      cudaStreamPerThread));
-        }
-    }
-    if (chosen)
-        length = 511 * 4 + (position % 4) + 1;
-    auto scores = s.Get("attScores", size_t(heads) * ((length + 127) / 128 * 128)),
-         mix = batch ? batch->mix : s.Get("attMix", width);
-    int launchLength = s.step ? (length + KVPageTokens - 1) / KVPageTokens * KVPageTokens : length;
-    scoreKV<<<dim3(launchLength, heads), 256>>>(rq, key, scores, start, length, heads, keep, keyStride,
-                                                chosen, false, s.step,
-                                                chosen    ? -1
-                                                : sliding ? 512
-                                                          : 0);
-    auto sink = w.View(p + "learnable_sink_param", s.device);
-    probKV<<<heads, 256>>>(scores, sink, length, s.step, chosen ? -1 : sliding ? 512 : 0);
-    applyKV<<<heads, 256>>>(scores, val, gate, mix, start, length, heads, keep, chosen, false, s.step,
-                            chosen    ? -1
-                            : sliding ? 512
-                                      : 0);
-    if (batch)
+static void SaveDraftAttentionKV(Weights &w, Scratch &s, DraftMemory *draft, int draftLayer, int draftWidth,
+                                 const float *kv, int position, int keep, float theta, const int *chosen,
+                                 const AttentionCache *cache) {
+    if (!draft)
         return;
-    Linear(w, s, p + "o_proj.weight", mix, out);
-    Norm(w, s, p + "post_proj_norm.weight", out, out, 3072);
+    const auto prefix = "model.dfly_layers." + std::to_string(draftLayer) + ".self_attn.";
+    auto projected = s.Get("draftHistoricalKV", 32 * 448);
+    Linear(w, s, prefix + "kv_b_proj.weight", kv, projected);
+    packKV<<<32, 256>>>(projected, kv + 512, 32, position, position % keep, theta, 8192, s.step, keep,
+                        &cache->draft);
+    if (chosen) {
+        auto dst = static_cast<int *>(draft->recalled.cudaData) + size_t(position % (draftWidth + 1)) * 512;
+        if (s.step)
+            saveChosenRing<<<2, 256>>>(static_cast<int *>(draft->recalled.cudaData), chosen, s.step,
+                                       draftWidth + 1);
+        else
+            Check(cudaMemcpyAsync(dst, chosen, 512 * sizeof(int), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread));
+    }
+}
+static void ExpandedAttentionTile(Weights &w, Scratch &s, const std::string &p, int heads,
+                                  const AttentionRow *rows, int n, const float *x, const float *qr,
+                                  const float *q, const float *kv, const float *gate, float *mix) {
+    const bool sliding = heads == 64;
+    const int width = heads * 256, keyStride = width + (sliding ? 0 : 256);
+    const float theta = sliding ? 10000.f : 10000000.f;
+    const float *latent = kv;
+    if (n > 1) {
+        auto packed = s.Get("batchKvLatent", n * 512);
+        for (int i = 0; i < n; ++i)
+            CopyStageCaptured(packed + i * 512, kv + i * 576, 512);
+        latent = packed;
+    }
+    auto expanded = s.Get("batchExpanded", n * heads * 448);
+    auto rq = s.Get("rotQ", width);
+    auto scores = s.Get("attScores", 32 * 2048);
+    LinearBatch(w, s, p + "kv_b_proj.weight", latent, expanded, n);
+    for (int i = 0; i < n; ++i) {
+        const auto &r = rows[i];
+        s.step = r.step;
+        const auto pages = &r.cache->target;
+        const int pos = r.position;
+        const int keep = sliding ? 512 + r.draftWidth : w.config["max_position_embeddings"].int_value();
+        packKV<<<heads, 256>>>(expanded + i * heads * 448, kv + i * 576 + 512, heads, pos, pos % keep, theta,
+                               keyStride, r.step, keep, pages);
+        rotQ<<<heads, 256>>>(q + i * width, rq, width, pos, theta, r.step);
+        const int *chosen =
+            sliding ? nullptr : IndexPool(w, s, p, x + i * 3072, qr + i * 1024, keyStride, pos, pages);
+        SaveDraftAttentionKV(w, s, r.draft, r.draftLayer, r.draftWidth, kv + i * 576, pos, keep, theta,
+                             chosen, r.cache);
+        const int length = chosen ? 2045 + (pos & 3) : (sliding ? std::min(pos + 1, 512) : pos + 1);
+        const int start = pos + 1 - length;
+        const int window = chosen ? -1 : (sliding ? 512 : 0);
+        scoreKV<<<dim3(r.step ? KVPageTokens : length, heads), 256>>>(
+            rq, scores, start, length, heads, keep, keyStride, chosen, false, r.step, window, pages);
+        probKV<<<heads, 256>>>(scores, w.View(p + "learnable_sink_param", s.device), length, r.step, window);
+        applyKV<<<heads, 256>>>(scores, gate + i * width, mix + i * width, start, length, heads, keep, chosen,
+                                false, r.step, window, pages);
+    }
 }
 
-void Attention(Weights &w, Scratch &s, int layer, int position, const float *x, float *out, Data &kc,
-               Data &vc, int draftWidth, DraftMemory *draft, int draftLayer) {
-    AttentionRowForward(w, s, layer, position, x, out, kc, vc, draftWidth, draft, draftLayer, nullptr);
-}
-void AttentionBatch(Weights &w, Scratch &s, int layer, const std::vector<AttentionRow> &rows,
-                    const float *inputs, float *outputs) {
-    const std::string p = "model.layers." + std::to_string(layer) + ".self_attn.";
-    const int heads = w.config["layer_types"][layer].string_value() == "sliding_attention" ? 64 : 32;
-    const int width = heads * 256;
-    if (rows.size() == 1) {
-        const auto &r = rows.front();
-        s.step = r.step;
-        Attention(w, s, layer, r.position, inputs, outputs, *r.key, *r.value, r.draftWidth, r.draft,
-                  r.draftLayer);
-        return;
-    }
-    for (int first = 0; first < int(rows.size()); first += 16) {
-        int n = std::min(16, int(rows.size()) - first);
-        auto x = inputs + size_t(first) * 3072;
-        auto y = outputs + size_t(first) * 3072;
-        auto qr = s.Get("batchQr", n * 1024), q = s.Get("batchQ", n * width), kv = s.Get("batchKv", n * 576);
-        auto expanded = s.Get("batchExpanded", n * heads * 448), gate = s.Get("batchGate", n * width),
-             mix = s.Get("batchMix", n * width);
-        LinearBatch(w, s, p + "q_a_proj.weight", x, qr, n);
-        LinearBatch(w, s, p + "kv_a_proj_with_mqa.weight", x, kv, n);
-        // kv_a begins with 512 normalized channels followed by 64 rotary channels.
-        auto normKv = s.Get("batchKvLatent", n * 512);
-        NormBatch(w, s, p + "q_a_layernorm.weight", qr, n, 1024);
-        NormBatch(w, s, p + "kv_a_layernorm.weight", kv, n, 512, 576);
-        for (int i = 0; i < n; ++i)
-            CopyStageCaptured(normKv + i * 512, kv + i * 576, 512);
-        LinearBatch(w, s, p + "q_b_proj.weight", qr, q, n);
-        LinearBatch(w, s, p + "kv_b_proj.weight", normKv, expanded, n);
-        LinearBatch(w, s, p + "linear_gate.weight", x, gate, n);
-        for (int i = 0; i < n; ++i) {
-            const auto &r = rows[first + i];
-            s.step = r.step;
-            ProjectedAttention projections{qr + i * 1024,    q + i * width,
-                                           kv + i * 576,     expanded + i * heads * 448,
-                                           gate + i * width, mix + i * width};
-            AttentionRowForward(w, s, layer, r.position, x + i * 3072, y + i * 3072, *r.key, *r.value,
-                                r.draftWidth, r.draft, r.draftLayer, &projections);
+#include "hy4-flash-mla.cuh"
+
+const AttentionCache *PrepareAttentionCaches(Weights &w, Scratch &s, int firstLayer, int endLayer,
+                                             int blockCount, const std::vector<int> &lengths,
+                                             const std::vector<std::pair<Data *, Data *>> &past,
+                                             const std::vector<int> &providers,
+                                             const std::vector<DraftRequest *> &states, int draftWidth) {
+    Select(s.device);
+    PreparePagedMla(s, std::accumulate(lengths.begin(), lengths.end(), 0));
+    std::vector<AttentionCache> caches;
+    caches.reserve((endLayer - firstLayer) * lengths.size());
+    for (int layer = firstLayer; layer < endLayer; ++layer) {
+        auto it = std::find(providers.begin(), providers.end(), layer);
+        for (size_t i = 0; i < lengths.size(); ++i) {
+            auto &kv = past[i * blockCount + layer];
+            int end = int(past[i * blockCount].first->cpuIntDatas.size()) + lengths[i];
+            auto *draft =
+                states[i] && it != providers.end() ? &states[i]->providers[it - providers.begin()] : nullptr;
+            caches.push_back(PrepareAttentionCache(w, s, layer, end, *kv.first, *kv.second,
+                                                   states[i] ? draftWidth : 0, draft));
         }
-        LinearBatch(w, s, p + "o_proj.weight", mix, y, n);
-        NormBatch(w, s, p + "post_proj_norm.weight", y, n, 3072);
     }
+    return UploadAttentionCaches(s, caches);
 }
 
 struct HashParams {
@@ -1212,11 +1319,12 @@ void SaveDraftHidden(Data &ring, int device, int position, int width, const floa
     auto dst = static_cast<float *>(ring.cudaData) + size_t(position % (width + 1)) * 3072;
     Check(cudaMemcpyAsync(dst, hidden, 3072 * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
 }
-__global__ static void draftEmbedding(Hy4View w, int constant, const int *selected, float *output) {
+__global__ static void draftEmbedding(Hy4View w, int constant, const int *selected, float *output,
+                                      int mask = 0) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < w.cols) {
-        int token = selected ? *selected : constant;
-        output[i] = read(w.data, w.type, size_t(token) * w.cols + i);
+        int token = blockIdx.y ? mask : (selected ? *selected : constant);
+        output[size_t(blockIdx.y) * w.cols + i] = read(w.data, w.type, size_t(token) * w.cols + i);
     }
 }
 __global__ static void fusionResidual(float *anchor, const float *fused, Hy4View gate) {
@@ -1226,8 +1334,7 @@ __global__ static void fusionResidual(float *anchor, const float *fused, Hy4View
 void DraftEmbed(Weights &w, Scratch &s, int anchor, int width, int mask, const float *targetHidden,
                 float *block) {
     auto table = w.View("model.embed_tokens.weight", s.device);
-    for (int row = 0; row < width; ++row)
-        draftEmbedding<<<12, 256>>>(table, row ? mask : anchor, nullptr, block + size_t(row) * 3072);
+    draftEmbedding<<<dim3(12, width), 256>>>(table, anchor, nullptr, block, mask);
     const std::string p = "model.dfly_layers.mtp_fusion.";
     auto concat = s.Get("draftFusionPair", 6144), fused = s.Get("draftFusionVector", 3072);
     Norm(w, s, p + "enorm.weight", block, concat, 3072);
@@ -1235,58 +1342,58 @@ void DraftEmbed(Weights &w, Scratch &s, int anchor, int width, int mask, const f
     Linear(w, s, p + "eh_proj.weight", concat, fused);
     fusionResidual<<<12, 256>>>(block, fused, w.View(p + "gate", s.device));
 }
-__global__ static void draftSlots(int *slots, int history, int base, int pos, const int *previous) {
+__global__ static void draftSlots(int *slots, int history, int base, int width, const int *previous) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < history)
         slots[i] = previous ? previous[i / 4] * 4 + i % 4 : i;
-    else if (i < history + pos - base + 1)
+    else if (i < history + width)
         slots[i] = base + i - history;
 }
-void DraftLayer(Weights &w, Scratch &s, int layer, int base, int width, DraftMemory &memory, float *block) {
+void DraftLayer(Weights &w, Scratch &s, int layer, int base, int width, DraftMemory &memory, float *block,
+                const KVPage *const *pages) {
     const std::string p = "model.dfly_layers." + std::to_string(layer) + ".", a = p + "self_attn.";
     const int limit = w.config["max_position_embeddings"].int_value();
-    ReserveKV(memory.keys, s.device, base + width, 32 * 256, limit);
-    ReserveKV(memory.values, s.device, base + width, 32 * 256, limit);
-    auto key = static_cast<__nv_bfloat16 *>(memory.keys.cudaData);
-    auto value = static_cast<__nv_bfloat16 *>(memory.values.cudaData);
-    auto x = s.Get("draftInput", 3072), qr = s.Get("draftQRes", 1024), q = s.Get("draftQ", 8192);
-    auto rotated = s.Get("draftRotated", 8192), kv = s.Get("draftKV", 576),
-         expanded = s.Get("draftKVExpand", 32 * 448);
-    auto gate = s.Get("draftAttGate", 8192), mix = s.Get("draftMix", 8192),
-         branch = s.Get("draftBranch", 3072);
+    auto x = s.Get("draftInput", width * 3072), qr = s.Get("draftQRes", width * 1024),
+         q = s.Get("draftQ", width * 8192), rotated = s.Get("draftRotated", width * 8192);
+    auto kv = s.Get("draftKV", width * 576), latent = s.Get("draftKVLatent", width * 512),
+         expanded = s.Get("draftKVExpand", width * 32 * 448);
+    auto gate = s.Get("draftAttGate", width * 8192), mix = s.Get("draftMix", width * 8192),
+         branch = s.Get("draftBranch", width * 3072);
     const int history = base <= 2048 ? base : 511 * 4 + (base - 1) % 4 + 1;
-    // Growing draft-only buffers every proposal would invalidate target graphs
-    // that share this arena even though their own operands never moved.
-    const int capacity = (history + width + KVPageTokens - 1) / KVPageTokens * KVPageTokens;
-    auto scores = s.Get("draftScores", size_t(32) * capacity);
+    // Recalled history is bounded. Keep draft scratch stable across target verify replays.
+    const int capacity = std::min(limit, 2048 + width);
+    auto scores = s.Get("draftScores", size_t(width) * 32 * capacity);
     auto slots = reinterpret_cast<int *>(s.Get("draftSlots", capacity));
     auto previous = base <= 2048 ? nullptr
                                  : static_cast<const int *>(memory.recalled.cudaData) +
                                        size_t((base - 1) % memory.recalled.dims[0]) * 512;
-    for (int row = 0; row < width; ++row) {
-        const int pos = base + row, length = history + row + 1;
-        float *h = block + size_t(row) * 3072;
-        Norm(w, s, p + "input_layernorm.weight", h, x, 3072);
-        Linear(w, s, a + "q_a_proj.weight", x, qr);
-        Norm(w, s, a + "q_a_layernorm.weight", qr, qr, 1024);
-        Linear(w, s, a + "q_b_proj.weight", qr, q);
-        Linear(w, s, a + "kv_a_proj_with_mqa.weight", x, kv);
-        Norm(w, s, a + "kv_a_layernorm.weight", kv, kv, 512);
-        Linear(w, s, a + "kv_b_proj.weight", kv, expanded);
-        Linear(w, s, a + "linear_gate.weight", x, gate);
-        packKV<<<32, 256>>>(expanded, kv + 512, nullptr, key, value, 32, pos, pos, 10000000.f, 8192);
-        rotQ<<<32, 256>>>(q, rotated, 8192, pos, 10000000.f);
-        draftSlots<<<(length + 255) / 256, 256>>>(slots, history, base, pos, previous);
-        scoreKV<<<dim3(length, 32), 256>>>(rotated, key, scores, 0, length, 32, limit, 8192, slots, true);
-        probKV<<<32, 256>>>(scores, w.View(a + "learnable_sink_param", s.device), length);
-        applyKV<<<32, 256>>>(scores, value, gate, mix, 0, length, 32, limit, slots, true);
-        Linear(w, s, a + "o_proj.weight", mix, branch);
-        Norm(w, s, a + "post_proj_norm.weight", branch, branch, 3072);
-        add<<<12, 256>>>(h, branch, 3072);
-        Norm(w, s, p + "post_attention_layernorm.weight", h, x, 3072);
-        DenseMlp(w, s, p + "mlp.", x, branch);
-        add<<<12, 256>>>(h, branch, 3072);
-    }
+    NormRows(w, s, p + "input_layernorm.weight", block, x, width, 3072, 3072, 3072);
+    LinearBatch(w, s, a + "q_a_proj.weight", x, qr, width);
+    NormBatch(w, s, a + "q_a_layernorm.weight", qr, width, 1024);
+    LinearBatch(w, s, a + "q_b_proj.weight", qr, q, width);
+    LinearBatch(w, s, a + "kv_a_proj_with_mqa.weight", x, kv, width);
+    NormRows(w, s, a + "kv_a_layernorm.weight", kv, latent, width, 512, 576, 512);
+    LinearBatch(w, s, a + "kv_b_proj.weight", latent, expanded, width);
+    LinearBatch(w, s, a + "linear_gate.weight", x, gate, width);
+    const dim3 headRows(32, width);
+    packKV<true>
+        <<<headRows, 256>>>(expanded, kv + 512, 32, base, base, 10000000.f, 8192, nullptr, limit, pages);
+    rotQ<true><<<headRows, 256>>>(q, rotated, 8192, base, 10000000.f);
+
+    // All draft rows share the recalled prefix. Row r sees only the first r + 1 new KV slots.
+    const int longest = history + width, firstLength = history + 1;
+    draftSlots<<<(longest + 255) / 256, 256>>>(slots, history, base, width, previous);
+    scoreKV<true><<<dim3(longest, 32, width), 256>>>(rotated, scores, 0, firstLength, 32, limit, 8192, slots,
+                                                     true, nullptr, 0, pages);
+    probKV<true><<<headRows, 256>>>(scores, w.View(a + "learnable_sink_param", s.device), firstLength);
+    applyKV<true>
+        <<<headRows, 256>>>(scores, gate, mix, 0, firstLength, 32, limit, slots, true, nullptr, 0, pages);
+    LinearBatch(w, s, a + "o_proj.weight", mix, branch, width);
+    NormBatch(w, s, a + "post_proj_norm.weight", branch, width, 3072);
+    add<<<12 * width, 256>>>(block, branch, width * 3072);
+    NormRows(w, s, p + "post_attention_layernorm.weight", block, x, width, 3072, 3072, 3072);
+    DenseMlpRows<true>(w, s, p + "mlp.", x, branch, width);
+    add<<<12 * width, 256>>>(block, branch, width * 3072);
 }
 __global__ static void argmaxLogits(const float *logits, int size, int *token) {
     __shared__ float values[256];
@@ -1324,8 +1431,7 @@ std::vector<int> DraftReadout(Weights &w, Scratch &s, int anchor, int width, flo
         draftEmbedding<<<12, 256>>>(table, anchor, i ? picks + i - 1 : nullptr, embed);
         Norm(w, s, p + "hidden_norm.weight", h, pair, 3072);
         Norm(w, s, p + "embed_norm.weight", embed, pair + 3072, 3072);
-        Linear(w, s, p + "gate_proj.weight", pair, g);
-        Linear(w, s, p + "up_proj.weight", pair, up);
+        DraftGateUp(w, s, p, pair, g, up, 1);
         activate<<<12, 256>>>(g, up, activated, 3072, false);
         Linear(w, s, p + "down_proj.weight", activated, delta);
         add<<<12, 256>>>(h, delta, 3072);
