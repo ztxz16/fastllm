@@ -392,9 +392,10 @@ static void TestLocalPrefillBatch() {
 // Exercise the Indexer contract separately from arbitrary index lists. Tail
 // rows, empty/future selections, and shuffled KV pages must survive packing.
 static void TestBlackwellIndexerAttention() {
-    for (bool paged : {false, true}) {
-        const int rows = paged ? 2051 : 149, keys = paged ? 2305 : 1181;
-        const int kvHeads = paged ? 2 : 1, heads = 16 * kvHeads, topK = 512, pageLen = 64;
+    for (int keys : {1181, 2305, 32768, 65536, 65543, 131072}) {
+        const bool paged = keys != 1181 && keys != 32768;
+        const int rows = keys > 2305 ? 149 : (paged ? 2051 : 149);
+        const int kvHeads = paged ? 2 : 1, heads = 16 * kvHeads, topK = keys > 2305 ? 2048 : 512, pageLen = 64;
         Data query(BFLOAT16), key(BFLOAT16), value(BFLOAT16), indices(INT32), sink, actual, reference;
         Upload(query, {1, rows, heads * 192}, 31);
         Data kTable(INT32), vTable(INT32);
@@ -434,7 +435,10 @@ static void TestBlackwellIndexerAttention() {
         indices.Resize({rows, topK});
         indices.Allocate();
         for (int r = 0; r < rows; ++r) for (int j = 0; j < topK; ++j) {
-            int k = (j * 97 + r * 37) % keys;
+            // Mix shared and dispersed selections in one FMHA launch, including
+            // a partial last group and a causal span crossing the bitmap capacity.
+            int pattern = keys >= 32768 && (r / 16) % 2 ? (r / 16) * 16 : r;
+            int k = (j * 97 + pattern * 37) % keys;
             int id = k;
             if (r % 101 == 0) id = -1;  // Empty selection.
             else if (r % 11 == 0) id = j == 0 ? keys - rows + r : -1;
@@ -449,7 +453,9 @@ static void TestBlackwellIndexerAttention() {
             192, 128, item.past, 0, reference);
         // Use a bounded view inside a larger allocation to exercise chunking
         // and catch writes beyond the logical loan.
-        constexpr int guard = 256, bytes = 12 << 20;
+        constexpr int guard = 256;
+        // Exercise full staging, head-striped staging and the cache reader.
+        const int bytes = keys == 32768 ? 100 << 20 : (keys == 65536 || keys == 65543) ? 52 << 20 : 12 << 20;
         Data storage(BFLOAT16, {(bytes + 2 * guard) / 2}), scratch(BFLOAT16, {bytes / 2});
         storage.ToDevice(DataDevice::CUDA, {0}, false);
         storage.Allocate(false);
