@@ -4091,20 +4091,30 @@ class FastLLmCompletion:
       thinking_block_index = None
       tool_blocks: Dict[int, Dict[str, Any]] = {}
       emitted_tool_use = False
+      if response_statistics is None:
+          response_statistics = {}
 
-      try:
+      def message_start():
+          # Keep prefill counts if a legacy stream releases the handle without
+          # a terminal snapshot. Its output count is still changing here.
+          statistics = response_statistics.copy()
+          usage = self._anthropic_usage(
+              handle, statistics, input_token_len, 0)
+          statistics.pop("output_tokens", None)
+          response_statistics.update(statistics)
+          usage.output_tokens = 0
           message = AnthropicMessageResponse(
               id = request_id,
               content = [],
               model = model_name,
               stop_reason = None,
               stop_sequence = None,
-              usage = AnthropicUsage(input_tokens = input_token_len,
-                                     output_tokens = 0),
+              usage = usage,
           )
-          yield self._create_anthropic_sse_event(
+          return self._create_anthropic_sse_event(
               "message_start", MessageStartEvent(message = message))
 
+      try:
           tool_parser = (
               self._create_function_call_parser(parser_request)
               if request.tools and parser_request is not None
@@ -4169,7 +4179,11 @@ class FastLLmCompletion:
               yield DeltaMessage(content=parsed.content,
                                  tool_calls=parsed.valid_tool_calls)
 
+          started = False
           async for delta_message in parsed_deltas():
+              if not started:
+                  started = True
+                  yield message_start()
               if not delta_message:
                   continue
 
@@ -4266,10 +4280,8 @@ class FastLLmCompletion:
                                   partial_json = tool_delta.function.arguments),
                           ))
 
-          # Release the terminal handle before any closing SSE is yielded.  A
-          # client cancellation after message_delta/message_stop must not let
-          # the old BackgroundTask abort a newly recycled numeric handle.
-          self._release_conversation_handle(request_id, handle)
+          if not started:
+              yield message_start()
 
           if thinking_block_index is not None:
               yield self._create_anthropic_sse_event(

@@ -136,6 +136,7 @@ namespace fastllm {
         std::map <std::string, int> intParams;
 
         int cacheLen = 0;
+        int pdCachedInputTokens = -1; // Usage reported by P, independent of D's local prefix.
 
         ~ResponseContext();
 

@@ -4432,7 +4432,8 @@ namespace fastllm {
 
     static void CopyResponseStatistics(const ResponseContext &context, int *statistics) {
         int inputTokens = std::max(0, context.inputTokens);
-        statistics[0] = std::min(inputTokens, std::max(0, context.cacheLen));
+        const int cached = context.pdCachedInputTokens >= 0 ? context.pdCachedInputTokens : context.cacheLen;
+        statistics[0] = std::min(inputTokens, std::max(0, cached));
         statistics[1] = inputTokens - statistics[0];
         statistics[2] = std::max(0, context.curTokens);
     }

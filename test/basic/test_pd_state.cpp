@@ -1155,6 +1155,7 @@ static void CheckLegacySessionPeer(bool sessionProtocol = false) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     Check(!context.isEnding && context.preTokens == 2 && executions == 1,
           "session negotiation retried model work or broke a legacy peer");
+    Check(context.pdCachedInputTokens == -1, "legacy producer unexpectedly reported cache usage");
     Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 17, "legacy fallback changed state");
     decode.StopPD(); legacy.Stop();
 }
@@ -1240,7 +1241,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 3000 && !decode.PollPD(&context); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         Check(!context.isEnding && context.preTokens == 5, "PD completion");
-        Check(context.currentTokens == std::vector<int>{29} && context.cacheLen == 0,
+        Check(context.currentTokens == std::vector<int>{29} && context.cacheLen == 0 && context.pdCachedInputTokens == 0,
               "decode handoff boundary");
         Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 3 + 14 + 33 + 76 + 115,
               "chunk position/state correctness");
@@ -1304,7 +1305,8 @@ int main(int argc, char **argv) {
         const int afterAdmission = prefill.forwards;
 
         for (int extended = 0; extended < 2; ++extended) {
-            ResponseContext reused;
+            int handle = decode.responseContextDict.CreateHandle();
+            auto &reused = *decode.responseContextDict.GetHandle(handle);
             reused.Init(1, FLOAT32, FLOAT32);
             reused.generationConfig.output_token_limit = 1;
             reused.allTokens = {3, 7, 11, 19, 23, 29};
@@ -1319,6 +1321,11 @@ int main(int argc, char **argv) {
             Check(((float *)reused.pastKeyValues[0].first.cpuData)[0] == (extended ? 632 : 241),
                   "restored prefix continuation positions");
             Check(prefill.forwards == afterAdmission + extended, "cached prefix must not recompute");
+            int cached, missed, output;
+            Check(decode.GetResponseStatistics(handle, cached, missed, output) && cached == 5 &&
+                  missed == reused.inputTokens - 5 && reused.cacheLen == 0,
+                  "PD usage must count only the reused producer prefix, including on exact hits");
+            decode.responseContextDict.RemoveHandle(handle);
         }
         StateModel mismatch;
         mismatch.ConfigurePD(json11::Json::object{{"role", "decode"},

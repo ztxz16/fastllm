@@ -32,12 +32,13 @@ from fastllm_pytools.openai_server.protocal.anthropic_protocol import (
 class FakeModel:
     def __init__(self):
         self.aborted_handles = []
+        self.output_tokens = 2
 
     def get_response_statistics(self, handle):
         return {
             "cached_input_tokens": 8,
             "missed_input_tokens": 4,
-            "output_tokens": 2,
+            "output_tokens": self.output_tokens,
         }
 
     def stream_response_handle_async(self, handle, response_statistics=None):
@@ -332,7 +333,8 @@ def test_stream_and_nonstream_include_native_usage():
             max_tokens=16,
             stream=True,
         )
-        final_anthropic_usage = None
+        completion.model.output_tokens = 1
+        start_anthropic_usage = final_anthropic_usage = None
         async for event in completion.anthropic_message_stream_generator(
                 anthropic_request, raw_request, model_deltas(),
                 "req-anthropic", 12, None, handle=4,
@@ -341,6 +343,10 @@ def test_stream_and_nonstream_include_native_usage():
                 if not line.startswith("data:"):
                     continue
                 data = json.loads(line[len("data:"):].strip())
+                if data.get("type") == "message_start":
+                    start_anthropic_usage = data["message"]["usage"]
+                    # This adapter has no terminal snapshot after handle release.
+                    completion.model.get_response_statistics = lambda handle: None
                 if data.get("type") == "message_delta":
                     final_anthropic_usage = data["usage"]
 
@@ -350,6 +356,7 @@ def test_stream_and_nonstream_include_native_usage():
             "cache_read_input_tokens": 8,
             "output_tokens": 2,
         }
+        assert start_anthropic_usage == dict(final_anthropic_usage, output_tokens=0)
 
     asyncio.run(run_test())
 
