@@ -41,11 +41,11 @@ class Pool {
 class RdmaConnection {
   public:
     virtual ~RdmaConnection() = default;
-    virtual void Send(const Socket &, const std::vector<Buffer> &, Deadline) = 0;
+    virtual void Send(const Socket &, const std::vector<Buffer> &payloads,
+                      const std::vector<size_t> &spanSizes, BufferPool &windows, Deadline) = 0;
     virtual void Receive(const Socket &, const std::vector<Buffer> &, Deadline) = 0;
     // Only after payload ACK and all writes are complete; errors tear down QPs.
     virtual void Complete() = 0;
-    virtual bool Registered(const Buffer &) const = 0;
 };
 std::unique_ptr<RdmaConnection> ConnectRdma(const Socket &, const Options &, Deadline);
 bool RdmaAvailable();

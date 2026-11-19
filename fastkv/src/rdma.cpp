@@ -27,7 +27,8 @@ std::atomic<uint64_t> identities{1};
 struct Device {
     ibv_context *context = nullptr;
     ibv_pd *pd = nullptr;
-    uint64_t id = identities.fetch_add(1);
+    const uint64_t id = identities.fetch_add(1);
+    const std::string registrationKey = "verbs:" + std::to_string(id);
     ~Device() {
         if (pd)
             ibv_dealloc_pd(pd);
@@ -101,7 +102,7 @@ struct Rail {
     ~Rail() { Close(); }
     std::shared_ptr<Registration> Register(const Buffer &buffer) {
         auto value =
-            buffer.Attachment("verbs:" + std::to_string(device->id), [d = device](void *p, size_t n) {
+            buffer.Attachment(device->registrationKey, [d = device](void *p, size_t n) {
                 auto reg = std::make_shared<Registration>();
                 reg->device = d;
                 reg->mr =
@@ -239,8 +240,16 @@ class Connection final : public RdmaConnection {
   public:
     std::vector<std::unique_ptr<Rail>> rails;
     std::vector<Buffer> held;
-    mutable std::map<int, std::vector<size_t>> deviceRails;
-    const std::vector<size_t> &SendRails(const Buffer &buffer) const {
+    using Registrations = std::vector<std::shared_ptr<Registration>>;
+    struct SendWindow {
+        Buffer buffer;
+        Registrations regs;
+        size_t used = 0;
+    };
+    // A failed send keeps its local DMA sources alive through QP teardown.
+    std::map<int, SendWindow> sendWindows;
+    std::map<int, std::vector<size_t>> deviceRails;
+    const std::vector<size_t> &SendRails(const Buffer &buffer) {
         const int device = buffer.Kind() == MemoryKind::Cuda ? buffer.Device() : -1;
         auto found = deviceRails.find(device);
         if (found != deviceRails.end()) return found->second;
@@ -273,61 +282,73 @@ class Connection final : public RdmaConnection {
         for (auto &rail : rails) Require(!rail->outstanding, "FastKV: incomplete RDMA operation");
         held.clear();
     }
-    bool Registered(const Buffer &buffer) const override {
-        if (!buffer.Size()) return true;
+    bool Registered(const Buffer &buffer) {
         for (auto index : SendRails(buffer))
-            if (!buffer.HasAttachment("verbs:" + std::to_string(rails[index]->device->id))) return false;
+            if (!buffer.HasAttachment(rails[index]->device->registrationKey)) return false;
         return true;
     }
-    void Send(const Socket &socket, const std::vector<Buffer> &buffers, Deadline deadline) override {
-        held.insert(held.end(), buffers.begin(), buffers.end());
+    Registrations Register(const Buffer &source) {
+        Registrations regs(rails.size());
+        for (size_t index : SendRails(source)) regs[index] = rails[index]->Register(source);
+        return regs;
+    }
+    void Drain(const Socket &socket, Deadline deadline) {
+        for (auto &rail : rails) rail->Poll(socket, deadline, true);
+        for (auto &item : sendWindows) item.second.used = 0;
+    }
+    SendWindow &Window(int device, BufferPool &pool, const Socket &socket, Deadline deadline) {
+        auto found = sendWindows.find(device);
+        if (found != sendWindows.end()) return found->second;
+        const size_t bytes = std::min(size_t(16) << 20, pool.Limit(device));
+        Buffer buffer;
+        for (;;) {
+            socket.CheckRunning(deadline);
+            try { buffer = pool.Acquire(bytes, device); break; }
+            catch (const CapacityBusy &) {
+                // A small pool can be shared by several devices/connections.
+                // Drain and release our own leases before waiting on another.
+                if (!sendWindows.empty()) {
+                    Drain(socket, deadline);
+                    sendWindows.clear();
+                } else pool.WaitForRelease();
+            }
+        }
+        auto regs = Register(buffer);
+        return sendWindows.emplace(device, SendWindow{std::move(buffer), std::move(regs)}).first->second;
+    }
+    void Send(const Socket &socket, const std::vector<Buffer> &payloads,
+              const std::vector<size_t> &spanSizes, BufferPool &windows, Deadline deadline) override {
+        held.insert(held.end(), payloads.begin(), payloads.end());
         auto bytes = socket.ReceiveFrame(32 << 20, deadline);
         Reader reader(bytes);
-        Require(reader.U32() == buffers.size() && reader.U32() == rails.size(),
+        Require(reader.U32() == spanSizes.size() && reader.U32() == rails.size(),
                 "FastKV: RDMA destination shape mismatch");
         struct Remote {
             uint64_t address, size;
             std::vector<uint32_t> keys;
         };
         std::vector<Remote> remote;
-        for (auto &buffer : buffers) {
+        for (size_t size : spanSizes) {
             Remote target;
             target.address = reader.U64();
             target.size = reader.U64();
-            Require(target.size == buffer.Size(), "FastKV: RDMA destination size mismatch");
+            Require(target.size == size, "FastKV: RDMA destination size mismatch");
             for (size_t i = 0; i < rails.size(); ++i)
                 target.keys.push_back(reader.U32());
             remote.push_back(std::move(target));
         }
         reader.End();
         uint64_t total = 0, sequence = 0;
-        struct Pending {
-            size_t buffer, offset = 0;
-            std::vector<std::shared_ptr<Registration>> regs;
-        };
-        std::deque<Pending> pending;
-        for (size_t b = 0; b < buffers.size(); ++b) {
-            if (!buffers[b].Size()) continue;
-            Pending work{b, 0, std::vector<std::shared_ptr<Registration>>(rails.size())};
-            for (size_t index : SendRails(buffers[b]))
-                work.regs[index] = rails[index]->Register(buffers[b]);
-            pending.push_back(std::move(work));
-        }
-        // Interleave payloads so a large tensor on one GPU cannot prevent
-        // other GPUs and their local NICs from issuing DMA concurrently.
-        while (!pending.empty()) {
-            auto work = std::move(pending.front());
-            pending.pop_front();
-            const size_t b = work.buffer, offset = work.offset;
-            const auto &selected = SendRails(buffers[b]);
-            size_t index = selected[sequence++ % selected.size()];
+        auto post = [&](const Buffer &source, size_t localOffset, size_t b, size_t offset,
+                        uint32_t n, const std::vector<size_t> &selected,
+                        const Registrations &regs) {
+            const size_t index = selected[sequence++ % selected.size()];
             auto &rail = *rails[index];
             if (rail.outstanding >= 32) rail.Poll(socket, deadline, false);
-            uint32_t n = uint32_t(std::min(size_t(1 << 20), buffers[b].Size() - offset));
             ibv_sge sge{};
-            sge.addr = uint64_t(reinterpret_cast<uintptr_t>(buffers[b].Data())) + offset;
+            sge.addr = uint64_t(reinterpret_cast<uintptr_t>(source.Data())) + localOffset;
             sge.length = n;
-            sge.lkey = work.regs[index]->mr->lkey;
+            sge.lkey = regs[index]->mr->lkey;
             ibv_send_wr wr{}, *bad = nullptr;
             wr.wr_id = rail.nextId++;
             wr.sg_list = &sge;
@@ -339,12 +360,66 @@ class Connection final : public RdmaConnection {
             wr.wr.rdma.rkey = remote[b].keys[index];
             Require(!ibv_post_send(rail.qp, &wr, &bad), "FastKV: ibv_post_send failed");
             ++rail.outstanding;
-            work.offset += n;
             total += n;
-            if (work.offset < buffers[b].Size()) pending.push_back(std::move(work));
+        };
+        struct Pending {
+            size_t payload, span;
+            size_t offset = 0, spanOffset = 0;
+            Registrations direct;
+        };
+        std::deque<Pending> pending;
+        size_t span = 0;
+        for (size_t i = 0; i < payloads.size(); ++i) {
+            const auto &payload = payloads[i];
+            if (!payload.Size()) continue;
+            while (span < remote.size() && !remote[span].size) ++span;
+            Pending work{i, span, 0, 0, {}};
+            for (size_t left = payload.Size(); left;) {
+                Require(span < remote.size() && remote[span].size && remote[span].size <= left,
+                        "FastKV: invalid RDMA destination span");
+                left -= remote[span++].size;
+            }
+            // A zero device budget explicitly disallows transport-owned staging.
+            if (payload.Kind() == MemoryKind::Host || !windows.Limit(payload.Device()) || Registered(payload))
+                work.direct = Register(payload);
+            pending.push_back(std::move(work));
         }
-        for (auto &rail : rails)
-            rail->Poll(socket, deadline, true);
+        // Give each payload a turn so different GPUs can issue DMA on their
+        // local NICs concurrently. Copy an unregistered GPU source once per
+        // window, independently of how the peer fragmented its destination.
+        while (!pending.empty()) {
+            auto work = std::move(pending.front());
+            pending.pop_front();
+            const auto &payload = payloads[work.payload];
+            const auto &selected = SendRails(payload);
+            size_t n = payload.Size() - work.offset, local = work.offset;
+            const Buffer *source = &payload;
+            const Registrations *regs = &work.direct;
+            if (work.direct.empty()) {
+                auto &window = Window(payload.Device(), windows, socket, deadline);
+                if (window.used == window.buffer.Size()) Drain(socket, deadline);
+                n = std::min(n, window.buffer.Size() - window.used);
+                local = window.used;
+                window.buffer.CopyFrom(payload, work.offset, local, n);
+                window.used += n;
+                source = &window.buffer;
+                regs = &window.regs;
+            } else {
+                n = std::min(n, size_t(1) << 20);
+            }
+            for (size_t sent = 0; sent < n;) {
+                const size_t left = size_t(remote[work.span].size) - work.spanOffset;
+                const auto chunk = uint32_t(std::min({size_t(1) << 20, n - sent, left}));
+                post(*source, local + sent, work.span, work.spanOffset, chunk, selected, *regs);
+                sent += chunk;
+                work.spanOffset += chunk;
+                if (work.spanOffset == remote[work.span].size) { ++work.span; work.spanOffset = 0; }
+            }
+            work.offset += n;
+            if (work.offset < payload.Size()) pending.push_back(std::move(work));
+        }
+        Drain(socket, deadline);
+        sendWindows.clear();
         Writer done;
         done.U32(Done);
         done.U64(total);

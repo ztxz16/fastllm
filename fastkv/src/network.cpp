@@ -350,36 +350,6 @@ struct Service::Impl {
         auto n = recv(socket.fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
         return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
     }
-    // Host snapshots are already resident: copying them is slower than their
-    // registration. GPU snapshots benefit from reusing expensive GPU MRs.
-    std::vector<Buffer> PrepareSend(RdmaConnection &rdma, const std::vector<Buffer> &buffers) {
-        auto result = buffers;
-        for (size_t first = 0; first < buffers.size();) {
-            if (buffers[first].Kind() == MemoryKind::Host || buffers[first].PoolBacked() || rdma.Registered(buffers[first])) { ++first; continue; }
-            size_t end = first + 1, bytes = buffers[first].Size();
-            const int device = buffers[first].Device();
-            constexpr size_t arenaBytes = 64 << 20;
-            while (end < buffers.size() && bytes < arenaBytes && buffers[end].Size() <= arenaBytes - bytes &&
-                   buffers[end].Device() == device && !buffers[end].PoolBacked() && !rdma.Registered(buffers[end]))
-                bytes = CheckedAdd(bytes, buffers[end++].Size());
-            Buffer arena;
-            try { arena = sendBuffers.Acquire(bytes, device); }
-            catch (const std::runtime_error &) {
-                // Pool pressure changes performance, never delivery semantics.
-                // Register the caller-owned buffers directly in this case.
-                first = end;
-                continue;
-            }
-            size_t offset = 0;
-            for (size_t i = first; i < end; ++i) {
-                arena.CopyFrom(buffers[i], 0, offset, buffers[i].Size());
-                result[i] = arena.Slice(offset, buffers[i].Size());
-                offset += buffers[i].Size();
-            }
-            first = end;
-        }
-        return result;
-    }
     void SendMessage(const Socket &s, RdmaConnection *rdma, const Message &message, Deadline deadline) {
         Require(message.metadata.size() <= options.maxMetadataBytes &&
                     message.buffers.size() <= options.maxBuffers,
@@ -400,7 +370,7 @@ struct Service::Impl {
         uint32_t accepted = r.U32();
         if (!accepted)
             throw std::runtime_error("FastKV receiver: " + r.String());
-        std::vector<Buffer> spans;
+        std::vector<size_t> spanSizes;
         const bool targeted = r.Remaining() != 0;
         if (targeted) {
             Require(r.U32() == ReceiveTargetFormat, "FastKV: unknown receive target format");
@@ -413,7 +383,7 @@ struct Service::Impl {
                 for (size_t i = 0; i < n; ++i) {
                     const uint64_t bytes = r.U64();
                     Require(bytes && bytes <= buffer.Size() - offset, "FastKV: invalid receive span");
-                    if (rdma) spans.push_back(buffer.Slice(offset, size_t(bytes)));
+                    if (rdma) spanSizes.push_back(size_t(bytes));
                     offset += size_t(bytes);
                 }
                 Require(offset == buffer.Size(), "FastKV: incomplete receive target");
@@ -421,8 +391,9 @@ struct Service::Impl {
         }
         r.End();
         if (rdma) {
-            auto prepared = PrepareSend(*rdma, targeted ? spans : message.buffers);
-            rdma->Send(s, prepared, deadline);
+            if (!targeted)
+                for (const auto &buffer : message.buffers) spanSizes.push_back(buffer.Size());
+            rdma->Send(s, message.buffers, spanSizes, sendBuffers, deadline);
             rdmaBytes += total;
         } else {
             std::vector<uint8_t> host;

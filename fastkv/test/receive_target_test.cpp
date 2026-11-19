@@ -5,11 +5,69 @@
 using namespace fastkv;
 using namespace std::chrono_literals;
 static void Check(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
+static void CheckGpuSendWindow(Options opts, int gpu) {
+    constexpr size_t window = 1 << 20;
+    Options senderOptions = opts;
+    senderOptions.maxInflightBytes = window;
+    std::atomic<int> allocations{0};
+    senderOptions.allocateBuffer = [&](size_t bytes, int device) {
+        if (device == gpu) {
+            Check(bytes == window, "unexpected GPU send window size");
+            ++allocations;
+        }
+        return Buffer::Allocate(bytes, device);
+    };
+    BufferPool snapshots(32 * window);
+    std::vector<Buffer> sources;
+    // Keep all eight snapshots live so the source pool cannot recycle one backing.
+    for (uint8_t seed = 1; seed <= 8; ++seed) {
+        const size_t size = window + size_t(seed) * 150001;
+        auto src = snapshots.Acquire(size, gpu);
+        std::vector<uint8_t> data(size);
+        for (size_t i = 0; i < size; ++i) data[i] = uint8_t(i * 17 + seed);
+        src.Write(data.data(), 0, size);
+        sources.push_back(std::move(src));
+    }
+    Service sender(senderOptions), receiver(opts);
+    sender.Start("127.0.0.1:0", [&](const Message &m) {
+        const auto seed = m.metadata.at(0);
+        const auto &src = sources.at(seed - 1);
+        return Message{{seed}, {src.Slice(0, 0), src, src.Slice(3, 97)}};
+    });
+    auto dst = Buffer::Allocate(4 * window, gpu);
+    for (uint8_t seed = 1; seed <= 8; ++seed) {
+        const size_t size = window + size_t(seed) * 150001;
+        Message req{{seed}, {}};
+        std::future<Message> future;
+        Check(receiver.TrySubmit(sender.Address(), req, future, {}, {},
+            [&](const Bytes &, const std::vector<size_t> &sizes) {
+                Check(sizes == std::vector<size_t>({0, size, 97}), "GPU window changed the wire layout");
+                return std::vector<std::vector<Buffer>>{{}, {dst.Slice(size, 13), dst.Slice(0, size - 13)},
+                                                       {dst.Slice(size + 13, 97)}};
+            }), "GPU window request rejected");
+        auto reply = future.get();
+        Check(reply.metadata == Bytes{seed} && reply.buffers.size() == 3, "missing GPU window reply");
+        std::vector<uint8_t> data(size + 97);
+        size_t at = 0;
+        for (const auto &part : reply.buffers) {
+            part.Read(data.data() + at, 0, part.Size());
+            at += part.Size();
+        }
+        for (size_t i = 0; i < data.size(); ++i) {
+            const size_t source = i < size ? i : i - size + 3;
+            Check(data[i] == uint8_t(source * 17 + seed), "overwritten GPU send window");
+        }
+    }
+    Check(allocations == 1, "variable GPU snapshots must reuse one send window");
+    std::cout << "GPU RDMA send window reused across eight variable snapshots PASS\n";
+}
 int main(int argc, char **argv) {
     try {
         Options o;
-        if (argc > 1) { Check(std::string(argv[1]) == "--rdma", "usage: receive_target_test [--rdma [GPU]]"); o.transport = Transport::Rdma; }
+        if (argc > 1) { Check(std::string(argv[1]) == "--rdma", "usage: receive_target_test [--rdma [GPU [rail]]]"); o.transport = Transport::Rdma; }
         const int gpu = argc > 2 ? std::stoi(argv[2]) : -1;
+        if (argc > 3) o.rdmaDevices = {argv[3]};
+        if (gpu >= 0) CheckGpuSendWindow(o, gpu);
         auto input = Buffer::Allocate(123457, gpu);
         std::vector<unsigned char> bytes(input.Size()), actual(bytes.size());
         for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (i * 71 + i / 97) % 251;
