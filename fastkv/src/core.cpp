@@ -111,12 +111,35 @@ struct DeviceScope {
     ~DeviceScope() { cudaSetDevice(previous); }
 };
 #endif
+bool EnableCudaPeerAccess(const std::vector<int> &devices) {
+#ifdef FASTKV_CUDA
+    if (devices.size() < 2) return false;
+    for (int device : devices) {
+        DeviceScope scope(device);
+        for (int peer : devices) if (peer != device) {
+            int accessible = 0;
+            CudaCheck(cudaDeviceCanAccessPeer(&accessible, device, peer));
+            if (!accessible) return false;
+            const auto error = cudaDeviceEnablePeerAccess(peer, 0);
+            if (error == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+            else if (error == cudaErrorTooManyPeers || error == cudaErrorPeerAccessUnsupported) {
+                cudaGetLastError();
+                return false;
+            } else CudaCheck(error);
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
+}
 struct Buffer::Storage {
     void *data = nullptr;
     size_t size = 0;
     MemoryKind kind = MemoryKind::Host;
     int device = -1;
     uint64_t id = 0;
+    bool preallocated = false;
     std::shared_ptr<void> owner;
     mutable std::mutex mutex;
     mutable std::map<std::string, std::shared_ptr<void>> attachments;
@@ -166,6 +189,9 @@ Buffer Buffer::Allocate(size_t n, int device) {
     throw std::runtime_error("FastKV was built without CUDA memory support");
 #endif
 }
+bool Buffer::Preallocated() const { return storage && storage->preallocated; }
+void Buffer::MarkPreallocated() { storage->preallocated = true; }
+size_t Buffer::AllocationSize() const { return storage ? storage->size : 0; }
 Buffer Buffer::Slice(size_t at, size_t n) const {
     Require(at <= length && n <= length - at, "FastKV: buffer slice out of range");
     Buffer b = *this;

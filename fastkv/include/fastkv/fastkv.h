@@ -48,6 +48,8 @@ class Reader {
 
 enum class MemoryKind : uint32_t { Host = 0, Cuda = 1 };
 enum class Transport : uint32_t { Tcp = 0, Rdma = 1, Auto = 2 };
+// True only when kernels on every listed GPU can write to every peer's allocations.
+bool EnableCudaPeerAccess(const std::vector<int> &devices);
 
 // A Buffer owns (or leases) an allocation; slices retain the same allocation.
 // Registration attachments die before the allocation itself. Allocation IDs
@@ -77,6 +79,7 @@ class Buffer {
     void Write(const void *host, size_t at, size_t bytes) const;
     void CopyFrom(const Buffer &source, size_t sourceOffset, size_t targetOffset, size_t bytes) const;
     void MakeRemoteWritesVisible() const;
+    bool Preallocated() const;
     bool HasAttachment(const std::string &key) const;
     std::shared_ptr<void>
     Attachment(const std::string &key,
@@ -84,6 +87,8 @@ class Buffer {
 
   private:
     friend class BufferPool;
+    size_t AllocationSize() const;
+    void MarkPreallocated();
     std::shared_ptr<Storage> storage;
     std::shared_ptr<void> lease;
     size_t offset = 0, length = 0;
@@ -104,6 +109,10 @@ class BufferPool {
     explicit BufferPool(size_t limit, std::map<int, size_t> deviceLimits = {},
                         BufferAllocator allocator = {});
     ~BufferPool();
+    // Before serving, reserve a share of this pool on each device. Its ranges
+    // can be independently leased and joined while retaining the physical MR.
+    // Set peerAccessible only after verifying GPU peer writes for all devices.
+    void Preallocate(const std::vector<int> &devices, bool peerAccessible = false);
     Buffer Acquire(size_t bytes, int device, std::shared_ptr<void> credit = {});
     // Reserve the complete message atomically; no caller holds partial leases
     // while waiting for another message to release capacity.
@@ -114,11 +123,30 @@ class BufferPool {
     // registration identity and lifetime. No model or tensor layout is assumed.
     std::vector<Buffer> AcquirePacked(const std::vector<std::pair<int, size_t>> &allocations,
                                      size_t alignment = 256, std::shared_ptr<void> credit = {});
+    // Immutable packing geometry can be reused when capacity is temporarily busy.
+    class PackedLayout {
+      public:
+        explicit PackedLayout(const std::vector<std::pair<int, size_t>> &allocations, size_t alignment = 256);
+      private:
+        friend class BufferPool;
+        struct Slice { size_t arena = 0, offset = 0, bytes = 0; };
+        size_t alignment;
+        std::vector<std::pair<int, size_t>> arenas;
+        std::vector<Slice> slices;
+        bool PlaceOnPeers(const std::vector<std::pair<int, size_t>> &space, PackedLayout &out) const;
+        std::vector<Buffer> SliceArenas(const std::vector<Buffer> &buffers) const;
+    };
+    std::vector<Buffer> AcquirePackedLayout(const PackedLayout &layout, std::shared_ptr<void> credit = {});
+    // A single producer may write whole tensors into peer-accessible warm arenas.
+    // Each returned buffer retains its actual RDMA/NUMA device.
+    std::vector<Buffer> AcquirePeerPackedLayout(const PackedLayout &layout);
     void Clear();
     size_t Limit(int device) const;
     void CheckCapacity(const std::vector<std::pair<int, size_t>> &allocations) const;
     void WaitForRelease();
   private:
+    std::vector<Buffer> AcquireBatchImpl(const std::vector<std::pair<int, size_t>> &allocations,
+                                         std::shared_ptr<void> credit, bool warmOnly);
     struct State;
     std::shared_ptr<State> state;
 };
