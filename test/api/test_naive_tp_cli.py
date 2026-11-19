@@ -198,6 +198,19 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
             with self.subTest(override=override), self.assertRaisesRegex(ValueError, 'prefill'):
                 self.configure([], saved={**settings, **override})
 
+    def test_kv_admission_reserve(self):
+        settings = ['--tp', '4', '--prefill_batch_tokens', '16384', '--prefill_chunked', 'true']
+        self.configure(settings)
+        self.loaded_model.set_kv_admission_reserve.assert_not_called()
+        for reserve in (0, 1024, 4096):
+            self.configure(settings + ['--kv_admission_reserve', str(reserve)])
+            self.loaded_model.set_kv_admission_reserve.assert_called_once_with(reserve)
+        self.configure([], saved={'tp': '4', 'kv_admission_reserve': 0})
+        self.loaded_model.set_kv_admission_reserve.assert_called_once_with(0)
+        for options in (['--kv_admission_reserve', '4096'], settings + ['--kv_admission_reserve', '-1']):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, 'kv_admission_reserve'):
+                self.configure(options)
+
     def test_attention_dp_saved_default_and_kvmem_chunk(self):
         args = self.configure([], saved=dict(tp='4', attn_dp_size=4,
                               kvmem='{"prefill_tokens": 2048}'), native_chunk=2048)

@@ -56,6 +56,10 @@ namespace fastllm {
                                      int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
+        bool SupportsKVReplay() const override {
+            return attentionDP == 1 && !draftEnabled && !kvMemConfig.enabled && !tpPagedCaches.empty();
+        }
+        void ReleaseKVForReplay(ResponseContext *context) override;
         int GetPrefillBatchGroups() const override { return attentionDP; }
         bool SupportsChunkedPrefillScheduling() const override { return SupportsPrefillBatching(); }
         int GetPrefillBatchGroup(const ResponseContext *context) const override;

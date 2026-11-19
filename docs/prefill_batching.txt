@@ -66,3 +66,13 @@ token不超过总预算/DP数量。公平调度改善decode停顿，攒批改善
 已有inference trace的prefill_coalescing.reason可观察wait、dp_targets、timeout、
 chunk_timeout、decode_budget和capacity；query_lengths/handles/context_before可核对
 跨chunk的同一请求和实际批量，不需要新增环境变量控制攒批行为。
+
+接纳新请求时如何估算 KV 用量
+----------------------------
+Naive 独立 TP 副本（attention DP=1、无草稿、纯 GPU 分页 KV）开启分块 prefill 攒批后，
+默认按每个文本请求未来最多 4096 个输出 token 估算空间。输出上限较短时按实际剩余额度估算。
+请求可以继续生成超过 4096 个 token。调度器随生成进度更新估算，API 输出上限和 KV 池大小保持原值。
+若物理页连下一步都放不下，调度器会暂停较晚的请求并回收其 KV，随后用已有输入和输出重建，
+继续同一条响应。重建期间按完整额度接纳新请求，直到被暂停的请求完成。
+通常可省略 --kv_admission_reserve。显式设置正整数可调整上述窗口，设置 0 可恢复完整预留。
+PD、attention DP、DSpark、KVMem 等配置，以及物理池不足以容纳单请求上下文上限时，沿用完整预留。

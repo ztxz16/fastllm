@@ -116,7 +116,35 @@ static void TestPlanMembershipOnFallback() {
     }
 }
 
+static void TestKVAdmissionReserve() {
+    struct ReplayModel : Model {
+        mutable PagedCacheManager pool;
+        ReplayModel() : Model(2, 8) {
+            max_positions = 12;
+            pool.pageLen = 2;
+            pool.SetMaxPages(6);
+            SetPrefillBatching(8, 0);
+        }
+        bool SupportsPrefillBatching() const override { return true; }
+        bool SupportsSharedPagedKVPool() const override { return true; }
+        bool SupportsKVReplay() const override { return true; }
+        PagedCacheManager *GetPagedKVCacheBudgetManager(const ResponseContext *) const override { return &pool; }
+    };
+    for (bool chunked : {false, true}) for (int reserve : {-1, 0, 32, 4096}) {
+        ReplayModel model;
+        model.prefillScheduling.chunked = chunked;
+        if (reserve >= 0) Check(model.SetKVAdmissionReserve(reserve), "KV admission override failed");
+        const int expectedWindow = !chunked ? 0 : (reserve < 0 ? 4096 : reserve);
+        Check(model.GetKVAdmissionWindow() == expectedWindow, "unexpected KV admission window");
+        Check(model.Run(), "KV admission pipeline did not start");
+        // Six free pages across two requests allow four steps after the partial-page allowance.
+        Check(model.submits == (expectedWindow > 0 ? 4 : 7) && model.collects == model.submits,
+              "KV admission and decode pipeline disagree on the reservation policy");
+    }
+}
+
 int main() {
+    TestKVAdmissionReserve();
     TestPlanMembershipOnFallback();
     for (bool history : {false, true}) for (int batch : {1,2,3,5,8,17}) for (int limit : {2,3,7}) {
         Model m(batch,limit); m.saveHistoryChat = history; m.historySupported = true;

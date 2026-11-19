@@ -569,6 +569,9 @@ if hasattr(fastllm_lib, "set_prefill_coalescing_llm_model"):
     fastllm_lib.set_prefill_coalescing_llm_model.argtypes = [ctypes.c_int] * 6
     fastllm_lib.set_prefill_coalescing_llm_model.restype = ctypes.c_bool
 
+if hasattr(fastllm_lib, "set_kv_admission_reserve_llm_model"):
+    fastllm_lib.set_kv_admission_reserve_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+    fastllm_lib.set_kv_admission_reserve_llm_model.restype = ctypes.c_bool
 if hasattr(fastllm_lib, "set_prefill_scheduling_llm_model"):
     fastllm_lib.set_prefill_scheduling_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool,
         ctypes.c_int, ctypes.c_bool, ctypes.c_int, ctypes.c_int]
@@ -3763,6 +3766,16 @@ class model:
         self.prefill_batching = dict(tokens=tokens, max_wait_ms=max_wait_ms,
                                     target_requests=target_requests, max_requests=max_requests,
                                     min_decode_requests=min_decode_requests)
+
+    def set_kv_admission_reserve(self, tokens):
+        if type(tokens) is not int or not 0 <= tokens <= 2147483647:
+            raise ValueError("KV admission reserve must be a non-negative int32")
+        if not hasattr(fastllm_lib, "set_kv_admission_reserve_llm_model"):
+            if tokens == 0:  # Older native libraries always reserve the full output.
+                return
+            raise RuntimeError("This FastLLM library does not support KV admission reserve")
+        if not fastllm_lib.set_kv_admission_reserve_llm_model(self.model, tokens):
+            raise ValueError("Configure KV admission before serving")
 
     def set_prefill_scheduling(self, *, balance_dp=False, adaptive_requests=0,
                               chunked=False, chunk_max_wait_ms=0, fairness_ms=0):
