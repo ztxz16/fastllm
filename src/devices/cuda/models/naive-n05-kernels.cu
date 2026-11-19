@@ -3607,46 +3607,56 @@ static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weight
         Data qScale;
         Output(q, DataType::BFLOAT16, {queries, heads, dim});
         Output(qScale, DataType::FLOAT32, {queries, heads});
-        naive_dsa_mma::QuantizeIndexer<<<queries * heads, 128>>>(
-            (const BF16 *)query.cudaData, (BF16 *)q.cudaData,
-            (float *)qScale.cudaData, dim, 0);
-        if (queries == 1) {
-            naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
-                (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
-                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                topKOutput, stride, keys, queryStart);
-        }
-#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
-        // WGMMA's smaller query tile repeats more K reads. For shared peer KV,
-        // use the larger MMA tile below to reduce traffic to the owning GPU.
-        else if ([&]() {
-            naive_indexer::FP8Entry entry{FastllmNaiveKV(packedKeys),
-                (const BF16 *)q.cudaData, (const BF16 *)weights.cudaData, (const float *)qScale.cudaData,
-                (float *)scores.cudaData, queries, keys, queryStart, stride};
-            if (!fp8Compute || topK != 2048) return false;
-            Output(indices, INT32, {queries, topK});
-            int *output = (int *)indices.cudaData;
-            return fp8IndicesReady = LaunchFP8ShortlistIndexer(&entry, 1, &output) != 0;
-        }()) {}
-        else if (!peerKeys && naive_indexer::Prepare()) {
-            naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
-                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, queries, keys, queryStart, stride);
-        }
+        const int arch = queries > 1 ? FastllmCudaRuntimeArch() : 0;
+        bool scored = false;
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
+        if (!peerKeys && (arch == 100 || arch == 103))
+            scored = FastllmCudaNaivePrefillIndexerSm100(static_cast<const BF16 *>(query.cudaData),
+                static_cast<const BF16 *>(weights.cudaData), FastllmNaiveKV(packedKeys), stride, queries, keys,
+                queryStart, q.cudaData, q.GetBytes(), static_cast<float *>(qScale.cudaData),
+                static_cast<float *>(scores.cudaData), cudaStreamPerThread);
 #endif
-        else {
-            // TopK consumes only each row's causal prefix. Blocks beyond
-            // the final query's prefix cannot contribute any selected key.
-            const int arch = FastllmCudaRuntimeArch();
-            const bool pipeline = arch == 90 || (!peerKeys && (arch == 100 || arch == 103) &&
-                queries >= 4096 && keys >= 4096 && packedKeys.dataType == FP8_E4M3);
-            const int rows = pipeline ? 32 : 64;
-            auto kernel = pipeline ? naive_dsa_mma::IndexerScores<true> : naive_dsa_mma::IndexerScores<false>;
-            kernel<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
-                (queries + rows - 1) / rows), rows * 4>>>(
-                (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
-                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, queries, keys, queryStart, stride, 0, 0);
+        if (!scored) {
+            naive_dsa_mma::QuantizeIndexer<<<queries * heads, 128>>>(
+                (const BF16 *)query.cudaData, (BF16 *)q.cudaData,
+                (float *)qScale.cudaData, dim, 0);
+            if (queries == 1) {
+                naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
+                    (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
+                    (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                    topKOutput, stride, keys, queryStart);
+            }
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
+            // WGMMA's smaller query tile repeats more K reads. For shared peer KV,
+            // use the larger MMA tile below to reduce traffic to the owning GPU.
+            else if ([&]() {
+                naive_indexer::FP8Entry entry{FastllmNaiveKV(packedKeys),
+                    (const BF16 *)q.cudaData, (const BF16 *)weights.cudaData, (const float *)qScale.cudaData,
+                    (float *)scores.cudaData, queries, keys, queryStart, stride};
+                if (!fp8Compute || topK != 2048) return false;
+                Output(indices, INT32, {queries, topK});
+                int *output = (int *)indices.cudaData;
+                return fp8IndicesReady = LaunchFP8ShortlistIndexer(&entry, 1, &output) != 0;
+            }()) {}
+            else if (!peerKeys && naive_indexer::Prepare()) {
+                naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
+                    (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                    (float *)scores.cudaData, queries, keys, queryStart, stride);
+            }
+#endif
+            else {
+                // TopK consumes only each row's causal prefix. Blocks beyond
+                // the final query's prefix cannot contribute any selected key.
+                const bool pipeline = arch == 90 || (!peerKeys && (arch == 100 || arch == 103) &&
+                    queries >= 4096 && keys >= 4096 && packedKeys.dataType == FP8_E4M3);
+                const int rows = pipeline ? 32 : 64;
+                auto kernel = pipeline ? naive_dsa_mma::IndexerScores<true> : naive_dsa_mma::IndexerScores<false>;
+                kernel<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
+                    (queries + rows - 1) / rows), rows * 4>>>(
+                    (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
+                    (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                    (float *)scores.cudaData, queries, keys, queryStart, stride, 0, 0);
+            }
         }
     } else
 #endif

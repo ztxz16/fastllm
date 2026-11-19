@@ -1,3 +1,5 @@
+#include "../../src/devices/cuda/models/naive-n05-dsa-mma.cuh"
+#include <algorithm>
 #include "../../src/devices/cuda/models/naive-n05-indexer-batch.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-sortpack.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-sm100.cuh"
@@ -195,6 +197,86 @@ static void Case(int count, int capacity, int stride, int page, bool fp8 = true,
     printf("PASS batch=%d capacity=%d stride=%d page=%d scaled=%d L2=%.9g graph/rebinding/TopK\n", count,
            capacity, stride, page, int(scaled), worst);
 }
+static void PrefillCase(int rows, int keys, bool paged, bool scaled, int keep, int rowBytes) {
+    Check(keep <= keys - rows + 1, "TopK must fit every reference row");
+    const int page = 64, pages = (keys + page - 1) / page;
+    const int stride = scaled ? rowBytes / 2 : rowBytes;
+    const int past = keys - rows;
+    unsigned seed = 718913;
+    auto sample = [&]() {
+        seed = 1664525u * seed + 1013904223u;
+        return (int(seed >> 16) - 32768) / 16384.f;
+    };
+    Buffer<unsigned char> pool(size_t(pages) * page * rowBytes);
+    std::vector<unsigned char> hostPool(pool.n);
+    for (size_t i = 0; i < size_t(pages) * page; ++i) {
+        auto *p = hostPool.data() + (i + 1) * rowBytes - (scaled ? FastllmNaiveIndexerBytes : 128);
+        for (int d = 0; d < 128; ++d) p[d] = __nv_fp8_e4m3(sample()).__x;
+        if (scaled) {
+            float scale = .05f + std::fabs(sample());
+            std::memcpy(p + 128, &scale, sizeof(scale));
+        }
+    }
+    pool.Put(hostPool);
+    Buffer<int> table(pages);
+    std::vector<int> map(pages);
+    for (int p = 0; p < pages; ++p) map[p] = pages - 1 - p;
+    table.Put(map);
+    FastllmNaiveKV cache(pool.p, paged ? table.p : nullptr, paged ? page : 0, !scaled);
+    cache.scaledIndexer = scaled;
+    Buffer<__nv_bfloat16> query(size_t(rows) * 16 * 128), weights(size_t(rows) * 16), rounded(query.n);
+    std::vector<__nv_bfloat16> input(query.n), weight(weights.n);
+    for (auto &x : input) x = __float2bfloat16(sample());
+    for (auto &x : weight) x = __float2bfloat16(sample());
+    query.Put(input);
+    weights.Put(weight);
+    Buffer<float> scales(weights.n), ref(size_t(rows) * keys), actual(ref.n);
+    const auto stream = cudaStreamPerThread;
+    naive_dsa_mma::QuantizeIndexer<<<rows * 16, 128, 0, stream>>>(query.p, rounded.p, scales.p, 128, 0);
+    naive_dsa_mma::IndexerScores<true><<<dim3((keys + 63) / 64, (rows + 31) / 32), 128, 0, stream>>>(
+        rounded.p, cache, scales.p, weights.p, ref.p, rows, keys, past, stride, 0, 0);
+    Cuda(cudaGetLastError());
+    auto run = [&](size_t bytesAvailable) {
+        return FastllmCudaNaivePrefillIndexerSm100(query.p, weights.p, cache, stride, rows, keys, past,
+            rounded.p, bytesAvailable, scales.p, actual.p, stream);
+    };
+    Check(!run(1), "prefill scorer accepted undersized scratch");
+    Check(run(rounded.n * sizeof(__nv_bfloat16)), "prefill scorer declined supported layout");
+    Cuda(cudaStreamSynchronize(stream));
+    auto old = ref.Get(), now = actual.Get();
+    double error = 0, norm = 0;
+    size_t matched = 0;
+    std::vector<int> original(keys), selected(keys);
+    for (int row = 0; row < rows; ++row) {
+        const size_t base = size_t(row) * keys;
+        const int live = past + row + 1;
+        for (int k = 0; k < keys; ++k) {
+            if (k >= live) {
+                Check(now[base + k] == -INFINITY, "noncausal score escaped the mask");
+                continue;
+            }
+            const double d = now[base + k] - old[base + k];
+            error += d * d;
+            norm += double(old[base + k]) * old[base + k];
+            original[k] = selected[k] = k;
+        }
+        auto select = [&](std::vector<int> &ids, const std::vector<float> &values) {
+            std::partial_sort(ids.begin(), ids.begin() + keep, ids.begin() + live, [&](int a, int b) {
+                return values[base + a] == values[base + b] ? a < b : values[base + a] > values[base + b];
+            });
+            std::sort(ids.begin(), ids.begin() + keep);
+        };
+        select(original, old);
+        select(selected, now);
+        for (int i = 0; i < keep; ++i)
+            matched += std::binary_search(original.begin(), original.begin() + keep, selected[i]);
+    }
+    const double l2 = std::sqrt(error / norm), overlap = double(matched) / (rows * keep);
+    printf("Prefill rows=%d keys=%d paged=%d scaled=%d topK=%d score L2=%.9g TopK overlap=%.9f\n",
+        rows, keys, paged, scaled, keep, l2, overlap);
+    Check(l2 < .003 && overlap >= .999, "prefill scores or TopK differ from reference");
+}
+
 int main() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
@@ -202,6 +284,11 @@ int main() {
     Cuda(cudaGetDeviceProperties(&prop, 0));
     if (prop.major != 10 || (prop.minor != 0 && prop.minor != 3)) return 77;
     try {
+        PrefillCase(129, 65539, true, true, 2048, 400);
+        PrefillCase(137, 1109, false, false, 128, 128);
+        PrefillCase(259, 2053, true, true, 128, 400);
+        PrefillCase(259, 2053, true, true, 128, FastllmNaiveIndexerBytes);
+        PrefillCase(1025, 8192, true, true, 2048, 400);
         Case(32, 8704, 128, 128, true, false);
         Case(64, 8704, 896, 128, true, false);
         Case(32, 8704, 144, 128);

@@ -220,6 +220,128 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
 #endif
 }
 
+// Pack Q into E4M3 once per head. Its scale is the same as the BF16-expanded
+// quantizer used by the fallback. Eight warps handle eight independent heads.
+__global__ void PackPrefillQueries(const __nv_bfloat16 *src, unsigned *packed, float *scales, int heads) {
+    const int head = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (head >= heads) return;
+    union { uint2 vector; __nv_bfloat16 values[4]; } v;
+    v.vector = reinterpret_cast<const uint2 *>(src)[size_t(head) * 32 + lane];
+    float maximum = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) maximum = fmaxf(maximum, fabsf(float(v.values[i])));
+    #pragma unroll
+    for (int delta = 16; delta; delta /= 2)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, delta));
+    const float scale = fmaxf(maximum, 1.e-4f) / 448.f;
+    unsigned word = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float value = fmaxf(-448.f, fminf(448.f, float(v.values[i]) / scale));
+        word |= unsigned(__nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3)) << (i * 8);
+    }
+    packed[size_t(head) * 32 + lane] = word;
+    if (!lane) scales[head] = scale;
+}
+
+__global__ void GatherPrefillIndexKeys(FastllmNaiveKV cache, int stride, int first, int count, uint4 *packed, float *scales) {
+    const int row = blockIdx.x * 16 + threadIdx.x / 8, lane = threadIdx.x % 8;
+    if (row >= count) return;
+    const auto *src = static_cast<const uint4 *>(cache.IndexRow(first + row, stride).data);
+    packed[size_t(row) * 8 + lane] = src[lane];
+    if (cache.scaledIndexer && lane == 0) scales[row] = cache.IndexScale(first + row, stride);
+}
+
+// Eight groups of 16 query heads form the N dimension of one 128 x 128
+// UMMA. Each CTA reuses that Q tile across up to eight consecutive K tiles.
+constexpr int PrefillQueries = 8, PrefillKeys = 128, PrefillTiles = 8;
+__global__ __launch_bounds__(128) void PrefillScores(const unsigned char *queries, const float *queryScales,
+        const __nv_bfloat16 *weights, const unsigned char *keys, const float *keyScales, float *scores,
+        int rows, int cols, int past, int keyOffset, int keyCount) {
+    const int t = threadIdx.x, firstQ = PrefillQueries * blockIdx.y;
+    const int firstK = PrefillKeys * PrefillTiles * blockIdx.x;
+    const int end = min(keyCount, past + min(rows, firstQ + PrefillQueries) - keyOffset);
+    const int liveTiles = min(PrefillTiles, (max(0, end - firstK) + PrefillKeys - 1) / PrefillKeys);
+    // Preserve the dense score contract for both the ordered and bitmap selectors.
+    for (int n = liveTiles; n < PrefillTiles; ++n) {
+        const int col = firstK + n * PrefillKeys + t;
+        if (col >= keyCount) break;
+        #pragma unroll
+        for (int i = 0; i < PrefillQueries; ++i)
+            if (firstQ + i < rows) scores[size_t(firstQ + i) * cols + keyOffset + col] = -INFINITY;
+    }
+    if (!liveTiles) return;
+    __shared__ __align__(1024) unsigned char q[128 * 128], k[128 * 128];
+    __shared__ __align__(16) float factors[128];
+    __shared__ uint64_t barrier;
+    __shared__ uint32_t tmem;
+    if (t < 32) {
+        cute::TMEM::Allocator1Sm allocator;
+        allocator.allocate(128, &tmem);
+        allocator.release_allocation_lock();
+    }
+    if (!t) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(address(&barrier)));
+    const size_t head = size_t(firstQ) * 16 + t;
+    // Per-head activation scales are nonnegative, so they can be folded
+    // into the weight before the paired FP32 dot-product reduction.
+    factors[t] = firstQ + t / 16 < rows ? float(weights[head]) * queryScales[head] : 0.f;
+    for (int j = t; j < 128 * 8; j += 128) {
+        const int h = j / 8, offset = j % 8 * 16, row = firstQ + h / 16;
+        LoadVector(q + h * 128 + (offset ^ ((h & 7) * 16)),
+            queries + (size_t(min(rows - 1, row)) * 16 + h % 16) * 128 + offset, row < rows);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    const uint64_t instruction = cute::UMMA::make_runtime_instr_desc<cutlass::float_e4m3_t,
+        cutlass::float_e4m3_t, float, 128, 128, cute::UMMA::Major::K, cute::UMMA::Major::K>();
+    for (int tile = 0; tile < liveTiles; ++tile) {
+        const int first = firstK + tile * PrefillKeys;
+        for (int j = t; j < 128 * 8; j += 128) {
+            const int h = j / 8, offset = j % 8 * 16;
+            LoadVector(k + h * 128 + (offset ^ ((h & 7) * 16)),
+                keys + size_t(min(first + h, keyCount - 1)) * 128 + offset, first + h < keyCount);
+        }
+        asm volatile("cp.async.commit_group; cp.async.wait_all; fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+        if (t < 32) {
+            const auto kd = descriptor(k), qd = descriptor(q);
+            #pragma unroll
+            for (int d = 0; d < 128; d += 32)
+                cute::SM100_MMA_F8F6F4_SS::fma(kd + d / 16, qd + d / 16, tmem, d != 0, instruction);
+            if (!t) asm volatile("tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];"
+                :: "r"(address(&barrier)) : "memory");
+        }
+        wait_bar(&barrier, tile & 1);
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        const int col = first + t;
+        const float ks = keyScales && col < keyCount ? keyScales[col] : 1.f;
+        #pragma unroll
+        for (int i = 0; i < PrefillQueries; ++i) {
+            uint32_t v[16];
+            cute::SM100::TMEM::LOAD::SM100_TMEM_LOAD_32dp32b16x::copy(tmem + i * 16 + ((t / 32) << 21),
+                v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+            uint64_t sum2 = 0;
+            #pragma unroll
+            for (int h = 0; h < 8; ++h) {
+                uint32_t lo = __float_as_uint(fmaxf(__uint_as_float(v[2 * h]), 0.f));
+                uint32_t hi = __float_as_uint(fmaxf(__uint_as_float(v[2 * h + 1]), 0.f));
+                uint64_t values = (uint64_t(hi) << 32) | lo;
+                uint64_t factors2 = reinterpret_cast<const uint64_t *>(factors + i * 16)[h];
+                asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(sum2) : "l"(values), "l"(factors2), "l"(sum2));
+            }
+            float sum = __uint_as_float(uint32_t(sum2)) + __uint_as_float(uint32_t(sum2 >> 32));
+            if (firstQ + i < rows && col < keyCount)
+                scores[size_t(firstQ + i) * cols + keyOffset + col] =
+                    keyOffset + col <= past + firstQ + i ? sum * ks : -INFINITY;
+        }
+        __syncthreads();
+    }
+    if (t < 32) {
+        cute::TMEM::Allocator1Sm allocator;
+        allocator.free(tmem, 128);
+    }
+}
+
 } // namespace naive_indexer_sm100
 
 bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int count, int capacity,
@@ -304,5 +426,51 @@ bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int coun
         aligned *= 2;
     blocks = aligned;
     Pipeline<><<<dim3(blocks, count), 256, shared, stream>>>(weights, batch);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool FastllmCudaNaivePrefillIndexerSm100(const __nv_bfloat16 *query, const __nv_bfloat16 *weights,
+        FastllmNaiveKV cache, int stride, int rows, int keys, int past, void *scratch, size_t scratchBytes,
+        float *queryScales, float *scores, cudaStream_t stream) {
+    using namespace naive_indexer_sm100;
+    if (!query || !weights || !scratch || !queryScales || !scores || stride <= 0 ||
+        rows < 128 || keys < 1024 || rows > 65535 * PrefillQueries || past < 0 ||
+        int64_t(past) + rows > keys || !cache.base || cache.fp4 || (!cache.scaledIndexer && !cache.fp8) ||
+        cache.offset || (cache.pages && cache.pageLen <= 0) ||
+        ((uintptr_t(query) | uintptr_t(cache.base) | uintptr_t(scratch)) & 15)) return false;
+    const size_t rowBytes = size_t(stride) * (cache.fp8 ? 1 : 2);
+    if (rowBytes < (cache.scaledIndexer ? FastllmNaiveIndexerBytes : 128) || rowBytes % 16) return false;
+    const size_t qBytes = size_t(rows) * 16 * 128;
+    const bool gather = cache.pages || rowBytes != 128 || cache.scaledIndexer;
+    if (scratchBytes < qBytes) return false;
+    int blockKeys = keys;
+    if (gather) {
+        const size_t packedRowBytes = 128 + (cache.scaledIndexer ? sizeof(float) : 0);
+        blockKeys = std::min<size_t>(keys, (scratchBytes - qBytes) / packedRowBytes);
+        if (blockKeys < keys) blockKeys -= blockKeys % PrefillKeys;
+        if (!blockKeys) return false;
+    }
+    // An SM-specific fatbin may not contain the active Blackwell variant.
+    cudaFuncAttributes attr{};
+    if (cudaFuncGetAttributes(&attr, PrefillScores) != cudaSuccess || attr.binaryVersion < 100) {
+        cudaGetLastError();
+        return false;
+    }
+    auto *packedQ = static_cast<unsigned char *>(scratch);
+    auto *packedK = packedQ + qBytes;
+    auto *keyScales = cache.scaledIndexer ? reinterpret_cast<float *>(packedK + size_t(blockKeys) * 128) : nullptr;
+    PackPrefillQueries<<<(rows * 16 + 7) / 8, 256, 0, stream>>>(query, reinterpret_cast<unsigned *>(packedQ), queryScales, rows * 16);
+    // The quantized Q is shared by all K blocks. Dense scores retain their
+    // full logical stride so causal masking and ordered selection are unchanged.
+    for (int first = 0; first < keys;) {
+        int count = std::min(blockKeys, keys - first);
+        if (gather) GatherPrefillIndexKeys<<<1 + (count - 1) / 16, 128, 0, stream>>>(
+            cache, stride, first, count, reinterpret_cast<uint4 *>(packedK), keyScales);
+        dim3 grid(1 + (count - 1) / (PrefillKeys * PrefillTiles), (rows + PrefillQueries - 1) / PrefillQueries);
+        PrefillScores<<<grid, 128, 0, stream>>>(packedQ, queryScales, weights,
+            gather ? packedK : reinterpret_cast<const unsigned char *>(cache.base), keyScales, scores,
+            rows, keys, past, first, count);
+        first += count;
+    }
     return cudaGetLastError() == cudaSuccess;
 }

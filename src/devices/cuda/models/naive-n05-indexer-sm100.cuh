@@ -20,3 +20,7 @@ constexpr int BatchLimit = 128;
 } // namespace naive_indexer_sm100
 bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int count, int capacity,
                                   const __nv_bfloat16 *weights, cudaStream_t stream);
+
+bool FastllmCudaNaivePrefillIndexerSm100(const __nv_bfloat16 *query, const __nv_bfloat16 *weights,
+        FastllmNaiveKV cache, int stride, int rows, int keys, int past, void *scratch, size_t scratchBytes,
+        float *queryScales, float *scores, cudaStream_t stream);
