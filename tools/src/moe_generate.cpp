@@ -1,4 +1,5 @@
 #include "distributed/qwen3_generation.h"
+#include "distributed/batch_invariant.h"
 #include "tp_graph_report.h"
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -91,6 +92,8 @@ Json::array States(ProcessGroup &group) {
         item["request_capacity"] = static_cast<long long>(states[i].capacity);
         item["request_kv_bytes"] = static_cast<long long>(states[i].deviceBytes);
         item["reserved_kv_bytes"] = static_cast<long long>(states[i].reservedKVBytes);
+        item["expert_gemm_submissions"] = static_cast<long long>(states[i].expertGemmSubmissions);
+        item["expert_gemm_backend"] = states[i].expertGemmSubmissions ? kMoeBatchInvariantBackend : "not_observed";
         graph[i] = item;
     }
     return graph;
@@ -183,7 +186,7 @@ int main(int argc, char **argv) {
     ProcessGroup group;
     try {
         std::map<std::string, std::string> args;
-        const std::set<std::string> allowed{"--model", "--worker", "--devices", "--session-fd", "--cuda-graph", "--prefix-cache", "--timeout-ms"};
+        const std::set<std::string> allowed{"--model", "--worker", "--devices", "--session-fd", "--cuda-graph", "--prefix-cache", "--timeout-ms", "--batch-invariant"};
         for (int i = 1; i < argc; i += 2) {
             if (i + 1 >= argc || !allowed.count(argv[i]) || !args.emplace(argv[i], argv[i+1]).second) throw std::runtime_error("invalid MoE argument");
         }
@@ -197,6 +200,11 @@ int main(int argc, char **argv) {
         options.workerPath = std::filesystem::absolute(args.at("--worker")).string();
         options.cudaGraph = ParseCudaGraph(args.at("--cuda-graph"));
         options.prefixCache = ParsePrefixCache(args.at("--prefix-cache"));
+        if (args.count("--batch-invariant")) {
+            const int mode = parse("--batch-invariant");
+            if (mode > 1) throw std::runtime_error("batch-invariant must be 0 or 1");
+            options.batchInvariant = mode != 0;
+        }
         const int timeout = parse("--timeout-ms");
         if (timeout <= 0) throw std::runtime_error("invalid MoE timeout");
         options.operationTimeoutMs = timeout;
@@ -211,11 +219,23 @@ int main(int argc, char **argv) {
         group.Start(options);
         auto loaded = group.LoadQwenMoe(std::filesystem::absolute(args.at("--model")).string(), 1ULL<<30, 12ULL<<30, timeout);
         Json::array workers;
-        for (const auto &w : group.Workers()) workers.push_back(Json::object{{"rank", w.rank}, {"device", w.device},
-            {"pid", w.pid}, {"gpu", w.deviceName}, {"cuda_runtime_version", w.cudaRuntimeVersion}, {"nccl_version", w.ncclVersion},
-            {"weight_device_bytes", static_cast<long long>(loaded.at(w.rank).deviceBytes)}});
+        for (const auto &w : group.Workers()) {
+            const auto &info = loaded.at(w.rank);
+            Json::array config;
+            for (auto value : info.batchInvariantConfig) config.push_back(int(value));
+            workers.push_back(Json::object{{"rank", w.rank}, {"device", w.device},
+                {"pid", w.pid}, {"gpu", w.deviceName}, {"cuda_runtime_version", w.cudaRuntimeVersion}, {"nccl_version", w.ncclVersion},
+                {"weight_device_bytes", static_cast<long long>(info.deviceBytes)},
+                {"batch_invariant", info.batchInvariant}, {"expert_gemm_config", config}});
+        }
+        Json::array config;
+        for (auto value : loaded.front().batchInvariantConfig) config.push_back(int(value));
+        Json mode = Json::object{{"requested", options.batchInvariant}, {"effective", loaded.front().batchInvariant},
+            {"backend", loaded.front().batchInvariant ? kMoeBatchInvariantBackend : "legacy"},
+            {"scope", "moe_experts"}, {"config", config}, {"full_model_validated", false}};
         channel.Write(Json::object{{"event", "ready"}, {"status", "PASS"}, {"protocol", 1},
             {"backend", "qwen_moe_attention_dp_ep"}, {"model_load_count", 1}, {"workers", workers},
+            {"batch_invariant", mode},
             {"cancellation", "round_boundary"}, {"token_events", true}, {"states", States(group)}});
         Serve(group, channel, options.devices.size(), options.cudaGraph, timeout);
         return 0;

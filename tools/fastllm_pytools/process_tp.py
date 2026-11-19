@@ -76,7 +76,7 @@ def validate_options(args, *, allow_dp=False):
     add_server_args(parser)
     defaults = vars(parser.parse_args([]))
     allowed = {'model', 'path', 'dp', 'attention_dp', 'ep', 'dp_routing', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
-               'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce', 'tokens', 'page_size'}
+               'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce', 'tokens', 'page_size', 'batch_invariant'}
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous') if is_attention_ep(args) else ('auto', 'paged'),
                   'device': (None, ''), 'FASTLLM_ACTIVATE_NUMA': ('OFF',), 'FASTLLM_NUMA_THREADS': (27,),
@@ -114,6 +114,10 @@ def validate_options(args, *, allow_dp=False):
         raise ValueError('custom_allreduce must be boolean')
     if type(getattr(args, 'cuda_graph', False)) is not bool:
         raise ValueError('cuda_graph must be boolean')
+    if type(getattr(args, 'batch_invariant', False)) is not bool:
+        raise ValueError('batch_invariant must be boolean')
+    if getattr(args, 'batch_invariant', False) and not is_attention_ep(args):
+        raise ValueError('batch-invariant currently requires Attention DP/EP')
     if not sys.platform.startswith('linux'):
         raise ValueError('process TP currently requires Linux + NVIDIA CUDA')
     if hasattr(args, 'max_new_tokens') and (type(args.max_new_tokens) is not int or not 1 <= args.max_new_tokens <= 2048):
@@ -188,7 +192,8 @@ class ProcessTPModel:
             from .qwen_moe_process_session import QwenMoeProcessSession
             session_class = QwenMoeProcessSession
             session_options = dict(routing=getattr(args, 'dp_routing', None) or 'round_robin',
-                                   queue_size=getattr(args, 'tp_queue_size', 8))
+                                   queue_size=getattr(args, 'tp_queue_size', 8),
+                                   batch_invariant=getattr(args, 'batch_invariant', False))
             self._stream_lock = nullcontext()
         self.session = session_class(binary, worker, self.model_path, self.devices,
                                           self.output / 'session', timeout=getattr(args, 'tp_timeout', 180),

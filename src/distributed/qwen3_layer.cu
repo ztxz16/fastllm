@@ -1,5 +1,6 @@
 #include "distributed/qwen3_limits.h"
 #include "distributed/qwen3_layer.h"
+#include "distributed/sm70_expert_gemm.h"
 #include "process_protocol.h"
 #include "qwen_moe_qkv.cuh"
 #include "qwen_moe_trace.cuh"
@@ -274,6 +275,8 @@ struct Qwen3LayerExecutor::Impl {
     ProcessAllReduce &allReduce;
     cublasHandle_t blas = nullptr;
     cublasLtHandle_t qkvLt = nullptr;
+    bool batchInvariant = false;
+    uint64_t expertGemmSubmissions = 0;
     std::vector<std::unique_ptr<detail::MoeQkvLtPlan>> qkvPlans, graphQkvPlans;
     std::string forwardTraceDirectory;
     std::unique_ptr<detail::MoeForwardTrace> forwardTrace;
@@ -734,7 +737,18 @@ struct Qwen3LayerExecutor::Impl {
             std::string name = prefix + "mlp.experts." + std::to_string(expert) + ".";
             auto gate = Weight(name + "gateup_proj.weight", {uint64_t(2*m), p.hiddenSize});
             auto down = Weight(name + "down_proj.weight", {p.hiddenSize, uint64_t(m)});
-            if (capacity == 1) {
+            if (batchInvariant && capacity == 1) {
+                // 只替换专家计算节点；沿用 Index、工作区、stream 及既有捕获/回放生命周期。
+                const int *indices = map + expert * rows;
+                moe::PackMasked<<<(rows*h+255)/256,256,0,stream>>>(
+                    gathered, indices, counts + expert, packed, rows, h, k);
+                Sm70ExpertGemm(packed, gate, nullptr, gateup, rows, 2*m, h, false, stream);
+                Swiglu<<<(rows*m+255)/256,256,0,stream>>>(gateup, activated, rows*m, m);
+                Sm70ExpertGemm(activated, down, nullptr, expertOutput, rows, h, m, false, stream);
+                expertGemmSubmissions += 2;
+                moe::ScatterMasked<<<(rows*h+255)/256,256,0,stream>>>(
+                    expertOutput, indices, counts + expert, allProb, contributions, rows, h);
+            } else if (capacity == 1) {
                 moe::DecodeGate<<<(rows*m+255)/256,256,0,stream>>>(gathered, gate, allIds, activated, rows, h, m, k, expert);
                 moe::DecodeDown<<<(rows*h+255)/256,256,0,stream>>>(activated, down, allIds, allProb, contributions, rows, h, m, k, expert);
             } else if (hostCounts[expert]) {
@@ -744,11 +758,16 @@ struct Qwen3LayerExecutor::Impl {
                 if (trace) trace->Capture(entry + "indices", indices, stream);
                 moe::Pack<<<(count*h+255)/256,256,0,stream>>>(gathered, indices, packed, count, h, k);
                 if (trace) trace->Capture(entry + "packed", packed, stream);
-                Linear(packed, gate, gateup, count, 2*m, h, false);
+                if (batchInvariant)
+                    Sm70ExpertGemm(packed, gate, nullptr, gateup, count, 2*m, h, false, stream);
+                else Linear(packed, gate, gateup, count, 2*m, h, false);
                 if (trace) trace->Capture(entry + "gateup", gateup, stream);
                 Swiglu<<<(count*m+255)/256,256,0,stream>>>(gateup, activated, count*m, m);
                 if (trace) trace->Capture(entry + "activated", activated, stream);
-                Linear(activated, down, expertOutput, count, h, m, false);
+                if (batchInvariant)
+                    Sm70ExpertGemm(activated, down, nullptr, expertOutput, count, h, m, false, stream);
+                else Linear(activated, down, expertOutput, count, h, m, false);
+                if (batchInvariant) expertGemmSubmissions += 2;
                 if (trace) trace->Capture(entry + "down", expertOutput, stream);
                 moe::Scatter<<<(count*h+255)/256,256,0,stream>>>(expertOutput, indices, allProb, contributions, count, h);
             }
@@ -987,10 +1006,26 @@ struct Qwen3LayerExecutor::Impl {
     }
 };
 
-Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph, bool prefixCache)
+Qwen3LayerExecutor::Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph, bool prefixCache, bool batchInvariant)
     : impl(new Impl{weights, stream, comm, allReduce}) {
     if (!stream || !comm) {
         throw std::runtime_error("Qwen3 layer requires initialized stream/NCCL");
+    }
+    if (batchInvariant) {
+        const auto &p = weights.Plan();
+        if (p.model != ShardModel::Qwen2Moe || p.hiddenSize % 8 || p.intermediateCount % 8)
+            throw std::runtime_error("batch-invariant requires Qwen2 MoE FP16 with 8-aligned expert K dimensions");
+        ValidateSm70ExpertGemmDevice();
+        for (uint32_t layer = 0; layer < p.layerCount; ++layer) {
+            for (uint32_t expert = p.rank; expert < p.expertCount; expert += p.worldSize) {
+                const auto prefix = "model.layers." + std::to_string(layer) + ".mlp.experts." + std::to_string(expert) + ".";
+                const auto gate = impl->Weight(prefix + "gateup_proj.weight", {2 * p.intermediateCount, p.hiddenSize});
+                const auto down = impl->Weight(prefix + "down_proj.weight", {p.hiddenSize, p.intermediateCount});
+                if (reinterpret_cast<uintptr_t>(gate) % 16 || reinterpret_cast<uintptr_t>(down) % 16)
+                    throw std::runtime_error("batch-invariant expert weights require 16-byte alignment: " + prefix);
+            }
+        }
+        impl->batchInvariant = true;
     }
     impl->graphInfo.enabled = cudaGraph;
     impl->prefixInfo.enabled = prefixCache;
@@ -1467,6 +1502,7 @@ Qwen3RequestInfo Qwen3LayerExecutor::RequestInfo() const {
         info.deviceBytes = info.prefix.activePages * info.prefix.pageLen * impl->weights.Plan().kvHeadCount * impl->weights.Plan().headDim * sizeof(half);
     }
     info.reservedKVBytes = impl->reservedKVBytes;
+    info.expertGemmSubmissions = impl->expertGemmSubmissions;
     for (const auto &entry : impl->prefixes) {
         info.prefix.snapshots.emplace_back(entry.position, entry.ids);
     }

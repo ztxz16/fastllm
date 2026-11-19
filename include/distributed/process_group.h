@@ -25,6 +25,7 @@ struct ProcessGroupOptions {
     bool cudaGraph = false;
     bool customAllReduce = false; // 严格要求双卡 P2P；大消息显式走 NCCL。
     bool prefixCache = false; // Dense复用FT分页前缀；MoE保留原有快照。
+    bool batchInvariant = false; // 固定 SM70 专家 GEMM，组生命周期内不可切换。
     uint32_t pageSize = 0, cacheTokens = 0; // 0沿用FT默认页大小/页池容量。
 };
 
@@ -41,6 +42,8 @@ struct ProcessModelInfo {
     uint32_t tensorCount = 0;
     uint64_t deviceBytes = 0;
     uint64_t sourceBytesRead = 0;
+    bool batchInvariant = false;
+    std::vector<uint32_t> batchInvariantConfig;
 };
 
 /** 最紧张的单层K/V页池；尚未建立页池时两项均为0，不包含可回收前缀页。 */
@@ -82,6 +85,7 @@ struct Qwen3RequestInfo {
     Qwen3PrefixInfo prefix;
     // MoE 固定地址 KV 预留；与活动请求逻辑字节分开统计，模型卸载时释放。
     uint64_t reservedKVBytes = 0;
+    uint64_t expertGemmSubmissions = 0; // 主机实际提交数，包含Graph捕获，不冒充回放次数。
 };
 
 /** 一轮联合调度的本地操作；Idle 仍参加专家通信，End 在轮次边界释放活动状态。 */

@@ -752,7 +752,8 @@ if (BUILD_PROCESS_TP)
             message(FATAL_ERROR "Process TP layer execution requires cuBLAS and cuBLASLt")
         endif()
         add_library(fastllm_tp_layer STATIC src/distributed/qwen3_layer.cu
-            src/distributed/process_allreduce.cu)
+            src/distributed/process_allreduce.cu src/distributed/sm70_expert_gemm.cu)
+        target_include_directories(fastllm_tp_layer PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cutlass/include)
         set_target_properties(fastllm_tp_layer PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         target_link_libraries(fastllm_tp_layer PUBLIC fastllm_tp_device_weights
             ${FASTLLM_PROCESS_CUBLAS} ${FASTLLM_PROCESS_CUBLASLT} nccl)

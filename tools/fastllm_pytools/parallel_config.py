@@ -276,6 +276,10 @@ def prepare_parallel_entry(args, *, allow_preview=False):
      * @return 预览时返回分配字典；正常执行返回 None，模型工厂负责分配和启动。
      */"""
     validate_parallel_options(args)
+    if type(getattr(args, 'batch_invariant', False)) is not bool:
+        raise ValueError('batch_invariant must be boolean')
+    if getattr(args, 'batch_invariant', False) and not is_attention_ep(args):
+        raise ValueError('--batch-invariant currently requires Attention DP/EP')
     if getattr(args, 'parallel_plan', False):
         if not allow_preview:
             raise ValueError('--parallel-plan is a CLI preview; use build_parallel_plan for a programmatic plan')
