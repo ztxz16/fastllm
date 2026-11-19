@@ -146,7 +146,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
     std::shared_ptr<void> samplingLinear;
     Data samplingW1, samplingW2, samplingInput, samplingTarget;
     std::vector<std::pair<Data, Data>> tpKV;
-    void *ready = nullptr, *done = nullptr;
+    void *done = nullptr;
     std::vector<void *> Pointers() const {
         std::vector<void *> out;
         for (const Data *p : {&id, &live, &positions, &hidden, &normalized, &combined, &batchKV}) out.push_back(p->isFake ? nullptr : p->cudaData);
@@ -162,7 +162,6 @@ struct NaiveN05FlashModel::DraftWorkspace {
         proposal.graph.Clear();
         proposals.clear();
         sampling.Clear();
-        if (ready) FastllmCudaEventDestroy(ready);
         if (done) FastllmCudaEventDestroy(done);
         // Data frees use their recorded device; restore the caller's selection.
         FastllmCudaSetDevice(previous);
@@ -372,7 +371,6 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
     if (!draftContextStorage) {
         draftContextStorage = std::make_shared<DraftWorkspace>();
         draftContextStorage->device = tp.devices.front();
-        draftContextStorage->ready = FastllmCudaEventCreate();
         for (int device : tp.devices) {
             auto rank = std::make_shared<DraftWorkspace>(); rank->device = device;
             rank->contextLayers.resize(draftLayers);
@@ -395,7 +393,8 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
     }
     const int heads = draftHeads / tp.attentionDivisor, kvHeads = std::max(1, draftKvHeads / tp.attentionDivisor);
     const int rows = selected->dims[1], width = kvHeads * draftHeadDim;
-    FastllmCudaEventRecordCurrentThread(ws.ready);
+    // Publish the root PTDS writes before another device reads the selected rows.
+    if (!tp.dataParallel || context.deviceRank != 0) FastllmCudaSyncCurrentThreadStream();
     tp.Run([&](int rank) {
         if (tp.dataParallel && rank != context.deviceRank) return;
         auto &r = *ws.tpRanks[rank];
@@ -406,7 +405,6 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
             r.contextSelected.Resize(selected->dims);
             r.contextSelected.ToDevice(DataDevice::CUDA, std::vector<int>{r.device}, false);
             r.contextSelected.Allocate(false);
-            FastllmCudaCurrentThreadStreamWaitEvent(ws.ready);
             AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(r.device, r.contextSelected.cudaData,
                 tp.devices.front(), selected->cudaData, selected->GetBytes()), "Draft TP context transfer failed.");
             input = &r.contextSelected;
@@ -1197,7 +1195,9 @@ void NaiveN05FlashModel::ProjectDraftContext(Data &combined, Data &projected, Da
         const int root = draftTP->devices.front();
         hidden.dataType = BFLOAT16; hidden.UpdateUnitSize(); hidden.Resize({1, rows, embed_dim});
         hidden.ToDevice(DataDevice::CUDA, {root}, false); hidden.Allocate(false);
-        FastllmCudaEventRecordCurrentThread(ws.ready);
+        // Publish the large context input once before peer streams read their rows.
+        // This path can move from the warmup thread to the serving thread.
+        FastllmCudaSyncCurrentThreadStream();
         draftTP->Run([&](int rank) {
             auto &r = *ws.tpRanks[rank];
             const int first = int(int64_t(rows) * rank / ranks);
@@ -1209,7 +1209,6 @@ void NaiveN05FlashModel::ProjectDraftContext(Data &combined, Data &projected, Da
                 auto &local = r.combined;
                 local.dataType = BFLOAT16; local.UpdateUnitSize(); local.Resize(view.dims);
                 local.ToDevice(DataDevice::CUDA, {r.device}, false); local.Allocate(false);
-                FastllmCudaCurrentThreadStreamWaitEvent(ws.ready);
                 AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(r.device, local.cudaData,
                     root, view.cudaData, view.GetBytes()), "Draft context row transfer failed.");
                 input = &local;
@@ -1473,7 +1472,9 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
     };
     if (draftTP) {
         auto &ws = *draftContextStorage;
-        FastllmCudaEventRecordCurrentThread(ws.ready);
+        if (std::any_of(rankRequests.begin() + 1, rankRequests.end(),
+                [](const auto &requests) { return !requests.empty(); }))
+            FastllmCudaSyncCurrentThreadStream();
         draftTP->Run([&](int rank) {
             auto &r = *ws.tpRanks[rank];
             const auto &requests = rankRequests[rank];
@@ -1486,7 +1487,6 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
                 int rows = 0; for (int i : requests) rows += counts[i];
                 local.dataType = BFLOAT16; local.UpdateUnitSize(); local.Resize({1, rows, width});
                 local.ToDevice(DataDevice::CUDA, {r.device}, false); local.Allocate(false);
-                if (rank) FastllmCudaCurrentThreadStreamWaitEvent(ws.ready);
                 if (dataParallel) {
                     size_t offset = 0;
                     std::vector<void *> destinations;
