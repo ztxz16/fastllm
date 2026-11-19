@@ -1,4 +1,5 @@
 #include "distributed/qwen3_limits.h"
+#include "distributed/batch_invariant.h"
 #include "distributed/process_protocol.h"
 
 #include <algorithm>
@@ -49,6 +50,7 @@ struct DeviceRuntime {
     bool cudaGraph;
     bool customAllReduce;
     bool prefixCache;
+    bool batchInvariant = false;
 #ifdef FASTLLM_PROCESS_TP_CUDA
     cudaStream_t stream = nullptr;
     ncclComm_t comm = nullptr;
@@ -169,6 +171,8 @@ struct DeviceRuntime {
         if (moe && customAllReduce) {
             throw std::runtime_error("MoE execution requires NCCL");
         }
+        if (batchInvariant && !moe)
+            throw std::runtime_error("batch-invariant currently supports Qwen2 MoE only");
         fastllm::distributed::Qwen3ShardLoader loader(directory, rank, world,
             moe ? fastllm::distributed::ShardModel::Qwen2Moe : fastllm::distributed::ShardModel::DenseQwen3);
         weights = std::make_unique<fastllm::distributed::Qwen3DeviceWeights>(
@@ -177,6 +181,12 @@ struct DeviceRuntime {
         Put32(result, weights->TensorCount());
         Put64(result, weights->DeviceBytes());
         Put64(result, weights->SourceBytesRead());
+        if (batchInvariant) {
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(
+                *weights, stream, comm, *allReduce, cudaGraph, prefixCache, true);
+            Put32(result, 1);
+            for (auto value : fastllm::distributed::MoeBatchInvariantConfig()) Put32(result, value);
+        }
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -270,7 +280,7 @@ struct DeviceRuntime {
         if (offset != payload.size()) throw std::runtime_error("trailing MoE payload");
         if (!layerExecutor) {
             layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(
-                *weights, stream, comm, *allReduce);
+                *weights, stream, comm, *allReduce, false, false, batchInvariant);
         }
         auto output = layerExecutor->ForwardMoe(Get32(payload, 0), tokens, capacity, position,
             static_cast<fastllm::distributed::Qwen3LayerStage>(Get32(payload, 8)), input);
@@ -331,7 +341,7 @@ struct DeviceRuntime {
         }
         if (offset != payload.size()) throw std::runtime_error("trailing joint MoE payload");
         if (!layerExecutor) layerExecutor = std::make_unique<Qwen3LayerExecutor>(
-            *weights, stream, comm, *allReduce, cudaGraph, prefixCache);
+            *weights, stream, comm, *allReduce, cudaGraph, prefixCache, batchInvariant);
         auto logits = layerExecutor->StepMoe(local, graph);
         std::vector<uint8_t> result;
         Put32(result, logits.size());
@@ -366,7 +376,7 @@ struct DeviceRuntime {
             memcpy(&input[i], &bits, sizeof(bits));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph, prefixCache);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph, prefixCache, batchInvariant);
         }
         auto output = layerExecutor->Forward(Get32(payload, 0), Get32(payload, 4), Get32(payload, 8),
             Get32(payload, 12), static_cast<fastllm::distributed::Qwen3LayerStage>(Get32(payload, 16)), input);
@@ -405,7 +415,7 @@ struct DeviceRuntime {
             ids.push_back(Get32(payload, offset));
         }
         if (!layerExecutor) {
-            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph, prefixCache);
+            layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(*weights, stream, comm, *allReduce, cudaGraph, prefixCache, batchInvariant);
         }
         auto logits = decode ? layerExecutor->Decode(Get32(payload, 0)) :
             begin ? layerExecutor->BeginRequest(ids, Get32(payload, 8), Get32(payload, 0)) :
@@ -447,7 +457,7 @@ struct DeviceRuntime {
 #ifdef FASTLLM_PROCESS_TP_CUDA
         if ((clearPrefix || preparePrefix) && prefixCache && weights && !layerExecutor) {
             layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(
-                *weights, stream, comm, *allReduce, cudaGraph, prefixCache);
+                *weights, stream, comm, *allReduce, cudaGraph, prefixCache, batchInvariant);
         }
         if (end && layerExecutor) {
             layerExecutor->EndRequest();
@@ -499,6 +509,7 @@ struct DeviceRuntime {
             Put32(result, info.prefix.backend.size());
             result.insert(result.end(), info.prefix.backend.begin(), info.prefix.backend.end());
         }
+        if (batchInvariant) Put64(result, info.expertGemmSubmissions);
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
@@ -538,7 +549,7 @@ int main(int argc, char **argv) {
                 throw std::runtime_error("invalid/duplicate worker arguments");
             }
         }
-        if (args.size() != 10 + args.count("--page-size") + args.count("--tokens") || args.at("--control-fd") != uint64_t(kWorkerFd) ||
+        if (args.size() != 10 + args.count("--page-size") + args.count("--tokens") + args.count("--batch-invariant") || args.at("--control-fd") != uint64_t(kWorkerFd) ||
             args.at("--world-size") == 0 || args.at("--world-size") > 1024 ||
             args.at("--rank") >= args.at("--world-size") || args.at("--device") > INT_MAX ||
             args.at("--control-only") > 1 || args.at("--cuda-graph") > 1 || args.at("--custom-allreduce") > 1 ||
@@ -548,6 +559,9 @@ int main(int argc, char **argv) {
             args.at("--parent-pid") > INT_MAX || args.at("--session") == 0) {
             throw std::runtime_error("invalid worker identity");
         }
+        if (args.count("--batch-invariant") && (args.at("--batch-invariant") > 1 ||
+            (args.at("--batch-invariant") && args.at("--control-only"))))
+            throw std::runtime_error("invalid batch-invariant worker mode");
         session = args.at("--session");
         rank = static_cast<int>(args.at("--rank"));
         pid_t parentPid = static_cast<pid_t>(args.at("--parent-pid"));
@@ -581,7 +595,8 @@ int main(int argc, char **argv) {
         int world = static_cast<int>(args.at("--world-size"));
         int device = static_cast<int>(args.at("--device"));
         DeviceRuntime runtime{args.at("--control-only") != 0, args.at("--cuda-graph") != 0,
-                              args.at("--custom-allreduce") != 0, args.at("--prefix-cache") != 0};
+                              args.at("--custom-allreduce") != 0, args.at("--prefix-cache") != 0,
+                              args.count("--batch-invariant") && args.at("--batch-invariant") != 0};
 #ifdef FASTLLM_PROCESS_TP_CUDA
         for (const auto &name : {"--page-size", "--tokens"}) {
             if (args.count(name) && (!args.at(name) || args.at(name) > INT_MAX))

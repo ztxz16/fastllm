@@ -118,7 +118,8 @@ def prefill(args, output, job, active_ranks, vocab, *, block_trace=False):
     environment.update({BLOCK_ENV: str(traces)} if block_trace else {TRACE_ENV: str(traces), LIMIT_ENV: '256'})
     with RoundTransport(args.build / 'fastllm_moe_generate', args.build / 'fastllm_tp_worker',
             args.model, '0,1,2,3', output / 'native', timeout=args.timeout,
-            cuda_graph=False, prefix_cache=False, environment=environment) as session:
+            cuda_graph=False, prefix_cache=False, environment=environment,
+            batch_invariant=getattr(args, 'batch_invariant', False)) as session:
         for repeat in (1, 2):
             steps = [dict(action=1, token_ids=job['token_ids'], position_begin=0,
                 capacity=len(job['token_ids']) + job['max_new_tokens'] - 1,

@@ -561,6 +561,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         dest = "speculative_dspark_confidence_threshold", type = float, default = 0.5,
                         help = "DSpark confidence 前缀阈值，范围 [0,1]；0 表示固定验证完整 block")
     parser.add_argument("--triton", action = "store_true", help = "启用Triton CUDA算子")
+    parser.add_argument("--batch-invariant", action="store_true",
+                        help="Attention DP/EP：启用固定 SM70 专家 GEMM 候选，完整模型一致性须独立验收")
     
     parser.add_argument('--custom', type = str, default = "", help = '指定描述自定义模型的python文件')
     parser.add_argument('--lora', type = str, default = "", help = '指定lora路径')

@@ -19,8 +19,9 @@ public:
      * @param allReduce 与执行器共享 stream 的规约器；须晚于全部请求图释放。
      * @param cudaGraph true 时单 token Decode 使用严格 CUDA Graph；Prefill 保持 Eager。
      * @param prefixCache 是否保留跨请求Prompt前缀；Qwen3使用FT共享页面，MoE保持连续快照。
+     * @param batchInvariant 固定 SM70 专家 GEMM；加载时验证支持条件，失败不回退。
      */
-    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph = false, bool prefixCache = false);
+    Qwen3LayerExecutor(const Qwen3DeviceWeights &weights, cudaStream_t stream, ncclComm_t comm, ProcessAllReduce &allReduce, bool cudaGraph = false, bool prefixCache = false, bool batchInvariant = false);
     ~Qwen3LayerExecutor();
     Qwen3LayerExecutor(const Qwen3LayerExecutor&) = delete;
     Qwen3LayerExecutor &operator=(const Qwen3LayerExecutor&) = delete;

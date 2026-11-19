@@ -1748,6 +1748,10 @@ GPU 上传、单层计算，最后执行 MoE
 本阶段是功能检查（warmup=0、iterations=1、repeats=1），不报告性能加速比。
 任一 case 失败返回非零，已执行部分仍生成报告。服务器全部通过后才推进阶段 3。
 
+## Attention DP/EP 后续优化：保持批次不变性的 Split-K（待实现）
+
+优化目标、批次不变性约束和验收要求见 [Attention DP/EP 专门文档](ATTENTION_EP.md#attention-dpep-后续优化保持批次不变性的-split-k待实现)。
+
 ## 普通 DP 负载与 KV 压力路由
 
 普通进程 DP>1 未指定 `--dp-routing` 时使用 `load`；显式 `round_robin`、`prefix`

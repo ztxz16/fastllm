@@ -1,5 +1,6 @@
 #include "distributed/qwen3_limits.h"
 #include "distributed/process_group.h"
+#include "distributed/batch_invariant.h"
 #include "process_protocol.h"
 
 #include <algorithm>
@@ -575,6 +576,10 @@ struct ProcessGroup::Impl {
                     if (!info.prefix.pageLen || !info.prefix.maxPages || info.prefix.deviceBytes > info.prefix.poolBytes ||
                         info.deviceBytes > info.prefix.poolBytes) throw std::runtime_error("invalid FT paged resources");
                 }
+                if (options.batchInvariant) {
+                    info.expertGemmSubmissions = Get64(bytes, offset);
+                    offset += 8;
+                }
                 if (offset != bytes.size()) throw std::runtime_error("trailing Qwen3 prefix directory bytes");
                 const auto &prefix = info.prefix;
                 const auto &ar = info.allReduce;
@@ -682,6 +687,7 @@ struct ProcessGroup::Impl {
             "--cuda-graph", options.cudaGraph ? "1" : "0",
             "--custom-allreduce", options.customAllReduce ? "1" : "0",
             "--prefix-cache", options.prefixCache ? "1" : "0"};
+        if (options.batchInvariant) { args.push_back("--batch-invariant"); args.push_back("1"); }
         if (options.pageSize) { args.push_back("--page-size"); args.push_back(std::to_string(options.pageSize)); }
         if (options.cacheTokens) { args.push_back("--tokens"); args.push_back(std::to_string(options.cacheTokens)); }
         std::vector<char*> argv;
@@ -830,7 +836,7 @@ void ProcessGroup::Start(const ProcessGroupOptions &options) {
         unique.size() != options.devices.size() || *unique.begin() < 0 ||
         options.startupTimeoutMs <= 0 || options.operationTimeoutMs <= 0 ||
         options.shutdownTimeoutMs <= 0 || options.heartbeatIntervalMs <= 0 ||
-        (options.controlOnly && (options.cudaGraph || options.customAllReduce || options.prefixCache)) ||
+        (options.controlOnly && (options.cudaGraph || options.customAllReduce || options.prefixCache || options.batchInvariant)) ||
         (options.customAllReduce && options.devices.size() != 2)) {
         throw std::invalid_argument("invalid process TP worker path, devices or timeout");
     }
@@ -986,14 +992,29 @@ std::vector<ProcessModelInfo> ProcessGroup::LoadModel(const std::string &directo
         if (moe && impl->options.customAllReduce) {
             throw std::invalid_argument("MoE execution requires NCCL");
         }
+        if (impl->options.batchInvariant && !moe)
+            throw std::invalid_argument("batch-invariant currently supports Qwen2 MoE only");
         auto replies = impl->Exchange(moe ? Kind::LoadQwenMoe : Kind::LoadQwen3, Kind::ModelLoaded, payload,
                                       Clock::now() + std::chrono::milliseconds(timeoutMs));
         std::vector<ProcessModelInfo> results;
         for (const auto &reply : replies) {
-            if (reply.payload.size() != 20 || !Get32(reply.payload, 0) || !Get64(reply.payload, 4)) {
+            const auto expectedConfig = MoeBatchInvariantConfig();
+            const size_t expectedSize = impl->options.batchInvariant ? 24 + 4 * expectedConfig.size() : 20;
+            if (reply.payload.size() != expectedSize || !Get32(reply.payload, 0) || !Get64(reply.payload, 4)) {
                 throw std::runtime_error("invalid Qwen3 loading result");
             }
             results.push_back({Get32(reply.payload, 0), Get64(reply.payload, 4), Get64(reply.payload, 12)});
+            if (impl->options.batchInvariant) {
+                if (Get32(reply.payload, 20) != 1)
+                    throw std::runtime_error("worker did not enable requested batch-invariant mode");
+                std::vector<uint32_t> actual;
+                for (size_t i = 0; i < expectedConfig.size(); ++i)
+                    actual.push_back(Get32(reply.payload, 24 + 4 * i));
+                if (actual != expectedConfig)
+                    throw std::runtime_error("worker batch-invariant GEMM configuration mismatch");
+                results.back().batchInvariant = true;
+                results.back().batchInvariantConfig = actual;
+            }
         }
         impl->moeModel = moe;
         return results;

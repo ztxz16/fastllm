@@ -16,12 +16,20 @@ from .qwen3_process_chat import validate_request
 from .qwen3_process_session import (Qwen3ProcessSession, GenerationCancelled,
                                     GenerationObserverError)
 from .tp_process_utils import isolated_process, wait_case
+from .moe_batch_invariant import validate_ready as validate_batch_invariant_ready
 
 BACKEND = 'qwen_moe_attention_dp_ep'
 
 
 class RoundTransport(Qwen3ProcessSession):
     """/** 复用有界帧与进程组回收；取消在联合轮次边界执行，不发送 dense TP 数据报。 */"""
+
+    def __init__(self, *args, batch_invariant=False, **kwargs):
+        """/** 固定本进程组计算模式；后续请求不得切换，缓存跟随既有组生命周期。 */"""
+        if type(batch_invariant) is not bool:
+            raise ValueError('batch_invariant must be boolean')
+        super().__init__(*args, **kwargs)
+        self.batch_invariant = batch_invariant
 
     def _send_cancel(self):
         pass
@@ -38,6 +46,8 @@ class RoundTransport(Qwen3ProcessSession):
                        '--devices', ','.join(map(str, self.devices)), '--session-fd', str(child.fileno()),
                        '--cuda-graph', str(int(self.cuda_graph)), '--prefix-cache', str(int(self.prefix_cache)),
                        '--timeout-ms', str(max(1, int(self.timeout * 1000)))]
+            if self.batch_invariant:
+                command += ['--batch-invariant', '1']
             (self.output / 'command.txt').write_text(shlex.join(command) + '\n')
             stdout = self._stack.enter_context((self.output / 'native.stdout.log').open('wb'))
             stderr = self._stack.enter_context((self.output / 'native.stderr.log').open('wb'))
@@ -53,6 +63,7 @@ class RoundTransport(Qwen3ProcessSession):
                         for i, (w, d) in enumerate(zip(workers, self.devices))) or
                     len({w['pid'] for w in workers}) != len(workers)):
                 raise RuntimeError('invalid Attention DP/EP startup response')
+            validate_batch_invariant_ready(self.ready, self.batch_invariant)
             (self.output / 'ready.json').write_text(json.dumps(self.ready, indent=2))
             self.state = 'ready'
             return self
@@ -89,7 +100,7 @@ class QwenMoeProcessSession:
 
     def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False,
                  cuda_graph=False, prefix_cache=False, routing='round_robin', queue_size=8,
-                 request_log=True, environment=None, trace_token_positions=None):
+                 request_log=True, environment=None, trace_token_positions=None, batch_invariant=False):
         if trace_token_positions is not None:
             if (not trace or not isinstance(trace_token_positions, (list, tuple)) or
                     not trace_token_positions or any(type(x) is not int or x < 1 for x in trace_token_positions) or
@@ -101,7 +112,9 @@ class QwenMoeProcessSession:
         if type(queue_size) is not int or queue_size < 1:
             raise ValueError('queue_size must be positive')
         self._transport = RoundTransport(binary, worker, model, devices, output, timeout=timeout,
-            cuda_graph=cuda_graph, prefix_cache=prefix_cache, request_log=request_log, environment=environment)
+            cuda_graph=cuda_graph, prefix_cache=prefix_cache, request_log=request_log, environment=environment,
+            batch_invariant=batch_invariant)
+        self.batch_invariant = batch_invariant
         self.concurrency = len(self._transport.devices)
         if self.concurrency not in (1, 2, 4):
             raise ValueError('Attention DP/EP requires 1, 2 or 4 ranks')

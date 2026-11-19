@@ -21,6 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', type=Path, required=True)
     parser.add_argument('--binary', type=Path, required=True)
+    parser.add_argument('--batch-invariant', action='store_true')
     parser.add_argument('--worker', type=Path, required=True)
     parser.add_argument('--build-cache', type=Path, required=True)
     parser.add_argument('--timeout', type=float, default=1800)
@@ -34,6 +35,8 @@ def main():
         '--cuda-graph', '--prefix-cache', 'true', '--dp-routing', 'prefix',
         '--tp-output', str(directory), '--tp-timeout', str(args.timeout), '--tp-request-timeout', '30',
         '--tp-queue-size', '2', '--host', '127.0.0.1', '--port', '0', '--model_name', 'moe']
+    if args.batch_invariant:
+        command += ['--batch-invariant']
     environment = dict(os.environ, PYTHONPATH=str(ROOT / 'tools'), PYTHONNOUSERSITE='1')
     payload = dict(model='moe', messages=[dict(role='user', content='请用一句话介绍北京。')],
                    max_tokens=8, temperature=0, top_k=0, top_p=1, seed=20261114)

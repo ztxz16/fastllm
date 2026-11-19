@@ -114,6 +114,45 @@ __global__ void Scatter(const half *values, const int *map, const half *prob, ha
     }
 }
 
+/**
+ * 按设备端有效行数聚合专家输入，尾部填零，复用 Graph 固定地址及路由索引。
+ * @param input 连续 FP16 [rows,hidden] 全组激活。
+ * @param map int32 [rows] 专家路由槽位，只有前 count 行有效。
+ * @param count 设备端单个 int32 有效行数，由正式 Index 生成。
+ * @param output FP16 [rows,hidden] 固定容量输出。
+ * @param rows 全组固定容量，不随本轮专家命中数变化。
+ * @param hidden 输入宽度。
+ * @param topk 每 Token 的路由槽位数。
+ */
+__global__ void PackMasked(const half *input, const int *map, const int *count, half *output,
+                           int rows, int hidden, int topk) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * hidden) {
+        int row = i / hidden;
+        output[i] = row < *count ? input[(map[row] / topk) * hidden + i % hidden] : __float2half_rn(0);
+    }
+}
+
+/**
+ * 仅将设备端有效行写回独占路由槽位；保持正式 Scatter 的 FP16 加权舍入边界。
+ * @param values FP16 [rows,hidden] 专家结果，尾部不得参与贡献。
+ * @param map int32 [rows] 路由槽位，仅前 count 行有效。
+ * @param count 设备端 int32 有效行数。
+ * @param prob FP16 [rows,topk] 原始路由概率。
+ * @param contributions FP16 [rows,topk,hidden]，调用前整组置零。
+ * @param rows 全组固定容量。
+ * @param hidden 输出宽度。
+ */
+__global__ void ScatterMasked(const half *values, const int *map, const int *count,
+                              const half *prob, half *contributions, int rows, int hidden) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * hidden && i / hidden < *count) {
+        int slot = map[i / hidden];
+        contributions[size_t(slot) * hidden + i % hidden] = __float2half_rn(
+            __half2float(values[i]) * __half2float(prob[slot]));
+    }
+}
+
 /** 查询当前 Token 对指定专家的路由槽位；未命中（包括空闲 padding）返回 -1。 */
 __device__ int Slot(const int *ids, int row, int topk, int expert) {
     for (int k = 0; k < topk; ++k) if (ids[row * topk + k] == expert) return row * topk + k;
