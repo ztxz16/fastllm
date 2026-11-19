@@ -1574,13 +1574,20 @@ struct MLAPlanInfo {
   }
 };
 
+// Capture owners can keep the schedule and partial results in private storage.
+struct MLAHostWorkspace {
+  std::vector<uint8_t> metadata;
+  size_t partial_bytes;
+};
+
 template <typename IdType>
 inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
                            void* int_buffer, void* page_locked_int_buffer,
                            size_t int_workspace_size_in_bytes, MLAPlanInfo& plan_info,
                            IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
                            uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
-                           bool causal, cudaStream_t stream, bool compact = false) {
+                           bool causal, cudaStream_t stream, bool compact = false,
+                           MLAHostWorkspace* host_workspace = nullptr) {
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1752,7 +1759,8 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   auto kv_start_vec = flatten(cluster_kv_start, total_num_works);
   auto kv_end_vec = flatten(cluster_kv_end, total_num_works);
 
-  AlignedAllocator int_allocator(int_buffer, int_workspace_size_in_bytes);
+  AlignedAllocator int_allocator = host_workspace ? AlignedAllocator()
+                                                  : AlignedAllocator(int_buffer, int_workspace_size_in_bytes);
   plan_info.q_indptr_offset =
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_q_indptr");
   plan_info.kv_indptr_offset =
@@ -1781,6 +1789,11 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
       int_allocator.aligned_alloc_offset(sizeof(IdType) * max_total_num_works, 16, "mla_kv_end");
   plan_info.work_indptr_offset = int_allocator.aligned_alloc_offset(
       sizeof(IdType) * (compact ? num_clusters + 1 : max_total_num_works), 16, "mla_work_indptr");
+
+  if (host_workspace) {
+    host_workspace->metadata.resize(int_allocator.num_allocated_bytes());
+    page_locked_int_buffer = host_workspace->metadata.data();
+  }
 
   IdType* cluster_q_indptr_h =
       GetPtrFromBaseOffset<IdType>(page_locked_int_buffer, plan_info.q_indptr_offset);
@@ -1831,17 +1844,20 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   std::copy(kv_end_vec.begin(), kv_end_vec.end(), cluster_kv_end_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), cluster_work_indptr_h);
 
-  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
-                                       cudaMemcpyHostToDevice, stream));
+  if (!host_workspace) {
+    FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer,
+                                         int_allocator.num_allocated_bytes(), cudaMemcpyHostToDevice, stream));
+  }
 
   constexpr size_t sizeof_dtype_o = 2;
-  AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);
+  AlignedAllocator float_allocator = host_workspace ? AlignedAllocator()
+                                                    : AlignedAllocator(float_buffer, float_workspace_size_in_bytes);
   plan_info.partial_o_offset = float_allocator.aligned_alloc_offset(
       2 * num_clusters * cluster_tile_q * sizeof_dtype_o * head_dim_o, 16, "mla_partial_o");
   plan_info.partial_lse_offset = float_allocator.aligned_alloc_offset(
       2 * num_clusters * cluster_tile_q * sizeof(float), 16, "mla_partial_lse");
 
+  if (host_workspace) host_workspace->partial_bytes = float_allocator.num_allocated_bytes();
   return cudaSuccess;
 }
 
