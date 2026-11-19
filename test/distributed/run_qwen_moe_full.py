@@ -185,6 +185,7 @@ class Suite:
             correctness='teacher-forced full logits; synthetic atol=rtol=.008, real atol=.05 rtol=.01',
             performance='end-to-end concurrent batch including admission and KV release; no token logs/trace; Eager/Graph use identical requests and EOS policy',
             report_title='Attention DP + EP full model')
+        self.metadata['batch_invariant'] = getattr(args, 'batch_invariant', False)
 
     def case(self, name, action, *, failure_evidence=None):
         """/** action共享误差累计器；可选failure_evidence在异常或中断后保存已采集证据。 */"""
@@ -245,10 +246,11 @@ class Suite:
     def session(self, model, world, graph=False, prefix=False, trace=True, routing='round_robin'):
         """/** 新建独立权重生命周期，不复用旧结果目录；不自动编译或下载。 */"""
         self.counter += 1
+        mode = {'batch_invariant': True} if getattr(self.args, 'batch_invariant', False) else {}
         return QwenMoeProcessSession(self.args.binary, self.args.worker, model,
             ','.join(map(str, range(world))), self.output / f'session-{self.counter:04d}',
             cuda_graph=graph, prefix_cache=prefix, routing=routing, timeout=self.args.timeout,
-            trace=trace, request_log=trace, queue_size=16)
+            trace=trace, request_log=trace, queue_size=16, **mode)
 
     def generation_alignment(self, model, requests, tokenizer):
         """/**
@@ -600,6 +602,11 @@ class Suite:
                             raw.append(elapsed)
                             responses.append(result)
                     record['states'] = session._states
+                    if getattr(self.args, 'batch_invariant', False):
+                        from fastllm_pytools.moe_batch_invariant import BACKEND as GEMM_BACKEND
+                        require(all(s.get('expert_gemm_submissions', 0) > 0 and
+                                    s.get('expert_gemm_backend') == GEMM_BACKEND for s in session._states),
+                                'benchmark missed requested SM70 expert GEMM backend')
                     if graph:
                         require(all(s['replays'] > 0 and s['captures'] == 1 for s in session._states), 'benchmark missed Graph')
                     evidence = session._states
@@ -741,6 +748,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--worker', type=Path, required=True)
+    parser.add_argument('--batch-invariant', action='store_true', help='使用正式 SM70 专家 GEMM 候选；不替代全链路验收')
     parser.add_argument('--build-cache', type=Path, required=True)
     parser.add_argument('--model', type=Path, help='真实Qwen1.5-MoE目录；省略则运行小模型及生命周期')
     parser.add_argument('--requests', type=Path, default=ROOT / 'test/distributed/data/qwen_moe_requests.jsonl')

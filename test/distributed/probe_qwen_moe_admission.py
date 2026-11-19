@@ -122,6 +122,7 @@ def main():
     """/** 固定准入组合逐批采集；同历史logits只作诊断，Token不同或采集异常保留FAIL与部分报告。 */"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', type=Path, required=True)
+    parser.add_argument('--batch-invariant', action='store_true')
     parser.add_argument('--build', type=Path, default=Path('build-attention-ep-cu126'))
     parser.add_argument('--prompt-length', type=int, default=1024)
     parser.add_argument('--output-tokens', type=int, default=128)
@@ -179,7 +180,7 @@ def main():
                 try:
                     with RoundTransport(args.build / 'fastllm_moe_generate', args.build / 'fastllm_tp_worker',
                             args.model, '0,1,2,3', directory / 'native', timeout=args.timeout,
-                            cuda_graph=graph, prefix_cache=False) as session:
+                            cuda_graph=graph, prefix_cache=False, batch_invariant=args.batch_invariant) as session:
                         _, previous = collect_schedule(session, job, wave, graph, args.trace_tokens, vocab,
                                                        directory / 'warmup', session.ready['states'])
                         for repeat in range(1, args.repeats+1):

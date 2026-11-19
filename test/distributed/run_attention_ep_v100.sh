@@ -16,6 +16,11 @@ export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES-0,1,2,3}"
 moe_common=(--binary "$moe_build/fastllm_moe_generate" --worker "$moe_build/fastllm_tp_worker"
             --build-cache "$moe_build/CMakeCache.txt")
+case "${ATTENTION_EP_BATCH_INVARIANT:-0}" in
+    0) ;;
+    1) moe_common+=(--batch-invariant) ;;
+    *) echo 'ATTENTION_EP_BATCH_INVARIANT 必须为 0 或 1' >&2; exit 2 ;;
+esac
 
 case "$moe_stage" in
     build)
@@ -36,7 +41,31 @@ PY
             -DCMAKE_CUDA_COMPILER="$CUDACXX" -DCUDA_ARCH=70
         cmake --build "$moe_build" --target fastllm_process_tp_package fastllm_moe_layer_check \
             fastllm_tp_decode_check fastllm_tp_prefill_check fastllm_tp_model_check fastllm_tp_layer_check \
-            fastllm_tp_shard_check -j "${ATTENTION_EP_JOBS:-4}"
+            fastllm_tp_shard_check fastllm_sm70_expert_gemm_check -j "${ATTENTION_EP_JOBS:-4}"
+        ;;
+    invariant-gemm)
+        moe_replay=()
+        [[ -z "${ATTENTION_EP_MOE_BASELINE:-}" ]] || moe_replay+=(--baseline "$ATTENTION_EP_MOE_BASELINE")
+        "$moe_python" test/distributed/run_sm70_expert_gemm.py --build "$moe_build" --model "$moe_model" "${moe_replay[@]}"
+        ;;
+    invariant)
+        read -r -a moe_invariant_lengths <<< "${ATTENTION_EP_INVARIANT_PROMPT_LENGTHS:-512 1024 1792}"
+        "$moe_python" test/distributed/run_qwen_moe_batch_invariant.py --build "$moe_build" --model "$moe_model" \
+            --prompt-lengths "${moe_invariant_lengths[@]}"
+        ;;
+    invariant-admission)
+        "$moe_python" test/distributed/probe_qwen_moe_admission.py --build "$moe_build" --model "$moe_model" --batch-invariant
+        ;;
+    invariant-trace)
+        "$moe_python" test/distributed/run_qwen_moe_batch_trace.py --build "$moe_build" --model "$moe_model"
+        ;;
+    invariant-performance)
+        read -r -a moe_perf_lengths <<< "${ATTENTION_EP_PERF_PROMPT_LENGTHS:-512 1024 1792}"
+        read -r -a moe_perf_caches <<< "${ATTENTION_EP_PERF_CACHE_STATES:-off cold hot}"
+        read -r -a moe_perf_concurrencies <<< "${ATTENTION_EP_PERF_CONCURRENCIES:-1 4 8}"
+        "$moe_python" test/distributed/run_qwen_moe_batch_performance.py --build "$moe_build" --model "$moe_model" \
+            --prompt-lengths "${moe_perf_lengths[@]}" --output-tokens "${ATTENTION_EP_PERF_OUTPUT_TOKENS:-128}" \
+            --cache-states "${moe_perf_caches[@]}" --concurrencies "${moe_perf_concurrencies[@]}"
         ;;
     synthetic)
         "${ATTENTION_EP_REFERENCE_PYTHON:-$moe_python}" test/distributed/run_parallel_config.py --execution-tests --benchmark-tests
@@ -78,7 +107,7 @@ PY
         "$moe_python" test/distributed/run_qwen3_decode.py --check "$moe_build/fastllm_tp_decode_check" "${moe_dense[@]}" --cuda-graph
         "$moe_python" test/distributed/run_attention_ep_dense_regression.py --build "$moe_build"
         ;;
-    *) echo 'usage: bash test/distributed/run_attention_ep_v100.sh {build|synthetic|reproduce CASE [REPEAT]|real|real-exact|real-numeric|real-all|http|performance|regression}' >&2; exit 2 ;;
+    *) echo 'usage: bash test/distributed/run_attention_ep_v100.sh {build|invariant-gemm|invariant|invariant-trace|invariant-admission|invariant-performance|synthetic|reproduce CASE [REPEAT]|real|real-exact|real-numeric|real-all|http|performance|regression}' >&2; exit 2 ;;
 esac
 if [[ "$moe_stage" == reproduce ]]; then
     echo 'PASS: reproduce（仅定向复现，不代表完整验收通过）；结果见本次summary.json。'

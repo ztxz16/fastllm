@@ -758,6 +758,12 @@ if (BUILD_PROCESS_TP)
         target_link_libraries(fastllm_tp_layer PUBLIC fastllm_tp_device_weights
             ${FASTLLM_PROCESS_CUBLAS} ${FASTLLM_PROCESS_CUBLASLT} nccl)
         target_link_libraries(fastllm_tp_worker PRIVATE fastllm_tp_layer)
+        add_executable(fastllm_sm70_expert_gemm_check tools/src/sm70_expert_gemm_check.cu
+            src/distributed/sm70_expert_gemm.cu third_party/json11/json11.cpp)
+        target_include_directories(fastllm_sm70_expert_gemm_check PRIVATE
+            ${PROJECT_SOURCE_DIR}/third_party/cutlass/include ${PROJECT_SOURCE_DIR}/third_party/json11)
+        set_target_properties(fastllm_sm70_expert_gemm_check PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_link_libraries(fastllm_sm70_expert_gemm_check PRIVATE ${FASTLLM_PROCESS_CUBLAS} ${FASTLLM_PROCESS_CUDART})
         add_executable(fastllm_tp_model_check tools/src/tp_model_check.cpp)
         target_include_directories(fastllm_tp_model_check PRIVATE ${PROJECT_SOURCE_DIR}/third_party/json11)
         target_link_libraries(fastllm_tp_model_check PRIVATE fastllm_process_tp fastllm_tp_weights)
