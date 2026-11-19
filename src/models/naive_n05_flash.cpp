@@ -1294,7 +1294,11 @@ Data NaiveN05FlashModel::RunTarget(
             else prepareIndexQuery(normed, positions, batchIndexQ, batchIndexWeights);
         }
         const bool broadcastBatchIndex = (indexerLayerSharding || separateIndex) && batchRopePrepared && batchNeedsIndex;
+        // Packed output views live for this layer only. Eager verification and
+        // a later long prefill may use the same per-request workspace.
+        std::vector<Data> packedIndices;
         if (broadcastBatchIndex || batchVerifyIndex) {
+            packedIndices.resize(batch->Size());
             // One contiguous TopK exchange per layer, independent of the number
             // of requests. Graph shapes share the largest warmup allocation.
             buf.indexBroadcast.dataType = INT32;
@@ -1304,8 +1308,7 @@ Data NaiveN05FlashModel::RunTarget(
             int offset = 0;
             for (int sequence = 0; sequence < batch->Size(); ++sequence) {
                 const int rows = batchVerifyIndex ? batch->lengths[sequence] : 1;
-                Data &indices = buf.sequences[sequence]->indices;
-                indices.FreeSpace(); // Fake views do not own their allocation.
+                Data &indices = packedIndices[sequence];
                 indices.Resize({rows, indexTopK});
                 indices.FakeFrom(buf.indexBroadcast, (size_t)offset * indexTopK * sizeof(int));
                 offset += rows;
@@ -1319,7 +1322,8 @@ Data NaiveN05FlashModel::RunTarget(
                 auto &part = *buf.sequences[sequence];
                 if (part.capacity > indexTopK)
                     rows.push_back({indexCache(sequence),
-                        &part.decode, &part.indices, sequence, part.capacity, indexTable(sequence)});
+                        &part.decode, packedIndices.empty() ? &part.indices : &packedIndices[sequence],
+                        sequence, part.capacity, indexTable(sequence)});
             }
             const int ranks = tensorParallel ? AttentionTPSize() : 1;
             const bool contextParallel = !attentionParallel && !indexerLayerSharding && !contextSharded && !verifying && decodeWorkspace && ranks > 1 &&
@@ -1360,7 +1364,7 @@ Data NaiveN05FlashModel::RunTarget(
                     indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
                     FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights,
                         *indexCache(sequence), part.liveKeys,
-                        part.capacity, indexFp8, part.decode, part.indices, indexTable(sequence));
+                        part.capacity, indexFp8, part.decode, packedIndices[sequence], indexTable(sequence));
                 }
             }
             if (indexerLayerSharding)
@@ -1396,7 +1400,6 @@ Data NaiveN05FlashModel::RunTarget(
         const bool dpPrefill = attentionParallel && AttentionTPSize() == 1 && batch &&
             !batch->Decode() && !decodeWorkspace && !verifying && !sparseLayer &&
             !slidingLayers[layer];
-        std::vector<Data> packedIndices;
         if (dpPrefill && reuseAttention && !indexerLayerSharding && indexTopK > 0 &&
             int64_t(qkv.dims.back()) - int64_t(cfg.heads) * cfg.valueDim >= 2LL * indexTopK) {
             // The Indexer runs after every packed QKV row has been consumed.
