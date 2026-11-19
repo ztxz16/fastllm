@@ -4356,6 +4356,22 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                     auto *stagedValue = stagedKey + (size_t)rows * key.dims[2];
                     FastllmCudaNaiveReadCache({{&key, stagedKey, first, rows},
                                              {&value, stagedValue, first, rows}});
+#ifdef FASTLLM_NAIVE_SWA_FLASHINFER
+                    const int arch = FastllmCudaRuntimeArch();
+                    if ((arch == 100 || arch == 103) && queries >= 8192 && value.dims[2] == kvHeads * valueDim &&
+                        FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) {
+                        // The staged view starts at the oldest visible key. Its
+                        // right-aligned causal window is identical to the cache's.
+                        auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
+                            stagedKey, stagedValue, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                            (BF16 *)output.cudaData, queries, rows, heads, kvHeads, key.dims[2],
+                            cudaStreamPerThread, arch);
+                        AssertInFastLLM(status == cudaSuccess,
+                            std::string("Naive staged SWA prefill: ") + cudaGetErrorString(status));
+                        CheckLaunch();
+                        return;
+                    }
+#endif
                     readKey = FastllmNaiveKV(stagedKey);
                     readValue = FastllmNaiveKV(stagedValue);
                     readKeys = rows; readPast = pastLength - first;

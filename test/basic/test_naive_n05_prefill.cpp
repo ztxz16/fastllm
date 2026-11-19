@@ -257,11 +257,11 @@ static void TestIndexerRaggedShards() {
     }
 }
 
-// Compare the scratch-backed FP8 expansion with direct FP8 attention exactly.
+// Compare scratch-backed FP8 expansion with the direct attention path.
 // Insufficient workspace must retain the same result without resizing storage.
 static void TestSwaPrefillScratch() {
     for (auto shape : {std::vector<int>{1025, 127, 16}, {4096, 65536, 64},
-                       {1025, 64, 16}, {4096, 0, 64}}) {
+                       {1025, 64, 16}, {4096, 0, 64}, {8193, 193, 16}}) {
         const int rows=shape[0], past=shape[1], heads=shape[2], kvHeads=heads/8, keys=past+rows;
         const int keyStride=kvHeads*192+16, valueStride=kvHeads*128;
         Data q(BFLOAT16), key(FP8_E4M3), value(FP8_E4M3), sink(FLOAT32), indices(INT32), reference, actual;
@@ -289,7 +289,22 @@ static void TestSwaPrefillScratch() {
             for (bool full : {true,false}) {
                 scratch.Resize({(int)(full?elements:elements-1)});
                 FastllmCudaNaiveAttention(q,key,value,indices,sink,heads,kvHeads,192,128,past,128,actual,true,&scratch);
-                Require(Read<uint16_t>(actual)==expected,"SWA prefill scratch changed BF16 output bits");
+                const auto got = Read<uint16_t>(actual);
+                if (rows >= 8192 && full) {
+                    double norm = 0, error = 0, maxAbs = 0;
+                    for (size_t i = 0; i < got.size(); ++i) {
+                        const double value = FromBits(expected[i]), delta = FromBits(got[i]) - value;
+                        Require(std::isfinite(delta), "nonfinite staged SWA output");
+                        norm += value * value;
+                        error += delta * delta;
+                        maxAbs = std::max(maxAbs, std::abs(delta));
+                    }
+                    double l2 = std::sqrt(error / std::max(norm, 1e-30));
+                    std::printf("Long staged SWA: relL2 %.6f maxAbs %.6f\n", l2, maxAbs);
+                    Require(l2 < .008 && maxAbs < .02, "long staged SWA exceeded BF16 error budget");
+                } else {
+                    Require(got == expected, "SWA prefill scratch changed BF16 output bits");
+                }
                 Require(scratch.cudaData==pointer && scratch.Count(0)==(full?elements:elements-1),"SWA scratch was resized");
                 ++checks;
             }
