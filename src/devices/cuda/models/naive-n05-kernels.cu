@@ -2512,6 +2512,7 @@ using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
     BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
 __global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, DraftFlashParams p) {
     const auto r = DraftRow(batch, blockIdx.y);
+    if (!r.key || !r.value) return; // Padding has no KV and no published output.
     p.q = const_cast<BF16 *>(r.input); p.k = r.key; p.v = r.value; p.o = r.output;
     p.kv_len = min(*r.live - 1, p.window_left) + p.qo_len;
     extern __shared__ uint8_t smem[];
@@ -2525,6 +2526,7 @@ template<class Batch>
 __global__ void BatchDraftQKV(Batch batch, const float *qNorm, const float *kNorm,
         int rows, int heads, int kvHeads, int dim, int window, float eps, float theta) {
     const auto r = DraftRow(batch, blockIdx.y / rows);
+    if (!r.key || !r.value) return;
     DraftQKVNormRopeBody(r.input, qNorm, kNorm, r.positions, r.live,
         r.key, r.value, r.query, heads, kvHeads, dim, window, 0, eps, theta,
         blockIdx.x, blockIdx.y % rows, 0, 1);
@@ -2688,7 +2690,7 @@ bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
 bool FastllmCudaNaiveDraftCacheBindingsSupported(int count, int rows,
         int heads, int kvHeads, int dim, int window) {
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
-    return count >= 8 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
+    return count > 0 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
         heads % kvHeads == 0 && heads / kvHeads <= 32 && dim == 128 && window >= rows &&
         BulkKernelSupported(BatchDraftFlash, sizeof(DraftFlashTraits::SharedStorageSingle), 80);
 #else
@@ -2759,7 +2761,7 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         query.dims[1] % count || query.dims[2] != heads * dim) return false;
     const int rows = query.dims[1] / count, capacity = window + rows - 1;
     if (rows <= 1 || rows >= 32) return false;
-    const bool fused = FastllmCudaNaiveDraftCacheBindingsSupported(count, rows, heads, kvHeads, dim, window);
+    const bool fused = (cacheBindings || count >= 8) && FastllmCudaNaiveDraftCacheBindingsSupported(count, rows, heads, kvHeads, dim, window);
     if (cacheBindings && (!fused || !DraftDense(*cacheBindings, INT32) ||
         cacheBindings->dataDeviceIds != query.dataDeviceIds ||
         cacheBindings->dims != std::vector<int>({count, 4}) ||

@@ -351,7 +351,7 @@ namespace fastllm {
                                    DraftContext &context, std::vector<int> &proposed);
         Data RunDraft(int anchor, DraftContext &context);
         bool RunDraftBatch(const std::vector<int> &anchors,
-                           const std::vector<DraftContext *> &contexts, Data &normalized);
+                           const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows = 0);
         void ApplyDraftDevice();
         Data &DraftWeight(const std::string &name);
         Data RunDraftHead(Data &hidden);
@@ -368,7 +368,8 @@ namespace fastllm {
         void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
         bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
         bool PrepareDraftBatchLocal(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
-        bool PrepareDraftBatchGraph(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
+        bool PrepareDraftBatchGraph(const std::vector<DraftRound *> &rounds, const Data &baseLogits,
+                                   int rank, int reserveRows = 0);
         void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth, int rank = -1);
         void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits);
         void PrepareDraftAcceptanceLocal(const std::vector<DraftRound *> &rounds, Data &logits, int rank);
@@ -421,9 +422,16 @@ namespace fastllm {
         // Affinity fixes the KV owner before admission. The global scheduler caps
         // total requests when the batch is not divisible by the number of groups.
         int RunningRequestsPerGroup(int batch) const { return 1 + (batch - 1) / attentionDP; }
-        int WindowRequestsPerGroup(int batch) const {
-            const int mean = RunningRequestsPerGroup(batch);
+        int WindowRequestsPerGroup(int batch) const { return WindowRequestsPerGroup(batch, attentionDP); }
+        static int WindowRequestsPerGroup(int batch, int groups) {
+            const int mean = 1 + (batch - 1) / groups;
             return std::min(batch, mean + (mean + 3) / 4);
+        }
+        static std::vector<int> SpeculativeGraphBuckets(int maxRows) {
+            std::vector<int> buckets;
+            for (int64_t rows = 1; rows < maxRows; rows *= 2) buckets.push_back((int)rows);
+            buckets.push_back(maxRows);
+            return buckets;
         }
         int WindowGroup(const Data &key) const;
         bool ReserveWindow(Data &key, bool request = true) const;
