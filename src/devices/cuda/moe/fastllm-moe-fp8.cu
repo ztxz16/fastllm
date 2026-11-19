@@ -5571,11 +5571,11 @@ static bool FastllmCudaTypedMergeMOEFP8E4M3Batch1Indexed(const fastllm::Data &in
 }
 
 #ifndef USE_ROCM
-// One warp per output channel, with all verifier routes in the same grid.
+// One warp per output channel, with all selected routes in the same grid.
 // Keep the two halves of the original 64-thread reduction independent until
 // their first addition. Missing routes are never consumed by the mailbox join.
 template <bool Gate>
-__global__ static void Fp8VerifyProjection(const float *inputs, float *outputs, const int32_t *slots,
+__global__ static void Fp8IndexedProjection(const float *inputs, float *outputs, const int32_t *slots,
         uint8_t *const *weights, float *const *scales, int topk, int columns, int channels, float limit) {
     const int route = blockIdx.y, slot = slots[route];
     const int channel = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -5614,13 +5614,13 @@ __global__ static void Fp8VerifyProjection(const float *inputs, float *outputs, 
     }
 }
 
-bool FastllmCudaMoeFP8VerifyProjections(const float *input, float *gate, float *partial,
+bool FastllmCudaMoeFP8IndexedProjections(const float *input, float *gate, float *partial,
         const FastllmCudaMoeFP8CacheView &view, const int32_t *slots, int rows, int topk,
         int hidden, int inter, float limit) {
     const int routes = rows * topk;
-    Fp8VerifyProjection<true><<<dim3(inter / 4, routes), 128, 0, cudaStreamPerThread>>>(
+    Fp8IndexedProjection<true><<<dim3(inter / 4, routes), 128, 0, cudaStreamPerThread>>>(
         input, gate, slots, view.gateWeights, view.gateScales, topk, hidden, inter, limit);
-    Fp8VerifyProjection<false><<<dim3(hidden / 4, routes), 128, 0, cudaStreamPerThread>>>(
+    Fp8IndexedProjection<false><<<dim3(hidden / 4, routes), 128, 0, cudaStreamPerThread>>>(
         gate, partial, slots, view.downWeights, view.downScales, topk, inter, hidden, limit);
     return cudaGetLastError() == cudaSuccess;
 }

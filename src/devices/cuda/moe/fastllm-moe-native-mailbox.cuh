@@ -639,14 +639,14 @@ struct NativeMoeMailbox {
     bool ComputeStandard(Layer &w, const OffloadLayout &layout, const uint8_t *records,
             const int32_t *slots, const float *scores, bool resident) {
         const int branch = resident ? 0 : 1;
-        if (w.rows == 4 && layout.standardFp8Graph && layout.weightType == fastllm::FP8_E4M3 &&
+        if ((w.rows == 1 || w.rows == 4) && layout.standardFp8Graph && layout.weightType == fastllm::FP8_E4M3 &&
             layout.swigluLimit > 0 && layout.gateBlockM == 128 && layout.gateBlockK == 128 &&
             layout.downBlockM == 128 && layout.downBlockK == 128 &&
             w.hidden % 256 == 0 && layout.inter % 256 == 0) {
             const auto view = resident ? FP8CacheView(layout, cache.fp8Pointers, cache.slots)
                                        : FP8CacheView(layout, fullCopy->fp8Pointers, fullCopy->expertReady.size());
             const size_t offset = size_t(branch) * w.routes;
-            return FastllmCudaMoeFP8VerifyProjections(
+            return FastllmCudaMoeFP8IndexedProjections(
                 static_cast<const float *>(w.compute->quantized.cudaData),
                 static_cast<float *>(w.compute->gate.cudaData) + offset * layout.inter,
                 w.compute->partial + offset * w.hidden, view, slots,

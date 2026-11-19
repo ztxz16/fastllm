@@ -1262,8 +1262,8 @@ struct HostEngramInput {
     HashParams config;
     const uint16_t *table = nullptr;
     const int *lookup = nullptr;
-    std::array<int, 3> ids;
     uint16_t *staging = nullptr;
+    const uint16_t *mapped = nullptr;
     ~HostEngramInput() {
         if (staging)
             cudaFreeHost(staging);
@@ -1277,23 +1277,25 @@ void PrepareEngramInput(Weights &w, Scratch &s, int layer, int row, const std::a
         input->config = HashConfig(w, layer, p);
         input->table = static_cast<const uint16_t *>(w.Host(p + "multi_head_embedding.embedding.weight"));
         input->lookup = static_cast<const int *>(w.Host(p + "lookup_table"));
-        Check(cudaHostAlloc(&input->staging, 16 * 96 * sizeof(uint16_t), cudaHostAllocPortable));
+        Check(cudaHostAlloc(&input->staging, 16 * 96 * sizeof(uint16_t), cudaHostAllocPortable | cudaHostAllocMapped));
+        cudaPointerAttributes attr{};
+        Check(cudaPointerGetAttributes(&attr, input->staging));
+        input->mapped = static_cast<const uint16_t *>(attr.devicePointer);
         entry = std::move(input);
     }
-    static_cast<HostEngramInput *>(entry.get())->ids = ids;
-}
-static void CUDART_CB readEngramRows(void *opaque) {
-    auto &in = *static_cast<HostEngramInput *>(opaque);
+    // Publish this row with the other replay inputs. The preceding forward has
+    // synchronized before this request/layer's pinned storage is reused.
+    auto &in = *static_cast<HostEngramInput *>(entry.get());
     for (int head = 0; head < 16; ++head) {
-        auto k = rowId(head, in.ids[0], in.ids[1], in.ids[2], in.config, in.lookup);
+        auto k = rowId(head, ids[0], ids[1], ids[2], in.config, in.lookup);
         std::memcpy(in.staging + head * 96, in.table + k * 96, 96 * sizeof(uint16_t));
     }
 }
 void RunPreparedEngram(Weights &w, Scratch &s, int layer, int row, const std::array<int, 3> &ids,
                        float *streams) {
     auto *input = static_cast<HostEngramInput *>(s.engramInputs.at({layer, row}).get());
-    Check(cudaLaunchHostFunc(cudaStreamPerThread, readEngramRows, input));
-    Engram(w, s, layer, ids, streams, input->staging, true);
+    Engram(w, s, layer, ids, streams, input->mapped ? input->mapped : input->staging,
+           input->mapped ? EngramRowStorage::Mapped : EngramRowStorage::Pinned);
 }
 __global__ static void gather(const __nv_bfloat16 *table, const int *map, HashParams m, int a, int b, int c,
                               bool staged, float *output, const StepInput *step) {
@@ -1328,7 +1330,7 @@ __global__ static void engramAdd(float *h, const float *signal, Hy4View gamma, H
     h[i] = bf(h[i] + bf(bf(*gate * v) + bf(v * read(scale.data, scale.type, i))));
 }
 void Engram(Weights &w, Scratch &s, int layer, const std::array<int, 3> &ids, float *h,
-            const uint16_t *hostRows, bool asyncCopy) {
+            const uint16_t *rows, EngramRowStorage storage) {
     if (ids[0] == w.config["engram_pad_id"].int_value() || ids[0] == 120120 || ids[0] == 120124)
         return;
     auto p = "model.layers." + std::to_string(layer) + ".engram_layer.";
@@ -1336,19 +1338,21 @@ void Engram(Weights &w, Scratch &s, int layer, const std::array<int, 3> &ids, fl
     auto emb = s.Get("engramVectors", 1536);
     const int *map = nullptr;
     const __nv_bfloat16 *table;
-    if (hostRows) {
+    if (storage == EngramRowStorage::Mapped) {
+        table = reinterpret_cast<const __nv_bfloat16 *>(rows);
+    } else if (rows) {
         auto *staged = s.Get("engramStaged", (16 * 96 + 1) / 2);
-        if (asyncCopy)
-            Check(cudaMemcpyAsync(staged, hostRows, 16 * 96 * sizeof(uint16_t), cudaMemcpyHostToDevice,
+        if (storage == EngramRowStorage::Pinned)
+            Check(cudaMemcpyAsync(staged, rows, 16 * 96 * sizeof(uint16_t), cudaMemcpyHostToDevice,
                                   cudaStreamPerThread));
         else
-            CopyToGPU(staged, hostRows, 16 * 96 * sizeof(uint16_t));
+            CopyToGPU(staged, rows, 16 * 96 * sizeof(uint16_t));
         table = (const __nv_bfloat16 *)staged;
     } else {
         map = (const int *)w.Device(p + "lookup_table", s.device);
         table = (const __nv_bfloat16 *)w.Device(p + "multi_head_embedding.embedding.weight", s.device);
     }
-    gather<<<16, 128>>>(table, map, m, ids[0], ids[1], ids[2], hostRows != nullptr, emb, s.step);
+    gather<<<16, 128>>>(table, map, m, ids[0], ids[1], ids[2], rows != nullptr, emb, s.step);
     EngramNormWeights norms;
     for (int j = 0; j < 16; j++)
         norms.head[j] = w.View(p + "lookup_per_head_norms." + std::to_string(j) + ".weight", s.device);

@@ -276,8 +276,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 input.dataDeviceIds = index.dataDeviceIds = score.dataDeviceIds = {device};
                 if (capture) {
                     const auto &out = graph.AddExperts(input, index, score, hostExperts[layer], layer);
-                    hy4::CopyStageCaptured(routed, static_cast<const float *>(out.cudaData),
-                                           size_t(rows) * 1536);
+                    routed = static_cast<float *>(out.cudaData);
                     dispatched = true;
                 } else {
                     dispatched = RunHybridMoe(input, index, score, output, hostExperts[layer].data(),

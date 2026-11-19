@@ -90,8 +90,9 @@ void HyperPreNorm(Weights &, Scratch &, const std::string &prefix, const std::st
                   float *streams, float *input, float *posts, int rows);
 void HyperPostNorm(Weights &, Scratch &, const std::string &normName, float *streams, const float *branch,
                    const float *posts, int rows, bool optional = false);
+enum class EngramRowStorage { Host, Pinned, Mapped };
 void Engram(Weights &, Scratch &, int layer, const std::array<int, 3> &ids, float *streams,
-            const uint16_t *hostRows = nullptr, bool asyncCopy = false);
+            const uint16_t *rows = nullptr, EngramRowStorage storage = EngramRowStorage::Host);
 void PrepareEngramInput(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids);
 void RunPreparedEngram(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids,
                        float *streams);
