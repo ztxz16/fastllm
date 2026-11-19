@@ -3398,6 +3398,7 @@ namespace fastllm {
                     const int scheduledChunk = scheduling.balanceDP
                         ? std::min(prefillChunk, std::max(1, prefillBatchLimit / prefillGroups)) : prefillChunk;
                     PrefillDecodeBudget decodeBudget;
+                    bool replanEager = false;
                     while (true) {
                         std::unique_ptr<inference_trace::Step> trace;
                         if (traceInference) trace.reset(new inference_trace::Step());
@@ -3425,7 +3426,9 @@ namespace fastllm {
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
                         if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
-                        if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens, &lastRecordTime)) continue;
+                        const bool tryPipeline = !replanEager;
+                        replanEager = false;
+                        if (tryPipeline && model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens, &lastRecordTime)) continue;
                         auto &forwardLocker = model->forwardLocker;
 
                         inference_trace::DetailRegion retireRegion("retire_requests");
@@ -3784,9 +3787,17 @@ namespace fastllm {
                         // PD has already reserved these requests' KV and installed
                         // their positions. A changed batch can start an asynchronous
                         // chain directly from the D-side last prompt tokens.
-                        if (fastDecodeInput && sharedKvPool && (!plannedPrefills.empty() || !waitingPD.empty()) &&
-                            model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens,
-                                &lastRecordTime, &plannedPrefills, &waitingPD)) continue;
+                        if (tryPipeline && fastDecodeInput && sharedKvPool && (!plannedPrefills.empty() || !waitingPD.empty())) {
+                            const auto membership = model->responseContextDict.MembershipStamp();
+                            if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens,
+                                    &lastRecordTime, &plannedPrefills, &waitingPD)) continue;
+                            // Submit can release dictLocker and then decline. Request
+                            // selection and KV admission were planned before that unlock.
+                            if (membership != model->responseContextDict.MembershipStamp()) {
+                                replanEager = true;
+                                continue;
+                            }
+                        }
                         bool requestStorageBlocked = false;
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;

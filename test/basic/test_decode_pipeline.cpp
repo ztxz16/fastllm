@@ -1,4 +1,5 @@
 #include "models/basellm.h"
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 using namespace fastllm;
@@ -8,6 +9,7 @@ struct Model : basellm {
     int invalidResultAt = -1;
     bool supported = true, historySupported = false, rowFence = false, consumedTerminal = false;
     bool consumeEarly = true, retired = false;
+    std::function<void()> onDecline;
     std::vector<ResponseContext *> fenced;
     long long generated = 0;
     std::vector<std::string> events;
@@ -36,7 +38,10 @@ struct Model : basellm {
         Model &m; std::vector<ResponseContext *> contexts; int tickets[2]{-1,-1};
         Pipe(Model &m, const std::vector<ResponseContext *> &c) : m(m), contexts(c) {}
         bool Submit(int slot, int input = -1) override {
-            if (m.submits == m.failAt) return false;
+            if (m.submits == m.failAt) {
+                if (m.onDecline) m.onDecline();
+                return false;
+            }
             Check(tickets[slot] < 0, "result slot overwritten");
             if (input >= 0) Check(tickets[input] >= 0, "GPU token released too early");
             tickets[slot] = ++m.submits; ++m.outstanding;
@@ -86,7 +91,33 @@ struct Model : basellm {
         return version;
     }
 };
+
+static void TestPlanMembershipOnFallback() {
+    for (bool replace : {false, true}) {
+        Model m(1, 3);
+        auto &requests = m.responseContextDict;
+        const int terminal = requests.CreateHandle();
+        requests.GetHandle(terminal)->isEnding = true;
+        const auto planned = requests.MembershipStamp();
+        m.failAt = 0;
+        Check(!m.Run() && planned == requests.MembershipStamp(), "unchanged fallback invalidated plan");
+        m.onDecline = [&] {
+            int token;
+            Check(m.FetchResponseTokensBatch(terminal, &token, 1) == -1, "terminal output was not drained");
+            if (replace) {
+                std::lock_guard<std::mutex> guard(m.dictLocker);
+                requests.nextHandle = terminal;
+                Check(requests.CreateHandle() == terminal, "expected replacement handle");
+            }
+        };
+        Check(!m.Run() && planned != requests.MembershipStamp(), "fallback reused obsolete request membership");
+        Check(requests.dicts.size() == (replace ? 2u : 1u), "unexpected live request count");
+        Check(m.generated == 0, "declined submit published output");
+    }
+}
+
 int main() {
+    TestPlanMembershipOnFallback();
     for (bool history : {false, true}) for (int batch : {1,2,3,5,8,17}) for (int limit : {2,3,7}) {
         Model m(batch,limit); m.saveHistoryChat = history; m.historySupported = true;
         Check(m.Run(), "pipeline not selected");

@@ -150,6 +150,12 @@ namespace fastllm {
         int nextHandle = 0;
         uint64_t nextGeneration = 0;
 
+        // Read under the model's dictLocker. The size detects removals and
+        // the generation detects insertions, even when the size is unchanged.
+        std::pair<uint64_t, size_t> MembershipStamp() const {
+            return {nextGeneration, dicts.size()};
+        }
+
         int CreateHandle();
 
         ResponseContext* GetHandle(int handleId);

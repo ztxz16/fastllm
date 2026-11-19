@@ -102,12 +102,17 @@ static void TestGPUAllocatorPressure() {
 
 // Exercise the actual chunked serving loop after transfer, rather than only
 // calling ImportPDState and supplying correct positions directly to Forward.
-static void TestChunkedDecodeHandoff(bool pipeline) {
+enum class HandoffPipeline { Disabled, Enabled, DeclineAfterAdmission };
+
+static void TestChunkedDecodeHandoff(HandoffPipeline mode) {
     class ScheduledModel final : public StateModel {
       public:
         std::atomic<int> positionErrors{0};
         std::atomic<int> pipelineSubmits{0};
-        bool pipelineEnabled = false;
+        HandoffPipeline mode = HandoffPipeline::Disabled;
+        mutable PagedCacheManager budget;
+        ResponseContext *newTerminal = nullptr;
+        bool retiredNew = false, firstForwardSawRetirement = false, observedFallback = false;
         ScheduledModel() {
             use_new_engine = false; canDoBatchForward = true; eos_token_id = -100;
             dataType = kvCacheDataType = FLOAT32;
@@ -119,7 +124,14 @@ static void TestChunkedDecodeHandoff(bool pipeline) {
         bool NeedAttentionMask(int, int) override { return false; }
         bool UseGenericHistoryCache() const override { return false; }
         bool RetainCudaWorkspace() const override { return true; }
-        bool SupportsDecodePipeline() const override { return pipelineEnabled; }
+        bool SupportsDecodePipeline() const override { return mode != HandoffPipeline::Disabled; }
+        bool SupportsSharedPagedKVPool() const override { return mode == HandoffPipeline::DeclineAfterAdmission; }
+        PagedCacheManager *GetPagedKVCacheManager(int layer, bool key) const override {
+            return SupportsSharedPagedKVPool() ? &budget : StateModel::GetPagedKVCacheManager(layer, key);
+        }
+        void OnResponseContextFinished(ResponseContext *ctx) override {
+            if (ctx == newTerminal) retiredNew = true;
+        }
         bool SupportsDecodePipelineHistory() const override { return true; }
         struct Pipe : DecodePipeline {
             ScheduledModel &model;
@@ -128,13 +140,25 @@ static void TestChunkedDecodeHandoff(bool pipeline) {
             Pipe(ScheduledModel &model, const std::vector<ResponseContext *> &contexts)
                 : model(model), contexts(contexts) {
                 for (auto *context : contexts) {
-                    Check(context->curTokens > 0 && context->pdPending &&
+                    Check((context->curTokens > 0 || model.SupportsSharedPagedKVPool()) && context->pdPending &&
                               !context->HasPendingPD() && context->pdAdmission,
                           "pipeline entered before PD commit/first token or lost its lease");
                     positions.push_back(context->preTokens);
                 }
             }
             bool Submit(int slot, int input = -1) override {
+                if (model.mode == HandoffPipeline::DeclineAfterAdmission) {
+                    if (!model.newTerminal) {
+                        // A fresh scheduler pass retires this row before the next forward.
+                        Check(contexts.at(0)->curTokens == 0, "expected planned PD first token");
+                        std::lock_guard<std::mutex> guard(model.dictLocker);
+                        auto &requests = model.responseContextDict;
+                        model.newTerminal = requests.GetHandle(requests.CreateHandle());
+                        model.newTerminal->Init(1, FLOAT32, FLOAT32);
+                        model.newTerminal->isEnding = true;
+                    }
+                    return false;
+                }
                 Check(results[slot].empty(), "PD pipeline overwrote a result slot");
                 for (size_t row = 0; row < contexts.size(); ++row) {
                     auto *context = contexts[row];
@@ -168,6 +192,10 @@ static void TestChunkedDecodeHandoff(bool pipeline) {
         int Forward(const Data &ids, const Data &, const Data &positions,
                     std::vector<std::pair<Data,Data>> &kv, const GenerationConfig &,
                     const LastTokensManager &, std::vector<float> *) override {
+            if (newTerminal && !observedFallback) {
+                observedFallback = true;
+                firstForwardSawRetirement = retiredNew;
+            }
             const int past = kv[0].first.dims.empty() ? 0 : kv[0].first.dims[1];
             for (size_t i = 0; i < ids.Count(0); ++i)
                 if (((float *)positions.cpuData)[i] != past + i) ++positionErrors;
@@ -179,7 +207,13 @@ static void TestChunkedDecodeHandoff(bool pipeline) {
             return 42;
         }
     } prefill, decode;
-    decode.pipelineEnabled = pipeline;
+    decode.mode = mode;
+    if (decode.SupportsSharedPagedKVPool()) {
+        decode.model_struct = "naive_n05_flash";
+        decode.budget.type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+        decode.budget.pageLen = 128;
+        decode.budget.SetMaxPages(32);
+    }
     fastkv::Service port; port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
     auto endpoint = port.Address(); port.Stop();
     SetMaxTokens(4096);
@@ -201,10 +235,12 @@ static void TestChunkedDecodeHandoff(bool pipeline) {
     }
     Check(prefill.positionErrors == 0 && decode.positionErrors == 0,
           "PD handoff reset prompt/decode positions");
-    Check(decode.pipelineSubmits == (pipeline ? 2 : 0),
+    Check(decode.pipelineSubmits == (mode == HandoffPipeline::Enabled ? 2 : 0),
           "committed PD request did not enter the decode pipeline");
+    if (mode == HandoffPipeline::DeclineAfterAdmission)
+        Check(decode.firstForwardSawRetirement, "fallback used a plan that predates admission");
     decode.Stop(); prefill.StopPD();
-    std::cout << "PASS PD chunked serving positions after handoff, pipeline=" << pipeline << "\n";
+    std::cout << "PASS PD chunked serving positions after handoff, pipeline=" << int(mode) << "\n";
 }
 
 static void TestDecodeDuringPDTransfer() {
@@ -1334,8 +1370,9 @@ int main(int argc, char **argv) {
         TestLoadAwareRouting();
         TestGroupAdmission();
         TestDecodeDuringPDTransfer();
-        TestChunkedDecodeHandoff(false);
-        TestChunkedDecodeHandoff(true);
+        TestChunkedDecodeHandoff(HandoffPipeline::Disabled);
+        TestChunkedDecodeHandoff(HandoffPipeline::Enabled);
+        TestChunkedDecodeHandoff(HandoffPipeline::DeclineAfterAdmission);
         std::cout << "PASS PD tensor packing, chunk positions, handoff, rejection "
                      "and cancellation\n";
     } catch (const std::exception &error) {
