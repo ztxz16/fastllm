@@ -47,6 +47,11 @@ struct BFloatFp8Auxiliary {
 };
 struct BFloatFp8AuxiliaryRegistry {
     std::mutex mutex;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    // The allocation and its auxiliary slots move together during MultiCuda placement.
+    struct ScaleInfo { int device; bool exact; };
+    std::map<const void *, ScaleInfo> mxfp8Scales;
+#endif
     std::map<const fastllm::Data *, std::shared_ptr<fastllm::Data>> routerBFloat16;
     std::map<const fastllm::Data *, BFloatFp8Auxiliary> weights;
     std::map<int, size_t> dequantizedBytes;
@@ -880,6 +885,27 @@ bool FastllmCudaPreparePerChannelW8A16(fastllm::Data &weight) {
 #endif
 }
 
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+void FastllmCudaRegisterMxfp8Scales(fastllm::Data &weight, void *allocation) {
+    const bool exact = std::all_of(weight.scales.begin(), weight.scales.end(), [](float value) {
+        int exponent;
+        return std::frexp(value, &exponent) == 0.5f && exponent >= -126 && exponent <= 128;
+    });
+    const int device = FastllmCudaGetDevice();
+    auto &registry = BFloatFp8Registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    MarkAuxiliaryOwner(weight);
+    registry.mxfp8Scales.emplace(allocation, BFloatFp8AuxiliaryRegistry::ScaleInfo{device, exact});
+}
+
+bool FastllmCudaHasExactMxfp8Scales(const void *allocation, int device) {
+    auto &registry = BFloatFp8Registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto it = registry.mxfp8Scales.find(allocation);
+    return it != registry.mxfp8Scales.end() && it->second.device == device && it->second.exact;
+}
+#endif
+
 extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (weight.isFake) return;
 #ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
@@ -887,11 +913,23 @@ extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
 #endif
     auto &registry = BFloatFp8Registry();
     BFloatFp8Auxiliary owned;
+    void *rowScales = nullptr;
     std::shared_ptr<fastllm::Data> routerBFloat16;
     std::map<std::pair<int, int>, std::shared_ptr<fastllm::Data>> shards;
     std::map<std::tuple<bool, int, int>, std::shared_ptr<fastllm::Data>> intermediateShards;
     {
         std::lock_guard<std::mutex> lock(registry.mutex);
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (!weight.extraCudaData.empty()) {
+            auto scale = registry.mxfp8Scales.find(weight.extraCudaData[0]);
+            if (scale != registry.mxfp8Scales.end()) {
+                owned.device = scale->second.device;
+                rowScales = weight.extraCudaData[0];
+                weight.extraCudaData[0] = nullptr;
+                registry.mxfp8Scales.erase(scale);
+            }
+        }
+#endif
         auto routerIt = registry.routerBFloat16.find(&weight);
         if (routerIt != registry.routerBFloat16.end()) {
             routerBFloat16 = std::move(routerIt->second);
@@ -921,6 +959,7 @@ extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (owned.device < 0) return;
     const int previous = FastllmCudaGetDevice();
     FastllmCudaSetDevice(owned.device);
+    if (rowScales) checkCudaErrors("Release MXFP8 weight scales", cudaFree(rowScales));
     void *pointers[] = {owned.packed, owned.scales, owned.locks, owned.dequantized};
     for (int i = 0; i < 4; ++i) {
         if (pointers[i]) FastllmCudaDirectFree(pointers[i]);

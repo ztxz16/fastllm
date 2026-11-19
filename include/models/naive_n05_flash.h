@@ -315,7 +315,7 @@ namespace fastllm {
                        TargetCapture *capture, int tpRank = -1, const Data *embedding = nullptr,
                        TargetWorkspace *workspace = nullptr, const TargetBatch *batch = nullptr);
         int CacheReserveCapacity(const GenerationConfig &config) const;
-        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0, bool usePool = true);
+        void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0, bool usePool = true, bool expandFP8 = false);
         void ReserveCache(Data &cache, int capacity, int width, bool usePool = true, const Data *requestKey = nullptr);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,

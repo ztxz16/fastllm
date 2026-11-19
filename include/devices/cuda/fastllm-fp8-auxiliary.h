@@ -40,3 +40,9 @@ bool FastllmCudaPreparePerChannelW8A16(fastllm::Data &weight);
 // reuses the existing bounded Linear lease, retained by captured graphs.
 bool FastllmCudaBlock32W8A8SM90(const void *input, const void *weight, const float *scales,
                               void *output, int rows, int inner, int channels);
+
+// Blackwell uses the same BF16 Linear lease and original FP8 weight as GEMV.
+bool FastllmCudaMxfp8LinearSM103(const void *input, fastllm::Data &weight, void *output,
+                                 int rows, int inner, int channels);
+void FastllmCudaRegisterMxfp8Scales(fastllm::Data &weight, void *allocation);
+bool FastllmCudaHasExactMxfp8Scales(const void *allocation, int device);

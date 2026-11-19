@@ -62,14 +62,14 @@ __global__ void SortPack(
 }
 // Keep exact score/position order while avoiding a separate selection launch.
 // Smaller candidate storage requires a finer threshold; use it only for short rows.
-template<int Capacity = naive_topk::kTopK>
+template<int Capacity = naive_topk::kTopK, bool ParallelCompact = false>
 __global__ void SelectSort(
 #if CUDART_VERSION >= 12010
         const __grid_constant__
 #endif
         Batch batch) {
     const Row r = batch.rows[blockIdx.x];
-    SelectRow<false, Capacity>(r);
+    SelectRow<false, Capacity, ParallelCompact>(r);
     __syncthreads();
     SortRow<256, 5, true, false, Capacity>(r);
 }

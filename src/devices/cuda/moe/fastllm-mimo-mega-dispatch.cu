@@ -28,7 +28,7 @@ struct Api {
 const Api hopper = API(sm90, "sm90-native-fp8-w8a8");
 #endif
 #ifdef FASTLLM_MIMO_MEGA_SM100
-const Api blackwell = API(sm100, "sm10x-requantized-fp8-ue8m0-w8a8");
+const Api blackwell = API(sm100, "sm10x-fp8-mxfp4-ue8m0");
 #endif
 #undef API
 thread_local const Api *lastApi = nullptr;
@@ -80,6 +80,18 @@ extern "C" void *fastllm_ep8_mega_moe_create(const void *const *g, const void *c
     auto h = std::make_unique<Handle>();
     h->api = a; h->inner = a->create(g,d,gs,ds,w,bytes,p,r,slot,n);
     return h->inner ? h.release() : nullptr;
+}
+extern "C" void *fastllm_ep8_mega_moe_create_mxfp4(const void *const *g, const void *const *d,
+    void *w, size_t bytes, const void *const *p, int r, int slot, int n) {
+#ifdef FASTLLM_MIMO_MEGA_SM100
+    if (select() == &blackwell) {
+        auto h = std::make_unique<Handle>();
+        h->api = &blackwell;
+        h->inner = fastllm_sm100_mega_moe_create_mxfp4(g,d,w,bytes,p,r,slot,n);
+        return h->inner ? h.release() : nullptr;
+    }
+#endif
+    lastApi = nullptr; error = "Native MXFP4 MegaMoE requires Blackwell"; return nullptr;
 }
 extern "C" int fastllm_ep8_mega_moe_decode_capacity(int rows, int ranks) {
     const auto *a = select(); return a ? a->decode_capacity(rows,ranks) : 0;

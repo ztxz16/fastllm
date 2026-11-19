@@ -131,6 +131,8 @@ void FastllmCudaNaiveRope(fastllm::Data &input, const fastllm::Data &positions,
 void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &output);
 void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
     const fastllm::Data *liveKeys = nullptr);
+// Write FP8 KV and return the same values expanded into the BF16 input rows.
+void FastllmCudaNaiveWriteAndExpandFP8(fastllm::Data &cache, fastllm::Data &input, int start);
 // Read logical cache slices into an existing BF16 staging allocation. Used by
 // history recording; no full-cache dequantization is needed for attention.
 struct FastllmNaiveKVRead {
@@ -303,6 +305,10 @@ struct FastllmNaiveDecodeScratch {
 // and optional KV/TMA tables. Preserve BF16 score/probability rounding. Large
 // batches use Tensor Cores with FP32 accumulation; unsupported shapes retain
 // the existing CUDA kernels.
+// Ordinary decode may use online softmax; verification retains its original rounding.
+bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
     int heads, int kvHeads, int dim, int valueDim,
@@ -457,11 +463,15 @@ bool FastllmCudaNaiveExpertPrefill(int device, const uint16_t *input,
     const float *siluLookup, float *perRouteOutput);
 void FastllmCudaNaiveClearExpertPrefill();
 
+// Return FP32 logits for a local BF16 prefill projection. The caller lends
+// an independent, dead MoE arena until expert dispatch on this stream.
+bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Data &weight,
+    fastllm::Data &scratch, fastllm::Data &output);
+bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output);
 // BF16 input, FP32 4096-column router, including sigmoid. Small batches
 // share weights and retain exact single-row arithmetic when requested by the
 // linear precision policy. Unsupported layouts return false without mutation.
-bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
-        const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
 
