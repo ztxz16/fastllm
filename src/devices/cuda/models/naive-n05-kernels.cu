@@ -655,10 +655,12 @@ void LaunchSelectTopKCompact(const float *scores, unsigned long long *selected, 
                             int queries, int keys, int queryStart, int topK, int capacity,
                             int partRows = 0, int gap = 0) {
     if ((int64_t)keys >= 4LL * capacity && (int64_t)keys <= 32LL * capacity && topK >= 256) {
-        // Narrow margins retain the same 2048 samples on both paths. Large
-        // Hopper batches use a histogram for the sampled threshold and wider
-        // vectorized scans; other shapes/architectures retain the old kernel.
-        if (topK > capacity / 2 && keys >= 32768 && queries >= 128 && FastllmCudaRuntimeArch() == 90)
+        // A wider vectorized scan amortizes its histogram over a long live
+        // prefix. The sample only proposes a cutoff; all candidates are checked.
+        const int arch = FastllmCudaRuntimeArch();
+        const bool wide = queries >= 128 && ((topK > capacity / 2 && keys >= 32768 && arch == 90) ||
+            (topK == 2048 && capacity == 4096 && queryStart >= 32768 && (arch == 100 || arch == 103)));
+        if (wide)
             SelectTopKCompact<true, 2, 1024><<<queries, 1024>>>(scores, selected, offsets, queries,
                 keys, queryStart, topK, capacity, partRows, gap);
         else if (topK > capacity / 2)
@@ -3002,8 +3004,12 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                 (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
         }
         if (blockSort) {
-            SortTopKCompact<><<<queries, 256>>>(input, begin, (int *)indices.cudaData,
-                queries, sortStride, topK, keys);
+            auto sort = SortTopKCompact<>;
+            if (queries >= 128 && keys >= 16384) {
+                const int arch = FastllmCudaRuntimeArch();
+                if (arch == 100 || arch == 103) sort = SortTopKCompact<false, 256, true>;
+            }
+            sort<<<queries, 256>>>(input, begin, (int *)indices.cudaData, queries, sortStride, topK, keys);
             CheckLaunch();
             return;
         }
