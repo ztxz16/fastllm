@@ -882,6 +882,7 @@ Data NaiveN05FlashModel::RunDraftTarget(const Data &inputIds, const Data &positi
 void NaiveN05FlashModel::CommitTargetCache(std::vector<std::pair<Data, Data>> &kv,
         int past, int count, bool ringVerify) {
 #ifdef USE_CUDA
+    if (ringVerify && attentionDP > 1 && CommitBoundVerifyCaches({&kv}, {past}, {count})) return;
     auto commit = [&](int device) {
         if (device >= 0 && !kv.front().first.multiDeviceDatas.count(device)) return;
         for (int layer = 0; layer < block_cnt; ++layer) {
@@ -935,11 +936,21 @@ void NaiveN05FlashModel::CommitTargetCaches(const std::vector<std::vector<std::p
         for (size_t i = 0; i < caches.size(); ++i) CommitTargetCache(*caches[i], past[i], counts[i], false);
         return;
     }
+    if (CommitBoundVerifyCaches(caches, past, counts)) return;
+    // DP owns complete requests. Partition once, before entering the workers,
+    // so an EP8 worker visits only its local KV. TP peers share the root
+    // descriptors; the first owner publishes those once.
+    std::map<int, std::vector<size_t>> deviceRows;
+    for (size_t i = 0; i < caches.size(); ++i) {
+        if (tpDevices.empty()) deviceRows[-1].push_back(i);
+        else for (int device : caches[i]->front().first.dataDeviceIds) deviceRows[device].push_back(i);
+    }
     auto commit = [&](int device) {
         std::map<int, std::vector<FastllmNaiveCacheCommit>> updates;
-        for (size_t i = 0; i < caches.size(); ++i) for (int layer = 0; layer < block_cnt; ++layer) {
+        auto group = deviceRows.find(device);
+        if (group == deviceRows.end()) return;
+        for (size_t i : group->second) for (int layer = 0; layer < block_cnt; ++layer) {
             auto &pair = caches[i]->at(layer);
-            if (device >= 0 && !pair.first.multiDeviceDatas.count(device)) continue;
             Data &key = device < 0 ? pair.first : *pair.first.multiDeviceDatas.at(device);
             Data &value = device < 0 ? pair.second : *pair.second.multiDeviceDatas.at(device);
             if (slidingLayers[layer]) updates[key.dataDeviceIds.at(0)].push_back({&key, &value, past[i], counts[i]});
@@ -979,6 +990,7 @@ void NaiveN05FlashModel::CommitTargetCaches(const std::vector<std::vector<std::p
             for (auto error : errors) if (error) std::rethrow_exception(error);
         }
     }
+    RememberVerifyCommit(caches, past, counts);
 #endif
 }
 

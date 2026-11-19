@@ -193,6 +193,8 @@ struct FastllmNaiveCacheCommit {
     fastllm::Data *key, *value;
     int past, count;
 };
+void FastllmCudaNaiveCommitBoundSwa(const void *const *bindings, const int *accepted,
+        int rows, int layers, uint64_t slidingMask, int tableStride, int keyBytes, int valueBytes);
 void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches);
 struct FastllmNaiveDraftKVUpdate {
     const fastllm::Data *raw, *norm;

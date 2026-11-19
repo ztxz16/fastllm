@@ -120,13 +120,14 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     std::vector<GenerationConfig> singleConfigs;
     std::vector<int> singleLengths;
     TargetBatch singleBatch{singleKV, singleConfigs, singleLengths, block_cnt};
-    if (tpServingState && !batch && inputIds.dims == std::vector<int>({1, 1}) && !capture) {
+    if (tpServingState && !batch && ((!capture && inputIds.dims == std::vector<int>({1, 1})) ||
+        (tpServingState->verifyWidth && capture && capture->verifying))) {
         for (auto &pair : kv) singleKV.emplace_back(&pair.first, &pair.second);
-        singleConfigs.push_back(config); singleLengths.push_back(1); batch = &singleBatch;
+        singleConfigs.push_back(config); singleLengths.push_back(inputIds.dims.at(1)); batch = &singleBatch;
     }
-    if (!capture || (!capture->verifying && !capture->collectHidden)) {
+    if (!capture || capture->verifying || !capture->collectHidden) {
         Data servingOutput;
-        if (ForwardAttentionParallelServing(inputIds, positions, kv, config, selection, batch, servingOutput))
+        if (ForwardAttentionParallelServing(inputIds, positions, kv, config, selection, batch, servingOutput, capture))
             return servingOutput;
         AssertInFastLLM(state.servingPadded || !tpServingState || tpServingState->pipelineOutputSlot < 0,
             "Naive DP pipeline lost its admitted serving graph");
@@ -146,7 +147,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     AssertInFastLLM(hostPositions.dataType == FLOAT32 && hostPositions.Count(0) == (size_t)total,
         "Naive attention DP requires one position per input row");
     const int liveRows = state.servingPadded ? state.servingLiveRows : sequences;
-    const bool ownedDecode = batch && batch->Decode() && !verifying && !sparseKv &&
+    const bool ownedVerify = verifying && state.servingPadded && state.verifyLengths;
+    const bool ownedDecode = batch && (ownedVerify || (batch->Decode() && !verifying)) && !sparseKv &&
         !(tpServingState && tpServingState->preparing) &&
         mainLoop && mainLoop->get_id() == std::this_thread::get_id();
     auto matchesPlan = [&] {
@@ -156,7 +158,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     const bool compatiblePlan = ownedDecode && state.plan.valid && state.plan.kvType == kvCacheDataType &&
         (!state.servingPadded || state.plan.graph.lock() == tpDecodeState);
     const bool reusePlan = compatiblePlan && matchesPlan();
-    const bool reserveCached = reusePlan && state.servingPadded && state.plan.CanAppend();
+    const bool reserveCached = reusePlan && state.servingPadded && state.plan.CanAppend(state.verifyLengths);
     // Do not publish a partially rebuilt plan after an exception.
     state.plan.valid = false;
     std::vector<int> retained;
@@ -170,14 +172,15 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                     const int seq = group.sequenceIndices[i];
                     if (seq < (int)localRows.size()) localRows[seq] = i;
                 }
-            retained = state.plan.Reorder(*batch, liveRows, tpRequestIds);
+            retained = state.plan.Reorder(*batch, liveRows, tpRequestIds, state.verifyLengths);
             state.previousBindingRows = retained;
             for (int &row : state.previousBindingRows) if (row >= 0) row = localRows[row];
         }
     }
     state.reuseBindings = false;
     if (reusePlan) {
-        AssertInFastLLM(total == sequences, "Naive attention DP decode row count changed");
+        const int width = ownedVerify ? tpServingState->verifyWidth : 1;
+        AssertInFastLLM(total == sequences * width, "Naive attention DP decode row count changed");
         const float *pos = (const float *)hostPositions.cpuData;
         for (auto &group : state.groups)
             for (size_t row = 0; row < group.sequenceIndices.size(); ++row) {
@@ -185,7 +188,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 // Sampling/grammar constraints and positions can change without
                 // changing KV ownership. Never cache these request values.
                 group.configs[row] = batch->configs[seq];
-                group.positions[row] = pos[seq];
+                std::copy_n(pos + seq * width, width, group.positions.begin() + row * width);
             }
     } else {
         for (auto &group : state.groups) {
@@ -236,7 +239,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         if (!state.transfer) {
             state.transfer = std::make_unique<parallel::CudaRowTransfer>(state.runtime, state.rows);
             if (state.servingPadded)
-                state.transfer->ReserveFixed(tpServingState->batchBuckets.back(), size_t(embed_dim) * 2);
+                state.transfer->ReserveFixed(tpServingState->batchBuckets.back() * std::max(1, tpServingState->verifyWidth), size_t(embed_dim) * 2);
         } else state.transfer->Reset(state.rows);
         state.transfer->Reserve(size_t(embed_dim) * sizeof(uint16_t));
         for (auto &group : state.groups)
@@ -264,9 +267,10 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             std::vector<Data *> pending;
             try {
                 for (size_t row = 0; row < group.lengths.size(); ++row) {
-                    const int seq = group.sequenceIndices[row], count = group.lengths[row];
+                    const int seq = group.sequenceIndices[row];
                     if ((state.servingPadded && seq >= liveRows) ||
                         (!retained.empty() && retained[seq] >= 0)) continue;
+                    const int count = state.verifyLengths ? state.verifyLengths->at(seq) : group.lengths[row];
                     for (int layer = 0; layer < block_cnt; ++layer) {
                         const auto &cfg = slidingLayers[layer] ? sliding : full;
                         for (int part = 0; part < 2; ++part) {
@@ -311,7 +315,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             }
         }
     }
-    if (!tpSwaPrefillWorkspaces.empty() && (!batch || !batch->Decode())) {
+    if (!verifying && !tpSwaPrefillWorkspaces.empty() && (!batch || !batch->Decode())) {
         const int length = batch ? *std::max_element(batch->lengths.begin(), batch->lengths.end()) : total;
         state.runtime.Run([&](int rank, int) { PrepareSwaPrefillWorkspace(rank, length); });
     }
@@ -320,14 +324,15 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     const bool distributedSampling = !isIntermediateChunkedPrefill && !capture && !sparseKv &&
         !(tpServingState && tpServingState->preparing) && state.samplingCapacity >= liveRows &&
         selection && selection->cudaSampling && !selection->cudaLogits;
+    const bool preparingVerify = verifying && tpServingState && tpServingState->preparing && state.servingPadded;
     const bool distributedVerification = verifying && capture && !capture->logitsDestinations.empty();
     if (distributedVerification) {
-        AssertInFastLLM(batch && capture->logitsDestinations.size() == (size_t)batch->Size(),
+        AssertInFastLLM(batch && capture->logitsDestinations.size() == (size_t)liveRows,
             "Invalid distributed verification destinations.");
-        for (int seq = 0; seq < batch->Size(); ++seq) {
+        for (int seq = 0; seq < liveRows; ++seq) {
             const Data *out = capture->logitsDestinations[seq];
             AssertInFastLLM(out && out->dataDevice == CUDA && out->dataType == FLOAT32 && out->cudaData &&
-                out->dims == std::vector<int>({batch->lengths[seq], vocab}), "Invalid local verification logits.");
+                out->dims == std::vector<int>({state.verifyLengths ? state.verifyLengths->at(seq) : batch->lengths[seq], vocab}), "Invalid local verification logits.");
         }
     }
     std::vector<std::vector<int>> samplingRows;
@@ -340,7 +345,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         }
     }
     Data &joined = tpSamplingLogits;
-    if (!isIntermediateChunkedPrefill && !distributedSampling && !distributedVerification) {
+    if (!isIntermediateChunkedPrefill && !distributedSampling && !distributedVerification && !preparingVerify) {
         FastllmCudaSetDevice(tpDevices.front());
         joined.dataType = FLOAT32; joined.UpdateUnitSize(); joined.Resize({outputRows, vocab});
         joined.ToDevice(CUDA, {tpDevices.front()}, false); joined.Allocate(false);
@@ -439,7 +444,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     bool ringVerify = verifying && tpSwaRingCache &&
         (batch ? std::all_of(batch->lengths.begin(), batch->lengths.end(),
             [](int count) { return count > 0 && count <= 8; }) : total > 0 && total <= 8);
-    for (int seq = 0; ringVerify && seq < sequences; ++seq)
+    for (int seq = 0; !state.servingPadded && ringVerify && seq < liveRows; ++seq)
         for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer])
             for (const Data *root : {&key(seq, layer), &value(seq, layer)})
                 for (const auto &entry : root->multiDeviceDatas)
@@ -472,6 +477,10 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             logits = RunTarget(ids, pos, kv, config, &captures[rank], rank,
                 embedding.dims.empty() ? nullptr : &embedding, &local.workspace, batch);
         }
+        if (preparingVerify) {
+            FastllmCudaSyncCurrentThreadStream();
+            return;
+        }
         if (!isIntermediateChunkedPrefill) {
             const auto range = tpVocabRanges[rank];
             const size_t bytes = size_t(range.second - range.first) * sizeof(float);
@@ -480,11 +489,11 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 std::vector<void *> dst;
                 std::vector<const void *> src;
                 std::vector<size_t> dstPitch, srcPitch, widths, heights;
-                for (int seq = 0; seq < batch->Size(); ++seq) {
+                for (int seq = 0; seq < liveRows; ++seq) {
                     dst.push_back((float *)capture->logitsDestinations[seq]->cudaData + range.first);
                     src.push_back((char *)logits.cudaData + size_t(row) * bytes);
                     dstPitch.push_back(size_t(vocab) * sizeof(float)); srcPitch.push_back(bytes);
-                    widths.push_back(bytes); heights.push_back(batch->lengths[seq]);
+                    widths.push_back(bytes); heights.push_back(state.verifyLengths ? state.verifyLengths->at(seq) : batch->lengths[seq]);
                     row += batch->lengths[seq];
                 }
                 AssertInFastLLM(FastllmCudaBatchCopy2DAsyncCurrentThread(dst.data(), src.data(),
@@ -628,18 +637,21 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     // Commit local and root metadata together, before recording prefix windows.
     // Each worker owns whole requests; no root can race another rank's update.
-    const bool committedMetadata = graphDecode && bindingsUnchanged &&
-        state.plan.AdvanceMetadata(window);
+    // A graph verification writes candidate payload only. Its consumer publishes
+    // the accepted length once, after the acceptance decision.
+    const bool deferredVerify = ownedVerify && graphDecode && ringVerify && !preparingVerify;
+    const bool committedMetadata = deferredVerify || (!verifying && graphDecode && bindingsUnchanged &&
+        state.plan.AdvanceMetadata(window));
     if (!committedMetadata) ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
         for (int seq = begin; seq < end; ++seq) {
             if (state.servingPadded && seq >= state.servingLiveRows) continue;
-            if (graphDecode && !retained.empty() && retained[seq] >= 0 &&
+            if (!verifying && graphDecode && !retained.empty() && retained[seq] >= 0 &&
                 state.plan.requests[seq].length >= window - 1 && !state.plan.lengthFields[seq].empty()) {
                 state.plan.AdvanceRow(seq);
                 continue;
             }
             const int oldLength = graphDecode ? key(seq, 0).dims[1] : 0;
-            const int count = batch ? batch->lengths[seq] : total;
+            const int count = state.verifyLengths ? state.verifyLengths->at(seq) : batch ? batch->lengths[seq] : total;
             for (int layer = 0; layer < block_cnt; ++layer) {
                 // A saturated sliding window keeps its descriptor shape. Only
                 // skip it when the owned plan survived reservation unchanged.
@@ -689,7 +701,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         FinishPrefixSnapshots(key(seq, 0), prefixes[seq], (batch ? batch->lengths[seq] : total) > 1);
     if (ownedDecode) {
         if ((!bindingsUnchanged && retained.empty()) || !graphDecode) state.plan.lengthFields.clear();
-        if (graphDecode && (state.plan.lengthFields.empty() || !retained.empty())) {
+        if (graphDecode && (!verifying || deferredVerify) && (state.plan.lengthFields.empty() || !retained.empty())) {
             state.plan.lengthFields.resize(liveRows);
             bool safe = true;
             for (int seq = 0; seq < liveRows; ++seq) {
@@ -722,7 +734,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         capture->hidden = std::move(captures.front().hidden);
         capture->prefixes = std::move(prefixes);
     }
-    if (isIntermediateChunkedPrefill || distributedVerification) return Data();
+    if (isIntermediateChunkedPrefill || distributedVerification || preparingVerify) return Data();
     if (distributedSampling) {
         if (asyncSampling) {
             if (!pipelined) {

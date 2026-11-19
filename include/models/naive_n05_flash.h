@@ -360,6 +360,10 @@ namespace fastllm {
                             const GenerationConfig &config, TargetCapture &capture,
                             const TargetBatch *batch = nullptr);
         void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count, bool ringVerify = false);
+        bool CommitBoundVerifyCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts);
+        void RememberVerifyCommit(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts);
         void CommitTargetCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
             const std::vector<int> &past, const std::vector<int> &counts, bool ringVerify);
         bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
@@ -506,7 +510,7 @@ namespace fastllm {
             std::vector<int> &counts, std::vector<std::vector<int>> *samplingRows = nullptr) const;
         bool ForwardAttentionParallelServing(const Data &inputIds, const Data &positions,
             std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
-            LogitsSelection *selection, const TargetBatch *batch, Data &output);
+            LogitsSelection *selection, const TargetBatch *batch, Data &output, TargetCapture *capture = nullptr);
         bool PrepareAttentionParallelServingDecode(const TargetBatch *batch);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;

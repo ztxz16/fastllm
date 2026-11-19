@@ -470,6 +470,23 @@ __global__ void BatchDraftTrimColumns(DraftTrimBatch batch) {
     for (int row = 0; row < batch.keep[i]; ++row)
         data[(size_t)row * batch.width[i] + column] = data[(size_t)(row + batch.drop[i]) * batch.width[i] + column];
 }
+// One CTA commits the accepted rows of one request/layer. The verifier
+// already installed the stable table on this stream. Unused rows have count 0.
+__global__ void CommitBoundSwa(const void *const *bindings, const int2 *accepted,
+        uint64_t slidingMask, int tableStride, int kc, int vc) {
+    const int request = blockIdx.y, layer = blockIdx.z;
+    const int2 item = accepted[request];
+    if (!item.y || !(slidingMask & (uint64_t(1) << layer))) return;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= kc + vc) return;
+    const auto *entry = bindings + size_t(layer) * tableStride + request * 4;
+    auto *ptr = (uint4 *)entry[column >= kc];
+    const int width = column < kc ? kc : vc, local = column < kc ? column : column - kc;
+    for (int row = 0; row < item.y; ++row)
+        ptr[size_t((item.x + row) & (kSwaWindow - 1)) * width + local] =
+            ptr[size_t(kSwaWindow + row) * width + local];
+}
+
 constexpr int kSwaCommitsPerLaunch = 112;
 struct SwaCommitBatch {
     void *key[kSwaCommitsPerLaunch], *value[kSwaCommitsPerLaunch];
@@ -5053,6 +5070,14 @@ void FastllmCudaNaiveCommitSwaVerify(fastllm::Data &key, fastllm::Data &value,
     const int kept = std::min(past + count, kSwaWindow - 1);
     key.Resize({1, kept, key.dims[2]});
     value.Resize({1, kept, value.dims[2]});
+}
+
+void FastllmCudaNaiveCommitBoundSwa(const void *const *bindings, const int *accepted,
+        int rows, int layers, uint64_t slidingMask, int tableStride, int keyBytes, int valueBytes) {
+    const int kc = keyBytes / sizeof(uint4), vc = valueBytes / sizeof(uint4);
+    CommitBoundSwa<<<dim3((kc + vc + 63) / 64, rows, layers), 64, 0, cudaStreamPerThread>>>(
+        bindings, (const int2 *)accepted, slidingMask, tableStride, kc, vc);
+    CheckLaunch();
 }
 
 void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches) {
