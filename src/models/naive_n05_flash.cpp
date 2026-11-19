@@ -2047,7 +2047,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
         } else if (batchedDSA) {
             Data &sink = localWeight(ap + "attention_sink_bias");
-            if (verifying || !FastllmCudaNaiveOnlineDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
+            if (!FastllmCudaNaiveOnlineDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, buf.decode, attn))
                 FastllmCudaNaiveBatchDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, buf.decode, attn);
