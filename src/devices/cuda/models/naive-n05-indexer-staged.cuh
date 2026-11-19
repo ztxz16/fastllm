@@ -1,23 +1,24 @@
 #pragma once
 namespace naive_indexer_batch {
 
-// Native FP8 keys only: copy the key scale in the same async group as K.
-// The caller retains the original path for BF16-backed Indexer tails.
+// FP8 Indexer payloads, either standalone or at the tail of a BF16 KV row.
+// Copy the key scale in the same async group as K, using the physical byte pitch.
 __device__ __forceinline__ void LoadStagedKey(const Row &r,int first,int n,int t,
                                              unsigned char *destination) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_mma;
     constexpr int Pitch=kIndexerDim+16;
+    const size_t rowBytes=(size_t)r.stride*(r.key.fp8?1:2);
     const bool onePage=!r.key.pages || r.key.pageLen%kKeys==0;
     const auto tile=onePage?r.key.IndexRow(first,r.stride):FastllmNaiveKVRow{};
     for(int i=t;i<kKeys*8;i+=128) {
         const int key=i/8,d=i%8*16;
-        const auto base=onePage?FastllmNaiveKVRow((const char*)tile.data+(size_t)key*r.stride,true)
+        const auto base=onePage?FastllmNaiveKVRow((const char*)tile.data+(size_t)key*rowBytes,true)
             :r.key.IndexRow(min(first+key,n-1),r.stride);
         LoadScoreVector<false>(destination+key*Pitch+d,(const unsigned char*)base.data+d,first+key<n);
     }
     if(t<kKeys && r.key.scaledIndexer) {
-        const auto base=onePage?FastllmNaiveKVRow((const char*)tile.data+(size_t)t*r.stride,true)
+        const auto base=onePage?FastllmNaiveKVRow((const char*)tile.data+(size_t)t*rowBytes,true)
             :r.key.IndexRow(min(first+t,n-1),r.stride);
         LoadScoreVector<false>(destination+t*Pitch+128,(const unsigned char*)base.data+128,first+t<n);
     }

@@ -16463,16 +16463,16 @@ __global__ void FastllmTypicalAcceptanceKernel(
 // finite-top-k ordering (scaled score, then token ID) at equal-score boundaries.
 size_t FastllmCudaTopKFirstSamplingWorkspaceBytes(int batch) {
     if (batch <= 0) return 0;
-    return FastllmCudaAlignBytes(size_t(batch) * sizeof(float), 256) +
-           FastllmCudaAlignBytes(size_t(batch) * sizeof(flashinfer::sampling::RadixRowState), 256);
+    return FastllmCudaAlignBytes(size_t(batch) * sizeof(flashinfer::sampling::RadixRowState), 256);
 }
 namespace {
 __global__ void ScaleTopKFirstLogits(const float *input, float *output,
-        const float *temperatures, float *ones, int vocab) {
-    const int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col == 0) ones[row] = 1.f;
-    if (col < vocab) output[size_t(row) * vocab + col] =
-        input[size_t(row) * vocab + col] * (1.f / temperatures[row]);
+        const float *temperatures, int batch, int vocab) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    for (unsigned row = blockIdx.y; row < (unsigned)batch; row += gridDim.y) {
+        if (col < vocab) output[size_t(row) * vocab + col] =
+            input[size_t(row) * vocab + col] * (1.f / temperatures[row]);
+    }
 }
 __global__ void TrimTopKBoundaryTies(float *logits, const int *topKs, int vocab) {
     constexpr int Threads = 256;
@@ -16516,17 +16516,13 @@ __global__ void TrimTopKBoundaryTies(float *logits, const int *topKs, int vocab)
         __syncthreads();
     }
 }
-bool PrepareTopKFirstLogits(float *logits, float *filtered, float *temperatures,
-        int *topKs, int batch, int vocab, void *workspace, size_t bytes) {
-    const size_t required = FastllmCudaTopKFirstSamplingWorkspaceBytes(batch);
-    if (!logits || !filtered || !temperatures || !topKs || !workspace ||
-        !required || bytes < required || vocab <= 0) return false;
-    auto *ones = static_cast<float *>(workspace);
-    auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(
-        static_cast<uint8_t *>(workspace) + FastllmCudaAlignBytes(size_t(batch) * sizeof(float), 256));
+bool MaskTopKFirstLogits(const float *logits, float *filtered, const float *temperatures, int *topKs,
+        int batch, int vocab, flashinfer::sampling::RadixRowState *states) {
+    if (!logits || !filtered || !temperatures || !topKs || !states || batch <= 0 || vocab <= 0) return false;
     cudaStream_t stream = cudaStreamPerThread;
-    ScaleTopKFirstLogits<<<dim3((vocab + 255) / 256, batch), 256, 0, stream>>>(
-        logits, filtered, temperatures, ones, vocab);
+    ScaleTopKFirstLogits<<<dim3((vocab + 255) / 256, std::min(batch, 65535)), 256, 0, stream>>>(
+        logits, filtered, temperatures, batch, vocab);
+    if (cudaGetLastError() != cudaSuccess) return false;
     cudaError_t status = cudaMemsetAsync(states, 0, size_t(batch) * sizeof(*states), stream);
     if (status == cudaSuccess)
         status = flashinfer::sampling::RadixTopKMaskLogitsMultiCTA<float, int>(
@@ -16626,8 +16622,8 @@ static bool FastllmCudaTopKTopPSamplingImpl(
     }
 
     if (topKFirst) {
-        if (!PrepareTopKFirstLogits(logits, cudaProbs, cudaTemperatures, cudaTopKArr,
-                batch, vocabSize, cudaParamBuf + topKWorkspaceOffset, topKWorkspaceBytes)) {
+        auto *states = reinterpret_cast<flashinfer::sampling::RadixRowState *>(cudaParamBuf + topKWorkspaceOffset);
+        if (!MaskTopKFirstLogits(logits, cudaProbs, cudaTemperatures, cudaTopKArr, batch, vocabSize, states)) {
             FastllmReleaseDequantScratch(scratch, scratchOwn);
             return false;
         }
@@ -17920,32 +17916,9 @@ __global__ void FastllmSamplingCommitKernel(const int *input, float *output,
     }
 }
 
-bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
-                                  float *logits, float *probs,
-                                  float *temperatures, int *topKArr,
-                                  float *topPArr,
-                                  int *penaltyIds, float *penaltyFactors,
-                                  int penaltyTokens,
-                                  int *output, float *floatOutput,
-                                  int batch, int vocabSize,
-                                  uint64_t *requestSeeds, uint64_t *requestOffsets) {
-    if (logits == nullptr || probs == nullptr || temperatures == nullptr ||
-        topKArr == nullptr || topPArr == nullptr || output == nullptr ||
-        floatOutput == nullptr || batch <= 0 || vocabSize <= 0 ||
-        penaltyTokens < 0 || (bool(requestSeeds) != bool(requestOffsets)) ||
-        (penaltyTokens > 0 &&
-         (penaltyIds == nullptr || penaltyFactors == nullptr))) {
-        return false;
-    }
-
-    if (penaltyTokens > 0) {
-        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
-            logits, penaltyIds, penaltyFactors,
-            penaltyTokens, vocabSize);
-    }
-    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(
-        logits, probs, temperatures, vocabSize);
-
+static bool SampleTopKTopPProbsToDevice(float *probs, int *topKArr, float *topPArr,
+        int *output, float *floatOutput, int batch, int vocabSize,
+        uint64_t *requestSeeds, uint64_t *requestOffsets) {
     cudaError_t samplingState;
     if (requestSeeds) {
         samplingState = flashinfer::sampling::TopKTopPSamplingFromProb<float, int, 0, true>(
@@ -17982,6 +17955,35 @@ bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
     return true;
 }
 
+bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr,
+                                  float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors,
+                                  int penaltyTokens,
+                                  int *output, float *floatOutput,
+                                  int batch, int vocabSize,
+                                  uint64_t *requestSeeds, uint64_t *requestOffsets) {
+    if (logits == nullptr || probs == nullptr || temperatures == nullptr ||
+        topKArr == nullptr || topPArr == nullptr || output == nullptr ||
+        floatOutput == nullptr || batch <= 0 || vocabSize <= 0 ||
+        penaltyTokens < 0 || (bool(requestSeeds) != bool(requestOffsets)) ||
+        (penaltyTokens > 0 &&
+         (penaltyIds == nullptr || penaltyFactors == nullptr))) {
+        return false;
+    }
+
+    if (penaltyTokens > 0) {
+        FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
+            logits, penaltyIds, penaltyFactors,
+            penaltyTokens, vocabSize);
+    }
+    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(
+        logits, probs, temperatures, vocabSize);
+    return SampleTopKTopPProbsToDevice(probs, topKArr, topPArr, output, floatOutput,
+                                       batch, vocabSize, requestSeeds, requestOffsets);
+}
+
 bool FastllmCudaTopKFirstSamplingToDeviceWithRng(
         float *logits, float *probs, float *temperatures, int *topKs, float *topPs,
         int *penaltyIds, float *penaltyFactors, int penaltyTokens,
@@ -17994,11 +17996,11 @@ bool FastllmCudaTopKFirstSamplingToDeviceWithRng(
     if (penaltyTokens)
         FastllmRepeatPenaltyFactorsKernel<64><<<batch, 64>>>(
             logits, penaltyIds, penaltyFactors, penaltyTokens, vocab);
-    if (!PrepareTopKFirstLogits(logits, probs, temperatures, topKs, batch, vocab,
-                               workspace, workspaceBytes)) return false;
-    return FastllmCudaTopKTopPSamplingToDeviceWithRng(probs, probs, static_cast<float *>(workspace),
-        topKs, topPs, nullptr, nullptr, 0, output, floatOutput, batch, vocab,
-        requestSeeds, requestOffsets);
+    auto *states = static_cast<flashinfer::sampling::RadixRowState *>(workspace);
+    if (!MaskTopKFirstLogits(logits, probs, temperatures, topKs, batch, vocab, states)) return false;
+    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(probs, probs, nullptr, vocab);
+    return SampleTopKTopPProbsToDevice(probs, topKs, topPs, output, floatOutput,
+                                       batch, vocab, requestSeeds, requestOffsets);
 }
 
 bool FastllmCudaTopKTopPSamplingToDevice(float *logits, float *probs,
@@ -18125,13 +18127,14 @@ __global__ void FastllmMtpTopPApply(const float *probs, float *output, const flo
     }
 }
 
-// Intersect top-k/top-p on the original temperature softmax, matching the
-// ordinary CUDA sampler. Filtering and renormalizing top-k first changes p.
+// The legacy sampler intersects top-k and top-p on the original softmax.
+// Naive verification applies top-k before normalizing the target distribution.
 struct FastllmMtpSamplingWorkspace {
     const int vocab, capacity;
     int rows;
     uint8_t *scratch = nullptr;
     bool own = false, dedicated = false, resident = false, needTopP = false, needTopK = false;
+    bool topKFirst = false;
     uint32_t *pinnedParameters = nullptr;
     std::vector<uint32_t> savedParameters;
     uint64_t parameterVersion = 0;
@@ -18238,7 +18241,7 @@ struct FastllmMtpSamplingWorkspace {
         } else {
             // Preserve the ordinary sampler's uniform-temperature fast path.
             const bool tiled = rows <= 64 && vocab >= 16384;
-            if (!tiled || !uniformTemperature)
+            if (!tiled || !uniformTemperature || (needTopK && topKFirst))
                 FastllmCudaCopyFromHostToDevice(temperatures, params.data(), rows * sizeof(float));
             if (needTopK)
                 FastllmCudaCopyFromHostToDevice(topKs, params.data() + capacity, rows * sizeof(int));
@@ -18252,7 +18255,12 @@ struct FastllmMtpSamplingWorkspace {
         a = bufferA;
         float *b = bufferB;
         cudaStream_t stream = cudaStreamPerThread;
-        if (!dedicated && rows <= 64 && vocab >= 16384) {
+        if (topKFirst && needTopK) {
+            // Match ordinary Naive sampling, including deterministic ties at the k-th logit.
+            if (!MaskTopKFirstLogits(logits, b, temperatures, topKs, rows, vocab, rowStates))
+                return false;
+            FastllmTemperatureSoftmaxKernel<1024><<<rows, 1024, 0, stream>>>(b, a, nullptr, vocab);
+        } else if (!dedicated && rows <= 64 && vocab >= 16384) {
             const int chunks = (vocab + 4095) / 4096;
             const float *tsDevice = uniformTemperature ? nullptr : temperatures;
             FastllmTemperatureSoftmaxPartialKernel<256, 4096><<<dim3(chunks, rows), 256, 0, stream>>>(
@@ -18282,7 +18290,7 @@ struct FastllmMtpSamplingWorkspace {
                 a, b, topPs, rows, 1.0f, vocab, stream, topPCuts);
             std::swap(a, b);
         }
-        if (state == cudaSuccess && needTopK) {
+        if (state == cudaSuccess && needTopK && !topKFirst) {
             state = cudaMemsetAsync(rowStates, 0,
                 rows * sizeof(flashinfer::sampling::RadixRowState), stream);
             if (state == cudaSuccess) {
@@ -18499,11 +18507,11 @@ bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
                                               output, 1, vocabSize, vocabSize, 1, workspace);
 }
 
-bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalProbs,
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,
                                     int *output, int *acceptedDraftTokens,
-                                    int batch, int draftTokens, int vocabSize) {
+                                    int batch, int draftTokens, int vocabSize, bool topKFirst) {
     if (!logits || !proposalProbs || !temperatures || !topKs || !topPs ||
         !draftTokenIds || !output || !acceptedDraftTokens || batch <= 0 ||
         draftTokens <= 0 || vocabSize <= 0) return false;
@@ -18511,6 +18519,7 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
     for (int i = 0; i < batch * draftTokens; ++i)
         if (draftTokenIds[i] < 0 || draftTokenIds[i] >= vocabSize) return false;
     FastllmMtpSamplingWorkspace ws(rows, vocabSize);
+    ws.topKFirst = topKFirst;
     if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocabSize)) return false;
     FastllmCudaCopyFromHostToDevice(ws.draftIds, (void*)draftTokenIds,
                                    batch * draftTokens * sizeof(int));
@@ -18543,6 +18552,24 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                 output[b * (draftTokens + 1) + i] >= vocabSize) return false;
     }
     return true;
+}
+
+bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+                                    const float *temperatures, const int *topKs,
+                                    const float *topPs, const int *draftTokenIds,
+                                    int *output, int *acceptedDraftTokens,
+                                    int batch, int draftTokens, int vocabSize) {
+    return FastllmCudaMtpRejectionSamplingImpl(logits, proposalProbs, temperatures, topKs, topPs,
+        draftTokenIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize, false);
+}
+
+bool FastllmCudaMtpRejectionSamplingTopKFirst(float *logits, float *proposalProbs,
+                                    const float *temperatures, const int *topKs,
+                                    const float *topPs, const int *draftTokenIds,
+                                    int *output, int *acceptedDraftTokens,
+                                    int batch, int draftTokens, int vocabSize) {
+    return FastllmCudaMtpRejectionSamplingImpl(logits, proposalProbs, temperatures, topKs, topPs,
+        draftTokenIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize, true);
 }
 
 void *FastllmCudaMtpCreateTargetDistribution(int rows, int vocab) {

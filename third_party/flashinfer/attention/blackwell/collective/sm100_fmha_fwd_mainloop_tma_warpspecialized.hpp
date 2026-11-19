@@ -37,6 +37,7 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "fmha_common.hpp"
+#include "../../../math.cuh"
 #include "fmha_fusion.hpp"
 #include "sm100_fmha_load_tma_warpspecialized.hpp"
 
@@ -50,7 +51,9 @@ template <class Element_, class ElementQK_, class ElementPV_, class TileShapeQK_
           // and referes to the two softmax warps
           // (2, 1, 1) means that they are stacked (best for large Q since it loads the least K/V)
           // (1, 2, 1) means they sit side by side (best for small Q / large K)
-          class ThreadShape = Shape<_2, _1, _1>>
+          class ThreadShape = Shape<_2, _1, _1>,
+          // Asymmetric head dimensions can leave room for one additional K or V stage.
+          int ExtraK = 0, int ExtraV = 0, bool ApproximateExp2 = false>
 struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using Element = Element_;
   using ElementQK = ElementQK_;
@@ -92,9 +95,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using SmemLayoutQ =
       decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StageCountQ>{}));
   using SmemLayoutK =
-      decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountKV>{}));
+      decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountKV + ExtraK>{}));
   using SmemLayoutV =
-      decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<StageCountKV>{}));
+      decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<StageCountKV + ExtraV>{}));
 
   struct TensorStorage {
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
@@ -126,10 +129,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
   // from load to mma warp, protects k/v in smem
   using PipelineK =
-      cutlass::PipelineTmaUmmaAsync<StageCountKV, typename CollectiveMmaQK::AtomThrShapeMNK>;
+      cutlass::PipelineTmaUmmaAsync<StageCountKV + ExtraK, typename CollectiveMmaQK::AtomThrShapeMNK>;
 
   using PipelineV =
-      cutlass::PipelineTmaUmmaAsync<StageCountKV, typename CollectiveMmaPV::AtomThrShapeMNK>;
+      cutlass::PipelineTmaUmmaAsync<StageCountKV + ExtraV, typename CollectiveMmaPV::AtomThrShapeMNK>;
 
   // from mma to softmax0/1 warp, protects S in tmem
   // (not sure yet about the reverse direction)
@@ -601,11 +604,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       float2 in = make_float2(tTMEM_LOADrS(i + 0), tTMEM_LOADrS(i + 1));
       float2 out;
       cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
-      tTMEM_LOADrS(i + 0) = out.x;
-      tTMEM_LOADrS(i + 1) = out.y;
-
-      tTMEM_LOADrS(i + 0) = ::exp2f(tTMEM_LOADrS(i + 0));
-      tTMEM_LOADrS(i + 1) = ::exp2f(tTMEM_LOADrS(i + 1));
+      if constexpr (ApproximateExp2) {
+        tTMEM_LOADrS(i + 0) = ::flashinfer::math::ptx_exp2(out.x);
+        tTMEM_LOADrS(i + 1) = ::flashinfer::math::ptx_exp2(out.y);
+      } else {
+        tTMEM_LOADrS(i + 0) = ::exp2f(out.x);
+        tTMEM_LOADrS(i + 1) = ::exp2f(out.y);
+      }
 
       Array<ElementQK, kConversionsPerStep> in_conv;
       CUTLASS_PRAGMA_UNROLL

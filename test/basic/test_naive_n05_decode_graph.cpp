@@ -612,7 +612,7 @@ static void TestSwaBatch(int batch, int heads, int kvHeads) {
     }
 }
 
-static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool sparse, bool fp8) {
+static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool sparse, bool fp8, bool online = false) {
     const int capacity = sparse ? 2048 : 128;
     Data query(BFLOAT16), key(BFLOAT16), value(BFLOAT16), sink(FLOAT32), live(INT32), table(INT32),
         pages(INT32), indices(INT32), maps(INT32), actual;
@@ -660,9 +660,29 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
     };
     bind(batch);
     FastllmNaiveDecodeScratch scratch;
+    auto runOnline = [&] {
+        return FastllmCudaNaiveOnlineDSADecode(query, sink, rows, heads, 1, dim, vd, scratch, actual);
+    };
+    if (online && !runOnline()) return; // Optional device/image.
     Graph graph;
-    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(query, sink, rows, heads, 1, dim, vd, scratch, actual); });
+    graph.Capture([&] {
+        if (online) Require(runOnline(), "online DSA unavailable during capture");
+        else FastllmCudaNaiveBatchDSADecode(query, sink, rows, heads, 1, dim, vd, scratch, actual);
+    });
     graph.Run(); auto reference = Read<uint16_t>(actual);
+    if (online) {
+        Data expected; FastllmNaiveDecodeScratch oldScratch;
+        FastllmCudaNaiveBatchDSADecode(query, sink, rows, heads, 1, dim, vd, oldScratch, expected);
+        auto old = Read<uint16_t>(expected);
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < old.size(); ++i) {
+            uint32_t a = uint32_t(reference[i]) << 16, b = uint32_t(old[i]) << 16;
+            float got, want;
+            std::memcpy(&got, &a, sizeof(got)); std::memcpy(&want, &b, sizeof(want));
+            error += double(got-want)*(got-want); norm += double(want)*want;
+        }
+        Require(std::sqrt(error/std::max(norm, 1e-20)) < .005, "online DSA BF16 reference");
+    }
     for (int active : {batch - 1, 1, 0, batch / 2, batch}) {
         bind(active); graph.Run(); auto result = Read<uint16_t>(actual);
         for (size_t i = 0; i < result.size(); ++i)
@@ -758,6 +778,8 @@ int main() {
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
         TestMixedRegionAttention();
+        for (int batch : {1, 4, 8, 32, 64})
+            TestPaddedAttention(batch, 16, 192, 128, true, true, true);
         for (int batch : {8, 40})
         for (bool sparse : {false, true})
         for (bool fp8 : {false, true}) {

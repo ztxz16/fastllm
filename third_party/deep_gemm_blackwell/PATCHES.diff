@@ -264,3 +264,54 @@
  
 -} // namespace deep_gemm::utils
 +} // namespace fastllm_blackwell_mega::utils
+--- a/deep_gemm/epilogue/operators.cuh
++++ b/deep_gemm/epilogue/operators.cuh
+@@ -8 +8 @@
+-namespace deep_gemm::epilogue::operators {
++namespace fastllm_blackwell_mega::epilogue::operators {
+@@ -222 +222 @@
+-} // namespace deep_gemm::epilogue::operators
++} // namespace fastllm_blackwell_mega::epilogue::operators
+--- a/deep_gemm/epilogue/sm100_store_cd.cuh
++++ b/deep_gemm/epilogue/sm100_store_cd.cuh
+@@ -11 +11 @@
+-namespace deep_gemm::epilogue {
++namespace fastllm_blackwell_mega::epilogue {
+@@ -189 +189 @@
+-} // namespace deep_gemm::epilogue
++} // namespace fastllm_blackwell_mega::epilogue
+--- a/deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh
++++ b/deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh
+@@ -11 +11 @@
+-namespace deep_gemm::epilogue {
++namespace fastllm_blackwell_mega::epilogue {
+@@ -210 +210 @@
+-} // namespace deep_gemm::epilogue
++} // namespace fastllm_blackwell_mega::epilogue
+--- a/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh
++++ b/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh
+@@ -22 +22 @@
+-namespace deep_gemm {
++namespace fastllm_blackwell_mega {
+--- a/deep_gemm/layout/gemm.cuh
++++ b/deep_gemm/layout/gemm.cuh
+@@ -9 +9 @@
+-namespace deep_gemm::layout {
++namespace fastllm_blackwell_mega::layout {
+@@ -67 +67 @@
+-} // namespace deep_gemm::layout
++} // namespace fastllm_blackwell_mega::layout
+--- a/deep_gemm/scheduler/gemm.cuh
++++ b/deep_gemm/scheduler/gemm.cuh
+@@ -6 +6 @@
+-namespace deep_gemm::sched {
++namespace fastllm_blackwell_mega::sched {
+@@ -205 +205 @@
+-        } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) { 
++        } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
+@@ -306 +306 @@
+-            // Unreachable 
++            // Unreachable
+@@ -314 +314 @@
+-} // namespace deep_gemm::sched
++} // namespace fastllm_blackwell_mega::sched

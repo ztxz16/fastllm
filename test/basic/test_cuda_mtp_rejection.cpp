@@ -29,17 +29,21 @@ struct Buffer {
         return v;
     }
 };
-std::vector<double> Oracle(const std::vector<float> &logits, float t, int k, float topP) {
+std::vector<double> Oracle(const std::vector<float> &logits, float t, int k, float topP, bool topKFirst = false) {
+    std::vector<int> order(logits.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return logits[a] > logits[b]; });
     std::vector<double> p(logits.size());
-    double maxLogit = *std::max_element(logits.begin(), logits.end());
-    for (int i = 0; i < (int)p.size(); ++i) p[i] = std::exp((logits[i] - maxLogit) / t);
+    const double maxLogit = logits[order.front()];
+    const int count = topKFirst && k > 0 ? std::min(k, (int)order.size()) : (int)order.size();
+    for (int i = 0; i < count; ++i) {
+        const int token = order[i];
+        p[token] = std::exp((logits[token] - maxLogit) / t);
+    }
     double sum = std::accumulate(p.begin(), p.end(), 0.0);
     for (auto &v : p) v /= sum;
     auto original = p;
     // FastLLM's joint sampler uses strict-greater counts/mass, including ties.
-    std::vector<int> order(p.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](int a, int b) { return original[a] > original[b]; });
     double mass = 0;
     for (int first = 0, end; first < (int)order.size(); first = end) {
         for (end = first + 1; end < (int)order.size() &&
@@ -200,7 +204,7 @@ void MarkovGraphCase() {
 }
 void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
                int drafts, int vocab, float targetTemperature = 1.f,
-               int targetK = 0, float targetP = 1.f) {
+               int targetK = 0, float targetP = 1.f, bool topKFirst = false) {
     const int batch = 16384, qRows = batch * drafts, pRows = batch * (drafts + 1);
     std::vector<float> qLogits(qRows * vocab, -INFINITY), pLogits(pRows * vocab, -INFINITY);
     const float bonus[] = {.1f, .2f, .7f};
@@ -220,7 +224,8 @@ void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
     Require(FastllmCudaMtpSampleDraft(ql.p, q.p, qt.data(), qk.data(), qp.data(), ids.data(),
                                      qRows, vocab), "chain proposal sampling failed");
     auto snapshot = q.Read();
-    Require(FastllmCudaMtpRejectionSampling(pl.p, q.p, pt.data(), pk.data(), pp.data(),
+    auto verify = topKFirst ? FastllmCudaMtpRejectionSamplingTopKFirst : FastllmCudaMtpRejectionSampling;
+    Require(verify(pl.p, q.p, pt.data(), pk.data(), pp.data(),
         ids.data(), out.data(), accepted.data(), batch, drafts, vocab), "chain verification failed");
     Require(snapshot == q.Read(), "verification mutated q");
     int counts[3] = {}, bonuses[3] = {}, residuals[3] = {}, allAccepted = 0, rejected = 0;
@@ -246,8 +251,8 @@ void ChainCase(const char *name, std::vector<float> p, std::vector<float> qdist,
     // Check the final law after rejection/correction, not just sampler bounds.
     std::vector<float> logP, logBonus;
     for (int i = 0; i < 3; ++i) { logP.push_back(std::log(p[i])); logBonus.push_back(std::log(bonus[i])); }
-    auto filteredP = Oracle(logP, targetTemperature, targetK, targetP);
-    auto filteredBonus = Oracle(logBonus, targetTemperature, targetK, targetP);
+    auto filteredP = Oracle(logP, targetTemperature, targetK, targetP, topKFirst);
+    auto filteredBonus = Oracle(logBonus, targetTemperature, targetK, targetP, topKFirst);
     p.assign(filteredP.begin(), filteredP.end());
     double alpha = 0, residualMass = 0;
     for (int i = 0; i < 3; ++i) {
@@ -538,6 +543,10 @@ int main() {
         for (int drafts : {1, 3, 5, 7})
             ChainCase("unfiltered-q filtered-p", {.55f, .30f, .15f}, {.10f, .40f, .50f},
                   drafts, 32, .7f, 2, .8f);
+        ChainCase("top-k before nucleus", {.50f,.30f,.20f}, {.25f,.25f,.50f},
+                  3, 32, 1.f, 2, .59f, true);
+        ChainCase("stable finite-k tie", {.4f,.3f,.3f}, {.3f,.3f,.4f},
+                  1, 32, .8f, 2, 1.f, true);
         ChainCase("identical", {.6f,.3f,.1f}, {.6f,.3f,.1f}, 3, 32);
         ChainCase("different", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 3, 17);
         ChainCase("seven drafts", {.6f,.3f,.1f}, {.3f,.5f,.2f}, 7, 32);

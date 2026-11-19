@@ -4,9 +4,16 @@
 
 // MiMo complete-expert EP4/EP8 backend. All handles and symmetric buffers
 // for decode are prepared before worker execution / CUDA Graph capture.
-// Legacy type name; supports built-in SM90 FP8 and packaged SM120 MXFP4 kernels.
+// The backend is selected from the group architecture and expert weight format.
 struct FastllmCudaMimoEp8Mega;
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices);
+// One row-major E2M1 plane followed by one UE8M0 byte per complete K32 group.
+inline bool FastllmCudaMimoIsMxfp4Expert(const fastllm::Data &w) {
+    return w.dataType == fastllm::NVFP4 && w.blockK == 1 && w.blockM == 32 &&
+           !w.IsRepacked && !w.cudaNativeNvfp4Layout && w.scales.empty() &&
+           w.dims.size() == 2 && w.dims[0] > 0 && w.dims[1] > 0 && w.dims[1] % 32 == 0 &&
+           w.GetBytes() == fastllm::GetNVFP4StorageBytes(w.dims[0], w.dims[1], 1, 32);
+}
 // Query only after group admission; preserves the calling CUDA device.
 bool FastllmCudaMimoEp8MegaOwnsPackedWeights(int device);
 // Required backing for an eligible eager prefill chunk, or zero for the

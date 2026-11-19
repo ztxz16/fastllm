@@ -10,12 +10,15 @@
 #include "utils/inference_trace.h"
 #include <cmath>
 #include <climits>
+#include <optional>
 #include <cstdlib>
 #include "devices/cuda/naive-n05-cuda.cuh"
 #ifdef USE_CUDA
 #include "naive_n05_indexer_tp.h"
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
+#include "devices/cuda/fastllm-linear-scratch.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -187,7 +190,7 @@ int NaiveN05FlashModel::CacheReserveCapacity(const GenerationConfig &config) con
     return (int)std::min<int64_t>(capacity, limit);
 }
 
-void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity, bool usePool) {
+void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity, bool usePool, bool expandFP8) {
     int oldLength = cache.dims.empty() ? 0 : cache.dims[1];
     int length = oldLength + input.dims[1];
     cache.dataType = cacheType;
@@ -206,7 +209,8 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
     if (cache.isPagedKVCache || cache.dataType == FP8_E4M3 || cache.dataType == FP4_E2M1 || cache.kvCacheFp8Indexer ||
         (sparseKv && cache.cudaDataBorrowed)) {
 #ifdef USE_CUDA
-        FastllmCudaNaivePagedWrite(cache, input, oldLength);
+        if (expandFP8) FastllmCudaNaiveWriteAndExpandFP8(cache, input, oldLength);
+        else FastllmCudaNaivePagedWrite(cache, input, oldLength);
 #endif
         cache.Resize({1, length, width});
         if (cache.isPagedKVCache) cache.lastPageLen = (length - 1) % cache.pageLen + 1;
@@ -876,10 +880,7 @@ Data NaiveN05FlashModel::RunTarget(
     Data *prefillScores = tensorParallel && !tpPrefillScores.empty() ? &tpPrefillScores.at(tpRank) : nullptr;
     Data &hidden = buf.hidden;
     Data &q = buf.q;
-    Data &k = buf.k;
-    Data &v = buf.v;
     Data &qkv = buf.qkv;
-    Data &attn = buf.attn;
     Data &routerInput = buf.routerInput;
     Data &router = buf.router;
     Data &expertIndex = buf.expertIndex;
@@ -910,6 +911,19 @@ Data NaiveN05FlashModel::RunTarget(
         EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     else Embedding(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, DataType::BFLOAT16);
+    // The score and router arenas are both dead during QKV/O projection. Some
+    // serving layouts allocate only the latter. Borrow existing storage only.
+    auto projectAttention = [&](Data &input, Data &weight, const Data &bias, Data &output) {
+        if (!decodeWorkspace && !verifying && length >= 1024) {
+            const Data *scratch = &routerInput;
+            if (prefillScores && prefillScores->expansionBytes > routerInput.expansionBytes)
+                scratch = prefillScores;
+            CudaLinearScratchScope loan(scratch);
+            Linear(input, weight, bias, output);
+        } else {
+            Linear(input, weight, bias, output);
+        }
+    };
     auto norm = [&](Data &input, Data &weight, Data &output) {
         if (!decodeWorkspace) {
             KimiK3RMSNorm(input, weight, rms_norm_eps, output);
@@ -937,6 +951,8 @@ Data NaiveN05FlashModel::RunTarget(
     const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
         tpEp8MegaState && (decodeWorkspace || localPrefillRows) && block_cnt > 1 && !moeLayers[0] &&
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
+    const bool compactPrefillHead = localMoeRows && !decodeWorkspace && !verifying &&
+        (!capture || !capture->collectHidden);
     const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace &&
         std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
             [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
@@ -944,6 +960,11 @@ Data NaiveN05FlashModel::RunTarget(
     if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
         maxLocalRows = std::max(maxLocalRows, (int)rows.size());
     bool localHiddenReady = false;
+    const bool canReusePrefillProjections = !decodeWorkspace && !verifying && attentionParallel &&
+        AttentionTPSize() == 1 && (!capture || (!capture->collectHidden && capture->prefixes.empty())) &&
+        FastllmCudaHasBlackwellIndexerAttention();
+    struct PrefillProjectionViews { Data key, value, attention; };
+    std::optional<PrefillProjectionViews> projectionViews;
     for (int layer = 0; layer < block_cnt; layer++) {
         const bool localMoe = localMoeRows && moeLayers[layer];
         auto *localDP = localMoe ? &attentionParallel->ranks[tpRank] : nullptr;
@@ -1022,9 +1043,43 @@ Data NaiveN05FlashModel::RunTarget(
         const bool batchRope = batch && (batch->Size() > 1 || buf.cacheTable) &&
             batch->Decode() && decodeWorkspace && !graphVerify &&
             (!capture || !capture->verifying);
+        const bool reusePrefillQkv = canReusePrefillProjections && mergedQkv && batch && !batch->Decode();
+        if (reusePrefillQkv && layer == 0) {
+            // Full and sliding layers share the projection buffer, but can have
+            // different output widths. Reserve the largest actual merged shard
+            // once; growing it at the next layer strands the first allocation.
+            int width = 0;
+            for (int next = 0; next < block_cnt; ++next) {
+                const auto &w = localWeight("model.layers." + std::to_string(next) + ".self_attn.mergeqkv.weight");
+                if (w.dims.size() == 2) width = std::max(width, w.dims[0]);
+            }
+            if (width && qkv.expansionSize < size_t(length) * width) {
+                qkv.dataType = BFLOAT16;
+                qkv.Resize({1, length, width});
+                qkv.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
+                qkv.Allocate(false);
+            }
+        }
+        if (reusePrefillQkv && !projectionViews) projectionViews.emplace();
+        const int keyWidth = cfg.kvHeads * cfg.headDim, valueWidth = cfg.kvHeads * cfg.valueDim;
+        const bool reuseProjected = reusePrefillQkv && keyWidth + valueWidth <= embed_dim;
+        Data &k = reuseProjected ? projectionViews->key : buf.k;
+        Data &v = reuseProjected ? projectionViews->value : buf.v;
+        if (reuseProjected) {
+            // K and V expire after the cache append. The local O projection
+            // overwrites this buffer only after all attention rows are ready.
+            projected.dataType = BFLOAT16;
+            projected.Resize({1, length, embed_dim});
+            projected.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
+            projected.Allocate(false);
+            k.Resize({1, length, keyWidth});
+            k.FakeFrom(projected, 0);
+            v.Resize({1, length, valueWidth});
+            v.FakeFrom(projected, size_t(length) * keyWidth * sizeof(uint16_t));
+        }
         if (mergedQkv) {
             if (!batchRope)
-                Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+                projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
             // Q/K and V have different head widths. Read packed projection rows
             // directly in the RoPE/cache kernel instead of launching three Splits.
             for (auto item : {std::make_pair(&q, cfg.heads * cfg.headDim),
@@ -1036,9 +1091,20 @@ Data NaiveN05FlashModel::RunTarget(
                 item.first->Allocate(false);
             }
         } else {
-            Linear(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
-            Linear(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
-            Linear(normed, localWeight(ap + "v_proj.weight"), localWeight(ap + "v_proj.bias"), v);
+            projectAttention(normed, localWeight(ap + "q_proj.weight"), localWeight(ap + "q_proj.bias"), q);
+            projectAttention(normed, localWeight(ap + "k_proj.weight"), localWeight(ap + "k_proj.bias"), k);
+            projectAttention(normed, localWeight(ap + "v_proj.weight"), localWeight(ap + "v_proj.bias"), v);
+        }
+        const bool reuseAttention = reusePrefillQkv && qkv.dataType == BFLOAT16 && qkv.dims.size() == 3 &&
+            qkv.dims.back() >= cfg.heads * cfg.valueDim;
+        Data &attn = reuseAttention ? projectionViews->attention : buf.attn;
+        if (reuseAttention) {
+            // Each request consumes its packed QKV before producing attention.
+            // Requests advance in row order; the narrower output prefix cannot
+            // reach the following request's unread projection. Deferred DSA
+            // consumes all QKV slices before publishing any output.
+            attn.Resize({1, length, cfg.heads * cfg.valueDim});
+            attn.FakeFrom(qkv, 0);
         }
         AssertInFastLLM(q.dataDevice == DataDevice::CUDA,
                         "Naive-N0.5 attention requires --device cuda.");
@@ -1152,7 +1218,7 @@ Data NaiveN05FlashModel::RunTarget(
 #endif
             if (!batchRopePrepared) {
                 if (mergedQkv)
-                    Linear(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+                    projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
                 batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
                     caches, liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
@@ -1330,7 +1396,24 @@ Data NaiveN05FlashModel::RunTarget(
         const bool dpPrefill = attentionParallel && AttentionTPSize() == 1 && batch &&
             !batch->Decode() && !decodeWorkspace && !verifying && !sparseLayer &&
             !slidingLayers[layer];
+        std::vector<Data> packedIndices;
+        if (dpPrefill && reuseAttention && !indexerLayerSharding && indexTopK > 0 &&
+            int64_t(qkv.dims.back()) - int64_t(cfg.heads) * cfg.valueDim >= 2LL * indexTopK) {
+            // The Indexer runs after every packed QKV row has been consumed.
+            // TopK occupies the suffix beyond the complete compact output,
+            // so later attention writes cannot corrupt another request's IDs.
+            size_t offset = size_t(length) * cfg.heads * cfg.valueDim * sizeof(uint16_t);
+            packedIndices.resize(batch->Size());
+            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
+                auto &ids = packedIndices[sequence];
+                ids.FakeFrom(qkv, offset);
+                ids.dataType = INT32;
+                ids.Resize({batch->lengths[sequence], indexTopK});
+                offset += size_t(batch->lengths[sequence]) * indexTopK * sizeof(int);
+            }
+        }
         std::vector<FastllmNaivePrefillAttentionItem> prefillAttention;
+        bool pairedPrefill = false;
         int attendPhase = 0;
         std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
         std::vector<std::unique_ptr<Data>> prefillViews;
@@ -1355,7 +1438,8 @@ Data NaiveN05FlashModel::RunTarget(
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &cacheKey, Data &cacheValue,
                           TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
-            Data &packed = buf.packed, &indexKey = buf.indexKey, &indices = buf.indices;
+            Data &packed = buf.packed, &indexKey = buf.indexKey;
+            Data &indices = packedIndices.empty() ? buf.indices : packedIndices[sequence];
             const bool sharedSwa = tensorParallel && slidingLayers[layer] &&
                 !decodeWorkspace && !verifying && !tpSwaPrefillWorkspaces.empty();
             Data &pastKey = sharedSwa ? tpSwaPrefillWorkspaces[tpRank].first : cacheKey;
@@ -1366,6 +1450,7 @@ Data NaiveN05FlashModel::RunTarget(
             const bool ringCache = tensorParallel && slidingLayers[layer] && tpSwaRingCache;
             const bool ringDecode = ringCache && decodeWorkspace && !graphVerify;
             const bool ringVerify = ringCache && capture && capture->ringVerify;
+            bool coldSwa = false;
             Data noIndices;
             Data *selected = attendPhase == 2 &&
                 (decodeWorkspace ? buf.capacity : localPast + length) > indexTopK ? &indices : &noIndices;
@@ -1433,15 +1518,14 @@ Data NaiveN05FlashModel::RunTarget(
                 if (!fusedCache) {
                     FastllmCudaNaiveRopeQKScaleV(q, k, v, positions, cfg.heads, cfg.kvHeads,
                         cfg.headDim, cfg.valueDim, rotaryDim, cfg.theta, valueScale, mergedQkv ? &qkv : nullptr);
+                    Data *cacheInput = &k;
                     if (localIndexer && !separateIndex) {
                         FastllmCudaNaiveRope(indexKey, positions, 1, indexDim, rotaryDim, cfg.theta);
                         Cat(k, indexKey, 2, packed);
-                    } else {
-                        packed.CopyFrom(k);
+                        cacheInput = &packed;
                     }
-                    Data *cacheInput = &packed;
                     if (pastKey.kvCacheFp8Indexer) {
-                        FastllmCudaNaivePackIndexer(packed, buf.packedIndexer);
+                        FastllmCudaNaivePackIndexer(*cacheInput, buf.packedIndexer);
                         cacheInput = &buf.packedIndexer;
                     }
                     if (decodeWorkspace || ringVerify) {
@@ -1454,8 +1538,16 @@ Data NaiveN05FlashModel::RunTarget(
                             pastValue.Resize({1, localPast + length, pastValue.dims[2]});
                         }
                     } else {
-                        AppendCache(pastKey, *cacheInput, LayerKVType(layer), layerCapacity);
-                        AppendCache(pastValue, v, LayerKVType(layer), layerCapacity);
+                        const auto type = LayerKVType(layer);
+                        // On a cold SWA chunk every visible KV row belongs to this projection.
+                        // Quantize once at the cache write and feed the same values to attention.
+                        coldSwa = slidingLayers[layer] && !verifying && localPast == 0 && length >= 1024 &&
+                            window == 128 && cfg.headDim == 192 && cfg.valueDim == 128 &&
+                            cfg.heads == cfg.kvHeads * 8 && type == FP8_E4M3 && cacheInput == &k &&
+                            !pastKey.kvCacheFp8Indexer && !FastllmCudaGraphIsCapturingFast() &&
+                            (FastllmCudaRuntimeArch() == 100 || FastllmCudaRuntimeArch() == 103);
+                        AppendCache(pastKey, *cacheInput, type, layerCapacity, true, coldSwa);
+                        AppendCache(pastValue, v, type, layerCapacity, true, coldSwa);
                     }
                 }
                 if (!slidingLayers[layer] && (decodeWorkspace ? buf.capacity : pastKey.dims[1]) > indexTopK) {
@@ -1656,8 +1748,8 @@ Data NaiveN05FlashModel::RunTarget(
             if ((batchVerifyIndex || dpPrefill) && attendPhase == 1) return;
             Data stagedKey, stagedValue;
             if (sparseLayer && !batchedDSA) StageSparseKv(tpRank, layer, pastKey, pastValue, stagedKey, stagedValue);
-            Data &attentionKey = sparseLayer && !batchedDSA ? stagedKey : pastKey;
-            Data &attentionValue = sparseLayer && !batchedDSA ? stagedValue : pastValue;
+            Data &attentionKey = coldSwa ? k : (sparseLayer && !batchedDSA ? stagedKey : pastKey);
+            Data &attentionValue = coldSwa ? v : (sparseLayer && !batchedDSA ? stagedValue : pastValue);
             Data &sink = localWeight(ap + "attention_sink_bias");
             if (!sink.dims.empty()) {
                 ToDataType(sink, DataType::FLOAT32);
@@ -1732,13 +1824,17 @@ Data NaiveN05FlashModel::RunTarget(
                         q, attentionKey, attentionValue, *selected, sink, cfg.heads, cfg.kvHeads,
                         localPast, balancedIndexRanks, attn)) {
                     if (balancedIndexRanks) FastllmCudaNaiveRestoreIndexerRows(*selected, balancedIndexRanks);
-                    // SWA has no Indexer projections. QKV already consumed this
-                    // request's input norm; post-attention RMSNorm overwrites it.
-                    // Reuse only this dead row slice, including without DSpark.
-                    FastllmCudaNaiveAttention(q, attentionKey, attentionValue, *selected, sink,
-                        cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
-                        localPast, slidingLayers[layer] ? window : 0, attn, true,
-                        slidingLayers[layer] ? &normed : nullptr);
+                    if (slidingLayers[layer] || verifying ||
+                        !FastllmCudaTryNaiveIndexerAttention({&q, &attentionKey, &attentionValue,
+                            selected, &attn, localPast}, sink, cfg.heads, cfg.kvHeads,
+                            cfg.headDim, cfg.valueDim, prefillScores ? *prefillScores : normed)) {
+                        // SWA has no Indexer projections. Its input norm is dead
+                        // until the post-attention RMSNorm overwrites this slice.
+                        FastllmCudaNaiveAttention(q, attentionKey, attentionValue, *selected, sink,
+                            cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                            localPast, slidingLayers[layer] ? window : 0, attn, true,
+                            slidingLayers[layer] ? &normed : nullptr);
+                    }
                 }
                 if (slidingLayers[layer] && capture && !capture->prefixes.empty()) {
                     for (const auto &snapshot : capture->prefixes[attentionParallel ?
@@ -1830,9 +1926,16 @@ Data NaiveN05FlashModel::RunTarget(
                         FastllmNcclBroadcast(buf.indexBroadcast.cudaData, buf.indexBroadcast.Count(0), INT32,
                             tpDevices[IndexerOwnerRank(layer)], gpu);
                 }
-                if (dpPrefill && phase == 0)
-                    FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
-                        indexFp8, prefillScores, indexerComputeFP8);
+                if (dpPrefill && phase == 0) {
+                    pairedPrefill = FastllmCudaHasBlackwellIndexerAttention() && !packedIndices.empty() &&
+                        prefillItems.size() == packedIndices.size();
+                    for (size_t i = 0; pairedPrefill && i < prefillItems.size(); ++i)
+                        pairedPrefill = prefillItems[i].indices == &packedIndices[i] &&
+                            prefillItems[i].keys->dims[1] <= 8192;
+                    if (!pairedPrefill)
+                        FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
+                            indexFp8, prefillScores, indexerComputeFP8);
+                }
                 if (batchPrefillIndex && phase == 0) {
                     AssertInFastLLM((int)prefillItems.size() == batch->Size(), "Incomplete prefill Indexer batch.");
                     if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores, indexerComputeFP8)) {
@@ -1861,9 +1964,17 @@ Data NaiveN05FlashModel::RunTarget(
             auto &pastValue = tensorParallel ? *pastKeyValues[layer].second.multiDeviceDatas.at(gpu) : pastKeyValues[layer].second;
             attend(normed, q, k, v, qkv, positions, pastKey, pastValue, buf, length, pastLength, reserveCapacity, attn);
         }
-        if (dpPrefill)
-            FastllmCudaNaiveBatchAttention(prefillAttention, localWeight(ap + "attention_sink_bias"),
-                cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim);
+        // A paired Indexer hands its scores directly to attention on this stream.
+        // The other paths have already published their ordered TopK rows.
+        if (pairedPrefill) {
+            for (size_t i = 0; i < prefillItems.size(); ++i)
+                FastllmCudaNaivePrefillIndexedAttention(prefillItems[i], prefillAttention.at(i),
+                    localWeight(ap + "attention_sink_bias"), indexHeads, indexDim, indexTopK,
+                    indexFp8, indexerComputeFP8, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    prefillScores, prefillScores ? *prefillScores : normed);
+        } else if (dpPrefill)
+            FastllmCudaNaiveBatchIndexerAttention(prefillAttention, localWeight(ap + "attention_sink_bias"),
+                cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, prefillScores ? *prefillScores : normed);
         if (batchedDSA && sparseLayer) {
             auto &cache = *sparseKv->ranks[tpRank]->layers[layer];
             // Each group contains at most the configured number of queries per
@@ -1931,15 +2042,19 @@ Data NaiveN05FlashModel::RunTarget(
                         dst.data(), src.data(), bytes.data(), dst.size()), "Sparse attention scatter failed.");
                 }
             }
-        } else if (batchedDSA)
-            FastllmCudaNaiveBatchDSADecode(q, localWeight(ap + "attention_sink_bias"), dsaRows,
-                cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, buf.decode, attn);
+        } else if (batchedDSA) {
+            Data &sink = localWeight(ap + "attention_sink_bias");
+            if (verifying || !FastllmCudaNaiveOnlineDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
+                    cfg.headDim, cfg.valueDim, buf.decode, attn))
+                FastllmCudaNaiveBatchDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
+                    cfg.headDim, cfg.valueDim, buf.decode, attn);
+        }
         if (batchedSWA) {
             Data eagerLengths;
             FastllmCudaNaiveBatchSWADecode(q, localWeight(ap + "attention_sink_bias"), swaRows,
                 verifySWA && !graphVerify ? eagerLengths : liveKeys, cfg.heads, cfg.kvHeads, attn);
         }
-        Linear(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
+        projectAttention(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         if (attentionParallel && AttentionTPSize() > 1) {
             auto &runtime = attentionParallel->runtime;
             // Match the existing TP reduction: sum BF16 partials in FP32,
@@ -2048,12 +2163,14 @@ Data NaiveN05FlashModel::RunTarget(
                 }
                 Data &routerSource = shardRouter ? routedInput : normed;
                 Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
-                if (canonicalPrefillRouter)
+                const bool localRouter = localMoe && !decodeWorkspace && !verifying &&
+                    FastllmCudaNaivePrefillRouter(routerSource, routerWeight, routerInput, router);
+                if (!localRouter && canonicalPrefillRouter)
                     RunLocalPrefillRouter(normed, routerWeight, attentionParallel->rows.localToGlobal[tpRank],
                         inputIds.dims[1], epRanks, routerInput, router);
-                hasRouterProbabilities =
-                    !canonicalPrefillRouter && FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
-                if (!canonicalPrefillRouter && !hasRouterProbabilities) {
+                hasRouterProbabilities = !localRouter && !canonicalPrefillRouter &&
+                    FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
+                if (!localRouter && !canonicalPrefillRouter && !hasRouterProbabilities) {
                     Data localRouterInput;
                     if (shardPrefillRouter) {
                         // Share one backing allocation with the prefill arena;
@@ -2193,10 +2310,9 @@ Data NaiveN05FlashModel::RunTarget(
                 buf.last.ToDevice(CUDA, {gpu}, false); buf.last.Allocate(false);
                 attentionParallel->transfer->Collect(tpRank, normed.cudaData, buf.last.cudaData, size_t(embed_dim) * 2);
             }
-            // Prefill selects each request's last row, then applies model.norm
-            // below. Keep unnormalized hidden rows for that existing contract
-            // and for intermediate DSpark feature capture.
-            if (captureHidden || (layer + 1 == block_cnt && !decodeWorkspace))
+            // Feature capture needs every row. Ordinary prefill passes only
+            // the last local row of each sequence to the vocabulary head.
+            if (captureHidden || (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead))
                 attentionParallel->transfer->Collect(tpRank, hidden.cudaData, buf.hidden.cudaData, size_t(embed_dim) * 2);
         }
         if (captureHidden && tpRank <= 0) {
@@ -2215,17 +2331,37 @@ Data NaiveN05FlashModel::RunTarget(
     Data localLogits;
     Data &last = buf.last, &logits = decodeWorkspace ? buf.logits : localLogits;
     if (!decodeWorkspace) {
-        if (capture && capture->verifying) Copy(hidden, last);
-        else if (batch) {
+        if (verifying) Copy(hidden, last);
+        else if (compactPrefillHead || batch) {
+            const int sequences = batch ? batch->Size() : 1;
             last.dataType = BFLOAT16;
-            last.Resize({1, batch->Size(), embed_dim});
+            last.Resize({1, sequences, embed_dim});
             last.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false);
             last.Allocate(false);
-            int offset = 0;
-            for (int sequence = 0; sequence < batch->Size(); ++sequence) {
-                offset += batch->lengths[sequence];
-                FastllmCudaCopyFromDeviceToDevice((uint16_t *)last.cudaData + (size_t)sequence * embed_dim,
-                    (uint16_t *)hidden.cudaData + (size_t)(offset - 1) * embed_dim, (size_t)embed_dim * sizeof(uint16_t));
+            if (compactPrefillHead) {
+                const auto &group = attentionParallel->groups[tpRank];
+                const auto &local = attentionParallel->ranks[tpRank].hidden;
+                FastllmCudaMemset0(last.cudaData, last.GetBytes());
+                int end = 0;
+                for (size_t i = 0; i < group.lengths.size(); ++i) {
+                    end += group.lengths[i];
+                    auto *dest = static_cast<uint16_t *>(last.cudaData) + size_t(group.sequenceIndices[i]) * embed_dim;
+                    auto *source = static_cast<const uint16_t *>(local.cudaData) + size_t(end - 1) * embed_dim;
+                    AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(dest, source,
+                        size_t(embed_dim) * sizeof(uint16_t)), "Failed to select the last local prefill row");
+                }
+                // Every owner is a group leader. Summing bytes with zeros from
+                // the other ranks preserves the selected BF16 rows bit for bit.
+                auto &runtime = attentionParallel->runtime;
+                runtime.AllReduce(runtime.Layout().leaders, tpRank, last.cudaData, last.GetBytes(),
+                    parallel::ScalarType::Byte);
+            } else {
+                int offset = 0;
+                for (int sequence = 0; sequence < sequences; ++sequence) {
+                    offset += batch->lengths[sequence];
+                    FastllmCudaCopyFromDeviceToDevice((uint16_t *)last.cudaData + (size_t)sequence * embed_dim,
+                        (uint16_t *)hidden.cudaData + (size_t)(offset - 1) * embed_dim, (size_t)embed_dim * sizeof(uint16_t));
+                }
             }
         } else Split(hidden, 1, length - 1, length, last);
         norm(last, localWeight("model.norm.weight"), last);
@@ -2280,10 +2416,7 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
 }
 
 bool NaiveN05FlashModel::SupportsCudaRejectionSampling(const GenerationConfig &config) const {
-    // Rejection p/q uses the existing joint-filter probability builder. Ordinary
-    // sampling's new sequential finite-k support must not change that contract.
-    return config.top_k >= weight.weight.at("lm_head.weight").dims[0] &&
-           SelectLogits(config).cudaSampling;
+    return config.top_k > 1 && SelectLogits(config).cudaSampling;
 }
 
 std::vector<int> NaiveN05FlashModel::SampleCudaLogits(

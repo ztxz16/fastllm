@@ -183,6 +183,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     TileScheduler tile_scheduler{params.tile_scheduler};
 
+    // An empty persistent lane has no epilogue to synchronize TMEM release.
+    // This scheduler predicate is uniform across the CTA.
+    if (!tile_scheduler.is_valid()) return;
+
     int warp_idx = cutlass::canonical_warp_idx_sync();
     auto role = warp_idx_to_WarpRole(warp_idx);
     uint32_t lane_predicate = cute::elect_one_sync();
@@ -314,7 +318,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
     TmemAllocator tmem_allocator;
 
-    if (role == WarpRole::Load && lane_predicate) {
+    // Initialize once even when the schedule has independent K and V loaders.
+    if (threadIdx.x == 0) {
       shared_storage.barrier_O.init(/*num_threads=*/1);
     }
 

@@ -2069,10 +2069,6 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
     LastTokensUnit samplingTokens = round.lastTokens;
     auto &selection = round.selection;
     selection = SelectLogits(config, true);
-    // Reuse Qwen3.5's GPU proposal/rejection sampler for unrestricted top-p.
-    // This shares ordinary CUDA sampling's top-p boundary/tie handling.
-    // Its finite top-k semantics differ from the legacy CPU sampler; penalties,
-    // legacy name masks and minimum-output constraints retain that generic fallback.
 #ifdef USE_CUDA
     // Grammar masks are applied per verification row. Greedy verification also
     // keeps full logits on the device, then transfers only the masked argmax.
@@ -2672,7 +2668,7 @@ void NaiveN05FlashModel::PrepareDraftAcceptanceLocal(const std::vector<DraftRoun
                 while (keep < drafts && r.proposed[keep] == (int)((float *)top.cpuData)[(b * rows + keep) * 2]) ++keep;
                 output[b * rows + keep] = (int)((float *)top.cpuData)[(b * rows + keep) * 2];
             }
-        } else AssertInFastLLM(FastllmCudaMtpRejectionSampling((float *)target.cudaData, (float *)proposal.cudaData,
+        } else AssertInFastLLM(FastllmCudaMtpRejectionSamplingTopKFirst((float *)target.cudaData, (float *)proposal.cudaData,
             temperatures.data(), ks.data(), ps.data(), ids.data(), output.data(), accepted.data(), count, drafts, vocab),
             "Batch rejection sampling failed.");
         for (int b = 0; b < count; ++b) {
@@ -2730,7 +2726,7 @@ int NaiveN05FlashModel::FinishDraftRound(DraftRound &round, Data &logits,
             const int rows = proposed.size() + 1;
             std::vector<float> temperatures(rows, config.temperature), topPs(rows, config.top_p);
             std::vector<int> topKs(rows, config.top_k), sampled(rows);
-            AssertInFastLLM(FastllmCudaMtpRejectionSampling((float *)logits.cudaData,
+            AssertInFastLLM(FastllmCudaMtpRejectionSamplingTopKFirst((float *)logits.cudaData,
                 (float *)proposal.cudaData, temperatures.data(), topKs.data(), topPs.data(),
                 proposed.data(), sampled.data(), &accepted, 1, proposed.size(), vocab),
                 "Naive CUDA rejection sampling failed.");

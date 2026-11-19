@@ -12,6 +12,9 @@ int fastllm_ep8_mega_moe_init_workspace(void *, size_t, const int *, int, int);
 int fastllm_ep8_mega_moe_supported();
 void *fastllm_ep8_mega_moe_create(const void *const *, const void *const *,
     const void *const *, const void *const *, void *, size_t, const void *const *, int, int, int);
+// Blackwell MXFP4 sources contain E2M1 values followed by one UE8M0 exponent per K32.
+void *fastllm_ep8_mega_moe_create_mxfp4(const void *const *, const void *const *,
+    void *, size_t, const void *const *, int, int, int);
 // Every rank must participate. Zero rows represent an idle source rank;
 // pointers must remain non-null, and no output rows are written for that rank.
 int fastllm_ep8_mega_moe_run(void *, const void *, void *, const int32_t *, const float *, int);
