@@ -83,7 +83,7 @@ struct StateCopies {
         // Even an unsuccessful partial submission must finish before borrowed
         // transport buffers can be released.
         FastllmCudaSyncCurrentThreadStream();
-        CheckPD(copied && strided, "state copy failed");
+        CheckPD(copied && strided && !FastllmCudaGetThreadError(), "state copy failed");
     }
 };
 // Indexer sidecars share K's physical page IDs, but have their own row width.
@@ -566,22 +566,60 @@ std::string NaiveN05FlashModel::PDLayout() const {
            std::to_string(indexerLayerSharding) + ":" + std::to_string(draftEnabled) + DraftPDLayout();
 }
 
+struct NaiveN05FlashModel::PDExportPlan {
+    PDStateWriter writer;
+    std::vector<PDStateWriter> ranks;
+    bool planned = false;
+    PDExportPlan(fastkv::BufferPool *pool, size_t count) : writer(pool) {
+        ranks.reserve(count);
+        for (size_t i = 0; i < count; ++i) ranks.push_back(writer.Fork());
+    }
+};
+
+std::function<fastkv::Message()> NaiveN05FlashModel::PreparePDExport(ResponseContext &context) {
+#ifdef USE_CUDA
+    if (attentionDP > 1 && AttentionTPSize() == 1 && !draftEnabled && !sparseKv && !HasSeparateIndexer()) {
+        auto devices = PDRequestDevices(context);
+        // Attention DP joins its workers to the caller before returning. Fence
+        // the owner's caller stream once before handing its pages and ring
+        // to another thread. Other devices can continue without a dispatch.
+        RestorePDDevice restoreDevice;
+        FastllmCudaSetDevice(devices.front());
+        FastllmCudaSyncCurrentThreadStream();
+        CheckPD(!FastllmCudaGetThreadError(), "producer stream failed");
+        auto plan = std::make_shared<PDExportPlan>(PDExportPool(), devices.size());
+        return [this, &context, devices, plan = std::move(plan)]() mutable {
+            auto reply = PackPDState(context, devices, *plan, true);
+            plan.reset(); // Transport owns the result. Only retain plans across capacity retries.
+            return reply;
+        };
+    }
+#endif
+    return {};
+}
+
+void NaiveN05FlashModel::ReleasePDExportSources(ResponseContext &context) {
+    // Release pages and physical SWA allocations before returning the admission
+    // slot. The export lane runs inline to leave model workers free for forward.
+    ReleaseRequestWindowStorage(&context, 1);
+}
+
 fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
+    const auto devices = PDRequestDevices(context);
+    PDExportPlan plan(PDExportPool(), devices.size());
+    return PackPDState(context, devices, plan, false);
+}
+
+fastkv::Message NaiveN05FlashModel::PackPDState(ResponseContext &context, const std::vector<int> &devices,
+                                               PDExportPlan &plan, bool independent) {
 #ifndef USE_CUDA
     throw std::runtime_error("FastKV Naive requires CUDA");
 #else
     CheckPD(!sparseKv, "PD prefill requires GPU KV storage");
     CheckPD(context.preTokens > 0, "empty prefill state");
-    const auto devices = PDRequestDevices(context);
     const bool tp = tpDevices.size() > 1;
-    PDStateWriter writer(PDExportPool());
-    writer.metadata.String(PDLayout());
-    writer.metadata.U32(context.preTokens);
-    for (const auto &pair : context.pastKeyValues)
-        for (const Data *root : {&pair.first, &pair.second})
-            writer.metadata.Ints(root->dims);
-    std::vector<PDStateWriter> ranks;
-    for (size_t i = 0; i < devices.size(); ++i) ranks.push_back(writer.Fork());
+    auto &writer = plan.writer;
+    auto &ranks = plan.ranks;
     auto pack = [&](int rank, bool planning) {
         if (!planning) FastllmCudaSetDevice(devices[rank]);
         const int worldRank = std::find(tpDevices.begin(), tpDevices.end(), devices[rank]) - tpDevices.begin();
@@ -642,12 +680,20 @@ fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
         }
         if (!planning) copies.Submit();
     };
-    if (!draftEnabled) {
-        for (int rank = 0; rank < int(devices.size()); ++rank) pack(rank, true);
-        writer.Reserve();
+    if (!plan.planned) {
+        writer.metadata.String(PDLayout());
+        writer.metadata.U32(context.preTokens);
+        for (const auto &pair : context.pastKeyValues)
+            for (const Data *root : {&pair.first, &pair.second})
+                writer.metadata.Ints(root->dims);
+        if (!draftEnabled)
+            for (int rank = 0; rank < int(devices.size()); ++rank) pack(rank, true);
+        plan.planned = true;
     }
-    RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices,
-                 [&](int rank) { pack(rank, false); });
+    if (!draftEnabled) writer.Reserve(independent);
+    if (independent) pack(0, false); // Dedicated thread/stream on this request's only owner.
+    else RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices,
+                      [&](int rank) { pack(rank, false); });
     for (auto &rank : ranks) {
         writer.metadata.Blob(rank.metadata.bytes.data(), rank.metadata.bytes.size());
         writer.metadata.U32(rank.buffers.size());

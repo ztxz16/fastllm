@@ -645,11 +645,37 @@ static void TestPreparedPrefill() {
     std::cout << "PASS PD bounded prepared queue, page credits, cancellation and exact state\n";
 }
 
-static void TestExportBackpressure() {
+static void TestExportBackpressure(bool independent) {
     class BusyModel : public StateModel {
       public:
         std::atomic<int> blocked{0}, live{0};
-        std::atomic<bool> freeze{false};
+        std::atomic<bool> freeze{false}, secondForward{false}, finishForward{false};
+        bool independent = false;
+        std::atomic<bool> firstSourceReleased{false};
+        std::thread::id modelThread;
+        ~BusyModel() override { finishForward = true; ShutdownRuntime(); }
+        std::function<fastkv::Message()> PreparePDExport(ResponseContext &context) override {
+            if (!independent) return {};
+            if (context.allTokens.front() == 3)
+                context.pastKeyValues.front().first.kvStorageOwner =
+                    std::shared_ptr<void>(this, [this](void *) { firstSourceReleased = true; });
+            return [this, &context] { return ExportPDState(context); };
+        }
+        void ReleasePDExportSources(ResponseContext &context) override {
+            context.pastKeyValues.front().first.kvStorageOwner.reset();
+        }
+        int Forward(const Data &ids, const Data &mask, const Data &positions,
+                    std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
+                    const LastTokensManager &last, std::vector<float> *logits) override {
+            if (forwards == 0) modelThread = std::this_thread::get_id();
+            int token = StateModel::Forward(ids, mask, positions, kv, config, last, logits);
+            if (independent && forwards == 2) {
+                secondForward = true;
+                for (int i = 0; i < 5000 && !finishForward; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return token;
+        }
         void OnResponseContextCreated(ResponseContext *) override { ++live; }
         void OnResponseContextRemoved(ResponseContext *) override { --live; }
         fastkv::Message ExportPDState(ResponseContext &context) override {
@@ -657,15 +683,19 @@ static void TestExportBackpressure() {
                 ++blocked;
                 throw fastkv::CapacityBusy("test export lease held by another transfer");
             }
+            auto lease = PDExportPool()->Acquire(4096, -1);
+            Check(!independent || std::this_thread::get_id() != modelThread,
+                  "independent export packed on the model thread with a free buffer");
             return StateModel::ExportPDState(context);
         }
     } model;
+    model.independent = independent;
     SetMaxTokens(4096);
     fastkv::Service port;
     port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
     const auto endpoint = port.Address(); port.Stop();
     model.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","pressure"},
-        {"transport","tcp"},{"listen",endpoint},{"chunk_tokens",64},{"transfer_workers",2}});
+        {"transport","tcp"},{"listen",endpoint},{"chunk_tokens",64},{"transfer_workers",2},{"max_inflight_bytes",1<<20}});
     fastkv::Options options; options.transport = fastkv::Transport::Tcp; options.workers = 2;
     fastkv::Service client(options);
     auto submit = [&](int token, std::shared_ptr<fastkv::Cancellation> cancellation = {}) {
@@ -676,11 +706,24 @@ static void TestExportBackpressure() {
         Check(client.TrySubmit(endpoint,request,result,std::move(cancellation)),"export fixture admission failed");
         return result;
     };
+    auto held = independent ? model.PDExportPool()->Acquire(1 << 20, -1) : fastkv::Buffer{};
     auto first = submit(3);
     for (int i = 0; i < 3000 && !model.blocked; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     Check(model.blocked > 0, "export backpressure fixture did not block");
     auto second = submit(7);
+    if (independent) {
+        for (int i = 0; i < 3000 && !model.secondForward; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(model.secondForward, "second forward did not start");
+        Check(!model.firstSourceReleased, "waiting export dropped its source lease");
+        held = {};
+        const bool overlapped = first.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        const bool sourceReleased = model.firstSourceReleased;
+        model.finishForward = true;
+        Check(sourceReleased, "completed copy kept its source lease until the next forward finished");
+        Check(overlapped, "releasing export capacity did not deliver the first KV during the next forward");
+    }
     for (auto *result : {&first, &second})
         Check(result->wait_for(std::chrono::seconds(5)) == std::future_status::ready,
               "busy export blocked the next prefill");
@@ -691,6 +734,15 @@ static void TestExportBackpressure() {
         Check(((float *)state.cpuData)[0] == token,"busy export changed state"); token = 7;
     }
     Check(model.forwards == 2,"busy export recomputed a completed prefix");
+    if (independent) {
+        for (int i = 0; i < 3000 && model.live; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(model.live == 0, "previous exports did not retire");
+        auto unblocked = submit(13);
+        Check(unblocked.wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+              "export with a free buffer stalled");
+        unblocked.get();
+    }
     model.freeze = true;
     for (bool shutdown : {false,true}) {
         const int blocked = model.blocked;
@@ -706,7 +758,8 @@ static void TestExportBackpressure() {
         for (int i = 0; i < 3000 && model.live; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
         Check(model.live == 0,"queued export leaked its context");
     }
-    std::cout << "PASS PD export pressure: forward progress, exact state, cancellation and shutdown\n";
+    std::cout << "PASS PD export pressure, independent=" << independent
+              << ": forward progress, exact state, cancellation and shutdown\n";
 }
 
 static void TestPrefillBatch() {
@@ -1019,6 +1072,45 @@ static void TestGPUState() {
     if (!FastllmCudaGetMemoryInfo(0, freeBytes, totalBytes)) return;
     std::vector<int> devices{0};
     if (FastllmCudaGetMemoryInfo(1, freeBytes, totalBytes)) devices.push_back(1);
+    if (devices.size() == 2 && fastkv::EnableCudaPeerAccess(devices)) {
+        fastkv::BufferPool peers(256 << 10);
+        peers.Preallocate(devices, true);
+        for (int owner : devices) {
+            FastllmCudaSetDevice(owner);
+            PDStateWriter output(&peers);
+            Data tensor(FLOAT32, {1, 12288});
+            tensor.dataDevice = CUDA;
+            tensor.dataDeviceIds = {owner};
+            for (int i = 0; i < 3; ++i) output.PlanTensor(tensor);
+            output.Reserve(true);
+            auto source = fastkv::Buffer::Allocate(3 * tensor.GetBytes(), owner);
+            std::vector<uint8_t> pattern(source.Size());
+            for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = (i * 31 + i / 97 + owner) & 255;
+            source.Write(pattern.data(), 0, pattern.size());
+            for (int i = 0; i < 3; ++i) {
+                Data view(FLOAT32, tensor.dims);
+                view.dataDevice = CUDA; view.dataDeviceIds = {owner};
+                output.AllocateTensor(view);
+                void *dst = view.cudaData;
+                const void *src = static_cast<const uint8_t *>(source.Data()) + i * tensor.GetBytes();
+                const size_t bytes = tensor.GetBytes();
+                Check(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(&dst, &src, &bytes, 1),
+                      "peer export kernel failed");
+            }
+            FastllmCudaSyncCurrentThreadStream();
+            auto message = output.Finish({owner});
+            Check(message.buffers[2].Device() != owner && message.buffers[2].Preallocated(),
+                  "oversized GPU export did not use peer memory");
+            Check(PDReceivePlacement(message.metadata, 3, {7}) == std::vector<int>({7,7,7}),
+                  "physical peer changed logical destination rank");
+            for (int i = 0; i < 3; ++i) {
+                std::vector<uint8_t> bytes(tensor.GetBytes());
+                message.buffers[i].Read(bytes.data(), 0, bytes.size());
+                Check(std::equal(bytes.begin(), bytes.end(), pattern.begin() + i*bytes.size()),
+                      "GPU peer export corrupted tensor contents");
+            }
+        }
+    }
     fastkv::BufferPool pool(256 << 20);
     PDStateWriter writer(&pool);
     std::vector<std::vector<uint8_t>> reference;
@@ -1369,7 +1461,8 @@ int main(int argc, char **argv) {
         mismatch.StopPD();
         prefill.StopPD();
         TestGPUState();
-        TestExportBackpressure();
+        TestExportBackpressure(false);
+        TestExportBackpressure(true);
         TestPrefillBatch();
         TestPrefillDPBatch();
         TestPreparedPrefill();

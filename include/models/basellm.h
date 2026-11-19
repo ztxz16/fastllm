@@ -826,6 +826,12 @@ namespace fastllm {
         int PreviewPDResidentPrefix(const std::vector<int> &tokens);
         fastkv::BufferPool *PDExportPool() const;
         virtual fastkv::Message ExportPDState(ResponseContext &context);
+        // Called on the model lane after forward. An opt-in adapter fences the
+        // producer and returns a retryable pack operation for the export lane.
+        // The adapter must support DescribePDCache on that lane and terminal
+        // release of its page/window leases before model-lane removal.
+        virtual std::function<fastkv::Message()> PreparePDExport(ResponseContext &) { return {}; }
+        virtual void ReleasePDExportSources(ResponseContext &) {}
         // Opaque immutable regions; policy, storage and transfers belong to FastKV.
         virtual fastkv::CacheSnapshot DescribePDCache(ResponseContext &context, const fastkv::Message &state);
         virtual void ImportPDState(ResponseContext &context, const fastkv::Message &state);

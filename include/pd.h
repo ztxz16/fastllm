@@ -30,11 +30,10 @@ class PDStateWriter {
     fastkv::Writer metadata;
     std::vector<fastkv::Buffer> buffers;
     void Tensor(const Data &tensor);
-    // Optional two-pass export: compact every rank's tensors into one arena
-    // per device and reserve the complete message on the model lane.
-    // CapacityBusy must never escape a GPU worker.
+    // Reserve the complete message before issuing GPU copies. A single-owner
+    // producer with peer-aware copy kernels may write into several warm GPUs.
     void PlanTensor(const Data &tensor);
-    void Reserve();
+    void Reserve(bool allowPeerWrites = false);
     // Allocate a compact GPU payload directly in an owned transport arena.
     // The Data is a temporary borrowed view; Finish retains the allocation.
     void AllocateTensor(Data &tensor);

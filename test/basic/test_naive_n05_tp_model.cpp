@@ -1107,6 +1107,8 @@ class Fixture : public NaiveN05FlashModel {
                 for (int i = 0; i < length; ++i) context->allTokens.push_back((i * 17 + 3) % 256);
                 context->inputTokens = length + 1;
                 (context == &reference ? *this : destination).OnResponseContextCreated(context);
+                if (context == &reference && dp > 1 && dp == ranks && !TryAdmitResponseContext(context))
+                    throw std::runtime_error("PD source window admission failed");
             }
             std::vector<float> ids(reference.allTokens.begin(), reference.allTokens.end()), positions(length);
             std::iota(positions.begin(), positions.end(), 0.f);
@@ -1131,6 +1133,42 @@ class Fixture : public NaiveN05FlashModel {
             isIntermediateChunkedPrefill = false;
             reference.preTokens = length;
             auto message = ExportPDState(reference);
+            const bool independentExport = dp > 1 && dp == ranks && !draft && kvCacheDataType == FP8_E4M3;
+            if (independentExport) {
+                auto pack = PreparePDExport(reference);
+                if (!pack) throw std::runtime_error("missing independent GPU export");
+                // Use another live request on the producer while packing a
+                // long prefix. The two paths must not share GPU worker state.
+                ResponseContext next;
+                const bool overlap = length == 4097;
+                if (overlap) {
+                    next.Init(block_cnt, dataType, kvCacheDataType);
+                    next.allTokens.assign(128, 17);
+                    next.generationConfig.input_token_length = next.inputTokens = 128;
+                    OnResponseContextCreated(&next);
+                    if (!TryAdmitResponseContext(&next)) throw std::runtime_error("overlap window admission failed");
+                }
+                auto result = std::async(std::launch::async, std::move(pack));
+                if (overlap) {
+                    std::vector<float> pos(128);
+                    std::iota(pos.begin(), pos.end(), 0.f);
+                    isIntermediateChunkedPrefill = true;
+                    Forward(Data(FLOAT32, {1,128}, std::vector<float>(128,17)), Data(), Data(FLOAT32, {1,128}, pos),
+                            next.pastKeyValues, next.generationConfig);
+                    isIntermediateChunkedPrefill = false;
+                    OnResponseContextRemoved(&next);
+                }
+                auto async = result.get();
+                if (async.metadata != message.metadata || async.buffers.size() != message.buffers.size())
+                    throw std::runtime_error("independent GPU export changed the wire format");
+                for (size_t i = 0; i < message.buffers.size(); ++i) {
+                    std::vector<uint8_t> a(message.buffers[i].Size()), b(async.buffers[i].Size());
+                    message.buffers[i].Read(a.data(), 0, a.size());
+                    async.buffers[i].Read(b.data(), 0, b.size());
+                    if (a != b) throw std::runtime_error("independent GPU export changed KV bytes");
+                }
+                message = std::move(async);
+            }
             imported.allTokens.push_back(42);
             if (kvmem) {
                 // Dropping an unsubmitted reservation must return every page.
@@ -1282,6 +1320,19 @@ class Fixture : public NaiveN05FlashModel {
                 }
                 if (!original->rounds || !original->proposed)
                     throw std::runtime_error("PD test did not execute speculative verification");
+            }
+            if (independentExport) {
+                // Imported state remains live. A mirrored root and leaf own
+                // only one page reference on the source GPU.
+                const Data &root = reference.pastKeyValues.front().first;
+                const Data &leaf = *root.multiDeviceDatas.at(PDRequestDevices(reference).front());
+                auto *pool = leaf.pagedKVCacheData;
+                const int page = leaf.pageIndex.at(0), refs = pool->pageRefCount.at(page);
+                std::weak_ptr<void> window = root.kvStorageOwner;
+                if (window.expired()) throw std::runtime_error("missing source window lease");
+                std::async(std::launch::async, [&] { ReleasePDExportSources(reference); }).get();
+                if (!window.expired() || pool->pageRefCount.at(page) != refs - 1 || !root.multiDeviceDatas.empty())
+                    throw std::runtime_error("finished export did not release its source exactly once");
             }
             OnResponseContextRemoved(&reference);
             destination.OnResponseContextRemoved(&imported);

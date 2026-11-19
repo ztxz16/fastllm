@@ -95,6 +95,8 @@ namespace fastllm {
                                   size_t required) override;
         bool HasPDResidentPrefixCache() const override { return saveHistoryChat && !tpPagedCaches.empty(); }
         fastkv::Message ExportPDState(ResponseContext &context) override;
+        std::function<fastkv::Message()> PreparePDExport(ResponseContext &context) override;
+        void ReleasePDExportSources(ResponseContext &context) override;
         fastkv::CacheSnapshot DescribePDCache(ResponseContext &context, const fastkv::Message &state) override;
         void ImportPDState(ResponseContext &context, const fastkv::Message &state) override;
         void AddPromptCache(const std::vector<int> &tokens) override;
@@ -228,7 +230,7 @@ namespace fastllm {
             }
         };
         using PrefixSnapshots = std::vector<std::shared_ptr<PrefixSnapshot>>;
-        void ReleaseRequestWindowStorage(ResponseContext *context);
+        void ReleaseRequestWindowStorage(ResponseContext *context, int threadLimit = GetThreads());
         struct HostPrefixTransfer;
         size_t hostPrefixBytes = 0;
         int64_t hostPrefixSwaBytes = -1;
@@ -336,6 +338,9 @@ namespace fastllm {
         bool PrepareDraftTP();
         void PrepareDraftContextTP(DraftContext &context);
         std::string DraftPDLayout() const;
+        struct PDExportPlan;
+        fastkv::Message PackPDState(ResponseContext &context, const std::vector<int> &devices,
+                                    PDExportPlan &plan, bool independent);
         void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length);
         std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length);
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
