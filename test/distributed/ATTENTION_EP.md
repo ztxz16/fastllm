@@ -353,6 +353,38 @@ Pack、Gate/Up、激活、Down、ReduceScatter后的逐槽贡献、有序累加�
 最终报告`first_different_stage`与每个专家的首个差异，并保存JSON/Markdown/CSV/XLSX。
 零容差FAIL表示观测到差异，不等于已证明算子错误；该诊断不自动放宽原验收标准。
 
+若共同输入和路由完全相同、首差位于专家Gate/Up或Down，可进一步做独立cuBLAS归约实验：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 "$ATTENTION_EP_REFERENCE_PYTHON" \
+  test/distributed/probe_qwen_moe_gemm_reduction.py \
+  --build "$ATTENTION_EP_BUILD" --model "$ATTENTION_EP_MODEL" \
+  --cuda-home "$ATTENTION_EP_CUDA_HOME" \
+  --baseline /绝对路径/时间戳_moe_block_batches_随机号
+```
+
+使用已有CUDA PyTorch与safetensors的reference环境，不编译、不重建worker。
+入口校验基准有效性、原worker、模型config/index及内部快照SHA256；按每个专家的
+首差选择Gate/Up或Down，并再次要求共同输入行完全一致。Down上游激活已经不同则
+拒绝归因。两边保留各自完整矩阵行数执行，只在结果比较时按原路由槽位抽取共同请求。
+
+从原模型分片读取对应专家权重，Gate在前、Up在后拼接，沿用FP16输入/输出、
+`CUBLAS_COMPUTE_32F`和`CUBLAS_GEMM_DEFAULT_TENSOR_OP`，在原owner GPU上
+使用现有worker链接的cuBLAS库。每模式每专家每矩阵warmup一次，正式调用至少5轮；
+必须全部精确重放原始输出，才进入候选配置。库符号来源和math mode均运行时核验。
+
+候选仅给私有handle增加`CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION`，
+该标志要求使用计算类型进行归约，见[NVIDIA数值行为说明](https://docs.nvidia.com/cuda/archive/12.6.2/cublas/index.html#gemm-algorithms-numerical-behavior)。
+它不保证不同矩阵形状逐位相同；对照结果也不能单独证明具体算法或归约步骤。
+本入口是独立数值实验，不修改正式后端，不运行完整生成、HF对齐或性能计时。
+
+报告目录为`时间戳_moe_gemm_reduction_随机号/`，保存原始输出、每轮样本引用和摘要、
+权重来源、GPU/库/构建信息及JSON/Markdown/CSV/XLSX。相同重复输出复用已保存文件。
+重点读取`baseline_replay_passed`和`candidate_batch_invariant`，后者还要求各矩阵重复
+运行稳定；`candidate_targets`列出各专家结果。旧配置跨批次差异仍记FAIL，因此即使候选
+全部通过，总报告仍FAIL并返回非零。基准重放失败或诊断异常时，候选结论为null并保留
+部分报告。候选通过后仍需另行修改正式路径并验证完整模型，不能直接视为问题已修复。
+
 ### 四项联合验收
 
 `real-all`等价于真实模型入口的`--alignment-policy all`。固定比较exact、K=5/容差0、
