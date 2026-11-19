@@ -37,6 +37,7 @@ class SchedulerModel : public basellm {
     int activeCaches = 0;
 public:
     int peakActiveCaches = 0;
+    bool sawMultiRowBatch = false;
     void EnableSharedPool(int perRequest) {
         kvMemConfig.enabled = true;
         kvMemConfig.maxTokens = max_positions = perRequest;
@@ -99,10 +100,29 @@ public:
     int Forward(const Data &ids, const Data &, const Data &,
                 std::vector<std::pair<Data, Data>> &cache,
                 const GenerationConfig &, const LastTokensManager &, std::vector<float> *) override {
+        return ForwardRow(ids.Count(0), cache[0].first, cache[0].second);
+    }
+    std::vector<int> ForwardBatch(int batch, const Data &ids, const std::vector<Data *> &,
+            const std::vector<Data *> &, const std::vector<int> &lengths,
+            std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &,
+            const LastTokensManager &, std::vector<std::vector<float> *> *) override {
+        Check(lengths.size() == batch && kv.size() == batch, "expected one KV pair per request");
+        sawMultiRowBatch |= batch > 1;
+        int total = 0;
+        std::vector<int> result;
+        for (int row = 0; row < batch; ++row) {
+            total += lengths[row];
+            result.push_back(ForwardRow(lengths[row], *kv[row].first, *kv[row].second));
+        }
+        Check(total == ids.Count(0), "packed batch token count mismatch");
+        return result;
+    }
+private:
+    int ForwardRow(int tokens, Data &key, Data &value) {
         bool concurrentDecode;
         {
             std::lock_guard<std::mutex> lock(cacheMutex);
-            concurrentDecode = activeCaches >= 2 && !cache[0].first.dims.empty();
+            concurrentDecode = activeCaches >= 2 && !key.dims.empty();
         }
         {
             std::unique_lock<std::mutex> lock(gateMutex);
@@ -115,12 +135,12 @@ public:
                   "scheduler fixture was not resumed");
         }
         std::lock_guard<std::mutex> lock(cacheMutex);
-        const bool fresh = cache[0].first.dims.empty();
-        const int length = (fresh ? 0 : cache[0].first.dims[1]) + ids.Count(0);
+        const bool fresh = key.dims.empty();
+        const int length = (fresh ? 0 : key.dims[1]) + tokens;
         Check(length <= tokensLimit, "scheduler exceeded the logical token limit");
         if (fresh) peakActiveCaches = std::max(peakActiveCaches, ++activeCaches);
         for (int component = 0; component < 2; ++component) {
-            Data &data = component == 0 ? cache[0].first : cache[0].second;
+            Data &data = component == 0 ? key : value;
             data.Resize({1, length, 1});
             if (view == CacheView::Contiguous) {
                 data.expansionDims = {1, tokensLimit, 1};
@@ -147,6 +167,7 @@ public:
         }
         return 7;
     }
+public:
     void OnResponseContextRemoved(ResponseContext *context) override {
         std::lock_guard<std::mutex> lock(cacheMutex);
         if (!context->pastKeyValues[0].first.dims.empty()) --activeCaches;
@@ -268,6 +289,8 @@ void Concurrent(CacheView view, bool pressure, const basellm *capabilities = nul
     std::cout << "CONCURRENT_RESULT view=" << (int)view << " pressure=" << pressure
               << " output=" << counts[0] << ',' << counts[1] << '\n';
     Check(model.peakActiveCaches == 2, "fixture did not exercise concurrent requests");
+    if (capabilities && capabilities->canDoBatchForward)
+        Check(model.sawMultiRowBatch, "fixture did not run a multi-request forward");
     if (!pressure) Check(counts == std::vector<int>({320, 192}), "concurrent request ended early");
     else Check(counts[0] > 0 && counts[1] > 0 && counts[0] <= 768 && counts[1] <= 768,
                "pool pressure violated the context limits");
