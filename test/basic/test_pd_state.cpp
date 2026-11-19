@@ -1318,6 +1318,7 @@ int main(int argc, char **argv) {
                                                  {"chunk_tokens", 2}});
         SetMaxTokens(4096);
         decode.tokensLimit = 130;
+        decode.max_positions = 130;
         decode.ConfigurePD(json11::Json::object{{"role", "decode"},
                                                 {"model_id", "test"},
                                                 {"transport", "tcp"},
@@ -1445,6 +1446,20 @@ int main(int argc, char **argv) {
             cancelled.allTokens = {1, 2, 3};
             decode.BeginPD(&cancelled);
             decode.PollPD(&cancelled);
+        }
+        // An overlong D prompt must reach API consumers as a context limit
+        // error before routing or claiming a remote prefill slot.
+        for (int length : {decode.max_positions - 1, decode.max_positions, decode.max_positions + 1}) {
+            ResponseContext boundary;
+            boundary.Init(1, FLOAT32, FLOAT32);
+            boundary.allTokens.assign(length, 1);
+            decode.BeginPD(&boundary);
+            if (length < decode.max_positions) {
+                Check(boundary.HasPendingPD() && !boundary.isEnding, "valid PD prompt rejected");
+            } else {
+                Check(boundary.isEnding && boundary.error == ResponseContextErrorPromptTooLong &&
+                      !boundary.pdPending && !boundary.pdAdmission, "wrong PD context-limit status");
+            }
         }
         ResponseContext oversized;
         oversized.Init(1, FLOAT32, FLOAT32);

@@ -1398,7 +1398,11 @@ void basellm::BeginPD(ResponseContext *context) {
     if (!IsPDDecode() || context->allTokens.size() < 2)
         return;
     Check(context->multimodalInput.empty(), "multimodal PD state transfer is not implemented");
-    Check(context->allTokens.size() < size_t(max_positions), "prompt exceeds context capacity");
+    if (context->allTokens.size() >= size_t(max_positions)) {
+        context->error = ResponseContextErrorPromptTooLong;
+        context->isEnding = true;
+        return;
+    }
     std::vector<int> prefix(context->allTokens.begin(), context->allTokens.end() - 1);
     fastkv::Writer writer;
     writer.U32(1);
