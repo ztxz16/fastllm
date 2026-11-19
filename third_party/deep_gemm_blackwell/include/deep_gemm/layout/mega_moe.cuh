@@ -55,7 +55,7 @@ struct alignas(128) MegaMoESignals {
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
     static constexpr uint32_t kNumMaxExperts = 2048;
     static constexpr uint32_t kNumMaxExpertsPerRank = 512;
-    static constexpr uint32_t kNumMaxRingBlocks = 1u << 20;  // 20 MiB for the ring signals
+    static constexpr uint32_t kNumMaxRingBlocks = 1024;  // FastLLM checks every compiled tile against this bound.
     static constexpr uint32_t kNumMaxSharedL2Blocks = 1u << 15;  // 128 KiB
 
     // Grid and NVLink synchronization
