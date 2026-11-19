@@ -129,8 +129,19 @@ const KVPage *ReservePages(KVPools &pools, int device, Data &key, Data &value, i
     }
     int length = std::min(end, retained);
     pages->Ensure((length + KVPageTokens - 1) / KVPageTokens, keyWidth, valueWidth);
-    key.Resize({1, length, keyWidth});
-    value.Resize({1, length, valueWidth});
+    // The scheduler accounts for allocated tokens separately from the live
+    // prefix. A rejected draft can shorten the prefix while its pages stay owned.
+    const int reserved = pages->published * KVPageTokens;
+    auto resizeView = [&](Data &data, int width) {
+        if (data.expansionDims.empty() || data.expansionDims[1] != reserved) {
+            data.expansionDims.clear();
+            data.Resize({1, reserved, width});
+            data.expansionDims = data.dims;
+        }
+        data.Resize({1, length, width});
+    };
+    resizeView(key, keyWidth);
+    resizeView(value, valueWidth);
     return pages->table;
 }
 } // namespace fastllm::hy4
