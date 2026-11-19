@@ -4860,8 +4860,8 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
 }
 
 #ifdef FASTLLM_NAIVE_BATCH_INDEXER
-static void LaunchBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descriptors,
-                                        int count, int capacity) {
+static void SelectBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descriptors,
+                                         int count, int capacity) {
     namespace batch = naive_indexer_batch;
     if (capacity > 16384) {
         const int blocks = std::min(naive_topk::kMaxBlocks, (capacity + 4095) / 4096);
@@ -4871,7 +4871,11 @@ static void LaunchBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descr
         }
         batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
     } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
-    batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
+}
+static void LaunchBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descriptors,
+                                         int count, int capacity) {
+    SelectBatchDecodeIndexerTopK(descriptors, count, capacity);
+    naive_indexer_batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
 }
 static bool ScalarBatchDecodeIndexer(const fastllm::Data &query, const fastllm::Data &weights,
         const fastllm::Data &liveKeys, const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query) {
@@ -4956,18 +4960,24 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     };
     bool hopper = FastllmCudaRuntimeArch() == 90;
     const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
+    // Replicated decode scans live keys with a bounded score grid and split radix
+    // passes. Only their tile-rounded int offsets need headroom. CP also has a
+    // separate candidate exchange and retains its existing dispatch limit.
+    const int maxCapacity = cp ? naive_topk::kMaxKeys : INT_MAX / 2;
     for (const auto &row : rows) {
         if (!row.key || !row.scratch || !row.indices || !FastllmNaiveKVType(row.key->dataType) ||
             row.key->dims.size() != 3 || row.key->dims[2] <
                 (contextPageLen && row.key->kvCacheFp8Indexer ? FastllmNaiveIndexerBytes / row.key->unitSize : dim) ||
             (contextPageLen && row.key->pageLen != contextPageLen / contextRanks) ||
-            row.capacity <= 0 || row.capacity > naive_topk::kMaxKeys ||
+            row.capacity <= 0 || row.capacity > maxCapacity ||
             row.sequence < 0 || row.sequence >= liveKeys.Count(0) ||
             (size_t)(row.sequence + 1) * heads * dim > query.Count(0) ||
             (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
         if (direct && width < std::min(naive_topk::kTopK, pagedShardCapacity(row.capacity))) return false;
         // cp.async copies 16 bytes; FP8 therefore needs twice as many elements.
-        hopper = hopper && row.key->dataType == cacheType &&
+        // Above the former batch limit the single-row path used BF16 MMA on
+        // quantized keys. Keep its accumulation order, including TopK ties.
+        hopper = hopper && row.capacity <= naive_topk::kMaxKeys && row.key->dataType == cacheType &&
             row.key->kvCacheFp8Indexer == rows.front().key->kvCacheFp8Indexer &&
             row.key->dims[2] % (cacheType == FP8_E4M3 ? 16 : 8) == 0 &&
             (uintptr_t)row.key->cudaData % 16 == 0;
@@ -5124,7 +5134,11 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             auto pairedKernel = batch::HopperScores<false, false, 2>;
             bool paired = pairChunk && count >= 16;
             paired = paired && BulkKernelSupported(pairedKernel, 0, 90);
-            const int scoreBlocks = DecodeIndexerScoreBlocks(paired ? count / 2 : count / sharedQueries,
+            // A long graph can have just one long live row. Give that row a
+            // full grid budget; short rows retire their unused tiles.
+            const int scoreRows = capacity > naive_topk::kMaxKeys ? 1 :
+                (paired ? count / 2 : count / sharedQueries);
+            const int scoreBlocks = DecodeIndexerScoreBlocks(scoreRows,
                 (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, hopper && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
             const dim3 grid(scoreBlocks, paired ? count / 2 : count / sharedQueries);
             if (paired) {
@@ -5195,14 +5209,9 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             BulkKernelSupported(naive_indexer_wide_select::SelectWide<>, 0, 90);
         if (wideSelect) {
             naive_indexer_wide_select::SelectWide<<<count, 1024>>>(descriptors);
-        } else if (capacity > 16384) {
-            const int blocks = std::min(naive_topk::kMaxBlocks, (capacity + 4095) / 4096);
-            for (int shift = 24; shift >= 0; shift -= 8) {
-                batch::SplitHistogram<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors, shift);
-                batch::SplitThreshold<><<<count, naive_topk::kThreads>>>(descriptors, blocks, shift);
-            }
-            batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
-        } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
+        } else {
+            SelectBatchDecodeIndexerTopK(descriptors, count, capacity);
+        }
         if (direct) {
             batch::SortContextPairs<0><<<count, naive_topk::kThreads>>>(descriptors, pairs, width);
             first += count;

@@ -566,6 +566,50 @@ static void CheckIndexerScores(const std::vector<unsigned> &actual,
     Require(relative <= 1e-7 && maximum <= 1e-6 + 2e-7 * scale, "FP8 indexer score error");
 }
 
+static void MixedLongDecodeIndexer() {
+    constexpr int batch = 4, capacity = 524288, longest = 262145;
+    Data q(BFLOAT16), weights(BFLOAT16), live(INT32);
+    Upload(q, {1, batch, 2048}, 191);
+    Upload(weights, {1, batch, 16}, 101);
+    live.Resize({batch});
+    live.ToDevice(DataDevice::CUDA, {0}, false);
+    live.Allocate();
+    Cuda(cudaMemset(live.cudaData, 0, batch * sizeof(int)));
+    std::vector<std::unique_ptr<FP8Tensor>> keys;
+    std::vector<Data> indices(batch);
+    std::vector<FastllmNaiveDecodeScratch> scratch(batch);
+    std::vector<FastllmNaiveIndexerRow> rows;
+    for (int i = 0; i < batch; ++i) {
+        keys.emplace_back(new FP8Tensor(i == 0 ? longest : 8193, 128, 37 + i, true));
+        rows.push_back({&keys.back()->data(), &scratch[i], &indices[i], i, capacity});
+    }
+    Graph graph;
+    graph.Capture([&] {
+        Require(FastllmCudaNaiveBatchDecodeIndexer(q, weights, live, rows, true),
+                "long graph declined the mixed decode batch");
+    });
+    for (int first : {8193, longest, 0}) {
+        int lengths[] = {first, 8193, 257, 0};
+        Cuda(cudaMemcpy(live.cudaData, lengths, sizeof(lengths), cudaMemcpyHostToDevice));
+        graph.Run();
+        for (int i = 0; i < batch; ++i) {
+            Data qi(BFLOAT16), wi(BFLOAT16), li(INT32), expected;
+            qi.Resize({1, 1, 2048}); qi.FakeFrom(q, size_t(i) * 2048 * q.unitSize);
+            wi.Resize({1, 1, 16}); wi.FakeFrom(weights, size_t(i) * 16 * weights.unitSize);
+            li.Resize({1}); li.FakeFrom(live, i * sizeof(int));
+            FastllmNaiveDecodeScratch reference;
+            FastllmCudaNaiveDecodeIndexer(qi, wi, keys[i]->data(), li,
+                std::max(1, lengths[i]), true, reference, expected);
+            Require(Read<int>(indices[i]) == Read<int>(expected), "long graph changed TopK indices");
+            auto scores = Read<unsigned>(scratch[i].indexScores);
+            auto expectedScores = Read<unsigned>(reference.indexScores);
+            Require(std::equal(scores.begin(), scores.begin() + lengths[i], expectedScores.begin()),
+                    "long graph changed Indexer score bits");
+        }
+    }
+    ++checks;
+}
+
 static void FP8BatchIndexer(int batch, bool paged, int width = 320, int length = 4097) {
     Data q(BFLOAT16), w(BFLOAT16), live(INT32);
     Upload(q, {1, batch, 16 * 128}, 191);
@@ -715,6 +759,7 @@ int main(int argc, char **argv) {
             std::printf("WIDE HEAD FP8 DSA PASS %d checks\n", checks);
             return 0;
         }
+        MixedLongDecodeIndexer();
         int peerAccess = 0;
         if (devices > 1) {
             Cuda(cudaDeviceCanAccessPeer(&peerAccess, 1, 0));
