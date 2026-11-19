@@ -67,15 +67,19 @@ class Hy4FlashModel final : public basellm {
     std::vector<int> devices;
     using Cache = std::vector<std::pair<Data *, Data *>>;
     using Logits = std::vector<std::vector<float>>;
-    Logits ProposeGpu(const std::vector<int> &anchors, Cache &past,
-                      const std::vector<GenerationConfig> &configs,
-                      const std::vector<hy4::DraftRequest *> &states);
-    Logits ProposeHybrid(const std::vector<int> &anchors, Cache &past,
-                         const std::vector<GenerationConfig> &configs,
-                         const std::vector<hy4::DraftRequest *> &states);
+    int CommitVerifiedTokens(size_t request, Cache &past, hy4::DraftRequest &state,
+                             const GenerationConfig &config, const std::vector<int> &tokens);
+    std::vector<int> ProposeGpu(const std::vector<int> &anchors, Cache &past,
+                                const std::vector<GenerationConfig> &configs,
+                                const std::vector<hy4::DraftRequest *> &states);
+    std::vector<int> ProposeHybrid(const std::vector<int> &anchors, Cache &past,
+                                   const std::vector<GenerationConfig> &configs,
+                                   const std::vector<hy4::DraftRequest *> &states);
     Logits ForwardGpu(const std::vector<int> &tokens, const std::vector<int> &lengths, Cache &past,
-                      const std::vector<GenerationConfig> &configs, bool verify = false);
+                      const std::vector<GenerationConfig> &configs, bool verify = false,
+                      std::vector<int> *sampled = nullptr, float **deviceLogits = nullptr);
     Logits ForwardHybrid(const std::vector<int> &tokens, const std::vector<int> &lengths, Cache &past,
-                         const std::vector<GenerationConfig> &configs, bool verify = false);
+                         const std::vector<GenerationConfig> &configs, bool verify = false,
+                         std::vector<int> *sampled = nullptr, float **deviceLogits = nullptr);
 };
 } // namespace fastllm

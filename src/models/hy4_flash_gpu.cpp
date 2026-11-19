@@ -5,17 +5,17 @@
 
 namespace fastllm {
 #ifdef FASTLLM_ENABLE_HY4_CUDA
-Hy4FlashModel::Logits Hy4FlashModel::ProposeGpu(const std::vector<int> &anchors, Cache &past,
-                                                const std::vector<GenerationConfig> &configs,
-                                                const std::vector<hy4::DraftRequest *> &states) {
+std::vector<int> Hy4FlashModel::ProposeGpu(const std::vector<int> &anchors, Cache &past,
+                                           const std::vector<GenerationConfig> &configs,
+                                           const std::vector<hy4::DraftRequest *> &states) {
     auto &w = *source;
     auto &arenas = gpuArenas;
     std::vector<int> expanded;
-    std::vector<int> bases;
+    const int vocab = w.meta.at("lm_head.weight").dims[0];
+    std::vector<hy4::DraftProposal> proposals(states.size());
     for (size_t i = 0; i < states.size(); ++i) {
         auto &state = *states[i];
         const int base = past[i * block_cnt].first->cpuIntDatas.size();
-        bases.push_back(base);
         auto target =
             static_cast<const float *>(state.hidden.cudaData) + size_t((base - 1) % (draftWidth + 1)) * 3072;
         size_t deviceIndex = arenas.size() - 1;
@@ -38,40 +38,31 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeGpu(const std::vector<int> &anchors,
             auto cache = hy4::UploadAttentionCaches(s, {{nullptr, table}});
             hy4::DraftLayer(w, s, k, base, draftWidth, provider, block, &cache->draft);
         }
-        auto candidates = hy4::DraftReadout(w, *arenas[deviceIndex], anchors[i], draftWidth, block);
+        if (!configs[i].IsSimpleGreedy()) {
+            // Keep q on the target head's device, including with layer-parallel placement.
+            if (deviceIndex != arenas.size() - 1) {
+                auto next = arenas.back()->Get("draftBlock", draftWidth * 3072);
+                hy4::CopyStage(next, devices.back(), block, devices[deviceIndex], size_t(draftWidth) * 3072);
+                block = next;
+                deviceIndex = arenas.size() - 1;
+            }
+            hy4::Select(devices.back());
+            proposals[i] = hy4::PrepareProposal(*arenas.back(), i, states.size(), draftWidth - 1, vocab);
+        }
+        auto candidates = hy4::DraftReadout(w, *arenas[deviceIndex], anchors[i], draftWidth, block,
+                                            configs[i], proposals[i]);
         expanded.push_back(anchors[i]);
         expanded.insert(expanded.end(), candidates.begin(), candidates.end());
     }
-    auto verified = ForwardGpu(expanded, std::vector<int>(states.size(), draftWidth), past, configs, true);
-    Logits output;
+    float *target = nullptr;
+    ForwardGpu(expanded, std::vector<int>(states.size(), draftWidth), past, configs, true, nullptr, &target);
+    std::vector<int> output;
     for (size_t i = 0; i < states.size(); ++i) {
         auto &state = *states[i];
         const size_t first = i * draftWidth;
-        int accepted = 0;
-        for (int j = 0; j < draftWidth; ++j) {
-            const auto &row = verified[first + j];
-            int next = std::max_element(row.begin(), row.end()) - row.begin();
-            if (j)
-                state.pending.push_back(next);
-            else
-                state.expected = next;
-            if (next == eos_token_id || eos_token_ids.count(next) || configs[i].stop_token_ids.count(next) ||
-                j + 1 == draftWidth || next != expanded[first + j + 1])
-                break;
-            ++accepted;
-        }
-        const int committed = bases[i] + 1 + accepted;
-        past[i * block_cnt].first->cpuIntDatas.resize(committed);
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            auto &kv = past[i * block_cnt + layer];
-            hy4::TruncateKV(*kv.first, *kv.second, committed);
-        }
-        for (auto &provider : state.providers)
-            hy4::TruncateKV(provider.keys, provider.values, committed);
-        if (GetFastllmEnv().printProfile)
-            fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i, bases[i],
-                    draftWidth - 1, accepted);
-        output.emplace_back(std::move(verified[first]));
+        auto tokens = hy4::VerifyDraft(*arenas.back(), target + first * vocab, draftWidth, vocab, configs[i],
+                                       proposals[i], expanded.data() + first + 1);
+        output.push_back(CommitVerifiedTokens(i, past, state, configs[i], tokens));
     }
     return output;
 }
@@ -79,7 +70,8 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeGpu(const std::vector<int> &anchors,
 
 Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
                                                 const std::vector<int> &lengths, Cache &past,
-                                                const std::vector<GenerationConfig> &configs, bool verify) {
+                                                const std::vector<GenerationConfig> &configs, bool verify,
+                                                std::vector<int> *sampled, float **deviceLogits) {
 #ifdef FASTLLM_ENABLE_HY4_CUDA
     auto &arenas = gpuArenas;
     if (arenas.empty())
@@ -89,7 +81,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
         gpuGraphs = std::make_shared<hy4::GpuGraphs>();
     auto &w = *source;
     std::vector<hy4::DraftRequest *> states;
-    bool propose = draftWidth && !verify && tokens.size() == lengths.size();
+    bool propose = sampled && draftWidth && !verify && tokens.size() == lengths.size();
     for (size_t i = 0; i < lengths.size(); ++i) {
         auto *state = draftWidth
                           ? static_cast<hy4::DraftRequest *>(past[i * block_cnt].first->kvStorageOwner.get())
@@ -97,13 +89,12 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
         states.push_back(state);
         const auto &cfg = configs[i];
         const int base = past[i * block_cnt].first->cpuIntDatas.size();
-        propose = propose && state && !state->hidden.dims.empty() && state->pending.empty() &&
-                  base + draftWidth <= max_positions && cfg.IsSimpleGreedy() && !cfg.do_sample &&
-                  !cfg.output_logits && !cfg.tool_call_grammar && !cfg.tool_call_name_constraint_enabled &&
-                  !cfg.tool_call_parameter_name_constraint_enabled && cfg.prefill_chunk_remaining < 0;
+        propose = propose && state && base + draftWidth <= max_positions && state->CanVerify(cfg);
     }
-    if (propose)
-        return ProposeGpu(tokens, past, configs, states);
+    if (propose) {
+        *sampled = ProposeGpu(tokens, past, configs, states);
+        return {};
+    }
     const int rows = tokens.size();
     if (GetFastllmEnv().printProfile)
         fprintf(stderr, "[HY4 gpu] requests=%zu tokens=%d verify=%d\n", lengths.size(), rows, int(verify));
@@ -262,9 +253,14 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
         for (auto &arena : arenas)
             arena->step = nullptr;
     }
-    Logits result(outputs, std::vector<float>(vocab));
-    for (size_t i = 0; i < outputs; ++i)
-        hy4::CopyToHost(result[i].data(), projected + i * vocab, vocab * sizeof(float));
+    Logits result;
+    if (deviceLogits) {
+        *deviceLogits = projected;
+    } else {
+        result.resize(outputs, std::vector<float>(vocab));
+        for (size_t i = 0; i < outputs; ++i)
+            hy4::CopyToHost(result[i].data(), projected + i * vocab, vocab * sizeof(float));
+    }
     if (!capture && rows == 1)
         gpuGraphs->warmedSingle = true;
     if (!capture)

@@ -76,13 +76,24 @@ struct DraftRequest {
     Data hidden;
     std::deque<int> pending;
     int expected = -1;
+    bool CanVerify(const GenerationConfig &config) const;
 };
 void DraftEmbed(Weights &, Scratch &, int anchor, int width, int mask, const float *targetHidden,
                 float *block);
 struct KVPage;
 void DraftLayer(Weights &, Scratch &, int draftLayer, int base, int width, DraftMemory &, float *block,
                 const KVPage *const *pages);
-std::vector<int> DraftReadout(Weights &, Scratch &, int anchor, int width, float *block);
+// One request's conditional proposal rows, borrowed until target verification completes.
+struct DraftProposal {
+    float *logits = nullptr, *logsumexp = nullptr;
+    int *tokens = nullptr;
+};
+DraftProposal PrepareProposal(Scratch &, int request, int batch, int drafts, int vocab);
+std::vector<int> DraftReadout(Weights &, Scratch &, int anchor, int width, float *block,
+                              const GenerationConfig &, DraftProposal);
+float *TargetProbabilities(Scratch &, float *target, int rows, int vocab, const GenerationConfig &);
+std::vector<int> VerifyDraft(Scratch &, float *target, int width, int vocab, const GenerationConfig &,
+                             DraftProposal, const int *candidates);
 void SaveDraftHidden(Data &ring, int device, int position, int width, const float *hidden,
                      const StepInput *step = nullptr);
 void Embed(Weights &, Scratch &, int token, float *streams);

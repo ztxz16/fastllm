@@ -2,6 +2,7 @@
 #include "utils.h"
 #include <fstream>
 #include <cstring>
+#include <cmath>
 #include <set>
 
 namespace fastllm {
@@ -82,6 +83,47 @@ bool Hy4FlashModel::EnableDFly2(int width) {
     draftWidth = width;
     return true;
 }
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+bool hy4::DraftRequest::CanVerify(const GenerationConfig &cfg) const {
+    if (hidden.dims.empty() || !pending.empty() || cfg.prefill_chunk_remaining >= 0 || cfg.output_logits ||
+        cfg.output_token_least > 0 || cfg.tool_call_grammar || cfg.tool_call_name_constraint_enabled ||
+        cfg.tool_call_parameter_name_constraint_enabled || cfg.tool_call_token_mask ||
+        !cfg.tool_call_allowed_token_ids.empty())
+        return false;
+    return cfg.IsSimpleGreedy() ||
+           (cfg.do_sample && cfg.repeat_penalty == 1.0f && std::isfinite(cfg.temperature) &&
+            cfg.temperature > 0 && std::isfinite(cfg.top_p) && cfg.top_p >= 0 && cfg.top_p <= 1);
+}
+
+// Publish exactly one verified prefix to the scheduler and commit the corresponding KV rows.
+int Hy4FlashModel::CommitVerifiedTokens(size_t request, Cache &past, hy4::DraftRequest &state,
+                                        const GenerationConfig &config, const std::vector<int> &tokens) {
+    auto firstLayer = past.begin() + request * block_cnt;
+    auto &history = firstLayer->first->cpuIntDatas;
+    AssertInFastLLM(!tokens.empty() && tokens.size() <= size_t(draftWidth) &&
+                        history.size() >= size_t(draftWidth),
+                    "HY4 DFly2 invalid verified prefix.");
+    const int base = int(history.size()) - draftWidth;
+    auto end = std::find_if(tokens.begin(), tokens.end(), [&](int token) {
+        return token == eos_token_id || eos_token_ids.count(token) || config.stop_token_ids.count(token);
+    });
+    if (end != tokens.end())
+        ++end;
+    state.expected = tokens.front();
+    state.pending.assign(tokens.begin() + 1, end);
+    const int accepted = int(state.pending.size());
+    const int committed = base + 1 + accepted;
+    history.resize(committed);
+    for (auto layer = firstLayer; layer != firstLayer + block_cnt; ++layer)
+        hy4::TruncateKV(*layer->first, *layer->second, committed);
+    for (auto &provider : state.providers)
+        hy4::TruncateKV(provider.keys, provider.values, committed);
+    if (GetFastllmEnv().printProfile)
+        fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", request, base,
+                draftWidth - 1, accepted);
+    return state.expected;
+}
+#endif
 void Hy4FlashModel::OnResponseContextCreated(ResponseContext *context) {
 #ifdef FASTLLM_ENABLE_HY4_CUDA
     if (draftWidth && context && !context->pastKeyValues.empty()) {
@@ -232,8 +274,13 @@ std::vector<int> Hy4FlashModel::ForwardV2(int batch, const Data &ids, const std:
     AssertInFastLLM(total == ids.Count(0), "HY4-Flash token count mismatch.");
     const auto *src = reinterpret_cast<const float *>(ids.cpuData);
     std::vector<int> tokens(src, src + total);
-    auto values = hybrid ? ForwardHybrid(tokens, lengths, past, cfg) : ForwardGpu(tokens, lengths, past, cfg);
     std::vector<int> sampled;
+    const bool wantsLogits = outs && std::any_of(outs->begin(), outs->end(), [](const auto *p) { return p; });
+    auto *verified = wantsLogits ? nullptr : &sampled;
+    auto values = hybrid ? ForwardHybrid(tokens, lengths, past, cfg, false, verified)
+                         : ForwardGpu(tokens, lengths, past, cfg, false, verified);
+    if (!sampled.empty())
+        return sampled;
     for (int i = 0; i < batch; ++i) {
         if (outs && i < outs->size() && (*outs)[i])
             *(*outs)[i] = values[i];

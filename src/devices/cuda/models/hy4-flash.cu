@@ -5,6 +5,11 @@
 #include <cublas_v2.h>
 extern "C" cublasHandle_t getFastllmCublasHandle();
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
+#include <cub/device/device_radix_sort.cuh>
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
+#include "devices/cuda/fastllm-cuda.cuh"
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
@@ -1471,28 +1476,8 @@ void DraftLayer(Weights &w, Scratch &s, int layer, int base, int width, DraftMem
     NormalizedDenseMlpRows<true>(w, s, p + "mlp.", x, branch, width);
     add<<<12 * width, 256>>>(block, branch, width * 3072);
 }
-__global__ static void argmaxLogits(const float *logits, int size, int *token) {
-    __shared__ float values[256];
-    __shared__ int indices[256];
-    int tid = threadIdx.x, best = tid;
-    for (int i = tid + 256; i < size; i += 256)
-        if (logits[i] > logits[best])
-            best = i;
-    values[tid] = logits[best];
-    indices[tid] = best;
-    __syncthreads();
-    for (int stride = 128; stride; stride /= 2) {
-        if (tid < stride && (values[tid + stride] > values[tid] ||
-                             (values[tid + stride] == values[tid] && indices[tid + stride] < indices[tid]))) {
-            values[tid] = values[tid + stride];
-            indices[tid] = indices[tid + stride];
-        }
-        __syncthreads();
-    }
-    if (!tid)
-        *token = indices[0];
-}
-std::vector<int> DraftReadout(Weights &w, Scratch &s, int anchor, int width, float *block) {
+std::vector<int> DraftReadout(Weights &w, Scratch &s, int anchor, int width, float *block,
+                              const GenerationConfig &cfg, DraftProposal proposal) {
     const std::string p = "model.dfly_layers.hidden_correction.";
     auto table = w.View("model.embed_tokens.weight", s.device);
     auto embed = s.Get("draftPreviousEmbed", 3072), pair = s.Get("draftCorrectionPair", 6144);
@@ -1500,7 +1485,7 @@ std::vector<int> DraftReadout(Weights &w, Scratch &s, int anchor, int width, flo
     auto activated = s.Get("draftCorrectionAct", 3072), delta = s.Get("draftCorrectionDelta", 3072);
     const int vocab = w.meta.at("lm_head.weight").dims[0];
     auto logits = s.Get("draftHeadLogits", vocab);
-    auto picks = reinterpret_cast<int *>(s.Get("draftPicks", width - 1));
+    auto picks = proposal.tokens ? proposal.tokens : reinterpret_cast<int *>(s.Get("draftPicks", width - 1));
     for (int i = 0; i < width - 1; ++i) {
         auto h = block + size_t(i + 1) * 3072;
         Norm(w, s, "model.dfly_layers.final_norm.weight", h, h, 3072);
@@ -1512,11 +1497,142 @@ std::vector<int> DraftReadout(Weights &w, Scratch &s, int anchor, int width, flo
         Linear(w, s, p + "down_proj.weight", activated, delta);
         add<<<12, 256>>>(h, delta, 3072);
         Linear(w, s, "lm_head.weight", h, logits);
-        argmaxLogits<<<1, 256>>>(logits, vocab, picks + i);
+        if (proposal.tokens) {
+            AssertInFastLLM(FastllmCudaMtpSampleDraftLogits(logits, proposal.logits + size_t(i) * vocab,
+                                                            proposal.logsumexp + i, picks + i, nullptr,
+                                                            &cfg.temperature, 1, vocab),
+                            "HY4 DFly2 proposal sampling failed.");
+        } else {
+            AssertInFastLLM(FastllmCudaGreedySampling(logits, picks + i, 1, vocab),
+                            "HY4 DFly2 greedy proposal failed.");
+        }
     }
     std::vector<int> result(width - 1);
     CopyToHost(result.data(), picks, result.size() * sizeof(int));
     return result;
+}
+
+DraftProposal PrepareProposal(Scratch &s, int request, int batch, int drafts, int vocab) {
+    const size_t rows = size_t(batch) * drafts;
+    const size_t offset = size_t(request) * drafts;
+    return {s.Get("draftSampleLogits", rows * vocab) + offset * vocab, s.Get("draftLogsumexp", rows) + offset,
+            reinterpret_cast<int *>(s.Get("draftSampleIds", rows)) + offset};
+}
+
+__global__ static void prepareSamplingScores(const float *logits, float *scores, int *ids, int vocab,
+                                             float invTemperature) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < vocab) {
+        scores[i] = logits[i] * invTemperature;
+        ids[i] = i;
+    }
+}
+
+// Match LLMSampling's top-k before top-p, retaining precisely the first
+// crossing token. Stable radix sort breaks equal scores by ascending token ID.
+__global__ static void sortedProbabilities(const float *scores, const int *ids, float *probs, int k,
+                                           float topP) {
+    constexpr int threads = 256;
+    using Reduce = cub::BlockReduce<double, threads>;
+    using Scan = cub::BlockScan<double, threads>;
+    __shared__ union {
+        typename Reduce::TempStorage reduce;
+        typename Scan::TempStorage scan;
+    } tmp;
+    __shared__ double total, previous;
+    __shared__ int keep;
+    double mass = 0;
+    const float maximum = scores[0];
+    for (int i = threadIdx.x; i < k; i += threads)
+        mass += expf(scores[i] - maximum);
+    double sum = Reduce(tmp.reduce).Sum(mass);
+    if (threadIdx.x == 0) {
+        total = sum;
+        keep = k;
+        previous = 0;
+    }
+    __syncthreads();
+    if (topP < 1) {
+        const double threshold = total * topP;
+        for (int base = 0; base < k; base += threads) {
+            const int i = base + threadIdx.x;
+            const double value = i < k ? expf(scores[i] - maximum) : 0;
+            double prefix, blockSum;
+            Scan(tmp.scan).InclusiveSum(value, prefix, blockSum);
+            const double cumulative = previous + prefix;
+            __syncthreads();
+            if (i < k && cumulative > threshold)
+                atomicMin(&keep, i + 1);
+            __syncthreads();
+            if (keep < k || (base + threads >= k)) {
+                if (i + 1 == keep)
+                    total = cumulative;
+                break;
+            }
+            if (!threadIdx.x)
+                previous += blockSum;
+            __syncthreads();
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < keep; i += threads)
+        probs[ids[i]] = expf(scores[i] - maximum) / total;
+}
+
+float *TargetProbabilities(Scratch &s, float *target, int width, int vocab, const GenerationConfig &cfg) {
+    auto probabilities = s.Get("verifyProbabilities", size_t(width) * vocab);
+    auto scores = s.Get("verifyScores", vocab), sorted = s.Get("verifySortedScores", vocab);
+    auto ids = reinterpret_cast<int *>(s.Get("verifyIds", vocab));
+    auto order = reinterpret_cast<int *>(s.Get("verifyOrder", vocab));
+    size_t bytes = 0;
+    Check(cub::DeviceRadixSort::SortPairsDescending(nullptr, bytes, scores, sorted, ids, order, vocab, 0, 32,
+                                                    cudaStreamPerThread));
+    auto temp = s.Get("verifySort", (bytes + sizeof(float) - 1) / sizeof(float));
+    Check(cudaMemsetAsync(probabilities, 0, size_t(width) * vocab * sizeof(float), cudaStreamPerThread));
+    const int k = std::clamp(cfg.top_k, 1, vocab);
+    for (int row = 0; row < width; ++row) {
+        prepareSamplingScores<<<(vocab + 255) / 256, 256>>>(target + size_t(row) * vocab, scores, ids, vocab,
+                                                            1.f / cfg.temperature);
+        Check(cub::DeviceRadixSort::SortPairsDescending(temp, bytes, scores, sorted, ids, order, vocab, 0, 32,
+                                                        cudaStreamPerThread));
+        sortedProbabilities<<<1, 256>>>(sorted, order, probabilities + size_t(row) * vocab, k, cfg.top_p);
+    }
+    Check(cudaGetLastError());
+    return probabilities;
+}
+
+std::vector<int> VerifyDraft(Scratch &s, float *target, int width, int vocab, const GenerationConfig &cfg,
+                             DraftProposal proposal, const int *candidates) {
+    Select(s.device);
+    std::vector<int> tokens(width);
+    if (!proposal.tokens) {
+        auto picks = reinterpret_cast<int *>(s.Get("verifyGreedyIds", width));
+        AssertInFastLLM(FastllmCudaGreedySampling(target, picks, width, vocab),
+                        "HY4 DFly2 greedy verification failed.");
+        CopyToHost(tokens.data(), picks, width * sizeof(int));
+        const auto mismatch = std::mismatch(tokens.begin(), tokens.end() - 1, candidates);
+        tokens.resize(mismatch.first - tokens.begin() + 1);
+        return tokens;
+    }
+    auto probabilities = TargetProbabilities(s, target, width, vocab, cfg);
+    int offset = 0;
+    while (offset < width - 1) {
+        // The shared kernel handles up to eight drafts. Continue after a fully
+        // accepted segment; only the last segment publishes its bonus token.
+        const int n = std::min(8, width - 1 - offset);
+        int accepted = 0;
+        AssertInFastLLM(FastllmCudaMtpRejectionFromProbs(
+                            probabilities + size_t(offset) * vocab, proposal.logits + size_t(offset) * vocab,
+                            proposal.logsumexp + offset, proposal.tokens + offset, tokens.data() + offset,
+                            &accepted, 1, n, vocab),
+                        "HY4 DFly2 rejection sampling failed.");
+        if (accepted < n) {
+            tokens.resize(offset + accepted + 1);
+            break;
+        }
+        offset += n;
+    }
+    return tokens;
 }
 
 } // namespace fastllm::hy4

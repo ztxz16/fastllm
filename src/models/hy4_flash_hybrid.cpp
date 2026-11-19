@@ -41,17 +41,17 @@ void Hy4FlashModel::OnModelWeightsLoaded() {
     }
 }
 #ifdef FASTLLM_ENABLE_HY4_CUDA
-Hy4FlashModel::Logits Hy4FlashModel::ProposeHybrid(const std::vector<int> &anchors, Cache &past,
-                                                   const std::vector<GenerationConfig> &configs,
-                                                   const std::vector<hy4::DraftRequest *> &states) {
+std::vector<int> Hy4FlashModel::ProposeHybrid(const std::vector<int> &anchors, Cache &past,
+                                              const std::vector<GenerationConfig> &configs,
+                                              const std::vector<hy4::DraftRequest *> &states) {
     auto &w = *source;
     auto &s = *hybridArena;
     std::vector<int> expanded;
-    std::vector<int> bases;
+    const int vocab = w.meta.at("lm_head.weight").dims[0];
+    std::vector<hy4::DraftProposal> proposals(states.size());
     for (size_t i = 0; i < states.size(); ++i) {
         auto &state = *states[i];
         const int base = past[i * block_cnt].first->cpuIntDatas.size();
-        bases.push_back(base);
         auto target =
             static_cast<const float *>(state.hidden.cudaData) + size_t((base - 1) % (draftWidth + 1)) * 3072;
         auto block = s.Get("draftBlock", draftWidth * 3072);
@@ -66,40 +66,22 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeHybrid(const std::vector<int> &ancho
         auto draftCaches = hy4::UploadAttentionCaches(s, caches);
         for (size_t k = 0; k < draftProviders.size(); ++k)
             hy4::DraftLayer(w, s, k, base, draftWidth, state.providers[k], block, &draftCaches[k].draft);
-        auto candidates = hy4::DraftReadout(w, s, anchors[i], draftWidth, block);
+        if (!configs[i].IsSimpleGreedy())
+            proposals[i] = hy4::PrepareProposal(s, i, states.size(), draftWidth - 1, vocab);
+        auto candidates = hy4::DraftReadout(w, s, anchors[i], draftWidth, block, configs[i], proposals[i]);
         expanded.push_back(anchors[i]);
         expanded.insert(expanded.end(), candidates.begin(), candidates.end());
     }
-    auto verified = ForwardHybrid(expanded, std::vector<int>(states.size(), draftWidth), past, configs, true);
-    Logits output;
+    float *target = nullptr;
+    ForwardHybrid(expanded, std::vector<int>(states.size(), draftWidth), past, configs, true, nullptr,
+                  &target);
+    std::vector<int> output;
     for (size_t i = 0; i < states.size(); ++i) {
         auto &state = *states[i];
         const size_t first = i * draftWidth;
-        int accepted = 0;
-        for (int j = 0; j < draftWidth; ++j) {
-            const auto &row = verified[first + j];
-            int next = std::max_element(row.begin(), row.end()) - row.begin();
-            if (j)
-                state.pending.push_back(next);
-            else
-                state.expected = next;
-            if (next == eos_token_id || eos_token_ids.count(next) || configs[i].stop_token_ids.count(next) ||
-                j + 1 == draftWidth || next != expanded[first + j + 1])
-                break;
-            ++accepted;
-        }
-        const int committed = bases[i] + 1 + accepted;
-        past[i * block_cnt].first->cpuIntDatas.resize(committed);
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            auto &kv = past[i * block_cnt + layer];
-            hy4::TruncateKV(*kv.first, *kv.second, committed);
-        }
-        for (auto &provider : state.providers)
-            hy4::TruncateKV(provider.keys, provider.values, committed);
-        if (GetFastllmEnv().printProfile)
-            fprintf(stderr, "[HY4 DFly2] request=%zu position=%d candidates=%d accepted=%d\n", i, bases[i],
-                    draftWidth - 1, accepted);
-        output.emplace_back(std::move(verified[first]));
+        auto tokens = hy4::VerifyDraft(s, target + first * vocab, draftWidth, vocab, configs[i], proposals[i],
+                                       expanded.data() + first + 1);
+        output.push_back(CommitVerifiedTokens(i, past, state, configs[i], tokens));
     }
     return output;
 }
@@ -107,8 +89,8 @@ Hy4FlashModel::Logits Hy4FlashModel::ProposeHybrid(const std::vector<int> &ancho
 
 Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &tokens,
                                                    const std::vector<int> &lengths, Cache &past,
-                                                   const std::vector<GenerationConfig> &configs,
-                                                   bool verify) {
+                                                   const std::vector<GenerationConfig> &configs, bool verify,
+                                                   std::vector<int> *sampled, float **deviceLogits) {
 #ifdef FASTLLM_ENABLE_HY4_CUDA
     const int device = devices.front();
     hy4::Select(device);
@@ -120,7 +102,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
     std::vector<Data *> biases(2 + 2 * 512, nullptr);
     auto &w = *source;
     std::vector<hy4::DraftRequest *> states;
-    bool propose = draftWidth && !verify && tokens.size() == lengths.size();
+    bool propose = sampled && draftWidth && !verify && tokens.size() == lengths.size();
     for (size_t i = 0; i < lengths.size(); ++i) {
         auto *state = draftWidth
                           ? static_cast<hy4::DraftRequest *>(past[i * block_cnt].first->kvStorageOwner.get())
@@ -128,13 +110,12 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
         states.push_back(state);
         const auto &cfg = configs[i];
         const int base = past[i * block_cnt].first->cpuIntDatas.size();
-        propose = propose && state && !state->hidden.dims.empty() && state->pending.empty() &&
-                  base + draftWidth <= max_positions && cfg.IsSimpleGreedy() && !cfg.do_sample &&
-                  !cfg.output_logits && !cfg.tool_call_grammar && !cfg.tool_call_name_constraint_enabled &&
-                  !cfg.tool_call_parameter_name_constraint_enabled && cfg.prefill_chunk_remaining < 0;
+        propose = propose && state && base + draftWidth <= max_positions && state->CanVerify(cfg);
     }
-    if (propose)
-        return ProposeHybrid(tokens, past, configs, states);
+    if (propose) {
+        *sampled = ProposeHybrid(tokens, past, configs, states);
+        return {};
+    }
     const int rows = tokens.size();
     if (GetFastllmEnv().printProfile)
         fprintf(stderr, "[HY4 hybrid] requests=%zu tokens=%d verify=%d\n", lengths.size(), rows, int(verify));
@@ -317,9 +298,14 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
         graph.Finish(key, verify, rows);
         s.step = nullptr;
     }
-    Logits result(outputs, std::vector<float>(vocab));
-    for (size_t i = 0; i < outputs; ++i)
-        hy4::CopyToHost(result[i].data(), projected + i * vocab, vocab * sizeof(float));
+    Logits result;
+    if (deviceLogits) {
+        *deviceLogits = projected;
+    } else {
+        result.resize(outputs, std::vector<float>(vocab));
+        for (size_t i = 0; i < outputs; ++i)
+            hy4::CopyToHost(result[i].data(), projected + i * vocab, vocab * sizeof(float));
+    }
     if (!capture && rows == 1)
         hybridGraphs->warmedSingle = true;
     if (!capture)
