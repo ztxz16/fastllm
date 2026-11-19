@@ -139,6 +139,5 @@ void PagedAttentionBatch(Weights &w, Scratch &s, int layer, const std::vector<At
         else
             ExpandedAttentionTile(w, s, p, heads, rows.data() + first, n, x, qr, q, kv, gate, mix);
         LinearBatch(w, s, p + "o_proj.weight", mix, y, n);
-        NormBatch(w, s, p + "post_proj_norm.weight", y, n, 3072);
     }
 }

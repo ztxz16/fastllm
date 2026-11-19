@@ -86,11 +86,10 @@ std::vector<int> DraftReadout(Weights &, Scratch &, int anchor, int width, float
 void SaveDraftHidden(Data &ring, int device, int position, int width, const float *hidden,
                      const StepInput *step = nullptr);
 void Embed(Weights &, Scratch &, int token, float *streams);
-void HyperPre(Weights &, Scratch &, const std::string &prefix, float *streams, float *input, float *post,
-              bool finalHead = false);
-void HyperPost(float *streams, const float *branch, const float *post, int width);
-void Norm(Weights &, Scratch &, const std::string &name, const float *input, float *output, int width);
-void NormBatch(Weights &, Scratch &, const std::string &name, float *data, int rows, int width, int stride = 0);
+void HyperPreNorm(Weights &, Scratch &, const std::string &prefix, const std::string &normName,
+                  float *streams, float *input, float *posts, int rows);
+void HyperPostNorm(Weights &, Scratch &, const std::string &normName, float *streams, const float *branch,
+                   const float *posts, int rows, bool optional = false);
 void Engram(Weights &, Scratch &, int layer, const std::array<int, 3> &ids, float *streams,
             const uint16_t *hostRows = nullptr, bool asyncCopy = false);
 void PrepareEngramInput(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids);

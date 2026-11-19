@@ -393,7 +393,7 @@ __global__ static void normEngramHeads(float *embedding, EngramNormWeights weigh
     float *row = embedding + blockIdx.x * 96;
     normRow(row, weights.head[blockIdx.x], row, 96, 1.1920929e-7f, false);
 }
-void Norm(Weights &w, Scratch &s, const std::string &name, const float *x, float *y, int width) {
+static void Norm(Weights &w, Scratch &s, const std::string &name, const float *x, float *y, int width) {
     norm<<<1, 256>>>(x, w.View(name, s.device), y, width, 1e-5f, true);
 }
 __global__ static void normBatch(const float *input, Hy4View weight, float *output, int width,
@@ -409,8 +409,8 @@ static void NormRows(Weights &w, Scratch &s, const std::string &name, const floa
     }
     normBatch<<<rows, 256>>>(input, w.View(name, s.device), output, width, inputStride, outputStride);
 }
-void NormBatch(Weights &w, Scratch &s, const std::string &name, float *data, int rows, int width,
-               int stride) {
+static void NormBatch(Weights &w, Scratch &s, const std::string &name, float *data, int rows, int width,
+                      int stride = 0) {
     NormRows(w, s, name, data, data, rows, width, stride ? stride : width, stride ? stride : width);
 }
 __global__ static void embed(Hy4View w, int token, float *h, const StepInput *step) {
@@ -450,7 +450,10 @@ __global__ static void hc(const float *h, const float *mix, Hy4View bias, Hy4Vie
 }
 constexpr int HcWidth = 3072, HcInputs = 4 * HcWidth, HcTiles = HcInputs / 512;
 __global__ static void hcPartials(const float *weight, const float *h, int rows, float *partial) {
-    int block = blockIdx.x;
+    const int blocks = rows * HcTiles + 8;
+    const int token = blockIdx.x / blocks, block = blockIdx.x % blocks;
+    h += size_t(token) * HcInputs;
+    partial += size_t(token) * blocks;
     if (block < rows * HcTiles) {
         int row = block / HcTiles, start = (block % HcTiles) * 512 + threadIdx.x;
         float sum = 0;
@@ -474,9 +477,8 @@ __global__ static void hcPartials(const float *weight, const float *h, int rows,
             partial[block] = square;
     }
 }
-__global__ static void hcMixOutput(const float *h, const float *partial, int rows, Hy4View bias,
-                                   Hy4View scale, float *out, float *post) {
-    __shared__ float pre[4];
+__device__ static void hcGates(const float *partial, int rows, Hy4View bias, Hy4View scale, float *pre,
+                               float *post, bool writePost) {
     int row = threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row < rows) {
         float dot = warpReduce(lane < HcTiles ? partial[row * HcTiles + lane] : 0.f);
@@ -487,18 +489,23 @@ __global__ static void hcMixOutput(const float *h, const float *partial, int row
                                  read(bias.data, bias.type, row));
             if (row < 4)
                 pre[row] = gate + 1.e-6f;
-            else if (blockIdx.x == 0)
+            else if (writePost)
                 post[row - 4] = 2.f * gate + 1.e-6f;
         }
     }
     __syncthreads();
+}
+__global__ static void hcMixOutput(const float *h, const float *partial, int rows, Hy4View bias,
+                                   Hy4View scale, float *out, float *post) {
+    __shared__ float pre[4];
+    hcGates(partial, rows, bias, scale, pre, post, blockIdx.x == 0);
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     float value = 0;
     for (int j = 0; j < 4; j++)
         value += h[j * HcWidth + col] * pre[j];
     out[col] = bf(value);
 }
-void HyperPre(Weights &w, Scratch &s, const std::string &prefix, float *h, float *x, float *post, bool head) {
+static void HyperPre(Weights &w, Scratch &s, const std::string &prefix, float *h, float *x, float *post, bool head) {
     auto name = prefix + (head ? "hc_head_fn" : "hc_fn");
     auto weight = w.View(name, s.device);
     auto bias = w.View(prefix + (head ? "hc_head_base" : "hc_base"), s.device),
@@ -514,13 +521,89 @@ void HyperPre(Weights &w, Scratch &s, const std::string &prefix, float *h, float
     Linear(w, s, name, h, mix, false);
     hc<<<1, 256>>>(h, mix, bias, scale, x, post, 3072, head);
 }
-__global__ static void hcPost(float *h, const float *x, const float *post, int width) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < width * 4)
-        h[i] = bf(fmaf(post[i / width], x[i % width], h[i]));
+// One CTA owns a token. Keep the BF16-rounded four-stream mixture on chip for RMSNorm.
+__global__ static void hcMixNorm(const float *streams, const float *partials, Hy4View bias, Hy4View scale,
+                                 Hy4View weight, float *input, float *posts) {
+    const int token = blockIdx.x, tid = threadIdx.x, col = tid * 4;
+    const float *h = streams + size_t(token) * HcInputs;
+    __shared__ float pre[4], mixed[HcWidth];
+    hcGates(partials + size_t(token) * (8 * HcTiles + 8), 8, bias, scale, pre, posts + token * 4, true);
+    float4 v = {};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float4 x = reinterpret_cast<const float4 *>(h + j * HcWidth)[tid];
+        v.x = fmaf(x.x, pre[j], v.x);
+        v.y = fmaf(x.y, pre[j], v.y);
+        v.z = fmaf(x.z, pre[j], v.z);
+        v.w = fmaf(x.w, pre[j], v.w);
+    }
+    float local[4] = {bf(v.x), bf(v.y), bf(v.z), bf(v.w)};
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        mixed[col + j] = local[j];
+    __syncthreads();
+    // Keep the same 256 accumulation chains and warp reduction as standalone Norm.
+    float sum = 0;
+    if (tid < 256) {
+#pragma unroll
+        for (int i = tid; i < HcWidth; i += 256)
+            sum = fmaf(mixed[i], mixed[i], sum);
+    }
+    const float inv = rsqrtf(reduce(sum) / HcWidth + 1.e-5f);
+    float4 y;
+    y.x = bf(bf(local[0] * inv) * read(weight.data, weight.type, col));
+    y.y = bf(bf(local[1] * inv) * read(weight.data, weight.type, col + 1));
+    y.z = bf(bf(local[2] * inv) * read(weight.data, weight.type, col + 2));
+    y.w = bf(bf(local[3] * inv) * read(weight.data, weight.type, col + 3));
+    reinterpret_cast<float4 *>(input + size_t(token) * HcWidth)[tid] = y;
 }
-void HyperPost(float *h, const float *x, const float *post, int d) {
-    hcPost<<<(d * 4 + 255) / 256, 256>>>(h, x, post, d);
+void HyperPreNorm(Weights &w, Scratch &s, const std::string &prefix, const std::string &normName,
+                  float *streams, float *input, float *posts, int rows) {
+    const auto weight = w.View(prefix + "hc_fn", s.device);
+    if (weight.type != 1 || weight.rows != 8 || weight.cols != HcInputs) {
+        for (int row = 0; row < rows; ++row)
+            HyperPre(w, s, prefix, streams + size_t(row) * HcInputs, input + size_t(row) * HcWidth,
+                     posts + row * 4, false);
+        NormBatch(w, s, normName, input, rows, HcWidth);
+        return;
+    }
+    const int blocks = 8 * HcTiles + 8;
+    auto partials = s.Get("hcPartials", size_t(rows) * blocks);
+    hcPartials<<<rows * blocks, 128>>>(static_cast<const float *>(weight.data), streams, 8, partials);
+    hcMixNorm<<<rows, HcWidth / 4>>>(streams, partials, w.View(prefix + "hc_base", s.device),
+                                     w.View(prefix + "hc_scale", s.device), w.View(normName, s.device),
+                                     input, posts);
+}
+
+// Each CTA normalizes one column tile and updates all four residual streams.
+// The branch is read-only, so tiles can recompute its small reduction independently.
+template <bool Normalize>
+__global__ static void hcPostNorm(float *streams, const float *branch, const float *posts, Hy4View weight) {
+    constexpr int tiles = HcWidth / 256;
+    const int token = blockIdx.x / tiles, col = (blockIdx.x % tiles) * 256 + threadIdx.x;
+    const float *x = branch + size_t(token) * HcWidth;
+    float value = x[col];
+    if constexpr (Normalize) {
+        float sum = 0;
+#pragma unroll
+        for (int i = threadIdx.x; i < HcWidth; i += 256)
+            sum = fmaf(x[i], x[i], sum);
+        float inv = rsqrtf(reduce(sum) / HcWidth + 1.e-5f);
+        value = bf(bf(value * inv) * read(weight.data, weight.type, col));
+    }
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float &h = streams[(size_t(token) * 4 + j) * HcWidth + col];
+        h = bf(fmaf(posts[token * 4 + j], value, h));
+    }
+}
+void HyperPostNorm(Weights &w, Scratch &s, const std::string &normName, float *streams, const float *branch,
+                   const float *posts, int rows, bool optional) {
+    const int blocks = rows * (HcWidth / 256);
+    if (optional && !w.meta.count(normName))
+        hcPostNorm<false><<<blocks, 256>>>(streams, branch, posts, {});
+    else
+        hcPostNorm<true><<<blocks, 256>>>(streams, branch, posts, w.View(normName, s.device));
 }
 __global__ static void activate(const float *gate, const float *up, float *out, int width, bool routed) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, slot = blockIdx.y;
@@ -537,8 +620,6 @@ static void DenseMlp(Weights &w, Scratch &s, const std::string &p, const float *
     Linear(w, s, p + "up_proj.weight", x, b);
     activate<<<(width + 255) / 256, 256>>>(a, b, mid, width, false);
     Linear(w, s, p + "down_proj.weight", mid, out);
-    if (w.meta.count(p + "post_fc2_norm.weight"))
-        Norm(w, s, p + "post_fc2_norm.weight", out, out, 3072);
 }
 __global__ static void denseBatchActivation(const float *gate, const float *up, float *out, int size) {
     int i = blockIdx.x * 256 + threadIdx.x;
@@ -567,9 +648,14 @@ static void DenseMlpRows(Weights &w, Scratch &s, const std::string &p, const flo
         }
         denseBatchActivation<<<(size + 255) / 256, 256>>>(gate, up, mid, size);
         LinearBatch(w, s, p + "down_proj.weight", mid, out, n);
-        if (w.meta.count(p + "post_fc2_norm.weight"))
-            NormBatch(w, s, p + "post_fc2_norm.weight", out, n, 3072);
     }
+}
+template <bool Draft>
+static void NormalizedDenseMlpRows(Weights &w, Scratch &s, const std::string &p, const float *input,
+                                   float *output, int rows) {
+    DenseMlpRows<Draft>(w, s, p, input, output, rows);
+    if (w.meta.count(p + "post_fc2_norm.weight"))
+        NormBatch(w, s, p + "post_fc2_norm.weight", output, rows, HcWidth);
 }
 void DenseMlpBatch(Weights &w, Scratch &s, const std::string &p, const float *input, float *output,
                    int rows) {
@@ -672,27 +758,13 @@ __global__ static void add(float *x, const float *y, int n) {
     if (i < n)
         x[i] = bf(x[i] + y[i]);
 }
-static void CombineExperts(Weights &w, Scratch &s, int layer, const float *x, const float *routed,
-                           float *out) {
-    auto p = "model.layers." + std::to_string(layer) + ".mlp.";
-    float *shared = s.Get("shared", 3072);
-    DenseMlp(w, s, p + "shared_experts.", x, shared);
-    Linear(w, s, p + "routed_expert_up_proj.weight", routed, out);
-    add<<<12, 256>>>(out, shared, 3072);
-    Norm(w, s, p + "combine_output_norm.weight", out, out, 3072);
-}
 void CombineExpertsBatch(Weights &w, Scratch &s, int layer, const float *input, const float *routed,
                          float *out, int rows) {
-    if (rows == 1) {
-        CombineExperts(w, s, layer, input, routed, out);
-        return;
-    }
     auto p = "model.layers." + std::to_string(layer) + ".mlp.";
     auto shared = s.Get("batchShared", size_t(rows) * 3072);
-    DenseMlpBatch(w, s, p + "shared_experts.", input, shared, rows);
+    NormalizedDenseMlpRows<false>(w, s, p + "shared_experts.", input, shared, rows);
     LinearBatch(w, s, p + "routed_expert_up_proj.weight", routed, out, rows);
     add<<<rows * 12, 256>>>(out, shared, rows * 3072);
-    NormBatch(w, s, p + "combine_output_norm.weight", out, rows, 3072);
 }
 void ProjectHead(Weights &w, Scratch &s, float *h, float *values, Data *draftHidden, int position,
                  int draftWidth, int rows) {
@@ -1392,7 +1464,7 @@ void DraftLayer(Weights &w, Scratch &s, int layer, int base, int width, DraftMem
     NormBatch(w, s, a + "post_proj_norm.weight", branch, width, 3072);
     add<<<12 * width, 256>>>(block, branch, width * 3072);
     NormRows(w, s, p + "post_attention_layernorm.weight", block, x, width, 3072, 3072, 3072);
-    DenseMlpRows<true>(w, s, p + "mlp.", x, branch, width);
+    NormalizedDenseMlpRows<true>(w, s, p + "mlp.", x, branch, width);
     add<<<12 * width, 256>>>(block, branch, width * 3072);
 }
 __global__ static void argmaxLogits(const float *logits, int size, int *token) {

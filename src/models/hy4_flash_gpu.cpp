@@ -222,11 +222,8 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
             for (int row = 0; row < rows; ++row) {
                 s.step = capture ? stepInputs[owner] + row : nullptr;
                 float *h = streams + size_t(row) * 4 * 3072;
-                float *x = inputs + size_t(row) * 3072, *post = posts + row * 4;
                 if (w.meta.count(p + "engram_layer.lookup_table"))
                     hy4::Engram(w, s, layer, grams[row], h);
-                hy4::HyperPre(w, s, p + "hc_attn_layer.hc_pre.", h, x, post);
-                hy4::Norm(w, s, p + "input_layernorm.weight", x, x, 3072);
                 auto provider = std::find(draftProviders.begin(), draftProviders.end(), layer);
                 auto *state = states[owners[row]];
                 auto index = provider - draftProviders.begin();
@@ -234,28 +231,21 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
                 attentionRows.push_back({positions[row], state ? draftWidth : 0, memory, int(index), s.step,
                                          layerCaches[layer] + owners[row]});
             }
+            hy4::HyperPreNorm(w, s, p + "hc_attn_layer.hc_pre.", p + "input_layernorm.weight",
+                              streams, inputs, posts, rows);
             hy4::PagedAttentionBatch(w, s, layer, attentionRows, inputs, attnOutput);
-            for (int row = 0; row < rows; ++row) {
-                auto h = streams + size_t(row) * 4 * 3072;
-                auto x = inputs + size_t(row) * 3072;
-                auto post = posts + row * 4;
-                hy4::HyperPost(h, attnOutput + size_t(row) * 3072, post, 3072);
-                hy4::HyperPre(w, s, p + "hc_mlp_layer.hc_pre.", h, x, post);
-                hy4::Norm(w, s, p + "post_attention_layernorm.weight", x, x, 3072);
-            }
+            hy4::HyperPostNorm(w, s, p + "self_attn.post_proj_norm.weight", streams, attnOutput, posts, rows);
+            hy4::HyperPreNorm(w, s, p + "hc_mlp_layer.hc_pre.", p + "post_attention_layernorm.weight",
+                              streams, inputs, posts, rows);
             if (!layer) {
                 hy4::DenseMlpBatch(w, s, p + "mlp.", inputs, branch, rows);
-                for (int row = 0; row < rows; ++row)
-                    hy4::HyperPost(streams + size_t(row) * 4 * 3072, branch + size_t(row) * 3072,
-                                   posts + row * 4, 3072);
+                hy4::HyperPostNorm(w, s, p + "mlp.post_fc2_norm.weight", streams, branch, posts, rows, true);
                 continue;
             }
             hy4::RouteBatch(w, s, layer, inputs, ids, scores, latents, rows);
             hy4::ResidentExperts(w, s, layer, latents, ids, scores, routed, rows);
             hy4::CombineExpertsBatch(w, s, layer, inputs, routed, branch, rows);
-            for (int row = 0; row < rows; ++row)
-                hy4::HyperPost(streams + size_t(row) * 4 * 3072, branch + size_t(row) * 3072, posts + row * 4,
-                               3072);
+            hy4::HyperPostNorm(w, s, p + "mlp.combine_output_norm.weight", streams, branch, posts, rows);
         }
         size_t output = 0;
         offset = 0;
