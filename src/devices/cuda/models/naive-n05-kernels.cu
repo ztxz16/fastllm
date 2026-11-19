@@ -5447,7 +5447,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             const dim3 grid(scoreBlocks, paired ? count / 2 : count / sharedQueries);
             bool blackwellScores = false;
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
-            if (blackwell && nativeScores && sharedQueries == 1) {
+            if (blackwell && nativeScores && (sharedQueries == 1 || count >= 32)) {
                 naive_indexer_sm100::Row entries[naive_indexer_sm100::BatchLimit];
                 for (int i = 0; i < count; ++i) {
                     const auto &r = descriptors.rows[i];
@@ -5523,9 +5523,9 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         }
         // Bound the single-CTA row work; retain the existing paths for
         // short rows, small batches, other CP layouts and architectures.
-        const bool wideSelect = cp && contextRanks == 4 && contextPageLen &&
+        const bool wideSelect = ((cp && contextRanks == 4 && contextPageLen && arch == 90) ||
+            (blackwell && nativeScores && sharedQueries > 1 && count >= 32)) &&
             rows.size() >= 16 && capacity > 16384 && capacity <= 65536 &&
-            FastllmCudaRuntimeArch() == 90 &&
             BulkKernelSupported(naive_indexer_wide_select::SelectWide<>, 0, 90);
         if (wideSelect) {
             naive_indexer_wide_select::SelectWide<<<count, 1024>>>(descriptors);
