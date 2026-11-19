@@ -70,7 +70,7 @@ static std::atomic<int> batchedRejectionCalls{0};
 static bool inspectDPRejection = false;
 static std::mutex rejectionMutex;
 static std::set<int> rejectionDevices;
-extern "C" bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
+extern "C" bool FastllmCudaMtpRejectionSamplingTopKFirst(float *logits, float *proposalProbs,
         const float *temperatures, const int *topKs, const float *topPs,
         const int *draftTokenIds, int *output, int *acceptedDraftTokens,
         int batch, int draftTokens, int vocabSize) {
@@ -100,8 +100,8 @@ extern "C" bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalPr
         auto error = cudaMemcpy(target.data(), logits, target.size() * sizeof(float), cudaMemcpyDeviceToHost);
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
     }
-    static auto fn = (bool (*)(float *, float *, const float *, const int *, const float *,
-        const int *, int *, int *, int, int, int))dlsym(RTLD_NEXT, "FastllmCudaMtpRejectionSampling");
+    static auto fn = reinterpret_cast<decltype(&FastllmCudaMtpRejectionSamplingTopKFirst)>(
+        dlsym(RTLD_NEXT, "FastllmCudaMtpRejectionSamplingTopKFirst"));
     const bool ok = fn(logits, proposalProbs, temperatures, topKs, topPs, draftTokenIds,
               output, acceptedDraftTokens, batch, draftTokens, vocabSize);
     if (ok && !target.empty()) for (int b = 0; b < batch; ++b)
@@ -2064,7 +2064,7 @@ class Fixture : public NaiveN05FlashModel {
         for (int k : {1, 4, 50}) {
             cfg.top_k = k;
             if (!SelectLogits(cfg).cudaSampling || SelectLogits(cfg, true).cudaSampling ||
-                SupportsCudaRejectionSampling(cfg))
+                SupportsCudaRejectionSampling(cfg) != (k > 1))
                 throw std::runtime_error("finite top-k GPU selection unavailable");
         }
         cfg.top_k = vocab;
@@ -3850,11 +3850,11 @@ class Fixture : public NaiveN05FlashModel {
         }
         if(draftBlock!=7 || draftTokens!=candidates) throw std::runtime_error("DP draft block size changed");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-        if (sample && !finiteTopK && batchedRejectionCalls <= rejectionCalls)
+        if (sample && batchedRejectionCalls <= rejectionCalls)
             throw std::runtime_error("DP rejection sampling did not batch requests");
         inspectDPRejection = false;
         const char *draftMode = std::getenv("FASTLLM_DSPARK_TP");
-        if (sample && !finiteTopK && draftMode && std::string(draftMode).find("dp:") == 0 &&
+        if (sample && draftMode && std::string(draftMode).find("dp:") == 0 &&
                 rejectionDevices.size() != (size_t)std::stoi(std::string(draftMode).substr(3)))
             throw std::runtime_error("Rejection sampling did not run on every draft owner");
 #endif

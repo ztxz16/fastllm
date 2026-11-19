@@ -1875,6 +1875,12 @@ bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                                     const float *topPs, const int *draftTokenIds,
                                     int *output, int *acceptedDraftTokens,
                                     int batch, int draftTokens, int vocabSize);
+// Target law used by Naive: truncate logits to k before applying nucleus sampling.
+bool FastllmCudaMtpRejectionSamplingTopKFirst(float *logits, float *proposalProbs,
+                                    const float *temperatures, const int *topKs,
+                                    const float *topPs, const int *draftTokenIds,
+                                    int *output, int *acceptedDraftTokens,
+                                    int batch, int draftTokens, int vocabSize);
 
 bool FastllmCudaTopKTopPSamplingWithTypicalAcceptance(
                                   float *logits, float *temperatures,

@@ -2280,10 +2280,7 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
 }
 
 bool NaiveN05FlashModel::SupportsCudaRejectionSampling(const GenerationConfig &config) const {
-    // Rejection p/q uses the existing joint-filter probability builder. Ordinary
-    // sampling's new sequential finite-k support must not change that contract.
-    return config.top_k >= weight.weight.at("lm_head.weight").dims[0] &&
-           SelectLogits(config).cudaSampling;
+    return config.top_k > 1 && SelectLogits(config).cudaSampling;
 }
 
 std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
