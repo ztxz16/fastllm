@@ -14,6 +14,7 @@ class PDReceiveState {
     virtual std::vector<std::vector<fastkv::Buffer>> Targets(
         const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) = 0;
     virtual void Commit(ResponseContext &context) = 0;
+    virtual void CommitShards(ResponseContext &, const fastkv::Message &);
 };
 
 // Logical payload metadata contains placement ranks, never allocator pointers.
@@ -21,6 +22,27 @@ class PDReceiveState {
 fastkv::Message PDStatePayload(const fastkv::Message &message);
 std::vector<int> PDReceivePlacement(const fastkv::Bytes &metadata,
                                    size_t buffers, const std::vector<int> &devices);
+
+// A portable row shard holds consecutive tokens and a contiguous byte range
+// within every logical row. Packed encodings use their physical byte axes.
+struct PDRowShard {
+    std::string component;
+    size_t offset, width;
+    fastkv::Buffer buffer;
+};
+struct PDRowDestination {
+    size_t rows, rowBytes;
+    std::vector<fastkv::Buffer> spans;
+};
+struct PDRowMessage {
+    std::string layout;
+    fastkv::Bytes metadata;
+    std::vector<PDRowShard> shards;
+    fastkv::Message Encode() const;
+    explicit PDRowMessage(const fastkv::Message &wire);
+    PDRowMessage() = default;
+    void Scatter(const std::map<std::string, PDRowDestination> &targets, int device) const;
+};
 
 class PDStateWriter {
   public:

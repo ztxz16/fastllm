@@ -86,6 +86,8 @@ namespace fastllm {
         void ConfigureHostPrefixCache(size_t bytes, int64_t kvBytes = -1, int64_t swaBytes = -1);
         bool TryRestoreHostPrefix(ResponseContext &context, int gpuTokens, bool &requery) override;
         std::string PDLayout() const override;
+        std::string PDAlternateLayout() const override;
+        fastkv::Message PDAlternateState(const fastkv::Message &state) const override;
         bool SupportsPDKvMemDecode() const override { return true; }
         std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) override;
         std::vector<int> PDDevices() const override { return tpDevices; }

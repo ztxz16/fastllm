@@ -808,6 +808,10 @@ namespace fastllm {
         // PollPD imports its result before admission to decode.
         void PreparePendingPD(ResponseContext *context);
         virtual std::string PDLayout() const;
+        // Optional wire schema offered to receivers with a different placement.
+        // Native caches stay in their original layout.
+        virtual std::string PDAlternateLayout() const { return {}; }
+        virtual fastkv::Message PDAlternateState(const fastkv::Message &state) const;
         virtual bool SupportsPDKvMemDecode() const { return false; }
         virtual std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) { return {}; }
         virtual std::vector<int> PDDevices() const;

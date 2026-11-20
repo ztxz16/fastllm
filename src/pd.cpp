@@ -35,7 +35,7 @@ uint64_t TensorBytes(const Data &data) {
 }
 constexpr uint32_t PDWireMagic = 0x32564450;
 // This probe negotiates a per-request cache-hit count after the reply's model metadata.
-constexpr uint32_t PDUsageProbe = 10, PDPrefillWithUsage = 9;
+constexpr uint32_t PDUsageProbe = 10, PDPrefillWithUsage = 9, PDShardPrefill = 11;
 template<class Receive>
 Receive WithoutPDUsageTrailer(Receive receive) {
     return [receive = std::move(receive)](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
@@ -44,6 +44,13 @@ Receive WithoutPDUsageTrailer(Receive receive) {
     };
 }
 constexpr size_t PDTransferArenaBytes = size_t(64) << 20;
+fastkv::Bytes PDEnvelope(const fastkv::Bytes &metadata, const std::vector<int> &placement) {
+    fastkv::Writer envelope;
+    envelope.U32(PDWireMagic);
+    envelope.Blob(metadata.data(), metadata.size());
+    envelope.Ints(placement);
+    return std::move(envelope.bytes);
+}
 bool HasPDEnvelope(const fastkv::Bytes &bytes) {
     if (bytes.size() < 4) return false;
     fastkv::Reader reader(bytes);
@@ -76,6 +83,85 @@ std::vector<int> PDReceivePlacement(const fastkv::Bytes &metadata,
     }
     return result;
 }
+fastkv::Message PDRowMessage::Encode() const {
+    fastkv::Writer header;
+    header.String(layout); header.Blob(metadata.data(), metadata.size()); header.U32(shards.size());
+    fastkv::Message wire;
+    for (const auto &shard : shards) {
+        header.String(shard.component); header.U64(shard.offset); header.U64(shard.width);
+        wire.buffers.push_back(shard.buffer);
+    }
+    wire.metadata = PDEnvelope(header.bytes, std::vector<int>(shards.size(), 0));
+    return wire;
+}
+PDRowMessage::PDRowMessage(const fastkv::Message &wire) {
+    const auto state = PDStatePayload(wire);
+    fastkv::Reader header(state.metadata);
+    layout = header.String(); metadata = header.Blob();
+    Check(header.U32() == state.buffers.size(), "invalid shard count");
+    for (const auto &buffer : state.buffers)
+        shards.push_back({header.String(128), header.U64(), header.U64(), buffer});
+    header.End();
+}
+void PDRowMessage::Scatter(const std::map<std::string, PDRowDestination> &targets, int device) const {
+#ifdef USE_CUDA
+    std::map<std::string, std::vector<fastkv::Shard>> sources;
+    for (const auto &s : shards) {
+        auto it = targets.find(s.component);
+        Check(it != targets.end(), "unknown PD component");
+        const auto &t = it->second;
+        Check(t.rows && s.width && s.width <= SIZE_MAX / t.rows && s.buffer.Size() == s.width * t.rows &&
+              s.buffer.Kind() == fastkv::MemoryKind::Cuda && s.buffer.Device() == device, "invalid PD row shard");
+        sources[s.component].push_back({s.component, layout, {}, s.buffer, {t.rowBytes}, {s.offset}, {s.width}, 1, 0});
+    }
+    std::vector<void *> dst; std::vector<const void *> src;
+    std::vector<size_t> dstPitch, srcPitch, widths, heights;
+    struct PeerCopy { void *dst; int device; const void *src; size_t bytes; };
+    std::vector<PeerCopy> peers;
+    for (const auto &item : targets) {
+        const auto &t = item.second;
+        Check(t.rows && t.rowBytes && !t.spans.empty(), "missing PD row destination");
+        const auto &inputs = sources.at(item.first);
+        fastkv::Shard row{item.first, layout, {}, t.spans.front(), {t.rowBytes}, {0}, {t.rowBytes}, 1, 0};
+        // Validate one row's coverage once and repeat strided copies per page
+        // run. A 200k-token prompt never expands into 200k transport spans.
+        const auto plan = fastkv::PlanCopies(inputs, {row});
+        size_t first = 0;
+        for (const auto &span : t.spans) {
+            const size_t count = span.Size() / t.rowBytes;
+            Check(span.Kind() == fastkv::MemoryKind::Cuda && count && span.Size() % t.rowBytes == 0 &&
+                  count <= t.rows - first, "invalid PD page span");
+            for (const auto &copy : plan) {
+                const auto &in = inputs[copy.source];
+                const size_t pitch = in.shape.front();
+                auto *to = static_cast<char *>(span.MutableData()) + copy.targetOffset;
+                const auto *from = static_cast<const char *>(in.buffer.Data()) + first * pitch + copy.sourceOffset;
+                if (span.Device() == device) {
+                    dst.push_back(to); src.push_back(from); dstPitch.push_back(t.rowBytes);
+                    srcPitch.push_back(pitch); widths.push_back(copy.bytes); heights.push_back(count);
+                } else {
+                    Check(pitch == copy.bytes && t.rowBytes == pitch, "cross-device row slice needs contiguous storage");
+                    peers.push_back({to, span.Device(), from, count * pitch});
+                }
+            }
+            first += count;
+        }
+        Check(first == t.rows, "incomplete PD destination rows");
+    }
+    const int previous = FastllmCudaGetDevice(); FastllmCudaSetDevice(device);
+    bool ok = FastllmCudaBatchCopy2DAsyncCurrentThread(dst.data(), src.data(), dstPitch.data(),
+        srcPitch.data(), widths.data(), heights.data(), widths.size());
+    for (const auto &peer : peers)
+        if (ok) ok = FastllmCudaMemcpyPeerAsyncCurrentThread(peer.device, peer.dst, device, peer.src, peer.bytes);
+    FastllmCudaSyncCurrentThreadStream();
+    ok = ok && !FastllmCudaGetThreadError();
+    FastllmCudaSetDevice(previous);
+    Check(ok, "GPU row shard transfer failed");
+#else
+    throw std::runtime_error("PD row scatter requires CUDA");
+#endif
+}
+
 struct PDStateWriter::Allocations {
     std::mutex mutex;
     std::vector<std::pair<int, size_t>> plan;
@@ -241,9 +327,7 @@ fastkv::Message PDStateWriter::Finish(const std::vector<int> &localDevices) {
         }
         placement.push_back(rank);
     }
-    fastkv::Writer envelope;
-    envelope.U32(PDWireMagic); envelope.Blob(result.metadata.data(), result.metadata.size());
-    envelope.Ints(placement); result.metadata = std::move(envelope.bytes);
+    result.metadata = PDEnvelope(result.metadata, placement);
     return result;
 }
 fastkv::Buffer PDBindTensor(fastkv::Reader &metadata, Data &storage,
@@ -324,14 +408,14 @@ struct PDPending {
     std::vector<std::future<fastkv::Message>> probes;
     std::vector<std::shared_ptr<fastkv::Cancellation>> probeCancellations;
     std::vector<fastkv::PrefillRouter::Estimate> estimates;
-    std::vector<bool> probed;
+    std::vector<bool> probed, shardedPeers;
     fastkv::Message probeRequest;
     std::vector<uint32_t> probeKinds;
     fastkv::SessionDirectory::Record placement;
     std::shared_ptr<fastkv::Cancellation> cancellation = std::make_shared<fastkv::Cancellation>();
     int length = 0;
     size_t reservation = 0;
-    bool committed = false, reportUsage = false;
+    bool committed = false, reportUsage = false, sharded = false;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~PDPending() {
         cancellation->Cancel();
@@ -362,7 +446,9 @@ struct PDRuntime {
         RequestMetadata metadata;
         std::promise<fastkv::Message> result;
         bool reportUsage = false;
+        const basellm *shardAdapter = nullptr;
         void Reply(fastkv::Message state, uint32_t cachedTokens) {
+            if (shardAdapter) state = shardAdapter->PDAlternateState(state);
             if (reportUsage) {
                 fastkv::Writer trailer;
                 trailer.bytes = std::move(state.metadata);
@@ -413,7 +499,10 @@ struct PDRuntime {
     std::map<std::string, Announcement> announcements;
     size_t sessionCapacity = 0;
     std::shared_ptr<Workload> workload = std::make_shared<Workload>();
-    std::string role, identity;
+    std::string role, identity, alternateIdentity;
+    bool Accepts(const std::string &name) const {
+        return name == identity || (!alternateIdentity.empty() && name == alternateIdentity);
+    }
     std::vector<std::string> peers;
     std::atomic<bool> stopping{false};
     int chunk = 2048;
@@ -468,11 +557,12 @@ struct PDRuntime {
     }
     std::future<fastkv::Message> Prefill(std::vector<int> input,
                                        std::shared_ptr<fastkv::Cancellation> cancellation, RequestMetadata metadata,
-                                       bool reportUsage) {
+                                       bool reportUsage, const basellm *shardAdapter) {
         auto request = std::make_shared<PrefillRequest>();
         request->input = std::move(input);
         request->metadata = std::move(metadata);
         request->reportUsage = reportUsage;
+        request->shardAdapter = shardAdapter;
         request->cancellation = std::move(cancellation);
         request->work = workload;
         // Pin an L2 hit at admission: its saved work is real, not a stale hint.
@@ -556,9 +646,17 @@ struct PDRuntime {
                             Check(rate > 0 && e.hostCachedTokens <= size_t(pending.length), "invalid host cache estimate");
                             e.restoreSeconds = double(bytes) / rate; e.pendingRestoreSeconds = double(queuedBytes) / rate;
                         }
+                        const bool sharded = kind == PDUsageProbe && reader.Remaining();
+                        if (sharded) {
+                            Check(reader.U32() == PDShardPrefill, "unknown PD transfer mode");
+                        }
                         reader.End();
                         Check(e.cachedTokens <= size_t(pending.length) && e.tokensPerSecond > 0,
                               "invalid routing estimate");
+                        if (sharded) {
+                            if (pending.shardedPeers.empty()) pending.shardedPeers.resize(peers.size());
+                            pending.shardedPeers[i] = true;
+                        }
                         e.available = true; pending.probed[i] = true;
                     } catch (const std::exception &) {
                         if (pending.probeKinds[i] > 2)
@@ -606,8 +704,9 @@ struct PDRuntime {
                 fastkv::SessionDirectory::Record{placement.version + 1, peers[chosen.peer]};
         }
         pending.reportUsage = probeKind == PDUsageProbe;
+        pending.sharded = !pending.shardedPeers.empty() && pending.shardedPeers[chosen.peer];
         if (pending.reportUsage || (!pending.sessionKey.empty() && probeKind >= 4)) {
-            pending.request.metadata[0] = pending.reportUsage ? PDPrefillWithUsage : 3;
+            pending.request.metadata[0] = pending.sharded ? PDShardPrefill : pending.reportUsage ? PDPrefillWithUsage : 3;
             fastkv::Writer suffix; suffix.String(pending.sessionKey);
             pending.request.metadata.insert(pending.request.metadata.end(), suffix.bytes.begin(), suffix.bytes.end());
         }
@@ -1147,6 +1246,12 @@ void PDRuntime::RunPrefill(basellm &model) {
 std::string basellm::PDLayout() const {
     throw std::invalid_argument("FastKV PD: this model has no state adapter");
 }
+void PDReceiveState::CommitShards(ResponseContext &, const fastkv::Message &) {
+    throw std::logic_error("PD receiver has no shard adapter");
+}
+fastkv::Message basellm::PDAlternateState(const fastkv::Message &) const {
+    throw std::logic_error("PD producer has no shard adapter");
+}
 fastkv::Message basellm::ExportPDState(ResponseContext &) { throw std::logic_error("missing PD adapter"); }
 fastkv::CacheSnapshot basellm::DescribePDCache(ResponseContext &, const fastkv::Message &state) {
     fastkv::CacheSnapshot result; result.state = state;
@@ -1188,7 +1293,12 @@ void basellm::ConfigurePD(const json11::Json &config) {
     Check(runtime->role == "prefill" || runtime->role == "decode", "role must be prefill or decode");
     Check(!config["model_id"].string_value().empty(),
           "model_id must identify the same checkpoint on P and D");
-    runtime->identity = config["model_id"].string_value() + ":gpu-state-v2:" + PDLayout();
+    const auto identityPrefix = config["model_id"].string_value() + ":gpu-state-v2:";
+    runtime->identity = identityPrefix + PDLayout();
+    if (runtime->role == "prefill") {
+        const auto alternate = PDAlternateLayout();
+        if (!alternate.empty()) runtime->alternateIdentity = identityPrefix + alternate;
+    }
     Check(!UseModelSpecificScheduler(), "PD requires a supported common scheduler");
     Check(!kvMemConfig.enabled || (runtime->role == "decode" && SupportsPDKvMemDecode()),
           "KVMem PD requires a supported decode adapter; prefill must use GPU KV");
@@ -1352,7 +1462,9 @@ void basellm::ConfigurePD(const json11::Json &config) {
                                            std::shared_ptr<fastkv::Cancellation> cancellation) {
                 fastkv::Reader reader(request.metadata);
                 const auto kind = reader.U32();
-                Check((kind == 1 || kind == 3 || kind == PDPrefillWithUsage) && reader.String() == raw->identity,
+                const auto requested = reader.String();
+                Check((kind == 1 || kind == 3 || kind == PDPrefillWithUsage || kind == PDShardPrefill) &&
+                      raw->Accepts(requested) && ((kind == PDShardPrefill) == (requested != raw->identity)),
                       "incompatible checkpoint or state layout");
                 auto tokens = reader.Ints(size_t(max_positions));
                 RequestMetadata metadata;
@@ -1361,13 +1473,18 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 Check(request.buffers.empty() && !tokens.empty() && tokens.size() < size_t(max_positions),
                       "invalid prefill request");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds the prefill token pool");
-                return raw->Prefill(std::move(tokens), std::move(cancellation), std::move(metadata), kind == PDPrefillWithUsage);
+                return raw->Prefill(std::move(tokens), std::move(cancellation), std::move(metadata),
+                                    kind == PDPrefillWithUsage || kind == PDShardPrefill,
+                                    kind == PDShardPrefill ? this : nullptr);
             }, [this, raw = runtime.get()](const fastkv::Message &request, fastkv::Message &reply) {
                 if (request.metadata.size() < 4) return false;
                 fastkv::Reader reader(request.metadata);
                 const auto kind = reader.U32();
                 if (kind != 2 && kind != 4 && kind != 6 && kind != 7 && kind != 8 && kind != PDUsageProbe) return false;
-                Check(reader.String() == raw->identity, "incompatible routing identity");
+                const auto requested = reader.String();
+                // Only the usage probe can negotiate a sharded response.
+                Check(requested == raw->identity || ((kind == PDUsageProbe || kind == 7) && raw->Accepts(requested)),
+                      "incompatible routing identity");
                 if (kind == 7) {
                     const auto session = reader.String(512);
                     fastkv::SessionDirectory::Record record;
@@ -1398,6 +1515,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
                     writer.U64(raw->workload->restoreBytes.load());
                     writer.U64(uint64_t(raw->HostRestoreBytesPerSecond()));
                 }
+                if (kind == PDUsageProbe && requested != raw->identity) writer.U32(PDShardPrefill);
                 reply.metadata = std::move(writer.bytes);
                 return true;
             });
@@ -1469,7 +1587,7 @@ void basellm::PreparePendingPD(ResponseContext *context) {
         }
         fastkv::ReceiveTarget target;
         fastkv::ReceivePlacement placement;
-        if (pending->receiver) {
+        if (pending->receiver && !pending->sharded) {
             target = [receiver = pending->receiver](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
                 return receiver->Targets(metadata, sizes);
             };
@@ -1526,7 +1644,10 @@ bool basellm::PollPD(ResponseContext *context) {
         pending->route.reset();
         std::lock_guard<std::mutex> lock(forwardLocker);
         const auto importBegin = std::chrono::steady_clock::now();
-        if (pending->receiver) pending->receiver->Commit(*context);
+        if (pending->sharded) {
+            Check(bool(pending->receiver), "missing destination for PD shards");
+            pending->receiver->CommitShards(*context, state);
+        } else if (pending->receiver) pending->receiver->Commit(*context);
         else ImportPDState(*context, state);
         pending->receiver.reset();
         context->pdCachedInputTokens = cachedTokens;

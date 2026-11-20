@@ -907,10 +907,12 @@ class Fixture : public NaiveN05FlashModel {
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
         SetSaveHistoryChat(true);
     }
-    void PreparePDGroupFixture(int dp) {
-        ConfigureAttentionParallel(dp); maxBatch = 4; SetMaxTokens(16384); WarmUp();
+    void PreparePDGroupFixture(int dp, bool draft = false) {
+        if (dp > 1) ConfigureAttentionParallel(dp);
+        if (draft) ConfigurePDDraft(dp);
+        maxBatch = 4; SetMaxTokens(16384); WarmUp();
     }
-    std::vector<PDGroupRecord> ExportPDGroupFixture() {
+    std::vector<PDGroupRecord> ExportPDGroupFixture(bool shards = false) {
         std::vector<PDGroupRecord> records;
         for (int length : {1, 127, 128, 129, 257, 3073, 4097}) {
             ResponseContext context; context.Init(block_cnt, dataType, kvCacheDataType);
@@ -928,7 +930,8 @@ class Fixture : public NaiveN05FlashModel {
             record.tokens = context.allTokens; record.tokens.push_back(42);
             // Model runtimes exclusively own their GPU workers. Preserve an
             // immutable wire checkpoint, then destroy P before constructing D.
-            record.state = fastkv::Snapshot(ExportPDState(context), -1);
+            auto native = ExportPDState(context);
+            record.state = fastkv::Snapshot(shards ? PDAlternateState(native) : native, -1);
             context.generationConfig.output_logits = true;
             record.logits.resize(3);
             for (int step = 0; step < 3; ++step) {
@@ -940,7 +943,7 @@ class Fixture : public NaiveN05FlashModel {
         }
         return records;
     }
-    void ImportPDGroupFixture(const std::vector<PDGroupRecord> &records, bool rdma) {
+    void ImportPDGroupFixture(const std::vector<PDGroupRecord> &records, bool rdma, bool shards = false) {
         fastkv::Options options; options.transport = rdma ? fastkv::Transport::Rdma : fastkv::Transport::Tcp;
         fastkv::Service server(options), client(options);
         fastkv::Message wire;
@@ -957,7 +960,7 @@ class Fixture : public NaiveN05FlashModel {
             if (!SelectPDRequestGroup(context, available, length + 8)) throw std::runtime_error("PD group selection failed");
             const auto devices = PDRequestDevices(context); wire = record.state;
             fastkv::Message request; std::future<fastkv::Message> future;
-            if (length == 129) {
+            if (!shards && length == 129) {
                 // Cancel before submission: the private final pages and SWA
                 // allocations must return. Cumulative reservations exceed the
                 // fixture's entire 16K pool, so leaked pages cannot hide here.
@@ -965,7 +968,7 @@ class Fixture : public NaiveN05FlashModel {
                     auto abandoned = PreparePDReceive(context);
                 }
             }
-            auto receiver = length == 257 ? std::shared_ptr<PDReceiveState>{} : PreparePDReceive(context);
+            auto receiver = length == 257 && !shards ? std::shared_ptr<PDReceiveState>{} : PreparePDReceive(context);
             if (length != 257 && !receiver) throw std::runtime_error("missing direct GPU PD receiver");
             if (receiver && length == 129) {
                 std::vector<size_t> sizes;
@@ -975,7 +978,7 @@ class Fixture : public NaiveN05FlashModel {
                 if (!rejected) throw std::runtime_error("GPU receiver accepted invalid metadata");
             }
             fastkv::ReceiveTarget target;
-            if (receiver) target = [receiver](const fastkv::Bytes &metadata,const std::vector<size_t> &sizes) {
+            if (receiver && !shards) target = [receiver](const fastkv::Bytes &metadata,const std::vector<size_t> &sizes) {
                 return receiver->Targets(metadata,sizes);
             };
             if (!client.TrySubmit(server.Address(), request, future, {}, {}, target,
@@ -985,7 +988,7 @@ class Fixture : public NaiveN05FlashModel {
             auto arrived = future.get();
             // Exercise the same per-request map through L2 as well. Keep the
             // checkpoint after source runtime destruction; restore onto D's group.
-            if (length == 257) {
+            if (!shards && length == 257) {
                 fastkv::HostCache::Options cacheOptions; cacheOptions.bytes = 16 << 20;
                 fastkv::HostCache cache(cacheOptions); fastkv::CacheSnapshot snapshot; snapshot.state = wire;
                 for (const auto &buffer : wire.buffers) {
@@ -1005,16 +1008,46 @@ class Fixture : public NaiveN05FlashModel {
             const auto locations = PDReceivePlacement(wire.metadata, wire.buffers.size(), devices);
             for (size_t i = 0; !receiver && i < arrived.buffers.size(); ++i)
                 if (arrived.buffers[i].Device() != locations[i]) throw std::runtime_error("PD cross-topology landing differs");
-            if (receiver) { receiver->Commit(context); receiver.reset(); arrived = {}; }
+            if (shards) { receiver->CommitShards(context, arrived); receiver.reset(); arrived = {}; }
+            else if (receiver) { receiver->Commit(context); receiver.reset(); arrived = {}; }
             else ImportPDState(context, arrived);
             context.preTokens = length;
             auto exported = ExportPDState(context);
-            if (exported.metadata != wire.metadata || exported.buffers.size() != wire.buffers.size())
-                throw std::runtime_error("PD cross-topology schema differs");
-            for (size_t i = 0; i < wire.buffers.size(); ++i) {
-                std::vector<uint8_t> a(wire.buffers[i].Size()), b(exported.buffers[i].Size());
-                wire.buffers[i].Read(a.data(),0,a.size()); exported.buffers[i].Read(b.data(),0,b.size());
-                if (a != b) throw std::runtime_error("PD cross-topology state bytes differ");
+            if (shards) {
+                PDRowMessage portable(wire);
+                std::vector<std::string> names;
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    names.push_back("k" + std::to_string(layer)); names.push_back("v" + std::to_string(layer));
+                    const auto indexer = "i" + std::to_string(layer);
+                    if (std::any_of(portable.shards.begin(), portable.shards.end(),
+                            [&](const auto &shard) { return shard.component == indexer; })) names.push_back(indexer);
+                }
+                for (int layer = 0; layer < draftLayers; ++layer) {
+                    names.push_back("dk" + std::to_string(layer)); names.push_back("dv" + std::to_string(layer));
+                }
+                fastkv::Reader attributes(portable.metadata); attributes.U32();
+                if (attributes.U32()) names.push_back("hidden");
+                if (names.size() != exported.buffers.size()) throw std::runtime_error("shard component count changed");
+                for (const auto &shard : portable.shards) {
+                    auto found = std::find(names.begin(), names.end(), shard.component);
+                    const auto &target = exported.buffers.at(found - names.begin());
+                    std::vector<uint8_t> source(shard.buffer.Size()), destination(target.Size());
+                    shard.buffer.Read(source.data(), 0, source.size());
+                    target.Read(destination.data(), 0, destination.size());
+                    const size_t rows = source.size() / shard.width, stride = destination.size() / rows;
+                    if (shard.offset + shard.width > stride) throw std::runtime_error("invalid assembled width");
+                    for (size_t row = 0; row < rows; ++row)
+                        if (std::memcmp(source.data() + row * shard.width, destination.data() + row * stride + shard.offset,
+                                        shard.width)) throw std::runtime_error("TP to DP state bytes differ");
+                }
+            } else {
+                if (exported.metadata != wire.metadata || exported.buffers.size() != wire.buffers.size())
+                    throw std::runtime_error("PD cross-topology schema differs");
+                for (size_t i = 0; i < wire.buffers.size(); ++i) {
+                    std::vector<uint8_t> a(wire.buffers[i].Size()), b(exported.buffers[i].Size());
+                    wire.buffers[i].Read(a.data(),0,a.size()); exported.buffers[i].Read(b.data(),0,b.size());
+                    if (a != b) throw std::runtime_error("PD cross-topology state bytes differ");
+                }
             }
             SetCudaGraph(true);
             for (int step = 0; step < 3; ++step) {
@@ -1025,7 +1058,7 @@ class Fixture : public NaiveN05FlashModel {
                 Forward(Data(FLOAT32,{1,1},{float(42+step)}),Data(),Data(FLOAT32,{1,1},{float(length+step)}),
                         context.pastKeyValues,context.generationConfig,LastTokensManager(),&actual);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-                if (verifyGraphLaunches.load() - before != ranks)
+                if (!shards && verifyGraphLaunches.load() - before != ranks)
                     throw std::runtime_error("PD decode did not replay the graph on every rank");
 #endif
                 if (actual.size() != record.logits[step].size()) throw std::runtime_error("PD logits missing");
@@ -5652,6 +5685,22 @@ int main(int argc, char **argv) {
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
         }
 #endif
+        if (argc > 2 && std::string(argv[2]) == "pd_draft_tp_to_dp") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            const int dst = argc > 3 ? std::stoi(argv[3]) : ranks;
+            if (devices < dst) return 77;
+            std::vector<PDGroupRecord> records;
+            {
+                Fixture producer(ranks, false, true, true, true);
+                producer.SetKVCacheDataType(FP8_E4M3); producer.SetIndexerDataType(FP8_E4M3);
+                producer.ConfigureDraftParallel(ranks, false);
+                producer.PreparePDGroupFixture(1, true); records = producer.ExportPDGroupFixture(true);
+            }
+            Fixture consumer(dst, false, true, true, true);
+            consumer.SetKVCacheDataType(FP8_E4M3); consumer.SetIndexerDataType(FP8_E4M3);
+            consumer.PreparePDGroupFixture(dst, true); consumer.ImportPDGroupFixture(records, false, true);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "pd_group") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             const auto type = argc > 4 && std::string(argv[4]) == "bf16" ? BFLOAT16 : FP8_E4M3;

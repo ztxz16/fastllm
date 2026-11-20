@@ -482,6 +482,48 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
         }
         received = true; return result;
     }
+    void CommitShards(ResponseContext &context, const fastkv::Message &wire) override {
+        PDRowMessage state(wire);
+        fastkv::Reader header(state.metadata);
+        const int committed = header.U32(), tailRows = header.U32();
+        header.End();
+        CheckPD(!received && draft && devices.size() == 1 && state.layout == model.PDLayout() &&
+                committed == length && tailRows >= 0 && tailRows <= draft->prefixHidden.dims[1],
+                "incompatible sharded checkpoint");
+        std::map<std::string, PDRowDestination> parts;
+        size_t slot = 0;
+        for (int layer = 0; layer < model.block_cnt; ++layer) {
+            for (int v = 0; v < 2; ++v) {
+                const auto &root = v ? reservation->pastKeyValues[layer].second : reservation->pastKeyValues[layer].first;
+                const auto &local = *root.multiDeviceDatas.at(devices.front());
+                parts.emplace((v ? "v" : "k") + std::to_string(layer), PDRowDestination{
+                    size_t(local.dims[1]), GetDataBytes(local.dataType, 1, local.dims[2]), targets.at(slot++)});
+            }
+            if (!model.slidingLayers[layer] && model.HasSeparateIndexer())
+                parts.emplace("i" + std::to_string(layer), PDRowDestination{size_t(length),
+                    GetDataBytes(model.AuxiliaryKVType(), 1, model.IndexerCacheWidth(model.AuxiliaryKVType())),
+                    targets.at(slot++)});
+        }
+        auto bind = [&](std::string name, Data &tensor) {
+            const size_t rows = tensor.dims[1], pitch = GetDataBytes(tensor.dataType, 1, tensor.dims[2]);
+            parts.emplace(std::move(name), PDRowDestination{rows, pitch, {fastkv::Buffer::Borrow(
+                tensor.cudaData, rows * pitch, fastkv::MemoryKind::Cuda, tensor.dataDeviceIds.front(), draft)}});
+        };
+        for (int layer = 0; layer < model.draftLayers; ++layer) {
+            bind("dk" + std::to_string(layer), draft->kv[layer].first);
+            bind("dv" + std::to_string(layer), draft->kv[layer].second);
+        }
+        if (tailRows) {
+            draft->prefixHidden.Resize({1, tailRows, model.embed_dim});
+            bind("hidden", draft->prefixHidden);
+        } else {
+            draft->prefixHidden.dims.clear();
+            draft->prefixHidden.strides.clear();
+        }
+        state.Scatter(parts, devices.front());
+        received = true;
+        Commit(context);
+    }
     void Commit(ResponseContext &context) override {
         CheckPD(received && !committed && context.pastKeyValues.size() == reservation->pastKeyValues.size(),
                 "GPU transfer not ready");
@@ -608,6 +650,84 @@ std::string NaiveN05FlashModel::PDGroupLayout(int attentionRanks) const {
                       int(HasSeparateIndexer())})
         layout += ":" + std::to_string(value);
     return draftEnabled ? layout + DraftPDLayout(true) : layout;
+}
+
+std::string NaiveN05FlashModel::PDAlternateLayout() const {
+    // Offer a full attention replica to a group-local receiver. The existing
+    // TP export and local checkpoints remain available in their native layout.
+    if (attentionDP != 1 || tpDevices.size() < 2 || !draftEnabled || sparseKv ||
+        indexerContextSharding || indexerLayerSharding) return {};
+    return PDGroupLayout(1);
+}
+
+fastkv::Message NaiveN05FlashModel::PDAlternateState(const fastkv::Message &wire) const {
+    PDRowMessage out; out.layout = PDAlternateLayout();
+    CheckPD(!out.layout.empty(), "unsupported TP to replica export");
+    const auto state = PDStatePayload(wire);
+    fastkv::Reader header(state.metadata);
+    CheckPD(header.String() == PDLayout(), "invalid native TP state");
+    const int length = header.U32();
+    int tailRows = 0;
+    for (int i = 0; i < block_cnt * 2; ++i) header.Ints(3);
+    size_t index = 0;
+    // Consume native tensor descriptors; retained shards alias the registered
+    // export arenas. Replicated GQA heads and Indexer rows cross the NIC once.
+    auto take = [&](fastkv::Reader &reader, const std::string &name, DataType type, int rows,
+                    int fullWidth, int rank, int ranks, size_t baseOffset = 0) {
+        const auto dtype = reader.U32(); const auto shape = reader.Ints(3);
+        reader.U32(); const size_t bytes = reader.U64();
+        CheckPD(dtype == uint32_t(type) && shape.size() == 3 && shape[0] == 1 && shape[1] == rows &&
+                shape[2] > 0 && fullWidth % shape[2] == 0 &&
+                ranks % (fullWidth / shape[2]) == 0 && bytes == GetDataBytes(type, rows, shape[2]),
+                "invalid logical shard geometry");
+        const auto &buf = state.buffers.at(index++);
+        CheckPD(buf.Size() == bytes, "invalid native shard buffer");
+        const int replicas = ranks / (fullWidth / shape[2]);
+        const size_t width = GetDataBytes(type, 1, shape[2]);
+        if (rank % replicas == 0)
+            out.shards.push_back({name, baseOffset + size_t(rank / replicas) * width, width, buf});
+    };
+    const int ranks = tpDevices.size();
+    for (int rank = 0; rank < ranks; ++rank) {
+        const auto descriptors = header.Blob();
+        const auto count = header.U32(); const size_t first = index;
+        fastkv::Reader tensors(descriptors);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const auto &cfg = slidingLayers[layer] ? sliding : full;
+            const int rows = slidingLayers[layer] ? std::min(length, window - 1) : length;
+            const auto k = "k" + std::to_string(layer);
+            take(tensors, k, LayerKVType(layer), rows, cfg.kvHeads * cfg.headDim, rank, ranks);
+            take(tensors, "v" + std::to_string(layer), LayerKVType(layer), rows, cfg.kvHeads * cfg.valueDim, rank, ranks);
+            if (!slidingLayers[layer]) {
+                const size_t kBytes = GetDataBytes(LayerKVType(layer), 1, cfg.kvHeads * cfg.headDim);
+                take(tensors, HasSeparateIndexer() ? "i" + std::to_string(layer) : k, AuxiliaryKVType(),
+                     rows, IndexerCacheWidth(AuxiliaryKVType()), rank, ranks, HasSeparateIndexer() ? 0 : kBytes);
+            }
+        }
+        tensors.End();
+        CheckPD(index - first == count, "invalid native TP tensor count");
+    }
+    CheckPD(header.U32() == 1 && header.U32() == uint32_t(length) &&
+            header.U32() == uint32_t(draftLayers), "invalid native draft checkpoint");
+    const int draftRanks = header.U32();
+    CheckPD(draftRanks > 0 && draftRanks <= ranks, "invalid draft rank count");
+    for (int rank = 0; rank < draftRanks; ++rank)
+        for (int layer = 0; layer < draftLayers; ++layer) for (const char *part : {"dk", "dv"})
+            take(header, part + std::to_string(layer), BFLOAT16, std::min(length, draftWindow - 1),
+                 draftKvHeads * draftHeadDim, rank, draftRanks);
+    if (header.U32()) {
+        const auto bytes = state.buffers.at(index).Size();
+        const size_t rowBytes = GetDataBytes(BFLOAT16, 1, embed_dim);
+        CheckPD(bytes % rowBytes == 0 && bytes / rowBytes <= size_t(std::min(length, draftWindow + GetPageLen() - 1)),
+                "invalid draft history length");
+        tailRows = bytes / rowBytes;
+        take(header, "hidden", BFLOAT16, tailRows, embed_dim, 0, 1);
+    }
+    header.End();
+    CheckPD(index == state.buffers.size(), "unclaimed native TP buffer");
+    fastkv::Writer attributes;
+    attributes.U32(length); attributes.U32(tailRows); out.metadata = std::move(attributes.bytes);
+    return out.Encode();
 }
 
 std::string NaiveN05FlashModel::PDLayout() const {

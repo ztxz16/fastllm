@@ -114,7 +114,7 @@ Attention DP 模式在导入阶段分配请求归属，由对应 GPU 的持久�
 
 Naive N0.5 的 adapter 交接各 TP rank 的逻辑 KV、完整注意力的分页内容和滑窗的时间顺序。远端页号不会直接用作本地页号。支持 BF16、FP8 和 FP4 KV，以及 replicated/layer_shard Indexer；FP4 的独立 FP8 Indexer 随主 KV 一起传输，payload 和 scale 均按原字节恢复，不重新量化。TP 交接统一使用 v3 布局。
 
-Naive 传统 TP 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持一致的 TP、激活、KV dtype 和 Indexer 配置。使用 FP4 时，两端将 `--kv_cache_dtype` 设为 `fp4`，保持 BF16 计算、TP >= 2、关闭 draft。Naive 支持 P 使用普通 GPU KV、D 使用 KVMem 的异构存储部署。Indexer context sharding、P 端 KVMem、KVMem 与 PD draft 同时启用，以及 P/D 不同 TP 或 KV 精度仍明确拒绝。
+Naive 传统 TP 部署使用 [Naive 模板](../example/pd/naive_n05.json)，两端保持一致的 TP、激活、KV dtype 和 Indexer 配置。使用 FP4 时，两端将 `--kv_cache_dtype` 设为 `fp4`，保持 BF16 计算、TP >= 2、关闭 draft。Naive 支持 P 使用普通 GPU KV、D 使用 KVMem 的异构存储部署。Indexer context sharding、P 端 KVMem、KVMem 与 PD draft 同时启用，以及 P/D 不同 KV 精度仍明确拒绝。
 
 ### Naive：Attention DP 与多副本
 
@@ -167,6 +167,8 @@ Naive 纯 GPU PD 支持 DSpark。传统 TP 部署支持单卡草稿、完整草�
 传统 TP 之间的草稿状态使用 `draft-v2` 布局：按逻辑 rank 传输已提交窗口的 K/V 和前缀检查点所需的归一化输入尾部。D 复用本地草稿缓冲区，预留候选空间后才允许执行；采样队列和 Graph 不跨节点传输。两端草稿结构、TP 大小及分片策略必须一致，旧草稿布局或不兼容配置会在交接前被拒绝。不启用 DSpark 时不附加草稿状态。
 
 当每个 Attention DP 组各有一份完整注意力权重时，P/D 可使用不同的 DP 数及 EP 数。两端配置相同的草稿检查点和候选数，例如 `--speculative_draft_model_path <目录> --dspark 3`。实例可通过 `--dspark_dp_size` 显式指定草稿副本数。未指定草稿布局参数时，先读取已有的 `FASTLLM_DSPARK_TP`，未设置时默认把草稿放到请求所属的 GPU。组间交接使用 `naive-n05-group-draft-v4`，P 只打包该请求已提交的草稿窗口及可选前缀尾部，D 复用 SWA 的已注册缓冲区接收草稿，并在同一次 GPU 提交中写入预留草稿 KV。主模型的完整 KV 仍直达最终页。两端的检查点路径标识、草稿窗口和 KV 表示须一致。
+
+纯 TP 的 P 也可向完整 Attention DP 副本的 D 交接草稿。P 使用 replicated Indexer。双方在路由探测时协商目标布局，P 消除重复 KV 头及 Indexer，D 在请求所属 GPU 上按逻辑列分片重组各页。该方向需要接收暂存和一次 GPU 复制。其他不匹配的几何布局会在交接前拒绝。
 
 GPU 状态在协议中携带逻辑 rank，由接收方映射到本地 GPU；网络线程只写私有 staging 或接收端预留的目标区，完成 RDMA 可见性处理后交给模型拥有者。Naive 在拥有者 stream 上批量整理/恢复页和滑窗，避免逐页 CUDA API 调用以及额外的导入副本。小 buffer 合并到有界 arena，复用内存、MR 和连接。纯 GPU 的 RDMA 路径不经主存 KV；KVMem 和普通 GPU DP 的完整 KV 可直达预留页，传统 TP 的 GPU 接收仍从 staging 恢复到本地页池。TCP 兼容路径仍经主存分块搬运。各路径仍有源端状态整理、完整状态传输和导入结束同步，尚不支持增量交接。
 
