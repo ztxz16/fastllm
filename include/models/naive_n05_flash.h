@@ -433,7 +433,6 @@ namespace fastllm {
         float draftConfidenceThreshold = 0.5f;
         std::vector<int> draftTargetLayers;
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
-        std::shared_ptr<DraftContext> idleDraftContext;
         std::vector<std::shared_ptr<DraftContext>> idleDraftContexts;
         void PrepareDraftServingMemory(bool history);
 

@@ -404,8 +404,7 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
     }
     auto &ws = *draftContextStorage;
     const int begin = std::max(0, hidden.dims[1] - draftWindow + 1);
-    // The usual commit input is already dense on rank 0. Its stream waits
-    // for all other ranks below before the caller can overwrite/reuse this storage.
+    // A peer must finish consuming the root input before its storage can be reused.
     Data *selected = &hidden;
     if (begin || hidden.dataDevice != DataDevice::CUDA ||
         hidden.dataDeviceIds != std::vector<int>{tp.devices.front()} || hidden.multiDeviceData ||
@@ -457,10 +456,11 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
         auto &kv = rank && !tp.dataParallel ? context.workspace->tpRanks[rank]->tpKV : context.kv;
         AssertInFastLLM(FastllmCudaNaiveDraftKV(raw, norms, start + begin, kv, kvHeads,
             draftHeadDim, draftWindow, draftWindow + draftBlock, draftEps, draftTheta), "Draft TP KV append failed.");
-        FastllmCudaEventRecordCurrentThread(r.done);
+        if (!tp.dataParallel) FastllmCudaEventRecordCurrentThread(r.done);
+        else if (rank) FastllmCudaSyncCurrentThreadStream();
     });
-    for (size_t rank = 1; rank < tp.devices.size(); ++rank)
-        if (!tp.dataParallel || (int)rank == context.deviceRank)
+    if (!tp.dataParallel)
+        for (size_t rank = 1; rank < tp.devices.size(); ++rank)
             FastllmCudaCurrentThreadStreamWaitEvent(ws.tpRanks[rank]->done);
     context.committed = start + hidden.dims[1];
     return true;
@@ -583,40 +583,29 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraf
 #ifdef USE_CUDA
     if (targetKey && CanShardDraftHead() && targetKey->multiDeviceData && targetKey->dataDeviceIds.size() == 1) {
         auto it = std::find(tpDevices.begin(), tpDevices.end(), targetKey->dataDeviceIds.front());
-        if (it != tpDevices.end()) {
-            const int rank = it - tpDevices.begin();
-            context->deviceRank = rank;
-            if (!idleDraftContext || idleDraftContext->deviceRank != rank) {
-                auto match = std::find_if(idleDraftContexts.rbegin(), idleDraftContexts.rend(),
-                    [rank](const auto &entry) { return entry->deviceRank == rank; });
-                if (match != idleDraftContexts.rend()) {
-                    std::swap(*match, idleDraftContexts.back());
-                    std::swap(idleDraftContext, idleDraftContexts.back());
-                    if (!idleDraftContexts.back()) idleDraftContexts.pop_back();
-                }
-            }
-        }
+        if (it != tpDevices.end()) context->deviceRank = it - tpDevices.begin();
     }
 #endif
-    if (!idleDraftContext && !idleDraftContexts.empty()) {
-        idleDraftContext = std::move(idleDraftContexts.back()); idleDraftContexts.pop_back();
-    }
-    if (idleDraftContext) {
-        context->deviceRank = idleDraftContext->deviceRank;
-        auto &storage = idleDraftContext->kvBacking;
-        context->kv.swap(storage.empty() ? idleDraftContext->kv : storage);
-        idleDraftContext->kv.clear(); // Retired views must not alias the next request.
-        context->workspace.swap(idleDraftContext->workspace);
+    auto match = std::find_if(idleDraftContexts.rbegin(), idleDraftContexts.rend(), [&](const auto &entry) {
+        return context->deviceRank < 0 || context->deviceRank == entry->deviceRank;
+    });
+    if (match == idleDraftContexts.rend()) return context;
+    std::swap(*match, idleDraftContexts.back());
+    auto recycled = std::move(idleDraftContexts.back());
+    idleDraftContexts.pop_back();
+    context->deviceRank = recycled->deviceRank;
+    auto &storage = recycled->kvBacking;
+    context->kv.swap(storage.empty() ? recycled->kv : storage);
+    recycled->kv.clear(); // Retired views must not alias the next request.
+    context->workspace.swap(recycled->workspace);
 #ifdef USE_CUDA
-        if (context->workspace) for (auto &rank : context->workspace->tpRanks)
-            for (auto &pair : rank->tpKV) for (Data *cache : {&pair.first, &pair.second})
-                if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
+    if (context->workspace) for (auto &rank : context->workspace->tpRanks)
+        for (auto &pair : rank->tpKV) for (Data *cache : {&pair.first, &pair.second})
+            if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
 #endif
-        idleDraftContext.reset();
-        for (auto &pair : context->kv)
-            for (Data *cache : {&pair.first, &pair.second})
-                if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
-    }
+    for (auto &pair : context->kv)
+        for (Data *cache : {&pair.first, &pair.second})
+            if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
     return context;
 }
 

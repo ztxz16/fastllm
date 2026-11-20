@@ -1787,7 +1787,7 @@ class Fixture : public NaiveN05FlashModel {
         ShutdownRuntime();
         if (batching && !batchedPrefills) throw std::runtime_error("prefill batching was never exercised");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-        idleDraftContext.reset();
+        idleDraftContexts.clear();
         inspectDraftPrefixAllocations = false;
         std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
         if (!draftPrefixAllocations.empty())
@@ -5021,7 +5021,8 @@ class DraftFixture : public NaiveN05FlashModel {
                     throw std::runtime_error("TP context input reuse");
                 ++checks;
             }
-            reference.idleDraftContext = std::move(a); candidate.idleDraftContext = std::move(b);
+            reference.idleDraftContexts.push_back(std::move(a));
+            candidate.idleDraftContexts.push_back(std::move(b));
         }
         if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0) throw std::runtime_error("no TP graph replay");
         if ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches != 0) throw std::runtime_error("TP graph failure not rolled back");
@@ -5071,7 +5072,7 @@ class DraftFixture : public NaiveN05FlashModel {
         }
         for (auto &old : contexts) {
             const int rank = old->deviceRank; void *pointer = old->kv[0].first.cudaData;
-            idleDraftContext = std::move(old);
+            idleDraftContexts.push_back(std::move(old));
             auto reused = CreateDraftContext();
             if (reused->committed || reused->deviceRank != rank || reused->kv[0].first.cudaData != pointer)
                 throw std::runtime_error("draft DP replacement lost storage ownership");
@@ -5085,6 +5086,31 @@ class DraftFixture : public NaiveN05FlashModel {
             if (a.dims != b.dims || std::memcmp(a.cpuData, b.cpuData, a.GetBytes()))
                 throw std::runtime_error("draft DP non-root survivor graph/eager differs");
         }
+        NaiveN05GraphTestAccess::SetDraftDevices(*this, ranks);
+        Data target;
+        target.multiDeviceData = true;
+        target.dataDeviceIds = {1};
+        auto otherOwner = std::make_shared<DraftContext>();
+        otherOwner->deviceRank = 0;
+        idleDraftContexts.push_back(otherOwner);
+        auto local = CreateDraftContext(&target);
+        if (local->deviceRank != 1 || idleDraftContexts.size() != 1 || idleDraftContexts.front() != otherOwner)
+            throw std::runtime_error("an idle cache displaced the target KV owner");
+        AppendDraftContext(h, 0, *local);
+        void *localKV = local->kv.front().first.cudaData;
+        idleDraftContexts.insert(idleDraftContexts.begin(), std::move(local));
+        auto reused = CreateDraftContext(&target);
+        if (reused->committed || reused->deviceRank != 1 || reused->kv.empty() ||
+            reused->kv.front().first.cudaData != localKV || idleDraftContexts.size() != 1 ||
+            idleDraftContexts.front() != otherOwner)
+            throw std::runtime_error("draft DP failed to reuse the matching owner's KV");
+        maxBatch = 1;
+        ResponseContext released;
+        draftContexts[&released.pastKeyValues] = std::move(reused);
+        OnResponseContextRemoved(&released);
+        if (idleDraftContexts.size() != 1 || idleDraftContexts.back()->kv.empty() ||
+            idleDraftContexts.back()->kv.front().first.cudaData != localKV)
+            throw std::runtime_error("draft DP failed to recycle within the request limit");
         draftEnabled = true;
         bool rejected = false;
         try { DraftPDLayout(); } catch (const std::runtime_error &) { rejected = true; }
@@ -5412,7 +5438,7 @@ class DraftFixture : public NaiveN05FlashModel {
                 ++checks;
             }
             // Exercise the same bounded storage transfer as request removal.
-            idleDraftContext = std::move(candidate);
+            idleDraftContexts.push_back(std::move(candidate));
         }
         if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0)
             throw std::runtime_error("draft did not replay a graph");
