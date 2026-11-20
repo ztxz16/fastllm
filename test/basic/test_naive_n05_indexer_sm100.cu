@@ -3,6 +3,7 @@
 #include "../../src/devices/cuda/models/naive-n05-indexer-batch.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-sortpack.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-sm100.cuh"
+#include "../../src/devices/cuda/models/naive-n05-indexer-ordered-topk.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-wide-select.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-staged.cuh"
 #include <cmath>
@@ -112,14 +113,34 @@ static void Case(int count, int capacity, int stride, int page, bool fp8 = true,
     auto fused = naive_indexer_sortpack::SelectSort<4096, true>;
     constexpr size_t sortBytes = naive_indexer_sortpack::SortBytes<256, 5, true, false, 4096>();
     Cuda(cudaFuncSetAttribute(fused, cudaFuncAttributeMaxDynamicSharedMemorySize, sortBytes));
+    namespace ordered = naive_indexer_ordered_topk;
+    b::LocalTopKBatch local{};
+    local.ranks = 1;
+    if (queryGroup > 1) {
+        Cuda(cudaFuncSetAttribute(ordered::OrderedTopK, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                  ordered::SharedBytes));
+        for (int i = 0; i < count; ++i) {
+            const auto &row = compact.rows[i];
+            local.rows[i] = {row.live, row.scores, row.workspace, row.indices};
+        }
+    }
     auto topk = [&]() {
         b::Select<><<<count, 256, 0, cudaStreamPerThread>>>(original);
         b::Sort<><<<count, 256, 0, cudaStreamPerThread>>>(original);
         if (queryGroup > 1) {
-            naive_indexer_wide_select::SelectWide<<<count, 1024, 0, cudaStreamPerThread>>>(compact);
-            b::Sort<><<<count, 256, 0, cudaStreamPerThread>>>(compact);
+            ordered::OrderedTopK<<<count, ordered::Threads, ordered::SharedBytes, cudaStreamPerThread>>>(local);
         } else {
             fused<<<count, 256, sortBytes, cudaStreamPerThread>>>(compact);
+        }
+    };
+    auto checkTopK = [&](const char *message) {
+        const auto expected = indices0.Get();
+        Check(expected == indices1.Get(), message);
+        if (queryGroup > 1) {
+            naive_indexer_wide_select::SelectWide<<<count, 1024, 0, cudaStreamPerThread>>>(compact);
+            b::Sort<><<<count, 256, 0, cudaStreamPerThread>>>(compact);
+            Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+            Check(expected == indices1.Get(), "wide fallback TopK order differs");
         }
     };
     auto update = [&](int step) {
@@ -188,7 +209,7 @@ static void Case(int count, int capacity, int stride, int page, bool fp8 = true,
         double l2 = std::sqrt(error / std::max(norm, 1.e-30));
         worst = std::max(worst, l2);
         Check(l2 < 3.e-4, "score mismatch after graph replay");
-        Check(indices0.Get() == indices1.Get(), "stable TopK order differs");
+        checkTopK("stable TopK order differs");
     }
     // A partially tied threshold must use bounded compaction, not overflow it.
     std::vector<unsigned> ties(ref.n);
@@ -197,8 +218,22 @@ static void Case(int count, int capacity, int stride, int page, bool fp8 = true,
     ref.Put(ties);
     topk();
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
-    Check(indices0.Get() == indices1.Get(), "threshold ties differ");
+    checkTopK("threshold ties differ");
     if (queryGroup == naive_indexer_sm100::VerifyQueries) {
+        // For a full row, 2016 scores win outright and 64 tie for the last 32
+        // slots. Scramble their positions so ordering the cutoff bucket matters.
+        for (int row = 0; row < count; ++row) {
+            for (int i = 0; i < capacity; ++i) {
+                const int rank = (4051 * i + row) % capacity;
+                ties[size_t(row) * capacity + i] = rank < 2016 ? 0xc0800000u :
+                    rank < 2080 ? 0xbf800000u : 0x3fffffffu;
+            }
+        }
+        ref.Put(ties);
+        topk();
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        checkTopK("stable cutoff bucket order differs");
+
         // Repeat the fixture's owners in a different order in each block of rows.
         // Compare full output spans, including empty, padded and partially live tiles.
         using namespace naive_indexer_sm100;

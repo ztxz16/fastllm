@@ -66,6 +66,9 @@
 #endif
 #include "naive-n05-indexer-sortpack.cuh"
 #include "naive-n05-indexer-wide-select.cuh"
+#if defined(FASTLLM_ENABLE_NAIVE_INDEXER_SM100) && CUDART_VERSION >= 12040
+#include "naive-n05-indexer-ordered-topk.cuh"
+#endif
 #include "naive-n05-context-merge.cuh"
 #include "naive-n05-context-merge-chunk.cuh"
 #endif
@@ -5727,14 +5730,16 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     namespace sm = naive_indexer_sm100;
     using VerifyTopK = batch::LocalTopKBatch;
     static_assert(sm::VerifyLimit <= batch::kLocalTopKLimit);
+    namespace ordered = naive_indexer_ordered_topk;
     const bool wideShape = blackwell && nativeScores && rows.size() > sm::BatchLimit &&
         (cacheType == FP8_E4M3 || rows.front().key->kvCacheFp8Indexer) &&
         localCapacity > 16384 && localCapacity <= 65536;
     constexpr size_t sortBytes = naive_indexer_sortpack::SortBytes<256, 5, true, false>();
     auto sort = naive_indexer_sortpack::SortPack<256, 5, true, false, VerifyTopK>;
-    const bool wideVerify = wideShape &&
-        BulkKernelSupported(naive_indexer_wide_select::SelectWide<VerifyTopK>, 0, 90) &&
-        BulkKernelSupported(sort, sortBytes, 90);
+    const bool orderedTopK = wideShape && BulkKernelSupported(ordered::OrderedTopK, ordered::SharedBytes, 90);
+    const bool wideVerify = wideShape && (orderedTopK ||
+        (BulkKernelSupported(naive_indexer_wide_select::SelectWide<VerifyTopK>, 0, 90) &&
+         BulkKernelSupported(sort, sortBytes, 90)));
     auto tryWideVerify = [&](int first, int count) {
         if (!sharesGroupKV(first, count, sm::VerifyQueries)) return false;
         sm::VerifyBatch scores{};
@@ -5750,8 +5755,12 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         if (!FastllmCudaNaiveVerifyIndexerSm100(scores, count, localCapacity, (const BF16 *)query.cudaData,
                 (const BF16 *)weights.cudaData, workspace->partials, sizeof(workspace->partials), cudaStreamPerThread))
             return false;
-        naive_indexer_wide_select::SelectWide<<<count, 1024>>>(selection);
-        sort<<<count, 256, sortBytes>>>(selection);
+        if (orderedTopK) {
+            ordered::OrderedTopK<<<count, ordered::Threads, ordered::SharedBytes>>>(selection);
+        } else {
+            naive_indexer_wide_select::SelectWide<<<count, 1024>>>(selection);
+            sort<<<count, 256, sortBytes>>>(selection);
+        }
         return true;
     };
 #endif
