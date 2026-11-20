@@ -8,7 +8,8 @@ bool Enabled(const char *name);
 bool Supported(int bits);
 // Full FP32 prefill using an already reserved native arena. Unsupported devices,
 // layouts, capture or missing arena retain the caller's original GEMM.
-bool Fp32(const float *input, const float *weight, float *output, int m, int n, int k);
+bool Fp32(const float *input, const float *weight, float *output, int m, int n, int k,
+          void *arena = nullptr, size_t arenaBytes = 0);
 // Optional W8A8 / W4A4 prefill. These paths change activation precision;
 // unsupported shapes, graph capture and unavailable cuBLAS plans return false.
 // Modes: 0=Linear, 1=Linear+SwiGLU, 2=Linear+residual. Failures after output

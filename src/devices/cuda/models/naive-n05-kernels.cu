@@ -4859,12 +4859,23 @@ bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Da
 
 bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
+    return FastllmCudaNaiveRouterFP32(input, weight, output, input);
+}
+
+bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output, const fastllm::Data &arena) {
     const int rows = RouterRows(input, weight, output, fastllm::FLOAT32);
     if (rows < 128 || FastllmCudaGraphIsCapturingFast()) return false;
     auto dims = input.dims; dims.back() = weight.dims[0];
     Output(output, fastllm::FLOAT32, dims);
+    // A row shard aliases the beginning of the arena. The unused tail is
+    // disjoint from its input and is dead until this stream dispatches MoE.
+    const size_t used = (input.GetBytes() + 255) & ~size_t(255);
+    const bool canBorrow = &arena != &input && !arena.isFake && !arena.cudaDataBorrowed &&
+        arena.cudaData == input.cudaData && arena.expansionBytes > used;
     return fastllm_native_prefill::Fp32((const float *)input.cudaData,
-        (const float *)weight.cudaData, (float *)output.cudaData, rows, weight.dims[0], 4096);
+        (const float *)weight.cudaData, (float *)output.cudaData, rows, weight.dims[0], 4096,
+        canBorrow ? (char *)arena.cudaData + used : nullptr, canBorrow ? arena.expansionBytes - used : 0);
 }
 
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,

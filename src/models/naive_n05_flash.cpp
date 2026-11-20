@@ -766,7 +766,7 @@ void NaiveN05FlashModel::RunLocalPrefillRouter(Data &normed, Data &routerWeight,
             destination.FakeFrom(input, shardRow * embed_dim * sizeof(float));
             ToDataType(source, destination, FLOAT32);
         });
-        if (!FastllmCudaNaiveRouterFP32(input, routerWeight, projectedRouter))
+        if (!FastllmCudaNaiveRouterFP32(input, routerWeight, projectedRouter, routerInput))
             Linear(input, routerWeight, Data(), projectedRouter);
         forEachSpan([&](size_t localRow, size_t shardRow, int count) {
             FastllmCudaCopyFromDeviceToDevice((float *)router.cudaData + localRow * experts,
@@ -2206,7 +2206,7 @@ Data NaiveN05FlashModel::RunTarget(
                     ToDataType(routerSource, fp32Input, DataType::FLOAT32);
                     const bool prefillRouter = !verifying && !decodeWorkspace && length > 1 &&
                         (!batch || !batch->Decode());
-                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router))
+                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router, routerInput))
                         Linear(fp32Input, routerWeight, Data(), router);
                 }
                 Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
