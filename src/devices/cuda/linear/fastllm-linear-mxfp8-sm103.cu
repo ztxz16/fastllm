@@ -202,12 +202,12 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     auto *packed = reinterpret_cast<uint32_t *>(base);
     auto *qx = base + scaleArea;
     auto *sx = qx + ((size_t(limit) + 3) / 4 * 4) * k;
-    // Narrower tiles expose more parallel copies for wide projections.
-    const bool wideK = k >= 8192;
-    const int tile = wideK ? 16 : 32;
-    const int threads = wideK ? 128 : 256;
+    // Smaller tiles distribute the scale transpose for wide input or output projections.
+    const bool smallTile = k >= 8192 || (rows >= 128 && rows <= 512 && k >= 4096 && n >= 8192);
+    const int tile = smallTile ? 16 : 32;
+    const int threads = smallTile ? 128 : 256;
     const int tilesPerRow = (k / 128 + tile - 1) / tile;
-    auto prepare = wideK ? PrepareOperands<16, 16, 128> : PrepareOperands<32, 32, 256>;
+    auto prepare = smallTile ? PrepareOperands<16, 16, 128> : PrepareOperands<32, 32, 256>;
     // A pair of CTAs must cover two complete N tiles. A trailing odd tile
     // needs a single-CTA kernel or the multicast barrier cannot complete.
     const bool paired = ((n + 127) / 128) % 2 == 0;
