@@ -322,10 +322,12 @@ namespace fastllm {
         int CacheReserveCapacity(const GenerationConfig &config) const;
         void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0, bool usePool = true, bool expandFP8 = false);
         void ReserveCache(Data &cache, int capacity, int width, bool usePool = true, const Data *requestKey = nullptr);
+        struct PageTableUpdate { Data *cache; size_t first; };
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
-                               std::vector<Data *> *pendingPageTables, const Data *requestKey = nullptr);
-        void UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables);
+                               std::vector<PageTableUpdate> *pendingPageTables, const Data *requestKey = nullptr,
+                               bool *requestInvalidated = nullptr);
+        void UploadPagedCacheTables(const std::vector<PageTableUpdate> &pendingPageTables);
         static void TrimCache(Data &cache, int length);
         int SampleTarget(Data &logits, std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,

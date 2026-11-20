@@ -1913,7 +1913,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
                 std::vector<std::exception_ptr> errors(ranks);
                 tpWorkers.Run(tpDevices, [&](int rank) {
                     FastllmCudaSetDevice(tpDevices[rank]);
-                    std::vector<Data *> pending;
+                    std::vector<PageTableUpdate> pending;
                     try {
                         std::vector<std::pair<Data *, int>> prepare;
                         for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer])
@@ -2473,7 +2473,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
             std::vector<std::vector<int>> limits(tpDevices.size(), std::vector<int>(growing.size(), INT_MAX));
             runRanks([&](int rank) {
                 FastllmCudaSetDevice(tpDevices[rank]);
-                std::vector<Data *> pendingPageTables;
+                std::vector<PageTableUpdate> pendingPageTables;
                 try {
                     for (size_t i = 0; i < growing.size(); ++i) {
                         const int row = growing[i], next = key(row, 0).dims[1] + 1;
