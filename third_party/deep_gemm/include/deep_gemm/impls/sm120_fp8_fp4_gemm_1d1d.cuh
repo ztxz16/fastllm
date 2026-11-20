@@ -86,7 +86,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
     // Cooperative warp layout: warps split across M and N dimensions
-    static constexpr uint32_t kNWarps = 2;
+    // A 16-row EP tile has only one MMA tile along M. Partition its four math warps along N.
+    static constexpr uint32_t kNWarps = kDeviceGroupedRows && BLOCK_M == MMA_M ? kNumMathWarps : 2;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;

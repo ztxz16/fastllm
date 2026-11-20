@@ -16,16 +16,17 @@
 
 namespace {
 using BF = __nv_bfloat16;
-constexpr int Tile = 32, Stages = 3;
+constexpr int Tile = 32, DecodeTile = 16;
 // D staging, then A, B and two scale tiles per stage, then mbarriers.
-template <class T>
-constexpr int Smem = Tile * 128 * sizeof(T) + Stages * ((Tile + 128) * 128 + (Tile + 128) * 4 + 16);
-template <class T>
+template <class T, int M = Tile>
+constexpr int Smem = M * 128 * sizeof(T) + (M == DecodeTile ? 4 : 3) * ((M + 128) * 128 + 128 + 512 + 16);
+template <class T, int M = Tile>
 constexpr auto gemm =
-    &deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0, 0, 0, 32, 32, 1, Tile, 128, 128, 128, 128, 128, Stages, 128,
-                                             128, 0, deep_gemm::GemmType::MGroupedContiguous, false, T,
+    &deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0, 0, 0, 32, 32, 1, M, 128, 128, 128, 128, 128,
+                                             M == DecodeTile ? 4 : 3, M == DecodeTile ? 32 : 128, 128, 0,
+                                             deep_gemm::GemmType::MGroupedContiguous, false, T,
                                              deep_gemm::epilogue::transform::EpilogueIdentity, false, true,
-                                             false, true, false, Tile, 1, true, std::is_same_v<T, cutlass::bfloat16_t>>;
+                                             false, true, false, M, 1, true, std::is_same_v<T, cutlass::bfloat16_t>>;
 
 void check(cudaError_t s) {
     if (s != cudaSuccess)
@@ -77,11 +78,12 @@ struct Buffers {
 struct Rank {
     Storage storage;
     int sms;
+    bool useDecodeTile;
     Mail mail;
     Mail *peers;
     Buffers b;
     struct Projection {
-        cute::TmaDescriptor a, b, sa, sb, d;
+        cute::TmaDescriptor a, b, sa, sb, d, decodeA, decodeSa, decodeD;
     };
     struct Layer {
         Storage storage;
@@ -123,14 +125,20 @@ __global__ void rendezvous(Mail *peers, int rank, int ranks) {
     }
 }
 
-__device__ uint8_t quantize(float x, uint8_t &sf) {
-    float a = fabsf(x);
-    for (int d = 16; d; d /= 2)
-        a = fmaxf(a, __shfl_xor_sync(~0u, a, d));
-    const float scale = fmaxf(a, 1e-4f) / 448.f;
-    int exp = __float_as_int(scale);
-    sf = (exp >> 23) + ((exp & 0x7fffff) != 0);
-    return __nv_cvt_float_to_fp8(x * __uint_as_float((254 - sf) << 23), __NV_SATFINITE, __NV_E4M3);
+// Eight adjacent lanes quantize one E8M0-scaled block of 32 FP8 values.
+__device__ uint32_t quantizeFour(float4 values, uint8_t &scaleByte) {
+    float amax = fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)), fmaxf(fabsf(values.z), fabsf(values.w)));
+    #pragma unroll
+    for (int delta = 4; delta > 0; delta /= 2)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, delta, 8));
+    const int bits = __float_as_int(fmaxf(amax, 1e-4f) / 448.f);
+    scaleByte = (bits >> 23) + ((bits & 0x7fffff) != 0);
+    const float invScale = __uint_as_float((254 - scaleByte) << 23);
+    const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(values.x * invScale, values.y * invScale),
+                                                 __NV_SATFINITE, __NV_E4M3);
+    const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(values.z * invScale, values.w * invScale),
+                                                 __NV_SATFINITE, __NV_E4M3);
+    return lo | (hi << 16);
 }
 __global__ void publish(Mail mail, Shape s, const BF *input, const int *ids, const float *scores, int rows,
                         const int *live) {
@@ -142,11 +150,14 @@ __global__ void publish(Mail mail, Shape s, const BF *input, const int *ids, con
         routes[j] = active ? ids[row * s.k + j] : -1;
         reinterpret_cast<float *>(routes + s.k)[j] = active ? scores[row * s.k + j] : 0.f;
     }
-    for (int c = threadIdx.x; c < s.h; c += blockDim.x) {
-        uint8_t sf;
-        p[c] = quantize(active ? __bfloat162float(input[size_t(row) * s.h + c]) : 0.f, sf);
-        if (!(c % 32))
-            p[s.h + c / 32] = sf;
+    for (int chunk = threadIdx.x; chunk < s.h / 4; chunk += blockDim.x) {
+        const auto *chunks = active ? reinterpret_cast<const uint2 *>(input + size_t(row) * s.h) : nullptr;
+        const uint2 raw = active ? chunks[chunk] : make_uint2(0, 0);
+        const float4 values = make_float4(__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
+                                          __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u));
+        uint8_t scale;
+        reinterpret_cast<uint32_t *>(p)[chunk] = quantizeFour(values, scale);
+        if (chunk % 8 == 0) p[s.h + chunk / 8] = scale;
     }
 }
 // Publish each activation once per selected owner. Empty owners only need
@@ -180,14 +191,15 @@ __global__ void countRoutes(Buffers b, Shape s, int rank, int routes) {
     int e = expert(b, s, t) - rank * s.localE;
     b.positions[t] = (unsigned)e < (unsigned)s.localE ? atomicAdd(b.counts + e, 1) : -1;
 }
+template <int M>
 __global__ void layout(Buffers b, Shape s) {
     int e = blockIdx.x;
     int base = 0, compact = 0;
     for (int j = 0; j < e; ++j) {
-        base += (b.counts[j] + Tile - 1) / Tile * Tile;
+        base += (b.counts[j] + M - 1) / M * M;
         compact += b.counts[j];
     }
-    const int padded = (b.counts[e] + Tile - 1) / Tile * Tile;
+    const int padded = (b.counts[e] + M - 1) / M * M;
     for (int j = b.counts[e] + threadIdx.x; j < padded; j += blockDim.x)
         b.returnRows[base + j] = nullptr;
     if (!threadIdx.x) {
@@ -198,7 +210,7 @@ __global__ void layout(Buffers b, Shape s) {
             b.layout[-1] = base + padded;
         }
     }
-    for (int j = threadIdx.x * Tile; j < b.counts[e]; j += blockDim.x * Tile)
+    for (int j = threadIdx.x * M; j < b.counts[e]; j += blockDim.x * M)
         b.layout[base + j] = e;
 }
 __global__ void makeTasks(Buffers b, Shape s, int rank, int routes, const Mail *peers, int rowsPerPeer) {
@@ -230,14 +242,18 @@ __global__ void activate(Buffers b, Shape s) {
         const auto *meta = b.incoming + size_t(task.x / s.k) * s.stride + s.h + s.h / 32 + s.k * sizeof(int);
         float score = reinterpret_cast<const float *>(meta)[task.x % s.k];
         const float *gate = b.gateUp + size_t(task.y) * 2 * s.i;
-        for (int col = threadIdx.x; col < s.i; col += blockDim.x) {
-            float g = gate[col];
-            float v = (g / (1.f + __expf(-g))) * gate[s.i + col];
-            uint8_t sf;
-            b.a[size_t(task.y) * s.i + col] = quantize(v * score, sf);
-            if (!(col % 32))
-                reinterpret_cast<uint8_t *>(
-                    b.sa)[(size_t(col / 128) * s.pool + task.y) * 4 + col % 128 / 32] = sf;
+        auto *activation = reinterpret_cast<uint32_t *>(b.a + size_t(task.y) * s.i);
+        for (int chunk = threadIdx.x; chunk < s.i / 4; chunk += blockDim.x) {
+            const float4 g = reinterpret_cast<const float4 *>(gate)[chunk];
+            const float4 u = reinterpret_cast<const float4 *>(gate + s.i)[chunk];
+            const float4 values = make_float4((g.x / (1.f + __expf(-g.x))) * u.x * score,
+                                              (g.y / (1.f + __expf(-g.y))) * u.y * score,
+                                              (g.z / (1.f + __expf(-g.z))) * u.z * score,
+                                              (g.w / (1.f + __expf(-g.w))) * u.w * score);
+            uint8_t scale;
+            activation[chunk] = quantizeFour(values, scale);
+            if (chunk % 8 == 0)
+                reinterpret_cast<uint8_t *>(b.sa)[(size_t(chunk / 32) * s.pool + task.y) * 4 + chunk % 32 / 8] = scale;
         }
     }
 }
@@ -302,19 +318,23 @@ Rank::Projection bindProjection(Storage &owner, Buffers b, Shape s, const std::v
     }
     auto sw = CU_TENSOR_MAP_SWIZZLE_128B;
     auto none = CU_TENSOR_MAP_SWIZZLE_NONE;
-    return {tensor(b.a, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, s.pool, k, 128, Tile, sw),
-            tensor(w, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B, k, size_t(n) * s.localE, k / 2, 128, 128, sw),
-            tensor(b.sa, CU_TENSOR_MAP_DATA_TYPE_INT32, s.pool, k / 128, s.pool * 4, Tile, 1, none),
-            tensor(sf, CU_TENSOR_MAP_DATA_TYPE_INT32, n, size_t(k / 128) * s.localE, n * 4, 128, 1, none),
-            part ? cute::TmaDescriptor{} : tensor(b.gateUp, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, n, s.pool, n * 4, 32, Tile, sw)};
+    auto activation = [&](int m) { return tensor(b.a, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, s.pool, k, 128, m, sw); };
+    auto scale = [&](int m) { return tensor(b.sa, CU_TENSOR_MAP_DATA_TYPE_INT32, s.pool, k / 128, s.pool * 4, m, 1, none); };
+    auto output = [&](int m) {
+        return part ? cute::TmaDescriptor{} : tensor(b.gateUp, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, n, s.pool, n * 4, 32, m, sw);
+    };
+    return {activation(Tile), tensor(w, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B, k, size_t(n) * s.localE, k / 2, 128, 128, sw),
+            scale(Tile), tensor(sf, CU_TENSOR_MAP_DATA_TYPE_INT32, n, size_t(k / 128) * s.localE, n * 4, 128, 1, none),
+            output(Tile), activation(DecodeTile), scale(DecodeTile), output(DecodeTile)};
 }
-template <class T, class Output>
+template <class T, int M, class Output>
 void multiply(const Rank &rank, const Rank::Projection &p, Output output, int n, int k) {
     auto &b = rank.b;
     // Both projections read the actual padded row count from the device layout.
-    gemm<T><<<rank.sms, 256, Smem<T>, cudaStreamPerThread>>>(
+    constexpr bool small = M == DecodeTile;
+    gemm<T, M><<<rank.sms, small ? 160 : 256, Smem<T, M>, cudaStreamPerThread>>>(
         output, nullptr, reinterpret_cast<__nv_fp8_e4m3 *>(b.a), nullptr, b.layout,
-        nullptr, nullptr, 0, n, k, n, 0, 0, p.a, p.b, p.sa, p.sb, p.d);
+        nullptr, nullptr, 0, n, k, n, 0, 0, small ? p.decodeA : p.a, p.b, small ? p.decodeSa : p.sa, p.sb, small ? p.decodeD : p.d);
 }
 } // namespace
 
@@ -380,6 +400,16 @@ std::shared_ptr<FastllmGenericEp> FastllmCreateGenericEp(const std::vector<int> 
         auto &a = rank->storage;
         a.device = d;
         check(cudaDeviceGetAttribute(&rank->sms, cudaDevAttrMultiProcessorCount, d));
+        int maxShared;
+        check(cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, d));
+        rank->useDecodeTile = s.ranks == 8 && h == 4096 && i == 2048 && experts == 256 && topk == 8 &&
+                              rank->sms == 110 && maxShared >= Smem<float, DecodeTile>;
+        if (rank->useDecodeTile) {
+            check(cudaFuncSetAttribute(gemm<float, DecodeTile>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       Smem<float, DecodeTile>));
+            check(cudaFuncSetAttribute(gemm<cutlass::bfloat16_t, DecodeTile>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       Smem<cutlass::bfloat16_t, DecodeTile>));
+        }
         auto &m = rank->mail;
         m.send = a.allocate<uint8_t>(size_t(s.cap) * s.stride);
         m.returned = a.allocate<BF>(size_t(s.cap) * s.k * h);
@@ -445,13 +475,17 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
         int routes = cap * s.ranks * s.k;
         check(cudaMemsetAsync(r.b.counts, 0, s.localE * sizeof(int), stream));
         countRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes);
-        layout<<<s.localE, 32, 0, stream>>>(r.b, s);
+        const bool shortBatch = r.useDecodeTile && cap <= 32;
+        if (shortBatch) layout<DecodeTile><<<s.localE, 32, 0, stream>>>(r.b, s);
+        else layout<Tile><<<s.localE, 32, 0, stream>>>(r.b, s);
         makeTasks<<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap);
         int blocks = std::min(routes, 4 * r.sms);
         gather<<<blocks, 128, 0, stream>>>(r.b, s);
-        multiply<float>(r, l.gate, r.b.gateUp, 2 * s.i, s.h);
+        if (shortBatch) multiply<float, DecodeTile>(r, l.gate, r.b.gateUp, 2 * s.i, s.h);
+        else multiply<float, Tile>(r, l.gate, r.b.gateUp, 2 * s.i, s.h);
         activate<<<blocks, 256, 0, stream>>>(r.b, s);
-        multiply<cutlass::bfloat16_t>(r, l.down, r.b.returnRows, s.h, s.i);
+        if (shortBatch) multiply<cutlass::bfloat16_t, DecodeTile>(r, l.down, r.b.returnRows, s.h, s.i);
+        else multiply<cutlass::bfloat16_t, Tile>(r, l.down, r.b.returnRows, s.h, s.i);
         rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
         if (n)
             combine<<<n, 256, 0, stream>>>(r.mail, s, index, static_cast<BF *>(out) + size_t(first) * s.h,
