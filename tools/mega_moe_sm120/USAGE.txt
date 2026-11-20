@@ -5,13 +5,24 @@ Expert weights are repacked and their source allocations are retired one layer
 at a time before serving. Only the native layout remains resident; temporary
 duplication is bounded to one layer. This applies to both EP4 and EP8.
 
-Inference uses the normal ftllm binary plus a matching package under
+For the tuned path, inference loads a matching package from
 ftllm/kernels/mxfp4_ep/. This backend needs CUDA 12.9+ on Linux, a compatible
 CUDA driver, and direct peer access between all EP GPUs. It does not import
 FlashInfer, Torch, Triton, cuda-python, or CUTLASS DSL at inference time.
 FastLLM's existing dependencies for other operators are unchanged.
 
-Currently shipped and tested:
+SM120 builds with the grouped MXFP4 Tensor Core kernel also support EP when
+the package or its model geometry does not match. Naive --ep 4/8 selects this
+backend automatically for complete block-32 E8M0 experts, BF16 activations,
+equal contiguous expert ownership and full P2P. Hidden and expert intermediate
+widths must be multiples of 128. The number of SMs, expert count and top-k are
+runtime parameters. The load log reports backend=sm120-grouped-ep. This path
+is linked into FastLLM and requires no standalone cubin. Each rank sends one
+quantized token per selected owner. Each owner computes only its routed rows.
+Workspace and packed weights are prepared before capture; requests larger
+than the 128-row per-rank workspace repeat the collective on all ranks.
+
+Currently shipped and tested packages:
   SM120, 110 SMs/GPU, EP4 and EP8, hidden=4096, intermediate=2048,
   256 experts, top-k=8, MXFP4 weights with block-32 E8M0 scales,
   BF16 input/output, MXFP8 internal activations.
@@ -64,7 +75,7 @@ as larger buckets are prepared.
 
 Architecture scope
 ------------------
-The native entry point remains gated to SM120 and a matching package (including
+The exported graph loader requires SM120 and a matching package (including
 SM count, EP size and model dimensions). Older CUDA toolkits and unsupported
 devices retain the existing backend. Do not relax the architecture guard to
 load these CUBINs on another SM.
@@ -81,11 +92,9 @@ Model widths, expert counts, top-k, EP size and SM partition are compile-time
 specializations in the upstream kernels. This staging path requires hidden to be
 a multiple of 128 and intermediate a multiple of 64; experts must divide across
 EP ranks. Other alignments need padding or a fallback implementation.
-A different tuple needs a new package;
-the loader must not relabel an existing package as a new shape. The Naive caller
-currently validates the model tuple above. Other model widths also require
-extending that caller's shape contract. Existing SM90 built-in kernels remain
-available on their original supported configurations.
+A different tuple needs a new export to use the specialized split pipeline.
+The Naive caller can use the built-in grouped EP implementation for its
+supported alignments without exporting a package.
 
 Build-only environment used for export:
   flashinfer-python 0.7.2

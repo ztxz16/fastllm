@@ -19,6 +19,7 @@
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mxfp4-ep-graph.h"
+#include "devices/cuda/fastllm-mxfp4-ep-generic.h"
 #include "devices/cuda/fastllm-moe-weight-owner.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -206,10 +207,14 @@ bool NaiveN05FlashModel::InitTensorParallel() {
             (cfg.kvHeads % ranks == 0 || ranks % cfg.kvHeads == 0),
             "Naive TP requires complete Q heads and divisible or replicated KV groups.");
     }
-    const bool geometry = embed_dim == 4096 && num_experts == 256 &&
-        num_experts_per_tok == 8 && block_cnt > 0 && block_cnt <= 48 &&
-        norm_topk_prob && routed_scaling_factor == 1.0f;
-    tpEp8Mega = explicitEp && geometry && ResidentMoePlacement() && FastllmCudaMimoEp8MegaSupported(tpDevices);
+    const bool fixedGeometry = embed_dim == 4096 && num_experts == 256 &&
+        num_experts_per_tok == 8 && block_cnt <= 48;
+    const bool layout = block_cnt > 0 && embed_dim > 0 && embed_dim % 128 == 0 &&
+        num_experts >= ranks && num_experts % ranks == 0 &&
+        num_experts_per_tok > 0 && num_experts_per_tok <= num_experts;
+    tpEp8Mega = explicitEp && layout && norm_topk_prob && routed_scaling_factor == 1.0f &&
+        ResidentMoePlacement() && (fixedGeometry ? FastllmCudaMimoEp8MegaSupported(tpDevices)
+                                                 : FastllmGenericEpSupported(tpDevices));
     tpPackedMoeSources = tpEp8Mega && FastllmCudaMimoEp8MegaOwnsPackedWeights(tpDevices.front());
     if (explicitEp && !tpEp8Mega)
         fprintf(stderr, "[MiMo EP] unsupported device group or model layout; using TP experts.\n");
@@ -233,22 +238,33 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     AssertInFastLLM(ranks > 1 && !GetKVCacheInCPU(), "Naive TP requires CUDA KV cache.");
     bool native = dataType == BFLOAT16 && moeAtype == BFLOAT16 && norm_topk_prob &&
         routed_scaling_factor == 1.0f && tpEp8Mega && ResidentMoePlacement();
-    const bool mxfp4Only = tpEp8Mega && FastllmCudaMxfp4EpGraphSupported(tpDevices);
+    const bool genericEp = tpEp8Mega && FastllmGenericEpSupported(tpDevices);
+    const bool mxfp4Only = genericEp || (tpEp8Mega && FastllmCudaMxfp4EpGraphSupported(tpDevices));
     // The built-in H20 adapter owns its MXFP4 layout. Its FP8 adapter borrows
     // weights, while SM120 manages MXFP4 source retirement separately.
     auto packsSource = [&](int format) {
         return UsesPackedMoeSource() || (!mxfp4Only && format == NVFP4);
     };
-    int expertFormat = -1;
+    int expertFormat = -1, epIntermediate = 0;
     auto nativeFormat = [&](const Data &w) {
         return (!mxfp4Only && w.dataType == FP8_E4M3 && w.blockM == 128 && w.blockK == 128) ||
             FastllmCudaMimoIsMxfp4Expert(w);
     };
-    for (int layer = 0; tpEp8Mega && native && layer < block_cnt; ++layer) if (moeLayers[layer]) {
+    for (int layer = 0; native && layer < block_cnt; ++layer) if (moeLayers[layer]) {
         for (int e = 0; native && e < num_experts; ++e) {
             std::string name = "model.layers." + std::to_string(layer) + ".mlp.experts." + std::to_string(e) + ".";
-            for (const auto &part : {std::make_pair("gateup_proj.weight", std::vector<int>{4096,4096}),
-                                  std::make_pair("down_proj.weight", std::vector<int>{4096,2048})}) {
+            if (!epIntermediate) {
+                const auto down = weight.weight.find(name + "down_proj.weight");
+                if (down != weight.weight.end() && down->second.dims.size() == 2)
+                    epIntermediate = down->second.dims[1];
+                if (epIntermediate <= 0 || epIntermediate > INT_MAX / 2 || epIntermediate % 128 ||
+                    (!genericEp && epIntermediate != 2048)) {
+                    native = false;
+                    break;
+                }
+            }
+            for (const auto &part : {std::make_pair("gateup_proj.weight", std::vector<int>{2 * epIntermediate, embed_dim}),
+                                     std::make_pair("down_proj.weight", std::vector<int>{embed_dim, epIntermediate})}) {
                 auto it = weight.weight.find(name + part.first);
                 native = native && it != weight.weight.end() && nativeFormat(it->second) && it->second.dims == part.second;
                 // Check every placed EP source before consuming the first layer.
@@ -467,8 +483,10 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
             tpMoeBiases[r][layer].resize(weights.size(), nullptr);
         }
     }
-    tpMoePreparationFailed = releaseSources;
-    if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights);
+    // SM120 retires placed expert buffers inside the EP factory, layer by layer.
+    // A partial bind also requires a reload when the caller retains the root descriptors.
+    tpMoePreparationFailed = releaseSources || (native && mxfp4Only);
+    if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights, num_experts_per_tok);
     if (releaseSources) {
         for (int layer = 0; layer < block_cnt; ++layer) if (moeLayers[layer]) {
             for (int e = 0; e < num_experts; ++e) {

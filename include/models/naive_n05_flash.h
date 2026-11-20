@@ -119,9 +119,9 @@ namespace fastllm {
         bool SupportsSharedPagedKVPool() const override { return !tpPagedCaches.empty(); }
         bool UsesPackedMoeSource() const { return tpPackedMoeSources; }
         int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
-            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
+            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < num_experts,
                            "MiMo EP8 expert loading must use the same ordered devices as TP.");
-            return tpDevices.at(expert / (256 / tpDevices.size()));
+            return tpDevices.at(expert / (num_experts / tpDevices.size()));
         }
         std::string MakeInput(const std::string &history, int,
                               const std::string &input) override { return history + input; }

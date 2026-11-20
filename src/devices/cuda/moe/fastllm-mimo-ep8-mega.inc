@@ -1,5 +1,6 @@
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mxfp4-ep-graph.h"
+#include "devices/cuda/fastllm-mxfp4-ep-generic.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "fastllm-mimo-ep8-builtin.inc"
 #include <climits>
@@ -18,7 +19,23 @@ bool FastllmCudaReplayMxfp4EpGraph(const FastllmMxfp4EpGraph &, const void *, co
     const float *, void *, int, int, int, const int *) { return false; }
 #endif
 
+#ifndef FASTLLM_ENABLE_DSV41_MXFP4_SM120
+bool FastllmGenericEpSupported(const std::vector<int> &) { return false; }
+std::shared_ptr<FastllmGenericEp> FastllmCreateGenericEp(const std::vector<int> &, int, int, int, int) {
+    throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
+}
+void FastllmBindGenericEp(FastllmGenericEp &, int, int, const std::vector<uint64_t> &) {
+    throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
+}
+void FastllmRunGenericEp(FastllmGenericEp &, int, int, const void *, const int32_t *, const float *,
+        void *, int, int, const int *) {
+    throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
+}
+#endif
+
 struct FastllmCudaMimoEp8Mega {
+    std::shared_ptr<FastllmGenericEp> generic;
+    int hidden = 0, topk = 0;
     std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> builtin;
     std::shared_ptr<FastllmMxfp4EpNativeState> native;
     std::vector<int> devices;
@@ -74,7 +91,7 @@ void FastllmCudaPrepareMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int maxRows) {
 
 bool FastllmCudaMimoEp8MegaSupported(const std::vector<int> &devices) {
     return FastllmCudaMimoEp8BuiltinMegaSupported(devices) ||
-        FastllmCudaMxfp4EpGraphSupported(devices);
+        FastllmCudaMxfp4EpGraphSupported(devices) || FastllmGenericEpSupported(devices);
 }
 
 size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows, int ranks) {
@@ -85,39 +102,62 @@ size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows, int ranks) {
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
         const std::vector<int> &devices,
         const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights) {
+    return FastllmCudaCreateMimoEp8Mega(devices, weights, 8);
+}
+
+std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
+        const std::vector<int> &devices,
+        const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights, int topk) {
     using namespace fastllm;
     auto state = std::make_shared<FastllmCudaMimoEp8Mega>();
     state->devices = devices;
-    if (!FastllmCudaMxfp4EpGraphSupported(devices)) {
+    const bool package = FastllmCudaMxfp4EpGraphSupported(devices);
+    if (!package && !FastllmGenericEpSupported(devices)) {
         state->builtin = FastllmCudaCreateMimoEp8BuiltinMega(devices, weights);
         return state;
     }
     if (weights.size() != devices.size()) throw std::runtime_error("Invalid SM120 EP weight rank count.");
+    int h = 0, mid = 0, experts = 0;
+    for (const auto &table : weights.front()) if (!table.empty()) {
+        if (table.size() < 4 || table.size() % 2 || !table[3] || table[3]->dims.size() != 2)
+            throw std::runtime_error("Invalid SM120 EP expert weight table");
+        experts = (table.size() - 2) / 2;
+        h = table[3]->dims[0]; mid = table[3]->dims[1];
+        break;
+    }
+    if (!experts || experts % devices.size() || h <= 0 || mid <= 0)
+        throw std::runtime_error("Invalid SM120 EP expert geometry");
+    const bool usePackage = package && h == 4096 && mid == 2048 && experts == 256 && topk == 8;
+    state->hidden = h; state->topk = topk;
     std::vector<std::vector<std::vector<uint64_t>>> sources;
     for (size_t r = 0; r < devices.size(); ++r) {
         std::vector<std::vector<uint64_t>> layers;
         for (const auto &table : weights[r]) {
-            std::vector<uint64_t> experts;
+            std::vector<uint64_t> pointers;
             if (!table.empty()) {
-                if (table.size() != 514) throw std::runtime_error("Invalid SM120 EP expert table.");
-                for (int e = r * (256 / devices.size()); e < (int)(r + 1) * (256 / devices.size()); ++e) {
+                if (table.size() != size_t(2 + 2 * experts)) throw std::runtime_error("Invalid SM120 EP expert table.");
+                for (int e = r * (experts / devices.size()); e < (int)(r + 1) * (experts / devices.size()); ++e) {
                     for (int part = 0; part < 2; ++part) {
                         const Data *w = table[2 + 2*e + part];
-                        const int n = 4096, k = part ? 2048 : 4096;
+                        const int n = part ? h : 2 * mid, k = part ? mid : h;
                         if (!w || w->dataType != NVFP4 || w->dims != std::vector<int>({n, k}) ||
                             !w->cudaData || w->dataDeviceIds != std::vector<int>{devices[r]} ||
                             w->GetBytes() != (uint64_t)n * k / 32 * 17)
                             throw std::runtime_error("SM120 EP requires complete planar MXFP4/E8M0 block32 experts.");
-                        experts.push_back(reinterpret_cast<uint64_t>(w->cudaData));
+                        pointers.push_back(reinterpret_cast<uint64_t>(w->cudaData));
                     }
                 }
             }
-            layers.push_back(std::move(experts));
+            layers.push_back(std::move(pointers));
         }
         sources.push_back(std::move(layers));
     }
-    state->native = FastllmCudaCreateMxfp4EpNative(devices, sources);
-    if (!state->native) throw std::runtime_error("Native SM120 MXFP4 EP is unavailable in this build.");
+    if (usePackage) {
+        state->native = FastllmCudaCreateMxfp4EpNative(devices, sources);
+        if (!state->native) throw std::runtime_error("Native SM120 MXFP4 EP is unavailable in this build.");
+    } else {
+        state->generic = FastllmCreateGenericEp(devices, h, mid, experts, topk);
+    }
     // The native layout is the sole serving representation. Repack and retire
     // sources one layer at a time, bounding temporary duplication to one layer
     // instead of retaining two complete copies of the model's experts.
@@ -127,22 +167,32 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     } restoreDevice;
     for (size_t layer = 0; layer < weights[0].size(); ++layer) {
         if (weights[0][layer].empty()) continue;
-        state->layers.push_back(layer);
-        FastllmCudaBindMxfp4EpNativeWeights(*state->native, layer);
+        if (state->native) {
+            state->layers.push_back(layer);
+            FastllmCudaBindMxfp4EpNativeWeights(*state->native, layer);
+        }
         for (size_t rank = 0; rank < devices.size(); ++rank) {
             FastllmCudaSetDevice(devices[rank]);
+            if (state->generic) FastllmBindGenericEp(*state->generic, rank, layer, sources[rank][layer]);
             for (Data *weight : weights[rank][layer])
                 if (weight) weight->FreeSpace();
         }
     }
-    printf("MIMO_EP_MEGA ranks=%zu experts=%zu inter=2048 W4A8 backend=flashinfer-sm120-native-cubin\n",
-           devices.size(), 256 / devices.size());
+    printf("MIMO_EP_MEGA ranks=%zu experts=%zu inter=%d W4A8 backend=%s\n",
+           devices.size(), experts / devices.size(), mid,
+           usePackage ? "flashinfer-sm120-native-cubin" : "sm120-grouped-ep");
     return state;
 }
 
 namespace {
-void MimoReplayRows(const FastllmMxfp4EpGraph &graph, const void *input, const int32_t *indices,
+void MimoReplayRows(FastllmCudaMimoEp8Mega &state, int rank, int layer, const void *input, const int32_t *indices,
         const float *scores, void *output, int rows, int collectiveRows, const int *liveKeys) {
+    if (state.generic) {
+        FastllmRunGenericEp(*state.generic, rank, layer, input, indices, scores, output,
+                            rows, collectiveRows, liveKeys);
+        return;
+    }
+    auto graph = state.Graph(rank, layer, collectiveRows);
     // Every EP rank executes the same rounds, including empty local slices.
     // The artifact's largest tile is a per-round capacity, not a request limit.
     if (graph.capacity <= 0) throw std::runtime_error("Invalid native EP graph capacity.");
@@ -201,13 +251,12 @@ void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int
         fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch) {
     if (state.builtin) return FastllmCudaRunMimoEp8BuiltinMegaLocal(*state.builtin, rank, layer,
         input, index, score, output, maxRows, liveKeys, prefillScratch);
-    if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || input.dims[1] != 4096 ||
+    if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || input.dims[1] != state.hidden ||
         input.dims[0] < 0 || input.dims[0] > maxRows || maxRows <= 0 ||
-        index.dims != std::vector<int>({input.dims[0], 8}) || score.dims != index.dims)
+        index.dims != std::vector<int>({input.dims[0], state.topk}) || score.dims != index.dims)
         throw std::runtime_error("Invalid rank-local SM120 EP input.");
     MimoGraphOutput(output, input, state.devices.at(rank));
-    auto graph = state.Graph(rank, layer, maxRows);
-    MimoReplayRows(graph, input.cudaData, (int32_t *)index.cudaData,
+    MimoReplayRows(state, rank, layer, input.cudaData, (int32_t *)index.cudaData,
         (float *)score.cudaData, output.cudaData, input.dims[0], maxRows, liveKeys);
 }
 
@@ -218,22 +267,21 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         fastllm::Data *prefillScratch, const int *liveKeys) {
     if (state.builtin) return FastllmCudaRunMimoEp8BuiltinMega(*state.builtin, rank, layer, input,
         index, score, output, graphDecode, residual, normWeight, normOutput, eps, prefillScratch, liveKeys);
-    if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || input.dims[1] != 4096)
+    if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || input.dims[1] != state.hidden)
         throw std::runtime_error("Invalid SM120 EP input.");
     const int total = input.dims[0], ranks = state.devices.size();
     const bool sharded = total >= ranks;
     const int first = sharded ? (int64_t)total * rank / ranks : 0;
     const int rows = sharded ? (int64_t)total * (rank + 1) / ranks - first : total;
-    const bool localRouting = sharded && index.dims == std::vector<int>({rows, 8});
-    if ((!localRouting && index.dims != std::vector<int>({total, 8})) || score.dims != index.dims)
+    const bool localRouting = sharded && index.dims == std::vector<int>({rows, state.topk});
+    if ((!localRouting && index.dims != std::vector<int>({total, state.topk})) || score.dims != index.dims)
         throw std::runtime_error("Invalid SM120 EP routing shape.");
     MimoGraphOutput(output, input, state.devices.at(rank));
-    auto graph = state.Graph(rank, layer, sharded ? (total + ranks - 1) / ranks : total);
-    MimoReplayRows(graph,
-        (uint16_t *)input.cudaData + (size_t)first * 4096,
-        (int32_t *)index.cudaData + (localRouting ? 0 : first * 8),
-        (float *)score.cudaData + (localRouting ? 0 : first * 8),
-        (uint16_t *)output.cudaData + (size_t)first * 4096,
+    MimoReplayRows(state, rank, layer,
+        (uint16_t *)input.cudaData + (size_t)first * state.hidden,
+        (int32_t *)index.cudaData + (localRouting ? 0 : first * state.topk),
+        (float *)score.cudaData + (localRouting ? 0 : first * state.topk),
+        (uint16_t *)output.cudaData + (size_t)first * state.hidden,
         rows, sharded ? (total + ranks - 1) / ranks : total,
         liveKeys ? liveKeys + first : nullptr);
     if (!graphDecode && localRouting && residual && normWeight && normOutput) {
@@ -241,20 +289,20 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
         // Update those rows, then publish normalized activations for the next
         // TP projection. Gathering raw MoE output and adding the full residual
         // would read stale nonlocal rows after the first sharded layer.
-        if (residual->dataType != fastllm::BFLOAT16 || residual->Count(0) != total * 4096 ||
-            normWeight->dataType != fastllm::FLOAT32 || normWeight->Count(0) != 4096)
+        if (residual->dataType != fastllm::BFLOAT16 || residual->Count(0) != total * state.hidden ||
+            normWeight->dataType != fastllm::FLOAT32 || normWeight->Count(0) != state.hidden)
             throw std::runtime_error("Invalid SM120 EP residual/RMSNorm shape.");
         normOutput->dataType = fastllm::BFLOAT16;
         normOutput->Resize(residual->dims);
         normOutput->ToDevice(output.dataDevice, output.dataDeviceIds, false);
         normOutput->Allocate(false);
-        const size_t offset = (size_t)first * 4096 * sizeof(uint16_t);
-        fastllm::Data localResidual(fastllm::BFLOAT16, {rows, 4096}), localOutput, localNorm;
+        const size_t offset = (size_t)first * state.hidden * sizeof(uint16_t);
+        fastllm::Data localResidual(fastllm::BFLOAT16, {rows, state.hidden}), localOutput, localNorm;
         localResidual.FakeFrom(*residual, offset);
         localOutput.FakeFrom(output, offset);
         localNorm.FakeFrom(*normOutput, offset);
         FastllmCudaNaiveAddDecodeRMSNorm(localResidual, localOutput, *normWeight, eps, localNorm);
-        fastllm::Data gathered(fastllm::BFLOAT16, {total, 4096});
+        fastllm::Data gathered(fastllm::BFLOAT16, {total, state.hidden});
         gathered.FakeFrom(*normOutput, 0);
         MimoGraphGather(state, rank, gathered);
         return true;

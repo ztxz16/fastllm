@@ -16,10 +16,13 @@ std::vector<FastllmMxfp4EpGraph> FastllmCudaPrepareMxfp4EpNative(FastllmMxfp4EpN
 bool FastllmCudaMxfp4EpGraphSupported(const std::vector<int> &devices) {
     #if CUDA_VERSION >= 12090 && defined(__linux__)
     if (devices.size() != 4 && devices.size() != 8) return false;
+    int planSms = 0;
     for (int device : devices) {
         cudaDeviceProp prop{};
         if (cudaGetDeviceProperties(&prop, device) != cudaSuccess || prop.major != 12 || prop.minor != 0)
             return false;
+        if (planSms && prop.multiProcessorCount != planSms) return false;
+        planSms = prop.multiProcessorCount;
         for (int peer : devices) if (peer != device) {
             int enabled = 0;
             if (cudaDeviceCanAccessPeer(&enabled, device, peer) != cudaSuccess || !enabled) return false;

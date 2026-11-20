@@ -565,7 +565,6 @@ def _configure_expert_parallel(args, is_naive_n05_model):
             raise ValueError("--ep 4/8 currently supports MiMo DSA / Naive-N0.5 FP8 or MXFP4 models")
         if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != ep:
             raise ValueError(f"--ep {ep} requires exactly {ep} TP devices")
-        print(f"[ep] --ep {ep}: {256 // ep} complete experts/GPU; MegaMoE backend selected by GPU and weight format")
     os.environ["FASTLLM_EP"] = str(ep)
     args.ep = ep
 

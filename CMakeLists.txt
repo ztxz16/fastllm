@@ -593,6 +593,7 @@ if (USE_CUDA)
         set(FASTLLM_CUDA_SM120_SOURCES
             ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
             ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            src/devices/cuda/moe/fastllm-mxfp4-ep-generic.cu
             ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
             src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
             src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
