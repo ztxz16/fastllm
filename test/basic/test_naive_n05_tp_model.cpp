@@ -3015,6 +3015,24 @@ class Fixture : public NaiveN05FlashModel {
             PreparePagedCache(owner, *pool, 129);
             if (owner.cudaData != table || owner.pageIndex.size() != 2 || directAllocations != before)
                 throw std::runtime_error("paged growth reallocated device storage");
+
+            // One growing table also needs COW on its second page. The other
+            // only appends. Both unchanged prefixes must survive a batched upload.
+            owner.Resize({1, 200, width});
+            std::vector<int> shared{owner.pageIndex[1]};
+            pool->Pick(shared);
+            std::vector<PageTableUpdate> updates;
+            PreparePagedCache(owner, *pool, 260, &updates);
+            PreparePagedCache(fork, *pool, 129, &updates);
+            if (updates.size() != 2 || updates[0].first != 1 || updates[1].first != 1 ||
+                owner.pageIndex[1] == shared.front()) throw std::runtime_error("incorrect dirty page suffix");
+            UploadPagedCacheTables(updates);
+            for (const Data *cache : {&owner, &fork}) {
+                std::vector<int> gpu(cache->pageIndex.size());
+                FastllmCudaCopyFromDeviceToHost(gpu.data(), cache->cudaData, gpu.size() * sizeof(int));
+                if (gpu != cache->pageIndex) throw std::runtime_error("stale paged KV table after growth/COW");
+            }
+            pool->ReleasePageIndices(shared);
         }
         Data cache(BFLOAT16);
         cache.dataDevice = DataDevice::CUDA;

@@ -286,13 +286,9 @@ struct DraftKVDestinations {
     int length[kDraftKVLayersPerLaunch], rows[kDraftKVLayersPerLaunch], start[kDraftKVLayersPerLaunch];
 };
 static_assert(sizeof(DraftKVDestinations) + 64 <= 4096, "Draft KV argument limit");
-__global__ void DraftNormRopeWrite(DraftKVDestinations dst, int rows,
-        int heads, int dim, float eps, float theta) {
-    int head = blockIdx.x % heads, row = (blockIdx.x / heads) % rows;
-    int slot = blockIdx.x / (heads * rows);
-    if (row >= dst.rows[slot]) return;
-    int t = threadIdx.x, width = heads * dim;
-    const BF16 *key = dst.raw[slot] + (size_t)row * 2 * width + head * dim;
+__device__ void DraftWriteHead(const BF16 *key, const float *norm, BF16 *outK, BF16 *outV,
+        int position, int width, int dim, float eps, float theta) {
+    const int t = threadIdx.x;
     __shared__ float sums[8];
     __shared__ BF16 normalized[256];
     float value = t < dim ? (float)key[t] : 0;
@@ -306,17 +302,44 @@ __global__ void DraftNormRopeWrite(DraftKVDestinations dst, int rows,
     __syncthreads();
     // Match KimiK3RMSNorm: BF16 normalization, FP32 weight, then BF16.
     if (t < dim)
-        normalized[t] = __float2bfloat16(RoundBF16(value * rsqrtf(sums[0] / dim + eps)) * dst.norm[slot][t]);
+        normalized[t] = __float2bfloat16(RoundBF16(value * rsqrtf(sums[0] / dim + eps)) * norm[t]);
     __syncthreads();
-    size_t offset = (size_t)(dst.length[slot] + row) * width + head * dim;
     if (t < dim / 2) {
-        float angle = (float)(dst.start[slot] + row) * powf(theta, -2.0f * t / dim);
+        float angle = (float)(position) * powf(theta, -2.0f * t / dim);
         float c = RoundBF16(cosf(angle)), s = RoundBF16(sinf(angle));
         float a = (float)normalized[t], b = (float)normalized[t + dim / 2];
-        dst.key[slot][offset + t] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
-        dst.key[slot][offset + t + dim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
+        outK[t] = __float2bfloat16(RoundBF16(a * c) - RoundBF16(b * s));
+        outK[t + dim / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
     }
-    if (t < dim) dst.value[slot][offset + t] = key[width + t];
+    if (t < dim) outV[t] = key[width + t];
+}
+__global__ void DraftNormRopeWrite(DraftKVDestinations dst, int rows,
+        int heads, int dim, float eps, float theta) {
+    int head = blockIdx.x % heads, row = (blockIdx.x / heads) % rows;
+    int slot = blockIdx.x / (heads * rows);
+    if (row >= dst.rows[slot]) return;
+    int width = heads * dim;
+    auto key = dst.raw[slot] + (size_t)row * 2 * width + head * dim;
+    size_t out = (size_t)(dst.length[slot] + row) * width + head * dim;
+    DraftWriteHead(key, dst.norm[slot], dst.key[slot] + out, dst.value[slot] + out,
+                   dst.start[slot] + row, width, dim, eps, theta);
+}
+__global__ void DraftNormRopeWriteAccepted(const BF16 *raw, const FastllmNaiveDraftKVSlot *slots,
+        const int *emitted, int batch, int rows, int heads, int dim, float eps, float theta) {
+    int head = blockIdx.x % heads, token = blockIdx.x / heads;
+    int request = token / rows, row = token % rows, layer = blockIdx.y;
+    // The anchor is committed even when every draft token was rejected.
+    if (row > emitted[request]) return;
+    const auto slot = slots[(size_t)layer * batch + request];
+    if (slot.targetPair && !layer && !row && !head && !threadIdx.x) {
+        slot.targetPair[0] = slot.position;
+        slot.targetPair[1] = emitted[request] + 1;
+    }
+    const int width = heads * dim;
+    const auto key = raw + ((size_t)layer * batch * rows + token) * 2 * width + head * dim;
+    size_t out = (size_t)row * width + head * dim;
+    DraftWriteHead(key, slot.norm, (BF16 *)slot.key + out, (BF16 *)slot.value + out,
+                   slot.position + row, width, dim, eps, theta);
 }
 void Output(fastllm::Data &out, fastllm::DataType type, const std::vector<int> &dims) {
     out.dataType = type;
@@ -2868,6 +2891,21 @@ void FastllmCudaNaiveDraftSwiGLU(const fastllm::Data &gateUp, fastllm::Data &out
     const int count = gateUp.Count(0) / 2;
     DraftRoundedSwiGLU<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
         (const BF16 *)gateUp.cudaData, (BF16 *)output.cudaData, dims.back(), count);
+    CheckLaunch();
+}
+
+bool FastllmCudaNaivePrepareDraftKVSlots(const std::vector<FastllmNaiveDraftKVSlot> &slots,
+        fastllm::Data &scratch) {
+    const size_t bytes = slots.size() * sizeof(FastllmNaiveDraftKVSlot);
+    if (!bytes || !scratch.cudaData || scratch.GetBytes() < bytes) return false;
+    return cudaMemcpyAsync(scratch.cudaData, slots.data(), bytes, cudaMemcpyHostToDevice, cudaStreamPerThread) == cudaSuccess;
+}
+
+void FastllmCudaNaiveWriteAcceptedDraftKV(const fastllm::Data &raw, const void *slots, const int *emitted,
+        int batch, int rows, int layers, int heads, int dim, float eps, float theta) {
+    DraftNormRopeWriteAccepted<<<dim3(batch * rows * heads, layers), 256, 0, cudaStreamPerThread>>>(
+        (const BF16 *)raw.cudaData, (const FastllmNaiveDraftKVSlot *)slots, emitted,
+        batch, rows, heads, dim, eps, theta);
     CheckLaunch();
 }
 

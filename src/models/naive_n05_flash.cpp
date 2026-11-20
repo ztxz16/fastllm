@@ -255,16 +255,18 @@ void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool
 // Page-index vectors are owned by the current rank task until this returns.
 // Complete every upload before callers can reuse their host storage or capture
 // a graph. General cache preparation keeps its original synchronous path.
-void NaiveN05FlashModel::UploadPagedCacheTables(const std::vector<Data *> &pendingPageTables) {
+void NaiveN05FlashModel::UploadPagedCacheTables(const std::vector<PageTableUpdate> &pendingPageTables) {
 #ifdef USE_CUDA
     if (pendingPageTables.empty()) return;
     // A single table is cheaper to copy directly. For a batch, upload packed
     // indices once, then scatter using the generic bounded batch-copy kernel.
     // Scratch is per worker and device; the stream completes before reuse.
     if (pendingPageTables.size() == 1) {
-        Data &cache = *pendingPageTables.front();
-        FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(),
-            cache.pageIndex.size() * sizeof(int));
+        const auto &update = pendingPageTables.front();
+        Data &cache = *update.cache;
+        if (cache.pageIndex.size() == update.first) return;
+        FastllmCudaCopyFromHostToDevice((int *)cache.cudaData + update.first, cache.pageIndex.data() + update.first,
+            (cache.pageIndex.size() - update.first) * sizeof(int));
         return;
     }
     struct Staging {
@@ -275,20 +277,23 @@ void NaiveN05FlashModel::UploadPagedCacheTables(const std::vector<Data *> &pendi
         std::vector<size_t> sizes;
     };
     static thread_local std::map<int, Staging> stagingByDevice;
-    const int device = pendingPageTables.front()->dataDeviceIds[0];
+    const int device = pendingPageTables.front().cache->dataDeviceIds[0];
     auto &staging = stagingByDevice[device];
     size_t count = 0;
-    for (Data *cache : pendingPageTables) count += cache->pageIndex.size();
+    for (const auto &update : pendingPageTables) count += update.cache->pageIndex.size() - update.first;
+    if (!count) return;
     staging.host.resize(count);
     staging.device.Resize({(int)count});
     staging.device.ToDevice(DataDevice::CUDA, {device}, false);
     staging.device.Allocate(false);
     staging.dst.clear(); staging.src.clear(); staging.sizes.clear();
     size_t offset = 0;
-    for (Data *cache : pendingPageTables) {
-        const size_t size = cache->pageIndex.size();
-        std::copy(cache->pageIndex.begin(), cache->pageIndex.end(), staging.host.begin() + offset);
-        staging.dst.push_back(cache->cudaData);
+    for (const auto &update : pendingPageTables) {
+        Data &cache = *update.cache;
+        const size_t size = cache.pageIndex.size() - update.first;
+        if (!size) continue;
+        std::copy_n(cache.pageIndex.data() + update.first, size, staging.host.data() + offset);
+        staging.dst.push_back((int *)cache.cudaData + update.first);
         staging.src.push_back((int *)staging.device.cudaData + offset);
         staging.sizes.push_back(size * sizeof(int));
         offset += size;
@@ -312,7 +317,8 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
 }
 
 bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
-                                         std::vector<Data *> *pendingPageTables, const Data *requestKey) {
+                                         std::vector<PageTableUpdate> *pendingPageTables, const Data *requestKey,
+                                         bool *requestInvalidated) {
 #ifdef USE_CUDA
     const int width = manager.dims[3], capacity = std::min(max_positions,
         std::min(tokensLimit > 0 ? tokensLimit : INT_MAX, manager.maxPages * manager.pageLen));
@@ -336,14 +342,6 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
     // table allocation/pool binding. Reinitialize the empty logical cache
     // before inspecting its length or constructing an Indexer view.
     if (cache.dims.empty()) cache.Resize({1, 0, width});
-    bool changed = !cache.cudaData;
-    if (!cache.cudaData) {
-        const size_t bytes = (size_t)((capacity + manager.pageLen - 1) / manager.pageLen) * sizeof(int);
-        cache.cudaData = AllocateCudaWorkspace(RequestKVPool(manager.dataDeviceIds[0], bytes), bytes);
-        if (!cache.cudaData) throw CudaWorkspaceExhausted("Naive KV page metadata pool exhausted.");
-        cache.directMemory = true;
-        cache.cudaDataBorrowed = false;
-    }
     cache.expansionDims = {1, capacity, width};
     cache.strides = {(uint64_t)capacity * width, (uint64_t)width, 1};
     const int previous = cache.dims[1];
@@ -355,6 +353,28 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
             copyTail = manager.pageRefCount[cache.pageIndex[(previous - 1) / cache.pageLen]] > 1;
         if (manager.FreePageCount() < std::max(0, pages - (int)cache.pageIndex.size()) + copyTail)
             throw CudaWorkspaceExhausted("Naive physical KV pages exhausted.");
+    }
+    const bool newTable = !cache.cudaData;
+    const bool changed = newTable || copyTail || pages > (int)cache.pageIndex.size();
+    if (!cache.cudaData) {
+        const size_t bytes = (size_t)((capacity + manager.pageLen - 1) / manager.pageLen) * sizeof(int);
+        cache.cudaData = AllocateCudaWorkspace(RequestKVPool(manager.dataDeviceIds[0], bytes), bytes);
+        if (!cache.cudaData) throw CudaWorkspaceExhausted("Naive KV page metadata pool exhausted.");
+        cache.directMemory = true;
+        cache.cudaDataBorrowed = false;
+    }
+    if (changed) {
+        // Register before acquiring pages. A later allocation failure can leave
+        // a valid partial extension which the caller flushes before retrying.
+        if (pendingPageTables) {
+            const size_t first = newTable ? 0 : copyTail ? size_t((previous - 1) / cache.pageLen) : cache.pageIndex.size();
+            pendingPageTables->push_back({&cache, first});
+        }
+        // One scheduler reservation invalidates this request once per rank.
+        if (!requestInvalidated || !*requestInvalidated) {
+            InvalidateTensorParallelCache(requestKey);
+            if (requestInvalidated) *requestInvalidated = true;
+        }
     }
     if (copyTail) {
         int last = (previous - 1) / cache.pageLen;
@@ -371,19 +391,11 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
         }
         cache.pageIndex[last] = page;
         manager.ReleasePageIndex(old);
-        changed = true;
     }
-    while ((int)cache.pageIndex.size() < pages) {
+    while ((int)cache.pageIndex.size() < pages)
         cache.pageIndex.push_back(manager.GetUnusedPageIndex(true));
-        changed = true;
-    }
-    if (changed) {
-        if (pendingPageTables)
-            pendingPageTables->push_back(&cache);
-        else
-            FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
-        InvalidateTensorParallelCache(requestKey);
-    }
+    if (changed && !pendingPageTables && !cache.pageIndex.empty())
+        FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
     cache.lastPageLen = previous ? (previous - 1) % cache.pageLen + 1 : 0;
     return changed;
 #else
@@ -2302,8 +2314,9 @@ Data NaiveN05FlashModel::RunTarget(
                 addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
         prefillNormReady = fusePrefillNorm && mlpNormWeight;
-        const bool captureHidden = capture && capture->collectHidden &&
-            std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end();
+        const auto featureLayer = capture && capture->collectHidden
+            ? std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) : draftTargetLayers.end();
+        const bool captureHidden = featureLayer != draftTargetLayers.end();
         if (localMoe) {
             // The vocabulary head and draft feature consumers require world
             // order. No intermediate attention or MoE layer needs that gather.
@@ -2315,10 +2328,17 @@ Data NaiveN05FlashModel::RunTarget(
             }
             // Feature capture needs every row. Ordinary prefill passes only
             // the last local row of each sequence to the vocabulary head.
-            if (captureHidden || (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead))
+            if ((captureHidden && !capture->packedOutput) || (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead))
                 attentionParallel->transfer->Collect(tpRank, hidden.cudaData, buf.hidden.cudaData, size_t(embed_dim) * 2);
         }
-        if (captureHidden && tpRank <= 0) {
+        if (captureHidden && capture->packedOutput) {
+            const size_t column = featureLayer - draftTargetLayers.begin();
+            auto dst = (uint16_t *)capture->packedOutput->cudaData + column * embed_dim;
+            const size_t rowBytes = (size_t)embed_dim * sizeof(uint16_t);
+            AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(dst,
+                draftTargetLayers.size() * rowBytes, hidden.cudaData, rowBytes, rowBytes, hidden.dims[1]),
+                "Cannot capture local draft features");
+        } else if (captureHidden && tpRank <= 0) {
             Data &featureHidden = localMoe ? buf.hidden : hidden;
             if (workspace && capture->borrowOutputs && !capture->verifying) {
                 // Internal prefill consumers finish before the next forward.

@@ -273,13 +273,14 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         tpWorkers.Run(tpDevices, [&](int rank) {
             FastllmCudaSetDevice(tpDevices[rank]);
             const auto &group = state.groups[topology.AttentionOwner(rank)];
-            std::vector<Data *> pending;
+            std::vector<PageTableUpdate> pending;
             try {
                 for (size_t row = 0; row < group.lengths.size(); ++row) {
                     const int seq = group.sequenceIndices[row];
                     if ((state.servingPadded && seq >= liveRows) ||
                         (!retained.empty() && retained[seq] >= 0)) continue;
                     const int count = state.verifyLengths ? state.verifyLengths->at(seq) : group.lengths[row];
+                    bool invalidated = false;
                     for (int layer = 0; layer < block_cnt; ++layer) {
                         const auto &cfg = slidingLayers[layer] ? sliding : full;
                         for (int part = 0; part < 2; ++part) {
@@ -293,7 +294,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                             } else {
                                 const int past = root.dims.empty() ? 0 : root.dims[1];
                                 PreparePagedCache(local, *tpPagedCaches[rank][layer * 2 + part],
-                                    past + count, &pending, &key(seq, 0));
+                                    past + count, &pending, &key(seq, 0), ownedDecode ? &invalidated : nullptr);
                             }
                         }
                     }

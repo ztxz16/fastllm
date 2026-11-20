@@ -233,7 +233,8 @@ void PrefixCopy() {
         Cuda(cudaMemcpy(pool.cudaData, original.data(), original.size(), cudaMemcpyHostToDevice));
         Cuda(cudaMemcpy(index.cudaData, sidecar.data(), sidecar.size(), cudaMemcpyHostToDevice));
         const int old = pool.GetUnusedPageIndex(true);
-        pool.pageRefCount[old] = 2;
+        std::vector<int> shared{old};
+        pool.Pick(shared);
         cache.dataType = FP4_E2M1;
         cache.UpdateUnitSize();
         cache.Resize({1, 63, width});
