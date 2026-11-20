@@ -54,14 +54,14 @@ __device__ __forceinline__ void StreamMma128(float (&c)[64], unsigned long long 
 #endif
 }
 __global__ __launch_bounds__(640, 1) void IndexerScoresStream(naive_indexer::FP8Entry e,
-        const __grid_constant__ CUtensorMap qmap, const __grid_constant__ CUtensorMap kmap) {
+        int span, const __grid_constant__ CUtensorMap qmap, const __grid_constant__ CUtensorMap kmap) {
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
     extern __shared__ __align__(1024) unsigned char storage[];
     unsigned char *sq = storage, *sk = sq + kStreamQBytes;
     auto *ready = (unsigned long long *)(sk + kStreamStages * kStreamKBytes);
     auto *released = ready + kStreamStages, *qready = released + kStreamStages;
     const int tid = threadIdx.x, wg = tid / 128, lane = tid % 32, warp = (tid % 128) / 32;
-    constexpr int span = kStreamSpan;
+
     const int firstQ = blockIdx.y * 8, firstK = blockIdx.x * span;
     const int lastQ = min(e.rows - 1, firstQ + 7);
     const int end = e.past + lastQ + (e.part && lastQ >= e.part ? e.gap : 0);
@@ -199,14 +199,18 @@ inline unsigned LaunchStream(const Batch &batch) {
     unsigned launched = 0;
     for (int i = 0; i < batch.count; ++i) if (batch.mask & (1u << i)) {
         const auto &e = batch.entries[i].prepared;
-        constexpr int span = kStreamSpan;
+        // For narrow query shards, let shorter key spans fill the SMs.
+        // Keep a long TMA pipeline once the original grid has several waves.
+        int span = kStreamSpan;
+        while (span > 1024 && ((e.keys + span - 1) / span) * ((e.rows + 7) / 8) < 2 * sms)
+            span /= 2;
         const int blocks = ((e.keys + span - 1) / span) * ((e.rows + 7) / 8);
         if (e.keys < 8192 || blocks < (sms + 1) / 2) continue;
         CUtensorMap q, k;
         if (!StreamMap(q, e.q, e.rows * 16, 128, 128) ||
             !StreamMap(k, e.key.base, batch.entries[i].keyRows, 144, 256)) continue;
         IndexerScoresStream<<<dim3((e.keys + span - 1) / span, (e.rows + 7) / 8),
-            640, kStreamShared>>>(e, q, k);
+            640, kStreamShared>>>(e, span, q, k);
         launched |= 1u << i;
     }
     return launched;

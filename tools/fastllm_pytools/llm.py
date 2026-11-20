@@ -1490,8 +1490,8 @@ class model:
                   indexer_dtype: str = "auto",
                   indexer_tp_storage: str = "replicated",
                   indexer_compute_dtype: str = "auto"):
-        if indexer_compute_dtype not in ("auto", "fp8"):
-            raise ValueError("indexer_compute_dtype must be auto or fp8")
+        if indexer_compute_dtype not in ("auto", "fp8", "fp8_direct"):
+            raise ValueError("indexer_compute_dtype must be auto, fp8 or fp8_direct")
         if indexer_compute_dtype != "auto" and not hasattr(fastllm_lib, "set_model_indexer_compute_dtype"):
             raise RuntimeError("The loaded FastLLM library does not support FP8 Indexer compute; rebuild FastLLM.")
         if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):

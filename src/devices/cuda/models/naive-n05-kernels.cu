@@ -3555,8 +3555,9 @@ void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks) {
 
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
 static unsigned LaunchFP8ShortlistIndexer(const naive_indexer::FP8Entry *entries, int count,
-                                          int *const *outputs) {
+                                          int *const *outputs, fastllm::NaiveIndexerCompute compute) {
     using namespace fastllm;
+    const bool direct = compute == NaiveIndexerCompute::FP8Direct;
     naive_indexer::FP8Entry eligible[8];
     if (count < 1 || count > 8) return 0;
     for (int i = 0; i < count; ++i) {
@@ -3579,20 +3580,22 @@ static unsigned LaunchFP8ShortlistIndexer(const naive_indexer::FP8Entry *entries
                 Output(offsets, INT32, {2, rows});
                 auto *selected = (unsigned long long *)candidates.cudaData;
                 auto *ends = (int *)offsets.cudaData;
-                // Keep a bounded superset of the FP8 top 3072 before exact
-                // candidate scoring. The original selector proves its size.
+                const int past = e.past + first + (part ? e.gap : 0);
+                int *indices = outputs[i] + (size_t)first * 2048;
                 LaunchSelectTopKCompact(e.scores + (size_t)first * e.keys, selected, ends,
-                    rows, e.keys, e.past + first + (part ? e.gap : 0), 3072, 4096);
+                    rows, e.keys, past, direct ? 2048 : 3072, 4096);
+                if (direct) {
+                    // Selection already packs ordered FP8 scores and the lower-index tie breaker.
+                    SortTopKCompact<false, 128><<<rows, 128>>>(selected, ends, indices, rows, 4096, 2048, e.keys);
+                    continue;
+                }
                 if (!first && naive_indexer::StageRefinementKeys(e, rows))
                     expanded = (const BF16 *)e.scores;
                 naive_indexer::FP8Entry tile = e;
                 tile.q += (size_t)first * 2048; tile.scales += first * 16; tile.weights += first * 16;
-                tile.rows = rows; tile.past += first + (part ? e.gap : 0); tile.part = tile.gap = 0;
+                tile.rows = rows; tile.past = past; tile.part = tile.gap = 0;
                 naive_indexer::RefineFP8(tile, selected, ends, 4096, expanded);
-                // LaunchFP8 has already selected Hopper. Other architectures
-                // retain the original BF16 scorer and generic compact sort.
-                SortTopKCompact<true, 128><<<rows, 128>>>(selected, ends, outputs[i] + (size_t)first * 2048,
-                    rows, 4096, 2048, e.keys);
+                SortTopKCompact<true, 128><<<rows, 128>>>(selected, ends, indices, rows, 4096, 2048, e.keys);
             }
         }
     }
@@ -3614,7 +3617,7 @@ struct PairedIndexerAttention {
 
 static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
-                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute,
+                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute,
         const PairedIndexerAttention *paired) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
@@ -3649,7 +3652,7 @@ static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weight
             tileWeights.FakeFrom(weights, size_t(first) * heads * weights.unitSize);
             tileIndices.FakeFrom(indices, size_t(first) * topK * sizeof(int));
             FastllmCudaNaiveIndexer(tileQuery, tileWeights, packedKeys, heads, dim,
-                queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch, fp8Compute);
+                queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch, compute);
             first += count;
         }
         return false;
@@ -3700,10 +3703,10 @@ static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weight
                 naive_indexer::FP8Entry entry{FastllmNaiveKV(packedKeys),
                     (const BF16 *)q.cudaData, (const BF16 *)weights.cudaData, (const float *)qScale.cudaData,
                     (float *)scores.cudaData, queries, keys, queryStart, stride};
-                if (!fp8Compute || topK != 2048) return false;
+                if (compute == fastllm::NaiveIndexerCompute::Auto || topK != 2048) return false;
                 Output(indices, INT32, {queries, topK});
                 int *output = (int *)indices.cudaData;
-                return fp8IndicesReady = LaunchFP8ShortlistIndexer(&entry, 1, &output) != 0;
+                return fp8IndicesReady = LaunchFP8ShortlistIndexer(&entry, 1, &output, compute) != 0;
             }()) {}
             else if (!peerKeys && naive_indexer::Prepare()) {
                 naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
@@ -3784,7 +3787,15 @@ static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weight
 void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
         const fastllm::Data &keys, int heads, int dim, int past, int topK, bool fp8Query,
         fastllm::Data &indices, bool peer, fastllm::Data *scratch, bool fp8Compute) {
-    NaiveIndexer(query, weights, keys, heads, dim, past, topK, fp8Query, indices, peer, scratch, fp8Compute, nullptr);
+    FastllmCudaNaiveIndexer(
+        query, weights, keys, heads, dim, past, topK, fp8Query, indices, peer, scratch,
+        fastllm::NaiveIndexerComputeFromFP8(fp8Compute));
+}
+
+void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+        const fastllm::Data &keys, int heads, int dim, int past, int topK, bool fp8Query,
+        fastllm::Data &indices, bool peer, fastllm::Data *scratch, fastllm::NaiveIndexerCompute compute) {
+    NaiveIndexer(query, weights, keys, heads, dim, past, topK, fp8Query, indices, peer, scratch, compute, nullptr);
 }
 
 void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerItem &index,
@@ -3792,9 +3803,20 @@ void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerIte
         int indexHeads, int indexDim, int topK, bool fp8Query, bool fp8Compute,
         int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
         const fastllm::Data &attentionScratch) {
+    FastllmCudaNaivePrefillIndexedAttention(
+        index, attention, sink, indexHeads, indexDim, topK, fp8Query,
+        fastllm::NaiveIndexerComputeFromFP8(fp8Compute), heads, kvHeads, dim, valueDim,
+        scoreScratch, attentionScratch);
+}
+
+void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerItem &index,
+        const FastllmNaivePrefillAttentionItem &attention, const fastllm::Data &sink,
+        int indexHeads, int indexDim, int topK, bool fp8Query, fastllm::NaiveIndexerCompute compute,
+        int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
+        const fastllm::Data &attentionScratch) {
     const PairedIndexerAttention paired{attention, sink, attentionScratch, heads, kvHeads, dim, valueDim};
     const bool consumed = NaiveIndexer(*index.query, *index.weights, *index.keys, indexHeads, indexDim,
-        index.past, topK, fp8Query, *index.indices, false, scoreScratch, fp8Compute, &paired);
+        index.past, topK, fp8Query, *index.indices, false, scoreScratch, compute, &paired);
     if (!consumed) FastllmCudaNaiveBatchIndexerAttention({attention}, sink, heads, kvHeads, dim, valueDim, attentionScratch);
 }
 
@@ -3825,6 +3847,14 @@ static bool BalancedIndexerSupported(const fastllm::Data &query, const fastllm::
 bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                                      const fastllm::Data &keys, int past, int rank, int ranks, bool fp8Query,
                                      bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch, bool fp8Compute) {
+    return FastllmCudaNaiveBalancedIndexer(
+        query, weights, keys, past, rank, ranks, fp8Query, peerKeys, indices, scoreScratch,
+        fastllm::NaiveIndexerComputeFromFP8(fp8Compute));
+}
+
+bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+                                     const fastllm::Data &keys, int past, int rank, int ranks, bool fp8Query,
+                                     bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
     if (!BalancedIndexerSupported(query, weights, keys, past, rank, ranks, fp8Query, peerKeys) ||
@@ -3832,14 +3862,12 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
     const int part = query.dims[1] / (2 * ranks), rows = part * 2, count = keys.dims[1];
     const int first = rank * part, second = query.dims[1] - (rank + 1) * part;
     const int start = past + first, gap = second - first - part;
-    Data q, scale, w, localScores, encoded, offsets;
+    Data q, scale, w, localScores;
     Data &scores = scoreScratch ? *scoreScratch : localScores;
     Output(q, BFLOAT16, {rows, 16, 128});
     Output(scale, FLOAT32, {rows, 16});
     Output(w, BFLOAT16, {rows, 16});
     Output(scores, FLOAT32, {rows, count});
-    Output(encoded, INT32, {rows, 4096, 2});
-    Output(offsets, INT32, {2, rows});
     Output(indices, INT32, {rows, 2048});
     naive_dsa_mma::QuantizeBalancedIndexer<<<rows * 16, 128>>>(
         (const BF16 *)query.cudaData, (const BF16 *)weights.cudaData, (BF16 *)q.cudaData, (float *)scale.cudaData,
@@ -3849,11 +3877,14 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
         (const BF16 *)w.cudaData, (const float *)scale.cudaData, (float *)scores.cudaData,
         rows, count, start, keys.dims[2], part, gap};
     int *output = (int *)indices.cudaData;
-    if (fp8Compute && LaunchFP8ShortlistIndexer(&entry, 1, &output)) {
+    if (compute != fastllm::NaiveIndexerCompute::Auto && LaunchFP8ShortlistIndexer(&entry, 1, &output, compute)) {
         CheckLaunch();
         return true;
     }
 #endif
+    Data encoded, offsets;
+    Output(encoded, INT32, {rows, 4096, 2});
+    Output(offsets, INT32, {2, rows});
     naive_dsa_mma::IndexerScores<true><<<dim3((past + second + part + 63) / 64, (rows + 31) / 32), 128>>>(
         (const BF16 *)q.cudaData, FastllmNaiveKV(keys), (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData, rows, count, start, keys.dims[2], part, gap);
@@ -3886,7 +3917,7 @@ static bool LocalPrefillIndexerSupported(const fastllm::Data &q, const fastllm::
 #endif
 
 static bool BatchPrefillIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items, int rank, int ranks,
-                                          bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute) {
+                                          bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute) {
 #ifdef FASTLLM_NAIVE_DSA_MMA
     using namespace fastllm;
     if (items.empty() || items.size() > 8 ||
@@ -3932,36 +3963,36 @@ static bool BatchPrefillIndexer(const std::vector<FastllmNaivePrefillIndexerItem
         Output(*items[i].indices, INT32, {batch.entries[i].rows, 2048});
         batch.entries[i].output = (int *)items[i].indices->cudaData;
     }
-    Data q, scale, w, localScores, encoded, offsets;
+    Data q, scale, w, localScores;
     Data &scores = scoreScratch ? *scoreScratch : localScores;
     Output(q, BFLOAT16, {batch.rows, 16, 128});
     Output(scale, FLOAT32, {batch.rows, 16});
     Output(w, BFLOAT16, {batch.rows, 16});
     Output(scores, FLOAT32, {(int)scoreCount});
-    Output(encoded, INT32, {batch.rows, 4096, 2});
-    Output(offsets, INT32, {2, batch.rows});
     naive_dsa_mma::QuantizeBatchIndexer<<<batch.rows * 16, 128>>>(batch, (BF16 *)q.cudaData, (float *)scale.cudaData,
                                                                   (BF16 *)w.cudaData);
     unsigned fp8Mask = 0;
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
-    naive_indexer::FP8Entry fp8Entries[8];
-    for (int i = 0; i < batch.count; ++i) {
-        const auto &e = batch.entries[i];
-        fp8Entries[i] = {e.key, (const BF16 *)q.cudaData + (size_t)e.rowOffset * 2048,
-            (const BF16 *)w.cudaData + e.rowOffset * 16, (const float *)scale.cudaData + e.rowOffset * 16,
-            (float *)scores.cudaData + e.scoreOffset, e.rows, e.keys, e.past + e.first, e.stride,
-            e.part, e.second - e.first - e.part};
+    if (compute != fastllm::NaiveIndexerCompute::Auto) {
+        naive_indexer::FP8Entry fp8Entries[8];
+        int *outputs[8];
+        for (int i = 0; i < batch.count; ++i) {
+            const auto &e = batch.entries[i];
+            outputs[i] = e.output;
+            fp8Entries[i] = {e.key, (const BF16 *)q.cudaData + (size_t)e.rowOffset * 2048,
+                (const BF16 *)w.cudaData + e.rowOffset * 16, (const float *)scale.cudaData + e.rowOffset * 16,
+                (float *)scores.cudaData + e.scoreOffset, e.rows, e.keys, e.past + e.first, e.stride,
+                e.part, e.second - e.first - e.part};
+        }
+        fp8Mask = LaunchFP8ShortlistIndexer(fp8Entries, batch.count, outputs, compute);
     }
-    int *outputs[8];
-    for (int i = 0; i < batch.count; ++i) outputs[i] = batch.entries[i].output;
-    if (fp8Compute) fp8Mask = LaunchFP8ShortlistIndexer(fp8Entries, batch.count, outputs);
 #endif
     if (fp8Mask || ranks == 1) {
         for (int i = 0; i < batch.count; ++i) if (!(fp8Mask & (1u << i))) {
             const auto &item = items[i];
             if (ranks == 1) {
                 FastllmCudaNaiveIndexer(*item.query, *item.weights, *item.keys, 16, 128,
-                    item.past, 2048, fp8Query, *item.indices, false, scoreScratch, fp8Compute);
+                    item.past, 2048, fp8Query, *item.indices, false, scoreScratch, compute);
                 continue;
             }
             AssertInFastLLM(FastllmCudaNaiveBalancedIndexer(*item.query, *item.weights, *item.keys,
@@ -3971,6 +4002,9 @@ static bool BatchPrefillIndexer(const std::vector<FastllmNaivePrefillIndexerItem
         CheckLaunch();
         return true;
     }
+    Data encoded, offsets;
+    Output(encoded, INT32, {batch.rows, 4096, 2});
+    Output(offsets, INT32, {2, batch.rows});
     naive_dsa_mma::BatchIndexerScores<<<dim3((maxKeys + 63) / 64, (maxRows + 31) / 32, batch.count), 128>>>(
         batch, (const BF16 *)q.cudaData, (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData);
@@ -3986,35 +4020,49 @@ static bool BatchPrefillIndexer(const std::vector<FastllmNaivePrefillIndexerItem
 }
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
         int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scratch, bool fp8Compute) {
+    return FastllmCudaNaiveBatchBalancedIndexer(
+        items, rank, ranks, fp8Query, peerKeys, scratch,
+        fastllm::NaiveIndexerComputeFromFP8(fp8Compute));
+}
+
+bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+        int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scratch, fastllm::NaiveIndexerCompute compute) {
     if (ranks != 2 && ranks != 4 && ranks != 8) return false;
-    return BatchPrefillIndexer(items, rank, ranks, fp8Query, peerKeys, scratch, fp8Compute);
+    return BatchPrefillIndexer(items, rank, ranks, fp8Query, peerKeys, scratch, compute);
 }
 
 void FastllmCudaNaiveBatchIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
         int heads, int dim, int topK, bool fp8Query, fastllm::Data *scratch, bool fp8Compute) {
+    FastllmCudaNaiveBatchIndexer(
+        items, heads, dim, topK, fp8Query, scratch,
+        fastllm::NaiveIndexerComputeFromFP8(fp8Compute));
+}
+
+void FastllmCudaNaiveBatchIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+        int heads, int dim, int topK, bool fp8Query, fastllm::Data *scratch, fastllm::NaiveIndexerCompute compute) {
     using namespace fastllm;
     std::vector<FastllmNaivePrefillIndexerItem> tiles;
     std::vector<std::unique_ptr<Data>> views;
     size_t bytes = 0;
     auto flush = [&] {
         if (tiles.empty()) return;
-        if (tiles.size() == 1 || !BatchPrefillIndexer(tiles, 0, 1, fp8Query, false, scratch, fp8Compute))
+        if (tiles.size() == 1 || !BatchPrefillIndexer(tiles, 0, 1, fp8Query, false, scratch, compute))
             for (const auto &item : tiles)
                 FastllmCudaNaiveIndexer(*item.query, *item.weights, *item.keys, heads, dim,
-                    item.past, topK, fp8Query, *item.indices, false, scratch, fp8Compute);
+                    item.past, topK, fp8Query, *item.indices, false, scratch, compute);
         tiles.clear(); views.clear(); bytes = 0;
     };
     for (const auto &item : items) {
         bool supported = false;
 #ifdef FASTLLM_NAIVE_DSA_MMA
-        supported = heads == 16 && dim == 128 && topK == 2048 && fp8Compute &&
+        supported = heads == 16 && dim == 128 && topK == 2048 && compute != fastllm::NaiveIndexerCompute::Auto &&
             (item.keys->dataType == FP8_E4M3 || item.keys->kvCacheFp8Indexer) &&
             LocalPrefillIndexerSupported(*item.query, *item.weights, *item.keys, item.past, fp8Query);
 #endif
         if (!supported) {
             flush();
             FastllmCudaNaiveIndexer(*item.query, *item.weights, *item.keys, heads, dim,
-                item.past, topK, fp8Query, *item.indices, false, scratch, fp8Compute);
+                item.past, topK, fp8Query, *item.indices, false, scratch, compute);
             continue;
         }
         const int rows = item.query->dims[1], keys = item.keys->dims[1];

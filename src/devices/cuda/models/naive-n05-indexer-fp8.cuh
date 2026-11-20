@@ -244,27 +244,47 @@ __global__ __launch_bounds__(128) void RefineScores(naive_indexer::FP8Entry e, u
     extern __shared__ __align__(1024) unsigned char buffer[];
     BF *k = (BF *)buffer, *q = k + 64 * 128;
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
-    for (int i = tid; i < 64 * 16; i += 128) {
-        int r = i / 16, d = i % 16 * 8, pos = first + r;
-        int key = pos < valid ? (int)(0xffffffffu - (unsigned)candidates[(size_t)row * count + pos]) : -1;
-        uint4 values = make_uint4(0, 0, 0, 0);
-        if (key >= 0) {
-            // LaunchFP8 stages local contiguous rows once. Avoid repeating the
-            // paged/peer/FP4 address machinery for every candidate vector.
-            if constexpr (Expanded)
-                values = *(const uint4 *)(expanded + (size_t)key * 128 + d);
-            else if constexpr (LocalStaged)
-                values =
-                    FastllmNaiveKVRow((const unsigned char *)e.key.base + (size_t)key * 144 + d, true).Load8();
-            else
-                values = (e.key.IndexRow(key, e.stride) + d).Load8();
+    if constexpr (Expanded) {
+        // One warp gathers 16 candidates. Broadcast each row address and
+        // copy both operands directly into the WGMMA shared layout.
+        const int pos = first + warp * 16 + lane;
+        const int ownKey = pos < valid ? int(0xffffffffu - unsigned(candidates[(size_t)row * count + pos])) : -1;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int i = warp * 256 + j * 32 + lane, r = i / 16, d = i % 16 * 8;
+            const int key = __shfl_sync(0xffffffff, ownKey, r % 16);
+            const unsigned dst = __cvta_generic_to_shared(k + naive_indexer::offset(r, d, 64));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::
+                "r"(dst), "l"(expanded + (size_t)max(0, key) * 128 + d), "r"(key >= 0 ? 16 : 0) : "memory");
         }
-        *(uint4 *)(k + naive_indexer::offset(r, d, 64)) = values;
-    }
-    for (int i = tid; i < 16 * 16; i += 128) {
-        int h = i / 16, d = i % 16 * 8;
-        *(uint4 *)(q + naive_indexer::offset(h, d, 16)) =
-            *(const uint4 *)(e.q + (size_t)row * 2048 + h * 128 + d);
+        for (int i = tid; i < 16 * 16; i += 128) {
+            const int h = i / 16, d = i % 16 * 8;
+            const unsigned dst = __cvta_generic_to_shared(q + naive_indexer::offset(h, d, 16));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::
+                "r"(dst), "l"(e.q + (size_t)row * 2048 + h * 128 + d) : "memory");
+        }
+        asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+    } else {
+        for (int i = tid; i < 64 * 16; i += 128) {
+            int r = i / 16, d = i % 16 * 8, pos = first + r;
+            int key = pos < valid ? (int)(0xffffffffu - (unsigned)candidates[(size_t)row * count + pos]) : -1;
+            uint4 values = make_uint4(0, 0, 0, 0);
+            if (key >= 0) {
+                // LaunchFP8 stages local contiguous rows once. Avoid repeating the
+                // paged/peer/FP4 address machinery for every candidate vector.
+                if constexpr (LocalStaged)
+                    values =
+                        FastllmNaiveKVRow((const unsigned char *)e.key.base + (size_t)key * 144 + d, true).Load8();
+                else
+                    values = (e.key.IndexRow(key, e.stride) + d).Load8();
+            }
+            *(uint4 *)(k + naive_indexer::offset(r, d, 64)) = values;
+        }
+        for (int i = tid; i < 16 * 16; i += 128) {
+            int h = i / 16, d = i % 16 * 8;
+            *(uint4 *)(q + naive_indexer::offset(h, d, 16)) =
+                *(const uint4 *)(e.q + (size_t)row * 2048 + h * 128 + d);
+        }
     }
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta; wgmma.fence.sync.aligned;" ::: "memory");

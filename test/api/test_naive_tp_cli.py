@@ -79,12 +79,13 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         self.configure([])
         self.assertEqual(self.model_options['indexer_compute_dtype'], 'auto')
         self.assertNotIn('FASTLLM_CUDA_NATIVE_FP8_PREFILL', self.native_env)
-        for saved in (False, True):
-            settings = {'indexer_compute_dtype': 'fp8', 'fp8_prefill': 'true'}
-            options = [] if saved else [part for k, v in settings.items() for part in ('--' + k, v)]
-            self.configure(options, saved=settings if saved else None)
-            self.assertEqual(self.model_options['indexer_compute_dtype'], 'fp8')
-            self.assertEqual(self.native_env['FASTLLM_CUDA_NATIVE_FP8_PREFILL'], '1')
+        for mode in ('fp8', 'fp8_direct'):
+            for saved in (False, True):
+                settings = {'indexer_compute_dtype': mode, 'fp8_prefill': 'true'}
+                options = [] if saved else [part for k, v in settings.items() for part in ('--' + k, v)]
+                self.configure(options, saved=settings if saved else None)
+                self.assertEqual(self.model_options['indexer_compute_dtype'], mode)
+                self.assertEqual(self.native_env['FASTLLM_CUDA_NATIVE_FP8_PREFILL'], '1')
 
     def test_fp8_prefill_environment_and_saved_booleans(self):
         name = 'FASTLLM_CUDA_NATIVE_FP8_PREFILL'
