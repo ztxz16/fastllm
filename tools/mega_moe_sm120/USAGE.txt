@@ -128,6 +128,13 @@ Caching must preserve exact output and meet the same performance margin; each
 bucket records dispatch_rank_cache, comparison timings and fallback reasons.
 The captured recipe resets the transient cache before every replay. This is
 per-invocation input reuse, not a cache across requests or decoding steps.
+
+With --combine auto, the exporter tests a Green Context partition that gives
+FC1 three fifths of the SMs, rounded down to the hardware alignment, and FC2
+the remainder. It then tests up to four FC1 operand stages within the tile's
+shared-memory and occupancy limits. Both trials use the same exact-output and
+latency criteria as input caching. FC2 keeps its original pipeline depth.
+
 Local combine rounds each owner's partial sum to BF16. The shipped EP4 package
 uses local combine for 512, 1024 and 2048 rows. Its owner input cache is enabled
 for 256, 1024 and 2048 rows. EP8 uses local combine and the owner input cache

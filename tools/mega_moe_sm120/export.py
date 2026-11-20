@@ -213,6 +213,71 @@ class Exporter:
                 ranks.append(entry)
         return dict(capacity=bucket,ranks=ranks)
 
+def export_bucket(exporter, args, layers, cap):
+    def provider(**options):
+        return GraphProvider(range(args.ep), layers, hidden=args.hidden, intermediate=args.intermediate,
+                             experts=args.experts, topk=args.topk, **options)
+
+    options = {'rank_local_combine': args.combine == 'local'}
+    selection = {'mode': 'local' if options['rank_local_combine'] else 'direct', 'dispatch_rank_cache': False}
+    selected = provider(**options)
+    try:
+        meta = selected.prepare(0, cap)
+        measured = benchmark(selected, cap)
+
+        def try_candidate(prefix, *, exact=True, **changes):
+            nonlocal selected, meta, measured
+            trial = provider(**{**options, **changes})
+            try:
+                try:
+                    trial_meta = trial.prepare(0, cap)
+                except ValueError as error:
+                    selection[prefix + 'reason'] = str(error)
+                    return False
+                timing = benchmark(trial, cap)
+                keep, comparison = select_candidate(measured, timing, exact=exact)
+                selection[prefix + 'benchmark'] = comparison
+                if keep:
+                    options.update(changes)
+                    selected, trial = trial, selected
+                    meta, measured = trial_meta, timing
+                else:
+                    accuracy = 'exact output' if exact else 'L2 <= 0.005'
+                    selection[prefix + 'reason'] = f'Requires {accuracy}, >= 5% aggregate gain and <= 5% regression per workload'
+                return keep
+            finally:
+                # After a successful swap, trial owns the previous winner.
+                trial.close()
+
+        if args.combine == 'auto' and try_candidate('', exact=False, rank_local_combine=True):
+            selection['mode'] = 'local'
+        if try_candidate('dispatch_cache_', dispatch_rank_cache=True):
+            selection['dispatch_rank_cache'] = True
+        if args.combine == 'auto':
+            from moe_sm120_mxfp4mxfp8_split.runtime.green_context import (
+                query_green_context_sm_counts, query_sm_resource_info)
+            device = selected.devices[0]
+            total, minimum, alignment = query_sm_resource_info(device)
+            k1 = (total * 3 // 5) // alignment * alignment
+            if minimum <= k1 <= total - minimum:
+                split = query_green_context_sm_counts(k1_sm_count=k1, device=device)
+                graph = next(iter(selected.workspaces[0][cap]._frontends.values()))._compiled.graph
+                if split != (graph.k1_sm_count, graph.k2_sm_count) and try_candidate('green_partition_', green_sms=split):
+                    selection['green_sms'] = list(split)
+            kernel = selected.workspaces[0][cap]._executions[cap].bundle.k1
+            available = kernel.smem_capacity // kernel.occupancy - kernel.fixed_smem_overhead
+            stages = min(4, available // kernel.ab_bytes_per_stage)
+            if stages > kernel.num_ab_stage and try_candidate('fc1_pipeline_', fc1_stages=stages):
+                selection['fc1_stages'] = stages
+
+        exporter.provider = selected
+        bucket = exporter.bucket(cap, meta)
+        bucket['selection'] = selection
+        return bucket
+    finally:
+        selected.close()
+
+
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--output',type=Path,required=True)
     ap.add_argument('--capacities', type=int, nargs='+',
@@ -246,57 +311,11 @@ def main():
                   hidden=h,intermediate=mid,experts=args.experts,topk=args.topk,ep=args.ep,buckets=[],
                   source='FlashInfer SM120 split CuTeDSL MegaMoE, flashinfer-python 0.7.2, Apache-2.0')
     for cap in sorted(args.capacities):
-        providers=[]
-        def prepare(local, cache=False):
-            provider=GraphProvider(list(range(args.ep)),layers,hidden=h,intermediate=mid,
-                                   experts=args.experts,topk=args.topk,rank_local_combine=local,
-                                   dispatch_rank_cache=cache)
-            providers.append(provider)
-            return provider,provider.prepare(0,cap)
-        try:
-            selected,meta=prepare(args.combine=='local')
-            selection={'mode':'local' if args.combine=='local' else 'direct','dispatch_rank_cache':False}
-            measured=benchmark(selected,cap)
-            if args.combine=='auto':
-                try:
-                    candidate,candidate_meta=prepare(True)
-                except ValueError as error:
-                    # Unsupported upstream combinations retain the direct graph.
-                    selection['reason']=str(error)
-                else:
-                    candidate_measurement=benchmark(candidate,cap)
-                    use_local,comparison=select_candidate(measured,candidate_measurement)
-                    selection['benchmark']=comparison
-                    if use_local:
-                        selected,meta=candidate,candidate_meta
-                        measured=candidate_measurement
-                        selection['mode']='local'
-                    else:
-                        selection['reason']='Requires L2 <= 0.005, >= 5% aggregate gain and <= 5% regression per workload'
-            # Reuse one token's activation on this owner across its experts.
-            # Cache state is reset by each captured graph, never across tokens.
-            # Select independently for every capacity; no serving row threshold.
-            try:
-                candidate,candidate_meta=prepare(selection['mode']=='local',cache=True)
-            except ValueError as error:
-                selection['dispatch_cache_reason']=str(error)
-            else:
-                use_cache,comparison=select_candidate(measured,benchmark(candidate,cap),exact=True)
-                selection['dispatch_cache_benchmark']=comparison
-                if use_cache:
-                    selected,meta=candidate,candidate_meta
-                    selection['dispatch_rank_cache']=True
-                else:
-                    selection['dispatch_cache_reason']='Requires exact output, >= 5% aggregate gain and <= 5% regression per workload'
-            exporter.provider=selected
-            bucket=exporter.bucket(cap,meta)
-            bucket['selection']=selection
-            manifest['buckets'].append(bucket)
-            manifest['binaries']=exporter.binaries
-            (args.output/'manifest.json').write_text(json.dumps(manifest,indent=2))
-            print('EXPORTED',cap,json.dumps(selection),'binary_count',len(exporter.binaries),flush=True)
-        finally:
-            for provider in reversed(providers):provider.close()
+        bucket = export_bucket(exporter, args, layers, cap)
+        manifest['buckets'].append(bucket)
+        manifest['binaries'] = exporter.binaries
+        (args.output/'manifest.json').write_text(json.dumps(manifest, indent=2))
+        print('EXPORTED', cap, json.dumps(bucket['selection']), 'binary_count', len(exporter.binaries), flush=True)
     # A regenerated package keeps only artifacts selected by this manifest.
     # Restrict cleanup to the exporter's SHA256-named CUDA binaries.
     for path in args.output.glob('*.cubin'):
