@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <map>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -21,6 +22,29 @@ public:
         return affinity >= 0 ? affinity : next.fetch_add(1, std::memory_order_relaxed) % groups;
     }
 };
+
+// Admission may trade a resident prefix for an earlier finish on another DP
+// group. Count unfinished prefill work, not reserved KV capacity: a long cached
+// continuation can reserve many pages while requiring very little computation.
+// Ownership changes still go through the model's empty-context placement hook.
+inline int ChoosePDPrefillGroup(int owner, const std::vector<size_t> &available,
+        size_t required, const std::vector<size_t> &queuedTokens,
+        size_t inputTokens, size_t cachedTokens) {
+    if (available.empty() || available.size() != queuedTokens.size() ||
+        owner < 0 || size_t(owner) >= available.size())
+        throw std::invalid_argument("invalid PD prefill placement inputs");
+    auto cost = [&](int group) {
+        const size_t remaining = inputTokens - (group == owner ? std::min(cachedTokens, inputTokens) : 0);
+        return queuedTokens[group] > std::numeric_limits<size_t>::max() - remaining
+            ? std::numeric_limits<size_t>::max() : queuedTokens[group] + remaining;
+    };
+    int best = available[owner] >= required ? owner : -1;
+    for (int group = 0; group < int(available.size()); ++group) {
+        if (available[group] < required) continue;
+        if (best < 0 || cost(group) < cost(best)) best = group;
+    }
+    return best;
+}
 
 // Per-replica admission policy. Resource accounting and cache ownership stay
 // in the scheduler; deadlines belong to requests, never to a sliding batch.

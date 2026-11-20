@@ -1587,6 +1587,10 @@ if (UNIT_TEST)
     fastllm_add_checked_test(prefill_batch_scheduler prefill_batch_scheduler_test "ALL_PASS" 30)
     set_tests_properties(prefill_batch_scheduler PROPERTIES RUN_SERIAL TRUE)
 
+    add_executable(pd_prefill_placement_test test/basic/test_pd_prefill_placement.cpp)
+    target_include_directories(pd_prefill_placement_test PRIVATE include)
+    fastllm_add_checked_test(pd_prefill_placement pd_prefill_placement_test "PASS PD shared-prefix" 30)
+
     add_executable(naive_prefix_queue_test test/basic/test_naive_prefix_queue.cpp)
     target_link_libraries(naive_prefix_queue_test PRIVATE fastllm)
     fastllm_add_checked_test(naive_prefix_queue naive_prefix_queue_test "ALL_PASS" 30)

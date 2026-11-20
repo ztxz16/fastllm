@@ -854,12 +854,13 @@ static void TestPrefillBatch() {
 }
 
 static void TestPrefillDPBatch(int globalRequests, int perRankRequests, int perRankTokens, bool balance,
-                               bool useSessions = false) {
+                               bool useSessions = false, bool sharedPrefix = false) {
     class GroupedModel final : public BatchStateModel {
         std::map<int, int> promptOwners;
         std::map<const Data *, int> owners;
       public:
-        int balancedBatches = 0, firstOwnerTokens = 0;
+        int balancedBatches = 0, firstOwnerTokens = 0, moved = 0;
+        bool sharedPrefix = false;
         int maxGlobal, maxSequences, maxTokens;
         int PDGroupCount() const override { return 2; }
         int PDRequestGroup(const ResponseContext &context) const override {
@@ -871,11 +872,26 @@ static void TestPrefillDPBatch(int globalRequests, int perRankRequests, int perR
             if (context->requestMetadata.sessionKey.empty()) {
                 // Anonymous arrivals start on owners 0,0,1,1, including on retry.
                 const int prompt = context->allTokens.front();
-                owner = promptOwners.emplace(prompt, (promptOwners.size() / 2) % 2).first->second;
+                owner = sharedPrefix ? 0 : promptOwners.emplace(prompt, (promptOwners.size() / 2) % 2).first->second;
             }
             Check(owner == 0 || owner == 1, "missing PD owner");
             context->intParams["owner"] = owner;
             owners[&context->pastKeyValues[0].first] = owner;
+        }
+        int QueryPagedPrefixCacheExtra(ResponseContext *, int) const override {
+            return sharedPrefix ? 1 : 0;
+        }
+        bool SelectPDRequestGroup(ResponseContext &context, const std::vector<size_t> &available,
+                                  size_t required) override {
+            const int owner = PDRequestGroup(context);
+            if (available.at(owner) >= required) return true;
+            if (!sharedPrefix || available.at(1 - owner) < required) return false;
+            Check(context.pdPrefillGroup < 0, "placement moved a session");
+            for (const auto &kv : context.pastKeyValues)
+                Check(kv.first.dims.empty() && kv.second.dims.empty(), "placement migrated live KV");
+            context.intParams["owner"] = owners[&context.pastKeyValues.front().first] = 1 - owner;
+            ++moved;
+            return true;
         }
         void OnResponseContextRemoved(ResponseContext *context) override {
             owners.erase(&context->pastKeyValues[0].first);
@@ -906,6 +922,7 @@ static void TestPrefillDPBatch(int globalRequests, int perRankRequests, int perR
     const auto endpoint = port.Address(); port.Stop();
     SetMaxTokens(64);
     model.SetChunkedPrefillSize(balance ? 2 : 8); // An oversized model chunk cannot raise a global cap.
+    model.sharedPrefix = sharedPrefix;
     model.maxGlobal = globalRequests;
     model.maxSequences = perRankRequests ? perRankRequests : globalRequests;
     model.maxTokens = perRankTokens ? perRankTokens : 2;
@@ -959,6 +976,7 @@ static void TestPrefillDPBatch(int globalRequests, int perRankRequests, int perR
         Check(model.live == 0 && model.liveTokens == 0, "DP selection leaked request/credit");
     }
     Check(model.balancedBatches >= 2, "PD did not select across nonadjacent owners");
+    if (sharedPrefix && !useSessions) Check(model.moved > 0, "shared prefix stranded work on one rank");
     if (!balance && perRankTokens > 2)
         Check(model.firstOwnerTokens == 3, "explicit rank token budget was clamped to the global average");
     model.StopPD();
@@ -1508,6 +1526,7 @@ int main(int argc, char **argv) {
         TestPrefillBatch();
         TestPrefillDPBatch(4, 0, 0, true);   // Legacy implicit token split.
         TestPrefillDPBatch(4, 1, 0, true, true); // Session queues with only the sequence cap overridden.
+        TestPrefillDPBatch(4, 0, 0, true, false, true); // Anonymous requests share one resident owner.
         TestPrefillDPBatch(4, 0, 1, true);   // Override only the token cap.
         TestPrefillDPBatch(2, 1, 1, true);   // A hot owner precedes candidates past the global cutoff.
         TestPrefillDPBatch(3, 2, 3, false);  // Rank cap above the average, independent of balancing.

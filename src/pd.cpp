@@ -405,9 +405,16 @@ struct PDRuntime {
     size_t tokenCapacity = 0;
     std::unique_ptr<fastkv::Budget> slots;
     std::vector<std::unique_ptr<fastkv::Budget>> groupTokens;
-    std::shared_ptr<void> ReserveGroup(basellm &model, ResponseContext &context, size_t required) {
+    std::shared_ptr<void> ReserveGroup(basellm &model, ResponseContext &context, size_t required,
+                                       int preferred = -1) {
         std::vector<size_t> available;
         for (const auto &budget : groupTokens) available.push_back(tokenCapacity - budget->Used());
+        if (preferred >= 0 && preferred != model.PDRequestGroup(context)) {
+            std::vector<size_t> candidate(available.size(), 0);
+            candidate.at(preferred) = available.at(preferred);
+            if (model.SelectPDRequestGroup(context, candidate, required))
+                return groupTokens.at(model.PDRequestGroup(context))->Reserve(required);
+        }
         if (!model.SelectPDRequestGroup(context, available, required))
             throw fastkv::CapacityBusy("PD request group has no capacity");
         const int group = model.PDRequestGroup(context);
@@ -927,6 +934,15 @@ void PDRuntime::RunPrefill(basellm &model) {
                 toScan.push_back(queue.size());
                 outstanding += queue.size();
             }
+            // Snapshot unfinished compute once per admission round. New entries
+            // join the estimate after cache restoration determines their actual work.
+            std::vector<size_t> queuedTokens;
+            if (outstanding && groups > 1 && model.prefillScheduling.balanceDP) {
+                queuedTokens.resize(groups);
+                for (int g = 0; g < groups; ++g)
+                    for (const auto *queue : {&ranks[g].active, &ranks[g].prepared})
+                        for (const auto &item : *queue) queuedTokens[g] += item->remaining;
+            }
             // Visit known session owners in turn before allocating a context.
             // A full rank or an oversized head cannot block another rank.
             while (outstanding && liveContexts < contextLimit && !stopping) {
@@ -965,7 +981,16 @@ void PDRuntime::RunPrefill(basellm &model) {
                     context.generationConfig.output_token_limit = 1;
                     context.generationConfig.input_token_length = request->input.size() + 1;
                     model.OnResponseContextCreated(&context);
-                    try { request->groupAdmission = ReserveGroup(model, context, request->reservation); }
+                    int preferred = -1;
+                    if (request->affinity < 0 && !queuedTokens.empty()) {
+                        std::vector<size_t> available(groups);
+                        for (int g = 0; g < groups; ++g)
+                            if (canPrepare(ranks[g], count)) available[g] = tokenCapacity - groupTokens[g]->Used();
+                        const auto cached = model.QueryPagedPrefixCacheExtra(&context, int(request->input.size()));
+                        preferred = ChoosePDPrefillGroup(model.PDRequestGroup(context), available,
+                            count, queuedTokens, request->input.size(), std::max(0, cached));
+                    }
+                    try { request->groupAdmission = ReserveGroup(model, context, count, preferred); }
                     catch (const fastkv::CapacityBusy &) {
                         deferAdmission(request, lane);
                         continue;
@@ -995,6 +1020,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                         // cache retries from prepared; import remains on this lane.
                         startHostRestore(request);
                         rank.prepared.push_back(request); rank.preparedTokens += request->reservation;
+                        if (!queuedTokens.empty()) queuedTokens[owner] += request->remaining;
                         continue;
                     }
                     request->SetRestoreBytes(0);
@@ -1028,6 +1054,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                         rank.prepared.push_back(request);
                         rank.preparedTokens += request->reservation;
                     }
+                    if (!queuedTokens.empty()) queuedTokens[owner] += request->remaining;
                 } catch (...) {
                     auto error = std::current_exception();
                     retire(request);
