@@ -13,6 +13,7 @@ import importlib.metadata as importlib_metadata
 import logging
 import site
 import sys
+from array import array
 from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
@@ -2473,7 +2474,7 @@ class model:
                     cached = self.text_input_token_cache.get(cache_key)
                     if cached is not None:
                         self.text_input_token_cache.move_to_end(cache_key)
-                        input_ids = list(cached)
+                        input_ids = cached
                     else:
                         pending = self.text_input_token_inflight.get(cache_key)
                         if pending is None:
@@ -2483,7 +2484,7 @@ class model:
                             owner = False
 
             if input_ids is None and not owner:
-                input_ids = list(pending.result())
+                input_ids = pending.result()
             elif input_ids is None:
                 try:
                     input_ids = apply_hf_chat_template(
@@ -2497,6 +2498,8 @@ class model:
                         thinking_effort = thinking_effort,
                         tool_choice = tool_choice,
                         chat_template_kwargs = chat_template_kwargs)
+                    # The cache, waiters and launch path only read these native C ints.
+                    input_ids = array('i', input_ids)
                 except BaseException as error:
                     if cache_key is not None:
                         with self.text_input_token_cache_lock:
@@ -2504,15 +2507,14 @@ class model:
                             pending.set_exception(error)
                     raise
                 if cache_key is not None:
-                    cached_input_ids = tuple(input_ids)
                     with self.text_input_token_cache_lock:
-                        self.text_input_token_cache[cache_key] = cached_input_ids
+                        self.text_input_token_cache[cache_key] = input_ids
                         self.text_input_token_cache.move_to_end(cache_key)
                         while (len(self.text_input_token_cache) >
                                self.text_input_token_cache_limit):
                             self.text_input_token_cache.popitem(last = False)
                         self.text_input_token_inflight.pop(cache_key, None)
-                        pending.set_result(cached_input_ids)
+                        pending.set_result(input_ids)
             # The OpenAI server asks for the prompt token count immediately
             # before launching the same request.  Keep that exact tokenization
             # for the launch path instead of rendering and tokenizing the chat
@@ -2526,7 +2528,7 @@ class model:
                 "thinking_effort": thinking_effort,
                 "tool_choice": copy.deepcopy(tool_choice),
                 "chat_template_kwargs": copy.deepcopy(chat_template_kwargs),
-                "input_ids": list(input_ids),
+                "input_ids": input_ids,
             }
             return len(input_ids)
         else:
@@ -3169,7 +3171,10 @@ class model:
                 handle = self._launch_clover(input, max_length, min_length, do_sample, top_p,
                     top_k, temperature, repeat_penalty, stop_token_ids, clover_options)
             else:
-                handle = launch_text("launch_response_llm_model", self.model, len(input), (ctypes.c_int * len(input))(*input),
+                native_type = ctypes.c_int * len(input)
+                native_ids = (native_type.from_buffer(input) if isinstance(input, array) and input.typecode == 'i'
+                              else native_type(*input))
+                handle = launch_text("launch_response_llm_model", self.model, len(input), native_ids,
                                                             max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                             False, stop_token_len, stop_token_list)
             if (self.save_history):

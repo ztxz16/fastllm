@@ -1,6 +1,7 @@
 """Counted chat requests must launch those exact IDs with native KV history on."""
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import ctypes
 import json
 from pathlib import Path
 import sys
@@ -125,11 +126,26 @@ class CountedHistoryTokensTest(unittest.TestCase):
                             'name': 'read', 'arguments': '{"path":"/tmp/a"}'}}]}]
         m = self.model
         m.get_input_token_len(messages)
-        expected = m.thread_local_obj.pending_text_input_token_cache['input_ids'][:]
+        expected = list(m.thread_local_obj.pending_text_input_token_cache['input_ids'])
         with patch.object(m.tokenizer_cache, 'tokenize_with_cache',
                           side_effect=AssertionError('Repeated tokenization')):
             m.launch_stream_response(messages)
         self.assertEqual(self.ids[-1], expected)
+
+    def test_exact_cache_hit_reuses_submitted_token_buffer(self):
+        m = self.model
+        launch = Mock(return_value=42)
+        self.native.launch_response_llm_model_with_session = launch
+        with patch.object(m.hf_tokenizer, 'apply_chat_template',
+                          wraps=m.hf_tokenizer.apply_chat_template) as render:
+            for session in ('first', 'second'):
+                self.assertEqual(m.get_input_token_len(self.messages), 1)
+                m.launch_stream_response(self.messages, session_key=session)
+        render.assert_called_once()
+        first, second = (call.args[2] for call in launch.call_args_list)
+        self.assertEqual(first[:], [1000])
+        self.assertEqual(second[:], [1000])
+        self.assertEqual(ctypes.addressof(first), ctypes.addressof(second))
 
     def test_changed_request_rejects_one_shot_ids(self):
         changes = [{'enable_thinking': False}, {'add_generation_prompt': False},
