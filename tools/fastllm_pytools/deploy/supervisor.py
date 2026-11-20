@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 import urllib.error
 import urllib.request
 import uuid
@@ -108,7 +109,7 @@ def stop(config):
 
 
 def check_ports(config):
-    for host, port in [('127.0.0.1', r['port']) for r in config['replicas']] + [
+    for host, port in [('127.0.0.1', r['port']) for r in config['replicas'] if r['url']] + [
             (config['router']['host'], config['router']['port'])]:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
         for family, kind, proto, _, address in infos:
@@ -121,7 +122,7 @@ def check_ports(config):
 
 def start(config):
     require_linux()
-    if importlib.util.find_spec('aiohttp') is None:
+    if config['router'].get('transport') != 'fastipc' and importlib.util.find_spec('aiohttp') is None:
         raise RuntimeError('The deploy router requires aiohttp; install ftllm[deploy] in this Python environment')
     root = Path(config['state_dir'])
     with locked(root):
@@ -136,8 +137,6 @@ def start(config):
         directory = root/'runs'/f'{stamp}_{uuid.uuid4().hex[:8]}'
         directory.mkdir(parents=True, mode=0o700)
         write_json(directory/'config.json', config)
-        write_json(directory/'commands.json', {r['name']: {'argv': r['command'], 'cwd': r['cwd'], 'env': r['env']}
-                                             for r in config['replicas']})
         source_dir = Path(__file__).parent
         sources = directory/'sources'
         sources.mkdir(mode=0o700)
@@ -188,6 +187,8 @@ def supervise(directory):
     config = read(directory/'config.json')
     manifest_path = directory/'manifest.json'
     manifest = read(manifest_path)
+    ipc_directory = (tempfile.TemporaryDirectory(prefix='ftllm-ipc-', dir='/tmp')
+                     if config['router'].get('transport') == 'fastipc' else None)
     children = {}
     stopping = False
     def requested(*_):
@@ -242,14 +243,36 @@ def supervise(directory):
         print('Deployment resource limits: ' + json.dumps(manifest['resource_limits']), flush=True)
         print('Deployment NUMA bindings: ' + json.dumps(manifest.get('numa', {})), flush=True)
         save()
-        for replica in config['replicas']:
+        sockets = Path(ipc_directory.name) if ipc_directory else None
+        def wait_worker(rank, replica, timeout):
+            if sockets is None:
+                return wait_ready(replica['url'] + '/v1/models', timeout)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                check_children()
+                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as probe:
+                    try:
+                        probe.connect(str(sockets / str(rank)))
+                        return
+                    except (FileNotFoundError, ConnectionRefusedError):
+                        time.sleep(.1)
+            raise TimeoutError(f'FastIPC replica {rank} did not become ready')
+
+        timeout = config['startup_timeout_seconds']
+        if sockets:
+            for rank, replica in enumerate(config['replicas']):
+                replica['command'].extend(['--deploy-fastipc', str(sockets / str(rank)),
+                                           str(replica['max_inflight']), str(config['router']['max_body_bytes'])])
+        write_json(directory/'commands.json', {r['name']: {'argv': r['command'], 'cwd': r['cwd'], 'env': r['env']}
+                                              for r in config['replicas']})
+        for rank, replica in enumerate(config['replicas']):
             launch(replica['name'], replica['command'], replica['env'], replica['cwd'])
             if config['sequential_start']:
-                wait_ready(replica['url'] + '/v1/models', config['startup_timeout_seconds'])
+                wait_worker(rank, replica, timeout)
         if not config['sequential_start']:
-            deadline = time.monotonic() + config['startup_timeout_seconds']
-            for replica in config['replicas']:
-                wait_ready(replica['url'] + '/v1/models', max(.01, deadline-time.monotonic()))
+            deadline = time.monotonic() + timeout
+            for rank, replica in enumerate(config['replicas']):
+                wait_worker(rank, replica, max(.01, deadline - time.monotonic()))
         for replica in config['replicas']:
             binding = replica.get('numa_binding', {})
             if binding.get('enabled'):
@@ -257,7 +280,11 @@ def supervise(directory):
                 manifest['numa'][replica['name']]['after_load'] = snapshot
                 print(f"NUMA after loading {replica['name']}: " + json.dumps(snapshot), flush=True)
         save()
-        launch('router', [sys.executable, '-m', __package__ + '.router', '--run-dir', str(directory)], {}, str(directory))
+        if sockets:
+            launch('router', [sys.executable, '-m', __package__ + '.ipc_gateway', str(directory), str(sockets)],
+                   {'CUDA_VISIBLE_DEVICES': ''}, str(directory))
+        else:
+            launch('router', [sys.executable, '-m', __package__ + '.router', '--run-dir', str(directory)], {}, str(directory))
         host = config['router']['host']
         if host in ('0.0.0.0', ''):
             host = '127.0.0.1'
@@ -286,6 +313,8 @@ def supervise(directory):
                 manifest['phase'] = 'stopped'
         except BaseException as error:
             manifest.update(phase='failed', cleanup_error=repr(error))
+        if ipc_directory is not None:
+            ipc_directory.cleanup()
         manifest['finished_at'] = time.time()
         save()
 

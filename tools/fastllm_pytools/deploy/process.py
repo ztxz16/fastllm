@@ -16,6 +16,10 @@ def configure_nofile(config, apply=False):
     # only downstream sockets. Reserve descriptors for health, logs and idle
     # connections. This is a capacity estimate, not a global connection cap.
     required = 2 * active + queued + 256
+    if config['router'].get('transport') == 'fastipc':
+        # Downstream HTTP sockets, one overflow fd per admitted large request,
+        # and a persistent control socket + shared mapping per replica.
+        required += 2 * len(config['replicas'])
     requested = config.get('nofile')
     if requested is not None and requested < required:
         raise ValueError(f'nofile={requested} is below the deployment capacity requirement {required}')

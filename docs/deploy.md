@@ -1,6 +1,6 @@
 # 单机多副本部署：ftllm deploy
 
-`ftllm deploy` 启动多个独立模型服务和一个流式 HTTP 路由。每个模型服务仍使用
+`ftllm deploy` 对外提供一个流式 HTTP 入口，按请求分配给本机模型副本。每个模型服务仍使用
 原有 `ftllm.server`，TP/EP、KVMem、模型加载和生成行为由原有服务处理。
 `ftllm serve` 的入口、默认参数和单实例行为不变。首版进程管理支持 Linux。
 
@@ -61,7 +61,7 @@
   显式重复的 GPU 标识和重复端口会被拒绝。
 - 工作目录、相对路径以部署配置所在目录为基准；`serve_args` 内的路径由原服务按该
   工作目录解释。每个副本可设置自己的 `env`，覆盖公共 `env`。
-- 模型服务统一绑定回环地址；API 入口由 `router.host/port` 控制。不要在 `serve_args`
+- HTTP 模型副本绑定回环地址；API 入口由 `router.host/port` 控制。不要在 `serve_args`
   中再传 `--host`、`--port` 或 `--startup-progress`。
 - 路由每副本在途上限默认使用显式的 `--max_batch`。自动 batch 时必须配置
   `router.max_inflight_per_replica`；也可用 `replicas[].max_inflight` 限制某个副本。
@@ -69,6 +69,27 @@
 - 选填 `worker.python` 可指定 Python，默认使用当前解释器。选填 `worker.script`
   可使用外部适配脚本替代 `python -m ftllm.server`，参数仍使用同一套 serve 参数。
   例如 SWE 的 token-count 适配器可以留在测试仓库中；deploy 不依赖 SWE。
+
+### Linux 同机 FastIPC
+
+省略所有副本的 `port` 和 `router.transport` 即使用 FastIPC。配置了副本端口时默认使用 HTTP，保留每个副本的直连地址。可显式设置 `router.transport` 为 `fastipc` 或 `http`；HTTP 要求每个副本都有端口，FastIPC 仅监听公共入口。例如，八张卡上部署两个 TP4/EP4 副本：
+
+```json
+{
+  "schema_version": 1,
+  "name": "local-tp4",
+  "serve_args": ["/models/model", "--tp", "4", "--ep", "4", "--max_batch", "256"],
+  "replicas": [
+    {"name": "r0", "gpus": [0, 1, 2, 3]},
+    {"name": "r1", "gpus": [4, 5, 6, 7]}
+  ],
+  "router": {"host": "127.0.0.1", "port": 8080}
+}
+```
+
+公共入口按会话分配请求，响应头 `X-FastLLM-Replica` 标识执行副本。每个副本在独立进程中加载一份模型，自行完成分词、工具约束、生成和流式响应。入口进程不加载权重。采样、模型接口与普通 `ftllm server` 共用实现。亲和映射保存在内存中，KV 保存在对应副本。FastIPC 网关重启后重新建立映射；需要副本 HTTP 直连或路由的逐请求 `routing/requests.jsonl` 时请选择 HTTP。自定义 `worker.script` 可以注册服务端点，启动时调用 `ftllm.server.parse_args()` 和 `ftllm.server.fastllm_server(args)`。
+
+入口与每个副本在启动时建立一条私有 Unix 连接并共享一个有界内存池。每路请求占用一个槽，传输请求体和响应字节；较长的请求按长度借用共享页，副本读取后即可归还。共享页不足时使用临时映射。每个流独立确认读进度，副本按当前就绪的流批量通知。断开连接时入口会取消对应任务，副本确认终止后才能复用槽位。FastIPC 使用 Linux 系统接口，依赖随 FastLLM 构建的原生库。
 
 ## 命令与进程归属
 
@@ -128,13 +149,13 @@ ftllm deploy stop   --config deployment.json
 supervisor 持续拥有这些进程，终端退出不影响已启动服务。
 
 默认按顺序加载副本以减少同时加载产生的内存峰值，`sequential_start=false` 可并行
-加载。就绪检查使用原生 `/v1/models`，不发送生成请求。启动失败会清理已启动的本轮
+加载。HTTP 使用原生 `/v1/models` 确认就绪，FastIPC 在模型初始化后与副本完成共享池握手。启动失败会清理已启动的本轮
 进程；服务运行中任一子进程退出会停止其他本轮进程并标记失败，不自动循环重启。
-HTTP 健康检查失败会在路由状态中体现，并阻止向不健康副本分配新请求。
+HTTP 定期探测副本接口；FastIPC 根据常驻连接状态报告健康。连接中断后，新会话只分给仍在线的副本。
 
-启动前检查 Linux `RLIMIT_NOFILE`。每个在途代理请求需要客户端、后端各一个连接，
+启动前检查 Linux `RLIMIT_NOFILE`。HTTP 的每个在途代理请求需要客户端、后端各一个连接，
 排队请求只占客户端连接；自动预算为 `2 × 总在途容量 + 总排队容量 + 256`，
-最后一项给健康检查、日志及空闲连接留出余量。独立 supervisor 会按需提高软限制，
+最后一项给健康检查、日志及空闲连接留出余量。FastIPC 按每路一个客户端和一个溢出文件描述符估算，每副本另留两个描述符用于常驻通道和共享映射。独立 supervisor 会按需提高软限制，
 所有模型进程和路由继承该限制；已有更高限制保持不变，不修改硬限制或调用方进程。
 硬限制不足时在加载模型前报错，应在启动环境或容器中提高限制后再启动。
 
@@ -171,7 +192,7 @@ HTTP 健康检查失败会在路由状态中体现，并阻止向不健康副本
   `queue_limit_per_replica`。
 - 会话表与推理槽位分开计数。会话空闲超时或表满时回收空闲 LRU，正在排队/请求的
   会话不会被回收。回收后新请求可能分到另一副本，影响缓存命中但不改写消息。
-- 上游响应读完后即释放副本在途名额，再结束下游响应。转发期间保留网络反压，
+- HTTP 路由读完上游响应后释放名额。FastIPC 在读取请求体前占用路由名额，下游响应结束或取消后归还；慢连接的流控按请求独立。转发期间保留网络反压，
   取消时关闭上游连接并回收名额。
 
 管理接口：
@@ -191,6 +212,7 @@ HTTP 健康检查失败会在路由状态中体现，并阻止向不健康副本
 
 ```sh
 python -m unittest discover -s test/api -p 'test_deploy*.py' -v
+python -m unittest discover -s test/api -p 'test_fastipc.py' -v
 ```
 
 测试使用假 HTTP worker，验证参数复用、默认值保持、进程回滚/崩溃清理、停止启动中
