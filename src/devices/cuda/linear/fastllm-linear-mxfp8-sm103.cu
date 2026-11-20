@@ -89,16 +89,16 @@ bool Descriptor(Desc &d, void *ptr, CUtensorMapDataType type, int inner, int out
 }
 
 template <int M, int Cluster> struct Projection {
-    // Large-M prefill uses the 128x256x128, five-stage Blackwell configuration
+    // Large-M projections use the 128x256x128, five-stage Blackwell configuration
     // with B multicast. Small rows use the transposed MMA and A multicast.
-    static constexpr bool Prefill = M == 128;
-    static constexpr int N = Prefill ? 256 : 128;
-    static constexpr int Stages = Prefill ? 5 : M == 16 ? (Cluster == 2 ? 12 : 11) : 10;
-    static constexpr int Shared = Prefill ? 205116 : 230204;
+    static constexpr bool LargeTile = M == 128;
+    static constexpr int N = LargeTile ? 256 : 128;
+    static constexpr int Stages = LargeTile ? 5 : M == 16 ? (Cluster == 2 ? 12 : 11) : 10;
+    static constexpr int Shared = LargeTile ? 205116 : 230204;
     static auto Kernel() {
         return &dg::sm100_fp8_fp4_gemm_1d1d_impl<cute::UMMA::Major::K, cute::UMMA::Major::K, 32, 32, 32, 0, 0,
                                                  0, M, N, 128, 1, 128, 128, 128, Stages, 2, 128, 128, Cluster,
-                                                 (!Prefill && Cluster == 2), kSMs, !Prefill, true, dg::GemmType::Normal, false,
+                                                 (!LargeTile && Cluster == 2), kSMs, !LargeTile, true, dg::GemmType::Normal, false,
                                                  cutlass::float_e4m3_t, cutlass::float_e4m3_t,
                                                  cutlass::bfloat16_t, dg::epilogue::operators::Identity>;
     }
@@ -108,11 +108,11 @@ template <int M, int Cluster> struct Projection {
     }
     static bool Run(void *q, void *w, void *sa, void *sw, void *y, int rows, int n, int k, int pitch) {
         Desc a, b, as, bs, c;
-        if (!Descriptor(a, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, rows, 1, 128, Prefill ? M : M / Cluster, true) ||
+        if (!Descriptor(a, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, rows, 1, 128, LargeTile ? M : M / Cluster, true) ||
             !Descriptor(b, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, n, 1, 128, 128, true) ||
             !Descriptor(as, sa, CU_TENSOR_MAP_DATA_TYPE_INT32, pitch, k / 128, 4, 128, 1, false) ||
             !Descriptor(bs, sw, CU_TENSOR_MAP_DATA_TYPE_INT32, n, k / 128, 4, N, 1, false) ||
-            !Descriptor(c, y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, n, rows, 2, 64, Prefill ? M : 16, true))
+            !Descriptor(c, y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, n, rows, 2, 64, LargeTile ? M : 16, true))
             return false;
         cudaLaunchAttribute attr{};
         attr.id = cudaLaunchAttributeClusterDimension;
@@ -130,27 +130,26 @@ template <int M, int Cluster> struct Projection {
         return true;
     }
 };
-bool Available(int device, bool capturing) {
-    static thread_local std::map<int, bool> ready;
-    auto it = ready.find(device);
-    if (it != ready.end()) return it->second;
-    if (capturing) return false;
+struct ProjectionSupport {
+    bool smallTile = false;
+    bool largeTile = false;
+};
+
+ProjectionSupport GetProjectionSupport(int device, bool capturing) {
+    static thread_local std::map<int, ProjectionSupport> cache;
+    auto it = cache.find(device);
+    if (it != cache.end()) return it->second;
+    if (capturing) return {};
     int sms = 0;
-    const bool ok = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
-                    sms == kSMs && Projection<16, 1>::Configure() && Projection<16, 2>::Configure() &&
-                    Projection<32, 1>::Configure() && Projection<32, 2>::Configure();
-    if (!ok) cudaGetLastError();
-    ready.emplace(device, ok);
-    return ok;
-}
-bool PrefillAvailable(int device) {
-    static thread_local std::map<int, bool> ready;
-    auto [it, inserted] = ready.try_emplace(device, false);
-    if (inserted) {
-        it->second = Projection<128, 2>::Configure();
-        if (!it->second) cudaGetLastError();
-    }
-    return it->second;
+    ProjectionSupport support;
+    support.smallTile = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+                        sms == kSMs && Projection<16, 1>::Configure() && Projection<16, 2>::Configure() &&
+                        Projection<32, 1>::Configure() && Projection<32, 2>::Configure();
+    // Configure both tile sizes before capture, even when warmup uses a single row.
+    if (support.smallTile) support.largeTile = Projection<128, 2>::Configure();
+    if (!support.largeTile) cudaGetLastError();
+    cache.emplace(device, support);
+    return support;
 }
 } // namespace
 
@@ -172,7 +171,8 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     auto *state = fastllm_bf16_lt::GetState(device, true);
     if (!state) return false;
     const bool capturing = FastllmCudaGraphIsCapturing();
-    if (!Available(device, capturing) || !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device)) return false;
+    const auto support = GetProjectionSupport(device, capturing);
+    if (!support.smallTile || !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device)) return false;
     auto *base = static_cast<uint8_t *>(capturing      ? fastllm_bf16_lt::CaptureWorkspace(*state)
                                         : state->eager ? state->eager->data
                                                        : nullptr);
@@ -203,15 +203,18 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     bool paired = ((n + 127) / 128) % 2 == 0;
     // A paired, non-transposed 128x256 tile shares B across two M tiles.
     // Keep the short-row kernels for tails and shapes without a full cluster.
-    const bool prefill = !capturing && rows >= 1024 && n % 256 == 0 && limit >= 256 && PrefillAvailable(device);
+    const bool canUseLargeTile = support.largeTile && n % 256 == 0 && limit >= 256;
     for (int start = 0; start < rows;) {
         int count = std::min(rows - start, limit);
         // Multicast needs an even number of M tiles. A partially filled
         // second tile is legal. For a short, narrow GEMM, splitting off
         // a lone tile costs more than using the existing single-launch path.
         const bool pairedM = ((count - 1) / 128 + 1) % 2 == 0;
-        const bool fullWave = int64_t(count / 128) * (n / 256) >= kSMs;
-        const bool largeTile = prefill && count >= 256 && (pairedM || fullWave);
+        const int64_t tiles = int64_t(count / 128) * (n / 256);
+        // At 64 complete output tiles, sharing weights across M pays off even
+        // for a 256-row graph. Narrow projections retain short-row parallelism.
+        const bool enoughWork = tiles >= 64 || (!capturing && rows >= 1024);
+        const bool largeTile = canUseLargeTile && count >= 256 && enoughWork && (pairedM || tiles >= kSMs);
         if (largeTile && !pairedM) count = count / 256 * 256;
         const int pitch = (count + 3) / 4 * 4;
         const int weightTiles = start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;

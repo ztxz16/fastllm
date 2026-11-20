@@ -83,7 +83,7 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
     Require(supported == quantized, "backend eligibility mismatch");
     Check(cudaDeviceSynchronize());
     std::vector<uint16_t> eager;
-    if (m >= 1024 && n % 256 == 0) {
+    if (m >= 256 && n % 256 == 0) {
         eager.resize(size_t(m) * n);
         Check(cudaMemcpy(eager.data(), y.cudaData, eager.size() * sizeof(uint16_t), cudaMemcpyDeviceToHost));
     }
@@ -115,8 +115,8 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
                 reference += expected * expected;
             }
             const double relative = std::sqrt(diff / std::max(reference, 1e-30));
-            std::printf("prefill versus graph, full output rel_l2=%.8f\n", relative);
-            Require(relative < 0.004, "eager prefill output disagrees with captured projection");
+            std::printf("eager versus graph, full output rel_l2=%.8f\n", relative);
+            Require(relative < 0.004, "eager output disagrees with captured projection");
         }
         double error = 0, norm = 0, bf16Error = 0, bf16Norm = 0;
         for (int row : {0, m / 2, m - 1}) {
@@ -202,6 +202,8 @@ int main() {
         Run(8, 1856, 4096);
         Run(32, 4096, 1024);
         Run(33, 320, 512);
+        Run(256, 8192, 512); // wide projection, exactly 64 large output tiles
+        Run(257, 8192, 512); // unpaired M tail at the same width
         Run(1933, 512, 512); // partially filled second M tile
         Run(2061, 4096, 4096); // bounded lease needs multiple GEMMs
         Run(2061, 4096, 4096, false, false, true); // bulk clusters plus a short tail
