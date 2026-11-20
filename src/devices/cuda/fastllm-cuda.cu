@@ -18551,7 +18551,8 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,
                                     int *output, int *acceptedDraftTokens,
-                                    int batch, int draftTokens, int vocabSize, bool topKFirst) {
+                                    int batch, int draftTokens, int vocabSize, bool topKFirst,
+                                    FastllmMtpAcceptedCallback callback = nullptr, void *context = nullptr) {
     if (!logits || !proposalProbs || !temperatures || !topKs || !topPs ||
         !draftTokenIds || !output || !acceptedDraftTokens || batch <= 0 ||
         draftTokens <= 0 || vocabSize <= 0) return false;
@@ -18563,7 +18564,7 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
     if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocabSize)) return false;
     FastllmCudaCopyFromHostToDevice(ws.draftIds, (void*)draftTokenIds,
                                    batch * draftTokens * sizeof(int));
-    if (batch <= 8 && draftTokens <= 8 && vocabSize >= 16384)
+    if (FastllmMtpUsesSmallRejection(batch, draftTokens, vocabSize))
         return FastllmCudaMtpRejectionFromProbabilities(ws.a, proposalProbs,
             ws.draftIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize);
     cudaStream_t stream = cudaStreamPerThread;
@@ -18579,6 +18580,7 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
     if (state != cudaSuccess) return false;
     // emitted counts the accepted prefix; accepted also counts later positions
     // after the first rejection and must never be used as the commit length.
+    if (callback) callback(context, ws.emitted);
     std::vector<int> result(rows + batch);
     FastllmCudaCopyFromDeviceToHost(result.data(), ws.output, result.size() * sizeof(int));
     DeviceSync();
@@ -18592,6 +18594,15 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
                 output[b * (draftTokens + 1) + i] >= vocabSize) return false;
     }
     return true;
+}
+
+bool FastllmCudaMtpRejectionWithAccepted(float *logits, float *proposalProbs,
+        const float *temperatures, const int *topKs, const float *topPs, const int *draftTokenIds,
+        int *output, int *acceptedDraftTokens, int batch, int draftTokens, int vocabSize,
+        FastllmMtpAcceptedCallback callback, void *context) {
+    if (!callback || FastllmMtpUsesSmallRejection(batch, draftTokens, vocabSize)) return false;
+    return FastllmCudaMtpRejectionSamplingImpl(logits, proposalProbs, temperatures, topKs, topPs,
+        draftTokenIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize, true, callback, context);
 }
 
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,

@@ -196,6 +196,17 @@ struct FastllmNaiveCacheCommit {
 void FastllmCudaNaiveCommitBoundSwa(const void *const *bindings, const int *accepted,
         int rows, int layers, uint64_t slidingMask, int tableStride, int keyBytes, int valueBytes);
 void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches);
+// Layer-major, then request. K/V point to the first writable row.
+struct FastllmNaiveDraftKVSlot {
+    void *key, *value;
+    const float *norm;
+    int position;
+    int *targetPair = nullptr;
+};
+bool FastllmCudaNaivePrepareDraftKVSlots(const std::vector<FastllmNaiveDraftKVSlot> &slots, fastllm::Data &scratch);
+void FastllmCudaNaiveWriteAcceptedDraftKV(const fastllm::Data &raw, const void *slots, const int *emitted,
+    int batch, int rows, int layers, int heads, int dim, float eps, float theta);
+
 struct FastllmNaiveDraftKVUpdate {
     const fastllm::Data *raw, *norm;
     fastllm::Data *key, *value;

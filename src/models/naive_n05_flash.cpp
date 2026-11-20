@@ -2314,8 +2314,9 @@ Data NaiveN05FlashModel::RunTarget(
                 addMlpResidual(moeOutput, !(tensorParallel && tpEp8MegaState));
         }
         prefillNormReady = fusePrefillNorm && mlpNormWeight;
-        const bool captureHidden = capture && capture->collectHidden &&
-            std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) != draftTargetLayers.end();
+        const auto featureLayer = capture && capture->collectHidden
+            ? std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) : draftTargetLayers.end();
+        const bool captureHidden = featureLayer != draftTargetLayers.end();
         if (localMoe) {
             // The vocabulary head and draft feature consumers require world
             // order. No intermediate attention or MoE layer needs that gather.
@@ -2327,10 +2328,17 @@ Data NaiveN05FlashModel::RunTarget(
             }
             // Feature capture needs every row. Ordinary prefill passes only
             // the last local row of each sequence to the vocabulary head.
-            if (captureHidden || (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead))
+            if ((captureHidden && !capture->packedOutput) || (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead))
                 attentionParallel->transfer->Collect(tpRank, hidden.cudaData, buf.hidden.cudaData, size_t(embed_dim) * 2);
         }
-        if (captureHidden && tpRank <= 0) {
+        if (captureHidden && capture->packedOutput) {
+            const size_t column = featureLayer - draftTargetLayers.begin();
+            auto dst = (uint16_t *)capture->packedOutput->cudaData + column * embed_dim;
+            const size_t rowBytes = (size_t)embed_dim * sizeof(uint16_t);
+            AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(dst,
+                draftTargetLayers.size() * rowBytes, hidden.cudaData, rowBytes, rowBytes, hidden.dims[1]),
+                "Cannot capture local draft features");
+        } else if (captureHidden && tpRank <= 0) {
             Data &featureHidden = localMoe ? buf.hidden : hidden;
             if (workspace && capture->borrowOutputs && !capture->verifying) {
                 // Internal prefill consumers finish before the next forward.

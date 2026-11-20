@@ -633,7 +633,7 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
 
 bool NaiveN05FlashModel::CommitBoundVerifyCaches(
         const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
-        const std::vector<int> &past, const std::vector<int> &counts) {
+        const std::vector<int> &past, const std::vector<int> &counts, const std::vector<char> *written) {
 #ifdef USE_CUDA
     if (!attentionParallel || !tpServingState || !tpServingState->verifyWidth ||
         block_cnt > 64 || window != 128 || caches.empty()) return false;
@@ -661,6 +661,9 @@ bool NaiveN05FlashModel::CommitBoundVerifyCaches(
     dp.runtime.Run([&](int rank, int) {
         const auto &group = dp.servingGroups[dp.runtime.Layout().AttentionOwner(rank)];
         auto &storage = *graph->ranks[rank]->storage;
+        if (written && std::all_of(group.sequenceIndices.begin(), group.sequenceIndices.end(), [&](int row) {
+                return row >= (int)caches.size() || written->at(row);
+            })) return;
         std::vector<int> accepted;
         for (int seq : group.sequenceIndices) {
             if (seq >= (int)caches.size()) break; // padding follows real requests on each owner
@@ -749,6 +752,16 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     if (attentionParallel) for (int &rows : serving->batchBuckets) rows *= attentionDP;
     const int maxRows = serving->batchBuckets.back();
     const int maxLocalRows = maxRows / attentionDP;
+    const bool localFeatures = draftEnabled && maxLocalRows > 8 &&
+        maxLocalRows >= std::min(maxRows, 8 * attentionDP) && CanShardDraftHead() && AttentionTPSize() == 1 &&
+        !draftTargetLayers.empty() &&
+        std::set<int>(draftTargetLayers.begin(), draftTargetLayers.end()).size() == draftTargetLayers.size() &&
+        (int64_t)maxLocalRows * stride * embed_dim <= INT_MAX / draftTargetLayers.size() &&
+        tpEp8MegaState && !moeLayers.empty() && !moeLayers.front() &&
+        std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; }) &&
+        std::all_of(draftTargetLayers.begin(), draftTargetLayers.end(), [&](int l) {
+            return l > 0 && l < block_cnt;
+        });
     const int attentionRanks = AttentionTPSize();
     std::vector<int> batches(serving->batchBuckets.rbegin(), serving->batchBuckets.rend());
     // The pool bounds the sum of live lengths, not each request's length by
@@ -829,14 +842,29 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             storage->buffers.cacheMaps = (const unsigned char *)storage->cacheMaps.cudaData;
         }
         for (int i = 0; i < maxLocalRows; ++i) storage->buffers.sequences.emplace_back(new TargetWorkspace());
+        auto &packed = storage->packedFeatures;
+        if (localFeatures)
+            allocate(packed, BFLOAT16, maxLocalRows * stride * embed_dim * draftTargetLayers.size());
         for (auto &entry : serving->graphs) {
             auto r = std::make_unique<TPDecodeState::Rank>(storage);
             r->features.verifying = r->features.collectHidden = draftEnabled;
-            if (draftEnabled && rank == 0) for (int layer : draftTargetLayers) {
-                auto &backing = storage->features[layer];
-                if (backing.dims.empty()) allocate(backing, BFLOAT16, storage->maxRows * embed_dim);
+            const int rows = entry.second->rows;
+            // Small rejection batches already use the legacy sampler. If the
+            // root view fits, preserve its matching capture and commit path.
+            // Both layouts reuse the same arena across serial graph replays.
+            if (localFeatures && rows / stride / attentionDP > 8) {
+                r->features.packedOutput = &packed;
+            } else if (draftEnabled && rank == 0) for (size_t i = 0; i < draftTargetLayers.size(); ++i) {
+                const int layer = draftTargetLayers[i];
                 auto &feature = r->features.hidden[layer];
-                feature.FakeFrom(backing, 0); feature.Resize({1, entry.second->rows, embed_dim});
+                if (localFeatures) {
+                    feature.FakeFrom(packed, i * rows * embed_dim * sizeof(uint16_t));
+                } else {
+                    auto &backing = storage->features[layer];
+                    if (backing.dims.empty()) allocate(backing, BFLOAT16, storage->maxRows * embed_dim);
+                    feature.FakeFrom(backing, 0);
+                }
+                feature.Resize({1, rows, embed_dim});
             }
             entry.second->ranks.push_back(std::move(r));
         }

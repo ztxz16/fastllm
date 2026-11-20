@@ -691,7 +691,7 @@ bool NaiveN05FlashModel::RestorePrefixWindow(ResponseContext *context,
         std::shared_ptr<DraftContext> draft;
         {
             std::lock_guard<std::mutex> guard(historyMutex);
-            draft = self->CreateDraftContext();
+            draft = self->CreateDraftContext(&context->pastKeyValues.front().first);
             self->draftContexts[&context->pastKeyValues] = draft;
         }
         self->RestoreDraftPrefix(*snapshot, length, *draft);

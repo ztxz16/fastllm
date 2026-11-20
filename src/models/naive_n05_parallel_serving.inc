@@ -161,6 +161,27 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
                 auto paddedHidden = std::move(capture->hidden);
                 for (auto &item : paddedHidden) copyRagged(item.second, capture->hidden[item.first], {1, liveTokens, embed_dim});
             }
+            if (capture->collectHidden && graph->ranks.front()->features.packedOutput) {
+                capture->packedRows.resize(batch->Size());
+                const size_t stride = (size_t)width * draftTargetLayers.size() * embed_dim;
+                for (int rank = 0; rank < (int)tpDevices.size(); ++rank) {
+                    const auto *src = (const uint16_t *)graph->ranks[rank]->features.packedOutput->cudaData;
+                    const auto &seqs = dp.groups[topology.AttentionOwner(rank)].sequenceIndices;
+                    const auto &storage = *graph->ranks[rank]->storage;
+                    auto node = storage.commitGraphs.find(counts[rank]);
+                    const bool bound = capture->ringVerify && dp.plan.valid && node != storage.commitGraphs.end();
+                    for (int row = 0; row < counts[rank]; ++row) {
+                        auto &f = capture->packedRows.at(seqs[row]);
+                        f = {src + row * stride, tpDevices[rank]};
+                        if (bound) {
+                            f.targetPair = (int *)storage.inputStorage.cudaData + 2 * row;
+                            f.targetCommit = node->second;
+                            f.targetRows = counts[rank];
+                        }
+                    }
+                }
+                if (!capture->consumePacked) UnpackDraftFeatures(*capture, batch->lengths);
+            }
             if (!logits.dims.empty()) {
                 const std::vector<int> shape{liveTokens, weight["lm_head.weight"].dims[0]};
                 if (contiguous) {
