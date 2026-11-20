@@ -246,6 +246,24 @@ fastkv::Message PDStateWriter::Finish(const std::vector<int> &localDevices) {
     envelope.Ints(placement); result.metadata = std::move(envelope.bytes);
     return result;
 }
+fastkv::Buffer PDBindTensor(fastkv::Reader &metadata, Data &storage,
+                            const std::shared_ptr<void> &lease, int boundedAxis) {
+    const auto type = metadata.U32();
+    const auto dims = metadata.Ints(8);
+    const auto fp8 = metadata.U32();
+    const auto bytes = metadata.U64();
+    Check(type == uint32_t(storage.dataType) && fp8 == uint32_t(storage.kvCacheFp8Indexer) &&
+          dims.size() == storage.dims.size() && storage.dataDevice == CUDA &&
+          storage.dataDeviceIds.size() == 1 && storage.cudaData, "invalid direct tensor descriptor");
+    for (size_t i = 0; i < dims.size(); ++i)
+        Check(int(i) == boundedAxis ? dims[i] > 0 && dims[i] <= storage.dims[i] :
+              dims[i] == storage.dims[i], "invalid direct tensor shape");
+    storage.Resize(dims);
+    Check(bytes && TensorBytes(storage) == bytes, "invalid direct tensor size");
+    return fastkv::Buffer::Borrow(storage.cudaData, bytes, fastkv::MemoryKind::Cuda,
+                                  storage.dataDeviceIds.front(), lease);
+}
+
 PDStateReader::PDStateReader(const fastkv::Message &value)
     : message(PDStatePayload(value)), metadata(message.metadata) {}
 void PDStateReader::Tensor(Data &tensor, bool borrowGpu) {

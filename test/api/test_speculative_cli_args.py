@@ -20,36 +20,18 @@ from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
 
 
 class SpeculativeDraftCliAliasesTest(unittest.TestCase):
-    def test_dspark_dp_is_explicit_and_exclusive(self):
-        with tempfile.TemporaryDirectory() as draft_path:
-            self.write_draft_config(draft_path, {"architectures": ["DSparkDraftModel"], "block_size": 7})
-            for flag in ("--dspark_dp_size", "--dspark-dp-size"):
+    def test_dspark_parallel_aliases_and_limits(self):
+        parser = make_normal_parser("test")
+        for mode in ("tp", "dp"):
+            for flag in (f"--dspark_{mode}_size", f"--dspark-{mode}-size"):
                 for ranks in (1, 2, 4, 8):
-                    with self.subTest(flag=flag, ranks=ranks), patch.dict(os.environ, {}, clear=True):
-                        self.configure_without_target(["--draft", draft_path, flag, str(ranks)])
-                        self.assertEqual(os.environ["FASTLLM_DSPARK_TP"], "dp:" + str(ranks))
-            for args in (["--dspark_dp_size", "0"], ["--dspark_dp_size", "-1"],
-                         ["--dspark_tp_size", "8", "--dspark_dp_size", "8"]):
-                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                    make_normal_parser("test").parse_args(args)
-
-    def test_dspark_tp_overrides_legacy_environment_only_when_explicit(self):
-        with tempfile.TemporaryDirectory() as draft_path:
-            self.write_draft_config(draft_path, {"architectures": ["DSparkDraftModel"], "block_size": 7})
-            for flag in ("--dspark_tp_size", "--dspark-tp-size"):
-                for ranks in (1, 2, 4, 8):
-                    with self.subTest(flag=flag, ranks=ranks), patch.dict(os.environ, {"FASTLLM_DSPARK_TP": "2"}, clear=True):
-                        self.configure_without_target(["--draft", draft_path, flag, str(ranks)])
-                        self.assertEqual(os.environ["FASTLLM_DSPARK_TP"], str(ranks))
-            with patch.dict(os.environ, {"FASTLLM_DSPARK_TP": "mlp:4"}, clear=True):
-                self.configure_without_target(["--draft", draft_path])
-                self.assertEqual(os.environ["FASTLLM_DSPARK_TP"], "mlp:4")
-            with patch.dict(os.environ, {}, clear=True):
-                self.configure_without_target(["--draft", draft_path])
-                self.assertNotIn("FASTLLM_DSPARK_TP", os.environ)
-            for ranks in ("0", "-1", "bad"):
-                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-                    make_normal_parser("test").parse_args(["--dspark_tp_size", ranks])
+                    args = parser.parse_args([flag, str(ranks)])
+                    self.assertEqual(getattr(args, f"dspark_{mode}_size"), ranks)
+                for invalid in ("0", "-1", "bad"):
+                    with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        parser.parse_args([flag, invalid])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--dspark_tp_size", "8", "--dspark_dp_size", "8"])
 
     def test_mtp_confidence_is_optional_and_validates_probability(self):
         parser = make_normal_parser("test")

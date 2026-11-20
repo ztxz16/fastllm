@@ -49,6 +49,11 @@ class PDStateWriter {
     std::shared_ptr<Allocations> allocations;
 };
 
+// Bind a dense incoming tensor to private final storage. A bounded axis may
+// shrink for request-specific tails. The returned slice retains the storage.
+fastkv::Buffer PDBindTensor(fastkv::Reader &metadata, Data &storage,
+                            const std::shared_ptr<void> &lease, int boundedAxis = -1);
+
 class PDStateReader {
     fastkv::Message message;
     size_t next = 0;

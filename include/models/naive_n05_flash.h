@@ -28,6 +28,7 @@ namespace fastllm {
         ~NaiveN05FlashModel() override;
         void InitParams() override;
         void ConfigureAttentionParallel(int attentionDP) override;
+        void ConfigureDraftParallel(int ranks, bool replicas);
         void SetIndexerDataType(DataType dataType) override;
         void SetIndexerComputeFP8(bool enabled);
         void SetKVCacheDataType(DataType dataType) override;
@@ -356,15 +357,17 @@ namespace fastllm {
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
         void ProjectDraftContext(Data &combined, Data &projected, Data &hidden);
-        std::shared_ptr<DraftContext> CreateDraftContext(const Data *targetKey = nullptr);
+        std::shared_ptr<DraftContext> CreateDraftContext(const std::vector<int> &devices = {});
         bool PrepareDraftTP();
         void PrepareDraftContextTP(DraftContext &context);
-        std::string DraftPDLayout() const;
+        std::string DraftPDLayout(bool localReplica = false) const;
+        std::string PDGroupLayout(int attentionRanks) const;
         struct PDExportPlan;
         fastkv::Message PackPDState(ResponseContext &context, const std::vector<int> &devices,
                                     PDExportPlan &plan, bool independent);
-        void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length);
-        std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length);
+        void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length, bool planning = false);
+        std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length, int device = -1);
+        std::shared_ptr<DraftContext> ReservePDDraft(int length, int device);
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
@@ -426,6 +429,7 @@ namespace fastllm {
                          std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
                          std::vector<float> *retLogits);
+        std::string draftParallelLayout;
         bool draftEnabled = false;
         int draftLayers = 0, draftBlock = 0, draftTokens = 0;
         int draftHeads = 0, draftKvHeads = 0, draftHeadDim = 0, draftWindow = 0;
@@ -433,7 +437,6 @@ namespace fastllm {
         float draftConfidenceThreshold = 0.5f;
         std::vector<int> draftTargetLayers;
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
-        std::shared_ptr<DraftContext> idleDraftContext;
         std::vector<std::shared_ptr<DraftContext>> idleDraftContexts;
         void PrepareDraftServingMemory(bool history);
 

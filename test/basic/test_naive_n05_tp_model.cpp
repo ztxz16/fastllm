@@ -898,6 +898,15 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 #endif
+    void ConfigurePDDraft(int dp) {
+        if (dp > 1) ConfigureDraftParallel(dp, true);
+        draftEnabled = canDoConcurrentForward = true;
+        draftLayers = 2; draftBlock = 7; draftTokens = 5;
+        draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
+        draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
+        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
+        SetSaveHistoryChat(true);
+    }
     void PreparePDGroupFixture(int dp) {
         ConfigureAttentionParallel(dp); maxBatch = 4; SetMaxTokens(16384); WarmUp();
     }
@@ -1029,14 +1038,7 @@ class Fixture : public NaiveN05FlashModel {
     }
     void PDStateChecks(bool kvmem = false, bool rdma = false, bool layerShard = false, bool draft = false, int dp = 1) {
         if (dp > 1) ConfigureAttentionParallel(dp);
-        if (draft) {
-            draftEnabled = canDoConcurrentForward = true;
-            draftLayers = 2; draftBlock = 7; draftTokens = 5;
-            draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
-            draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
-            AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
-            SetSaveHistoryChat(true);
-        }
+        if (draft) ConfigurePDDraft(dp);
         // The batched oracle keeps four reference and four candidate requests
         // alive together, in addition to graph scratch page descriptors.
         maxBatch = draft ? 16 : 4; SetMaxTokens(16384); SetChunkedPrefillSize(4096);
@@ -1133,7 +1135,7 @@ class Fixture : public NaiveN05FlashModel {
             isIntermediateChunkedPrefill = false;
             reference.preTokens = length;
             auto message = ExportPDState(reference);
-            const bool independentExport = dp > 1 && dp == ranks && !draft && kvCacheDataType == FP8_E4M3;
+            const bool independentExport = dp > 1 && dp == ranks && kvCacheDataType == FP8_E4M3;
             if (independentExport) {
                 auto pack = PreparePDExport(reference);
                 if (!pack) throw std::runtime_error("missing independent GPU export");
@@ -1170,7 +1172,7 @@ class Fixture : public NaiveN05FlashModel {
                 message = std::move(async);
             }
             imported.allTokens.push_back(42);
-            if (kvmem) {
+            if (kvmem || (draft && dp > 1 && length != 257)) {
                 // Dropping an unsubmitted reservation must return every page.
                 auto abandoned = destination.PreparePDReceive(imported); abandoned.reset();
                 auto receive = destination.PreparePDReceive(imported);
@@ -1196,7 +1198,7 @@ class Fixture : public NaiveN05FlashModel {
                 if (span != arrived.buffers.size()) throw std::runtime_error("PD receive spans left over");
                 size_t host = 0;
                 for (const auto &buffer : arrived.buffers) if (buffer.Kind() == fastkv::MemoryKind::Host) host += buffer.Size();
-                if (!host) throw std::runtime_error("KVMem main KV did not land on host");
+                if (kvmem != bool(host)) throw std::runtime_error("PD final storage kind mismatch");
                 receive->Commit(imported);
             } else {
                 // Exercise the ordinary transport placement path too. Logical
@@ -1237,7 +1239,7 @@ class Fixture : public NaiveN05FlashModel {
             if (draft) {
                 auto original = draftContexts.at(&reference.pastKeyValues);
                 auto restored = draftContexts.at(&imported.pastKeyValues);
-                if (length == 1) {
+                if (length == 1 && dp == 1) {
                     PDStateWriter writer;
                     ExportDraftPDState(writer, *original, length);
                     auto state = PDStatePayload(writer.Finish(PDDevices()));
@@ -1635,6 +1637,7 @@ class Fixture : public NaiveN05FlashModel {
             KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
         }
+        SetSaveHistoryChat(true);
         WarmUp();
         if (batching) DraftPrefillOracle();
         useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
@@ -1787,7 +1790,7 @@ class Fixture : public NaiveN05FlashModel {
         ShutdownRuntime();
         if (batching && !batchedPrefills) throw std::runtime_error("prefill batching was never exercised");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-        idleDraftContext.reset();
+        idleDraftContexts.clear();
         inspectDraftPrefixAllocations = false;
         std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
         if (!draftPrefixAllocations.empty())
@@ -5021,7 +5024,8 @@ class DraftFixture : public NaiveN05FlashModel {
                     throw std::runtime_error("TP context input reuse");
                 ++checks;
             }
-            reference.idleDraftContext = std::move(a); candidate.idleDraftContext = std::move(b);
+            reference.idleDraftContexts.push_back(std::move(a));
+            candidate.idleDraftContexts.push_back(std::move(b));
         }
         if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0) throw std::runtime_error("no TP graph replay");
         if ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches != 0) throw std::runtime_error("TP graph failure not rolled back");
@@ -5071,7 +5075,7 @@ class DraftFixture : public NaiveN05FlashModel {
         }
         for (auto &old : contexts) {
             const int rank = old->deviceRank; void *pointer = old->kv[0].first.cudaData;
-            idleDraftContext = std::move(old);
+            idleDraftContexts.push_back(std::move(old));
             auto reused = CreateDraftContext();
             if (reused->committed || reused->deviceRank != rank || reused->kv[0].first.cudaData != pointer)
                 throw std::runtime_error("draft DP replacement lost storage ownership");
@@ -5412,7 +5416,7 @@ class DraftFixture : public NaiveN05FlashModel {
                 ++checks;
             }
             // Exercise the same bounded storage transfer as request removal.
-            idleDraftContext = std::move(candidate);
+            idleDraftContexts.push_back(std::move(candidate));
         }
         if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0)
             throw std::runtime_error("draft did not replay a graph");
@@ -5682,7 +5686,7 @@ int main(int argc, char **argv) {
             fixture.SetIndexerDataType(FP8_E4M3);
             fixture.PDStateChecks(std::string(argv[2]) == "pd_kvmem", argc > 5 && std::string(argv[5]) == "rdma",
                                   argc > 4 && std::string(argv[4]) == "layer_shard",
-                                  std::string(argv[2]) == "pd_draft"); return 0;
+                                  std::string(argv[2]) == "pd_draft", argc > 6 ? std::stoi(argv[6]) : 1); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));

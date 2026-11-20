@@ -56,6 +56,17 @@ namespace {
         else Linear(input, weight, Data(), output);
     }
 #ifdef USE_CUDA
+    // Both receive paths keep these addresses stable for subsequent verify graphs.
+    void ReserveDraftCache(Data &cache, int device, const std::vector<int> &shape, int capacity) {
+        cache.dataType = BFLOAT16;
+        cache.UpdateUnitSize();
+        cache.ToDevice(CUDA, std::vector<int>{device}, false);
+        if (cache.expansionDims.empty() || cache.expansionDims[1] < capacity)
+            cache.Expansion({1, capacity, shape.back()});
+        cache.Resize(shape);
+        cache.SetKVCache();
+    }
+
     void GatherDraftHeadInput(const Data &hidden, const std::vector<int> &limits, int block, Data &input) {
         const int width = hidden.dims.back(), rows = std::accumulate(limits.begin(), limits.end(), 0);
         input.dataType = hidden.dataType; input.UpdateUnitSize(); input.Resize({1, rows, width});
@@ -72,6 +83,12 @@ namespace {
             "Cannot gather batch draft head input.");
     }
 #endif
+}
+
+void NaiveN05FlashModel::ConfigureDraftParallel(int ranks, bool replicas) {
+    if (ranks < 1 || tpPrepared || !draftContexts.empty())
+        throw std::invalid_argument("configure a positive draft group size before warmup");
+    draftParallelLayout = (replicas ? "dp:" : "") + std::to_string(ranks);
 }
 
 #ifdef USE_CUDA
@@ -222,7 +239,7 @@ struct NaiveN05FlashModel::DraftTPState {
 
 bool NaiveN05FlashModel::PrepareDraftTP() {
     if (draftTP) return true;
-    const char *option = std::getenv("FASTLLM_DSPARK_TP");
+    const char *option = draftParallelLayout.empty() ? std::getenv("FASTLLM_DSPARK_TP") : draftParallelLayout.c_str();
     const bool automatic = !option || !*option;
     const std::string setting = automatic ? std::to_string(std::max<size_t>(1, tpDevices.size())) : option;
     auto singleDevice = [&]() {
@@ -468,13 +485,18 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
 
 #endif
 
-std::string NaiveN05FlashModel::DraftPDLayout() const {
+std::string NaiveN05FlashModel::DraftPDLayout(bool localReplica) const {
     if (!draftEnabled) return {};
     int ranks = 1, divisor = 1;
 #ifdef USE_CUDA
     if (draftTP) {
-        CheckDraftPD(!draftTP->dataParallel, "Naive PD draft state requires TP rather than draft DP.");
-        ranks = draftTP->devices.size(); divisor = draftTP->attentionDivisor;
+        if (attentionDP > 1) {
+            CheckDraftPD(AttentionTPSize() == 1 && draftTP->dataParallel && draftTP->devices == tpDevices,
+                "Group PD requires a full draft replica on each attention owner.");
+        } else {
+            CheckDraftPD(!draftTP->dataParallel, "Draft DP requires group-local PD placement.");
+            ranks = draftTP->devices.size(); divisor = draftTP->attentionDivisor;
+        }
         // The generic PD placement map is the target's device group. Draft
         // subgroups use its first N ranks, including nonzero physical devices.
         CheckDraftPD(tpDevices.size() >= size_t(ranks) &&
@@ -483,52 +505,66 @@ std::string NaiveN05FlashModel::DraftPDLayout() const {
     }
 #endif
     std::string layout = ":draft-v2";
+    if (localReplica) {
+        ranks = divisor = 1;
+        CheckDraftPD(attentionDP == 1 || bool(draftTP), "Group PD requires initialized draft replicas.");
+        auto checkpoint = weight.dicts.find("dspark.model_path");
+        layout += ":local:" + (checkpoint == weight.dicts.end() ? std::string() : checkpoint->second);
+    }
     for (int value : {draftLayers, draftBlock, draftHeads, draftKvHeads, draftHeadDim,
                       draftWindow, ranks, divisor}) layout += ":" + std::to_string(value);
     return layout;
 }
 
-void NaiveN05FlashModel::ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length) {
+void NaiveN05FlashModel::ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length, bool planning) {
 #ifdef USE_CUDA
     CheckDraftPD(context.pending.empty() && context.committed == length,
         "Naive PD requires a committed draft prefix.");
-    const int ranks = draftTP ? draftTP->devices.size() : 1;
+    const int ranks = draftTP && !draftTP->dataParallel ? draftTP->devices.size() : 1;
     const int divisor = draftTP ? draftTP->attentionDivisor : 1;
     const int width = std::max(1, draftKvHeads / divisor) * draftHeadDim;
     const std::vector<int> shape{1, std::min(length, draftWindow - 1), width};
-    CheckDraftPD(!draftTP || (context.workspace && context.workspace->tpRanks.size() == size_t(ranks)),
+    CheckDraftPD(!draftTP || (context.workspace && context.workspace->tpRanks.size() == draftTP->devices.size()),
         "Naive PD draft rank state is missing.");
     // Finish all owner streams before FastKV snapshots their committed KV.
-    if (draftTP) draftTP->Run([](int) { FastllmCudaSyncCurrentThreadStream(); });
-    else FastllmCudaSyncCurrentThreadStream();
-    writer.metadata.U32(context.committed);
-    writer.metadata.U32(draftLayers); writer.metadata.U32(ranks);
+    if (!planning) {
+        if (draftTP) draftTP->Run([](int) { FastllmCudaSyncCurrentThreadStream(); });
+        else FastllmCudaSyncCurrentThreadStream();
+        writer.metadata.U32(context.committed);
+        writer.metadata.U32(draftLayers); writer.metadata.U32(ranks);
+    }
+    auto tensor = [&](const Data &value) {
+        if (planning) writer.PlanTensor(value);
+        else writer.Tensor(value);
+    };
     for (int rank = 0; rank < ranks; ++rank) {
         const auto &kv = rank ? context.workspace->tpRanks[rank]->tpKV : context.kv;
         CheckDraftPD(kv.size() == size_t(draftLayers), "Naive PD draft layer state is missing.");
         for (const auto &pair : kv) for (const Data *cache : {&pair.first, &pair.second}) {
             CheckDraftPD(cache->dataType == BFLOAT16 && cache->dims == shape,
                 "Naive PD draft KV shape mismatch.");
-            writer.Tensor(*cache);
+            tensor(*cache);
         }
     }
     // Normalized prefill tails are needed by aligned prefix checkpoints on D.
     // Proposal distributions, RNG and graph workspaces are local to decode.
-    writer.metadata.U32(!context.prefixHidden.dims.empty());
-    if (!context.prefixHidden.dims.empty()) writer.Tensor(context.prefixHidden);
+    if (!planning) writer.metadata.U32(!context.prefixHidden.dims.empty());
+    if (!context.prefixHidden.dims.empty()) tensor(context.prefixHidden);
 #endif
 }
 
 std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraftPDState(
-        PDStateReader &reader, int length) {
+        PDStateReader &reader, int length, int device) {
     std::shared_ptr<DraftContext> context;
     {
         std::lock_guard<std::mutex> guard(historyMutex);
-        context = CreateDraftContext();
+        context = CreateDraftContext({device});
     }
 #ifdef USE_CUDA
     ApplyDraftDevice();
-    const auto devices = draftTP ? draftTP->devices : std::vector<int>{FastllmCudaGetDevice()};
+    if (draftTP) PrepareDraftContextTP(*context);
+    const auto devices = draftTP && draftTP->dataParallel ? std::vector<int>{draftTP->devices.at(context->deviceRank)} :
+        draftTP ? draftTP->devices : std::vector<int>{FastllmCudaGetDevice()};
     const int divisor = draftTP ? draftTP->attentionDivisor : 1;
     const int width = std::max(1, draftKvHeads / divisor) * draftHeadDim;
     const std::vector<int> shape{1, std::min(length, draftWindow - 1), width};
@@ -536,8 +572,7 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
     const auto layers = reader.metadata.U32(), ranks = reader.metadata.U32();
     CheckDraftPD(committed == length && layers == size_t(draftLayers) && ranks == devices.size(),
         "Naive PD draft prefix or TP size mismatch.");
-    if (draftTP) PrepareDraftContextTP(*context);
-    else context->kv.resize(draftLayers);
+    if (!draftTP) context->kv.resize(draftLayers);
     for (size_t rank = 0; rank < devices.size(); ++rank) {
         auto &kv = rank ? context->workspace->tpRanks[rank]->tpKV : context->kv;
         FastllmCudaSetDevice(devices[rank]);
@@ -546,15 +581,8 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
             reader.Tensor(value, true);
             CheckDraftPD(value.dataType == BFLOAT16 && value.dims == shape && !value.kvCacheFp8Indexer,
                 "Naive PD draft KV shape mismatch.");
-            value.ToDevice(CUDA, {devices[rank]});
-            cache->dataType = BFLOAT16; cache->UpdateUnitSize();
-            cache->ToDevice(CUDA, {devices[rank]}, false);
-            // Verification appends candidates after the retained window. The
-            // imported compact payload must reserve that space before graphs
-            // bind its pointers, even when the prompt is shorter than a window.
-            if (cache->expansionDims.empty() || cache->expansionDims[1] < draftWindow + draftBlock)
-                cache->Expansion({1, draftWindow + draftBlock, width});
-            cache->Resize(shape); cache->SetKVCache();
+            value.ToDevice(CUDA, std::vector<int>{devices[rank]});
+            ReserveDraftCache(*cache, devices[rank], shape, draftWindow + draftBlock);
             // Retain warmup/recycled addresses and copy directly from the
             // borrowed transport tensor into its final draft allocation.
             const bool copied = FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
@@ -569,54 +597,74 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
     CheckDraftPD(tail.dims.empty() || (tail.dataType == BFLOAT16 && tail.dims.size() == 3 &&
         tail.dims[0] == 1 && tail.dims[1] > 0 && tail.dims[1] <= std::min(length, draftWindow + GetPageLen() - 1) &&
         tail.dims[2] == embed_dim), "Naive PD draft prefix tail shape mismatch.");
-    if (!tail.dims.empty()) context->prefixHidden.ToDevice(CUDA, {devices.front()});
+    if (!tail.dims.empty()) context->prefixHidden.ToDevice(CUDA, std::vector<int>{draftTP ? draftTP->devices.front() : devices.front()});
     reader.End();
     context->committed = length;
 #endif
     return context;
 }
 
-std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraftContext(const Data *targetKey) {
+#ifdef USE_CUDA
+std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ReservePDDraft(int length, int device) {
+    std::shared_ptr<DraftContext> draft;
+    {
+        std::lock_guard<std::mutex> guard(historyMutex);
+        draft = CreateDraftContext({device});
+    }
+    PrepareDraftContextTP(*draft);
+    const std::vector<int> shape{1, std::min(length, draftWindow - 1), draftKvHeads * draftHeadDim};
+    for (auto &pair : draft->kv) {
+        ReserveDraftCache(pair.first, device, shape, draftWindow + draftBlock);
+        ReserveDraftCache(pair.second, device, shape, draftWindow + draftBlock);
+    }
+    // The normalized prefill features are consumed on the projection device.
+    // Keep the optional wire tail within the existing per-request workspace.
+    Data &tail = draft->workspace->prefixStorage;
+    tail.dataType = BFLOAT16; tail.UpdateUnitSize();
+    tail.Resize({1,std::min(length, draftWindow + GetPageLen() - 1),embed_dim});
+    tail.ToDevice(CUDA, std::vector<int>{draftTP->devices.front()}, false); tail.Allocate(false);
+    draft->prefixHidden.FakeFrom(tail, 0); draft->prefixHidden.Resize(tail.dims);
+    draft->committed = length;
+    return draft;
+}
+#endif
+
+std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraftContext(const std::vector<int> &devices) {
     // The request lifecycle and caller hold historyMutex. Reuse storage only;
     // reset every logical prefix, proposal and sampling state for a new request.
     auto context = std::make_shared<DraftContext>();
+    int owner = -1;
 #ifdef USE_CUDA
-    if (targetKey && CanShardDraftHead() && targetKey->multiDeviceData && targetKey->dataDeviceIds.size() == 1) {
-        auto it = std::find(tpDevices.begin(), tpDevices.end(), targetKey->dataDeviceIds.front());
-        if (it != tpDevices.end()) {
-            const int rank = it - tpDevices.begin();
-            context->deviceRank = rank;
-            if (!idleDraftContext || idleDraftContext->deviceRank != rank) {
-                auto match = std::find_if(idleDraftContexts.rbegin(), idleDraftContexts.rend(),
-                    [rank](const auto &entry) { return entry->deviceRank == rank; });
-                if (match != idleDraftContexts.rend()) {
-                    std::swap(*match, idleDraftContexts.back());
-                    std::swap(idleDraftContext, idleDraftContexts.back());
-                    if (!idleDraftContexts.back()) idleDraftContexts.pop_back();
-                }
-            }
-        }
+    if (devices.size() == 1 && draftTP && draftTP->dataParallel) {
+        auto it = std::find(draftTP->devices.begin(), draftTP->devices.end(), devices.front());
+        if (it != draftTP->devices.end()) owner = int(it - draftTP->devices.begin());
     }
 #endif
-    if (!idleDraftContext && !idleDraftContexts.empty()) {
-        idleDraftContext = std::move(idleDraftContexts.back()); idleDraftContexts.pop_back();
+    context->deviceRank = owner;
+    if (idleDraftContexts.empty()) return context;
+    auto slot = std::prev(idleDraftContexts.end());
+    if (owner >= 0 && (*slot)->deviceRank != owner) {
+        auto match = std::find_if(idleDraftContexts.begin(), slot,
+            [owner](const auto &idle) { return idle->deviceRank == owner; });
+        if (match == slot) return context;
+        std::iter_swap(match, slot);
     }
-    if (idleDraftContext) {
-        context->deviceRank = idleDraftContext->deviceRank;
-        auto &storage = idleDraftContext->kvBacking;
-        context->kv.swap(storage.empty() ? idleDraftContext->kv : storage);
-        idleDraftContext->kv.clear(); // Retired views must not alias the next request.
-        context->workspace.swap(idleDraftContext->workspace);
+    auto idle = std::move(*slot);
+    idleDraftContexts.pop_back();
+    context->deviceRank = idle->deviceRank;
+    auto &storage = idle->kvBacking.empty() ? idle->kv : idle->kvBacking;
+    context->kv.swap(storage);
+    idle->kv.clear(); // Drop retired views before reusing their backing storage.
+    context->workspace.swap(idle->workspace);
+    auto reset = [](auto &kv) {
+        for (auto &pair : kv) for (Data *cache : {&pair.first, &pair.second})
+            if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
+    };
+    reset(context->kv);
 #ifdef USE_CUDA
-        if (context->workspace) for (auto &rank : context->workspace->tpRanks)
-            for (auto &pair : rank->tpKV) for (Data *cache : {&pair.first, &pair.second})
-                if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
+    if (context->workspace)
+        for (auto &rank : context->workspace->tpRanks) reset(rank->tpKV);
 #endif
-        idleDraftContext.reset();
-        for (auto &pair : context->kv)
-            for (Data *cache : {&pair.first, &pair.second})
-                if (cache->dims.size() == 3) cache->Resize({1, 0, cache->dims[2]});
-    }
     return context;
 }
 
@@ -3332,7 +3380,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             if (found == byFirstKey.end()) continue;
             auto &entry = *found->second;
             caches[i] = const_cast<std::vector<std::pair<Data, Data>> *>(entry.first);
-            if (!entry.second) entry.second = CreateDraftContext(&entry.first->front().first);
+            if (!entry.second) entry.second = CreateDraftContext(entry.first->front().first.dataDeviceIds);
             owners[i] = entry.second;
         }
     }
@@ -3678,7 +3726,7 @@ int NaiveN05FlashModel::ForwardDraft(
     {
         std::lock_guard<std::mutex> guard(historyMutex);
         auto &entry = draftContexts[&kv];
-        if (!entry) entry = CreateDraftContext(kv.empty() ? nullptr : &kv.front().first);
+        if (!entry) entry = kv.empty() ? CreateDraftContext() : CreateDraftContext(kv.front().first.dataDeviceIds);
         owner = entry;
     }
     auto &context = *owner;

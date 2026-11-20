@@ -3623,6 +3623,14 @@ class model:
             raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
+    def configure_dspark_parallel(self, size: int, *, replicas: bool):
+        configure = fastllm_lib.configure_dspark_parallel_llm_model
+        configure.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_bool]
+        configure.restype = ctypes.c_char_p
+        error = configure(self.model, size, replicas)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
+
     def configure_attention_parallel(self, size: int):
         setter = getattr(fastllm_lib, "configure_attention_parallel_llm_model", None)
         if setter is None:

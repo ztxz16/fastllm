@@ -1552,10 +1552,6 @@ def make_normal_llm_model(args, startup_progress = None):
         os.environ["FASTLLM_DSPARK_MODEL_PATH"] = speculative_draft_path
         if getattr(args, "dspark_tp_size", None) is not None and getattr(args, "dspark_dp_size", None) is not None:
             raise ValueError("dspark_tp_size and dspark_dp_size are mutually exclusive")
-        if getattr(args, "dspark_tp_size", None) is not None:
-            os.environ["FASTLLM_DSPARK_TP"] = str(args.dspark_tp_size)
-        elif getattr(args, "dspark_dp_size", None) is not None:
-            os.environ["FASTLLM_DSPARK_TP"] = "dp:" + str(args.dspark_dp_size)
         if draft_tokens > 0:
             os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
             args.draft_tokens = draft_tokens
@@ -2319,6 +2315,16 @@ def make_normal_llm_model(args, startup_progress = None):
         if (args.moe_atype != ""):
             model.set_moe_atype(args.moe_atype)
         if is_naive_n05_model:
+            if args.speculative_algorithm == "dspark":
+                tp_size = getattr(args, "dspark_tp_size", None)
+                dp_size = getattr(args, "dspark_dp_size", None)
+                if tp_size is not None:
+                    model.configure_dspark_parallel(tp_size, replicas=False)
+                elif dp_size is not None:
+                    model.configure_dspark_parallel(dp_size, replicas=True)
+                elif (pd_options is not None and attention_dp > 1 and attention_dp == world
+                      and not os.getenv("FASTLLM_DSPARK_TP")):
+                    model.configure_dspark_parallel(attention_dp, replicas=True)
             role = pd_options.get("role") if pd_options is not None else None
             # D receives complete state from P. Configure its pool before warmup.
             if not history_explicit:

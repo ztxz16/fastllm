@@ -904,6 +904,16 @@ extern "C" {
         return fastllmPytoolsContextResult.c_str();
     }
 
+    DLL_EXPORT const char *configure_dspark_parallel_llm_model(int modelId, int ranks, bool replicas) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
+            if (!model) throw std::invalid_argument("draft parallel placement requires a Naive DSA model");
+            model->ConfigureDraftParallel(ranks, replicas);
+        } catch (const std::exception &error) { fastllmPytoolsContextResult = error.what(); }
+        return fastllmPytoolsContextResult.c_str();
+    }
+
     DLL_EXPORT const char *set_model_indexer_compute_dtype(int modelId, const char *dtype) {
         fastllmPytoolsContextResult.clear();
         try {
