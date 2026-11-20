@@ -59,10 +59,15 @@ __device__ __forceinline__ void SelectTopKCompactRow(const float *input, unsigne
             // Only estimate a threshold here. Round down after sorting the
             // high bits; the full scan still proves a bounded exact superset.
             constexpr int lowBit = SampleItems > 4 || Threads > 256 ? 8 : 16;
-            if constexpr (Threads == 1024) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
+            constexpr bool histogramSample = Threads >= 512;
+#else
+            constexpr bool histogramSample = Threads == 1024;
+#endif
+            if constexpr (histogramSample) {
                 // Only the sampled kth score is needed, not a sorted sample. Three
                 // radix histograms find exactly the same rounded threshold. Keep
-                // all 2048 sample positions and the full-scan candidate proof.
+                // all sample positions and the full-scan candidate proof.
                 const int sampleRank =
                     max(0, min(sampleCount - 1,
                                (int)(((int64_t)keep + capacity) * sampleCount / (2LL * count)) - 1));

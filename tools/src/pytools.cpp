@@ -932,12 +932,16 @@ extern "C" {
         fastllmPytoolsContextResult.clear();
         try {
             const std::string value = dtype ? dtype : "";
-            if (value != "auto" && value != "fp8")
-                throw std::invalid_argument("indexer_compute_dtype must be auto or fp8");
+            using fastllm::NaiveIndexerCompute;
+            NaiveIndexerCompute mode = NaiveIndexerCompute::Auto;
+            if (value == "fp8") mode = NaiveIndexerCompute::FP8;
+            else if (value == "fp8_direct") mode = NaiveIndexerCompute::FP8Direct;
+            else if (value != "auto")
+                throw std::invalid_argument("indexer_compute_dtype must be auto, fp8 or fp8_direct");
             auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
             if (!model && value != "auto")
                 throw std::invalid_argument("FP8 Indexer compute requires a Naive DSA model");
-            if (model) model->SetIndexerComputeFP8(value == "fp8");
+            if (model) model->SetIndexerCompute(mode);
         } catch (const std::exception &error) { fastllmPytoolsContextResult = error.what(); }
         return fastllmPytoolsContextResult.c_str();
     }
@@ -1562,6 +1566,10 @@ extern "C" {
                                                    int targetRequests, int maxRequests, int minDecodeRequests) {
         return models.GetModel(modelId)->SetPrefillBatching(tokens, maxWaitMs, targetRequests,
                                                           maxRequests, minDecodeRequests);
+    }
+
+    DLL_EXPORT bool set_kv_admission_reserve_llm_model(int modelId, int tokens) {
+        return models.GetModel(modelId)->SetKVAdmissionReserve(tokens);
     }
 
     DLL_EXPORT bool set_prefill_scheduling_llm_model(int modelId, bool balanceDP, int adaptiveRequests,

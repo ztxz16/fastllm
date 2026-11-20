@@ -118,6 +118,9 @@ namespace fastllm {
         int prefillOffset = 0;
         PrefillBatchPolicy::Clock::time_point prefillQueuedAt = queuedAt;
         bool isEnding = false; // 代表这个请求已经处理完成了，不需要再forward了，但生成的token可能还没有被fetch
+        // Rebuild model state from allTokens after KV pressure. Client output and sampler state stay live.
+        bool replayingKV = false;
+        bool NeedsPrefill() const { return curTokens == 0 || replayingKV; }
         bool isAbort = false; // 代表这个请求被中断了，也就是说不会再有人来fetch它了，那么推理完之后就可以删除这个请求了
         
         std::vector <int> allTokens;
@@ -137,6 +140,7 @@ namespace fastllm {
         std::map <std::string, int> intParams;
 
         int cacheLen = 0;
+        int originalCachedInputTokens = -1; // Preserve client accounting across KV replay.
         int pdCachedInputTokens = -1; // Usage reported by P, independent of D's local prefix.
 
         ~ResponseContext();
@@ -662,6 +666,11 @@ namespace fastllm {
 
         // Check admission before touching cached state; reserve only for a selected request.
         virtual bool CanAdmitResponseContext(const ResponseContext *) const { return true; }
+        // Only adapters that can detach all private KV/SWA without resetting sampling identity may opt in.
+        virtual bool SupportsKVReplay() const { return false; }
+        virtual void ReleaseKVForReplay(ResponseContext *context);
+        bool SetKVAdmissionReserve(int tokens);
+        int GetKVAdmissionWindow() const;
         virtual bool TryAdmitResponseContext(ResponseContext *context) { return true; }
 
         virtual bool UseGenericHistoryCache() const { return true; }
@@ -916,6 +925,7 @@ namespace fastllm {
         int chunkedPrefillSize = -1;
         PrefillBatchPolicy prefillBatchPolicy;
         PrefillSchedulingOptions prefillScheduling;
+        int kvAdmissionReserve = -1; // Unset selects the default window on replay-capable deployments.
 
         // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
         // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。

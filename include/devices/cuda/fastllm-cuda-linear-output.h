@@ -10,6 +10,9 @@ bool FastllmCudaBFloat16LinearFloat32(const fastllm::Data &input, const fastllm:
 // ordinary Linear loop. Output must already own enough CUDA storage.
 bool FastllmCudaBFloat16LinearFixedRows(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
+// Packed BF16 prefill with a batch-independent reduction order.
+bool FastllmCudaBFloat16PrefillLinear(const fastllm::Data &input,
+    const fastllm::Data &weight, fastllm::Data &output);
 // Pack one or two immutable FP32 matrices only when every value is exactly BF16.
 // Preparation is eager-only; the owned packed allocation must outlive captured graphs.
 bool FastllmCudaTryPackBFloat16Weights(const fastllm::Data &first,

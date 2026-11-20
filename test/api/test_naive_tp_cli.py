@@ -116,12 +116,13 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         self.configure([])
         self.assertEqual(self.model_options['indexer_compute_dtype'], 'auto')
         self.assertNotIn('FASTLLM_CUDA_NATIVE_FP8_PREFILL', self.native_env)
-        for saved in (False, True):
-            settings = {'indexer_compute_dtype': 'fp8', 'fp8_prefill': 'true'}
-            options = [] if saved else [part for k, v in settings.items() for part in ('--' + k, v)]
-            self.configure(options, saved=settings if saved else None)
-            self.assertEqual(self.model_options['indexer_compute_dtype'], 'fp8')
-            self.assertEqual(self.native_env['FASTLLM_CUDA_NATIVE_FP8_PREFILL'], '1')
+        for mode in ('fp8', 'fp8_direct'):
+            for saved in (False, True):
+                settings = {'indexer_compute_dtype': mode, 'fp8_prefill': 'true'}
+                options = [] if saved else [part for k, v in settings.items() for part in ('--' + k, v)]
+                self.configure(options, saved=settings if saved else None)
+                self.assertEqual(self.model_options['indexer_compute_dtype'], mode)
+                self.assertEqual(self.native_env['FASTLLM_CUDA_NATIVE_FP8_PREFILL'], '1')
 
     def test_fp8_prefill_environment_and_saved_booleans(self):
         name = 'FASTLLM_CUDA_NATIVE_FP8_PREFILL'
@@ -234,6 +235,19 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         for override in ({'prefill_batch_tokens': 0}, {'attn_dp_size': 1}):
             with self.subTest(override=override), self.assertRaisesRegex(ValueError, 'prefill'):
                 self.configure([], saved={**settings, **override})
+
+    def test_kv_admission_reserve(self):
+        settings = ['--tp', '4', '--prefill_batch_tokens', '16384', '--prefill_chunked', 'true']
+        self.configure(settings)
+        self.loaded_model.set_kv_admission_reserve.assert_not_called()
+        for reserve in (0, 1024, 4096):
+            self.configure(settings + ['--kv_admission_reserve', str(reserve)])
+            self.loaded_model.set_kv_admission_reserve.assert_called_once_with(reserve)
+        self.configure([], saved={'tp': '4', 'kv_admission_reserve': 0})
+        self.loaded_model.set_kv_admission_reserve.assert_called_once_with(0)
+        for options in (['--kv_admission_reserve', '4096'], settings + ['--kv_admission_reserve', '-1']):
+            with self.subTest(options=options), self.assertRaisesRegex(ValueError, 'kv_admission_reserve'):
+                self.configure(options)
 
     def test_attention_dp_saved_default_and_kvmem_chunk(self):
         args = self.configure([], saved=dict(tp='4', attn_dp_size=4,

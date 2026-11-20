@@ -2,6 +2,7 @@
 #define FASTLLM_NAIVE_N05_FLASH_H
 
 #include "basellm.h"
+#include "models/naive_indexer_compute.h"
 #include "parallel/model.h"
 #include <algorithm>
 #include <atomic>
@@ -19,7 +20,6 @@ namespace fastllm {
     class PDStateReader;
     class NaiveN05FlashModel : public basellm, public parallel::AttentionParallelModel {
     protected:
-        static constexpr int MaxTPDecodeBatch = 512;
         struct TargetCapture;
         struct LogitsSelection;
         struct TargetBatch;
@@ -31,6 +31,7 @@ namespace fastllm {
         void ConfigureDraftParallel(int ranks, bool replicas);
         void SetIndexerDataType(DataType dataType) override;
         void SetIndexerComputeFP8(bool enabled);
+        void SetIndexerCompute(NaiveIndexerCompute mode);
         void SetKVCacheDataType(DataType dataType) override;
         void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
@@ -57,6 +58,10 @@ namespace fastllm {
                                      int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
+        bool SupportsKVReplay() const override {
+            return attentionDP == 1 && !draftEnabled && !kvMemConfig.enabled && !tpPagedCaches.empty();
+        }
+        void ReleaseKVForReplay(ResponseContext *context) override;
         int GetPrefillBatchGroups() const override { return attentionDP; }
         bool SupportsChunkedPrefillScheduling() const override { return SupportsPrefillBatching(); }
         int GetPrefillBatchGroup(const ResponseContext *context) const override;
@@ -116,9 +121,9 @@ namespace fastllm {
         bool SupportsSharedPagedKVPool() const override { return !tpPagedCaches.empty(); }
         bool UsesPackedMoeSource() const { return tpPackedMoeSources; }
         int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
-            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
+            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < num_experts,
                            "MiMo EP8 expert loading must use the same ordered devices as TP.");
-            return tpDevices.at(expert / (256 / tpDevices.size()));
+            return tpDevices.at(expert / (num_experts / tpDevices.size()));
         }
         std::string MakeInput(const std::string &history, int,
                               const std::string &input) override { return history + input; }
@@ -127,6 +132,13 @@ namespace fastllm {
                                 const std::string &output) override { return history + input + output; }
 
     protected:
+        // Empty rows select deferred host inputs for mixed sampling paths.
+        struct DraftVerifyInput {
+            std::function<void()> materialize;
+            std::vector<const float *> rows;
+            std::vector<int> strides;
+            std::vector<void *> ready;
+        };
         // Batch-major request descriptors, borrowed only for one forward. KV
         // storage remains owned by each response; weights are shared by all rows.
         struct TargetBatch {
@@ -134,6 +146,7 @@ namespace fastllm {
             const std::vector<GenerationConfig> &configs;
             const std::vector<int> &lengths;
             int layers;
+            const DraftVerifyInput *proposals = nullptr;
             int Size() const { return lengths.size(); }
             bool Decode() const {
                 return std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; });
@@ -475,6 +488,7 @@ namespace fastllm {
         // Affinity fixes the KV owner before admission. The global scheduler caps
         // total requests when the batch is not divisible by the number of groups.
         int RunningRequestsPerGroup(int batch) const { return 1 + (batch - 1) / attentionDP; }
+        std::vector<int> LocalServingGraphBuckets(int maxRequests) const;
         int WindowRequestsPerGroup(int batch) const { return WindowRequestsPerGroup(batch, attentionDP); }
         static int WindowRequestsPerGroup(int batch, int groups) {
             const int mean = 1 + (batch - 1) / groups;
@@ -619,7 +633,7 @@ namespace fastllm {
         float partialRotary = 0.334f, valueScale = 0.707f;
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
-        bool indexerComputeFP8 = false;
+        NaiveIndexerCompute indexerCompute = NaiveIndexerCompute::Auto;
         bool indexerLayerSharding = false;
         bool indexerContextSharding = false;
         bool tpIndexerPeerAccess = false;

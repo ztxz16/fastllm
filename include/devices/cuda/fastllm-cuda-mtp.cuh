@@ -1,10 +1,18 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
 
 // Persist q directly into per-request chain storage. A zero stride selects
 // contiguous vocabulary rows. Sampling uses identical probabilities and RNG.
 bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits,
     float *proposalProbs, float *deviceTokens, uint64_t offset, int probabilityStride);
+
+// Pack owner-local, step-major sampler outputs into request-major graph input.
+bool FastllmCudaMtpGatherVerifyIds(float *output, int width, const float *const *rows,
+    const int *strides, const int *lengths, int count, int vocab);
+
+// Reuse the host mirror and event only for sampler graphs of the same shape.
+bool FastllmCudaMtpReadDraftIdsAsync(const float *ids, std::size_t count, float *&host, void *&ready);
 
 // Publish the anchors, temperatures and a fresh seed on the proposal graph's stream.
 // Draft q is the full temperature-softmax; top-k/top-p are applied by the verifier.
@@ -99,8 +107,9 @@ bool FastllmCudaMtpNormalizeTargetDistribution(void *distribution,
 // Retarget only the input-reading normalization nodes; all scratch stays owned.
 bool FastllmCudaMtpRebindTargetDistribution(void *graph, void *exec, float *logits);
 
+constexpr int kFastllmMtpSmallRejectionMaxBatch = 8;
 inline bool FastllmMtpUsesSmallRejection(int batch, int draftTokens, int vocabSize) {
-    return batch <= 8 && draftTokens <= 8 && vocabSize >= 16384;
+    return batch <= kFastllmMtpSmallRejectionMaxBatch && draftTokens <= 8 && vocabSize >= 16384;
 }
 
 // Submit a same-stream consumer of the accepted prefix before the regular CPU

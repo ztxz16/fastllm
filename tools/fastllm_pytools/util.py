@@ -565,7 +565,6 @@ def _configure_expert_parallel(args, is_naive_n05_model):
             raise ValueError("--ep 4/8 currently supports MiMo DSA / Naive-N0.5 FP8 or MXFP4 models")
         if _thread_tp_cuda_device_count(getattr(args, "tp", "")) != ep:
             raise ValueError(f"--ep {ep} requires exactly {ep} TP devices")
-        print(f"[ep] --ep {ep}: {256 // ep} complete experts/GPU; MegaMoE backend selected by GPU and weight format")
     os.environ["FASTLLM_EP"] = str(ep)
     args.ep = ep
 
@@ -1031,8 +1030,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
     parser.add_argument('--atype', type = str, default = "auto", help = '推理类型，可使用float32或float16')
     parser.add_argument('--indexer_dtype', choices=['auto', 'fp8', 'fp8_e4m3'], default='auto',
                         help='Naive DSA Indexer 类型；fp8 独立量化 Indexer Q/K 并压缩 K 缓存，auto 保持模型默认路径')
-    parser.add_argument('--indexer_compute_dtype', choices=['auto', 'fp8'], default='auto',
-                        help='Naive Indexer prefill 计算类型；fp8 启用原生 Hopper FP8 打分，需 FP8 Q/K；不支持的设备、形状及解码保持原路径，auto 保持默认计算精度')
+    parser.add_argument('--indexer_compute_dtype', choices=['auto', 'fp8', 'fp8_direct'], default='auto',
+                        help='Naive Hopper FP8 Indexer prefill，需 FP8 Q/K。auto 使用默认计算，fp8 使用 BF16 候选精排，fp8_direct 直接按 FP8 分数选位，可能改变输出')
     parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
                         help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 按上下文分片并合并全局 TopK，支持纯显存 KV 和 KVMem；默认各卡复制')
     parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA、DeepSeek-V4.1，或 Naive TP KVMem 的 DSA KV；Naive SWA/Indexer 保持 FP8）')
@@ -1066,6 +1065,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='已有 prefill chunk 等待其他请求合批的上限，0立即继续；需 prefill_chunked')
     parser.add_argument('--prefill_fairness_ms', type=int, default=0,
                         help='繁忙时连续 prefill 达此毫秒后安排等长 decode 时间，0关闭；需 prefill_chunked')
+    parser.add_argument('--kv_admission_reserve', type=int, default=None,
+                        help='接纳新请求时为后续输出预估的 token 数。Naive 独立 TP 纯 GPU、无草稿的分块攒批默认 4096；0 按完整输出上限预留')
     fast_prefill = parser.add_mutually_exclusive_group()
     fast_prefill.add_argument('--fast_prefill', '--fast-prefill', action='store_true',
                              help='开启DeepSeek-V4.1快速 prefill；该模型的--auto默认开启，可用--no_fast_prefill关闭')
@@ -1312,6 +1313,12 @@ def make_normal_llm_model(args, startup_progress = None):
         if type(value) is not int or not 0 <= value <= 2147483647:
             raise ValueError(name + ' must be a non-negative int32')
         prefill_scheduling[name] = value
+    kv_admission_reserve = getattr(args, 'kv_admission_reserve', None)
+    if kv_admission_reserve is not None:
+        if type(kv_admission_reserve) is not int or not 0 <= kv_admission_reserve <= 2147483647:
+            raise ValueError("--kv_admission_reserve must be a non-negative int32")
+        if kv_admission_reserve > 0 and not prefill_scheduling['prefill_chunked']:
+            raise ValueError("--kv_admission_reserve requires chunked prefill batching")
     if (not prefill_scheduling['prefill_chunked'] and
             (prefill_scheduling['prefill_chunk_max_wait_ms'] or prefill_scheduling['prefill_fairness_ms'])):
         raise ValueError('prefill chunk timing requires prefill_chunked')
@@ -2382,6 +2389,8 @@ def make_normal_llm_model(args, startup_progress = None):
                                           min_decode_requests=prefill_min_decode_requests)
             else:
                 model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+        if kv_admission_reserve is not None:
+            model.set_kv_admission_reserve(kv_admission_reserve)
         if any(prefill_scheduling.values()):
             model.set_prefill_scheduling(balance_dp=prefill_scheduling['prefill_dp_balance'],
                 adaptive_requests=prefill_scheduling['prefill_adaptive_requests'],

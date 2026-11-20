@@ -614,3 +614,68 @@ bool FastllmCudaMtpVerifierResolve(void *opaque, int *output, int *accepted) {
     }
     return true;
 }
+
+bool FastllmCudaMtpReadDraftIdsAsync(const float *ids, size_t count, float *&host, void *&ready) {
+    if (!ids || !count || count > SIZE_MAX / sizeof(float) || bool(host) != bool(ready)) return false;
+    if (!host) {
+        float *buffer = nullptr;
+        if (cudaMallocHost(&buffer, count * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        cudaEvent_t event = nullptr;
+        if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) != cudaSuccess) {
+            cudaFreeHost(buffer);
+            cudaGetLastError();
+            return false;
+        }
+        host = buffer;
+        ready = event;
+    }
+    if (cudaMemcpyAsync(host, ids, count * sizeof(float), cudaMemcpyDeviceToHost, cudaStreamPerThread) == cudaSuccess) {
+        if (cudaEventRecord((cudaEvent_t)ready, cudaStreamPerThread) == cudaSuccess) return true;
+        // The copy is in flight without a completion event.
+        cudaStreamSynchronize(cudaStreamPerThread);
+    }
+    cudaGetLastError();
+    return false;
+}
+
+namespace {
+// Pass the small row map by value. It changes on request replacement and
+// needs neither persistent CUDA storage nor a graph update.
+struct VerifyIdRows {
+    struct Row { const float *ids; int stride, length; };
+    static constexpr int Capacity = 192;
+    Row rows[Capacity];
+};
+__global__ void GatherVerifyIds(VerifyIdRows sources, float *output, int width, int count, int vocab) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count * width) return;
+    const auto &row = sources.rows[i / width];
+    const int step = i % width;
+    const float id = step < row.length ? row.ids[size_t(step) * row.stride] : 0.f;
+    // Host publication also checks all sampled ids. Never index embedding
+    // weights out of bounds if a malformed sampler result reaches replay.
+    output[i] = id >= 0.f && id < vocab && id == truncf(id) ? id : 0.f;
+}
+}
+
+bool FastllmCudaMtpGatherVerifyIds(float *output, int width, const float *const *rows,
+        const int *strides, const int *lengths, int count, int vocab) {
+    if (!output || !rows || !strides || !lengths || width <= 0 || count <= 0 ||
+            count > INT_MAX / width || vocab <= 0) return false;
+    for (int i = 0; i < count; ++i)
+        if (!rows[i] || strides[i] <= 0 || lengths[i] < 1 || lengths[i] > width) return false;
+    for (int first = 0; first < count;) {
+        const int n = std::min(count - first, int(VerifyIdRows::Capacity));
+        VerifyIdRows sources{};
+        for (int j = 0; j < n; ++j)
+            sources.rows[j] = {rows[first + j], strides[first + j], lengths[first + j]};
+        GatherVerifyIds<<<(n * width - 1) / 128 + 1, 128, 0, cudaStreamPerThread>>>(
+            sources, output + size_t(first) * width, width, n, vocab);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        first += n;
+    }
+    return true;
+}

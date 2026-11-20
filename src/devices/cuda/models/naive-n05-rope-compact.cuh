@@ -68,7 +68,7 @@ inline bool CanPackVerifyRope(const std::vector<RopeCacheRow> &rows,
         if (!r.cache || !r.length || !r.ringVerify || r.pageLen || r.keyPages ||
             r.valuePages || r.indexKey || r.indexCache || r.separateIndex || r.scaledIndexer ||
             r.keyRows != first.keyRows || r.valueRows != first.valueRows || r.fp8 != first.fp8 ||
-            r.q != first.q + i * heads * dim || r.k != first.k + i * kvHeads * dim ||
+            r.fp4 != first.fp4 || r.q != first.q + i * heads * dim || r.k != first.k + i * kvHeads * dim ||
             r.v != first.v + i * kvHeads * valueDim || r.positions != first.positions + i ||
             r.length != first.length + i ||
             r.qkv != (first.qkv ? first.qkv + i * ((heads + kvHeads) * dim + kvHeads * valueDim) : nullptr))

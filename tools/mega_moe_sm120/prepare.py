@@ -9,6 +9,7 @@ them from relocatable metadata.
 """
 import concurrent.futures
 import contextlib
+from dataclasses import replace
 import importlib
 import math
 import pathlib
@@ -43,7 +44,8 @@ class _PeerArena:
 
     def abort(self, error):
         with self.condition:
-            self.error = error
+            if self.error is None:
+                self.error = error
             self.condition.notify_all()
 
     def allocate(self, shape, dtype):
@@ -113,6 +115,14 @@ def _load_runtime():
     base = runtime.MegaMoESm120W4A8Frontend
     compile_lock = threading.Lock()
     class LocalFrontend(base):
+        def _select_spec(self, tokens_per_rank):
+            spec = super()._select_spec(tokens_per_rank)
+            stages = getattr(self.workspace, 'fc1_stages', None)
+            if stages is None:
+                return spec
+            # FC2 has an explicit stage count in its kernel config.
+            return replace(spec, jit=replace(spec.jit, num_ab_stages_override=stages))
+
         def _barrier(self):
             if not getattr(_context, 'compiling', False):
                 _context.barrier.wait(timeout=300)
@@ -151,7 +161,7 @@ def _cuda_bytes(pointer, count, device):
 
 class GraphProvider:
     def __init__(self, devices, layers, hidden=4096, intermediate=2048, experts=256, topk=8,
-                 rank_local_combine=False, dispatch_rank_cache=False):
+                 rank_local_combine=False, dispatch_rank_cache=False, green_sms=None, fc1_stages=None):
         import torch
         from cuda.bindings import runtime as cuda
         # cuda.core chooses its CUDA-major namespace lazily. Resolve it before
@@ -163,6 +173,8 @@ class GraphProvider:
         self.hidden, self.intermediate, self.experts, self.topk = hidden, intermediate, experts, topk
         self.rank_local_combine = rank_local_combine
         self.dispatch_rank_cache = dispatch_rank_cache
+        self.green_sms = green_sms
+        self.fc1_stages = fc1_stages
         self.arena = _PeerArena(self.devices)
         self.barrier = threading.Barrier(len(self.devices))
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.devices))
@@ -218,18 +230,20 @@ class GraphProvider:
         with self.context(rank, bucket):
             runtime = self.runtime
             if bucket not in self.workspaces[rank]:
+                knobs = dict(rank_local_combine=self.rank_local_combine,
+                             dispatch_rank_cache=self.dispatch_rank_cache,
+                             k2_warps=8, k2_tail_reclaim=False)
+                if self.green_sms is not None:
+                    k1, k2 = self.green_sms
+                    knobs.update(k1_sms=k1, k2_sms=k2, tx_sms=0, rx_sms=0)
                 cfg = runtime.MegaMoESm120W4A8Config(
                     rank=rank, world_size=len(self.devices), max_tokens_per_rank=bucket,
                     num_topk=self.topk, num_total_experts=self.experts, hidden=self.hidden,
                     # Every owner holds complete experts. EP size is not the
                     # tensor-parallel width of an expert's GEMMs.
                     intermediate=self.intermediate, tensor_parallel_size=1,
-                    knobs={'rank_local_combine': self.rank_local_combine,
-                           'dispatch_rank_cache': self.dispatch_rank_cache,
-                           # Preserve the established K2 arithmetic/scheduling
-                           # family while comparing communication strategies.
-                           'k2_warps': 8, 'k2_tail_reclaim': False})
-                plan_workspace = types.SimpleNamespace(config=cfg, _execution_plans={})
+                    knobs=knobs)
+                plan_workspace = types.SimpleNamespace(config=cfg, _execution_plans={}, fc1_stages=self.fc1_stages)
                 planner = runtime.MegaMoESm120W4A8Frontend(plan_workspace, compile_bucket=bucket)
                 spec, bundle = planner._ensure_plan(bucket)
                 sizes = [bucket*self.hidden, bucket*((self.hidden//32+3)//4*4),
@@ -287,6 +301,10 @@ class GraphProvider:
                 raise
         futures = [self.pool.submit(prepare_rank, rank)
                    for rank in range(len(self.devices))]
+        # Finish all rank workers before a failed candidate releases peer buffers.
+        concurrent.futures.wait(futures)
+        if self.arena.error is not None:
+            raise self.arena.error
         return [future.result() for future in futures]
 
     def close(self):

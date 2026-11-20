@@ -65,6 +65,7 @@ def set_ulimit(target_soft_limit: int = 65535):
 def parse_args():
     parser = make_normal_parser("OpenAI-compatible API server")
     add_server_args(parser)
+    parser.add_argument("--deploy-fastipc", nargs=3, help=argparse.SUPPRESS)
     return apply_page_size_default(parser.parse_args())
 
 app = fastapi.FastAPI()
@@ -109,24 +110,27 @@ def _prewarm_request_executor(executor, workers: int) -> int:
         future.result()
     return started
 
+def _setup_api_executor():
+    global request_executor
+    loop = asyncio.get_running_loop()
+    if request_executor is None:
+        request_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers = api_thread_pool_workers,
+            thread_name_prefix = "fastllm-api")
+        loop.set_default_executor(request_executor)
+        started = _prewarm_request_executor(
+            request_executor, api_thread_pool_workers)
+        logging.info(
+            "FastLLM API request thread pool: workers=%d, prewarmed=%d",
+            api_thread_pool_workers, started)
+
 class FastLLMUvicornServer(uvicorn.Server):
     def __init__(self, config, startup_progress = None):
         super().__init__(config)
         self.startup_progress = startup_progress
 
     async def startup(self, sockets = None):
-        global request_executor
-        loop = asyncio.get_running_loop()
-        if request_executor is None:
-            request_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers = api_thread_pool_workers,
-                thread_name_prefix = "fastllm-api")
-            loop.set_default_executor(request_executor)
-            started = _prewarm_request_executor(
-                request_executor, api_thread_pool_workers)
-            logging.info(
-                "FastLLM API request thread pool: workers=%d, prewarmed=%d",
-                api_thread_pool_workers, started)
+        _setup_api_executor()
         await super().startup(sockets)
         if self.started and not self.should_exit:
             from .llm import disable_cuda_malloc
@@ -275,7 +279,6 @@ def _fastllm_server(args, startup_progress):
     if args.api_key:
         @app.middleware("http")
         async def authentication(request: Request, call_next):
-            print("auth")
             if request.method == "OPTIONS":
                 return await call_next(request)
             url_path = request.url.path            
@@ -341,6 +344,25 @@ def _fastllm_server(args, startup_progress):
         api_thread_pool_workers = default_workers
     api_thread_pool_workers = max(1, min(256, api_thread_pool_workers))
     set_ulimit()
+    if getattr(args, 'deploy_fastipc', None):
+        from .deploy.ipc_server import serve_worker
+        from .llm import disable_cuda_malloc
+        socket_path, capacity, body_limit = args.deploy_fastipc
+        async def serve():
+            _setup_api_executor()
+            def ready():
+                disable_cuda_malloc()
+                startup_progress.ready()
+            await serve_worker(app, socket_path, int(capacity), int(body_limit), on_ready=ready)
+        startup_progress.progress("server_starting", 1, 1)
+        # Match the ordinary server's choice of event loop.
+        try:
+            import uvloop
+        except ImportError:
+            pass
+        else:
+            uvloop.install()
+        return asyncio.run(serve())
     config = uvicorn.Config(app, host = args.host, port = args.port)
     startup_progress.progress("server_starting", 1, 1)
     FastLLMUvicornServer(config, startup_progress = startup_progress).run()

@@ -550,23 +550,15 @@ if (USE_CUDA)
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MOE16_SM90)
     endif()
 
-    # The host pass must only reference the online decode kernels when the fatbin
-    # contains an image for one of the architectures used by runtime dispatch.
-    set(FASTLLM_CUDA_REQUESTED_ARCHS ${FASTLLM_CUDA_ARCHITECTURES})
-    if ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES)
-        list(APPEND FASTLLM_CUDA_REQUESTED_ARCHS ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
-    endif()
-    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
-        FASTLLM_CUDA_REQUESTED_ARCHS MATCHES "(^|;)(10[03][af]?(-real|-virtual)?|all(-major)?)(;|$)")
-        set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
-            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_BUILD_NAIVE_BLACKWELL_DECODE)
-    endif()
-
     # Embed only the pinned kernel headers; no Python/JIT/runtime dependency.
     set(FASTLLM_MIMO_MEGA_ARCHS "")
     if (UNIX AND NOT APPLE AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE AND
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
-        foreach(arch IN LISTS FASTLLM_CUDA_REQUESTED_ARCHS)
+        set(FASTLLM_MIMO_MEGA_REQUESTED_ARCHS ${FASTLLM_CUDA_ARCHITECTURES})
+        if ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES)
+            list(APPEND FASTLLM_MIMO_MEGA_REQUESTED_ARCHS ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+        endif()
+        foreach(arch IN LISTS FASTLLM_MIMO_MEGA_REQUESTED_ARCHS)
             string(REGEX MATCH "^[0-9]+" number "${arch}")
             if (number STREQUAL "90" AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
                 list(APPEND FASTLLM_MIMO_MEGA_ARCHS 90)
@@ -601,6 +593,7 @@ if (USE_CUDA)
         set(FASTLLM_CUDA_SM120_SOURCES
             ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
             ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            src/devices/cuda/moe/fastllm-mxfp4-ep-generic.cu
             ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
             src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
             src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
@@ -4345,6 +4338,9 @@ if (BUILD_CLI)
 endif()
 
 add_library(fastllm_tools SHARED tools/src/pytools.cpp)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(fastllm_tools PRIVATE fastipc/fastipc.cpp)
+endif()
 target_link_libraries(fastllm_tools PRIVATE fastllm)
 
 set(BUILD_INFO_USE_CUDA "false")
@@ -4373,6 +4369,17 @@ if (USE_IVCOREX)
 endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
 "{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
+
+# copy_directory overlays existing files. Replace each shipped EP package so
+# incremental builds cannot bundle CUBINs retired from its manifest.
+file(GLOB sm120_ep_manifests "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/kernels/mxfp4_ep/*/manifest.json")
+foreach(manifest IN LISTS sm120_ep_manifests)
+    get_filename_component(package_dir "${manifest}" DIRECTORY)
+    get_filename_component(package_name "${package_dir}" NAME)
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "${CMAKE_BINARY_DIR}/tools/ftllm/kernels/mxfp4_ep/${package_name}"
+        VERBATIM)
+endforeach()
 
 if (${CMAKE_HOST_WIN32})
     add_custom_command(
@@ -4416,7 +4423,6 @@ endif()
 
 if (USE_CUDA AND NOT USE_ROCM)
     # A package-only update must refresh the POST_BUILD copy as well.
-    file(GLOB sm120_ep_manifests "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/kernels/mxfp4_ep/*/manifest.json")
     set_property(TARGET fastllm_tools APPEND PROPERTY LINK_DEPENDS
         ${sm120_ep_manifests} "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_sm120_ep/UPSTREAM.json")
     add_custom_command(TARGET fastllm_tools POST_BUILD

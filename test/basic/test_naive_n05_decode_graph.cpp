@@ -800,7 +800,7 @@ int main() {
             TestPaddedAttention(batch, 8, 192, 128, sparse, fp8);
             TestPaddedAttention(batch, 2, 64, 256, sparse, fp8);
         }
-        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 24, 32, 48, 64, 128})
+        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 32, 48, 64, 128, 129})
             for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})

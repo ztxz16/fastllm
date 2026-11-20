@@ -13,8 +13,8 @@ struct HopperStorage {
     int selected[Tile];
     float alpha[8], denominator[8];
 };
-__global__ __launch_bounds__(256) void Hopper(const BF *q,
-        FastllmNaiveKV key, FastllmNaiveKV value, const int *indices,
+template<class KV> __global__ __launch_bounds__(256) void Hopper(const BF *q,
+        KV key, KV value, const int *indices,
         const float *sink, BF *out, int heads, int kvHeads, int stride,
         int keys, int count, int past, bool causal, int indexTile = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900

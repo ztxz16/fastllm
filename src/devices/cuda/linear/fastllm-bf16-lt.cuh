@@ -14,10 +14,11 @@
 #include <vector>
 
 // Tune small BF16 GEMMs using algorithms supported by the current GPU/library.
-// Large prefill retains GemmEx. Calls use the per-thread default stream.
+// Callers can request a fixed reduction order. Calls use the per-thread default stream.
 namespace fastllm_bf16_lt {
 constexpr size_t workspaceBytes = 8ull << 20;
 constexpr size_t maxPlans = 64;
+constexpr int prefillReferenceRows = 2048;
 constexpr size_t maxWorkspacesPerDevice = 16; // 128 MiB, including graph-held buffers
 constexpr int maxCandidates = 8;
 constexpr int timingRepeats = 32;
@@ -194,7 +195,7 @@ struct State {
     }
 };
 
-inline State *GetState(int device, bool capture) {
+inline State *GetState(int device, bool capture, bool needsWorkspace = true) {
     static thread_local std::map<int, std::unique_ptr<State>> local;
     auto found = local.find(device);
     if (found == local.end()) {
@@ -207,6 +208,7 @@ inline State *GetState(int device, bool capture) {
     if (!capture) {
         state.captured = nullptr;
         state.captureId = 0;
+        if (!needsWorkspace) return &state;
         if (!state.eager) state.eager = AcquireWorkspace(device);
         if (!state.eager) return nullptr; // retry once other owners return leases
 #if CUDART_VERSION >= 11030
@@ -294,7 +296,7 @@ inline bool Run(State &s, Plan &p, const cublasLtMatmulAlgo_t &algo,
                 const void *weight, const void *input, void *output, void *workspace) {
     float alpha = 1.0f, beta = 0.0f;
     return CheckBlas(cublasLtMatmul(s.handle, p.op, &alpha, weight, p.a, input, p.b,
-        &beta, output, p.c, output, p.c, &algo, workspace, workspaceBytes, cudaStreamPerThread));
+        &beta, output, p.c, output, p.c, &algo, workspace, workspace ? workspaceBytes : 0, cudaStreamPerThread));
 }
 
 inline bool MakeLayouts(Plan &p, const Key &key) {
@@ -310,7 +312,7 @@ inline bool MakeLayouts(Plan &p, const Key &key) {
 }
 
 inline void MakePlan(State &s, Plan &p, const Key &key,
-                     const void *weight, const void *input, void *output) {
+                     const void *weight, const void *input, void *output, bool heuristicOnly = false) {
     if (!MakeLayouts(p, key)) return;
     const int M = key[0];
     const auto dtype = static_cast<cudaDataType_t>(key[6]);
@@ -319,9 +321,10 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     if (!CheckBlas(cublasLtMatmulPreferenceCreate(&search.preference))) return;
     // Allow unsplit GEMM or split-K with FP32 intermediate results. This avoids
     // BF16 partial-sum rounding, but does NOT reproduce the single-row GEMV tree.
+    const size_t limit = heuristicOnly ? 0 : workspaceBytes;
     uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
     if (!CheckBlas(cublasLtMatmulPreferenceSetAttribute(search.preference,
-            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspaceBytes, sizeof(workspaceBytes))) ||
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit, sizeof(limit))) ||
         !CheckBlas(cublasLtMatmulPreferenceSetAttribute(search.preference,
             CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &reduction, sizeof(reduction)))) return;
     const cublasLtMatmulPreferenceAttributes_t attributes[] = {
@@ -336,6 +339,22 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     int count = 0;
     if (!CheckBlas(cublasLtMatmulAlgoGetHeuristic(s.handle, p.op, p.a, p.b, p.c, p.c,
             search.preference, maxCandidates, candidates, &count)) || count == 0) return;
+    if (heuristicOnly) {
+        // The reference layout can exceed the actual buffers. Query it without
+        // executing a trial. Unsplit GEMM keeps the reduction independent of M.
+        for (int i = 0; i < count; ++i) {
+            uint32_t split = 0;
+            size_t written = 0;
+            if (candidates[i].state == CUBLAS_STATUS_SUCCESS && !candidates[i].workspaceSize &&
+                CheckBlas(cublasLtMatmulAlgoConfigGetAttribute(&candidates[i].algo,
+                    CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split, sizeof(split), &written)) && split <= 1) {
+                p.algo = candidates[i].algo;
+                p.valid = true;
+                break;
+            }
+        }
+        return;
+    }
     // BF16 decode on Hopper values reproducibility across TP ranks and
     // restarts. Timing near-tied algorithms (especially under a profiler) can
     // change both latency and the reduction tree. Use the library's first
@@ -423,10 +442,11 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
 inline bool Matmul(const void *input, const void *weight, void *output, int M, int K, int N,
                    cudaDataType_t storage = CUDA_R_16BF, int referenceRows = 0) {
     // This bounds tuning cost, not model/architecture-specific dispatch.
-    if (N <= 0 || K <= 0) return false;
+    const bool prefill = referenceRows == prefillReferenceRows;
+    if (M <= 0 || N <= 0 || K <= 0) return false;
     if (storage == CUDA_R_16BF) {
-        if (M < 1 || M > (referenceRows ? 256 : 32) ||
-            (referenceRows && (referenceRows != 32 || M % referenceRows))) return false;
+        if (!prefill && (M > (referenceRows ? 256 : 32) ||
+            (referenceRows && (referenceRows != 32 || M % referenceRows)))) return false;
     } else if (storage == CUDA_R_16F) {
         // Large decode heads amortize tuning and saturate Hopper bandwidth.
         // Other shapes retain their native GEMV and exact-row reduction tree.
@@ -437,9 +457,13 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
     CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
     int device = 0;
     CheckCuda(cudaGetDevice(&device));
-    State *s = GetState(device, capture != cudaStreamCaptureStatusNone);
-    if (!s || (referenceRows && s->arch != 90)) return false;
+    State *s = GetState(device, capture != cudaStreamCaptureStatusNone, !prefill);
+    if (!s || (referenceRows && s->arch != (prefill ? 120 : 90))) return false;
     Key key{M, N, K, Alignment(weight), Alignment(input), Alignment(output), static_cast<int>(storage), referenceRows};
+    if (prefill) {
+        if (std::min({key[3], key[4], key[5]}) < 16) return false;
+        key[3] = key[4] = key[5] = 16;
+    }
     auto found = s->plans.find(key);
     if (found == s->plans.end()) {
         if (capture != cudaStreamCaptureStatusNone) return false;
@@ -452,13 +476,12 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
         }
         auto plan = std::make_unique<Plan>();
         if (referenceRows) {
-            // Select exactly the ordinary 32-row plan, then keep its tile and
-            // reduction configuration while extending only the row dimension.
-            Key reference = key; reference[0] = referenceRows; reference[7] = 0;
+            // Keep the reference tile and reduction configuration and vary only M.
+            Key reference = key; reference[0] = referenceRows; reference[7] = prefill ? -1 : 0;
             auto original = s->plans.find(reference);
             if (original == s->plans.end()) {
                 auto base = std::make_unique<Plan>();
-                MakePlan(*s, *base, reference, weight, input, output);
+                MakePlan(*s, *base, reference, weight, input, output, prefill);
                 original = s->plans.emplace(reference, std::move(base)).first;
             }
             if (original->second->valid && MakeLayouts(*plan, key)) {
@@ -466,7 +489,7 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
                 plan->algo = original->second->algo;
                 plan->valid = CheckBlas(cublasLtMatmulAlgoCheck(s->handle, plan->op,
                     plan->a, plan->b, plan->c, plan->c, &plan->algo, &checked)) &&
-                    checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= workspaceBytes;
+                    checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= (prefill ? 0 : workspaceBytes);
             }
         } else MakePlan(*s, *plan, key, weight, input, output);
         found = s->plans.emplace(key, std::move(plan)).first;
@@ -474,6 +497,7 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
     Plan &p = *found->second;
     p.lastUse = ++s->planClock;
     if (!p.valid) return false;
+    if (prefill) return Run(*s, p, p.algo, weight, input, output, nullptr);
     void *workspace = capture == cudaStreamCaptureStatusNone
         ? s->eager->data : CaptureWorkspace(*s);
     return workspace && Run(*s, p, p.algo, weight, input, output, workspace);

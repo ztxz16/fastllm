@@ -118,7 +118,16 @@ def resolve_config(data, source):
     router = copy.deepcopy(data.get('router', {}))
     fields(router, ('host', 'port', 'max_inflight_per_replica', 'queue_limit_per_replica',
                     'queue_timeout_seconds', 'request_timeout_seconds', 'max_sessions',
-                    'affinity_ttl_seconds', 'health_interval_seconds', 'max_body_bytes'), 'router')
+                    'affinity_ttl_seconds', 'health_interval_seconds', 'max_body_bytes', 'transport'), 'router')
+    replicas = data.get('replicas')
+    if not isinstance(replicas, list) or not replicas:
+        raise ValueError('At least one replica is required')
+    # An explicit replica port is part of the existing HTTP deployment contract.
+    transport = router.setdefault('transport', 'http' if any(
+        isinstance(r, dict) and 'port' in r for r in replicas) else 'fastipc')
+    ipc = transport == 'fastipc'
+    if transport not in ('http', 'fastipc'):
+        raise ValueError('router.transport must be http or fastipc')
     host = router.setdefault('host', '127.0.0.1')
     if not isinstance(host, str) or not host or any(c in host for c in ('/', '\0', '\n')):
         raise ValueError('Invalid router host')
@@ -138,9 +147,6 @@ def resolve_config(data, source):
     capacity = router.get('max_inflight_per_replica', args.max_batch)
     integer(capacity, 'router.max_inflight_per_replica (required when --max_batch is automatic)')
     router['max_inflight_per_replica'] = capacity
-    replicas = data.get('replicas')
-    if not isinstance(replicas, list) or not replicas:
-        raise ValueError('At least one replica is required')
     roles, names, ports, devices = [], set(), {port}, set()
     for index, replica in enumerate(replicas):
         fields(replica, ('name', 'gpus', 'port', 'env', 'max_inflight', 'numa_node'), 'replica')
@@ -163,10 +169,12 @@ def resolve_config(data, source):
         if len(set(gpu_ids)) != len(gpu_ids) or devices.intersection(gpu_ids):
             raise ValueError('Replica GPU assignments overlap')
         devices.update(gpu_ids)
-        port = integer(replica.get('port'), 'replica.port', maximum=65535)
-        if port in ports:
-            raise ValueError('Replica and router ports must be distinct')
-        ports.add(port)
+        port = (None if ipc and 'port' not in replica else
+                integer(replica.get('port'), 'replica.port', maximum=65535))
+        if port is not None:
+            if port in ports:
+                raise ValueError('Replica and router ports must be distinct')
+            ports.add(port)
         limit = integer(replica.get('max_inflight', capacity), 'replica.max_inflight')
         if args.max_batch > 0 and limit > args.max_batch:
             raise ValueError('Router max_inflight exceeds worker --max_batch')
@@ -178,9 +186,9 @@ def resolve_config(data, source):
             env['PYTHONPATH'] = control_pythonpath()
         roles.append({'name': name, 'gpus': gpu_ids, 'port': port, 'max_inflight': limit,
                       'numa_node': numa_node,
-                      'url': f'http://127.0.0.1:{port}', 'env': env, 'cwd': str(base),
+                      'url': None if ipc else f'http://127.0.0.1:{port}', 'env': env, 'cwd': str(base),
                       'command': [python, *entry, *data['serve_args'], '--host', '127.0.0.1',
-                                  '--port', str(port), '--startup-progress', 'ndjson']})
+                                  *([] if ipc else ['--port', str(port)]), '--startup-progress', 'ndjson']})
     sequential = data.get('sequential_start', True)
     if type(sequential) is not bool:
         raise ValueError('sequential_start must be a boolean')

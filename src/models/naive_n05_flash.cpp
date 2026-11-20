@@ -16,9 +16,11 @@
 #ifdef USE_CUDA
 #include "naive_n05_indexer_tp.h"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
+#include "devices/cuda/naive-n05-swa-prefill.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-linear-scratch.h"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -78,7 +80,8 @@ namespace {
         if (!rows.empty() && rows.size() < 16) {
             int capacity = 0;
             for (const auto &row : rows) capacity = std::max(capacity, row.capacity);
-            directWidth = std::min(2048, ((capacity + page - 1) / page) * (page / ranks));
+            const int pages = capacity / page + (capacity % page != 0);
+            directWidth = std::min(2048, pages * (page / ranks));
         }
         const int rowWords = (directWidth ? directWidth : 2048) * 2;
         const int part = rows.size() * rowWords;
@@ -154,12 +157,16 @@ void NaiveN05FlashModel::SetIndexerDataType(DataType type) {
 }
 
 void NaiveN05FlashModel::SetIndexerComputeFP8(bool enabled) {
+    SetIndexerCompute(NaiveIndexerComputeFromFP8(enabled));
+}
+
+void NaiveN05FlashModel::SetIndexerCompute(NaiveIndexerCompute mode) {
     if (tpPrepared || tpServingState || !tpKVPool.empty() || !activePrefixes.empty())
         throw std::invalid_argument("Set Indexer compute dtype before warmup or inference.");
 #ifndef USE_CUDA
-    if (enabled) throw std::invalid_argument("FP8 Indexer compute requires CUDA.");
+    if (mode != NaiveIndexerCompute::Auto) throw std::invalid_argument("FP8 Indexer compute requires CUDA.");
 #endif
-    indexerComputeFP8 = enabled;
+    indexerCompute = mode;
 }
 
 void NaiveN05FlashModel::SetIndexerTPStorage(bool shardByLayer, bool shardByContext) {
@@ -764,7 +771,7 @@ void NaiveN05FlashModel::RunLocalPrefillRouter(Data &normed, Data &routerWeight,
             destination.FakeFrom(input, shardRow * embed_dim * sizeof(float));
             ToDataType(source, destination, FLOAT32);
         });
-        if (!FastllmCudaNaiveRouterFP32(input, routerWeight, projectedRouter))
+        if (!FastllmCudaNaiveRouterFP32(input, routerWeight, projectedRouter, routerInput))
             Linear(input, routerWeight, Data(), projectedRouter);
         forEachSpan([&](size_t localRow, size_t shardRow, int count) {
             FastllmCudaCopyFromDeviceToDevice((float *)router.cudaData + localRow * experts,
@@ -795,6 +802,7 @@ Data NaiveN05FlashModel::RunTarget(
     const bool decodeWorkspace = workspace && workspace->capacity > 0;
     const bool verifying = capture && capture->verifying;
     const bool graphVerify = decodeWorkspace && verifying;
+    const bool batchDecode = batch && batch->Decode();
     const int gpu = tensorParallel ? tpDevices.at(tpRank) : -1;
     Data emptyWeight;
     auto localWeight = [&](const std::string &name) -> Data & {
@@ -830,7 +838,7 @@ Data NaiveN05FlashModel::RunTarget(
                     data.Count(0), embed_dim, rms_norm_eps, data.dataType, gpu)) return true;
         }
 #endif
-        if (((batch && batch->Decode()) || (capture && capture->verifying)) && inputIds.dims[1] > 1) {
+        if ((batchDecode || verifying) && inputIds.dims[1] > 1) {
             if (!FastllmCudaCustomAllReduceRows(data.cudaData, data.cudaData,
                     data.Count(0), embed_dim, data.dataType, gpu)) {
                 // An unsupported/disabled custom path must retain ordinary
@@ -864,7 +872,7 @@ Data NaiveN05FlashModel::RunTarget(
     // especially the FP32 router where rounding can change expert selection.
     // BF16 tensor-core projections can use cuBLAS and allow bounded
     // floating-point differences from independent single-row decoding.
-    if ((batch && batch->Decode()) || (capture && capture->verifying))
+    if (batchDecode || verifying)
         FastllmCudaSetLinearExactBatchThreshold(std::max(previousExactThreshold, length + 1));
     Data &firstKey = batch ? batch->Key(0, 0) : pastKeyValues[0].first;
     int pastLength = firstKey.dims.empty() ? 0 : firstKey.dims[1];
@@ -965,7 +973,11 @@ Data NaiveN05FlashModel::RunTarget(
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
     const bool compactPrefillHead = localMoeRows && !decodeWorkspace && !verifying &&
         (!capture || !capture->collectHidden);
-    const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace &&
+    // A request must keep the same FFN reduction and local router when another
+    // KV owner joins a prefill batch.
+    const bool stablePrefill = attentionParallel && attentionParallel->stablePrefillReduction &&
+        !decodeWorkspace && !verifying && (batch ? !batchDecode : length > 1);
+    const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace && !stablePrefill &&
         std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
             [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
     int maxLocalRows = 0;
@@ -975,6 +987,9 @@ Data NaiveN05FlashModel::RunTarget(
     const bool canReusePrefillProjections = !decodeWorkspace && !verifying && attentionParallel &&
         AttentionTPSize() == 1 && (!capture || (!capture->collectHidden && capture->prefixes.empty())) &&
         FastllmCudaHasBlackwellIndexerAttention();
+    const int dpGroup = attentionParallel ? attentionParallel->runtime.Layout().AttentionOwner(tpRank) : 0;
+    const TargetBatch *attentionBatch = attentionParallel ? attentionParallel->groups[dpGroup].batch.get() : batch;
+    const bool attentionBatchDecode = attentionParallel ? attentionBatch && attentionBatch->Decode() : batchDecode;
     struct PrefillProjectionViews { Data key, value, attention; };
     std::optional<PrefillProjectionViews> projectionViews;
     for (int layer = 0; layer < block_cnt; layer++) {
@@ -1016,12 +1031,10 @@ Data NaiveN05FlashModel::RunTarget(
         // retains that order; other layouts use the canonical world rows.
         if ((!decodeWorkspace && !prefillNormReady) || layer == 0)
             norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
-        const int dpGroup = attentionParallel ? attentionParallel->runtime.Layout().AttentionOwner(tpRank) : 0;
         const int globalLength = length;
-        const TargetBatch *globalBatch = batch;
         if (!attentionParallel || !attentionParallel->groups[dpGroup].lengths.empty()) {
         const int length = attentionParallel ? attentionParallel->rows.localToGlobal[dpGroup].size() : globalLength;
-        const TargetBatch *batch = attentionParallel ? attentionParallel->groups[dpGroup].batch.get() : globalBatch;
+        const TargetBatch *batch = attentionBatch;
         Data &positions = attentionParallel ? attentionParallel->ranks[tpRank].positions : buf.positions;
         Data &normed = attentionParallel ? attentionParallel->ranks[tpRank].normalized : buf.normed;
         Data &projected = attentionParallel ? attentionParallel->ranks[tpRank].projected : buf.projected;
@@ -1052,10 +1065,9 @@ Data NaiveN05FlashModel::RunTarget(
         int rotaryDim = (int)(cfg.headDim * partialRotary);
         const auto merged = weight.weight.find(ap + "mergeqkv.weight");
         const bool mergedQkv = merged != weight.weight.end() && !merged->second.dims.empty();
-        const bool batchRope = batch && (batch->Size() > 1 || buf.cacheTable) &&
-            batch->Decode() && decodeWorkspace && !graphVerify &&
-            (!capture || !capture->verifying);
-        const bool reusePrefillQkv = canReusePrefillProjections && mergedQkv && batch && !batch->Decode();
+        const bool batchRope = attentionBatchDecode && (batch->Size() > 1 || buf.cacheTable) &&
+            decodeWorkspace && !verifying;
+        const bool reusePrefillQkv = canReusePrefillProjections && mergedQkv && batch && !attentionBatchDecode;
         if (reusePrefillQkv && layer == 0) {
             // Full and sliding layers share the projection buffer, but can have
             // different output widths. Reserve the largest actual merged shard
@@ -1131,14 +1143,16 @@ Data NaiveN05FlashModel::RunTarget(
             indexTopK <= 2048 && cfg.headDim <= 256 &&
             (cfg.valueDim == 128 || cfg.valueDim == 256) &&
             (batchVerifyDSA || (!verifying &&
-                (batch ? batch->Decode() : length == 1)));
+                (batch ? attentionBatchDecode : length == 1)));
         std::vector<FastllmNaiveDSARow> dsaRows;
         if (batchedDSA) dsaRows.reserve(length);
         const bool verifySWA = verifying && (!graphVerify || (batch && capture->ringVerify)) && window == 128 &&
             cfg.headDim == 192 && cfg.valueDim == 128 &&
             (attentionParallel || cfg.heads < 64 || cfg.heads / cfg.kvHeads != 8);
-        const bool batchedSWA = slidingLayers[layer] &&
-            (verifySWA || (decodeWorkspace && batch && batch->Decode() && tpSwaRingCache));
+        const bool ringBatchDecode = slidingLayers[layer] && tpSwaRingCache && attentionBatchDecode;
+        const bool eagerSwa = ringBatchDecode && !verifying && !decodeWorkspace && !tpSwaPrefillWorkspaces.empty();
+        const bool batchedSWA = (slidingLayers[layer] && verifySWA) ||
+            (ringBatchDecode && decodeWorkspace) || eagerSwa;
         std::vector<FastllmNaiveSWARow> swaRows;
         if (batchedSWA) swaRows.reserve(length);
         auto prepareIndexKey = [&](Data &normed, TargetWorkspace &buf, bool alreadyProjected = false) {
@@ -1410,7 +1424,7 @@ Data NaiveN05FlashModel::RunTarget(
         // requests before bounded Indexer/Attention batches; SWA retains its shared
         // rolling workspace and existing specialized kernels.
         const bool dpPrefill = attentionParallel && AttentionTPSize() == 1 && batch &&
-            !batch->Decode() && !decodeWorkspace && !verifying && !sparseLayer &&
+            !attentionBatchDecode && !decodeWorkspace && !verifying && !sparseLayer &&
             !slidingLayers[layer];
         if (dpPrefill && reuseAttention && !indexerLayerSharding && indexTopK > 0 &&
             int64_t(qkv.dims.back()) - int64_t(cfg.heads) * cfg.valueDim >= 2LL * indexTopK) {
@@ -1428,6 +1442,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
         }
         std::vector<FastllmNaivePrefillAttentionItem> prefillAttention;
+        std::vector<FastllmNaiveStagedSwa> stagedSwa;
         bool pairedPrefill = false;
         int attendPhase = 0;
         std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
@@ -1474,10 +1489,11 @@ Data NaiveN05FlashModel::RunTarget(
                 if (sparseLayer && !batchedDSA)
                     sparseKv->ranks[tpRank]->layers[layer]->InvalidateTail(cacheKey.cudaData, localPast, cudaStreamPerThread);
                 if (sharedSwa) {
-                    pastKey.Resize({1, localPast, cfg.kvHeads * cfg.headDim});
-                    pastValue.Resize({1, localPast, cfg.kvHeads * cfg.valueDim});
+                    const int history = eagerSwa ? 0 : localPast;
+                    pastKey.Resize({1, history, cfg.kvHeads * cfg.headDim});
+                    pastValue.Resize({1, history, cfg.kvHeads * cfg.valueDim});
                     CopySwaWindow(cacheKey, cacheValue, pastKey, pastValue,
-                        ringCache ? (globalPast - localPast) % window : 0, 0, localPast, ringCache ? window : 0);
+                        ringCache ? (globalPast - history) % window : 0, 0, history, ringCache ? window : 0);
                 }
                 // Graph replay reads/writes the ring directly. Eager prefill/fallback
                 // uses the existing contiguous kernels and restores the ring once.
@@ -1701,7 +1717,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 rankIndices.FakeFrom(indices, (size_t)tpRank * rows * indexTopK * sizeof(int));
                                 const bool mergedParts = balanced && indexTopK == 2048 &&
                                     FastllmCudaNaiveBalancedIndexer(indexQ, indexWeights, *scoreKey,
-                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding || contextSharded, rankIndices, prefillScores, indexerComputeFP8);
+                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding || contextSharded, rankIndices, prefillScores, indexerCompute);
                                 for (int part = 0; !mergedParts && part < parts; ++part) {
                                     const int first = part == 0 ? tpRank * partRows :
                                         length - (tpRank + 1) * partRows;
@@ -1714,7 +1730,7 @@ Data NaiveN05FlashModel::RunTarget(
                                     localIndices.FakeFrom(indices,
                                         (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
                                     FastllmCudaNaiveIndexer(localQ, localWeights, *scoreKey, indexHeads, indexDim,
-                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding || contextSharded, prefillScores, indexerComputeFP8);
+                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding || contextSharded, prefillScores, indexerCompute);
                                 }
                                 FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
                                 if (balanced) balancedIndexRanks = ranks;
@@ -1723,7 +1739,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 Data temporary;
                                 Data &gathered = length % ranks ? temporary : indices;
                                 ScoreRaggedIndexer(indexQ, indexWeights, *scoreKey, localPast,
-                                    indexTopK, indexFp8, tpRank, ranks, gathered, prefillScores, indexerComputeFP8);
+                                    indexTopK, indexFp8, tpRank, ranks, gathered, prefillScores, indexerCompute);
                                 const int rows = RaggedIndexerRows(length, ranks);
                                 AssertInFastLLM(FastllmNcclAllGather(
                                     (int *)gathered.cudaData + (size_t)tpRank * rows * indexTopK,
@@ -1737,7 +1753,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 return;
                             }
                             else FastllmCudaNaiveIndexer(indexQ, indexWeights, *scoreKey, indexHeads, indexDim,
-                                                        localPast, indexTopK, indexFp8, indices, false, prefillScores, indexerComputeFP8);
+                                                        localPast, indexTopK, indexFp8, indices, false, prefillScores, indexerCompute);
                         }
                     }
                     }
@@ -1814,7 +1830,18 @@ Data NaiveN05FlashModel::RunTarget(
                 for (int query = 0; query < length; ++query) {
                     FastllmNaiveSWARow row{pastKey.cudaData, pastValue.cudaData,
                         layerCache ? layerCache + sequence * cacheStride : nullptr, pastKey.dataType == FP8_E4M3};
-                    if (verifySWA) {
+                    if (eagerSwa) {
+                        // The shared workspace holds only the new KV. Bind attention to
+                        // the request's ring before another row reuses that workspace.
+                        CopySwaWindow(pastKey, pastValue, cacheKey, cacheValue,
+                            0, globalPast % window, 1, 0, window);
+                        row.key = cacheKey.cudaData;
+                        row.value = cacheValue.cudaData;
+                        row.length = globalPast + 1;
+                        const int retained = std::min(row.length, window - 1);
+                        cacheKey.Resize({1, retained, cfg.kvHeads * cfg.headDim});
+                        cacheValue.Resize({1, retained, cfg.kvHeads * cfg.valueDim});
+                    } else if (verifySWA) {
                         row.ring = ringVerify;
                         row.length = (ringVerify ? globalPast : localPast) + query + 1;
                         row.verifyOffset = ringVerify ? query : -1;
@@ -1845,10 +1872,12 @@ Data NaiveN05FlashModel::RunTarget(
                             cfg.headDim, cfg.valueDim, prefillScores ? *prefillScores : normed)) {
                         // SWA has no Indexer projections. Its input norm is dead
                         // until the post-attention RMSNorm overwrites this slice.
-                        FastllmCudaNaiveAttention(q, attentionKey, attentionValue, *selected, sink,
+                        FastllmCudaNaivePrefillAttention(q, attentionKey, attentionValue, *selected, sink,
                             cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                             localPast, slidingLayers[layer] ? window : 0, attn, true,
-                            slidingLayers[layer] ? &normed : nullptr);
+                            slidingLayers[layer] ? &normed : nullptr,
+                            batch && batch->Size() > 1 && !verifying && q.isFake && attn.isFake && normed.isFake
+                                ? &stagedSwa : nullptr);
                     }
                 }
                 if (slidingLayers[layer] && capture && !capture->prefixes.empty()) {
@@ -1898,7 +1927,7 @@ Data NaiveN05FlashModel::RunTarget(
                     // Sequential prefill attention needs one scratch/history
                     // buffer, regardless of the number of admitted requests.
                     // Deferred Indexer scoring and decode keep independent rows.
-                    const bool sharedPrefill = !batch->Decode() && !decodeWorkspace &&
+                    const bool sharedPrefill = !attentionBatchDecode && !decodeWorkspace &&
                         !verifying && !batchPrefillIndex && !dpPrefill;
                     auto &part = sharedPrefill ? buf : *buf.sequences[sequence];
                     if (decodeWorkspace || (capture && capture->ringVerify)) {
@@ -1912,6 +1941,10 @@ Data NaiveN05FlashModel::RunTarget(
                            CacheReserveCapacity(batch->configs[sequence]), rowAttention,
                            sequence);
                     offset += count;
+                }
+                if (!stagedSwa.empty()) {
+                    FastllmCudaNaiveFlushSwa(stagedSwa, localWeight(ap + "attention_sink_bias"), cfg.heads, cfg.kvHeads);
+                    stagedSwa.clear();
                 }
                 if (batchVerifyIndex && phase == 0) {
                     if (contextSharded && !verifyIndexItems.empty()) {
@@ -1949,14 +1982,14 @@ Data NaiveN05FlashModel::RunTarget(
                             prefillItems[i].keys->dims[1] <= 8192;
                     if (!pairedPrefill)
                         FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
-                            indexFp8, prefillScores, indexerComputeFP8);
+                            indexFp8, prefillScores, indexerCompute);
                 }
                 if (batchPrefillIndex && phase == 0) {
                     AssertInFastLLM((int)prefillItems.size() == batch->Size(), "Incomplete prefill Indexer batch.");
-                    if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores, indexerComputeFP8)) {
+                    if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores, indexerCompute)) {
                         for (const auto &item : prefillItems) {
                             if (FastllmCudaNaiveBalancedIndexer(*item.query, *item.weights, *item.keys,
-                                    item.past, tpRank, prefillRanks, indexFp8, true, *item.indices, prefillScores, indexerComputeFP8)) continue;
+                                    item.past, tpRank, prefillRanks, indexFp8, true, *item.indices, prefillScores, indexerCompute)) continue;
                             const int part = item.query->dims[1] / (2 * prefillRanks);
                             for (int range = 0; range < 2; ++range) {
                                 const int first = range ? item.query->dims[1] - (tpRank + 1) * part : tpRank * part;
@@ -1966,7 +1999,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 localWeights.FakeFrom(*item.weights, (size_t)first * indexHeads * item.weights->unitSize);
                                 localIndices.FakeFrom(*item.indices, (size_t)range * part * indexTopK * sizeof(int));
                                 FastllmCudaNaiveIndexer(localQ, localWeights, *item.keys, indexHeads, indexDim,
-                                    item.past + first, indexTopK, indexFp8, localIndices, true, prefillScores, indexerComputeFP8);
+                                    item.past + first, indexTopK, indexFp8, localIndices, true, prefillScores, indexerCompute);
                             }
                         }
                     }
@@ -1985,7 +2018,7 @@ Data NaiveN05FlashModel::RunTarget(
             for (size_t i = 0; i < prefillItems.size(); ++i)
                 FastllmCudaNaivePrefillIndexedAttention(prefillItems[i], prefillAttention.at(i),
                     localWeight(ap + "attention_sink_bias"), indexHeads, indexDim, indexTopK,
-                    indexFp8, indexerComputeFP8, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    indexFp8, indexerCompute, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     prefillScores, prefillScores ? *prefillScores : normed);
         } else if (dpPrefill)
             FastllmCudaNaiveBatchIndexerAttention(prefillAttention, localWeight(ap + "attention_sink_bias"),
@@ -2067,7 +2100,7 @@ Data NaiveN05FlashModel::RunTarget(
         if (batchedSWA) {
             Data eagerLengths;
             FastllmCudaNaiveBatchSWADecode(q, localWeight(ap + "attention_sink_bias"), swaRows,
-                verifySWA && !graphVerify ? eagerLengths : liveKeys, cfg.heads, cfg.kvHeads, attn);
+                eagerSwa || (verifySWA && !graphVerify) ? eagerLengths : liveKeys, cfg.heads, cfg.kvHeads, attn);
         }
         projectAttention(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
         if (attentionParallel && AttentionTPSize() > 1) {
@@ -2145,12 +2178,20 @@ Data NaiveN05FlashModel::RunTarget(
             Data &w1 = workspace ? buf.denseGate : buf.w1;
             Data &w2 = workspace ? buf.denseDown : buf.w2;
             Data &w3 = workspace ? buf.denseUp : buf.w3;
-            Linear(normed, localWeight(prefix + ".mlp.gate_proj.weight"), Data(), w1);
-            Linear(normed, localWeight(prefix + ".mlp.up_proj.weight"), Data(), w3);
+            auto project = [&](Data &input, Data &weight, Data &output) {
+                if (stablePrefill && FastllmCudaBFloat16PrefillLinear(input, weight, output)) return;
+                Linear(input, weight, Data(), output);
+            };
+            project(normed, localWeight(prefix + ".mlp.gate_proj.weight"), w1);
+            project(normed, localWeight(prefix + ".mlp.up_proj.weight"), w3);
             Silu(w1, w1);
             MulTo(w1, w3);
-            Linear(w1, localWeight(prefix + ".mlp.down_proj.weight"), Data(), w2);
-            addMlpResidual(w2, true);
+            project(w1, localWeight(prefix + ".mlp.down_proj.weight"), w2);
+            // NCCL BF16 may round partial sums at different ranks as the message
+            // grows. The row reduction accumulates ranks in FP32 and chunks large messages.
+            const bool reduced = stablePrefill && FastllmCudaCustomAllReduceRows(
+                w2.cudaData, w2.cudaData, w2.Count(0), embed_dim, w2.dataType, gpu);
+            addMlpResidual(w2, !reduced);
         } else {
             // EP ranks route only their contiguous token shard, borrowing
             // the normalized activation until MegaMoE finishes reading it.
@@ -2196,8 +2237,8 @@ Data NaiveN05FlashModel::RunTarget(
                     Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
                     ToDataType(routerSource, fp32Input, DataType::FLOAT32);
                     const bool prefillRouter = !verifying && !decodeWorkspace && length > 1 &&
-                        (!batch || !batch->Decode());
-                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router))
+                        !batchDecode;
+                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router, routerInput))
                         Linear(fp32Input, routerWeight, Data(), router);
                 }
                 Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
@@ -2255,7 +2296,7 @@ Data NaiveN05FlashModel::RunTarget(
                     {"biass___batch", (int)moeBiases[layer].size()},
                     {"layer", layer}, {"gateType", (int)MoeGateSwiglu}, {"fp8EagerMode", 1}
                 });
-            } else if (((batch && batch->Decode()) || (capture && capture->verifying)) && length > 1 &&
+            } else if ((batchDecode || verifying) && length > 1 &&
                        (moeWeights[layer][2]->dataType == DataType::BFLOAT16 ||
                         moeWeights[layer][2]->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) &&
                        normed.dataDevice == DataDevice::CUDA) {
@@ -2786,7 +2827,9 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         "Naive startup KV pool exceeds the memory budget; reduce --tokens/--max_batch or prefill chunk size.");
     const int pageLen = GetPageLen();
     const int fullLayers = std::count(slidingLayers.begin(), slidingLayers.end(), 0);
-    const int graphRows = DecodeGraphBatchBuckets(std::min(batch, MaxTPDecodeBatch)).back();
+    const auto graphBuckets = LocalServingGraphBuckets(batch);
+    AssertInFastLLM(!graphBuckets.empty(), "Naive graph batch exceeds tensor dimensions.");
+    const int graphRows = graphBuckets.back();
     const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
         ((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int) + 512) +
         (int64_t)block_cnt * graphRows * (separateIndex ? 8 : 4) * sizeof(void *) + 512;

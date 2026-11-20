@@ -123,6 +123,19 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     }
 }
 
+void NaiveN05FlashModel::ReleaseKVForReplay(ResponseContext *context) {
+    const Data *key = &context->pastKeyValues.front().first;
+    ReleaseRequestWindowStorage(context);
+    {
+        std::lock_guard<std::mutex> guard(historyMutex);
+        activePrefixes.erase(key);
+        if (saveHistoryChat) activePrefixes.try_emplace(key);
+    }
+    // Invalidate cached forward metadata. The independent sampling ID survives the replay.
+    std::lock_guard<std::mutex> guard(tpRequestMutex);
+    tpRequestIds.at(key) = ++tpNextRequestId;
+}
+
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
     const Data *key = context->pastKeyValues.empty() ? nullptr : &context->pastKeyValues.front().first;
     {
@@ -149,9 +162,10 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
                       << " accepted=" << s.accepted << " acceptance=" << (double)s.accepted / s.proposed
                       << " tokens_per_round=" << 1.0 + (double)s.accepted / s.rounds << std::endl;
         if (s.workspace || !s.kv.empty()) {
-            const size_t limit = maxBatch > 0 ? maxBatch : 512;
-            if (idleDraftContexts.size() >= limit) idleDraftContexts.pop_back();
-            idleDraftContexts.push_back(std::move(draft->second));
+            if (idleDraftContexts.size() < (size_t)(maxBatch > 0 ? maxBatch : 512))
+                idleDraftContexts.push_back(std::move(draft->second));
+            else
+                idleDraftContexts.back() = std::move(draft->second);
         }
         draftContexts.erase(draft);
     }

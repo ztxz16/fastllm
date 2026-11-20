@@ -134,7 +134,10 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     // An intervening prefill, verification or eager fallback may change cache
     // descriptors or shared graph storage. Revalidate on the next serving step.
-    if (!state.servingPadded) state.servingPlan.valid = false;
+    if (!state.servingPadded) {
+        if (batch && batch->proposals) batch->proposals->materialize();
+        state.servingPlan.valid = false;
+    }
     const auto &topology = state.runtime.Layout();
     const int sequences = batch ? batch->Size() : 1;
     const int total = inputIds.dims.at(1);
@@ -473,11 +476,21 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     for (auto &feature : captures) feature.ringVerify = ringVerify;
     if (graphDecode && verifying)
         for (auto &rank : tpDecodeState->ranks) rank->features.ringVerify = ringVerify;
+    std::vector<std::vector<FastllmCudaPackedBf16Slice>> packedSlices;
+    if (batch && batch->proposals && state.servingPadded &&
+        (batch->proposals->rows.empty() || !graphDecode || !tpDecodeState->captured))
+        batch->proposals->materialize();
     auto forwardRank = [&](int rank, int device) {
         const int group = topology.AttentionOwner(rank);
         auto &local = state.ranks[rank];
         Data logits;
         if (graphDecode) {
+            std::optional<FastllmCudaAllocationRecorder> recorder;
+            if (state.servingPadded && tpServingState->preparing && tpDecodeState->mode == TPDecodeState::Warm) {
+                auto &requests = tpDecodeState->ranks[rank]->captureAllocations;
+                requests.clear();
+                recorder.emplace(&requests);
+            }
             logits = ForwardTensorParallelDecode(rank, inputIds, positions, kv, config,
                 nullptr, &captures[rank], nullptr, batch, true);
             if (tpDecodeState->mode == TPDecodeState::Prepare ||
@@ -496,19 +509,22 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             const auto range = tpVocabRanges[rank];
             const size_t bytes = size_t(range.second - range.first) * sizeof(float);
             if (distributedVerification) {
+                const auto &source = packedSlices.empty() ? logits : tpDecodeState->ranks[rank]->storage->buffers.logitsBf16;
+                const size_t sourceBytes = size_t(range.second - range.first) * source.unitSize;
+                std::vector<void *> dst(liveRows);
+                std::vector<const void *> src(liveRows);
+                std::vector<size_t> dstPitch(liveRows, size_t(vocab) * sizeof(float));
+                std::vector<size_t> widths(liveRows, sourceBytes), heights(liveRows);
                 int row = 0;
-                std::vector<void *> dst;
-                std::vector<const void *> src;
-                std::vector<size_t> dstPitch, srcPitch, widths, heights;
                 for (int seq = 0; seq < liveRows; ++seq) {
-                    dst.push_back((float *)capture->logitsDestinations[seq]->cudaData + range.first);
-                    src.push_back((char *)logits.cudaData + size_t(row) * bytes);
-                    dstPitch.push_back(size_t(vocab) * sizeof(float)); srcPitch.push_back(bytes);
-                    widths.push_back(bytes); heights.push_back(state.verifyLengths ? state.verifyLengths->at(seq) : batch->lengths[seq]);
+                    const auto &out = *capture->logitsDestinations[seq];
+                    dst[seq] = static_cast<float *>(out.cudaData) + range.first;
+                    src[seq] = static_cast<const char *>(source.cudaData) + size_t(row) * sourceBytes;
+                    heights[seq] = out.dims[0];
                     row += batch->lengths[seq];
                 }
                 AssertInFastLLM(FastllmCudaBatchCopy2DAsyncCurrentThread(dst.data(), src.data(),
-                    dstPitch.data(), srcPitch.data(), widths.data(), heights.data(), dst.size()),
+                    dstPitch.data(), widths.data(), widths.data(), heights.data(), liveRows),
                     "Naive verification logits redistribution failed");
             } else if (shardedSampling) {
                 const int shards = tpDevices.size();
@@ -554,10 +570,18 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured && !tpDecodeState->disabled &&
         (!tpServingState || !tpServingState->preparing || tpServingState->capturing)) {
         auto &graph = *tpDecodeState;
+        // These prewarmed variants share rank buffers and replay serially. Use
+        // the same family identity for reservation, capture and pool pinning.
+        const void *family = state.servingPadded ? graph.ranks.front()->storage.get() : nullptr;
+        FastllmCudaGraphScratchGroup group(family);
         graph.mode = TPDecodeState::Prepare;
         state.runtime.Run(forwardRank);
         state.runtime.Run([&](int rank, int) {
-            graph.ranks[rank]->ok = FastllmCudaGraphPrepareCaptureDevice();
+            FastllmCudaGraphScratchGroup group(family);
+            auto &r = *graph.ranks[rank];
+            r.ok = FastllmCudaGraphPrepareCaptureDevice() &&
+                (r.captureAllocations.empty() || FastllmCudaReserveGraphWorkspace(r.captureAllocations));
+            r.captureAllocations.clear();
         });
         bool ok = std::all_of(graph.ranks.begin(), graph.ranks.end(), [](const auto &r) { return r->ok; });
         bool pool = ok && FastllmCudaGraphMemoryPoolBegin();
@@ -570,6 +594,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             int arrived = 0;
             std::vector<int> begun(tpDevices.size(), 0);
             state.runtime.Run([&](int rank, int device) {
+                FastllmCudaGraphScratchGroup group(family);
                 FastllmCudaClearThreadError();
                 begun[rank] = FastllmCudaGraphBeginCapture();
                 {
@@ -626,6 +651,33 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             }
         }
     } pendingSampling{tpDevices, state.sampling};
+    // Replay owns stable LM-head buffers. A BF16 head widens to FP32 by a
+    // bit shift; send its original bits straight into each destination slice.
+    // Eager execution, true FP32 heads and external destinations use full FP32.
+    if (distributedVerification && graphDecode && tpDecodeState->captured && !preparingVerify) {
+        bool bf16Heads = true;
+        for (size_t rank = 0; rank < tpDevices.size() && bf16Heads; ++rank) {
+            const auto &head = tpDecodeState->ranks[rank]->storage->buffers.logitsBf16;
+            const auto range = tpVocabRanges[rank];
+            bf16Heads = head.dataType == BFLOAT16 && head.cudaData &&
+                head.expansionBytes >= size_t(total) * (range.second - range.first) * sizeof(uint16_t);
+        }
+        if (bf16Heads) {
+            packedSlices.resize(tpDevices.size());
+            for (const Data *dst : capture->logitsDestinations) {
+                const auto owner = dst->dataDeviceIds.size() == 1
+                    ? std::find(tpDevices.begin(), tpDevices.end(), dst->dataDeviceIds.front()) : tpDevices.end();
+                if (owner == tpDevices.end()) {
+                    packedSlices.clear();
+                    break;
+                }
+                auto &slices = packedSlices[owner - tpDevices.begin()];
+                for (const auto &range : tpVocabRanges)
+                    slices.push_back({static_cast<float *>(dst->cudaData) + range.first,
+                                      range.second - range.first, dst->dims[0]});
+            }
+        }
+    }
     if (asyncSampling) {
         pendingSampling.active = true;
         state.runtime.Enqueue(forwardRank);
@@ -641,6 +693,15 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 "Naive attention DP sampling admission changed after submission");
         });
     } else state.runtime.Run(forwardRank);
+    if (!packedSlices.empty()) {
+        // Both Run calls join the workers' completion events: peer writes
+        // finish before local expansion, which in turn finishes before sampling.
+        state.runtime.Run([&](int rank, int) {
+            const auto &slices = packedSlices[rank];
+            AssertInFastLLM(FastllmCudaExpandPackedBf16Slices(slices.data(), slices.size(), vocab),
+                            "Naive verification logits expansion failed");
+        });
+    }
     if (graphDecode) {
         tpDecodeState->warmed = true;
         if (!std::all_of(tpDecodeState->ranks.begin(), tpDecodeState->ranks.end(),

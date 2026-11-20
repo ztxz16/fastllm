@@ -175,14 +175,15 @@ static void RunStatic(int device, int rows, int heads, int kvHeads, int dim, int
         "rejected static append changed outputs");
 }
 
-static void RunBatch(int batch, bool merged, bool ring, bool staged = false, bool indirect = false, bool fp8 = false) {
-    const int heads = 8, kvHeads = 1, dim = 192, vd = 128, rd = 64;
+static void RunBatch(int batch, bool merged, bool ring, bool staged = false, bool indirect = false,
+                     bool fp8 = false, int heads = 8, int kvHeads = 1) {
+    const int dim = 192, vd = 128, rd = 64;
     const int indexDim = ring || staged ? 0 : 128, capacity = staged ? 136 : ring ? 128 : 2052;
-    const int kc = dim + indexDim;
+    const int kc = kvHeads * dim + indexDim;
     Data q(BFLOAT16), qr(BFLOAT16), k(BFLOAT16), v(BFLOAT16), qkv(BFLOAT16), positions(FLOAT32), live(INT32);
     Init(q, {1, batch, heads * dim}, 0); Init(qr, q.dims, 0);
-    Init(k, {1, batch, dim}, 0); Init(v, {1, batch, vd}, 0);
-    Init(qkv, {1, batch, (heads + kvHeads) * dim + vd}, 0);
+    Init(k, {1, batch, kvHeads * dim}, 0); Init(v, {1, batch, kvHeads * vd}, 0);
+    Init(qkv, {1, batch, (heads + kvHeads) * dim + kvHeads * vd}, 0);
     Init(positions, {1, batch}, 0); Init(live, {batch}, 0);
     const auto cacheType = fp8 ? FP8_E4M3 : BFLOAT16;
     std::vector<Data> keys(batch, Data(cacheType)), values(batch, Data(cacheType)),
@@ -193,7 +194,7 @@ static void RunBatch(int batch, bool merged, bool ring, bool staged = false, boo
     std::vector<FastllmNaiveRopeCacheRow> rows;
     for (int b = 0; b < batch; ++b) {
         Init(keys[b], {1, capacity, kc}, 0); Init(keyRef[b], keys[b].dims, 0);
-        Init(values[b], {1, capacity, vd}, 0); Init(valueRef[b], values[b].dims, 0);
+        Init(values[b], {1, capacity, kvHeads * vd}, 0); Init(valueRef[b], values[b].dims, 0);
         if (indexDim) Init(index[b], {1, 1, indexDim}, 0);
         rows.push_back({&keys[b], &values[b], indexDim ? &index[b] : nullptr});
         if (staged) rows.back().verifyOffset = indirect ? b % 8 : 0;
@@ -308,8 +309,9 @@ int main() {
             RunBatch(batch, merged, false, true);
             RunBatch(batch, merged, true);
         }
-        for (int batch : {193, 257, 1025}) for (bool merged : {false, true})
+        for (int batch : {32, 128, 193, 257, 1025}) for (bool merged : {false, true})
             for (bool fp8 : {false, true}) RunBatch(batch, merged, false, true, true, fp8);
+        RunBatch(33, true, false, true, true, true, 64, 8);
         std::printf("Naive RoPE/cache: %d checks passed\n", checks);
         return 0;
     } catch (const std::exception &e) {

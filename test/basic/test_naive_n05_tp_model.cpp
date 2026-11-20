@@ -233,6 +233,9 @@ struct NaiveN05GraphTestAccess {
         if (model.tpSamplingLogits.GetBytes() != bytes)
             throw std::runtime_error("draft warmup sized verification logits for the training block");
         if (model.tpBatchVerifyStorage) for (const auto &rank : model.tpBatchVerifyStorage->ranks) {
+            const size_t slots = size_t(model.block_cnt) * model.maxBatch * (model.HasSeparateIndexer() ? 8 : 4);
+            if (rank->storage->hostCache.size() < slots || rank->storage->cacheTable.GetBytes() < slots * sizeof(void *))
+                throw std::runtime_error("draft warmup undersized the verification cache binding table");
             const auto &scratch = rank->storage->buffers.decode;
             const size_t rows = size_t(model.maxBatch) * (model.draftTokens + 1);
             if (scratch.indexQuery.Count(0) < rows * 16 * 128 ||
@@ -2355,7 +2358,7 @@ class Fixture : public NaiveN05FlashModel {
         if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
         const int captures = verifyGraphCaptures;
         int checks = 0, replayed = 0, eager = 0;
-        for (int prefix : (ragged ? std::vector<int>{3070} : std::vector<int>{3, 254, 2046, 4094})) {
+        for (int prefix : (ragged ? std::vector<int>{254, 3070} : std::vector<int>{3, 254, 2046, 4094})) {
             using Cache = std::vector<std::pair<Data, Data>>;
             const int requests = large ? maxBatch : ragged ? 9 : padding ? 47 : 8;
             std::vector<std::vector<std::vector<float>>> capturedLogits;
@@ -2363,9 +2366,12 @@ class Fixture : public NaiveN05FlashModel {
             for (bool graph : {true, false}) {
                 std::vector<Cache> actual(requests);
                 std::vector<int> past(requests, prefix);
-                // Nine requests pad to 16. The longest exceeds pool / 16 = 4096,
-                // while the total live KV fits the pool.
-                if (ragged) past[0] += 3072;
+                if (ragged) {
+                    // Cross the short-attention boundary with live lengths 255, 256 and 1023.
+                    // The longer case also exceeds pool / 16 while fitting the total budget.
+                    past[0] += prefix == 254 ? 768 : 3072;
+                    ++past[1];
+                }
                 GenerationConfig config;
                 config.input_token_length = prefix;
                 config.output_token_limit = 64;
@@ -5167,6 +5173,28 @@ class DraftFixture : public NaiveN05FlashModel {
             if (a.dims != b.dims || std::memcmp(a.cpuData, b.cpuData, a.GetBytes()))
                 throw std::runtime_error("draft DP non-root survivor graph/eager differs");
         }
+        NaiveN05GraphTestAccess::SetDraftDevices(*this, ranks);
+        auto otherOwner = std::make_shared<DraftContext>();
+        otherOwner->deviceRank = 0;
+        idleDraftContexts.push_back(otherOwner);
+        auto local = CreateDraftContext({1});
+        if (local->deviceRank != 1 || idleDraftContexts.size() != 1 || idleDraftContexts.front() != otherOwner)
+            throw std::runtime_error("an idle cache displaced the target KV owner");
+        AppendDraftContext(h, 0, *local);
+        void *localKV = local->kv.front().first.cudaData;
+        idleDraftContexts.insert(idleDraftContexts.begin(), std::move(local));
+        auto reused = CreateDraftContext({1});
+        if (reused->committed || reused->deviceRank != 1 || reused->kv.empty() ||
+            reused->kv.front().first.cudaData != localKV || idleDraftContexts.size() != 1 ||
+            idleDraftContexts.front() != otherOwner)
+            throw std::runtime_error("draft DP failed to reuse the matching owner's KV");
+        maxBatch = 1;
+        ResponseContext released;
+        draftContexts[&released.pastKeyValues] = std::move(reused);
+        OnResponseContextRemoved(&released);
+        if (idleDraftContexts.size() != 1 || idleDraftContexts.back()->kv.empty() ||
+            idleDraftContexts.back()->kv.front().first.cudaData != localKV)
+            throw std::runtime_error("draft DP failed to recycle within the request limit");
         draftEnabled = true;
         bool rejected = false;
         try { DraftPDLayout(); } catch (const std::runtime_error &) { rejected = true; }
