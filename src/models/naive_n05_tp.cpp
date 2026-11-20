@@ -15,6 +15,7 @@
 #ifdef USE_CUDA
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mxfp4-ep-graph.h"
@@ -752,11 +753,17 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     if (attentionParallel) for (int &rows : serving->batchBuckets) rows *= attentionDP;
     const int maxRows = serving->batchBuckets.back();
     const int maxLocalRows = maxRows / attentionDP;
-    const bool localFeatures = draftEnabled && maxLocalRows > 8 &&
-        maxLocalRows >= std::min(maxRows, 8 * attentionDP) && CanShardDraftHead() && AttentionTPSize() == 1 &&
+    // Rank zero also holds the world rows for the small-batch rejection sampler.
+    int rootFeatureRows = maxLocalRows;
+    for (int bucket : serving->batchBuckets) {
+        if (bucket / attentionDP <= kFastllmMtpSmallRejectionMaxBatch)
+            rootFeatureRows = std::max(rootFeatureRows, bucket);
+    }
+    const bool localFeatures = draftEnabled && maxLocalRows > kFastllmMtpSmallRejectionMaxBatch &&
+        CanShardDraftHead() && AttentionTPSize() == 1 &&
         !draftTargetLayers.empty() &&
         std::set<int>(draftTargetLayers.begin(), draftTargetLayers.end()).size() == draftTargetLayers.size() &&
-        (int64_t)maxLocalRows * stride * embed_dim <= INT_MAX / draftTargetLayers.size() &&
+        (int64_t)rootFeatureRows * stride * embed_dim <= INT_MAX / draftTargetLayers.size() &&
         tpEp8MegaState && !moeLayers.empty() && !moeLayers.front() &&
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; }) &&
         std::all_of(draftTargetLayers.begin(), draftTargetLayers.end(), [&](int l) {
@@ -844,15 +851,13 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         for (int i = 0; i < maxLocalRows; ++i) storage->buffers.sequences.emplace_back(new TargetWorkspace());
         auto &packed = storage->packedFeatures;
         if (localFeatures)
-            allocate(packed, BFLOAT16, maxLocalRows * stride * embed_dim * draftTargetLayers.size());
+            allocate(packed, BFLOAT16, (rank == 0 ? rootFeatureRows : maxLocalRows) * stride * embed_dim * draftTargetLayers.size());
         for (auto &entry : serving->graphs) {
             auto r = std::make_unique<TPDecodeState::Rank>(storage);
             r->features.verifying = r->features.collectHidden = draftEnabled;
             const int rows = entry.second->rows;
-            // Small rejection batches already use the legacy sampler. If the
-            // root view fits, preserve its matching capture and commit path.
-            // Both layouts reuse the same arena across serial graph replays.
-            if (localFeatures && rows / stride / attentionDP > 8) {
+            // Both feature layouts share stable storage across serial graph replays.
+            if (localFeatures && rows / stride / attentionDP > kFastllmMtpSmallRejectionMaxBatch) {
                 r->features.packedOutput = &packed;
             } else if (draftEnabled && rank == 0) for (size_t i = 0; i < draftTargetLayers.size(); ++i) {
                 const int layer = draftTargetLayers[i];

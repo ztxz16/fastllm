@@ -3575,6 +3575,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     Data logits = RunDraftTarget(input, positions, unused, requests.configs.front(), capture, &requests);
     const int vocab = rounds.front()->vocab;
     int offset = 0;
+#ifdef USE_CUDA
     // Commit on the sampler stream only for a complete, homogeneous set of
     // owner-local rows. A shrinking batch, mixed proposal widths or a changed
     // binding keeps its single coordinated cache commit on the normal path.
@@ -3584,12 +3585,14 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             const auto &feature = capture.packedRows[i];
             const auto &r = *rounds[i];
             local = !r.greedy && r.samplingRank >= 0 && r.samplingRank == r.context.deviceRank &&
-                feature.targetCommit && feature.targetRows > 8 && r.oldLength == r.context.committed &&
+                feature.targetCommit && feature.targetRows > kFastllmMtpSmallRejectionMaxBatch &&
+                r.oldLength == r.context.committed &&
                 feature.device == tpDevices.at(r.samplingRank) && lengths[i] == lengths.front();
         }
         if (local)
             for (size_t i = 0; i < rounds.size(); ++i) rounds[i]->feature = capture.packedRows[i];
     }
+#endif
     PrepareDraftAcceptance(rounds, logits);
     if (std::all_of(rounds.begin(), rounds.end(), [](const auto &r) { return r->sampledAccepted >= 0; })) {
         std::vector<int> past, counts;
