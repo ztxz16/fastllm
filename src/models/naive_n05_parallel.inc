@@ -143,7 +143,12 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     const int vocab = weight["lm_head.weight"].dims[0];
     auto key = [&](int seq, int layer) -> Data & { return batch ? batch->Key(seq, layer) : kv[layer].first; };
     auto value = [&](int seq, int layer) -> Data & { return batch ? batch->Value(seq, layer) : kv[layer].second; };
-    Data hostPositions(positions); hostPositions.ToDevice(CPU);
+    Data downloadedPositions;
+    if (positions.dataDevice != CPU) {
+        downloadedPositions.CopyFrom(positions);
+        downloadedPositions.ToDevice(CPU);
+    }
+    const Data &hostPositions = positions.dataDevice == CPU ? positions : downloadedPositions;
     AssertInFastLLM(hostPositions.dataType == FLOAT32 && hostPositions.Count(0) == (size_t)total,
         "Naive attention DP requires one position per input row");
     const int liveRows = state.servingPadded ? state.servingLiveRows : sequences;
@@ -172,7 +177,11 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                     const int seq = group.sequenceIndices[i];
                     if (seq < (int)localRows.size()) localRows[seq] = i;
                 }
-            retained = state.plan.Reorder(*batch, liveRows, tpRequestIds, state.verifyLengths);
+            // Recheck under this lock before retaining cached descriptor pointers.
+            if (reusePlan && !state.plan.Matches(*batch, state.plan.epoch, tpRequestIds, liveRows))
+                throw AttentionParallelState::UnsupportedServingLayout{};
+            retained = reusePlan ? state.plan.RetainInOrder(state.verifyLengths) :
+                state.plan.Reorder(*batch, liveRows, tpRequestIds, state.verifyLengths);
             state.previousBindingRows = retained;
             for (int &row : state.previousBindingRows) if (row >= 0) row = localRows[row];
         }
@@ -309,7 +318,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                                 int64_t(local.pageIndex.size()) * local.pageLen : 0;
                             reservationLimits[seq] = std::min<int64_t>(reservationLimits[seq],
                                 std::min<int64_t>(capacity, local.expansionDims.at(1)));
-                            if (local.isPagedKVCache)
+                            if (local.isPagedKVCache && (!reusePlan || retained.empty()))
                                 state.plan.pageTails[local.pagedKVCacheData].emplace_back(&local, seq);
                         }
             }
@@ -332,7 +341,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         for (int seq = 0; seq < liveRows; ++seq) {
             const Data *out = capture->logitsDestinations[seq];
             AssertInFastLLM(out && out->dataDevice == CUDA && out->dataType == FLOAT32 && out->cudaData &&
-                out->dims == std::vector<int>({state.verifyLengths ? state.verifyLengths->at(seq) : batch->lengths[seq], vocab}), "Invalid local verification logits.");
+                out->dims.size() == 2 && out->dims[0] == (state.verifyLengths ? state.verifyLengths->at(seq) : batch->lengths[seq]) &&
+                out->dims[1] == vocab, "Invalid local verification logits.");
         }
     }
     std::vector<std::vector<int>> samplingRows;

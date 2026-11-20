@@ -58,6 +58,26 @@ struct NaiveN05FlashModel::AttentionParallelState {
             }
             return true;
         }
+        // Request identities and order have already matched. Keep the plan and
+        // its per-pool descriptor lists in place across page growth or tail COW.
+        std::vector<int> RetainInOrder(const std::vector<int> *counts) {
+            std::vector<int> source(requests.size());
+            for (size_t i = 0; i < requests.size(); ++i) {
+                const int append = counts ? (*counts)[i] : 1;
+                source[i] = requests[i].reservedUntil - requests[i].length >= append ? int(i) : -1;
+            }
+            for (const auto &group : pageTails) {
+                std::lock_guard<std::mutex> guard(group.first->pageIndexLocker);
+                for (const auto &entry : group.second) {
+                    const int row = entry.second;
+                    if (source[row] >= 0 && HasSharedTail(*entry.first, requests[row].length)) source[row] = -1;
+                }
+            }
+            if (!lengthFields.empty())
+                for (size_t i = 0; i < source.size(); ++i)
+                    if (source[i] < 0) lengthFields[i].clear();
+            return source;
+        }
         // Move surviving request metadata into the new batch order. Old roots
         // may have been freed or recycled, so only inspect live batch roots.
         std::vector<int> Reorder(const TargetBatch &batch, int count,
