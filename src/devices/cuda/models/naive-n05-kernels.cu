@@ -920,45 +920,59 @@ __global__ void RopeQKScaleVToken(BF16 *q, BF16 *k, BF16 *v, const float *positi
 #if !defined(USE_ROCM) && CUDART_VERSION >= 12080
 // Packed 192/128 projection with a 64-column split-half RoPE. Eight
 // consecutive vector lanes cover both rotary halves of each Q/K head.
-__global__ void RopePackedPrefill(BF16 *q, BF16 *k, BF16 *v, const float *positions,
-        int heads, int kvHeads, float theta, BF16 scale, const BF16 *packed) {
-    __shared__ __align__(16) BF16 cosine[32], sine[32];
-    int token = blockIdx.x, t = threadIdx.x;
+__device__ __forceinline__ void LoadPackedRopeAngles(const float *positions, float theta, BF16 *cosine, BF16 *sine) {
+    const int t = threadIdx.x;
     if (t < 32) {
-        float angle = positions[token] * powf(theta, -2.f * t / 64);
+        float angle = positions[blockIdx.x] * powf(theta, -2.f * t / 64);
         cosine[t] = __float2bfloat16_rn(cosf(angle));
         sine[t] = __float2bfloat16_rn(sinf(angle));
     }
     __syncthreads();
+}
+
+__device__ __forceinline__ void RotatePackedQK(uint4 &data, int col, const BF16 *cosine, const BF16 *sine) {
+    auto *a = reinterpret_cast<__nv_bfloat162 *>(&data);
+    int inHead = col % 24;
+    if (inHead < 8) {
+        // A 24-vector head starts on an eight-lane boundary.
+        unsigned active = 0xffu << (threadIdx.x % 32 / 8 * 8);
+        uint4 other = make_uint4(__shfl_xor_sync(active, data.x, 4, 8), __shfl_xor_sync(active, data.y, 4, 8),
+                                  __shfl_xor_sync(active, data.z, 4, 8), __shfl_xor_sync(active, data.w, 4, 8));
+        const auto *b = reinterpret_cast<const __nv_bfloat162 *>(&other);
+        uint4 cv = ((const uint4 *)cosine)[inHead % 4], sv = ((const uint4 *)sine)[inHead % 4];
+        const auto *c = reinterpret_cast<const __nv_bfloat162 *>(&cv);
+        const auto *s = reinterpret_cast<const __nv_bfloat162 *>(&sv);
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            auto x = __hmul2_rn(a[j], c[j]), y = __hmul2_rn(b[j], s[j]);
+            a[j] = inHead < 4 ? __hsub2_rn(x, y) : __hadd2_rn(x, y);
+        }
+    }
+}
+
+__device__ __forceinline__ void ScalePackedV(uint4 &data, BF16 scale) {
+    auto *a = reinterpret_cast<__nv_bfloat162 *>(&data);
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) a[j] = __hmul2_rn(a[j], __halves2bfloat162(scale, scale));
+}
+
+__global__ void RopePackedPrefill(BF16 *q, BF16 *k, BF16 *v, const float *positions,
+        int heads, int kvHeads, float theta, BF16 scale, const BF16 *packed) {
+    __shared__ __align__(16) BF16 cosine[32], sine[32];
+    int token = blockIdx.x, t = threadIdx.x;
+    LoadPackedRopeAngles(positions, theta, cosine, sine);
     const int qWidth = heads * 24, kWidth = kvHeads * 24, vWidth = kvHeads * 16;
     const int width = qWidth + kWidth + vWidth;
     int col = blockIdx.y * blockDim.x + t;
     if (col >= width) return;
     uint4 data = ((const uint4 *)packed)[size_t(token) * width + col];
-    auto *a = reinterpret_cast<__nv_bfloat162 *>(&data);
     uint4 *dst;
     if (col < qWidth + kWidth) {
-        int inHead = col % 24;
-        if (inHead < 8) {
-            // A 24-vector head starts on an eight-lane boundary.
-            unsigned active = 0xffu << (t % 32 / 8 * 8);
-            uint4 other = make_uint4(__shfl_xor_sync(active, data.x, 4, 8), __shfl_xor_sync(active, data.y, 4, 8),
-                                      __shfl_xor_sync(active, data.z, 4, 8), __shfl_xor_sync(active, data.w, 4, 8));
-            const auto *b = reinterpret_cast<const __nv_bfloat162 *>(&other);
-            uint4 cv = ((const uint4 *)cosine)[inHead % 4], sv = ((const uint4 *)sine)[inHead % 4];
-            const auto *c = reinterpret_cast<const __nv_bfloat162 *>(&cv);
-            const auto *s = reinterpret_cast<const __nv_bfloat162 *>(&sv);
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                auto x = __hmul2_rn(a[j], c[j]), y = __hmul2_rn(b[j], s[j]);
-                a[j] = inHead < 4 ? __hsub2_rn(x, y) : __hadd2_rn(x, y);
-            }
-        }
+        RotatePackedQK(data, col, cosine, sine);
         dst = col < qWidth ? (uint4 *)q + size_t(token) * qWidth + col
                            : (uint4 *)k + size_t(token) * kWidth + col - qWidth;
     } else {
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) a[j] = __hmul2_rn(a[j], __halves2bfloat162(scale, scale));
+        ScalePackedV(data, scale);
         dst = (uint4 *)v + size_t(token) * vWidth + col - qWidth - kWidth;
     }
     *dst = data;
@@ -1109,6 +1123,44 @@ __global__ void VerifyRopeAppendCache(const __grid_constant__ VerifyRopeBatch ba
         0, blockIdx.x, heads, kvHeads, dim, valueDim, 0, rotaryDim, theta,
         valueScale, kSwaWindow, false);
 }
+
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+// Graph bindings and live lengths may change at replay. Inactive rows clear
+// only Q. Candidate cache slots are separate from the committed sliding ring.
+__global__ void VerifyPackedSwaRope(const __grid_constant__ VerifyRopeBatch batch,
+        int heads, int kvHeads, float theta, BF16 scale) {
+    const int token = blockIdx.x;
+    const int qWidth = heads * 24, kWidth = kvHeads * 24, vWidth = kvHeads * 16;
+    const int width = qWidth + kWidth + vWidth, col = blockIdx.y * blockDim.x + threadIdx.x;
+    const auto &geometry = batch.geometry;
+    auto *q = (uint4 *)geometry.q + size_t(token) * qWidth;
+    if (geometry.length[token] <= 0) {
+        if (col < qWidth) q[col] = make_uint4(0, 0, 0, 0);
+        return;
+    }
+    __shared__ __align__(16) BF16 cosine[32], sine[32];
+    LoadPackedRopeAngles(geometry.positions, theta, cosine, sine);
+    if (col >= width) return;
+    uint4 data = ((const uint4 *)geometry.qkv)[size_t(token) * width + col];
+    if (col < qWidth + kWidth) {
+        RotatePackedQK(data, col, cosine, sine);
+        if (col < qWidth) {
+            q[col] = data;
+            return;
+        }
+    } else {
+        ScalePackedV(data, scale);
+    }
+    const auto binding = batch.rows[token];
+    const bool value = col >= qWidth + kWidth;
+    const size_t dst = size_t(kSwaWindow + binding.offset) * (value ? vWidth : kWidth)
+        + col - qWidth - (value ? kWidth : 0);
+    FastllmNaiveKVWriteRow cache{(void *)binding.cache[value ? 1 : 0], geometry.fp8};
+    const auto *elements = reinterpret_cast<const BF16 *>(&data);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) cache[dst * 8 + i] = elements[i];
+}
+#endif
 #endif
 
 #endif
@@ -3394,7 +3446,8 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
             dim, valueDim, rotaryDim, theta, valueScale, window, packedQkv, ring,
             descriptors, indexDim)) return false;
     // SM60 retains the same per-row math without the SM70 large-argument ABI.
-    if (FastllmCudaRuntimeArch() < 70) {
+    const int arch = FastllmCudaRuntimeArch();
+    if (arch < 70) {
         auto kernel = packedQkv ? RopeAppendCache<true> : RopeAppendCache<false>;
         for (const auto &descriptor : descriptors)
             kernel<<<heads + 2 * kvHeads + (indexDim != 0), 128>>>(descriptor,
@@ -3407,7 +3460,15 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
     const bool staged = std::any_of(rows.begin(), rows.end(),
         [](const FastllmNaiveRopeCacheRow &r) { return r.verifyOffset >= 0 || r.cacheOffset >= 0; });
 #if CUDART_VERSION >= 12010
-    if (!ring && window == kSwaWindow && indexDim == 0 && count > kRopeCacheBatch &&
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+    const bool vectorVerify = arch == 90 && packedQkv && count >= 32 && dim == 192 && valueDim == 128 &&
+        rotaryDim == 64 && !descriptors.front().fp4 &&
+        !(reinterpret_cast<uintptr_t>(q.cudaData) % alignof(uint4)) &&
+        !(reinterpret_cast<uintptr_t>(packedQkv->cudaData) % alignof(uint4));
+#else
+    constexpr bool vectorVerify = false;
+#endif
+    if (staged && !ring && window == kSwaWindow && indexDim == 0 && (vectorVerify || count > kRopeCacheBatch) &&
         CanPackVerifyRope(descriptors, heads, kvHeads, dim, valueDim)) {
         for (int first = 0; first < count; first += kVerifyRopeRows) {
             const int n = std::min(kVerifyRopeRows, count - first);
@@ -3415,6 +3476,14 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
             batch.geometry = descriptors[first];
             for (int i = 0; i < n; ++i)
                 batch.rows[i] = {descriptors[first + i].cache, descriptors[first + i].verifyOffset};
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+            if (vectorVerify) {
+                const int vectors = (heads + kvHeads) * 24 + kvHeads * 16;
+                VerifyPackedSwaRope<<<dim3(n, (vectors + 127) / 128), 128>>>(
+                    batch, heads, kvHeads, theta, __float2bfloat16_rn(valueScale));
+                continue;
+            }
+#endif
             auto kernel = packedQkv ? VerifyRopeAppendCache<true> : VerifyRopeAppendCache<false>;
             kernel<<<dim3(heads + 2 * kvHeads, n), 128>>>(batch, heads, kvHeads, dim,
                 valueDim, rotaryDim, theta, __float2bfloat16_rn(valueScale));
@@ -3422,14 +3491,12 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
         CheckLaunch();
         return true;
     }
-#endif
     // Compact only graph-bound decode requests with the screened geometry.
     // Validate the complete batch before any kernel can modify Q or KV.
-#if CUDART_VERSION >= 12010
     const bool compactGeometry = !staged && count >= 80 && count <= kCompactRopeRequests &&
         heads == 16 && kvHeads == (ring ? 2 : 1) && dim == 192 && valueDim == 128 &&
         rotaryDim == 64 && indexDim == (ring ? 0 : 128) && window == (ring ? 128 : 0);
-    if (compactGeometry && FastllmCudaRuntimeArch() == 90) {
+    if (compactGeometry && arch == 90) {
         CompactRopeRequests packed{};
         if (PackRope(descriptors.data(), count, packed)) {
             auto kernel = packedQkv ? RequestRope<true, CompactRopeRequests, 1>
