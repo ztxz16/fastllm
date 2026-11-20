@@ -3515,6 +3515,13 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
         return true;
     }
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+    constexpr int queryHeadsPerTile = 8;
+    auto canTileQueryHeads = [&](const RopeCacheRow *first, int size) {
+        return heads >= 32 && dim == 192 && valueDim == 128 && rotaryDim == 64 &&
+            std::all_of(first, first + size, [](const RopeCacheRow &row) {
+                return !row.fp4 && (!row.qkv || ((uintptr_t(row.qkv) | uintptr_t(row.q)) & 15) == 0);
+            });
+    };
     const bool staged = std::any_of(rows.begin(), rows.end(),
         [](const FastllmNaiveRopeCacheRow &r) { return r.verifyOffset >= 0 || r.cacheOffset >= 0; });
 #if CUDART_VERSION >= 12010
@@ -3542,6 +3549,13 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
                 continue;
             }
 #endif
+            if (canTileQueryHeads(descriptors.data() + first, n)) {
+                auto tiled = packedQkv ? RequestRope<true, VerifyRopeBatch, 0, false, queryHeadsPerTile>
+                                       : RequestRope<false, VerifyRopeBatch, 0, false, queryHeadsPerTile>;
+                tiled<<<dim3(n, (heads + queryHeadsPerTile - 1) / queryHeadsPerTile), 128>>>(batch, heads, kvHeads, dim, valueDim,
+                    0, rotaryDim, theta, __float2bfloat16_rn(valueScale), window, false);
+                continue;
+            }
             auto kernel = packedQkv ? VerifyRopeAppendCache<true> : VerifyRopeAppendCache<false>;
             kernel<<<dim3(heads + 2 * kvHeads, n), 128>>>(batch, heads, kvHeads, dim,
                 valueDim, rotaryDim, theta, __float2bfloat16_rn(valueScale));
@@ -3583,6 +3597,13 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
             std::none_of(batch.rows, batch.rows + batchSize, [](const auto &r) { return r.fp4; }) &&
             rotaryDim <= 192 && rotaryDim % 2 == 0 && rotaryDim <= dim &&
             (!indexDim || (indexDim == 128 && rotaryDim <= indexDim));
+        if (requestFusion && canTileQueryHeads(batch.rows, batchSize)) {
+            auto tiled = packedQkv ? RequestRope<true, RopeCacheBatch, 0, false, queryHeadsPerTile>
+                                   : RequestRope<false, RopeCacheBatch, 0, false, queryHeadsPerTile>;
+            tiled<<<dim3(batchSize, (heads + queryHeadsPerTile - 1) / queryHeadsPerTile), 128>>>(batch, heads, kvHeads, dim, valueDim,
+                indexDim, rotaryDim, theta, __float2bfloat16_rn(valueScale), window, ring);
+            continue;
+        }
         auto kernel = requestFusion ? (packedQkv ? RequestRope<true> : RequestRope<false>)
                                     : (packedQkv ? BatchRopeAppendCache<true> : BatchRopeAppendCache<false>);
         const dim3 grid = requestFusion ? dim3(batchSize)
