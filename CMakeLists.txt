@@ -4284,6 +4284,17 @@ endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
 "{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
 
+# copy_directory overlays existing files. Replace each shipped EP package so
+# incremental builds cannot bundle CUBINs retired from its manifest.
+file(GLOB sm120_ep_manifests "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/kernels/mxfp4_ep/*/manifest.json")
+foreach(manifest IN LISTS sm120_ep_manifests)
+    get_filename_component(package_dir "${manifest}" DIRECTORY)
+    get_filename_component(package_name "${package_dir}" NAME)
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "${CMAKE_BINARY_DIR}/tools/ftllm/kernels/mxfp4_ep/${package_name}"
+        VERBATIM)
+endforeach()
+
 if (${CMAKE_HOST_WIN32})
     add_custom_command(
             TARGET fastllm_tools
@@ -4326,7 +4337,6 @@ endif()
 
 if (USE_CUDA AND NOT USE_ROCM)
     # A package-only update must refresh the POST_BUILD copy as well.
-    file(GLOB sm120_ep_manifests "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/kernels/mxfp4_ep/*/manifest.json")
     set_property(TARGET fastllm_tools APPEND PROPERTY LINK_DEPENDS
         ${sm120_ep_manifests} "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_sm120_ep/UPSTREAM.json")
     add_custom_command(TARGET fastllm_tools POST_BUILD
