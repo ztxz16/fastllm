@@ -534,6 +534,11 @@ bool FastllmCudaBatchCopy2DAsyncCurrentThread(
     void *const *dsts, const void *const *srcs, const size_t *dstPitch,
     const size_t *srcPitch, const size_t *widths, const size_t *heights, int count);
 
+// Packed BF16 starts at the beginning of each disjoint FP32 destination slice.
+struct FastllmCudaPackedBf16Slice { float *base; int columns, rows; };
+bool FastllmCudaExpandPackedBf16Slices(const FastllmCudaPackedBf16Slice *slices,
+                                       int count, int rowStride);
+
 void *FastllmCudaHostMalloc(size_t size);
 void FastllmCudaHostFree(void *ptr);
 bool FastllmCudaHostRegister(void *ptr, size_t size);

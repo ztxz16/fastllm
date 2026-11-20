@@ -6769,6 +6769,56 @@ bool FastllmCudaBatchCopy2DAsyncCurrentThread(
 }
 
 namespace {
+constexpr int Bf16SlicesPerLaunch = 128;
+struct PackedBf16Slices { FastllmCudaPackedBf16Slice items[Bf16SlicesPerLaunch]; };
+
+// Expand in place from high columns down. During each pass the FP32 stores
+// start beyond the final BF16 read. Each row/shard belongs to exactly one CTA.
+__global__ void ExpandPackedBf16Slices(PackedBf16Slices p, int rowStride) {
+    const auto slice = p.items[blockIdx.x];
+    for (int64_t row = blockIdx.y; row < slice.rows; row += gridDim.y) {
+        auto *out = reinterpret_cast<uint32_t *>(slice.base + size_t(row) * rowStride);
+        const auto *bits = reinterpret_cast<const uint16_t *>(out);
+        int end = slice.columns;
+        while (end > int(blockDim.x)) {
+            const int begin = end / 2 + end % 2;
+            for (int64_t i = int64_t(begin) + threadIdx.x; i < end; i += blockDim.x)
+                out[i] = uint32_t(bits[i]) << 16;
+            __syncthreads();
+            end = begin;
+        }
+        uint32_t value = threadIdx.x < end ? uint32_t(bits[threadIdx.x]) << 16 : 0;
+        __syncthreads();
+        if (threadIdx.x < end) out[threadIdx.x] = value;
+    }
+}
+}
+
+bool FastllmCudaExpandPackedBf16Slices(const FastllmCudaPackedBf16Slice *slices,
+                                       int count, int rowStride) {
+    if (count < 0 || (count && (!slices || rowStride <= 0))) return false;
+    // In-place expansion cannot be retried after an earlier batch has written.
+    for (int i = 0; i < count; ++i) {
+        const auto &slice = slices[i];
+        if (!slice.base || slice.columns <= 0 || slice.columns > rowStride || slice.rows < 0) return false;
+    }
+    for (int first = 0; first < count;) {
+        PackedBf16Slices p{};
+        const int n = std::min(Bf16SlicesPerLaunch, count - first);
+        int rows = 0;
+        for (int i = 0; i < n; ++i) {
+            p.items[i] = slices[first + i];
+            rows = std::max(rows, p.items[i].rows);
+        }
+        first += n;
+        if (!rows) continue;
+        ExpandPackedBf16Slices<<<dim3(n, std::min(rows, 65535)), 256, 0, cudaStreamPerThread>>>(p, rowStride);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+    return true;
+}
+
+namespace {
     constexpr int FASTLLM_CUDA_BATCH_COPY_MAX_SEGMENTS = 128;
     constexpr int FASTLLM_CUDA_BATCH_COPY_BLOCKS_PER_SEGMENT = 8;
 

@@ -472,6 +472,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     for (auto &feature : captures) feature.ringVerify = ringVerify;
     if (graphDecode && verifying)
         for (auto &rank : tpDecodeState->ranks) rank->features.ringVerify = ringVerify;
+    std::vector<std::vector<FastllmCudaPackedBf16Slice>> packedSlices;
     auto forwardRank = [&](int rank, int device) {
         const int group = topology.AttentionOwner(rank);
         auto &local = state.ranks[rank];
@@ -495,19 +496,22 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             const auto range = tpVocabRanges[rank];
             const size_t bytes = size_t(range.second - range.first) * sizeof(float);
             if (distributedVerification) {
+                const auto &source = packedSlices.empty() ? logits : tpDecodeState->ranks[rank]->storage->buffers.logitsBf16;
+                const size_t sourceBytes = size_t(range.second - range.first) * source.unitSize;
+                std::vector<void *> dst(liveRows);
+                std::vector<const void *> src(liveRows);
+                std::vector<size_t> dstPitch(liveRows, size_t(vocab) * sizeof(float));
+                std::vector<size_t> widths(liveRows, sourceBytes), heights(liveRows);
                 int row = 0;
-                std::vector<void *> dst;
-                std::vector<const void *> src;
-                std::vector<size_t> dstPitch, srcPitch, widths, heights;
                 for (int seq = 0; seq < liveRows; ++seq) {
-                    dst.push_back((float *)capture->logitsDestinations[seq]->cudaData + range.first);
-                    src.push_back((char *)logits.cudaData + size_t(row) * bytes);
-                    dstPitch.push_back(size_t(vocab) * sizeof(float)); srcPitch.push_back(bytes);
-                    widths.push_back(bytes); heights.push_back(state.verifyLengths ? state.verifyLengths->at(seq) : batch->lengths[seq]);
+                    const auto &out = *capture->logitsDestinations[seq];
+                    dst[seq] = static_cast<float *>(out.cudaData) + range.first;
+                    src[seq] = static_cast<const char *>(source.cudaData) + size_t(row) * sourceBytes;
+                    heights[seq] = out.dims[0];
                     row += batch->lengths[seq];
                 }
                 AssertInFastLLM(FastllmCudaBatchCopy2DAsyncCurrentThread(dst.data(), src.data(),
-                    dstPitch.data(), srcPitch.data(), widths.data(), heights.data(), dst.size()),
+                    dstPitch.data(), widths.data(), widths.data(), heights.data(), liveRows),
                     "Naive verification logits redistribution failed");
             } else if (shardedSampling) {
                 const int shards = tpDevices.size();
@@ -625,6 +629,33 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             }
         }
     } pendingSampling{tpDevices, state.sampling};
+    // Replay owns stable LM-head buffers. A BF16 head widens to FP32 by a
+    // bit shift; send its original bits straight into each destination slice.
+    // Eager execution, true FP32 heads and external destinations use full FP32.
+    if (distributedVerification && graphDecode && tpDecodeState->captured && !preparingVerify) {
+        bool bf16Heads = true;
+        for (size_t rank = 0; rank < tpDevices.size() && bf16Heads; ++rank) {
+            const auto &head = tpDecodeState->ranks[rank]->storage->buffers.logitsBf16;
+            const auto range = tpVocabRanges[rank];
+            bf16Heads = head.dataType == BFLOAT16 && head.cudaData &&
+                head.expansionBytes >= size_t(total) * (range.second - range.first) * sizeof(uint16_t);
+        }
+        if (bf16Heads) {
+            packedSlices.resize(tpDevices.size());
+            for (const Data *dst : capture->logitsDestinations) {
+                const auto owner = dst->dataDeviceIds.size() == 1
+                    ? std::find(tpDevices.begin(), tpDevices.end(), dst->dataDeviceIds.front()) : tpDevices.end();
+                if (owner == tpDevices.end()) {
+                    packedSlices.clear();
+                    break;
+                }
+                auto &slices = packedSlices[owner - tpDevices.begin()];
+                for (const auto &range : tpVocabRanges)
+                    slices.push_back({static_cast<float *>(dst->cudaData) + range.first,
+                                      range.second - range.first, dst->dims[0]});
+            }
+        }
+    }
     if (asyncSampling) {
         pendingSampling.active = true;
         state.runtime.Enqueue(forwardRank);
@@ -640,6 +671,15 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 "Naive attention DP sampling admission changed after submission");
         });
     } else state.runtime.Run(forwardRank);
+    if (!packedSlices.empty()) {
+        // Both Run calls join the workers' completion events: peer writes
+        // finish before local expansion, which in turn finishes before sampling.
+        state.runtime.Run([&](int rank, int) {
+            const auto &slices = packedSlices[rank];
+            AssertInFastLLM(FastllmCudaExpandPackedBf16Slices(slices.data(), slices.size(), vocab),
+                            "Naive verification logits expansion failed");
+        });
+    }
     if (graphDecode) {
         tpDecodeState->warmed = true;
         if (!std::all_of(tpDecodeState->ranks.begin(), tpDecodeState->ranks.end(),

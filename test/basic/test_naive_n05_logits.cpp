@@ -7,12 +7,68 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_runtime_api.h>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 using namespace fastllm;
 static void Check(bool ok, const char *msg) { if (!ok) throw std::runtime_error(msg); }
 static void Cuda(cudaError_t err) { Check(err == cudaSuccess, cudaGetErrorString(err)); }
+// A packed shard occupies the first half of its FP32 slice. Guard columns
+// and other shards must survive in-place expansion, including on graph replay.
+static int CheckPackedLogits() {
+    struct Shape { int columns, rows; };
+    std::vector<Shape> shapes = {{1, 3}, {255, 1}, {256, 2}, {257, 3}, {19072, 3}, {19999, 1}, {32, 0}};
+    shapes.resize(129, {1, 1});  // Cross the 128-slice launch boundary.
+    constexpr int rows = 3;
+    int stride = 1;
+    for (auto shape : shapes) stride += shape.columns + 1;
+    std::vector<uint32_t> expected(size_t(rows) * stride, 0xdeadbeef), actual(expected.size());
+    Data dst(FLOAT32); dst.Resize({rows, stride}); dst.ToDevice(DataDevice::CUDA, {0}, false); dst.Allocate(false);
+    auto *base = static_cast<float *>(dst.cudaData);
+    std::vector<FastllmCudaPackedBf16Slice> slices;
+    int offset = 1;
+    for (auto shape : shapes) {
+        slices.push_back({base + offset, shape.columns, shape.rows});
+        offset += shape.columns + 1;
+    }
+    const size_t bytes = expected.size() * sizeof(uint32_t);
+    Cuda(cudaMemcpy(base, expected.data(), bytes, cudaMemcpyHostToDevice));
+    auto invalid = slices;
+    invalid.back().base = nullptr;
+    Check(!FastllmCudaExpandPackedBf16Slices(invalid.data(), invalid.size(), stride), "accepted invalid final slice");
+    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+    Cuda(cudaMemcpy(actual.data(), base, bytes, cudaMemcpyDeviceToHost));
+    Check(actual == expected, "invalid descriptor partially expanded earlier slices");
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Check(FastllmCudaExpandPackedBf16Slices(slices.data(), slices.size(), stride), "capture BF16 expansion");
+    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+#if CUDART_VERSION >= 12000
+    Cuda(cudaGraphInstantiate(&exec, graph, 0));
+#else
+    Cuda(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+#endif
+    for (unsigned pass : {0u, 31469u}) {
+        std::fill(actual.begin(), actual.end(), 0xdeadbeef);
+        for (const auto &slice : slices) {
+            const size_t col = slice.base - base;
+            for (int row = 0; row < slice.rows; ++row) for (int i = 0; i < slice.columns; ++i) {
+                size_t at = size_t(row) * stride + col;
+                uint16_t bits = uint16_t(pass + row * stride + col + i);
+                std::memcpy(reinterpret_cast<char *>(actual.data() + at) + i * sizeof(bits), &bits, sizeof(bits));
+                expected[at + i] = uint32_t(bits) << 16;
+            }
+        }
+        Cuda(cudaMemcpy(base, actual.data(), bytes, cudaMemcpyHostToDevice));
+        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        Cuda(cudaMemcpy(actual.data(), base, bytes, cudaMemcpyDeviceToHost));
+        Check(actual == expected, "packed logits or a surrounding column changed");
+    }
+    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+    return 3;
+}
 static int CheckSamplingBoundaries() {
     Check(!FastllmNaiveCanSelectLogits(1, 0, 65, false), "Oversized top-k accepted");
     Check(!FastllmNaiveCanSelectLogits(kNaiveLogitsMaxShard + 1, 0, 4, false), "Oversized shard accepted");
@@ -122,7 +178,7 @@ int main() {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
-        int checks = CheckSamplingBoundaries() + CheckSampling();
+        int checks = CheckSamplingBoundaries() + CheckSampling() + CheckPackedLogits();
         for (int vocab : {1, 257, 2053, 19072, 152576})
         for (int rows : {1, 8})
         for (int shards : {1, 3, 8}) {
