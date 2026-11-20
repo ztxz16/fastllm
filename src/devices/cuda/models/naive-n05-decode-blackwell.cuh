@@ -4,9 +4,10 @@
 // Producers gather independent K/V pages; two MMA warps reduce disjoint
 // halves of each tile. The final normalization includes the attention sink.
 #include "naive-n05-attention-bulk.cuh"
-#if !defined(USE_ROCM) && CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
-#define FASTLLM_NAIVE_BLACKWELL_DECODE
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
 namespace blackwell_decode {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
+#define FASTLLM_NAIVE_BLACKWELL_DECODE
 constexpr int TILE = 32, NSTAGE = 4, NCW = 2, NP = 4;
 constexpr int K_STRIDE = 208, V_STRIDE = 144;
 constexpr int OFF_V = TILE * K_STRIDE;
@@ -348,9 +349,12 @@ __global__ void __launch_bounds__((NCW + NP) * 32)
     }
 #endif
 }
+#endif
+// Keep the merge launch stub linkable in builds targeting only older GPUs.
 // One warp reduces four adjacent output channels per lane.
 __global__ void Merge(const float *parts, const float2 *stats, const float *sink, __nv_bfloat16 *out, int heads,
                       int splits) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     const int lane = threadIdx.x, head = blockIdx.x;
     const size_t row = size_t(blockIdx.y) * heads + head;
     const float2 st = lane < splits ? stats[row * splits + lane] : make_float2(-INFINITY, 0.f);
@@ -376,6 +380,7 @@ __global__ void Merge(const float *parts, const float2 *stats, const float *sink
     const float inv = denom > 0.f ? 1.f / denom : 0.f;
     for (int i = 0; i < 4; ++i)
         out[row * 128 + 4 * lane + i] = __float2bfloat16(acc[i] * inv);
+#endif
 }
 } // namespace blackwell_decode
 #endif
