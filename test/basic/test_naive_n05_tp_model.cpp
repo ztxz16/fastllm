@@ -359,7 +359,8 @@ static void CheckLogitComparison() {
 }
 // Shared deterministic draft weights; existing target embeddings stay untouched.
 static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int vocab, bool merged,
-                                int hidden = 256, int head = 32, int intermediate = 512) {
+                                int hidden = 256, int head = 32, int intermediate = 512,
+                                const std::set<std::string> &contextWeights = {}) {
     unsigned seed = 17;
     auto add = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
         weight.AddEmptyWeight(name, dims, norm ? FLOAT32 : BFLOAT16);
@@ -395,6 +396,13 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
         add(p + "mlp.up_proj.weight", {intermediate, hidden});
         add(p + "mlp.down_proj.weight", {hidden, intermediate});
     }
+    if (!contextWeights.empty()) {
+        for (auto it = weight.weight.begin(); it != weight.weight.end();) {
+            if (it->first.rfind("dspark.", 0) == 0 && !contextWeights.count(it->first.substr(7)))
+                it = weight.weight.erase(it);
+            else ++it;
+        }
+    }
     if (merged) for (int i = 0; i < layers; ++i) {
         const std::string p = "dspark.layers." + std::to_string(i) + ".";
         auto merge = [&](std::vector<std::string> names, std::string out) {
@@ -410,6 +418,10 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
                 weight.weight.erase(p + name);
             }
         };
+        if (!contextWeights.empty()) {
+            merge({"self_attn.k_proj.weight", "self_attn.v_proj.weight"}, "self_attn.mergekv.weight");
+            continue;
+        }
         merge({"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"}, "self_attn.mergeqkv.weight");
         merge({"mlp.gate_proj.weight", "mlp.up_proj.weight"}, "mlp.gateup_proj.weight");
     }
@@ -904,13 +916,16 @@ class Fixture : public NaiveN05FlashModel {
         draftLayers = 2; draftBlock = 7; draftTokens = 5;
         draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
         draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
-        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
+        draftKVOnly = pdPrefillOnly;
+        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true, 256, 32, 512, PDDraftContextWeightNames());
         SetSaveHistoryChat(true);
     }
     void PreparePDGroupFixture(int dp, bool draft = false) {
         if (dp > 1) ConfigureAttentionParallel(dp);
         if (draft) ConfigurePDDraft(dp);
         maxBatch = 4; SetMaxTokens(16384); WarmUp();
+        if (pdPrefillOnly && (draftProposalStorage || !draftSamplingRanks.empty()))
+            throw std::runtime_error("PD prefill warmup allocated draft sampling buffers");
     }
     std::vector<PDGroupRecord> ExportPDGroupFixture(bool shards = false) {
         std::vector<PDGroupRecord> records;
@@ -5724,6 +5739,7 @@ int main(int argc, char **argv) {
                 Fixture producer(ranks, false, true, true, true);
                 producer.SetKVCacheDataType(FP8_E4M3); producer.SetIndexerDataType(FP8_E4M3);
                 producer.ConfigureDraftParallel(ranks, false);
+                producer.pdPrefillOnly = true;
                 producer.PreparePDGroupFixture(1, true); records = producer.ExportPDGroupFixture(true);
             }
             Fixture consumer(dst, false, true, true, true);

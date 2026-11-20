@@ -1291,6 +1291,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
     auto runtime = std::make_shared<PDRuntime>();
     runtime->role = config["role"].string_value();
     Check(runtime->role == "prefill" || runtime->role == "decode", "role must be prefill or decode");
+    Check(!pdPrefillOnly || runtime->role == "prefill", "prefill-only warmup requires a prefill PD role");
     Check(!config["model_id"].string_value().empty(),
           "model_id must identify the same checkpoint on P and D");
     const auto identityPrefix = config["model_id"].string_value() + ":gpu-state-v2:";

@@ -67,6 +67,18 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                         calls = [call[0] for call in self.loaded_model.mock_calls]
                         self.assertLess(calls.index("configure_dspark_parallel"), calls.index("warmup"))
 
+    def test_pd_prefill_role_before_warmup(self):
+        for role in ("prefill", "decode"):
+            self.configure(["--tp", "4", "--pd", json.dumps({"role": role})])
+            self.assertEqual(self.model_options["pd_prefill"], role == "prefill")
+            warmup = self.loaded_model.warmup
+            if role == "prefill":
+                warmup.assert_called_once_with(pd_prefill=True)
+            else:
+                warmup.assert_called_once_with()
+            order = [call[0] for call in self.loaded_model.mock_calls]
+            self.assertLess(order.index("warmup"), order.index("configure_pd"))
+
     def test_naive_host_prefix_cache(self):
         self.configure(['--tp', '8'])
         self.loaded_model.set_save_history.assert_called_once_with(True)

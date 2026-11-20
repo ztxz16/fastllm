@@ -2131,6 +2131,7 @@ def make_normal_llm_model(args, startup_progress = None):
     history_explicit = args.cache_history not in ("", None)
     history_enabled = _arg_enabled(args.cache_history)
     pd_options = json.loads(args.pd) if getattr(args, "pd", "") else None
+    pd_prefill = pd_options is not None and pd_options.get("role") == "prefill"
     l2_bytes = getattr(args, "prefix_cache_l2_bytes", 0)
     kv_bytes = getattr(args, "prefix_cache_l2_kv_bytes", None)
     swa_bytes = getattr(args, "prefix_cache_l2_swa_bytes", None)
@@ -2299,7 +2300,8 @@ def make_normal_llm_model(args, startup_progress = None):
                             rope_scaling = rope_scaling,
                             indexer_dtype = getattr(args, "indexer_dtype", "auto"),
                             indexer_compute_dtype = getattr(args, "indexer_compute_dtype", "auto"),
-                            indexer_tp_storage = indexer_storage)
+                            indexer_tp_storage = indexer_storage,
+                            pd_prefill = pd_prefill)
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
         if is_clover_model:
@@ -2388,7 +2390,10 @@ def make_normal_llm_model(args, startup_progress = None):
                 fairness_ms=prefill_scheduling['prefill_fairness_ms'])
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
-        model.warmup()
+        if pd_prefill:
+            model.warmup(pd_prefill=True)
+        else:
+            model.warmup()
         if l2_enabled:
             model.configure_host_prefix_cache(l2_bytes, **split_limits)
         if kernel_policy is not None:

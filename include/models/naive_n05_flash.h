@@ -353,6 +353,12 @@ namespace fastllm {
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
                          std::vector<float> *retLogits, LogitsSelection *selection = nullptr);
         void InitDraft();
+        std::set<std::string> PDDraftContextWeightNames() const override;
+        bool draftKVOnly = false;
+        const char *DraftKVProjectionName() const {
+            return draftKVOnly ? "mergekv.weight" : "mergeqkv.weight";
+        }
+        int DraftContextQueryHeads() const { return draftKVOnly ? 0 : draftHeads; }
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
         void RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context);
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);

@@ -294,8 +294,14 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
             "Draft TP needs a dense BF16 projection with matching shape: " + name);
         return true;
     };
+    const int kvWidth = draftKvHeads * draftHeadDim;
+    const std::vector<int> widths = draftKVOnly ? std::vector<int>{kvWidth, kvWidth} :
+        std::vector<int>{draftHeads * draftHeadDim, kvWidth, kvWidth};
     for (int i = 0; i < draftLayers; ++i) {
         const std::string p = "dspark.layers." + std::to_string(i) + ".";
+        if (!projection(p + "self_attn." + DraftKVProjectionName(),
+                        {(DraftContextQueryHeads() + 2 * draftKvHeads) * draftHeadDim, embed_dim})) return singleDevice();
+        if (draftKVOnly) continue;
         auto down = weight.weight.find(p + "mlp.down_proj.weight");
         const bool valid = down != weight.weight.end() && down->second.dims.size() == 2 &&
             down->second.dims[1] > 0 && down->second.dims[1] <= INT_MAX / 2 &&
@@ -303,9 +309,7 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
         if (automatic && !valid) return singleDevice();
         AssertInFastLLM(valid, "Draft MLP width must be divisible by its TP size.");
         const int mid = down->second.dims[1];
-        if (!projection(p + "self_attn.mergeqkv.weight",
-                        {(draftHeads + 2 * draftKvHeads) * draftHeadDim, embed_dim}) ||
-            !projection(p + "self_attn.o_proj.weight", {embed_dim, draftHeads * draftHeadDim}) ||
+        if (!projection(p + "self_attn.o_proj.weight", {embed_dim, draftHeads * draftHeadDim}) ||
             !projection(p + "mlp.gateup_proj.weight", {2 * mid, embed_dim}) ||
             !projection(p + "mlp.down_proj.weight", {embed_dim, mid})) return singleDevice();
     }
@@ -323,7 +327,7 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
             const int width = widths[part];
             // When TP exceeds the KV-head count, neighboring query shards
             // share one whole KV head. Never split a head's RoPE channels.
-            const int copies = qkv && part > 0 && !replicated ? std::max(1, ranks / draftKvHeads) : 1;
+            const int copies = qkv && part + 2 >= widths.size() && !replicated ? std::max(1, ranks / draftKvHeads) : 1;
             const int divisions = ranks / copies;
             AssertInFastLLM(width > 0 && (replicated || width % divisions == 0), "Draft TP projection cannot be split.");
             for (int rank = 0; rank < ranks; ++rank) {
@@ -354,8 +358,11 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
         const std::string p = "dspark.layers." + std::to_string(i) + ".";
         // MLP-only TP replicates attention using the same ownership transfer
         // as shards; neither strategy retains a second source weight payload.
-        split(p + "self_attn.mergeqkv.weight", 0,
-              {draftHeads * draftHeadDim, draftKvHeads * draftHeadDim, draftKvHeads * draftHeadDim}, mlpOnly, true);
+        split(p + "self_attn." + DraftKVProjectionName(), 0, widths, mlpOnly, true);
+        if (draftKVOnly) {
+            replicate(p + "self_attn.k_norm.weight");
+            continue;
+        }
         split(p + "self_attn.o_proj.weight", mlpOnly ? 0 : 1,
               {mlpOnly ? embed_dim : draftHeads * draftHeadDim}, mlpOnly);
         const int mid = weight[p + "mlp.down_proj.weight"].dims.at(1);
@@ -363,9 +370,11 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
         split(p + "mlp.down_proj.weight", 1, {mid});
         for (const char *name : {"input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight"}) replicate(p + name);
     }
-    replicate("dspark.norm.weight");
-    replicate("dspark.mask_embedding");
-    replicate("model.embed_tokens.weight");
+    if (!draftKVOnly) {
+        replicate("dspark.norm.weight");
+        replicate("dspark.mask_embedding");
+        replicate("model.embed_tokens.weight");
+    }
     // Context rows are independent. Replicate this dense projection
     // so high-concurrency commits can divide their rows across draft workers.
     auto fc = weight.weight.find("dspark.fc.weight");
@@ -373,7 +382,8 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
     if (fc != weight.weight.end() && fc->second.dataType == BFLOAT16 &&
         fc->second.dims == std::vector<int>{embed_dim, (int)draftTargetLayers.size() * embed_dim} &&
         contextNorm != weight.weight.end() && contextNorm->second.dims == std::vector<int>{embed_dim}) {
-        replicate("dspark.fc.weight");
+        if (draftKVOnly) split("dspark.fc.weight", 0, {embed_dim}, true);
+        else replicate("dspark.fc.weight");
         replicate("dspark.hidden_norm.weight");
     }
     state->group = FastllmCudaNaiveDraftTPCreate(state->devices);
@@ -431,7 +441,7 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
         ws.contextSelected.ToDevice(DataDevice::CUDA, std::vector<int>{tp.devices.front()});
         selected = &ws.contextSelected;
     }
-    const int heads = draftHeads / tp.attentionDivisor, kvHeads = std::max(1, draftKvHeads / tp.attentionDivisor);
+    const int heads = DraftContextQueryHeads() / tp.attentionDivisor, kvHeads = std::max(1, draftKvHeads / tp.attentionDivisor);
     const int rows = selected->dims[1], width = kvHeads * draftHeadDim;
     // Publish the root PTDS writes before another device reads the selected rows.
     if (!tp.dataParallel || context.deviceRank != 0) FastllmCudaSyncCurrentThreadStream();
@@ -453,7 +463,7 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
         std::vector<const Data *> raw, norms, weights;
         for (int i = 0; i < draftLayers; ++i) {
             const std::string p = "dspark.layers." + std::to_string(i) + ".self_attn.";
-            Data &qkv = *weight[p + "mergeqkv.weight"].multiDeviceDatas.at(r.device);
+            Data &qkv = *weight[p + DraftKVProjectionName()].multiDeviceDatas.at(r.device);
             views[i].FakeFrom(qkv, (size_t)heads * draftHeadDim * embed_dim * sizeof(uint16_t));
             views[i].Resize({2 * width, embed_dim});
             weights.push_back(&views[i]);
@@ -1072,8 +1082,20 @@ void NaiveN05FlashModel::CommitTargetCaches(const std::vector<std::vector<std::p
 #endif
 }
 
+std::set<std::string> NaiveN05FlashModel::PDDraftContextWeightNames() const {
+    if (!draftKVOnly) return {};
+    std::set<std::string> names{"fc.weight", "hidden_norm.weight"};
+    for (int layer = 0; layer < draftLayers; ++layer) {
+        const auto prefix = "layers." + std::to_string(layer) + ".self_attn.";
+        for (const char *part : {"k_proj.weight", "v_proj.weight", "k_norm.weight"})
+            names.insert(prefix + part);
+    }
+    return names;
+}
+
 void NaiveN05FlashModel::InitDraft() {
     draftEnabled = weight.dicts.count("dspark.model_path") != 0;
+    draftKVOnly = draftEnabled && pdPrefillOnly;
     if (!draftEnabled) return;
     auto number = [&](const std::string &name) {
         return std::stof(weight.dicts.at("dspark." + name));
@@ -1131,6 +1153,11 @@ void NaiveN05FlashModel::InitDraft() {
     for (int i = 0; i < draftLayers; ++i) {
         const std::string layer = "dspark.layers." + std::to_string(i) + ".";
         const std::string attn = layer + "self_attn.", mlp = layer + "mlp.";
+        if (draftKVOnly) {
+            weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
+                {attn + "k_proj.weight", attn + "v_proj.weight"}, attn + DraftKVProjectionName(), "linear")}));
+            continue;
+        }
         weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
             {attn + "q_proj.weight", attn + "k_proj.weight", attn + "v_proj.weight"},
             attn + "mergeqkv.weight", "linear")}));
@@ -1164,11 +1191,11 @@ bool NaiveN05FlashModel::AppendDraftContextFused(Data &hidden, int start, DraftC
     // copy of the weights, even when all layers share the context input.
     for (int i = 0; i < draftLayers; ++i) {
         const auto name = "dspark.layers." + std::to_string(i) + ".self_attn.";
-        auto merged = weight.weight.find(name + "mergeqkv.weight");
+        auto merged = weight.weight.find(name + DraftKVProjectionName());
         if (merged == weight.weight.end()) return false;
         const Data &qkv = merged->second;
         if (qkv.dataType != BFLOAT16 || qkv.multiDeviceData ||
-            qkv.dims != std::vector<int>{(draftHeads + 2 * draftKvHeads) * draftHeadDim, hidden.dims[2]} ||
+            qkv.dims != std::vector<int>{(DraftContextQueryHeads() + 2 * draftKvHeads) * draftHeadDim, hidden.dims[2]} ||
             qkv.strides != std::vector<uint64_t>{(uint64_t)hidden.dims[2], 1} ||
             qkv.dataDevice != DataDevice::CUDA || qkv.dataDeviceIds != devices || !qkv.cudaData)
             return false;
@@ -1180,9 +1207,9 @@ bool NaiveN05FlashModel::AppendDraftContextFused(Data &hidden, int start, DraftC
         norms.push_back(&norm);
     }
     for (int i = 0; i < draftLayers; ++i) {
-        Data &qkv = weight["dspark.layers." + std::to_string(i) + ".self_attn.mergeqkv.weight"];
+        Data &qkv = weight["dspark.layers." + std::to_string(i) + ".self_attn." + DraftKVProjectionName()];
         Data view;
-        view.FakeFrom(qkv, (size_t)draftHeads * draftHeadDim * hidden.dims[2] * sizeof(uint16_t));
+        view.FakeFrom(qkv, (size_t)DraftContextQueryHeads() * draftHeadDim * hidden.dims[2] * sizeof(uint16_t));
         view.Resize({2 * width, hidden.dims[2]});
         Data &output = context.workspace ? context.workspace->contextLayers[i].raw : local[i];
         DraftLinear(hidden, view, output);
@@ -1223,12 +1250,12 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
         Data localKey, localValue;
         Data &key = buffers ? buffers->contextLayers[i].key : localKey;
         Data &value = buffers ? buffers->contextLayers[i].value : localValue;
-        auto merged = weight.weight.find(layer + "mergeqkv.weight");
+        auto merged = weight.weight.find(layer + DraftKVProjectionName());
         if (merged != weight.weight.end()) {
             Data &qkvWeight = merged->second;
             qkvWeight.ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()});
             Data keyWeight, valueWeight;
-            const int qw = draftHeads * draftHeadDim, kw = draftKvHeads * draftHeadDim;
+            const int qw = DraftContextQueryHeads() * draftHeadDim, kw = draftKvHeads * draftHeadDim;
             keyWeight.FakeFrom(qkvWeight, (size_t)qw * embed_dim * sizeof(uint16_t));
             valueWeight.FakeFrom(qkvWeight, (size_t)(qw + kw) * embed_dim * sizeof(uint16_t));
             keyWeight.Resize({kw, embed_dim});
@@ -1379,6 +1406,10 @@ void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
             else { Cat(combined, selected, -1, joined); Copy(joined, combined); }
         }
     }
+#ifdef USE_CUDA
+    // Place the retained projections before their first use on the root device.
+    if (draftKVOnly && !draftTP) PrepareDraftTP();
+#endif
     ProjectDraftContext(combined, projected, hidden);
     AppendDraftContext(hidden, oldCommitted + firstRow, context);
 #ifdef USE_CUDA
@@ -1529,7 +1560,7 @@ bool NaiveN05FlashModel::ProjectDraftKVWeights(Data &input, int device, int head
     std::vector<Data> weightViews(draftLayers);
     std::vector<const Data *> weights;
     for (int layer = 0; layer < draftLayers; ++layer) {
-        const auto name = "dspark.layers." + std::to_string(layer) + ".self_attn.mergeqkv.weight";
+        const auto name = "dspark.layers." + std::to_string(layer) + ".self_attn." + DraftKVProjectionName();
         const auto merged = weight.weight.find(name);
         if (merged == weight.weight.end()) return false;
         Data &w = draftTP ? *merged->second.multiDeviceDatas.at(device) : merged->second;
@@ -1584,7 +1615,7 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
     const int ranks = draftTP ? draftTP->devices.size() : 1;
     const bool dataParallel = draftTP && draftTP->dataParallel;
     const int divisor = draftTP ? draftTP->attentionDivisor : 1;
-    const int heads = draftHeads / divisor, kvHeads = std::max(1, draftKvHeads / divisor);
+    const int heads = DraftContextQueryHeads() / divisor, kvHeads = std::max(1, draftKvHeads / divisor);
     const int width = kvHeads * draftHeadDim;
     auto weightAt = [&](const std::string &name, int rank) -> Data & {
         return draftTP ? *weight[name].multiDeviceDatas.at(draftTP->devices[rank]) : weight[name];
@@ -1610,9 +1641,9 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
     }
     for (int rank = 0; rank < ranks; ++rank) for (int i = 0; i < draftLayers; ++i) {
         const auto name = "dspark.layers." + std::to_string(i) + ".self_attn.";
-        auto merged = weight.weight.find(name + "mergeqkv.weight");
+        auto merged = weight.weight.find(name + DraftKVProjectionName());
         if (merged != weight.weight.end()) {
-            const Data &w = weightAt(name + "mergeqkv.weight", rank);
+            const Data &w = weightAt(name + DraftKVProjectionName(), rank);
             if (w.dataType != BFLOAT16 || w.multiDeviceData || w.dims !=
                 std::vector<int>{(heads + 2 * kvHeads) * draftHeadDim, embed_dim}) return false;
         } else for (auto part : {"k_proj.weight", "v_proj.weight"}) {
@@ -1673,12 +1704,12 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
         const bool batched = ProjectDraftKVWeights(input, localDevices.front(), heads, width, projectedKV, pointers);
         for (int layer = 0; layer < draftLayers; ++layer) {
             const auto name = "dspark.layers." + std::to_string(layer) + ".self_attn.";
-            auto merged = weight.weight.find(name + "mergeqkv.weight");
+            auto merged = weight.weight.find(name + DraftKVProjectionName());
             if (batched) {
                 raw[layer].Resize({1, total, 2 * width});
                 raw[layer].FakeFrom(projectedKV, (size_t)layer * total * 2 * width * sizeof(uint16_t));
             } else if (merged != weight.weight.end()) {
-                Data &w = weightAt(name + "mergeqkv.weight", rank);
+                Data &w = weightAt(name + DraftKVProjectionName(), rank);
                 w.ToDevice(DataDevice::CUDA, localDevices);
                 Data view; view.Resize({2 * width, embed_dim});
                 view.FakeFrom(w, (size_t)heads * draftHeadDim * embed_dim * sizeof(uint16_t));
@@ -3417,7 +3448,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     }
     // A warm one-token PD/chunked-prefill tail is still prefill. Its target
     // intentionally omits logits, so it must never enter speculative decode.
-    bool prefill = isIntermediateChunkedPrefill;
+    bool prefill = draftKVOnly || isIntermediateChunkedPrefill;
     for (int i = 0; i < batch; ++i) {
         AssertInFastLLM(caches[i] && owners[i] && positionIds[i],
                        "DSpark request has no registered draft context.");
@@ -3784,7 +3815,7 @@ int NaiveN05FlashModel::ForwardDraft(
     int limit = std::min(draftTokens, max_positions - oldLength - 1);
     if (config.output_token_limit > 0)
         limit = std::min(limit, config.output_token_limit - (oldLength - config.input_token_length) - 1);
-    if (isIntermediateChunkedPrefill || config.prefill_chunk_remaining >= 0 || context.committed == 0 || context.kv.empty() ||
+    if (draftKVOnly || isIntermediateChunkedPrefill || config.prefill_chunk_remaining >= 0 || context.committed == 0 || context.kv.empty() ||
         inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
         // Only the final draft window is used; there is no CPU prefix archive.
@@ -3848,6 +3879,21 @@ void NaiveN05FlashModel::PrepareDraftServingMemory(bool history) {
         }
         contexts.push_back(context.get()); owners.push_back(std::move(context));
     }
+    auto warmPrefillCommit = [&]() {
+        TargetCapture capture;
+        for (int layer : draftTargetLayers) {
+            Data &feature = capture.hidden[layer];
+            feature.dataType = BFLOAT16; feature.Resize({1, draftWindow + GetPageLen() - 1, embed_dim});
+            feature.ToDevice(DataDevice::CUDA, {draftTP->devices.front()}, false); feature.Allocate(true);
+        }
+        std::vector<std::pair<Data, Data>> unused;
+        CommitDraftContext(capture, draftWindow + GetPageLen() - 1, *contexts.front(), unused);
+    };
+    if (pdPrefillOnly) {
+        warmPrefillCommit();
+        idleDraftContexts = std::move(owners);
+        return;
+    }
     const int ranks = draftTP->devices.size();
     const int localLimit = draftTP->dataParallel ? WindowRequestsPerGroup(batch, ranks) : 0;
     const auto buckets = localLimit && GetFastllmEnv().cudaGraph ? SpeculativeGraphBuckets(localLimit) : std::vector<int>{};
@@ -3897,14 +3943,8 @@ void NaiveN05FlashModel::PrepareDraftServingMemory(bool history) {
             feature.ToDevice(DataDevice::CUDA, {draftTP->devices.front()}, false); feature.Allocate(true);
         }
         CommitDraftContexts(capture, std::vector<int>(batch, verifyRows), std::vector<int>(batch, verifyRows), contexts);
-        capture.hidden.clear(); capture.verifying = false;
-        for (int layer : draftTargetLayers) {
-            Data &feature = capture.hidden[layer];
-            feature.dataType = BFLOAT16; feature.Resize({1, draftWindow + GetPageLen() - 1, embed_dim});
-            feature.ToDevice(DataDevice::CUDA, {draftTP->devices.front()}, false); feature.Allocate(true);
-        }
-        std::vector<std::pair<Data, Data>> unused;
-        CommitDraftContext(capture, draftWindow + GetPageLen() - 1, *contexts.front(), unused);
+        capture.hidden.clear();
+        warmPrefillCommit();
     }
     if (!buckets.empty()) {
         std::vector<std::vector<DraftContext *>> groups(ranks);

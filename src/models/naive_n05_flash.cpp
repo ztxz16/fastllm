@@ -2583,10 +2583,16 @@ void NaiveN05FlashModel::WarmUp() {
     std::vector<std::pair<Data, Data>> cache;
     for (int layer = 0; layer < block_cnt; layer++)
         cache.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
-    Forward(ids, Data(), positions, cache);
+    {
+        struct RestorePhase {
+            bool &flag; bool saved;
+            ~RestorePhase() { flag = saved; }
+        } restore{isIntermediateChunkedPrefill, isIntermediateChunkedPrefill};
+        if (pdPrefillOnly && draftEnabled) isIntermediateChunkedPrefill = true;
+        Forward(ids, Data(), positions, cache);
+    }
     if (draftEnabled) {
-        auto context = draftContexts.at(&cache);
-        RunDraft(1, *context);
+        if (!pdPrefillOnly) RunDraft(1, *draftContexts.at(&cache));
         draftContexts.erase(&cache);
     }
     elementsInKVCachePerToken = 0;

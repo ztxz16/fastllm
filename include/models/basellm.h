@@ -799,6 +799,8 @@ namespace fastllm {
 
         ResponseContextDict responseContextDict;
 
+        // Empty selects the full external draft checkpoint.
+        virtual std::set<std::string> PDDraftContextWeightNames() const { return {}; }
         void ConfigurePD(const json11::Json &config);
         void StopPD();
         bool IsPDDecode() const;
@@ -917,6 +919,7 @@ namespace fastllm {
 
         // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
         // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
+        bool pdPrefillOnly = false; // Dedicated P role, known before KV pool sizing.
         bool isIntermediateChunkedPrefill = false;
 
         int defaultChunkedPrefillSize = 8192;
