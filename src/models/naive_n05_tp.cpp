@@ -499,7 +499,8 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         }
     }
     tpIndexerPeerAccess = indexerLayerSharding && tpEp8MegaState && FastllmCudaPeerAccessInit(tpDevices);
-    tpSwaRingCache = GetFastllmEnv().cudaGraph && FastllmNaiveKVType(AuxiliaryKVType()) &&
+    tpSwaRingCache = (GetFastllmEnv().cudaGraph || (attentionDP > 1 && !draftEnabled)) &&
+        FastllmNaiveKVType(AuxiliaryKVType()) &&
         window == 128 && sliding.headDim == 192 && sliding.valueDim == 128 &&
         (attentionDP > 1 || sliding.heads / ranks < 64);
     AssertInFastLLM(!indexerContextSharding || (indexFp8 && indexHeads == 16 &&
