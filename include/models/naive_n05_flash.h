@@ -305,6 +305,9 @@ namespace fastllm {
             std::deque<std::pair<int, int>> pending;
             std::mt19937_64 random{std::random_device{}()};
             uint64_t rounds = 0, proposed = 0, accepted = 0;
+            std::vector<std::pair<Data, Data>> kvBacking;
+            int kvOffset = 0;
+            void SlideKV(int count, int window, int reserve, int width);
             double Uniform() { return std::generate_canonical<double, 53>(random); }
         };
         struct TargetWorkspace;

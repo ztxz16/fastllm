@@ -91,6 +91,33 @@ class ProjectionFixture : public NaiveN05FlashModel {
         return CreateDraftContext();
     }
 };
+static void CheckSlidingCommit() {
+    ProjectionFixture model(81);
+    auto actual = std::make_shared<ProjectionFixture::DraftContext>();
+    ProjectionFixture::DraftContext reference;
+    int start = 0, wraps = 0;
+    bool moved = false;
+    for (int turn = 0; turn < 54; ++turn) {
+        const int count = turn % 3 == 0 ? 2 : 7;
+        Data hidden = BF({1, count, 256}, start);
+        int previous = actual->kvOffset;
+        // Occasionally use the ordinary append on a shifted cache.
+        if (start && turn % 9) actual->SlideKV(count, 17, 24, 128);
+        wraps += previous > 0 && actual->kvOffset == 0;
+        moved |= actual->kvOffset > 0;
+        Check(model.Fused(hidden, start, *actual) && model.Fused(hidden, start, reference), "sliding append rejected");
+        for (size_t i = 0; i < actual->kv.size(); ++i) {
+            Check(Bits(actual->kv[i].first) == Bits(reference.kv[i].first), "shifted draft K differs");
+            Check(Bits(actual->kv[i].second) == Bits(reference.kv[i].second), "shifted draft V differs");
+        }
+        start += count;
+    }
+    Check(moved && wraps >= 2, "sliding commit did not cross two physical boundaries");
+    void *base = actual->kvBacking[0].first.cudaData;
+    auto reused = model.Reuse(actual);
+    Check(actual->kv.empty() && reused->kv[0].first.cudaData == base && !reused->kv[0].first.cudaDataBorrowed &&
+        reused->kv[0].first.dims[1] == 0, "recycled request lost its KV allocation");
+}
 static double Relative(const Data &a, const Data &b) {
     auto ah = Bits(a), bh = Bits(b);
     Check(ah.size() == bh.size(), "relative error shape mismatch");
@@ -424,6 +451,7 @@ int main() {
                 Check(Bits(recovered->kv[0].first) == before, "recovered context differs");
                 checks += 13;
             }
+            CheckSlidingCommit();
         }
         Check(cudaDeviceSynchronize() == cudaSuccess, "CUDA failed");
         printf("PASS %d checks (postprocessing exact; merged GEMM relative L2 < 1%%)\n", checks);
