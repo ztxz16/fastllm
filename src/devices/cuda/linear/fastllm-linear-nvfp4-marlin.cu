@@ -9,6 +9,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-nvfp4-prefill.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "fastllm-cublas-prefill.cuh"
 #include "fastllm-native-lowbit-prefill.cuh"
@@ -429,6 +430,10 @@ static bool EnsureNvfp4MarlinOnDevice(fastllm::Data &weight,
 
 }  // namespace
 
+bool FastllmCudaNvfp4MarlinEnabled(bool defaultEnabled) {
+    return Nvfp4PrefillEnvFlag("FASTLLM_CUDA_NVFP4_MARLIN", defaultEnabled);
+}
+
 extern "C" bool FastllmCudaHasNVFP4MarlinLayout(
         const fastllm::Data &weight) {
     return HasNvfp4MarlinOnDevice(weight);
@@ -440,7 +445,7 @@ extern "C" bool FastllmCudaTryMarlinHalfMatMulFloatNVFP4Block16(
         int n, int m, int k) {
     // Process-start option: do not change an already-repacked weight's layout.
     // With Marlin disabled, untouched weights use the existing raw GEMV/GEMM path.
-    static const bool marlinEnabled = Nvfp4PrefillEnvFlag("FASTLLM_CUDA_NVFP4_MARLIN", true);
+    static const bool marlinEnabled = FastllmCudaNvfp4MarlinEnabled(true);
     if (!marlinEnabled && !HasNvfp4MarlinOnDevice(weight)) return false;
     int packedN = 0;
     if (!GetNvfp4MarlinPackedOutputDim(k, packedN)) return false;

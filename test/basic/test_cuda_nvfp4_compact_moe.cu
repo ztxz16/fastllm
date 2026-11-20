@@ -1,4 +1,5 @@
 #include "fastllm.h"
+#include "devices/cuda/fastllm-nvfp4-prefill.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -224,6 +225,149 @@ static void RunShape(int hidden, int inter, const std::vector<int>& batches, int
         }
     }
 }
+// Dot products which cancel exactly before the tensor-scale multiply can acquire
+// a residual if each scaled weight is first rounded to BF16.
+static void CheckLateScalePrefill(int columns, bool fragmented) {
+    using namespace fastllm;
+    constexpr int tokens = 33, outputs = 17;
+    Data weight(NVFP4_BLOCK_16_E4M3_PACKED, {outputs, columns});
+    Data input(BFLOAT16, {tokens, columns}), output(BFLOAT16, {tokens, outputs});
+    weight.Allocate(true);
+    input.Allocate(true);
+    output.Allocate(false);
+    const size_t pitch = weight.GetBytes() / outputs;
+    const auto scaleForRow = [fragmented](int row) {
+        return (fragmented ? row % 2 == 0 : row < 7) ? .037f : .071f;
+    };
+    for (int row = 0; row < outputs; ++row) {
+        auto *packed = weight.cpuData + size_t(row) * pitch;
+        const float global = scaleForRow(row);
+        std::memcpy(packed, &global, sizeof(global));
+        packed[4] = 0x32;    // First pair of weights: 1 and 1.5.
+        packed[4 + 8] = 0x38; // First block scale: 1 in E4M3.
+    }
+    auto *x = reinterpret_cast<__nv_bfloat16 *>(input.cpuData);
+    for (int t = 0; t < tokens; ++t) {
+        x[t * columns] = __float2bfloat16_rn(t % 2 ? .5f : 1.5f);
+        x[t * columns + 1] = __float2bfloat16_rn(-1.f);
+    }
+    FastllmNvfp4PrefillPlan plan;
+    FastllmCudaPlanNvfp4Prefill(plan, weight);
+    Require(fragmented ? plan.empty() : plan.at(&weight).size() == 2, "incorrect NVFP4 scale runs");
+    weight.ToDevice(CUDA, std::vector<int>{0});
+    input.ToDevice(CUDA, std::vector<int>{0});
+    output.ToDevice(CUDA, std::vector<int>{0});
+    FastllmCudaNvfp4Scope scope(plan);
+    Require(FastllmCudaBFloat16MatMulNVFP4Block16(input, weight, *GetEmptyData(),
+            output, tokens, columns, outputs), "late-scale compact GEMM failed");
+    Check(cudaDeviceSynchronize());
+    output.ToDevice(CPU);
+    const auto *y = reinterpret_cast<const __nv_bfloat16 *>(output.cpuData);
+    for (int t = 0; t < tokens; ++t) {
+        for (int row = 0; row < outputs; ++row) {
+            const float global = scaleForRow(row);
+            const float expected = Round(t % 2 ? -global : 0.f, BFLOAT16);
+            Require(__bfloat162float(y[t * outputs + row]) == expected,
+                    "compact GEMM rounded the tensor scale before the dot product");
+        }
+    }
+}
+
+// Exercise the 8-, 4-, 2- and 1-row tiles in one decode call. Nonuniform
+// scales and bias expose incorrect addressing on either output axis.
+static void CheckCompactDecodeTiles(int columns) {
+    using namespace fastllm;
+    constexpr int rows = 15, channels = 4096;
+    Data weight(NVFP4_BLOCK_16_E4M3_PACKED, {channels, columns});
+    Data input(BFLOAT16, {rows, columns}), bias(FLOAT32, {channels});
+    Data output(BFLOAT16, {rows, channels}), reference(BFLOAT16, {rows, channels});
+    weight.Allocate(false);
+    input.Allocate(false);
+    bias.Allocate(false);
+    std::mt19937 random(57);
+    const size_t pitch = weight.GetBytes() / channels;
+    for (int c = 0; c < channels; ++c) {
+        auto *packed = weight.cpuData + size_t(c) * pitch;
+        float global = (1 + c % 3) / 4096.f;
+        std::memcpy(packed, &global, sizeof(global));
+        for (size_t j = sizeof(global); j < pitch; ++j) packed[j] = uint8_t(random());
+        reinterpret_cast<float*>(bias.cpuData)[c] = (c % 51 - 25) / 128.f;
+    }
+    for (int i = 0; i < rows * columns; ++i)
+        reinterpret_cast<__nv_bfloat16*>(input.cpuData)[i] = __float2bfloat16_rn((int(random() % 16384) - 8192) / 4096.f);
+    for (Data *data : {&weight, &input, &bias}) data->ToDevice(CUDA, std::vector<int>{0});
+    for (Data *data : {&output, &reference}) {
+        data->ToDevice(CUDA, {0}, false);
+        data->Allocate(false);
+    }
+    FastllmNvfp4PrefillPlan plan;
+    FastllmCudaNvfp4Scope decode(plan, true);
+    Require(FastllmCudaBFloat16MatMulNVFP4Block16(input, weight, bias, output, rows, columns, channels),
+            "compact batch projection failed");
+    for (int r = 0; r < rows; ++r) {
+        Data x, y;
+        x.FakeFrom(input, size_t(r) * columns * input.unitSize);
+        x.Resize({1, columns});
+        y.FakeFrom(reference, size_t(r) * channels * reference.unitSize);
+        y.Resize({1, channels});
+        Require(FastllmCudaBFloat16MatMulNVFP4Block16(x, weight, bias, y, 1, columns, channels),
+                "compact single-row projection failed");
+    }
+    Check(cudaDeviceSynchronize());
+    output.ToDevice(CPU);
+    reference.ToDevice(CPU);
+    Require(std::memcmp(output.cpuData, reference.cpuData, output.GetBytes()) == 0,
+            "compact decode tiles differ from single rows");
+}
+
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+// A one-hot input selects an exact signed FP4 weight. Check real Marlin
+// launches against that independent oracle on both sides of a fused scale
+// boundary, the full group permutation and a short final M tile.
+static void CheckCompactMarlin(int inner) {
+    using namespace fastllm;
+    constexpr int rows = 11, columns = 4096;
+    Data weight(NVFP4_BLOCK_16_E4M3_PACKED, {columns, inner});
+    Data input(BFLOAT16, {rows, inner}), output(BFLOAT16, {rows, columns});
+    weight.Allocate(false);
+    input.Allocate(false);
+    std::memset(input.cpuData, 0, input.GetBytes());
+    std::vector<float> expected(rows * columns);
+    std::mt19937 rng(120);
+    auto *x = reinterpret_cast<__nv_bfloat16 *>(input.cpuData);
+    for (int r = 0; r < rows; ++r) x[r * inner + (r * 1319 % inner)] = __float2bfloat16_rn(1);
+    for (int c = 0; c < columns; ++c) {
+        const float global = c < columns / 2 ? 0.0031f : 0.0073f;
+        auto *p = weight.cpuData + size_t(c) * (4 + inner / 16 * 9);
+        std::memcpy(p, &global, sizeof(global));
+        for (int g = 0; g < inner / 16; ++g) {
+            for (int i = 0; i < 8; ++i) p[4 + 9*g + i] = uint8_t(rng());
+            p[4 + 9*g + 8] = (c + g) % 17 ? 8 + rng() % 119 : 0;
+        }
+        for (int r = 0; r < rows; ++r) {
+            int i = r * 1319 % inner;
+            const auto *group = p + 4 + (i / 16) * 9;
+            int nibble = group[i % 16 / 2] >> (4 * (i % 2)) & 15;
+            expected[r * columns + c] = Round(Fp4(nibble) * Fp8(group[8]) * global, BFLOAT16);
+        }
+    }
+    FastllmNvfp4PrefillPlan plan;
+    FastllmCudaPlanNvfp4Prefill(plan, weight);
+    for (Data *t : {&weight, &input}) t->ToDevice(CUDA, std::vector<int>{0});
+    output.ToDevice(CUDA, {0}, false);
+    output.Allocate(false);
+    auto cache = FastllmCreateCompactMarlinCache();
+    for (int m : {1, rows}) {
+        Require(FastllmCudaCompactMarlinLinear(*cache, plan, weight, input.cudaData, output.cudaData,
+                m, columns, inner), "eligible compact Marlin weights rejected");
+        std::vector<__nv_bfloat16> values(m * columns);
+        Check(cudaMemcpy(values.data(), output.cudaData, values.size() * sizeof(values[0]), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < values.size(); ++i)
+            Require(__bfloat162float(values[i]) == expected[i], "Marlin differs from compact FP4 oracle");
+    }
+}
+#endif
+
 int main(int argc,char**argv) {
     try {
         Require(argc == 1 || (argc == 2 && std::strcmp(argv[1], "--quick") == 0),
@@ -233,6 +377,18 @@ int main(int argc,char**argv) {
         Check(status);cudaDeviceProp properties;Check(cudaGetDeviceProperties(&properties,0));
         if(properties.major<8)return 77; // BF16 support is required.
         FastllmCudaSetDevice(0);
+        if (properties.major == 12 && properties.minor == 0) {
+            for (int columns : {4096, 12288}) {
+                CheckCompactDecodeTiles(columns);
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+                CheckCompactMarlin(columns);
+#endif
+            }
+        }
+        for (int columns : {64, 80}) {
+            CheckLateScalePrefill(columns, false);
+            CheckLateScalePrefill(columns, true);
+        }
         RunShape(128,128,argc>1 ? std::vector<int>{1,65} : std::vector<int>{1,9,32,65,200});
         if(argc==1) {
             RunShape(256,256,{1,17,96});

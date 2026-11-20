@@ -471,6 +471,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
+        src/devices/cuda/linear/fastllm-compact-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-disk-mxfp4-marlin.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
