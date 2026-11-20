@@ -1149,6 +1149,26 @@ bool FastllmCudaHalfMatMulBFloat16(const fastllm::Data &input, fastllm::Data &we
 }
 
 // BF16 input × BF16 weight -> BF16 output
+bool FastllmCudaBFloat16PrefillLinear(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    if (input.dataType != BFLOAT16 || weight.dataType != BFLOAT16 ||
+        input.dataDevice != CUDA || weight.dataDevice != CUDA || !input.cudaData || !weight.cudaData ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.multiDeviceData || weight.multiDeviceData ||
+        input.dims.size() != 3 || input.dims[0] != 1 || input.dims[1] <= 0 || weight.dims.size() != 2 ||
+        input.strides.size() != 3 || weight.strides.size() != 2 || weight.dims[0] <= 0 || weight.dims[1] <= 0 ||
+        input.dims.back() != weight.dims[1] || input.strides[1] != (uint64_t)weight.dims[1] ||
+        input.strides[2] != 1 || weight.strides[0] != (uint64_t)weight.dims[1] || weight.strides[1] != 1 ||
+        FastllmCudaRuntimeArch() != 120) return false;
+    output.dataType = BFLOAT16;
+    output.UpdateUnitSize();
+    output.Resize({1, input.dims[1], weight.dims[0]});
+    output.ToDevice(CUDA, input.dataDeviceIds, false);
+    output.Allocate(false);
+    return fastllm_bf16_lt::Matmul(input.cudaData, weight.cudaData, output.cudaData,
+        input.dims[1], weight.dims[1], weight.dims[0], CUDA_R_16BF, fastllm_bf16_lt::prefillReferenceRows);
+}
+
 bool FastllmCudaBFloat16LinearFixedRows(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
     auto dense = [](const fastllm::Data &x) {

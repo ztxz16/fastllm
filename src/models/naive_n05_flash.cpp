@@ -20,6 +20,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-linear-scratch.h"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -972,7 +973,11 @@ Data NaiveN05FlashModel::RunTarget(
         std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
     const bool compactPrefillHead = localMoeRows && !decodeWorkspace && !verifying &&
         (!capture || !capture->collectHidden);
-    const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace &&
+    // A request must keep the same FFN reduction and local router when another
+    // KV owner joins a prefill batch.
+    const bool stablePrefill = attentionParallel && !decodeWorkspace && !verifying &&
+        (batch ? !batchDecode : length > 1) && FastllmCudaRuntimeArch() == 120;
+    const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace && !stablePrefill &&
         std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
             [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
     int maxLocalRows = 0;
@@ -2173,12 +2178,20 @@ Data NaiveN05FlashModel::RunTarget(
             Data &w1 = workspace ? buf.denseGate : buf.w1;
             Data &w2 = workspace ? buf.denseDown : buf.w2;
             Data &w3 = workspace ? buf.denseUp : buf.w3;
-            Linear(normed, localWeight(prefix + ".mlp.gate_proj.weight"), Data(), w1);
-            Linear(normed, localWeight(prefix + ".mlp.up_proj.weight"), Data(), w3);
+            auto project = [&](Data &input, Data &weight, Data &output) {
+                if (stablePrefill && FastllmCudaBFloat16PrefillLinear(input, weight, output)) return;
+                Linear(input, weight, Data(), output);
+            };
+            project(normed, localWeight(prefix + ".mlp.gate_proj.weight"), w1);
+            project(normed, localWeight(prefix + ".mlp.up_proj.weight"), w3);
             Silu(w1, w1);
             MulTo(w1, w3);
-            Linear(w1, localWeight(prefix + ".mlp.down_proj.weight"), Data(), w2);
-            addMlpResidual(w2, true);
+            project(w1, localWeight(prefix + ".mlp.down_proj.weight"), w2);
+            // NCCL BF16 may round partial sums at different ranks as the message
+            // grows. The row reduction accumulates ranks in FP32 and chunks large messages.
+            const bool reduced = stablePrefill && FastllmCudaCustomAllReduceRows(
+                w2.cudaData, w2.cudaData, w2.Count(0), embed_dim, w2.dataType, gpu);
+            addMlpResidual(w2, !reduced);
         } else {
             // EP ranks route only their contiguous token shard, borrowing
             // the normalized activation until MegaMoE finishes reading it.
