@@ -2048,6 +2048,13 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
     auto run = [&](const std::function<void(int)> &fn) {
         if (draftTP) draftTP->Run(fn); else fn(0);
     };
+    // Store token IDs and live lengths after this bucket's KV bindings when
+    // the existing descriptor allocation has room. Views depend only on the
+    // captured bucket; each replay uploads fresh request data, including padding.
+    auto packedInputs = [&](int count) {
+        return bucketedDP && count % 4 == 0 &&
+            size_t(count) * (2 * draftLayers + 1) <= size_t(std::max(maxBatch, count)) * 2 * draftLayers;
+    };
     auto upload = [&](int rank) {
         auto &r = scratch(rank);
         const auto &requests = rankRequests[rank];
@@ -2065,15 +2072,24 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             localTokens[row] = anchors[seq];
             localLengths[row] = contexts[seq]->committed + 1;
         }
-        copy(r.id, FLOAT32, localTokens.data(), {1, count});
-        copy(r.live, INT32, localLengths.data(), {count});
+        const bool packed = packedInputs(count);
+        if (!packed) {
+            copy(r.id, FLOAT32, localTokens.data(), {1, count});
+            copy(r.live, INT32, localLengths.data(), {count});
+        }
         if (dynamicKV) {
-            std::vector<uint64_t> bindings(size_t(draftLayers) * count * 2);
+            const size_t slots = size_t(draftLayers) * count * 2;
+            std::vector<uint64_t> bindings(slots + (packed ? count : 0));
             for (int layer = 0; layer < draftLayers; ++layer) for (size_t row = 0; row < requests.size(); ++row) {
                 auto &cache = cacheAt(*contexts[requests[row]], rank, layer);
                 const size_t slot = (size_t(layer) * count + row) * 2;
                 bindings[slot] = (uint64_t)cache.first.cudaData;
                 bindings[slot + 1] = (uint64_t)cache.second.cudaData;
+            }
+            if (packed) {
+                auto *tail = reinterpret_cast<unsigned char *>(bindings.data() + slots);
+                std::memcpy(tail, localTokens.data(), count * sizeof(float));
+                std::memcpy(tail + count * sizeof(float), localLengths.data(), count * sizeof(int));
             }
             r.batchKV.dataType = INT32; r.batchKV.UpdateUnitSize();
             r.batchKV.Resize({draftLayers, std::max(maxBatch, count), 4});
@@ -2109,7 +2125,17 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
         };
         auto &r = scratch(rank);
         if (r.layers.empty()) r.layers.resize(draftLayers);
-        Data &ids = r.id, &live = r.live, &result = r.normalized;
+        Data packedIds, packedLive;
+        const int count = rankRows[rank];
+        const bool packed = packedInputs(count);
+        if (packed) {
+            const size_t tail = size_t(draftLayers) * count * 2 * sizeof(uint64_t);
+            packedIds.FakeFrom(r.batchKV, tail);
+            packedIds.dataType = FLOAT32; packedIds.UpdateUnitSize(); packedIds.Resize({1, count});
+            packedLive.FakeFrom(r.batchKV, tail + count * sizeof(float)); packedLive.Resize({count});
+        }
+        Data &ids = packed ? packedIds : r.id, &live = packed ? packedLive : r.live;
+        Data &result = r.normalized;
         auto addNorm = [&](Data &hidden, Data &branch, Data &gamma, Data &output) {
             gamma.ToDevice(DataDevice::CUDA, std::vector<int>{devices[rank]});
             if (hidden.dataType == BFLOAT16 && branch.dataType == BFLOAT16 &&
@@ -2420,10 +2446,10 @@ struct NaiveN05FlashModel::DraftRound {
         ++context.rounds;
         context.proposed += proposed.size();
         context.accepted += accepted;
-        proposed.resize(accepted);
-        proposed.push_back(next);
-        for (int i = 1; i < (int)proposed.size(); ++i)
+        for (int i = 1; i < accepted; ++i)
             context.pending.emplace_back(proposed[i - 1], proposed[i]);
+        if (!accepted) return next;
+        context.pending.emplace_back(proposed[accepted - 1], next);
         return proposed[0];
     }
 
