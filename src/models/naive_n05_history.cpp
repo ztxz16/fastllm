@@ -123,6 +123,19 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     }
 }
 
+void NaiveN05FlashModel::ReleaseKVForReplay(ResponseContext *context) {
+    const Data *key = &context->pastKeyValues.front().first;
+    ReleaseRequestWindowStorage(context);
+    {
+        std::lock_guard<std::mutex> guard(historyMutex);
+        activePrefixes.erase(key);
+        if (saveHistoryChat) activePrefixes.try_emplace(key);
+    }
+    // Invalidate cached forward metadata. The independent sampling ID survives the replay.
+    std::lock_guard<std::mutex> guard(tpRequestMutex);
+    tpRequestIds.at(key) = ++tpNextRequestId;
+}
+
 void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
     const Data *key = context->pastKeyValues.empty() ? nullptr : &context->pastKeyValues.front().first;
     {

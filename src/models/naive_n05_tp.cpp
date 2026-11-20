@@ -2324,6 +2324,15 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         if (state.mode == TPDecodeState::Prepare) return output;
     }
     if (state.mode == TPDecodeState::Replay) {
+        if (attentionParallel && attentionParallel->servingPadded && batch && batch->proposals &&
+                !batch->proposals->rows.empty()) {
+            const auto &src = *batch->proposals;
+            for (auto event : src.ready) FastllmCudaCurrentThreadStreamWaitEvent(event);
+            AssertInFastLLM(FastllmCudaMtpGatherVerifyIds((float *)buf.inputIds.cudaData,
+                tpServingState->verifyWidth, src.rows.data(), src.strides.data(),
+                attentionParallel->verifyLengths->data(), src.rows.size(), weight["lm_head.weight"].dims[0]),
+                "Cannot assemble draft verification tokens.");
+        }
         AssertInFastLLM(FastllmCudaGraphLaunch(r.exec), "Naive TP decode graph launch failed.");
     } else {
         if (state.mode == TPDecodeState::Warm) {

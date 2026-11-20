@@ -2,7 +2,9 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "fastllm.h"
+#include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <cstdio>
 #include <cstring>
 #include <cuda_fp8.h>
@@ -119,6 +121,36 @@ static void Case(int rows, int past, int part, int gap, bool scaled, bool zero, 
     printf("SCORE rows=%d past=%d nrmse=%g maxabs=%g\n", rows, past, nrmse,
            maxabs); // Hopper FP8 MMA has reduced product-accumulation precision, with FP32 output.
     Check(nrmse < 2.e-4, "score math mismatch");
+    if (!part && (rows == 65 || past == 0)) {
+        // Score the exact quantized model query, then independently sort its causal prefix on CPU.
+        Data values, scales;
+        Check(FastllmCudaNaiveQuantizeIndexer(q, values, scales, false), "quantize direct reference query");
+        auto entry = e;
+        entry.q = (const __nv_bfloat16 *)values.cudaData;
+        entry.scales = (const float *)scales.cudaData;
+        Check(launch(entry) == 1, "score direct reference");
+        FastllmCudaSyncCurrentThreadStream();
+        q.Reshape({1, rows, 2048});
+        w.Reshape({1, rows, 16});
+        Data direct;
+        FastllmCudaNaiveIndexer(q, w, key, 16, 128, past, 2048, true, direct, false, nullptr,
+                                NaiveIndexerCompute::FP8Direct);
+        FastllmCudaSyncCurrentThreadStream();
+        for (int row : {0, rows / 2, rows - 1}) {
+            const int visible = past + row + 1;
+            std::vector<float> coarse(visible);
+            std::vector<int> expected(visible), got(2048);
+            Check(cudaMemcpy(coarse.data(), (const float *)scores.cudaData + size_t(row) * keys,
+                             visible * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess, "copy direct scores");
+            Check(cudaMemcpy(got.data(), (const int *)direct.cudaData + size_t(row) * 2048,
+                             2048 * sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess, "copy direct TopK");
+            std::iota(expected.begin(), expected.end(), 0);
+            std::partial_sort(expected.begin(), expected.begin() + std::min(visible, 2048), expected.end(),
+                              [&](int a, int b) { return coarse[a] == coarse[b] ? a < b : coarse[a] > coarse[b]; });
+            expected.resize(2048, -1);
+            Check(got == expected, "direct TopK differs from ordered causal FP8 scores");
+        }
+    }
     if (!part) {
         q.Reshape({1, rows, 2048});
         w.Reshape({1, rows, 16});

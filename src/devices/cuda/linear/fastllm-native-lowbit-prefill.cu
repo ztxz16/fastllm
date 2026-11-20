@@ -33,6 +33,7 @@ struct Plan {
     cublasLtMatmulDesc_t op = nullptr;
     cublasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
     cublasLtMatmulAlgo_t algo{};
+    bool hasRouterTile = false;
     bool valid = false, tuned = false;
     std::vector<cublasLtMatmulAlgo_t> candidates;
     ~Plan() {
@@ -54,9 +55,8 @@ struct State {
     cudaEvent_t ready = nullptr;
     static constexpr size_t workspaceBytes = 32ull << 20, capacity = 384ull << 20;
     std::map<std::tuple<int, int, int, int>, std::unique_ptr<Plan>> plans;
-    bool initialized = false;
 };
-inline State *GetState(bool initialize = true) {
+inline State *GetState(bool initialize = true, bool borrowed = false) {
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess)
         return nullptr;
@@ -65,34 +65,34 @@ inline State *GetState(bool initialize = true) {
     State *s;
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (!initialize && states.find(dev) == states.end()) return nullptr;
+        if (!initialize && !borrowed && states.find(dev) == states.end()) return nullptr;
         auto &v = states[dev];
         if (!v)
             v = std::make_unique<State>();
         s = v.get();
     }
     std::lock_guard<std::mutex> lock(s->mutex);
-    if (s->initialized)
+    if (s->workspace || (borrowed && s->handle))
         return s;
-    // Reserve before KV budget calibration. Serving never grows this allocation.
-    if (!initialize || !FastllmCudaGetNcclForceSync())
+    if (!borrowed && (!initialize || !FastllmCudaGetNcclForceSync()))
         return nullptr;
+    if (!s->handle) {
+        if (cublasLtCreate(&s->handle) != CUBLAS_STATUS_SUCCESS) return nullptr;
+        if (cudaEventCreateWithFlags(&s->ready, cudaEventDisableTiming) != cudaSuccess) {
+            cublasLtDestroy(s->handle);
+            s->handle = nullptr;
+            return nullptr;
+        }
+        CheckCuda(cudaEventRecord(s->ready, cudaStreamPerThread), "native prefill init event");
+    }
+    // The router can lend its existing MoE arena. Only the quantized projection
+    // warmup may reserve a persistent device allocation before KV sizing.
+    if (borrowed) return s;
     if (cudaMalloc(&s->workspace, State::workspaceBytes + State::capacity) != cudaSuccess) {
         cudaGetLastError();
         return nullptr;
     }
     s->scratch = static_cast<uint8_t *>(s->workspace) + State::workspaceBytes;
-    if (cublasLtCreate(&s->handle) != CUBLAS_STATUS_SUCCESS ||
-        cudaEventCreateWithFlags(&s->ready, cudaEventDisableTiming) != cudaSuccess) {
-        if (s->handle)
-            cublasLtDestroy(s->handle);
-        s->handle = nullptr;
-        cudaFree(s->workspace);
-        s->workspace = nullptr;
-        return nullptr;
-    }
-    CheckCuda(cudaEventRecord(s->ready, cudaStreamPerThread), "native prefill init event");
-    s->initialized = true;
     return s;
 }
 // A different output tile may improve FP32 throughput without changing its
@@ -164,7 +164,32 @@ inline Plan *GetPlan(State &s, int bits, int M, int N, int K) {
             p->candidates.push_back(h[i].algo);
     if (p->candidates.empty())
         return nullptr;
-    p->algo = p->candidates[0];
+    p->algo = p->candidates.front();
+    if (bits == 32 && N == 256 && K == 4096) {
+        // The default 128x128 tile can leave a partial wave on Hopper for
+        // narrow gates. Only change the output tile; preserve the FP32 kernel,
+        // split-K count, reduction scheme and every other algorithm setting.
+        int device = 0, sms = 0, tile = 0;
+        size_t written = 0;
+        const int64_t blocks = (int64_t)((N + 127) / 128) * ((M + 127) / 128);
+        auto candidate = p->algo;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+            blocks * 3 >= sms && blocks <= sms &&
+            cublasLtMatmulAlgoConfigGetAttribute(&candidate, CUBLASLT_ALGO_CONFIG_TILE_ID,
+                &tile, sizeof(tile), &written) == CUBLAS_STATUS_SUCCESS && tile == CUBLASLT_MATMUL_TILE_128x128) {
+            tile = CUBLASLT_MATMUL_TILE_128x64;
+            cublasLtMatmulHeuristicResult_t check{};
+            if (cublasLtMatmulAlgoConfigSetAttribute(&candidate, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile)) ==
+                    CUBLAS_STATUS_SUCCESS &&
+                cublasLtMatmulAlgoCheck(s.handle, p->op, p->a, p->b, p->c, p->c, &candidate, &check) ==
+                    CUBLAS_STATUS_SUCCESS && check.state == CUBLAS_STATUS_SUCCESS &&
+                check.workspaceSize <= State::workspaceBytes) {
+                p->algo = candidate;
+                p->hasRouterTile = true;
+            }
+        }
+    }
     p->valid = true;
     return p;
 }
@@ -208,22 +233,30 @@ inline void Tune(State &s, Plan &p, const void *a, const void *b, float *c) {
     if (best == 1.e30f)
         p.valid = false;
 }
-bool Fp32(const float *input, const float *weight, float *output, int M, int N, int K) {
+bool Fp32(const float *input, const float *weight, float *output, int M, int N, int K,
+          void *arena, size_t arenaBytes) {
     if (FastllmCudaRuntimeArch() != 90 || M < 128 || N <= 0 || K <= 0 || N % 16 || K % 16 ||
         !input || !weight || !output || uintptr_t(input) % 16 || uintptr_t(weight) % 16 ||
         uintptr_t(output) % 16 || FastllmCudaGraphIsCapturingFast()) return false;
-    // Borrow the arena already reserved by native prefill before KV sizing.
-    // Enabling this path never creates an additional serving allocation.
-    State *s = GetState(false);
+    // Either workspace already exists; never reserve GPU memory here.
+    const bool borrowed = arena && uintptr_t(arena) % 256 == 0 && arenaBytes >= State::workspaceBytes;
+    State *s = GetState(false, borrowed);
     if (!s) return false;
     std::lock_guard<std::mutex> lock(s->mutex);
+    // In a serving workload each ragged prefill can have a new M. A model
+    // lending its MoE arena only needs plans for the current/recent forwards.
+    if (!s->workspace && s->plans.size() >= 64 && !s->plans.count(std::make_tuple(32, M, N, K)))
+        s->plans.clear();
     Plan *p = GetPlan(*s, 32, M, N, K);
     if (!p) return false;
+    // An unsupported tile on a model without a native arena retains its
+    // original cuBLAS dispatch. No autotuning on the borrowed path.
+    if (!s->workspace && !p->hasRouterTile) return false;
     CheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, s->ready, 0), "FP32 prefill scratch dependency");
-    Tune(*s, *p, weight, input, output);
+    if (!p->hasRouterTile) Tune(*s, *p, weight, input, output);
     const float alpha = 1, beta = 0;
     bool ok = p->valid && cublasLtMatmul(s->handle, p->op, &alpha, weight, p->a, input, p->b,
-        &beta, output, p->c, output, p->c, &p->algo, s->workspace, State::workspaceBytes,
+        &beta, output, p->c, output, p->c, &p->algo, borrowed ? arena : s->workspace, State::workspaceBytes,
         cudaStreamPerThread) == CUBLAS_STATUS_SUCCESS;
     CheckCuda(cudaGetLastError(), "FP32 prefill output");
     CheckCuda(cudaEventRecord(s->ready, cudaStreamPerThread), "FP32 prefill completion");
@@ -684,7 +717,7 @@ bool Supported(int bits) {
 namespace fastllm_native_prefill {
 bool Enabled(const char *) { return false; }
 bool Supported(int) { return false; }
-bool Fp32(const float *, const float *, float *, int, int, int) { return false; }
+bool Fp32(const float *, const float *, float *, int, int, int, void *, size_t) { return false; }
 bool Fp8BFloat16(const __nv_bfloat16 *, const uint8_t *, const float *, __nv_bfloat16 *, int, int, int) {
     return false;
 }

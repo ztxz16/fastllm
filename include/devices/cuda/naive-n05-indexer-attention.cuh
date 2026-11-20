@@ -19,3 +19,8 @@ void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerIte
     int indexHeads, int indexDim, int topK, bool fp8Query, bool fp8Compute,
     int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
     const fastllm::Data &attentionScratch);
+void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerItem &index,
+    const FastllmNaivePrefillAttentionItem &attention, const fastllm::Data &sink,
+    int indexHeads, int indexDim, int topK, bool fp8Query, fastllm::NaiveIndexerCompute compute,
+    int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
+    const fastllm::Data &attentionScratch);

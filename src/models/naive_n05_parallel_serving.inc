@@ -111,6 +111,9 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
             // means the caller already has the exact captured input layout.
             if (batch->Size() == slots && liveTokens == graph->rows)
                 return ForwardAttentionParallel(inputIds, positions, kv, config, capture, &all, batch);
+            const bool deviceIds = !serving.preparing && graph->captured &&
+                batch->proposals && !batch->proposals->rows.empty();
+            if (batch->proposals && !deviceIds) batch->proposals->materialize();
             std::vector<std::pair<Data *, Data *>> pointers = batch->kv;
             std::vector<GenerationConfig> configs = batch->configs;
             std::vector<int> lengths(slots, width);
@@ -118,7 +121,8 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
             int source = 0;
             for (int seq = 0; seq < batch->Size(); ++seq) {
                 const int count = batch->lengths[seq];
-                std::copy_n((const float *)inputIds.cpuData + source, count, ids.begin() + seq * width);
+                if (!deviceIds)
+                    std::copy_n((const float *)inputIds.cpuData + source, count, ids.begin() + seq * width);
                 std::copy_n((const float *)positions.cpuData + source, count, pos.begin() + seq * width);
                 source += count;
             }
@@ -130,7 +134,7 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
                 }
                 configs.push_back(config);
             }
-            TargetBatch padded{pointers, configs, lengths, block_cnt};
+            TargetBatch padded{pointers, configs, lengths, block_cnt, deviceIds ? batch->proposals : nullptr};
             return ForwardAttentionParallel(Data(FLOAT32, {1, graph->rows}, ids),
                 Data(FLOAT32, {1, graph->rows}, pos), kv, config, capture, &all, &padded);
         };
@@ -232,7 +236,13 @@ bool NaiveN05FlashModel::PrepareAttentionParallelServingDecode(const TargetBatch
         const auto &previous = dp.previousBindingRows;
         bool moved = false;
         std::vector<int> changedRows;
-        for (int row = 0; row < buf.tableRows; ++row) {
+        // Padding follows the live rows within each owner. Only slots that
+        // were previously bound can need clearing when the batch shrinks.
+        int liveEnd = count;
+        while (liveEnd && group.sequenceIndices[liveEnd - 1] >= dp.servingLiveRows) --liveEnd;
+        const int updateEnd = storage.boundRowEnd < 0 ? buf.tableRows : std::max(storage.boundRowEnd, liveEnd);
+        storage.boundRowEnd = updateEnd; // Keep a conservative bound on partial failure.
+        for (int row = 0; row < updateEnd; ++row) {
             const int seq = row < count ? group.sequenceIndices[row] : dp.servingLiveRows;
             if (seq < dp.servingLiveRows && !previous.empty() && previous[seq] >= 0) {
                 if (previous[seq] == row) continue;
@@ -316,16 +326,19 @@ bool NaiveN05FlashModel::PrepareAttentionParallelServingDecode(const TargetBatch
                 }
             }
         }
+        storage.boundRowEnd = liveEnd;
         return true;
     };
     if (preparing) {
         for (int rank = 0; rank < (int)tpDevices.size(); ++rank)
             if (!prepareRank(rank)) return false;
     } else {
-        // Each rank owns its graph storage. Rebind changed batches on the
-        // existing rank workers before any rank is allowed to launch.
+        // Replay binding only updates host descriptors. A GPU dispatch here
+        // would synchronize the sampling stream before verification is ready.
         std::vector<char> ready(tpDevices.size());
-        dp.runtime.Run([&](int rank, int) { ready[rank] = prepareRank(rank); });
+        std::vector<std::exception_ptr> errors(tpDevices.size());
+        tpWorkers.Run(tpDevices, [&](int rank) { ready[rank] = prepareRank(rank); }, errors);
+        for (auto error : errors) if (error) std::rethrow_exception(error);
         if (std::find(ready.begin(), ready.end(), 0) != ready.end()) return false;
     }
     return graph.active = true;

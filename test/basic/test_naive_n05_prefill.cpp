@@ -318,7 +318,7 @@ static void TestSwaPrefillScratch() {
 }
 
 static void TestLocalPrefillBatch() {
-    for (bool fp8Compute : {false, true}) {
+    for (auto compute : {NaiveIndexerCompute::Auto, NaiveIndexerCompute::FP8, NaiveIndexerCompute::FP8Direct}) {
         struct Item { Data q{BFLOAT16}, w{BFLOAT16}, k{BFLOAT16}, packed, reference, actual; };
         std::vector<std::unique_ptr<Item>> storage;
         std::vector<FastllmNaivePrefillIndexerItem> items;
@@ -331,14 +331,15 @@ static void TestLocalPrefillBatch() {
             Upload(item->q, {1, rows, 2048}, 53 + i);
             Upload(item->w, {1, rows, 16}, 71 + i);
             Upload(item->k, {1, keys, 128}, 113 + i);
-            if (fp8Compute || i % 2) FastllmCudaNaivePackIndexer(item->k, item->packed);
-            Data &key = fp8Compute || i % 2 ? item->packed : item->k;
+            const bool packKey = compute != NaiveIndexerCompute::Auto || i % 2;
+            if (packKey) FastllmCudaNaivePackIndexer(item->k, item->packed);
+            Data &key = packKey ? item->packed : item->k;
             FastllmCudaNaiveIndexer(item->q, item->w, key, 16, 128, keys-rows, 2048, true,
-                item->reference, false, nullptr, fp8Compute);
+                item->reference, false, nullptr, compute);
             items.push_back({&item->q, &item->w, &key, &item->actual, keys-rows});
             storage.push_back(std::move(item));
         }
-        FastllmCudaNaiveBatchIndexer(items, 16, 128, 2048, true, nullptr, fp8Compute);
+        FastllmCudaNaiveBatchIndexer(items, 16, 128, 2048, true, nullptr, compute);
         for (const auto &item : storage)
             Require(Read<int>(item->reference) == Read<int>(item->actual), "DP Indexer batch changed exact indices");
         ++checks;

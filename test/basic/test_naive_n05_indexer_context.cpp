@@ -193,6 +193,11 @@ static void ContextCase(int capacity, int page, int ranks, int batch, int kind, 
         if (pass)
             for (int i = 0; i < baseBatch; i++)
                 lengths[i] = std::max(0, lengths[i] - 29 - i);
+        if (pass == 2 && !verifyBlock) {
+            const int mixed[] = {capacity, 8193, 257, 0};
+            for (int i = 0; i < batch; ++i)
+                lengths[i] = std::min(capacity, mixed[i % 4]);
+        }
         Cuda(cudaMemcpy(live.cudaData, lengths.data(), baseBatch * 4, cudaMemcpyHostToDevice));
         if (graph)
             captured.Run();
@@ -378,6 +383,11 @@ int main(int argc, char **argv) {
         return 77;
     try {
         if (argc > 1) {
+            // Cross the former global cap, then the cap on one paged shard.
+            // Exercise direct and full-width exchange, including equal scores.
+            ContextCase(262145, 128, 4, 4, 2, false, true);
+            ContextCase(262145, 128, 8, 16, 1, true, true);
+            ContextCase(524289, 128, 2, 4, 1, false, true);
             for (int ranks : {4, 8})
                 for (int batch : {64, 128, 129})
                     for (int kind : {0, 1, 2, 3})

@@ -22,6 +22,13 @@
 
 namespace fastllm {
 namespace {
+#ifdef USE_CUDA
+    int CheckedDraftToken(float token, int vocab) {
+        AssertInFastLLM(token >= 0 && token < vocab && token == int(token), "Invalid graph draft token.");
+        return int(token);
+    }
+#endif
+
     bool DraftIsGreedy(const GenerationConfig &config) {
         if (!config.tool_call_token_mask) return config.IsSimpleGreedy();
         auto unmasked = config;
@@ -142,7 +149,16 @@ struct NaiveN05FlashModel::DraftWorkspace {
         float temperature = -1, topP = -1;
         int topK = 0;
         bool disabled = false;
+        float *hostIds = nullptr;
+        void *idsReady = nullptr;
         void Clear() {
+            if (idsReady) {
+                FastllmCudaEventSynchronize(idsReady);
+                FastllmCudaEventDestroy(idsReady);
+                idsReady = nullptr;
+            }
+            if (hostIds) FastllmCudaHostFree(hostIds);
+            hostIds = nullptr;
             for (auto &graph : graphs) graph.Clear();
             graphs.clear();
             if (ownsSampler) FastllmCudaMtpDestroyDraftSampler(sampler);
@@ -2293,6 +2309,8 @@ struct NaiveN05FlashModel::DraftRound {
     int samplingRank = -1;
     Data *targetLogits = nullptr;
     std::shared_ptr<DraftWorkspace> proposalOwner;
+    bool deferIds = false;
+    int proposalRow = -1;
     const Data &ProposalStorage() const {
 #ifdef USE_CUDA
         if (proposalOwner) return proposalOwner->sampling.probabilities;
@@ -2667,14 +2685,22 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
         r.proposalOwner = state;
         r.proposalOffset = size_t(row) * steps * vocab;
     }
+    // Proposal width is known before sampling finishes. Keep a host mirror
+    // for publication and eager fallback without blocking target preparation.
+    if (rank >= 0 && rounds.front()->deferIds && FastllmCudaMtpReadDraftIdsAsync(
+            (float *)p.ids.cudaData + count, size_t(steps) * count, p.hostIds, p.idsReady)) {
+        for (int row = 0; row < live; ++row) {
+            rounds[row]->proposalRow = row;
+            rounds[row]->proposed.resize(rounds[row]->limit);
+        }
+        return true;
+    }
     std::vector<float> tokens((size_t)steps * count);
     FastllmCudaCopyFromDeviceToHost(tokens.data(), (float *)p.ids.cudaData + count, tokens.size() * sizeof(float));
     for (int step = 0; step < steps; ++step) for (int row = 0; row < live; ++row) {
         if (step >= rounds[row]->limit) continue;
         const float token = tokens[(size_t)step * count + row];
-        AssertInFastLLM(std::isfinite(token) && token >= 0 && token < vocab && token == (int)token,
-            "Invalid graph draft token.");
-        rounds[row]->proposed.push_back((int)token);
+        rounds[row]->proposed.push_back(CheckedDraftToken(token, vocab));
     }
     return true;
 #else
@@ -2823,7 +2849,7 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
             round->targetLogits->Resize({(int)round->proposed.size() + 1, vocab});
             targetRow += round->proposed.size() + 1;
         }
-        FastllmCudaSyncCurrentThreadStream();
+        if (groups[rank].front()->proposalRow < 0) FastllmCudaSyncCurrentThreadStream();
     });
     return true;
 #else
@@ -3492,6 +3518,10 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     }
     std::vector<std::unique_ptr<DraftRound>> rounds;
     rounds.reserve(selected.size());
+#ifdef USE_CUDA
+    const bool deferIds = attentionDP > 1 && tpServingState && !GetLowMemMode() &&
+        draftTP && draftTP->dataParallel && draftTP->devices == tpDevices;
+#endif
     // Only grammar cursors advance privately. Other rounds borrow the caller's config.
     std::deque<GenerationConfig> grammarConfigs;
     const bool fullBatch = selected.size() == size_t(batch);
@@ -3515,6 +3545,9 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         }
         int anchor = context.pending.empty() ? anchors[i] : context.pending.back().second;
         rounds.emplace_back(new DraftRound(*this, context, *config, anchor, limits[row]));
+#ifdef USE_CUDA
+        rounds.back()->deferIds = deferIds;
+#endif
         if (config->NeedsTokenHistory()) {
             auto &tokens = rounds.back()->lastTokens.emplace(history(i));
             for (const auto &item : context.pending) tokens.Push(item.second);
@@ -3559,6 +3592,42 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     // descriptors for this forward, including after requests have changed slots.
     TargetBatch requests{fullBatch ? pastKeyValues : verifyCaches,
                          fullBatch ? configs : verifyConfigs, lengths, block_cnt};
+#ifdef USE_CUDA
+    DraftVerifyInput proposals;
+    bool materialized = false;
+    for (const auto &round : rounds) {
+        if (round->proposalRow < 0) continue;
+        const auto &p = round->proposalOwner->sampling;
+        // Each sampling owner records one event for its whole group.
+        if (round->proposalRow == 0) proposals.ready.push_back(p.idsReady);
+        proposals.rows.push_back((const float *)p.ids.cudaData + round->proposalRow);
+        proposals.strides.push_back(p.rows);
+    }
+    if (!proposals.ready.empty()) {
+        proposals.materialize = [&] {
+            if (materialized) return;
+            for (auto event : proposals.ready) FastllmCudaEventSynchronize(event);
+            size_t offset = 0;
+            auto *ids = (float *)input.cpuData;
+            for (auto &r : rounds) {
+                if (r->proposalRow >= 0) {
+                    const auto &p = r->proposalOwner->sampling;
+                    for (size_t step = 0; step < r->proposed.size(); ++step) {
+                        const float id = p.hostIds[step * p.rows + r->proposalRow];
+                        r->proposed[step] = CheckedDraftToken(id, r->vocab);
+                        ids[offset + 1 + step] = id;
+                    }
+                }
+                offset += r->proposed.size() + 1;
+            }
+            materialized = true;
+        };
+        // Draft DP established peer access for this device domain. Target DP
+        // consumes global scheduler order even when owners are interleaved.
+        if (proposals.rows.size() != rounds.size()) proposals.rows.clear();
+        requests.proposals = &proposals;
+    }
+#endif
     TargetCapture capture;
     // All acceptance and KV commits below complete before another target
     // forward can overwrite the stable graph/logits workspace.
@@ -3573,6 +3642,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         for (auto &round : rounds) capture.logitsDestinations.push_back(round->targetLogits);
     std::vector<std::pair<Data, Data>> unused;
     Data logits = RunDraftTarget(input, positions, unused, requests.configs.front(), capture, &requests);
+    if (requests.proposals) requests.proposals->materialize();
     const int vocab = rounds.front()->vocab;
     int offset = 0;
 #ifdef USE_CUDA

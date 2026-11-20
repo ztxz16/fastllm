@@ -1,6 +1,7 @@
 #pragma once
 #include "fastllm.h"
 #include "devices/cuda/naive-n05-dsa.h"
+#include "models/naive_indexer_compute.h"
 
 inline bool FastllmNaiveKVType(fastllm::DataType type) {
     return type == fastllm::BFLOAT16 || type == fastllm::FP8_E4M3;
@@ -239,6 +240,9 @@ bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
 bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
     const fastllm::Data &keys, int past, int rank, int ranks,
     bool fp8Query, bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
+bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+    const fastllm::Data &keys, int past, int rank, int ranks,
+    bool fp8Query, bool peerKeys, fastllm::Data &indices, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute);
 // All items use the same rank/layout, but query and context lengths may differ.
 // At most eight requests and 512 MiB of scores; rejection leaves outputs untouched.
 struct FastllmNaivePrefillIndexerItem {
@@ -248,16 +252,25 @@ struct FastllmNaivePrefillIndexerItem {
 };
 bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
     int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
+bool FastllmCudaNaiveBatchBalancedIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+    int rank, int ranks, bool fp8Query, bool peerKeys, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute);
 
 // Local request batches use bounded score tiles and preserve serial fallback dispatch.
 void FastllmCudaNaiveBatchIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
     int heads, int dim, int topK, bool fp8Query, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
+void FastllmCudaNaiveBatchIndexer(const std::vector<FastllmNaivePrefillIndexerItem> &items,
+    int heads, int dim, int topK, bool fp8Query, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute);
 
 void FastllmCudaNaiveIndexer(const fastllm::Data &query,
                             const fastllm::Data &weights,
                             const fastllm::Data &packedKeys,
                             int heads, int dim, int queryStart, int topK,
                             bool fp8Query, fastllm::Data &indices, bool peerKeys = false, fastllm::Data *scoreScratch = nullptr, bool fp8Compute = false);
+void FastllmCudaNaiveIndexer(const fastllm::Data &query,
+                            const fastllm::Data &weights,
+                            const fastllm::Data &packedKeys,
+                            int heads, int dim, int queryStart, int topK,
+                            bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute);
 // Restore front/back-paired query shards after AllGather, in the same allocation.
 void FastllmCudaNaiveRestoreIndexerRows(fastllm::Data &indices, int ranks);
 // Consume front/back-paired Indexer rows directly. False leaves all inputs
@@ -491,6 +504,8 @@ bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Da
     fastllm::Data &scratch, fastllm::Data &output);
 bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output);
+bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
+        const fastllm::Data &weight, fastllm::Data &output, const fastllm::Data &arena);
 // BF16 input, FP32 4096-column router, including sigmoid. Small batches
 // share weights and retain exact single-row arithmetic when requested by the
 // linear precision policy. Unsupported layouts return false without mutation.
