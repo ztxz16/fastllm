@@ -6482,9 +6482,25 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
     if (rows.empty() || rows.front().verifyOffset < 0) return false;
     const bool fp8 = rows.front().fp8;
     auto kernel = fp8 ? swa::SwaVerifyQueries<4, true> : swa::SwaVerifyQueries<4, false>;
-    const size_t shared = std::max(sizeof(swa::SwaQueryStorage<4>),
+    size_t shared = std::max(sizeof(swa::SwaQueryStorage<4>),
         fp8 ? sizeof(naive_attention_bulk::Storage<128, true>) : sizeof(naive_attention_bulk::Storage<128>));
-    if (!BulkKernelSupported(kernel, shared, 80)) return false;
+    bool supported = false;
+#if CUDART_VERSION >= 12080
+    if (fp8) {
+        const int arch = FastllmCudaRuntimeArch();
+        if (arch == 100 || arch == 103) {
+            auto specialized = swa::SwaVerifyQueries<4, true, true>;
+            const size_t bytes = std::max(sizeof(swa::SwaFP8VerifyStorage),
+                                          sizeof(naive_attention_bulk::Storage<128, true>));
+            if (BulkKernelSupported(specialized, bytes, 100)) {
+                kernel = specialized;
+                shared = bytes;
+                supported = true;
+            }
+        }
+    }
+#endif
+    if (!supported && !BulkKernelSupported(kernel, shared, 80)) return false;
     std::vector<swa::SwaVerifyGroup> groups;
     groups.reserve(rows.size());
     bool reused = false;
