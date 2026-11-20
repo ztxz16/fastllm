@@ -34,6 +34,20 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(segment['contained_actions'][0]['action_description'], 'Standing on skis.')
         self.assertEqual(len(SCENE['segments'][0]['contained_actions']), 2)
 
+    def test_continuation_keeps_the_environment_edit_and_rebases_action_time(self):
+        item = {"segments": [{"start_time": "00:05.000", "end_time": "00:10.000",
+                              "visual_description_long": None,
+                              "description_change": "Compared to the previous segment, the rain stops.",
+                              "contained_actions": [{"start_time": "00:06.000", "end_time": "00:09.000",
+                                                     "action_description": "Offers the cup."}]}]}
+        scene = json.loads(pe.shape_scene(item, 5, continuation=True))
+        self.assertEqual(set(scene), {"segments"})
+        segment = scene["segments"][0]
+        self.assertNotIn("visual_description_long", segment)
+        self.assertEqual(segment["description_change"], item["segments"][0]["description_change"])
+        self.assertEqual(segment["contained_actions"][0]["start_time"], "00:01.000")
+        self.assertEqual(segment["contained_actions"][0]["end_time"], "00:04.000")
+
     def test_invalid_scenes_fail_before_generation(self):
         for value in (None, {}, {'subject_list': []}):
             with self.assertRaises(ValueError): pe.shape_scene(value, 1)

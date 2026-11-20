@@ -14,9 +14,9 @@
 
 namespace fastllm { namespace nomas {
 Pipeline::Pipeline(const std::string &model,const std::string &text,int device):
-    rt_(device),tokenizer_(text),text_(rt_,text),
+    pixelCheckpoint_(model+"/VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors"),rt_(device),tokenizer_(text),text_(rt_,text),
     dit_(rt_,model+"/DiT/distilled/diffusion_pytorch_model_ema_0_995.safetensors"),
-    decoder_(rt_,model+"/VAE/PixelUMM_FT/diffusion_pytorch_model.safetensors") {}
+    decoder_(rt_,pixelCheckpoint_) {}
 Pipeline::Pipeline(const std::string &model,const std::string &text,const ParallelOptions &options)
     :Pipeline(model,text,options.devices.empty()?throw std::invalid_argument("empty parallel devices"):options.devices[0]) {
     if(options.devices.size()>1)
@@ -132,8 +132,8 @@ std::vector<float> cameraTrajectory(int frames,int action) {
 
 std::unique_ptr<WorldState> Pipeline::createWorld(const std::string &prompt,int width,int height,uint64_t seed,int steps) {
     rt_.activate();
-    if(prompt.empty() || prompt.size()>16384 || width<64 || width>512 || height<64 || height>512 || width%32 || height%32 || width*height>512*288 || steps<1 || steps>32)
-        throw std::invalid_argument("world accepts a prompt, 64..512 pixel multiples of 32 (at most 147456 pixels), and 1..32 steps");
+    if(prompt.empty() || prompt.size()>16384 || width<64 || width>512 || height<64 || height>512 || width%32 || height%32 || width*height>512*384 || steps<1 || steps>32)
+        throw std::invalid_argument("world accepts a prompt, 64..512 pixel multiples of 32 (at most 196608 pixels), and 1..32 steps");
     auto state=std::make_unique<WorldState>();
     state->width=width; state->height=height; state->steps=steps; state->seed=seed;
     state->generator.seed(seed);
@@ -169,9 +169,32 @@ Tensor Pipeline::encodeWorldPrompt(const std::string &prompt) {
     } catch(...) { text_.unload(); throw; }
 }
 
-std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress progress,void *user,const std::string *prompt) {
+std::vector<uint8_t> Pipeline::initializeReference(WorldState &world,const uint8_t *rgb,size_t bytes,
+                                                   Progress progress,void *user) {
+    if(world.frameOffset!=0) throw std::invalid_argument("an image can only initialize a fresh world");
     rt_.activate();
-    if(action<0 || action>9 || world.frameOffset>=720)
+    unloadModels();
+    if(progress && progress(1,0,1,user)) throw std::runtime_error("generation cancelled");
+    auto latent=encodeReferenceImage(rt_.device(),pixelCheckpoint_,world.width,world.height,rgb,bytes);
+    return advance(world,9,progress,user,nullptr,120,std::move(latent));
+}
+
+std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress progress,void *user,
+                                         const std::string *prompt) {
+    return stepWorld(world,action,progress,user,prompt,20);
+}
+
+std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress progress,void *user,
+                                         const std::string *prompt,int frames) {
+    if(frames<20 || frames>120 || frames%20 || (action!=9 && frames!=20))
+        throw std::invalid_argument("text segments accept 20..120 frames in multiples of 20");
+    return advance(world,action,progress,user,prompt,frames,{});
+}
+
+std::vector<uint8_t> Pipeline::advance(WorldState &world,int action,Progress progress,void *user,
+                                       const std::string *prompt,int frames,std::vector<float> latent) {
+    rt_.activate();
+    if(action<0 || action>9 || world.frameOffset+frames/4>720)
         throw std::invalid_argument("invalid action or world reached its 120-second horizon; reset it");
     auto update=[&](int stage,int current,int total) {
         if(progress && progress(stage,current,total,user)) throw std::runtime_error("generation cancelled");
@@ -186,10 +209,15 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
         next.features=encodeWorldPrompt(*prompt); next.prompt=*prompt;
         update(1,1,1);
     }
-    const int t=5,h=world.height/32,w=world.width/32,n=t*h*w;
+    const int t=frames/4,h=world.height/32,w=world.width/32,n=t*h*w;
     std::normal_distribution<float> normal;
-    std::vector<float> latent(size_t(n)*32);
-    for(auto &v:latent) v=normal(next.generator);
+    const bool reference=!latent.empty();
+    if(reference) {
+        if(latent.size()!=size_t(n)*32) throw std::invalid_argument("unexpected reference latent size");
+    } else {
+        latent.resize(size_t(n)*32);
+        for(auto &v:latent) v=normal(next.generator);
+    }
     // "Follow the prompt" omits camera injection entirely. An identity
     // trajectory is a stationary-camera condition, not text-only generation.
     const bool hasCamera=action!=9;
@@ -207,7 +235,7 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
     auto sigma=[&](int i) { float s=1.f-float(i)/world.steps; return 5.f*s/(1.f+4.f*s); };
     DiTCache workspace;
     std::vector<DiTCache> parallelWorkspace;
-    for(int step=0;step<world.steps;++step) {
+    for(int step=0;!reference && step<world.steps;++step) {
         update(2,step,world.steps+1);
         auto input=rt_.upload(latent.data(),n,32);
         auto velocity=rt_.download(parallel_
@@ -251,18 +279,27 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
         else trim(next.cache);
     }
     update(2,world.steps+1,world.steps+1); update(3,0,1);
-    std::vector<float> context=world.decoderLatents;
-    int previous=int(context.size()/(size_t(h)*w*32));
-    context.insert(context.end(),latent.begin(),latent.end());
-    int decodeT=previous+t,begin=world.frameOffset-previous;
-    auto noise=rt_.pixelNoise(world.seed,begin,decodeT,world.height,world.width);
-    NOMAS_TRACE("decoder_latents",context);
-    NOMAS_TRACE("pixel_noise",noise);
-    auto input=rt_.upload(context.data(),decodeT*h*w,32);
-    auto pixels=parallel_?parallel_->decode(input,noise,decodeT,h,w):decoder_.forward(input,noise,decodeT,h,w);
-    NOMAS_TRACE("pixels",pixels);
-    auto rgb=rt_.downloadPixelRGB(pixels,world.width,world.height,previous*4,20);
-    next.decoderLatents=std::move(latent); next.frameOffset+=t;
+    const int stride=h*w*32;
+    std::vector<uint8_t> rgb;
+    // The image history is committed as one full DiT segment. Only its last
+    // half second is published; preceding decoder windows are outside view.
+    for(int pos=reference?t-5:0;pos<t;pos+=5) {
+        std::vector<float> context=pos==0?world.decoderLatents:
+            std::vector<float>(latent.begin()+(pos-5)*stride,latent.begin()+pos*stride);
+        int previous=int(context.size()/stride);
+        context.insert(context.end(),latent.begin()+pos*stride,latent.begin()+(pos+5)*stride);
+        int decodeT=previous+5,begin=world.frameOffset+pos-previous;
+        auto noise=rt_.pixelNoise(world.seed,begin,decodeT,world.height,world.width);
+        NOMAS_TRACE("decoder_latents",context);
+        NOMAS_TRACE("pixel_noise",noise);
+        auto input=rt_.upload(context.data(),decodeT*h*w,32);
+        auto pixels=parallel_?parallel_->decode(input,noise,decodeT,h,w):decoder_.forward(input,noise,decodeT,h,w);
+        NOMAS_TRACE("pixels",pixels);
+        auto part=rt_.downloadPixelRGB(pixels,world.width,world.height,previous*4+(reference?8:0),reference?12:20);
+        rgb.insert(rgb.end(),part.begin(),part.end());
+    }
+    next.decoderLatents.assign(latent.end()-5*stride,latent.end());
+    next.frameOffset+=t;
     update(3,1,1); update(4,1,1);
     world=std::move(next);
     return rgb;

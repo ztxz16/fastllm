@@ -246,6 +246,37 @@ class HTTPTests(unittest.TestCase):
         self.assertGreaterEqual(result['total_seconds'], result['generation_seconds']-.001)
         self.assertEqual(self.client.get('/v1/videos/unknown/events').status_code, 404)
 
+    def test_reference_preview_advances_five_model_seconds_once(self):
+        import base64
+        self.backend.release.set()
+        request = dict(prompt="A cafe", width=64, height=64, text_frames=120,
+                       reference_rgb=base64.b64encode(bytes(64*64*3)).decode())
+        self.assertEqual(self.client.post("/v1/worlds", json={**request, "reference_rgb":"bad"}).status_code, 422)
+        world = self.client.post("/v1/worlds", json=request).json()
+        url = "/v1/worlds/" + world["id"]
+        first = self.terminal(world["current_job"])
+        self.assertEqual((first["num_frames"], first["frames_ready"]), (12, 12))
+        self.assertEqual(self.client.get(url).json()["model_frames"], 120)
+        self.client.patch(url, json={"prompt":"the rain stops", "kind":"environment"}).raise_for_status()
+        second = self.terminal(self.client.post(url+"/actions", json={"action":"follow_prompt"}).json()["id"])
+        self.assertEqual((second["num_frames"], second["start_frame"]), (120, 12))
+        state = self.client.get(url).json()
+        self.assertEqual((state["generated_frames"], state["model_frames"]), (132,240))
+
+    def test_camera_continuation_reuses_the_committed_action_interval(self):
+        self.backend.release.set()
+        world = self.client.post("/v1/worlds", json=dict(prompt="Rainy cafe", width=64, height=64, text_frames=120)).json()
+        self.terminal(world["current_job"])
+        url = "/v1/worlds/" + world["id"]
+        self.client.patch(url, json={"prompt":"lifts one mug", "kind":"action"}).raise_for_status()
+        for kind in ("follow_prompt", "stay"):
+            job = self.client.post(url+"/actions", json={"action":kind}).json()
+            self.assertEqual(self.terminal(job["id"])["status"], "completed")
+        scene, continuation = self.backend.requests[-2:]
+        self.assertEqual(scene.caption(), continuation.caption())
+        action = json.loads(scene.caption())["segments"][0]["contained_actions"][0]
+        self.assertEqual(action["end_time"], "00:05.000")
+
     def test_world_resolution_and_cache_budget(self):
         self.backend.release.set()
         request = dict(prompt='A room', width=512, height=288)
