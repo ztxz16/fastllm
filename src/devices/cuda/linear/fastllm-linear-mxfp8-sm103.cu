@@ -88,13 +88,17 @@ bool Descriptor(Desc &d, void *ptr, CUtensorMapDataType type, int inner, int out
                CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-template <int M, int Cluster> struct Projection {
-    // Large-M projections use the 128x256x128, five-stage Blackwell configuration
-    // with B multicast. Small rows use the transposed MMA and A multicast.
+template <int M, int Cluster, int N = 128> struct Projection {
+    // Full M tiles share weights between CTAs; short rows use the transposed MMA.
     static constexpr bool LargeTile = M == 128;
-    static constexpr int N = LargeTile ? 256 : 128;
-    static constexpr int Stages = LargeTile ? 5 : M == 16 ? (Cluster == 2 ? 12 : 11) : 10;
-    static constexpr int Shared = LargeTile ? 205116 : 230204;
+    static constexpr int LoadM = LargeTile ? M : M / Cluster;
+    static constexpr int LoadN = LargeTile ? N / Cluster : N;
+    static constexpr int ScaleN = N < 128 ? 128 : N;
+    static constexpr int Stages = LargeTile ? (N == 64 ? 9 : N == 128 ? 7 : 5)
+                                            : (M == 16 ? (Cluster == 2 ? 12 : 11) : 10);
+    using SharedStorage = dg::layout::SM100FP8FP4GemmSharedStorage<
+        Stages, 2, 2, LoadM, LoadN, 128, LargeTile ? M : 16, LargeTile ? 64 : N, 128, ScaleN, 1,
+        cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::bfloat16_t>;
     static auto Kernel() {
         return &dg::sm100_fp8_fp4_gemm_1d1d_impl<cute::UMMA::Major::K, cute::UMMA::Major::K, 32, 32, 32, 0, 0,
                                                  0, M, N, 128, 1, 128, 128, 128, Stages, 2, 128, 128, Cluster,
@@ -103,15 +107,15 @@ template <int M, int Cluster> struct Projection {
                                                  cutlass::bfloat16_t, dg::epilogue::operators::Identity>;
     }
     static bool Configure() {
-        return cudaFuncSetAttribute(Kernel(), cudaFuncAttributeMaxDynamicSharedMemorySize, Shared) ==
+        return cudaFuncSetAttribute(Kernel(), cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(SharedStorage)) ==
                cudaSuccess;
     }
     static bool Run(void *q, void *w, void *sa, void *sw, void *y, int rows, int n, int k, int pitch) {
         Desc a, b, as, bs, c;
-        if (!Descriptor(a, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, rows, 1, 128, LargeTile ? M : M / Cluster, true) ||
-            !Descriptor(b, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, n, 1, 128, 128, true) ||
+        if (!Descriptor(a, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, rows, 1, 128, LoadM, true) ||
+            !Descriptor(b, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, n, 1, 128, LoadN, true) ||
             !Descriptor(as, sa, CU_TENSOR_MAP_DATA_TYPE_INT32, pitch, k / 128, 4, 128, 1, false) ||
-            !Descriptor(bs, sw, CU_TENSOR_MAP_DATA_TYPE_INT32, n, k / 128, 4, N, 1, false) ||
+            !Descriptor(bs, sw, CU_TENSOR_MAP_DATA_TYPE_INT32, n, k / 128, 4, ScaleN, 1, false) ||
             !Descriptor(c, y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, n, rows, 2, 64, LargeTile ? M : 16, true))
             return false;
         cudaLaunchAttribute attr{};
@@ -120,7 +124,7 @@ template <int M, int Cluster> struct Projection {
         cudaLaunchConfig_t cfg{};
         cfg.gridDim = dim3(kSMs);
         cfg.blockDim = dim3(256);
-        cfg.dynamicSmemBytes = Shared;
+        cfg.dynamicSmemBytes = sizeof(SharedStorage);
         cfg.stream = cudaStreamPerThread;
         cfg.attrs = &attr;
         cfg.numAttrs = 1;
@@ -131,8 +135,10 @@ template <int M, int Cluster> struct Projection {
     }
 };
 struct ProjectionSupport {
-    bool smallTile = false;
-    bool largeTile = false;
+    bool smallRows = false;
+    bool columns256 = false;
+    bool columns128 = false;
+    bool columns64 = false;
 };
 
 ProjectionSupport GetProjectionSupport(int device, bool capturing) {
@@ -142,12 +148,16 @@ ProjectionSupport GetProjectionSupport(int device, bool capturing) {
     if (capturing) return {};
     int sms = 0;
     ProjectionSupport support;
-    support.smallTile = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+    support.smallRows = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
                         sms == kSMs && Projection<16, 1>::Configure() && Projection<16, 2>::Configure() &&
                         Projection<32, 1>::Configure() && Projection<32, 2>::Configure();
-    // Configure both tile sizes before capture, even when warmup uses a single row.
-    if (support.smallTile) support.largeTile = Projection<128, 2>::Configure();
-    if (!support.largeTile) cudaGetLastError();
+    // Warm every supported shape outside capture, including on a single-row warmup.
+    if (support.smallRows) {
+        support.columns256 = Projection<128, 2, 256>::Configure();
+        support.columns128 = Projection<128, 2, 128>::Configure();
+        support.columns64 = Projection<128, 2, 64>::Configure();
+    }
+    if (!support.columns256 || !support.columns128 || !support.columns64) cudaGetLastError();
     cache.emplace(device, support);
     return support;
 }
@@ -172,7 +182,7 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     if (!state) return false;
     const bool capturing = FastllmCudaGraphIsCapturing();
     const auto support = GetProjectionSupport(device, capturing);
-    if (!support.smallTile || !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device)) return false;
+    if (!support.smallRows || !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device)) return false;
     auto *base = static_cast<uint8_t *>(capturing      ? fastllm_bf16_lt::CaptureWorkspace(*state)
                                         : state->eager ? state->eager->data
                                                        : nullptr);
@@ -200,22 +210,32 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     auto prepare = wideK ? PrepareOperands<16, 16, 128> : PrepareOperands<32, 32, 256>;
     // A pair of CTAs must cover two complete N tiles. A trailing odd tile
     // needs a single-CTA kernel or the multicast barrier cannot complete.
-    bool paired = ((n + 127) / 128) % 2 == 0;
-    // A paired, non-transposed 128x256 tile shares B across two M tiles.
-    // Keep the short-row kernels for tails and shapes without a full cluster.
-    const bool canUseLargeTile = support.largeTile && n % 256 == 0 && limit >= 256;
+    const bool paired = ((n + 127) / 128) % 2 == 0;
     for (int start = 0; start < rows;) {
         int count = std::min(rows - start, limit);
         // Multicast needs an even number of M tiles. A partially filled
         // second tile is legal. For a short, narrow GEMM, splitting off
         // a lone tile costs more than using the existing single-launch path.
-        const bool pairedM = ((count - 1) / 128 + 1) % 2 == 0;
+        const int rowTiles = (count - 1) / 128 + 1;
+        const bool pairedM = rowTiles % 2 == 0;
         const int64_t tiles = int64_t(count / 128) * (n / 256);
-        // At 64 complete output tiles, sharing weights across M pays off even
-        // for a 256-row graph. Narrow projections retain short-row parallelism.
+        // Preserve the wide-column prefill path and use it in graphs when
+        // there are at least 64 complete 128x256 output tiles.
         const bool enoughWork = tiles >= 64 || (!capturing && rows >= 1024);
-        const bool largeTile = canUseLargeTile && count >= 256 && enoughWork && (pairedM || tiles >= kSMs);
-        if (largeTile && !pairedM) count = count / 256 * 256;
+        auto run = paired ? Projection<32, 2>::Run : Projection<32, 1>::Run;
+        // Prefer a single well-occupied wave. Two adjacent M tiles must be
+        // present for weight multicast, including when the last tile is partial.
+        const int64_t tiles64 = int64_t(rowTiles) * (n / 64);
+        if (pairedM && tiles64 >= 96 && tiles64 <= kSMs && support.columns64) {
+            run = Projection<128, 2, 64>::Run;
+        } else if (pairedM && tiles64 > kSMs && tiles64 <= 2 * kSMs && n % 128 == 0 && support.columns128) {
+            run = Projection<128, 2, 128>::Run;
+        } else if (support.columns256 && n % 256 == 0 && count >= 256 && enoughWork && (pairedM || tiles >= kSMs)) {
+            if (!pairedM) count = count / 256 * 256;
+            run = Projection<128, 2, 256>::Run;
+        } else if (count <= 16) {
+            run = paired ? Projection<16, 2>::Run : Projection<16, 1>::Run;
+        }
         const int pitch = (count + 3) / 4 * 4;
         const int weightTiles = start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;
         const int activationTiles = (size_t(count) * k / 8 + threads - 1) / threads;
@@ -223,9 +243,6 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
             static_cast<const float4 *>(w.extraCudaData[0]), packed,
             static_cast<const __nv_bfloat16 *>(x) + size_t(start) * k, qx, sx, count, n, k, pitch, tilesPerRow,
             weightTiles);
-        auto run = paired ? Projection<32, 2>::Run : Projection<32, 1>::Run;
-        if (largeTile) run = Projection<128, 2>::Run;
-        else if (count <= 16) run = paired ? Projection<16, 2>::Run : Projection<16, 1>::Run;
         if (!run(qx, w.cudaData, sx, packed, static_cast<__nv_bfloat16 *>(y) + size_t(start) * n, count, n, k,
                  pitch))
             return false;

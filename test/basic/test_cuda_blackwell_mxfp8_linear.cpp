@@ -202,7 +202,9 @@ int main() {
         Run(8, 1856, 4096);
         Run(32, 4096, 1024);
         Run(33, 320, 512);
-        Run(256, 8192, 512); // wide projection, exactly 64 large output tiles
+        Run(129, 4160, 512); // partial M pair, 64-column tiles and an odd number of N tiles
+        Run(256, 4096, 8192); // verification attention output projection
+        Run(256, 8192, 512); // 128-column tiles fill a single wave
         Run(257, 8192, 512); // unpaired M tail at the same width
         Run(1933, 512, 512); // partially filled second M tile
         Run(2061, 4096, 4096); // bounded lease needs multiple GEMMs
