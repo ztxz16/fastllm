@@ -1,5 +1,6 @@
 #include "fastllm.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cstdint>
@@ -30,8 +31,8 @@ static unsigned OrderedReference(float x) {
         b = 0;
     return b & 0x80000000u ? ~b : b ^ 0x80000000u;
 }
-static void AdversarialSamples(int keys) {
-    const int rows = 5, past = keys - rows, top = 2048;
+static void AdversarialSamples(int keys, int past) {
+    const int rows = 5, top = 2048;
     for (int mode = 0; mode < 6; ++mode) {
         std::vector<float> values((size_t)rows * keys);
         std::vector<int> expected((size_t)rows * top);
@@ -60,19 +61,33 @@ static void AdversarialSamples(int keys) {
             }
             std::vector<int> order(count);
             std::iota(order.begin(), order.end(), 0);
-            std::partial_sort(order.begin(), order.begin() + top, order.end(), [&](int a, int b) {
+            const int keep = std::min(top, count);
+            std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) {
                 unsigned aa = OrderedReference(v[a]), bb = OrderedReference(v[b]);
                 return aa > bb || (aa == bb && a < b);
             });
-            std::copy_n(order.data(), top, expected.data() + (size_t)row * top);
+            auto *result = expected.data() + (size_t)row * top;
+            std::copy_n(order.data(), keep, result);
+            std::fill(result + keep, result + top, -1);
         }
-        Data scores(FLOAT32), out;
+        Data scores(FLOAT32), out(INT32);
         scores.Resize({rows, keys});
         scores.Allocate();
         std::memcpy(scores.cpuData, values.data(), values.size() * sizeof(float));
         scores.ToDevice(DataDevice::CUDA, {0}, true);
-        FastllmCudaNaiveTopK(scores, past, top, out);
-        Require(Read<int>(out) == expected, "sampled-threshold fallback differs from exact CPU order");
+        const bool medium = keys > 4096 && keys < 8192;
+        if (medium) {
+            out.Resize({rows, top});
+            out.ToDevice(DataDevice::CUDA, {0}, false);
+            out.Allocate(false);
+        }
+        std::vector<size_t> allocations;
+        {
+            FastllmCudaAllocationRecorder record(&allocations);
+            FastllmCudaNaiveTopK(scores, past, top, out);
+        }
+        if (medium) Require(allocations.empty(), "medium TopK requested global scratch");
+        Require(Read<int>(out) == expected, "TopK differs from exact CPU order");
         ++checks;
         printf("adversarial mode=%d PASS\n", mode);
         fflush(stdout);
@@ -83,10 +98,13 @@ int main() {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
         return 77;
     try {
-        for (int keys : {8192, 16384, 82001, 131072, 131073, 200000})
-            AdversarialSamples(keys);
+        for (int keys : {4096, 4097, 7335, 8191, 8192, 16384, 82001, 131072, 131073, 200000})
+            AdversarialSamples(keys, keys - 5);
+        // Cold-prefix padding, the K boundary, and many identical candidates.
+        for (int past : {0, 2046, 4094})
+            AdversarialSamples(7335, past);
         Require(cudaDeviceSynchronize() == cudaSuccess, "final sync failed");
-        std::printf("PASS: exact sampled TopK, %d adversarial cases\n", checks);
+        std::printf("PASS: exact TopK, %d adversarial cases\n", checks);
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

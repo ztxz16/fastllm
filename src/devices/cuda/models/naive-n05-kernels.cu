@@ -689,6 +689,21 @@ void SortTopKPairs(const unsigned *input, const int *positions, int count,
 using naive_topk::SelectTopKCompact;
 using naive_topk::SelectTopKCompactRow;
 
+// One CTA owns one causal row. The existing select/sort helpers use blockIdx.x
+// to index their storage, so x is zero for these single-row shared buffers.
+__global__ void SelectSortMediumTopK(const float *scores, int keys, int queryStart, int *indices) {
+    constexpr int topK = 2048, threads = 256, items = topK / threads;
+    __shared__ unsigned long long candidates[topK];
+    __shared__ int offsets[2];
+    __shared__ typename naive_topk::CompactTopKSort<items, threads, 4>::TempStorage sortStorage;
+    const int row = blockIdx.y;
+    SelectTopKCompactRow<false>(scores + size_t(row) * keys, candidates, offsets, 1,
+                                queryStart + row + 1, topK, topK);
+    __syncthreads();
+    naive_topk::SortTopKCompactRow<items, false, threads, 4>(candidates, offsets,
+        indices + size_t(row) * topK, 1, topK, topK, keys, sortStorage);
+}
+
 // Keep long/short contexts on the original compiled kernel. The sample is
 // useful when its upper tail has enough observations to bracket K reliably.
 void LaunchSelectTopKCompact(const float *scores, unsigned long long *selected, int *offsets,
@@ -3047,6 +3062,15 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
         int64_t total = (int64_t)queries * keys;
         AssertInFastLLM(total <= INT_MAX && (int64_t)queries * topK <= INT_MAX,
             "Naive-N0.5 batched TopK is too large.");
+        // This interval previously materialized two complete matrices of
+        // 64-bit keys plus a similarly sized segmented radix sort workspace.
+        if (topK == 2048 && keys > 4096 && keys < 8192) {
+            Output(indices, INT32, {queries, topK});
+            SelectSortMediumTopK<<<dim3(1, queries), 256>>>((const float *)scores.cudaData,
+                keys, queryStart, (int *)indices.cudaData);
+            CheckLaunch();
+            return;
+        }
         // Full sorting remains cheaper for short rows or large requested K.
         bool compact = (int64_t)keys >= (int64_t)topK * 4;
         int sortStride = compact ? topK * 2 : keys;
