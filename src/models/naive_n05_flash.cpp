@@ -896,7 +896,31 @@ Data NaiveN05FlashModel::RunTarget(
     TargetWorkspace temporary;
     TargetWorkspace &buf = workspace ? *workspace : temporary;
     Data *prefillScores = tensorParallel && !tpPrefillScores.empty() ? &tpPrefillScores.at(tpRank) : nullptr;
-    Data &hidden = buf.hidden;
+    // Raw fused kernels require the TP path's prebound CUDA norm weights.
+    // The generic path keeps the dispatcher that transfers weights on demand.
+    const bool fusePrefillNorm = tensorParallel && !decodeWorkspace && !verifying && length > 1;
+    bool prefillNormReady = false, prefillResidualSharded = false;
+    // Fully data-parallel attention can keep activations local through the
+    // consecutive MoE layers, including graph verification. Hybrid attention-TP
+    // and unsupported layer layouts retain the existing world-row path.
+    // Each owner keeps its real rows, including empty owners. The shared EP
+    // arena and dispatch rounds use the maximum local row count on every rank.
+    const bool localPrefillRows = attentionParallel && fusePrefillNorm && shardPrefillRouter;
+    const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
+        tpEp8MegaState && (decodeWorkspace || localPrefillRows) && block_cnt > 1 && !moeLayers[0] &&
+        std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
+    const bool compactPrefillHead = localMoeRows && !decodeWorkspace && !verifying &&
+        (!capture || !capture->collectHidden);
+    const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace &&
+        std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
+            [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
+    int maxLocalRows = 0;
+    if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
+        maxLocalRows = std::max(maxLocalRows, (int)rows.size());
+    const bool localDense = pdPrefillLimits.chunk && compactPrefillHead && workspace &&
+        !embedding && inputIds.dataDevice == CPU && inputIds.dataType == FLOAT32 &&
+        GetCudaEmbedding() && !GetLowMemMode() && FastllmCudaHasBlackwellIndexerAttention();
+    Data &hidden = localDense ? attentionParallel->ranks[tpRank].hidden : buf.hidden;
     Data &q = buf.q;
     Data &qkv = buf.qkv;
     Data &routerInput = buf.routerInput;
@@ -922,7 +946,23 @@ Data NaiveN05FlashModel::RunTarget(
             FastllmCudaNaiveVerifyLengths(localPositions, attentionParallel ? attentionParallel->ranks[tpRank].liveKeys : buf.liveKeys);
         }
     }
-    if (embedding) hidden.CopyFrom(*embedding);
+    if (localDense) {
+        const auto &rows = attentionParallel->rows.localToGlobal[tpRank];
+        if (rows.empty()) {
+            for (Data *data : {&hidden, &attentionParallel->ranks[tpRank].normalized}) {
+                data->dataType = BFLOAT16;
+                data->Resize({1, 0, embed_dim});
+                data->ToDevice(CUDA, {gpu}, false);
+            }
+        } else {
+            const auto *ids = reinterpret_cast<const float *>(inputIds.cpuData);
+            std::vector<float> selected;
+            selected.reserve(rows.size());
+            for (int row : rows) selected.push_back(ids[row]);
+            Data localIds(FLOAT32, {1, int(rows.size())}, selected);
+            EmbeddingDirect(localIds, localWeight("model.embed_tokens.weight"), hidden);
+        }
+    } else if (embedding) hidden.CopyFrom(*embedding);
     // A persistent verification workspace keeps BF16 storage. Embedding's
     // FP32 intermediate cannot reuse that allocation at the same element count.
     else if (decodeWorkspace || (workspace && GetCudaEmbedding() && !GetLowMemMode()))
@@ -956,28 +996,7 @@ Data NaiveN05FlashModel::RunTarget(
             else AssertInFastLLM(false, "Naive TP RMSNorm launch failed.");
         }
     };
-    // Raw fused kernels require the TP path's prebound CUDA norm weights.
-    // The generic path keeps the dispatcher that transfers weights on demand.
-    const bool fusePrefillNorm = tensorParallel && !decodeWorkspace && !verifying && length > 1;
-    bool prefillNormReady = false, prefillResidualSharded = false;
-    // Fully data-parallel attention can keep activations local through the
-    // consecutive MoE layers, including graph verification. Hybrid attention-TP
-    // and unsupported layer layouts retain the existing world-row path.
-    // Each owner keeps its real rows, including empty owners. The shared EP
-    // arena and dispatch rounds use the maximum local row count on every rank.
-    const bool localPrefillRows = attentionParallel && fusePrefillNorm && shardPrefillRouter;
-    const bool localMoeRows = attentionParallel && AttentionTPSize() == 1 &&
-        tpEp8MegaState && (decodeWorkspace || localPrefillRows) && block_cnt > 1 && !moeLayers[0] &&
-        std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool moe) { return moe; });
-    const bool compactPrefillHead = localMoeRows && !decodeWorkspace && !verifying &&
-        (!capture || !capture->collectHidden);
-    const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace &&
-        std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
-            [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
-    int maxLocalRows = 0;
-    if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
-        maxLocalRows = std::max(maxLocalRows, (int)rows.size());
-    bool localHiddenReady = false;
+    bool localHiddenReady = localDense;
     const bool canReusePrefillProjections = !decodeWorkspace && !verifying && attentionParallel &&
         AttentionTPSize() == 1 && (!capture || (!capture->collectHidden && capture->prefixes.empty())) &&
         FastllmCudaHasBlackwellIndexerAttention();
@@ -985,11 +1004,12 @@ Data NaiveN05FlashModel::RunTarget(
     std::optional<PrefillProjectionViews> projectionViews;
     for (int layer = 0; layer < block_cnt; layer++) {
         const bool localMoe = localMoeRows && moeLayers[layer];
-        auto *localDP = localMoe ? &attentionParallel->ranks[tpRank] : nullptr;
-        const int length = localMoe ? attentionParallel->rows.localToGlobal[tpRank].size() : inputIds.dims[1];
-        Data &hidden = localMoe ? localDP->hidden : buf.hidden;
-        Data &normed = localMoe ? localDP->normalized : buf.normed;
-        Data &projected = localMoe ? localDP->projected : buf.projected;
+        const bool ownerRows = localMoe || (localDense && layer == 0);
+        auto *localDP = ownerRows ? &attentionParallel->ranks[tpRank] : nullptr;
+        const int length = ownerRows ? attentionParallel->rows.localToGlobal[tpRank].size() : inputIds.dims[1];
+        Data &hidden = ownerRows ? localDP->hidden : buf.hidden;
+        Data &normed = ownerRows ? localDP->normalized : buf.normed;
+        Data &projected = ownerRows ? localDP->projected : buf.projected;
         // World-row decode reuses the registered attention projection buffer;
         // local EP output needs no peer AllGather registration.
         Data &moeOutput = !localMoe && shardMoe ? buf.projected : buf.moeOutput;
@@ -1020,7 +1040,7 @@ Data NaiveN05FlashModel::RunTarget(
         std::string ap = prefix + ".self_attn.";
         // Attention consumes its owning DP group's rows. The local MoE path
         // retains that order; other layouts use the canonical world rows.
-        if ((!decodeWorkspace && !prefillNormReady) || layer == 0)
+        if (((!decodeWorkspace && !prefillNormReady) || layer == 0) && (!ownerRows || length))
             norm(hidden, localWeight(prefix + ".input_layernorm.weight"), normed);
         const int dpGroup = attentionParallel ? attentionParallel->runtime.Layout().AttentionOwner(tpRank) : 0;
         const int globalLength = length;
@@ -1033,7 +1053,7 @@ Data NaiveN05FlashModel::RunTarget(
         Data &projected = attentionParallel ? attentionParallel->ranks[tpRank].projected : buf.projected;
         const int pastLength = batch && !batch->Key(0, 0).dims.empty() ? batch->Key(0, 0).dims[1] :
             (pastKeyValues.empty() || pastKeyValues[0].first.dims.empty() ? 0 : pastKeyValues[0].first.dims[1]);
-        if (attentionParallel && !localMoe) {
+        if (attentionParallel && !ownerRows) {
             normed.dataType = BFLOAT16; normed.UpdateUnitSize();
             normed.Resize({1, length, embed_dim}); normed.ToDevice(CUDA, {gpu}, false); normed.Allocate(false);
             attentionParallel->transfer->Select(tpRank, buf.normed.cudaData, normed.cudaData, size_t(embed_dim) * 2);
@@ -2094,14 +2114,14 @@ Data NaiveN05FlashModel::RunTarget(
             ToDataType(sum, projected, BFLOAT16);
         }
         }
-        if (attentionParallel && !localMoe) {
+        if (attentionParallel && !ownerRows) {
             projected.dataType = BFLOAT16; projected.UpdateUnitSize();
             projected.Resize({1, length, embed_dim}); projected.ToDevice(CUDA, {gpu}, false); projected.Allocate(false);
             attentionParallel->transfer->Collect(tpRank, attentionParallel->ranks[tpRank].projected.cudaData,
                 projected.cudaData, size_t(embed_dim) * sizeof(uint16_t));
         }
         Data &postAttentionNorm = localWeight(prefix + ".post_attention_layernorm.weight");
-        bool attentionNormReady = localMoe && !length;
+        bool attentionNormReady = ownerRows && !length;
         if (shardPrefillNorm && length >= 1024 && length % epRanks == 0) {
             // Only this rank's token shard feeds the following EP Router/MoE.
             // Avoid distributing reduced rows that are never consumed here.
@@ -2153,7 +2173,48 @@ Data NaiveN05FlashModel::RunTarget(
                 FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
                     rms_norm_eps, *mlpNormOutput);
         };
-        if (!moeLayers[layer]) {
+        auto reservePrefillArena = [&]() {
+            const int dispatchRows = localMoe || localDense ? maxLocalRows * epRanks : length;
+            const size_t rowBytes = size_t(embed_dim) * sizeof(float);
+            size_t bytes = FastllmCudaMimoEp8PrefillWorkspaceBytes(dispatchRows, epRanks);
+            if (localDense) {
+                // Router math sees only the owner's rows. The symmetric EP plan still
+                // covers the most populated owner on every rank.
+                const size_t routerBytes = 3ull * num_experts *
+                    (embed_dim * sizeof(uint16_t) + size_t(maxLocalRows) * sizeof(float));
+                bytes = std::max({bytes, size_t(maxLocalRows) * rowBytes,
+                    std::min(routerBytes, size_t(dispatchRows) * rowBytes),
+                    size_t(inputIds.dims[1]) * embed_dim * sizeof(uint16_t)});
+            } else bytes = std::max(bytes, size_t(dispatchRows) * rowBytes);
+            routerInput.dataType = FLOAT32;
+            routerInput.Resize({int((bytes + rowBytes - 1) / rowBytes), embed_dim});
+            routerInput.ToDevice(CUDA, {gpu}, false);
+            routerInput.Allocate(false);
+            routerInput.Resize({localDense ? maxLocalRows : dispatchRows, embed_dim});
+        };
+        if (localDense && layer == 0) {
+            // Gather post-attention activations once. Gate/up preserve the original
+            // world-row GEMMs and the down projection keeps the same TP all-reduce.
+            // Q, QKV and the router/EP workspace are all dead during this FFN.
+            reservePrefillArena();
+            Data world;
+            world.FakeFrom(routerInput, 0);
+            world.dataType = BFLOAT16;
+            world.Resize({1, inputIds.dims[1], embed_dim});
+            attentionParallel->transfer->Collect(tpRank, normed.cudaData, world.cudaData,
+                size_t(embed_dim) * sizeof(uint16_t));
+            Linear(world, localWeight(prefix + ".mlp.gate_proj.weight"), Data(), q);
+            Linear(world, localWeight(prefix + ".mlp.up_proj.weight"), Data(), qkv);
+            Silu(q, q);
+            MulTo(q, qkv);
+            Linear(q, localWeight(prefix + ".mlp.down_proj.weight"), Data(), world);
+            reduce(world);
+            if (length) {
+                attentionParallel->transfer->Select(tpRank, world.cudaData, projected.cudaData,
+                    size_t(embed_dim) * sizeof(uint16_t));
+                addMlpResidual(projected, false);
+            }
+        } else if (!moeLayers[layer]) {
             // Dense and routed-expert scratch have independent lifetimes.
             Data &w1 = workspace ? buf.denseGate : buf.w1;
             Data &w2 = workspace ? buf.denseDown : buf.w2;
@@ -2171,15 +2232,6 @@ Data NaiveN05FlashModel::RunTarget(
             bool hasRouterProbabilities = false;
             // Every local EP source needs the same arena capacity, even an
             // empty DP group. FP32 router input is dead before MoE dispatch.
-            auto reservePrefillArena = [&]() {
-                const int rows = localMoe ? maxLocalRows * epRanks : length;
-                const size_t rowBytes = (size_t)embed_dim * sizeof(float);
-                const size_t arenaBytes = FastllmCudaMimoEp8PrefillWorkspaceBytes(rows, epRanks);
-                routerInput.dataType = FLOAT32; routerInput.UpdateUnitSize();
-                routerInput.Resize({(int)std::max<size_t>(rows, (arenaBytes + rowBytes - 1) / rowBytes), embed_dim});
-                routerInput.ToDevice(CUDA, {gpu}, false); routerInput.Allocate(false);
-                routerInput.Resize({rows, embed_dim});
-            };
             if (localMoe && !decodeWorkspace) reservePrefillArena();
             if (!localMoe || length) {
                 Data routedInput;
