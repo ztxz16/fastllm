@@ -266,6 +266,46 @@ template<int Rows> __global__ void RouterPairs4096(const BF16 *input, const floa
         output[size_t(first + r) * experts + expert] = 1.0 / (1.0 + expf(-(value + 0.0f)));
 }
 
+constexpr int kRouterTileRows = 8, kRouterTileExperts = 4;
+// Four adjacent columns per lane preserve the original 256 partial sums.
+__global__ void RouterTile(const BF16 *input, const float *weight, float *output,
+                           int rows, int experts) {
+    constexpr int ExpertThreads = 256 / kRouterTileExperts;
+    const int lane = threadIdx.x % ExpertThreads, group = threadIdx.x / ExpertThreads;
+    const int expert = blockIdx.x * kRouterTileExperts + group, first = blockIdx.y * kRouterTileRows;
+    float partial[kRouterTileRows][4]{};
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int col = i * 256 + lane * 4;
+        const float4 w = *reinterpret_cast<const float4 *>(weight + size_t(expert) * 4096 + col);
+        #pragma unroll
+        for (int r = 0; r < kRouterTileRows; ++r) {
+            const auto pack = *reinterpret_cast<const uint2 *>(input + size_t(min(first + r, rows - 1)) * 4096 + col);
+            const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&pack.x));
+            const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(&pack.y));
+            partial[r][0] = fmaf(a.x, w.x, partial[r][0]);
+            partial[r][1] = fmaf(a.y, w.y, partial[r][1]);
+            partial[r][2] = fmaf(b.x, w.z, partial[r][2]);
+            partial[r][3] = fmaf(b.y, w.w, partial[r][3]);
+        }
+    }
+    __shared__ float sums[kRouterTileExperts][kRouterTileRows][8];
+    #pragma unroll
+    for (int r = 0; r < kRouterTileRows; ++r) {
+        float v = (partial[r][0] + partial[r][1]) + (partial[r][2] + partial[r][3]);
+        #pragma unroll
+        for (int d = 1; d < 8; d *= 2) v += __shfl_down_sync(0xffffffffu, v, d);
+        if (lane % 8 == 0) sums[group][r][lane / 8] = v;
+    }
+    __syncthreads();
+    const int r = lane / 8;
+    float v = sums[group][r][lane % 8];
+    #pragma unroll
+    for (int d = 1; d < 8; d *= 2) v += __shfl_down_sync(0xffffffffu, v, d, 8);
+    if (lane % 8 == 0 && first + r < rows)
+        output[size_t(first + r) * experts + expert] = 1.0 / (1.0 + expf(-(v + 0.0f)));
+}
+
 // Keep the full argument block below the legacy 4 KiB CUDA limit.
 constexpr int kDraftKVLayersPerLaunch = 80;
 struct DraftKVWeights { const void *data[kDraftKVLayersPerLaunch]; };
@@ -4941,6 +4981,7 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     Output(output, FLOAT32, dims);
     const int experts = weight.dims[0];
     const int arch = FastllmCudaRuntimeArch();
+    const int rowTiles = 1 + (rows - 1) / kRouterTileRows;
     const bool blackwell = arch == 100 || arch == 103;
     if (blackwell && rows >= 2 && ((uintptr_t(input.cudaData) | uintptr_t(weight.cudaData)) & 7) == 0) {
         auto kernel = rows <= 4 ? RouterPairs4096<1> : RouterPairs4096<2>;
@@ -4952,6 +4993,11 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     else if (rows == 1)
         RouterSigmoid4096<<<experts, 256>>>((const BF16 *)input.cudaData,
             (const float *)weight.cudaData, (float *)output.cudaData);
+    else if (arch == 120 && experts % kRouterTileExperts == 0 &&
+             int64_t(experts / kRouterTileExperts) * rowTiles >= DeviceSMCount() &&
+             ((uintptr_t)input.cudaData & 7) == 0 && ((uintptr_t)weight.cudaData & 15) == 0)
+        RouterTile<<<dim3(experts / kRouterTileExperts, rowTiles), 256>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData, (float *)output.cudaData, rows, experts);
     else if (rows >= 3 && arch == 90 &&
              (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0)
         BatchRouterSigmoid4096Vector<<<dim3(experts, (rows + 3) / 4), 128>>>(
