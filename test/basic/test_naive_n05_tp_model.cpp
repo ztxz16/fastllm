@@ -3789,6 +3789,50 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 
+    void CheckDraftHeadRows(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts) {
+        // Non-monotone owner order, unequal prefix lengths and empty owners must preserve the
+        // row layout of the original full-backbone gather and sharded vocabulary projection.
+        const std::vector<int> limits{2, 1, 3};
+        Data hidden;
+        if (!RunDraftBatch(anchors, contexts, hidden)) throw std::runtime_error("draft hidden reference");
+        hidden.ToDevice(CPU);
+        Data packed(BFLOAT16, {1, 6, embed_dim});
+        packed.Allocate();
+        size_t dest = 0;
+        for (size_t i = 0; i < limits.size(); ++i) {
+            const size_t bytes = size_t(limits[i]) * embed_dim * sizeof(uint16_t);
+            std::memcpy(packed.cpuData + dest, hidden.cpuData + i * draftBlock * embed_dim * sizeof(uint16_t), bytes);
+            dest += bytes;
+        }
+        std::vector<uint8_t> expected(packed.cpuData, packed.cpuData + dest);
+        packed.ToDevice(CUDA, std::vector<int>{0});
+        Data reference = RunDraftHead(packed);
+        std::vector<uint16_t> expectedLogits(reference.Count(0));
+        FastllmCudaCopyFromDeviceToHost(expectedLogits.data(), reference.cudaData, reference.GetBytes());
+        std::vector<Data> inputs, logits;
+        DraftHeadShards shards{limits, inputs, logits};
+        if (!RunDraftBatch(anchors, contexts, hidden, 0, &shards)) throw std::runtime_error("draft shard fallback");
+        int offset = 0;
+        for (int rank = 0; rank < ranks; ++rank) {
+            FastllmCudaSetDevice(rank);
+            if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error("reading draft shard");
+            auto &input = inputs.at(rank), &shard = logits.at(rank);
+            input.ToDevice(CPU); shard.ToDevice(CPU);
+            if (input.GetBytes() != expected.size() || std::memcmp(input.cpuData, expected.data(), expected.size()))
+                throw std::runtime_error("direct draft shard input differs from packed BF16 reference");
+            const int width = shard.dims.back(), vocab = reference.dims.back();
+            for (int row = 0; row < packed.dims[1]; ++row) {
+                const size_t src = size_t(row) * width * sizeof(uint16_t);
+                const size_t dst = size_t(row) * vocab + offset;
+                if (std::memcmp(shard.cpuData + src, expectedLogits.data() + dst, width * sizeof(uint16_t)))
+                    throw std::runtime_error("direct draft logits differ from joined BF16 reference");
+            }
+            offset += width;
+        }
+        if (offset != reference.dims.back()) throw std::runtime_error("draft vocabulary coverage");
+        FastllmCudaSetDevice(0);
+    }
+
     void AttentionDPSpark(int groups, int candidates, bool sample, bool finiteTopK = false, bool sampleOracle = false, bool toolGrammar = false) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         const int rejectionCalls = batchedRejectionCalls;
@@ -3846,6 +3890,12 @@ class Fixture : public NaiveN05FlashModel {
                 draftEnabled=false; expected[i]=Forward(input,Data(),positions,reference[i],cfg); draftEnabled=true;
                 if(anchors[i]!=expected[i]) throw std::runtime_error("DP draft prefill token mismatch");
             }
+        }
+        if (CanShardDraftHead()) {
+            const int last = requests - 1;
+            CheckDraftHeadRows({anchors[last], anchors[1], anchors[0]},
+                {draftContexts.at(&caches[last]).get(), draftContexts.at(&caches[1]).get(),
+                 draftContexts.at(&caches[0]).get()});
         }
         for(int turn=0;turn<24;++turn) {
             std::vector<int> order;

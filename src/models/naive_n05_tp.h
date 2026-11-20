@@ -45,7 +45,16 @@ struct NaiveN05FlashModel::TPDecodeState {
         Data inputStorage, cacheTable, cacheMaps, indexScores, indexExchange;
         Data decodeTokenRows[2];
         void *gatherReady = nullptr;
-        ~Storage() { if (gatherReady) FastllmCudaEventDestroy(gatherReady); }
+        std::map<int, void *> commitGraphs;
+        ~Storage() {
+            if (gatherReady) FastllmCudaEventDestroy(gatherReady);
+            if (!commitGraphs.empty()) {
+                const int previous = FastllmCudaGetDevice();
+                FastllmCudaSetDevice(cacheTable.dataDeviceIds.front());
+                for (auto &entry : commitGraphs) FastllmCudaGraphExecDestroy(entry.second);
+                FastllmCudaSetDevice(previous);
+            }
+        }
         std::shared_ptr<void> linearGraphWorkspace;
         std::vector<unsigned char> hostInput;
         std::vector<void *> hostCache;
@@ -93,7 +102,7 @@ struct NaiveN05FlashModel::TPServingState {
     int pipelineInputSlot = -1, pipelineOutputSlot = -1;
     std::vector<const float *> feedbackRows[2];
     bool preparing = false, capturing = false, sealed = false, pipelineReady = false;
-    int prepareCapacity = 0;
+    int prepareCapacity = 0, verifyWidth = 0;
     DataType moeType = BFLOAT16, kvType = BFLOAT16;
     uint64_t generation = 0, cacheEpoch = UINT64_MAX;
     std::vector<const Data *> requests;

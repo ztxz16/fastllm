@@ -165,7 +165,7 @@ int ProjectTests(int layers, int inner, int columns,
 }
 static void MixedBatch(int count, int window, bool mixedStorage = false, int appendedRows = 0) {
     constexpr int heads = 2, dim = 64, width = heads * dim;
-    std::vector<Data> raw(count), norms(count);
+    std::vector<Data> raw(count), norms(count), packed(count);
     std::vector<std::pair<Data, Data>> actual(count), expected(count);
     std::vector<std::pair<Data, Data>> views(count);
     std::vector<FastllmNaiveDraftKVUpdate> updates;
@@ -183,6 +183,13 @@ static void MixedBatch(int count, int window, bool mixedStorage = false, int app
             Append(part ? expected[i].second : expected[i].first, initial, window + std::max(16, rows));
         }
         updates.push_back({&raw[i], &norms[i], &actual[i].first, &actual[i].second, start});
+        if (mixedStorage && i % 3) {
+            auto padding = BF({1, 2, 2 * width}, 41);
+            Cat(padding, raw[i], 1, packed[i]);
+            updates.back().raw = &packed[i];
+            updates.back().firstRow = 2;
+            updates.back().rowCount = i % 3 == 1 ? rows : -1;
+        }
         original[i] = actual[i].first.cudaData;
         if (mixedStorage && i % 4 == 1) {
             actual[i].first.isKVCache = actual[i].second.isKVCache = false;
@@ -225,6 +232,11 @@ static void MixedBatch(int count, int window, bool mixedStorage = false, int app
             Check(u.key->isFake && u.key->cudaData == original[i], "view ownership changed");
     }
     auto before = Bits(actual.front().first);
+    const int first = updates.back().firstRow;
+    updates.back().firstRow = updates.back().raw->dims[1];
+    Check(!FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, window + 16, 1e-5f, 10000.f),
+          "invalid packed KV row offset accepted");
+    updates.back().firstRow = first;
     updates.back().norm = nullptr;
     Check(!FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, window + 16, 1e-5f, 10000.f), "invalid mixed KV accepted");
     Check(Bits(actual.front().first) == before, "mixed KV preflight altered earlier request");

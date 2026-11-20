@@ -3,6 +3,7 @@
 #include "../../src/devices/cuda/models/naive-n05-indexer-batch.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-sortpack.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-sm100.cuh"
+#include "../../src/devices/cuda/models/naive-n05-indexer-wide-select.cuh"
 #include "../../src/devices/cuda/models/naive-n05-indexer-staged.cuh"
 #include <cmath>
 #include <cstdio>
@@ -36,7 +37,7 @@ static float Decode(unsigned bits) {
     std::memcpy(&value, &raw, 4);
     return value;
 }
-static void Case(int count, int capacity, int stride, int page, bool fp8 = true, bool scaled = true) {
+static void Case(int count, int capacity, int stride, int page, bool fp8 = true, bool scaled = true, int queryGroup = 1) {
     const int rowStride = stride / (fp8 ? 1 : 2);
     const int pages = capacity / page;
     unsigned seed = 171117;
@@ -90,7 +91,7 @@ static void Case(int count, int capacity, int stride, int page, bool fp8 = true,
     b::Batch original{}, compact{};
     naive_indexer_sm100::Row native[naive_indexer_sm100::BatchLimit];
     for (int i = 0; i < count; ++i) {
-        auto key = FastllmNaiveKV(pool0.p, table0.p + i * pages, page, fp8);
+        auto key = FastllmNaiveKV(pool0.p, table0.p + (i / queryGroup) * pages, page, fp8);
         key.scaledIndexer = scaled;
         original.rows[i] = {key,
                             live.p + i,
@@ -114,14 +115,19 @@ static void Case(int count, int capacity, int stride, int page, bool fp8 = true,
     auto topk = [&]() {
         b::Select<><<<count, 256, 0, cudaStreamPerThread>>>(original);
         b::Sort<><<<count, 256, 0, cudaStreamPerThread>>>(original);
-        fused<<<count, 256, sortBytes, cudaStreamPerThread>>>(compact);
+        if (queryGroup > 1) {
+            naive_indexer_wide_select::SelectWide<<<count, 1024, 0, cudaStreamPerThread>>>(compact);
+            b::Sort<><<<count, 256, 0, cudaStreamPerThread>>>(compact);
+        } else {
+            fused<<<count, 256, sortBytes, cudaStreamPerThread>>>(compact);
+        }
     };
     auto update = [&](int step) {
         const int sizes[] = {0, 1, 63, 64, 65, 127, 128, 129, 2048, 2049, 8191, capacity};
         for (int i = 0; i < count; ++i) {
             lengths[i] = sizes[(i + step) % 12];
             bindings[i * 4] = step % 2 ? pool1.p : pool0.p;
-            bindings[i * 4 + 2] = (step % 2 ? table1.p : table0.p) + i * pages;
+            bindings[i * 4 + 2] = (step % 2 ? table1.p : table0.p) + (i / queryGroup) * pages;
         }
         for (auto &v : weights)
             v = __float2bfloat16(step == 2 ? 0.f : rnd());
@@ -294,6 +300,7 @@ int main() {
         Case(32, 8704, 144, 128);
         Case(64, 8704, 400, 256);
         Case(128, 20480, 144, 128);
+        Case(32, 32768, 144, 128, true, true, 4);
         Case(64, 8704, 1680, 128, false);
         Case(8, 8704, 1792, 128, false, false);
         Case(16, 8704, 1792, 128, false, false);

@@ -4,7 +4,8 @@
 // Producers gather independent K/V pages; two MMA warps reduce disjoint
 // halves of each tile. The final normalization includes the attention sink.
 #include "naive-n05-attention-bulk.cuh"
-#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
+#define FASTLLM_NAIVE_BLACKWELL_DECODE
 namespace blackwell_decode {
 constexpr int TILE = 32, NSTAGE = 4, NCW = 2, NP = 4;
 constexpr int K_STRIDE = 208, V_STRIDE = 144;

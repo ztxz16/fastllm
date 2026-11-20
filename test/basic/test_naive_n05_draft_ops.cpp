@@ -226,6 +226,43 @@ static void FusedBatchSampling(int count, int vocab, int steps) {
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaMtpDestroyDraftSampler(sampler);
     std::cout << "FUSED PROPOSAL PASS rows=" << count << " vocab=" << vocab << " steps=" << steps << std::endl;
 }
+static void DraftReplayInputs() {
+    const int capacity = 259, vocab = 17;
+    std::vector<float> anchors(capacity), temperatures(capacity, 1), ps(capacity, 1);
+    std::vector<int> ks(capacity, 0);
+    Data ids(FLOAT32, {capacity}), sampled(FLOAT32, {capacity}), q(FLOAT32, {capacity, vocab});
+    Data logits(FLOAT32, {capacity, vocab});
+    logits.Allocate();
+    for (size_t i = 0; i < logits.Count(0); ++i) ((float *)logits.cpuData)[i] = (i % vocab) * 0.125f;
+    for (Data *data : {&ids, &sampled, &q, &logits}) {
+        data->ToDevice(CUDA, std::vector<int>{0}); data->Allocate(false);
+    }
+    auto *sampler = FastllmCudaMtpCreateDraftSamplerBatch(capacity, vocab, temperatures.data(), ks.data(), ps.data());
+    for (int rows : {capacity, 1, 129}) {
+        for (int i = 0; i < rows; ++i) {
+            anchors[i] = (i * 17 + rows) % 251;
+            temperatures[i] = 0.5f + (i % 5) * 0.25f;
+        }
+        Require(FastllmCudaMtpPrepareDraftReplay(sampler, (float *)ids.cudaData, rows, anchors.data(), temperatures.data()),
+                "prepare draft replay inputs");
+        auto sample = [&] {
+            Require(FastllmCudaMtpDraftSamplerRunBatch(sampler, (float *)logits.cudaData,
+                (float *)q.cudaData, (float *)sampled.cudaData, 0), "sample replay rows");
+            std::vector<float> values(size_t(rows) * vocab);
+            FastllmCudaCopyFromDeviceToHost(values.data(), q.cudaData, values.size() * sizeof(float));
+            return values;
+        };
+        auto actual = sample();
+        std::vector<float> published(rows);
+        FastllmCudaCopyFromDeviceToHost(published.data(), ids.cudaData, rows * sizeof(float));
+        Require(std::equal(published.begin(), published.end(), anchors.begin()), "replay anchors differ");
+        Require(FastllmCudaMtpDraftSamplerSetParameters(sampler, rows, temperatures.data(), ks.data(), ps.data()),
+                "reference draft replay parameters");
+        Require(actual == sample(), "replay changed proposal probabilities");
+    }
+    FastllmCudaMtpDestroyDraftSampler(sampler);
+}
+
 int main() {
     try {
         int devices = 0;
@@ -234,6 +271,7 @@ int main() {
         for (int count : {1, 3, 8, 40, 65}) LargeBatchTopP(count, 65536);
         LargeBatchTopP(8, 152576);
         for (int count : {2, 8, 40}) for (int vocab : {7, 257, 16385}) BatchSampling(count, vocab);
+        DraftReplayInputs();
         for (int steps : {1, 3, 5, 7}) FusedBatchSampling(33, 257, steps);
         FusedBatchSampling(65, 16385, 3);
         FusedBatchSampling(256, 152576, 3);
@@ -317,6 +355,29 @@ int main() {
             Require(FastllmCudaNaiveDraftConcat(pointers, rows, output), "concat fast path rejected valid inputs");
             Require(Bits(output) == Bits(reference), "concat changed feature order");
             Require(!FastllmCudaNaiveDraftConcat(pointers, 9, output), "concat accepted an invalid row count");
+            ++checks;
+        }
+        for (int width : {256, 257}) {
+            Data x = BF({1, 300, width}, 17), y = BF({1, 300, width}, 73), output;
+            auto xb = Bits(x), yb = Bits(y);
+            std::vector<int> selected;
+            decltype(xb) expected;
+            for (int i = 0; i < 289; ++i) {
+                int row = i * 7 % 300;
+                selected.push_back(row);
+                for (const auto *values : {&xb, &yb})
+                    expected.insert(expected.end(), values->begin() + row * width, values->begin() + (row + 1) * width);
+            }
+            Require(FastllmCudaNaiveDraftConcatRows({&x, &y}, 300, selected, output) &&
+                Bits(output) == expected, "selected draft context rows differ across chunks");
+            Data sampling = BF({1, int(selected.size()), width * 2}, 11);
+            auto address = sampling.cudaData;
+            Require(FastllmCudaNaiveGatherDraftLogits({&x, &y}, {0, 0}, 300, selected, sampling) &&
+                sampling.cudaData == address && Bits(sampling) == expected, "draft head changed sampling storage or rows");
+            Require(!FastllmCudaNaiveGatherDraftLogits({&x, &y}, {0, 0}, 300, {1}, sampling) &&
+                Bits(sampling) == expected, "invalid sampling view changed output");
+            Require(!FastllmCudaNaiveDraftConcatRows({&x, &y}, 300, {300}, output) &&
+                Bits(output) == expected, "invalid draft context row changed output");
             ++checks;
         }
         {

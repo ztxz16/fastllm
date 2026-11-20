@@ -470,6 +470,23 @@ __global__ void BatchDraftTrimColumns(DraftTrimBatch batch) {
     for (int row = 0; row < batch.keep[i]; ++row)
         data[(size_t)row * batch.width[i] + column] = data[(size_t)(row + batch.drop[i]) * batch.width[i] + column];
 }
+// One CTA commits the accepted rows of one request/layer. The verifier
+// already installed the stable table on this stream. Unused rows have count 0.
+__global__ void CommitBoundSwa(const void *const *bindings, const int2 *accepted,
+        uint64_t slidingMask, int tableStride, int kc, int vc) {
+    const int request = blockIdx.y, layer = blockIdx.z;
+    const int2 item = accepted[request];
+    if (!item.y || !(slidingMask & (uint64_t(1) << layer))) return;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= kc + vc) return;
+    const auto *entry = bindings + size_t(layer) * tableStride + request * 4;
+    auto *ptr = (uint4 *)entry[column >= kc];
+    const int width = column < kc ? kc : vc, local = column < kc ? column : column - kc;
+    for (int row = 0; row < item.y; ++row)
+        ptr[size_t((item.x + row) & (kSwaWindow - 1)) * width + local] =
+            ptr[size_t(kSwaWindow + row) * width + local];
+}
+
 constexpr int kSwaCommitsPerLaunch = 112;
 struct SwaCommitBatch {
     void *key[kSwaCommitsPerLaunch], *value[kSwaCommitsPerLaunch];
@@ -2512,6 +2529,7 @@ using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
     BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
 __global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, DraftFlashParams p) {
     const auto r = DraftRow(batch, blockIdx.y);
+    if (!r.key || !r.value) return; // Padding has no KV and no published output.
     p.q = const_cast<BF16 *>(r.input); p.k = r.key; p.v = r.value; p.o = r.output;
     p.kv_len = min(*r.live - 1, p.window_left) + p.qo_len;
     extern __shared__ uint8_t smem[];
@@ -2525,6 +2543,7 @@ template<class Batch>
 __global__ void BatchDraftQKV(Batch batch, const float *qNorm, const float *kNorm,
         int rows, int heads, int kvHeads, int dim, int window, float eps, float theta) {
     const auto r = DraftRow(batch, blockIdx.y / rows);
+    if (!r.key || !r.value) return;
     DraftQKVNormRopeBody(r.input, qNorm, kNorm, r.positions, r.live,
         r.key, r.value, r.query, heads, kvHeads, dim, window, 0, eps, theta,
         blockIdx.x, blockIdx.y % rows, 0, 1);
@@ -2688,7 +2707,7 @@ bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
 bool FastllmCudaNaiveDraftCacheBindingsSupported(int count, int rows,
         int heads, int kvHeads, int dim, int window) {
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
-    return count >= 8 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
+    return count > 0 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
         heads % kvHeads == 0 && heads / kvHeads <= 32 && dim == 128 && window >= rows &&
         BulkKernelSupported(BatchDraftFlash, sizeof(DraftFlashTraits::SharedStorageSingle), 80);
 #else
@@ -2759,7 +2778,7 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         query.dims[1] % count || query.dims[2] != heads * dim) return false;
     const int rows = query.dims[1] / count, capacity = window + rows - 1;
     if (rows <= 1 || rows >= 32) return false;
-    const bool fused = FastllmCudaNaiveDraftCacheBindingsSupported(count, rows, heads, kvHeads, dim, window);
+    const bool fused = (cacheBindings || count >= 8) && FastllmCudaNaiveDraftCacheBindingsSupported(count, rows, heads, kvHeads, dim, window);
     if (cacheBindings && (!fused || !DraftDense(*cacheBindings, INT32) ||
         cacheBindings->dataDeviceIds != query.dataDeviceIds ||
         cacheBindings->dims != std::vector<int>({count, 4}) ||
@@ -2864,15 +2883,18 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         if (!u.raw || !u.norm || !u.key || !u.value || u.start < 0 ||
             !DraftDense(*u.raw, BFLOAT16, device) || !DraftDense(*u.norm, FLOAT32, device) ||
             u.norm->dims.size() != 1 || u.norm->dims[0] != dim || u.raw->dims.size() != 3 ||
-            u.raw->dims[0] != 1 || u.raw->dims[2] != 2 * width || u.raw->dims[1] <= 0 ||
-            (int64_t)u.start + u.raw->dims[1] > INT_MAX ||
-            (int64_t)16 * u.raw->dims[1] * heads > INT_MAX || u.key->dims != u.value->dims) return false;
+            u.raw->dims[0] != 1 || u.raw->dims[2] != 2 * width ||
+            u.firstRow < 0 || u.firstRow >= u.raw->dims[1] || u.rowCount < -1) return false;
+        const int available = u.raw->dims[1] - u.firstRow;
+        const int rows = u.rowCount == -1 ? available : u.rowCount;
+        if (rows <= 0 || rows > available || (int64_t)u.start + rows > INT_MAX ||
+            (int64_t)16 * rows * heads > INT_MAX || u.key->dims != u.value->dims) return false;
         for (const Data *cache : {u.key, u.value}) {
             if (cache->dims.empty()) { if (!cache->expansionDims.empty()) return false; continue; }
             if (cache->dataType != BFLOAT16 || cache->dataDevice != DataDevice::CUDA ||
                 cache->dataDeviceIds != devices || !cache->cudaData || cache->multiDeviceData ||
                 cache->dims.size() != 3 || cache->dims[0] != 1 || cache->dims[2] != width || cache->dims[1] < 0 ||
-                (int64_t)cache->dims[1] + u.raw->dims[1] > INT_MAX || cache->strides.size() != 3 ||
+                (int64_t)cache->dims[1] + rows > INT_MAX || cache->strides.size() != 3 ||
                 cache->strides[2] != 1 || cache->strides[1] != width ||
                 (!cache->expansionDims.empty() && (cache->expansionDims.size() != 3 ||
                     cache->expansionDims[0] != 1 || cache->expansionDims[2] != width))) return false;
@@ -2890,11 +2912,12 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         for (int i = 0; i < count; ++i) {
             const auto &u = updates[first + i];
             const int old = u.key->dims.empty() ? 0 : u.key->dims[1];
-            const int n = std::min(u.raw->dims[1], window - 1);
-            const int skip = u.raw->dims[1] - n;
+            const int sourceRows = u.rowCount == -1 ? u.raw->dims[1] - u.firstRow : u.rowCount;
+            const int n = std::min(sourceRows, window - 1);
+            const int skip = sourceRows - n;
             const int keep = std::min(old, window - 1 - n);
             rows = std::max(rows, n);
-            dst.raw[i] = (const BF16 *)u.raw->cudaData + (size_t)skip * 2 * width;
+            dst.raw[i] = (const BF16 *)u.raw->cudaData + size_t(u.firstRow + skip) * 2 * width;
             dst.norm[i] = (const float *)u.norm->cudaData;
             dst.length[i] = keep; dst.rows[i] = n; dst.start[i] = u.start + skip;
             for (Data *cache : {u.key, u.value}) {
@@ -5053,6 +5076,14 @@ void FastllmCudaNaiveCommitSwaVerify(fastllm::Data &key, fastllm::Data &value,
     value.Resize({1, kept, value.dims[2]});
 }
 
+void FastllmCudaNaiveCommitBoundSwa(const void *const *bindings, const int *accepted,
+        int rows, int layers, uint64_t slidingMask, int tableStride, int keyBytes, int valueBytes) {
+    const int kc = keyBytes / sizeof(uint4), vc = valueBytes / sizeof(uint4);
+    CommitBoundSwa<<<dim3((kc + vc + 63) / 64, rows, layers), 64, 0, cudaStreamPerThread>>>(
+        bindings, (const int2 *)accepted, slidingMask, tableStride, kc, vc);
+    CheckLaunch();
+}
+
 void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches) {
     using namespace fastllm;
     const int device = FastllmCudaGetDevice();
@@ -5447,7 +5478,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             const dim3 grid(scoreBlocks, paired ? count / 2 : count / sharedQueries);
             bool blackwellScores = false;
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
-            if (blackwell && nativeScores && sharedQueries == 1) {
+            if (blackwell && nativeScores && (sharedQueries == 1 || count >= 32)) {
                 naive_indexer_sm100::Row entries[naive_indexer_sm100::BatchLimit];
                 for (int i = 0; i < count; ++i) {
                     const auto &r = descriptors.rows[i];
@@ -5523,9 +5554,9 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         }
         // Bound the single-CTA row work; retain the existing paths for
         // short rows, small batches, other CP layouts and architectures.
-        const bool wideSelect = cp && contextRanks == 4 && contextPageLen &&
+        const bool wideSelect = ((cp && contextRanks == 4 && contextPageLen && arch == 90) ||
+            (blackwell && nativeScores && sharedQueries > 1 && count >= 32)) &&
             rows.size() >= 16 && capacity > 16384 && capacity <= 65536 &&
-            FastllmCudaRuntimeArch() == 90 &&
             BulkKernelSupported(naive_indexer_wide_select::SelectWide<>, 0, 90);
         if (wideSelect) {
             naive_indexer_wide_select::SelectWide<<<count, 1024>>>(descriptors);
@@ -6178,7 +6209,7 @@ bool FastllmCudaNaiveEncodeDSAMaps(void *host, const void *key, const void *valu
 bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
         FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
-#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+#ifdef FASTLLM_NAIVE_BLACKWELL_DECODE
     using namespace fastllm;
     namespace bw = blackwell_decode;
     const int arch = FastllmCudaRuntimeArch();
@@ -6840,16 +6871,16 @@ __global__ void LogitsTopKFinish(const float2 *partial, float2 *output, int bloc
     }
 }
 struct DraftHiddenInputs { const BF16 *ptr[32]; };
-__global__ void DraftConcat(DraftHiddenInputs inputs, BF16 *output,
-                            int rows, int width, int count) {
-    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = (size_t)rows * width * count;
-    if (index < total) {
-        int column = index % width;
-        int layer = (index / width) % count;
-        int row = index / ((size_t)width * count);
-        output[index] = inputs.ptr[layer][(size_t)row * width + column];
-    }
+struct DraftRowIndices { int row[256]; };
+template <typename Unit>
+__global__ void DraftConcatRows(DraftHiddenInputs inputs, DraftRowIndices indices,
+        Unit *output, int width, int layers, int first) {
+    const size_t column = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (column >= width) return;
+    const int row = blockIdx.z, layer = blockIdx.y;
+    const auto *source = reinterpret_cast<const Unit *>(inputs.ptr[layer]);
+    output[(size_t(row) * layers + layer) * width + column] =
+        source[size_t(first < 0 ? indices.row[row] : first + row) * width + column];
 }
 }
 
@@ -6924,27 +6955,66 @@ void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
         (const uint32_t *)mask.cudaData, (float *)output.cudaData, vocab);
     CheckLaunch();
 }
-bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
-    int rows, fastllm::Data &output) {
-    if (inputs.empty() || inputs.size() > 32 || rows <= 0) return false;
+static bool ConcatDraftRows(const std::vector<const fastllm::Data *> &inputs,
+    int rows, const std::vector<int> &selected, fastllm::Data &output, const std::vector<int> *peerDevices) {
+    if (inputs.empty() || inputs.size() > 32 || !inputs.front() || rows <= 0 || selected.size() > INT_MAX) return false;
     int width = inputs[0]->dims.empty() ? 0 : inputs[0]->dims.back();
-    if (width <= 0) return false;
-    const std::vector<int> deviceIds{FastllmCudaGetDevice()};
+    if (width <= 0 || width > INT_MAX / int(inputs.size())) return false;
+    const int device = FastllmCudaGetDevice();
+    if (peerDevices && peerDevices->size() != inputs.size()) return false;
     DraftHiddenInputs pointers{};
+    bool vectorized = width % 8 == 0;
+    for (int row : selected) if (row < 0 || row >= rows) return false;
     for (size_t i = 0; i < inputs.size(); ++i) {
+        if (!inputs[i]) return false;
         const auto &x = *inputs[i];
         if (x.dataType != fastllm::BFLOAT16 || x.dims.size() != 3 || x.dims[0] != 1 ||
             x.dims[1] < rows || x.dims[2] != width || x.dataDevice != fastllm::DataDevice::CUDA ||
-            x.dataDeviceIds != deviceIds || !x.cudaData || x.strides.size() != 3 ||
+            x.dataDeviceIds.size() != 1 || x.dataDeviceIds.front() != (peerDevices ? (*peerDevices)[i] : device) ||
+            !x.cudaData || x.strides.size() != 3 ||
             x.strides[1] != width || x.strides[2] != 1) return false;
+        vectorized &= reinterpret_cast<uintptr_t>(x.cudaData) % 16 == 0;
         pointers.ptr[i] = (const BF16 *)x.cudaData;
     }
-    Output(output, fastllm::BFLOAT16, {1, rows, width * (int)inputs.size()});
-    size_t total = (size_t)rows * width * inputs.size();
-    DraftConcat<<<(total + 255) / 256, 256>>>(pointers, (BF16 *)output.cudaData,
-        rows, width, inputs.size());
-    CheckLaunch();
+    const int count = selected.empty() ? rows : static_cast<int>(selected.size());
+    const int columnsOut = width * int(inputs.size());
+    if (peerDevices) {
+        if (!DraftDense(output, fastllm::BFLOAT16, device) || output.dims.size() != 3 ||
+            output.dims[0] != 1 || output.dims[1] != count || output.dims[2] != columnsOut) return false;
+    } else Output(output, fastllm::BFLOAT16, {1, count, columnsOut});
+    vectorized &= reinterpret_cast<uintptr_t>(output.cudaData) % 16 == 0;
+    const int columns = vectorized ? width / 8 : width;
+    for (int first = 0; first < count;) {
+        DraftRowIndices indices{};
+        const int n = std::min(count - first, selected.empty() ? 65535 : int(sizeof(indices.row) / sizeof(int)));
+        if (!selected.empty()) std::copy_n(selected.data() + first, n, indices.row);
+        auto *dst = static_cast<BF16 *>(output.cudaData) + size_t(first) * width * inputs.size();
+        dim3 grid((unsigned(columns) + 255) / 256, inputs.size(), n);
+        if (vectorized)
+            DraftConcatRows<<<grid, 256, 0, cudaStreamPerThread>>>(pointers, indices,
+                reinterpret_cast<uint4 *>(dst), columns, int(inputs.size()), selected.empty() ? first : -1);
+        else
+            DraftConcatRows<<<grid, 256, 0, cudaStreamPerThread>>>(pointers, indices,
+                dst, columns, int(inputs.size()), selected.empty() ? first : -1);
+        CheckLaunch();
+        first += n;
+    }
     return true;
+}
+
+bool FastllmCudaNaiveDraftConcatRows(const std::vector<const fastllm::Data *> &inputs,
+        int rows, const std::vector<int> &selected, fastllm::Data &output) {
+    return ConcatDraftRows(inputs, rows, selected, output, nullptr);
+}
+
+bool FastllmCudaNaiveGatherDraftLogits(const std::vector<const fastllm::Data *> &shards,
+        const std::vector<int> &devices, int rows, const std::vector<int> &selected, fastllm::Data &output) {
+    return ConcatDraftRows(shards, rows, selected, output, &devices);
+}
+
+bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
+        int rows, fastllm::Data &output) {
+    return FastllmCudaNaiveDraftConcatRows(inputs, rows, {}, output);
 }
 
 void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,

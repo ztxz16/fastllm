@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/deepseek-ai/DeepGEMM",
   "commit": "5081f8513af57e61696de4f4f04b0e707ffb503e",
-  "changes": "C++ namespace isolation and trailing whitespace cleanup; numerical kernel is unmodified.",
+  "changes": "C++ namespace isolation for FastLLM, bounded ring signal storage and trailing whitespace cleanup; numerical kernel is unmodified.",
   "headers": {
     "deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh": {
       "original_sha256": "9d577f200e482fb2deed3e9d8a8b6ec0f71d15df2782d4b8f0a5321102ccc970",
@@ -45,7 +45,7 @@
     },
     "deep_gemm/layout/mega_moe.cuh": {
       "original_sha256": "53008d96b7eeaeec35af54e1400a9a3149625bc39b385611fe544b08c5084b50",
-      "installed_sha256": "4c4ca902cd133657f6c7f2f294c417e651efd779eb1871f1a2879e008c1455b4",
+      "installed_sha256": "28d67f705a1171b6f60627988763d5bb158f08703eb6810d07892e77b298660c",
       "adapted": true
     },
     "deep_gemm/layout/sym_buffer.cuh": {

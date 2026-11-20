@@ -1294,7 +1294,11 @@ Data NaiveN05FlashModel::RunTarget(
             else prepareIndexQuery(normed, positions, batchIndexQ, batchIndexWeights);
         }
         const bool broadcastBatchIndex = (indexerLayerSharding || separateIndex) && batchRopePrepared && batchNeedsIndex;
+        // Packed output views live for this layer only. Eager verification and
+        // a later long prefill may use the same per-request workspace.
+        std::vector<Data> packedIndices;
         if (broadcastBatchIndex || batchVerifyIndex) {
+            packedIndices.resize(batch->Size());
             // One contiguous TopK exchange per layer, independent of the number
             // of requests. Graph shapes share the largest warmup allocation.
             buf.indexBroadcast.dataType = INT32;
@@ -1304,8 +1308,7 @@ Data NaiveN05FlashModel::RunTarget(
             int offset = 0;
             for (int sequence = 0; sequence < batch->Size(); ++sequence) {
                 const int rows = batchVerifyIndex ? batch->lengths[sequence] : 1;
-                Data &indices = buf.sequences[sequence]->indices;
-                indices.FreeSpace(); // Fake views do not own their allocation.
+                Data &indices = packedIndices[sequence];
                 indices.Resize({rows, indexTopK});
                 indices.FakeFrom(buf.indexBroadcast, (size_t)offset * indexTopK * sizeof(int));
                 offset += rows;
@@ -1319,7 +1322,8 @@ Data NaiveN05FlashModel::RunTarget(
                 auto &part = *buf.sequences[sequence];
                 if (part.capacity > indexTopK)
                     rows.push_back({indexCache(sequence),
-                        &part.decode, &part.indices, sequence, part.capacity, indexTable(sequence)});
+                        &part.decode, packedIndices.empty() ? &part.indices : &packedIndices[sequence],
+                        sequence, part.capacity, indexTable(sequence)});
             }
             const int ranks = tensorParallel ? AttentionTPSize() : 1;
             const bool contextParallel = !attentionParallel && !indexerLayerSharding && !contextSharded && !verifying && decodeWorkspace && ranks > 1 &&
@@ -1360,7 +1364,7 @@ Data NaiveN05FlashModel::RunTarget(
                     indexWeights.FakeFrom(batchIndexWeights, (size_t)sequence * indexHeads * batchIndexWeights.unitSize);
                     FastllmCudaNaiveDecodeIndexer(indexQ, indexWeights,
                         *indexCache(sequence), part.liveKeys,
-                        part.capacity, indexFp8, part.decode, part.indices, indexTable(sequence));
+                        part.capacity, indexFp8, part.decode, packedIndices[sequence], indexTable(sequence));
                 }
             }
             if (indexerLayerSharding)
@@ -1396,7 +1400,6 @@ Data NaiveN05FlashModel::RunTarget(
         const bool dpPrefill = attentionParallel && AttentionTPSize() == 1 && batch &&
             !batch->Decode() && !decodeWorkspace && !verifying && !sparseLayer &&
             !slidingLayers[layer];
-        std::vector<Data> packedIndices;
         if (dpPrefill && reuseAttention && !indexerLayerSharding && indexTopK > 0 &&
             int64_t(qkv.dims.back()) - int64_t(cfg.heads) * cfg.valueDim >= 2LL * indexTopK) {
             // The Indexer runs after every packed QKV row has been consumed.
@@ -2044,7 +2047,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
         } else if (batchedDSA) {
             Data &sink = localWeight(ap + "attention_sink_bias");
-            if (verifying || !FastllmCudaNaiveOnlineDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
+            if (!FastllmCudaNaiveOnlineDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, buf.decode, attn))
                 FastllmCudaNaiveBatchDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, buf.decode, attn);
@@ -2378,9 +2381,9 @@ Data NaiveN05FlashModel::RunTarget(
 #endif
 }
 
-NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
+NaiveN05FlashModel::LogitsOptions NaiveN05FlashModel::GetLogitsOptions(
         const GenerationConfig &config, bool speculative) const {
-    LogitsSelection selection;
+    LogitsOptions selection;
     // Stateful transforms need the request's history/cache lengths, but the
     // logits remain on GPU. Only explicit logits output retains host transfer.
     if (config.prefill_chunk_remaining > 0 || config.output_logits) return selection;
@@ -2402,7 +2405,7 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
         selection.cudaSampling = true;
         return selection;
     }
-    if (config.tool_call_grammar || config.tool_call_token_mask) return LogitsSelection();
+    if (config.tool_call_grammar || config.tool_call_token_mask) return LogitsOptions();
     if (selection.greedy) selection.count = 1;
     else if (config.top_k > 1 && config.top_k <= kNaiveLogitsMaxTopK &&
              std::isfinite(config.temperature) && config.temperature > 0 &&
@@ -2415,8 +2418,13 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
     return selection;
 }
 
+NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
+        const GenerationConfig &config, bool speculative) const {
+    return {GetLogitsOptions(config, speculative), {}, {}};
+}
+
 bool NaiveN05FlashModel::SupportsCudaRejectionSampling(const GenerationConfig &config) const {
-    return config.top_k > 1 && SelectLogits(config).cudaSampling;
+    return config.top_k > 1 && GetLogitsOptions(config, false).cudaSampling;
 }
 
 std::vector<int> NaiveN05FlashModel::SampleCudaLogits(

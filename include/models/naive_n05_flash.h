@@ -253,15 +253,18 @@ namespace fastllm {
         void CopyPrefixWindow(const PrefixSnapshot &snapshot, int rank, int layer,
                               const Data &key, const Data &value, int first, bool ring);
 
-        struct LogitsSelection {
+        struct LogitsOptions {
             int count = 0;
             bool greedy = false;
             bool cudaSampling = false;
             bool cudaLogits = false; // Keep full logits on device for rejection sampling.
             float invTemperature = 1.0f;
+        };
+        struct LogitsSelection : LogitsOptions {
             Data candidates; // CPU [rows, count * 2], (global token ID, score).
             std::vector<int> sampledTokens;
         };
+        LogitsOptions GetLogitsOptions(const GenerationConfig &config, bool speculative) const;
         LogitsSelection SelectLogits(const GenerationConfig &config, bool speculative = false) const;
         bool SupportsCudaRejectionSampling(const GenerationConfig &config) const;
         std::vector<int> SampleCudaLogits(Data &logits,
@@ -350,25 +353,39 @@ namespace fastllm {
         bool RunDraftProposalGraph(int anchor, const Data &baseLogits,
                                    DraftContext &context, std::vector<int> &proposed);
         Data RunDraft(int anchor, DraftContext &context);
+        // Request-local prefixes are packed into each vocabulary shard's existing input buffer.
+        struct DraftHeadShards {
+            const std::vector<int> &limits;
+            std::vector<Data> &inputs, &logits;
+        };
         bool RunDraftBatch(const std::vector<int> &anchors,
-                           const std::vector<DraftContext *> &contexts, Data &normalized);
+                           const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows = 0,
+                           DraftHeadShards *headShards = nullptr);
         void ApplyDraftDevice();
         Data &DraftWeight(const std::string &name);
         Data RunDraftHead(Data &hidden);
+        void RunDraftHead(Data &hidden, Data &output);
+        bool CanShardDraftHead() const;
         Data RunDraftTarget(const Data &inputIds, const Data &positions,
                             std::vector<std::pair<Data, Data>> &kv,
                             const GenerationConfig &config, TargetCapture &capture,
                             const TargetBatch *batch = nullptr);
         void CommitTargetCache(std::vector<std::pair<Data, Data>> &kv, int past, int count, bool ringVerify = false);
+        bool CommitBoundVerifyCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts);
+        void RememberVerifyCommit(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts);
         void CommitTargetCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
             const std::vector<int> &past, const std::vector<int> &counts, bool ringVerify);
         bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
             const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
         struct DraftRound;
         void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
-        bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &baseLogits);
+        bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
+                               int reserveRows = 0, bool *backboneReady = nullptr);
         bool PrepareDraftBatchLocal(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
-        bool PrepareDraftBatchGraph(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
+        bool PrepareDraftBatchGraph(const std::vector<DraftRound *> &rounds, const Data &baseLogits,
+                                   int rank, int reserveRows = 0);
         void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth, int rank = -1);
         void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits);
         void PrepareDraftAcceptanceLocal(const std::vector<DraftRound *> &rounds, Data &logits, int rank);
@@ -421,9 +438,16 @@ namespace fastllm {
         // Affinity fixes the KV owner before admission. The global scheduler caps
         // total requests when the batch is not divisible by the number of groups.
         int RunningRequestsPerGroup(int batch) const { return 1 + (batch - 1) / attentionDP; }
-        int WindowRequestsPerGroup(int batch) const {
-            const int mean = RunningRequestsPerGroup(batch);
+        int WindowRequestsPerGroup(int batch) const { return WindowRequestsPerGroup(batch, attentionDP); }
+        static int WindowRequestsPerGroup(int batch, int groups) {
+            const int mean = 1 + (batch - 1) / groups;
             return std::min(batch, mean + (mean + 3) / 4);
+        }
+        static std::vector<int> SpeculativeGraphBuckets(int maxRows) {
+            std::vector<int> buckets;
+            for (int64_t rows = 1; rows < maxRows; rows *= 2) buckets.push_back((int)rows);
+            buckets.push_back(maxRows);
+            return buckets;
         }
         int WindowGroup(const Data &key) const;
         bool ReserveWindow(Data &key, bool request = true) const;
@@ -498,7 +522,7 @@ namespace fastllm {
             std::vector<int> &counts, std::vector<std::vector<int>> *samplingRows = nullptr) const;
         bool ForwardAttentionParallelServing(const Data &inputIds, const Data &positions,
             std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &config,
-            LogitsSelection *selection, const TargetBatch *batch, Data &output);
+            LogitsSelection *selection, const TargetBatch *batch, Data &output, TargetCapture *capture = nullptr);
         bool PrepareAttentionParallelServingDecode(const TargetBatch *batch);
         std::vector<int> tpDevices;
         std::map<int, std::shared_ptr<CudaWorkspace>> tpKVPool;

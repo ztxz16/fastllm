@@ -6,6 +6,11 @@
 bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits,
     float *proposalProbs, float *deviceTokens, uint64_t offset, int probabilityStride);
 
+// Publish the anchors, temperatures and a fresh seed on the proposal graph's stream.
+// Draft q is the full temperature-softmax; top-k/top-p are applied by the verifier.
+bool FastllmCudaMtpPrepareDraftReplay(void *sampler, float *deviceAnchors, int rows,
+    const float *anchors, const float *temperatures);
+
 // Fuse BF16 base+bias (with BF16 rounding) and temperature softmax for large
 // unfiltered draft batches. Unsupported cases return false before writing.
 bool FastllmCudaMtpDraftSamplerRunBF16BiasBatch(void *sampler, const void *base, const void *bias,

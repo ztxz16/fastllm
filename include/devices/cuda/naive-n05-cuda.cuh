@@ -193,11 +193,14 @@ struct FastllmNaiveCacheCommit {
     fastllm::Data *key, *value;
     int past, count;
 };
+void FastllmCudaNaiveCommitBoundSwa(const void *const *bindings, const int *accepted,
+        int rows, int layers, uint64_t slidingMask, int tableStride, int keyBytes, int valueBytes);
 void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches);
 struct FastllmNaiveDraftKVUpdate {
     const fastllm::Data *raw, *norm;
     fastllm::Data *key, *value;
     int start;
+    int firstRow = 0, rowCount = -1; // A negative-one count selects the remaining source rows.
 };
 bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
     int heads, int dim, int window, int reserve, float eps, float theta);
@@ -450,6 +453,14 @@ void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
 // Unsupported layouts return false before modifying output.
 bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
     int rows, fastllm::Data &output);
+// Pack selected source rows in caller order while joining their feature columns.
+bool FastllmCudaNaiveDraftConcatRows(const std::vector<const fastllm::Data *> &inputs,
+    int rows, const std::vector<int> &selected, fastllm::Data &output);
+
+// Gather equal-width vocabulary shards into a preallocated BF16 sampling view.
+// The caller enables peer access and orders source writes before the gather.
+bool FastllmCudaNaiveGatherDraftLogits(const std::vector<const fastllm::Data *> &shards,
+    const std::vector<int> &devices, int rows, const std::vector<int> &selected, fastllm::Data &output);
 
 // NUMA FP8 weights are row-packed [128 E4M3 bytes, FP32 scale]. Gate/up
 // output rows are interleaved. Route ids index the original [token, top-k].

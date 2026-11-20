@@ -14,7 +14,7 @@ std::shared_ptr<NaiveN05FlashModel::TPDecodeState> NaiveN05FlashModel::SelectAtt
         const int owner = topology.AttentionOwner(device - tpDevices.begin());
         ++counts[owner];
         if (samplingRows) (*samplingRows)[owner].push_back(row);
-        const int length = key.dims[1] + 1;
+        const int length = key.dims[1] + batch.lengths[row];
         if (length <= 1 || length > max_positions) return nullptr;
         longest = std::max(longest, length);
     }
@@ -24,12 +24,12 @@ std::shared_ptr<NaiveN05FlashModel::TPDecodeState> NaiveN05FlashModel::SelectAtt
     // Captured kernels read each row's live length. A long-capacity graph also
     // handles shorter rows (Indexer selects all valid keys when length <= K),
     // including the exact dense-to-sparse boundary and mixed-length batches.
-    int capacity = longest <= 256 ? 256 : longest < 2048 ? 2047 : 4096;
-    while (capacity < longest && capacity < max_positions)
-        capacity = (int)std::min<int64_t>((int64_t)capacity * 2, max_positions);
-    if (serving.preparing) capacity = serving.prepareCapacity;
-    auto found = serving.graphs.find({shape.graphRows, capacity});
-    if (found == serving.graphs.end() || found->second->disabled ||
+    // Ordinary decode starts its sparse graph range at capacity 4096.
+    const int minCapacity = !serving.verifyWidth && longest >= 2048 ? std::max(longest, 4096) : longest;
+    const auto found = serving.preparing
+        ? serving.graphs.find({shape.graphRows, serving.prepareCapacity})
+        : serving.graphs.lower_bound({shape.graphRows, minCapacity});
+    if (found == serving.graphs.end() || found->first.first != shape.graphRows || found->second->disabled ||
         (!serving.preparing && !found->second->captured)) return nullptr;
     return found->second;
 }
@@ -41,16 +41,21 @@ std::shared_ptr<NaiveN05FlashModel::TPDecodeState> NaiveN05FlashModel::SelectAtt
 bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
         const Data &positions, std::vector<std::pair<Data, Data>> &kv,
         const GenerationConfig &config, LogitsSelection *selection,
-        const TargetBatch *batch, Data &output) {
+        const TargetBatch *batch, Data &output, TargetCapture *capture) {
 #ifdef USE_CUDA
     auto &dp = *attentionParallel;
-    if (!tpServingState || dp.servingPadded || !batch || !batch->Decode() ||
+    const bool verify = capture && capture->verifying;
+    if (!tpServingState || dp.servingPadded || !batch || verify != bool(tpServingState->verifyWidth) ||
+        (!verify && !batch->Decode()) ||
         !GetFastllmEnv().cudaGraph || isIntermediateChunkedPrefill || sparseKv ||
         inputIds.dataDevice != CPU || positions.dataDevice != CPU ||
         inputIds.dataType != FLOAT32 || positions.dataType != FLOAT32 ||
-        inputIds.dims != std::vector<int>({1, batch->Size()}) ||
-        positions.Count(0) != (size_t)batch->Size()) return false;
+        inputIds.dims.size() != 2 || inputIds.dims[0] != 1 || positions.Count(0) != inputIds.Count(0) ||
+        inputIds.dims[1] != std::accumulate(batch->lengths.begin(), batch->lengths.end(), 0)) return false;
     auto &serving = *tpServingState;
+    const int width = std::max(1, serving.verifyWidth);
+    if (verify && std::any_of(batch->lengths.begin(), batch->lengths.end(),
+            [width](int n) { return n < 1 || n > width; })) return false;
     if (dataType != BFLOAT16 || kvCacheDataType != serving.kvType || moeAtype != serving.moeType ||
         !GetCudaEmbedding() || GetLowMemMode() || serving.generation != FastllmGetNcclGeneration()) {
         serving.sealed = false;
@@ -75,20 +80,8 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
             }
         }
     }
-    std::vector<std::pair<Data *, Data *>> pointers = batch->kv;
-    std::vector<GenerationConfig> configs = batch->configs;
-    std::vector<int> lengths(graph->rows, 1);
-    std::vector<float> ids((float *)inputIds.cpuData, (float *)inputIds.cpuData + batch->Size());
-    std::vector<float> pos((float *)positions.cpuData, (float *)positions.cpuData + batch->Size());
-    for (int group = 0; group < attentionDP; ++group)
-    for (int row = counts[group]; row < graph->rows / attentionDP; ++row) {
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            auto &pair = dp.padding[group * block_cnt + layer];
-            pointers.emplace_back(&pair.first, &pair.second);
-        }
-        configs.push_back(config); ids.push_back(0); pos.push_back(-1);
-    }
-    TargetBatch padded{pointers, configs, lengths, block_cnt};
+    const int slots = graph->rows / width;
+    const int liveTokens = inputIds.dims[1];
     struct Scope {
         AttentionParallelState &dp;
         std::shared_ptr<TPDecodeState> &current, previous;
@@ -104,16 +97,84 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
         }
         ~Scope() {
             SwapScratch(); dp.reuseBindings = false;
-            dp.servingPadded = false; current = previous;
+            dp.servingPadded = false; dp.verifyLengths = nullptr; current = previous;
         }
     } scope(dp, tpDecodeState, batch->Size());
     tpDecodeState = graph;
+    if (verify) dp.verifyLengths = &batch->lengths;
     LogitsSelection all;
     all.cudaSampling = selection && selection->cudaSampling && !selection->cudaLogits;
     all.cudaLogits = !all.cudaSampling;
     try {
-        Data logits = ForwardAttentionParallel(Data(FLOAT32, {1, graph->rows}, ids),
-            Data(FLOAT32, {1, graph->rows}, pos), kv, config, nullptr, &all, &padded);
+        auto forward = [&]() -> Data {
+            // Every request has at most width rows. Filling every slot and row
+            // means the caller already has the exact captured input layout.
+            if (batch->Size() == slots && liveTokens == graph->rows)
+                return ForwardAttentionParallel(inputIds, positions, kv, config, capture, &all, batch);
+            std::vector<std::pair<Data *, Data *>> pointers = batch->kv;
+            std::vector<GenerationConfig> configs = batch->configs;
+            std::vector<int> lengths(slots, width);
+            std::vector<float> ids(graph->rows, 0), pos(graph->rows, -1);
+            int source = 0;
+            for (int seq = 0; seq < batch->Size(); ++seq) {
+                const int count = batch->lengths[seq];
+                std::copy_n((const float *)inputIds.cpuData + source, count, ids.begin() + seq * width);
+                std::copy_n((const float *)positions.cpuData + source, count, pos.begin() + seq * width);
+                source += count;
+            }
+            for (int group = 0; group < attentionDP; ++group)
+            for (int row = counts[group]; row < slots / attentionDP; ++row) {
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    auto &pair = dp.padding[group * block_cnt + layer];
+                    pointers.emplace_back(&pair.first, &pair.second);
+                }
+                configs.push_back(config);
+            }
+            TargetBatch padded{pointers, configs, lengths, block_cnt};
+            return ForwardAttentionParallel(Data(FLOAT32, {1, graph->rows}, ids),
+                Data(FLOAT32, {1, graph->rows}, pos), kv, config, capture, &all, &padded);
+        };
+        Data logits = forward();
+        if (verify) {
+            if (serving.preparing) return true;
+            FastllmCudaSetDevice(tpDevices.front());
+            const bool contiguous = liveTokens == batch->Size() * width;
+            auto copyRagged = [&](const Data &paddedRows, Data &packed, const std::vector<int> &shape) {
+                packed.dataType = paddedRows.dataType; packed.UpdateUnitSize(); packed.Resize(shape);
+                packed.ToDevice(CUDA, {tpDevices.front()}, false); packed.Allocate(false);
+                const size_t bytes = size_t(shape.back()) * paddedRows.unitSize;
+                std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> sizes;
+                int offset = 0;
+                for (int seq = 0; seq < batch->Size(); ++seq) {
+                    dst.push_back((char *)packed.cudaData + size_t(offset) * bytes);
+                    src.push_back((char *)paddedRows.cudaData + size_t(seq) * width * bytes);
+                    sizes.push_back(size_t(batch->lengths[seq]) * bytes);
+                    offset += batch->lengths[seq];
+                }
+                AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
+                    dst.data(), src.data(), sizes.data(), dst.size()), "Cannot compact verify rows");
+                FastllmCudaSyncCurrentThreadStream();
+            };
+            if (contiguous) {
+                for (auto &item : capture->hidden) item.second.Resize({1, liveTokens, embed_dim});
+            } else {
+                auto paddedHidden = std::move(capture->hidden);
+                for (auto &item : paddedHidden) copyRagged(item.second, capture->hidden[item.first], {1, liveTokens, embed_dim});
+            }
+            if (!logits.dims.empty()) {
+                const std::vector<int> shape{liveTokens, weight["lm_head.weight"].dims[0]};
+                if (contiguous) {
+                    Data live;
+                    live.FakeFrom(logits, 0);
+                    live.Resize(shape);
+                    output.CopyFrom(live);
+                } else {
+                    copyRagged(logits, output, shape);
+                }
+                if (!(selection && selection->cudaLogits)) output.ToDevice(CPU);
+            }
+            return true;
+        }
         if (all.cudaSampling) selection->sampledTokens = std::move(all.sampledTokens);
         else {
             logits.Resize({batch->Size(), weight["lm_head.weight"].dims[0]});
@@ -149,25 +210,28 @@ bool NaiveN05FlashModel::PrepareAttentionParallelServingDecode(const TargetBatch
         const int count = group.sequenceIndices.size();
         const auto &previous = dp.previousBindingRows;
         bool moved = false;
-        for (int row = 0; row < count && !previous.empty(); ++row) {
-            const int seq = group.sequenceIndices[row];
-            if (seq < dp.servingLiveRows && previous[seq] >= 0 && previous[seq] != row) moved = true;
+        std::vector<int> changedRows;
+        for (int row = 0; row < buf.tableRows; ++row) {
+            const int seq = row < count ? group.sequenceIndices[row] : dp.servingLiveRows;
+            if (seq < dp.servingLiveRows && !previous.empty() && previous[seq] >= 0) {
+                if (previous[seq] == row) continue;
+                moved = true;
+            }
+            changedRows.push_back(row);
         }
         // A compaction can overwrite a later row's source. Snapshot the old
         // table only when survivors actually move between physical slots.
         const auto oldTable = moved ? storage.hostCache : std::vector<void *>{};
         for (int layer = 0; layer < block_cnt; ++layer)
-        for (int row = 0; row < buf.tableRows; ++row) {
+        for (int row : changedRows) {
             const bool live = row < count && group.sequenceIndices[row] < dp.servingLiveRows;
             const int seq = live ? group.sequenceIndices[row] : -1;
             const int stride = HasSeparateIndexer() && !slidingLayers[layer] ? 8 : 4;
             const size_t slot = (size_t)layer * buf.tableRows * (HasSeparateIndexer() ? 8 : 4) + row * stride;
             if (live && !previous.empty() && previous[seq] >= 0) {
-                if (previous[seq] != row) {
-                    auto src = oldTable.begin() + (slot - row * stride) + previous[seq] * stride;
-                    std::copy_n(src, stride, storage.hostCache.begin() + slot);
-                    storage.cacheDirty = true;
-                }
+                auto src = oldTable.begin() + (slot - row * stride) + previous[seq] * stride;
+                std::copy_n(src, stride, storage.hostCache.begin() + slot);
+                storage.cacheDirty = true;
                 continue;
             }
             void *bindings[8] = {};
@@ -179,8 +243,12 @@ bool NaiveN05FlashModel::PrepareAttentionParallelServingDecode(const TargetBatch
                 const auto &cfg = slidingLayers[layer] ? sliding : full;
                 const int width = std::max(1, cfg.kvHeads / AttentionTPSize()) *
                     (part ? cfg.valueDim : cfg.headDim) + (!part ? LocalIndexerCacheWidth(layer, rank) : 0);
-                const int next = batch->Key(seq, 0).dims[1] + 1;
-                const int required = slidingLayers[layer] ? std::min(next, window) : next;
+                const int past = batch->Key(seq, 0).dims[1];
+                const int count = dp.verifyLengths ? dp.verifyLengths->at(seq) : 1;
+                const int required = slidingLayers[layer] ? (graph.verifying ?
+                    std::min(past, window - 1) + count : std::min(past + count, window)) : past + count;
+                if (graph.verifying && slidingLayers[layer] && (local.expansionDims.size() != 3 ||
+                    local.expansionDims[1] < window + batch->lengths[seq])) return false;
                 const int rootWidth = cfg.kvHeads * (part ? cfg.valueDim : cfg.headDim) +
                     (!part && !slidingLayers[layer] ? PackedIndexerWidth() : 0);
                 // A DP root is metadata only and may retain the caller's
@@ -212,17 +280,18 @@ bool NaiveN05FlashModel::PrepareAttentionParallelServingDecode(const TargetBatch
                 }
         }
         if (preparing) {
+            const int width = std::max(1, tpServingState->verifyWidth);
             if (indexerContextSharding) {
                 buf.indexContextExchange.FakeFrom(storage.indexExchange, 0);
-                buf.indexContextExchange.Resize({count * AttentionTPSize() * indexTopK * 2});
+                buf.indexContextExchange.Resize({count * width * AttentionTPSize() * indexTopK * 2});
             }
             if (graph.capacity > 2048) {
                 buf.decode.indexScores.FakeFrom(storage.indexScores, 0);
-                buf.decode.indexScores.Resize({count * graph.capacity});
+                buf.decode.indexScores.Resize({count * width * graph.capacity});
                 for (int row = 0; row < count; ++row) {
                     auto &part = *buf.sequences[row];
-                    part.decode.indexScores.FakeFrom(storage.indexScores, (size_t)row * graph.capacity * sizeof(int));
-                    part.decode.indexScores.Resize({graph.capacity});
+                    part.decode.indexScores.FakeFrom(storage.indexScores, (size_t)row * width * graph.capacity * sizeof(int));
+                    part.decode.indexScores.Resize({width * graph.capacity});
                 }
             }
         }

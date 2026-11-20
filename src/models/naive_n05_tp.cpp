@@ -631,9 +631,100 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
 #endif
 }
 
+bool NaiveN05FlashModel::CommitBoundVerifyCaches(
+        const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+        const std::vector<int> &past, const std::vector<int> &counts) {
+#ifdef USE_CUDA
+    if (!attentionParallel || !tpServingState || !tpServingState->verifyWidth ||
+        block_cnt > 64 || window != 128 || caches.empty()) return false;
+    auto &dp = *attentionParallel;
+    auto &plan = dp.servingPlan;
+    auto graph = plan.graph.lock();
+    if (!graph || !graph->captured || !plan.valid || plan.requests.size() != caches.size()) return false;
+    {
+        std::lock_guard<std::mutex> lock(tpRequestMutex);
+        if (tpCacheEpoch.load(std::memory_order_relaxed) != plan.epoch) return false;
+        for (size_t row = 0; row < caches.size(); ++row) {
+            const auto &request = plan.requests[row];
+            const auto &key = caches[row]->front().first;
+            auto id = tpRequestIds.find(&key);
+            if (id == tpRequestIds.end() || id->second != request.identity || request.key != &key ||
+                request.length != past[row] || key.dims[1] != past[row] || counts[row] < 0 ||
+                counts[row] > tpServingState->verifyWidth) return false;
+        }
+    }
+    for (int rank = 0; rank < (int)graph->ranks.size(); ++rank) {
+        auto &group = dp.servingGroups[dp.runtime.Layout().AttentionOwner(rank)];
+        const auto &nodes = graph->ranks[rank]->storage->commitGraphs;
+        if (nodes.lower_bound(group.sequenceIndices.size()) == nodes.end()) return false;
+    }
+    dp.runtime.Run([&](int rank, int) {
+        const auto &group = dp.servingGroups[dp.runtime.Layout().AttentionOwner(rank)];
+        auto &storage = *graph->ranks[rank]->storage;
+        std::vector<int> accepted;
+        for (int seq : group.sequenceIndices) {
+            if (seq >= (int)caches.size()) break; // padding follows real requests on each owner
+            accepted.push_back(past[seq]); accepted.push_back(counts[seq]);
+        }
+        if (accepted.empty()) return;
+        const auto node = storage.commitGraphs.lower_bound(accepted.size() / 2);
+        accepted.resize(node->first * 2, 0);
+        FastllmCudaCopyFromHostToDevice(storage.inputStorage.cudaData, accepted.data(), accepted.size() * sizeof(int));
+        AssertInFastLLM(FastllmCudaGraphLaunch(node->second), "Cannot replay verify KV commit");
+    });
+    ForSequenceRanges(tpWorkers, tpDevices, caches.size(), true, [&](int begin, int end) {
+        for (int seq = begin; seq < end; ++seq) {
+            const int committed = past[seq] + counts[seq];
+            if (past[seq] >= window - 1 && plan.lengthFields.size() == caches.size() &&
+                !plan.lengthFields[seq].empty()) {
+                plan.AdvanceRow(seq, counts[seq]);
+                plan.requests[seq].length = committed;
+                continue;
+            }
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (slidingLayers[layer] && past[seq] >= window - 1) continue;
+                const int length = slidingLayers[layer] ? std::min(committed, window - 1) : committed;
+                auto &pair = caches[seq]->at(layer);
+                for (Data *root : {&pair.first, &pair.second}) {
+                    for (const auto &entry : root->multiDeviceDatas) {
+                        auto &local = *entry.second;
+                        FastllmNaiveResizeKVLength(local, length, local.dims[2]);
+                        if (local.isPagedKVCache) local.lastPageLen = length ? (length - 1) % local.pageLen + 1 : 0;
+                    }
+                    FastllmNaiveResizeKVLength(*root, length, root->dims[2]);
+                }
+            }
+            plan.requests[seq].length = committed;
+        }
+    });
+    return true;
+#else
+    return false;
+#endif
+}
+
+void NaiveN05FlashModel::RememberVerifyCommit(
+        const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+        const std::vector<int> &past, const std::vector<int> &counts) {
+#ifdef USE_CUDA
+    if (!attentionParallel || !tpServingState || !tpServingState->verifyWidth) return;
+    auto &plan = attentionParallel->servingPlan;
+    if (!plan.valid || plan.requests.size() != caches.size()) return;
+    for (size_t row = 0; row < caches.size(); ++row) {
+        auto &request = plan.requests[row];
+        const auto &key = caches[row]->front().first;
+        if (request.key != &key || request.length != past[row] || key.dims[1] != past[row] + counts[row]) {
+            plan.valid = false;
+            return;
+        }
+        request.length = key.dims[1];
+    }
+#endif
+}
+
 void NaiveN05FlashModel::PrepareTensorParallelServing() {
 #ifdef USE_CUDA
-    if (tpServingState || !GetFastllmEnv().cudaGraph || !tpPrepared || draftEnabled ||
+    if (tpServingState || !GetFastllmEnv().cudaGraph || !tpPrepared || (draftEnabled && (!attentionParallel || sparseKv)) ||
         tpDevices.size() <= 1 || !tpSwaRingCache ||
         (!tpEp8MegaState && std::any_of(moeLayers.begin(), moeLayers.end(), [](int x) { return x != 0; })) ||
         dataType != BFLOAT16 || !FastllmNaiveAttentionKVType(kvCacheDataType) || !GetCudaEmbedding() ||
@@ -646,38 +737,58 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     serving->moeType = moeAtype;
     serving->kvType = kvCacheDataType;
     serving->generation = FastllmGetNcclGeneration();
-    const int maxRequests = std::min(maxBatch > 0 ? maxBatch : 256, MaxTPDecodeBatch);
+    const int maxRequests = draftEnabled ? (maxBatch > 0 ? maxBatch : 256) :
+        std::min(maxBatch > 0 ? maxBatch : 256, MaxTPDecodeBatch);
+    serving->verifyWidth = draftEnabled ? std::min(draftTokens, draftBlock) + 1 : 0;
+    if (draftEnabled && (serving->verifyWidth < 2 || serving->verifyWidth > 8)) return;
+    const int stride = std::max(1, serving->verifyWidth);
     const int64_t tokenBudget = tokensLimit > 0 ? tokensLimit : (int64_t)maxRequests * 16384;
-    serving->batchBuckets = DecodeGraphBatchBuckets(attentionParallel ?
-        std::min(maxRequests, MaxTPDecodeBatch / attentionDP) : maxRequests);
+    serving->batchBuckets = draftEnabled ? SpeculativeGraphBuckets(WindowRequestsPerGroup(maxRequests)) :
+        DecodeGraphBatchBuckets(attentionParallel ? std::min(maxRequests, MaxTPDecodeBatch / attentionDP) : maxRequests);
+    if (serving->batchBuckets.empty() || (int64_t)serving->batchBuckets.back() * attentionDP * stride > INT_MAX) return;
     if (attentionParallel) for (int &rows : serving->batchBuckets) rows *= attentionDP;
     const int maxRows = serving->batchBuckets.back();
     const int maxLocalRows = maxRows / attentionDP;
     const int attentionRanks = AttentionTPSize();
     std::vector<int> batches(serving->batchBuckets.rbegin(), serving->batchBuckets.rend());
-    int64_t scoreElements = 0;
     // The pool bounds the sum of live lengths, not each request's length by
     // the average. A ragged batch (including padded rows) may contain a long
     // request at any batch size, so every bucket needs the same length range.
-    const int limit = (int)std::min<int64_t>(max_positions, tokenBudget);
-    for (int rows : batches) {
+    const int modelLimit = contextPlan.effectiveLength > 0 ?
+        std::min(contextPlan.effectiveLength, max_positions) : max_positions;
+    const int limit = (int)std::min<int64_t>(draftEnabled ? modelLimit : max_positions, tokenBudget);
+    std::vector<int> capacities;
+    if (draftEnabled) {
+        // Match the existing batched verifier at K when a sparse graph is available.
+        // A context capped at or below K only needs the dense graph.
+        if (limit > indexTopK) capacities.push_back(indexTopK - 1);
+        capacities.push_back(limit);
+    } else {
         // Round the last bucket up; device live lengths bound KV reads.
-        std::vector<int> capacities{256, 2047};
+        capacities = {256, 2047};
         for (int64_t capacity = 4096; capacity / 2 < limit; capacity *= 2) {
             capacities.push_back((int)std::min<int64_t>(capacity, max_positions));
             if (capacity >= max_positions) break;
         }
+    }
+    const int64_t scoreElements = capacities.back() > 2048 ? (int64_t)maxLocalRows * stride * capacities.back() : 0;
+    // The shared arenas below use one-dimensional Data shapes with int extents.
+    if (scoreElements > INT_MAX || (draftEnabled && (int64_t)maxRows * stride * embed_dim > INT_MAX) ||
+        (indexerContextSharding && (int64_t)maxLocalRows * stride * attentionRanks * indexTopK * 2 > INT_MAX)) return;
+    for (int rows : batches) {
         for (int capacity : capacities) {
             auto state = std::make_shared<TPDecodeState>();
             state->devices = tpDevices;
-            state->rows = rows;
+            state->rows = rows * stride;
+            state->verifying = state->collectHidden = draftEnabled;
+            state->dynamicCache = draftEnabled;
+            if (draftEnabled) state->sequenceRows.assign(rows, stride);
             state->capacity = capacity;
             state->ncclGeneration = serving->generation;
             state->selection.count = attentionParallel ? 0 : 1;
             state->selection.greedy = true;
             if (attentionParallel) state->sequenceCapacities.assign(rows, capacity);
             serving->graphs.emplace(std::make_pair(rows, capacity), state);
-            if (capacity > 2048) scoreElements = std::max(scoreElements, (int64_t)(rows / attentionDP) * capacity);
         }
     }
     // All graph variants alias one scratch sized for the largest shape;
@@ -686,7 +797,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         FastllmCudaSetDevice(tpDevices[rank]);
         if (!FastllmCudaNaiveDecodeGraphSupported()) return;
         auto storage = std::make_shared<TPDecodeState::Storage>();
-        storage->maxRows = maxRows;
+        storage->maxRows = maxRows * stride;
         if (attentionParallel) storage->gatherReady = FastllmCudaEventCreate();
         storage->hostCache.resize((size_t)block_cnt * maxLocalRows * (HasSeparateIndexer() ? 8 : 4));
         auto allocate = [&](Data &data, DataType type, int elements) {
@@ -708,7 +819,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         } else allocate(storage->cacheTable, INT32, tableElements);
         allocate(storage->indexScores, INT32, (int)scoreElements);
         if (indexerContextSharding)
-            allocate(storage->indexExchange, INT32, maxLocalRows * attentionRanks * indexTopK * 2);
+            allocate(storage->indexExchange, INT32, maxLocalRows * stride * attentionRanks * indexTopK * 2);
         storage->buffers.cacheTable = (const void *const *)storage->cacheTable.cudaData;
         storage->buffers.tableRows = maxLocalRows;
         if (!attentionParallel && !sparseKv && kvCacheDataType == BFLOAT16 && FastllmCudaNaiveDSAMapsSupported() && full.headDim == 192 && full.valueDim == 128 &&
@@ -720,7 +831,13 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         for (int i = 0; i < maxLocalRows; ++i) storage->buffers.sequences.emplace_back(new TargetWorkspace());
         for (auto &entry : serving->graphs) {
             auto r = std::make_unique<TPDecodeState::Rank>(storage);
-            r->features.collectHidden = false;
+            r->features.verifying = r->features.collectHidden = draftEnabled;
+            if (draftEnabled && rank == 0) for (int layer : draftTargetLayers) {
+                auto &backing = storage->features[layer];
+                if (backing.dims.empty()) allocate(backing, BFLOAT16, storage->maxRows * embed_dim);
+                auto &feature = r->features.hidden[layer];
+                feature.FakeFrom(backing, 0); feature.Resize({1, entry.second->rows, embed_dim});
+            }
             entry.second->ranks.push_back(std::move(r));
         }
     }
@@ -811,13 +928,17 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             std::vector<std::pair<Data *, Data *>> pointers;
             for (int i = 0; i < rows * block_cnt; ++i)
                 pointers.emplace_back(&roots[i].first, &roots[i].second);
-            std::vector<int> lengths(rows, 1);
+            std::vector<int> lengths(rows, stride);
             std::vector<GenerationConfig> configs(rows, config);
             TargetBatch batch{pointers, configs, lengths, block_cnt};
-            Data ids(FLOAT32, {1, rows}, std::vector<float>(rows, 1.0f));
-            Data positions(FLOAT32, {1, rows}, std::vector<float>(rows, 2.0f));
+            Data ids(FLOAT32, {1, state.rows}, std::vector<float>(state.rows, 1.f));
+            std::vector<float> pos(state.rows);
+            for (int i = 0; i < state.rows; ++i) pos[i] = 2 + i % stride;
+            Data positions(FLOAT32, {1, state.rows}, pos);
             auto selection = SelectLogits(config);
-            ForwardTensorParallel(ids, positions, empty, config, nullptr, &selection, &batch);
+            TargetCapture features;
+            features.verifying = features.borrowOutputs = draftEnabled;
+            ForwardTensorParallel(ids, positions, empty, config, draftEnabled ? &features : nullptr, &selection, &batch);
         }
     }
     serving->preparing = false;
@@ -833,6 +954,33 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         auto &state = *entry.second;
         state.active = false;
         if (state.captured && !state.disabled) ++captured;
+    }
+    if (captured && draftEnabled && block_cnt <= 64 && window == 128) {
+        uint64_t slidingMask = 0;
+        for (int layer = 0; layer < block_cnt; ++layer) if (slidingLayers[layer]) slidingMask |= uint64_t(1) << layer;
+        const int kvHeads = std::max(1, sliding.kvHeads / AttentionTPSize());
+        const int bytes = AuxiliaryKVType() == FP8_E4M3 ? 1 : 2;
+        const int kc = kvHeads * sliding.headDim * bytes, vc = kvHeads * sliding.valueDim * bytes;
+        if (slidingMask && kc % 16 == 0 && vc % 16 == 0) {
+            // The commit uses the verifier's fixed table and its now-dead input
+            // arena. It needs a single kernel node; the device table carries all
+            // request addresses, lengths, and accepted counts between launches.
+            attentionParallel->runtime.Run([&](int rank, int) {
+                auto &storage = *serving->graphs.begin()->second->ranks[rank]->storage;
+                if (!storage.inputStorage.cudaData || !storage.buffers.cacheTable) return;
+                for (int bucket : serving->batchBuckets) {
+                    const int rows = bucket / attentionDP;
+                    void *graph = nullptr, *exec = nullptr;
+                    if (!FastllmCudaGraphBeginCapture()) break;
+                    FastllmCudaNaiveCommitBoundSwa(storage.buffers.cacheTable, (const int *)storage.inputStorage.cudaData,
+                        rows, block_cnt, slidingMask, storage.buffers.tableRows * (HasSeparateIndexer() ? 8 : 4), kc, vc);
+                    bool ok = FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec);
+                    FastllmCudaGraphDestroy(graph);
+                    if (!ok) { FastllmCudaGraphExecDestroy(exec); break; }
+                    storage.commitGraphs.emplace(rows, exec);
+                }
+            });
+        }
     }
     bool dpPipelineReady = false;
     if (captured && attentionParallel && attentionParallel->samplingCapacity) {
@@ -872,7 +1020,7 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
         pipelineShapes += ready;
     }
     serving->pipelineReady = pipelineShapes != 0;
-    if (attentionParallel) printf("[Naive decode pipeline] prepared %zu/%zu shapes across all DP ranks; unavailable shapes use ordinary decoding.\n",
+    if (attentionParallel && !draftEnabled) printf("[Naive decode pipeline] prepared %zu/%zu shapes across all DP ranks; unavailable shapes use ordinary decoding.\n",
            pipelineShapes, serving->graphs.size());
     printf("[Naive CUDA Graph] prepared %zu/%zu shapes, batch <= %d, shared Indexer scratch %.2f MiB/GPU. Serving only replays prepared shapes.\n",
         captured, serving->graphs.size(), maxRows, scoreElements * 4 / 1048576.0);
@@ -1535,9 +1683,10 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     // buffers alive across requests, but only replay after validating all KV
     // addresses/capacities and the collective generation below.
     if (tpDecodeState) tpDecodeState->active = false;
-    if (tpServingState && !verifying && attentionParallel)
+    if (tpServingState && attentionParallel &&
+        (attentionParallel->servingPadded || (!tpServingState->verifyWidth && !verifying)))
         return PrepareAttentionParallelServingDecode(batch);
-    if (tpServingState && !verifying)
+    if (tpServingState && !tpServingState->verifyWidth && !verifying)
         return PrepareTensorParallelServingDecode(inputIds, selection, cacheLengths, batch, collectHidden);
     if (inputIds.dims.size() != 2) return false;
     const int rows = verifying ? inputIds.dims[1] : batch ? batch->Size() : 1;
@@ -2017,6 +2166,11 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
     const int actualRows = state.verifying ? inputIds.dims[1] : batch ? batch->Size() : state.rows;
     auto liveLengths = [&]() {
         std::vector<int> lengths(state.rows);
+        if (attentionParallel && attentionParallel->verifyLengths) {
+            const float *pos = (const float *)positions.cpuData;
+            for (int i = 0; i < actualRows; ++i) lengths[i] = int(pos[i]) + 1;
+            return lengths;
+        }
         int offset = 0;
         for (int sequence = 0; sequence < (batch ? batch->Size() : 1); ++sequence) {
             if (attentionParallel && attentionParallel->servingPadded &&
@@ -2954,12 +3108,16 @@ struct NaiveN05FlashModel::DraftHeadState {
 #endif
 
 Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
-    // Separate branch-local return objects would copy the borrowed GPU logits.
     Data output;
+    RunDraftHead(hidden, output);
+    return output;
+}
+
+void NaiveN05FlashModel::RunDraftHead(Data &hidden, Data &output) {
     if (tpDevices.empty()) {
         if (hidden.dims[1] > 1) MatMulTransB(hidden, weight["lm_head.weight"], output);
         else Linear(hidden, weight["lm_head.weight"], Data(), output);
-        return output;
+        return;
     }
 #ifdef USE_CUDA
     const int rows = hidden.dims[1], vocab = weight["lm_head.weight"].dims[0];
@@ -3027,7 +3185,7 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
         // so rank workers cannot overwrite the joined logits too early.
         output.FakeFrom(tpDraftHeadOutput, 0);
         output.Resize(tpDraftHeadOutput.dims);
-        return output;
+        return;
     }
     // Copy once before workers consume the owner stream's result. Each worker
     // owns its inputs and the existing vocabulary shard; no extra full head.
@@ -3066,9 +3224,6 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
     }
     ApplyDraftDevice();
     output.ToDevice(DataDevice::CUDA, std::vector<int>{tpDevices.front()});
-    return output;
-#else
-    return output;
 #endif
 }
 
