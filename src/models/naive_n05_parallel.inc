@@ -485,6 +485,12 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         auto &local = state.ranks[rank];
         Data logits;
         if (graphDecode) {
+            std::optional<FastllmCudaAllocationRecorder> recorder;
+            if (state.servingPadded && tpServingState->preparing && tpDecodeState->mode == TPDecodeState::Warm) {
+                auto &requests = tpDecodeState->ranks[rank]->captureAllocations;
+                requests.clear();
+                recorder.emplace(&requests);
+            }
             logits = ForwardTensorParallelDecode(rank, inputIds, positions, kv, config,
                 nullptr, &captures[rank], nullptr, batch, true);
             if (tpDecodeState->mode == TPDecodeState::Prepare ||
@@ -564,10 +570,18 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (graphDecode && tpDecodeState->warmed && !tpDecodeState->captured && !tpDecodeState->disabled &&
         (!tpServingState || !tpServingState->preparing || tpServingState->capturing)) {
         auto &graph = *tpDecodeState;
+        // These prewarmed variants share rank buffers and replay serially. Use
+        // the same family identity for reservation, capture and pool pinning.
+        const void *family = state.servingPadded ? graph.ranks.front()->storage.get() : nullptr;
+        FastllmCudaGraphScratchGroup group(family);
         graph.mode = TPDecodeState::Prepare;
         state.runtime.Run(forwardRank);
         state.runtime.Run([&](int rank, int) {
-            graph.ranks[rank]->ok = FastllmCudaGraphPrepareCaptureDevice();
+            FastllmCudaGraphScratchGroup group(family);
+            auto &r = *graph.ranks[rank];
+            r.ok = FastllmCudaGraphPrepareCaptureDevice() &&
+                (r.captureAllocations.empty() || FastllmCudaReserveGraphWorkspace(r.captureAllocations));
+            r.captureAllocations.clear();
         });
         bool ok = std::all_of(graph.ranks.begin(), graph.ranks.end(), [](const auto &r) { return r->ok; });
         bool pool = ok && FastllmCudaGraphMemoryPoolBegin();
@@ -580,6 +594,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             int arrived = 0;
             std::vector<int> begun(tpDevices.size(), 0);
             state.runtime.Run([&](int rank, int device) {
+                FastllmCudaGraphScratchGroup group(family);
                 FastllmCudaClearThreadError();
                 begun[rank] = FastllmCudaGraphBeginCapture();
                 {

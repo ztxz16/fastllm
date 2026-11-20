@@ -82,6 +82,7 @@ struct NaiveN05FlashModel::TPDecodeState {
         void *graph = nullptr, *exec = nullptr;
         bool ok = true;
         std::vector<void *> communicationPointers;
+        std::vector<size_t> captureAllocations;
     };
     std::vector<int> devices;
     std::vector<std::unique_ptr<Rank>> ranks;

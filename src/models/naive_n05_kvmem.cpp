@@ -18,7 +18,7 @@ void NaiveN05FlashModel::ConfigureKvMem(const KvMemConfig &config) {
     throw std::invalid_argument("MiMo KVMem requires CUDA");
 #else
     if (tpDevices.size() < 2 || GetKVCacheInCPU() || dataType != BFLOAT16 ||
-        !FastllmNaiveAttentionKVType(kvCacheDataType) || maxBatch < 1 || maxBatch > MaxTPDecodeBatch)
+        !FastllmNaiveAttentionKVType(kvCacheDataType) || maxBatch < 1 || maxBatch > 512)
         throw std::invalid_argument("MiMo KVMem requires CUDA TP, BF16 compute, BF16/FP8/FP4 DSA KV, explicit max_batch in [1,512]");
     if (draftEnabled && kvCacheDataType == FP4_E2M1)
         throw std::invalid_argument("MiMo FP4 DSA KV does not support draft decoding");

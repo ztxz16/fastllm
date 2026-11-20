@@ -12,9 +12,11 @@
 #include <cstring>
 #include <set>
 #include <numeric>
+#include <optional>
 #ifdef USE_CUDA
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
@@ -322,9 +324,15 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         root.ClearTensorParallelLayout();
     };
     AssertInFastLLM(FastllmInitNccl(tpDevices), "Naive TP: NCCL initialization failed.");
-    if (attentionDP > 1 && !attentionParallel)
-        attentionParallel = std::make_shared<AttentionParallelState>(
+    if (attentionDP > 1 && !attentionParallel) {
+        auto state = std::make_shared<AttentionParallelState>(
             parallel::Topology(tpDevices, attentionDP, tpEp8Mega ? ranks : 1));
+        // Dense TP spans the whole world, so every rank must select the same collective.
+        std::vector<int> architectures(ranks);
+        state->runtime.Run([&](int rank, int) { architectures[rank] = FastllmCudaRuntimeArch(); });
+        state->stablePrefillReduction = AttentionParallelState::SupportsStablePrefillReduction(architectures);
+        attentionParallel = std::move(state);
+    }
     const int attentionRanks = AttentionTPSize();
     auto attentionScheme = [&](int total) {
         AssertInFastLLM(total % attentionRanks == 0, "Naive attention projection width must divide group TP.");
@@ -497,7 +505,8 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         }
     }
     tpIndexerPeerAccess = indexerLayerSharding && tpEp8MegaState && FastllmCudaPeerAccessInit(tpDevices);
-    tpSwaRingCache = GetFastllmEnv().cudaGraph && FastllmNaiveKVType(AuxiliaryKVType()) &&
+    tpSwaRingCache = (GetFastllmEnv().cudaGraph || (attentionDP > 1 && !draftEnabled)) &&
+        FastllmNaiveKVType(AuxiliaryKVType()) &&
         window == 128 && sliding.headDim == 192 && sliding.valueDim == 128 &&
         (attentionDP > 1 || sliding.heads / ranks < 64);
     AssertInFastLLM(!indexerContextSharding || (indexFp8 && indexHeads == 16 &&
@@ -744,6 +753,13 @@ void NaiveN05FlashModel::RememberVerifyCommit(
 #endif
 }
 
+std::vector<int> NaiveN05FlashModel::LocalServingGraphBuckets(int maxRequests) const {
+    // Ordinary decode admits at most this many live requests to each KV owner.
+    // Speculative verification also uses the owner's reserved window slots.
+    return draftEnabled ? SpeculativeGraphBuckets(WindowRequestsPerGroup(maxRequests)) :
+        DecodeGraphBatchBuckets(RunningRequestsPerGroup(maxRequests));
+}
+
 void NaiveN05FlashModel::PrepareTensorParallelServing() {
 #ifdef USE_CUDA
     if (tpServingState || !GetFastllmEnv().cudaGraph || !tpPrepared || (draftEnabled && (!attentionParallel || sparseKv)) ||
@@ -759,14 +775,12 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     serving->moeType = moeAtype;
     serving->kvType = kvCacheDataType;
     serving->generation = FastllmGetNcclGeneration();
-    const int maxRequests = draftEnabled ? (maxBatch > 0 ? maxBatch : 256) :
-        std::min(maxBatch > 0 ? maxBatch : 256, MaxTPDecodeBatch);
+    const int maxRequests = maxBatch > 0 ? maxBatch : 256;
     serving->verifyWidth = draftEnabled ? std::min(draftTokens, draftBlock) + 1 : 0;
     if (draftEnabled && (serving->verifyWidth < 2 || serving->verifyWidth > 8)) return;
     const int stride = std::max(1, serving->verifyWidth);
     const int64_t tokenBudget = tokensLimit > 0 ? tokensLimit : (int64_t)maxRequests * 16384;
-    serving->batchBuckets = draftEnabled ? SpeculativeGraphBuckets(WindowRequestsPerGroup(maxRequests)) :
-        DecodeGraphBatchBuckets(attentionParallel ? std::min(maxRequests, MaxTPDecodeBatch / attentionDP) : maxRequests);
+    serving->batchBuckets = LocalServingGraphBuckets(maxRequests);
     if (serving->batchBuckets.empty() || (int64_t)serving->batchBuckets.back() * attentionDP * stride > INT_MAX) return;
     if (attentionParallel) for (int &rows : serving->batchBuckets) rows *= attentionDP;
     const int maxRows = serving->batchBuckets.back();
@@ -1744,7 +1758,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     // The verification kernels accept every block length up to eight, including
     // shortened rounds near an output limit. Key the graph by its actual shape.
     if (verifying && !batch && (rows < 1 || rows > 8)) return false;
-    const int maxBatchRows = tpEp8MegaState ? MaxTPDecodeBatch : 8;
+    const int maxBatchRows = tpEp8MegaState ? (maxBatch > 0 ? maxBatch : 512) : 8;
     if (batch && ((!verifying && !batch->Decode()) || batch->Size() > maxBatchRows)) return false;
     const std::vector<int> sequenceRows = batch ? batch->lengths : std::vector<int>{rows};
     if (verifying && std::any_of(sequenceRows.begin(), sequenceRows.end(),
@@ -2366,16 +2380,23 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
 #endif
         RunTarget(buf.inputIds, buf.positions, kv, config,
                   state.verifying || state.collectHidden ? &r.features : nullptr, rank, embedding, &buf, batch);
-        if (FastllmCudaMergeMOEUsedGraphUnsafeFallback()) r.ok = false;
+        const bool unsafeMoe = FastllmCudaMergeMOEUsedGraphUnsafeFallback();
+        if (unsafeMoe) r.ok = false;
         if (state.selection.count)
             FastllmCudaNaiveLogitsSelect(buf.logits, tpVocabRanges[rank].first,
                 state.selection.count, state.selection.greedy, state.selection.invTemperature,
                 storage.logitsPartial, storage.logitsCandidates);
         if (state.mode == TPDecodeState::Capture) {
-            bool clean = !FastllmCudaGetThreadError();
-            r.ok = FastllmCudaGraphEndCapture(&r.graph) && clean && r.ok;
-            if (!r.ok) fprintf(stderr, "[Fastllm] Naive TP graph rank %d: %s\n", rank,
-                               FastllmCudaGraphLastError());
+            const bool operatorError = FastllmCudaGetThreadError();
+            const bool ended = FastllmCudaGraphEndCapture(&r.graph);
+            r.ok = ended && !operatorError && r.ok;
+            if (!r.ok) {
+                const char *reason = !ended ? FastllmCudaGraphLastError() :
+                    operatorError ? "operator reported a capture error" :
+                    unsafeMoe ? "MoE used a graph-unsafe fallback" : "communication buffer changed after warmup";
+                fprintf(stderr, "[Fastllm] Naive TP graph rank %d, rows %d, KV capacity %d: %s\n",
+                        rank, state.rows, state.capacity, reason);
+            }
             return output;
         }
     }
