@@ -436,9 +436,12 @@ struct PDRuntime {
         prefillCV.notify_all();
         if (prefillThread.joinable()) prefillThread.join();
     }
-    size_t CachedTokens(basellm &model, const std::vector<int> &input) {
-        return residentPrefix ? model.PreviewPDResidentPrefix(input) :
-               cache ? cache->ProbeTokens(identity, input) : 0;
+    size_t CachedTokens(basellm &model, const std::vector<int> &input, const std::string &session) {
+        if (residentPrefix) {
+            const int group = sessions->LocalGroup(session, model.PDGroupCount(), false);
+            return model.PreviewPDResidentPrefix(input, group);
+        }
+        return cache ? cache->ProbeTokens(identity, input) : 0;
     }
     double HostRestoreBytesPerSecond() const {
         const auto stats = hostCache ? hostCache->Stats() : fastkv::HostCache::Statistics{};
@@ -573,19 +576,11 @@ struct PDRuntime {
         if (!available) for (auto &e : pending.estimates) e = {};
         // All D ranks discover committed placement from producer probes. Only
         // new sessions or expired metadata fall back to rendezvous hashing.
-        size_t preferred = SIZE_MAX;
-        uint64_t highest = 0;
-        if (!pending.sessionKey.empty()) for (size_t i = 0; i < peers.size(); ++i) {
-            uint64_t hash = 14695981039346656037ULL;
-            for (unsigned char c : pending.sessionKey + std::string(1, '\0') + peers[i])
-                hash = (hash ^ c) * 1099511628211ULL;
-            if (preferred == SIZE_MAX || hash > highest) { preferred = i; highest = hash; }
-        }
         auto placement = sessions->Get(pending.sessionKey);
         auto owner = std::find(peers.begin(), peers.end(), placement.owner);
-        const bool owned = placement.version && owner != peers.end();
-        if (owned) preferred = owner - peers.begin();
-        auto chosen = router->Reserve(pending.length, pending.estimates, preferred, owned);
+        const size_t preferred = placement.version && owner != peers.end() ? size_t(owner - peers.begin()) :
+            fastkv::PrefillRouter::SessionPeer(pending.sessionKey, peers);
+        auto chosen = router->Reserve(pending.length, pending.estimates, preferred, preferred != SIZE_MAX);
         const auto probeKind = pending.probeKinds[chosen.peer];
         if (!pending.sessionKey.empty() && probeKind >= 6) {
             Check(placement.version < UINT64_MAX, "session placement version exhausted");
@@ -855,7 +850,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                                       << " cache_tier=l2 restore_ms=" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - request->restoreBegin).count()
                                       << " bytes=" << request->hostHit.Bytes() << " cache_bytes=" << stats.bytes
                                       << " entries=" << stats.entries << " d2h_bytes=" << stats.copiedToHost
-                                      << " reused_bytes=" << stats.reusedBytes << std::endl;
+                                      << " reused_bytes=" << stats.reusedBytes << " group=" << model.PDRequestGroup(context) << std::endl;
                         }
                         if (size_t(context.preTokens) == request->input.size()) {
                             const auto reservation = request->reservation;
@@ -912,6 +907,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     auto &context = *request->context;
                     context.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
                     context.requestMetadata = request->metadata;
+                    context.pdPrefillGroup = sessions->LocalGroup(request->metadata.sessionKey, model.PDGroupCount(), true);
                     context.currentTokens = context.allTokens = request->input;
                     context.inputTokens = request->input.size();
                     context.generationConfig.top_k = 1;
@@ -930,7 +926,8 @@ void PDRuntime::RunPrefill(basellm &model) {
                         auto latest = hostCache->Find(identity, request->input);
                         if (latest.Tokens() > request->hostHit.Tokens()) request->hostHit = std::move(latest);
                     }
-                    const size_t residentTokens = request->hostHit && residentPrefix ? size_t(model.PreviewPDResidentPrefix(request->input)) : hit.tokens;
+                    const size_t residentTokens = request->hostHit && residentPrefix
+                        ? model.PreviewPDResidentPrefix(request->input, model.PDRequestGroup(context)) : hit.tokens;
                     // A few extra cached tail tokens do not justify restoring
                     // an entire host checkpoint when L1 already covers the prefix.
                     const bool useHost = request->hostHit.Tokens() > residentTokens &&
@@ -967,7 +964,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                                   << " cache_entries=" << stats.entries << " cache_bytes=" << stats.bytes
                                   << " cache_logical_bytes=" << stats.logicalBytes
                                   << " cache_evictions=" << stats.evictions
-                                  << " resident_gpu=" << residentPrefix << std::endl;
+                                  << " resident_gpu=" << residentPrefix << " group=" << model.PDRequestGroup(context) << std::endl;
                         std::cout << "[FastKV PD timing] restore_ms="
                                   << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - restoreBegin).count()
                                   << std::endl;
@@ -1370,7 +1367,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 Check(!tokens.empty() && tokens.size() < size_t(max_positions), "invalid routing prompt");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds routing peer capacity");
                 fastkv::Writer writer;
-                writer.U32(kind); writer.U64(raw->CachedTokens(*this, tokens));
+                writer.U32(kind); writer.U64(raw->CachedTokens(*this, tokens, session));
                 writer.U64(raw->workload->tokens.load());
                 writer.U64(uint64_t(std::max(1.0, raw->workload->tokensPerSecond.load())));
                 if (kind >= 6) {

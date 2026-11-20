@@ -358,8 +358,9 @@ class PrefillRouter {
         std::shared_ptr<void> lease;
     };
     explicit PrefillRouter(size_t peers);
+    static size_t SessionPeer(const std::string &key, const std::vector<std::string> &peers);
     Route Reserve(size_t tokens, const std::vector<Estimate> &estimates, size_t preferred = SIZE_MAX,
-                  bool owned = false);
+                  bool pinPreferred = false);
     std::vector<size_t> Pending() const;
   private:
     struct State;
@@ -376,6 +377,8 @@ class SessionDirectory {
     Record Get(const std::string &key) const;
     bool Update(const std::string &key, const Record &record);
     static bool Newer(const Record &a, const Record &b);
+    // Replica-local DP ownership. Read-only routing probes never allocate a group.
+    int LocalGroup(const std::string &key, int groups, bool assign);
   private:
     struct Impl;
     std::unique_ptr<Impl> impl;

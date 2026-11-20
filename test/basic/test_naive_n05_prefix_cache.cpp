@@ -377,6 +377,27 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         }
     }
 
+    static void PDGroupPreview() {
+        NaiveN05PrefixCacheTestAccess model(3), fullOnly(3);
+        model.tpDevices = {7};
+        auto warm = model.Request(1);
+        warm->pastKeyValues[0].first.dataDeviceIds = {7};
+        model.Checkpoint(*warm, 0, 8192);
+        model.Publish(*warm);
+        model.Drain(*warm);
+
+        // The other group has identical full-KV pages, but no SWA checkpoint.
+        auto cold = fullOnly.Request(1);
+        fullOnly.Publish(*cold);
+        fullOnly.Drain(*cold);
+        model.tpPagedCaches.insert(model.tpPagedCaches.begin(), std::move(fullOnly.tpPagedCaches.front()));
+        model.tpDevices = {3, 7};
+        model.attentionDP = 2;
+        Require(model.PreviewPDResidentPrefix(warm->currentTokens, 0) == 0, "borrowed another group's SWA");
+        Require(model.PreviewPDResidentPrefix(warm->currentTokens, 1) == 8192, "missed the owning group's prefix");
+        Require(model.PreviewPDResidentPrefix(warm->currentTokens) == 8192, "unknown session missed a warm group");
+    }
+
     static void PressureTelemetry() {
         for (bool fullPressure : {false, true}) {
             NaiveN05PrefixCacheTestAccess model(3);
@@ -519,6 +540,7 @@ int main() {
         fastllm::NaiveN05PrefixCacheTestAccess::EvictCompletedOnly();
         fastllm::NaiveN05PrefixCacheTestAccess::SharedReplacement();
         fastllm::NaiveN05PrefixCacheTestAccess::RollingConversations();
+        fastllm::NaiveN05PrefixCacheTestAccess::PDGroupPreview();
         fastllm::NaiveN05PrefixCacheTestAccess::PressureTelemetry();
         fastllm::NaiveN05PrefixCacheTestAccess::AlignedExactRepeat();
         fastllm::NaiveN05PrefixCacheTestAccess::PartialTailEviction();

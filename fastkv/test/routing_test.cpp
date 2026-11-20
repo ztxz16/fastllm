@@ -63,26 +63,35 @@ int main() {
 
         quotes[0] = {}; quotes[1] = {};
         quotes[0].cachedTokens = quotes[1].cachedTokens = 9900;
-        quotes[1].pendingTokens = 10000;
-        for (int i = 0; i < 32; ++i)
-            Check(router.Reserve(10000, quotes, 1, true).peer == 1,
-                  "one prefill batch's imbalance moved a committed session");
-        quotes[1].pendingTokens = 100000;
-        Check(router.Reserve(10000, quotes, 1, true).peer == 1, "transient overload moved a session");
-        PrefillRouter longSessions(2);
-        auto longQuotes = quotes; longQuotes[1].pendingTokens = 2000000;
-        Check(longSessions.Reserve(100000, longQuotes, 1, true).peer == 1,
-              "long-prefix migration ignored rebuild time");
-        std::this_thread::sleep_for(1050ms);
-        Check(longSessions.Reserve(100000, longQuotes, 1, true).peer == 1,
-              "one batch wave moved a long session before its rebuild interval");
-        Check(router.Reserve(10000, quotes, 1, true).peer == 0, "persistent overload cannot migrate");
+        quotes[1].pendingTokens = 2000000;
+        Check(router.Reserve(100000, quotes, 1, true).peer == 1, "queue pressure moved a live session");
         quotes[1].available = false;
         Check(router.Reserve(10000, quotes, 1, true).peer == 0, "failed owner cannot fail over");
         quotes[1] = {};
-        Check(router.Reserve(10000, quotes, 1, true).peer == 0,
-              "lost owner prefix forced recomputation despite a warm producer");
+        Check(router.Reserve(10000, quotes, 1, true).peer == 1,
+              "a cold cache estimate moved a healthy session");
+        quotes[1].tokensPerSecond = std::numeric_limits<double>::quiet_NaN();
+        Check(router.Reserve(10000, quotes, 1, true).peer == 0, "pinned an invalid owner estimate");
 
+        std::vector<std::string> peers{"machine:18343", "machine:18347"};
+        std::vector<std::string> reverse{peers[1], peers[0]};
+        int onFirst = 0;
+        for (int i = 0; i < 512; ++i) {
+            auto key = "tool-session-" + std::to_string(i);
+            const size_t peer = PrefillRouter::SessionPeer(key, peers);
+            Check(peers[peer] == reverse[PrefillRouter::SessionPeer(key, reverse)], "decoder order changed session owner");
+            onFirst += peer == 0;
+        }
+        Check(onFirst > 200 && onFirst < 312, "new sessions piled up on one endpoint");
+        Check(PrefillRouter::SessionPeer("", peers) == SIZE_MAX, "anonymous request was pinned");
+        SessionDirectory groups(2);
+        Check(groups.LocalGroup("a", 4, false) == -1, "probe assigned a DP group");
+        Check(groups.LocalGroup("a", 4, true) == 0 && groups.LocalGroup("a", 4, true) == 0 &&
+              groups.LocalGroup("b", 4, true) == 1, "turns advanced the session round robin");
+        groups.Update("a", {1, "p0"});
+        Check(groups.LocalGroup("a", 4, false) == 0, "placement announcement lost the local group");
+        Check(groups.LocalGroup("c", 4, true) == 2 && groups.LocalGroup("b", 4, false) == -1,
+              "group mapping exceeded the directory bound");
         SessionDirectory directory(2);
         Check(directory.Update("a", {1,"p0"}), "first placement missing");
         Check(directory.Update("a", {2,"p1"}), "migration missing");

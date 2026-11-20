@@ -509,6 +509,8 @@ bool NaiveN05FlashModel::SelectPDRequestGroup(ResponseContext &context,
     CheckPD(available.size() == size_t(attentionDP), "invalid PD group budgets");
     const int previous = PDRequestGroup(context);
     if (available.at(previous) >= required && TryAdmitResponseContext(&context)) return true;
+    // A full session lane queues until its budget or SWA slot is released.
+    if (context.pdPrefillGroup >= 0) return false;
     if (!context.pastKeyValues.empty() && context.pastKeyValues.front().first.kvStorageOwner) return false;
     int group = -1;
     for (int g = 0; g < attentionDP; ++g)

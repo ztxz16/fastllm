@@ -1019,7 +1019,9 @@ static void TestLoadAwareRouting() {
         temporary.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
         return temporary.Address();
     };
-    const auto a = endpoint(), b = endpoint();
+    auto a = endpoint(), b = endpoint();
+    const std::string session = "queued-3";
+    if (fastkv::PrefillRouter::SessionPeer(session, {a, b}) != 0) std::swap(a, b);
     SetMaxTokens(65536);
     BatchStateModel p0, p1;
     p0.maxBatch = p1.maxBatch = 2;
@@ -1047,20 +1049,21 @@ static void TestLoadAwareRouting() {
         Check(!context.isEnding && context.preTokens == 2, "routing stranded a request");
         Check(((float *)context.pastKeyValues[0].first.cpuData)[0] == 11, "routing changed KV state");
     };
-    run("queued-3");
+    run();
     Check(p1.forwards == 0 && p1.batches == 0, "routing ignored P0 resident cache");
+    run(session);
     p0.hold = true;
     auto first = submit(a, std::vector<int>(2048, 11)), second = submit(a, std::vector<int>(2048, 21));
     for (int i = 0; i < 3000 && !p0.entered; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     Check(p0.entered, "routing fixture did not saturate P0");
     try { run(); } catch (...) { p0.hold = false; throw; }
-    Check(p1.forwards + p1.batches > 0, "warm affinity blocked behind saturated P0");
+    Check(p1.forwards + p1.batches > 0, "anonymous request blocked behind saturated P0");
     p0.hold = false; (void)first.get(); (void)second.get();
     p0.StopPD();
     // The old owner is unreachable. The live peer may satisfy this entirely
     // from its prefix cache, so require correct completion, not extra forward.
-    run("queued-3");
+    run(session);
     decode.StopPD(); p0.StopPD(); p1.StopPD();
     Check(p0.live == 0 && p1.live == 0, "routing leaked producer contexts");
     std::cout << "PASS PD live-prefix routing, saturated/dead producer bypass and cross-peer state correctness\n";
