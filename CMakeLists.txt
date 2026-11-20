@@ -4463,6 +4463,19 @@ if (FASTLLM_MIMO_EP8_MEGA_ENABLED AND ("100" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR 
             ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/deep_gemm_blackwell)
 endif()
 
+foreach(asset IN ITEMS demo.html openapi.json)
+    configure_file("tools/qwen_image/${asset}" "${CMAKE_BINARY_DIR}/tools/ftllm/qwen_image_assets/${asset}" COPYONLY)
+endforeach()
+foreach(asset IN ITEMS demo.html server.py)
+    configure_file("tools/lingbot_world/${asset}" "${CMAKE_BINARY_DIR}/tools/ftllm/lingbot_world_assets/${asset}" COPYONLY)
+endforeach()
+
+foreach(duo_asset IN ITEMS live.html avc-player.js presets/default.txt
+                           presets/default-256x192.bf16 presets/default-512x384.bf16)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tools/duo/${duo_asset}"
+                   "${CMAKE_BINARY_DIR}/tools/ftllm/duo_assets/${duo_asset}" COPYONLY)
+endforeach()
+
 if (USE_CUDA AND NOT USE_ROCM)
     # A package-only update must refresh the POST_BUILD copy as well.
     set_property(TARGET fastllm_tools APPEND PROPERTY LINK_DEPENDS

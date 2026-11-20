@@ -3,8 +3,13 @@
               <button id="studio-chat-tab" class="secondary-button" type="button">对话 / 工作区</button>
               <button id="studio-video-tab" class="secondary-button" type="button">视频生成</button>
               <button id="studio-image-tab" class="secondary-button" type="button">图像生成</button>
+              <button id="studio-demo-tab" class="secondary-button hidden" type="button">交互 Demo</button>
+              <select id="studio-demo-service" class="hidden" aria-label="交互服务"></select>
               <label id="studio-chat-select-label">对话模型 <select id="studio-chat-select" aria-label="对话模型"></select></label>
             </div>
+            <section id="interactive-studio" class="hidden" aria-label="交互 Demo">
+              <p id="interactive-error" role="status" hidden></p>
+            </section>
             <section id="video-studio" class="video-studio hidden" aria-label="视频生成工作室"></section>
             <section id="image-studio" class="image-studio hidden" aria-label="图像生成工作室"></section>
             <section id="agent-runtime-card" class="agent-runtime-card hidden" aria-label="Pi 智能体运行时">

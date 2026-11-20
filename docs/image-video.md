@@ -11,9 +11,9 @@ FastLLM 提供 MiniMax-H3 / Pika H3 Flex 音视频生成、MiniMax-H3-Image 图�
 | MiniMax-H3 | 文生音视频、首帧/尾帧/首尾帧、有序图片/视频/音频参考 | `ftllm launch` 的视频后端 | `minimax_h3_server` / `minimax_h3_generate` |
 | Pika H3 Flex | H3 基座加官方适配器，固定六步音视频生成 | 同一视频后端，选择 Pika 目录 | 同一 H3 原生程序，自动识别适配器 |
 | MiniMax-H3-Image | 六步文生图、单图编辑、多图参考合成 | `ftllm launch` 的图像后端 | `minimax_h3_image_server` / `minimax_h3_image_generate` |
-| Qwen-Image-2.1 | 文生图、单图和多图编辑 | `ftllm qwen-image server` + `/demo` | `ftllm qwen-image generate` |
+| Qwen-Image-2.1 | 文生图、单图和多图编辑 | `ftllm server MODEL_PATH` + `/demo` | `ftllm qwen-image generate` |
 
-`ftllm server` 是语言模型服务入口。生成模型请使用上表对应后端；图像理解模型的 `image_url` 输入也不等于图片生成能力。Qwen-Image 当前没有独立的 Launcher 启动项，使用其 CLI 或独立 Demo。
+在启动器选择模型路径，或运行 `ftllm server 模型路径`，两者都根据本地模型元数据识别图像或视频服务。
 
 HY-Nomas、LingBot World 的世界模型部署另见 [HY-Nomas](hy_nomas.md) 和 [LingBot World](lingbot_world.md)。
 
@@ -42,7 +42,7 @@ FTLLM_PACKAGE="$(python -c 'from pathlib import Path; import ftllm; print(Path(f
 
 ### 启动器
 
-在 **启动服务 → 增加启动项 → 模型类型 / 后端** 选择视频（MiniMax H3 / Pika H3），填写模型路径、端口、输出目录和可用 GPU，保存并启动。发布包中的可执行文件路径可留空。
+在 **启动服务 → 增加启动项** 选择 MiniMax H3 或 Pika 的模型路径，填写端口、输出目录和可用 GPU，保存并启动。启动器自动查找原生服务。
 
 - H3：选择完整 MiniMax-H3 目录。
 - Pika：选择包含 `fl2va/manifest.json`、`fl2va/adapter.safetensors`、`ref2va/manifest.json`、`ref2va/adapter.safetensors` 的官方适配器目录。仍需匹配的完整 H3 基座；在启动项中指定基座路径，或通过 Pika 目录内的 `base_model` 软链接关联。基座版本与适配器要求见 [Pika 说明](../tools/minimax_h3/README.md#pika-h3-flex)。
@@ -84,7 +84,7 @@ curl -X POST http://127.0.0.1:8009/v1/videos/VIDEO_ID/cancel
 
 ### 启动器与模型路径
 
-选择 **图像（MiniMax H3 Image）** 后端，填写模型路径、端口、输出目录和 GPU。就绪后打开 **工作室 → 图像生成** 或 **图像 Demo**，支持文生图、上传参考图、排序、编辑、进度、取消和下载。
+选择 MiniMax H3 Image 的模型路径，填写端口、输出目录和 GPU。就绪后打开 **工作室 → 图像生成** 或 **图像 Demo**，支持文生图、上传参考图、排序、编辑、进度、取消和下载。
 
 BF16 使用完整原始目录。FP8 / INT8 / NVFP4 / GGUF 使用已支持布局的具体量化文件，并保留完整原始 H3 Image 基座；建议在量化目录内设置 `base_model` 目录或软链接，避免自动查找出现歧义。视频 H3 基座不能代替 H3 Image 基座。
 
@@ -125,7 +125,7 @@ curl http://127.0.0.1:8010/v1/images/edits \
 ### 启动服务或直接导出图片
 
 ```sh
-ftllm qwen-image server --model /path/to/Qwen-Image-2.1 \
+ftllm server /path/to/Qwen-Image-2.1 \
   --devices 0 --host 127.0.0.1 --port 8008 --output ./qwen-image-output
 ```
 
@@ -137,7 +137,7 @@ ftllm qwen-image generate --model /path/to/Qwen-Image-2.1 --devices 0 \
   --width 1024 --height 1024 --steps 40 --seed 1234 --output apple.png
 ```
 
-增加 `--image reference.png --reference-resolution 512` 可编辑参考图；多图重复 `--image`。完整参数见 `ftllm qwen-image server --help` / `generate --help`。
+增加 `--image reference.png --reference-resolution 512` 可编辑参考图；多图重复 `--image`。完整参数见 `ftllm server --help` / `generate --help`。
 
 ### HTTP API
 
@@ -183,8 +183,8 @@ H3 / Pika 量化目录使用 `h3_quantization.json` 将 `base_model`、`fl2va`�
 
 ```sh
 # 进程内的 0、1 对应这里选出的物理 GPU 2、3
-CUDA_VISIBLE_DEVICES=2,3 ftllm qwen-image server \
-  --model /path/to/Qwen-Image-2.1 --devices 0,1 --port 8008
+CUDA_VISIBLE_DEVICES=2,3 ftllm server \
+  /path/to/Qwen-Image-2.1 --devices 0,1 --port 8008
 ```
 
 H3 原生程序同样接受 `--devices 0,1`，启动器会自动映射勾选的 GPU。H3 / H3 Image 支持 `--gpu-memory-limit GiB`（每卡）和 `--host-memory-limit GiB`（服务共享）进行常驻/逐层加载规划；Qwen-Image 根据可用显存与请求自动选择常驻或阶段卸载。模型预算不是整个进程显存的硬隔离，仍需为 CUDA、通信、激活与媒体编解码留出空间。

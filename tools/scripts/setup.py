@@ -72,7 +72,8 @@ setup (
              'launcher_assets/locales/*.json', 'webui_assets/*',
              'ui_plugins/*/*', 'plugin_assets/*', 'minimax_h3_server', 'minimax_h3_generate', 'h3_assets/*',
              'minimax_h3_image_server', 'minimax_h3_image_generate', 'h3_image_assets/*',
-             'qwen_image_server', 'qwen_image_generate', 'qwen_image_assets/*']
+             'qwen_image_server', 'qwen_image_generate', 'qwen_image_assets/*',
+             'duo_assets/*', 'duo_assets/presets/*', 'lingbot_world_assets/*']
     },
     install_requires=[
         'pyreadline3',

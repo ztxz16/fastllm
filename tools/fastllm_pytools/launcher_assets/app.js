@@ -23,7 +23,7 @@ import {
   renderAgentRuntime, refreshAgentRuntime, installAgentRuntime, renderWebUIAvailability,
   openEmbeddedWebUI
 } from "../ui_plugins/studio/launcher.js";
-import {openVideoService, openImageService} from "../ui_plugins/studio/video.js";
+import {openVideoService, openImageService, openInteractiveService} from "../ui_plugins/studio/video.js";
 
 import {
   mountPluginHost
@@ -776,7 +776,7 @@ function renderRuntime() {
   elements.openApiInfo.disabled = !runtime.ready || isWebui;
   if (elements.apiInfoDialog.open && (!runtime.ready || isWebui
       || elements.apiInfoDialog.dataset.sessionId !== runtime.sessionId)) elements.apiInfoDialog.close();
-  elements.openEndpoint.textContent = runtime.kind === "image" ? t("Image demo") : runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
+  elements.openEndpoint.textContent = runtime.kind === "interactive" ? t("Interactive demo") : runtime.kind === "image" ? t("Image demo") : runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
   renderInferenceSpeed();
   renderContextWindow();
   renderWebUIAvailability();
@@ -870,6 +870,11 @@ function basename(value) {
 
 function openEndpoint() {
   if (!state.runtime?.endpoint || !state.runtime.ready) return;
+  if (state.runtime.capabilities?.includes("interactive.demo")) {
+    openInteractiveService(state.runtime.sessionId);
+    switchView("webui");
+    return;
+  }
   if (state.runtime.kind === "image") {
     openImageService(state.runtime.sessionId);
     switchView("webui");
@@ -895,8 +900,8 @@ async function openApiInfo() {
     elements.apiInfoKey.value = info.apiKey;
     const contract = document.getElementById("api-contract");
     const media = info.kind === "video" || info.kind === "image";
-    document.getElementById("api-contract-field").classList.toggle("hidden", !media);
-    contract.value = media ? [info.create, info.status, info.content, info.cancel,
+    document.getElementById("api-contract-field").classList.toggle("hidden", !media && !info.routes);
+    contract.value = info.routes ? info.routes.join("\n") : media ? [info.create, info.status, info.content, info.cancel,
       ...(info.edit ? [info.edit] : []), ...(info.conditioning_health ? [info.conditioning_health] : []),
       "", JSON.stringify(info.request, null, 2),
       ...(info.references ? ["", JSON.stringify({modes: info.modes, keyframes: info.keyframes,

@@ -257,12 +257,12 @@ The queue allows up to four pending/running jobs. Up to 128 recent jobs are kept
 
 ## ftllm launch
 
-Launch the current source/wheel with `ftllm launch`. Under **启动服务 → 增加启动项**, choose **图像（MiniMax H3 Image）**, set the model directory, port, output directory and available GPUs, then start the profile. Click **图像 Demo**, or open **工作室 → 图像生成**, to generate, edit or combine images, monitor progress, cancel, preview and download. The image backend can run alongside chat and video services; its requests pass through the launcher's authenticated service proxy.
+Launch the current source/wheel with `ftllm launch`. Under **启动服务 → 增加启动项**, select the model directory or quantized file, then set the port, output directory and available GPUs, then start the profile. Click **图像 Demo**, or open **工作室 → 图像生成**, to generate, edit or combine images, monitor progress, cancel, preview and download. The image backend can run alongside chat and video services; its requests pass through the launcher's authenticated service proxy.
 
-The launcher locates `minimax_h3_image_server` from the profile's binary field, `FTLLM_H3_IMAGE_SERVER`, the installed wheel, PATH or the source build directory, in that order. For a separate build directory:
+The launcher locates `minimax_h3_image_server` in the installed package, on `PATH`, or in a source build directory, in that order. For a separate build directory:
 
 ```bash
-FTLLM_H3_IMAGE_SERVER=/absolute/build/src/models/minimax_h3/minimax_h3_image_server ftllm launch
+PATH="/absolute/build/src/models/minimax_h3:$PATH" ftllm launch
 ```
 
 GPU indices in the launcher refer to its visible GPU list. If a container exposes physical GPU 3 only, select logical GPU 0. Select 1, 2, 4 or 8 GPUs; two-device inference has been validated. The image profile exposes the same auto/TP/SP selector as video. BF16 auto selects SP or streamed TP from the per-device memory budget; quantized auto keeps SP. Select TP explicitly to shard quantized weights. CUDA release wheel packaging includes both image executables, OpenAPI, the standalone demo and its shared JS/CSS assets; model weights are separate downloads.

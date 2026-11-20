@@ -10,6 +10,10 @@ ftllm launch
 
 Add a profile → select a model → choose Automatic configuration → save and start. The launcher provides model downloads, command previews, logs, and Studio.
 
+## Interactive demos
+
+In Model Management, create a profile for **Scene interaction (HY-Nomas)** or **Audiovisual conversation (Duo)**. Choose the weights and GPUs. Launcher automatically locates installed runtimes and standard source builds. HY-Nomas requires its BF16 native library and the Qwen2.5-VL-7B-Instruct text encoder. Duo requires duo_live and Duo-1.0-distill-quant, supports one or four GPUs, and accepts optional character assets and an Intent NF4 cache. After startup, choose **Interactive demo** to open the native player in Studio. Use separate service ports for concurrent profiles. Only the Launcher port needs forwarding. Camera recording requires localhost or HTTPS. See the build instructions for [HY-Nomas](hy_nomas.md) and [Duo](../tools/duo/README.md).
+
 ## Startup and access
 
 `ftllm` (or `ftllm launch`) listens only on `127.0.0.1:8000` by default and opens the browser after the service is ready; use `ftllm launch --no-browser` to disable automatic opening. The page can download models from ModelScope, save and preview launch profiles, and run either `ftllm server` or the chat-oriented `ftllm webui`. For a new profile, select a local model and Automatic configuration; `--auto` plans inference settings when the service starts. Expand Resource limits or Model parameters to override individual options. Leave Chunk and Maximum concurrency blank to restore automatic planning. See the [`--auto` tuning guide](auto_en.md#launcher-automatic-mode). Custom configuration remains available. Its interface supports Simplified Chinese and English, preferring the last selection and otherwise following the browser language; terminal output from `ftllm launch` always uses English. To access it from the LAN, run `ftllm launch --host 0.0.0.0`; the terminal and Launcher page then list loopback, LAN, and directly assigned public-interface addresses when available. Public access also requires the host firewall and cloud security group to allow the port, plus port forwarding when behind NAT; Launcher does not discover NAT public mappings. Non-loopback access uses unencrypted HTTP and should only be enabled on a trusted network. It shares profiles with the terminal wizard and stops its managed download and model processes when the launcher exits. Run `ftllm launch --help` for other options.
@@ -18,7 +22,15 @@ Add a profile → select a model → choose Automatic configuration → save and
 
 ## Concurrent models, GPUs, and image/video generation
 
-Each profile selects a backend: LLM, **MiniMax H3 / Pika H3 video**, or **MiniMax H3 Image**. See the [image and video guide](image-video_en.md) for model preparation, quantization, parallelism, and APIs. Qwen-Image-2.1 currently uses its dedicated CLI/demo instead of these profiles. Services
+The launcher identifies the service from the local model path. MiniMax H3, Pika H3 Flex, MiniMax H3 Image, Qwen-Image-2.1, HY-Nomas, LingBot World and Duo use the same CLI entry point.
+
+```sh
+ftllm server /workspace2/hfmodels/Duo-1.0-distill-quant --devices 2 --port 8080
+```
+
+For quantized video, select the directory or its `h3_quantization.json`. For an image directory containing multiple quantizations, select a specific weight file. See the [image and video guide](image-video_en.md).
+
+Services
 can run concurrently on different ports. The top service selector controls API
 information and Stop; profile cards can also manage or stop an individual service.
 Stopping one model leaves other services running. Exiting Launcher stops all of them.
@@ -37,11 +49,10 @@ this setting cannot widen it. Visibility restrictions do not reserve GPUs exclus
 
 To launch video:
 
-1. Release wheels and portable packages include `minimax_h3_server`; leave its path empty.
-   For source installations or older wheels, follow the [H3 build instructions](../tools/minimax_h3/README.md).
-   Enter its absolute path, add it to `PATH`, or set `FTLLM_H3_SERVER`. The source
-   `build` and `build-cuda` directories are also searched.
-2. Choose the video backend, model directory, port and GPUs. Pika is detected
+1. Launcher finds `minimax_h3_server` in the release package, on `PATH`, or in the source
+   `build` and `build-cuda` directories. For a source installation or an older wheel,
+   follow the [H3 build instructions](../tools/minimax_h3/README.md).
+2. Choose the H3 or Pika model directory, port and GPUs. Pika is detected
    automatically and still requires the full H3 base. Set the base directory if it
    is not beside Pika as `MiniMax-H3` or linked through `base_model`.
 3. Once ready, API information includes create, status, cancel and content-download
@@ -61,7 +72,7 @@ To launch video:
    and audio, with a 255 MiB Studio upload limit; see [H3 API constraints](../tools/minimax_h3/README.md#http-与-demo).
    Studio downloads are limited to 256 MiB per result. Refreshing reloads the service's job list.
 
-For images, select **Image · MiniMax H3 Image**, set the full model directory or supported quantized file, port, and GPUs, then start. Quantized files still need a matching original base. Open **Studio → Image generation** or the standalone demo to generate, edit, upload references, and download PNGs. Release packages discover `minimax_h3_image_server` automatically. See [H3 Image usage](image-video_en.md#images-minimax-h3-image).
+For images, select the MiniMax H3 Image model directory or a supported quantized file, then set the port and GPUs, then start. Quantized files still need a matching original base. Open **Studio → Image generation** or the standalone demo to generate, edit, upload references, and download PNGs. Release packages discover `minimax_h3_image_server` automatically. See [H3 Image usage](image-video_en.md#images-minimax-h3-image).
 
 Studio has an independent chat model selector. Opening a video service or demo
 does not disconnect chat. Start an LLM and video service, install Pi and create a

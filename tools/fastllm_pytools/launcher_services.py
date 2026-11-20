@@ -165,7 +165,7 @@ class LauncherServicePool:
         return [{"id": state["sessionId"], "name": state["profileName"] or state["modelName"],
                  "model": state["modelName"], **BACKENDS[state["backend"]].api_contract(state)}
                 for state in self.states() if state["ready"] and state["phase"] == "running"
-                and state.get("kind", "llm") != "llm"]
+                and state.get("kind") in {"image", "video"}]
 
     def media_request(self, service_id, method, path, data=None, content_type="application/json"):
         """Bounded, authenticated requests allowed by a registered backend.
