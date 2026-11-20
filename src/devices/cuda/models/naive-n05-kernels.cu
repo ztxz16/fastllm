@@ -5323,15 +5323,14 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     std::vector<int> packedStarts;
     if (cp && !direct) packedBatches.reserve((rows.size() + batch::BatchLimit - 1) / batch::BatchLimit);
     auto pagedShardCapacity = [&](int capacity) {
-        return ((capacity + contextPageLen - 1) / contextPageLen) * (contextPageLen / contextRanks);
+        return (1 + (capacity - 1) / contextPageLen) * (contextPageLen / contextRanks);
     };
     const int arch = FastllmCudaRuntimeArch();
     const bool blackwell = !cp && (arch == 100 || arch == 103);
     const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
-    // Replicated decode scans live keys with a bounded score grid and split radix
-    // passes. Only their tile-rounded int offsets need headroom. CP also has a
-    // separate candidate exchange and retains its existing dispatch limit.
-    const int maxCapacity = cp ? naive_topk::kMaxKeys : INT_MAX / 2;
+    // Paged shards scan local keys and exchange at most kTopK pairs per rank.
+    // Only contiguous CP retains the old capacity limit.
+    const int maxCapacity = cp && !contextPageLen ? naive_topk::kMaxKeys : INT_MAX / 2;
     bool nativeScores = arch == 90 || (blackwell && rows.size() >= 8 &&
         (cacheType == BFLOAT16 || cacheType == FP8_E4M3) &&
         BulkKernelSupported(batch::HopperScores<false>, 0, 80));

@@ -78,7 +78,8 @@ namespace {
         if (!rows.empty() && rows.size() < 16) {
             int capacity = 0;
             for (const auto &row : rows) capacity = std::max(capacity, row.capacity);
-            directWidth = std::min(2048, ((capacity + page - 1) / page) * (page / ranks));
+            const int pages = capacity / page + (capacity % page != 0);
+            directWidth = std::min(2048, pages * (page / ranks));
         }
         const int rowWords = (directWidth ? directWidth : 2048) * 2;
         const int part = rows.size() * rowWords;
