@@ -47,13 +47,41 @@ class Router:
         self.slots = [asyncio.Semaphore(n) for n in self.capacities]
         self.cursor = 0
         self.client = None
+        self.snapshot_task = None
+        self.snapshot_queued = False
 
     @property
     def assigned(self):
         return [sum(e['rank'] == i for e in self.entries.values()) for i in range(len(self.backends))]
 
-    def persist(self):
-        write_json(self.path, {'backends': self.backends, 'sessions': self.entries})
+    def persist(self, entries=None):
+        write_json(self.path, {'backends': self.backends, 'sessions': self.entries if entries is None else entries})
+
+    def queue_snapshot(self):
+        # Requests arriving before capture share one write and one completion.
+        if not self.snapshot_queued or self.snapshot_task.done():
+            self.snapshot_queued = True
+            self.snapshot_task = asyncio.create_task(self.write_request_snapshot(self.snapshot_task))
+
+    async def flush_snapshot(self):
+        # A concurrent continuation must wait for its owner's first write.
+        task = self.snapshot_task
+        if task is not None:
+            if task.done():
+                if not task.cancelled() and task.exception() is None:
+                    return
+                self.queue_snapshot()
+                task = self.snapshot_task
+            await asyncio.shield(task)
+
+    async def write_request_snapshot(self, previous):
+        if previous is not None and not previous.cancelled():
+            # A new snapshot contains the complete table and can retry a failed write.
+            with contextlib.suppress(Exception):
+                await previous
+        self.snapshot_queued = False
+        entries = {key: entry.copy() for key, entry in self.entries.items()}
+        await asyncio.get_running_loop().run_in_executor(None, self.persist, entries)
 
     def expire(self):
         now = time.time()
@@ -61,7 +89,8 @@ class Router:
             if not self.references.get(session) and now-entry['last_seen'] >= self.settings['affinity_ttl_seconds']:
                 del self.entries[session]
 
-    def select(self, session=None):
+    def select(self, session=None, *, on_assignment=None):
+        save = self.persist if on_assignment is None else on_assignment
         self.expire()
         if session in self.entries:
             rank = self.entries[session]['rank']
@@ -77,7 +106,7 @@ class Router:
                            (i-self.cursor) % len(self.backends)))
                 self.entries[session]['rank'] = rank
                 self.cursor = (rank+1) % len(self.backends)
-                self.persist()
+                save()
             self.entries[session]['last_seen'] = time.time()
             return rank
         candidates = [i for i, health in enumerate(self.healthy) if health]
@@ -100,7 +129,7 @@ class Router:
             rank = min(candidates, key=lambda i: (counts[i]/self.capacities[i],
                        self.pending[i]/self.capacities[i], (i-self.cursor) % len(self.backends)))
             self.entries[session] = {'rank': rank, 'last_seen': time.time()}
-            self.persist()
+            save()
         else:
             rank = min(candidates, key=lambda i: (self.pending[i]/self.capacities[i],
                        (i-self.cursor) % len(self.backends)))
@@ -141,6 +170,9 @@ class Router:
                 monitor_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await monitor_task
+                if self.entries or self.path.exists():
+                    self.queue_snapshot()
+                    await self.flush_snapshot()
 
     async def health(self, request):
         healthy = all(self.healthy)
@@ -163,15 +195,16 @@ class Router:
             raise web.HTTPBadRequest(text='A session ID header is required')
         if self.references.get(session):
             raise web.HTTPConflict(text='Session has active or queued requests')
-        self.entries.pop(session, None)
-        self.persist()
+        if self.entries.pop(session, None) is not None:
+            self.queue_snapshot()
+        await self.flush_snapshot()
         return web.json_response({'released': True})
 
     async def forward(self, request):
         session = request.headers.get('X-Session-Id') or request.headers.get('X-SMG-Routing-Key')
         if session and len(session) > 512:
             raise web.HTTPBadRequest(text='Session ID exceeds 512 characters')
-        rank = self.select(session)
+        rank = self.select(session, on_assignment=self.queue_snapshot)
         if self.pending[rank] >= self.capacities[rank] + self.settings['queue_limit_per_replica']:
             raise web.HTTPTooManyRequests(text='Replica queue is full', headers={'Retry-After': '1'})
         self.pending[rank] += 1
@@ -192,6 +225,8 @@ class Router:
         record = {'start': time.time(), 'replica': self.config['replicas'][rank]['name'],
                   'path': request.path, 'status': None, 'bytes': 0}
         try:
+            if session:
+                await self.flush_snapshot()
             try:
                 await asyncio.wait_for(self.slots[rank].acquire(), self.settings['queue_timeout_seconds'])
             except asyncio.TimeoutError as error:
@@ -235,7 +270,8 @@ class Router:
                 if not self.references[session]:
                     del self.references[session]
                 self.entries[session]['last_seen'] = time.time()
-                self.persist()
+                self.queue_snapshot()
+                await self.flush_snapshot()
             record['end'] = time.time()
             with (self.directory/'requests.jsonl').open('a') as output:
                 output.write(json.dumps(record)+'\n')
