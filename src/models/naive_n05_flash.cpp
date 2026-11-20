@@ -2381,9 +2381,9 @@ Data NaiveN05FlashModel::RunTarget(
 #endif
 }
 
-NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
+NaiveN05FlashModel::LogitsOptions NaiveN05FlashModel::GetLogitsOptions(
         const GenerationConfig &config, bool speculative) const {
-    LogitsSelection selection;
+    LogitsOptions selection;
     // Stateful transforms need the request's history/cache lengths, but the
     // logits remain on GPU. Only explicit logits output retains host transfer.
     if (config.prefill_chunk_remaining > 0 || config.output_logits) return selection;
@@ -2405,7 +2405,7 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
         selection.cudaSampling = true;
         return selection;
     }
-    if (config.tool_call_grammar || config.tool_call_token_mask) return LogitsSelection();
+    if (config.tool_call_grammar || config.tool_call_token_mask) return LogitsOptions();
     if (selection.greedy) selection.count = 1;
     else if (config.top_k > 1 && config.top_k <= kNaiveLogitsMaxTopK &&
              std::isfinite(config.temperature) && config.temperature > 0 &&
@@ -2418,8 +2418,13 @@ NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
     return selection;
 }
 
+NaiveN05FlashModel::LogitsSelection NaiveN05FlashModel::SelectLogits(
+        const GenerationConfig &config, bool speculative) const {
+    return {GetLogitsOptions(config, speculative), {}, {}};
+}
+
 bool NaiveN05FlashModel::SupportsCudaRejectionSampling(const GenerationConfig &config) const {
-    return config.top_k > 1 && SelectLogits(config).cudaSampling;
+    return config.top_k > 1 && GetLogitsOptions(config, false).cudaSampling;
 }
 
 std::vector<int> NaiveN05FlashModel::SampleCudaLogits(

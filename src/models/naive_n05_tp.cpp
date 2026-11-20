@@ -3108,12 +3108,16 @@ struct NaiveN05FlashModel::DraftHeadState {
 #endif
 
 Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
-    // Separate branch-local return objects would copy the borrowed GPU logits.
     Data output;
+    RunDraftHead(hidden, output);
+    return output;
+}
+
+void NaiveN05FlashModel::RunDraftHead(Data &hidden, Data &output) {
     if (tpDevices.empty()) {
         if (hidden.dims[1] > 1) MatMulTransB(hidden, weight["lm_head.weight"], output);
         else Linear(hidden, weight["lm_head.weight"], Data(), output);
-        return output;
+        return;
     }
 #ifdef USE_CUDA
     const int rows = hidden.dims[1], vocab = weight["lm_head.weight"].dims[0];
@@ -3181,7 +3185,7 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
         // so rank workers cannot overwrite the joined logits too early.
         output.FakeFrom(tpDraftHeadOutput, 0);
         output.Resize(tpDraftHeadOutput.dims);
-        return output;
+        return;
     }
     // Copy once before workers consume the owner stream's result. Each worker
     // owns its inputs and the existing vocabulary shard; no extra full head.
@@ -3220,9 +3224,6 @@ Data NaiveN05FlashModel::RunDraftHead(Data &hidden) {
     }
     ApplyDraftDevice();
     output.ToDevice(DataDevice::CUDA, std::vector<int>{tpDevices.front()});
-    return output;
-#else
-    return output;
 #endif
 }
 

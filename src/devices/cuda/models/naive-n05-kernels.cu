@@ -2883,15 +2883,18 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         if (!u.raw || !u.norm || !u.key || !u.value || u.start < 0 ||
             !DraftDense(*u.raw, BFLOAT16, device) || !DraftDense(*u.norm, FLOAT32, device) ||
             u.norm->dims.size() != 1 || u.norm->dims[0] != dim || u.raw->dims.size() != 3 ||
-            u.raw->dims[0] != 1 || u.raw->dims[2] != 2 * width || u.raw->dims[1] <= 0 ||
-            (int64_t)u.start + u.raw->dims[1] > INT_MAX ||
-            (int64_t)16 * u.raw->dims[1] * heads > INT_MAX || u.key->dims != u.value->dims) return false;
+            u.raw->dims[0] != 1 || u.raw->dims[2] != 2 * width ||
+            u.firstRow < 0 || u.firstRow >= u.raw->dims[1] || u.rowCount < -1) return false;
+        const int available = u.raw->dims[1] - u.firstRow;
+        const int rows = u.rowCount == -1 ? available : u.rowCount;
+        if (rows <= 0 || rows > available || (int64_t)u.start + rows > INT_MAX ||
+            (int64_t)16 * rows * heads > INT_MAX || u.key->dims != u.value->dims) return false;
         for (const Data *cache : {u.key, u.value}) {
             if (cache->dims.empty()) { if (!cache->expansionDims.empty()) return false; continue; }
             if (cache->dataType != BFLOAT16 || cache->dataDevice != DataDevice::CUDA ||
                 cache->dataDeviceIds != devices || !cache->cudaData || cache->multiDeviceData ||
                 cache->dims.size() != 3 || cache->dims[0] != 1 || cache->dims[2] != width || cache->dims[1] < 0 ||
-                (int64_t)cache->dims[1] + u.raw->dims[1] > INT_MAX || cache->strides.size() != 3 ||
+                (int64_t)cache->dims[1] + rows > INT_MAX || cache->strides.size() != 3 ||
                 cache->strides[2] != 1 || cache->strides[1] != width ||
                 (!cache->expansionDims.empty() && (cache->expansionDims.size() != 3 ||
                     cache->expansionDims[0] != 1 || cache->expansionDims[2] != width))) return false;
@@ -2909,11 +2912,12 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         for (int i = 0; i < count; ++i) {
             const auto &u = updates[first + i];
             const int old = u.key->dims.empty() ? 0 : u.key->dims[1];
-            const int n = std::min(u.raw->dims[1], window - 1);
-            const int skip = u.raw->dims[1] - n;
+            const int sourceRows = u.rowCount == -1 ? u.raw->dims[1] - u.firstRow : u.rowCount;
+            const int n = std::min(sourceRows, window - 1);
+            const int skip = sourceRows - n;
             const int keep = std::min(old, window - 1 - n);
             rows = std::max(rows, n);
-            dst.raw[i] = (const BF16 *)u.raw->cudaData + (size_t)skip * 2 * width;
+            dst.raw[i] = (const BF16 *)u.raw->cudaData + size_t(u.firstRow + skip) * 2 * width;
             dst.norm[i] = (const float *)u.norm->cudaData;
             dst.length[i] = keep; dst.rows[i] = n; dst.start[i] = u.start + skip;
             for (Data *cache : {u.key, u.value}) {
@@ -6867,16 +6871,16 @@ __global__ void LogitsTopKFinish(const float2 *partial, float2 *output, int bloc
     }
 }
 struct DraftHiddenInputs { const BF16 *ptr[32]; };
-__global__ void DraftConcat(DraftHiddenInputs inputs, BF16 *output,
-                            int rows, int width, int count) {
-    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = (size_t)rows * width * count;
-    if (index < total) {
-        int column = index % width;
-        int layer = (index / width) % count;
-        int row = index / ((size_t)width * count);
-        output[index] = inputs.ptr[layer][(size_t)row * width + column];
-    }
+struct DraftRowIndices { int row[256]; };
+template <typename Unit>
+__global__ void DraftConcatRows(DraftHiddenInputs inputs, DraftRowIndices indices,
+        Unit *output, int width, int layers, int first) {
+    const size_t column = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (column >= width) return;
+    const int row = blockIdx.z, layer = blockIdx.y;
+    const auto *source = reinterpret_cast<const Unit *>(inputs.ptr[layer]);
+    output[(size_t(row) * layers + layer) * width + column] =
+        source[size_t(first < 0 ? indices.row[row] : first + row) * width + column];
 }
 }
 
@@ -6951,27 +6955,66 @@ void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
         (const uint32_t *)mask.cudaData, (float *)output.cudaData, vocab);
     CheckLaunch();
 }
-bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
-    int rows, fastllm::Data &output) {
-    if (inputs.empty() || inputs.size() > 32 || rows <= 0) return false;
+static bool ConcatDraftRows(const std::vector<const fastllm::Data *> &inputs,
+    int rows, const std::vector<int> &selected, fastllm::Data &output, const std::vector<int> *peerDevices) {
+    if (inputs.empty() || inputs.size() > 32 || !inputs.front() || rows <= 0 || selected.size() > INT_MAX) return false;
     int width = inputs[0]->dims.empty() ? 0 : inputs[0]->dims.back();
-    if (width <= 0) return false;
-    const std::vector<int> deviceIds{FastllmCudaGetDevice()};
+    if (width <= 0 || width > INT_MAX / int(inputs.size())) return false;
+    const int device = FastllmCudaGetDevice();
+    if (peerDevices && peerDevices->size() != inputs.size()) return false;
     DraftHiddenInputs pointers{};
+    bool vectorized = width % 8 == 0;
+    for (int row : selected) if (row < 0 || row >= rows) return false;
     for (size_t i = 0; i < inputs.size(); ++i) {
+        if (!inputs[i]) return false;
         const auto &x = *inputs[i];
         if (x.dataType != fastllm::BFLOAT16 || x.dims.size() != 3 || x.dims[0] != 1 ||
             x.dims[1] < rows || x.dims[2] != width || x.dataDevice != fastllm::DataDevice::CUDA ||
-            x.dataDeviceIds != deviceIds || !x.cudaData || x.strides.size() != 3 ||
+            x.dataDeviceIds.size() != 1 || x.dataDeviceIds.front() != (peerDevices ? (*peerDevices)[i] : device) ||
+            !x.cudaData || x.strides.size() != 3 ||
             x.strides[1] != width || x.strides[2] != 1) return false;
+        vectorized &= reinterpret_cast<uintptr_t>(x.cudaData) % 16 == 0;
         pointers.ptr[i] = (const BF16 *)x.cudaData;
     }
-    Output(output, fastllm::BFLOAT16, {1, rows, width * (int)inputs.size()});
-    size_t total = (size_t)rows * width * inputs.size();
-    DraftConcat<<<(total + 255) / 256, 256>>>(pointers, (BF16 *)output.cudaData,
-        rows, width, inputs.size());
-    CheckLaunch();
+    const int count = selected.empty() ? rows : static_cast<int>(selected.size());
+    const int columnsOut = width * int(inputs.size());
+    if (peerDevices) {
+        if (!DraftDense(output, fastllm::BFLOAT16, device) || output.dims.size() != 3 ||
+            output.dims[0] != 1 || output.dims[1] != count || output.dims[2] != columnsOut) return false;
+    } else Output(output, fastllm::BFLOAT16, {1, count, columnsOut});
+    vectorized &= reinterpret_cast<uintptr_t>(output.cudaData) % 16 == 0;
+    const int columns = vectorized ? width / 8 : width;
+    for (int first = 0; first < count;) {
+        DraftRowIndices indices{};
+        const int n = std::min(count - first, selected.empty() ? 65535 : int(sizeof(indices.row) / sizeof(int)));
+        if (!selected.empty()) std::copy_n(selected.data() + first, n, indices.row);
+        auto *dst = static_cast<BF16 *>(output.cudaData) + size_t(first) * width * inputs.size();
+        dim3 grid((unsigned(columns) + 255) / 256, inputs.size(), n);
+        if (vectorized)
+            DraftConcatRows<<<grid, 256, 0, cudaStreamPerThread>>>(pointers, indices,
+                reinterpret_cast<uint4 *>(dst), columns, int(inputs.size()), selected.empty() ? first : -1);
+        else
+            DraftConcatRows<<<grid, 256, 0, cudaStreamPerThread>>>(pointers, indices,
+                dst, columns, int(inputs.size()), selected.empty() ? first : -1);
+        CheckLaunch();
+        first += n;
+    }
     return true;
+}
+
+bool FastllmCudaNaiveDraftConcatRows(const std::vector<const fastllm::Data *> &inputs,
+        int rows, const std::vector<int> &selected, fastllm::Data &output) {
+    return ConcatDraftRows(inputs, rows, selected, output, nullptr);
+}
+
+bool FastllmCudaNaiveGatherDraftLogits(const std::vector<const fastllm::Data *> &shards,
+        const std::vector<int> &devices, int rows, const std::vector<int> &selected, fastllm::Data &output) {
+    return ConcatDraftRows(shards, rows, selected, output, &devices);
+}
+
+bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
+        int rows, fastllm::Data &output) {
+    return FastllmCudaNaiveDraftConcatRows(inputs, rows, {}, output);
 }
 
 void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,
