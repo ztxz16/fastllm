@@ -1,4 +1,5 @@
 #include "pipeline.h"
+#include "reference.h"
 #include "tables.h"
 #include "avc.h"
 #include <c10/cuda/CUDAStream.h>
@@ -306,8 +307,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
         if (!real || fresh) {
             if (!real)
                 real = std::make_unique<Session>(0, ModelSource(root), h / 16, w / 16);
-            auto ref = readFile(assets /
-                                ("presets/default-" + std::to_string(w) + "x" + std::to_string(h) + ".bf16"));
+            auto ref = readFile(assets / referencePreset(w, h));
             if (ref.size() != size_t(h / 16) * (w / 16) * 24 * 2)
                 throw std::runtime_error("wrong preset geometry");
             auto values = floats(at::from_blob(ref.data(), {int64_t(ref.size() / 2)}, at::kBFloat16));

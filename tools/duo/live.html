@@ -1,181 +1,121 @@
 <!doctype html>
 <html lang="zh-CN">
-  <meta charset="utf-8" /><meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
-  />
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Duo · 音视频对话</title>
   <style>
-    * {
-      box-sizing: border-box;
+    :root { color-scheme: light; --ink: #22212a; --muted: #686572; --line: #dfdde6; --purple: #6550b7; --paper: #f6f5f8; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 14px/1.5 "DM Sans","PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+    main { max-width: 1260px; margin: auto; padding: clamp(16px,2.7vw,40px); }
+    header, .heading, .controls, .file-title { display: flex; align-items: center; gap: 10px; }
+    header { justify-content: space-between; margin-bottom: clamp(14px,2vw,26px); }
+    .identity { display: flex; align-items: center; gap: 12px; }
+    .mark { display: flex; align-items: center; justify-content: center; gap: 3px; width: 42px; height: 42px; border-radius: 13px; background: #2e2445; }
+    .mark i { width: 4px; height: 12px; border-radius: 4px; background: #dacbff; }
+    .mark i:nth-child(2) { height: 24px; } .mark i:nth-child(3) { height: 17px; }
+    h1,h2,p,figure { margin: 0; }
+    h1 { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; font-size: clamp(23px,3vw,34px); line-height: 1.2; letter-spacing: -.045em; }
+    h1 span { font-size: 14px; font-weight: 550; color: var(--muted); letter-spacing: normal; }
+    h2 { font-size: 16px; font-weight: 650; }
+    #status { font-size: 12px; padding: 5px 10px; border-radius: 7px; background: #ece8f5; color: #56447c; overflow-wrap: anywhere; max-width: 44%; }
+    .workspace { display: grid; grid-template-columns: minmax(0,1fr) clamp(238px,26%,312px); gap: 16px; align-items: start; }
+    .stage-card,.panel { min-width: 0; border-radius: 17px; border: 1px solid var(--line); background: white; }
+    .stage-card { overflow: hidden; }
+    .stage { position: relative; display: grid; place-items: center; isolation: isolate; overflow: hidden; aspect-ratio: 16/10; background: #191621; }
+    .stage > video,.stage > canvas,.standby { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+    .standby { pointer-events: none; display: grid; background: radial-gradient(ellipse at 62% 45%,#3b294f,#211a30 61%,#191622); }
+    #signal { width: 100%; height: 100%; }
+    #stage-portrait { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #191621; }
+    .stage-copy { position: absolute; inset: auto 0 0; color: white; padding: 36px clamp(16px,3vw,34px) 24px; background: linear-gradient(transparent,#181421c4); }
+    .stage-copy strong { font-size: clamp(20px,2.8vw,31px); font-weight: 600; letter-spacing: -.02em; }
+    .stage-copy p { color: #d4cbdc; margin-top: 2px; font-size: 13px; }
+    .local-view { position: absolute; top: 12px; right: 12px; width: clamp(64px,18%,132px); overflow: hidden; border: 1px solid #ffffff65; border-radius: 9px; background: #201d28; }
+    .local-view video { display: block; width: 100%; aspect-ratio: 4/3; object-fit: cover; }
+    .local-view summary { cursor: pointer; padding: 2px 6px; font-size: 11px; color: white; }
+    .local-view:not([open]) { width: auto; }
+    .controls { flex-wrap: wrap; padding: 14px; gap: 8px; }
+    button,textarea,select { font: inherit; }
+    button, .file-pick, select { min-height: 36px; border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; color: var(--ink); background: white; }
+    button,.file-pick,select { cursor: pointer; } button:hover:enabled,.file-pick:hover { border-color: #aaa1bc; background-color: #f5f2f9; }
+    button:disabled, fieldset:disabled .file-pick,select:disabled { opacity: .5; cursor: default; }
+    button:focus-visible, select:focus-visible, textarea:focus-visible, .file-pick:focus-within { outline: 2px solid var(--purple); outline-offset: 2px; }
+    #record { display: inline-flex; align-items: center; gap: 8px; background: #57428e; color: white; border-color: transparent; }
+    #record:hover:enabled { background: #463478; } #record::before { content: ""; width: 9px; height: 9px; border-radius: 50%; background: #e5d3ff; }
+    #record.recording::before { background: #ffb0a9; border-radius: 2px; }
+    #stop { margin-inline-start: auto; } #stop:disabled { border-color: transparent; }
+    .side { display: grid; gap: 14px; } .panel { padding: clamp(14px,2vw,21px); }
+    fieldset { border: 0; padding: 0; margin: 0; min-width: 0; } legend { padding: 0; font-size: 16px; font-weight: 650; }
+    .label { display: block; margin: 15px 0 6px; font-weight: 550; font-size: 13px; }
+    .file-pick { display: grid; position: relative; text-align: center; align-items: center; justify-content: center; min-height: 76px; border: 1px dashed #b9adc9; background: #f9f7fc; color: #5f4e78; }
+    .file-pick strong { font-weight: 600; } .file-pick small { font-size: 11px; color: var(--muted); }
+    .file-pick input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: inherit; }
+    #portrait { max-width: 100%; width: 110px; border-radius: 5px; }
+    .file-title { justify-content: space-between; } #clear-portrait { min-height: 0; padding: 2px 0; border: 0; color: var(--purple); font-size: 12px; }
+    textarea,select { width: 100%; } textarea { min-height: 88px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; resize: vertical; line-height: 1.6; }
+    textarea::placeholder { color: #77717d; } .hint { color: var(--muted); font-size: 12px; margin-top: 9px; }
+    .history { margin-top: 15px; } .heading { justify-content: space-between; } a { color: var(--purple); text-underline-offset: 3px; }
+    #log { display: grid; gap: 9px; margin-top: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    #log:empty::after { content: "对话开始后，这里会显示转写和回复。"; font-size: 13px; color: var(--muted); }
+    #log div { border-inline-start: 3px solid #d8cbeb; padding-left: 10px; }
+    @media (prefers-color-scheme: dark) {
+      :root { color-scheme: dark; --paper: #1a191d; --ink: #f1edf5; --muted: #b8b2c2; --line: #433f49; --purple: #cbbaf8; }
+      .stage-card,.panel,button,textarea,select { background: #27252b; color: var(--ink); }
+      #status,.file-pick { background: #342e40; color: #ddcff3; }
+      button:hover:enabled,.file-pick:hover { background-color: #38323f; }
+      textarea::placeholder { color: #b6aebc; }
     }
-    body {
-      margin: 0;
-      background: #f4f3ef;
-      color: #222a27;
-      font-family: Inter, "PingFang SC", sans-serif;
-    }
-    main {
-      max-width: 1040px;
-      margin: auto;
-      padding: 32px 24px;
-    }
-    header,
-    .bar,
-    .controls {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    header {
-      border-bottom: 1px solid #cccfc7;
-      padding-bottom: 18px;
-    }
-    h1 {
-      font-size: 26px;
-      letter-spacing: -1px;
-      margin: 0;
-    }
-    h1 strong {
-      font-size: 34px;
-      margin-right: 12px;
-    }
-    #status {
-      font-size: 14px;
-      color: #285843;
-    }
-    section {
-      margin: 24px 0;
-    }
-    .views {
-      display: grid;
-      grid-template-columns: 2fr 1fr;
-      align-items: start;
-      gap: 16px;
-    }
-    figure {
-      margin: 0;
-    }
-    video[hidden], canvas[hidden] { display: none; }
-    canvas { width: 100%; height: auto; }
-    video {
-      width: 100%;
-      display: block;
-      background: #202825;
-      border-radius: 12px;
-      aspect-ratio: 4/3;
-      object-fit: contain;
-    }
-    figcaption {
-      padding: 9px 1px;
-      font-size: 14px;
-    }
-    button,
-    select,
-    a {
-      font: inherit;
-    }
-    button,
-    select {
-      border: 1px solid #bbc3ba;
-      border-radius: 8px;
-      padding: 10px 16px;
-      background: white;
-      color: inherit;
-      cursor: pointer;
-    }
-    button:disabled,
-    .disabled {
-      opacity: 0.45;
-      cursor: default;
-    }
-    .primary {
-      background: #245440;
-      color: white;
-      border-color: #245440;
-    }
-    .controls {
-      justify-content: flex-start;
-    }
-    a {
-      color: #225d43;
-    }
-    #log {
-      white-space: pre-wrap;
-      line-height: 1.7;
-      min-height: 28px;
-    }
-    .bar {
-      border-bottom: 1px solid #c9cdc4;
-      padding: 12px 0;
-    }
-    .bar h2 {
-      font-size: 17px;
-      margin: 0;
-    }
-    small {
-      color: #576359;
-    }
-    button:focus-visible,
-    select:focus-visible {
-      outline: 3px solid #64a483;
-    }
-    @media (max-width: 600px) {
-      main {
-        padding: 16px;
-      }
-      .views {
-        grid-template-columns: 1fr;
-      }
-      .views figure + figure {
-        max-width: 180px;
-      }
-      h1 {
-        font-size: 19px;
-      }
+    @media (max-width: 690px) {
+      main { padding: 14px; } .workspace { grid-template-columns: minmax(0,1fr); gap: 12px; }
+      .main-col,.side { display: contents; } .stage-card { order: 1; } .settings { order: 2; } .history { order: 3; margin: 0; }
+      .stage { aspect-ratio: 16/10; } .stage-copy { padding: 16px; } #stop { margin-inline-start: 0; }
     }
   </style>
-  <main>
-    <header>
-      <h1><strong>Duo</strong>音视频对话</h1>
-      <span id="status" role="status">准备就绪</span>
-    </header>
-    <section class="views">
-      <figure>
-        <video id="reply" playsinline controls></video>
-        <canvas id="livePicture" hidden></canvas>
-        <figcaption>助手</figcaption>
-      </figure>
-      <figure>
-        <video id="preview" muted playsinline autoplay></video>
-        <figcaption>我的画面</figcaption>
-      </figure>
-    </section>
-    <div class="controls">
-      <button class="primary" id="record">开始录制</button
-      ><button id="upload">上传视频</button
-      ><input type="file" id="file" hidden accept="video/*" /><button
-        id="stop"
-        disabled
-      >
-        结束会话
-      </button>
-      <label>回复分辨率 <select id="resolution"><option value="">服务默认</option></select></label>
+</head>
+<body><main>
+  <header>
+    <div class="identity"><div class="mark" aria-hidden="true"><i></i><i></i><i></i></div><h1>Duo <span>音视频对话</span></h1></div>
+    <span id="status" role="status">准备就绪</span>
+  </header>
+  <div class="workspace">
+    <div class="main-col">
+      <section class="stage-card" aria-label="音视频对话">
+        <div class="stage">
+          <video id="reply" playsinline controls></video><canvas id="livePicture" hidden></canvas>
+          <div class="standby" id="standby">
+            <canvas id="signal" width="1024" height="640" aria-hidden="true"></canvas>
+            <img id="stage-portrait" hidden alt="角色参考图">
+            <div class="stage-copy"><strong id="stage-title">等待对话</strong><p id="stage-hint">录制或上传一段有声视频，最长 30 秒。</p></div>
+          </div>
+          <details class="local-view" id="local-view" hidden open><summary>我的画面</summary><video id="preview" muted playsinline autoplay></video></details>
+        </div>
+        <div class="controls">
+          <button id="record">开始录制</button><button id="upload">上传视频</button><input id="file" hidden type="file" accept="video/*">
+          <button id="stop" disabled>结束会话</button>
+        </div>
+      </section>
+      <section class="panel history">
+        <div class="heading"><h2>对话记录</h2><a hidden id="download" download="duo-reply.mp4">下载完整回复</a></div>
+        <div id="log" aria-live="polite"></div>
+      </section>
     </div>
-    <section>
-      <small>录制或上传一段有声视频，最长 30 秒。回复按片段播放。</small>
-    </section>
-    <section>
-      <div class="bar">
-        <h2>对话记录</h2>
-        <a hidden id="download" download="duo-reply.mp4">下载完整回复</a>
-      </div>
-      <div id="log" aria-live="polite"></div>
-    </section>
-  </main>
-  <script src="/avc-player.js"></script>
+    <aside class="side"><div class="panel settings">
+      <fieldset id="role"><legend>助手角色</legend>
+        <div class="file-title"><span class="label">初始图片</span><button id="clear-portrait" type="button" hidden>移除图片</button></div>
+        <label class="file-pick"><input id="role-image" type="file" aria-label="选择角色初始图片" accept="image/png,image/jpeg,image/webp">
+          <span id="pick-copy"><strong>选择图片</strong><br><small>PNG · JPEG · WebP</small></span>
+          <canvas id="portrait" aria-label="初始图片裁切预览" hidden></canvas>
+        </label>
+        <label class="label" for="description">角色和场景说明</label>
+        <textarea id="description" rows="3" maxlength="512" placeholder="例如，桂言叶站在雨夜咖啡馆的吧台后，手边放着一个白杯。"></textarea>
+        <p class="hint" id="role-hint" role="status">两项都可选。留空的项目沿用启动预设。</p>
+      </fieldset>
+      <label class="label" for="resolution">回复分辨率</label><select id="resolution"><option value="">服务默认</option></select>
+    </div></aside>
+  </div>
+</main>
+  <script src="avc-player.js"></script>
   <script>
     let avcPlayer, audioClock;
     const el = (id) => document.getElementById(id);
@@ -188,16 +128,97 @@
       queue = [],
       playing = false,
       inputURL,
-      assistantLine;
+      assistantLine,
+      portraitRGB = null,
+      readingPortrait = false,
+      portraitError = "",
+      portraitVersion = 0;
+    // Static standby artwork. The player replaces it when the first reply frame arrives.
+    function drawStandby() {
+      const canvas = el("signal");
+      const ctx = canvas.getContext("2d"), width = canvas.width, height = canvas.height;
+      const ink = ctx.createLinearGradient(0, 0, width, height * .2);
+      ink.addColorStop(0, "#9978da");
+      ink.addColorStop(.38, "#bd90e2");
+      ink.addColorStop(.67, "#e2b8f7");
+      ink.addColorStop(1, "#978cf5");
+      ctx.strokeStyle = ink;
+      for (let line = 0; line < 56; line++) {
+        const layer = line / 55;
+        ctx.globalAlpha = .23 + .43 * Math.sin(layer * Math.PI);
+        ctx.lineWidth = 1.25;
+        ctx.beginPath();
+        for (let x = 0; x <= width; x += 3) {
+          const t = x / width, bend = Math.sin(2 * Math.PI * (t - .14));
+          const y = height * (.43 + .16 * bend + .10 * Math.sin(t * 9 + 1.4 + layer * 2.9)
+                    + (layer - .5) * (.14 + .17 * Math.cos(t * 12)));
+          if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    }
+    drawStandby();
     function status(text) {
       el("status").textContent = text;
     }
     function controls() {
-      el("resolution").disabled = !!session || busy || !!recorder;
-      el("record").disabled = busy;
-      el("upload").disabled = busy || !!recorder;
+      const locked = !!session || busy || !!recorder;
+      el("resolution").disabled = locked;
+      el("role").disabled = locked;
+      el("record").classList.toggle("recording", !!recorder);
+      el("local-view").hidden = !inputURL && !stream;
+      el("pick-copy").hidden = !!portraitRGB;
+      el("stage-portrait").hidden = !portraitRGB;
+      el("stage-title").textContent = recorder ? "正在录制" : busy ? "等待助手回复" : portraitRGB ? "角色参考图" : "等待对话";
+      el("stage-hint").textContent = recorder ? "点击发送录制，开始这一轮对话。" : busy ? "" : "录制或上传一段有声视频，最长 30 秒。";
+      el("role-hint").textContent = portraitError || (readingPortrait ? "正在读取图片…" :
+        session ? "当前会话沿用此角色。结束会话后可更换。" : "两项都可选。留空的项目沿用启动预设。");
+      el("record").disabled = busy || readingPortrait || !!portraitError;
+      el("upload").disabled = busy || !!recorder || readingPortrait || !!portraitError;
       el("stop").disabled = !session && !busy && !recorder;
     }
+    async function preparePortrait() {
+      const version = ++portraitVersion;
+      const file = el("role-image").files[0], canvas = el("portrait");
+      portraitRGB = null;
+      portraitError = "";
+      readingPortrait = !!file;
+      canvas.hidden = true;
+      el("clear-portrait").hidden = !file;
+      controls();
+      if (!file) return;
+      const url = URL.createObjectURL(file);
+      try {
+        const photo = new Image();
+        photo.src = url;
+        await photo.decode();
+        if (version !== portraitVersion) return;
+        const [width, height] = (el("resolution").value || "512x384").split("x").map(Number);
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "white";
+        ctx.fillRect(0, 0, width, height);
+        const scale = Math.max(width / photo.naturalWidth, height / photo.naturalHeight);
+        const w = photo.naturalWidth * scale, h = photo.naturalHeight * scale;
+        ctx.drawImage(photo, (width-w)/2, (height-h)/2, w, h);
+        const rgba = ctx.getImageData(0, 0, width, height).data;
+        const rgb = new Uint8Array(width * height * 3);
+        for (let src = 0, dst = 0; src < rgba.length; src += 4) {
+          rgb[dst++] = rgba[src]; rgb[dst++] = rgba[src+1]; rgb[dst++] = rgba[src+2];
+        }
+        portraitRGB = new Blob([rgb], {type: "application/octet-stream"});
+        el("stage-portrait").src = canvas.toDataURL("image/jpeg", .9);
+        canvas.hidden = false;
+      } catch {
+        if (version === portraitVersion) portraitError = "图片读取失败，请重新选择或移除图片。";
+      } finally {
+        URL.revokeObjectURL(url);
+        if (version === portraitVersion) { readingPortrait = false; controls(); }
+      }
+    }
+    el("role-image").onchange = el("resolution").onchange = preparePortrait;
+    el("clear-portrait").onclick = () => { el("role-image").value = ""; preparePortrait(); };
     function note(text) {
       const line = document.createElement("div");
       line.textContent = text;
@@ -205,7 +226,7 @@
       return line;
     }
     async function api(path, options) {
-      const res = await fetch(path, options);
+      const res = await fetch("." + path, options);
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw Error(err.detail || res.statusText);
@@ -215,7 +236,10 @@
     api("/resolutions").then(sizes => {
       el("resolution").replaceChildren(...sizes.map(size => new Option(size.replace("x", " × "), size)));
     }).catch(e => status(e.message));
+    function showReply() { el("standby").hidden = true; }
+    el("reply").onloadeddata = showReply;
     function clearPlayer() {
+      el("standby").hidden = false;
       avcPlayer?.close();
       avcPlayer = null;
       el("livePicture").hidden = true;
@@ -256,6 +280,10 @@
       }
       releaseCamera();
       el("record").textContent = "开始录制";
+      if (inputURL) URL.revokeObjectURL(inputURL);
+      inputURL = null;
+      el("preview").removeAttribute("src");
+      el("preview").load();
       clearPlayer();
       controls();
       if (old) await api("/sessions/" + old, { method: "DELETE" });
@@ -278,14 +306,14 @@
             }
             if (e.type === "chunk") {
               if (e.url.endsWith(".mp4")) {
-                queue.push(e.url);
+                queue.push("." + e.url);
                 if (!playing) next();
               }
             }
             if (e.type === "done") {
               busy = false;
               status("回复已生成");
-              el("download").href = e.url;
+              el("download").href = "." + e.url;
               el("download").hidden = false;
               controls();
             }
@@ -333,7 +361,15 @@
             audioClock ??= new AudioContext();
             await audioClock.resume();
           }
-          const created = await api("/sessions?resolution=" + resolution + (audioClock ? "&playback=avc" : ""), { method: "POST" });
+          const description = el("description").value.trim();
+          let route = "/sessions", body;
+          if (portraitRGB || description) {
+            route = "/sessions/custom";
+            body = new FormData();
+            if (portraitRGB) body.append("reference_rgb", portraitRGB, "reference.rgb");
+            if (description) body.append("description", description);
+          }
+          const created = await api(route + "?resolution=" + resolution + (audioClock ? "&playback=avc" : ""), {method: "POST", body});
           if (version !== epoch) {
             await api("/sessions/" + created.id, { method: "DELETE" });
             return;
@@ -350,8 +386,8 @@
         if (audioClock) {
           el("reply").hidden = true;
           el("livePicture").hidden = false;
-          const active = avcPlayer = new DuoAvcPlayer(el("livePicture"), audioClock);
-          active.play(accepted.stream).catch(error => {
+          const active = avcPlayer = new DuoAvcPlayer(el("livePicture"), audioClock, undefined, showReply);
+          active.play("." + accepted.stream).catch(error => {
             if (active === avcPlayer && error.name !== "AbortError") {
               active.close(); status(error.message);
             }
@@ -428,8 +464,8 @@
     };
     window.addEventListener("pagehide", () => {
       if (session)
-        fetch("/sessions/" + session, { method: "DELETE", keepalive: true });
+        fetch("./sessions/" + session, { method: "DELETE", keepalive: true });
       releaseCamera();
     });
   </script>
-</html>
+</body></html>

@@ -6,6 +6,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -30,17 +31,30 @@ def check_avc_stream(stream, chunks):
     assert offset == len(stream)
 
 
-def smoke(url, video, playback):
-    def fetch(path, method="GET", body=None):
-        request = Request(url.rstrip("/") + path, data=body, method=method)
+def smoke(url, video, playback, reference_rgb=None, description=""):
+    def fetch(path, method="GET", body=None, headers=None):
+        request = Request(url.rstrip("/") + path, data=body, method=method, headers=headers or {})
         with urlopen(request, timeout=40) as response:
             return response.read()
 
     selected = json.loads(fetch("/resolutions"))[0]
     expected_size = tuple(map(int, selected.split("x")))
-    session = (
-        "/sessions/" + json.loads(fetch("/sessions?playback=" + playback, "POST"))["id"]
-    )
+    route = "/sessions"
+    body, headers = None, {}
+    if reference_rgb or description:
+        route = "/sessions/custom"
+        fields = {}
+        if reference_rgb:
+            fields["reference_rgb"] = reference_rgb.read_bytes()
+            assert len(fields["reference_rgb"]) == expected_size[0] * expected_size[1] * 3
+        if description:
+            fields["description"] = description.encode("utf-8")
+        boundary = uuid.uuid4().hex
+        parts = [f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n'.encode()
+                 + value + b"\r\n" for key, value in fields.items()]
+        body = b"".join(parts) + f"--{boundary}--\r\n".encode()
+        headers["Content-Type"] = "multipart/form-data; boundary=" + boundary
+    session = "/sessions/" + json.loads(fetch(route + "?playback=" + playback, "POST", body, headers))["id"]
     cursor = 0
 
     def until(kind, timeout=300):
@@ -130,5 +144,7 @@ if __name__ == "__main__":
     parser.add_argument("video", type=Path)
     parser.add_argument("--url", default="http://127.0.0.1:8190")
     parser.add_argument("--playback", choices=("mp4", "avc"), default="mp4")
+    parser.add_argument("--reference-rgb", type=Path, help="RGB24 at the default reply resolution")
+    parser.add_argument("--description", default="", help="Assistant and scene description")
     arguments = parser.parse_args()
-    smoke(arguments.url, arguments.video, arguments.playback)
+    smoke(arguments.url, arguments.video, arguments.playback, arguments.reference_rgb, arguments.description)

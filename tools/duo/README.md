@@ -22,6 +22,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 "$duo_bin/duo_live" "$duo_model" tools/duo /path/to
 
 单卡启动使用 `CUDA_VISIBLE_DEVICES=0`，将配置名改为 `single`。服务监听 `127.0.0.1`，可用 `ssh -N -L 18190:127.0.0.1:18190 USER@GPU_HOST` 转发。页面支持 512×384 和 256×192，接受 30 秒、64 MiB 以内的视频。已验证默认中文角色。语音对齐按汉字与空格分词，日语及韩语专用分词尚未验证。
 
+首次上传或录制对话视频前，可在“助手角色”中选择 PNG、JPEG 或 WebP 初始图片，并填写角色和场景说明。图片按回复分辨率居中裁切，预览就是送入编码器的画面。两项可独立覆盖启动预设，同一会话的各轮沿用同一角色。结束会话后可更换。
+
+原生接口 `POST /sessions/custom?resolution=512x384&playback=avc` 接收 multipart/form-data。字段 `reference_rgb` 为对应分辨率的 HWC RGB24 原始字节，`description` 为最多 2048 字节的 UTF-8 文本，至少提供一项。服务按会话使用发布的 VAE 编码器、后验均值和 Duo 通道统计量生成 BF16 参考 latent，角色说明进入 Intent 的系统前缀。使用启动预设时，沿用 `POST /sessions`。
+
 NF4 缓存包含量化投影、反量化 scale 和嵌入等权重。缓存由本地原权重生成，建包目录需有约 21 GB 空间。服务检查源分片与 adapter 文件标识。省略 `--intent-cache` 可从原权重在首次请求中直接量化。该缓存只加快模型加载，各回合仍根据实际录音、画面和聊天历史计算 Intent。
 
 ## 跨块调度与精度
