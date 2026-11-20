@@ -562,7 +562,8 @@ namespace fastllm {
         while (resultTokenQueue.size() > 0){
             resultTokenQueue.pop();
         }
-        isEnding = false;
+        isEnding = replayingKV = false;
+        originalCachedInputTokens = -1;
         preTokens = 0;
     }
 
@@ -3090,6 +3091,13 @@ namespace fastllm {
         }
     }
 
+    int basellm::GetKVAdmissionWindow() const {
+        if (kvAdmissionReserve == 0 || !prefillScheduling.chunked || prefillBatchPolicy.targetTokens <= 0 ||
+            pdRuntime || !SupportsPrefillBatching() || !SupportsSharedPagedKVPool() || !SupportsKVReplay())
+            return 0;
+        return kvAdmissionReserve < 0 ? 4096 : kvAdmissionReserve;
+    }
+
     bool basellm::RunDecodePipeline(std::unique_lock<std::mutex> &dictLock,
                                     int batchLimit, int totalLimit, long long *generatedTokens,
                                     std::chrono::system_clock::time_point *lastRecordTime,
@@ -3113,7 +3121,7 @@ namespace fastllm {
             }
             const bool first = c->curTokens == 0 && admittedPD && admittedPD->count(entry.first) &&
                 c->pdPending && !c->HasPendingPD() && c->preTokens > 0;
-            if (c->isAbort || (!first && c->curTokens == 0) || c->currentTokens.size() != 1 ||
+            if (c->isAbort || (!first && c->NeedsPrefill()) || c->currentTokens.size() != 1 ||
                 c->generationConfig.NeedsTokenHistory() || c->generationConfig.output_logits ||
                 !c->multimodalInput.empty() || c->HasPendingPD()) return false;
             // Bind the first grammar state before the sampler compiles it. Use
@@ -3125,6 +3133,18 @@ namespace fastllm {
             contexts.push_back(c);
         }
         if (contexts.empty() || contexts.size() > (size_t)batchLimit) return false;
+        // A chain can bypass admission for many steps. Reserve for all rows, including a
+        // partial-page copy and an unaligned append, then return to the scheduler to renew.
+        long long safeDecodeSteps = LLONG_MAX;
+        if (GetKVAdmissionWindow() > 0) {
+            auto *pool = GetPagedKVCacheBudgetManager(contexts.front());
+            if (pool && (long long)pool->maxPages * pool->pageLen >= max_positions) {
+                std::lock_guard<std::mutex> guard(pool->pageIndexLocker);
+                const long long pagesPerRow = pool->FreePageCount() / (long long)contexts.size();
+                safeDecodeSteps = (pagesPerRow - 1) * pool->pageLen;
+                if (safeDecodeSteps <= 0) return false;
+            }
+        }
         auto pipeline = CreateDecodePipeline(contexts);
         if (!pipeline || (preparePD && !pipeline->CanPreparePDReceive())) return false;
         std::unordered_set<ResponseContext *> admitted(contexts.begin(), contexts.end());
@@ -3197,12 +3217,13 @@ namespace fastllm {
         try {
             int slot = 0;
             const bool submitted = pipeline->Submit(slot);
+            --safeDecodeSteps;
             dictLock.lock();
             if (!submitted) return false;
             for (;;) {
                 // New work, cancellation, limits and config-sensitive requests
                 // break the chain. Drain the already submitted token first.
-                bool chain = !isFree;
+                bool chain = !isFree && safeDecodeSteps > 0;
                 for (auto *c : contexts) {
                     chain = chain && !c->isAbort && !c->isEnding &&
                         (c->generationConfig.output_token_limit <= 0 ||
@@ -3218,6 +3239,7 @@ namespace fastllm {
                 }
                 dictLock.unlock();
                 const bool next = chain && pipeline->Submit(1 - slot, slot);
+                if (next) --safeDecodeSteps;
                 auto tokens = collect(slot);
                 dictLock.lock();
                 if (!next) {
@@ -3268,12 +3290,14 @@ namespace fastllm {
                             return true;
                         }
                     }
+                    if (safeDecodeSteps == 0) return true;
                     pipeline.reset();
                     pipeline = CreateDecodePipeline(contexts);
                     if (!pipeline) return true;
                     dictLock.unlock();
                     slot = 0;
                     const bool restarted = pipeline->Submit(slot);
+                    --safeDecodeSteps;
                     dictLock.lock();
                     if (!restarted) return true;
                     continue;
@@ -3409,6 +3433,10 @@ namespace fastllm {
                     const bool fixedKvSlots = model->kvMemConfig.enabled && model->SupportsKvMemBatch();
                     const bool sharedKvPool = model->SupportsSharedPagedKVPool();
                     const int maxPromptTokens = model->max_positions - (sharedKvPool ? 1 : 0);
+                    const int kvAdmissionWindow = model->GetKVAdmissionWindow();
+                    if (model->kvAdmissionReserve > 0 && kvAdmissionWindow == 0)
+                        fprintf(stderr, "[Fastllm] KV admission reserve unavailable for this configuration; using full reservation.\n");
+                    bool recoveringKV = false;
                     const int prefillChunk = model->GetChunkedPrefillSize();
                     const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
                     // Keep empty per-request history slots for sampling fallbacks,
@@ -3477,7 +3505,7 @@ namespace fastllm {
                             if (entry.second->isEnding) continue;
                             if (!model->PollPD(entry.second) && entry.second->pdPending)
                                 waitingPD.insert(entry.first);
-                            else if (entry.second->curTokens == 0)
+                            else if (entry.second->NeedsPrefill())
                                 hasPrefillRequests = true;
                         }
                         for (auto &entry : model->responseContextDict.dicts)
@@ -3544,7 +3572,7 @@ namespace fastllm {
                             std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
                             return manager->FreePageCount();
                         };
-                        auto remainingPages = [&](ResponseContext *ctx) -> long long {
+                        auto remainingPages = [&](ResponseContext *ctx, int horizon) -> long long {
                             const Data &root = ctx->pastKeyValues[model->kvCacheId].first;
                             const Data &cache = root.multiDeviceData && !root.multiDeviceDatas.empty()
                                 ? *root.multiDeviceDatas.begin()->second : root;
@@ -3553,6 +3581,7 @@ namespace fastllm {
                             if (output > 0)
                                 end = std::min(end, (long long)ctx->allTokens.size() +
                                                    output - ctx->curTokens);
+                            if (horizon > 0) end = std::min(end, (long long)ctx->allTokens.size() + horizon);
                             // The final sampled token does not need its own KV.
                             const long long pages = (std::max(0LL, end - 1) + pageLen - 1) / pageLen;
                             long long extra = std::max(0LL, pages - allocatedTokens(root) / pageLen);
@@ -3563,40 +3592,82 @@ namespace fastllm {
                             }
                             return extra;
                         };
+                        auto canReplay = [&](ResponseContext *ctx) {
+                            return kvAdmissionWindow > 0 && preallocatedPagedCache && ctx->multimodalInput.empty() && !ctx->pdPending &&
+                                (long long)pagedManager->maxPages * pageLen >= model->max_positions;
+                        };
+                        auto reserveHorizon = [&](ResponseContext *ctx) {
+                            return canReplay(ctx) && !recoveringKV ? kvAdmissionWindow : 0;
+                        };
                         std::map<PagedCacheManager *, long long> reservedPages;
+                        bool recoveryRequestsLive = false;
                         int activeDecode = 0, activeRequests = 0;
                         std::vector<PrefillGroupLoad> groupLoads(prefillGroups);
                         if (batchPrefill || sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
                             auto *ctx = entry.second;
-                            if (!ctx->isEnding && (ctx->curTokens > 0 || ctx->prefillOffset > 0)) {
-                                if (sharedKvPool && hasPrefillRequests)
-                                    reservedPages[model->GetPagedKVCacheBudgetManager(ctx)] += remainingPages(ctx);
+                            if (recoveringKV && ctx->originalCachedInputTokens >= 0 && !ctx->isEnding)
+                                recoveryRequestsLive = true;
+                            if (!ctx->isEnding && (!ctx->NeedsPrefill() || ctx->prefillOffset > 0)) {
+                                // Rolling admission also checks for replay pressure during decode.
+                                if (sharedKvPool && (hasPrefillRequests || kvAdmissionWindow > 0))
+                                    reservedPages[model->GetPagedKVCacheBudgetManager(ctx)] += remainingPages(ctx, reserveHorizon(ctx));
                                 ++activeRequests;
-                                if (ctx->curTokens > 0) {
+                                if (!ctx->NeedsPrefill()) {
                                     ++activeDecode;
                                     ++groupLoads.at(model->GetPrefillBatchGroup(ctx)).decoding;
                                 }
                             }
                         }
-                        auto releasePendingPrefix = [&](ResponseContext *ctx) {
-                            if (!ctx->cacheLen) return;
-                            model->OnResponseContextRemoved(ctx);
-                            for (auto &kv : ctx->pastKeyValues) {
-                                ReleasePagedCachePages(kv.first, true);
-                                ReleasePagedCachePages(kv.second, true);
+                        auto restartPrefill = [&](ResponseContext *ctx) {
+                            if (ctx->replayingKV) {
+                                model->ReleaseKVForReplay(ctx);
+                            } else {
+                                model->OnResponseContextRemoved(ctx);
+                                for (auto &kv : ctx->pastKeyValues) {
+                                    ReleasePagedCachePages(kv.first, true);
+                                    ReleasePagedCachePages(kv.second, true);
+                                }
                             }
                             ctx->currentTokens = ctx->allTokens;
                             ctx->cacheLen = ctx->preTokens = ctx->prefillOffset = 0;
                             ctx->intParams.clear();
-                            model->OnResponseContextCreated(ctx);
+                            ctx->prefillPreview.reset();
+                            if (!ctx->replayingKV) model->OnResponseContextCreated(ctx);
                         };
+                        // Replay-capable adapters use a single physical admission domain. Only
+                        // walk active rows a second time when the rolling forecast exceeds it.
+                        if (kvAdmissionWindow > 0 && !reservedPages.empty()) {
+                            const long long available = freePagedPages(reservedPages.begin()->first);
+                            if (reservedPages.begin()->second > available) {
+                                long long needed = 0;
+                                ResponseContext *victim = nullptr;
+                                for (const auto &entry : model->responseContextDict.dicts) {
+                                    auto *ctx = entry.second;
+                                    if (ctx->isEnding || (ctx->NeedsPrefill() && !ctx->prefillOffset)) continue;
+                                    const bool eligible = canReplay(ctx);
+                                    needed += remainingPages(ctx, eligible ? 1 : 0);
+                                    if (eligible && (!victim || ctx->queuedAt > victim->queuedAt)) victim = ctx;
+                                }
+                                if (needed > available && victim) {
+                                    if (victim->originalCachedInputTokens < 0)
+                                        victim->originalCachedInputTokens = victim->cacheLen;
+                                    victim->replayingKV = true;
+                                    restartPrefill(victim);
+                                    recoveringKV = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        // Requests that survived or resumed under pressure get full credit until
+                        // the retracted cohort exits. Continuous arrivals need not drain to idle.
+                        if (!recoveryRequestsLive) recoveringKV = false;
                         auto reserveSharedRequest = [&](ResponseContext *ctx) {
                             auto *domain = model->GetPagedKVCacheBudgetManager(ctx);
-                            const long long needed = remainingPages(ctx);
+                            const long long needed = remainingPages(ctx, reserveHorizon(ctx));
                             if (reservedPages[domain] + needed > freePagedPages(domain)) {
                                 // A waiting cache hit must not pin otherwise
                                 // reclaimable pages needed by active decoders.
-                                releasePendingPrefix(ctx);
+                                if (ctx->cacheLen) restartPrefill(ctx);
                                 return false;
                             }
                             reservedPages[domain] += needed;
@@ -3627,7 +3698,7 @@ namespace fastllm {
                                 // for both sides of every comparator invocation.
                                 auto *left = a.context;
                                 auto *right = b.context;
-                                const bool lp = left->curTokens == 0, rp = right->curTokens == 0;
+                                const bool lp = left->NeedsPrefill(), rp = right->NeedsPrefill();
                                 if (lp != rp) return lp;
                                 if (lp) {
                                     // A completed chunk rejoins behind work that has already
@@ -3649,7 +3720,7 @@ namespace fastllm {
                             inference_trace::DetailRegion previewRegion("prefill_preview");
                             int pendingRequests = 0;
                             for (const auto &order : orders)
-                                pendingRequests += !order.context->isEnding && order.context->curTokens == 0;
+                                pendingRequests += !order.context->isEnding && order.context->NeedsPrefill();
                             const auto policy = scheduling.Effective(model->prefillBatchPolicy,
                                                                     activeDecode + pendingRequests);
                             if (activeDecode < std::max(1, policy.minDecodeRequests))
@@ -3667,7 +3738,7 @@ namespace fastllm {
                             PrefillBatchQueue prefillQueue;
                             for (int i = 0; i < (int)orders.size(); ++i) {
                                 const auto *ctx = orders[i].context;
-                                if (!ctx->isEnding && ctx->curTokens == 0)
+                                if (!ctx->isEnding && ctx->NeedsPrefill())
                                     prefillQueue.Push(i, model->GetPrefillBatchGroup(ctx));
                             }
                             // Select without pinning KV, including idle/zero-wait admission.
@@ -3719,7 +3790,7 @@ namespace fastllm {
                                         auto &protectedPages = protectedDomains[domain];
                                         long long pins = 0;
                                         for (int page : unreferenced) pins += !protectedPages.Contains(page);
-                                        const long long growth = std::max(0LL, remainingPages(ctx) - prefix / pageLen);
+                                        const long long growth = std::max(0LL, remainingPages(ctx, reserveHorizon(ctx)) - prefix / pageLen);
                                         if (previewReserved[domain] + growth + pins > availablePages[domain]) {
                                             capacityLimited = groupLoads[group].capacityLimited = true;
                                             continue;
@@ -3792,11 +3863,11 @@ namespace fastllm {
                                     const int group = model->GetPrefillBatchGroup(ctx);
                                     if (chunked && scheduling.balanceDP && admittedTokens[group] + count >
                                         std::max(1, prefillBatchLimit / prefillGroups)) {
-                                        if (!ctx->prefillOffset) releasePendingPrefix(ctx);
+                                        if (!ctx->prefillOffset && ctx->cacheLen) restartPrefill(ctx);
                                         continue;
                                     }
                                     if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) {
-                                        if (!ctx->prefillOffset) releasePendingPrefix(ctx);
+                                        if (!ctx->prefillOffset && ctx->cacheLen) restartPrefill(ctx);
                                         if (!scheduling.balanceDP) break;
                                         continue;
                                     }
@@ -3854,7 +3925,7 @@ namespace fastllm {
                                     it.second->currentTokens.size() == 1 &&
                                     plannedPrefills.count(it.first) && model->SupportsDecodePipeline();
                                 const bool pendingPrefill = !pdFirst && ((batchPrefill || sharedKvPool)
-                                    ? it.second->curTokens == 0 : it.second->preTokens == 0);
+                                    ? it.second->NeedsPrefill() : it.second->preTokens == 0);
                                 if (isPrompt && !pendingPrefill) {
                                     continue;
                                 }
@@ -4271,6 +4342,7 @@ namespace fastllm {
                                     continue; // No sampling, output, EOS, grammar or output-limit update.
                                 }
                                 it.second->prefillOffset = 0;
+                                it.second->replayingKV = false;
                                 int curRet = ret[i];
                                 do {
                                     if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
@@ -4458,7 +4530,8 @@ namespace fastllm {
 
     static void CopyResponseStatistics(const ResponseContext &context, int *statistics) {
         int inputTokens = std::max(0, context.inputTokens);
-        const int cached = context.pdCachedInputTokens >= 0 ? context.pdCachedInputTokens : context.cacheLen;
+        const int cached = context.pdCachedInputTokens >= 0 ? context.pdCachedInputTokens :
+                           (context.originalCachedInputTokens >= 0 ? context.originalCachedInputTokens : context.cacheLen);
         statistics[0] = std::min(inputTokens, std::max(0, cached));
         statistics[1] = inputTokens - statistics[0];
         statistics[2] = std::max(0, context.curTokens);
@@ -4880,6 +4953,20 @@ namespace fastllm {
             // independent of that hard budget, as in ordinary chunked prefill.
             return std::max({GetChunkedPrefillSize(), chunkedPrefillSize, prefillBatchPolicy.targetTokens});
         return this->GetChunkedPrefillSize();
+    }
+
+    bool basellm::SetKVAdmissionReserve(int tokens) {
+        std::lock_guard<std::mutex> lock(mainLoopLocker);
+        if (mainLoop || tokens < 0) return false;
+        kvAdmissionReserve = tokens;
+        return true;
+    }
+
+    void basellm::ReleaseKVForReplay(ResponseContext *context) {
+        for (auto &kv : context->pastKeyValues) {
+            ReleasePagedCachePages(kv.first, true);
+            ReleasePagedCachePages(kv.second, true);
+        }
     }
 
     bool basellm::SetPrefillScheduling(bool balanceDP, int adaptiveRequests, bool chunked,

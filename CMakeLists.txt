@@ -4339,6 +4339,9 @@ if (BUILD_CLI)
 endif()
 
 add_library(fastllm_tools SHARED tools/src/pytools.cpp)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(fastllm_tools PRIVATE fastipc/fastipc.cpp)
+endif()
 target_link_libraries(fastllm_tools PRIVATE fastllm)
 
 set(BUILD_INFO_USE_CUDA "false")

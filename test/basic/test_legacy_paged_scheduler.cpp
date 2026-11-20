@@ -188,6 +188,110 @@ public:
     }
 };
 
+// Exercise the production scheduler with actual page ownership. Forward is cheap and
+// its next token depends on the complete input prefix, including earlier outputs.
+class ReplayModel : public SchedulerModel {
+    int stopAt;
+    std::map<const Data *, uint32_t> state;
+    int Next(const Data &key, const float *tokens, int count) {
+        uint32_t &hash = state[&key];
+        if (key.dims[1] == count) hash = 0;
+        for (int i = 0; i < count; ++i) hash = hash * 31 + (int)tokens[i];
+        return key.dims[1] >= stopAt ? eos_token_id : 1 + hash % 251;
+    }
+public:
+    int retractions = 0;
+    bool cancelOnReplay = false;
+    std::atomic<int> victimIndex{-1};
+    ReplayModel(int stopAt, int reserve) : SchedulerModel(CacheView::Paged, 256, 8, 8), stopAt(stopAt) {
+        max_positions = 128;
+        canDoBatchForward = true;
+        chunkedPrefillSize = 16;
+        Check(SetPrefillBatching(32, 0) && SetPrefillScheduling(false, 0, true, 0, 0) &&
+              SetKVAdmissionReserve(reserve), "KV replay configuration failed");
+    }
+    bool SupportsKVReplay() const override { return true; }
+    bool SupportsSharedPagedKVPool() const override { return true; }
+    bool SupportsPrefillBatching() const override { return true; }
+    bool SupportsChunkedPrefillScheduling() const override { return true; }
+    void ReleaseKVForReplay(ResponseContext *c) override {
+        if (++retractions == 1 && cancelOnReplay) {
+            Pause();
+            victimIndex.store(c->allTokens.front() - 1);
+        }
+        OnResponseContextRemoved(c);
+        basellm::ReleaseKVForReplay(c);
+    }
+    int Forward(const Data &ids, const Data &mask, const Data &positions,
+                std::vector<std::pair<Data, Data>> &cache, const GenerationConfig &cfg,
+                const LastTokensManager &hist, std::vector<float> *logits) override {
+        SchedulerModel::Forward(ids, mask, positions, cache, cfg, hist, logits);
+        return Next(cache[0].first, (const float *)ids.cpuData, ids.Count(0));
+    }
+    std::vector<int> ForwardBatch(int n, const Data &ids, const std::vector<Data *> &masks,
+            const std::vector<Data *> &positions, const std::vector<int> &lengths,
+            std::vector<std::pair<Data *,Data *>> &kv, const std::vector<GenerationConfig> &cfg,
+            const LastTokensManager &hist, std::vector<std::vector<float> *> *logits) override {
+        auto out = SchedulerModel::ForwardBatch(n, ids, masks, positions, lengths, kv, cfg, hist, logits);
+        int offset = 0;
+        for (int i = 0; i < n; ++i) {
+            out[i] = Next(*kv[i].first, (const float *)ids.cpuData + offset, lengths[i]);
+            offset += lengths[i];
+        }
+        return out;
+    }
+};
+
+void ReplayPressure(int stopAt, int reserve, bool cancel = false) {
+    constexpr int count = 8, prompt = 12;
+    ReplayModel model(stopAt, reserve);
+    model.cancelOnReplay = cancel;
+    model.Pause();
+    GenerationConfig cfg;
+    cfg.output_token_limit = 110;
+    cfg.add_special_tokens = false;
+    std::vector<int> handles;
+    for (int i = 0; i < count; ++i)
+        handles.push_back(model.LaunchResponseTokens(std::vector<int>(prompt, i+1), cfg));
+    model.Resume();
+    std::vector<uint32_t> hashes(count);
+    for (int i = 0; i < count; ++i)
+        for (int j = 0; j < prompt; ++j) hashes[i] = hashes[i] * 31 + i + 1;
+    std::vector<int> emitted(count);
+    std::vector<bool> done(count);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+    while (std::find(done.begin(), done.end(), false) != done.end()) {
+        Check(std::chrono::steady_clock::now() < deadline, "replayed request stalled");
+        const int victim = model.victimIndex.load();
+        if (victim >= 0 && !done[victim]) {
+            int hit, miss, generated;
+            Check(model.GetResponseStatistics(handles[victim], hit, miss, generated) &&
+                  hit == 0 && miss == prompt && generated >= emitted[victim] && generated > 0,
+                  "retraction reset public usage");
+            model.AbortResponse(handles[victim]);
+            done[victim] = true;
+            model.Resume();
+        }
+        for (int i = 0; i < count; ++i) {
+            if (done[i] || !model.CanFetchResponse(handles[i])) continue;
+            const int token = model.FetchResponseTokens(handles[i]);
+            if (token < 0) {
+                Check(token == -1 && emitted[i] == std::min(stopAt-prompt, cfg.output_token_limit),
+                      "replay lost output or changed stop condition");
+                done[i] = true;
+            } else {
+                Check(token == (int)(1 + hashes[i] % 251), "replay changed streamed token");
+                hashes[i] = hashes[i] * 31 + token;
+                ++emitted[i];
+            }
+        }
+        std::this_thread::yield();
+    }
+    model.CheckReleased();
+    Check((model.retractions > 0) == (reserve > 0 && stopAt > 32), "expected pressure behavior");
+    if (reserve && stopAt <= 32) Check(model.peakActiveCaches > 2, "reduced reservation did not admit more requests");
+}
+
 int Launch(SchedulerModel &model, int prompt, int output) {
     GenerationConfig config;
     config.output_token_limit = output;
@@ -359,6 +463,8 @@ int main() {
         SetMaxTokens(0);
         CompletePagesOnly();
         OverlappingPageViews();
+        for (int stopAt : {20, 100, 128}) for (int reserve : {0, 8}) ReplayPressure(stopAt, reserve);
+        ReplayPressure(100, 8, true);
         SharedPoolPressure();
         ConcurrentConsumers();
         for (auto view : {CacheView::Contiguous, CacheView::Paged, CacheView::TensorParallel}) {

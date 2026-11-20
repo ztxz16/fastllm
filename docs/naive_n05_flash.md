@@ -58,15 +58,17 @@ CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调�
 
 ### Indexer prefill 计算精度
 
-`--indexer_compute_dtype fp8` 显式启用 Hopper 上的原生 FP8 prefill 打分，
-与控制 Q/K 量化和缓存存储的 `--indexer_dtype fp8` 分开设置。默认 `auto`
-保留原来的计算路径。内核使用仓库内 CUDA/PTX 实现，不需要额外 Python 包或编译服务。
-FP8 Q/K 的数值及 scale 保持不变，使用原生 FP8 Tensor Core 筛选 3072～4096 个候选，
-再以原来的 BF16 算法重算候选分数并选出 2048 个位置，减小误差逐层放大。
-不做全量 BF16 回算，也不承诺逐位一致；显式启用前应按实际语料检查精度。
-不超过 4096 个 key 时保留原路径。默认 `auto` 不引入这项数值变化。
-非 Hopper、非 FP8 Q/K、不支持的布局、解码和 Graph 捕获保留原计算路径。
-参数须在预热前设置；Python API 对应 `indexer_compute_dtype="fp8"`。
+在启动或预热前通过 `--indexer_compute_dtype` 选择打分方式。Python API 使用同名参数。
+`--indexer_dtype` 单独控制 Q/K 量化和 K 缓存存储。
+
+| 取值 | 长前缀 prefill 的选位方式 |
+|---|---|
+| `auto`（默认） | 沿用模型原有计算路径。 |
+| `fp8` | 原生 FP8 打分，保留 3072～4096 个候选，再按 BF16 重算候选分数，选出 2048 个位置。 |
+| `fp8_direct` | 直接按原生 FP8 分数选出 2048 个位置。省去 BF16 精排，可能改变入选位置和模型输出。 |
+
+两种 FP8 模式共用仓库内的 Hopper CUDA 内核、因果掩码和同分时优先较小位置的规则。
+它们需要 FP8 Q/K 和支持的 prefill 形状。非 Hopper、key 数不超过 4096、解码和 Graph 捕获等情况沿用原路径。
 
 ### DSA FP4 KV（实验性）
 

@@ -16,6 +16,7 @@
 #ifdef USE_CUDA
 #include "naive_n05_indexer_tp.h"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
+#include "devices/cuda/naive-n05-swa-prefill.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-linear-scratch.h"
@@ -78,7 +79,8 @@ namespace {
         if (!rows.empty() && rows.size() < 16) {
             int capacity = 0;
             for (const auto &row : rows) capacity = std::max(capacity, row.capacity);
-            directWidth = std::min(2048, ((capacity + page - 1) / page) * (page / ranks));
+            const int pages = capacity / page + (capacity % page != 0);
+            directWidth = std::min(2048, pages * (page / ranks));
         }
         const int rowWords = (directWidth ? directWidth : 2048) * 2;
         const int part = rows.size() * rowWords;
@@ -154,12 +156,16 @@ void NaiveN05FlashModel::SetIndexerDataType(DataType type) {
 }
 
 void NaiveN05FlashModel::SetIndexerComputeFP8(bool enabled) {
+    SetIndexerCompute(NaiveIndexerComputeFromFP8(enabled));
+}
+
+void NaiveN05FlashModel::SetIndexerCompute(NaiveIndexerCompute mode) {
     if (tpPrepared || tpServingState || !tpKVPool.empty() || !activePrefixes.empty())
         throw std::invalid_argument("Set Indexer compute dtype before warmup or inference.");
 #ifndef USE_CUDA
-    if (enabled) throw std::invalid_argument("FP8 Indexer compute requires CUDA.");
+    if (mode != NaiveIndexerCompute::Auto) throw std::invalid_argument("FP8 Indexer compute requires CUDA.");
 #endif
-    indexerComputeFP8 = enabled;
+    indexerCompute = mode;
 }
 
 void NaiveN05FlashModel::SetIndexerTPStorage(bool shardByLayer, bool shardByContext) {
@@ -764,7 +770,7 @@ void NaiveN05FlashModel::RunLocalPrefillRouter(Data &normed, Data &routerWeight,
             destination.FakeFrom(input, shardRow * embed_dim * sizeof(float));
             ToDataType(source, destination, FLOAT32);
         });
-        if (!FastllmCudaNaiveRouterFP32(input, routerWeight, projectedRouter))
+        if (!FastllmCudaNaiveRouterFP32(input, routerWeight, projectedRouter, routerInput))
             Linear(input, routerWeight, Data(), projectedRouter);
         forEachSpan([&](size_t localRow, size_t shardRow, int count) {
             FastllmCudaCopyFromDeviceToDevice((float *)router.cudaData + localRow * experts,
@@ -1428,6 +1434,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
         }
         std::vector<FastllmNaivePrefillAttentionItem> prefillAttention;
+        std::vector<FastllmNaiveStagedSwa> stagedSwa;
         bool pairedPrefill = false;
         int attendPhase = 0;
         std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
@@ -1701,7 +1708,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 rankIndices.FakeFrom(indices, (size_t)tpRank * rows * indexTopK * sizeof(int));
                                 const bool mergedParts = balanced && indexTopK == 2048 &&
                                     FastllmCudaNaiveBalancedIndexer(indexQ, indexWeights, *scoreKey,
-                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding || contextSharded, rankIndices, prefillScores, indexerComputeFP8);
+                                        localPast, tpRank, ranks, indexFp8, indexerLayerSharding || contextSharded, rankIndices, prefillScores, indexerCompute);
                                 for (int part = 0; !mergedParts && part < parts; ++part) {
                                     const int first = part == 0 ? tpRank * partRows :
                                         length - (tpRank + 1) * partRows;
@@ -1714,7 +1721,7 @@ Data NaiveN05FlashModel::RunTarget(
                                     localIndices.FakeFrom(indices,
                                         (size_t)(tpRank * rows + part * partRows) * indexTopK * sizeof(int));
                                     FastllmCudaNaiveIndexer(localQ, localWeights, *scoreKey, indexHeads, indexDim,
-                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding || contextSharded, prefillScores, indexerComputeFP8);
+                                        localPast + first, indexTopK, indexFp8, localIndices, indexerLayerSharding || contextSharded, prefillScores, indexerCompute);
                                 }
                                 FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, tpRank, indices);
                                 if (balanced) balancedIndexRanks = ranks;
@@ -1723,7 +1730,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 Data temporary;
                                 Data &gathered = length % ranks ? temporary : indices;
                                 ScoreRaggedIndexer(indexQ, indexWeights, *scoreKey, localPast,
-                                    indexTopK, indexFp8, tpRank, ranks, gathered, prefillScores, indexerComputeFP8);
+                                    indexTopK, indexFp8, tpRank, ranks, gathered, prefillScores, indexerCompute);
                                 const int rows = RaggedIndexerRows(length, ranks);
                                 AssertInFastLLM(FastllmNcclAllGather(
                                     (int *)gathered.cudaData + (size_t)tpRank * rows * indexTopK,
@@ -1737,7 +1744,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 return;
                             }
                             else FastllmCudaNaiveIndexer(indexQ, indexWeights, *scoreKey, indexHeads, indexDim,
-                                                        localPast, indexTopK, indexFp8, indices, false, prefillScores, indexerComputeFP8);
+                                                        localPast, indexTopK, indexFp8, indices, false, prefillScores, indexerCompute);
                         }
                     }
                     }
@@ -1845,10 +1852,12 @@ Data NaiveN05FlashModel::RunTarget(
                             cfg.headDim, cfg.valueDim, prefillScores ? *prefillScores : normed)) {
                         // SWA has no Indexer projections. Its input norm is dead
                         // until the post-attention RMSNorm overwrites this slice.
-                        FastllmCudaNaiveAttention(q, attentionKey, attentionValue, *selected, sink,
+                        FastllmCudaNaivePrefillAttention(q, attentionKey, attentionValue, *selected, sink,
                             cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                             localPast, slidingLayers[layer] ? window : 0, attn, true,
-                            slidingLayers[layer] ? &normed : nullptr);
+                            slidingLayers[layer] ? &normed : nullptr,
+                            batch && batch->Size() > 1 && !verifying && q.isFake && attn.isFake && normed.isFake
+                                ? &stagedSwa : nullptr);
                     }
                 }
                 if (slidingLayers[layer] && capture && !capture->prefixes.empty()) {
@@ -1913,6 +1922,10 @@ Data NaiveN05FlashModel::RunTarget(
                            sequence);
                     offset += count;
                 }
+                if (!stagedSwa.empty()) {
+                    FastllmCudaNaiveFlushSwa(stagedSwa, localWeight(ap + "attention_sink_bias"), cfg.heads, cfg.kvHeads);
+                    stagedSwa.clear();
+                }
                 if (batchVerifyIndex && phase == 0) {
                     if (contextSharded && !verifyIndexItems.empty()) {
                         RunContextVerifyIndexer(batchIndexQ, batchIndexWeights, verifyIndexItems,
@@ -1949,14 +1962,14 @@ Data NaiveN05FlashModel::RunTarget(
                             prefillItems[i].keys->dims[1] <= 8192;
                     if (!pairedPrefill)
                         FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
-                            indexFp8, prefillScores, indexerComputeFP8);
+                            indexFp8, prefillScores, indexerCompute);
                 }
                 if (batchPrefillIndex && phase == 0) {
                     AssertInFastLLM((int)prefillItems.size() == batch->Size(), "Incomplete prefill Indexer batch.");
-                    if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores, indexerComputeFP8)) {
+                    if (!FastllmCudaNaiveBatchBalancedIndexer(prefillItems, tpRank, prefillRanks, indexFp8, true, prefillScores, indexerCompute)) {
                         for (const auto &item : prefillItems) {
                             if (FastllmCudaNaiveBalancedIndexer(*item.query, *item.weights, *item.keys,
-                                    item.past, tpRank, prefillRanks, indexFp8, true, *item.indices, prefillScores, indexerComputeFP8)) continue;
+                                    item.past, tpRank, prefillRanks, indexFp8, true, *item.indices, prefillScores, indexerCompute)) continue;
                             const int part = item.query->dims[1] / (2 * prefillRanks);
                             for (int range = 0; range < 2; ++range) {
                                 const int first = range ? item.query->dims[1] - (tpRank + 1) * part : tpRank * part;
@@ -1966,7 +1979,7 @@ Data NaiveN05FlashModel::RunTarget(
                                 localWeights.FakeFrom(*item.weights, (size_t)first * indexHeads * item.weights->unitSize);
                                 localIndices.FakeFrom(*item.indices, (size_t)range * part * indexTopK * sizeof(int));
                                 FastllmCudaNaiveIndexer(localQ, localWeights, *item.keys, indexHeads, indexDim,
-                                    item.past + first, indexTopK, indexFp8, localIndices, true, prefillScores, indexerComputeFP8);
+                                    item.past + first, indexTopK, indexFp8, localIndices, true, prefillScores, indexerCompute);
                             }
                         }
                     }
@@ -1985,7 +1998,7 @@ Data NaiveN05FlashModel::RunTarget(
             for (size_t i = 0; i < prefillItems.size(); ++i)
                 FastllmCudaNaivePrefillIndexedAttention(prefillItems[i], prefillAttention.at(i),
                     localWeight(ap + "attention_sink_bias"), indexHeads, indexDim, indexTopK,
-                    indexFp8, indexerComputeFP8, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
+                    indexFp8, indexerCompute, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     prefillScores, prefillScores ? *prefillScores : normed);
         } else if (dpPrefill)
             FastllmCudaNaiveBatchIndexerAttention(prefillAttention, localWeight(ap + "attention_sink_bias"),
@@ -2197,7 +2210,7 @@ Data NaiveN05FlashModel::RunTarget(
                     ToDataType(routerSource, fp32Input, DataType::FLOAT32);
                     const bool prefillRouter = !verifying && !decodeWorkspace && length > 1 &&
                         (!batch || !batch->Decode());
-                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router))
+                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router, routerInput))
                         Linear(fp32Input, routerWeight, Data(), router);
                 }
                 Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");

@@ -19,21 +19,19 @@ template <int Max, int Groups = 1> struct Storage {
     BF prob[Groups * 8][Max + 8];
     int selected[Tile];
 };
-template<int Width, int Pitch, int Tile, int Threads, int Window = 0, class KV>
-__device__ inline void Load(BF (*dst)[Pitch], int *selected, KV kv,
-        const int *indices, int query, int first, int count, int keys,
-        int past, bool causal, int stride, int head, int indexRow) {
-    int t = threadIdx.x;
-    if (t < Tile) {
-        int key = first + t < count ? (indices ? indices[(size_t)indexRow * count + first + t] : first + t) : -1;
-        if constexpr (Window > 0) {
-            if (key >= 0) key += max(0, past + query + 1 - Window);
-        }
-        if (key >= keys || (causal && key > past + query)) key = -1;
-        // Translate each selected row once, then share it across vector loads.
-        selected[t] = key >= 0 ? kv.PhysicalRow(key) : -1;
+template<int Window, class KV>
+__device__ __forceinline__ int SelectedRow(KV kv, const int *indices, int indexRow, int slot,
+        int count, int keys, int position, bool causal) {
+    int key = slot < count ? (indices ? indices[(size_t)indexRow * count + slot] : slot) : -1;
+    if constexpr (Window > 0) {
+        if (key >= 0) key += max(0, position + 1 - Window);
     }
-    __syncthreads();
+    return key >= 0 && key < keys && (!causal || key <= position) ? kv.PhysicalRow(key) : -1;
+}
+
+template<int Width, int Pitch, int Tile, int Threads, class KV>
+__device__ inline void CopySelected(BF (*dst)[Pitch], const int *selected, KV kv, int stride, int head) {
+    const int t = threadIdx.x;
     for (int i = t; i < Tile * (Width / 8); i += Threads) {
         int key = selected[i / (Width / 8)], d = i % (Width / 8) * 8;
         naive_dsa_decode::Copy<true>(&dst[i / (Width / 8)][d],
@@ -42,6 +40,15 @@ __device__ inline void Load(BF (*dst)[Pitch], int *selected, KV kv,
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;" ::: "memory");
 #endif
+}
+template<int Width, int Pitch, int Tile, int Threads, int Window = 0, class KV>
+__device__ inline void Load(BF (*dst)[Pitch], int *selected, KV kv,
+        const int *indices, int query, int first, int count, int keys,
+        int past, bool causal, int stride, int head, int indexRow) {
+    const int t = threadIdx.x;
+    if (t < Tile) selected[t] = SelectedRow<Window>(kv, indices, indexRow, first + t, count, keys, past + query, causal);
+    __syncthreads();
+    CopySelected<Width, Pitch, Tile, Threads>(dst, selected, kv, stride, head);
 }
 template <int Max, int Window = 0, int Groups = 1>
 __global__ __launch_bounds__(256) void Generic(const BF *q, FastllmNaiveKV key, FastllmNaiveKV value,

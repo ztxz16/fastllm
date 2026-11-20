@@ -74,8 +74,23 @@ static void Case(int rows, int past, int heads, bool fp8, int pageLen, bool sink
             heads, kvHeads, stride, keys, 128, past, true, 0);
     const BF *query = q.data + (size_t)initialRows * heads * 192;
     BF *output = b.data + (size_t)initialRows * heads * 128;
-    for (bool registers : {false, true}) {
-        if (fullRows && registers) {
+    const bool contiguous = !fp8 && !pageLen && !offset && fullRows > 0;
+    for (int mode = 0; mode < (contiguous ? 3 : 2); ++mode) {
+        if (mode == 2) {
+            StagedSwaBatch<32> batch{};
+            int tiles = 0, first = 0;
+            for (int i = 0; i < 2 && first < fullRows; ++i) {
+                const int count = i ? fullRows - first : std::max(1, fullRows / 2);
+                tiles += (count + 7) / 8;
+                batch.entries[i] = {query + (size_t)first * heads * 192, k.data, v.data,
+                    output + (size_t)first * heads * 128, count, stride, keys, past + initialRows + first, tiles};
+                first += count;
+            }
+            auto kernel = SwaContiguous<8, 32>;
+            Check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(ContigWindow<8>)));
+            kernel<<<dim3(tiles, heads / 8), 256, sizeof(ContigWindow<8>)>>>(
+                batch, sink ? bias.data : nullptr, heads, kvHeads);
+        } else if (fullRows && mode == 1) {
             Check(cudaFuncSetAttribute(SwaRegisterTile<8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                        sizeof(SwaRegisterStorage<8>)));
             SwaRegisterTile<8><<<dim3((fullRows + 7) / 8, heads / 8), 256, sizeof(SwaRegisterStorage<8>)>>>(

@@ -2,6 +2,7 @@
 #define FASTLLM_NAIVE_N05_FLASH_H
 
 #include "basellm.h"
+#include "models/naive_indexer_compute.h"
 #include "parallel/model.h"
 #include <algorithm>
 #include <atomic>
@@ -30,6 +31,7 @@ namespace fastllm {
         void ConfigureAttentionParallel(int attentionDP) override;
         void SetIndexerDataType(DataType dataType) override;
         void SetIndexerComputeFP8(bool enabled);
+        void SetIndexerCompute(NaiveIndexerCompute mode);
         void SetKVCacheDataType(DataType dataType) override;
         void SetIndexerTPStorage(bool shardByLayer, bool shardByContext = false);
         std::map<std::string, std::vector<std::pair<std::string, DataType>>>
@@ -56,6 +58,10 @@ namespace fastllm {
                                      int &token) override;
         bool NeedAttentionMask(int, int) override { return false; }
         bool SupportsPrefillBatching() const override;
+        bool SupportsKVReplay() const override {
+            return attentionDP == 1 && !draftEnabled && !kvMemConfig.enabled && !tpPagedCaches.empty();
+        }
+        void ReleaseKVForReplay(ResponseContext *context) override;
         int GetPrefillBatchGroups() const override { return attentionDP; }
         bool SupportsChunkedPrefillScheduling() const override { return SupportsPrefillBatching(); }
         int GetPrefillBatchGroup(const ResponseContext *context) const override;
@@ -609,7 +615,7 @@ namespace fastllm {
         float partialRotary = 0.334f, valueScale = 0.707f;
         bool indexFp8 = true;
         bool fp8IndexerCache = false;
-        bool indexerComputeFP8 = false;
+        NaiveIndexerCompute indexerCompute = NaiveIndexerCompute::Auto;
         bool indexerLayerSharding = false;
         bool indexerContextSharding = false;
         bool tpIndexerPeerAccess = false;

@@ -427,9 +427,11 @@ static void BatchBalancedPrefillIndexer(bool paged, bool remote, bool eight = fa
     fflush(stdout);
 }
 static void FusedPrefillAttention(bool paged) {
+    const bool hopper = FastllmCudaRuntimeArch() == 90;
+    const std::vector<int> headCounts = hopper ? std::vector<int>{8, 16, 32, 64} : std::vector<int>{16, 32};
     for (int rows : {32, 65, 256, 2048})
-        for (int kvHeads : {1, 2}) {
-            const int heads = kvHeads * 16, length = 8193;
+        for (int heads : headCounts) {
+            const int kvHeads = std::max(1, heads / 16), length = 8193;
             FP8Tensor key(length, kvHeads * 192 + 128, 91, paged), value(length, kvHeads * 128, 97, paged);
             Data q(BFLOAT16), sink(FLOAT32), idx(INT32), reference, actual;
             Upload(q, {1, rows, heads * 192}, 53);
@@ -447,8 +449,7 @@ static void FusedPrefillAttention(bool paged) {
                 }
             idx.ToDevice(DataDevice::CUDA, {0}, true);
             for (bool causal : {false, true}) {
-                // Dense BF16 contains the exact dequantized FP8 values and uses
-                // the materialized-score fallback instead of the FP8 fused path.
+                // Dense BF16 contains the exact dequantized cache values.
                 FastllmCudaNaiveAttention(q, key.dense, value.dense, idx, sink, heads, kvHeads, 192, 128,
                                           length - rows, 0, reference, causal);
                 FastllmCudaNaiveAttention(q, key.data(), value.data(), idx, sink, heads, kvHeads, 192, 128,
@@ -469,8 +470,9 @@ static void FusedPrefillAttention(bool paged) {
                     balanced.ToDevice(DataDevice::CUDA, {0}, true);
                     bool fused = FastllmCudaNaiveBalancedAttention(q, key.data(), value.data(), balanced, sink, heads,
                                                                    kvHeads, length - rows, 4, actual);
-                    Require(fused == (rows >= 2048 && FastllmCudaRuntimeArch() == 90), "balanced fused dispatch");
-                    Require(Read<uint16_t>(actual) == Read<uint16_t>(reference),
+                    const bool expected = hopper && (heads == 8 || (rows >= 64 && rows * heads >= 2048));
+                    Require(fused == expected, "balanced fused dispatch");
+                    if (fused) Require(Read<uint16_t>(actual) == Read<uint16_t>(reference),
                             "balanced fused FP8 prefill changed exact output");
                     ++checks;
                 }

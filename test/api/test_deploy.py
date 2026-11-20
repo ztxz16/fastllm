@@ -67,6 +67,22 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn('fastllm_pytools.llm', sys.modules)
         self.assertNotIn('fastllm_pytools.server', sys.modules)
 
+    def test_transport_keeps_explicit_replica_ports_and_defaults_to_local_ipc_without_ports(self):
+        self.assertEqual(self.resolve()['router']['transport'], 'http')
+        del self.data['replicas'][0]['port']
+        with self.assertRaisesRegex(ValueError, 'replica.port'):
+            self.resolve()
+        del self.data['replicas'][1]['port']
+        cfg = self.resolve()
+        self.assertEqual(cfg['router']['transport'], 'fastipc')
+        self.assertTrue(all(r['url'] is None and '--port' not in r['command'] for r in cfg['replicas']))
+        self.data['router']['transport'] = 'http'
+        with self.assertRaisesRegex(ValueError, 'replica.port'):
+            self.resolve()
+        self.data['router']['transport'] = 'other'
+        with self.assertRaisesRegex(ValueError, 'router.transport'):
+            self.resolve()
+
     def test_worker_python_preserves_virtual_environment(self):
         import venv
         venv_dir = self.root/'venv'
