@@ -44,9 +44,12 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
-          uint32_t kSplitKFactor = 1, bool kDeviceGroupedRows = false, bool kScatterRows = false>
+          uint32_t kSplitKFactor = 1, bool kDeviceGroupedRows = false, bool kScatterRows = false,
+          typename GroupedOutput = void>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const*, cd_dtype_t*> gmem_d,
+sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, void>,
+                                                  cute::conditional_t<kScatterRows, cd_dtype_t* const*, cd_dtype_t*>,
+                                                  GroupedOutput> gmem_d,
                              const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                              int* grouped_layout,
@@ -112,6 +115,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
     static_assert(!kScatterRows || (kDeviceGroupedRows && kUseTMAStoreEpilogue && !kWithAccumulation &&
                                    kSplitKFactor == 1 && cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>));
     static constexpr uint32_t kNumEpiMSubs = kUseTMAStoreEpilogue ? (BLOCK_M / kEpiSubM) : 0;
+    static constexpr bool kCustomOutput = !cute::is_same_v<GroupedOutput, void>;
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
         ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * kEpiSubM)
         : 0u;
@@ -195,7 +199,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
         cute::prefetch_tma_descriptor(&tensor_map_b_base);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
-        if constexpr (!kScatterRows) cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (!kScatterRows && !kCustomOutput) cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
     __syncwarp();
 
@@ -1203,7 +1207,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
             const int64_t cd_batch_offset = kIsBatchedEpilogue
                 ? static_cast<int64_t>(scheduler.current_group_idx) * stride_cd_batch : 0;
 
-            if constexpr (kUseTMAStoreEpilogue) {
+            if constexpr (kCustomOutput) {
+                static_assert(kDeviceGroupedRows && !kScatterRows && !kWithAccumulation && kUseTMAStoreEpilogue);
+                gmem_d.template store<BLOCK_M, BLOCK_N, kMTilesPerWarp, kNTilesPerWarp, kNumMathThreads>(
+                    smem_d_base, shape_n, m_base, n_base, m_tile_base, n_tile_base, lane_idx, accum);
+            } else if constexpr (kUseTMAStoreEpilogue) {
                 #pragma unroll
                 for (uint32_t ms = 0; ms < kNumEpiMSubs; ++ms) {
                     const uint32_t epi_m_start = ms * kEpiSubM;
@@ -1371,7 +1379,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
         } // persistent loop
 
         // Final TMA store drain
-        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1 and !kScatterRows) {
+        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1 and !kScatterRows and !kCustomOutput) {
             if (math_warp_idx == 0 and lane_idx == 0)
                 cute::tma_store_wait<0>();
         }
