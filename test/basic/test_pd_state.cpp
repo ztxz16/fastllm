@@ -1377,7 +1377,16 @@ int main(int argc, char **argv) {
         port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
         const auto endpoint = port.Address();
         port.Stop();
-        StateModel prefill, decode;
+        struct RetryModel : StateModel {
+            std::atomic<bool> busy{false};
+            std::atomic<int> retries{0};
+            bool SelectPDRequestGroup(ResponseContext &context, const std::vector<size_t> &available,
+                                      size_t required) override {
+                if (busy) { ++retries; return false; }
+                return StateModel::SelectPDRequestGroup(context, available, required);
+            }
+        } prefill;
+        StateModel decode;
         SetPageLen(128);
         SetMaxTokens(16);
         prefill.ConfigurePD(json11::Json::object{{"role", "prefill"},
@@ -1478,7 +1487,27 @@ int main(int argc, char **argv) {
                 reused.allTokens.insert(reused.allTokens.end(), {31, 37});
             reused.currentTokens = reused.allTokens;
             reused.inputTokens = reused.allTokens.size();
+            prefill.busy = !extended;
             decode.BeginPD(&reused);
+            if (prefill.busy) {
+                for (int i = 0; i < 3000 && prefill.retries < 2; ++i) {
+                    decode.PollPD(&reused);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                Check(prefill.retries >= 2, "cached request did not retry group admission");
+                fastkv::Service control;
+                fastkv::Writer query; query.U32(8); query.String("test:gpu-state-v2:test-recurrent-state-v1");
+                query.Ints({3,7,11,19,23}); query.String("");
+                auto reply = control.Call(endpoint, {query.bytes,{}});
+                fastkv::Reader quote(reply.metadata);
+                Check(quote.U32() == 8 && quote.U64() == 0 && quote.U64() == 0,
+                      "requeued L2 hit was charged as new compute");
+                quote.U64(); quote.U64(); quote.String(); // forward rate and session placement
+                const auto hostTokens = quote.U64(), hostBytes = quote.U64(), queuedBytes = quote.U64();
+                Check(hostTokens == 5 && hostBytes > 0 && queuedBytes == hostBytes,
+                      "requeued L2 hit lost its restore charge");
+                prefill.busy = false;
+            }
             for (int i = 0; i < 3000 && !decode.PollPD(&reused); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             Check(!reused.isEnding && reused.preTokens == (extended ? 7 : 5), "cached handoff");

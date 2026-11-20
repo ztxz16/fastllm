@@ -664,6 +664,11 @@ bool HostCache::Restore(Hit hit, std::vector<int> devices, std::vector<Buffer> t
     if (submitted) result = promise->get_future();
     return submitted;
 }
+double HostCache::RestoreBytesPerSecond() const {
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    const auto &stats = impl->stats;
+    return stats.restoreMicroseconds ? double(stats.restoredBytes) * 1e6 / stats.restoreMicroseconds : 0;
+}
 HostCache::Statistics HostCache::Stats() const {
     std::lock_guard<std::mutex> lock(impl->mutex);
     auto stats = impl->stats;

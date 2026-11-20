@@ -362,6 +362,9 @@ class PrefillRouter {
         std::shared_ptr<void> lease;
     };
     explicit PrefillRouter(size_t peers);
+    // Producers apply their own page size before advertising a host hit.
+    static bool PreferHostPrefix(size_t residentTokens, size_t hostTokens, size_t pageTokens,
+                                 double tokensPerSecond, double restoreSeconds);
     static size_t SessionPeer(const std::string &key, const std::vector<std::string> &peers);
     Route Reserve(size_t tokens, const std::vector<Estimate> &estimates, size_t preferred = SIZE_MAX,
                   bool pinPreferred = false);

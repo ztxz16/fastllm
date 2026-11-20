@@ -80,6 +80,8 @@ class HostCache {
     // after all DMA has completed. A busy return leaves targets untouched.
     bool RestoreIntoAsync(Hit hit, std::vector<Buffer> targets, std::future<Message> &result);
     Statistics Stats() const;
+    // Copy-worker bandwidth only. Zero until the first successful restore.
+    double RestoreBytesPerSecond() const;
     void Drain();
   private:
     bool Restore(Hit hit, std::vector<int> devices, std::vector<Buffer> targets,

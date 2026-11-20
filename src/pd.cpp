@@ -551,24 +551,37 @@ struct PDRuntime {
         return cache ? cache->ProbeTokens(identity, input) : 0;
     }
     double HostRestoreBytesPerSecond() const {
-        const auto stats = hostCache ? hostCache->Stats() : fastkv::HostCache::Statistics{};
-        return stats.restoreMicroseconds ?
-            std::max(1.0, double(stats.restoredBytes) * 1e6 / stats.restoreMicroseconds) : 1e10;
+        const double measured = hostCache ? hostCache->RestoreBytesPerSecond() : 0;
+        return measured > 0 ? std::max(1.0, measured) : 1e10;
     }
-    std::future<fastkv::Message> Prefill(std::vector<int> input,
-                                       std::shared_ptr<fastkv::Cancellation> cancellation, RequestMetadata metadata,
-                                       bool reportUsage, const basellm *shardAdapter) {
+    size_t ResidentPageTokens() const { return residentPrefix ? std::max(1, GetPageLen()) : 1; }
+    bool PreferHostPrefix(size_t resident, const fastkv::HostCache::Hit &hit,
+                          double forwardRate, double restoreRate) const {
+        return fastkv::PrefillRouter::PreferHostPrefix(resident, hit.Tokens(), ResidentPageTokens(),
+                                                       forwardRate, double(hit.Bytes()) / restoreRate);
+    }
+    std::future<fastkv::Message> Prefill(basellm &model, std::vector<int> input,
+                                        std::shared_ptr<fastkv::Cancellation> cancellation, RequestMetadata metadata,
+                                        uint32_t kind) {
         auto request = std::make_shared<PrefillRequest>();
         request->input = std::move(input);
         request->metadata = std::move(metadata);
-        request->reportUsage = reportUsage;
-        request->shardAdapter = shardAdapter;
+        request->reportUsage = kind == PDPrefillWithUsage || kind == PDShardPrefill;
+        request->shardAdapter = kind == PDShardPrefill ? &model : nullptr;
         request->cancellation = std::move(cancellation);
         request->work = workload;
-        // Pin an L2 hit at admission: its saved work is real, not a stale hint.
+        // Keep the lease for the final DP placement. Charge the waiting queue
+        // for the tier we expect to use, including a recomputed L1 tail.
         if (hostCache) request->hostHit = hostCache->Find(identity, request->input);
-        request->SetRemaining(request->input.size() - request->hostHit.Tokens());
-        request->SetRestoreBytes(request->hostHit.Bytes());
+        size_t cached = 0;
+        if (request->hostHit) {
+            cached = CachedTokens(model, request->input, request->metadata.sessionKey);
+            if (PreferHostPrefix(cached, request->hostHit, workload->tokensPerSecond.load(), HostRestoreBytesPerSecond())) {
+                cached = request->hostHit.Tokens();
+                request->SetRestoreBytes(request->hostHit.Bytes());
+            }
+        }
+        request->SetRemaining(request->input.size() - cached);
         auto result = request->result.get_future();
         {
             std::lock_guard<std::mutex> lock(prefillMutex);
@@ -731,7 +744,7 @@ void PDRuntime::RunPrefill(basellm &model) {
     std::deque<Request> active, prepared, exporting;
     size_t reserved = 0, preparedTokens = 0;
     const size_t prepareBudget = totalTokenCapacity / 2;
-    const size_t page = residentPrefix ? std::max(1, GetPageLen()) : 1;
+    const size_t page = ResidentPageTokens();
     const size_t contextLimit = std::max(batchRequests, model.maxBatch > 0 ? model.maxBatch : 1);
     auto startHostRestore = [&](const Request &request) {
         auto placement = PDReceivePlacement(request->hostHit.Metadata(), request->hostHit.Payloads(), model.PDRequestDevices(*request->context));
@@ -739,8 +752,7 @@ void PDRuntime::RunPrefill(basellm &model) {
         return hostCache->RestoreAsync(request->hostHit, std::move(placement), request->hostRestore,
                                        request->cancellation);
     };
-    auto retire = [&](const Request &request) {
-        request->SetRemaining(0); request->SetRestoreBytes(0);
+    auto releaseReservation = [&](const Request &request) {
         reserved -= request->reservation;
         request->reservation = 0;
         auto context = std::move(request->context);
@@ -750,6 +762,10 @@ void PDRuntime::RunPrefill(basellm &model) {
         }
         context.reset();
         request->groupAdmission.reset();
+    };
+    auto retire = [&](const Request &request) {
+        request->SetRemaining(0); request->SetRestoreBytes(0);
+        releaseReservation(request);
     };
     // Only the model lane retires contexts. The export lane owns no model
     // scheduler state and only sees completed, pinned requests.
@@ -1036,8 +1052,8 @@ void PDRuntime::RunPrefill(basellm &model) {
                     model.OnResponseContextCreated(&context);
                     try { request->groupAdmission = ReserveGroup(model, context, request->reservation); }
                     catch (const fastkv::CapacityBusy &) {
-                        retire(request);
-                        request->SetRemaining(request->input.size());
+                        // Still queued: keep its estimated compute and restore work.
+                        releaseReservation(request);
                         std::lock_guard<std::mutex> queueLock(prefillMutex);
                         waiting.push_back(request);
                         continue;
@@ -1048,12 +1064,8 @@ void PDRuntime::RunPrefill(basellm &model) {
                     }
                     const size_t residentTokens = request->hostHit && residentPrefix
                         ? model.PreviewPDResidentPrefix(request->input, model.PDRequestGroup(context)) : hit.tokens;
-                    // A few extra cached tail tokens do not justify restoring
-                    // an entire host checkpoint when L1 already covers the prefix.
-                    const bool useHost = request->hostHit.Tokens() > residentTokens &&
-                        double(request->hostHit.Tokens() - residentTokens) / workload->tokensPerSecond.load() >
-                        double(request->hostHit.Bytes()) / HostRestoreBytesPerSecond();
-                    if (useHost) {
+                    if (request->hostHit && PreferHostPrefix(residentTokens, request->hostHit,
+                            workload->tokensPerSecond.load(), HostRestoreBytesPerSecond())) {
                         request->restoring = true; request->restoreBegin = restoreBegin;
                         request->SetRestoreBytes(request->hostHit.Bytes());
                         request->SetRemaining(request->input.size() - request->hostHit.Tokens());
@@ -1479,9 +1491,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 Check(request.buffers.empty() && !tokens.empty() && tokens.size() < size_t(max_positions),
                       "invalid prefill request");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds the prefill token pool");
-                return raw->Prefill(std::move(tokens), std::move(cancellation), std::move(metadata),
-                                    kind == PDPrefillWithUsage || kind == PDShardPrefill,
-                                    kind == PDShardPrefill ? this : nullptr);
+                return raw->Prefill(*this, std::move(tokens), std::move(cancellation), std::move(metadata), kind);
             }, [this, raw = runtime.get()](const fastkv::Message &request, fastkv::Message &reply) {
                 if (request.metadata.size() < 4) return false;
                 fastkv::Reader reader(request.metadata);
@@ -1508,18 +1518,24 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 Check(!tokens.empty() && tokens.size() < size_t(max_positions), "invalid routing prompt");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds routing peer capacity");
                 fastkv::Writer writer;
-                writer.U32(kind); writer.U64(raw->CachedTokens(*this, tokens, session));
+                const size_t resident = raw->CachedTokens(*this, tokens, session);
+                const auto forwardRate = uint64_t(std::max(1.0, raw->workload->tokensPerSecond.load()));
+                writer.U32(kind); writer.U64(resident);
                 writer.U64(raw->workload->tokens.load());
-                writer.U64(uint64_t(std::max(1.0, raw->workload->tokensPerSecond.load())));
+                writer.U64(forwardRate);
                 if (kind >= 6) {
                     const auto record = raw->sessions->Get(session);
                     writer.U64(record.version); writer.String(record.owner);
                 }
                 if (kind >= 8) {
                     const auto hit = raw->hostCache ? raw->hostCache->Find(raw->identity, tokens) : fastkv::HostCache::Hit{};
-                    writer.U64(hit.Tokens()); writer.U64(hit.Bytes());
+                    const auto restoreRate = uint64_t(raw->HostRestoreBytesPerSecond());
+                    // The producer knows its page size. Filtering the quote here
+                    // works with older decoders and different P/D page layouts.
+                    const bool useHost = raw->PreferHostPrefix(resident, hit, forwardRate, restoreRate);
+                    writer.U64(useHost ? hit.Tokens() : 0); writer.U64(useHost ? hit.Bytes() : 0);
                     writer.U64(raw->workload->restoreBytes.load());
-                    writer.U64(uint64_t(raw->HostRestoreBytesPerSecond()));
+                    writer.U64(restoreRate);
                 }
                 if (kind == PDUsageProbe && requested != raw->identity) writer.U32(PDShardPrefill);
                 reply.metadata = std::move(writer.bytes);
