@@ -1641,6 +1641,36 @@ class Fixture : public NaiveN05FlashModel {
                 if (observed.size() != expected.size()) throw std::runtime_error("PD tail logits count");
                 RequireCloseLogits(observed.data(), expected, "PD tail target continuation logits");
             }
+            if (pd && count == 2) {
+                // The first two verify rows of request 0 can emit only token 7.
+                // Request 1 is already past its minimum. Compare the boundary
+                // and bonus rows against an independent scalar forward.
+                std::vector<GenerationConfig> configs(count);
+                std::vector<float> ids(count, 17);
+                std::vector<std::pair<Data *, Data *>> caches;
+                for (int i = 0; i < count; ++i) {
+                    auto &cfg = configs[i];
+                    cfg.top_k = 1; cfg.output_token_limit = 16; cfg.input_token_length = past[i] + 1;
+                    cfg.output_token_least = i ? 1 : 3;
+                    for (int token = 0; token < 256; ++token) if (token != 7) cfg.stop_token_ids.insert(token);
+                    for (auto &layer : actual[i]->pastKeyValues) caches.emplace_back(&layer.first, &layer.second);
+                }
+                for (int step = 0; step < 4; ++step) {
+                    std::vector<Data> positions(count); std::vector<Data *> pos;
+                    std::vector<int> oracle(count);
+                    for (int i = 0; i < count; ++i) {
+                        positions[i].CopyFrom(Data(FLOAT32,{1,1},{float(past[i]+1+step)}));
+                        pos.push_back(&positions[i]);
+                        oracle[i] = Forward(Data(FLOAT32,{1,1},{ids[i]}), Data(), positions[i],
+                                            reference[i]->pastKeyValues, configs[i], LastTokensManager());
+                    }
+                    auto got = ForwardBatch(count, Data(FLOAT32,{1,count},ids), {}, pos, std::vector<int>(count,1),
+                                            caches, configs, LastTokensManager());
+                    if (got != oracle || (step < 2 && got[0] != 7))
+                        throw std::runtime_error("batched min_tokens changed greedy output");
+                    ids.assign(got.begin(), got.end());
+                }
+            }
             for (auto *group : {&reference, &actual}) for (auto &ctx : *group) OnResponseContextRemoved(ctx.get());
         }
         // Cancellation before the first forward leaves only an ownership entry.

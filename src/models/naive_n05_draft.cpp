@@ -2378,6 +2378,31 @@ struct NaiveN05FlashModel::DraftRound {
         return proposed[0];
     }
 
+#ifdef USE_CUDA
+    // Only target argmax decides acceptance. Mask the bonus row as well if
+    // it falls before min_tokens. Proposal logits can remain unmasked.
+    void MaskGreedyStops(Data &logits, int offset) const {
+        if (!greedy || config.output_token_least <= 0) return;
+        const int remaining = config.output_token_least - (oldLength + 1 - config.input_token_length);
+        const int rows = std::min<int>(proposed.size() + 1, remaining);
+        if (rows <= 0) return;
+        std::vector<int> stop;
+        auto add = [&](int token) {
+            if (token >= 0 && token < vocab && std::find(stop.begin(), stop.end(), token) == stop.end())
+                stop.push_back(token);
+        };
+        add(model.eos_token_id);
+        for (int token : model.eos_token_ids) add(token);
+        for (int token : config.stop_token_ids) add(token);
+        Data view;
+        view.FakeFrom(logits, size_t(offset) * vocab * sizeof(float));
+        view.Resize({rows, vocab});
+        if (logits.dataDevice == CUDA) FastllmResetLogitsOfEOSAll(rows, &view, stop);
+        else for (int row = 0; row < rows; ++row)
+            for (int id : stop) reinterpret_cast<float *>(view.cpuData)[size_t(row) * vocab + id] = -1e30f;
+    }
+#endif
+
     std::vector<float> Distribution(Data &logits, int row, int position,
             const LastTokensUnit &history, const GenerationConfig &stepConfig) {
         logits.ToDevice(DataDevice::CPU);
@@ -2425,7 +2450,11 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
         }
     }
 #endif
-    const bool greedy = round.greedy = DraftIsGreedy(config) && config.output_token_least <= 0;
+    bool canMaskStops = config.output_token_least <= 0;
+#ifdef USE_CUDA
+    canMaskStops |= baseLogits.dataDevice == CUDA;
+#endif
+    const bool greedy = round.greedy = DraftIsGreedy(config) && canMaskStops;
     LastTokensUnit samplingTokens = round.CopyHistory();
     auto &selection = round.selection;
     selection = SelectLogits(config, true);
@@ -2433,7 +2462,8 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
     // Grammar masks are applied per verification row. Greedy verification also
     // keeps full logits on the device, then transfers only the masked argmax.
     if (baseLogits.dataDevice == DataDevice::CUDA &&
-        ((greedy && config.tool_call_grammar) || (!greedy && SupportsCudaRejectionSampling(config)))) {
+        ((greedy && (config.tool_call_grammar || config.output_token_least > 0)) ||
+         (!greedy && SupportsCudaRejectionSampling(config)))) {
         if (!greedy) {
             context.proposalProbs.ToDevice(DataDevice::CUDA, baseLogits.dataDeviceIds, false);
             context.proposalProbs.Resize({limit, vocab});
@@ -2754,7 +2784,6 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
         anchors.push_back(round->anchor); limits.push_back(round->limit); contexts.push_back(&round->context);
         distributed = distributed && round->context.deviceRank >= 0 &&
             round->context.deviceRank < (int)draftTP->devices.size() && round->limit > 0 &&
-            round->config.output_token_least == 0 &&
             (DraftIsGreedy(round->config) || SupportsCudaRejectionSampling(round->config));
         total += round->limit; steps = std::max(steps, round->limit);
     }
@@ -2907,7 +2936,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchLocal(const std::vector<DraftRound *> 
     std::vector<GenerationConfig> configs;
     for (auto &owner : rounds) {
         auto &r = *owner;
-        if (r.limit < 1 || r.config.output_token_least > 0 ||
+        if (r.limit < 1 ||
             (!DraftIsGreedy(r.config) && !SupportsCudaRejectionSampling(r.config))) return false;
         offsets.push_back(total); total += r.limit; steps = std::max(steps, r.limit);
         configs.push_back(r.config);
@@ -3113,6 +3142,7 @@ void NaiveN05FlashModel::PrepareDraftAcceptanceLocal(const std::vector<DraftRoun
     for (int i = 0; i < (int)rounds.size(); ++i) {
         auto &r = *rounds[i]; offsets.push_back(offset); offset += r.proposed.size() + 1;
         if (r.vocab != vocab || (!r.greedy && !r.selection.cudaLogits)) continue;
+        r.MaskGreedyStops(logits, offsets.back());
         if (r.config.tool_call_grammar && !deviceMasks) {
             auto config = r.config;
             for (int row = 0; row <= (int)r.proposed.size(); ++row) {
@@ -3276,6 +3306,7 @@ int NaiveN05FlashModel::FinishDraftRound(DraftRound &round, Data &logits,
     std::vector<GenerationConfig> verifyConfigs;
     bool deviceMasks = false;
 #ifdef USE_CUDA
+    if (round.sampledAccepted < 0) round.MaskGreedyStops(logits, 0);
     if (round.sampledAccepted < 0 && round.proposalOwner && round.proposalOwner->sampling.constrained &&
             round.proposalOwner->sampling.rows == 1 && logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32) {
         ApplyDraftDevice();
@@ -3532,7 +3563,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             // immutable transitions, so only its request-local cursor advances.
             if (!context.committed || context.kv.empty() || terminal ||
                 context.pending.size() > pendingLimit ||
-                config.output_logits || config.output_token_least > 0 ||
+                config.output_logits ||
                 (!config.tool_call_grammar && (config.tool_call_token_mask ||
                     config.tool_call_name_constraint_enabled ||
                     config.tool_call_parameter_name_constraint_enabled ||
