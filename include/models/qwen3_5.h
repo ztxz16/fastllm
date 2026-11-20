@@ -21,6 +21,8 @@
 
 namespace fastllm {
     class CudaWorkspace;
+    int Qwen35ConfiguredMtpDrafts();
+    int Qwen35MtpProfileInterval();
     struct Qwen35VisionTPState;
     struct Qwen35DFlashTpMlpWorkspace;
 
@@ -250,6 +252,7 @@ namespace fastllm {
             int tokens = 0;
             // The actual proposal distribution belongs to this chain.
             // Truncate only changes KV, never the saved proposal or tokens.
+            int proposalDepth = 0; // A request may pin its own lookahead at admission.
             bool sampleProposal = false;
             bool proposalUsesLogits = false;
             bool deferProposalTokens = false;
@@ -272,9 +275,14 @@ namespace fastllm {
 
             void Append(const Data &k, const Data &v,
                         PagedCacheManager &keyPool, PagedCacheManager &valuePool);
+            int ProposalCapacity() const;
             void Truncate(int tokens);
             void SetTpLength(int tokens, int heads, int headDim, DataType type);
         };
+#ifdef USE_CUDA
+        static int VerifyMtpSamplingRows(float *targetLogits, int vocab, int device,
+                const MtpKvCache &proposal, int drafts, const GenerationConfig &config, int *output);
+#endif
         struct MtpPagedCachePool {
             PagedCacheManager key;
             PagedCacheManager value;

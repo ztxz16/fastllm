@@ -1654,7 +1654,13 @@ def make_normal_llm_model(args, startup_progress = None):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
-            is_qwen35_model = (
+            is_loop_model = model_type == "sensenova_loop"
+            if is_loop_model:
+                if args.dtype == "auto":
+                    args.dtype = "bfloat16"
+                if args.atype == "auto":
+                    args.atype = "bfloat16"
+            is_qwen35_model = not is_loop_model and (
                 architecture in (
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
@@ -1662,7 +1668,7 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type in ("qwen3_5", "qwen3_5_moe") or
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
             )
-            if is_qwen35_model and getattr(args, "auto", False):
+            if (is_qwen35_model or is_loop_model) and getattr(args, "auto", False):
                 from .auto_config import apply_model_defaults
                 apply_model_defaults(args, config)
                 mtp = args.mtp
@@ -1791,9 +1797,11 @@ def make_normal_llm_model(args, startup_progress = None):
                         raise ValueError(
                             "GLM-5.3 MTP uses the checkpoint's embedded "
                             "next-token prediction layer and does not accept an external draft")
-                elif not (is_qwen35_model or is_qwen38_flash_next_model):
+                elif is_loop_model and mtp not in (1, 2):
+                    raise ValueError("SenseNova Loop supports one or two embedded MTP draft tokens")
+                elif not (is_qwen35_model or is_loop_model or is_qwen38_flash_next_model):
                     raise ValueError(
-                        "MTP currently requires a Qwen3.5, Qwen3.8-Flash-Next or GLM-5.3 target, got "
+                        "MTP currently requires a SenseNova-Loop, Qwen3.5, Qwen3.8-Flash-Next or GLM-5.3 target, got "
                         "architecture=%s model_type=%s" %
                         (architecture, model_type))
                 if (not is_deepseek_v4_model and speculative_draft_path and not (

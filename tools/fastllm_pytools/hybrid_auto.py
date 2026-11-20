@@ -393,14 +393,26 @@ def geometry(metadata, kv_dtype, mtp, dspark=0):
         kernel = int(get("linear_conv_kernel_dim", "ssm.conv_kernel", 4))
         if min(key_heads, value_heads, key_dim, value_dim, kernel) <= 0:
             raise ValueError("Auto: invalid Qwen3.5 recurrent state")
-        kv = [kv_heads * dim * 2 * unit if kind == "full_attention" else 0 for kind in kinds]
+        full_kv = kv_heads * dim * 2 * unit
         state_bytes = (value_heads * key_dim * value_dim +
                        (key_heads * key_dim + value_heads * value_dim) * kernel) * 4
-        state = [state_bytes if kind == "linear_attention" else 0 for kind in kinds]
+        visits = [1] * layers
+        recurrent = state_bytes
+        if metadata.get("model_type") == "sensenova_loop":
+            loop = metadata["loop_settings"]
+            start, end, passes = loop["start"], loop["end"], loop["eval_count"]
+            if not (0 <= start < end <= layers and passes >= 1 and 0 <= mtp <= 2):
+                raise ValueError("Unsupported SenseNova Loop execution plan")
+            visits[start:end] = [passes] * (end - start)
+            # The loop stores Q as well as K and V in convolution state and
+            # retains one recurrent snapshot for each speculative prefix.
+            recurrent = (state_bytes + 4 * key_heads * key_dim * kernel) * (1 + mtp)
+        kv = [count * full_kv if kind == "full_attention" else 0 for count, kind in zip(visits, kinds)]
+        state = [count * recurrent if kind == "linear_attention" else 0 for count, kind in zip(visits, kinds)]
         if mtp:
             if int(config.get("mtp_num_hidden_layers", 0)) != 1:
                 raise ValueError("Auto: Qwen3.5 MTP requires one embedded draft layer")
-            kv.append(kv_heads * dim * 2 * unit)
+            kv.append(full_kv)
             state.append(state_bytes)
         return Geometry(family, layers, context, hidden, 1, 1, inter, kv, state,
                         1, hidden * 8 + value_heads * value_dim * 12, 1024,
