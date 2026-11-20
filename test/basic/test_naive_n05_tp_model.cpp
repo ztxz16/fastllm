@@ -233,6 +233,9 @@ struct NaiveN05GraphTestAccess {
         if (model.tpSamplingLogits.GetBytes() != bytes)
             throw std::runtime_error("draft warmup sized verification logits for the training block");
         if (model.tpBatchVerifyStorage) for (const auto &rank : model.tpBatchVerifyStorage->ranks) {
+            const size_t slots = size_t(model.block_cnt) * model.maxBatch * (model.HasSeparateIndexer() ? 8 : 4);
+            if (rank->storage->hostCache.size() < slots || rank->storage->cacheTable.GetBytes() < slots * sizeof(void *))
+                throw std::runtime_error("draft warmup undersized the verification cache binding table");
             const auto &scratch = rank->storage->buffers.decode;
             const size_t rows = size_t(model.maxBatch) * (model.draftTokens + 1);
             if (scratch.indexQuery.Count(0) < rows * 16 * 128 ||
@@ -1635,6 +1638,7 @@ class Fixture : public NaiveN05FlashModel {
             KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
         }
+        SetSaveHistoryChat(true);
         WarmUp();
         if (batching) DraftPrefillOracle();
         useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();

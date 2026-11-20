@@ -1808,11 +1808,13 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     };
     auto bindCache = [&](TPDecodeState &state) {
         if (!state.dynamicCache) return;
+        // Context sharding and KVMem create separate Indexer storage after the first warmup.
+        // Reserve the final table layout up front so captured device pointers stay valid.
+        const int slotsPerRow = (HasSeparateIndexer() || indexerContextSharding || kvMemConfig.enabled) ? 8 : 4;
+        const size_t count = size_t(block_cnt) * std::max(sequences, maxBatch > 0 ? maxBatch : 512) * slotsPerRow;
         for (int rank = 0; rank < ranks; ++rank) {
             auto &storage = *state.ranks[rank]->storage;
             FastllmCudaSetDevice(tpDevices[rank]);
-            const size_t count = (size_t)block_cnt *
-                std::max(sequences, maxBatch > 0 ? maxBatch : 512) * (HasSeparateIndexer() ? 8 : 4);
             if (storage.hostCache.empty()) {
                 storage.hostCache.resize(count, nullptr);
                 storage.cacheTable.dataType = INT32;
