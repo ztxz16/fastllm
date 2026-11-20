@@ -20,7 +20,6 @@ namespace fastllm {
     class PDStateReader;
     class NaiveN05FlashModel : public basellm, public parallel::AttentionParallelModel {
     protected:
-        static constexpr int MaxTPDecodeBatch = 512;
         struct TargetCapture;
         struct LogitsSelection;
         struct TargetBatch;
@@ -477,6 +476,7 @@ namespace fastllm {
         // Affinity fixes the KV owner before admission. The global scheduler caps
         // total requests when the batch is not divisible by the number of groups.
         int RunningRequestsPerGroup(int batch) const { return 1 + (batch - 1) / attentionDP; }
+        std::vector<int> LocalServingGraphBuckets(int maxRequests) const;
         int WindowRequestsPerGroup(int batch) const { return WindowRequestsPerGroup(batch, attentionDP); }
         static int WindowRequestsPerGroup(int batch, int groups) {
             const int mean = 1 + (batch - 1) / groups;

@@ -16,8 +16,7 @@ static void Check(bool ok, const char *message) {
 namespace fastllm {
 struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     static void CheckAttentionPlan() {
-        // Host-only: also cover sizes beyond the CUDA Graph limit. The plan has
-        // no batch cap; unsupported graph shapes retain the normal eager path.
+        // The plan must also track large batches and arbitrary request order.
         {
             AttentionParallelState::RequestPlan plan;
             PagedCacheManager pool;
@@ -102,6 +101,25 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     std::vector<std::unique_ptr<ResponseContext>> contexts;
     std::vector<std::shared_ptr<TPDecodeState::Storage>> storage;
     NaiveN05PrefixCacheTestAccess() {
+        for (int groups : {1, 2, 4, 8}) {
+            attentionDP = groups;
+            for (int requests : {1, 17, 513, 769, 1024, 1025, 1536, 2048, 2049, 3072, 4097}) {
+                const int peak = (requests + groups - 1) / groups;
+                draftEnabled = false;
+                const auto buckets = LocalServingGraphBuckets(requests);
+                for (int live = 1; live <= peak; ++live) {
+                    const auto shape = DecodeGraphBatch::Select(live, buckets);
+                    Check(shape && shape.graphRows >= live && shape.graphRows - live < 8,
+                          "decode graph must cover every admitted owner batch");
+                }
+                draftEnabled = true;
+                const int window = std::min(requests, peak + (peak + 3) / 4);
+                Check(LocalServingGraphBuckets(requests) == SpeculativeGraphBuckets(window),
+                      "verification graph must cover the reserved owner window");
+            }
+        }
+        draftEnabled = false;
+        attentionDP = 1;
         block_cnt = 48;
         maxBatch = 352;
         max_positions = 200000;

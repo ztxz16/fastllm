@@ -2793,7 +2793,9 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
         "Naive startup KV pool exceeds the memory budget; reduce --tokens/--max_batch or prefill chunk size.");
     const int pageLen = GetPageLen();
     const int fullLayers = std::count(slidingLayers.begin(), slidingLayers.end(), 0);
-    const int graphRows = DecodeGraphBatchBuckets(std::min(batch, MaxTPDecodeBatch)).back();
+    const auto graphBuckets = LocalServingGraphBuckets(batch);
+    AssertInFastLLM(!graphBuckets.empty(), "Naive graph batch exceeds tensor dimensions.");
+    const int graphRows = graphBuckets.back();
     const int64_t metadataBytes = (int64_t)fullLayers * 2 * batch *
         ((std::min<int64_t>(max_positions, tokens) + pageLen - 1) / pageLen * sizeof(int) + 512) +
         (int64_t)block_cnt * graphRows * (separateIndex ? 8 : 4) * sizeof(void *) + 512;
