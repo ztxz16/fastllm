@@ -6205,7 +6205,7 @@ bool FastllmCudaNaiveEncodeDSAMaps(void *host, const void *key, const void *valu
 bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
         FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
-#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+#ifdef FASTLLM_NAIVE_BLACKWELL_DECODE
     using namespace fastllm;
     namespace bw = blackwell_decode;
     const int arch = FastllmCudaRuntimeArch();
