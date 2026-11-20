@@ -16,6 +16,7 @@
 #ifdef USE_CUDA
 #include "naive_n05_indexer_tp.h"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
+#include "devices/cuda/naive-n05-swa-prefill.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-linear-scratch.h"
@@ -1429,6 +1430,7 @@ Data NaiveN05FlashModel::RunTarget(
             }
         }
         std::vector<FastllmNaivePrefillAttentionItem> prefillAttention;
+        std::vector<FastllmNaiveStagedSwa> stagedSwa;
         bool pairedPrefill = false;
         int attendPhase = 0;
         std::vector<FastllmNaivePrefillIndexerItem> prefillItems;
@@ -1846,10 +1848,12 @@ Data NaiveN05FlashModel::RunTarget(
                             cfg.headDim, cfg.valueDim, prefillScores ? *prefillScores : normed)) {
                         // SWA has no Indexer projections. Its input norm is dead
                         // until the post-attention RMSNorm overwrites this slice.
-                        FastllmCudaNaiveAttention(q, attentionKey, attentionValue, *selected, sink,
+                        FastllmCudaNaivePrefillAttention(q, attentionKey, attentionValue, *selected, sink,
                             cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                             localPast, slidingLayers[layer] ? window : 0, attn, true,
-                            slidingLayers[layer] ? &normed : nullptr);
+                            slidingLayers[layer] ? &normed : nullptr,
+                            batch && batch->Size() > 1 && !verifying && q.isFake && attn.isFake && normed.isFake
+                                ? &stagedSwa : nullptr);
                     }
                 }
                 if (slidingLayers[layer] && capture && !capture->prefixes.empty()) {
@@ -1913,6 +1917,10 @@ Data NaiveN05FlashModel::RunTarget(
                            CacheReserveCapacity(batch->configs[sequence]), rowAttention,
                            sequence);
                     offset += count;
+                }
+                if (!stagedSwa.empty()) {
+                    FastllmCudaNaiveFlushSwa(stagedSwa, localWeight(ap + "attention_sink_bias"), cfg.heads, cfg.kvHeads);
+                    stagedSwa.clear();
                 }
                 if (batchVerifyIndex && phase == 0) {
                     if (contextSharded && !verifyIndexItems.empty()) {

@@ -4365,6 +4365,34 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                               const fastllm::Data &sink, int heads, int kvHeads,
                               int dim, int valueDim, int pastLength, int window,
                               fastllm::Data &output, bool causal, const fastllm::Data *prefillScratch) {
+    FastllmCudaNaivePrefillAttention(query, key, value, indices, sink, heads, kvHeads, dim, valueDim,
+        pastLength, window, output, causal, prefillScratch, nullptr);
+}
+
+void FastllmCudaNaiveFlushSwa(const std::vector<FastllmNaiveStagedSwa> &pending,
+        const fastllm::Data &sink, int heads, int kvHeads) {
+    constexpr int tile = 8, limit = 32;
+    for (size_t first = 0; first < pending.size(); first += limit) {
+        naive_prefill_mma::StagedSwaBatch<limit> batch{};
+        const int n = std::min<size_t>(limit, pending.size() - first);
+        int tiles = 0;
+        for (int i = 0; i < n; ++i) {
+            batch.entries[i] = pending[first + i];
+            tiles += (batch.entries[i].rows + tile - 1) / tile;
+            batch.entries[i].endTile = tiles;
+        }
+        naive_prefill_mma::SwaContiguous<tile, limit><<<dim3(tiles, heads / 8), tile * 32,
+            sizeof(naive_prefill_mma::ContigWindow<tile>)>>>(batch,
+                sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, kvHeads);
+    }
+    if (!pending.empty()) CheckLaunch();
+}
+
+void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm::Data &key,
+        const fastllm::Data &value, const fastllm::Data &indices, const fastllm::Data &sink,
+        int heads, int kvHeads, int dim, int valueDim, int pastLength, int window,
+        fastllm::Data &output, bool causal, const fastllm::Data *prefillScratch,
+        std::vector<FastllmNaiveStagedSwa> *pending) {
     using namespace fastllm;
     int queries = query.dims[1], keys = key.dims[1];
     int count = indices.dims.empty() ? (window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys) : indices.dims[1];
@@ -4402,7 +4430,8 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
         (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0) {
         // Neighboring causal windows overlap. Share their cache reads while
         // retaining each query's original MMA order and BF16 rounding.
-        if (queries >= 1024 && pastLength >= 0 && count == 128 &&
+        const bool hopperStaging = FastllmCudaRuntimeArch() == 90 && queries >= 256 && prefillScratch;
+        if ((queries >= 1024 || hopperStaging) && pastLength >= 0 && count == 128 &&
             (int64_t)pastLength + queries <= keys) {
             auto grouped = naive_prefill_mma::SwaQueryTile<4>;
             size_t bytes = sizeof(naive_prefill_mma::SwaQueryStorage<4>);
@@ -4470,6 +4499,29 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                         q, readKey, readValue, nullptr, bias, out, heads, kvHeads,
                         key.dims[2], readKeys, count, readPast, true, 0);
                 const int fullQueries = queries - initialQueries;
+                // Only the staged FP8 cache has contiguous BF16 rows here.
+                if (hopperStaging && !readKey.fp8 && value.dims[2] == kvHeads * valueDim) {
+                    const int tile = (int64_t)fullQueries * heads < 8192 ? 4 : 8;
+                    auto kernel = tile == 4 ? naive_prefill_mma::SwaContiguous<4, 1>
+                                            : naive_prefill_mma::SwaContiguous<8, 1>;
+                    const size_t shared = tile == 4 ? sizeof(naive_prefill_mma::ContigWindow<4>)
+                                                    : sizeof(naive_prefill_mma::ContigWindow<8>);
+                    if (BulkKernelSupported(kernel, shared, 90)) {
+                        FastllmNaiveStagedSwa item{q + (size_t)initialQueries * heads * dim,
+                            readKey.base, readValue.base, out + (size_t)initialQueries * heads * valueDim,
+                            fullQueries, key.dims[2], readKeys, readPast + initialQueries, 0};
+                        if (pending && BulkKernelSupported(naive_prefill_mma::SwaContiguous<8, 32>,
+                                sizeof(naive_prefill_mma::ContigWindow<8>), 90)) {
+                            pending->push_back(item);
+                        } else {
+                            naive_prefill_mma::StagedSwaBatch<1> batch{{item}};
+                            kernel<<<dim3((fullQueries + tile - 1) / tile, heads / 8), tile * 32, shared>>>(
+                                batch, bias, heads, kvHeads);
+                        }
+                        CheckLaunch();
+                        return;
+                    }
+                }
                 grouped<<<dim3((fullQueries + queryTile - 1) / queryTile, heads / 8), 256, bytes>>>(
                     q + (size_t)initialQueries * heads * kSwaQkDim, readKey, readValue, bias,
                     out + (size_t)initialQueries * heads * kSwaValueDim,

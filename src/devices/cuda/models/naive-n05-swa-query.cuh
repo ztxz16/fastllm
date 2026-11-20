@@ -1,5 +1,6 @@
 #pragma once
 #include "naive-n05-prefill-mma.cuh"
+#include "devices/cuda/naive-n05-swa-prefill.cuh"
 namespace naive_prefill_mma {
 template <int Queries> struct SwaQueryStorage {
     BF q[Queries][8][200];
@@ -207,6 +208,162 @@ __global__ __launch_bounds__(Queries * 32) void SwaRegisterTile(const BF *q, Fas
                 out[((size_t)(row + r) * heads + head + (l % 4) * 2 + i % 2) * 128 + w * 16 + l / 4 +
                     (i / 2) * 8] = __float2bfloat16(acc[w][i]);
         }
+    }
+#endif
+}
+// One warp per query shares the overlapping chronological K/V windows.
+template <int R> struct ContigWindow {
+    union {
+        BF k[127 + R][200];
+        BF v[127 + R][136];
+    } tile;
+    BF prob[R][8][136];
+};
+template <int R, int Width, int Pitch>
+__device__ __forceinline__ void LoadContiguousWindow(BF (*smem)[Pitch], const BF *base, int first, int keys, int stride,
+                                                     int kh) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    for (int i = threadIdx.x; i < (127 + R) * (Width / 8); i += R * 32) {
+        const int key = first + i / (Width / 8), d = i % (Width / 8) * 8;
+        naive_dsa_decode::Copy<true>(&smem[i / (Width / 8)][d],
+                                     base + (size_t)max(0, min(key, keys - 1)) * stride + kh * Width + d,
+                                     key >= 0 && key < keys);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
+}
+template <int N> struct StagedSwaBatch { FastllmNaiveStagedSwa entries[N]; };
+static_assert(sizeof(StagedSwaBatch<32>) + 64 <= 4096);
+
+template <int R, int N>
+__global__ __launch_bounds__(R * 32) void SwaContiguous(StagedSwaBatch<N> batch, const float *sink,
+                                                        int heads, int kvHeads) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    int entry = 0, firstTile = 0;
+    if constexpr (N > 1) {
+        while (blockIdx.x >= batch.entries[entry].endTile) firstTile = batch.entries[entry++].endTile;
+    }
+    const auto &item = batch.entries[entry];
+    const auto *q = (const BF *)item.query, *k = (const BF *)item.key, *v = (const BF *)item.value;
+    auto *out = (BF *)item.output;
+    const int rows = item.rows, keys = item.keys, stride = item.stride, past = item.past;
+    using namespace naive_attention_bulk;
+    extern __shared__ __align__(16) char buffer[];
+    auto &s = *reinterpret_cast<ContigWindow<R> *>(buffer);
+    const int row = (blockIdx.x - firstTile) * R, h = blockIdx.y * 8, kh = h / (heads / kvHeads), r = threadIdx.x / 32,
+              l = threadIdx.x % 32;
+    const int first = past + row - 127;
+    LoadContiguousWindow<R, 192, 200>(s.tile.k, k, first, keys, stride, kh);
+    const int qrow = min(row + r, rows - 1);
+    const BF *src = q + ((size_t)qrow * heads + h + l / 4) * 192 + 2 * (l % 4);
+    uint32_t qr[12][2];
+#pragma unroll
+    for (int d = 0; d < 12; ++d) {
+        qr[d][0] = *(const uint32_t *)(src + d * 16);
+        qr[d][1] = *(const uint32_t *)(src + d * 16 + 8);
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
+    BF logits[16][2];
+    if (row + r < rows) {
+#pragma unroll
+        for (int kb = 0; kb < 8; ++kb) {
+            float dots[4] = {};
+#pragma unroll
+            for (int d = 0; d < 12; ++d) {
+                uint32_t a[4];
+                ld4(a, &s.tile.k[r + kb * 16 + ar][d * 16 + ac]);
+                mma(dots, a, qr[d]);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int j = kb * 2 + i / 2;
+                BF score = __float2bfloat16(naive_dsa_decode::Round(naive_dsa_decode::Round(dots[i]) * rsqrtf(192.f)));
+                logits[j][i % 2] = score;
+            }
+        }
+    }
+    __syncthreads();
+    LoadContiguousWindow<R, 128, 136>(s.tile.v, v, first, keys, kvHeads * 128, kh);
+    if (row + r < rows) {
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int head = (l % 4) * 2 + half;
+            float mx = sink ? sink[h + head] : -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                mx = fmaxf(mx, (float)logits[j][half]);
+#pragma unroll
+            for (int d = 16; d >= 4; d /= 2)
+                mx = fmaxf(mx, __shfl_xor_sync(~0u, mx, d));
+            float ex[16];
+#pragma unroll
+            for (int j = 0; j < 16; ++j) ex[j] = expf((float)logits[j][half] - mx);
+            float p[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                float left = ex[j];
+                if (j == 0 && sink && l / 4 == 0) left += expf(sink[h + head] - mx);
+                p[j] = left + ex[j + 8];
+            }
+            // Spell out the 8-4-2-1 tree. Indexing its live registers with a
+            // variable stride makes nvcc put the normalization array in local memory.
+            float den = ((p[0] + p[4]) + (p[2] + p[6])) + ((p[1] + p[5]) + (p[3] + p[7]));
+#pragma unroll
+            for (int d = 16; d >= 4; d /= 2)
+                den += __shfl_down_sync(~0u, den, d);
+            den = __shfl_sync(~0u, den, l % 4);
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                s.prob[r][head][j * 8 + l / 4] = __float2bfloat16(den > 0 ? ex[j] / den : 0.f);
+        }
+    }
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    if (row + r < rows) {
+        float acc[8][4] = {};
+#pragma unroll
+        for (int j = 0; j < 128; j += 16) {
+            uint32_t b[2];
+            ld2(b, &s.prob[r][l & 7][j + ((l >> 3) & 1) * 8]);
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                uint32_t a[4];
+                ldt4(a, &s.tile.v[r + j + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
+                mma(acc[w], a, b);
+            }
+        }
+#if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12000
+        // Transpose the MMA accumulator fragments in the now-dead probability
+        // tile. Each lane can then write eight adjacent BF16 output channels.
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            uint32_t pairs[2];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                auto pair = __floats2bfloat162_rn(acc[w][2 * i], acc[w][2 * i + 1]);
+                memcpy(&pairs[i], &pair, sizeof(pair));
+            }
+            const unsigned addr = __cvta_generic_to_shared(&s.prob[r][l & 7][w * 16 + ((l >> 3) & 1) * 8]);
+            asm volatile("stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};"
+                :: "r"(addr), "r"(pairs[0]), "r"(pairs[1]) : "memory");
+        }
+        __syncwarp();
+#pragma unroll
+        for (int slot = l; slot < 8 * 16; slot += 32) {
+            auto *dst = out + ((size_t)(row + r) * heads + h + slot / 16) * 128 + (slot % 16) * 8;
+            *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(&s.prob[r][slot / 16][(slot % 16) * 8]);
+        }
+#else
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                out[((size_t)(row + r) * heads + h + (l % 4) * 2 + i % 2) * 128 + w * 16 + l / 4 + (i / 2) * 8] =
+                    __float2bfloat16(acc[w][i]);
+        }
+#endif
     }
 #endif
 }
