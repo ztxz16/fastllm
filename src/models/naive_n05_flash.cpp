@@ -975,8 +975,8 @@ Data NaiveN05FlashModel::RunTarget(
         (!capture || !capture->collectHidden);
     // A request must keep the same FFN reduction and local router when another
     // KV owner joins a prefill batch.
-    const bool stablePrefill = attentionParallel && !decodeWorkspace && !verifying &&
-        (batch ? !batchDecode : length > 1) && FastllmCudaRuntimeArch() == 120;
+    const bool stablePrefill = attentionParallel && attentionParallel->stablePrefillReduction &&
+        !decodeWorkspace && !verifying && (batch ? !batchDecode : length > 1);
     const bool canonicalPrefillRouter = localMoeRows && !decodeWorkspace && !stablePrefill &&
         std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
             [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });

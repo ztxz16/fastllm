@@ -324,9 +324,15 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         root.ClearTensorParallelLayout();
     };
     AssertInFastLLM(FastllmInitNccl(tpDevices), "Naive TP: NCCL initialization failed.");
-    if (attentionDP > 1 && !attentionParallel)
-        attentionParallel = std::make_shared<AttentionParallelState>(
+    if (attentionDP > 1 && !attentionParallel) {
+        auto state = std::make_shared<AttentionParallelState>(
             parallel::Topology(tpDevices, attentionDP, tpEp8Mega ? ranks : 1));
+        // Dense TP spans the whole world, so every rank must select the same collective.
+        std::vector<int> architectures(ranks);
+        state->runtime.Run([&](int rank, int) { architectures[rank] = FastllmCudaRuntimeArch(); });
+        state->stablePrefillReduction = AttentionParallelState::SupportsStablePrefillReduction(architectures);
+        attentionParallel = std::move(state);
+    }
     const int attentionRanks = AttentionTPSize();
     auto attentionScheme = [&](int total) {
         AssertInFastLLM(total % attentionRanks == 0, "Naive attention projection width must divide group TP.");

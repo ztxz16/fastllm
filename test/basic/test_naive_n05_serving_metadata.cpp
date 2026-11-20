@@ -16,6 +16,13 @@ static void Check(bool ok, const char *message) {
 namespace fastllm {
 struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     static void CheckAttentionPlan() {
+        Check(AttentionParallelState::SupportsStablePrefillReduction({120, 120}),
+              "SM120 ranks must share the stable prefill reduction");
+        for (const std::vector<int> &archs : std::vector<std::vector<int>>{
+                 {120, 90}, {90, 120}, {120, 121}, {120, 0}, {90, 90}, {}}) {
+            Check(!AttentionParallelState::SupportsStablePrefillReduction(archs),
+                  "unsupported rank must disable stable prefill for the whole group");
+        }
         // The plan must also track large batches and arbitrary request order.
         {
             AttentionParallelState::RequestPlan plan;
