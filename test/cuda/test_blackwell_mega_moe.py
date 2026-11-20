@@ -516,23 +516,27 @@ def main():
             )
             + "\n"
         )
-    def check_prefill(max_rows, uneven):
+    def check_prefill(max_rows, scenario):
         total = max_rows * R
         span = scratch_bytes(total, R)
         if not span:
             # Small router buffers can use the bounded fallback, especially at EP4.
-            assert max_rows <= 512
+            assert max_rows <= (1024 if R == 4 else 512)
             return
         assert span <= total * H * 4
         buffers = []
         for rank in range(R):
             torch.cuda.set_device(rank)
             rows = max_rows
-            if uneven:
+            if scenario == "uneven":
                 rows = [max_rows, 0, 13, max_rows - 1, max_rows // 2, 1, 0, 73][rank]
+            elif scenario == "all_idle":
+                rows = 0
             x = torch.randn(max_rows + 1, H, dtype=torch.bfloat16, device=rank)
             first = torch.randint(E, (max_rows, 1), dtype=torch.int32, device=rank)
             idx = (first + 17 * torch.arange(K, dtype=torch.int32, device=rank)) % E
+            if scenario == "one_owner":
+                idx = torch.arange(K, dtype=torch.int32, device=rank).repeat(max_rows, 1)
             scores = torch.rand(max_rows, K, device=rank).softmax(-1)
             y = torch.full_like(x, -123.)
             reference = torch.full_like(x, -123.)
@@ -557,40 +561,47 @@ def main():
             torch.cuda.set_device(rank)
             handle, arena = ranks[rank]["handle"], record[-1]
             assert prepare_prefill(handle, arena.data_ptr(), span - 1, total) == 0
+            assert prepare_prefill(handle, arena.data_ptr() + 1, span, total) == 0
             capacities.append(prepare_prefill(handle, arena.data_ptr(), span, total))
         capacity = capacities[0]
         assert len(set(capacities)) == 1 and C < capacity <= 32768, capacities
         sync()
-        for start in range(0, max_rows, capacity):
-            for rank, (rows, x, idx, scores, y, _, _) in enumerate(buffers):
-                torch.cuda.set_device(rank)
-                count = min(capacity, max(0, rows - start))
-                assert run_prefill(
-                    ranks[rank]["handle"], peers, x[start].data_ptr(), y[start].data_ptr(),
-                    idx[start].data_ptr(), scores[start].data_ptr(), count
-                ), err()
-        sync()
+        repeats = 2 if scenario in ("one_owner", "all_idle") else 1
+        for _ in range(repeats):
+            for start in range(0, max_rows, capacity):
+                for rank, (rows, x, idx, scores, y, _, _) in enumerate(buffers):
+                    torch.cuda.set_device(rank)
+                    count = min(capacity, max(0, rows - start))
+                    assert run_prefill(
+                        ranks[rank]["handle"], peers, x[start].data_ptr(), y[start].data_ptr(),
+                        idx[start].data_ptr(), scores[start].data_ptr(), count
+                    ), err()
+            sync()
         errors = []
-        for rows, _, _, _, y, reference, arena in buffers:
+        for rank, (rows, _, _, _, y, reference, arena) in enumerate(buffers):
+            assert (ranks[rank]["allocation"][size:] == 165).all()
             assert (arena[span:] == 165).all() and (y[rows:] == -123).all()
             if rows:
                 actual, expected = y[:rows].float(), reference[:rows].float()
                 rel = ((actual - expected).norm() / expected.norm().clamp_min(1e-20)).item()
-                assert rel < 0.015 and actual.isfinite().all(), (max_rows, uneven, rel)
+                assert rel < 0.015 and actual.isfinite().all(), (max_rows, scenario, rel)
                 errors.append(rel)
-        reports.append(dict(prefill_rows=max_rows, capacity=capacity, uneven=uneven,
-                            workspace_bytes=span, max_relative_l2=max(errors)))
+        reports.append(dict(prefill_rows=max_rows, capacity=capacity, scenario=scenario, uneven=scenario == "uneven",
+                            workspace_bytes=span, max_relative_l2=max(errors, default=0.0)))
         print("PREFILL_PASS", reports[-1], flush=True)
 
     if a.prefill:
         scratch_bytes = bind("prefill_workspace_bytes", [ctypes.c_int, ctypes.c_int], ctypes.c_size_t)
         prepare_prefill = bind("prepare_prefill", [ptr, ptr, ctypes.c_size_t, ctypes.c_int])
         run_prefill = bind("run_prefill", [ptr, P, ptr, ptr, ptr, ptr, ctypes.c_int])
-        cases = [(512, False), (2048, True), (4096, False), (4096, True)]
+        assert scratch_bytes(C * R, R) == 0 and scratch_bytes(8192 * R, 3) == 0
+        cases = [(n, "spread") for n in (129, 193, 256, 512, 768, 1024, 4096, 8192)]
+        cases.extend([(2048, "uneven"), (4096, "uneven"), (8192, "one_owner"),
+                      (8192, "uneven"), (8192, "all_idle")])
         if R == 8:
-            cases.extend([(8192, True), (16384, True), (32768, False), (32768, True)])
-        for max_rows, uneven in cases:
-            check_prefill(max_rows, uneven)
+            cases.extend([(16384, "uneven"), (32768, "spread"), (32768, "uneven")])
+        for max_rows, scenario in cases:
+            check_prefill(max_rows, scenario)
         Path(a.out).write_text(json.dumps(dict(
             ranks=R, weight_format="mxfp4" if a.mxfp4 else "fp8", workspace_bytes=size,
             reports=reports, checkpoint_quality=quality
