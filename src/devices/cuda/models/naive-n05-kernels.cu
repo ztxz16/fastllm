@@ -31,6 +31,9 @@
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <climits>
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+#include "naive-n05-verify-router.cuh"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <type_traits>
@@ -5017,6 +5020,7 @@ int DecodeTopKBlocks() {
 }
 }
 
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
 namespace {
 __global__ void SplitRouterWeight(const float *weight, BF16 *terms, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -5032,7 +5036,61 @@ __global__ void SumRouterTerms(const float *products, float *out, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) out[i] = (products[i] + products[count + i]) + products[2 * count + i];
 }
+
+struct alignas(16) RouterWeightPack { __nv_bfloat162 pairs[4]; };
+
+// Each thread converts eight adjacent weights; no converted copy survives the layer.
+__global__ void SplitRouterWeightVector(const float *__restrict__ weight, BF16 *__restrict__ terms, int count) {
+    const int start = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+    float4 a = *reinterpret_cast<const float4 *>(weight + start);
+    float4 b = *reinterpret_cast<const float4 *>(weight + start + 4);
+    #pragma unroll
+    for (int term = 0; term < 3; ++term) {
+        const RouterWeightPack packed{{__floats2bfloat162_rn(a.x, a.y), __floats2bfloat162_rn(a.z, a.w),
+                                       __floats2bfloat162_rn(b.x, b.y), __floats2bfloat162_rn(b.z, b.w)}};
+        *reinterpret_cast<RouterWeightPack *>(terms + term * count + start) = packed;
+        const float2 aa = __bfloat1622float2(packed.pairs[0]), ab = __bfloat1622float2(packed.pairs[1]);
+        const float2 ba = __bfloat1622float2(packed.pairs[2]), bb = __bfloat1622float2(packed.pairs[3]);
+        a.x -= aa.x; a.y -= aa.y; a.z -= ab.x; a.w -= ab.y;
+        b.x -= ba.x; b.y -= ba.y; b.z -= bb.x; b.w -= bb.y;
+    }
 }
+
+bool InRouterScratch(const fastllm::Data &scratch, const fastllm::Data &tensor) {
+    const auto base = uintptr_t(scratch.cudaData), ptr = uintptr_t(tensor.cudaData);
+    return base && ptr >= base && ptr - base < scratch.expansionBytes;
+}
+
+float *RouterProducts(const fastllm::Data &input, const fastllm::Data &weight,
+                      const fastllm::Data &scratch, int rows) {
+    using namespace fastllm;
+    if (scratch.isFake || scratch.cudaDataBorrowed || !scratch.cudaData ||
+        scratch.dataDevice != CUDA || scratch.dataDeviceIds != input.dataDeviceIds) return nullptr;
+    const int k = weight.dims[1], n = weight.dims[0];
+    if (int64_t(k) * n > INT_MAX / 3 || int64_t(rows) * n > INT_MAX / 3) return nullptr;
+    const size_t termsBytes = size_t(3) * k * n * sizeof(BF16);
+    if (termsBytes + size_t(3) * rows * n * sizeof(float) > scratch.expansionBytes ||
+        InRouterScratch(scratch, input) || InRouterScratch(scratch, weight)) return nullptr;
+    // FP32 products and FP32 accumulation can use the existing device handle.
+    auto handle = getFastllmCublasHandle();
+    if (!handle) return nullptr;
+    auto *terms = (BF16 *)scratch.cudaData;
+    auto *products = (float *)((char *)scratch.cudaData + termsBytes);
+    // Transient decomposition keeps the original weight as the only resident copy.
+    if ((uintptr_t(weight.cudaData) | uintptr_t(terms)) % 16 == 0)
+        SplitRouterWeightVector<<<k * n / (8 * 256), 256>>>((const float *)weight.cudaData, terms, k * n);
+    else
+        SplitRouterWeight<<<(k * n + 255) / 256, 256>>>((const float *)weight.cudaData, terms, k * n);
+    const float alpha = 1.f, beta = 0.f;
+    auto status = cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k,
+        &alpha, terms, CUDA_R_16BF, k, int64_t(n) * k, input.cudaData, CUDA_R_16BF, k, 0,
+        &beta, products, CUDA_R_32F, n, int64_t(rows) * n, 3, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status == CUBLAS_STATUS_NOT_SUPPORTED) return nullptr;
+    AssertInFastLLM(status == CUBLAS_STATUS_SUCCESS, "Blackwell router GEMM failed.");
+    return products;
+}
+}
+#endif
 
 bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Data &weight,
         fastllm::Data &scratch, fastllm::Data &output) {
@@ -5041,30 +5099,47 @@ bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Da
     const int arch = FastllmCudaRuntimeArch();
     if ((arch != 100 && arch != 103) || FastllmCudaGraphIsCapturingFast()) return false;
     const int rows = RouterRows(input, weight, output);
-    if (rows < 128 || scratch.isFake || scratch.cudaDataBorrowed || !scratch.cudaData ||
-        scratch.dataDevice != CUDA || scratch.dataDeviceIds != input.dataDeviceIds) return false;
-    const int k = weight.dims[1], n = weight.dims[0];
-    if (int64_t(k) * n > INT_MAX / 3 || int64_t(rows) * n > INT_MAX / 3) return false;
-    const size_t termsBytes = size_t(3) * k * n * sizeof(BF16);
-    if (termsBytes + size_t(3) * rows * n * sizeof(float) > scratch.expansionBytes ||
-        scratch.cudaData == input.cudaData || scratch.cudaData == weight.cudaData ||
-        scratch.cudaData == output.cudaData) return false;
-    // FP32 products and FP32 accumulation can use the existing device handle.
-    auto handle = getFastllmCublasHandle();
-    if (!handle) return false;
-    auto *terms = (BF16 *)scratch.cudaData;
-    auto *products = (float *)((char *)scratch.cudaData + termsBytes);
-    // Transient decomposition keeps the original weight as the only resident copy.
-    SplitRouterWeight<<<(k * n + 255) / 256, 256>>>((const float *)weight.cudaData, terms, k * n);
-    const float alpha = 1.f, beta = 0.f;
-    auto status = cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k,
-        &alpha, terms, CUDA_R_16BF, k, int64_t(n) * k, input.cudaData, CUDA_R_16BF, k, 0,
-        &beta, products, CUDA_R_32F, n, int64_t(rows) * n, 3, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (status == CUBLAS_STATUS_NOT_SUPPORTED) return false;
-    AssertInFastLLM(status == CUBLAS_STATUS_SUCCESS, "Blackwell router GEMM failed.");
+    if (rows < 128 || &scratch == &output || InRouterScratch(scratch, output)) return false;
+    const int n = weight.dims[0];
+    float *products = RouterProducts(input, weight, scratch, rows);
+    if (!products) return false;
     auto dims = input.dims; dims.back() = n;
     Output(output, FLOAT32, dims);
     SumRouterTerms<<<(rows * n + 255) / 256, 256>>>(products, (float *)output.cudaData, rows * n);
+    CheckLaunch();
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaNaiveVerifyRouter(const fastllm::Data &input, const fastllm::Data &weight,
+        const fastllm::Data &bias, const fastllm::Data &scratch, fastllm::Data &indices,
+        fastllm::Data &scores, int topk, bool normalize, float scale) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+    using namespace fastllm;
+    using namespace naive_verify_router;
+    const int rows = RouterRows(input, weight, indices);
+    if (rows < 128 || topk != Top || weight.dims[0] != Experts ||
+        bias.dims.size() != 1 || bias.dims[0] != Experts || bias.dataType != FLOAT32 ||
+        bias.dataDevice != CUDA || bias.dataDeviceIds != input.dataDeviceIds ||
+        !bias.cudaData || bias.strides.size() != 1 || bias.strides[0] != 1 ||
+        (uintptr_t(input.cudaData) | uintptr_t(weight.cudaData)) % 8 != 0) return false;
+    const int arch = FastllmCudaRuntimeArch();
+    if (arch != 100 && arch != 103) return false;
+    if (&indices == &scores || (indices.cudaData && indices.cudaData == scores.cudaData)) return false;
+    for (const Data *source : {&input, &weight, &bias, &scratch}) {
+        for (const Data *output : {&indices, &scores})
+            if (source == output || (source->cudaData && source->cudaData == output->cudaData)) return false;
+    }
+    if (indices.isFake || scores.isFake || InRouterScratch(scratch, bias)) return false;
+    float *products = RouterProducts(input, weight, scratch, rows);
+    if (!products) return false;
+    Output(indices, INT32, {rows, Top});
+    Output(scores, FLOAT32, {rows, Top});
+    naive_verify_router::Finish<<<rows, Experts>>>(products, (const BF16 *)input.cudaData,
+        (const float *)weight.cudaData, (const float *)bias.cudaData, (int *)indices.cudaData,
+        (float *)scores.cudaData, rows, normalize, scale);
     CheckLaunch();
     return true;
 #else

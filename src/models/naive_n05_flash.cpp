@@ -2196,7 +2196,7 @@ Data NaiveN05FlashModel::RunTarget(
             // EP ranks route only their contiguous token shard, borrowing
             // the normalized activation until MegaMoE finishes reading it.
             auto &executor = *(Executor *)GetExecutor();
-            bool hasRouterProbabilities = false;
+            Data *dispatchScratch = nullptr;
             // Every local EP source needs the same arena capacity, even an
             // empty DP group. FP32 router input is dead before MoE dispatch.
             auto reservePrefillArena = [&]() {
@@ -2219,46 +2219,52 @@ Data NaiveN05FlashModel::RunTarget(
                 }
                 Data &routerSource = shardRouter ? routedInput : normed;
                 Data &routerWeight = localWeight(prefix + ".mlp.gate.weight");
-                const bool localRouter = localMoe && !decodeWorkspace && !verifying &&
-                    FastllmCudaNaivePrefillRouter(routerSource, routerWeight, routerInput, router);
-                if (!localRouter && canonicalPrefillRouter)
-                    RunLocalPrefillRouter(normed, routerWeight, attentionParallel->rows.localToGlobal[tpRank],
-                        inputIds.dims[1], epRanks, routerInput, router);
-                hasRouterProbabilities = !localRouter && !canonicalPrefillRouter &&
-                    FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
-                if (!localRouter && !canonicalPrefillRouter && !hasRouterProbabilities) {
-                    Data localRouterInput;
-                    if (shardPrefillRouter) {
-                        // Share one backing allocation with the prefill arena;
-                        // only the logical local rows are converted/projected.
-                        if (!localMoe) reservePrefillArena();
-                        localRouterInput.FakeFrom(routerInput, 0);
-                    }
-                    Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
-                    ToDataType(routerSource, fp32Input, DataType::FLOAT32);
-                    const bool prefillRouter = !verifying && !decodeWorkspace && length > 1 &&
-                        !batchDecode;
-                    if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router, routerInput))
-                        Linear(fp32Input, routerWeight, Data(), router);
-                }
                 Data &routerBias = localWeight(prefix + ".mlp.gate.e_score_correction_bias");
-                bool fusedRouter = false;
-                // Small decode/verify batches already include sigmoid in their shared
-                // router projection. Other multi-row paths fuse it with selection.
-                if (!hasRouterProbabilities && (length > 1 || canonicalPrefillRouter) && router.dataDevice == DataDevice::CUDA) {
-                    DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
-                                           {"score", &expertScore}, {"gateBias", &routerBias}};
-                    FloatDict routerFloats = {{"routeScale", routed_scaling_factor}};
-                    IntDict routerInts = {{"topk", num_experts_per_tok}, {"needNorm", norm_topk_prob ? 1 : 0}};
-                    fusedRouter = executor.CanRunOnFirstDevice(
-                        "FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
-                    if (fusedRouter)
-                        executor.Run("FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
-                }
-                if (!fusedRouter) {
-                    if (!hasRouterProbabilities) Sigmoid(router, router);
-                    SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
-                                 norm_topk_prob, routed_scaling_factor, &routerBias);
+                const bool selected = verifying && prefillScores &&
+                    FastllmCudaNaiveVerifyRouter(routerSource, routerWeight, routerBias, *prefillScores,
+                        expertIndex, expertScore, num_experts_per_tok, norm_topk_prob, routed_scaling_factor);
+                if (!selected) {
+                    const bool localRouter = localMoe && !decodeWorkspace && !verifying &&
+                        FastllmCudaNaivePrefillRouter(routerSource, routerWeight, routerInput, router);
+                    if (!localRouter && canonicalPrefillRouter)
+                        RunLocalPrefillRouter(normed, routerWeight, attentionParallel->rows.localToGlobal[tpRank],
+                            inputIds.dims[1], epRanks, routerInput, router);
+                    const bool hasRouterProbabilities = !localRouter && !canonicalPrefillRouter &&
+                        FastllmCudaNaiveRouterSigmoid(routerSource, routerWeight, router);
+                    if (!localRouter && !canonicalPrefillRouter && !hasRouterProbabilities) {
+                        Data localRouterInput;
+                        if (shardPrefillRouter) {
+                            // Share one backing allocation with the prefill arena;
+                            // only the logical local rows are converted/projected.
+                            if (!localMoe) reservePrefillArena();
+                            localRouterInput.FakeFrom(routerInput, 0);
+                        }
+                        Data &fp32Input = shardPrefillRouter ? localRouterInput : routerInput;
+                        ToDataType(routerSource, fp32Input, DataType::FLOAT32);
+                        const bool prefillRouter = !verifying && !decodeWorkspace && length > 1 &&
+                            !batchDecode;
+                        if (!prefillRouter || !FastllmCudaNaiveRouterFP32(fp32Input, routerWeight, router, routerInput))
+                            Linear(fp32Input, routerWeight, Data(), router);
+                    }
+                    bool fusedRouter = false;
+                    // Small decode/verify batches already include sigmoid in their shared
+                    // router projection. Other multi-row paths fuse it with selection.
+                    if (!hasRouterProbabilities && (length > 1 || canonicalPrefillRouter) && router.dataDevice == DataDevice::CUDA) {
+                        DataDict routerData = {{"logits", &router}, {"index", &expertIndex},
+                                               {"score", &expertScore}, {"gateBias", &routerBias}};
+                        FloatDict routerFloats = {{"routeScale", routed_scaling_factor}};
+                        IntDict routerInts = {{"topk", num_experts_per_tok}, {"needNorm", norm_topk_prob ? 1 : 0}};
+                        fusedRouter = executor.CanRunOnFirstDevice(
+                            "FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
+                        if (fusedRouter)
+                            executor.Run("FusedSigmoidSelectExpert", routerData, routerFloats, routerInts);
+                    }
+                    if (!fusedRouter) {
+                        if (!hasRouterProbabilities) Sigmoid(router, router);
+                        SelectExpert(router, expertIndex, expertScore, num_experts_per_tok,
+                                     norm_topk_prob, routed_scaling_factor, &routerBias);
+                    }
+                    if (!decodeWorkspace && !hasRouterProbabilities) dispatchScratch = &routerInput;
                 }
             } else {
                 expertIndex.dataType = INT32; expertIndex.UpdateUnitSize(); expertIndex.Resize({0, num_experts_per_tok});
@@ -2277,7 +2283,7 @@ Data NaiveN05FlashModel::RunTarget(
                     expertIndex, expertScore, moeOutput, decodeWorkspace || shardMoe,
                     (shardMoe || shardPrefillNorm) ? &hidden : nullptr,
                     mlpNormWeight, mlpNormOutput, rms_norm_eps,
-                    !decodeWorkspace && !hasRouterProbabilities ? &routerInput : nullptr,
+                    dispatchScratch,
                     decodeWorkspace && !verifying ? (const int *)buf.liveKeys.cudaData : nullptr);
             } else if (executor.firstDevice.find("numa") == 0 &&
                 (moeWeights[layer][2]->dataType == DataType::FP8_E4M3 ||
