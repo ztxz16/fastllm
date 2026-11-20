@@ -1469,35 +1469,31 @@ bool NaiveN05FlashModel::PrepareTensorParallelServingDecode(const Data &inputIds
         inputIds.dataType != FLOAT32 || inputIds.dims != std::vector<int>({1, batch->Size()}) ||
         collectHidden) return false;
     const int rows = batch->Size(), ranks = tpDevices.size();
-    int capacity = serving.prepareCapacity;
+    int minCapacity = serving.prepareCapacity;
     if (!serving.preparing) {
         if (maxBatch > 0 && rows > maxBatch) return false;
-        int region = -1, longest = 0;
+        int shortest = INT_MAX, longest = 0;
         for (int row = 0; row < rows; ++row) {
             const Data &key = batch->Key(row, 0);
             if (key.dims.size() != 3) return false;
             const int length = key.dims[1] + 1;
             if (length <= 1 || length > max_positions) return false;
-            const int current = length <= 256 ? 0 : length <= 2048 ? 1 : 2;
-            if (region >= 0 && region != current) return false;
-            region = current;
+            shortest = std::min(shortest, length);
             longest = std::max(longest, length);
         }
-        capacity = region == 0 ? 256 : region == 1 ? 2047 : 4096;
-        // 2048 uses the ordinary eager boundary path, preserving the previous
-        // reduction/selection behavior exactly.
-        if (longest == 2048) return false;
-        if (region == 2) {
-            while (capacity < longest && capacity < max_positions)
-                capacity = (int)std::min<int64_t>((int64_t)capacity * 2, max_positions);
-        }
+        // Both dense graphs mask KV by each row's live length. A mixed batch
+        // can use the larger dense graph; sparse Indexer selection changes at K.
+        if (shortest <= indexTopK && longest >= indexTopK) return false;
+        // Ordinary sparse decode starts at the 4096-token graph.
+        minCapacity = longest > indexTopK ? std::max(longest, 4096) : longest;
     }
     const auto shape = DecodeGraphBatch::Select(rows, serving.batchBuckets);
     if (!shape) return false;
-    auto found = serving.graphs.find({shape.graphRows, capacity});
-    if (found == serving.graphs.end() || found->second->disabled ||
+    auto found = serving.graphs.lower_bound({shape.graphRows, minCapacity});
+    if (found == serving.graphs.end() || found->first.first != shape.graphRows || found->second->disabled ||
         (!serving.preparing && (!serving.sealed || !found->second->captured))) return false;
     auto state = found->second;
+    const int capacity = state->capacity;
     const size_t slots = (size_t)rows * block_cnt * ranks * 2;
     const bool reuse = CanReuseTensorParallelServingCache(batch);
     const uint64_t epoch = tpCacheEpoch.load(std::memory_order_relaxed);
@@ -1812,11 +1808,13 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     };
     auto bindCache = [&](TPDecodeState &state) {
         if (!state.dynamicCache) return;
+        // Context sharding and KVMem create separate Indexer storage after the first warmup.
+        // Reserve the final table layout up front so captured device pointers stay valid.
+        const int slotsPerRow = (HasSeparateIndexer() || indexerContextSharding || kvMemConfig.enabled) ? 8 : 4;
+        const size_t count = size_t(block_cnt) * std::max(sequences, maxBatch > 0 ? maxBatch : 512) * slotsPerRow;
         for (int rank = 0; rank < ranks; ++rank) {
             auto &storage = *state.ranks[rank]->storage;
             FastllmCudaSetDevice(tpDevices[rank]);
-            const size_t count = (size_t)block_cnt *
-                std::max(sequences, maxBatch > 0 ? maxBatch : 512) * (HasSeparateIndexer() ? 8 : 4);
             if (storage.hostCache.empty()) {
                 storage.hostCache.resize(count, nullptr);
                 storage.cacheTable.dataType = INT32;

@@ -233,6 +233,9 @@ struct NaiveN05GraphTestAccess {
         if (model.tpSamplingLogits.GetBytes() != bytes)
             throw std::runtime_error("draft warmup sized verification logits for the training block");
         if (model.tpBatchVerifyStorage) for (const auto &rank : model.tpBatchVerifyStorage->ranks) {
+            const size_t slots = size_t(model.block_cnt) * model.maxBatch * (model.HasSeparateIndexer() ? 8 : 4);
+            if (rank->storage->hostCache.size() < slots || rank->storage->cacheTable.GetBytes() < slots * sizeof(void *))
+                throw std::runtime_error("draft warmup undersized the verification cache binding table");
             const auto &scratch = rank->storage->buffers.decode;
             const size_t rows = size_t(model.maxBatch) * (model.draftTokens + 1);
             if (scratch.indexQuery.Count(0) < rows * 16 * 128 ||
@@ -1635,6 +1638,7 @@ class Fixture : public NaiveN05FlashModel {
             KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
         }
+        SetSaveHistoryChat(true);
         WarmUp();
         if (batching) DraftPrefillOracle();
         useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
@@ -2274,7 +2278,7 @@ class Fixture : public NaiveN05FlashModel {
         if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
         const int captures = verifyGraphCaptures;
         int checks = 0, replayed = 0, eager = 0;
-        for (int prefix : (ragged ? std::vector<int>{3070} : std::vector<int>{3, 254, 2046, 4094})) {
+        for (int prefix : (ragged ? std::vector<int>{254, 3070} : std::vector<int>{3, 254, 2046, 4094})) {
             using Cache = std::vector<std::pair<Data, Data>>;
             const int requests = large ? maxBatch : ragged ? 9 : padding ? 47 : 8;
             std::vector<std::vector<std::vector<float>>> capturedLogits;
@@ -2282,9 +2286,12 @@ class Fixture : public NaiveN05FlashModel {
             for (bool graph : {true, false}) {
                 std::vector<Cache> actual(requests);
                 std::vector<int> past(requests, prefix);
-                // Nine requests pad to 16. The longest exceeds pool / 16 = 4096,
-                // while the total live KV fits the pool.
-                if (ragged) past[0] += 3072;
+                if (ragged) {
+                    // Cross the short-attention boundary with live lengths 255, 256 and 1023.
+                    // The longer case also exceeds pool / 16 while fitting the total budget.
+                    past[0] += prefix == 254 ? 768 : 3072;
+                    ++past[1];
+                }
                 GenerationConfig config;
                 config.input_token_length = prefix;
                 config.output_token_limit = 64;
