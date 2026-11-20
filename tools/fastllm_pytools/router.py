@@ -69,12 +69,14 @@ def load_config(path):
                 if type(workers) is not int or not 1 <= workers <= 64:
                     raise ValueError('transfer_workers must be an integer in [1, 64]')
                 pd['transfer_workers'] = workers
+            if role == 'decode' and 'max_workspace_mib_per_rank' in group:
+                raise ValueError('max_workspace_mib_per_rank is only valid for prefill')
             if role == 'prefill':
                 pd['queue_depth'] = max(1, sum(node.get('max_inflight', 64) for node in config['decode']
                     if group['endpoint'] in node.get('prefill', peers)))
                 pd['listen'] = group.get('listen', group['endpoint'])
                 pd['chunk_tokens'] = group.get('chunk_tokens', 2048)
-                for key in ('max_requests_per_rank', 'max_new_tokens_per_rank'):
+                for key in ('max_requests_per_rank', 'max_new_tokens_per_rank', 'max_workspace_mib_per_rank'):
                     if key in group:
                         if type(group[key]) is not int or not 1 <= group[key] <= 2147483647:
                             raise ValueError(f'{key} must be a positive 32-bit integer')

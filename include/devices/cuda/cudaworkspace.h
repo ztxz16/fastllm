@@ -67,12 +67,15 @@ bool TryFreeCudaWorkspaceAfterStream(void *pointer, void *stream);
 class CudaMemoryReservation {
 public:
     CudaMemoryReservation(int device, size_t bytes);
+    // Publish an arena already charged to the model before KV sizing.
+    explicit CudaMemoryReservation(std::shared_ptr<CudaWorkspace> backing);
     ~CudaMemoryReservation();
     CudaMemoryReservation(const CudaMemoryReservation&) = delete;
     CudaMemoryReservation &operator=(const CudaMemoryReservation&) = delete;
 private:
     std::shared_ptr<CudaWorkspace> workspace;
 };
+bool HasCudaReservation(int device);
 bool TryAllocateCudaReservation(int device, size_t bytes, void **pointer);
 bool IsCudaReservationPointer(void *pointer);
 // Caller provides cudaFree-equivalent completion ordering before release.

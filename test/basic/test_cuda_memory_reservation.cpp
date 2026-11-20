@@ -98,6 +98,25 @@ int main() {
             FastllmCudaDirectFree(p);
         }
         FastllmCudaSetDevice(0);
+        reserve.reset();
+        auto backing = std::make_shared<CudaWorkspace>(0, 64 * MiB);
+        Check(!HasCudaReservation(0), "KV sizing must see the backing before activation");
+        reserve = std::make_unique<CudaMemoryReservation>(backing);
+        Check(HasCudaReservation(0), "preallocated workspace was not activated");
+        DisableCudaMalloc();
+        void *optional = nullptr;
+        Check(FastllmCudaTryDirectMalloc(&optional, 32 * MiB) == FASTLLM_CUDA_TRY_MALLOC_SUCCESS &&
+              IsCudaReservationPointer(optional), "optional direct allocation bypassed frozen arena");
+        FastllmCudaDirectFree(optional);
+        auto cached = FastllmCudaMalloc(48 * MiB);
+        FastllmCudaFree(cached);
+        optional = nullptr;
+        Check(FastllmCudaTryMalloc(&optional, 64 * MiB) == FASTLLM_CUDA_TRY_MALLOC_SUCCESS &&
+              IsCudaReservationPointer(optional), "frozen arena could not reclaim idle cached storage");
+        FastllmCudaFree(optional);
+        FastllmCudaReleaseIdleCachedBuffers(0);
+        reserve.reset();
+        Check(!HasCudaReservation(0), "reservation survived its owner");
         std::cout << "PASS: CUDA memory reservation" << std::endl;
     } catch (const std::exception &error) {
         std::cerr << error.what() << std::endl; return 1;

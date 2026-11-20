@@ -2392,7 +2392,10 @@ def make_normal_llm_model(args, startup_progress = None):
                 fairness_ms=prefill_scheduling['prefill_fairness_ms'])
         llm.report_model_load_progress("weights_finalize", 1, 1)
         llm.report_model_load_progress("warmup", 0, 1)
-        model.warmup()
+        if is_naive_n05_model and attention_dp > 1 and pd_options and pd_options.get("role") == "prefill":
+            model.warmup(pd_prefill=pd_options)
+        else:
+            model.warmup()
         if l2_enabled:
             model.configure_host_prefix_cache(l2_bytes, **split_limits)
         if kernel_policy is not None:

@@ -28,7 +28,12 @@ using RuntimeResultBatch = std::function<void(int index, std::vector <std::strin
 namespace fastkv { struct Message; struct CacheSnapshot; class BufferPool; }
 
 namespace fastllm {
+    class CudaMemoryReservation;
     struct PDRuntime;
+    struct PDPrefillLimits {
+        int chunk, batchRequests, batchTokens, rankRequests, rankTokens;
+        int workspaceLimitMiB = 0;
+    };
     struct PDPending;
     class PDReceiveState;
     using ChatMessages = std::vector <std::pair <std::string, std::string> >;
@@ -808,6 +813,9 @@ namespace fastllm {
 
         ResponseContextDict responseContextDict;
 
+        PDPrefillLimits GetPDPrefillLimits(const json11::Json &config);
+        virtual void PlanPDPrefillMemory(const PDPrefillLimits &) {}
+        virtual std::vector<std::shared_ptr<CudaMemoryReservation>> ActivatePDPrefillMemory(const PDPrefillLimits &) { return {}; }
         void ConfigurePD(const json11::Json &config);
         void StopPD();
         bool IsPDDecode() const;

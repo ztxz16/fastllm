@@ -90,6 +90,8 @@ namespace fastllm {
         bool SetSaveHistoryChat(bool save) override;
         void ConfigureHostPrefixCache(size_t bytes, int64_t kvBytes = -1, int64_t swaBytes = -1);
         bool TryRestoreHostPrefix(ResponseContext &context, int gpuTokens, bool &requery) override;
+        void PlanPDPrefillMemory(const PDPrefillLimits &limits) override;
+        std::vector<std::shared_ptr<CudaMemoryReservation>> ActivatePDPrefillMemory(const PDPrefillLimits &limits) override;
         std::string PDLayout() const override;
         bool SupportsPDKvMemDecode() const override { return true; }
         std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) override;
@@ -593,6 +595,9 @@ namespace fastllm {
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpPrefillWorkspaces;
         std::vector<Data> tpPrefillScores;
+        PDPrefillLimits pdPrefillLimits{};
+        std::vector<std::shared_ptr<CudaWorkspace>> pdPrefillArenas;
+        void WarmPDPrefillMemory();
         void PrepareTensorParallelMemory();
         std::vector<Data> tpDraftHeadInputs, tpDraftHeadLogits;
         Data tpDraftHeadOutput;

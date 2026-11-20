@@ -3641,7 +3641,14 @@ class model:
         if error:
             raise ValueError(error.decode("utf-8", errors="replace"))
 
-    def warmup(self):
+    def warmup(self, pd_prefill=None):
+        if pd_prefill is not None:
+            plan = fastllm_lib.plan_pd_prefill_llm_model
+            plan.argtypes = [ctypes.c_int, ctypes.c_char_p]
+            plan.restype = ctypes.c_bool
+            if not plan(self.model, json.dumps(pd_prefill, allow_nan=False).encode()):
+                fastllm_lib.get_pd_error.restype = ctypes.c_char_p
+                raise ValueError(fastllm_lib.get_pd_error().decode())
         error = fastllm_lib.warmup_llm_model(self.model)
         if error:
             raise RuntimeError(error.decode("utf-8", errors="replace"))

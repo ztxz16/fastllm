@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
-from fastllm_pytools.util import make_normal_llm_model, make_normal_parser, _is_naive_n05_family
+from fastllm_pytools.util import add_server_args, make_normal_llm_model, make_normal_parser, _is_naive_n05_family
 
 
 class NaiveTensorParallelCliTest(unittest.TestCase):
@@ -24,7 +24,9 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
                 path = root / "launch.json"
                 path.write_text(json.dumps({"model": str(root), **saved}))
                 model_path = str(path)
-            args = make_normal_parser("test").parse_args([model_path, "-t", "4", *options])
+            parser = make_normal_parser("test")
+            add_server_args(parser)
+            args = parser.parse_args([model_path, "-t", "4", *options])
             fake = types.ModuleType("ftllm")
             fake.llm = MagicMock()
             fake.llm.model.return_value.get_max_input_len.return_value = 4096
@@ -41,6 +43,17 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
             self.loaded_model = fake.llm.model.return_value
             self.model_options = fake.llm.model.call_args.kwargs
             return args
+
+    def test_pd_prefill_warmup_receives_the_scheduler_limits(self):
+        limits = dict(role="prefill", model_id="test", transport="rdma",
+                      listen="127.0.0.1:1234", chunk_tokens=32768,
+                      max_requests_per_rank=16, max_new_tokens_per_rank=32768, max_workspace_mib_per_rank=6144)
+        self.configure(["--tp", "8", "--attn-dp-size", "8", "--pd", json.dumps(limits)])
+        self.loaded_model.warmup.assert_called_once_with(pd_prefill=limits)
+        self.loaded_model.configure_pd.assert_called_once_with(**limits)
+        decode = dict(role="decode", model_id="test", transport="rdma", prefill=["127.0.0.1:1234"])
+        self.configure(["--tp", "8", "--attn-dp-size", "8", "--pd", json.dumps(decode)])
+        self.loaded_model.warmup.assert_called_once_with()
 
     def test_naive_host_prefix_cache(self):
         self.configure(['--tp', '8'])

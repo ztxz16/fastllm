@@ -336,6 +336,7 @@ bool ResponseContext::IsPDTransferPending() const {
 }
 
 struct PDRuntime {
+    std::vector<std::shared_ptr<CudaMemoryReservation>> prefillReservations;
     struct Workload {
         std::atomic<uint64_t> tokens{0}, restoreBytes{0};
         std::atomic<double> tokensPerSecond{10000};
@@ -401,7 +402,7 @@ struct PDRuntime {
     std::string role, identity;
     std::vector<std::string> peers;
     std::atomic<bool> stopping{false};
-    int chunk = 2048;
+    int chunk = 0;
     size_t tokenCapacity = 0;
     std::unique_ptr<fastkv::Budget> slots;
     std::vector<std::unique_ptr<fastkv::Budget>> groupTokens;
@@ -1254,6 +1255,33 @@ void basellm::StopPD() {
     }
 }
 
+PDPrefillLimits basellm::GetPDPrefillLimits(const json11::Json &config) {
+    PDPrefillLimits limits{};
+    limits.chunk = config["chunk_tokens"].is_number() ? config["chunk_tokens"].int_value() : 2048;
+    Check(limits.chunk > 0 && limits.chunk <= max_positions, "invalid prefill chunk size");
+    const int concurrent = maxBatch > 0 ? maxBatch : 1;
+    const bool batching = SupportsPrefillBatching() && canDoBatchForward;
+    limits.batchRequests = batching ? concurrent : 1;
+    if (prefillBatchPolicy.maxRequests > 0)
+        limits.batchRequests = std::min(limits.batchRequests, prefillBatchPolicy.maxRequests);
+    limits.batchTokens = batching ? std::max(limits.chunk, GetBatchedPrefillTokenLimit()) : limits.chunk;
+    if (batching && prefillBatchPolicy.targetTokens > 0)
+        limits.batchTokens = std::min(limits.batchTokens, prefillBatchPolicy.targetTokens);
+    auto rankLimit = [&](const char *key, int fallback) {
+        if (!config.object_items().count(key)) return fallback;
+        const auto &value = config[key];
+        const double n = value.number_value();
+        if (!value.is_number() || n < 1 || n > INT_MAX || n != int(n))
+            throw std::invalid_argument(std::string(key) + " must be a positive 32-bit integer");
+        return int(n);
+    };
+    limits.workspaceLimitMiB = rankLimit("max_workspace_mib_per_rank", 0);
+    limits.rankRequests = rankLimit("max_requests_per_rank", limits.batchRequests);
+    limits.rankTokens = rankLimit("max_new_tokens_per_rank", prefillScheduling.balanceDP ?
+        std::max(1, limits.batchTokens / PDGroupCount()) : limits.batchTokens);
+    return limits;
+}
+
 void basellm::ConfigurePD(const json11::Json &config) {
     Check(!mainLoop && !pdRuntime, "configure PD once, after warmup and before serving");
     auto runtime = std::make_shared<PDRuntime>();
@@ -1265,6 +1293,8 @@ void basellm::ConfigurePD(const json11::Json &config) {
     Check(!UseModelSpecificScheduler(), "PD requires a supported common scheduler");
     Check(!kvMemConfig.enabled || (runtime->role == "decode" && SupportsPDKvMemDecode()),
           "KVMem PD requires a supported decode adapter; prefill must use GPU KV");
+    Check(runtime->role == "prefill" || !config.object_items().count("max_workspace_mib_per_rank"),
+          "max_workspace_mib_per_rank is only valid for prefill");
     const int concurrent = maxBatch > 0 ? maxBatch : 1;
     runtime->sessionCapacity = size_t(concurrent) * 4;
     runtime->sessions.reset(new fastkv::SessionDirectory(runtime->sessionCapacity));
@@ -1374,9 +1404,6 @@ void basellm::ConfigurePD(const json11::Json &config) {
         }
         runtime->slots.reset(new fastkv::Budget(concurrent, "decode request slots"));
     } else {
-        if (config["chunk_tokens"].is_number())
-            runtime->chunk = config["chunk_tokens"].int_value();
-        Check(runtime->chunk > 0 && runtime->chunk <= max_positions, "invalid prefill chunk size");
         auto cacheLimit = [&](const char *key, int64_t fallback) -> int64_t {
             const auto &value = config[key];
             if (value.is_null()) return fallback;
@@ -1410,24 +1437,16 @@ void basellm::ConfigurePD(const json11::Json &config) {
     try {
         if (runtime->role == "prefill") {
             Check(!config["listen"].string_value().empty(), "prefill listen endpoint is required");
+            const auto limits = GetPDPrefillLimits(config);
+            runtime->chunk = limits.chunk;
+            runtime->batchRequests = limits.batchRequests;
+            runtime->batchTokens = limits.batchTokens;
+            runtime->rankRequests = limits.rankRequests;
+            runtime->rankTokens = limits.rankTokens;
+            runtime->prefillReservations = ActivatePDPrefillMemory(limits);
+            Check(!limits.workspaceLimitMiB || !runtime->prefillReservations.empty(),
+                "max_workspace_mib_per_rank requires a warmed GPU Naive attention-DP prefill worker without draft");
             const bool batching = SupportsPrefillBatching() && canDoBatchForward;
-            runtime->batchRequests = batching ? concurrent : 1;
-            if (prefillBatchPolicy.maxRequests > 0)
-                runtime->batchRequests = std::min(runtime->batchRequests, prefillBatchPolicy.maxRequests);
-            runtime->batchTokens = batching ? std::max(runtime->chunk, GetBatchedPrefillTokenLimit()) : runtime->chunk;
-            if (batching && prefillBatchPolicy.targetTokens > 0)
-                runtime->batchTokens = std::min(runtime->batchTokens, prefillBatchPolicy.targetTokens);
-            auto rankLimit = [&](const char *key, int fallback) {
-                if (!config.object_items().count(key)) return fallback;
-                const auto &value = config[key];
-                const double n = value.number_value();
-                if (!value.is_number() || n < 1 || n > INT_MAX || n != int(n))
-                    throw std::invalid_argument(std::string(key) + " must be a positive 32-bit integer");
-                return int(n);
-            };
-            runtime->rankRequests = rankLimit("max_requests_per_rank", runtime->batchRequests);
-            runtime->rankTokens = rankLimit("max_new_tokens_per_rank", prefillScheduling.balanceDP ?
-                std::max(1, runtime->batchTokens / groups) : runtime->batchTokens);
             runtime->targetRequests = prefillBatchPolicy.targetRequests > 0 ?
                 std::min(runtime->batchRequests, prefillBatchPolicy.targetRequests) : runtime->batchRequests;
             runtime->waitMs = batching ? prefillBatchPolicy.maxWaitMs : 0;

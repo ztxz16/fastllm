@@ -511,10 +511,157 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
 #endif
 }
 
+void NaiveN05FlashModel::PlanPDPrefillMemory(const PDPrefillLimits &limits) {
+    if (attentionDP <= 1 || draftEnabled || kvMemConfig.enabled) return;
+    if (tpPrepared || mainLoop)
+        throw std::invalid_argument("Plan Naive PD prefill memory before warmup");
+    pdPrefillLimits = limits;
+}
+
+std::vector<std::shared_ptr<CudaMemoryReservation>> NaiveN05FlashModel::ActivatePDPrefillMemory(const PDPrefillLimits &limits) {
+#ifdef USE_CUDA
+    if (!pdPrefillLimits.chunk) return {};
+    const auto &plan = pdPrefillLimits;
+    if (limits.workspaceLimitMiB != plan.workspaceLimitMiB)
+        throw std::invalid_argument("PD prefill workspace limit changed after warmup");
+    if (limits.chunk > plan.chunk || limits.batchRequests > plan.batchRequests ||
+        limits.batchTokens > plan.batchTokens || limits.rankRequests > plan.rankRequests ||
+        limits.rankTokens > plan.rankTokens || pdPrefillArenas.size() != tpDevices.size())
+        throw std::runtime_error("PD admission limits exceed Naive prefill warmup");
+    // Short MoE tails use AllGatherV when the world rows do not divide
+    // evenly. NCCL creates its send/receive connections on first use.
+    // The large, balanced warmup forwards only exercised ordinary AllGather.
+    if (tpEp8MegaState && tpDevices.size() == 8 && limits.batchTokens > 1) {
+        int rows = std::min(63, limits.batchTokens);
+        if (rows % tpDevices.size() == 0) --rows;
+        attentionParallel->runtime.Run([&](int rank, int) {
+            Data tail;
+            tail.FakeFrom(tpPrefillScores.at(rank), 0);
+            tail.dataType = BFLOAT16;
+            tail.Resize({rows, embed_dim});
+            FastllmCudaMemset0(tail.cudaData, tail.GetBytes());
+            FastllmCudaMimoEp8PrefillAllGather(*tpEp8MegaState, rank, tail);
+            FastllmCudaSyncCurrentThreadStream();
+        });
+    }
+    // KV pools, graph storage and RDMA staging are now allocated. Only eager
+    // pool misses on these devices are redirected to the pre-budgeted arenas.
+    std::vector<std::shared_ptr<CudaMemoryReservation>> reservations;
+    for (auto &arena : pdPrefillArenas)
+        reservations.push_back(std::make_shared<CudaMemoryReservation>(arena));
+    return reservations;
+#else
+    return {};
+#endif
+}
+
+void NaiveN05FlashModel::WarmPDPrefillMemory() {
+#ifdef USE_CUDA
+    if (!pdPrefillArenas.empty()) return;
+    const auto &plan = pdPrefillLimits;
+    const int context = contextPlan.effectiveLength > 0 ?
+        std::min(max_positions, contextPlan.effectiveLength) : max_positions;
+    const int chunk = std::min(plan.chunk, context);
+    const int rankTokens = std::min(plan.rankTokens, plan.batchTokens);
+    const int maxRows = std::min({plan.rankRequests, plan.batchRequests, rankTokens});
+    struct RestoreFlag {
+        bool &flag; bool saved;
+        ~RestoreFlag() { flag = saved; }
+    } intermediate{isIntermediateChunkedPrefill, isIntermediateChunkedPrefill};
+    isIntermediateChunkedPrefill = true;
+    for (int device : tpDevices) FastllmCudaReleaseIdleCachedBuffers(device);
+    // Exercise a long row and the maximum admitted number of rows on every
+    // owner. Rotate full owners through the batch when the global cap binds.
+    auto runShape = [&](int rows) {
+        const int tokens = int(std::min<int64_t>(rankTokens, int64_t(rows) * chunk));
+        const int owners = std::min({attentionDP, plan.batchRequests / rows, plan.batchTokens / tokens});
+        for (int first = 0; first < attentionDP; first += owners) {
+            const int requests = int(std::min<int64_t>({int64_t(attentionDP) * rows,
+                plan.batchRequests, plan.batchTokens}));
+            std::vector<std::pair<Data, Data>> roots;
+            roots.reserve(size_t(requests) * block_cnt);
+            std::vector<std::pair<Data *, Data *>> pointers;
+            std::vector<int> lengths;
+            std::vector<GenerationConfig> configs;
+            std::vector<float> positions;
+            for (int offset = 0; offset < attentionDP; ++offset) {
+                const int left = plan.batchTokens - int(positions.size());
+                const int localRows = std::min({rows, requests - int(lengths.size()), left});
+                if (!localRows) break;
+                const int localTokens = int(std::min<int64_t>({tokens, left, int64_t(localRows) * chunk}));
+                const int group = (first + offset) % attentionDP;
+                for (int row = 0; row < localRows; ++row) {
+                    const int count = localTokens / localRows + (row < localTokens % localRows);
+                    std::vector<std::pair<Data *, Data *>> layers;
+                    for (int i = 0; i < block_cnt; ++i) {
+                        auto &layer = roots.emplace_back(Data(kvCacheDataType), Data(kvCacheDataType));
+                        layers.emplace_back(&layer.first, &layer.second);
+                    }
+                    InitAttentionParallelCache(layers, group);
+                    pointers.insert(pointers.end(), layers.begin(), layers.end());
+                    configs.emplace_back();
+                    configs.back().input_token_length = count;
+                    configs.back().output_token_limit = 1;
+                    lengths.push_back(count);
+                    for (int pos = 0; pos < count; ++pos) positions.push_back(float(pos));
+                }
+            }
+            const int total = positions.size();
+            Data ids(FLOAT32, {1, total}, std::vector<float>(total, 1.f));
+            Data pos(FLOAT32, {1, total}, positions);
+            TargetBatch batch{pointers, configs, lengths, block_cnt};
+            std::vector<std::pair<Data, Data>> unused;
+            ForwardTensorParallel(ids, pos, unused, configs.front(), nullptr, nullptr, &batch);
+        }
+    };
+    // Measure eager rank tensors in disposable storage. Keeping their maximum
+    // cold shapes outside the arena would strand most of the measured bytes
+    // when paged or ragged forwards replace those tensors.
+    auto &state = *attentionParallel;
+    std::vector<AttentionParallelState::Rank> bootstrapRanks(tpDevices.size());
+    bootstrapRanks.swap(state.ranks);
+    struct RestoreRanks {
+        decltype(bootstrapRanks) &bootstrap, &active;
+        ~RestoreRanks() { active.swap(bootstrap); }
+    };
+    {
+        RestoreRanks restore{bootstrapRanks, state.ranks};
+        runShape(1);
+        if (maxRows > 1) runShape(maxRows);
+        for (int device : tpDevices) FastllmCudaSyncDevice(device);
+    }
+    bootstrapRanks.clear();
+    // Retained model tensors are already charged. Repack the measured idle
+    // blocks into one splittable backing allocation per GPU before sizing KV.
+    std::vector<std::shared_ptr<CudaWorkspace>> arenas;
+    for (int device : tpDevices) {
+        FastllmCudaSyncDevice(device);
+        size_t bytes = FastllmCudaReleaseIdleCachedBuffers(device);
+        if (plan.workspaceLimitMiB)
+            bytes = std::min(bytes, size_t(plan.workspaceLimitMiB) << 20);
+        auto arena = std::make_shared<CudaWorkspace>(device, std::max<size_t>(256, bytes));
+        printf("[Naive PD prefill memory] GPU %d: %d requests / %d tokens per rank, reusable workspace %.2f MiB.\n",
+            device, maxRows, rankTokens, arena->Capacity() / 1048576.);
+        arenas.push_back(std::move(arena));
+    }
+    // Keep the production rank's maximum-shape tensors resident as well.
+    // A ragged batch can need new packed/global buffers while other tensors
+    // still hold the preceding shape. Both lifetimes precede the KV budget.
+    runShape(1);
+    if (maxRows > 1) runShape(maxRows);
+    for (int device : tpDevices) {
+        FastllmCudaSyncDevice(device);
+        FastllmCudaReleaseIdleCachedBuffers(device);
+    }
+    pdPrefillArenas.swap(arenas);
+    fflush(stdout);
+#endif
+}
+
 void NaiveN05FlashModel::PrepareTensorParallelMemory() {
 #ifdef USE_CUDA
     const char *serving = std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
-    if (!serving || std::string(serving) != "1" || !draftEnabled || !tpPrepared ||
+    if ((!pdPrefillLimits.chunk && (!serving || std::string(serving) != "1" || !draftEnabled)) || !tpPrepared ||
         tpDevices.size() <= 1 || !tpKVPool.empty()) return;
     const int batch = maxBatch > 0 ? maxBatch : 512;
     const int contextLimit = contextPlan.effectiveLength > 0 ? std::min(max_positions, contextPlan.effectiveLength) : max_positions;
@@ -535,6 +682,10 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
         auto &scores = tpPrefillScores[rank];
         scores.dataType = FLOAT32; scores.Resize({(int)(scoreBytes / sizeof(float))});
         scores.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); scores.Allocate(false);
+    }
+    if (pdPrefillLimits.chunk) {
+        WarmPDPrefillMemory();
+        return;
     }
     printf("[Naive serving memory] preparing chunk %d, batch %d, verification rows %d (%s).\n",
         chunk, batch, verifyRows, sparseKv ? "sparse KV bindings" : "before KV allocation"); fflush(stdout);

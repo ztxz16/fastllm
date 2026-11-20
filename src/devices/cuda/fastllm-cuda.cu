@@ -4995,6 +4995,13 @@ static size_t FastllmCudaReleaseIdleBigBuffersLocked(int id, std::vector<CudaMem
     return released;
 }
 
+// A sealed arena may still split/reclaim its own backing when the process
+// audits driver allocations. Devices without an arena keep the frozen cache.
+static bool FastllmCudaPoolFrozen(int device) {
+    return fastllmCudaMallocDisabled.load(std::memory_order_relaxed) &&
+           !fastllm::HasCudaReservation(device);
+}
+
 static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
         void **ret, size_t size, int id, FastllmCudaMemPoolView &view, const char *file, int line) {
     if (ret != nullptr) {
@@ -5002,7 +5009,7 @@ static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
     }
     cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
     if (cudaSuccess == state || state != cudaErrorMemoryAllocation ||
-        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+        FastllmCudaPoolFrozen(id)) {
         return state;
     }
     cudaGetLastError();
@@ -5013,17 +5020,16 @@ static cudaError_t FastllmCudaCheckedMallocWithIdlePoolRetry(
     return FastllmCudaCheckedMallocRaw(ret, size, file, line);
 }
 
-static void FastllmCudaReleaseIdleCachedBuffersForDevice(int device);
+static size_t FastllmCudaReleaseIdleCachedBuffersForDevice(int device);
 cudaError_t FastllmCudaCheckedMalloc(void **ret, size_t size, const char *file, int line) {
     // Direct operator allocations must be able to reclaim eager scratch too.
     // Keep the common successful allocation free of pool locks, and never
     // release graph-owned memory or attempt cudaFree during capture.
     cudaError_t state = FastllmCudaCheckedMallocRaw(ret, size, file, line);
     if (state != cudaErrorMemoryAllocation || FastllmCudaGraphIsCapturingFast() ||
-        FastllmCudaGraphMemoryPoolActive() ||
-        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) return state;
+        FastllmCudaGraphMemoryPoolActive()) return state;
     int device = -1;
-    if (cudaGetDevice(&device) != cudaSuccess || device < 0) return state;
+    if (cudaGetDevice(&device) != cudaSuccess || device < 0 || FastllmCudaPoolFrozen(device)) return state;
     auto view = FastllmGetCudaMemPoolView(device);
     std::lock_guard<std::mutex> lock(*view.lock);
     cudaGetLastError();
@@ -5440,8 +5446,7 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
     if (FastllmCudaGetThreadError()) {
         return FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
-    if (FastllmCudaGraphIsCapturing() ||
-        fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (FastllmCudaGraphIsCapturing()) {
         return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
     }
     int id = -1;
@@ -5455,6 +5460,7 @@ FastllmCudaTryMallocResult FastllmCudaTryDirectMalloc(
         }
         return FASTLLM_CUDA_TRY_MALLOC_ERROR;
     }
+    if (FastllmCudaPoolFrozen(id)) return FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
     FastllmCudaMemPoolView view = FastllmGetCudaMemPoolView(id);
     std::lock_guard<std::mutex> lock(*view.lock);
     state = FastllmCudaCheckedMallocWithIdlePoolRetry(
@@ -5602,7 +5608,8 @@ static void FastllmCudaPrintPoolRejectStateLocked(int id, size_t requestSize,
     fflush(stderr);
 }
 
-static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
+static size_t FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
+    size_t released = 0;
     cudaError_t state = cudaSetDevice(id);
     checkCudaErrors("Error: CUDA error when switching device to release cached memory!", state);
 
@@ -5619,6 +5626,7 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
             } else {
                 FastllmCudaDestroyReuseEventLocked(buffer);
                 state = FastllmCudaCheckedFree(buffer.data);
+                if (state == cudaSuccess) released += (buffer.size + 255) / 256 * 256;
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle big buffer on device %d!", id);
                     checkCudaErrors("", state);
@@ -5641,6 +5649,7 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
             } else {
                 FastllmCudaDestroyReuseEventLocked(buffer);
                 state = FastllmCudaCheckedFree(buffer.data);
+                if (state == cudaSuccess) released += (buffer.size + 255) / 256 * 256;
                 if (cudaSuccess != state) {
                     printf("Error: CUDA error when releasing idle buffer on device %d!", id);
                     checkCudaErrors("", state);
@@ -5651,18 +5660,21 @@ static void FastllmCudaReleaseIdleCachedBuffersForDevice(int id) {
         noBusyCnt[id] = 0;
         cudaBuffersMinId[id] = (int)cudaBuffers.size();
     }
+    return released;
 }
 
-void FastllmCudaReleaseIdleCachedBuffers(int device) {
+size_t FastllmCudaReleaseIdleCachedBuffers(int device) {
+    size_t released = 0;
     const int previous = FastllmCudaGetDevice();
     auto release = [&](int id) {
         auto view = FastllmGetCudaMemPoolView(id);
         std::lock_guard<std::mutex> lock(*view.lock);
-        FastllmCudaReleaseIdleCachedBuffersForDevice(id);
+        released += FastllmCudaReleaseIdleCachedBuffersForDevice(id);
     };
     if (device >= 0) release(device);
     else for (auto &view : FastllmSnapshotCudaMemPoolViews()) release(view.device);
     FastllmCudaSetDevice(previous);
+    return released;
 }
 
 static bool FastllmCudaRetryMallocAfterReleasingIdle(
@@ -5678,7 +5690,7 @@ static bool FastllmCudaRetryMallocAfterReleasingIdle(
     // Once serving has frozen allocations, idle blocks are the reserve that
     // future requests must reuse.  Releasing them cannot make a forbidden
     // allocation succeed and would only destroy the warmed pool.
-    if (fastllmCudaMallocDisabled.load(std::memory_order_relaxed)) {
+    if (FastllmCudaPoolFrozen(id)) {
         return false;
     }
     cudaGetLastError();
@@ -5924,9 +5936,10 @@ static void *FastllmCudaMallocImpl(
         else FastllmCudaSetThreadError();
         return nullptr;
     }
+    const bool frozen = FastllmCudaPoolFrozen(id);
     const bool useAnyFittingPooledBuffer = capturePoolOnly ||
         (fastllmCudaGraphWorkspaceReserving && fastllmCudaGraphScratchGroup) ||
-        fastllmCudaMallocDisabled.load(std::memory_order_relaxed);
+        frozen;
     std::lock_guard<std::mutex> lock(*view.lock);
 retryPoolAllocation:
     if (size > 1024 * 1024) {
@@ -5981,8 +5994,7 @@ retryPoolAllocation:
             goto retryPoolAllocation;
         void * ret = nullptr;
         if (tryResult != nullptr &&
-            (capturePoolOnly || fastllmCudaMallocDisabled.load(
-                                    std::memory_order_relaxed))) {
+            (capturePoolOnly || frozen)) {
             *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
             return nullptr;
         }
@@ -6085,8 +6097,7 @@ retryPoolAllocation:
         goto retryPoolAllocation;
     void * ret = nullptr;
     if (tryResult != nullptr &&
-        (capturePoolOnly || fastllmCudaMallocDisabled.load(
-                                std::memory_order_relaxed))) {
+        (capturePoolOnly || frozen)) {
         *tryResult = FASTLLM_CUDA_TRY_MALLOC_CAPACITY_FAILURE;
         return nullptr;
     }

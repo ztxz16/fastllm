@@ -61,12 +61,29 @@ CudaMemoryReservation::CudaMemoryReservation(int device, size_t bytes) {
     state.devices[device] = workspace;
 }
 
+CudaMemoryReservation::CudaMemoryReservation(std::shared_ptr<CudaWorkspace> backing)
+    : workspace(std::move(backing)) {
+    if (!workspace) throw std::invalid_argument("CUDA reservation requires a backing arena");
+    auto &state = Reserved();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    auto &device = state.devices[workspace->Device()];
+    if (!device.expired()) throw std::runtime_error("CUDA device already has a serving reservation");
+    device = workspace;
+}
+
 CudaMemoryReservation::~CudaMemoryReservation() {
     auto &state = Reserved();
     std::lock_guard<std::mutex> guard(state.mutex);
     auto it = state.devices.find(workspace->Device());
     if (it != state.devices.end() && it->second.lock() == workspace)
         state.devices.erase(it);
+}
+
+bool HasCudaReservation(int device) {
+    auto &state = Reserved();
+    std::lock_guard<std::mutex> guard(state.mutex);
+    auto it = state.devices.find(device);
+    return it != state.devices.end() && !it->second.expired();
 }
 
 bool TryAllocateCudaReservation(int device, size_t bytes, void **pointer) {

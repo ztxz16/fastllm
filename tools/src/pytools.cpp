@@ -1139,6 +1139,16 @@ extern "C" {
 
     static thread_local std::string fastkvPDError;
     DLL_EXPORT const char *get_pd_error() { return fastkvPDError.c_str(); }
+    DLL_EXPORT bool plan_pd_prefill_llm_model(int modelId, const char *options) {
+        try {
+            std::string error;
+            auto config = json11::Json::parse(options ? options : "", error);
+            if (!error.empty()) throw std::invalid_argument(error);
+            auto *model = models.GetModel(modelId);
+            model->PlanPDPrefillMemory(model->GetPDPrefillLimits(config));
+            return true;
+        } catch (const std::exception &e) { fastkvPDError = e.what(); return false; }
+    }
     DLL_EXPORT bool configure_pd_llm_model(int modelId, const char *options) {
         try {
             if (!options) throw std::invalid_argument("PD options required");
