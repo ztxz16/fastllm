@@ -62,7 +62,7 @@ struct NaiveN05FlashModel::TPDecodeState {
         bool cacheDirty = false, mapsDirty = false;
         int maxRows = 0;
         TargetWorkspace buffers;
-        Data logitsPartial, logitsCandidates;
+        Data logitsPartial, logitsCandidates, packedFeatures;
         std::map<int, Data> features;
         std::vector<void *> Pointers() const {
             std::vector<void *> out;

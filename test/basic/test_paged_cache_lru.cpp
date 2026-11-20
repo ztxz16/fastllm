@@ -37,6 +37,8 @@ static void CheckPoolPartition(PagedCacheManager &pool) {
         Require(node && !pool.freePageFlags[page] && node->unusedIndex >= 0 &&
                 pool.triePages[node->unusedIndex] == page, "cached page membership invalid");
     }
+    Require(pool.HasSharedPages() == std::any_of(pool.pageRefCount.begin(), pool.pageRefCount.end(),
+        [](int refs) { return refs > 1; }), "shared page count differs from physical references");
     for (int page = 0; page < pool.maxPages; ++page)
         Require((unused[page] == 1) == (pool.pageRefCount[page] == 0), "lost page or dangling reference");
 }

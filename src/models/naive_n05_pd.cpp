@@ -363,7 +363,7 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
             const int worldRank = std::find(model.tpDevices.begin(), model.tpDevices.end(), device) - model.tpDevices.begin();
             fastkv::Writer descriptors; const size_t begin = targets.size(); size_t windowOffset = 0;
             windows[rank].resize(model.block_cnt * 2);
-            std::vector<Data *> tables;
+            std::vector<PageTableUpdate> tables;
             auto pages = [&](const Data &key, const Data &pool) {
                 auto &base = model.pdReceivePools->buffers[&pool];
                 if (!base.Size()) base = fastkv::Buffer::Borrow(pool.cudaData, pool.GetBytes(),
@@ -402,7 +402,8 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
                         add(local.dataType,rows,width,false,{view});
                     } else {
                         auto &pool = *model.tpPagedCaches[worldRank][layer * 2 + part];
-                        model.PreparePagedCache(local,pool,length,&tables,&context.pastKeyValues.front().first);
+                        if (model.PreparePagedCache(local,pool,length,&tables,&context.pastKeyValues.front().first))
+                            tables.back().first = 0;
                         // Private unwritten pages may be reordered before their
                         // first upload, reducing scatter spans without copying.
                         std::sort(local.pageIndex.begin(),local.pageIndex.end());

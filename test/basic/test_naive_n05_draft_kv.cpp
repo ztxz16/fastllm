@@ -91,6 +91,113 @@ class ProjectionFixture : public NaiveN05FlashModel {
         return CreateDraftContext();
     }
 };
+static void CheckSlidingCommit() {
+    ProjectionFixture model(81);
+    auto actual = std::make_shared<ProjectionFixture::DraftContext>();
+    ProjectionFixture::DraftContext reference;
+    int start = 0, wraps = 0;
+    bool moved = false;
+    for (int turn = 0; turn < 54; ++turn) {
+        const int count = turn % 3 == 0 ? 2 : 7;
+        Data hidden = BF({1, count, 256}, start);
+        int previous = actual->kvOffset;
+        // Occasionally use the ordinary append on a shifted cache.
+        if (start && turn % 9) actual->SlideKV(count, 17, 24, 128);
+        wraps += previous > 0 && actual->kvOffset == 0;
+        moved |= actual->kvOffset > 0;
+        Check(model.Fused(hidden, start, *actual) && model.Fused(hidden, start, reference), "sliding append rejected");
+        for (size_t i = 0; i < actual->kv.size(); ++i) {
+            Check(Bits(actual->kv[i].first) == Bits(reference.kv[i].first), "shifted draft K differs");
+            Check(Bits(actual->kv[i].second) == Bits(reference.kv[i].second), "shifted draft V differs");
+        }
+        start += count;
+    }
+    Check(moved && wraps >= 2, "sliding commit did not cross two physical boundaries");
+    void *base = actual->kvBacking[0].first.cudaData;
+    auto reused = model.Reuse(actual);
+    Check(actual->kv.empty() && reused->kv[0].first.cudaData == base && !reused->kv[0].first.cudaDataBorrowed &&
+        reused->kv[0].first.dims[1] == 0, "recycled request lost its KV allocation");
+}
+static void CheckMaskedCommit() {
+    // Distinct owner, layer and row values catch cross-request aliasing as well
+    // as off-by-one writes after a first-token rejection.
+    constexpr int batch = 4, layers = 3, heads = 2, dim = 64, width = heads * dim;
+    constexpr int rows = 4, window = 17, reserve = 24;
+    std::vector<ProjectionFixture::DraftContext> live(batch), reference(batch);
+    Data norm(FLOAT32, {dim}, std::vector<float>(dim, 0.75f));
+    norm.ToDevice(CUDA, std::vector<int>{device});
+    Data scratch = BF({1, 512}, 123);
+    Data targetPairs(INT32, {batch, 2}); targetPairs.Allocate();
+    targetPairs.ToDevice(CUDA, std::vector<int>{device});
+    for (int i = 0; i < batch; ++i) {
+        Data initial = BF({1, window - 1, width}, i * 71);
+        for (auto *ctx : {&live[i], &reference[i]}) {
+            ctx->kv.resize(layers);
+            for (auto &pair : ctx->kv) for (auto cache : {&pair.first, &pair.second})
+                Append(*cache, initial, 128);
+            ctx->committed = window - 1;
+        }
+    }
+    int compactions = 0;
+    for (int turn = 0; turn < 96; ++turn) {
+        Data raw = BF({layers, batch * rows, 2 * width}, turn * 451);
+        std::vector<int> emitted;
+        for (int i = 0; i < batch; ++i) {
+            emitted.push_back((turn + i) % rows);
+            int old = live[i].kvOffset;
+            Check(live[i].PrepareKVAppend(rows, window, reserve, width), "masked append preflight");
+            compactions += old > live[i].kvOffset;
+        }
+        Data counts(INT32, {batch}); counts.Allocate();
+        std::copy(emitted.begin(), emitted.end(), (int *)counts.cpuData);
+        counts.ToDevice(CUDA, std::vector<int>{device});
+        std::vector<Data> slices(layers);
+        std::vector<FastllmNaiveDraftKVSlot> slots;
+        std::vector<FastllmNaiveDraftKVUpdate> updates;
+        uint16_t guard = 0, after = 0;
+        uint16_t *probe = nullptr;
+        for (int l = 0; l < layers; ++l) {
+            slices[l].FakeFrom(raw, size_t(l) * batch * rows * 2 * width * sizeof(uint16_t));
+            slices[l].Resize({1, batch * rows, 2 * width});
+            for (int i = 0; i < batch; ++i) {
+                auto &pair = live[i].kv[l];
+                auto off = (size_t)pair.first.dims[1] * width;
+                auto *v = (uint16_t *)pair.second.cudaData + off;
+                slots.push_back({(uint16_t *)pair.first.cudaData + off, v, (float *)norm.cudaData,
+                                 live[i].committed, (int *)targetPairs.cudaData + 2 * i});
+                if (emitted[i] == 0 && !l) probe = v + width;
+                auto &ref = reference[i].kv[l];
+                updates.push_back({&slices[l], &norm, &ref.first, &ref.second, live[i].committed,
+                                   i * rows, emitted[i] + 1});
+            }
+        }
+        Check(cudaMemcpy(&guard, probe, sizeof(guard), cudaMemcpyDeviceToHost) == cudaSuccess, "read tail guard");
+        Check(FastllmCudaNaivePrepareDraftKVSlots(slots, scratch), "masked slots upload");
+        FastllmCudaNaiveWriteAcceptedDraftKV(raw, scratch.cudaData, (const int *)counts.cudaData, batch,
+            rows, layers, heads, dim, 1e-5f, 10000.0f);
+        Check(cudaMemcpy(&after, probe, sizeof(after), cudaMemcpyDeviceToHost) == cudaSuccess && guard == after,
+              "rejected row overwritten");
+        Check(FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, reserve, 1e-5f, 10000.0f),
+              "masked reference append");
+        int pairs[batch * 2];
+        Check(cudaMemcpy(pairs, targetPairs.cudaData, sizeof(pairs), cudaMemcpyDeviceToHost) == cudaSuccess,
+              "read target commit pairs");
+        for (int i = 0; i < batch; ++i)
+            Check(pairs[2 * i] == live[i].committed && pairs[2 * i + 1] == emitted[i] + 1,
+                  "target cache acceptance differs from draft");
+        for (int i = 0; i < batch; ++i) {
+            const int n = emitted[i] + 1;
+            live[i].SlideKV(n, window, reserve, width); live[i].committed += n;
+            for (int l = 0; l < layers; ++l) {
+                auto &a = live[i].kv[l]; auto &b = reference[i].kv[l];
+                a.first.dims[1] += n; a.second.dims[1] += n;
+                Check(Bits(a.first) == Bits(b.first) && Bits(a.second) == Bits(b.second), "masked KV bits differ");
+            }
+        }
+    }
+    Check(compactions >= batch, "masked commit missed physical compaction");
+}
+
 static double Relative(const Data &a, const Data &b) {
     auto ah = Bits(a), bh = Bits(b);
     Check(ah.size() == bh.size(), "relative error shape mismatch");
@@ -424,6 +531,8 @@ int main() {
                 Check(Bits(recovered->kv[0].first) == before, "recovered context differs");
                 checks += 13;
             }
+            CheckSlidingCommit();
+            CheckMaskedCommit();
         }
         Check(cudaDeviceSynchronize() == cudaSuccess, "CUDA failed");
         printf("PASS %d checks (postprocessing exact; merged GEMM relative L2 < 1%%)\n", checks);

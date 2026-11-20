@@ -53,6 +53,7 @@ struct NaiveN05FlashModel::AttentionParallelState {
             // lock, once per pool rather than once per request/layer.
             for (const auto &group : pageTails) {
                 std::lock_guard<std::mutex> guard(group.first->pageIndexLocker);
+                if (!group.first->HasSharedPages()) continue;
                 for (const auto &entry : group.second)
                     if (HasSharedTail(*entry.first, requests[entry.second].length)) return false;
             }
@@ -68,6 +69,7 @@ struct NaiveN05FlashModel::AttentionParallelState {
             }
             for (const auto &group : pageTails) {
                 std::lock_guard<std::mutex> guard(group.first->pageIndexLocker);
+                if (!group.first->HasSharedPages()) continue;
                 for (const auto &entry : group.second) {
                     const int row = entry.second;
                     if (source[row] >= 0 && HasSharedTail(*entry.first, requests[row].length)) source[row] = -1;

@@ -98,3 +98,15 @@ bool FastllmCudaMtpNormalizeTargetDistribution(void *distribution,
 
 // Retarget only the input-reading normalization nodes; all scratch stays owned.
 bool FastllmCudaMtpRebindTargetDistribution(void *graph, void *exec, float *logits);
+
+inline bool FastllmMtpUsesSmallRejection(int batch, int draftTokens, int vocabSize) {
+    return batch <= 8 && draftTokens <= 8 && vocabSize >= 16384;
+}
+
+// Submit a same-stream consumer of the accepted prefix before the regular CPU
+// result copy. The callback borrows the device pointer only for this submission.
+using FastllmMtpAcceptedCallback = void (*)(void *, const int *);
+bool FastllmCudaMtpRejectionWithAccepted(float *logits, float *proposalProbs,
+    const float *temperatures, const int *topKs, const float *topPs, const int *draftTokenIds,
+    int *output, int *acceptedDraftTokens, int batch, int draftTokens, int vocabSize,
+    FastllmMtpAcceptedCallback callback, void *context);
