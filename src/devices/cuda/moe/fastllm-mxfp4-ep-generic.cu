@@ -188,25 +188,28 @@ struct QuantizedSwiGLU {
         }
     }
 };
-__global__ void publish(Mail mail, Shape s, const BF *input, const int *ids, const float *scores, int rows,
-                        const int *live) {
-    int row = blockIdx.x;
-    uint8_t *p = mail.send + size_t(row) * s.stride;
-    bool active = row < rows && (!live || live[row] > 0);
-    int *routes = reinterpret_cast<int *>(p + s.h + s.h / 32);
-    for (int j = threadIdx.x; j < s.k; j += blockDim.x) {
-        routes[j] = active ? ids[row * s.k + j] : -1;
-        reinterpret_cast<float *>(routes + s.k)[j] = active ? scores[row * s.k + j] : 0.f;
+__device__ void packInputRow(uint8_t *p, const BF *input, const int *ids, const float *scores,
+                             int row, int hidden, int topk, bool active) {
+    int *routes = reinterpret_cast<int *>(p + hidden + hidden / 32);
+    for (int j = threadIdx.x; j < topk; j += blockDim.x) {
+        routes[j] = active ? ids[row * topk + j] : -1;
+        reinterpret_cast<float *>(routes + topk)[j] = active ? scores[row * topk + j] : 0.f;
     }
-    for (int chunk = threadIdx.x; chunk < s.h / 4; chunk += blockDim.x) {
-        const auto *chunks = active ? reinterpret_cast<const uint2 *>(input + size_t(row) * s.h) : nullptr;
+    for (int chunk = threadIdx.x; chunk < hidden / 4; chunk += blockDim.x) {
+        const auto *chunks = active ? reinterpret_cast<const uint2 *>(input + size_t(row) * hidden) : nullptr;
         const uint2 raw = active ? chunks[chunk] : make_uint2(0, 0);
         const float4 values = make_float4(__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
                                           __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u));
         uint8_t scale;
         reinterpret_cast<uint32_t *>(p)[chunk] = quantizeFour(values, scale);
-        if (chunk % 8 == 0) p[s.h + chunk / 8] = scale;
+        if (chunk % 8 == 0) p[hidden + chunk / 8] = scale;
     }
+}
+__global__ void publish(Mail mail, Shape s, const BF *input, const int *ids, const float *scores, int rows,
+                        const int *live) {
+    const int row = blockIdx.x;
+    packInputRow(mail.send + size_t(row) * s.stride, input, ids, scores, row, s.h, s.k,
+                 row < rows && (!live || live[row] > 0));
 }
 // Publish each activation once per selected owner. Empty owners only need
 // the routing metadata to discard their slots. PCIe writes avoid remote reads.
@@ -227,6 +230,33 @@ __global__ void dispatch(Mail *peers, Shape s, int rank, int rows) {
     const auto *src = reinterpret_cast<const uint4 *>(packet);
     for (int j = first + threadIdx.x; j < s.stride / 16; j += blockDim.x)
         dst[j] = src[j];
+}
+// Four peers share one quantized packet. A peer with no routes only needs its metadata.
+constexpr int DispatchPeers = 4;
+__global__ void dispatchDecodeRows(Mail *peers, int rank, const BF *input, const int *ids, const float *scores,
+                                   int rows, int cap, const int *live) {
+    constexpr int hidden = 4096, topk = 8, ranks = 8, localExperts = 32;
+    constexpr int metadataOffset = hidden + hidden / 32;
+    constexpr int stride = metadataOffset + topk * (sizeof(int) + sizeof(float));
+    __shared__ __align__(16) uint8_t packet[stride];
+    const int row = blockIdx.x;
+    packInputRow(packet, input, ids, scores, row, hidden, topk, row < rows && (!live || live[row] > 0));
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
+    if (threadIdx.x < DispatchPeers) {
+        const int owner = (rank + blockIdx.y * DispatchPeers + threadIdx.x) % ranks;
+        const auto *routes = reinterpret_cast<const int *>(packet + metadataOffset);
+        bool hit = false;
+        #pragma unroll
+        for (int j = 0; j < topk; ++j)
+            hit |= static_cast<unsigned>(routes[j] - owner * localExperts) < localExperts;
+        const int first = hit ? 0 : metadataOffset;
+        auto *dst = peers[owner].receive + (size_t(rank) * cap + row) * stride + first;
+        const unsigned addr = __cvta_generic_to_shared(packet + first);
+        asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::
+                     "l"(dst), "r"(addr), "r"(stride - first) : "memory");
+        asm volatile("cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;" ::: "memory");
+    }
 }
 __device__ int expert(Buffers b, Shape s, int route) {
     const uint8_t *p = b.incoming + size_t(route / s.k) * s.stride + s.h + s.h / 32;
@@ -314,15 +344,19 @@ __global__ void activate(Buffers b, Shape s) {
         }
     }
 }
+template <int FixedTopK = 0>
 __global__ void combine(Mail local, Shape s, const int *ids, BF *out, const int *live) {
     const int row = blockIdx.x;
     const bool active = !live || live[row] > 0;
+    const int topk = FixedTopK ? FixedTopK : s.k;
     constexpr int width = sizeof(uint4) / sizeof(BF);
-    for (int chunk = threadIdx.x; chunk < s.h / width; chunk += blockDim.x) {
+    const int start = FixedTopK ? blockIdx.y * blockDim.x + threadIdx.x : threadIdx.x;
+    const int step = FixedTopK ? gridDim.y * blockDim.x : blockDim.x;
+    for (int chunk = start; chunk < s.h / width; chunk += step) {
         float sum[width] = {};
         if (active) {
-            for (int j = 0; j < s.k; ++j) {
-                const int slot = row * s.k + j;
+            for (int j = 0; j < topk; ++j) {
+                const int slot = row * topk + j;
                 if (static_cast<unsigned>(ids[slot]) >= static_cast<unsigned>(s.ranks * s.localE)) continue;
                 const auto *values = reinterpret_cast<const uint4 *>(local.returned + size_t(slot) * s.h);
                 const uint4 packed = values[chunk];
@@ -554,10 +588,15 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
         auto *keys = live ? live + first : nullptr;
         const int *index = n ? ids + size_t(first) * s.k : nullptr;
         const bool shortBatch = r.tunedEp8 && cap <= 32;
-        publish<<<cap, 256, 0, stream>>>(r.mail, s,
-                                         n ? static_cast<const BF *>(input) + size_t(first) * s.h : nullptr,
-                                         index, n ? scores + size_t(first) * s.k : nullptr, n, keys);
-        dispatch<<<dim3(cap, s.ranks), 128, 0, stream>>>(r.peers, s, rank, cap);
+        const BF *rowsIn = n ? static_cast<const BF *>(input) + size_t(first) * s.h : nullptr;
+        const float *weights = n ? scores + size_t(first) * s.k : nullptr;
+        if (shortBatch) {
+            dispatchDecodeRows<<<dim3(cap, s.ranks / DispatchPeers), 256, 0, stream>>>(
+                r.peers, rank, rowsIn, index, weights, n, cap, keys);
+        } else {
+            publish<<<cap, 256, 0, stream>>>(r.mail, s, rowsIn, index, weights, n, keys);
+            dispatch<<<dim3(cap, s.ranks), 128, 0, stream>>>(r.peers, s, rank, cap);
+        }
         rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
         int routes = cap * s.ranks * s.k;
         check(cudaMemsetAsync(r.b.counts, 0, s.localE * sizeof(int), stream));
@@ -583,9 +622,11 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
         if (shortBatch) multiply<cutlass::bfloat16_t, DecodeTile>(r, l.down, r.b.returnRows, s.h, s.i);
         else multiply<cutlass::bfloat16_t, Tile>(r, l.down, r.b.returnRows, s.h, s.i);
         rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
-        if (n)
-            combine<<<n, 256, 0, stream>>>(r.mail, s, index, static_cast<BF *>(out) + size_t(first) * s.h,
-                                           keys);
+        if (n && shortBatch)
+            combine<8><<<dim3(n, 4), 128, 0, stream>>>(r.mail, s, index,
+                static_cast<BF *>(out) + size_t(first) * s.h, keys);
+        else if (n)
+            combine<><<<n, 256, 0, stream>>>(r.mail, s, index, static_cast<BF *>(out) + size_t(first) * s.h, keys);
         check(cudaGetLastError());
     }
 }
