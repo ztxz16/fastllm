@@ -696,6 +696,7 @@ int main(int argc, char **argv) {
             TestRebinding(769, 4097, true, false, false, fp8, 6);
             TestRebinding(1025, 4097, true, false, false, fp8, 8);
         }
+        TestRebinding(64, 707, false, false, false, true, 4, 64, 4);
         TestRebinding(4, 707, false, true);
         TestRebinding(33, 4097, true, true);
         for (int capacity : {127, 128, 129, 2047, 2048, 4097}) {

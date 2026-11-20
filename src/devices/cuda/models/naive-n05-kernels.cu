@@ -9,6 +9,7 @@
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include "naive-n05-attention-small.cuh"
+#include "naive-n05-verify-dense.cuh"
 #include "naive-n05-attention-prefetch.cuh"
 #include "naive-n05-attention-hopper.cuh"
 #include "naive-n05-decode-blackwell.cuh"
@@ -4653,21 +4654,25 @@ __global__ void CopyVerifyWindow(FastllmNaiveKV key, FastllmNaiveKV value,
         outValue[index] = value.Row(begin + index / vc, vc)[index % vc];
 }
 
-int DecodeIndexerScoreBlocks(int rows, int tiles, int blocksPerSM) {
-    static thread_local std::map<int, int> budgets;
+int DeviceSMCount() {
+    static thread_local std::map<int, int> smCounts;
     const int device = FastllmCudaGetDevice();
-    auto it = budgets.find(device);
-    if (it == budgets.end()) {
+    auto it = smCounts.find(device);
+    if (it == smCounts.end()) {
         int sms = 0;
         if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
             cudaGetLastError();
             sms = 1;
         }
-        it = budgets.emplace(device, std::max(1, sms)).first;
+        it = smCounts.emplace(device, std::max(1, sms)).first;
     }
+    return it->second;
+}
+
+int DecodeIndexerScoreBlocks(int rows, int tiles, int blocksPerSM) {
     // Spread work over several resident waves without launching the padded
     // history grid for every request. Small batches retain per-row parallelism.
-    return std::min(tiles, std::min(256, std::max(1, it->second * blocksPerSM / rows)));
+    return std::min(tiles, std::min(256, std::max(1, DeviceSMCount() * blocksPerSM / rows)));
 }
 
 int DecodeTopKBlocks() {
@@ -6097,6 +6102,39 @@ bool SmallDSAAttention(const fastllm::Data &query, const fastllm::Data &sink,
     return true;
 }
 
+// Only pair queries whose KV bindings stay shared on every graph replay.
+template<int Max>
+bool DensePairAttention(const fastllm::Data &query, const float *sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    namespace bulk = naive_attention_bulk;
+    if (rows.size() % 2 || FastllmCudaRuntimeArch() != 120) return false;
+    // Leave small grids to the per-row kernel so they can fill the device.
+    if (rows.size() / 2 * (heads / 8) < size_t(2 * DeviceSMCount())) return false;
+    for (size_t i = 0; i < rows.size(); i += 2) {
+        const auto &a = rows[i], &b = rows[i + 1];
+        if (!a.fp8 || !b.fp8 || a.keyStride != b.keyStride || a.pageLen != b.pageLen ||
+            a.cache != b.cache || a.keyPages != b.keyPages || a.valuePages != b.valuePages ||
+            (!a.cache && (a.key != b.key || a.value != b.value))) return false;
+    }
+    constexpr size_t shared = sizeof(bulk::DensePairStorage<Max>);
+    auto kernel = bulk::DensePair<Max>;
+    if (!BulkKernelSupported(kernel, shared, 80)) return false;
+    constexpr int limit = bulk::BatchLimit / 2 * 2;
+    for (int first = 0; first < int(rows.size()); first += limit) {
+        int n = std::min(limit, int(rows.size()) - first);
+        bulk::Batch batch{};
+        std::copy_n(rows.begin() + first, n, batch.rows);
+        kernel<<<dim3(n / 2, heads / 8), 256, shared>>>(
+            static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, sink,
+            static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128, heads, kvHeads);
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 template <int Max, bool Ring>
 bool BulkAttention(const fastllm::Data &query, const float *bias,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
@@ -6298,6 +6336,9 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
             launched = count <= 1024 ? HopperBulkAttention<1024>(query, bias, rows, heads, output)
                                      : HopperBulkAttention<2048>(query, bias, rows, heads, output);
 #endif
+        if (!launched && dense)
+            launched = count <= 1024 ? DensePairAttention<1024>(query, bias, rows, heads, kvHeads, output)
+                                     : DensePairAttention<2048>(query, bias, rows, heads, kvHeads, output);
         if (!launched)
             launched = count <= 1024 ? BulkAttention<1024, false>(query, bias, rows, heads, kvHeads, output)
                                      : BulkAttention<2048, false>(query, bias, rows, heads, kvHeads, output);
