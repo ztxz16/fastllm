@@ -4125,6 +4125,21 @@ void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
     }
 }
 
+static bool NaivePrefillStageFits(const fastllm::Data &key, const fastllm::Data &value) {
+    return (uint64_t)key.dims[1] * (key.dims[2] + value.dims[2]) * sizeof(BF16) <= (size_t(256) << 20);
+}
+
+// Expand the cache once when multiple gathers amortize reading it. Keep the
+// original SIMT arithmetic for small 16:1 shards that do not use MMA.
+static bool StageHopperSparseFP8(const fastllm::Data &key, const fastllm::Data &value,
+        int queries, int count, int heads, int kvHeads, int arch) {
+    return arch == 90 && count == 2048 && queries >= 64 &&
+        (heads != kvHeads * 16 || (uint64_t)queries * heads >= 2048) &&
+        key.dataType == fastllm::FP8_E4M3 && value.dataType == key.dataType &&
+        !key.kvCacheFp8Indexer && !value.kvCacheFp8Indexer &&
+        (uint64_t)key.dims[1] * 2 <= (uint64_t)queries * count && NaivePrefillStageFits(key, value);
+}
+
 static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
         const fastllm::Data &key, const fastllm::Data &value,
         const fastllm::Data &indices, const fastllm::Data &sink,
@@ -4137,7 +4152,9 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
     if (count <= 0 || count > 2048 || (size_t)query.cudaData % 16 != 0) return false;
     const int arch = FastllmCudaRuntimeArch();
     const bool blackwellBF16 = arch == 120 && key.dataType == BFLOAT16;
-    if (heads == kvHeads * 16 && (queries < (blackwellBF16 ? 32 : (key.dataType == FP8_E4M3 ? 2048 : 1024)) ||
+    const bool stageFP8 = StageHopperSparseFP8(key, value, queries, count, heads, kvHeads, arch);
+    const int minRows = blackwellBF16 ? 32 : (key.dataType == FP8_E4M3 ? 2048 : 1024);
+    if (heads == kvHeads * 16 && ((!stageFP8 && queries < minRows) ||
         count != 2048 || (arch != 90 && !blackwellBF16) ||
         key.dataType != value.dataType || !FastllmNaiveAttentionKVType(key.dataType) ||
         key.kvCacheFp8Indexer || value.kvCacheFp8Indexer)) return false;
@@ -4151,15 +4168,14 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
         shared = sizeof(mma::Storage<2048, 2>);
         groupedHeads = 16;
     } else if (FastllmCudaRuntimeArch() == 90 &&
-               BulkKernelSupported(mma::Hopper, sizeof(mma::HopperStorage), 90)) {
-        kernel = mma::Hopper;
+               BulkKernelSupported(mma::Hopper<FastllmNaiveKV>, sizeof(mma::HopperStorage), 90)) {
+        kernel = mma::Hopper<FastllmNaiveKV>;
         shared = sizeof(mma::HopperStorage);
     }
     const size_t probabilityRowBytes = size_t(heads) * 2056 * sizeof(BF16);
     const int tileRows = std::min<size_t>(queries, (size_t(512) << 20) / probabilityRowBytes);
     const bool split = groupedHeads == 16 && count == 2048 && tileRows > 0;
-    // Check the kernels actually launched. Split QK/PV need 32/39 KiB,
-    // rather than the fused kernel's 96 KiB shared-memory allocation.
+    // Check each split kernel against its own shared-memory requirement.
     if (split) {
         if (!BulkKernelSupported(mma::SplitQK<2048,0,2,mma::SplitBF16KV>, sizeof(mma::QKStorage<2>), 80) ||
             !BulkKernelSupported(mma::SplitNormalize<2048>, 0, 80) ||
@@ -4167,10 +4183,13 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
     } else if (!BulkKernelSupported(kernel, shared, 80)) return false;
     Data stagedKey, stagedValue;
     const Data *readKey = &key, *readValue = &value;
-    if (groupedHeads == 16 && key.dataType != BFLOAT16) {
+    const bool stagedHopper = groupedHeads == 8 && stageFP8 &&
+        BulkKernelSupported(mma::Hopper<mma::SplitBF16KV>, sizeof(mma::HopperStorage), 90);
+    if (stagedHopper) shared = sizeof(mma::HopperStorage);
+    if ((groupedHeads == 16 || stagedHopper) && key.dataType != BFLOAT16) {
         // Expand each cached value once, instead of repeating packed KV
         // conversion for every query's gathered tile. Storage stays quantized.
-        if ((uint64_t)keys * (key.dims[2] + value.dims[2]) * sizeof(BF16) > (size_t(256) << 20)) return false;
+        if (!NaivePrefillStageFits(key, value)) return false;
         Output(stagedKey, BFLOAT16, key.dims);
         Output(stagedValue, BFLOAT16, value.dims);
         FastllmCudaNaiveReadCache({{&key, stagedKey.cudaData, 0, keys}, {&value, stagedValue.cudaData, 0, keys}});
@@ -4190,11 +4209,11 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
         // reusing a bounded probability tile on the same CUDA stream.
         for (int first = 0; first < queries; first += tileRows) {
             const int rows = std::min(tileRows, queries - first);
-            mma::SplitQK<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::QKStorage<2>)>>>(
+            mma::SplitQK<2048,0,2><<<dim3(rows,heads/16),mma::QKStorage<2>::Threads,sizeof(mma::QKStorage<2>)>>>(
                 (const BF16 *)query.cudaData, splitKey,
                 ids, p, heads, kvHeads, key.dims[2], keys, count, pastLength, causal, indexTile, first, queries);
-            mma::SplitNormalize<2048><<<dim3(rows,heads),256>>>(p,bias,heads,count);
-            mma::SplitPV<2048,0,2><<<dim3(rows,heads/16),256,sizeof(mma::PVStorage<2>)>>>(
+            mma::SplitNormalize<2048><<<dim3(heads / 4, rows),256>>>(p,bias,heads);
+            mma::SplitPV<2048,0,2><<<dim3(rows,heads/16),mma::PVStorage<2>::Threads,sizeof(mma::PVStorage<2>)>>>(
                 p, splitValue, ids,
                 (BF16 *)output.cudaData, heads, kvHeads, keys, count,
                 pastLength, causal, indexTile, first, queries);
@@ -4202,12 +4221,17 @@ static bool LaunchNaivePrefillAttention(const fastllm::Data &query,
         CheckLaunch();
         return true;
     }
-    kernel<<<dim3(queries, heads / groupedHeads), 256, shared>>>(
-        (const BF16 *)query.cudaData, FastllmNaiveKV(*readKey), FastllmNaiveKV(*readValue),
-        indices.dims.empty() ? nullptr : (const int *)indices.cudaData,
-        sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
-        (BF16 *)output.cudaData, heads, kvHeads, key.dims[2], keys, count,
-        pastLength, causal, indexTile);
+    auto launchFused = [&](auto fused, auto k, auto v) {
+        fused<<<dim3(queries, heads / groupedHeads), 256, shared>>>(
+            (const BF16 *)query.cudaData, k, v, indices.dims.empty() ? nullptr : (const int *)indices.cudaData,
+            sink.dims.empty() ? nullptr : (const float *)sink.cudaData, (BF16 *)output.cudaData,
+            heads, kvHeads, key.dims[2], keys, count, pastLength, causal, indexTile);
+    };
+    if (stagedHopper) {
+        launchFused(mma::Hopper<mma::SplitBF16KV>, mma::SplitBF16KV(*readKey), mma::SplitBF16KV(*readValue));
+    } else {
+        launchFused(kernel, FastllmNaiveKV(*readKey), FastllmNaiveKV(*readValue));
+    }
     CheckLaunch();
     return true;
 }
@@ -4284,10 +4308,11 @@ static void NaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionIt
             ids.dataDevice == DataDevice::CUDA && ids.dataDeviceIds == q.dataDeviceIds && ids.cudaData &&
             FastllmCudaFlashInferDataTypeSupported(BFLOAT16);
         // Do not replace the faster fused/split dispatch or change its arithmetic.
-        const bool canStage = k.dataType == BFLOAT16 ||
-            (uint64_t)keys * (k.dims[2] + v.dims[2]) * sizeof(BF16) <= (size_t(256) << 20);
-        if (heads == kvHeads * 16 && rows >= (k.dataType == FP8_E4M3 ? 2048 : 1024) &&
-            FastllmCudaRuntimeArch() == 90 && k.dataType == v.dataType &&
+        const bool canStage = k.dataType == BFLOAT16 || NaivePrefillStageFits(k, v);
+        const int arch = FastllmCudaRuntimeArch();
+        if (heads == kvHeads * 16 && (rows >= (k.dataType == FP8_E4M3 ? 2048 : 1024) ||
+            StageHopperSparseFP8(k, v, rows, 2048, heads, kvHeads, arch)) &&
+            arch == 90 && k.dataType == v.dataType &&
             FastllmNaiveAttentionKVType(k.dataType) && !k.kvCacheFp8Indexer && !v.kvCacheFp8Indexer && canStage)
             supported = false;
         if (supported) {
