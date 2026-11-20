@@ -836,6 +836,8 @@ namespace fastllm {
 
             // 每个页面的引用计数
             std::vector<int> pageRefCount;
+            // Caller holds pageIndexLocker, as for pageRefCount.
+            bool HasSharedPages() const { return sharedPageCount != 0; }
 
             // Trie树缓存管理
             CacheTrieNode *trieRoot = nullptr;
@@ -889,6 +891,7 @@ namespace fastllm {
             std::set<std::pair<long long, int>> unrestorableLeaves;
             std::unordered_map<int, int> prefixCheckpoints;
             bool requirePrefixCheckpoints = false;
+            int sharedPageCount = 0;
             void UpdateEvictableLeaf(CacheTrieNode *node);
             void TouchTrieNode(CacheTrieNode *node, long long access);
             void RemoveTriePage(int pageIndex);

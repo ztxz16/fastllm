@@ -332,7 +332,8 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         index.SetMaxPages(pages);
         model.tpIndexerSidecars[&main] = &index;
         int old = main.GetUnusedPageIndex(true);
-        main.pageRefCount[old]++;
+        std::vector<int> shared{old};
+        main.Pick(shared);
         Data cache(INT32, {pages});
         cache.ToDevice(DataDevice::CUDA, {0}, false);
         cache.Allocate(false);

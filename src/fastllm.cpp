@@ -6173,6 +6173,7 @@ namespace fastllm {
         }
         pageTimestamp.assign(maxPages, 0);
         pageRefCount.assign(maxPages, 0);
+        sharedPageCount = 0;
         // Keep generations monotonic across pool resets as well as page reuse.
         trieRoot = new CacheTrieNode();
         pressureEvictedPages = 0;
@@ -6326,6 +6327,7 @@ namespace fastllm {
     }
 
     void PagedCacheManager::ReleasePageIndexLocked(int pageIndex) {
+        if (pageRefCount[pageIndex] == 2) --sharedPageCount;
         if (--pageRefCount[pageIndex] > 0) return;
         pageRefCount[pageIndex] = 0;
         auto *node = pageToTrieNode[pageIndex];
@@ -6359,7 +6361,10 @@ namespace fastllm {
         bool rebuildFree = false;
         for (int pid : pageIds) {
             // Already referenced pages cannot be in either unused-page pool.
-            if (++pageRefCount[pid] > 1) continue;
+            if (++pageRefCount[pid] > 1) {
+                if (pageRefCount[pid] == 2) ++sharedPageCount;
+                continue;
+            }
             if (freePageFlags[pid]) {
                 freePageFlags[pid] = 0;
                 rebuildFree = true;
