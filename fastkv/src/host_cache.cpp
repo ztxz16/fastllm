@@ -17,13 +17,15 @@ uint64_t Namespace(const std::string &name) {
     for (unsigned char c : name) h = Hash(h, c);
     return h;
 }
-struct Copy { Buffer source, target; };
+struct Copy {
+    Buffer source, target;
+    bool Direct() const { return source.HostPinned() || target.HostPinned(); }
+};
 void AddCopy(std::vector<Copy> &copies, Buffer source, Buffer target) {
     if (source.Size()) copies.push_back({std::move(source), std::move(target)});
 }
-// Pageable resident storage and a small pinned staging window are separate
-// budgets. Each worker owns private streams: no default-stream/device barrier.
-// Adjacent regions are staged together, avoiding one DMA submission per page.
+// Each worker owns private streams. Registered slabs transfer directly;
+// pageable spans share a bounded pair of staging windows on each device.
 class Copier {
 #ifdef FASTKV_CUDA
     struct Lane {
@@ -31,40 +33,39 @@ class Copier {
         cudaStream_t stream = nullptr;
         void *staging = nullptr;
         Buffer storage;
-        bool registered = false;
         cudaEvent_t ready[2]{};
         const DeviceNuma &numa;
         std::unique_ptr<Pool> worker;
-        explicit Lane(int device, size_t bytes, int slots) : device(device), numa(NumaForDevice(device)) {
-            NumaScope affinity(numa);
+        explicit Lane(int device) : device(device), numa(NumaForDevice(device)) {
             Check(cudaSetDevice(device));
-            bytes = CheckedMul(bytes, size_t(slots));
-            storage = AllocateNumaHost(bytes, numa);
-            staging = storage.MutableData();
-            std::memset(staging, 0, bytes);
             Check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-            auto result = cudaHostRegister(staging, bytes, cudaHostRegisterPortable);
-            registered = result == cudaSuccess;
-            if (!registered) {
-                cudaGetLastError();
-                storage = {};
-                result = cudaHostAlloc(&staging, bytes, cudaHostAllocPortable);
-            }
-            if (result != cudaSuccess) { cudaStreamDestroy(stream); Check(result); }
             try {
                 for (auto &event : ready) Check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             } catch (...) {
                 for (auto event : ready) if (event) cudaEventDestroy(event);
-                if (registered) cudaHostUnregister(staging); else cudaFreeHost(staging);
                 cudaStreamDestroy(stream); throw;
             }
+        }
+        void EnsureStaging(size_t bytes) {
+            if (staging) return;
+            auto memory = AllocateNumaHost(bytes, numa);
+            void *address = memory.MutableData();
+            std::memset(address, 0, bytes);
+            if (cudaHostRegister(address, bytes, cudaHostRegisterPortable) == cudaSuccess) {
+                storage = std::move(memory);
+            } else {
+                cudaGetLastError();
+                Check(cudaHostAlloc(&address, bytes, cudaHostAllocPortable));
+            }
+            staging = address;
         }
         ~Lane() {
             worker.reset();
             cudaSetDevice(device);
             cudaStreamSynchronize(stream);
             for (auto event : ready) cudaEventDestroy(event);
-            if (registered) cudaHostUnregister(staging); else cudaFreeHost(staging);
+            if (storage.Size()) cudaHostUnregister(staging);
+            else if (staging) cudaFreeHost(staging);
             cudaStreamDestroy(stream);
         }
     };
@@ -77,16 +78,18 @@ class Copier {
     int stages;
   public:
     explicit Copier(size_t bytes) : stagingBytes(std::max(size_t(1), bytes / 2)), stages(bytes > 1 ? 2 : 1) {}
-    void Run(const std::vector<Copy> &copies, const std::shared_ptr<Cancellation> &cancel = {}) {
+    size_t Run(const std::vector<Copy> &copies, const std::shared_ptr<Cancellation> &cancel = {}) {
         // Group by device to overlap the independent PCIe links. A staging
         // window gathers/scatters CPU regions but transfers contiguous GPU spans.
         std::map<int, std::vector<const Copy *>> groups;
+        size_t directBytes = 0;
         for (const auto &copy : copies) {
             if (copy.source.Kind() == MemoryKind::Host && copy.target.Kind() == MemoryKind::Host) {
                 std::memcpy(copy.target.MutableData(), copy.source.Data(), copy.source.Size());
             } else {
                 const int device = copy.source.Kind() == MemoryKind::Cuda ? copy.source.Device() : copy.target.Device();
                 groups[device].push_back(&copy);
+                if (copy.Direct()) directBytes += copy.source.Size();
             }
         }
 #ifndef FASTKV_CUDA
@@ -99,7 +102,7 @@ class Copier {
             bool pending[2]{};
         };
         for (const auto &group : groups)
-            if (!lanes.count(group.first)) lanes[group.first].reset(new Lane(group.first, stagingBytes, stages));
+            if (!lanes.count(group.first)) lanes[group.first].reset(new Lane(group.first));
         auto stage = [](const std::vector<Piece> &pieces, char *staging, bool download) {
             for (size_t i = 0; i < pieces.size();) {
                 const auto &p = pieces[i];
@@ -136,17 +139,40 @@ class Copier {
             Check(cudaSetDevice(lane.device));
             Cursor cursor;
             int slot = 0;
+            bool directPending = false;
             try {
                 while (cursor.index < group.size()) {
                     if (cancel && cancel->Cancelled()) throw std::runtime_error("FastKV: restore cancelled");
+                    const auto &first = *group[cursor.index];
+                    if (first.Direct()) {
+                        // All slices (and their logical leases) stay live through completion.
+                        // Merge only contiguous ranges in both physical allocations.
+                        size_t bytes = first.source.Size();
+                        ++cursor.index;
+                        while (cursor.index < group.size()) {
+                            const auto &next = *group[cursor.index];
+                            if (next.source.Id() != first.source.Id() || next.target.Id() != first.target.Id() ||
+                                next.source.Offset() != first.source.Offset() + bytes ||
+                                next.target.Offset() != first.target.Offset() + bytes) break;
+                            bytes += next.source.Size();
+                            ++cursor.index;
+                        }
+                        const auto kind = first.source.Kind() == MemoryKind::Cuda ?
+                            cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice;
+                        Check(cudaMemcpyAsync(first.target.MutableData(), first.source.Data(), bytes, kind, lane.stream));
+                        directPending = true;
+                        continue;
+                    }
                     // Reuse only a completed slot. CPU staging of the next
                     // window overlaps DMA of the other, within the same budget.
+                    lane.EnsureStaging(CheckedMul(stagingBytes, size_t(stages)));
                     finish(lane, cursor, slot);
                     auto &pieces = cursor.pieces[slot];
                     char *staging = static_cast<char *>(lane.staging) + slot * stagingBytes;
                     size_t used = 0;
                     while (cursor.index < group.size() && used < stagingBytes) {
                         const Copy *copy = group[cursor.index];
+                        if (copy->Direct()) break;
                         const size_t bytes = std::min(stagingBytes - used, copy->source.Size() - cursor.offset);
                         pieces.push_back({copy, cursor.offset, bytes, used});
                         used += bytes; cursor.offset += bytes;
@@ -173,10 +199,12 @@ class Copier {
                         i = j;
                     }
                     Check(cudaEventRecord(lane.ready[slot], lane.stream));
+                    directPending = false; // The slot event also covers preceding direct transfers.
                     cursor.pending[slot] = true;
                     slot = (slot + 1) % stages;
                 }
                 for (int s = 0; s < stages; ++s) finish(lane, cursor, s);
+                if (directPending) Check(cudaStreamSynchronize(lane.stream));
             } catch (...) {
                 cudaStreamSynchronize(lane.stream);
                 throw;
@@ -209,6 +237,7 @@ class Copier {
         }
 #endif
         if (cancel && cancel->Cancelled()) throw std::runtime_error("FastKV: restore cancelled");
+        return directBytes;
     }
 };
 } // namespace
@@ -276,7 +305,7 @@ struct HostCache::Impl {
         explicit ResidentPool(size_t limit) : limit(limit), budget(limit, "host cache") {}
     };
     ResidentPool kv, window;
-    Budget inflight;
+    Budget inflight, pinned;
     std::mutex allocationMutex;
     std::map<int, std::unique_ptr<Budget>> destinationBudgets;
     mutable std::mutex mutex;
@@ -293,7 +322,8 @@ struct HostCache::Impl {
     explicit Impl(Options options) : options(options),
                                     kv(options.bytes - size_t(std::max<int64_t>(0, options.swaBytes))),
                                     window(size_t(std::max<int64_t>(0, options.swaBytes))),
-                                    inflight(options.inflightBytes, "host cache transfers") {
+                                    inflight(options.inflightBytes, "host cache transfers"),
+                                    pinned(options.pinnedBytes, "pinned host cache") {
         Require(options.swaBytes >= -1 && window.limit <= options.bytes && options.bytes && options.inflightBytes && options.stagingBytes && options.queueDepth &&
                     options.workers > 0 && options.workers <= 64, "FastKV: invalid host cache options");
         for (const auto &limit : options.restoreDeviceBytes) {
@@ -358,7 +388,7 @@ struct HostCache::Impl {
         std::lock_guard<std::mutex> lock(mutex);
         if (bytes > kv.limit) throw CapacityBusy("FastKV: metadata exceeds KV budget");
         while (bytes > kv.limit - kv.budget.Used())
-            if (!Evict()) throw CapacityBusy("FastKV: host cache pinned or full");
+            if (!kv.slabs.ReleaseIdle() && !Evict()) throw CapacityBusy("FastKV: host cache pinned or full");
         return kv.budget.Reserve(bytes);
     }
     Buffer Allocate(size_t bytes, int device, CacheStorage storage) {
@@ -381,11 +411,26 @@ struct HostCache::Impl {
                 // would recreate unbounded small mappings near a full cache.
                 if (available >= preferred) {
                     credit = pool.budget.Reserve(preferred);
-                } else if (!Evict(windowOnly)) {
+                } else if (!pool.slabs.ReleaseIdle() && !Evict(windowOnly)) {
                     throw CapacityBusy("FastKV: host cache pinned or full");
                 }
             }
-            if (credit) return pool.slabs.Add(AllocateNumaHost(preferred, numa), std::move(credit), numa.node, bytes);
+            if (credit) {
+                const bool canPin = device >= 0 && options.pinnedBytes;
+                auto slab = AllocateNumaHost(preferred, numa, canPin);
+#if defined(__linux__) && defined(FASTKV_CUDA)
+                if (canPin) {
+                    const size_t page = size_t(getpagesize());
+                    const size_t registrationBytes = CheckedAdd(preferred, page - 1) / page * page;
+                    // Growth is serialized by allocationMutex. Charge whole OS pages.
+                    if (registrationBytes <= options.pinnedBytes - pinned.Used()) {
+                        NumaScope affinity(numa);
+                        slab.TryPinHost(pinned.Reserve(registrationBytes), device);
+                    }
+                }
+#endif
+                return pool.slabs.Add(std::move(slab), std::move(credit), numa.node, bytes);
+            }
         }
     }
     bool Enqueue(size_t bytes, bool priority, std::function<void(Copier &, std::shared_ptr<void>)> job) {
@@ -466,7 +511,9 @@ struct HostCache::Impl {
             }
             entry->payloads.push_back(std::move(payload));
         }
-        copier.Run(copies);
+        const auto begin = std::chrono::steady_clock::now();
+        const size_t directBytes = copier.Run(copies);
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
         std::lock_guard<std::mutex> lock(mutex);
         auto previous = Match(name, tokens);
         if (!previous || previous->tokens.size() != tokens.size()) {
@@ -485,6 +532,8 @@ struct HostCache::Impl {
             ++stats.publications;
         }
         stats.copiedToHost += copied; stats.reusedBytes += reused;
+        stats.directToHost += directBytes;
+        if (copied) stats.publishCopyMicroseconds += std::max<int64_t>(1, us);
     }
 };
 
@@ -598,12 +647,13 @@ bool HostCache::Restore(Hit hit, std::vector<int> devices, std::vector<Buffer> t
                     message.buffers.push_back(target.ReadOnly());
                 }
                 const auto begin = std::chrono::steady_clock::now();
-                copier.Run(copies, cancellation);
+                const size_t directBytes = copier.Run(copies, cancellation);
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count();
                 {
                     std::lock_guard<std::mutex> lock(p->mutex);
                     ++p->stats.restores; p->stats.restoredBytes += hit.Bytes();
                     p->stats.restoreMicroseconds += std::max(int64_t(1), int64_t(us));
+                    p->stats.directToDevice += directBytes;
                 }
                 promise->set_value(std::move(message));
             } catch (...) {
@@ -621,6 +671,7 @@ HostCache::Statistics HostCache::Stats() const {
     stats.bytes = kv + window;
     if (impl->options.swaBytes >= 0) { stats.kvBytes = kv; stats.swaBytes = window; }
     stats.inflightBytes = impl->inflight.Used();
+    stats.pinnedResidentBytes = impl->pinned.Used();
     stats.queued = impl->queue.size() + impl->restores.size() + impl->running;
     for (const auto &bucket : impl->entries) stats.entries += bucket.second.size();
     return stats;

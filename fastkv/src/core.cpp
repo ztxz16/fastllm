@@ -141,10 +141,12 @@ struct Buffer::Storage {
     uint64_t id = 0;
     bool preallocated = false;
     std::shared_ptr<void> owner;
+    std::shared_ptr<void> hostRegistration;
     mutable std::mutex mutex;
     mutable std::map<std::string, std::shared_ptr<void>> attachments;
     ~Storage() {
         attachments.clear();
+        hostRegistration.reset();
         owner.reset();
     }
 };
@@ -190,6 +192,27 @@ Buffer Buffer::Allocate(size_t n, int device) {
 #endif
 }
 bool Buffer::Preallocated() const { return storage && storage->preallocated; }
+bool Buffer::HostPinned() const { return storage && bool(storage->hostRegistration); }
+void Buffer::TryPinHost(std::shared_ptr<void> credit, int device) {
+#ifdef FASTKV_CUDA
+    DeviceScope scope(device);
+    auto result = cudaHostRegister(storage->data, storage->size, cudaHostRegisterPortable);
+    if (result == cudaSuccess) {
+        storage->hostRegistration = std::shared_ptr<void>(storage->data, [credit = std::move(credit), device](void *p) {
+            int previous = 0;
+            cudaGetDevice(&previous);
+            cudaSetDevice(device);
+            cudaHostUnregister(p);
+            cudaSetDevice(previous);
+        });
+    } else if (result == cudaErrorMemoryAllocation || result == cudaErrorNotSupported ||
+               result == cudaErrorOperatingSystem || result == cudaErrorNotPermitted) {
+        cudaGetLastError(); // This slab will use the pageable staging path.
+    } else {
+        CudaCheck(result);
+    }
+#endif
+}
 void Buffer::MarkPreallocated() { storage->preallocated = true; }
 size_t Buffer::AllocationSize() const { return storage ? storage->size : 0; }
 Buffer Buffer::Slice(size_t at, size_t n) const {

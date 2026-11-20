@@ -80,6 +80,7 @@ class Buffer {
     void CopyFrom(const Buffer &source, size_t sourceOffset, size_t targetOffset, size_t bytes) const;
     void MakeRemoteWritesVisible() const;
     bool Preallocated() const;
+    bool HostPinned() const;
     bool HasAttachment(const std::string &key) const;
     std::shared_ptr<void>
     Attachment(const std::string &key,
@@ -87,6 +88,9 @@ class Buffer {
 
   private:
     friend class BufferPool;
+    friend class HostCache;
+    // Only called on a new, exclusively owned host slab before publishing it.
+    void TryPinHost(std::shared_ptr<void> credit, int device);
     size_t AllocationSize() const;
     void MarkPreallocated();
     std::shared_ptr<Storage> storage;

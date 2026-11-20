@@ -178,13 +178,33 @@ int main(int argc, char **argv) {
         // Both staging slots cross region boundaries, including a short final
         // slot. A one-byte budget keeps the same contract without rounding up.
         for (size_t staging : {size_t(1), size_t(4099), size_t(65537)}) {
-            HostCache odd({1 << 20, 1 << 20, staging, 4, 1});
+            HostCache::Options pageable{1 << 20, 1 << 20, staging, 4, 1};
+            pageable.pinnedBytes = 0;
+            HostCache odd(pageable);
             Check(odd.PublishAsync("odd", {1}, a), "odd staging publish"); odd.Drain();
             Equal(a.state, Restore(odd, odd.Find("odd", {1}), device));
         }
         // Larger than every staging window: cancel while DMA is in flight,
         // then reuse the worker. Never release a source/destination early.
         if (device >= 0) {
+#ifdef __linux__
+            // The small window fits one 64 KiB slab, the 96-page KV payload requires a larger slab.
+            const std::pair<size_t, size_t> cases[] = {{0, 0}, {65536, 513}, {1 << 20, 96 * 4096 + 513}};
+            for (const auto &[pinLimit, directBytes] : cases) {
+                HostCache::Options opt;
+                opt.bytes = 1 << 20;
+                opt.pinnedBytes = pinLimit;
+                HostCache subset(opt);
+                auto input = State(96, device);
+                Check(subset.PublishAsync("subset", {1}, input), "mixed registration admission");
+                subset.Drain();
+                Equal(input.state, Restore(subset, subset.Find("subset", {1}), device));
+                const auto stats = subset.Stats();
+                Check(stats.directToHost == directBytes && stats.directToDevice == directBytes &&
+                      stats.pinnedResidentBytes <= pinLimit && stats.publishCopyMicroseconds,
+                      "pinned and staged spans or resident pin budget");
+            }
+#endif
             auto large = State(1024, device);
             HostCache streamed({32 << 20, 32 << 20, 8192, 4, 1});
             Check(streamed.PublishAsync("stream", {1}, large), "stream publish"); streamed.Drain();

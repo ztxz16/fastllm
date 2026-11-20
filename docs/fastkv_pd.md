@@ -245,6 +245,8 @@ Naive/MiMo 多卡服务默认把历史窗口保存在 GPU。Attention DP 每组�
 
 需要分别控制 CPU 占用时，单实例可设置 `--prefix_cache_l2_kv_bytes 4294967296 --prefix_cache_l2_swa_bytes 2147483648`。PD 在每个 prefill group 设置对应的 `cache_kv_bytes` 和 `cache_swa_bytes`，单位均为字节。此例给完整 KV、Indexer 和缓存目录 4 GiB，给 SWA 窗口及可选草稿检查点 2 GiB。两个池独立计费，包括各自分配块里的空闲空间。
 
+Linux CUDA 的 P 端可用每组的 `cache_pinned_bytes` 控制其中多少主存允许锁页。默认取 1 GiB 与该组总 L2 容量的较小值，设为 0 关闭驻留块直传。锁页按需注册，KV 和窗口共用这份额度，达到上限或系统无法注册时继续使用 staging。首次写入包含注册成本，淘汰后的空闲锁页块可复用。P 日志的 `pinned_bytes` 是当前注册量，`direct_d2h_bytes` 和 `direct_h2d_bytes` 分别是累计直传的写入和读取字节。
+
 只设置总额沿用共享池。设置总额和一项分额时，另一项使用总额的剩余部分；直接指定两项时可省略总额。只给一项且没有总额时，另一项为零。显式零预算会跳过需要该类数据的检查点。任一池不足时，只能淘汰完整的旧检查点或跳过本次备份，GPU 前缀复用和冷算仍可使用。
 
 单实例只备份完整的页对齐边界。FastKV 后台复制请求持有的完整 KV 页、对应 Indexer、GPU 窗口以及启用草稿时的草稿检查点。GPU 命中足够长时直接复用。若 L2 有更长的边界，模型为目标组预留私有页和窗口，FastKV 将数据复制到这些预分配的地址，调度器等待复制成功后再接入请求。预算或队列不足时可回到已驻留前缀或重新计算。`[FastKV L2] restored_tokens` 表示实际导入长度。

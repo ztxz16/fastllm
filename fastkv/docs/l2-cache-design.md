@@ -41,7 +41,9 @@ Naive adapter 对 Full KV 和 indexer 使用存储对象、物理页、allocatio
 5. 所有复制完成后返回相同 metadata 和 buffer 边界。模型执行线程校验并导入状态，随后计算未命中的后缀。
 6. 取消或丢弃 future 不会提前释放 DMA 中的源、目标或额度。后台复制排空后释放；缓存停止时排空已接收任务。
 
-CUDA worker 使用每设备私有 non-blocking stream，将既有 pinned staging 预算分为
+CUDA worker 使用每设备私有 non-blocking stream。Linux 上按驻留锁页额度注册整块主存，
+锁页区域直接与 GPU 传输，源和目标在各自底层分配内都连续时合并 DMA。
+普通主存路径按需分配 pinned staging，将预算分为
 两个轮换窗口，以事件保护窗口复用。连续物理区域的 CPU 复制和 DMA 分别合并，
 逻辑 buffer 边界保持不变。多设备任务复用 FastKV 的有界线程池，每 worker、每设备
 至多一条持久复制线程，使各卡 CPU 搬运与 DMA 独立推进；单设备任务直接在 worker 执行。
@@ -56,7 +58,8 @@ Linux CUDA 构建通过设备 PCI 地址查询 NUMA 节点，主存 arena 与 st
 
 L2 驻留内存按 NUMA 节点使用大块分配、内部切分复用，常规 slab 目标为 64 MiB，
 小缓存按总预算缩小，超大 payload 可单独占用更大的 slab。分配时按空洞大小查找，
-释放时合并相邻空洞；只有最后一个分片 lease 释放后才解除整块映射。
+释放时合并相邻空洞。空闲的普通块立即归还，空闲的锁页块保留用于下次分配，
+预算压力或缓存销毁时归还。外部 lease 持有的块保持有效。
 避免每个小 arena 单独 `mmap/mbind`，防止长期淘汰产生大量 VMA 并触及
 `vm.max_map_count`。不修改系统映射上限，不新增环境变量。
 
@@ -69,9 +72,10 @@ PD 接入在请求准入时取得 L2 lease，并将待恢复字节与未命中�
 
 | 资源 | 约束与释放时机 |
 |---|---|
-| Host 驻留 | `bytes` 约束整块 Host slab（含内部空洞）与核算的元数据；最后一个分片引用释放后归还 slab 额度 |
+| Host 驻留 | `bytes` 约束整块 Host slab（含内部空洞）与核算的元数据，空闲但保留的锁页块继续计费 |
 | 在途复制 | `inflightBytes` 约束备份源与恢复目标；恢复结果被消费者持有期间继续计费 |
 | 每设备恢复 | `restoreDeviceBytes` 可进一步限制目标设备，额度随结果 buffer 最后一个引用释放 |
+| 驻留锁页 | `pinnedBytes` 约束已注册驻留块，按系统页计费，包含在 Host 驻留预算内 |
 | pinned staging | 每 worker、每使用过的 GPU 最多 `stagingBytes`，默认 8 MiB，与 Host 容量独立 |
 | 工作队列 | `queueDepth` 包含等待和执行中的任务，恢复优先于可选备份 |
 

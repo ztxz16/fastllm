@@ -794,7 +794,10 @@ void PDRuntime::RunPrefill(basellm &model) {
             std::cout << "[FastKV L2 cache] entries=" << stats.entries << " bytes=" << stats.bytes
                       << " queued=" << stats.queued << " skipped=" << stats.skipped << " failures=" << stats.failures
                       << " d2h_bytes=" << stats.copiedToHost << " h2d_bytes=" << stats.restoredBytes
-                      << " reused_bytes=" << stats.reusedBytes << std::endl;
+                      << " reused_bytes=" << stats.reusedBytes
+                      << " pinned_bytes=" << stats.pinnedResidentBytes
+                      << " direct_d2h_bytes=" << stats.directToHost << " direct_h2d_bytes=" << stats.directToDevice
+                      << " d2h_copy_us=" << stats.publishCopyMicroseconds << " h2d_copy_us=" << stats.restoreMicroseconds << std::endl;
         }
         if (request->pack) model.ReleasePDExportSources(*request->context);
         else retire(request);
@@ -1427,6 +1430,8 @@ void basellm::ConfigurePD(const json11::Json &config) {
         fastkv::HostCache::Options host;
         host.SetBudgets(cacheLimit("cache_bytes", 0), cacheLimit("cache_kv_bytes", -1),
                         cacheLimit("cache_swa_bytes", -1));
+        host.pinnedBytes = cacheLimit("cache_pinned_bytes", std::min(host.pinnedBytes, host.bytes));
+        Check(host.pinnedBytes <= host.bytes, "pinned cache budget exceeds total L2 capacity");
         Check(host.bytes <= (1ULL << 40), "total prefix cache budget exceeds 1 TiB");
         if (host.bytes) {
             host.inflightBytes = options.maxInflightBytes / 2;
