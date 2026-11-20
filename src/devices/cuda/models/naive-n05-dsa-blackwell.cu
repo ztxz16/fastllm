@@ -4,6 +4,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils/utils.h"
 #include "devices/cuda/naive-n05-kv.cuh"
+#include "naive-n05-decode-blackwell.cuh"
 #include "attention/blackwell/collective/fmha_fusion.hpp"
 
 // Indexer scores are consumed as a set by fused attention. Select the exact
@@ -484,4 +485,8 @@ bool FastllmCudaTryBlackwellScoreAttention(const FastllmNaivePrefillAttentionIte
         const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim,
         const fastllm::Data &scratch, const fastllm::Data &scores) {
     return BlackwellAttention(item, sink, heads, kvHeads, dim, valueDim, scratch, &scores);
+}
+
+namespace blackwell_decode {
+DecodeKernel PairedDecodeKernel() { return &Decode<false, 2>; }
 }

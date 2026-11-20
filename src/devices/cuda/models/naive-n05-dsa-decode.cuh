@@ -1,14 +1,11 @@
 #pragma once
 #include "devices/cuda/naive-n05-kv.cuh"
-#include "devices/cuda/naive-n05-dsa.h"
+#include "naive-n05-attention-batch.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 namespace naive_dsa_decode {
 using BF16 = __nv_bfloat16;
-__device__ __forceinline__ int Length(const FastllmNaiveDSARow &r) {
-    return max(0, min(r.capacity, r.liveKeys ? *r.liveKeys : r.length));
-}
 // A whole CTA owns this output slice. Test before page translation, index
 // reads or barriers: padded rows have no KV allocation or valid tensor map.
 __device__ __forceinline__ bool ZeroInactive(const FastllmNaiveDSARow &r, BF16 *out, int count) {

@@ -4,23 +4,13 @@
 // caches and a GQA group divisible by eight. Unsupported shapes retain the
 // existing attention kernels.
 // No global score or partial-output workspace is required.
-#include "devices/cuda/naive-n05-dsa.h"
+#include "naive-n05-attention-batch.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 namespace naive_attention_bulk {
 using BF = __nv_bfloat16;
-#if CUDART_VERSION >= 12010
-constexpr int BatchLimit = 256;
-#else
-constexpr int BatchLimit = (4096 - 128) / sizeof(FastllmNaiveDSARow);
-#endif
-struct Batch {
-    FastllmNaiveDSARow rows[BatchLimit];
-};
-static_assert(sizeof(Batch) + 128 <= (CUDART_VERSION >= 12010 ? 32764 : 4096),
-              "Attention arguments exceed CUDA parameter space");
 __device__ inline FastllmNaiveDSARow BatchRow(const Batch &batch, int i) { return batch.rows[i]; }
 #if CUDART_VERSION >= 12010
 // Verification queries may share KV bindings while using independent lengths

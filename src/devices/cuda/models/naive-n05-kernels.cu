@@ -6777,7 +6777,18 @@ bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::
     const int total = static_cast<int>(rows.size());
     const bool split = total < 32;
     auto kernel = split ? bw::Decode<true> : bw::Decode<false>;
-    if (!BulkKernelSupported(kernel, bw::SMEM_BYTES, 100)) return false;
+    int groupsPerBlock = 1, sharedBytes = bw::Layout<1>::Bytes;
+#ifdef FASTLLM_ENABLE_BLACKWELL_DSA
+    if (total >= 64 && kvHeads % 2 == 0) {
+        auto paired = bw::PairedDecodeKernel();
+        if (BulkKernelSupported(paired, bw::Layout<2>::Bytes, 100)) {
+            kernel = paired;
+            groupsPerBlock = 2;
+            sharedBytes = bw::Layout<2>::Bytes;
+        }
+    }
+#endif
+    if (groupsPerBlock == 1 && !BulkKernelSupported(kernel, sharedBytes, 100)) return false;
     Output(output, BFLOAT16, {1, total, heads * 128});
     const int groups = total * kvHeads;
     const int splits = split ? (groups <= 16 ? 16 : groups <= 32 ? 8 : 4) : 1;
@@ -6794,7 +6805,7 @@ bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::
         naive_attention_bulk::Batch batch{};
         std::copy_n(rows.begin() + first, count, batch.rows);
         auto *out = static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128;
-        kernel<<<dim3(count, kvHeads, splits), (bw::NCW + bw::NP) * 32, bw::SMEM_BYTES>>>(
+        kernel<<<dim3(count, kvHeads / groupsPerBlock, splits), (bw::NCW * groupsPerBlock + bw::NP) * 32, sharedBytes>>>(
             static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, bias,
             out, heads, parts, stats);
         // All split rows fit a single descriptor batch.
