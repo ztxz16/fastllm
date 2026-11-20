@@ -35,6 +35,24 @@ class ConfigurationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'max_inflight_bytes'):
                     load_config(path)
 
+    def test_prefill_rank_limits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = configuration(directory)
+            path = Path(directory) / 'config.json'
+            group = config['prefill'][0]
+            group.update(max_requests_per_rank=16, max_new_tokens_per_rank=32768)
+            path.write_text(json.dumps(config))
+            loaded = load_config(path)
+            prefill = json.loads(loaded['prefill'][0]['command'][-1])
+            decode = json.loads(loaded['decode'][0]['command'][-1])
+            for key in ('max_requests_per_rank', 'max_new_tokens_per_rank'):
+                self.assertEqual(prefill[key], group[key])
+                self.assertNotIn(key, decode)
+                for invalid in (None, True, 0, -1, 1 << 31, 1.5):
+                    path.write_text(json.dumps(dict(config, prefill=[dict(group, **{key: invalid})])))
+                    with self.assertRaisesRegex(ValueError, key):
+                        load_config(path)
+
     def test_transfer_queues_cover_dependent_decode_groups(self):
         with tempfile.TemporaryDirectory() as directory:
             config = configuration(directory)

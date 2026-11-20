@@ -853,21 +853,27 @@ static void TestPrefillBatch() {
     std::cout << "PASS PD real prefill batching, ragged chunks, prefix reuse, token credits and shutdown\n";
 }
 
-static void TestPrefillDPBatch() {
+static void TestPrefillDPBatch(int globalRequests, int perRankRequests, int perRankTokens, bool balance,
+                               bool useSessions = false) {
     class GroupedModel final : public BatchStateModel {
-        int created = 0;
+        std::map<int, int> promptOwners;
         std::map<const Data *, int> owners;
       public:
-        int balancedBatches = 0;
-        int GetPrefillBatchGroups() const override { return 2; }
-        int GetPrefillBatchGroup(const ResponseContext *context) const override {
-            return context->intParams.at("owner");
+        int balancedBatches = 0, firstOwnerTokens = 0;
+        int maxGlobal, maxSequences, maxTokens;
+        int PDGroupCount() const override { return 2; }
+        int PDRequestGroup(const ResponseContext &context) const override {
+            return context.intParams.at("owner");
         }
         void OnResponseContextCreated(ResponseContext *context) override {
             BatchStateModel::OnResponseContextCreated(context);
-            // Deliberately skew arrival order: 0,0,1,1. Each request retains
-            // that resident owner through every subsequent prefill chunk.
-            const int owner = AllocatePrefillGroup((created++ / 2) % 2);
+            int owner = context->pdPrefillGroup;
+            if (context->requestMetadata.sessionKey.empty()) {
+                // Anonymous arrivals start on owners 0,0,1,1, including on retry.
+                const int prompt = context->allTokens.front();
+                owner = promptOwners.emplace(prompt, (promptOwners.size() / 2) % 2).first->second;
+            }
+            Check(owner == 0 || owner == 1, "missing PD owner");
             context->intParams["owner"] = owner;
             owners[&context->pastKeyValues[0].first] = owner;
         }
@@ -879,10 +885,19 @@ static void TestPrefillDPBatch() {
                 const std::vector<Data *> &positions, const std::vector<int> &lengths,
                 std::vector<std::pair<Data *, Data *>> &kv, const std::vector<GenerationConfig> &configs,
                 const LastTokensManager &last, std::vector<std::vector<float> *> *logits) override {
-            int tokens[2] = {};
-            for (int i = 0; i < batch; ++i) tokens[owners.at(kv[i].first)] += lengths[i];
-            Check(tokens[0] <= 2 && tokens[1] <= 2, "PD ignored per-DP token budget");
-            if (tokens[0] == 2 && tokens[1] == 2) ++balancedBatches;
+            int sequences[2] = {}, tokens[2] = {};
+            for (int i = 0; i < batch; ++i) {
+                const int owner = owners.at(kv[i].first);
+                ++sequences[owner]; tokens[owner] += lengths[i];
+            }
+            Check(batch <= maxGlobal && tokens[0] + tokens[1] <= 4, "PD ignored global ceiling");
+            for (int g = 0; g < 2; ++g)
+                Check(sequences[g] <= maxSequences && tokens[g] <= maxTokens, "PD ignored rank ceiling");
+            if (batches == 0) {
+                Check(forwards == 0 && tokens[0] && tokens[1], "global cutoff hid the other rank on first forward");
+                firstOwnerTokens = tokens[0];
+            }
+            if (tokens[0] && tokens[1]) ++balancedBatches;
             return BatchStateModel::ForwardBatch(batch, ids, masks, positions, lengths, kv, configs, last, logits);
         }
     } model;
@@ -890,11 +905,17 @@ static void TestPrefillDPBatch() {
     port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
     const auto endpoint = port.Address(); port.Stop();
     SetMaxTokens(64);
-    model.SetChunkedPrefillSize(2);
-    Check(model.SetPrefillBatching(4, 5000, 4, 4) && model.SetPrefillScheduling(true, 0, false, 0, 0),
-          "configure DP prefill policy");
-    model.ConfigurePD(json11::Json::object{{"role", "prefill"}, {"model_id", "dp-batch"},
-        {"transport", "tcp"}, {"listen", endpoint}, {"chunk_tokens", 2}, {"device_cache_bytes", 0}});
+    model.SetChunkedPrefillSize(balance ? 2 : 8); // An oversized model chunk cannot raise a global cap.
+    model.maxGlobal = globalRequests;
+    model.maxSequences = perRankRequests ? perRankRequests : globalRequests;
+    model.maxTokens = perRankTokens ? perRankTokens : 2;
+    Check(model.SetPrefillBatching(4, 5000, globalRequests, globalRequests) &&
+          model.SetPrefillScheduling(balance, 0, false, 0, 0), "configure DP prefill policy");
+    json11::Json::object pd{{"role", "prefill"}, {"model_id", "dp-batch"}, {"transport", "tcp"},
+        {"listen", endpoint}, {"chunk_tokens", 2}, {"device_cache_bytes", 0}};
+    if (perRankRequests) pd["max_requests_per_rank"] = perRankRequests;
+    if (perRankTokens) pd["max_new_tokens_per_rank"] = perRankTokens;
+    model.ConfigurePD(pd);
     fastkv::Options options; options.transport = fastkv::Transport::Tcp; options.workers = 8;
     fastkv::Service client(options);
     for (bool fail : {false, true}) {
@@ -906,8 +927,9 @@ static void TestPrefillDPBatch() {
         std::unique_lock<std::mutex> forwardGuard(model.forwardLocker);
         for (int i = 0; i < 4; ++i) calls.push_back(std::async(std::launch::async, [&, i] {
             fastkv::Writer writer;
-            writer.U32(1); writer.String("dp-batch:gpu-state-v2:test-recurrent-state-v1");
+            writer.U32(useSessions ? 3 : 1); writer.String("dp-batch:gpu-state-v2:test-recurrent-state-v1");
             writer.Ints(std::vector<int>(3 + i, 11 + i));
+            if (useSessions) writer.String("queued-" + std::to_string(11 + i));
             return client.Call(endpoint, {std::move(writer.bytes), {}});
         }));
         fastkv::Writer query;
@@ -937,6 +959,8 @@ static void TestPrefillDPBatch() {
         Check(model.live == 0 && model.liveTokens == 0, "DP selection leaked request/credit");
     }
     Check(model.balancedBatches >= 2, "PD did not select across nonadjacent owners");
+    if (!balance && perRankTokens > 2)
+        Check(model.firstOwnerTokens == 3, "explicit rank token budget was clamped to the global average");
     model.StopPD();
     std::cout << "PASS PD balanced owner selection, ragged chunks, exact state and failure cleanup\n";
 }
@@ -1482,7 +1506,11 @@ int main(int argc, char **argv) {
         TestExportBackpressure(false);
         TestExportBackpressure(true);
         TestPrefillBatch();
-        TestPrefillDPBatch();
+        TestPrefillDPBatch(4, 0, 0, true);   // Legacy implicit token split.
+        TestPrefillDPBatch(4, 1, 0, true, true); // Session queues with only the sequence cap overridden.
+        TestPrefillDPBatch(4, 0, 1, true);   // Override only the token cap.
+        TestPrefillDPBatch(2, 1, 1, true);   // A hot owner precedes candidates past the global cutoff.
+        TestPrefillDPBatch(3, 2, 3, false);  // Rank cap above the average, independent of balancing.
         TestPreparedPrefill();
         TestQueuedTransfers();
         TestLoadAwareRouting();

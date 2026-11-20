@@ -4,6 +4,7 @@
 #include "models/basellm.h"
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <deque>
 #include <iostream>
@@ -365,6 +366,8 @@ struct PDRuntime {
         int exportGroup = 0;
         std::atomic<bool> exportFinished{false};
         std::chrono::steady_clock::time_point exportQueued;
+        int affinity = -1;
+        uint64_t readyOrder = 0;
         size_t reservation = 0;
         std::shared_ptr<Workload> work;
         size_t remaining = 0, restoreBytes = 0;
@@ -399,7 +402,7 @@ struct PDRuntime {
     std::vector<std::string> peers;
     std::atomic<bool> stopping{false};
     int chunk = 2048;
-    size_t tokenCapacity = 0, totalTokenCapacity = 0;
+    size_t tokenCapacity = 0;
     std::unique_ptr<fastkv::Budget> slots;
     std::vector<std::unique_ptr<fastkv::Budget>> groupTokens;
     std::shared_ptr<void> ReserveGroup(basellm &model, ResponseContext &context, size_t required) {
@@ -420,6 +423,7 @@ struct PDRuntime {
     std::deque<std::shared_ptr<PrefillRequest>> waiting;
     std::thread prefillThread;
     int batchRequests = 1, batchTokens = 1, targetRequests = 1, waitMs = 0;
+    int rankRequests = 1, rankTokens = 1;
 
     ~PDRuntime() {
         StopPrefill();
@@ -608,14 +612,43 @@ struct PDRuntime {
 
 void PDRuntime::RunPrefill(basellm &model) {
     using Request = std::shared_ptr<PrefillRequest>;
-    // Raw RPCs own no cache. Prepared contexts own the same immutable page
-    // references and private companion state as active contexts, but have not
-    // entered forward yet. Both use one token budget and one retirement path.
-    std::deque<Request> active, prepared, exporting;
-    size_t reserved = 0, preparedTokens = 0;
-    const size_t prepareBudget = totalTokenCapacity / 2;
+    struct RankQueue {
+        std::deque<Request> active, prepared;
+        size_t preparedTokens = 0;
+    };
+    const int groups = model.PDGroupCount();
+    std::vector<RankQueue> ranks(groups);
+    // The extra queue holds anonymous RPCs until the model resolves their prefix owner.
+    std::vector<std::deque<Request>> pending(groups + 1);
+    std::deque<Request> exporting;
+    size_t liveContexts = 0;
+    uint64_t readyOrder = 0;
+    size_t nextPending = 0;
+    int firstRank = 0;
+    const size_t prepareBudget = tokenCapacity / 2;
     const size_t page = residentPrefix ? std::max(1, GetPageLen()) : 1;
     const size_t contextLimit = std::max(batchRequests, model.maxBatch > 0 ? model.maxBatch : 1);
+    const size_t rankContextLimit = std::max(size_t(rankRequests), (contextLimit + groups - 1) / groups);
+    auto enqueueActive = [&](RankQueue &rank, const Request &request) {
+        rank.active.push_back(request);
+        request->readyOrder = ++readyOrder;
+    };
+    auto canPrepare = [&](const RankQueue &rank, size_t count) {
+        const size_t candidates = rank.active.size() + rank.prepared.size();
+        return candidates < size_t(rankRequests) || (residentPrefix && candidates < rankContextLimit &&
+            rank.preparedTokens <= prepareBudget && count <= prepareBudget - rank.preparedTokens);
+    };
+    auto canAdmitFrom = [&](size_t lane, int affinity, size_t count) {
+        auto fits = [&](size_t group) {
+            return canPrepare(ranks[group], count) && count <= tokenCapacity - groupTokens[group]->Used();
+        };
+        if (affinity >= 0) return fits(affinity);
+        // A deferred anonymous request can still move if its owner's KV budget fills.
+        if (lane < ranks.size() && !canPrepare(ranks[lane], count)) return false;
+        for (size_t group = 0; group < ranks.size(); ++group)
+            if (fits(group)) return true;
+        return false;
+    };
     auto startHostRestore = [&](const Request &request) {
         auto placement = PDReceivePlacement(request->hostHit.Metadata(), request->hostHit.Payloads(), model.PDRequestDevices(*request->context));
         if (placement.empty()) placement.assign(request->hostHit.Payloads(), -1);
@@ -624,7 +657,7 @@ void PDRuntime::RunPrefill(basellm &model) {
     };
     auto retire = [&](const Request &request) {
         request->SetRemaining(0); request->SetRestoreBytes(0);
-        reserved -= request->reservation;
+        if (request->reservation) --liveContexts;
         request->reservation = 0;
         auto context = std::move(request->context);
         if (context) {
@@ -633,6 +666,12 @@ void PDRuntime::RunPrefill(basellm &model) {
         }
         context.reset();
         request->groupAdmission.reset();
+    };
+    auto deferAdmission = [&](const Request &request, size_t lane) {
+        retire(request);
+        request->SetRemaining(request->input.size() - request->hostHit.Tokens());
+        request->SetRestoreBytes(request->hostHit.Bytes());
+        pending[lane].push_back(request);
     };
     // Only the model lane retires contexts. The export lane owns no model
     // scheduler state and only sees completed, pinned requests.
@@ -765,7 +804,8 @@ void PDRuntime::RunPrefill(basellm &model) {
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(prefillMutex);
-                if (active.empty() && prepared.empty() && exporting.empty()) {
+                if (!liveContexts && std::all_of(pending.begin(), pending.end(),
+                        [](const auto &queue) { return queue.empty(); })) {
                     prefillCV.wait(lock, [&] { return stopping || !waiting.empty(); });
                     if (!stopping && waitMs > 0) {
                         const auto deadline = waiting.front()->queued + std::chrono::milliseconds(waitMs);
@@ -778,17 +818,24 @@ void PDRuntime::RunPrefill(basellm &model) {
                     }
                 }
                 if (stopping) break;
-                for (auto it = waiting.begin(); it != waiting.end();) {
-                    if ((*it)->cancellation->Cancelled()) {
-                        (*it)->result.set_exception(cancelled);
-                        it = waiting.erase(it);
-                    } else ++it;
-                }
             }
             // The model lane owns context mutation and retirement.
             // RPC handlers return futures immediately; network workers never
             // wait for the model or hold forwardLocker.
             std::unique_lock<std::mutex> lock(model.forwardLocker);
+            {
+                std::lock_guard<std::mutex> queueLock(prefillMutex);
+                while (!waiting.empty()) {
+                    const auto &request = waiting.front();
+                    if (request->cancellation->Cancelled()) request->result.set_exception(cancelled);
+                    else {
+                        request->affinity = sessions->LocalGroup(request->metadata.sessionKey, groups, true);
+                        const int lane = request->affinity < 0 ? groups : request->affinity;
+                        pending[lane].push_back(request);
+                    }
+                    waiting.pop_front();
+                }
+            }
             // Completed contexts retain their pages and admission while waiting
             // for a whole-message export reservation. Other requests can still
             // forward; no owner worker waits on a transport buffer lease.
@@ -813,86 +860,90 @@ void PDRuntime::RunPrefill(basellm &model) {
             }
             // Cancellation touches model state only on its execution lane,
             // between completed forward calls. The service drains the future.
-            for (auto it = active.begin(); it != active.end();) {
-                if ((*it)->cancellation->Cancelled()) {
-                    retire(*it);
-                    (*it)->result.set_exception(cancelled);
-                    it = active.erase(it);
-                } else ++it;
-            }
-            for (auto it = prepared.begin(); it != prepared.end();) {
-                if ((*it)->cancellation->Cancelled()) {
-                    preparedTokens -= (*it)->reservation;
-                    retire(*it);
-                    (*it)->result.set_exception(cancelled);
-                    it = prepared.erase(it);
-                } else ++it;
-            }
-            for (auto it = prepared.begin(); it != prepared.end();) {
-                const auto request = *it;
-                try {
-                    if (request->restoring) {
-                        if (!request->hostRestore.valid()) {
-                            if (!startHostRestore(request)) { ++it; continue; }
-                        }
-                        if (request->hostRestore.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
-                        auto state = request->hostRestore.get();
-                        auto &context = *request->context;
-                        context.allTokens.resize(request->hostHit.Tokens()); context.allTokens.push_back(0);
-                        model.ImportPDState(context, state);
-                        context.preTokens = request->hostHit.Tokens(); context.allTokens = request->input;
-                        context.pdCachedInputTokens = context.preTokens;
-                        request->restoring = false; request->SetRestoreBytes(0);
-                        request->SetRemaining(request->input.size() - context.preTokens);
-                        if (model.verbose) {
-                            const auto stats = hostCache->Stats();
-                            std::cout << "[FastKV PD] prefix_hit=" << context.preTokens << " prompt=" << request->input.size()
-                                      << " cache_tier=l2 restore_ms=" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - request->restoreBegin).count()
-                                      << " bytes=" << request->hostHit.Bytes() << " cache_bytes=" << stats.bytes
-                                      << " entries=" << stats.entries << " d2h_bytes=" << stats.copiedToHost
-                                      << " reused_bytes=" << stats.reusedBytes << " group=" << model.PDRequestGroup(context) << std::endl;
-                        }
-                        if (size_t(context.preTokens) == request->input.size()) {
-                            const auto reservation = request->reservation;
-                            recordPrefix(request);
-                            complete(request, &state);
-                            preparedTokens -= reservation;
-                            it = prepared.erase(it);
-                            continue;
-                        }
-                    }
-                    if (int(active.size()) < batchRequests) {
-                        preparedTokens -= request->reservation;
-                        active.push_back(request); it = prepared.erase(it);
+            for (auto &rank : ranks) {
+                auto &active = rank.active, &prepared = rank.prepared;
+                auto &preparedTokens = rank.preparedTokens;
+                for (auto it = active.begin(); it != active.end();) {
+                    if ((*it)->cancellation->Cancelled()) {
+                        retire(*it);
+                        (*it)->result.set_exception(cancelled);
+                        it = active.erase(it);
                     } else ++it;
-                } catch (...) {
-                    const auto error = std::current_exception();
-                    // Never import partially restored state or silently continue
-                    // from a damaged checkpoint. Normal request cleanup owns it.
-                    preparedTokens -= request->reservation;
-                    retire(request); request->result.set_exception(error); it = prepared.erase(it);
+                }
+                for (auto it = prepared.begin(); it != prepared.end();) {
+                    const auto request = *it;
+                    try {
+                        if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
+                        if (request->restoring) {
+                            if (!request->hostRestore.valid()) {
+                                if (!startHostRestore(request)) { ++it; continue; }
+                            }
+                            if (request->hostRestore.wait_for(std::chrono::seconds(0)) != std::future_status::ready) { ++it; continue; }
+                            auto state = request->hostRestore.get();
+                            auto &context = *request->context;
+                            context.allTokens.resize(request->hostHit.Tokens()); context.allTokens.push_back(0);
+                            model.ImportPDState(context, state);
+                            context.preTokens = request->hostHit.Tokens(); context.allTokens = request->input;
+                            context.pdCachedInputTokens = context.preTokens;
+                            request->restoring = false; request->SetRestoreBytes(0);
+                            request->SetRemaining(request->input.size() - context.preTokens);
+                            if (model.verbose) {
+                                const auto stats = hostCache->Stats();
+                                std::cout << "[FastKV PD] prefix_hit=" << context.preTokens << " prompt=" << request->input.size()
+                                          << " cache_tier=l2 restore_ms=" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - request->restoreBegin).count()
+                                          << " bytes=" << request->hostHit.Bytes() << " cache_bytes=" << stats.bytes
+                                          << " entries=" << stats.entries << " d2h_bytes=" << stats.copiedToHost
+                                          << " reused_bytes=" << stats.reusedBytes << " group=" << model.PDRequestGroup(context) << std::endl;
+                            }
+                            if (size_t(context.preTokens) == request->input.size()) {
+                                const auto reservation = request->reservation;
+                                recordPrefix(request);
+                                complete(request, &state);
+                                preparedTokens -= reservation;
+                                it = prepared.erase(it);
+                                continue;
+                            }
+                        }
+                        if (int(active.size()) < rankRequests) {
+                            preparedTokens -= request->reservation;
+                            enqueueActive(rank, request); it = prepared.erase(it);
+                        } else ++it;
+                    } catch (...) {
+                        const auto error = std::current_exception();
+                        preparedTokens -= request->reservation;
+                        retire(request); request->result.set_exception(error); it = prepared.erase(it);
+                    }
                 }
             }
-            size_t scanned = 0;
-            { std::lock_guard<std::mutex> queueLock(prefillMutex); scanned = waiting.size(); }
-            for (; scanned > 0 && active.size() + prepared.size() + exporting.size() < contextLimit; --scanned) {
-                const bool lookahead = int(active.size()) >= batchRequests;
-                if (lookahead && !residentPrefix) break;
-                Request request;
-                {
-                    std::lock_guard<std::mutex> lock(prefillMutex);
-                    if (stopping || waiting.empty()) break;
-                    const size_t count = std::min(tokenCapacity,
-                        ((waiting.front()->input.size() + page - 1) / page) * page);
-                    // Reserve the FULL final prompt, not merely its cached
-                    // portion. This leaves room to finish every admitted
-                    // request and bounds queued retention independently.
-                    if (count > totalTokenCapacity - reserved ||
-                        (lookahead && (preparedTokens >= prepareBudget || count > prepareBudget - preparedTokens))) break;
-                    request = std::move(waiting.front()); waiting.pop_front();
-                    reserved += count;
-                    request->reservation = count;
+            std::vector<size_t> toScan;
+            size_t outstanding = 0;
+            for (auto &queue : pending) {
+                for (auto it = queue.begin(); it != queue.end();) {
+                    if ((*it)->cancellation->Cancelled()) {
+                        (*it)->result.set_exception(cancelled);
+                        it = queue.erase(it);
+                    } else ++it;
                 }
+                toScan.push_back(queue.size());
+                outstanding += queue.size();
+            }
+            // Visit known session owners in turn before allocating a context.
+            // A full rank or an oversized head cannot block another rank.
+            while (outstanding && liveContexts < contextLimit && !stopping) {
+                const size_t lane = nextPending;
+                nextPending = (nextPending + 1) % pending.size();
+                if (!toScan[lane]) continue;
+                --toScan[lane]; --outstanding;
+                auto &queue = pending[lane];
+                Request request = std::move(queue.front());
+                queue.pop_front();
+                const size_t count = std::min(tokenCapacity, ((request->input.size() + page - 1) / page) * page);
+                if (!canAdmitFrom(lane, request->affinity, count)) {
+                    queue.push_back(request);
+                    continue;
+                }
+                ++liveContexts;
+                request->reservation = count;
                 try {
                     if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
                     const auto restoreBegin = std::chrono::steady_clock::now();
@@ -907,7 +958,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     auto &context = *request->context;
                     context.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
                     context.requestMetadata = request->metadata;
-                    context.pdPrefillGroup = sessions->LocalGroup(request->metadata.sessionKey, model.PDGroupCount(), true);
+                    context.pdPrefillGroup = request->affinity;
                     context.currentTokens = context.allTokens = request->input;
                     context.inputTokens = request->input.size();
                     context.generationConfig.top_k = 1;
@@ -916,10 +967,13 @@ void PDRuntime::RunPrefill(basellm &model) {
                     model.OnResponseContextCreated(&context);
                     try { request->groupAdmission = ReserveGroup(model, context, request->reservation); }
                     catch (const fastkv::CapacityBusy &) {
-                        retire(request);
-                        request->SetRemaining(request->input.size());
-                        std::lock_guard<std::mutex> queueLock(prefillMutex);
-                        waiting.push_back(request);
+                        deferAdmission(request, lane);
+                        continue;
+                    }
+                    const int owner = model.PDRequestGroup(context);
+                    auto &rank = ranks.at(owner);
+                    if (!canPrepare(rank, count)) {
+                        deferAdmission(request, owner);
                         continue;
                     }
                     if (hostCache) {
@@ -940,7 +994,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                         // Start the private copy before the next forward. A busy
                         // cache retries from prepared; import remains on this lane.
                         startHostRestore(request);
-                        prepared.push_back(request); preparedTokens += request->reservation;
+                        rank.prepared.push_back(request); rank.preparedTokens += request->reservation;
                         continue;
                     }
                     request->SetRestoreBytes(0);
@@ -969,47 +1023,49 @@ void PDRuntime::RunPrefill(basellm &model) {
                                   << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - restoreBegin).count()
                                   << std::endl;
                     }
-                    if (lookahead) {
-                        prepared.push_back(request);
-                        preparedTokens += request->reservation;
-                    } else active.push_back(request);
+                    if (rank.active.size() < size_t(rankRequests)) enqueueActive(rank, request);
+                    else {
+                        rank.prepared.push_back(request);
+                        rank.preparedTokens += request->reservation;
+                    }
                 } catch (...) {
                     auto error = std::current_exception();
                     retire(request);
                     request->result.set_exception(error);
                 }
             }
-            if (active.empty()) {
+            std::vector<Request> selected;
+            std::vector<int> lengths, sequences(groups), tokens(groups);
+            int budget = batchTokens;
+            while (budget > 0 && selected.size() < size_t(batchRequests)) {
+                int owner = -1;
+                for (int offset = 0; offset < groups; ++offset) {
+                    const int g = (firstRank + offset) % groups;
+                    if (size_t(sequences[g]) >= ranks[g].active.size() || tokens[g] >= rankTokens) continue;
+                    if (owner < 0) owner = g;
+                    else if (model.prefillScheduling.balanceDP) {
+                        if (tokens[g] < tokens[owner]) owner = g;
+                    } else if (ranks[g].active[sequences[g]]->readyOrder <
+                               ranks[owner].active[sequences[owner]]->readyOrder) owner = g;
+                }
+                if (owner < 0) break;
+                firstRank = (owner + 1) % groups;
+                const auto &request = ranks[owner].active[sequences[owner]++];
+                const int count = std::min({chunk, budget, rankTokens - tokens[owner],
+                    int(request->input.size()) - request->context->preTokens});
+                Check(count > 0, "empty prefill candidate");
+                selected.push_back(request);
+                lengths.push_back(count);
+                tokens[owner] += count;
+                budget -= count;
+            }
+            const int batch = selected.size();
+            if (!batch) {
                 lock.unlock();
                 std::unique_lock<std::mutex> queueLock(prefillMutex);
                 prefillCV.wait_for(queueLock, std::chrono::milliseconds(1));
                 continue;
             }
-
-            std::vector<Request> selected;
-            std::vector<int> lengths;
-            // Placement is fixed by the model's cache/session affinity. Plan
-            // across those owners, just like the ordinary prefill scheduler;
-            // FIFO RPC arrival order need not be balanced across DP groups.
-            const bool balanceDP = model.prefillScheduling.balanceDP;
-            const int groupBudget = std::max(1, batchTokens / std::max(1, model.GetPrefillBatchGroups()));
-            PrefillBatchQueue queue;
-            std::map<int, int> groupTokens;
-            for (int i = 0; i < (int)active.size(); ++i)
-                queue.Push(i, balanceDP ? model.GetPrefillBatchGroup(active[i]->context.get()) : 0);
-            int budget = batchTokens;
-            for (int index; budget && (index = queue.Pop()) >= 0;) {
-                const auto &request = active[index];
-                const int group = balanceDP ? model.GetPrefillBatchGroup(request->context.get()) : 0;
-                const int available = balanceDP ? groupBudget - groupTokens[group] : budget;
-                const int count = std::min({chunk, budget, available,
-                    int(request->input.size()) - request->context->preTokens});
-                if (count <= 0) continue;
-                selected.push_back(request); lengths.push_back(count); budget -= count;
-                groupTokens[group] += count;
-                queue.AddTokens(count);
-            }
-            const int batch = selected.size();
             std::vector<Data> ids(batch), masks(batch), positions(batch);
             std::vector<Data *> maskRefs, positionRefs;
             std::vector<std::pair<Data *, Data *>> past;
@@ -1065,16 +1121,24 @@ void PDRuntime::RunPrefill(basellm &model) {
             if (model.verbose) {
                 size_t queued;
                 { std::lock_guard<std::mutex> lock(prefillMutex); queued = waiting.size(); }
+                size_t activeCount = 0, preparedCount = 0, preparedTokens = 0, reserved = 0;
+                for (const auto &credits : groupTokens) reserved += credits->Used();
+                for (const auto &rank : ranks) {
+                    activeCount += rank.active.size(); preparedCount += rank.prepared.size();
+                    preparedTokens += rank.preparedTokens;
+                }
+                for (const auto &queue : pending) queued += queue.size();
                 std::cout << "[FastKV PD] prefill_batch=" << batch << " tokens=" << batchTokens - budget
                           << " forward_ms=" << seconds * 1000
-                          << " active=" << active.size() << " prepared=" << prepared.size()
+                          << " active=" << activeCount << " prepared=" << preparedCount
                           << " exporting=" << exporting.size()
                           << " queued=" << queued << " reserved_tokens=" << reserved
                           << " prepared_tokens=" << preparedTokens << std::endl;
             }
             for (int i = 0; i < batch; ++i) {
                 auto request = selected[i];
-                active.erase(std::find(active.begin(), active.end(), request));
+                auto &rank = ranks[model.PDRequestGroup(*request->context)];
+                rank.active.pop_front();
                 request->context->preTokens += lengths[i];
                 request->SetRemaining(request->input.size() - request->context->preTokens);
                 if (request->cancellation->Cancelled()) {
@@ -1083,7 +1147,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     continue;
                 }
                 if (size_t(request->context->preTokens) != request->input.size()) {
-                    active.push_back(request); // round-robin chunks, no long-request monopolization
+                    enqueueActive(rank, request); // round-robin chunks, no long-request monopolization
                     continue;
                 }
                 try {
@@ -1111,14 +1175,14 @@ void PDRuntime::RunPrefill(basellm &model) {
             waiting.clear();
         }
         std::lock_guard<std::mutex> lock(model.forwardLocker);
-        for (const auto &request : active) {
-            retire(request);
-            request->result.set_exception(error);
-        }
-        for (const auto &request : prepared) {
-            retire(request);
-            request->result.set_exception(error);
-        }
+        for (const auto &queue : pending)
+            for (const auto &request : queue) request->result.set_exception(error);
+        for (const auto &rank : ranks)
+            for (const auto *queue : {&rank.active, &rank.prepared})
+                for (const auto &request : *queue) {
+                    retire(request);
+                    request->result.set_exception(error);
+                }
         for (const auto &request : exporting) {
             retire(request);
             if (!request->exportFinished) request->result.set_exception(error);
@@ -1184,7 +1248,6 @@ void basellm::ConfigurePD(const json11::Json &config) {
     const int groups = PDGroupCount();
     Check(groups > 0 && runtime->tokenCapacity > 0 &&
           size_t(groups) <= SIZE_MAX / runtime->tokenCapacity, "invalid PD group capacity");
-    runtime->totalTokenCapacity = runtime->tokenCapacity * groups;
     for (int group = 0; group < groups; ++group)
         runtime->groupTokens.emplace_back(new fastkv::Budget(runtime->tokenCapacity, "PD group token budget"));
     fastkv::Options options;
@@ -1325,6 +1388,19 @@ void basellm::ConfigurePD(const json11::Json &config) {
             if (prefillBatchPolicy.maxRequests > 0)
                 runtime->batchRequests = std::min(runtime->batchRequests, prefillBatchPolicy.maxRequests);
             runtime->batchTokens = batching ? std::max(runtime->chunk, GetBatchedPrefillTokenLimit()) : runtime->chunk;
+            if (batching && prefillBatchPolicy.targetTokens > 0)
+                runtime->batchTokens = std::min(runtime->batchTokens, prefillBatchPolicy.targetTokens);
+            auto rankLimit = [&](const char *key, int fallback) {
+                if (!config.object_items().count(key)) return fallback;
+                const auto &value = config[key];
+                const double n = value.number_value();
+                if (!value.is_number() || n < 1 || n > INT_MAX || n != int(n))
+                    throw std::invalid_argument(std::string(key) + " must be a positive 32-bit integer");
+                return int(n);
+            };
+            runtime->rankRequests = rankLimit("max_requests_per_rank", runtime->batchRequests);
+            runtime->rankTokens = rankLimit("max_new_tokens_per_rank", prefillScheduling.balanceDP ?
+                std::max(1, runtime->batchTokens / groups) : runtime->batchTokens);
             runtime->targetRequests = prefillBatchPolicy.targetRequests > 0 ?
                 std::min(runtime->batchRequests, prefillBatchPolicy.targetRequests) : runtime->batchRequests;
             runtime->waitMs = batching ? prefillBatchPolicy.maxWaitMs : 0;
