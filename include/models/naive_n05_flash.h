@@ -130,6 +130,13 @@ namespace fastllm {
                                 const std::string &output) override { return history + input + output; }
 
     protected:
+        // Empty rows select deferred host inputs for mixed sampling paths.
+        struct DraftVerifyInput {
+            std::function<void()> materialize;
+            std::vector<const float *> rows;
+            std::vector<int> strides;
+            std::vector<void *> ready;
+        };
         // Batch-major request descriptors, borrowed only for one forward. KV
         // storage remains owned by each response; weights are shared by all rows.
         struct TargetBatch {
@@ -137,6 +144,7 @@ namespace fastllm {
             const std::vector<GenerationConfig> &configs;
             const std::vector<int> &lengths;
             int layers;
+            const DraftVerifyInput *proposals = nullptr;
             int Size() const { return lengths.size(); }
             bool Decode() const {
                 return std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; });

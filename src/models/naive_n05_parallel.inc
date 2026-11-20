@@ -134,7 +134,10 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     }
     // An intervening prefill, verification or eager fallback may change cache
     // descriptors or shared graph storage. Revalidate on the next serving step.
-    if (!state.servingPadded) state.servingPlan.valid = false;
+    if (!state.servingPadded) {
+        if (batch && batch->proposals) batch->proposals->materialize();
+        state.servingPlan.valid = false;
+    }
     const auto &topology = state.runtime.Layout();
     const int sequences = batch ? batch->Size() : 1;
     const int total = inputIds.dims.at(1);
@@ -473,6 +476,9 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     for (auto &feature : captures) feature.ringVerify = ringVerify;
     if (graphDecode && verifying)
         for (auto &rank : tpDecodeState->ranks) rank->features.ringVerify = ringVerify;
+    if (batch && batch->proposals && state.servingPadded &&
+        (batch->proposals->rows.empty() || !graphDecode || !tpDecodeState->captured))
+        batch->proposals->materialize();
     auto forwardRank = [&](int rank, int device) {
         const int group = topology.AttentionOwner(rank);
         auto &local = state.ranks[rank];

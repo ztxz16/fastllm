@@ -111,6 +111,9 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
             // means the caller already has the exact captured input layout.
             if (batch->Size() == slots && liveTokens == graph->rows)
                 return ForwardAttentionParallel(inputIds, positions, kv, config, capture, &all, batch);
+            const bool deviceIds = !serving.preparing && graph->captured &&
+                batch->proposals && !batch->proposals->rows.empty();
+            if (batch->proposals && !deviceIds) batch->proposals->materialize();
             std::vector<std::pair<Data *, Data *>> pointers = batch->kv;
             std::vector<GenerationConfig> configs = batch->configs;
             std::vector<int> lengths(slots, width);
@@ -118,7 +121,8 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
             int source = 0;
             for (int seq = 0; seq < batch->Size(); ++seq) {
                 const int count = batch->lengths[seq];
-                std::copy_n((const float *)inputIds.cpuData + source, count, ids.begin() + seq * width);
+                if (!deviceIds)
+                    std::copy_n((const float *)inputIds.cpuData + source, count, ids.begin() + seq * width);
                 std::copy_n((const float *)positions.cpuData + source, count, pos.begin() + seq * width);
                 source += count;
             }
@@ -130,7 +134,7 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
                 }
                 configs.push_back(config);
             }
-            TargetBatch padded{pointers, configs, lengths, block_cnt};
+            TargetBatch padded{pointers, configs, lengths, block_cnt, deviceIds ? batch->proposals : nullptr};
             return ForwardAttentionParallel(Data(FLOAT32, {1, graph->rows}, ids),
                 Data(FLOAT32, {1, graph->rows}, pos), kv, config, capture, &all, &padded);
         };

@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-dspark.h"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "baseblock.h"
 #include <algorithm>
 #include <cmath>
@@ -486,6 +487,32 @@ void GraphSamplerCase() {
     FastllmCudaMtpDestroyDraftSampler(state);
     std::puts("sampling Graph: changing logits, fresh RNG, saved q, independent scratch: PASS");
 }
+
+void VerifyProposalLayoutCase() {
+    constexpr int count = 205, width = 4, stride = count + 7;
+    std::vector<float> stepMajor(width * stride);
+    std::iota(stepMajor.begin(), stepMajor.end(), 1.f);
+    Buffer source(stepMajor), result(count * width);
+    std::vector<const float *> rows(count);
+    std::vector<int> strides(count, stride), lengths(count);
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<float> expected(count * width, 0.f);
+        for (int row = 0; row < count; ++row) {
+            const int slot = pass ? count - 1 - row : row;
+            lengths[row] = 1 + (row + pass) % width;
+            rows[row] = source.p + slot;
+            for (int step = 0; step < lengths[row]; ++step)
+                expected[row * width + step] = stepMajor[step * stride + slot];
+        }
+        Require(FastllmCudaMtpGatherVerifyIds(result.p, width, rows.data(), strides.data(),
+                    lengths.data(), count, width * stride + 1), "verification input gather failed");
+        Require(result.Read() == expected, "verification tokens changed across slot/length updates");
+    }
+    lengths.back() = width + 1;
+    Require(!FastllmCudaMtpGatherVerifyIds(result.p, width, rows.data(), strides.data(),
+                lengths.data(), count, width * stride + 1), "out-of-range proposal length accepted");
+}
+
 void LargeVocabularyCase() {
     for (int vocab : {65535, 65536, 65537, 152576, 153001}) {
         const int rows = vocab == 65537 ? 33 : 8;
@@ -536,6 +563,7 @@ int main() {
         DeviceFilterCase();
         MarkovGraphCase();
         FullVocabularyCase();
+        VerifyProposalLayoutCase();
         LargeVocabularyCase();
         GraphSamplerCase();
         ResizableGraphSamplerCase();
