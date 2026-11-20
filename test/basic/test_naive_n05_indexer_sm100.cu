@@ -198,6 +198,67 @@ static void Case(int count, int capacity, int stride, int page, bool fp8 = true,
     topk();
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
     Check(indices0.Get() == indices1.Get(), "threshold ties differ");
+    if (queryGroup == naive_indexer_sm100::VerifyQueries) {
+        // Repeat the fixture's owners in a different order in each block of rows.
+        // Compare full output spans, including empty, padded and partially live tiles.
+        using namespace naive_indexer_sm100;
+        VerifyBatch batch{};
+        Buffer<unsigned> wide(size_t(VerifyLimit) * capacity);
+        Buffer<__nv_bfloat16> input(q.n), packed(size_t(VerifyLimit) * 2048);
+        Buffer<float> packedScales(size_t(VerifyLimit) * 16);
+        for (auto &value : query) value = __float2bfloat16(rnd());
+        input.Put(query);
+        auto sourceRow = [&](int row) {
+            const int group = (row / queryGroup + row / count) % (count / queryGroup);
+            return group * queryGroup + row % queryGroup;
+        };
+        for (int i = 0; i < VerifyLimit; ++i) {
+            const int source = sourceRow(i);
+            batch.rows[i] = native[source];
+            batch.rows[i].cache = native[source / queryGroup * queryGroup].cache;
+            batch.rows[i].query = packed.p + size_t(i) * 2048;
+            batch.rows[i].scale = packedScales.p + size_t(i) * 16;
+            batch.rows[i].scores = wide.p + size_t(i) * capacity;
+        }
+        const auto stream = cudaStreamPerThread;
+        constexpr size_t scratchBytes = sizeof(naive_topk::Workspace::partials);
+        auto wideScore = [&](int n, size_t bytes) {
+            return FastllmCudaNaiveVerifyIndexerSm100(batch, n, capacity, input.p, w.p,
+                                                       workspace1.p->partials, bytes, stream);
+        };
+        Check(!wideScore(VerifyLimit - 1, scratchBytes) && !wideScore(VerifyLimit + queryGroup, scratchBytes),
+              "invalid shared-query group");
+        Check(!wideScore(VerifyLimit, 0), "missing verification scratch must fall back");
+        Check(wideScore(VerifyLimit, scratchBytes), "wide scorer warmup");
+        Cuda(cudaStreamSynchronize(stream));
+        cudaGraph_t verifyGraph;
+        cudaGraphExec_t verifyExec;
+        Cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        Cuda(cudaMemsetAsync(out.p, 0xff, out.n * sizeof(unsigned), stream));
+        Cuda(cudaMemsetAsync(wide.p, 0xff, wide.n * sizeof(unsigned), stream));
+        b::Quantize<<<dim3(16, count), 128, 0, stream>>>(input.p, original);
+        score();
+        Check(wideScore(VerifyLimit, scratchBytes), "wide scorer declined capture");
+        Cuda(cudaStreamEndCapture(stream, &verifyGraph));
+        Cuda(cudaGraphInstantiate(&verifyExec, verifyGraph, nullptr, nullptr, 0));
+        for (int step = 0; step < 5; ++step) {
+            update(step);
+            if (step >= 3) {
+                std::fill(lengths.begin(), lengths.end(), step == 3 ? capacity : 0);
+                live.Put(lengths);
+            }
+            Cuda(cudaGraphLaunch(verifyExec, stream));
+            Cuda(cudaStreamSynchronize(stream));
+            const auto expected = out.Get(), actual = wide.Get();
+            for (int i = 0; i < VerifyLimit; ++i) {
+                auto row = expected.begin() + size_t(sourceRow(i)) * capacity;
+                Check(std::equal(row, row + capacity, actual.begin() + size_t(i) * capacity),
+                      "wide verification scores or inactive positions changed after graph replay");
+            }
+        }
+        Cuda(cudaGraphExecDestroy(verifyExec));
+        Cuda(cudaGraphDestroy(verifyGraph));
+    }
     Cuda(cudaGraphExecDestroy(executable));
     Cuda(cudaGraphDestroy(graph));
     printf("PASS batch=%d capacity=%d stride=%d page=%d scaled=%d L2=%.9g graph/rebinding/TopK\n", count,

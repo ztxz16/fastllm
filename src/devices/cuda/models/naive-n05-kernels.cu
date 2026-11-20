@@ -5690,6 +5690,19 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     if (compactTopK && !compactScores) compactRows.reserve(rows.size());
 #endif
 
+#if CUDART_VERSION >= 12040
+    // The page table and its graph-rebound binding must match within each query group.
+    auto sharesGroupKV = [&](int first, int count, int queries) {
+        for (int i = 0; i < count; i += queries) {
+            const auto &owner = rows[first + i];
+            for (int j = 1; j < queries; ++j) {
+                const auto &row = rows[first + i + j];
+                if (row.key != owner.key || row.cache != owner.cache || row.capacity != owner.capacity) return false;
+            }
+        }
+        return true;
+    };
+#endif
     std::vector<int> rowOrder;
     int pairedRows = 0;
     if (!cp && arch == 90 && nativeScores && cacheType == BFLOAT16 &&
@@ -5710,7 +5723,46 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         pairedRows = rowOrder.size();
         rowOrder.insert(rowOrder.end(), singles.begin(), singles.end());
     }
+#if defined(FASTLLM_ENABLE_NAIVE_INDEXER_SM100) && CUDART_VERSION >= 12040
+    namespace sm = naive_indexer_sm100;
+    using VerifyTopK = batch::LocalTopKBatch;
+    static_assert(sm::VerifyLimit <= batch::kLocalTopKLimit);
+    const bool wideShape = blackwell && nativeScores && rows.size() > sm::BatchLimit &&
+        (cacheType == FP8_E4M3 || rows.front().key->kvCacheFp8Indexer) &&
+        localCapacity > 16384 && localCapacity <= 65536;
+    constexpr size_t sortBytes = naive_indexer_sortpack::SortBytes<256, 5, true, false>();
+    auto sort = naive_indexer_sortpack::SortPack<256, 5, true, false, VerifyTopK>;
+    const bool wideVerify = wideShape &&
+        BulkKernelSupported(naive_indexer_wide_select::SelectWide<VerifyTopK>, 0, 90) &&
+        BulkKernelSupported(sort, sortBytes, 90);
+    auto tryWideVerify = [&](int first, int count) {
+        if (!sharesGroupKV(first, count, sm::VerifyQueries)) return false;
+        sm::VerifyBatch scores{};
+        VerifyTopK selection{};
+        selection.ranks = 1;
+        for (int i = 0; i < count; ++i) {
+            const auto r = prepareRow(first + i);
+            scores.rows[i] = {r.key, r.live, r.query, r.scale, r.scores, r.sequence, r.stride, r.cache};
+            selection.rows[i] = {r.live, r.scores, r.workspace, r.indices};
+        }
+        // This row's selection scratch is idle until the scoring kernel retires.
+        auto *workspace = selection.rows[0].workspace;
+        if (!FastllmCudaNaiveVerifyIndexerSm100(scores, count, localCapacity, (const BF16 *)query.cudaData,
+                (const BF16 *)weights.cudaData, workspace->partials, sizeof(workspace->partials), cudaStreamPerThread))
+            return false;
+        naive_indexer_wide_select::SelectWide<<<count, 1024>>>(selection);
+        sort<<<count, 256, sortBytes>>>(selection);
+        return true;
+    };
+#endif
     for (int first = 0; first < (int)rows.size();) {
+#if defined(FASTLLM_ENABLE_NAIVE_INDEXER_SM100) && CUDART_VERSION >= 12040
+        const int wideCount = std::min(sm::VerifyLimit, (int)rows.size() - first) / sm::VerifyQueries * sm::VerifyQueries;
+        if (wideVerify && wideCount >= sm::BatchLimit && tryWideVerify(first, wideCount)) {
+            first += wideCount;
+            continue;
+        }
+#endif
         const bool pairChunk = first < pairedRows;
         int count = std::min(pairChunk ? (batch::BatchLimit / 2) * 2 : batch::BatchLimit,
             (pairChunk ? pairedRows : (int)rows.size()) - first);
@@ -5725,13 +5777,8 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
                 (!cp || contextPageLen) && rowOrder.empty()) {
             for (int queries : {4, 2}) {
                 const int aligned = count / queries * queries;
-                bool compatible = aligned > 0;
-                for (int i = 0; compatible && i < aligned; ++i) {
-                    const auto &a = rows[first + i], &b = rows[first + i / queries * queries];
-                    compatible = a.key == b.key && a.cache == b.cache && a.capacity == b.capacity;
-                }
                 auto kernel = queries == 4 ? batch::HopperScoresSharedHead<4> : batch::HopperScoresSharedHead<2>;
-                if (compatible && BulkKernelSupported(kernel, 0, 90)) {
+                if (aligned && sharesGroupKV(first, aligned, queries) && BulkKernelSupported(kernel, 0, 90)) {
                     sharedQueries = queries;
                     count = aligned;
                     break;
