@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/deepseek-ai/DeepGEMM",
   "commit": "5081f8513af57e61696de4f4f04b0e707ffb503e",
-  "changes": "C++ namespace isolation and trailing whitespace cleanup; numerical kernel is unmodified.",
+  "changes": "C++ namespace isolation for FastLLM, bounded ring signal storage and trailing whitespace cleanup; numerical kernel is unmodified.",
   "headers": {
     "deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh": {
       "original_sha256": "9d577f200e482fb2deed3e9d8a8b6ec0f71d15df2782d4b8f0a5321102ccc970",
@@ -45,7 +45,7 @@
     },
     "deep_gemm/layout/mega_moe.cuh": {
       "original_sha256": "53008d96b7eeaeec35af54e1400a9a3149625bc39b385611fe544b08c5084b50",
-      "installed_sha256": "4c4ca902cd133657f6c7f2f294c417e651efd779eb1871f1a2879e008c1455b4",
+      "installed_sha256": "28d67f705a1171b6f60627988763d5bb158f08703eb6810d07892e77b298660c",
       "adapted": true
     },
     "deep_gemm/layout/sym_buffer.cuh": {
@@ -91,6 +91,36 @@
     "deep_gemm/common/utils.cuh": {
       "original_sha256": "9fd0fdb872bb1d037370cab53918535c5e049b2936dd5e8b8af51648dfb843f2",
       "installed_sha256": "d897bba98f06355bc8be34448c6b8c4baf8769bb03cc7d9cc05552f664371cfb",
+      "adapted": true
+    },
+    "deep_gemm/epilogue/operators.cuh": {
+      "original_sha256": "4e916eab753dcc06eee8fe8664a8f1ba412a4724119cdbb04de52e01c12f7bf3",
+      "installed_sha256": "6cde31e93d8702c8cadf5fa84f74afa397b75aa330b6b59221b22e7beee68ea6",
+      "adapted": true
+    },
+    "deep_gemm/epilogue/sm100_store_cd.cuh": {
+      "original_sha256": "f90b1baca0b88bad39cd84a3634447e2a4f24c249ab067bfa6afb7eed5979aea",
+      "installed_sha256": "bd4f63f22144317eec8fb6f50c58574ee59a01ea7d8c417bbd57d3afde470c84",
+      "adapted": true
+    },
+    "deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh": {
+      "original_sha256": "23cf25fed0aa5bcc26465a88cb3b11144d236f9697458d072dbb9171ad1edd8d",
+      "installed_sha256": "3b1f540e98182affff6a66c4ae3f3433f2c5cd8c183db0ffda8fa2ba505f3282",
+      "adapted": true
+    },
+    "deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh": {
+      "original_sha256": "f567031e4f6e2b86b0ee99560c3eaff0160623a82e01aff0559fbeb3c2ec17b4",
+      "installed_sha256": "22b48f7b20d024615cb27898821467ab48ab8b60ee79e10c0a984f4d4577c70b",
+      "adapted": true
+    },
+    "deep_gemm/layout/gemm.cuh": {
+      "original_sha256": "b692f024495a4160dc65a8094bb13eae65be4c902d10436fce6446e6919d2b57",
+      "installed_sha256": "44f3e539fe98be61a6d9691963f9231a6afcfcaf56429aaecd6ab89fe7abcb12",
+      "adapted": true
+    },
+    "deep_gemm/scheduler/gemm.cuh": {
+      "original_sha256": "f48dfef610affd81d1cae7798bdf602d0e2c3b9aa7cc2c0df0376370eea97ed6",
+      "installed_sha256": "6d664486a56df776a97af6bfd373440dd4a0125d722618fc40d9fb7db8023048",
       "adapted": true
     }
   },

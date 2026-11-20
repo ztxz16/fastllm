@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -140,6 +141,70 @@ class AffinityTests(unittest.TestCase):
 
 
 class TransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_snapshot_retries_without_changing_the_owner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = config(['http://a', 'http://b'])
+            router = Router(settings, tmp)
+            router.healthy = [True, True]
+            owner = router.select('session', on_assignment=router.queue_snapshot)
+            with patch('fastllm_pytools.deploy.router.write_json', side_effect=OSError('write failed')):
+                with self.assertRaises(OSError):
+                    await router.flush_snapshot()
+            self.assertEqual(router.select('session', on_assignment=router.queue_snapshot), owner)
+            await router.flush_snapshot()
+            self.assertEqual(Router(settings, tmp).entries, router.entries)
+
+    async def test_cancelled_queued_writer_does_not_block_the_next_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = config(['http://a'])
+            router = Router(settings, tmp)
+            router.healthy = [True]
+            router.select('session', on_assignment=router.queue_snapshot)
+            router.snapshot_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await router.snapshot_task
+            await router.flush_snapshot()
+            self.assertEqual(Router(settings, tmp).entries, router.entries)
+
+    async def test_burst_snapshots_keep_latest_placement_after_caller_cancels(self):
+        from fastllm_pytools.deploy.process import write_json
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = config(['http://a', 'http://b'])
+            router = Router(settings, tmp)
+            router.healthy = [True, True]
+            loop = asyncio.get_running_loop()
+            started, release = asyncio.Event(), threading.Event()
+            snapshots = []
+
+            def slow_write(path, value):
+                snapshots.append(value)
+                if len(snapshots) == 1:
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(3):
+                        raise TimeoutError('affinity write blocked the event loop')
+                write_json(path, value)
+
+            with patch('fastllm_pytools.deploy.router.write_json', side_effect=slow_write):
+                router.select('first', on_assignment=router.queue_snapshot)
+                first = asyncio.create_task(router.flush_snapshot())
+                await asyncio.wait_for(started.wait(), 2)
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                router.entries.pop('first')
+                writes = []
+                for i in range(16):
+                    router.select(str(i), on_assignment=router.queue_snapshot)
+                    writes.append(asyncio.create_task(router.flush_snapshot()))
+                await asyncio.sleep(0)
+                release.set()
+                await asyncio.gather(*writes)
+                self.assertEqual(Router(settings, tmp).entries, router.entries)
+                router.select('0', on_assignment=router.queue_snapshot)
+                await router.flush_snapshot()
+            self.assertEqual(len(snapshots), 2)
+            self.assertEqual(set(snapshots[0]['sessions']), {'first'})
+
     async def test_upstream_completion_releases_slot_before_downstream_eof(self):
         output = b'data: first\n\ndata: [DONE]\n\n'
         async def backend(request):

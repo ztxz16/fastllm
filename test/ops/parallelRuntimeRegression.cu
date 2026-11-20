@@ -252,16 +252,21 @@ int main() {
             });
         }
         CudaRowTransfer transfer(runtime, RowPartition(dp, {}));
-        if (dp >= 4) transfer.ReserveFixed(513, 37);
-        for (int n : {0, 1, 2, 7, 8, 9, 32, 129, 513, 2, 0, 9}) for (bool skew : {false, true}) {
+        const size_t smallFields[] = {13, 0, 7, 17};
+        const size_t wideFields[] = {2064, 0, 256, 512};
+        const size_t wideBytes = wideFields[0] + wideFields[2] + wideFields[3];
+        if (dp >= 4) transfer.ReserveFixed(513, wideBytes);
+        for (int n : {0, 1, 2, 7, 8, 9, 32, 33, 129, 513, 2, 0, 9}) for (bool skew : {false, true}) {
+            const size_t *widths = n == 33 ? wideFields : smallFields;
+            const size_t rowBytes = n == 33 ? wideBytes : 37;
             std::vector<int> owners(n);
             for (int i = 0; i < n; ++i) owners[i] = skew ? dp - 1 : (i * 7) % dp;
             RowPartition rows(dp, owners);
             transfer.Reset(rows);
             transfer.Reset(rows); // same permutation keeps existing storage
-            transfer.Reserve(37);
+            transfer.Reserve(rowBytes);
             std::vector<unsigned char*> global(8), local(8), collected(8);
-            std::vector<unsigned char> input(n * 37);
+            std::vector<unsigned char> input(n * rowBytes);
             for (size_t i = 0; i < input.size(); ++i) input[i] = (i * 31 + 17) % 251;
             runtime.Run([&](int r, int) {
                 const size_t bytes = std::max<size_t>(1, input.size());
@@ -270,8 +275,8 @@ int main() {
                 if (!input.empty()) Cuda(cudaMemcpyAsync(global[r], input.data(), input.size(), cudaMemcpyHostToDevice, cudaStreamPerThread));
             });
             runtime.Enqueue([&](int r, int) {
-                transfer.Select(r, global[r], local[r], 37);
-                transfer.Collect(r, local[r], collected[r], 37);
+                transfer.Select(r, global[r], local[r], rowBytes);
+                transfer.Collect(r, local[r], collected[r], rowBytes);
             });
             runtime.Run([&](int r, int) {
                 std::vector<unsigned char> result(input.size());
@@ -284,7 +289,6 @@ int main() {
             auto packed = [&](int r, int) {
                 const size_t localRows = rows.localToGlobal[runtime.Layout().AttentionOwner(r)].size();
                 CudaRowTransfer::Field fields[4];
-                const size_t widths[] = {13, 0, 7, 17};
                 size_t offset = 0;
                 for (int i = 0; i < 4; ++i) {
                     auto *source = local[r] + localRows * offset;
@@ -296,7 +300,7 @@ int main() {
                 transfer.Collect(r, fields, 4);
             };
             runtime.Enqueue(packed);
-            if (n == 9 || n == 32) {
+            if (n == 9 || n == 32 || n == 33) {
                 runtime.Run([](int, int) {});
                 for (int device : devices) {
                     Cuda(cudaSetDevice(device));

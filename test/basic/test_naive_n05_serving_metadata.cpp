@@ -18,6 +18,25 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     static void CheckAttentionPlan() {
         // Host-only: also cover sizes beyond the CUDA Graph limit. The plan has
         // no batch cap; unsupported graph shapes retain the normal eager path.
+        {
+            AttentionParallelState::RequestPlan plan;
+            PagedCacheManager pool;
+            pool.SetMaxPages(8);
+            std::vector<Data> keys(3);
+            for (int row = 0; row < 3; ++row) {
+                Data &key = keys[row];
+                key.pagedKVCacheData = &pool; key.pageLen = 16;
+                key.pageIndex = {pool.GetUnusedPageIndex(true)};
+                plan.pageTails[&pool].emplace_back(&key, row);
+                plan.requests.push_back({&key, uint64_t(row + 1), 13, row == 1 ? 14 : 16});
+            }
+            std::vector<int> counts(3, 2);
+            pool.Pick(keys[2].pageIndex);
+            Check(plan.RetainInOrder(&counts) == std::vector<int>({0, -1, -1}), "stable batch missed growth or shared tail");
+            pool.ReleasePageIndices(keys[2].pageIndex);
+            Check(plan.RetainInOrder(&counts) == std::vector<int>({0, -1, 2}), "stable batch retained stale sharing");
+            for (auto &key : keys) { pool.ReleasePageIndices(key.pageIndex); key.pagedKVCacheData = nullptr; }
+        }
         for (int count : {1, 256, 512, 513, 1024}) {
             std::vector<Data> roots(count);
             std::vector<std::pair<Data *, Data *>> kv;

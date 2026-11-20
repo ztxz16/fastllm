@@ -25,8 +25,8 @@ struct NaiveN05FlashModel::AttentionParallelState {
         std::map<PagedCacheManager *, std::vector<std::pair<const Data *, int>>> pageTails;
         struct LengthField { int *length, *lastPage; int pageLen; };
         std::vector<std::vector<LengthField>> lengthFields;
-        void AdvanceRow(size_t row) const {
-            const int length = requests[row].length + 1;
+        void AdvanceRow(size_t row, int count = 1) const {
+            const int length = requests[row].length + count;
             for (const auto &field : lengthFields[row]) {
                 *field.length = length;
                 if (field.lastPage) *field.lastPage = (length - 1) % field.pageLen + 1;
@@ -44,9 +44,10 @@ struct NaiveN05FlashModel::AttentionParallelState {
             return length > 0 && length % cache.pageLen &&
                 cache.pagedKVCacheData->pageRefCount[cache.pageIndex[(length - 1) / cache.pageLen]] > 1;
         }
-        bool CanAppend() const {
-            if (requests.empty() || !std::all_of(requests.begin(), requests.end(),
-                [](const Request &r) { return r.length < r.reservedUntil; })) return false;
+        bool CanAppend(const std::vector<int> *counts = nullptr) const {
+            if (requests.empty() || (counts && counts->size() != requests.size())) return false;
+            for (size_t i = 0; i < requests.size(); ++i)
+                if (requests[i].reservedUntil - requests[i].length < (counts ? (*counts)[i] : 1)) return false;
             // Sharing can change without replacing a descriptor (prefix/PD
             // snapshots call Pick). Check the physical tail under each pool's
             // lock, once per pool rather than once per request/layer.
@@ -57,10 +58,30 @@ struct NaiveN05FlashModel::AttentionParallelState {
             }
             return true;
         }
+        // Request identities and order have already matched. Keep the plan and
+        // its per-pool descriptor lists in place across page growth or tail COW.
+        std::vector<int> RetainInOrder(const std::vector<int> *counts) {
+            std::vector<int> source(requests.size());
+            for (size_t i = 0; i < requests.size(); ++i) {
+                const int append = counts ? (*counts)[i] : 1;
+                source[i] = requests[i].reservedUntil - requests[i].length >= append ? int(i) : -1;
+            }
+            for (const auto &group : pageTails) {
+                std::lock_guard<std::mutex> guard(group.first->pageIndexLocker);
+                for (const auto &entry : group.second) {
+                    const int row = entry.second;
+                    if (source[row] >= 0 && HasSharedTail(*entry.first, requests[row].length)) source[row] = -1;
+                }
+            }
+            if (!lengthFields.empty())
+                for (size_t i = 0; i < source.size(); ++i)
+                    if (source[i] < 0) lengthFields[i].clear();
+            return source;
+        }
         // Move surviving request metadata into the new batch order. Old roots
         // may have been freed or recycled, so only inspect live batch roots.
         std::vector<int> Reorder(const TargetBatch &batch, int count,
-                const std::unordered_map<const Data *, uint64_t> &live) {
+                const std::unordered_map<const Data *, uint64_t> &live, const std::vector<int> *append) {
             std::unordered_map<const Data *, int> oldRows;
             for (size_t i = 0; i < requests.size(); ++i) oldRows.emplace(requests[i].key, i);
             std::vector<int> source(count, -1), destination(requests.size(), -1);
@@ -74,7 +95,7 @@ struct NaiveN05FlashModel::AttentionParallelState {
                 const int index = old->second;
                 const auto &request = requests[index];
                 if (request.identity != id->second || request.length != key.dims[1] ||
-                    request.length >= request.reservedUntil) continue;
+                    request.reservedUntil - request.length < (append ? (*append)[row] : 1)) continue;
                 source[row] = index;
                 destination[index] = row;
                 next[row] = request;
@@ -173,6 +194,7 @@ struct NaiveN05FlashModel::AttentionParallelState {
     std::vector<std::pair<Data, Data>> padding;
     bool servingPadded = false;
     int servingLiveRows = 0;
+    const std::vector<int> *verifyLengths = nullptr;
     struct UnsupportedServingLayout {};
     explicit AttentionParallelState(parallel::Topology topology)
         : runtime(topology), groups(topology.attentionDP), ranks(topology.Size()),

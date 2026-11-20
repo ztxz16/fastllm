@@ -539,6 +539,7 @@ namespace fastllm {
     }
 
     void ResponseContext::Init(int blocks, DataType, DataType kvCacheDataType) {
+        pdPrefillGroup = -1;
         pastKeyValues.clear();
         // A request owns two cache descriptors per transformer block.  Without
         // reserving here, vector growth repeatedly copy-constructs every Data
@@ -1873,25 +1874,47 @@ namespace fastllm {
     }
 
     int basellm::PreviewPDResidentPrefix(const std::vector<int> &tokens) {
+        return PreviewPDResidentPrefix(tokens, -1);
+    }
+
+    int basellm::PreviewPDResidentPrefix(const std::vector<int> &tokens, int group) {
         if (!HasPDResidentPrefixCache() || tokens.empty()) return 0;
-        // Topology is fixed before PD starts. Each manager and companion-state
-        // query takes its own metadata lock; no GPU work or forward lock here.
-        ResidentPrefixManagers plan;
-        plan.Init(this, nullptr);
-        if (!plan.probe || plan.probe->pageLen <= 0) return 0;
+        const int groups = PDGroupCount();
+        const auto devices = groups > 1 ? PDDevices() : std::vector<int>{};
+        AssertInFastLLM(groups > 0 && group >= -1 && group < groups &&
+            (groups == 1 || (!devices.empty() && devices.size() % groups == 0)), "Invalid PD cache probe group.");
         ResponseContext context;
         context.currentTokens = tokens;
+        if (groups > 1) context.pastKeyValues.emplace_back();
         PrefillPrefixPreview preview;
         preview.Reset(tokens);
-        const int page = plan.probe->pageLen;
-        const auto &hashes = preview.Hashes(page);
-        int pages = (tokens.size() - 1) / page;
-        for (auto *manager : plan.managers) {
-            pages = std::min(pages, manager->PreviewPrefix(hashes, preview.matches[manager]));
-            if (!pages) return 0;
+        int best = 0;
+        // A DP group owns an independent cache. Every TP shard and the SWA
+        // checkpoint of the same group must cover the reported prefix.
+        const int first = group < 0 ? 0 : group;
+        const int end = group < 0 ? groups : group + 1;
+        for (int g = first; g < end; ++g) {
+            if (groups > 1) {
+                const auto width = devices.size() / groups;
+                context.pastKeyValues.front().first.dataDeviceIds.assign(
+                    devices.begin() + g * width, devices.begin() + (g + 1) * width);
+            }
+            ResidentPrefixManagers plan;
+            plan.Init(this, &context);
+            if (!plan.probe || plan.probe->pageLen <= 0) continue;
+            const int page = plan.probe->pageLen;
+            const auto &hashes = preview.Hashes(page);
+            int pages = (tokens.size() - 1) / page;
+            for (auto *manager : plan.managers) {
+                pages = std::min(pages, manager->PreviewPrefix(hashes, preview.matches[manager]));
+                if (pages * page <= best) break;
+            }
+            if (pages * page > best) {
+                const int length = PreviewPagedPrefixCacheExtra(&context, pages * page, preview);
+                best = std::max(best, std::min(pages * page, length) / page * page);
+            }
         }
-        return std::max(0, std::min(pages * page,
-            PreviewPagedPrefixCacheExtra(&context, pages * page, preview))) / page * page;
+        return best;
     }
 
     static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
@@ -3449,9 +3472,13 @@ namespace fastllm {
                         }
 
                         std::set<int> waitingPD;
+                        bool hasPrefillRequests = false;
                         for (auto &entry : model->responseContextDict.dicts) {
-                            if (!entry.second->isEnding && !model->PollPD(entry.second) && entry.second->pdPending)
+                            if (entry.second->isEnding) continue;
+                            if (!model->PollPD(entry.second) && entry.second->pdPending)
                                 waitingPD.insert(entry.first);
+                            else if (entry.second->curTokens == 0)
+                                hasPrefillRequests = true;
                         }
                         for (auto &entry : model->responseContextDict.dicts)
                             if (entry.second->isEnding) {
@@ -3488,11 +3515,13 @@ namespace fastllm {
                         };
                         long long lenSum = 0;
                         int currentActivate = 0;
-                        for (auto &it: model->responseContextDict.dicts) {
-                            if (allocatedTokens(it.second->pastKeyValues[model->kvCacheId].first) > 0) {
-                                const Data &cache = it.second->pastKeyValues[model->kvCacheId].first;
-                                lenSum += allocatedTokens(cache);
-                                currentActivate++;
+                        // Shared pools already reserve decode growth at admission. Only
+                        // a runnable prompt can consume a new reservation this turn.
+                        if (!sharedKvPool || !preallocatedPagedCache || hasPrefillRequests) {
+                            for (const auto &it : model->responseContextDict.dicts) {
+                                const auto allocated = allocatedTokens(it.second->pastKeyValues[model->kvCacheId].first);
+                                lenSum += allocated;
+                                currentActivate += allocated > 0;
                             }
                         }
                         auto reservePagedAppend = [&](const Data &cache, int append) {
@@ -3540,7 +3569,8 @@ namespace fastllm {
                         if (batchPrefill || sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
                             auto *ctx = entry.second;
                             if (!ctx->isEnding && (ctx->curTokens > 0 || ctx->prefillOffset > 0)) {
-                                if (sharedKvPool) reservedPages[model->GetPagedKVCacheBudgetManager(ctx)] += remainingPages(ctx);
+                                if (sharedKvPool && hasPrefillRequests)
+                                    reservedPages[model->GetPagedKVCacheBudgetManager(ctx)] += remainingPages(ctx);
                                 ++activeRequests;
                                 if (ctx->curTokens > 0) {
                                     ++activeDecode;
@@ -3581,10 +3611,8 @@ namespace fastllm {
                         };
                         std::vector<ScheduleOrder> orders;
                         orders.reserve(model->responseContextDict.dicts.size());
-                        bool hasPrefillRequests = false;
                         for (auto &it : model->responseContextDict.dicts) {
                             if (waitingPD.count(it.first)) continue;
-                            hasPrefillRequests |= it.second->curTokens == 0;
                             orders.push_back({-(int)it.second->currentTokens.size(), it.first, it.second});
                         }
                         // Without prefill requests the admission comparator reduces
@@ -3799,7 +3827,7 @@ namespace fastllm {
                             }
                         }
                         bool requestStorageBlocked = false;
-                        for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
+                        for (int isPrompt = hasPrefillRequests || !(batchPrefill || sharedKvPool); isPrompt >= 0; --isPrompt) {
                             int cnt = 0;
                             if (isPrompt && deferPrefill) continue; // Keep decoding while collecting prompts.
                             if (isPrompt == 0 && seqLens.size() > 0) {
@@ -3807,10 +3835,8 @@ namespace fastllm {
                             }
                             int currentMaxLen = 0, admittedNew = 0;
 
-                            // for (auto &it: model->responseContextDict.dicts) {
-                            for (auto &ii : orders) {
-                                auto &it = *model->responseContextDict.dicts.find(ii.second);
-                                // if (model->model_struct == "deepseek_v2" && isPrompt && seqLens.size() > 0) {
+                            for (const auto &order : orders) {
+                                const auto it = std::make_pair(order.second, order.context);
                                 if (isPrompt && seqLens.size() > 0 && !batchPrefill) {
                                     // TODO: multicuda支持多prompt一起推理
                                     continue;

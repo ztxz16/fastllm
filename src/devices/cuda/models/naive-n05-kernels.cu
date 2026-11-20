@@ -1,5 +1,5 @@
 #include "devices/cuda/fastllm-cuda-norm.cuh"
-#include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
 #include "naive-n05-topk.cuh"
@@ -11,6 +11,7 @@
 #include "naive-n05-attention-small.cuh"
 #include "naive-n05-attention-prefetch.cuh"
 #include "naive-n05-attention-hopper.cuh"
+#include "naive-n05-decode-blackwell.cuh"
 #include "naive-n05-prefill.cuh"
 #include "naive-n05-prefill-hopper.cuh"
 #include "naive-n05-prefill-split.cuh"
@@ -56,6 +57,9 @@
 #include "naive-n05-dsa-mma.cuh"
 #ifdef FASTLLM_NAIVE_BATCH_INDEXER
 #include "naive-n05-indexer-staged.cuh"
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
+#include "naive-n05-indexer-sm100.cuh"
+#endif
 #if CUDART_VERSION >= 12040
 #include "naive-n05-indexer-compact.cuh"
 #endif
@@ -222,6 +226,43 @@ __global__ void BatchRouterSigmoid4096Vector(const BF16 *input, const float *wei
     if (lane == 0 && first + row < rows)
         output[(size_t)(first + row) * experts + expert] =
             1.0 / (1.0 + expf(-(total + 0.0f)));
+}
+
+// Each lane owns two adjacent partials of the reference GEMV. Combining the
+// pair before the warp reduction preserves every FP32 accumulation and tie.
+template<int Rows> __global__ void RouterPairs4096(const BF16 *input, const float *weight,
+                                                    float *output, int rows, int experts) {
+    const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
+    __shared__ float sums[Rows][8];
+    float partial[Rows][2]{};
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int col = t * 2 + i * 256;
+        const float2 w = *reinterpret_cast<const float2 *>(weight + size_t(expert) * 4096 + col);
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            const auto *x = reinterpret_cast<const __nv_bfloat162 *>(
+                input + size_t(min(first + r, rows - 1)) * 4096 + col);
+            const float2 v = __bfloat1622float2(*x);
+            partial[r][0] = fmaf(v.x, w.x, partial[r][0]);
+            partial[r][1] = fmaf(v.y, w.y, partial[r][1]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+        float value = partial[r][0] + partial[r][1];
+#pragma unroll
+        for (int d = 1; d < 16; d *= 2) value += __shfl_down_sync(~0u, value, d);
+        if (t % 16 == 0) sums[r][t / 16] = value;
+    }
+    __syncthreads();
+    const int r = t / 32, lane = t % 32;
+    if (r >= Rows) return;
+    float value = lane < 8 ? sums[r][lane] : 0.f;
+#pragma unroll
+    for (int d = 1; d < 8; d *= 2) value += __shfl_down_sync(~0u, value, d);
+    if (lane == 0 && first + r < rows)
+        output[size_t(first + r) * experts + expert] = 1.0 / (1.0 + expf(-(value + 0.0f)));
 }
 
 // Keep the full argument block below the legacy 4 KiB CUDA limit.
@@ -429,6 +470,23 @@ __global__ void BatchDraftTrimColumns(DraftTrimBatch batch) {
     for (int row = 0; row < batch.keep[i]; ++row)
         data[(size_t)row * batch.width[i] + column] = data[(size_t)(row + batch.drop[i]) * batch.width[i] + column];
 }
+// One CTA commits the accepted rows of one request/layer. The verifier
+// already installed the stable table on this stream. Unused rows have count 0.
+__global__ void CommitBoundSwa(const void *const *bindings, const int2 *accepted,
+        uint64_t slidingMask, int tableStride, int kc, int vc) {
+    const int request = blockIdx.y, layer = blockIdx.z;
+    const int2 item = accepted[request];
+    if (!item.y || !(slidingMask & (uint64_t(1) << layer))) return;
+    const int column = blockIdx.x * blockDim.x + threadIdx.x;
+    if (column >= kc + vc) return;
+    const auto *entry = bindings + size_t(layer) * tableStride + request * 4;
+    auto *ptr = (uint4 *)entry[column >= kc];
+    const int width = column < kc ? kc : vc, local = column < kc ? column : column - kc;
+    for (int row = 0; row < item.y; ++row)
+        ptr[size_t((item.x + row) & (kSwaWindow - 1)) * width + local] =
+            ptr[size_t(kSwaWindow + row) * width + local];
+}
+
 constexpr int kSwaCommitsPerLaunch = 112;
 struct SwaCommitBatch {
     void *key[kSwaCommitsPerLaunch], *value[kSwaCommitsPerLaunch];
@@ -614,10 +672,12 @@ void LaunchSelectTopKCompact(const float *scores, unsigned long long *selected, 
                             int queries, int keys, int queryStart, int topK, int capacity,
                             int partRows = 0, int gap = 0) {
     if ((int64_t)keys >= 4LL * capacity && (int64_t)keys <= 32LL * capacity && topK >= 256) {
-        // Narrow margins retain the same 2048 samples on both paths. Large
-        // Hopper batches use a histogram for the sampled threshold and wider
-        // vectorized scans; other shapes/architectures retain the old kernel.
-        if (topK > capacity / 2 && keys >= 32768 && queries >= 128 && FastllmCudaRuntimeArch() == 90)
+        // A wider vectorized scan amortizes its histogram over a long live
+        // prefix. The sample only proposes a cutoff; all candidates are checked.
+        const int arch = FastllmCudaRuntimeArch();
+        const bool wide = queries >= 128 && ((topK > capacity / 2 && keys >= 32768 && arch == 90) ||
+            (topK == 2048 && capacity == 4096 && queryStart >= 32768 && (arch == 100 || arch == 103)));
+        if (wide)
             SelectTopKCompact<true, 2, 1024><<<queries, 1024>>>(scores, selected, offsets, queries,
                 keys, queryStart, topK, capacity, partRows, gap);
         else if (topK > capacity / 2)
@@ -792,6 +852,54 @@ __global__ void RopeQKScaleVToken(BF16 *q, BF16 *k, BF16 *v, const float *positi
         }
     }
 }
+
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+// Packed 192/128 projection with a 64-column split-half RoPE. Eight
+// consecutive vector lanes cover both rotary halves of each Q/K head.
+__global__ void RopePackedPrefill(BF16 *q, BF16 *k, BF16 *v, const float *positions,
+        int heads, int kvHeads, float theta, BF16 scale, const BF16 *packed) {
+    __shared__ __align__(16) BF16 cosine[32], sine[32];
+    int token = blockIdx.x, t = threadIdx.x;
+    if (t < 32) {
+        float angle = positions[token] * powf(theta, -2.f * t / 64);
+        cosine[t] = __float2bfloat16_rn(cosf(angle));
+        sine[t] = __float2bfloat16_rn(sinf(angle));
+    }
+    __syncthreads();
+    const int qWidth = heads * 24, kWidth = kvHeads * 24, vWidth = kvHeads * 16;
+    const int width = qWidth + kWidth + vWidth;
+    int col = blockIdx.y * blockDim.x + t;
+    if (col >= width) return;
+    uint4 data = ((const uint4 *)packed)[size_t(token) * width + col];
+    auto *a = reinterpret_cast<__nv_bfloat162 *>(&data);
+    uint4 *dst;
+    if (col < qWidth + kWidth) {
+        int inHead = col % 24;
+        if (inHead < 8) {
+            // A 24-vector head starts on an eight-lane boundary.
+            unsigned active = 0xffu << (t % 32 / 8 * 8);
+            uint4 other = make_uint4(__shfl_xor_sync(active, data.x, 4, 8), __shfl_xor_sync(active, data.y, 4, 8),
+                                      __shfl_xor_sync(active, data.z, 4, 8), __shfl_xor_sync(active, data.w, 4, 8));
+            const auto *b = reinterpret_cast<const __nv_bfloat162 *>(&other);
+            uint4 cv = ((const uint4 *)cosine)[inHead % 4], sv = ((const uint4 *)sine)[inHead % 4];
+            const auto *c = reinterpret_cast<const __nv_bfloat162 *>(&cv);
+            const auto *s = reinterpret_cast<const __nv_bfloat162 *>(&sv);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                auto x = __hmul2_rn(a[j], c[j]), y = __hmul2_rn(b[j], s[j]);
+                a[j] = inHead < 4 ? __hsub2_rn(x, y) : __hadd2_rn(x, y);
+            }
+        }
+        dst = col < qWidth ? (uint4 *)q + size_t(token) * qWidth + col
+                           : (uint4 *)k + size_t(token) * kWidth + col - qWidth;
+    } else {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) a[j] = __hmul2_rn(a[j], __halves2bfloat162(scale, scale));
+        dst = (uint4 *)v + size_t(token) * vWidth + col - qWidth - kWidth;
+    }
+    *dst = data;
+}
+#endif
 
 struct RopeCacheRow {
     BF16 *q, *key, *value;
@@ -2421,6 +2529,7 @@ using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
     BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
 __global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, DraftFlashParams p) {
     const auto r = DraftRow(batch, blockIdx.y);
+    if (!r.key || !r.value) return; // Padding has no KV and no published output.
     p.q = const_cast<BF16 *>(r.input); p.k = r.key; p.v = r.value; p.o = r.output;
     p.kv_len = min(*r.live - 1, p.window_left) + p.qo_len;
     extern __shared__ uint8_t smem[];
@@ -2434,6 +2543,7 @@ template<class Batch>
 __global__ void BatchDraftQKV(Batch batch, const float *qNorm, const float *kNorm,
         int rows, int heads, int kvHeads, int dim, int window, float eps, float theta) {
     const auto r = DraftRow(batch, blockIdx.y / rows);
+    if (!r.key || !r.value) return;
     DraftQKVNormRopeBody(r.input, qNorm, kNorm, r.positions, r.live,
         r.key, r.value, r.query, heads, kvHeads, dim, window, 0, eps, theta,
         blockIdx.x, blockIdx.y % rows, 0, 1);
@@ -2597,7 +2707,7 @@ bool FastllmCudaNaiveDraftQKV(const fastllm::Data &raw,
 bool FastllmCudaNaiveDraftCacheBindingsSupported(int count, int rows,
         int heads, int kvHeads, int dim, int window) {
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
-    return count >= 8 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
+    return count > 0 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
         heads % kvHeads == 0 && heads / kvHeads <= 32 && dim == 128 && window >= rows &&
         BulkKernelSupported(BatchDraftFlash, sizeof(DraftFlashTraits::SharedStorageSingle), 80);
 #else
@@ -2668,7 +2778,7 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         query.dims[1] % count || query.dims[2] != heads * dim) return false;
     const int rows = query.dims[1] / count, capacity = window + rows - 1;
     if (rows <= 1 || rows >= 32) return false;
-    const bool fused = FastllmCudaNaiveDraftCacheBindingsSupported(count, rows, heads, kvHeads, dim, window);
+    const bool fused = (cacheBindings || count >= 8) && FastllmCudaNaiveDraftCacheBindingsSupported(count, rows, heads, kvHeads, dim, window);
     if (cacheBindings && (!fused || !DraftDense(*cacheBindings, INT32) ||
         cacheBindings->dataDeviceIds != query.dataDeviceIds ||
         cacheBindings->dims != std::vector<int>({count, 4}) ||
@@ -2773,15 +2883,18 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         if (!u.raw || !u.norm || !u.key || !u.value || u.start < 0 ||
             !DraftDense(*u.raw, BFLOAT16, device) || !DraftDense(*u.norm, FLOAT32, device) ||
             u.norm->dims.size() != 1 || u.norm->dims[0] != dim || u.raw->dims.size() != 3 ||
-            u.raw->dims[0] != 1 || u.raw->dims[2] != 2 * width || u.raw->dims[1] <= 0 ||
-            (int64_t)u.start + u.raw->dims[1] > INT_MAX ||
-            (int64_t)16 * u.raw->dims[1] * heads > INT_MAX || u.key->dims != u.value->dims) return false;
+            u.raw->dims[0] != 1 || u.raw->dims[2] != 2 * width ||
+            u.firstRow < 0 || u.firstRow >= u.raw->dims[1] || u.rowCount < -1) return false;
+        const int available = u.raw->dims[1] - u.firstRow;
+        const int rows = u.rowCount == -1 ? available : u.rowCount;
+        if (rows <= 0 || rows > available || (int64_t)u.start + rows > INT_MAX ||
+            (int64_t)16 * rows * heads > INT_MAX || u.key->dims != u.value->dims) return false;
         for (const Data *cache : {u.key, u.value}) {
             if (cache->dims.empty()) { if (!cache->expansionDims.empty()) return false; continue; }
             if (cache->dataType != BFLOAT16 || cache->dataDevice != DataDevice::CUDA ||
                 cache->dataDeviceIds != devices || !cache->cudaData || cache->multiDeviceData ||
                 cache->dims.size() != 3 || cache->dims[0] != 1 || cache->dims[2] != width || cache->dims[1] < 0 ||
-                (int64_t)cache->dims[1] + u.raw->dims[1] > INT_MAX || cache->strides.size() != 3 ||
+                (int64_t)cache->dims[1] + rows > INT_MAX || cache->strides.size() != 3 ||
                 cache->strides[2] != 1 || cache->strides[1] != width ||
                 (!cache->expansionDims.empty() && (cache->expansionDims.size() != 3 ||
                     cache->expansionDims[0] != 1 || cache->expansionDims[2] != width))) return false;
@@ -2799,11 +2912,12 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
         for (int i = 0; i < count; ++i) {
             const auto &u = updates[first + i];
             const int old = u.key->dims.empty() ? 0 : u.key->dims[1];
-            const int n = std::min(u.raw->dims[1], window - 1);
-            const int skip = u.raw->dims[1] - n;
+            const int sourceRows = u.rowCount == -1 ? u.raw->dims[1] - u.firstRow : u.rowCount;
+            const int n = std::min(sourceRows, window - 1);
+            const int skip = sourceRows - n;
             const int keep = std::min(old, window - 1 - n);
             rows = std::max(rows, n);
-            dst.raw[i] = (const BF16 *)u.raw->cudaData + (size_t)skip * 2 * width;
+            dst.raw[i] = (const BF16 *)u.raw->cudaData + size_t(u.firstRow + skip) * 2 * width;
             dst.norm[i] = (const float *)u.norm->cudaData;
             dst.length[i] = keep; dst.rows[i] = n; dst.start[i] = u.start + skip;
             for (Data *cache : {u.key, u.value}) {
@@ -2913,8 +3027,12 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                 (const float *)scores.cudaData, input, begin, queries, keys, queryStart);
         }
         if (blockSort) {
-            SortTopKCompact<><<<queries, 256>>>(input, begin, (int *)indices.cudaData,
-                queries, sortStride, topK, keys);
+            auto sort = SortTopKCompact<>;
+            if (queries >= 128 && keys >= 16384) {
+                const int arch = FastllmCudaRuntimeArch();
+                if (arch == 100 || arch == 103) sort = SortTopKCompact<false, 256, true>;
+            }
+            sort<<<queries, 256>>>(input, begin, (int *)indices.cudaData, queries, sortStride, topK, keys);
             CheckLaunch();
             return;
         }
@@ -2997,6 +3115,17 @@ void FastllmCudaNaiveRopeQKScaleV(fastllm::Data &q, fastllm::Data &k,
     }
     const uintptr_t addresses = (uintptr_t)q.cudaData | (uintptr_t)k.cudaData |
         (uintptr_t)v.cudaData | (packedQkv ? (uintptr_t)packedQkv->cudaData : 0);
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+    if (packedQkv && dim == 192 && valueDim == 128 && rotaryDim == 64 && q.dims[1] >= 1024 &&
+        addresses % 16 == 0 && (FastllmCudaRuntimeArch() == 100 || FastllmCudaRuntimeArch() == 103)) {
+        const int vectors = (heads + kvHeads) * 24 + kvHeads * 16;
+        RopePackedPrefill<<<dim3(q.dims[1], (vectors + 127) / 128), 128>>>(
+            (BF16 *)q.cudaData, (BF16 *)k.cudaData, (BF16 *)v.cudaData, (const float *)positions.cudaData,
+            heads, kvHeads, theta, __float2bfloat16_rn(valueScale), (const BF16 *)packedQkv->cudaData);
+        CheckLaunch();
+        return;
+    }
+#endif
     const bool tokenRope = q.dims[1] >= 1024 && rotaryDim <= 256 &&
         dim % 2 == 0 && valueDim % 2 == 0 && addresses % alignof(__nv_bfloat162) == 0;
     auto kernel = tokenRope ? (packedQkv ? RopeQKScaleVToken<true> : RopeQKScaleVToken<false>)
@@ -3433,9 +3562,22 @@ static unsigned LaunchFP8ShortlistIndexer(const naive_indexer::FP8Entry *entries
 }
 #endif
 
-void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+#ifdef FASTLLM_ENABLE_BLACKWELL_DSA
+bool FastllmCudaTryBlackwellScoreAttention(const FastllmNaivePrefillAttentionItem &, const fastllm::Data &,
+    int, int, int, int, const fastllm::Data &, const fastllm::Data &);
+#endif
+namespace {
+struct PairedIndexerAttention {
+    const FastllmNaivePrefillAttentionItem &item;
+    const fastllm::Data &sink, &scratch;
+    int heads, kvHeads, dim, valueDim;
+};
+}
+
+static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
-                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute) {
+                            int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, bool fp8Compute,
+        const PairedIndexerAttention *paired) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
     // has a general head-count path, but a different block width is unsupported.
@@ -3472,7 +3614,7 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
                 queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch, fp8Compute);
             first += count;
         }
-        return;
+        return false;
     }
     int stride = packedKeys.dims[2];
     bool fp8IndicesReady = false;
@@ -3494,44 +3636,56 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         Data qScale;
         Output(q, DataType::BFLOAT16, {queries, heads, dim});
         Output(qScale, DataType::FLOAT32, {queries, heads});
-        naive_dsa_mma::QuantizeIndexer<<<queries * heads, 128>>>(
-            (const BF16 *)query.cudaData, (BF16 *)q.cudaData,
-            (float *)qScale.cudaData, dim, 0);
-        if (queries == 1) {
-            naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
-                (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
-                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                topKOutput, stride, keys, queryStart);
-        }
-#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
-        // WGMMA's smaller query tile repeats more K reads. For shared peer KV,
-        // use the larger MMA tile below to reduce traffic to the owning GPU.
-        else if ([&]() {
-            naive_indexer::FP8Entry entry{FastllmNaiveKV(packedKeys),
-                (const BF16 *)q.cudaData, (const BF16 *)weights.cudaData, (const float *)qScale.cudaData,
-                (float *)scores.cudaData, queries, keys, queryStart, stride};
-            if (!fp8Compute || topK != 2048) return false;
-            Output(indices, INT32, {queries, topK});
-            int *output = (int *)indices.cudaData;
-            return fp8IndicesReady = LaunchFP8ShortlistIndexer(&entry, 1, &output) != 0;
-        }()) {}
-        else if (!peerKeys && naive_indexer::Prepare()) {
-            naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
-                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, queries, keys, queryStart, stride);
-        }
+        const int arch = queries > 1 ? FastllmCudaRuntimeArch() : 0;
+        bool scored = false;
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
+        if (!peerKeys && (arch == 100 || arch == 103))
+            scored = FastllmCudaNaivePrefillIndexerSm100(static_cast<const BF16 *>(query.cudaData),
+                static_cast<const BF16 *>(weights.cudaData), FastllmNaiveKV(packedKeys), stride, queries, keys,
+                queryStart, q.cudaData, q.GetBytes(), static_cast<float *>(qScale.cudaData),
+                static_cast<float *>(scores.cudaData), cudaStreamPerThread);
 #endif
-        else {
-            // TopK consumes only each row's causal prefix. Blocks beyond
-            // the final query's prefix cannot contribute any selected key.
-            const bool pipeline = FastllmCudaRuntimeArch() == 90;
-            const int rows = pipeline ? 32 : 64;
-            auto kernel = pipeline ? naive_dsa_mma::IndexerScores<true> : naive_dsa_mma::IndexerScores<false>;
-            kernel<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
-                (queries + rows - 1) / rows), rows * 4>>>(
-                (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
-                (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
-                (float *)scores.cudaData, queries, keys, queryStart, stride, 0, 0);
+        if (!scored) {
+            naive_dsa_mma::QuantizeIndexer<<<queries * heads, 128>>>(
+                (const BF16 *)query.cudaData, (BF16 *)q.cudaData,
+                (float *)qScale.cudaData, dim, 0);
+            if (queries == 1) {
+                naive_dsa_mma::IndexerDecodeScores<<<(keys + kKeys - 1) / kKeys, kThreads>>>(
+                    (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
+                    (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                    topKOutput, stride, keys, queryStart);
+            }
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM90
+            // WGMMA's smaller query tile repeats more K reads. For shared peer KV,
+            // use the larger MMA tile below to reduce traffic to the owning GPU.
+            else if ([&]() {
+                naive_indexer::FP8Entry entry{FastllmNaiveKV(packedKeys),
+                    (const BF16 *)q.cudaData, (const BF16 *)weights.cudaData, (const float *)qScale.cudaData,
+                    (float *)scores.cudaData, queries, keys, queryStart, stride};
+                if (!fp8Compute || topK != 2048) return false;
+                Output(indices, INT32, {queries, topK});
+                int *output = (int *)indices.cudaData;
+                return fp8IndicesReady = LaunchFP8ShortlistIndexer(&entry, 1, &output) != 0;
+            }()) {}
+            else if (!peerKeys && naive_indexer::Prepare()) {
+                naive_indexer::Launch((const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
+                    (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                    (float *)scores.cudaData, queries, keys, queryStart, stride);
+            }
+#endif
+            else {
+                // TopK consumes only each row's causal prefix. Blocks beyond
+                // the final query's prefix cannot contribute any selected key.
+                const bool pipeline = arch == 90 || (!peerKeys && (arch == 100 || arch == 103) &&
+                    queries >= 4096 && keys >= 4096 && packedKeys.dataType == FP8_E4M3);
+                const int rows = pipeline ? 32 : 64;
+                auto kernel = pipeline ? naive_dsa_mma::IndexerScores<true> : naive_dsa_mma::IndexerScores<false>;
+                kernel<<<dim3((queryStart + queries + kKeys - 1) / kKeys,
+                    (queries + rows - 1) / rows), rows * 4>>>(
+                    (const BF16 *)q.cudaData, FastllmNaiveKV(packedKeys),
+                    (const float *)qScale.cudaData, (const BF16 *)weights.cudaData,
+                    (float *)scores.cudaData, queries, keys, queryStart, stride, 0, 0);
+            }
         }
     } else
 #endif
@@ -3569,11 +3723,15 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
         }
     }
     CheckLaunch();
-    if (fp8IndicesReady) return;
+    if (fp8IndicesReady) return false;
+#ifdef FASTLLM_ENABLE_BLACKWELL_DSA
+    if (paired && FastllmCudaTryBlackwellScoreAttention(paired->item, paired->sink, paired->heads,
+            paired->kvHeads, paired->dim, paired->valueDim, paired->scratch, scores)) return true;
+#endif
     // The selector derives positions directly; CUB's fallback uses emitted positions.
     if (selectBlocks) {
         CooperativeTopK((const unsigned *)scores.cudaData, queryStart + 1, selectBlocks, indices);
-        return;
+        return false;
     }
     if (decodeTopK) {
         SortTopKPairs((const unsigned *)scores.cudaData, (const int *)positions.cudaData,
@@ -3582,7 +3740,26 @@ void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &we
     } else {
         FastllmCudaNaiveTopK(scores, queryStart, topK, indices);
     }
+    return false;
 }
+
+void FastllmCudaNaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
+        const fastllm::Data &keys, int heads, int dim, int past, int topK, bool fp8Query,
+        fastllm::Data &indices, bool peer, fastllm::Data *scratch, bool fp8Compute) {
+    NaiveIndexer(query, weights, keys, heads, dim, past, topK, fp8Query, indices, peer, scratch, fp8Compute, nullptr);
+}
+
+void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerItem &index,
+        const FastllmNaivePrefillAttentionItem &attention, const fastllm::Data &sink,
+        int indexHeads, int indexDim, int topK, bool fp8Query, bool fp8Compute,
+        int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
+        const fastllm::Data &attentionScratch) {
+    const PairedIndexerAttention paired{attention, sink, attentionScratch, heads, kvHeads, dim, valueDim};
+    const bool consumed = NaiveIndexer(*index.query, *index.weights, *index.keys, indexHeads, indexDim,
+        index.past, topK, fp8Query, *index.indices, false, scoreScratch, fp8Compute, &paired);
+    if (!consumed) FastllmCudaNaiveBatchIndexerAttention({attention}, sink, heads, kvHeads, dim, valueDim, attentionScratch);
+}
+
 
 #ifdef FASTLLM_NAIVE_DSA_MMA
 static bool BalancedIndexerSupported(const fastllm::Data &query, const fastllm::Data &weights,
@@ -4016,8 +4193,16 @@ bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
         heads, kvHeads, pastLength, true, query.dims[1] / (2 * ranks), output);
 }
 
-void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
-        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim) {
+#ifndef FASTLLM_ENABLE_BLACKWELL_DSA
+bool FastllmCudaHasBlackwellIndexerAttention() { return false; }
+bool FastllmCudaTryNaiveIndexerAttention(const FastllmNaivePrefillAttentionItem &,
+        const fastllm::Data &, int, int, int, int, const fastllm::Data &) {
+    return false;
+}
+#endif
+
+static void NaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim, const fastllm::Data *indexerScratch) {
     using namespace fastllm;
 #ifdef FASTLLM_NAIVE_DSA_MMA
     naive_dsa_mma::PrefillAttentionBatch batch{};
@@ -4045,6 +4230,8 @@ void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttenti
     };
 #endif
     for (const auto &item : items) {
+        if (indexerScratch && FastllmCudaTryNaiveIndexerAttention(item, sink, heads,
+                kvHeads, dim, valueDim, *indexerScratch)) continue;
 #ifdef FASTLLM_NAIVE_DSA_MMA
         const auto &q = *item.query, &k = *item.key, &v = *item.value, &ids = *item.indices;
         const int rows = q.dims[1], keys = k.dims[1];
@@ -4089,6 +4276,16 @@ void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttenti
 #ifdef FASTLLM_NAIVE_DSA_MMA
     flush();
 #endif
+}
+
+void FastllmCudaNaiveBatchAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim) {
+    NaiveBatchAttention(items, sink, heads, kvHeads, dim, valueDim, nullptr);
+}
+
+void FastllmCudaNaiveBatchIndexerAttention(const std::vector<FastllmNaivePrefillAttentionItem> &items,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim, const fastllm::Data &scratch) {
+    NaiveBatchAttention(items, sink, heads, kvHeads, dim, valueDim, &scratch);
 }
 
 void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &key,
@@ -4182,6 +4379,22 @@ void FastllmCudaNaiveAttention(const fastllm::Data &query, const fastllm::Data &
                     auto *stagedValue = stagedKey + (size_t)rows * key.dims[2];
                     FastllmCudaNaiveReadCache({{&key, stagedKey, first, rows},
                                              {&value, stagedValue, first, rows}});
+#ifdef FASTLLM_NAIVE_SWA_FLASHINFER
+                    const int arch = FastllmCudaRuntimeArch();
+                    if ((arch == 100 || arch == 103) && queries >= 8192 && value.dims[2] == kvHeads * valueDim &&
+                        FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) {
+                        // The staged view starts at the oldest visible key. Its
+                        // right-aligned causal window is identical to the cache's.
+                        auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
+                            stagedKey, stagedValue, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                            (BF16 *)output.cudaData, queries, rows, heads, kvHeads, key.dims[2],
+                            cudaStreamPerThread, arch);
+                        AssertInFastLLM(status == cudaSuccess,
+                            std::string("Naive staged SWA prefill: ") + cudaGetErrorString(status));
+                        CheckLaunch();
+                        return;
+                    }
+#endif
                     readKey = FastllmNaiveKV(stagedKey);
                     readValue = FastllmNaiveKV(stagedValue);
                     readKeys = rows; readPast = pastLength - first;
@@ -4474,6 +4687,61 @@ int DecodeTopKBlocks() {
 }
 }
 
+namespace {
+__global__ void SplitRouterWeight(const float *weight, BF16 *terms, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float remaining = weight[i];
+    for (int term = 0; term < 3; ++term) {
+        const BF16 value = __float2bfloat16_rn(remaining);
+        terms[term * count + i] = value;
+        remaining -= __bfloat162float(value);
+    }
+}
+__global__ void SumRouterTerms(const float *products, float *out, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = (products[i] + products[count + i]) + products[2 * count + i];
+}
+}
+
+bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Data &weight,
+        fastllm::Data &scratch, fastllm::Data &output) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+    using namespace fastllm;
+    const int arch = FastllmCudaRuntimeArch();
+    if ((arch != 100 && arch != 103) || FastllmCudaGraphIsCapturingFast()) return false;
+    const int rows = RouterRows(input, weight, output);
+    if (rows < 128 || scratch.isFake || scratch.cudaDataBorrowed || !scratch.cudaData ||
+        scratch.dataDevice != CUDA || scratch.dataDeviceIds != input.dataDeviceIds) return false;
+    const int k = weight.dims[1], n = weight.dims[0];
+    if (int64_t(k) * n > INT_MAX / 3 || int64_t(rows) * n > INT_MAX / 3) return false;
+    const size_t termsBytes = size_t(3) * k * n * sizeof(BF16);
+    if (termsBytes + size_t(3) * rows * n * sizeof(float) > scratch.expansionBytes ||
+        scratch.cudaData == input.cudaData || scratch.cudaData == weight.cudaData ||
+        scratch.cudaData == output.cudaData) return false;
+    // FP32 products and FP32 accumulation can use the existing device handle.
+    auto handle = getFastllmCublasHandle();
+    if (!handle) return false;
+    auto *terms = (BF16 *)scratch.cudaData;
+    auto *products = (float *)((char *)scratch.cudaData + termsBytes);
+    // Transient decomposition keeps the original weight as the only resident copy.
+    SplitRouterWeight<<<(k * n + 255) / 256, 256>>>((const float *)weight.cudaData, terms, k * n);
+    const float alpha = 1.f, beta = 0.f;
+    auto status = cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k,
+        &alpha, terms, CUDA_R_16BF, k, int64_t(n) * k, input.cudaData, CUDA_R_16BF, k, 0,
+        &beta, products, CUDA_R_32F, n, int64_t(rows) * n, 3, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status == CUBLAS_STATUS_NOT_SUPPORTED) return false;
+    AssertInFastLLM(status == CUBLAS_STATUS_SUCCESS, "Blackwell router GEMM failed.");
+    auto dims = input.dims; dims.back() = n;
+    Output(output, FLOAT32, dims);
+    SumRouterTerms<<<(rows * n + 255) / 256, 256>>>(products, (float *)output.cudaData, rows * n);
+    CheckLaunch();
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
     const int rows = RouterRows(input, weight, output, fastllm::FLOAT32);
@@ -4493,10 +4761,19 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     dims.back() = weight.dims[0];
     Output(output, FLOAT32, dims);
     const int experts = weight.dims[0];
-    if (rows == 1)
+    const int arch = FastllmCudaRuntimeArch();
+    const bool blackwell = arch == 100 || arch == 103;
+    if (blackwell && rows >= 2 && ((uintptr_t(input.cudaData) | uintptr_t(weight.cudaData)) & 7) == 0) {
+        auto kernel = rows <= 4 ? RouterPairs4096<1> : RouterPairs4096<2>;
+        const int tile = rows <= 4 ? 1 : 2;
+        kernel<<<dim3(experts, (rows + tile - 1) / tile), 128>>>(
+            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
+            (float *)output.cudaData, rows, experts);
+    }
+    else if (rows == 1)
         RouterSigmoid4096<<<experts, 256>>>((const BF16 *)input.cudaData,
             (const float *)weight.cudaData, (float *)output.cudaData);
-    else if (rows >= 3 && FastllmCudaRuntimeArch() == 90 &&
+    else if (rows >= 3 && arch == 90 &&
              (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0)
         BatchRouterSigmoid4096Vector<<<dim3(experts, (rows + 3) / 4), 128>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
@@ -4639,8 +4916,30 @@ __global__ void PagedWriteFP4(uint8_t *pool, const int *pages, const BF16 *input
         input + (size_t)token * width + column, column, width);
 }
 }
-void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
-        const fastllm::Data *liveKeys) {
+// Write eight contiguous FP8 values per lane and reuse the converted bytes
+// when cold-window attention needs BF16 K/V in the original activation.
+template<bool Expand>
+__global__ void WriteFP8Rows(uint2 *cache, const int *pages, const uint4 *input,
+        uint4 *expanded, int first, int rows, int width, int pageLen) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(rows) * width) return;
+    int row = first + i / width;
+    size_t physical = pages ? size_t(pages[row / pageLen]) * pageLen + row % pageLen : row;
+    uint4 values = input[i];
+    unsigned short pairs[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j)
+        pairs[j] = __nv_cvt_bfloat16raw2_to_fp8x2(reinterpret_cast<__nv_bfloat162 *>(&values)[j],
+            __NV_SATFINITE, __NV_E4M3);
+    cache[physical * width + i % width] = make_uint2(
+        unsigned(pairs[0]) | (unsigned(pairs[1]) << 16),
+        unsigned(pairs[2]) | (unsigned(pairs[3]) << 16));
+    if constexpr (Expand)
+        expanded[i] = make_uint4(FastllmNaiveKVRow::ConvertPair(pairs[0]), FastllmNaiveKVRow::ConvertPair(pairs[1]),
+                                 FastllmNaiveKVRow::ConvertPair(pairs[2]), FastllmNaiveKVRow::ConvertPair(pairs[3]));
+}
+static void NaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
+        const fastllm::Data *liveKeys, void *expanded) {
     using namespace fastllm;
     AssertInFastLLM(FastllmNaiveAttentionKVType(cache.dataType) && input.dataType == BFLOAT16 &&
         cache.dataDevice == DataDevice::CUDA && input.dataDevice == DataDevice::CUDA &&
@@ -4673,12 +4972,34 @@ void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input
     }
     FastllmNaiveKVWriteRow destination{cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData,
                                      cache.dataType == FP8_E4M3};
+    if (destination.fp8 && !liveKeys && input.dims[1] >= 128 && input.dims[2] % 8 == 0 &&
+        (uintptr_t(destination.data) % 8) == 0 && (uintptr_t(input.cudaData) % 16) == 0) {
+        auto kernel = expanded ? WriteFP8Rows<true> : WriteFP8Rows<false>;
+        kernel<<<(input.Count(0) / 8 + 255) / 256, 256>>>((uint2 *)destination.data,
+            cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr, (const uint4 *)input.cudaData,
+            (uint4 *)expanded, start, input.dims[1], input.dims[2] / 8, cache.pageLen);
+        CheckLaunch();
+        return;
+    }
     PagedWrite<<<(input.Count(0) + 255) / 256, 256>>>(destination,
         cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr, (const BF16 *)input.cudaData,
         start, input.dims[1], input.dims[2], cache.pageLen,
         liveKeys ? (const int *)liveKeys->cudaData : nullptr,
         cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1]);
     CheckLaunch();
+    if (expanded) FastllmCudaNaiveReadCache({{&cache, expanded, start, input.dims[1]}});
+}
+
+void FastllmCudaNaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
+        const fastllm::Data *liveKeys) {
+    NaivePagedWrite(cache, input, start, liveKeys, nullptr);
+}
+
+void FastllmCudaNaiveWriteAndExpandFP8(fastllm::Data &cache, fastllm::Data &input, int start) {
+    fastllm::AssertInFastLLM(cache.dataType == fastllm::FP8_E4M3 && !cache.kvCacheFp8Indexer,
+                            "Expected an unscaled FP8 attention cache.");
+    NaivePagedWrite(cache, input, start, nullptr, input.cudaData);
+
 }
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
@@ -4753,6 +5074,14 @@ void FastllmCudaNaiveCommitSwaVerify(fastllm::Data &key, fastllm::Data &value,
     const int kept = std::min(past + count, kSwaWindow - 1);
     key.Resize({1, kept, key.dims[2]});
     value.Resize({1, kept, value.dims[2]});
+}
+
+void FastllmCudaNaiveCommitBoundSwa(const void *const *bindings, const int *accepted,
+        int rows, int layers, uint64_t slidingMask, int tableStride, int keyBytes, int valueBytes) {
+    const int kc = keyBytes / sizeof(uint4), vc = valueBytes / sizeof(uint4);
+    CommitBoundSwa<<<dim3((kc + vc + 63) / 64, rows, layers), 64, 0, cudaStreamPerThread>>>(
+        bindings, (const int2 *)accepted, slidingMask, tableStride, kc, vc);
+    CheckLaunch();
 }
 
 void FastllmCudaNaiveBatchCommitSwaVerify(const std::vector<FastllmNaiveCacheCommit> &caches) {
@@ -4860,8 +5189,8 @@ void FastllmCudaNaiveDecodeIndexer(const fastllm::Data &query,
 }
 
 #ifdef FASTLLM_NAIVE_BATCH_INDEXER
-static void LaunchBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descriptors,
-                                        int count, int capacity) {
+static void SelectBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descriptors,
+                                         int count, int capacity) {
     namespace batch = naive_indexer_batch;
     if (capacity > 16384) {
         const int blocks = std::min(naive_topk::kMaxBlocks, (capacity + 4095) / 4096);
@@ -4871,7 +5200,11 @@ static void LaunchBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descr
         }
         batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
     } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
-    batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
+}
+static void LaunchBatchDecodeIndexerTopK(const naive_indexer_batch::Batch &descriptors,
+                                         int count, int capacity) {
+    SelectBatchDecodeIndexerTopK(descriptors, count, capacity);
+    naive_indexer_batch::Sort<><<<count, naive_topk::kThreads>>>(descriptors);
 }
 static bool ScalarBatchDecodeIndexer(const fastllm::Data &query, const fastllm::Data &weights,
         const fastllm::Data &liveKeys, const std::vector<FastllmNaiveIndexerRow> &rows, bool fp8Query) {
@@ -4954,23 +5287,33 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     auto pagedShardCapacity = [&](int capacity) {
         return ((capacity + contextPageLen - 1) / contextPageLen) * (contextPageLen / contextRanks);
     };
-    bool hopper = FastllmCudaRuntimeArch() == 90;
+    const int arch = FastllmCudaRuntimeArch();
+    const bool blackwell = !cp && (arch == 100 || arch == 103);
     const auto cacheType = rows.front().key ? rows.front().key->dataType : BFLOAT16;
+    // Replicated decode scans live keys with a bounded score grid and split radix
+    // passes. Only their tile-rounded int offsets need headroom. CP also has a
+    // separate candidate exchange and retains its existing dispatch limit.
+    const int maxCapacity = cp ? naive_topk::kMaxKeys : INT_MAX / 2;
+    bool nativeScores = arch == 90 || (blackwell && rows.size() >= 8 &&
+        (cacheType == BFLOAT16 || cacheType == FP8_E4M3) &&
+        BulkKernelSupported(batch::HopperScores<false>, 0, 80));
     for (const auto &row : rows) {
         if (!row.key || !row.scratch || !row.indices || !FastllmNaiveKVType(row.key->dataType) ||
             row.key->dims.size() != 3 || row.key->dims[2] <
                 (contextPageLen && row.key->kvCacheFp8Indexer ? FastllmNaiveIndexerBytes / row.key->unitSize : dim) ||
             (contextPageLen && row.key->pageLen != contextPageLen / contextRanks) ||
-            row.capacity <= 0 || row.capacity > naive_topk::kMaxKeys ||
+            row.capacity <= 0 || row.capacity > maxCapacity ||
             row.sequence < 0 || row.sequence >= liveKeys.Count(0) ||
             (size_t)(row.sequence + 1) * heads * dim > query.Count(0) ||
             (size_t)(row.sequence + 1) * heads > weights.Count(0)) return false;
         if (direct && width < std::min(naive_topk::kTopK, pagedShardCapacity(row.capacity))) return false;
         // cp.async copies 16 bytes; FP8 therefore needs twice as many elements.
-        hopper = hopper && row.key->dataType == cacheType &&
+        // Above the former batch limit the single-row path used BF16 MMA on
+        // quantized keys. Keep its accumulation order, including TopK ties.
+        nativeScores = nativeScores && row.capacity <= naive_topk::kMaxKeys && row.key->dataType == cacheType &&
             row.key->kvCacheFp8Indexer == rows.front().key->kvCacheFp8Indexer &&
             row.key->dims[2] % (cacheType == FP8_E4M3 ? 16 : 8) == 0 &&
-            (uintptr_t)row.key->cudaData % 16 == 0;
+            (uintptr_t)FastllmNaiveKV(*row.key).base % 16 == 0;
     }
 
     auto prepareRow = [&](int index) {
@@ -4996,7 +5339,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
 #if CUDART_VERSION >= 12040
     // Only combine descriptor chunks for the validated large Hopper CP4
     // paged-FP8 layout. Small batches and other layouts keep their old path.
-    compactScores = hopper && cacheType == FP8_E4M3 && cp && contextRanks == 4 &&
+    compactScores = nativeScores && cacheType == FP8_E4M3 && cp && contextRanks == 4 &&
         contextPageLen == 128 && rows.size() > batch::BatchLimit &&
         rows.size() <= naive_indexer_compact::CompactLimit;
     for (const auto &row : rows)
@@ -5047,7 +5390,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     for (const auto &row : rows) localCapacity = std::max(localCapacity, row.capacity);
     if (contextPageLen) localCapacity = pagedShardCapacity(localCapacity);
     constexpr size_t localSortBytes = naive_indexer_sortpack::SortBytes<256, 5, true>();
-    const bool compactTopK = hopper && contextRanks == 4 && contextPageLen && rows.size() >= 128 &&
+    const bool compactTopK = nativeScores && contextRanks == 4 && contextPageLen && rows.size() >= 128 &&
         localCapacity > 16384 && localCapacity <= 65536 &&
         BulkKernelSupported(naive_indexer_wide_select::SelectWide<batch::LocalTopKBatch>, 0, 90) &&
         BulkKernelSupported(naive_indexer_sortpack::SortPack<256, 5, true, true, batch::LocalTopKBatch>,
@@ -5058,7 +5401,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
 
     std::vector<int> rowOrder;
     int pairedRows = 0;
-    if (!cp && hopper && cacheType == BFLOAT16 &&
+    if (!cp && arch == 90 && nativeScores && cacheType == BFLOAT16 &&
             !rows.front().key->kvCacheFp8Indexer && rows.size() >= 16) {
         std::vector<int> singles;
         rowOrder.reserve(rows.size());
@@ -5080,13 +5423,14 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         const bool pairChunk = first < pairedRows;
         int count = std::min(pairChunk ? (batch::BatchLimit / 2) * 2 : batch::BatchLimit,
             (pairChunk ? pairedRows : (int)rows.size()) - first);
+        if (blackwell) count = std::min(count, 128);
         int sharedQueries = 1;
 #if CUDART_VERSION >= 12040
         // Reuse one K tile across adjacent verification queries. Keep row
         // order intact for CP exchange; ragged groups and other layouts fall
         // back to the single-query kernel. Paged CP has a common local origin;
         // contiguous CP can change Begin() with each device length.
-        if (!compactScores && hopper && cacheType == FP8_E4M3 && rows.size() >= 16 &&
+        if (!compactScores && nativeScores && (cacheType == FP8_E4M3 || (blackwell && rows.front().key->kvCacheFp8Indexer)) && rows.size() >= 16 &&
                 (!cp || contextPageLen) && rowOrder.empty()) {
             for (int queries : {4, 2}) {
                 const int aligned = count / queries * queries;
@@ -5124,27 +5468,47 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
             auto pairedKernel = batch::HopperScores<false, false, 2>;
             bool paired = pairChunk && count >= 16;
             paired = paired && BulkKernelSupported(pairedKernel, 0, 90);
-            const int scoreBlocks = DecodeIndexerScoreBlocks(paired ? count / 2 : count / sharedQueries,
-                (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, hopper && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
+            // A long graph can have just one long live row. Give that row a
+            // full grid budget; short rows retire their unused tiles.
+            const int scoreRows = capacity > naive_topk::kMaxKeys ? 1 :
+                (paired ? count / 2 : count / sharedQueries);
+            const int scoreBlocks = DecodeIndexerScoreBlocks(scoreRows,
+                (capacity + naive_dsa_mma::kKeys - 1) / naive_dsa_mma::kKeys, blackwell && nativeScores ? 7 :
+                    nativeScores && fp8Keys && CUDART_VERSION >= 12040 ? 64 : 32);
             const dim3 grid(scoreBlocks, paired ? count / 2 : count / sharedQueries);
-            if (paired) {
-                pairedKernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
-            } else
-    #if CUDART_VERSION >= 12040
-            // Check the compiled PTX image as well as the runtime GPU: an SM80
-            // image JITed on Hopper must retain the original compatible path.
-            if (hopper && cacheType == FP8_E4M3 && rows.size() >= 16 &&
-                BulkKernelSupported(batch::HopperScoresSharedHead<>, 0, 90)) {
-                auto kernel = sharedQueries == 4 ? batch::HopperScoresSharedHead<4> :
-                    sharedQueries == 2 ? batch::HopperScoresSharedHead<2> : batch::HopperScoresSharedHead<>;
-                kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
-            } else
-    #endif
-            if (hopper) {
-                auto kernel = fp8Keys ? batch::HopperScores<true, (CUDART_VERSION >= 12040)> : batch::HopperScores<false>;
-                kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+            bool blackwellScores = false;
+#ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
+            if (blackwell && nativeScores && (sharedQueries == 1 || count >= 32)) {
+                naive_indexer_sm100::Row entries[naive_indexer_sm100::BatchLimit];
+                for (int i = 0; i < count; ++i) {
+                    const auto &r = descriptors.rows[i];
+                    entries[i] = {r.key, r.live, r.query, r.scale, r.scores, r.sequence, r.stride, r.cache};
+                }
+                blackwellScores = FastllmCudaNaiveIndexerSm100(entries, count, capacity,
+                    (const BF16 *)weights.cudaData, cudaStreamPerThread);
             }
-            else batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
+#endif
+            if (!blackwellScores) {
+                if (paired) {
+                    pairedKernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+                } else
+#if CUDART_VERSION >= 12040
+                // Check the compiled PTX image as well as the runtime GPU: an SM80
+                // image JITed on Hopper must retain the original compatible path.
+                if (nativeScores && (cacheType == FP8_E4M3 || (blackwell && fp8Keys)) && (rows.size() >= 16 || blackwell) &&
+                    BulkKernelSupported(batch::HopperScoresSharedHead<>, 0, 90)) {
+                    auto kernel = sharedQueries == 4 ? batch::HopperScoresSharedHead<4> :
+                        sharedQueries == 2 ? batch::HopperScoresSharedHead<2> : batch::HopperScoresSharedHead<>;
+                    kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+                } else
+#endif
+                if (nativeScores) {
+                    auto kernel = fp8Keys ? batch::HopperScores<true, (CUDART_VERSION >= 12040)> : batch::HopperScores<false>;
+                    kernel<<<grid, 128>>>((const BF16 *)weights.cudaData, descriptors);
+                } else {
+                    batch::Scores<<<grid, naive_dsa_mma::kThreads>>>((const BF16 *)weights.cudaData, descriptors);
+                }
+            }
         }
 #if CUDART_VERSION >= 12040
         if (compactTopK) {
@@ -5176,9 +5540,10 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         // Fuse exact threshold selection and stable sorting. Refining to 2048
         // candidates pays off for short contexts; longer rows keep 4096 slots.
         // CP layouts, long contexts and unsupported images retain their paths.
-        if (!cp && hopper && rows.size() >= 16 && capacity <= 16384) {
+        if (!cp && (blackwell || (nativeScores && rows.size() >= 16)) && capacity <= 16384) {
             namespace sortpack = naive_indexer_sortpack;
-            auto kernel = capacity <= 4096 ? sortpack::SelectSort<2048> : sortpack::SelectSort<4096>;
+            auto kernel = capacity <= 4096 ? sortpack::SelectSort<2048> :
+                blackwell ? sortpack::SelectSort<4096, true> : sortpack::SelectSort<4096>;
             const size_t bytes = capacity <= 4096 ? sortpack::SortBytes<256, 5, true, false, 2048>()
                                                   : sortpack::SortBytes<256, 5, true, false, 4096>();
             if (BulkKernelSupported(kernel, bytes, 90)) {
@@ -5189,27 +5554,22 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         }
         // Bound the single-CTA row work; retain the existing paths for
         // short rows, small batches, other CP layouts and architectures.
-        const bool wideSelect = cp && contextRanks == 4 && contextPageLen &&
+        const bool wideSelect = ((cp && contextRanks == 4 && contextPageLen && arch == 90) ||
+            (blackwell && nativeScores && sharedQueries > 1 && count >= 32)) &&
             rows.size() >= 16 && capacity > 16384 && capacity <= 65536 &&
-            FastllmCudaRuntimeArch() == 90 &&
             BulkKernelSupported(naive_indexer_wide_select::SelectWide<>, 0, 90);
         if (wideSelect) {
             naive_indexer_wide_select::SelectWide<<<count, 1024>>>(descriptors);
-        } else if (capacity > 16384) {
-            const int blocks = std::min(naive_topk::kMaxBlocks, (capacity + 4095) / 4096);
-            for (int shift = 24; shift >= 0; shift -= 8) {
-                batch::SplitHistogram<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors, shift);
-                batch::SplitThreshold<><<<count, naive_topk::kThreads>>>(descriptors, blocks, shift);
-            }
-            batch::SplitCompact<><<<dim3(blocks, count), naive_topk::kThreads>>>(descriptors);
-        } else batch::Select<><<<count, naive_topk::kThreads>>>(descriptors);
+        } else {
+            SelectBatchDecodeIndexerTopK(descriptors, count, capacity);
+        }
         if (direct) {
             batch::SortContextPairs<0><<<count, naive_topk::kThreads>>>(descriptors, pairs, width);
             first += count;
             continue;
         }
         bool packed = false;
-        if (cp && contextRanks == 4 && contextPageLen && hopper && rows.size() >= 16) {
+        if (cp && contextRanks == 4 && contextPageLen && nativeScores && rows.size() >= 16) {
             namespace sortpack = naive_indexer_sortpack;
             if (rows.size() >= 128) {
                 constexpr size_t bytes = sortpack::SortBytes<256, 5, true>();
@@ -5228,7 +5588,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         // Independent verification rows need only the sorted indices. Reuse
         // the stable cooperative sort without CP packing; unsupported images
         // and small batches keep the existing generic implementation.
-        if (!cp && hopper && rows.size() >= 16) {
+        if (!cp && nativeScores && rows.size() >= 16) {
             namespace sortpack = naive_indexer_sortpack;
             constexpr size_t bytes = sortpack::SortBytes<256, 5, true, false>();
             if (BulkKernelSupported(sortpack::SortPack<256, 5, true, false>, bytes, 90)) {
@@ -5524,7 +5884,6 @@ template <class Kernel> bool BulkKernelSupported(Kernel kernel, size_t shared, i
     }
     return found->second;
 }
-
 
 // Overlap the next packed FP8 tile load with current BF16 MMA. The kernel
 // retains the original QK/PV reduction order and global softmax tree.
@@ -5841,6 +6200,56 @@ bool FastllmCudaNaiveEncodeDSAMaps(void *host, const void *key, const void *valu
     CUtensorMap maps[2];
     if (!naive_attention_bulk::EncodeMaps(maps, key, value, capacity, keyStride)) return false;
     std::memcpy(host, maps, sizeof(maps));
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+#ifdef FASTLLM_NAIVE_BLACKWELL_DECODE
+    using namespace fastllm;
+    namespace bw = blackwell_decode;
+    const int arch = FastllmCudaRuntimeArch();
+    if ((arch != 100 && arch != 103) || rows.empty() || kvHeads <= 0 ||
+        heads != kvHeads * 16 || dim != 192 || valueDim != 128 || query.dataType != BFLOAT16)
+        return false;
+    for (const auto &row : rows) {
+        if (!row.fp8 || row.fp4 || !row.indices || row.selectedCount != 2048 ||
+            !row.key || !row.value || row.capacity < 0 || row.keyStride < kvHeads * dim ||
+            row.keyStride % 16 || ((uintptr_t(row.key) | uintptr_t(row.value)) & 15))
+            return false;
+    }
+    const auto *bias = sink.dims.empty() ? nullptr : static_cast<const float *>(sink.cudaData);
+    const int total = static_cast<int>(rows.size());
+    const bool split = total < 32;
+    auto kernel = split ? bw::Decode<true> : bw::Decode<false>;
+    if (!BulkKernelSupported(kernel, bw::SMEM_BYTES, 100)) return false;
+    Output(output, BFLOAT16, {1, total, heads * 128});
+    const int groups = total * kvHeads;
+    const int splits = split ? (groups <= 16 ? 16 : groups <= 32 ? 8 : 4) : 1;
+    float *parts = nullptr;
+    float2 *stats = nullptr;
+    if (split) {
+        Output(scratch.attentionPartial, FLOAT32, {total, heads, splits, 128});
+        Output(scratch.attentionScores, FLOAT32, {total, heads, splits, 2});
+        parts = static_cast<float *>(scratch.attentionPartial.cudaData);
+        stats = static_cast<float2 *>(scratch.attentionScores.cudaData);
+    }
+    for (int first = 0; first < total; first += naive_attention_bulk::BatchLimit) {
+        const int count = std::min(total - first, int(naive_attention_bulk::BatchLimit));
+        naive_attention_bulk::Batch batch{};
+        std::copy_n(rows.begin() + first, count, batch.rows);
+        auto *out = static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128;
+        kernel<<<dim3(count, kvHeads, splits), (bw::NCW + bw::NP) * 32, bw::SMEM_BYTES>>>(
+            static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, bias,
+            out, heads, parts, stats);
+        // All split rows fit a single descriptor batch.
+        if (split) bw::Merge<<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, splits);
+    }
+    CheckLaunch();
     return true;
 #else
     return false;
@@ -6462,16 +6871,16 @@ __global__ void LogitsTopKFinish(const float2 *partial, float2 *output, int bloc
     }
 }
 struct DraftHiddenInputs { const BF16 *ptr[32]; };
-__global__ void DraftConcat(DraftHiddenInputs inputs, BF16 *output,
-                            int rows, int width, int count) {
-    size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t total = (size_t)rows * width * count;
-    if (index < total) {
-        int column = index % width;
-        int layer = (index / width) % count;
-        int row = index / ((size_t)width * count);
-        output[index] = inputs.ptr[layer][(size_t)row * width + column];
-    }
+struct DraftRowIndices { int row[256]; };
+template <typename Unit>
+__global__ void DraftConcatRows(DraftHiddenInputs inputs, DraftRowIndices indices,
+        Unit *output, int width, int layers, int first) {
+    const size_t column = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (column >= width) return;
+    const int row = blockIdx.z, layer = blockIdx.y;
+    const auto *source = reinterpret_cast<const Unit *>(inputs.ptr[layer]);
+    output[(size_t(row) * layers + layer) * width + column] =
+        source[size_t(first < 0 ? indices.row[row] : first + row) * width + column];
 }
 }
 
@@ -6546,27 +6955,66 @@ void FastllmCudaNaiveDraftSamplingLogits(const fastllm::Data &base,
         (const uint32_t *)mask.cudaData, (float *)output.cudaData, vocab);
     CheckLaunch();
 }
-bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
-    int rows, fastllm::Data &output) {
-    if (inputs.empty() || inputs.size() > 32 || rows <= 0) return false;
+static bool ConcatDraftRows(const std::vector<const fastllm::Data *> &inputs,
+    int rows, const std::vector<int> &selected, fastllm::Data &output, const std::vector<int> *peerDevices) {
+    if (inputs.empty() || inputs.size() > 32 || !inputs.front() || rows <= 0 || selected.size() > INT_MAX) return false;
     int width = inputs[0]->dims.empty() ? 0 : inputs[0]->dims.back();
-    if (width <= 0) return false;
-    const std::vector<int> deviceIds{FastllmCudaGetDevice()};
+    if (width <= 0 || width > INT_MAX / int(inputs.size())) return false;
+    const int device = FastllmCudaGetDevice();
+    if (peerDevices && peerDevices->size() != inputs.size()) return false;
     DraftHiddenInputs pointers{};
+    bool vectorized = width % 8 == 0;
+    for (int row : selected) if (row < 0 || row >= rows) return false;
     for (size_t i = 0; i < inputs.size(); ++i) {
+        if (!inputs[i]) return false;
         const auto &x = *inputs[i];
         if (x.dataType != fastllm::BFLOAT16 || x.dims.size() != 3 || x.dims[0] != 1 ||
             x.dims[1] < rows || x.dims[2] != width || x.dataDevice != fastllm::DataDevice::CUDA ||
-            x.dataDeviceIds != deviceIds || !x.cudaData || x.strides.size() != 3 ||
+            x.dataDeviceIds.size() != 1 || x.dataDeviceIds.front() != (peerDevices ? (*peerDevices)[i] : device) ||
+            !x.cudaData || x.strides.size() != 3 ||
             x.strides[1] != width || x.strides[2] != 1) return false;
+        vectorized &= reinterpret_cast<uintptr_t>(x.cudaData) % 16 == 0;
         pointers.ptr[i] = (const BF16 *)x.cudaData;
     }
-    Output(output, fastllm::BFLOAT16, {1, rows, width * (int)inputs.size()});
-    size_t total = (size_t)rows * width * inputs.size();
-    DraftConcat<<<(total + 255) / 256, 256>>>(pointers, (BF16 *)output.cudaData,
-        rows, width, inputs.size());
-    CheckLaunch();
+    const int count = selected.empty() ? rows : static_cast<int>(selected.size());
+    const int columnsOut = width * int(inputs.size());
+    if (peerDevices) {
+        if (!DraftDense(output, fastllm::BFLOAT16, device) || output.dims.size() != 3 ||
+            output.dims[0] != 1 || output.dims[1] != count || output.dims[2] != columnsOut) return false;
+    } else Output(output, fastllm::BFLOAT16, {1, count, columnsOut});
+    vectorized &= reinterpret_cast<uintptr_t>(output.cudaData) % 16 == 0;
+    const int columns = vectorized ? width / 8 : width;
+    for (int first = 0; first < count;) {
+        DraftRowIndices indices{};
+        const int n = std::min(count - first, selected.empty() ? 65535 : int(sizeof(indices.row) / sizeof(int)));
+        if (!selected.empty()) std::copy_n(selected.data() + first, n, indices.row);
+        auto *dst = static_cast<BF16 *>(output.cudaData) + size_t(first) * width * inputs.size();
+        dim3 grid((unsigned(columns) + 255) / 256, inputs.size(), n);
+        if (vectorized)
+            DraftConcatRows<<<grid, 256, 0, cudaStreamPerThread>>>(pointers, indices,
+                reinterpret_cast<uint4 *>(dst), columns, int(inputs.size()), selected.empty() ? first : -1);
+        else
+            DraftConcatRows<<<grid, 256, 0, cudaStreamPerThread>>>(pointers, indices,
+                dst, columns, int(inputs.size()), selected.empty() ? first : -1);
+        CheckLaunch();
+        first += n;
+    }
     return true;
+}
+
+bool FastllmCudaNaiveDraftConcatRows(const std::vector<const fastllm::Data *> &inputs,
+        int rows, const std::vector<int> &selected, fastllm::Data &output) {
+    return ConcatDraftRows(inputs, rows, selected, output, nullptr);
+}
+
+bool FastllmCudaNaiveGatherDraftLogits(const std::vector<const fastllm::Data *> &shards,
+        const std::vector<int> &devices, int rows, const std::vector<int> &selected, fastllm::Data &output) {
+    return ConcatDraftRows(shards, rows, selected, output, &devices);
+}
+
+bool FastllmCudaNaiveDraftConcat(const std::vector<const fastllm::Data *> &inputs,
+        int rows, fastllm::Data &output) {
+    return FastllmCudaNaiveDraftConcatRows(inputs, rows, {}, output);
 }
 
 void FastllmCudaNaiveDraftInput(const fastllm::Data &id, const fastllm::Data &embedding,

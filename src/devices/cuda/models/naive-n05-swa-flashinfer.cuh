@@ -51,6 +51,8 @@ inline cudaError_t Run(const BF16 *q, const BF16 *k, const BF16 *v, const float 
     p.v_stride_n = kvHeads * 128;
     p.v_stride_h = 128;
     p.sink = sink;
+    if ((arch == 100 || arch == 103) && queries >= 1024 && heads == kvHeads * 8)
+        return queries >= 8192 ? RunWindow<128>(p, stream) : RunWindow<64>(p, stream);
     if ((arch == 90 || arch == 120) && queries >= 32 && heads == kvHeads * 8)
         return arch == 90 && queries >= 8192 ? RunWindow<128>(p, stream) : RunWindow<64>(p, stream);
     // A null scratch pointer disables split-KV so the sink is counted once.

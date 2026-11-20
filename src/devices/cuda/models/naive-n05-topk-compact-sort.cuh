@@ -2,25 +2,25 @@
 #include "naive-n05-topk.cuh"
 
 namespace naive_topk {
-// Hopper benefits from fewer radix passes; retain CUB's original setting
-// on other architectures where the larger digit's resource cost is unmeasured.
+// The default kernel chooses its radix on the device. Keep its entry-point
+// signature identical across architectures in a multi-architecture fatbin.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 900
 constexpr int kCompactTopKRadixBits = 6;
 #else
 constexpr int kCompactTopKRadixBits = 4;
 #endif
-template<int Items, int Threads = 256>
+template<int Items, int Threads = 256, int RadixBits = kCompactTopKRadixBits>
 using CompactTopKSort = cub::BlockRadixSort<unsigned long long, Threads, Items,
-    cub::NullType, kCompactTopKRadixBits>;
+    cub::NullType, RadixBits>;
 
 // Keep all score bits but compress the inverse index to its actual width.
 // Skipping constant index bits reduces radix passes without changing score
 // order or lower-index tie breaking, including signed zero and NaNs.
-template<int Items, bool RawScores = false, int Threads = 256>
+template<int Items, bool RawScores = false, int Threads = 256, int RadixBits = kCompactTopKRadixBits>
 __device__ void SortTopKCompactRow(const unsigned long long *input, const int *ends,
         int *indices, int queries, int stride, int topK, int keyCount,
-        typename CompactTopKSort<Items, Threads>::TempStorage &storage, int outputRow = -1) {
-    using Sort = CompactTopKSort<Items, Threads>;
+        typename CompactTopKSort<Items, Threads, RadixBits>::TempStorage &storage, int outputRow = -1) {
+    using Sort = CompactTopKSort<Items, Threads, RadixBits>;
     const int row = blockIdx.x, count = ends[queries + row] - row * stride;
     const int indexBits = 32 - __clz((unsigned)max(1, keyCount - 1));
     const unsigned mask = 0xffffffffu >> (32 - indexBits);
@@ -71,23 +71,24 @@ __device__ void SortTopKCompactRow(const unsigned long long *input, const int *e
 
 // Candidate selection still has 4096 slots. Sort only the populated range;
 // shrinking selection itself would add radix passes on long or tied rows.
-template<bool RawScores = false, int Threads = 256>
+template<bool RawScores = false, int Threads = 256, bool WideRadix = false>
 __global__ void SortTopKCompact(const unsigned long long *input, const int *ends,
         int *indices, int queries, int stride, int topK, int keyCount) {
     static_assert(Threads == 128 || Threads == 256, "Unsupported compact sort geometry");
+    constexpr int RadixBits = WideRadix ? 6 : kCompactTopKRadixBits;
     union Storage {
-        typename CompactTopKSort<2048 / Threads, Threads>::TempStorage small;
-        typename CompactTopKSort<3072 / Threads, Threads>::TempStorage medium;
-        typename CompactTopKSort<4096 / Threads, Threads>::TempStorage large;
+        typename CompactTopKSort<2048 / Threads, Threads, RadixBits>::TempStorage small;
+        typename CompactTopKSort<3072 / Threads, Threads, RadixBits>::TempStorage medium;
+        typename CompactTopKSort<4096 / Threads, Threads, RadixBits>::TempStorage large;
     };
     __shared__ Storage storage;
     const int count = ends[queries + blockIdx.x] - blockIdx.x * stride;
     if (count <= 2048)
-        SortTopKCompactRow<2048 / Threads, RawScores, Threads>(input, ends, indices, queries, stride, topK, keyCount, storage.small);
+        SortTopKCompactRow<2048 / Threads, RawScores, Threads, RadixBits>(input, ends, indices, queries, stride, topK, keyCount, storage.small);
     else if (count <= 3072)
-        SortTopKCompactRow<3072 / Threads, RawScores, Threads>(input, ends, indices, queries, stride, topK, keyCount, storage.medium);
+        SortTopKCompactRow<3072 / Threads, RawScores, Threads, RadixBits>(input, ends, indices, queries, stride, topK, keyCount, storage.medium);
     else
-        SortTopKCompactRow<4096 / Threads, RawScores, Threads>(input, ends, indices, queries, stride, topK, keyCount, storage.large);
+        SortTopKCompactRow<4096 / Threads, RawScores, Threads, RadixBits>(input, ends, indices, queries, stride, topK, keyCount, storage.large);
 }
 
 } // namespace naive_topk

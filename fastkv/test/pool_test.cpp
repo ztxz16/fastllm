@@ -137,6 +137,75 @@ int main() {
               "pool shutdown invalidated a packed lease");
         reusedPacked.clear();
 
+        // Mixed prompt lengths on two owners reuse physical arenas. Hold a
+        // slice across releases, then exercise an export above a fair share.
+        {
+            size_t allocations = 0;
+            BufferPool ranges(64 * 4096, {}, [&](size_t bytes, int device) {
+                ++allocations;
+                auto storage = std::shared_ptr<uint8_t>(new uint8_t[bytes], std::default_delete<uint8_t[]>());
+                return Buffer::Borrow(storage.get(), bytes, MemoryKind::Cuda, device, storage);
+            });
+            ranges.Preallocate({0, 1}, true);
+            Check(allocations == 2, "export arenas were not warmed");
+            for (int round = 0; round < 16; ++round) {
+                const size_t n = (15 + round % 6) * 4096;
+                auto first = ranges.Acquire(n, 0);
+                auto last = ranges.Acquire(4 * 4096, 0);
+                Check(first.Preallocated() && last.Preallocated() && first.Id() == last.Id() && first.Offset() + first.Size() <= last.Offset(),
+                      "simultaneous exports overlapped or lost registration reuse");
+                auto other = ranges.Acquire(24 * 4096, 1);
+                auto pinned = first.Slice(15, 1);
+                *static_cast<uint8_t *>(pinned.MutableData()) = 0xa7;
+                first = {};
+                bool busy = false;
+                try { ranges.Acquire(30 * 4096, 0); }
+                catch (const CapacityBusy &) { busy = true; }
+                Check(busy && *static_cast<const uint8_t *>(pinned.Data()) == 0xa7,
+                      "active export range was not protected");
+            }
+            Check(allocations == 2, "variable exports churned physical memory");
+            for (int round = 0; round < 24; ++round) {
+                const int device = round % 2;
+                const size_t sizes[] = {17 * 4096, 12 * 4096, size_t(9 + round % 6) * 4096};
+                BufferPool::PackedLayout layout({{device, sizes[0]}, {device, sizes[1]}, {device, sizes[2]}});
+                auto buffers = ranges.AcquirePeerPackedLayout(layout);
+                Check(buffers[0].Device() == device && buffers[2].Device() != device &&
+                      buffers[0].Id() == buffers[1].Id(), "oversized message did not borrow a peer");
+                for (int i = 0; i < 3; ++i) {
+                    Check(buffers[i].Preallocated() && buffers[i].Size() == sizes[i], "peer tensor lost its backing");
+                    std::memset(buffers[i].MutableData(), round+i, sizes[i]);
+                }
+                bool busy = false;
+                try { ranges.AcquirePeerPackedLayout(layout); } catch (const CapacityBusy &) { busy = true; }
+                Check(busy && allocations == 2, "oversize contention evicted a warm or live GPU slab");
+                for (int i = 0; i < 3; ++i)
+                    Check(static_cast<const uint8_t *>(buffers[i].Data())[sizes[i]-1] == round+i,
+                          "overlapping peer leases overwrote a live tensor");
+            }
+            BufferPool::PackedLayout indivisible({{1, 48 * 4096}});
+            auto big = std::move(ranges.AcquirePeerPackedLayout(indivisible).front());
+            Check(!big.Preallocated() && big.Size() == 48 * 4096, "fair share incorrectly capped a long prompt");
+            big = {};
+            for (int round = 0; round < 4; ++round) {
+                auto max = ranges.Acquire(64 * 4096, round % 2);
+                Check(max.Size() == 64 * 4096, "could not rebalance the entire idle export budget");
+            }
+            auto restored = ranges.Acquire(4096, 0);
+            Check(restored.Preallocated(), "rebuilt standard export arena lost direct registration");
+        }
+
+        {
+            BufferPool tight(64 * 4096, {}, [](size_t bytes, int) {
+                if (bytes > 16 * 4096) throw CapacityBusy("simulated initial memory pressure");
+                return Buffer::Allocate(bytes);
+            });
+            tight.Preallocate({-1});
+            auto a = tight.Acquire(4096, -1);
+            auto b = tight.Acquire(8192, -1);
+            Check(a.Id() == b.Id(), "smaller preallocation did not recover from initial pressure");
+        }
+
         // Retiring an MR may block. An independent cached allocation must
         // remain usable, and physical capacity stays charged until retirement.
         BufferPool retiring(16384);

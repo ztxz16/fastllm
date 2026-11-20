@@ -1,6 +1,6 @@
 #include "fastllm.h"
 #include "../../src/models/naive_n05_indexer_tp.h"
-#include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "utils/utils.h"
 #include <cuda_runtime_api.h>
 #include <cuda_fp8.h>
@@ -257,11 +257,11 @@ static void TestIndexerRaggedShards() {
     }
 }
 
-// Compare the scratch-backed FP8 expansion with direct FP8 attention exactly.
+// Compare scratch-backed FP8 expansion with the direct attention path.
 // Insufficient workspace must retain the same result without resizing storage.
 static void TestSwaPrefillScratch() {
     for (auto shape : {std::vector<int>{1025, 127, 16}, {4096, 65536, 64},
-                       {1025, 64, 16}, {4096, 0, 64}}) {
+                       {1025, 64, 16}, {4096, 0, 64}, {8193, 193, 16}}) {
         const int rows=shape[0], past=shape[1], heads=shape[2], kvHeads=heads/8, keys=past+rows;
         const int keyStride=kvHeads*192+16, valueStride=kvHeads*128;
         Data q(BFLOAT16), key(FP8_E4M3), value(FP8_E4M3), sink(FLOAT32), indices(INT32), reference, actual;
@@ -289,7 +289,22 @@ static void TestSwaPrefillScratch() {
             for (bool full : {true,false}) {
                 scratch.Resize({(int)(full?elements:elements-1)});
                 FastllmCudaNaiveAttention(q,key,value,indices,sink,heads,kvHeads,192,128,past,128,actual,true,&scratch);
-                Require(Read<uint16_t>(actual)==expected,"SWA prefill scratch changed BF16 output bits");
+                const auto got = Read<uint16_t>(actual);
+                if (rows >= 8192 && full) {
+                    double norm = 0, error = 0, maxAbs = 0;
+                    for (size_t i = 0; i < got.size(); ++i) {
+                        const double value = FromBits(expected[i]), delta = FromBits(got[i]) - value;
+                        Require(std::isfinite(delta), "nonfinite staged SWA output");
+                        norm += value * value;
+                        error += delta * delta;
+                        maxAbs = std::max(maxAbs, std::abs(delta));
+                    }
+                    double l2 = std::sqrt(error / std::max(norm, 1e-30));
+                    std::printf("Long staged SWA: relL2 %.6f maxAbs %.6f\n", l2, maxAbs);
+                    Require(l2 < .008 && maxAbs < .02, "long staged SWA exceeded BF16 error budget");
+                } else {
+                    Require(got == expected, "SWA prefill scratch changed BF16 output bits");
+                }
                 Require(scratch.cudaData==pointer && scratch.Count(0)==(full?elements:elements-1),"SWA scratch was resized");
                 ++checks;
             }
@@ -389,11 +404,245 @@ static void TestLocalPrefillBatch() {
     }
 }
 
+// Exercise the Indexer contract separately from arbitrary index lists. Tail
+// rows, empty/future selections, and shuffled KV pages must survive packing.
+static void TestBlackwellIndexerAttention() {
+    for (int keys : {1181, 2305, 32768, 65536, 65543, 131072}) {
+        const bool paged = keys != 1181 && keys != 32768;
+        const int rows = keys > 2305 ? 149 : (paged ? 2051 : 149);
+        const int kvHeads = paged ? 2 : 1, heads = 16 * kvHeads, topK = keys > 2305 ? 2048 : 512, pageLen = 64;
+        Data query(BFLOAT16), key(BFLOAT16), value(BFLOAT16), indices(INT32), sink, actual, reference;
+        Upload(query, {1, rows, heads * 192}, 31);
+        Data kTable(INT32), vTable(INT32);
+        PagedCacheManager kPool, vPool;
+        auto fillCache = [&](Data &cache, Data &table, PagedCacheManager &pool, int width, int seed) {
+            if (!paged) {
+                Upload(cache, {1, keys, width}, seed);
+                return;
+            }
+            int pages = (keys + pageLen - 1) / pageLen;
+            pool.dataType = FP8_E4M3;
+            pool.UpdateUnitSize();
+            pool.pageLen = pageLen;
+            pool.Resize({pages, pageLen, 1, width});
+            pool.Allocate();
+            unsigned x = seed;
+            for (size_t i = 0; i < pool.Count(0); ++i) {
+                x = x * 1664525u + 1013904223u;
+                pool.cpuData[i] = __nv_fp8_e4m3((int(x >> 16) - 32768) / 32768.f).__x;
+            }
+            pool.ToDevice(DataDevice::CUDA, {0}, true);
+            pool.SetMaxPages(pages);
+            table.Resize({pages});
+            table.Allocate();
+            for (int i = 0; i < pages; ++i) ((int *)table.cpuData)[i] = (pages - 1 - i + seed) % pages;
+            table.ToDevice(DataDevice::CUDA, {0}, true);
+            cache.FakeFrom(table, 0);
+            cache.dataType = FP8_E4M3;
+            cache.UpdateUnitSize();
+            cache.Resize({1, keys, width});
+            cache.isPagedKVCache = true;
+            cache.pagedKVCacheData = &pool;
+            cache.pageLen = pageLen;
+        };
+        fillCache(key, kTable, kPool, kvHeads * 192 + 128, 71);
+        fillCache(value, vTable, vPool, kvHeads * 128, 113);
+        indices.Resize({rows, topK});
+        indices.Allocate();
+        for (int r = 0; r < rows; ++r) for (int j = 0; j < topK; ++j) {
+            // Mix shared and dispersed selections in one FMHA launch, including
+            // a partial last group and a causal span crossing the bitmap capacity.
+            int pattern = keys >= 32768 && (r / 16) % 2 ? (r / 16) * 16 : r;
+            int k = (j * 97 + pattern * 37) % keys;
+            int id = k;
+            if (r % 101 == 0) id = -1;  // Empty selection.
+            else if (r % 11 == 0) id = j == 0 ? keys - rows + r : -1;
+            else if (r % 13 == 0) id = k > 511 ? k : -1;
+            else if (j % 37 == 0) id = -1;
+            else if (j % 31 == 0) id = keys;  // Out of range.
+            ((int *)indices.cpuData)[size_t(r) * topK + j] = id;
+        }
+        indices.ToDevice(DataDevice::CUDA, {0}, true);
+        FastllmNaivePrefillAttentionItem item{&query, &key, &value, &indices, &actual, keys - rows};
+        FastllmCudaNaiveAttention(query, key, value, indices, sink, heads, kvHeads,
+            192, 128, item.past, 0, reference);
+        // Use a bounded view inside a larger allocation to exercise chunking
+        // and catch writes beyond the logical loan.
+        constexpr int guard = 256;
+        // Exercise full staging, head-striped staging and the cache reader.
+        const int bytes = keys == 32768 ? 100 << 20 : (keys == 65536 || keys == 65543) ? 52 << 20 : 12 << 20;
+        Data storage(BFLOAT16, {(bytes + 2 * guard) / 2}), scratch(BFLOAT16, {bytes / 2});
+        storage.ToDevice(DataDevice::CUDA, {0}, false);
+        storage.Allocate(false);
+        Require(cudaMemset(storage.cudaData, 0xa5, bytes + 2 * guard) == cudaSuccess, "scratch guard setup");
+        scratch.FakeFrom(storage, guard);
+        if (FastllmCudaHasBlackwellIndexerAttention()) {
+            Data tiny(BFLOAT16, {32});
+            tiny.FakeFrom(storage, guard);
+            Require(!FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, tiny),
+                    "insufficient scratch must fall back");
+            Require(!FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, query),
+                    "overlapping scratch must fall back");
+            Require(FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, scratch),
+                    "supported Blackwell prefill did not use the fused kernel");
+        } else {
+            FastllmCudaNaiveBatchIndexerAttention({item}, sink, heads, kvHeads, 192, 128, scratch);
+        }
+        auto guards = Read<uint16_t>(storage);
+        for (int i = 0; i < guard / 2; ++i)
+            Require(guards[i] == 0xa5a5 && guards[(bytes + guard) / 2 + i] == 0xa5a5, "DSA scratch overrun");
+        auto got = Read<uint16_t>(actual), expected = Read<uint16_t>(reference);
+        double error = 0, norm = 0, maxAbs = 0;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            double a = FromBits(got[i]), b = FromBits(expected[i]);
+            Require(std::isfinite(a), "Indexer attention produced a nonfinite value");
+            if (i / (heads * 128) % 101 == 0) Require(a == 0, "nonzero empty TopK row");
+            error += (a - b) * (a - b);
+            norm += b * b;
+            maxAbs = std::max(maxAbs, std::abs(a - b));
+        }
+        double l2 = std::sqrt(error / std::max(norm, 1e-30));
+        std::printf("Indexer prefill %s: relL2 %.6f, maxAbs %.6f\n", paged ? "paged FP8" : "BF16", l2, maxAbs);
+        Require(l2 < .01 && maxAbs < .01, "Indexer attention exceeds BF16 error budget");
+        ++checks;
+    }
+}
+
+static void TestPackedPrefillRope() {
+    constexpr int rows = 1025, heads = 16, kvHeads = 2;
+    constexpr int widths[] = {heads * 192, kvHeads * 192, kvHeads * 128};
+    constexpr int stride = widths[0] + widths[1] + widths[2];
+    Data packed(BFLOAT16), positions(FLOAT32);
+    Upload(packed, {1, rows, stride}, 43); Upload(positions, {rows}, 53);
+    Data actual[3], expected[3];
+    int offset = 0;
+    for (int j = 0; j < 3; ++j) {
+        for (Data *d : {actual + j, expected + j}) {
+            d->dataType = BFLOAT16; d->UpdateUnitSize(); d->Resize({1, rows, widths[j]});
+            d->ToDevice(DataDevice::CUDA, {0}, false); d->Allocate(false);
+        }
+        Require(cudaMemcpy2DAsync(expected[j].cudaData, widths[j] * 2,
+            (const uint16_t *)packed.cudaData + offset, stride * 2, widths[j] * 2, rows,
+            cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess, "unpack RoPE reference");
+        offset += widths[j];
+    }
+    FastllmCudaNaiveRopeQKScaleV(expected[0], expected[1], expected[2], positions,
+        heads, kvHeads, 192, 128, 64, 300000.f, 1.543f);
+    FastllmCudaNaiveRopeQKScaleV(actual[0], actual[1], actual[2], positions,
+        heads, kvHeads, 192, 128, 64, 300000.f, 1.543f, &packed);
+    for (int j = 0; j < 3; ++j)
+        Require(Read<uint16_t>(actual[j]) == Read<uint16_t>(expected[j]), "packed RoPE changed BF16 output bits");
+    ++checks;
+}
+
+static void TestColdWindowCacheWrite() {
+    constexpr int rows = 1025, heads = 16, kvHeads = 2, past = 7;
+    Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), key(FP8_E4M3), value(FP8_E4M3);
+    Data selected, sink(FLOAT32), actual, expected;
+    Upload(q, {1, rows, heads * 192}, 67);
+    Upload(sink, {heads}, 47);
+    auto write = [&](Data &cache, Data &input, int width, int seed) {
+        Upload(input, {1, rows, width}, seed);
+        auto original = Read<uint16_t>(input);
+        cache.Resize({1, rows + past, width});
+        cache.ToDevice(DataDevice::CUDA, {0}, false); cache.Allocate(false);
+        Require(cudaMemset(cache.cudaData, 0, cache.GetBytes()) == cudaSuccess, "FP8 cache initialization");
+        FastllmCudaNaiveWriteAndExpandFP8(cache, input, past);
+        auto stored = Read<unsigned char>(cache);
+        auto expanded = Read<uint16_t>(input);
+        for (size_t i = 0; i < original.size(); ++i) {
+            __nv_fp8_e4m3 fp8(FromBits(original[i]));
+            Require(stored[size_t(past) * width + i] == fp8.__x, "FP8 cache write changed bytes");
+            Require(expanded[i] == Float32ToBFloat16RNEBits(float(fp8)), "FP8 expansion changed values");
+        }
+        ++checks;
+    };
+    write(key, k, kvHeads * 192, 73);
+    write(value, v, kvHeads * 128, 79);
+    // Skip the prefix used to exercise the nonzero cache write offset.
+    Data kd(FP8_E4M3, k.dims), vd(FP8_E4M3, v.dims);
+    kd.FakeFrom(key, past * kvHeads * 192); vd.FakeFrom(value, past * kvHeads * 128);
+    FastllmCudaNaiveAttention(q, kd, vd, selected, sink, heads, kvHeads, 192, 128, 0, 128, expected);
+    FastllmCudaNaiveAttention(q, k, v, selected, sink, heads, kvHeads, 192, 128, 0, 128, actual);
+    auto a = Read<uint16_t>(actual), b = Read<uint16_t>(expected);
+    double error = 0, magnitude = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        double delta = FromBits(a[i]) - FromBits(b[i]);
+        error += delta * delta; magnitude += double(FromBits(b[i])) * FromBits(b[i]);
+    }
+    double l2 = std::sqrt(error / magnitude);
+    std::printf("Cold SWA vs FP8 cache attention: relL2 %.7f\n", l2);
+    Require(l2 < .008, "Cold SWA exceeds BF16 error budget");
+    ++checks;
+}
+
+static void TestPairedPrefillAttention() {
+    if (!FastllmCudaHasBlackwellIndexerAttention()) return;
+    constexpr int rows = 257, keys = 2017, keep = 512, heads = 16, past = keys - rows;
+    Data iq(BFLOAT16), weights(BFLOAT16), ik(BFLOAT16), q(BFLOAT16), k(BFLOAT16), v(BFLOAT16);
+    Data ordered(INT32), privateIds(INT32, {rows, keep}), sink, expected, actual;
+    Upload(iq, {1, rows, 2048}, 43); Upload(weights, {1, rows, 16}, 53); Upload(ik, {1, keys, 128}, 59);
+    Upload(q, {1, rows, heads * 192}, 67); Upload(k, {1, keys, 192}, 71); Upload(v, {1, keys, 128}, 73);
+    privateIds.ToDevice(DataDevice::CUDA, {0}, false); privateIds.Allocate(false);
+    Data loan(FLOAT32, {4 * 1024 * 1024});
+    loan.ToDevice(DataDevice::CUDA, {0}, false); loan.Allocate(false);
+    for (bool tied : {false, true}) {
+        if (tied) Require(cudaMemset(weights.cudaData, 0, weights.GetBytes()) == cudaSuccess, "zero Indexer weights");
+        FastllmCudaNaiveIndexer(iq, weights, ik, 16, 128, past, keep, true, ordered);
+        FastllmNaivePrefillAttentionItem reference{&q, &k, &v, &ordered, &expected, past};
+        Require(FastllmCudaTryNaiveIndexerAttention(reference, sink, heads, 1, 192, 128, loan),
+                "ordered Blackwell attention declined reference");
+        FastllmNaivePrefillIndexerItem index{&iq, &weights, &ik, &privateIds, past};
+        FastllmNaivePrefillAttentionItem attention{&q, &k, &v, &privateIds, &actual, past};
+        FastllmCudaNaivePrefillIndexedAttention(index, attention, sink, 16, 128, keep, true,
+            false, heads, 1, 192, 128, &loan, loan);
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "score bitmap changed ordered TopK attention");
+        ++checks;
+    }
+}
+
+static void TestBlackwellLocalRouter() {
+    if (!FastllmCudaHasBlackwellIndexerAttention()) return;
+    constexpr int rows = 257, channels = 4096, experts = 64, top = 8;
+    Data x(BFLOAT16), w(FLOAT32), out, scratch(FLOAT32, {rows, channels});
+    Upload(x, {rows, channels}, 71);
+    Upload(w, {experts, channels}, 113);
+    scratch.ToDevice(DataDevice::CUDA, {0}, false); scratch.Allocate(false);
+    Require(FastllmCudaNaivePrefillRouter(x, w, scratch, out), "compact router did not dispatch");
+    auto a = Read<uint16_t>(x);
+    auto b = Read<float>(w), actual = Read<float>(out);
+    double error = 0, magnitude = 0;
+    for (int i = 0; i < rows; ++i) {
+        std::vector<double> ref(experts);
+        std::vector<int> expected(experts), routed(experts);
+        for (int e = 0; e < experts; ++e) {
+            for (int k = 0; k < channels; ++k)
+                ref[e] += double(FromBits(a[i * channels + k])) * b[e * channels + k];
+            expected[e] = routed[e] = e;
+            double diff = actual[i * experts + e] - ref[e];
+            error += diff * diff; magnitude += ref[e] * ref[e];
+        }
+        std::partial_sort(expected.begin(), expected.begin()+top, expected.end(), [&](int u,int v){return ref[u]>ref[v];});
+        std::partial_sort(routed.begin(), routed.begin()+top, routed.end(), [&](int u,int v){return actual[i*experts+u]>actual[i*experts+v];});
+        std::sort(expected.begin(),expected.begin()+top); std::sort(routed.begin(),routed.begin()+top);
+        Require(std::equal(expected.begin(),expected.begin()+top,routed.begin()), "router expert set mismatch");
+    }
+    double l2 = std::sqrt(error / magnitude);
+    std::printf("Local router FP64 reference: relL2 %.9g, %d exact top-%d sets\n", l2, rows, top);
+    Require(l2 < 2e-5, "router exceeds FP32 error budget");
+    ++checks;
+}
+
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
     try {
         SetThreads(4);
+        TestPackedPrefillRope();
+        TestColdWindowCacheWrite();
+        TestPairedPrefillAttention();
+        TestBlackwellLocalRouter();
+        TestBlackwellIndexerAttention();
         TestLocalPrefillBatch();
         TestSwaPrefillScratch(); TestAttentionGroupedScores(); TestAttentionSwa(); TestIndexerPrefillShards(); TestIndexerRaggedShards();
         Require(cudaDeviceSynchronize()==cudaSuccess,"prefill CUDA synchronization failed");

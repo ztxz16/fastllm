@@ -1660,20 +1660,34 @@ bool FastllmCudaMatMulFloatFP8E4M3PerChannel(const fastllm::Data &input, fastllm
     return true;
 }
 
-void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+static void FastllmCudaFP8E4M3EnsureScalesOnDevice(fastllm::Data &weight) {
     // After FP8 Marlin converts cudaData in place, scales/bias remain in
     // extraCudaData. Do not use the weight layout as the cache-init signal.
     // A cached output-channel shard can reserve the auxiliary vector before
     // this owner runs a GEMV. Reserved slots do not imply initialized scales.
     if (weight.extraCudaData.size() < 2) weight.extraCudaData.resize(2, nullptr);
     if (weight.extraCudaData[0] == nullptr) {
-        float *cudaScales;
-        cudaError_t state = cudaSuccess;
-        state = cudaMalloc(&cudaScales, weight.scales.size() * sizeof(float));
-        state = cudaMemcpy(cudaScales, weight.scales.data(), weight.scales.size() * sizeof(float), cudaMemcpyHostToDevice);
-        checkCudaErrors("Error: CUDA error when moving FP8 scales to device!", state);
+        const size_t bytes = weight.scales.size() * sizeof(float);
+        float *cudaScales = nullptr;
+        auto status = cudaMalloc(&cudaScales, bytes);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        try {
+            status = cudaMemcpy(cudaScales, weight.scales.data(), bytes, cudaMemcpyHostToDevice);
+            if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+            if (!weight.isFake && weight.blockK == 1 && weight.blockM == 32 && FastllmCudaRuntimeArch() == 103)
+                FastllmCudaRegisterMxfp8Scales(weight, cudaScales);
+#endif
+        } catch (...) {
+            cudaFree(cudaScales);
+            throw;
+        }
         weight.extraCudaData[0] = cudaScales;
     }
+}
+
+void FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
+    FastllmCudaFP8E4M3EnsureScalesOnDevice(weight);
     if (weight.extraCudaData[1] == nullptr) {
         float *cudaBiasData;
         cudaError_t state = cudaMalloc(&cudaBiasData, k * sizeof(float));
@@ -2848,7 +2862,7 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     if (n > 1 && bias.dims.empty() && weight.blockK == 1 &&
         FastllmCudaTryMxfp8QuantizedLinear(input, weight, output)) return true;
 #endif
-    FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(weight, bias, k);
+    FastllmCudaFP8E4M3EnsureScalesOnDevice(weight);
     FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(weight, bias, k);
 
     float *cudaScales = (float*)weight.extraCudaData[0];
@@ -2856,6 +2870,13 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    if (bias.dims.empty() && FastllmCudaMxfp8LinearSM103(cudaInput, weight, cudaOutput, n, m, k)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+#endif
 #ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
     // Preserve the original 1x32 weight/scales. Unlike the legacy SIMT and
     // expanded-BF16 paths, this computes with FP8 Tensor Cores at every batch.

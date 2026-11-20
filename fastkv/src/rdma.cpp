@@ -29,6 +29,7 @@ struct Device {
     ibv_pd *pd = nullptr;
     const uint64_t id = identities.fetch_add(1);
     const std::string registrationKey = "verbs:" + std::to_string(id);
+    const std::string sourceKey = registrationKey + ":source";
     ~Device() {
         if (pd)
             ibv_dealloc_pd(pd);
@@ -100,18 +101,23 @@ struct Rail {
         }
     }
     ~Rail() { Close(); }
-    std::shared_ptr<Registration> Register(const Buffer &buffer) {
-        auto value =
-            buffer.Attachment(device->registrationKey, [d = device](void *p, size_t n) {
-                auto reg = std::make_shared<Registration>();
-                reg->device = d;
-                reg->mr =
-                    ibv_reg_mr(d->pd, p, std::max(size_t(1), n),
-                               IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-                Require(reg->mr, "FastKV: ibv_reg_mr failed (check memlock and GPU peer-memory support)");
-                return reg;
-            });
-        return std::static_pointer_cast<Registration>(value);
+    std::shared_ptr<Registration> Register(const Buffer &buffer, bool optionalSource = false) {
+        const auto &key = optionalSource ? device->sourceKey : device->registrationKey;
+        auto value = buffer.Attachment(key, [d = device, optionalSource](void *p, size_t n) {
+            auto reg = std::make_shared<Registration>();
+            reg->device = d;
+            // GPU peer memory needs a writable local pin even for a source-only
+            // MR. The send side never advertises remote access to this backing.
+            const int flags = IBV_ACCESS_LOCAL_WRITE |
+                (optionalSource ? 0 : (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ));
+            reg->mr = ibv_reg_mr(d->pd, p, std::max(size_t(1), n), flags);
+            // Cache an optional failure as well. All slices on this physical
+            // slab can then use send windows without retrying MR creation.
+            Require(optionalSource || reg->mr, "FastKV: ibv_reg_mr failed (check memlock and GPU peer-memory support)");
+            return reg;
+        });
+        auto registration = std::static_pointer_cast<Registration>(value);
+        return registration->mr ? registration : nullptr;
     }
     void Poll(const Socket &socket, Deadline deadline, bool drain) {
         while (outstanding) {
@@ -287,9 +293,12 @@ class Connection final : public RdmaConnection {
             if (!buffer.HasAttachment(rails[index]->device->registrationKey)) return false;
         return true;
     }
-    Registrations Register(const Buffer &source) {
+    Registrations Register(const Buffer &source, bool optionalSource = false) {
         Registrations regs(rails.size());
-        for (size_t index : SendRails(source)) regs[index] = rails[index]->Register(source);
+        for (size_t index : SendRails(source)) {
+            regs[index] = rails[index]->Register(source, optionalSource);
+            if (!regs[index]) return {};
+        }
         return regs;
     }
     void Drain(const Socket &socket, Deadline deadline) {
@@ -382,6 +391,8 @@ class Connection final : public RdmaConnection {
             // A zero device budget explicitly disallows transport-owned staging.
             if (payload.Kind() == MemoryKind::Host || !windows.Limit(payload.Device()) || Registered(payload))
                 work.direct = Register(payload);
+            else if (payload.Preallocated())
+                work.direct = Register(payload, true);
             pending.push_back(std::move(work));
         }
         // Give each payload a turn so different GPUs can issue DMA on their

@@ -18311,6 +18311,22 @@ __global__ void FastllmMtpSampleIdToFloat(const int *token, float *output, int c
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) output[i] = (float)token[i];
 }
+struct FastllmDraftReplayRows {
+    static constexpr int capacity = 128;
+    float anchors[capacity], temperatures[capacity];
+};
+__global__ void FastllmMtpWriteDraftReplay(FastllmDraftReplayRows values, int first, int count,
+        float *anchors, float *temperatures, int *topKs, float *topPs, int vocab,
+        uint64_t *deviceSeed, uint64_t seed) {
+    const int i = threadIdx.x;
+    if (i >= count) return;
+    const int row = first + i;
+    anchors[row] = values.anchors[i];
+    temperatures[row] = values.temperatures[i];
+    topKs[row] = vocab;
+    topPs[row] = 1.0f;
+    if (row == 0) *deviceSeed = seed;
+}
 uint64_t FastllmMtpSamplingSeed() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
     return rng();
@@ -18343,6 +18359,30 @@ bool FastllmCudaMtpDraftSamplerSetParameters(void *sampler, int rows,
 }
 void FastllmCudaMtpDestroyDraftSampler(void *sampler) {
     delete static_cast<FastllmMtpSamplingWorkspace *>(sampler);
+}
+bool FastllmCudaMtpPrepareDraftReplay(void *sampler, float *deviceAnchors, int rows,
+        const float *anchors, const float *temperatures) {
+    if (!sampler || !deviceAnchors || !anchors || !temperatures) return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
+    if (!ws.dedicated || rows < 1 || rows > ws.capacity) return false;
+    for (int i = 0; i < rows; ++i)
+        if (!std::isfinite(temperatures[i]) || temperatures[i] <= 0) return false;
+    ws.rows = rows;
+    ws.needTopK = ws.needTopP = false;
+    const uint64_t seed = FastllmMtpSamplingSeed();
+    // Kernel arguments snapshot the host rows. Their lifetime is independent
+    // of the caller, even when a peer GEMM is still ahead of us on the stream.
+    for (int first = 0; first < rows;) {
+        FastllmDraftReplayRows values{};
+        const int count = std::min(rows - first, FastllmDraftReplayRows::capacity);
+        std::copy_n(anchors + first, count, values.anchors);
+        std::copy_n(temperatures + first, count, values.temperatures);
+        FastllmMtpWriteDraftReplay<<<1, FastllmDraftReplayRows::capacity, 0, cudaStreamPerThread>>>(
+            values, first, count, deviceAnchors, ws.temperatures, ws.topKs, ws.topPs, ws.vocab, ws.seed, seed);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        first += count;
+    }
+    return true;
 }
 bool FastllmCudaMtpDraftSamplerSetSeed(void *sampler) {
     if (!sampler) return false;

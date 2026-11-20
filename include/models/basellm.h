@@ -98,6 +98,7 @@ namespace fastllm {
 
     struct ResponseContext {
         RequestMetadata requestMetadata;
+        int pdPrefillGroup = -1; // Set only for a session admitted on a P replica.
         // Admission covers retained KV, not just pending transport/forward.
         // Declare before pdPending and pastKeyValues so their resources are
         // destroyed before returning slot/token credits to another request.
@@ -824,8 +825,15 @@ namespace fastllm {
         int RestorePDResidentPrefix(ResponseContext *context);
         // Metadata-only routing hint; does not pin pages or restore GPU state.
         int PreviewPDResidentPrefix(const std::vector<int> &tokens);
+        int PreviewPDResidentPrefix(const std::vector<int> &tokens, int group);
         fastkv::BufferPool *PDExportPool() const;
         virtual fastkv::Message ExportPDState(ResponseContext &context);
+        // Called on the model lane after forward. An opt-in adapter fences the
+        // producer and returns a retryable pack operation for the export lane.
+        // The adapter must support DescribePDCache on that lane and terminal
+        // release of its page/window leases before model-lane removal.
+        virtual std::function<fastkv::Message()> PreparePDExport(ResponseContext &) { return {}; }
+        virtual void ReleasePDExportSources(ResponseContext &) {}
         // Opaque immutable regions; policy, storage and transfers belong to FastKV.
         virtual fastkv::CacheSnapshot DescribePDCache(ResponseContext &context, const fastkv::Message &state);
         virtual void ImportPDState(ResponseContext &context, const fastkv::Message &state);

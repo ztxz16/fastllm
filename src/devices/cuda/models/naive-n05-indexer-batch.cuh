@@ -303,7 +303,7 @@ __global__ void HopperScores(const BF16 *weights, Batch batch) {
 // A request owns one CTA instead of a cooperative grid. Independent requests
 // fill the GPU together. Refine a radix threshold until at most 4096 candidates
 // remain, then compact in position order for the existing stable block sort.
-template<bool Merge = false, int Capacity = naive_topk::kCapacity>
+template<bool Merge = false, int Capacity = naive_topk::kCapacity, bool ParallelCompact = false>
 __device__ void SelectRow(const Row &row) {
     using namespace naive_topk;
     static_assert(Capacity >= kTopK && Capacity <= kCapacity);
@@ -365,6 +365,39 @@ __device__ void SelectRow(const Row &row) {
         candidates = state->candidates;
         mask |= (kBuckets - 1u) << shift;
         if (candidates <= Capacity || shift == 0 || prefix == state->maximum) break;
+    }
+    if constexpr (ParallelCompact) {
+        // Scan warp counts once for the whole row instead of synchronizing a
+        // block scan for every 256 positions. Preserve input order for ties.
+        // Oversized rows and tie-heavy thresholds keep the bounded fallback.
+        if (n <= 16384 && candidates <= Capacity) {
+            __shared__ int offsets[512];
+            const unsigned laneMask = lane ? ((1u << lane) - 1u) : 0;
+            for (int i = t; i < 16384; i += kThreads) {
+                unsigned bits = i < n ? row.Score<Merge>(i, mergeWidth) : 0;
+                unsigned take = __ballot_sync(0xffffffffu, i < n && bits >= prefix);
+                if (lane == 0) offsets[i / 32] = __popc(take);
+            }
+            __syncthreads();
+            int counts[2] = {offsets[t * 2], offsets[t * 2 + 1]}, before[2], total;
+            Scan(scan).ExclusiveSum(counts, before, total);
+            __syncthreads();
+            offsets[t * 2] = before[0];
+            offsets[t * 2 + 1] = before[1];
+            if (t == 0) state->selected = total;
+            __syncthreads();
+            for (int base = 0; base < n; base += kThreads) {
+                int i = base + t;
+                unsigned bits = i < n ? row.Score<Merge>(i, mergeWidth) : 0;
+                unsigned take = __ballot_sync(0xffffffffu, i < n && bits >= prefix);
+                if (i < n && bits >= prefix) {
+                    int dst = offsets[i / 32] + __popc(take & laneMask);
+                    out->keys[dst] = bits - prefix;
+                    out->positions[dst] = row.Position<Merge>(i, mergeWidth);
+                }
+            }
+            return;
+        }
     }
     int offset = 0, tiesBefore = 0;
     for (int base = 0; base < n; base += kThreads) {

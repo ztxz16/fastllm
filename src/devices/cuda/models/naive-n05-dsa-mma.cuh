@@ -321,13 +321,12 @@ __device__ __forceinline__ void IndexerDecodeScoresRow(const BF16 *q, FastllmNai
         const float *qscale, const BF16 *weights, ScoreOutput scores,
         int stride, int keys, int past, int firstKey = 0, int blockOffset = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    if (keys <= 0) return;
+    // A graph may reserve a much longer history than this row currently owns.
+    const int first = firstKey + (blockOffset * gridDim.x + blockIdx.x) * kKeys;
+    if (first >= keys) return;
     __shared__ __align__(16) BF16 qs[kHeads][kIndexerDim + 8], ks[kKeys][kIndexerDim + 8];
     __shared__ float scale[kHeads], weight[kHeads];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    // Decode graphs can cap the grid and let each CTA walk several tiles.
-    // The default keeps the original one-tile-per-CTA launch unchanged.
-    const int first = firstKey + (blockOffset * gridDim.x + blockIdx.x) * kKeys;
     for (int i = tid; i < kHeads * (kIndexerDim / 8); i += kThreads) {
         int row = i / 16, d = i % 16 * 8;
         *reinterpret_cast<uint4*>(&qs[row][d]) =

@@ -7,15 +7,36 @@ namespace fastkv {
 struct PrefillRouter::State {
     mutable std::mutex mutex;
     std::vector<size_t> pending;
-    std::vector<std::chrono::steady_clock::time_point> overloaded;
     size_t next = 0;
-    explicit State(size_t peers) : pending(peers), overloaded(peers) {}
+    explicit State(size_t peers) : pending(peers) {}
 };
 PrefillRouter::PrefillRouter(size_t peers) : state(std::make_shared<State>(peers)) {
     Require(peers > 0, "FastKV: routing needs at least one peer");
 }
+size_t PrefillRouter::SessionPeer(const std::string &key, const std::vector<std::string> &peers) {
+    if (key.empty()) return SIZE_MAX;
+    uint64_t highest = 0;
+    size_t best = SIZE_MAX;
+    for (size_t i = 0; i < peers.size(); ++i) {
+        uint64_t hash = 14695981039346656037ULL;
+        for (unsigned char c : peers[i])
+            hash = (hash ^ c) * 1099511628211ULL;
+        hash *= 1099511628211ULL; // NUL separator between endpoint and session.
+        for (unsigned char c : key)
+            hash = (hash ^ c) * 1099511628211ULL;
+        // MurmurHash3 fmix64 separates neighbouring ports and sequential session IDs.
+        hash ^= hash >> 33;
+        hash *= 0xff51afd7ed558ccdULL;
+        hash ^= hash >> 33;
+        hash *= 0xc4ceb9fe1a85ec53ULL;
+        hash ^= hash >> 33;
+        if (best == SIZE_MAX || hash > highest) { highest = hash; best = i; }
+    }
+    return best;
+}
+
 PrefillRouter::Route PrefillRouter::Reserve(size_t tokens, const std::vector<Estimate> &estimates,
-                                           size_t preferred, bool owned) {
+                                           size_t preferred, bool pinPreferred) {
     Require(tokens > 0 && estimates.size() == state->pending.size(), "FastKV: invalid routing estimates");
     struct Lease {
         std::shared_ptr<State> state;
@@ -61,33 +82,14 @@ PrefillRouter::Route PrefillRouter::Reserve(size_t tokens, const std::vector<Est
         if (seconds < score) { best = peer; cost = miss; score = seconds; }
     }
     if (best == estimates.size()) throw CapacityBusy("FastKV: no available prefill peer");
-    // A modest queue difference should not duplicate a long session prefix.
-    // Do not prefer a cold owner over a substantially warmer peer or prevent
-    // spilling when the owner is overloaded/unavailable.
-    if (owned && preferred < estimates.size() && estimates[preferred].available &&
-        preferredCost > 0 && std::isfinite(preferredScore)) {
-        // Rebuilding/duplicating a whole session costs more than a transient
-        // batch's queue imbalance. Require a sustained advantage before moving
-        // an established owner; failures can still spill immediately.
-        auto &since = state->overloaded[preferred];
-        const auto now = std::chrono::steady_clock::now();
-        const double rebuild = double(tokens) / estimates[preferred].tokensPerSecond;
-        // Migration consumes a full-prefix rebuild and displaces resident KV
-        // for future turns. Its benefit must cover both costs, and remain
-        // visible for at least one rebuild rather than a single batch wave.
-        const double margin = std::max(2.0, 2.0 * rebuild);
-        const bool lostPrefix = std::max(estimates[preferred].cachedTokens, estimates[preferred].hostCachedTokens) < tokens / 4 && bestMiss < tokens / 4;
-        if (lostPrefix || preferredScore <= score + margin) since = {};
-        else if (since == std::chrono::steady_clock::time_point{}) since = now;
-        if (!lostPrefix && (since == std::chrono::steady_clock::time_point{} ||
-            now - since < std::chrono::duration<double>(std::max(1.0, rebuild)))) {
+    // A live session keeps its producer even when another producer is idle.
+    // An unavailable or invalid estimate never populated preferredScore.
+    if (std::isfinite(preferredScore)) {
+        const double slack = double(std::max(bestMiss / 4, tokens / 64)) / estimates[preferred].tokensPerSecond;
+        if (pinPreferred || (preferredCost <= bestMiss + std::max(size_t(128), tokens / 100) &&
+                             preferredScore <= score + slack)) {
             best = preferred; cost = preferredCost;
         }
-    } else if (preferred < estimates.size() && estimates[preferred].available &&
-        preferredCost > 0 && std::isfinite(preferredScore) &&
-        preferredCost <= bestMiss + std::max(size_t(128), tokens / 100) &&
-        preferredScore <= score + double(std::max(bestMiss / 4, tokens / 64)) / estimates[preferred].tokensPerSecond) {
-        best = preferred; cost = preferredCost;
     }
     Require(cost <= SIZE_MAX - state->pending[best], "FastKV: routing work overflow");
     state->pending[best] += cost;
@@ -101,12 +103,26 @@ std::vector<size_t> PrefillRouter::Pending() const {
 }
 
 struct SessionDirectory::Impl {
-    struct Entry { Record record; uint64_t used = 0; };
+    struct Entry { Record record; uint64_t used = 0; int localGroup = -1; };
     mutable std::mutex mutex;
     mutable std::map<std::string, Entry> entries;
     mutable uint64_t clock = 0;
+    uint64_t nextGroup = 0;
     size_t capacity;
     explicit Impl(size_t capacity) : capacity(capacity) {}
+    Entry &Touch(const std::string &key) {
+        auto it = entries.find(key);
+        if (it == entries.end()) {
+            if (entries.size() == capacity) {
+                auto oldest = std::min_element(entries.begin(), entries.end(),
+                    [](const auto &a, const auto &b) { return a.second.used < b.second.used; });
+                entries.erase(oldest);
+            }
+            it = entries.emplace(key, Entry{}).first;
+        }
+        it->second.used = ++clock;
+        return it->second;
+    }
 };
 SessionDirectory::SessionDirectory(size_t capacity) : impl(new Impl(capacity)) {
     Require(capacity > 0, "FastKV: empty session directory capacity");
@@ -128,12 +144,18 @@ bool SessionDirectory::Update(const std::string &key, const Record &record) {
     std::lock_guard<std::mutex> lock(impl->mutex);
     auto it = impl->entries.find(key);
     if (it != impl->entries.end() && !Newer(record, it->second.record)) return false;
-    if (it == impl->entries.end() && impl->entries.size() >= impl->capacity) {
-        auto oldest = std::min_element(impl->entries.begin(), impl->entries.end(),
-            [](const auto &a, const auto &b) { return a.second.used < b.second.used; });
-        impl->entries.erase(oldest);
-    }
-    impl->entries[key] = {record, ++impl->clock};
+    impl->Touch(key).record = record;
     return true;
+}
+int SessionDirectory::LocalGroup(const std::string &key, int groups, bool assign) {
+    if (key.empty() || groups <= 1) return -1;
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (!assign) {
+        const auto it = impl->entries.find(key);
+        return it == impl->entries.end() ? -1 : it->second.localGroup;
+    }
+    auto &entry = impl->Touch(key);
+    if (entry.localGroup < 0) entry.localGroup = impl->nextGroup++ % groups;
+    return entry.localGroup;
 }
 } // namespace fastkv

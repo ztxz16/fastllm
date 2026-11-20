@@ -612,23 +612,37 @@ static void TestSwaBatch(int batch, int heads, int kvHeads) {
     }
 }
 
-static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool sparse, bool fp8) {
-    const int capacity = sparse ? 2048 : 128;
+static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool sparse, bool fp8, bool online = false) {
+    const int kvHeads = online ? heads / 16 : 1;
+    const int capacity = online ? 2049 : sparse ? 2048 : 128;
+    const int pageLen = online ? 128 : capacity;
+    const int pageCount = (capacity + pageLen - 1) / pageLen;
+    const int storedRows = pageCount * pageLen;
     Data query(BFLOAT16), key(BFLOAT16), value(BFLOAT16), sink(FLOAT32), live(INT32), table(INT32),
         pages(INT32), indices(INT32), maps(INT32), actual;
     Upload(query, {1, batch, heads * dim}, 301);
-    Upload(key, {1, capacity, dim}, 302); Upload(value, {1, capacity, vd}, 303);
+    Upload(key, {1, storedRows, kvHeads * dim}, 302); Upload(value, {1, storedRows, kvHeads * vd}, 303);
     Upload(sink, {heads}, 304); Upload(live, {batch}, 305);
     if (fp8) {
-        // Every byte is finite E4M3. This test checks masking and bindings,
-        // independently of the numerical conversion used by the writer.
-        Cuda(cudaMemset(key.cudaData, 0x30, capacity * dim));
-        Cuda(cudaMemset(value.cudaData, 0x28, capacity * vd));
+        // Distinct finite E4M3 values expose token and GQA head addressing errors.
+        unsigned seed = 302;
+        for (Data *cache : {&key, &value}) {
+            std::vector<uint8_t> payload(cache->Count(0));
+            for (auto &byte : payload) {
+                seed = 1664525u * seed + 1013904223u;
+                byte = uint8_t((seed >> 24) & 0x80) | uint8_t((seed >> 16) % 57);
+            }
+            Cuda(cudaMemcpy(cache->cudaData, payload.data(), payload.size(), cudaMemcpyHostToDevice));
+        }
     }
     Upload(table, {int(batch * 4 * sizeof(void *) / sizeof(int))}, 306);
-    Upload(pages, {1}, 307); Cuda(cudaMemset(pages.cudaData, 0, sizeof(int)));
+    Upload(pages, {pageCount}, 307);
+    std::vector<int> physicalPages(pageCount);
+    for (int i = 0; i < pageCount; ++i) physicalPages[i] = pageCount - 1 - i;
+    Cuda(cudaMemcpy(pages.cudaData, physicalPages.data(), pages.GetBytes(), cudaMemcpyHostToDevice));
     Upload(indices, {2048}, 308);
-    std::vector<int> selected(2048); for (int i = 0; i < 2048; ++i) selected[i] = i;
+    std::vector<int> selected(2048);
+    for (int i = 0; i < 2048; ++i) selected[i] = online ? (i * 37 + 13) % capacity : i;
     Cuda(cudaMemcpy(indices.cudaData, selected.data(), indices.GetBytes(), cudaMemcpyHostToDevice));
     if (!fp8 && heads == 8 && dim == 192 && vd == 128 && !sparse && FastllmCudaNaiveDSAMapsSupported()) {
         Upload(maps, {FastllmNaiveDSAMapBytes / int(sizeof(int))}, 309);
@@ -643,14 +657,14 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
         auto &r = rows[b];
         r.key = key.cudaData; r.value = value.cudaData;
         r.indices = sparse ? (const int *)indices.cudaData : nullptr;
-        r.selectedCount = sparse ? 2048 : 0; r.capacity = capacity; r.keyStride = dim;
+        r.selectedCount = sparse ? 2048 : 0; r.capacity = capacity; r.keyStride = kvHeads * dim;
         r.liveKeys = (const int *)live.cudaData + b;
         r.cache = (const void *const *)table.cudaData + b * 4;
-        r.tensorMaps = maps.cudaData; r.pageLen = capacity; r.fp8 = fp8;
+        r.tensorMaps = maps.cudaData; r.pageLen = pageLen; r.poolTokens = storedRows; r.fp8 = fp8;
     }
     auto bind = [&](int active) {
         for (int b = 0; b < batch; ++b) {
-            lengths[b] = b < active ? capacity : 0;
+            lengths[b] = b < active ? capacity - (online ? b % 4 : 0) : 0;
             bindings[b * 4] = b < active ? key.cudaData : nullptr;
             bindings[b * 4 + 1] = b < active ? value.cudaData : nullptr;
             bindings[b * 4 + 2] = bindings[b * 4 + 3] = b < active ? pages.cudaData : nullptr;
@@ -660,9 +674,29 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
     };
     bind(batch);
     FastllmNaiveDecodeScratch scratch;
+    auto runOnline = [&] {
+        return FastllmCudaNaiveOnlineDSADecode(query, sink, rows, heads, kvHeads, dim, vd, scratch, actual);
+    };
+    if (online && !runOnline()) return; // Optional device/image.
     Graph graph;
-    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(query, sink, rows, heads, 1, dim, vd, scratch, actual); });
+    graph.Capture([&] {
+        if (online) Require(runOnline(), "online DSA unavailable during capture");
+        else FastllmCudaNaiveBatchDSADecode(query, sink, rows, heads, kvHeads, dim, vd, scratch, actual);
+    });
     graph.Run(); auto reference = Read<uint16_t>(actual);
+    if (online) {
+        Data expected; FastllmNaiveDecodeScratch oldScratch;
+        FastllmCudaNaiveBatchDSADecode(query, sink, rows, heads, kvHeads, dim, vd, oldScratch, expected);
+        auto old = Read<uint16_t>(expected);
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < old.size(); ++i) {
+            uint32_t a = uint32_t(reference[i]) << 16, b = uint32_t(old[i]) << 16;
+            float got, want;
+            std::memcpy(&got, &a, sizeof(got)); std::memcpy(&want, &b, sizeof(want));
+            error += double(got-want)*(got-want); norm += double(want)*want;
+        }
+        Require(std::sqrt(error/std::max(norm, 1e-20)) < .005, "online DSA BF16 reference");
+    }
     for (int active : {batch - 1, 1, 0, batch / 2, batch}) {
         bind(active); graph.Run(); auto result = Read<uint16_t>(actual);
         for (size_t i = 0; i < result.size(); ++i)
@@ -758,6 +792,8 @@ int main() {
         if (!FastllmCudaNaiveDecodeGraphSupported())
             return 77;
         TestMixedRegionAttention();
+        for (int batch : {1, 4, 8, 32, 64})
+            for (int heads : {16, 64}) TestPaddedAttention(batch, heads, 192, 128, true, true, true);
         for (int batch : {8, 40})
         for (bool sparse : {false, true})
         for (bool fp8 : {false, true}) {

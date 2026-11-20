@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <deque>
 #include <iostream>
+#include <sstream>
 #include <thread>
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -78,8 +79,10 @@ std::vector<int> PDReceivePlacement(const fastkv::Bytes &metadata,
 struct PDStateWriter::Allocations {
     std::mutex mutex;
     std::vector<std::pair<int, size_t>> plan;
+    std::unique_ptr<fastkv::BufferPool::PackedLayout> layout;
     std::vector<fastkv::Buffer> reserved;
     bool prepared = false;
+    int producer = -1;
 };
 PDStateWriter::PDStateWriter(fastkv::BufferPool *pool)
     : pool(pool), allocations(std::make_shared<Allocations>()) {}
@@ -96,10 +99,19 @@ void PDStateWriter::PlanTensor(const Data &data) {
     plannedTensors.push_back(allocations->plan.size());
     allocations->plan.emplace_back(data.dataDeviceIds.front(), bytes);
 }
-void PDStateWriter::Reserve() {
+void PDStateWriter::Reserve(bool allowPeerWrites) {
     Check(!allocations->prepared, "export plan already reserved");
-    if (pool) allocations->reserved = pool->AcquirePacked(allocations->plan);
-    else for (const auto &item : allocations->plan)
+    if (pool) {
+        if (!allocations->layout)
+            allocations->layout = std::make_unique<fastkv::BufferPool::PackedLayout>(allocations->plan);
+        if (allowPeerWrites && !allocations->plan.empty()) {
+            const int device = allocations->plan.front().first;
+            Check(std::all_of(allocations->plan.begin(), allocations->plan.end(),
+                [device](const auto &part) { return part.first == device; }), "peer export needs a single producer");
+            allocations->producer = device;
+            allocations->reserved = pool->AcquirePeerPackedLayout(*allocations->layout);
+        } else allocations->reserved = pool->AcquirePackedLayout(*allocations->layout);
+    } else for (const auto &item : allocations->plan)
         allocations->reserved.push_back(fastkv::Buffer::Allocate(item.second, item.first));
     allocations->prepared = true;
 }
@@ -107,7 +119,8 @@ fastkv::Buffer PDStateWriter::Allocate(size_t bytes, int device) {
     if (allocations->prepared) {
         Check(nextTensor < plannedTensors.size(), "unplanned export allocation");
         auto &reserved = allocations->reserved.at(plannedTensors[nextTensor++]);
-        Check(reserved.Device() == device && reserved.Size() == bytes, "export plan changed");
+        Check((reserved.Device() == device || allocations->producer == device) &&
+              reserved.Size() == bytes, "export plan changed");
         return std::move(reserved);
     }
     if (!pool) return fastkv::Buffer::Allocate(bytes, device);
@@ -208,6 +221,7 @@ fastkv::Message PDStateWriter::Finish(const std::vector<int> &localDevices) {
     fastkv::Message result{std::move(metadata.bytes), std::move(buffers)};
     if (!pool && result.buffers.size() > 1) result = fastkv::Snapshot(result);
     std::vector<int> devices = localDevices, placement;
+    if (devices.empty() && allocations->producer >= 0) devices.push_back(allocations->producer);
     if (devices.empty()) {
         for (const auto &buffer : result.buffers)
             if (buffer.Kind() == fastkv::MemoryKind::Cuda &&
@@ -218,7 +232,10 @@ fastkv::Message PDStateWriter::Finish(const std::vector<int> &localDevices) {
     for (const auto &buffer : result.buffers) {
         int rank = -1;
         if (buffer.Kind() == fastkv::MemoryKind::Cuda) {
-            auto it = std::find(devices.begin(), devices.end(), buffer.Device());
+            // Wire ranks name the model shard. A peer-backed export may be
+            // transmitted by a different physical GPU and its local NIC.
+            int owner = allocations->producer >= 0 ? allocations->producer : buffer.Device();
+            auto it = std::find(devices.begin(), devices.end(), owner);
             Check(it != devices.end(), "payload owner absent from device map");
             rank = it - devices.begin();
         }
@@ -343,7 +360,10 @@ struct PDRuntime {
         std::future<fastkv::Message> hostRestore;
         std::chrono::steady_clock::time_point restoreBegin;
         bool restoring = false;
-        bool prefixRecorded = false;
+        double prefixRecordMs = 0;
+        std::function<fastkv::Message()> pack;
+        int exportGroup = 0;
+        std::atomic<bool> exportFinished{false};
         std::chrono::steady_clock::time_point exportQueued;
         size_t reservation = 0;
         std::shared_ptr<Workload> work;
@@ -407,18 +427,21 @@ struct PDRuntime {
         if (service) service->Stop(); // callbacks capture this runtime
     }
     void StopPrefill() {
-        if (exportPool) exportPool->Clear();
         std::lock_guard<std::mutex> stoppingLock(prefillStopMutex);
         {
             std::lock_guard<std::mutex> lock(prefillMutex);
             stopping = true;
         }
+        if (exportPool) exportPool->Clear();
         prefillCV.notify_all();
         if (prefillThread.joinable()) prefillThread.join();
     }
-    size_t CachedTokens(basellm &model, const std::vector<int> &input) {
-        return residentPrefix ? model.PreviewPDResidentPrefix(input) :
-               cache ? cache->ProbeTokens(identity, input) : 0;
+    size_t CachedTokens(basellm &model, const std::vector<int> &input, const std::string &session) {
+        if (residentPrefix) {
+            const int group = sessions->LocalGroup(session, model.PDGroupCount(), false);
+            return model.PreviewPDResidentPrefix(input, group);
+        }
+        return cache ? cache->ProbeTokens(identity, input) : 0;
     }
     double HostRestoreBytesPerSecond() const {
         const auto stats = hostCache ? hostCache->Stats() : fastkv::HostCache::Statistics{};
@@ -553,19 +576,11 @@ struct PDRuntime {
         if (!available) for (auto &e : pending.estimates) e = {};
         // All D ranks discover committed placement from producer probes. Only
         // new sessions or expired metadata fall back to rendezvous hashing.
-        size_t preferred = SIZE_MAX;
-        uint64_t highest = 0;
-        if (!pending.sessionKey.empty()) for (size_t i = 0; i < peers.size(); ++i) {
-            uint64_t hash = 14695981039346656037ULL;
-            for (unsigned char c : pending.sessionKey + std::string(1, '\0') + peers[i])
-                hash = (hash ^ c) * 1099511628211ULL;
-            if (preferred == SIZE_MAX || hash > highest) { preferred = i; highest = hash; }
-        }
         auto placement = sessions->Get(pending.sessionKey);
         auto owner = std::find(peers.begin(), peers.end(), placement.owner);
-        const bool owned = placement.version && owner != peers.end();
-        if (owned) preferred = owner - peers.begin();
-        auto chosen = router->Reserve(pending.length, pending.estimates, preferred, owned);
+        const size_t preferred = placement.version && owner != peers.end() ? size_t(owner - peers.begin()) :
+            fastkv::PrefillRouter::SessionPeer(pending.sessionKey, peers);
+        auto chosen = router->Reserve(pending.length, pending.estimates, preferred, preferred != SIZE_MAX);
         const auto probeKind = pending.probeKinds[chosen.peer];
         if (!pending.sessionKey.empty() && probeKind >= 6) {
             Check(placement.version < UINT64_MAX, "session placement version exhausted");
@@ -619,15 +634,27 @@ void PDRuntime::RunPrefill(basellm &model) {
         context.reset();
         request->groupAdmission.reset();
     };
+    // Only the model lane retires contexts. The export lane owns no model
+    // scheduler state and only sees completed, pinned requests.
+    std::mutex exportMutex;
+    std::condition_variable exportCV;
+    std::deque<Request> readyToPack;
+    std::thread exportThread;
+    std::atomic<bool> closeExports{false};
     const auto cancelled = std::make_exception_ptr(std::runtime_error("FastKV PD: request cancelled"));
+    auto recordPrefix = [&](const Request &request) {
+        if (!residentPrefix) return;
+        const auto begin = std::chrono::steady_clock::now();
+        request->context->TryRecordPagedCache(&model);
+        request->prefixRecordMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin).count();
+    };
     auto complete = [&](const Request &request, fastkv::Message *restored) {
         const auto exportBegin = std::chrono::steady_clock::now();
-        if (residentPrefix && !request->prefixRecorded) {
-            request->context->TryRecordPagedCache(&model);
-            request->prefixRecorded = true;
-        }
-        const auto recorded = std::chrono::steady_clock::now();
-        auto reply = restored ? std::move(*restored) : model.ExportPDState(*request->context);
+        auto reply = restored ? std::move(*restored) :
+            request->pack ? request->pack() : model.ExportPDState(*request->context);
+        if (request->pack && (stopping || request->cancellation->Cancelled()))
+            std::rethrow_exception(cancelled);
         const auto exported = std::chrono::steady_clock::now();
         if (cache) {
             try { cache->Publish(identity, request->input, reply); }
@@ -652,19 +679,87 @@ void PDRuntime::RunPrefill(basellm &model) {
                       << " d2h_bytes=" << stats.copiedToHost << " h2d_bytes=" << stats.restoredBytes
                       << " reused_bytes=" << stats.reusedBytes << std::endl;
         }
-        retire(request);
+        if (request->pack) model.ReleasePDExportSources(*request->context);
+        else retire(request);
         if (model.verbose) {
             const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-            std::cout << "[FastKV PD timing] record_ms=" << ms(exportBegin, recorded)
-                      << " export_ms=" << ms(recorded, exported)
+            std::ostringstream timing;
+            timing << "[FastKV PD timing] record_ms=" << request->prefixRecordMs
+                      << " export_ms=" << ms(exportBegin, exported)
                       << " export_wait_ms=" << (request->exportQueued.time_since_epoch().count() ?
                           ms(request->exportQueued, exportBegin) : 0.0)
-                      << " publish_ms=" << ms(exported, published)
-                      << " retire_ms=" << ms(published, std::chrono::steady_clock::now())
-                      << " kv_d2h_bytes=" << fastkv::Buffer::Traffic().deviceToHost
-                      << " kv_h2d_bytes=" << fastkv::Buffer::Traffic().hostToDevice << std::endl;
+                      << " publish_ms=" << ms(exported, published);
+            if (request->pack) timing << " source_release_ms=" << ms(published, std::chrono::steady_clock::now())
+                                      << " retire_deferred=1";
+            else timing << " retire_ms=" << ms(published, std::chrono::steady_clock::now());
+            timing << " kv_d2h_bytes=" << fastkv::Buffer::Traffic().deviceToHost
+                      << " kv_h2d_bytes=" << fastkv::Buffer::Traffic().hostToDevice << '\n';
+            std::cout << timing.str() << std::flush;
         }
         request->Reply(std::move(reply), cachedTokens);
+    };
+    auto runExports = [&] {
+        std::deque<Request> pending;
+        while (!closeExports && !stopping) {
+            {
+                std::unique_lock<std::mutex> lock(exportMutex);
+                if (pending.empty()) exportCV.wait(lock, [&] { return closeExports || !readyToPack.empty(); });
+                pending.insert(pending.end(), readyToPack.begin(), readyToPack.end());
+                readyToPack.clear();
+            }
+            bool progressed = false;
+            std::set<int> blockedGroups;
+            for (auto it = pending.begin(); it != pending.end() && !closeExports && !stopping;) {
+                const auto &request = *it;
+                try {
+                    if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
+                    if (blockedGroups.count(request->exportGroup)) {
+                        ++it;
+                        continue;
+                    }
+                    complete(request, nullptr);
+                } catch (const fastkv::CapacityBusy &) {
+                    blockedGroups.insert(request->exportGroup);
+                    ++it;
+                    continue;
+                } catch (...) {
+                    request->result.set_exception(std::current_exception());
+                }
+                request->exportFinished.store(true, std::memory_order_release);
+                it = pending.erase(it);
+                progressed = true;
+            }
+            if (progressed) prefillCV.notify_one();
+            else if (!pending.empty() && !stopping && !closeExports) {
+                try { exportPool->WaitForRelease(); }
+                catch (const std::runtime_error &) { return; } // StopPrefill closed the pool.
+            }
+        }
+    };
+    auto startExport = [&](const Request &request) {
+        recordPrefix(request);
+        request->pack = model.PreparePDExport(*request->context);
+        if (!request->pack) {
+            try {
+                complete(request, nullptr);
+            } catch (const fastkv::CapacityBusy &) {
+                request->exportQueued = std::chrono::steady_clock::now();
+                exporting.push_back(request);
+            }
+            return;
+        }
+        request->exportQueued = std::chrono::steady_clock::now();
+        request->exportGroup = model.PDRequestGroup(*request->context);
+        if (!exportThread.joinable()) exportThread = std::thread(runExports);
+        exporting.push_back(request);
+        try {
+            std::lock_guard<std::mutex> lock(exportMutex);
+            readyToPack.push_back(request);
+        } catch (...) {
+            exporting.pop_back();
+            throw;
+        }
+        exportCV.notify_one();
     };
     try {
         while (true) {
@@ -690,7 +785,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     } else ++it;
                 }
             }
-            // Only the model execution lane touches contexts and GPU state.
+            // The model lane owns context mutation and retirement.
             // RPC handlers return futures immediately; network workers never
             // wait for the model or hold forwardLocker.
             std::unique_lock<std::mutex> lock(model.forwardLocker);
@@ -699,6 +794,13 @@ void PDRuntime::RunPrefill(basellm &model) {
             // forward; no owner worker waits on a transport buffer lease.
             for (auto it = exporting.begin(); it != exporting.end();) {
                 const auto request = *it;
+                if (request->pack) {
+                    if (request->exportFinished.load(std::memory_order_acquire)) {
+                        retire(request);
+                        it = exporting.erase(it);
+                    } else ++it;
+                    continue;
+                }
                 try {
                     if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
                     complete(request, nullptr);
@@ -748,10 +850,11 @@ void PDRuntime::RunPrefill(basellm &model) {
                                       << " cache_tier=l2 restore_ms=" << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - request->restoreBegin).count()
                                       << " bytes=" << request->hostHit.Bytes() << " cache_bytes=" << stats.bytes
                                       << " entries=" << stats.entries << " d2h_bytes=" << stats.copiedToHost
-                                      << " reused_bytes=" << stats.reusedBytes << std::endl;
+                                      << " reused_bytes=" << stats.reusedBytes << " group=" << model.PDRequestGroup(context) << std::endl;
                         }
                         if (size_t(context.preTokens) == request->input.size()) {
                             const auto reservation = request->reservation;
+                            recordPrefix(request);
                             complete(request, &state);
                             preparedTokens -= reservation;
                             it = prepared.erase(it);
@@ -804,6 +907,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     auto &context = *request->context;
                     context.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
                     context.requestMetadata = request->metadata;
+                    context.pdPrefillGroup = sessions->LocalGroup(request->metadata.sessionKey, model.PDGroupCount(), true);
                     context.currentTokens = context.allTokens = request->input;
                     context.inputTokens = request->input.size();
                     context.generationConfig.top_k = 1;
@@ -822,7 +926,8 @@ void PDRuntime::RunPrefill(basellm &model) {
                         auto latest = hostCache->Find(identity, request->input);
                         if (latest.Tokens() > request->hostHit.Tokens()) request->hostHit = std::move(latest);
                     }
-                    const size_t residentTokens = request->hostHit && residentPrefix ? size_t(model.PreviewPDResidentPrefix(request->input)) : hit.tokens;
+                    const size_t residentTokens = request->hostHit && residentPrefix
+                        ? model.PreviewPDResidentPrefix(request->input, model.PDRequestGroup(context)) : hit.tokens;
                     // A few extra cached tail tokens do not justify restoring
                     // an entire host checkpoint when L1 already covers the prefix.
                     const bool useHost = request->hostHit.Tokens() > residentTokens &&
@@ -859,7 +964,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                                   << " cache_entries=" << stats.entries << " cache_bytes=" << stats.bytes
                                   << " cache_logical_bytes=" << stats.logicalBytes
                                   << " cache_evictions=" << stats.evictions
-                                  << " resident_gpu=" << residentPrefix << std::endl;
+                                  << " resident_gpu=" << residentPrefix << " group=" << model.PDRequestGroup(context) << std::endl;
                         std::cout << "[FastKV PD timing] restore_ms="
                                   << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - restoreBegin).count()
                                   << std::endl;
@@ -982,10 +1087,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     continue;
                 }
                 try {
-                    complete(request, nullptr);
-                } catch (const fastkv::CapacityBusy &) {
-                    request->exportQueued = std::chrono::steady_clock::now();
-                    exporting.push_back(request);
+                    startExport(request);
                 } catch (...) {
                     auto error = std::current_exception();
                     retire(request);
@@ -996,6 +1098,12 @@ void PDRuntime::RunPrefill(basellm &model) {
         throw std::runtime_error("FastKV PD: prefill cancelled by shutdown");
     } catch (...) {
         const auto error = std::current_exception();
+        {
+            std::lock_guard<std::mutex> lock(exportMutex);
+            closeExports = true;
+        }
+        exportCV.notify_one();
+        if (exportThread.joinable()) exportThread.join();
         {
             std::lock_guard<std::mutex> lock(prefillMutex);
             stopping = true;
@@ -1013,7 +1121,7 @@ void PDRuntime::RunPrefill(basellm &model) {
         }
         for (const auto &request : exporting) {
             retire(request);
-            request->result.set_exception(error);
+            if (!request->exportFinished) request->result.set_exception(error);
         }
     }
 }
@@ -1156,6 +1264,11 @@ void basellm::ConfigurePD(const json11::Json &config) {
     runtime->service.reset(new fastkv::Service(options));
     runtime->exportPool.reset(new fastkv::BufferPool(options.maxInflightBytes,
         options.deviceBufferBytes, options.allocateBuffer));
+#ifdef USE_CUDA
+    if (runtime->role == "prefill" && groups > 1 && groups == int(devices.size()) &&
+        options.transport == fastkv::Transport::Rdma)
+        runtime->exportPool->Preallocate(devices, fastkv::EnableCudaPeerAccess(devices));
+#endif
     runtime->residentPrefix = HasPDResidentPrefixCache();
     for (const auto &peer : config["prefill"].array_items()) {
         Check(peer.is_string() && !peer.string_value().empty(), "invalid prefill endpoint");
@@ -1254,7 +1367,7 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 Check(!tokens.empty() && tokens.size() < size_t(max_positions), "invalid routing prompt");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds routing peer capacity");
                 fastkv::Writer writer;
-                writer.U32(kind); writer.U64(raw->CachedTokens(*this, tokens));
+                writer.U32(kind); writer.U64(raw->CachedTokens(*this, tokens, session));
                 writer.U64(raw->workload->tokens.load());
                 writer.U64(uint64_t(std::max(1.0, raw->workload->tokensPerSecond.load())));
                 if (kind >= 6) {
@@ -1282,7 +1395,11 @@ void basellm::BeginPD(ResponseContext *context) {
     if (!IsPDDecode() || context->allTokens.size() < 2)
         return;
     Check(context->multimodalInput.empty(), "multimodal PD state transfer is not implemented");
-    Check(context->allTokens.size() < size_t(max_positions), "prompt exceeds context capacity");
+    if (context->allTokens.size() >= size_t(max_positions)) {
+        context->error = ResponseContextErrorPromptTooLong;
+        context->isEnding = true;
+        return;
+    }
     std::vector<int> prefix(context->allTokens.begin(), context->allTokens.end() - 1);
     fastkv::Writer writer;
     writer.U32(1);

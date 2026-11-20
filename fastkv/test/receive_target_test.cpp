@@ -5,7 +5,7 @@
 using namespace fastkv;
 using namespace std::chrono_literals;
 static void Check(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
-static void CheckGpuSendWindow(Options opts, int gpu) {
+static void CheckGpuSendWindow(Options opts, int gpu, bool preallocated) {
     constexpr size_t window = 1 << 20;
     Options senderOptions = opts;
     senderOptions.maxInflightBytes = window;
@@ -18,6 +18,7 @@ static void CheckGpuSendWindow(Options opts, int gpu) {
         return Buffer::Allocate(bytes, device);
     };
     BufferPool snapshots(32 * window);
+    if (preallocated) snapshots.Preallocate({gpu});
     std::vector<Buffer> sources;
     // Keep all eight snapshots live so the source pool cannot recycle one backing.
     for (uint8_t seed = 1; seed <= 8; ++seed) {
@@ -37,6 +38,10 @@ static void CheckGpuSendWindow(Options opts, int gpu) {
     auto dst = Buffer::Allocate(4 * window, gpu);
     for (uint8_t seed = 1; seed <= 8; ++seed) {
         const size_t size = window + size_t(seed) * 150001;
+        std::vector<uint8_t> sourceBytes(size);
+        sources[seed - 1].Read(sourceBytes.data(), 0, size);
+        for (size_t i = 0; i < size; ++i)
+            Check(sourceBytes[i] == uint8_t(i * 17 + seed), "source range overwritten before RDMA");
         Message req{{seed}, {}};
         std::future<Message> future;
         Check(receiver.TrySubmit(sender.Address(), req, future, {}, {},
@@ -55,11 +60,15 @@ static void CheckGpuSendWindow(Options opts, int gpu) {
         }
         for (size_t i = 0; i < data.size(); ++i) {
             const size_t source = i < size ? i : i - size + 3;
-            Check(data[i] == uint8_t(source * 17 + seed), "overwritten GPU send window");
+            if (data[i] != uint8_t(source * 17 + seed))
+                throw std::runtime_error("GPU transfer mismatch seed=" + std::to_string(seed) +
+                    " byte=" + std::to_string(i) + " observed=" + std::to_string(data[i]) +
+                    " expected=" + std::to_string(uint8_t(source * 17 + seed)));
         }
     }
-    Check(allocations == 1, "variable GPU snapshots must reuse one send window");
-    std::cout << "GPU RDMA send window reused across eight variable snapshots PASS\n";
+    Check(allocations == (preallocated ? 0 : 1), "unexpected send-window count for GPU snapshots");
+    std::cout << (preallocated ? "Preallocated GPU RDMA slices" : "GPU RDMA send window")
+              << " across eight variable snapshots PASS\n";
 }
 int main(int argc, char **argv) {
     try {
@@ -67,7 +76,10 @@ int main(int argc, char **argv) {
         if (argc > 1) { Check(std::string(argv[1]) == "--rdma", "usage: receive_target_test [--rdma [GPU [rail]]]"); o.transport = Transport::Rdma; }
         const int gpu = argc > 2 ? std::stoi(argv[2]) : -1;
         if (argc > 3) o.rdmaDevices = {argv[3]};
-        if (gpu >= 0) CheckGpuSendWindow(o, gpu);
+        if (gpu >= 0) {
+            CheckGpuSendWindow(o, gpu, false);
+            CheckGpuSendWindow(o, gpu, true);
+        }
         auto input = Buffer::Allocate(123457, gpu);
         std::vector<unsigned char> bytes(input.Size()), actual(bytes.size());
         for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (i * 71 + i / 97) % 251;

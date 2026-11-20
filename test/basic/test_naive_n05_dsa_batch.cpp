@@ -565,7 +565,7 @@ static void TestVerifySwa(int requests, int width, bool fp8) {
 
 // Compare every physical byte against a CPU ring update, including unwritten
 // slots, mixed BF16/FP8 rows and chunks that end partway through a batch.
-static void TestCommitSwa(int count) {
+static void TestCommitSwa(int count, int boundBytes = 0) {
     std::vector<Data> keys(count), values(count);
     std::vector<std::vector<unsigned char>> expected(count * 2);
     std::vector<FastllmNaiveCacheCommit> updates;
@@ -573,7 +573,7 @@ static void TestCommitSwa(int count) {
         const int past = 121 + i * 13, accepted = i % 9;
         for (int part = 0; part < 2; ++part) {
             Data &cache = part ? values[i] : keys[i];
-            cache.dataType = i % 2 ? FP8_E4M3 : BFLOAT16;
+            cache.dataType = (boundBytes ? boundBytes == 1 : i % 2) ? FP8_E4M3 : BFLOAT16;
             cache.UpdateUnitSize();
             const int width = part ? 128 : 192;
             cache.dataDevice = DataDevice::CUDA; cache.dataDeviceIds = {0};
@@ -589,11 +589,39 @@ static void TestCommitSwa(int count) {
         }
         updates.push_back({&keys[i], &values[i], past, accepted});
     }
-    FastllmCudaNaiveBatchCommitSwaVerify(updates);
+    if (boundBytes) {
+        // Include a separate-indexer half-table, a padded slot, and null
+        // bindings for masked layers and requests with zero accepted rows.
+        const int layers = 3, stride = (count + 1) * 8;
+        std::vector<const void *> entries(layers * stride);
+        std::vector<int> lengths((count + 1) * 2);
+        for (int i = 0; i < count; ++i) {
+            lengths[2 * i] = 121 + 13 * i;
+            lengths[2 * i + 1] = i % 9;
+            if (i % 9) {
+                entries[stride + 4 * i] = keys[i].cudaData;
+                entries[stride + 4 * i + 1] = values[i].cudaData;
+            }
+        }
+        Data table(INT32, {(int)(entries.size() * sizeof(void *) / sizeof(int))});
+        Data accepted(INT32, {(int)lengths.size()});
+        table.ToDevice(CUDA, std::vector<int>{0}, false); table.Allocate();
+        accepted.ToDevice(CUDA, std::vector<int>{0}, false); accepted.Allocate();
+        Cuda(cudaMemcpy(table.cudaData, entries.data(), table.GetBytes(), cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(accepted.cudaData, lengths.data(), accepted.GetBytes(), cudaMemcpyHostToDevice));
+        Graph graph;
+        graph.Capture([&] {
+            FastllmCudaNaiveCommitBoundSwa((const void *const *)table.cudaData, (const int *)accepted.cudaData,
+                count + 1, layers, uint64_t(1) << 1, stride, 192 * boundBytes, 128 * boundBytes);
+        });
+        graph.Run();
+    } else {
+        FastllmCudaNaiveBatchCommitSwaVerify(updates);
+    }
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
     for (int i = 0; i < count; ++i) for (int part = 0; part < 2; ++part) {
         Data &cache = part ? values[i] : keys[i];
-        Require(cache.dims[1] == std::min(121 + i * 13 + i % 9, 127), "SWA commit logical length");
+        if (!boundBytes) Require(cache.dims[1] == std::min(121 + i * 13 + i % 9, 127), "SWA commit logical length");
         std::vector<unsigned char> actual(expected[i * 2 + part].size());
         Cuda(cudaMemcpy(actual.data(), cache.cudaData, actual.size(), cudaMemcpyDeviceToHost));
         if (actual != expected[i * 2 + part]) {
@@ -637,7 +665,8 @@ int main(int argc, char **argv) {
             TestRebinding(65 * width, 257, true, false, false, true, width, 16);
         for (int requests : {8, 65}) for (int width : {4, 6, 7, 8})
             TestSharedIndexerQueries(requests, width);
-        for (int count : {1, 32, 112, 113, 257}) TestCommitSwa(count);
+        for (int count : {1, 32, 112, 113, 257})
+            for (int width : {0, 1, 2}) TestCommitSwa(count, width);
         for (int requests : {8, 32, 128}) for (int width : {4, 6, 8})
             for (bool fp8 : {false, true}) TestVerifySwa(requests, width, fp8);
 

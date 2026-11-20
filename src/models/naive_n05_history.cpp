@@ -74,7 +74,7 @@ bool NaiveN05FlashModel::TryAdmitResponseContext(ResponseContext *context) {
 void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     RestoreTensorParallelCache(context);
     std::shared_ptr<PrefixSnapshot> queuedPrefix;
-    int group = -1, best = 0;
+    int group = context->pdPrefillGroup, best = 0;
     const int preferred = tpNextRequestId % attentionDP;
     if (saveHistoryChat && context->multimodalInput.empty()) {
         std::lock_guard<std::mutex> guard(historyMutex);
@@ -88,6 +88,7 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
                 auto owner = std::find(tpDevices.begin(), tpDevices.end(), entry->ownerDevice);
                 if (owner == tpDevices.end()) continue;
                 candidate = (owner - tpDevices.begin()) / AttentionTPSize();
+                if (context->pdPrefillGroup >= 0 && candidate != context->pdPrefillGroup) continue;
             }
             if (entry->length > best || candidate == preferred) {
                 group = candidate; best = entry->length; queuedPrefix = entry;

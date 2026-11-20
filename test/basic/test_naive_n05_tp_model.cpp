@@ -1107,6 +1107,8 @@ class Fixture : public NaiveN05FlashModel {
                 for (int i = 0; i < length; ++i) context->allTokens.push_back((i * 17 + 3) % 256);
                 context->inputTokens = length + 1;
                 (context == &reference ? *this : destination).OnResponseContextCreated(context);
+                if (context == &reference && dp > 1 && dp == ranks && !TryAdmitResponseContext(context))
+                    throw std::runtime_error("PD source window admission failed");
             }
             std::vector<float> ids(reference.allTokens.begin(), reference.allTokens.end()), positions(length);
             std::iota(positions.begin(), positions.end(), 0.f);
@@ -1131,6 +1133,42 @@ class Fixture : public NaiveN05FlashModel {
             isIntermediateChunkedPrefill = false;
             reference.preTokens = length;
             auto message = ExportPDState(reference);
+            const bool independentExport = dp > 1 && dp == ranks && !draft && kvCacheDataType == FP8_E4M3;
+            if (independentExport) {
+                auto pack = PreparePDExport(reference);
+                if (!pack) throw std::runtime_error("missing independent GPU export");
+                // Use another live request on the producer while packing a
+                // long prefix. The two paths must not share GPU worker state.
+                ResponseContext next;
+                const bool overlap = length == 4097;
+                if (overlap) {
+                    next.Init(block_cnt, dataType, kvCacheDataType);
+                    next.allTokens.assign(128, 17);
+                    next.generationConfig.input_token_length = next.inputTokens = 128;
+                    OnResponseContextCreated(&next);
+                    if (!TryAdmitResponseContext(&next)) throw std::runtime_error("overlap window admission failed");
+                }
+                auto result = std::async(std::launch::async, std::move(pack));
+                if (overlap) {
+                    std::vector<float> pos(128);
+                    std::iota(pos.begin(), pos.end(), 0.f);
+                    isIntermediateChunkedPrefill = true;
+                    Forward(Data(FLOAT32, {1,128}, std::vector<float>(128,17)), Data(), Data(FLOAT32, {1,128}, pos),
+                            next.pastKeyValues, next.generationConfig);
+                    isIntermediateChunkedPrefill = false;
+                    OnResponseContextRemoved(&next);
+                }
+                auto async = result.get();
+                if (async.metadata != message.metadata || async.buffers.size() != message.buffers.size())
+                    throw std::runtime_error("independent GPU export changed the wire format");
+                for (size_t i = 0; i < message.buffers.size(); ++i) {
+                    std::vector<uint8_t> a(message.buffers[i].Size()), b(async.buffers[i].Size());
+                    message.buffers[i].Read(a.data(), 0, a.size());
+                    async.buffers[i].Read(b.data(), 0, b.size());
+                    if (a != b) throw std::runtime_error("independent GPU export changed KV bytes");
+                }
+                message = std::move(async);
+            }
             imported.allTokens.push_back(42);
             if (kvmem) {
                 // Dropping an unsubmitted reservation must return every page.
@@ -1282,6 +1320,19 @@ class Fixture : public NaiveN05FlashModel {
                 }
                 if (!original->rounds || !original->proposed)
                     throw std::runtime_error("PD test did not execute speculative verification");
+            }
+            if (independentExport) {
+                // Imported state remains live. A mirrored root and leaf own
+                // only one page reference on the source GPU.
+                const Data &root = reference.pastKeyValues.front().first;
+                const Data &leaf = *root.multiDeviceDatas.at(PDRequestDevices(reference).front());
+                auto *pool = leaf.pagedKVCacheData;
+                const int page = leaf.pageIndex.at(0), refs = pool->pageRefCount.at(page);
+                std::weak_ptr<void> window = root.kvStorageOwner;
+                if (window.expired()) throw std::runtime_error("missing source window lease");
+                std::async(std::launch::async, [&] { ReleasePDExportSources(reference); }).get();
+                if (!window.expired() || pool->pageRefCount.at(page) != refs - 1 || !root.multiDeviceDatas.empty())
+                    throw std::runtime_error("finished export did not release its source exactly once");
             }
             OnResponseContextRemoved(&reference);
             destination.OnResponseContextRemoved(&imported);
@@ -3738,6 +3789,50 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 
+    void CheckDraftHeadRows(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts) {
+        // Non-monotone owner order, unequal prefix lengths and empty owners must preserve the
+        // row layout of the original full-backbone gather and sharded vocabulary projection.
+        const std::vector<int> limits{2, 1, 3};
+        Data hidden;
+        if (!RunDraftBatch(anchors, contexts, hidden)) throw std::runtime_error("draft hidden reference");
+        hidden.ToDevice(CPU);
+        Data packed(BFLOAT16, {1, 6, embed_dim});
+        packed.Allocate();
+        size_t dest = 0;
+        for (size_t i = 0; i < limits.size(); ++i) {
+            const size_t bytes = size_t(limits[i]) * embed_dim * sizeof(uint16_t);
+            std::memcpy(packed.cpuData + dest, hidden.cpuData + i * draftBlock * embed_dim * sizeof(uint16_t), bytes);
+            dest += bytes;
+        }
+        std::vector<uint8_t> expected(packed.cpuData, packed.cpuData + dest);
+        packed.ToDevice(CUDA, std::vector<int>{0});
+        Data reference = RunDraftHead(packed);
+        std::vector<uint16_t> expectedLogits(reference.Count(0));
+        FastllmCudaCopyFromDeviceToHost(expectedLogits.data(), reference.cudaData, reference.GetBytes());
+        std::vector<Data> inputs, logits;
+        DraftHeadShards shards{limits, inputs, logits};
+        if (!RunDraftBatch(anchors, contexts, hidden, 0, &shards)) throw std::runtime_error("draft shard fallback");
+        int offset = 0;
+        for (int rank = 0; rank < ranks; ++rank) {
+            FastllmCudaSetDevice(rank);
+            if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error("reading draft shard");
+            auto &input = inputs.at(rank), &shard = logits.at(rank);
+            input.ToDevice(CPU); shard.ToDevice(CPU);
+            if (input.GetBytes() != expected.size() || std::memcmp(input.cpuData, expected.data(), expected.size()))
+                throw std::runtime_error("direct draft shard input differs from packed BF16 reference");
+            const int width = shard.dims.back(), vocab = reference.dims.back();
+            for (int row = 0; row < packed.dims[1]; ++row) {
+                const size_t src = size_t(row) * width * sizeof(uint16_t);
+                const size_t dst = size_t(row) * vocab + offset;
+                if (std::memcmp(shard.cpuData + src, expectedLogits.data() + dst, width * sizeof(uint16_t)))
+                    throw std::runtime_error("direct draft logits differ from joined BF16 reference");
+            }
+            offset += width;
+        }
+        if (offset != reference.dims.back()) throw std::runtime_error("draft vocabulary coverage");
+        FastllmCudaSetDevice(0);
+    }
+
     void AttentionDPSpark(int groups, int candidates, bool sample, bool finiteTopK = false, bool sampleOracle = false, bool toolGrammar = false) {
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
         const int rejectionCalls = batchedRejectionCalls;
@@ -3795,6 +3890,12 @@ class Fixture : public NaiveN05FlashModel {
                 draftEnabled=false; expected[i]=Forward(input,Data(),positions,reference[i],cfg); draftEnabled=true;
                 if(anchors[i]!=expected[i]) throw std::runtime_error("DP draft prefill token mismatch");
             }
+        }
+        if (CanShardDraftHead()) {
+            const int last = requests - 1;
+            CheckDraftHeadRows({anchors[last], anchors[1], anchors[0]},
+                {draftContexts.at(&caches[last]).get(), draftContexts.at(&caches[1]).get(),
+                 draftContexts.at(&caches[0]).get()});
         }
         for(int turn=0;turn<24;++turn) {
             std::vector<int> order;
