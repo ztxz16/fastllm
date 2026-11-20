@@ -311,6 +311,24 @@ inline bool MakeLayouts(Plan &p, const Key &key) {
     return true;
 }
 
+// Keep Lt's recommendation for an unsplit GEMM. For split-K, try larger
+// split counts first and keep Lt's order among equally partitioned candidates.
+inline void PreferSplitK(cublasLtMatmulHeuristicResult_t *candidates, int count) {
+    uint32_t splits[maxCandidates]{};
+    for (int i = 0; i < count; ++i) {
+        uint32_t split = 0;
+        size_t written = 0;
+        if (CheckBlas(cublasLtMatmulAlgoConfigGetAttribute(&candidates[i].algo,
+                CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split, sizeof(split), &written)))
+            splits[i] = split;
+        if (i == 0 && splits[0] <= 1) return;
+        for (int j = i; j > 0 && splits[j] > splits[j - 1]; --j) {
+            std::swap(splits[j], splits[j - 1]);
+            std::swap(candidates[j], candidates[j - 1]);
+        }
+    }
+}
+
 inline void MakePlan(State &s, Plan &p, const Key &key,
                      const void *weight, const void *input, void *output, bool heuristicOnly = false) {
     if (!MakeLayouts(p, key)) return;
@@ -355,20 +373,21 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
         }
         return;
     }
-    // BF16 decode on Hopper values reproducibility across TP ranks and
-    // restarts. Timing near-tied algorithms (especially under a profiler) can
-    // change both latency and the reduction tree. Use the library's first
-    // supported heuristic within the same FP32/workspace/alignment constraints.
-    const bool stableBf16 = dtype == CUDA_R_16BF && (M == 1 || s.arch == 90);
+    auto end = std::remove_if(candidates, candidates + count, [](const auto &candidate) {
+        return candidate.state != CUBLAS_STATUS_SUCCESS || candidate.workspaceSize > workspaceBytes;
+    });
+    if (end == candidates) return;
+    // First-use timing can change the BF16 reduction across TP ranks and restarts.
+    const bool blackwell = s.arch / 10 == 10;
+    const bool stableBf16 = dtype == CUDA_R_16BF && (M == 1 || s.arch == 90 || blackwell);
+    if (stableBf16 && blackwell && M > 1) PreferSplitK(candidates, int(end - candidates));
     if (!stableBf16) {
         CheckCuda(cudaEventCreate(&search.begin));
         CheckCuda(cudaEventCreate(&search.end));
     }
     float best = std::numeric_limits<float>::max();
-    for (int i = 0; i < count; ++i) {
-        if (candidates[i].state != CUBLAS_STATUS_SUCCESS ||
-            candidates[i].workspaceSize > workspaceBytes) continue;
-        const auto &algo = candidates[i].algo;
+    for (auto candidate = candidates; candidate != end; ++candidate) {
+        const auto &algo = candidate->algo;
         if (!Run(s, p, algo, weight, input, output, s.eager->data)) continue;
         if (stableBf16) {
             p.algo = algo;

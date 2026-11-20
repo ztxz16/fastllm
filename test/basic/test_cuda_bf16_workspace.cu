@@ -284,11 +284,17 @@ int main() {
         waitBusy(0);
         // Recreating substantially more workers than the former eight lifetime
         // slots must keep using Lt. Source graph destruction releases its lease.
+        const auto workerReference = p[2].reference;
         for (int i = 0; i < 24; ++i) {
             std::thread worker([&]() {
                 try {
                     cu(cudaSetDevice(0));
+                    const size_t capturesBeforeWarm = observed.size();
                     p[2].warm();
+                    if (prop.major == 10) {
+                        need(observed.size() == capturesBeforeWarm, "Blackwell BF16 warmup ran timing captures");
+                        need(p[2].reference == workerReference, "fresh worker changed the BF16 reduction");
+                    }
                     p[2].capture();
                     cu(cudaGraphLaunch(p[2].exec, cudaStreamPerThread));
                     cu(cudaStreamSynchronize(cudaStreamPerThread));
@@ -347,7 +353,7 @@ int main() {
             try {
                 cu(cudaSetDevice(0));
                 auto *s = lt::GetState(0, false);
-                // Hopper BF16 uses deterministic heuristics without timing
+                // BF16 can use deterministic heuristics without timing
                 // captures. Exercise capture failures through the FP16 search.
                 lt::Key key{M, N, K, lt::Alignment(p[2].weight), lt::Alignment(p[2].input),
                             lt::Alignment(p[2].output), static_cast<int>(CUDA_R_16F)};
