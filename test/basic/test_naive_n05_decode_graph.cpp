@@ -706,11 +706,11 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
     }
 }
 
-static void TestRouterBatch(int batch, int pattern) {
+static void TestRouterBatch(int batch, int pattern, int experts = 256) {
     Data input(BFLOAT16), weight(FLOAT32), bias(FLOAT32), actual, expected(FLOAT32);
     Data indices(INT32), scores(FLOAT32), referenceIndices(INT32), referenceScores(FLOAT32);
-    Upload(input, {1, batch, 4096}, 181); Upload(weight, {256, 4096}, 182);
-    Upload(bias, {256}, 183); Upload(expected, {1, batch, 256}, 184);
+    Upload(input, {1, batch, 4096}, 181); Upload(weight, {experts, 4096}, 182);
+    Upload(bias, {experts}, 183); Upload(expected, {1, batch, experts}, 184);
     Upload(indices, {batch, 8}, 185); Upload(scores, {batch, 8}, 186);
     Upload(referenceIndices, {batch, 8}, 187); Upload(referenceScores, {batch, 8}, 188);
     if (pattern == 1) {
@@ -735,7 +735,7 @@ static void TestRouterBatch(int batch, int pattern) {
         for (int b = 0; b < batch; ++b) {
             Data row, result;
             row.Resize({1, 1, 4096}); row.FakeFrom(input, (size_t)b * 4096 * 2);
-            result.Resize({1, 1, 256}); result.FakeFrom(expected, (size_t)b * 256 * 4);
+            result.Resize({1, 1, experts}); result.FakeFrom(expected, (size_t)b * experts * sizeof(float));
             Require(FastllmCudaNaiveRouterSigmoid(row, weight, result), "reference router unsupported");
         }
         Require(Read<float>(actual) == Read<float>(expected), "batch router probabilities changed");
@@ -800,8 +800,9 @@ int main() {
             TestPaddedAttention(batch, 8, 192, 128, sparse, fp8);
             TestPaddedAttention(batch, 2, 64, 256, sparse, fp8);
         }
-        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 32, 48, 64, 128, 129})
+        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 31, 32, 33, 48, 64, 128, 129, 255, 256})
             for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
+        TestRouterBatch(33, 2, 255);
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})
                 TestSwaBatch(batch, heads, heads == 16 ? 2 : 1);

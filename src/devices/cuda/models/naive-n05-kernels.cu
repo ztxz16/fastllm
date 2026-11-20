@@ -309,6 +309,58 @@ __global__ void RouterTile(const BF16 *input, const float *weight, float *output
         output[size_t(first + r) * experts + expert] = 1.0 / (1.0 + expf(-(v + 0.0f)));
 }
 
+// Reuse activations across experts and weights across rows. Keep the same
+// per-lane FMAs and reduction order as the single-row router.
+template <int Rows, int Experts>
+__global__ void RouterTile4096(const BF16 *__restrict__ input, const float *__restrict__ weight,
+                                float *__restrict__ output, int rows, int experts) {
+    const int t = threadIdx.x, firstExpert = blockIdx.x * Experts;
+    const int ownedRow = blockIdx.y * Rows;
+    // Shift the final partial tile inside the input. Only its trailing rows are written.
+    const int firstRow = min(ownedRow, rows - Rows);
+    __shared__ float sums[Rows * Experts][8];
+    float2 partial[Rows][Experts]{};
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int col = t * 2 + i * 256;
+        float2 w[Experts];
+        #pragma unroll
+        for (int e = 0; e < Experts; ++e)
+            w[e] = *reinterpret_cast<const float2 *>(weight + size_t(firstExpert + e) * 4096 + col);
+        #pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            const float2 x = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162 *>(
+                input + size_t(firstRow + r) * 4096 + col));
+            #pragma unroll
+            for (int e = 0; e < Experts; ++e) {
+                partial[r][e].x = fmaf(x.x, w[e].x, partial[r][e].x);
+                partial[r][e].y = fmaf(x.y, w[e].y, partial[r][e].y);
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < Rows; ++r) {
+        #pragma unroll
+        for (int e = 0; e < Experts; ++e) {
+            float value = partial[r][e].x + partial[r][e].y;
+            #pragma unroll
+            for (int d = 1; d < 16; d *= 2) value += __shfl_down_sync(~0u, value, d);
+            if (t % 16 == 0) sums[r * Experts + e][t / 16] = value;
+        }
+    }
+    __syncthreads();
+    for (int group = t / 8; group < Rows * Experts; group += 16) {
+        float value = sums[group][t % 8];
+        const unsigned mask = 0xffu << (t & 24);
+        #pragma unroll
+        for (int d = 1; d < 8; d *= 2) value += __shfl_down_sync(mask, value, d, 8);
+        const int row = firstRow + group / Experts;
+        if (t % 8 == 0 && row >= ownedRow)
+            output[size_t(row) * experts + firstExpert + group % Experts] =
+                1.0 / (1.0 + expf(-(value + 0.f)));
+    }
+}
+
 // Keep the full argument block below the legacy 4 KiB CUDA limit.
 constexpr int kDraftKVLayersPerLaunch = 80;
 struct DraftKVWeights { const void *data[kDraftKVLayersPerLaunch]; };
@@ -5054,9 +5106,16 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
     const int rowTiles = 1 + (rows - 1) / kRouterTileRows;
     const bool blackwell = arch == 100 || arch == 103;
     if (blackwell && rows >= 2 && ((uintptr_t(input.cudaData) | uintptr_t(weight.cudaData)) & 7) == 0) {
-        auto kernel = rows <= 4 ? RouterPairs4096<1> : RouterPairs4096<2>;
-        const int tile = rows <= 4 ? 1 : 2;
-        kernel<<<dim3(experts, (rows + tile - 1) / tile), 128>>>(
+        constexpr int wideRows = 8, wideExperts = 4;
+        const int rowTiles = (rows + wideRows - 1) / wideRows;
+        // Keep the narrow launch when a wider tile would leave too few blocks.
+        const bool tiled = rows >= 32 && experts % wideExperts == 0 &&
+            int64_t(rowTiles) * (experts / wideExperts) >= 256;
+        const int rowTile = tiled ? wideRows : (rows <= 4 ? 1 : 2);
+        const int expertTile = tiled ? wideExperts : 1;
+        auto kernel = tiled ? RouterTile4096<wideRows, wideExperts> :
+            (rows <= 4 ? RouterPairs4096<1> : RouterPairs4096<2>);
+        kernel<<<dim3(experts / expertTile, (rows + rowTile - 1) / rowTile), 128>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
             (float *)output.cudaData, rows, experts);
     }
