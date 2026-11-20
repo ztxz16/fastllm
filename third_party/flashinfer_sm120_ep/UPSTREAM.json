@@ -82,7 +82,7 @@
     1024,
     2048
   ],
-  "manifest_sha256": "6aace41c2f3224a3238bb1bb72547563cb3ef2e58725cb2ea325efa4e89df87a",
+  "manifest_sha256": "2cc45ac57f071b9afe97a2470f80bdc96b5ff5d011dbf56acd49a181d0ab6d1c",
   "binaries_sha256": [
     "0139d1b040c7f431d2fee6d81f7405eb7bf1333ab6e14aa97bf3c03563d8f839",
     "025cd6781e34350390af921c130817a201831d0e260b3a7cdcab2b5fc24be120",
@@ -301,7 +301,7 @@
         1024,
         2048
       ],
-      "manifest_sha256": "cb62a064c66714943f2aeab52460e4a1a6d2856df8ccfe685b3cefa3aa67b07c",
+      "manifest_sha256": "3a6c8579d26e8c66087e26f6beda8233e65a48fe12038b28c2dec9ee8e0cb48f",
       "binaries_sha256": [
         "029865ff8e55c3e1d1678a385b474ce569082a8daeb24cb7f7479e28f4a23dfb",
         "02e818ad8458d011d597077c5cd548c5883ec95028e6f81040cce48bb34d5f88",
