@@ -550,15 +550,23 @@ if (USE_CUDA)
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MOE16_SM90)
     endif()
 
+    # The host pass must only reference the online decode kernels when the fatbin
+    # contains an image for one of the architectures used by runtime dispatch.
+    set(FASTLLM_CUDA_REQUESTED_ARCHS ${FASTLLM_CUDA_ARCHITECTURES})
+    if ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES)
+        list(APPEND FASTLLM_CUDA_REQUESTED_ARCHS ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+    endif()
+    if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8 AND
+        FASTLLM_CUDA_REQUESTED_ARCHS MATCHES "(^|;)(10[03][af]?(-real|-virtual)?|all(-major)?)(;|$)")
+        set_property(SOURCE src/devices/cuda/models/naive-n05-kernels.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_BUILD_NAIVE_BLACKWELL_DECODE)
+    endif()
+
     # Embed only the pinned kernel headers; no Python/JIT/runtime dependency.
     set(FASTLLM_MIMO_MEGA_ARCHS "")
     if (UNIX AND NOT APPLE AND NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE AND
         EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/cutlass.h")
-        set(FASTLLM_MIMO_MEGA_REQUESTED_ARCHS ${FASTLLM_CUDA_ARCHITECTURES})
-        if ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES)
-            list(APPEND FASTLLM_MIMO_MEGA_REQUESTED_ARCHS ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
-        endif()
-        foreach(arch IN LISTS FASTLLM_MIMO_MEGA_REQUESTED_ARCHS)
+        foreach(arch IN LISTS FASTLLM_CUDA_REQUESTED_ARCHS)
             string(REGEX MATCH "^[0-9]+" number "${arch}")
             if (number STREQUAL "90" AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
                 list(APPEND FASTLLM_MIMO_MEGA_ARCHS 90)
