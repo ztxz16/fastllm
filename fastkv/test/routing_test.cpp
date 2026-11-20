@@ -21,6 +21,14 @@ int main() {
         quotes[0] = {}; quotes[1] = {};
         quotes[0].hostCachedTokens = 9900; quotes[0].restoreSeconds = .02;
         Check(router.Reserve(10000, quotes).peer == 0, "L2 hit treated as a full recompute");
+        Check(!PrefillRouter::PreferHostPrefix(9216, 9305, 128, 18400, .0031) &&
+               PrefillRouter::PreferHostPrefix(9216, 9305, 64, 18400, .0031), "ignored producer page size");
+        Check(!PrefillRouter::PreferHostPrefix(9216, 9216 + 127, 128, 18400, .0031), "sub-page gain used L2");
+        Check(PrefillRouter::PreferHostPrefix(9216, 9216 + 128, 128, 18400, .0031), "full-page gain lost L2");
+        Check(!PrefillRouter::PreferHostPrefix(9216, 9216 + 128, 128, 18400, .02), "ignored restore cost");
+        Check(PrefillRouter::PreferHostPrefix(0, 89, 128, 18400, .001), "discarded a short L2-only prefix");
+        Check(!PrefillRouter::PreferHostPrefix(89, 89, 1, 18400, 0), "equal L1 hit used L2");
+        Check(!PrefillRouter::PreferHostPrefix(90, 89, 1, 18400, 0), "shorter L2 prefix underflowed");
         quotes[1].cachedTokens = 9900;
         Check(router.Reserve(10000, quotes).peer == 1, "L1 ignored restore cost");
         quotes[1] = {}; quotes[0].pendingRestoreSeconds = 10;

@@ -620,15 +620,15 @@ extern "C" {
         return fastllmPytoolsContextResult.c_str();
     }
 
-    DLL_EXPORT int create_llm_model_fromhf_with_context(char *path, int dataType, int groupCnt,
+    static int CreateHFModelWithContext(char *path, int dataType, int groupCnt,
             bool skipTokenizer, char *lora, bool useMoe, int moeDataType, int moeGroupCnt,
-            char *dtypeConfigString, int maxLength, char *ropeScaling) {
+            char *dtypeConfigString, int maxLength, char *ropeScaling, bool pdPrefill) {
         fastllmPytoolsContextResult.clear();
         try {
             std::lock_guard<std::mutex> guard(models.locker);
             auto model = fastllm::CreateLLMModelFromHF(path, (fastllm::DataType)dataType,
                 groupCnt, skipTokenizer, "", lora, false, useMoe, (fastllm::DataType)moeDataType,
-                moeGroupCnt, dtypeConfigString, {maxLength, ropeScaling == nullptr ? "" : ropeScaling});
+                moeGroupCnt, dtypeConfigString, {maxLength, ropeScaling == nullptr ? "" : ropeScaling}, pdPrefill);
             int id = models.models.size();
             models.models[id] = std::move(model);
             return id;
@@ -640,6 +640,20 @@ extern "C" {
             fastllmPytoolsContextResult = "unknown model initialization error";
         }
         return -1;
+    }
+
+    DLL_EXPORT int create_llm_model_fromhf_with_context(char *path, int dataType, int groupCnt,
+            bool skipTokenizer, char *lora, bool useMoe, int moeDataType, int moeGroupCnt,
+            char *dtypeConfigString, int maxLength, char *ropeScaling) {
+        return CreateHFModelWithContext(path, dataType, groupCnt, skipTokenizer, lora, useMoe,
+                moeDataType, moeGroupCnt, dtypeConfigString, maxLength, ropeScaling, false);
+    }
+
+    DLL_EXPORT int create_pd_prefill_model_fromhf_with_context(char *path, int dataType, int groupCnt,
+            bool skipTokenizer, char *lora, bool useMoe, int moeDataType, int moeGroupCnt,
+            char *dtypeConfigString, int maxLength, char *ropeScaling) {
+        return CreateHFModelWithContext(path, dataType, groupCnt, skipTokenizer, lora, useMoe,
+                moeDataType, moeGroupCnt, dtypeConfigString, maxLength, ropeScaling, true);
     }
 
     DLL_EXPORT int create_llm_model_from_gguf_with_context(
@@ -904,6 +918,16 @@ extern "C" {
         return fastllmPytoolsContextResult.c_str();
     }
 
+    DLL_EXPORT const char *configure_dspark_parallel_llm_model(int modelId, int ranks, bool replicas) {
+        fastllmPytoolsContextResult.clear();
+        try {
+            auto *model = dynamic_cast<fastllm::NaiveN05FlashModel *>(models.GetModel(modelId));
+            if (!model) throw std::invalid_argument("draft parallel placement requires a Naive DSA model");
+            model->ConfigureDraftParallel(ranks, replicas);
+        } catch (const std::exception &error) { fastllmPytoolsContextResult = error.what(); }
+        return fastllmPytoolsContextResult.c_str();
+    }
+
     DLL_EXPORT const char *set_model_indexer_compute_dtype(int modelId, const char *dtype) {
         fastllmPytoolsContextResult.clear();
         try {
@@ -968,10 +992,11 @@ extern "C" {
         return;
     }
 
-    DLL_EXPORT const char *warmup_llm_model(int modelId) {
+    static const char *WarmupModel(int modelId, bool pdPrefillOnly) {
         fastllmPytoolsWarmupError.clear();
         try {
             auto model = models.GetModel(modelId);
+            if (pdPrefillOnly) model->pdPrefillOnly = true;
             model->AutoWarmup();
             return nullptr;
         } catch (const std::exception &error) {
@@ -986,6 +1011,14 @@ extern "C" {
                 fastllmPytoolsWarmupError.c_str());
         fflush(stderr);
         return fastllmPytoolsWarmupError.c_str();
+    }
+
+    DLL_EXPORT const char *warmup_llm_model(int modelId) {
+        return WarmupModel(modelId, false);
+    }
+
+    DLL_EXPORT const char *warmup_pd_prefill_llm_model(int modelId) {
+        return WarmupModel(modelId, true);
     }
 
     DLL_EXPORT void save_llm_model(int modelId, char *path) {

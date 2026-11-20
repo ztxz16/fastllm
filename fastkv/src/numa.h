@@ -72,20 +72,22 @@ class NumaScope {
     NumaScope(const NumaScope &) = delete;
     NumaScope &operator=(const NumaScope &) = delete;
 };
-inline Buffer AllocateNumaHost(size_t bytes, const DeviceNuma &node) {
+inline Buffer AllocateNumaHost(size_t bytes, const DeviceNuma &node, bool pageAligned = false) {
 #if defined(__linux__) && defined(FASTKV_CUDA)
-    if (bytes && node.node >= 0) {
+    if (bytes && (node.node >= 0 || pageAligned)) {
         void *address = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (address == MAP_FAILED) throw std::bad_alloc();
         std::shared_ptr<void> owner(address, [bytes](void *p) { munmap(p, bytes); });
-        constexpr size_t bits = sizeof(unsigned long) * 8;
-        std::vector<unsigned long> mask(size_t(node.node) / bits + 1);
-        mask[node.node / bits] |= 1UL << (node.node % bits);
-        // PREFERRED can spill under memory pressure. Unsupported/denied policy
-        // falls back to first touch on the copy worker without breaking restore.
-        // Linux reads maxnode - 1 bits. Include the highest set bit too;
-        // otherwise a single-node mask silently becomes the local policy.
-        syscall(SYS_mbind, address, bytes, MPOL_PREFERRED, mask.data(), mask.size() * bits + 1, 0);
+        if (node.node >= 0) {
+            constexpr size_t bits = sizeof(unsigned long) * 8;
+            std::vector<unsigned long> mask(size_t(node.node) / bits + 1);
+            mask[node.node / bits] |= 1UL << (node.node % bits);
+            // PREFERRED can spill under memory pressure. Unsupported/denied policy
+            // falls back to first touch on the copy worker without breaking restore.
+            // Linux reads maxnode - 1 bits. Include the highest set bit too;
+            // otherwise a single-node mask silently becomes the local policy.
+            syscall(SYS_mbind, address, bytes, MPOL_PREFERRED, mask.data(), mask.size() * bits + 1, 0);
+        }
         return Buffer::Borrow(address, bytes, MemoryKind::Host, -1, std::move(owner));
     }
 #endif

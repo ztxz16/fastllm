@@ -36,6 +36,8 @@ class HostCache {
         // A negative window limit selects the historical shared pool. In split
         // mode the rest of bytes covers KV, Indexer and directory metadata.
         int64_t swaBytes = -1;
+        // Subset of the resident KV/window budgets. Zero keeps pageable storage.
+        size_t pinnedBytes = size_t(1) << 30;
         void SetBudgets(size_t total, int64_t kv = -1, int64_t swa = -1);
     };
     struct Entry;
@@ -56,6 +58,8 @@ class HostCache {
         uint64_t publications = 0, evictions = 0, skipped = 0, failures = 0;
         uint64_t copiedToHost = 0, reusedBytes = 0, restoredBytes = 0, restores = 0;
         uint64_t restoreMicroseconds = 0;
+        size_t pinnedResidentBytes = 0;
+        uint64_t directToHost = 0, directToDevice = 0, publishCopyMicroseconds = 0;
     };
     explicit HostCache(Options options);
     ~HostCache();
@@ -76,6 +80,8 @@ class HostCache {
     // after all DMA has completed. A busy return leaves targets untouched.
     bool RestoreIntoAsync(Hit hit, std::vector<Buffer> targets, std::future<Message> &result);
     Statistics Stats() const;
+    // Copy-worker bandwidth only. Zero until the first successful restore.
+    double RestoreBytesPerSecond() const;
     void Drain();
   private:
     bool Restore(Hit hit, std::vector<int> devices, std::vector<Buffer> targets,

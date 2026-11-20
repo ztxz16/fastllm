@@ -564,7 +564,7 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
         scores.ToDevice(DataDevice::CUDA, {tpDevices[rank]}, false); scores.Allocate(false);
     }
     printf("[Naive serving memory] preparing chunk %d, batch %d, verification rows %d (%s).\n",
-        chunk, batch, verifyRows, sparseKv ? "sparse KV bindings" : "before KV allocation"); fflush(stdout);
+        chunk, batch, pdPrefillOnly ? 0 : verifyRows, sparseKv ? "sparse KV bindings" : "before KV allocation"); fflush(stdout);
     GenerationConfig config;
     config.input_token_length = chunk; config.output_token_limit = verifyRows + 1;
     config.top_k = weight["lm_head.weight"].dims[0]; config.temperature = 1.0f; config.top_p = 0.95f;
@@ -606,6 +606,10 @@ void NaiveN05FlashModel::PrepareTensorParallelMemory() {
             prefillRoots.clear();
             capture.hidden.clear();
         }
+    }
+    if (pdPrefillOnly) {
+        PrepareDraftServingMemory(history);
+        return;
     }
     std::vector<std::pair<Data, Data>> roots;
     roots.reserve((size_t)batch * block_cnt);
@@ -762,7 +766,7 @@ std::vector<int> NaiveN05FlashModel::LocalServingGraphBuckets(int maxRequests) c
 
 void NaiveN05FlashModel::PrepareTensorParallelServing() {
 #ifdef USE_CUDA
-    if (tpServingState || !GetFastllmEnv().cudaGraph || !tpPrepared || (draftEnabled && (!attentionParallel || sparseKv)) ||
+    if ((draftEnabled && pdPrefillOnly) || tpServingState || !GetFastllmEnv().cudaGraph || !tpPrepared || (draftEnabled && (!attentionParallel || sparseKv)) ||
         tpDevices.size() <= 1 || !tpSwaRingCache ||
         (!tpEp8MegaState && std::any_of(moeLayers.begin(), moeLayers.end(), [](int x) { return x != 0; })) ||
         dataType != BFLOAT16 || !FastllmNaiveAttentionKVType(kvCacheDataType) || !GetCudaEmbedding() ||

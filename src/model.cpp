@@ -1840,24 +1840,28 @@ namespace fastllm {
         std::set <std::string> fileNames;
         std::map <std::string, SafeTensorItem> itmeDict;
 
-        SafeTensors (const std::set <std::string> &fileNames) {
+        SafeTensors (const std::set <std::string> &fileNames, const std::set<std::string> &required = {}) {
             std::string error;
             this->fileNames = fileNames;
             for (auto &fileName : fileNames) {
-                FILE *f = fopen(fileName.c_str(), "rb");
-                uint64_t configBytes;
-                int ret = fread(&configBytes, 8, 1, f);
-                char *configString = new char[configBytes + 5];
-                ret = fread(configString, 1, configBytes, f);
-                configString[configBytes] = 0;
-                auto config = json11::Json::parse(configString, error);
-                for (auto it : config.object_items()) {
-                    if (it.first != "__metadata__" ) {
+                std::ifstream file(fileName, std::ios::binary | std::ios::ate);
+                const auto size = file.tellg();
+                uint64_t configBytes = 0;
+                file.seekg(0);
+                AssertInFastLLM(size >= 8 && file.read(reinterpret_cast<char*>(&configBytes), 8) &&
+                        configBytes <= static_cast<uint64_t>(size) - 8,
+                        "Invalid or missing safetensors shard: " + fileName);
+                std::string header(configBytes, '\0');
+                AssertInFastLLM(file.read(header.data(), configBytes).good(),
+                                "Cannot read safetensors header: " + fileName);
+                auto config = json11::Json::parse(header, error);
+                AssertInFastLLM(error.empty() && config.is_object(), "Invalid safetensors header: " + fileName);
+                for (const auto &it : config.object_items()) {
+                    if (it.first != "__metadata__" && (required.empty() || required.count(it.first))) {
                         itmeDict[it.first] = SafeTensorItem(it.first, fileName, it.second, 8 + configBytes);
                     }
                 }
 
-                delete[] configString;
             }
         }
 
@@ -3067,6 +3071,14 @@ namespace fastllm {
         } else {
             ErrorInFastLLM("Unsupport tokenizer_class: " + tokenizerClass);
         }
+    }
+
+    std::unique_ptr<basellm> CreateLLMModelFromHF(const std::string &modelPath, DataType linearDataType,
+            int groupCnt, bool skipTokenizer, const std::string &modelConfig, const std::string &loraPath,
+            bool weightOnly, bool useMoeDataType, DataType moeDataType, int moeGroupCnt,
+            const std::string &dtypeConfigString, const ContextOptions &contextOptions) {
+        return CreateLLMModelFromHF(modelPath, linearDataType, groupCnt, skipTokenizer, modelConfig,
+                loraPath, weightOnly, useMoeDataType, moeDataType, moeGroupCnt, dtypeConfigString, contextOptions, false);
     }
 
     // 从hf文件夹读取分词
@@ -4980,7 +4992,7 @@ namespace fastllm {
     std::unique_ptr <basellm> CreateLLMModelFromHF(const std::string &modelPath, 
                                                     DataType linearDataType, int groupCnt, bool skipTokenizer, const std::string &modelConfig,
                                                     const std::string &loraPath, bool weightOnly, bool useMoeDataType, DataType moeDataType, int moeGroupCnt,
-                                                    const std::string &dtypeConfigString, const ContextOptions &contextOptions) {
+                                                    const std::string &dtypeConfigString, const ContextOptions &contextOptions, bool pdPrefillOnly) {
         if (moeGroupCnt == -1) {
             moeGroupCnt = groupCnt;
         }
@@ -5068,27 +5080,6 @@ namespace fastllm {
                 stFiles.insert(path + it.second.string_value());
             }
         }
-        if (!dsparkPath.empty()) {
-            std::string dsparkIndexFile =
-                dsparkPath + "model.safetensors.index.json";
-            if (!FileExists(dsparkIndexFile)) {
-                AssertInFastLLM(
-                    FileExists(dsparkPath + "model.safetensors"),
-                    "DSpark checkpoint has no model.safetensors: " +
-                    dsparkPath);
-                stFiles.insert(dsparkPath + "model.safetensors");
-            } else {
-                std::string dsparkIndexError;
-                auto dsparkIndex = json11::Json::parse(
-                    ReadAllFile(dsparkIndexFile),
-                    dsparkIndexError)["weight_map"];
-                AssertInFastLLM(dsparkIndexError.empty(),
-                                "Failed to parse DSpark safetensors index.");
-                for (auto it : dsparkIndex.object_items()) {
-                    stFiles.insert(dsparkPath + it.second.string_value());
-                }
-            }
-        }
         if (!dflashPath.empty()) {
             std::string dflashIndexFile =
                 dflashPath + "model.safetensors.index.json";
@@ -5143,15 +5134,6 @@ namespace fastllm {
                 if (entry.first.find(".engram.embed.") != std::string::npos)
                     safeTensors.itmeDict[entry.first] = entry.second;
         }
-        NormalizeSafeTensorSources(config["quantization_config"]["quant_method"].string_value(), safeTensors.itmeDict);
-        {
-            const auto &textConfig = config["text_config"].is_object() ? config["text_config"] : config;
-            for (const auto &layer : textConfig["engram_layer_ids"].array_items()) {
-                const std::string name = "layers." + std::to_string(layer.int_value()) + ".engram.embed.";
-                AssertInFastLLM(safeTensors.itmeDict.count(name + "weight") && safeTensors.itmeDict.count(name + "scale"),
-                    "Checkpoint is missing Engram tables; supply --engram-path or FASTLLM_DSV41_ENGRAM_PATH.");
-            }
-        }
         bool isAwqModel = false;
         int awqGroupCnt = 128;
         std::string modelType = "";
@@ -5191,6 +5173,7 @@ namespace fastllm {
         }
         std::unique_ptr<basellm> modelOwner(CreateModelWithType(modelType));
         basellm *model = modelOwner.get();
+        model->pdPrefillOnly = pdPrefillOnly;
         if (isJsonModel) {
             ((GraphLLMModel*)model)->graphLLMModelConfig->Init(modelConfig);
         }
@@ -5300,6 +5283,47 @@ namespace fastllm {
         if (model->contextPlan.configured) model->max_positions = model->contextPlan.effectiveLength;
 
         // 4.1 读取权重
+        if (!dsparkPath.empty()) {
+            const auto required = model->PDDraftContextWeightNames();
+            std::set<std::string> draftFiles;
+            std::string dsparkIndexFile =
+                dsparkPath + "model.safetensors.index.json";
+            if (!FileExists(dsparkIndexFile)) {
+                AssertInFastLLM(
+                    FileExists(dsparkPath + "model.safetensors"),
+                    "DSpark checkpoint has no model.safetensors: " +
+                    dsparkPath);
+                draftFiles.insert(dsparkPath + "model.safetensors");
+            } else {
+                std::string dsparkIndexError;
+                auto dsparkIndex = json11::Json::parse(
+                    ReadAllFile(dsparkIndexFile),
+                    dsparkIndexError)["weight_map"];
+                AssertInFastLLM(dsparkIndexError.empty(),
+                                "Failed to parse DSpark safetensors index.");
+                for (const auto &name : required)
+                    AssertInFastLLM(dsparkIndex[name].is_string(),
+                                    "Missing P-side draft KV weight in index: " + name);
+                for (const auto &it : dsparkIndex.object_items()) {
+                    if (required.empty() || required.count(it.first))
+                        draftFiles.insert(dsparkPath + it.second.string_value());
+                }
+            }
+            SafeTensors draft(draftFiles, required);
+            for (const auto &name : required)
+                AssertInFastLLM(draft.itmeDict.count(name), "Missing P-side draft KV weight: " + name);
+            for (const auto &item : draft.itmeDict)
+                safeTensors.itmeDict[item.first] = item.second;
+        }
+        NormalizeSafeTensorSources(config["quantization_config"]["quant_method"].string_value(), safeTensors.itmeDict);
+        {
+            const auto &textConfig = config["text_config"].is_object() ? config["text_config"] : config;
+            for (const auto &layer : textConfig["engram_layer_ids"].array_items()) {
+                const std::string name = "layers." + std::to_string(layer.int_value()) + ".engram.embed.";
+                AssertInFastLLM(safeTensors.itmeDict.count(name + "weight") && safeTensors.itmeDict.count(name + "scale"),
+                    "Checkpoint is missing Engram tables; supply --engram-path or FASTLLM_DSV41_ENGRAM_PATH.");
+            }
+        }
         auto tensors = safeTensors.GetSortedItemNames();
         
         // tensorMap[name]代表本名为name的tensor，创建后的名字以及类型
