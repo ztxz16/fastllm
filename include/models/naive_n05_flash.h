@@ -344,7 +344,8 @@ namespace fastllm {
         struct PDExportPlan;
         fastkv::Message PackPDState(ResponseContext &context, const std::vector<int> &devices,
                                     PDExportPlan &plan, bool independent);
-        void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length);
+        void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length,
+                                int transportDevice = -1, bool planning = false);
         std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length);
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);

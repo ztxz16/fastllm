@@ -471,51 +471,84 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
 std::string NaiveN05FlashModel::DraftPDLayout() const {
     if (!draftEnabled) return {};
     int ranks = 1, divisor = 1;
+    bool dataParallel = false;
 #ifdef USE_CUDA
     if (draftTP) {
-        CheckDraftPD(!draftTP->dataParallel, "Naive PD draft state requires TP rather than draft DP.");
-        ranks = draftTP->devices.size(); divisor = draftTP->attentionDivisor;
+        dataParallel = draftTP->dataParallel;
+        if (dataParallel) {
+            CheckDraftPD(attentionDP > 1 && AttentionTPSize() == 1 && draftTP->devices == tpDevices,
+                "Naive PD draft DP requires one complete replica per target attention group.");
+        } else {
+            CheckDraftPD(attentionDP == 1, "Naive attention DP PD requires draft DP.");
+            ranks = draftTP->devices.size(); divisor = draftTP->attentionDivisor;
+        }
         // The generic PD placement map is the target's device group. Draft
         // subgroups use its first N ranks, including nonzero physical devices.
         CheckDraftPD(tpDevices.size() >= size_t(ranks) &&
             std::equal(draftTP->devices.begin(), draftTP->devices.end(), tpDevices.begin()),
             "Naive PD draft TP requires a subgroup of target TP.");
     }
+    CheckDraftPD(attentionDP == 1 || dataParallel, "Naive attention DP PD requires prepared draft DP.");
 #endif
-    std::string layout = ":draft-v2";
+    // A DP request carries one complete draft state, independent of the
+    // producer's and consumer's physical GPU owners.
+    std::string layout = dataParallel ? ":draft-dp-v1" : ":draft-v2";
     for (int value : {draftLayers, draftBlock, draftHeads, draftKvHeads, draftHeadDim,
                       draftWindow, ranks, divisor}) layout += ":" + std::to_string(value);
     return layout;
 }
 
-void NaiveN05FlashModel::ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length) {
+void NaiveN05FlashModel::ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length,
+        int transportDevice, bool planning) {
 #ifdef USE_CUDA
     CheckDraftPD(context.pending.empty() && context.committed == length,
         "Naive PD requires a committed draft prefix.");
-    const int ranks = draftTP ? draftTP->devices.size() : 1;
+    const bool dataParallel = draftTP && draftTP->dataParallel;
+    const int ranks = draftTP && !dataParallel ? draftTP->devices.size() : 1;
     const int divisor = draftTP ? draftTP->attentionDivisor : 1;
     const int width = std::max(1, draftKvHeads / divisor) * draftHeadDim;
     const std::vector<int> shape{1, std::min(length, draftWindow - 1), width};
-    CheckDraftPD(!draftTP || (context.workspace && context.workspace->tpRanks.size() == size_t(ranks)),
+    CheckDraftPD(!draftTP || (context.workspace && context.workspace->tpRanks.size() == draftTP->devices.size()),
         "Naive PD draft rank state is missing.");
+    if (dataParallel) {
+        CheckDraftPD(context.deviceRank >= 0 && size_t(context.deviceRank) < draftTP->devices.size(),
+            "Naive PD draft DP owner is missing.");
+        if (transportDevice < 0) transportDevice = draftTP->devices.at(context.deviceRank);
+    }
+    auto tensor = [&](const Data &source) {
+        if (planning) {
+            Data view(source.dataType, source.dims);
+            view.dataDevice = CUDA;
+            view.dataDeviceIds = dataParallel ? std::vector<int>{transportDevice} : source.dataDeviceIds;
+            writer.PlanTensor(view);
+        } else if (dataParallel && source.dataDeviceIds != std::vector<int>{transportDevice}) {
+            // FastKV routes all group-local payloads through the target owner.
+            // Draft DP ownership is independent; never move its live KV.
+            Data staged(source);
+            staged.ToDevice(CUDA, std::vector<int>{transportDevice});
+            writer.Tensor(staged);
+        } else writer.Tensor(source);
+    };
     // Finish all owner streams before FastKV snapshots their committed KV.
-    if (draftTP) draftTP->Run([](int) { FastllmCudaSyncCurrentThreadStream(); });
-    else FastllmCudaSyncCurrentThreadStream();
-    writer.metadata.U32(context.committed);
-    writer.metadata.U32(draftLayers); writer.metadata.U32(ranks);
+    if (!planning) {
+        if (draftTP) draftTP->Run([](int) { FastllmCudaSyncCurrentThreadStream(); });
+        else FastllmCudaSyncCurrentThreadStream();
+        writer.metadata.U32(context.committed);
+        writer.metadata.U32(draftLayers); writer.metadata.U32(ranks);
+    }
     for (int rank = 0; rank < ranks; ++rank) {
         const auto &kv = rank ? context.workspace->tpRanks[rank]->tpKV : context.kv;
         CheckDraftPD(kv.size() == size_t(draftLayers), "Naive PD draft layer state is missing.");
         for (const auto &pair : kv) for (const Data *cache : {&pair.first, &pair.second}) {
             CheckDraftPD(cache->dataType == BFLOAT16 && cache->dims == shape,
                 "Naive PD draft KV shape mismatch.");
-            writer.Tensor(*cache);
+            tensor(*cache);
         }
     }
     // Normalized prefill tails are needed by aligned prefix checkpoints on D.
     // Proposal distributions, RNG and graph workspaces are local to decode.
-    writer.metadata.U32(!context.prefixHidden.dims.empty());
-    if (!context.prefixHidden.dims.empty()) writer.Tensor(context.prefixHidden);
+    if (!planning) writer.metadata.U32(!context.prefixHidden.dims.empty());
+    if (!context.prefixHidden.dims.empty()) tensor(context.prefixHidden);
 #endif
 }
 
@@ -528,7 +561,11 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
     }
 #ifdef USE_CUDA
     ApplyDraftDevice();
-    const auto devices = draftTP ? draftTP->devices : std::vector<int>{FastllmCudaGetDevice()};
+    if (draftTP) PrepareDraftContextTP(*context);
+    else context->kv.resize(draftLayers);
+    const bool dataParallel = draftTP && draftTP->dataParallel;
+    const auto devices = dataParallel ? std::vector<int>{draftTP->devices.at(context->deviceRank)} :
+        draftTP ? draftTP->devices : std::vector<int>{FastllmCudaGetDevice()};
     const int divisor = draftTP ? draftTP->attentionDivisor : 1;
     const int width = std::max(1, draftKvHeads / divisor) * draftHeadDim;
     const std::vector<int> shape{1, std::min(length, draftWindow - 1), width};
@@ -536,8 +573,6 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
     const auto layers = reader.metadata.U32(), ranks = reader.metadata.U32();
     CheckDraftPD(committed == length && layers == size_t(draftLayers) && ranks == devices.size(),
         "Naive PD draft prefix or TP size mismatch.");
-    if (draftTP) PrepareDraftContextTP(*context);
-    else context->kv.resize(draftLayers);
     for (size_t rank = 0; rank < devices.size(); ++rank) {
         auto &kv = rank ? context->workspace->tpRanks[rank]->tpKV : context->kv;
         FastllmCudaSetDevice(devices[rank]);
@@ -546,7 +581,7 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
             reader.Tensor(value, true);
             CheckDraftPD(value.dataType == BFLOAT16 && value.dims == shape && !value.kvCacheFp8Indexer,
                 "Naive PD draft KV shape mismatch.");
-            value.ToDevice(CUDA, {devices[rank]});
+            value.ToDevice(CUDA, std::vector<int>{devices[rank]});
             cache->dataType = BFLOAT16; cache->UpdateUnitSize();
             cache->ToDevice(CUDA, {devices[rank]}, false);
             // Verification appends candidates after the retained window. The
@@ -563,13 +598,14 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
             CheckDraftPD(copied, "KV restore copy failed.");
         }
     }
-    FastllmCudaSetDevice(devices.front());
+    const int prefixDevice = draftTP ? draftTP->devices.front() : devices.front();
+    FastllmCudaSetDevice(prefixDevice);
     if (reader.metadata.U32()) reader.Tensor(context->prefixHidden);
     const auto &tail = context->prefixHidden;
     CheckDraftPD(tail.dims.empty() || (tail.dataType == BFLOAT16 && tail.dims.size() == 3 &&
         tail.dims[0] == 1 && tail.dims[1] > 0 && tail.dims[1] <= std::min(length, draftWindow + GetPageLen() - 1) &&
         tail.dims[2] == embed_dim), "Naive PD draft prefix tail shape mismatch.");
-    if (!tail.dims.empty()) context->prefixHidden.ToDevice(CUDA, {devices.front()});
+    if (!tail.dims.empty()) context->prefixHidden.ToDevice(CUDA, std::vector<int>{prefixDevice});
     reader.End();
     context->committed = length;
 #endif

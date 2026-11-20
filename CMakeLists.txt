@@ -3163,6 +3163,9 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;naive;pd" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                     PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
             endforeach()
+            add_test(NAME naive_n05_pd_group_draft COMMAND naive_n05_verify_graph_test 2 pd_group_draft)
+            set_tests_properties(naive_n05_pd_group_draft PROPERTIES LABELS "cuda;naive;pd" RUN_SERIAL TRUE
+                TIMEOUT 300 SKIP_RETURN_CODE 77 PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
             add_test(NAME naive_n05_pd_group_4_to_8 COMMAND naive_n05_verify_graph_test 4 pd_group 4 fp8 8)
             add_test(NAME naive_n05_pd_group_8_to_4 COMMAND naive_n05_verify_graph_test 8 pd_group 8 fp8 4)
             set_tests_properties(naive_n05_pd_group_4_to_8 naive_n05_pd_group_8_to_4

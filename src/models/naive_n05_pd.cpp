@@ -544,21 +544,20 @@ bool NaiveN05FlashModel::SelectPDRequestGroup(ResponseContext &context,
 
 std::string NaiveN05FlashModel::PDLayout() const {
     CheckPD(!indexerContextSharding, "Indexer context sharding needs a separate state adapter");
-    CheckPD(attentionDP == 1 || (!draftEnabled && !sparseKv),
-            "Attention DP PD currently requires GPU KV and no draft");
+    CheckPD(attentionDP == 1 || !sparseKv, "Attention DP PD requires GPU KV");
     if (attentionDP > 1) {
         // Group-local wire ranks. World/DP/EP sizes are execution details;
         // head sharding and the state representation remain strict.
         // V2 keeps packed K/Indexer rows together so receive targets can point
         // at final pages without one RDMA span per token. Legacy TP/KVMem keep
         // their established component wire layout.
-        std::string layout = "naive-n05-group-state-v2";
+        std::string layout = draftEnabled ? "naive-n05-group-state-v3" : "naive-n05-group-state-v2";
         for (int value : {block_cnt, AttentionTPSize(), int(dataType), int(kvCacheDataType),
                           int(fp8IndexerCache), window, full.kvHeads, full.headDim, full.valueDim,
                           sliding.kvHeads, sliding.headDim, sliding.valueDim, IndexerCacheWidth(AuxiliaryKVType()),
                           int(HasSeparateIndexer())})
             layout += ":" + std::to_string(value);
-        return layout;
+        return layout + DraftPDLayout();
     }
     CheckPD(!(sparseKv && draftEnabled), "KVMem PD draft state transfer is not implemented");
     return std::string(tpDevices.size() > 1 ? "naive-n05-state-v3:" : "naive-n05-state-v1:") +
@@ -682,17 +681,24 @@ fastkv::Message NaiveN05FlashModel::PackPDState(ResponseContext &context, const 
         }
         if (!planning) copies.Submit();
     };
+    std::shared_ptr<DraftContext> draft;
+    if (draftEnabled) {
+        auto it = draftContexts.find(&context.pastKeyValues);
+        CheckPD(it != draftContexts.end() && it->second && it->second->pending.empty(),
+                "missing committed draft state");
+        draft = it->second;
+    }
     if (!plan.planned) {
         writer.metadata.String(PDLayout());
         writer.metadata.U32(context.preTokens);
         for (const auto &pair : context.pastKeyValues)
             for (const Data *root : {&pair.first, &pair.second})
                 writer.metadata.Ints(root->dims);
-        if (!draftEnabled)
-            for (int rank = 0; rank < int(devices.size()); ++rank) pack(rank, true);
+        for (int rank = 0; rank < int(devices.size()); ++rank) pack(rank, true);
+        if (draft) ExportDraftPDState(writer, *draft, context.preTokens, devices.front(), true);
         plan.planned = true;
     }
-    if (!draftEnabled) writer.Reserve(independent);
+    writer.Reserve(independent);
     if (independent) pack(0, false); // Dedicated thread/stream on this request's only owner.
     else RunPDWorkers(attentionParallel ? &attentionParallel->runtime : nullptr, tpWorkers, devices,
                       [&](int rank) { pack(rank, false); });
@@ -702,11 +708,7 @@ fastkv::Message NaiveN05FlashModel::PackPDState(ResponseContext &context, const 
         writer.buffers.insert(writer.buffers.end(), rank.buffers.begin(), rank.buffers.end());
     }
     writer.metadata.U32(draftEnabled);
-    if (draftEnabled) {
-        auto it = draftContexts.find(&context.pastKeyValues);
-        CheckPD(it != draftContexts.end() && it->second->pending.empty(), "missing committed draft state");
-        ExportDraftPDState(writer, *it->second, context.preTokens);
-    }
+    if (draft) ExportDraftPDState(writer, *draft, context.preTokens, devices.front());
     return writer.Finish(devices);
 #endif
 }

@@ -1031,7 +1031,7 @@ class Fixture : public NaiveN05FlashModel {
         if (dp > 1) ConfigureAttentionParallel(dp);
         if (draft) {
             draftEnabled = canDoConcurrentForward = true;
-            draftLayers = 2; draftBlock = 7; draftTokens = 5;
+            draftLayers = 2; draftBlock = 7; draftTokens = dp > 1 ? 3 : 5;
             draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
             draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
             AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
@@ -5630,6 +5630,14 @@ int main(int argc, char **argv) {
             DraftFixture fixture(true, 2, 0, 5); fixture.PrefillCommitChecks(); return 0;
         }
 #endif
+        if (argc > 2 && std::string(argv[2]) == "pd_group_draft") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            setenv("FASTLLM_DSPARK_TP", ("dp:" + std::to_string(ranks)).c_str(), 1);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.SetKVCacheDataType(BFLOAT16); fixture.SetIndexerDataType(FP8_E4M3);
+            fixture.PDStateChecks(false, argc > 3 && std::string(argv[3]) == "rdma", false, true, ranks);
+            unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "pd_group") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             const auto type = argc > 4 && std::string(argv[4]) == "bf16" ? BFLOAT16 : FP8_E4M3;
