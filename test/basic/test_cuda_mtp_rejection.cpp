@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <cstring>
 #include <numeric>
-#include <random>
 #include <map>
 #include <stdexcept>
 #include <vector>
@@ -350,7 +349,6 @@ void RoundedResidualCase() {
     Buffer ids(1), output(1);
     int id = 0, correction = -1;
     Check(cudaMemcpy(ids.p, &id, sizeof(id), cudaMemcpyHostToDevice));
-    Check(cudaMemset(output.p, 0xff, sizeof(int)));
     Require(FastllmCudaMtpRecoverRoundedResidual(target.p, proposal.p, (int *)ids.p, (int *)output.p,
                 correction, 0, 0, 1, 2, 42, nullptr) && correction == id,
             "rounding-induced rejection should emit the supported draft token");
@@ -360,14 +358,14 @@ void RoundedResidualCase() {
     const float qq[] = {.500001f, .5f};
     Check(cudaMemcpy(target.p, pq, sizeof(pq), cudaMemcpyHostToDevice));
     Check(cudaMemcpy(proposal.p, qq, sizeof(qq), cudaMemcpyHostToDevice));
-    const auto seed = std::mt19937_64(1451158)();
+    constexpr unsigned long long seed = 0x70fb98d7a45ca3a6ULL;
     Require(FastllmCudaMtpRecoverRoundedResidual(target.p, proposal.p, (int *)ids.p, (int *)output.p,
                 correction, 0, 0, 1, 2, seed, nullptr) && correction == 1,
             "rescaled residual must sample the positive difference");
     Check(cudaMemset(target.p, 0, 2 * sizeof(float)));
-    Check(cudaMemset(output.p, 0xff, sizeof(int)));
     Require(!FastllmCudaMtpRecoverRoundedResidual(target.p, proposal.p, (int *)ids.p, (int *)output.p,
-                correction, 0, 0, 1, 2, 42, nullptr), "an empty target cannot supply a correction");
+                correction, 0, 0, 1, 2, 42, nullptr) && correction == -1,
+            "an empty target must clear the previous correction");
 }
 void GraphTopPCase() {
     for (int vocab : {65535, 65536, 152576}) {

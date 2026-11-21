@@ -100,6 +100,12 @@ __device__ float Uniform(unsigned int x) {
     return fminf(fmaxf((float)x * 0x1p-32f, 0x1p-32f), 0x1.fffffep-1f);
 }
 __device__ float Gumbel(unsigned int x) { return -logf(-log1pf(-Uniform(x))); }
+__device__ void InitSmallAcceptanceRng(curandStatePhilox4_32_10_t &rng, unsigned long long seed,
+                                       int row, int drafts, unsigned long long round) {
+    // Keep acceptance uniforms disjoint from both draft and residual Gumbels.
+    const uint64_t stride = (uint64_t(drafts) + 15) / 16 * 16;
+    curand_init(seed ^ 0xd2b74407b1ce6e93ULL, row, round * stride, &rng);
+}
 __device__ bool Better(float x, int id, float y, int other) {
     return x > y || (x == y && id < other);
 }
@@ -205,8 +211,7 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
     }
     for (int i = 0; i <= drafts; ++i) result[offset + i] = -1;
     curandStatePhilox4_32_10_t rng;
-    // Keep acceptance uniforms disjoint from both draft and residual Gumbels.
-    curand_init(seed ^ 0xd2b74407b1ce6e93ULL, b, *counter * (((uint64_t)drafts + 15) / 16 * 16), &rng);
+    InitSmallAcceptanceRng(rng, seed, b, drafts, *counter);
     for (int i = 0; i < drafts; ++i) {
         int token = ids[i];
         if (token < 0 || token >= vocab) break;
@@ -325,8 +330,8 @@ __global__ void RecoverRoundedResidual(const float *p, const float *q, const int
     const unsigned long long round = counter ? *counter - 1 : 0;
     if (tid == 0) {
         curandStatePhilox4_32_10_t rng;
-        curand_init(counter ? seed ^ 0xd2b74407b1ce6e93ULL : seed, row,
-                    round * (((drafts + 15) / 16) * 16), &rng);
+        if (counter) InitSmallAcceptanceRng(rng, seed, row, drafts, round);
+        else curand_init(seed, row, 0, &rng);
         float u = 0;
         for (int i = 0; i <= step; ++i) u = counter ? Uniform(curand(&rng)) : curand_uniform(&rng);
         const double target = double(p[token]) * qs, proposal = double(q[token]) * ps;

@@ -1911,16 +1911,18 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
       reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(
           smem_sampling);
 
+  auto accept_draft = [&](uint32_t i, IdType draft_id) {
+    const float target = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id];
+    const float proposal = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
+    const float u = curand_uniform(&curand_state);
+    // The draw can be 1 and a rounded proposal can exceed 1 at a point mass.
+    return target > 0.f && (target >= proposal || (target == 1.f && isfinite(proposal)) ||
+                            u * proposal < target);
+  };
   uint32_t pos = num_speculative_tokens;
   for (uint32_t i = 0; i < num_speculative_tokens; ++i) {
-    IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
-    float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
-          p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
-    float u = curand_uniform(&curand_state);
-    // curand_uniform includes 1. Accept p == q unconditionally: rejecting
-    // identical distributions would leave an empty residual distribution.
-    if (q > 0.f && (q >= p || (q == 1.f && isfinite(p)) || u * p < q)) {
-      // accept the draft models output
+    const IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    if (accept_draft(i, draft_id)) {
       output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
     } else {
       pos = i;
@@ -1928,23 +1930,17 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     }
   }
 
-  uint32_t emitted_token_num = pos;
   uint32_t accepted_token_num = pos;
   for (uint32_t i = pos; i < num_speculative_tokens; ++i) {
-    int draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
-    float q = target_probs[(row_idx * (num_speculative_tokens + 1) + i) * d + draft_id],
-          p = draft_probs[(row_idx * num_speculative_tokens + i) * d + draft_id];
-    float u = curand_uniform(&curand_state);
-    // curand_uniform includes 1. Accept p == q unconditionally: rejecting
-    // identical distributions would leave an empty residual distribution.
-    if (q > 0.f && (q >= p || (q == 1.f && isfinite(p)) || u * p < q)) {
+    const IdType draft_id = draft_token_ids[row_idx * num_speculative_tokens + i];
+    if (accept_draft(i, draft_id)) {
       ++accepted_token_num;
     }
   }
 
   if (tx == 0) {
     output_accepted_token_num[row_idx] += accepted_token_num;
-    output_emitted_draft_token_num[row_idx] += emitted_token_num;
+    output_emitted_draft_token_num[row_idx] += pos;
   }
 
   // sample from relu(target_probs - draft_probs)
