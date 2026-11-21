@@ -12,7 +12,7 @@ from unittest import mock
 from qwen3_layer_reference import prefill
 from run_qwen3_prefill import compare_logits, make_model
 from run_qwen3_decode import (BACKEND, EMPTY, cases, compare_results, expectations, expected_cache,
-                              main, make_tasks, verify, verify_failure)
+                              main, make_tasks, verify, verify_failure, verify_paged_pool)
 
 
 class DecodeTests(unittest.TestCase):
@@ -24,12 +24,12 @@ class DecodeTests(unittest.TestCase):
         self.metrics = dict(max=0.0, sum=0.0, count=0, failed=0)
         self.reference = {}
 
-    def report(self, devices):
+    def report(self, devices, page_size=None, pool_pages=None):
         results = []
         eager_decodes = 0
         for task, state in zip(self.tasks, expectations(self.tasks)):
             result = dict(task=task["name"], op=task["op"],
-                cache=[expected_cache(self.config, state, rank, len(devices)) for rank in range(len(devices))])
+                cache=[expected_cache(self.config, state, rank, len(devices), page_size) for rank in range(len(devices))])
             if "ids" in state:
                 key = (tuple(state["ids"]), state["rope_position"])
                 if key not in self.reference:
@@ -42,6 +42,10 @@ class DecodeTests(unittest.TestCase):
                 eager_decodes = 0
             result['graph'] = [dict(enabled=False, active=False, captures=0, replays=0, warmups=0,
                                     eager_decodes=eager_decodes, workspace_bytes=0) for _ in devices]
+            if page_size:
+                for graph in result['graph']:
+                    graph['prefix_cache'] = dict(directory_version=2, cache_layout='paged',
+                                                page_len=page_size, max_pages=pool_pages)
             results.append(result)
         return dict(status="PASS", backend=BACKEND, execution="eager",
             graph_after_unload=[dict(enabled=False, active=False, captures=0, replays=0, warmups=0,
@@ -165,6 +169,92 @@ class DecodeTests(unittest.TestCase):
                         dict(report, shutdown_complete=False), dict(report, cleanup_error="timeout")):
             with self.assertRaises(AssertionError):
                 verify_failure(1, changed, spec, self.tasks)
+
+    def test_paged_pool_cases_cover_both_sides_and_exact_limit(self):
+        """/** 容量边界独立计数，成功用例实际填到边界，超限仍在合法上下文范围内。 */"""
+        specs = dict(cases())
+        self.assertNotIn("reject_kv_limit", specs)
+        self.assertLessEqual(len(specs), 50)
+        for name, capacity in (("paged_pool_below_limit", 7), ("paged_pool_at_limit", 8)):
+            spec = specs[name]
+            tasks = make_tasks(self.config, spec)
+            self.assertEqual(spec["page_size"] * spec["pool_pages"], 8)
+            self.assertEqual(spec["capacity"], capacity)
+            self.assertEqual(max(state["tokens"] for state in expectations(tasks)), capacity)
+            self.assertGreaterEqual(spec["steps"], 2)  # Graph首次捕获后还有重放。
+        spec = specs["reject_paged_pool_capacity"]
+        tasks = make_tasks(self.config, spec)
+        self.assertEqual(tasks[0], dict(name="initial", op="query"))
+        self.assertEqual(tasks[-1]["capacity"], spec["page_size"] * spec["pool_pages"] + 1)
+        self.assertLessEqual(tasks[-1]["capacity"], 2048)
+        self.assertLessEqual(len(tasks[-1]["token_ids"]), 8)
+
+    def test_paged_pool_requires_actual_configuration_on_every_rank(self):
+        """/** 配置未生效、缺少rank或回到连续KV路径时不能误报边界通过。 */"""
+        spec = dict(cases())["paged_pool_at_limit"]
+        original = self.report([0, 1], page_size=4, pool_pages=2)
+        verify_paged_pool(original, spec, 2)
+        for update in (dict(page_len=128), dict(max_pages=300), dict(directory_version=1),
+                       dict(cache_layout="continuous")):
+            report = copy.deepcopy(original)
+            report["results"][-1]["graph"][1]["prefix_cache"].update(update)
+            with self.subTest(update=update), self.assertRaisesRegex(AssertionError, "paged pool"):
+                verify_paged_pool(report, spec, 2)
+        for results in ([], [dict(task="initial", graph=[])], [dict(task="initial", graph=[{}])]):
+            with self.assertRaisesRegex(AssertionError, "paged pool"):
+                verify_paged_pool(dict(results=results), spec, 2)
+
+    def test_paged_pool_rejection_checks_error_evidence_and_cleanup(self):
+        """/** 成功返回、其他错误及未回收worker都不能冒充预期的页池超限拒绝。 */"""
+        spec = dict(cases())["reject_paged_pool_capacity"]
+        tasks = make_tasks(self.config, spec)
+        original = self.report([0, 1], page_size=4, pool_pages=2)
+        original.update(status="FAIL", error=spec["reason"], group_failed=True,
+                        workers_reaped=True, shutdown_complete=True, current_task=tasks[-1]["name"],
+                        results=original["results"][:1])
+        verify_failure(1, original, spec, tasks)
+        changes = [(0, dict(status="PASS")), (1, dict(error="Qwen3 request KV exceeds 256 MiB")),
+                   (1, dict(error="CUDA out of memory")), (1, dict(current_task="initial")),
+                   (1, dict(workers_reaped=False)), (1, dict(shutdown_complete=False)),
+                   (1, dict(results=[])), (1, dict(workers=[]))]
+        for code, update in changes:
+            report = dict(original, **update)
+            with self.subTest(update=update), self.assertRaises(AssertionError):
+                verify_failure(code, report, spec, tasks)
+
+    def test_paged_pool_flags_reach_tp_eager_and_single_with_saved_evidence(self):
+        """/** 检查正式调用参数及结构化报告；仅替换原生执行与Graph计数，不触发编译。 */"""
+        spec = dict(cases())["paged_pool_at_limit"]
+        self.tasks = make_tasks(self.config, spec)
+        tp = self.report([0, 1], page_size=4, pool_pages=2)
+        single = self.report([0], page_size=4, pool_pages=2)
+        root = Path(self.temp.name)
+        cache = root / "CMakeCache.txt"
+        cache.write_text("CUDA_ARCH:STRING=70\n")
+        args = ["run_qwen3_decode.py", "--check", "/bin/false", "--worker", "/bin/false",
+                "--build-cache", str(cache), "--output", str(root), "--cuda-graph"]
+        selected = dict(tp, execution="decode_cuda_graph")
+        with mock.patch("sys.argv", args), mock.patch("run_qwen3_decode.capture", return_value="test"), \
+             mock.patch("run_qwen3_decode.cases", return_value=[("paged_pool_at_limit", spec)]), \
+             mock.patch("run_qwen3_decode.verify_graph"), \
+             mock.patch("run_qwen3_decode.invoke", side_effect=[(0, selected), (0, tp), (0, single)]) as invoke, \
+             redirect_stdout(io.StringIO()):
+            self.assertEqual(main(), 0)
+        self.assertEqual([call.args[5] for call in invoke.call_args_list], ["tp", "eager_tp", "single"])
+        for index, call in enumerate(invoke.call_args_list):
+            flags = call.kwargs["extra_args"]
+            observed = dict(zip(flags[::2], flags[1::2]))
+            self.assertEqual(observed["--page-size"], "4")
+            self.assertEqual(observed["--tokens"], "8")
+            self.assertEqual(observed["--cuda-graph"], "1" if index == 0 else "0")
+        output = next(root.glob("*_decode_*"))
+        report = json.loads((output / "summary.json").read_text())
+        self.assertEqual(report["status"], "PASS")
+        self.assertIn("paged", report["metadata"]["kv_cache"])
+        self.assertEqual(report["cases"][0]["paged_pool"][1]["max_pages"], 2)
+        self.assertGreater(report["cases"][0]["compared_elements"], 0)
+        for suffix in ("json", "md", "csv", "xlsx"):
+            self.assertGreater((output / ("summary." + suffix)).stat().st_size, 0)
 
     def test_uneven_and_replicated_kv_accounting(self):
         state = dict(active=True, tokens=2, capacity=8, position_begin=123)

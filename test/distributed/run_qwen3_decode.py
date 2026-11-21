@@ -28,6 +28,8 @@ def cases():
         ("head_dim_128", dict(head_dim=128)), ("position", dict(position=123)),
         ("position_limit", dict(position=1048573, tokens=1, steps=3, capacity=4)),
         ("capacity_one", dict(tokens=1, steps=0, capacity=1)),
+        ("paged_pool_below_limit", dict(page_size=4, pool_pages=2, capacity=7, tokens=4, steps=3, layers=1)),
+        ("paged_pool_at_limit", dict(page_size=4, pool_pages=2, capacity=8, tokens=5, steps=3, layers=1)),
         ("cross_128", dict(tokens=128, steps=2, capacity=130, cycles=1, layers=1)),
         ("new_prompt", dict(new_prompt=True)), ("reload", dict(reload=True)),
         ("active_unload", dict(active_unload=True)),
@@ -48,10 +50,10 @@ def cases():
         ("position_overflow", "invalid Qwen3 request capacity/position/timeout", False),
         ("empty", "invalid Qwen3 request capacity/position/timeout", False),
         ("too_many_prompt", "invalid Qwen3 request capacity/position/timeout", False),
-        ("kv_limit", "Qwen3 request KV exceeds 256 MiB", True),
+        ("paged_pool_capacity", "Qwen3 request exceeds FT paged pool capacity", True),
         ("report_limit", "decode report logit limit exceeded", False)]
     return positive + [("reject_" + name, dict(reject=name, reason=reason, group_failed=failed,
-        **(dict(layers=129, head_dim=128) if name == "kv_limit" else
+        **(dict(page_size=4, pool_pages=2, capacity=9, layers=1) if name == "paged_pool_capacity" else
            dict(max_logit_elements=17) if name == "report_limit" else {}))) for name, reason, failed in negative]
 
 
@@ -81,16 +83,20 @@ def make_tasks(config, spec):
             actions += [dict(op="decode", token_id=1)]
         elif reject == "bad_prompt":
             actions[0]["token_ids"] = [vocab]
-        elif reject in ("zero_capacity", "large_capacity", "small_capacity", "kv_limit"):
+        elif reject in ("zero_capacity", "large_capacity", "small_capacity"):
             actions[0]["capacity"] = dict(zero_capacity=0, large_capacity=2049,
-                                         small_capacity=len(ids)-1, kv_limit=2048)[reject]
+                                         small_capacity=len(ids)-1)[reject]
         elif reject == "position_overflow":
             actions[0]["position_begin"] = 1048576
         elif reject == "empty":
             actions[0]["token_ids"] = []
         elif reject == "too_many_prompt":
             actions[0].update(token_ids=[1] * 2049, capacity=2048)
-        return [dict(action, name=f"reject-{i}-{action['op']}") for i, action in enumerate(actions)]
+        tasks = [dict(action, name=f"reject-{i}-{action['op']}") for i, action in enumerate(actions)]
+        if reject == "paged_pool_capacity":
+            # 拒绝前保存实际页池配置，排除参数未生效或意外进入连续KV路径。
+            tasks.insert(0, dict(name="initial", op="query"))
+        return tasks
 
     tasks = [dict(name="initial", op="query")]
     for cycle in range(spec.get("cycles", 2)):
@@ -235,6 +241,34 @@ def verify_allreduce(report, tasks, config, graph_enabled):
     require(custom > 0, 'custom AllReduce was never exercised')
 
 
+def checker_args(spec, cuda_graph=False, custom_allreduce=False):
+    """/** 通过正式CLI参数统一配置TP、Eager对照与单卡的页池和执行模式。 */"""
+    flags = ["--cuda-graph", str(int(cuda_graph)), "--custom-allreduce", str(int(custom_allreduce))]
+    if "max_logit_elements" in spec:
+        flags += ["--max-logit-elements", str(spec["max_logit_elements"])]
+    if "pool_pages" in spec:
+        flags += ["--page-size", str(spec["page_size"]),
+                  "--tokens", str(spec["page_size"] * spec["pool_pages"])]
+    return flags
+
+
+def verify_paged_pool(report, spec, world):
+    """/** 核对各rank实际页池配置；缺少证据或容量未按正式参数生效时拒绝通过。 */"""
+    if "pool_pages" not in spec:
+        return
+    results = report.get("results", [])
+    require(bool(results), "missing paged pool evidence before request")
+    for result in results:
+        states = result.get("graph", [])
+        require(len(states) == world, "missing paged pool rank evidence")
+        for rank, state in enumerate(states):
+            prefix = state.get("prefix_cache", {})
+            require(prefix.get("directory_version") == 2 and prefix.get("cache_layout") == "paged" and
+                    prefix.get("page_len") == spec["page_size"] and
+                    prefix.get("max_pages") == spec["pool_pages"],
+                    f'{result["task"]}: rank={rank} paged pool configuration differs: {prefix}')
+
+
 def verify_failure(code, report, spec, tasks):
     require(code == 1 and report.get("status") == "FAIL" and report.get("backend") == BACKEND,
             f"exit={code}; {report_error(report)}")
@@ -243,6 +277,12 @@ def verify_failure(code, report, spec, tasks):
     require(report.get("shutdown_complete") is True and "cleanup_error" not in report, "decode cleanup failed")
     if spec["group_failed"]:
         require(report.get("workers_reaped") is True, "failed group left workers")
+    if spec.get("reject") == "paged_pool_capacity":
+        completed = report.get("results", [])
+        require(len(completed) == 1 and completed[0].get("task") == "initial" and
+                completed[0].get("op") == "query", "missing initial paged pool query before rejection")
+        require(len(report.get("workers", [])) == 2, "missing paged pool worker identities")
+        verify_paged_pool(report, spec, 2)
     if spec.get("reject") == "report_limit":
         require(report.get("logit_limit") == spec["max_logit_elements"] and
                 report.get("recorded_logits") == 17 and len(report.get("results", [])) == 1,
@@ -309,7 +349,7 @@ def main():
         git_status=capture(["git", "status", "--short"]), seed=0, warmup=0, iterations=1, repeats=1,
         gpu=capture(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"), devices=devices, atol=atol, rtol=rtol,
-        model=str(args.model.resolve()) if args.model else "generated", kv_cache="FP16 request-local contiguous",
+        model=str(args.model.resolve()) if args.model else "generated", kv_cache="FP16 paged; request-local page references",
         prefix_cache=False, execution="decode_cuda_graph" if args.cuda_graph else "eager",
         custom_allreduce=args.custom_allreduce, graph_warmup_per_request=1 if args.cuda_graph else 0, sampling="fixed input IDs; no sampling", eos="no stopping",
         expected_case_count=len(selected), report_title="Qwen3 request KV and decode correctness",
@@ -342,17 +382,20 @@ def main():
                            vocabulary=config["vocab_size"], prompt_tokens=spec.get("tokens", 5),
                            decode_steps=spec.get("steps", 3), cycles=spec.get("cycles", 2),
                            output_tokens=0, input_tasks="tasks.json")
-                extra_args = ["--max-logit-elements", str(spec["max_logit_elements"])] if "max_logit_elements" in spec else []
-                extra_args += ["--cuda-graph", "1" if args.cuda_graph else "0",
-                               "--custom-allreduce", "1" if args.custom_allreduce else "0"]
+                extra_args = checker_args(spec, args.cuda_graph, args.custom_allreduce)
                 code, tp = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices, "tp",
                                   reload_model=reload_model, extra_args=extra_args)
                 row["workers"] = tp.get("workers", [])
+                row["execution"] = tp.get("execution")
+                if "pool_pages" in spec:
+                    row["paged_pool"] = [state.get("prefix_cache", {})
+                        for state in tp.get("results", [{}])[0].get("graph", [])] if tp.get("results") else []
                 if "reason" in spec:
                     verify_failure(code, tp, spec, tasks)
                 else:
                     require(code == 0, f"TP exit={code}; {report_error(tp)}")
                     verify(tp, devices, tasks, config)
+                    verify_paged_pool(tp, spec, len(devices))
                     verify_graph(tp, tasks, len(devices), args.cuda_graph)
                     if args.custom_allreduce:
                         verify_allreduce(tp, tasks, config, args.cuda_graph)
@@ -366,17 +409,20 @@ def main():
                                peak_graph_workspace_bytes=max(g['workspace_bytes'] for g in observed))
                     if args.cuda_graph or args.custom_allreduce:
                         code, eager = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices,
-                                             "eager_tp", reload_model=reload_model)
+                                             "eager_tp", reload_model=reload_model, extra_args=checker_args(spec))
                         require(code == 0, f"Eager TP exit={code}; {report_error(eager)}")
                         verify(eager, devices, tasks, config)
+                        verify_paged_pool(eager, spec, len(devices))
                         verify_graph(eager, tasks, len(devices), False)
                         for actual, baseline in zip(tp["results"], eager["results"]):
                             if "logits" in actual:
                                 compare_logits(actual["logits"], baseline["logits"], metrics,
                                                actual["task"] + " selected path vs NCCL Eager TP", atol, rtol)
-                    code, single = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices[:1], "single", reload_model=reload_model)
+                    code, single = invoke(args.check.resolve(), args.worker.resolve(), model, directory, devices[:1],
+                                          "single", reload_model=reload_model, extra_args=checker_args(spec))
                     require(code == 0, f"single exit={code}; {report_error(single)}")
                     verify(single, devices[:1], tasks, config)
+                    verify_paged_pool(single, spec, 1)
                     compare_results(tp, single, tasks, config, tensors, updated, metrics, atol, rtol, spec,
                                     reference_path=directory / "reference.json")
                 row["status"] = "PASS"

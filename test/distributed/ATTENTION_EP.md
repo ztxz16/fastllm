@@ -968,7 +968,10 @@ bash test/distributed/run_attention_ep_acceptance_v100.sh
 - 完整小模型：两份各 48 项，保留全部 8 种夹具的 EP/Graph/Prefix 组合。
 - 生命周期：小模型旧路径、真实模型旧路径、真实模型批次不变模式，各 2 项。
 - HTTP：真实模型旧路径与批次不变模式各 6 项。
-- 稠密 Decode：Eager/Graph 各 30 项；公开 DP/TP：四种配置各 12 项。
+- 稠密 Decode：Eager/Graph 各 32 项；公开 DP/TP：四种配置各 12 项。
+  Decode 的页池边界通过正式 `--page-size 4 --tokens 8` 配置，分别验证请求容量
+  7/8 成功、9 明确拒绝；核对各 rank 实际页池配置，并保留数值与资源清理检查。
+  此项替换旧连续 KV 的 `reject_kv_limit`（256 MiB）预期，不修改推理容量限制。
 - HF：全部 8 条中文请求拆成两份，每份分别跑旧路径和批次不变模式。
   每份包含 38 项生成明细、5 项 numeric 和 4 项策略汇总，共 47 项；
   exact、Top-5、Top-5/0.1、numeric 各自保留结论，任一失败仍返回非零。
