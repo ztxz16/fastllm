@@ -34,6 +34,7 @@ int main(int argc,char **argv) {try {
                 cancelled=true;
             }
             if(!cancelled || world->frameOffset!=saved.frameOffset || world->generator!=saved.generator ||
+               world->cacheNoiseGenerator!=saved.cacheNoiseGenerator ||
                world->decoderLatents!=saved.decoderLatents || world->prompt!=saved.prompt)
                 throw std::runtime_error("cancelled step modified world");
             if(world->parallelCaches.size()!=saved.parallelCaches.size())

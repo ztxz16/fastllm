@@ -348,6 +348,9 @@ struct WorldState {
     std::vector<float> decoderLatents;
     std::vector<int> segmentTokens;
     std::mt19937_64 generator;
+    // Immutable BF16 initial noise is shared across transactional snapshots.
+    std::shared_ptr<const std::vector<uint16_t>> noiseTimeline;
+    std::mt19937 cacheNoiseGenerator;
     int width=0, height=0, steps=8, frameOffset=0, maxHistorySegments=6;
     uint64_t seed=0;
 };

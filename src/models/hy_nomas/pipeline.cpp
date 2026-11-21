@@ -1,5 +1,6 @@
 #include "models/hy_nomas/runtime.h"
 #include "resolution.h"
+#include "world_noise.h"
 #include "models/hy_nomas/parallel_model.h"
 #include <algorithm>
 #include <cmath>
@@ -139,6 +140,12 @@ std::unique_ptr<WorldState> Pipeline::createWorld(const std::string &prompt,int 
     state->width=width; state->height=height; state->steps=steps; state->seed=seed;
     state->generator.seed(seed);
     state->features=encodeWorldPrompt(prompt); state->prompt=prompt;
+    if(rt_.dtype()==DType::BF16) {
+        state->cacheNoiseGenerator.seed(static_cast<uint32_t>(seed));
+        size_t tokens=size_t(world_noise::horizon)*(height/32)*(width/32);
+        state->noiseTimeline=std::make_shared<const std::vector<uint16_t>>(
+            world_noise::draw(state->cacheNoiseGenerator,tokens));
+    }
     return state;
 }
 
@@ -195,7 +202,7 @@ std::vector<uint8_t> Pipeline::stepWorld(WorldState &world,int action,Progress p
 std::vector<uint8_t> Pipeline::advance(WorldState &world,int action,Progress progress,void *user,
                                        const std::string *prompt,int frames,std::vector<float> latent) {
     rt_.activate();
-    if(action<0 || action>9 || world.frameOffset+frames/4>720)
+    if(action<0 || action>9 || world.frameOffset+frames/4>world_noise::horizon)
         throw std::invalid_argument("invalid action or world reached its 120-second horizon; reset it");
     auto update=[&](int stage,int current,int total) {
         if(progress && progress(stage,current,total,user)) throw std::runtime_error("generation cancelled");
@@ -217,7 +224,10 @@ std::vector<uint8_t> Pipeline::advance(WorldState &world,int action,Progress pro
         if(latent.size()!=size_t(n)*32) throw std::invalid_argument("unexpected reference latent size");
     } else {
         latent.resize(size_t(n)*32);
-        for(auto &v:latent) v=normal(next.generator);
+        if(next.noiseTimeline)
+            world_noise::read(*next.noiseTimeline,size_t(world.frameOffset)*h*w,latent);
+        else
+            for(auto &v:latent) v=normal(next.generator);
     }
     // "Follow the prompt" omits camera injection entirely. An identity
     // trajectory is a stationary-camera condition, not text-only generation.
@@ -266,15 +276,21 @@ std::vector<uint8_t> Pipeline::advance(WorldState &world,int action,Progress pro
             :dit_.forward(input,segmentFeatures,sigma(step)*1000.f,t,h,w,world.frameOffset,
                           &next.cache,false,hasCamera?&camera:nullptr,&workspace));
         float dt=sigma(step+1)-sigma(step);
-        for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
+        for(size_t i=0;i<latent.size();++i) {
+            float value=latent[i]+velocity[i]*dt;
+            latent[i]=next.noiseTimeline?world_noise::unpack(world_noise::pack(value)):value;
+        }
         NOMAS_TRACE("latent_"+std::to_string(step+1),latent);
     }
     update(2,world.steps,world.steps+1);
     std::vector<float> cacheInput=latent;
     const float cacheSigma=.206897f;
     std::vector<float> cacheNoise(cacheInput.size());
+    if(next.noiseTimeline)
+        world_noise::read(world_noise::draw(next.cacheNoiseGenerator,n),0,cacheNoise);
+    else
+        for(auto &v:cacheNoise) v=normal(next.generator);
     for(size_t i=0;i<cacheInput.size();++i) {
-        cacheNoise[i]=normal(next.generator);
         cacheInput[i]=(1.f-cacheSigma)*cacheInput[i]+cacheSigma*cacheNoise[i];
     }
     NOMAS_TRACE("cache_noise",cacheNoise);

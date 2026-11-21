@@ -71,6 +71,7 @@ CUDA_VISIBLE_DEVICES=0 python3 tools/fastllm_pytools/nomas_server.py \
 - `CUDA_VISIBLE_DEVICES` 选择使用的 GPU；`--device 0` 表示可见 GPU 中的第一张。
 - `--output` 用于保存生成的 MP4 短片或 PNG 帧，服务进程需要有写入权限。
 - 默认使用 `--precision bf16`：权重、主激活和 KV 使用 BF16，矩阵乘法累加、归一化内部计算及采样更新保留 FP32。需要精度排查时，可显式使用 `--precision fp32`。
+- BF16 交互世界按官方顺序从种子生成 120 秒的初始噪声，并用同一随机流给每段的历史 KV 加噪。每步 Euler 更新通过 FP32 计算后舍入到 BF16。跨后端回放时，长序列的镜头仍可能逐段偏离。
 - 从其他机器访问时，将 `--host` 改为 `0.0.0.0`，浏览器访问部署机器的 IP 和端口。服务没有内置认证，对外开放时可接入已有认证网关。
 
 启动后访问：
