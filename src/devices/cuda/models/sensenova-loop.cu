@@ -10,6 +10,10 @@ void FastllmCudaBf16ExactRows(const void *, const void *, void *, int, int, int)
 void FastllmCudaGdnBf16DecodeRows(const fastllm::Data &, const fastllm::Data &, const fastllm::Data &,
     const fastllm::Data &, const fastllm::Data &, const std::vector<fastllm::Data*> &, int, int, fastllm::Data &);
 
+void FastllmCudaGdnBf16VerifyRows(const fastllm::Data &, const fastllm::Data &, const fastllm::Data &,
+    const fastllm::Data &, const fastllm::Data &, const std::vector<fastllm::Data*> &,
+    std::vector<std::pair<fastllm::Data,fastllm::Data>> &, int, int, int, bool, fastllm::Data &);
+
 namespace fastllm {
 namespace {
 __device__ float LogSumExp(float a, float b) {
@@ -140,20 +144,21 @@ __global__ void Merge(const __nv_bfloat16 *branch, const __nv_bfloat16 *mix,
 struct ConvStateRows {
     static constexpr int capacity = 32;
     float4 *state[capacity];
+    float4 *prefix[2][capacity];
 };
 struct NoConvStateRows {};
 template <bool VERIFY = false, bool BATCH = false>
 __global__ void ConvDecode(const __nv_bfloat16 *input, const float4 *weights,
                            float4 *state, __nv_bfloat16 *beta, float *out,
                            int channels, int heads, int rows = 1,
-                           float4 *prefix0 = nullptr, float4 *prefix1 = nullptr,
                            int inputPitch = 0, int gatePitch = 0,
                            typename std::conditional<BATCH, ConvStateRows, NoConvStateRows>::type states = {}) {
     if constexpr (BATCH) {
         state = states.state[blockIdx.y];
-        input += size_t(blockIdx.y) * channels;
-        beta += size_t(blockIdx.y) * heads;
-        out += size_t(blockIdx.y) * channels;
+        const size_t first = size_t(blockIdx.y) * rows;
+        input += first * (VERIFY ? inputPitch : channels);
+        beta += first * (VERIFY ? gatePitch : heads);
+        out += first * channels;
     }
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= channels) return;
@@ -164,8 +169,11 @@ __global__ void ConvDecode(const __nv_bfloat16 *input, const float4 *weights,
             beta[t * gatePitch + i] = __float2bfloat16_rn(1.f / (1.f + expf(-b)));
         }
         float4 next = make_float4(prev.y, prev.z, prev.w, __bfloat162float(input[t * inputPitch + i]));
-        if (VERIFY && t + 1 < rows) (t == 0 ? prefix0 : prefix1)[i] = next;
-        else state[i] = next;
+        if constexpr (VERIFY) {
+            (t + 1 < rows ? states.prefix[t][blockIdx.y] : state)[i] = next;
+        } else {
+            state[i] = next;
+        }
         float value = cuda_conv::Accumulate<__nv_bfloat16, false>(0.f, next.x, w.x);
         value = cuda_conv::Accumulate<__nv_bfloat16, false>(value, next.y, w.y);
         value = cuda_conv::Accumulate<__nv_bfloat16, false>(value, next.z, w.z);
@@ -317,7 +325,7 @@ void SenseNovaBatchRecurrent(const Data &input, const Data &alpha, Data &beta,
             (const float4*)convWeight.cudaData, nullptr,
             (__nv_bfloat16*)beta.cudaData + size_t(first) * valueHeads,
             (float*)convolved.cudaData + size_t(first) * channels, channels, valueHeads,
-            1, nullptr, nullptr, 0, 0, table);
+            1, 0, 0, table);
     }
     FastllmCudaGdnBf16DecodeRows(convolved, alpha, beta, aLog, dtBias, states, keyHeads, valueHeads, core);
     CheckLaunch();
@@ -344,49 +352,71 @@ void SenseNovaGdnOutput(const Data &core, const Data &z, Data &weight, float eps
 // Verify consecutive rows using the very same one-token convolution, GDN
 // recurrence and rounding kernels as ordinary decode. Each gate writes into
 // its final row and snapshots stay on the request worker's CUDA stream.
-void SenseNovaVerifyRecurrent(const Data &qkv, const Data &z, const Data &alpha, Data &beta,
-        Data &convWeight, Data &aLog, Data &dtBias, Data &normWeight, Data &conv,
-        Data &state, int keyHeads, int valueHeads, float eps,
-        std::vector<std::pair<Data,Data>> &prefixes, Data &gated, bool mergedQkv, bool mergedBA) {
-    const int rows = qkv.dims[1], channels = (2 * keyHeads + valueHeads) * 128, width = valueHeads * 128;
+void SenseNovaVerifyRecurrent(const Data &qkv, const Data &z, const Data &alpha, Data &beta, Data &convWeight,
+                              Data &aLog, Data &dtBias, Data &normWeight, const std::vector<Data *> &convCaches,
+                              const std::vector<Data *> &states, int keyHeads, int valueHeads, float eps,
+                              std::vector<std::pair<Data, Data>> &prefixes, Data &gated, bool mergedQkv,
+                              bool mergedBA) {
+    const int batch = states.size(), total = qkv.dims[1];
+    if (batch == 0 || batch > ConvStateRows::capacity || convCaches.size() != states.size() || total % batch)
+        throw std::runtime_error("Unexpected SenseNova verification batch shape.");
+    const int rows = total / batch;
+    const int channels = (2 * keyHeads + valueHeads) * 128, width = valueHeads * 128;
     const int inputPitch = qkv.dims.back(), gatePitch = beta.dims.back();
-    if (rows < 2 || rows > 3 || conv.dims != std::vector<int>({1, channels, 4}) ||
-        state.dims != std::vector<int>({1, valueHeads, 128, 128}))
-        throw std::runtime_error("Unexpected SenseNova MTP recurrent cache shape.");
-    if (prefixes.size() < size_t(rows - 1)) prefixes.resize(rows - 1);
-    AllocateLike(gated, z, {1, rows, width});
+    if (rows < 2 || rows > 3)
+        throw std::runtime_error("Unexpected SenseNova verification batch shape.");
+    if (prefixes.size() < size_t(batch * (rows - 1)))
+        prefixes.resize(batch * (rows - 1));
+    AllocateLike(gated, z, {1, total, width});
     Data convolved, core;
-    AllocateLike(convolved, qkv, {1, rows, channels}, FLOAT32);
-    AllocateLike(core, qkv, {1, rows, width}, FLOAT32);
-    float4 *convPrefixes[2] = {};
-    for (int t = 0; t + 1 < rows; ++t) {
-        AllocateLike(prefixes[t].first, conv, conv.dims, FLOAT32);
-        convPrefixes[t] = (float4*)prefixes[t].first.cudaData;
+    AllocateLike(convolved, qkv, {1, total, channels}, FLOAT32);
+    AllocateLike(core, qkv, {1, total, width}, FLOAT32);
+    ConvStateRows table{};
+    for (int b = 0; b < batch; ++b) {
+        Data &c = *convCaches[b], &s = *states[b];
+        if (c.dims != std::vector<int>({1, channels, 4}) || s.dims != std::vector<int>({1, valueHeads, 128, 128}))
+            throw std::runtime_error("Unexpected SenseNova MTP recurrent cache shape.");
+        table.state[b] = (float4 *)c.cudaData;
+        for (int t = 0; t + 1 < rows; ++t) {
+            auto &prefix = prefixes[b * (rows - 1) + t];
+            AllocateLike(prefix.first, c, c.dims, FLOAT32);
+            AllocateLike(prefix.second, s, s.dims, FLOAT32);
+            table.prefix[t][b] = (float4 *)prefix.first.cudaData;
+        }
     }
-    ConvDecode<true><<<(channels+255)/256,256>>>((const __nv_bfloat16*)qkv.cudaData,
-        (const float4*)convWeight.cudaData, (float4*)conv.cudaData, (__nv_bfloat16*)beta.cudaData,
-        (float*)convolved.cudaData, channels, valueHeads, rows, convPrefixes[0], convPrefixes[1], inputPitch, gatePitch);
+    ConvDecode<true, true><<<dim3((channels + 255) / 256, batch), 256>>>(
+        (const __nv_bfloat16 *)qkv.cudaData, (const float4 *)convWeight.cudaData, nullptr,
+        (__nv_bfloat16 *)beta.cudaData, (float *)convolved.cudaData, channels, valueHeads, rows,
+        inputPitch, gatePitch, table);
     CheckLaunch();
-    // Use the original one-row recurrent kernel for every token. Recompiling
-    // its FP32 update as a multi-row kernel can change a cancellation by one ULP.
-    for (int t = 0; t < rows; ++t) {
-        Data q, a, b, rowCore;
-        auto view = [t](const Data &source, int columns, Data &row, int offset = 0) {
-            row.FakeFrom(source, (size_t(t) * source.dims.back() + offset) * source.unitSize);
-            row.Resize({1, 1, columns});
-        };
-        view(convolved, channels, q);
-        view(alpha, valueHeads, a, mergedBA ? valueHeads : 0);
-        view(beta, valueHeads, b);
-        view(core, width, rowCore);
-        if (!FastllmCudaGatedDeltaRuleSequence(q, a, b, aLog, dtBias, state, rowCore,
-                keyHeads, valueHeads, 128, 128, 1e-6f / 128, nullptr, true))
-            throw std::runtime_error("SenseNova MTP recurrence rejected its row.");
-        if (t + 1 < rows) SenseNovaCopyState(state, prefixes[t].second);
+    if (batch > 1) {
+        FastllmCudaGdnBf16VerifyRows(convolved, alpha, beta, aLog, dtBias, states, prefixes, rows, keyHeads,
+                                     valueHeads, mergedBA, core);
+    } else {
+        // Use the original one-row recurrent kernel for every token. Recompiling
+        // its FP32 update as a multi-row kernel can change a cancellation by one ULP.
+        Data &state = *states.front();
+        for (int t = 0; t < rows; ++t) {
+            Data q, a, b, rowCore;
+            auto view = [t](const Data &source, int columns, Data &row, int offset = 0) {
+                row.FakeFrom(source, (size_t(t) * source.dims.back() + offset) * source.unitSize);
+                row.Resize({1, 1, columns});
+            };
+            view(convolved, channels, q);
+            view(alpha, valueHeads, a, mergedBA ? valueHeads : 0);
+            view(beta, valueHeads, b);
+            view(core, width, rowCore);
+            if (!FastllmCudaGatedDeltaRuleSequence(q, a, b, aLog, dtBias, state, rowCore, keyHeads, valueHeads, 128,
+                                                   128, 1e-6f / 128, nullptr, true))
+                throw std::runtime_error("SenseNova MTP recurrence rejected its row.");
+            if (t + 1 < rows)
+                SenseNovaCopyState(state, prefixes[t].second);
+        }
     }
-    GdnOutput<<<rows * valueHeads,64>>>((const float*)core.cudaData,
-        (const __nv_bfloat16*)z.cudaData + (mergedQkv ? channels : 0), (const float*)normWeight.cudaData,
-        eps, (__nv_bfloat16*)gated.cudaData, valueHeads, mergedQkv ? inputPitch : 0);
+    GdnOutput<<<total * valueHeads, 64>>>((const float *)core.cudaData,
+                                          (const __nv_bfloat16 *)z.cudaData + (mergedQkv ? channels : 0),
+                                          (const float *)normWeight.cudaData, eps, (__nv_bfloat16 *)gated.cudaData,
+                                          valueHeads, mergedQkv ? inputPitch : 0);
     CheckLaunch();
 }
 

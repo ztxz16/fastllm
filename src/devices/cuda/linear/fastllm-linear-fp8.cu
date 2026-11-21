@@ -2139,14 +2139,9 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
                                                     int m, int k, int blockM, int blockK) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
-    // Exact verification batches use PART=1 and grid.y for independent rows.
-    // This is the identical kernel used by single-token decode, preserving the
-    // per-row floating-point operation and reduction order across CUDA GPUs.
-    if constexpr (PART == 1) {
-        const size_t gridRow = (size_t)blockIdx.y;
-        A += gridRow * m;
-        C += gridRow * k;
-    }
+    const size_t firstRow = size_t(blockIdx.y) * PART;
+    A += firstRow * m;
+    C += firstRow * k;
 
     int st = blockIdx.x;
 #pragma unroll
@@ -2855,6 +2850,127 @@ const fastllm::kernels::Family fp8ProjectionFamily{1,"linear.fp8.bf16",__DATE__ 
 const bool fp8ProjectionRegistered=[] {fastllm::kernels::Register(&fp8ProjectionFamily);return true;}();
 }
 
+// Each warp computes a small panel of outputs. A 128-bit load supplies
+// eight consecutive BF16 activations, following the single-row K reduction.
+template <int Values, int Tokens, int Rows = 4>
+static __global__ __launch_bounds__(128) void SenseNovaFp8VerifyTile(
+    const __nv_bfloat16 *__restrict__ x, const uint8_t *__restrict__ w, const float *__restrict__ scales,
+    const __nv_bfloat16 *__restrict__ bias, __nv_bfloat16 *__restrict__ y, int inner, int columns) {
+    const int lane = threadIdx.x % 32;
+    const int row = (blockIdx.y * 4 + threadIdx.x / 32) * Rows;
+    x += size_t(blockIdx.x) * Tokens * inner;
+    y += size_t(blockIdx.x) * Tokens * columns;
+    float sums[Tokens][Rows][2] = {};
+    // Stream one aligned E4M3 vector per lane. Leave L1 available for the
+    // activations shared by every output tile. Each K chain keeps its order.
+#pragma unroll (Values == 16 ? 2 : 1)
+    for (int k = lane * Values; k < inner; k += 32 * Values) {
+        float2 weights[Rows][Values / 2];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            const uint8_t *ptr = w + size_t(row + r) * inner + k;
+            uint32_t words[Values / 4];
+            if constexpr (Values == 16) {
+                const uint4 v = __ldcs(reinterpret_cast<const uint4 *>(ptr));
+                words[0] = v.x;
+                words[1] = v.y;
+                words[2] = v.z;
+                words[3] = v.w;
+            } else {
+                const uint2 v = __ldcs(reinterpret_cast<const uint2 *>(ptr));
+                words[0] = v.x;
+                words[1] = v.y;
+            }
+#pragma unroll
+            for (int j = 0; j < Values / 2; ++j) {
+                __nv_fp8x2_e4m3 pair;
+                pair.__x = uint16_t(words[j / 2] >> ((j % 2) * 16));
+                weights[r][j] = static_cast<float2>(pair);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < Tokens; ++t) {
+            const auto *src = reinterpret_cast<const uint4 *>(x + size_t(t) * inner + k);
+#pragma unroll
+            for (int chunk = 0; chunk < Values / 8; ++chunk) {
+                uint4 v = __ldg(src + chunk);
+                uint32_t pairs[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float2 a = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&pairs[j]));
+#pragma unroll
+                    for (int r = 0; r < Rows; ++r) {
+                        float2 weight = weights[r][4 * chunk + j];
+                        sums[t][r][0] = __fmaf_rn(a.x, weight.x, sums[t][r][0]);
+                        sums[t][r][1] = __fmaf_rn(a.y, weight.y, sums[t][r][1]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < Tokens; ++t) {
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            float s = sums[t][r][0] + sums[t][r][1];
+#pragma unroll
+            for (int d = 16; d; d /= 2)
+                s += __shfl_down_sync(0xffffffff, s, d);
+            if (lane == 0)
+                y[size_t(t) * columns + row + r] =
+                    __nv_bfloat16(s * scales[row + r] + (bias ? float(bias[row + r]) : 0.f));
+        }
+    }
+}
+
+template <int Step, int Values>
+static void LaunchSenseNovaFp8Tiles(const __nv_bfloat16 *x, const uint8_t *w, const float *scales,
+                                    const __nv_bfloat16 *bias, __nv_bfloat16 *y, int rows, int inner, int columns) {
+    if constexpr (Step == 3 && Values == 8) {
+        // At full two-draft concurrency, a wider output tile reuses each
+        // activation across eight columns of the long-K MLP down projection.
+        if (rows == 24 && inner == 12288 && columns == 4096) {
+            SenseNovaFp8VerifyTile<Values, 8, 8>
+                <<<dim3(3, columns / 32), 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+            return;
+        }
+    }
+    const int tiles = rows / (4 * Step), blocks = columns / 16;
+    if (tiles) {
+        SenseNovaFp8VerifyTile<Values, 4 * Step>
+            <<<dim3(tiles, blocks), 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        x += size_t(tiles) * 4 * Step * inner;
+        y += size_t(tiles) * 4 * Step * columns;
+    }
+    const dim3 grid(1, blocks);
+    switch (rows / Step % 4) {
+    case 1:
+        SenseNovaFp8VerifyTile<Values, Step>
+            <<<grid, 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        break;
+    case 2:
+        SenseNovaFp8VerifyTile<Values, 2 * Step>
+            <<<grid, 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        break;
+    case 3:
+        SenseNovaFp8VerifyTile<Values, 3 * Step>
+            <<<grid, 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        break;
+    }
+}
+
+template <int Step>
+static void LaunchSenseNovaFp8Verify(const __nv_bfloat16 *x, const uint8_t *w, const float *scales,
+                                     const __nv_bfloat16 *bias, __nv_bfloat16 *y, int rows, int inner, int columns) {
+    // The original two-row and three-row SIMT kernels use different K partitions.
+    const bool wide =
+        inner % 512 == 0 && (Step == 2 ? columns <= 8192 || columns >= 16384 : columns > 8192 && columns < 16384);
+    if (wide)
+        LaunchSenseNovaFp8Tiles<Step, 16>(x, w, scales, bias, y, rows, inner, columns);
+    else
+        LaunchSenseNovaFp8Tiles<Step, 8>(x, w, scales, bias, y, rows, inner, columns);
+}
+
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
     // Native row-wise MXFP8 projections use W8A8 for batched decode/prefill.
@@ -2880,6 +2996,39 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
         return true;
     }
 #endif
+
+    // Preserve the 2/3-row FP8 reduction of a single verifier. Independent
+    // requests use the same launch for each wide projection.
+    const int step = nvfp4Scope ? nvfp4Scope->verifyRows : 0;
+    if ((step == 2 || step == 3) && n > step && n % step == 0 && n <= 24 && weight.blockK == 1 &&
+        weight.blockM == m && !weight.IsRepacked && FastllmCudaRuntimeArch() == 120) {
+        auto *w = (uint8_t *)weight.cudaData;
+        if (k % 16 == 0 && reinterpret_cast<uintptr_t>(cudaInput) % 16 == 0 &&
+            CanRunFastllmRowFP8<__nv_bfloat16, 8>(cudaInput, w, cudaOutput, cudaBF16Bias, cudaScales, step, m, k,
+                                                  weight.blockM, weight.blockK)) {
+            if (step == 2)
+                LaunchSenseNovaFp8Verify<2>(cudaInput, w, cudaScales, cudaBF16Bias, cudaOutput, n, m, k);
+            else
+                LaunchSenseNovaFp8Verify<3>(cudaInput, w, cudaScales, cudaBF16Bias, cudaOutput, n, m, k);
+        } else if (k < 512 && m == 4096 && step >= fastllm::FastllmCudaGetLinearExactBatchThreshold() &&
+                   reinterpret_cast<uintptr_t>(cudaInput) % 8 == 0 && reinterpret_cast<uintptr_t>(w) % 4 == 0) {
+            // Share the narrow GDN gate launch across request tiles.
+            dim3 grid(k, n / step);
+            if (step == 2)
+                FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 2, false, true>
+                    <<<grid, 64>>>(cudaInput, w, cudaOutput, cudaBF16Bias, cudaScales, m, k, m, 1);
+            else
+                FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 3, true, true>
+                    <<<grid, 64>>>(cudaInput, w, cudaOutput, cudaBF16Bias, cudaScales, m, k, m, 1);
+        } else {
+            for (int row = 0; row < n; row += step)
+                LaunchFastllmGemmBF16FP8E4M3(cudaInput + size_t(row) * m, w, cudaOutput + size_t(row) * k,
+                                             cudaBF16Bias, cudaScales, step, m, k, weight.blockM, weight.blockK);
+        }
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
 
     // Plain row-scaled checkpoints already hold the layout consumed by FP8 GEMM.
     // The native prefill policy controls activation quantization and warmup.
@@ -5098,7 +5247,12 @@ void FastllmCudaPlanNvfp4Prefill(FastllmNvfp4PrefillPlan &plan, const fastllm::D
 
 FastllmCudaNvfp4Scope::FastllmCudaNvfp4Scope(const FastllmNvfp4PrefillPlan &plan, bool batched,
         int promptRows, FastllmCompactMarlinCache *marlin)
-    : previous(nvfp4Scope), plan(plan), batched(batched), promptRows(promptRows), marlin(marlin) {
+    : FastllmCudaNvfp4Scope(plan, batched, promptRows, marlin, 0) {}
+
+FastllmCudaNvfp4Scope::FastllmCudaNvfp4Scope(const FastllmNvfp4PrefillPlan &plan, bool batched,
+        int promptRows, FastllmCompactMarlinCache *marlin, int verifyRows)
+    : previous(nvfp4Scope), plan(plan), batched(batched), verifyRows(verifyRows == 2 || verifyRows == 3 ? verifyRows : 0),
+      promptRows(promptRows), marlin(marlin) {
     nvfp4Scope = this;
 }
 

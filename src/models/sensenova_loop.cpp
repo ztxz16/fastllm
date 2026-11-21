@@ -1,11 +1,14 @@
 #include "models/sensenova_loop.h"
 #include "baseblock.h"
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
+#endif
 
 namespace fastllm {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 void SenseNovaBf16GateProjection(const Data &, Data &, Data &);
 void SenseNovaVerifyRecurrent(const Data &, const Data &, const Data &, Data &, Data &, Data &,
-    Data &, Data &, Data &, Data &, int, int, float, std::vector<std::pair<Data,Data>> &, Data &, bool, bool);
+    Data &, Data &, const std::vector<Data*> &, const std::vector<Data*> &, int, int, float, std::vector<std::pair<Data,Data>> &, Data &, bool, bool);
 void SenseNovaBatchRecurrent(const Data &, const Data &, Data &, Data &, Data &, Data &,
     const std::vector<Data*> &, const std::vector<Data*> &, int, int, Data &);
 void SenseNovaJoinPrefillRows(const std::vector<Data> &, int, Data &);
@@ -134,7 +137,7 @@ long long SenseNovaLoopModel::GetAutoWarmupCudaRuntimeReserveBytes(int device, i
         if (weight.weight.count(prefix + "linear_attn.conv1d.weight"))
             extra += draftCount * elements * sizeof(float);
     }
-    return base + extra;
+    return base + extra * std::max(1, std::min(batch, 8));
 }
 
 void SenseNovaLoopModel::OnResponseContextCreated(ResponseContext *context) {
@@ -215,6 +218,26 @@ std::vector<int> SenseNovaLoopModel::ForwardV2(int batch, const Data &ids, const
         std::all_of(lengths.begin(), lengths.end(), [&](int n) { return n == lengths.front(); })) {
         return RunTarget(ids, positions, lengths, cache, configs, last, logits, nullptr, nullptr);
     }
+    if (draftCount && batch <= 8) {
+        std::vector<std::shared_ptr<DraftRequest>> active;
+        {
+            std::lock_guard<std::mutex> guard(requestMutex);
+            for (int b = 0; b < batch; ++b) {
+                auto it = requests.find(cache[b * visits.size()].first);
+                if (it == requests.end()) break;
+                if ((!it->second->emitted && lengths[b] != it->second->promptLength) ||
+                    !SenseNovaMtpSupportsSampling(configs[b])) {
+                    requests.erase(it);
+                    break;
+                }
+                active.push_back(it->second);
+            }
+        }
+        if ((int)active.size() == batch && HasMtpBatchPages(active, lengths, cache)) {
+            FastllmCudaNvfp4Scope scope(nvfp4PrefillPlan);
+            return DraftForwardBatch(active, ids, positions, lengths, cache, configs, last);
+        }
+    }
     if (batch > 1) {
         std::vector<int> outputs;
         int offset = 0;
@@ -226,29 +249,12 @@ std::vector<int> SenseNovaLoopModel::ForwardV2(int batch, const Data &ids, const
             LastTokensManager history(1, configs[b].last_n);
             if (b < (int)last.units.size()) history.units[0] = last.units[b];
             std::vector<std::vector<float>*> outputLogits{logits ? logits->at(b) : nullptr};
-            outputs.push_back(ForwardV2(1, slice, {masks[b]}, {positions[b]}, {lengths[b]}, row,
+            outputs.push_back(ForwardV2(1, slice, {b < (int)masks.size() ? masks[b] : nullptr}, {positions[b]}, {lengths[b]}, row,
                                         {configs[b]}, history, &outputLogits)[0]);
         }
         return outputs;
     }
     AssertInFastLLM(!positions.empty() && positions[0], "SenseNova Loop needs text position IDs.");
-    Data &position = *positions[0];
-    std::shared_ptr<DraftRequest> request;
-    if (draftCount) {
-        std::lock_guard<std::mutex> guard(requestMutex);
-        auto it = requests.find(cache[0].first);
-        if (it != requests.end()) {
-            // Chunked prefill and history restoration use the ordinary target.
-            if ((!it->second->emitted && lengths[0] != it->second->promptLength) ||
-                !SenseNovaMtpSupportsSampling(configs[0]))
-                requests.erase(it);
-            else request = it->second;
-        }
-    }
-    if (request) {
-        FastllmCudaNvfp4Scope nvfp4(nvfp4PrefillPlan);
-        return DraftForward(*request, ids, position, cache, configs[0], last);
-    }
     return RunTarget(ids, positions, lengths, cache, configs, last, logits, nullptr, nullptr);
 #endif
 }
@@ -317,7 +323,25 @@ void SenseNovaLoopModel::FullAttention(const std::string &p, Data &input, const 
         // AttentionPagedBatch already returns token-major output for the causal query block.
         if (length > 1 && !verify) PermuteSelf(attn, {1, 0, 2});
     };
-    if (keys.size() > 1 && length > (int) keys.size()) {
+    if (keys.size() > 1 && verify) {
+        // Each verification cohort has a common lookahead, but independent KV pages.
+        const int rows = length / keys.size();
+        for (Data *x : {&q, &k, &v}) {
+            PermuteSelf(*x, {0,2,1,3});
+            x->Reshape({-1,length,head_dim});
+        }
+        for (int b = 0; b < (int)keys.size(); ++b) {
+            Data kb, vb;
+            Split(k, 1, b * rows, (b + 1) * rows, kb);
+            Split(v, 1, b * rows, (b + 1) * rows, vb);
+            AppendPagedCache(*keys[b]->pagedKVCacheData, *keys[b], kb);
+            AppendPagedCache(*values[b]->pagedKVCacheData, *values[b], vb);
+        }
+        GeneratePagedBatchParams(q, keys, keys.size(), pages.qSizes, pages.pageSizes,
+            pages.indices, pages.lastLens, std::vector<int>(keys.size(), rows));
+        AttentionPagedBatch(q, pastKey, pastValue, pages.qSizes, pages.pageSizes, pages.indices,
+            pages.lastLens, attn, group, scale, 1, false, false);
+    } else if (keys.size() > 1 && length > (int) keys.size()) {
         const int perRequest = length / keys.size();
         std::vector<Data> results(keys.size());
         for (int b = 0; b < (int) keys.size(); ++b) {
@@ -478,7 +502,7 @@ void SenseNovaLoopModel::LinearAttention(const std::string &p, Data &input,
         const bool mergedQkv = !packedQkvZ.dims.empty(), mergedBA = !packedBA.dims.empty();
         SenseNovaVerifyRecurrent(mergedQkv ? packedQkvZ : qkv, mergedQkv ? packedQkvZ : z,
             mergedBA ? packedBA : a, mergedBA ? packedBA : b, weight[p+"conv1d.weight"],
-            weight[p+"A_log"], weight[p+"dt_bias"], weight[p+"norm.weight"], conv, state,
+            weight[p+"A_log"], weight[p+"dt_bias"], weight[p+"norm.weight"], convCaches, states,
             num_k_heads, num_v_heads, rms_norm_eps, *prefixes, gated, mergedQkv, mergedBA);
     } else if (states.size() > 1 && length > (int) states.size()) {
         const int perRequest = length / states.size();
@@ -546,11 +570,12 @@ void SenseNovaLoopModel::RoutedInput(const std::string &p, Data &streams, Data &
 
 std::vector<int> SenseNovaLoopModel::RunTarget(const Data &ids, const std::vector<Data*> &positions,
         const std::vector<int> &lengths, Cache &cache, const std::vector<GenerationConfig> &configs,
-        const LastTokensManager &last, std::vector<std::vector<float>*> *logits, Data *capture, PrefixStates *prefixes, MtpKvCache *proposal) {
+        const LastTokensManager &last, std::vector<std::vector<float>*> *logits, Data *capture, PrefixStates *prefixes, Data *verifyLogits) {
     const int length = ids.dims[1], batch = lengths.size();
     const bool allDecode = batch == length;
-    const int promptRows = batch > 1 && !allDecode ? lengths.front() : 0;
-    FastllmCudaNvfp4Scope nvfp4(nvfp4PrefillPlan, batch > 1, promptRows, allDecode ? nvfp4DecodeCache.get() : nullptr);
+    const int promptRows = batch > 1 && !allDecode && !prefixes ? lengths.front() : 0;
+    FastllmCudaNvfp4Scope nvfp4(nvfp4PrefillPlan, batch > 1, promptRows, allDecode ? nvfp4DecodeCache.get() : nullptr,
+                                prefixes ? lengths.front() : 0);
     ApplyDeviceMap(deviceMap, 1, 1);
     Data embedded, hidden, streams, intermediate, mix, branch, normalized, update;
     Embedding(ids, weight[language_prefix + "embed_tokens.weight"], embedded);
@@ -628,151 +653,293 @@ std::vector<int> SenseNovaLoopModel::RunTarget(const Data &ids, const std::vecto
     if (capture)
         RMSNorm(hidden, weight[language_prefix + "norm.weight"], rms_norm_eps, *capture);
     if (prefixes) {
-        Data allLogits;
-        Linear(*capture, weight["lm_head.weight"], Data(), allLogits);
-        ToDataType(allLogits, FLOAT32);
-        if (proposal) {
-            output.resize(length);
-            int accepted = VerifyMtpSamplingRows((float*)allLogits.cudaData, allLogits.dims.back(),
-                allLogits.dataDeviceIds.at(0), *proposal, length - 1, configs.front(), output.data());
-            output.resize(accepted + 1); // accepted prefix followed by residual or bonus
-            return output;
-        }
-        // MTP admission excludes min-length masking and constrained decoding.
-        // TopK uses the same per-row greedy tie order as LLMSamplingBlock.
-        Data best;
-        TopK(allLogits, best, 1);
-        best.ToDevice(CPU);
-        const float *pairs = reinterpret_cast<const float*>(best.cpuData);
-        for (int t = 0; t < length; ++t) output.push_back((int)pairs[2 * t]);
-        return output;
+        Linear(*capture, weight["lm_head.weight"], Data(), *verifyLogits);
+        ToDataType(*verifyLogits, FLOAT32);
+        return {};
     }
     LLMSamplingBlock(this, &hidden, &weight[language_prefix + "norm.weight"], &weight["lm_head.weight"],
                      rms_norm_eps, batch, allDecode, lengths, cache, configs, last, logits, output);
     return output;
 }
 
-std::vector<int> SenseNovaLoopModel::DraftForward(DraftRequest &r, const Data &ids, Data &positionIds,
-        Cache &cache, const GenerationConfig &config, const LastTokensManager &last) {
-    // Draft KV covers only committed target inputs. A chain temporarily extends
-    // it with draft-generated hidden states and discards that extension.
-    Data cpuIds(ids);
-    cpuIds.ToDevice(CPU);
-    const float *values = reinterpret_cast<const float*>(cpuIds.cpuData);
-    std::vector<int> inputs(values, values + ids.dims[1]);
-    const int base = r.kv.tokens;
-    int budget = max_positions - base;
-    if (tokensLimit > 0) budget = std::min(budget, tokensLimit - base);
-    if (config.output_token_limit > 0)
-        budget = std::min(budget, config.output_token_limit - r.emitted);
-    // A shared page pool can run out of lookahead pages with multiple requests.
-    // Only verify as far as every target visit can append without eviction.
-    for (auto &pair : cache) {
-        Data &k = *pair.first;
-        if (k.isPagedKVCache && k.pagedKVCacheData) {
-            const int extra = k.pageLen - k.lastPageLen + k.pageLen * k.pagedKVCacheData->FreePageCount();
-            budget = std::min(budget, extra);
-        }
-    }
-    const int look = std::min((int)r.drafts.size(), std::max(0, budget - 1));
-    inputs.insert(inputs.end(), r.drafts.begin(), r.drafts.begin() + look);
-    auto stopped = [&](int token) {
-        return token == eos_token_id || eos_token_ids.count(token) || config.stop_token_ids.count(token);
+std::vector<int> SenseNovaLoopModel::SampleVerifyRows(Data &logits, const std::vector<MtpKvCache *> &proposals,
+                                                      const std::vector<GenerationConfig> &configs, int drafts,
+                                                      std::vector<int> &accepted) {
+    const int batch = proposals.size(), rows = drafts + 1, vocab = logits.dims.back();
+    std::vector<int> sampled(batch * rows);
+    accepted.assign(batch, -1); // Greedy acceptance is determined by matching the proposed IDs.
+    auto greedy = [](Data &scores, int count, int *out) {
+        Data best;
+        TopK(scores, best, 1);
+        best.ToDevice(CPU);
+        const auto *pairs = reinterpret_cast<const float *>(best.cpuData);
+        for (int i = 0; i < count; ++i) out[i] = int(pairs[2 * i]);
     };
-    const int n = inputs.size();
-    Data capture, positions;
-    std::vector<int> predicted;
-    if (look == 0) {
-        positions.CopyFrom(positionIds);
-        predicted = RunTarget(ids, {&positions}, {ids.dims[1]}, cache, {config}, last, nullptr, &capture, nullptr);
+    if (std::all_of(proposals.begin(), proposals.end(), [](auto *p) { return !p->sampleProposal; })) {
+        greedy(logits, batch * rows, sampled.data());
+        return sampled;
+    }
+    auto *scores = (float *)logits.cudaData;
+    if (batch > 1 && std::all_of(proposals.begin(), proposals.end(),
+                                 [](auto *p) { return p->sampleProposal && p->proposalUsesLogits; })) {
+        std::vector<FastllmMtpProposalView> views(batch);
+        std::vector<float> temperatures, topPs;
+        std::vector<int> topKs;
+        for (int b = 0; b < batch; ++b) {
+            const auto &q = *proposals[b];
+            views[b] = {(float *)q.proposalProbs.cudaData, (float *)q.proposalLogsumexp.cudaData,
+                        (int *)q.proposalDeviceTokens.cudaData};
+            temperatures.insert(temperatures.end(), rows, configs[b].temperature);
+            topPs.insert(topPs.end(), rows, configs[b].top_p);
+            topKs.insert(topKs.end(), rows, configs[b].top_k);
+        }
+        AssertInFastLLM(FastllmCudaMtpRejectionSamplingLogitsBatch(scores, views.data(), temperatures.data(),
+                                                                   topKs.data(), topPs.data(), sampled.data(),
+                                                                   accepted.data(), batch, drafts, vocab),
+                        "SenseNova batched rejection sampling failed.");
     } else {
-        AssertInFastLLM(ids.dims[1] == 1, "Expected a single committed SenseNova MTP anchor.");
-        std::vector<float> steps(n), packed(inputs.begin(), inputs.end());
-        Data firstPos = BuildMtpPositionIdsSlice(positionIds, 0, 1, 0);
-        const float start = reinterpret_cast<float*>(firstPos.cpuData)[0];
-        for (int t = 0; t < n; ++t) steps[t] = start + t;
-        positions.CopyFrom(Data(FLOAT32, {1,n}, steps));
-        Data packedIds(FLOAT32, {1,n}, packed);
-        verifyPrefixes.resize(visits.size());
-        const bool sampling = r.kv.sampleProposal;
-        if (sampling) {
-            AssertInFastLLM((int)r.kv.proposalTokens.size() >= look &&
-                std::equal(inputs.begin()+1, inputs.end(), r.kv.proposalTokens.begin()),
-                "SenseNova MTP proposal tokens and densities are out of sync.");
-        }
-        predicted = RunTarget(packedIds, {&positions}, {n}, cache, {config}, last, nullptr, &capture,
-                              &verifyPrefixes, sampling ? &r.kv : nullptr);
-        int accepted = 0;
-        if (sampling) {
-            accepted = (int)predicted.size() - 1;
-        } else {
-            while (accepted < look && !stopped(predicted[accepted]) &&
-                   predicted[accepted] == inputs[accepted+1]) ++accepted;
-        }
-        int committed = accepted + 1;
-        for (int t = 0; t < accepted; ++t) {
-            if (stopped(predicted[t])) { committed = t + 1; break; }
-        }
-        r.rounds++;
-        r.acceptedFirst += accepted > 0;
-        r.accepted += std::min(accepted, committed);
-        r.proposed += look;
-        if (committed < n) {
-            for (size_t slot = 0; slot < cache.size(); ++slot) {
-                auto [k,v] = cache[slot];
-                if (k->isLinearAttention) {
-                    SenseNovaCopyState(verifyPrefixes[slot][committed - 1].first, *k);
-                    SenseNovaCopyState(verifyPrefixes[slot][committed - 1].second, *v);
-                } else {
-                    for (Data *kv : {k,v}) {
-                        const int tokens = kv->dims[1] - (n - committed);
-                        const int pages = (tokens + kv->pageLen - 1) / kv->pageLen;
-                        std::vector<int> released(kv->pageIndex.begin()+pages, kv->pageIndex.end());
-                        kv->pageIndex.resize(pages);
-                        kv->lastPageLen = (tokens - 1) % kv->pageLen + 1;
-                        kv->Resize({kv->dims[0],tokens,kv->dims[2]});
-                        kv->pagedKVCacheData->ReleasePageIndices(released);
-                    }
-                }
+        for (int b = 0; b < batch; ++b) {
+            auto *out = sampled.data() + b * rows;
+            if (proposals[b]->sampleProposal) {
+                accepted[b] =
+                    VerifyMtpSamplingRows(scores + size_t(b) * rows * vocab, vocab, logits.dataDeviceIds.front(),
+                                          *proposals[b], drafts, configs[b], out);
+            } else {
+                Data slice;
+                slice.FakeFrom(logits, size_t(b) * rows * vocab * sizeof(float));
+                slice.Resize({1, rows, vocab});
+                greedy(slice, rows, out);
             }
         }
-        predicted.resize(committed);
-        inputs.resize(committed);
     }
-    r.pending.assign(predicted.begin()+1, predicted.end());
-    r.emitted += predicted.size();
-    r.drafts.clear();
-    // With at most one output left the next round cannot verify a draft.
-    if (config.output_token_limit > 0 && r.emitted + 1 >= config.output_token_limit)
-        return {predicted.front()};
-    const int count = inputs.size();
-    const int anchor = predicted.back();
-    if (stopped(anchor))
-        return {predicted.front()};
-    Data hidden, pos = BuildMtpPositionIdsSlice(positions, 0, count, 0);
-    if (count != n) Split(capture, 1, 0, count, hidden);
-    inputs.erase(inputs.begin());
-    inputs.push_back(anchor);
-    const int device = capture.dataDeviceIds.at(0);
-    Data firstHidden;
-    r.kv.BeginProposal(config);
-    int first = RunMtpDraft(device, {device}, r.kv, count == n ? capture : hidden, inputs, pos,
-                            count - 1, r.kv.proposalDepth == 2 ? &firstHidden : nullptr);
-    r.drafts.push_back(first);
-    if (r.kv.proposalDepth == 2 && !stopped(first) &&
-        (config.output_token_limit <= 0 || config.output_token_limit > r.emitted + 2)) {
-        Data nextPos = BuildMtpPositionIdsSlice(pos, count-1, count, 1);
-        const int committed = r.kv.tokens;
+    return sampled;
+}
+
+// Near exhaustion, the scheduler's per-request fallback can reuse pages released
+// by the preceding request. Account for shared pools before advancing any lane.
+bool SenseNovaLoopModel::HasMtpBatchPages(const std::vector<std::shared_ptr<DraftRequest>> &requests,
+                                         const std::vector<int> &lengths, const Cache &cache) const {
+    if (requests.size() == 1) return true;
+    std::map<PagedCacheManager *, int> needed;
+    for (size_t b = 0; b < requests.size(); ++b) {
+        const int rows = lengths[b] + requests[b]->drafts.size();
+        for (size_t slot = 0; slot < visits.size(); ++slot) {
+            auto [key, value] = cache[b * visits.size() + slot];
+            for (Data *kv : {key, value}) {
+                if (!kv->isPagedKVCache || !kv->pagedKVCacheData) continue;
+                const int extra = rows - (kv->pageLen - kv->lastPageLen);
+                if (extra > 0) needed[kv->pagedKVCacheData] += (extra + kv->pageLen - 1) / kv->pageLen;
+            }
+        }
+    }
+    return std::all_of(needed.begin(), needed.end(),
+                       [](const auto &item) { return item.first->FreePageCount() >= item.second; });
+}
+
+std::vector<int> SenseNovaLoopModel::DraftForwardBatch(const std::vector<std::shared_ptr<DraftRequest>> &active,
+                                                       const Data &ids, const std::vector<Data *> &positions,
+                                                       const std::vector<int> &lengths, Cache &cache,
+                                                       const std::vector<GenerationConfig> &configs,
+                                                       const LastTokensManager &last) {
+    const int batch = active.size(), slots = visits.size();
+    Data cpuIds(ids);
+    cpuIds.ToDevice(CPU);
+    const float *id = (const float *)cpuIds.cpuData;
+    std::vector<std::vector<int>> inputs(batch), predicted(batch);
+    std::vector<int> groups[3], output(batch);
+    std::vector<Data> pos(batch), hidden(batch);
+    Data captures[3];
+    auto stopped = [&](int b, int token) {
+        return token == eos_token_id || eos_token_ids.count(token) || configs[b].stop_token_ids.count(token);
+    };
+    int offset = 0;
+    for (int b = 0; b < batch; ++b) {
+        auto &r = *active[b];
+        const int base = r.kv.tokens;
+        int budget = max_positions - base;
+        if (tokensLimit > 0)
+            budget = std::min(budget, tokensLimit - base);
+        if (configs[b].output_token_limit > 0)
+            budget = std::min(budget, configs[b].output_token_limit - r.emitted);
+        for (int slot = 0; slot < slots; ++slot) {
+            Data &k = *cache[b * slots + slot].first;
+            if (k.isPagedKVCache && k.pagedKVCacheData)
+                budget =
+                    std::min(budget, k.pageLen - k.lastPageLen + k.pageLen * k.pagedKVCacheData->FreePageCount());
+        }
+        int look = std::min((int)r.drafts.size(), std::max(0, budget - 1));
+        inputs[b].assign(id + offset, id + offset + lengths[b]);
+        inputs[b].insert(inputs[b].end(), r.drafts.begin(), r.drafts.begin() + look);
+        if (look) {
+            groups[look].push_back(b);
+            AssertInFastLLM(lengths[b] == 1, "Expected a single SenseNova MTP anchor.");
+            if (r.kv.sampleProposal)
+                AssertInFastLLM(
+                    (int)r.kv.proposalTokens.size() >= look &&
+                        std::equal(r.drafts.begin(), r.drafts.begin() + look, r.kv.proposalTokens.begin()),
+                    "SenseNova MTP proposal tokens and densities are out of sync.");
+            Data first = BuildMtpPositionIdsSlice(*positions[b], 0, 1, 0);
+            std::vector<float> steps(look + 1);
+            for (int t = 0; t <= look; ++t)
+                steps[t] = ((float *)first.cpuData)[0] + t;
+            pos[b].CopyFrom(Data(FLOAT32, {1, look + 1}, steps));
+        } else {
+            pos[b].CopyFrom(*positions[b]);
+            Data input(FLOAT32, {1, lengths[b]}, std::vector<float>(id + offset, id + offset + lengths[b]));
+            Cache lane(cache.begin() + b * slots, cache.begin() + (b + 1) * slots);
+            LastTokensManager history(1, configs[b].last_n);
+            if (b < (int)last.units.size())
+                history.units[0] = last.units[b];
+            predicted[b] = RunTarget(input, {&pos[b]}, {lengths[b]}, lane, {configs[b]}, history, nullptr,
+                                     &hidden[b], nullptr);
+        }
+        offset += lengths[b];
+    }
+
+    verifyPrefixes.resize(slots);
+    for (int look = 1; look <= 2; ++look) {
+        const auto &group = groups[look];
+        if (group.empty())
+            continue;
+        const int rows = look + 1;
+        std::vector<float> tokens;
+        std::vector<Data *> groupPos;
+        std::vector<MtpKvCache *> proposals;
+        std::vector<GenerationConfig> groupConfigs;
+        Cache groupCache;
+        for (int b : group) {
+            tokens.insert(tokens.end(), inputs[b].begin(), inputs[b].end());
+            groupPos.push_back(&pos[b]);
+            proposals.push_back(&active[b]->kv);
+            groupConfigs.push_back(configs[b]);
+            groupCache.insert(groupCache.end(), cache.begin() + b * slots, cache.begin() + (b + 1) * slots);
+        }
+        Data packed(FLOAT32, {1, (int)tokens.size()}, tokens), logits;
+        RunTarget(packed, groupPos, std::vector<int>(group.size(), rows), groupCache, groupConfigs, last, nullptr,
+                  &captures[look], &verifyPrefixes, &logits);
+        std::vector<int> acceptedRows;
+        auto sampled = SampleVerifyRows(logits, proposals, groupConfigs, look, acceptedRows);
+        for (int i = 0; i < (int)group.size(); ++i) {
+            int b = group[i], accepted = acceptedRows[i];
+            auto &r = *active[b];
+            const int *pred = sampled.data() + i * rows;
+            if (accepted < 0) {
+                accepted = 0;
+                while (accepted < look && !stopped(b, pred[accepted]) && pred[accepted] == r.drafts[accepted])
+                    ++accepted;
+            }
+            int committed = accepted + 1;
+            for (int t = 0; t < accepted; ++t)
+                if (stopped(b, pred[t])) {
+                    committed = t + 1;
+                    break;
+                }
+            r.rounds++;
+            r.acceptedFirst += accepted > 0;
+            r.accepted += std::min(accepted, committed);
+            r.proposed += look;
+            if (committed < rows)
+                for (int slot = 0; slot < slots; ++slot) {
+                    auto [k, v] = cache[b * slots + slot];
+                    if (k->isLinearAttention) {
+                        auto &prefix = verifyPrefixes[slot][i * look + committed - 1];
+                        SenseNovaCopyState(prefix.first, *k);
+                        SenseNovaCopyState(prefix.second, *v);
+                    } else {
+                        for (Data *kv : {k, v}) {
+                            const int len = kv->dims[1] - (rows - committed),
+                                      pages = (len + kv->pageLen - 1) / kv->pageLen;
+                            std::vector<int> released(kv->pageIndex.begin() + pages, kv->pageIndex.end());
+                            kv->pageIndex.resize(pages);
+                            kv->lastPageLen = (len - 1) % kv->pageLen + 1;
+                            kv->Resize({kv->dims[0], len, kv->dims[2]});
+                            kv->pagedKVCacheData->ReleasePageIndices(released);
+                        }
+                    }
+                }
+            predicted[b].assign(pred, pred + committed);
+            inputs[b].resize(committed);
+            const Data &capture = captures[look];
+            hidden[b].FakeFrom(capture, size_t(i) * rows * embed_dim * capture.unitSize);
+            hidden[b].Resize({1, committed, embed_dim});
+        }
+    }
+
+    std::vector<int> firstRows, secondRows;
+    std::vector<int> saved(batch);
+    for (int b = 0; b < batch; ++b) {
+        auto &r = *active[b];
+        auto &pred = predicted[b];
+        r.pending.assign(pred.begin() + 1, pred.end());
+        r.emitted += pred.size();
+        r.drafts.clear();
+        output[b] = pred.front();
+        if (stopped(b, pred.back()) ||
+            (configs[b].output_token_limit > 0 && r.emitted + 1 >= configs[b].output_token_limit))
+            continue;
+        inputs[b].erase(inputs[b].begin());
+        inputs[b].push_back(pred.back());
+        r.kv.BeginProposal(configs[b]);
+        firstRows.push_back(b);
+    }
+    if (firstRows.empty())
+        return output;
+    const int device = hidden[firstRows.front()].dataDeviceIds.front();
+    std::vector<Data> firstHidden;
+    auto draft = [&](const std::vector<int> &lanes, bool second) {
+        std::vector<MtpKvCache *> caches;
+        std::vector<const Data *> hs;
+        std::vector<std::vector<int>> tokens;
+        std::vector<int> sampleRows;
+        std::vector<Data> slices(lanes.size());
+        std::vector<Data *> positionPtrs;
+        for (int i = 0; i < (int)lanes.size(); ++i) {
+            int b = lanes[i], count = inputs[b].size();
+            auto &r = *active[b];
+            caches.push_back(&r.kv);
+            if (second) {
+                hs.push_back(&firstHidden[saved[b]]);
+                tokens.push_back({r.drafts.front()});
+            } else {
+                hs.push_back(&hidden[b]);
+                tokens.push_back(inputs[b]);
+            }
+            slices[i].CopyFrom(BuildMtpPositionIdsSlice(pos[b], second ? count - 1 : 0, count, second ? 1 : 0));
+            positionPtrs.push_back(&slices[i]);
+            sampleRows.push_back(second ? 0 : count - 1);
+        }
+        return RunMtpDraftBatch(device, {device}, caches, hs, tokens, positionPtrs, sampleRows,
+                                !second && draftCount == 2 ? &firstHidden : nullptr);
+    };
+    auto first = draft(firstRows, false);
+    std::vector<int> committedTokens(batch);
+    for (int i = 0; i < (int)firstRows.size(); ++i) {
+        int b = firstRows[i];
+        auto &r = *active[b];
+        r.drafts.push_back(first[i]);
+        if (r.kv.proposalDepth == 2 && !stopped(b, first[i]) &&
+            (configs[b].output_token_limit <= 0 || configs[b].output_token_limit > r.emitted + 2)) {
+            saved[b] = i;
+            committedTokens[b] = r.kv.tokens;
+            secondRows.push_back(b);
+        }
+    }
+    if (!secondRows.empty()) {
         try {
-            r.drafts.push_back(RunMtpDraft(device, {device}, r.kv, firstHidden, {first}, nextPos, 0));
+            auto second = draft(secondRows, true);
+            for (int i = 0; i < (int)secondRows.size(); ++i)
+                active[secondRows[i]]->drafts.push_back(second[i]);
         } catch (...) {
-            r.kv.Truncate(committed);
+            for (int b : secondRows)
+                active[b]->kv.Truncate(committedTokens[b]);
             throw;
         }
-        r.kv.Truncate(committed);
+        for (int b : secondRows)
+            active[b]->kv.Truncate(committedTokens[b]);
     }
-    return {predicted.front()};
+    return output;
 }
+
 #endif
 
 std::vector<int> SenseNovaLoopModel::ForwardMultimodal(const Data &, const Data &, const Data &,

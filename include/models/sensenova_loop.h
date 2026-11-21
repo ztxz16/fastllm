@@ -64,9 +64,14 @@ private:
     std::map<const Data*, std::shared_ptr<DraftRequest>> requests;
     std::vector<int> RunTarget(const Data &ids, const std::vector<Data*> &positions, const std::vector<int> &lengths,
         Cache &cache, const std::vector<GenerationConfig> &configs, const LastTokensManager &last,
-        std::vector<std::vector<float>*> *logits, Data *capture, PrefixStates *prefixes, MtpKvCache *proposal = nullptr);
-    std::vector<int> DraftForward(DraftRequest &request, const Data &ids, Data &positionIds,
-        Cache &cache, const GenerationConfig &config, const LastTokensManager &last);
+        std::vector<std::vector<float>*> *logits, Data *capture, PrefixStates *prefixes, Data *verifyLogits = nullptr);
+    bool HasMtpBatchPages(const std::vector<std::shared_ptr<DraftRequest>> &requests,
+                          const std::vector<int> &lengths, const Cache &cache) const;
+    std::vector<int> DraftForwardBatch(const std::vector<std::shared_ptr<DraftRequest>> &batchRequests,
+        const Data &ids, const std::vector<Data*> &positions, const std::vector<int> &lengths,
+        Cache &cache, const std::vector<GenerationConfig> &configs, const LastTokensManager &last);
+    std::vector<int> SampleVerifyRows(Data &logits, const std::vector<MtpKvCache*> &proposals,
+        const std::vector<GenerationConfig> &configs, int drafts, std::vector<int> &accepted);
     void FullAttention(const std::string &prefix, Data &input, const Data &rotary,
                        int slot, std::vector<Data*> &keys, std::vector<Data*> &values, DecodePages &pages, bool verify, Data &output);
     void LinearAttention(const std::string &prefix, Data &input,

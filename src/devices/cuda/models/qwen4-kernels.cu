@@ -1403,6 +1403,7 @@ namespace {
     struct GdnStateRows {
         static constexpr int capacity = 32;
         float *state[capacity];
+        int requestStride, gatePitch;
     };
 
     template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false, bool BATCHED = false,
@@ -1453,8 +1454,8 @@ namespace {
 
         const int tid = threadIdx.x;
         for (int token = 0; token < sequence; token++) {
-            const uint64_t row =
-                (uint64_t)batchIndex * sequence + token;
+            uint64_t row = (uint64_t)batchIndex * sequence + token;
+            if constexpr (SEPARATE_STATES) row = (uint64_t)batchIndex * states.requestStride;
             const uint64_t qkvBase = row * qkvChannels;
             const float *queryRaw =
                 qkv + qkvBase + keyHead * KEY_DIM;
@@ -1489,7 +1490,8 @@ namespace {
                 }
             }
             if (tid == 0) {
-                const uint64_t gateIndex = row * valueHeads + valueHead;
+                uint64_t gateIndex = row * valueHeads + valueHead;
+                if constexpr (SEPARATE_STATES) gateIndex = row * states.gatePitch + valueHead;
                 const float alphaValue =
                     Qwen4CudaToFloat(alpha[gateIndex]);
                 const float biasedAlpha =
@@ -4945,6 +4947,8 @@ void FastllmCudaGdnBf16DecodeRows(const fastllm::Data &qkv, const fastllm::Data 
     const int rows = states.size();
     for (int first = 0; first < rows; first += GdnStateRows::capacity) {
         GdnStateRows table{};
+        table.requestStride = 1;
+        table.gatePitch = valueHeads;
         const int count = std::min(rows - first, GdnStateRows::capacity);
         for (int row = 0; row < count; ++row) table.state[row] = (float*)states[first + row]->cudaData;
         Qwen4GatedDeltaRuleDecodeKernel<__nv_bfloat16, false, false, false, true>
@@ -4955,6 +4959,40 @@ void FastllmCudaGdnBf16DecodeRows(const fastllm::Data &qkv, const fastllm::Data 
                 (const float*)aLog.cudaData, (const float*)dtBias.cudaData, nullptr, nullptr,
                 (float*)core.cudaData + size_t(first) * width, keyHeads, valueHeads, 1,
                 1e-6f / 128, 1.0f / std::sqrt(128.f), true, nullptr, nullptr, 0.f, false, {}, table);
+    }
+}
+
+// Advance each request in place, saving the intermediate states needed for rollback.
+void FastllmCudaGdnBf16VerifyRows(const fastllm::Data &qkv, const fastllm::Data &alpha, const fastllm::Data &beta,
+                                  const fastllm::Data &aLog, const fastllm::Data &dtBias,
+                                  const std::vector<fastllm::Data *> &states,
+                                  std::vector<std::pair<fastllm::Data, fastllm::Data>> &prefixes, int steps,
+                                  int keyHeads, int valueHeads, bool mergedBA, fastllm::Data &core) {
+    const int width = 128 * valueHeads, channels = 128 * (2 * keyHeads + valueHeads);
+    const int batch = states.size(), gatePitch = beta.dims.back();
+    GdnStateRows table{};
+    table.requestStride = steps;
+    table.gatePitch = gatePitch;
+    for (int b = 0; b < batch; ++b)
+        table.state[b] = (float *)states[b]->cudaData;
+    for (int t = 0; t < steps; ++t) {
+        Qwen4GatedDeltaRuleDecodeKernel<__nv_bfloat16, false, false, false, true>
+            <<<batch * valueHeads, 128, 0, cudaStreamPerThread>>>(
+                (const float *)qkv.cudaData + t * channels,
+                (const __nv_bfloat16 *)alpha.cudaData + t * gatePitch + (mergedBA ? valueHeads : 0),
+                (const __nv_bfloat16 *)beta.cudaData + t * gatePitch, (const float *)aLog.cudaData,
+                (const float *)dtBias.cudaData, nullptr, nullptr, (float *)core.cudaData + t * width, keyHeads,
+                valueHeads, 1, 1e-6f / 128, 1.0f / std::sqrt(128.f), true, nullptr, nullptr, 0.f, false, {}, table);
+        // In-place GDN and out-of-place GDN contract different FP32 products.
+        // Snapshot after the update to retain the single-request reduction.
+        if (t + 1 < steps) {
+            for (int b = 0; b < batch; ++b) {
+                auto status = cudaMemcpyAsync(prefixes[b * (steps - 1) + t].second.cudaData, states[b]->cudaData,
+                                              states[b]->GetBytes(), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+                if (status != cudaSuccess)
+                    throw std::runtime_error(cudaGetErrorString(status));
+            }
+        }
     }
 }
 

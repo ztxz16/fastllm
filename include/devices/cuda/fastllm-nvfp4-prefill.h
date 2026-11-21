@@ -30,11 +30,15 @@ class FastllmCudaNvfp4Scope {
 public:
     const FastllmNvfp4PrefillPlan &plan;
     const bool batched;
+    // Verifier cohorts use two or three rows. Keep the existing public field offsets.
+    const unsigned char verifyRows;
     const int promptRows;
     FastllmCompactMarlinCache *const marlin;
 
     explicit FastllmCudaNvfp4Scope(const FastllmNvfp4PrefillPlan &plan, bool batched = false,
                                    int promptRows = 0, FastllmCompactMarlinCache *marlin = nullptr);
+    FastllmCudaNvfp4Scope(const FastllmNvfp4PrefillPlan &plan, bool batched, int promptRows,
+                          FastllmCompactMarlinCache *marlin, int verifyRows);
     ~FastllmCudaNvfp4Scope();
     static bool IsBatched();
     FastllmCudaNvfp4Scope(const FastllmCudaNvfp4Scope &) = delete;
