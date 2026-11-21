@@ -4165,7 +4165,8 @@ if (UNIT_TEST)
             add_test(NAME custom_ar_registration COMMAND customArRegistrationRegression)
             add_test(NAME custom_ar_registration_pool_reuse COMMAND customArRegistrationRegression reuse)
             add_test(NAME custom_ar_selftest_upload COMMAND customArRegistrationRegression selftest)
-            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse custom_ar_selftest_upload PROPERTIES
+            add_test(NAME custom_ar_transient_inputs COMMAND customArRegistrationRegression transient)
+            set_tests_properties(custom_ar_registration custom_ar_registration_pool_reuse custom_ar_selftest_upload custom_ar_transient_inputs PROPERTIES
                 LABELS cuda TIMEOUT 30 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         endif()
 

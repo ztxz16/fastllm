@@ -170,6 +170,19 @@ bool FastllmMultiCudaMatMul(const fastllm::Data &input, fastllm::Data &weight, c
 struct FastllmCudaV41AttentionRequest;
 
 namespace fastllm {
+#ifndef USE_ROCM
+    // Mark temporary operands on the worker that submits the collective.
+    class TransientAllReduceInputs {
+    public:
+        explicit TransientAllReduceInputs(bool enabled);
+        ~TransientAllReduceInputs();
+        TransientAllReduceInputs(const TransientAllReduceInputs &) = delete;
+        TransientAllReduceInputs &operator=(const TransientAllReduceInputs &) = delete;
+    private:
+        bool previous;
+    };
+#endif
+
     // Upload a compact CPU activation once, then broadcast it to TP ranks.
     // Unsupported layouts/devices return false before changing the input.
     bool MultiCudaBroadcastCpuActivation(Data &input, const std::vector<int> &devices);

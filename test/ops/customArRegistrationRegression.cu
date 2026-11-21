@@ -62,15 +62,6 @@ static void Require(cudaError_t status, const char *where) {
 }
 
 static int RunSelfTestUploadRegression() {
-    for (int device = 0; device < 2; ++device) {
-        int peer = 0;
-        Require(cudaDeviceCanAccessPeer(&peer, device, 1 - device), "peer access query");
-        if (!peer) return 77;
-    }
-    // Skip auto tuning here: exercise its real correctness check directly,
-    // with a cached pointer tuple so cold registration cannot mask the race.
-    setenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE", "1", 1);
-    if (!FastllmInitNccl({0, 1}) || !FastllmCudaCustomAllReduceEnabled()) return 1;
     CustomArState &state = GetCustomArState();
     for (int device = 0; device < 2; ++device) {
         Require(cudaSetDevice(device), "staging device");
@@ -121,11 +112,68 @@ static int RunSelfTestUploadRegression() {
     return passed ? 0 : 1;
 }
 
+// Vary peer addresses on every launch. Queue multiple launches before reading
+// back to detect a descriptor accidentally overwritten by the following round.
+static int RunTransientInputsRegression() {
+    auto &state = GetCustomArState();
+    const auto &devices = state.devices;
+    constexpr int rounds = 32, width = 128;
+    CustomArBenchBuffers buffers;
+    const size_t bytes = rounds * width * sizeof(float);
+    if (!AllocateCustomArBenchBuffers(devices, bytes, buffers)) return 1;
+    std::vector<float> values(rounds * width);
+    for (int rank : devices) {
+        Require(cudaSetDevice(rank), "input device");
+        for (int i = 0; i < rounds * width; ++i) values[i] = (float)(rank + i);
+        Require(cudaMemcpyAsync(buffers.inputs[rank], values.data(), bytes, cudaMemcpyHostToDevice, cudaStreamPerThread), "input upload");
+        Require(cudaStreamSynchronize(cudaStreamPerThread), "input readiness");
+    }
+    float us = 0;
+    auto reduce = [&](int rank, int row) {
+        return RunCustomArCandidate(static_cast<float *>(buffers.inputs[rank]) + row * width,
+                                    static_cast<float *>(buffers.outputs[rank]) + row * width,
+                                    width, fastllm::FLOAT32, rank, false);
+    };
+    if (!RunCustomArRankOperation(devices, 1, [&](int rank) { return reduce(rank, 0); }, us)) return 1;
+    const size_t registrations = state.registrations.size();
+    bool ok = RunCustomArRankOperation(devices, 1, [&](int rank) {
+        {
+            // One transient peer makes the whole tuple transient.
+            fastllm::TransientAllReduceInputs transient(rank == 0);
+            for (int i = 1; i < rounds; ++i)
+                if (!reduce(rank, i)) return false;
+        }
+        return reduce(rank, 0);
+    }, us);
+    for (int rank : devices) {
+        Require(cudaSetDevice(rank), "result device");
+        Require(cudaMemcpyAsync(values.data(), buffers.outputs[rank], bytes, cudaMemcpyDeviceToHost, cudaStreamPerThread), "result download");
+        Require(cudaStreamSynchronize(cudaStreamPerThread), "result readiness");
+        for (int i = 0; i < rounds * width; ++i) ok &= values[i] == (float)(2 * i + 1);
+    }
+    ok &= state.registrations.size() == registrations;
+    FreeCustomArBenchBuffers(devices, buffers);
+    std::printf("%s: rotating peer inputs preserve results and registration count\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     const bool reuse = argc > 1 && std::strcmp(argv[1], "reuse") == 0;
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 2) return 77;
-    if (argc > 1 && std::strcmp(argv[1], "selftest") == 0) return RunSelfTestUploadRegression();
+    const bool selfTest = argc > 1 && std::strcmp(argv[1], "selftest") == 0;
+    const bool transient = argc > 1 && std::strcmp(argv[1], "transient") == 0;
+    if (selfTest || transient) {
+        for (int device = 0; device < 2; ++device) {
+            int peer = 0;
+            Require(cudaDeviceCanAccessPeer(&peer, device, 1 - device), "peer access query");
+            if (!peer) return 77;
+        }
+        // Exercise the custom kernels even when the parent process disabled them.
+        setenv("FASTLLM_CUDA_CUSTOM_ALLREDUCE", "1", 1);
+        if (!FastllmInitNccl({0, 1}) || !FastllmCudaCustomAllReduceEnabled()) return 1;
+        return selfTest ? RunSelfTestUploadRegression() : RunTransientInputsRegression();
+    }
     CustomArState state;
     state.devices = {0, 1};
     std::vector<void *> inputs(2);

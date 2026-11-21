@@ -482,6 +482,9 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         (batch->proposals->rows.empty() || !graphDecode || !tpDecodeState->captured))
         batch->proposals->materialize();
     auto forwardRank = [&](int rank, int device) {
+#ifndef USE_ROCM
+        TransientAllReduceInputs transient(tpServingState && !tpServingState->preparing && !state.servingPadded);
+#endif
         const int group = topology.AttentionOwner(rank);
         auto &local = state.ranks[rank];
         Data logits;
