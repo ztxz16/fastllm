@@ -16390,45 +16390,92 @@ __global__ void ScaleTopKFirstLogits(const float *input, float *output,
             input[size_t(row) * vocab + col] * (1.f / temperatures[row]);
     }
 }
-__global__ void TrimTopKBoundaryTies(float *logits, const int *topKs, int vocab) {
-    constexpr int Threads = 256;
-    const int row = blockIdx.x, k = topKs[row];
-    if (k <= 0 || k >= vocab) return;
-    float *values = logits + size_t(row) * vocab;
-    using Min = cub::BlockReduce<float, Threads>;
-    using Sum = cub::BlockReduce<int, Threads>;
-    using Scan = cub::BlockScan<int, Threads>;
-    __shared__ union { typename Min::TempStorage min; typename Sum::TempStorage sum;
-                       typename Scan::TempStorage scan; } scratch;
-    __shared__ float pivot;
-    __shared__ int retained, needed, preceding;
-    float minimum = INFINITY; int count = 0;
-    for (int id = threadIdx.x; id < vocab; id += Threads) {
-        const float x = values[id];
-        if (isfinite(x)) { minimum = fminf(minimum, x); ++count; }
+// After radix masking, only the smallest finite score can have excess ties.
+// Summaries over contiguous token ranges let each CTA determine its exact
+// share of that score, keeping ascending token ID as the tie breaker.
+struct TopKBoundary {
+    float minimum;
+    int finite, equal, positiveInf;
+};
+struct JoinTopKBoundary {
+    __device__ TopKBoundary operator()(TopKBoundary a, TopKBoundary b) const {
+        const float m = fminf(a.minimum, b.minimum);
+        return {m, a.finite + b.finite, (a.minimum == m ? a.equal : 0) + (b.minimum == m ? b.equal : 0),
+                a.positiveInf + b.positiveInf};
     }
-    float m = Min(scratch.min).Reduce(minimum, [](float a, float b) { return fminf(a, b); });
-    if (threadIdx.x == 0) pivot = m;
+};
+constexpr int TopKTieThreads = 256;
+using TopKTieReduce = cub::BlockReduce<TopKBoundary, TopKTieThreads>;
+
+__device__ TopKBoundary TopKTileSummary(const float *row, int64_t begin, int64_t end,
+                                        TopKTieReduce::TempStorage &scratch) {
+    TopKBoundary item{INFINITY, 0, 0, 0};
+    for (int64_t j = begin + threadIdx.x; j < end; j += blockDim.x) {
+        const float x = row[j];
+        if (isfinite(x)) {
+            ++item.finite;
+            if (x < item.minimum) { item.minimum = x; item.equal = 1; }
+            else if (x == item.minimum) ++item.equal;
+        } else if (x == INFINITY) ++item.positiveInf;
+    }
+    return TopKTieReduce(scratch).Reduce(item, JoinTopKBoundary{});
+}
+
+__global__ void CountTopKBoundaryTiles(const float *logits, int vocab, TopKBoundary *tiles) {
+    __shared__ TopKTieReduce::TempStorage scratch;
+    const int64_t begin = int64_t(vocab) * blockIdx.y / gridDim.y;
+    const int64_t end = int64_t(vocab) * (blockIdx.y + 1) / gridDim.y;
+    const auto stats = TopKTileSummary(logits + size_t(blockIdx.x) * vocab, begin, end, scratch);
+    if (!threadIdx.x) tiles[size_t(blockIdx.x) * gridDim.y + blockIdx.y] = stats;
+}
+
+template<bool SingleTile>
+__global__ void TrimTopKBoundaryTies(float *logits, const int *topKs, int vocab, const TopKBoundary *tiles) {
+    const int row = blockIdx.x, k = topKs[row], tile = blockIdx.y;
+    if (k <= 0 || k >= vocab) return;
+    using Sum = cub::BlockReduce<int, TopKTieThreads>;
+    using Scan = cub::BlockScan<int, TopKTieThreads>;
+    __shared__ union { TopKTieReduce::TempStorage stats; Sum::TempStorage sum; Scan::TempStorage scan; } scratch;
+    __shared__ TopKBoundary total;
+    __shared__ int keep;
+    float *values = logits + size_t(row) * vocab;
+    const int64_t begin = int64_t(vocab) * tile / gridDim.y, end = int64_t(vocab) * (tile + 1) / gridDim.y;
+    TopKBoundary item{INFINITY, 0, 0, 0}, aggregate;
+    if constexpr (SingleTile) {
+        aggregate = TopKTileSummary(values, begin, end, scratch.stats);
+    } else {
+        tiles += size_t(row) * gridDim.y;
+        if (threadIdx.x < gridDim.y) item = tiles[threadIdx.x];
+        aggregate = TopKTieReduce(scratch.stats).Reduce(item, JoinTopKBoundary{});
+    }
+    if (!threadIdx.x) total = aggregate;
     __syncthreads();
-    int n = Sum(scratch.sum).Sum(count);
-    if (threadIdx.x == 0) retained = n;
+    if (total.finite <= k) return;
+    const int quota = k - (total.finite - total.equal + total.positiveInf);
+    if constexpr (SingleTile) {
+        if (!threadIdx.x) keep = quota;
+    } else {
+        if (tiles[tile].minimum != total.minimum) return;
+        int before = Sum(scratch.sum).Sum(threadIdx.x < tile && item.minimum == total.minimum ? item.equal : 0);
+        if (!threadIdx.x) keep = quota - before;
+    }
     __syncthreads();
-    if (retained <= k) return;
-    count = 0;
-    for (int id = threadIdx.x; id < vocab; id += Threads) count += values[id] > pivot;
-    n = Sum(scratch.sum).Sum(count);
-    if (threadIdx.x == 0) { needed = k - n; preceding = 0; }
-    __syncthreads();
-    // Rare exact ties only: scan IDs in order, retaining exactly k entries.
-    // This also makes greedy/top_k=1 deterministic without another CPU path.
-    for (int first = 0; first < vocab; first += Threads) {
-        const int id = first + threadIdx.x;
-        const int equal = id < vocab && values[id] == pivot;
-        int before, total;
-        Scan(scratch.scan).ExclusiveSum(equal, before, total);
-        if (equal && preceding + before >= needed) values[id] = -INFINITY;
+    if constexpr (!SingleTile) {
+        if (keep >= tiles[tile].equal) return;
+    }
+    if (keep <= 0) {
+        for (int64_t j = begin + threadIdx.x; j < end; j += blockDim.x)
+            if (values[j] == total.minimum) values[j] = -INFINITY;
+        return;
+    }
+    for (int64_t base = begin; base < end; base += blockDim.x) {
+        const int64_t j = base + threadIdx.x;
+        const int equal = j < end && values[j] == total.minimum;
+        int rank, n;
+        Scan(scratch.scan).ExclusiveSum(equal, rank, n);
+        if (equal && rank >= keep) values[j] = -INFINITY;
         __syncthreads();
-        if (threadIdx.x == 0) preceding += total;
+        if (!threadIdx.x) keep -= n;
         __syncthreads();
     }
 }
@@ -16444,7 +16491,18 @@ bool MaskTopKFirstLogits(const float *logits, float *filtered, const float *temp
         status = flashinfer::sampling::RadixTopKMaskLogitsMultiCTA<float, int>(
             filtered, filtered, topKs, batch, 0, vocab, states, stream);
     if (status != cudaSuccess) return false;
-    TrimTopKBoundaryTies<<<batch, 256, 0, stream>>>(filtered, topKs, vocab);
+    // Reuse the radix workspace after its last read. Limit scratch, not vocab
+    // or batch: the tile ranges grow to cover arbitrarily wide rows.
+    constexpr int maxTiles = std::min<size_t>(TopKTieThreads, sizeof(*states) / sizeof(TopKBoundary));
+    const int tiles = std::min(maxTiles, 1 + (vocab - 1) / 1024);
+    if (tiles == 1) {
+        TrimTopKBoundaryTies<true><<<batch, TopKTieThreads, 0, stream>>>(filtered, topKs, vocab, nullptr);
+    } else {
+        auto *summaries = reinterpret_cast<TopKBoundary *>(states);
+        dim3 grid(batch, tiles);
+        CountTopKBoundaryTiles<<<grid, TopKTieThreads, 0, stream>>>(filtered, vocab, summaries);
+        TrimTopKBoundaryTies<false><<<grid, TopKTieThreads, 0, stream>>>(filtered, topKs, vocab, summaries);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 }
