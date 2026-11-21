@@ -60,11 +60,23 @@ struct Body {
     std::shared_future<void> intentCommitted;
 };
 } // namespace
-Pipeline::Pipeline(std::string r, fs::path a, int width, int height, bool four, bool streamAvc,
+GpuLayout GpuLayout::fromProfile(const std::string &profile) {
+    if (profile == "single")
+        return {0, 0, 0, {}};
+    if (profile == "two")
+        return {0, 1, 1, {}};
+    if (profile == "four")
+        return {1, 3, 2, {3}};
+    if (profile == "eight")
+        return {1, 3, 2, {3, 4, 5, 6, 7}};
+    throw std::invalid_argument("expected Duo GPU profile single, two, four or eight");
+}
+
+Pipeline::Pipeline(std::string r, fs::path a, int width, int height, GpuLayout layout, bool streamAvc,
                    fs::path cache)
     : root(std::move(r)), assets(std::move(a)), intentCache(std::move(cache)), w(width), h(height),
-      intentDev(four ? 1 : 0), codecDev(four ? 2 : 0), streamAvc(streamAvc), tokens(root + "/intent_adapter"),
-      inputs(root, four ? 3 : 0, intentDev) {}
+      devices(std::move(layout)), streamAvc(streamAvc), tokens(root + "/intent_adapter"),
+      inputs(root, devices.speech, devices.intent) {}
 void Pipeline::check() const {
     if (cancelled.load())
         throw std::runtime_error("session cancelled");
@@ -256,7 +268,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
         try {
             if (!intent || fresh) {
                 if (!intent)
-                    intent = std::make_unique<Intent>(root, intentDev, intentDev != 0, intentCache);
+                    intent = std::make_unique<Intent>(root, devices.intent, devices.intent != 0, intentCache);
                 shared.set_value(prefix());
             } else
                 shared.set_value({});
@@ -271,7 +283,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
             std::promise<void> intentCommit;
             bool released = false;
             Intent::HiddenReady waitReady;
-            if (fresh && intentDev != 0) {
+            if (fresh && devices.intent != 0) {
                 waitReady = [&](const at::Tensor &h50) {
                     auto features = floats(h50.narrow(0, h50.size(0) - 1, 1));
                     bodies.put({index, std::move(features), intentCommit.get_future().share()});
@@ -285,7 +297,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
             if (released) {
                 // KV writes from the remaining layers are asynchronous. Resolve
                 // the publication fence only after GPU completion on their stream.
-                c10::cuda::getCurrentCUDAStream(intentDev).synchronize();
+                c10::cuda::getCurrentCUDAStream(devices.intent).synchronize();
                 intentCommit.set_value();
             }
             auto &[hidden, ids] = pending;
@@ -318,7 +330,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
         Body b;
         while (bodies.take(b)) {
             check();
-            if (codecDev != 0) {
+            if (devices.codec != 0) {
                 std::promise<void> committed;
                 auto ready = committed.get_future().share();
                 try {
@@ -341,11 +353,11 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
         packets.close();
     });
     auto codec = worker([&] {
-        c10::cuda::CUDAGuard dev(at::Device(at::kCUDA, codecDev));
+        c10::cuda::CUDAGuard dev(at::Device(at::kCUDA, devices.codec));
         if (!solarx) {
-            solarx = std::make_unique<SolarX>(root + "/codec/video_vae/model.safetensors", codecDev,
-                                              codecDev == 2 ? 3 : -1);
-            audioRuntime = std::make_unique<minimax_h3::Runtime>(codecDev, nomas::DType::FP32);
+            solarx = std::make_unique<SolarX>(root + "/codec/video_vae/model.safetensors", devices.codec,
+                                              devices.tilePeers);
+            audioRuntime = std::make_unique<minimax_h3::Runtime>(devices.codec, nomas::DType::FP32);
             audio = std::make_unique<minimax_h3::AudioVAE>(*audioRuntime, root + "/codec/audio_vae");
         }
         solarx->reset();
@@ -401,7 +413,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
             if (avc) {
                 auto yuv = at::empty({17, h * w * 3 / 2}, deviceRgb.options());
                 duo_rgb_to_i420(deviceRgb.data_ptr<uint8_t>(), yuv.data_ptr<uint8_t>(), w, h, 17,
-                                c10::cuda::getCurrentCUDAStream(codecDev));
+                                c10::cuda::getCurrentCUDAStream(devices.codec));
                 C10_CUDA_KERNEL_LAUNCH_CHECK();
                 auto host = yuv.cpu();
                 avc->write(dir / name, count, host.data_ptr<uint8_t>(), g.audio);

@@ -95,7 +95,7 @@ int runWorker(char **argv) {
         if (fs::exists(rgb))
             writeBytes(fs::path(argv[3]) / referencePreset(w, h), encodeReference(argv[2], readFile(rgb), w, h));
         Pipeline pipeline(argv[2], argv[3], w, h,
-                          std::string(argv[7]) == "four", std::string(argv[9]) == "avc", argv[10]);
+                          GpuLayout::fromProfile(argv[7]), std::string(argv[9]) == "avc", argv[10]);
         for (;;) {
             auto turn = receive(workerSocket);
             if (turn.empty())
@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
     if (argc == 11 && std::string(argv[1]) == "--worker")
         return runWorker(argv);
     if (argc != 6 && (argc != 8 || std::string(argv[6]) != "--intent-cache")) {
-        std::cerr << "Usage: duo_live MODEL TOOLS_DUO_DIRECTORY SESSION_DIRECTORY PORT single|four "
+        std::cerr << "Usage: duo_live MODEL TOOLS_DUO_DIRECTORY SESSION_DIRECTORY PORT single|two|four|eight "
                      "[--intent-cache DIRECTORY]\n";
         return 2;
     }
@@ -220,7 +220,8 @@ int main(int argc, char **argv) {
         const fs::path assets = argv[2], sessions = argv[3];
         const fs::path intentCache = argc == 8 ? argv[7] : "";
         int port = std::stoi(argv[4]);
-        if ((profile != "single" && profile != "four") || port < 1 || port > 65535)
+        GpuLayout::fromProfile(profile);
+        if (port < 1 || port > 65535)
             throw std::invalid_argument("invalid serving configuration");
         const std::string html = readFile(assets / "live.html");
         const auto player = readFile(assets / "avc-player.js");

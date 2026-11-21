@@ -37,8 +37,8 @@ Tensor join(const Tensor &prior, const Tensor &tile, int dim, int overlap) {
     return at::cat({mixed, tile.slice(dim, overlap)}, dim);
 }
 } // namespace
-SolarX::SolarX(const std::string &file, int device, int secondDevice)
-    : weights(at::Device(at::kCUDA, device)), weightFile(file), secondDevice(secondDevice) {
+SolarX::SolarX(const std::string &file, int device, std::vector<int> peerDevices)
+    : weights(at::Device(at::kCUDA, device)), weightFile(file), peerDevices(std::move(peerDevices)) {
     c10::InferenceMode guard;
     weights.load(file, {"decoder.", "post_quant_conv."});
     auto constant = [&](const float *data, at::IntArrayRef shape) {
@@ -80,13 +80,21 @@ void SolarX::plan(int h, int w, int assignedTiles) {
     cosine = angles.cos();
     sine = angles.sin();
     const int tiles = xs.size() * ys.size();
-    localTiles = assignedTiles ? assignedTiles : tiles;
-    if (secondDevice >= 0 && tiles > 1) {
-        localTiles = (tiles + 1) / 2;
-        c10::cuda::CUDAGuard guard(at::Device(at::kCUDA, secondDevice));
-        if (!second)
-            second = std::make_unique<SolarX>(weightFile, secondDevice);
-        second->plan(h, w, tiles - localTiles);
+    const int workers = std::min<int>(tiles, 1 + peerDevices.size());
+    auto share = [&](int rank) { return tiles / workers + (rank < tiles % workers); };
+    localTiles = assignedTiles ? assignedTiles : share(0);
+    peers.resize(workers - 1);
+    std::vector<std::future<void>> setups;
+    for (int rank = 1; rank < workers; ++rank) {
+        const auto stream = c10::cuda::getCurrentCUDAStream(peerDevices[rank - 1]);
+        setups.push_back(std::async(std::launch::async, [this, rank, stream, h, w, count = share(rank)] {
+            c10::InferenceMode inference;
+            c10::cuda::CUDAStreamGuard guard(stream);
+            auto &peer = peers[rank - 1];
+            if (!peer)
+                peer = std::make_unique<SolarX>(weightFile, stream.device_index());
+            peer->plan(h, w, count);
+        }));
     }
     keys.clear();
     values.clear();
@@ -94,6 +102,8 @@ void SolarX::plan(int h, int w, int assignedTiles) {
         keys.push_back(at::empty({localTiles, 5 + 7 * th * tw, 32, 64}, opts));
         values.push_back(at::empty_like(keys.back()));
     }
+    for (auto &setup : setups)
+        setup.get();
 }
 Tensor SolarX::layers(const Tensor &tiles, const std::vector<int> &fresh, int slot) {
     const int batch = tiles.size(0), hw = th * tw, n = fresh.size() * hw;
@@ -175,21 +185,30 @@ Tensor SolarX::push(const Tensor &latent) {
     int count = (index % 5 == 0) ? 1 : 4;
     auto input = at::cat(tiles, 2);
     Tensor decoded;
-    if (localTiles < input.size(0)) {
-        // Tile attention is independent. Keep each tile's KV on its assigned GPU;
-        // merge predictions before the original blending and color correction.
-        auto shard = input.slice(0, localTiles).to(second->weights.device, input.scalar_type(), true);
-        auto stream = c10::cuda::getCurrentCUDAStream(secondDevice);
-        auto other = std::async(std::launch::async, [this, shard, stream, &fresh, slot] {
-            c10::InferenceMode inference;
-            c10::cuda::CUDAStreamGuard guard(stream);
-            return second->layers(shard, fresh, slot);
-        });
-        auto local = layers(input.narrow(0, 0, localTiles), fresh, slot);
-        auto remote = other.get();
-        decoded = at::cat({local, remote.to(weights.device, remote.scalar_type(), true)});
-    } else {
+    if (peers.empty()) {
         decoded = layers(input, fresh, slot);
+    } else {
+        // Tile attention is independent. Keep each tile's KV on its GPU and
+        // collect predictions in raster order before blending overlaps.
+        std::vector<std::future<Tensor>> jobs;
+        int offset = localTiles;
+        for (const auto &peer : peers) {
+            const auto device = peer->weights.device;
+            auto shard = input.narrow(0, offset, peer->localTiles).to(device, input.scalar_type(), true);
+            offset += peer->localTiles;
+            auto stream = c10::cuda::getCurrentCUDAStream(device.index());
+            jobs.push_back(std::async(std::launch::async, [worker = peer.get(), shard, stream, &fresh, slot] {
+                c10::InferenceMode inference;
+                c10::cuda::CUDAStreamGuard guard(stream);
+                return worker->layers(shard, fresh, slot);
+            }));
+        }
+        std::vector<Tensor> parts{layers(input.narrow(0, 0, localTiles), fresh, slot)};
+        for (auto &job : jobs) {
+            auto result = job.get();
+            parts.push_back(result.to(weights.device, result.scalar_type(), true));
+        }
+        decoded = at::cat(parts);
     }
     auto out = blend(decoded).slice(1, 4 - count).to(at::kFloat);
     auto pick = [&](int k) {

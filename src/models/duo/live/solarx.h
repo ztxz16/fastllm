@@ -5,7 +5,7 @@
 namespace fastllm::duo::live {
 class SolarX {
   public:
-    SolarX(const std::string &file, int device, int secondDevice = -1);
+    SolarX(const std::string &file, int device, std::vector<int> peerDevices = {});
     // Input is the normalized BF16 [24,5,H/16,W/16] packet. Returns [17,H,W,3] uint8.
     at::Tensor decode(const at::Tensor &packet);
     void reset();
@@ -13,8 +13,9 @@ class SolarX {
   private:
     Weights weights;
     std::string weightFile;
-    int secondDevice, localTiles = 0;
-    std::unique_ptr<SolarX> second;
+    std::vector<int> peerDevices;
+    std::vector<std::unique_ptr<SolarX>> peers;
+    int localTiles = 0;
 
     std::vector<int64_t> xs, ys;
     int height = 0, width = 0, th = 0, tw = 0, index = 0, window = -1;
