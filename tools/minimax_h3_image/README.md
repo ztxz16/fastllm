@@ -36,7 +36,8 @@ and SM120. Other packed four-bit formats are rejected.
 
 These files contain the DiT only. Keep the original complete `MiniMax-H3-Image` base
 beside the quantized repository, or provide a `base_model` directory/symlink inside it.
-The loader searches locally up to two parent directories; it rejects missing or
+The launcher can place the matching base in `base_model/` beside the selected weight.
+Without that explicit base the loader searches locally up to two parent directories. It rejects missing or
 ambiguous bases and does not download anything. Text encoder, VAE, AdaLN, refiners and
 PDD heads use the original base. Only the 50 main blocks' QKV/output and FC1/FC2
 projections use the selected quantized weights and matching dynamic activation format. Quantization changes pixels and exceeds the BF16

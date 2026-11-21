@@ -4466,7 +4466,7 @@ endif()
 foreach(asset IN ITEMS demo.html openapi.json)
     configure_file("tools/qwen_image/${asset}" "${CMAKE_BINARY_DIR}/tools/ftllm/qwen_image_assets/${asset}" COPYONLY)
 endforeach()
-foreach(asset IN ITEMS demo.html server.py)
+foreach(asset IN ITEMS demo.html server.py convert_assets.py)
     configure_file("tools/lingbot_world/${asset}" "${CMAKE_BINARY_DIR}/tools/ftllm/lingbot_world_assets/${asset}" COPYONLY)
 endforeach()
 

@@ -39,7 +39,7 @@ def stage_demo_assets(source, package):
     demo_files = set()
     for src, folder, names in (
         ('qwen_image', 'qwen_image_assets', ('demo.html', 'openapi.json')),
-        ('lingbot_world', 'lingbot_world_assets', ('demo.html', 'server.py')),
+        ('lingbot_world', 'lingbot_world_assets', ('demo.html', 'server.py', 'convert_assets.py')),
         ('duo', 'duo_assets', ('live.html', 'avc-player.js', 'presets/default.txt',
                                'presets/default-256x192.bf16', 'presets/default-512x384.bf16')),
         ('minimax_h3', 'h3_assets', ('demo.html', 'openapi.json')),

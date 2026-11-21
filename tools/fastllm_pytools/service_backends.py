@@ -401,7 +401,10 @@ class NomasBackend(InteractiveBackend):
     def encoder(self, config):
         if config.nomas_text_encoder.strip():
             return Path(config.nomas_text_encoder.strip()).expanduser()
-        return Path(config.model.strip()).expanduser().parent / "Qwen2.5-VL-7B-Instruct"
+        root = Path(config.model.strip()).expanduser()
+        if (root / "text_encoder/tokenizer.json").is_file():
+            return root / "text_encoder"
+        return root.parent / "Qwen2.5-VL-7B-Instruct"
 
     def validate_runtime(self, config, add):
         if len(logical_devices(config)) not in (1, 2, 4, 8):

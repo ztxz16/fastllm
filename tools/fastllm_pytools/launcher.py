@@ -25,15 +25,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .modelscope_download import PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX
 from .agent_runtime_install import AgentRuntimeInstaller
 from .launcher_harness import HarnessRuntime
 from .launcher_opencode import OpenCodeRuntime
 from .launcher_codex import CodexRuntime
 from .launcher_claude import ClaudeRuntime
 from .launcher_mtp import detect_mtp_support, _dspark_config
-from .model_catalog import MODELSCOPE_DOWNLOAD_GROUPS
-from .modelscope_download import _filter_file_sizes
+from .model_catalog import DOWNLOAD_BUNDLES, MODELSCOPE_DOWNLOAD_GROUPS
+from .modelscope_download import (
+    PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX,
+    _filter_file_sizes, bundle_receipt, preparation_error, uses_modelscope,
+)
 from .startup_progress import PROGRESS_PREFIX
 from .ui_hardware import detect_hardware
 from .ui_plugins import BUNDLED_PLUGINS, PluginRegistry, install_plugin_routes, mount_studio_assets
@@ -199,6 +201,7 @@ class DownloadConfig:
     max_workers: int = 4
     token: str = ""
     include: str = ""
+    bundle: str = ""
 
 
 def _modelscope_is_available() -> bool:
@@ -275,6 +278,7 @@ def _coerce_download_config(payload: Any) -> DownloadConfig:
         max_workers=max_workers,
         token=token,
         include=include,
+        bundle=text_value("bundle").strip(),
     )
 
 
@@ -318,6 +322,19 @@ def _validate_download_config(config: DownloadConfig) -> List[str]:
         errors.append("Download file patterns may contain at most 64 entries.")
     elif any(len(pattern) > 512 or pattern.startswith("-") for pattern in include_patterns):
         errors.append("Each download file pattern must be at most 512 characters and cannot start with '-'.")
+    if config.bundle:
+        recipe = DOWNLOAD_BUNDLES.get(config.bundle)
+        if not recipe or recipe["id"] != config.model_id or config.include or config.revision != "master":
+            errors.append("Bundle source, revision and file selection are fixed by the catalog.")
+        elif problem := preparation_error(recipe):
+            errors.append(problem)
+    if config.target_dir and not errors:
+        try:
+            bundle_receipt(Path(config.target_dir), config.bundle)
+        except (ValueError, OSError) as error:
+            errors.append(str(error))
+    if uses_modelscope(DOWNLOAD_BUNDLES.get(config.bundle)) and not _modelscope_is_available():
+        errors.append(MODELSCOPE_INSTALL_ERROR)
     return errors
 
 
@@ -337,6 +354,8 @@ def _download_arguments(config: DownloadConfig) -> List[str]:
         "--max-workers",
         str(config.max_workers),
     ]
+    if config.bundle:
+        arguments.extend(("--bundle", config.bundle))
     for pattern in _download_include_patterns(config.include):
         arguments.extend(("--include", pattern))
     return arguments
@@ -353,18 +372,9 @@ def _download_display_command(config: DownloadConfig) -> str:
     return " ".join(shlex.quote(part) for part in argv) + suffix
 
 
-def _downloaded_model_path(config: DownloadConfig) -> str:
-    """Keep service bundles intact, including pipelines with a single GGUF component."""
-    from .model_service import identify_model
-    root = Path(config.target_dir)
-    service = identify_model(str(root))
-    if service.backend != "llm" and not service.error:
-        return str(root)
-    patterns = _download_include_patterns(config.include)
-    if not patterns and (root / "config.json").is_file():
-        return str(root)
+def _single_gguf_entry(root, files, patterns=()):
     candidates = []
-    for path in root.rglob("*.gguf"):
+    for path in files:
         if not path.is_file() or path.name.lower().startswith("mmproj"):
             continue
         if not _filter_file_sizes({path.relative_to(root).as_posix(): 0}, patterns):
@@ -376,6 +386,20 @@ def _downloaded_model_path(config: DownloadConfig) -> str:
     # Multiple variants require the user to select the intended checkpoint.
     return str(candidates[0]) if len(candidates) == 1 else str(root)
 
+
+def _downloaded_model_path(config: DownloadConfig) -> str:
+    """Keep service bundles intact, including pipelines with a single GGUF component."""
+    from .model_service import identify_model
+    root = Path(config.target_dir)
+    if config.bundle:
+        return str(root / DOWNLOAD_BUNDLES[config.bundle]["entry"])
+    service = identify_model(str(root))
+    if service.backend != "llm":
+        return str(root)
+    patterns = _download_include_patterns(config.include)
+    if not patterns and (root / "config.json").is_file():
+        return str(root)
+    return _single_gguf_entry(root, root.rglob("*.gguf"), patterns)
 
 
 def _redacted_command(
@@ -705,8 +729,6 @@ class LauncherRuntime:
     def preview_download(self, payload: Any) -> Dict[str, Any]:
         config = _coerce_download_config(payload)
         errors = _validate_download_config(config)
-        if not _modelscope_is_available():
-            errors.append(MODELSCOPE_INSTALL_ERROR)
         return {
             "command": _download_display_command(config) if not errors else "",
             "destination": config.target_dir,
@@ -733,8 +755,6 @@ class LauncherRuntime:
     def start_download(self, payload: Any) -> Dict[str, Any]:
         config = _coerce_download_config(payload)
         errors = _validate_download_config(config)
-        if not _modelscope_is_available():
-            errors.append(MODELSCOPE_INSTALL_ERROR)
         if errors:
             raise LauncherError("\n".join(errors))
 
@@ -767,6 +787,7 @@ class LauncherRuntime:
                 "phase": "starting",
                 "pid": None,
                 "modelId": config.model_id,
+                "stage": "", "component": "", "failure": "",
                 "destination": config.target_dir,
                 "modelPath": "",
                 "progress": 0.0,
@@ -838,11 +859,19 @@ class LauncherRuntime:
             except Exception:
                 pass
 
-    def _handle_download_progress(self, event: Dict[str, int], generation: int):
+    def _handle_download_progress(self, event: Dict[str, Any], generation: int):
         with self._lock:
             if generation != self._download_generation:
                 return
+            if "error" in event:
+                self._download_state["failure"] = event["error"]
+                if self._download_state["phase"] == "failed":
+                    self._download_state["message"] = event["error"]
+                self._append_log("modelscope", "error", event["error"])
+                return
             total_bytes = event["totalBytes"]
+            if self._download_state["phase"] not in ("starting", "downloading"):
+                return
             downloaded_bytes = event["downloadedBytes"]
             total_files = event["totalFiles"]
             completed_files = event["completedFiles"]
@@ -864,6 +893,8 @@ class LauncherRuntime:
                 "totalBytes": total_bytes,
                 "completedFiles": completed_files,
                 "totalFiles": total_files,
+                "stage": event.get("stage", ""),
+                "component": event.get("component", ""),
                 "message": f"Downloading model... Overall progress {progress:.1f}%",
             })
 
@@ -894,7 +925,7 @@ class LauncherRuntime:
                     if completed
                     else "Download cancelled. It can be resumed from the same directory."
                     if cancelling
-                    else f"Model download failed (code={exit_code})"
+                    else self._download_state.get("failure") or f"Model download failed (code={exit_code})"
                 ),
                 "exitCode": exit_code,
                 "modelPath": model_path if completed else "",
@@ -1369,7 +1400,7 @@ def _port_is_available(host: str, port: int, *, interactive: bool = False) -> bo
         return False
 
 
-def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
+def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, Any]]:
     value = str(line).strip()
     if not value.startswith(MODELSCOPE_PROGRESS_PREFIX):
         return None
@@ -1377,6 +1408,9 @@ def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
         payload = json.loads(value[len(MODELSCOPE_PROGRESS_PREFIX):])
     except (json.JSONDecodeError, TypeError):
         return None
+    if (isinstance(payload, dict) and payload.get("version") == 1 and payload.get("type") == "download.error"
+            and isinstance(payload.get("error"), str) and payload["error"]):
+        return {"error": payload["error"][:1000]}
     if (
         not isinstance(payload, dict)
         or payload.get("version") != 1
@@ -1395,6 +1429,9 @@ def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
     result["completedFiles"] = min(
         result["completedFiles"], result["totalFiles"]
     )
+    if payload.get("stage") in ("fetch", "verify", "convert"):
+        result["stage"] = payload["stage"]
+        result["component"] = str(payload.get("component", ""))[:512]
     return result
 
 

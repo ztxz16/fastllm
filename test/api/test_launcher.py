@@ -11,6 +11,7 @@ import threading
 import time
 import unittest
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -754,6 +755,20 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertEqual(args.api_key, "test-api-key")
         self.assertEqual(args.port, 1616)
         self.assertFalse(hasattr(args, "moe_device"))
+
+    @patch("fastllm_pytools.launcher._modelscope_is_available", return_value=True)
+    def test_curated_bundle_preview_rejects_overrides_and_existing_foreign_directory(self, available):
+        payload = {"modelId": "inclusionAI/Duo-1.0-distill-quant", "bundle": "duo-distill-fp8",
+                   "targetDir": os.path.join(self.model_path, "duo")}
+        self.assertIn("--bundle duo-distill-fp8", self.runtime.preview_download(payload)["command"])
+        for override in ({"modelId": "test/other"}, {"include": "realization/*"},
+                         {"bundle": "unknown"}, {"revision": "v2"}):
+            self.assertTrue(self.runtime.preview_download({**payload, **override})["errors"])
+        os.makedirs(payload["targetDir"])
+        Path(payload["targetDir"], "existing.txt").write_text("keep")
+        self.assertIn("another model", self.runtime.preview_download(payload)["errors"][0])
+        cfg = DownloadConfig(target_dir=self.model_path, bundle="h3-image-fp8")
+        self.assertEqual(_downloaded_model_path(cfg), os.path.join(self.model_path, "MiniMax-H3-Image-FP8.safetensors"))
 
     def test_download_preview_hides_token(self):
         payload = {
