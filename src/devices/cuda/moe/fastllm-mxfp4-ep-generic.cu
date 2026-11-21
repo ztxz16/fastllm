@@ -135,14 +135,24 @@ struct Buffers {
     uint8_t *ownerSlots = nullptr;
     int2 *tasks;
 };
+struct DenseExchange {
+    std::array<uint8_t *, 8> receive{};
+    Mail *peers = nullptr;
+};
 struct Rank {
     Storage storage;
     cudaStream_t prefillStream = nullptr;
     cudaEvent_t prefillEvent = nullptr;
+    cudaStream_t copyStream = nullptr;
+    cudaEvent_t copyStart = nullptr, copyDone = nullptr;
+    DenseExchange prefetched;
     ~Rank() {
         if (!prefillStream && !prefillEvent) return;
         int previous;
         if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(storage.device) != cudaSuccess) return;
+        if (copyStart) cudaEventDestroy(copyStart);
+        if (copyDone) cudaEventDestroy(copyDone);
+        if (copyStream) cudaStreamDestroy(copyStream);
         if (prefillEvent) cudaEventDestroy(prefillEvent);
         if (prefillStream) cudaStreamDestroy(prefillStream);
         cudaSetDevice(previous);
@@ -151,7 +161,7 @@ struct Rank {
     int sms;
     bool tunedEp8;
     bool relayAcrossNuma = false;
-    std::array<uint8_t *, 8> receiveByRank{};
+    DenseExchange current;
     Mail *pairedReturnPeers = nullptr;
     float *rowScores = nullptr;
     uint8_t *downInput;
@@ -740,7 +750,7 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         throw std::runtime_error("SM120 generic EP tensor dimensions exceed kernel indexing");
     s.stride = (h + h / 32 + topk * 8 + 15) / 16 * 16;
     s.pool = (s.cap * s.ranks * topk + (alignment - 1) * s.localE) / alignment * alignment;
-    std::vector<Mail> mail;
+    std::vector<Mail> mail, prefetchMail;
     // With four GPUs on each host NUMA node, each pair of remote GPUs can
     // share one cross-socket transfer. Other rank orders use direct dispatch.
     bool relayAcrossNuma = capacity > 128 && devices.size() == 8;
@@ -795,6 +805,17 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
                                        Smem<cutlass::bfloat16_t, DecodeTile>));
         }
         auto &m = rank->mail;
+        if (relayAcrossNuma) {
+            check(cudaStreamCreateWithFlags(&rank->copyStream, cudaStreamNonBlocking));
+            check(cudaEventCreateWithFlags(&rank->copyStart, cudaEventDisableTiming));
+            check(cudaEventCreateWithFlags(&rank->copyDone, cudaEventDisableTiming));
+            Mail next{};
+            next.receive = a.allocate<uint8_t>(size_t(s.cap) * s.ranks * s.stride);
+            // The copy stream rendezvous can overlap the normal completion rendezvous.
+            next.flags = a.allocate<unsigned long long>(s.ranks + 1);
+            check(cudaMemset(next.flags, 0, (s.ranks + 1) * sizeof(*next.flags)));
+            prefetchMail.push_back(next);
+        }
         m.send = a.allocate<uint8_t>(size_t(s.cap) * s.stride);
         m.returned = a.allocate<BF>(size_t(s.cap) * s.k * h);
         m.flags = a.allocate<unsigned long long>(s.ranks + 1);
@@ -831,9 +852,14 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
             // Adjacent packets in the dense buffer originate at socket counterparts.
             std::array<Mail, 8> paired;
             for (int rank = 0; rank < 8; ++rank) {
-                r->receiveByRank[rank] = mail[rank].receive;
+                r->current.receive[rank] = mail[rank].receive;
+                r->prefetched.receive[rank] = prefetchMail[rank].receive;
                 paired[2 * (rank % 4) + rank / 4] = mail[rank];
             }
+            r->current.peers = r->peers;
+            r->prefetched.peers = r->storage.allocate<Mail>(prefetchMail.size());
+            check(cudaMemcpy(r->prefetched.peers, prefetchMail.data(), prefetchMail.size() * sizeof(Mail),
+                             cudaMemcpyHostToDevice));
             r->pairedReturnPeers = r->storage.allocate<Mail>(paired.size());
             check(cudaMemcpy(r->pairedReturnPeers, paired.data(), sizeof(paired), cudaMemcpyHostToDevice));
         }
@@ -891,34 +917,50 @@ void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::
 namespace {
 // Send each packed activation across the socket link once. Its socket partner
 // and its local copy then form one contiguous DMA for each of the other three GPUs.
-void dispatchDenseEp8(Rank &r, const Shape &s, int rank, const BF *input, const int *ids,
-                      const float *scores, int rows, cudaStream_t stream) {
-    const size_t bytes = size_t(rows) * s.stride;
+void dispatchDenseEp8(const DenseExchange &exchange, const Shape &s, int rank, const BF *input, const int *ids,
+                      const float *scores, int cap, cudaStream_t stream) {
+    const auto &receive = exchange.receive;
+    const size_t bytes = size_t(cap) * s.stride;
     const size_t pairOffset = 2 * (rank % 4) * bytes;
     const size_t offset = pairOffset + (rank / 4) * bytes;
-    Mail local = r.mail;
-    local.send = r.b.incoming + offset;
-    publish<<<rows, 256, 0, stream>>>(local, s, input, ids, scores, rows, nullptr);
-    check(cudaMemcpyAsync(r.receiveByRank[rank ^ 4] + offset, local.send, bytes, cudaMemcpyDeviceToDevice, stream));
-    rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
+    Mail local{};
+    local.send = receive[rank] + offset;
+    publish<<<cap, 256, 0, stream>>>(local, s, input, ids, scores, cap, nullptr);
+    check(cudaMemcpyAsync(receive[rank ^ 4] + offset, local.send, bytes, cudaMemcpyDeviceToDevice, stream));
+    rendezvous<<<1, 32, 0, stream>>>(exchange.peers, rank, s.ranks);
     for (int step = 1; step < 4; ++step) {
         int peer = (rank & 4) + ((rank + step) % 4);
-        check(cudaMemcpyAsync(r.receiveByRank[peer] + pairOffset, r.b.incoming + pairOffset,
+        check(cudaMemcpyAsync(receive[peer] + pairOffset, receive[rank] + pairOffset,
                               2 * bytes, cudaMemcpyDeviceToDevice, stream));
     }
 }
+void dispatchSparseEp8(Mail *peers, int rank, const BF *input, const int *ids, const float *scores,
+                       int rows, int cap, const int *live, cudaStream_t stream) {
+    dispatchEp8ToNumaPeers<<<cap, 256, 0, stream>>>(peers, rank, input, ids, scores, rows, cap, live);
+    rendezvous<<<1, 32, 0, stream>>>(peers, rank, 8);
+    forwardEp8WithinNumaNode<<<dim3(cap, 2), 128, 0, stream>>>(peers, rank, cap);
+}
+struct PrefetchChunk {
+    int capacity = 0;
+    int rows = 0;
+    bool dense = false;
+};
 void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF *rowsIn, const int *index,
-              const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream, bool dense) {
+              const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream,
+              bool dense, bool prefetched, PrefetchChunk next) {
+    auto buffers = r.b;
+    if (prefetched) buffers.incoming = r.prefetched.receive[rank];
     const bool shortBatch = r.tunedEp8 && cap <= 32;
     const bool paired = dense && r.pairedReturnPeers && r.tunedEp8 && cap > 128;
-    const bool ownerPartial = r.b.ownerSlots && cap >= (paired ? MinOwnerCombineRows : 1024);
+    // Sparse chunks have fewer repeated hits to amortize the owner reduction.
+    const bool ownerPartial = buffers.ownerSlots && cap >= (paired ? MinOwnerCombineRows : 1024);
     const Mail *returnPeers = paired ? r.pairedReturnPeers : r.peers;
-    if (paired) {
-        dispatchDenseEp8(r, s, rank, rowsIn, index, weights, cap, stream);
+    if (prefetched) {
+        check(cudaStreamWaitEvent(stream, r.copyDone, 0));
+    } else if (paired) {
+        dispatchDenseEp8(r.current, s, rank, rowsIn, index, weights, cap, stream);
     } else if (r.tunedEp8 && cap > 128 && r.relayAcrossNuma) {
-        dispatchEp8ToNumaPeers<<<cap, 256, 0, stream>>>(r.peers, rank, rowsIn, index, weights, n, cap, keys);
-        rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
-        forwardEp8WithinNumaNode<<<dim3(cap, 2), 128, 0, stream>>>(r.peers, rank, cap);
+        dispatchSparseEp8(r.peers, rank, rowsIn, index, weights, n, cap, keys, stream);
     } else if (shortBatch || (r.tunedEp8 && cap > 128)) {
         dispatchDecodeRows<<<dim3(cap, s.ranks / DispatchPeers), 256, 0, stream>>>(
             r.peers, rank, rowsIn, index, weights, n, cap, keys);
@@ -927,29 +969,44 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
         dispatch<<<dim3(cap, s.ranks), 128, 0, stream>>>(r.peers, s, rank, cap);
     }
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
+    if (next.capacity) {
+        // Separate mailboxes and barrier epochs let the next dispatch overlap this chunk.
+        check(cudaEventRecord(r.copyStart, stream));
+        check(cudaStreamWaitEvent(r.copyStream, r.copyStart, 0));
+        const BF *input = next.rows ? rowsIn + size_t(cap) * s.h : nullptr;
+        const int *ids = next.rows ? index + size_t(cap) * s.k : nullptr;
+        const float *scores = next.rows ? weights + size_t(cap) * s.k : nullptr;
+        if (next.dense) {
+            dispatchDenseEp8(r.prefetched, s, rank, input, ids, scores, next.capacity, r.copyStream);
+        } else {
+            const int *live = next.rows && keys ? keys + cap : nullptr;
+            dispatchSparseEp8(r.prefetched.peers, rank, input, ids, scores, next.rows, next.capacity, live, r.copyStream);
+        }
+        check(cudaEventRecord(r.copyDone, r.copyStream));
+    }
     int routes = cap * s.ranks * s.k;
     if (shortBatch && cap <= 4) {
-        planTinyRoutes<<<1, 256, 0, stream>>>(r.b, s, rank, cap, r.peers, r.rowScores);
+        planTinyRoutes<<<1, 256, 0, stream>>>(buffers, s, rank, cap, r.peers, r.rowScores);
     } else {
-        check(cudaMemsetAsync(r.b.counts, 0, s.localE * sizeof(int), stream));
-        countRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes);
+        check(cudaMemsetAsync(buffers.counts, 0, s.localE * sizeof(int), stream));
+        countRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(buffers, s, rank, routes);
         if (r.tunedEp8) {
-            if (shortBatch) layout<DecodeTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
-            else if (cap > 128) layout<WideTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
-            else layout<Tile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
+            if (shortBatch) layout<DecodeTile, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores);
+            else if (cap > 128) layout<WideTile, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores);
+            else layout<Tile, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores);
             if (ownerPartial)
                 makeTasks<true, true><<<(routes + 255) / 256, 256, 0, stream>>>(
-                    r.b, s, rank, routes, returnPeers, cap, r.rowScores);
+                    buffers, s, rank, routes, returnPeers, cap, r.rowScores);
             else
                 makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(
-                    r.b, s, rank, routes, returnPeers, cap, r.rowScores);
+                    buffers, s, rank, routes, returnPeers, cap, r.rowScores);
         } else {
-            layout<Tile, false><<<s.localE, 32, 0, stream>>>(r.b, s, nullptr);
-            makeTasks<false><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, nullptr);
+            layout<Tile, false><<<s.localE, 32, 0, stream>>>(buffers, s, nullptr);
+            makeTasks<false><<<(routes + 255) / 256, 256, 0, stream>>>(buffers, s, rank, routes, r.peers, cap, nullptr);
         }
     }
     int blocks = std::min(routes, 4 * r.sms);
-    gather<<<blocks, 128, 0, stream>>>(r.b, s);
+    gather<<<blocks, 128, 0, stream>>>(buffers, s);
     if (r.tiles && cap > 128) {
         const QuantizedSwiGLU output{r.downInput, reinterpret_cast<uint8_t *>(r.downScales), r.rowScores, s.pool, r.tiles};
         const unsigned columns = (2 * s.i + TileConfig<float, WideTile>::n - 1) / TileConfig<float, WideTile>::n;
@@ -957,11 +1014,11 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
         check(cudaEventRecord(r.prefillEvent, stream));
         check(cudaStreamWaitEvent(r.prefillStream, r.prefillEvent, 0));
         multiply<float, WideTile>(r, l.gate, output, 2 * s.i, s.h, stream, GateBlocks);
-        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, r.b.returnRows, s.h, s.i, r.prefillStream,
+        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, buffers.returnRows, s.h, s.i, r.prefillStream,
                                                 EarlyDownBlocks, {r.tiles, columns, false});
         check(cudaEventRecord(r.prefillEvent, r.prefillStream));
         check(cudaStreamWaitEvent(stream, r.prefillEvent, 0));
-        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, r.b.returnRows, s.h, s.i, stream, r.sms,
+        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, buffers.returnRows, s.h, s.i, stream, r.sms,
                                                 {r.tiles, columns, true});
     } else {
         if (r.tunedEp8) {
@@ -969,14 +1026,14 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
             if (shortBatch) multiply<float, DecodeTile>(r, l.gate, output, 2 * s.i, s.h, stream, r.sms);
             else multiply<float, Tile>(r, l.gate, output, 2 * s.i, s.h, stream, r.sms);
         } else {
-            multiply<float, Tile>(r, l.gate, r.b.gateUp, 2 * s.i, s.h, stream, r.sms);
-            activate<<<blocks, 256, 0, stream>>>(r.b, s);
+            multiply<float, Tile>(r, l.gate, buffers.gateUp, 2 * s.i, s.h, stream, r.sms);
+            activate<<<blocks, 256, 0, stream>>>(buffers, s);
         }
-        if (shortBatch) multiply<cutlass::bfloat16_t, DecodeTile>(r, l.down, r.b.returnRows, s.h, s.i, stream, r.sms);
-        else multiply<cutlass::bfloat16_t, Tile>(r, l.down, r.b.returnRows, s.h, s.i, stream, r.sms);
+        if (shortBatch) multiply<cutlass::bfloat16_t, DecodeTile>(r, l.down, buffers.returnRows, s.h, s.i, stream, r.sms);
+        else multiply<cutlass::bfloat16_t, Tile>(r, l.down, buffers.returnRows, s.h, s.i, stream, r.sms);
     }
     if (ownerPartial)
-        publishOwnerRows<<<s.ranks * cap, 256, 0, stream>>>(r.b, returnPeers, cap);
+        publishOwnerRows<<<s.ranks * cap, 256, 0, stream>>>(buffers, returnPeers, cap);
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
     if (ownerPartial && n)
         combine<8, true><<<n, 256, 0, stream>>>(r.mail, s, index, out, keys);
@@ -1003,13 +1060,23 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
     if (rows < 0 || rows > commonRows || densePrefixRows < 0 || densePrefixRows > rows || (live && densePrefixRows))
         throw std::runtime_error("Invalid generic EP row count");
     const auto stream = cudaStreamPerThread;
+    bool prefetched = false;
     for (int64_t start = 0; start < commonRows; start += s.cap) {
         int cap = std::min<int64_t>(commonRows - start, s.cap);
         int first = std::min<int64_t>(start, rows), n = std::min(rows - first, cap);
+        PrefetchChunk next;
+        const int nextCap = std::min<int64_t>(s.cap, commonRows - start - cap);
+        const bool nextDense = start + cap + nextCap <= densePrefixRows;
+        if (!prefetched && r.copyStream && nextCap > 128 && (nextDense || nextCap >= 512)) {
+            next.capacity = nextCap;
+            next.rows = std::min<int64_t>(nextCap, std::max<int64_t>(0, int64_t(rows) - start - cap));
+            next.dense = nextDense;
+        }
         runChunk(r, s, primaryLayer, rank,
                  n ? static_cast<const BF *>(input) + size_t(first) * s.h : nullptr,
                  n ? ids + size_t(first) * s.k : nullptr, n ? scores + size_t(first) * s.k : nullptr,
                  n ? static_cast<BF *>(out) + size_t(first) * s.h : nullptr, n, cap,
-                 n && live ? live + first : nullptr, stream, start + cap <= densePrefixRows);
+                 n && live ? live + first : nullptr, stream, start + cap <= densePrefixRows, prefetched, next);
+        prefetched = next.capacity != 0;
     }
 }
