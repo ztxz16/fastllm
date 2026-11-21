@@ -21,7 +21,7 @@ using BF = __nv_bfloat16;
 constexpr int Tile = 32, DecodeTile = 16;
 constexpr int WideTile = 64;
 constexpr int PrefillChunk = 1024;
-constexpr int MinOwnerCombineRows = 512;
+constexpr int MinOwnerCombineRows = 384;
 constexpr int GateBlocks = 72, EarlyDownBlocks = 38;
 
 struct PrefillTile {
@@ -422,13 +422,15 @@ __global__ void layout(Buffers b, Shape s, float *rowScores) {
 }
 template <bool WithScores, bool OwnerReturn = false>
 __global__ void makeTasks(Buffers b, Shape s, int rank, int routes, const Mail *peers, int rowsPerPeer,
-                          float *rowScores) {
+                          float *rowScores, bool crossSocketOnly = false) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     int offset = t < routes ? b.positions[t] : -1;
     unsigned slots = 0;
     if constexpr (OwnerReturn) {
         // Each group of eight lanes handles one token's top-8 slots.
         slots = (__ballot_sync(0xffffffffu, offset >= 0) >> (threadIdx.x & 24)) & 0xff;
+        // Dense dispatch interleaves the two sockets in consecutive source slots.
+        if (crossSocketOnly && ((t / (rowsPerPeer * 8)) & 1) == rank / 4) slots = 0;
         if (t < routes && !(t % 8)) b.ownerSlots[t / 8] = slots;
     }
     if (offset < 0) return;
@@ -555,6 +557,57 @@ __global__ void publishOwnerRows(Buffers b, const Mail *peers, int cap) {
         asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::
                      "l"(dst), "r"(addr), "r"(unsigned(sizeof(packet))) : "memory");
         asm volatile("cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;" ::: "memory");
+    }
+}
+// Remote owners have already summed their slots. For owners on this socket,
+// FC2 wrote the original rows directly. Reproduce the same per-owner BF16 rounding
+// at the destination, in the order of each owner's first top-8 occurrence.
+__global__ void combineCrossSocketRows(Mail mail, const int *ids, BF *out, int rank) {
+    constexpr int topk = 8, hidden = 4096, width = sizeof(uint4) / sizeof(BF);
+    const int row = blockIdx.x;
+    __shared__ uint8_t groups[topk];
+    if (threadIdx.x < topk) {
+        const unsigned slot = threadIdx.x;
+        const unsigned expertId = ids[row * topk + slot];
+        const unsigned owner = expertId / 32;
+        const unsigned mask = __match_any_sync(0xffu, owner);
+        const unsigned first = __ffs(mask) - 1;
+        const unsigned contributions = owner / 4 == unsigned(rank / 4) ? mask : 1u << first;
+        groups[slot] = expertId < 256 && slot == first ? contributions : 0;
+    }
+    __syncthreads();
+    const auto *rows = reinterpret_cast<const uint4 *>(mail.returned) + size_t(row) * topk * (hidden / width);
+    for (int col = threadIdx.x; col < hidden / width; col += blockDim.x) {
+        float total[width] = {};
+        for (int first = 0; first < topk; ++first) {
+            const unsigned slots = groups[first];
+            if (!slots) continue;
+            const uint4 initial = rows[first * (hidden / width) + col];
+            float partial[width];
+            #pragma unroll
+            for (int k = 0; k < width; ++k)
+                partial[k] = __bfloat162float(reinterpret_cast<const BF *>(&initial)[k]);
+            unsigned rest = slots & (slots - 1);
+            if (rest) {
+                do {
+                    const int slot = __ffs(rest) - 1;
+                    const uint4 value = rows[slot * (hidden / width) + col];
+                    #pragma unroll
+                    for (int k = 0; k < width; ++k)
+                        partial[k] += __bfloat162float(reinterpret_cast<const BF *>(&value)[k]);
+                    rest &= rest - 1;
+                } while (rest);
+                #pragma unroll
+                for (int k = 0; k < width; ++k)
+                    partial[k] = __bfloat162float(__float2bfloat16(partial[k]));
+            }
+            #pragma unroll
+            for (int k = 0; k < width; ++k) total[k] += partial[k];
+        }
+        uint4 packet;
+        #pragma unroll
+        for (int k = 0; k < width; ++k) reinterpret_cast<BF *>(&packet)[k] = __float2bfloat16(total[k]);
+        reinterpret_cast<uint4 *>(out)[size_t(row) * (hidden / width) + col] = packet;
     }
 }
 template <int FixedTopK = 0, bool OwnerPartial = false>
@@ -954,6 +1007,9 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
     const bool paired = dense && r.pairedReturnPeers && r.tunedEp8 && cap > 128;
     // Sparse chunks have fewer repeated hits to amortize the owner reduction.
     const bool ownerPartial = buffers.ownerSlots && cap >= (paired ? MinOwnerCombineRows : 1024);
+    // Mid-sized dense chunks benefit from avoiding a local publish pass. Full
+    // chunks reuse the input transfer pipeline and aggregate on both sockets.
+    const bool crossSocketOnly = paired && ownerPartial && cap < PrefillChunk;
     const Mail *returnPeers = paired ? r.pairedReturnPeers : r.peers;
     if (prefetched) {
         check(cudaStreamWaitEvent(stream, r.copyDone, 0));
@@ -996,7 +1052,7 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
             else layout<Tile, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores);
             if (ownerPartial)
                 makeTasks<true, true><<<(routes + 255) / 256, 256, 0, stream>>>(
-                    buffers, s, rank, routes, returnPeers, cap, r.rowScores);
+                    buffers, s, rank, routes, returnPeers, cap, r.rowScores, crossSocketOnly);
             else
                 makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(
                     buffers, s, rank, routes, returnPeers, cap, r.rowScores);
@@ -1035,7 +1091,9 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
     if (ownerPartial)
         publishOwnerRows<<<s.ranks * cap, 256, 0, stream>>>(buffers, returnPeers, cap);
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
-    if (ownerPartial && n)
+    if (crossSocketOnly && n)
+        combineCrossSocketRows<<<n, 256, 0, stream>>>(r.mail, index, out, rank);
+    else if (ownerPartial && n)
         combine<8, true><<<n, 256, 0, stream>>>(r.mail, s, index, out, keys);
     else if (n && shortBatch)
         combine<8><<<dim3(n, 4), 128, 0, stream>>>(r.mail, s, index,
