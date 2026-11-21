@@ -41,6 +41,7 @@
 #include "kimi_k3.h"
 #include "qwen3_5.h"
 #include "sensenova_loop.h"
+#include "inkling2.h"
 #include "clover.h"
 #include "step3p5.h"
 #include "laguna.h"
@@ -1026,6 +1027,8 @@ namespace fastllm {
         } else if (modelType == "qwen3") {
             model = new Qwen3Model();
             model->model_type = "qwen3";
+        } else if (modelType == "inkling2_loop") {
+            model = new Inkling2Model();
         } else if (modelType == "sensenova_loop") {
             model = new SenseNovaLoopModel();
         } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
@@ -5367,6 +5370,14 @@ namespace fastllm {
                 safeTensors.itmeDict[item.first] = item.second;
         }
         NormalizeSafeTensorSources(config["quantization_config"]["quant_method"].string_value(), safeTensors.itmeDict);
+        if (auto *inkling = dynamic_cast<Inkling2Model *>(model)) {
+            for (const auto &entry : safeTensors.itmeDict) {
+                const auto &t = entry.second;
+                if (entry.first.find(".mlp.experts.") != std::string::npos)
+                    inkling->expertTensors.emplace(entry.first, inkling2::TensorRange{
+                        t.fileName, t.dtype, t.intShape, t.data_offsets.at(0), t.data_offsets.at(1)});
+            }
+        }
         if (config["model_type"].string_value() == "hy_v4_flash") {
             const auto &text = config["text_config"];
             for (const auto &layer : text["engram_layer_ids"].array_items()) {

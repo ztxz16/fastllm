@@ -2374,6 +2374,8 @@ class model:
                 architecture = self.config["architectures"][0]
             except:
                 architecture = ""
+            if architecture == "Inkling2LoopForConditionalGeneration":
+                raise ValueError("Inkling 2 Mini currently supports text inputs only")
             if self._is_deepseek_v41():
                 if multimodal_videos:
                     raise ValueError("DeepSeek-V4.1 does not support video input.")
@@ -2923,6 +2925,8 @@ class model:
             except:
                 print("Error: can't detect architectures for this model.")
                 exit(0)
+            if architecture == "Inkling2LoopForConditionalGeneration":
+                raise ValueError("Inkling 2 Mini currently supports text inputs only")
             if (architecture == "CogVLMForCausalLM"):
                 if (len(multimodal_videos) > 0):
                     print("Error: CogVLM multimodal only supports images.")
