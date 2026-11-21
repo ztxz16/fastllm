@@ -4640,6 +4640,13 @@ if (UNIT_TEST)
         set_tests_properties(cuda_fp4_kv_native_no_split PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
             ENVIRONMENT "FASTLLM_FORCE_NATIVE_ATTN=1;FASTLLM_PAGED_NO_SPLIT=1")
 
+        foreach(op_test IN ITEMS cudaAttnResRegression)
+            add_executable(${op_test} test/ops/${op_test}.cu)
+            target_link_libraries(${op_test} PRIVATE fastllm)
+            add_test(NAME ${op_test} COMMAND ${op_test})
+            set_tests_properties(${op_test} PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
+
         add_executable(cudaGraphPoolMissRegression test/ops/cudaGraphPoolMissRegression.cpp)
         target_link_libraries(cudaGraphPoolMissRegression fastllm)
         target_include_directories(cudaGraphPoolMissRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
