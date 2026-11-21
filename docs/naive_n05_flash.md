@@ -56,6 +56,13 @@ FP4 主 K 使用独立的 FP8 Indexer 页，三种布局均共享主 K 的物理
 CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。
 CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调用保留原路径。
 
+### H20 上的 FP8 DSA decode
+
+在 QK=192、V=128、缓存按 16 字节对齐的 Exp18 中，每个 rank 的行数乘以本地 Q 头数达到 128 时，
+稠密、TopK 2048 和混批 decode 均可使用融合内核。对 attention TP1、TP2、TP4、TP8，
+分别从 2、4、8、16 行起生效。CUDA Graph 按捕获的行数选择内核，回放时读取各行当前的长度和页表。
+混批中的稠密行读取连续位置，稀疏行读取自己的 TopK 列表。更小的批次沿用按 key 分块的内核。
+
 ### Indexer prefill 计算精度
 
 在启动或预热前通过 `--indexer_compute_dtype` 选择打分方式。Python API 使用同名参数。
@@ -98,11 +105,11 @@ DSA K/V 的净存储降为 FP8 的 9/16，减少 43.75%；页表、Indexer、SWA
 KVMem prefill 将已有 FP4 历史解码到预分配、各层复用的 BF16 工作区；
 普通显存 prefill 通过分页视图读取 FP4，匹配的算子使用 BF16 staging。decode 直接读取
 GPU 分页池或热缓存中的 FP4。CUDA Graph 沿用设备指针表与动态页表，不固化请求地址。
-满足形状与资源条件时，Hopper 上至少 32 行、16-head GQA、单 KV head、
-QK=192/V=128、TopK=2048 的 FP4 decode 复用 FP8 融合路径的 BF16 Tensor Core
-QK/PV 和全局 softmax；FP4 tile 异步预取到共享内存后解包，不生成全局 score 工作区。
+Hopper 上，每个 rank 至少 32 行、QK=192/V=128 时，FP4 decode 支持 64Q/4KV、32Q/2KV、16Q/1KV 和 8Q/1KV。
+四种形状均支持最多 2048 个位置的稠密注意力、TopK=2048 和稠密/TopK 混批。
+每组 8 或 16 个 Q 头共享一个 KV 头。内核按头将数据及其 scale 预取到共享内存，用 BF16 Tensor Core 计算 QK/PV，沿用全局 softmax。
 缓存仍保存 FP4，并非使用原生 FP4 Tensor Core 指令；MMA 累加顺序可能与标量路径
-产生合理的数值差异，不要求逐位一致。每个 tile 由 16 个 head 共享，紧凑参数表保留
+产生合理的数值差异，不要求逐位一致。紧凑参数表保留
 Graph 重绑和动态页表；资源不足时回退到 8-head 共享或原有标量路径。
 其他形状保留原路径；不使用要求 BF16/FP8 原始布局的 TMA 路径。
 FP4 解包使用向量读取，prefill 的 BF16 工作区可复用 Hopper 分块注意力，

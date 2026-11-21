@@ -6405,18 +6405,9 @@ bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
         fastllm::Data &output) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = pipeline_bulk;
-    // Each CTA must remain within one KV group. The same pipeline works for
-    // any number of groups, including unsharded DP attention heads.
-    if (FastllmCudaRuntimeArch() != 90 || kvHeads <= 0 || heads % kvHeads ||
-        heads / kvHeads < 16 || (heads / kvHeads) % 16 || rows.size() < 32)
-        return false;
-    for (const auto &row : rows)
-        if (!row.fp8 || !row.indices || row.selectedCount != 2048 || row.keyStride % 16 ||
-            (uintptr_t)row.key % 16 || (uintptr_t)row.value % 16)
-            return false;
-    // Share KV loads across two eight-warp groups without changing per-head
-    // accumulation. Keep small batches and unsupported resources on the old path.
-    if (rows.size() >= 64) {
+    // Each 16-head CTA stays inside one KV group. Count independent groups
+    // across rows and KV heads to decide when sharing their loads pays off.
+    if ((heads / kvHeads) % 16 == 0 && rows.size() * kvHeads >= 64) {
         auto sharedHeads = bulk::Decode<2048, false, true, true, true, true, true,
             bulk::MaxBatchLimit, true>;
         constexpr size_t shared = sizeof(bulk::Storage<2048, true, 16>);
@@ -6569,24 +6560,27 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
 
 // FP4 uses the same BF16 MMA and global softmax as the FP8 fused path.
 // Dequantize only the current shared-memory tile; retain FP4 in the KV pool.
-template<bool Share16Heads>
+template<int KVHeads>
 bool PrefetchFP4DSAAttention(const fastllm::Data &query, const float *bias,
-        const std::vector<FastllmNaiveDSARow> &rows, fastllm::Data &output) {
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, fastllm::Data &output) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = pipeline_bulk;
-    constexpr int Heads = Share16Heads ? 16 : 8, Threads = Share16Heads ? 512 : 256;
     constexpr int Limit = bulk::FP4BatchLimit;
-    constexpr size_t shared = sizeof(bulk::Storage<2048, true, Heads, true>);
-    auto kernel = bulk::Decode<2048, false, false, true, true, true, true,
-        Limit, Share16Heads, true>;
-    if (!BulkKernelSupported(kernel, shared, 90)) return false;
+    constexpr size_t shared16 = sizeof(bulk::Storage<2048, true, 16, true>);
+    constexpr size_t shared8 = sizeof(bulk::Storage<2048, true, 8, true>);
+    auto kernel16 = bulk::Decode<2048, false, false, true, true, true, true, Limit, true, KVHeads>;
+    auto kernel8 = bulk::Decode<2048, false, false, true, true, true, true, Limit, false, KVHeads>;
+    const bool share16 = heads / KVHeads == 16 && BulkKernelSupported(kernel16, shared16, 90);
+    if (!share16 && !BulkKernelSupported(kernel8, shared8, 90)) return false;
+    auto kernel = share16 ? kernel16 : kernel8;
+    const int blockHeads = share16 ? 16 : 8;
     for (int first = 0; first < (int)rows.size(); first += Limit) {
         const int count = std::min(Limit, (int)rows.size() - first);
         bulk::BatchT<Limit, bulk::FP4Row> descriptors{};
         std::copy_n(rows.begin() + first, count, descriptors.rows);
-        kernel<<<dim3(16 / Heads, count), Threads, shared>>>(
-            (const BF16 *)query.cudaData + (size_t)first * 16 * 192, descriptors, bias,
-            (BF16 *)output.cudaData + (size_t)first * 16 * 128, 16, 1);
+        kernel<<<dim3(heads / blockHeads, count), blockHeads * 32, share16 ? shared16 : shared8>>>(
+            (const BF16 *)query.cudaData + (size_t)first * heads * 192, descriptors, bias,
+            (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, KVHeads);
     }
     return true;
 #else
@@ -6598,14 +6592,9 @@ bool PrefetchFP4DSAAttention(const fastllm::Data &query, const float *bias,
 // complete GQA groups. Other layouts retain the existing attention paths.
 bool SmallDSAAttention(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads,
-        int dim, int valueDim, FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
     namespace small = naive_attention_small;
     using namespace fastllm;
-    if (rows.empty() || rows.size() >= 32 || dim != 192 || valueDim != 128 ||
-        heads < 16 || (heads / kvHeads) % 16 != 0) return false;
-    for (const auto &row : rows)
-        if (!row.indices || row.selectedCount != 2048 || row.fp4 || row.keyStride % 8 ||
-            (uintptr_t)row.key % 16 || (uintptr_t)row.value % 16) return false;
     if (!BulkKernelSupported(small::Scores<16>, sizeof(small::SparseScoreStorage<16>), 90) ||
         !BulkKernelSupported(small::Values, sizeof(small::ValueStorage), 90)) return false;
     const int count = rows.size();
@@ -6840,31 +6829,43 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         query.dataType == BFLOAT16, "Unsupported batched DSA decode shape.");
     int count = 0;
     bool sparse = heads >= 4, dense = true;
-    bool hopper = FastllmCudaRuntimeArch() == 90 && dim == 192 && valueDim == 128;
+    const int groupHeads = heads / kvHeads;
+    const bool fusedShape = dim == 192 && valueDim == 128;
+    bool hopper = fusedShape && FastllmCudaRuntimeArch() == 90;
+    bool bulkLayout = fusedShape && groupHeads % 8 == 0;
+    bool hopperFP8 = hopper && (groupHeads == 8 || groupHeads % 16 == 0);
+    bool groupedFP4 = hopper && rows.size() >= 32 && heads == 16 && kvHeads == 1;
+    bool fusedFP4 = hopper && rows.size() >= 32 &&
+        ((kvHeads == 1 && (heads == 8 || heads == 16)) ||
+         (kvHeads == 2 && heads == 32) || (kvHeads == 4 && heads == 64));
     for (const auto &row : rows) {
         AssertInFastLLM(row.key && row.value && row.capacity >= 0 &&
             row.keyStride >= kvHeads * dim && row.selectedCount >= 0,
             "Invalid batched DSA cache.");
         count = std::max(count, row.indices ? row.selectedCount : row.capacity);
-        sparse = sparse && row.indices && row.selectedCount == 2048;
+        const bool topK = row.indices && row.selectedCount == 2048;
+        const bool valueAligned = uintptr_t(row.value) % 16 == 0;
+        const bool aligned = valueAligned && uintptr_t(row.key) % 16 == 0;
+        sparse = sparse && topK;
         dense = dense && !row.indices;
-        hopper = hopper && (uintptr_t)row.value % 16 == 0;
+        hopper = hopper && valueAligned;
+        bulkLayout = bulkLayout && aligned && !row.fp4 && row.keyStride % 8 == 0;
+        hopperFP8 = hopperFP8 && row.fp8 && row.keyStride % 16 == 0 && (!row.indices || topK);
+        groupedFP4 = groupedFP4 && valueAligned && topK && row.fp4 && row.keyStride % 16 == 0;
+        fusedFP4 = fusedFP4 && aligned && row.fp4 && !row.fp8 && row.keyStride == kvHeads * dim &&
+            (!row.indices || topK);
     }
     AssertInFastLLM(count <= 2048, "Batched DSA supports at most 2048 selected keys.");
-    if (SmallDSAAttention(query, sink, rows, heads, kvHeads, dim, valueDim, scratch, output)) {
-        CheckLaunch(); return;
-    }
-    // Keep the established small-batch kernels. Eight heads share KV only
-    // when the complete GQA group and cache vectors satisfy the MMA layout.
-    bool bulk = rows.size() >= 32 && dim == 192 && valueDim == 128 &&
-        (heads / kvHeads) % 8 == 0 && count > 0;
-    for (const auto &row : rows)
-        bulk = bulk && !row.fp4 && row.keyStride % 8 == 0 && (uintptr_t)row.key % 16 == 0 &&
-            (uintptr_t)row.value % 16 == 0;
-    if (bulk) {
+    // A narrow batch can fill the fused kernel across query heads. Below
+    // this crossover the split kernels have more parallelism over keys.
+    const bool smallFP8 = hopperFP8 && groupHeads <= 16 && rows.size() * heads >= 128;
+    if (bulkLayout && count > 0 && (rows.size() >= 32 || smallFP8)) {
         Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        bool launched = sparse &&
+        // Mixed batches gather each row's own dense range or TopK list. For
+        // large all-sparse groups of eight, the compact bulk kernel wins.
+        const bool prefetch = hopperFP8 && !dense && !(sparse && groupHeads == 8 && rows.size() > 128);
+        bool launched = prefetch &&
             PrefetchDSAAttention(query, bias, rows, heads, kvHeads, output);
 #if CUDART_VERSION >= 12010
         if (!launched && dense && kvHeads == 1)
@@ -6879,18 +6880,20 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                                      : BulkAttention<2048, false>(query, bias, rows, heads, kvHeads, output);
         if (launched) { CheckLaunch(); return; }
     }
-    bool groupedFP4 = hopper && sparse && heads == 16 && kvHeads == 1 && rows.size() >= 32;
-    bool fusedFP4 = groupedFP4;
-    for (const auto &row : rows) {
-        groupedFP4 = groupedFP4 && row.fp4 && row.keyStride % 16 == 0;
-        fusedFP4 = fusedFP4 && row.fp4 && !row.fp8 && row.keyStride == 192 &&
-            (uintptr_t)row.key % 16 == 0 && (uintptr_t)row.value % 16 == 0;
+    if (bulkLayout && sparse && rows.size() < 32 && groupHeads % 16 == 0 &&
+        SmallDSAAttention(query, sink, rows, heads, kvHeads, scratch, output)) {
+        CheckLaunch(); return;
     }
     if (fusedFP4) {
         Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        if (PrefetchFP4DSAAttention<true>(query, bias, rows, output) ||
-            PrefetchFP4DSAAttention<false>(query, bias, rows, output)) {
+        bool launched;
+        switch (kvHeads) {
+            case 1: launched = PrefetchFP4DSAAttention<1>(query, bias, rows, heads, output); break;
+            case 2: launched = PrefetchFP4DSAAttention<2>(query, bias, rows, heads, output); break;
+            default: launched = PrefetchFP4DSAAttention<4>(query, bias, rows, heads, output); break;
+        }
+        if (launched) {
             CheckLaunch();
             return;
         }
