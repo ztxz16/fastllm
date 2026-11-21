@@ -56,6 +56,13 @@ FP4 主 K 使用独立的 FP8 Indexer 页，三种布局均共享主 K 的物理
 CUDA Graph、采样和临时算子工作区有各自的分配策略，不属于这项 KV 保证。
 CPU、按层串行、其他 KV 类型、草稿模型及跳过预热的直接调用保留原路径。
 
+### H20 上的 FP8 DSA decode
+
+在 QK=192、V=128、缓存按 16 字节对齐的 Exp18 中，每个 rank 的行数乘以本地 Q 头数达到 128 时，
+稠密、TopK 2048 和混批 decode 均可使用融合内核。对 attention TP1、TP2、TP4、TP8，
+分别从 2、4、8、16 行起生效。CUDA Graph 按捕获的行数选择内核，回放时读取各行当前的长度和页表。
+混批中的稠密行读取连续位置，稀疏行读取自己的 TopK 列表。更小的批次沿用按 key 分块的内核。
+
 ### Indexer prefill 计算精度
 
 在启动或预热前通过 `--indexer_compute_dtype` 选择打分方式。Python API 使用同名参数。
@@ -76,14 +83,16 @@ Naive/MiMo 的 CUDA TP 路径可显式设置 `--kv_cache_dtype fp4`，不要求�
 仅将 DSA 主 attention 的 K/V 改成 E2M1 FP4，每 16 个值配一个 E4M3 scale。
 SWA 窗口和前缀快照继续使用 FP8 E4M3，Indexer 继续沿用 FP8 缓存及原来的
 `--indexer_dtype` 选择；该选项不启用或关闭 FP8 Indexer 评分，也不改变模型权重。
-默认配置不变。该组合要求至少两张 TP 卡、BF16 计算和启动预热，
-不支持 draft；不满足条件时启动报错。
+该组合要求 `--tp` 总设备数至少为 2、BF16 计算和启动预热。每个 Attention DP 组可以只有一张卡。
+使用 GPU 分页池时，Attention DP 支持普通解码和 DSpark。DSpark 的草稿 KV 使用 BF16。
+普通 TP 和 KVMem 的 FP4 路径仅支持关闭草稿的配置。
 
 在已有 CUDA TP 的启动命令或 deploy worker 参数中，将
 `--kv_cache_dtype fp8` 改为 `--kv_cache_dtype fp4` 即可。普通显存模式使用 GPU 分页池；
 需要主机 KV 备份时再显式配置 `--kvmem`。其余容量、NUMA、
 TP/EP、Indexer、请求并发和攒批参数仍由启动配置指定，没有预设模型路径或机器地址。
-支持 `layer_shard` 和 `context_shard` 的 FP8 Indexer 存储，保持原有分片与全局 TopK 合并规则。
+普通 TP 的 FP8 Indexer 支持 `replicated`、`layer_shard` 和 `context_shard`。
+Attention DP 支持 `replicated` 和 `context_shard`，与 PD 一起部署时使用 `replicated`。
 既有 `--kvmem` 主机内存预算会根据 FP4 的实际存储字节重新检查；固定 `--tokens`
 时不会自动扩大上下文容量。
 
@@ -96,11 +105,11 @@ DSA K/V 的净存储降为 FP8 的 9/16，减少 43.75%；页表、Indexer、SWA
 KVMem prefill 将已有 FP4 历史解码到预分配、各层复用的 BF16 工作区；
 普通显存 prefill 通过分页视图读取 FP4，匹配的算子使用 BF16 staging。decode 直接读取
 GPU 分页池或热缓存中的 FP4。CUDA Graph 沿用设备指针表与动态页表，不固化请求地址。
-满足形状与资源条件时，Hopper 上至少 32 行、16-head GQA、单 KV head、
-QK=192/V=128、TopK=2048 的 FP4 decode 复用 FP8 融合路径的 BF16 Tensor Core
-QK/PV 和全局 softmax；FP4 tile 异步预取到共享内存后解包，不生成全局 score 工作区。
+Hopper 上，每个 rank 至少 32 行、QK=192/V=128 时，FP4 decode 支持 64Q/4KV、32Q/2KV、16Q/1KV 和 8Q/1KV。
+四种形状均支持最多 2048 个位置的稠密注意力、TopK=2048 和稠密/TopK 混批。
+每组 8 或 16 个 Q 头共享一个 KV 头。内核按头将数据及其 scale 预取到共享内存，用 BF16 Tensor Core 计算 QK/PV，沿用全局 softmax。
 缓存仍保存 FP4，并非使用原生 FP4 Tensor Core 指令；MMA 累加顺序可能与标量路径
-产生合理的数值差异，不要求逐位一致。每个 tile 由 16 个 head 共享，紧凑参数表保留
+产生合理的数值差异，不要求逐位一致。紧凑参数表保留
 Graph 重绑和动态页表；资源不足时回退到 8-head 共享或原有标量路径。
 其他形状保留原路径；不使用要求 BF16/FP8 原始布局的 TMA 路径。
 FP4 解包使用向量读取，prefill 的 BF16 工作区可复用 Hopper 分块注意力，
@@ -648,13 +657,13 @@ TP 改变 GEMM 与跨卡归约顺序，跨策略使用既有数值容差；同�
 结果按原请求顺序汇集，模型训练的 `block_size` 不变。
 Graph 捕获失败使用相同的 DP eager 路径；不指定 DP 时继续使用默认 TP/单卡选择。
 当前 proposal 与接受/拒绝采样仍在首卡，DP 参数只改变草稿骨干及对应 KV 的分工。
-PD 状态传输目前要求草稿使用 TP；显式草稿 DP 与 PD 的组合会在布局检查时拒绝。
+在纯 Attention DP 的 GPU 分页部署中，草稿可以随请求的 attention 组放置。
 `naive_n05_draft_dp_*` 和 `naive_n05_draft_dp_storage_*` 覆盖 2/4/8 卡、
 Graph/eager、固定 KV 归属、非首卡存活请求与空闲存储复用。
 
-纯 GPU 的 [PD 分离](fastkv_pd.md) 也支持上述草稿 TP。P/D 需使用相同的草稿模型、
-TP 配置和 BF16/FP8 主 KV；FastKV 按 rank 交接已提交的草稿窗口，并在 D 端恢复候选
-空间和本地 Graph。KVMem 的 PD 接收适配器目前仍不接收草稿状态，FP4 KV 仍要求关闭草稿。
+纯 GPU 的 [PD 分离](fastkv_pd.md) 支持草稿 TP 和上述按组放置。P/D 使用相同的草稿模型和兼容的 KV 布局。
+Attention DP 的主 DSA KV 可使用 FP4，FastKV 同时交接独立 FP8 Indexer 和已提交的 BF16 草稿窗口。
+D 端恢复候选空间并使用本地图。KVMem 的 PD 接收适配器目前仍要求关闭草稿。
 
 纯 Attention DP 与兼容的 MegaMoE 布局在验证 Graph 中复用本地 hidden、residual、
 router 和专家分发，避免每层汇集全局 hidden。草稿所需的中间层特征及最终输出仍按

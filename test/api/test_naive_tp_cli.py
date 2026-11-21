@@ -191,6 +191,12 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'prefill'):
             self.configure([], saved={'prefill_batch_tokens': 2147483648})
 
+    def test_attention_dp_fp4_kv(self):
+        for dtype in ('fp4', 'fp4_e2m1', 'nvfp4'):
+            with self.subTest(dtype=dtype):
+                self.configure(['--tp', '4', '--attn-dp-size', '4', '--kv_cache_dtype', dtype])
+                self.assertEqual(self.model_options['kv_cache_dtype'], dtype)
+
     def test_attention_dp_default_budget_and_wait(self):
         for world, dp, chunk, limit, wait, expected in (
                 (4, 4, 4096, 32, 0, 16384), (8, 8, 4096, 64, 0, 32768),

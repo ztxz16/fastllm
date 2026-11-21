@@ -502,6 +502,10 @@ void FastllmCudaNaiveClearExpertPrefill();
 // an independent, dead MoE arena until expert dispatch on this stream.
 bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Data &weight,
     fastllm::Data &scratch, fastllm::Data &output);
+// Large verification rows use transient BF16 terms in the rank's idle attention arena.
+bool FastllmCudaNaiveVerifyRouter(const fastllm::Data &input, const fastllm::Data &weight,
+    const fastllm::Data &bias, const fastllm::Data &scratch, fastllm::Data &indices, fastllm::Data &scores,
+    int topk, bool normalize, float scale);
 bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,

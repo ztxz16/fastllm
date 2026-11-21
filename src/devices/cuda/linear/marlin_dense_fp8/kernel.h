@@ -45,7 +45,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool bf16_output = false,
           // Small-M MXFP8: independent partials, deterministic last-CTA reduce.
           const bool parallel_fp32_reduce = false,
-          const bool fp32_output = false>
+          const bool fp32_output = false,
+          const bool tile_global_scale = false>
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }

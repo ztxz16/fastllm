@@ -6,6 +6,7 @@
 #include "models/mimo_tool_grammar.h"
 #include "models/naive_n05_flash.h"
 #include "models/clover.h"
+#include "models/hy4_flash.h"
 #include "parallel/model.h"
 #include "devices/disk/diskdevice.h"
 #include "moe_cache_config.h"
@@ -1182,6 +1183,11 @@ extern "C" {
             fastkvPDError.clear();
             return true;
         } catch (const std::exception &e) { fastkvPDError = e.what(); return false; }
+    }
+
+    DLL_EXPORT bool enable_dfly2_llm_model(int modelId, int width) {
+        auto *model = dynamic_cast<fastllm::Hy4FlashModel *>(models.GetModel(modelId));
+        return model && model->EnableDFly2(width);
     }
 
     DLL_EXPORT bool configure_clover_llm_model(int modelId, const char *options) {

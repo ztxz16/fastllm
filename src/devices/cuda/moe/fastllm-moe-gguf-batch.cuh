@@ -183,7 +183,7 @@ __global__ void GGUFGroupedProjection(const block_q8_1 *input, T *activation, fl
             const float a=float(DequantizeCast<T>::cast(g[j][0]));
             if constexpr(Gate) {
                 const float b=float(DequantizeCast<T>::cast(u[j][0]));
-                activation[size_t(routes[j])*view.inter+row]=DequantizeCast<T>::cast(a/(1.0f+expf(-a))*b);
+                activation[size_t(routes[j])*view.inter+row]=DequantizeCast<T>::cast(ExpertSwiglu(a, b, view));
             } else partial[size_t(OriginalRoute(view,routes[j]))*view.hidden+row]=a;
         }
         if (sharedInput) __syncthreads();

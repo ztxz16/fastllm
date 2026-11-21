@@ -219,6 +219,20 @@ struct NaiveN05GraphTestAccess {
         }
     }
     static auto &PrefixHistory(NaiveN05FlashModel &model) { return model.prefixHistory; }
+    static void CheckFP4Pools(const NaiveN05FlashModel &model) {
+        if (model.tpPagedCaches.size() != model.tpDevices.size())
+            throw std::runtime_error("missing FP4 GPU page pools");
+        for (size_t rank = 0; rank < model.tpDevices.size(); ++rank)
+            for (int layer = 0; layer < model.block_cnt; ++layer) if (!model.slidingLayers[layer]) {
+                for (int part = 0; part < 2; ++part) {
+                    const auto &pool = *model.tpPagedCaches[rank].at(2 * layer + part);
+                    if (pool.dataType != FP4_E2M1 || pool.GetBytes() != pool.Count(0) / 16 * 9)
+                        throw std::runtime_error("incorrect physical FP4 page layout");
+                }
+                if (model.IndexerStorage(layer, rank).dataType != FP8_E4M3)
+                    throw std::runtime_error("incorrect physical FP8 Indexer layout");
+            }
+    }
     static auto &DraftPrefixPool(NaiveN05FlashModel &model) { return model.prefixPool; }
     static void CheckHeadReturn(const NaiveN05FlashModel &model, const Data &output, bool deviceInput) {
         const bool borrowed = deviceInput && !model.tpDevices.empty() && FastllmCudaPeerAccessInit(model.tpDevices);
@@ -1094,6 +1108,8 @@ class Fixture : public NaiveN05FlashModel {
         // alive together, in addition to graph scratch page descriptors.
         maxBatch = draft ? 16 : 4; SetMaxTokens(16384); SetChunkedPrefillSize(4096);
         WarmUp();
+        if (dp > 1 && kvCacheDataType == FP4_E2M1)
+            NaiveN05GraphTestAccess::CheckFP4Pools(*this);
         if (draft) {
             DraftPrefillOracle(true);
             SetSaveHistoryChat(true);
@@ -1186,7 +1202,8 @@ class Fixture : public NaiveN05FlashModel {
             isIntermediateChunkedPrefill = false;
             reference.preTokens = length;
             auto message = ExportPDState(reference);
-            const bool independentExport = dp > 1 && dp == ranks && kvCacheDataType == FP8_E4M3;
+            const bool independentExport = dp > 1 && dp == ranks &&
+                (kvCacheDataType == FP8_E4M3 || kvCacheDataType == FP4_E2M1);
             if (independentExport) {
                 auto pack = PreparePDExport(reference);
                 if (!pack) throw std::runtime_error("missing independent GPU export");

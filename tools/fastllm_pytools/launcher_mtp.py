@@ -192,7 +192,7 @@ def detect_mtp_support(model_path, model_config):
             return "enabled" if _has_dspark_weights(_hf_mtp_names(path), layers) else "missing_weights"
         if not (set(architectures) & {
             "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration",
-        } or model_types & {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}):
+        } or model_types & {"sensenova_loop", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}):
             return "unsupported_architecture" if model_config else "unverified"
         if is_gguf:
             architecture = model_config["gguf_architecture"]

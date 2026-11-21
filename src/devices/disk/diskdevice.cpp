@@ -2124,6 +2124,9 @@ namespace fastllm {
         int device = -1;
         void *cudaRecord = nullptr;
         bool packedCuda = false;
+        // A planar FP8 host source can be restored losslessly from its packed
+        // CUDA blocks, including the gate/up row permutation used at upload.
+        bool restoreFp8 = false, interleavedGate = false;
 #ifdef USE_CUDA
         std::shared_ptr<uint8_t> cudaAllocation;
 #endif
@@ -2178,6 +2181,7 @@ namespace fastllm {
     };
 
     struct DiskExpertEntry {
+        bool standardFp8 = false; // Registered model weights can return packed GPU records to the RAM tier.
         std::unique_ptr<DiskCachedExpert> cpu;
         std::map<int, std::unique_ptr<DiskCachedExpert>> cuda;
         uint64_t lastUse = 0, epoch = 0;
@@ -2310,13 +2314,54 @@ namespace fastllm {
 #endif
 
 #ifdef USE_CUDA
-    // GPU GGUF records keep the canonical bytes, so returning them to RAM
-    // needs no requantization or layout conversion. Other CUDA formats may
-    // interleave gate/up and are deliberately left on their existing path.
-    static bool CanDemoteDiskGGUF(const DiskCachedExpert &expert) {
-        return expert.device >= 0 && expert.cudaRecord &&
-            expert.gate->dataType == DATA_GGUF_FORMAT && expert.down->dataType == DATA_GGUF_FORMAT &&
-            !expert.gate->IsRepacked && !expert.down->IsRepacked;
+    static bool CanDemoteDiskExpert(const DiskCachedExpert &expert) {
+        if (expert.device < 0) return false;
+        if (expert.restoreFp8) return expert.gate->cudaData && expert.down->cudaData;
+        return expert.cudaRecord && expert.gate->dataType == DATA_GGUF_FORMAT &&
+               expert.down->dataType == DATA_GGUF_FORMAT && !expert.gate->IsRepacked && !expert.down->IsRepacked;
+    }
+
+    static uint64_t DemotedHostBytes(const DiskCachedExpert &expert) {
+        uint64_t bytes = 0;
+        for (const Data *w : {expert.gate.get(), expert.down.get()}) {
+            bytes += expert.restoreFp8 ? uint64_t(w->dims[0]) * w->dims[1] +
+                                             uint64_t((w->dims[0] + w->blockK - 1) / w->blockK) *
+                                                 (w->dims[1] / 128) * sizeof(float)
+                                       : DiskGGUFAllocationBytes(w->GetBytes());
+        }
+        return bytes;
+    }
+
+    static std::unique_ptr<Data> DownloadPlanarFp8(const Data &src, bool interleaved) {
+        const int rows = src.dims[0], columns = src.dims[1];
+        const size_t pitch = GetDataBytes(FP8_E4M3_BLOCK_128, 1, columns);
+        auto dst = std::make_unique<Data>(FP8_E4M3, src.dims);
+        dst->blockK = src.blockK;
+        dst->blockM = src.blockM;
+        const int scaleCols = columns / 128;
+        dst->scales.resize(size_t((rows + src.blockK - 1) / src.blockK) * scaleCols);
+        dst->Allocate(false);
+        const int tile = std::max<int>(1, std::min<size_t>(rows, (2u << 20) / pitch));
+        std::vector<uint8_t> packed(size_t(tile) * pitch);
+        for (int first = 0; first < rows; first += tile) {
+            const int count = std::min(tile, rows - first);
+            FastllmCudaCopyFromDeviceToHost(packed.data(),
+                                            static_cast<uint8_t *>(src.cudaData) + size_t(first) * pitch,
+                                            size_t(count) * pitch);
+            for (int i = 0; i < count; ++i) {
+                const int row = first + i;
+                const int original = interleaved ? row / 2 + (row % 2) * (rows / 2) : row;
+                const auto *from = packed.data() + size_t(i) * pitch;
+                auto *to = dst->cpuData + size_t(original) * columns;
+                for (int col = 0; col < columns; col += 128, from += 128 + sizeof(float)) {
+                    memcpy(to + col, from, 128);
+                    if (original % src.blockK == 0)
+                        memcpy(&dst->scales[size_t(original / src.blockK) * scaleCols + col / 128],
+                               from + 128, sizeof(float));
+                }
+            }
+        }
+        return dst;
     }
 
     static std::unique_ptr<Data> AllocateDiskGGUFHost(const Data &src, DiskWeightStorage &storage) {
@@ -2334,13 +2379,18 @@ namespace fastllm {
         return dst;
     }
 
-    static std::unique_ptr<DiskCachedExpert> DownloadDiskGGUF(const DiskCachedExpert &source) {
+    static std::unique_ptr<DiskCachedExpert> DownloadDiskExpert(const DiskCachedExpert &source) {
         struct DeviceGuard {
             int previous = FastllmCudaGetDevice();
             ~DeviceGuard() { FastllmCudaSetDevice(previous); }
         } guard;
         FastllmCudaSetDevice(source.device);
         auto result = std::make_unique<DiskCachedExpert>();
+        if (source.restoreFp8) {
+            result->gate = DownloadPlanarFp8(*source.gate, source.interleavedGate);
+            result->down = DownloadPlanarFp8(*source.down, false);
+            return result;
+        }
         const auto copy = [](const Data &src, DiskWeightStorage &storage) {
             auto dst = AllocateDiskGGUFHost(src, storage);
             try {
@@ -2434,7 +2484,7 @@ namespace fastllm {
                 auto *slot = entry->Cuda(device);
                 bool download = false;
 #ifdef USE_CUDA
-                download = !entry->cpu && CanDemoteDiskGGUF(*slot) && bool(GetMoeCpuCacheBytes());
+                download = !entry->cpu && CanDemoteDiskExpert(*slot) && bool(GetMoeCpuCacheBytes());
 #endif
                 return DiskMoeReplacementCost::Record{slot->Bytes(), entry->Heat(Epoch()), download};
             };
@@ -2657,15 +2707,14 @@ namespace fastllm {
             if (recycled) *recycled = std::move(slot);
             else slot.reset();
         }
-        void DemoteGGUF(DiskExpertEntry &victim, int device) {
+        void DemoteExpert(DiskExpertEntry &victim, int device) {
 #ifdef USE_CUDA
             auto &slot = Slot(victim, device);
-            if (device < 0 || !slot || victim.cpu || !CanDemoteDiskGGUF(*slot) ||
+            if (device < 0 || !slot || victim.cpu || !CanDemoteDiskExpert(*slot) ||
                 !GetMoeCpuCacheBytes() || !MakeRoom(&victim, -1,
-                    DiskGGUFAllocationBytes(slot->gate->GetBytes()) +
-                    DiskGGUFAllocationBytes(slot->down->GetBytes()), GetMoeCpuCacheBytes())) return;
+                    DemotedHostBytes(*slot), GetMoeCpuCacheBytes())) return;
             const auto started = std::chrono::steady_clock::now();
-            auto host = DownloadDiskGGUF(*slot);
+            auto host = DownloadDiskExpert(*slot);
             const uint64_t moved = slot->Bytes();
             const double us = std::chrono::duration<double, std::micro>(
                 std::chrono::steady_clock::now() - started).count();
@@ -2701,7 +2750,7 @@ namespace fastllm {
                 // No idle allocator pool survives an admission or budget trim.
                 bool reuse = recycled && !*recycled && device >= 0 &&
                     slot->cudaRecord && slot->Bytes() == bytes;
-                DemoteGGUF(victim, device);
+                DemoteExpert(victim, device);
                 Evict(victim, device, reuse ? recycled : nullptr);
             };
             if (Slot(*weakest, device)->Bytes() >= used - (budget - bytes)) {
@@ -2769,7 +2818,7 @@ namespace fastllm {
                     return Colder(b, a);
                 });
                 for (auto *entry : block.entries) {
-                    DemoteGGUF(*entry, device);
+                    DemoteExpert(*entry, device);
                     Evict(*entry, device);
                 }
                 reserved -= block.storage->bytes;
@@ -3137,8 +3186,12 @@ namespace fastllm {
     }
 
     static std::unique_ptr<DiskCachedExpert> DiskCudaExpert(const DiskCachedExpert &host,
-                                                          MoeGateType gateType, bool canonicalGGUF = false) {
+                                                          MoeGateType gateType, bool canonicalGGUF = false, bool restoreFp8 = false) {
         std::unique_ptr<DiskCachedExpert> gpu(new DiskCachedExpert);
+        gpu->restoreFp8 = restoreFp8 && host.gate->dataType == FP8_E4M3 && host.down->dataType == FP8_E4M3 &&
+                          host.gate->blockM == 128 && host.down->blockM == 128 && host.gate->blockK > 0 && host.down->blockK > 0 &&
+                          host.gate->dims[1] % 128 == 0 && host.down->dims[1] % 128 == 0;
+        gpu->interleavedGate = !canonicalGGUF && gateType != MoeGateGeglu;
         gpu->gate = DiskCudaWeight(*host.gate, !canonicalGGUF && gateType != MoeGateGeglu);
         gpu->down = DiskCudaWeight(*host.down, false);
         if (!gpu->gate || !gpu->down) return nullptr;
@@ -5149,7 +5202,7 @@ namespace fastllm {
                 if (offloadRam && mxfp4) transientGpu = uploader.Upload(*host, reusableGpu);
 #endif
                 if (!transientGpu) {
-                    transientGpu = DiskCudaExpert(*host, gateType, canonicalGGUF);
+                    transientGpu = DiskCudaExpert(*host, gateType, canonicalGGUF, entry && entry->standardFp8);
                     if (transientGpu) {
                         transientGpu->packedCuda = ordinaryCanonical;
                         bool uploaded;
@@ -5287,7 +5340,7 @@ namespace fastllm {
                     promotion->packedCuda = ordinaryCanonical;
                     return promotion;
                 }
-                return DiskCudaExpert(*host, gateType, canonicalGGUF);
+                return DiskCudaExpert(*host, gateType, canonicalGGUF, entry && entry->standardFp8);
             };
             // Limit transfer churn to the hottest eligible expert per invocation.
             // A promoted expert no longer needs to occupy the RAM tier too.

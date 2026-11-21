@@ -762,7 +762,8 @@ struct NaiveN05FlashModel::PDExportPlan {
 
 std::function<fastkv::Message()> NaiveN05FlashModel::PreparePDExport(ResponseContext &context) {
 #ifdef USE_CUDA
-    if (attentionDP > 1 && AttentionTPSize() == 1 && !sparseKv && !HasSeparateIndexer()) {
+    if (attentionDP > 1 && AttentionTPSize() == 1 && !sparseKv &&
+        (!HasSeparateIndexer() || kvCacheDataType == FP4_E2M1)) {
         auto devices = PDRequestDevices(context);
         // Attention DP joins its workers to the caller before returning. Fence
         // the owner's caller stream once before handing its pages and ring

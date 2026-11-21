@@ -1,5 +1,6 @@
 #include "devices/cuda/fastllm-kernel-benchmark.cuh"
 #include <climits>
+#include "devices/cuda/fastllm-nvfp4-prefill.h"
 #include "devices/cuda/fastllm-fp8-block-batch.cuh"
 #include <stdexcept>
 #include "devices/cuda/fastllm-fp8-small-t.cuh"
@@ -2115,17 +2116,17 @@ __device__ __forceinline__ uint2 FastllmFp8ScaledBFloat16x4(uint32_t packed, flo
     return values;
 }
 
-// Block-32 weights use shifts for scale lookup and one vector store per four
-// outputs. Other scale layouts keep the established conversion below.
-__global__ void FastllmCudaFP8E4M32BF16Block32Kernel(
+// Vectorized BF16 staging for 32x32 blocks or one scale per output row.
+template <bool ROW_SCALE>
+__global__ void FastllmCudaFP8E4M3UnpackBF16Kernel(
         const uint8_t *__restrict__ input, const float *__restrict__ scales,
         __nv_bfloat16 *__restrict__ output, int columns) {
     const int row = blockIdx.x;
-    const float *rowScales = scales + (size_t)(row / 32) * (columns / 32);
+    const float *rowScales = ROW_SCALE ? scales + row : scales + (size_t)(row / 32) * (columns / 32);
     for (int i = threadIdx.x * 4; i < columns; i += blockDim.x * 4) {
         const uint32_t packed = *reinterpret_cast<const uint32_t *>(
             input + (size_t)row * columns + i);
-        const float scale = rowScales[i / 32];
+        const float scale = rowScales[ROW_SCALE ? 0 : i / 32];
         const uint2 values = FastllmFp8ScaledBFloat16x4(packed, scale);
         *reinterpret_cast<uint2 *>(output + (size_t)row * columns + i) = values;
     }
@@ -2138,14 +2139,9 @@ __global__ void FastllmGemvBF16FP8E4M3Kernel1MultiRow(__nv_bfloat16 *A, uint8_t 
                                                     int m, int k, int blockM, int blockK) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
-    // Exact verification batches use PART=1 and grid.y for independent rows.
-    // This is the identical kernel used by single-token decode, preserving the
-    // per-row floating-point operation and reduction order across CUDA GPUs.
-    if constexpr (PART == 1) {
-        const size_t gridRow = (size_t)blockIdx.y;
-        A += gridRow * m;
-        C += gridRow * k;
-    }
+    const size_t firstRow = size_t(blockIdx.y) * PART;
+    A += firstRow * m;
+    C += firstRow * k;
 
     int st = blockIdx.x;
 #pragma unroll
@@ -2841,6 +2837,8 @@ extern "C" bool FastllmCudaBFloat16FP8ReplicatedRowSlice(
     return true;
 }
 
+static thread_local const FastllmCudaNvfp4Scope *nvfp4Scope = nullptr;
+
 namespace {
 const fastllm::kernels::Family fp8ProjectionFamily{1,"linear.fp8.bf16",__DATE__ " " __TIME__,{
     {"cuda.projection.native",json11::Json::object{{"backend","cuda"},{"description","Existing FP8 CUDA implementation"},{"format","FP8_E4M3 block32 -> BF16"},{"graph",true}}},
@@ -2850,6 +2848,127 @@ const fastllm::kernels::Family fp8ProjectionFamily{1,"linear.fp8.bf16",__DATE__ 
     {"cuda.projection.triton.batch64",json11::Json::object{{"backend","triton"},{"sm",json11::Json::array{120,121}},{"description","Row-tiled FP8/BF16 projection; arbitrary logical rows"},{"parameters",json11::Json::object{{"block_m",64},{"warps",4},{"stages",3}}},{"graph",true}}}
 }};
 const bool fp8ProjectionRegistered=[] {fastllm::kernels::Register(&fp8ProjectionFamily);return true;}();
+}
+
+// Each warp computes a small panel of outputs. A 128-bit load supplies
+// eight consecutive BF16 activations, following the single-row K reduction.
+template <int Values, int Tokens, int Rows = 4>
+static __global__ __launch_bounds__(128) void SenseNovaFp8VerifyTile(
+    const __nv_bfloat16 *__restrict__ x, const uint8_t *__restrict__ w, const float *__restrict__ scales,
+    const __nv_bfloat16 *__restrict__ bias, __nv_bfloat16 *__restrict__ y, int inner, int columns) {
+    const int lane = threadIdx.x % 32;
+    const int row = (blockIdx.y * 4 + threadIdx.x / 32) * Rows;
+    x += size_t(blockIdx.x) * Tokens * inner;
+    y += size_t(blockIdx.x) * Tokens * columns;
+    float sums[Tokens][Rows][2] = {};
+    // Stream one aligned E4M3 vector per lane. Leave L1 available for the
+    // activations shared by every output tile. Each K chain keeps its order.
+#pragma unroll (Values == 16 ? 2 : 1)
+    for (int k = lane * Values; k < inner; k += 32 * Values) {
+        float2 weights[Rows][Values / 2];
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            const uint8_t *ptr = w + size_t(row + r) * inner + k;
+            uint32_t words[Values / 4];
+            if constexpr (Values == 16) {
+                const uint4 v = __ldcs(reinterpret_cast<const uint4 *>(ptr));
+                words[0] = v.x;
+                words[1] = v.y;
+                words[2] = v.z;
+                words[3] = v.w;
+            } else {
+                const uint2 v = __ldcs(reinterpret_cast<const uint2 *>(ptr));
+                words[0] = v.x;
+                words[1] = v.y;
+            }
+#pragma unroll
+            for (int j = 0; j < Values / 2; ++j) {
+                __nv_fp8x2_e4m3 pair;
+                pair.__x = uint16_t(words[j / 2] >> ((j % 2) * 16));
+                weights[r][j] = static_cast<float2>(pair);
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < Tokens; ++t) {
+            const auto *src = reinterpret_cast<const uint4 *>(x + size_t(t) * inner + k);
+#pragma unroll
+            for (int chunk = 0; chunk < Values / 8; ++chunk) {
+                uint4 v = __ldg(src + chunk);
+                uint32_t pairs[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    float2 a = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 *>(&pairs[j]));
+#pragma unroll
+                    for (int r = 0; r < Rows; ++r) {
+                        float2 weight = weights[r][4 * chunk + j];
+                        sums[t][r][0] = __fmaf_rn(a.x, weight.x, sums[t][r][0]);
+                        sums[t][r][1] = __fmaf_rn(a.y, weight.y, sums[t][r][1]);
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < Tokens; ++t) {
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+            float s = sums[t][r][0] + sums[t][r][1];
+#pragma unroll
+            for (int d = 16; d; d /= 2)
+                s += __shfl_down_sync(0xffffffff, s, d);
+            if (lane == 0)
+                y[size_t(t) * columns + row + r] =
+                    __nv_bfloat16(s * scales[row + r] + (bias ? float(bias[row + r]) : 0.f));
+        }
+    }
+}
+
+template <int Step, int Values>
+static void LaunchSenseNovaFp8Tiles(const __nv_bfloat16 *x, const uint8_t *w, const float *scales,
+                                    const __nv_bfloat16 *bias, __nv_bfloat16 *y, int rows, int inner, int columns) {
+    if constexpr (Step == 3 && Values == 8) {
+        // At full two-draft concurrency, a wider output tile reuses each
+        // activation across eight columns of the long-K MLP down projection.
+        if (rows == 24 && inner == 12288 && columns == 4096) {
+            SenseNovaFp8VerifyTile<Values, 8, 8>
+                <<<dim3(3, columns / 32), 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+            return;
+        }
+    }
+    const int tiles = rows / (4 * Step), blocks = columns / 16;
+    if (tiles) {
+        SenseNovaFp8VerifyTile<Values, 4 * Step>
+            <<<dim3(tiles, blocks), 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        x += size_t(tiles) * 4 * Step * inner;
+        y += size_t(tiles) * 4 * Step * columns;
+    }
+    const dim3 grid(1, blocks);
+    switch (rows / Step % 4) {
+    case 1:
+        SenseNovaFp8VerifyTile<Values, Step>
+            <<<grid, 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        break;
+    case 2:
+        SenseNovaFp8VerifyTile<Values, 2 * Step>
+            <<<grid, 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        break;
+    case 3:
+        SenseNovaFp8VerifyTile<Values, 3 * Step>
+            <<<grid, 128, 0, cudaStreamPerThread>>>(x, w, scales, bias, y, inner, columns);
+        break;
+    }
+}
+
+template <int Step>
+static void LaunchSenseNovaFp8Verify(const __nv_bfloat16 *x, const uint8_t *w, const float *scales,
+                                     const __nv_bfloat16 *bias, __nv_bfloat16 *y, int rows, int inner, int columns) {
+    // The original two-row and three-row SIMT kernels use different K partitions.
+    const bool wide =
+        inner % 512 == 0 && (Step == 2 ? columns <= 8192 || columns >= 16384 : columns > 8192 && columns < 16384);
+    if (wide)
+        LaunchSenseNovaFp8Tiles<Step, 16>(x, w, scales, bias, y, rows, inner, columns);
+    else
+        LaunchSenseNovaFp8Tiles<Step, 8>(x, w, scales, bias, y, rows, inner, columns);
 }
 
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
@@ -2877,6 +2996,51 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
         return true;
     }
 #endif
+
+    // Preserve the 2/3-row FP8 reduction of a single verifier. Independent
+    // requests use the same launch for each wide projection.
+    const int step = nvfp4Scope ? nvfp4Scope->verifyRows : 0;
+    if ((step == 2 || step == 3) && n > step && n % step == 0 && n <= 24 && weight.blockK == 1 &&
+        weight.blockM == m && !weight.IsRepacked && FastllmCudaRuntimeArch() == 120) {
+        auto *w = (uint8_t *)weight.cudaData;
+        if (k % 16 == 0 && reinterpret_cast<uintptr_t>(cudaInput) % 16 == 0 &&
+            CanRunFastllmRowFP8<__nv_bfloat16, 8>(cudaInput, w, cudaOutput, cudaBF16Bias, cudaScales, step, m, k,
+                                                  weight.blockM, weight.blockK)) {
+            if (step == 2)
+                LaunchSenseNovaFp8Verify<2>(cudaInput, w, cudaScales, cudaBF16Bias, cudaOutput, n, m, k);
+            else
+                LaunchSenseNovaFp8Verify<3>(cudaInput, w, cudaScales, cudaBF16Bias, cudaOutput, n, m, k);
+        } else if (k < 512 && m == 4096 && step >= fastllm::FastllmCudaGetLinearExactBatchThreshold() &&
+                   reinterpret_cast<uintptr_t>(cudaInput) % 8 == 0 && reinterpret_cast<uintptr_t>(w) % 4 == 0) {
+            // Share the narrow GDN gate launch across request tiles.
+            dim3 grid(k, n / step);
+            if (step == 2)
+                FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 2, false, true>
+                    <<<grid, 64>>>(cudaInput, w, cudaOutput, cudaBF16Bias, cudaScales, m, k, m, 1);
+            else
+                FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 3, true, true>
+                    <<<grid, 64>>>(cudaInput, w, cudaOutput, cudaBF16Bias, cudaScales, m, k, m, 1);
+        } else {
+            for (int row = 0; row < n; row += step)
+                LaunchFastllmGemmBF16FP8E4M3(cudaInput + size_t(row) * m, w, cudaOutput + size_t(row) * k,
+                                             cudaBF16Bias, cudaScales, step, m, k, weight.blockM, weight.blockK);
+        }
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
+    // Plain row-scaled checkpoints already hold the layout consumed by FP8 GEMM.
+    // The native prefill policy controls activation quantization and warmup.
+    if (weight.blockK == 1 && weight.blockM == m && !weight.IsRepacked && bias.dims.empty() &&
+        (n >= 128 || FastllmCudaGetNcclForceSync()) &&
+        fastllm_native_prefill::Fp8BFloat16(cudaInput, static_cast<const uint8_t *>(weight.cudaData),
+            nullptr, cudaOutput, n, k, m, cudaScales)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+
 #ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
     // Preserve the original 1x32 weight/scales. Unlike the legacy SIMT and
     // expanded-BF16 paths, this computes with FP8 Tensor Cores at every batch.
@@ -2988,6 +3152,12 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
             }
         }
         int ms = (m - 1) / weight.blockM + 1;
+        const int promptRows = nvfp4Scope && nvfp4Scope->promptRows > 0 && n % nvfp4Scope->promptRows == 0
+                             ? nvfp4Scope->promptRows : n;
+        const bool rowScale = weight.blockK == 1 && weight.blockM == m && m % 4 == 0 &&
+                              reinterpret_cast<uintptr_t>(weight.cudaData) % alignof(uint32_t) == 0 &&
+                              reinterpret_cast<uintptr_t>(cudaBF16Weight) % alignof(uint2) == 0 &&
+                              FastllmCudaRuntimeArch() == 120;
 
         float h_alpha = 1.0f, h_beta = 0.0f;
         cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
@@ -2998,11 +3168,14 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
             auto *scaleChunk = cudaScales + (size_t)(kOff / blockK) * ms;
             if (cachedWeight) {
                 // The copy was produced by the identical dequantization kernel.
+            } else if (rowScale) {
+                FastllmCudaFP8E4M3UnpackBF16Kernel<true><<<kc, 256>>>(
+                    weightChunk, scaleChunk, cudaBF16Weight, m);
             } else if (weight.blockK == 32 && weight.blockM == 32 && m % 32 == 0 &&
                 reinterpret_cast<uintptr_t>(weightChunk) % alignof(uint32_t) == 0 &&
                 reinterpret_cast<uintptr_t>(cudaBF16Weight) % alignof(uint2) == 0) {
                 const int threads = m >= 4096 ? 256 : 128;
-                FastllmCudaFP8E4M32BF16Block32Kernel<<<kc, threads>>>(
+                FastllmCudaFP8E4M3UnpackBF16Kernel<false><<<kc, threads>>>(
                     weightChunk, scaleChunk, cudaBF16Weight, m);
             } else {
                 FastllmCudaFP8E4M32BF16Kernel<<<kc, 256>>>(
@@ -3014,19 +3187,17 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
                 FastllmCudaCacheBFloat16FP8Weight(weight, cudaBF16Weight,
                     (size_t)k * m * sizeof(__nv_bfloat16));
 
-            if (!FastllmCudaHybridBf16Gemm(cudaInput, cudaBF16Weight, cudaOutput + kOff,
-                    n, m, kc, k, fastllmCublasHandle)) {
-                const cublasStatus_t status = cublasGemmEx(fastllmCublasHandle,
-                                    CUBLAS_OP_T, CUBLAS_OP_N,
-                                    kc, n, m,
-                                    &h_alpha, cudaBF16Weight, AType,
-                                    m, cudaInput, BType,
-                                    m, &h_beta,
-                                    cudaOutput + kOff, CType,
-                                    k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-                if (status != CUBLAS_STATUS_SUCCESS) {
-                    printf("Error: cublas error (BFloat16MatMulFP8E4M3).\n");
-                    throw("cublas error");
+            // Keep each prompt's original GEMM shape and reduction order. The
+            // unpacked panel stays valid for all requests in this forward.
+            for (int row = 0; row < n; row += promptRows) {
+                auto *x = cudaInput + (size_t)row * m;
+                auto *y = cudaOutput + (size_t)row * k + kOff;
+                if (!FastllmCudaHybridBf16Gemm(x, cudaBF16Weight, y, promptRows, m, kc, k, fastllmCublasHandle)) {
+                    const auto status = cublasGemmEx(fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        kc, promptRows, m, &h_alpha, cudaBF16Weight, AType, m, x, BType, m,
+                        &h_beta, y, CType, k, ComputeType, CUBLAS_GEMM_DEFAULT);
+                    if (status != CUBLAS_STATUS_SUCCESS)
+                        throw std::runtime_error("FP8 to BF16 prefill GEMM failed.");
                 }
             }
         }
@@ -3896,7 +4067,7 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
 // them load one consecutive uint32 each and exchange the words within the 4-lane
 // group. This turns three strided warp loads into one fully coalesced 12-byte/block
 // load and keeps the dot accumulator in a register until reduction.
-template <int THREAD_PER_BLOCK, bool PLANAR, bool COMPACT, typename InputT, typename OutputT, typename BiasT>
+template <int THREAD_PER_BLOCK, bool PLANAR, bool COMPACT, int ROWS = 1, int WIDTH = 0, typename InputT, typename OutputT, typename BiasT>
 __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
         const InputT * __restrict__ A, const uint8_t * __restrict__ B,
         OutputT * __restrict__ C, const BiasT * __restrict__ bias,
@@ -3904,20 +4075,24 @@ __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
     static_assert(THREAD_PER_BLOCK >= 32 && THREAD_PER_BLOCK % 32 == 0,
                   "NVFP4 coalesced GEMV requires whole warps");
     constexpr int WARP_COUNT = THREAD_PER_BLOCK / 32;
-    __shared__ float warpSums[WARP_COUNT];
+    __shared__ float warpSums[ROWS][WARP_COUNT];
     const unsigned int tid = threadIdx.x;
     const int laneId = tid & 31;
     const int warpId = tid >> 5;
     const int laneInGroup = laneId & 3;
     const int groupBaseLane = laneId & ~3;
     const int row = blockIdx.x;
+    if constexpr (WIDTH) m = WIDTH;
     const int blocks = (m + 15) / 16;
     const uint8_t *rowData = B + (PLANAR ? fastllm::NVFP4PlanarWeightOffset(row, blocks) : (size_t)row * perRow);
     const float *rowScales = PLANAR ? (const float *)(B + fastllm::NVFP4PlanarScaleOffset(row, blocks)) : nullptr;
     const float globalScale = COMPACT ? *(const float *)rowData : 1.0f;
     if (COMPACT) rowData += sizeof(float);
-    float acc = 0.0f;
+    float acc[ROWS] = {};
 
+    // Specializing the two common projection widths lets ptxas pipeline the
+    // independent block-scale loads without changing a lane's accumulation.
+    #pragma unroll
     for (int i = tid * 4; i < m; i += THREAD_PER_BLOCK * 4) {
         const uint8_t *blockData = rowData +
             (size_t)(i >> 4) * (COMPACT ? 9 : (PLANAR ? 8 : 12));
@@ -3928,8 +4103,20 @@ __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
             // kernel's dot products, thread count, and reduction order.
             packed4 = uint16_t(blockData[laneInGroup * 2]) |
                       (uint16_t(blockData[laneInGroup * 2 + 1]) << 8);
-            blockScale = __fmul_rn(
-                FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]), globalScale);
+            const uint8_t scale = blockData[8];
+            float value;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890 && !defined(USE_ROCM)
+            if constexpr (WIDTH) {
+                uint32_t halfs;
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halfs) : "h"((uint16_t)scale));
+                // The legacy inline scale decoder assigns magnitude 480 to
+                // the reserved E4M3 code. Retain it for older packed files.
+                value = (scale & 127) == 127 ? (scale & 128 ? -480.f : 480.f)
+                                             : __half2float(__ushort_as_half(halfs & 65535));
+            } else
+#endif
+                value = FastllmCudaNVFP4E4M3ScaleToFloat(scale);
+            blockScale = __fmul_rn(value, globalScale);
         } else {
             const uint32_t loaded = PLANAR && laneInGroup == 2
                     ? __float_as_uint(rowScales[i >> 4])
@@ -3951,28 +4138,176 @@ __global__ void FastllmGemvNVFP4Block16Kernel1Coalesced(
         const float w1 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed01 >> 4);
         const float w2 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 & 0xF);
         const float w3 = FastllmCudaNVFP4PseudoBFloat16ToFloat(packed23 >> 4);
-        const float blockSum = FastllmCudaNVFP4Dot4(A, i, w0, w1, w2, w3);
-        acc += blockSum * (blockScale * FastllmCudaNVFP4MagicScale());
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            const float dot = FastllmCudaNVFP4Dot4(A + r * m, i, w0, w1, w2, w3);
+            acc[r] += dot * (blockScale * FastllmCudaNVFP4MagicScale());
+        }
     }
-
-#pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc[r] += __shfl_down_sync(0xffffffff, acc[r], offset);
+        if (laneId == 0) warpSums[r][warpId] = acc[r];
     }
-    if (laneId == 0) warpSums[warpId] = acc;
     __syncthreads();
-
     if (warpId == 0) {
-        acc = laneId < WARP_COUNT ? warpSums[laneId] : 0.0f;
-#pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            acc += __shfl_down_sync(0xffffffff, acc, offset);
-        }
-        if (laneId == 0) {
-            C[row] = FastllmCudaNVFP4FloatToValue<OutputT>(
-                    acc + FastllmCudaNVFP4BiasValue((BiasT *)bias, row));
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            float sum = laneId < WARP_COUNT ? warpSums[r][laneId] : 0.0f;
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffff, sum, offset);
+            if (laneId == 0)
+                C[r * k + row] = FastllmCudaNVFP4FloatToValue<OutputT>(
+                    sum + FastllmCudaNVFP4BiasValue((BiasT *)bias, row));
         }
     }
+}
+
+// Four FP4 values for one lane and the original row/block scale product.
+__device__ __forceinline__ float FastllmCompactDecodeBlock4(const uint8_t *block, int lane,
+        float global, float (&weights)[4]) {
+    const int byte = (lane & 3) * 2;
+    const unsigned packed = block[byte] | (unsigned(block[byte + 1]) << 8);
+    #pragma unroll
+    for (int d = 0; d < 4; ++d)
+        weights[d] = FastllmCudaNVFP4PseudoBFloat16ToFloat((packed >> (4 * d)) & 15);
+    const uint8_t raw = block[8];
+    float scale;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890 && !defined(USE_ROCM)
+    uint32_t halves;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halves) : "h"((uint16_t)raw));
+    scale = (raw & 127) == 127 ? (raw & 128 ? -480.f : 480.f)
+                                : __half2float(__ushort_as_half(halves & 65535));
+#else
+    scale = FastllmCudaNVFP4E4M3ScaleToFloat(raw);
+#endif
+    return __fmul_rn(scale, global) * FastllmCudaNVFP4MagicScale();
+}
+
+// Each warp uses the original four-weight FP32 dot products and reduction order.
+// Tile in blocks of 4096 columns to keep the scale and nibble loads independent.
+template<int WIDTH, int ROWS, int OUTPUT_ROWS>
+__global__ void FastllmCompactVerifyGemv(const __nv_bfloat16 *__restrict__ input,
+        const uint8_t *__restrict__ weights, __nv_bfloat16 *__restrict__ output,
+        const __nv_bfloat16 *bias, int channels) {
+    constexpr int threads = 128, pitch = sizeof(float) + WIDTH / 16 * 9;
+    int lane = threadIdx.x % threads, group = threadIdx.x / threads;
+    int row = blockIdx.x * OUTPUT_ROWS + group;
+    const uint8_t *base = weights + size_t(row) * pitch;
+    const float global = *reinterpret_cast<const float*>(base);
+    float sums[ROWS] = {};
+    #pragma unroll
+    for (int panel = 0; panel < WIDTH / 4096; ++panel) {
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            int col = panel * 4096 + t * 512 + lane * 4;
+            const uint8_t *block = base + 4 + (col / 16) * 9;
+            float w[4];
+            const float multiplier = FastllmCompactDecodeBlock4(block, lane, global, w);
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r) {
+                const float dot = FastllmCudaNVFP4Dot4(input + r * WIDTH, col, w[0], w[1], w[2], w[3]);
+                sums[r] = __fmaf_rn(dot, multiplier, sums[r]);
+            }
+        }
+    }
+    __shared__ float partial[OUTPUT_ROWS][ROWS][4];
+    #pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        #pragma unroll
+        for (int offset = 16; offset; offset /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], offset);
+        if ((lane & 31) == 0) partial[group][r][lane / 32] = sums[r];
+    }
+    __syncthreads();
+    if (lane < ROWS) {
+        const float *w = partial[group][lane];
+        output[lane * channels + row] = __float2bfloat16_rn(
+            (w[0] + w[2]) + (w[1] + w[3]) + (bias ? float(bias[row]) : 0.f));
+    }
+}
+
+// An activation row is shared across several output channels in registers.
+// Each of the 128 lanes retains the single-request four-column dot and sum.
+template<int WIDTH, int ROWS, int CHANNELS>
+__global__ void FastllmCompactBatchGemv(const __nv_bfloat16 *__restrict__ input,
+        const uint8_t *__restrict__ weights, __nv_bfloat16 *__restrict__ output,
+        const __nv_bfloat16 *bias, int outputs) {
+    constexpr int pitch = sizeof(float) + WIDTH / 16 * 9;
+    int lane = threadIdx.x;
+    int first = blockIdx.x * CHANNELS;
+    float global[CHANNELS], sums[CHANNELS][ROWS] = {};
+    #pragma unroll
+    for (int c = 0; c < CHANNELS; ++c)
+        global[c] = *reinterpret_cast<const float*>(weights + size_t(first + c) * pitch);
+    #pragma unroll 8
+    for (int col = lane * 4; col < WIDTH; col += 512) {
+        float values[CHANNELS][4], scales[CHANNELS];
+        #pragma unroll
+        for (int c = 0; c < CHANNELS; ++c) {
+            const uint8_t *block = weights + size_t(first + c) * pitch + 4 + (col / 16) * 9;
+            scales[c] = FastllmCompactDecodeBlock4(block, lane, global[c], values[c]);
+        }
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            union_bf16_4_fp8 x;
+            x.in = *reinterpret_cast<const uint2*>(input + r * WIDTH + col);
+            #pragma unroll
+            for (int c = 0; c < CHANNELS; ++c) {
+                const float *w = values[c];
+                float dot = float(x.out[0]) * w[0] + float(x.out[1]) * w[1]
+                          + float(x.out[2]) * w[2] + float(x.out[3]) * w[3];
+                sums[c][r] = __fmaf_rn(dot, scales[c], sums[c][r]);
+            }
+        }
+    }
+    __shared__ float partial[CHANNELS][ROWS][4];
+    #pragma unroll
+    for (int c = 0; c < CHANNELS; ++c) {
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            #pragma unroll
+            for (int offset = 16; offset; offset /= 2)
+                sums[c][r] += __shfl_down_sync(0xffffffff, sums[c][r], offset);
+            if ((lane & 31) == 0) partial[c][r][lane / 32] = sums[c][r];
+        }
+    }
+    __syncthreads();
+    if (lane < CHANNELS * ROWS) {
+        int c = lane / ROWS, r = lane % ROWS;
+        const float *v = partial[c][r];
+        output[r * outputs + first + c] = __float2bfloat16_rn(
+            (v[0] + v[2]) + (v[1] + v[3]) + (bias ? float(bias[first + c]) : 0.f));
+    }
+}
+
+template <int ROWS, typename T, typename O, typename B>
+static void LaunchCompactVerify(T *input, uint8_t *weight, O *output, B *bias,
+                                int m, int k, int perRow, int threads) {
+    if constexpr (std::is_same<T, __nv_bfloat16>::value) {
+        if (m == 4096) {
+            FastllmCompactVerifyGemv<4096, ROWS, 1><<<k, 128>>>(input, weight, output, bias, k);
+            return;
+        }
+        if (m == 12288) {
+            if (k % 2 == 0) {
+                FastllmCompactVerifyGemv<12288, ROWS, 2><<<k / 2, 256>>>(input, weight, output, bias, k);
+            } else {
+                FastllmGemvNVFP4Block16Kernel1Coalesced<128, false, true, ROWS, 12288><<<k, 128>>>(
+                    input, weight, output, bias, m, k, perRow);
+            }
+            return;
+        }
+    }
+    if (threads == 128)
+        FastllmGemvNVFP4Block16Kernel1Coalesced<128, false, true, ROWS><<<k, 128>>>(
+            input, weight, output, bias, m, k, perRow);
+    else
+        FastllmGemvNVFP4Block16Kernel1Coalesced<64, false, true, ROWS><<<k, 64>>>(
+            input, weight, output, bias, m, k, perRow);
 }
 
 static inline int FastllmCudaNVFP4Block16ThreadsPerRow(int m) {
@@ -4038,6 +4373,14 @@ template <bool SCALE_E8M0, bool BLOCK32 = false, bool PLANAR = false, bool COMPA
           typename InputT, typename OutputT, typename BiasT>
 static void LaunchFastllmGemmNVFP4Block16(InputT *input, uint8_t *weight, OutputT *output,
                                           BiasT *bias, int n, int m, int k, int perRow) {
+    if constexpr (COMPACT && !PLANAR && !SCALE_E8M0 && !BLOCK32) {
+        if ((m & 15) == 0 && (n == 2 || n == 3)) {
+            int threads = FastllmCudaNVFP4Block16ThreadsPerRow(m);
+            if (n == 2) LaunchCompactVerify<2>(input, weight, output, bias, m, k, perRow, threads);
+            else LaunchCompactVerify<3>(input, weight, output, bias, m, k, perRow, threads);
+            return;
+        }
+    }
     if (n == 1) {
         const int threads = FastllmCudaNVFP4Block16ThreadsPerRow(m);
         if (!SCALE_E8M0 && (m & 15) == 0) {
@@ -4396,25 +4739,76 @@ __global__ void FastllmCudaNVFP4Block162HalfKernel(uint8_t *a, half *b, int m, i
     }
 }
 
-__global__ void FastllmCudaNVFP4Block162BFloat16Kernel(uint8_t *a, __nv_bfloat16 *b, int m, int perRow, int rowStart, bool planar, bool compactScales) {
+__global__ void FastllmCudaNVFP4Block162BFloat16Kernel(uint8_t *a, __nv_bfloat16 *b, int m, int perRow, int rowStart, bool planar, bool compactScales, bool lateScale, float *tensorScales) {
     int row = blockIdx.x;
     int tid = threadIdx.x;
 
     const int blocks = (m + 15) / 16;
     const int sourceRow = rowStart + row;
     uint8_t *rowData = a + (planar ? fastllm::NVFP4PlanarWeightOffset(sourceRow, blocks) : (size_t)sourceRow * perRow);
-    const float globalScale = compactScales ? *(const float*)rowData : 1.0f;
-    if (compactScales) rowData += sizeof(float);
+    float tensorScale = 1.0f;
+    if (compactScales) {
+        const float header = *reinterpret_cast<const float *>(rowData);
+        if (!lateScale) tensorScale = header;
+        else if (tensorScales != nullptr && tid == 0) tensorScales[row] = header;
+        rowData += sizeof(float);
+    }
     const float *rowScales = planar ? (const float *)(a + fastllm::NVFP4PlanarScaleOffset(sourceRow, blocks)) : nullptr;
     __nv_bfloat16 *rowOut = b + (size_t)row * m;
     for (int i = tid; i < m; i += blockDim.x) {
         int block = i >> 4;
         int offset = i & 15;
         uint8_t *blockData = rowData + block * (compactScales ? 9 : (planar ? 8 : (8 + sizeof(float))));
-        float scale = compactScales ? __fmul_rn(FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8]), globalScale) : planar ? rowScales[block] : *(float*)(blockData + 8);
+        float scale = compactScales ? __fmul_rn(tensorScale, FastllmCudaNVFP4E4M3ScaleToFloat(blockData[8])) : planar ? rowScales[block] : *(float*)(blockData + 8);
         uint8_t packed = blockData[offset >> 1];
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2bfloat16_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
+    }
+}
+
+#ifndef USE_ROCM
+// Eight adjacent BF16 weights per lane. Four 9-byte blocks occupy nine aligned
+// words; the two fragments straddling a word are joined before decoding.
+template<bool applyTensorScale>
+__global__ void FastllmCompactPrefillUnpack(const uint8_t *__restrict__ input,
+        __nv_bfloat16 *__restrict__ output, int width, int pitch, int firstRow, float *tensorScales) {
+    const int row = blockIdx.x;
+    const uint8_t *src = input + size_t(firstRow + row) * pitch;
+    const float header = *reinterpret_cast<const float *>(src);
+    if (tensorScales != nullptr && threadIdx.x == 0) tensorScales[row] = header;
+    const float tensorScale = applyTensorScale ? header : 1.0f;
+    src += sizeof(float);
+    for (int col = threadIdx.x * 8; col < width; col += blockDim.x * 8) {
+        const int block = col / 16;
+        const uint8_t *group = src + block * 9;
+        const int which = (col / 8) & 1;
+        const uint32_t *words = reinterpret_cast<const uint32_t *>(src) + (block * 9) / 4 + which;
+        const uint32_t packed = __funnelshift_r(words[0], words[1], (block & 3) * 8);
+        const float scale = __fmul_rn(tensorScale, FastllmCudaNVFP4E4M3ScaleToFloat(group[8]));
+        union { uint4 vector; __nv_bfloat162 pairs[4]; } decoded;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const unsigned q = (packed >> (8 * i)) & 255;
+            // E2M1 values are exactly representable in FP16.
+            unsigned lut = __byte_perm(0x3e3c3800u, 0x46444240u, q & 0x77u);
+            unsigned halves = __byte_perm(lut, 0u, 0x1404u) | ((q & 8u) << 12) | ((q & 128u) << 24);
+            float2 vals = __half22float2(*reinterpret_cast<const __half2 *>(&halves));
+            decoded.pairs[i] = __floats2bfloat162_rn(vals.x * scale, vals.y * scale);
+        }
+        *reinterpret_cast<uint4 *>(output + size_t(row) * width + col) = decoded.vector;
+    }
+}
+#endif
+
+// E2M1 times an E4M3 block scale fits exactly in BF16. Apply the remaining
+// per-row tensor scale to the FP32 dot product before its only BF16 rounding.
+__global__ void FastllmCompactPrefillScaleOutput(const float *sums, const float *tensorScales,
+        __nv_bfloat16 *output, int tokens, int columns, int outputStride) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= columns) return;
+    for (int row = blockIdx.y; row < tokens; row += gridDim.y) {
+        output[size_t(row) * outputStride + col] = __float2bfloat16_rn(
+            sums[size_t(row) * columns + col] * tensorScales[col]);
     }
 }
 
@@ -4459,10 +4853,6 @@ __global__ void FastllmCudaNVFP4Block16E8M02BFloat16Kernel(
         uint8_t fp4 = (offset & 1) ? (packed >> 4) : (packed & 0xF);
         rowOut[i] = __float2bfloat16_rn(FastllmCudaNVFP4E2M1ToFloat(fp4) * scale);
     }
-}
-
-static inline size_t FastllmCudaNVFP4Block16BytesPerRow(int m) {
-    return (size_t)((m - 1) / 16 + 1) * (8 + sizeof(float));
 }
 
 static bool FastllmCudaHasNVFP4Sm70TurboMindLayout(
@@ -4835,6 +5225,45 @@ bool FastllmCudaHalfMatMulFloatNVFP4Block16E8M0(const fastllm::Data &input, fast
     return true;
 }
 
+void FastllmCudaPlanNvfp4Prefill(FastllmNvfp4PrefillPlan &plan, const fastllm::Data &weight) {
+    if (weight.dataType != fastllm::NVFP4_BLOCK_16_E4M3_PACKED || weight.dims.size() != 2 ||
+        weight.dataDevice != fastllm::CPU || weight.cpuData == nullptr) return;
+    const int rows = weight.dims[0];
+    const size_t pitch = fastllm::GetDataBytes(weight.dataType, 1, weight.dims[1]);
+    FastllmNvfp4ScaleRuns runs;
+    for (int row = 0; row < rows; ++row) {
+        float scale;
+        std::memcpy(&scale, weight.cpuData + size_t(row) * pitch, sizeof(scale));
+        if (runs.empty() || runs.back().scale != scale) {
+            // Highly fragmented weights are cheaper with the existing vector epilogue.
+            if (runs.size() >= 16 || !std::isfinite(scale) || scale <= 0.0f) return;
+            runs.push_back({row + 1, scale});
+        } else {
+            runs.back().endRow = row + 1;
+        }
+    }
+    if (!runs.empty()) plan.emplace(&weight, std::move(runs));
+}
+
+FastllmCudaNvfp4Scope::FastllmCudaNvfp4Scope(const FastllmNvfp4PrefillPlan &plan, bool batched,
+        int promptRows, FastllmCompactMarlinCache *marlin)
+    : FastllmCudaNvfp4Scope(plan, batched, promptRows, marlin, 0) {}
+
+FastllmCudaNvfp4Scope::FastllmCudaNvfp4Scope(const FastllmNvfp4PrefillPlan &plan, bool batched,
+        int promptRows, FastllmCompactMarlinCache *marlin, int verifyRows)
+    : previous(nvfp4Scope), plan(plan), batched(batched), verifyRows(verifyRows == 2 || verifyRows == 3 ? verifyRows : 0),
+      promptRows(promptRows), marlin(marlin) {
+    nvfp4Scope = this;
+}
+
+FastllmCudaNvfp4Scope::~FastllmCudaNvfp4Scope() {
+    nvfp4Scope = previous;
+}
+
+bool FastllmCudaNvfp4Scope::IsBatched() {
+    return nvfp4Scope && nvfp4Scope->batched;
+}
+
 bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     FastllmCudaFP8E4M3Block128EnsureBFloat16BiasOnDevice(weight, bias, k);
 
@@ -4845,6 +5274,43 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
     const bool planar = weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_PLANAR;
     const bool compactScales = weight.dataType == fastllm::DataType::NVFP4_BLOCK_16_E4M3_PACKED;
     const size_t packedBytesPerRow = fastllm::GetDataBytes(weight.dataType, 1, m);
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    if (compactScales && nvfp4Scope && nvfp4Scope->marlin && !cudaBiasData &&
+        FastllmCudaCompactMarlinLinear(*nvfp4Scope->marlin, nvfp4Scope->plan, weight, cudaInput, cudaOutput, n, k, m)) {
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
+#endif
+    if (compactScales && nvfp4Scope && nvfp4Scope->batched && !nvfp4Scope->promptRows && (n == 2 || n >= 4) && m % 16 == 0) {
+        // Share the packed weights while retaining the one-token reduction tree.
+        int row = 0;
+        const bool tileChannels = k >= 4096 && k % 8 == 0 && FastllmCudaRuntimeArch() == 120;
+        const int threads = FastllmCudaNVFP4Block16ThreadsPerRow(m);
+        auto launch = [&](auto size) {
+            constexpr int rows = decltype(size)::value;
+            auto *x = cudaInput + size_t(row) * m;
+            auto *y = cudaOutput + size_t(row) * k;
+            auto *w = static_cast<uint8_t*>(weight.cudaData);
+            if (rows > 1 && tileChannels && m == 4096) {
+                constexpr int channels = rows == 2 ? 4 : 8;
+                FastllmCompactBatchGemv<4096, rows, channels><<<k / channels, 128>>>(x, w, y, cudaBiasData, k);
+            } else if (rows > 1 && tileChannels && m == 12288) {
+                constexpr int channels = rows == 2 ? 2 : 8;
+                FastllmCompactBatchGemv<12288, rows, channels><<<k / channels, 128>>>(x, w, y, cudaBiasData, k);
+            } else {
+                LaunchCompactVerify<rows>(x, w, y, cudaBiasData, m, k, int(packedBytesPerRow), threads);
+            }
+            row += rows;
+        };
+        while (row + 8 <= n) launch(std::integral_constant<int, 8>{});
+        if (row + 4 <= n) launch(std::integral_constant<int, 4>{});
+        if (row + 2 <= n) launch(std::integral_constant<int, 2>{});
+        if (row < n) launch(std::integral_constant<int, 1>{});
+        FastllmCudaFinishInput(input, cudaInput);
+        FastllmCudaFinishOutput(output, cudaOutput);
+        return true;
+    }
     if (FastllmCudaNVFP4UseGemv(n)) {
         LaunchFastllmGemmNVFP4Block16Layout(cudaInput, (uint8_t*)weight.cudaData, cudaOutput,
             cudaBiasData, n, m, k, (int)packedBytesPerRow, planar, compactScales);
@@ -4856,34 +5322,107 @@ bool FastllmCudaBFloat16MatMulNVFP4Block16(const fastllm::Data &input, fastllm::
     auto fastllmCublasHandle = getFastllmCublasHandle();
     size_t wsBytes = 0;
     bool ownScratch = false;
-    __nv_bfloat16 *cudaBF16Weight = (__nv_bfloat16 *) FastllmBorrowDequantScratch((size_t)k * m * sizeof(__nv_bfloat16), &wsBytes, &ownScratch);
-    size_t bytesPerRow = (size_t)m * sizeof(__nv_bfloat16);
-    int maxRowsPerChunk = (int)std::min<size_t>((size_t)k, std::max<size_t>(1, wsBytes / bytesPerRow));
+    // These SM120 panels fit the expanded weights in L2 for the following GEMM.
+    // Keep the full width elsewhere, including tails where cuBLAS selects a
+    // different split-K reduction.
+    const int promptRows = compactScales && nvfp4Scope && nvfp4Scope->promptRows > 0 && n % nvfp4Scope->promptRows == 0
+        ? nvfp4Scope->promptRows : n;
+    int panelRows = k;
+#ifndef USE_ROCM
+    if (compactScales && promptRows >= 128 && promptRows <= 512 && promptRows % 64 == 0 && FastllmCudaRuntimeArch() == 120) {
+        if (m == 4096 && (k == 12288 || k == 24576)) {
+            panelRows = promptRows >= 256 ? 4096 : (k == 12288 ? 6144 : 8192);
+        } else if (promptRows == 512 && m == 4096 && k == 10240) {
+            panelRows = 4096;
+        } else if (promptRows == 512 && m == 12288 && k == 4096) {
+            panelRows = 2048;
+        }
+    }
+#endif
+    const bool lateScale = compactScales && nvfp4Scope != nullptr;
+    const FastllmNvfp4ScaleRuns *runs = nullptr;
+    if (lateScale) {
+        auto it = nvfp4Scope->plan.find(&weight);
+        if (it != nvfp4Scope->plan.end() && it->second.back().endRow == k) {
+            if (auto handle = getFastllmCublasFp32ReductionHandle()) {
+                fastllmCublasHandle = handle;
+                runs = &it->second;
+            }
+        }
+    }
+    const bool separateScale = lateScale && !runs;
+    const size_t bytesPerRow = (size_t)m * sizeof(__nv_bfloat16);
+    // Bound the additional FP32 output tile for long prompts.
+    if (separateScale) {
+        const size_t maxColumns = std::max<size_t>(1, (32u << 20) / (sizeof(float) * size_t(n)));
+        if (maxColumns < size_t(panelRows)) {
+            panelRows = maxColumns < 64 ? int(maxColumns) : int(maxColumns / 64) * 64;
+        }
+    }
+    const size_t weightBytes = (size_t(panelRows) * bytesPerRow + 255) & ~size_t(255);
+    const size_t sumElements = separateScale ? size_t(panelRows) * n : 0;
+    const size_t scratchBytes = weightBytes + (sumElements + (separateScale ? panelRows : 0)) * sizeof(float);
+    __nv_bfloat16 *cudaBF16Weight = (__nv_bfloat16 *) FastllmBorrowDequantScratch(
+        scratchBytes, &wsBytes, &ownScratch);
+    if (cudaBF16Weight == nullptr || wsBytes < scratchBytes) {
+        throw std::runtime_error("Insufficient NVFP4 prefill workspace.");
+    }
+    float *sums = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(cudaBF16Weight) + weightBytes);
+    float *tensorScales = separateScale ? sums + sumElements : nullptr;
 
     float h_alpha = 1.0f, h_beta = 0.0f;
     cudaDataType_t AType = CUDA_R_16BF, BType = CUDA_R_16BF, CType = CUDA_R_16BF, ComputeType = CUDA_R_32F;
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
     int dequantThreads = std::min(256, m);
 
-    for (int kOff = 0; kOff < k; kOff += maxRowsPerChunk) {
-        int kc = std::min(maxRowsPerChunk, k - kOff);
-        FastllmCudaNVFP4Block162BFloat16Kernel <<< kc, dequantThreads >>>(
-            (uint8_t*)weight.cudaData,
-            cudaBF16Weight, m, packedBytesPerRow, kOff, planar, compactScales);
-
-        status = cublasGemmEx(fastllmCublasHandle,
-                              CUBLAS_OP_T, CUBLAS_OP_N,
-                              kc, n, m,
-                              &h_alpha, cudaBF16Weight, AType,
-                              m, cudaInput, BType,
-                              m, &h_beta,
-                              cudaOutput + kOff, CType,
-                              k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            printf("Error: cublas error (BFloat16MatMulNVFP4Block16).\n");
-            throw("cublas error");
-            exit(0);
+    size_t runIndex = 0;
+    for (int kOff = 0; kOff < k;) {
+        int kc = std::min(panelRows, k - kOff);
+        if (runs) {
+            const auto &run = (*runs)[runIndex];
+            kc = std::min(kc, run.endRow - kOff);
+            h_alpha = run.scale;
+            if (kOff + kc == run.endRow) ++runIndex;
         }
+#ifndef USE_ROCM
+        // Four consecutive nine-byte blocks keep row headers and vector reads aligned.
+        if (compactScales && m % 64 == 0) {
+            if (lateScale) {
+                FastllmCompactPrefillUnpack<false><<<kc, 256>>>((const uint8_t *)weight.cudaData,
+                    cudaBF16Weight, m, packedBytesPerRow, kOff, tensorScales);
+            } else {
+                FastllmCompactPrefillUnpack<true><<<kc, 256>>>((const uint8_t *)weight.cudaData,
+                    cudaBF16Weight, m, packedBytesPerRow, kOff, nullptr);
+            }
+        } else
+#endif
+        {
+            FastllmCudaNVFP4Block162BFloat16Kernel <<< kc, dequantThreads >>>(
+                (uint8_t*)weight.cudaData,
+                cudaBF16Weight, m, packedBytesPerRow, kOff, planar, compactScales, lateScale, tensorScales);
+        }
+
+        void *panelOutput = separateScale ? static_cast<void *>(sums) : static_cast<void *>(cudaOutput + kOff);
+        for (int row = 0; row < n; row += promptRows) {
+            void *rowOutput = separateScale ? static_cast<void *>(static_cast<float *>(panelOutput) + size_t(row) * kc)
+                                            : static_cast<void *>(static_cast<__nv_bfloat16 *>(panelOutput) + size_t(row) * k);
+            status = cublasGemmEx(fastllmCublasHandle,
+                                  CUBLAS_OP_T, CUBLAS_OP_N,
+                                  kc, promptRows, m,
+                                  &h_alpha, cudaBF16Weight, AType,
+                                  m, cudaInput + size_t(row) * m, BType,
+                                  m, &h_beta,
+                                  rowOutput, separateScale ? CUDA_R_32F : CType,
+                                  separateScale ? kc : k, ComputeType, static_cast<cublasGemmAlgo_t>(CUBLAS_GEMM_DEFAULT));
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                throw std::runtime_error("cuBLAS NVFP4 BF16 prefill GEMM failed.");
+            }
+        }
+        if (separateScale) {
+            dim3 grid((kc + 255) / 256, std::min(n, 65535));
+            FastllmCompactPrefillScaleOutput<<<grid, 256>>>(sums, tensorScales, cudaOutput + kOff, n, kc, k);
+        }
+        kOff += kc;
     }
 
     if (cudaBiasData != nullptr) {

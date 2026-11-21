@@ -690,7 +690,11 @@ bool NaiveN05FlashModel::CommitBoundVerifyCaches(
         const auto &nodes = graph->ranks[rank]->storage->commitGraphs;
         if (nodes.lower_bound(group.sequenceIndices.size()) == nodes.end()) return false;
     }
-    dp.runtime.Run([&](int rank, int) {
+    // The rejection sampler synchronizes each local fused write before publishing
+    // its accepted counts. Only dispatch a separate commit when a payload remains.
+    const bool payloadComplete = written && written->size() == caches.size() &&
+        std::all_of(written->begin(), written->end(), [](char done) { return done != 0; });
+    if (!payloadComplete) dp.runtime.Run([&](int rank, int) {
         const auto &group = dp.servingGroups[dp.runtime.Layout().AttentionOwner(rank)];
         auto &storage = *graph->ranks[rank]->storage;
         if (written && std::all_of(group.sequenceIndices.begin(), group.sequenceIndices.end(), [&](int row) {

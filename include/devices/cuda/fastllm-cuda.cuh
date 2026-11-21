@@ -534,6 +534,12 @@ bool FastllmCudaBatchCopy2DAsyncCurrentThread(
     void *const *dsts, const void *const *srcs, const size_t *dstPitch,
     const size_t *srcPitch, const size_t *widths, const size_t *heights, int count);
 
+// Gather vocabulary shards on the destination device, widening BF16 bits directly into FP32.
+struct FastllmCudaLogitShard { const uint16_t *src; int offset, columns; };
+struct FastllmCudaLogitRows { float *dst; int first, rows; };
+bool FastllmCudaGatherBf16Logits(const FastllmCudaLogitShard *shards, int shardCount,
+                                const FastllmCudaLogitRows *requests, int count, int vocab);
+
 // Packed BF16 starts at the beginning of each disjoint FP32 destination slice.
 struct FastllmCudaPackedBf16Slice { float *base; int columns, rows; };
 bool FastllmCudaExpandPackedBf16Slices(const FastllmCudaPackedBf16Slice *slices,
@@ -1031,6 +1037,13 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     fastllm::Data &state, fastllm::Data &output,
     int keyHeads, int valueHeads, int keyDim, int valueDim,
     float recurrentEps, fastllm::Data *stateOutput = nullptr);
+bool FastllmCudaGatedDeltaRuleSequence(
+    const fastllm::Data &qkv, const fastllm::Data &alpha,
+    const fastllm::Data &beta,
+    const fastllm::Data &aLog, const fastllm::Data &dtBias,
+    fastllm::Data &state, fastllm::Data &output,
+    int keyHeads, int valueHeads, int keyDim, int valueDim,
+    float recurrentEps, fastllm::Data *stateOutput, bool betaIsProbability);
 // Single-token FP16 decode with the exact output norm/gate in the same kernel.
 // tiledOutput writes the local GGUF [value-within-group, key-head] layout.
 // Unsupported inputs return false before modifying recurrent state.
@@ -2138,6 +2151,7 @@ struct FastllmCudaMoeCacheLayer {
     // execution supplies its own ownership and does not use this restriction.
     int cacheDevice = -1;
     bool qwen38FlashNext = false; // Explicit caller profile; Standard arithmetic.
+    bool standardFp8Graph = false; // Opt in to FP32 routed FP8 decode and verification.
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.
@@ -2234,6 +2248,7 @@ struct FastllmCudaMoeGGUFCacheView {
     // private. Null retains this view's ordinary workspace/input preparation.
     const void *preparedQ8Input = nullptr;
     bool exactSubwarp = false; // Qwen verification; other callers retain warp kernels.
+    float swigluLimit = 0.f;
 };
 bool FastllmCudaMoeGGUFCacheNeedsPreparation(const fastllm::Data &input,
     const FastllmCudaMoeGGUFCacheView &view, int topk);

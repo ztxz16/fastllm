@@ -20,6 +20,23 @@ from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
 
 
 class SpeculativeDraftCliAliasesTest(unittest.TestCase):
+    def test_dfly2_width_is_scoped_to_the_requested_model(self):
+        with tempfile.TemporaryDirectory() as target, tempfile.TemporaryDirectory() as other:
+            self.write_draft_config(target, {"model_type": "hy_v4_flash", "architectures": ["HYV4FlashForCausalLM"]})
+            self.write_draft_config(other, {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]})
+            api = types.ModuleType("ftllm")
+            api.llm = MagicMock()
+            def load(directory, *options):
+                args = make_normal_parser("test").parse_args([directory, "--device", "cuda", *options])
+                make_normal_llm_model(args)
+                return api.llm.model.call_args.kwargs
+            with patch.dict(sys.modules, {"ftllm": api}), patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                self.assertEqual(load(target, "--speculative_algorithm", "dfly2", "--draft_tokens", "5")["dfly2_block_size"], 6)
+                self.assertNotIn("dfly2_block_size", load(target))
+                self.assertNotIn("dfly2_block_size", load(other))
+                with self.assertRaisesRegex(ValueError, "requires a HY4-Flash"):
+                    load(other, "--speculative_algorithm", "dfly2")
+
     def test_dspark_parallel_aliases_and_limits(self):
         parser = make_normal_parser("test")
         for mode in ("tp", "dp"):

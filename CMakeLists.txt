@@ -227,7 +227,7 @@ set(FASTLLM_CXX_SOURCES src/exl3.cpp src/fastllm.cpp src/pd.cpp src/models/naive
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/sensenova_loop.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp src/models/hy4_flash_hybrid.cpp src/models/hy4_flash_kv.cpp src/models/hy4_flash_gguf.cpp src/models/qwen3_next.cpp
         src/models/qwen4_exp.cpp src/models/qwen4_exp_moe.cpp src/models/qwen4_exp_gpu.cpp
         src/models/qwen4_exp_graph.cpp src/models/qwen4_exp_gpu_graph.cpp src/models/qwen4_exp_hybrid_graph.cpp
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
@@ -471,6 +471,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
+        src/devices/cuda/linear/fastllm-compact-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-disk-mxfp4-marlin.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
@@ -491,6 +492,7 @@ if (USE_CUDA)
         src/devices/cuda/models/dots3-note-kernels.cu
         src/devices/cuda/models/naive-n05-kernels.cu
         src/devices/cuda/models/naive-n05-experts.cu
+        src/devices/cuda/models/sensenova-loop.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
         src/devices/cuda/models/deepseekv41-commit.cu
@@ -504,6 +506,16 @@ if (USE_CUDA)
         src/devices/cuda/models/clover-kernels.cu
         src/devices/cuda/models/clover-attention.cu
         src/devices/cuda/models/qwen4-kernels.cu)
+
+    # The published E4M3 checkpoint uses cuda_fp8.h from CUDA 11.8.
+    if (NOT USE_ROCM AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.8)
+        set(HY4_CUDA_SOURCES src/devices/cuda/models/hy4-flash.cu
+            src/devices/cuda/models/hy4-flash-gpu-graph.cu src/devices/cuda/models/hy4-flash-hybrid-graph.cu)
+        list(APPEND FASTLLM_CUDA_SOURCES ${HY4_CUDA_SOURCES})
+        set_property(SOURCE src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp
+            src/models/hy4_flash_hybrid.cpp src/models/hy4_flash_kv.cpp ${HY4_CUDA_SOURCES}
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_HY4_CUDA)
+    endif()
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
 
@@ -1058,6 +1070,10 @@ if (UNIT_TEST)
     add_executable(parallel_topology_test test/basic/test_parallel_topology.cpp)
     target_include_directories(parallel_topology_test PRIVATE include)
     add_test(NAME parallel_topology COMMAND parallel_topology_test)
+    add_executable(hy4_gguf_wire_test test/basic/test_hy4_gguf_wire.cpp)
+    target_link_libraries(hy4_gguf_wire_test PRIVATE fastllm)
+    add_test(NAME hy4_gguf_wire COMMAND hy4_gguf_wire_test)
+    set_tests_properties(hy4_gguf_wire PROPERTIES PASS_REGULAR_EXPRESSION "PASS: HY4 scalar E4M3")
     add_executable(weight_source_test test/basic/test_weight_source.cpp)
     target_link_libraries(weight_source_test PRIVATE fastllm)
     add_test(NAME weight_source COMMAND weight_source_test)
@@ -1324,6 +1340,10 @@ if (UNIT_TEST)
         set_target_properties(hybrid_moe_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
         fastllm_add_checked_test(hybrid_moe hybrid_moe_test "ALL_PASS" 60)
     endif()
+
+    add_executable(hy4_flash_placement_test test/basic/test_hy4_flash_placement.cpp)
+    target_link_libraries(hy4_flash_placement_test PRIVATE fastllm)
+    fastllm_add_checked_test(hy4_flash_placement hy4_flash_placement_test "ALL_PASS" 60)
 
     add_executable(moe_decode_policy_test test/basic/test_moe_decode_policy.cpp)
     target_include_directories(moe_decode_policy_test PRIVATE include)
@@ -2271,6 +2291,22 @@ if (UNIT_TEST)
         add_test(NAME cuda_fp8_marlin_prepare COMMAND cuda_fp8_marlin_prepare_test)
         set_tests_properties(cuda_fp8_marlin_prepare PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
                              PASS_REGULAR_EXPRESSION "FP8 explicit Marlin preparation: PASS")
+        if (HY4_CUDA_SOURCES)
+            add_executable(hy4_dfly_sampling_test test/basic/test_hy4_dfly_sampling.cpp)
+            target_link_libraries(hy4_dfly_sampling_test PRIVATE fastllm)
+            target_include_directories(hy4_dfly_sampling_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_compile_definitions(hy4_dfly_sampling_test PRIVATE FASTLLM_ENABLE_HY4_CUDA)
+            add_test(NAME hy4_dfly_sampling COMMAND hy4_dfly_sampling_test)
+            set_tests_properties(hy4_dfly_sampling PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+            add_executable(hy4_hybrid_pp_graph_test test/basic/test_hy4_hybrid_pp_graph.cpp)
+            target_link_libraries(hy4_hybrid_pp_graph_test PRIVATE fastllm)
+            target_include_directories(hy4_hybrid_pp_graph_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_compile_definitions(hy4_hybrid_pp_graph_test PRIVATE FASTLLM_ENABLE_HY4_CUDA)
+            add_test(NAME hy4_hybrid_pp_graph COMMAND hy4_hybrid_pp_graph_test)
+            set_tests_properties(hy4_hybrid_pp_graph PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                PASS_REGULAR_EXPRESSION "PASS: HY4 two-stage graph replay" TIMEOUT 60)
+        endif()
+
         add_executable(cuda_mtp_rejection_test test/basic/test_cuda_mtp_rejection.cpp)
         target_link_libraries(cuda_mtp_rejection_test PRIVATE fastllm)
         target_include_directories(cuda_mtp_rejection_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2830,8 +2866,11 @@ if (UNIT_TEST)
                 endforeach()
             endforeach()
             add_test(NAME naive_n05_pd_draft_dp COMMAND naive_n05_verify_graph_test 2 pd_draft fp8 replicated tcp 2)
+            add_test(NAME naive_n05_pd_state_dp_fp4 COMMAND naive_n05_verify_graph_test 2 pd_state fp4 replicated tcp 2)
+            add_test(NAME naive_n05_pd_draft_dp_fp4 COMMAND naive_n05_verify_graph_test 2 pd_draft fp4 replicated tcp 2)
             add_test(NAME naive_n05_pd_draft_tp_to_dp COMMAND naive_n05_verify_graph_test 4 pd_draft_tp_to_dp 2)
-            set_tests_properties(naive_n05_pd_draft_dp naive_n05_pd_draft_tp_to_dp PROPERTIES
+            set_tests_properties(naive_n05_pd_draft_dp naive_n05_pd_state_dp_fp4 naive_n05_pd_draft_dp_fp4
+                naive_n05_pd_draft_tp_to_dp PROPERTIES
                 LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
             foreach(NAIVE_PD_DRAFT_TP 1 2 4 mlp:4)
@@ -3482,6 +3521,9 @@ if (UNIT_TEST)
             target_link_libraries(cuda_standard_moe_mailbox_test PRIVATE fastllm)
             target_include_directories(cuda_standard_moe_mailbox_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(cuda_standard_moe_mailbox cuda_standard_moe_mailbox_test "ALL_PASS" 240)
+            fastllm_add_checked_test(cuda_standard_moe_numa_block128 cuda_standard_moe_mailbox_test "ALL_PASS" 120 --numa-block128)
+            set_tests_properties(cuda_standard_moe_numa_block128 PROPERTIES LABELS "cuda;moe;numa"
+                ENVIRONMENT "FT_THREADS=4;FASTLLM_DSV41_MOE_CACHE_MODE=gpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
             set_tests_properties(cuda_standard_moe_mailbox PROPERTIES LABELS cuda
                 ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
             fastllm_add_checked_test(cuda_standard_moe_pageable cuda_standard_moe_mailbox_test "ALL_PASS" 360)

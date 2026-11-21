@@ -6769,6 +6769,67 @@ bool FastllmCudaBatchCopy2DAsyncCurrentThread(
 }
 
 namespace {
+struct LogitGatherBatch {
+    FastllmCudaLogitShard shards[32];
+    FastllmCudaLogitRows requests[128];
+};
+constexpr int logitTile = 2048;
+__global__ void GatherBf16Logits(LogitGatherBatch batch, int vocab) {
+    const auto shard = batch.shards[blockIdx.z];
+    const auto request = batch.requests[blockIdx.y];
+    const int first = blockIdx.x * logitTile;
+    if (first >= shard.columns) return;
+    const auto *src = shard.src + size_t(request.first) * shard.columns + first;
+    auto *dst = reinterpret_cast<uint32_t *>(request.dst) + shard.offset + first;
+    const int n = min(logitTile, shard.columns - first);
+    const bool aligned = ((uintptr_t(src) | uintptr_t(dst)) & 15) == 0 &&
+                         shard.columns % 8 == 0 && vocab % 4 == 0;
+    for (int row = 0; row < request.rows; ++row) {
+        if (aligned) {
+            const int i = threadIdx.x * 8;
+            if (i < n) {
+                const uint4 w = *reinterpret_cast<const uint4 *>(src + i);
+                auto *out = reinterpret_cast<uint4 *>(dst + i);
+                out[0] = make_uint4(w.x << 16, w.x & 0xffff0000u, w.y << 16, w.y & 0xffff0000u);
+                out[1] = make_uint4(w.z << 16, w.z & 0xffff0000u, w.w << 16, w.w & 0xffff0000u);
+            }
+        } else {
+            for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = uint32_t(src[i]) << 16;
+        }
+        src += shard.columns;
+        dst += vocab;
+    }
+}
+}
+
+bool FastllmCudaGatherBf16Logits(const FastllmCudaLogitShard *shards, int shardCount,
+                                const FastllmCudaLogitRows *requests, int count, int vocab) {
+    if (count < 0 || shardCount < 1 || !shards || (count && !requests) || vocab <= 0) return false;
+    for (int s = 0; s < shardCount; ++s) {
+        const auto &v = shards[s];
+        if (!v.src || v.offset < 0 || v.columns <= 0 || v.offset > vocab - v.columns) return false;
+    }
+    for (int i = 0; i < count; ++i)
+        if (!requests[i].dst || requests[i].first < 0 || requests[i].rows < 0) return false;
+    for (int s = 0; s < shardCount;) {
+        LogitGatherBatch batch{};
+        const int ns = std::min(shardCount - s, int(std::size(batch.shards)));
+        std::copy_n(shards + s, ns, batch.shards);
+        int width = 0;
+        for (int i = 0; i < ns; ++i) width = std::max(width, batch.shards[i].columns);
+        for (int begin = 0; begin < count;) {
+            const int n = std::min(count - begin, int(std::size(batch.requests)));
+            std::copy_n(requests + begin, n, batch.requests);
+            GatherBf16Logits<<<dim3(1 + (width - 1) / logitTile, n, ns), 256, 0, cudaStreamPerThread>>>(batch, vocab);
+            if (cudaGetLastError() != cudaSuccess) return false;
+            begin += n;
+        }
+        s += ns;
+    }
+    return true;
+}
+
+namespace {
 constexpr int Bf16SlicesPerLaunch = 128;
 struct PackedBf16Slices { FastllmCudaPackedBf16Slice items[Bf16SlicesPerLaunch]; };
 
@@ -16316,6 +16377,59 @@ __global__ void FastllmBF16BiasTemperatureSoftmaxKernel(FastllmBF16BiasSoftmaxIn
     FastllmTemperatureSoftmaxBody<1024>(input, probs, temperatures, vocabSize);
 }
 
+// Parallelize wide proposal rows without changing the 1024-lane sum or the
+// Philox draw. The final pass writes directly into the retained rejection chain.
+constexpr int kProposalTile = 4096;
+__global__ void FastllmProposalTileMax(FastllmBF16BiasSoftmaxInput input, const float *temperatures,
+        float *maxima, int vocab) {
+    const int row = blockIdx.y, first = blockIdx.x * kProposalTile;
+    const float invTemp = 1.f / temperatures[row];
+    float largest = -1.e30f;
+    for (int i = first + threadIdx.x; i < min(vocab, first + kProposalTile); i += blockDim.x)
+        largest = fmaxf(largest, input(row, i, vocab) * invTemp);
+    using Reduce = cub::BlockReduce<float, 256>;
+    __shared__ typename Reduce::TempStorage storage;
+    const float maximum = Reduce(storage).Reduce(largest, MaxReduceOp{});
+    if (threadIdx.x == 0) maxima[size_t(row) * gridDim.x + blockIdx.x] = maximum;
+}
+__global__ void FastllmProposalLaneSums(FastllmBF16BiasSoftmaxInput input, const float *temperatures,
+        const float *maxima, float *sums, float *probs, int vocab, int tiles, int stride) {
+    const int row = blockIdx.y;
+    const int lane = blockIdx.x * 128 + threadIdx.x;
+    float maximum = -1.e30f;
+    for (int i = threadIdx.x; i < tiles; i += 128)
+        maximum = fmaxf(maximum, maxima[size_t(row) * tiles + i]);
+    using Reduce = cub::BlockReduce<float, 128>;
+    __shared__ typename Reduce::TempStorage storage;
+    __shared__ float rowMax;
+    maximum = Reduce(storage).Reduce(maximum, MaxReduceOp{});
+    if (threadIdx.x == 0) rowMax = maximum;
+    __syncthreads();
+    const float invTemp = 1.f / temperatures[row];
+    float sum = 0.f;
+    for (int i = lane; i < vocab; i += 1024) {
+        const float value = expf(input(row, i, vocab) * invTemp - rowMax);
+        sum += value;
+        probs[size_t(row) * stride + i] = value;
+    }
+    sums[size_t(row) * 1024 + lane] = sum;
+}
+__global__ void FastllmNormalizeProposal(const float *sums, float *probs, int *sampleRows,
+        int vocab, int stride) {
+    const int row = blockIdx.y, first = blockIdx.x * kProposalTile;
+    using Reduce = cub::BlockReduce<float, 1024>;
+    __shared__ typename Reduce::TempStorage storage;
+    __shared__ float inverse;
+    const float sum = Reduce(storage).Sum(sums[size_t(row) * 1024 + threadIdx.x]);
+    if (threadIdx.x == 0) {
+        inverse = 1.f / sum;
+        if (!blockIdx.x) sampleRows[row] = row * (stride / vocab);
+    }
+    __syncthreads();
+    for (int i = first + threadIdx.x; i < min(vocab, first + kProposalTile); i += 1024)
+        probs[size_t(row) * stride + i] *= inverse;
+}
+
 // Small decode batches cannot fill the GPU with one CTA per vocabulary row.
 // Keep compact per-tile statistics in the second probability scratch buffer;
 // the following normalization pass reuses those statistics from cache.
@@ -18449,19 +18563,20 @@ bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *pro
                                       float *deviceToken, uint64_t offset) {
     return FastllmCudaMtpDraftSamplerRunBatchStrided(sampler, logits, proposalProbs, deviceToken, offset, 0);
 }
-static bool FastllmMtpRetainAndSample(FastllmMtpSamplingWorkspace &ws, float *proposalProbs,
-        float *deviceToken, uint64_t offset, int probabilityStride) {
-    cudaStream_t stream = cudaStreamPerThread;
-    cudaError_t result = cudaMemcpy2DAsync(proposalProbs, size_t(probabilityStride) * sizeof(float),
-        ws.a, size_t(ws.vocab) * sizeof(float), size_t(ws.vocab) * sizeof(float),
-        ws.rows, cudaMemcpyDeviceToDevice, stream);
-    if (result == cudaSuccess)
-        result = flashinfer::sampling::SamplingFromProb<float, int, 1>(
-            ws.a, ws.output, ws.valid, nullptr, ws.rows, ws.vocab, true,
-            ws.seed, 0, nullptr, offset, stream);
-    if (result != cudaSuccess) return false;
+static bool FastllmMtpSampleProposal(FastllmMtpSamplingWorkspace &ws, float *probs,
+        int *sampleRows, float *deviceToken, uint64_t offset) {
+    const cudaStream_t stream = cudaStreamPerThread;
+    if (flashinfer::sampling::SamplingFromProb<float, int, 1>(probs, ws.output, ws.valid,
+            sampleRows, ws.rows, ws.vocab, true, ws.seed, 0, nullptr, offset, stream) != cudaSuccess) return false;
     FastllmMtpSampleIdToFloat<<<(ws.rows + 127) / 128, 128, 0, stream>>>(ws.output, deviceToken, ws.rows);
     return cudaGetLastError() == cudaSuccess;
+}
+static bool FastllmMtpRetainAndSample(FastllmMtpSamplingWorkspace &ws, float *proposalProbs,
+        float *deviceToken, uint64_t offset, int probabilityStride) {
+    if (cudaMemcpy2DAsync(proposalProbs, size_t(probabilityStride) * sizeof(float),
+            ws.a, size_t(ws.vocab) * sizeof(float), size_t(ws.vocab) * sizeof(float),
+            ws.rows, cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess) return false;
+    return FastllmMtpSampleProposal(ws, ws.a, nullptr, deviceToken, offset);
 }
 bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits, float *proposalProbs,
                                       float *deviceToken, uint64_t offset, int probabilityStride) {
@@ -18478,14 +18593,28 @@ bool FastllmCudaMtpDraftSamplerRunBF16BiasBatch(void *sampler, const void *base,
         steps <= 0 || step < 0 || step >= steps) return false;
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
     // Keep the existing small-batch/tiled and filtered-distribution fallbacks.
-    // This path fuses only the same one-CTA temperature-softmax computation.
     if (ws.rows <= 32 || ws.needTopK || ws.needTopP) return false;
     if (!probabilityStride) probabilityStride = ws.vocab;
     if (probabilityStride < ws.vocab) return false;
+    const FastllmBF16BiasSoftmaxInput input{
+        (const __nv_bfloat16 *)base, (const __nv_bfloat16 *)bias, mask, step, steps};
+    if (ws.vocab >= 65536 && ws.rows <= 65535 && probabilityStride % ws.vocab == 0 &&
+        size_t(ws.rows - 1) * probabilityStride + ws.vocab <= UINT32_MAX) {
+        const int tiles = (ws.vocab - 1) / kProposalTile + 1;
+        float *maxima = ws.bufferB, *sums = maxima + size_t(ws.rows) * tiles;
+        int *sampleRows = reinterpret_cast<int *>(sums + size_t(ws.rows) * 1024);
+        const cudaStream_t stream = cudaStreamPerThread;
+        FastllmProposalTileMax<<<dim3(tiles, ws.rows), 256, 0, stream>>>(input, ws.temperatures, maxima, ws.vocab);
+        FastllmProposalLaneSums<<<dim3(8, ws.rows), 128, 0, stream>>>(
+            input, ws.temperatures, maxima, sums, proposalProbs, ws.vocab, tiles, probabilityStride);
+        FastllmNormalizeProposal<<<dim3(tiles, ws.rows), 1024, 0, stream>>>(
+            sums, proposalProbs, sampleRows, ws.vocab, probabilityStride);
+        return cudaGetLastError() == cudaSuccess &&
+            FastllmMtpSampleProposal(ws, proposalProbs, sampleRows, deviceToken, offset);
+    }
     ws.a = ws.bufferA;
     FastllmBF16BiasTemperatureSoftmaxKernel<<<ws.rows, 1024, 0, cudaStreamPerThread>>>(
-        {(const __nv_bfloat16 *)base, (const __nv_bfloat16 *)bias, mask, step, steps},
-        ws.a, ws.temperatures, ws.vocab);
+        input, ws.a, ws.temperatures, ws.vocab);
     if (cudaGetLastError() != cudaSuccess) return false;
     return FastllmMtpRetainAndSample(ws, proposalProbs, deviceToken, offset, probabilityStride);
 }

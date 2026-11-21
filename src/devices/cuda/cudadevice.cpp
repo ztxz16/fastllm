@@ -6067,10 +6067,10 @@ namespace fastllm {
         if (stateOutput != nullptr) {
             stateOutput->Allocate(false);
         }
-        if (!FastllmCudaQwen4GatedDeltaRuleDecode(
+        if (!FastllmCudaGatedDeltaRuleSequence(
                 qkv, alpha, beta, aLog, dtBias, state, output,
                 keyHeads, valueHeads, keyDim, valueDim, recurrentEps,
-                stateOutput)) {
+                stateOutput, intParams.count("betaIsProbability") && intParams.at("betaIsProbability"))) {
             ErrorInFastLLM(
                 "GatedDeltaRuleSequence CUDA error: kernel rejected input.\n");
         }

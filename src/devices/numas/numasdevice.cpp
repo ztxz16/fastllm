@@ -4362,6 +4362,16 @@ namespace fastllm {
                weights[2]->dims[1] == weights[3]->dims[0];
     }
 
+    // Standard GGUF projections keep FP32 activations. Apply the model's
+    // optional gate/up limits before the normal GGUF down-input quantizer.
+    static void ClampedCrossSwiglu(const float *pairs, float *out, size_t count, float limit) {
+        for (size_t i = 0; i < count; ++i) {
+            const float gate = std::min(pairs[2 * i], limit);
+            const float up = std::clamp(pairs[2 * i + 1], -limit, limit);
+            out[i] = gate / (1.f + std::exp(-gate)) * up;
+        }
+    }
+
     static void NumasMoeDecodeExpertsImpl(const float *input, float *output,
             Data **weights, const int32_t *indices, const int32_t *gpuIndices,
             int topk, int layer, const float *routeScores, float swigluLimit,
@@ -4371,6 +4381,7 @@ namespace fastllm {
         const bool scoredBfloat = routeScores != nullptr;
         // Either projection may require GGUF activation packing. A native gate
         // with a GGUF down must not use the fused native BF16 down writer.
+        const bool clampedGGUF = !scoredBfloat && swigluLimit > 0.f && weights[2]->dataType == DATA_GGUF_FORMAT;
         const bool scoredGguf = scoredBfloat &&
             (weights[2]->dataType == DataType::DATA_GGUF_FORMAT ||
              weights[3]->dataType == DataType::DATA_GGUF_FORMAT);
@@ -4512,7 +4523,7 @@ namespace fastllm {
             finishCpu();
             return;
         }
-        if (!scoredBfloat && q8Down && gateAct >= DataType::DATA_GGUF_FORMAT &&
+        if (!scoredBfloat && !clampedGGUF && q8Down && gateAct >= DataType::DATA_GGUF_FORMAT &&
                 gateAct < DataType::DATA_GGUF_FORMAT_END) {
             work.hybridDecodeQueues.resize(config->numaCnt);
             work.hybridDecodeWorkers.resize(config->threads);
@@ -4631,7 +4642,7 @@ namespace fastllm {
                                     item * columns + node * perNode), DataType::FLOAT32,
                                 work.swigluOutput.data() + item * inter,
                                 1, hidden, columns, row, row + rows, node * perNode,
-                                quantizeDownRows ? nullptr : work.downInput.data() + item * downBytes, downAct);
+                                quantizeDownRows ? nullptr : work.downInput.data() + item * downBytes, downAct, clampedGGUF);
                         } else {
                             downTasks.emplace_back(work.downInput.data() + item * downBytes, downAct,
                                 weight.numasData[node], weight.GetDataType(),
@@ -4672,7 +4683,9 @@ namespace fastllm {
             runWorkers(work.decodeWorkers, phase == 0, &active);
             // Q8_K/Q8_1 and other GGUF activation formats retain the normal
             // whole-row quantizer after all gate/up tasks have completed.
-            if (phase == 0 && quantizeDownRows)
+            if (phase == 0 && clampedGGUF)
+                ClampedCrossSwiglu(work.gateUpOutput.data(), work.swigluOutput.data(), size_t(count) * inter, swigluLimit);
+            if (phase == 0 && (quantizeDownRows || clampedGGUF))
                 RunMultiThreadConvertFromFloat32(work.downInput.data(), downAct,
                     work.swigluOutput.data(), count, inter, pool);
         }
@@ -7797,7 +7810,9 @@ namespace fastllm {
             stride = 208;
         }
         const bool useDeepSeekV4PostOps = useDeepSeekV4LargeFast || quantizedPrepareBlock;
-        const bool skipRedundantCrossSwiglu = useDeepSeekV4PostOps || fp8EagerMode || bf16ExpertMode;
+        const bool clampedGGUF = !deepSeekV4Mode && swigluLimit > 0.f && !weights[0] &&
+            weights[2] && weights[2]->dataType == DATA_GGUF_FORMAT;
+        const bool skipRedundantCrossSwiglu = useDeepSeekV4PostOps || fp8EagerMode || bf16ExpertMode || clampedGGUF;
         const bool useParallelDeepSeekV4Prepare =
             quantizedPrepareBlock || (useDeepSeekV4LargeFast &&
                              interDim % (128 * numaConfig->numaCnt) == 0);
@@ -7961,7 +7976,11 @@ namespace fastllm {
 
         // 4. swigluOutput -> downInput. DeepSeek-V4 must redo the fused
         // activation from gateUpOutput to preserve its BF16/clamp/route order.
-        if (bf16ExpertMode) {
+        if (clampedGGUF) {
+            ClampedCrossSwiglu(gateUpOutput.data(), swigluOutput.data(), size_t(totalLines) * interDim, swigluLimit);
+            RunMultiThreadConvertFromFloat32(downInput.data(), downInputDataType,
+                swigluOutput.data(), totalLines, interDim, GetHostMoePool());
+        } else if (bf16ExpertMode) {
             // Native BF16 projections round before SwiGLU, then the complete
             // activation rounds once. Do not round SiLU or apply scores here.
             const auto &silu = GetBFloat16SiluLookup();
@@ -8571,7 +8590,7 @@ namespace fastllm {
     }
 #endif
 
-    static void NumasMoeGGUFExpertsBatch(const float *input, float *output, int rows,
+    void NumasMoeGroupedExpertsBatch(const float *input, float *output, int rows,
         Data **weights, const int32_t *indices, const int32_t *gpuIndices,
         int topk, int layer, const std::function<void()> *submitGpu, double *cpuElapsedUs) {
         HostMoePlacementScope placement(weights[2]);
@@ -8584,6 +8603,7 @@ namespace fastllm {
         for (int r = 0; r < rows * topk; ++r)
             if (gpuIndices[r] < 0) routes.push_back(r);
         if (routes.empty()) {
+            if (cpuElapsedUs) *cpuElapsedUs = 0;
             if (submitGpu) (*submitGpu)();
             return;
         }
@@ -8611,6 +8631,8 @@ namespace fastllm {
         work.downOutput.resize((size_t)count * hidden);
         auto *pool = GetHostMoePool();
         auto *config = GetNumaConfig();
+        const auto interval = pool->curActivateThreadInterval;
+        const int workers = interval.first == 0 && interval.second >= config->threads ? config->threads : 0;
         // Retain the single-token activation encoding. Group only the rows
         // owned by the CPU, including repeated experts and sparse GPU masks.
         RunMultiThreadConvertFromFloat32(work.realInput.data(), gateAct, input, rows, hidden, pool);
@@ -8638,27 +8660,35 @@ namespace fastllm {
                 auto &q = *work.hybridDecodeQueues[node];
                 q.phase = phase;
                 q.units = groups.size() * (phase == 0 ? 2 * inter : hidden) / config->numaCnt / 4;
-                q.tasks = std::min(q.units, 3 * (int)config->numaToCpuDict[node].size());
+                q.tasks = workers ? std::min(q.units, 3 * (int)config->numaToCpuDict[node].size()) : 1;
                 q.next.store(0, std::memory_order_relaxed);
             }
             const double start = cpuElapsedUs ? NumasProfileNowMs() * 1000 : 0;
             if (cpuElapsedUs) cpuWorkUs += start - cpuHostStart;
-            for (auto &worker : work.hybridDecodeWorkers) worker.measureTime = cpuElapsedUs != nullptr;
-            for (int t = 0; t < config->threads; ++t) pool->PushOp(t, &work.hybridDecodeWorkers[t]);
+            for (int t = 0; t < workers; ++t) {
+                auto &worker = work.hybridDecodeWorkers[t];
+                worker.measureTime = cpuElapsedUs != nullptr;
+                pool->PushOp(t, &worker);
+            }
+            if (!workers) {
+                // A restricted pool can exclude workers that own weight shards.
+                for (int node = 0; node < config->numaCnt; ++node)
+                    work.hybridDecodeQueues[node]->RunBatch(0);
+            }
+            double completed = cpuElapsedUs && !workers ? NumasProfileNowMs() * 1000 : start;
             try {
                 // Start PCIe/GPU work while all grouped CPU gate/up jobs run.
                 if (phase == 0 && submitGpu) (*submitGpu)();
             } catch (...) {
-                for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+                for (int t = 0; t < workers; ++t) pool->Wait(t);
                 throw;
             }
-            for (int t = 0; t < config->threads; ++t) pool->Wait(t);
+            for (int t = 0; t < workers; ++t) pool->Wait(t);
             if (cpuElapsedUs) {
                 // Match single-row timing: count worker completion, excluding
                 // a slower GPU submission callback or host-side wait tail.
-                double completed = start;
-                for (const auto &worker : work.hybridDecodeWorkers)
-                    completed = std::max(completed, worker.completedUs);
+                for (int t = 0; t < workers; ++t)
+                    completed = std::max(completed, work.hybridDecodeWorkers[t].completedUs);
                 cpuWorkUs += completed - start;
                 cpuHostStart = NumasProfileNowMs() * 1000;
             }
@@ -8680,7 +8710,7 @@ namespace fastllm {
         const int hidden = weights[2]->dims[1];
         if (rows > 1 &&
             weights[2]->dataType == DATA_GGUF_FORMAT && weights[3]->dataType == DATA_GGUF_FORMAT) {
-            NumasMoeGGUFExpertsBatch(input, output, rows, weights, indices, gpuIndices,
+            NumasMoeGroupedExpertsBatch(input, output, rows, weights, indices, gpuIndices,
                                     topk, layer, submitGpu, cpuElapsedUs);
             return;
         }

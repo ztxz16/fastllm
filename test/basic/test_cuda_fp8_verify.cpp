@@ -1,6 +1,11 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
+#include "fastllm.h"
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-nvfp4-prefill.h"
+
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -61,6 +66,53 @@ void RunCase(int rows, int inputDim, int outputDim, bool withBias) {
     if (observed != expected) throw std::runtime_error("FP8 verification differs from independent rows");
     std::printf("FP8 n=%d K=%d N=%d bias=%d bitwise PASS\n", rows, inputDim, outputDim, withBias);
 }
+
+// Compare each request with the same single-request verifier, including its
+// K reduction order. The 24-row down projection has a distinct output tile.
+void RunBf16VerifyCase(int device, int inner, int columns) {
+    using namespace fastllm;
+    std::mt19937 rng(559);
+    Data weight(FP8_E4M3, {columns, inner});
+    weight.blockM = inner;
+    weight.blockK = 1;
+    weight.scales.resize(columns);
+    for (int i = 0; i < columns; ++i) weight.scales[i] = .0312f + .00013f * (i % 97);
+    weight.ToDevice(CUDA, {device}, false);
+    weight.Allocate(false);
+    std::vector<uint8_t> bytes(size_t(columns) * inner);
+    for (auto &v : bytes) {
+        const auto bits = rng();
+        v = (bits & 128u) | ((bits >> 8) % 120);
+    }
+    Check(cudaMemcpy(weight.cudaData, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+    std::vector<float> values(24 * inner);
+    for (auto &v : values) v = (int(rng() % 65537) - 32768) / 8192.f;
+    Data input(BFLOAT16, {24, inner}, values);
+    input.ToDevice(CUDA, {device}, true);
+    auto project = [&](int first, int rows, uint16_t *result) {
+        Data x, y(BFLOAT16, {rows, columns});
+        x.FakeFrom(input, size_t(first) * inner * sizeof(uint16_t));
+        x.Resize({rows, inner});
+        y.ToDevice(CUDA, {device}, false);
+        y.Allocate(false);
+        FastllmCudaBFloat16MatMulFP8E4M3(x, weight, Data(), y, rows, inner, columns);
+        FastllmCudaSyncCurrentThreadStream();
+        Check(cudaMemcpy(result, y.cudaData, size_t(rows) * columns * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    };
+    FastllmNvfp4PrefillPlan plan;
+    for (int steps : {2, 3}) {
+        std::vector<uint16_t> expected(8 * steps * columns);
+        for (int b = 0; b < 8; ++b) project(b * steps, steps, expected.data() + b * steps * columns);
+        for (int batch = 2; batch <= 8; ++batch) {
+            std::vector<uint16_t> actual(batch * steps * columns);
+            FastllmCudaNvfp4Scope scope(plan, true, 0, nullptr, steps);
+            project(0, batch * steps, actual.data());
+            if (!std::equal(actual.begin(), actual.end(), expected.begin()))
+                throw std::runtime_error("Batched BF16/FP8 verifier differs from single-request verification");
+        }
+    }
+}
+
 }
 
 int main() {
@@ -70,6 +122,12 @@ int main() {
         for (int device = 0; device < devices; ++device) {
             Check(cudaSetDevice(device));
             std::printf("device=%d\n", device);
+            cudaDeviceProp prop{};
+            Check(cudaGetDeviceProperties(&prop, device));
+            if (prop.major == 12 && prop.minor == 0) {
+                RunBf16VerifyCase(device, 4096, 24576);
+                RunBf16VerifyCase(device, 12288, 4096);
+            }
             for (auto shape : std::vector<std::pair<int, int>>{
                     {128, 1}, {128, 3}, {128, 127}, {128, 128}, {128, 129}, {384, 255},
                     {5120, 17408}, {8704, 5120}, {5120, 8192}, {3072, 5120}, {5120, 7168}}) {
