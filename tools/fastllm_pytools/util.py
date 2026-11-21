@@ -1158,7 +1158,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "启用 DSpark 并指定每轮候选数；外置草稿配合 --draft 使用，保留 checkpoint 的训练 block size")
     draft_parallel = parser.add_mutually_exclusive_group()
     draft_parallel.add_argument("--dspark_tp_size", "--dspark-tp-size", type = _positive_int, default = None,
-                        help = "Naive/MiMo 外置 DSpark 草稿 TP 数，1 为单卡；默认跟随主模型 CUDA TP，布局不支持时回退单卡；兼容 FASTLLM_DSPARK_TP")
+                        help = "Naive/MiMo 外置 DSpark 草稿 TP 数，1 为单卡；默认使用主模型 CUDA TP 的卡数，dense 草稿用 TP，MoE 草稿用 DP，布局不支持时回退单卡；兼容 FASTLLM_DSPARK_TP")
     draft_parallel.add_argument("--dspark_dp_size", "--dspark-dp-size", type = _positive_int, default = None,
                         help = "Naive/MiMo 外置 DSpark 草稿 DP 副本数；按完整请求分摊计算，增加 BF16 权重副本，KV 按请求分配；与草稿 TP 参数互斥")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
@@ -1236,11 +1236,12 @@ def expand_cudapp_device(device_str):
     return str({f'cuda:{i}': w for i, w in enumerate(weights)})
 
 
-def _configure_embedded_dspark(args):
-    threshold = float(args.speculative_dspark_confidence_threshold)
+def _configure_dspark(args, tokens):
+    threshold = float(getattr(args, "speculative_dspark_confidence_threshold", 0.5))
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("--speculative_dspark_confidence_threshold must be in [0, 1]")
-    os.environ["FASTLLM_DSPARK_TOKENS"] = str(args.dspark)
+    if tokens > 0:
+        os.environ["FASTLLM_DSPARK_TOKENS"] = str(tokens)
     os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(threshold)
     args.speculative_algorithm = "dspark"
 
@@ -1536,7 +1537,7 @@ def make_normal_llm_model(args, startup_progress = None):
         dspark_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or draft_config["dspark_block_size"]
         args.dspark = dspark_tokens
         args.speculative_draft_model_path = speculative_draft_path
-        _configure_embedded_dspark(args)
+        _configure_dspark(args, dspark_tokens)
     elif speculative_draft_path:
         if not os.path.isdir(speculative_draft_path):
             raise ValueError(
@@ -1569,20 +1570,11 @@ def make_normal_llm_model(args, startup_progress = None):
         if getattr(args, "dspark_tp_size", None) is not None and getattr(args, "dspark_dp_size", None) is not None:
             raise ValueError("dspark_tp_size and dspark_dp_size are mutually exclusive")
         if draft_tokens > 0:
-            os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
             args.draft_tokens = draft_tokens
-        confidence_threshold = float(getattr(
-            args, "speculative_dspark_confidence_threshold", 0.5))
-        if not 0.0 <= confidence_threshold <= 1.0:
-            raise ValueError(
-                "--speculative_dspark_confidence_threshold must be in [0, 1]")
-        os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
-            confidence_threshold)
         args.speculative_draft_model_path = speculative_draft_path
-        args.speculative_algorithm = "dspark"
-    else:
-        if dspark_tokens > 0:
-            _configure_embedded_dspark(args)
+        _configure_dspark(args, draft_tokens)
+    elif dspark_tokens > 0:
+        _configure_dspark(args, dspark_tokens)
 
     usenuma = False
     try:
@@ -1723,7 +1715,7 @@ def make_normal_llm_model(args, startup_progress = None):
                 if dspark_tokens > 0:
                     # Also refresh defaults for explicit --dspark / GGUF drafts.
                     speculative_algorithm = args.speculative_algorithm
-                    _configure_embedded_dspark(args)
+                    _configure_dspark(args, dspark_tokens)
             if speculative_algorithm == "dspark":
                 if speculative_draft_path and not draft_is_dspark_gguf:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -1787,20 +1779,10 @@ def make_normal_llm_model(args, startup_progress = None):
                             "checkpoint training block size "
                             "(requested=%d, checkpoint=%d)" %
                             (mtp, checkpoint_block))
-                    confidence_threshold = float(getattr(
-                        args, "speculative_dspark_confidence_threshold", 0.5))
-                    if not 0.0 <= confidence_threshold <= 1.0:
-                        raise ValueError(
-                            "--speculative_dspark_confidence_threshold must be "
-                            "in [0, 1]")
                     dspark_tokens = mtp
                     args.dspark = mtp
-                    os.environ["FASTLLM_DSPARK_TOKENS"] = str(mtp)
-                    os.environ[
-                        "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"
-                    ] = str(confidence_threshold)
-                    args.speculative_algorithm = "dspark"
-                    speculative_algorithm = "dspark"
+                    _configure_dspark(args, dspark_tokens)
+                    speculative_algorithm = args.speculative_algorithm
                     print(
                         "[Fastllm] DeepSeek-V4 --mtp uses the checkpoint's "
                         "embedded DSpark draft weights.",

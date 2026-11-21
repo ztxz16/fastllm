@@ -314,6 +314,9 @@ namespace fastllm {
         std::shared_ptr<DraftTPState> draftTP;
         bool draftSingleDeviceLogged = false;
         struct DraftWorkspace;
+        struct DraftMoeScratch;
+        void RunDraftMoe(int layer, int rank, const Data &input, Data &output,
+                         DraftMoeScratch &scratch, int collectiveRows, bool communicate);
         // Bounded LRU; graph-owned inputs are refreshed on every replay.
         std::vector<std::shared_ptr<DraftWorkspace>> draftBatchWorkspaces;
         // Graph variants execute serially and share their large activation buffers.
@@ -400,6 +403,7 @@ namespace fastllm {
         struct DraftHeadShards {
             const std::vector<int> &limits;
             std::vector<Data> &inputs, &logits;
+            bool collectiveDynamicKV = false;
         };
         bool RunDraftBatch(const std::vector<int> &anchors,
                            const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows = 0,
@@ -452,6 +456,8 @@ namespace fastllm {
                          std::vector<float> *retLogits);
         std::string draftParallelLayout;
         bool draftEnabled = false;
+        int draftExperts = 0, draftTopK = 0, draftExpertWidth = 0;
+        float draftRouteScale = 1.0f;
         int draftLayers = 0, draftBlock = 0, draftTokens = 0;
         int draftHeads = 0, draftKvHeads = 0, draftHeadDim = 0, draftWindow = 0;
         float draftEps = 1e-5f, draftTheta = 10000;

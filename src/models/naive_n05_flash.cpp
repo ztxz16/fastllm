@@ -541,7 +541,7 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
     auto result = basellm::GetTensorMap(names);
     const std::set<std::string> sourceNames(names.begin(), names.end());
     const bool compactNvfp4 = std::any_of(names.begin(), names.end(), [](const std::string &name) {
-        return name.find(".mlp.experts.") != std::string::npos &&
+        return name.rfind("model.layers.", 0) == 0 && name.find(".mlp.experts.") != std::string::npos &&
                (StringEndWith(name, ".weight_scale") || StringEndWith(name, ".weight_scale_2"));
     });
     auto usesCuda = [](const std::map<std::string, int> &devices) {
@@ -563,9 +563,9 @@ NaiveN05FlashModel::GetTensorMap(const std::vector<std::string> &names) {
                 name.rfind("markov_head.", 0) == 0 || name.rfind("confidence_head.", 0) == 0 ||
                 name == "fc.weight" || name == "hidden_norm.weight" ||
                 name == "norm.weight" || name == "mask_embedding")) {
-            auto type = (name.find("norm.weight") != std::string::npos ||
-                         name.rfind("confidence_head.", 0) == 0) ? DataType::FLOAT32 : DataType::BFLOAT16;
-            result[name] = {{"dspark." + name, type}};
+            const bool fp32 = name.find("norm.weight") != std::string::npos ||
+                name.rfind("confidence_head.", 0) == 0 || name.find(".mlp.gate.") != std::string::npos;
+            result[name] = {{"dspark." + name, fp32 ? DataType::FLOAT32 : DataType::BFLOAT16}};
         } else if (compactNvfp4 && moeLinears.count(name)) {
             result[name] = {{name, nvfp4Type}};
         } else if (name.find(".mlp.gate.") != std::string::npos) {

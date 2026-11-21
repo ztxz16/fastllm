@@ -4994,6 +4994,51 @@ class DraftFixture : public NaiveN05FlashModel {
         weight["model.embed_tokens.weight"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
         weight["dspark.mask_embedding"].ToDevice(DataDevice::CUDA, std::vector<int>{owner});
     }
+    // Identical routed experts with normalized top-k weights reproduce a dense
+    // MLP. Swapping the only nonzero branch also catches a missing/doubled shared expert.
+    static void CheckMoeFallback() {
+        SetCudaEmbedding(true); SetCudaGraph(false);
+        DraftFixture dense(true);
+        Data context(BFLOAT16, {1, 7, 256}); context.Allocate();
+        for (int i = 0; i < context.Count(0); ++i)
+            ((uint16_t *)context.cpuData)[i] = Float32ToBFloat16RNEBits(std::sin(i * .017f));
+        context.ToDevice(CUDA, std::vector<int>{0});
+        auto evaluate = [&](DraftFixture &model) {
+            auto cache = model.CreateDraftContext();
+            model.AppendDraftContext(context, 0, *cache);
+            Data result = model.RunDraft(13, *cache);
+            result.ToDevice(CPU);
+            return result;
+        };
+        auto expected = evaluate(dense);
+        for (bool shared : {false, true}) {
+            DraftFixture model(true);
+            model.draftExperts = 4; model.draftTopK = 3;
+            for (int layer = 0; layer < model.draftLayers; ++layer) {
+                const auto p = "dspark.layers." + std::to_string(layer) + ".mlp.";
+                auto &router = model.weight[p + "gate.weight"];
+                router.dataType = FLOAT32; router.Resize({4, 256}); router.Allocate(0.0f);
+                for (int e = -1; e < 4; ++e) {
+                    const auto base = e < 0 ? p + "shared_experts." : p + "experts." + std::to_string(e) + ".";
+                    for (std::string suffix : {"gateup_proj.weight", "down_proj.weight"}) {
+                        auto &w = model.weight[base + suffix];
+                        w.CopyFrom(model.weight[p + suffix]);
+                        if ((e < 0) != shared && suffix == "down_proj.weight")
+                            std::memset(w.cpuData, 0, w.GetBytes());
+                    }
+                }
+            }
+            auto actual = evaluate(model);
+            double diff = 0, norm = 0;
+            for (int i = 0; i < expected.Count(0); ++i) {
+                const float e = BFloat16BitsToFloat32(((uint16_t *)expected.cpuData)[i]);
+                const float a = BFloat16BitsToFloat32(((uint16_t *)actual.cpuData)[i]);
+                diff += (a - e) * (a - e); norm += e * e;
+            }
+            if (!(diff < 0.0004 * norm)) throw std::runtime_error("MoE draft fallback changed the dense reference");
+        }
+        std::cout << "DRAFT MOE PASS" << std::endl;
+    }
     void PrefillCommitChecks() {
         setenv("FASTLLM_DSPARK_TP", "1", 1);
         auto actual = CreateDraftContext(), reference = CreateDraftContext();
@@ -5769,6 +5814,9 @@ int main(int argc, char **argv) {
                 }
             }
             return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "draft_moe") {
+            DraftFixture::CheckMoeFallback(); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "draft_prefill_tail") {
             SetCudaEmbedding(true); SetCudaGraph(true);
