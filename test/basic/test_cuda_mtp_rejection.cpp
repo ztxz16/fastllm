@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <numeric>
+#include <random>
 #include <map>
 #include <stdexcept>
 #include <vector>
@@ -341,6 +342,33 @@ void PointMassCase() {
         FastllmCudaMtpDestroyTargetDistribution(target);
     }
 }
+void RoundedResidualCase() {
+    // Same two logits, different FP32 normalization paths. Both p entries
+    // rounded below q even though the proposal and target have full support.
+    Buffer target(std::vector<float>{.5004068613052368f, .4995931088924408f});
+    Buffer proposal(std::vector<float>{.5004069209098816f, .4995931386947632f});
+    Buffer ids(1), output(1);
+    int id = 0, correction = -1;
+    Check(cudaMemcpy(ids.p, &id, sizeof(id), cudaMemcpyHostToDevice));
+    Check(cudaMemset(output.p, 0xff, sizeof(int)));
+    Require(FastllmCudaMtpRecoverRoundedResidual(target.p, proposal.p, (int *)ids.p, (int *)output.p,
+                correction, 0, 0, 1, 2, 42, nullptr) && correction == id,
+            "rounding-induced rejection should emit the supported draft token");
+    // The original draw is near one. After rescaling it still rejects token
+    // zero, and the only positive residual belongs to token one.
+    const float pq[] = {.499999f, .5f};
+    const float qq[] = {.500001f, .5f};
+    Check(cudaMemcpy(target.p, pq, sizeof(pq), cudaMemcpyHostToDevice));
+    Check(cudaMemcpy(proposal.p, qq, sizeof(qq), cudaMemcpyHostToDevice));
+    const auto seed = std::mt19937_64(1451158)();
+    Require(FastllmCudaMtpRecoverRoundedResidual(target.p, proposal.p, (int *)ids.p, (int *)output.p,
+                correction, 0, 0, 1, 2, seed, nullptr) && correction == 1,
+            "rescaled residual must sample the positive difference");
+    Check(cudaMemset(target.p, 0, 2 * sizeof(float)));
+    Check(cudaMemset(output.p, 0xff, sizeof(int)));
+    Require(!FastllmCudaMtpRecoverRoundedResidual(target.p, proposal.p, (int *)ids.p, (int *)output.p,
+                correction, 0, 0, 1, 2, 42, nullptr), "an empty target cannot supply a correction");
+}
 void GraphTopPCase() {
     for (int vocab : {65535, 65536, 152576}) {
         for (int parameter = 0; parameter < 6; ++parameter) {
@@ -598,6 +626,7 @@ int main() {
         ResizableGraphSamplerCase();
         GraphTopPCase();
         PointMassCase();
+        RoundedResidualCase();
         for (int drafts : {1, 3, 5, 7})
             ChainCase("unfiltered-q filtered-p", {.55f, .30f, .15f}, {.10f, .40f, .50f},
                   drafts, 32, .7f, 2, .8f);

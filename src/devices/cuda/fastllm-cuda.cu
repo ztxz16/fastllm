@@ -18760,13 +18760,14 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
         return FastllmCudaMtpRejectionFromProbabilities(ws.a, proposalProbs,
             ws.draftIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize);
     cudaStream_t stream = cudaStreamPerThread;
+    const uint64_t seed = FastllmMtpSamplingSeed();
     cudaError_t state = cudaMemsetAsync(ws.accepted, 0, batch * sizeof(int), stream);
     if (state == cudaSuccess)
         state = cudaMemsetAsync(ws.emitted, 0, batch * sizeof(int), stream);
     if (state == cudaSuccess) {
         state = flashinfer::sampling::ChainSpeculativeSampling<float, int, 1>(
             proposalProbs, ws.draftIds, ws.a, ws.output, ws.accepted, ws.emitted,
-            batch, draftTokens, vocabSize, true, nullptr, FastllmMtpSamplingSeed(),
+            batch, draftTokens, vocabSize, true, nullptr, seed,
             nullptr, 0, stream);
     }
     if (state != cudaSuccess) return false;
@@ -18781,6 +18782,10 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
     for (int b = 0; b < batch; ++b) {
         int n = acceptedDraftTokens[b];
         if (n < 0 || n > draftTokens) return false;
+        int &next = output[b * (draftTokens + 1) + n];
+        if (next == -1 && n < draftTokens &&
+            !FastllmCudaMtpRecoverRoundedResidual(ws.a, proposalProbs, ws.draftIds, ws.output, next,
+                b, n, draftTokens, vocabSize, seed, nullptr)) return false;
         for (int i = 0; i <= n; ++i)
             if (output[b * (draftTokens + 1) + i] < 0 ||
                 output[b * (draftTokens + 1) + i] >= vocabSize) return false;

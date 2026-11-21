@@ -295,7 +295,74 @@ __global__ void FinishResidualKernel(const Partial *partials, int *result,
         if (b == 0) ++*counter;
     }
 }
+// Normally the residual contains positive mass whenever a draft is rejected.
+// Two separately rounded distributions can instead satisfy p <= q everywhere.
+// Recheck that row with its original acceptance draw and FP64 row masses.
+__global__ void RecoverRoundedResidual(const float *p, const float *q, const int *id,
+        int *result, int vocab, int row, int step, int drafts, unsigned long long seed,
+        const unsigned long long *counter) {
+    const int tid = threadIdx.x;
+    if (tid == 0) *result = -1;
+    double2 sums = make_double2(0, 0);
+    for (int i = tid; i < vocab; i += Threads) {
+        const float x = p[i], y = q[i];
+        sums.x += isfinite(x) && isfinite(y) && x >= 0 && x <= y ? double(x) : NAN;
+        sums.y += y;
+    }
+    __shared__ double2 totals[Threads];
+    totals[tid] = sums;
+    __syncthreads();
+    for (int stride = Threads / 2; stride; stride >>= 1) {
+        if (tid < stride) {
+            totals[tid].x += totals[tid + stride].x;
+            totals[tid].y += totals[tid + stride].y;
+        }
+        __syncthreads();
+    }
+    const double ps = totals[0].x, qs = totals[0].y;
+    const int token = *id;
+    if (!(ps > 0 && qs > 0) || token < 0 || token >= vocab || !(q[token] > 0)) return;
+    const unsigned long long round = counter ? *counter - 1 : 0;
+    if (tid == 0) {
+        curandStatePhilox4_32_10_t rng;
+        curand_init(counter ? seed ^ 0xd2b74407b1ce6e93ULL : seed, row,
+                    round * (((drafts + 15) / 16) * 16), &rng);
+        float u = 0;
+        for (int i = 0; i <= step; ++i) u = counter ? Uniform(curand(&rng)) : curand_uniform(&rng);
+        const double target = double(p[token]) * qs, proposal = double(q[token]) * ps;
+        // Emit the token as the correction. The already submitted KV prefix stays valid.
+        if (target > 0 && (target >= proposal || double(u) * proposal < target)) *result = token;
+    }
+    __syncthreads();
+    if (*result >= 0) return;
+    curandStatePhilox4_32_10_t rng;
+    curand_init(seed ^ 0x1571c9d23eacf083ULL, (uint64_t)row * Threads + tid, round * 4, &rng);
+    Partial best{-INFINITY, 0, -INFINITY, INT_MAX};
+    for (int i = tid; i < vocab; i += Threads) {
+        const double residual = __dmul_rn(p[i], qs) - __dmul_rn(q[i], ps);
+        if (residual <= 0) continue;
+        const float score = float(log(residual)) + Gumbel(curand(&rng));
+        if (Better(score, i, best.best, best.token)) { best.best = score; best.token = i; }
+    }
+    __shared__ Partial shared[Threads];
+    best = Reduce(best, shared);
+    if (tid == 0 && isfinite(best.best)) *result = best.token;
+}
 } // namespace
+
+bool FastllmCudaMtpRecoverRoundedResidual(const float *p, const float *q, const int *ids,
+        int *deviceOutput, int &output, int row, int step, int drafts, int vocab,
+        unsigned long long seed, const unsigned long long *counter) {
+    if (!p || !q || !ids || !deviceOutput || row < 0 || step < 0 || step >= drafts || vocab <= 0) return false;
+    const size_t target = size_t(row) * (drafts + 1) + step;
+    const size_t proposal = size_t(row) * drafts + step;
+    RecoverRoundedResidual<<<1, Threads, 0, cudaStreamPerThread>>>(p + target * vocab,
+        q + proposal * vocab, ids + proposal, deviceOutput + target, vocab, row, step, drafts, seed, counter);
+    return cudaGetLastError() == cudaSuccess &&
+        cudaMemcpyAsync(&output, deviceOutput + target, sizeof(int), cudaMemcpyDeviceToHost,
+                        cudaStreamPerThread) == cudaSuccess && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess &&
+        output >= 0 && output < vocab;
+}
 
 bool FastllmCudaMtpSampleDraftLogits(const float *logits, float *saved, float *lse,
         int *output, float *floatOutput, const float *temperatures, int batch, int vocab) {
@@ -336,6 +403,12 @@ static bool FastllmMtpReject(const float *p, const float *logits,
     std::copy_n(ws.hostResults + batch * (drafts + 1), batch, accepted);
     for (int b = 0; b < batch; ++b) {
         if (accepted[b] < 0 || accepted[b] > drafts) return false;
+        if constexpr (Probability) {
+            int &next = output[b * (drafts + 1) + accepted[b]];
+            if (next == -1 && accepted[b] < drafts &&
+                !FastllmCudaMtpRecoverRoundedResidual(p, logits, draftIds, ws.results, next,
+                    b, accepted[b], drafts, vocab, ws.seed, ws.counter)) return false;
+        }
         for (int i = 0; i <= accepted[b]; ++i)
             if (output[b * (drafts + 1) + i] < 0 || output[b * (drafts + 1) + i] >= vocab) return false;
     }

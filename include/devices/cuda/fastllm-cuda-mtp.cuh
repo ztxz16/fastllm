@@ -54,6 +54,12 @@ bool FastllmCudaMtpRejectionFromProbs(const float *targetProbs,
     const float *proposalLogits, const float *proposalLogsumexp,
     const int *deviceDraftTokens, int *output, int *accepted,
     int batch, int drafts, int vocab);
+// Retry only a rejected row with an empty FP32 residual. Reuse its output slot
+// and acceptance RNG (the completed small-sampler counter, or the FlashInfer seed).
+bool FastllmCudaMtpRecoverRoundedResidual(const float *p, const float *q, const int *ids,
+    int *deviceOutput, int &output, int row, int step, int drafts, int vocab,
+    unsigned long long seed, const unsigned long long *counter);
+
 // Same rejection law when the proposal is already stored as probabilities.
 // Parallelizes only the first residual/bonus row over vocabulary tiles.
 bool FastllmCudaMtpRejectionFromProbabilities(const float *targetProbs,
