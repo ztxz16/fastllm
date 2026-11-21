@@ -19,6 +19,9 @@ bool Fp8(const half *input, const uint8_t *weight, const float *scales, const ha
 // Packed per-output-channel E4M3 weights; FP32 bias and BF16 output.
 bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float *bias,
                 __nv_bfloat16 *output, int m, int n, int k);
+// Same activation quantization with contiguous E4M3 weights and separate row scales.
+bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float *bias,
+                __nv_bfloat16 *output, int m, int n, int k, const float *rowScales);
 bool Fp4(const half *input, const uint32_t *weight, const uint8_t *scales, const float *global,
          const half *bias, half *output, int m, int n, int packedN, int k, int mode = 0, bool nativeLayout = false);
 } // namespace fastllm_native_prefill

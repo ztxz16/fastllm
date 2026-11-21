@@ -4839,6 +4839,16 @@ namespace fastllm {
             Data &state, int keyHeads, int valueHeads,
             int keyDim, int valueDim, float recurrentEps, Data &output,
             Data *stateOutput) {
+        GatedDeltaRuleSequence(qkv, alpha, beta, aLog, dtBias, state, keyHeads, valueHeads,
+                               keyDim, valueDim, recurrentEps, output, stateOutput, false);
+    }
+
+    void GatedDeltaRuleSequence(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output,
+            Data *stateOutput, bool betaIsProbability) {
         DataDict datas = {
                 {"input", (Data*)&qkv},
                 {"alpha", (Data*)&alpha}, {"beta", (Data*)&beta},
@@ -4851,7 +4861,7 @@ namespace fastllm {
         curExecutor->Run("GatedDeltaRuleSequence", datas,
         {{"recurrentEps", recurrentEps}},
         {{"keyHeads", keyHeads}, {"valueHeads", valueHeads},
-         {"keyDim", keyDim}, {"valueDim", valueDim}});
+         {"keyDim", keyDim}, {"valueDim", valueDim}, {"betaIsProbability", betaIsProbability}});
     }
 
     void Qwen4GatedDeltaRuleDecode(

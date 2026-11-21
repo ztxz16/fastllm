@@ -38,6 +38,7 @@
 #include "qwen4_exp.h"
 #include "kimi_k3.h"
 #include "qwen3_5.h"
+#include "sensenova_loop.h"
 #include "clover.h"
 #include "step3p5.h"
 #include "laguna.h"
@@ -1018,6 +1019,8 @@ namespace fastllm {
         } else if (modelType == "qwen3") {
             model = new Qwen3Model();
             model->model_type = "qwen3";
+        } else if (modelType == "sensenova_loop") {
+            model = new SenseNovaLoopModel();
         } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
             model->model_type = modelType;
@@ -1880,6 +1883,32 @@ namespace fastllm {
             return ret;
         }
     };
+
+    // Some W4A16 releases serialize E4M3 block scales as raw U8 bytes.
+    // Their build manifest identifies exactly which matrices use that encoding.
+    static void NormalizeRawNVFP4Scales(const std::string &path, SafeTensors &tensors) {
+        const std::string file = path + "nvfp4_build.json";
+        if (!FileExists(file)) return;
+        std::string error;
+        const auto manifest = json11::Json::parse(ReadAllFile(file), error);
+        if (manifest["format"].string_value() != "nvfp4-w4a16-g16") return;
+        for (const auto &entry : manifest["quantized"].array_items()) {
+            const std::string name = entry.string_value() + ".weight";
+            auto w = tensors.itmeDict.find(name);
+            auto scale = tensors.itmeDict.find(name + "_scale");
+            auto global = tensors.itmeDict.find(name + "_scale_2");
+            AssertInFastLLM(w != tensors.itmeDict.end() && scale != tensors.itmeDict.end() &&
+                            global != tensors.itmeDict.end(), "Missing NVFP4 tensors for " + name);
+            const auto &packed = w->second;
+            auto &block = scale->second;
+            AssertInFastLLM(packed.dtype == "U8" && packed.shape.size() == 2 &&
+                            (block.dtype == "U8" || block.dtype == "F8_E4M3") && block.shape.size() == 2 &&
+                            block.shape[0] == packed.shape[0] && block.shape[1] * 8 == packed.shape[1] &&
+                            global->second.dtype == "F32" && global->second.len == 1,
+                            "Invalid NVFP4 group-16 weights or scales for " + name);
+            block.dtype = "F8_E4M3";
+        }
+    }
 
     static bool IsPackedFP4StorageDType(const std::string &dtype) {
         return dtype == "I8" || dtype == "U8";
@@ -5102,6 +5131,7 @@ namespace fastllm {
             }
         }
         SafeTensors safeTensors(stFiles);
+        NormalizeRawNVFP4Scales(path, safeTensors);
 
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
@@ -5413,6 +5443,16 @@ namespace fastllm {
             }
         }
 
+        auto defaultLinearType = [&](DataType mapped, const std::string &name) {
+            DataType source;
+            if (model->model_type == "sensenova_loop" && mapped == DATA_AUTO_LINEAR &&
+                name.rfind("model.language_model.layers.", 0) == 0 &&
+                TryGetPackedFP4DataType(safeTensors, name, source) && source == NVFP4_BLOCK_16) {
+                return NVFP4_BLOCK_16_E4M3_PACKED;
+            }
+            return mapped;
+        };
+
         int cur = 0;
         long long totalBytes = 0;
         std::set <std::string> allWeightNames; // 所有创建了的weight name
@@ -5439,9 +5479,9 @@ namespace fastllm {
             for (auto &it : tensorMap[tensorName]) {
                 std::string weightName = it.first;
                 allWeightNames.insert(weightName);
-                auto dataType = it.second;
+                auto dataType = defaultLinearType(it.second, tensorName);
                 int ggmlType = -1;
-                if (canApplyDtypeRule(weightName, dataType) &&
+                if (canApplyDtypeRule(weightName, it.second) &&
                     dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
@@ -5653,7 +5693,7 @@ namespace fastllm {
                                 std::lock_guard<std::mutex> weightGuard(locker);
                                 destinationWeight = &model->weight.weight.at(weightName);
                             }
-                            auto dataType = it.second;
+                            auto dataType = defaultLinearType(it.second, tensorName);
                             int ggmlType = -1;
 
                             bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
@@ -5665,7 +5705,7 @@ namespace fastllm {
                                     ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
                                     : groupCnt;
 
-                            if (canApplyDtypeRule(weightName, dataType) &&
+                            if (canApplyDtypeRule(weightName, it.second) &&
                                 dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
 /*
@@ -6276,6 +6316,7 @@ namespace fastllm {
             }
         }
         SafeTensors safeTensors(stFiles);
+        NormalizeRawNVFP4Scales(path, safeTensors);
 
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";

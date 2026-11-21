@@ -227,7 +227,7 @@ set(FASTLLM_CXX_SOURCES src/exl3.cpp src/fastllm.cpp src/pd.cpp src/models/naive
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/sensenova_loop.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/qwen3_next.cpp
         src/models/qwen4_exp.cpp src/models/qwen4_exp_moe.cpp src/models/qwen4_exp_gpu.cpp
         src/models/qwen4_exp_graph.cpp src/models/qwen4_exp_gpu_graph.cpp src/models/qwen4_exp_hybrid_graph.cpp
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
@@ -471,6 +471,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp8.cu
         src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
         src/devices/cuda/linear/fastllm-linear-nvfp4-marlin.cu
+        src/devices/cuda/linear/fastllm-compact-nvfp4-marlin.cu
         src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
         src/devices/cuda/linear/fastllm-disk-mxfp4-marlin.cu
         src/devices/cuda/linear/fastllm-linear-fp8-cutlass.cu
@@ -491,6 +492,7 @@ if (USE_CUDA)
         src/devices/cuda/models/dots3-note-kernels.cu
         src/devices/cuda/models/naive-n05-kernels.cu
         src/devices/cuda/models/naive-n05-experts.cu
+        src/devices/cuda/models/sensenova-loop.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
         src/devices/cuda/models/deepseekv41-commit.cu

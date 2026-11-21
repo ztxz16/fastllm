@@ -1037,6 +1037,13 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     fastllm::Data &state, fastllm::Data &output,
     int keyHeads, int valueHeads, int keyDim, int valueDim,
     float recurrentEps, fastllm::Data *stateOutput = nullptr);
+bool FastllmCudaGatedDeltaRuleSequence(
+    const fastllm::Data &qkv, const fastllm::Data &alpha,
+    const fastllm::Data &beta,
+    const fastllm::Data &aLog, const fastllm::Data &dtBias,
+    fastllm::Data &state, fastllm::Data &output,
+    int keyHeads, int valueHeads, int keyDim, int valueDim,
+    float recurrentEps, fastllm::Data *stateOutput, bool betaIsProbability);
 // Single-token FP16 decode with the exact output norm/gate in the same kernel.
 // tiledOutput writes the local GGUF [value-within-group, key-head] layout.
 // Unsupported inputs return false before modifying recurrent state.

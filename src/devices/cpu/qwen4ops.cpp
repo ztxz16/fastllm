@@ -1381,6 +1381,7 @@ namespace fastllm {
     void CpuQwen4GatedDeltaRuleDecodeOp::Run(
             const std::string &opType, const DataDict &datas,
             const FloatDict &floatParams, const IntDict &intParams) {
+        const bool betaIsProbability = intParams.count("betaIsProbability") && intParams.at("betaIsProbability");
         Data &qkv = *datas.find("input")->second;
         Data &alpha = *datas.find("alpha")->second;
         Data &beta = *datas.find("beta")->second;
@@ -1494,8 +1495,8 @@ namespace fastllm {
 
                     const uint64_t gateIndex =
                         row * valueHeads + valueHead;
-                    const float betaValue = Qwen4SigmoidCpu(Qwen4LoadCpu(
-                        beta.cpuData, beta.dataType, gateIndex));
+                    float betaValue = Qwen4LoadCpu(beta.cpuData, beta.dataType, gateIndex);
+                    if (!betaIsProbability) betaValue = Qwen4SigmoidCpu(betaValue);
                     const float alphaValue = Qwen4LoadCpu(
                         alpha.cpuData, alpha.dataType, gateIndex);
                     const float biasedAlpha =

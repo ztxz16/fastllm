@@ -60,14 +60,14 @@ namespace {
     template<typename T>
     __global__ void Qwen4PrefillGatesKernel(const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float2 *gates,
-            int heads, size_t count) {
+            int heads, size_t count, bool betaIsProbability) {
         for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
              i < count; i += size_t(gridDim.x) * blockDim.x) {
             const int h = i % heads;
             const float x = float(alpha[i]) + dtBias[h];
             const float sp = x > 20.f ? x : log1p(expf(x));
             gates[i] = make_float2(expf(-expf((double)aLog[h]) * sp),
-                                   1.0 / (1.0 + expf(-float(beta[i]))));
+                                   betaIsProbability ? float(beta[i]) : 1.0 / (1.0 + expf(-float(beta[i]))));
         }
     }
 
@@ -1400,17 +1400,23 @@ namespace {
         Qwen4GdnDecodePointers requests[CAPACITY];
     };
     struct Qwen4NoGdnDecodeBatch {};
+    struct GdnStateRows {
+        static constexpr int capacity = 32;
+        float *state[capacity];
+    };
 
-    template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false, bool BATCHED = false>
+    template <typename T, bool OUT_OF_PLACE_STATE, bool FUSE_OUTPUT = false, bool BATCHED = false,
+              bool SEPARATE_STATES = false>
     __global__ __launch_bounds__(128) void Qwen4GatedDeltaRuleDecodeKernel(
             const float *qkv, const T *alpha, const T *beta,
             const float *aLog, const float *dtBias, float *state,
             float *stateOutput, float *output,
             int keyHeads, int valueHeads,
             int sequence, float recurrentEps, float inverseHead,
-            const float *normWeight = nullptr, const half *outputGate = nullptr,
+            bool betaIsProbability = false, const float *normWeight = nullptr, const half *outputGate = nullptr,
             float outputNormEps = 0.0f, bool tiledOutput = false,
-            typename std::conditional<BATCHED, Qwen4GdnDecodeBatch, Qwen4NoGdnDecodeBatch>::type requests = {}) {
+            typename std::conditional<BATCHED, Qwen4GdnDecodeBatch, Qwen4NoGdnDecodeBatch>::type requests = {},
+            typename std::conditional<SEPARATE_STATES, GdnStateRows, Qwen4NoGdnDecodeBatch>::type states = {}) {
         if constexpr (BATCHED) {
             static_assert(FUSE_OUTPUT && std::is_same<T,half>::value);
             const auto &request = requests.requests[blockIdx.y];
@@ -1427,8 +1433,12 @@ namespace {
         const int repeat = valueHeads / keyHeads;
         const int keyHead = valueHead / repeat;
         const int qkvChannels = (2 * keyHeads + valueHeads) * KEY_DIM;
-        float *headState = state +
-            (uint64_t)item * KEY_DIM * VALUE_DIM;
+        float *headState;
+        if constexpr (SEPARATE_STATES) {
+            headState = states.state[batchIndex] + (uint64_t)valueHead * KEY_DIM * VALUE_DIM;
+        } else {
+            headState = state + (uint64_t)item * KEY_DIM * VALUE_DIM;
+        }
         float *headNextState = headState;
         if constexpr (OUT_OF_PLACE_STATE) {
             headNextState = stateOutput +
@@ -1489,7 +1499,7 @@ namespace {
                 const float betaValue =
                     Qwen4CudaToFloat(beta[gateIndex]);
                 // Preserve the established single-token expressions exactly.
-                gateValues[0] = 1.0 / (1.0 + expf(-betaValue));
+                gateValues[0] = betaIsProbability ? betaValue : 1.0 / (1.0 + expf(-betaValue));
                 gateValues[1] = expf(
                     -expf((double)aLog[valueHead]) * softplus);
             }
@@ -1583,7 +1593,7 @@ namespace {
             float *stateOutput, float *output,
             int keyHeads, int valueHeads,
             int sequence, float recurrentEps, float inverseHead,
-            typename std::conditional<BATCHED_REPLAY,
+            bool betaIsProbability = false, typename std::conditional<BATCHED_REPLAY,
                 Qwen4LinearReplaySequenceBatch, Qwen4NoLinearReplayBatch>::type
                 layers = {}, float *updates = nullptr) {
         static_assert(!BATCHED_REPLAY || !OUT_OF_PLACE_STATE);
@@ -1678,7 +1688,7 @@ namespace {
                     ? biasedAlpha : log1p(expf(biasedAlpha));
                 const float betaValue =
                     Qwen4CudaToFloat(beta[gateIndex]);
-                gateValues[0] = 1.0 / (1.0 + expf(-betaValue));
+                gateValues[0] = betaIsProbability ? betaValue : 1.0 / (1.0 + expf(-betaValue));
                 gateValues[1] = expf(
                     -expf((double)aLog[valueHead]) * softplus);
             }
@@ -3038,7 +3048,7 @@ namespace {
             fastllm::Data *stateOutput, fastllm::Data &output,
             int blocks, int keyHeads, int valueHeads, int sequence,
             float recurrentEps, float inverseHead,
-            bool useValueTile) {
+            bool useValueTile, bool betaIsProbability) {
         float *nextState = OUT_OF_PLACE_STATE
             ? (float*)stateOutput->cudaData : nullptr;
         if (useValueTile) {
@@ -3051,7 +3061,7 @@ namespace {
                 (const float*)dtBias.cudaData,
                 (float*)state.cudaData, nextState,
                 (float*)output.cudaData, keyHeads, valueHeads,
-                sequence, recurrentEps, inverseHead);
+                sequence, recurrentEps, inverseHead, betaIsProbability);
         } else {
             Qwen4GatedDeltaRuleDecodeKernel<T, OUT_OF_PLACE_STATE><<<
                 blocks, 128, 0, cudaStreamPerThread>>>(
@@ -3061,7 +3071,7 @@ namespace {
                 (const float*)dtBias.cudaData,
                 (float*)state.cudaData, nextState,
                 (float*)output.cudaData, keyHeads, valueHeads,
-                sequence, recurrentEps, inverseHead);
+                sequence, recurrentEps, inverseHead, betaIsProbability);
         }
     }
 
@@ -3088,7 +3098,7 @@ namespace {
             dim3(valueHeads * 4, items.size()), 32, 0, cudaStreamPerThread>>>(
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, keyHeads, valueHeads, sequence,
-            recurrentEps, inverseHead, layers);
+            recurrentEps, inverseHead, false, layers);
     }
 
     bool Qwen4CanRunGatedDeltaRule(
@@ -4922,6 +4932,39 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
         fastllm::Data &state, fastllm::Data &output,
         int keyHeads, int valueHeads, int keyDim, int valueDim,
         float recurrentEps, fastllm::Data *stateOutput) {
+    return FastllmCudaGatedDeltaRuleSequence(qkv, alpha, beta, aLog, dtBias, state, output,
+        keyHeads, valueHeads, keyDim, valueDim, recurrentEps, stateOutput, false);
+}
+
+// One token per request, with the same FP32 accumulator and reduction order
+// as BF16 single-token decode. The scheduler owns each request's state.
+void FastllmCudaGdnBf16DecodeRows(const fastllm::Data &qkv, const fastllm::Data &alpha,
+        const fastllm::Data &beta, const fastllm::Data &aLog, const fastllm::Data &dtBias,
+        const std::vector<fastllm::Data*> &states, int keyHeads, int valueHeads, fastllm::Data &core) {
+    const int width = 128 * valueHeads, channels = 128 * (2 * keyHeads + valueHeads);
+    const int rows = states.size();
+    for (int first = 0; first < rows; first += GdnStateRows::capacity) {
+        GdnStateRows table{};
+        const int count = std::min(rows - first, GdnStateRows::capacity);
+        for (int row = 0; row < count; ++row) table.state[row] = (float*)states[first + row]->cudaData;
+        Qwen4GatedDeltaRuleDecodeKernel<__nv_bfloat16, false, false, false, true>
+            <<<count * valueHeads, 128, 0, cudaStreamPerThread>>>(
+                (const float*)qkv.cudaData + size_t(first) * channels,
+                (const __nv_bfloat16*)alpha.cudaData + size_t(first) * valueHeads,
+                (const __nv_bfloat16*)beta.cudaData + size_t(first) * valueHeads,
+                (const float*)aLog.cudaData, (const float*)dtBias.cudaData, nullptr, nullptr,
+                (float*)core.cudaData + size_t(first) * width, keyHeads, valueHeads, 1,
+                1e-6f / 128, 1.0f / std::sqrt(128.f), true, nullptr, nullptr, 0.f, false, {}, table);
+    }
+}
+
+bool FastllmCudaGatedDeltaRuleSequence(
+        const fastllm::Data &qkv, const fastllm::Data &alpha,
+        const fastllm::Data &beta,
+        const fastllm::Data &aLog, const fastllm::Data &dtBias,
+        fastllm::Data &state, fastllm::Data &output,
+        int keyHeads, int valueHeads, int keyDim, int valueDim,
+        float recurrentEps, fastllm::Data *stateOutput, bool betaIsProbability) {
     if (!Qwen4CanRunGatedDeltaRule(qkv, alpha, beta, aLog, dtBias, state,
             output, keyHeads, valueHeads, keyDim, valueDim,
             fastllm::DataType::FLOAT32) ||
@@ -4965,7 +5008,7 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
                     using T = std::remove_cv_t<std::remove_pointer_t<decltype(typedAlpha)>>;
                     Qwen4PrefillGatesKernel<T><<<gateBlocks, 256, 0, cudaStreamPerThread>>>(
                         typedAlpha, (const T *)beta.cudaData, (const float *)aLog.cudaData,
-                        (const float *)dtBias.cudaData, gates, valueHeads, gateCount);
+                        (const float *)dtBias.cudaData, gates, valueHeads, gateCount, betaIsProbability);
                 };
                 if (alpha.dataType == fastllm::FLOAT32) prepareGates((const float *)alpha.cudaData);
                 else if (alpha.dataType == fastllm::FLOAT16) prepareGates((const half *)alpha.cudaData);
@@ -4987,35 +5030,35 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
             Qwen4LaunchGatedDeltaRule<float, false>(
                 qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTile);
+                inverseHead, useValueTile, betaIsProbability);
         } else {
             Qwen4LaunchGatedDeltaRule<float, true>(
                 qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTile);
+                inverseHead, useValueTile, betaIsProbability);
         }
     } else if (alpha.dataType == fastllm::DataType::FLOAT16) {
         if (stateOutput == nullptr) {
             Qwen4LaunchGatedDeltaRule<half, false>(
                 qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTile);
+                inverseHead, useValueTile, betaIsProbability);
         } else {
             Qwen4LaunchGatedDeltaRule<half, true>(
                 qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
                 blocks, keyHeads, valueHeads, sequence, recurrentEps,
-                inverseHead, useValueTile);
+                inverseHead, useValueTile, betaIsProbability);
         }
     } else if (stateOutput == nullptr) {
         Qwen4LaunchGatedDeltaRule<__nv_bfloat16, false>(
             qkv, alpha, beta, aLog, dtBias, state, nullptr, output,
             blocks, keyHeads, valueHeads, sequence, recurrentEps,
-            inverseHead, useValueTile);
+            inverseHead, useValueTile, betaIsProbability);
     } else {
         Qwen4LaunchGatedDeltaRule<__nv_bfloat16, true>(
             qkv, alpha, beta, aLog, dtBias, state, stateOutput, output,
             blocks, keyHeads, valueHeads, sequence, recurrentEps,
-            inverseHead, useValueTile);
+            inverseHead, useValueTile, betaIsProbability);
     }
     DeviceSync();
     return cudaGetLastError() == cudaSuccess;
@@ -5054,7 +5097,7 @@ bool RunGdnDecode(void *opaque,int implementation) {
                     dim3(c.valueHeads,count),128,0,cudaStreamPerThread>>>(
                     nullptr,nullptr,nullptr,c.aLog,c.dtBias,nullptr,nullptr,nullptr,
                     c.keyHeads,c.valueHeads,1,c.recurrentEps,1.f/std::sqrt(128.f),
-                    c.normWeight,nullptr,c.normEps,c.tiledOutput,tile);
+                    false,c.normWeight,nullptr,c.normEps,c.tiledOutput,tile);
             };
             if(c.requests[first].state==c.requests[first].nextState)
                 launch(std::false_type{});
@@ -5392,7 +5435,7 @@ bool FastllmCudaQwen4GatedDeltaRuleCaptureUpdates(
             static_cast<const T *>(beta.cudaData), static_cast<const float *>(aLog.cudaData),
             static_cast<const float *>(dtBias.cudaData), static_cast<float *>(state.cudaData),
             static_cast<float *>(nextState.cudaData), static_cast<float *>(output.cudaData),
-            keyHeads, valueHeads, rows, recurrentEps, inverseHead, {}, static_cast<float *>(updates.cudaData));
+            keyHeads, valueHeads, rows, recurrentEps, inverseHead, false, {}, static_cast<float *>(updates.cudaData));
     };
     if (alpha.dataType == FLOAT32) launch(static_cast<const float *>(alpha.cudaData));
     else if (alpha.dataType == FLOAT16) launch(static_cast<const half *>(alpha.cudaData));
