@@ -87,8 +87,8 @@ FP16；以下区分已确认结果与尚缺当前版本服务器报告的项目�
 - 已测同一长度和输出数下、关闭缓存、并发 1/4、Eager/Graph 的旧/新路径性能。
   并发 1 的有效加速比分别为 1.199、1.179；并发 4 标记不可直接比较。
   这些是现有版本的局部结果，后续修复版本仍需按影响范围复测。
-- HTTP、生命周期、小模型及既有 TP/DP 回归、HF 对齐的当前版本 GPU 验收结果待核对。
-  缺少本次报告不等于确定没有运行；HF 历史失败继续单独保留。
+- HTTP、小模型及既有 TP/DP 回归、HF 对齐与其余生命周期结果待核对。
+  已收到的本轮部分结果见下方；缺少报告不等于确定没有运行，HF 历史失败继续单独保留。
 
 剩余工作按四个验收阶段管理；阶段数量不代表固定测试运行次数，修复后的新失败需要继续定位：
 
@@ -114,13 +114,40 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
 
 ### 本轮优先事项（2026-11-21）
 
-- [ ] 按用户要求，先补齐 HTTP、生命周期、小模型、TP/DP 回归与独立 HF 对齐。
+- [ ] 按用户要求，先补齐 HTTP、小模型、TP/DP 回归、独立 HF 对齐及剩余生命周期检查。
   已准备分批后台入口 `test/distributed/run_attention_ep_acceptance_v100.sh`；每份独立脚本
-  最多 48 项，包含旧路径及适用的真实模型批次不变模式。当前尚未取得本轮服务器 GPU 结果，
-  不将脚本准备完成记为这些验收事项完成。
+  最多 48 项，包含旧路径及适用的真实模型批次不变模式。当前仅取得部分服务器 GPU 结果，
+  尚未完成整组验收，不将脚本准备完成记为这些验收事项完成。
 - [ ] 使用同一入口汇总当前版本性能及交付材料。原始结果保存到 `test/distributed/results/`，
   持续性能汇总保存到 `docs/performance/runs/`。前缀缓存问题保留待讨论；当前性能与服务验收
   不能关闭该问题，修复后的最终交付结论仍需对应版本复测与完整矩阵证据。
+
+本轮服务器回传（2026-11-21，依据用户粘贴输出，未通过 SSH 读取）：
+
+- [ ] 复验稠密 Decode 分页 KV 容量边界（Eager/Graph）。原 `reject_kv_limit` 仍按
+  连续 KV 的 256 MiB 上限预期拒绝，实际分页路径成功，导致断言失败。已将测试改为
+  显式配置每页 4 Token、2 页，分别检查容量 7/8 成功、9 拒绝；检查实际页池配置、
+  输出数值及失败清理。35 项纯 Python 回归检查已通过，日志位于
+  `test/distributed/results/20261121T033814Z_decode_pool_cpu_ad6a9d1c/`。
+  当前待服务器 GPU 验收，原始 FAIL 证据保留，不直接改判 PASS。
+- 运行目录：`test/distributed/results/20261121T023739Z_attention_ep_acceptance_12648c88/`。
+- `layer_ep1` 已 PASS；`layer_ep2` 已开始，但尚未取得该批最终结果。
+- `lifecycle_legacy`：`joint_lifecycle` FAIL，原因为
+  `AssertionError: partial prefix changed actual logits`；`worker_failure_reaps_group` PASS。
+  证据位于本次目录下 `lifecycle_legacy/reports/20261121T024434Z_moe_full_f7242e65/summary.json`。
+  用户补充的误差统计为：最大绝对误差 0.025，平均绝对误差 0.004，超阈值元素 1600 个；
+  此处展示值保留三位小数，完整精度以服务器原始 JSON 为准。
+- `lifecycle_candidate`：`joint_lifecycle` 与 `worker_failure_reaps_group` 均 PASS；
+  本用例已比较的 logits 最大/平均绝对误差均为 0.000，超阈值元素为 0。
+  候选模式执行到了后续 LRU 淘汰和末尾清缓存步骤；这一组已取得通过结果。
+- 该失败发生在旧路径、Graph/Prefix 开启时：先缓存输入 `[4, 5, 6]`，再为 `[4, 5, 7, 8]`
+  复用两个前缀 Token；清缓存后重算相同请求，并固定后续输入 Token 历史，比较三步完整 logits。
+  本检查实际阈值是 `abs(actual - expected) <= 0.008 + 0.008 * abs(expected)`；
+  与真实模型 HF 数值对齐使用的阈值不同，不能混淆，也不能为通过而直接放宽。
+- 旧路径断言后面的 LRU 淘汰和末尾清缓存检查没有执行到，尚未取得这些步骤的验收结果。
+  本次候选模式通过的是“输入 4 Token、复用 2 Token、生成 3 Token”的短前缀场景，
+  不能替代此前“输入 1024 Token、复用 1023 Token、生成 128 Token”的失败用例复验。
+  旧路径差异尚未定位到具体算子或缓存恢复环节，也不能认定与第 99 个 Token 分歧同根因。
 
 ## PD 分离并行模式
 
