@@ -163,7 +163,9 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                             args = self.configure_without_target([
                                 "--draft", draft_path, flag, str(tokens),
                                 "--speculative_dspark_block_size", str(block),
+                                "--speculative_dspark_confidence_threshold", "0",
                             ])
+                            self.assertEqual(os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"], "0.0")
                             self.assertEqual(args.draft_tokens, tokens)
                             self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], str(tokens))
                             self.assertEqual(os.environ["FASTLLM_DSPARK_MODEL_PATH"], draft_path)
@@ -180,6 +182,7 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                 (["--dspark", "10"], "checkpoint block_size"),
                 (["--dspark", "3", "--draft_tokens", "5"], "different token counts"),
                 (["--dspark", "3", "--speculative_dspark_block_size", "3"], "match the checkpoint"),
+                (["--speculative_dspark_confidence_threshold", "nan"], "confidence_threshold"),
             ]
             for options, message in cases:
                 with self.subTest(options=options), patch.dict(os.environ, {}, clear=True):
@@ -196,6 +199,7 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 self.configure_without_target(["--draft", draft_path])
                 self.assertNotIn("FASTLLM_DSPARK_TOKENS", os.environ)
+                self.assertEqual(os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"], "0.5")
 
     def test_embedded_dspark_accepts_draft_tokens(self):
         with patch.dict(os.environ, {}, clear=True):

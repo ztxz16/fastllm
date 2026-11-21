@@ -1954,7 +1954,7 @@ Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
     Data pos(FLOAT32, {1, draftBlock}, positions);
     for (int i = 0; i < draftLayers; ++i) {
         const std::string layer = "dspark.layers." + std::to_string(i) + ".";
-        Data normed, q, k, v, qkv, attention, output, gate, up, gateUp;
+        Data normed, q, k, v, qkv, attention, output;
         KimiK3RMSNorm(hidden, weight[layer + "input_layernorm.weight"], draftEps, normed);
         auto &cache = context.kv[i];
         const int past = cache.first.dims[1];
@@ -2000,19 +2000,21 @@ Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
         if (draftExperts) {
             DraftMoeScratch scratch;
             RunDraftMoe(i, 0, normed, output, scratch, 0, true);
-            AddTo(hidden, output);
-            continue;
-        }
-        if (weight.weight.count(layer + "mlp.gateup_proj.weight")) {
-            DraftLinear(normed, weight[layer + "mlp.gateup_proj.weight"], gateUp);
-            FastllmCudaNaiveDraftSwiGLU(gateUp, gate);
         } else {
-            DraftLinear(normed, weight[layer + "mlp.gate_proj.weight"], gate);
-            DraftLinear(normed, weight[layer + "mlp.up_proj.weight"], up);
-            Silu(gate, gate);
-            MulTo(gate, up);
+            Data gate;
+            if (weight.weight.count(layer + "mlp.gateup_proj.weight")) {
+                Data gateUp;
+                DraftLinear(normed, weight[layer + "mlp.gateup_proj.weight"], gateUp);
+                FastllmCudaNaiveDraftSwiGLU(gateUp, gate);
+            } else {
+                Data up;
+                DraftLinear(normed, weight[layer + "mlp.gate_proj.weight"], gate);
+                DraftLinear(normed, weight[layer + "mlp.up_proj.weight"], up);
+                Silu(gate, gate);
+                MulTo(gate, up);
+            }
+            DraftLinear(gate, weight[layer + "mlp.down_proj.weight"], output);
         }
-        DraftLinear(gate, weight[layer + "mlp.down_proj.weight"], output);
         AddTo(hidden, output);
     }
     KimiK3RMSNorm(hidden, weight["dspark.norm.weight"], draftEps, normalized);
