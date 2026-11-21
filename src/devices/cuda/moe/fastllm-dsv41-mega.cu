@@ -100,6 +100,17 @@ constexpr int sharedSfRows = dg::layout::get_num_max_shared_sf_tokens(CAP);
 struct Maps { Desc a1, s1, w1, ws1, d1, a2, s2, w2, ws2; };
 // Shard replicated TP tokens by row modulo EP size. Remap FastLLM's modulo
 // expert placement to the contiguous expert IDs expected by upstream.
+__device__ __forceinline__ void writeRoute(int slot, const int32_t *ids, const float *scores,
+        int64_t *qi, float *qs, int row, int localRow) {
+    const int expert = ids[row * K + slot];
+    qi[localRow * K + slot] = expert < 0 ? -1 : (expert % R) * LE + expert / R;
+    qs[localRow * K + slot] = scores[row * K + slot];
+}
+__global__ void publishLocalRoutes(const int32_t *ids, const float *scores, int64_t *qi, float *qs) {
+    const int row = blockIdx.x, lane = threadIdx.x;
+    if (lane < K) writeRoute(lane, ids, scores, qi, qs, row, row);
+}
+template <bool PackOnly = false>
 __global__ void prepare(const __nv_bfloat16 *x, const int32_t *ids, const float *scores,
     uint8_t *qx, uint8_t *sf, int64_t *qi, float *qs, int rank, int rows, bool ownerOutput, uint8_t *sharedSf = nullptr, bool sourceLocal = false) {
     const int localRow = blockIdx.x / (H / 32), group = blockIdx.x % (H / 32);
@@ -120,10 +131,10 @@ __global__ void prepare(const __nv_bfloat16 *x, const int32_t *ids, const float 
             sharedSf[(group/4 * sharedSfRows + rowIndex)*4 + group%4] = exp;
         }
     }
-    if (group == 0 && lane < K) {
-        const int expert = ids[row * K + lane];
-        qi[localRow * K + lane] = expert < 0 ? -1 : (expert % R) * LE + expert / R;
-        qs[localRow * K + lane] = scores[row * K + lane];
+    if constexpr (!PackOnly) {
+        if (group == 0) {
+            if (lane < K) writeRoute(lane, ids, scores, qi, qs, row, localRow);
+        }
     }
 }
 __global__ void scatter(dg::layout::SymBuffer<R> sym, const int32_t *ids,
@@ -153,7 +164,7 @@ __global__ void scatter(dg::layout::SymBuffer<R> sym, const int32_t *ids,
 template <bool WithShared = false, bool WithPost = false>
 __global__ void combineOwnedRows(const __nv_bfloat16 *slots, const int32_t *ids,
                                  void *out, int count, int start, const __nv_bfloat16 *residual = nullptr,
-                                 const float *post = nullptr, const float *comb = nullptr) {
+                                 const float *post = nullptr, const float *comb = nullptr, const int *routeOrder = nullptr) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count * H) return;
     const int local = i / H, column = i % H, row = start + local;
@@ -200,6 +211,10 @@ template <int Shared = 0, int ActiveSms = SMS, bool RegisterPull = false, bool S
 
 struct FastllmDsv41MegaLayer {
     bool registerPull = false, singleHistogram = false;
+    cudaStream_t packStream = nullptr;
+    cudaEvent_t inputReady = nullptr, packetReady = nullptr;
+    bool canPackEarly = false;
+    int *routeOrder = nullptr;
     int device = -1, rank = -1;
     const void *cacheKey = nullptr;
     void *gate = nullptr, *down = nullptr, *gateSf = nullptr, *downSf = nullptr;
@@ -212,6 +227,10 @@ struct FastllmDsv41MegaLayer {
         { std::lock_guard<std::mutex> lock(readyMutex); readyKeys.erase(cacheKey); sharedKeys.erase(cacheKey); }
         int previous = 0; cudaGetDevice(&previous);
         if (device >= 0) cudaSetDevice(device);
+        if (routeOrder) cudaFree(routeOrder);
+        if (packetReady) cudaEventDestroy(packetReady);
+        if (inputReady) cudaEventDestroy(inputReady);
+        if (packStream) cudaStreamDestroy(packStream);
         for (void *p : {gate, down, gateSf, downSf, sharedGate, sharedDown, sharedGateSf, sharedDownSf, (void *)domains}) if (p) cudaFree(p);
         cudaSetDevice(previous);
     }
@@ -314,6 +333,18 @@ FastllmDsv41MegaLayer *FastllmDsv41MegaCreate(const void *const *gate,
     if (rank < 0 || rank >= R || !FastllmDsv41MegaSupported(layer->device))
         throw std::runtime_error("Invalid DSV41 MegaMoE rank/device");
     layer->workspace = workspaces[rank];
+    const char *order = std::getenv("FASTLLM_DSV41_ORDER_WORD");
+    if (order && !std::strcmp(order, "1") && cudaMalloc(&layer->routeOrder, CAP * sizeof(int)) != cudaSuccess) {
+        cudaGetLastError();
+        layer->routeOrder = nullptr;
+    }
+    const char *early = std::getenv("FASTLLM_DSV41_EARLY_MOE_PACK");
+    if (early && !std::strcmp(early, "1")) {
+        layer->canPackEarly = cudaStreamCreateWithFlags(&layer->packStream, cudaStreamNonBlocking) == cudaSuccess &&
+            cudaEventCreateWithFlags(&layer->inputReady, cudaEventDisableTiming) == cudaSuccess &&
+            cudaEventCreateWithFlags(&layer->packetReady, cudaEventDisableTiming) == cudaSuccess;
+        if (!layer->canPackEarly) cudaGetLastError();
+    }
     for (int r = 0; r < R; ++r) layer->peers[r] = reinterpret_cast<int64_t>(workspaces[r]);
     layer->gate = allocate((size_t)LE * I * H);
     layer->down = allocate((size_t)LE * H * I / 2);
@@ -348,16 +379,47 @@ bool FastllmDsv41MegaGraphReady(const void *cacheKey, int rows) {
         ((rows == 1 || rows % R == 0) && sharedKeys.count(cacheKey));
 }
 void FastllmDsv41MegaDestroy(FastllmDsv41MegaLayer *layer) { delete layer; }
+FastllmDsv41InputPacket FastllmDsv41OwnerInputPacket(FastllmDsv41MegaLayer *layer, int rows) {
+    const char *enable = std::getenv("FASTLLM_DSV41_POST_PACKET");
+    if (!layer || !layer->sharedGate || rows < 1 || rows > CAP || !enable || std::strcmp(enable, "1")) return {};
+    auto b = buffer(layer->workspace, 1);
+    auto packet = FastllmDsv41InputPacket{b.input_token_buffer.get_base_ptr<uint8_t>(),
+        b.input_sf_buffer.get_base_ptr<uint8_t>(), b.shared_l1_sf_buffer.get_base_ptr<uint8_t>(), sharedSfRows};
+    const char *direct = std::getenv("FASTLLM_DSV41_DIRECT_ROUTES");
+    if (direct && !std::strcmp(direct, "1")) {
+        packet.routeIds = b.input_topk_idx_buffer.get_base_ptr<int64_t>();
+        packet.routeScores = b.input_topk_weights_buffer.get_base_ptr<float>();
+        packet.routeOrder = layer->routeOrder;
+    }
+    return packet;
+}
+// Small owners publish during mHC; for GEMM-sized owners this branch overlaps router projection.
+void *FastllmDsv41PackLocalInput(FastllmDsv41MegaLayer *layer, const void *input, int rows) {
+    if (!layer || !layer->canPackEarly || !layer->sharedGate || !input || rows < 16 || rows > CAP) return nullptr;
+    auto b = buffer(layer->workspace, 1);
+    check(cudaEventRecord(layer->inputReady, cudaStreamPerThread));
+    check(cudaStreamWaitEvent(layer->packStream, layer->inputReady));
+    prepare<true><<<rows * (H / 32), 32, 0, layer->packStream>>>(
+        static_cast<const __nv_bfloat16 *>(input), nullptr, nullptr, b.input_token_buffer.get_base_ptr<uint8_t>(),
+        b.input_sf_buffer.get_base_ptr<uint8_t>(), nullptr, nullptr, layer->rank, rows, true,
+        b.shared_l1_sf_buffer.get_base_ptr<uint8_t>(), true);
+    check(cudaEventRecord(layer->packetReady, layer->packStream));
+    return layer->packetReady;
+}
 template <bool Shared, bool Local = false, bool Post = false> static void run(FastllmDsv41MegaLayer *layer, const void *input,
     const int32_t *ids, const float *scores, void *output, int rows, void *rawStream, bool ownerOutput,
-    const void *residual = nullptr, const float *post = nullptr, const float *comb = nullptr, cudaEvent_t mixDone = nullptr) {
+    const void *residual = nullptr, const float *post = nullptr, const float *comb = nullptr, cudaEvent_t mixDone = nullptr, cudaEvent_t packetReady = nullptr, bool packed = false, bool routesReady = false) {
     if (!layer || rows < (Local ? 0 : 1) || rows > (Local ? CAP : CAP * R) ||
         (!Shared && ownerOutput && rows % R) || (rows && (!input || !ids || !scores || !output)))
         throw std::runtime_error("Invalid DSV41 MegaMoE decode input");
     auto stream = rawStream ? static_cast<cudaStream_t>(rawStream) : cudaStreamPerThread;
     dg::layout::MegaMoEBuffer b = buffer(layer->workspace, int(Shared));
     const int localRows = Local ? rows : (rows + R - 1 - layer->rank) / R;
-    if (localRows) prepare<<<localRows * (H / 32), 32, 0, stream>>>(
+    if (packetReady || packed) {
+        if (!routesReady) publishLocalRoutes<<<localRows, 32, 0, stream>>>(ids, scores,
+            b.input_topk_idx_buffer.get_base_ptr<int64_t>(), b.input_topk_weights_buffer.get_base_ptr<float>());
+        if (packetReady) check(cudaStreamWaitEvent(stream, packetReady));
+    } else if (localRows) prepare<false><<<localRows * (H / 32), 32, 0, stream>>>(
         static_cast<const __nv_bfloat16 *>(input), ids, scores,
         b.input_token_buffer.get_base_ptr<uint8_t>(), b.input_sf_buffer.get_base_ptr<uint8_t>(),
         b.input_topk_idx_buffer.get_base_ptr<int64_t>(), b.input_topk_weights_buffer.get_base_ptr<float>(), layer->rank, rows, ownerOutput, Shared ? b.shared_l1_sf_buffer.get_base_ptr<uint8_t>() : nullptr, Local);
@@ -399,7 +461,7 @@ template <bool Shared, bool Local = false, bool Post = false> static void run(Fa
         const int start = Local ? 0 : layer->rank * (rows/R) + std::min(layer->rank, rows%R);
         combineOwnedRows<Shared, Post><<<(localRows * H + 255) / 256, 256, 0, stream>>>(
             b.combine_token_buffer.get_base_ptr<__nv_bfloat16>(), ids, output, localRows, start,
-            static_cast<const __nv_bfloat16 *>(residual), post, comb);
+            static_cast<const __nv_bfloat16 *>(residual), post, comb, routesReady ? layer->routeOrder : nullptr);
     } else {
         scatter<<<(rows * H + 255) / 256, 256, 0, stream>>>(
             dg::layout::SymBuffer<R>(layer->peers, layer->rank), ids, static_cast<float *>(output), rows, layer->rank);
@@ -423,12 +485,17 @@ void FastllmDsv41MegaRunLocal(FastllmDsv41MegaLayer *layer, const void *input,
     run<true, true>(layer, input, ids, scores, output, rows, stream, true);
 }
 
+void FastllmDsv41MegaRunLocalPacket(FastllmDsv41MegaLayer *layer, const void *input,
+    const int32_t *ids, const float *scores, const void *residual, const float *post,
+    const float *comb, void *hidden, int rows, void *stream, void *mixDone, void *packetReady, bool packed, bool routesReady) {
+    if (!layer || !layer->sharedGate || (rows && (!residual || !post || !comb)))
+        throw std::invalid_argument("Invalid DSV41 local expert residual");
+    run<true, true, true>(layer, input, ids, scores, hidden, rows, stream, true, residual, post, comb, static_cast<cudaEvent_t>(mixDone), static_cast<cudaEvent_t>(packetReady), packed, routesReady);
+}
 void FastllmDsv41MegaRunLocalPostAfterMix(FastllmDsv41MegaLayer *layer, const void *input,
     const int32_t *ids, const float *scores, const void *residual, const float *post,
     const float *comb, void *hidden, int rows, void *stream, void *mixDone) {
-    if (!layer || !layer->sharedGate || (rows && (!residual || !post || !comb)))
-        throw std::invalid_argument("Invalid DSV41 local expert residual");
-    run<true, true, true>(layer, input, ids, scores, hidden, rows, stream, true, residual, post, comb, static_cast<cudaEvent_t>(mixDone));
+    FastllmDsv41MegaRunLocalPacket(layer,input,ids,scores,residual,post,comb,hidden,rows,stream,mixDone,nullptr);
 }
 void FastllmDsv41MegaRunLocalPost(FastllmDsv41MegaLayer *layer, const void *input,
     const int32_t *ids, const float *scores, const void *residual, const float *post,
@@ -441,5 +508,5 @@ const void *FastllmDsv41OwnerPostKernel() {
 }
 
 const void *FastllmDsv41PrepareKernel() {
-    return reinterpret_cast<const void *>(prepare);
+    return reinterpret_cast<const void *>(prepare<false>);
 }

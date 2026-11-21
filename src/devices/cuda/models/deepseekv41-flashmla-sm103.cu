@@ -62,8 +62,8 @@ __global__ void Gather(const FastllmV41FullDecodeRequest *requests, const int *s
 // encoder output. All other rows are accepted in FastLLM's physical packed
 // format. Keep raw bytes and scales together, as required by interleaved
 // FlashMLA. This also supports independently allocated and reordered caches.
-template <bool HistoryOnly>
-__global__ void GatherPacked(const FastllmV41FullDecodeRequest *requests, const int *selected,
+template <bool HistoryOnly, bool AllIndices = false>
+__global__ void GatherPacked(const FastllmV41FullDecodeRequest *requests, int *selected,
                              const uint8_t *current, uint8_t *ring, uint8_t *extra, int *indices, int *positions,
                              int *lengths, int width, int pitch, int ratio) {
     const int t = blockIdx.y, slot = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -77,11 +77,15 @@ __global__ void GatherPacked(const FastllmV41FullDecodeRequest *requests, const 
     }
     const int col = slot - 128;
     const bool compressed = col >= 0;
+    // Following non-source layers reuse this selection, including after a long
+    // replay. Publish every logical column even if this request is shorter.
+    if constexpr (AllIndices)
+        if (compressed && col < width && !lane) selected[size_t(t) * width + col] = col;
     const int destination = compressed ? t * (pitch - 128) + col : t * 128 + slot;
     int id = -1;
     if (compressed) {
         if (col < min(width, visible) && req.compressedKV) {
-            id = selected[size_t(t) * width + col];
+            id = AllIndices ? col : selected[size_t(t) * width + col];
             if (id >= visible)
                 id = -1;
         }
@@ -113,9 +117,12 @@ __global__ void Unpack(const __nv_fp8_e4m3 *codes, const uint32_t *scales, __nv_
 }
 } // namespace
 
-bool FastllmV41IsMlaHistoryKernel(const void *func) { return func == (const void *)GatherPacked<true>; }
+bool FastllmV41IsMlaHistoryKernel(const void *func) {
+    return func == (const void *)GatherPacked<true> || func == (const void *)GatherPacked<true, true>;
+}
 bool FastllmV41IsMlaPageKernel(const void *func) {
-    return func == reinterpret_cast<const void *>(GatherPacked<false>) || FastllmV41IsMlaHistoryKernel(func) || func == reinterpret_cast<const void *>(Gather);
+    return func == (const void *)GatherPacked<false> || func == (const void *)GatherPacked<false, true> ||
+        FastllmV41IsMlaHistoryKernel(func) || func == (const void *)Gather;
 }
 
 FastllmV41MlaWorkspace::~FastllmV41MlaWorkspace() {
@@ -194,7 +201,7 @@ cudaError_t FastllmV41RunMla(const FastllmV41MlaWorkspace &w, const FastllmV41Fu
 
 cudaError_t FastllmV41RunMla(const FastllmV41MlaWorkspace &w, const FastllmV41FullDecodeConfig &c,
                              const FastllmV41FullDecodeBuffers &b, const FastllmV41FullDecodeRequest *requests,
-                             cudaStream_t stream, bool unpack, bool historyOnly) {
+                             cudaStream_t stream, bool unpack, bool historyOnly, bool allIndices) {
     if (w.outputOnly || c.batch != w.batch || !requests || !b.sink || (unpack && !b.output) ||
         (w.width && !b.topk) || (!w.paged && !b.kv))
         return cudaErrorInvalidValue;
@@ -203,8 +210,9 @@ cudaError_t FastllmV41RunMla(const FastllmV41MlaWorkspace &w, const FastllmV41Fu
             return cudaErrorInvalidValue;
         auto *ring = static_cast<uint8_t *>(w.keys);
         auto gather = historyOnly ? GatherPacked<true> : GatherPacked<false>;
+        if (allIndices) gather = historyOnly ? GatherPacked<true, true> : GatherPacked<false, true>;
         gather<<<dim3((w.pitch + 3) / 4, c.batch), 128, 0, stream>>>(
-            requests, static_cast<const int *>(b.topk), static_cast<const uint8_t *>(b.savedKV), ring,
+            requests, static_cast<int *>(b.topk), static_cast<const uint8_t *>(b.savedKV), ring,
             ring + size_t(c.batch) * 128 * 528, w.indices, w.positions, w.lengths, w.width, w.pitch, c.ratio);
     } else
         Gather<<<dim3((w.pitch + 3) / 4, c.batch), 256, 0, stream>>>(

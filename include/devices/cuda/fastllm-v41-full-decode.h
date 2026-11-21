@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 // Separate causal layouts without a fixed batch-size offset or key collision.
 inline int64_t FastllmV41VerificationGraphKey(int rows, bool segmented) {
@@ -51,6 +52,7 @@ struct FastllmV41FullDecodeBuffers {
     // The producer must run again after every mask/position update.
     void *candidateBlocks = nullptr, *candidateCounts = nullptr;
     bool reuseCandidates = false;
+    const float *indexNorm = nullptr;
 };
 
 struct FastllmV41FullDecodeRequest {
@@ -92,8 +94,15 @@ bool FastllmCudaV41UploadFullDecode(void *plan, const FastllmV41FullDecodeReques
 bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size_t layers,
     const FastllmV41FullDecodeRequest *requests, size_t batch);
 bool FastllmCudaV41PrepareFullDecode(void *plan);
+bool FastllmCudaV41CanPublishSource(const void *plan);
+bool FastllmCudaV41PrepareAllIndices(void *plan, bool publishSource);
+bool FastllmCudaV41FinishSource(void *plan);
+void *FastllmCudaV41ForkSourceStore(const void *graph);
+void *FastllmCudaV41MoveSourceToPrelude(void *prefix, const void *compressorReady, const void *core);
 bool FastllmCudaV41FinishFullDecode(void *plan);
 bool FastllmCudaV41FinishAllIndices(void *plan);
+std::vector<void *> FastllmCudaV41CaptureNodes();
+void *FastllmCudaV41WithoutIndexProjections(const void *graph, const std::vector<void *> &nodes);
 void *FastllmCudaV41CaptureFrontier();
 bool FastllmCudaV41FuseExpertBoundary(const void *previous, const void *attention,
         const void *shortAttention, const void *postKernel, int rows, bool packOnly, void **result);

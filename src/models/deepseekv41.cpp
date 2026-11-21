@@ -4930,6 +4930,7 @@ namespace fastllm {
         bool containsGpuMoe = false;
         void *compressorInput = nullptr, *beforeCompressor = nullptr;
         void *beforeIndexProjection = nullptr;
+        std::vector<void *> indexProjectionNodes;
         int composedLast = -1;
         std::vector<int> qDims, kvDims, qIdxDims;
         std::vector<int> ffnDims, ffnInputDims, expertIndexDims, expertScoreDims;
@@ -6565,6 +6566,7 @@ namespace fastllm {
             // 【CUDA Graph 的 pre 段】这里到 RoPE 之前全部与 token 位置无关，整段可捕获。
             bool needIndexer = ratio > 0 && isIndexSource[layer];
             void *beforeIndexProjection = nullptr, *compressorInput = nullptr, *beforeCompressor = nullptr;
+            std::vector<void *> indexProjectionNodes;
             auto runAttentionPre = [&]() {
             // The workspace owns shared activation buffers across asynchronous
             // TP dispatch and graph replay; W8A16 paths consume BF16 directly.
@@ -6711,8 +6713,12 @@ namespace fastllm {
             }
             if (ratio > 0 && isIndexSource[layer]) {
 #ifdef USE_CUDA
-                if (f.graphCapture && v41AttentionRankRuntime && V41EnvFlag("FASTLLM_DSV41_SHORT_INDEX"))
+                std::vector<void *> preceding;
+                if (f.graphCapture && v41AttentionRankRuntime && V41EnvFlag("FASTLLM_DSV41_SHORT_INDEX")) {
                     beforeIndexProjection = FastllmCudaV41CaptureFrontier();
+                    if (seqlen >= 16 && V41EnvFlag("FASTLLM_DSV41_INDEX_PROJECTIONS"))
+                        preceding = FastllmCudaV41CaptureNodes();
+                }
 #endif
                 std::string ipre = pre + ".attn.indexer";
                 // indexer 在每张卡上各算一份：它选出的候选块要供后续所有层复用，
@@ -6726,6 +6732,13 @@ namespace fastllm {
                 ToDataType(idxWeights, DataType::FLOAT32);
                 Mul(idxWeights, (1.0f / std::sqrt((float)index_head_dim)) * (1.0f / std::sqrt((float)index_n_heads)),
                     idxWeightsAll);
+#ifdef USE_CUDA
+                if (!preceding.empty()) {
+                    for (auto node : FastllmCudaV41CaptureNodes())
+                        if (std::find(preceding.begin(), preceding.end(), node) == preceding.end())
+                            indexProjectionNodes.push_back(node);
+                }
+#endif
             }
             };   // runAttentionPre
             RunForwardGraphSegment(f, runAttentionPre, kV41GraphSegmentsPerLayer * layer, true,
@@ -6749,6 +6762,7 @@ namespace fastllm {
 #endif
                     meta.qIdxDims = qIdxAll.dims;
                     meta.beforeIndexProjection = beforeIndexProjection;
+                    meta.indexProjectionNodes = std::move(indexProjectionNodes);
                     meta.compressorInput = compressorInput;
                     meta.beforeCompressor = beforeCompressor;
                 },

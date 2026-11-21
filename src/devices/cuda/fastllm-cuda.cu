@@ -11,6 +11,7 @@
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
 #include "devices/cuda/fastllm-dsv41-mega.h"
+#include "devices/cuda/fastllm-v41-route-order.cuh"
 #endif
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
@@ -12303,7 +12304,7 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
 // then performs TopK; exact ties rebuild the original 64-thread lists and
 // merge tree so both instantiations remain compatible with the legacy path.
 template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK, bool APPLY_SIGMOID = false>
-__global__ void FastllmSelectExpertFixedTopKKernel(
+__device__ __forceinline__ void FastllmFixedTopKRow(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
     constexpr int VALUES_PER_LANE = EXPERTS / 32;
@@ -12564,6 +12565,92 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
         }
     }
 }
+
+template <bool Softmax, int Experts, int TopK, bool Sigmoid = false>
+__global__ void FastllmSelectExpertFixedTopKKernel(const float *logits, const float *bias, int32_t *ids,
+        float *scores, int hasBias, int needNorm, float scale) {
+    FastllmFixedTopKRow<Softmax, Experts, TopK, Sigmoid>(logits, bias, ids, scores, hasBias, needNorm, scale);
+}
+
+#ifndef USE_ROCM
+#include "devices/cuda/fastllm-dsv41-mega.h"
+#include "devices/cuda/fastllm-v41-route-order.cuh"
+// In the common case all six biased winners are unique. Use coalesced loads
+// and one warp per independent row; an exact tie reuses the legacy merge.
+__global__ void FastllmV41PublishTopK(float *logits, const float *bias, int *ids, float *scores, float scale,
+                                      FastllmDsv41InputPacket packet) {
+#if __CUDA_ARCH__ >= 800
+    const int row = blockIdx.x, lane = threadIdx.x;
+    const float *input = logits + row * 384;
+    float value[12], key[12];
+#pragma unroll
+    for (int j = 0; j < 12; ++j) {
+        const int e = j * 32 + lane;
+        value[j] = input[e];
+        float k = value[j] + bias[e];
+        key[j] = isfinite(k) ? k : -FLT_MAX;
+    }
+    int selectedId = -1;
+    float selectedProbability = 0.f, sum = 0.f;
+    bool tie = false;
+#pragma unroll
+    for (int slot = 0; slot < 6; ++slot) {
+        float largest = key[0];
+#pragma unroll
+        for (int j = 1; j < 12; ++j) largest = fmaxf(largest, key[j]);
+        unsigned bits = __float_as_uint(largest);
+        bits ^= bits & 0x80000000u ? ~0u : 0x80000000u;
+        bits = __reduce_max_sync(~0u, bits);
+        largest = __uint_as_float(bits ^ (bits & 0x80000000u ? 0x80000000u : ~0u));
+        int matches = 0, id = 0;
+        float v = 0.f;
+#pragma unroll
+        for (int j = 0; j < 12; ++j) {
+            if (key[j] == largest) {
+                ++matches; id = j * 32 + lane; v = value[j]; key[j] = -FLT_MAX;
+            }
+        }
+        if (__reduce_add_sync(~0u, matches) != 1 || largest == -FLT_MAX) { tie = true; break; }
+        const int winner = __ffs(__ballot_sync(~0u, matches)) - 1;
+        id = __shfl_sync(~0u, id, winner);
+        v = __shfl_sync(~0u, v, winner);
+        v = isfinite(v) ? v : 0.f;
+        if (lane == slot) { selectedId = id; selectedProbability = v; }
+        sum += v;
+    }
+    if (tie) {
+        FastllmFixedTopKRow<false,384,6>(logits,bias,ids,scores,1,1,scale);
+    } else if (lane < 6) {
+        if (!isfinite(sum) || fabsf(sum) < 1e-20f) sum = 1.f;
+        ids[row*6+lane] = selectedId;
+        scores[row*6+lane] = selectedProbability / sum * scale;
+    }
+    __syncwarp();
+    if (packet.routeOrder) FastllmV41PublishOrder(ids + row * 6, packet.routeOrder + row);
+    if (lane < 6) {
+        const int i = row*6+lane, id = ids[i];
+        packet.routeIds[i] = id < 0 ? -1 : (id % 8) * 48 + id / 8;
+        packet.routeScores[i] = scores[i];
+    }
+#endif
+}
+
+bool FastllmCudaV41SelectAndPublish(float *logits, const float *bias, int *ids, float *scores, int rows,
+                                    float scale, FastllmDsv41InputPacket packet) {
+    if (rows < 1 || rows > 32 || !logits || !bias || !ids || !scores || !packet.routeIds || !packet.routeScores)
+        return false;
+    cudaFuncAttributes attrs{};
+    if (cudaFuncGetAttributes(&attrs, FastllmV41PublishTopK) != cudaSuccess ||
+            attrs.binaryVersion < 80 || (attrs.ptxVersion && attrs.ptxVersion < 80)) {
+        cudaGetLastError();
+        return false;
+    }
+    FastllmV41PublishTopK<<<rows,32,0,cudaStreamPerThread>>>(logits,bias,ids,scores,scale,packet);
+    return cudaGetLastError() == cudaSuccess;
+}
+#endif
+
+
 #endif
 
 __device__ __forceinline__ void FastllmWriteNormalizedLogitsTop8(

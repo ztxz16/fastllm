@@ -25,7 +25,7 @@ cudaError_t FastllmV41RunMla(const FastllmV41MlaWorkspace &w, const FastllmV41Fu
 bool FastllmV41IsMlaHistoryKernel(const void *func);
 cudaError_t FastllmV41RunMla(const FastllmV41MlaWorkspace &w, const FastllmV41FullDecodeConfig &c,
                              const FastllmV41FullDecodeBuffers &buffers, const FastllmV41FullDecodeRequest *requests,
-                             cudaStream_t stream, bool unpack, bool historyOnly);
+                             cudaStream_t stream, bool unpack, bool historyOnly, bool allIndices = false);
 bool FastllmV41IsMlaPageKernel(const void *func);
 
 void FastllmV41MlaCore(const FastllmV41MlaWorkspace &w, const FastllmV41FullDecodeConfig &c,

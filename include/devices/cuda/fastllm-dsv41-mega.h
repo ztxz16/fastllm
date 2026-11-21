@@ -36,6 +36,20 @@ const void *FastllmDsv41PrepareKernel();
 void FastllmDsv41MegaRunLocalPost(FastllmDsv41MegaLayer *layer, const void *input,
     const int32_t *ids, const float *scores, const void *residual, const float *post,
     const float *comb, void *hidden, int localRows, void *stream);
+struct FastllmDsv41InputPacket {
+    uint8_t *codes = nullptr, *scales = nullptr, *sharedScales = nullptr;
+    int sharedScaleRows = 0;
+    int64_t *routeIds = nullptr;
+    float *routeScores = nullptr;
+    int *routeOrder = nullptr;
+};
+bool FastllmCudaV41SelectAndPublish(float *logits, const float *bias, int *ids, float *scores, int rows,
+                                    float scale, FastllmDsv41InputPacket packet);
+FastllmDsv41InputPacket FastllmDsv41OwnerInputPacket(FastllmDsv41MegaLayer *layer, int rows);
+void *FastllmDsv41PackLocalInput(FastllmDsv41MegaLayer *layer, const void *input, int localRows);
+void FastllmDsv41MegaRunLocalPacket(FastllmDsv41MegaLayer *layer, const void *input,
+    const int32_t *ids, const float *scores, const void *residual, const float *post,
+    const float *comb, void *hidden, int localRows, void *stream, void *mixDone, void *packetReady, bool packed = false, bool routesReady = false);
 void FastllmDsv41MegaRunLocalPostAfterMix(FastllmDsv41MegaLayer *layer, const void *input,
     const int32_t *ids, const float *scores, const void *residual, const float *post,
     const float *comb, void *hidden, int localRows, void *stream, void *mixDone);

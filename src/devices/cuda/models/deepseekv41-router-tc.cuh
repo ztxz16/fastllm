@@ -199,9 +199,10 @@ cudaError_t V41TcLaunchPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, 
 }
 
 // Each warp owns a row. Values and corrected selection scores stay in registers.
-template <int N, int TopK, bool RawLogits = false>
+template <int N, int TopK, bool RawLogits = false, bool Publish = false>
 __global__ void V41TcRouterTopK(float *input, const float *bias, int *ids, float *weights,
-                                float scale, float invTemp) {
+                                float scale, float invTemp, int64_t *routeIds = nullptr,
+                                float *routeWeights = nullptr, int *order = nullptr) {
 #if __CUDA_ARCH__ >= 800
     static_assert(N % 32 == 0 && TopK > 0 && N >= TopK);
     int row = blockIdx.x, lane = threadIdx.x;
@@ -264,5 +265,15 @@ __global__ void V41TcRouterTopK(float *input, const float *bias, int *ids, float
             ids[row * TopK + t] = chosen[t];
             weights[row * TopK + t] = selected[t] * (scale / (total > 0.f ? total : 1.f));
         }
+    if constexpr (Publish) {
+        static_assert(N == 384 && TopK == 6);
+        __syncwarp();
+        if (order) FastllmV41PublishOrder(ids + row * TopK, order + row);
+        if (lane < TopK) {
+            const int i = row * TopK + lane, id = ids[i];
+            routeIds[i] = id < 0 ? -1 : (id % 8) * 48 + id / 8;
+            routeWeights[i] = weights[i];
+        }
+    }
 #endif
 }

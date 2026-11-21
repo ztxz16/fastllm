@@ -21,32 +21,14 @@ __device__ __forceinline__ float2 MixMultiplyAdd(float c, float2 x, float2 acc) 
 #endif
 }
 
-// Sort the six slots by (expert rank, original slot) in each eight-lane
-// subgroup. Stable order preserves both FP32 reductions while keeping the
-// accumulator in registers when IDs vary across real request rows.
-__device__ __forceinline__ int RouteOrder(const int *ids) {
-    const int lane = threadIdx.x & 7;
-    const int expert = lane < 6 ? ids[lane] : -1;
-    int key = ((expert >= 0 ? expert % 8 : 8) << 3) | lane;
-#pragma unroll
-    for (int span = 2; span <= 8; span *= 2) {
-#pragma unroll
-        for (int d = span / 2; d; d /= 2) {
-            const int other = __shfl_xor_sync(0xffffffff, key, d, 8);
-            key = bool(lane & span) == bool(lane & d) ? min(key, other) : max(key, other);
-        }
-    }
-    const int next = __shfl_down_sync(0xffffffff, key, 1, 8);
-    return (key & 7) | (key < 64 ? 8 : 0) | (lane == 5 || key / 8 != next / 8 ? 16 : 0);
-}
-
+template <bool PackedOrder>
 __device__ __forceinline__ float2 ReadExpertSum(const ExpertBoundary &ep, int row, int column, int route) {
     constexpr int maxRows = FastllmDsv41MegaMaxRows / 8;
     float2 values[6], total{}, partial{};
     int order[6];
 #pragma unroll
     for (int k = 0; k < 6; ++k) {
-        order[k] = __shfl_sync(0xffffffff, route, k, 8);
+        order[k] = PackedOrder ? ((static_cast<unsigned>(route) >> (5 * k)) & 31) : __shfl_sync(0xffffffff, route, k, 8);
         const int slot = order[k] & 7;
         const auto value = (order[k] & 8) ? ep.slots[(slot * maxRows + row) * 2560 + column] :
             __floats2bfloat162_rn(0.f, 0.f);
@@ -63,10 +45,10 @@ __device__ __forceinline__ float2 ReadExpertSum(const ExpertBoundary &ep, int ro
     return __bfloat1622float2(__floats2bfloat162_rn(total.x + shared.x, total.y + shared.y));
 }
 
-template <bool PushSums, bool Experts = false, bool Pack = false, bool Quantize = false, bool WriteNorm = true, int Blocks = 4>
+template <bool PushSums, bool Experts = false, bool Pack = false, bool Quantize = false, bool WriteNorm = true, int Blocks = 4, bool MoeInput = false, bool PackedOrder = false>
 __device__ __forceinline__ void PostNormBody(const Pair *attention, const Pair *residual,
         const float *post, const float *comb, const float *pre, const float *weight, float eps,
-        Pair *hidden, Pair *normalized, ExpertBoundary boundary = {}) {
+        Pair *hidden, Pair *normalized, ExpertBoundary boundary = {}, FastllmDsv41InputPacket packet = {}) {
 #if __CUDA_ARCH__ >= 900
     constexpr int width = 2560;
     auto cluster = cooperative_groups::this_cluster();
@@ -86,14 +68,23 @@ __device__ __forceinline__ void PostNormBody(const Pair *attention, const Pair *
     }
     post += row * 4; comb += row * 16; pre += row * 4;
     residual += size_t(row) * 4 * width; hidden += size_t(row) * 4 * width;
-    const int route = Experts ? RouteOrder(boundary.ids + row * 6) : 0;
+    const int route = Experts ? (PackedOrder ? boundary.ids[row] : FastllmV41RouteOrder(boundary.ids + row * 6)) : 0;
+    float2 normWeight[3];
+    if constexpr (MoeInput) {
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const int d = tid + k * 1024;
+            if (d < width)
+                asm volatile("ld.global.v2.f32 {%0,%1}, [%2];" : "=f"(normWeight[k].x), "=f"(normWeight[k].y) : "l"(weight + 2 * d));
+        }
+    }
     float2 saved[3];
     float sum = 0.f;
 #pragma unroll
     for (int k = 0; k < 3; ++k) {
         const int d = tid + k * 1024;
         if (d >= width) continue;
-        const float2 x = Experts ? ReadExpertSum(boundary, row, d, route) : __bfloat1622float2(attention[row * width + d]);
+        const float2 x = Experts ? ReadExpertSum<PackedOrder>(boundary, row, d, route) : __bfloat1622float2(attention[row * width + d]);
         float2 r[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) r[i] = __bfloat1622float2(residual[i * width + d]);
@@ -149,9 +140,27 @@ __device__ __forceinline__ void PostNormBody(const Pair *attention, const Pair *
     for (int k = 0; k < 3; ++k) {
         const int d = tid + k * 1024;
         if (d < width) {
-            const Pair value = __floats2bfloat162_rn(saved[k].x * scale * weight[2 * d],
-                                                     saved[k].y * scale * weight[2 * d + 1]);
+            const Pair value = __floats2bfloat162_rn(saved[k].x * scale * (MoeInput ? normWeight[k].x : weight[2 * d]),
+                                                     saved[k].y * scale * (MoeInput ? normWeight[k].y : weight[2 * d + 1]));
             if constexpr (WriteNorm) normalized[row * width + d] = value;
+            if constexpr (MoeInput) {
+                const auto v = __bfloat1622float2(value);
+                float maximum = fmaxf(fabsf(v.x), fabsf(v.y));
+#pragma unroll
+                for (int offset = 8; offset; offset >>= 1)
+                    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset, 16));
+                // The E4M3 exponent and minimum scale exactly match MegaMoE prepare.
+                const unsigned exponent = max((__float_as_uint(maximum) + 0x1fffffu) >> 23, 113u) - 8u;
+                const float inverse = __uint_as_float((254u - exponent) << 23);
+                const auto fp8 = __nv_fp8x2_e4m3(make_float2(v.x * inverse, v.y * inverse));
+                reinterpret_cast<uint16_t *>(packet.codes)[row * width + d] = fp8.__x;
+                if ((d & 15) == 0) {
+                    const int group = d / 16;
+                    packet.scales[row * 160 + group] = exponent;
+                    const int sfRow = row / 16 * 128 + row % 16 * 4;
+                    packet.sharedScales[(group / 4 * packet.sharedScaleRows + sfRow) * 4 + group % 4] = exponent;
+                }
+            }
             if constexpr (Pack) V41PackNormalizedPair(value, boundary.codes, boundary.scales, boundary.pitch, row, width, d);
             if constexpr (Quantize) {
                 const auto v = __bfloat1622float2(value);
@@ -175,11 +184,18 @@ __global__ __launch_bounds__(256) void PostNormCluster(const Pair *attention, co
     PostNormBody<PushSums, false, false, false, true, Blocks>(attention, residual, post, comb, pre, weight, eps, hidden, normalized);
 }
 
-template <bool Pack, bool Quantize, bool WriteNorm = true, int Blocks = 4>
+__global__ __launch_bounds__(128) void PostNormPacket(const Pair *attention, const Pair *residual,
+        const float *post, const float *comb, const float *pre, const float *weight, float eps,
+        Pair *hidden, Pair *normalized, FastllmDsv41InputPacket packet) {
+    PostNormBody<true, false, false, false, true, 8, true>(attention, residual, post, comb, pre,
+        weight, eps, hidden, normalized, {}, packet);
+}
+
+template <bool Pack, bool Quantize, bool WriteNorm = true, int Blocks = 4, bool PackedOrder = false>
 __global__ __launch_bounds__(256) void ExpertResidualNorm(
         const Pair *residual, const float *post, const float *comb, const float *pre,
         const float *weight, float eps, Pair *hidden, Pair *normalized, ExpertBoundary boundary) {
-    PostNormBody<true, true, Pack, Quantize, WriteNorm, Blocks>(nullptr, residual, post, comb, pre, weight, eps,
+    PostNormBody<true, true, Pack, Quantize, WriteNorm, Blocks, false, PackedOrder>(nullptr, residual, post, comb, pre, weight, eps,
                                             hidden, normalized, boundary);
 }
 
@@ -213,6 +229,7 @@ __global__ void TensorSinkhorn(const Bf *x, const float *projected, const float 
 struct StreamPlan {
     int rows = 0, device = -1;
     bool pushSums = false;
+    bool packetCluster8 = false;
     int blocks = 4;
     fastllm_v41_hc_graph::OwnerMixGemm gemm;
     cudaEvent_t ready = nullptr, done = nullptr;
@@ -241,6 +258,15 @@ void *FastllmCudaV41CreateOwnerStream(int rows) {
     if (maxCluster < 4) return nullptr;
     auto p = std::make_unique<StreamPlan>();
     p->rows = rows; p->pushSums = push; p->blocks = wide && maxCluster >= 8 ? 8 : 4;
+    if (push && p->blocks == 4) {
+        cfg.gridDim.x = 8;
+        cfg.blockDim.x = 128;
+        int packetClusterSize = 0;
+        if (cudaOccupancyMaxPotentialClusterSize(&packetClusterSize, PostNormPacket, &cfg) == cudaSuccess)
+            p->packetCluster8 = packetClusterSize >= 8;
+        else
+            cudaGetLastError();
+    }
     if (cudaGetDevice(&p->device) != cudaSuccess || !p->gemm.Prepare(rows >= 16) ||
         cudaEventCreateWithFlags(&p->ready, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&p->done, cudaEventDisableTiming) != cudaSuccess) {
@@ -252,10 +278,10 @@ void *FastllmCudaV41CreateOwnerStream(int rows) {
 void FastllmCudaV41DestroyOwnerStream(void *p) {
     delete static_cast<fastllm_v41_owner_mix::StreamPlan *>(p);
 }
-void *FastllmCudaV41OwnerClusterPost(void *plan, int rows, float *scratch,
+void *FastllmCudaV41OwnerClusterPacket(void *plan, int rows, float *scratch,
         const Data &attention, const Data &residual, const Data &oldPre, const Data &oldPost, const Data &oldComb,
         Data &fn, const Data &scale, const Data &base, const Data &weight, int iterations, float mixEps,
-        float normEps, Data &hidden, Data &pre, Data &post, Data &comb, Data &normalized) {
+        float normEps, Data &hidden, Data &pre, Data &post, Data &comb, Data &normalized, FastllmDsv41InputPacket *packet) {
     using namespace fastllm_v41_owner_mix;
     if (!plan || !scratch) return nullptr;
     auto &p = *static_cast<StreamPlan *>(plan);
@@ -283,10 +309,22 @@ void *FastllmCudaV41OwnerClusterPost(void *plan, int rows, float *scratch,
     cudaLaunchConfig_t cfg{}; cfg.gridDim = dim3(p.blocks, rows); cfg.blockDim = dim3(1024 / p.blocks);
     cfg.stream = cudaStreamPerThread; cfg.attrs = &attr; cfg.numAttrs = 1;
     auto kernel = p.blocks == 8 ? PostNormCluster<true,8> : (p.pushSums ? PostNormCluster<true> : PostNormCluster<false>);
-    check(cudaLaunchKernelEx(&cfg, kernel, (const Pair *)attention.cudaData,
-        (const Pair *)residual.cudaData, (const float *)oldPost.cudaData, (const float *)oldComb.cudaData,
-        (const float *)oldPre.cudaData, (const float *)weight.cudaData, normEps, (Pair *)hidden.cudaData,
-        (Pair *)normalized.cudaData));
+    if (packet && packet->codes && p.packetCluster8 &&
+        (reinterpret_cast<uintptr_t>(weight.cudaData) & (alignof(float2) - 1)) == 0) {
+        attr.val.clusterDim.x = 8;
+        cfg.gridDim.x = 8;
+        cfg.blockDim.x = 128;
+        check(cudaLaunchKernelEx(&cfg, PostNormPacket, (const Pair *)attention.cudaData,
+            (const Pair *)residual.cudaData, (const float *)oldPost.cudaData, (const float *)oldComb.cudaData,
+            (const float *)oldPre.cudaData, (const float *)weight.cudaData, normEps, (Pair *)hidden.cudaData,
+            (Pair *)normalized.cudaData, *packet));
+    } else {
+        if (packet) *packet = {};
+        check(cudaLaunchKernelEx(&cfg, kernel, (const Pair *)attention.cudaData,
+            (const Pair *)residual.cudaData, (const float *)oldPost.cudaData, (const float *)oldComb.cudaData,
+            (const float *)oldPre.cudaData, (const float *)weight.cudaData, normEps, (Pair *)hidden.cudaData,
+            (Pair *)normalized.cudaData));
+    }
     check(cudaEventRecord(p.ready, cudaStreamPerThread));
     check(cudaStreamWaitEvent(p.gemm.stream, p.ready));
     if (packed) {

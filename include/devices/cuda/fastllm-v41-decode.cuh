@@ -131,10 +131,18 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const fastllm::Data &input, fastl
 // One auxiliary stream and an optional private cuBLAS workspace per owner graph.
 void *FastllmCudaV41CreateOwnerStream(int rows);
 void FastllmCudaV41DestroyOwnerStream(void *plan);
+struct FastllmDsv41InputPacket;
+bool FastllmCudaV41OwnerRouterPacket(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &bias,
+        float temperature, float scale, fastllm::Data &logits, fastllm::Data &ids, fastllm::Data &scores,
+        const FastllmDsv41InputPacket &packet);
 void *FastllmCudaV41OwnerClusterPost(void *plan, int rows, float *scratch,
         const fastllm::Data &attention, const fastllm::Data &residual, const fastllm::Data &oldPre, const fastllm::Data &oldPost, const fastllm::Data &oldComb,
         fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base, const fastllm::Data &weight, int iterations, float mixEps,
         float normEps, fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb, fastllm::Data &normalized);
+void *FastllmCudaV41OwnerClusterPacket(void *plan, int rows, float *scratch,
+        const fastllm::Data &attention, const fastllm::Data &residual, const fastllm::Data &oldPre, const fastllm::Data &oldPost, const fastllm::Data &oldComb,
+        fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base, const fastllm::Data &weight, int iterations, float mixEps,
+        float normEps, fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb, fastllm::Data &normalized, FastllmDsv41InputPacket *packet);
 extern "C" void *FastllmCudaV41ForkOwnerMix(const void *const *children, int count, int rows, float *scratch, const void *postKernel, const void *prepareKernel, void **ownerGemm);
 extern "C" void *FastllmCudaV41ForkOwnerMixQuery(const void *const *children, int count, int rows, float *scratch, const void *postKernel, const void *prepareKernel, void **ownerGemm, bool keepQuery);
 extern "C" void FastllmCudaV41DestroyOwnerMixGemm(void *plan);

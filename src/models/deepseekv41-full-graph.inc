@@ -1368,19 +1368,23 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                             auto *a = g->ownerFfn[rank].get();
                             auto *local = a ? g->attentionStates[rank]->workspace.get() : nullptr;
                             const int m = a ? g->attentionGraphs[rank]->batch : 0;
-                            void *mixReady = nullptr;
+                            void *mixReady = nullptr, *packetReady = nullptr;
+                            FastllmDsv41InputPacket packet{};
+                            bool routesReady = false;
                             if (a) {
                                 auto w = [&](const char *suffix) -> Data & {
                                     return V41FullLocal(weight[prefix + suffix], device);
                                 };
                                 Data &fn = w(".hc_ffn_fn"), &scale = w(".hc_ffn_scale"), &base = w(".hc_ffn_base");
                                 Data &norm = w(".ffn_norm.weight");
-                                if (a->clusterMix)
-                                    mixReady = FastllmCudaV41OwnerClusterPost(a->clusterMix, m,
+                                if (a->clusterMix) {
+                                    packet = FastllmDsv41OwnerInputPacket(g->ownerExperts[l][rank], m);
+                                    mixReady = FastllmCudaV41OwnerClusterPacket(a->clusterMix, m,
                                         static_cast<float *>(a->mixScratch.cudaData), local->attnProj,
                                         local->hiddenStates, local->attnPre, local->attnPost, local->attnComb,
                                         fn, scale, base, norm, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
-                                        a->residual, local->preMix, a->post, a->comb, a->input);
+                                        a->residual, local->preMix, a->post, a->comb, a->input, &packet);
+                                }
                                 bool fused = mixReady || FastllmCudaDeepSeekV41HcPostMixPreNorm(local->attnProj,
                                     local->hiddenStates, local->attnPre, local->attnPost, local->attnComb,
                                     fn, scale, base, norm, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
@@ -1397,22 +1401,33 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                         FastllmCudaDeepSeekV41HcPreNorm(a->residual, local->attnPre, norm,
                                             rms_norm_eps, a->input), "owner-local FFN normalization failed");
                                 }
+                                if (!mixReady || !packet.codes)
+                                    packetReady = FastllmDsv41PackLocalInput(g->ownerExperts[l][rank], a->input.cudaData, m);
                                 auto &rw = w(".ffn.gate.weight"), &bias = w(".ffn.gate.bias");
-                                if (!FastllmCudaV41OwnerRouterSelect(a->input,rw,bias,gate_temp,routed_scaling_factor,
+                                if (packetReady) packet = FastllmDsv41OwnerInputPacket(g->ownerExperts[l][rank], m);
+                                if ((packetReady || mixReady) && packet.routeIds && m >= 16)
+                                    routesReady = FastllmCudaV41OwnerRouterPacket(a->input,rw,bias,gate_temp,
+                                        routed_scaling_factor,a->logits,a->ids,a->scores,packet);
+                                if (!routesReady && !FastllmCudaV41OwnerRouterSelect(a->input,rw,bias,gate_temp,routed_scaling_factor,
                                         a->logits,a->ids,a->scores)) {
-                                    AssertInFastLLM(FastllmCudaV41RouterScores(a->input,rw,gate_temp,a->logits) &&
-                                        FastllmCudaSelectExpert(a->logits,&bias,a->ids,a->scores,6,true,
-                                            routed_scaling_factor), "owner-local FFN routing failed");
+                                    AssertInFastLLM(FastllmCudaV41RouterScores(a->input,rw,gate_temp,a->logits),
+                                                    "owner-local FFN router projection failed");
+                                    if (mixReady && packet.routeIds)
+                                        routesReady = FastllmCudaV41SelectAndPublish((float *)a->logits.cudaData,
+                                            (const float *)bias.cudaData, (int *)a->ids.cudaData, (float *)a->scores.cudaData,
+                                            m, routed_scaling_factor, packet);
+                                    AssertInFastLLM(routesReady || FastllmCudaSelectExpert(a->logits,&bias,a->ids,a->scores,
+                                            6,true,routed_scaling_factor), "owner-local FFN selection failed");
                                 }
                             }
                             FastllmCudaGraphRecordCollective();
-                            FastllmDsv41MegaRunLocalPostAfterMix(g->ownerExperts[l][rank], a ? a->input.cudaData : nullptr,
+                            FastllmDsv41MegaRunLocalPacket(g->ownerExperts[l][rank], a ? a->input.cudaData : nullptr,
                                 a ? static_cast<int32_t *>(a->ids.cudaData) : nullptr,
                                 a ? static_cast<float *>(a->scores.cudaData) : nullptr,
                                 a ? a->residual.cudaData : nullptr,
                                 a ? static_cast<float *>(a->post.cudaData) : nullptr,
                                 a ? static_cast<float *>(a->comb.cudaData) : nullptr,
-                                a ? local->hiddenStates.cudaData : nullptr, m, nullptr, mixReady);
+                                a ? local->hiddenStates.cudaData : nullptr, m, nullptr, mixReady, packetReady, mixReady && packet.codes, routesReady);
                             if (publish) {
                                 parallel::CudaRowTransfer::Field fields[] = {
                                     {a ? local->hiddenStates.cudaData : nullptr,
@@ -1535,6 +1550,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 }
                 if (layer.config.kvSource)
                     b.compressNorm = ptr(weight[prefix + ".attn.compressor.norm.weight"]);
+                if (layer.config.kvSource && layer.config.indexSource) {
+                    auto &norm = weight[prefix + ".attn.indexer.k_norm.weight"];
+                    if (norm.dataType == DataType::FLOAT32 && norm.Count(0) == 128)
+                        b.indexNorm = static_cast<const float *>(ptr(norm));
+                }
                 layer.plans[rank] = FastllmCudaV41CreateFullDecode(layer.config, b);
                 // Hidden-state dependencies serialize every layer's attention,
                 // including when independent mHC/MoE branches overlap.
@@ -1570,32 +1590,46 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 AssertInFastLLM(V41FullUploadRank(*g, segments, rank, device),
                                 "full graph initial metadata rejected");
             });
-            auto captureAttention = [&](bool allIndices) { capture([&] {
-                V41FullDispatch(*g, [&](int rank, int) {
-                    AssertInFastLLM(FastllmCudaV41PrepareFullDecode(layer.plans[rank]),
-                                    "full graph prepare failed");
-                });
-                if (layer.config.kvSource && layer.config.indexSource) {
-                    LinearWithActivationQuant(layer.latents, prefix + ".attn.indexer.wk.weight",
-                                              layer.keys, true);
-                    V41RMSNormBF16(layer.keys, weight[prefix + ".attn.indexer.k_norm.weight"],
-                                   rms_norm_eps, layer.keys);
-                }
-                V41FullDispatch(*g, [&](int rank, int) {
-                    AssertInFastLLM((allIndices ? FastllmCudaV41FinishAllIndices : FastllmCudaV41FinishFullDecode)(layer.plans[rank]),
-                                    "full graph attention failed");
+            auto captureAttention = [&](bool allIndices) {
+                const bool publish = allIndices &&
+                    std::all_of(layer.plans.begin(), layer.plans.end(), FastllmCudaV41CanPublishSource);
+                capture([&] {
+                    V41FullDispatch(*g, [&](int rank, int) {
+                        auto *plan = layer.plans[rank];
+                        const bool prepared = allIndices ? FastllmCudaV41PrepareAllIndices(plan, publish) :
+                                                          FastllmCudaV41PrepareFullDecode(plan);
+                        AssertInFastLLM(prepared, "full graph prepare failed");
+                    });
+                    if (layer.config.kvSource && layer.config.indexSource) {
+                        LinearWithActivationQuant(layer.latents, prefix + ".attn.indexer.wk.weight", layer.keys, true);
+                        if (!publish)
+                            V41RMSNormBF16(layer.keys, weight[prefix + ".attn.indexer.k_norm.weight"], rms_norm_eps, layer.keys);
+                    }
+                    V41FullDispatch(*g, [&](int rank, int) {
+                        auto *plan = layer.plans[rank];
+                        const bool finished = publish ? FastllmCudaV41FinishSource(plan) :
+                            allIndices ? FastllmCudaV41FinishAllIndices(plan) : FastllmCudaV41FinishFullDecode(plan);
+                        AssertInFastLLM(finished, "full graph attention failed");
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-                    if (layer.outputProjection)
-                        AssertInFastLLM(FastllmCudaV41RunOutput(layer.outputProjection),
-                                        "full graph output projection failed");
+                        if (layer.outputProjection)
+                            AssertInFastLLM(FastllmCudaV41RunOutput(layer.outputProjection),
+                                            "full graph output projection failed");
 #endif
+                    });
                 });
-            }); };
+            };
             captureAttention(false);
             if (attentionOnly && !verifying && layer.config.indexSource && V41EnvFlag("FASTLLM_DSV41_SHORT_INDEX")) {
                 const auto ordinary = children[0].back();
                 captureAttention(true);
-                g->allIndexChildren[ordinary] = {layer.config.ratio, children[0].back()};
+                auto selected = children[0].back();
+                if (FastllmCudaV41CanPublishSource(layer.plans[0])) {
+                    if (auto fork = FastllmCudaV41ForkSourceStore(selected)) {
+                        g->splitAttentionChildren.push_back(fork);
+                        selected = fork;
+                    }
+                }
+                g->allIndexChildren[ordinary] = {layer.config.ratio, selected};
                 children[0].pop_back();
             }
             } // dynamic local/world attention
@@ -1629,10 +1663,25 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                             auto alternative = input;
                             auto replacement = g->allIndexChildren.at(input[1]);
                             alternative[1] = replacement.second;
-                            auto prefixGraph = FastllmCudaV41GraphPrefix(prelude.graphs[0], prelude.beforeIndexProjection,
-                                prelude.compressorInput, prelude.beforeCompressor);
+                            auto prefixGraph = prelude.indexProjectionNodes.empty() ? nullptr :
+                                FastllmCudaV41WithoutIndexProjections(prelude.graphs[0], prelude.indexProjectionNodes);
+                            if (V41DecodeCudaGraphVerbose() && batch >= 16 && g->devices.front() == 0)
+                                printf("[Fastllm] short index prelude layer=%d rows=%d projection_nodes=%zu trimmed=%d frontier=%d\n",
+                                    l, batch, prelude.indexProjectionNodes.size(), int(prefixGraph != nullptr),
+                                    int(prelude.beforeIndexProjection != nullptr));
+                            if (!prefixGraph)
+                                prefixGraph = FastllmCudaV41GraphPrefix(prelude.graphs[0], prelude.beforeIndexProjection,
+                                    prelude.compressorInput, prelude.beforeCompressor);
                             if (prefixGraph) {
                                 alternative[0] = prefixGraph;
+                                if (prelude.beforeCompressor && prelude.compressorInput &&
+                                    FastllmV41HcEnabledAtRows("FASTLLM_DSV41_EARLY_COMPRESS", batch)) {
+                                    if (auto core = FastllmCudaV41MoveSourceToPrelude(prefixGraph,
+                                            prelude.beforeIndexProjection, alternative[1])) {
+                                        alternative[1] = core;
+                                        g->splitAttentionChildren.push_back(core);
+                                    }
+                                }
                                 g->splitAttentionChildren.push_back(prefixGraph);
                             }
                             if (auto shortFork = FastllmCudaV41ForkOwnerMixQuery(alternative.data(), alternative.size(), batch,

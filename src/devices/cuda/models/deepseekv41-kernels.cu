@@ -25,10 +25,14 @@ SOFTWARE.
 #endif
 #include "deepseekv41-router.cuh"
 #include "deepseekv41-indexer.cuh"
+#ifndef USE_ROCM
+#include "devices/cuda/fastllm-v41-route-order.cuh"
+#endif
 #include "deepseekv41-router-tc.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include "fastllm-v41-decode.cuh"
+#include "devices/cuda/fastllm-dsv41-mega.h"
 //
 // DeepSeek-V4.1 专用 CUDA kernel。
 //
@@ -5134,7 +5138,7 @@ extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
 
 static bool V41RouterSelectImpl(const Data &input, Data &weight,
         Data &bias, float temperature, float routeScale, Data &logits,
-        Data &indices, Data &scores, int topk, bool ownerDecode) {
+        Data &indices, Data &scores, int topk, bool ownerDecode, const FastllmDsv41InputPacket *packet = nullptr) {
 #ifdef CUDA_NO_TENSOR_CORE
     return false;
 #else
@@ -5149,6 +5153,8 @@ static bool V41RouterSelectImpl(const Data &input, Data &weight,
     const int experts = weight.dims[0];
     const int rows = input.Count(0) / input.dims.back();
     const int arch = FastllmCudaRuntimeArch();
+    if (packet && (!ownerDecode || rows < 16 || arch != 103 || experts != 384 || weight.dims[1] != 5120))
+        return false;
     // Keep tall prefill matrices on GEMM; this split-K pipeline targets
     // batches whose row count is comparable to the small router width.
     if (rows < 5 || rows > 2 * experts || arch < 80) return false;
@@ -5186,9 +5192,15 @@ static bool V41RouterSelectImpl(const Data &input, Data &weight,
                 input.cudaData, CUDA_R_16BF, weight.dims[1], &beta, logits.cudaData, CUDA_R_32F, experts,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
             if (gemm == CUBLAS_STATUS_SUCCESS) {
-                V41TcRouterTopK<384, 6, true><<<rows, 32, 0, cudaStreamPerThread>>>(
-                    (float*)logits.cudaData, (const float*)bias.cudaData, (int*)indices.cudaData,
-                    (float*)scores.cudaData, routeScale, invTemp);
+                if (packet) {
+                    V41TcRouterTopK<384, 6, true, true><<<rows, 32, 0, cudaStreamPerThread>>>(
+                        (float *)logits.cudaData, (const float *)bias.cudaData, (int *)indices.cudaData,
+                        (float *)scores.cudaData, routeScale, invTemp, packet->routeIds, packet->routeScores, packet->routeOrder);
+                } else {
+                    V41TcRouterTopK<384, 6, true><<<rows, 32, 0, cudaStreamPerThread>>>(
+                        (float*)logits.cudaData, (const float*)bias.cudaData, (int*)indices.cudaData,
+                        (float*)scores.cudaData, routeScale, invTemp);
+                }
                 return V41CheckLaunch("RouterGemmTopK");
             }
             if (gemm != CUBLAS_STATUS_NOT_SUPPORTED && gemm != CUBLAS_STATUS_ARCH_MISMATCH &&
@@ -5197,6 +5209,7 @@ static bool V41RouterSelectImpl(const Data &input, Data &weight,
         }
     }
 #endif
+    if (packet) return false;
     const bool pdl = arch >= 90 && target->second >= 90;
     const bool cluster = pdl && arch < 100 && weight.dims[1] == 5120;
     // Bound persistent split-K scratch, independently of the logical batch.
@@ -5234,7 +5247,7 @@ static bool V41RouterSelectImpl(const Data &input, Data &weight,
     cudaLaunchAttribute attr = {}; attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr.val.programmaticStreamSerializationAllowed = 1; cfg.attrs = &attr; cfg.numAttrs = pdl ? 1 : 0;
     status = cudaLaunchKernelEx(&cfg, select, (float*)logits.cudaData,
-        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale, invTemp);
+        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale, invTemp, (int64_t *)nullptr, (float *)nullptr, (int *)nullptr);
     if (status != cudaSuccess) { cudaGetLastError(); return false; }
     return V41CheckLaunch("RouterTopK");
 #else
@@ -5251,6 +5264,11 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     return V41RouterSelectImpl(input, weight, bias, temperature, routeScale, logits, indices, scores, topk, false);
 }
 
+bool FastllmCudaV41OwnerRouterPacket(const Data &input, Data &weight, Data &bias, float temperature,
+        float routeScale, Data &logits, Data &indices, Data &scores, const FastllmDsv41InputPacket &packet) {
+    return packet.routeIds && packet.routeScores &&
+        V41RouterSelectImpl(input,weight,bias,temperature,routeScale,logits,indices,scores,6,true,&packet);
+}
 extern "C" bool FastllmCudaV41OwnerRouterSelect(const Data &input, Data &weight, Data &bias,
         float temperature, float routeScale, Data &logits, Data &indices, Data &scores) {
     return V41RouterSelectImpl(input, weight, bias, temperature, routeScale, logits, indices, scores, 6, true);
@@ -7269,7 +7287,7 @@ struct V41FullDecodePlan {
     std::shared_ptr<FastllmV41MlaWorkspace> mla;
     bool directMlaOutput = false;
 #endif
-    bool directRing = false, earlyHistory = false;
+    bool directRing = false, earlyHistory = false, shortPages = false;
     bool scalarAttention = false, scalarIndex = false;
     bool indexPairs = false, indexPairNarrow = false;
     bool qkPrefetch = false, wideTopKMerge = false, indexPrefetch = false;
@@ -7477,6 +7495,69 @@ __global__ void V41FullDecodeGather(const FastllmV41FullDecodeRequest *requests,
     }
 }
 
+// Keep the pre-RoPE BF16 latent for Wk while writing the independent main KV
+// record from shared memory. Each request owns its own C2 tail and output page.
+__global__ void V41PublishCompressed(FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
+        const FastllmV41FullDecodeRequest *requests, V41RopeTable rope) {
+    const int row = blockIdx.x, d = threadIdx.x;
+    const auto r = requests[row];
+    const bool ready = (r.position + 1) % c.ratio == 0;
+    float value = static_cast<const float *>(b.rawKV)[size_t(row) * 512 + d];
+    if (c.ratio == 2) {
+        const float score = static_cast<const float *>(b.rawScore)[size_t(row) * 512 + d];
+        const float old = ready ? static_cast<const float *>(r.rawTailKV)[d] : value;
+        const float prev = ready ? static_cast<const float *>(r.rawTailScore)[d] : score;
+        if (!ready) {
+            static_cast<float *>(r.rawTailKV)[d] = value;
+            static_cast<float *>(r.rawTailScore)[d] = score;
+        }
+        const float mx = fmaxf(fmaxf(-FLT_MAX, prev), score);
+        const float a = __expf(prev - mx), z = __expf(score - mx);
+        float acc = 0.f;
+        acc += a * old; acc += z * value;
+        value = acc / (a + z);
+    }
+    __shared__ float partial[32];
+    __shared__ __nv_bfloat16 transformed[512];
+    value = V41Bf16Round(value);
+    const float ss = V41BlockSum<512>(value * value, partial);
+    const auto latent = __float2bfloat16_rn(static_cast<const float *>(b.compressNorm)[d] * value *
+                                            rsqrtf(ss / 512.f + c.normEps));
+    static_cast<__nv_bfloat16 *>(b.latents)[size_t(row) * 512 + d] = latent;
+    if (!ready) return;
+    transformed[d] = latent;
+    __syncthreads();
+    const int pos = (r.position / c.ratio) * c.ratio;
+    V41DecodeTransformRow({transformed, nullptr, 1, 512, pos, 3, 0, 16}, 0, d, rope, c.ropeDim, c.window);
+    __syncthreads();
+    if (d < kKvQuantThreads)
+        V41QuantizeKVRow(transformed, static_cast<uint8_t *>(r.compressedKV) +
+            size_t(r.position / c.ratio) * c.cmpRowBytes, 512, c.cmpMode, 16);
+}
+
+__global__ void V41PublishIndexK(FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
+        const FastllmV41FullDecodeRequest *requests, V41RopeTable rope) {
+    const int row = blockIdx.x, d = threadIdx.x;
+    const auto r = requests[row];
+    if ((r.position + 1) % c.ratio) return;
+    const auto *key = static_cast<const __nv_bfloat16 *>(b.newIndexKeys) + row * 128;
+    __shared__ float partial[4];
+    __shared__ __nv_bfloat16 norm[128];
+    float sum = 0.f;
+    if (d < 64) {
+        const auto v = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 *>(key)[d]);
+        sum += v.x * v.x + v.y * v.y;
+    }
+    // Match the 64-thread BF16 RMSNorm tree (two nonzero warp sums).
+    const float ss = V41BlockSum<128>(sum, partial);
+    norm[d] = __float2bfloat16_rn(__bfloat162float(key[d]) * rsqrtf(ss / 128.f + c.normEps) * b.indexNorm[d]);
+    __syncthreads();
+    V41DecodeTransformRow({norm, nullptr, 1, 128, (r.position / c.ratio) * c.ratio, 2, 0, 32},
+                          0, d, rope, c.ropeDim, c.window);
+    __syncthreads();
+    V41QuantizeKVRow(norm, static_cast<uint8_t *>(r.indexK) + size_t(r.position / c.ratio) * c.indexRowBytes,
+                     128, c.indexMode, 32);
+}
 __global__ void V41FullDecodeAppend(const FastllmV41FullDecodeRequest *requests,
         const __nv_bfloat16 *latent, const __nv_bfloat16 *keys, int ratio, bool indexSource) {
     const auto r = requests[blockIdx.x];
@@ -7725,6 +7806,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
             p->mla = FastllmV41CreateMla(c, V41EnvOn("FASTLLM_DSV41_MLA_EXACT_ATTENTION"));
         p->earlyHistory = p->mla && p->mla->paged && !p->mla->outputOnly && !c.verifying &&
             !c.kvSource && !c.indexSource && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_EARLY_HISTORY", c.batch);
+        p->shortPages = p->mla && p->mla->paged && !p->mla->outputOnly && c.indexSource && !c.verifying &&
+            FastllmV41HcEnabledAtRows("FASTLLM_DSV41_SHORT_PAGES", c.batch);
     }
 #endif
     return p.release();
@@ -7949,7 +8032,13 @@ __global__ void V41PackExactAttention(const V41DecodeTransformDescriptor *transf
 }
 #endif
 
-bool FastllmCudaV41PrepareFullDecode(void *handle) {
+bool FastllmCudaV41CanPublishSource(const void *handle) {
+    const auto *p = static_cast<const V41FullDecodePlan *>(handle);
+    return p && p->shortPages && p->config.kvSource && p->config.indexSource && p->buffers.indexNorm &&
+        p->config.indexMode == 2 && (p->config.ratio == 1 || p->config.ratio == 2) &&
+        !V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_SOURCE_PUBLISH", p->config.batch);
+}
+static bool V41PrepareDecode(void *handle, bool allIndices, bool publish) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
@@ -7957,7 +8046,8 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
     uint8_t *mlaRing = nullptr;
     float *angles = nullptr;
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
-    if (p->earlyHistory) mlaRing = static_cast<uint8_t *>(p->mla->keys);
+    if (p->earlyHistory || (allIndices && p->shortPages && !c.kvSource))
+        mlaRing = static_cast<uint8_t *>(p->mla->keys);
     if (p->mla && !p->mla->outputOnly) { packedQuery = static_cast<__nv_bfloat16 *>(p->mla->query); angles = p->mla->angles; }
 #endif
     bool nativeQuery = false;
@@ -7973,7 +8063,9 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
     });
     if (c.ringMode && !p->directRing)
         V41FullVerifyPackWindow<<<c.batch, kKvQuantThreads, 0, cudaStreamPerThread>>>(c, b);
-    if (c.kvSource) {
+    if (publish) {
+        V41PublishCompressed<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests, p->rope);
+    } else if (c.kvSource) {
         if (c.verifying)
             V41FullVerifyGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
         else
@@ -7986,6 +8078,36 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
             static_cast<__nv_bfloat16 *>(b.latents));
     }
     return V41CheckLaunch("FullDecodePrepare");
+}
+
+bool FastllmCudaV41PrepareFullDecode(void *handle) { return V41PrepareDecode(handle, false, false); }
+bool FastllmCudaV41PrepareAllIndices(void *handle, bool publishSource) {
+    return (!publishSource || FastllmCudaV41CanPublishSource(handle)) && V41PrepareDecode(handle, true, publishSource);
+}
+
+// cuBLAS and other projection implementations can leave several capture
+// frontiers. Record node identity without changing the graph's dependencies.
+std::vector<void *> FastllmCudaV41CaptureNodes() {
+#if defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103) && !defined(USE_ROCM) && CUDART_VERSION >= 12000
+    cudaGraph_t graph = nullptr;
+    cudaStreamCaptureStatus status;
+#if CUDART_VERSION >= 13000
+    const auto rc = cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, nullptr, nullptr, nullptr);
+#else
+    const auto rc = cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, &graph, nullptr, nullptr);
+#endif
+    size_t count = 0;
+    if (rc != cudaSuccess || status != cudaStreamCaptureStatusActive || !graph ||
+        cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess || !count) {
+        cudaGetLastError();
+        return {};
+    }
+    std::vector<cudaGraphNode_t> nodes(count);
+    if (cudaGraphGetNodes(graph, nodes.data(), &count) == cudaSuccess)
+        return {nodes.begin(), nodes.end()};
+    cudaGetLastError();
+#endif
+    return {};
 }
 
 // Store the actual CUDA stream frontier before the index-only Q projections.
@@ -8062,11 +8184,13 @@ __global__ void V41DecodeAllIndices(int *indices, int width) {
     for (int i = threadIdx.x; i < width; i += blockDim.x)
         indices[size_t(blockIdx.x) * width + i] = i;
 }
-static bool V41FinishDecode(void *handle, bool allIndices) {
+static bool V41FinishDecode(void *handle, bool allIndices, bool publish = false) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
-    if (c.kvSource) {
+    if (publish) {
+        V41PublishIndexK<<<c.batch, 128, 0, cudaStreamPerThread>>>(c, b, p->requests, p->rope);
+    } else if (c.kvSource) {
         V41FullDecodeTransforms(*p, 2, 1);
         if (c.indexSource)
             V41FullDecodeTransforms(*p, 3, 1);
@@ -8076,7 +8200,8 @@ static bool V41FinishDecode(void *handle, bool allIndices) {
             static_cast<const __nv_bfloat16 *>(b.latents), static_cast<const __nv_bfloat16 *>(b.newIndexKeys), c.ratio, c.indexSource);
     }
     if (allIndices && c.indexSource) {
-        V41DecodeAllIndices<<<c.batch, 128, 0, cudaStreamPerThread>>>(static_cast<int *>(b.topk), c.topK);
+        if (!p->shortPages)
+            V41DecodeAllIndices<<<c.batch, 128, 0, cudaStreamPerThread>>>(static_cast<int *>(b.topk), c.topK);
     } else if (c.indexSource) {
         V41FullDecodeTransforms(*p, 4, (c.indexHeads + 3) / 4);
         V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
@@ -8186,7 +8311,8 @@ static bool V41FinishDecode(void *handle, bool allIndices) {
     };
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
     if (p->mla && !p->mla->outputOnly)
-        return FastllmV41RunMla(*p->mla, c, b, p->requests, cudaStreamPerThread, !p->directMlaOutput, p->earlyHistory) == cudaSuccess;
+        return FastllmV41RunMla(*p->mla, c, b, p->requests, cudaStreamPerThread, !p->directMlaOutput,
+                p->earlyHistory || (allIndices && p->shortPages && !c.kvSource), allIndices && p->shortPages) == cudaSuccess;
 #endif
     const bool attentionOk =
 #ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
@@ -8222,6 +8348,105 @@ static bool V41FinishDecode(void *handle, bool allIndices) {
 
 
 bool FastllmCudaV41FinishFullDecode(void *handle) { return V41FinishDecode(handle, false); }
+bool FastllmCudaV41FinishSource(void *handle) {
+    return FastllmCudaV41CanPublishSource(handle) && V41FinishDecode(handle, true, true);
+}
+void *FastllmCudaV41ForkSourceStore(const void *source) {
+#if defined(FASTLLM_ENABLE_DSV41_FLASHMLA) && CUDART_VERSION >= 12000
+    cudaGraph_t g = nullptr;
+    if (cudaGraphClone(&g, (cudaGraph_t)source) != cudaSuccess) return nullptr;
+    auto reject = [&]() -> void * { cudaGetLastError(); cudaGraphDestroy(g); return nullptr; };
+    size_t n = 0;
+    if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess) return reject();
+    std::vector<cudaGraphNode_t> nodes(n);
+    if (cudaGraphGetNodes(g, nodes.data(), &n) != cudaSuccess) return reject();
+    cudaGraphNode_t main = nullptr, index = nullptr, pages = nullptr;
+    for (auto node : nodes) {
+        cudaGraphNodeType type;
+        if (cudaGraphNodeGetType(node, &type) != cudaSuccess) return reject();
+        if (type != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams p{};
+        auto rc = cudaGraphKernelNodeGetParams(node, &p);
+        if (rc == cudaErrorInvalidDeviceFunction) { cudaGetLastError(); continue; }
+        if (rc != cudaSuccess) return reject();
+        if (p.func == (void *)V41PublishCompressed) main = node;
+        if (p.func == (void *)V41PublishIndexK) index = node;
+        if (FastllmV41IsMlaPageKernel(p.func)) pages = node;
+    }
+    cudaGraphNode_t parent = nullptr, flash = nullptr;
+    if (!main || !index || !pages ||
+        FastllmCudaGraphNodeGetDependencies(pages, nullptr, &n) != cudaSuccess || n != 1 ||
+        FastllmCudaGraphNodeGetDependencies(pages, &parent, &n) != cudaSuccess || parent != index ||
+        FastllmCudaGraphNodeGetDependentNodes(pages, nullptr, &n) != cudaSuccess || n != 1 ||
+        FastllmCudaGraphNodeGetDependentNodes(pages, &flash, &n) != cudaSuccess ||
+        FastllmCudaGraphNodeGetDependentNodes(flash, nullptr, &n) != cudaSuccess) return reject();
+    std::vector<cudaGraphNode_t> consumers(n);
+    if (n && FastllmCudaGraphNodeGetDependentNodes(flash, consumers.data(), &n) != cudaSuccess) return reject();
+    // No following projection may reuse the indexer's scratch until it has retired.
+    for (auto node : consumers)
+        if (FastllmCudaGraphAddDependencies(g, &index, &node, 1) != cudaSuccess) return reject();
+    if (FastllmCudaGraphAddDependencies(g, &main, &pages, 1) != cudaSuccess) return reject();
+#if CUDART_VERSION >= 13000
+    if (cudaGraphRemoveDependencies(g, &index, &pages, nullptr, 1) != cudaSuccess) return reject();
+#else
+    if (cudaGraphRemoveDependencies(g, &index, &pages, 1) != cudaSuccess) return reject();
+#endif
+    return g;
+#else
+    return nullptr;
+#endif
+}
+// The recorded compressor frontier is a node of the original prelude. Its
+// clone still produces rawKV and rawScore after the independent Q branch is cut.
+void *FastllmCudaV41MoveSourceToPrelude(void *prefix, const void *compressorReady, const void *core) {
+#if defined(FASTLLM_ENABLE_DSV41_FLASHMLA) && CUDART_VERSION >= 12000
+    cudaGraphNode_t ready = nullptr;
+    if (!prefix || !compressorReady || !core || cudaGraphNodeFindInClone(&ready,
+            (cudaGraphNode_t)compressorReady, (cudaGraph_t)prefix) != cudaSuccess) {
+        cudaGetLastError(); return nullptr;
+    }
+    cudaGraph_t g = nullptr;
+    if (cudaGraphClone(&g, (cudaGraph_t)core) != cudaSuccess) return nullptr;
+    auto reject = [&]() -> void * { cudaGetLastError(); cudaGraphDestroy(g); return nullptr; };
+    size_t n = 0;
+    if (cudaGraphGetNodes(g, nullptr, &n) != cudaSuccess) return reject();
+    std::vector<cudaGraphNode_t> nodes(n);
+    if (cudaGraphGetNodes(g, nodes.data(), &n) != cudaSuccess) return reject();
+    cudaGraphNode_t compression = nullptr;
+    cudaKernelNodeParams params{};
+    for (auto node : nodes) {
+        cudaGraphNodeType type;
+        if (cudaGraphNodeGetType(node, &type) != cudaSuccess) return reject();
+        if (type != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams p{};
+        auto rc = cudaGraphKernelNodeGetParams(node, &p);
+        if (rc == cudaErrorInvalidDeviceFunction) { cudaGetLastError(); continue; }
+        if (rc != cudaSuccess) return reject();
+        if (p.func == (void *)V41PublishCompressed) {
+            if (compression) return reject();
+            compression = node; params = p;
+        }
+    }
+    cudaGraphNode_t parent = nullptr, early = nullptr;
+    if (!compression || FastllmCudaGraphNodeGetDependencies(compression, nullptr, &n) != cudaSuccess || n != 1 ||
+        FastllmCudaGraphNodeGetDependencies(compression, &parent, &n) != cudaSuccess ||
+        FastllmCudaGraphNodeGetDependentNodes(compression, nullptr, &n) != cudaSuccess || !n) return reject();
+    std::vector<cudaGraphNode_t> consumers(n);
+    if (FastllmCudaGraphNodeGetDependentNodes(compression, consumers.data(), &n) != cudaSuccess) return reject();
+    for (auto node : consumers)
+        if (FastllmCudaGraphAddDependencies(g, &parent, &node, 1) != cudaSuccess) return reject();
+    // Only mutate the prefix after the cloned attention is usable. Its child
+    // graph joins every prelude leaf before the first Wk or page consumer.
+    if (cudaGraphAddKernelNode(&early, (cudaGraph_t)prefix, &ready, 1, &params) != cudaSuccess) return reject();
+    if (cudaGraphDestroyNode(compression) != cudaSuccess) {
+        cudaGraphDestroyNode(early);
+        return reject();
+    }
+    return g;
+#else
+    return nullptr;
+#endif
+}
 bool FastllmCudaV41FinishAllIndices(void *handle) { return V41FinishDecode(handle, true); }
 
 bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
@@ -8271,10 +8496,40 @@ bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
 #ifndef USE_ROCM
 #include "deepseekv41-hc-graph.cuh"
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-#include "devices/cuda/fastllm-dsv41-mega.h"
 #include "deepseekv41-owner-mix.cuh"
 #endif
 #endif
+// Only remove work captured inside the index projection itself. Any consumer
+// outside that set makes this short graph ineligible for the optimization.
+void *FastllmCudaV41WithoutIndexProjections(const void *source, const std::vector<void *> &suffix) {
+#if defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103) && !defined(USE_ROCM) && CUDART_VERSION >= 12000
+    cudaGraph_t graph = nullptr;
+    if (!source || suffix.empty() || cudaGraphClone(&graph, (cudaGraph_t)source) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    auto reject = [&]() -> void * { cudaGetLastError(); cudaGraphDestroy(graph); return nullptr; };
+    std::vector<cudaGraphNode_t> nodes;
+    for (auto original : suffix) {
+        cudaGraphNode_t node;
+        if (cudaGraphNodeFindInClone(&node, (cudaGraphNode_t)original, graph) != cudaSuccess) return reject();
+        nodes.push_back(node);
+    }
+    // cuBLAS may use non-default programmatic edges, even for a single consumer.
+    for (auto node : nodes) {
+        size_t count = 0;
+        if (fastllm_v41_hc_graph::OwnerNeighbors<false>(node, nullptr, &count) != cudaSuccess) return reject();
+        std::vector<cudaGraphNode_t> users(count);
+        if (count && fastllm_v41_hc_graph::OwnerNeighbors<false>(node, users.data(), &count) != cudaSuccess) return reject();
+        for (auto user : users)
+            if (std::find(nodes.begin(), nodes.end(), user) == nodes.end()) return reject();
+    }
+    for (auto node : nodes) if (cudaGraphDestroyNode(node) != cudaSuccess) return reject();
+    return graph;
+#else
+    return nullptr;
+#endif
+}
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
 namespace {
 struct BoundaryNorm {
@@ -8317,12 +8572,12 @@ bool TakeBoundaryNorm(cudaGraph_t graph, int rows, BoundaryNorm &result) {
     return found && cudaGraphDestroyNode(found) == cudaSuccess;
 }
 }
-template <int Blocks>
+template <int Blocks, bool PackedOrder = false>
 static void *V41BoundaryKernel(bool pack, bool quantize, bool packOnly) {
     using namespace fastllm_v41_owner_mix;
-    if (pack && packOnly) return (void *)ExpertResidualNorm<true,false,false,Blocks>;
-    if (pack) return quantize ? (void *)ExpertResidualNorm<true,true,true,Blocks> : (void *)ExpertResidualNorm<true,false,true,Blocks>;
-    return quantize ? (void *)ExpertResidualNorm<false,true,true,Blocks> : (void *)ExpertResidualNorm<false,false,true,Blocks>;
+    if (pack && packOnly) return (void *)ExpertResidualNorm<true,false,false,Blocks,PackedOrder>;
+    if (pack) return quantize ? (void *)ExpertResidualNorm<true,true,true,Blocks,PackedOrder> : (void *)ExpertResidualNorm<true,false,true,Blocks,PackedOrder>;
+    return quantize ? (void *)ExpertResidualNorm<false,true,true,Blocks,PackedOrder> : (void *)ExpertResidualNorm<false,false,true,Blocks,PackedOrder>;
 }
 bool FastllmCudaV41FuseExpertBoundary(const void *previous, const void *attention,
         const void *shortAttention, const void *postKernel, int rows, bool packOnly, void **result) {
@@ -8362,7 +8617,13 @@ bool FastllmCudaV41FuseExpertBoundary(const void *previous, const void *attentio
     void *fused[] = {args[5],args[6],args[7],&a.pre,&a.weight,&a.eps,args[2],&a.out,&ep};
     const bool wide = V41EnvOn("FASTLLM_DSV41_WIDE_CLUSTER");
     const unsigned blocks = wide ? 8 : 4;
-    params.func = wide ? V41BoundaryKernel<8>(a.pack, a.quantize, packOnly) : V41BoundaryKernel<4>(a.pack, a.quantize, packOnly);
+    const int *order = *static_cast<const int **>(args[8]);
+    if (order && !wide) {
+        ep.ids = order;
+        params.func = V41BoundaryKernel<4,true>(a.pack, a.quantize, packOnly);
+    } else {
+        params.func = wide ? V41BoundaryKernel<8>(a.pack, a.quantize, packOnly) : V41BoundaryKernel<4>(a.pack, a.quantize, packOnly);
+    }
     params.kernelParams = fused; params.gridDim = dim3(blocks, rows); params.blockDim = dim3(1024 / blocks);
     cudaKernelNodeAttrValue attr{};attr.clusterDim.x = blocks;attr.clusterDim.y = 1;attr.clusterDim.z = 1;
     if (cudaGraphKernelNodeSetParams(combine, &params) != cudaSuccess ||
@@ -8374,11 +8635,18 @@ bool FastllmCudaV41FuseExpertBoundary(const void *previous, const void *attentio
 #ifndef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
 void *FastllmCudaV41CreateOwnerStream(int) { return nullptr; }
 void FastllmCudaV41DestroyOwnerStream(void *) {}
+void *FastllmCudaV41OwnerClusterPacket(void *plan, int rows, float *scratch,
+        const fastllm::Data &attention, const fastllm::Data &residual, const fastllm::Data &oldPre, const fastllm::Data &oldPost, const fastllm::Data &oldComb,
+        fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base, const fastllm::Data &weight, int iterations, float mixEps,
+        float normEps, fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb, fastllm::Data &normalized, FastllmDsv41InputPacket *packet) { return nullptr; }
+#endif
 void *FastllmCudaV41OwnerClusterPost(void *plan, int rows, float *scratch,
         const fastllm::Data &attention, const fastllm::Data &residual, const fastllm::Data &oldPre, const fastllm::Data &oldPost, const fastllm::Data &oldComb,
         fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base, const fastllm::Data &weight, int iterations, float mixEps,
-        float normEps, fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb, fastllm::Data &normalized) { return nullptr; }
-#endif
+        float normEps, fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb, fastllm::Data &normalized) {
+    return FastllmCudaV41OwnerClusterPacket(plan, rows, scratch, attention, residual, oldPre, oldPost, oldComb,
+        fn, scale, base, weight, iterations, mixEps, normEps, hidden, pre, post, comb, normalized, nullptr);
+}
 extern "C" void *FastllmCudaV41ForkOwnerMixQuery(const void *const *children, int count, int rows, float *scratch, const void *postKernel, const void *prepareKernel, void **ownerGemm, bool keepQuery) {
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
     if (V41IsSm<10, 3>()) return fastllm_v41_hc_graph::ForkOwnerMix(children, count, rows, scratch, postKernel, prepareKernel, ownerGemm, keepQuery);

@@ -44,6 +44,17 @@ export FASTLLM_DSV41_SINGLE_HISTOGRAM=1
 export FASTLLM_DSV41_FIXED_QNORM=1
 export FASTLLM_DSV41_FORK_KEY_NORM=1
 
+# Set the group to 0 to use the original decode implementation on this preset.
+boundary=${FASTLLM_DSV41_BOUNDARY_OPT:-1}
+export FASTLLM_DSV41_SHORT_PAGES="${FASTLLM_DSV41_SHORT_PAGES:-$boundary}"
+export FASTLLM_DSV41_INDEX_PROJECTIONS="${FASTLLM_DSV41_INDEX_PROJECTIONS:-$boundary}"
+export FASTLLM_DSV41_SOURCE_PUBLISH="${FASTLLM_DSV41_SOURCE_PUBLISH:-$boundary}"
+export FASTLLM_DSV41_EARLY_COMPRESS="${FASTLLM_DSV41_EARLY_COMPRESS:-$boundary}"
+export FASTLLM_DSV41_POST_PACKET="${FASTLLM_DSV41_POST_PACKET:-$boundary}"
+export FASTLLM_DSV41_DIRECT_ROUTES="${FASTLLM_DSV41_DIRECT_ROUTES:-$boundary}"
+export FASTLLM_DSV41_ORDER_WORD="${FASTLLM_DSV41_ORDER_WORD:-$boundary}"
+export FASTLLM_DSV41_EARLY_MOE_PACK="${FASTLLM_DSV41_EARLY_MOE_PACK:-$boundary}"
+
 exec "${PYTHON:-python3}" -m ftllm.cli serve "$model" \
   --host 127.0.0.1 --port "${PORT:-18417}" --model_name deepseek-v41-flash-1017 \
   --tp 8 --attn-dp-size 8 --moe_device multicuda:0,1,2,3,4,5,6,7 --ngram_device cuda \
