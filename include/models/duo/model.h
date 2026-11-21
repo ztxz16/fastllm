@@ -46,6 +46,11 @@ class Model {
                                       Cache *committed = nullptr, std::function<void()> checkpoint = {});
 
   private:
+    friend class Session;
+    Tensor prepareText(const Layout &, const Tensor &text);
+    std::pair<Tensor, Tensor> forwardPrepared(const Layout &, const Tensor &video, const Tensor &audio,
+                                              const Tensor &condition, float time, const Cache &past,
+                                              Cache *committed, std::function<void()> checkpoint);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

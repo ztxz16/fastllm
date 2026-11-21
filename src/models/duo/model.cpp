@@ -8,6 +8,7 @@
 #include <random>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 
 namespace fastllm::duo {
 namespace fs = std::filesystem;
@@ -50,6 +51,20 @@ Tensor selectRows(Runtime &rt, const Tensor &input, const std::vector<RowRange> 
     for (const auto &range : ranges)
         slices.push_back(input.rowSlice(range.first, range.count));
     return rt.concat(slices);
+}
+
+// Attention has finished reading the joined tensor on the inference stream.
+// Keep its existing history in place and compact only the retained current rows.
+Tensor commitRows(Runtime &rt, const Tensor &current, Tensor joined, const std::vector<RowRange> &ranges) {
+    if (ranges.size() == 1 && ranges.front().count == current.rows)
+        return joined;
+    auto keep = selectRows(rt, current, ranges);
+    int pastRows = joined.rows - current.rows;
+    if (!pastRows)
+        return keep;
+    auto tail = joined.rowSlice(pastRows, keep.rows);
+    rt.concatInto({keep}, tail);
+    return joined.rowSlice(0, pastRows + keep.rows);
 }
 
 } // namespace
@@ -236,10 +251,14 @@ struct Model::Impl {
         const bool swap = name.size() >= 8 && name.substr(name.size() - 8) == ".mlp.fc1";
         return addAdapter(x, logical(name), out, swap);
     }
-    Tensor attend(const Tensor &x, const std::string &p, const std::vector<AttentionDomain> &domains,
-                  const std::pair<Tensor, Tensor> *rope, const std::pair<Tensor, Tensor> *past,
-                  const Tensor *retain, std::pair<Tensor, Tensor> *committed) {
+    std::array<Tensor, 3> prepareQkv(const Tensor &x, const std::string &p,
+                                     const std::pair<Tensor, Tensor> *rope) {
         auto packed = projection(x, p + ".qkv_proj");
+        const auto &qw = weights.get(p + ".q_norm.weight"), &kw = weights.get(p + ".k_norm.weight");
+        require(packed.cols == 3 * cfg.heads * cfg.headDim, "invalid Duo QKV projection width");
+        if (!lora && packed.dtype == DType::BF16 && cfg.headDim == 128)
+            return rt.unpackHeadQkvNormRotary128(packed, qw, kw, cfg.qkEps, rope ? &rope->first : nullptr,
+                                                rope ? &rope->second : nullptr);
         Tensor q = splitQkv(rt, packed, cfg.heads, cfg.headDim, 0),
                k = splitQkv(rt, packed, cfg.heads, cfg.headDim, 1),
                v = splitQkv(rt, packed, cfg.heads, cfg.headDim, 2);
@@ -247,28 +266,29 @@ struct Model::Impl {
         q = addAdapter(x, target + ".to_q", q);
         k = addAdapter(x, target + ".to_k", k);
         v = addAdapter(x, target + ".to_v", v);
-        q = rt.rms(q, weights.get(p + ".q_norm.weight"), cfg.qkEps, cfg.headDim);
-        k = rt.rms(k, weights.get(p + ".k_norm.weight"), cfg.qkEps, cfg.headDim);
-        if (rope) {
-            q = rt.rotary(q, rope->first, rope->second, cfg.headDim);
-            k = rt.rotary(k, rope->first, rope->second, cfg.headDim);
+        if (rope)
+            std::tie(q, k) = rt.qkNormRotary(q, k, qw, kw, cfg.qkEps, rope->first, rope->second, cfg.headDim);
+        else {
+            q = rt.rms(q, qw, cfg.qkEps, cfg.headDim);
+            k = rt.rms(k, kw, cfg.qkEps, cfg.headDim);
         }
-        if (committed) {
-            auto ck = rt.gather(k, *retain), cv = rt.gather(v, *retain);
-            *committed = {past ? rt.concat({past->first, ck}) : ck,
-                          past ? rt.concat({past->second, cv}) : cv};
-        }
-        if (past) {
-            k = rt.concat({past->first, k});
-            v = rt.concat({past->second, v});
-        }
+        return {q, k, v};
+    }
+    Tensor attend(const Tensor &x, const std::string &p, const std::vector<AttentionDomain> &domains,
+                  const std::pair<Tensor, Tensor> *rope, const std::pair<Tensor, Tensor> *past,
+                  const std::vector<RowRange> &retain, std::pair<Tensor, Tensor> *committed) {
+        auto [q, k, v] = prepareQkv(x, p, rope);
+        auto allK = past ? rt.concat({past->first, k}) : k;
+        auto allV = past ? rt.concat({past->second, v}) : v;
         std::vector<Tensor> attended;
         for (const auto &domain : domains) {
             const auto &range = domain.queries;
             attended.push_back(rt.attention(q.rowSlice(range.first, range.count),
-                                            selectRows(rt, k, domain.keys), selectRows(rt, v, domain.keys),
+                                            selectRows(rt, allK, domain.keys), selectRows(rt, allV, domain.keys),
                                             cfg.heads));
         }
+        if (committed)
+            *committed = {commitRows(rt, k, std::move(allK), retain), commitRows(rt, v, std::move(allV), retain)};
         auto output = attended.size() == 1 ? attended.front() : rt.concat(attended);
         return projection(output, p + ".out_proj");
     }
@@ -292,7 +312,7 @@ struct Model::Impl {
         for (int i = 0; i < cfg.refiners; ++i) {
             auto p = "token_refiner.blocks." + std::to_string(i);
             auto n = rt.rms(x, weights.get(p + ".norm1.weight"), cfg.eps);
-            x = rt.add(x, attend(n, p + ".attn", domains, nullptr, nullptr, nullptr, nullptr));
+            x = rt.add(x, attend(n, p + ".attn", domains, nullptr, nullptr, {}, nullptr));
             n = rt.rms(x, weights.get(p + ".norm2.weight"), cfg.eps);
             x = rt.add(x, feedForward(n, p + ".mlp"));
             release(p);
@@ -343,11 +363,24 @@ void Model::prepare() {
 std::pair<Tensor, Tensor> Model::forward(const Layout &s, const Tensor &video, const Tensor &audio,
                                          const Tensor &text, float time, const Cache &past, Cache *committed,
                                          std::function<void()> checkpoint) {
+    return forwardPrepared(s, video, audio, prepareText(s, text), time, past, committed, std::move(checkpoint));
+}
+Tensor Model::prepareText(const Layout &s, const Tensor &text) {
+    auto &m = *impl_;
+    require(text.cols == m.cfg.text && text.rows == groupRows(s.refinerGroups), "forward text shape differs");
+    if (s.text.empty())
+        return {};
+    return m.rt.gather(m.refine(text, s), m.rt.indices(s.textSelection));
+}
+std::pair<Tensor, Tensor> Model::forwardPrepared(const Layout &s, const Tensor &video, const Tensor &audio,
+                                                 const Tensor &condition, float time, const Cache &past,
+                                                 Cache *committed, std::function<void()> checkpoint) {
     auto &m = *impl_;
     prepare();
     auto &rt = m.rt;
     require(video.rows == int(s.video.size()) && video.cols == 96 && audio.rows == int(s.audio.size()) &&
-                audio.cols == 32 && text.cols == m.cfg.text && text.rows == groupRows(s.refinerGroups),
+                audio.cols == 32 && condition.rows == int(s.text.size()) &&
+                (s.text.empty() || condition.cols == m.cfg.hidden),
             "forward input shape differs");
     require(past.layers.empty() || past.layers.size() == size_t(m.cfg.layers), "KV layer count differs");
     auto found = std::find(m.times.begin(), m.times.end(), time);
@@ -365,13 +398,14 @@ std::pair<Tensor, Tensor> Model::forward(const Layout &s, const Tensor &video, c
     auto ti = s.text.empty() ? Tensor{} : rt.indices(s.text);
     Tensor x(s.rows(), m.cfg.hidden);
     if (!s.text.empty())
-        rt.scatter(x, rt.gather(m.refine(text, s), rt.indices(s.textSelection)), ti);
+        rt.scatter(x, condition, ti);
     if (video.rows)
         rt.scatter(x, rt.cast(m.projection(video, "video_patch_proj", true), DType::BF16), vi);
     if (audio.rows)
         rt.scatter(x, rt.cast(m.projection(audio, "audio_patch_proj", true), DType::BF16), ai);
     auto rope = rt.ropeTable(s.positions, m.cfg.rope, m.cfg.theta);
-    std::vector<int> modulation(s.rows()), output(s.rows()), retain;
+    std::vector<int> modulation(s.rows()), output(s.rows());
+    std::vector<RowRange> retain;
     Cache next;
     for (int i = 0; i < s.rows(); ++i) {
         output[i] = plan * 2 + s.time[i];
@@ -382,8 +416,10 @@ std::pair<Tensor, Tensor> Model::forward(const Layout &s, const Tensor &video, c
         int offset = pastRows;
         for (auto g : s.groups)
             if (g.kind == Kind::Reference || g.kind == Kind::Shared || g.kind == Kind::Clean) {
-                for (int i = 0; i < g.count; ++i)
-                    retain.push_back(g.first + i);
+                if (!retain.empty() && retain.back().first + retain.back().count == g.first)
+                    retain.back().count += g.count;
+                else
+                    retain.push_back({g.first, g.count});
                 g.first = offset;
                 offset += g.count;
                 next.groups.push_back(g);
@@ -391,9 +427,7 @@ std::pair<Tensor, Tensor> Model::forward(const Layout &s, const Tensor &video, c
         require(!retain.empty(), "empty clean commitment");
         next.layers.resize(m.cfg.layers);
     }
-    Tensor idx = rt.indices(modulation), retained;
-    if (committed)
-        retained = rt.indices(retain);
+    Tensor idx = rt.indices(modulation);
     for (int i = 0; i < m.cfg.layers; ++i) {
         if (checkpoint)
             checkpoint();
@@ -401,7 +435,7 @@ std::pair<Tensor, Tensor> Model::forward(const Layout &s, const Tensor &video, c
         auto n =
             rt.rmsModulateRows(x, m.weights.get(p + ".norm1.weight"), m.cfg.eps, m.modulation[i], idx, 0, 1);
         auto att = m.attend(n, p + ".attn", domains, &rope, past.layers.empty() ? nullptr : &past.layers[i],
-                            committed ? &retained : nullptr, committed ? &next.layers[i] : nullptr);
+                            retain, committed ? &next.layers[i] : nullptr);
         x = rt.residualRows(x, att, m.modulation[i], idx, 2);
         n = rt.rmsModulateRows(x, m.weights.get(p + ".norm2.weight"), m.cfg.eps, m.modulation[i], idx, 3, 4);
         x = rt.residualRows(x, m.feedForward(n, p + ".mlp"), m.modulation[i], idx, 5);
@@ -517,10 +551,12 @@ ChunkResult Session::generate(int chunk, const std::vector<float> &features, int
             return uploadFp32(rt, values, n, c);
         };
         auto v = random(nv, 96), a = random(na, 32);
+        // All sampling steps and the clean KV pass use the same text rows and visibility.
+        auto condition = model_.prepareText(current, text);
         auto grid = schedule(source_.steps, source_.shift);
         for (int i = 0; i < source_.steps; ++i) {
             checkpoint();
-            auto pred = model_.forward(current, v, a, text, grid[i], cache_, nullptr, [&] { checkpoint(); });
+            auto pred = model_.forwardPrepared(current, v, a, condition, grid[i], cache_, nullptr, [&] { checkpoint(); });
             float amount = source_.stage == "causal" ? grid[i + 1] - grid[i] : 1.f - grid[i];
             v = flowUpdate(rt, v, pred.first, amount);
             a = flowUpdate(rt, a, pred.second, amount);
@@ -547,8 +583,8 @@ ChunkResult Session::generate(int chunk, const std::vector<float> &features, int
             mediaReady(out);
         }
         Cache committed;
-        model_.forward(chunkLayout(height_, width_, sharedRows_, rows, chunk, true), v, a, text, 1.f, cache_,
-                       &committed, [&] { checkpoint(); });
+        model_.forwardPrepared(chunkLayout(height_, width_, sharedRows_, rows, chunk, true), v, a, condition,
+                               1.f, cache_, &committed, [&] { checkpoint(); });
         if (mediaReady) {
             // Downloads above have already synchronized the denoising passes. Finish
             // queued KV writes before handing the committed block back to the caller.
