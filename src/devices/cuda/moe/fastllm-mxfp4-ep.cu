@@ -20,7 +20,7 @@
 static constexpr float inf = __builtin_inff();
 namespace {
 namespace fm = flashinfer::megamoe;
-constexpr int H = 4096, I = 2048, E = 256, K = 8, DECODE_CAP = 128, PREFILL_CAP = 2048, SMS = 78;
+constexpr int H = 4096, I = 2048, DECODE_CAP = 128, MAIN_PREFILL_CAP = 2048, SMS = 78;
 constexpr int SMEM = 232448;
 thread_local std::string error;
 void check(cudaError_t s) {
@@ -74,9 +74,14 @@ __global__ void pack(const uint8_t *src, uint8_t *dst, int n, int k, int shift, 
     }
 }
 
-struct Base { int ranks, device; virtual ~Base() = default; };
-template<int R> struct Mega {
+struct Base {
+    int device;
+    virtual ~Base() = default;
+    virtual void forward(const void *, void *, const int32_t *, const float *, int, int, const int *) = 0;
+};
+template<int R, int E = 256, int K = 8> struct Mega {
     static constexpr int LE = E / R;
+    static constexpr int PREFILL_CAP = E == 128 ? 256 : MAIN_PREFILL_CAP;
     static constexpr int DecodeBlock = R == 8 ? 32 : 24;
     static constexpr int DecodeStages = R == 4 ? 4 : 3;
     using Buffers = fm::layout::MegaMoEBuffers;
@@ -111,7 +116,11 @@ template<int R> struct Mega {
         std::array<int64_t, R> peers;
         Allocation gate, down, globals;
         std::array<Descriptors, 3> decodeDescriptors, prefillDescriptors;
-        Layer() { ranks = R; check(cudaGetDevice(&device)); }
+        Layer() { check(cudaGetDevice(&device)); }
+        void forward(const void *input, void *output, const int32_t *ids, const float *scores,
+                     int rows, int commonRows, const int *live) override {
+            Mega::run(*this, input, output, ids, scores, rows, commonRows, live);
+        }
     };
     template<int CAP> static void prepareDescriptors(Descriptors &d, Buffers &b, int bm) {
         constexpr int POOL = Plan<CAP>::POOL, SFPOOL = Plan<CAP>::SFPOOL;
@@ -235,15 +244,21 @@ template<int R> struct Mega {
 
 extern "C" const char *fastllm_mxfp4_ep_error() { return error.c_str(); }
 extern "C" int fastllm_mxfp4_ep_capacity() { return DECODE_CAP; }
-extern "C" int fastllm_mxfp4_ep_prefill_capacity() { return PREFILL_CAP; }
+extern "C" int fastllm_mxfp4_ep_prefill_capacity() { return MAIN_PREFILL_CAP; }
 extern "C" size_t fastllm_mxfp4_ep_workspace_bytes(int ranks) {
     return ranks == 4 ? Mega<4>::bytes() : ranks == 8 ? Mega<8>::bytes() : 0;
 }
+extern "C" size_t fastllm_mxfp4_ep_draft_workspace(int ranks, int *prefillCapacity) {
+    size_t bytes = ranks == 4 ? Mega<4, 128, 3>::bytes() : ranks == 8 ? Mega<8, 128, 3>::bytes() : 0;
+    if (prefillCapacity) *prefillCapacity = bytes ? Mega<8, 128, 3>::PREFILL_CAP : 0;
+    return bytes;
+}
 extern "C" int fastllm_mxfp4_ep_init(void *p, size_t bytes, const int *devices, int rank, int ranks) {
     try {
-        size_t required = fastllm_mxfp4_ep_workspace_bytes(ranks);
+        // Initialization only clears the arena. Layer creation checks its exact geometry.
+        const size_t required = fastllm_mxfp4_ep_draft_workspace(ranks, nullptr);
         int device; check(cudaGetDevice(&device));
-        if (!required || !p || bytes < required || rank < 0 || rank >= ranks || devices[rank] != device)
+        if (!required || !p || bytes < required || rank < 0 || rank >= ranks || !devices || devices[rank] != device)
             throw std::runtime_error("Invalid MXFP4 EP initialization");
         for (int r = 0; r < ranks; ++r) if (r != rank) {
             int accessible; check(cudaDeviceCanAccessPeer(&accessible, device, devices[r]));
@@ -254,21 +269,26 @@ extern "C" int fastllm_mxfp4_ep_init(void *p, size_t bytes, const int *devices, 
         check(cudaMemset(p, 0, bytes)); check(cudaDeviceSynchronize()); return 1;
     } catch (const std::exception &e) { error = e.what(); return 0; }
 }
-extern "C" void *fastllm_mxfp4_ep_create(const void *const *gate, const void *const *down,
-        void *workspace, size_t bytes, const void *const *peers, int rank, int ranks) {
+extern "C" void *fastllm_mxfp4_ep_create_shape(const void *const *gate, const void *const *down,
+        void *workspace, size_t bytes, const void *const *peers, int rank, int ranks, int experts, int topk) {
     try {
+        if (experts == 128 && topk == 3 && ranks == 4) return Mega<4, 128, 3>::create(gate, down, workspace, bytes, peers, rank);
+        if (experts == 128 && topk == 3 && ranks == 8) return Mega<8, 128, 3>::create(gate, down, workspace, bytes, peers, rank);
+        if (experts != 256 || topk != 8) throw std::runtime_error("Unsupported SM90 MXFP4 expert geometry");
         if (ranks == 4) return Mega<4>::create(gate, down, workspace, bytes, peers, rank);
         if (ranks == 8) return Mega<8>::create(gate, down, workspace, bytes, peers, rank);
         throw std::runtime_error("MXFP4 EP requires four or eight ranks");
     } catch (const std::exception &e) { error = e.what(); return nullptr; }
 }
+extern "C" void *fastllm_mxfp4_ep_create(const void *const *gate, const void *const *down,
+        void *workspace, size_t bytes, const void *const *peers, int rank, int ranks) {
+    return fastllm_mxfp4_ep_create_shape(gate, down, workspace, bytes, peers, rank, ranks, 256, 8);
+}
 extern "C" int fastllm_mxfp4_ep_run(void *handle, const void *x, void *y, const int32_t *idx,
         const float *scores, int rows, int commonRows, const int *live) {
     try {
         if (!handle) throw std::runtime_error("Missing MXFP4 EP handle");
-        if (static_cast<Base *>(handle)->ranks == 4)
-            Mega<4>::run(*static_cast<Mega<4>::Layer *>(handle), x, y, idx, scores, rows, commonRows, live);
-        else Mega<8>::run(*static_cast<Mega<8>::Layer *>(handle), x, y, idx, scores, rows, commonRows, live);
+        static_cast<Base *>(handle)->forward(x, y, idx, scores, rows, commonRows, live);
         return 1;
     } catch (const std::exception &e) { error = e.what(); return 0; }
 }

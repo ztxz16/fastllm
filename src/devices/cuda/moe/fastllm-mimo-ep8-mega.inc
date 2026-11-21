@@ -142,7 +142,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     state->devices = devices;
     const bool package = FastllmCudaMxfp4EpGraphSupported(devices);
     if (!package && !FastllmGenericEpSupported(devices)) {
-        state->builtin = FastllmCudaCreateMimoEp8BuiltinMega(devices, weights);
+        state->builtin = FastllmCudaCreateMimoEp8BuiltinMega(devices, weights, topk);
         return state;
     }
     if (weights.size() != devices.size()) throw std::runtime_error("Invalid SM120 EP weight rank count.");

@@ -153,8 +153,14 @@ extern "C" int fastllm_mxfp4_ep_capacity() { return 0; }
 extern "C" int fastllm_mxfp4_ep_prefill_capacity() { return 0; }
 extern "C" size_t fastllm_mxfp4_ep_workspace_bytes(int) { return 0; }
 extern "C" int fastllm_mxfp4_ep_init(void *, size_t, const int *, int, int) { return 0; }
+extern "C" size_t fastllm_mxfp4_ep_draft_workspace(int, int *prefillCapacity) {
+    if (prefillCapacity) *prefillCapacity = 0;
+    return 0;
+}
 extern "C" void *fastllm_mxfp4_ep_create(const void *const *, const void *const *, void *, size_t,
     const void *const *, int, int) { return nullptr; }
+extern "C" void *fastllm_mxfp4_ep_create_shape(const void *const *, const void *const *, void *, size_t,
+    const void *const *, int, int, int, int) { return nullptr; }
 extern "C" int fastllm_mxfp4_ep_run(void *, const void *, void *, const int32_t *, const float *, int, int, const int *) { return 0; }
 extern "C" void fastllm_mxfp4_ep_destroy(void *) {}
 #endif
