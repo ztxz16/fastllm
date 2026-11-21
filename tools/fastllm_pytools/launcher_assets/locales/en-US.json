@@ -386,7 +386,7 @@
   "messages": {
     "Interactive demo": "Interactive demo",
     "Start HY-Nomas to create a scene from a reference image and guide it with successive instructions.": "Start HY-Nomas to create a scene from a reference image and guide it with successive instructions.",
-    "Select Duo-1.0-distill-quant and one or four GPUs for audiovisual conversation.": "Select Duo-1.0-distill-quant and one or four GPUs for audiovisual conversation.",
+    "Select Duo-1.0-distill-quant and one, two, four or eight GPUs for audiovisual conversation.": "Select Duo-1.0-distill-quant and one, two, four or eight GPUs for audiovisual conversation.",
     "Pi Agent": "Pi Agent",
     "Install Agent dependencies": "Install Agent dependencies",
     "Installing…": "Installing…",

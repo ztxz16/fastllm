@@ -165,7 +165,7 @@ function renderProfilePresentation() {
   const folder = interactive ? config.backend : (image || config.backend === "qwen_image") ? "images" : "videos";
   elements.launchForm.querySelector('[data-field="output_dir"]').placeholder = `~/.local/share/fastllm/${folder}/port`;
   if (nomas) elements.profileEditorDescription.textContent = t("Start HY-Nomas to create a scene from a reference image and guide it with successive instructions.");
-  if (duo) elements.profileEditorDescription.textContent = t("Select Duo-1.0-distill-quant and one or four GPUs for audiovisual conversation.");
+  if (duo) elements.profileEditorDescription.textContent = t("Select Duo-1.0-distill-quant and one, two, four or eight GPUs for audiovisual conversation.");
   if (video) elements.profileEditorDescription.textContent = t("Start a video API alongside your chat models. Pika is detected automatically.");
   if (image) elements.profileEditorDescription.textContent = t("MiniMax H3 Image · text-to-image and reference editing. Select a model directory or FP8 / INT8 / NVFP4 safetensors or GGUF; precision is detected automatically.");
 }

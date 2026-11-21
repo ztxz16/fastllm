@@ -208,6 +208,32 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(duo.executable(), str(packed))
             self.assertEqual(nomas.library(), package / lib.name)
 
+    def test_duo_tp_device_selection(self):
+        from fastllm_pytools.cli import main
+        mask = "7,6,5,4,3,2,1,0"
+        base = ["server", str(self.models["duo"])]
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": mask}), patch("os.execvpe") as execute:
+            for flags, profile, selected in [
+                (["--tp", "8"], "eight", mask),
+                (["--tp", "2"], "two", "7,6"),
+                (["--tp", "cuda:3"], "single", "4"),
+                (["--tp", "1,3"], "two", "6,4"),
+                (["--tp", "2", "--devices", "3,1"], "two", "4,6"),
+            ]:
+                with self.subTest(flags=flags):
+                    main(base + flags)
+                    _, argv, env = execute.call_args.args
+                    self.assertEqual(argv[-1], profile)
+                    self.assertEqual(env["CUDA_VISIBLE_DEVICES"], selected)
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "5,3,1"}), \
+                    patch("fastllm_pytools.util._cuda_device_count", return_value=8):
+                main(base + ["--tp", "auto"])
+                self.assertEqual(execute.call_args.args[2]["CUDA_VISIBLE_DEVICES"], "5,3")
+            for flags in (["--tp", "3"], ["--tp", "8", "--devices", "0,1"], ["--tp", "0,8"],
+                          ["--tp", "2,2"], ["--tp", "0,1", "--devices", "1,0"]):
+                with self.subTest(flags=flags), self.assertRaises(SystemExit), patch("sys.stderr"):
+                    main(base + flags)
+
     def test_interactive_profiles_and_scoped_players(self):
         from fastllm_pytools.service_backends import BACKENDS
         (self.directory / "tokenizer.json").touch()
@@ -222,6 +248,9 @@ class ServiceTest(unittest.TestCase):
                 if backend == "duo":
                     self.assertEqual(argv[-1], "four")
                     config.visible_gpus = "0,1"
+                    self.assertEqual(validate_config(config), [])
+                    self.assertEqual(BACKENDS[backend].argv(config)[-1], "two")
+                    config.visible_gpus = "0,1,2"
                     self.assertTrue(validate_config(config))
                     config.visible_gpus = ""
                     self.assertEqual(BACKENDS[backend].argv(config)[-1], "single")

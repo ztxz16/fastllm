@@ -424,6 +424,7 @@ class NomasBackend(InteractiveBackend):
 
 class DuoBackend(InteractiveBackend):
     id = "duo"
+    profiles = {1: "single", 2: "two", 4: "four", 8: "eight"}
     name = "Duo"
     label = "音视频对话 · Duo"
     health_path = "/resolutions"
@@ -438,14 +439,45 @@ class DuoBackend(InteractiveBackend):
     def assets(self, config):
         return Path(config.duo_assets.strip()).expanduser() if config.duo_assets.strip() else media_assets("duo")
 
+    def tp_devices(self, tp, devices):
+        spec = str(tp).strip().lower()
+        if spec == "auto":
+            if devices:
+                return devices
+            from .util import _cuda_device_count
+            available = _cuda_device_count()
+            for count in sorted(self.profiles, reverse=True):
+                selection = ",".join(map(str, range(count)))
+                if count <= available:
+                    try:
+                        visible_gpu_environment(selection)
+                    except ValueError:
+                        continue
+                    return selection
+            raise ValueError("Duo --tp auto found no visible CUDA devices")
+        if spec.isascii() and spec.isdigit():
+            count = max(1, int(spec))
+            if count not in self.profiles:
+                raise ValueError("Duo supports 1, 2, 4 or 8 GPUs")
+            if devices and len(devices.split(",")) != count:
+                raise ValueError("Duo --tp count must match the number of --devices")
+            return devices or ",".join(map(str, range(count)))
+        if spec.startswith("cuda:") or "," in spec:
+            if devices:
+                raise ValueError("Select Duo GPU IDs with either --tp or --devices")
+            ids = (spec[5:] if spec.startswith("cuda:") else spec).split(",")
+            if all(i.strip().isascii() and i.strip().isdigit() for i in ids):
+                return ",".join(i.strip() for i in ids)
+        raise ValueError("Duo --tp expects 1, 2, 4, 8, auto or a list of CUDA device IDs")
+
     def validate_runtime(self, config, add):
         model = Path(config.model.strip()).expanduser()
         if model.is_dir() and not all((model / name).is_dir() for name in ("realization", "intent", "intent_adapter", "codec", "speech")):
             add("Duo 需要完整的 distill-quant 权重及相应的 causal-base 组件。", "model")
         if not shutil.which(self.executable()):
             add("当前安装缺少 Duo 交互服务。请安装含 Duo 的版本或构建 duo_live 目标。", "model")
-        if len(logical_devices(config)) not in (1, 4):
-            add("Duo 支持单卡或四卡，请选择 1 或 4 张 GPU。", "visible_gpus")
+        if len(logical_devices(config)) not in self.profiles:
+            add("Duo 支持 1、2、4 或 8 张 GPU。", "visible_gpus")
         required = ("live.html", "avc-player.js", "presets/default.txt", "presets/default-256x192.bf16",
                     "presets/default-512x384.bf16")
         assets = self.assets(config)
@@ -456,7 +488,7 @@ class DuoBackend(InteractiveBackend):
 
     def argv(self, config):
         args = [self.executable(), os.path.expanduser(config.model.strip()), str(self.assets(config)),
-                self.output(config), config.port.strip(), "four" if len(logical_devices(config)) == 4 else "single"]
+                self.output(config), config.port.strip(), self.profiles[len(logical_devices(config))]]
         if config.duo_intent_cache.strip():
             args.extend(["--intent-cache", os.path.expanduser(config.duo_intent_cache.strip())])
         return args

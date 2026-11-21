@@ -55,6 +55,8 @@ def dispatch(args, parser):
         return False
     backend = BACKENDS[family.backend]
     allowed = {field for field, (_, families) in OPTIONS.items() if backend.id in families}
+    if backend.id == "duo":
+        allowed.add("tp")
     unexpected = supplied - allowed - {"command", "model", "path", "host", "port", "api_key", "visible_gpus", "output_dir"}
     if unexpected:
         parser.error(f"{backend.label} does not accept: " + ", ".join(sorted(unexpected)))
@@ -67,6 +69,8 @@ def dispatch(args, parser):
     if backend.id == "duo" and config.host not in {"127.0.0.1", "localhost"}:
         parser.error(f"{backend.label} listens on 127.0.0.1")
     try:
+        if backend.id == "duo" and "tp" in supplied:
+            config.visible_gpus = backend.tp_devices(args.tp, config.visible_gpus)
         env = {**os.environ, **visible_gpu_environment(config.visible_gpus)}
     except ValueError as error:
         parser.error(str(error))

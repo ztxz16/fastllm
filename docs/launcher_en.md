@@ -12,7 +12,7 @@ Add a profile → select a model → choose Automatic configuration → save and
 
 ## Interactive demos
 
-In Model Management, create a profile for **Scene interaction (HY-Nomas)** or **Audiovisual conversation (Duo)**. Choose the weights and GPUs. Launcher automatically locates installed runtimes and standard source builds. HY-Nomas requires its BF16 native library and the Qwen2.5-VL-7B-Instruct text encoder. Duo requires duo_live and Duo-1.0-distill-quant, supports one or four GPUs, and accepts optional character assets and an Intent NF4 cache. After startup, choose **Interactive demo** to open the native player in Studio. Use separate service ports for concurrent profiles. Only the Launcher port needs forwarding. Camera recording requires localhost or HTTPS. See the build instructions for [HY-Nomas](hy_nomas.md) and [Duo](../tools/duo/README.md).
+In Model Management, create a profile for **Scene interaction (HY-Nomas)** or **Audiovisual conversation (Duo)**. Choose the weights and GPUs. Launcher automatically locates installed runtimes and standard source builds. HY-Nomas requires its BF16 native library and the Qwen2.5-VL-7B-Instruct text encoder. Duo requires duo_live and Duo-1.0-distill-quant, supports one, two, four or eight GPUs, and accepts optional character assets and an Intent NF4 cache. After startup, choose **Interactive demo** to open the native player in Studio. Use separate service ports for concurrent profiles. Only the Launcher port needs forwarding. Camera recording requires localhost or HTTPS. See the build instructions for [HY-Nomas](hy_nomas.md) and [Duo](../tools/duo/README.md).
 
 ## Startup and access
 

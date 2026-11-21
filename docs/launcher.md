@@ -12,7 +12,7 @@ ftllm launch
 
 ## 交互模型 Demo
 
-在「模型管理」新增启动项，填写 HY-Nomas 或 Duo 的权重目录并选择 GPU。启动器自动查找已安装或在标准目录构建的原生运行库和服务程序。HY-Nomas 使用 Qwen2.5-VL-7B-Instruct 文本编码器。Duo 使用 duo_live 和 Duo-1.0-distill-quant，支持单卡或四卡，可指定角色资源和预先生成的 Intent NF4 缓存。服务就绪后点击「交互 Demo」，可在工作室内上传参考图、连续编辑场景，或向 Duo 上传、录制视频并播放回复。两个服务使用不同端口即可分别管理。远程使用只需转发启动器端口，摄像头录制需要 localhost 或 HTTPS。原生运行时的编译方法见 [HY-Nomas](hy_nomas.md) 和 [Duo](../tools/duo/README.md)。
+在「模型管理」新增启动项，填写 HY-Nomas 或 Duo 的权重目录并选择 GPU。启动器自动查找已安装或在标准目录构建的原生运行库和服务程序。HY-Nomas 使用 Qwen2.5-VL-7B-Instruct 文本编码器。Duo 使用 duo_live 和 Duo-1.0-distill-quant，支持 1、2、4 或 8 张 GPU，可指定角色资源和预先生成的 Intent NF4 缓存。服务就绪后点击「交互 Demo」，可在工作室内上传参考图、连续编辑场景，或向 Duo 上传、录制视频并播放回复。两个服务使用不同端口即可分别管理。远程使用只需转发启动器端口，摄像头录制需要 localhost 或 HTTPS。原生运行时的编译方法见 [HY-Nomas](hy_nomas.md) 和 [Duo](../tools/duo/README.md)。
 
 ## 启动与访问
 
