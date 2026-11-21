@@ -14,6 +14,39 @@
 using namespace fastllm;
 static void Check(bool ok, const char *msg) { if (!ok) throw std::runtime_error(msg); }
 static void Cuda(cudaError_t err) { Check(err == cudaSuccess, cudaGetErrorString(err)); }
+// Compare raw bits, including BF16 NaNs, with permuted rows and untouched padding.
+static int CheckGatherBf16Logits() {
+    constexpr int requests = 129, rows = 4, vocab = 2112;
+    std::vector<int> widths{2056, 17};
+    widths.resize(33, 1);
+    std::vector<uint16_t> bits(rows * vocab);
+    for (size_t i = 0; i < bits.size(); ++i) bits[i] = uint16_t(i * 7919);
+    Data src(BFLOAT16), dst(FLOAT32);
+    src.Resize({rows, vocab}); dst.Resize({requests * 3, vocab});
+    for (auto *x : {&src, &dst}) { x->ToDevice(DataDevice::CUDA, {0}, false); x->Allocate(false); }
+    Cuda(cudaMemcpy(src.cudaData, bits.data(), bits.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    std::vector<uint32_t> expected(size_t(requests) * 3 * vocab, 0xdeadbeef), actual(expected.size());
+    Cuda(cudaMemcpy(dst.cudaData, expected.data(), expected.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    std::vector<FastllmCudaLogitShard> shards;
+    std::vector<FastllmCudaLogitRows> dest;
+    int offset = 0;
+    for (int width : widths) {
+        shards.push_back({static_cast<uint16_t *>(src.cudaData) + rows * offset, offset, width});
+        offset += width;
+    }
+    for (int i = 0; i < requests; ++i) {
+        const int first = i % 2, n = i % 4, at = (requests - 1 - i) * 3 * vocab;
+        dest.push_back({static_cast<float *>(dst.cudaData) + at, first, n});
+        for (auto shard : shards) for (int r = 0; r < n; ++r) for (int c = 0; c < shard.columns; ++c)
+            expected[at + r * vocab + shard.offset + c] =
+                uint32_t(bits[rows * shard.offset + (first + r) * shard.columns + c]) << 16;
+    }
+    Check(FastllmCudaGatherBf16Logits(shards.data(), shards.size(), dest.data(), dest.size(), vocab),
+          "BF16 verification gather failed");
+    Cuda(cudaMemcpy(actual.data(), dst.cudaData, actual.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    Check(actual == expected, "BF16 verification gather changed logits or padding");
+    return 1;
+}
 // A packed shard occupies the first half of its FP32 slice. Guard columns
 // and other shards must survive in-place expansion, including on graph replay.
 static int CheckPackedLogits() {
@@ -178,7 +211,7 @@ int main() {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
-        int checks = CheckSamplingBoundaries() + CheckSampling() + CheckPackedLogits();
+        int checks = CheckSamplingBoundaries() + CheckSampling() + CheckPackedLogits() + CheckGatherBf16Logits();
         for (int vocab : {1, 257, 2053, 19072, 152576})
         for (int rows : {1, 8})
         for (int shards : {1, 3, 8}) {

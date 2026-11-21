@@ -6769,6 +6769,67 @@ bool FastllmCudaBatchCopy2DAsyncCurrentThread(
 }
 
 namespace {
+struct LogitGatherBatch {
+    FastllmCudaLogitShard shards[32];
+    FastllmCudaLogitRows requests[128];
+};
+constexpr int logitTile = 2048;
+__global__ void GatherBf16Logits(LogitGatherBatch batch, int vocab) {
+    const auto shard = batch.shards[blockIdx.z];
+    const auto request = batch.requests[blockIdx.y];
+    const int first = blockIdx.x * logitTile;
+    if (first >= shard.columns) return;
+    const auto *src = shard.src + size_t(request.first) * shard.columns + first;
+    auto *dst = reinterpret_cast<uint32_t *>(request.dst) + shard.offset + first;
+    const int n = min(logitTile, shard.columns - first);
+    const bool aligned = ((uintptr_t(src) | uintptr_t(dst)) & 15) == 0 &&
+                         shard.columns % 8 == 0 && vocab % 4 == 0;
+    for (int row = 0; row < request.rows; ++row) {
+        if (aligned) {
+            const int i = threadIdx.x * 8;
+            if (i < n) {
+                const uint4 w = *reinterpret_cast<const uint4 *>(src + i);
+                auto *out = reinterpret_cast<uint4 *>(dst + i);
+                out[0] = make_uint4(w.x << 16, w.x & 0xffff0000u, w.y << 16, w.y & 0xffff0000u);
+                out[1] = make_uint4(w.z << 16, w.z & 0xffff0000u, w.w << 16, w.w & 0xffff0000u);
+            }
+        } else {
+            for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = uint32_t(src[i]) << 16;
+        }
+        src += shard.columns;
+        dst += vocab;
+    }
+}
+}
+
+bool FastllmCudaGatherBf16Logits(const FastllmCudaLogitShard *shards, int shardCount,
+                                const FastllmCudaLogitRows *requests, int count, int vocab) {
+    if (count < 0 || shardCount < 1 || !shards || (count && !requests) || vocab <= 0) return false;
+    for (int s = 0; s < shardCount; ++s) {
+        const auto &v = shards[s];
+        if (!v.src || v.offset < 0 || v.columns <= 0 || v.offset > vocab - v.columns) return false;
+    }
+    for (int i = 0; i < count; ++i)
+        if (!requests[i].dst || requests[i].first < 0 || requests[i].rows < 0) return false;
+    for (int s = 0; s < shardCount;) {
+        LogitGatherBatch batch{};
+        const int ns = std::min(shardCount - s, int(std::size(batch.shards)));
+        std::copy_n(shards + s, ns, batch.shards);
+        int width = 0;
+        for (int i = 0; i < ns; ++i) width = std::max(width, batch.shards[i].columns);
+        for (int begin = 0; begin < count;) {
+            const int n = std::min(count - begin, int(std::size(batch.requests)));
+            std::copy_n(requests + begin, n, batch.requests);
+            GatherBf16Logits<<<dim3(1 + (width - 1) / logitTile, n, ns), 256, 0, cudaStreamPerThread>>>(batch, vocab);
+            if (cudaGetLastError() != cudaSuccess) return false;
+            begin += n;
+        }
+        s += ns;
+    }
+    return true;
+}
+
+namespace {
 constexpr int Bf16SlicesPerLaunch = 128;
 struct PackedBf16Slices { FastllmCudaPackedBf16Slice items[Bf16SlicesPerLaunch]; };
 
