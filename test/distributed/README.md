@@ -481,7 +481,10 @@ bash test/distributed/run_qwen3_prefill_v100.sh /home/models/Qwen3-1.7B
 只计算新 token，Attention 读取历史 KV，成功同步后才增加有效长度。任一 worker
 失败会终止整组，不能复用部分更新的缓存。
 
-GPU 缓存为每层 FP16 `[capacity, 2, local_kv_heads, head_dim]`，第二维依次为 K、V。
+以下连续 KV 布局和限制是初版记录；当前 Dense Qwen3 已使用 FT 分页缓存，
+以页池容量检查请求上限，详见下文“Qwen3进程TP复用FT分页缓存”。
+
+初版 GPU 缓存为每层 FP16 `[capacity, 2, local_kv_heads, head_dim]`，第二维依次为 K、V。
 KV 按现有 Attention 分片保存，TP 大于 KV 头数时对应 KV 头复制。分配字节为
 `layers * capacity * 2 * local_kv_heads * head_dim * sizeof(FP16)`，每 rank 上限
 256 MiB，独立于 256 MiB 临时工作区。缓存跨前向调用存活，临时工作区仍每次释放；
@@ -498,10 +501,14 @@ End 同步并释放 KV，可以重复调用；卸载模型和正常 Stop 也释�
 - 无状态 `PrefillQwen3` 保持原语义，可在请求活动时用于完整前缀重算，不读写请求 KV。
 - Python 服务端 `--tp_backend process` 仍未开放，不能把检查器当作完整服务后端。
 
-默认数值验收包含 30 个 case：F16/BF16/F32 源权重（GPU 均为 FP16）、bias、
+当前默认数值验收包含 32 个 case：F16/BF16/F32 源权重（GPU 均为 FP16）、bias、
 tied embedding、KV 头复制、128 维头、位置上限、容量边界、不同 Prompt、重复
 请求、活动请求卸载、变更权重后的重载、无请求 Decode、重复 Begin、无效 ID、
-容量耗尽、KV 配额超限和报告容量超限。所有正例均逐步对比单卡与双卡完整 logits，前缀不超过
+容量耗尽、分页页池容量边界和报告容量超限。页池边界使用正式参数
+`--page-size 4 --tokens 8`：请求容量 7/8 必须成功并实际计算到该长度，9 必须以
+页池超限错误拒绝并回收整组；每个 rank 的实际页大小和页数也必须符合配置。
+此项替换旧 `reject_kv_limit` 的 256 MiB 拒绝预期，不改变运行时限制。
+所有正例均逐步对比单卡与双卡完整 logits，前缀不超过
 128 时还通过公开无状态 Prefill 入口重算；小模型对照独立未分片 CPU 数学参考。
 最大上下文用例从 128 个 ID=14 的 Prompt token 继续送入 1920 个 ID=16，达到
 2048；固定的小模型已检查该输入能识别丢弃早期 128 个 KV 的错误。所有步
@@ -957,8 +964,8 @@ bash test/distributed/run_qwen3_custom_allreduce_v100.sh /home/models/Qwen3-1.7B
 
 1. 通信底座：27 次变长 FP32 数值检查，覆盖 1/31/255/256/4095/4096/65535/65536/65537 元素，
    验证实际 custom/NCCL 次数；非法输入、TP=1 拒绝、重启、崩溃、停顿、对端退出后的整组回收。
-2. Eager 合成 Decode 30 项；逐步对照 NCCL TP、单卡和独立 CPU 参考。
-3. Graph 合成 Decode 30 项；严格校验每层两次规约及 warmup、replay 的实际次数。
+2. Eager 合成 Decode 32 项；逐步对照 NCCL TP、单卡和独立 CPU 参考。
+3. Graph 合成 Decode 32 项；严格校验每层两次规约及 warmup、replay 的实际次数。
 4. Graph 真实模型 Decode 1 项。
 5. Graph 合成常驻会话 96 项，包含流式、请求复用、取消恢复。
 6. Graph 真实模型常驻会话 16 项。
