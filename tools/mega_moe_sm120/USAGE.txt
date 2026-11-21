@@ -5,12 +5,13 @@ Expert weights are repacked and their source allocations are retired one layer
 at a time before serving. The native and grouped EP8 paths share the FP4 values. Each retains its own
 scale layout. Temporary copies of the original weights are bounded to one layer.
 
-For the shipped 110-SM EP8 geometry, the default uses grouped MoE at up to
-128 collective rows per rank and the native package above that threshold.
-The rank with the largest slice sets the collective row count for all peers.
-The log reports backend=sm120-grouped-decode-native-prefill. Set
-FASTLLM_SM120_EP_BACKEND=grouped or native before loading the model to
-benchmark one implementation. EP4 continues to use its packaged kernels.
+On the shipped 110-SM EP8 geometry, auto uses grouped MoE for up to 128
+collective rows per rank. With four ranks on each of two NUMA nodes and the
+prefill pipeline enabled, it also uses grouped for fully dense prefill at
+129–288, 384, 448, 480–768, and 2048 rows. The log reports
+backend=sm120-auto-grouped-and-native. Above 128 rows all other shapes,
+including uneven slices and masked verification, use native. EP4 uses native.
+Set FASTLLM_SM120_EP_BACKEND=grouped or native to force a backend.
 
 Packages in ftllm/kernels/mxfp4_ep/ require CUDA 12.9+ on Linux, a compatible
 driver and direct peer access. Inference runs without the Python export tools.
@@ -23,9 +24,8 @@ widths must be multiples of 128. The number of SMs, expert count and top-k are
 runtime parameters. The load log reports backend=sm120-grouped-ep. This path
 is linked into FastLLM and requires no standalone cubin. Each rank sends one
 quantized token per selected owner. Each owner computes only its routed rows.
-Workspace and packed weights are prepared before capture. On tuned EP8,
-standalone grouped prefill uses two independent 512-row workspaces and
-streams. Set FASTLLM_SM120_EP_PREFILL_PIPELINE=0 for the 128-row workspace.
+Workspace and packed weights are prepared before capture. Tuned EP8 prefill
+uses 1024-row chunks and can prefetch the following chunk on a copy stream. Set FASTLLM_SM120_EP_PREFILL_PIPELINE=0 for the 128-row workspace.
 Other supported geometries use the 128-row workspace.
 
 Currently shipped and tested packages:

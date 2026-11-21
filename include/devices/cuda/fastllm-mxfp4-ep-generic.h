@@ -14,6 +14,8 @@ void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::
 // Shared decode borrows native FP4 values for the lifetime of the state.
 bool FastllmGenericEpTunedEp8(const std::vector<int> &devices);
 std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8Decode(const std::vector<int> &devices);
+// Auto mode also shares native FP4 values for dense prefill on paired NUMA ranks.
+std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8(const std::vector<int> &devices, bool &densePrefill);
 void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::vector<uint64_t> &gateDown,
                           const std::array<void *, 2> &sharedWeights);
 void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *input, const int32_t *ids,

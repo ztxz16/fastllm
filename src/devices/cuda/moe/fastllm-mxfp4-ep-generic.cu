@@ -222,12 +222,14 @@ __global__ void rendezvous(Mail *peers, int rank, int ranks) {
 }
 
 // Eight adjacent lanes quantize one E8M0-scaled block of 32 FP8 values.
+template <bool Fc1Output = false>
 __device__ uint32_t quantizeFour(float4 values, uint8_t &scaleByte) {
     float amax = fmaxf(fmaxf(fabsf(values.x), fabsf(values.y)), fmaxf(fabsf(values.z), fabsf(values.w)));
     #pragma unroll
     for (int delta = 4; delta > 0; delta /= 2)
         amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, delta, 8));
-    const int bits = __float_as_int(fmaxf(amax, 1e-4f) / 448.f);
+    // Input staging floors its scale. The fused FC1 epilogue uses the actual block maximum.
+    const int bits = __float_as_int(Fc1Output ? amax * (1.f / 448.f) : fmaxf(amax, 1e-4f) / 448.f);
     scaleByte = (bits >> 23) + ((bits & 0x7fffff) != 0);
     const float invScale = __uint_as_float((254 - scaleByte) << 23);
     const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(values.x * invScale, values.y * invScale),
@@ -247,6 +249,14 @@ struct QuantizedSwiGLU {
     PrefillTile *tiles = nullptr;
 
     __device__ static float activate(float gate, float up, float score) {
+        if constexpr (Notify) {
+            // Match the packaged FC1 arithmetic before converting the result to MXFP8.
+            float exponent, reciprocal;
+            asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(exponent) : "f"(gate * -1.4426950408889634f));
+            const float denominator = 1.f + exponent;
+            asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(reciprocal) : "f"(denominator));
+            return (up * gate) * reciprocal * score;
+        }
         return (gate / (1.f + __expf(-gate))) * up * score;
     }
 
@@ -276,7 +286,7 @@ struct QuantizedSwiGLU {
         for (int idx = threadIdx.x; idx < M * chunksPerRow; idx += Threads) {
             int row = mBase + idx / chunksPerRow, col = nBase / 2 + (idx % chunksPerRow) * 4;
             uint8_t sf;
-            auto quant = quantizeFour(reinterpret_cast<const float4 *>(tile)[idx], sf);
+            auto quant = quantizeFour<Notify>(reinterpret_cast<const float4 *>(tile)[idx], sf);
             *reinterpret_cast<uint32_t *>(data + size_t(row) * inter + col) = quant;
             if (!(col % 32)) scales[(size_t(col / 128) * pool + row) * 4 + col % 128 / 32] = sf;
         }
@@ -597,33 +607,37 @@ __global__ void publishOwnerRows(Buffers b, const Mail *peers, int cap) {
         asm volatile("cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;" ::: "memory");
     }
 }
-// Fold direct FC2 slots at the requester in top-8 order with the same BF16
-// rounding as the expert owner. Pre-reduced owners only occupy their first slot.
-template <bool BalanceReturns = false>
-__global__ void combineCrossSocketRows(Mail mail, const int *ids, BF *out, int rank) {
+// Round each owner partial to BF16, then accumulate owners in rank order,
+// as in the packaged prefill reduction. An owner can also send its partial directly.
+enum class OwnerReturn { Direct, CrossSocket, Reduced };
+template <bool BalanceReturns = false, OwnerReturn Mode = OwnerReturn::CrossSocket>
+__global__ void combineDenseEp8Rows(Mail mail, const int *ids, BF *out, int rank) {
     constexpr int topk = 8, hidden = 4096, width = sizeof(uint4) / sizeof(BF);
     const int row = blockIdx.x;
     __shared__ uint8_t groups[topk];
+    if (threadIdx.x < topk) groups[threadIdx.x] = 0;
+    __syncthreads();
     if (threadIdx.x < topk) {
         const unsigned slot = threadIdx.x;
         const unsigned expertId = ids[row * topk + slot];
         const unsigned owner = expertId / 32;
         const unsigned mask = __match_any_sync(0xffu, owner);
         const unsigned first = __ffs(mask) - 1;
-        bool direct = owner / 4 == unsigned(rank / 4);
+        bool direct = Mode == OwnerReturn::Direct || (Mode == OwnerReturn::CrossSocket && owner / 4 == unsigned(rank / 4));
         if constexpr (BalanceReturns) {
             if (owner < 8) direct |= directReturn(row, owner, mail.directShares()[owner]);
         }
         const unsigned contributions = direct ? mask : 1u << first;
-        groups[slot] = expertId < 256 && slot == first ? contributions : 0;
+        if (expertId < 256 && slot == first) groups[owner] = contributions;
     }
     __syncthreads();
     const auto *rows = reinterpret_cast<const uint4 *>(mail.returned) + size_t(row) * topk * (hidden / width);
     for (int col = threadIdx.x; col < hidden / width; col += blockDim.x) {
         float total[width] = {};
-        for (int first = 0; first < topk; ++first) {
-            const unsigned slots = groups[first];
+        for (int owner = 0; owner < topk; ++owner) {
+            const unsigned slots = groups[owner];
             if (!slots) continue;
+            const int first = __ffs(slots) - 1;
             const uint4 initial = rows[first * (hidden / width) + col];
             float partial[width];
             #pragma unroll
@@ -833,6 +847,30 @@ bool FastllmGenericEpSupported(const std::vector<int> &devices) {
     return true;
 }
 namespace {
+bool pairedEp8Numa(const std::vector<int> &devices) {
+    if (devices.size() != 8) return false;
+    int nodes[8];
+    for (int r = 0; r < 8; ++r) {
+        if (cudaDeviceGetAttribute(&nodes[r], cudaDevAttrHostNumaId, devices[r]) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        if (nodes[r] < 0 || nodes[r] != nodes[r & 4]) return false;
+    }
+    return nodes[0] != nodes[4];
+}
+bool supportsCompactPrefill(const std::vector<int> &devices) {
+    return std::all_of(devices.begin(), devices.end(), [](int device) {
+        int shared;
+        check(cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        return shared >= Smem<float, Tile, true>;
+    });
+}
+bool prefillPipelineEnabled() {
+    const char *option = std::getenv("FASTLLM_SM120_EP_PREFILL_PIPELINE");
+    return !option || std::string(option) == "1";
+}
+
 std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &devices, int h, int i,
                                                   int experts, int topk, int capacity) {
     Restore restore;
@@ -848,26 +886,8 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
     s.stride = (h + h / 32 + topk * 8 + 15) / 16 * 16;
     s.pool = (s.cap * s.ranks * topk + (alignment - 1) * s.localE) / alignment * alignment;
     std::vector<Mail> mail, prefetchMail;
-    // With four GPUs on each host NUMA node, each pair of remote GPUs can
-    // share one cross-socket transfer. Other rank orders use direct dispatch.
-    bool relayAcrossNuma = capacity > 128 && devices.size() == 8;
-    int nodes[8]{};
-    if (relayAcrossNuma) {
-        for (int r = 0; r < 8; ++r) {
-            if (cudaDeviceGetAttribute(&nodes[r], cudaDevAttrHostNumaId, devices[r]) != cudaSuccess) {
-                cudaGetLastError();
-                relayAcrossNuma = false;
-                break;
-            }
-            relayAcrossNuma &= nodes[r] >= 0 && nodes[r] == nodes[r & 4];
-        }
-        relayAcrossNuma = relayAcrossNuma && nodes[0] != nodes[4];
-    }
-    const bool compactPrefill = relayAcrossNuma && std::all_of(devices.begin(), devices.end(), [](int device) {
-        int shared;
-        check(cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-        return shared >= Smem<float, Tile, true>;
-    });
+    const bool relayAcrossNuma = capacity > 128 && pairedEp8Numa(devices);
+    const bool compactPrefill = relayAcrossNuma && supportsCompactPrefill(devices);
     // Once a gate tile completes, FC2 can reuse its FP8 input rows for BF16 partials.
     s.inputPitch = relayAcrossNuma ? h * int(sizeof(BF)) : h;
     for (int d : devices) {
@@ -995,13 +1015,17 @@ std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8Decode(const std::vector
     // Called only after validating the shipped EP8 weight layout and hardware.
     return createWorkspace(devices, 4096, 2048, 256, 8, 128);
 }
+std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8(const std::vector<int> &devices, bool &densePrefill) {
+    densePrefill = prefillPipelineEnabled() && pairedEp8Numa(devices) && supportsCompactPrefill(devices);
+    if (!densePrefill) return FastllmCreateSharedEp8Decode(devices);
+    return createWorkspace(devices, 4096, 2048, 256, 8, PrefillChunk);
+}
 std::shared_ptr<FastllmGenericEp> FastllmCreateGenericEp(const std::vector<int> &devices, int h, int i,
                                                          int experts, int topk) {
     if (!FastllmGenericEpSupported(devices) || h <= 0 || i <= 0 || h % 128 || i % 128 || experts <= 0 ||
         experts % devices.size() || topk <= 0 || topk > experts)
         throw std::runtime_error("Unsupported SM120 generic EP geometry");
-    const char *option = std::getenv("FASTLLM_SM120_EP_PREFILL_PIPELINE");
-    bool usePipeline = (!option || std::string(option) == "1") && h == 4096 && i == 2048 &&
+    bool usePipeline = prefillPipelineEnabled() && h == 4096 && i == 2048 &&
                        experts == 256 && topk == 8 && FastllmGenericEpTunedEp8(devices);
     return createWorkspace(devices, h, i, experts, topk, usePipeline ? PrefillChunk : 128);
 }
@@ -1170,9 +1194,13 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
         publishOwnerRows<<<s.ranks * cap, 256, 0, stream>>>(buffers, returnPeers, cap);
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
     if (compact && n)
-        combineCrossSocketRows<true><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
+        combineDenseEp8Rows<true><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
     else if (crossSocketOnly && n)
-        combineCrossSocketRows<><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
+        combineDenseEp8Rows<><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
+    else if (paired && n && ownerPartial)
+        combineDenseEp8Rows<false, OwnerReturn::Reduced><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
+    else if (paired && n)
+        combineDenseEp8Rows<false, OwnerReturn::Direct><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
     else if (ownerPartial && n)
         combine<8, true><<<n, 256, 0, stream>>>(r.mail, s, index, out, keys);
     else if (n && shortBatch)

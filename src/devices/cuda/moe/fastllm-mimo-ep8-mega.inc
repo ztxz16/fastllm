@@ -31,6 +31,10 @@ void FastllmBindGenericEp(FastllmGenericEp &, int, int, const std::vector<uint64
 }
 bool FastllmGenericEpTunedEp8(const std::vector<int> &) { return false; }
 std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8Decode(const std::vector<int> &) { return {}; }
+std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8(const std::vector<int> &, bool &densePrefill) {
+    densePrefill = false;
+    return {};
+}
 void FastllmBindGenericEp(FastllmGenericEp &, int, int, const std::vector<uint64_t> &, const std::array<void *,2> &) {
     throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
 }
@@ -51,6 +55,16 @@ struct FastllmCudaMimoEp8Mega {
     // The generic weight views are destroyed before the owning native state.
     std::shared_ptr<FastllmGenericEp> generic;
     static constexpr int SharedDecodeRows = 128;
+    bool groupedDensePrefill = false;
+
+    bool useGrouped(int rows, int densePrefixRows) const {
+        if (!generic || !native) return bool(generic);
+        if (rows <= SharedDecodeRows) return true;
+        // All ranks must make the same choice even for ragged or masked graphs.
+        if (!groupedDensePrefill || densePrefixRows != rows) return false;
+        // In the 320–479 crossover, native wins several neighboring shapes.
+        return rows <= 288 || rows == 384 || rows == 448 || (rows >= 480 && rows <= 768) || rows == 2048;
+    }
     std::vector<int> devices;
     std::vector<int> layers;
     int preparedRows = 0;
@@ -96,6 +110,7 @@ void FastllmCudaPrepareMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int maxRows) {
     // after one rank has entered a peer collective can block every other rank.
     // Prepare on the coordinator, while all earlier peer work can still drain.
     for (int rows = state.preparedRows ? state.preparedRows * 2 : 1; ; rows *= 2) {
+        // The same bucket may serve masked replays even when dense prefill uses grouped.
         if (!state.generic || rows > state.SharedDecodeRows)
             for (int layer : state.layers) state.Graph(0, layer, rows);
         state.preparedRows = rows;
@@ -148,7 +163,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     const bool compatible = package && h == 4096 && mid == 2048 && experts == 256 && topk == 8;
     if (mode == "native" && !compatible) throw std::runtime_error("No matching SM120 EP kernel package");
     const bool usePackage = compatible && mode != "grouped";
-    const bool sharedDecode = usePackage && mode == "auto" && FastllmGenericEpTunedEp8(devices);
+    const bool shareWeights = usePackage && mode == "auto" && FastllmGenericEpTunedEp8(devices);
     state->hidden = h; state->topk = topk;
     std::vector<std::vector<std::vector<uint64_t>>> sources;
     for (size_t r = 0; r < devices.size(); ++r) {
@@ -176,7 +191,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     if (usePackage) {
         state->native = FastllmCudaCreateMxfp4EpNative(devices, sources);
         if (!state->native) throw std::runtime_error("Native SM120 MXFP4 EP is unavailable in this build.");
-        if (sharedDecode) state->generic = FastllmCreateSharedEp8Decode(devices);
+        if (shareWeights) state->generic = FastllmCreateSharedEp8(devices, state->groupedDensePrefill);
     } else {
         state->generic = FastllmCreateGenericEp(devices, h, mid, experts, topk);
     }
@@ -195,7 +210,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
         for (size_t rank = 0; rank < devices.size(); ++rank) {
             FastllmCudaSetDevice(devices[rank]);
             if (state->generic) {
-                const auto packed = sharedDecode ? FastllmCudaMxfp4EpPackedWeights(*state->native, rank, layer)
+                const auto packed = shareWeights ? FastllmCudaMxfp4EpPackedWeights(*state->native, rank, layer)
                                                  : std::array<void *, 2>{};
                 FastllmBindGenericEp(*state->generic, rank, layer, sources[rank][layer], packed);
             }
@@ -205,7 +220,8 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     }
     printf("MIMO_EP_MEGA ranks=%zu experts=%zu inter=%d W4A8 backend=%s\n",
            devices.size(), experts / devices.size(), mid,
-           sharedDecode ? "sm120-grouped-decode-native-prefill" :
+           state->groupedDensePrefill ? "sm120-auto-grouped-and-native" :
+           shareWeights ? "sm120-grouped-decode-native-prefill" :
            usePackage ? "flashinfer-sm120-native-cubin" : "sm120-grouped-ep");
     return state;
 }
@@ -213,7 +229,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
 namespace {
 void MimoReplayRows(FastllmCudaMimoEp8Mega &state, int rank, int layer, const void *input, const int32_t *indices,
         const float *scores, void *output, int rows, int collectiveRows, const int *liveKeys, int densePrefixRows = 0) {
-    if (state.generic && (!state.native || collectiveRows <= state.SharedDecodeRows)) {
+    if (state.useGrouped(collectiveRows, densePrefixRows)) {
         FastllmRunGenericEp(*state.generic, rank, layer, input, indices, scores, output,
                             rows, collectiveRows, liveKeys, densePrefixRows);
         return;
@@ -309,13 +325,15 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     if ((!localRouting && index.dims != std::vector<int>({total, state.topk})) || score.dims != index.dims)
         throw std::runtime_error("Invalid SM120 EP routing shape.");
     MimoGraphOutput(output, input, state.devices.at(rank));
+    const int commonRows = sharded ? (total + ranks - 1) / ranks : total;
+    const int densePrefix = !graphDecode && !liveKeys && state.groupedDensePrefill
+        ? (sharded ? total / ranks : total) : 0;
     MimoReplayRows(state, rank, layer,
         (uint16_t *)input.cudaData + (size_t)first * state.hidden,
         (int32_t *)index.cudaData + (localRouting ? 0 : first * state.topk),
         (float *)score.cudaData + (localRouting ? 0 : first * state.topk),
         (uint16_t *)output.cudaData + (size_t)first * state.hidden,
-        rows, sharded ? (total + ranks - 1) / ranks : total,
-        liveKeys ? liveKeys + first : nullptr);
+        rows, commonRows, liveKeys ? liveKeys + first : nullptr, densePrefix);
     if (!graphDecode && localRouting && residual && normWeight && normOutput) {
         // Prefill deliberately retains only the owning rank's residual rows.
         // Update those rows, then publish normalized activations for the next
