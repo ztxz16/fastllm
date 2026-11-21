@@ -394,6 +394,9 @@ if hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
     fastllm_lib.create_llm_model_fromhf_with_context.argtypes = (
         fastllm_lib.create_llm_model_fromhf.argtypes + [ctypes.c_int, ctypes.c_char_p])
     fastllm_lib.create_llm_model_fromhf_with_context.restype = ctypes.c_int
+    if hasattr(fastllm_lib, "create_pd_prefill_model_fromhf_with_context"):
+        fastllm_lib.create_pd_prefill_model_fromhf_with_context.argtypes = fastllm_lib.create_llm_model_fromhf_with_context.argtypes
+        fastllm_lib.create_pd_prefill_model_fromhf_with_context.restype = ctypes.c_int
     fastllm_lib.get_llm_context_result.argtypes = []
     fastllm_lib.get_llm_context_result.restype = ctypes.c_char_p
     fastllm_lib.get_llm_context_config.argtypes = [ctypes.c_int]
@@ -593,6 +596,9 @@ fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
 
 fastllm_lib.warmup_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.warmup_llm_model.restype = ctypes.c_char_p
+if hasattr(fastllm_lib, "warmup_pd_prefill_llm_model"):
+    fastllm_lib.warmup_pd_prefill_llm_model.argtypes = [ctypes.c_int]
+    fastllm_lib.warmup_pd_prefill_llm_model.restype = ctypes.c_char_p
 if hasattr(fastllm_lib, "configure_attention_parallel_llm_model"):
     fastllm_lib.configure_attention_parallel_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
     fastllm_lib.configure_attention_parallel_llm_model.restype = ctypes.c_char_p
@@ -1490,7 +1496,7 @@ class model:
                   rope_scaling = None,
                   indexer_dtype: str = "auto",
                   indexer_tp_storage: str = "replicated",
-                  indexer_compute_dtype: str = "auto"):
+                  indexer_compute_dtype: str = "auto", pd_prefill: bool = False):
         if indexer_compute_dtype not in ("auto", "fp8", "fp8_direct"):
             raise ValueError("indexer_compute_dtype must be auto, fp8 or fp8_direct")
         if indexer_compute_dtype != "auto" and not hasattr(fastllm_lib, "set_model_indexer_compute_dtype"):
@@ -1679,7 +1685,10 @@ class model:
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
                         ctypes.c_bool(skip_tokenizer), model_json.encode())
                 elif hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
-                    self.model = fastllm_lib.create_llm_model_fromhf_with_context(
+                    factory = fastllm_lib.create_llm_model_fromhf_with_context
+                    if pd_prefill:
+                        factory = getattr(fastllm_lib, "create_pd_prefill_model_fromhf_with_context", factory)
+                    self.model = factory(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
                         ctypes.c_bool(skip_tokenizer), lora.encode(),
                         use_moe_dtype, fastllm_data_type_dict[moe_dtype], moe_int4g_groupcnt,
@@ -3631,6 +3640,14 @@ class model:
             raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
+    def configure_dspark_parallel(self, size: int, *, replicas: bool):
+        configure = fastllm_lib.configure_dspark_parallel_llm_model
+        configure.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_bool]
+        configure.restype = ctypes.c_char_p
+        error = configure(self.model, size, replicas)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
+
     def configure_attention_parallel(self, size: int):
         setter = getattr(fastllm_lib, "configure_attention_parallel_llm_model", None)
         if setter is None:
@@ -3641,15 +3658,18 @@ class model:
         if error:
             raise ValueError(error.decode("utf-8", errors="replace"))
 
-    def warmup(self, pd_prefill=None):
-        if pd_prefill is not None:
+    def warmup(self, pd_prefill=False):
+        if isinstance(pd_prefill, dict):
             plan = fastllm_lib.plan_pd_prefill_llm_model
             plan.argtypes = [ctypes.c_int, ctypes.c_char_p]
             plan.restype = ctypes.c_bool
             if not plan(self.model, json.dumps(pd_prefill, allow_nan=False).encode()):
                 fastllm_lib.get_pd_error.restype = ctypes.c_char_p
                 raise ValueError(fastllm_lib.get_pd_error().decode())
-        error = fastllm_lib.warmup_llm_model(self.model)
+        warmup = fastllm_lib.warmup_llm_model
+        if pd_prefill:
+            warmup = getattr(fastllm_lib, "warmup_pd_prefill_llm_model", warmup)
+        error = warmup(self.model)
         if error:
             raise RuntimeError(error.decode("utf-8", errors="replace"))
         self._refresh_context_config()

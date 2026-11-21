@@ -19,10 +19,16 @@ def kernel_binaries(nodes):
 
 class Sm120EpPrefillPackagesTest(unittest.TestCase):
     def test_packages_cover_full_prefill_shapes(self):
+        provenance = json.loads((ROOT / "third_party/flashinfer_sm120_ep/UPSTREAM.json").read_text())
+        records = {entry["specialization"]["ep"]: entry
+                   for entry in [provenance, *provenance["additional_packages"]]}
         for ep in (4, 8):
             with self.subTest(ep=ep):
                 package = PACKAGES / f"sm120_sms110_ep{ep}_h4096_i2048_e256_k8"
-                manifest = json.loads((package / "manifest.json").read_text())
+                data = (package / "manifest.json").read_bytes()
+                self.assertEqual(hashlib.sha256(data).hexdigest(), records[ep]["manifest_sha256"])
+                manifest = json.loads(data)
+                self.assertEqual(set(manifest["binaries"]), set(records[ep]["binaries_sha256"]))
                 buckets = manifest["buckets"]
                 capacities = {bucket["capacity"] for bucket in buckets}
                 self.assertTrue({256, 512, 1024, 2048} <= capacities, sorted(capacities))

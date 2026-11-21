@@ -91,6 +91,11 @@ def load_config(path):
                     pd['cache_kv_bytes'] = kv
                 if swa is not None:
                     pd['cache_swa_bytes'] = swa
+                if 'cache_pinned_bytes' in group:
+                    pinned = group['cache_pinned_bytes']
+                    if type(pinned) is not int or not 0 <= pinned <= effective:
+                        raise ValueError('cache_pinned_bytes must be an integer within the L2 cache budget')
+                    pd['cache_pinned_bytes'] = pinned
                 if 'cache_workers' in group:
                     if type(group['cache_workers']) is not int or not 1 <= group['cache_workers'] <= 64:
                         raise ValueError('cache_workers must be an integer in [1, 64]')

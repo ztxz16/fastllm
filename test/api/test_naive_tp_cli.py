@@ -55,6 +55,41 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         self.configure(["--tp", "8", "--attn-dp-size", "8", "--pd", json.dumps(decode)])
         self.loaded_model.warmup.assert_called_once_with()
 
+    def test_dspark_parallel_placement_before_warmup(self):
+        with tempfile.TemporaryDirectory() as draft:
+            (Path(draft) / "config.json").write_text(json.dumps({"architectures": ["DSparkDraftModel"], "block_size": 7}))
+            target = ["--draft", draft, "--tp", "4", "--attn-dp-size", "4"]
+            pd = target + ["--pd", '{"role":"decode"}']
+            for opts, legacy, expected in (
+                    (pd, None, (4, True)),
+                    (pd, "mlp:4", None),
+                    (pd + ["--dspark_dp_size", "4"], "1", (4, True)),
+                    (target + ["--dspark_tp_size", "1"], "dp:4", (1, False)),
+                    (target, None, None)):
+                with self.subTest(opts=opts, legacy=legacy):
+                    env = {"FASTLLM_DSPARK_TP": legacy} if legacy else {}
+                    self.configure(opts, environment=env)
+                    self.assertEqual(self.native_env.get("FASTLLM_DSPARK_TP"), legacy)
+                    configure = self.loaded_model.configure_dspark_parallel
+                    if expected is None:
+                        configure.assert_not_called()
+                    else:
+                        configure.assert_called_once_with(expected[0], replicas=expected[1])
+                        calls = [call[0] for call in self.loaded_model.mock_calls]
+                        self.assertLess(calls.index("configure_dspark_parallel"), calls.index("warmup"))
+
+    def test_pd_prefill_role_before_warmup(self):
+        for role in ("prefill", "decode"):
+            self.configure(["--tp", "4", "--pd", json.dumps({"role": role})])
+            self.assertEqual(self.model_options["pd_prefill"], role == "prefill")
+            warmup = self.loaded_model.warmup
+            if role == "prefill":
+                warmup.assert_called_once_with(pd_prefill=True)
+            else:
+                warmup.assert_called_once_with()
+            order = [call[0] for call in self.loaded_model.mock_calls]
+            self.assertLess(order.index("warmup"), order.index("configure_pd"))
+
     def test_naive_host_prefix_cache(self):
         self.configure(['--tp', '8'])
         self.loaded_model.set_save_history.assert_called_once_with(True)

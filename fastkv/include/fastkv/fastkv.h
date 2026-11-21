@@ -80,6 +80,7 @@ class Buffer {
     void CopyFrom(const Buffer &source, size_t sourceOffset, size_t targetOffset, size_t bytes) const;
     void MakeRemoteWritesVisible() const;
     bool Preallocated() const;
+    bool HostPinned() const;
     bool HasAttachment(const std::string &key) const;
     std::shared_ptr<void>
     Attachment(const std::string &key,
@@ -87,6 +88,9 @@ class Buffer {
 
   private:
     friend class BufferPool;
+    friend class HostCache;
+    // Only called on a new, exclusively owned host slab before publishing it.
+    void TryPinHost(std::shared_ptr<void> credit, int device);
     size_t AllocationSize() const;
     void MarkPreallocated();
     std::shared_ptr<Storage> storage;
@@ -358,6 +362,9 @@ class PrefillRouter {
         std::shared_ptr<void> lease;
     };
     explicit PrefillRouter(size_t peers);
+    // Producers apply their own page size before advertising a host hit.
+    static bool PreferHostPrefix(size_t residentTokens, size_t hostTokens, size_t pageTokens,
+                                 double tokensPerSecond, double restoreSeconds);
     static size_t SessionPeer(const std::string &key, const std::vector<std::string> &peers);
     Route Reserve(size_t tokens, const std::vector<Estimate> &estimates, size_t preferred = SIZE_MAX,
                   bool pinPreferred = false);

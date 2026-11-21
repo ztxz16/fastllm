@@ -44,9 +44,10 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
-          uint32_t kSplitKFactor = 1>
+          uint32_t kSplitKFactor = 1, bool kDeviceGroupedRows = false, bool kScatterRows = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
+sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const*, cd_dtype_t*> gmem_d,
+                             const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                              int* grouped_layout,
                              cute::TmaDescriptor* tensor_map_buffer,
@@ -107,6 +108,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                    (BLOCK_N * sizeof(cd_dtype_t)) % kSwizzleCDMode == 0;
         }
     }();
+    static_assert(!kScatterRows || (kDeviceGroupedRows && kUseTMAStoreEpilogue && !kWithAccumulation &&
+                                   kSplitKFactor == 1 && cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>));
     static constexpr uint32_t kNumEpiMSubs = kUseTMAStoreEpilogue ? (BLOCK_M / kEpiSubM) : 0;
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
         ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * kEpiSubM)
@@ -138,6 +141,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
     static constexpr uint32_t kTMACopySwizzleA = kIsFP4 ? 0u : kSwizzleAMode;
     static constexpr uint32_t kTMACopySwizzleB = kIsFP4 ? 0u : kSwizzleBMode;
 
+    // EP routing produces the padded row count on-device immediately before GEMM.
+    if constexpr (kDeviceGroupedRows) {
+        static_assert(kGemmType == GemmType::MGroupedContiguous && SHAPE_M == 0);
+        shape_m = __ldg(grouped_layout - 1);
+    }
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
     shape_k = SHAPE_K != 0 ? SHAPE_K : shape_k;
@@ -186,7 +194,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         cute::prefetch_tma_descriptor(&tensor_map_b_base);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
-        cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (!kScatterRows) cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
     __syncwarp();
 
@@ -1199,8 +1207,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                 for (uint32_t ms = 0; ms < kNumEpiMSubs; ++ms) {
                     const uint32_t epi_m_start = ms * kEpiSubM;
 
-                    if (math_warp_idx == 0 and lane_idx == 0)
-                        cute::tma_store_wait<0>();
+                    if constexpr (!kScatterRows) {
+                        if (math_warp_idx == 0 and lane_idx == 0)
+                            cute::tma_store_wait<0>();
+                    }
                     cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
                     #pragma unroll
@@ -1256,10 +1266,26 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
                         }
                     }
 
-                    cute::tma_store_fence();
+                    if constexpr (!kScatterRows) cute::tma_store_fence();
                     cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
-                    if (math_warp_idx == 0 and lane_idx == 0) {
+                    if constexpr (kScatterRows) {
+                        // EP return slots belong to the requesting ranks. Null entries mark padded rows.
+                        constexpr uint32_t elems = sizeof(uint4) / sizeof(cd_dtype_t);
+                        constexpr uint32_t vectors = BLOCK_N / elems;
+                        for (uint32_t v = threadIdx.x; v < kEpiSubM * vectors; v += kNumMathThreads) {
+                            const uint32_t row = v / vectors, col = v % vectors * elems;
+                            auto* dst = gmem_d[m_base + epi_m_start + row];
+                            if (!dst || n_base + col >= shape_n) continue;
+                            const uint32_t sub = col / kTMAStoreInnerDim;
+                            const uint32_t byte = (col % kTMAStoreInnerDim * sizeof(cd_dtype_t)) ^
+                                (((row >> kSwizzleCDShift) & kSwizzleCDMask) << 4);
+                            const auto* src = reinterpret_cast<const char*>(smem_d_base) +
+                                (sub * kEpiSubM + row) * kSwizzleCDMode + byte;
+                            // EP columns and mailbox rows are 16-byte aligned.
+                            *reinterpret_cast<uint4*>(dst + n_base + col) = *reinterpret_cast<const uint4*>(src);
+                        }
+                    } else if (math_warp_idx == 0 and lane_idx == 0) {
                         const uint32_t batch_store_idx = kIsBatchedEpilogue ? scheduler.current_group_idx : 0;
                         #pragma unroll
                         for (uint32_t ts = 0; ts < kNumTMAStores; ++ts) {
@@ -1344,7 +1370,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cd_dtype_t* gmem_d, const cd_dtype_t* gmem_c,
         } // persistent loop
 
         // Final TMA store drain
-        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1) {
+        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1 and !kScatterRows) {
             if (math_warp_idx == 0 and lane_idx == 0)
                 cute::tma_store_wait<0>();
         }

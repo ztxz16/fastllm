@@ -22,6 +22,9 @@ size_t FastllmCudaMimoEp8PrefillWorkspaceBytes(int rows, int ranks);
 std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     const std::vector<int> &devices,
     const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights);
+std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
+    const std::vector<int> &devices,
+    const std::vector<std::vector<std::vector<fastllm::Data *>>> &weights, int topk);
 // Coordinator only, before rank workers submit collectives. Prepare native
 // graph capacities up to the requested per-rank row bound; cached calls are cheap.
 void FastllmCudaPrepareMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int maxRows);

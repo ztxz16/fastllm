@@ -20,7 +20,6 @@ namespace fastllm {
     class PDStateReader;
     class NaiveN05FlashModel : public basellm, public parallel::AttentionParallelModel {
     protected:
-        static constexpr int MaxTPDecodeBatch = 512;
         struct TargetCapture;
         struct LogitsSelection;
         struct TargetBatch;
@@ -29,6 +28,7 @@ namespace fastllm {
         ~NaiveN05FlashModel() override;
         void InitParams() override;
         void ConfigureAttentionParallel(int attentionDP) override;
+        void ConfigureDraftParallel(int ranks, bool replicas);
         void SetIndexerDataType(DataType dataType) override;
         void SetIndexerComputeFP8(bool enabled);
         void SetIndexerCompute(NaiveIndexerCompute mode);
@@ -93,6 +93,8 @@ namespace fastllm {
         void PlanPDPrefillMemory(const PDPrefillLimits &limits) override;
         std::vector<std::shared_ptr<CudaMemoryReservation>> ActivatePDPrefillMemory(const PDPrefillLimits &limits) override;
         std::string PDLayout() const override;
+        std::string PDAlternateLayout() const override;
+        fastkv::Message PDAlternateState(const fastkv::Message &state) const override;
         bool SupportsPDKvMemDecode() const override { return true; }
         std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) override;
         std::vector<int> PDDevices() const override { return tpDevices; }
@@ -121,9 +123,9 @@ namespace fastllm {
         bool SupportsSharedPagedKVPool() const override { return !tpPagedCaches.empty(); }
         bool UsesPackedMoeSource() const { return tpPackedMoeSources; }
         int Ep8ExpertDevice(int expert, const std::vector<int> &loadDevices) const {
-            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < 256,
+            AssertInFastLLM(tpEp8Mega && loadDevices == tpDevices && expert >= 0 && expert < num_experts,
                            "MiMo EP8 expert loading must use the same ordered devices as TP.");
-            return tpDevices.at(expert / (256 / tpDevices.size()));
+            return tpDevices.at(expert / (num_experts / tpDevices.size()));
         }
         std::string MakeInput(const std::string &history, int,
                               const std::string &input) override { return history + input; }
@@ -366,22 +368,29 @@ namespace fastllm {
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
                          std::vector<float> *retLogits, LogitsSelection *selection = nullptr);
         void InitDraft();
+        std::set<std::string> PDDraftContextWeightNames() const override;
+        bool draftKVOnly = false;
+        const char *DraftKVProjectionName() const {
+            return draftKVOnly ? "mergekv.weight" : "mergeqkv.weight";
+        }
+        int DraftContextQueryHeads() const { return draftKVOnly ? 0 : draftHeads; }
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
         void RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context);
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
         void ProjectDraftContext(Data &combined, Data &projected, Data &hidden);
-        std::shared_ptr<DraftContext> CreateDraftContext(const Data *targetKey = nullptr);
+        std::shared_ptr<DraftContext> CreateDraftContext(const std::vector<int> &devices = {});
         bool PrepareDraftTP();
         void PrepareDraftContextTP(DraftContext &context);
-        std::string DraftPDLayout() const;
+        std::string DraftPDLayout(bool localReplica = false) const;
+        std::string PDGroupLayout(int attentionRanks) const;
         struct PDExportPlan;
         fastkv::Message PackPDState(ResponseContext &context, const std::vector<int> &devices,
                                     PDExportPlan &plan, bool independent);
-        void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length,
-                                int transportDevice = -1, bool planning = false);
-        std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length);
+        void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length, bool planning = false);
+        std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length, int device = -1);
+        std::shared_ptr<DraftContext> ReservePDDraft(int length, int device);
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
@@ -443,6 +452,7 @@ namespace fastllm {
                          std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
                          std::vector<float> *retLogits);
+        std::string draftParallelLayout;
         bool draftEnabled = false;
         int draftLayers = 0, draftBlock = 0, draftTokens = 0;
         int draftHeads = 0, draftKvHeads = 0, draftHeadDim = 0, draftWindow = 0;
@@ -450,7 +460,6 @@ namespace fastllm {
         float draftConfidenceThreshold = 0.5f;
         std::vector<int> draftTargetLayers;
         std::map<const std::vector<std::pair<Data, Data>> *, std::shared_ptr<DraftContext>> draftContexts;
-        std::shared_ptr<DraftContext> idleDraftContext;
         std::vector<std::shared_ptr<DraftContext>> idleDraftContexts;
         void PrepareDraftServingMemory(bool history);
 
@@ -481,6 +490,7 @@ namespace fastllm {
         // Affinity fixes the KV owner before admission. The global scheduler caps
         // total requests when the batch is not divisible by the number of groups.
         int RunningRequestsPerGroup(int batch) const { return 1 + (batch - 1) / attentionDP; }
+        std::vector<int> LocalServingGraphBuckets(int maxRequests) const;
         int WindowRequestsPerGroup(int batch) const { return WindowRequestsPerGroup(batch, attentionDP); }
         static int WindowRequestsPerGroup(int batch, int groups) {
             const int mean = 1 + (batch - 1) / groups;

@@ -61,6 +61,74 @@ class StateModel : public basellm {
     }
 };
 
+// Exercise the router probe, conversion of a cached native checkpoint, and
+// the consumer's model-lane commit through a real transport connection.
+static void TestAlternateLayout() {
+    struct Producer : StateModel {
+        std::string PDAlternateLayout() const override { return "alternate"; }
+        fastkv::Message PDAlternateState(const fastkv::Message &state) const override {
+            PDStateReader native(state);
+            PDStateWriter wire;
+            wire.metadata.U32(1234);
+            wire.metadata.U32(native.metadata.U32());
+            Data value;
+            native.Tensor(value); native.End(); wire.Tensor(value);
+            return wire.Finish();
+        }
+    } producer;
+    struct Consumer : StateModel {
+        std::string PDLayout() const override { return "alternate"; }
+        struct Receive : PDReceiveState {
+            std::vector<std::vector<fastkv::Buffer>> Targets(const fastkv::Bytes &,
+                    const std::vector<size_t> &) override { throw std::logic_error("unexpected direct target"); }
+            void Commit(ResponseContext &) override { throw std::logic_error("unexpected native commit"); }
+            void CommitShards(ResponseContext &context, const fastkv::Message &wire) override {
+                PDStateReader state(wire);
+                Check(state.metadata.U32() == 1234 && state.metadata.U32() == context.allTokens.size() - 1,
+                      "alternate state lost its prefix");
+                state.Tensor(context.pastKeyValues[0].first); state.End();
+            }
+        };
+        std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &) override {
+            return std::make_shared<Receive>();
+        }
+    } consumer;
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    SetMaxTokens(4096);
+    producer.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","alternate-test"},
+        {"transport","tcp"},{"listen",endpoint},{"cache_bytes",16384},{"chunk_tokens",2}});
+    // A legacy D can only import native state, even when its identity matches
+    // the alternate layout advertised to newer peers.
+    fastkv::Options options; options.transport = fastkv::Transport::Tcp;
+    fastkv::Service client(options);
+    auto probe = [&](const std::string &layout) {
+        fastkv::Writer request;
+        request.U32(2); request.String("alternate-test:gpu-state-v2:" + layout); request.Ints({3, 7});
+        return client.Call(endpoint, {std::move(request.bytes), {}});
+    };
+    probe(producer.PDLayout());
+    bool rejected = false;
+    try { probe(consumer.PDLayout()); }
+    catch (const std::exception &) { rejected = true; }
+    Check(rejected, "legacy probe selected a layout it cannot import");
+    consumer.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","alternate-test"},
+        {"transport","tcp"},{"prefill",json11::Json::array{endpoint}}});
+    for (int pass = 0; pass < 2; ++pass) {
+        ResponseContext ctx; ctx.Init(1, FLOAT32, FLOAT32);
+        ctx.allTokens = {3,7,11,19}; ctx.inputTokens = ctx.allTokens.size();
+        ctx.requestMetadata.sessionKey = "same"; ctx.generationConfig.output_token_limit = 1;
+        consumer.BeginPD(&ctx);
+        for (int i = 0; i < 3000 && !consumer.PollPD(&ctx); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Check(!ctx.isEnding && ctx.preTokens == 3 && ctx.pdCachedInputTokens == (pass ? 3 : 0) &&
+              reinterpret_cast<float *>(ctx.pastKeyValues[0].first.cpuData)[0] == 50,
+              "negotiated alternate state did not survive a cold or cached transfer");
+    }
+    consumer.StopPD(); producer.StopPD();
+}
+
 // Opt-in: this test deliberately fills one GPU. It uses the production PD
 // allocator to recover idle engine memory that raw FastKV CUDA cannot reclaim.
 static void TestGPUAllocatorPressure() {
@@ -1351,7 +1419,16 @@ int main(int argc, char **argv) {
         port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
         const auto endpoint = port.Address();
         port.Stop();
-        StateModel prefill, decode;
+        struct RetryModel : StateModel {
+            std::atomic<bool> busy{false};
+            std::atomic<int> retries{0};
+            bool SelectPDRequestGroup(ResponseContext &context, const std::vector<size_t> &available,
+                                      size_t required) override {
+                if (busy) { ++retries; return false; }
+                return StateModel::SelectPDRequestGroup(context, available, required);
+            }
+        } prefill;
+        StateModel decode;
         SetPageLen(128);
         SetMaxTokens(16);
         prefill.ConfigurePD(json11::Json::object{{"role", "prefill"},
@@ -1452,7 +1529,27 @@ int main(int argc, char **argv) {
                 reused.allTokens.insert(reused.allTokens.end(), {31, 37});
             reused.currentTokens = reused.allTokens;
             reused.inputTokens = reused.allTokens.size();
+            prefill.busy = !extended;
             decode.BeginPD(&reused);
+            if (prefill.busy) {
+                for (int i = 0; i < 3000 && prefill.retries < 2; ++i) {
+                    decode.PollPD(&reused);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                Check(prefill.retries >= 2, "cached request did not retry group admission");
+                fastkv::Service control;
+                fastkv::Writer query; query.U32(8); query.String("test:gpu-state-v2:test-recurrent-state-v1");
+                query.Ints({3,7,11,19,23}); query.String("");
+                auto reply = control.Call(endpoint, {query.bytes,{}});
+                fastkv::Reader quote(reply.metadata);
+                Check(quote.U32() == 8 && quote.U64() == 0 && quote.U64() == 0,
+                      "requeued L2 hit was charged as new compute");
+                quote.U64(); quote.U64(); quote.String(); // forward rate and session placement
+                const auto hostTokens = quote.U64(), hostBytes = quote.U64(), queuedBytes = quote.U64();
+                Check(hostTokens == 5 && hostBytes > 0 && queuedBytes == hostBytes,
+                      "requeued L2 hit lost its restore charge");
+                prefill.busy = false;
+            }
             for (int i = 0; i < 3000 && !decode.PollPD(&reused); ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             Check(!reused.isEnding && reused.preTokens == (extended ? 7 : 5), "cached handoff");
@@ -1520,6 +1617,7 @@ int main(int argc, char **argv) {
         decode.StopPD();
         mismatch.StopPD();
         prefill.StopPD();
+        TestAlternateLayout();
         TestGPUState();
         TestExportBackpressure(false);
         TestExportBackpressure(true);

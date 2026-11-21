@@ -107,8 +107,9 @@ bool FastllmCudaMtpNormalizeTargetDistribution(void *distribution,
 // Retarget only the input-reading normalization nodes; all scratch stays owned.
 bool FastllmCudaMtpRebindTargetDistribution(void *graph, void *exec, float *logits);
 
+constexpr int kFastllmMtpSmallRejectionMaxBatch = 8;
 inline bool FastllmMtpUsesSmallRejection(int batch, int draftTokens, int vocabSize) {
-    return batch <= 8 && draftTokens <= 8 && vocabSize >= 16384;
+    return batch <= kFastllmMtpSmallRejectionMaxBatch && draftTokens <= 8 && vocabSize >= 16384;
 }
 
 // Submit a same-stream consumer of the accepted prefix before the regular CPU

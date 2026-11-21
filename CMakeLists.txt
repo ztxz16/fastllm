@@ -593,6 +593,7 @@ if (USE_CUDA)
         set(FASTLLM_CUDA_SM120_SOURCES
             ${FASTLLM_DSV4_SPARSE_MLA_SM120_SOURCE}
             ${FASTLLM_DSV4_MOE_DEEPGEMM_SM120_SOURCE}
+            src/devices/cuda/moe/fastllm-mxfp4-ep-generic.cu
             ${FASTLLM_DSV4_WOA_DEEPGEMM_SM120_SOURCE}
             src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
             src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
@@ -2571,7 +2572,7 @@ if (UNIT_TEST)
         target_link_libraries(naive_n05_topk_threshold_test PRIVATE fastllm)
         target_include_directories(naive_n05_topk_threshold_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         fastllm_add_checked_test(naive_n05_topk_threshold naive_n05_topk_threshold_test
-            "PASS: exact sampled TopK" 120)
+            "PASS: exact TopK" 120)
         set_tests_properties(naive_n05_topk_threshold PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
 
         add_executable(naive_n05_prefill_split_test test/basic/test_naive_n05_prefill_split.cu)
@@ -2832,6 +2833,11 @@ if (UNIT_TEST)
                         PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
                 endforeach()
             endforeach()
+            add_test(NAME naive_n05_pd_draft_dp COMMAND naive_n05_verify_graph_test 2 pd_draft fp8 replicated tcp 2)
+            add_test(NAME naive_n05_pd_draft_tp_to_dp COMMAND naive_n05_verify_graph_test 4 pd_draft_tp_to_dp 2)
+            set_tests_properties(naive_n05_pd_draft_dp naive_n05_pd_draft_tp_to_dp PROPERTIES
+                LABELS "cuda;multigpu" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
             foreach(NAIVE_PD_DRAFT_TP 1 2 4 mlp:4)
                 foreach(NAIVE_PD_DRAFT_KV bf16 fp8)
                     string(REPLACE ":" "_" NAIVE_PD_DRAFT_NAME ${NAIVE_PD_DRAFT_TP})
@@ -4371,6 +4377,17 @@ endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
 "{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
 
+# copy_directory overlays existing files. Replace each shipped EP package so
+# incremental builds cannot bundle CUBINs retired from its manifest.
+file(GLOB sm120_ep_manifests "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/kernels/mxfp4_ep/*/manifest.json")
+foreach(manifest IN LISTS sm120_ep_manifests)
+    get_filename_component(package_dir "${manifest}" DIRECTORY)
+    get_filename_component(package_name "${package_dir}" NAME)
+    add_custom_command(TARGET fastllm_tools POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E remove_directory "${CMAKE_BINARY_DIR}/tools/ftllm/kernels/mxfp4_ep/${package_name}"
+        VERBATIM)
+endforeach()
+
 if (${CMAKE_HOST_WIN32})
     add_custom_command(
             TARGET fastllm_tools
@@ -4413,7 +4430,6 @@ endif()
 
 if (USE_CUDA AND NOT USE_ROCM)
     # A package-only update must refresh the POST_BUILD copy as well.
-    file(GLOB sm120_ep_manifests "${CMAKE_CURRENT_SOURCE_DIR}/tools/fastllm_pytools/kernels/mxfp4_ep/*/manifest.json")
     set_property(TARGET fastllm_tools APPEND PROPERTY LINK_DEPENDS
         ${sm120_ep_manifests} "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_sm120_ep/UPSTREAM.json")
     add_custom_command(TARGET fastllm_tools POST_BUILD

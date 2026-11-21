@@ -203,7 +203,7 @@ struct Scheduler {
     }
 
     CUTLASS_DEVICE bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
-        const auto next_block_idx = (++ current_iter) * kNumSMs + blockIdx.x;
+        const auto next_block_idx = (++ current_iter) * (kNumSMs ? kNumSMs : gridDim.x) + blockIdx.x;
 
         if constexpr (kGemmType == GemmType::MGroupedMasked) {
             while (true) {

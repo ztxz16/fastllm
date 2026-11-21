@@ -60,3 +60,11 @@ Kernel reference tests do not replace model-level accuracy evaluation.
 Run `python test/ops/check_fp8_block32_sm90.py --lib /path/to/libfastllm_tools.so`
 for independent FP32 references, arbitrary FP32 scales, biased fallback, M/N
 tails, arena-scoped capture and graph replay after larger workspace use.
+
+The SM120 MXFP4 EP fallback uses the M-grouped contiguous kernel with runtime
+matrix dimensions. A zero scheduler SM count uses the launch grid width.
+The optional device row count reads the padded extent immediately before the
+expert layout, so unbalanced routing needs no host readback during graph replay.
+For the SM120 EP down projection, a local epilogue writes each valid BF16 row
+directly to its request slot over P2P. The routing pass builds the destination
+table on device, including null entries for tile padding.

@@ -114,6 +114,42 @@ struct Pack {
         cudaFree(output);
     }
 };
+static void checkPrefillReduction(const Pack &pack) {
+    constexpr int maxRows = 2053, referenceCols = 16;
+    std::vector<__nv_bfloat16> input(maxRows * K), weight(referenceCols * K);
+    cu(cudaMemcpy(input.data(), pack.input, K * sizeof(input[0]), cudaMemcpyDeviceToHost));
+    cu(cudaMemcpy(weight.data(), pack.weight, weight.size() * sizeof(weight[0]), cudaMemcpyDeviceToHost));
+    for (int row = 1; row < maxRows; ++row)
+        std::copy_n(input.data(), K, input.data() + row * K);
+    void *x, *y;
+    cu(cudaMalloc(&x, input.size() * sizeof(input[0])));
+    cu(cudaMalloc(&y, size_t(maxRows) * N * sizeof(input[0])));
+    cu(cudaMemcpy(x, input.data(), input.size() * sizeof(input[0]), cudaMemcpyHostToDevice));
+    std::vector<unsigned short> reference, values(N);
+    for (int rows : {1, 48, 129, 257, maxRows}) {
+        need(lt::Matmul(x, pack.weight, y, rows, K, N, CUDA_R_16BF, lt::prefillReferenceRows),
+             "SM120 prefill reference algorithm unavailable");
+        for (int row : {0, rows - 1}) {
+            cu(cudaMemcpy(values.data(), (unsigned short *)y + size_t(row) * N, N * 2, cudaMemcpyDeviceToHost));
+            if (reference.empty()) reference = values;
+            need(values == reference, "BF16 prefill depends on batch size or row position");
+        }
+    }
+    std::vector<__nv_bfloat16> result(referenceCols);
+    cu(cudaMemcpy(result.data(), y, referenceCols * 2, cudaMemcpyDeviceToHost));
+    double error = 0, norm = 0;
+    for (int col = 0; col < referenceCols; ++col) {
+        double sum = 0;
+        for (int i = 0; i < K; ++i)
+            sum += double(__bfloat162float(input[i])) * __bfloat162float(weight[col * K + i]);
+        double delta = __bfloat162float(result[col]) - sum;
+        error += delta * delta;
+        norm += sum * sum;
+    }
+    need(error < 0.004 * 0.004 * norm, "BF16 prefill exceeds FP64 reference tolerance");
+    cu(cudaFree(y));
+    cu(cudaFree(x));
+}
 static size_t busy() {
     auto &p = lt::Pool();
     std::lock_guard<std::mutex> lock(p.mutex);
@@ -248,11 +284,17 @@ int main() {
         waitBusy(0);
         // Recreating substantially more workers than the former eight lifetime
         // slots must keep using Lt. Source graph destruction releases its lease.
+        const auto workerReference = p[2].reference;
         for (int i = 0; i < 24; ++i) {
             std::thread worker([&]() {
                 try {
                     cu(cudaSetDevice(0));
+                    const size_t capturesBeforeWarm = observed.size();
                     p[2].warm();
+                    if (prop.major == 10) {
+                        need(observed.size() == capturesBeforeWarm, "Blackwell BF16 warmup ran timing captures");
+                        need(p[2].reference == workerReference, "fresh worker changed the BF16 reduction");
+                    }
                     p[2].capture();
                     cu(cudaGraphLaunch(p[2].exec, cudaStreamPerThread));
                     cu(cudaStreamSynchronize(cudaStreamPerThread));
@@ -311,7 +353,7 @@ int main() {
             try {
                 cu(cudaSetDevice(0));
                 auto *s = lt::GetState(0, false);
-                // Hopper BF16 uses deterministic heuristics without timing
+                // BF16 can use deterministic heuristics without timing
                 // captures. Exercise capture failures through the FP16 search.
                 lt::Key key{M, N, K, lt::Alignment(p[2].weight), lt::Alignment(p[2].input),
                             lt::Alignment(p[2].output), static_cast<int>(CUDA_R_16F)};
@@ -433,6 +475,7 @@ int main() {
         waitBusy(0);
         for (auto s : streams)
             cu(cudaStreamDestroy(s));
+        if (prop.major == 12 && prop.minor == 0) checkPrefillReduction(p[0]);
         puts("PASS independent captures, cross-thread replay/eager, graph lifetime, 24 worker "
              "recreations, capture/tuning failures, 48 serial variants in concurrent "
              "families, bounded reusable leases, bounded hot-plan reuse after eviction");

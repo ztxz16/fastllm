@@ -1,18 +1,22 @@
 #pragma once
 // Full E4M3 K/V decode. Adapted from NaiveSGLang's B300 mixed DSA kernel
-// (28cfec6fbb). A CTA owns one request and one group of 16 query heads.
+// (28cfec6fbb). A CTA owns one request and one or two adjacent groups of 16 query heads.
 // Producers gather independent K/V pages; two MMA warps reduce disjoint
 // halves of each tile. The final normalization includes the attention sink.
-#include "naive-n05-attention-bulk.cuh"
-#if !defined(USE_ROCM) && CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000)
-#define FASTLLM_NAIVE_BLACKWELL_DECODE
+#include "naive-n05-attention-batch.cuh"
+#include "devices/cuda/naive-n05-kv.cuh"
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
 namespace blackwell_decode {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
+#define FASTLLM_NAIVE_BLACKWELL_DECODE
 constexpr int TILE = 32, NSTAGE = 4, NCW = 2, NP = 4;
-constexpr int K_STRIDE = 208, V_STRIDE = 144;
-constexpr int OFF_V = TILE * K_STRIDE;
-constexpr int OFF_VALID = OFF_V + TILE * V_STRIDE;
-constexpr int STAGE_BYTES = OFF_VALID + 16;
-constexpr int SMEM_BYTES = NSTAGE * STAGE_BYTES + 2 * NSTAGE * sizeof(uint64_t);
+template<int Groups> struct Layout {
+    static constexpr int KeyStride = Groups * 192 + 16, ValueStride = Groups * 128 + 16;
+    static constexpr int ValueOffset = TILE * KeyStride, ValidOffset = ValueOffset + TILE * ValueStride;
+    static constexpr int StageBytes = ValidOffset + 16;
+    static constexpr int Bytes = NSTAGE * StageBytes + 2 * NSTAGE * sizeof(uint64_t) +
+                                 (Groups == 2 ? 2048 * sizeof(int2) : 0);
+};
 constexpr float RESCALE_TH = 8.f;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
 __device__ __forceinline__ unsigned smem_u32(const void *p) {
@@ -47,8 +51,8 @@ __device__ __forceinline__ void bulk_g2s(void *dst, const void *src, unsigned by
                  "l"(src), "r"(bytes), "r"(smem_u32(bar))
                  : "memory");
 }
-__device__ __forceinline__ void consumer_sync() {
-    asm volatile("bar.sync 1, %0;\n" ::"n"(NCW * 32) : "memory");
+template<int Groups> __device__ __forceinline__ void consumer_sync() {
+    asm volatile("bar.sync 1, %0;\n" ::"n"(Groups * NCW * 32) : "memory");
 }
 
 // two e4m3 (low byte -> low half) -> bf16x2, exact
@@ -78,23 +82,28 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const unsigned (&a)[4], 
 }
 
 #endif
-template <bool Split = false>
-__global__ void __launch_bounds__((NCW + NP) * 32)
+template <bool Split = false, int Groups = 1>
+__global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
     Decode(const __nv_bfloat16 *q, const __grid_constant__ naive_attention_bulk::Batch batch, const float *sink,
            __nv_bfloat16 *out, int q_heads, float *parts = nullptr, float2 *stats = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-    const int b = blockIdx.x, hg = blockIdx.y;
+    static_assert(Groups == 1 || (Groups == 2 && !Split));
+    using L = Layout<Groups>;
+    constexpr int Ahead = Groups == 2 ? NSTAGE : 1;
+    const int b = blockIdx.x, firstHead = blockIdx.y * Groups;
+    const int group = (threadIdx.x / 32) / NCW;
+    const int hg = firstHead + group;
     const FastllmNaiveDSARow row = FastllmNaiveResolveDSARow(batch.rows[b]);
     const int length = naive_dsa_decode::Length(row);
     if (length == 0) {
         if constexpr (Split) {
             // Merge skips empty partitions, so their PV storage is never read.
             if (threadIdx.x < 16)
-                stats[((size_t)b * q_heads + hg * 16 + threadIdx.x) * gridDim.z + blockIdx.z] =
+                stats[((size_t)b * q_heads + firstHead * 16 + threadIdx.x) * gridDim.z + blockIdx.z] =
                     make_float2(-INFINITY, 0.f);
         } else {
-            for (int i = threadIdx.x; i < 16 * 128; i += blockDim.x)
-                out[((size_t)b * q_heads + hg * 16) * 128 + i] = __float2bfloat16(0.f);
+            for (int i = threadIdx.x; i < Groups * 16 * 128; i += blockDim.x)
+                out[((size_t)b * q_heads + firstHead * 16) * 128 + i] = __float2bfloat16(0.f);
         }
         return;
     }
@@ -104,46 +113,78 @@ __global__ void __launch_bounds__((NCW + NP) * 32)
     const int n_tiles = Split ? tiles * (blockIdx.z + 1) / gridDim.z - begin : tiles;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     extern __shared__ __align__(128) uint8_t smem[];
-    uint64_t *full = reinterpret_cast<uint64_t *>(smem + NSTAGE * STAGE_BYTES);
+    uint64_t *full = reinterpret_cast<uint64_t *>(smem + NSTAGE * L::StageBytes);
     uint64_t *empty = full + NSTAGE;
-    __shared__ float s_ml[16][2];
+    __shared__ float s_ml[Groups][16][2];
+    int2 *mapped = reinterpret_cast<int2 *>(empty + NSTAGE);
+    if constexpr (Groups == 2) {
+        // Translate once per selected token. A complemented K marks a masked
+        // slot while still loading the original logical row zero for K and V.
+        for (int slot = tid; slot < row.selectedCount; slot += blockDim.x) {
+            const int index = row.indices[slot];
+            const bool valid = index >= 0 && index < length;
+            const int logical = valid ? index : 0;
+            const int key = FastllmNaivePhysicalRow(row, logical);
+            mapped[slot] = make_int2(valid ? key : ~key, FastllmNaivePhysicalRow(row, logical, true));
+        }
+    }
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < NSTAGE; ++s) {
             mbar_init(&full[s], NP);
-            mbar_init(&empty[s], NCW);
+            mbar_init(&empty[s], NCW * Groups);
         }
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
-    if (warp >= NCW) {
+    if (warp >= NCW * Groups) {
+        if constexpr (Groups == 2) asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
         constexpr int TPW = TILE / NP;
-        const int pw = warp - NCW, tok = pw * TPW + lane;
-        for (int it = 0; it < n_tiles; ++it) {
-            const int s = it % NSTAGE;
-            if (it >= NSTAGE) mbar_wait(&empty[s], ((it / NSTAGE) - 1) & 1);
-            uint8_t *st = smem + s * STAGE_BYTES;
-            const int slot = (begin + it) * TILE + tok;
-            const int idx = lane < TPW && slot < row.selectedCount ? row.indices[slot] : -1;
-            const bool valid = idx >= 0 && idx < length;
-            unsigned mask = __ballot_sync(0xffffffffu, valid);
-            if (lane == 0) {
-                st[OFF_VALID + pw] = static_cast<uint8_t>(mask);
-                mbar_arrive_expect_tx(&full[s], TPW * (192 + 128));
+        const int pw = warp - NCW * Groups, tok = pw * TPW + lane;
+        for (int base = 0; base < n_tiles; base += Ahead) {
+            int k[Ahead], v[Ahead]; bool valid[Ahead];
+#pragma unroll
+            for (int u = 0; u < Ahead; ++u) {
+                const int slot = (begin + base + u) * TILE + tok;
+                if constexpr (Groups == 2) {
+                    // This variant is dispatched only for a full 2048-slot selection.
+                    const int2 pair = lane < TPW ? mapped[slot] : make_int2(-1, 0);
+                    valid[u] = pair.x >= 0;
+                    k[u] = valid[u] ? pair.x : ~pair.x;
+                    v[u] = pair.y;
+                } else {
+                    const int idx = lane < TPW && slot < row.selectedCount ? row.indices[slot] : -1;
+                    valid[u] = idx >= 0 && idx < length;
+                    k[u] = FastllmNaivePhysicalRow(row, valid[u] ? idx : 0);
+                    v[u] = FastllmNaivePhysicalRow(row, valid[u] ? idx : 0, true);
+                }
             }
-            __syncwarp();
-            if (lane < TPW) {
-                const int k = FastllmNaivePhysicalRow(row, valid ? idx : 0);
-                const int v = FastllmNaivePhysicalRow(row, valid ? idx : 0, true);
-                bulk_g2s(st + tok * K_STRIDE, (const uint8_t *)row.key + (size_t)k * row.keyStride + hg * 192,
-                         192, &full[s]);
-                bulk_g2s(st + OFF_V + tok * V_STRIDE,
-                         (const uint8_t *)row.value + ((size_t)v * (q_heads / 16) + hg) * 128, 128, &full[s]);
+#pragma unroll
+            for (int u = 0; u < Ahead; ++u) {
+                const int it = base + u;
+                if (it >= n_tiles) break;
+                const int s = it % NSTAGE;
+                if (it >= NSTAGE) mbar_wait(&empty[s], ((it / NSTAGE) - 1) & 1);
+                uint8_t *st = smem + s * L::StageBytes;
+                const unsigned mask = __ballot_sync(0xffffffffu, valid[u]);
+                if (lane == 0) {
+                    st[L::ValidOffset + pw] = static_cast<uint8_t>(mask);
+                    mbar_arrive_expect_tx(&full[s], TPW * Groups * (192 + 128));
+                }
+                __syncwarp();
+                if (lane < TPW) {
+                    bulk_g2s(st + tok * L::KeyStride, (const uint8_t *)row.key + size_t(k[u]) * row.keyStride + firstHead * 192,
+                             Groups * 192, &full[s]);
+                    bulk_g2s(st + L::ValueOffset + tok * L::ValueStride,
+                             (const uint8_t *)row.value + (size_t(v[u]) * (q_heads / 16) + firstHead) * 128,
+                             Groups * 128, &full[s]);
+                }
             }
         }
         return;
     }
-    const int g = warp, r = lane >> 2, c = lane & 3;
+    if constexpr (Groups == 2) asm volatile("setmaxnreg.inc.sync.aligned.u32 216;");
+    const int g = warp % NCW, r = lane >> 2, c = lane & 3;
     unsigned query[6][2][4];
     const auto *qh = q + ((size_t)b * q_heads + hg * 16) * 192;
 #pragma unroll
@@ -166,12 +207,12 @@ __global__ void __launch_bounds__((NCW + NP) * 32)
     for (int it = 0; it < n_tiles; ++it) {
         const int s = it % NSTAGE;
         mbar_wait(&full[s], (it / NSTAGE) & 1);
-        const uint8_t *st = smem + s * STAGE_BYTES;
-        const unsigned valid = *reinterpret_cast<const unsigned *>(st + OFF_VALID);
+        const uint8_t *st = smem + s * L::StageBytes;
+        const unsigned valid = *reinterpret_cast<const unsigned *>(st + L::ValidOffset);
         float sc[2][4]{};
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
-            const uint8_t *key = st + (g * 16 + nt * 8 + r) * K_STRIDE;
+            const uint8_t *key = st + (g * 16 + nt * 8 + r) * L::KeyStride + group * 192;
 #pragma unroll
             for (int ch = 0; ch < 6; ++ch) {
                 uint2 v = *reinterpret_cast<const uint2 *>(key + ch * 32 + c * 8);
@@ -237,14 +278,14 @@ __global__ void __launch_bounds__((NCW + NP) * 32)
         }
         // Accumulate PV with B fragments unpacked directly from FP8 values.
         {
-            const uint8_t *vb = st + OFF_V + 4 * r;
+            const uint8_t *vb = st + L::ValueOffset + group * 128 + 4 * r;
             const int t0 = g * 16 + 2 * c;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const unsigned w0 = *reinterpret_cast<const unsigned *>(vb + t0 * V_STRIDE + 32 * j);
-                const unsigned w1 = *reinterpret_cast<const unsigned *>(vb + (t0 + 1) * V_STRIDE + 32 * j);
-                const unsigned w2 = *reinterpret_cast<const unsigned *>(vb + (t0 + 8) * V_STRIDE + 32 * j);
-                const unsigned w3 = *reinterpret_cast<const unsigned *>(vb + (t0 + 9) * V_STRIDE + 32 * j);
+                const unsigned w0 = *reinterpret_cast<const unsigned *>(vb + t0 * L::ValueStride + 32 * j);
+                const unsigned w1 = *reinterpret_cast<const unsigned *>(vb + (t0 + 1) * L::ValueStride + 32 * j);
+                const unsigned w2 = *reinterpret_cast<const unsigned *>(vb + (t0 + 8) * L::ValueStride + 32 * j);
+                const unsigned w3 = *reinterpret_cast<const unsigned *>(vb + (t0 + 9) * L::ValueStride + 32 * j);
                 const unsigned x01 = prmt(w0, w1, 0x5140u), y01 = prmt(w0, w1, 0x7362u);
                 const unsigned x23 = prmt(w2, w3, 0x5140u), y23 = prmt(w2, w3, 0x7362u);
                 const unsigned(&a)[4] = pa;
@@ -267,9 +308,8 @@ __global__ void __launch_bounds__((NCW + NP) * 32)
         l_row[rr] += __shfl_xor_sync(0xffffffffu, l_row[rr], 1);
         l_row[rr] += __shfl_xor_sync(0xffffffffu, l_row[rr], 2);
     }
-    consumer_sync();                               // every MMA warp is done with the stage buffers (all copies
-                                                   // have landed)
-    float *mbuf = reinterpret_cast<float *>(smem); // fragment order: [i][lane]
+    consumer_sync<Groups>();
+    float *mbuf = reinterpret_cast<float *>(smem) + group * 16 * 4 * 32; // fragment order: [i][lane]
     if (g == 1) {
 #pragma unroll
         for (int i = 0; i < 16; ++i)
@@ -277,18 +317,18 @@ __global__ void __launch_bounds__((NCW + NP) * 32)
             for (int k = 0; k < 4; ++k)
                 mbuf[(i * 4 + k) * 32 + lane] = o_acc[i][k];
         if (c == 0) {
-            s_ml[r][0] = m_ref[0];
-            s_ml[r][1] = l_row[0];
-            s_ml[r + 8][0] = m_ref[1];
-            s_ml[r + 8][1] = l_row[1];
+            s_ml[group][r][0] = m_ref[0];
+            s_ml[group][r][1] = l_row[0];
+            s_ml[group][r + 8][0] = m_ref[1];
+            s_ml[group][r + 8][1] = l_row[1];
         }
     }
-    consumer_sync();
+    consumer_sync<Groups>();
     if (g == 0) {
         float sc_self[2], sc_other[2], lsum[2], mmax[2];
 #pragma unroll
         for (int rr = 0; rr < 2; ++rr) {
-            const float m2 = s_ml[r + rr * 8][0], l2 = s_ml[r + rr * 8][1];
+            const float m2 = s_ml[group][r + rr * 8][0], l2 = s_ml[group][r + rr * 8][1];
             const float mm = fmaxf(m_ref[rr], m2);
             const float mu = (mm == -INFINITY) ? 0.f : mm;
             sc_self[rr] = exp2f(m_ref[rr] - mu);
@@ -348,9 +388,12 @@ __global__ void __launch_bounds__((NCW + NP) * 32)
     }
 #endif
 }
+#endif
+// Keep the merge launch stub linkable in builds targeting only older GPUs.
 // One warp reduces four adjacent output channels per lane.
-__global__ void Merge(const float *parts, const float2 *stats, const float *sink, __nv_bfloat16 *out, int heads,
+static __global__ void Merge(const float *parts, const float2 *stats, const float *sink, __nv_bfloat16 *out, int heads,
                       int splits) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     const int lane = threadIdx.x, head = blockIdx.x;
     const size_t row = size_t(blockIdx.y) * heads + head;
     const float2 st = lane < splits ? stats[row * splits + lane] : make_float2(-INFINITY, 0.f);
@@ -376,6 +419,11 @@ __global__ void Merge(const float *parts, const float2 *stats, const float *sink
     const float inv = denom > 0.f ? 1.f / denom : 0.f;
     for (int i = 0; i < 4; ++i)
         out[row * 128 + 4 * lane + i] = __float2bfloat16(acc[i] * inv);
+#endif
 }
+// The paired producer/consumer warp groups require the architecture-specific cubin.
+using DecodeKernel = void (*)(const __nv_bfloat16 *, naive_attention_bulk::Batch, const float *,
+                              __nv_bfloat16 *, int, float *, float2 *);
+DecodeKernel PairedDecodeKernel();
 } // namespace blackwell_decode
 #endif

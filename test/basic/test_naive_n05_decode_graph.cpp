@@ -706,11 +706,11 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
     }
 }
 
-static void TestRouterBatch(int batch, int pattern) {
+static void TestRouterBatch(int batch, int pattern, int experts = 256) {
     Data input(BFLOAT16), weight(FLOAT32), bias(FLOAT32), actual, expected(FLOAT32);
     Data indices(INT32), scores(FLOAT32), referenceIndices(INT32), referenceScores(FLOAT32);
-    Upload(input, {1, batch, 4096}, 181); Upload(weight, {256, 4096}, 182);
-    Upload(bias, {256}, 183); Upload(expected, {1, batch, 256}, 184);
+    Upload(input, {1, batch, 4096}, 181); Upload(weight, {experts, 4096}, 182);
+    Upload(bias, {experts}, 183); Upload(expected, {1, batch, experts}, 184);
     Upload(indices, {batch, 8}, 185); Upload(scores, {batch, 8}, 186);
     Upload(referenceIndices, {batch, 8}, 187); Upload(referenceScores, {batch, 8}, 188);
     if (pattern == 1) {
@@ -735,7 +735,7 @@ static void TestRouterBatch(int batch, int pattern) {
         for (int b = 0; b < batch; ++b) {
             Data row, result;
             row.Resize({1, 1, 4096}); row.FakeFrom(input, (size_t)b * 4096 * 2);
-            result.Resize({1, 1, 256}); result.FakeFrom(expected, (size_t)b * 256 * 4);
+            result.Resize({1, 1, experts}); result.FakeFrom(expected, (size_t)b * experts * sizeof(float));
             Require(FastllmCudaNaiveRouterSigmoid(row, weight, result), "reference router unsupported");
         }
         Require(Read<float>(actual) == Read<float>(expected), "batch router probabilities changed");
@@ -745,6 +745,65 @@ static void TestRouterBatch(int batch, int pattern) {
         ++checks;
     }
     FastllmCudaSetLinearExactBatchThreshold(previous);
+}
+
+static void TestVerifyRouter() {
+    constexpr int rows = 129, experts = 256, hidden = 4096, top = 8;
+    Data x(BFLOAT16), w(FLOAT32), bias(FLOAT32), scratch(FLOAT32), ids(INT32), weights(FLOAT32), ref(FLOAT32);
+    Upload(x, {rows, hidden}, 201);
+    Upload(w, {experts, hidden}, 202);
+    Upload(bias, {experts}, 203);
+    scratch.Resize({3 * experts * hidden / 2 + 3 * rows * experts});
+    scratch.ToDevice(DataDevice::CUDA, {0}, false);
+    scratch.Allocate(false);
+    Data smallScratch(FLOAT32);
+    Require(!FastllmCudaNaiveVerifyRouter(x, w, bias, smallScratch, ids, weights, top, true, 1.f),
+            "verify router accepted missing scratch");
+    cudaDeviceProp prop;
+    Cuda(cudaGetDeviceProperties(&prop, 0));
+    if (prop.major != 10 || (prop.minor != 0 && prop.minor != 3) || CUDART_VERSION < 12080) return;
+    Data small;
+    small.Resize({127, hidden});
+    small.FakeFrom(x, 0);
+    Require(!FastllmCudaNaiveVerifyRouter(small, w, bias, scratch, ids, weights, top, true, 1.f),
+            "verify router accepted small batch");
+    Graph graph;
+    graph.Capture([&]() {
+        Require(FastllmCudaNaiveVerifyRouter(x, w, bias, scratch, ids, weights, top, true, 1.7f),
+                "large verify router unsupported");
+    });
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass) {
+            Cuda(cudaMemset(x.cudaData, 0, x.GetBytes()));
+            Cuda(cudaMemset(bias.cudaData, 0, bias.GetBytes()));
+        }
+        graph.Run();
+        const auto actualIds = Read<int>(ids);
+        const auto actualWeights = Read<float>(weights);
+        const auto correction = Read<float>(bias);
+        int threshold = FastllmCudaGetLinearExactBatchThreshold();
+        FastllmCudaSetLinearExactBatchThreshold(rows + 1);
+        Require(FastllmCudaNaiveRouterSigmoid(x, w, ref), "reference router failed");
+        FastllmCudaSetLinearExactBatchThreshold(threshold);
+        const auto probabilities = Read<float>(ref);
+        for (int r = 0; r < rows; ++r) {
+            const float *pr = probabilities.data() + r * experts;
+            std::vector<int> order(experts);
+            for (int e = 0; e < experts; ++e) order[e] = e;
+            std::partial_sort(order.begin(), order.begin() + top, order.end(), [&](int a, int b) {
+                float left = pr[a] + correction[a], right = pr[b] + correction[b];
+                return left == right ? a < b : left > right;
+            });
+            float sum = 0.f;
+            for (int k = 0; k < top; ++k) sum += pr[order[k]];
+            for (int k = 0; k < top; ++k) {
+                Require(actualIds[r * top + k] == order[k], "verify router stable top-8 mismatch");
+                Require(std::abs(actualWeights[r * top + k] - 1.7f * pr[order[k]] / sum) < 1.e-5f,
+                        "verify router mixture weight mismatch");
+            }
+        }
+        ++checks;
+    }
 }
 
 static void TestIndexerKeyNorm(int rows) {
@@ -800,8 +859,10 @@ int main() {
             TestPaddedAttention(batch, 8, 192, 128, sparse, fp8);
             TestPaddedAttention(batch, 2, 64, 256, sparse, fp8);
         }
-        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 24, 32, 48, 64, 128})
+        for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 24, 31, 32, 33, 48, 64, 128, 129, 255, 256})
             for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
+        TestRouterBatch(33, 2, 255);
+        TestVerifyRouter();
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})
                 TestSwaBatch(batch, heads, heads == 16 ? 2 : 1);

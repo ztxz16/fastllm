@@ -304,6 +304,9 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
     std::vector<int> devices;
     std::vector<std::vector<fastkv::Buffer>> targets, windows;
     fastkv::Bytes expected;
+    std::shared_ptr<DraftContext> draft;
+    fastkv::Buffer draftArena;
+    std::vector<std::pair<fastkv::Buffer, fastkv::Buffer>> draftCopies;
     int length;
     bool received = false, committed = false;
 
@@ -352,6 +355,13 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
                         throw fastkv::CapacityBusy("GPU receive pages exhausted");
                 }
             }
+            if (model.draftEnabled) {
+                const size_t kv = GetDataBytes(BFLOAT16, std::min(length, model.draftWindow - 1),
+                                               model.draftKvHeads * model.draftHeadDim);
+                const size_t tail = GetDataBytes(BFLOAT16, std::min(length, model.draftWindow + GetPageLen() - 1),
+                                                 model.embed_dim);
+                bytes += 2 * model.draftLayers * kv + tail;
+            }
             windowPlan.emplace_back(device, bytes);
         }
         std::vector<fastkv::Buffer> arenas;
@@ -394,7 +404,9 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
                         (!swa && !part ? model.LocalIndexerCacheWidth(layer, worldRank) : 0);
                     local.kvCacheFp8Indexer = !swa && !part && !model.HasSeparateIndexer() && model.fp8IndexerCache;
                     if (swa) {
-                        const int capacity = (std::max(rows, model.tpSwaRingCache ? model.window : rows) + 127) / 128 * 128;
+                        const int slots = model.tpSwaRingCache ?
+                            model.window + (model.draftEnabled ? model.draftBlock : 0) : rows;
+                        const int capacity = (slots + 127) / 128 * 128;
                         model.ReserveCache(local,capacity,width,true,&context.pastKeyValues.front().first);
                         const size_t bytes = GetDataBytes(local.dataType,rows,width);
                         auto view = arenas[rank].Slice(windowOffset,bytes); windowOffset += bytes;
@@ -418,24 +430,99 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
                     add(index.dataType,length,index.dims.back(),model.fp8IndexerCache,pages(key,index));
                 }
             }
+            if (model.draftEnabled)
+                draftArena = arenas[rank].Slice(windowOffset, arenas[rank].Size() - windowOffset);
             model.UploadPagedCacheTables(tables);
             metadata.Blob(descriptors.bytes.data(),descriptors.bytes.size()); metadata.U32(targets.size()-begin);
         }
-        metadata.U32(0); expected = std::move(metadata.bytes);
+        metadata.U32(model.draftEnabled);
+        if (model.draftEnabled) {
+            draft = model.ReservePDDraft(length, devices.front());
+            metadata.U32(length); metadata.U32(model.draftLayers); metadata.U32(1);
+        }
+        expected = std::move(metadata.bytes);
     }
     std::vector<std::vector<fastkv::Buffer>> Targets(const fastkv::Bytes &metadata,
                                                    const std::vector<size_t> &sizes) override {
-        CheckPD(!received && sizes.size() == targets.size(), "invalid GPU receive payload count");
+        CheckPD(!received && (draft || sizes.size() == targets.size()), "invalid GPU receive payload count");
         fastkv::Message wire; wire.metadata = metadata; wire.buffers.resize(sizes.size());
-        CheckPD(PDStatePayload(wire).metadata == expected, "incompatible GPU state metadata");
+        const auto payload = PDStatePayload(wire);
+        CheckPD(draft ? payload.metadata.size() >= expected.size() &&
+                std::equal(expected.begin(), expected.end(), payload.metadata.begin()) :
+                payload.metadata == expected, "incompatible GPU state metadata");
         (void)PDReceivePlacement(metadata,sizes.size(),devices);
         auto result = targets;
+        if (draft) {
+            fastkv::Reader reader(payload.metadata.data() + expected.size(), payload.metadata.size() - expected.size());
+            // Register the existing SWA arena once. Registering each transient
+            // draft allocation on every RDMA rail costs more than the GPU copy.
+            size_t offset = 0;
+            auto bind = [&](Data &tensor, int boundedAxis = -1) {
+                auto destination = PDBindTensor(reader, tensor, draft, boundedAxis);
+                auto staging = draftArena.Slice(offset, destination.Size());
+                offset += destination.Size();
+                draftCopies.emplace_back(std::move(destination), staging);
+                result.push_back({std::move(staging)});
+            };
+            for (auto &pair : draft->kv) { bind(pair.first); bind(pair.second); }
+            const auto hasTail = reader.U32();
+            CheckPD(hasTail <= 1, "invalid draft tail flag");
+            if (hasTail) bind(draft->prefixHidden, 1);
+            else {
+                draft->prefixHidden.dims.clear();
+                draft->prefixHidden.strides.clear();
+            }
+            reader.End();
+            CheckPD(result.size() == sizes.size(), "invalid draft payload count");
+        }
         for (size_t i = 0; i < result.size(); ++i) {
             size_t bytes = 0;
             for (auto &span : result[i]) { bytes += span.Size(); span = span.WithLease(reservation); }
             CheckPD(bytes == sizes[i], "invalid GPU state bytes");
         }
         received = true; return result;
+    }
+    void CommitShards(ResponseContext &context, const fastkv::Message &wire) override {
+        PDRowMessage state(wire);
+        fastkv::Reader header(state.metadata);
+        const int committed = header.U32(), tailRows = header.U32();
+        header.End();
+        CheckPD(!received && draft && devices.size() == 1 && state.layout == model.PDLayout() &&
+                committed == length && tailRows >= 0 && tailRows <= draft->prefixHidden.dims[1],
+                "incompatible sharded checkpoint");
+        std::map<std::string, PDRowDestination> parts;
+        size_t slot = 0;
+        for (int layer = 0; layer < model.block_cnt; ++layer) {
+            for (int v = 0; v < 2; ++v) {
+                const auto &root = v ? reservation->pastKeyValues[layer].second : reservation->pastKeyValues[layer].first;
+                const auto &local = *root.multiDeviceDatas.at(devices.front());
+                parts.emplace((v ? "v" : "k") + std::to_string(layer), PDRowDestination{
+                    size_t(local.dims[1]), GetDataBytes(local.dataType, 1, local.dims[2]), targets.at(slot++)});
+            }
+            if (!model.slidingLayers[layer] && model.HasSeparateIndexer())
+                parts.emplace("i" + std::to_string(layer), PDRowDestination{size_t(length),
+                    GetDataBytes(model.AuxiliaryKVType(), 1, model.IndexerCacheWidth(model.AuxiliaryKVType())),
+                    targets.at(slot++)});
+        }
+        auto bind = [&](std::string name, Data &tensor) {
+            const size_t rows = tensor.dims[1], pitch = GetDataBytes(tensor.dataType, 1, tensor.dims[2]);
+            parts.emplace(std::move(name), PDRowDestination{rows, pitch, {fastkv::Buffer::Borrow(
+                tensor.cudaData, rows * pitch, fastkv::MemoryKind::Cuda, tensor.dataDeviceIds.front(), draft)}});
+        };
+        for (int layer = 0; layer < model.draftLayers; ++layer) {
+            bind("dk" + std::to_string(layer), draft->kv[layer].first);
+            bind("dv" + std::to_string(layer), draft->kv[layer].second);
+        }
+        if (tailRows) {
+            draft->prefixHidden.Resize({1, tailRows, model.embed_dim});
+            bind("hidden", draft->prefixHidden);
+        } else {
+            draft->prefixHidden.dims.clear();
+            draft->prefixHidden.strides.clear();
+        }
+        state.Scatter(parts, devices.front());
+        received = true;
+        Commit(context);
     }
     void Commit(ResponseContext &context) override {
         CheckPD(received && !committed && context.pastKeyValues.size() == reservation->pastKeyValues.size(),
@@ -446,6 +533,29 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
             for (const auto &local : root->multiDeviceDatas)
                 CheckPD(local.second->dims.empty() && local.second->pageIndex.empty(), "GPU receive overwrites state");
         }
+        RunPDWorkers(model.attentionParallel ? &model.attentionParallel->runtime : nullptr,model.tpWorkers,devices,[&](int rank) {
+            StateCopies copies; const int rows = std::min(length,model.window - 1);
+            for (int layer = 0; layer < model.block_cnt; ++layer) if (model.slidingLayers[layer])
+                for (int part = 0; part < 2; ++part) {
+                    auto &root = part ? reservation->pastKeyValues[layer].second : reservation->pastKeyValues[layer].first;
+                    auto &local = *root.multiDeviceDatas.at(devices[rank]);
+                    const size_t rowBytes = GetDataBytes(local.dataType,1,local.dims.back());
+                    const int first = model.tpSwaRingCache ? (length - rows) % model.window : 0;
+                    const int count = std::min(rows,model.window-first);
+                    const char *source = static_cast<const char *>(windows[rank][layer * 2 + part].Data());
+                    copies.Add(static_cast<char *>(local.cudaData)+first*rowBytes,source,count*rowBytes);
+                    if (count < rows) copies.Add(local.cudaData,source+count*rowBytes,(rows-count)*rowBytes);
+                }
+            bool ok = true;
+            for (const auto &copy : draftCopies) {
+                const auto &to = copy.first, &from = copy.second;
+                if (to.Device() == from.Device()) copies.Add(to.MutableData(), from.Data(), from.Size());
+                else if (ok) ok = FastllmCudaMemcpyPeerAsyncCurrentThread(
+                    to.Device(), to.MutableData(), from.Device(), from.Data(), from.Size());
+            }
+            copies.Submit();
+            CheckPD(ok, "draft prefix transfer failed");
+        });
         model.InvalidateTensorParallelCache(model.attentionParallel ? &context.pastKeyValues.front().first : nullptr);
         for (int layer = 0; layer < model.block_cnt; ++layer) for (int part = 0; part < 2; ++part) {
             auto &source = part ? reservation->pastKeyValues[layer].second : reservation->pastKeyValues[layer].first;
@@ -458,21 +568,10 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
             target.dataDevice = CUDA; target.dataDeviceIds = devices;
             target.multiDeviceData = true;
         }
-        RunPDWorkers(model.attentionParallel ? &model.attentionParallel->runtime : nullptr,model.tpWorkers,devices,[&](int rank) {
-            StateCopies copies; const int rows = std::min(length,model.window - 1);
-            for (int layer = 0; layer < model.block_cnt; ++layer) if (model.slidingLayers[layer])
-                for (int part = 0; part < 2; ++part) {
-                    auto &root = part ? context.pastKeyValues[layer].second : context.pastKeyValues[layer].first;
-                    auto &local = *root.multiDeviceDatas.at(devices[rank]);
-                    const size_t rowBytes = GetDataBytes(local.dataType,1,local.dims.back());
-                    const int first = model.tpSwaRingCache ? (length - rows) % model.window : 0;
-                    const int count = std::min(rows,model.window-first);
-                    const char *source = static_cast<const char *>(windows[rank][layer * 2 + part].Data());
-                    copies.Add(static_cast<char *>(local.cudaData)+first*rowBytes,source,count*rowBytes);
-                    if (count < rows) copies.Add(local.cudaData,source+count*rowBytes,(rows-count)*rowBytes);
-                }
-            copies.Submit();
-        });
+        if (draft) {
+            std::lock_guard<std::mutex> guard(model.historyMutex);
+            model.draftContexts.at(&context.pastKeyValues) = std::move(draft);
+        }
         committed = true;
     }
 };
@@ -486,7 +585,7 @@ std::shared_ptr<PDReceiveState> NaiveN05FlashModel::PreparePDReceive(ResponseCon
         CheckPD(context.allTokens.size() > 1 && context.allTokens.size() <= size_t(max_positions), "invalid KVMem prompt");
         return std::make_shared<SparsePDReceive>(*this, context.allTokens.size() - 1);
     }
-    if (attentionDP > 1 && !draftEnabled && !tpPagedCaches.empty())
+    if (attentionDP > 1 && !tpPagedCaches.empty())
         return std::make_shared<GpuPDReceive>(*this,context);
 #endif
     return {};
@@ -543,6 +642,94 @@ bool NaiveN05FlashModel::SelectPDRequestGroup(ResponseContext &context,
     return TryAdmitResponseContext(&context);
 }
 
+std::string NaiveN05FlashModel::PDGroupLayout(int attentionRanks) const {
+    std::string layout = draftEnabled ? "naive-n05-group-draft-v4" : "naive-n05-group-state-v2";
+    for (int value : {block_cnt, attentionRanks, int(dataType), int(kvCacheDataType),
+                      int(fp8IndexerCache), window, full.kvHeads, full.headDim, full.valueDim,
+                      sliding.kvHeads, sliding.headDim, sliding.valueDim, IndexerCacheWidth(AuxiliaryKVType()),
+                      int(HasSeparateIndexer())})
+        layout += ":" + std::to_string(value);
+    return draftEnabled ? layout + DraftPDLayout(true) : layout;
+}
+
+std::string NaiveN05FlashModel::PDAlternateLayout() const {
+    // Offer a full attention replica to a group-local receiver. The existing
+    // TP export and local checkpoints remain available in their native layout.
+    if (attentionDP != 1 || tpDevices.size() < 2 || !draftEnabled || sparseKv ||
+        indexerContextSharding || indexerLayerSharding) return {};
+    return PDGroupLayout(1);
+}
+
+fastkv::Message NaiveN05FlashModel::PDAlternateState(const fastkv::Message &wire) const {
+    PDRowMessage out; out.layout = PDAlternateLayout();
+    CheckPD(!out.layout.empty(), "unsupported TP to replica export");
+    const auto state = PDStatePayload(wire);
+    fastkv::Reader header(state.metadata);
+    CheckPD(header.String() == PDLayout(), "invalid native TP state");
+    const int length = header.U32();
+    int tailRows = 0;
+    for (int i = 0; i < block_cnt * 2; ++i) header.Ints(3);
+    size_t index = 0;
+    // Consume native tensor descriptors; retained shards alias the registered
+    // export arenas. Replicated GQA heads and Indexer rows cross the NIC once.
+    auto take = [&](fastkv::Reader &reader, const std::string &name, DataType type, int rows,
+                    int fullWidth, int rank, int ranks, size_t baseOffset = 0) {
+        const auto dtype = reader.U32(); const auto shape = reader.Ints(3);
+        reader.U32(); const size_t bytes = reader.U64();
+        CheckPD(dtype == uint32_t(type) && shape.size() == 3 && shape[0] == 1 && shape[1] == rows &&
+                shape[2] > 0 && fullWidth % shape[2] == 0 &&
+                ranks % (fullWidth / shape[2]) == 0 && bytes == GetDataBytes(type, rows, shape[2]),
+                "invalid logical shard geometry");
+        const auto &buf = state.buffers.at(index++);
+        CheckPD(buf.Size() == bytes, "invalid native shard buffer");
+        const int replicas = ranks / (fullWidth / shape[2]);
+        const size_t width = GetDataBytes(type, 1, shape[2]);
+        if (rank % replicas == 0)
+            out.shards.push_back({name, baseOffset + size_t(rank / replicas) * width, width, buf});
+    };
+    const int ranks = tpDevices.size();
+    for (int rank = 0; rank < ranks; ++rank) {
+        const auto descriptors = header.Blob();
+        const auto count = header.U32(); const size_t first = index;
+        fastkv::Reader tensors(descriptors);
+        for (int layer = 0; layer < block_cnt; ++layer) {
+            const auto &cfg = slidingLayers[layer] ? sliding : full;
+            const int rows = slidingLayers[layer] ? std::min(length, window - 1) : length;
+            const auto k = "k" + std::to_string(layer);
+            take(tensors, k, LayerKVType(layer), rows, cfg.kvHeads * cfg.headDim, rank, ranks);
+            take(tensors, "v" + std::to_string(layer), LayerKVType(layer), rows, cfg.kvHeads * cfg.valueDim, rank, ranks);
+            if (!slidingLayers[layer]) {
+                const size_t kBytes = GetDataBytes(LayerKVType(layer), 1, cfg.kvHeads * cfg.headDim);
+                take(tensors, HasSeparateIndexer() ? "i" + std::to_string(layer) : k, AuxiliaryKVType(),
+                     rows, IndexerCacheWidth(AuxiliaryKVType()), rank, ranks, HasSeparateIndexer() ? 0 : kBytes);
+            }
+        }
+        tensors.End();
+        CheckPD(index - first == count, "invalid native TP tensor count");
+    }
+    CheckPD(header.U32() == 1 && header.U32() == uint32_t(length) &&
+            header.U32() == uint32_t(draftLayers), "invalid native draft checkpoint");
+    const int draftRanks = header.U32();
+    CheckPD(draftRanks > 0 && draftRanks <= ranks, "invalid draft rank count");
+    for (int rank = 0; rank < draftRanks; ++rank)
+        for (int layer = 0; layer < draftLayers; ++layer) for (const char *part : {"dk", "dv"})
+            take(header, part + std::to_string(layer), BFLOAT16, std::min(length, draftWindow - 1),
+                 draftKvHeads * draftHeadDim, rank, draftRanks);
+    if (header.U32()) {
+        const auto bytes = state.buffers.at(index).Size();
+        const size_t rowBytes = GetDataBytes(BFLOAT16, 1, embed_dim);
+        CheckPD(bytes % rowBytes == 0 && bytes / rowBytes <= size_t(std::min(length, draftWindow + GetPageLen() - 1)),
+                "invalid draft history length");
+        tailRows = bytes / rowBytes;
+        take(header, "hidden", BFLOAT16, tailRows, embed_dim, 0, 1);
+    }
+    header.End();
+    CheckPD(index == state.buffers.size(), "unclaimed native TP buffer");
+    fastkv::Writer attributes;
+    attributes.U32(length); attributes.U32(tailRows); out.metadata = std::move(attributes.bytes);
+    return out.Encode();
+}
+
 std::string NaiveN05FlashModel::PDLayout() const {
     CheckPD(!indexerContextSharding, "Indexer context sharding needs a separate state adapter");
     CheckPD(attentionDP == 1 || !sparseKv, "Attention DP PD requires GPU KV");
@@ -552,13 +739,7 @@ std::string NaiveN05FlashModel::PDLayout() const {
         // V2 keeps packed K/Indexer rows together so receive targets can point
         // at final pages without one RDMA span per token. Legacy TP/KVMem keep
         // their established component wire layout.
-        std::string layout = draftEnabled ? "naive-n05-group-state-v3" : "naive-n05-group-state-v2";
-        for (int value : {block_cnt, AttentionTPSize(), int(dataType), int(kvCacheDataType),
-                          int(fp8IndexerCache), window, full.kvHeads, full.headDim, full.valueDim,
-                          sliding.kvHeads, sliding.headDim, sliding.valueDim, IndexerCacheWidth(AuxiliaryKVType()),
-                          int(HasSeparateIndexer())})
-            layout += ":" + std::to_string(value);
-        return layout + DraftPDLayout();
+        return PDGroupLayout(AttentionTPSize());
     }
     CheckPD(!(sparseKv && draftEnabled), "KVMem PD draft state transfer is not implemented");
     return std::string(tpDevices.size() > 1 ? "naive-n05-state-v3:" : "naive-n05-state-v1:") +
@@ -571,6 +752,7 @@ std::string NaiveN05FlashModel::PDLayout() const {
 struct NaiveN05FlashModel::PDExportPlan {
     PDStateWriter writer;
     std::vector<PDStateWriter> ranks;
+    std::shared_ptr<DraftContext> draft;
     bool planned = false;
     PDExportPlan(fastkv::BufferPool *pool, size_t count) : writer(pool) {
         ranks.reserve(count);
@@ -580,7 +762,7 @@ struct NaiveN05FlashModel::PDExportPlan {
 
 std::function<fastkv::Message()> NaiveN05FlashModel::PreparePDExport(ResponseContext &context) {
 #ifdef USE_CUDA
-    if (attentionDP > 1 && AttentionTPSize() == 1 && !draftEnabled && !sparseKv && !HasSeparateIndexer()) {
+    if (attentionDP > 1 && AttentionTPSize() == 1 && !sparseKv && !HasSeparateIndexer()) {
         auto devices = PDRequestDevices(context);
         // Attention DP joins its workers to the caller before returning. Fence
         // the owner's caller stream once before handing its pages and ring
@@ -590,6 +772,19 @@ std::function<fastkv::Message()> NaiveN05FlashModel::PreparePDExport(ResponseCon
         FastllmCudaSyncCurrentThreadStream();
         CheckPD(!FastllmCudaGetThreadError(), "producer stream failed");
         auto plan = std::make_shared<PDExportPlan>(PDExportPool(), devices.size());
+        if (draftEnabled) {
+            {
+                std::lock_guard<std::mutex> lock(historyMutex);
+                plan->draft = draftContexts.at(&context.pastKeyValues);
+            }
+            CheckPD(bool(plan->draft), "missing draft export state");
+            // Draft projection joins its owner stream on the projection device.
+            if (tpDevices.front() != devices.front() && !plan->draft->prefixHidden.dims.empty()) {
+                FastllmCudaSetDevice(tpDevices.front());
+                FastllmCudaSyncCurrentThreadStream();
+                CheckPD(!FastllmCudaGetThreadError(), "draft producer stream failed");
+            }
+        }
         return [this, &context, devices, plan = std::move(plan)]() mutable {
             auto reply = PackPDState(context, devices, *plan, true);
             plan.reset(); // Transport owns the result. Only retain plans across capacity retries.
@@ -609,6 +804,10 @@ void NaiveN05FlashModel::ReleasePDExportSources(ResponseContext &context) {
 fastkv::Message NaiveN05FlashModel::ExportPDState(ResponseContext &context) {
     const auto devices = PDRequestDevices(context);
     PDExportPlan plan(PDExportPool(), devices.size());
+    if (draftEnabled) {
+        std::lock_guard<std::mutex> lock(historyMutex);
+        plan.draft = draftContexts.at(&context.pastKeyValues);
+    }
     return PackPDState(context, devices, plan, false);
 }
 
@@ -682,13 +881,45 @@ fastkv::Message NaiveN05FlashModel::PackPDState(ResponseContext &context, const 
         }
         if (!planning) copies.Submit();
     };
-    std::shared_ptr<DraftContext> draft;
-    if (draftEnabled) {
-        auto it = draftContexts.find(&context.pastKeyValues);
-        CheckPD(it != draftContexts.end() && it->second && it->second->pending.empty(),
-                "missing committed draft state");
-        draft = it->second;
-    }
+    auto packDraft = [&](bool planning) {
+        if (!draftEnabled) return;
+        CheckPD(bool(plan.draft), "missing draft export state");
+        const auto &draft = *plan.draft;
+        if (attentionDP == 1) {
+            ExportDraftPDState(writer, draft, context.preTokens, planning);
+            return;
+        }
+        CheckPD(draft.pending.empty() && draft.committed == context.preTokens &&
+                draft.kv.size() == size_t(draftLayers), "invalid committed draft state");
+        const int device = devices.front();
+        StateCopies copies;
+        auto component = [&](const Data &source) {
+            CheckPD(source.dataDevice == CUDA && source.dataDeviceIds.size() == 1 &&
+                    source.cudaData && source.dims.size() == 3 && source.dims[0] == 1 &&
+                    source.dataType == BFLOAT16 && source.strides[2] == 1 &&
+                    source.strides[1] == uint64_t(source.dims[2]), "invalid dense draft tensor");
+            Data compact(source.dataType, source.dims);
+            compact.dataDevice = CUDA; compact.dataDeviceIds = {device};
+            if (planning) { writer.PlanTensor(compact); return; }
+            writer.AllocateTensor(compact);
+            if (source.dataDeviceIds.front() == device)
+                copies.Add(compact.cudaData, source.cudaData, compact.GetBytes());
+            else {
+                // Prefix features can live on the projection GPU. Copy them once
+                // directly to the registered arena instead of moving live tensors.
+                CheckPD(FastllmCudaMemcpyPeerAsyncCurrentThread(writer.buffers.back().Device(), compact.cudaData,
+                        source.dataDeviceIds.front(), source.cudaData, compact.GetBytes()), "draft peer copy failed");
+            }
+        };
+        if (!planning) {
+            FastllmCudaSetDevice(device);
+            writer.metadata.U32(draft.committed); writer.metadata.U32(draftLayers); writer.metadata.U32(1);
+        }
+        for (const auto &pair : draft.kv) { component(pair.first); component(pair.second); }
+        if (!planning) writer.metadata.U32(!draft.prefixHidden.dims.empty());
+        if (!draft.prefixHidden.dims.empty()) component(draft.prefixHidden);
+        if (!planning) copies.Submit();
+    };
     if (!plan.planned) {
         writer.metadata.String(PDLayout());
         writer.metadata.U32(context.preTokens);
@@ -696,7 +927,7 @@ fastkv::Message NaiveN05FlashModel::PackPDState(ResponseContext &context, const 
             for (const Data *root : {&pair.first, &pair.second})
                 writer.metadata.Ints(root->dims);
         for (int rank = 0; rank < int(devices.size()); ++rank) pack(rank, true);
-        if (draft) ExportDraftPDState(writer, *draft, context.preTokens, devices.front(), true);
+        packDraft(true);
         plan.planned = true;
     }
     writer.Reserve(independent);
@@ -709,7 +940,7 @@ fastkv::Message NaiveN05FlashModel::PackPDState(ResponseContext &context, const 
         writer.buffers.insert(writer.buffers.end(), rank.buffers.begin(), rank.buffers.end());
     }
     writer.metadata.U32(draftEnabled);
-    if (draft) ExportDraftPDState(writer, *draft, context.preTokens, devices.front());
+    packDraft(false);
     return writer.Finish(devices);
 #endif
 }
@@ -909,7 +1140,8 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
         rest.metadata.assign(message.metadata.begin() + consumed, message.metadata.end());
         rest.buffers.assign(message.buffers.begin() + offset, message.buffers.end());
         PDStateReader reader(rest);
-        auto draft = ImportDraftPDState(reader, length);
+        auto draft = ImportDraftPDState(reader, length, attentionDP > 1 ? devices.front() : -1);
+        std::lock_guard<std::mutex> lock(historyMutex);
         draftContexts[&context.pastKeyValues] = std::move(draft);
     } else {
         metadata.End();

@@ -7,17 +7,19 @@
 #include <cute/arch/mma_sm100_umma.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
 #include <cute/arch/copy_sm100.hpp>
+#include <cub/block/block_scan.cuh>
 #include <algorithm>
 #include <map>
 namespace naive_indexer_sm100 {
+template<int Queries>
 struct TmaBatch {
-    Row rows[BatchLimit];
+    Row rows[Queries == 1 ? BatchLimit : VerifyLimit];
     CUtensorMap map, scaleMap;
     const void *base;
     int rowBytes;
     bool scaled;
 };
-static_assert(sizeof(TmaBatch) + 128 <= 32764);
+static_assert(sizeof(TmaBatch<VerifyQueries>) + 128 <= 32764);
 __device__ unsigned address(const void *p) { return unsigned(__cvta_generic_to_shared(p)); }
 __device__ uint64_t descriptor(void *p) {
     cute::UMMA::SmemDescriptor d{};
@@ -68,25 +70,39 @@ __device__ void wait_bar(uint64_t *p, int phase) {
 __device__ void arrive_bar(uint64_t *p) {
     asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" ::"r"(address(p)) : "memory");
 }
-template <int Stages = 4, int Outputs = 2>
+struct VerifyStripe { int owner, offset, stride; };
+
+template <int Stages = 4, int Outputs = 2, int Queries = 1>
 __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
-                                                   const __grid_constant__ TmaBatch batch) {
+                                                   const __grid_constant__ TmaBatch<Queries> batch,
+                                                   const VerifyStripe *schedule = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-    auto r = batch.rows[blockIdx.y];
+    VerifyStripe stripe{int(blockIdx.y), int(blockIdx.x), int(gridDim.x)};
+    if constexpr (Queries == VerifyQueries) {
+        stripe = schedule[blockIdx.x];
+        if (stripe.owner < 0) return;
+    }
+    const Row *rows = batch.rows + stripe.owner * Queries;
+    auto r = rows[0];
     r.key.Bind(r.cache);
-    const int begin = r.Begin() + int(blockIdx.x) * 128, end = r.Begin() + r.Count(),
-              step = int(gridDim.x) * 128;
+    const int begin = r.Begin() + stripe.offset * 128, step = stripe.stride * 128;
+    int lengths[Queries], end = 0;
+#pragma unroll
+    for (int j = 0; j < Queries; ++j) {
+        lengths[j] = rows[j].Count();
+        end = max(end, lengths[j]);
+    }
     if (begin >= end) return;
     const int tiles = (end - begin + step - 1) / step, t = threadIdx.x, warp = t / 32, lane = t % 32;
     // 128-byte swizzle repeats every 1 KiB. Align both staging areas so TMA
     // and the cp.async fallback use the same relative XOR permutation.
-    __shared__ __align__(1024) unsigned char q[16 * 128];
+    __shared__ __align__(1024) unsigned char q[Queries * 16 * 128];
     extern __shared__ __align__(1024) unsigned char data[];
     auto k = reinterpret_cast<unsigned char(*)[128 * 128]>(data);
     // Stage the padded scale tail too: wide KV rows otherwise cause one
     // scattered global load per key in the epilogue.
     __shared__ __align__(128) unsigned char keyScales[Stages][128][16];
-    __shared__ __align__(8) float w[16];
+    __shared__ __align__(8) float w[Queries][16];
     __shared__ uint32_t tmem;
     __shared__ uint64_t fullK[Stages], emptyK[Stages], fullC[Outputs], emptyC[Outputs];
     bool tma = r.key.base == batch.base && r.key.scaledIndexer == batch.scaled &&
@@ -94,7 +110,7 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
                r.Begin() % 128 == 0 && r.key.offset == 0;
     if (warp == 0) {
         cute::TMEM::Allocator1Sm a;
-        a.allocate(32, &tmem);
+        a.allocate(Outputs * Queries * 16, &tmem);
         a.release_allocation_lock();
     }
     if (t == 0) {
@@ -110,12 +126,25 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
             arrive_bar(&emptyC[i]);
         }
     }
-    for (int i = t; i < 16 * 128; i += 256) {
-        int row = i / 128, col = i % 128;
-        q[row * 128 + (col ^ ((row & 7) * 16))] =
-            __nv_cvt_float_to_fp8(float(r.query[i]), __NV_SATFINITE, __NV_E4M3);
+    if constexpr (Queries == VerifyQueries) {
+        for (int i = t; i < Queries * 16 * 8; i += 256) {
+            const int row = i / 8, col = i % 8;
+            const auto *packed = reinterpret_cast<const uint4 *>(rows[row / 16].query);
+            reinterpret_cast<uint4 *>(q)[row * 8 + (col ^ (row & 7))] =
+                lengths[row / 16] > 0 ? packed[(row % 16) * 8 + col] : make_uint4(0, 0, 0, 0);
+        }
+    } else {
+        for (int i = t; i < 16 * 128; i += 256) {
+            const int row = i / 128, col = i % 128;
+            q[row * 128 + (col ^ ((row & 7) * 16))] =
+                __nv_cvt_float_to_fp8(float(rows[0].query[i]), __NV_SATFINITE, __NV_E4M3);
+        }
     }
-    if (t < 16) w[t] = r.scale[t] * float(weights[r.sequence * 16 + t]);
+    if (t < Queries * 16) {
+        const auto &query = rows[t / 16];
+        w[t / 16][t % 16] = Queries == 1 || lengths[t / 16] > 0
+            ? query.scale[t % 16] * float(weights[query.sequence * 16 + t % 16]) : 0.f;
+    }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     __syncthreads();
@@ -147,7 +176,7 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
         }
     } else if (warp == 1) {
         const uint64_t id =
-            cute::UMMA::make_runtime_instr_desc<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 128, 16,
+            cute::UMMA::make_runtime_instr_desc<cutlass::float_e4m3_t, cutlass::float_e4m3_t, float, 128, Queries * 16,
                                                 cute::UMMA::Major::K, cute::UMMA::Major::K>();
         auto qdesc = descriptor(q);
         for (int i = 0; i < tiles; ++i) {
@@ -161,7 +190,7 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
             auto kd = descriptor(k[stage]);
 #pragma unroll
             for (int d = 0; d < 128; d += 32)
-                cute::SM100_MMA_F8F6F4_SS::fma(kd + d / 16, qdesc + d / 16, tmem + out * 16, d != 0, id);
+                cute::SM100_MMA_F8F6F4_SS::fma(kd + d / 16, qdesc + d / 16, tmem + out * Queries * 16, d != 0, id);
             if (lane == 0) {
                 asm volatile(
                     "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(
@@ -171,60 +200,61 @@ __global__ __launch_bounds__(256, 2) void Pipeline(const __nv_bfloat16 *weights,
         }
     } else if (warp >= 4) {
         const int row = t - 128;
-        uint64_t ww[8];
-#pragma unroll
-        for (int h = 0; h < 8; ++h)
-            ww[h] = reinterpret_cast<uint64_t *>(w)[h];
         for (int i = 0; i < tiles; ++i) {
             int out = i % Outputs, first = begin + i * step;
 
             wait_bar(&fullC[out], (i / Outputs) & 1);
             asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
             float ks = r.key.scaledIndexer ? *(float *)keyScales[i % Stages][row] : 1.f;
-            uint32_t v[16];
-            cute::SM100::TMEM::LOAD::SM100_TMEM_LOAD_32dp32b16x::copy(
-                tmem + out * 16 + ((row / 32) << 21), v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8],
-                v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
-            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-            asm volatile("bar.sync 1, 128;" ::: "memory");
-            // Release K only after all scale reads and TMEM loads have completed.
-            if (row == 0) {
-                arrive_bar(&emptyC[out]);
-                arrive_bar(&emptyK[i % Stages]);
+#pragma unroll
+            for (int j = 0; j < Queries; ++j) {
+                uint32_t v[16];
+                cute::SM100::TMEM::LOAD::SM100_TMEM_LOAD_32dp32b16x::copy(
+                    tmem + (out * Queries + j) * 16 + ((row / 32) << 21),
+                    v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15]);
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                if (j == Queries - 1) {
+                    asm volatile("bar.sync 1, 128;" ::: "memory");
+                    // Release K only after all scale reads and TMEM loads have completed.
+                    if (row == 0) {
+                        arrive_bar(&emptyC[out]);
+                        arrive_bar(&emptyK[i % Stages]);
+                    }
+                }
+                const auto *headWeights = reinterpret_cast<const uint64_t *>(w[j]);
+                uint64_t values[8];
+#pragma unroll
+                for (int h = 0; h < 8; ++h) {
+                    uint64_t x = uint64_t(v[h * 2]) | (uint64_t(v[h * 2 + 1]) << 32),
+                             abs = x & 0x7fffffff7fffffffull;
+                    asm volatile("add.f32x2 %0, %1, %2;" : "=l"(values[h]) : "l"(x), "l"(abs));
+                    asm volatile("mul.f32x2 %0, %1, %2;" : "=l"(values[h]) : "l"(values[h]), "l"(headWeights[h]));
+                }
+#pragma unroll
+                for (int d = 4; d; d /= 2)
+#pragma unroll
+                    for (int h = 0; h < d; ++h)
+                        asm volatile("add.f32x2 %0, %1, %2;"
+                                     : "=l"(values[h])
+                                     : "l"(values[h]), "l"(values[h + d]));
+                float sum =
+                    (__uint_as_float(uint32_t(values[0])) + __uint_as_float(uint32_t(values[0] >> 32))) * 0.5f;
+                if (first + row < lengths[j]) rows[j].scores[first + row] = OrderedScoreBits(sum * ks);
             }
-            uint64_t values[8];
-#pragma unroll
-            for (int h = 0; h < 8; ++h) {
-                uint64_t x = uint64_t(v[h * 2]) | (uint64_t(v[h * 2 + 1]) << 32),
-                         abs = x & 0x7fffffff7fffffffull;
-                asm volatile("add.f32x2 %0, %1, %2;" : "=l"(values[h]) : "l"(x), "l"(abs));
-                asm volatile("mul.f32x2 %0, %1, %2;" : "=l"(values[h]) : "l"(values[h]), "l"(ww[h]));
-            }
-#pragma unroll
-            for (int d = 4; d; d /= 2)
-#pragma unroll
-                for (int h = 0; h < d; ++h)
-                    asm volatile("add.f32x2 %0, %1, %2;"
-                                 : "=l"(values[h])
-                                 : "l"(values[h]), "l"(values[h + d]));
-            float sum =
-                (__uint_as_float(uint32_t(values[0])) + __uint_as_float(uint32_t(values[0] >> 32))) * 0.5f;
-            if (first + row < end) r.scores[first + row - r.Begin()] = OrderedScoreBits(sum * ks);
         }
     }
     __syncthreads();
     if (warp == 0) {
         cute::TMEM::Allocator1Sm a;
-        a.free(tmem, 32);
+        a.free(tmem, Outputs * Queries * 16);
     }
 #endif
 }
 
 // Pack Q into E4M3 once per head. Its scale is the same as the BF16-expanded
 // quantizer used by the fallback. Eight warps handle eight independent heads.
-__global__ void PackPrefillQueries(const __nv_bfloat16 *src, unsigned *packed, float *scales, int heads) {
-    const int head = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (head >= heads) return;
+__device__ void PackHead(const __nv_bfloat16 *src, unsigned *packed, float *scales, int head) {
+    const int lane = threadIdx.x % 32;
     union { uint2 vector; __nv_bfloat16 values[4]; } v;
     v.vector = reinterpret_cast<const uint2 *>(src)[size_t(head) * 32 + lane];
     float maximum = 0.f;
@@ -242,6 +272,52 @@ __global__ void PackPrefillQueries(const __nv_bfloat16 *src, unsigned *packed, f
     }
     packed[size_t(head) * 32 + lane] = word;
     if (!lane) scales[head] = scale;
+}
+
+__global__ void PackPrefillQueries(const __nv_bfloat16 *src, unsigned *packed, float *scales, int heads) {
+    const int head = blockIdx.x * 8 + threadIdx.x / 32;
+    if (head < heads) PackHead(src, packed, scales, head);
+}
+
+// The first CTA shares this launch with Q packing. It partitions key tiles
+// using current device lengths, including graph replays with different requests.
+__global__ void PrepareVerify(const __grid_constant__ TmaBatch<VerifyQueries> batch,
+                              const __nv_bfloat16 *input, int owners, int blocks, int uniformStripes,
+                              VerifyStripe *schedule) {
+    if (blockIdx.y) {
+        const Row &r = batch.rows[blockIdx.y - 1];
+        if (*r.live > 0) PackHead(input + size_t(r.sequence) * 16 * 128, reinterpret_cast<unsigned *>(r.query),
+                                   r.scale, blockIdx.x * 8 + threadIdx.x / 32);
+        return;
+    }
+    if (blockIdx.x) return;
+    const int t = threadIdx.x;
+    int tiles = 0;
+    if (t < owners) {
+        for (int j = 0; j < VerifyQueries; ++j) tiles = max(tiles, batch.rows[t * VerifyQueries + j].Count());
+        tiles = (tiles + 127) / 128;
+    }
+    __shared__ int firstLength;
+    if (!t) firstLength = tiles;
+    __syncthreads();
+    if (!__syncthreads_or(t < owners && tiles != firstLength)) {
+        for (int i = t; i < blocks; i += blockDim.x) {
+            const int owner = i / uniformStripes;
+            schedule[i] = {owner < owners ? owner : -1, i % uniformStripes, uniformStripes};
+        }
+        return;
+    }
+    using Scan = cub::BlockScan<int, 256>;
+    __shared__ typename Scan::TempStorage storage;
+    int before, total;
+    Scan(storage).ExclusiveSum(tiles, before, total);
+    if (t < owners) {
+        // One stripe per owner; distribute all remaining stripes by tile count.
+        const int extra = blocks - owners;
+        const int first = t + before * extra / total;
+        const int end = t + 1 + (before + tiles) * extra / total;
+        for (int i = first; i < end; ++i) schedule[i] = {t, i - first, end - first};
+    }
 }
 
 __global__ void GatherPrefillIndexKeys(FastllmNaiveKV cache, int stride, int first, int count, uint4 *packed, float *scales) {
@@ -342,17 +418,16 @@ __global__ __launch_bounds__(128) void PrefillScores(const unsigned char *querie
     }
 }
 
-} // namespace naive_indexer_sm100
-
-bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int count, int capacity,
-                                  const __nv_bfloat16 *weights, cudaStream_t stream) {
-    using namespace naive_indexer_sm100;
-    if (!rows || !weights || count < 32 || count > BatchLimit || capacity < 4096) return false;
+template<int Queries>
+bool Score(const Row *rows, int count, int capacity, const __nv_bfloat16 *weights, cudaStream_t stream,
+           const __nv_bfloat16 *input = nullptr, void *scratch = nullptr, size_t scratchBytes = 0) {
+    constexpr int limit = Queries == 1 ? BatchLimit : VerifyLimit;
+    if (!rows || !weights || count < 32 || count > limit || count % Queries || capacity < 4096) return false;
     for (int i = 0; i < count; ++i) {
         const auto &r = rows[i];
         const int rowBytes = r.stride * (r.key.fp8 ? 1 : 2);
         if ((!r.key.scaledIndexer && !r.key.fp8) || r.key.fp4 || r.key.offset || !r.key.pages ||
-            r.key.pageLen % 128 || !r.key.base || !r.live || !r.query || !r.scale || !r.scores ||
+            r.key.pageLen <= 0 || r.key.pageLen % 128 || !r.key.base || !r.live || !r.query || !r.scale || !r.scores ||
             rowBytes < (r.key.scaledIndexer ? 144 : 128) || rowBytes % 16 || (uintptr_t)r.key.base % 16)
             return false;
     }
@@ -377,8 +452,8 @@ bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int coun
         cudaFuncAttributes attr{};
         bool ok = cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.major == 10 &&
                   (prop.minor == 0 || prop.minor == 3) &&
-                  cudaFuncGetAttributes(&attr, Pipeline<>) == cudaSuccess && attr.binaryVersion >= 100 &&
-                  cudaFuncSetAttribute(Pipeline<>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) ==
+                  cudaFuncGetAttributes(&attr, Pipeline<4, 2, Queries>) == cudaSuccess && attr.binaryVersion >= 100 &&
+                  cudaFuncSetAttribute(Pipeline<4, 2, Queries>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) ==
                       cudaSuccess;
         if (!ok) cudaGetLastError();
         entry = devices.emplace(device, Support{ok, prop.multiProcessorCount}).first;
@@ -413,20 +488,45 @@ bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int coun
         cached.map = map;
         cached.scaleMap = scaleMap;
     }
-    TmaBatch batch{};
+    TmaBatch<Queries> batch{};
     std::copy(rows, rows + count, batch.rows);
     batch.map = cached.map;
     batch.scaleMap = cached.scaleMap;
     batch.base = rows[0].key.base;
     batch.rowBytes = rowBytes;
     batch.scaled = scaled;
-    int blocks = std::min((capacity + 127) / 128, std::max(1, entry->second.sms * 2 / count));
-    int aligned = 1;
-    while (aligned * 2 <= blocks)
-        aligned *= 2;
-    blocks = aligned;
-    Pipeline<><<<dim3(blocks, count), 256, shared, stream>>>(weights, batch);
+    const int owners = count / Queries;
+    const int maxStripes = std::min((capacity + 127) / 128, std::max(1, 2 * cached.sms / owners));
+    int stripes = 1;
+    while (2 * stripes <= maxStripes) stripes *= 2;
+    if constexpr (Queries == VerifyQueries) {
+        const int tasks = static_cast<int>(std::min(scratchBytes / sizeof(VerifyStripe), size_t(2 * cached.sms)));
+        if (!input || (reinterpret_cast<uintptr_t>(input) & 7) || !scratch ||
+            reinterpret_cast<uintptr_t>(scratch) % alignof(VerifyStripe) || tasks < owners * stripes) return false;
+        for (int i = 0; i < count; ++i)
+            if (reinterpret_cast<uintptr_t>(rows[i].query) & 15) return false;
+        auto *schedule = static_cast<VerifyStripe *>(scratch);
+        PrepareVerify<<<dim3(2, count + 1), 256, 0, stream>>>(batch, input, owners, tasks, stripes, schedule);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        Pipeline<4, 2, Queries><<<tasks, 256, shared, stream>>>(weights, batch, schedule);
+    } else {
+        Pipeline<4, 2, Queries><<<dim3(stripes, owners), 256, shared, stream>>>(weights, batch);
+    }
     return cudaGetLastError() == cudaSuccess;
+}
+
+} // namespace naive_indexer_sm100
+
+bool FastllmCudaNaiveIndexerSm100(const naive_indexer_sm100::Row *rows, int count, int capacity,
+                                  const __nv_bfloat16 *weights, cudaStream_t stream) {
+    return naive_indexer_sm100::Score<1>(rows, count, capacity, weights, stream);
+}
+
+bool FastllmCudaNaiveVerifyIndexerSm100(const naive_indexer_sm100::VerifyBatch &batch, int count, int capacity,
+        const __nv_bfloat16 *query, const __nv_bfloat16 *weights, void *scratch, size_t scratchBytes,
+        cudaStream_t stream) {
+    using namespace naive_indexer_sm100;
+    return Score<VerifyQueries>(batch.rows, count, capacity, weights, stream, query, scratch, scratchBytes);
 }
 
 bool FastllmCudaNaivePrefillIndexerSm100(const __nv_bfloat16 *query, const __nv_bfloat16 *weights,

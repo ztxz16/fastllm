@@ -816,6 +816,9 @@ namespace fastllm {
         PDPrefillLimits GetPDPrefillLimits(const json11::Json &config);
         virtual void PlanPDPrefillMemory(const PDPrefillLimits &) {}
         virtual std::vector<std::shared_ptr<CudaMemoryReservation>> ActivatePDPrefillMemory(const PDPrefillLimits &) { return {}; }
+
+        // Empty selects the full external draft checkpoint.
+        virtual std::set<std::string> PDDraftContextWeightNames() const { return {}; }
         void ConfigurePD(const json11::Json &config);
         void StopPD();
         bool IsPDDecode() const;
@@ -825,6 +828,10 @@ namespace fastllm {
         // PollPD imports its result before admission to decode.
         void PreparePendingPD(ResponseContext *context);
         virtual std::string PDLayout() const;
+        // Optional wire schema offered to receivers with a different placement.
+        // Native caches stay in their original layout.
+        virtual std::string PDAlternateLayout() const { return {}; }
+        virtual fastkv::Message PDAlternateState(const fastkv::Message &state) const;
         virtual bool SupportsPDKvMemDecode() const { return false; }
         virtual std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) { return {}; }
         virtual std::vector<int> PDDevices() const;
@@ -931,6 +938,7 @@ namespace fastllm {
 
         // 由调度器在 long-prefill 的非末切片前向期间设置。支持该优化的
         // 模型可据此只更新 KV/线性状态，省去不会被消费的 lm_head 和采样。
+        bool pdPrefillOnly = false; // Dedicated P role, known before KV pool sizing.
         bool isIntermediateChunkedPrefill = false;
 
         int defaultChunkedPrefillSize = 8192;

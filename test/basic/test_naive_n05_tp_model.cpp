@@ -241,6 +241,9 @@ struct NaiveN05GraphTestAccess {
         if (model.tpSamplingLogits.GetBytes() != bytes)
             throw std::runtime_error("draft warmup sized verification logits for the training block");
         if (model.tpBatchVerifyStorage) for (const auto &rank : model.tpBatchVerifyStorage->ranks) {
+            const size_t slots = size_t(model.block_cnt) * model.maxBatch * (model.HasSeparateIndexer() ? 8 : 4);
+            if (rank->storage->hostCache.size() < slots || rank->storage->cacheTable.GetBytes() < slots * sizeof(void *))
+                throw std::runtime_error("draft warmup undersized the verification cache binding table");
             const auto &scratch = rank->storage->buffers.decode;
             const size_t rows = size_t(model.maxBatch) * (model.draftTokens + 1);
             if (scratch.indexQuery.Count(0) < rows * 16 * 128 ||
@@ -367,7 +370,8 @@ static void CheckLogitComparison() {
 }
 // Shared deterministic draft weights; existing target embeddings stay untouched.
 static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int vocab, bool merged,
-                                int hidden = 256, int head = 32, int intermediate = 512) {
+                                int hidden = 256, int head = 32, int intermediate = 512,
+                                const std::set<std::string> &contextWeights = {}) {
     unsigned seed = 17;
     auto add = [&](const std::string &name, std::vector<int> dims, bool norm = false) {
         weight.AddEmptyWeight(name, dims, norm ? FLOAT32 : BFLOAT16);
@@ -403,6 +407,13 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
         add(p + "mlp.up_proj.weight", {intermediate, hidden});
         add(p + "mlp.down_proj.weight", {hidden, intermediate});
     }
+    if (!contextWeights.empty()) {
+        for (auto it = weight.weight.begin(); it != weight.weight.end();) {
+            if (it->first.rfind("dspark.", 0) == 0 && !contextWeights.count(it->first.substr(7)))
+                it = weight.weight.erase(it);
+            else ++it;
+        }
+    }
     if (merged) for (int i = 0; i < layers; ++i) {
         const std::string p = "dspark.layers." + std::to_string(i) + ".";
         auto merge = [&](std::vector<std::string> names, std::string out) {
@@ -418,6 +429,10 @@ static void AddDraftTestWeights(WeightMap &weight, int layers, int kvHeads, int 
                 weight.weight.erase(p + name);
             }
         };
+        if (!contextWeights.empty()) {
+            merge({"self_attn.k_proj.weight", "self_attn.v_proj.weight"}, "self_attn.mergekv.weight");
+            continue;
+        }
         merge({"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"}, "self_attn.mergeqkv.weight");
         merge({"mlp.gate_proj.weight", "mlp.up_proj.weight"}, "mlp.gateup_proj.weight");
     }
@@ -906,10 +921,24 @@ class Fixture : public NaiveN05FlashModel {
         return result;
     }
 #endif
-    void PreparePDGroupFixture(int dp) {
-        ConfigureAttentionParallel(dp); maxBatch = 4; SetMaxTokens(16384); WarmUp();
+    void ConfigurePDDraft(int dp) {
+        if (dp > 1) ConfigureDraftParallel(dp, true);
+        draftEnabled = canDoConcurrentForward = true;
+        draftLayers = 2; draftBlock = 7; draftTokens = 5;
+        draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
+        draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
+        draftKVOnly = pdPrefillOnly;
+        AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true, 256, 32, 512, PDDraftContextWeightNames());
+        SetSaveHistoryChat(true);
     }
-    std::vector<PDGroupRecord> ExportPDGroupFixture() {
+    void PreparePDGroupFixture(int dp, bool draft = false) {
+        if (dp > 1) ConfigureAttentionParallel(dp);
+        if (draft) ConfigurePDDraft(dp);
+        maxBatch = 4; SetMaxTokens(16384); WarmUp();
+        if (pdPrefillOnly && (draftProposalStorage || !draftSamplingRanks.empty()))
+            throw std::runtime_error("PD prefill warmup allocated draft sampling buffers");
+    }
+    std::vector<PDGroupRecord> ExportPDGroupFixture(bool shards = false) {
         std::vector<PDGroupRecord> records;
         for (int length : {1, 127, 128, 129, 257, 3073, 4097}) {
             ResponseContext context; context.Init(block_cnt, dataType, kvCacheDataType);
@@ -927,7 +956,8 @@ class Fixture : public NaiveN05FlashModel {
             record.tokens = context.allTokens; record.tokens.push_back(42);
             // Model runtimes exclusively own their GPU workers. Preserve an
             // immutable wire checkpoint, then destroy P before constructing D.
-            record.state = fastkv::Snapshot(ExportPDState(context), -1);
+            auto native = ExportPDState(context);
+            record.state = fastkv::Snapshot(shards ? PDAlternateState(native) : native, -1);
             context.generationConfig.output_logits = true;
             record.logits.resize(3);
             for (int step = 0; step < 3; ++step) {
@@ -939,7 +969,7 @@ class Fixture : public NaiveN05FlashModel {
         }
         return records;
     }
-    void ImportPDGroupFixture(const std::vector<PDGroupRecord> &records, bool rdma) {
+    void ImportPDGroupFixture(const std::vector<PDGroupRecord> &records, bool rdma, bool shards = false) {
         fastkv::Options options; options.transport = rdma ? fastkv::Transport::Rdma : fastkv::Transport::Tcp;
         fastkv::Service server(options), client(options);
         fastkv::Message wire;
@@ -956,7 +986,7 @@ class Fixture : public NaiveN05FlashModel {
             if (!SelectPDRequestGroup(context, available, length + 8)) throw std::runtime_error("PD group selection failed");
             const auto devices = PDRequestDevices(context); wire = record.state;
             fastkv::Message request; std::future<fastkv::Message> future;
-            if (length == 129) {
+            if (!shards && length == 129) {
                 // Cancel before submission: the private final pages and SWA
                 // allocations must return. Cumulative reservations exceed the
                 // fixture's entire 16K pool, so leaked pages cannot hide here.
@@ -964,7 +994,7 @@ class Fixture : public NaiveN05FlashModel {
                     auto abandoned = PreparePDReceive(context);
                 }
             }
-            auto receiver = length == 257 ? std::shared_ptr<PDReceiveState>{} : PreparePDReceive(context);
+            auto receiver = length == 257 && !shards ? std::shared_ptr<PDReceiveState>{} : PreparePDReceive(context);
             if (length != 257 && !receiver) throw std::runtime_error("missing direct GPU PD receiver");
             if (receiver && length == 129) {
                 std::vector<size_t> sizes;
@@ -974,7 +1004,7 @@ class Fixture : public NaiveN05FlashModel {
                 if (!rejected) throw std::runtime_error("GPU receiver accepted invalid metadata");
             }
             fastkv::ReceiveTarget target;
-            if (receiver) target = [receiver](const fastkv::Bytes &metadata,const std::vector<size_t> &sizes) {
+            if (receiver && !shards) target = [receiver](const fastkv::Bytes &metadata,const std::vector<size_t> &sizes) {
                 return receiver->Targets(metadata,sizes);
             };
             if (!client.TrySubmit(server.Address(), request, future, {}, {}, target,
@@ -984,7 +1014,7 @@ class Fixture : public NaiveN05FlashModel {
             auto arrived = future.get();
             // Exercise the same per-request map through L2 as well. Keep the
             // checkpoint after source runtime destruction; restore onto D's group.
-            if (length == 257) {
+            if (!shards && length == 257) {
                 fastkv::HostCache::Options cacheOptions; cacheOptions.bytes = 16 << 20;
                 fastkv::HostCache cache(cacheOptions); fastkv::CacheSnapshot snapshot; snapshot.state = wire;
                 for (const auto &buffer : wire.buffers) {
@@ -1004,16 +1034,46 @@ class Fixture : public NaiveN05FlashModel {
             const auto locations = PDReceivePlacement(wire.metadata, wire.buffers.size(), devices);
             for (size_t i = 0; !receiver && i < arrived.buffers.size(); ++i)
                 if (arrived.buffers[i].Device() != locations[i]) throw std::runtime_error("PD cross-topology landing differs");
-            if (receiver) { receiver->Commit(context); receiver.reset(); arrived = {}; }
+            if (shards) { receiver->CommitShards(context, arrived); receiver.reset(); arrived = {}; }
+            else if (receiver) { receiver->Commit(context); receiver.reset(); arrived = {}; }
             else ImportPDState(context, arrived);
             context.preTokens = length;
             auto exported = ExportPDState(context);
-            if (exported.metadata != wire.metadata || exported.buffers.size() != wire.buffers.size())
-                throw std::runtime_error("PD cross-topology schema differs");
-            for (size_t i = 0; i < wire.buffers.size(); ++i) {
-                std::vector<uint8_t> a(wire.buffers[i].Size()), b(exported.buffers[i].Size());
-                wire.buffers[i].Read(a.data(),0,a.size()); exported.buffers[i].Read(b.data(),0,b.size());
-                if (a != b) throw std::runtime_error("PD cross-topology state bytes differ");
+            if (shards) {
+                PDRowMessage portable(wire);
+                std::vector<std::string> names;
+                for (int layer = 0; layer < block_cnt; ++layer) {
+                    names.push_back("k" + std::to_string(layer)); names.push_back("v" + std::to_string(layer));
+                    const auto indexer = "i" + std::to_string(layer);
+                    if (std::any_of(portable.shards.begin(), portable.shards.end(),
+                            [&](const auto &shard) { return shard.component == indexer; })) names.push_back(indexer);
+                }
+                for (int layer = 0; layer < draftLayers; ++layer) {
+                    names.push_back("dk" + std::to_string(layer)); names.push_back("dv" + std::to_string(layer));
+                }
+                fastkv::Reader attributes(portable.metadata); attributes.U32();
+                if (attributes.U32()) names.push_back("hidden");
+                if (names.size() != exported.buffers.size()) throw std::runtime_error("shard component count changed");
+                for (const auto &shard : portable.shards) {
+                    auto found = std::find(names.begin(), names.end(), shard.component);
+                    const auto &target = exported.buffers.at(found - names.begin());
+                    std::vector<uint8_t> source(shard.buffer.Size()), destination(target.Size());
+                    shard.buffer.Read(source.data(), 0, source.size());
+                    target.Read(destination.data(), 0, destination.size());
+                    const size_t rows = source.size() / shard.width, stride = destination.size() / rows;
+                    if (shard.offset + shard.width > stride) throw std::runtime_error("invalid assembled width");
+                    for (size_t row = 0; row < rows; ++row)
+                        if (std::memcmp(source.data() + row * shard.width, destination.data() + row * stride + shard.offset,
+                                        shard.width)) throw std::runtime_error("TP to DP state bytes differ");
+                }
+            } else {
+                if (exported.metadata != wire.metadata || exported.buffers.size() != wire.buffers.size())
+                    throw std::runtime_error("PD cross-topology schema differs");
+                for (size_t i = 0; i < wire.buffers.size(); ++i) {
+                    std::vector<uint8_t> a(wire.buffers[i].Size()), b(exported.buffers[i].Size());
+                    wire.buffers[i].Read(a.data(),0,a.size()); exported.buffers[i].Read(b.data(),0,b.size());
+                    if (a != b) throw std::runtime_error("PD cross-topology state bytes differ");
+                }
             }
             SetCudaGraph(true);
             for (int step = 0; step < 3; ++step) {
@@ -1024,7 +1084,7 @@ class Fixture : public NaiveN05FlashModel {
                 Forward(Data(FLOAT32,{1,1},{float(42+step)}),Data(),Data(FLOAT32,{1,1},{float(length+step)}),
                         context.pastKeyValues,context.generationConfig,LastTokensManager(),&actual);
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-                if (verifyGraphLaunches.load() - before != ranks)
+                if (!shards && verifyGraphLaunches.load() - before != ranks)
                     throw std::runtime_error("PD decode did not replay the graph on every rank");
 #endif
                 if (actual.size() != record.logits[step].size()) throw std::runtime_error("PD logits missing");
@@ -1037,14 +1097,7 @@ class Fixture : public NaiveN05FlashModel {
     }
     void PDStateChecks(bool kvmem = false, bool rdma = false, bool layerShard = false, bool draft = false, int dp = 1) {
         if (dp > 1) ConfigureAttentionParallel(dp);
-        if (draft) {
-            draftEnabled = canDoConcurrentForward = true;
-            draftLayers = 2; draftBlock = 7; draftTokens = dp > 1 ? 3 : 5;
-            draftHeads = 8; draftKvHeads = 2; draftHeadDim = 32; draftWindow = 1024;
-            draftConfidenceThreshold = 0; draftTargetLayers = {0, 1};
-            AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true);
-            SetSaveHistoryChat(true);
-        }
+        if (draft) ConfigurePDDraft(dp);
         // The batched oracle keeps four reference and four candidate requests
         // alive together, in addition to graph scratch page descriptors.
         maxBatch = draft ? 16 : 4; SetMaxTokens(16384); SetChunkedPrefillSize(4096);
@@ -1141,7 +1194,7 @@ class Fixture : public NaiveN05FlashModel {
             isIntermediateChunkedPrefill = false;
             reference.preTokens = length;
             auto message = ExportPDState(reference);
-            const bool independentExport = dp > 1 && dp == ranks && !draft && kvCacheDataType == FP8_E4M3;
+            const bool independentExport = dp > 1 && dp == ranks && kvCacheDataType == FP8_E4M3;
             if (independentExport) {
                 auto pack = PreparePDExport(reference);
                 if (!pack) throw std::runtime_error("missing independent GPU export");
@@ -1178,7 +1231,7 @@ class Fixture : public NaiveN05FlashModel {
                 message = std::move(async);
             }
             imported.allTokens.push_back(42);
-            if (kvmem) {
+            if (kvmem || (draft && dp > 1 && length != 257)) {
                 // Dropping an unsubmitted reservation must return every page.
                 auto abandoned = destination.PreparePDReceive(imported); abandoned.reset();
                 auto receive = destination.PreparePDReceive(imported);
@@ -1204,7 +1257,7 @@ class Fixture : public NaiveN05FlashModel {
                 if (span != arrived.buffers.size()) throw std::runtime_error("PD receive spans left over");
                 size_t host = 0;
                 for (const auto &buffer : arrived.buffers) if (buffer.Kind() == fastkv::MemoryKind::Host) host += buffer.Size();
-                if (!host) throw std::runtime_error("KVMem main KV did not land on host");
+                if (kvmem != bool(host)) throw std::runtime_error("PD final storage kind mismatch");
                 receive->Commit(imported);
             } else {
                 // Exercise the ordinary transport placement path too. Logical
@@ -1245,7 +1298,7 @@ class Fixture : public NaiveN05FlashModel {
             if (draft) {
                 auto original = draftContexts.at(&reference.pastKeyValues);
                 auto restored = draftContexts.at(&imported.pastKeyValues);
-                if (length == 1) {
+                if (length == 1 && dp == 1) {
                     PDStateWriter writer;
                     ExportDraftPDState(writer, *original, length);
                     auto state = PDStatePayload(writer.Finish(PDDevices()));
@@ -1614,6 +1667,36 @@ class Fixture : public NaiveN05FlashModel {
                 if (observed.size() != expected.size()) throw std::runtime_error("PD tail logits count");
                 RequireCloseLogits(observed.data(), expected, "PD tail target continuation logits");
             }
+            if (pd && count == 2) {
+                // The first two verify rows of request 0 can emit only token 7.
+                // Request 1 is already past its minimum. Compare the boundary
+                // and bonus rows against an independent scalar forward.
+                std::vector<GenerationConfig> configs(count);
+                std::vector<float> ids(count, 17);
+                std::vector<std::pair<Data *, Data *>> caches;
+                for (int i = 0; i < count; ++i) {
+                    auto &cfg = configs[i];
+                    cfg.top_k = 1; cfg.output_token_limit = 16; cfg.input_token_length = past[i] + 1;
+                    cfg.output_token_least = i ? 1 : 3;
+                    for (int token = 0; token < 256; ++token) if (token != 7) cfg.stop_token_ids.insert(token);
+                    for (auto &layer : actual[i]->pastKeyValues) caches.emplace_back(&layer.first, &layer.second);
+                }
+                for (int step = 0; step < 4; ++step) {
+                    std::vector<Data> positions(count); std::vector<Data *> pos;
+                    std::vector<int> oracle(count);
+                    for (int i = 0; i < count; ++i) {
+                        positions[i].CopyFrom(Data(FLOAT32,{1,1},{float(past[i]+1+step)}));
+                        pos.push_back(&positions[i]);
+                        oracle[i] = Forward(Data(FLOAT32,{1,1},{ids[i]}), Data(), positions[i],
+                                            reference[i]->pastKeyValues, configs[i], LastTokensManager());
+                    }
+                    auto got = ForwardBatch(count, Data(FLOAT32,{1,count},ids), {}, pos, std::vector<int>(count,1),
+                                            caches, configs, LastTokensManager());
+                    if (got != oracle || (step < 2 && got[0] != 7))
+                        throw std::runtime_error("batched min_tokens changed greedy output");
+                    ids.assign(got.begin(), got.end());
+                }
+            }
             for (auto *group : {&reference, &actual}) for (auto &ctx : *group) OnResponseContextRemoved(ctx.get());
         }
         // Cancellation before the first forward leaves only an ownership entry.
@@ -1643,6 +1726,7 @@ class Fixture : public NaiveN05FlashModel {
             KvMemConfig cfg; cfg.enabled = true; cfg.maxTokens = 8192; cfg.residentTokens = 8192;
             cfg.prefillTokens = 1024; cfg.hostBytes = 1ULL << 30; ConfigureKvMem(cfg);
         }
+        SetSaveHistoryChat(true);
         WarmUp();
         if (batching) DraftPrefillOracle();
         useRealScheduler = true; eos_token_id = -1; eos_token_ids.clear();
@@ -1795,7 +1879,7 @@ class Fixture : public NaiveN05FlashModel {
         ShutdownRuntime();
         if (batching && !batchedPrefills) throw std::runtime_error("prefill batching was never exercised");
 #ifdef FASTLLM_TEST_VERIFY_GRAPH_HOOKS
-        idleDraftContext.reset();
+        idleDraftContexts.clear();
         inspectDraftPrefixAllocations = false;
         std::lock_guard<std::mutex> guard(draftPrefixAllocationMutex);
         if (!draftPrefixAllocations.empty())
@@ -2282,7 +2366,7 @@ class Fixture : public NaiveN05FlashModel {
         if (!verifyGraphCaptures) throw std::runtime_error("serving warmup captured no graphs");
         const int captures = verifyGraphCaptures;
         int checks = 0, replayed = 0, eager = 0;
-        for (int prefix : (ragged ? std::vector<int>{3070} : std::vector<int>{3, 254, 2046, 4094})) {
+        for (int prefix : (ragged ? std::vector<int>{254, 3070} : std::vector<int>{3, 254, 2046, 4094})) {
             using Cache = std::vector<std::pair<Data, Data>>;
             const int requests = large ? maxBatch : ragged ? 9 : padding ? 47 : 8;
             std::vector<std::vector<std::vector<float>>> capturedLogits;
@@ -2290,9 +2374,12 @@ class Fixture : public NaiveN05FlashModel {
             for (bool graph : {true, false}) {
                 std::vector<Cache> actual(requests);
                 std::vector<int> past(requests, prefix);
-                // Nine requests pad to 16. The longest exceeds pool / 16 = 4096,
-                // while the total live KV fits the pool.
-                if (ragged) past[0] += 3072;
+                if (ragged) {
+                    // Cross the short-attention boundary with live lengths 255, 256 and 1023.
+                    // The longer case also exceeds pool / 16 while fitting the total budget.
+                    past[0] += prefix == 254 ? 768 : 3072;
+                    ++past[1];
+                }
                 GenerationConfig config;
                 config.input_token_length = prefix;
                 config.output_token_limit = 64;
@@ -5031,7 +5118,8 @@ class DraftFixture : public NaiveN05FlashModel {
                     throw std::runtime_error("TP context input reuse");
                 ++checks;
             }
-            reference.idleDraftContext = std::move(a); candidate.idleDraftContext = std::move(b);
+            reference.idleDraftContexts.push_back(std::move(a));
+            candidate.idleDraftContexts.push_back(std::move(b));
         }
         if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0) throw std::runtime_error("no TP graph replay");
         if ((failVerifyBegin || failVerifyInstantiate) && verifyGraphLaunches != 0) throw std::runtime_error("TP graph failure not rolled back");
@@ -5081,7 +5169,7 @@ class DraftFixture : public NaiveN05FlashModel {
         }
         for (auto &old : contexts) {
             const int rank = old->deviceRank; void *pointer = old->kv[0].first.cudaData;
-            idleDraftContext = std::move(old);
+            idleDraftContexts.push_back(std::move(old));
             auto reused = CreateDraftContext();
             if (reused->committed || reused->deviceRank != rank || reused->kv[0].first.cudaData != pointer)
                 throw std::runtime_error("draft DP replacement lost storage ownership");
@@ -5095,6 +5183,28 @@ class DraftFixture : public NaiveN05FlashModel {
             if (a.dims != b.dims || std::memcmp(a.cpuData, b.cpuData, a.GetBytes()))
                 throw std::runtime_error("draft DP non-root survivor graph/eager differs");
         }
+        NaiveN05GraphTestAccess::SetDraftDevices(*this, ranks);
+        auto otherOwner = std::make_shared<DraftContext>();
+        otherOwner->deviceRank = 0;
+        idleDraftContexts.push_back(otherOwner);
+        auto local = CreateDraftContext({1});
+        if (local->deviceRank != 1 || idleDraftContexts.size() != 1 || idleDraftContexts.front() != otherOwner)
+            throw std::runtime_error("an idle cache displaced the target KV owner");
+        AppendDraftContext(h, 0, *local);
+        void *localKV = local->kv.front().first.cudaData;
+        idleDraftContexts.insert(idleDraftContexts.begin(), std::move(local));
+        auto reused = CreateDraftContext({1});
+        if (reused->committed || reused->deviceRank != 1 || reused->kv.empty() ||
+            reused->kv.front().first.cudaData != localKV || idleDraftContexts.size() != 1 ||
+            idleDraftContexts.front() != otherOwner)
+            throw std::runtime_error("draft DP failed to reuse the matching owner's KV");
+        maxBatch = 1;
+        ResponseContext released;
+        draftContexts[&released.pastKeyValues] = std::move(reused);
+        OnResponseContextRemoved(&released);
+        if (idleDraftContexts.size() != 1 || idleDraftContexts.back()->kv.empty() ||
+            idleDraftContexts.back()->kv.front().first.cudaData != localKV)
+            throw std::runtime_error("draft DP failed to recycle within the request limit");
         draftEnabled = true;
         bool rejected = false;
         try { DraftPDLayout(); } catch (const std::runtime_error &) { rejected = true; }
@@ -5422,7 +5532,7 @@ class DraftFixture : public NaiveN05FlashModel {
                 ++checks;
             }
             // Exercise the same bounded storage transfer as request removal.
-            idleDraftContext = std::move(candidate);
+            idleDraftContexts.push_back(std::move(candidate));
         }
         if (!failVerifyBegin && !failVerifyInstantiate && verifyGraphLaunches == 0)
             throw std::runtime_error("draft did not replay a graph");
@@ -5666,6 +5776,23 @@ int main(int argc, char **argv) {
             fixture.PDStateChecks(false, argc > 3 && std::string(argv[3]) == "rdma", false, true, ranks);
             unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
+        if (argc > 2 && std::string(argv[2]) == "pd_draft_tp_to_dp") {
+            SetCudaEmbedding(true); SetCudaGraph(true);
+            const int dst = argc > 3 ? std::stoi(argv[3]) : ranks;
+            if (devices < dst) return 77;
+            std::vector<PDGroupRecord> records;
+            {
+                Fixture producer(ranks, false, true, true, true);
+                producer.SetKVCacheDataType(FP8_E4M3); producer.SetIndexerDataType(FP8_E4M3);
+                producer.ConfigureDraftParallel(ranks, false);
+                producer.pdPrefillOnly = true;
+                producer.PreparePDGroupFixture(1, true); records = producer.ExportPDGroupFixture(true);
+            }
+            Fixture consumer(dst, false, true, true, true);
+            consumer.SetKVCacheDataType(FP8_E4M3); consumer.SetIndexerDataType(FP8_E4M3);
+            consumer.PreparePDGroupFixture(dst, true); consumer.ImportPDGroupFixture(records, false, true);
+            return 0;
+        }
         if (argc > 2 && std::string(argv[2]) == "pd_group") {
             SetCudaEmbedding(true); SetCudaGraph(true);
             const auto type = argc > 4 && std::string(argv[4]) == "bf16" ? BFLOAT16 : FP8_E4M3;
@@ -5700,7 +5827,7 @@ int main(int argc, char **argv) {
             fixture.SetIndexerDataType(FP8_E4M3);
             fixture.PDStateChecks(std::string(argv[2]) == "pd_kvmem", argc > 5 && std::string(argv[5]) == "rdma",
                                   argc > 4 && std::string(argv[4]) == "layer_shard",
-                                  std::string(argv[2]) == "pd_draft"); return 0;
+                                  std::string(argv[2]) == "pd_draft", argc > 6 ? std::stoi(argv[6]) : 1); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "draft_prefix") {
             SetCudaEmbedding(true); SetCudaGraph(!(argc > 4 && std::string(argv[4]) == "eager"));
