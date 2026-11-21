@@ -150,6 +150,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, 
     if constexpr (kDeviceGroupedRows) {
         static_assert(kGemmType == GemmType::MGroupedContiguous && SHAPE_M == 0);
         shape_m = __ldg(grouped_layout - 1);
+        if constexpr (!cute::is_same_v<RowSelection, void>) {
+            if (shape_m == 0) return;
+        }
     }
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;

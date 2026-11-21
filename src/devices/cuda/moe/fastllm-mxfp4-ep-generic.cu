@@ -22,6 +22,8 @@ constexpr int Tile = 32, DecodeTile = 16;
 constexpr int WideTile = 64;
 constexpr int PrefillChunk = 1024;
 constexpr int MinOwnerCombineRows = 384;
+constexpr int CompactPrefillLimit = 512;
+constexpr int CompactGateBlocks = 76, CompactDownBlocks = 34;
 constexpr int GateBlocks = 72, EarlyDownBlocks = 38;
 
 struct PrefillTile {
@@ -60,32 +62,34 @@ struct PrefillSelection {
         return selected == PrefillTile::Early;
     }
 };
+template <bool Notify>
 struct QuantizedSwiGLU;
 
 // FC2 uses a wider N tile for long batches. FC1 stages only the activated half
 // of its output tile. The shared-memory request must also include aligned SFA.
-template <class T, int M>
+template <class T, int M, bool Pipelined = (M == WideTile)>
 struct TileConfig {
-    static constexpr bool wideDown = M == WideTile && std::is_same_v<T, cutlass::bfloat16_t>;
+    static constexpr bool wideDown = Pipelined && std::is_same_v<T, cutlass::bfloat16_t>;
     static constexpr int n = wideDown ? 256 : 128;
-    static constexpr int stages = M == DecodeTile ? 4 : wideDown ? 2 : 3;
+    static constexpr bool fourStages = M == DecodeTile || (Pipelined && M == Tile);
+    static constexpr int stages = wideDown ? 2 : fourStages ? 4 : 3;
     static constexpr int epilogueRows = M == WideTile ? 32 : M;
     static constexpr int scaleA = M > 32 ? M * 4 : 128;
     static constexpr int shared = epilogueRows * n * sizeof(T) +
         stages * ((M + n) * 128 + scaleA + n * 4 + 16);
 };
-template <class T, int M = Tile>
-constexpr int Smem = TileConfig<T, M>::shared;
-template <class T, int M = Tile, bool FuseGate = false>
+template <class T, int M = Tile, bool Pipelined = (M == WideTile)>
+constexpr int Smem = TileConfig<T, M, Pipelined>::shared;
+template <class T, int M = Tile, bool FuseGate = false, bool Pipelined = (M == WideTile)>
 constexpr auto gemm =
-    &deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0, 0, 0, 32, 32, 1, M, TileConfig<T, M>::n, 128, 128, 128, 128,
-                                             TileConfig<T, M>::stages, M == DecodeTile ? 32 : 128, 128, 0,
+    &deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0, 0, 0, 32, 32, 1, M, TileConfig<T, M, Pipelined>::n, 128, 128, 128, 128,
+                                             TileConfig<T, M, Pipelined>::stages, M == DecodeTile ? 32 : 128, 128, 0,
                                              deep_gemm::GemmType::MGroupedContiguous, false, T,
                                              deep_gemm::epilogue::transform::EpilogueIdentity, false, true,
-                                             false, true, false, TileConfig<T, M>::epilogueRows, 1, true,
+                                             false, true, false, TileConfig<T, M, Pipelined>::epilogueRows, 1, true,
                                              std::is_same_v<T, cutlass::bfloat16_t>,
-                                             std::conditional_t<FuseGate, QuantizedSwiGLU, void>,
-                                             std::conditional_t<M == WideTile, PrefillSelection, void>>;
+                                             std::conditional_t<FuseGate, QuantizedSwiGLU<Pipelined>, void>,
+                                             std::conditional_t<Pipelined, PrefillSelection, void>>;
 
 void check(cudaError_t s) {
     if (s != cudaSuccess)
@@ -125,6 +129,9 @@ struct Mail {
     uint8_t *send, *receive;
     BF *returned;
     unsigned long long *flags;
+
+    // Dense EP8 appends a word per expert rank after the eight arrivals and the epoch.
+    __host__ __device__ unsigned long long *directShares() const { return flags + 9; }
 };
 struct Buffers {
     uint8_t *incoming, *a;
@@ -132,6 +139,7 @@ struct Buffers {
     float *gateUp = nullptr;
     cutlass::bfloat16_t **returnRows;
     int *counts, *bases, *positions, *layout;
+    int *compactLayout = nullptr;
     uint8_t *ownerSlots = nullptr;
     int2 *tasks;
 };
@@ -160,6 +168,7 @@ struct Rank {
     PrefillTile *tiles = nullptr;
     int sms;
     bool tunedEp8;
+    bool compactPrefill = false;
     bool relayAcrossNuma = false;
     DenseExchange current;
     Mail *pairedReturnPeers = nullptr;
@@ -228,6 +237,7 @@ __device__ uint32_t quantizeFour(float4 values, uint8_t &scaleByte) {
     return lo | (hi << 16);
 }
 // Neighboring N fragments contain eight gate columns and their eight up columns.
+template <bool Notify>
 struct QuantizedSwiGLU {
     uint8_t *data;
     uint8_t *scales;
@@ -270,7 +280,7 @@ struct QuantizedSwiGLU {
             *reinterpret_cast<uint32_t *>(data + size_t(row) * inter + col) = quant;
             if (!(col % 32)) scales[(size_t(col / 128) * pool + row) * 4 + col % 128 / 32] = sf;
         }
-        if constexpr (M == WideTile) {
+        if constexpr (Notify) {
             // Publish every writer's quantized data and scales to subsequent TMA reads.
             asm volatile("fence.proxy.async.global;" ::: "memory");
             cutlass::arch::NamedBarrier::sync(Threads, 0);
@@ -396,15 +406,35 @@ __global__ void countRoutes(Buffers b, Shape s, int rank, int routes) {
     int e = expert(b, s, t) - rank * s.localE;
     b.positions[t] = (unsigned)e < (unsigned)s.localE ? atomicAdd(b.counts + e, 1) : -1;
 }
-template <int M, bool WithScores>
-__global__ void layout(Buffers b, Shape s, float *rowScores) {
+template <int M, bool WithScores, bool BalanceReturns = false>
+__global__ void layout(Buffers b, Shape s, float *rowScores, Mail *peers = nullptr, int rank = 0, int cap = 0) {
     int e = blockIdx.x;
+    int alignment = M;
+    if constexpr (BalanceReturns) {
+        // This EP8 specialization launches one warp per local expert.
+        static_assert(M == Tile);
+        int count = b.counts[threadIdx.x];
+        int total = count;
+        for (int step = 16; step; step /= 2)
+            total += __shfl_xor_sync(0xffffffffu, total, step);
+        // A heavily loaded rank amortizes 64-row tiles and benefits from sending
+        // one reduced vector per remote owner. Other ranks can still use 32 rows.
+        bool overloaded = total > 2 * cap * s.k;
+        alignment = overloaded ? WideTile : Tile;
+        int *inactive = overloaded ? b.compactLayout : b.layout;
+        if (!overloaded) b.layout = b.compactLayout;
+        if (e == 0) {
+            bool hot = __any_sync(0xffffffffu, count > cap / 2);
+            if (threadIdx.x == 0) inactive[-1] = 0;
+            if (threadIdx.x < 8) peers[threadIdx.x].directShares()[rank] = overloaded ? 0 : hot ? 2 : 4;
+        }
+    }
     int base = 0, compact = 0;
     for (int j = 0; j < e; ++j) {
-        base += (b.counts[j] + M - 1) / M * M;
+        base += (b.counts[j] + alignment - 1) / alignment * alignment;
         compact += b.counts[j];
     }
-    const int padded = (b.counts[e] + M - 1) / M * M;
+    const int padded = (b.counts[e] + alignment - 1) / alignment * alignment;
     for (int j = b.counts[e] + threadIdx.x; j < padded; j += blockDim.x) {
         b.returnRows[base + j] = nullptr;
         if constexpr (WithScores) rowScores[base + j] = 0.f;
@@ -417,12 +447,17 @@ __global__ void layout(Buffers b, Shape s, float *rowScores) {
             b.layout[-1] = base + padded;
         }
     }
-    for (int j = threadIdx.x * M; j < b.counts[e]; j += blockDim.x * M)
+    for (int j = threadIdx.x * alignment; j < b.counts[e]; j += blockDim.x * alignment)
         b.layout[base + j] = e;
 }
-template <bool WithScores, bool OwnerReturn = false>
+// Spread direct FC2 writes across destination rows and expert ranks. Both sides
+// use the same bucket so the requester preserves the per-owner BF16 rounding.
+__device__ bool directReturn(unsigned row, unsigned owner, unsigned share) {
+    return ((row + 3 * owner) & 7) < share;
+}
+template <bool WithScores, bool OwnerReturn = false, bool BalanceReturns = false>
 __global__ void makeTasks(Buffers b, Shape s, int rank, int routes, const Mail *peers, int rowsPerPeer,
-                          float *rowScores, bool crossSocketOnly = false) {
+                          float *rowScores, bool crossSocketOnly = false, const unsigned long long *shares = nullptr) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     int offset = t < routes ? b.positions[t] : -1;
     unsigned slots = 0;
@@ -431,6 +466,9 @@ __global__ void makeTasks(Buffers b, Shape s, int rank, int routes, const Mail *
         slots = (__ballot_sync(0xffffffffu, offset >= 0) >> (threadIdx.x & 24)) & 0xff;
         // Dense dispatch interleaves the two sockets in consecutive source slots.
         if (crossSocketOnly && ((t / (rowsPerPeer * 8)) & 1) == rank / 4) slots = 0;
+        if constexpr (BalanceReturns) {
+            if (directReturn((t / 8) % rowsPerPeer, rank, shares[rank])) slots = 0;
+        }
         if (t < routes && !(t % 8)) b.ownerSlots[t / 8] = slots;
     }
     if (offset < 0) return;
@@ -559,9 +597,9 @@ __global__ void publishOwnerRows(Buffers b, const Mail *peers, int cap) {
         asm volatile("cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;" ::: "memory");
     }
 }
-// Remote owners have already summed their slots. For owners on this socket,
-// FC2 wrote the original rows directly. Reproduce the same per-owner BF16 rounding
-// at the destination, in the order of each owner's first top-8 occurrence.
+// Fold direct FC2 slots at the requester in top-8 order with the same BF16
+// rounding as the expert owner. Pre-reduced owners only occupy their first slot.
+template <bool BalanceReturns = false>
 __global__ void combineCrossSocketRows(Mail mail, const int *ids, BF *out, int rank) {
     constexpr int topk = 8, hidden = 4096, width = sizeof(uint4) / sizeof(BF);
     const int row = blockIdx.x;
@@ -572,7 +610,11 @@ __global__ void combineCrossSocketRows(Mail mail, const int *ids, BF *out, int r
         const unsigned owner = expertId / 32;
         const unsigned mask = __match_any_sync(0xffu, owner);
         const unsigned first = __ffs(mask) - 1;
-        const unsigned contributions = owner / 4 == unsigned(rank / 4) ? mask : 1u << first;
+        bool direct = owner / 4 == unsigned(rank / 4);
+        if constexpr (BalanceReturns) {
+            if (owner < 8) direct |= directReturn(row, owner, mail.directShares()[owner]);
+        }
+        const unsigned contributions = direct ? mask : 1u << first;
         groups[slot] = expertId < 256 && slot == first ? contributions : 0;
     }
     __syncthreads();
@@ -741,20 +783,22 @@ Rank::Projection bindProjection(Storage &owner, const Rank &rank, Shape s, const
     bindActivation(p, rank, s, part != 0, k);
     return p;
 }
-template <class T, int M, class Output>
+template <class T, int M, bool Pipelined = (M == WideTile), class Output>
 void multiply(const Rank &rank, const Rank::Projection &p, Output output, int n, int k, cudaStream_t stream, int mmaBlocks, PrefillSelection selection = {}) {
     auto &b = rank.b;
     // Both projections read the actual padded row count from the device layout.
     constexpr bool small = M == DecodeTile;
     const auto &a = M == WideTile ? p.wideA : small ? p.decodeA : p.a;
     const auto &sa = M == WideTile ? p.wideSa : small ? p.decodeSa : p.sa;
-    constexpr bool wideDown = TileConfig<T, M>::wideDown;
+    constexpr bool wideDown = TileConfig<T, M, Pipelined>::wideDown;
     auto workspace = [&]() {
-        if constexpr (M == WideTile) return selection;
+        if constexpr (Pipelined) return selection;
         else return static_cast<float *>(nullptr);
     }();
-    gemm<T, M, std::is_same_v<Output, QuantizedSwiGLU>><<<mmaBlocks, small ? 160 : 256, Smem<T, M>, stream>>>(
-        output, nullptr, reinterpret_cast<__nv_fp8_e4m3 *>(b.a), nullptr, b.layout,
+    int *layout = Pipelined && M == Tile ? b.compactLayout : b.layout;
+    gemm<T, M, std::is_same_v<Output, QuantizedSwiGLU<Pipelined>>, Pipelined>
+        <<<mmaBlocks, small ? 160 : 256, Smem<T, M, Pipelined>, stream>>>(
+        output, nullptr, reinterpret_cast<__nv_fp8_e4m3 *>(b.a), nullptr, layout,
         nullptr, workspace, 0, n, k, n, 0, 0, a, wideDown ? p.wideB : p.b, sa, wideDown ? p.wideSb : p.sb,
         small ? p.decodeD : p.d);
 }
@@ -819,6 +863,11 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         }
         relayAcrossNuma = relayAcrossNuma && nodes[0] != nodes[4];
     }
+    const bool compactPrefill = relayAcrossNuma && std::all_of(devices.begin(), devices.end(), [](int device) {
+        int shared;
+        check(cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        return shared >= Smem<float, Tile, true>;
+    });
     // Once a gate tile completes, FC2 can reuse its FP8 input rows for BF16 partials.
     s.inputPitch = relayAcrossNuma ? h * int(sizeof(BF)) : h;
     for (int d : devices) {
@@ -844,7 +893,14 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         rank->tunedEp8 = s.ranks == 8 && h == 4096 && i == 2048 && experts == 256 && topk == 8 &&
                               rank->sms == 110 && maxShared >= Smem<float, DecodeTile>;
         if (capacity > 128) {
-            rank->tiles = a.allocate<PrefillTile>(s.pool / WideTile);
+            rank->compactPrefill = compactPrefill && rank->tunedEp8;
+            if (rank->compactPrefill) {
+                check(cudaFuncSetAttribute(gemm<float, Tile, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           Smem<float, Tile, true>));
+                check(cudaFuncSetAttribute(gemm<cutlass::bfloat16_t, Tile, false, true>,
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize, Smem<cutlass::bfloat16_t, Tile, true>));
+            }
+            rank->tiles = a.allocate<PrefillTile>(s.pool / (rank->compactPrefill ? Tile : WideTile));
             check(cudaStreamCreateWithFlags(&rank->prefillStream, cudaStreamNonBlocking));
             check(cudaEventCreateWithFlags(&rank->prefillEvent, cudaEventDisableTiming));
             check(cudaFuncSetAttribute(gemm<float, WideTile, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, Smem<float, WideTile>));
@@ -871,7 +927,7 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         }
         m.send = a.allocate<uint8_t>(size_t(s.cap) * s.stride);
         m.returned = a.allocate<BF>(size_t(s.cap) * s.k * h);
-        m.flags = a.allocate<unsigned long long>(s.ranks + 1);
+        m.flags = a.allocate<unsigned long long>(s.ranks + 1 + (rank->compactPrefill ? s.ranks : 0));
         check(cudaMemset(m.flags, 0, (s.ranks + 1) * sizeof(*m.flags)));
 
         rank->peers = a.allocate<Mail>(s.ranks);
@@ -897,6 +953,7 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         b.positions = a.allocate<int>(tokens * s.k);
         if (relayAcrossNuma) b.ownerSlots = a.allocate<uint8_t>(tokens);
         b.layout = a.allocate<int>(s.pool + 1) + 1;
+        if (rank->compactPrefill) b.compactLayout = a.allocate<int>(s.pool + 1) + 1;
         ep->ranks.push_back(std::move(rank));
     }
     for (auto &r : ep->ranks) {
@@ -998,6 +1055,32 @@ struct PrefetchChunk {
     int rows = 0;
     bool dense = false;
 };
+template <int M>
+void prefillGemm(Rank &r, const Shape &s, const Rank::Layer &l, const Buffers &buffers, cudaStream_t stream,
+                int gateBlocks, int downBlocks) {
+    // Both tile sizes can be captured in one graph. Layout sets the inactive
+    // GEMM's row count to zero, including when replay changes the routing.
+    const QuantizedSwiGLU<true> output{r.downInput, reinterpret_cast<uint8_t *>(r.downScales), r.rowScores, s.pool, r.tiles};
+    const unsigned columns = (2 * s.i + TileConfig<float, M, true>::n - 1) / TileConfig<float, M, true>::n;
+    check(cudaMemsetAsync(r.tiles, 0, (s.pool / M) * sizeof(PrefillTile), stream));
+    check(cudaEventRecord(r.prefillEvent, stream));
+    check(cudaStreamWaitEvent(r.prefillStream, r.prefillEvent, 0));
+    multiply<float, M, true>(r, l.gate, output, 2 * s.i, s.h, stream, gateBlocks);
+    if constexpr (M == Tile)
+        multiply<float, WideTile>(r, l.gate, output, 2 * s.i, s.h, stream, GateBlocks);
+    multiply<cutlass::bfloat16_t, M, true>(r, l.down, buffers.returnRows, s.h, s.i, r.prefillStream,
+                                            downBlocks, {r.tiles, columns, false});
+    if constexpr (M == Tile)
+        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, buffers.returnRows, s.h, s.i, r.prefillStream,
+                                                EarlyDownBlocks, {r.tiles, columns, false});
+    check(cudaEventRecord(r.prefillEvent, r.prefillStream));
+    check(cudaStreamWaitEvent(stream, r.prefillEvent, 0));
+    multiply<cutlass::bfloat16_t, M, true>(r, l.down, buffers.returnRows, s.h, s.i, stream, r.sms,
+                                            {r.tiles, columns, true});
+    if constexpr (M == Tile)
+        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, buffers.returnRows, s.h, s.i, stream, r.sms,
+                                                {r.tiles, columns, true});
+}
 void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF *rowsIn, const int *index,
               const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream,
               bool dense, bool prefetched, PrefetchChunk next) {
@@ -1010,6 +1093,7 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
     // Mid-sized dense chunks benefit from avoiding a local publish pass. Full
     // chunks reuse the input transfer pipeline and aggregate on both sockets.
     const bool crossSocketOnly = paired && ownerPartial && cap < PrefillChunk;
+    const bool compact = r.compactPrefill && crossSocketOnly && cap < CompactPrefillLimit;
     const Mail *returnPeers = paired ? r.pairedReturnPeers : r.peers;
     if (prefetched) {
         check(cudaStreamWaitEvent(stream, r.copyDone, 0));
@@ -1048,9 +1132,13 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
         countRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(buffers, s, rank, routes);
         if (r.tunedEp8) {
             if (shortBatch) layout<DecodeTile, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores);
+            else if (compact) layout<Tile, true, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores, r.peers, rank, cap);
             else if (cap > 128) layout<WideTile, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores);
             else layout<Tile, true><<<s.localE, 32, 0, stream>>>(buffers, s, r.rowScores);
-            if (ownerPartial)
+            if (compact)
+                makeTasks<true, true, true><<<(routes + 255) / 256, 256, 0, stream>>>(
+                    buffers, s, rank, routes, returnPeers, cap, r.rowScores, true, r.mail.directShares());
+            else if (ownerPartial)
                 makeTasks<true, true><<<(routes + 255) / 256, 256, 0, stream>>>(
                     buffers, s, rank, routes, returnPeers, cap, r.rowScores, crossSocketOnly);
             else
@@ -1064,21 +1152,11 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
     int blocks = std::min(routes, 4 * r.sms);
     gather<<<blocks, 128, 0, stream>>>(buffers, s);
     if (r.tiles && cap > 128) {
-        const QuantizedSwiGLU output{r.downInput, reinterpret_cast<uint8_t *>(r.downScales), r.rowScores, s.pool, r.tiles};
-        const unsigned columns = (2 * s.i + TileConfig<float, WideTile>::n - 1) / TileConfig<float, WideTile>::n;
-        check(cudaMemsetAsync(r.tiles, 0, (s.pool / WideTile) * sizeof(PrefillTile), stream));
-        check(cudaEventRecord(r.prefillEvent, stream));
-        check(cudaStreamWaitEvent(r.prefillStream, r.prefillEvent, 0));
-        multiply<float, WideTile>(r, l.gate, output, 2 * s.i, s.h, stream, GateBlocks);
-        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, buffers.returnRows, s.h, s.i, r.prefillStream,
-                                                EarlyDownBlocks, {r.tiles, columns, false});
-        check(cudaEventRecord(r.prefillEvent, r.prefillStream));
-        check(cudaStreamWaitEvent(stream, r.prefillEvent, 0));
-        multiply<cutlass::bfloat16_t, WideTile>(r, l.down, buffers.returnRows, s.h, s.i, stream, r.sms,
-                                                {r.tiles, columns, true});
+        if (compact) prefillGemm<Tile>(r, s, l, buffers, stream, CompactGateBlocks, CompactDownBlocks);
+        else prefillGemm<WideTile>(r, s, l, buffers, stream, GateBlocks, EarlyDownBlocks);
     } else {
         if (r.tunedEp8) {
-            const QuantizedSwiGLU output{r.downInput, reinterpret_cast<uint8_t *>(r.downScales), r.rowScores, s.pool};
+            const QuantizedSwiGLU<false> output{r.downInput, reinterpret_cast<uint8_t *>(r.downScales), r.rowScores, s.pool};
             if (shortBatch) multiply<float, DecodeTile>(r, l.gate, output, 2 * s.i, s.h, stream, r.sms);
             else multiply<float, Tile>(r, l.gate, output, 2 * s.i, s.h, stream, r.sms);
         } else {
@@ -1091,8 +1169,10 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
     if (ownerPartial)
         publishOwnerRows<<<s.ranks * cap, 256, 0, stream>>>(buffers, returnPeers, cap);
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
-    if (crossSocketOnly && n)
-        combineCrossSocketRows<<<n, 256, 0, stream>>>(r.mail, index, out, rank);
+    if (compact && n)
+        combineCrossSocketRows<true><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
+    else if (crossSocketOnly && n)
+        combineCrossSocketRows<><<<n, 256, 0, stream>>>(r.mail, index, out, rank);
     else if (ownerPartial && n)
         combine<8, true><<<n, 256, 0, stream>>>(r.mail, s, index, out, keys);
     else if (n && shortBatch)
