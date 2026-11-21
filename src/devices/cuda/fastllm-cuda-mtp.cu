@@ -214,7 +214,10 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
         if constexpr (Probability) {
             float proposal = qLogits[(size_t)i * vocab + token];
             float u = Uniform(curand(&rng));
-            if (!(target > 0 && (target >= proposal || u * proposal < target))) break;
+            // A point-mass target always accepts its own token, even if the
+            // stored proposal rounded slightly above one.
+            if (!(target > 0 && (target >= proposal || (target == 1.f && isfinite(proposal)) ||
+                                u * proposal < target))) break;
         } else {
             float logq = qLogits[(size_t)i * vocab + token] - qLse[i];
             float logp = logf(target);

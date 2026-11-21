@@ -1745,7 +1745,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPRenormProbK
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
         const uint32_t idx = base_idx + j;
         float v = probs_vec[j];
-        probs_vec[j] = (idx < d) ? (v * normalizer) : 0.0f;
+        probs_vec[j] = (idx < d) ? (v > 0 && v == row_sum ? 1.0f : v * normalizer) : 0.0f;
       }
       if (base_idx < d) {
         probs_vec.cast_store(renormed_prob + row_idx * d + base_idx);
@@ -1854,7 +1854,8 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPRenormProbK
     }
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      probs_vec[j] = (probs_vec[j] > low) ? probs_vec[j] * normalizer : 0;
+      const float value = probs_vec[j];
+      probs_vec[j] = (value > low) ? (value == sum_low ? 1.0f : value * normalizer) : 0;
     }
     if ((i * BLOCK_THREADS + tx) * VEC_SIZE < d) {
       probs_vec.cast_store(renormed_prob + row_idx * d + i * BLOCK_THREADS * VEC_SIZE +
@@ -1918,7 +1919,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     float u = curand_uniform(&curand_state);
     // curand_uniform includes 1. Accept p == q unconditionally: rejecting
     // identical distributions would leave an empty residual distribution.
-    if (q > 0.f && (q >= p || u * p < q)) {
+    if (q > 0.f && (q >= p || (q == 1.f && isfinite(p)) || u * p < q)) {
       // accept the draft models output
       output_token_ids[row_idx * (num_speculative_tokens + 1) + i] = draft_id;
     } else {
@@ -1936,7 +1937,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void ChainSpeculativ
     float u = curand_uniform(&curand_state);
     // curand_uniform includes 1. Accept p == q unconditionally: rejecting
     // identical distributions would leave an empty residual distribution.
-    if (q > 0.f && (q >= p || u * p < q)) {
+    if (q > 0.f && (q >= p || (q == 1.f && isfinite(p)) || u * p < q)) {
       ++accepted_token_num;
     }
   }

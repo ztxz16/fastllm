@@ -312,6 +312,35 @@ void FullVocabularyCase() {
     }
     std::puts("152576-token vocabulary, sequential q rows, temperatures/top-p/ties: PASS");
 }
+void PointMassCase() {
+    // DSpark can compare a nearly certain draft against a singleton target.
+    // Inspect the probabilities directly so a rare rejection draw is unnecessary.
+    const float temperature = .6f, topP = .95f;
+    for (const int vocab : {32768, 152576}) {
+        std::vector<float> values(vocab, -80.f);
+        values[0] = 34.f;
+        Buffer logits(values), q(vocab), token(1);
+        void *draft = FastllmCudaMtpCreateDraftSampler(vocab, temperature, vocab, 1.f);
+        Require(draft && FastllmCudaMtpDraftSamplerSetSeed(draft) &&
+                FastllmCudaMtpDraftSamplerRun(draft, logits.p, q.p, token.p),
+                "point-mass draft sampling failed");
+        Require(q.Read()[0] == 1.f, "rounded draft peak must have unit probability");
+        FastllmCudaMtpDestroyDraftSampler(draft);
+
+        values[0] = 3.f; values[1] = .78125f; values[2] = -1.21875f;
+        Check(cudaMemcpy(logits.p, values.data(), logits.n * sizeof(float), cudaMemcpyHostToDevice));
+        void *target = FastllmCudaMtpCreateTargetDistribution(1, vocab);
+        float *probabilities = nullptr;
+        bool changed = false;
+        Require(target && FastllmCudaMtpPrepareTargetDistribution(target, &temperature, &vocab, &topP, &changed) &&
+                FastllmCudaMtpNormalizeTargetDistribution(target, logits.p, &probabilities),
+                "point-mass target normalization failed");
+        Check(cudaMemcpy(values.data(), probabilities, logits.n * sizeof(float), cudaMemcpyDeviceToHost));
+        Require(values[0] == 1.f && std::all_of(values.begin() + 1, values.end(),
+                [](float p) { return p == 0.f; }), "singleton nucleus must have exactly unit mass");
+        FastllmCudaMtpDestroyTargetDistribution(target);
+    }
+}
 void GraphTopPCase() {
     for (int vocab : {65535, 65536, 152576}) {
         for (int parameter = 0; parameter < 6; ++parameter) {
@@ -568,6 +597,7 @@ int main() {
         GraphSamplerCase();
         ResizableGraphSamplerCase();
         GraphTopPCase();
+        PointMassCase();
         for (int drafts : {1, 3, 5, 7})
             ChainCase("unfiltered-q filtered-p", {.55f, .30f, .15f}, {.10f, .40f, .50f},
                   drafts, 32, .7f, 2, .8f);

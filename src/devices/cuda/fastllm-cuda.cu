@@ -16366,7 +16366,7 @@ __device__ void FastllmTemperatureSoftmaxBody(Input input, float *probs,
 
     float localSum = 0.0f;
     for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
-        localSum += expf(input(bid, i, vocabSize) * invTemp - maxVal);
+        localSum += expf(__fmul_rn(input(bid, i, vocabSize), invTemp) - maxVal);
     }
     __syncthreads();
     float blockSum = BlockReduce(tempStorage).Sum(localSum);
@@ -16376,7 +16376,7 @@ __device__ void FastllmTemperatureSoftmaxBody(Input input, float *probs,
 
     float invSum = 1.0f / sumExp;
     for (int i = threadIdx.x; i < vocabSize; i += BLOCK_THREADS) {
-        output[i] = expf(input(bid, i, vocabSize) * invTemp - maxVal) * invSum;
+        output[i] = expf(__fmul_rn(input(bid, i, vocabSize), invTemp) - maxVal) * invSum;
     }
 }
 template <int BLOCK_THREADS>
@@ -16419,7 +16419,7 @@ __global__ void FastllmProposalLaneSums(FastllmBF16BiasSoftmaxInput input, const
     const float invTemp = 1.f / temperatures[row];
     float sum = 0.f;
     for (int i = lane; i < vocab; i += 1024) {
-        const float value = expf(input(row, i, vocab) * invTemp - rowMax);
+        const float value = expf(__fmul_rn(input(row, i, vocab), invTemp) - rowMax);
         sum += value;
         probs[size_t(row) * stride + i] = value;
     }
@@ -16549,7 +16549,8 @@ __global__ void FastllmMtpSoftmaxNormalizeKernel(const float *logits, const floa
     __syncthreads();
     float invTemp = 1.0f / temperatures[blockIdx.y];
     for (int i = blockIdx.x * 4096 + threadIdx.x; i < min((int)(blockIdx.x + 1) * 4096, vocab); i += 256)
-        output[i] = expf(input[i] * invTemp - rowMax) * invSum;
+        // Match the rounded scaled logits used to compute the tile maxima and sums.
+        output[i] = expf(__fmul_rn(input[i], invTemp) - rowMax) * invSum;
 }
 
 template <int BLOCK_THREADS>
@@ -18290,7 +18291,8 @@ __global__ void FastllmMtpTopPCut(FastllmMtpTopPState *states, const float *topP
     double keptMass = Reduce(temp.reduce).Sum(included);
     if (threadIdx.x == 0 && threshold > 0 &&
         fabs(higherMass - p) > margin && fabs(keptMass - p) > margin)
-        cuts[row] = make_float2(threshold, float(1 / keptMass));
+        // A zero scale marks a singleton nucleus, whose probability is exactly one.
+        cuts[row] = make_float2(threshold, keptMass == threshold ? 0.0f : float(1 / keptMass));
 }
 __global__ void FastllmMtpTopPApply(const float *probs, float *output, const float2 *cuts, int vocab) {
     const int row = blockIdx.y;
@@ -18298,7 +18300,7 @@ __global__ void FastllmMtpTopPApply(const float *probs, float *output, const flo
     if (cut.x <= 0) return;
     for (int i = blockIdx.x * 256 + threadIdx.x; i < vocab; i += gridDim.x * 256) {
         float value = probs[(size_t)row * vocab + i];
-        output[(size_t)row * vocab + i] = value >= cut.x ? value * cut.y : 0;
+        output[(size_t)row * vocab + i] = value >= cut.x ? (cut.y == 0 ? 1.0f : value * cut.y) : 0;
     }
 }
 
