@@ -130,8 +130,8 @@ namespace {
 }
 
 void NaiveN05FlashModel::SetKVCacheDataType(DataType type) {
-    if (attentionDP > 1 && type != BFLOAT16 && type != FP8_E4M3)
-        throw std::invalid_argument("Naive attention DP requires BF16 or FP8 KV");
+    if (attentionDP > 1 && !FastllmNaiveAttentionKVType(type))
+        throw std::invalid_argument("Naive attention DP requires BF16, FP8 or FP4 KV");
     if (type == FP4_E2M1 || kvCacheDataType == FP4_E2M1)
         AssertInFastLLM(!mainLoop && !tpPrepared && !sparseKv && !kvMemLocked && !autoWarmupRunning.load(),
                         "Set Naive FP4 KV dtype before warmup or inference.");
@@ -2612,8 +2612,9 @@ int NaiveN05FlashModel::SampleTarget(
 void NaiveN05FlashModel::WarmUp() {
     const DataType requestedKV = kvCacheDataType;
     if (requestedKV == FP4_E2M1) {
-        AssertInFastLLM(tpDevices.size() > 1 && !GetKVCacheInCPU() && !draftEnabled,
-                        "Naive FP4 DSA KV requires CUDA TP and no draft.");
+        AssertInFastLLM(tpDevices.size() > 1 && !GetKVCacheInCPU() &&
+                        (!draftEnabled || (attentionDP > 1 && !kvMemConfig.enabled)),
+                        "Naive FP4 DSA KV requires CUDA TP; FP4 with draft requires attention DP and GPU-resident KV.");
         AssertInFastLLM(full.headDim % 16 == 0 && full.valueDim % 16 == 0 &&
                         full.headDim <= 256 && full.valueDim <= 256,
                         "Naive FP4 DSA KV requires block16-aligned head widths <= 256.");
@@ -2657,20 +2658,21 @@ void NaiveN05FlashModel::WarmUp() {
     }
     cache.clear();
 #ifdef USE_CUDA
+    PrepareTensorParallelMemory();
+    // Bootstrap workspaces may use FP8. Permanent pages, Indexer sidecars
+    // and serving graphs must all see the requested physical storage type.
+    kvCacheDataType = requestedKV;
     if (attentionDP > 1) {
-        PrepareTensorParallelMemory();
         PrepareAttentionParallelSampling();
         if (kvMemConfig.enabled) InitSparseKv();
         else InitTensorParallelKVPool();
         if (!kvMemConfig.enabled) PrepareTensorParallelServing();
         return;
     }
-    PrepareTensorParallelMemory();
     // Ragged prefill warmup may leave large idle allocator blocks. Return only
     // those blocks before KVMem sizing; graph-pinned and busy workspaces stay.
     if (draftEnabled && prefillBatchPolicy.targetTokens > 0)
         FastllmCudaReleaseIdleCachedBuffers();
-    kvCacheDataType = requestedKV;
     if (kvMemConfig.enabled) {
         InitSparseKv();
         if (draftEnabled) {

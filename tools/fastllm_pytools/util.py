@@ -1034,7 +1034,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='Naive Hopper FP8 Indexer prefill，需 FP8 Q/K。auto 使用默认计算，fp8 使用 BF16 候选精排，fp8_direct 直接按 FP8 分数选位，可能改变输出')
     parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
                         help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 按上下文分片并合并全局 TopK，支持纯显存 KV 和 KVMem；默认各卡复制')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA、DeepSeek-V4.1，或 Naive TP KVMem 的 DSA KV；Naive SWA/Indexer 保持 FP8）')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4。Qwen3.5 CUDA、DeepSeek-V4.1 和 Naive CUDA TP/Attention DP 支持 fp4；Naive 仅压缩 DSA KV，SWA/Indexer 保持 FP8。')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
                         help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭（--auto 可按预算启用 Qwen4 精确换页），Qwen3/3.5 单请求稀疏检索；Qwen4/QSA 混合推理精确换页；MiMo/Naive CUDA TP 支持多请求精确 DSA KV 缓存，需先设置 --max_batch')
@@ -2125,8 +2125,8 @@ def make_normal_llm_model(args, startup_progress = None):
             raise ValueError("Attention DP requires a DeepSeek V4.1 or Naive/MiMo adapter")
         if is_naive_n05_model and indexer_storage == "layer_shard":
             raise ValueError("Naive Attention DP supports replicated or context_shard Indexer storage")
-        if is_naive_n05_model and args.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
-            raise ValueError("Naive Attention DP supports BF16 or FP8 KV")
+        if is_naive_n05_model and args.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3", "fp4", "nvfp4", "fp4_e2m1"):
+            raise ValueError("Naive Attention DP supports BF16, FP8 or FP4 KV")
         world = _thread_tp_cuda_device_count(getattr(args, "tp", ""))
         if world < attention_dp or world % attention_dp:
             raise ValueError("--attn-dp-size must divide the total --tp device count")

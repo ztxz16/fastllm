@@ -76,14 +76,16 @@ Naive/MiMo 的 CUDA TP 路径可显式设置 `--kv_cache_dtype fp4`，不要求�
 仅将 DSA 主 attention 的 K/V 改成 E2M1 FP4，每 16 个值配一个 E4M3 scale。
 SWA 窗口和前缀快照继续使用 FP8 E4M3，Indexer 继续沿用 FP8 缓存及原来的
 `--indexer_dtype` 选择；该选项不启用或关闭 FP8 Indexer 评分，也不改变模型权重。
-默认配置不变。该组合要求至少两张 TP 卡、BF16 计算和启动预热，
-不支持 draft；不满足条件时启动报错。
+该组合要求 `--tp` 总设备数至少为 2、BF16 计算和启动预热。每个 Attention DP 组可以只有一张卡。
+使用 GPU 分页池时，Attention DP 支持普通解码和 DSpark。DSpark 的草稿 KV 使用 BF16。
+普通 TP 和 KVMem 的 FP4 路径仅支持关闭草稿的配置。
 
 在已有 CUDA TP 的启动命令或 deploy worker 参数中，将
 `--kv_cache_dtype fp8` 改为 `--kv_cache_dtype fp4` 即可。普通显存模式使用 GPU 分页池；
 需要主机 KV 备份时再显式配置 `--kvmem`。其余容量、NUMA、
 TP/EP、Indexer、请求并发和攒批参数仍由启动配置指定，没有预设模型路径或机器地址。
-支持 `layer_shard` 和 `context_shard` 的 FP8 Indexer 存储，保持原有分片与全局 TopK 合并规则。
+普通 TP 的 FP8 Indexer 支持 `replicated`、`layer_shard` 和 `context_shard`。
+Attention DP 支持 `replicated` 和 `context_shard`，与 PD 一起部署时使用 `replicated`。
 既有 `--kvmem` 主机内存预算会根据 FP4 的实际存储字节重新检查；固定 `--tokens`
 时不会自动扩大上下文容量。
 
@@ -648,13 +650,13 @@ TP 改变 GEMM 与跨卡归约顺序，跨策略使用既有数值容差；同�
 结果按原请求顺序汇集，模型训练的 `block_size` 不变。
 Graph 捕获失败使用相同的 DP eager 路径；不指定 DP 时继续使用默认 TP/单卡选择。
 当前 proposal 与接受/拒绝采样仍在首卡，DP 参数只改变草稿骨干及对应 KV 的分工。
-PD 状态传输目前要求草稿使用 TP；显式草稿 DP 与 PD 的组合会在布局检查时拒绝。
+在纯 Attention DP 的 GPU 分页部署中，草稿可以随请求的 attention 组放置。
 `naive_n05_draft_dp_*` 和 `naive_n05_draft_dp_storage_*` 覆盖 2/4/8 卡、
 Graph/eager、固定 KV 归属、非首卡存活请求与空闲存储复用。
 
-纯 GPU 的 [PD 分离](fastkv_pd.md) 也支持上述草稿 TP。P/D 需使用相同的草稿模型、
-TP 配置和 BF16/FP8 主 KV；FastKV 按 rank 交接已提交的草稿窗口，并在 D 端恢复候选
-空间和本地 Graph。KVMem 的 PD 接收适配器目前仍不接收草稿状态，FP4 KV 仍要求关闭草稿。
+纯 GPU 的 [PD 分离](fastkv_pd.md) 支持草稿 TP 和上述按组放置。P/D 使用相同的草稿模型和兼容的 KV 布局。
+Attention DP 的主 DSA KV 可使用 FP4，FastKV 同时交接独立 FP8 Indexer 和已提交的 BF16 草稿窗口。
+D 端恢复候选空间并使用本地图。KVMem 的 PD 接收适配器目前仍要求关闭草稿。
 
 纯 Attention DP 与兼容的 MegaMoE 布局在验证 Graph 中复用本地 hidden、residual、
 router 和专家分发，避免每层汇集全局 hidden。草稿所需的中间层特征及最终输出仍按

@@ -8,8 +8,8 @@ void NaiveN05FlashModel::ConfigureAttentionParallel(int dp) {
     if (indexerLayerSharding)
         throw std::invalid_argument("Naive attention DP supports replicated or context-sharded Indexer storage");
     parallel::Topology topology(tpDevices, dp, tpEp8Mega ? tpDevices.size() : 1);
-    if (GetKVCacheInCPU() || dataType != BFLOAT16 || !FastllmNaiveKVType(kvCacheDataType))
-        throw std::invalid_argument("Naive attention DP requires BF16 compute and BF16/FP8 GPU KV");
+    if (GetKVCacheInCPU() || dataType != BFLOAT16 || !FastllmNaiveAttentionKVType(kvCacheDataType))
+        throw std::invalid_argument("Naive attention DP requires BF16 compute and BF16/FP8/FP4 GPU KV");
     for (auto cfg : {full, sliding})
         if (cfg.heads % topology.attentionTP ||
             (cfg.kvHeads % topology.attentionTP && topology.attentionTP % cfg.kvHeads))

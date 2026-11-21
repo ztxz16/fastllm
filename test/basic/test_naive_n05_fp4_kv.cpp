@@ -255,6 +255,16 @@ void PrefixCopy() {
         Cuda(cudaMemcpy(&devicePage, cache.cudaData, 4, cudaMemcpyDeviceToHost));
         Require(devicePage == copied && pool.pageRefCount[old] == 1 && pool.pageRefCount[copied] == 1,
                 "prefix copy metadata/refcounts");
+        // An owning page table can describe reserved space without expansion metadata.
+        cache.expansionDims.clear();
+        Data next(BFLOAT16);
+        Allocate(next, {1, 1, width});
+        auto input = Input(width, 13);
+        Upload(next, input);
+        FastllmCudaNaivePagedWrite(cache, next, 63);
+        auto packed = Quantize(input.data(), width);
+        std::copy(packed.begin(), packed.end(), original.begin() + copied * bytes + 63 * packed.size());
+        Require(Read<uint8_t>(pool) == original, "append to the reserved FP4 prefix page");
         // Data owns the page table; the test owns physical-page references.
         pool.ReleasePageIndex(old);
         pool.ReleasePageIndex(copied);
@@ -276,6 +286,29 @@ void ReadWrite() {
         FastllmCudaNaiveReadCache({{&c.view, restored.cudaData, 0, 513}});
         Require(Read<uint16_t>(restored) == c.Decode(), "FP4 paged prefill/history decode");
     }
+}
+void VerifyPagedBlock() {
+    Cache k(513, 192, 71), v(513, 128, 79);
+    Data nk(BFLOAT16), nv(BFLOAT16), q(BFLOAT16), lengths(INT32), empty, actual, expected;
+    Allocate(nk, {1, 4, 192}); Allocate(nv, {1, 4, 128});
+    Allocate(q, {1, 4, 8 * 192}); Allocate(lengths, {4});
+    const auto keys = Input(4 * 192, 19), values = Input(4 * 128, 23);
+    Upload(nk, keys); Upload(nv, values); Upload(q, Input(4 * 8 * 192, 31));
+    const int live[] = {127, 128, 129, 130};
+    Cuda(cudaMemcpy(lengths.cudaData, live, sizeof(live), cudaMemcpyHostToDevice));
+    FastllmCudaNaiveAppendVerifyCache(k.view, v.view, nk, nv, lengths, 0);
+    k.ReferenceWrite(keys, 126); v.ReferenceWrite(values, 126);
+    k.Verify(); v.Verify(); k.RefreshDense(); v.RefreshDense();
+    FastllmNaiveDecodeScratch sa, sb;
+    auto verify = [&](const Data &key, const Data &value, FastllmNaiveDecodeScratch &scratch, Data &out) {
+        FastllmCudaNaiveGraphVerifyAttention(q, key, value, empty, empty, lengths, 513, 8, 1,
+                                            192, 128, 0, scratch, out, false);
+    };
+    Graph graph;
+    graph.Capture([&] { verify(k.view, v.view, sa, actual); });
+    graph.Run();
+    verify(k.dense, v.dense, sb, expected);
+    Near(actual, expected);
 }
 void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, bool uniform = false) {
     Cache k(length, 192, 71), v(length, 128, 79), k2(length, 192, 83), v2(length, 128, 89);
@@ -688,6 +721,7 @@ int main() {
         FastllmCudaSetDevice(0);
         LengthMetadata();
         ReadWrite();
+        VerifyPagedBlock();
         PrefillChunks();
         Prefill();
         PrefixCopy();

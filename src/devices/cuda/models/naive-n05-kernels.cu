@@ -5354,13 +5354,22 @@ void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &outp
 }
 namespace {
 __global__ void PagedWriteFP4(uint8_t *pool, const int *pages, const BF16 *input,
-        int start, int count, int width, int pageLen, const int *liveKeys, int capacity) {
-    if (liveKeys) { start = *liveKeys - count; if (start < 0 || *liveKeys > capacity) return; }
+        int start, int count, int width, int pageLen, const int *liveKeys, int capacity, bool verify) {
+    if (liveKeys && !verify) {
+        const int end = *liveKeys;
+        if (end < count || end > capacity) return;
+        start = end - count;
+    }
     const size_t block = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int blocksPerRow = width / 16;
     if (block >= (size_t)count * blocksPerRow) return;
     const int token = block / blocksPerRow, column = (block % blocksPerRow) * 16;
-    const int row = start + token;
+    int row = start + token;
+    if (verify) {
+        const int end = liveKeys[token];
+        if (end <= 0 || end > capacity) return;
+        row = end - 1;
+    }
     const size_t physical = pages ? (size_t)pages[row / pageLen] * pageLen + row % pageLen : row;
     FastllmWriteFP4KVBlock(pool + physical * (blocksPerRow * 9),
         input + (size_t)token * width + column, column, width);
@@ -5389,28 +5398,30 @@ __global__ void WriteFP8Rows(uint2 *cache, const int *pages, const uint4 *input,
                                  FastllmNaiveKVRow::ConvertPair(pairs[2]), FastllmNaiveKVRow::ConvertPair(pairs[3]));
 }
 static void NaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
-        const fastllm::Data *liveKeys, void *expanded) {
+        const fastllm::Data *liveKeys, void *expanded, bool verify = false) {
     using namespace fastllm;
     AssertInFastLLM(FastllmNaiveAttentionKVType(cache.dataType) && input.dataType == BFLOAT16 &&
         cache.dataDevice == DataDevice::CUDA && input.dataDevice == DataDevice::CUDA &&
         cache.dims.size() == 3 && input.dims.size() == 3 &&
         cache.kvCacheFp8Indexer == input.kvCacheFp8Indexer &&
         cache.dims[2] == input.dims[2] + (cache.kvCacheFp8Indexer
-            ? FastllmNaiveIndexerBytes / cache.unitSize - FastllmNaiveIndexerBytes / 2 : 0) && start >= 0 &&
-        start + input.dims[1] <= (cache.isPagedKVCache && !cache.isFake
-            ? (int)cache.pageIndex.size() * cache.pageLen
-            : (cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1])),
+            ? FastllmNaiveIndexerBytes / cache.unitSize - FastllmNaiveIndexerBytes / 2 : 0) && start >= 0,
         "Invalid Naive KV append.");
+    const int capacity = cache.isPagedKVCache && !cache.isFake ? (int)cache.pageIndex.size() * cache.pageLen
+        : (cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1]);
+    AssertInFastLLM(start <= capacity && input.dims[1] <= capacity - start, "Naive KV append exceeds capacity.");
     if (cache.dataType == FP4_E2M1) {
         AssertInFastLLM(!cache.kvCacheFp8Indexer && !input.kvCacheFp8Indexer && cache.dims[2] % 16 == 0,
                         "FP4 DSA KV stores block16-aligned K/V with a separate Indexer cache.");
+        // Serving graphs bind new pages on replay within the reserved capacity.
+        const int liveCapacity = cache.expansionDims.empty() ? capacity : cache.expansionDims[1];
         const size_t blocks = (size_t)input.dims[1] * (input.dims[2] / 16);
         if (blocks) PagedWriteFP4<<<(blocks + 127) / 128, 128>>>(
             (uint8_t *)(cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData),
             cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr,
             (const BF16 *)input.cudaData, start, input.dims[1], input.dims[2], cache.pageLen,
             liveKeys ? (const int *)liveKeys->cudaData : nullptr,
-            cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1]);
+            liveCapacity, verify);
         CheckLaunch();
         return;
     }
@@ -7249,6 +7260,14 @@ void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
         const fastllm::Data &liveKeys, int window, bool ringVerify) {
     const int kc = key.dims[2], vc = value.dims[2], rows = newKey.dims[1];
+    if (key.dataType == fastllm::FP4_E2M1) {
+        fastllm::AssertInFastLLM(value.dataType == key.dataType && !window && !ringVerify &&
+            liveKeys.dataType == fastllm::INT32 && liveKeys.cudaData && liveKeys.Count(0) == rows,
+            "FP4 target verification requires one device length per DSA query.");
+        NaivePagedWrite(key, newKey, 0, &liveKeys, nullptr, true);
+        NaivePagedWrite(value, newValue, 0, &liveKeys, nullptr, true);
+        return;
+    }
     if (key.kvCacheFp8Indexer) {
         WriteIndexerCache<<<rows, 128>>>(FastllmNaiveKV(key), (const BF16 *)newKey.cudaData,
             kc, 0, (const int *)liveKeys.cudaData, FastllmNaiveKV(value), (const BF16 *)newValue.cudaData, vc);
@@ -7774,6 +7793,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
             // request length: a restored prefix can reference any pool page.
             r.poolTokens = key.isPagedKVCache ? key.pagedKVCacheData->maxPages * key.pageLen : 0;
             r.fp8 = k.fp8;
+            r.fp4 = k.fp4;
             r.capacity = capacity;
             r.keyStride = key.dims[2];
             r.liveKeys = (const int *)liveKeys.cudaData + row;
