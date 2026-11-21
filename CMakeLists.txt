@@ -3000,6 +3000,10 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_kv_pool PROPERTIES
                 LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
                 PASS_REGULAR_EXPRESSION "KV POOL PASS")
+            add_test(NAME naive_n05_draft_moe COMMAND naive_n05_verify_graph_test 1 draft_moe)
+            set_tests_properties(naive_n05_draft_moe PROPERTIES
+                ENVIRONMENT "FASTLLM_DSPARK_TP=1" LABELS "cuda" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                PASS_REGULAR_EXPRESSION "DRAFT MOE PASS")
             add_test(NAME naive_n05_draft_prefill_tail COMMAND naive_n05_verify_graph_test 1 draft_prefill_tail)
             set_tests_properties(naive_n05_draft_prefill_tail PROPERTIES
                 LABELS "cuda" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180

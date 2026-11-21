@@ -14,6 +14,8 @@
 #include <unordered_map>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/fastllm-mimo-ep8-mega.h"
+#include "devices/cuda/fastllm-mxfp4-ep-generic.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-token-constraint.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
@@ -99,8 +101,16 @@ void NaiveN05FlashModel::ConfigureDraftParallel(int ranks, bool replicas) {
 }
 
 #ifdef USE_CUDA
+struct NaiveN05FlashModel::DraftMoeScratch {
+    Data fp32, logits, index, score, routed, gateUp, gate;
+    Data w1, w2, w3, currentInput, currentOutput;
+    std::map<int, std::vector<Data *>> experts;
+    std::vector<Data *> biases;
+};
+
 struct NaiveN05FlashModel::DraftWorkspace {
     struct Layer { Data normed, q, k, v, qkv, query, packed, attention, output, reduced, gate, up, gateUp, scores; };
+    std::unique_ptr<DraftMoeScratch> moe;
     struct Graph {
         // The CUDA graph allocation pool has one capture session per process.
         // DP owners can replay independently after their captures finish.
@@ -209,6 +219,10 @@ struct NaiveN05FlashModel::DraftWorkspace {
         for (const auto &l : layers)
             for (const Data *p : {&l.normed, &l.q, &l.k, &l.v, &l.qkv, &l.query, &l.packed,
                     &l.attention, &l.output, &l.reduced, &l.gate, &l.up, &l.gateUp, &l.scores}) out.push_back(p->isFake ? nullptr : p->cudaData);
+        if (moe) {
+            for (const Data *p : {&moe->fp32, &moe->logits, &moe->index, &moe->score,
+                                  &moe->routed, &moe->gateUp, &moe->gate}) out.push_back(p->cudaData);
+        }
         return out;
     }
     ~DraftWorkspace() {
@@ -228,6 +242,7 @@ struct NaiveN05FlashModel::DraftTPState {
     std::vector<int> devices;
     int attentionDivisor = 1;
     bool dataParallel = false;
+    std::shared_ptr<FastllmCudaMimoEp8Mega> moe;
     size_t nextContextRank = 0;
     void *group = nullptr;
     PersistentWorkerGroup workers;
@@ -257,7 +272,8 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
     if (draftTP) return true;
     const char *option = draftParallelLayout.empty() ? std::getenv("FASTLLM_DSPARK_TP") : draftParallelLayout.c_str();
     const bool automatic = !option || !*option;
-    const std::string setting = automatic ? std::to_string(std::max<size_t>(1, tpDevices.size())) : option;
+    const std::string setting = automatic ? (draftExperts ? "dp:" : "") +
+        std::to_string(std::max<size_t>(1, tpDevices.size())) : option;
     auto singleDevice = [&]() {
         if (!draftSingleDeviceLogged) {
             printf("[Naive draft] backbone_tp=1 attention_tp=1 mode=%s\n",
@@ -318,16 +334,17 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
         if (!projection(p + "self_attn." + DraftKVProjectionName(),
                         {(DraftContextQueryHeads() + 2 * draftKvHeads) * draftHeadDim, embed_dim})) return singleDevice();
         if (draftKVOnly) continue;
-        auto down = weight.weight.find(p + "mlp.down_proj.weight");
+        const std::string mlp = p + (draftExperts ? "mlp.shared_experts." : "mlp.");
+        auto down = weight.weight.find(mlp + "down_proj.weight");
         const bool valid = down != weight.weight.end() && down->second.dims.size() == 2 &&
             down->second.dims[1] > 0 && down->second.dims[1] <= INT_MAX / 2 &&
-            (dataParallel || down->second.dims[1] % ranks == 0);
+            (draftExperts || dataParallel || down->second.dims[1] % ranks == 0);
         if (automatic && !valid) return singleDevice();
         AssertInFastLLM(valid, "Draft MLP width must be divisible by its TP size.");
         const int mid = down->second.dims[1];
         if (!projection(p + "self_attn.o_proj.weight", {embed_dim, draftHeads * draftHeadDim}) ||
-            !projection(p + "mlp.gateup_proj.weight", {2 * mid, embed_dim}) ||
-            !projection(p + "mlp.down_proj.weight", {embed_dim, mid})) return singleDevice();
+            !projection(mlp + "gateup_proj.weight", {2 * mid, embed_dim}) ||
+            !projection(mlp + "down_proj.weight", {embed_dim, mid})) return singleDevice();
     }
     const bool peerAccess = FastllmCudaPeerAccessInit(state->devices);
     if (automatic && !peerAccess) return singleDevice();
@@ -370,6 +387,18 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
             for (int device : state->devices) AssertInFastLLM(w.multiDeviceDatas.count(device), "Missing replicated draft input.");
         } else PrepareMultiCudaReplicatedData(w, state->devices, true);
     };
+    bool nativeMoe = false;
+    if (draftExperts && dataParallel && draftExperts % ranks == 0) {
+        FastllmCudaSetDevice(state->devices.front());
+        const auto &first = weight["dspark.layers.0.mlp.experts.0.down_proj.weight"];
+        const bool sm90Shape = embed_dim == 4096 && draftExpertWidth == 2048 &&
+                               draftExperts == 128 && draftTopK == 3;
+        nativeMoe = FastllmCudaMimoIsMxfp4Expert(first) && embed_dim % 128 == 0 &&
+            draftExpertWidth % 128 == 0 && (FastllmGenericEpSupported(state->devices) ||
+                (sm90Shape && FastllmCudaRuntimeArch() == 90 && FastllmCudaMimoEp8MegaSupported(state->devices)));
+    }
+    std::vector<std::vector<std::vector<Data *>>> tables(nativeMoe ? ranks : 0);
+    for (auto &rank : tables) rank.resize(draftLayers);
     for (int i = 0; i < draftLayers; ++i) {
         const std::string p = "dspark.layers." + std::to_string(i) + ".";
         // MLP-only TP replicates attention using the same ownership transfer
@@ -381,9 +410,27 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
         }
         split(p + "self_attn.o_proj.weight", mlpOnly ? 0 : 1,
               {mlpOnly ? embed_dim : draftHeads * draftHeadDim}, mlpOnly);
-        const int mid = weight[p + "mlp.down_proj.weight"].dims.at(1);
-        split(p + "mlp.gateup_proj.weight", 0, {mid, mid});
-        split(p + "mlp.down_proj.weight", 1, {mid});
+        const std::string mlp = p + (draftExperts ? "mlp.shared_experts." : "mlp.");
+        const int mid = weight[mlp + "down_proj.weight"].dims.at(1);
+        split(mlp + "gateup_proj.weight", 0, {mid, mid}, draftExperts != 0);
+        split(mlp + "down_proj.weight", 1, {mid}, draftExperts != 0);
+        if (draftExperts) {
+            replicate(p + "mlp.gate.weight");
+            for (auto &rank : tables) rank[i].resize(2 + 2 * draftExperts);
+            for (int e = 0; e < draftExperts; ++e) {
+                const auto expert = p + "mlp.experts." + std::to_string(e) + ".";
+                for (int part = 0; part < 2; ++part) {
+                    const auto name = expert + (part ? "down_proj.weight" : "gateup_proj.weight");
+                    if (!nativeMoe) { replicate(name); continue; }
+                    auto &w = weight[name];
+                    const int rank = e / (draftExperts / ranks), gpu = state->devices[rank];
+                    w.directMemory = true;
+                    AssertInFastLLM(PlaceMultiCudaWeightOnDevice(w, state->devices, gpu),
+                                    "Cannot place DSpark expert on its owner.");
+                    tables[rank][i][2 + 2 * e + part] = w.multiDeviceDatas.at(gpu);
+                }
+            }
+        }
         for (const char *name : {"input_layernorm.weight", "post_attention_layernorm.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight"}) replicate(p + name);
     }
     if (!draftKVOnly) {
@@ -402,6 +449,7 @@ bool NaiveN05FlashModel::PrepareDraftTP() {
         else replicate("dspark.fc.weight");
         replicate("dspark.hidden_norm.weight");
     }
+    if (nativeMoe) state->moe = FastllmCudaCreateMimoEp8Mega(state->devices, tables, draftTopK);
     state->group = FastllmCudaNaiveDraftTPCreate(state->devices);
     AssertInFastLLM(state->group, "Draft TP communicator creation failed.");
     draftTP = std::move(state);
@@ -696,6 +744,7 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::CreateDraf
 
 bool NaiveN05FlashModel::RunDraftGraph(int anchor, DraftContext &context, Data &output) {
 #ifdef USE_CUDA
+    if (draftExperts) return false;
     if (!GetFastllmEnv().cudaGraph || !GetCudaEmbedding() || GetLowMemMode() ||
         draftBlock < 2 || draftBlock >= 32 || draftHeadDim % 4 || draftHeadDim > 256 ||
         context.kv.size() != (size_t)draftLayers) return false;
@@ -970,6 +1019,61 @@ void NaiveN05FlashModel::ApplyDraftDevice() {
     }
 }
 
+#ifdef USE_CUDA
+void NaiveN05FlashModel::RunDraftMoe(int layer, int rank, const Data &input, Data &output,
+        DraftMoeScratch &s, int collectiveRows, bool communicate) {
+    const int device = FastllmCudaGetDevice();
+    const std::string mlp = "dspark.layers." + std::to_string(layer) + ".mlp.";
+    auto local = [&](const std::string &suffix) -> Data & {
+        auto &w = weight[mlp + suffix];
+        return w.multiDeviceData ? *w.multiDeviceDatas.at(device) : w;
+    };
+    const int rows = input.Count(0) / embed_dim;
+    Data flat(input.dataType, {rows, embed_dim});
+    if (rows) {
+        flat.FakeFrom(input, 0);
+        ToDataType(flat, s.fp32, FLOAT32);
+        Linear(s.fp32, local("gate.weight"), Data(), s.logits);
+        AssertInFastLLM(FastllmCudaDeepSeekV4RouteScoreTransform(s.logits, 2),
+                        "DSpark sqrtsoftplus router failed.");
+        SelectExpert(s.logits, s.index, s.score, draftTopK, true, draftRouteScale);
+        Linear(flat, local("shared_experts.gateup_proj.weight"), Data(), s.gateUp);
+        FastllmCudaNaiveDraftSwiGLU(s.gateUp, s.gate);
+        Linear(s.gate, local("shared_experts.down_proj.weight"), Data(), output);
+    } else {
+        s.index.Resize({0, draftTopK}); s.score.Resize({0, draftTopK});
+    }
+    if (draftTP && draftTP->moe) {
+        if (!communicate) {
+            s.routed.dataType = BFLOAT16; s.routed.UpdateUnitSize();
+            s.routed.Resize({std::max(1, rows), embed_dim});
+            s.routed.ToDevice(CUDA, {device}, false); s.routed.Allocate(false);
+            if (rows) output.Reshape(input.dims);
+            return;
+        }
+        FastllmCudaRunMimoEp8MegaLocal(*draftTP->moe, rank, layer, flat, s.index, s.score,
+                                      s.routed, collectiveRows);
+    } else {
+        auto &experts = s.experts[layer];
+        if (experts.empty()) {
+            experts.resize(2 + 2 * draftExperts);
+            s.biases.resize(experts.size());
+            for (int e = 0; e < draftExperts; ++e) {
+                const auto p = "experts." + std::to_string(e) + ".";
+                experts[2 + 2 * e] = &local(p + "gateup_proj.weight");
+                experts[3 + 2 * e] = &local(p + "down_proj.weight");
+            }
+        }
+        MergeMOE(flat, s.index, s.score, experts, s.biases, s.w1, s.w2, s.w3,
+                 s.currentInput, s.currentOutput, 0.0f, s.routed, layer);
+    }
+    if (rows) {
+        AddTo(output, s.routed);
+        output.Reshape(input.dims);
+    }
+}
+#endif
+
 Data &NaiveN05FlashModel::DraftWeight(const std::string &name) {
     Data &data = weight[name];
     return tpDevices.empty() || !data.multiDeviceData ? data :
@@ -1118,6 +1222,16 @@ void NaiveN05FlashModel::InitDraft() {
     };
     draftLayers = number("num_hidden_layers");
     draftBlock = number("block_size");
+    if (weight.dicts.count("dspark.moe_config.n_routed_experts")) {
+        draftExperts = number("moe_config.n_routed_experts");
+        draftTopK = number("moe_config.num_experts_per_tok");
+        draftRouteScale = number("moe_config.routed_scaling_factor");
+        draftExpertWidth = number("moe_config.moe_intermediate_size");
+        AssertInFastLLM(draftExperts > 0 && draftTopK > 0 && draftTopK <= draftExperts &&
+            draftExpertWidth > 0 && number("moe_config.n_shared_experts") == 1 &&
+            weight.dicts.at("dspark.moe_config.scoring_func") == "sqrtsoftplus",
+            "Unsupported DSpark MoE router/shared expert configuration.");
+    }
     draftHeads = number("num_attention_heads");
     draftKvHeads = number("num_key_value_heads");
     draftHeadDim = number("head_dim");
@@ -1177,9 +1291,14 @@ void NaiveN05FlashModel::InitDraft() {
         weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
             {attn + "q_proj.weight", attn + "k_proj.weight", attn + "v_proj.weight"},
             attn + "mergeqkv.weight", "linear")}));
-        weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
-            {mlp + "gate_proj.weight", mlp + "up_proj.weight"},
-            mlp + "gateup_proj.weight", "linear")}));
+        auto mergeExpert = [&](const std::string &base) {
+            weightMergeRules.push_back(WeightMergeRule({WeightMergeRuleSingle(
+                {base + "gate_proj.weight", base + "up_proj.weight"},
+                base + "gateup_proj.weight", "linear")}));
+        };
+        mergeExpert(draftExperts ? mlp + "shared_experts." : mlp);
+        for (int e = 0; e < draftExperts; ++e)
+            mergeExpert(mlp + "experts." + std::to_string(e) + ".");
     }
 }
 
@@ -1814,6 +1933,7 @@ Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
     Data normalized;
 #ifdef USE_CUDA
     if (draftTP && RunDraftBatch({anchor}, {&context}, normalized)) return normalized;
+    AssertInFastLLM(!draftTP || !draftTP->moe, "DSpark EP requires owner-local draft KV.");
 #endif
     if (RunDraftGraph(anchor, context, normalized)) return normalized;
 #ifdef USE_CUDA
@@ -1877,6 +1997,12 @@ Data NaiveN05FlashModel::RunDraft(int anchor, DraftContext &context) {
         DraftLinear(attention, weight[layer + "self_attn.o_proj.weight"], output);
         AddTo(hidden, output);
         KimiK3RMSNorm(hidden, weight[layer + "post_attention_layernorm.weight"], draftEps, normed);
+        if (draftExperts) {
+            DraftMoeScratch scratch;
+            RunDraftMoe(i, 0, normed, output, scratch, 0, true);
+            AddTo(hidden, output);
+            continue;
+        }
         if (weight.weight.count(layer + "mlp.gateup_proj.weight")) {
             DraftLinear(normed, weight[layer + "mlp.gateup_proj.weight"], gateUp);
             FastllmCudaNaiveDraftSwiGLU(gateUp, gate);
@@ -1979,11 +2105,25 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
         draftBatchStorage->device = device;
         for (int gpu : devices) {
             auto scratch = std::make_shared<DraftWorkspace>(); scratch->device = gpu;
+            if (draftExperts) scratch->moe = std::make_unique<DraftMoeScratch>();
             draftBatchStorage->tpRanks.push_back(std::move(scratch));
         }
     }
     auto scratch = [&](int rank) -> DraftWorkspace & { return *draftBatchStorage->tpRanks.at(rank); };
-    const bool bucketedDP = dataParallel && dynamicKV && GetFastllmEnv().cudaGraph;
+    const bool collective = draftTP && draftTP->moe;
+    int collectiveRows = 0;
+    if (collective) {
+        int rows = *std::max_element(rankRows.begin(), rankRows.end());
+        if (dynamicKV && GetFastllmEnv().cudaGraph) {
+            const int bound = WindowRequestsPerGroup(maxBatch > 0 ? maxBatch : 512, ranks);
+            rows = DraftGraphBucket(std::max(rows, reserveRows), bound);
+            for (auto &n : rankRows) if (n) n = rows;
+        }
+        collectiveRows = draftBlock * rows;
+        FastllmCudaPrepareMimoEp8Mega(*draftTP->moe, collectiveRows);
+    }
+    const bool graphEnabled = GetFastllmEnv().cudaGraph && (!draftExperts || collective);
+    const bool bucketedDP = dataParallel && dynamicKV && graphEnabled && !collective;
     std::shared_ptr<DraftWorkspace> state;
     if (bucketedDP) {
         const int maxLocal = WindowRequestsPerGroup(maxBatch > 0 ? maxBatch : 512, ranks);
@@ -2008,7 +2148,7 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             for (Data *cache : {&cacheAt(*context, rank, layer).first, &cacheAt(*context, rank, layer).second})
                 inputs.push_back(cache->cudaData);
         }
-        if (GetFastllmEnv().cudaGraph) {
+        if (graphEnabled) {
             auto found = std::find_if(draftBatchWorkspaces.begin(), draftBatchWorkspaces.end(),
                 [&](const std::shared_ptr<DraftWorkspace> &entry) {
                     return entry->device == device && entry->inputs == inputs && entry->shortRows == shortRows &&
@@ -2033,7 +2173,7 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
                 state->tpRanks.push_back(std::move(local));
             }
         }
-        if (GetFastllmEnv().cudaGraph) {
+        if (graphEnabled) {
             draftBatchWorkspaces.push_back(state);
             if (draftBatchWorkspaces.size() > 8) draftBatchWorkspaces.erase(draftBatchWorkspaces.begin());
         }
@@ -2099,11 +2239,18 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
     };
     auto body = [&](int rank, bool reduce = true) {
         const auto &selected = rankRequests[rank];
-        if (selected.empty()) return;
+        if (selected.empty()) {
+            if (collective) {
+                Data empty(BFLOAT16, {0, embed_dim}), unused;
+                for (int layer = 0; layer < draftLayers; ++layer)
+                    RunDraftMoe(layer, rank, empty, unused, *scratch(rank).moe, collectiveRows, reduce);
+            }
+            return;
+        }
         std::vector<DraftContext *> localContexts;
         for (int i : selected) localContexts.push_back(contexts[i]);
         // Only geometry is captured. Padded slots bind null in the replay table.
-        if (bucketedDP) localContexts.resize(rankRows[rank], localContexts.front());
+        if (bucketedDP || collective) localContexts.resize(rankRows[rank], localContexts.front());
 #ifndef USE_ROCM
         FastllmCudaLinearGraphScope linearScope(draftLinearGraphWorkspaces.at(devices[rank]));
 #endif
@@ -2230,15 +2377,19 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             linear(attention, w(p + "self_attn.o_proj.weight"), output);
             if (draftTP && draftTP->attentionDivisor > 1) allReduce(output, l.reduced);
             addNorm(hidden, output, w(p + "post_attention_layernorm.weight"), normed);
-            if (weight.weight.count(p + "mlp.gateup_proj.weight")) {
-                linear(normed, w(p + "mlp.gateup_proj.weight"), gateUp);
-                FastllmCudaNaiveDraftSwiGLU(gateUp, gate);
+            if (draftExperts) {
+                RunDraftMoe(layer, rank, normed, output, *r.moe, collectiveRows, reduce);
             } else {
-                linear(normed, w(p + "mlp.gate_proj.weight"), gate);
-                linear(normed, w(p + "mlp.up_proj.weight"), up); Silu(gate, gate); MulTo(gate, up);
+                if (weight.weight.count(p + "mlp.gateup_proj.weight")) {
+                    linear(normed, w(p + "mlp.gateup_proj.weight"), gateUp);
+                    FastllmCudaNaiveDraftSwiGLU(gateUp, gate);
+                } else {
+                    linear(normed, w(p + "mlp.gate_proj.weight"), gate);
+                    linear(normed, w(p + "mlp.up_proj.weight"), up); Silu(gate, gate); MulTo(gate, up);
+                }
+                linear(gate, w(p + "mlp.down_proj.weight"), output);
+                allReduce(output, l.reduced);
             }
-            linear(gate, w(p + "mlp.down_proj.weight"), output);
-            allReduce(output, l.reduced);
             if (layer + 1 == draftLayers)
                 addNorm(hidden, output, w("dspark.norm.weight"), result);
             else
@@ -2289,7 +2440,7 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             run([&](int rank) { body(rank, false); ForceDeviceSync(); });
             state->warmed = true;
         }
-        bool useGraph = GetFastllmEnv().cudaGraph && !state->disabled;
+        bool useGraph = graphEnabled && !state->disabled;
         if (useGraph && !localState(0).graphs[0].exec) {
             run([&](int rank) { body(rank); ForceDeviceSync(); });
             invalidateMoved();
