@@ -1,11 +1,14 @@
 #include "models/duo/model.h"
-#include <array>
+#include <cuda_runtime_api.h>
 #include <iostream>
 #include <random>
 
 using namespace fastllm::duo;
 
 int main() {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+        return 77;
     try {
         Runtime rt(0, DType::BF16, {true, false});
         rt.activate();

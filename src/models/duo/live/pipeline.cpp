@@ -10,6 +10,7 @@ extern "C" void duo_rgb_to_i420(const uint8_t *, uint8_t *, int, int, int, cudaS
 #include <deque>
 #include <future>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <fstream>
@@ -68,7 +69,7 @@ GpuLayout GpuLayout::fromProfile(const std::string &profile) {
     if (profile == "four")
         return {1, 3, 2, {3}};
     if (profile == "eight")
-        return {1, 3, 2, {3, 4, 5, 6, 7}};
+        return {1, 7, 2, {3, 4, 5, 6, 7}, 3};
     throw std::invalid_argument("expected Duo GPU profile single, two, four or eight");
 }
 
@@ -235,6 +236,16 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
     if (fresh)
         global = 0;
     check();
+    const bool resetReal = !real || fresh;
+    if (!real && devices.ffnPeer >= 0) {
+        c10::cuda::CUDAGuard guard(at::Device(at::kCUDA, 0));
+        auto session = std::make_unique<Session>(0, ModelSource(root), h / 16, w / 16);
+        if (session->enableFfnPeer(devices.ffnPeer)) {
+            std::erase(devices.tilePeers, devices.ffnPeer);
+            std::clog << "Duo Realization FFN on CUDA 0 and " << devices.ffnPeer << '\n';
+        }
+        real = std::move(session);
+    }
     Channel<Body> bodies;
     struct Packet {
         ChunkResult media;
@@ -316,7 +327,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
     });
     auto realization = worker([&] {
         c10::cuda::CUDAGuard dev(at::Device(at::kCUDA, 0));
-        if (!real || fresh) {
+        if (resetReal) {
             if (!real)
                 real = std::make_unique<Session>(0, ModelSource(root), h / 16, w / 16);
             auto ref = readFile(assets / referencePreset(w, h));

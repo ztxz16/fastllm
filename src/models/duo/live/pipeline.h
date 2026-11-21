@@ -9,6 +9,7 @@ using Emit = std::function<void(json11::Json::object)>;
 struct GpuLayout {
     int intent, speech, codec;
     std::vector<int> tilePeers;
+    int ffnPeer = -1;
     static GpuLayout fromProfile(const std::string &profile);
 };
 

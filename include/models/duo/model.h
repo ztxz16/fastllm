@@ -67,6 +67,8 @@ class Session {
   public:
     Session(int device, const ModelSource &, int height, int width, int historyChunks = 2,
             bool lowMemory = false);
+    // Called before generation. Returns false when this model or peer cannot run the split FFN.
+    bool enableFfnPeer(int device);
     void reset(const std::vector<float> &reference, const std::vector<float> &shared, int sharedRows,
                bool reuseSystemPrefix = false);
     // A separate device may consume the immutable denoised media while clean KV is built.

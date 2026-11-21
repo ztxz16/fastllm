@@ -1,4 +1,5 @@
 #include "models/duo/model.h"
+#include "ffn_peer.h"
 #include "models/minimax_h3_image/fp8.h"
 #include <algorithm>
 #include <chrono>
@@ -13,6 +14,8 @@
 namespace fastllm::duo {
 namespace fs = std::filesystem;
 namespace {
+constexpr int minPeerFfnRows = 512;
+
 void require(bool ok, const std::string &why) {
     if (!ok)
         throw std::invalid_argument("Duo: " + why);
@@ -193,6 +196,7 @@ struct Model::Impl {
     std::vector<Tensor> modulation;
     Tensor outputMod;
     bool lowMemory;
+    std::unique_ptr<FfnPeer> ffnPeer;
     Impl(int device, const ModelSource &s, bool low)
         : source(s), cfg(s.entry["config"]), rt(device, DType::BF16, {true, false}),
           full(device, DType::FP32), weights(rt, s.weights), fullWeights(full, s.weights), lowMemory(low) {
@@ -293,6 +297,10 @@ struct Model::Impl {
         return projection(output, p + ".out_proj");
     }
     Tensor feedForward(const Tensor &x, const std::string &p) {
+        if (ffnPeer && x.rows >= minPeerFfnRows && p.compare(0, 7, "blocks.") == 0) {
+            const auto up = p + ".fc1", down = p + ".fc2";
+            return ffnPeer->run(rt, x, up, down, *quant.at(quantKeys.at(up)), *quant.at(quantKeys.at(down)));
+        }
         return projection(rt.siluMultiply(projection(x, p + ".fc1"), true), p + ".fc2");
     }
     void release(const std::string &p) {
@@ -460,6 +468,14 @@ Session::Session(int device, const ModelSource &s, int h, int w, int history, bo
     : source_(s), model_(device, s, low), height_(h), width_(w), history_(history) {
     prefixLayout(h, w, 1);
     require(history >= 1 && history <= 128, "historyChunks must be in [1,128]");
+}
+bool Session::enableFfnPeer(int device) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto &m = *model_.impl_;
+    const int mediaRows = 5 * height_ * width_ / 4 + 58;
+    if (!m.lowMemory && !m.ffnPeer && mediaRows >= minPeerFfnRows)
+        m.ffnPeer = FfnPeer::create(m.rt.device(), device, m.source, m.cfg, m.quantKeys);
+    return bool(m.ffnPeer);
 }
 void Session::checkpoint() const {
     if (cancelled_.load())

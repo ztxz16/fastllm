@@ -37,7 +37,7 @@ NF4 缓存包含量化投影、反量化 scale 和嵌入等权重。缓存由本
 ## 跨块调度与精度
 
 - 双卡模式下，GPU 0 执行视频输入编码、Intent 和 Realization，GPU 1 负责语音识别、对齐和音视频解码。
-- 四卡和八卡模式下，可见 GPU 0 执行 Realization，GPU 1 执行视频输入编码和 Intent，余下的 GPU 并行解码 SolarX 空间图块。512×384 共有六个图块，四卡时 GPU 2、3 各解三个，八卡时 GPU 2 至 7 各解一个。GPU 2 按原顺序融合图块并解码双声道音频，GPU 3 同时承载 ASR 和强制对齐。只有一个图块时由 GPU 2 解码。Intent 在专用显存中保留部分解包后的 BF16 权重以加速预填充，单 token 解码继续读取 NF4。每个阶段独立按序消费数据，两级队列分别最多容纳两块。单卡沿用同一调度。
+- 四卡和八卡模式下，可见 GPU 0 执行 Realization，GPU 1 执行视频输入编码和 Intent，GPU 2 负责音频解码及视频图块融合。四卡时 GPU 2、3 各解三个 512×384 图块，GPU 3 也执行 ASR 和对齐。八卡时 ASR 和对齐在 GPU 7 上执行。对于 512×384 的 ModelOpt FP8 模型，两张支持双向 P2P 的 SM120 卡在显存充足时共同执行主干 FFN：GPU 0 和 3 分别计算不同的 token 行，GPU 2、4、5、6、7 处理六个视频图块。其他配置沿用单卡主干，GPU 3 也可参与分块解码。只有一个图块时由 GPU 2 解码。Intent 在专用显存中保留部分解包后的 BF16 权重以加速预填充，单 token 解码继续读取 NF4。每个阶段独立按序消费数据，两级队列分别最多容纳两块。单卡沿用同一调度。
 - Intent 使用原始 64 层 Qwen、BF16 激活、NF4 权重、发布的 LoRA 和可训练 token；每次提交真实前向第 50 层的指定行。FP8 Realization 使用 BF16 主干、四步 DMD 和分块 KV 提交。
 - SolarX 使用发布的 V3 补偿表、七槽 BF16 KV、五步窗口移位及重叠槽重算。每五个 latent 直接输出本块的 17 帧。音频 VAE 按发布实现用 FP32 解码，每块按累计采样时钟裁剪。最终 MP4 从连续 PCM 编码一次 AAC。
 - `presets/default.txt` 和两个 BF16 静态参考图 latent 对应官方默认角色，来源为 Duo 提交 `897a7fefdee3b93e9c911cd9eedfa4c7a6420b5a` 的 `demo/assets/assistant-reference.jpg`，图像 SHA256 为 `aa90569031374866a5fc2e7bcac4307adb252fc43017ba3dffc1c6c6e3ba621c`。使用发布 FP32 参考图编码器的后验均值按对应分辨率生成。
