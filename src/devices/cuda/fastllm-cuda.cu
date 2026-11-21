@@ -9522,19 +9522,12 @@ namespace {
 
     __global__ void KimiK3SiTUAndMulKernel(
             const __nv_bfloat16 *gate, const __nv_bfloat16 *up,
-            __nv_bfloat16 *output, size_t count,
-            float beta, float linearBeta) {
-        size_t index = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-        if (index >= count) {
-            return;
+            __nv_bfloat16 *output, size_t count, float beta, float linearBeta) {
+        const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i < count) {
+            output[i] = __float2bfloat16_rn(FastllmSiTUAndMul(
+                __bfloat162float(gate[i]), __bfloat162float(up[i]), beta, linearBeta));
         }
-        float gateValue = __bfloat162float(gate[index]);
-        float upValue = __bfloat162float(up[index]);
-        float situ = beta * tanhf(gateValue / beta) *
-                     KimiK3CudaSigmoid(gateValue);
-        float boundedUp = linearBeta > 0.0f ?
-            linearBeta * tanhf(upValue / linearBeta) : upValue;
-        output[index] = __float2bfloat16_rn(situ * boundedUp);
     }
 
     __global__ void KimiK3CausalConv1DKernel(

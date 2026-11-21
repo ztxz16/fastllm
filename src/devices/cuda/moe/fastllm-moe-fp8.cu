@@ -3,6 +3,7 @@
 //
 
 #include "fastllm-moe-stages.cuh"
+#include "devices/cuda/fastllm-cuda-moe-activation.h"
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 
@@ -1829,7 +1830,7 @@ __global__ __launch_bounds__(256) void FastllmGemvTypedFP8E4M3TopKDownReduceInde
     }
 }
 
-template <typename T, int THREAD_PER_BLOCK>
+template <typename T, int THREAD_PER_BLOCK, bool PROJECT_ONLY = false>
 __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel(T *A, const int32_t *indices,
                                                                          uint8_t **weights, float **scalesPtrs,
                                                                          T *C, int batch, int topk, int m, int k,
@@ -1882,11 +1883,16 @@ __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel(T *A, c
     if (tid == 0) {
         float gate = FastllmMoeFp8Round<T>(sdataGate[0] * magicScaleConstant);
         float up = FastllmMoeFp8Round<T>(sdataUp[0] * magicScaleConstant);
-        C[(size_t)task * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
+        if constexpr (PROJECT_ONLY) {
+            C[(size_t)task * (2 * k) + p] = gate;
+            C[(size_t)task * (2 * k) + k + p] = up;
+        } else {
+            C[(size_t)task * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
+        }
     }
 }
 
-template <typename T, int THREAD_PER_BLOCK>
+template <typename T, int THREAD_PER_BLOCK, bool PREWEIGHTED = false>
 __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKDownReduceIndexedKernel(T *A, const int32_t *indices,
                                                                              uint8_t **weights, float **scalesPtrs,
                                                                              T *C, const float *scores, int batch, int topk,
@@ -1937,7 +1943,7 @@ __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKDownReduceIndexedKernel(T *
         }
 
         if (tid == 0) {
-            out += FastllmMoeFp8Round<T>(sdata[0] * magicScaleConstant) * scores[task];
+            out += FastllmMoeFp8Round<T>(sdata[0] * magicScaleConstant) * (PREWEIGHTED ? 1.f : scores[task]);
         }
         __syncthreads();
     }
@@ -2472,7 +2478,7 @@ __global__ void FastllmGemvTypedNVFP4Block16TopKDownReduceIndexedParallelKernel(
     }
 }
 
-template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK>
+template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK, bool PROJECT_ONLY = false>
 __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel(T *A, const int32_t *indices,
                                                                               uint8_t **weights, T *C,
                                                                               int batch, int topk, int m, int k,
@@ -2512,11 +2518,16 @@ __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel(T 
     if (tid == 0) {
         float gate = FastllmMoeFp8Round<T>(sdataGate[0]);
         float up = FastllmMoeFp8Round<T>(sdataUp[0]);
-        C[(size_t)task * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
+        if constexpr (PROJECT_ONLY) {
+            C[(size_t)task * (2 * k) + p] = gate;
+            C[(size_t)task * (2 * k) + k + p] = up;
+        } else {
+            C[(size_t)task * k + p] = FastllmMoeFp8Traits<T>::fromFloat((gate / (1.0f + expf(-gate))) * up);
+        }
     }
 }
 
-template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK>
+template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK, bool PREWEIGHTED = false>
 __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKernel(T *A, const int32_t *indices,
                                                                                   uint8_t **weights, T *C,
                                                                                   const float *scores, int batch, int topk,
@@ -2556,7 +2567,7 @@ __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKerne
         }
 
         if (tid == 0) {
-            out += FastllmMoeFp8Round<T>(sdata[0]) * scores[task];
+            out += FastllmMoeFp8Round<T>(sdata[0]) * (PREWEIGHTED ? 1.f : scores[task]);
         }
         __syncthreads();
     }
@@ -6336,4 +6347,74 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128Swiglu(const fastllm::Data &input, 
 
 bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, fastllm::Data &weight, fastllm::Data &output, float alpha, bool overwrite, int n, int m, int k) {
     return FastllmCudaTypedMatMulFP8E4M3Block128AddTo<__nv_bfloat16>(input, weight, output, alpha, overwrite, n, m, k);
+}
+
+namespace fastllm {
+bool PrepareCudaIndexedMoeWeights(Data **weights, int count) {
+    int h = weights[2]->dims.at(1), inter = weights[2]->dims.at(0) / 2;
+    if (weights[2]->dataType == FP8_E4M3) {
+        FastllmMoeFp8ExpertTable *table = nullptr;
+        return FastllmGetMoeFp8ExpertTable(weights, count, h, inter, table);
+    }
+    FastllmMoeNVFP4ExpertTable *table = nullptr;
+    return weights[2]->dataType == NVFP4_BLOCK_16 &&
+        FastllmGetMoeNVFP4ExpertTable(weights, count, h, inter, table);
+}
+
+void ReleaseCudaIndexedMoeWeights(Data **weights) {
+    auto key = std::make_pair(FastllmCudaGetDevice(), (const void *)weights[2]);
+    if (weights[2]->dataType == FP8_E4M3) {
+        std::lock_guard<std::mutex> guard(fastllmMoeFp8ExpertTablesMutex);
+        auto it = fastllmMoeFp8ExpertTables.find(key);
+        if (it == fastllmMoeFp8ExpertTables.end()) return;
+        auto &t = it->second;
+        FastllmCudaFree(t.gateWeights); FastllmCudaFree(t.downWeights);
+        FastllmCudaFree(t.gateScales); FastllmCudaFree(t.downScales);
+        fastllmMoeFp8ExpertTables.erase(it);
+    } else {
+        std::lock_guard<std::mutex> guard(fastllmMoeNVFP4ExpertTablesMutex);
+        auto it = fastllmMoeNVFP4ExpertTables.find(key);
+        if (it == fastllmMoeNVFP4ExpertTables.end()) return;
+        FastllmCudaFree(it->second.gateWeights); FastllmCudaFree(it->second.downWeights);
+        fastllmMoeNVFP4ExpertTables.erase(it);
+    }
+}
+
+bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data &indices,
+        const Data &scores, Data &gateUp, Data &middle, Data **weights, int count,
+        const CudaMoeActivation &activation) {
+    const int rows = input.dims[0], hidden = input.dims[1], top = indices.dims[1];
+    const int inter = weights[2]->dims[0] / 2;
+    const auto *ids = static_cast<const int32_t *>(indices.cudaData);
+    auto *x = static_cast<float *>(input.cudaData), *gate = static_cast<float *>(gateUp.cudaData);
+    auto *mid = static_cast<float *>(middle.cudaData), *out = static_cast<float *>(output.cudaData);
+    if (rows > 65535 / top || hidden != weights[2]->dims[1] || gateUp.dataType != FLOAT32 ||
+        middle.dataType != FLOAT32 || (weights[2]->dataType != FP8_E4M3 &&
+        weights[2]->dataType != NVFP4_BLOCK_16)) return false;
+    const int routes = rows * top;
+    if (gateUp.Count(0) < size_t(routes) * 2 * inter || middle.Count(0) < size_t(routes) * inter)
+        return false;
+    if (weights[2]->dataType == FP8_E4M3) {
+        FastllmMoeFp8ExpertTable *table = nullptr;
+        if (!FastllmGetMoeFp8ExpertTable(weights, count, hidden, inter, table)) return false;
+        FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel<float,64,true>
+            <<<dim3(inter, routes),64>>>(x, ids, table->gateWeights, table->gateScales, gate,
+                rows, top, hidden, inter, table->gateBlockM, table->gateBlockK);
+        activation.Run(gateUp, scores, middle, routes, inter);
+        FastllmGemvTypedFP8E4M3SmallBatchTopKDownReduceIndexedKernel<float,64,true>
+            <<<dim3(hidden, rows),64>>>(mid, ids, table->downWeights, table->downScales, out, nullptr,
+                rows, top, inter, hidden, table->downBlockM, table->downBlockK);
+    } else {
+        FastllmMoeNVFP4ExpertTable *table = nullptr;
+        if (!FastllmGetMoeNVFP4ExpertTable(weights, count, hidden, inter, table)) return false;
+        FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel<NVFP4_BLOCK_16,float,64,true>
+            <<<dim3(inter, routes),64>>>(x, ids, table->gateWeights, gate, rows, top, hidden, inter,
+                table->gatePerRow);
+        activation.Run(gateUp, scores, middle, routes, inter);
+        FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKernel<NVFP4_BLOCK_16,float,64,true>
+            <<<dim3(hidden, rows),64>>>(mid, ids, table->downWeights, out, nullptr, rows, top, inter,
+                hidden, table->downPerRow);
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+}
 }

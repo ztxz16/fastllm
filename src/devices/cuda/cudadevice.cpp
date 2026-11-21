@@ -21,6 +21,7 @@
 #include "devices/cuda/cudadevice.h"
 
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-moe-activation.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-prefill.h"
 
@@ -10168,7 +10169,7 @@ namespace fastllm {
             const Data &input, Data &output, const Data &index,
             const Data &score, int batch, int topk, Data &gateOutput,
             Data &activation, Data **weights, int weightsBatch,
-            MoeGateType gateType, float swigluLimit) {
+            MoeGateType gateType, float swigluLimit, const CudaMoeActivation *policy = nullptr) {
         bool hasCandidate =
             weights != nullptr && weightsBatch >= 4 &&
             weights[2] != nullptr &&
@@ -10195,7 +10196,12 @@ namespace fastllm {
             }
             return false;
         }
-        bool success = FastllmCudaMergeMOENVFP4E4M3MarlinIndexedClamped(
+        bool success =
+#ifndef USE_ROCM
+            policy ? RunCudaMarlinMoeWithActivation(input, output, index, score, gateOutput, activation,
+                                                    weights, weightsBatch, *policy) :
+#endif
+            FastllmCudaMergeMOENVFP4E4M3MarlinIndexedClamped(
             input, gateOutput, activation, output, weights, weightsBatch,
             (const int32_t *)index.cudaData, (const float *)score.cudaData,
             batch, topk, swigluLimit);
@@ -10815,6 +10821,39 @@ namespace fastllm {
             FastllmCudaSyncDevice(device);
         }
     }
+
+#ifndef USE_ROCM
+    void DoCudaMergeMOE(const Data &input, Data &output, const Data &index, const Data &score,
+                        Data &gateUp, Data &middle, Data **weights, int count,
+                        const CudaMoeActivation &policy, const CudaGroupedMxfp8Moe *grouped, int *workspace) {
+        if (!weights || count < 4 || (count & 1) || !weights[2] || !weights[3] ||
+            weights[2]->dims.size() != 2 || input.dataDevice != CUDA || output.dataDevice != CUDA ||
+            index.dataDevice != CUDA || score.dataDevice != CUDA || gateUp.dataDevice != CUDA ||
+            middle.dataDevice != CUDA || !input.cudaData || !output.cudaData || input.dims.size() != 2 || input.dims[0] <= 0 || output.dims != input.dims ||
+            (grouped ? (weights[2]->dataType != FP8_E4M3 || input.dataType != BFLOAT16 ||
+                        gateUp.dataType != BFLOAT16 || middle.dataType != BFLOAT16) :
+                 (input.dataType != FLOAT32 && !(input.dataType == FLOAT16 && weights[2]->dataType == NVFP4_BLOCK_16_E4M3))) ||
+            output.dataType != FLOAT32 || !gateUp.cudaData || !middle.cudaData ||
+            index.dims.size() != 2 || index.dims[0] != input.dims[0] || index.dims[1] <= 0 ||
+            !index.cudaData || !score.cudaData || score.dims != index.dims || index.dataType != INT32 ||
+            score.dataType != FLOAT32)
+            throw std::invalid_argument("CUDA MergeMOE received incompatible routed projections");
+        if (grouped) {
+            const int rows = input.dims[0], top = index.dims[1], inter = weights[2]->dims[0] / 2;
+            size_t routes = size_t(rows) * top;
+            if (weights[2]->dims[1] != input.dims[1] || gateUp.Count(0) < routes * std::max(2 * inter, input.dims[1]) ||
+                middle.Count(0) < routes * inter || (!workspace && grouped->WorkspaceInts(rows, top)))
+                throw std::invalid_argument("CUDA MergeMOE grouped MXFP8 workspace or shape mismatch");
+            grouped->Run(input, output, index, score, gateUp, middle, workspace, policy);
+            return;
+        }
+        if (TryCudaMergeMOENVFP4E4M3MarlinIndexed(input, output, index, score, input.dims[0], index.dims[1],
+                gateUp, middle, weights, count, MoeGateSwiglu, 0.f, &policy)) return;
+        if (RunCudaIndexedMoeWithActivation(input, output, index, score, gateUp, middle, weights, count, policy))
+            return;
+        throw std::runtime_error("CUDA MergeMOE cannot run the prepared expert layout");
+    }
+#endif
 
     void DoCudaMergeMOE(Data &input, Data &output, Data &index, Data &score, Data &w1, Data &w2, Data &w3, 
                         Data **weights, Data **biass, float sharedScale, MoeGateType gateType, int weightsBatch, float swigluLimit, bool deepSeekV41) {
