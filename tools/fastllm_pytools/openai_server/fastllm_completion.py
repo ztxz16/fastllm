@@ -457,10 +457,15 @@ class FastLLmCompletion:
                   return token, end
       return None
 
+  def _uses_inkling_messages(self):
+      config = getattr(self.model, "config", None)
+      return isinstance(config, dict) and config.get("model_type") == "inkling2_loop"
+
   def _uses_tagged_reasoning_response(self, enable_thinking: bool, template_kwargs=None) -> bool:
       if self._hy4_think_tags:
           return (template_kwargs or {}).get("reasoning_effort", "high") != "no_think"
-      return (self._is_deepseek_v4_reasoning_response(enable_thinking)
+      return (self._uses_inkling_messages()
+              or self._is_deepseek_v4_reasoning_response(enable_thinking)
               or self._is_poolside_reasoning_response(enable_thinking)
               or self._is_kimi_k3_reasoning_response(enable_thinking)
               or self._is_glm5_next_reasoning_response()
@@ -910,6 +915,8 @@ class FastLLmCompletion:
       return 0
 
   def _new_reasoning_state(self, emit_reasoning_content, preserve_xtml=False):
+      if self._uses_inkling_messages():
+          return {"format": "inkling", "phase": "content", "active": False, "buffer": ""}
       reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
       return {
           "active": emit_reasoning_content,
@@ -927,6 +934,13 @@ class FastLLmCompletion:
 
   def _split_reasoning_response(self, result, emit_reasoning_content,
                                preserve_xtml=False):
+      if self._uses_inkling_messages():
+          from .inkling_messages import consume
+          state = {"phase": "content", "buffer": ""}
+          parts = list(consume(result, state))
+          parts.append((state["phase"], state["buffer"]))
+          return ("".join(text for channel, text in parts if channel == "content"),
+                  "".join(text for channel, text in parts if channel == "reasoning") or None)
       if self._is_kimi_k3_model():
           if emit_reasoning_content:
               result, reasoning_content = self._split_kimi_k3_reasoning(
@@ -1185,11 +1199,26 @@ class FastLLmCompletion:
               reasoning_content=reasoning_delta)], ""
       return [], ""
 
+  def _finish_reasoning_delta(self, state):
+      tail = state["buffer"]
+      if not tail:
+          return None
+      if state["format"] == "inkling" and state["phase"] == "content":
+          return DeltaMessage(content=tail)
+      if state["format"] == "inkling" or (state["format"] != "kimi_k3" and state["active"]):
+          return DeltaMessage(reasoning_content=tail)
+      return None
+
   def _consume_tagged_reasoning_delta(
       self,
       delta_text: str,
       state: Dict[str, Any],
   ) -> Tuple[List[DeltaMessage], str]:
+      if state.get("format") == "inkling":
+          from .inkling_messages import consume
+          parts = list(consume(delta_text, state))
+          return ([DeltaMessage(reasoning_content=text) for channel, text in parts if channel == "reasoning"],
+                  "".join(text for channel, text in parts if channel == "content"))
       if state.get("format") == "kimi_k3":
           return self._consume_kimi_k3_reasoning_delta(
               delta_text, state)
@@ -3922,13 +3951,11 @@ class FastLLmCompletion:
                     data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
 
-        if (emit_reasoning_content
-                and reasoning_state.get("format") != "kimi_k3"
-                and reasoning_state.get("active")
-                and reasoning_state.get("buffer")):
+        tail = self._finish_reasoning_delta(reasoning_state)
+        if tail is not None:
             choice_data = ChatCompletionResponseStreamChoice(
                 index = 0,
-                delta = DeltaMessage(reasoning_content = reasoning_state["buffer"]),
+                delta = tail,
                 logprobs = None,
                 finish_reason = None)
             chunk = ChatCompletionStreamResponseWithUsage(
@@ -4188,12 +4215,9 @@ class FastLLmCompletion:
               # A terminal native handle may be reused before we yield the
               # parser's last buffered call or the closing SSE events.
               self._release_conversation_handle(request_id, handle)
-              if (emit_reasoning_content
-                      and reasoning_state.get("format") != "kimi_k3"
-                      and reasoning_state.get("active")
-                      and reasoning_state.get("buffer")):
-                  yield DeltaMessage(reasoning_content=reasoning_state["buffer"])
-                  reasoning_state["buffer"] = ""
+              tail = self._finish_reasoning_delta(reasoning_state)
+              if tail is not None:
+                  yield tail
               if tool_parser is None:
                   return
               usage = self._anthropic_usage(
