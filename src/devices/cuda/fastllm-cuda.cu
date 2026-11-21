@@ -14292,6 +14292,13 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                        cudaInput0, input0Stride, input0Spatial,
                                        &beta,
                                        cudaOutput, k, k * n, batch);
+    } else if (output.dataType == fastllm::FLOAT32 && input0.dataType == input1.dataType &&
+               (input0.dataType == fastllm::BFLOAT16 || input0.dataType == fastllm::FLOAT16)) {
+        const auto type = input0.dataType == fastllm::BFLOAT16 ? CUDA_R_16BF : CUDA_R_16F;
+        status = cublasGemmStridedBatchedEx(fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
+                k, n, m, &alpha, cudaInput1, type, input1Stride, input1Spatial,
+                cudaInput0, type, input0Stride, input0Spatial, &beta, cudaOutput, CUDA_R_32F,
+                k, k * n, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     } else if (input0.dataType == fastllm::DataType::FLOAT16 && input1.dataType == fastllm::DataType::FLOAT16) {
         half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
         status = cublasHgemmStridedBatched(fastllmCublasHandle,
