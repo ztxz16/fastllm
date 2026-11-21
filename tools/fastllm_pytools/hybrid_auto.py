@@ -178,7 +178,8 @@ def inventory(path):
         if weight_map is not None and set(weight_map) != {t.name for t in tensors}:
             raise ValueError("Hybrid auto: incomplete safetensors checkpoint")
     tensors = normalize_checkpoint(metadata, tensors)
-    if not path.is_file():
+    # HY4 stores its Engram tables inside the indexed checkpoint under its own tensor names.
+    if not path.is_file() and metadata.get("model_type") != "hy_v4_flash":
         engram_path = os.environ.get("FASTLLM_DSV41_ENGRAM_PATH") or metadata.get("engram_table_dir")
         if engram_path:
             external_path = Path(engram_path)

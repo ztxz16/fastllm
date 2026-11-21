@@ -54,6 +54,22 @@ class AutoConfigTest(unittest.TestCase):
         self.costs = ([4 * GiB] * 8, [1 << 20] * 8, 1 << 20, 1 << 20, 4 * GiB, False)
         self.ram = {'total': 32 * GiB, 'available': 30 * GiB}
 
+    def test_hy4_auto_uses_its_embedded_engram_and_respects_cache_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'config.json').write_text(json.dumps({'model_type': 'hy_v4_flash',
+                'text_config': {'engram_layer_ids': [1]}}))
+            header = json.dumps({'model.layers.1.engram_layer.multi_head_embedding.embedding.weight': {
+                'dtype': 'BF16', 'shape': [1], 'data_offsets': [0, 2]}}).encode()
+            (root / 'model.safetensors').write_bytes(len(header).to_bytes(8, 'little') + header + bytes(2))
+            args = self.args('-p', directory, '--device', 'cuda:1', '--tp', 'off', '--moe_cuda_cache', '0')
+            plan = self.resolve(args)
+            self.assertEqual((args.device, args.moe_device, args.moe_cuda_cache), ('cuda:1', 'numa', 0))
+            self.assertEqual(plan['automatic']['policy'], 'hy4-single-cuda-host-experts')
+            args = self.args('-p', directory, '--auto_gpu_memory_limit', '1g')
+            with self.assertRaisesRegex(ValueError, 'enough memory'):
+                self.resolve(args)
+
     def test_exl3_uses_canonical_numa_weights_with_shared_cuda_cache(self):
         self.mixed_fixture()
         self.ram = {'total':128*GiB, 'available':120*GiB}

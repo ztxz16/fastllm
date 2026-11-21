@@ -237,7 +237,35 @@ def qwen_image_versions():
     return versions
 
 
+def sensenova_versions():
+    versions = [{"preset": "sensenova-loop-bf16", "id": "SenseNova/SenseNova-Loop-9B",
+                 "label": "BF16", "include": "", "downloadGB": 19.4}]
+    for precision, owner, revision, size in (
+        ("FP8", "igerry", "59a10ec42b57f7714ebadaa09d0ac7ec3fec520a", 12.2),
+        ("NVFP4", "Kaleto", "b8e8307d4ac9b034359eeb0699ec54d46071eb7a", 9.4),
+    ):
+        files = "*.json *.safetensors chat_template.jinja modeling_sensenova_loop.py"
+        weights = source(f"{owner}/SenseNova-Loop-9B-{precision}", files,
+                         required="config.json tokenizer.json model.safetensors.index.json")
+        weights.update(hub="Hugging Face", revision=revision)
+        versions.append(bundle("sensenova-loop-" + precision.lower(), precision, [weights], gb=size))
+    return versions
+
+
+def hy4_versions():
+    versions = [{"preset": "hy4-flash-fp8", "id": "Tencent-Hunyuan/Hy4-flash-FP8",
+                 "label": "FP8", "include": "", "downloadGB": 287.1}]
+    for precision, size in (("Q4_K_M", 168.3), ("Q3_K", 155.4)):
+        first, second = (f"Hy4-flash-{precision}-{part:05d}-of-00002.gguf" for part in (1, 2))
+        versions.append(bundle("hy4-flash-" + precision.lower(), "GGUF " + precision,
+                               [source("AngelSlim/Hy4-flash-GGUF", first + " " + second)],
+                               entry=first, gb=size))
+    return versions
+
+
 MODELSCOPE_DOWNLOAD_GROUPS += (
+    {"category": "language", "id": "sensenova-loop", "label": "SenseNova Loop · 9B", "models": sensenova_versions()},
+    {"category": "language", "id": "hy4-flash", "label": "HY4 Flash", "models": hy4_versions()},
     {"category": "image", "id": "qwen-image", "label": "Qwen-Image-2.1", "models": qwen_image_versions()},
     {"category": "image", "id": "h3-image", "label": "MiniMax H3 Image", "models": image_versions()},
     {"category": "video", "id": "minimax-h3", "label": "MiniMax H3", "models": video_versions(False)},

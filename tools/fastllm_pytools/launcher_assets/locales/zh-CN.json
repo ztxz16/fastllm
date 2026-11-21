@@ -462,6 +462,8 @@
     "Reading model metadata, weight size, GPU memory, system memory, and NUMA topology.": "正在读取模型元数据、权重大小、GPU 显存、系统内存与 NUMA 拓扑。",
     "Automatic configuration applied": "已应用自动配置",
     "Automatic configuration failed": "自动配置失败",
+    "This model requires an NVIDIA CUDA GPU.": "该模型需要 NVIDIA CUDA 显卡。",
+    "SenseNova Loop requires enough free memory on one CUDA GPU.": "SenseNova Loop 需要在单张 CUDA 显卡上放下模型，请检查空闲显存。",
     "Automatic configuration paused": "自动配置已暂停",
     "Your manual inference settings were kept. Use Automatic configuration to run it again.": "已保留手动填写的推理参数；如需重新分析，请点击自动配置。",
     "Recommendation was not applied": "未应用推荐配置",

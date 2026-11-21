@@ -792,6 +792,41 @@ class LauncherConfigTest(unittest.TestCase):
         self.assertIn("--include 'Q2_0/*'", preview["command"])
         self.assertIn("--include 'mmproj-*.gguf'", preview["command"])
 
+    def test_hy4_download_and_folder_preview_select_the_same_shard(self):
+        family = next(group for group in self.runtime.download_catalog() if group["id"] == "hy4-flash")
+        self.assertEqual(family["category"], "language")
+        self.assertEqual([m["label"] for m in family["models"]], ["FP8", "GGUF Q4_K_M", "GGUF Q3_K"])
+        root = Path(self.model_path)
+        preset = family["models"][1]
+        names = preset["sources"][0]["files"]
+        for name in names:
+            (root / name).touch()
+        first = str(root / names[0])
+        self.assertEqual(_downloaded_model_path(DownloadConfig(target_dir=str(root), bundle=preset["preset"])), first)
+        for managed in (False, True):
+            if managed:
+                (root / ".ftllm-bundle.json").write_text(json.dumps({"preset": preset["preset"]}))
+            preview = self.runtime.preview(self.config(config_mode="auto"))
+            self.assertEqual(preview["errors"], [])
+            self.assertIn(first, preview["command"])
+            self.assertIn("--auto", preview["command"])
+
+    def test_sensenova_quantized_profile_requires_one_gpu(self):
+        root = os.path.join(self.temp.name, "model-with-arbitrary-name")
+        self.write_model(root, {"model_type": "sensenova_loop", "architectures": ["SenseNovaLoopForConditionalGeneration"],
+                                "quantization_config": {"quant_algo": "W4A16_NVFP4"}}, 1)
+        result = recommend_launch_config(root, self.hardware((24, 24)))
+        self.assertEqual((result["detected"]["quantization"], result["strategy"]), ("NVFP4", "cuda"))
+        with self.assertRaisesRegex(LauncherError, "CUDA GPU"):
+            recommend_launch_config(root, self.hardware(()))
+
+    @patch("fastllm_pytools.launcher._modelscope_is_available", return_value=False)
+    @patch("fastllm_pytools.modelscope_download.importlib.util.find_spec", return_value=object())
+    def test_huggingface_only_release_can_download_without_modelscope(self, _filelock, _modelscope):
+        payload = {"modelId": "Kaleto/SenseNova-Loop-9B-NVFP4", "bundle": "sensenova-loop-nvfp4",
+                   "targetDir": os.path.join(self.temp.name, "nvfp4")}
+        self.assertEqual(self.runtime.preview_download(payload)["errors"], [])
+
     def test_downloaded_gguf_selects_filtered_first_shard_and_excludes_mmproj(self):
         for name in ("Q2_0/model-00001-of-00002.gguf", "Q2_0/model-00002-of-00002.gguf",
                      "IQ3_S/model.gguf", "mmproj-bf16.gguf"):

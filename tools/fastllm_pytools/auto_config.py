@@ -600,16 +600,24 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
 
 def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     """Resolve one --auto invocation transactionally, before model allocation."""
-    config_path = Path(args.path) / "config.json"
+    path = Path(args.path)
+    config_path = path / "config.json"
+    family = None
     if config_path.is_file():
         with config_path.open() as stream:
             config = json.load(stream)
+        family = config.get("model_type")
         if config.get("model_type") == "clover_moe":
             from .clover_config import resolve as resolve_clover
             trial = copy.copy(args)
             result = resolve_clover(trial, query_gpu, config, hardware=hardware, ram=ram)
             vars(args).update(vars(trial))
             return result
+    elif path.suffix.lower() == ".gguf" and path.is_file():
+        family = memory.gguf.read_gguf_metadata(path, {"general.architecture"}).get("general.architecture")
+    if family == "hy_v4_flash":
+        from .hy4_config import resolve as resolve_hy4
+        return resolve_hy4(args, query_gpu, hardware, ram, use_numa)
     from .env import env
     from .util import _fastllm_env_flag_enabled
     graph_enabled = ("FASTLLM_CUDA_GRAPH" not in os.environ or

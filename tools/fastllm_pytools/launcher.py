@@ -134,6 +134,7 @@ MOE_MODEL_TYPES = frozenset({
     "glm5_next_text",
     "glm_moe_dsa",
     "hy_v3",
+    "hy_v4_flash",
     "kimi_k3",
     "laguna",
     "minimax_m1",
@@ -164,6 +165,8 @@ TP_UNSUPPORTED_ARCHITECTURES = frozenset({
     "DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM",
+    "HYV4FlashForConditionalGeneration",
+    "SenseNovaLoopForConditionalGeneration",
     "Step3p5ForCausalLM",
     "Step3p7ForConditionalGeneration",
 })
@@ -237,6 +240,7 @@ def _coerce_config(payload: Any) -> DeployConfig:
     if not isinstance(payload, dict):
         raise LauncherError("Invalid configuration format.")
     config = config_from_dict(payload)
+    config.model = _local_launch_entry(config.model)
     if config.backend != "llm":
         config.command = "server"
     if config.command not in ("server", "webui"):
@@ -385,6 +389,30 @@ def _single_gguf_entry(root, files, patterns=()):
         candidates.append(path)
     # Multiple variants require the user to select the intended checkpoint.
     return str(candidates[0]) if len(candidates) == 1 else str(root)
+
+
+def _local_launch_entry(model):
+    if not model:
+        return model
+    root = Path(model).expanduser()
+    if not root.is_dir():
+        return model
+    marker = root / ".ftllm-bundle.json"
+    try:
+        if marker.is_file() and marker.stat().st_size <= MODEL_CONFIG_SIZE_LIMIT:
+            receipt = json.loads(marker.read_text(encoding="utf-8"))
+            preset = receipt.get("preset") if isinstance(receipt, dict) else None
+            recipe = DOWNLOAD_BUNDLES.get(preset) if isinstance(preset, str) else None
+            if recipe and recipe["entry"]:
+                return str(root / recipe["entry"])
+        if (root / "config.json").is_file() or not any(root.glob("*.gguf")):
+            return model
+        from .model_service import identify_model
+        if identify_model(str(root)).backend == "llm":
+            return _single_gguf_entry(root, root.glob("*.gguf"))
+    except (OSError, ValueError):
+        pass
+    return model
 
 
 def _downloaded_model_path(config: DownloadConfig) -> str:
@@ -1383,10 +1411,10 @@ def _port_is_available(host: str, port: int, *, interactive: bool = False) -> bo
         with socket.socket(family, socket.SOCK_STREAM) as listener:
             # Uvicorn uses REUSEADDR and duo_live uses REUSEPORT on Linux.
             # Match them so a just-closed stream in TIME_WAIT permits restart.
-            if interactive:
+            if os.name != "nt" or interactive:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if hasattr(socket, "SO_REUSEPORT"):
-                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if interactive and hasattr(socket, "SO_REUSEPORT"):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             listener.bind((normalized_host, port))
         if interactive:
             # REUSEPORT can bind beside a live listener. Close our own probe
@@ -1531,6 +1559,13 @@ def _positive_number(value: Any) -> float:
 
 def _read_model_config_for_recommendation(model_path: str) -> Dict[str, Any]:
     path = Path(os.path.abspath(os.path.expanduser(model_path)))
+    if path.is_file() and path.suffix.lower() == ".gguf":
+        from .gguf_metadata import read_gguf_metadata
+        try:
+            if read_gguf_metadata(path, {"general.architecture"}).get("general.architecture") == "hy_v4_flash":
+                return {"model_type": "hy_v4_flash", "architectures": ["HYV4FlashForConditionalGeneration"]}
+        except (ValueError, OSError):
+            pass
     if path.is_dir():
         config_path = path / "config.json"
     elif path.name.lower() == "config.json":
@@ -1558,6 +1593,10 @@ def _sum_model_weight_bytes(model_path: str) -> int:
     path = Path(os.path.abspath(os.path.expanduser(model_path)))
     try:
         if path.is_file():
+            split = re.fullmatch(r"(.+)-\d{5}-of-(\d{5})\.gguf", path.name, re.IGNORECASE)
+            if split:
+                siblings = re.compile(re.escape(split[1]) + r"-\d{5}-of-" + split[2] + r"\.gguf", re.IGNORECASE)
+                return sum(shard.stat().st_size for shard in path.parent.iterdir() if siblings.fullmatch(shard.name))
             return path.stat().st_size if _is_model_weight_file(path) else 0
         if not path.is_dir():
             return 0
@@ -1603,6 +1642,8 @@ def _detect_model_quantization(
         quantization = text_config.get("quantization_config")
     if not isinstance(quantization, dict):
         quantization = {}
+    if "NVFP4" in str(quantization.get("quant_algo", "")).upper():
+        return {"name": "NVFP4", "dtype": "auto", "sourceBytesPerParameter": 0.65, "convertible": False}
     lower_identity = f"{identity} {model_path}".lower()
     bits = int(_positive_number(quantization.get("bits")))
     group_size = int(_positive_number(quantization.get("group_size")))
@@ -1870,7 +1911,7 @@ def recommend_launch_config(
     model_path = str(model_path or "").strip()[:4096]
     if not model_path:
         raise LauncherError("Model path is required for automatic configuration.")
-    expanded_path = os.path.abspath(os.path.expanduser(model_path))
+    expanded_path = os.path.abspath(os.path.expanduser(_local_launch_entry(model_path)))
     if not os.path.exists(expanded_path):
         raise LauncherError("Model path does not exist; choose a local model first.")
     metadata = inspect_launch_model(expanded_path, str(name or "")[:512])
@@ -1913,7 +1954,19 @@ def recommend_launch_config(
     }
     strategy = "automatic"
     gpu_plan = _choose_gpu_launch_plan(metadata, normalized_hardware)
-    if gpu_plan:
+    model_type = metadata["modelType"]
+    if model_type in ("hy_v4_flash", "sensenova_loop") and (
+            not normalized_hardware["gpus"] or normalized_hardware["build"].get("USE_ROCM")):
+        raise LauncherError("This model requires an NVIDIA CUDA GPU.")
+    if model_type == "sensenova_loop" and not gpu_plan:
+        raise LauncherError("SenseNova Loop requires enough free memory on one CUDA GPU.")
+    if model_type == "hy_v4_flash":
+        config["device"] = "cuda"
+        config["cuda_device_id"] = str(normalized_hardware["gpus"][0]["index"])
+        config["enable_moe_hybrid"] = True
+        config["moe_device"] = "numa" if normalized_hardware["numaNodes"] > 1 else "cpu"
+        strategy = "hybrid_" + config["moe_device"]
+    elif gpu_plan:
         selected = sorted(gpu_plan["gpus"], key=lambda gpu: gpu["index"])
         if len(selected) == 1:
             strategy = "cuda"

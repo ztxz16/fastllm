@@ -178,9 +178,12 @@ class ServiceTest(unittest.TestCase):
                 client.connect(address)
                 connection, _ = server.accept()
                 self.assertFalse(_port_is_available(*address, interactive=True))
+                self.assertFalse(_port_is_available(*address))
                 connection.close()
                 self.assertEqual(client.recv(1), b"")
             self.assertTrue(_port_is_available(*address, interactive=True))
+            if option == socket.SO_REUSEADDR and os.name != "nt":
+                self.assertTrue(_port_is_available(*address))
 
     def test_interactive_runtime_discovery(self):
         from fastllm_pytools import service_backends
