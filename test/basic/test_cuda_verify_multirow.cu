@@ -64,13 +64,13 @@ static void Linear(int rows, int m, int k, bool bias, int pattern) {
     Check(Read<uint16_t>(c) == Read<uint16_t>(r), "BF16 multirow differs bitwise from single rows");
     ++checks;
 }
-static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
-    const int n = rows;
-    Data x(FLOAT32, {n, 256}), p(FLOAT32, {n, 256}), b(FLOAT32, {256});
+static void Router(int rows, int pattern, bool bias, bool norm, float scale, int experts) {
+    int n = rows;
+    Data x(FLOAT32, {n, experts}), p(FLOAT32, {n, experts}), b(FLOAT32, {experts});
     Data i(INT32, {n, 8}), s(FLOAT32, {n, 8}), ri(INT32, {n, 8}), rs(FLOAT32, {n, 8});
     for (Data *d : {&x, &p, &b, &i, &s, &ri, &rs})
         Allocate(*d);
-    std::vector<float> v(n * 256), bv(256);
+    std::vector<float> v(n * experts), bv(experts);
     unsigned rng = 1327;
     for (size_t j = 0; j < v.size(); ++j) {
         rng = 1664525u * rng + 1013904223u;
@@ -88,7 +88,7 @@ static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
         if (pattern == 6)
             v[j] = -1000; // zero normalization denominator
     }
-    for (int j = 0; j < 256; ++j) {
+    for (int j = 0; j < experts; ++j) {
         bv[j] = pattern == 1 ? 0.f : (int(j % 13) - 6) * .015625f;
         if (pattern == 4 && j % 11 == 0)
             bv[j] = INFINITY;
@@ -98,7 +98,7 @@ static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
     Check(FastllmCudaSigmoid(x, p), "sigmoid reference failed");
     LaunchFastllmSelectExpertGeneric(
         (float *)p.cudaData, bias ? (float *)b.cudaData : nullptr, (int32_t *)ri.cudaData,
-        (float *)rs.cudaData, n, 256, 8, bias, norm, scale);
+        (float *)rs.cudaData, n, experts, 8, bias, norm, scale);
     Cuda(cudaGetLastError());
     Check(FastllmCudaFusedSigmoidSelectExpert(x, bias ? &b : nullptr, i, s, 8, norm, scale),
           "fused router failed");
@@ -111,13 +111,17 @@ static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
     sc = Read<unsigned>(s);
     Check(std::equal(a.begin(), a.end(), ref.begin()), "unfused router indices differ");
     Check(std::equal(sc.begin(), sc.end(), sr.begin()), "unfused router scores differ bitwise");
-    cudaGraph_t graph; cudaGraphExec_t exec;
-    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-    Check(FastllmCudaSelectExpert(p, bias ? &b : nullptr, i, s, 8, norm, scale), "captured router failed");
-    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
-    Cuda(cudaGraphInstantiate(&exec, graph, 0)); Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
-    Check(Read<int>(i) == a && Read<unsigned>(s) == sc, "captured router changed output");
-    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+    for (bool fused : {false, true}) {
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        bool ok = fused ? FastllmCudaFusedSigmoidSelectExpert(x, bias ? &b : nullptr, i, s, 8, norm, scale)
+                        : FastllmCudaSelectExpert(p, bias ? &b : nullptr, i, s, 8, norm, scale);
+        Check(ok, "captured router failed");
+        Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Cuda(cudaGraphInstantiate(&exec, graph, 0)); Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Check(Read<int>(i) == a && Read<unsigned>(s) == sc, "captured router changed output");
+        Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+    }
     ++checks;
 }
 int main() {
@@ -137,7 +141,8 @@ int main() {
                 for (bool bias : {false, true})
                     for (bool norm : {false, true})
                         for (float scale : {1.f, 2.5f})
-                            Router(rows, pattern, bias, norm, scale);
+                            for (int experts : {128, 256})
+                                Router(rows, pattern, bias, norm, scale, experts);
         Cuda(cudaDeviceSynchronize());
         printf("VERIFY MULTIROW PASS checks=%d\n", checks);
         return 0;

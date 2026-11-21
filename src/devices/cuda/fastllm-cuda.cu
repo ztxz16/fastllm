@@ -18,6 +18,7 @@
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "fastllm-cuda-activation.cuh"
+#include "fastllm-cuda-select-expert.cuh"
 #include "fastllm-bfloat16-silu.cuh"
 #include "utils/bfloat16_silu.h"
 #include "fastllm-cuda-gdn-step.cuh"
@@ -12034,16 +12035,7 @@ __device__ __forceinline__ void FastllmRouterLoad8(
 template <>
 __device__ __forceinline__ void FastllmRouterLoad8<float>(
         const float *source, float (&values)[8]) {
-    float4 lo = reinterpret_cast<const float4*>(source)[0];
-    float4 hi = reinterpret_cast<const float4*>(source)[1];
-    values[0] = lo.x;
-    values[1] = lo.y;
-    values[2] = lo.z;
-    values[3] = lo.w;
-    values[4] = hi.x;
-    values[5] = hi.y;
-    values[6] = hi.z;
-    values[7] = hi.w;
+    fastllm::cuda::LoadRouter8(source, values);
 }
 
 template <>
@@ -12385,72 +12377,11 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
     }
 }
 
-// Fixed-shape selection with a legacy-compatible tie fallback.
-// APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
-// selection while reproducing its max/sum/division order exactly. One warp
-// then performs TopK; exact ties rebuild the original 64-thread lists and
-// merge tree so all supported shapes remain compatible with the legacy path.
-template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK, bool APPLY_SIGMOID = false>
-__device__ __forceinline__ void FastllmFixedTopKRow(
-        const float *logits, const float *bias, int32_t *index, float *score,
-        int hasBias, int needNorm, float routeScale) {
-    __shared__ fastllm::cuda::RouterTopKScratch<TOPK> scratch;
-    __shared__ float softmaxReduce[257];
-    __shared__ __align__(16) float softmaxProbabilities[EXPERTS];
-
-    static_assert((EXPERTS == 256 && TOPK == 8) ||
-                  (EXPERTS == 512 && TOPK == 10) ||
-                  (!APPLY_SOFTMAX && ((EXPERTS == 288 && TOPK == 8) ||
-                                      (EXPERTS == 384 && TOPK == 6))));
-    int token = blockIdx.x;
-    const float *tokenLogits = logits + (size_t)token * EXPERTS;
-    index += (size_t)token * TOPK;
-    score += (size_t)token * TOPK;
-    int tid = threadIdx.x;
-    const float *probabilityLogits = tokenLogits;
-    if constexpr (APPLY_SOFTMAX) {
-        float maxValue = -1e100;
-        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
-            maxValue = max(maxValue, tokenLogits[expert]);
-        }
-        float softmaxMaximum = fastllm::cuda::OrderedBlockReduce<256>(
-            maxValue, softmaxReduce, fastllm::cuda::OrderedMax{});
-
-        float sum = 0.0f;
-        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
-            softmaxProbabilities[expert] =
-                exp(tokenLogits[expert] - softmaxMaximum);
-            sum += softmaxProbabilities[expert];
-        }
-        float denominator = fastllm::cuda::OrderedBlockReduce<256>(
-            sum, softmaxReduce, fastllm::cuda::OrderedSum{});
-        if (fabs(denominator) < 1e-6) denominator = 0.0001f;
-        for (int expert = tid; expert < EXPERTS; expert += blockDim.x) {
-            softmaxProbabilities[expert] /= denominator;
-        }
-        __syncthreads();
-        probabilityLogits = softmaxProbabilities;
-    }
-    if constexpr (APPLY_SIGMOID) {
-        // Match the standalone FP32 sigmoid, including its double division.
-        for (int expert = tid; expert < EXPERTS; expert += 32) {
-            float x = tokenLogits[expert];
-            softmaxProbabilities[expert] = 1.0 / (1.0 + expf(-x));
-        }
-        __syncwarp();
-        probabilityLogits = softmaxProbabilities;
-    }
-    if (tid >= 32) {
-        return;
-    }
-    fastllm::cuda::SelectRouterTopK<EXPERTS, TOPK>(probabilityLogits, bias,
-        index, score, hasBias, needNorm, routeScale, scratch);
-}
-
 template <bool Softmax, int Experts, int TopK, bool Sigmoid = false>
-__global__ void FastllmSelectExpertFixedTopKKernel(const float *logits, const float *bias, int32_t *ids,
-        float *scores, int hasBias, int needNorm, float scale) {
-    FastllmFixedTopKRow<Softmax, Experts, TopK, Sigmoid>(logits, bias, ids, scores, hasBias, needNorm, scale);
+__global__ void FastllmSelectExpertFixedTopKKernel(const float *logits, const float *bias, int32_t *index,
+                                                   float *score, int hasBias, int needNorm, float routeScale) {
+    fastllm::cuda::SelectExpertFixedRow<Softmax, Experts, TopK, Sigmoid>(
+        logits, bias, index, score, hasBias, needNorm, routeScale);
 }
 
 #ifndef USE_ROCM
@@ -12500,7 +12431,7 @@ __global__ void FastllmV41PublishTopK(float *logits, const float *bias, int *ids
         sum += v;
     }
     if (tie) {
-        FastllmFixedTopKRow<false,384,6>(logits,bias,ids,scores,1,1,scale);
+        fastllm::cuda::SelectExpertFixedRow<false,384,6>(logits,bias,ids,scores,1,1,scale);
     } else if (lane < 6) {
         if (!isfinite(sum) || fabsf(sum) < 1e-20f) sum = 1.f;
         ids[row*6+lane] = selectedId;
@@ -13352,8 +13283,8 @@ __global__ void FastllmFusedSelectExpert256Kernel(
     }
 }
 
-template <int ROUTER_TOPK, bool ROUTER_SIGMOID>
-static bool FastllmCudaFusedSelectExpert256(
+template <int ROUTER_TOPK, bool ROUTER_SIGMOID, int EXPERTS = 256>
+static bool FastllmCudaFusedSelectExpert(
         const fastllm::Data &logits, const fastllm::Data *gateBias,
         fastllm::Data &index, fastllm::Data &score,
         bool needNorm, float routeScale) {
@@ -13371,12 +13302,12 @@ static bool FastllmCudaFusedSelectExpert256(
         return false;
     }
 
-    int tokens = logits.Count(0) / 256;
+    int tokens = logits.Count(0) / EXPERTS;
     int biasType = !hasBias || gateBias->dataType == fastllm::DataType::FLOAT32 ? 0 :
                    (gateBias->dataType == fastllm::DataType::FLOAT16 ? 1 : 2);
 #ifndef USE_ROCM
     if constexpr (ROUTER_SIGMOID && ROUTER_TOPK == 8) {
-        FastllmSelectExpertFixedTopKKernel<false, 256, 8, true><<<tokens, 32>>>(
+        FastllmSelectExpertFixedTopKKernel<false, EXPERTS, 8, true><<<tokens, 32>>>(
             (const float *)cudaLogits, (const float *)cudaBias, cudaIndex, cudaScore,
             hasBias ? 1 : 0, needNorm ? 1 : 0, routeScale);
     } else if constexpr (ROUTER_SIGMOID) {
@@ -13525,7 +13456,7 @@ bool FastllmCudaFusedSoftmaxSelectExpert(
                      gateBias->dataType != fastllm::DataType::BFLOAT16))) {
         return false;
     }
-    return FastllmCudaFusedSelectExpert256<8, false>(
+    return FastllmCudaFusedSelectExpert<8, false>(
         logits, gateBias, index, score, needNorm, routeScale);
 }
 
@@ -13534,12 +13465,16 @@ bool FastllmCudaFusedSigmoidSelectExpert(
         fastllm::Data &index, fastllm::Data &score,
         int topk, bool needNorm, float routeScale) {
 #ifndef USE_ROCM
-    if (topk == 8 && !logits.dims.empty() && logits.dims.back() == 256 &&
+    const int experts = logits.dims.empty() ? 0 : logits.dims.back();
+    if (topk == 8 && (experts == 128 || experts == 256) &&
         logits.Count(0) > 0 && logits.dataType == fastllm::DataType::FLOAT32) {
         if (gateBias && !gateBias->dims.empty() &&
-            (gateBias->Count(0) != 256 || gateBias->dataType != fastllm::DataType::FLOAT32))
+            (gateBias->Count(0) != experts || gateBias->dataType != fastllm::DataType::FLOAT32))
             return false;
-        return FastllmCudaFusedSelectExpert256<8, true>(
+        if (experts == 128)
+            return FastllmCudaFusedSelectExpert<8, true, 128>(
+                logits, gateBias, index, score, needNorm, routeScale);
+        return FastllmCudaFusedSelectExpert<8, true>(
             logits, gateBias, index, score, needNorm, routeScale);
     }
 #endif
@@ -13556,120 +13491,15 @@ bool FastllmCudaFusedSigmoidSelectExpert(
                      gateBias->dataType != fastllm::DataType::BFLOAT16))) {
         return false;
     }
-    return FastllmCudaFusedSelectExpert256<10, true>(
+    return FastllmCudaFusedSelectExpert<10, true>(
         logits, gateBias, index, score, needNorm, routeScale);
 }
 
-// CUDA kernel for SelectExpert
-template <int THREAD_PER_BLOCK, int MAXK>
-__global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *index, float *score, 
-    int n, int numExperts, int topk, int hasBias, bool needNorm, float routeScale) {
-    __shared__ float idData[THREAD_PER_BLOCK][MAXK];
-    __shared__ float maxData[THREAD_PER_BLOCK][MAXK];
-    
-    int tokenIdx = blockIdx.x;
-    float *inputData = logits + tokenIdx * numExperts;
-    int32_t *outputIndex = index + tokenIdx * topk;
-    float *outputScore = score + tokenIdx * topk;
-    
-    int tid = threadIdx.x;
-    
-    // Initialize
-    for (int i = 0; i < topk; i++) {
-        maxData[tid][i] = -1e100;
-        idData[tid][i] = -1;
-    }
-    
-    // Find topk experts
-    for (int j = tid; j < numExperts; j += THREAD_PER_BLOCK) {
-        float cur = inputData[j];
-        if (hasBias) {
-            cur += bias[j];
-        }
-        // A non-finite router value used to leave idData at -1.  The writeback
-        // below would then read inputData[-1], turning a numerical issue into an
-        // illegal CUDA access and poisoning the entire device context.  Rank a
-        // non-finite value last while retaining a valid expert id instead.
-        if (!isfinite(cur)) {
-            cur = -FLT_MAX;
-        }
-        
-        for (int l = 0; l < topk; l++) {
-            if (cur > maxData[tid][l]) {
-                for (int x = topk - 1; x > l; x--) {
-                    maxData[tid][x] = maxData[tid][x - 1];
-                    idData[tid][x] = idData[tid][x - 1];
-                }
-                maxData[tid][l] = cur;
-                idData[tid][l] = j;
-                break;
-            }
-        }
-    }
-    __syncthreads();
-    
-    // Merge results from all threads
-    for (unsigned int s = THREAD_PER_BLOCK / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            int pos0 = 0, pos1 = 0;
-            while (pos0 + pos1 < topk) {
-                if (maxData[tid][pos0] > maxData[tid + s][pos1]) {
-                    pos0++;
-                } else {
-                    pos1++;
-                }
-            }
-            pos0--;
-            pos1--;
-            int pos = topk - 1;
-            while (pos >= 0) {
-                if (pos1 < 0 || (pos0 >= 0 && maxData[tid][pos0] < maxData[tid + s][pos1])) {
-                    maxData[tid][pos] = maxData[tid][pos0];
-                    idData[tid][pos] = idData[tid][pos0];
-                    pos0--;
-                } else {
-                    maxData[tid][pos] = maxData[tid + s][pos1];
-                    idData[tid][pos] = idData[tid + s][pos1];
-                    pos1--;
-                }
-                pos--;
-            }
-        }
-        __syncthreads();
-    }
-    
-    // Write output
-    if (tid == 0) {
-        // Calculate sum for normalization
-        float sum = 1.0f;
-        if (needNorm) {
-            sum = 0.0f;
-            for (int i = 0; i < topk; i++) {
-                int expertIdx = idData[0][i];
-                if (expertIdx >= 0 && expertIdx < numExperts &&
-                    isfinite(inputData[expertIdx])) {
-                    sum += inputData[expertIdx];
-                }
-            }
-            if (!isfinite(sum) || fabsf(sum) < 1.0e-20f) {
-                sum = 1.0f;
-            }
-        }
-        
-        // Write index and score
-        for (int i = 0; i < topk; i++) {
-            int expertIdx = idData[0][i];
-            if (expertIdx < 0 || expertIdx >= numExperts) {
-                expertIdx = 0;
-            }
-            float expertScore = inputData[expertIdx];
-            if (!isfinite(expertScore)) {
-                expertScore = 0.0f;
-            }
-            outputIndex[i] = expertIdx;
-            outputScore[i] = expertScore / sum * routeScale;
-        }
-    }
+template <int Threads, int MaxK>
+__global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *index, float *score,
+        int n, int numExperts, int topk, int hasBias, bool needNorm, float routeScale) {
+    fastllm::cuda::SelectExpertRow<Threads, MaxK>(logits, bias, index, score, numExperts, topk,
+                                                  hasBias, needNorm, routeScale);
 }
 
 // Keep one launcher for the generic fallback and independent selector tests.

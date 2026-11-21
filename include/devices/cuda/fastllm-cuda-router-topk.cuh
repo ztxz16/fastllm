@@ -23,7 +23,7 @@ __device__ __forceinline__ void SelectRouterTopK(const float *probabilityLogits,
         const float *bias, int32_t *index, float *score, int hasBias, int needNorm,
         float routeScale, RouterTopKScratch<TOPK> &scratch) {
     // Vector loads and register storage below cover these existing router widths.
-    static_assert(EXPERTS == 256 || EXPERTS == 288 || EXPERTS == 384 || EXPERTS == 512);
+    static_assert(EXPERTS == 128 || EXPERTS == 256 || EXPERTS == 288 || EXPERTS == 384 || EXPERTS == 512);
     static_assert(TOPK > 0 && TOPK <= 32);
     constexpr int VALUES_PER_LANE=EXPERTS/32, LEGACY_THREADS=64;
     constexpr float NEG_INF=-FLT_MAX;
@@ -37,7 +37,8 @@ __device__ __forceinline__ void SelectRouterTopK(const float *probabilityLogits,
     int firstExpert = lane * VALUES_PER_LANE;
     float choiceKeys[VALUES_PER_LANE];
     float firstProbabilities[8], secondProbabilities[8];
-    if constexpr (EXPERTS != 288 && EXPERTS != 384) {
+    constexpr bool packed = VALUES_PER_LANE % 8 == 0;
+    if constexpr (packed) {
         LoadRouter8(probabilityLogits + firstExpert, firstProbabilities);
         if constexpr (VALUES_PER_LANE > 8)
             LoadRouter8(probabilityLogits + firstExpert + 8, secondProbabilities);
@@ -46,7 +47,7 @@ __device__ __forceinline__ void SelectRouterTopK(const float *probabilityLogits,
     for (int part = 0; part < VALUES_PER_LANE; ++part) {
         int expert = firstExpert + part;
         float probability;
-        if constexpr (EXPERTS == 288 || EXPERTS == 384) probability = probabilityLogits[expert];
+        if constexpr (!packed) probability = probabilityLogits[expert];
         else probability = part < 8 ? firstProbabilities[part] : secondProbabilities[part - 8];
         float key = probability + (hasBias ? bias[expert] : 0.0f);
         choiceKeys[part] = isfinite(key) ? key : NEG_INF;
