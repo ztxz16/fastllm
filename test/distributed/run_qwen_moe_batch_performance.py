@@ -41,7 +41,11 @@ def compare_samples(old, new, old_status, new_status):
     median = statistics.median(b)
     return dict(comparison_eligible=comparable, measurements_valid=measurements_valid,
         speedup=statistics.median(a) / median if comparable else None,
+        elapsed_change_percent=(median / statistics.median(a) - 1) * 100 if comparable else None,
         baseline_median_ms=statistics.median(a), median_ms=median,
+        baseline_p95_ms=sorted(a)[math.ceil(.95 * len(a)) - 1],
+        baseline_cv=statistics.pstdev(a) / statistics.mean(a),
+        baseline_tokens_per_second=old['concurrency'] * old['output_tokens'] * 1000 / statistics.median(a),
         p95_ms=sorted(b)[math.ceil(.95 * len(b)) - 1], cv=statistics.pstdev(b) / statistics.mean(b),
         tokens_per_second=new['concurrency'] * new['output_tokens'] * 1000 / median,
         reason='' if comparable else 'outputs/cache/workload differ or a source case failed; speedup not comparable')
@@ -64,6 +68,9 @@ def main():
     for values in (args.prompt_lengths, args.concurrencies, args.cache_states):
         if len(values) != len(set(values)):
             parser.error('duplicate matrix values')
+    comparisons = 2 * len(args.prompt_lengths) * len(args.concurrencies) * len(args.cache_states)
+    if comparisons * 3 > 50:
+        parser.error('旧路径、候选与比较报告合计超过50项，请按输入长度和缓存状态分批')
     args.model, args.build = args.model.resolve(), args.build.resolve()
     output = args.output.resolve() / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') +
                                      '_moe_batch_performance_' + uuid.uuid4().hex[:8])
@@ -74,6 +81,8 @@ def main():
         gpu=capture(['nvidia-smi', '--query-gpu=name,uuid,driver_version', '--format=csv']),
         cuda=capture(['nvcc', '--version']), build_cache=(args.build / 'CMakeCache.txt').read_text(),
         warmup=1, iterations=1, repeats=5, source_reports={}, model=str(args.model),
+        expected_case_count=comparisons, independent_execution_cases=2 * comparisons,
+        dtype='FP16', attention_dp=4, ep=4, tp=1, dp=1,
         report_title='Attention DP/EP 批次不变候选性能代价',
         report_description='正式公开会话端到端计时；未串入 HF。加速比=旧路径耗时/候选耗时，输出历史不同则不可直接比较。')
     try:
@@ -100,6 +109,14 @@ def main():
             old = json.loads(old_path.read_text()) if old_path.exists() else {}
             new = json.loads(new_path.read_text()) if new_path.exists() else {}
             result.update(compare_samples(old, new, source['status'], row['status']))
+            result.update(model=args.model.name, dtype='FP16', attention_dp=4, ep=4,
+                          prompt_length=new.get('prompt_length'), output_tokens=new.get('output_tokens'),
+                          concurrency=new.get('concurrency'), cuda_graph=new.get('cuda_graph'),
+                          cache_state=new.get('cache_state'), repeats=5)
+            result['legacy_backend'] = sorted({state.get('expert_gemm_backend', 'unreported') for state in old.get('states', [])})
+            for key in ('ttft_median_ms', 'itl_median_ms', 'queue_median_ms', 'reserved_kv_bytes',
+                        'prefix_bytes', 'graph_workspace_bytes'):
+                result[key] = row.get(key)
             if result['measurements_valid']:
                 result.update(status='PASS', failed_elements=0)
             result.update(legacy_evidence=str(old_path), candidate_evidence=str(new_path))

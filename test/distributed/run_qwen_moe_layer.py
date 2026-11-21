@@ -244,16 +244,22 @@ def main():
     parser.add_argument("--check", type=Path, required=True)
     parser.add_argument("--worker", type=Path, required=True)
     parser.add_argument("--devices", default="0,1,2,3")
+    parser.add_argument("--world-size", type=int, choices=(1, 2, 4),
+                        help="仅运行一个EP规模，使每个独立脚本不超过50个case")
     parser.add_argument("--build-cache", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, default=ROOT / "test/distributed/results")
     args = parser.parse_args()
     devices = [int(x) for x in args.devices.split(",")]
     if len(devices) not in (1, 2, 4) or len(set(devices)) != len(devices) or min(devices) < 0:
         parser.error("devices must contain 1, 2 or 4 distinct logical IDs")
+    sizes = [args.world_size] if args.world_size else [size for size in (1, 2, 4) if size <= len(devices)]
+    if any(size > len(devices) for size in sizes):
+        parser.error('world-size exceeds available devices')
+    matrix = [(f"ep{size}_{name}", spec, devices[:size]) for size in sizes for name, spec in cases()]
+    if len(matrix) > 50:
+        parser.error('单层矩阵超过50个case，请按--world-size 1、2、4分别运行')
     output = args.output_root.resolve() / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_moe_layer_" + uuid.uuid4().hex[:8])
     output.mkdir(parents=True, exist_ok=False)
-    sizes = [size for size in (1, 2, 4) if size <= len(devices)]
-    matrix = [(f"ep{size}_{name}", spec, devices[:size]) for size in sizes for name, spec in cases()]
     metadata = dict(command=shlex.join([sys.executable, *sys.argv]), git=capture(["git", "rev-parse", "HEAD"]),
                     git_status=capture(["git", "status", "--short"]), seed=20261113, warmup=0, iterations=1, repeats=1,
                     gpu=capture(["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"]),

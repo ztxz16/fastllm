@@ -943,6 +943,65 @@ HTTP 将 `run` 改为 `serve`，去掉 `--prompt`、`--max-new-tokens`，添加
 
 ## 验收与报告边界
 
+### 分批后台验收入口（2026-11-21）
+
+当前优先补齐 HTTP、生命周期、小模型、TP/DP 回归、独立 HF 对齐与当前版本性能报告。
+前缀缓存命中/未命中不一致仍是独立待办；本轮结果不能替代完整批次不变性验收。
+本地没有服务器 GPU、模型与编译产物时，只能检查脚本，不能把脚本就绪记为 GPU PASS。
+
+代码同步到四卡 V100 服务器、已有编译产物可用后执行：
+
+```bash
+(
+set -eo pipefail
+source /workspace/fastllm-v100-setup/env.sh
+cd /home/project/vllm_fastllm
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+bash test/distributed/run_attention_ep_acceptance_v100.sh
+)
+```
+
+启动器立即返回 PID 和独立日志目录，后台顺序运行 29 份独立 `run.sh`；不并行争用 GPU。
+每份脚本最多 48 项，基准、参数化组合以及 HF 策略/性能比较汇总均保守计入上限：
+
+- 单层：EP=1/2/4 各一份，每份 37 项，合计 111 项。
+- 完整小模型：两份各 48 项，保留全部 8 种夹具的 EP/Graph/Prefix 组合。
+- 生命周期：小模型旧路径、真实模型旧路径、真实模型批次不变模式，各 2 项。
+- HTTP：真实模型旧路径与批次不变模式各 6 项。
+- 稠密 Decode：Eager/Graph 各 30 项；公开 DP/TP：四种配置各 12 项。
+- HF：全部 8 条中文请求拆成两份，每份分别跑旧路径和批次不变模式。
+  每份包含 38 项生成明细、5 项 numeric 和 4 项策略汇总，共 47 项；
+  exact、Top-5、Top-5/0.1、numeric 各自保留结论，任一失败仍返回非零。
+- 性能：512/1024/1792 输入、128 输出，按 off/cold/hot 分成 9 份。
+  每份包含 6 项旧路径、6 项候选及 6 项比较，共 18 项，全部至少 5 轮。
+
+小模型夹具包含不满足 SM70 专家对齐要求的维度及多种源权重类型，继续作为既有路径回归。
+SM70 模式通过真实模型的生命周期、HTTP、生成/numeric 与性能入口验证。
+numeric 中独立的单层检查器继续使用既有路径，不能把该项 PASS 解释成候选专家后端的单层验收。
+
+只运行选定范围也使用同一后台启动器，例如：
+
+```bash
+bash test/distributed/run_attention_ep_acceptance_v100.sh --groups validation
+bash test/distributed/run_attention_ep_acceptance_v100.sh --only http_candidate
+bash test/distributed/run_attention_ep_acceptance_v100.sh --groups performance
+```
+
+上述是可选的独立启动方式，不要同时执行多个 GPU 验收任务。完整批次清单见本次 `plan.md`，
+每批有独立命令、PID、stdout、stderr、退出码和原始报告。普通用例失败保留证据后继续其他批次，
+最终所选范围任一失败或缺少报告都会返回非零。后台运行时不要更新源码或替换二进制，
+准备阶段保存的摘要会在每批开始前核对；摘要只能固定本次产物，不能证明产物由当前 Git 编译。
+
+汇总位于 `test/distributed/results/YYYYMMDDTHHMMSSZ_attention_ep_acceptance_<8位随机ID>/`：
+`summary.json/md/csv/xlsx`、`delivery.md`、`exit.code`；性能另在 `performance/` 聚合。
+所选范围 PASS 与 `final_delivery_eligible=false` 同时保留，避免覆盖已知缓存一致性阻塞。
+性能报告包括原始证据链接、模型、并行场景、输入输出长度、缓存/Graph 模式、延迟、吞吐和可比性；
+输出历史或缓存行为不一致时保留耗时，加速比为空。
+
+本次性能还会保存到 `docs/performance/runs/<运行目录名>/`，提供 JSON、Markdown、CSV。
+原始结果目录仍生成 XLSX；持续性能汇总目录遵循用户要求不增加 Excel。
+本轮性能属于当前版本结果；修复缓存问题后仍需按影响范围复测，不能提前标记最终交付。
+
 - 小模型包含 FP16/BF16/FP32 源权重、有无 bias、归一化路由、绑定输出层、无本地专家和热点专家。
   单层验收覆盖 Router、专家与层输出；全模型逐步比较独立 CPU 重算的完整 logits。
   `attention_fp16_rounding`通过正式单层入口覆盖放大的有限投影、变长/空rank与完整层；

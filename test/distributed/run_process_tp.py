@@ -42,7 +42,8 @@ def save_report(output, rows, metadata):
         summary.update(complete=complete, completed_case_count=len(rows), expected_case_count=expected)
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     fields = ["case", "backend", "status", "max_abs_error", "mean_abs_error", "failed_elements", "reason"]
-    for key in ('custom_calls', 'nccl_calls', 'prefix_hits', 'reused_tokens', 'evictions', 'prefix_bytes',
+    for key in ('model', 'dtype', 'attention_dp', 'ep', 'cuda_graph', 'cache_state', 'legacy_backend',
+                'custom_calls', 'nccl_calls', 'prefix_hits', 'reused_tokens', 'evictions', 'prefix_bytes',
                 'token_mismatches', 'compared_steps', 'first_divergence_token_1based',
                 'alignment_policy', 'configuration_scope', 'topk', 'near_tie_tol', 'exact_match',
                 'token_match', 'text_match', 'candidate_match', 'near_tie_accepted_directions',
@@ -54,7 +55,8 @@ def save_report(output, rows, metadata):
                 'heartbeat_interval_ms', 'stop_return_ms', 'restarts', 'fd_count_before', 'fd_count_after',
                 'workers_reaped', 'observed_error', 'median_ms', 'p95_ms', 'cv', 'tokens_per_second',
                 'speedup', 'prompt_length', 'output_tokens', 'concurrency', 'repeats', 'ttft_median_ms', 'itl_median_ms', 'queue_median_ms',
-                'reserved_kv_bytes', 'graph_workspace_bytes', 'effective_tops', 'baseline_median_ms', 'comparison_eligible'):
+                'reserved_kv_bytes', 'graph_workspace_bytes', 'effective_tops', 'baseline_median_ms',
+                'baseline_p95_ms', 'baseline_cv', 'baseline_tokens_per_second', 'elapsed_change_percent', 'comparison_eligible'):
         if any(key in row for row in rows):
             fields.append(key)
 
