@@ -653,8 +653,7 @@ class LauncherRuntime:
             {
                 "id": group["id"],
                 "label": group["label"],
-                "description": group.get("description", ""),
-                "accent": group.get("accent", "slate"),
+                "category": group.get("category", "language"),
                 "models": [dict(model) for model in group.get("models", ())],
             }
             for group in MODELSCOPE_DOWNLOAD_GROUPS

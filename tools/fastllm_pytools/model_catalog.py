@@ -1,23 +1,17 @@
-"""Curated ModelScope catalog shown by the launcher download page.
-
-The records are deliberately data-only.  The browser can present the same
-catalog as cards and as a compact select, while the TUI keeps its smaller
-legacy choice list.
-"""
+"""Curated browser downloads. Bundle paths are relative to the chosen model directory."""
 
 
 MODELSCOPE_DOWNLOAD_GROUPS = (
     {
         "id": "deepseek-v41",
         "label": "DeepSeek · V4.1 Flash",
-        "description": "大 MoE 混合推理模型，建议使用自动规划器部署。",
-        "accent": "orange",
         "models": (
             {
                 "preset": "deepseek-v41-flash-1017",
                 "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-                "label": "DeepSeek V4.1 Flash · 1017",
-                "meta": "约 510 GB · 混合推理",
+                "label": "官方权重 · 1017",
+                "downloadGB": 510,
+                "meta": "混合推理",
                 "include": "",
             },
             {
@@ -46,34 +40,39 @@ MODELSCOPE_DOWNLOAD_GROUPS = (
     {
         "id": "qwen38-27b",
         "label": "Qwen3.8 · 27B",
-        "description": "稠密主模型，覆盖原始、FP8、NVFP4 与 DFlash2 草稿权重。",
-        "accent": "green",
         "models": (
             {
                 "preset": "qwen38-27b-bf16",
                 "id": "Qwen/Qwen3.8-27B",
-                "label": "Qwen3.8-27B · BF16",
+                "label": "BF16",
                 "meta": "原始质量",
                 "include": "",
             },
             {
                 "preset": "qwen38-27b-fp8",
                 "id": "Qwen/Qwen3.8-27B-FP8",
-                "label": "Qwen3.8-27B · FP8",
-                "meta": "约 31 GB",
+                "label": "FP8",
+                "downloadGB": 31,
+                "meta": "",
                 "include": "",
             },
             {
                 "preset": "qwen38-27b-nvfp4",
                 "id": "QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4",
-                "label": "Qwen3.8-27B · QUASAR NVFP4",
+                "label": "QUASAR NVFP4",
                 "meta": "显存友好",
                 "include": "",
             },
+        ),
+    },
+    {
+        "id": "qwen38-27b-dflash",
+        "label": "Qwen3.8-27B · DFlash2",
+        "models": (
             {
                 "preset": "qwen38-27b-dflash2",
                 "id": "z-lab/Qwen3.8-27B-DFlash2",
-                "label": "Qwen3.8-27B · DFlash2",
+                "label": "DFlash2",
                 "meta": "推测解码草稿",
                 "include": "",
             },
@@ -82,37 +81,45 @@ MODELSCOPE_DOWNLOAD_GROUPS = (
     {
         "id": "qwen38-flash-gsq",
         "label": "Qwen3.8-Flash-Next · GSQ-RCO",
-        "description": "选择一个量化子目录；下载器只拉选中的分片与共享 mmproj。",
-        "accent": "violet",
         "models": (
             {
                 "preset": "flash-gsq-q2-0",
                 "id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
                 "label": "GSQ-RCO · Q2_0",
-                "meta": "约 66.4 GB · 速度优先",
+                "downloadGB": 66.4,
+                "meta": "速度优先",
                 "include": "Q2_0/*,mmproj-*.gguf",
             },
             {
                 "preset": "flash-gsq-iq2-xs",
                 "id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
                 "label": "GSQ-RCO · IQ2_XS",
-                "meta": "约 68.0 GB · 体积优先",
+                "downloadGB": 68.0,
+                "meta": "体积优先",
                 "include": "IQ2_XS/*,mmproj-*.gguf",
             },
             {
                 "preset": "flash-gsq-iq3-xxs",
                 "id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
                 "label": "GSQ-RCO · IQ3_XXS",
-                "meta": "约 75.8 GB · 平衡",
+                "downloadGB": 75.8,
+                "meta": "平衡",
                 "include": "IQ3_XXS/*,mmproj-*.gguf",
             },
             {
                 "preset": "flash-gsq-iq3-s",
                 "id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
                 "label": "GSQ-RCO · IQ3_S",
-                "meta": "约 83.6 GB · 质量优先",
+                "downloadGB": 83.6,
+                "meta": "质量优先",
                 "include": "IQ3_S/*,mmproj-*.gguf",
             },
+        ),
+    },
+    {
+        "id": "qwen38-flash-gsq-coder",
+        "label": "Qwen3.8-Flash-Next · GSQ-RCO Coder",
+        "models": (
             {
                 "preset": "flash-gsq-coder-iq1-m",
                 "id": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF",
@@ -124,14 +131,12 @@ MODELSCOPE_DOWNLOAD_GROUPS = (
     },
     {
         "id": "quick-check",
-        "label": "快速验证",
-        "description": "小模型和自定义入口，用于先验证环境、权限与下载链路。",
-        "accent": "slate",
+        "label": "Qwen3 · 0.6B",
         "models": (
             {
                 "preset": "qwen3-0.6b",
                 "id": "Qwen/Qwen3-0.6B",
-                "label": "Qwen3 · 0.6B",
+                "label": "BF16",
                 "meta": "快速验证",
                 "include": "",
             },
@@ -232,7 +237,7 @@ def qwen_image_versions():
     return versions
 
 
-BUNDLE_GROUPS = (
+MODELSCOPE_DOWNLOAD_GROUPS += (
     {"category": "image", "id": "qwen-image", "label": "Qwen-Image-2.1", "models": qwen_image_versions()},
     {"category": "image", "id": "h3-image", "label": "MiniMax H3 Image", "models": image_versions()},
     {"category": "video", "id": "minimax-h3", "label": "MiniMax H3", "models": video_versions(False)},
@@ -259,5 +264,5 @@ BUNDLE_GROUPS = (
                gb=131.4, note="FP8 Realization · 原版 Intent、Codec 与语音组件"),)},
 )
 
-DOWNLOAD_BUNDLES = {model["preset"]: model for group in BUNDLE_GROUPS
+DOWNLOAD_BUNDLES = {model["preset"]: model for group in MODELSCOPE_DOWNLOAD_GROUPS
                     for model in group["models"] if "sources" in model}
