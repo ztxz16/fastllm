@@ -14,6 +14,11 @@
 - Missing/blocked: 如果 skill 文件缺失或无法读取，简短说明后继续采用最佳替代方案。
 - Context hygiene: 先读 `SKILL.md`，只在需要时再加载更多上下文。
 
+## 待办记录规范
+
+- 后续讨论中产生或更新的待办事宜，统一记录到项目现有的
+  [project/TODO.md](project/TODO.md)，并在该文件中维护事项内容和状态。
+
 ## 已确认的后续需求
 
 ### Attention DP/EP 批次不变性实施顺序
