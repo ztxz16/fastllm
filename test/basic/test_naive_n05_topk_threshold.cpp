@@ -75,23 +75,71 @@ static void AdversarialSamples(int keys, int past) {
         scores.Allocate();
         std::memcpy(scores.cpuData, values.data(), values.size() * sizeof(float));
         scores.ToDevice(DataDevice::CUDA, {0}, true);
-        const bool medium = keys > 4096 && keys < 8192;
-        if (medium) {
-            out.Resize({rows, top});
-            out.ToDevice(DataDevice::CUDA, {0}, false);
-            out.Allocate(false);
-        }
+        out.Resize({rows, top});
+        out.ToDevice(DataDevice::CUDA, {0}, false);
+        out.Allocate(false);
         std::vector<size_t> allocations;
         {
             FastllmCudaAllocationRecorder record(&allocations);
             FastllmCudaNaiveTopK(scores, past, top, out);
         }
-        if (medium) Require(allocations.empty(), "medium TopK requested global scratch");
+        Require(allocations.empty(), "batched Top2048 requested global scratch");
         Require(Read<int>(out) == expected, "TopK differs from exact CPU order");
+        if (keys >= 16384) {
+            Data scratch(INT32, {rows * (4096 * 2 + 2)});
+            scratch.ToDevice(DataDevice::CUDA, {0}, false);
+            scratch.Allocate(false);
+            FastllmCudaNaiveTopK(scores, past, top, out, scratch.cudaData, scratch.GetBytes());
+            Require(Read<int>(out) == expected, "sampled TopK differs from exact CPU order");
+            ++checks;
+        }
         ++checks;
         printf("adversarial mode=%d PASS\n", mode);
         fflush(stdout);
     }
+}
+// Increasing scores give an exact reference for every row, including causal
+// padding and the first row of each tile. Preallocate the public result so
+// the recorder measures only the operator's scratch requests.
+static void CheckLargeBatch(int rows, int keys, int past, int top, int scratchRows = 0) {
+    Data scores(FLOAT32, {rows, keys});
+    scores.Allocate();
+    for (int row = 0; row < rows; ++row) {
+        auto *values = reinterpret_cast<float *>(scores.cpuData) + size_t(row) * keys;
+        std::iota(values, values + keys, 0.f);
+    }
+    scores.ToDevice(DataDevice::CUDA, {0}, true);
+    Data out(INT32, {rows, top});
+    out.ToDevice(DataDevice::CUDA, {0}, false);
+    out.Allocate(false);
+    const int scratchWords = scratchRows * (4096 * 2 + 2);
+    Data scratch(INT32, {scratchWords + 4});
+    scratch.ToDevice(DataDevice::CUDA, {0}, false);
+    scratch.Allocate(false);
+    Require(cudaMemset(scratch.cudaData, 0xa5, scratch.GetBytes()) == cudaSuccess, "scratch init failed");
+    std::vector<size_t> allocations;
+    {
+        FastllmCudaAllocationRecorder record(&allocations);
+        FastllmCudaNaiveTopK(scores, past, top, out, static_cast<int *>(scratch.cudaData) + 2,
+                             size_t(scratchWords) * sizeof(int));
+    }
+    const auto guard = Read<unsigned>(scratch);
+    Require(guard[0] == 0xa5a5a5a5u && guard[1] == guard[0] &&
+            guard[scratchWords + 2] == guard[0] && guard[scratchWords + 3] == guard[0],
+            "TopK wrote outside the supplied workspace");
+    if (top == 2048) {
+        Require(allocations.empty(), "batched Top2048 requested global scratch");
+    } else {
+        // These full and compact cases would need larger buffers without row tiling.
+        for (size_t bytes : allocations)
+            Require(bytes <= (size_t(16) << 20), "generic TopK scratch grew with batch rows");
+    }
+    auto actual = Read<int>(out);
+    for (int row = 0; row < rows; ++row)
+        for (int i = 0; i < top; ++i)
+            Require(actual[size_t(row) * top + i] == std::max(-1, past + row - i),
+                    "wrong TopK index at a causal or tile boundary");
+    ++checks;
 }
 int main() {
     int devices = 0;
@@ -103,6 +151,13 @@ int main() {
         // Cold-prefix padding, the K boundary, and many identical candidates.
         for (int past : {0, 2046, 4094})
             AdversarialSamples(7335, past);
+        CheckLargeBatch(7808, 8586, 0, 2048);
+        CheckLargeBatch(778, 8586, 7808, 2048);
+        CheckLargeBatch(385, 16385, 15999, 2048, 128);
+        CheckLargeBatch(129, 32768, 32000, 2048, 127);
+        CheckLargeBatch(1297, 2301, 3, 1024);
+        CheckLargeBatch(1231, 8586, 2000, 1000);
+        CheckLargeBatch(33, 79, 0, 100);
         Require(cudaDeviceSynchronize() == cudaSuccess, "final sync failed");
         std::printf("PASS: exact TopK, %d adversarial cases\n", checks);
     } catch (const std::exception &error) {

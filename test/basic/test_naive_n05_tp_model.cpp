@@ -166,6 +166,14 @@ struct NaiveN05GraphTestAccess {
         model.tpDevices.resize(ranks);
         std::iota(model.tpDevices.begin(), model.tpDevices.end(), 0);
     }
+    static void CheckPrefillIndexSlots(const NaiveN05FlashModel &model) {
+        for (const auto &rank : model.attentionParallel->ranks) {
+            for (const auto &slot : rank.workspace.sequences) {
+                if (slot->indices.cudaData || slot->indexQ.cudaData || slot->indexWeights.cudaData)
+                    throw std::runtime_error("DP prefill retained Indexer storage per sequence slot");
+            }
+        }
+    }
     static int &SamplingCapacity(NaiveN05FlashModel &model) { return model.attentionParallel->samplingCapacity; }
     static void InvalidateAll(NaiveN05FlashModel &model) { model.InvalidateTensorParallelCache(); }
     static bool HasDPServingPlan(NaiveN05FlashModel &model) {
@@ -4122,6 +4130,8 @@ class Fixture : public NaiveN05FlashModel {
                     offset += lengths[i];
                 }
             }
+            if (batched && !pooled && layoutGroups == ranks && ranks > 1 && turn == 1)
+                NaiveN05GraphTestAccess::CheckPrefillIndexSlots(*this);
             for (size_t i = 0; i < order.size(); ++i) {
                 const int owner = order[i]; past[owner] += lengths[i];
                 results.push_back(logits[i]);

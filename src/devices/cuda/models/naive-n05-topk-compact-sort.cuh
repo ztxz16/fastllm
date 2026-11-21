@@ -19,9 +19,9 @@ using CompactTopKSort = cub::BlockRadixSort<unsigned long long, Threads, Items,
 template<int Items, bool RawScores = false, int Threads = 256, int RadixBits = kCompactTopKRadixBits>
 __device__ void SortTopKCompactRow(const unsigned long long *input, const int *ends,
         int *indices, int queries, int stride, int topK, int keyCount,
-        typename CompactTopKSort<Items, Threads, RadixBits>::TempStorage &storage, int outputRow = -1) {
+        typename CompactTopKSort<Items, Threads, RadixBits>::TempStorage &storage, int outputRow = -1, int row = blockIdx.x) {
     using Sort = CompactTopKSort<Items, Threads, RadixBits>;
-    const int row = blockIdx.x, count = ends[queries + row] - row * stride;
+    const int count = ends[queries + row] - row * stride;
     const int indexBits = 32 - __clz((unsigned)max(1, keyCount - 1));
     const unsigned mask = 0xffffffffu >> (32 - indexBits);
     unsigned long long keys[Items];

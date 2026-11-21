@@ -1438,16 +1438,37 @@ Data NaiveN05FlashModel::RunTarget(
         const bool dpPrefill = attentionParallel && AttentionTPSize() == 1 && batch &&
             !batch->Decode() && !decodeWorkspace && !verifying && !sparseLayer &&
             !slidingLayers[layer];
-        if (dpPrefill && reuseAttention && !indexerLayerSharding && indexTopK > 0 &&
-            int64_t(qkv.dims.back()) - int64_t(cfg.heads) * cfg.valueDim >= 2LL * indexTopK) {
-            // The Indexer runs after every packed QKV row has been consumed.
-            // TopK occupies the suffix beyond the complete compact output,
-            // so later attention writes cannot corrupt another request's IDs.
-            size_t offset = size_t(length) * cfg.heads * cfg.valueDim * sizeof(uint16_t);
+        const bool rankIndexer = dpPrefill && localIndexer && !indexerLayerSharding && indexTopK > 0;
+        const bool idsInQkv = rankIndexer && reuseAttention &&
+            int64_t(qkv.dims.back()) - int64_t(cfg.heads) * cfg.valueDim >= 2LL * indexTopK;
+        if (rankIndexer) {
+            // All three deferred outputs live across requests. Pack by local
+            // token offset: the rank token budget bounds their total size even
+            // when the longest request moves between batch slots.
+            auto prepareRows = [&](Data &storage, DataType type, int width) {
+                storage.dataType = type;
+                storage.Resize({1, length, width});
+                storage.ToDevice(normed.dataDevice, normed.dataDeviceIds, false);
+                storage.Allocate(false);
+            };
+            prepareRows(batchIndexQ, BFLOAT16, indexHeads * indexDim);
+            prepareRows(batchIndexWeights, BFLOAT16, indexHeads);
+            Data *owner = &buf.indexBroadcast;
+            size_t offset = 0;
+            if (idsInQkv) {
+                owner = &qkv;
+                offset = size_t(length) * cfg.heads * cfg.valueDim * sizeof(uint16_t);
+            } else if (!reuseProjected && embed_dim >= 2LL * indexTopK) {
+                // O projection starts after attention has consumed every ID.
+                prepareRows(projected, BFLOAT16, embed_dim);
+                owner = &projected;
+            } else {
+                prepareRows(*owner, INT32, indexTopK);
+            }
             packedIndices.resize(batch->Size());
             for (int sequence = 0; sequence < batch->Size(); ++sequence) {
                 auto &ids = packedIndices[sequence];
-                ids.FakeFrom(qkv, offset);
+                ids.FakeFrom(*owner, offset);
                 ids.dataType = INT32;
                 ids.Resize({batch->lengths[sequence], indexTopK});
                 offset += size_t(batch->lengths[sequence]) * indexTopK * sizeof(int);
@@ -1479,7 +1500,7 @@ Data NaiveN05FlashModel::RunTarget(
         Data &contextGather = buf.indexContextGather;
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &cacheKey, Data &cacheValue,
-                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
+                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0, int rowOffset = 0) {
             Data &packed = buf.packed, &indexKey = buf.indexKey;
             Data &indices = packedIndices.empty() ? buf.indices : packedIndices[sequence];
             const bool sharedSwa = tensorParallel && slidingLayers[layer] &&
@@ -1606,10 +1627,10 @@ Data NaiveN05FlashModel::RunTarget(
                         (int64_t)(length / ranks) * pastKey.dims[1] >= 1024 * 1024;
                     if ((localIndexer || parallelIndex) && !batchIndexerPrepared) {
                         Data rowIndexQ, rowIndexWeights;
-                        const bool packedQueries = batchIndexPrepared || batchVerifyIndex;
+                        const bool packedQueries = rankIndexer || batchIndexPrepared || batchVerifyIndex;
                         Data &indexQ = packedQueries ? rowIndexQ : buf.indexQ;
                         Data &indexWeights = packedQueries ? rowIndexWeights : buf.indexWeights;
-                        int queryOffset = sequence;
+                        int queryOffset = rankIndexer ? rowOffset : sequence;
                         if (batchVerifyIndex) {
                             queryOffset = 0;
                             for (int i = 0; i < sequence; ++i) queryOffset += batch->lengths[i];
@@ -1619,7 +1640,9 @@ Data NaiveN05FlashModel::RunTarget(
                             indexQ.FakeFrom(batchIndexQ, (size_t)queryOffset * indexHeads * indexDim * batchIndexQ.unitSize);
                             indexWeights.Resize({1, length, indexHeads});
                             indexWeights.FakeFrom(batchIndexWeights, (size_t)queryOffset * indexHeads * batchIndexWeights.unitSize);
-                        } else if (localIndexer) prepareIndexQuery(normed, positions, indexQ, indexWeights);
+                        }
+                        if (rankIndexer || (!packedQueries && localIndexer))
+                            prepareIndexQuery(normed, positions, indexQ, indexWeights);
                         if (batchVerifyIndex) {
                             verifyIndexItems.push_back({&scoringKey, &indices, queryOffset, length, localPast,
                                 graphVerify ? buf.capacity : 0, indexTable(sequence)});
@@ -1925,11 +1948,11 @@ Data NaiveN05FlashModel::RunTarget(
                     rowPositions.Resize({1, count});
                     rowPositions.FakeFrom(positions, (size_t)offset * sizeof(float));
                     // Sequential prefill attention needs one scratch/history
-                    // buffer, regardless of the number of admitted requests.
-                    // Deferred Indexer scoring and decode keep independent rows.
+                    // buffer. The DP Indexer retains only the packed rank views;
+                    // its per-request KV lives in the request's own cache.
                     const bool sharedPrefill = !batch->Decode() && !decodeWorkspace &&
                         !verifying && !batchPrefillIndex && !dpPrefill;
-                    auto &part = sharedPrefill ? buf : *buf.sequences[sequence];
+                    auto &part = sharedPrefill || rankIndexer ? buf : *buf.sequences[sequence];
                     if (decodeWorkspace || (capture && capture->ringVerify)) {
                         part.liveKeys.Resize({count});
                         part.liveKeys.FakeFrom(liveKeys, offset * sizeof(int));
@@ -1939,7 +1962,7 @@ Data NaiveN05FlashModel::RunTarget(
                            *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
                            batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
                            CacheReserveCapacity(batch->configs[sequence]), rowAttention,
-                           sequence);
+                           sequence, offset);
                     offset += count;
                 }
                 if (!stagedSwa.empty()) {
@@ -1975,7 +1998,7 @@ Data NaiveN05FlashModel::RunTarget(
                             tpDevices[IndexerOwnerRank(layer)], gpu);
                 }
                 if (dpPrefill && phase == 0) {
-                    pairedPrefill = FastllmCudaHasBlackwellIndexerAttention() && !packedIndices.empty() &&
+                    pairedPrefill = idsInQkv && FastllmCudaHasBlackwellIndexerAttention() &&
                         prefillItems.size() == packedIndices.size();
                     for (size_t i = 0; pairedPrefill && i < prefillItems.size(); ++i)
                         pairedPrefill = prefillItems[i].indices == &packedIndices[i] &&

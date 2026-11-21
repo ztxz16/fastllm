@@ -13,7 +13,7 @@ __device__ inline unsigned long long TopKOrder(unsigned scoreBits, int index) {
 template <bool Sampled, int SampleItems = 4, int Threads = 256>
 __device__ __forceinline__ void SelectTopKCompactRow(const float *input, unsigned long long *selected,
                                                      int *offsets, int queries, int count, int topK,
-                                                     int capacity) {
+                                                     int capacity, int row = blockIdx.x) {
     constexpr int threads = Threads, warps = threads / 32;
     using Scan = cub::BlockScan<int, threads>;
     __shared__ typename Scan::TempStorage scan;
@@ -26,7 +26,7 @@ __device__ __forceinline__ void SelectTopKCompactRow(const float *input, unsigne
     auto &histogram = temporary.histogram;
     __shared__ unsigned prefix;
     __shared__ int rank, candidateCount, selectedCount, tiesSeen;
-    int row = blockIdx.x, t = threadIdx.x, lane = t % 32, warp = t / 32;
+    int t = threadIdx.x, lane = t % 32, warp = t / 32;
     int keep = min(count, topK);
     unsigned long long *output = selected + (size_t)row * capacity;
     if (t == 0) {
