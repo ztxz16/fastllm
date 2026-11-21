@@ -4,6 +4,7 @@
 #include <cstring>
 #ifdef FASTLLM_ENABLE_HY4_CUDA
 #include "hy4_flash_hybrid_graph.h"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-policy.h"
 #endif
@@ -35,7 +36,7 @@ void Hy4FlashModel::OnModelWeightsLoaded() {
     if (MoeCudaCacheRequested() && (allCpu || allNuma)) {
         HybridMoeCachePlan plan(HybridMoeMath::Hy4Flash, 10.f);
         for (int layer = 1; layer < block_cnt; layer++)
-            plan.Add(hostExperts[layer], SelectMoeDeviceForLayer(layer), devices.front());
+            plan.Add(hostExperts[layer], SelectMoeDeviceForLayer(layer), devices[HybridStage(layer)]);
         hostCacheReady = plan.Prepare([this] { WarmupNumaMoeWeights(true); }, true);
         AssertInFastLLM(hostCacheReady, "Failed to register HY4-Flash expert weights with the CUDA cache.");
     }
@@ -45,7 +46,7 @@ std::vector<int> Hy4FlashModel::ProposeHybrid(const std::vector<int> &anchors, C
                                               const std::vector<GenerationConfig> &configs,
                                               const std::vector<hy4::DraftRequest *> &states) {
     auto &w = *source;
-    auto &s = *hybridArena;
+    auto &head = *hybridArenas.back();
     std::vector<int> expanded;
     const int vocab = w.meta.at("lm_head.weight").dims[0];
     std::vector<hy4::DraftProposal> proposals(states.size());
@@ -54,21 +55,40 @@ std::vector<int> Hy4FlashModel::ProposeHybrid(const std::vector<int> &anchors, C
         const int base = past[i * block_cnt].first->cpuIntDatas.size();
         auto target =
             static_cast<const float *>(state.hidden.cudaData) + size_t((base - 1) % (draftWidth + 1)) * 3072;
-        auto block = s.Get("draftBlock", draftWidth * 3072);
-        hy4::DraftEmbed(w, s, anchors[i], draftWidth, draftMask, target, block);
-        std::vector<hy4::AttentionCache> caches;
+        size_t stage = hybridArenas.size() - 1;
+        hy4::Select(head.device);
+        auto block = head.Get("draftBlock", draftWidth * 3072);
+        hy4::DraftEmbed(w, head, anchors[i], draftWidth, draftMask, target, block);
+        auto moveBlock = [&](size_t next) {
+            if (next == stage)
+                return;
+            hy4::Select(devices[next]);
+            auto dst = hybridArenas[next]->Get("draftBlock", draftWidth * 3072);
+            hy4::CopyStage(dst, devices[next], block, devices[stage], size_t(draftWidth) * 3072);
+            block = dst;
+            stage = next;
+        };
         const int limit = w.config["max_position_embeddings"].int_value();
-        for (auto &provider : state.providers) {
-            auto pages = hy4::ReservePages(s.kvPools, s.device, provider.keys, provider.values,
-                                           base + draftWidth, limit, 8192, 8192);
-            caches.push_back({nullptr, pages});
+        for (size_t first = 0; first < draftProviders.size();) {
+            moveBlock(HybridStage(draftProviders[first]));
+            auto &s = *hybridArenas[stage];
+            std::vector<hy4::AttentionCache> caches;
+            size_t end = first;
+            while (end < draftProviders.size() && HybridStage(draftProviders[end]) == stage) {
+                auto &provider = state.providers[end++];
+                auto pages = hy4::ReservePages(s.kvPools, s.device, provider.keys, provider.values,
+                                               base + draftWidth, limit, 8192, 8192);
+                caches.push_back({nullptr, pages});
+            }
+            auto tables = hy4::UploadAttentionCaches(s, caches);
+            for (size_t k = first; k < end; ++k)
+                hy4::DraftLayer(w, s, k, base, draftWidth, state.providers[k], block, &tables[k - first].draft);
+            first = end;
         }
-        auto draftCaches = hy4::UploadAttentionCaches(s, caches);
-        for (size_t k = 0; k < draftProviders.size(); ++k)
-            hy4::DraftLayer(w, s, k, base, draftWidth, state.providers[k], block, &draftCaches[k].draft);
+        moveBlock(hybridArenas.size() - 1);
         if (!configs[i].IsSimpleGreedy())
-            proposals[i] = hy4::PrepareProposal(s, i, states.size(), draftWidth - 1, vocab);
-        auto candidates = hy4::DraftReadout(w, s, anchors[i], draftWidth, block, configs[i], proposals[i]);
+            proposals[i] = hy4::PrepareProposal(head, i, states.size(), draftWidth - 1, vocab);
+        auto candidates = hy4::DraftReadout(w, head, anchors[i], draftWidth, block, configs[i], proposals[i]);
         expanded.push_back(anchors[i]);
         expanded.insert(expanded.end(), candidates.begin(), candidates.end());
     }
@@ -79,7 +99,7 @@ std::vector<int> Hy4FlashModel::ProposeHybrid(const std::vector<int> &anchors, C
     for (size_t i = 0; i < states.size(); ++i) {
         auto &state = *states[i];
         const size_t first = i * draftWidth;
-        auto tokens = hy4::VerifyDraft(s, target + first * vocab, draftWidth, vocab, configs[i], proposals[i],
+        auto tokens = hy4::VerifyDraft(head, target + first * vocab, draftWidth, vocab, configs[i], proposals[i],
                                        expanded.data() + first + 1);
         output.push_back(CommitVerifiedTokens(i, past, state, configs[i], tokens));
     }
@@ -92,13 +112,13 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                                                    const std::vector<GenerationConfig> &configs, bool verify,
                                                    std::vector<int> *sampled, float **deviceLogits) {
 #ifdef FASTLLM_ENABLE_HY4_CUDA
-    const int device = devices.front();
-    hy4::Select(device);
-    if (!hybridArena)
-        hybridArena = std::make_shared<hy4::Scratch>(device);
+    auto &arenas = hybridArenas;
+    if (arenas.empty())
+        for (int device : devices)
+            arenas.push_back(std::make_shared<hy4::Scratch>(device));
     if (!hybridGraphs)
         hybridGraphs = std::make_shared<hy4::HybridGraphs>();
-    auto &s = *hybridArena;
+    auto &head = *arenas.back();
     std::vector<Data *> biases(2 + 2 * 512, nullptr);
     auto &w = *source;
     std::vector<hy4::DraftRequest *> states;
@@ -143,37 +163,59 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
     FastllmCudaMoeRouteScope phase(verify   ? FastllmMoeRoutePhase::Verify
                                    : decode ? FastllmMoeRoutePhase::Decode
                                             : FastllmMoeRoutePhase::SmallPrefill);
-    HybridMoeDecodeStep step;
-    if (hostCacheReady && decode)
-        step.Begin(hostExperts[1].data(), hostExperts[1].size(), 16);
+    HybridMoeDecodeGroup steps;
     const bool graphEnabled = GetFastllmEnv().cudaGraph;
-    bool capture = graphEnabled && decode && (bool(step) || (diskGraphReady && rows <= 32)) &&
-                   hybridGraphs->warmedRows >= size_t(rows) && (rows != 1 || hybridGraphs->warmedSingle) &&
-                   (diskGraphReady ||
-                    FastllmCudaNativeMoeGraphOwner(hostExperts[1].data(), hostExperts[1].size(), rows));
+    if (graphEnabled && !hybridGraphs->peerChecked) {
+        hybridGraphs->peerReady = devices.size() == 1 || FastllmCudaPeerAccessInit(devices);
+        hybridGraphs->peerChecked = true;
+    }
+    bool capture = graphEnabled && hybridGraphs->peerReady && decode &&
+                   (hostCacheReady || (diskGraphReady && devices.size() == 1 && rows <= 32)) &&
+                   hybridGraphs->warmedRows >= size_t(rows) && (rows != 1 || hybridGraphs->warmedSingle);
     for (size_t i = 0; i < lengths.size() && capture; ++i)
         capture = positions[lastRows[i]] + 1 - lengths[i] >= 4;
-    auto attentionCaches = hy4::PrepareAttentionCaches(w, s, 0, block_cnt, block_cnt, lengths, past,
-                                                       draftProviders, states, draftWidth);
+
+    std::vector<const hy4::AttentionCache *> layerCaches(block_cnt);
+    for (size_t stage = 0; stage < arenas.size(); ++stage) {
+        auto &s = *arenas[stage];
+        const int first = stage ? hybridStageEnds[stage - 1] : 0, end = hybridStageEnds[stage];
+        hy4::Select(s.device);
+        const int firstExpert = std::max(1, first);
+        if (hostCacheReady && decode && firstExpert < end) {
+            auto &weights = hostExperts[firstExpert];
+            const bool active = steps.Begin(s.device, weights.data(), weights.size(), 16);
+            capture = capture && active && FastllmCudaNativeMoeGraphOwner(weights.data(), weights.size(), rows);
+        }
+        auto tables = hy4::PrepareAttentionCaches(w, s, first, end, block_cnt, lengths, past,
+                                                  draftProviders, states, draftWidth);
+        for (int layer = first; layer < end; ++layer)
+            layerCaches[layer] = tables + (layer - first) * lengths.size();
+    }
     if (capture)
         for (int layer = 0; layer < block_cnt; ++layer)
-            if (w.meta.count("model.layers." + std::to_string(layer) + ".engram_layer.lookup_table"))
+            if (w.meta.count("model.layers." + std::to_string(layer) + ".engram_layer.lookup_table")) {
+                auto &s = *arenas[HybridStage(layer)];
+                hy4::Select(s.device);
                 for (int row = 0; row < rows; ++row)
                     hy4::PrepareEngramInput(w, s, layer, row, grams[row]);
+            }
+    hy4::Select(head.device);
     const int vocab = w.meta.at("lm_head.weight").dims[0];
     const size_t outputs = verify ? rows : lengths.size();
-    auto projected = s.Get("batchedLogits", outputs * vocab);
+    auto projected = head.Get("batchedLogits", outputs * vocab);
     // Reserve the widest request before recording the scratch generation in the graph key.
     if (capture && verify)
-        s.Get("headX", size_t(*std::max_element(lengths.begin(), lengths.end())) * 3072);
+        head.Get("headX", size_t(*std::max_element(lengths.begin(), lengths.end())) * 3072);
 
     std::vector<uintptr_t> key;
-    const hy4::StepInput *stepInputs = nullptr;
+    std::vector<const hy4::StepInput *> stepInputs(arenas.size());
     if (capture) {
         std::vector<hy4::StepInput> params;
         for (int row = 0; row < rows; ++row)
             params.push_back({tokens[row], grams[row][1], grams[row][2], positions[row]});
-        stepInputs = hy4::UploadStep(s, params);
+        // Each stage uploads its inputs on its own replay stream.
+        for (size_t stage = 0; stage < arenas.size(); ++stage)
+            stepInputs[stage] = hy4::UploadStep(*arenas[stage], params);
         key = {uintptr_t(verify), uintptr_t(rows), uintptr_t(lengths.size()), uintptr_t(projected)};
         for (int row = 0; row < rows; ++row) {
             const bool skip = w.SkipEngram(tokens[row]);
@@ -189,19 +231,37 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                     key.push_back(uintptr_t(mem.recalled.cudaData));
             }
         }
-        key.push_back(s.generation);
+        for (const auto &arena : arenas)
+            key.push_back(arena->generation);
     }
 
     bool replay = capture && hy4::ReplayHybrid(*hybridGraphs, key, verify, rows);
     if (!replay) {
         hy4::HybridGraphCapture graph(capture ? hybridGraphs.get() : nullptr, diskGraphReady);
-        graph.Start(device);
-        auto streams = s.Get("streams", size_t(rows) * 4 * 3072);
+        hy4::Select(devices.front());
+        graph.Start(devices.front());
+        const size_t streamSize = size_t(rows) * 4 * 3072;
+        auto streams = arenas.front()->Get("streams", streamSize);
         for (int row = 0; row < rows; ++row) {
-            s.step = capture ? stepInputs + row : nullptr;
-            hy4::Embed(w, s, tokens[row], streams + size_t(row) * 4 * 3072);
+            arenas.front()->step = capture ? stepInputs.front() + row : nullptr;
+            hy4::Embed(w, *arenas.front(), tokens[row], streams + size_t(row) * 4 * 3072);
         }
+        size_t stage = 0;
         for (int layer = 0; layer < block_cnt; ++layer) {
+            if (layer == hybridStageEnds[stage]) {
+                graph.CloseStage();
+                ++stage;
+                hy4::Select(devices[stage]);
+                auto next = arenas[stage]->Get("streams", streamSize);
+                graph.Start(devices[stage]);
+                if (capture)
+                    hy4::CopyStageCaptured(next, streams, streamSize);
+                else
+                    hy4::CopyStage(next, devices[stage], streams, devices[stage - 1], streamSize);
+                streams = next;
+            }
+            auto &s = *arenas[stage];
+            const int device = s.device;
             const auto p = "model.layers." + std::to_string(layer) + ".";
             auto inputs = s.Get("inputs", size_t(rows) * 3072);
             auto branch = s.Get("branch", size_t(rows) * 3072), posts = s.Get("posts", rows * 4);
@@ -213,7 +273,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
             attentionRows.reserve(rows);
             auto attnOutput = s.Get("attentionOutput", size_t(rows) * 3072);
             for (int row = 0; row < rows; ++row) {
-                s.step = capture ? stepInputs + row : nullptr;
+                s.step = capture ? stepInputs[stage] + row : nullptr;
                 float *h = streams + size_t(row) * 4 * 3072;
                 if (w.meta.count(p + "engram_layer.lookup_table")) {
                     if (capture)
@@ -234,7 +294,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 auto index = provider - draftProviders.begin();
                 auto *memory = state && provider != draftProviders.end() ? &state->providers[index] : nullptr;
                 attentionRows.push_back({positions[row], state ? draftWidth : 0, memory, int(index), s.step,
-                                         attentionCaches + layer * lengths.size() + owners[row]});
+                                         layerCaches[layer] + owners[row]});
             }
             hy4::HyperPreNorm(w, s, p + "hc_attn_layer.hc_pre.", p + "input_layernorm.weight",
                               streams, inputs, posts, rows);
@@ -248,6 +308,8 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 continue;
             }
             hy4::RouteBatch(w, s, layer, inputs, ids, scores, latents, rows);
+            const float *shared = nullptr;
+            auto runShared = [&] { shared = hy4::SharedExpertsBatch(w, s, layer, inputs, rows); };
             bool dispatched = false;
             if ((hostCacheReady && decode) || capture) {
                 Data input(FLOAT32, {rows, 1536}, CUDA, latents);
@@ -255,12 +317,12 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 Data output;
                 input.dataDeviceIds = index.dataDeviceIds = score.dataDeviceIds = {device};
                 if (capture) {
-                    const auto &out = graph.AddExperts(input, index, score, hostExperts[layer], layer);
+                    const auto &out = graph.AddExperts(input, index, score, hostExperts[layer], layer, runShared);
                     routed = static_cast<float *>(out.cudaData);
                     dispatched = true;
                 } else {
                     dispatched = RunHybridMoe(input, index, score, output, hostExperts[layer].data(),
-                                              hostExperts[layer].size(), layer);
+                                              hostExperts[layer].size(), layer, runShared);
                     if (dispatched)
                         hy4::CopyStage(routed, device, static_cast<const float *>(output.cudaData), device,
                                        size_t(rows) * 1536);
@@ -283,19 +345,22 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 hy4::Select(device);
                 hy4::CopyToGPU(routed, out.cpuData, size_t(rows) * 1536 * sizeof(float));
             }
-            hy4::CombineExpertsBatch(w, s, layer, inputs, routed, branch, rows);
+            if (!shared)
+                runShared();
+            hy4::JoinExpertsBatch(w, s, layer, shared, routed, branch, rows);
             hy4::HyperPostNorm(w, s, p + "mlp.combine_output_norm.weight", streams, branch, posts, rows);
         }
         for (size_t i = 0; i < lengths.size(); ++i) {
             const int count = verify ? lengths[i] : 1;
             const int first = lastRows[i] + 1 - count;
             const size_t output = verify ? size_t(first) : i;
-            s.step = capture ? stepInputs + first : nullptr;
-            hy4::ProjectHead(w, s, streams + size_t(first) * 4 * 3072, projected + output * vocab,
+            head.step = capture ? stepInputs.back() + first : nullptr;
+            hy4::ProjectHead(w, head, streams + size_t(first) * 4 * 3072, projected + output * vocab,
                              states[i] ? &states[i]->hidden : nullptr, positions[first], draftWidth, count);
         }
         graph.Finish(key, verify, rows);
-        s.step = nullptr;
+        for (auto &arena : arenas)
+            arena->step = nullptr;
     }
     Logits result;
     if (deviceLogits) {

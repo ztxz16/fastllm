@@ -18,5 +18,8 @@ int main() {
         !usesHostExperts("disk", "cuda:0", 1) || usesHostExperts("numa", "cuda:0", 41) ||
         !usesHostExperts("cpu", "cuda:0", -1))
         return 1;
+    SetDeviceMap({{"cuda:0", 1}, {"cuda:1", 1}});
+    if (!usesHostExperts("numa", "numa", 0) || usesHostExperts("cuda:0", "cuda:0", 0))
+        return 1;
     std::puts("ALL_PASS");
 }

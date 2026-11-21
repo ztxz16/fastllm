@@ -1,5 +1,8 @@
 #include "hy4_flash_ops.h"
 #include "utils.h"
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+#include "utils/cuda_chunked_prefill.h"
+#endif
 #include <fstream>
 #include <cstring>
 #include <cmath>
@@ -47,7 +50,24 @@ void Hy4FlashModel::InitParams() {
         hybrid = placement == "cpu" || placement == "disk" || placement == "numa" ||
                  placement.rfind("numa:", 0) == 0;
     }
-    AssertInFastLLM(!hybrid || devices.size() == 1, "HY4-Flash hybrid inference requires one dense GPU.");
+    hybridStageEnds = {block_cnt};
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+    if (hybrid && devices.size() > 1) {
+        // Use the same weighted, contiguous PP placement as V4.1.
+        std::vector<CudaPrefillStage> stages;
+        AssertInFastLLM(BuildCudaPrefillStages(dense, block_cnt, stages),
+                        "HY4-Flash hybrid PP requires a layer map such as {\"cuda:0\":1,\"cuda:1\":1}.");
+        devices.clear();
+        hybridStageEnds.clear();
+        for (const auto &stage : stages) {
+            devices.push_back(stage.device);
+            hybridStageEnds.push_back(stage.endLayer);
+        }
+    }
+#endif
+}
+size_t Hy4FlashModel::HybridStage(int layer) const {
+    return std::upper_bound(hybridStageEnds.begin(), hybridStageEnds.end(), layer) - hybridStageEnds.begin();
 }
 void Hy4FlashModel::SetConfig(const json11::Json &root) {
     const auto &cfg = root["text_config"];

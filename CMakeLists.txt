@@ -2298,6 +2298,13 @@ if (UNIT_TEST)
             target_compile_definitions(hy4_dfly_sampling_test PRIVATE FASTLLM_ENABLE_HY4_CUDA)
             add_test(NAME hy4_dfly_sampling COMMAND hy4_dfly_sampling_test)
             set_tests_properties(hy4_dfly_sampling PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+            add_executable(hy4_hybrid_pp_graph_test test/basic/test_hy4_hybrid_pp_graph.cpp)
+            target_link_libraries(hy4_hybrid_pp_graph_test PRIVATE fastllm)
+            target_include_directories(hy4_hybrid_pp_graph_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            target_compile_definitions(hy4_hybrid_pp_graph_test PRIVATE FASTLLM_ENABLE_HY4_CUDA)
+            add_test(NAME hy4_hybrid_pp_graph COMMAND hy4_hybrid_pp_graph_test)
+            set_tests_properties(hy4_hybrid_pp_graph PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE
+                PASS_REGULAR_EXPRESSION "PASS: HY4 two-stage graph replay" TIMEOUT 60)
         endif()
 
         add_executable(cuda_mtp_rejection_test test/basic/test_cuda_mtp_rejection.cpp)

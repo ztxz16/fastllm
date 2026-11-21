@@ -143,6 +143,9 @@ void PagedAttentionBatch(Weights &, Scratch &, int layer, const std::vector<Atte
                          float *);
 void DenseMlpBatch(Weights &, Scratch &, const std::string &, const float *, float *, int rows);
 void RouteBatch(Weights &, Scratch &, int layer, const float *, int *, float *, float *, int rows);
+const float *SharedExpertsBatch(Weights &, Scratch &, int layer, const float *input, int rows);
+void JoinExpertsBatch(Weights &, Scratch &, int layer, const float *shared, const float *routed,
+                      float *out, int rows);
 void CombineExpertsBatch(Weights &, Scratch &, int layer, const float *, const float *, float *, int rows);
 void ResidentExperts(Weights &, Scratch &, int layer, const float *latent, const int *ids,
                      const float *scores, float *result, int rows);

@@ -1375,7 +1375,7 @@ bool NativeMailboxOwnsLayer(const OffloadGroup &group, const DeviceCache &cache,
             [&](int d) { return d >= 0 && d != cache.device; })) return true;
     // Serial PP: each complete layer has one immutable owner. It never borrows
     // another device's expert cache (unlike EP/cooperative GGUF execution).
-    return (group.layout.deepSeekV41 || group.qwen38FlashNext) &&
+    return (group.layout.deepSeekV41 || group.qwen38FlashNext || group.layout.standardFp8Graph) &&
         table >= 0 && table < int(group.cacheDevices.size()) && group.cacheDevices[table] == cache.device;
 }
 
@@ -1385,7 +1385,7 @@ bool CanOverlapNativeAdmissions(const OffloadGroup &group, const DeviceCache &ca
     if (!cache.nativeMailbox || !group.expertDevices.empty() || group.tensorParallelRequested ||
         cache.prefillOwnerCount != 1) return false;
     if (group.deviceCaches.size() == 1) return true;
-    if ((!group.layout.deepSeekV41 && !group.qwen38FlashNext) ||
+    if ((!group.layout.deepSeekV41 && !group.qwen38FlashNext && !group.layout.standardFp8Graph) ||
         group.cacheDevices.size() != group.tableKeys.size() || cache.layerSlots.size() != group.tableKeys.size())
         return false;
     for (int l = 0; l < int(group.tableKeys.size()); ++l)

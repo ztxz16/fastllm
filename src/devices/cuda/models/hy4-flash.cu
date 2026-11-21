@@ -795,13 +795,22 @@ __global__ static void add(float *x, const float *y, int n, bool floatMath = fal
     if (i < n)
         x[i] = floatMath ? x[i] + y[i] : bf(x[i] + y[i]);
 }
+const float *SharedExpertsBatch(Weights &w, Scratch &s, int layer, const float *input, int rows) {
+    auto shared = s.Get("batchShared", size_t(rows) * 3072);
+    const auto prefix = "model.layers." + std::to_string(layer) + ".mlp.shared_experts.";
+    NormalizedDenseMlpRows<false>(w, s, prefix, input, shared, rows);
+    return shared;
+}
+void JoinExpertsBatch(Weights &w, Scratch &s, int layer, const float *shared, const float *routed,
+                      float *out, int rows) {
+    const auto weight = "model.layers." + std::to_string(layer) + ".mlp.routed_expert_up_proj.weight";
+    LinearBatch(w, s, weight, routed, out, rows);
+    add<<<rows * 12, 256>>>(out, shared, rows * 3072, w.gguf);
+}
 void CombineExpertsBatch(Weights &w, Scratch &s, int layer, const float *input, const float *routed,
                          float *out, int rows) {
-    auto p = "model.layers." + std::to_string(layer) + ".mlp.";
-    auto shared = s.Get("batchShared", size_t(rows) * 3072);
-    NormalizedDenseMlpRows<false>(w, s, p + "shared_experts.", input, shared, rows);
-    LinearBatch(w, s, p + "routed_expert_up_proj.weight", routed, out, rows);
-    add<<<rows * 12, 256>>>(out, shared, rows * 3072, w.gguf);
+    const auto *shared = SharedExpertsBatch(w, s, layer, input, rows);
+    JoinExpertsBatch(w, s, layer, shared, routed, out, rows);
 }
 void ProjectHead(Weights &w, Scratch &s, float *h, float *values, Data *draftHidden, int position,
                  int draftWidth, int rows) {

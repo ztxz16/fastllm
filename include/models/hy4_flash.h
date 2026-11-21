@@ -61,7 +61,9 @@ class Hy4FlashModel final : public basellm {
     std::vector<std::shared_ptr<hy4::Scratch>> gpuArenas;
     std::shared_ptr<hy4::GpuGraphs> gpuGraphs;
     std::shared_ptr<hy4::HybridGraphs> hybridGraphs;
-    std::shared_ptr<hy4::Scratch> hybridArena;
+    std::vector<std::shared_ptr<hy4::Scratch>> hybridArenas;
+    std::vector<int> hybridStageEnds;
+    size_t HybridStage(int layer) const;
     int draftWidth = 0, draftMask = 0;
     std::vector<int> draftProviders;
     bool hybrid = false;
