@@ -4,9 +4,8 @@
 #include <limits>
 
 namespace fastllm::duo::live {
-void Weights::load(const std::string &file, const std::vector<std::string> &prefixes,
-                   at::ScalarType precision,
-                   const std::function<void(const std::string &, at::Tensor &)> &transform) {
+void Weights::load(const std::string &file, const std::vector<std::string> &prefixes, native::Type precision,
+                   const std::function<void(const std::string &, native::Tensor &)> &transform) {
     std::ifstream in(file, std::ios::binary | std::ios::ate);
     if (!in)
         throw std::runtime_error("cannot open " + file);
@@ -27,19 +26,19 @@ void Weights::load(const std::string &file, const std::vector<std::string> &pref
             }))
             continue;
         auto type = entry["dtype"].string_value();
-        at::ScalarType dtype;
+        native::Type dtype;
         if (type == "BF16")
-            dtype = at::kBFloat16;
+            dtype = native::kBFloat16;
         else if (type == "F32")
-            dtype = at::kFloat;
+            dtype = native::kFloat;
         else if (type == "F16")
-            dtype = at::kHalf;
+            dtype = native::kHalf;
         else if (type == "U8")
-            dtype = at::kByte;
+            dtype = native::kByte;
         else
             throw std::runtime_error("unsupported weight dtype: " + name + " " + type);
         std::vector<int64_t> shape;
-        int64_t bytes = c10::elementSize(dtype);
+        int64_t bytes = native::elementSize(dtype);
         for (const auto &dim : entry["shape"].array_items()) {
             int64_t n = static_cast<int64_t>(dim.number_value());
             if (n <= 0 || n > length / bytes)
@@ -53,26 +52,26 @@ void Weights::load(const std::string &file, const std::vector<std::string> &pref
         int64_t start = offsets[0].number_value(), end = offsets[1].number_value();
         if (start < 0 || end < start || end > length - 8 - int64_t(header) || bytes != end - start)
             throw std::runtime_error("invalid tensor extent: " + name);
-        auto host = at::empty(shape, at::TensorOptions().dtype(dtype));
+        auto host = native::empty(shape, dtype);
         in.seekg(8 + header + start);
         in.read(reinterpret_cast<char *>(host.data_ptr()), bytes);
         if (!in)
             throw std::runtime_error("short weight read: " + name);
-        auto tensor = host.to(device, precision == at::ScalarType::Undefined ? dtype : precision);
+        auto tensor = host.to(device, precision == native::Type::Undefined ? dtype : precision);
         if (transform)
             transform(name, tensor);
         if (tensor.defined())
             tensors.emplace(name, std::move(tensor));
     }
 }
-const at::Tensor &Weights::get(const std::string &name) const {
+const native::Tensor &Weights::get(const std::string &name) const {
     auto it = tensors.find(name);
     if (it == tensors.end())
         throw std::runtime_error("missing weight " + name);
     return it->second;
 }
-at::Tensor Weights::linear(const at::Tensor &x, const std::string &name) const {
+native::Tensor Weights::linear(const native::Tensor &x, const std::string &name) const {
     auto bias = tensors.find(name + ".bias");
-    return at::linear(x, get(name + ".weight"), bias == tensors.end() ? at::Tensor() : bias->second);
+    return native::linear(x, get(name + ".weight"), bias == tensors.end() ? native::Tensor() : bias->second);
 }
 } // namespace fastllm::duo::live

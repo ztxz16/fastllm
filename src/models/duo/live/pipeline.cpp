@@ -2,10 +2,7 @@
 #include "reference.h"
 #include "tables.h"
 #include "avc.h"
-#include <c10/cuda/CUDAStream.h>
 extern "C" void duo_rgb_to_i420(const uint8_t *, uint8_t *, int, int, int, cudaStream_t);
-#include <c10/core/InferenceMode.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <condition_variable>
 #include <deque>
 #include <future>
@@ -50,8 +47,8 @@ template <class T> class Channel {
         return true;
     }
 };
-std::vector<float> floats(at::Tensor tensor) {
-    tensor = tensor.to(at::kCPU, at::kFloat).contiguous();
+std::vector<float> floats(native::Tensor tensor) {
+    tensor = tensor.to(native::kCPU, native::kFloat).contiguous();
     auto ptr = tensor.data_ptr<float>();
     return {ptr, ptr + tensor.numel()};
 }
@@ -111,8 +108,8 @@ std::vector<float> Pipeline::prefix() {
         start = stop;
     }
     auto features = intent->forward(ids, nullptr, false);
-    prefixFeatures =
-        floats(features.index_select(0, at::tensor(keep, at::kInt).to(features.device(), at::kLong)));
+    prefixFeatures = floats(
+        features.index_select(0, native::rowIndices(keep, features.device())));
     prefixDescription = std::move(desc);
     prefixPosition = intent->position();
     prefixLength = intent->length();
@@ -150,7 +147,7 @@ Pipeline::Plan Pipeline::plan(const Visual &visual, const std::vector<int> &body
         return {floats(all.narrow(0, all.size(0) - 1, 1)), {151676}};
     }
     intent->forward(ids, &visual, !hold);
-    std::vector<at::Tensor> hidden;
+    std::vector<native::Tensor> hidden;
     std::vector<int> committed;
     int token = hold ? 151676 : intent->nextToken();
     if (token != 151680)
@@ -165,10 +162,10 @@ Pipeline::Plan Pipeline::plan(const Visual &visual, const std::vector<int> &body
         if (token == 151645)
             break;
     }
-    return {floats(at::cat(hidden)), committed};
+    return {floats(native::cat(hidden)), committed};
 }
 void Pipeline::turn(const fs::path &file, const fs::path &dir, const Emit &emit) {
-    c10::InferenceMode inference;
+
     check();
     emit({{"type", "stage"}, {"name", "识别语音"}});
     auto input =
@@ -238,7 +235,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
     check();
     const bool resetReal = !real || fresh;
     if (!real && devices.ffnPeer >= 0) {
-        c10::cuda::CUDAGuard guard(at::Device(at::kCUDA, 0));
+        native::DeviceGuard guard(0);
         auto session = std::make_unique<Session>(0, ModelSource(root), h / 16, w / 16);
         if (session->enableFfnPeer(devices.ffnPeer)) {
             std::erase(devices.tilePeers, devices.ffnPeer);
@@ -256,7 +253,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
     std::exception_ptr error;
     auto worker = [&](auto fn) {
         return std::async(std::launch::async, [&, fn] {
-            c10::InferenceMode mode;
+
             try {
                 fn();
             } catch (...) {
@@ -295,7 +292,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
             bool released = false;
             Intent::HiddenReady waitReady;
             if (fresh && devices.intent != 0) {
-                waitReady = [&](const at::Tensor &h50) {
+                waitReady = [&](const native::Tensor &h50) {
                     auto features = floats(h50.narrow(0, h50.size(0) - 1, 1));
                     bodies.put({index, std::move(features), intentCommit.get_future().share()});
                     released = true;
@@ -308,7 +305,10 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
             if (released) {
                 // KV writes from the remaining layers are asynchronous. Resolve
                 // the publication fence only after GPU completion on their stream.
-                c10::cuda::getCurrentCUDAStream(devices.intent).synchronize();
+                {
+                    native::DeviceGuard intentDevice(devices.intent);
+                    native::check(cudaStreamSynchronize(nullptr));
+                }
                 intentCommit.set_value();
             }
             auto &[hidden, ids] = pending;
@@ -326,14 +326,14 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
         bodies.close();
     });
     auto realization = worker([&] {
-        c10::cuda::CUDAGuard dev(at::Device(at::kCUDA, 0));
+        native::DeviceGuard dev(0);
         if (resetReal) {
             if (!real)
                 real = std::make_unique<Session>(0, ModelSource(root), h / 16, w / 16);
             auto ref = readFile(assets / referencePreset(w, h));
             if (ref.size() != size_t(h / 16) * (w / 16) * 24 * 2)
                 throw std::runtime_error("wrong preset geometry");
-            auto values = floats(at::from_blob(ref.data(), {int64_t(ref.size() / 2)}, at::kBFloat16));
+            auto values = floats(native::from_blob(ref.data(), {int64_t(ref.size() / 2)}, native::kBFloat16));
             auto states = sharedFuture.get();
             check();
             real->reset(values, states, states.size() / 5120, fresh);
@@ -364,7 +364,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
         packets.close();
     });
     auto codec = worker([&] {
-        c10::cuda::CUDAGuard dev(at::Device(at::kCUDA, devices.codec));
+        native::DeviceGuard dev(devices.codec);
         if (!solarx) {
             solarx = std::make_unique<SolarX>(root + "/codec/video_vae/model.safetensors", devices.codec,
                                               devices.tilePeers);
@@ -385,7 +385,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
             if (r.chunk != first + count)
                 throw std::logic_error("out-of-order Codec packet");
             int lh = h / 16, lw = w / 16, samples = r.endSample - r.firstSample;
-            auto z = at::from_blob(r.video.data(), {5, lh / 2, lw / 2, 24, 2, 2}, at::kFloat)
+            auto z = native::from_blob(r.video.data(), {5, lh / 2, lw / 2, 24, 2, 2}, native::kFloat)
                          .permute({3, 0, 1, 4, 2, 5})
                          .reshape({24, 5, lh, lw});
             auto deviceRgb = solarx->decode(z);
@@ -398,7 +398,7 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
                 std::vector<float> latent(29 * 32);
                 for (int t = 0; t < 29; ++t)
                     for (int c = 0; c < 32; ++c)
-                        latent[t * 32 + c] = float(at::BFloat16(r.audio[(ch * 29 + t) * 32 + c])) *
+                        latent[t * 32 + c] = float(__nv_bfloat16(r.audio[(ch * 29 + t) * 32 + c])) *
                                                  constants::audio_latents_std[c] +
                                              constants::audio_latents_mean[c];
                 auto wave =
@@ -422,10 +422,9 @@ void Pipeline::run(const fs::path &dir, const Emit &emit, bool fresh,
             if (!rgbFile || !pcmFile)
                 throw std::runtime_error("media storage full");
             if (avc) {
-                auto yuv = at::empty({17, h * w * 3 / 2}, deviceRgb.options());
-                duo_rgb_to_i420(deviceRgb.data_ptr<uint8_t>(), yuv.data_ptr<uint8_t>(), w, h, 17,
-                                c10::cuda::getCurrentCUDAStream(devices.codec));
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                auto yuv = native::empty({17, h * w * 3 / 2}, deviceRgb.options());
+                duo_rgb_to_i420(deviceRgb.data_ptr<uint8_t>(), yuv.data_ptr<uint8_t>(), w, h, 17, nullptr);
+                native::check(cudaGetLastError());
                 auto host = yuv.cpu();
                 avc->write(dir / name, count, host.data_ptr<uint8_t>(), g.audio);
             } else {

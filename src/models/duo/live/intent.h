@@ -6,7 +6,7 @@ namespace fastllm::duo::live {
 struct Visual {
     int rows, cols;
     // One entry per temporal pair. Each contains the primary embedding and three deepstack tensors.
-    std::vector<std::array<at::Tensor, 4>> pairs;
+    std::vector<std::array<native::Tensor, 4>> pairs;
 };
 class Intent {
   public:
@@ -14,9 +14,9 @@ class Intent {
            const std::filesystem::path &cache = {});
     void writeCache(const std::string &path) const;
     void reset();
-    using HiddenReady = std::function<void(const at::Tensor &)>;
-    at::Tensor forward(const std::vector<int> &ids, const Visual *visual = nullptr, bool logits = true,
-                       const HiddenReady &hiddenReady = {});
+    using HiddenReady = std::function<void(const native::Tensor &)>;
+    native::Tensor forward(const std::vector<int> &ids, const Visual *visual = nullptr, bool logits = true,
+                           const HiddenReady &hiddenReady = {});
     int nextToken() const;
     int length() const { return past; }
     int position() const { return nextPosition; }
@@ -25,17 +25,17 @@ class Intent {
   private:
     Weights base, adapter;
     std::string identity;
-    at::Tensor logits, frequency, dynamicMap;
-    std::array<at::Tensor, 64> keys, values;
+    native::Tensor logits, frequency, dynamicMap;
+    std::array<native::Tensor, 64> keys, values;
     struct Quant {
-        at::Tensor packed, scales;
+        native::Tensor packed, scales;
         int rows, cols;
-        at::Tensor dense;
+        native::Tensor dense;
     };
     std::map<std::string, Quant> quant;
     size_t prefillBudget = 0, prefillBytes = 0;
     int past = 0, nextPosition = 0, capacity = 0;
-    at::Tensor project(const at::Tensor &x, const std::string &name);
-    void compress(const std::string &name, at::Tensor &weight);
+    native::Tensor project(const native::Tensor &x, const std::string &name);
+    void compress(const std::string &name, native::Tensor &weight);
 };
 } // namespace fastllm::duo::live

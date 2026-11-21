@@ -1,16 +1,16 @@
 # Duo 音视频交互与原生 Realization 后端
 
-浏览器在文件上传或录制结束后提交完整视频。支持 WebCodecs 的浏览器通过一个持续的 HTTP 响应接收 H.264 Annex B 与 32 kHz 双声道 PCM，每段 17 帧。其他浏览器使用 H.264/AAC 分段，回合结束均可下载完整 MP4。HTTP 服务及每个会话的推理工作进程均由同一原生可执行文件启动。原生流水线还提供逐块输入接口 `Pipeline::stream`。工作进程执行语音识别与对齐、视觉编码、Intent、Realization 和 Codec。LibTorch 提供 C++ ATen CUDA 算子，FFmpeg 和 ffprobe 负责容器与音视频格式。
+浏览器在文件上传或录制结束后提交完整视频。支持 WebCodecs 的浏览器通过一个持续的 HTTP 响应接收 H.264 Annex B 与 32 kHz 双声道 PCM，每段 17 帧。其他浏览器使用 H.264/AAC 分段，回合结束均可下载完整 MP4。HTTP 服务及每个会话的推理工作进程均由同一原生可执行文件启动。原生流水线还提供逐块输入接口 `Pipeline::stream`。工作进程执行语音识别与对齐、视觉编码、Intent、Realization 和 Codec。Intent、语音对齐和 SolarX 使用 C++/CUDA、cuBLAS 和 cuFFT。FFmpeg 和 ffprobe 负责容器与音视频格式。
 
 ## 构建与运行对话服务
 
-需要 CUDA 工具链、CUDA 版 LibTorch C++ 发行包、FFmpeg、x264 和原生 Qwen3-ASR 源码。构建需安装原生开发包 `libx264-dev`、`libavcodec-dev`、`libavutil-dev`、`libswscale-dev`。以下命令适用于本次的 SM120 GPU。Qwen3-ASR 在构建时链接进服务。
+需要 CUDA 工具链、cuBLAS、cuFFT、FFmpeg、x264 和原生 Qwen3-ASR 源码。构建需安装原生开发包 `libx264-dev`、`libavcodec-dev`、`libavutil-dev`、`libswscale-dev`。以下命令适用于本次的 SM120 GPU。Qwen3-ASR 在构建时链接进服务。 Duo 的构建、运行与测试均无需安装 PyTorch，也无需设置 Torch 环境变量。
 
 ```sh
 git clone https://github.com/antirez/qwen-asr /path/to/qwen-asr
 git -C /path/to/qwen-asr checkout 924694251d9e0f18e5d86bbd06aa3ab5f870002d
 cmake -S . -B build-duo -DUSE_CUDA=ON -DCUDA_ARCH=120 -DBUILD_DUO=ON \
-  -DDUO_LIBTORCH_ROOT=/path/to/libtorch -DDUO_QWEN_ASR_SOURCE=/path/to/qwen-asr \
+  -DDUO_QWEN_ASR_SOURCE=/path/to/qwen-asr \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build-duo --target duo_live duo_pack_intent duo_solarx -j 6
 
@@ -109,6 +109,8 @@ HTTP 入口每个请求最多 32 MiB，忙时返回 409，不积压生成请求�
 `chunk` 从 0 连续递增。输出 `first_sample/end_sample` 使用
 `ceil(frame * 32000 / 24)`，与官方半开音频区间一致，不能累计取整后的 708 ms。
 
+运行时的 Intent、视听预处理、对齐和 SolarX 解码由 C++/CUDA 执行。
+
 服务 RNG 是 C++ `mt19937_64`＋`normal_distribution<float>`，同一构建、输入和 seed
 可重复；不承诺与 Torch CUDA 使用相同 seed 时噪声一致，也不承诺跨标准库位一致。
 数值对照应使用 CLI 的显式噪声输入。
@@ -134,8 +136,7 @@ causal 两个张量；四步 DMD 八个张量，顺序为初始 video/audio、�
 video/audio。错误、非有限值或取消均不会发布部分结果。
 
 ```sh
-# inclusionAI/Duo 固定参考提交：897a7fefdee3b93e9c911cd9eedfa4c7a6420b5a
-PYTHONPATH=/path/to/Duo python3 test/duo/reference_fixture.py /tmp/duo-tiny
+python3 test/duo/reference_fixture.py /tmp/duo-tiny
 build-duo/src/models/duo/duo_generate /tmp/duo-tiny /tmp/duo-tiny/request.json \
   /tmp/duo-native /tmp/duo-tiny/adapter
 python3 test/duo/compare.py /tmp/duo-tiny /tmp/duo-native
@@ -151,11 +152,14 @@ ModelOpt FP8 输出的上限为 0.001，与 MiniMax-H3 音视频流水线的输�
 可用 `--max-absolute` 指定额外门槛。BF16、LoRA 和 causal 基准继续使用相对 L2 0.0005 和最大绝对误差 0.001。
 所有对照都校验形状和有限值，全零参考要求输出也全零。
 使用 `reference_fixture.py --fp8 --production-head` 生成正式模型头宽为 128 的对照样本。
+在 SM120 上，额外的 `--production-head` 四步 BF16 和 LoRA 样本最大绝对误差分别为 0.00121 和 0.00233，超过 0.001 门槛。两组相对 L2 均低于 0.0003，原生化前后的 Realization 输出逐字节一致。启动器的 Distill FP8 样本通过既有门槛。
 独立投影测试 `minimax_h3_image_fp8` 用 CPU E4M3 参考计算校验 ModelOpt 的逐通道权重缩放和动态激活量化。
 
 ## 回归测试
 
-生成四组 fixture 后，可统一执行：
+回归样本来自 inclusionAI/Duo 的 `897a7fefdee3b93e9c911cd9eedfa4c7a6420b5a`。生成脚本可用 `git show d6ca83b5:test/duo/reference_fixture.py` 查看。仓库按 SHA256 去重保存权重、输入与官方输出；展开 12 种配置中的任意一组只需 Python 标准库。
+
+展开四组基础样本后，可统一执行：
 
 ```sh
 python3 test/duo/run_suite.py --build build-duo --fixtures /path/to/fixtures

@@ -1,7 +1,7 @@
 #include "reference.h"
 #include "models/minimax_h3/runtime.h"
 #include "tables.h"
-#include <c10/util/BFloat16.h>
+#include <cuda_bf16.h>
 #include <cmath>
 #include <stdexcept>
 
@@ -24,7 +24,7 @@ std::string encodeReference(const std::string &model, const std::string &rgb, in
     const auto moments = encoder.encodeMoments(pixels);
     // The official reference takes the posterior mean, normalizes each channel
     // and packs each 2x2 patch in (channel, dy, dx) order.
-    std::vector<c10::BFloat16> packed;
+    std::vector<__nv_bfloat16> packed;
     packed.reserve(size_t(moments.height) * moments.width * 24);
     for (int y = 0; y < moments.height; y += 2)
         for (int x = 0; x < moments.width; x += 2)

@@ -3,6 +3,7 @@
 #include <chrono>
 #include <iostream>
 
+namespace native = fastllm::duo::native;
 int main(int argc, char **argv) {
     try {
         if (argc < 7) {
@@ -19,7 +20,7 @@ int main(int argc, char **argv) {
             throw std::runtime_error("cannot open RGB output");
         for (int i = 6; i < argc; ++i) {
             std::ifstream in(argv[i], std::ios::binary | std::ios::ate);
-            auto packed = at::empty({5, h / 2, w / 2, 24, 2, 2}, at::kFloat);
+            auto packed = native::empty({5, h / 2, w / 2, 24, 2, 2}, native::kFloat);
             if (!in || in.tellg() != int64_t(packed.nbytes()))
                 throw std::runtime_error("wrong input size");
             in.seekg(0);
