@@ -16,8 +16,11 @@ def main():
     """/** 使用既有Dense公共入口回归四种配置；任何子验收失败即非零退出。 */"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--build', type=Path, required=True)
+    parser.add_argument('--configuration', choices=('dp2_tp1_eager', 'dp4_tp1_graph', 'dp2_tp2_eager', 'dp2_tp2_graph'),
+                        help='只运行一个公开DP/TP回归分组')
+    parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
     args = parser.parse_args()
-    directory = ROOT / 'test/distributed/results' / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_dense_regression_' + uuid.uuid4().hex[:8])
+    directory = args.output.resolve() / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_dense_regression_' + uuid.uuid4().hex[:8])
     directory.mkdir(parents=True)
     model = directory / 'model'
     config, _ = make_model(model, {})
@@ -31,9 +34,13 @@ def main():
     fast.chat_template = "{% for message in messages %}w1 {{ message['content'] }} w2 {% endfor %}w3"
     fast.save_pretrained(model)
     for dp, tp, graph in ((2, 1, False), (4, 1, True), (2, 2, False), (2, 2, True)):
+        name = f'dp{dp}_tp{tp}_{"graph" if graph else "eager"}'
+        if args.configuration and args.configuration != name:
+            continue
         command = [sys.executable, str(ROOT / 'test/distributed/run_qwen3_dp.py'), '--model', str(model),
                    '--generate', str(args.build / 'fastllm_tp_generate'), '--worker', str(args.build / 'fastllm_tp_worker'),
-                   '--build-cache', str(args.build / 'CMakeCache.txt'), '--dp', str(dp), '--tp', str(tp)]
+                   '--build-cache', str(args.build / 'CMakeCache.txt'), '--dp', str(dp), '--tp', str(tp),
+                   '--dp-routing', 'load', '--output', str(directory)]
         if graph:
             command += ['--cuda-graph', '--prefix-cache']
         with (directory / f'dp{dp}_tp{tp}_graph{int(graph)}.log').open('wb') as log, case_process(command, stdout=log, stderr=log) as process:

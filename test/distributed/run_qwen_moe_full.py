@@ -393,12 +393,15 @@ class Suite:
                 self.correctness(model, world, lambda ids: full_logits(config, tensors, ids),
                                  modes=[(graph, prefix)], case_suffix=f'_repeat{index+1:03d}')
         else:
-            for name, options in SYNTHETIC_FIXTURES.items():
+            selected = getattr(self.args, 'synthetic_fixtures', None) or list(SYNTHETIC_FIXTURES)
+            self.metadata.update(scope='synthetic_partition', selected_fixtures=selected,
+                                 expected_case_count=len(selected) * 12)
+            for name in selected:
+                options = SYNTHETIC_FIXTURES[name]
                 model = self.output / name
                 config, tensors = fixture(model, **options)
                 for world in (1, 2, 4):
                     self.correctness(model, world, lambda ids: full_logits(config, tensors, ids))
-            self.lifecycle(self.output / 'f16_bias')
 
     def lifecycle(self, model):
         """/** 覆盖EOS、非法输入、取消后复用、关闭与真实worker故障；失败不能假装PASS。 */"""
@@ -769,6 +772,10 @@ def main():
                         help='定向性能复测的并发数；默认1/4/8，始终同时测试Eager/Graph')
     parser.add_argument('--synthetic-case', choices=sorted(SYNTHETIC_CASES),
                         help='只复现指定小模型用例；不代表完整验收通过')
+    parser.add_argument('--synthetic-fixtures', nargs='+', choices=sorted(SYNTHETIC_FIXTURES),
+                        help='分批运行小模型；每种模型展开12个case，每批最多4种，生命周期单独运行')
+    parser.add_argument('--lifecycle-only', action='store_true',
+                        help='仅运行生命周期与worker故障；省略--model时使用FP16小模型')
     parser.add_argument('--repeat', type=int, default=1, help='定向用例独立执行次数；任何一轮失败则总体失败')
     parser.add_argument('--timeout', type=float, default=1800)
     parser.add_argument('--output', type=Path, default=ROOT / 'test/distributed/results')
@@ -796,6 +803,24 @@ def main():
         parser.error('--repeat必须为正整数，重复执行必须指定--synthetic-case')
     if args.synthetic_case and (args.model or args.performance):
         parser.error('--synthetic-case不能与--model或--performance混用')
+    if args.synthetic_fixtures and (args.model or args.performance or args.synthetic_case or args.lifecycle_only):
+        parser.error('--synthetic-fixtures不能与真实模型、性能、定向case或生命周期混用')
+    if args.lifecycle_only and (args.performance or args.synthetic_case or args.alignment_policy != 'topk'):
+        parser.error('--lifecycle-only必须独立运行')
+    if args.synthetic_fixtures and len(set(args.synthetic_fixtures)) != len(args.synthetic_fixtures):
+        parser.error('小模型分组不能包含重复项')
+    if not (args.model or args.performance or args.synthetic_case or args.lifecycle_only):
+        if 12 * len(args.synthetic_fixtures or SYNTHETIC_FIXTURES) > 50:
+            parser.error('小模型矩阵超过50个case，请用--synthetic-fixtures分批，每批最多4种')
+    if args.performance and 2 * len(args.performance_prompt_lengths) * len(args.performance_cache_states) * len(args.performance_concurrencies) > 50:
+        parser.error('性能矩阵超过50个case，请按长度或缓存状态拆分')
+    if args.model and not args.performance and not args.lifecycle_only:
+        request_count = sum(bool(line.strip()) for line in args.requests.read_text().splitlines())
+        generation_cases = 8 * request_count + 6
+        # all包含生成明细、5项numeric及4项策略汇总，保守地全部计入上限。
+        case_count = 5 if args.alignment_policy == 'numeric' else generation_cases + (9 if args.alignment_policy == 'all' else 0)
+        if case_count > 50:
+            parser.error('HF对齐超过50个case，请拆分--requests；all模式每批最多4条请求')
     if args.performance and (args.alignment_policy != 'topk' or args.alignment_topk != 5 or args.near_tie_tol != 0.1):
         parser.error('--performance独立测速，不能同时指定其他对齐策略或候选阈值')
     if args.alignment_policy == 'all':
@@ -810,7 +835,13 @@ def main():
         parser.error(str(error))
     suite = Suite(args)
     try:
-        if args.performance:
+        if args.lifecycle_only:
+            model = args.model or suite.output / 'f16_bias'
+            if not args.model:
+                fixture(model, **SYNTHETIC_FIXTURES['f16_bias'])
+            suite.metadata.update(scope='lifecycle', expected_case_count=2)
+            suite.lifecycle(model)
+        elif args.performance:
             model = args.model or suite.output / 'f16_bias'
             if not args.model:
                 fixture(model, **SYNTHETIC_FIXTURES['f16_bias'])

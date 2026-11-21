@@ -154,14 +154,14 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(snapshots[-1]['completed_case_count'], 18)
 
     def test_long_context_matrix_counts_each_length_and_uses_matching_baselines(self):
-        """/** 三个长输入各跑18项，吞吐量按128输出计数，Eager/Graph只比较同长度基线。 */"""
-        lengths = [512, 1024, 1792]
+        """/** 两个长输入各跑18项，总数不超过50，Eager/Graph只比较同长度基线。 */"""
+        lengths = [1024, 1792]
         code, snapshots, _ = self.run_performance(prompt_lengths=lengths, output_tokens=128)
         self.assertEqual(code, 0)
         result = snapshots[-1]
         self.assertTrue(result['complete'])
-        self.assertEqual(result['expected_case_count'], 54)
-        self.assertEqual(result['completed_case_count'], 54)
+        self.assertEqual(result['expected_case_count'], 36)
+        self.assertEqual(result['completed_case_count'], 36)
         self.assertEqual(result['metadata']['prompt_lengths'], lengths)
         self.assertEqual(result['metadata']['max_new_tokens'], 128)
         for length in lengths:
