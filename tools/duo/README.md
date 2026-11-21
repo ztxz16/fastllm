@@ -16,8 +16,8 @@ cmake --build build-duo --target duo_live duo_pack_intent duo_solarx -j 6
 
 duo_bin=build-duo/src/models/duo/live
 duo_model=/path/to/Duo-1.0-distill-quant
-CUDA_VISIBLE_DEVICES=0 "$duo_bin/duo_pack_intent" "$duo_model" /path/to/intent-nf4
-CUDA_VISIBLE_DEVICES=0,1,2,3 "$duo_bin/duo_live" "$duo_model" tools/duo /path/to/sessions 18190 four --intent-cache /path/to/intent-nf4
+"$duo_bin/duo_pack_intent" "$duo_model" /path/to/intent-nf4
+"$duo_bin/duo_live" "$duo_model" tools/duo /path/to/sessions 18190 four --intent-cache /path/to/intent-nf4
 ```
 
 安装了 Duo 运行包后，用以下命令在前八张可见 GPU 上启动一个会话服务。

@@ -184,7 +184,7 @@ void Cache::evict(Runtime &rt, int first) {
     groups = std::move(kept);
 }
 struct Model::Impl {
-    ModelSource source;
+    float loraScale;
     Config cfg;
     Runtime rt, full;
     nomas::Weights weights, fullWeights;
@@ -198,8 +198,9 @@ struct Model::Impl {
     bool lowMemory;
     std::unique_ptr<FfnPeer> ffnPeer;
     Impl(int device, const ModelSource &s, bool low)
-        : source(s), cfg(s.entry["config"]), rt(device, DType::BF16, {true, false}),
-          full(device, DType::FP32), weights(rt, s.weights), fullWeights(full, s.weights), lowMemory(low) {
+        : loraScale(s.loraScale), cfg(s.entry["config"]), rt(device, DType::BF16, {true, false}),
+          full(device, DType::FP32), weights(rt, s.weights), fullWeights(full, s.weights),
+          times(schedule(s.steps, s.shift)), lowMemory(low) {
         if (!s.adapter.empty()) {
             lora = std::make_unique<nomas::Weights>(full, s.adapter + "/adapter.safetensors");
             auto metadata = readJson(s.adapter + "/adapter.json");
@@ -237,8 +238,8 @@ struct Model::Impl {
             return out;
         require(loraKeys.count(b), "incomplete adapter pair");
         auto delta = full.linear(full.linear(full.cast(x, DType::FP32), lora->get(a)), lora->get(b));
-        if (source.loraScale != 1)
-            delta = full.affine(delta, source.loraScale);
+        if (loraScale != 1)
+            delta = full.affine(delta, loraScale);
         if (swap)
             delta = swapHalves(full, delta);
         auto type = out.dtype;
@@ -340,7 +341,6 @@ void Model::prepare() {
     auto &m = *impl_;
     if (!m.modulation.empty())
         return;
-    m.times = schedule(m.source.steps, m.source.shift);
     std::vector<Tensor> inputs, plans;
     for (float time : m.times) {
         auto x = m.full.timestepEmbedding({1.f, time}, m.cfg.freq);
@@ -474,7 +474,7 @@ bool Session::enableFfnPeer(int device) {
     auto &m = *model_.impl_;
     const int mediaRows = 5 * height_ * width_ / 4 + 58;
     if (!m.lowMemory && !m.ffnPeer && mediaRows >= minPeerFfnRows)
-        m.ffnPeer = FfnPeer::create(m.rt.device(), device, m.source, m.cfg, m.quantKeys);
+        m.ffnPeer = FfnPeer::create(m.rt.device(), device, source_, m.cfg, m.quantKeys);
     return bool(m.ffnPeer);
 }
 void Session::checkpoint() const {
@@ -569,14 +569,15 @@ ChunkResult Session::generate(int chunk, const std::vector<float> &features, int
         auto v = random(nv, 96), a = random(na, 32);
         // All sampling steps and the clean KV pass use the same text rows and visibility.
         auto condition = model_.prepareText(current, text);
-        auto grid = schedule(source_.steps, source_.shift);
+        const auto &grid = model_.impl_->times;
+        const bool distilled = source_.stage == "dmd";
         for (int i = 0; i < source_.steps; ++i) {
             checkpoint();
             auto pred = model_.forwardPrepared(current, v, a, condition, grid[i], cache_, nullptr, [&] { checkpoint(); });
-            float amount = source_.stage == "causal" ? grid[i + 1] - grid[i] : 1.f - grid[i];
+            const float amount = distilled ? 1.f - grid[i] : grid[i + 1] - grid[i];
             v = flowUpdate(rt, v, pred.first, amount);
             a = flowUpdate(rt, a, pred.second, amount);
-            if (source_.stage == "dmd" && i + 1 < source_.steps) {
+            if (distilled && i + 1 < source_.steps) {
                 v = flowNoise(rt, v, random(nv, 96), grid[i + 1]);
                 a = flowNoise(rt, a, random(na, 32), grid[i + 1]);
             }
