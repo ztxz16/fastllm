@@ -4362,6 +4362,16 @@ namespace fastllm {
                weights[2]->dims[1] == weights[3]->dims[0];
     }
 
+    // Standard GGUF projections keep FP32 activations. Apply the model's
+    // optional gate/up limits before the normal GGUF down-input quantizer.
+    static void ClampedCrossSwiglu(const float *pairs, float *out, size_t count, float limit) {
+        for (size_t i = 0; i < count; ++i) {
+            const float gate = std::min(pairs[2 * i], limit);
+            const float up = std::clamp(pairs[2 * i + 1], -limit, limit);
+            out[i] = gate / (1.f + std::exp(-gate)) * up;
+        }
+    }
+
     static void NumasMoeDecodeExpertsImpl(const float *input, float *output,
             Data **weights, const int32_t *indices, const int32_t *gpuIndices,
             int topk, int layer, const float *routeScores, float swigluLimit,
@@ -4371,6 +4381,7 @@ namespace fastllm {
         const bool scoredBfloat = routeScores != nullptr;
         // Either projection may require GGUF activation packing. A native gate
         // with a GGUF down must not use the fused native BF16 down writer.
+        const bool clampedGGUF = !scoredBfloat && swigluLimit > 0.f && weights[2]->dataType == DATA_GGUF_FORMAT;
         const bool scoredGguf = scoredBfloat &&
             (weights[2]->dataType == DataType::DATA_GGUF_FORMAT ||
              weights[3]->dataType == DataType::DATA_GGUF_FORMAT);
@@ -4512,7 +4523,7 @@ namespace fastllm {
             finishCpu();
             return;
         }
-        if (!scoredBfloat && q8Down && gateAct >= DataType::DATA_GGUF_FORMAT &&
+        if (!scoredBfloat && !clampedGGUF && q8Down && gateAct >= DataType::DATA_GGUF_FORMAT &&
                 gateAct < DataType::DATA_GGUF_FORMAT_END) {
             work.hybridDecodeQueues.resize(config->numaCnt);
             work.hybridDecodeWorkers.resize(config->threads);
@@ -4631,7 +4642,7 @@ namespace fastllm {
                                     item * columns + node * perNode), DataType::FLOAT32,
                                 work.swigluOutput.data() + item * inter,
                                 1, hidden, columns, row, row + rows, node * perNode,
-                                quantizeDownRows ? nullptr : work.downInput.data() + item * downBytes, downAct);
+                                quantizeDownRows ? nullptr : work.downInput.data() + item * downBytes, downAct, clampedGGUF);
                         } else {
                             downTasks.emplace_back(work.downInput.data() + item * downBytes, downAct,
                                 weight.numasData[node], weight.GetDataType(),
@@ -4672,7 +4683,9 @@ namespace fastllm {
             runWorkers(work.decodeWorkers, phase == 0, &active);
             // Q8_K/Q8_1 and other GGUF activation formats retain the normal
             // whole-row quantizer after all gate/up tasks have completed.
-            if (phase == 0 && quantizeDownRows)
+            if (phase == 0 && clampedGGUF)
+                ClampedCrossSwiglu(work.gateUpOutput.data(), work.swigluOutput.data(), size_t(count) * inter, swigluLimit);
+            if (phase == 0 && (quantizeDownRows || clampedGGUF))
                 RunMultiThreadConvertFromFloat32(work.downInput.data(), downAct,
                     work.swigluOutput.data(), count, inter, pool);
         }
@@ -7797,7 +7810,9 @@ namespace fastllm {
             stride = 208;
         }
         const bool useDeepSeekV4PostOps = useDeepSeekV4LargeFast || quantizedPrepareBlock;
-        const bool skipRedundantCrossSwiglu = useDeepSeekV4PostOps || fp8EagerMode || bf16ExpertMode;
+        const bool clampedGGUF = !deepSeekV4Mode && swigluLimit > 0.f && !weights[0] &&
+            weights[2] && weights[2]->dataType == DATA_GGUF_FORMAT;
+        const bool skipRedundantCrossSwiglu = useDeepSeekV4PostOps || fp8EagerMode || bf16ExpertMode || clampedGGUF;
         const bool useParallelDeepSeekV4Prepare =
             quantizedPrepareBlock || (useDeepSeekV4LargeFast &&
                              interDim % (128 * numaConfig->numaCnt) == 0);
@@ -7961,7 +7976,11 @@ namespace fastllm {
 
         // 4. swigluOutput -> downInput. DeepSeek-V4 must redo the fused
         // activation from gateUpOutput to preserve its BF16/clamp/route order.
-        if (bf16ExpertMode) {
+        if (clampedGGUF) {
+            ClampedCrossSwiglu(gateUpOutput.data(), swigluOutput.data(), size_t(totalLines) * interDim, swigluLimit);
+            RunMultiThreadConvertFromFloat32(downInput.data(), downInputDataType,
+                swigluOutput.data(), totalLines, interDim, GetHostMoePool());
+        } else if (bf16ExpertMode) {
             // Native BF16 projections round before SwiGLU, then the complete
             // activation rounds once. Do not round SiLU or apply scores here.
             const auto &silu = GetBFloat16SiluLookup();

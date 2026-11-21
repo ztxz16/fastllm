@@ -111,17 +111,16 @@ template<class T> static std::vector<float> Q8Reference(const T *values, int cou
 struct ReferenceStages { bool gate, down; };
 static ReferenceStages ExpectedStages(ggml_type gate, ggml_type down, int rows, bool resident = false) {
     if (resident && rows > 32) return {true, true};
-    auto supported = [rows](ggml_type type) {
+    auto supported = [](ggml_type type) {
         switch (type) {
             case GGML_TYPE_Q2_0: case GGML_TYPE_IQ1_M: case GGML_TYPE_IQ2_XXS:
-            case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: return true;
+            case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
             case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
-            case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: return rows <= 32;
+            case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ4_XS: return true;
             default: return false;
         }
     };
-    const bool g = supported(gate), d = supported(down);
-    return rows <= 32 ? ReferenceStages{g, d} : ReferenceStages{g && d, g && d};
+    return {supported(gate), supported(down)};
 }
 
 template<class T> static void CheckReference(ggml_type type, fastllm::DataType dtype,
@@ -289,8 +288,83 @@ template<class T> static void Run(ggml_type type, fastllm::DataType dtype, int b
     Require(fastllm_moe_cuda_cache_stats(0, stats, false) && stats[2] == 0, "released GPU allocation counted");
     std::printf("PASS GGUF cache type=%d dtype=%d batch=%d: mixed layers, snapshot, cold/hot, eviction, duplicate/invalid routes, graph, release\n", type, dtype, batch);
 }
-// Validate FP32 MMQ/MMVQ against CPU-decoded weights and an independent Q8
-// activation oracle. Exact activations also cover the FP16 metadata layouts.
+// Compare single-token K projections against the original identity-mapped
+// path, including replay after the staged route set changes or becomes empty.
+static void RunClippedKDecode(ggml_type gateType, ggml_type downType, bool sparse, bool cross) {
+    using namespace fastllm;
+    constexpr int width = 512, topk = 3;
+    auto g = Weight(gateType, 2 * width, width, 1);
+    auto d = Weight(downType, width, width, 2);
+    const size_t offset = g->GetBytes(), stride = offset + d->GetBytes();
+    Data records(INT8, {int(stride)}), workspace(FLOAT32, {width});
+    Data input(FLOAT32, {1, width}), gate(FLOAT32, {topk, width}), output(FLOAT32, {1, width});
+    Data partial(FLOAT32, {topk, width}), slots(INT32, {topk}), map(INT32, {topk}), scores(FLOAT32, {topk});
+    for (auto *v : {&records,&workspace,&input,&gate,&output,&partial,&slots,&map,&scores}) Gpu(*v);
+    Cuda(cudaMemcpy(records.cudaData, g->cpuData, offset, cudaMemcpyHostToDevice));
+    Cuda(cudaMemcpy(static_cast<uint8_t *>(records.cudaData) + offset, d->cpuData, d->GetBytes(), cudaMemcpyHostToDevice));
+    int identity[topk] = {0, 1, 2};
+    Cuda(cudaMemcpy(map.cudaData, identity, sizeof(identity), cudaMemcpyHostToDevice));
+    FastllmCudaMoeGGUFCacheView view{static_cast<uint8_t *>(records.cudaData), static_cast<int32_t *>(slots.cudaData),
+        stride,offset,gateType,downType,width,width,workspace.cudaData,workspace.GetBytes()};
+    view.swigluLimit = 7;
+    view.numaGateType = cross ? int(gateType) : -1;
+    view.numaDownType = cross ? int(downType) : -1;
+    view.preserveMissing = sparse;
+    auto project = [&] {
+        Require(FastllmCudaMoeGGUFCacheCompute(input,gate,output,view,static_cast<float *>(scores.cudaData),
+                    topk,static_cast<float *>(partial.cudaData)), "clipped K projection rejected");
+    };
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    Cuda(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+    project();
+    Cuda(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+    Cuda(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+    for (int step = 0; step < 4; ++step) {
+        std::vector<float> x(width);
+        for (int i = 0; i < width; ++i)
+            x[i] = step == 3 || (step == 1 && i >= 256) ? 0.f : .11f * std::sin(i * .73f + step);
+        int routes[topk] = {step == 1 ? -1 : 0, step % 2 ? -1 : 0, step == 0 ? 0 : -1};
+        std::vector<float> quantized;
+        // The generic Q3 gate consumes floats. Feed it exactly the activation
+        // represented by each Q8_K block in the single-row packed path.
+        if (gateType == GGML_TYPE_Q3_K) {
+            quantized = x;
+            for (int b = 0; b < width; b += QK_K) {
+                float peak = 0;
+                for (int i = b; i < b + QK_K; ++i) peak = std::max(peak, std::fabs(x[i]));
+                if (peak == 0) continue;
+                for (int i = b; i < b + QK_K; ++i)
+                    quantized[i] = std::nearbyint(x[i] * (127.f / peak)) * (peak / 127.f);
+            }
+        }
+        const auto &referenceInput = quantized.empty() ? x : quantized;
+        Cuda(cudaMemcpy(input.cudaData,referenceInput.data(),input.GetBytes(),cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(slots.cudaData,routes,sizeof(routes),cudaMemcpyHostToDevice));
+        view.routeMap = static_cast<int32_t *>(map.cudaData);
+        view.routeCount = topk;
+        project();
+        std::vector<float> expected(topk*width), actual(topk*width);
+        Cuda(cudaMemcpy(expected.data(),partial.cudaData,partial.GetBytes(),cudaMemcpyDeviceToHost));
+        if (!quantized.empty())
+            Cuda(cudaMemcpy(input.cudaData,x.data(),input.GetBytes(),cudaMemcpyHostToDevice));
+        Cuda(cudaMemsetAsync(partial.cudaData,0xff,partial.GetBytes(),cudaStreamPerThread));
+        Cuda(cudaMemsetAsync(gate.cudaData,0xff,gate.GetBytes(),cudaStreamPerThread));
+        Cuda(cudaGraphLaunch(exec,cudaStreamPerThread));
+        Cuda(cudaMemcpy(actual.data(),partial.cudaData,partial.GetBytes(),cudaMemcpyDeviceToHost));
+        for (int i = 0; i < topk * width; ++i) {
+            if (sparse && routes[i / width] < 0) {
+                Require(std::isnan(actual[i]), "sparse replay overwrote an inactive expert partial");
+                continue;
+            }
+            Require(std::isfinite(actual[i]) && std::fabs(actual[i]-expected[i]) <=
+                3.e-4f * std::max(1.f,std::fabs(expected[i])), "clipped K replay changed expert partial");
+        }
+    }
+    Cuda(cudaGraphExecDestroy(exec));
+    Cuda(cudaGraphDestroy(graph));
+}
+
 // Call the declaration-only MMVQ interface with its original default template
 // arguments. This catches missing explicit instantiations after CUDA splitting
 // and keeps the multi-matrix/indirect-expert path covered by a CPU oracle.
@@ -347,6 +421,8 @@ static void RunLegacyMmvqDispatch() {
     fastllm::FastllmCudaSetLinearExactBatchThreshold(previous);
 }
 
+// Validate FP32 MMQ/MMVQ against CPU-decoded weights and an independent Q8
+// activation oracle. Exact activations also cover the FP16 metadata layouts.
 static void RunFloatGgufMatmul(ggml_type type, int batch, int columns, int width, bool exactActivation = false) {
     const auto matmul = batch <= 8 ? FastllmCudaFloatMatMulGGUFMMVQ : FastllmCudaFloatMatMulGGUFMMQ;
     auto weight = Weight(type, width, columns, 5, true);
@@ -1820,6 +1896,13 @@ int main(int argc, char **argv) {
     try {
         int count = 0; Cuda(cudaGetDeviceCount(&count)); if (!count) { std::puts("SKIP: no CUDA device"); return 0; }
         Cuda(cudaSetDevice(0));
+        if (argc == 1 || std::strcmp(argv[1], "--clipped-k-decode") == 0) {
+            for (auto gate : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K})
+                for (auto down : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K})
+                    for (bool sparse : {false, true})
+                        for (bool cross : {false, true}) RunClippedKDecode(gate, down, sparse, cross);
+            if (argc > 1) { std::puts("PASS: clipped K decode graph replay"); return 0; }
+        }
         if (argc > 1 && std::strcmp(argv[1], "--subwarp-bench") == 0) {
             for (auto pair : {std::make_pair(GGML_TYPE_IQ3_S,GGML_TYPE_Q2_0),
                               std::make_pair(GGML_TYPE_IQ2_S,GGML_TYPE_Q2_0),
@@ -1866,27 +1949,22 @@ int main(int argc, char **argv) {
             std::puts("PASS: GGUF split upload dependencies"); return 0;
         }
         if (argc > 1 && std::strcmp(argv[1], "--numa-layout") == 0) {
-            // R4 requires the Q8 projection for each packed part. Some mixed
-            // pairs switch to floating-point projection above 32 input rows.
-            struct Case { ggml_type gate, down; int maxRows; };
-            const Case cases[] = {
-                {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, 64},
-                {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, 32},
-                {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, 64},
-                {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, 32},
-                {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, 32},
-                {GGML_TYPE_F16, GGML_TYPE_F32, 64},
+            const std::pair<ggml_type, ggml_type> cases[] = {
+                {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0},
+                {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL},
+                {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS},
+                {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S},
+                {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS},
+                {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL},
+                {GGML_TYPE_F16, GGML_TYPE_F32},
             };
             for (int rows : {1, 2, 3, 4, 5, 8, 17, 32, 64}) {
-                for (const auto &test : cases) {
-                    if (rows > test.maxRows) continue;
-                    RunRoutedBatch<float>(test.gate, test.down, fastllm::FLOAT32, rows, true);
-                    RunRoutedBatch<half>(test.gate, test.down, fastllm::FLOAT16, rows, true);
-                    RunRoutedBatch<__nv_bfloat16>(test.gate, test.down, fastllm::BFLOAT16, rows, true);
+                for (const auto &[gate, down] : cases) {
+                    RunRoutedBatch<float>(gate, down, fastllm::FLOAT32, rows, true);
+                    RunRoutedBatch<half>(gate, down, fastllm::FLOAT16, rows, true);
+                    RunRoutedBatch<__nv_bfloat16>(gate, down, fastllm::BFLOAT16, rows, true);
                 }
             }
-            Require(!FastllmCudaMoeGGUFCacheNumaSupported(GGML_TYPE_IQ3_XXS_R4,
-                GGML_TYPE_IQ4_NL, 256, 256, 64), "large R4 batch should retain restore fallback");
             Require(!FastllmCudaMoeGGUFCacheNumaSupported(GGML_TYPE_Q4_K_R4,
                 GGML_TYPE_IQ4_NL, 256, 256, 1), "unsupported R4 should retain restore fallback");
             std::puts("PASS: direct NUMA GGUF layout"); return 0;

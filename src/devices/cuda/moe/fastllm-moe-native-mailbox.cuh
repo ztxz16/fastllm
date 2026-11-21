@@ -695,7 +695,9 @@ struct NativeMoeMailbox {
                     w.hidden, layout.inter, w.compute->ggufWorkspace[branch].cudaData,
                     size_t(w.compute->ggufWorkspace[branch].GetBytes()), resident ? cache.slotOffsets : nullptr};
                 SetStandardGGUFLayout(group, w.table, view);
-            view.exactSubwarp = group.qwen38FlashNext && w.rows > 1;
+                // The mailbox reads this branch's partials only for staged routes.
+                view.preserveMissing = !resident && w.rows == 1;
+                view.exactSubwarp = group.qwen38FlashNext && w.rows > 1;
                 if (w.sharedQ8Input) view.preparedQ8Input = w.compute->ggufWorkspace[0].cudaData;
                 if (!ComputeGGUFExperts(input, gate, dummy, layout, view,
                         scores + row * w.topk, w.topk, partial)) return false;

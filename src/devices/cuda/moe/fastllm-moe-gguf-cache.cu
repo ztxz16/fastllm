@@ -34,6 +34,41 @@ using gguf_cache_q8::ggml_cuda_dp4a;
 #include <vector>
 
 namespace {
+// One CTA quantizes a 256-element activation block, using the positive FP32
+// scale and round-to-nearest-even of the NUMA expert backend.
+__device__ __forceinline__ int QuantizeSymmetricK(float x, float &scale) {
+    __shared__ float maxima[8];
+    float amax = fabsf(x);
+    for (int mask = 16; mask; mask >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask));
+    if (threadIdx.x % 32 == 0) maxima[threadIdx.x / 32] = amax;
+    __syncthreads();
+    amax = 0;
+    for (int i = 0; i < 8; ++i) amax = fmaxf(amax, maxima[i]);
+    const float inverse = amax == 0 ? 0 : __fdiv_rn(127.f, amax);
+    scale = __fdiv_rn(amax, 127.f);
+    return __float2int_rn(__fmul_rn(x, inverse));
+}
+
+struct Q8Activation {
+    float scale;
+    int8_t values[QK_K];
+};
+__global__ void PackQ8Activation(const float *input, Q8Activation *output) {
+    const int lane = threadIdx.x;
+    float scale;
+    const int q = QuantizeSymmetricK(input[blockIdx.x * QK_K + lane], scale);
+    output[blockIdx.x].values[lane] = int8_t(q);
+    if (lane == 0) output[blockIdx.x].scale = scale;
+}
+} // namespace
+
+namespace glm5_gguf_cache {
+template<bool Packed = false, typename T>
+__global__ void Quantize(const T *input, float *output, int columns, float *packed = nullptr, const int32_t *slots = nullptr);
+}
+
+namespace {
 // Keep dispatch and admission on the same list. Cache slots hold ordinary GGUF
 // blocks, either restored from NUMA shards or copied from a canonical snapshot.
 #define GGUF_CACHE_TYPES(M) \
@@ -106,7 +141,17 @@ struct ResidentView {
     int experts, gateType, downType, hidden, inter;
     void *workspace;
     size_t workspaceBytes;
+    float swigluLimit = 0.f;
 };
+
+template<class View>
+__device__ __forceinline__ float ExpertSwiglu(float gate, float up, const View &view) {
+    if (view.swigluLimit > 0.f) {
+        gate = fminf(gate, view.swigluLimit);
+        up = fminf(fmaxf(up, -view.swigluLimit), view.swigluLimit);
+    }
+    return gate / (1.f + expf(-gate)) * up;
+}
 
 template<class View> const void *PreparedQ8Input(const View &) { return nullptr; }
 const void *PreparedQ8Input(const FastllmCudaMoeGGUFCacheView &view) { return view.preparedQ8Input; }
@@ -251,7 +296,7 @@ __global__ void Q8Projection(const block_q8_1 *input, T *gate, float *partial,
         if constexpr (IsGate) {
             up = float(DequantizeCast<T>::cast(up));
             value = float(DequantizeCast<T>::cast(value));
-            value = value / (1.0f + expf(-value)) * up;
+            value = ExpertSwiglu(value, up, view);
         }
     }
     if (threadIdx.x%ThreadsPerRow == 0) {
@@ -390,7 +435,77 @@ __global__ void Gate(const T *input, T *gateOutput, View view,
         for (int w = 0; w < 4; ++w) { gate += gates[w]; up += ups[w]; }
         gate = float(DequantizeCast<T>::cast(gate));
         up = float(DequantizeCast<T>::cast(up));
-        gateOutput[route * view.inter + row] = DequantizeCast<T>::cast(gate / (1.0f + expf(-gate)) * up);
+        gateOutput[route * view.inter + row] = DequantizeCast<T>::cast(ExpertSwiglu(gate, up, view));
+    }
+}
+
+// Each lane covers four low and four high nibbles from the same packed word.
+// Both projection rows reuse the activation loads and their four-byte sums.
+__device__ __forceinline__ float Q4KPartial(const block_q4_K &w, int lane, int group,
+        int xlo, int xhi, int sumLo, int sumHi) {
+    uint8_t sc0, sc1, m0, m1;
+    get_scale_min_k4(group, w.scales, sc0, m0);
+    get_scale_min_k4(group + 1, w.scales, sc1, m1);
+    const uint32_t weight = gguf_cache_q8::get_int_b4(w.qs, lane);
+    const int lo = gguf_cache_q8::ggml_cuda_dp4a(weight & 0x0f0f0f0f, xlo, 0);
+    const int hi = gguf_cache_q8::ggml_cuda_dp4a((weight >> 4) & 0x0f0f0f0f, xhi, 0);
+    return __low2float(w.dm) * (sc0 * lo + sc1 * hi) - __high2float(w.dm) * (m0 * sumLo + m1 * sumHi);
+}
+
+// Four consecutive Q3_K codes in each half of a 256-element block. The halves
+// share the sign-mask byte and the packed scales have one nibble per half.
+__device__ __forceinline__ float Q3KPartial(const block_q3_K &w, int lane, int xlo, int xhi) {
+    const int word = lane % 8, shift = lane / 8;
+    const uint32_t missing = ~gguf_cache_q8::get_int_b2(w.hmask, word);
+    const uint32_t lo = gguf_cache_q8::get_int_b2(w.qs, word);
+    const uint32_t hi = gguf_cache_q8::get_int_b2(w.qs, 8 + word);
+    const int qlo = __vsub4((lo >> (2 * shift)) & 0x03030303, ((missing >> shift) & 0x01010101) << 2);
+    const int qhi = __vsub4((hi >> (2 * shift)) & 0x03030303, ((missing >> (shift + 4)) & 0x01010101) << 2);
+    const int group = lane / 4;
+    const int low = w.scales[group], high = w.scales[8 + group % 4] >> (2 * (group / 4));
+    const int scaleLo = ((low & 15) | ((high & 3) << 4)) - 32;
+    const int scaleHi = ((low >> 4) | (high & 0x30)) - 32;
+    return __half2float(w.d) * (scaleLo * gguf_cache_q8::ggml_cuda_dp4a(qlo, xlo, 0) +
+                                scaleHi * gguf_cache_q8::ggml_cuda_dp4a(qhi, xhi, 0));
+}
+
+template<ggml_type Type>
+__global__ void PackedGate(const Q8Activation *input, float *activation, FastllmCudaMoeGGUFCacheView view) {
+    const int route = blockIdx.y, lane = threadIdx.x % 32;
+    using Block = std::conditional_t<Type == GGML_TYPE_Q3_K, block_q3_K, block_q4_K>;
+    const auto *record = reinterpret_cast<const Block *>(ExpertWeight<true>(view, route));
+    if (!record && view.preserveMissing) return;
+    // The staged grid covers a few tiles per route, even when all slots are
+    // empty. Occupied slots advance through the remaining output rows on GPU.
+    for (int row = blockIdx.x * 4 + threadIdx.x / 32; row < view.inter; row += gridDim.x * 4) {
+        float gate = 0, up = 0;
+        if (record) {
+            const int blocks = view.hidden / QK_K;
+            const bool cross = view.numaGateType >= 0;
+            const auto *g = record + size_t(cross ? 2 * row : row) * blocks;
+            const auto *u = g + size_t(cross ? 1 : view.inter) * blocks;
+            for (int b = 0; b < blocks; ++b) {
+                if constexpr (Type == GGML_TYPE_Q3_K) {
+                    const int xlo = gguf_cache_q8::get_int_b4(input[b].values, lane);
+                    const int xhi = gguf_cache_q8::get_int_b4(input[b].values, lane + 32);
+                    gate = fmaf(input[b].scale, Q3KPartial(g[b], lane, xlo, xhi), gate);
+                    up = fmaf(input[b].scale, Q3KPartial(u[b], lane, xlo, xhi), up);
+                } else {
+                    const int group = 2 * (lane / 8), pos = group * 8 + lane % 8;
+                    const int xlo = gguf_cache_q8::get_int_b4(input[b].values, pos);
+                    const int xhi = gguf_cache_q8::get_int_b4(input[b].values, pos + 8);
+                    const int sumLo = gguf_cache_q8::ggml_cuda_dp4a(0x01010101, xlo, 0);
+                    const int sumHi = gguf_cache_q8::ggml_cuda_dp4a(0x01010101, xhi, 0);
+                    gate = fmaf(input[b].scale, Q4KPartial(g[b], lane, group, xlo, xhi, sumLo, sumHi), gate);
+                    up = fmaf(input[b].scale, Q4KPartial(u[b], lane, group, xlo, xhi, sumLo, sumHi), up);
+                }
+            }
+            for (int mask = 16; mask; mask >>= 1) {
+                gate += __shfl_down_sync(0xffffffff, gate, mask);
+                up += __shfl_down_sync(0xffffffff, up, mask);
+            }
+        }
+        if (lane == 0) activation[size_t(route) * view.inter + row] = ExpertSwiglu(gate, up, view);
     }
 }
 
@@ -409,6 +524,9 @@ __global__ void Down(const T *gateOutput, T *output, View view,
         value = Dot<type>(weight, gateOutput + route * view.inter, view.inter, 0, 1);
     }
     if (perExpert) {
+        if constexpr (std::is_same_v<View, FastllmCudaMoeGGUFCacheView>) {
+            if (!record && view.preserveMissing) return;
+        }
         if (threadIdx.x % 32 == 0)
             perExpert[size_t(OriginalRoute(view, route))*view.hidden + row] = float(DequantizeCast<T>::cast(value));
         return;
@@ -516,6 +634,38 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
         if (!partial)
             partial = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(qGate) + Q8Bytes(routes, view.inter));
     }
+    const T *gateInput = static_cast<const T *>(input.cudaData);
+    // Pack the single-row gate input once for both projections. The existing
+    // Q4_K path also rounds the activation passed to the down projection.
+    const bool clippedK = view.swigluLimit > 0.f && std::is_same_v<T, float> &&
+        (view.downType == GGML_TYPE_Q4_K || view.downType == GGML_TYPE_Q6_K);
+    const bool numaQ4 = clippedK && view.gateType == GGML_TYPE_Q4_K;
+    bool packedGate = false;
+    const int32_t *quantizeSlots = nullptr;
+    if (numaQ4 && (!view.workspace || view.workspaceBytes < size_t(rows) * view.hidden * sizeof(float))) return false;
+    if constexpr (std::is_same_v<View, FastllmCudaMoeGGUFCacheView> && std::is_same_v<T, float>) {
+        packedGate = clippedK && (view.gateType == GGML_TYPE_Q4_K || view.gateType == GGML_TYPE_Q3_K) &&
+            perExpert && rows == 1 && !view.routeMap &&
+            (view.numaGateType < 0 || view.numaGateType == view.gateType) &&
+            view.workspace && view.workspaceBytes >= size_t(view.hidden / QK_K) * sizeof(Q8Activation);
+        if (packedGate) {
+            auto *packed = static_cast<Q8Activation *>(view.workspace);
+            PackQ8Activation<<<view.hidden / QK_K, QK_K, 0, cudaStreamPerThread>>>(gateInput, packed);
+            const int tiles = (view.inter + 3) / 4;
+            const int blocks = view.preserveMissing ? std::min(tiles, 64) : tiles;
+            if (view.preserveMissing) quantizeSlots = view.routeSlots;
+            auto *out = static_cast<float *>(gate.cudaData);
+            if (view.gateType == GGML_TYPE_Q3_K)
+                PackedGate<GGML_TYPE_Q3_K><<<dim3(blocks, routes), 128, 0, cudaStreamPerThread>>>(packed, out, view);
+            else
+                PackedGate<GGML_TYPE_Q4_K><<<dim3(blocks, routes), 128, 0, cudaStreamPerThread>>>(packed, out, view);
+        }
+    }
+    if (numaQ4 && !packedGate) {
+        glm5_gguf_cache::Quantize<<<dim3(view.hidden / QK_K, rows), 256, 0, cudaStreamPerThread>>>(
+            gateInput, static_cast<float *>(view.workspace), view.hidden);
+        gateInput = static_cast<const T *>(view.workspace);
+    }
     bool groupedGate = false;
     const auto gateType = static_cast<ggml_type>(view.gateType);
     const auto downType = static_cast<ggml_type>(view.downType);
@@ -536,17 +686,20 @@ bool Compute(const fastllm::Data &input, fastllm::Data &gate, fastllm::Data &out
 #undef Q8_GATE
             default: return false;
         }
-    } else {
+    } else if (!packedGate) {
         switch (gateType) {
 #define LAUNCH_GATE(name) case GGML_TYPE_##name: \
             Gate<GGML_TYPE_##name><<<dim3(view.inter, routes), 128, 0, cudaStreamPerThread>>>( \
-                static_cast<const T *>(input.cudaData), static_cast<T *>(gate.cudaData), \
+                gateInput, static_cast<T *>(gate.cudaData), \
                 view, topk, ggml_row_size(gateType, view.hidden)); break;
             GGUF_CACHE_TYPES(LAUNCH_GATE)
 #undef LAUNCH_GATE
             default: return false;
         }
     }
+    if (numaQ4)
+        glm5_gguf_cache::Quantize<<<dim3(view.inter / QK_K, routes), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const float *>(gate.cudaData), static_cast<float *>(gate.cudaData), view.inter, nullptr, quantizeSlots);
     if (stages & 2)
         QuantizeQ8<<<dim3((view.inter+255)/256, routes), 256, 0, cudaStreamPerThread>>>(
             static_cast<const T *>(gate.cudaData), qGate, view.inter, DeviceRouteCount(view));
@@ -938,22 +1091,14 @@ __device__ __forceinline__ float NumaDot(const uint8_t *record, int row,
 // Match iqk_quantize_row_q8_K on the CPU: one FP32 positive scale per
 // 256 elements and nearest-even integer rounding. Keep the dequantized
 // activation in scratch; original expert weights remain packed in VRAM.
-template<bool Packed = false>
-__global__ void Quantize(const __nv_bfloat16 *input, float *output, int columns, float *packed = nullptr) {
-    __shared__ float maxima[8];
+template<bool Packed, typename T>
+__global__ void Quantize(const T *input, float *output, int columns, float *packed, const int32_t *slots) {
+    if (slots && slots[blockIdx.y] < 0) return;
     const int c = blockIdx.x * 256 + threadIdx.x;
     const size_t offset = size_t(blockIdx.y) * columns + c;
-    const float x = __bfloat162float(input[offset]);
-    float amax = fabsf(x);
-    for (int mask = 16; mask; mask >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask));
-    if (threadIdx.x % 32 == 0) maxima[threadIdx.x / 32] = amax;
-    __syncthreads();
-    amax = 0;
-    for (int i = 0; i < 8; ++i) amax = fmaxf(amax, maxima[i]);
-    const float inverse = amax == 0 ? 0 : __fdiv_rn(127.f, amax);
-    const int q = __float2int_rn(__fmul_rn(x, inverse));
-    const float value = __fmul_rn(__fdiv_rn(amax, 127.f), float(q));
+    float scale;
+    const int q = QuantizeSymmetricK(float(input[offset]), scale);
+    const float value = __fmul_rn(scale, float(q));
     if constexpr (Packed) {
         // Keep canonical gate input for subsequent staged experts. Down input
         // only needs the layout consumed by the vector loads.

@@ -2248,6 +2248,7 @@ struct FastllmCudaMoeGGUFCacheView {
     // private. Null retains this view's ordinary workspace/input preparation.
     const void *preparedQ8Input = nullptr;
     bool exactSubwarp = false; // Qwen verification; other callers retain warp kernels.
+    float swigluLimit = 0.f;
 };
 bool FastllmCudaMoeGGUFCacheNeedsPreparation(const fastllm::Data &input,
     const FastllmCudaMoeGGUFCacheView &view, int topk);

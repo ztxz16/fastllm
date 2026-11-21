@@ -2561,7 +2561,8 @@ bool FastllmCudaPrepareMoeCacheWithBudgets(
                 layers[layer].weights, layers[layer].weightsBatch);
     }
 #endif
-    group->nativeStandardGGUF = group->qwen38FlashNext &&
+    group->nativeStandardGGUF = (group->qwen38FlashNext || (layout.standardFp8Graph &&
+        layout.weightType == fastllm::DATA_GGUF_FORMAT)) &&
         StandardNativeGGUFSupported(*group);
     if (group->nativeStandardGGUF)
         std::fprintf(stderr, "[Fastllm] Standard GGUF expert cache retains native NUMA records.\n");
@@ -2969,7 +2970,9 @@ bool ComputeGGUFExperts(const fastllm::Data &input, fastllm::Data &gateOutput,
     if (layout.glm5)
         return FastllmCudaMoeGlm5GGUFCacheComputeStaged(input, gateOutput, view,
             scores, topk, layout.swigluLimit, perExpert, events);
-    return FastllmCudaMoeGGUFCacheComputeStaged(input, gateOutput, output, view,
+    auto standardView = view;
+    if (layout.standardFp8Graph) standardView.swigluLimit = layout.swigluLimit;
+    return FastllmCudaMoeGGUFCacheComputeStaged(input, gateOutput, output, standardView,
         scores, topk, perExpert, events);
 }
 
@@ -6209,9 +6212,11 @@ void *FastllmCudaNativeMoeGraphOwner(fastllm::Data **weights, int weightsBatch, 
         FastllmCudaV41CanonicalGGUFCacheWorkspaceBytes(layout.hidden, layout.inter) != 0;
     const bool standardFp8 = layout.standardFp8Graph &&
         (layout.weightType == fastllm::FP8_E4M3 || layout.weightType == fastllm::FP8_E4M3_BLOCK_128);
-    // The standard FP8 graph follows its registered placement independently of the V4.1 cache override.
-    if (!standardFp8 && Dsv41GpuCacheRequested()) return nullptr;
-    const bool standard = standardFp8 || (group->qwen38FlashNext && !layout.deepSeekV41 && !layout.glm5 &&
+    const bool standardGGUF = rows == 1 && layout.standardFp8Graph &&
+        layout.weightType == fastllm::DATA_GGUF_FORMAT && GGUFHybridShape(layout);
+    // Standard FP8 and GGUF graphs follow their registered expert placement.
+    if (!standardFp8 && !standardGGUF && Dsv41GpuCacheRequested()) return nullptr;
+    const bool standard = standardFp8 || standardGGUF || (group->qwen38FlashNext && !layout.deepSeekV41 && !layout.glm5 &&
         ((layout.weightType == fastllm::NVFP4_BLOCK_16_E4M3 && SupportsNVFP4WideDecode(layout)) ||
          (layout.weightType == fastllm::DATA_GGUF_FORMAT && GGUFHybridShape(layout))));
     if (!standard && (!layout.deepSeekV41 ||
