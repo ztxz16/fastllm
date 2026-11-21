@@ -127,6 +127,32 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/videos/unknown").status_code, 404)
         self.assertIn("/v1/videos", self.client.get("/openapi.json").json()["paths"])
 
+    def test_mp4_content_and_ranges(self):
+        if not self.client.app.state.jobs.ffmpeg:
+            self.skipTest("FFmpeg with libx264 is unavailable")
+        self.request["response_format"] = "mp4"
+        job = self.submit()
+        self.assertEqual(self.client.get(f"/v1/videos/{job}/content").status_code, 409)
+        self.backend.release.set()
+        result = self.terminal(job)
+        self.assertEqual(result["output"]["format"], "mp4")
+        url = result["output"]["url"]
+        response = self.client.get(url)
+        self.assertEqual(response.headers["content-type"], "video/mp4")
+        self.assertEqual(response.content[4:8], b"ftyp")
+        part = self.client.get(url, headers={"Range": "bytes=0-15"})
+        self.assertEqual((part.status_code, part.content), (206, response.content[:16]))
+        self.assertEqual(self.client.get(f"/v1/videos/{job}/frames/0").status_code, 404)
+
+    def test_mp4_encoding_failure_delivers_png_without_regeneration(self):
+        self.client.app.state.jobs.ffmpeg = "/nonexistent/ffmpeg"
+        self.request["response_format"] = "mp4"
+        self.backend.release.set()
+        result = self.terminal(self.submit())
+        self.assertEqual(result["response_format"], "png_frames")
+        self.assertEqual(self.client.get(result["output"]["frames"][0]).status_code, 200)
+        self.assertEqual(len(self.backend.requests), 1)
+
     def test_cancel_and_failure_do_not_publish_frames(self):
         job = self.submit()
         self.assertTrue(self.backend.started.wait(2))
@@ -246,6 +272,31 @@ class HTTPTests(unittest.TestCase):
         self.assertGreaterEqual(result['total_seconds'], result['generation_seconds']-.001)
         self.assertEqual(self.client.get('/v1/videos/unknown/events').status_code, 404)
 
+    def test_edit_length_applies_to_subsequent_text_segments(self):
+        world = self.world()
+        url = "/v1/worlds/" + world["id"]
+        self.assertEqual(world["text_frames"], 20)
+        def edit(count):
+            return self.client.patch(url, json={"prompt": "A red ball", "text_frames": count})
+        for invalid in (16, 21, 140):
+            self.assertEqual(edit(invalid).status_code, 422)
+        self.assertEqual(edit(120).json()["text_frames"], 120)
+        self.backend.release.set()
+        self.assertEqual(self.terminal(world["current_job"])["num_frames"], 20)
+        def submit(action):
+            response = self.client.post(url + "/actions", json={"action": action})
+            self.assertEqual(response.status_code, 202)
+            return response.json()["id"]
+        self.backend.release.clear()
+        long_job = submit("follow_prompt")
+        shorter = edit(40).json()
+        self.assertGreater(shorter["prompt_revision"], world["prompt_revision"])
+        self.backend.release.set()
+        self.assertEqual(self.terminal(long_job)["num_frames"], 120)
+        self.assertEqual(self.terminal(submit("forward"))["num_frames"], 20)
+        self.assertEqual(self.terminal(submit("follow_prompt"))["num_frames"], 40)
+        self.assertEqual(self.client.patch(url, json={"prompt": "A blue ball"}).json()["text_frames"], 40)
+
     def test_reference_preview_advances_five_model_seconds_once(self):
         import base64
         self.backend.release.set()
@@ -277,6 +328,16 @@ class HTTPTests(unittest.TestCase):
         action = json.loads(scene.caption())["segments"][0]["contained_actions"][0]
         self.assertEqual(action["end_time"], "00:05.000")
 
+    def test_custom_resolution_and_hd_limits(self):
+        for schema in (server.WorldRequest, server.GenerateRequest):
+            for width, height in ((736, 416), (1280, 704), (704, 1280)):
+                with self.subTest(width=width, height=height):
+                    item = schema(prompt="snow", width=width, height=height)
+                    self.assertEqual((item.width, item.height), (width, height))
+            for width, height in ((1280, 736), (736, 410), (32, 64)):
+                with self.assertRaises(ValueError):
+                    schema(prompt="snow", width=width, height=height)
+
     def test_world_resolution_and_cache_budget(self):
         self.backend.release.set()
         request = dict(prompt='A room', width=512, height=288)
@@ -284,7 +345,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.terminal(response.json()['current_job'])
         self.assertEqual(self.client.post('/v1/worlds', json=dict(prompt='A room',width=64,height=64)).status_code, 429)
-        self.assertEqual(self.client.post('/v1/worlds', json={**request, 'height':512}).status_code, 422)
+        self.assertEqual(self.client.post('/v1/worlds', json={**request, 'width':1280, 'height':736}).status_code, 422)
         self.assertEqual(self.client.delete('/v1/worlds/'+response.json()['id']).status_code, 200)
 
     def world(self):

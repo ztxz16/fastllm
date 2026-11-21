@@ -81,6 +81,7 @@ progress { width: 100%; height: 6px; accent-color: var(--green); margin: 10px 0 
 .composer { border: 1px solid var(--line); border-radius: 12px; padding: 5px; }
 .composer select,.composer textarea { border: 0; background: transparent; color: inherit; }
 .composer textarea { flex: 1; width: 0; min-width: 55px; min-height: 38px; height: 38px; resize: none; }
+.composer #edit-frames { width: auto; flex: none; }
 .composer #apply-scene { flex: 0 0 auto; }
 .scene-dock { position: relative; flex-wrap: wrap; margin-top: 8px; }
 #navigation { flex-wrap: wrap; }
@@ -148,7 +149,7 @@ body:has(.exploring) main > header,.exploring aside { display: none; }
     <button id="screen-toggle" type="button" hidden>全屏</button>
   </div>
   <div class="stage" id="stage">
-    <img id="ambient" alt="" aria-hidden="true" hidden>
+    <canvas id="ambient" aria-hidden="true" hidden></canvas>
     <canvas id="video" width="512" height="384" tabindex="0" aria-label="场景画面。用 W A S D 移动，按方向键或拖动画面转向。"></canvas>
     <img id="reference-preview" hidden alt="所选起始参考图"><div id="placeholder">
       <img id="sample-image" src="nomas-cafe.webp" alt="">
@@ -164,6 +165,10 @@ body:has(.exploring) main > header,.exploring aside { display: none; }
       <div class="composer">
         <div id="edit-type-option" hidden><select id="edit-kind" aria-label="指令类型"><option value="environment">环境变化</option><option value="action">人物动作</option><option value="prompt">完整描述</option></select></div>
         <textarea id="instruction" rows="1" aria-label="下一条场景指令" placeholder="例如，让窗外的雨停下来"></textarea>
+        <select id="edit-frames" aria-label="本条指令的生成帧数" title="本条指令的生成帧数" hidden>
+          <option value="20">20 帧</option><option value="40">40 帧</option><option value="60">60 帧</option>
+          <option value="80">80 帧</option><option value="100">100 帧</option><option value="120">120 帧</option>
+        </select>
         <button id="apply-scene" type="button" disabled>发送指令</button>
       </div>
       <p id="prompt-status" class="hint" role="status"></p>
@@ -209,9 +214,14 @@ body:has(.exploring) main > header,.exploring aside { display: none; }
         <label class="file-pick"><span id="reference-name">选择图片</span><input id="reference-image" type="file" aria-label="选择起始参考图" accept="image/png,image/jpeg,image/webp"></label>
       </div>
       <label for="prompt">起始场景描述</label><textarea id="prompt" rows="3" required>A quiet café at night. A waitress stands behind a wooden counter. A white mug rests between her hands. Rain falls outside the window.</textarea>
-      <div id="enhance-option" hidden><label><input id="enhance-prompt" type="checkbox" checked> 自动扩写场景描述</label></div>
+      <div id="enhance-option"><label><input id="enhance-prompt" type="checkbox" checked> 提示词增强（Nomas-PE）</label><small class="hint" id="enhancer-hint" hidden>请在启动器的 HY-Nomas 服务设置中配置提示词增强地址。</small></div>
       <div id="perspective-option" hidden><label for="perspective">观察方式</label><select id="perspective" disabled><option value="auto">根据描述选择</option><option value="first-person">第一人称</option><option value="second-person">正面近景</option><option value="third-person follow">跟随主体</option><option value="third-person observer">外部观察</option></select></div>
-      <label for="size">画面尺寸</label><select id="size"><option>128 × 128</option><option>256 × 160</option><option>256 × 256</option><option>384 × 224</option><option>512 × 288</option><option selected>512 × 384</option></select>
+      <label for="size">画面尺寸</label><select id="size"><option>128 × 128</option><option>256 × 160</option><option>256 × 256</option><option>384 × 224</option><option>512 × 288</option><option selected>512 × 384</option><option>768 × 448</option><option>960 × 544</option><option>1280 × 704</option><option value="custom">自定义</option></select>
+      <div id="custom-size" hidden>
+        <div class="row"><label>宽度（像素）<input id="custom-width" type="number" min="64" max="1280" step="32" value="512"></label>
+        <label>高度（像素）<input id="custom-height" type="number" min="64" max="1280" step="32" value="384"></label></div>
+        <small class="hint">宽高分别为 64–1280 的 32 倍数，最多 901120 像素。</small>
+      </div>
       <details class="subsection"><summary>生成参数</summary>
         <div class="row"><div><label for="seed">随机种子</label><input id="seed" type="number" min="0" max="4294967295" value="42" required></div>
         <div id="frame-option"><label for="frames">视频帧数</label><select id="frames"><option value="20">20 帧</option><option value="16">16 帧</option><option value="32">32 帧</option><option value="40">40 帧</option></select></div></div>
@@ -226,7 +236,8 @@ const $=id=>document.getElementById(id);
 const actions={forward:'前进',backward:'后退',left:'左移',right:'右移',look_left:'左转',look_right:'右转',look_up:'抬头',look_down:'低头',stay:'原地观察',follow_prompt:'按描述继续生成'};
 let active=null,world=null,busy=false,images=[],timer=null,playing=false,currentFrame=0,fps=24,epoch=0,originFrame=0,loop=true;
 let continuous=false,desiredAction="stay",pendingAction=null,adaptiveRate=1,promptUpdate=null,promptError='',activePromptRevision=0;
-let enhancerAvailable=null;
+let enhancerAvailable=null,preferClip=false;
+let clip=null,frameCount=0;
 const sampleURL='nomas-cafe.webp';
 let referenceURL=null;
 let exploring=false,queuedStep=null,gesture=null;
@@ -327,7 +338,8 @@ $('instruction').onkeydown=event=>{
 
 function configureEnhancer(available){
   enhancerAvailable=Boolean(available);
-  $('enhance-option').hidden=!enhancerAvailable;
+  $('enhancer-hint').hidden=enhancerAvailable;
+  if(!enhancerAvailable)$('enhance-prompt').checked=false;
   $('perspective-option').hidden=!enhancerAvailable;
   controls();
 }
@@ -364,22 +376,27 @@ function controls() {
   $('reset').hidden=!interactive||!world;
   $('cancel').hidden=!active;
   $('progress').hidden=!busy;
-  $('placeholder').hidden=Boolean(images.length)||Boolean(interactive&&(referenceURL||exploring));
+  $('placeholder').hidden=Boolean(frameCount)||Boolean(interactive&&(referenceURL||exploring));
   $('sample-image').hidden=!interactive;
   $('use-sample').hidden=!interactive||busy;
   $('poster-title').textContent=interactive?'雨夜咖啡馆':'等待生成视频';
   $('poster-label').textContent=interactive?'示例参考图':'独立短视频';
   $('remove-reference').hidden=!referenceURL;
   $('remove-reference').disabled=busy;
-  $('reference-preview').hidden=!interactive||!referenceURL||Boolean(images.length);
+  $('reference-preview').hidden=!interactive||!referenceURL||Boolean(frameCount);
   $('reference-image').disabled=busy;
   $('layout').classList.toggle('has-world',Boolean(world)&&interactive);
   for(const id of ['generate','mode','size','seed'])$(id).disabled=busy||Boolean(promptUpdate);
+  const custom=$('size').value==='custom';
+  $('custom-size').hidden=!custom;
+  for(const id of ['custom-width','custom-height'])$(id).disabled=!custom||busy||Boolean(promptUpdate);
   $('generate').disabled=busy||Boolean(promptUpdate)||enhancerAvailable===null;
   $('enhance-prompt').disabled=busy||Boolean(promptUpdate)||Boolean(world)||!enhancerAvailable;
   $('perspective').disabled=$('enhance-prompt').disabled||!$('enhance-prompt').checked;
   $('prompt').disabled=busy;
   $('instruction').disabled=Boolean(promptUpdate);
+  $('edit-frames').hidden=!interactive||world?.text_frames==null;
+  $('edit-frames').disabled=Boolean(promptUpdate);
   $('apply-scene').hidden=!interactive;
   $('apply-scene').textContent=busy&&!continuous?'保存下一段指令':'发送指令';
   $('apply-scene').disabled=!interactive||!world||!['ready','generating'].includes(world.status)||Boolean(promptUpdate)||!$('instruction').value.trim();
@@ -400,31 +417,50 @@ function controls() {
   $('session-info').textContent=interactive&&world?'当前场景':(interactive?(referenceURL?'起始参考图':''):'独立短视频');
 }
 function drawFrame(index) {
-  if(!images.length)return;
-  currentFrame=Math.max(0,Math.min(images.length-1,index));
+  if(!frameCount)return;
+  currentFrame=Math.max(0,Math.min(frameCount-1,index));
   const canvas=$('video');
-  canvas.getContext('2d').drawImage(images[currentFrame],0,0,canvas.width,canvas.height);
+  canvas.getContext('2d').drawImage(clip||images[currentFrame],0,0,canvas.width,canvas.height);
   $('seek').value=currentFrame;
-  $('frame-info').textContent=`第 ${currentFrame+1} / ${images.length} 帧 · ${(currentFrame/fps).toFixed(2)} / ${(images.length/fps).toFixed(2)} 秒`;
+  $('frame-info').textContent=`第 ${currentFrame+1} / ${frameCount} 帧 · ${(currentFrame/fps).toFixed(2)} / ${(frameCount/fps).toFixed(2)} 秒`;
+}
+function seekFrame(index) {
+  if(clip){
+    clip.currentTime=(Math.max(0,Math.min(frameCount-1,index))+.5)/fps;
+  } else drawFrame(index);
 }
 function tick() {
-  if(!playing||!images.length)return;
+  if(!playing||!frameCount)return;
   const rate=Number($('speed').value)*adaptiveRate,elapsed=Math.max(0,performance.now()-epoch);
+  if(clip){
+    if(!clip.seeking)drawFrame(Math.floor(clip.currentTime*fps));
+    timer=setTimeout(tick,1000/(fps*clip.playbackRate));
+    return;
+  }
   const index=originFrame+Math.floor(elapsed*fps*rate/1000);
-  if(!loop&&index>=images.length-1){drawFrame(images.length-1);setPlaying(false);return;}
-  drawFrame(index%images.length);
+  if(!loop&&index>=frameCount-1){drawFrame(frameCount-1);setPlaying(false);return;}
+  drawFrame(index%frameCount);
   timer=setTimeout(tick,1000/(fps*rate));
 }
 function setPlaying(value) {
   clearTimeout(timer);timer=null;
-  playing=Boolean(value&&images.length);
+  playing=Boolean(value&&frameCount);
   epoch=performance.now();originFrame=currentFrame;
   $('play').textContent=playing?'暂停':'播放';
   $('play').setAttribute('aria-label',playing?'暂停播放':'开始播放');
+  if(clip){
+    if(playing){
+      const activeClip=clip;
+      clip.playbackRate=Math.max(.0625,Math.min(16,Number($('speed').value)*adaptiveRate));
+      clip.play().catch(error=>{
+        if(activeClip===clip&&playing&&error.name!=='AbortError'){setPlaying(false);$('status').textContent=error.message;}
+      });
+    } else clip.pause();
+  }
   if(playing)tick();
 }
-$('play').onclick=()=>{stopContinuous();if(!playing&&!loop&&currentFrame===images.length-1)drawFrame(0);setPlaying(!playing);};
-$('seek').oninput=()=>{stopContinuous();setPlaying(false);drawFrame(Number($('seek').value));};
+$('play').onclick=()=>{stopContinuous();if(!playing&&!loop&&currentFrame===frameCount-1)seekFrame(0);setPlaying(!playing);};
+$('seek').oninput=()=>{stopContinuous();setPlaying(false);seekFrame(Number($('seek').value));};
 $('speed').onchange=()=>setPlaying(playing);
 document.addEventListener('visibilitychange',()=>{if(document.hidden){stopContinuous();}else if(playing)setPlaying(true);});
 function preload(job){
@@ -433,23 +469,47 @@ function preload(job){
     promise.catch(()=>{});frameLoads.set(url,promise);
   }
 }
+function loadClip(url){
+  return new Promise((resolve,reject)=>{
+    const video=document.createElement('video');
+    video.muted=true;video.playsInline=true;video.preload='auto';
+    video.onloadeddata=()=>resolve(video);
+    video.onerror=()=>reject(Error('读取视频失败，请刷新页面重试'));
+    video.src=serviceUrl(url);
+  });
+}
+function releaseClip(){
+  if(!clip)return;
+  clip.onended=null;clip.onseeked=null;clip.onerror=null;clip.onloadeddata=null;
+  clip.removeAttribute('src');clip.load();clip=null;
+}
 async function showResult(job) {
   showEnhancement(job);
   $('status').textContent='正在加载画面…';
   preload(job);
-  const loaded=await Promise.all(job.output.frames.map(url=>frameLoads.get(url)));
+  const nextClip=job.output?.format==='mp4'?await loadClip(job.output.url):null;
+  const loaded=nextClip?[]:await Promise.all((job.output?.frames||[]).map(url=>frameLoads.get(url)));
   while((continuous||exploring)&&job.world_id&&!loop&&playing)await sleep(25); // Finish the current view before the next segment.
   frameLoads.clear();
-  if(!loaded.length)throw Error('生成结果没有画面');
-  setPlaying(false);images=loaded;fps=Number(job.fps)||24;
-  adaptiveRate=continuous&&$('paced').checked&&job.segment_index>1?Math.min(1,images.length/(fps*Math.max(.01,job.total_seconds||job.generation_seconds)*1.05)):1;
+  if(!nextClip&&!loaded.length)throw Error('生成结果没有画面');
+  setPlaying(false);releaseClip();
+  clip=nextClip;images=loaded;frameCount=clip?job.num_frames:loaded.length;fps=Number(job.fps)||24;
+  adaptiveRate=continuous&&$('paced').checked&&job.segment_index>1?Math.min(1,frameCount/(fps*Math.max(.01,job.total_seconds||job.generation_seconds)*1.05)):1;
   currentFrame=0;loop=!job.world_id;
-  $('video').width=job.width;$('video').height=job.height;$('seek').max=images.length-1;$('player').hidden=false;$('player').open=!job.world_id;$('progress').value=100;
+  $('video').width=job.width;$('video').height=job.height;$('seek').max=frameCount-1;$('player').hidden=false;$('player').open=!job.world_id;$('progress').value=100;
   $('status').textContent=job.world_id?
     (job.segment_index===1?'场景已创建，可以发送第一条指令。':'第 '+job.segment_index+' 段已生成。'):
     '视频已生成，正在循环播放。';
   $('placeholder').hidden=true;$('reference-preview').hidden=true;
-  if(job.world_id){$('ambient').src=loaded[0].src;$('ambient').hidden=false;}
+  if(clip){
+    clip.loop=loop;
+    clip.onseeked=()=>drawFrame(Math.floor(clip.currentTime*fps));
+    clip.onended=()=>{drawFrame(frameCount-1);setPlaying(false);};
+  }
+  if(job.world_id){
+    const ambient=$('ambient');ambient.width=160;ambient.height=Math.round(160*job.height/job.width);
+    ambient.getContext('2d').drawImage(clip||images[0],0,0,ambient.width,ambient.height);ambient.hidden=false;
+  }
   drawFrame(0);setPlaying(true);
 }
 async function refreshWorld() {
@@ -531,9 +591,10 @@ $('form').onsubmit=async event=>{
   event.preventDefault();if(busy||promptUpdate||enhancerAvailable===null)return;
   busy=true;controls();setPlaying(false);$('progress').value=0;$('status').textContent='正在提交…';
   try {
-    const [width,height]=$('size').value.split(' × ').map(Number);
+    const [width,height]=selectedResolution();
     const enhancePrompt=enhancerAvailable&&$('enhance-prompt').checked;
     const body={model:'hy-nomas',messages:[{role:'user',content:$('prompt').value}],width,height,num_frames:Number($('frames').value),seed:Number($('seed').value),steps:8,enhance_prompt:enhancePrompt,perspective:enhancePrompt?$('perspective').value:'auto'};
+    if(preferClip)body.response_format='mp4';
     if($('mode').value==='world') {
       let reference=$('reference-image').files[0];
       if(referenceURL===sampleURL){
@@ -544,6 +605,7 @@ $('form').onsubmit=async event=>{
       if(reference){body.reference_rgb=await fitReference(reference,width,height);body.text_frames=120;}
       if(world){await api('/v1/worlds/'+world.id,{method:'DELETE'});world=null;}
       world=await post('/v1/worlds',body);
+      $('edit-frames').value=String(world.text_frames??20);
       clearPlayback();previewSize();
       $('setup').open=false;$('instruction').value='';promptError='';
       setExploring(true);
@@ -554,7 +616,7 @@ $('form').onsubmit=async event=>{
 };
 async function move(action) {
   if(busy||promptUpdate||!world||world.status!=='ready'||world.segments===0)return;
-  busy=true;controls();if(!continuous&&!exploring){setPlaying(false);drawFrame(images.length-1);}$('progress').value=0;$('status').textContent=(actions[action]||'操作')+'…';
+  busy=true;controls();if(!continuous&&!exploring){setPlaying(false);seekFrame(frameCount-1);}$('progress').value=0;$('status').textContent=(actions[action]||'操作')+'…';
   try{await followJob(await post('/v1/worlds/'+world.id+'/actions',{action}));}
   catch(error){stopContinuous();$('status').textContent=error.message;try{await refreshWorld();}catch{}}
   finally{idle();}
@@ -562,7 +624,7 @@ async function move(action) {
 function clearPlayback(){
   queuedStep=null;$('ambient').hidden=true;
   setPlaying(false);
-  images=[];currentFrame=0;
+  releaseClip();images=[];frameCount=0;currentFrame=0;
   const canvas=$('video');
   canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
   $('player').hidden=true;showEnhancement(null);
@@ -575,7 +637,7 @@ function setReference(url, name){
   const preview=$('reference-preview');
   if(url)preview.src=url;
   else preview.removeAttribute('src');
-  if(!world && images.length)clearPlayback();
+  if(!world && frameCount)clearPlayback();
   previewSize();controls();
 }
 $('reference-image').onchange=()=>{
@@ -590,25 +652,38 @@ $('remove-reference').onclick=()=>{
   $('reference-image').value='';
   setReference(null,'');
 };
+function selectedResolution(){
+  const size=$('size').value==='custom'
+    ? [Number($('custom-width').value),Number($('custom-height').value)]
+    : $('size').value.split(' × ').map(Number);
+  if(size.length!==2||size.some(n=>!Number.isInteger(n)||n<64||n>1280||n%32)||size[0]*size[1]>1280*704)
+    throw Error('宽高须为 64–1280 的 32 倍数，且总像素不超过 1280 × 704。');
+  return size;
+}
 function previewSize(){
-  if(images.length)return;
-  const [width,height]=$('size').value.split(' × ').map(Number);
+  if(frameCount)return;
+  let width,height;
+  try{[width,height]=selectedResolution();}catch{return;}
   $('video').width=width;$('video').height=height;
 }
-$('size').onchange=previewSize;
+$('size').onchange=()=>{controls();previewSize();};
+$('custom-width').oninput=$('custom-height').oninput=previewSize;
 $('instruction').oninput=()=>{promptError='';controls();};
 $('edit-kind').onchange=controls;
 $('apply-scene').onclick=async()=>{
   if(promptUpdate||!world||!['ready','generating'].includes(world.status))return;
   const id=world.id,prompt=$('instruction').value;
   if(!prompt.trim())return;
+  const edit={prompt};
+  if(!world.enhance_prompt&&['environment','action'].includes($('edit-kind').value))edit.kind=$('edit-kind').value;
+  if(world.text_frames!=null)edit.text_frames=Number($('edit-frames').value);
   promptError='';
   promptUpdate=(async()=>{
     try{
-      const accepted=await api('/v1/worlds/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(!world.enhance_prompt&&['environment','action'].includes($('edit-kind').value)?{prompt,kind:$('edit-kind').value}:{prompt})});
+      const accepted=await api('/v1/worlds/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(edit)});
       // Do not let a delayed PATCH response overwrite newer generation state.
       if(world?.id!==id)return false;
-      world.prompt=accepted.prompt;world.prompt_revision=accepted.prompt_revision;
+      world.prompt=accepted.prompt;world.prompt_revision=accepted.prompt_revision;world.text_frames=accepted.text_frames;
       if($('instruction').value===prompt)$('instruction').value='';
       return true;
     }
@@ -654,7 +729,7 @@ $('reset').onclick=async()=>{
   catch(error){$('status').textContent=error.message;}
   finally{idle();}
 };
-$('mode').onchange=()=>{controls();if(!busy&&!images.length)$('status').textContent=$('mode').value==='world'?'等待创建场景':'等待生成视频';};
+$('mode').onchange=()=>{controls();if(!busy&&!frameCount)$('status').textContent=$('mode').value==='world'?'等待创建场景':'等待生成视频';};
 $('enhance-prompt').onchange=controls;
 $('cancel').onclick=async()=>{
   stopContinuous();
@@ -683,9 +758,18 @@ function restoreWorldInputs(){
   const initial=world.prompt_revision>1?world.initial_scene:world.prompt;
   if(typeof initial==='string')$('prompt').value=initial;
   if(world.edit_kind)$('edit-kind').value=world.edit_kind;
+  $('edit-frames').value=String(world.text_frames??20);
   $('enhance-prompt').checked=Boolean(world.enhance_prompt);$('perspective').value=world.perspective||'auto';showEnhancement(world);
-  $('size').value=`${world.width} × ${world.height}`;$('seed').value=world.seed;
+  const size=`${world.width} × ${world.height}`;
+  $('size').value=size;
+  if($('size').value!==size){
+    $('size').value='custom';$('custom-width').value=world.width;$('custom-height').value=world.height;
+  }
+  $('seed').value=world.seed;
 }
-api('/health').then(health=>configureEnhancer(health.prompt_enhancer?.enabled)).catch(()=>configureEnhancer(false));
+api('/health').then(health=>{
+  preferClip=health.playback_formats?.includes('mp4')&&Boolean(document.createElement('video').canPlayType('video/mp4; codecs="avc1.4D4028"'));
+  configureEnhancer(health.prompt_enhancer?.enabled);
+}).catch(()=>configureEnhancer(false));
 controls();restore();
 </script></html>

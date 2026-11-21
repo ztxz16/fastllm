@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "resolution.h"
 #include "models/hy_nomas/parallel.h"
 #include <algorithm>
 #include <cstring>
@@ -121,7 +122,7 @@ struct PipelineHandle {
                                                           fastllm::nomas::RowReduction::Activation}) {}
 };
 int checkedTokens(int t,int h,int w) {
-    if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>16384)
+    if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>fastllm::nomas::maxGridTokens)
         throw std::invalid_argument("invalid or oversized HY-Nomas tensor grid");
     return t*h*w;
 }
@@ -213,7 +214,7 @@ void fastllm_nomas_pipeline_destroy(void *handle) { delete static_cast<PipelineH
 int fastllm_nomas_generate(void *handle,const char *prompt,int width,int height,int frames,uint64_t seed,int steps,
                           uint8_t *rgb,size_t capacity,fastllm::nomas::Progress progress,void *user) {
     try {
-        lastError.clear(); if(!handle || !prompt || !rgb || width<1 || width>512 || height<1 || height>512 || frames<1 || frames>40 || capacity<size_t(width)*height*frames*3)
+        lastError.clear(); if(!handle || !prompt || !rgb || !fastllm::nomas::validResolution(width,height) || frames<1 || frames>40 || capacity<size_t(width)*height*frames*3)
             throw std::invalid_argument("invalid generation arguments or RGB buffer capacity");
         auto &ctx=*static_cast<PipelineHandle *>(handle); std::lock_guard<std::mutex> lock(ctx.mutex);
         auto result=ctx.pipeline.generate(prompt,width,height,frames,seed,steps,progress,user);

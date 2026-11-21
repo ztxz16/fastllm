@@ -10,6 +10,9 @@ OPTIONS = {
     "video_host_memory_limit": ("--host-memory-limit", H3),
     "video_parallel_mode": ("--parallel-mode", H3),
     "nomas_text_encoder": ("--text-encoder", ("hy_nomas",)),
+    "nomas_pe_url": ("--prompt-enhancer-url", ("hy_nomas",)),
+    "nomas_pe_model": ("--prompt-enhancer-model", ("hy_nomas",)),
+    "nomas_pe_prompts": ("--prompt-enhancer-prompts", ("hy_nomas",)),
     "duo_assets": ("--assets", ("duo",)),
     "duo_intent_cache": ("--intent-cache", ("duo",)),
 }

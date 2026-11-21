@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "resolution.h"
 #include "models/hy_nomas/parallel_model.h"
 #include <algorithm>
 #include <cmath>
@@ -31,10 +32,10 @@ void Pipeline::unloadModels() {
 std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int height,int frames,
                                        uint64_t seed,int steps,Progress progress,void *user) {
     rt_.activate();
-    if(prompt.empty() || prompt.size()>16384 || width<64 || height<64 || width>512 || height>512 ||
-       width%32 || height%32 || frames<4 || frames>40 || frames%4 || steps<1 || steps>32 ||
-       int64_t(frames/4)*(height/16)*(width/16)>16384)
-        throw std::invalid_argument("baseline accepts a nonempty prompt, 64..512 pixel multiples of 32, 4..40 frames in multiples of 4, and 1..32 steps");
+    if(prompt.empty() || prompt.size()>16384 || !validResolution(width,height) ||
+       frames<4 || frames>40 || frames%4 || steps<1 || steps>32 ||
+       int64_t(frames/4)*(height/16)*(width/16)>maxGridTokens)
+        throw std::invalid_argument("baseline accepts a nonempty prompt, 64..1280 pixel multiples of 32 (up to 1280x704 pixels), 4..40 frames in multiples of 4, and 1..32 steps");
     auto update=[&](int stage,int current,int total) {
         if(progress && progress(stage,current,total,user)) throw std::runtime_error("generation cancelled");
     };
@@ -132,8 +133,8 @@ std::vector<float> cameraTrajectory(int frames,int action) {
 
 std::unique_ptr<WorldState> Pipeline::createWorld(const std::string &prompt,int width,int height,uint64_t seed,int steps) {
     rt_.activate();
-    if(prompt.empty() || prompt.size()>16384 || width<64 || width>512 || height<64 || height>512 || width%32 || height%32 || width*height>512*384 || steps<1 || steps>32)
-        throw std::invalid_argument("world accepts a prompt, 64..512 pixel multiples of 32 (at most 196608 pixels), and 1..32 steps");
+    if(prompt.empty() || prompt.size()>16384 || !validResolution(width,height) || steps<1 || steps>32)
+        throw std::invalid_argument("world accepts a prompt, 64..1280 pixel multiples of 32 (up to 1280x704 pixels), and 1..32 steps");
     auto state=std::make_unique<WorldState>();
     state->width=width; state->height=height; state->steps=steps; state->seed=seed;
     state->generator.seed(seed);
@@ -223,6 +224,27 @@ std::vector<uint8_t> Pipeline::advance(WorldState &world,int action,Progress pro
     const bool hasCamera=action!=9;
     const bool cameraContinuation=hasCamera && world.frameOffset>0 && !promptChanged;
     const Tensor &segmentFeatures=cameraContinuation?cameraContinuationFeatures_:next.features;
+    // Keep whole history segments that fit alongside the incoming segment.
+    auto trimHistory=[&](int incomingTokens) {
+        int total=incomingTokens;
+        for(int tokens:next.segmentTokens) total+=tokens;
+        int remove=0;
+        while(int(next.segmentTokens.size())>next.maxHistorySegments || total-remove>maxCacheTokens) {
+            remove+=next.segmentTokens.front(); next.segmentTokens.erase(next.segmentTokens.begin());
+        }
+        if(remove) {
+            auto trim=[&](DiTCache &cache) {
+                for(size_t i=0;i<cache.key.size();++i) {
+                    int kept=cache.key[i].rows-remove;
+                    cache.key[i]=cache.key[i].rowSlice(remove,kept);
+                    cache.value[i]=cache.value[i].rowSlice(remove,kept);
+                }
+            };
+            if(parallel_) for(auto &cache:next.parallelCaches) trim(cache);
+            else trim(next.cache);
+        }
+    };
+    trimHistory(n+segmentFeatures.rows);
     auto poses=hasCamera?cameraTrajectory(20,action):std::vector<float>();
     std::vector<Tensor> camera;
     if(hasCamera) {
@@ -263,21 +285,7 @@ std::vector<uint8_t> Pipeline::advance(WorldState &world,int action,Progress pro
     else dit_.forward(cacheTensor,segmentFeatures,cacheSigma*1000.f,t,h,w,world.frameOffset,
                       &next.cache,true,hasCamera?&camera:nullptr,&workspace);
     next.segmentTokens.push_back(n+segmentFeatures.rows);
-    int remove=0;
-    while(int(next.segmentTokens.size())>next.maxHistorySegments) {
-        remove+=next.segmentTokens.front(); next.segmentTokens.erase(next.segmentTokens.begin());
-    }
-    if(remove) {
-        auto trim=[&](DiTCache &cache) {
-            for(size_t i=0;i<cache.key.size();++i) {
-                int kept=cache.key[i].rows-remove;
-                cache.key[i]=cache.key[i].rowSlice(remove,kept);
-                cache.value[i]=cache.value[i].rowSlice(remove,kept);
-            }
-        };
-        if(parallel_) for(auto &cache:next.parallelCaches) trim(cache);
-        else trim(next.cache);
-    }
+    trimHistory(0);
     update(2,world.steps+1,world.steps+1); update(3,0,1);
     const int stride=h*w*32;
     std::vector<uint8_t> rgb;

@@ -406,6 +406,10 @@ class NomasBackend(InteractiveBackend):
             return root / "text_encoder"
         return root.parent / "Qwen2.5-VL-7B-Instruct"
 
+    def enhancer_prompts(self, config):
+        value = config.nomas_pe_prompts.strip()
+        return Path(value).expanduser() if value else Path(config.model.strip()).expanduser() / "prompts"
+
     def validate_runtime(self, config, add):
         if len(logical_devices(config)) not in (1, 2, 4, 8):
             add("HY-Nomas 支持 1、2、4 或 8 张 GPU。", "visible_gpus")
@@ -414,12 +418,25 @@ class NomasBackend(InteractiveBackend):
         if not (self.encoder(config) / "tokenizer.json").is_file():
             add("请选择包含 tokenizer.json 的 Qwen2.5-VL-7B-Instruct 目录。", "nomas_text_encoder")
 
+        url = config.nomas_pe_url.strip()
+        if url:
+            if not re.match(r"^https?://[^/\s]+/", url):
+                add("请填写包含路径的 HTTP(S) Chat Completions 地址。", "nomas_pe_url")
+            names = ("system_prompt", "first_turn")
+            if not all((self.enhancer_prompts(config) / f"online_user_video_rewriter_{name}.md").is_file() for name in names):
+                add("请选择包含官方 Nomas-PE 提示词文件的目录。", "nomas_pe_prompts")
+
     def argv(self, config):
         devices = logical_devices(config)
-        return [sys.executable, str(PACKAGE / "nomas_server.py"), "--library", str(self.library()),
+        argv = [sys.executable, str(PACKAGE / "nomas_server.py"), "--library", str(self.library()),
                 "--model", os.path.expanduser(config.model.strip()), "--text-encoder", str(self.encoder(config)),
                 "--output", self.output(config), "--precision", "bf16", "--host", config.host,
                 "--port", config.port.strip(), "--devices" if len(devices) > 1 else "--device", ",".join(devices)]
+        if config.nomas_pe_url.strip():
+            argv.extend(["--prompt-enhancer-url", config.nomas_pe_url.strip(),
+                         "--prompt-enhancer-model", config.nomas_pe_model.strip() or "Nomas-PE",
+                         "--prompt-enhancer-prompts", str(self.enhancer_prompts(config))])
+        return argv
 
 
 class DuoBackend(InteractiveBackend):

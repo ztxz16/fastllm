@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "resolution.h"
 #include "models/hy_nomas/parallel.h"
 #include <cmath>
 #include <stdexcept>
@@ -7,8 +8,8 @@ namespace fastllm { namespace nomas {
 namespace {
 int tokenCount(int t,int h,int w) {
     // Bound public requests before allocating activations or constructing grids.
-    if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>16384)
-        throw std::invalid_argument("HY-Nomas grid exceeds baseline limit (16384 tokens)");
+    if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>maxGridTokens)
+        throw std::invalid_argument("HY-Nomas grid exceeds the supported resolution or frame count");
     return t*h*w;
 }
 }
@@ -69,7 +70,7 @@ Tensor DiT::forward(const Tensor &latent,const Tensor &features,float timestep,i
     if(hasCache && (cache->key.size()!=54 || cache->value.size()!=54))
         throw std::invalid_argument("invalid DiT cache layer count");
     int history=hasCache?cache->key[0].rows:0;
-    if(history+tokens+features.rows>32768) throw std::invalid_argument("DiT cache limit exceeded; start a new session");
+    if(history+tokens+features.rows>maxCacheTokens) throw std::invalid_argument("DiT cache limit exceeded; start a new session");
     if(workspace) {
         if(workspace==cache) throw std::invalid_argument("DiT workspace must not be the history cache");
         if(workspace->key.empty() && workspace->value.empty()) {

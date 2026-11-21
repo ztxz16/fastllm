@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "resolution.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -125,7 +126,7 @@ Volume reduce(Runtime &rt,Weights &weights,const Volume &v,const std::string &pr
 
 std::vector<float> encodeReferenceImage(int device,const std::string &path,int width,int height,
                                         const uint8_t *rgb,size_t bytes) {
-    if(width<64 || height<64 || width>512 || height>512 || width*height>512*384 || !rgb || bytes!=size_t(width)*height*3 || width%32 || height%32)
+    if(!validResolution(width,height) || !rgb || bytes!=size_t(width)*height*3)
         throw std::invalid_argument("reference must be a fitted RGB24 frame");
     // The released encoder and its intermediate rounding use BF16 even when
     // the primary DiT is configured for FP32 diagnostics.

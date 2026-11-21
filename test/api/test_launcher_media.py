@@ -50,6 +50,7 @@ class H(BaseHTTPRequestHandler):
   if args.kind in ('duo','hy_nomas'):
    if self.path in ('/health', '/resolutions'): return self.answer({'ready':True})
    if self.path.endswith('/events'): return self.answer(b'data: {}\n\n',mime='text/event-stream')
+   if args.kind=='hy_nomas' and self.path.endswith(('/content','?format=mp4')): return self.answer(b'fake-mp4',mime='video/mp4')
    if self.path.endswith('/avc'): return self.answer(b'frame',mime='application/octet-stream')
    return self.answer({'path':self.path})
   if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')), 'reference_model_available':True, 'dit_precision':'fp8', 'reference_dit_precision':'gguf', 'dit_parallel_mode':'sp', 'dit_sequence_parallel_size':2, 'dit_tensor_parallel_size':1},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
@@ -234,6 +235,25 @@ class ServiceTest(unittest.TestCase):
                 with self.subTest(flags=flags), self.assertRaises(SystemExit), patch("sys.stderr"):
                     main(base + flags)
 
+    def test_nomas_prompt_enhancement_profile(self):
+        from fastllm_pytools.service_backends import BACKENDS
+        (self.directory / "tokenizer.json").touch()
+        config = config_from_dict(self.profile("hy_nomas", api_key="", nomas_text_encoder=str(self.directory)))
+        backend = BACKENDS["hy_nomas"]
+        flag = "--prompt-enhancer-url"
+        self.assertNotIn(flag, backend.argv(config))
+        config.nomas_pe_url = "http://127.0.0.1:8008/v1/chat/completions"
+        config.nomas_pe_prompts = str(self.directory)
+        self.assertTrue(any("提示词文件" in error for error in validate_config(config)))
+        for name in ("system_prompt", "first_turn"):
+            (self.directory / f"online_user_video_rewriter_{name}.md").touch()
+        self.assertEqual(validate_config(config), [])
+        self.assertIn(flag, build_fastllm_argv(config))
+        self.assertEqual(backend.argv(config)[-6:], [flag, config.nomas_pe_url, "--prompt-enhancer-model",
+                                                     "Nomas-PE", "--prompt-enhancer-prompts", str(self.directory)])
+        config.nomas_pe_model = "my-pe"
+        self.assertIn("my-pe", backend.argv(config))
+
     def test_interactive_profiles_and_scoped_players(self):
         from fastllm_pytools.service_backends import BACKENDS
         (self.directory / "tokenizer.json").touch()
@@ -278,7 +298,10 @@ class ServiceTest(unittest.TestCase):
                 self.assertEqual(self.client.patch(world, content=b"edit").json()["data"], "edit")
                 self.assertEqual(self.client.delete(world, headers={"origin":"https://elsewhere.test"}).status_code, 403)
                 self.assertEqual(self.client.delete(world).json()["method"], "DELETE")
-                events = self.client.get(path + "v1/videos/video_" + "a" * 32 + "/events")
+                video = path + "v1/videos/video_" + "a" * 32
+                for suffix in ("/content", "?format=mp4"):
+                    self.assertEqual(self.client.get(video + suffix).headers["content-type"], "video/mp4")
+                events = self.client.get(video + "/events")
                 self.assertEqual(events.content, b"data: {}\n\n")
             else:
                 self.assertIn("DuoAvcPlayer", self.client.get(path + "avc-player.js").text)

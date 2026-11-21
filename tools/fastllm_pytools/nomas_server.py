@@ -1,7 +1,8 @@
 """HY-Nomas HTTP transport. All model inference and sampling run in C++/CUDA.
 
 Uses fastllm's existing FastAPI/uvicorn dependencies and Python's standard
-library. Frames are PNG, so neither FFmpeg nor a video codec package is needed.
+library. PNG output is always available. Interactive clients can negotiate H.264
+playback when FFmpeg includes libx264.
 """
 import argparse
 import base64
@@ -10,11 +11,13 @@ import asyncio
 import ctypes as C
 from contextlib import asynccontextmanager
 import json
+import logging
 import os
 from pathlib import Path
 import queue
 import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -51,33 +54,44 @@ class PromptRequest(BaseModel):
         return self.prompt if self.prompt is not None else "\n".join(m.content for m in self.messages)
 
 
+MAX_SIDE = 1280
+MAX_PIXELS = 1280 * 704
+
+
 class GenerateRequest(PromptRequest):
     model: Literal["hy-nomas"] = "hy-nomas"
     enhance_prompt: bool = True
     perspective: Literal["auto", "first-person", "second-person", "third-person follow", "third-person observer"] = "auto"
-    width: int = Field(default=128, ge=64, le=512, multiple_of=32, strict=True)
-    height: int = Field(default=128, ge=64, le=512, multiple_of=32, strict=True)
+    width: int = Field(default=128, ge=64, le=MAX_SIDE, multiple_of=32, strict=True)
+    height: int = Field(default=128, ge=64, le=MAX_SIDE, multiple_of=32, strict=True)
     num_frames: int = Field(default=16, ge=4, le=40, multiple_of=4, strict=True)
     seed: int = Field(default=42, ge=0, le=2**64-1, strict=True)
     steps: int = Field(default=8, ge=1, le=32, strict=True)
-    response_format: Literal["png_frames"] = "png_frames"
+    response_format: Literal["png_frames", "mp4"] = "png_frames"
+
+    @model_validator(mode="after")
+    def validate_resolution(self):
+        if self.width * self.height > MAX_PIXELS:
+            raise ValueError("resolution exceeds 1280 x 704 pixels")
+        return self
 
 
 Action = Literal["stay", "forward", "backward", "left", "right", "look_left", "look_right", "look_up", "look_down", "follow_prompt"]
 ACTIONS = ("stay", "forward", "backward", "left", "right", "look_left", "look_right", "look_up", "look_down", "follow_prompt")
 
 
+TextFrames = Literal[20, 40, 60, 80, 100, 120]
+
+
 class WorldRequest(GenerateRequest):
-    width: int = Field(default=384, ge=64, le=512, multiple_of=32, strict=True)
-    height: int = Field(default=224, ge=64, le=512, multiple_of=32, strict=True)
+    width: int = Field(default=384, ge=64, le=MAX_SIDE, multiple_of=32, strict=True)
+    height: int = Field(default=224, ge=64, le=MAX_SIDE, multiple_of=32, strict=True)
     num_frames: Literal[20] = 20
-    reference_rgb: Optional[str] = Field(default=None, max_length=512*384*4)
-    text_frames: Literal[20, 40, 60, 80, 100, 120] = 20
+    reference_rgb: Optional[str] = Field(default=None, max_length=MAX_PIXELS*4)
+    text_frames: TextFrames = 20
 
     @model_validator(mode="after")
-    def validate_area(self):
-        if self.width*self.height > 512*384:
-            raise ValueError("world resolution is limited to 196608 pixels (for example 512x384)")
+    def validate_reference(self):
         if self.reference_rgb is not None:
             if len(self.reference_rgb) != self.width*self.height*4:
                 raise ValueError("reference_rgb must contain one fitted RGB24 frame")
@@ -91,6 +105,7 @@ class WorldRequest(GenerateRequest):
 
 
 class WorldEditRequest(PromptRequest):
+    text_frames: Optional[TextFrames] = None
     kind: Literal["prompt", "environment", "action"] = "prompt"
 
 
@@ -207,10 +222,40 @@ def png_rgb(rgb, width, height):
             + chunk(b"IDAT", zlib.compress(scanlines, 3)) + chunk(b"IEND", b""))
 
 
+def find_video_encoder():
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            codecs = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True,
+                                    check=True, timeout=5).stdout.splitlines()
+            if any(line.split()[1:2] == [b"libx264"] for line in codecs):
+                return ffmpeg
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return None
+
+
+def encode_clip(ffmpeg, rgb, job, path):
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "-video_size", f"{job['width']}x{job['height']}", "-framerate", str(job["fps"]), "-i", "pipe:0",
+               "-filter_threads", "2", "-vf", "scale=out_color_matrix=bt709", "-c:v", "libx264", "-threads", "4",
+               "-preset", "veryfast", "-crf", "18", "-profile:v", "main", "-pix_fmt", "yuv420p",
+               "-colorspace", "bt709", "-movflags", "+faststart", str(path)]
+    try:
+        subprocess.run(command, input=rgb, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       check=True, timeout=60)
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        logging.getLogger(__name__).warning("MP4 encoding failed for %s, saving PNG frames: %s", job["id"], exc)
+        path.unlink(missing_ok=True)
+        return False
+
+
 class Jobs:
     def __init__(self, backend, output, max_queue=4, max_results=16, enhancer=None):
         self.backend, self.output = backend, Path(output)
         self.enhancer = enhancer
+        self.ffmpeg = find_video_encoder()
         self.output.mkdir(parents=True, exist_ok=True)
         self.pending = queue.Queue(maxsize=max_queue)
         self.jobs, self.lock = {}, threading.RLock()
@@ -244,7 +289,7 @@ class Jobs:
             job_id = "video_" + uuid.uuid4().hex
             job = dict(id=job_id, object="video", model="hy-nomas", status="queued", created_at=int(time.time()),
                        progress=0, stage="queued", frames_ready=0, width=request.width, height=request.height,
-                       num_frames=request.num_frames, fps=24, seed=request.seed, response_format="png_frames",
+                       num_frames=request.num_frames, fps=24, seed=request.seed, response_format=request.response_format if self.ffmpeg else "png_frames",
                        request=request, cancel=threading.Event())
             if isinstance(request, WorldGenerationRequest):
                 world = self.worlds[request.world_id]
@@ -289,7 +334,10 @@ class Jobs:
         with self.lock:
             if world_id not in self.worlds:
                 raise HTTPException(404, "unknown world; server restart requires a new world")
-            return {k: v for k, v in self.worlds[world_id].items() if k != "request"}
+            world = self.worlds[world_id]
+            result = {k: v for k, v in world.items() if k != "request"}
+            result["text_frames"] = world["request"].text_frames
+            return result
 
     def action_world(self, world_id, action):
         with self.lock:
@@ -317,8 +365,10 @@ class Jobs:
             if world["status"] not in ("ready", "generating"):
                 raise HTTPException(409, "world is failed, deleting, or complete; reset it")
             caption = request.caption()
-            if caption != world["prompt"] or request.kind != world["edit_kind"]:
-                world["request"] = world["request"].model_copy(update={"prompt": caption, "messages": None})
+            current = world["request"]
+            text_frames = current.text_frames if request.text_frames is None else request.text_frames
+            if caption != world["prompt"] or request.kind != world["edit_kind"] or text_frames != current.text_frames:
+                world["request"] = current.model_copy(update={"prompt": caption, "messages": None, "text_frames": text_frames})
                 world.update(prompt=caption, edit_kind=request.kind, prompt_revision=world["prompt_revision"]+1)
             return self.get_world(world_id)
 
@@ -338,7 +388,9 @@ class Jobs:
     def public(job):
         result = {k: v for k, v in job.items() if k not in ("request", "cancel", "commit_started")}
         result["events_url"] = f"/v1/videos/{job['id']}/events"
-        if result.get("frames_ready", 0):
+        if job["response_format"] == "mp4" and job["status"] == "completed":
+            result["output"] = {"format": "mp4", "url": f"/v1/videos/{job['id']}?format=mp4"}
+        elif job["response_format"] == "png_frames" and job["frames_ready"]:
             result["output"] = {"format": "png_frames", "frames": [f"/v1/videos/{job['id']}/frames/{i}" for i in range(job["frames_ready"])]}
         return result
 
@@ -438,13 +490,20 @@ class Jobs:
                     job["generation_seconds"] = round(time.monotonic()-started, 4)
                     job["generation_fps"] = round(job["num_frames"]/max(job["generation_seconds"], .0001), 2)
                 directory.mkdir()
-                size = job["width"] * job["height"] * 3
-                for i in range(job["num_frames"]):
-                    if self.stopping.is_set() or job["cancel"].is_set():
-                        raise RuntimeError("generation cancelled")
-                    (directory / f"{i}.png").write_bytes(png_rgb(rgb[i*size:(i+1)*size], job["width"], job["height"]))
+                encoded = job["response_format"] == "mp4" and encode_clip(self.ffmpeg, rgb, job, directory / "clip.mp4")
+                if encoded:
                     with self.lock:
-                        job["frames_ready"] = i+1
+                        job["frames_ready"] = job["num_frames"]
+                else:
+                    with self.lock:
+                        job["response_format"] = "png_frames"
+                    size = job["width"] * job["height"] * 3
+                    for i in range(job["num_frames"]):
+                        if self.stopping.is_set() or job["cancel"].is_set():
+                            raise RuntimeError("generation cancelled")
+                        (directory / f"{i}.png").write_bytes(png_rgb(rgb[i*size:(i+1)*size], job["width"], job["height"]))
+                        with self.lock:
+                            job["frames_ready"] = i+1
                 with self.lock:
                     if job["cancel"].is_set():
                         raise RuntimeError("generation cancelled")
@@ -504,6 +563,7 @@ def create_app(backend, output, precision="bf16", enhancer=None):
     @app.get("/health")
     def health():
         return {"status": "ok", "backend": "native_cpp_cuda", "precision": precision,
+                "playback_formats": ["png_frames", "mp4"] if jobs.ffmpeg else ["png_frames"],
                 "precision_status": "default" if precision == "bf16" else "reference",
                 "prompt_enhancer": {"enabled": enhancer is not None, "model": enhancer.model if enhancer else None},
                 "torch_loaded": "torch" in sys.modules}
@@ -545,7 +605,9 @@ def create_app(backend, output, precision="bf16", enhancer=None):
 
     @app.get("/v1/videos/{job_id}")
     @app.get("/v1/generate/{job_id}")
-    def status(job_id: str):
+    def status(job_id: str, format: Literal["json", "mp4"] = "json"):
+        if format == "mp4":
+            return content(job_id)
         return jobs.get(job_id)
 
     @app.get("/v1/videos/{job_id}/events", response_class=StreamingResponse,
@@ -580,9 +642,20 @@ def create_app(backend, output, precision="bf16", enhancer=None):
     def cancel(job_id: str):
         return jobs.cancel(job_id)
 
+    @app.get("/v1/videos/{job_id}/content")
+    def content(job_id: str):
+        job = jobs.get(job_id)
+        if job["response_format"] != "mp4":
+            raise HTTPException(404, "video has no MP4 output")
+        if job["status"] != "completed":
+            raise HTTPException(409, "video is not ready")
+        return FileResponse(jobs.output / job_id / "clip.mp4", media_type="video/mp4")
+
     @app.get("/v1/videos/{job_id}/frames/{index}")
     def frame(job_id: str, index: int):
         job = jobs.get(job_id)
+        if job["response_format"] != "png_frames":
+            raise HTTPException(404, "video has no PNG frames")
         if not 0 <= index < job["num_frames"]:
             raise HTTPException(404, "frame index out of range")
         if index >= job["frames_ready"]:

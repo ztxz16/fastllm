@@ -16,7 +16,7 @@ ROUTES = {
         "DELETE": r"v1/worlds/world_[0-9a-f]{24}",
     },
     "hy_nomas": {
-        "GET": rf"health|openapi\.json|{WORLD}|{VIDEO}(?:/events|/frames/[0-9]+)?",
+        "GET": rf"health|openapi\.json|{WORLD}|{VIDEO}(?:/content|/events|/frames/[0-9]+)?",
         "POST": rf"v1/worlds|v1/videos|{WORLD}/actions|{VIDEO}/cancel",
         "PATCH": WORLD, "DELETE": WORLD,
     },
