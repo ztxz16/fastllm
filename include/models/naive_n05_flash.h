@@ -403,6 +403,7 @@ namespace fastllm {
         struct DraftHeadShards {
             const std::vector<int> &limits;
             std::vector<Data> &inputs, &logits;
+            bool collectiveDynamicKV = false;
         };
         bool RunDraftBatch(const std::vector<int> &anchors,
                            const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows = 0,

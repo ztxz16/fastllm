@@ -2484,6 +2484,7 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
         if (!useGraph) invalidateMoved();
     }
     if (headShards) {
+        headShards->collectiveDynamicKV = collective && dynamicKV;
         // Each vocabulary shard reads the live prefix directly from each DP owner.
         // Source rows are owner-local and can be reordered or padded by the backbone graph.
         std::vector<int> offsets(batch + 1);
@@ -2566,6 +2567,7 @@ struct NaiveN05FlashModel::DraftRound {
     bool greedy = false;
     int sampledAccepted = -1, sampledNext = -1;
     bool targetCommitted = false, draftCommitted = false;
+    bool collectiveDynamicKV = false;
     TargetCapture::FeatureRows feature;
     bool targetPayloadWritten = false;
     bool standalone = false; // Only this round may borrow the shared sampling arena.
@@ -3059,6 +3061,7 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
     std::vector<std::vector<int>> offsets(ranks);
     int offset = 0;
     for (auto &round : rounds) {
+        round->collectiveDynamicKV = headShards.collectiveDynamicKV;
         const int rank = round->context.deviceRank;
         groups[rank].push_back(round.get()); offsets[rank].push_back(offset);
         offset += round->limit;
@@ -3389,9 +3392,10 @@ void NaiveN05FlashModel::PrepareDraftAcceptanceLocal(const std::vector<DraftRoun
     for (const auto &entry : groups) {
         const bool greedy = entry.first.first;
         const int drafts = entry.first.second, rows = drafts + 1, count = entry.second.size();
-        // The sampler's small-batch algorithm has its own exact fallback.
+        // Collective graphs reload KV pointers from the binding table on each replay.
         bool masked = !greedy && rank >= 0 && rounds[entry.second.front()]->feature.data &&
-            !FastllmMtpUsesSmallRejection(count, drafts, vocab) && draftContextStorage && CanSlideDraftKV();
+            !FastllmMtpUsesSmallRejection(count, drafts, vocab) && draftContextStorage &&
+            (rounds[entry.second.front()]->collectiveDynamicKV || CanSlideDraftKV());
         // Launch the two shape-only projections while the host packs sampling
         // parameters and checks where each accepted prefix may be appended.
         if (masked) masked = ProjectVerifyDraftRows(rounds, entry.second, rank, rows);
