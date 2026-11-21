@@ -18,3 +18,7 @@ void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::
                           const std::array<void *, 2> &sharedWeights);
 void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *input, const int32_t *ids,
                          const float *scores, void *output, int rows, int commonRows, const int *liveKeys);
+// densePrefixRows is agreed by all ranks and contains only unmasked, real rows.
+void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *input, const int32_t *ids,
+                         const float *scores, void *output, int rows, int commonRows, const int *liveKeys,
+                         int densePrefixRows);

@@ -149,6 +149,8 @@ struct Rank {
     int sms;
     bool tunedEp8;
     bool relayAcrossNuma = false;
+    std::array<uint8_t *, 8> receiveByRank{};
+    Mail *pairedReturnPeers = nullptr;
     float *rowScores = nullptr;
     uint8_t *downInput;
     uint32_t *downScales;
@@ -758,6 +760,16 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
     }
     for (auto &r : ep->ranks) {
         check(cudaSetDevice(r->storage.device));
+        if (relayAcrossNuma) {
+            // Adjacent packets in the dense buffer originate at socket counterparts.
+            std::array<Mail, 8> paired;
+            for (int rank = 0; rank < 8; ++rank) {
+                r->receiveByRank[rank] = mail[rank].receive;
+                paired[2 * (rank % 4) + rank / 4] = mail[rank];
+            }
+            r->pairedReturnPeers = r->storage.allocate<Mail>(paired.size());
+            check(cudaMemcpy(r->pairedReturnPeers, paired.data(), sizeof(paired), cudaMemcpyHostToDevice));
+        }
         check(cudaMemcpy(r->peers, mail.data(), mail.size() * sizeof(Mail), cudaMemcpyHostToDevice));
     }
     return ep;
@@ -810,10 +822,31 @@ void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::
     check(cudaStreamSynchronize(cudaStreamPerThread));
 }
 namespace {
+// Send each packed activation across the socket link once. Its socket partner
+// and its local copy then form one contiguous DMA for each of the other three GPUs.
+void dispatchDenseEp8(Rank &r, const Shape &s, int rank, const BF *input, const int *ids,
+                      const float *scores, int rows, cudaStream_t stream) {
+    const size_t bytes = size_t(rows) * s.stride;
+    const size_t pairOffset = 2 * (rank % 4) * bytes;
+    const size_t offset = pairOffset + (rank / 4) * bytes;
+    Mail local = r.mail;
+    local.send = r.b.incoming + offset;
+    publish<<<rows, 256, 0, stream>>>(local, s, input, ids, scores, rows, nullptr);
+    check(cudaMemcpyAsync(r.receiveByRank[rank ^ 4] + offset, local.send, bytes, cudaMemcpyDeviceToDevice, stream));
+    rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
+    for (int step = 1; step < 4; ++step) {
+        int peer = (rank & 4) + ((rank + step) % 4);
+        check(cudaMemcpyAsync(r.receiveByRank[peer] + pairOffset, r.b.incoming + pairOffset,
+                              2 * bytes, cudaMemcpyDeviceToDevice, stream));
+    }
+}
 void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF *rowsIn, const int *index,
-              const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream) {
+              const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream, bool dense) {
     const bool shortBatch = r.tunedEp8 && cap <= 32;
-    if (r.tunedEp8 && cap > 128 && r.relayAcrossNuma) {
+    const bool paired = dense && r.pairedReturnPeers && r.tunedEp8 && cap > 128;
+    if (paired) {
+        dispatchDenseEp8(r, s, rank, rowsIn, index, weights, cap, stream);
+    } else if (r.tunedEp8 && cap > 128 && r.relayAcrossNuma) {
         dispatchEp8ToNumaPeers<<<cap, 256, 0, stream>>>(r.peers, rank, rowsIn, index, weights, n, cap, keys);
         rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
         forwardEp8WithinNumaNode<<<dim3(cap, 2), 128, 0, stream>>>(r.peers, rank, cap);
@@ -835,7 +868,8 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
             if (shortBatch) layout<DecodeTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
             else if (cap > 128) layout<WideTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
             else layout<Tile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
-            makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, r.rowScores);
+            makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(
+                r.b, s, rank, routes, paired ? r.pairedReturnPeers : r.peers, cap, r.rowScores);
         } else {
             layout<Tile, false><<<s.localE, 32, 0, stream>>>(r.b, s, nullptr);
             makeTasks<false><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, nullptr);
@@ -880,11 +914,16 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
 
 void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *input, const int32_t *ids,
                          const float *scores, void *out, int rows, int commonRows, const int *live) {
+    FastllmRunGenericEp(ep, rank, layer, input, ids, scores, out, rows, commonRows, live, 0);
+}
+
+void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *input, const int32_t *ids,
+                         const float *scores, void *out, int rows, int commonRows, const int *live, int densePrefixRows) {
     auto &r = *ep.ranks.at(rank);
     const auto &s = ep.s;
     // Validate the layer even for an empty batch, as in the original entry point.
     const auto &primaryLayer = r.layers.at(layer);
-    if (rows < 0 || rows > commonRows)
+    if (rows < 0 || rows > commonRows || densePrefixRows < 0 || densePrefixRows > rows || (live && densePrefixRows))
         throw std::runtime_error("Invalid generic EP row count");
     const auto stream = cudaStreamPerThread;
     for (int64_t start = 0; start < commonRows; start += s.cap) {
@@ -894,6 +933,6 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
                  n ? static_cast<const BF *>(input) + size_t(first) * s.h : nullptr,
                  n ? ids + size_t(first) * s.k : nullptr, n ? scores + size_t(first) * s.k : nullptr,
                  n ? static_cast<BF *>(out) + size_t(first) * s.h : nullptr, n, cap,
-                 n && live ? live + first : nullptr, stream);
+                 n && live ? live + first : nullptr, stream, start + cap <= densePrefixRows);
     }
 }

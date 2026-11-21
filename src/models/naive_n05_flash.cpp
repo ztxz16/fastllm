@@ -981,8 +981,14 @@ Data NaiveN05FlashModel::RunTarget(
         std::any_of(attentionParallel->rows.localToGlobal.begin(), attentionParallel->rows.localToGlobal.end(),
             [&](const auto &rows) { return rows.size() != attentionParallel->rows.localToGlobal.front().size(); });
     int maxLocalRows = 0;
-    if (localMoeRows) for (const auto &rows : attentionParallel->rows.localToGlobal)
-        maxLocalRows = std::max(maxLocalRows, (int)rows.size());
+    int minLocalRows = 0;
+    if (localMoeRows && !attentionParallel->rows.localToGlobal.empty()) {
+        minLocalRows = attentionParallel->rows.localToGlobal.front().size();
+        for (const auto &rows : attentionParallel->rows.localToGlobal) {
+            maxLocalRows = std::max(maxLocalRows, (int)rows.size());
+            minLocalRows = std::min(minLocalRows, (int)rows.size());
+        }
+    }
     bool localHiddenReady = false;
     const bool canReusePrefillProjections = !decodeWorkspace && !verifying && attentionParallel &&
         AttentionTPSize() == 1 && (!capture || (!capture->collectHidden && capture->prefixes.empty())) &&
@@ -2271,7 +2277,8 @@ Data NaiveN05FlashModel::RunTarget(
                 FastllmCudaRunMimoEp8MegaLocal(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, maxLocalRows,
                     decodeWorkspace ? (const int *)localDP->liveKeys.cudaData : nullptr,
-                    decodeWorkspace ? nullptr : &routerInput);
+                    decodeWorkspace ? nullptr : &routerInput,
+                    !decodeWorkspace && !verifying ? minLocalRows : 0);
             } else if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, decodeWorkspace || shardMoe,

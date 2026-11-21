@@ -38,6 +38,10 @@ void FastllmRunGenericEp(FastllmGenericEp &, int, int, const void *, const int32
         void *, int, int, const int *) {
     throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
 }
+void FastllmRunGenericEp(FastllmGenericEp &, int, int, const void *, const int32_t *, const float *,
+        void *, int, int, const int *, int) {
+    throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
+}
 #endif
 
 struct FastllmCudaMimoEp8Mega {
@@ -208,10 +212,10 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
 
 namespace {
 void MimoReplayRows(FastllmCudaMimoEp8Mega &state, int rank, int layer, const void *input, const int32_t *indices,
-        const float *scores, void *output, int rows, int collectiveRows, const int *liveKeys) {
+        const float *scores, void *output, int rows, int collectiveRows, const int *liveKeys, int densePrefixRows = 0) {
     if (state.generic && (!state.native || collectiveRows <= state.SharedDecodeRows)) {
         FastllmRunGenericEp(*state.generic, rank, layer, input, indices, scores, output,
-                            rows, collectiveRows, liveKeys);
+                            rows, collectiveRows, liveKeys, densePrefixRows);
         return;
     }
     auto graph = state.Graph(rank, layer, collectiveRows);
@@ -271,6 +275,12 @@ void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &state, int r
 void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch) {
+    FastllmCudaRunMimoEp8MegaLocal(state, rank, layer, input, index, score, output, maxRows, liveKeys, prefillScratch, 0);
+}
+
+void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+        const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch, int densePrefixRows) {
     if (state.builtin) return FastllmCudaRunMimoEp8BuiltinMegaLocal(*state.builtin, rank, layer,
         input, index, score, output, maxRows, liveKeys, prefillScratch);
     if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || input.dims[1] != state.hidden ||
@@ -279,7 +289,7 @@ void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int
         throw std::runtime_error("Invalid rank-local SM120 EP input.");
     MimoGraphOutput(output, input, state.devices.at(rank));
     MimoReplayRows(state, rank, layer, input.cudaData, (int32_t *)index.cudaData,
-        (float *)score.cudaData, output.cudaData, input.dims[0], maxRows, liveKeys);
+        (float *)score.cudaData, output.cudaData, input.dims[0], maxRows, liveKeys, densePrefixRows);
 }
 
 bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int layer,

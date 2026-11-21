@@ -56,3 +56,8 @@ void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int
     const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
     fastllm::Data &output, int maxRows, const int *liveKeys = nullptr,
     fastllm::Data *prefillScratch = nullptr);
+// Scheduler-provided lower bound on the number of real, unmasked rows on every rank.
+void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+    const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &output, int maxRows, const int *liveKeys,
+    fastllm::Data *prefillScratch, int densePrefixRows);
