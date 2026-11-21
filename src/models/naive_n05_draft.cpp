@@ -1384,6 +1384,14 @@ void NaiveN05FlashModel::ProjectDraftContext(Data &combined, Data &projected, Da
 #endif
 }
 
+bool NaiveN05FlashModel::NeedsDraftPrefillHidden(const Data &key, int end, int promptLength) const {
+    const int keep = draftWindow + GetPageLen() - 1;
+    if (end > promptLength - keep) return true;
+    // An early PD fork needs the same normalized draft window as the prompt tail.
+    const int fork = PDBranchCheckpointEnd(key);
+    return fork > 0 && end <= fork && end > fork - keep;
+}
+
 void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
         DraftContext &context, std::vector<std::pair<Data, Data>> &kv) {
     ApplyDraftDevice();
@@ -3578,8 +3586,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             const auto &key = caches[i]->front().first;
             const int past = key.dims.empty() ? 0 : key.dims[1];
             AssertInFastLLM(owners[i]->committed == past, "Naive target/draft cache length mismatch.");
-            const int start = std::max(0, configs[i].input_token_length - draftWindow - GetPageLen() + 1);
-            collect[i] = past + seqLens[i] > start;
+            collect[i] = NeedsDraftPrefillHidden(key, past + seqLens[i], configs[i].input_token_length);
             capture.collectHidden |= collect[i];
         }
         auto tokens = ForwardTargetBatch(batch, inputIds, {}, positionIds, seqLens,
@@ -3917,11 +3924,8 @@ int NaiveN05FlashModel::ForwardDraft(
     if (draftKVOnly || isIntermediateChunkedPrefill || config.prefill_chunk_remaining >= 0 || context.committed == 0 || context.kv.empty() ||
         inputIds.dims[1] != 1 || config.output_logits || constrained || limit <= 0) {
         TargetCapture capture;
-        // Only the final draft window is used; there is no CPU prefix archive.
-        // Preserve absolute position accounting while skipping invisible
-        // prompt chunks' feature copies, projection and draft KV construction.
-        const int draftStart = std::max(0, config.input_token_length - draftWindow - GetPageLen() + 1);
-        capture.collectHidden = oldLength + inputIds.dims[1] > draftStart;
+        capture.collectHidden = NeedsDraftPrefillHidden(kv.front().first, oldLength + inputIds.dims[1],
+                                                       config.input_token_length);
         capture.borrowOutputs = true;
         auto selection = SelectLogits(config);
         capture.selection = &selection;

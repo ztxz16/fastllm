@@ -847,6 +847,8 @@ namespace fastllm {
         }
         virtual bool HasPDResidentPrefixCache() const { return false; }
         int RestorePDResidentPrefix(ResponseContext *context);
+        int RestorePDResidentPrefix(ResponseContext *context, int *fullMatch);
+        int PDBranchCheckpointEnd(const Data &key) const;
         // Metadata-only routing hint; does not pin pages or restore GPU state.
         int PreviewPDResidentPrefix(const std::vector<int> &tokens);
         int PreviewPDResidentPrefix(const std::vector<int> &tokens, int group);

@@ -398,6 +398,58 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         Require(model.PreviewPDResidentPrefix(warm->currentTokens) == 8192, "unknown session missed a warm group");
     }
 
+    static void BranchWindowPressure() {
+        NaiveN05PrefixCacheTestAccess model(2);
+        auto regular = model.Request(1);
+        model.Checkpoint(*regular, 0, 1300);
+        model.Publish(*regular); model.Drain(*regular);
+        const int regularHit = model.PreviewPDResidentPrefix(regular->currentTokens);
+        Require(regularHit == 1280, "missing regular continuation");
+
+        auto other = model.Request(2);
+        model.Publish(*other); model.Drain(*other);
+        auto branch = std::make_shared<PrefixSnapshot>();
+        branch->slot = model.TryTakePrefixSlot(0, true);
+        Require(branch->slot >= 0, "branch could not use a spare slot");
+        branch->pool = model.prefixPool;
+        branch->branchOnly = true;
+        branch->length = 256;
+        branch->tokens.assign(other->currentTokens.begin(), other->currentTokens.begin() + branch->length);
+        branch->tokenHash = PagedCacheManager::HashTokenPage(branch->tokens.data(), branch->length);
+        model.prefixHistory.push_back(branch);
+        Require(model.TryTakePrefixSlot(0, true) < 0, "branch displaced a held or regular window");
+        Require(model.PreviewPDResidentPrefix(other->currentTokens) == 256,
+                "matched FULL pages must support an equivalent branch window");
+        auto miss = other->currentTokens;
+        miss[0] += 1;
+        Require(model.PreviewPDResidentPrefix(miss) == 0, "branch survived a mismatched prefix");
+        model.draftEnabled = true;
+        Require(model.PreviewPDResidentPrefix(other->currentTokens) == 0, "used an incomplete draft window");
+        model.draftEnabled = false;
+        int branchSlot = branch->slot;
+        branch.reset();
+        Require(model.TakeHistorySlot(0) == branchSlot, "ordinary allocation evicted a continuation");
+        Require(model.TryTakePrefixSlot(0, true) < 0, "branch displaced an ordinary window in a full pool");
+        Require(model.PreviewPDResidentPrefix(regular->currentTokens) == regularHit,
+                "branch allocation changed regular prefix availability");
+        model.prefixPool->slots.Return(branchSlot);
+
+        model.prefixPool->branchStart = 2;
+        model.prefixPool->branchSlots.Init(1, 1);
+        auto exclusive = std::make_shared<PrefixSnapshot>();
+        exclusive->pool = model.prefixPool;
+        exclusive->branchOnly = true;
+        exclusive->slot = model.TryTakePrefixSlot(0, true);
+        Require(exclusive->slot == 2, "branch did not use the dedicated row");
+        model.prefixHistory.push_back(exclusive);
+        Require(model.TryTakePrefixSlot(0, false) == branchSlot, "branch consumed a normal slot");
+        Require(model.TryTakePrefixSlot(0, true) < 0, "overwrote a live branch window");
+        exclusive.reset();
+        Require(model.TryTakePrefixSlot(0, true) == 2, "saturated history prevented branch replacement");
+        model.prefixPool->branchSlots.Return(0);
+        model.prefixPool->slots.Return(branchSlot);
+    }
+
     static void PressureTelemetry() {
         for (bool fullPressure : {false, true}) {
             NaiveN05PrefixCacheTestAccess model(3);
@@ -541,6 +593,7 @@ int main() {
         fastllm::NaiveN05PrefixCacheTestAccess::SharedReplacement();
         fastllm::NaiveN05PrefixCacheTestAccess::RollingConversations();
         fastllm::NaiveN05PrefixCacheTestAccess::PDGroupPreview();
+        fastllm::NaiveN05PrefixCacheTestAccess::BranchWindowPressure();
         fastllm::NaiveN05PrefixCacheTestAccess::PressureTelemetry();
         fastllm::NaiveN05PrefixCacheTestAccess::AlignedExactRepeat();
         fastllm::NaiveN05PrefixCacheTestAccess::PartialTailEviction();

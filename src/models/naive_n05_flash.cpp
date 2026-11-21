@@ -2892,9 +2892,10 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     }
     prefixes->slotBytes = (prefixes->slotBytes + 255) / 256 * 256;
     if (draftEnabled) prefixes->draftSlotBytes = (size_t)(draftWindow - 1) * embed_dim * sizeof(uint16_t);
-    const int prefixSlots = reserveWindowHistory ? prefixes->SlotCount(localBatch, budget) : 0;
-    const int totalSlots = prefixSlots * attentionDP;
-    const int64_t prefixBytes = (int64_t)prefixSlots * prefixes->slotBytes +
+    const int regularSlots = reserveWindowHistory ? prefixes->SlotCount(localBatch, budget) : 0;
+    int prefixSlots = regularSlots;
+    int totalSlots = prefixSlots * attentionDP;
+    int64_t prefixBytes = (int64_t)prefixSlots * prefixes->slotBytes +
         (int64_t)PrefixPool::DraftShardSlots(totalSlots, 0, ranks) * prefixes->draftSlotBytes;
     fixedBytes += prefixBytes;
     int64_t tokens = GetMaxTokens() > 0 ? GetMaxTokens() :
@@ -2903,7 +2904,23 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
     if (tokensLimit > 0) tokens = std::min<int64_t>(tokens, tokensLimit);
     tokens = std::min<int64_t>(tokens, INT_MAX - 127);
     // Preserve the existing budget, including a partial page per request.
-    const int64_t bytes = fixedBytes + (tokens + (int64_t)batch * 127) * fullBytesPerToken;
+    int64_t bytes = fixedBytes + (tokens + (int64_t)batch * 127) * fullBytesPerToken;
+    if (pdPrefillOnly && prefixSlots > 0) {
+        const int extraDraftRows = PrefixPool::DraftShardSlots(totalSlots + attentionDP, 0, ranks) -
+                                   PrefixPool::DraftShardSlots(totalSlots, 0, ranks);
+        const int64_t extra = prefixes->slotBytes + extraDraftRows * prefixes->draftSlotBytes;
+        // Preserve the entire computed FULL capacity and every ordinary window.
+        // When the startup budget is tight, use only reclaimable spare slots.
+        if (extra <= budget - bytes) {
+            prefixes->branchStart = totalSlots;
+            prefixes->branchSlots.Init(attentionDP, 1);
+            ++prefixSlots;
+            totalSlots += attentionDP;
+            prefixBytes += extra;
+            fixedBytes += extra;
+            bytes += extra;
+        }
+    }
     AssertInFastLLM(tokens >= 128 && bytes > 0 && bytes <= budget,
         "Naive startup KV pool exceeds the memory budget; reduce --tokens/--max_batch or prefill chunk size.");
     const int pageLen = GetPageLen();
@@ -2988,7 +3005,7 @@ void NaiveN05FlashModel::InitTensorParallelKVPool() {
                 storage.directMemory = true;
             }
         }
-        prefixes->slots.Init(attentionDP, prefixSlots);
+        prefixes->slots.Init(attentionDP, regularSlots);
         prefixPool = std::move(prefixes);
         printf("[Naive GPU prefix cache] %d window slots, %.2f MiB/GPU within KV budget; no CPU KV archive.\n",
                prefixSlots, prefixBytes / 1048576.0);

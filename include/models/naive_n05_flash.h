@@ -208,6 +208,9 @@ namespace fastllm {
             // Serialized by historyMutex. Metadata previews never own slots.
             uint64_t historyVersion = 0;
             uint64_t orphanWindows = 0, evictedWindows = 0, recycledWindows = 0, noWindowSlots = 0;
+            // Optional rows are appended after the ordinary pool, one per DP group.
+            int branchStart = -1;
+            WindowSlots branchSlots;
             int SlotCount(int requests, int64_t budget) const {
                 if (!slotBytes) return 0;
                 // Reserve all active checkpoints before spending spare budget
@@ -222,6 +225,7 @@ namespace fastllm {
             int slot = -1, length = 0;
             int ownerDevice = -1;
             bool draftReady = false;
+            bool branchOnly = false;
             std::vector<int> tokens;
             uint64_t tokenHash = 0; // Immutable with tokens after publication.
             // Observe the resident full-prefix endpoint without pinning KV.
@@ -239,11 +243,13 @@ namespace fastllm {
             bool HasResidentPrefix() const {
                 return fullPool && fullPool->IsCachedPage(fullPage, fullGeneration);
             }
+            bool HasDedicatedSlot() const { return branchOnly && pool && pool->branchStart >= 0; }
             ~PrefixSnapshot() {
                 for (const auto &entry : checkpointPages)
                     entry.pool->ReleasePrefixCheckpoint(entry.page, entry.generation);
                 if (pool && slot >= 0) {
-                    pool->slots.Return(slot);
+                    if (HasDedicatedSlot()) pool->branchSlots.Return(slot - pool->branchStart);
+                    else pool->slots.Return(slot);
                 }
             }
         };
@@ -255,6 +261,7 @@ namespace fastllm {
         std::shared_ptr<fastkv::HostCache> hostPrefixCache;
         void PublishHostPrefix(ResponseContext &context, const std::shared_ptr<PrefixSnapshot> &snapshot);
         bool RestorePrefixWindow(ResponseContext *context, const std::shared_ptr<PrefixSnapshot> &snapshot) const;
+        int TryTakePrefixSlot(int group, bool branchOnly);
         int TakeHistorySlot(int group);
         void RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &snapshot);
         PrefixSnapshots BeginPrefixSnapshots(const Data &key, int past, int length);
@@ -377,6 +384,7 @@ namespace fastllm {
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
         void RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context);
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
+        bool NeedsDraftPrefillHidden(const Data &key, int end, int promptLength) const;
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
                                 std::vector<std::pair<Data, Data>> &kv);
         void ProjectDraftContext(Data &combined, Data &projected, Data &hidden);

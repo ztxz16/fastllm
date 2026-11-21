@@ -19,7 +19,8 @@ public:
         prefixPool = std::make_shared<PrefixPool>();
         prefixPool->slotBytes = 1;
         pages.pageLen = 128; pages.SetMaxPages(8);
-        Install(1, 0); Install(2, 1);
+        prefixPool->slots.Init(1, 2);
+        Install(1); Install(2);
     }
     ~NaiveN05PrefixCacheTestAccess() override {
         ShutdownRuntime();
@@ -27,9 +28,9 @@ public:
         if (pages.trieRoot) pages.EvictTrieSubtree(pages.trieRoot);
         pages.trieRoot = nullptr;
     }
-    void Install(int token, int slot) {
+    void Install(int token) {
         auto snapshot = std::make_shared<PrefixSnapshot>();
-        snapshot->pool = prefixPool; snapshot->slot = slot;
+        snapshot->pool = prefixPool; snapshot->slot = prefixPool->slots.Take(0);
         snapshot->length = 128; snapshot->tokens.assign(128, token);
         snapshot->tokenHash = PagedCacheManager::HashTokenPage(snapshot->tokens.data(), 128);
         snapshot->draftReady = true;

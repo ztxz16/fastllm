@@ -118,7 +118,7 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
         auto &active = activePrefixes[&context->pastKeyValues.front().first];
         // Unbounded API queues must not pin every slot. Each protected waiter
         // uses one of the existing per-request checkpoint slots, not full KV.
-        if (activePrefixes.size() <= (size_t)(maxBatch > 0 ? maxBatch : 512))
+        if (queuedPrefix && !queuedPrefix->branchOnly && activePrefixes.size() <= (size_t)(maxBatch > 0 ? maxBatch : 512))
             active.queued = std::move(queuedPrefix);
     }
 }
@@ -185,11 +185,33 @@ void NaiveN05FlashModel::RetirePrefixSnapshot(std::shared_ptr<PrefixSnapshot> &s
     snapshot.reset();
 }
 
+// Each group has one branch window. When it borrows an ordinary slot, regular
+// checkpoints (including host restores) reclaim it before evicting other history.
+int NaiveN05FlashModel::TryTakePrefixSlot(int group, bool branchOnly) {
+    if (!branchOnly) {
+        int slot = prefixPool->slots.Take(group);
+        if (slot >= 0 || prefixPool->branchStart >= 0) return slot;
+    }
+    auto victim = std::find_if(prefixHistory.begin(), prefixHistory.end(), [&](const auto &entry) {
+        return entry->branchOnly && entry->slot % attentionDP == group;
+    });
+    if (victim != prefixHistory.end()) {
+        if (victim->use_count() != 1) return -1;
+        prefixHistory.erase(victim);
+        ++prefixPool->historyVersion;
+    }
+    if (branchOnly && prefixPool->branchStart >= 0) {
+        int lease = prefixPool->branchSlots.Take(group);
+        return lease < 0 ? -1 : prefixPool->branchStart + lease;
+    }
+    return prefixPool->slots.Take(group);
+}
+
 // Caller holds historyMutex. A checkpoint with another reader cannot free its slot.
 int NaiveN05FlashModel::TakeHistorySlot(int group) {
-    int slot = prefixPool->slots.Take(group);
+    int slot = TryTakePrefixSlot(group, false);
     for (auto it = prefixHistory.begin(); slot < 0 && it != prefixHistory.end();) {
-        if (it->use_count() != 1 || (*it)->slot % attentionDP != group) {
+        if ((*it)->HasDedicatedSlot() || it->use_count() != 1 || (*it)->slot % attentionDP != group) {
             ++it;
             continue;
         }
@@ -218,7 +240,9 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
     const int group = WindowGroup(key);
     std::vector<int> boundaries;
     const int last = end / page * page;
-    if (length > 1 && last == end && last - page >= past && last > page)
+    const bool branchOnly = PDBranchCheckpointEnd(key) == end;
+    if (branchOnly && length == 1) return result;
+    if (!branchOnly && length > 1 && last == end && last - page >= past && last > page)
         boundaries.push_back(last - page);
     if (last > 0 && last >= past) boundaries.push_back(last);
     for (int boundary : boundaries) {
@@ -230,6 +254,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
         size_t replaceIndex = 0;
         auto *replace = length == 1 ? &active->second.decode : nullptr;
         if (length > 1 && active->second.prefill.size() + result.size() >= MaxPrefillSnapshots) {
+            if (branchOnly) continue;
             // Keep the newest boundary and spread the remaining checkpoints.
             // Retaining only the last few pages makes a small tail eviction
             // invalidate every SWA checkpoint of a long resident prefix.
@@ -261,7 +286,8 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
             if (replaceList) replaceList->erase(replaceList->begin() + replaceIndex);
             replace = nullptr;
         };
-        int slot = prefixPool->slots.Take(group);
+        int slot = TryTakePrefixSlot(group, branchOnly);
+        if (branchOnly && slot < 0) continue;
         if (slot < 0 && replace && *replace) {
             const bool published = std::find(prefixHistory.begin(), prefixHistory.end(), *replace) != prefixHistory.end();
             if (replace->use_count() == 1 + (int)published) {
@@ -275,7 +301,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
             // checkpoint. Full KV and window pools share no physical copies.
             prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(),
                 [&](const auto &entry) {
-                    if (entry->HasResidentPrefix()) return false;
+                    if (entry->HasDedicatedSlot() || entry->HasResidentPrefix()) return false;
                     ++prefixPool->orphanWindows;
                     return true;
                 }), prefixHistory.end());
@@ -297,7 +323,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
                    overlaps(active->second.decode);
         };
         for (auto it = prefixHistory.begin(); slot < 0 && it != prefixHistory.end();) {
-            if ((*it)->slot % attentionDP != group || it->use_count() != 1 || !overlapsActivePrefix(*it)) { ++it; continue; }
+            if ((*it)->HasDedicatedSlot() || (*it)->slot % attentionDP != group || it->use_count() != 1 || !overlapsActivePrefix(*it)) { ++it; continue; }
             ++prefixPool->recycledWindows;
             it = prefixHistory.erase(it);
             slot = prefixPool->slots.Take(group);
@@ -310,6 +336,7 @@ NaiveN05FlashModel::PrefixSnapshots NaiveN05FlashModel::BeginPrefixSnapshots(
         snapshot->pool = prefixPool;
         snapshot->slot = slot;
         snapshot->length = boundary;
+        snapshot->branchOnly = branchOnly;
         snapshot->ownerDevice = key.dataDeviceIds.empty() ? -1 : key.dataDeviceIds.front();
         result.push_back(std::move(snapshot));
     }
@@ -379,9 +406,19 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         !context->multimodalInput.empty()) return;
     auto active = activePrefixes.find(&context->pastKeyValues.front().first);
     if (active == activePrefixes.end()) return;
+    const bool branch = context->preTokens > 0 &&
+        PDBranchCheckpointEnd(context->pastKeyValues.front().first) == context->preTokens;
+    auto &prefill = active->second.prefill;
+    PrefixSnapshots snapshots;
+    if (branch) {
+        if (prefill.empty() || !prefill.back()->branchOnly) return;
+        snapshots.push_back(std::move(prefill.back()));
+        prefill.pop_back();
+    } else {
+        snapshots = prefill;
+        if (active->second.decode) snapshots.push_back(active->second.decode);
+    }
     ++prefixPool->historyVersion;
-    PrefixSnapshots snapshots = active->second.prefill;
-    if (active->second.decode) snapshots.push_back(active->second.decode);
     if (detail) {
         detail->Count("history.snapshots", snapshots.size());
         detail->Count("history.entries_before_publish", prefixHistory.size());
@@ -430,8 +467,10 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
                         }
                         // Register every layer/rank so allocation and preview
                         // use the same policy across all TP cache pools.
-                        snapshot->checkpointPages.push_back({manager, page, generation});
-                        manager->RegisterPrefixCheckpoint(page, generation);
+                        if (!snapshot->branchOnly) {
+                            snapshot->checkpointPages.push_back({manager, page, generation});
+                            manager->RegisterPrefixCheckpoint(page, generation);
+                        }
                         if (!snapshot->fullPool) {
                             snapshot->fullPool = manager;
                             snapshot->fullPage = page;
@@ -447,13 +486,13 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
         recordTrace.Next("history.dedup_publish");
         prefixHistory.erase(std::remove_if(prefixHistory.begin(), prefixHistory.end(),
             [&](const auto &entry) {
-            return entry == snapshot || (entry.use_count() == 1 &&
+            return entry == snapshot || (entry.use_count() == 1 && entry->branchOnly == snapshot->branchOnly &&
                                          entry->ownerDevice == snapshot->ownerDevice &&
                                          entry->tokenHash == snapshot->tokenHash &&
                                          entry->tokens == snapshot->tokens);
         }), prefixHistory.end());
         prefixHistory.push_back(snapshot);
-        if (hostPrefixCache && (snapshot == active->second.decode ||
+        if (!snapshot->branchOnly && hostPrefixCache && (snapshot == active->second.decode ||
             (!active->second.prefill.empty() && snapshot == active->second.prefill.back()) ||
             (snapshot->length < context->inputTokens && snapshot->length + GetPageLen() == context->inputTokens))) {
             try { PublishHostPrefix(*context, snapshot); }
@@ -587,12 +626,15 @@ int NaiveN05FlashModel::PreviewPagedPrefixCacheExtra(ResponseContext *context, i
         memo.ownerDevice = ownerDevice;
         memo.initialized = true;
     }
+    // A branch window is immutable. Equivalent FULL pages may have been rebound
+    // by another request. The restore path checks all FULL shards independently.
     int best = 0;
     previewTrace.Next("history.residency_check");
     if (detail) detail->Count("history.candidates_checked", memo.candidates.size());
     for (const auto &candidate : memo.candidates) {
         auto entry = candidate.lock();
-        if (entry && entry->length > best && entry->length <= length && entry->HasResidentPrefix())
+        if (entry && entry->length > best && entry->length <= length &&
+            (entry->branchOnly || entry->HasResidentPrefix()))
             best = entry->length;
     }
     return best;
@@ -610,7 +652,7 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
             if ((attentionDP == 1 || (*it)->ownerDevice == context->pastKeyValues.front().first.dataDeviceIds.front()) &&
                 (!draftEnabled || (*it)->draftReady) && (*it)->length == length && (*it)->tokenHash == tokenHash &&
                 (*it)->tokens.size() <= context->currentTokens.size() &&
-                (*it)->HasResidentPrefix() &&
+                ((*it)->branchOnly || (*it)->HasResidentPrefix()) &&
                 std::equal((*it)->tokens.begin(), (*it)->tokens.end(), context->currentTokens.begin())) {
                 snapshot = *it;
                 std::rotate(it, it + 1, self->prefixHistory.end());
@@ -717,7 +759,7 @@ bool NaiveN05FlashModel::RestorePrefixWindow(ResponseContext *context,
     {
         std::lock_guard<std::mutex> guard(historyMutex);
         auto &active = self->activePrefixes[&context->pastKeyValues.front().first];
-        active.prefill = {snapshot};
+        if (!snapshot->branchOnly) active.prefill = {snapshot};
         active.queued.reset();
     }
     return true;

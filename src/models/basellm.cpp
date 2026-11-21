@@ -1553,7 +1553,8 @@ namespace fastllm {
 
     // Both schedulers restore the same page references and model-specific
     // companion state. Called while scheduling is locked, between forwards.
-    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx, bool tryHost = true) {
+    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx, bool tryHost = true, int *fullMatch = nullptr) {
+        if (fullMatch) *fullMatch = 0;
         if ((model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
             ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
         PagedCacheManager *probeManager = nullptr;
@@ -1626,6 +1627,7 @@ namespace fastllm {
             }
             if (minCachedPages > 0) {
                 int cachedLen = minCachedPages * probeManager->pageLen;
+                if (fullMatch) *fullMatch = cachedLen;
                 int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
                 extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
                 minCachedPages = extraCachedLen / probeManager->pageLen;
@@ -1637,7 +1639,7 @@ namespace fastllm {
                 // Optional L2 staging may have recycled unreferenced GPU pages.
                 // Never apply the directory entries observed before that attempt.
                 ctx->prefillPreview.reset();
-                return RestoreResidentPrefixImpl(model, ctx, false);
+                return RestoreResidentPrefixImpl(model, ctx, false, fullMatch);
             }
             if (minCachedPages > 0) {
                 int cachedLen = minCachedPages * probeManager->pageLen;
@@ -1870,7 +1872,11 @@ namespace fastllm {
     }
 
     int basellm::RestorePDResidentPrefix(ResponseContext *context) {
-        RestoreResidentPrefixImpl(this, context);
+        return RestorePDResidentPrefix(context, nullptr);
+    }
+
+    int basellm::RestorePDResidentPrefix(ResponseContext *context, int *fullMatch) {
+        RestoreResidentPrefixImpl(this, context, true, fullMatch);
         return context->cacheLen;
     }
 

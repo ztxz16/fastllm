@@ -473,6 +473,7 @@ struct PDRuntime {
         std::chrono::steady_clock::time_point exportQueued;
         int affinity = -1;
         uint64_t readyOrder = 0;
+        int branchEnd = 0;
         size_t reservation = 0;
         std::shared_ptr<Workload> work;
         size_t remaining = 0, restoreBytes = 0;
@@ -533,6 +534,8 @@ struct PDRuntime {
     std::unique_ptr<fastkv::HostCache> hostCache;
     std::unique_ptr<fastkv::BufferPool> exportPool;
     bool residentPrefix = false;
+    // Only read during a synchronous model forward, on the prefill execution lane.
+    std::unordered_map<const Data *, int> branchCheckpoints;
     std::mutex prefillMutex, prefillStopMutex;
     std::condition_variable prefillCV;
     std::deque<std::shared_ptr<PrefillRequest>> waiting;
@@ -748,11 +751,18 @@ struct PDRuntime {
     }
 };
 
+int basellm::PDBranchCheckpointEnd(const Data &key) const {
+    if (!pdRuntime) return 0;
+    const auto it = pdRuntime->branchCheckpoints.find(&key);
+    return it == pdRuntime->branchCheckpoints.end() ? 0 : it->second;
+}
+
 void PDRuntime::RunPrefill(basellm &model) {
     using Request = std::shared_ptr<PrefillRequest>;
     struct RankQueue {
         std::deque<Request> active, prepared;
         size_t preparedTokens = 0;
+        std::weak_ptr<PrefillRequest> branchProducer;
     };
     const int groups = model.PDGroupCount();
     std::vector<RankQueue> ranks(groups);
@@ -1157,7 +1167,15 @@ void PDRuntime::RunPrefill(basellm &model) {
                     request->SetRestoreBytes(0);
                     request->hostHit = {}; // only an actually restored parent may supply inherited bytes
                     if (residentPrefix) {
-                        context.preTokens = model.RestorePDResidentPrefix(&context);
+                        int fullMatch;
+                        context.preTokens = model.RestorePDResidentPrefix(&context, &fullMatch);
+                        // The ordinary end checkpoint already covers the last partial page.
+                        // Repair on demand, with at most one producer per attention group.
+                        if (context.preTokens == 0 && fullMatch > 0 && request->input.size() - fullMatch > page &&
+                            rank.branchProducer.expired() && !context.intParams.count("paged_prefix_restore_disabled")) {
+                            request->branchEnd = fullMatch;
+                            rank.branchProducer = request;
+                        }
                         hit.tokens = context.preTokens;
                     }
                     if (hit.state) {
@@ -1192,6 +1210,22 @@ void PDRuntime::RunPrefill(basellm &model) {
                     request->result.set_exception(error);
                 }
             }
+            // Cold requests can reach this queue before any peer publishes FULL KV.
+            // Only split a real, page-aligned fork visible in the next forward.
+            if (residentPrefix) for (auto &rank : ranks) {
+                if (rank.active.size() < 2 || !rank.branchProducer.expired()) continue;
+                const auto &producer = rank.active[0], &peer = rank.active[1];
+                if (producer->context->preTokens || peer->context->preTokens ||
+                    producer->context->intParams.count("paged_prefix_restore_disabled") ||
+                    peer->context->intParams.count("paged_prefix_restore_disabled")) continue;
+                const auto &a = producer->input, &b = peer->input;
+                const size_t limit = std::min({a.size(), b.size(), size_t(chunk), size_t(rankTokens)});
+                const size_t common = std::mismatch(a.begin(), a.begin() + limit, b.begin()).first - a.begin();
+                const size_t end = common / page * page;
+                if (!end || common == limit || std::min(a.size(), b.size()) - end <= page) continue;
+                producer->branchEnd = int(end);
+                rank.branchProducer = producer;
+            }
             std::vector<Request> selected;
             std::vector<int> lengths, sequences(groups), tokens(groups);
             int budget = batchTokens;
@@ -1209,8 +1243,12 @@ void PDRuntime::RunPrefill(basellm &model) {
                 if (owner < 0) break;
                 firstRank = (owner + 1) % groups;
                 const auto &request = ranks[owner].active[sequences[owner]++];
+                const int end = request->branchEnd ? request->branchEnd : int(request->input.size());
                 const int count = std::min({chunk, budget, rankTokens - tokens[owner],
-                    int(request->input.size()) - request->context->preTokens});
+                    end - request->context->preTokens});
+                // Draft state can span multiple chunks leading up to this checkpoint.
+                if (request->branchEnd)
+                    branchCheckpoints.emplace(&request->context->pastKeyValues.front().first, end);
                 Check(count > 0, "empty prefill candidate");
                 selected.push_back(request);
                 lengths.push_back(count);
@@ -1293,6 +1331,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                           << " queued=" << queued << " reserved_tokens=" << reserved
                           << " prepared_tokens=" << preparedTokens << std::endl;
             }
+            std::vector<Request> repairedBranches;
             for (int i = 0; i < batch; ++i) {
                 auto request = selected[i];
                 auto &rank = ranks[model.PDRequestGroup(*request->context)];
@@ -1303,6 +1342,14 @@ void PDRuntime::RunPrefill(basellm &model) {
                     retire(request);
                     request->result.set_exception(cancelled);
                     continue;
+                }
+                if (request->branchEnd && request->context->preTokens == request->branchEnd) {
+                    request->branchEnd = 0;
+                    rank.branchProducer.reset();
+                    // Peers publish FULL pages through their ordinary completion
+                    // path. Adding a window must not rebind their page chains.
+                    model.TryRecordResponseContext(request->context.get());
+                    repairedBranches.push_back(request);
                 }
                 if (size_t(request->context->preTokens) != request->input.size()) {
                     enqueueActive(rank, request); // round-robin chunks, no long-request monopolization
@@ -1315,6 +1362,34 @@ void PDRuntime::RunPrefill(basellm &model) {
                     retire(request);
                     request->result.set_exception(error);
                 }
+            }
+            branchCheckpoints.clear();
+            // A published window changes the budget only for matching requests that
+            // have not forwarded yet. Readmit to release any shorter restored state.
+            for (const auto &source : repairedBranches) {
+                const int owner = model.PDRequestGroup(*source->context);
+                auto &rank = ranks[owner];
+                const int length = source->context->preTokens;
+                if (model.PreviewPDResidentPrefix(source->input, owner) < length) continue;
+                std::deque<Request> retry;
+                for (auto *queue : {&rank.active, &rank.prepared}) {
+                    for (auto it = queue->begin(); it != queue->end();) {
+                        const auto &r = *it;
+                        const auto &ctx = *r->context;
+                        if (r->restoring || r->hostHit || ctx.preTokens != ctx.pdCachedInputTokens ||
+                            ctx.preTokens >= length || r->input.size() <= size_t(length) ||
+                            !std::equal(source->input.begin(), source->input.begin() + length, r->input.begin())) {
+                            ++it;
+                            continue;
+                        }
+                        if (queue == &rank.prepared) rank.preparedTokens -= r->reservation;
+                        releaseReservation(r);
+                        r->affinity = owner;
+                        retry.push_back(r);
+                        it = queue->erase(it);
+                    }
+                }
+                pending[owner].insert(pending[owner].begin(), retry.begin(), retry.end());
             }
         }
         throw std::runtime_error("FastKV PD: prefill cancelled by shutdown");
