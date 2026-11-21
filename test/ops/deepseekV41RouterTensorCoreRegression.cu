@@ -81,7 +81,7 @@ int main() {
         for (int experts : {384, 128}) {
             const int topk = experts == 384 ? 6 : 3;
         for (int k : {128, 512, 4096, 5120, 6144})
-            for (int m : {5, 6, 7, 8, 9, 12, 17, 24, 33, 40, 41, 65, 129}) {
+            for (int m : {5, 6, 7, 8, 9, 12, 17, 24, 33, 40, 41, 65, 128, 129}) {
                 std::vector<__nv_bfloat16> x(m * k);
                 std::vector<float> w(experts * k), bias(experts);
                 for (auto &v : x)
@@ -102,6 +102,11 @@ int main() {
                         FastllmCudaV41RouterSelectTopK(input, weight, biasData, temp, 2.5f, logits, ids, scores, topk),
                         "eligible path rejected");
                     Validate(logits, ids, scores, x, w, bias, m, k, temp, 2.5f, experts, topk);
+                    if (experts == 384 && k == 5120 && m >= 16) {
+                        Check(FastllmCudaV41OwnerRouterSelect(input, weight, biasData, temp, 2.5f,
+                            logits, ids, scores), "owner-local decode router rejected real rows");
+                        Validate(logits, ids, scores, x, w, bias, m, k, temp, 2.5f, experts, topk);
+                    }
                     ++cases;
                 }
                 // Same graph consumes new inputs; poison every output before replay.

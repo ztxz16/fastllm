@@ -43,7 +43,7 @@ static float RoundE4M3(float x) {
     return std::copysign(codes[i], x);
 }
 
-static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false, bool borrowScratch = false) {
+static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false, bool borrowScratch = false, bool block32 = false) {
     std::mt19937 rng(24816);
     std::vector<float> values(size_t(m) * k);
     // All inputs are exactly representable in BF16; ranges differ by both row and K32 block.
@@ -56,18 +56,20 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
     y.Allocate(false);
     Data w(FP8_E4M3, {n, k});
     w.blockM = 32;
-    w.blockK = 1;
+    w.blockK = block32 ? 32 : 1;
     w.Allocate();
     std::vector<uint8_t> bytes(size_t(n) * k);
     for (auto &b : bytes)
         b = uint8_t((rng() % 120) | ((rng() % 2) << 7));
     std::memcpy(w.cpuData, bytes.data(), bytes.size());
-    w.scales.resize(bytes.size() / 32);
+    w.scales.resize(bytes.size() / (32 * w.blockK));
     for (size_t i = 0; i < w.scales.size(); ++i)
         w.scales[i] = std::ldexp(1.f, int(i % 11) - 10);
     if (invalid) w.scales.back() = 1.25f;
     w.ToDevice(CUDA, {0}, true);
+    Data projectionWorkspace;
     auto call = [&] {
+        if (block32 && FastllmCudaTryBlock32Mxfp8Sm103(x, w, y, projectionWorkspace)) return;
         Require(FastllmCudaBFloat16MatMulFP8E4M3(x, w, bias, y, m, k, n), "public entry failed");
     };
     Data scratch;
@@ -78,8 +80,8 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
     }
     CudaLinearScratchScope loan(borrowScratch ? &scratch : nullptr);
     call(); // upload legacy scales and validate metadata before capture
-    bool supported = FastllmCudaMxfp8LinearSM103(x.cudaData, w, y.cudaData, m, k, n);
-    const bool quantized = !invalid && (m > 1 || wideGemv);
+    bool supported = block32 ? FastllmCudaTryBlock32Mxfp8Sm103(x, w, y, projectionWorkspace) : FastllmCudaMxfp8LinearSM103(x.cudaData, w, y.cudaData, m, k, n);
+    const bool quantized = !invalid && (m > 1 || wideGemv || block32);
     Require(supported == quantized, "backend eligibility mismatch");
     Check(cudaDeviceSynchronize());
     std::vector<uint16_t> eager;
@@ -134,7 +136,7 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
                 double expected = 0, bf16Expected = 0;
                 for (int i = 0; i < k; i++) {
                     size_t index = size_t(col) * k + i;
-                    const double weight = double(E4M3(bytes[index])) * w.scales[index / 32];
+                    const double weight = double(E4M3(bytes[index])) * w.scales[size_t(col / w.blockK) * (k / 32) + i / 32];
                     expected += a[i] * weight;
                     bf16Expected += values[size_t(row) * k + i] * weight;
                 }
@@ -196,6 +198,7 @@ int main() {
         FastllmCudaSetDevice(0);
         std::shared_ptr<void> lease;
         FastllmCudaLinearGraphScope scope(lease);
+        for (int rows : {1, 7, 16, 128}) Run(rows, 4096, 1280, false, false, false, true);
         Run(1, 256, 512);
         Run(1, 6784, 4096, false, true); // wide GEMV selects native MXFP8
         Run(3, 192, 256);

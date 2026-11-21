@@ -393,8 +393,8 @@ int main() {
         }
         cudaDeviceProp prop{};
         Check(cudaGetDeviceProperties(&prop, 0));
-        if (prop.major != 12 || prop.minor > 1) {
-            std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: FlashInfer adapter requires SM120/SM121");
+        if (!(prop.major == 10 && prop.minor == 3) && (prop.major != 12 || prop.minor > 1)) {
+            std::puts("FASTLLM_TEST_SKIP_NO_DEVICE: FlashInfer adapter requires SM103/SM120/SM121");
             return 77;
         }
         CheckGuards();

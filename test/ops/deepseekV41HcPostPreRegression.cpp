@@ -1,8 +1,10 @@
+#include "fastllm-v41-decode.cuh"
 // Fused attention mHC: independent FP64 coefficient oracle, exact residual/
 // normalized/quantized-input checks, and changing-input graph replay on every GPU.
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-v41-decode.cuh"
+#include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -53,7 +55,8 @@ template <class T> static std::vector<T> Read(const Data &v) {
 }
 static bool quick = false;
 static double worstOracle = 0;
-static void Run(int device, int m, int d, int batch = 1) {
+enum class MixGraph { Captured, SingleAttention, Owner, Cluster };
+static void Run(int device, int m, int d, int batch = 1, MixGraph mode = MixGraph::Captured) {
     const int n = m / batch, iter = 20;
     const float eps = 1e-6f;
     Data x, r, prevPre, prevPost, prevComb, fn, scale, base, norm, h, pre, post, comb, y, oh, opre, opost,
@@ -97,32 +100,107 @@ static void Run(int device, int m, int d, int batch = 1) {
     Upload(scale, sw);
     Upload(base, bw);
     Upload(norm, nw);
+    const bool tensorBatch = m >= 16;
+    void *clusterPlan = nullptr;
+    Data clusterScratch;
+    if (mode == MixGraph::Cluster) {
+        clusterPlan = FastllmCudaV41CreateOwnerStream(m);
+        Check(clusterPlan != nullptr, "cluster owner stream");
+        Alloc(clusterScratch, FLOAT32, {m, 8, 25}, device);
+        Alloc(quantized, BFLOAT16, {batch, n, d}, device);
+        Alloc(h, BFLOAT16, {batch, n, 4, d}, device);
+        Alloc(y, BFLOAT16, {batch, n, d}, device);
+        Alloc(pre, FLOAT32, {batch, n, 4}, device);
+        Alloc(post, FLOAT32, {batch, n, 4}, device);
+        Alloc(comb, FLOAT32, {batch, n, 4, 4}, device);
+        Check(!FastllmCudaV41OwnerClusterPost(clusterPlan, m + 1, static_cast<float *>(clusterScratch.cudaData),
+            x, r, prevPre, prevPost, prevComb, fn, scale, base, norm, iter, eps, eps, h, pre, post, comb, y),
+            "owner stream accepted a different row count");
+    }
     auto call = [&] {
+        if (clusterPlan) {
+            auto done = FastllmCudaV41OwnerClusterPost(clusterPlan, m, static_cast<float *>(clusterScratch.cudaData),
+                x, r, prevPre, prevPost, prevComb, fn, scale, base, norm, iter, eps, eps, h, pre, post, comb, y);
+            Check(done != nullptr, "cluster post + norm rejected");
+            Cuda(cudaStreamWaitEvent(cudaStreamPerThread, static_cast<cudaEvent_t>(done)));
+            Check(FastllmCudaDeepSeekV41QuantizeActivation(y, quantized), "cluster output quantization");
+            return;
+        }
+        if (tensorBatch || mode != MixGraph::Captured) {
+            Check(FastllmCudaDeepSeekV41HcPost(x, r, prevPost, prevComb, h), "batched post");
+            Check(FastllmCudaDeepSeekV41HcMixPreNorm(h, prevPre, fn, scale, base, norm,
+                iter, eps, eps, pre, post, comb, y, &quantized), "batched mHC rejected");
+            return;
+        }
         Check(FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
                                                              iter, eps, eps, h, pre, post, comb, y, quantized),
               "fused rejected");
     };
     auto old = [&] {
         Check(FastllmCudaDeepSeekV41HcPost(x, r, prevPost, prevComb, oh), "old post");
+        if (tensorBatch) {
+            setenv("FASTLLM_DSV41_DISABLE_HC_TENSOR", "1", 1);
+            Check(FastllmCudaDeepSeekV41HcMix(oh, fn, scale, base, 4, iter, eps, eps, opre, opost, ocomb),
+                  "batched reference coefficients");
+            unsetenv("FASTLLM_DSV41_DISABLE_HC_TENSOR");
+            Check(FastllmCudaDeepSeekV41HcPreNorm(oh, prevPre, norm, eps, oy), "batched reference normalization");
+            return;
+        }
         Check(FastllmCudaDeepSeekV41HcMixPreNorm(oh, prevPre, fn, scale, base, norm, iter, eps, eps, opre,
                                                  opost, ocomb, oy),
               "old pre");
     };
-    call();
+    std::vector<size_t> allocations;
+    { FastllmCudaAllocationRecorder record(&allocations); call(); }
     old();
     Cuda(cudaStreamSynchronize(cudaStreamPerThread));
-    cudaGraph_t graph;
-    cudaGraphExec_t exec;
-    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Check(FastllmCudaGraphPrepareCaptureDevice(), "prepare capture");
+    Check(FastllmCudaReserveGraphWorkspace(allocations), "reserve capture scratch");
+    void *graph = nullptr, *exec = nullptr;
+    Check(FastllmCudaGraphBeginCapture(), "begin capture");
     call();
-    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
-    Cuda(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    Check(FastllmCudaGraphEndCapture(&graph), "end capture");
+    Data splitScratch;
+    void *referenceExec = nullptr, *privateGemm = nullptr;
+    if (mode == MixGraph::Owner) {
+        Alloc(splitScratch, FLOAT32, {m, 8, 25}, device);
+        const void *child = graph;
+        void *fork = FastllmCudaV41ForkOwnerMix(&child, 1, m, static_cast<float *>(splitScratch.cudaData),
+                                               nullptr, nullptr, &privateGemm);
+        Check(fork != nullptr, "owner mix graph rewrite");
+        if (tensorBatch) Check(privateGemm != nullptr, "owner tensor projection was not separated");
+        Check(FastllmCudaGraphInstantiate(graph, &referenceExec), "instantiate original graph");
+        FastllmCudaGraphDestroy(graph);
+        graph = fork;
+    }
+    if (mode == MixGraph::SingleAttention) {
+        Alloc(splitScratch, FLOAT32, {8 * 25}, device);
+        void *clone = FastllmCudaV41CloneSingleAttentionMix(graph, static_cast<float *>(splitScratch.cudaData));
+        Check(clone != nullptr, "single-token attention graph rewrite");
+        FastllmCudaGraphDestroy(graph); graph = clone;
+    }
+    Check(FastllmCudaGraphInstantiate(graph, &exec), "instantiate graph");
     for (int replay = 0; replay < 3; replay++) {
         std::rotate(xv.begin(), xv.begin() + 1, xv.end());
         std::rotate(rv.begin(), rv.begin() + 3, rv.end());
         Upload(x, xv);
         Upload(r, rv);
-        Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Check(FastllmCudaGraphLaunch(exec), "replay graph");
+        if (referenceExec) {
+            auto q = Read<uint16_t>(quantized), normalized = Read<uint16_t>(y);
+            auto a = Read<float>(pre), b = Read<float>(post), c = Read<float>(comb);
+            Check(FastllmCudaGraphLaunch(referenceExec), "replay original graph");
+            Check(a == Read<float>(pre) && b == Read<float>(post) && c == Read<float>(comb) &&
+                  q == Read<uint16_t>(quantized) && normalized == Read<uint16_t>(y),
+                  "owner scheduling changed graph output");
+        }
+        if (clusterPlan && tensorBatch) {
+            Check(FastllmCudaDeepSeekV41HcPost(x, r, prevPost, prevComb, oh), "cluster reference post");
+            Check(FastllmCudaDeepSeekV41HcMixPreNorm(oh, prevPre, fn, scale, base, norm,
+                iter, eps, eps, opre, opost, ocomb, oy), "cluster reference tensor projection");
+            Check(Read<float>(pre) == Read<float>(opre) && Read<float>(post) == Read<float>(opost) &&
+                  Read<float>(comb) == Read<float>(ocomb), "cluster coefficients changed bits");
+        }
         old();
         Check(FastllmCudaDeepSeekV41QuantizeActivation(oy, referenceQuantized), "standalone quantizer");
         Check(Read<uint16_t>(quantized) == Read<uint16_t>(referenceQuantized), "quantized output changed bits");
@@ -131,7 +209,7 @@ static void Run(int device, int m, int d, int batch = 1) {
         Check(Read<uint16_t>(y) == Read<uint16_t>(oy), "normalized input changed bits");
         auto pr = Read<float>(pre), ps = Read<float>(post), cb = Read<float>(comb);
         auto opr = Read<float>(opre), ops = Read<float>(opost), ocb = Read<float>(ocomb);
-        Check(std::memcmp(pr.data(), opr.data(), pr.size() * sizeof(float)) == 0 &&
+        if (!tensorBatch) Check(std::memcmp(pr.data(), opr.data(), pr.size() * sizeof(float)) == 0 &&
                   std::memcmp(ps.data(), ops.data(), ps.size() * sizeof(float)) == 0 &&
                   std::memcmp(cb.data(), ocb.data(), cb.size() * sizeof(float)) == 0,
               "mHC coefficients changed bits");
@@ -204,8 +282,11 @@ static void Run(int device, int m, int d, int batch = 1) {
                 check(cb[t * 16 + j], refComb[j]);
         }
     }
-    Cuda(cudaGraphExecDestroy(exec));
-    Cuda(cudaGraphDestroy(graph));
+    FastllmCudaGraphExecDestroy(exec);
+    if (referenceExec) FastllmCudaGraphExecDestroy(referenceExec);
+    FastllmCudaV41DestroyOwnerMixGemm(privateGemm);
+    FastllmCudaV41DestroyOwnerStream(clusterPlan);
+    FastllmCudaGraphDestroy(graph);
     Check(!FastllmCudaDeepSeekV41HcPostMixPreNorm(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
                                                   iter, eps, eps, r, pre, post, comb, y),
           "aliased input output accepted");
@@ -214,12 +295,14 @@ static void Run(int device, int m, int d, int batch = 1) {
           "aliased outputs accepted");
     Check(!FastllmCudaDeepSeekV41HcPostMixPreNormQuantized(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
           iter, eps, eps, h, pre, post, comb, y, y), "aliased quantized output accepted");
-    auto dims = r.dims;
-    r.dims = {1, 1, 4, d};
-    Check(!FastllmCudaDeepSeekV41HcPostMixPreNorm(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
-                                                  iter, eps, eps, h, pre, post, comb, y),
-          "M1 accepted");
-    r.dims = dims;
+    if (m > 1) {
+        auto dims = r.dims;
+        r.dims = {1, 1, 4, d};
+        Check(!FastllmCudaDeepSeekV41HcPostMixPreNorm(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
+                                                      iter, eps, eps, h, pre, post, comb, y),
+              "inconsistent single-row metadata accepted");
+        r.dims = dims;
+    }
     auto ids = prevPre.dataDeviceIds;
     prevPre.dataDeviceIds = {device + 1};
     Check(!FastllmCudaDeepSeekV41HcPostMixPreNorm(x, r, prevPre, prevPost, prevComb, fn, scale, base, norm,
@@ -229,7 +312,15 @@ static void Run(int device, int m, int d, int batch = 1) {
 }
 int main(int argc, char **) {
     quick = argc > 1;
+    fastllm::SetCudaGraph(true); // Prepare the same cuBLAS scratch as the graph-serving entry point.
     try {
+        const char *policy = "FASTLLM_TEST_HC_ROWS";
+        setenv(policy, "small", 1);
+        Check(FastllmV41HcEnabledAtRows(policy, 1) && FastllmV41HcEnabledAtRows(policy, 8) &&
+              !FastllmV41HcEnabledAtRows(policy, 0) && !FastllmV41HcEnabledAtRows(policy, 9), "small owner policy");
+        setenv(policy, "tensor", 1);
+        Check(!FastllmV41HcEnabledAtRows(policy, 15) && FastllmV41HcEnabledAtRows(policy, 16), "tensor owner policy");
+        unsetenv(policy);
         int devices;
         Cuda(cudaGetDeviceCount(&devices));
         if (!devices)
@@ -237,6 +328,32 @@ int main(int argc, char **) {
         int cases = 0;
         for (int dev = 0; dev < (quick ? 1 : devices); dev++) {
             Cuda(cudaSetDevice(dev));
+            cudaDeviceProp prop{};
+            Cuda(cudaGetDeviceProperties(&prop, dev));
+            if (prop.major == 10 && prop.minor == 3) {
+                Run(dev, 1, 5120);
+                Run(dev, 1, 5120, 1, MixGraph::SingleAttention);
+                cases += 2;
+                if (dev == 0) {
+                    Check(!FastllmCudaV41CreateOwnerStream(9), "unsupported owner row count accepted");
+                    setenv("FASTLLM_DSV41_DISABLE_HC_TENSOR", "1", 1);
+                    Check(!FastllmCudaV41CreateOwnerStream(16), "disabled tensor path accepted");
+                    unsetenv("FASTLLM_DSV41_DISABLE_HC_TENSOR");
+                    setenv("FASTLLM_DSV41_HC_OVERLAP", "1", 1);
+                    setenv("FASTLLM_DSV41_HC_TENSOR_OVERLAP", "1", 1);
+                    for (int rows : {1, 3, 16, 17, 128}) {
+                        Run(dev, rows, 5120, rows, MixGraph::Owner);
+                        Run(dev, rows, 5120, rows, MixGraph::Cluster);
+                        cases += 2;
+                    }
+                    unsetenv("FASTLLM_DSV41_HC_TENSOR_OVERLAP");
+                    unsetenv("FASTLLM_DSV41_HC_OVERLAP");
+                }
+                if (dev == 0) for (int rows : {16, 17, 128}) {
+                    Run(dev, rows, 5120, rows);
+                    cases++;
+                }
+            }
             if (dev == 0 && !quick) {
                 for (int d : {4096, 5120, 6144, 7168, 8192})
                     for (int m : {2, 3, 4, 5, 6, 7, 8}) {
