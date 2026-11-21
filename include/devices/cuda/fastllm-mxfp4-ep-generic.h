@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -10,5 +11,10 @@ std::shared_ptr<FastllmGenericEp> FastllmCreateGenericEp(const std::vector<int> 
                                                          int intermediate, int experts, int topk);
 // The caller may release the source buffers after this returns.
 void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::vector<uint64_t> &gateDown);
+// Shared decode borrows native FP4 values for the lifetime of the state.
+bool FastllmGenericEpTunedEp8(const std::vector<int> &devices);
+std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8Decode(const std::vector<int> &devices);
+void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::vector<uint64_t> &gateDown,
+                          const std::array<void *, 2> &sharedWeights);
 void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *input, const int32_t *ids,
                          const float *scores, void *output, int rows, int commonRows, const int *liveKeys);

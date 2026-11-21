@@ -4,6 +4,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "fastllm-mimo-ep8-builtin.inc"
 #include <climits>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 
@@ -14,6 +15,7 @@ struct FastllmMxfp4EpNativeState {};
 std::shared_ptr<FastllmMxfp4EpNativeState> FastllmCudaCreateMxfp4EpNative(const std::vector<int> &,
     const std::vector<std::vector<std::vector<uint64_t>>> &) { return {}; }
 void FastllmCudaBindMxfp4EpNativeWeights(FastllmMxfp4EpNativeState &, int) {}
+std::array<void *, 2> FastllmCudaMxfp4EpPackedWeights(const FastllmMxfp4EpNativeState &, int, int) { return {}; }
 std::vector<FastllmMxfp4EpGraph> FastllmCudaPrepareMxfp4EpNative(FastllmMxfp4EpNativeState &, int, int) { return {}; }
 bool FastllmCudaReplayMxfp4EpGraph(const FastllmMxfp4EpGraph &, const void *, const int32_t *,
     const float *, void *, int, int, int, const int *) { return false; }
@@ -27,6 +29,11 @@ std::shared_ptr<FastllmGenericEp> FastllmCreateGenericEp(const std::vector<int> 
 void FastllmBindGenericEp(FastllmGenericEp &, int, int, const std::vector<uint64_t> &) {
     throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
 }
+bool FastllmGenericEpTunedEp8(const std::vector<int> &) { return false; }
+std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8Decode(const std::vector<int> &) { return {}; }
+void FastllmBindGenericEp(FastllmGenericEp &, int, int, const std::vector<uint64_t> &, const std::array<void *,2> &) {
+    throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
+}
 void FastllmRunGenericEp(FastllmGenericEp &, int, int, const void *, const int32_t *, const float *,
         void *, int, int, const int *) {
     throw std::runtime_error("SM120 grouped MXFP4 EP was not compiled.");
@@ -34,10 +41,12 @@ void FastllmRunGenericEp(FastllmGenericEp &, int, int, const void *, const int32
 #endif
 
 struct FastllmCudaMimoEp8Mega {
-    std::shared_ptr<FastllmGenericEp> generic;
     int hidden = 0, topk = 0;
     std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> builtin;
     std::shared_ptr<FastllmMxfp4EpNativeState> native;
+    // The generic weight views are destroyed before the owning native state.
+    std::shared_ptr<FastllmGenericEp> generic;
+    static constexpr int SharedDecodeRows = 128;
     std::vector<int> devices;
     std::vector<int> layers;
     int preparedRows = 0;
@@ -83,7 +92,8 @@ void FastllmCudaPrepareMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int maxRows) {
     // after one rank has entered a peer collective can block every other rank.
     // Prepare on the coordinator, while all earlier peer work can still drain.
     for (int rows = state.preparedRows ? state.preparedRows * 2 : 1; ; rows *= 2) {
-        for (int layer : state.layers) state.Graph(0, layer, rows);
+        if (!state.generic || rows > state.SharedDecodeRows)
+            for (int layer : state.layers) state.Graph(0, layer, rows);
         state.preparedRows = rows;
         if (rows == capacity) break;
     }
@@ -127,7 +137,14 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     }
     if (!experts || experts % devices.size() || h <= 0 || mid <= 0)
         throw std::runtime_error("Invalid SM120 EP expert geometry");
-    const bool usePackage = package && h == 4096 && mid == 2048 && experts == 256 && topk == 8;
+    const char *option = std::getenv("FASTLLM_SM120_EP_BACKEND");
+    const std::string mode = option ? option : "auto";
+    if (mode != "auto" && mode != "grouped" && mode != "native")
+        throw std::runtime_error("FASTLLM_SM120_EP_BACKEND accepts auto, grouped or native");
+    const bool compatible = package && h == 4096 && mid == 2048 && experts == 256 && topk == 8;
+    if (mode == "native" && !compatible) throw std::runtime_error("No matching SM120 EP kernel package");
+    const bool usePackage = compatible && mode != "grouped";
+    const bool sharedDecode = usePackage && mode == "auto" && FastllmGenericEpTunedEp8(devices);
     state->hidden = h; state->topk = topk;
     std::vector<std::vector<std::vector<uint64_t>>> sources;
     for (size_t r = 0; r < devices.size(); ++r) {
@@ -155,12 +172,12 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
     if (usePackage) {
         state->native = FastllmCudaCreateMxfp4EpNative(devices, sources);
         if (!state->native) throw std::runtime_error("Native SM120 MXFP4 EP is unavailable in this build.");
+        if (sharedDecode) state->generic = FastllmCreateSharedEp8Decode(devices);
     } else {
         state->generic = FastllmCreateGenericEp(devices, h, mid, experts, topk);
     }
-    // The native layout is the sole serving representation. Repack and retire
-    // sources one layer at a time, bounding temporary duplication to one layer
-    // instead of retaining two complete copies of the model's experts.
+    // The grouped and native kernels use the same FP4 value order on tuned EP8.
+    // Build their scale layouts before releasing the original expert tensors.
     struct RestoreDevice {
         int device = FastllmCudaGetDevice();
         ~RestoreDevice() { FastllmCudaSetDevice(device); }
@@ -173,13 +190,18 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
         }
         for (size_t rank = 0; rank < devices.size(); ++rank) {
             FastllmCudaSetDevice(devices[rank]);
-            if (state->generic) FastllmBindGenericEp(*state->generic, rank, layer, sources[rank][layer]);
+            if (state->generic) {
+                const auto packed = sharedDecode ? FastllmCudaMxfp4EpPackedWeights(*state->native, rank, layer)
+                                                 : std::array<void *, 2>{};
+                FastllmBindGenericEp(*state->generic, rank, layer, sources[rank][layer], packed);
+            }
             for (Data *weight : weights[rank][layer])
                 if (weight) weight->FreeSpace();
         }
     }
     printf("MIMO_EP_MEGA ranks=%zu experts=%zu inter=%d W4A8 backend=%s\n",
            devices.size(), experts / devices.size(), mid,
+           sharedDecode ? "sm120-grouped-decode-native-prefill" :
            usePackage ? "flashinfer-sm120-native-cubin" : "sm120-grouped-ep");
     return state;
 }
@@ -187,7 +209,7 @@ std::shared_ptr<FastllmCudaMimoEp8Mega> FastllmCudaCreateMimoEp8Mega(
 namespace {
 void MimoReplayRows(FastllmCudaMimoEp8Mega &state, int rank, int layer, const void *input, const int32_t *indices,
         const float *scores, void *output, int rows, int collectiveRows, const int *liveKeys) {
-    if (state.generic) {
+    if (state.generic && (!state.native || collectiveRows <= state.SharedDecodeRows)) {
         FastllmRunGenericEp(*state.generic, rank, layer, input, indices, scores, output,
                             rows, collectiveRows, liveKeys);
         return;

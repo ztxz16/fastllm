@@ -18,19 +18,33 @@
 namespace {
 using BF = __nv_bfloat16;
 constexpr int Tile = 32, DecodeTile = 16;
+constexpr int WideTile = 64;
 constexpr int PrefillChunk = 512;
 constexpr int PrefillMmaBlocks = 96;
 struct QuantizedSwiGLU;
-// D staging, then A, B and two scale tiles per stage, then mbarriers.
+
+// FC2 uses a wider N tile for long batches. FC1 stages only the activated half
+// of its output tile. The shared-memory request must also include aligned SFA.
+template <class T, int M>
+struct TileConfig {
+    static constexpr bool wideDown = M == WideTile && std::is_same_v<T, cutlass::bfloat16_t>;
+    static constexpr int n = wideDown ? 256 : 128;
+    static constexpr int stages = M == DecodeTile ? 4 : wideDown ? 2 : 3;
+    static constexpr int epilogueRows = M == WideTile ? 32 : M;
+    static constexpr int scaleA = M > 32 ? M * 4 : 128;
+    static constexpr int shared = epilogueRows * n * sizeof(T) +
+        stages * ((M + n) * 128 + scaleA + n * 4 + 16);
+};
 template <class T, int M = Tile>
-constexpr int Smem = M * 128 * sizeof(T) + (M == DecodeTile ? 4 : 3) * ((M + 128) * 128 + 128 + 512 + 16);
+constexpr int Smem = TileConfig<T, M>::shared;
 template <class T, int M = Tile, bool FuseGate = false>
 constexpr auto gemm =
-    &deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0, 0, 0, 32, 32, 1, M, 128, 128, 128, 128, 128,
-                                             M == DecodeTile ? 4 : 3, M == DecodeTile ? 32 : 128, 128, 0,
+    &deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0, 0, 0, 32, 32, 1, M, TileConfig<T, M>::n, 128, 128, 128, 128,
+                                             TileConfig<T, M>::stages, M == DecodeTile ? 32 : 128, 128, 0,
                                              deep_gemm::GemmType::MGroupedContiguous, false, T,
                                              deep_gemm::epilogue::transform::EpilogueIdentity, false, true,
-                                             false, true, false, M, 1, true, std::is_same_v<T, cutlass::bfloat16_t>,
+                                             false, true, false, TileConfig<T, M>::epilogueRows, 1, true,
+                                             std::is_same_v<T, cutlass::bfloat16_t>,
                                              std::conditional_t<FuseGate, QuantizedSwiGLU, void>>;
 
 void check(cudaError_t s) {
@@ -101,7 +115,7 @@ struct Rank {
     Mail *peers;
     Buffers b;
     struct Projection {
-        cute::TmaDescriptor a, b, sa, sb, d, decodeA, decodeSa, decodeD;
+        cute::TmaDescriptor a, b, sa, sb, d, decodeA, decodeSa, decodeD, wideA, wideSa, wideB, wideSb;
     };
     struct Layer {
         Storage storage;
@@ -324,6 +338,44 @@ __global__ void makeTasks(Buffers b, Shape s, int rank, int routes, const Mail *
     b.returnRows[row] = reinterpret_cast<cutlass::bfloat16_t *>(mailbox);
     b.tasks[b.bases[s.localE + e] + offset] = make_int2(t, row);
 }
+// The complete routing table for four rows/rank fits in a single CTA (8 ranks x top-8).
+__global__ void planTinyRoutes(Buffers b, Shape s, int rank, int cap, const Mail *peers, float *rowScores) {
+    __shared__ int counts[32], bases[32], compact[32];
+    int t = threadIdx.x;
+    if (t < 32) counts[t] = 0;
+    __syncthreads();
+    const int e = t < cap * 64 ? expert(b, s, t) - rank * 32 : -1;
+    const int offset = static_cast<unsigned>(e) < 32 ? atomicAdd(counts + e, 1) : -1;
+    __syncthreads();
+    if (t < 32) {
+        const int count = counts[t];
+        const int padded = (count + DecodeTile - 1) / DecodeTile * DecodeTile;
+        int sum = count, total = padded;
+        for (int d = 1; d < 32; d *= 2) {
+            int c = __shfl_up_sync(0xffffffff, sum, d), p = __shfl_up_sync(0xffffffff, total, d);
+            if (t >= d) { sum += c; total += p; }
+        }
+        bases[t] = total - padded;
+        compact[t] = sum - count;
+        if (t == 31) { b.layout[-1] = total; b.counts[32] = sum; }
+    }
+    __syncthreads();
+    for (int group = t / 32; group < 32; group += blockDim.x / 32) {
+        const int base = bases[group], count = counts[group], lane = t % 32;
+        const int padded = (count + DecodeTile - 1) / DecodeTile * DecodeTile;
+        for (int j = lane * DecodeTile; j < count; j += 32 * DecodeTile) b.layout[base + j] = group;
+        if (count + lane < padded) {
+            b.returnRows[base + count + lane] = nullptr;
+            rowScores[base + count + lane] = 0.f;
+        }
+    }
+    if (offset < 0) return;
+    const int row = bases[e] + offset, slots = cap * 8;
+    b.returnRows[row] = reinterpret_cast<cutlass::bfloat16_t *>(peers[t / slots].returned + size_t(t % slots) * s.h);
+    const auto *packet = b.incoming + size_t(t / 8) * s.stride;
+    rowScores[row] = reinterpret_cast<const float *>(packet + s.h + s.h / 32 + 8 * sizeof(int))[t % 8];
+    b.tasks[compact[e] + offset] = make_int2(t, row);
+}
 __global__ void gather(Buffers b, Shape s) {
     int count = b.counts[s.localE];
     for (int job = blockIdx.x; job < count; job += gridDim.x) {
@@ -396,9 +448,11 @@ __global__ void packGatePairs(const uint8_t *src, uint8_t *dst, uint32_t *scales
     const int row = blockIdx.x;
     // Interleave eight gate rows and eight up rows so one warp owns both MMA fragments.
     const int srcRow = (row / 16) * 8 + row % 8 + ((row / 8) % 2) * (n / 2);
-    auto *in = reinterpret_cast<const uint4 *>(src) + size_t(srcRow) * (k / 32);
-    auto *out = reinterpret_cast<uint4 *>(dst) + size_t(row) * (k / 32);
-    for (int j = threadIdx.x; j < k / 32; j += blockDim.x) out[j] = in[j];
+    if (dst) {
+        auto *in = reinterpret_cast<const uint4 *>(src) + size_t(srcRow) * (k / 32);
+        auto *out = reinterpret_cast<uint4 *>(dst) + size_t(row) * (k / 32);
+        for (int j = threadIdx.x; j < k / 32; j += blockDim.x) out[j] = in[j];
+    }
     auto *sf = reinterpret_cast<const uint32_t *>(src + size_t(n) * k / 2);
     for (int j = threadIdx.x; j < k / 128; j += blockDim.x)
         scales[size_t(j) * n + row] = sf[size_t(srcRow) * (k / 128) + j];
@@ -434,20 +488,24 @@ void bindActivation(Rank::Projection &p, const Rank &rank, const Shape &s, bool 
     p.sa = scale(Tile);
     p.decodeA = activation(DecodeTile);
     p.decodeSa = scale(DecodeTile);
+    if (s.cap > 128) {
+        p.wideA = activation(WideTile);
+        p.wideSa = scale(WideTile);
+    }
 }
 Rank::Projection bindProjection(Storage &owner, const Rank &rank, Shape s, const std::vector<uint64_t> &ptrs,
-                                int part, int n, int k) {
+                                int part, int n, int k, void *sharedWeight) {
     const auto &b = rank.b;
     size_t values = size_t(n) * k / 2, words = size_t(n) * k / 128;
-    auto *w = owner.allocate<uint8_t>(values * s.localE);
+    auto *w = sharedWeight ? static_cast<uint8_t *>(sharedWeight) : owner.allocate<uint8_t>(values * s.localE);
     auto *sf = owner.allocate<uint32_t>(words * s.localE);
     for (int e = 0; e < s.localE; ++e) {
         auto *src = reinterpret_cast<const uint8_t *>(ptrs[2 * e + part]);
         if (!part && rank.tunedEp8) {
-            packGatePairs<<<n, 128, 0, cudaStreamPerThread>>>(src, w + e * values, sf + e * words, n, k);
+            packGatePairs<<<n, 128, 0, cudaStreamPerThread>>>(src, sharedWeight ? nullptr : w + e * values, sf + e * words, n, k);
             continue;
         }
-        check(cudaMemcpyAsync(w + e * values, src, values, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        if (!sharedWeight) check(cudaMemcpyAsync(w + e * values, src, values, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         packScales<<<(words + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             reinterpret_cast<const uint32_t *>(src + values), sf + e * words, n, k / 128);
     }
@@ -459,6 +517,10 @@ Rank::Projection bindProjection(Storage &owner, const Rank &rank, Shape s, const
     Rank::Projection p{};
     p.b = tensor(w, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B, k, size_t(n) * s.localE, k / 2, 128, 128, sw);
     p.sb = tensor(sf, CU_TENSOR_MAP_DATA_TYPE_INT32, n, size_t(k / 128) * s.localE, n * 4, 128, 1, none);
+    if (s.cap > 128 && part) {
+        p.wideB = tensor(w, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B, k, size_t(n) * s.localE, k / 2, 128, 256, sw);
+        p.wideSb = tensor(sf, CU_TENSOR_MAP_DATA_TYPE_INT32, n, size_t(k / 128) * s.localE, n * 4, 256, 1, none);
+    }
     p.d = output(Tile);
     p.decodeD = output(DecodeTile);
     bindActivation(p, rank, s, part != 0, k);
@@ -469,9 +531,13 @@ void multiply(const Rank &rank, const Rank::Projection &p, Output output, int n,
     auto &b = rank.b;
     // Both projections read the actual padded row count from the device layout.
     constexpr bool small = M == DecodeTile;
+    const auto &a = M == WideTile ? p.wideA : small ? p.decodeA : p.a;
+    const auto &sa = M == WideTile ? p.wideSa : small ? p.decodeSa : p.sa;
+    constexpr bool wideDown = TileConfig<T, M>::wideDown;
     gemm<T, M, std::is_same_v<Output, QuantizedSwiGLU>><<<mmaBlocks, small ? 160 : 256, Smem<T, M>, stream>>>(
         output, nullptr, reinterpret_cast<__nv_fp8_e4m3 *>(b.a), nullptr, b.layout,
-        nullptr, nullptr, 0, n, k, n, 0, 0, small ? p.decodeA : p.a, p.b, small ? p.decodeSa : p.sa, p.sb, small ? p.decodeD : p.d);
+        nullptr, nullptr, 0, n, k, n, 0, 0, a, wideDown ? p.wideB : p.b, sa, wideDown ? p.wideSb : p.sb,
+        small ? p.decodeD : p.d);
 }
 } // namespace
 
@@ -517,7 +583,8 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         int64_t(h) + h / 32 + int64_t(topk) * 8 + 15 > limit || i > limit / 4 || int64_t(h) * i / 64 > limit)
         throw std::runtime_error("SM120 generic EP tensor dimensions exceed kernel indexing");
     s.stride = (h + h / 32 + topk * 8 + 15) / 16 * 16;
-    s.pool = (s.cap * s.ranks * topk + (Tile - 1) * s.localE) / Tile * Tile;
+    int alignment = capacity > 128 ? WideTile : Tile;
+    s.pool = (s.cap * s.ranks * topk + (alignment - 1) * s.localE) / alignment * alignment;
     std::vector<Mail> mail;
     for (int d : devices) {
         check(cudaSetDevice(d));
@@ -540,6 +607,10 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         check(cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, d));
         rank->tunedEp8 = s.ranks == 8 && h == 4096 && i == 2048 && experts == 256 && topk == 8 &&
                               rank->sms == 110 && maxShared >= Smem<float, DecodeTile>;
+        if (capacity > 128) {
+            check(cudaFuncSetAttribute(gemm<float, WideTile, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, Smem<float, WideTile>));
+            check(cudaFuncSetAttribute(gemm<cutlass::bfloat16_t, WideTile>, cudaFuncAttributeMaxDynamicSharedMemorySize, Smem<cutlass::bfloat16_t, WideTile>));
+        }
         if (rank->tunedEp8) {
             check(cudaFuncSetAttribute(gemm<float, Tile, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, Smem<float>));
             check(cudaFuncSetAttribute(gemm<float, DecodeTile, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -585,22 +656,28 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
 }
 } // namespace
 
+bool FastllmGenericEpTunedEp8(const std::vector<int> &devices) {
+    if (devices.size() != 8 || !FastllmGenericEpSupported(devices)) return false;
+    for (int device : devices) {
+        int sms, shared;
+        check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+        check(cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+        if (sms != 110 || shared < Smem<float, DecodeTile>) return false;
+    }
+    return true;
+}
+std::shared_ptr<FastllmGenericEp> FastllmCreateSharedEp8Decode(const std::vector<int> &devices) {
+    // Called only after validating the shipped EP8 weight layout and hardware.
+    return createWorkspace(devices, 4096, 2048, 256, 8, 128);
+}
 std::shared_ptr<FastllmGenericEp> FastllmCreateGenericEp(const std::vector<int> &devices, int h, int i,
                                                          int experts, int topk) {
     if (!FastllmGenericEpSupported(devices) || h <= 0 || i <= 0 || h % 128 || i % 128 || experts <= 0 ||
         experts % devices.size() || topk <= 0 || topk > experts)
         throw std::runtime_error("Unsupported SM120 generic EP geometry");
     const char *option = std::getenv("FASTLLM_SM120_EP_PREFILL_PIPELINE");
-    bool usePipeline = option && std::string(option) == "1" && devices.size() == 8 &&
-                       h == 4096 && i == 2048 && experts == 256 && topk == 8;
-    if (usePipeline) {
-        for (int device : devices) {
-            int sms, shared;
-            check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-            check(cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-            if (sms != 110 || shared < Smem<float, DecodeTile>) usePipeline = false;
-        }
-    }
+    bool usePipeline = (!option || std::string(option) == "1") && h == 4096 && i == 2048 &&
+                       experts == 256 && topk == 8 && FastllmGenericEpTunedEp8(devices);
     auto ep = createWorkspace(devices, h, i, experts, topk, usePipeline ? PrefillChunk : 128);
     if (usePipeline) {
         Restore restore;
@@ -614,6 +691,9 @@ std::shared_ptr<FastllmGenericEp> FastllmCreateGenericEp(const std::vector<int> 
     return ep;
 }
 void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::vector<uint64_t> &ptrs) {
+    FastllmBindGenericEp(ep, rank, layer, ptrs, {});
+}
+void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::vector<uint64_t> &ptrs, const std::array<void *, 2> &sharedWeights) {
     auto &r = *ep.ranks.at(rank);
     auto &s = ep.s;
     if (ptrs.size() != 2 * s.localE)
@@ -625,8 +705,8 @@ void FastllmBindGenericEp(FastllmGenericEp &ep, int rank, int layer, const std::
         throw std::runtime_error("Generic EP layer weights already bound");
     auto &l = inserted.first->second;
     l.storage.device = r.storage.device;
-    l.gate = bindProjection(l.storage, r, s, ptrs, 0, 2 * s.i, s.h);
-    l.down = bindProjection(l.storage, r, s, ptrs, 1, s.h, s.i);
+    l.gate = bindProjection(l.storage, r, s, ptrs, 0, 2 * s.i, s.h, sharedWeights[0]);
+    l.down = bindProjection(l.storage, r, s, ptrs, 1, s.h, s.i, sharedWeights[1]);
     if (ep.prefill) {
         auto &worker = *ep.prefill->ranks.at(rank);
         auto &views = worker.layers.try_emplace(layer).first->second;
@@ -650,27 +730,34 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
     }
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
     int routes = cap * s.ranks * s.k;
-    check(cudaMemsetAsync(r.b.counts, 0, s.localE * sizeof(int), stream));
-    countRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes);
-    if (r.tunedEp8) {
-        if (shortBatch) layout<DecodeTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
-        else layout<Tile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
-        makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, r.rowScores);
+    if (shortBatch && cap <= 4) {
+        planTinyRoutes<<<1, 256, 0, stream>>>(r.b, s, rank, cap, r.peers, r.rowScores);
     } else {
-        layout<Tile, false><<<s.localE, 32, 0, stream>>>(r.b, s, nullptr);
-        makeTasks<false><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, nullptr);
+        check(cudaMemsetAsync(r.b.counts, 0, s.localE * sizeof(int), stream));
+        countRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes);
+        if (r.tunedEp8) {
+            if (shortBatch) layout<DecodeTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
+            else if (cap > 128) layout<WideTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
+            else layout<Tile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
+            makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, r.rowScores);
+        } else {
+            layout<Tile, false><<<s.localE, 32, 0, stream>>>(r.b, s, nullptr);
+            makeTasks<false><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, nullptr);
+        }
     }
     int blocks = std::min(routes, 4 * r.sms);
     gather<<<blocks, 128, 0, stream>>>(r.b, s);
     if (r.tunedEp8) {
         const QuantizedSwiGLU output{r.downInput, reinterpret_cast<uint8_t *>(r.downScales), r.rowScores, s.pool};
         if (shortBatch) multiply<float, DecodeTile>(r, l.gate, output, 2 * s.i, s.h, stream, mmaBlocks);
+        else if (cap > 128) multiply<float, WideTile>(r, l.gate, output, 2 * s.i, s.h, stream, mmaBlocks);
         else multiply<float, Tile>(r, l.gate, output, 2 * s.i, s.h, stream, mmaBlocks);
     } else {
         multiply<float, Tile>(r, l.gate, r.b.gateUp, 2 * s.i, s.h, stream, mmaBlocks);
         activate<<<blocks, 256, 0, stream>>>(r.b, s);
     }
     if (shortBatch) multiply<cutlass::bfloat16_t, DecodeTile>(r, l.down, r.b.returnRows, s.h, s.i, stream, mmaBlocks);
+    else if (r.tunedEp8 && cap > 128) multiply<cutlass::bfloat16_t, WideTile>(r, l.down, r.b.returnRows, s.h, s.i, stream, mmaBlocks);
     else multiply<cutlass::bfloat16_t, Tile>(r, l.down, r.b.returnRows, s.h, s.i, stream, mmaBlocks);
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
     if (n && shortBatch)
@@ -691,17 +778,18 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
     if (rows < 0 || rows > commonRows)
         throw std::runtime_error("Invalid generic EP row count");
     const auto stream = cudaStreamPerThread;
-    Rank *worker = ep.prefill && commonRows > s.cap ? ep.prefill->ranks[rank].get() : nullptr;
+    const int chunkRows = ep.prefill && commonRows > 256 && commonRows <= 512 ? (commonRows + 1) / 2 : s.cap;
+    Rank *worker = ep.prefill && commonRows > chunkRows ? ep.prefill->ranks[rank].get() : nullptr;
     if (worker) {
         check(cudaEventRecord(worker->prefillEvent, stream));
         check(cudaStreamWaitEvent(worker->prefillStream, worker->prefillEvent, 0));
     }
     // Each lane uses its own epoch counters, route tables and activation buffers.
     // Fork and join on the caller's stream so this sequence is also graph-capturable.
-    for (int64_t start = 0, chunk = 0; start < commonRows; start += s.cap, ++chunk) {
+    for (int64_t start = 0, chunk = 0; start < commonRows; start += chunkRows, ++chunk) {
         const bool onWorker = worker && (chunk % 2);
         auto &lane = onWorker ? *worker : r;
-        int cap = std::min<int64_t>(commonRows - start, s.cap);
+        int cap = std::min<int64_t>(commonRows - start, chunkRows);
         int first = std::min<int64_t>(start, rows), n = std::min(rows - first, cap);
         runChunk(lane, s, onWorker ? lane.layers.at(layer) : primaryLayer, rank,
                  n ? static_cast<const BF *>(input) + size_t(first) * s.h : nullptr,

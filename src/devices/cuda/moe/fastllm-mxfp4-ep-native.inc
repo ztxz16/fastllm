@@ -637,6 +637,11 @@ void FastllmCudaBindMxfp4EpNativeWeights(FastllmMxfp4EpNativeState &state, int l
     }
 }
 
+std::array<void *, 2> FastllmCudaMxfp4EpPackedWeights(const FastllmMxfp4EpNativeState &state, int rank, int layer) {
+    const auto &weights = state.runtime->ranks.at(rank)->weights.at(layer);
+    return {weights.at("w13")->ptr, weights.at("w2")->ptr};
+}
+
 std::vector<FastllmMxfp4EpGraph> FastllmCudaPrepareMxfp4EpNative(FastllmMxfp4EpNativeState &state, int layer,
                                                                  int rows) {
     DeviceRestore restore;
