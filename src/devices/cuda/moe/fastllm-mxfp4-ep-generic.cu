@@ -21,6 +21,7 @@ using BF = __nv_bfloat16;
 constexpr int Tile = 32, DecodeTile = 16;
 constexpr int WideTile = 64;
 constexpr int PrefillChunk = 1024;
+constexpr int MinOwnerCombineRows = 512;
 constexpr int GateBlocks = 72, EarlyDownBlocks = 38;
 
 struct PrefillTile {
@@ -118,7 +119,7 @@ struct Storage {
     }
 };
 struct Shape {
-    int h, i, ranks, localE, k, cap, stride, pool;
+    int h, i, ranks, localE, k, cap, stride, pool, inputPitch;
 };
 struct Mail {
     uint8_t *send, *receive;
@@ -131,6 +132,7 @@ struct Buffers {
     float *gateUp = nullptr;
     cutlass::bfloat16_t **returnRows;
     int *counts, *bases, *positions, *layout;
+    uint8_t *ownerSlots = nullptr;
     int2 *tasks;
 };
 struct Rank {
@@ -408,16 +410,28 @@ __global__ void layout(Buffers b, Shape s, float *rowScores) {
     for (int j = threadIdx.x * M; j < b.counts[e]; j += blockDim.x * M)
         b.layout[base + j] = e;
 }
-template <bool WithScores>
+template <bool WithScores, bool OwnerReturn = false>
 __global__ void makeTasks(Buffers b, Shape s, int rank, int routes, const Mail *peers, int rowsPerPeer,
                           float *rowScores) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= routes || b.positions[t] < 0)
-        return;
-    int e = expert(b, s, t) - rank * s.localE, offset = b.positions[t];
+    int offset = t < routes ? b.positions[t] : -1;
+    unsigned slots = 0;
+    if constexpr (OwnerReturn) {
+        // Each group of eight lanes handles one token's top-8 slots.
+        slots = (__ballot_sync(0xffffffffu, offset >= 0) >> (threadIdx.x & 24)) & 0xff;
+        if (t < routes && !(t % 8)) b.ownerSlots[t / 8] = slots;
+    }
+    if (offset < 0) return;
+    const int e = expert(b, s, t) - rank * s.localE;
     const int row = b.bases[e] + offset;
     const int slotsPerPeer = rowsPerPeer * s.k;
     auto *mailbox = peers[t / slotsPerPeer].returned + size_t(t % slotsPerPeer) * s.h;
+    if constexpr (OwnerReturn) {
+        if (slots & (slots - 1)) {
+            mailbox = reinterpret_cast<BF *>(b.a) + size_t(row) * s.h;
+            b.positions[t] = row;
+        }
+    }
     if constexpr (WithScores) {
         const auto *packet = b.incoming + size_t(t / s.k) * s.stride;
         const auto *scores = reinterpret_cast<const float *>(packet + s.h + s.h / 32 + s.k * sizeof(int));
@@ -470,7 +484,7 @@ __global__ void gather(Buffers b, Shape s) {
         int2 task = b.tasks[job];
         auto *p = b.incoming + size_t(task.x / s.k) * s.stride;
         for (int j = threadIdx.x; j < s.h / 16; j += blockDim.x)
-            reinterpret_cast<uint4 *>(b.a + size_t(task.y) * s.h)[j] = reinterpret_cast<const uint4 *>(p)[j];
+            reinterpret_cast<uint4 *>(b.a + size_t(task.y) * s.inputPitch)[j] = reinterpret_cast<const uint4 *>(p)[j];
         for (int j = threadIdx.x; j < s.h / 128; j += blockDim.x)
             b.sa[size_t(j) * s.pool + task.y] = reinterpret_cast<const uint32_t *>(p + s.h)[j];
     }
@@ -497,7 +511,43 @@ __global__ void activate(Buffers b, Shape s) {
         }
     }
 }
-template <int FixedTopK = 0>
+// Single-hit tokens already went straight to their destination from FC2. For repeated
+// hits, sum the BF16 expert rows in FP32 and send one BF16 vector in the first slot.
+__global__ void publishOwnerRows(Buffers b, const Mail *peers, int cap) {
+    constexpr int hidden = 4096, width = sizeof(uint4) / sizeof(BF);
+    __shared__ __align__(16) uint4 packet[hidden / width];
+    const int token = blockIdx.x;
+    const unsigned slots = b.ownerSlots[token];
+    if (!(slots & (slots - 1))) return;
+    const auto *positions = b.positions + token * 8;
+    const auto *rows = reinterpret_cast<const uint4 *>(b.a);
+    for (int col = threadIdx.x; col < hidden / width; col += blockDim.x) {
+        float sums[width] = {};
+        for (unsigned remaining = slots; remaining; remaining &= remaining - 1) {
+            const int slot = __ffs(remaining) - 1;
+            const uint4 value = rows[size_t(positions[slot]) * (hidden / width) + col];
+            const auto *elements = reinterpret_cast<const BF *>(&value);
+            #pragma unroll
+            for (int i = 0; i < width; ++i) sums[i] += __bfloat162float(elements[i]);
+        }
+        uint4 packed;
+        auto *elements = reinterpret_cast<BF *>(&packed);
+        #pragma unroll
+        for (int i = 0; i < width; ++i) elements[i] = __float2bfloat16(sums[i]);
+        packet[col] = packed;
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int first = __ffs(slots) - 1;
+        auto *dst = peers[token / cap].returned + (size_t(token % cap) * 8 + first) * hidden;
+        const unsigned addr = __cvta_generic_to_shared(packet);
+        asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::
+                     "l"(dst), "r"(addr), "r"(unsigned(sizeof(packet))) : "memory");
+        asm volatile("cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;" ::: "memory");
+    }
+}
+template <int FixedTopK = 0, bool OwnerPartial = false>
 __global__ void combine(Mail local, Shape s, const int *ids, BF *out, const int *live) {
     const int row = blockIdx.x;
     const bool active = !live || live[row] > 0;
@@ -505,12 +555,26 @@ __global__ void combine(Mail local, Shape s, const int *ids, BF *out, const int 
     constexpr int width = sizeof(uint4) / sizeof(BF);
     const int start = FixedTopK ? blockIdx.y * blockDim.x + threadIdx.x : threadIdx.x;
     const int step = FixedTopK ? gridDim.y * blockDim.x : blockDim.x;
+    unsigned firstSlots = 0;
+    if constexpr (OwnerPartial) {
+        static_assert(FixedTopK == 8);
+        unsigned seen = 0;
+        for (int j = 0; active && j < FixedTopK; ++j) {
+            unsigned expertId = ids[row * FixedTopK + j];
+            if (expertId >= 256) continue;
+            unsigned owner = 1u << (expertId / 32);
+            if (!(seen & owner)) firstSlots |= 1u << j;
+            seen |= owner;
+        }
+    }
     for (int chunk = start; chunk < s.h / width; chunk += step) {
         float sum[width] = {};
         if (active) {
             for (int j = 0; j < topk; ++j) {
                 const int slot = row * topk + j;
-                if (static_cast<unsigned>(ids[slot]) >= static_cast<unsigned>(s.ranks * s.localE)) continue;
+                if constexpr (OwnerPartial) {
+                    if (!(firstSlots & (1u << j))) continue;
+                } else if (static_cast<unsigned>(ids[slot]) >= static_cast<unsigned>(s.ranks * s.localE)) continue;
                 const auto *values = reinterpret_cast<const uint4 *>(local.returned + size_t(slot) * s.h);
                 const uint4 packed = values[chunk];
                 const uint32_t pairs[] = {packed.x, packed.y, packed.z, packed.w};
@@ -567,7 +631,7 @@ void bindActivation(Rank::Projection &p, const Rank &rank, const Shape &s, bool 
     auto *a = down ? rank.downInput : rank.b.a;
     auto *scales = down ? rank.downScales : rank.b.sa;
     auto activation = [&](int m) {
-        return tensor(a, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, s.pool, k, 128, m, CU_TENSOR_MAP_SWIZZLE_128B);
+        return tensor(a, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, s.pool, down ? k : s.inputPitch, 128, m, CU_TENSOR_MAP_SWIZZLE_128B);
     };
     auto scale = [&](int m) {
         return tensor(scales, CU_TENSOR_MAP_DATA_TYPE_INT32, s.pool, k / 128, s.pool * 4, m, 1, CU_TENSOR_MAP_SWIZZLE_NONE);
@@ -692,6 +756,8 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         }
         relayAcrossNuma = relayAcrossNuma && nodes[0] != nodes[4];
     }
+    // Once a gate tile completes, FC2 can reuse its FP8 input rows for BF16 partials.
+    s.inputPitch = relayAcrossNuma ? h * int(sizeof(BF)) : h;
     for (int d : devices) {
         check(cudaSetDevice(d));
         for (int peer : devices)
@@ -739,7 +805,7 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         auto &b = rank->b;
         m.receive = b.incoming = a.allocate<uint8_t>(tokens * s.stride);
         mail.push_back(m);
-        b.a = a.allocate<uint8_t>(size_t(s.pool) * std::max(h, i));
+        b.a = a.allocate<uint8_t>(size_t(s.pool) * std::max(s.inputPitch, i));
         b.sa = a.allocate<uint32_t>(size_t(s.pool) * std::max(h, i) / 128);
         if (rank->tunedEp8) {
             rank->rowScores = a.allocate<float>(s.pool);
@@ -755,6 +821,7 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         b.bases = a.allocate<int>(2 * s.localE);
         b.tasks = a.allocate<int2>(tokens * s.k);
         b.positions = a.allocate<int>(tokens * s.k);
+        if (relayAcrossNuma) b.ownerSlots = a.allocate<uint8_t>(tokens);
         b.layout = a.allocate<int>(s.pool + 1) + 1;
         ep->ranks.push_back(std::move(rank));
     }
@@ -844,6 +911,8 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
               const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream, bool dense) {
     const bool shortBatch = r.tunedEp8 && cap <= 32;
     const bool paired = dense && r.pairedReturnPeers && r.tunedEp8 && cap > 128;
+    const bool ownerPartial = r.b.ownerSlots && cap >= (paired ? MinOwnerCombineRows : 1024);
+    const Mail *returnPeers = paired ? r.pairedReturnPeers : r.peers;
     if (paired) {
         dispatchDenseEp8(r, s, rank, rowsIn, index, weights, cap, stream);
     } else if (r.tunedEp8 && cap > 128 && r.relayAcrossNuma) {
@@ -868,8 +937,12 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
             if (shortBatch) layout<DecodeTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
             else if (cap > 128) layout<WideTile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
             else layout<Tile, true><<<s.localE, 32, 0, stream>>>(r.b, s, r.rowScores);
-            makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(
-                r.b, s, rank, routes, paired ? r.pairedReturnPeers : r.peers, cap, r.rowScores);
+            if (ownerPartial)
+                makeTasks<true, true><<<(routes + 255) / 256, 256, 0, stream>>>(
+                    r.b, s, rank, routes, returnPeers, cap, r.rowScores);
+            else
+                makeTasks<true><<<(routes + 255) / 256, 256, 0, stream>>>(
+                    r.b, s, rank, routes, returnPeers, cap, r.rowScores);
         } else {
             layout<Tile, false><<<s.localE, 32, 0, stream>>>(r.b, s, nullptr);
             makeTasks<false><<<(routes + 255) / 256, 256, 0, stream>>>(r.b, s, rank, routes, r.peers, cap, nullptr);
@@ -902,8 +975,12 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
         if (shortBatch) multiply<cutlass::bfloat16_t, DecodeTile>(r, l.down, r.b.returnRows, s.h, s.i, stream, r.sms);
         else multiply<cutlass::bfloat16_t, Tile>(r, l.down, r.b.returnRows, s.h, s.i, stream, r.sms);
     }
+    if (ownerPartial)
+        publishOwnerRows<<<s.ranks * cap, 256, 0, stream>>>(r.b, returnPeers, cap);
     rendezvous<<<1, 32, 0, stream>>>(r.peers, rank, s.ranks);
-    if (n && shortBatch)
+    if (ownerPartial && n)
+        combine<8, true><<<n, 256, 0, stream>>>(r.mail, s, index, out, keys);
+    else if (n && shortBatch)
         combine<8><<<dim3(n, 4), 128, 0, stream>>>(r.mail, s, index,
             out, keys);
     else if (n)
