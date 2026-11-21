@@ -3425,9 +3425,14 @@ namespace fastllm {
                     // scalar views alive across steps; prefill and other models
                     // still go through their virtual input builder.
                     const bool fastDecodeInput = model->model_struct == "naive_n05_flash";
-                    std::vector<float> decodePositions(fastDecodeInput ? maxBatch : 0);
+                    // V4.1 inherits the base scalar position formula. Share the
+                    // preallocated position views without changing pipeline admission.
+                    const char *scalarDecode = std::getenv("FASTLLM_DSV41_SCALAR_DECODE");
+                    const bool scalarPosition = fastDecodeInput || (model->model_struct == "deepseek_v41" &&
+                        scalarDecode && std::string(scalarDecode) == "1");
+                    std::vector<float> decodePositions(scalarPosition ? maxBatch : 0);
                     std::vector<Data> decodePositionIds;
-                    if (fastDecodeInput) decodePositionIds.reserve(maxBatch);
+                    if (scalarPosition) decodePositionIds.reserve(maxBatch);
                     const bool batchPrefill = (maxBatch > 1 || model->prefillScheduling.chunked) && model->SupportsPrefillBatching() &&
                                               model->prefillBatchPolicy.targetTokens > 0;
                     const bool fixedKvSlots = model->kvMemConfig.enabled && model->SupportsKvMemBatch();
@@ -4078,7 +4083,7 @@ namespace fastllm {
                                     attentionMasks.push_back(nullptr);
                                     positionIds.push_back(new Data(FLOAT32, {1, chunkTokens}, positions));
                                     ownedPositionIds.push_back(positionIds.back());
-                                } else if (fastDecodeInput && !isPrompt && it.second->multimodalInput.empty() &&
+                                } else if (scalarPosition && !isPrompt && it.second->multimodalInput.empty() &&
                                     it.second->currentTokens.size() == 1) {
                                     const size_t row = seqLens.size();
                                     decodePositions[row] = (float)it.second->intParams["promptLen"] +

@@ -2,6 +2,18 @@
 
 #include "fastllm.h"
 #include <vector>
+#include <cstdlib>
+#include <cstring>
+
+// Choose mHC scheduling per local owner. The cooperative MoE grid is selected
+// separately, with an identical persistent CTA count on every expert rank.
+inline bool FastllmV41HcEnabledAtRows(const char *name, int rows) {
+    const char *value = std::getenv(name);
+    if (rows < 1 || !value || !*value || std::strcmp(value, "0") == 0) return false;
+    if (std::strcmp(value, "small") == 0) return rows <= 8;
+    if (std::strcmp(value, "tensor") == 0) return rows >= 16;
+    return true;
+}
 
 struct FastllmCudaV41DecodeTransform {
     fastllm::Data *input;
@@ -104,6 +116,9 @@ extern "C" bool FastllmCudaV41QKVNormQuant(const fastllm::Data &q, const fastllm
     const fastllm::Data &qWeight, const fastllm::Data &kvWeight, float eps,
     fastllm::Data &qNorm, fastllm::Data &qQuant, fastllm::Data &kvNorm);
 
+extern "C" bool FastllmCudaV41OwnerRouterSelect(const fastllm::Data &input, fastllm::Data &weight,
+    fastllm::Data &bias, float temperature, float routeScale, fastllm::Data &logits,
+    fastllm::Data &indices, fastllm::Data &scores);
 extern "C" bool FastllmCudaV41RouterSelect(const fastllm::Data &input, fastllm::Data &weight,
     fastllm::Data &bias, float temperature, float routeScale, fastllm::Data &logits,
     fastllm::Data &indices, fastllm::Data &scores);
@@ -113,5 +128,17 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const fastllm::Data &input, fastl
     fastllm::Data &indices, fastllm::Data &scores, int topk);
 
 // Single-token hybrid mHC outputs are consumed only at the supplied join child.
+// One auxiliary stream and an optional private cuBLAS workspace per owner graph.
+void *FastllmCudaV41CreateOwnerStream(int rows);
+void FastllmCudaV41DestroyOwnerStream(void *plan);
+void *FastllmCudaV41OwnerClusterPost(void *plan, int rows, float *scratch,
+        const fastllm::Data &attention, const fastllm::Data &residual, const fastllm::Data &oldPre, const fastllm::Data &oldPost, const fastllm::Data &oldComb,
+        fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base, const fastllm::Data &weight, int iterations, float mixEps,
+        float normEps, fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb, fastllm::Data &normalized);
+extern "C" void *FastllmCudaV41ForkOwnerMix(const void *const *children, int count, int rows, float *scratch, const void *postKernel, const void *prepareKernel, void **ownerGemm);
+extern "C" void *FastllmCudaV41ForkOwnerMixQuery(const void *const *children, int count, int rows, float *scratch, const void *postKernel, const void *prepareKernel, void **ownerGemm, bool keepQuery);
+extern "C" void FastllmCudaV41DestroyOwnerMixGemm(void *plan);
+// The caller owns the clone and its 200-float mix scratch until replay completes.
+extern "C" void *FastllmCudaV41CloneSingleAttentionMix(void *source, float *scratch);
 extern "C" bool FastllmCudaV41ComposeHcGraph(const void *const *children, int count,
     const int *start, const int *join, int branches, float *saved, void **outGraph, void **outExec);

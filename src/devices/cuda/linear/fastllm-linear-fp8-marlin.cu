@@ -15,6 +15,7 @@
 #include "fastllm-fp8-marlin-gemv.cuh"
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -49,10 +50,11 @@ struct BFloatFp8AuxiliaryRegistry {
     std::mutex mutex;
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
     // The allocation and its auxiliary slots move together during MultiCuda placement.
-    struct ScaleInfo { int device; bool exact; };
+    struct ScaleInfo { int device; bool exact; uint32_t *packed = nullptr; void *panels = nullptr; };
     std::map<const void *, ScaleInfo> mxfp8Scales;
 #endif
     std::map<const fastllm::Data *, std::shared_ptr<fastllm::Data>> routerBFloat16;
+    std::map<const fastllm::Data *, std::shared_ptr<fastllm::Data>> hcSplit;
     std::map<const fastllm::Data *, BFloatFp8Auxiliary> weights;
     std::map<int, size_t> dequantizedBytes;
     std::map<const fastllm::Data *, std::map<std::tuple<bool, int, int>,
@@ -850,6 +852,48 @@ fastllm::Data *FastllmCudaFP8ColumnShard(fastllm::Data &weight, int start, int c
     return FP8IntermediateShard(weight, start, count, false);
 }
 
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+namespace {
+__global__ void PackHcSplitWeight(const float *source, __nv_bfloat16 *planes, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float value = source[i];
+    const auto high = __float2bfloat16_rn(value);
+    planes[i] = high;
+    planes[count + i] = __float2bfloat16_rn(value - __bfloat162float(high));
+}
+}
+#endif
+
+fastllm::Data *FastllmCudaHcSplitWeight(fastllm::Data &weight) {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    using namespace fastllm;
+    if (weight.isFake || weight.multiDeviceData || weight.dataType != FLOAT32 ||
+        weight.dataDevice != CUDA || !weight.cudaData || weight.Count(0) != 24 * 20480 ||
+        weight.dataDeviceIds.size() != 1 || weight.dataDeviceIds.front() != FastllmCudaGetDevice() ||
+        FastllmCudaRuntimeArch() != 103) return nullptr;
+    auto &registry = BFloatFp8Registry();
+    {
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        auto found = registry.hcSplit.find(&weight);
+        if (found != registry.hcSplit.end()) return found->second.get();
+    }
+    if (FastllmCudaGraphIsCapturingFast()) return nullptr;
+    auto packed = std::make_shared<Data>(BFLOAT16, std::vector<int>{48, 20480});
+    packed->ToDevice(CUDA, weight.dataDeviceIds, false);
+    packed->Allocate(false);
+    const int count = 24 * 20480;
+    PackHcSplitWeight<<<(count+255)/256, 256, 0, cudaStreamPerThread>>>(
+        (const float *)weight.cudaData, (__nv_bfloat16 *)packed->cudaData, count);
+    checkCudaErrors("Pack mHC weight", cudaStreamSynchronize(cudaStreamPerThread));
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    MarkAuxiliaryOwner(weight);
+    return registry.hcSplit.emplace(&weight, packed).first->second.get();
+#else
+    return nullptr;
+#endif
+}
+
 fastllm::Data *FastllmCudaExactRouterBFloat16Weight(fastllm::Data &weight) {
     using namespace fastllm;
     if (weight.isFake || weight.multiDeviceData || weight.dataType != DataType::FLOAT32 ||
@@ -904,6 +948,68 @@ bool FastllmCudaHasExactMxfp8Scales(const void *allocation, int device) {
     auto it = registry.mxfp8Scales.find(allocation);
     return it != registry.mxfp8Scales.end() && it->second.device == device && it->second.exact;
 }
+
+// A group of 128 output features consumes one contiguous 16 KiB weight panel per K step.
+static __global__ void PackV41OutputPanels(const uint4 *weights, uint4 *panels) {
+    const int tile = blockIdx.x, lane = threadIdx.x;
+    constexpr int k = 8192, panel = 128, vec = panel / sizeof(uint4);
+    const int baseRow = tile / (k / panel) * panel, kVec = tile % (k / panel) * vec;
+    for (int i = lane; i < panel * vec; i += blockDim.x) {
+        panels[tile * panel * vec + i] = weights[(baseRow + i / vec) * (k / sizeof(uint4)) + kVec + i % vec];
+    }
+}
+
+void *FastllmCudaV41OutputPanels(fastllm::Data &w, int device) {
+    if (w.dims != std::vector<int>{5120, 8192} || FastllmCudaGraphIsCapturing()) return nullptr;
+    auto &registry = BFloatFp8Registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto it = registry.mxfp8Scales.find(w.extraCudaData[0]);
+    if (it == registry.mxfp8Scales.end() || it->second.device != device || !it->second.exact) return nullptr;
+    if (it->second.panels) return it->second.panels;
+    uint4 *panels = nullptr;
+    if (cudaMalloc(&panels, size_t(5120) * 8192) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    PackV41OutputPanels<<<(5120 / 128) * (8192 / 128), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const uint4 *>(w.cudaData), panels);
+    if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) {
+        cudaFree(panels);
+        return nullptr;
+    }
+    return it->second.panels = panels;
+}
+
+// TMA addresses scale words by [K128, output row]. Repeat a checkpoint
+// scale across its 32 output rows once, while preserving the original layout.
+const uint32_t *FastllmCudaBlock32PackedScales(fastllm::Data &w, int device, bool capturing) {
+    auto &registry = BFloatFp8Registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto found = registry.mxfp8Scales.find(w.extraCudaData[0]);
+    if (found == registry.mxfp8Scales.end() || found->second.device != device || !found->second.exact)
+        return nullptr;
+    auto &entry = found->second;
+    if (entry.packed || capturing) return entry.packed;
+    const int n = w.dims[0], groups = w.dims[1] / 128;
+    std::vector<uint32_t> packed(size_t(n) * groups);
+    for (int g = 0; g < groups; ++g) {
+        for (int row = 0; row < n; row += 32) {
+            uint32_t word = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint32_t bits;
+                memcpy(&bits, &w.scales[(size_t(row / 32) * groups + g) * 4 + j], sizeof(bits));
+                word |= ((bits >> 23) & 255u) << (8 * j);
+            }
+            std::fill_n(packed.data() + size_t(g) * n + row, 32, word);
+        }
+    }
+    uint32_t *ptr = nullptr;
+    if (cudaMalloc(&ptr, packed.size() * sizeof(uint32_t)) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    const auto status = cudaMemcpy(ptr, packed.data(), packed.size() * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) { cudaFree(ptr); throw std::runtime_error(cudaGetErrorString(status)); }
+    entry.packed = ptr;
+    return ptr;
+}
 #endif
 
 extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
@@ -913,8 +1019,9 @@ extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
 #endif
     auto &registry = BFloatFp8Registry();
     BFloatFp8Auxiliary owned;
-    void *rowScales = nullptr;
-    std::shared_ptr<fastllm::Data> routerBFloat16;
+    void *rowScales = nullptr, *blockScales = nullptr;
+    void *panelWeight = nullptr;
+    std::shared_ptr<fastllm::Data> routerBFloat16, hcSplit;
     std::map<std::pair<int, int>, std::shared_ptr<fastllm::Data>> shards;
     std::map<std::tuple<bool, int, int>, std::shared_ptr<fastllm::Data>> intermediateShards;
     {
@@ -925,11 +1032,18 @@ extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
             if (scale != registry.mxfp8Scales.end()) {
                 owned.device = scale->second.device;
                 rowScales = weight.extraCudaData[0];
+                blockScales = scale->second.packed;
+                panelWeight = scale->second.panels;
                 weight.extraCudaData[0] = nullptr;
                 registry.mxfp8Scales.erase(scale);
             }
         }
 #endif
+        auto hcIt = registry.hcSplit.find(&weight);
+        if (hcIt != registry.hcSplit.end()) {
+            hcSplit = std::move(hcIt->second);
+            registry.hcSplit.erase(hcIt);
+        }
         auto routerIt = registry.routerBFloat16.find(&weight);
         if (routerIt != registry.routerBFloat16.end()) {
             routerBFloat16 = std::move(routerIt->second);
@@ -959,6 +1073,8 @@ extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (owned.device < 0) return;
     const int previous = FastllmCudaGetDevice();
     FastllmCudaSetDevice(owned.device);
+    if (panelWeight) checkCudaErrors("Release MXFP8 output panels", cudaFree(panelWeight));
+    if (blockScales) checkCudaErrors("Release MXFP8 block scales", cudaFree(blockScales));
     if (rowScales) checkCudaErrors("Release MXFP8 weight scales", cudaFree(rowScales));
     void *pointers[] = {owned.packed, owned.scales, owned.locks, owned.dequantized};
     for (int i = 0; i < 4; ++i) {

@@ -9,6 +9,9 @@
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-token-constraint.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+#include "devices/cuda/fastllm-dsv41-mega.h"
+#endif
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
@@ -398,6 +401,9 @@ bool FastllmCudaV41MoeGraphReady(const fastllm::Data *key, int rows, int topk,
         const fastllm::Data *prequantizedInput) {
 #ifndef USE_ROCM
     if (!key || rows <= 0 || topk <= 0) return false;
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+    if (topk == 6 && FastllmDsv41MegaGraphReady(key, rows)) return true;
+#endif
     return FastllmCudaV41GGUFGraphReady(key, rows, topk) ||
         FastllmCudaExl3MoeGraphReady(key, rows, topk) ||
         (topk <= 16 && FastllmCudaV41MarlinGraphReady(key, rows, prequantizedInput));

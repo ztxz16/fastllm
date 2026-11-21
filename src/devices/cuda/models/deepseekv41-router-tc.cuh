@@ -199,9 +199,9 @@ cudaError_t V41TcLaunchPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, 
 }
 
 // Each warp owns a row. Values and corrected selection scores stay in registers.
-template <int N, int TopK>
-__global__ void V41TcRouterTopK(const float *input, const float *bias, int *ids, float *weights,
-                                float scale) {
+template <int N, int TopK, bool RawLogits = false>
+__global__ void V41TcRouterTopK(float *input, const float *bias, int *ids, float *weights,
+                                float scale, float invTemp) {
 #if __CUDA_ARCH__ >= 800
     static_assert(N % 32 == 0 && TopK > 0 && N >= TopK);
     int row = blockIdx.x, lane = threadIdx.x;
@@ -218,6 +218,10 @@ __global__ void V41TcRouterTopK(const float *input, const float *bias, int *ids,
     for (int j = 0; j < N / 32; ++j) {
         int e = j * 32 + lane;
         float v = input[row * N + e];
+        if constexpr (RawLogits) {
+            v = V41TcRouterTransform(v * invTemp);
+            input[row * N + e] = v;
+        }
         value[j] = v;
         score[j] += v;
         if (isnan(score[j]))

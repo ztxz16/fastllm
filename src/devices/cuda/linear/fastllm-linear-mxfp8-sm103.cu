@@ -1,5 +1,6 @@
 // Native Blackwell MXFP8 Linear. Both GEMV and GEMM retain the original FP8
 // values and FP32 scales. The block-scaled operands live only in borrowed scratch.
+#include <array>
 #include "fastllm-cuda.cuh"
 #include "fastllm-fp8-auxiliary.h"
 #include "fastllm-linear-scratch.h"
@@ -9,6 +10,9 @@
 #include <cuda_bf16.h>
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
 #include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <stdexcept>
 
@@ -88,19 +92,20 @@ bool Descriptor(Desc &d, void *ptr, CUtensorMapDataType type, int inner, int out
                CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-template <int M, int Cluster> struct Projection {
+template <int M, int Cluster, bool FixedQA = false, bool PanelB = false> struct Projection {
     // Large-M prefill uses the 128x256x128, five-stage Blackwell configuration
     // with B multicast. Small rows use the transposed MMA and A multicast.
     static constexpr bool Prefill = M == 128;
     static constexpr int N = Prefill ? 256 : 128;
-    static constexpr int Stages = Prefill ? 5 : M == 16 ? (Cluster == 2 ? 12 : 11) : 10;
+    static constexpr int Grid = FixedQA ? 1792 / N : kSMs;
+    static constexpr int Stages = FixedQA ? 10 : Prefill ? 5 : M == 16 ? (Cluster == 2 ? 12 : 11) : 10;
     static constexpr int Shared = Prefill ? 205116 : 230204;
     static auto Kernel() {
-        return &dg::sm100_fp8_fp4_gemm_1d1d_impl<cute::UMMA::Major::K, cute::UMMA::Major::K, 32, 32, 32, 0, 0,
-                                                 0, M, N, 128, 1, 128, 128, 128, Stages, 2, 128, 128, Cluster,
-                                                 (!Prefill && Cluster == 2), kSMs, !Prefill, true, dg::GemmType::Normal, false,
+        return &dg::sm100_fp8_fp4_gemm_1d1d_impl<cute::UMMA::Major::K, cute::UMMA::Major::K, 32, 32, 32, 0, FixedQA ? 1792 : 0,
+                                                 FixedQA ? 5120 : 0, M, N, 128, 1, 128, 128, 128, Stages, 2, 128, 128, Cluster,
+                                                 (!Prefill && Cluster == 2), Grid, !Prefill, true, dg::GemmType::Normal, false,
                                                  cutlass::float_e4m3_t, cutlass::float_e4m3_t,
-                                                 cutlass::bfloat16_t, dg::epilogue::operators::Identity>;
+                                                 cutlass::bfloat16_t, dg::epilogue::operators::Identity, PanelB>;
     }
     static bool Configure() {
         return cudaFuncSetAttribute(Kernel(), cudaFuncAttributeMaxDynamicSharedMemorySize, Shared) ==
@@ -109,7 +114,7 @@ template <int M, int Cluster> struct Projection {
     static bool Run(void *q, void *w, void *sa, void *sw, void *y, int rows, int n, int k, int pitch) {
         Desc a, b, as, bs, c;
         if (!Descriptor(a, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, rows, 1, 128, Prefill ? M : M / Cluster, true) ||
-            !Descriptor(b, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, n, 1, 128, 128, true) ||
+            !Descriptor(b, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, PanelB ? 128 : k, PanelB ? n * (k / 128) : n, 1, 128, 128, true) ||
             !Descriptor(as, sa, CU_TENSOR_MAP_DATA_TYPE_INT32, pitch, k / 128, 4, 128, 1, false) ||
             !Descriptor(bs, sw, CU_TENSOR_MAP_DATA_TYPE_INT32, n, k / 128, 4, N, 1, false) ||
             !Descriptor(c, y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, n, rows, 2, 64, Prefill ? M : 16, true))
@@ -118,7 +123,7 @@ template <int M, int Cluster> struct Projection {
         attr.id = cudaLaunchAttributeClusterDimension;
         attr.val.clusterDim = {Cluster, 1, 1};
         cudaLaunchConfig_t cfg{};
-        cfg.gridDim = dim3(kSMs);
+        cfg.gridDim = dim3(Grid);
         cfg.blockDim = dim3(256);
         cfg.dynamicSmemBytes = Shared;
         cfg.stream = cudaStreamPerThread;
@@ -130,6 +135,34 @@ template <int M, int Cluster> struct Projection {
         return true;
     }
 };
+// For these three decode shapes a single CTA per cluster avoids multicast
+// setup. The block-scaled MMA order and BF16 epilogue remain identical.
+bool V41SingleCtaProjection(int rows, int n, int k) {
+    static const bool enabled = [] {
+        const char *value = std::getenv("FASTLLM_DSV41_SINGLE_CTA_PROJECTIONS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled && rows <= 16 && ((n == 1792 && k == 5120) ||
+        (n == 32768 && k == 1280) || (n == 5120 && k == 8192));
+}
+
+bool UseDecodeProjections() {
+    static const bool enabled = std::getenv("FASTLLM_DSV41_TUNED_PROJECTIONS") &&
+        std::strcmp(std::getenv("FASTLLM_DSV41_TUNED_PROJECTIONS"), "1") == 0;
+    return enabled;
+}
+
+bool FixedQAAvailable(int device, bool capturing) {
+    static thread_local std::map<int, bool> ready;
+    const auto it = ready.find(device);
+    if (it != ready.end()) return it->second;
+    if (capturing) return false;
+    const bool ok = Projection<16, 1, true>::Configure();
+    if (!ok) cudaGetLastError();
+    ready.emplace(device, ok);
+    return ok;
+}
+
 bool Available(int device, bool capturing) {
     static thread_local std::map<int, bool> ready;
     auto it = ready.find(device);
@@ -154,31 +187,46 @@ bool PrefillAvailable(int device) {
 }
 } // namespace
 
-bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int rows, int k, int n) {
+static bool Mxfp8Projection(const void *x, fastllm::Data &w, void *y, int rows, int k, int n, bool block32, fastllm::Data *owned = nullptr) {
     // Streaming measurements favor GEMV on narrow single-row TP shards.
-    if (rows == 1 && (k < 4096 || n < 4096 || size_t(k) * n < (size_t(24) << 20))) return false;
-    if (w.dataType != fastllm::FP8_E4M3 || w.IsRepacked || w.isFake || w.blockK != 1 || w.blockM != 32 ||
+    if (!block32 && rows == 1 && (k < 4096 || n < 4096 || size_t(k) * n < (size_t(24) << 20))) return false;
+    if (w.dataType != fastllm::FP8_E4M3 || w.IsRepacked || w.isFake || w.blockK != (block32 ? 32 : 1) || w.blockM != 32 ||
         w.dims.size() != 2 || w.dims[0] != n || w.dims[1] != k) return false;
     if (FastllmCudaRuntimeArch() != 103 || rows < 1 || k < 128 || k % 128 || n <= 0 || n % 64 || !x || !y ||
         !w.cudaData || w.extraCudaData.empty() || !w.extraCudaData[0] ||
         ((uintptr_t(x) | uintptr_t(y) | uintptr_t(w.cudaData) | uintptr_t(w.extraCudaData[0])) & 15))
         return false;
     const size_t scaleCount = size_t(n) * k / 32;
-    const size_t scaleArea = (scaleCount + 255) & ~size_t(255);
-    if (w.scales.size() != scaleCount) return false;
+    const size_t scaleArea = block32 ? 0 : (scaleCount + 255) & ~size_t(255);
+    if (w.scales.size() != scaleCount / w.blockK) return false;
     const int device = FastllmCudaGetDevice();
     // Look up the existing Linear lease without creating a handle, allocating
     // a workspace or refilling the spare pool. CaptureWorkspace pins its owner.
-    auto *state = fastllm_bf16_lt::GetState(device, true);
-    if (!state) return false;
     const bool capturing = FastllmCudaGraphIsCapturing();
     if (!Available(device, capturing) || !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device)) return false;
-    auto *base = static_cast<uint8_t *>(capturing      ? fastllm_bf16_lt::CaptureWorkspace(*state)
-                                        : state->eager ? state->eager->data
-                                                       : nullptr);
+    uint8_t *base = nullptr;
     size_t capacity = kWorkspace;
+    if (owned) {
+        // A V4.1 graph slot owns its workspace through all child graph
+        // captures/replays. Another slot or independent batch gets its own.
+        const int packedRows = (std::min(rows, 256) + 3) / 4 * 4;
+        const size_t bytes = size_t(packedRows) * (k + k / 32);
+        if (capturing && (!owned->cudaData || owned->expansionBytes < bytes)) return false;
+        owned->dataType = fastllm::BFLOAT16;
+        owned->UpdateUnitSize();
+        owned->Resize({int(bytes / 2)});
+        owned->ToDevice(fastllm::CUDA, {device}, false);
+        owned->Allocate();
+        base = static_cast<uint8_t *>(owned->cudaData);
+        capacity = bytes;
+    } else {
+        auto *state = fastllm_bf16_lt::GetState(device, true);
+        if (!state) return false;
+        base = static_cast<uint8_t *>(capturing ? fastllm_bf16_lt::CaptureWorkspace(*state) :
+                                     state->eager ? state->eager->data : nullptr);
+    }
     const auto *scratch = fastllm::CudaLinearScratchScope::Get();
-    if (!capturing && rows >= 1024 && scratch && scratch->cudaData && !scratch->isFake &&
+    if (!owned && !capturing && rows >= 1024 && scratch && scratch->cudaData && !scratch->isFake &&
         !scratch->cudaDataBorrowed && (reinterpret_cast<uintptr_t>(scratch->cudaData) & 15) == 0 &&
         scratch->dataDevice == fastllm::DataDevice::CUDA && scratch->dataDeviceIds.size() == 1 &&
         scratch->dataDeviceIds[0] == device && scratch->expansionBytes > capacity) {
@@ -189,7 +237,9 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     const size_t maxRows = (capacity - scaleArea) / (size_t(k) + k / 32) / 4 * 4;
     if (maxRows < 4) return false;
     const int limit = static_cast<int>(std::min<size_t>(rows, maxRows));
-    auto *packed = reinterpret_cast<uint32_t *>(base);
+    auto *packed = block32 ? const_cast<uint32_t *>(FastllmCudaBlock32PackedScales(w, device, capturing))
+                           : reinterpret_cast<uint32_t *>(base);
+    if (!packed) return false;
     auto *qx = base + scaleArea;
     auto *sx = qx + ((size_t(limit) + 3) / 4 * 4) * k;
     // Narrower tiles expose more parallel copies for wide projections.
@@ -214,7 +264,7 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
         const bool largeTile = prefill && count >= 256 && (pairedM || fullWave);
         if (largeTile && !pairedM) count = count / 256 * 256;
         const int pitch = (count + 3) / 4 * 4;
-        const int weightTiles = start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;
+        const int weightTiles = !block32 && start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;
         const int activationTiles = (size_t(count) * k / 8 + threads - 1) / threads;
         prepare<<<weightTiles + activationTiles, threads, 0, cudaStreamPerThread>>>(
             static_cast<const float4 *>(w.extraCudaData[0]), packed,
@@ -222,7 +272,11 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
             weightTiles);
         auto run = paired ? Projection<32, 2>::Run : Projection<32, 1>::Run;
         if (largeTile) run = Projection<128, 2>::Run;
-        else if (count <= 16) run = paired ? Projection<16, 2>::Run : Projection<16, 1>::Run;
+        else if (count <= 16)
+            run = paired && !(block32 && V41SingleCtaProjection(count, n, k)) ?
+                Projection<16, 2>::Run : Projection<16, 1>::Run;
+        if (owned && block32 && count <= 16 && n == 1792 && k == 5120 && UseDecodeProjections() && FixedQAAvailable(device, capturing))
+            run = Projection<16, 1, true>::Run;
         if (!run(qx, w.cudaData, sx, packed, static_cast<__nv_bfloat16 *>(y) + size_t(start) * n, count, n, k,
                  pitch))
             return false;
@@ -230,3 +284,35 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     }
     return true;
 }
+
+void *FastllmCudaV41PrepareBlock32Kernel() {
+    return reinterpret_cast<void *>(PrepareOperands<32, 32, 256>);
+}
+
+bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int rows, int k, int n) {
+    return Mxfp8Projection(x, w, y, rows, k, n, false);
+}
+
+bool FastllmCudaTryBlock32Mxfp8Sm103(const fastllm::Data &x, fastllm::Data &w, fastllm::Data &y, fastllm::Data &workspace) {
+    using namespace fastllm;
+    if (FastllmCudaRuntimeArch() != 103 || &x == &y || &w == &y ||
+        x.multiDeviceData || w.multiDeviceData || y.multiDeviceData || x.dataType != BFLOAT16 ||
+        w.dataType != FP8_E4M3 || w.blockK != 32 || w.blockM != 32 || w.isFake || w.IsRepacked ||
+        x.dataDevice != CUDA || w.dataDevice != CUDA || !x.cudaData || !w.cudaData ||
+        x.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} || w.dataDeviceIds != x.dataDeviceIds ||
+        w.dims.size() != 2 || x.dims.empty() || x.dims.back() != w.dims[1]) return false;
+    const int n = w.dims[0], k = w.dims[1];
+    if (k <= 0 || k % 128 || n <= 0 || n % 64 || x.Count(0) / k > INT_MAX) return false;
+    const int rows = x.Count(0) / k;
+    if (!rows || size_t(n) * k < (size_t(4) << 20)) return false;
+    if (w.extraCudaData.empty() || !w.extraCudaData[0]) {
+        if (FastllmCudaGraphIsCapturing()) return false;
+        FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(w, *GetEmptyData(), n);
+    }
+    auto dims = x.dims; dims.back() = n;
+    y.dataType = BFLOAT16; y.UpdateUnitSize(); y.Resize(dims);
+    y.ToDevice(CUDA, x.dataDeviceIds); y.Allocate();
+    return Mxfp8Projection(x.cudaData, w, y.cudaData, rows, k, n, true, &workspace);
+}
+
+#include "fastllm-v41-output-sm103.cuh"

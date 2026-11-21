@@ -638,9 +638,15 @@ if (USE_CUDA)
     # Keep DSV4.1's pinned headers and architecture-specific cubins isolated.
     if ((FASTLLM_CUTLASS_FP8_SM120_ENABLED OR FASTLLM_CUTLASS_FP8_SM121_ENABLED)
         AND NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
-        set(FASTLLM_DSV41_FLASHINFER_ENABLED ON)
+        set(FASTLLM_DSV41_FLASHINFER_SM12X ON)
         set_property(SOURCE src/devices/cuda/models/deepseekv41-kernels.cu
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_FLASHINFER_SM120)
+    endif()
+
+    if (FASTLLM_DSV41_FLASHINFER_SM12X OR "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+        set(FASTLLM_DSV41_FLASHINFER_ENABLED ON)
+        set_property(SOURCE src/devices/cuda/models/deepseekv41-kernels.cu
+            APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE)
     endif()
 
     # Marlin 内核需要 sm_75+，但通过 __CUDA_ARCH__ 宏保护可在低算力（如 sm_70）下编译为占位实现，
@@ -944,9 +950,22 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_options(fastllm_mxfp8_linear_sm103 PRIVATE
         "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr")
     set_property(SOURCE src/devices/cuda/linear/fastllm-linear-fp8.cu
-        src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu
+        src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu src/devices/cuda/models/deepseekv41-kernels.cu
+        src/models/deepseekv41.cpp
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
-    set(FASTLLM_MXFP8_LINEAR_OBJECTS $<TARGET_OBJECTS:fastllm_mxfp8_linear_sm103>)
+    add_library(fastllm_dsv41_mega_sm103 OBJECT src/devices/cuda/moe/fastllm-dsv41-mega.cu)
+    set_target_properties(fastllm_dsv41_mega_sm103 PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_dsv41_mega_sm103 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_blackwell/include"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_dsv41_mega_sm103 PRIVATE
+        "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
+        "--ptxas-options=--register-usage-level=10")
+    set_property(SOURCE src/devices/multicuda/multicudadevice.cpp src/devices/cuda/fastllm-cuda.cu
+        src/models/deepseekv41_gpu.cpp APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_SM100_MEGA)
+    set(FASTLLM_MXFP8_LINEAR_OBJECTS $<TARGET_OBJECTS:fastllm_mxfp8_linear_sm103>
+        $<TARGET_OBJECTS:fastllm_dsv41_mega_sm103>)
 endif()
 
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
@@ -963,18 +982,75 @@ if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     set(FASTLLM_GLM53_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_glm53_flashinfer_sm120>)
 endif()
 
-if (FASTLLM_DSV41_FLASHINFER_ENABLED)
-    add_library(fastllm_dsv41_flashinfer_sm120 OBJECT
-        src/devices/cuda/models/deepseekv41-flashinfer-sm120.cu
-        src/devices/cuda/models/deepseekv41-indexer-sm120.cu)
-    set_target_properties(fastllm_dsv41_flashinfer_sm120 PROPERTIES
-        CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
-    target_compile_options(fastllm_dsv41_flashinfer_sm120 PRIVATE
-        "--generate-code=arch=compute_120a,code=sm_120a"
-        "--generate-code=arch=compute_121a,code=sm_121a" "--use_fast_math")
-    target_include_directories(fastllm_dsv41_flashinfer_sm120 BEFORE PRIVATE
+set(FASTLLM_FLASHMLA_ROOT "" CACHE PATH "Optional FlashMLA source checkout (3e081494) with CUTLASS submodule")
+if (FASTLLM_DSV41_FLASHINFER_ENABLED AND "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS AND FASTLLM_FLASHMLA_ROOT)
+    set(mla_src "${FASTLLM_FLASHMLA_ROOT}/csrc")
+    set(mla_inst "${mla_src}/cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations")
+    option(FASTLLM_FLASHMLA_BF16_EPILOGUE "Enable FastLLM BF16 rounding boundaries in FlashMLA" OFF)
+    if (FASTLLM_FLASHMLA_BF16_EPILOGUE)
+        # Apply the small numerical adapter only inside the build tree.
+        set(mla_rel cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn)
+        set(mla_overlay "${CMAKE_CURRENT_BINARY_DIR}/flashmla_bf16")
+        set(mla_dir "${mla_overlay}/${mla_rel}")
+        set(mla_patch "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashmla_dsv41/bf16-epilogue.patch")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mla_patch}")
+        foreach(f kernel.h kernel.cuh config.h instantiations/v41_h64_prefill_nonorm.cu
+                  instantiations/v41_h64_decode_nonorm.cu instantiations/v41fp4_h64_decode_nonorm.cu)
+            configure_file("${mla_src}/${mla_rel}/${f}" "${mla_dir}/${f}" COPYONLY)
+        endforeach()
+        find_package(Git REQUIRED)
+        execute_process(COMMAND "${GIT_EXECUTABLE}" apply -p1 "${mla_patch}"
+            WORKING_DIRECTORY "${mla_dir}" RESULT_VARIABLE mla_patch_status)
+        if (NOT mla_patch_status EQUAL 0)
+            message(FATAL_ERROR "FlashMLA BF16 adapter requires checkout 3e081494 and its CUTLASS submodule")
+        endif()
+        set(mla_inst "${mla_dir}/instantiations")
+    endif()
+    add_library(fastllm_dsv41_flashmla OBJECT
+        src/devices/cuda/models/deepseekv41-flashmla-sm103.cu
+        src/devices/cuda/models/deepseekv41-flashmla-launch.cu "${mla_inst}/v41_h64_prefill_nonorm.cu"
+        "${mla_inst}/v41_h64_decode_nonorm.cu" "${mla_inst}/v41fp4_h64_decode_nonorm.cu")
+    set_target_properties(fastllm_dsv41_flashmla PROPERTIES CUDA_ARCHITECTURES OFF
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED YES POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(fastllm_dsv41_flashmla PRIVATE FLASH_MLA_IS_BUILD_ON_CUDA KERUTILS_ENABLE_SM103A)
+    target_compile_options(fastllm_dsv41_flashmla PRIVATE
+        "--generate-code=arch=compute_103a,code=sm_103a" --use_fast_math --expt-relaxed-constexpr --extended-lambda)
+    target_include_directories(fastllm_dsv41_flashmla BEFORE PRIVATE "${mla_src}"
+        "${mla_src}/3rdparty/kerutils/include" "${mla_src}/3rdparty/cutlass/include"
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_dsv41/include")
-    set(FASTLLM_DSV41_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_dsv41_flashinfer_sm120>)
+    if (FASTLLM_FLASHMLA_BF16_EPILOGUE)
+        target_compile_definitions(fastllm_dsv41_flashmla PRIVATE FASTLLM_FLASHMLA_BF16_EPILOGUE)
+        target_include_directories(fastllm_dsv41_flashmla BEFORE PRIVATE "${mla_overlay}")
+    endif()
+    set_property(SOURCE src/devices/cuda/models/deepseekv41-kernels.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_FLASHMLA)
+    list(APPEND FASTLLM_DSV41_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_dsv41_flashmla>)
+endif()
+
+if (FASTLLM_DSV41_FLASHINFER_ENABLED)
+    set(dsv41_decode_arch_flags "")
+    if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+        list(APPEND dsv41_decode_arch_flags "--generate-code=arch=compute_103a,code=sm_103a")
+    endif()
+    if (FASTLLM_DSV41_FLASHINFER_SM12X)
+        set(dsv41_sm12x_flags "--generate-code=arch=compute_120a,code=sm_120a"
+            "--generate-code=arch=compute_121a,code=sm_121a")
+        list(APPEND dsv41_decode_arch_flags ${dsv41_sm12x_flags})
+        add_library(fastllm_dsv41_indexer_sm12x OBJECT src/devices/cuda/models/deepseekv41-indexer-sm120.cu)
+        set_target_properties(fastllm_dsv41_indexer_sm12x PROPERTIES
+            CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(fastllm_dsv41_indexer_sm12x PRIVATE ${dsv41_sm12x_flags} "--use_fast_math")
+        target_include_directories(fastllm_dsv41_indexer_sm12x BEFORE PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_dsv41/include")
+        list(APPEND FASTLLM_DSV41_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_dsv41_indexer_sm12x>)
+    endif()
+    add_library(fastllm_dsv41_flashinfer_decode OBJECT src/devices/cuda/models/deepseekv41-flashinfer-sm120.cu)
+    set_target_properties(fastllm_dsv41_flashinfer_decode PROPERTIES
+        CUDA_ARCHITECTURES OFF POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(fastllm_dsv41_flashinfer_decode PRIVATE ${dsv41_decode_arch_flags} "--use_fast_math")
+    target_include_directories(fastllm_dsv41_flashinfer_decode BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/flashinfer_dsv41/include")
+    list(APPEND FASTLLM_DSV41_FLASHINFER_OBJECTS $<TARGET_OBJECTS:fastllm_dsv41_flashinfer_decode>)
 endif()
 
 # The embedded component follows the framework build; its standalone

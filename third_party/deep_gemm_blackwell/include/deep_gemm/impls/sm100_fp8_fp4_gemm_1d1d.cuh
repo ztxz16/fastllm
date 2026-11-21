@@ -34,7 +34,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
-          typename epilogue_operator_t>
+          typename epilogue_operator_t, bool kPanelMajorB = false>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -283,7 +283,9 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                         &tensor_map_a, &smem.full_barriers[stage_idx], smem.a[stage_idx], m_idx, k_a_idx, kNumMulticast, batch_idx);
                 if constexpr (kMajorB == cute::UMMA::Major::K)
                     tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
-                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], k_b_idx, n_idx, kNumMulticast, batch_idx);
+                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], kPanelMajorB ? 0u : k_b_idx,
+                        kPanelMajorB ? n_idx * (shape_k / BLOCK_K) + (k_b_idx / BLOCK_K) * LOAD_BLOCK_N : n_idx,
+                        kNumMulticast, batch_idx);
                 if constexpr (kMajorB == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
                         &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], n_idx, k_b_idx, kNumMulticast, batch_idx);

@@ -655,6 +655,7 @@ bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
     const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output);
 // Round each FP32 local branch to BF16, then round their sum to BF16.
 // The distinct output is ready for a BF16 collective; inputs are not modified.
+bool FastllmCudaDeepSeekV41JoinTokenRows(const float *routed, const void *shared, void *output, int count);
 bool FastllmCudaDeepSeekV41MoeJoinBFloat16(const float *routed, const float *shared,
                                         void *output, int count);
 // BF16 routed rows: preserve activation rounding before block-32 FP8 quantization.

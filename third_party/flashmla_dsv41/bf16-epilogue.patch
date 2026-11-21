@@ -1,0 +1,126 @@
+--- a/kernel.h
++++ b/kernel.h
+@@ -49,6 +49,11 @@
+     uint32_t stride_out_sf_wv_group, stride_out_sf_head_dim;
+     // out_sf in the 128x4-swizzled scale layout per wv group: row r at word (r/128)*128*words_per_row + (r%32)*4 + (r/32)%4, 4-column stride 128
+     bool out_sf_swizzled_128x4 = false;
++    bool fastllm_bf16_rounding = false;
++    bool fastllm_head_major = false;
++    bool fastllm_native_query = false;
++    bool fastllm_stage_native = false;
++    alignas(64) uint64_t fastllm_query_map[16]{};
+ };
+ 
+ template<SparseAttnFwdMode FWD_MODE>
+--- a/kernel.cuh
++++ b/kernel.cuh
+@@ -574,6 +574,16 @@
+             const uint8_t *src = (const uint8_t*)(params.q + (uint64_t)s_q_idx * params.stride_q_s_q) + offset;
+             bar.arrive_and_expect_tx(bytes);
+             for (uint32_t i = 0; i < bytes / Q_COPY_BYTES; ++i) {
++                if constexpr (IS_DECODE && H_Q == 64) {
++                    if (params.fastllm_stage_native) {
++                        // 16 channels x 64 heads x 8 channel groups make one 16 KiB segment.
++                        const int group = (offset + i * Q_COPY_BYTES) / (64 * 16 * sizeof(bf16));
++                        cute::SM90_TMA_LOAD_4D::copy(params.fastllm_query_map, (uint64_t*)&bar,
++                            static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
++                            (uint8_t*)dst + i * Q_COPY_BYTES, 0, 0, group, s_q_idx);
++                        continue;
++                    }
++                }
+                 cute::SM90_BULK_COPY_G2S::copy(src + i * Q_COPY_BYTES, (uint64_t*)&bar, (uint8_t*)dst + i * Q_COPY_BYTES, Q_COPY_BYTES);
+             }
+         };
+@@ -671,7 +681,8 @@
+                         dst[1] = swap ? first : second;
+                     } else {
+                         KU_LDG_256(
+-                            q_token_base + h_q_idx * NUM_BF16_PER_LOAD + d_q_idx * H_Q + (GROUP_Q_LOADS ? q_load_dep : 0u), // always 0
++                            q_token_base + (params.fastllm_native_query ? h_q_idx * D_QK + d_q_idx :
++                                h_q_idx * NUM_BF16_PER_LOAD + d_q_idx * H_Q) + (GROUP_Q_LOADS ? q_load_dep : 0u), // always 0
+                             cached_q + local_tile_idx * TILE_SIZE + i * NUM_BF16_PER_LOAD,
+                             ".nc", "no_allocate", "evict_first", "256B"
+                         );
+@@ -874,6 +885,15 @@
+             // (unrolled), with PIPELINED_EPILOGUE one load runs ahead (rolled), otherwise one tile is finished before the next
+             // one starts. finish_tile is a tile's work after its TMEM load; the load and the tO_empty arrive belong to the loop
+             auto finish_tile = [&]<bool MAY_ROPE = true>(const uint32_t mma_atom_idx, const uint32_t epilogue_tile_idx_in_atom, float (&output)[EPILOGUE_TILE_SIZE], const float reduce_result_by_tmem_ld) {
++                // The FastLLM reference materializes normalized attention in BF16
++                // before conjugate RoPE and rounds its rotated output before FP8.
++                // Retain both boundaries without round-tripping through global memory.
++                const float cast_scale = params.fastllm_bf16_rounding ? 1.0f : output_scale;
++                if (params.fastllm_bf16_rounding) {
++                    CUTE_UNROLL
++                    for (uint32_t j = 0; j < EPILOGUE_TILE_SIZE; ++j)
++                        output[j] = __bfloat162float(__float2bfloat16_rn(output[j] * output_scale));
++                }
+                 // RoPE (conjugate); the condition is warp-uniform
+                 bool should_perform_rope;
+                 {
+@@ -899,6 +919,8 @@
+                             float cur_cos = __shfl_sync(0xFFFFFFFF, cos_src, j/2);
+                             float cur_sin = __shfl_sync(0xFFFFFFFF, sin_src, j/2);
+                             float2 y = apply_rope(x, cur_cos, cur_sin);
++                            if (params.fastllm_bf16_rounding)
++                                y = __bfloat1622float2(__floats2bfloat162_rn(y.x, y.y));
+                             *(float2*)(output + j) = y;
+                         }
+                     }
+@@ -906,8 +928,8 @@
+ 
+                 // Cast to FP8
+                 float output_abs_max;
+-                if (!IS_TMEM_LD_WITH_RED_AVAILABLE || should_perform_rope) {
+-                    output_abs_max = get_max<EPILOGUE_TILE_SIZE, true>(output) * output_scale;
++                if (!IS_TMEM_LD_WITH_RED_AVAILABLE || should_perform_rope || params.fastllm_bf16_rounding) {
++                    output_abs_max = get_max<EPILOGUE_TILE_SIZE, true>(output) * cast_scale;
+                 } else {
+                     output_abs_max = reduce_result_by_tmem_ld * output_scale;
+                 }
+@@ -917,7 +939,7 @@
+                 uint32_t exp_sf = (int32_t)((sf_as_uint32-1) >> 23) + (1 - 127);
+                 uint32_t sf_inv_as_uint32 = (127 - exp_sf) << 23;
+                 float sf_inv = *reinterpret_cast<float*>(&sf_inv_as_uint32);
+-                float cur_multiplier = output_scale * sf_inv;
++                float cur_multiplier = cast_scale * sf_inv;
+                 float2 cur_multiplier_float2 = float2(cur_multiplier, cur_multiplier);
+ 
+                 uint32_t tile_fp8[EPILOGUE_TILE_SIZE / 4];
+@@ -941,13 +963,18 @@
+                     mma_atom_idx * MMA_ATOM_N + (warp_idx/(H_Q_PER_CTA/32)) * (MMA_ATOM_N/FOLD_FACTOR) :
+                     mma_atom_idx * NUM_O_TMEM_COLS_PER_ATOM + (warp_idx/(H_Q_PER_CTA/32)) * MMA_ATOM_N;
+                 uint32_t head_dim_idx = head_dim_idx_base + epilogue_tile_idx_in_atom * EPILOGUE_TILE_SIZE;
+-                uint32_t sf_block_idx = head_idx_in_wv_group + (head_dim_idx/OUTPUT_SAVE_AS_SCALE_GRAN) * WV_GROUP_SIZE;
++                // Keep data and SF in one order. Head-major preserves the checkpoint's
++                // reduction order in the following grouped projection.
++                const uint32_t channel_block = head_dim_idx / OUTPUT_SAVE_AS_SCALE_GRAN;
++                uint32_t sf_block_idx = params.fastllm_head_major
++                    ? head_idx_in_wv_group * (D_VO / OUTPUT_SAVE_AS_SCALE_GRAN) + channel_block
++                    : channel_block * WV_GROUP_SIZE + head_idx_in_wv_group;
+                 const uint32_t sf_row = params.out_sf_swizzled_128x4 ?
+                     (cur_job.s_q_idx / 128) * (128 * SF_WORDS_PER_ROW) + (cur_job.s_q_idx % 32) * 4 + (cur_job.s_q_idx / 32) % 4 : cur_job.s_q_idx;
+                 *((uint8_t*)(params.out_sf + sf_row + wv_group_idx*params.stride_out_sf_wv_group + (sf_block_idx/4)*params.stride_out_sf_head_dim) + sf_block_idx%4) = (uint8_t)(exp_sf + 127);  // TODO Optimize
+                 asm volatile(
+                     "st.global.L1::no_allocate.L2::evict_first.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};\n"
+-                    :: "l"(params.out_fp8 + (uint64_t)cur_job.s_q_idx*(H_Q*D_VO) + wv_group_idx*(WV_GROUP_SIZE*D_VO) + head_idx_in_wv_group*32 + head_dim_idx*WV_GROUP_SIZE),
++                    :: "l"(params.out_fp8 + (uint64_t)cur_job.s_q_idx*(H_Q*D_VO) + wv_group_idx*(WV_GROUP_SIZE*D_VO) + sf_block_idx*OUTPUT_SAVE_AS_SCALE_GRAN),
+                        "r"(tile_fp8[0]), "r"(tile_fp8[1]), "r"(tile_fp8[2]), "r"(tile_fp8[3]),
+                        "r"(tile_fp8[4]), "r"(tile_fp8[5]), "r"(tile_fp8[6]), "r"(tile_fp8[7]));
+             };
+@@ -2046,6 +2073,16 @@
+         }
+     }
+     if constexpr (CONFIG.FWD_MODE == SparseAttnFwdMode::Decode && CONFIG.H_Q == 64) {
++        // V4.1 owner-local decode can directly consume the Q-B head-major BF16 rows.
++        if (params.fastllm_native_query && !params.fastllm_stage_native) {
++            constexpr Config DIRECT_Q = [] {
++                Config config = CONFIG;
++                config.STAGE_Q = false;
++                return config;
++            }();
++            Kernel<DIRECT_Q>::run(params);
++            return;
++        }
+         constexpr Config OVERSIZED_CONFIG = [] {
+             Config config = CONFIG;
+             config.OVERSIZED_SMEM = true;

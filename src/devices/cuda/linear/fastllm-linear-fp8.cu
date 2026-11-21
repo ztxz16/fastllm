@@ -1675,7 +1675,7 @@ static void FastllmCudaFP8E4M3EnsureScalesOnDevice(fastllm::Data &weight) {
             status = cudaMemcpy(cudaScales, weight.scales.data(), bytes, cudaMemcpyHostToDevice);
             if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-            if (!weight.isFake && weight.blockK == 1 && weight.blockM == 32 && FastllmCudaRuntimeArch() == 103)
+            if (!weight.isFake && (weight.blockK == 1 || weight.blockK == 32) && weight.blockM == 32 && FastllmCudaRuntimeArch() == 103)
                 FastllmCudaRegisterMxfp8Scales(weight, cudaScales);
 #endif
         } catch (...) {

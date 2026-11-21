@@ -20,6 +20,9 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+#include <cooperative_groups.h>
+#endif
 #include "deepseekv41-router.cuh"
 #include "deepseekv41-indexer.cuh"
 #include "deepseekv41-router-tc.cuh"
@@ -41,6 +44,9 @@ SOFTWARE.
 #include "deepseekv41-reference.cuh"
 #ifndef USE_ROCM
 #include "deepseekv41-flashinfer.cuh"
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+#include "deepseekv41-flashmla.cuh"
+#endif
 // FlashInfer synchronization primitives require SM70 or newer.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 #define FASTLLM_V41_FP16_ATTENTION
@@ -51,6 +57,10 @@ SOFTWARE.
 #endif
 #include "fastllm.h"
 
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+#include <cuda_fp8.h>
+void *FastllmCudaV41PrepareBlock32Kernel();
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -332,7 +342,7 @@ namespace {
         return s > 0.0f ? s : ldexpf(1.0f, -9);
     }
 
-    __device__ __forceinline__ float V41QuantValueDev(float v, float scale, int quantMode) {
+    __device__ __forceinline__ float V41QuantCodeInput(float v, float scale, int quantMode) {
         float qmax = quantMode == 1 ? 448.0f : 6.0f;
         const unsigned bits = __float_as_uint(scale);
         // FP8 block scales are powers of two. Their normal reciprocals are
@@ -341,7 +351,11 @@ namespace {
         const float scaled = quantMode == 1 && bits >= 0x00800000u &&
                              bits < 0x7f000000u && !(bits & 0x007fffffu)
             ? v * __uint_as_float(0x7f000000u - bits) : v / scale;
-        float q = fminf(qmax, fmaxf(-qmax, scaled));
+        return fminf(qmax, fmaxf(-qmax, scaled));
+    }
+
+    __device__ __forceinline__ float V41QuantValueDev(float v, float scale, int quantMode) {
+        float q = V41QuantCodeInput(v, scale, quantMode);
         q = quantMode == 1 ? V41Fp8RoundTripDev(q) : V41Fp4RoundTripDev(q);
         return q * scale;
     }
@@ -1020,6 +1034,67 @@ namespace {
         V41HcDecodeDotsBody<__nv_bfloat16, TILE>(x, fn, flatDim, mix);
     }
 
+    // Each block computes one original warp's partial dot. At one token this
+    // gives SM103 200 independently schedulable blocks instead of 25. The
+    // finish kernel adds the eight warp sums in their original order.
+    __global__ void V41HcWarpDots5120(const __nv_bfloat16 *x, const float *fn, float *mix) {
+        constexpr int flat = 4 * 5120;
+        const int dot = blockIdx.x, token = blockIdx.y, warp = blockIdx.z;
+        const int first = warp * 32 + threadIdx.x;
+        x += size_t(token) * flat;
+        fn += size_t(dot == 24 ? 0 : dot) * flat;
+        float sum = 0.0f;
+#pragma unroll 16
+        for (int i = 0; i < flat / 256; ++i) {
+            const int k = first + i * 256;
+            const float value = __bfloat162float(x[k]);
+            sum = fmaf(value, dot == 24 ? value : fn[k], sum);
+        }
+        sum = V41WarpSum(sum);
+        if (threadIdx.x == 0) mix[(token * 8 + warp) * 25 + dot] = sum;
+    }
+
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    // Eight warps fetch one reference warp's 80 input/weight pairs in parallel.
+    // The original lanes still perform all FMAs and the same XOR reduction.
+    template <int Outputs>
+    __global__ void V41HcStagedDots5120(const __nv_bfloat16 *x, const float *weights, float *mix) {
+        constexpr int flat = 4 * 5120, parts = flat / 256;
+        const int token = blockIdx.y, warp = blockIdx.z, firstDot = blockIdx.x * Outputs;
+        const int tid = threadIdx.x, lane = tid & 31;
+        __shared__ float values[parts * 32], factors[Outputs][parts * 32];
+#pragma unroll
+        for (int i = 0; i < parts * 32 / 256; ++i) {
+            const int local = i * 256 + tid;
+            const int column = (local / 32) * 256 + warp * 32 + lane;
+            values[local] = __bfloat162float(x[size_t(token) * flat + column]);
+#pragma unroll
+            for (int d = 0; d < Outputs; ++d)
+                if (firstDot + d < 24) factors[d][local] = weights[(firstDot + d) * flat + column];
+        }
+        __syncthreads();
+        const int output = tid / 32, dot = firstDot + output;
+        if (output >= Outputs || dot >= 25) return;
+        float sum = 0.f;
+#pragma unroll 16
+        for (int i = 0; i < parts; ++i) {
+            const float value = values[i * 32 + lane];
+            sum = fmaf(value, dot == 24 ? value : factors[output][i * 32 + lane], sum);
+        }
+        sum = V41WarpSum(sum);
+        if (!lane) mix[(token * 8 + warp) * 25 + dot] = sum;
+    }
+
+    // These launches and CUDA graph rewrites share the same shape contract.
+    bool V41SelectStagedDots(int rows, cudaKernelNodeParams &p) {
+        if (rows > 8 || !FastllmV41HcEnabledAtRows("FASTLLM_DSV41_STAGED_HC", rows)) return false;
+        p.func = rows == 1 ? (void *)V41HcStagedDots5120<1> : (void *)V41HcStagedDots5120<2>;
+        p.gridDim = dim3(rows == 1 ? 25 : 13, rows, 8);
+        p.blockDim = dim3(256);
+        return true;
+    }
+#endif
+
     // A CTA owns one of the original dot kernel's eight logical warps.
     // Keep every lane's strided FMA sequence and XOR reduction unchanged; the
     // finish kernel sums the eight warp results in the original left-to-right
@@ -1123,6 +1198,82 @@ namespace {
             for (int w = 0; w < kHcThreads / 32; ++w) total += partial[threadIdx.x][w];
             mix[(uint64_t)(first + threadIdx.x) * 25 + m] = total;
         }
+    }
+
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    __global__ void V41HcJoinTensorDots(const __nv_bfloat16 *x, const float *dots, float *mix) {
+        const int row = blockIdx.x;
+        x += row * 20480; dots += row * 48; mix += row * 25;
+        float sum = 0.f;
+        for (int k = threadIdx.x; k < 20480; k += kHcThreads) {
+            const float value = __bfloat162float(x[k]);
+            sum += value * value;
+        }
+        __shared__ float partial[kHcThreads / 32];
+        sum = V41WarpSum(sum);
+        if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = sum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float total = 0.f;
+            for (int i = 0; i < kHcThreads / 32; ++i) total += partial[i];
+            mix[24] = total;
+        }
+        if (threadIdx.x < 24) mix[threadIdx.x] = dots[threadIdx.x] + dots[24 + threadIdx.x];
+    }
+#endif
+
+    bool V41EnvOn(const char *name);
+
+    bool V41HcTensorCandidate(const Data &x, int rows) {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        return rows >= 16 && rows <= 192 && x.dataType == DataType::BFLOAT16 &&
+            x.dims.back() == 5120 && FastllmCudaRuntimeArch() == 103 && !V41EnvOn("FASTLLM_DSV41_DISABLE_HC_TENSOR");
+#else
+        return false;
+#endif
+    }
+
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    // This optional capture marker gives graph composition an ABI-independent
+    // boundary for the cuBLAS projection. Composition removes the marker.
+    __global__ void V41HcTensorMarker(const __nv_bfloat16 *hidden, const void *packed) {}
+
+    cublasStatus_t V41HcTensorGemm(cublasHandle_t handle, const void *hidden, const void *packed,
+                                   int rows, float *projected) {
+        const float alpha = 1.f, beta = 0.f;
+        return cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, 48, rows, 20480,
+            &alpha, packed, CUDA_R_16BF, 20480, hidden, CUDA_R_16BF, 20480,
+            &beta, projected, CUDA_R_32F, 48, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+#endif
+
+    bool V41HcTensorDots(const Data &x, Data &fn, int rows, float *mix) {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (!V41HcTensorCandidate(x, rows)) return false;
+        auto *packed = FastllmCudaHcSplitWeight(fn);
+        if (!packed) return false;
+        auto handle = getFastllmCublasFp32ReductionHandle();
+        if (!handle) return false;
+        // Both views belong to the same graph-pinned allocation. Align cuBLAS C.
+        float *projected = mix + (rows * 25 + 3) / 4 * 4;
+        if (FastllmV41HcEnabledAtRows("FASTLLM_DSV41_HC_OVERLAP", rows) && V41EnvOn("FASTLLM_DSV41_HC_TENSOR_OVERLAP")) {
+            cudaStreamCaptureStatus capture;
+            if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess &&
+                capture == cudaStreamCaptureStatusActive)
+                V41HcTensorMarker<<<1, 1, 0, cudaStreamPerThread>>>(
+                    static_cast<const __nv_bfloat16 *>(x.cudaData), packed->cudaData);
+        }
+        const auto status = V41HcTensorGemm(handle, x.cudaData, packed->cudaData, rows, projected);
+        if (status == CUBLAS_STATUS_NOT_SUPPORTED || status == CUBLAS_STATUS_ARCH_MISMATCH ||
+            status == CUBLAS_STATUS_ALLOC_FAILED) return false;
+        if (status != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("mHC cuBLAS failure " + std::to_string(int(status)));
+        V41HcJoinTensorDots<<<rows, kHcThreads, 0, cudaStreamPerThread>>>(
+            (const __nv_bfloat16 *)x.cudaData, projected, mix);
+        return true;
+#else
+        return false;
+#endif
     }
 
     // One lane per matrix entry. Shuffles retain the serial kernel's exact
@@ -1280,14 +1431,32 @@ namespace {
     //     跨 warp 的 warp_sums 归约、rsqrtf(val / channels + eps) 与写出的 lo * s * w
     //     都与 RMSNorm kernel 一致。
     // 所以 THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 对同一个 channels 的选择相同。
-    template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false, bool QUANTIZE_OUTPUT = false, int MIX_WARPS = 1>
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    __device__ __forceinline__ void V41PackNormalizedPair(__nv_bfloat162 ov, uint8_t *codes,
+            uint8_t *scales, int pitch, int token, int bf2, int i) {
+        float2 v = __bfloat1622float2(ov);
+        float maximum = fmaxf(fabsf(v.x), fabsf(v.y));
+        const unsigned active = __activemask();
+#pragma unroll
+        for (int d = 8; d; d >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(active, maximum, d, 16));
+        const unsigned bits = __float_as_uint(maximum / 448.f);
+        const unsigned e = min(254u, max(1u, (bits >> 23) + unsigned((bits & 0x7fffffu) != 0)));
+        const float inverse = __uint_as_float(e == 254 ? 0x00400000u : (254u - e) << 23);
+        v.x *= inverse; v.y *= inverse;
+        reinterpret_cast<__nv_fp8x2_storage_t *>(codes)[size_t(token) * bf2 + i] =
+        __nv_cvt_float2_to_fp8x2(v, __NV_SATFINITE, __NV_E4M3);
+        if (!(i & 15)) scales[(size_t(i / 64) * pitch + token) * 4 + (i / 16) % 4] = e;
+    }
+#endif
+    template <int THREAD_PER_BLOCK, int MAX_ITER, bool FINISH_MIX = false, bool QUANTIZE_OUTPUT = false, int MIX_WARPS = 1, bool PACK_MX = false>
     __device__ __forceinline__ void
     V41HcPreNormBody(const __nv_bfloat16 *x, const float *pre, const float *weight,
                        __nv_bfloat16 *out, int hcMult, int channels, float eps, int token,
                        const float *mix = nullptr, const float *mixScale = nullptr,
                        const float *mixBase = nullptr, int sinkhornIters = 0,
                        float mixEps = 0, float *post = nullptr, float *comb = nullptr, float *nextPre = nullptr,
-                       __nv_bfloat16 *quantized = nullptr) {
+                       __nv_bfloat16 *quantized = nullptr, uint8_t *codes = nullptr,
+                       uint8_t *scales = nullptr, int pitch = 0) {
         V41DependencyWait();
         V41DependencyLaunch();
         // The model consumes the PREVIOUS sublayer's pre coefficients.
@@ -1379,6 +1548,11 @@ namespace {
                 ov.x = __float2bfloat16_rn(cache[k].x * s * w0);
                 ov.y = __float2bfloat16_rn(cache[k].y * s * w1);
                 outb[i] = ov;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+                if constexpr (PACK_MX) {
+                    V41PackNormalizedPair(ov, codes, scales, pitch, token, bf2, i);
+                }
+#endif
                 if constexpr (QUANTIZE_OUTPUT) {
                     // One BF16 pair is one lane here; width-16 covers the
                     // same contiguous block-32 group as the standalone
@@ -1413,6 +1587,16 @@ namespace {
             sinkhornIters, mixEps, post, comb, nextPre, quantized);
     }
 
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    template <bool Quantized>
+    __global__ __launch_bounds__(1024) void V41HcPreNormPacked(const __nv_bfloat16 *x, const float *pre,
+            const float *weight, __nv_bfloat16 *out, int hc, int width, float eps,
+            const float *, const float *, const float *, int, float, float *, float *, float *,
+            __nv_bfloat16 *quantized, uint8_t *codes, uint8_t *scales, int pitch) {
+        V41HcPreNormBody<1024, 3, false, Quantized, 1, true>(x, pre, weight, out, hc, width, eps,
+            blockIdx.x, nullptr, nullptr, nullptr, 0, 0.f, nullptr, nullptr, nullptr, quantized, codes, scales, pitch);
+    }
+#endif
     // The delayed-pre normalization reads previousPre, not this layer's mix.
     // Run it alongside the 25 independent dots, retaining both reduction trees.
     // Only the small single-token SM120 path uses this combined launch.
@@ -1658,9 +1842,11 @@ namespace {
         uint8_t *packedWindow = nullptr;
     };
 
+    template <bool PackForProjection = false>
     __device__ __forceinline__ void V41DecodeTransformRow(
             const V41DecodeTransformDescriptor &item, int row, int d,
-            V41RopeTable rope, int ropeDim, int windowSize) {
+            V41RopeTable rope, int ropeDim, int windowSize, uint8_t *codes = nullptr,
+            uint8_t *scales = nullptr, int token = 0, int pitch = 0, bool headMajor = false) {
         auto *base = item.input + (size_t)row * item.dim;
         if (item.packedWindow) {
             // Reuse the packed-KV encoder's four-warp layout. Other warps
@@ -1699,6 +1885,15 @@ namespace {
                 maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1));
             } else maximum = V41WarpMax(maximum);
             const float scale = V41QuantScaleDev(maximum, item.mode);
+            if constexpr (PackForProjection) {
+                const int group = row / 8;
+                const int block = headMajor ? (row % 8) * 16 + d / 32 : d / 32 * 8 + row % 8;
+                const __nv_fp8_e4m3 code(V41QuantCodeInput(v, scale, 1));
+                codes[(size_t(token * 8 + group) * 128 + block) * 32 + d % 32] = code.__x;
+                if (d % 32 == 0)
+                    scales[((group * 32 + block / 4) * pitch + token) * 4 + block % 4] = __float_as_uint(scale) >> 23;
+                return;
+            }
             v = V41QuantValueDev(v, scale, item.mode);
         }
         base[d] = __float2bfloat16_rn(v);
@@ -4499,12 +4694,12 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
     // Match FastllmRMSNormKernelInner1<512>: pairwise loading, FMA order,
     // shuffle-down tree, and BF16 output rounding. Q quantization consumes that
     // rounded value, never the unrounded FP32 expression.
-    template <int CACHE_PAIRS = 0, bool QUANTIZE_QUERY = true>
-    __global__ void V41QKVNormQuantKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
+    template <int CACHE_PAIRS = 0, bool QUANTIZE_QUERY = true, bool PACK = false, int FixedDim = 0, bool PackedOnly = false>
+    __device__ __forceinline__ void V41QKVNormBody(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
             const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *qq,
-            __nv_bfloat16 *kn, int qdim, int kdim, int qStride, int kStride, float eps) {
-        const bool query = (blockIdx.x & 1) == 0;
-        const int token = blockIdx.x / 2, dim = query ? qdim : kdim;
+            __nv_bfloat16 *kn, int qdim, int kdim, int qStride, int kStride, float eps, uint8_t *codes = nullptr, uint8_t *scales = nullptr, int pitch = 0, bool useRounded = false, int row = -1) {
+        const bool query = FixedDim ? FixedDim == 1280 : (blockIdx.x & 1) == 0;
+        const int token = row >= 0 ? row : int(blockIdx.x / 2), dim = FixedDim ? FixedDim : (query ? qdim : kdim);
         const auto *input = reinterpret_cast<const __nv_bfloat162 *>(query ? q : kv) +
             (size_t)token * ((query ? qStride : kStride) / 2);
         auto *output = reinterpret_cast<__nv_bfloat162 *>(query ? qn : kn) + (size_t)token * (dim / 2);
@@ -4541,7 +4736,12 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
                 v = CACHE_PAIRS ? values[base / 512] : input[i];
                 v.x = __float2bfloat16_rn(__bfloat162float(v.x) * s * w.x);
                 v.y = __float2bfloat16_rn(__bfloat162float(v.y) * s * w.y);
-                output[i] = v;
+                if (!PackedOnly || !query) output[i] = v;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+                if constexpr (PACK) {
+                    if (query && !useRounded) V41PackNormalizedPair(v, codes, scales, pitch, token, dim / 2, i);
+                }
+#endif
             }
             if (query && QUANTIZE_QUERY) {
                 float maximum = fmaxf(fabsf(__bfloat162float(v.x)), fabsf(__bfloat162float(v.y)));
@@ -4551,10 +4751,44 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
                 const float qs = V41QuantScaleDev(maximum, 1);
                 v.x = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(v.x), qs, 1));
                 v.y = __float2bfloat16_rn(V41QuantValueDev(__bfloat162float(v.y), qs, 1));
-                if (i < dim / 2) reinterpret_cast<__nv_bfloat162 *>(qq)[(size_t)token * (dim / 2) + i] = v;
+                if (!PackedOnly && i < dim / 2) reinterpret_cast<__nv_bfloat162 *>(qq)[(size_t)token * (dim / 2) + i] = v;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+                if constexpr (PACK) {
+                    if (useRounded && i < dim / 2) V41PackNormalizedPair(v, codes, scales, pitch, token, dim / 2, i);
+                }
+#endif
             }
         }
     }
+
+    template <int CACHE_PAIRS = 0, bool QUANTIZE_QUERY = true>
+    __global__ void V41QKVNormQuantKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
+            const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *qq,
+            __nv_bfloat16 *kn, int qdim, int kdim, int qStride, int kStride, float eps) {
+        V41QKVNormBody<CACHE_PAIRS, QUANTIZE_QUERY>(q, kv, qw, kw, qn, qq, kn, qdim, kdim, qStride, kStride, eps);
+    }
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    __global__ void V41QKVNormPackForB(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
+            const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *qq, __nv_bfloat16 *kn,
+            int qdim, int kdim, int qStride, int kStride, float eps, uint8_t *codes, uint8_t *scales,
+            int pitch, bool useRounded) {
+        V41QKVNormBody<2, true, true>(q, kv, qw, kw, qn, qq, kn, qdim, kdim, qStride, kStride, eps,
+                                      codes, scales, pitch, useRounded);
+    }
+    template<bool PackedOnly, bool QueryOnly = false>
+    __global__ void V41QKVNormPack1280(const __nv_bfloat16 *q, const __nv_bfloat16 *kv,
+            const float *qw, const float *kw, __nv_bfloat16 *qn, __nv_bfloat16 *qq, __nv_bfloat16 *kn,
+            int qdim, int kdim, int qStride, int kStride, float eps, uint8_t *codes, uint8_t *scales,
+            int pitch, bool useRounded) {
+        // The 1280-channel query uses two pair-load rounds; the 512-channel
+        // K row uses one. Keep the original sixteen-warp FP32 reduction tree.
+        if ((blockIdx.x & 1) == 0)
+            V41QKVNormBody<2, true, true, 1280, PackedOnly>(q, kv, qw, kw, qn, qq, kn,
+                qdim, kdim, qStride, kStride, eps, codes, scales, pitch, useRounded);
+        else if constexpr (!QueryOnly)
+            V41QKVNormBody<1, false, false, 512>(q, kv, qw, kw, qn, qq, kn, qdim, kdim, qStride, kStride, eps);
+    }
+#endif
 
     // Two physical warps groups reproduce all sixteen logical warp sums in
     // the existing order, with fewer idle threads for the short KV row.
@@ -4898,9 +5132,9 @@ extern "C" bool FastllmCudaV41QKVNormQuant(const Data &q, const Data &kv,
     return V41CheckLaunch("QKVNormQuant");
 }
 
-extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
+static bool V41RouterSelectImpl(const Data &input, Data &weight,
         Data &bias, float temperature, float routeScale, Data &logits,
-        Data &indices, Data &scores, int topk) {
+        Data &indices, Data &scores, int topk, bool ownerDecode) {
 #ifdef CUDA_NO_TENSOR_CORE
     return false;
 #else
@@ -4939,6 +5173,30 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
         target = compiledTargets.emplace(device, attrs.ptxVersion).first;
     }
     if (target->second < 80) return false;
+    const float invTemp = fabsf(temperature - 1.f) > 1e-6f ? 1.f / temperature : 1.f;
+#if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
+    // Score all real rows in one FP32-accumulating GEMM. Fuse temperature,
+    // softplus/sqrt, bias and top-k in the consumer while retaining logits.
+    if (ownerDecode && arch == 103 && rows >= 16 && experts == 384 && weight.dims[1] == 5120) {
+        auto handle = getFastllmCublasFp32ReductionHandle();
+        const float alpha = 1.f, beta = 0.f;
+        if (handle) {
+            const auto gemm = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                experts, rows, weight.dims[1], &alpha, compact->cudaData, CUDA_R_16BF, weight.dims[1],
+                input.cudaData, CUDA_R_16BF, weight.dims[1], &beta, logits.cudaData, CUDA_R_32F, experts,
+                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            if (gemm == CUBLAS_STATUS_SUCCESS) {
+                V41TcRouterTopK<384, 6, true><<<rows, 32, 0, cudaStreamPerThread>>>(
+                    (float*)logits.cudaData, (const float*)bias.cudaData, (int*)indices.cudaData,
+                    (float*)scores.cudaData, routeScale, invTemp);
+                return V41CheckLaunch("RouterGemmTopK");
+            }
+            if (gemm != CUBLAS_STATUS_NOT_SUPPORTED && gemm != CUBLAS_STATUS_ARCH_MISMATCH &&
+                gemm != CUBLAS_STATUS_ALLOC_FAILED)
+                throw std::runtime_error("DeepSeek V4.1 router cuBLAS failure " + std::to_string(int(gemm)));
+        }
+    }
+#endif
     const bool pdl = arch >= 90 && target->second >= 90;
     const bool cluster = pdl && arch < 100 && weight.dims[1] == 5120;
     // Bound persistent split-K scratch, independently of the logical batch.
@@ -4957,7 +5215,6 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
         }
         partial = (float*)found->second->cudaData;
     }
-    const float invTemp = fabsf(temperature - 1.f) > 1e-6f ? 1.f / temperature : 1.f;
     cudaError_t status;
     for (int first = 0; first < rows; first += chunkRows) {
         const int count = std::min(chunkRows, rows - first);
@@ -4976,16 +5233,27 @@ extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
     cudaLaunchConfig_t cfg = {}; cfg.gridDim = rows; cfg.blockDim = 32; cfg.stream = cudaStreamPerThread;
     cudaLaunchAttribute attr = {}; attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr.val.programmaticStreamSerializationAllowed = 1; cfg.attrs = &attr; cfg.numAttrs = pdl ? 1 : 0;
-    status = cudaLaunchKernelEx(&cfg, select, (const float*)logits.cudaData,
-        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale);
+    status = cudaLaunchKernelEx(&cfg, select, (float*)logits.cudaData,
+        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale, invTemp);
     if (status != cudaSuccess) { cudaGetLastError(); return false; }
     return V41CheckLaunch("RouterTopK");
 #else
-    select<<<rows,32,0,cudaStreamPerThread>>>((const float*)logits.cudaData,
-        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale);
+    select<<<rows,32,0,cudaStreamPerThread>>>((float*)logits.cudaData,
+        (const float*)bias.cudaData, (int*)indices.cudaData, (float*)scores.cudaData, routeScale, invTemp);
     return V41CheckLaunch("RouterTopK");
 #endif
 #endif
+}
+
+extern "C" bool FastllmCudaV41RouterSelectTopK(const Data &input, Data &weight,
+        Data &bias, float temperature, float routeScale, Data &logits,
+        Data &indices, Data &scores, int topk) {
+    return V41RouterSelectImpl(input, weight, bias, temperature, routeScale, logits, indices, scores, topk, false);
+}
+
+extern "C" bool FastllmCudaV41OwnerRouterSelect(const Data &input, Data &weight, Data &bias,
+        float temperature, float routeScale, Data &logits, Data &indices, Data &scores) {
+    return V41RouterSelectImpl(input, weight, bias, temperature, routeScale, logits, indices, scores, 6, true);
 }
 
 extern "C" bool FastllmCudaV41RouterSelect(const Data &input, Data &weight,
@@ -5009,6 +5277,22 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
     if (!V41PrepareOutput(scores, DataType::FLOAT32, dims)) return false;
     const float invTemp = fabsf(temperature - 1.0f) > 1e-6f ? 1.0f / temperature : 1.0f;
     const int rows = input.Count(0) / input.dims.back();
+    if (weight.dims[0] == 384 && weight.dims[1] == 5120 && V41IsSm<10, 3>() &&
+        FastllmV41HcEnabledAtRows("FASTLLM_DSV41_VECTOR_ROUTER", rows) &&
+        !(reinterpret_cast<uintptr_t>(input.cudaData) & 7)) {
+        if (Data *compact = FastllmCudaExactRouterBFloat16Weight(weight)) {
+            auto *x = static_cast<const __nv_bfloat16 *>(input.cudaData);
+            auto *w = static_cast<const __nv_bfloat16 *>(compact->cudaData);
+            auto *y = static_cast<float *>(scores.cudaData);
+            if (!(reinterpret_cast<uintptr_t>(w) & 7)) {
+                if (rows <= 2)
+                    V41RouterVector5120<128,1><<<dim3(384, rows), 128, 0, cudaStreamPerThread>>>(x, w, y, 384, invTemp);
+                else
+                    V41RouterVector5120<64,1><<<dim3(384, rows), 64, 0, cudaStreamPerThread>>>(x, w, y, 384, invTemp);
+                return V41CheckLaunch("RouterVector5120");
+            }
+        }
+    }
     if (rows >= 2 && weight.dims[0] >= 256 && weight.dims[1] >= 1024) {
         const int arch = FastllmCudaRuntimeArch();
         const bool streaming = arch >= 90 && arch < 100;
@@ -5029,7 +5313,7 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
     }
     // Checkpoint router weights are BF16 promoted to FP32. Compact only
     // exactly representable weights; retain every FP32 FMA/reduction step.
-    if (rows == 1 && V41IsSm<12, 0>()) {
+    if (rows == 1 && (V41IsSm<12, 0>() || V41IsSm<10, 3>())) {
         if (Data *compact = FastllmCudaExactRouterBFloat16Weight(weight)) {
             V41RouterScoresKernel<1, __nv_bfloat16><<<weight.dims[0], 256>>>(
                 (const __nv_bfloat16*)input.cudaData, (const __nv_bfloat16*)compact->cudaData,
@@ -5056,7 +5340,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
     if (!V41OnCuda(x) || !V41OnCuda(previousPre) || previousPre.dataType != DataType::FLOAT32 ||
         x.multiDeviceData || previousPre.multiDeviceData || x.dataType != DataType::BFLOAT16 ||
         x.dims.size() != 4 || x.dims[2] != 4 || x.dims[0] * x.dims[1] < 1 ||
-        x.dims[0] * x.dims[1] >= 16 || x.dims[3] < 4096 || x.dims[3] > 8192 ||
+        x.dims[0] * x.dims[1] > 192 || x.dims[3] < 4096 || x.dims[3] > 8192 ||
         (x.dims[3] & 1) || fn.dataType != DataType::FLOAT32 ||
         scale.dataType != DataType::FLOAT32 || base.dataType != DataType::FLOAT32 ||
         normWeight.dataType != DataType::FLOAT32 || normWeight.Count(0) != x.dims[3]) return false;
@@ -5067,7 +5351,11 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
     for (Data *w : {&fn, &scale, &base, &normWeight})
         w->ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()}, true);
     Data scratch;
-    if (!V41PrepareOutput(scratch, DataType::FLOAT32, {tokens, 25}) ||
+    const bool splitDots = tokens <= 4 && d == 5120 && V41IsSm<10, 3>();
+    const bool tensor = V41HcTensorCandidate(x, tokens);
+    if (tokens >= 16 && !tensor) return false;
+    if (!V41PrepareOutput(scratch, DataType::FLOAT32,
+            {tensor ? (tokens*25+3)/4*4 + tokens*48 : tokens*(splitDots ? 8*25 : 25)}) ||
         !V41PrepareOutput(pre, DataType::FLOAT32, {b, n, 4}) ||
         !V41PrepareOutput(post, DataType::FLOAT32, {b, n, 4}) ||
         !V41PrepareOutput(comb, DataType::FLOAT32, {b, n, 4, 4}) ||
@@ -5085,18 +5373,30 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
             sinkhornIters, mixEps, normEps, (float*)pre.cudaData, (float*)post.cudaData, (float*)comb.cudaData);
         return V41CheckLaunch("HcDotsPreNorm");
     }
-    V41LaunchHcDecodeDots((const __nv_bfloat16 *)x.cudaData, (const float *)fn.cudaData,
-                         tokens, 4 * d, (float *)scratch.cudaData);
-#define V41_MIX_NORM(I, Q) V41HcPreNormKernel<1024, I, true, Q><<<tokens * 2, 1024>>>( \
+    if (tokens >= 16) {
+        if (!V41HcTensorDots(x, fn, tokens, (float *)scratch.cudaData)) return false;
+    } else if (splitDots) {
+        V41HcWarpDots5120<<<dim3(25, tokens, 8), 32>>>(
+            (const __nv_bfloat16 *)x.cudaData, (const float *)fn.cudaData, (float *)scratch.cudaData);
+    } else {
+        V41LaunchHcDecodeDots((const __nv_bfloat16 *)x.cudaData, (const float *)fn.cudaData,
+                             tokens, 4 * d, (float *)scratch.cudaData);
+    }
+#define V41_MIX_NORM_W(I, Q, W) V41HcPreNormKernel<1024, I, true, Q, W><<<tokens * 2, 1024>>>( \
         (const __nv_bfloat16 *)x.cudaData, (const float *)previousPre.cudaData, \
         (const float *)normWeight.cudaData, (__nv_bfloat16 *)output.cudaData, 4, d, normEps, \
         (const float *)scratch.cudaData, (const float *)scale.cudaData, (const float *)base.cudaData, \
         sinkhornIters, mixEps, (float *)post.cudaData, (float *)comb.cudaData, (float *)pre.cudaData, \
         Q ? (__nv_bfloat16 *)quantizedOutput->cudaData : nullptr)
-    if (d <= 4096) { if (quantizedOutput) V41_MIX_NORM(2, true); else V41_MIX_NORM(2, false); }
+#define V41_MIX_NORM(I, Q) V41_MIX_NORM_W(I, Q, 1)
+    if (splitDots) {
+        if (quantizedOutput) V41_MIX_NORM_W(3, true, 8);
+        else V41_MIX_NORM_W(3, false, 8);
+    } else if (d <= 4096) { if (quantizedOutput) V41_MIX_NORM(2, true); else V41_MIX_NORM(2, false); }
     else if (d <= 6144) { if (quantizedOutput) V41_MIX_NORM(3, true); else V41_MIX_NORM(3, false); }
     else { if (quantizedOutput) V41_MIX_NORM(4, true); else V41_MIX_NORM(4, false); }
 #undef V41_MIX_NORM
+#undef V41_MIX_NORM_W
     return V41CheckLaunch("HcMixPreNorm");
 }
 
@@ -5111,7 +5411,8 @@ static bool V41HcPostMixPreNormImpl(const Data &input, const Data &residual,
         residual.dims[2] != 4 || residual.dims[0] <= 0 || residual.dims[1] <= 0) return false;
     const int64_t tokens64 = (int64_t)residual.dims[0] * residual.dims[1];
     const int d = residual.dims[3];
-    if (tokens64 < 2 || tokens64 > 8 || d < 4096 || d > 8192 || d % 1024) return false;
+    if (tokens64 < 1 || (tokens64 == 1 && (d != 5120 || !V41IsSm<10, 3>())) ||
+        tokens64 > 8 || d < 4096 || d > 8192 || d % 1024) return false;
     const int tokens = (int)tokens64, b = residual.dims[0], n = residual.dims[1];
     const Data *inputs[] = {&input, &residual, &previousPre, &previousPost, &previousComb,
                            &fn, &scale, &base, &normWeight};
@@ -6733,6 +7034,19 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data &input, const f
     return V41CheckLaunch("HcPost");
 }
 
+__global__ void V41JoinTokenRows(const float *routed, const __nv_bfloat16 *shared,
+                                 __nv_bfloat16 *output, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) output[i] = __float2bfloat16_rn(routed[i] + __bfloat162float(shared[i]));
+}
+extern "C" bool FastllmCudaDeepSeekV41JoinTokenRows(const float *routed, const void *shared,
+                                                   void *output, int count) {
+    if (!routed || !shared || !output || count < 1) return false;
+    V41JoinTokenRows<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        routed, static_cast<const __nv_bfloat16 *>(shared), static_cast<__nv_bfloat16 *>(output), count);
+    return V41CheckLaunch("JoinTokenRows");
+}
+
 __global__ void V41MoeJoinBFloat16Kernel(const float *routed, const float *shared,
                                         __nv_bfloat16 *output, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -6944,13 +7258,18 @@ namespace {
 constexpr int kFullDecodeTransforms = 5;
 
 struct V41FullDecodePlan {
-#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
     void *flashInfer = nullptr;
 #endif
 #ifdef FASTLLM_V41_FP16_ATTENTION
     std::shared_ptr<void> fp16Workspace;
     size_t fp16WorkspaceBytes = 0;
 #endif
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    std::shared_ptr<FastllmV41MlaWorkspace> mla;
+    bool directMlaOutput = false;
+#endif
+    bool directRing = false, earlyHistory = false;
     bool scalarAttention = false, scalarIndex = false;
     bool indexPairs = false, indexPairNarrow = false;
     bool qkPrefetch = false, wideTopKMerge = false, indexPrefetch = false;
@@ -6973,7 +7292,7 @@ struct V41FullDecodePlan {
         int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
         // Graph ownership must be released before its operand storage.
         cudaStreamSynchronize(cudaStreamPerThread);
-#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
         FastllmV41FlashInferDestroy(flashInfer);
 #endif
         if (pending) cudaEventSynchronize(copied);
@@ -7065,23 +7384,72 @@ __device__ __forceinline__ void V41FullDecodeSetupRow(
 // Q/KV transforms read request and buffer arguments directly. They do not
 // depend on the descriptors initialized by the first CTA; later kernels see
 // both descriptor writes and transformed rows through ordinary stream order.
+struct V41DecodeKeyNorm {
+    const __nv_bfloat16 *raw;
+    const float *weight;
+    int stride;
+    float eps;
+};
+
+template<bool NativeQuery = false, bool NormalizeKey = false>
 __global__ void V41FullDecodePrepareKernel(
         FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
         V41DecodeIndexDescriptor *index, V41AttentionDescriptor *attention,
         float *indexScores, float *blockScores, float *attentionScores, int tiles,
-        V41RopeTable rope, int *candidateBlocks, int *candidateCounts, int rowOffset) {
+        V41RopeTable rope, int *candidateBlocks, int *candidateCounts, int rowOffset, bool directRing,
+        __nv_bfloat16 *mlaQuery, float *mlaAngles, uint8_t *mlaRing, V41DecodeKeyNorm keyNorm) {
     const int token = rowOffset + blockIdx.y;
-    if (blockIdx.x == 0 && threadIdx.x == 0)
+    const bool metadata = blockIdx.x == (NormalizeKey ? 1 : 0);
+    if (metadata && threadIdx.x == 0)
         V41FullDecodeSetupRow(token, c, b, requests, transforms, index, attention,
                              indexScores, blockScores, attentionScores, tiles,
                              candidateBlocks, candidateCounts);
-    const bool kv = blockIdx.x == c.heads;
+    if constexpr (NativeQuery) {
+        if (metadata && threadIdx.x < 32) {
+            const float angle = float(requests[token].position) * rope.invFreq[threadIdx.x];
+            mlaAngles[token * 64 + threadIdx.x] = cosf(angle);
+            mlaAngles[token * 64 + 32 + threadIdx.x] = sinf(angle);
+        }
+    }
+    if constexpr (NormalizeKey) {
+        if (metadata) return;
+        V41QKVNormBody<1, false, false, 512>(nullptr, keyNorm.raw, nullptr, keyNorm.weight,
+            nullptr, nullptr, static_cast<__nv_bfloat16 *>(b.kv), 0, 512, 0, keyNorm.stride,
+            keyNorm.eps, nullptr, nullptr, 0, false, token);
+        __syncthreads(); // Rotate the normalized BF16 pairs produced by this CTA.
+    }
+    const bool kv = NativeQuery || blockIdx.x == c.heads;
     auto *input = kv ? static_cast<__nv_bfloat16 *>(b.kv) + (size_t)token * 512 :
         static_cast<__nv_bfloat16 *>(b.q) + ((size_t)token * c.heads + blockIdx.x) * 512;
+    if (mlaQuery && !kv) {
+        const int d = threadIdx.x;
+        mlaQuery[((size_t(token) * 32 + d / 16) * c.heads + blockIdx.x) * 16 + d % 16] = input[d];
+        if (blockIdx.x == 0 && d < 32) {
+            const float angle = float(requests[token].position) * rope.invFreq[d];
+            mlaAngles[token * 64 + d] = cosf(angle);
+            mlaAngles[token * 64 + 32 + d] = sinf(angle);
+        }
+        return;
+    }
     const V41DecodeTransformDescriptor item{
         input, nullptr, 1, 512, requests[token].position, kv ? 1 : 0, 0, 32};
     V41DecodeTransformRow(item, 0, threadIdx.x, rope, c.ropeDim, c.window);
+    if (kv && directRing) {
+        // The preceding 127 positions cannot use position % 128. The
+        // current token remains BF16 in the separate attention merge.
+        __syncthreads();
+        auto *saved = static_cast<uint8_t *>(b.savedKV) + size_t(token)*c.ringRowBytes;
+        if (threadIdx.x < kKvQuantThreads) V41QuantizeKVRow(input, saved, 512, 1, 32);
+        __syncthreads();
+        auto *slot = static_cast<uint8_t *>(requests[token].windowKV) +
+            size_t(requests[token].position % c.window)*c.ringRowBytes;
+        for (int d = threadIdx.x; d < c.ringRowBytes; d += blockDim.x) {
+            const auto value = saved[d];
+            slot[d] = value;
+            if (mlaRing) mlaRing[(size_t(token) * 128 + 127) * 528 + d] = value;
+        }
+    }
     // This lane owns the transformed element. Saving it here preserves the
     // exact KV bytes and avoids a separate launch after attention. The saved
     // rows are speculative scratch; committed ring/tail storage is untouched.
@@ -7344,16 +7712,50 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
         });
     }
 #endif
-#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
     if (FastllmV41FlashInferEnabled())
         p->flashInfer = FastllmV41FlashInferCreate(c);
+    p->directRing = p->flashInfer && !c.verifying && c.window == 128 && c.ringMode == 1 &&
+        V41IsSm<10,3>() && !V41EnvOn("FASTLLM_DSV41_DISABLE_FUSED_RING");
+#endif
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    if (p->directRing && V41EnvOn("FASTLLM_DSV41_FLASHMLA")) {
+        int sms = 0;
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, p->device) == cudaSuccess && sms == 148)
+            p->mla = FastllmV41CreateMla(c, V41EnvOn("FASTLLM_DSV41_MLA_EXACT_ATTENTION"));
+        p->earlyHistory = p->mla && p->mla->paged && !p->mla->outputOnly && !c.verifying &&
+            !c.kvSource && !c.indexSource && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_EARLY_HISTORY", c.batch);
+    }
 #endif
     return p.release();
 }
 
+bool FastllmCudaV41MlaOutput(void *handle, void *&codes, void *&scales, int &pitch, bool &headMajor) {
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    auto *p = static_cast<V41FullDecodePlan *>(handle);
+    if (p && p->mla) {
+        codes = p->mla->codes; scales = p->mla->scales; pitch = p->mla->scalePitch; headMajor = p->mla->headMajor;
+        return true;
+    }
+#endif
+    return false;
+}
+
+void FastllmCudaV41UseMlaOutput(void *handle) {
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    static_cast<V41FullDecodePlan *>(handle)->directMlaOutput = true;
+#endif
+}
 void FastllmCudaV41DestroyFullDecode(void *plan) { delete static_cast<V41FullDecodePlan *>(plan); }
 bool FastllmCudaV41ShareAttentionWorkspace(void *handle, void *source) {
     auto *p = static_cast<V41FullDecodePlan *>(handle), *q = static_cast<V41FullDecodePlan *>(source);
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    if (p && q && p->device == q->device && p->mla && q->mla &&
+        p->mla->batch == q->mla->batch && p->mla->width == q->mla->width &&
+        p->mla->outputOnly == q->mla->outputOnly && p->mla->paged == q->mla->paged &&
+        p->mla->bf16Rounding == q->mla->bf16Rounding && p->mla->headMajor == q->mla->headMajor)
+        p->mla = q->mla;
+#endif
 #ifdef FASTLLM_V41_FP16_ATTENTION
     if (p && q && p->device == q->device && p->fp16Workspace && q->fp16Workspace &&
         p->fp16WorkspaceBytes <= q->fp16WorkspaceBytes) {
@@ -7361,7 +7763,7 @@ bool FastllmCudaV41ShareAttentionWorkspace(void *handle, void *source) {
         return true;
     }
 #endif
-#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
     return p && q && p->device == q->device &&
         FastllmV41FlashInferShareWorkspace(p->flashInfer, q->flashInfer);
 #else
@@ -7405,6 +7807,12 @@ bool V41ValidateFullDecodeRequests(const V41FullDecodePlan *p,
 }
 } // namespace
 
+bool FastllmCudaV41UploadAuxiliaryInputs(const FastllmV41HostCopy *copies, size_t count) {
+    if (!count) return true;
+    return copies && !FastllmCudaGraphIsCapturingFast() &&
+        V41UploadCopies(copies[0], copies + 1, count - 1);
+}
+
 bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, size_t layers,
         const FastllmV41FullDecodeRequest *requests, size_t batch,
         const FastllmV41HostCopy *extra, size_t extraCount) {
@@ -7422,6 +7830,63 @@ bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, siz
     // The bounded pinned staging pool retains each source until its copy event
     // completes. The upload and graph replay use the same worker stream.
     return V41UploadCopies({storage, requests, layers * batch * sizeof(*requests)}, extra, extraCount);
+}
+
+namespace {
+__global__ void V41AdvanceFixedPositions(FastllmV41FullDecodeRequest *requests, size_t count) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) ++requests[i].position;
+}
+}
+namespace {
+template<class Weight>
+__global__ void V41OwnerEmbedding(const Weight *weight, const int *ids, __nv_bfloat16 *hidden,
+        float *mix, int dim, int vocab, const int *positions,
+        FastllmV41FullDecodeRequest *requests, int layers) {
+    const int row = blockIdx.y;
+    if (positions && !blockIdx.x) {
+        for (int layer = threadIdx.x; layer < layers; layer += blockDim.x)
+            requests[size_t(layer) * gridDim.y + row].position = positions[row];
+    }
+    const int col = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (!blockIdx.x && threadIdx.x < 4) mix[row * 4 + threadIdx.x] = threadIdx.x == 0 ? 1.f : 0.f;
+    if (col >= dim) return;
+    // Replay validates IDs on the host. Bound even the capture/warmup input.
+    const int id = ids[row];
+    const auto *src = weight + size_t(unsigned(id) < unsigned(vocab) ? id : 0) * dim + col;
+    alignas(8) __nv_bfloat16 value[4];
+    if constexpr (std::is_same_v<Weight, __nv_bfloat16>)
+        *reinterpret_cast<uint2 *>(value) = *reinterpret_cast<const uint2 *>(src);
+    else {
+        const auto x = *reinterpret_cast<const float4 *>(src);
+        value[0] = __float2bfloat16_rn(x.x); value[1] = __float2bfloat16_rn(x.y);
+        value[2] = __float2bfloat16_rn(x.z); value[3] = __float2bfloat16_rn(x.w);
+    }
+    for (int channel = 0; channel < 4; ++channel)
+        *reinterpret_cast<uint2 *>(hidden + (size_t(row) * 4 + channel) * dim + col) =
+            *reinterpret_cast<const uint2 *>(value);
+}
+}
+bool FastllmCudaV41OwnerEmbedding(const void *weight, bool fp32, const int *ids, void *hidden,
+                                  float *firstMix, int rows, int dim, int vocab) {
+    return FastllmCudaV41OwnerEmbedding(weight, fp32, ids, hidden, firstMix, rows, dim, vocab, nullptr, nullptr, 0);
+}
+bool FastllmCudaV41OwnerEmbedding(const void *weight, bool fp32, const int *ids, void *hidden,
+                                  float *firstMix, int rows, int dim, int vocab,
+                                  const int *positions, FastllmV41FullDecodeRequest *requests, int layers) {
+    if (positions && (!requests || layers <= 0)) return false;
+    if (vocab < 1 || !weight || !ids || !hidden || !firstMix || rows < 1 || dim < 4 || dim % 4) return false;
+    dim3 grid((dim + 511) / 512, rows);
+    auto *dst = static_cast<__nv_bfloat16 *>(hidden);
+    if (fp32) V41OwnerEmbedding<<<grid,128,0,cudaStreamPerThread>>>(static_cast<const float *>(weight),ids,dst,firstMix,dim,vocab,positions,requests,layers);
+    else V41OwnerEmbedding<<<grid,128,0,cudaStreamPerThread>>>(static_cast<const __nv_bfloat16 *>(weight),ids,dst,firstMix,dim,vocab,positions,requests,layers);
+    return cudaGetLastError() == cudaSuccess;
+}
+bool FastllmCudaV41AdvancePositions(void *storage, size_t count) {
+    if (!storage || !count || count > INT_MAX || FastllmCudaGraphIsCapturingFast()) return false;
+    V41AdvanceFixedPositions<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        static_cast<FastllmV41FullDecodeRequest *>(storage), count);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size_t layers,
@@ -7473,17 +7938,40 @@ void V41FullDecodeTransforms(const V41FullDecodePlan &p, int slot, int columns) 
 }
 } // namespace
 
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+// Keep the original split reduction and BF16 boundary. The existing inverse
+// RoPE transform writes its exact FP8 codes in O-A's interleaved input order.
+__global__ void V41PackExactAttention(const V41DecodeTransformDescriptor *transforms,
+        V41RopeTable rope, uint8_t *codes, uint8_t *scales, int pitch, int begin, bool headMajor) {
+    const int token = begin + blockIdx.y;
+    V41DecodeTransformRow<true>(transforms[size_t(token) * kFullDecodeTransforms],
+        blockIdx.x, threadIdx.x, rope, 64, 128, codes, scales, token, pitch, headMajor);
+}
+#endif
+
 bool FastllmCudaV41PrepareFullDecode(void *handle) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
+    __nv_bfloat16 *packedQuery = nullptr;
+    uint8_t *mlaRing = nullptr;
+    float *angles = nullptr;
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    if (p->earlyHistory) mlaRing = static_cast<uint8_t *>(p->mla->keys);
+    if (p->mla && !p->mla->outputOnly) { packedQuery = static_cast<__nv_bfloat16 *>(p->mla->query); angles = p->mla->angles; }
+#endif
+    bool nativeQuery = false;
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    nativeQuery = p->mla && p->mla->nativeQuery;
+#endif
     V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
-        V41FullDecodePrepareKernel<<<dim3(c.heads + 1, rows), 512, 0, cudaStreamPerThread>>>(
+        auto prepare = nativeQuery ? V41FullDecodePrepareKernel<true> : V41FullDecodePrepareKernel<false>;
+        prepare<<<dim3(nativeQuery ? 1 : c.heads + 1, rows), 512, 0, cudaStreamPerThread>>>(
             c, b, p->requests, p->transforms, p->index, p->attention,
             p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope,
-            p->candidateBlocks, p->candidateCounts, begin);
+            p->candidateBlocks, p->candidateCounts, begin, p->directRing, packedQuery, angles, mlaRing, V41DecodeKeyNorm{});
     });
-    if (c.ringMode)
+    if (c.ringMode && !p->directRing)
         V41FullVerifyPackWindow<<<c.batch, kKvQuantThreads, 0, cudaStreamPerThread>>>(c, b);
     if (c.kvSource) {
         if (c.verifying)
@@ -7500,7 +7988,81 @@ bool FastllmCudaV41PrepareFullDecode(void *handle) {
     return V41CheckLaunch("FullDecodePrepare");
 }
 
-bool FastllmCudaV41FinishFullDecode(void *handle) {
+// Store the actual CUDA stream frontier before the index-only Q projections.
+void *FastllmCudaV41CaptureFrontier() {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12000
+    cudaStreamCaptureStatus status;
+    const cudaGraphNode_t *deps = nullptr;
+    size_t count = 0;
+#if CUDART_VERSION >= 13000
+    const auto rc = cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, nullptr, &deps, nullptr, &count);
+#else
+    const auto rc = cudaStreamGetCaptureInfo(cudaStreamPerThread, &status, nullptr, nullptr, &deps, &count);
+#endif
+    if (rc == cudaSuccess && status == cudaStreamCaptureStatusActive && count == 1) return deps[0];
+    if (rc != cudaSuccess) cudaGetLastError();
+#endif
+    return nullptr;
+}
+void *FastllmCudaV41GraphPrefix(const void *source, const void *frontier, const void *compressorInput,
+                                const void *beforeCompressor, bool trim) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12000
+    if (!source || !frontier) return nullptr;
+    cudaGraph_t graph = nullptr;
+    if (cudaGraphClone(&graph, (cudaGraph_t)source) != cudaSuccess) return nullptr;
+    auto reject = [&]() -> void * { cudaGetLastError(); cudaGraphDestroy(graph); return nullptr; };
+    cudaGraphNode_t last = nullptr;
+    if (cudaGraphNodeFindInClone(&last, (cudaGraphNode_t)frontier, graph) != cudaSuccess) return reject();
+    if (compressorInput && beforeCompressor) {
+        cudaGraphNode_t ready = nullptr, query = nullptr, first = nullptr;
+        size_t count = 0;
+        if (cudaGraphNodeFindInClone(&ready, (cudaGraphNode_t)compressorInput, graph) != cudaSuccess ||
+            cudaGraphNodeFindInClone(&query, (cudaGraphNode_t)beforeCompressor, graph) != cudaSuccess ||
+            FastllmCudaGraphNodeGetDependentNodes(query, nullptr, &count) != cudaSuccess || count != 1 ||
+            FastllmCudaGraphNodeGetDependentNodes(query, &first, &count) != cudaSuccess ||
+            FastllmCudaGraphNodeGetDependencies(first, nullptr, &count) != cudaSuccess || count != 1 ||
+            FastllmCudaGraphAddDependencies(graph, &ready, &first, 1) != cudaSuccess) return reject();
+#if CUDART_VERSION >= 13000
+        if (cudaGraphRemoveDependencies(graph, &query, &first, nullptr, 1) != cudaSuccess) return reject();
+#else
+        if (cudaGraphRemoveDependencies(graph, &query, &first, 1) != cudaSuccess) return reject();
+#endif
+        // The full path can reuse projection scratch in the subsequent indexer.
+        // The short path joins both terminal nodes at its attention child.
+        if (!trim) {
+            if (FastllmCudaGraphNodeGetDependentNodes(last, nullptr, &count) != cudaSuccess || !count) return reject();
+            std::vector<cudaGraphNode_t> next(count);
+            if (FastllmCudaGraphNodeGetDependentNodes(last, next.data(), &count) != cudaSuccess) return reject();
+            for (auto user : next)
+                if (FastllmCudaGraphAddDependencies(graph, &query, &user, 1) != cudaSuccess) return reject();
+            return graph;
+        }
+    } else if (!trim) return reject();
+    // Only descendants of the recorded stream boundary belong to the suffix.
+    // Unrelated nodes and their original PDL edge attributes survive the clone.
+    std::vector<cudaGraphNode_t> todo{last}, suffix;
+    while (!todo.empty()) {
+        auto node = todo.back(); todo.pop_back();
+        size_t n = 0;
+        if (FastllmCudaGraphNodeGetDependentNodes(node, nullptr, &n) != cudaSuccess) return reject();
+        std::vector<cudaGraphNode_t> next(n);
+        if (n && FastllmCudaGraphNodeGetDependentNodes(node, next.data(), &n) != cudaSuccess) return reject();
+        for (auto child : next) if (std::find(suffix.begin(), suffix.end(), child) == suffix.end()) {
+            suffix.push_back(child); todo.push_back(child);
+        }
+    }
+    if (suffix.empty()) return reject();
+    for (auto n : suffix) if (cudaGraphDestroyNode(n) != cudaSuccess) return reject();
+    return graph;
+#else
+    return nullptr;
+#endif
+}
+__global__ void V41DecodeAllIndices(int *indices, int width) {
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        indices[size_t(blockIdx.x) * width + i] = i;
+}
+static bool V41FinishDecode(void *handle, bool allIndices) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (!p || FastllmCudaGetDevice() != p->device) return false;
     const auto &c = p->config; const auto &b = p->buffers;
@@ -7513,7 +8075,9 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
         else V41FullDecodeAppend<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
             static_cast<const __nv_bfloat16 *>(b.latents), static_cast<const __nv_bfloat16 *>(b.newIndexKeys), c.ratio, c.indexSource);
     }
-    if (c.indexSource) {
+    if (allIndices && c.indexSource) {
+        V41DecodeAllIndices<<<c.batch, 128, 0, cudaStreamPerThread>>>(static_cast<int *>(b.topk), c.topK);
+    } else if (c.indexSource) {
         V41FullDecodeTransforms(*p, 4, (c.indexHeads + 3) / 4);
         V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
             auto *index = p->index + begin;
@@ -7620,8 +8184,12 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
             launch(std::integral_constant<int, kAttnHeadsPerBlock>{}, std::false_type{}, std::integral_constant<int, 1>{});
         return V41CheckLaunch("FullDecodeScalarAttention");
     };
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    if (p->mla && !p->mla->outputOnly)
+        return FastllmV41RunMla(*p->mla, c, b, p->requests, cudaStreamPerThread, !p->directMlaOutput, p->earlyHistory) == cudaSuccess;
+#endif
     const bool attentionOk =
-#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_SM120
+#ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
         p->flashInfer ? FastllmV41FlashInferRun(p->flashInfer, b, p->requests, cudaStreamPerThread) == cudaSuccess :
 #endif
         p->scalarAttention ? scalarAttention() :
@@ -7631,17 +8199,30 @@ bool FastllmCudaV41FinishFullDecode(void *handle) {
         p->splits == 2 ? V41FullDecodeAttention<2, true>(*p) :
         p->fused ? V41FullDecodeAttention<1, false>(*p) : V41FullDecodeAttention<1, true>(*p);
     if (!attentionOk) return false;
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+    if (p->mla && p->mla->outputOnly && p->directMlaOutput) {
+        V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
+            V41PackExactAttention<<<dim3(c.heads, rows),512,0,cudaStreamPerThread>>>(
+                p->transforms, p->rope, static_cast<uint8_t *>(p->mla->codes),
+                reinterpret_cast<uint8_t *>(p->mla->scales), p->mla->scalePitch, begin, p->mla->headMajor);
+        });
+        return V41CheckLaunch("FullDecodePackExactAttention");
+    }
+#endif
     // Independent descriptors share one launch; each row retains its original math.
     if (c.verifying || c.ringMode) {
         V41FullDecodeTransforms(*p, 0, c.heads);
     } else {
         V41FullDecodeTransforms<2>(*p, 0, c.heads);
     }
-    if (!c.verifying && c.ringMode)
+    if (!c.verifying && c.ringMode && !p->directRing)
         V41FullDecodeStorePackedRing<<<c.batch, 256, 0, cudaStreamPerThread>>>(c, b, p->requests);
     return V41CheckLaunch("FullDecodeFinish");
 }
 
+
+bool FastllmCudaV41FinishFullDecode(void *handle) { return V41FinishDecode(handle, false); }
+bool FastllmCudaV41FinishAllIndices(void *handle) { return V41FinishDecode(handle, true); }
 
 bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
         std::atomic<unsigned> **ready, void **result) {
@@ -7689,7 +8270,135 @@ bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
 
 #ifndef USE_ROCM
 #include "deepseekv41-hc-graph.cuh"
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+#include "devices/cuda/fastllm-dsv41-mega.h"
+#include "deepseekv41-owner-mix.cuh"
 #endif
+#endif
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+namespace {
+struct BoundaryNorm {
+    const void *input = nullptr, *pre = nullptr, *weight = nullptr;
+    void *out = nullptr, *rounded = nullptr, *codes = nullptr, *scales = nullptr;
+    float eps = 0;
+    int pitch = 0;
+    bool pack = false, quantize = false;
+    bool Matches(const BoundaryNorm &b) const {
+        return input == b.input && pre == b.pre && weight == b.weight && out == b.out &&
+            rounded == b.rounded && codes == b.codes && scales == b.scales && eps == b.eps &&
+            pitch == b.pitch && pack == b.pack && quantize == b.quantize;
+    }
+};
+
+bool TakeBoundaryNorm(cudaGraph_t graph, int rows, BoundaryNorm &result) {
+    size_t count = 0;
+    if (cudaGraphGetRootNodes(graph, nullptr, &count) != cudaSuccess || !count) return false;
+    std::vector<cudaGraphNode_t> roots(count);
+    if (cudaGraphGetRootNodes(graph, roots.data(), &count) != cudaSuccess) return false;
+    cudaGraphNode_t found = nullptr;
+    for (auto root : roots) {
+        cudaGraphNodeType type;
+        if (cudaGraphNodeGetType(root, &type) != cudaSuccess) return false;
+        if (type != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams p{};
+        if (cudaGraphKernelNodeGetParams(root, &p) != cudaSuccess) { cudaGetLastError(); continue; }
+        bool pack = p.func == (void *)V41HcPreNormPacked<true> || p.func == (void *)V41HcPreNormPacked<false>;
+        bool quant = p.func == (void *)V41HcPreNormPacked<true> || p.func == (void *)V41HcPreNormKernel<1024,3,false,true>;
+        if (!(pack || quant || p.func == (void *)V41HcPreNormKernel<1024,3,false,false>)) continue;
+        void **a = p.kernelParams;
+        if (found || !a || p.extra || p.gridDim.x != rows || p.gridDim.y != 1 ||
+            *static_cast<int *>(a[4]) != 4 || *static_cast<int *>(a[5]) != 5120) return false;
+        auto ptr = [&](int i) {return *static_cast<void **>(a[i]);};
+        result = {ptr(0), ptr(1), ptr(2), ptr(3), quant ? ptr(15) : nullptr,
+                  pack ? ptr(16) : nullptr, pack ? ptr(17) : nullptr, *static_cast<float *>(a[6]),
+                  pack ? *static_cast<int *>(a[18]) : 0, pack, quant};
+        found = root;
+    }
+    return found && cudaGraphDestroyNode(found) == cudaSuccess;
+}
+}
+template <int Blocks>
+static void *V41BoundaryKernel(bool pack, bool quantize, bool packOnly) {
+    using namespace fastllm_v41_owner_mix;
+    if (pack && packOnly) return (void *)ExpertResidualNorm<true,false,false,Blocks>;
+    if (pack) return quantize ? (void *)ExpertResidualNorm<true,true,true,Blocks> : (void *)ExpertResidualNorm<true,false,true,Blocks>;
+    return quantize ? (void *)ExpertResidualNorm<false,true,true,Blocks> : (void *)ExpertResidualNorm<false,false,true,Blocks>;
+}
+bool FastllmCudaV41FuseExpertBoundary(const void *previous, const void *attention,
+        const void *shortAttention, const void *postKernel, int rows, bool packOnly, void **result) {
+    using namespace fastllm_v41_owner_mix;
+    if (!V41IsSm<10,3>() || rows < 1 || rows > 32 || !previous || !attention || !postKernel) return false;
+    auto clone = [](const void *source) {
+        cudaGraph_t graph = nullptr;
+        if (source) cudaGraphClone(&graph, (cudaGraph_t)source);
+        return fastllm_v41_hc_graph::OwnerGraph(graph, &cudaGraphDestroy);
+    };
+    auto producer = clone(previous), normal = clone(attention), shortGraph = clone(shortAttention);
+    BoundaryNorm a{}, b{};
+    if (!producer || !normal || !TakeBoundaryNorm(normal.get(), rows, a) ||
+        (shortAttention && (!shortGraph || !TakeBoundaryNorm(shortGraph.get(), rows, b) || !a.Matches(b)))) return false;
+    size_t count = 0;
+    if (cudaGraphGetNodes(producer.get(), nullptr, &count) != cudaSuccess || !count) return false;
+    std::vector<cudaGraphNode_t> nodes(count);
+    if (cudaGraphGetNodes(producer.get(), nodes.data(), &count) != cudaSuccess) return false;
+    cudaGraphNode_t combine = nullptr;
+    cudaKernelNodeParams params{};
+    for (auto node : nodes) {
+        cudaGraphNodeType type;
+        if (cudaGraphNodeGetType(node, &type) != cudaSuccess) return false;
+        if (type != cudaGraphNodeTypeKernel) continue;
+        cudaKernelNodeParams p{};
+        if (cudaGraphKernelNodeGetParams(node, &p) != cudaSuccess) { cudaGetLastError(); continue; }
+        if (p.func != postKernel) continue;
+        if (combine) return false;
+        combine = node; params = p;
+    }
+    auto args = params.kernelParams;
+    if (!combine || !args || params.extra || *static_cast<void **>(args[2]) != a.input ||
+        *static_cast<int *>(args[3]) != rows || *static_cast<int *>(args[4]) != 0 ||
+        fastllm_v41_hc_graph::OwnerNeighbors<false>(combine, nullptr, &count) != cudaSuccess || count) return false;
+    ExpertBoundary ep{*static_cast<const Pair **>(args[0]), *static_cast<const int **>(args[1]),
+                      static_cast<Pair *>(a.rounded), static_cast<uint8_t *>(a.codes), static_cast<uint8_t *>(a.scales), a.pitch};
+    void *fused[] = {args[5],args[6],args[7],&a.pre,&a.weight,&a.eps,args[2],&a.out,&ep};
+    const bool wide = V41EnvOn("FASTLLM_DSV41_WIDE_CLUSTER");
+    const unsigned blocks = wide ? 8 : 4;
+    params.func = wide ? V41BoundaryKernel<8>(a.pack, a.quantize, packOnly) : V41BoundaryKernel<4>(a.pack, a.quantize, packOnly);
+    params.kernelParams = fused; params.gridDim = dim3(blocks, rows); params.blockDim = dim3(1024 / blocks);
+    cudaKernelNodeAttrValue attr{};attr.clusterDim.x = blocks;attr.clusterDim.y = 1;attr.clusterDim.z = 1;
+    if (cudaGraphKernelNodeSetParams(combine, &params) != cudaSuccess ||
+        cudaGraphKernelNodeSetAttribute(combine, cudaKernelNodeAttributeClusterDimension, &attr) != cudaSuccess) return false;
+    result[0] = producer.release(); result[1] = normal.release(); result[2] = shortGraph.release();
+    return true;
+}
+#endif
+#ifndef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+void *FastllmCudaV41CreateOwnerStream(int) { return nullptr; }
+void FastllmCudaV41DestroyOwnerStream(void *) {}
+void *FastllmCudaV41OwnerClusterPost(void *plan, int rows, float *scratch,
+        const fastllm::Data &attention, const fastllm::Data &residual, const fastllm::Data &oldPre, const fastllm::Data &oldPost, const fastllm::Data &oldComb,
+        fastllm::Data &fn, const fastllm::Data &scale, const fastllm::Data &base, const fastllm::Data &weight, int iterations, float mixEps,
+        float normEps, fastllm::Data &hidden, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb, fastllm::Data &normalized) { return nullptr; }
+#endif
+extern "C" void *FastllmCudaV41ForkOwnerMixQuery(const void *const *children, int count, int rows, float *scratch, const void *postKernel, const void *prepareKernel, void **ownerGemm, bool keepQuery) {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    if (V41IsSm<10, 3>()) return fastllm_v41_hc_graph::ForkOwnerMix(children, count, rows, scratch, postKernel, prepareKernel, ownerGemm, keepQuery);
+#endif
+    return nullptr;
+}
+extern "C" void *FastllmCudaV41ForkOwnerMix(const void *const *children, int count, int rows, float *scratch, const void *postKernel, const void *prepareKernel, void **ownerGemm) {
+    return FastllmCudaV41ForkOwnerMixQuery(children, count, rows, scratch, postKernel, prepareKernel, ownerGemm, true);
+}
+extern "C" void FastllmCudaV41DestroyOwnerMixGemm(void *plan) {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    delete static_cast<fastllm_v41_hc_graph::OwnerMixGemm *>(plan);
+#endif
+}
+extern "C" void *FastllmCudaV41CloneSingleAttentionMix(void *source, float *scratch) {
+#ifndef USE_ROCM
+    if (V41IsSm<10, 3>()) return fastllm_v41_hc_graph::CloneSingleAttentionMix(source, scratch);
+#endif
+    return nullptr;
+}
 extern "C" bool FastllmCudaV41ComposeHcGraph(const void *const *children, int count,
         const int *start, const int *join, int branches, float *saved,
         void **outGraph, void **outExec) {

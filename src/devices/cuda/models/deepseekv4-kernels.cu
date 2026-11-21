@@ -6136,9 +6136,11 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
                              fastllm::Data &output, int bsz, int seqlen,
                              int heads, int headDim, int groups, int oRank) {
     int tokens = bsz * seqlen;
-    // BF16 verification batches also benefit from FP32-accumulating Tensor
-    // Cores. Keep the single-token and mixed-dtype reduction paths unchanged.
-    const bool bf16Verify = tokens >= 2 && tokens <= 8 &&
+    // For DP decode each SM103 owns all eight output groups. The strided
+    // GEMM reads BF16 weights directly and accumulates in FP32.
+    const bool singleBlackwell = tokens == 1 && groups == 8 && oRank == 1024 &&
+        heads == 64 && headDim == 512 && FastllmCudaRuntimeArch() == 103;
+    const bool bf16Verify = (singleBlackwell || (tokens >= 2 && tokens <= 8)) &&
         o.dataType == fastllm::DataType::BFLOAT16 &&
         woA.dataType == fastllm::DataType::BFLOAT16 &&
         FastllmCudaRuntimeArch() >= 80 && heads % groups == 0 &&
@@ -6166,14 +6168,14 @@ bool DeepSeekV4LaunchWoAGemm(const fastllm::Data &o, const fastllm::Data &woA,
 #if !defined(USE_ROCM) && CUBLAS_VERSION >= 11000
     // FP32 compute alone still permits BF16 split reductions in cuBLAS.
     // Keep Tensor Cores, but preserve FP32 intermediates for the small BF16
-    // verification path. Single-token decode and FP8 weights never enter it.
+    // verification and SM103 single-row paths.
     auto handle = bf16Verify ? getFastllmCublasFp32ReductionHandle() : getFastllmCublasHandle();
     if (!handle) return false;
 #else
     auto handle = getFastllmCublasHandle();
 #endif
 
-    if (o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::BFLOAT16) {
+    if (!singleBlackwell && o.dataType == fastllm::DataType::BFLOAT16 && woA.dataType == fastllm::DataType::BFLOAT16) {
         bool complete = true;
         for (int group = 0; group < groups; ++group) {
             if (!FastllmCudaHybridBf16Gemm(

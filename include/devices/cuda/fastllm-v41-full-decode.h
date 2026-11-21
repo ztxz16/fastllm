@@ -93,9 +93,18 @@ bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size
     const FastllmV41FullDecodeRequest *requests, size_t batch);
 bool FastllmCudaV41PrepareFullDecode(void *plan);
 bool FastllmCudaV41FinishFullDecode(void *plan);
+bool FastllmCudaV41FinishAllIndices(void *plan);
+void *FastllmCudaV41CaptureFrontier();
+bool FastllmCudaV41FuseExpertBoundary(const void *previous, const void *attention,
+        const void *shortAttention, const void *postKernel, int rows, bool packOnly, void **result);
+void *FastllmCudaV41GraphPrefix(const void *graph, const void *frontier, const void *compressorInput = nullptr,
+                                const void *beforeCompressor = nullptr, bool trim = true);
 
 // Source bytes are staged in pinned storage until all asynchronous copies finish.
 struct FastllmV41HostCopy { void *dst; const void *src; size_t bytes; };
+// A distributed coordinator owns only Engram and token metadata; request
+// descriptors belong to the attention ranks.
+bool FastllmCudaV41UploadAuxiliaryInputs(const FastllmV41HostCopy *copies, size_t count);
 bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, size_t layers,
     const FastllmV41FullDecodeRequest *requests, size_t batch,
     const FastllmV41HostCopy *extra, size_t extraCount);
@@ -106,3 +115,15 @@ bool FastllmCudaV41UploadFullDecodeInputs(void *storage, void *const *plans, siz
 // Do not reuse either buffer until the previous graph has consumed it.
 bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
     std::atomic<unsigned> **ready, void **graph);
+
+bool FastllmCudaV41MlaOutput(void *plan, void *&codes, void *&scales, int &pitch, bool &headMajor);
+void FastllmCudaV41UseMlaOutput(void *plan);
+
+// Validated, fixed independent decode rows on the same rank stream.
+bool FastllmCudaV41AdvancePositions(void *storage, size_t count);
+
+bool FastllmCudaV41OwnerEmbedding(const void *weight, bool fp32, const int *ids, void *hidden,
+                                  float *firstMix, int rows, int dim, int vocab);
+bool FastllmCudaV41OwnerEmbedding(const void *weight, bool fp32, const int *ids, void *hidden,
+                                  float *firstMix, int rows, int dim, int vocab,
+                                  const int *positions, FastllmV41FullDecodeRequest *requests, int layers);

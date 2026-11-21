@@ -7,6 +7,9 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+#include "devices/cuda/fastllm-dsv41-mega.h"
+#endif
 #endif
 
 namespace fastllm {
@@ -28,6 +31,22 @@ namespace fastllm {
         Data &tempInput = ws->tempInput, &tempOutput = ws->tempOutput;
         Data &moeInputTemp = ws->moeInputTemp, &moeOutputTemp = ws->moeOutputTemp;
 #ifdef USE_CUDA
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+        if (tp && v41AttentionDP == 8 && hasSharedExpertOut && !dsparkVerify && !dumpDebug &&
+            (!graphActive || ctx.capturesWholeGpuMoe) && swiglu_limit == 10.f &&
+            V41EnvFlag("FASTLLM_DSV41_SM100_MEGA") && V41EnvFlag("FASTLLM_DSV41_MEGA_SHARED") &&
+            !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && !V41EnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") &&
+            V41DeviceSpecUsesType(SelectMoeDeviceForLayer(layer), "multicuda") &&
+            quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") &&
+            quantizedLinearNames.count(pre + ".ffn.shared_experts.gateup.weight") &&
+            quantizedLinearNames.count(pre + ".ffn.shared_experts.w2.weight") &&
+            MultiCudaDsv41CombinedExperts(ffnInput, expertIndex, expertScore, moeWeights,
+                weight[pre + ".ffn.shared_experts.gateup.weight"], weight[pre + ".ffn.shared_experts.w2.weight"],
+                ffnOut, tpDevices, graphActive)) {
+            ctx.releaseSharedScratch();
+            return false;
+        }
+#endif
         // Both branches only read ffnInput. Shared GEMV scratch/output and the
         // resident routed buffers are distinct persistent allocations. Mark only
         // GPU decode/verification captures; eager and unsupported paths stay serial.
@@ -54,9 +73,10 @@ namespace fastllm {
             moeWeights.size() > 2 ? moeWeights[2] : nullptr, HybridMoeMath::DeepSeekV41) ||
             quantizedLinearNames.count(pre + ".ffn.experts.0.w1.weight") != 0;
         const bool sharedPartial = ws->sharedExpertPartition == V41SharedExpertPartition::Intermediate;
+        const bool tokenRows = ws->sharedExpertPartition == V41SharedExpertPartition::TokenRows;
         bool combineFfnPostDispatch = false;
 #ifdef USE_CUDA
-        combineFfnPostDispatch = !sharedPartial && (!fp32ExpertSum ||
+        combineFfnPostDispatch = !tokenRows && !sharedPartial && (!fp32ExpertSum ||
             (ffnInput.dataType == DataType::BFLOAT16 && sharedExpertOut.dataType == DataType::BFLOAT16)) &&
             tp && single && hasSharedExpertOut && !dumpDebug &&
             (seqlen == 1 || dsparkVerify);
@@ -91,7 +111,7 @@ namespace fastllm {
             score = &cpuMoeScore;
         }
         if (ws->sharedExpertPartition != V41SharedExpertPartition::Replicated) {
-            AssertInFastLLM((combineFfnPostDispatch || sharedPartial) && fp32ExpertSum && routedExpertParallel,
+            AssertInFastLLM((combineFfnPostDispatch || sharedPartial || tokenRows) && fp32ExpertSum && routedExpertParallel,
                 "Sharded shared output requires local FP32 routed sums and a joint reduction.\n");
             // Native BF16 graph inputs need neither dtype conversion nor a CPU
             // fallback. MultiCUDA keeps the replicated output metadata current.
@@ -111,7 +131,7 @@ namespace fastllm {
                 {"weights___batch", (int)moeWeights.size()}, {"biass___batch", (int)biass[layer].size()},
                 {"layer", layer}, {"gateType", (int)MoeGateSwiglu}, {"expertParallel", 1},
                 {"deepSeekV4Mode", 1}, {"activationQuantBlock", 32},
-                {"quantizeSharedExpert", 0}, {"deferRankReduction", 1},
+                {"quantizeSharedExpert", 0}, {"deferRankReduction", 1}, {"v41OwnedTokenRows", int(tokenRows)},
                 {"v41ParallelJoinLayer", sharedPartial && ctx.parallelShared ? layer : -1}
             });
         } else {
@@ -125,6 +145,19 @@ namespace fastllm {
         ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
 #ifdef USE_CUDA
         if (!sharedPartial) markParallel(2);
+        if (tokenRows) {
+            const int count = ffnOut.Count(0) / tpDevices.size();
+            AssertInFastLLM(MultiCudaRunDeviceCallbacks(tpDevices, [&](int rank, int device) {
+                auto *routed = static_cast<float *>(routedOutput.multiDeviceDatas.at(device)->cudaData);
+                auto *output = static_cast<uint16_t *>(ffnOut.multiDeviceDatas.at(device)->cudaData);
+                const auto *shared = sharedExpertOut.multiDeviceDatas.at(device)->cudaData;
+                const int start = rank * count;
+                AssertInFastLLM(FastllmCudaDeepSeekV41JoinTokenRows(routed + start, shared, output + start, count) &&
+                    FastllmNcclAllGather(output + start, output, count, BFLOAT16, device),
+                    "DeepSeek V4.1 FFN row gather failed");
+            }), "DeepSeek V4.1 FFN row dispatch failed");
+            return false;
+        }
         if (sharedPartial) {
             Data &partial = ws->reductionBuffers["moe_shared_tp_partial"];
             const int count = routedOutput.Count(0);

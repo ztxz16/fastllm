@@ -147,6 +147,7 @@ namespace fastllm {
     struct DeepSeekV41RequestState {
         // Released after layer views; the lease owns a bounded serving KV slot.
         std::shared_ptr<void> storageLease;
+        uint64_t storageRevision = 0;
         // MLA state is replicated only inside this request's attention TP group.
         int attentionGroup = -1;
         std::vector<std::shared_ptr<DeepSeekV41RequestState>> attentionRanks;
@@ -338,6 +339,7 @@ namespace fastllm {
         std::shared_ptr<AttentionParallel> v41AttentionParallel;
         int v41AttentionDP = 1;
         parallel::CudaRuntime *v41AttentionRankRuntime = nullptr;
+        std::map<std::pair<int, bool>, std::shared_ptr<Data>> v41OutputWeights;
         int v41AttentionRank = -1;
         int v41AttentionLogicalRows = 0;
         void PrepareAttentionParallel();
@@ -357,7 +359,7 @@ namespace fastllm {
         void LinearWithActivationQuant(Data &input, const std::string &weightName,
                                        Data &output, bool replicated = false, Data *scratch = nullptr,
                                        bool inputQuantized = false, Data *reductionScratch = nullptr,
-                                       bool preserveQuantizedInput = false);
+                                       bool preserveQuantizedInput = false, bool decodeProjection = false);
 
         // -------- 跨层共享 --------
         std::vector<int> kv_source_layer_ids;

@@ -21,7 +21,11 @@ struct DeepSeekV41Model::AttentionParallel {
         if (local) return local;
         auto restored = std::make_shared<DeepSeekV41RequestState>();
         restored->layers.resize(models[rank]->block_cnt);
-        models[rank]->PrepareRequestStorage(restored, std::move(state->storageLease));
+        // Admission reserves a slot on the first attention-TP rank. Peers
+        // must not concurrently move the same parent shared_ptr.
+        std::shared_ptr<void> reservation;
+        if (runtime.Layout().AttentionRank(rank) == 0) reservation = std::move(state->storageLease);
+        models[rank]->PrepareRequestStorage(restored, std::move(reservation));
         restored->totalLen = state->totalLen;
         if (state->totalLen) {
             for (int layer = 0; layer < models[rank]->block_cnt; ++layer) {
@@ -243,6 +247,9 @@ void DeepSeekV41Model::PrepareAttentionParallel() {
         auto local = std::make_unique<DeepSeekV41Model>();
         local->weight.dicts = weight.dicts;
         local->InitParams();
+        // Rank-local attention graphs use the same serving window as their parent.
+        local->max_positions = max_positions;
+        local->tokensLimit = tokensLimit;
         // basellm::InitParams imports the process default device maps. Override
         // them afterwards: a rank adapter must never dispatch world MultiCUDA.
         local->deviceMap = {{"cuda:" + std::to_string(devices[rank]), 1}};

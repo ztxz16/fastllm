@@ -10,6 +10,9 @@
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+#include "devices/cuda/fastllm-dsv41-mega.h"
+#endif
 #include "devices/multicuda/multicudadevice.h"
 
 #include "fastllm-multicuda.cuh"
@@ -7112,10 +7115,197 @@ auto st = std::chrono::system_clock::now();
         return result;
     }
 
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+    // This cache owns all ranks together: a collective backend must never fall
+    // back independently on one rank. Prepare outside capture and retain the
+    // existing Marlin cache so larger batches continue to use that backend.
+    struct Dsv41MegaGroup {
+        std::vector<int> devices;
+        std::array<void *, 8> workspaces{};
+        std::array<FastllmDsv41MegaLayer *, 8> layers{};
+        bool sharedReady = false;
+        ~Dsv41MegaGroup() {
+            const int previous = FastllmCudaGetDevice();
+            for (int r = 0; r < (int)devices.size(); ++r) {
+                FastllmCudaSetDevice(devices[r]);
+                FastllmDsv41MegaDestroy(layers[r]);
+                if (workspaces[r]) FastllmCudaDirectFree(workspaces[r]);
+            }
+            FastllmCudaSetDevice(previous);
+        }
+    };
+    static std::mutex &Dsv41MegaMutex() { static std::mutex m; return m; }
+    static std::map<const Data *, std::unique_ptr<Dsv41MegaGroup>> &Dsv41MegaGroups() {
+        static std::map<const Data *, std::unique_ptr<Dsv41MegaGroup>> groups;
+        return groups;
+    }
+    static Dsv41MegaGroup *PrepareDsv41Mega(Data **weights, int count,
+                                          const std::vector<int> &devices) {
+        if (!MultiCudaEnvFlagEnabled("FASTLLM_DSV41_SM100_MEGA") ||
+            devices.size() != 8 || count != 770 || !weights || !weights[2]) return nullptr;
+        std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+        auto &entry = Dsv41MegaGroups()[weights[2]];
+        if (entry) {
+            return entry->devices == devices ? entry.get() : nullptr;
+        }
+        if (FastllmCudaGraphIsCapturingFast() || !FastllmDsv41MegaCanPrepare(devices.data(), devices.size()))
+            return nullptr;
+        std::array<std::array<const void *, 48>, 8> gate{}, down{};
+        std::array<const Data *, 8> localKeys{};
+        for (int e = 0; e < 384; ++e) for (int part = 0; part < 2; ++part) {
+            Data *root = weights[2 + e * 2 + part];
+            if (!root) return nullptr;
+            auto it = root->multiDeviceDatas.find(devices[e % 8]);
+            if (it == root->multiDeviceDatas.end() || !it->second) return nullptr;
+            Data *w = it->second;
+            const std::vector<int> shape = part ? std::vector<int>{5120, 2304} : std::vector<int>{4608, 5120};
+            const size_t elements = (size_t)shape[0] * shape[1];
+            if (w->dataType != NVFP4 || w->dims != shape || w->blockM != 32 || w->blockK != 1 ||
+                w->IsRepacked || !w->cudaData || !w->directMemory || !w->scales.empty() ||
+                w->expansionBytes < elements / 2 + elements / 32) return nullptr;
+            (part ? down : gate)[e % 8][e / 8] = w->cudaData;
+            if (e < 8 && part == 0) localKeys[e] = w;
+        }
+        const int previous = FastllmCudaGetDevice();
+        auto state = std::make_unique<Dsv41MegaGroup>(); state->devices = devices;
+        try {
+            // Drain outstanding TP work before cold cudaMalloc; never allocate
+            // while only some ranks have entered a peer collective.
+            for (int device : devices) { FastllmCudaSetDevice(device); ForceDeviceSync(); }
+            const size_t bytes = FastllmDsv41MegaWorkspaceBytes();
+            for (int r = 0; r < 8; ++r) {
+                FastllmCudaSetDevice(devices[r]);
+                state->workspaces[r] = FastllmCudaDirectMalloc(bytes);
+                FastllmDsv41MegaInitWorkspace(state->workspaces[r], devices.data(), r);
+            }
+            for (int r = 0; r < 8; ++r) {
+                FastllmCudaSetDevice(devices[r]);
+                state->layers[r] = FastllmDsv41MegaCreate(gate[r].data(), down[r].data(),
+                    state->workspaces.data(), r, localKeys[r]);
+            }
+            entry = std::move(state);
+            printf("DSV41_MEGA backend=builtin-sm100 ep=8 source_rows=1..256 shared=tp workspace_per_gpu=%zu layer=%s\n",
+                bytes, weights[2]->name.c_str());
+            fflush(stdout);
+        } catch (...) { FastllmCudaSetDevice(previous); throw; }
+        FastllmCudaSetDevice(previous);
+        return entry.get();
+    }
+#endif
+
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+    // Assemble the two MXFP8 shared expert matrices once. All ranks agree on
+    // placement and exact UE8M0 scales before any rank enters the collective.
+    static bool PrepareDsv41Shared(Dsv41MegaGroup &group, Data &gate, Data &down) {
+        std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+        if (group.sharedReady) return true;
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        std::array<std::vector<uint8_t>, 2> scales;
+        Data *weights[] = {&gate, &down};
+        for (int part = 0; part < 2; ++part) {
+            Data &w = *weights[part];
+            const auto expected = part ? std::vector<int>{5120,2304} : std::vector<int>{4608,5120};
+            if (w.dims != expected || w.dataType != FP8_E4M3 || w.blockK != 32 || w.blockM != 32 ||
+                w.isFake || w.IsRepacked) return false;
+            if (!w.multiDeviceData) PrepareMultiCudaReplicatedData(w, group.devices, true);
+            if (!w.IsTensorParallelReplicated()) return false;
+            for (int device : group.devices) {
+                const auto found = w.multiDeviceDatas.find(device);
+                if (found == w.multiDeviceDatas.end() || !found->second || !found->second->cudaData ||
+                    found->second->dims != expected || found->second->IsRepacked) return false;
+            }
+            const auto &f = w.scales.empty() ? w.multiDeviceDatas.at(group.devices[0])->scales : w.scales;
+            if (f.size() != size_t(expected[0]/32)*(expected[1]/32)) return false;
+            scales[part].reserve(f.size());
+            for (float value : f) {
+                int exponent = 0;
+                if (std::frexp(value, &exponent) != 0.5f || exponent < -125 || exponent > 128) return false;
+                scales[part].push_back(uint8_t(exponent + 126));
+            }
+        }
+        const bool ok = MultiCudaRunDeviceCallbacks(group.devices, [&](int r, int device) {
+            FastllmDsv41MegaEnableShared(group.layers[r], gate.multiDeviceDatas.at(device)->cudaData,
+                scales[0].data(), down.multiDeviceDatas.at(device)->cudaData, scales[1].data());
+        });
+        AssertInFastLLM(ok, "DSV41 shared MegaMoE packing failed");
+        group.sharedReady = true;
+        printf("DSV41_MEGA shared=mxfp8 ep=8 layer=%s\n", gate.name.c_str());
+        fflush(stdout);
+        return true;
+    }
+    std::vector<FastllmDsv41MegaLayer *> MultiCudaDsv41SharedLayers(const Data *key,
+            const std::vector<int> &devices) {
+        std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+        auto it = Dsv41MegaGroups().find(key);
+        if (it == Dsv41MegaGroups().end() || !it->second || !it->second->sharedReady ||
+            it->second->devices != devices) return {};
+        return {it->second->layers.begin(), it->second->layers.end()};
+    }
+    bool MultiCudaDsv41CombinedExperts(Data &input, Data &ids, Data &scores, std::vector<Data *> &routed,
+            Data &gate, Data &down, Data &output, const std::vector<int> &devices, bool runDecode) {
+        if (devices.size() != 8 || input.dims.size() != 2 || input.dims[1] != 5120 ||
+            input.dataType != BFLOAT16 || ids.dataType != INT32 || scores.dataType != FLOAT32 ||
+            MultiCudaEnvFlagEnabled("FASTLLM_DISABLE_NCCL")) return false;
+        const int rows = input.dims[0];
+        if (!(rows == 1 || (rows >= 8 && rows <= FastllmDsv41MegaMaxRows && rows%8 == 0)) ||
+            ids.Count(0) != size_t(rows)*6 || scores.Count(0) != ids.Count(0)) return false;
+        for (Data *v : {&input,&ids,&scores}) {
+            if (!v->IsTensorParallelReplicated()) return false;
+            for (int device : devices) {
+                const auto local = v->multiDeviceDatas.find(device);
+                if (local == v->multiDeviceDatas.end() || !local->second || !local->second->cudaData ||
+                    local->second->Count(0) != v->Count(0)) return false;
+            }
+        }
+        auto *g = PrepareDsv41Mega(routed.data(), routed.size(), devices);
+        // Warm immutable packed weights eagerly, while leaving prompt-token
+        // arithmetic on the original prefill implementation.
+        if (!g || !PrepareDsv41Shared(*g, gate, down) || !runDecode || !FastllmInitNccl(devices)) return false;
+        output.dataType = BFLOAT16;
+        output.UpdateUnitSize();
+        output.Resize(input.dims);
+        output.dataDevice = CUDA;
+        output.dataDeviceIds = {devices.front()};
+        EnsureReplicatedMultiCudaTensor(output, devices, false);
+        SyncReplicatedLocalShapeFromRoot(output, devices);
+        const int count = rows == 1 ? 5120 : rows/8*5120;
+        AssertInFastLLM(MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+            Data &result = *output.multiDeviceDatas.at(device);
+            result.dataType = BFLOAT16;
+            result.UpdateUnitSize();
+            result.Allocate(false);
+            auto *out = static_cast<uint16_t *>(result.cudaData);
+            auto *local = rows == 1 ? out : out + rank*count;
+            FastllmCudaGraphRecordCollective();
+            FastllmDsv41MegaRunShared(g->layers[rank], input.multiDeviceDatas.at(device)->cudaData,
+                static_cast<int32_t *>(ids.multiDeviceDatas.at(device)->cudaData),
+                static_cast<float *>(scores.multiDeviceDatas.at(device)->cudaData), local, rows, nullptr);
+            if (rows == 1) {
+                FastllmNcclBroadcast(out, count, BFLOAT16, devices.front(), device);
+                AssertInFastLLM(!FastllmCudaGetThreadError(), "DSV41 shared expert broadcast failed");
+            } else {
+                AssertInFastLLM(FastllmNcclAllGather(local, out, count, BFLOAT16, device),
+                    "DSV41 shared expert all-gather failed");
+            }
+        }), "DSV41 combined experts dispatch failed");
+        return true;
+    }
+#endif
+
     void MultiCudaReleaseMoeWeightCaches(const Data *layerKey) {
         if (layerKey == nullptr) {
             return;
         }
+
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+        std::unique_ptr<Dsv41MegaGroup> retiredMega;
+        {
+            std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+            auto &groups = Dsv41MegaGroups();
+            auto it = groups.find(layerKey);
+            if (it != groups.end()) { retiredMega = std::move(it->second); groups.erase(it); }
+        }
+#endif
 
         // Persistent worker threads cannot have their thread_local maps erased
         // from the model-destruction thread. Bump a generation so each worker
@@ -7161,10 +7351,15 @@ auto st = std::chrono::system_clock::now();
         bool deepSeekV41 = false;
         const Data *prequantizedInput = nullptr;
         bool deferRankReduction = false;
+        bool ownedTokenRows = false;
         const Data *joinSharedPartial = nullptr;
         Data *joinOutput = nullptr;
         int parallelJoinLayer = -1;
         bool sharedJoined = false;
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+        FastllmDsv41MegaLayer *megaLayer = nullptr;
+        bool megaOwnsRows = false;
+#endif
         Data *output;
         Data *pairedReduceInput;
         int rootDeviceId;
@@ -7227,6 +7422,18 @@ auto st = std::chrono::system_clock::now();
 
         bool RunMarlin(const Data &routedInput, Data **localWeights, int localCount,
                        const int32_t *indices, const float *scores, int topk) {
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+            if (megaLayer) {
+                const int rows = routedInput.Count(0) / routedInput.dims.back();
+                megaOwnsRows = rows >= 16 && rows % expertOwnerCount == 0 && doNcclReduce &&
+                    (!deferRankReduction || ownedTokenRows) && !reduceToRoot && !pairedReduceInput && !joinOutput &&
+                    output->dataType == FLOAT32;
+                FastllmCudaGraphRecordCollective();
+                FastllmDsv41MegaRun(megaLayer, routedInput.cudaData, indices, scores,
+                    (float *)output->cudaData, rows, nullptr, megaOwnsRows);
+                return true;
+            }
+#endif
             if (joinOutput && FastllmCudaV41MarlinExpertParallelShared(
                     routedInput, *w1, *output, localWeights, localCount, indices, scores, topk,
                     expertOwnerRank, expertOwnerCount, swigluLimit, prequantizedInput,
@@ -7613,7 +7820,28 @@ auto st = std::chrono::system_clock::now();
             }
 
             // The caller joins the shared branch before the joint collective.
+            if (ownedTokenRows) {
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+                if (megaOwnsRows) return;
+#endif
+                // General expert kernels produce partials for every token.
+                // Reduce just the slice this rank will join to its shared expert.
+                const int count = output->Count(0) / expertOwnerCount;
+                auto *data = static_cast<float *>(output->cudaData);
+                AssertInFastLLM(FastllmNcclReduceScatter(data, data + expertOwnerRank * count,
+                    count, FLOAT32, deviceId), "DeepSeek V4.1 routed reduce-scatter failed");
+                return;
+            }
             if (deferRankReduction) return;
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+            if (megaOwnsRows) {
+                const int count = output->Count(0) / expertOwnerCount;
+                auto *values = static_cast<float *>(output->cudaData);
+                AssertInFastLLM(FastllmNcclAllGather(values + expertOwnerRank * count, values,
+                    count, FLOAT32, deviceId), "DeepSeek V4.1 routed row gather failed");
+                return;
+            }
+#endif
             if (doNcclReduce) {
                 if (pairedReduceInput != nullptr) {
                     AssertInFastLLM(
@@ -7854,7 +8082,10 @@ auto st = std::chrono::system_clock::now();
              MultiCudaEnvFlagEnabled("FASTLLM_MULTICUDA_MOE_EXPERT_PARALLEL"));
         const bool deferRankReduction = intParams.count("deferRankReduction") &&
             intParams.at("deferRankReduction");
-        AssertInFastLLM(!deferRankReduction || (deepSeekV41 && n >= 1 && n <= 8 && useExpertParallel &&
+        const bool ownedRows = intParams.count("v41OwnedTokenRows") && intParams.at("v41OwnedTokenRows");
+        const bool validRows = ownedRows ? (devices.size() == 8 && n >= 16 && n <= 256 && n % 8 == 0) :
+                                          (n >= 1 && n <= 8);
+        AssertInFastLLM(!deferRankReduction || (deepSeekV41 && validRows && useExpertParallel &&
             input.multiDeviceData && input.IsTensorParallelReplicated() &&
             input.dataType == DataType::BFLOAT16 && !hasSharedExpert && !pairedReduceInput),
             "Deferred MoE reduction requires native BF16 small-batch EP replicas.\n");
@@ -7923,6 +8154,11 @@ auto st = std::chrono::system_clock::now();
                 }
             }
         }
+
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+        Dsv41MegaGroup *mega = deepSeekV41 && useExpertParallel && !hasSharedExpert &&
+            topk == 6 && swigluLimit == 10.f ? PrepareDsv41Mega(weights, wBatch, devices) : nullptr;
+#endif
 
         // Routed expert outputs are BF16, but their local/EP sum stays FP32
         // until the model adds the shared expert and rounds once.
@@ -8263,6 +8499,15 @@ auto st = std::chrono::system_clock::now();
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
                 op->deferRankReduction = deferRankReduction;
+                op->ownedTokenRows = ownedRows;
+                AssertInFastLLM(!op->ownedTokenRows || (deepSeekV41 && useExpertParallel && deferRankReduction &&
+                    n % devices.size() == 0), "Invalid DeepSeek V4.1 owned-token partition");
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+                // Eager prefills also contain small row counts. Keep their canonical Marlin arithmetic.
+                if (mega && (ownedRows || FastllmCudaGraphIsCapturingFast()) &&
+                    n >= 16 && n <= FastllmDsv41MegaMaxRows && input.dataType == BFLOAT16)
+                    op->megaLayer = mega->layers[i];
+#endif
                 auto joinShared = datas.find("v41JoinSharedPartial");
                 auto joinOut = datas.find("v41JoinOutput");
                 if (joinShared != datas.end() && joinOut != datas.end()) {

@@ -256,7 +256,7 @@ bool KernelReady(int heads, bool compressed) {
     int major = 0, minor = 0;
     bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
               cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
-              major == 12 && minor >= 0 && minor <= 1;
+              ((major == 10 && minor == 3) || (major == 12 && minor >= 0 && minor <= 1));
     if (ok)
         ok = cudaFuncSetAttribute(AttentionKernel<Verify, Requests, Decoded>(heads, compressed),
             cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Dsv41Bf16Smem)) == cudaSuccess;
@@ -270,7 +270,7 @@ bool KernelReady(int heads, bool compressed) {
 void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     // Independent decode requests and one contiguous causal verification
     // chunk share the packed-cache kernel. Other cache formats retain native math.
-    if (c.batch < 1 || c.heads < 1 || c.heads > 128 || c.window != 128 ||
+    if (c.batch < 1 || (!c.verifying && c.batch > 128) || c.heads < 1 || c.heads > 128 || c.window != 128 ||
         c.ringMode != 1 || c.ringRowBytes != 528 || c.cmpMode != 3 || c.cmpRowBytes != 288 || c.ratio < 0 ||
         c.ratio > 2 || c.topK < 1 || c.topK > 1024 || !std::isfinite(c.softmaxScale) || c.softmaxScale <= 0.f)
         return nullptr;
