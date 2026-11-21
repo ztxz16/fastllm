@@ -8,6 +8,7 @@ struct GpuGraphs;
 struct HybridGraphs;
 struct DraftRequest;
 } // namespace hy4
+struct ReadGGUFTask;
 class Hy4FlashModel final : public basellm {
   public:
     Hy4FlashModel();
@@ -47,6 +48,7 @@ class Hy4FlashModel final : public basellm {
     void OnResponseContextCreated(ResponseContext *context) override;
     bool PopPendingResponseToken(ResponseContext *context, int previous, int &token) override;
     struct Weights;
+    void ImportGGUF(const json11::Json &params, const std::vector<ReadGGUFTask> &tasks);
     void AddSource(const std::string &name, const std::string &file, const std::string &dtype,
                    const std::vector<int> &dims, uint64_t offset, uint64_t bytes);
     // Enable the embedded draft before creating response contexts.

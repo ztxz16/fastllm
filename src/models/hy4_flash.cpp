@@ -203,6 +203,10 @@ const void *Hy4FlashModel::Weights::Device(const std::string &name, int device) 
         return it->second->ptr;
     const auto &s = meta.at(name);
     std::unique_ptr<Allocation> a(new Allocation{device, hy4::Allocate(device, s.bytes)});
+    if (s.file.empty()) {
+        hy4::CopyToGPU(a->ptr, host.at(name).data(), s.bytes);
+        return gpu.emplace(key, std::move(a)).first->second->ptr;
+    }
     auto f = OpenRange(s);
     std::vector<char> chunk(std::min<uint64_t>(s.bytes, 16U << 20));
     for (uint64_t off = 0; off < s.bytes; off += chunk.size()) {
@@ -223,6 +227,8 @@ Hy4View Hy4FlashModel::Weights::View(const std::string &name, int device) {
             return 1;
         if (dtype == "F8_E4M3")
             return 2;
+        if (dtype == "Q8_0")
+            return 4;
         if (dtype == "I32")
             return 3;
         throw std::runtime_error("Unsupported HY4-Flash storage type " + dtype);
@@ -230,6 +236,7 @@ Hy4View Hy4FlashModel::Weights::View(const std::string &name, int device) {
     const auto &s = meta.at(name);
     Hy4View v;
     v.type = type(s.dtype);
+    v.floatMath = gguf;
     v.data = Device(name, device);
     v.cols = s.dims.empty() ? 1 : s.dims.back();
     v.rows = s.dims.size() < 2 ? 1 : s.dims[s.dims.size() - 2];

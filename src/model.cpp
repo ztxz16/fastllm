@@ -3286,7 +3286,7 @@ namespace fastllm {
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
             {"qwen35moe", "qwen3_5_moe"}, {"qwen3_5_moe", "qwen3_5_moe"},
-            {"qwen4exp", "qwen4_exp"},
+            {"qwen4exp", "qwen4_exp"}, {"hy_v4_flash", "hy_v4_flash"},
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"glm5next", "glm5_next"}, {"glm5-next", "glm5_next"},
@@ -3388,6 +3388,11 @@ namespace fastllm {
             addAlias(alias.first, alias.second);
         }
 
+        if (model->model_struct == "hy_v4_flash") {
+            const auto heads = GetGGUFArchParam(params, arch, "attention.head_count").array_items();
+            AssertInFastLLM(!heads.empty() && heads.front().int_value() > 0, "Invalid HY4 GGUF head counts.");
+            model->weight.AddDict("num_attention_heads", std::to_string(heads.front().int_value()));
+        }
         if (model->model_struct == "deepseek_v41") {
             for (const auto &alias : std::vector<std::pair<std::string, std::string>>{
                      {"o_lora_rank", "attention.output_lora_rank"}, {"o_groups", "attention.output_group_count"},
@@ -3589,7 +3594,7 @@ namespace fastllm {
             mergeScores.reserve(mergeItems.size());
             for (size_t i = 0; i < mergeItems.size(); i++) {
                 const std::string &pair = mergeItems[i].string_value();
-                if (model->weight.tokenizer.preTokenizer == "joyai-llm")
+                if (model->weight.tokenizer.preTokenizer == "joyai-llm" || model->weight.tokenizer.preTokenizer == "hy_v4")
                     model->weight.tokenizer.bpeMergeRanks.emplace(pair, int(i));
                 const size_t separator = pair.find(' ', 1);
                 if (separator == std::string::npos) {
@@ -4304,6 +4309,8 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
+        AssertInFastLLM((arch == "hy_v4_flash") == (params["general.architecture"].string_value() == "hy_v4_flash"),
+                        "HY4 GGUF architecture does not match the original model configuration.");
         if (arch == "deepseek_v41") {
             model->weight.AddDict("model_directory", ParentDirectoryWithSlash(ggufFileNames[0]));
         }
@@ -4354,6 +4361,13 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
+        }
+        if (arch == "hy_v4_flash") {
+            auto *hy = dynamic_cast<Hy4FlashModel *>(model);
+            AssertInFastLLM(hy && hy->UsesHostExperts(), "HY4 GGUF requires hybrid expert placement.");
+            hy->ImportGGUF(params, readGGUFTasks);
+            hy->OnModelWeightsLoaded();
+            return modelOwner;
         }
         if (arch == "deepseek_v41" && params["deepseek41.engram.present"].bool_value()) {
             const std::string name = params["deepseek41.engram.file"].string_value();

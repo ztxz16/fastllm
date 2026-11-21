@@ -59,7 +59,8 @@ __global__ static void mlaSinkGate(const __nv_bfloat16 *values, const float *lse
     const int head = blockIdx.x, row = blockIdx.y;
     const int i = (row * heads + head) * 256 + threadIdx.x;
     const float scale = sigmoid(lse[row * heads + head] - read(sink.data, sink.type, head));
-    out[i] = bf(bf(__bfloat162float(values[i]) * scale) * bf(sigmoid(gate[i])));
+    const float value = __bfloat162float(values[i]) * scale;
+    out[i] = sink.floatMath ? value * sigmoid(gate[i]) : bf(bf(value) * bf(sigmoid(gate[i])));
 }
 
 static void PagedMlaTile(Weights &w, Scratch &s, const std::string &p, int heads, const AttentionRow *rows,

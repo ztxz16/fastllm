@@ -156,8 +156,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardGpu(const std::vector<int> &tokens,
             stepInputs.push_back(hy4::UploadStep(*arena, params));
         key = {uintptr_t(verify), uintptr_t(rows), uintptr_t(lengths.size()), uintptr_t(projected)};
         for (int row = 0; row < rows; ++row) {
-            const bool skip = tokens[row] == w.config["engram_pad_id"].int_value() || tokens[row] == 120120 ||
-                              tokens[row] == 120124;
+            const bool skip = w.SkipEngram(tokens[row]);
             key.push_back(int(positions[row] >= 2048) * 2 + int(skip));
         }
         for (size_t i = 0; i < lengths.size(); ++i) {

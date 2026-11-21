@@ -12,7 +12,9 @@ namespace fastllm {
 struct Hy4View {
     const void *data = nullptr, *scale = nullptr;
     int type = 0, scaleType = 0, rows = 0, cols = 0;
+    bool floatMath = false;
 };
+void ReadEngramRow(const void *table, bool scalarFp8, int64_t row, uint16_t *out);
 struct Hy4Source {
     std::string file, dtype;
     uint64_t offset = 0, bytes = 0;
@@ -28,6 +30,13 @@ struct Hy4FlashModel::Weights {
     };
     std::map<std::pair<int, std::string>, std::unique_ptr<Allocation>> gpu;
     json11::Json config;
+    // GGUF stores one E4M3 byte per Engram element and already folds the row quantizer.
+    bool gguf = false;
+    std::map<int, std::array<int64_t, 3>> engramFactors;
+    bool SkipEngram(int token) const {
+        // Every vocabulary entry in a HY4 GGUF has an explicit compressed ID.
+        return !gguf && (token == config["engram_pad_id"].int_value() || token == 120120 || token == 120124);
+    }
     const void *Host(const std::string &name);
     const void *Device(const std::string &name, int device);
     Hy4View View(const std::string &name, int device);

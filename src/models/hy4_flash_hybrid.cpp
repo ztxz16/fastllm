@@ -176,8 +176,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
         stepInputs = hy4::UploadStep(s, params);
         key = {uintptr_t(verify), uintptr_t(rows), uintptr_t(lengths.size()), uintptr_t(projected)};
         for (int row = 0; row < rows; ++row) {
-            const bool skip = tokens[row] == w.config["engram_pad_id"].int_value() || tokens[row] == 120120 ||
-                              tokens[row] == 120124;
+            const bool skip = w.SkipEngram(tokens[row]);
             // Sparse attention selects recalled groups starting at position 2048.
             key.push_back(2 * int(positions[row] >= 2048) + int(skip));
         }
@@ -220,13 +219,13 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                     if (capture)
                         hy4::RunPreparedEngram(w, s, layer, row, grams[row], h);
                     else {
-                        auto table = static_cast<const uint16_t *>(
-                            w.Host(p + "engram_layer.multi_head_embedding.embedding.weight"));
+                        const auto name = p + "engram_layer.multi_head_embedding.embedding.weight";
+                        const auto *table = w.Host(name);
+                        const bool fp8 = w.meta.at(name).dtype == "E4M3";
                         auto indices = hy4::EngramRows(w, layer, grams[row]);
                         std::array<uint16_t, 16 * 96> staging;
                         for (int j = 0; j < 16; ++j)
-                            std::memcpy(staging.data() + j * 96, table + indices[j] * 96,
-                                        96 * sizeof(uint16_t));
+                            ReadEngramRow(table, fp8, indices[j], staging.data() + j * 96);
                         hy4::Engram(w, s, layer, grams[row], h, staging.data());
                     }
                 }
@@ -271,7 +270,7 @@ Hy4FlashModel::Logits Hy4FlashModel::ForwardHybrid(const std::vector<int> &token
                 std::vector<float> hostLatents(size_t(rows) * 1536), hostScores(rows * 16);
                 hy4::CopyToHost(hostLatents.data(), latents, hostLatents.size() * sizeof(float));
                 hy4::CopyToHost(hostScores.data(), scores, hostScores.size() * sizeof(float));
-                Data input(BFLOAT16, {rows, 1536}, hostLatents), index(INT32PARAM, {rows, 16});
+                Data input(w.gguf ? FLOAT32 : BFLOAT16, {rows, 1536}, hostLatents), index(INT32PARAM, {rows, 16});
                 Data score(FLOAT32, {rows, 16}, hostScores);
                 index.Allocate(false);
                 hy4::CopyToHost(index.cpuData, ids, size_t(rows) * 16 * sizeof(int));

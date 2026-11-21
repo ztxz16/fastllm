@@ -227,7 +227,7 @@ set(FASTLLM_CXX_SOURCES src/exl3.cpp src/fastllm.cpp src/pd.cpp src/models/naive
         src/models/graphllm.cpp src/models/chatglm.cpp src/models/moss.cpp src/models/llama.cpp src/models/qwen.cpp src/models/basellm.cpp src/kvmem.cpp src/models/basellmkvmem.cpp
         src/models/glm.cpp src/models/minicpm.cpp src/models/minicpm3.cpp src/models/internlm2.cpp src/models/bert.cpp src/models/moe.cpp src/models/deepseekv2.cpp src/models/deepseekv4.cpp
         src/models/deepseekv41.cpp src/models/deepseekv41_execution.cpp src/models/deepseekv41_gpu.cpp src/models/deepseekv41_hybrid.cpp src/models/deepseekv41_vision.cpp src/models/deepseekv41_dspark.cpp src/models/dots3_note.cpp
-        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/sensenova_loop.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp src/models/hy4_flash_hybrid.cpp src/models/hy4_flash_kv.cpp src/models/qwen3_next.cpp
+        src/models/phi3.cpp src/models/xlmroberta.cpp src/models/cogvlm.cpp src/models/qwen3.cpp src/models/sensenova_loop.cpp src/models/qwen3_moe.cpp src/models/hy_v3.cpp src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp src/models/hy4_flash_hybrid.cpp src/models/hy4_flash_kv.cpp src/models/hy4_flash_gguf.cpp src/models/qwen3_next.cpp
         src/models/qwen4_exp.cpp src/models/qwen4_exp_moe.cpp src/models/qwen4_exp_gpu.cpp
         src/models/qwen4_exp_graph.cpp src/models/qwen4_exp_gpu_graph.cpp src/models/qwen4_exp_hybrid_graph.cpp
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
@@ -1070,6 +1070,10 @@ if (UNIT_TEST)
     add_executable(parallel_topology_test test/basic/test_parallel_topology.cpp)
     target_include_directories(parallel_topology_test PRIVATE include)
     add_test(NAME parallel_topology COMMAND parallel_topology_test)
+    add_executable(hy4_gguf_wire_test test/basic/test_hy4_gguf_wire.cpp)
+    target_link_libraries(hy4_gguf_wire_test PRIVATE fastllm)
+    add_test(NAME hy4_gguf_wire COMMAND hy4_gguf_wire_test)
+    set_tests_properties(hy4_gguf_wire PROPERTIES PASS_REGULAR_EXPRESSION "PASS: HY4 scalar E4M3")
     add_executable(weight_source_test test/basic/test_weight_source.cpp)
     target_link_libraries(weight_source_test PRIVATE fastllm)
     add_test(NAME weight_source COMMAND weight_source_test)

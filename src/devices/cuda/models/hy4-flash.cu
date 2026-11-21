@@ -10,6 +10,7 @@ extern "C" cublasHandle_t getFastllmCublasHandle();
 #include <cub/device/device_radix_sort.cuh>
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
@@ -221,10 +222,26 @@ __global__ static void warpGemv(Hy4View w, const float *input, float *out, const
         }
     }
 }
+__global__ static void projectionBias(float *y, Hy4View bias, int count) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) y[i] += read(bias.data, bias.type, i);
+}
+static void ProjectQ8(Scratch &s, Hy4View v, const float *x, float *y, int rows) {
+    const size_t bytes = FastllmCudaQ8ProjectionScratchBytes(rows, v.cols);
+    auto scratch = s.Get("ggufQ8Activation", (bytes + sizeof(float) - 1) / sizeof(float));
+    FastllmCudaProjectQ8_0(x, v.data, y, scratch, rows, v.cols, v.rows);
+}
 static void Linear(Weights &w, Scratch &s, const std::string &name, const float *x, float *y,
                    bool roundOutput = true, const int *ids = nullptr, int slots = 1, int routesPerInput = 0,
                    const std::string &biasName = {}) {
     auto v = w.View(name, s.device);
+    if (v.type == 4) {
+        if (ids || slots != 1) throw std::runtime_error("Unsupported routed HY4 Q8_0 projection");
+        ProjectQ8(s, v, x, y, 1);
+        if (!biasName.empty()) projectionBias<<<(v.rows + 255) / 256, 256>>>(y, w.View(biasName, s.device), v.rows);
+        return;
+    }
+    roundOutput = roundOutput && !v.floatMath;
     if (v.type == 2) {
         const int rows = routesPerInput ? (slots - 1) / routesPerInput + 1 : 1;
         float *qx = s.Get("quantInput", size_t(rows) * v.cols);
@@ -304,6 +321,8 @@ static void LinearBatch(Weights &w, Scratch &s, const std::string &name, const f
         return;
     }
     auto v = w.View(name, s.device);
+    if (v.type == 4) return ProjectQ8(s, v, x, y, rows);
+    roundOutput = roundOutput && !v.floatMath;
     if (v.type == 2)
         x = QuantizeRows(s, x, rows, v.cols);
     dim3 grid((v.rows + 3) / 4, (rows + 3) / 4);
@@ -383,7 +402,8 @@ __device__ static void normRow(const float *x, Hy4View w, float *y, int width, f
     float inv = rsqrtf(reduce(sum) / width + eps);
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
         float v = x[i] * inv;
-        y[i] = bf((roundFirst ? bf(v) : v) * (w.data ? read(w.data, w.type, i) : 1.f));
+        const float weight = w.data ? read(w.data, w.type, i) : 1.f;
+        y[i] = w.floatMath ? v * weight : bf((roundFirst ? bf(v) : v) * weight);
     }
 }
 __global__ static void norm(const float *x, Hy4View w, float *y, int width, float eps, bool roundFirst,
@@ -422,8 +442,13 @@ __global__ static void embed(Hy4View w, int token, float *h, const StepInput *st
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (step)
         token = step->token;
-    if (i < 4 * w.cols)
-        h[i] = read(w.data, w.type, size_t(token) * w.cols + i % w.cols);
+    if (i >= 4 * w.cols) return;
+    const size_t col = size_t(token) * w.cols + i % w.cols;
+    if (w.type == 4) {
+        // Q8_0 blocks contain a half scale followed by 32 signed bytes.
+        const auto *block = static_cast<const int8_t *>(w.data) + col / 32 * 34;
+        h[i] = __half2float(*reinterpret_cast<const half *>(block)) * block[2 + col % 32];
+    } else h[i] = read(w.data, w.type, col);
 }
 void Embed(Weights &w, Scratch &s, int token, float *h) {
     auto v = w.View("model.embed_tokens.weight", s.device);
@@ -450,7 +475,7 @@ __global__ static void hc(const float *h, const float *mix, Hy4View bias, Hy4Vie
         float v = 0;
         for (int j = 0; j < 4; j++)
             v += h[j * d + i] * pre[j];
-        out[i] = bf(v);
+        out[i] = bias.floatMath ? v : bf(v);
     }
 }
 constexpr int HcWidth = 3072, HcInputs = 4 * HcWidth, HcTiles = HcInputs / 512;
@@ -508,7 +533,7 @@ __global__ static void hcMixOutput(const float *h, const float *partial, int row
     float value = 0;
     for (int j = 0; j < 4; j++)
         value += h[j * HcWidth + col] * pre[j];
-    out[col] = bf(value);
+    out[col] = bias.floatMath ? value : bf(value);
 }
 static void HyperPre(Weights &w, Scratch &s, const std::string &prefix, float *h, float *x, float *post, bool head) {
     auto name = prefix + (head ? "hc_head_fn" : "hc_fn");
@@ -542,7 +567,8 @@ __global__ static void hcMixNorm(const float *streams, const float *partials, Hy
         v.z = fmaf(x.z, pre[j], v.z);
         v.w = fmaf(x.w, pre[j], v.w);
     }
-    float local[4] = {bf(v.x), bf(v.y), bf(v.z), bf(v.w)};
+    float local[4] = {v.x, v.y, v.z, v.w};
+    if (!weight.floatMath) for (float &a : local) a = bf(a);
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         mixed[col + j] = local[j];
@@ -555,11 +581,15 @@ __global__ static void hcMixNorm(const float *streams, const float *partials, Hy
             sum = fmaf(mixed[i], mixed[i], sum);
     }
     const float inv = rsqrtf(reduce(sum) / HcWidth + 1.e-5f);
+    auto normalize = [&](float x, int k) {
+        float gamma = read(weight.data, weight.type, k);
+        return weight.floatMath ? x * inv * gamma : bf(bf(x * inv) * gamma);
+    };
     float4 y;
-    y.x = bf(bf(local[0] * inv) * read(weight.data, weight.type, col));
-    y.y = bf(bf(local[1] * inv) * read(weight.data, weight.type, col + 1));
-    y.z = bf(bf(local[2] * inv) * read(weight.data, weight.type, col + 2));
-    y.w = bf(bf(local[3] * inv) * read(weight.data, weight.type, col + 3));
+    y.x = normalize(local[0], col);
+    y.y = normalize(local[1], col + 1);
+    y.z = normalize(local[2], col + 2);
+    y.w = normalize(local[3], col + 3);
     reinterpret_cast<float4 *>(input + size_t(token) * HcWidth)[tid] = y;
 }
 void HyperPreNorm(Weights &w, Scratch &s, const std::string &prefix, const std::string &normName,
@@ -594,12 +624,14 @@ __global__ static void hcPostNorm(float *streams, const float *branch, const flo
         for (int i = threadIdx.x; i < HcWidth; i += 256)
             sum = fmaf(x[i], x[i], sum);
         float inv = rsqrtf(reduce(sum) / HcWidth + 1.e-5f);
-        value = bf(bf(value * inv) * read(weight.data, weight.type, col));
+        const float gamma = read(weight.data, weight.type, col);
+        value = weight.floatMath ? value * inv * gamma : bf(bf(value * inv) * gamma);
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
         float &h = streams[(size_t(token) * 4 + j) * HcWidth + col];
-        h = bf(fmaf(posts[token * 4 + j], value, h));
+        const float next = fmaf(posts[token * 4 + j], value, h);
+        h = weight.floatMath ? next : bf(next);
     }
 }
 void HyperPostNorm(Weights &w, Scratch &s, const std::string &normName, float *streams, const float *branch,
@@ -610,26 +642,26 @@ void HyperPostNorm(Weights &w, Scratch &s, const std::string &normName, float *s
     else
         hcPostNorm<true><<<blocks, 256>>>(streams, branch, posts, w.View(normName, s.device));
 }
-__global__ static void activate(const float *gate, const float *up, float *out, int width, bool routed) {
+__global__ static void activate(const float *gate, const float *up, float *out, int width, bool routed, bool floatMath = false) {
     int i = blockIdx.x * blockDim.x + threadIdx.x, slot = blockIdx.y;
     if (i >= width)
         return;
     const float *g = gate + size_t(slot) * 2 * width;
     float a = routed ? fminf(g[i], 10.f) : g[i], b = up ? up[i] : fminf(10.f, fmaxf(-10.f, g[width + i]));
-    out[size_t(slot) * width + i] = bf(bf(a * sigmoid(a)) * b);
+    out[size_t(slot) * width + i] = floatMath ? a * sigmoid(a) * b : bf(bf(a * sigmoid(a)) * b);
 }
 static void DenseMlp(Weights &w, Scratch &s, const std::string &p, const float *x, float *out) {
     const int width = w.meta.at(p + "gate_proj.weight").dims[0];
     auto a = s.Get("denseGate", width), b = s.Get("denseUp", width), mid = s.Get("denseMid", width);
     Linear(w, s, p + "gate_proj.weight", x, a);
     Linear(w, s, p + "up_proj.weight", x, b);
-    activate<<<(width + 255) / 256, 256>>>(a, b, mid, width, false);
+    activate<<<(width + 255) / 256, 256>>>(a, b, mid, width, false, w.gguf);
     Linear(w, s, p + "down_proj.weight", mid, out);
 }
-__global__ static void denseBatchActivation(const float *gate, const float *up, float *out, int size) {
+__global__ static void denseBatchActivation(const float *gate, const float *up, float *out, int size, bool floatMath) {
     int i = blockIdx.x * 256 + threadIdx.x;
     if (i < size)
-        out[i] = bf(bf(gate[i] * sigmoid(gate[i])) * up[i]);
+        out[i] = floatMath ? gate[i] * sigmoid(gate[i]) * up[i] : bf(bf(gate[i] * sigmoid(gate[i])) * up[i]);
 }
 template <bool Draft>
 static void DenseMlpRows(Weights &w, Scratch &s, const std::string &p, const float *input, float *output,
@@ -651,7 +683,7 @@ static void DenseMlpRows(Weights &w, Scratch &s, const std::string &p, const flo
             LinearBatch(w, s, p + "gate_proj.weight", x, gate, n);
             LinearBatch(w, s, p + "up_proj.weight", x, up, n);
         }
-        denseBatchActivation<<<(size + 255) / 256, 256>>>(gate, up, mid, size);
+        denseBatchActivation<<<(size + 255) / 256, 256>>>(gate, up, mid, size, w.gguf);
         LinearBatch(w, s, p + "down_proj.weight", mid, out, n);
     }
 }
@@ -758,10 +790,10 @@ void ResidentExperts(Weights &w, Scratch &s, int layer, const float *x, const in
         sumExperts<<<dim3(6, count), 256>>>(down, expertIds, score + first * 16, out + size_t(first) * 1536);
     }
 }
-__global__ static void add(float *x, const float *y, int n) {
+__global__ static void add(float *x, const float *y, int n, bool floatMath = false) {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i < n)
-        x[i] = bf(x[i] + y[i]);
+        x[i] = floatMath ? x[i] + y[i] : bf(x[i] + y[i]);
 }
 void CombineExpertsBatch(Weights &w, Scratch &s, int layer, const float *input, const float *routed,
                          float *out, int rows) {
@@ -769,7 +801,7 @@ void CombineExpertsBatch(Weights &w, Scratch &s, int layer, const float *input, 
     auto shared = s.Get("batchShared", size_t(rows) * 3072);
     NormalizedDenseMlpRows<false>(w, s, p + "shared_experts.", input, shared, rows);
     LinearBatch(w, s, p + "routed_expert_up_proj.weight", routed, out, rows);
-    add<<<rows * 12, 256>>>(out, shared, rows * 3072);
+    add<<<rows * 12, 256>>>(out, shared, rows * 3072, w.gguf);
 }
 void ProjectHead(Weights &w, Scratch &s, float *h, float *values, Data *draftHidden, int position,
                  int draftWidth, int rows) {
@@ -1230,7 +1262,7 @@ static HashParams HashConfig(Weights &w, int layer, const std::string &p) {
     if (w.config["engram_seed"].int_value() != 0)
         throw std::runtime_error("Unsupported Engram hash seed");
     HashParams m{};
-    auto &v = factors.at(layer);
+    const auto &v = w.gguf ? w.engramFactors.at(layer) : factors.at(layer);
     std::copy(v.begin(), v.end(), m.factors);
     auto &orders = w.config["engram_layer_head_vocab_sizes"][std::to_string(layer + 1)];
     int64_t offset = 0;
@@ -1248,10 +1280,13 @@ static HashParams HashConfig(Weights &w, int layer, const std::string &p) {
     return m;
 }
 __host__ __device__ static int64_t rowId(int head, int a, int b, int c, HashParams m, const int *map) {
-    auto ma = map[a >= 0 && a < m.mapSize ? a : m.pad], mb = map[b >= 0 && b < m.mapSize ? b : m.pad];
-    int64_t mixed = ma * m.factors[0] ^ mb * m.factors[1];
+    auto compressed = [&](int token) -> uint64_t {
+        int id = token >= 0 && token < m.mapSize ? map[token] : -1;
+        return id >= 0 ? id : map[m.pad];
+    };
+    uint64_t mixed = compressed(a) * m.factors[0] ^ compressed(b) * m.factors[1];
     if (head >= 8)
-        mixed ^= map[c >= 0 && c < m.mapSize ? c : m.pad] * m.factors[2];
+        mixed ^= compressed(c) * m.factors[2];
     return m.offsets[head] + mixed % m.sizes[head];
 }
 std::array<int64_t, 16> EngramRows(Weights &w, int layer, const std::array<int, 3> &ids) {
@@ -1265,7 +1300,8 @@ std::array<int64_t, 16> EngramRows(Weights &w, int layer, const std::array<int, 
 }
 struct HostEngramInput {
     HashParams config;
-    const uint16_t *table = nullptr;
+    const void *table = nullptr;
+    bool scalarFp8 = false;
     const int *lookup = nullptr;
     uint16_t *staging = nullptr;
     const uint16_t *mapped = nullptr;
@@ -1280,7 +1316,8 @@ void PrepareEngramInput(Weights &w, Scratch &s, int layer, int row, const std::a
         auto input = std::make_shared<HostEngramInput>();
         const auto p = "model.layers." + std::to_string(layer) + ".engram_layer.";
         input->config = HashConfig(w, layer, p);
-        input->table = static_cast<const uint16_t *>(w.Host(p + "multi_head_embedding.embedding.weight"));
+        input->scalarFp8 = w.meta.at(p + "multi_head_embedding.embedding.weight").dtype == "E4M3";
+        input->table = w.Host(p + "multi_head_embedding.embedding.weight");
         input->lookup = static_cast<const int *>(w.Host(p + "lookup_table"));
         Check(cudaHostAlloc(&input->staging, 16 * 96 * sizeof(uint16_t), cudaHostAllocPortable | cudaHostAllocMapped));
         cudaPointerAttributes attr{};
@@ -1293,7 +1330,7 @@ void PrepareEngramInput(Weights &w, Scratch &s, int layer, int row, const std::a
     auto &in = *static_cast<HostEngramInput *>(entry.get());
     for (int head = 0; head < 16; ++head) {
         auto k = rowId(head, ids[0], ids[1], ids[2], in.config, in.lookup);
-        std::memcpy(in.staging + head * 96, in.table + k * 96, 96 * sizeof(uint16_t));
+        ReadEngramRow(in.table, in.scalarFp8, k, in.staging + head * 96);
     }
 }
 void RunPreparedEngram(Weights &w, Scratch &s, int layer, int row, const std::array<int, 3> &ids,
@@ -1303,7 +1340,7 @@ void RunPreparedEngram(Weights &w, Scratch &s, int layer, int row, const std::ar
            input->mapped ? EngramRowStorage::Mapped : EngramRowStorage::Pinned);
 }
 __global__ static void gather(const __nv_bfloat16 *table, const int *map, HashParams m, int a, int b, int c,
-                              bool staged, float *output, const StepInput *step) {
+                              bool staged, bool quantize, float *output, const StepInput *step) {
     if (step) {
         a = step->token;
         b = step->previous;
@@ -1312,6 +1349,10 @@ __global__ static void gather(const __nv_bfloat16 *table, const int *map, HashPa
     int h = blockIdx.x, i = threadIdx.x;
     int64_t row = staged ? h : rowId(h, a, b, c, m, map);
     float v = i < 96 ? __bfloat162float(table[row * 96 + i]) : 0;
+    if (!quantize) {
+        if (i < 96) output[h * 96 + i] = v;
+        return;
+    }
     float scale = bf(fmaxf(reduce<true>(fabsf(v)), 1.e-12f) / 448.f);
     if (i < 96) {
         float quant = float(__nv_fp8_e4m3(bf(v / scale)));
@@ -1320,7 +1361,14 @@ __global__ static void gather(const __nv_bfloat16 *table, const int *map, HashPa
         output[h * 96 + i] = bf(v + bf(restored - v));
     }
 }
-__global__ static void engramGate(const float *a, const float *b, float *out) {
+__global__ static void engramGate(const float *a, const float *b, float *out, bool floatMath) {
+    if (floatMath) {
+        float dot = 0;
+        for (int i = threadIdx.x; i < 3072; i += blockDim.x) dot = fmaf(a[i], b[i], dot);
+        dot = reduce(dot) * rsqrtf(3072.f);
+        if (threadIdx.x == 0) *out = sigmoid(copysignf(sqrtf(fmaxf(fabsf(dot), 1.e-6f)), dot));
+        return;
+    }
     float dot = 0;
     for (int i = threadIdx.x; i < 3072; i += blockDim.x)
         dot += bf(a[i] * b[i]);
@@ -1331,12 +1379,16 @@ __global__ static void engramGate(const float *a, const float *b, float *out) {
 __global__ static void engramAdd(float *h, const float *signal, Hy4View gamma, Hy4View scale,
                                  const float *gate) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gamma.floatMath) {
+        h[i] += signal[i] * read(gamma.data, gamma.type, i) * (*gate + read(scale.data, scale.type, i));
+        return;
+    }
     float v = bf(signal[i] * read(gamma.data, gamma.type, i));
     h[i] = bf(h[i] + bf(bf(*gate * v) + bf(v * read(scale.data, scale.type, i))));
 }
 void Engram(Weights &w, Scratch &s, int layer, const std::array<int, 3> &ids, float *h,
             const uint16_t *rows, EngramRowStorage storage) {
-    if (ids[0] == w.config["engram_pad_id"].int_value() || ids[0] == 120120 || ids[0] == 120124)
+    if (w.SkipEngram(ids[0]))
         return;
     auto p = "model.layers." + std::to_string(layer) + ".engram_layer.";
     auto m = HashConfig(w, layer, p);
@@ -1357,14 +1409,16 @@ void Engram(Weights &w, Scratch &s, int layer, const std::array<int, 3> &ids, fl
         map = (const int *)w.Device(p + "lookup_table", s.device);
         table = (const __nv_bfloat16 *)w.Device(p + "multi_head_embedding.embedding.weight", s.device);
     }
-    gather<<<16, 128>>>(table, map, m, ids[0], ids[1], ids[2], rows != nullptr, emb, s.step);
+    gather<<<16, 128>>>(table, map, m, ids[0], ids[1], ids[2], rows != nullptr, !w.gguf, emb, s.step);
     EngramNormWeights norms;
     for (int j = 0; j < 16; j++)
         norms.head[j] = w.View(p + "lookup_per_head_norms." + std::to_string(j) + ".weight", s.device);
     normEngramHeads<<<16, 128>>>(emb, norms);
     auto signal = s.Get("engramValue", 3072), gates = s.Get("engramGates", 4);
     Linear(w, s, p + "value_proj.weight", emb, signal, true, nullptr, 1, false, p + "value_proj.bias");
-    norm<<<1, 256>>>(signal, {}, signal, 3072, 1.1920929e-7f, false);
+    Hy4View unit;
+    unit.floatMath = w.gguf;
+    norm<<<1, 256>>>(signal, unit, signal, 3072, 1.1920929e-7f, false);
     for (int j = 0; j < 4; j++) {
         auto id = std::to_string(j);
         float *k = s.Get("engramKey", 3072), *q = s.Get("engramQuery", 3072);
@@ -1372,9 +1426,9 @@ void Engram(Weights &w, Scratch &s, int layer, const std::array<int, 3> &ids, fl
                p + "key_projs." + id + ".bias");
         norm<<<1, 256>>>(k, w.View(p + "norm_key." + id + ".weight", s.device), k, 3072, 1.1920929e-7f,
                          false);
-        norm<<<1, 256>>>(h + 3072 * j, w.View(p + "norm_query." + id + ".weight", s.device), q, 3072,
+        norm<<<1, 256>>>(h + 3072 * j, (w.gguf ? unit : w.View(p + "norm_query." + id + ".weight", s.device)), q, 3072,
                          1.1920929e-7f, false);
-        engramGate<<<1, 256>>>(k, q, gates + j);
+        engramGate<<<1, 256>>>(k, q, gates + j, w.gguf);
         engramAdd<<<12, 256>>>(h + 3072 * j, signal, w.View(p + "unified_pre_gamma", s.device),
                                w.View(p + "unified_per_hc_scales." + id, s.device), gates + j);
     }

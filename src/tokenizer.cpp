@@ -18,6 +18,10 @@ namespace py = pybind11;
 #endif
 namespace fastllm {
     namespace {
+        // HY v4 and JoyAI publish the same three regex splits before ByteLevel BPE.
+        bool UsesSplitBPE(const std::string &pre) {
+            return pre == "joyai-llm" || pre == "hy_v4";
+        }
         struct UnicodeRange { uint32_t first, last; uint8_t mask; };
         constexpr UnicodeRange unicodeCategories[] = {
 #include "unicode-categories.inc"
@@ -230,7 +234,7 @@ namespace fastllm {
             return;
         }
         float score = now->score;
-        if (preTokenizer == "joyai-llm") {
+        if (UsesSplitBPE(preTokenizer)) {
             auto rank = bpeMergeRanks.find(std::string(symbols[l].s + symbols[l].pos, symbols[l].len) + " " +
                                           std::string(symbols[r].s + symbols[r].pos, symbols[r].len));
             if (rank == bpeMergeRanks.end()) return;
@@ -532,7 +536,7 @@ namespace fastllm {
             std::string &s = const_cast<std::string &>(ori);
             std::vector<float> v;
             auto encodePlain = [&](const std::string &plain) {
-                if (preTokenizer == "joyai-llm") {
+                if (UsesSplitBPE(preTokenizer)) {
                     for (const auto &part : DeepSeekV41PreTokens(plain)) {
                         auto ids = BytePairEncode(Normalize(part, false));
                         v.insert(v.end(), ids.begin(), ids.end());
@@ -582,7 +586,7 @@ namespace fastllm {
                         v.push_back(nextSpecialToken);
                     }
                 }
-            } else if (preTokenizer == "joyai-llm") {
+            } else if (UsesSplitBPE(preTokenizer)) {
                 encodePlain(ori);
             } else {
                 std::string ns = Normalize(ori);
@@ -779,7 +783,7 @@ namespace fastllm {
     }
 
     std::string Tokenizer::DecodeTokens(const std::vector<int> &tokens) {
-        if (preTokenizer == "joyai-llm") {
+        if (UsesSplitBPE(preTokenizer)) {
             std::string decoded;
             for (int id : tokens) {
                 const auto &token = tokenToStringDict.at(id);

@@ -393,6 +393,23 @@ bool FastllmCudaGGUFPrefillSupported(fastllm::DataType inputType, int weightType
     return false;
 }
 
+std::size_t FastllmCudaQ8ProjectionScratchBytes(int rows, int columns) {
+    return size_t(rows) * (columns / QK8_1) * sizeof(block_q8_1);
+}
+
+void FastllmCudaProjectQ8_0(const float *input, const void *weight, float *output, void *scratch,
+                            int rows, int columns, int outputs) {
+    auto q = static_cast<block_q8_1 *>(scratch);
+    ggml_backend_cuda_context ctx;
+    quantize_row_q8_1_cuda(input, q, columns, rows, 1, columns, GGML_TYPE_Q8_1, cudaStreamPerThread);
+    for (int row = 0; row < rows; row += MMVQ_MAX_BATCH_SIZE) {
+        const int n = std::min(rows - row, int(MMVQ_MAX_BATCH_SIZE));
+        ggml_cuda_op_mul_mat_vec_q_impl(ctx, GGML_TYPE_Q8_0, columns, outputs, 1, 0, 0, 0, 0,
+            static_cast<const char *>(weight), reinterpret_cast<const char *>(q + size_t(row) * (columns / QK8_1)),
+            output + size_t(row) * outputs, nullptr, 0, outputs, n, columns, cudaStreamPerThread);
+    }
+}
+
 bool FastllmCudaMatMulFloatGGUF(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
     if ((ggml_type)weight.ggmlType == GGML_TYPE_BF16) {
         return FastllmCudaMatMulBFloat16(
