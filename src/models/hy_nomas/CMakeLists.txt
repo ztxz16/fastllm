@@ -56,7 +56,7 @@ if(UNIT_TEST)
 endif()
 
 if(BUILD_HY_NOMAS)
-    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp parallel_model.cpp noise.cu)
+    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp parallel_model.cpp noise.cu reference.cu)
     target_link_libraries(fastllm_nomas PRIVATE fastllm_continuous)
     target_compile_options(fastllm_nomas PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>

@@ -19,6 +19,7 @@ function renderAgentRuntime() {
   const busy = state.agentRuntimeRequest || ["checking", "unchecked", "installing"].includes(phase);
   elements.agentRuntimeCard.classList.toggle("hidden", phase === "ready"
     || !document.getElementById("video-studio").classList.contains("hidden")
+    || !document.getElementById("interactive-studio").classList.contains("hidden")
     || !document.getElementById("image-studio").classList.contains("hidden"));
   elements.installAgentRuntime.disabled = busy || runtime.supported === false;
   elements.installAgentRuntime.textContent = t(phase === "installing" ? "Installing…"

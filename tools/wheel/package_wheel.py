@@ -34,6 +34,26 @@ def audit_elf(path, max_glibc):
             'rpath': re.findall(r'\((?:RUNPATH|RPATH)\).*?\[(.*?)\]', dynamic)}
 
 
+def stage_demo_assets(source, package):
+    # Copy from current sources even when the binaries were built earlier.
+    demo_files = set()
+    for src, folder, names in (
+        ('qwen_image', 'qwen_image_assets', ('demo.html', 'openapi.json')),
+        ('lingbot_world', 'lingbot_world_assets', ('demo.html', 'server.py', 'convert_assets.py')),
+        ('duo', 'duo_assets', ('live.html', 'avc-player.js', 'presets/default.txt',
+                               'presets/default-256x192.bf16', 'presets/default-512x384.bf16')),
+        ('minimax_h3', 'h3_assets', ('demo.html', 'openapi.json')),
+        ('minimax_h3_image', 'h3_image_assets', ('demo.html', 'openapi.json')),
+        ('fastllm_pytools/ui_plugins/studio', 'h3_image_assets', ('image-workspace.js', 'image-workspace.css')),
+    ):
+        for name in names:
+            target = package / folder / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / 'tools' / src / name, target)
+            demo_files.add(target.relative_to(package.parent).as_posix())
+    return demo_files
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ['source-dir', 'build-dir', 'output-dir', 'max-glibc', 'cxx', 'strip', 'do-strip']:
@@ -63,17 +83,7 @@ def main():
         for name in ('qwen_image_server', 'qwen_image_generate'):
             shutil.copy2(build / 'cuda/src/models/qwen_image' / name, package / name)
         shutil.copy2(build / 'cuda/libfastllm_qwen_image.so', package / 'libfastllm_qwen_image.so')
-        (package / 'qwen_image_assets').mkdir()
-        for name in ('demo.html', 'openapi.json'):
-            shutil.copy2(source / 'tools/qwen_image' / name, package / 'qwen_image_assets' / name)
-        (package / 'h3_assets').mkdir()
-        for name in ('demo.html', 'openapi.json'):
-            shutil.copy2(source / 'tools/minimax_h3' / name, package / 'h3_assets' / name)
-        (package / 'h3_image_assets').mkdir()
-        for name in ('demo.html', 'openapi.json'):
-            shutil.copy2(source / 'tools/minimax_h3_image' / name, package / 'h3_image_assets' / name)
-        for name in ('image-workspace.js', 'image-workspace.css'):
-            shutil.copy2(source / 'tools/fastllm_pytools/ui_plugins/studio' / name, package / 'h3_image_assets' / name)
+        demo_files = stage_demo_assets(source, package)
         numa = Path(output(args.cxx, '-print-file-name=libnuma.so').strip())
         if not numa.is_file():
             raise RuntimeError('libnuma.so not found; install libnuma-dev in the build environment')
@@ -104,14 +114,12 @@ def main():
             expected = {'ftllm/libfastllm_tools.so', 'ftllm/libfastllm_tools-cpu.so',
                         'ftllm/libnuma.so.1', 'ftllm/libfastllm_minimax_h3.so',
                         'ftllm/minimax_h3_server', 'ftllm/minimax_h3_generate',
-                        'ftllm/h3_assets/demo.html', 'ftllm/h3_assets/openapi.json',
                         'ftllm/minimax_h3_image_server', 'ftllm/minimax_h3_image_generate',
-                        'ftllm/h3_image_assets/demo.html', 'ftllm/h3_image_assets/openapi.json',
-                        'ftllm/h3_image_assets/image-workspace.js', 'ftllm/h3_image_assets/image-workspace.css',
                         'ftllm/libfastllm_qwen_image.so', 'ftllm/qwen_image_server', 'ftllm/qwen_image_generate',
-                        'ftllm/qwen_image_assets/demo.html', 'ftllm/qwen_image_assets/openapi.json'}
-            if not expected <= set(archive.namelist()):
-                raise RuntimeError('Wheel is missing required native libraries')
+                        'ftllm/nomas_demo.html', 'ftllm/ui_plugins/studio/nomas-cafe.webp'}
+            missing = (expected | demo_files) - set(archive.namelist())
+            if missing:
+                raise RuntimeError('Wheel is missing: ' + ', '.join(sorted(missing)))
         target = dest / wheel.name
         # Publish only after the complete wheel passes the audit and archive checks.
         with tempfile.NamedTemporaryFile(prefix='.wheel-', dir=dest, delete=False) as tmp:

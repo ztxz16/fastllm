@@ -116,7 +116,7 @@ BF16 模式保留 FP32 GEMM 累加；PixelUMM 使用 BF16 部分输出及归约�
 
 ```bash
 mkdir -p /path/to/nomas-prompts
-for name in online_user_video_rewriter_system_prompt online_user_video_rewriter_first_turn; do
+for name in online_user_video_rewriter_system_prompt online_user_video_rewriter_first_turn online_user_video_rewriter_intermediate_turn; do
   curl -fL "https://raw.githubusercontent.com/Tencent-Hunyuan/Hy-Nomas/9d80c58616538eef721b9c489cb1ec4e12cdb2a3/apps/prompts/${name}.md" \
     -o "/path/to/nomas-prompts/${name}.md"
 done
@@ -145,19 +145,25 @@ CUDA_VISIBLE_DEVICES=0 ftllm server /path/to/Hy-Nomas/PE \
 
 若服务分别运行在容器中，应使用容器内可达的 PE 地址，并挂载提示词目录。`/health` 的 `prompt_enhancer.enabled` 表示是否配置扩写。调用只使用 Python 标准库 HTTP 客户端，PE 推理仍由 fastllm 执行。
 
-开启后，Demo 默认自动扩写，也可以在创建前取消勾选。“观察方式”仅在启用扩写时可选；没有配置 PE 时隐藏，取消勾选扩写后禁用。API 创建请求可传 `enhance_prompt: false` 关闭扩写；`perspective` 仅用于扩写，可选择 `auto`、`first-person`、`second-person`、`third-person follow`、`third-person observer`。`auto` 保留描述中明确的第一人称要求，否则使用外部观察视角；修改沿用当前场景视角。
+开启后，Demo 默认自动扩写，也可以在创建前取消勾选。“观察方式”仅在启用扩写时可选；没有配置 PE 时隐藏，取消勾选扩写后禁用。场景创建后自动进入探索视图。用 WASD 或屏幕方向按钮移动，拖动或滑动画面后松开即可转向。单步探索时，当前片段生成期间最多保留一个后续动作，重新选择方向会替换它。在画面下方输入指令后按 Enter 发送，Shift+Enter 换行，按 / 可聚焦输入框。「纯画面」收起控件，点击「显示操作」恢复。「场景设置」可返回编辑器，再点「进入场景」继续同一个世界。
+
+API 创建请求可传 `enhance_prompt: false` 关闭扩写；`perspective` 仅用于扩写，可选择 `auto`、`first-person`、`second-person`、`third-person follow`、`third-person observer`。`auto` 保留描述中明确的第一人称要求，否则使用外部观察视角；修改沿用当前场景视角。
 
 扩写在后台任务中执行，进度阶段为 `prompt_enhancement`。创建和修改描述时调用 PE，移动、转向和重复按描述继续生成复用已完成的扩写。原始 `prompt` 保留用于编辑，`enhanced_prompt` 返回实际送入生成模型的场景 JSON；页面提供展开查看入口。扩写失败会令任务失败，不会悄悄退回原提示词。
 
-当前接入使用官方系统提示词和首轮格式，场景修改参考上一份扩写文本，尚未输入历史画面。原生 Demo 每次生成固定帧数，因此仅保留本次时间窗内的动作，不将 PE 的未来动作压缩到当前片段。场景文本最多接受 1200 个编码 token，超限会报错；这不是官方完整的多轮视觉扩写流程。
+首轮扩写记录人物和环境。后续扩写使用官方后续回合格式，把环境变化写入 `description_change`，人物动作写入 `contained_actions`。送进文本编码器前，动作起止时间换算为本段的相对时间。PE 可见首轮和上一轮的文本描述。场景文本最多接受 1200 个编码 token。
 
 ## 5. 使用网页 Demo
 
 输入场景描述并创建世界后，使用 W/A/S/D 移动、方向键调整视角，也可点击界面按钮。“连续探索”会自动提交后续动作，点击停止可结束自动探索。
 
-“修改当前场景”保留当前世界和历史，并在下一段应用新描述。修改成功后，移动和转向会继续探索该场景；“重建场景”则清空历史并创建新世界。场景修改和长期探索仍可能出现语义偏差或画面漂移。
+场景创建后，在“下一条指令”里输入环境变化或人物动作，点击“发送指令”即可沿着当前场景生成。展开“场景设置”可调整起始条件并重建场景。场景修改和长期探索仍可能出现语义偏差或画面漂移。
 
-默认分辨率为 384×224，可选最高 512×288；需要减少生成资源占用时可降低分辨率。切换到“独立短视频”可单独生成一段视频。网页以 PNG 帧播放结果，不输出可直接渲染的三维网格。
+默认分辨率为 384×224，可选最高 512×384；需要减少生成资源占用时可降低分辨率。切换到“独立短视频”可单独生成一段视频。网页以 PNG 帧播放结果，不输出可直接渲染的三维网格。
+
+在交互世界中选取「起始参考图」并填写初始描述。浏览器按所选尺寸等比缩放并居中补黑边，把 RGB24 像素传给服务。C++/CUDA 编码器使用 PixelUMM_FT 权重中的 `encoder.*`，处理 120 个重复的像素帧，一次写入 30 帧潜变量的场景历史。页面显示解码结果的最后 12 帧。带参考图的网页会话为每条文本指令生成 120 帧，移动和转向每次生成 20 帧。
+
+API 创建请求可传 `reference_rgb`（恰好 `width * height * 3` 字节的 RGB24，使用标准 Base64 编码）。`text_frames` 可选 20 到 120 之间的 20 的倍数，默认 20。场景的 `generated_frames` 统计可播放帧数，`model_frames` 包含完整的参考图历史。后续 PATCH 可直接传官方结构化提示词字符串，或用 `{"kind":"environment","prompt":"the falling rain stops"}`、`{"kind":"action","prompt":"lifts the white mug and offers it once"}` 指定指令类型。提交 `follow_prompt` 应用修改。
 
 世界和任务索引保存在服务内存中，刷新页面可恢复当前服务中的场景，服务重启后需要重新创建。
 

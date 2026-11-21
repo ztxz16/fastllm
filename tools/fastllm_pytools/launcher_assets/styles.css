@@ -169,16 +169,14 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 
 
 .projects-card,
-.configuration-card,
-.download-card {
+.configuration-card {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: white;
   box-shadow: var(--shadow);
 }
 .projects-card { margin-top: 0; padding: 0; border: 0; border-radius: 0; box-shadow: none; }
-.configuration-card,
-.download-card { padding: 18px; }
+.configuration-card { padding: 18px; }
 .profile-editor-modal {
   position: fixed;
   inset: 0;
@@ -487,6 +485,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .studio-toolbar select { max-width: 260px; }
 .studio-toolbar .selected { outline: 2px solid var(--primary); }
 .image-studio { overflow: auto; flex: 1; width: 100%; }
+#interactive-studio { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+#interactive-frame { flex: 1; width: 100%; min-height: 0; border: 0; }
 .video-studio { overflow: auto; flex: 1; width: 100%; }
 .gpu-choices { display: flex; flex-wrap: wrap; gap: 8px 16px; }
 .gpu-choices label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
@@ -719,51 +719,90 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .form-actions { justify-content: flex-end; margin-top: 17px; }
 
 .view-hero.compact-hero,
-.view-hero.hardware-hero,
-.view-hero.download-hero { min-height: 128px; }
+.view-hero.hardware-hero { min-height: 128px; }
 
-.download-catalog { display: grid; gap: 12px; margin-top: 2px; }
-.download-catalog-group { padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); background: linear-gradient(135deg, #ffffff 0%, #f8fbf9 100%); box-shadow: var(--shadow); }
-.download-catalog-group.accent-violet { background: linear-gradient(135deg, #ffffff 0%, #faf8ff 100%); }
-.download-catalog-group.accent-orange { background: linear-gradient(135deg, #ffffff 0%, #fffaf3 100%); }
-.download-catalog-group.accent-slate { background: linear-gradient(135deg, #ffffff 0%, #f7f9fb 100%); }
-.download-catalog-heading { display: flex; align-items: center; gap: 18px; cursor: pointer; list-style: none; }
-.download-catalog-heading::-webkit-details-marker { display: none; }
-.download-catalog-heading::before { content: "›"; flex-shrink: 0; color: var(--primary); font-size: 17px; line-height: 1; transition: transform .15s ease; }
-.download-catalog-group[open] > .download-catalog-heading::before { transform: rotate(90deg); }
-.download-catalog-heading > div { flex-shrink: 0; }
-.download-catalog-heading > p { margin-left: auto; }
-.download-catalog-eyebrow { color: var(--primary); font-size: 9px; font-weight: 780; letter-spacing: 1.2px; }
-.download-catalog-group h2 { margin-top: 4px; font-size: 15px; letter-spacing: -.2px; }
-.download-catalog-group p { max-width: 560px; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.5; }
-.download-catalog-models { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-top: 14px; }
-.download-model-option { display: grid; gap: 5px; min-width: 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255, 255, 255, .82); color: var(--ink); text-align: left; cursor: pointer; transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease, background .16s ease; }
-.download-model-option:hover, .download-model-option:focus-visible { border-color: #93c8ab; background: white; box-shadow: 0 6px 16px rgba(29, 74, 51, .1); transform: translateY(-1px); }
-.download-model-option[aria-pressed="true"] { border-color: var(--primary); background: var(--primary-soft); box-shadow: inset 0 0 0 1px var(--primary); }
-.download-model-option strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-.download-model-option small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+/* Model downloads */
+#view-download [hidden] { display: none; }
+.download-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin: 0 0 19px; }
+.download-header h1 { font-size: 28px; line-height: 1.25; letter-spacing: -.8px; }
+#download-catalog-count { color: var(--muted); font-size: 13px; }
+.download-categories, #download-versions { min-width: 0; padding: 0; margin: 0; border: 0; }
+.download-categories { display: flex; flex-wrap: wrap; gap: 5px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.download-categories label { position: relative; cursor: pointer; }
+.download-categories input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.download-categories span { display: block; padding: 8px 14px; border: 1px solid transparent; border-radius: 8px; color: var(--muted); font-weight: 550; }
+.download-categories label:last-child { margin-inline-start: auto; }
+.download-categories label:last-child span { border-color: var(--line); }
+.download-categories label:hover span { color: var(--ink); background: var(--surface-soft); }
+.download-categories input:checked + span { color: var(--primary-dark); background: var(--primary-soft); border-color: var(--primary); }
+.download-categories input:focus-visible + span { outline: 2px solid var(--primary); outline-offset: 2px; }
 
-.download-layout { display: grid; grid-template-columns: minmax(0, 1fr) 310px; align-items: start; gap: 14px; margin-top: 14px; }
-.download-status-card {
-  position: sticky;
-  top: 0;
-  padding: 23px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: white;
-  box-shadow: var(--shadow);
-}
-.download-status-icon { display: grid; width: 46px; height: 46px; margin-bottom: 17px; place-items: center; border-radius: 13px; background: var(--primary-soft); color: var(--primary); font-size: 19px; font-weight: 740; }
-.download-status-card > span { color: var(--primary); font-size: 11px; font-weight: 760; letter-spacing: 1.15px; }
-.download-status-card h2 { margin-top: 7px; font-size: 17px; }
-.download-status-card > p { min-height: 48px; margin-top: 8px; color: var(--muted); font-size: 11px; line-height: 1.55; }
-.download-progress-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 18px; color: var(--muted); font-size: 11px; }
-.download-progress-heading strong { color: var(--primary); }
-.download-stat-list { display: grid; gap: 9px; margin-top: 17px; padding-top: 5px; border-top: 1px solid var(--line); }
-.download-stat-list > div { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding-top: 8px; font-size: 11px; }
-.download-stat-list span { color: var(--subtle); }
-.download-stat-list strong { max-width: 68%; overflow-wrap: anywhere; color: #50596a; text-align: right; }
-.download-status-card > .secondary-button { width: 100%; margin-top: 18px; }
+.download-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .56fr); align-items: start; gap: clamp(18px, 2.8vw, 40px); padding-top: 22px; }
+.download-catalog { display: grid; min-width: 0; gap: 22px; }
+.download-family { display: grid; gap: 6px; }
+.download-family > span, #download-versions legend, .download-checkout h2 { font-size: 13px; font-weight: 650; }
+.download-family select { width: 100%; height: 46px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); color: var(--ink); font: inherit; font-size: 19px; font-weight: 650; cursor: pointer; }
+#download-versions { margin-top: 20px; }
+#download-options { display: grid; gap: 4px; margin-top: 8px; }
+.download-model-option { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 11px; min-height: 41px; padding: 8px 13px; border: 1px solid transparent; border-radius: 7px; background: var(--surface-soft); cursor: pointer; }
+.download-model-option:hover { border-color: var(--line-strong); }
+.download-model-option:has(input:checked) { background: var(--primary-soft); border-color: var(--primary); }
+.download-model-option:has(input:focus-visible) { outline: 2px solid var(--primary); outline-offset: 1px; }
+.download-model-option input { width: 16px; height: 16px; accent-color: var(--primary); margin: 0; cursor: pointer; }
+.download-model-option strong { font-size: 13px; font-weight: 620; overflow-wrap: anywhere; }
+.download-model-option small { max-width: 20ch; color: var(--muted); font-size: 12px; text-align: end; font-variant-numeric: tabular-nums; }
+.download-model-option:has(input:checked) small { color: var(--primary-dark); }
+#download-note:not(:empty) { margin: 9px 1px 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+
+#download-source-panel { border-top: 1px solid var(--line); padding-top: 14px; }
+#download-source-panel summary, .download-advanced summary { list-style: none; cursor: pointer; }
+#download-source-panel summary::-webkit-details-marker, .download-advanced summary::-webkit-details-marker { display: none; }
+#download-source-panel > summary, .download-advanced summary { display: flex; align-items: center; gap: 8px; min-height: 32px; font-size: 13px; font-weight: 650; }
+#download-source-panel summary::after, .download-advanced summary::after { content: ""; justify-self: end; width: 6px; height: 6px; margin: 0 3px 3px auto; flex: none; border: solid var(--muted); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
+#download-source-panel[open] > summary::after, #download-sources details[open] > summary::after, .download-advanced[open] > summary::after { transform: rotate(225deg); margin-bottom: -3px; }
+#download-source-count { font-size: 11px; font-weight: 450; color: var(--muted); }
+#download-sources { list-style: none; padding: 0; margin: 3px 0 0; }
+#download-sources li + li { border-top: 1px solid var(--line); }
+#download-sources summary { display: grid; grid-template-columns: minmax(95px, .7fr) minmax(0, 1.5fr) 10px; align-items: baseline; gap: 8px; padding: 10px 2px; font-size: 12px; overflow-wrap: anywhere; }
+#download-sources summary:hover { color: var(--primary-dark); }
+#download-sources summary span, #download-sources code { color: var(--muted); }
+#download-sources code { display: block; padding: 10px 12px; margin: 0 0 8px; border-radius: 6px; background: var(--surface-soft); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.65; }
+
+.download-checkout { position: sticky; top: 0; min-width: 0; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 13px; background: var(--surface); align-self: start; }
+.download-receipt { padding: 21px; background: #183e35; color: #f5fbf8; }
+.download-receipt h2 { margin: 0 0 6px; color: #c5e4d6; font-weight: 500; }
+#download-selection { display: block; font-size: 17px; line-height: 1.35; letter-spacing: -.25px; overflow-wrap: anywhere; }
+#download-estimate { display: flex; flex-wrap: wrap; align-items: baseline; gap: 3px 7px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #ffffff30; }
+#download-estimate small { flex-basis: 100%; color: #cbddd5; font-size: 12px; }
+#download-estimate strong { font-size: 34px; line-height: 1.18; font-weight: 620; font-variant-numeric: tabular-nums; letter-spacing: -1.3px; }
+#download-estimate span { font-size: 16px; color: #c5e4d6; }
+:root[data-theme="dark"] .download-receipt { background: #203649; }
+:root[data-theme="dark"] .download-receipt :is(h2, small, span) { color: #c2d9eb; }
+.download-checkout-controls { padding: 18px 20px 12px; }
+.download-path { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+#download-target { min-width: 0; height: 37px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); color: var(--ink); font-size: 12px; }
+.download-path .secondary-button { padding-inline: 12px; }
+#download-cache-hint, .download-advanced small { display: block; margin-top: 6px; color: var(--muted); font-size: 11px; line-height: 1.55; }
+#download-review { display: none; }
+#download-start { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 40px; margin: 15px 0 12px; }
+#download-start .icon { width: 16px; height: 16px; }
+.download-advanced { border-top: 1px solid var(--line); padding: 2px 0; }
+.download-advanced summary { color: var(--muted); font-weight: 500; font-size: 12px; }
+.download-advanced .form-grid, #download-command { margin: 5px 0 12px; }
+#download-command { padding: 10px; border-radius: 6px; background: var(--surface-soft); color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.55; }
+#download-validation .validation-message { background: var(--danger-soft); color: var(--danger); }
+
+.download-transfer { padding: 14px 17px; margin: 0 0 18px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--surface-soft); }
+.download-transfer-head, .download-transfer-footer, .download-transfer-stats { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; justify-content: space-between; }
+.download-transfer-head h2 { font-size: 15px; }
+.download-transfer-head strong { color: var(--primary-dark); font-variant-numeric: tabular-nums; }
+.download-transfer[data-phase="failed"] h2 { color: var(--danger); }
+#download-status-message, .download-transfer-stats, #download-destination { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+#download-status-message, .download-transfer-stats, .download-transfer-footer { margin-top: 8px; }
+.download-transfer-stats { justify-content: flex-start; }
+.download-transfer-stats strong { font-weight: 550; color: var(--ink); }
+#download-destination { min-width: 0; flex: 1 1 180px; }
+
 .terminal-card { margin-top: 15px; overflow: hidden; border: 1px solid #292f40; border-radius: 15px; background: #151923; box-shadow: 0 14px 34px rgba(24, 28, 43, 0.14); }
 .terminal-heading { display: grid; grid-template-columns: 90px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 12px 15px; border-bottom: 1px solid #282e3e; background: #1b202c; }
 .terminal-heading > div { display: flex; gap: 6px; }
@@ -857,6 +896,13 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 .webui-placeholder h1 { font-size: 22px; font-weight: 600; }
 .webui-placeholder p { max-width: 560px; color: var(--muted); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
 
+@media (min-width: 1241px) and (max-width: 1550px) {
+  .workspace:has(#view-download.active) .service-controls { gap: 12px; }
+  .workspace:has(#view-download.active) .service-selector-label select { max-width: 165px; }
+  .workspace:has(#view-download.active) .topbar-status small { display: none; }
+  .workspace:has(#view-download.active) .topbar :is(button, .service-selector-label > span) { white-space: nowrap; }
+  .workspace:has(#view-download.active) .inference-status-bar { gap: 6px; padding-left: 8px; }
+}
 @media (max-width: 1240px) {
   .topbar { flex-basis: auto; min-height: 54px; padding-block: 8px; }
   .workspace-breadcrumb { display: none; }
@@ -880,8 +926,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .page-scroll { padding: 20px 22px; }
   .workspace-shortcut { padding: 12px; gap: 10px; }
   .workspace-shortcut small { line-height: 1.6; }
-  .download-layout { grid-template-columns: minmax(0, 1fr) 260px; }
-  .download-status-card { padding: 18px; }
+  .download-layout { grid-template-columns: minmax(0, 1fr) 275px; gap: 18px; }
 }
 @media (max-width: 900px) {
   .workspace-shortcuts { gap: 10px; }
@@ -889,8 +934,11 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .projects-header { gap: 15px; }
   .projects-header h1 { font-size: 22px; }
   .projects-header .primary-button { padding-inline: 12px; }
-  .download-layout { grid-template-columns: 1fr; }
-  .download-status-card { position: static; }
+  .download-layout { grid-template-columns: minmax(0, 1fr); }
+  .download-catalog { display: contents; }
+  .download-release { grid-row: 1; }
+  .download-checkout { position: static; grid-row: 2; }
+  #download-source-panel { grid-row: 3; }
   .four-columns { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .launcher-address-card { grid-template-columns: 1fr; }
   .launcher-address-list { justify-content: flex-start; }
@@ -949,8 +997,6 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .editor-navigation { gap: 1px; }
   .editor-navigation button { flex: 1; min-width: 0; padding: 10px 4px; font-size: 11px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
   #profile-parameters > .form-section, #profile-parameters > .advanced-section { scroll-margin-top: 95px; }
-  .download-catalog-heading { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; }
-  .download-catalog-heading > p { grid-column: 2; margin-left: 0; }
   .configuration-mode-options, .automatic-mode-options { grid-template-columns: 1fr; }
   .configuration-mode-card { padding: 13px; }
   .configuration-mode-card small { margin-top: 4px; }
@@ -974,6 +1020,32 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 @media (max-height: 920px) and (min-width: 681px) {
   .sidebar-tip { display: none; }
   .sidebar-footer { padding-top: 16px; }
+}
+@media (max-width: 680px) {
+  .app-shell:has(#view-download.active) .navigation { display: flex; flex-flow: row nowrap; overflow-x: auto; gap: 4px; align-items: center; padding: 2px; }
+  .app-shell:has(#view-download.active) .navigation > .sidebar-heading:not(.agent-heading) { display: none; }
+  .app-shell:has(#view-download.active) .navigation > :is(.nav-button, .plugin-manager-button) { position: static; width: auto; min-height: 36px; flex: none; flex-direction: row; gap: 5px; margin: 0; padding: 6px 9px; }
+  .app-shell:has(#view-download.active) .nav-button strong { white-space: nowrap; min-height: 0; font-size: 11px; }
+  .app-shell:has(#view-download.active) .agent-heading { margin: 0 4px; gap: 4px; }
+  body:has(#view-download.active) .toast-region { bottom: calc(70px + env(safe-area-inset-bottom)); }
+  .app-shell:has(#view-download.active) .page-scroll { scroll-padding-bottom: 80px; }
+  #view-download { padding-bottom: calc(65px + env(safe-area-inset-bottom)); }
+  #download-checkout-title { scroll-margin-top: 12px; }
+  .download-checkout .download-cart-action { position: fixed; z-index: 3; inset: auto 0 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 9px 16px calc(9px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line-strong); background: var(--surface); box-shadow: 0 -3px 12px #00000009; }
+  #download-review { display: grid; gap: 3px; min-width: 0; padding: 2px 0; background: transparent; color: var(--ink); text-align: start; cursor: pointer; }
+  #download-review span { font-size: 11px; color: var(--muted); }
+  #download-review strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .download-cart-action #download-start { min-width: 120px; margin: 0; }
+  .download-checkout .download-advanced:first-of-type { margin-top: 12px; }
+  .download-header { gap: 5px 10px; margin-bottom: 12px; }
+  .download-header h1 { font-size: 24px; }
+  .download-categories { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; padding-bottom: 11px; }
+  .download-categories label:last-child { margin: 0; }
+  .download-categories span { padding: 7px 3px; height: 100%; display: grid; place-content: center; text-align: center; font-size: 12px; }
+  .download-layout { padding-top: 14px; }
+  #download-versions { margin-top: 13px; }
+  .download-receipt { padding: 16px; }
+  .download-checkout-controls { padding: 14px 16px 8px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
@@ -1022,11 +1094,11 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
 :root[data-theme="dark"] .sidebar { background: var(--surface); }
 :root[data-theme="dark"] .topbar { background: var(--surface-soft); }
 :root[data-theme="dark"] :is(.launcher-address-card, .projects-card, .configuration-card,
-  .download-card, .folder-picker-window, .confirmation-window, .folder-picker-up,
+  .folder-picker-window, .confirmation-window, .folder-picker-up,
   .modal-close-button, .automatic-config-dialog, .automatic-config-status,
   .shortcut-icon, .project-action, .field input, .field select, .field textarea,
   .advanced-section[open] > summary, .switch-field, .hybrid-inference-section .switch-field,
-  .download-status-card, .hardware-status, .hardware-card, .toast,
+  .hardware-status, .hardware-card, .toast,
   .agent-runtime-card, .webui-content) { background: var(--surface); }
 :root[data-theme="dark"] :is(.sidebar-tip, .folder-picker-location, .folder-picker-list,
   .confirmation-actions, .empty-profile, .empty-profile-icon, .folder-picker-button) {
@@ -1040,7 +1112,7 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospac
   .configuration-mode-card strong, .speculative-auto-option strong,
   .automatic-config-status strong, .section-title strong, .field > span, .field > label,
   .field input, .field select, .field textarea, .advanced-section > summary strong,
-  .switch-field strong, .download-stat-list strong, .hardware-row strong, .toast) { color: var(--ink); }
+  .switch-field strong, .hardware-row strong, .toast) { color: var(--ink); }
 :root[data-theme="dark"] :is(.folder-picker-close, .folder-picker-location label,
   .folder-picker-up, .folder-picker-entry-arrow, .folder-picker-placeholder,
   .folder-picker-status, .confirmation-copy p, .modal-close-button > span:first-child,

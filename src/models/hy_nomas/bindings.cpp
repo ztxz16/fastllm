@@ -227,6 +227,32 @@ void *fastllm_nomas_world_create(void *pipeline,const char *prompt,int width,int
         return ctx.pipeline.createWorld(prompt,width,height,seed,steps).release();
     } catch(const std::exception &e) { lastError=e.what(); return nullptr; }
 }
+int fastllm_nomas_world_reference(void *pipeline,void *world,const uint8_t *rgb,size_t bytes,
+                                  uint8_t *preview,size_t capacity,fastllm::nomas::Progress progress,void *user) {
+    try {
+        lastError.clear();
+        if(!pipeline || !world || !rgb || !preview) throw std::invalid_argument("missing reference buffer");
+        auto &ctx=*static_cast<PipelineHandle *>(pipeline); std::lock_guard<std::mutex> lock(ctx.mutex);
+        auto &state=*static_cast<fastllm::nomas::WorldState *>(world);
+        if(capacity<size_t(state.width)*state.height*3*12) throw std::invalid_argument("reference preview buffer too small");
+        auto pixels=ctx.pipeline.initializeReference(state,rgb,bytes,progress,user);
+        std::memcpy(preview,pixels.data(),pixels.size()); return 0;
+    } catch(const std::exception &e) { lastError=e.what(); return -1; }
+}
+int fastllm_nomas_world_text_segment(void *pipeline,void *world,const char *prompt,int frames,
+                                     uint8_t *rgb,size_t capacity,fastllm::nomas::Progress progress,void *user) {
+    try {
+        lastError.clear();
+        if(!pipeline || !world || !prompt || !rgb || frames<20 || frames>120 || frames%20)
+            throw std::invalid_argument("invalid text segment");
+        auto &ctx=*static_cast<PipelineHandle *>(pipeline); std::lock_guard<std::mutex> lock(ctx.mutex);
+        auto &state=*static_cast<fastllm::nomas::WorldState *>(world);
+        if(capacity<size_t(state.width)*state.height*3*frames) throw std::invalid_argument("segment RGB buffer too small");
+        std::string caption(prompt);
+        auto pixels=ctx.pipeline.stepWorld(state,9,progress,user,&caption,frames);
+        std::memcpy(rgb,pixels.data(),pixels.size()); return 0;
+    } catch(const std::exception &e) { lastError=e.what(); return -1; }
+}
 void fastllm_nomas_world_destroy(void *pipeline,void *world) {
     if(!pipeline) return;
     auto &ctx=*static_cast<PipelineHandle *>(pipeline); std::lock_guard<std::mutex> lock(ctx.mutex);

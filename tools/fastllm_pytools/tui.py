@@ -65,10 +65,11 @@ MODELSCOPE_MODEL_CHOICES: Sequence[Choice] = _flatten_modelscope_model_choices()
 @dataclass
 class DeployConfig:
     name: str = ""
-    backend: str = "llm"
     visible_gpus: str = ""
-    server_binary: str = ""
     base_model: str = ""
+    nomas_text_encoder: str = ""
+    duo_assets: str = ""
+    duo_intent_cache: str = ""
     output_dir: str = ""
     video_gpu_memory_limit: str = ""
     video_host_memory_limit: str = ""
@@ -133,6 +134,11 @@ class DeployConfig:
     config_mode: str = "custom"
     enable_speculative_decoding: bool = False
     low_gpu_mem: bool = False
+
+    @property
+    def backend(self):
+        from .model_service import identify_model
+        return identify_model(self.model).backend
 
 
 @dataclass
@@ -773,9 +779,10 @@ def default_model_name_from_path(model_path: str) -> str:
 
 
 def effective_model_name(config: DeployConfig) -> str:
-    if config.backend != "llm":
-        from .service_backends import get_backend
-        return get_backend(config).model_name(config)
+    from .service_backends import get_backend
+    backend = get_backend(config)
+    if backend.kind != "llm":
+        return backend.model_name(config)
     return config.model_name.strip() or default_model_name_from_path(config.model)
 
 
@@ -1017,7 +1024,7 @@ def _runtime_auto_config(config: DeployConfig) -> DeployConfig:
     """Keep service settings and explicit auto overrides, excluding manual fields."""
     if config.backend != "llm" or config.config_mode != "auto" or config.command != "server":
         return config
-    service_fields = ("name", "backend", "visible_gpus", "command", "model", "model_name", "host", "port",
+    service_fields = ("name", "visible_gpus", "command", "model", "model_name", "host", "port",
                       "api_key", "hide_input", "config_mode", "auto_gpu_memory_limit",
                       "auto_host_memory_limit", "force_ddr_limit", "mmproj",
                       "extra_args", "env_vars", *AUTO_TUNING_OPTIONS)
@@ -1201,9 +1208,11 @@ def _add_speculative_options(argv: List[str], config: DeployConfig):
 
 
 def build_fastllm_argv(config: DeployConfig) -> List[str]:
-    if config.backend != "llm":
-        from .service_backends import get_backend
-        return get_backend(config).argv(config)
+    from .service_backends import get_backend
+    backend = get_backend(config)
+    if backend.kind != "llm":
+        from .media_server import server_argv
+        return server_argv(config, backend)
     config = _normalize_speculative_config(config)
     argv = ["ftllm", config.command]
     model = _expand_user_path(config.model.strip())
@@ -1316,7 +1325,7 @@ def validate_config(config: DeployConfig, field_errors: Optional[List[dict]] = N
     try:
         backend = get_backend(config)
     except ValueError as error:
-        backend_errors.append({"message": str(error), "fields": ["backend"]})
+        backend_errors.append({"message": str(error), "fields": ["model"]})
         backend = None
     try:
         visible_gpu_environment(config.visible_gpus)

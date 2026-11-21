@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,11 @@ class H(BaseHTTPRequestHandler):
    self.answer({'error':{'message':'unauthorized'}},401); return False
   return True
  def do_GET(self):
+  if args.kind in ('duo','hy_nomas'):
+   if self.path in ('/health', '/resolutions'): return self.answer({'ready':True})
+   if self.path.endswith('/events'): return self.answer(b'data: {}\n\n',mime='text/event-stream')
+   if self.path.endswith('/avc'): return self.answer(b'frame',mime='application/octet-stream')
+   return self.answer({'path':self.path})
   if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')), 'reference_model_available':True, 'dit_precision':'fp8', 'reference_dit_precision':'gguf', 'dit_parallel_mode':'sp', 'dit_sequence_parallel_size':2, 'dit_tensor_parallel_size':1},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
   if not self.auth(): return
   if self.path=='/v1/models': return self.answer({'data':[{'id':'stub-'+args.kind}], 'visible':os.environ.get('CUDA_VISIBLE_DEVICES')})
@@ -54,7 +60,12 @@ class H(BaseHTTPRequestHandler):
    if args.kind=='image': return self.answer(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5WQAAAAASUVORK5CYII='),mime='image/png')
    return self.answer(b'fake-mp4',mime='video/mp4')
   return self.answer(jobs[self.path.split('/')[-1]])
+ def do_PATCH(self):
+  self.answer({'data':self.rfile.read(int(self.headers.get('Content-Length','0'))).decode()})
+ def do_DELETE(self): self.answer({'method':self.command})
  def do_POST(self):
+  if args.kind in ('duo','hy_nomas'):
+   return self.answer({'path':self.path,'size':len(self.rfile.read(int(self.headers.get('Content-Length','0'))))})
   if not self.auth(): return
   if self.path.endswith('/cancel'):
    job=jobs[self.path.split('/')[-2]]; job['status']='cancelled'; return self.answer(job)
@@ -88,11 +99,46 @@ class ServiceTest(unittest.TestCase):
         self.worker = self.directory / "server.py"
         self.worker.write_text("#!" + sys.executable + "\n" + WORKER)
         self.worker.chmod(0o755)
+        self.models = {family: self.directory / family for family in
+                       ("llm", "minimax_h3", "minimax_h3_image", "hy_nomas", "duo", "qwen_image", "lingbot_world")}
+        for root in self.models.values():
+            root.mkdir()
+        for family, pipeline in (("minimax_h3", "MiniMaxH3ModularPipeline"), ("minimax_h3_image", "MiniMaxH3ImagePipeline"),
+                                 ("qwen_image", "QwenImage21Pipeline")):
+            (self.models[family] / "model_index.json").write_text(json.dumps({"_class_name": pipeline}))
+        for part in ("DiT/distilled", "VAE/PixelUMM_FT"):
+            (self.models["hy_nomas"] / part).mkdir(parents=True)
+        for name in ("realization", "intent", "intent_adapter", "codec", "speech"):
+            (self.models["duo"] / name).mkdir()
+        (self.models["duo"] / "realization/diffusion_pytorch_model.safetensors.index.json").write_text("{}")
+        for name in ("transformers/model.safetensors.index.json", "google/umt5-xxl/tokenizer.json",
+                     "native/t5.safetensors", "native/vae.safetensors"):
+            asset = self.models["lingbot_world"] / name
+            asset.parent.mkdir(exist_ok=True, parents=True)
+            asset.touch()
+        bin_dir = self.directory / "bin"
+        bin_dir.mkdir()
+        for name in ("minimax_h3_server", "minimax_h3_image_server", "duo_live", "libfastllm_nomas.so",
+                     "qwen_image_server", "libfastllm_lingbot.so"):
+            (bin_dir / name).symlink_to(self.worker)
+        env = patch.dict(os.environ, {"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                                      "LD_LIBRARY_PATH": str(bin_dir)})
+        env.start()
+        self.addCleanup(env.stop)
         self.commands = []
         def popen(argv, **kwargs):
             self.commands.append((argv, kwargs["env"].copy()))
-            if "-m" in argv:
+            from fastllm_pytools import cli
+            from fastllm_pytools.model_service import identify_model
+            self.assertEqual(argv[1:4], ["-m", "fastllm_pytools.cli", "server"])
+            if identify_model(argv[4]).backend == "llm":
                 argv = [str(self.worker), "--kind", "llm"] + argv[4:]
+            else:
+                with patch.dict(os.environ, kwargs["env"]), patch("os.execvpe") as execute:
+                    cli.main(argv[3:])
+                execute.assert_called_once()
+                _, native, kwargs["env"] = execute.call_args.args
+                argv = [str(self.worker), *native[1:]]
             return subprocess.Popen(argv, **kwargs)
         runtime = LauncherRuntime(str(self.directory / "profiles.json"), popen_factory=popen,
             webui_history_dir=str(self.directory / "history"),
@@ -103,9 +149,9 @@ class ServiceTest(unittest.TestCase):
         self.headers = {"X-FTLLM-Launcher-Token": "control-key"}
 
     def profile(self, backend="llm", **changes):
-        config = dict(name=backend, model=str(self.directory), backend=backend, config_mode="auto",
+        config = dict(name=backend, model=str(self.models[backend]), config_mode="auto",
             host="127.0.0.1", port=port(), api_key="test-service-key", visible_gpus="0",
-            server_binary=str(self.worker), output_dir=str(self.directory / "output"))
+            output_dir=str(self.directory / "output"))
         config.update(changes)
         return config
 
@@ -120,25 +166,143 @@ class ServiceTest(unittest.TestCase):
             time.sleep(.05)
         self.fail(str(self.pool.state()) + str(self.pool.logs()))
 
-    def test_bundled_video_backend_is_found_without_path_and_can_be_overridden(self):
+    @unittest.skipUnless(hasattr(socket, "SO_REUSEPORT"), "requires SO_REUSEPORT")
+    def test_interactive_port_reuse_after_stream_shutdown(self):
+        from fastllm_pytools.launcher import _port_is_available
+        for option in (socket.SO_REUSEADDR, socket.SO_REUSEPORT):
+            with socket.socket() as server, socket.socket() as client:
+                server.setsockopt(socket.SOL_SOCKET, option, 1)
+                server.bind(("127.0.0.1", 0))
+                address = server.getsockname()
+                server.listen()
+                client.connect(address)
+                connection, _ = server.accept()
+                self.assertFalse(_port_is_available(*address, interactive=True))
+                self.assertFalse(_port_is_available(*address))
+                connection.close()
+                self.assertEqual(client.recv(1), b"")
+            self.assertTrue(_port_is_available(*address, interactive=True))
+            if option == socket.SO_REUSEADDR and os.name != "nt":
+                self.assertTrue(_port_is_available(*address))
+
+    def test_interactive_runtime_discovery(self):
+        from fastllm_pytools import service_backends
+        root = self.directory
+        package = root / "tools/fastllm_pytools"
+        package.mkdir(parents=True)
+        duo = service_backends.BACKENDS["duo"]
+        nomas = service_backends.BACKENDS["hy_nomas"]
+        relative = Path("src/models/duo/live/duo_live")
+        binary = root / "build-duo" / relative
+        binary.parent.mkdir(parents=True)
+        binary.symlink_to(self.worker)
+        lib = root / "build-hy-nomas/libfastllm_nomas.so"
+        lib.parent.mkdir()
+        lib.touch()
+        with patch.object(service_backends, "PACKAGE", package), patch.dict(os.environ, {"PATH": "", "LD_LIBRARY_PATH": ""}):
+            self.assertEqual(duo.executable(), str(binary))
+            self.assertEqual(nomas.library(), lib)
+            packed = package / relative.name
+            packed.symlink_to(self.worker)
+            (package / lib.name).touch()
+            self.assertEqual(duo.executable(), str(packed))
+            self.assertEqual(nomas.library(), package / lib.name)
+
+    def test_interactive_profiles_and_scoped_players(self):
+        from fastllm_pytools.service_backends import BACKENDS
+        (self.directory / "tokenizer.json").touch()
+        for backend in ("hy_nomas", "duo"):
+            options = dict(api_key="", nomas_text_encoder=str(self.directory))
+            with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "5,4,3,2"}):
+                config = config_from_dict(self.profile(backend, visible_gpus="3,2,1,0", **options))
+                self.assertEqual(validate_config(config), [])
+                self.assertEqual(build_fastllm_env(config)["CUDA_VISIBLE_DEVICES"], "2,3,4,5")
+                self.assertEqual(build_fastllm_argv(config)[:3], ["ftllm", "server", config.model])
+                argv = BACKENDS[backend].argv(config)
+                if backend == "duo":
+                    self.assertEqual(argv[-1], "four")
+                    config.visible_gpus = "0,1"
+                    self.assertTrue(validate_config(config))
+                    config.visible_gpus = ""
+                    self.assertEqual(BACKENDS[backend].argv(config)[-1], "single")
+                else:
+                    self.assertEqual(argv[-2:], ["--devices", "0,1,2,3"])
+                    self.assertIn("bf16", argv)
+            def stub(cfg):
+                return [str(self.worker), "--host", "127.0.0.1", "--port", cfg.port, "--kind", backend]
+            with patch.object(BACKENDS[backend], "argv", stub):
+                session = self.start(backend, **options)
+            path = "/demos/" + session + "/"
+            self.assertEqual(self.client.get(path).status_code, 403)
+            opened = self.client.post("/api/services/" + session + "/demo", headers=self.headers)
+            self.assertEqual(opened.json(), {"url": path})
+            page = self.client.get(path)
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("text/html", page.headers["content-type"])
+            self.assertEqual(self.client.get(path + "api/runtime").status_code, 404)
+            self.assertEqual(self.pool.catalog(), [])
+            if backend == "hy_nomas":
+                sample = self.client.get(path + "nomas-cafe.webp")
+                self.assertEqual(sample.headers["content-type"], "image/webp")
+                self.assertEqual(sample.content[8:12], b"WEBP")
+                world = path + "v1/worlds/world_" + "a" * 32
+                self.assertEqual(self.client.patch(world, content=b"edit").json()["data"], "edit")
+                self.assertEqual(self.client.delete(world, headers={"origin":"https://elsewhere.test"}).status_code, 403)
+                self.assertEqual(self.client.delete(world).json()["method"], "DELETE")
+                events = self.client.get(path + "v1/videos/video_" + "a" * 32 + "/events")
+                self.assertEqual(events.content, b"data: {}\n\n")
+            else:
+                self.assertIn("DuoAvcPlayer", self.client.get(path + "avc-player.js").text)
+                self.assertEqual(self.client.post(path + "sessions?resolution=512x384").json()["path"], "/sessions?resolution=512x384")
+                custom = self.client.post(path + "sessions/custom?resolution=256x192",
+                    files={"reference_rgb": ("portrait.rgb", bytes(256 * 192 * 3), "application/octet-stream")},
+                    data={"description": "A café attendant"})
+                self.assertEqual(custom.json()["path"], "/sessions/custom?resolution=256x192")
+                self.assertGreater(custom.json()["size"], 256 * 192 * 3)
+                turn = path + "sessions/" + "b" * 32
+                self.assertEqual(self.client.post(turn + "/turns", content=b"clip").json()["size"], 4)
+                self.assertEqual(self.client.get(turn + "/turn-0/avc").content, b"frame")
+            self.pool.stop(session)
+            self.assertNotEqual(self.client.get(path).status_code, 200)
+
+    def test_automatically_detected_qwen_and_lingbot_demos(self):
+        qwen = self.start("qwen_image")
+        with patch("fastllm_pytools.service_backends.LingBotBackend.argv",
+                   lambda backend, cfg: [str(self.worker), "--kind", "hy_nomas", "--host", "127.0.0.1", "--port", cfg.port]):
+            world = self.start("lingbot_world", api_key="")
+        for session, title in ((qwen, "Qwen-Image"), (world, "LingBot")):
+            response = self.client.post(f"/api/services/{session}/demo", headers=self.headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            path = response.json()["url"]
+            self.assertIn(title, self.client.get(path).text)
+            self.assertEqual(self.client.get(path + "health").status_code, 200)
+            self.assertEqual(self.client.get(path + "sessions").status_code, 404)
+        response = self.client.post(f"/demos/{qwen}/v1/images/jobs", json={"prompt": "test"})
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(f"/demos/{world}/v1/worlds", json={"prompt": "test"})
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def test_bundled_video_backend_is_found_without_path(self):
         from fastllm_pytools import service_backends
         binary = self.directory / "minimax_h3_server"
         binary.touch()
-        config = SimpleNamespace(server_binary="")
-        with patch.object(service_backends, "__file__", str(self.directory / "service_backends.py")), \
-                patch.dict(os.environ, {"FTLLM_H3_SERVER": ""}), \
-                patch.object(service_backends.shutil, "which", return_value=None):
-            self.assertEqual(service_backends.H3Backend.executable(config), str(binary))
-            config.server_binary = str(self.worker)
-            self.assertEqual(service_backends.H3Backend.executable(config), str(self.worker))
+        binary.chmod(0o755)
+        with patch.object(service_backends, "PACKAGE", self.directory), \
+                patch.dict(os.environ, {"PATH": ""}):
+            self.assertEqual(service_backends.H3Backend.executable(), str(binary))
 
     def test_image_gguf_path_reaches_native_service_without_precision_flags(self):
         model = self.directory / "image-Q4_K_M.gguf"
-        model.write_bytes(b"GGUF")  # Payload validation belongs to the native loader.
+        def gguf_string(value):
+            raw = value.encode()
+            return struct.pack("<Q", len(raw)) + raw
+        metadata = {"general.architecture": "wan", "config": json.dumps({"transformer": {"pdd_steps": 6, "pdd_sigmas": [1]}})}
+        model.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(metadata)) + b"".join(
+            gguf_string(key) + struct.pack("<I", 8) + gguf_string(value) for key, value in metadata.items()))
         session = self.start("minimax_h3_image", model=str(model))
         self.assertTrue(self.pool.service(session).state()["ready"])
         argv = self.commands[-1][0]
-        self.assertEqual(argv[argv.index("--model") + 1], str(model))
+        self.assertEqual(argv[4], str(model))
         self.assertNotIn("--precision", argv)
 
     def test_quantized_video_manifest_and_parallel_mode(self):
@@ -211,15 +375,12 @@ class ServiceTest(unittest.TestCase):
         from fastllm_pytools import service_backends
         binary = self.directory / "minimax_h3_image_server"
         binary.touch()
-        config = SimpleNamespace(server_binary="")
-        with patch.object(service_backends, "__file__", str(self.directory / "service_backends.py")), \
-                patch.dict(os.environ, {"FTLLM_H3_IMAGE_SERVER": ""}), \
-                patch.object(service_backends.shutil, "which", return_value=None):
-            self.assertEqual(service_backends.H3ImageBackend.executable(config), str(binary))
-            config.server_binary = str(self.worker)
-            self.assertEqual(service_backends.H3ImageBackend.executable(config), str(self.worker))
+        binary.chmod(0o755)
+        with patch.object(service_backends, "PACKAGE", self.directory), \
+                patch.dict(os.environ, {"PATH": ""}):
+            self.assertEqual(service_backends.H3ImageBackend.executable(), str(binary))
         config = config_from_dict(self.profile("minimax_h3_image", video_gpu_memory_limit="4", video_host_memory_limit="2", base_model="unused"))
-        command = build_fastllm_argv(config)
+        command = service_backends.H3ImageBackend().argv(config)
         self.assertEqual(command[command.index("--device") + 1], "0")
         self.assertNotIn("--devices", command)
         self.assertNotIn("--base-model", command)
@@ -238,11 +399,12 @@ class ServiceTest(unittest.TestCase):
 
     def test_image_fp8_uses_existing_model_path(self):
         checkpoint = self.directory / "arbitrary.safetensors"
-        checkpoint.touch()
+        header = json.dumps({"pdd_proj_out.0.weight": {"dtype": "F8_E4M3"}}).encode()
+        checkpoint.write_bytes(struct.pack("<Q", len(header)) + header + b"0")
         config = config_from_dict(self.profile("minimax_h3_image", model=str(checkpoint)))
         self.assertEqual(validate_config(config), [])
         command = build_fastllm_argv(config)
-        self.assertEqual(command[command.index("--model") + 1], str(checkpoint))
+        self.assertEqual(command[2], str(checkpoint))
         self.assertNotIn("--fp8-weights", command)
 
     def test_image_memory_budget_validation(self):
@@ -501,7 +663,7 @@ class ServiceTest(unittest.TestCase):
         downloads = []
         bridge = GenerationBridge(self.pool, lambda name, body: downloads.append((name, body)))
         self.addCleanup(bridge.close)
-        command = [sys.executable, str(TOOLS / "fastllm_pytools/media_agent.py"), "--bridge", bridge.url, "--token", bridge.token]
+        command = [sys.executable, str(TOOLS / "fastllm_pytools/media_agent.py"), "--bridge", bridge.url, "--token=" + bridge.token]
         result = subprocess.run(command + ["generate", "--service", video, "--prompt", "hello", "--output", "videos/result.mp4", "--wait", "0"], cwd=self.directory, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.directory / "videos/result.mp4").read_bytes(), b"fake-mp4")
@@ -566,10 +728,12 @@ class ServiceTest(unittest.TestCase):
                 {"index": "1", "name": "Test GPU B", "uuid": "GPU-b"}]}))
             errors = []; page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"http://127.0.0.1:{server.config.port}/?token=control-key")
+            expect(page.locator("#config-path")).to_contain_text("profiles.json")
             page.locator("#language-select").select_option("en-US")
             page.locator("#new-profile").click()
-            page.locator("#model-backend").select_option("minimax_h3")
-            expect(page.locator('[data-field="server_binary"]')).to_be_visible()
+            page.locator("#model-path").fill(str(self.models["minimax_h3"]))
+            expect(page.locator("#model-backend")).to_contain_text("Pika")
+            expect(page.locator('[data-field="server_binary"], [data-field="nomas_library"]')).to_have_count(0)
             expect(page.locator('[data-field="visible_gpus"]')).to_be_visible()
             expect(page.locator('[data-field="video_gpu_memory_limit"]')).to_be_visible()
             page.locator('[data-field="video_gpu_memory_limit"]').fill("3.75")
@@ -577,14 +741,16 @@ class ServiceTest(unittest.TestCase):
             expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
             page.locator('[data-field="video_host_memory_limit"]').fill("2.5")
             self.assertTrue(page.locator('[data-field="video_host_memory_limit"]').evaluate("input => input.checkValidity()"))
-            page.locator("#model-backend").select_option("minimax_h3_image")
+            page.locator("#model-path").fill(str(self.models["minimax_h3_image"]))
+            expect(page.locator("#model-backend")).to_contain_text("H3 Image")
             expect(page.locator('[data-field="video_parallel_mode"]')).to_be_visible()
             page.locator('[data-field="video_parallel_mode"]').select_option("tp")
             expect(page.locator('[data-field="video_parallel_mode"]')).to_have_value("tp")
             expect(page.locator('[data-field="video_gpu_memory_limit"]')).to_be_visible()
             expect(page.locator('[data-field="video_host_memory_limit"]')).to_be_visible()
             expect(page.locator('[data-field="base_model"]')).not_to_be_visible()
-            page.locator("#model-backend").select_option("minimax_h3")
+            page.locator("#model-path").fill(str(self.models["minimax_h3"]))
+            expect(page.locator("#model-backend")).to_contain_text("Pika")
             page.locator('#gpu-choices input[value="1"]').check()
             expect(page.locator('[data-field="visible_gpus"]')).to_have_value("1")
             expect(page.locator("#configuration-mode-settings")).not_to_be_visible()
@@ -619,13 +785,12 @@ class ServiceTest(unittest.TestCase):
             page.locator("#language-select").select_option("zh-CN")
             expect(page.get_by_role("link", name="下载视频")).to_be_visible()
             expect(page.locator("#video-player")).to_be_visible()
+            expect(page.locator("#config-path")).to_contain_text("profiles.json")
             page.locator("#language-select").select_option("en-US")
             page.locator("#studio-chat-tab").click()
             expect(page.locator("#webui-content")).to_be_visible()
             self.assertEqual(page.locator("#studio-chat-select").input_value(), chat)
             page.locator("#studio-video-tab").click()
-            if os.environ.get("FTLLM_MEDIA_SCREENSHOT"):
-                page.screenshot(path=os.environ["FTLLM_MEDIA_SCREENSHOT"])
             self.assertEqual(errors, [])
             browser.close()
 

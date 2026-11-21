@@ -143,7 +143,9 @@ ModelSource resolveModelSource(const std::string &input) {
         for (const auto &candidate : {directory, directory / "base_model", directory / "MiniMax-H3-Image"})
             if (base(candidate))
                 found.insert(fs::canonical(candidate));
-        if (directory == directory.parent_path())
+        // A bundle supplies its base beside the quantized file. Other installed releases
+        // in the parent directory do not participate in that explicit selection.
+        if ((level == 0 && base(directory / "base_model")) || directory == directory.parent_path())
             break;
         directory = directory.parent_path();
     }

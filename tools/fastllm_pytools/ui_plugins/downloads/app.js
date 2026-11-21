@@ -15,104 +15,159 @@ import {
 const ACTIVE_DOWNLOAD_PHASES = new Set(["starting", "downloading", "cancelling"]);
 function renderDownloadValidation(errors) {
   renderValidation(elements.downloadValidation, errors, t("Download configuration is valid and ready."));
+  elements.downloadValidation.hidden = !errors.length;
+}
+
+const categoryLabels = {
+  language: "Language models", image: "Image generation", video: "Video generation",
+  world: "World models", dialogue: "Audiovisual dialogue"
+};
+
+let selectedPreset = "";
+let customDraft = null;
+let startingDownload = false;
+
+function selectedModel() {
+  for (const group of state.downloadCatalog) {
+    const model = group.models.find(item => item.preset === selectedPreset);
+    if (model) return {group, model};
+  }
+  return {};
+}
+
+function renderCategories(activeCategory) {
+  const categories = [...new Set(state.downloadCatalog.map(group => group.category)), "custom"];
+  for (const category of categories) {
+    let input = elements.downloadCategory.querySelector(`input[value="${category}"]`);
+    if (!input) {
+      input = document.createElement("input");
+      input.type = "radio";
+      input.name = "download-category";
+      input.value = category;
+      const label = document.createElement("label");
+      label.append(input, document.createElement("span"));
+      elements.downloadCategory.append(label);
+    }
+    input.checked = category === activeCategory;
+    input.nextElementSibling.textContent = category === "custom" ? t("Custom repository") : t(categoryLabels[category]);
+  }
 }
 
 function renderDownloadCatalog() {
-  const selected = elements.downloadPreset.value;
-  const expanded = new Set([...elements.downloadCatalog.querySelectorAll("details[open]")]
-    .map((group) => group.dataset.group));
-  elements.downloadPreset.replaceChildren();
-  elements.downloadCatalog.replaceChildren();
-  for (const group of state.downloadCatalog) {
-    const optgroup = document.createElement("optgroup");
-    optgroup.label = localizeServerText(group.label || group.id || t("Models"));
-    const section = document.createElement("details");
-    section.dataset.group = group.id;
-    section.open = expanded.has(group.id);
-    section.className = `download-catalog-group accent-${group.accent || "slate"}`;
-    const heading = document.createElement("summary");
-    heading.className = "download-catalog-heading";
-    const title = document.createElement("div");
-    const eyebrow = document.createElement("span");
-    eyebrow.className = "download-catalog-eyebrow";
-    eyebrow.textContent = "MODEL CLUSTER";
-    const headingText = document.createElement("h2");
-    headingText.textContent = localizeServerText(group.label || group.id || t("Models"));
-    title.append(eyebrow, headingText);
-    const description = document.createElement("p");
-    description.textContent = localizeServerText(group.description || "");
-    heading.append(title, description);
-    const models = document.createElement("div");
-    models.className = "download-catalog-models";
-    for (const model of group.models || []) {
-      const preset = model.preset || model.id;
-      const option = document.createElement("option");
-      option.value = preset;
-      option.textContent = model.label || model.id;
-      optgroup.append(option);
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "download-model-option";
-      button.dataset.preset = preset;
-      button.setAttribute("aria-pressed", preset === selected ? "true" : "false");
-      const modelLabel = document.createElement("strong");
-      modelLabel.textContent = model.label || model.id;
-      const modelMeta = document.createElement("small");
-      modelMeta.textContent = localizeServerText(model.meta || model.id);
-      button.append(modelLabel, modelMeta);
-      button.addEventListener("click", () => {
-        elements.downloadPreset.value = preset;
-        selectDownloadPreset();
-      });
-      models.append(button);
-    }
-    if (optgroup.children.length) elements.downloadPreset.append(optgroup);
-    if (models.children.length) {
-      section.append(heading, models);
-      elements.downloadCatalog.append(section);
-    }
-  }
-  const custom = document.createElement("option");
-  custom.value = "custom";
-  custom.textContent = t("Custom model ID");
-  elements.downloadPreset.append(custom);
-  elements.downloadPreset.value = [...elements.downloadPreset.options].some((option) => option.value === selected)
-    ? selected
-    : "custom";
-  const active = elements.downloadPreset.value;
-  for (const button of elements.downloadCatalog.querySelectorAll("[data-preset]")) {
-    button.setAttribute("aria-pressed", button.dataset.preset === active ? "true" : "false");
+  const {group, model} = selectedModel();
+  const catalog = state.downloadCatalog;
+  renderCategories(group?.category || "custom");
+  elements.downloadCatalogCount.textContent = t("{models} models · {versions} releases", {
+    models: catalog.length, versions: catalog.reduce((count, item) => count + item.models.length, 0)
+  });
+  const groups = catalog.filter(item => item.category === group?.category);
+  elements.downloadFamily.replaceChildren(...groups.map(item => new Option(localizeServerText(item.label), item.id)));
+  elements.downloadFamily.closest("label").hidden = !group;
+  elements.downloadVersions.hidden = !group;
+  elements.downloadSourcePanel.hidden = !group;
+  elements.downloadCacheHint.hidden = !model?.sources;
+  for (const row of elements.downloadForm.querySelectorAll("[data-custom-download]")) row.hidden = Boolean(group);
+  elements.downloadTarget.title = elements.downloadTarget.value;
+  elements.downloadTarget.scrollLeft = elements.downloadTarget.scrollWidth;
+  renderSelection(group, model);
+  if (!group) return;
+  elements.downloadFamily.value = group.id;
+  renderVersions(group, model);
+  elements.downloadNote.textContent = model.sources || model.downloadGB ? localizeServerText(model.meta || "") : "";
+  const sources = model.sources || [{repo: model.id, files: model.include ? model.include.split(",") : []}];
+  const hubs = [...new Set(sources.map(src => src.hub || "ModelScope"))];
+  elements.downloadSourceCount.textContent = hubs.join(" + ");
+  elements.downloadSources.replaceChildren();
+  for (const src of sources) {
+    const row = document.createElement("li");
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    const role = document.createElement("strong");
+    role.textContent = localizeServerText(src.label || "模型权重");
+    const repo = document.createElement("span");
+    repo.textContent = (hubs.length > 1 ? (src.hub || "ModelScope") + " · " : "") + src.repo;
+    summary.append(role, repo);
+    const scope = document.createElement("code");
+    scope.textContent = src.files.length ? src.files.map(name => {
+      const path = [src.into, src.rename?.[name] || name].filter(Boolean).join("/");
+      return path === name ? name : name + " → " + path;
+    }).join("\n") : t("Entire repository");
+    details.append(summary, scope);
+    row.append(details);
+    elements.downloadSources.append(row);
   }
 }
 
-function findDownloadModel(preset) {
-  for (const group of state.downloadCatalog) {
-    const model = (group.models || []).find((item) => (item.preset || item.id) === preset);
-    if (model) return model;
+function renderSelection(group, model) {
+  elements.downloadSelection.textContent = group
+    ? [localizeServerText(group.label), localizeServerText(model.label)].join(" · ")
+    : downloadField("modelId").value.trim() || t("Custom repository");
+  renderMobileSummary(model);
+  elements.downloadEstimate.replaceChildren();
+  if (model?.downloadGB) {
+    const label = document.createElement("small");
+    label.textContent = t("Estimated package size");
+    const size = document.createElement("strong");
+    size.textContent = String(model.downloadGB);
+    const unit = document.createElement("span");
+    unit.textContent = "GB";
+    elements.downloadEstimate.append(label, size, unit);
+  } else {
+    const hint = document.createElement("small");
+    hint.textContent = t("Size available when the download connects.");
+    elements.downloadEstimate.append(hint);
   }
-  return null;
 }
 
-function findDownloadPreset(modelId, include = "") {
-  let fallback = null;
-  for (const group of state.downloadCatalog) {
-    for (const model of group.models || []) {
-      if (model.id !== modelId) continue;
-      const preset = model.preset || model.id;
-      if (String(model.include || "") === String(include || "")) return preset;
-      if (!fallback && !model.include) fallback = preset;
+function renderMobileSummary(model) {
+  const active = ACTIVE_DOWNLOAD_PHASES.has(state.download?.phase);
+  elements.downloadReviewLabel.textContent = t(active ? "View download progress" : "Review download");
+  elements.downloadReview.setAttribute("aria-controls", active ? "download-status-title" : "download-checkout-title");
+  if (active) {
+    elements.downloadReviewValue.textContent = elements.downloadProgressValue.textContent;
+  } else {
+    elements.downloadReviewValue.textContent = model?.downloadGB
+      ? t("About {size} GB", {size: model.downloadGB}) : elements.downloadSelection.textContent;
+  }
+}
+
+function renderVersions(group, model) {
+  const list = elements.downloadOptions;
+  if (list.dataset.family !== group.id) {
+    list.replaceChildren();
+    list.dataset.family = group.id;
+    for (const variant of group.models) {
+      const row = document.createElement("label");
+      row.className = "download-model-option";
+      const input = document.createElement("input");
+      input.type = "radio";
+      input.name = "download-version";
+      input.value = variant.preset;
+      input.dataset.preset = variant.preset;
+      row.append(input, document.createElement("strong"), document.createElement("small"));
+      list.append(row);
     }
   }
-  return fallback;
+  for (const [index, variant] of group.models.entries()) {
+    const row = list.children[index];
+    row.querySelector("input").checked = variant.preset === model.preset;
+    row.querySelector("strong").textContent = localizeServerText(variant.label);
+    row.querySelector("small").textContent = variant.downloadGB
+      ? t("About {size} GB", {size: variant.downloadGB})
+      : localizeServerText(variant.meta || "");
+  }
+}
+
+function downloadField(name) {
+  return elements.downloadForm.querySelector(`[data-download-field="${name}"]`);
 }
 
 function fillDownloadForm(config) {
   for (const input of elements.downloadForm.querySelectorAll("[data-download-field]")) {
-    const value = config?.[input.dataset.downloadField];
-    input.value = value === null || value === undefined ? "" : String(value);
+    input.value = config?.[input.dataset.downloadField] ?? "";
   }
-  const modelId = String(config?.modelId || "");
-  elements.downloadPreset.value = findDownloadPreset(modelId, config?.include || "") || "custom";
+  selectedPreset = state.downloadCatalog.flatMap(group => group.models).find(model =>
+    !model.sources && model.id === config?.modelId && (model.include || "") === (config?.include || ""))?.preset || "";
   state.downloadTargetAutomatic = true;
   renderDownloadCatalog();
 }
@@ -122,56 +177,57 @@ function collectDownloadForm() {
   for (const input of elements.downloadForm.querySelectorAll("[data-download-field]")) {
     config[input.dataset.downloadField] = input.value;
   }
+  const {model} = selectedModel();
+  if (model?.sources) config.bundle = model.preset;
   return config;
 }
 
-function downloadTargetFor(modelId, include = "") {
+function downloadTargetFor(modelId, include = "", bundle = "") {
   const template = String(state.downloadDefaults?.targetDir || "");
-  const templateModel = basename(state.downloadDefaults?.modelId || "");
   const slash = Math.max(template.lastIndexOf("/"), template.lastIndexOf("\\"));
-  const root = slash >= 0 ? template.slice(0, slash) : template;
-  const separator = template.includes("\\") && !template.includes("/") ? "\\" : "/";
-  const variant = String(include || "").split(/[,;\n]/)[0].trim()
-    .replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  const name = `${basename(modelId) || templateModel || "model"}${variant ? `-${variant}` : ""}`;
-  return root ? `${root}${separator}${name}` : name;
+  const variant = include.split(/[,;\n]/)[0].trim().replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  const name = bundle || [basename(modelId) || "model", variant].filter(Boolean).join("-");
+  return template.slice(0, slash + 1) + name;
 }
 
-function selectDownloadPreset() {
-  if (elements.downloadPreset.value === "custom") {
-    renderDownloadCatalog();
-    elements.downloadForm.querySelector('[data-download-field="modelId"]').focus();
-    return;
+function selectDownloadPreset(preset) {
+  if (!selectedPreset) customDraft = collectDownloadForm();
+  selectedPreset = preset;
+  const {model} = selectedModel();
+  downloadField("modelId").value = model?.id ?? customDraft?.modelId ?? "";
+  downloadField("include").value = model ? model.include || "" : customDraft?.include || "";
+  downloadField("revision").value = model ? "master" : customDraft?.revision || "master";
+  if (state.downloadTargetAutomatic) {
+    downloadField("targetDir").value = downloadTargetFor(downloadField("modelId").value, downloadField("include").value,
+      model?.sources ? model.preset : "");
   }
-  const model = findDownloadModel(elements.downloadPreset.value);
-  if (!model) return;
-  const modelInput = elements.downloadForm.querySelector('[data-download-field="modelId"]');
-  const targetInput = elements.downloadForm.querySelector('[data-download-field="targetDir"]');
-  const includeInput = elements.downloadForm.querySelector('[data-download-field="include"]');
-  modelInput.value = model.id;
-  if (includeInput) includeInput.value = model.include || "";
-  if (state.downloadTargetAutomatic) targetInput.value = downloadTargetFor(modelInput.value, model.include);
   renderDownloadCatalog();
   scheduleDownloadPreview(0);
+}
+
+function handleCatalogChange(event) {
+  if (event.target.name === "download-category") {
+    const group = state.downloadCatalog.find(item => item.category === event.target.value);
+    selectDownloadPreset(group?.models[0].preset || "");
+    if (!group) downloadField("modelId").focus();
+  } else if (event.target.name === "download-version") {
+    selectDownloadPreset(event.target.value);
+  } else if (event.target === elements.downloadFamily) {
+    const group = state.downloadCatalog.find(item => item.id === event.target.value);
+    if (group) selectDownloadPreset(group.models[0].preset);
+  }
 }
 
 function handleDownloadChange(event) {
   if (!event.target.matches("[data-download-field]")) return;
   const field = event.target.dataset.downloadField;
-  if (field === "modelId") {
-    const includeInput = elements.downloadForm.querySelector('[data-download-field="include"]');
-    elements.downloadPreset.value = findDownloadPreset(event.target.value, includeInput?.value || "") || "custom";
-    if (state.downloadTargetAutomatic) {
-      const targetInput = elements.downloadForm.querySelector('[data-download-field="targetDir"]');
-      targetInput.value = downloadTargetFor(event.target.value, includeInput?.value || "");
-    }
-  } else if (field === "targetDir") {
-    state.downloadTargetAutomatic = false;
-  } else if (field === "include") {
-    const modelInput = elements.downloadForm.querySelector('[data-download-field="modelId"]');
-    elements.downloadPreset.value = findDownloadPreset(modelInput?.value || "", event.target.value) || "custom";
+  if (field === "modelId" && !selectedPreset) renderSelection();
+  if (field === "targetDir") {
+    state.downloadTargetAutomatic = !event.target.value;
+    event.target.title = event.target.value;
+  } else if ((field === "modelId" || field === "include") && state.downloadTargetAutomatic) {
+    downloadField("targetDir").value = downloadTargetFor(downloadField("modelId").value, downloadField("include").value);
   }
-  renderDownloadCatalog();
   scheduleDownloadPreview();
   if (event.target.matches("[data-path-input]")) schedulePathSuggestions(event.target);
 }
@@ -206,10 +262,14 @@ async function updateDownloadPreview(requestId) {
 }
 
 async function startDownload() {
+  if (startingDownload || ACTIVE_DOWNLOAD_PHASES.has(state.download?.phase)) return;
+  startingDownload = true;
+  const config = collectDownloadForm();
+  renderDownload();
   try {
     const preview = await request("/api/download/preview", {
       method: "POST",
-      body: JSON.stringify(collectDownloadForm())
+      body: JSON.stringify(config)
     });
     state.downloadPreview = preview;
     elements.downloadCommand.textContent = localizeDisplayCommand(preview.command)
@@ -221,7 +281,7 @@ async function startDownload() {
     }
     state.download = await request("/api/download/start", {
       method: "POST",
-      body: JSON.stringify(collectDownloadForm())
+      body: JSON.stringify(config)
     });
     renderDownload();
     switchView("download");
@@ -229,6 +289,9 @@ async function startDownload() {
   } catch (error) {
     showToast(friendlyError(error), "error", 7000);
     await refreshDownload();
+  } finally {
+    startingDownload = false;
+    renderDownload();
   }
 }
 
@@ -278,15 +341,15 @@ function renderDownload() {
     completed: t("Model download completed"),
     failed: t("Model download failed")
   };
-  const badges = {
-    idle: t("Not started"), starting: t("Connecting"), downloading: t("Downloading"), cancelling: t("Cancelling"),
-    cancelled: t("Cancelled"), completed: t("Completed"), failed: t("Failed")
-  };
-  elements.downloadBadge.className = `save-state ${phase === "completed" ? "saved" : phase}`;
-  elements.downloadBadge.textContent = badges[phase] || phase;
-  elements.downloadStatusTitle.textContent = titles[phase] || phase;
-  elements.downloadStatusMessage.textContent = localizeServerText(download.message) || "—";
-  elements.downloadStatusIcon.textContent = phase === "completed" ? "✓" : (phase === "failed" ? "!" : "↓");
+  elements.downloadTransfer.hidden = phase === "idle";
+  elements.downloadTransfer.dataset.phase = phase;
+  const title = titles[phase] || phase;
+  if (elements.downloadStatusTitle.textContent !== title) elements.downloadStatusTitle.textContent = title;
+  const stages = {fetch: "Fetching component", verify: "Checking component files", convert: "Converting LingBot assets on CPU"};
+  elements.downloadStatusMessage.hidden = phase === "idle" || phase === "completed";
+  elements.downloadStatusMessage.textContent = phase === "downloading" && stages[download.stage]
+    ? [t(stages[download.stage]), download.component].filter(Boolean).join(" · ")
+    : localizeServerText(download.message) || "—";
   const percent = Math.max(0, Math.min(100, Number(download.progress || 0)));
   elements.downloadProgressValue.textContent = download.progressIndeterminate
     ? t("Processing")
@@ -304,13 +367,13 @@ function renderDownload() {
   elements.downloadFiles.textContent = download.totalFiles
     ? `${download.completedFiles || 0} / ${download.totalFiles}`
     : "—";
-  elements.downloadDestination.textContent = download.destination || collectDownloadForm().targetDir || "—";
-  elements.downloadStart.disabled = active || Boolean(state.downloadPreview?.errors?.length);
+  elements.downloadDestination.textContent = download.destination || "";
+  elements.downloadStart.disabled = startingDownload || active || Boolean(state.downloadPreview?.errors?.length);
   elements.downloadCancel.classList.toggle("hidden", !active);
   elements.downloadCancel.disabled = phase === "cancelling";
   const completed = phase === "completed" && Boolean(download.destination);
   elements.downloadUseModel.classList.toggle("hidden", !completed);
-  elements.downloadUseLast.classList.toggle("hidden", !completed);
+  renderMobileSummary(selectedModel().model);
   const nav = document.querySelector('[data-view-button="download"]');
   if (active) nav.classList.add("has-activity");
   else if (state.currentView === "download") nav.classList.remove("has-activity");
@@ -343,7 +406,7 @@ function useDownloadedModel() {
 
 
 export {
-  renderDownloadValidation, renderDownloadCatalog, fillDownloadForm, selectDownloadPreset,
+  renderDownloadValidation, renderDownloadCatalog, fillDownloadForm, handleCatalogChange,
   handleDownloadChange, scheduleDownloadPreview, startDownload, cancelDownload, refreshDownload,
   renderDownload, useDownloadedModel
 };

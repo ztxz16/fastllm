@@ -53,7 +53,7 @@ def args_parser():
     shared_parser = make_normal_parser("fastllm", add_help = False)
 
     # 下载解析器
-    from .download import make_download_parser
+    from .util import make_download_parser
     download_parser = make_download_parser(add_help = False)
 
     # 打开终端部署向导
@@ -117,8 +117,10 @@ def args_parser():
 
     from .util import add_server_args
     add_server_args(shared_parser)
-    subparsers.add_parser('serve', parents = [shared_parser], help = 'api模式')
-    subparsers.add_parser('server', parents = [shared_parser], help = 'api模式')
+    from .media_server import add_media_args
+    server_parser = subparsers.add_parser('server', aliases=['serve'], parents=[shared_parser],
+                                          help='Start a model service, automatically identified from the model path')
+    add_media_args(server_parser)
 
     from .deploy import add_deploy_args
     deploy_parser = subparsers.add_parser('deploy', help='Manage independent model replicas')
@@ -152,7 +154,8 @@ def main(argv=None):
         return qwen_image_main(raw_argv[1:])
     if not raw_argv:
         raw_argv = ["launch"]
-    args = args_parser().parse_args(raw_argv)
+    parser = args_parser()
+    args = parser.parse_args(raw_argv)
     if (args.version):
         from . import __version__
         print("ftllm version: " + __version__)
@@ -191,6 +194,9 @@ def main(argv=None):
         from .launcher import fastllm_launcher
         return fastllm_launcher(args)
     elif args.command in ('server', 'serve'):
+        from .media_server import dispatch
+        if dispatch(args, parser):
+            return
         from .server import fastllm_server
         fastllm_server(args)
     elif args.command == 'deploy':

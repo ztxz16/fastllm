@@ -4,6 +4,8 @@ Uses fastllm's existing FastAPI/uvicorn dependencies and Python's standard
 library. Frames are PNG, so neither FFmpeg nor a video codec package is needed.
 """
 import argparse
+import base64
+import binascii
 import asyncio
 import ctypes as C
 from contextlib import asynccontextmanager
@@ -69,12 +71,27 @@ class WorldRequest(GenerateRequest):
     width: int = Field(default=384, ge=64, le=512, multiple_of=32, strict=True)
     height: int = Field(default=224, ge=64, le=512, multiple_of=32, strict=True)
     num_frames: Literal[20] = 20
+    reference_rgb: Optional[str] = Field(default=None, max_length=512*384*4)
+    text_frames: Literal[20, 40, 60, 80, 100, 120] = 20
 
     @model_validator(mode="after")
     def validate_area(self):
-        if self.width*self.height > 512*288:
-            raise ValueError("world resolution is limited to 147456 pixels (for example 512x288)")
+        if self.width*self.height > 512*384:
+            raise ValueError("world resolution is limited to 196608 pixels (for example 512x384)")
+        if self.reference_rgb is not None:
+            if len(self.reference_rgb) != self.width*self.height*4:
+                raise ValueError("reference_rgb must contain one fitted RGB24 frame")
+            try:
+                pixels = base64.b64decode(self.reference_rgb, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ValueError("invalid base64 reference_rgb") from exc
+            if len(pixels) != self.width*self.height*3:
+                raise ValueError("wrong decoded reference size")
         return self
+
+
+class WorldEditRequest(PromptRequest):
+    kind: Literal["prompt", "environment", "action"] = "prompt"
 
 
 class ActionRequest(BaseModel):
@@ -83,8 +100,10 @@ class ActionRequest(BaseModel):
 
 
 class WorldGenerationRequest(WorldRequest):
+    num_frames: Literal[12, 20, 40, 60, 80, 100, 120] = 20
     world_id: str
     action: Action
+    edit_kind: Literal["prompt", "environment", "action"] = "prompt"
 
 
 class NativeBackend:
@@ -105,6 +124,11 @@ class NativeBackend:
         self.lib.fastllm_nomas_world_destroy.argtypes = [C.c_void_p, C.c_void_p]
         self.lib.fastllm_nomas_world_step.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.POINTER(C.c_uint8), C.c_size_t, self.callback_type, C.c_void_p]
         self.lib.fastllm_nomas_world_step_prompt.argtypes = [C.c_void_p, C.c_void_p, C.c_char_p, C.c_int, C.POINTER(C.c_uint8), C.c_size_t, self.callback_type, C.c_void_p]
+        pixel_ptr = C.POINTER(C.c_uint8)
+        self.lib.fastllm_nomas_world_reference.argtypes = [C.c_void_p, C.c_void_p, pixel_ptr, C.c_size_t,
+                                                           pixel_ptr, C.c_size_t, self.callback_type, C.c_void_p]
+        self.lib.fastllm_nomas_world_text_segment.argtypes = [C.c_void_p, C.c_void_p, C.c_char_p, C.c_int,
+                                                              pixel_ptr, C.c_size_t, self.callback_type, C.c_void_p]
         if devices is None:
             self.handle = self.lib.fastllm_nomas_pipeline_create(str(model).encode(), str(text_encoder).encode(), device)
         else:
@@ -138,7 +162,17 @@ class NativeBackend:
                 self.worlds[request.world_id] = handle
                 if progress(1, 1, 1):
                     raise RuntimeError("generation cancelled")
-            rc = self.lib.fastllm_nomas_world_step_prompt(self.handle, self.worlds[request.world_id], request.caption().encode(), ACTIONS.index(request.action), rgb, size, callback, None)
+            handle = self.worlds[request.world_id]
+            if request.reference_rgb:
+                frame = base64.b64decode(request.reference_rgb, validate=True)
+                source = (C.c_uint8 * len(frame)).from_buffer_copy(frame)
+                rc = self.lib.fastllm_nomas_world_reference(self.handle, handle, source, len(frame), rgb, size, callback, None)
+            elif request.action == "follow_prompt" and request.num_frames != 20:
+                rc = self.lib.fastllm_nomas_world_text_segment(self.handle, handle, request.caption().encode(),
+                                                              request.num_frames, rgb, size, callback, None)
+            else:
+                rc = self.lib.fastllm_nomas_world_step_prompt(self.handle, handle, request.caption().encode(),
+                                                            ACTIONS.index(request.action), rgb, size, callback, None)
         else:
             rc = self.lib.fastllm_nomas_generate(self.handle, request.caption().encode(), request.width, request.height,
                                                 request.num_frames, request.seed, request.steps, rgb, size, callback, None)
@@ -233,11 +267,13 @@ class Jobs:
         with self.lock:
             if len(self.worlds) >= 2:
                 raise HTTPException(429, "at most two worlds; delete an old world first")
-            if sum(w["width"]*w["height"] for w in self.worlds.values())+request.width*request.height > 512*288:
+            area = request.width*request.height
+            if self.worlds and sum(w["width"]*w["height"] for w in self.worlds.values())+area > 512*288:
                 raise HTTPException(429, "world GPU cache budget reached; delete an old world or use a smaller resolution")
             world_id = "world_" + uuid.uuid4().hex
             world = dict(id=world_id, object="world", status="ready", width=request.width, height=request.height,
-                         seed=request.seed, history_segments=6, segments=0, generated_frames=0, current_job=None, latest_video=None,
+                         seed=request.seed, history_segments=6, segments=0, generated_frames=0, model_frames=0,
+                         initial_scene=None, edit_kind="prompt", current_job=None, latest_video=None,
                          prompt=request.caption(), prompt_revision=1, applied_prompt=None, applied_prompt_revision=0,
                          enhanced_prompt=None, enhancer_model=None, enhance_prompt=bool(self.enhancer and request.enhance_prompt),
                          perspective=request.perspective, request=request)
@@ -261,7 +297,15 @@ class Jobs:
             world = self.worlds[world_id]
             if world["status"] != "ready":
                 raise HTTPException(409, "world is busy, failed, or complete; wait or reset it")
-            request = WorldGenerationRequest(**world["request"].model_dump(), world_id=world_id, action=action)
+            fields = world["request"].model_dump()
+            if world["segments"]:
+                fields["reference_rgb"] = None
+            count = 12 if fields["reference_rgb"] else fields["text_frames"] if action == "follow_prompt" else 20
+            model_count = 120 if fields["reference_rgb"] else count
+            if world["model_frames"] + model_count > 2880:
+                raise HTTPException(409, "segment exceeds the model horizon; shorten it or reset the world")
+            fields["num_frames"] = count
+            request = WorldGenerationRequest(**fields, world_id=world_id, action=action, edit_kind=world["edit_kind"])
             return self.submit(request)
 
     def update_world_prompt(self, world_id, request):
@@ -273,9 +317,9 @@ class Jobs:
             if world["status"] not in ("ready", "generating"):
                 raise HTTPException(409, "world is failed, deleting, or complete; reset it")
             caption = request.caption()
-            if caption != world["prompt"]:
+            if caption != world["prompt"] or request.kind != world["edit_kind"]:
                 world["request"] = world["request"].model_copy(update={"prompt": caption, "messages": None})
-                world.update(prompt=caption, prompt_revision=world["prompt_revision"]+1)
+                world.update(prompt=caption, edit_kind=request.kind, prompt_revision=world["prompt_revision"]+1)
             return self.get_world(world_id)
 
     def delete_world(self, world_id):
@@ -320,12 +364,28 @@ class Jobs:
 
     def prepare_request(self, job):
         request = job["request"]
-        if not self.enhancer or not request.enhance_prompt:
-            return request
         with self.lock:
             world = self.worlds.get(job.get("world_id"))
             previous = world.get("enhanced_prompt") if world else None
-            cached = previous if world and world["applied_prompt"] == request.caption() else None
+            cached = previous if world and world["applied_prompt_revision"] == job["prompt_revision"] else None
+        if isinstance(request, WorldGenerationRequest) and request.edit_kind != "prompt" and not request.reference_rgb:
+            # A caller can specify the type of edit without running a language model.
+            if cached:
+                job["enhanced_prompt"] = cached
+                return request.model_copy(update={"prompt": cached, "messages": None})
+            if request.edit_kind == "environment":
+                segment = {"description_change": "Compared to the previous segment, " + request.caption(),
+                           "contained_actions": []}
+            else:
+                segment = {"contained_actions": [{"start_time": "00:00.000",
+                           "end_time": f"00:{request.num_frames/24:06.3f}",
+                           "action_description": "<Action1><|Subject1|> " + request.caption() + "</Action1>"}]}
+            prompt = json.dumps({"segments": [segment]}, ensure_ascii=False)
+            job["enhanced_prompt"] = prompt
+            return request.model_copy(update={"prompt": prompt, "messages": None})
+        if not self.enhancer or not request.enhance_prompt:
+            return request
+        with self.lock:
             job["enhancement_status"] = "cached" if cached else "in_progress"
             if not cached:
                 job["stage"] = "prompt_enhancement"
@@ -333,7 +393,10 @@ class Jobs:
             enhancement = {"model": self.enhancer.model, "prompt": cached, "source_prompt": request.caption()}
         else:
             enhancement = self.enhancer.enhance(request.caption(), seed=request.seed,
-                                               num_frames=request.num_frames, perspective=request.perspective,
+                                               num_frames=120 if getattr(request, "reference_rgb", None) else request.num_frames,
+                                               perspective=request.perspective,
+                                               initial_scene=world["initial_scene"] if world else None,
+                                               model_frames=world["model_frames"] if world else 0,
                                                previous=previous,
                                                cancelled=lambda: self.stopping.is_set() or job["cancel"].is_set())
         if self.stopping.is_set() or job["cancel"].is_set():
@@ -388,14 +451,17 @@ class Jobs:
                     job.update(status="completed", progress=100, stage="completed", completed_at=int(time.time()), total_seconds=round(time.monotonic()-started, 4))
                     if job.get("world_id"):
                         world = self.worlds[job["world_id"]]
-                        world.update(status="complete" if world["generated_frames"]+20 >= 2880 else "ready",
-                                     segments=world["segments"]+1, generated_frames=world["generated_frames"]+20,
+                        model_frames = world["model_frames"] + (120 if job["request"].reference_rgb else job["num_frames"])
+                        if not world["segments"]:
+                            world["initial_scene"] = job.get("enhanced_prompt") or job["request"].caption()
+                        world.update(status="complete" if model_frames >= 2880 else "ready", model_frames=model_frames,
+                                     segments=world["segments"]+1, generated_frames=world["generated_frames"]+job["num_frames"],
                                      latest_video=job_id, last_action=job["action"],
                                      last_text_condition=job["text_condition"],
                                      enhanced_prompt=job.get("enhanced_prompt"), enhancer_model=job.get("enhancer_model"),
                                      applied_prompt=job["request"].caption(), applied_prompt_revision=job["prompt_revision"])
                     (directory / "generation.json").write_text(
-                        json.dumps({"request": job["request"].model_dump(), "result": self.public(job)}, ensure_ascii=False, indent=2),
+                        json.dumps({"request": job["request"].model_dump(exclude={"reference_rgb"}), "result": self.public(job)}, ensure_ascii=False, indent=2),
                         encoding="utf-8")
             except Exception as exc:
                 shutil.rmtree(directory, ignore_errors=True)
@@ -431,6 +497,10 @@ def create_app(backend, output, precision="bf16", enhancer=None):
     def demo():
         return Path(__file__).with_name("nomas_demo.html").read_text()
 
+    @app.get("/nomas-cafe.webp", include_in_schema=False)
+    def demo_reference():
+        return FileResponse(Path(__file__).parent / "ui_plugins/studio/nomas-cafe.webp", media_type="image/webp")
+
     @app.get("/health")
     def health():
         return {"status": "ok", "backend": "native_cpp_cuda", "precision": precision,
@@ -441,7 +511,7 @@ def create_app(backend, output, precision="bf16", enhancer=None):
     @app.get("/v1/models")
     def models():
         return {"object": "list", "data": [{"id": "hy-nomas", "object": "model", "owned_by": "tencent-hunyuan",
-                                             "capabilities": ["text_to_video", "png_frames", "world_sessions", "camera_actions", "text_only_continuation", "live_prompt_edits", "sse_progress"], "preview": True}]}
+                                             "capabilities": ["text_to_video", "png_frames", "world_sessions", "camera_actions", "text_only_continuation", "live_prompt_edits", "image_reference", "structured_turns", "sse_progress"], "preview": True}]}
 
     @app.post("/v1/worlds", status_code=202)
     def create_world(request: WorldRequest):
@@ -452,7 +522,7 @@ def create_app(backend, output, precision="bf16", enhancer=None):
         return jobs.get_world(world_id)
 
     @app.patch("/v1/worlds/{world_id}")
-    def update_world_prompt(world_id: str, request: PromptRequest):
+    def update_world_prompt(world_id: str, request: WorldEditRequest):
         """Stage a scene description without resetting history or starting a job.
 
         Accepts prompt or user messages. Already submitted segments retain

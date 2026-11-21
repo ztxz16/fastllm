@@ -105,13 +105,16 @@ DeepSeek-V4 / V4.1 使用原生加载入口，当前推荐的格式与部署方�
 
 ### 图片与视频生成模型
 
-这些模型使用专用原生后端，入口、量化范围和多卡限制见[图片与视频生成指南](image-video.md)，不使用 LLM 的 `ftllm server` 命令。
+在启动器中选择本地模型路径，或运行 `ftllm server <模型路径>`。两种入口都根据模型元数据选择对应的原生推理服务。GPU 选择和 Demo 入口见[启动器指南](launcher.md)。
 
-| 模型 | 能力 | 启动入口 |
+| 模型 | 能力 | 模型准备与用法 |
 | --- | --- | --- |
-| MiniMax-H3 / Pika H3 Flex | 音视频生成、首尾帧、图片/视频/音频参考；Pika 固定六步 | 启动器视频后端或 `minimax_h3_server` |
-| MiniMax-H3-Image | 图片生成、单图编辑、多图参考 | 启动器图像后端或 `minimax_h3_image_server` |
-| Qwen-Image-2.1 | 图片生成、单图/多图编辑 | `ftllm qwen-image server` / `generate` |
+| MiniMax-H3 / Pika H3 Flex | 音视频生成，支持首尾帧和图片、视频、音频参考。Pika 使用 H3 基座和适配器，固定六步采样 | [视频生成](image-video.md#视频生成minimax-h3--pika-h3-flex) |
+| MiniMax-H3-Image | 图片生成、单图编辑、多图参考 | [图像生成](image-video.md) |
+| Qwen-Image-2.1 | 图片生成、单图及多图编辑 | [Qwen-Image 用法](../tools/qwen_image/README.md) |
+| HY-Nomas | 用参考图初始化场景，连续输入场景指令或相机动作 | [HY-Nomas 用法](hy_nomas.md) |
+| LingBot World 2.0 1.3B | 从起始图片创建世界会话，按相机移动或转向动作生成后续画面 | [LingBot World 用法](lingbot_world.md) |
+| Duo | 输入音视频，流式生成角色的语音和画面回复 | [Duo 用法](../tools/duo/README.md) |
 
 ### LLaMA类模型
 

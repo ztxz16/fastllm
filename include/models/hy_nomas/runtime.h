@@ -83,6 +83,7 @@ public:
     void setLinearAutotuning(bool enabled) { tuneLinear_ = enabled; }
     bool isFloat32() const { return dtype_ == DType::FP32; }
     DType dtype() const { return dtype_; }
+    int device() const { return device_; }
     ~Runtime();
     Runtime(const Runtime &) = delete;
     Runtime &operator=(const Runtime &) = delete;
@@ -355,6 +356,8 @@ struct WorldState {
 // Actions: 0 stay, 1 forward, 2 backward, 3 left, 4 right,
 // 5 look left, 6 look right, 7 look up, 8 look down.
 std::vector<float> cameraTrajectory(int frames, int action);
+std::vector<float> encodeReferenceImage(int device, const std::string &weights, int width, int height,
+                                        const uint8_t *rgb, size_t bytes);
 class Pipeline {
 public:
     Pipeline(const std::string &modelDirectory, const std::string &textDirectory, int device);
@@ -371,7 +374,14 @@ public:
     std::vector<uint8_t> stepWorld(WorldState &world, int action,
                                    Progress progress = nullptr, void *user = nullptr,
                                    const std::string *prompt = nullptr);
+    std::vector<uint8_t> stepWorld(WorldState &world, int action, Progress progress, void *user,
+                                   const std::string *prompt, int frames);
+    std::vector<uint8_t> initializeReference(WorldState &, const uint8_t *rgb, size_t bytes,
+                                             Progress, void *);
 private:
+    std::vector<uint8_t> advance(WorldState &, int action, Progress, void *, const std::string *,
+                                 int frames, std::vector<float> latent);
+    std::string pixelCheckpoint_;
     Tensor encodeWorldPrompt(const std::string &prompt);
     void unloadModels();
     Runtime rt_;
@@ -420,6 +430,12 @@ int fastllm_nomas_generate(void *handle, const char *prompt, int width, int heig
                           int frames, uint64_t seed, int steps, uint8_t *rgb,
                           size_t rgbCapacity, fastllm::nomas::Progress progress, void *user);
 void *fastllm_nomas_world_create(void *pipeline, const char *prompt, int width, int height, uint64_t seed, int steps);
+// Initialize a fresh world with 120 repeated RGB frames. Publishes the last 12 decoded frames.
+int fastllm_nomas_world_reference(void *pipeline, void *world, const uint8_t *rgb, size_t bytes,
+                                 uint8_t *preview, size_t capacity, fastllm::nomas::Progress, void *);
+// Text-directed segments may cover up to five seconds in one diffusion pass.
+int fastllm_nomas_world_text_segment(void *pipeline, void *world, const char *prompt, int frames,
+                                     uint8_t *rgb, size_t capacity, fastllm::nomas::Progress, void *);
 void fastllm_nomas_world_destroy(void *pipeline, void *world);
 int fastllm_nomas_world_step(void *pipeline, void *world, int action, uint8_t *rgb, size_t rgbCapacity,
                             fastllm::nomas::Progress progress, void *user);
