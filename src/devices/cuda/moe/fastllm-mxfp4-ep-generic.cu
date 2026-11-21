@@ -658,11 +658,13 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
 
 bool FastllmGenericEpTunedEp8(const std::vector<int> &devices) {
     if (devices.size() != 8 || !FastllmGenericEpSupported(devices)) return false;
+    constexpr int requiredShared = std::max({Smem<float, DecodeTile>, Smem<float, WideTile>,
+                                             Smem<cutlass::bfloat16_t, WideTile>});
     for (int device : devices) {
         int sms, shared;
         check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
         check(cudaDeviceGetAttribute(&shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-        if (sms != 110 || shared < Smem<float, DecodeTile>) return false;
+        if (sms != 110 || shared < requiredShared) return false;
     }
     return true;
 }
