@@ -6278,15 +6278,30 @@ namespace fastllm {
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
         std::lock_guard<std::mutex> guard(pageIndexLocker);
         PrepareFreePages(1);
-        int pageIndex = freePages.back();
-        if (pick) {
-            freePages.pop_back();
-            freePageFlags[pageIndex] = 0;
-            pageRefCount[pageIndex] = 1;
-            prefixCheckpoints.erase(pageIndex);
-            pageTimestamp[pageIndex] = ++currentTimestamp;
-        }
+        return pick ? TakeFreePageLocked() : freePages.back();
+    }
+
+    int PagedCacheManager::TakeFreePageLocked() {
+        const int pageIndex = freePages.back();
+        freePages.pop_back();
+        freePageFlags[pageIndex] = 0;
+        pageRefCount[pageIndex] = 1;
+        prefixCheckpoints.erase(pageIndex);
+        pageTimestamp[pageIndex] = ++currentTimestamp;
         return pageIndex;
+    }
+
+    void PagedCacheManager::ExtendPageIndices(std::vector<int> &pages, int total) {
+        if (total <= int(pages.size())) return;
+        pages.reserve(total);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        AssertInFastLLM(total - int(pages.size()) <= FreePageCount(), "Insufficient free KV pages.");
+        // Evict only when the next scalar allocation would. Pre-evicting the
+        // entire suffix would reverse the order of recycled physical pages.
+        while (int(pages.size()) < total) {
+            if (freePages.empty()) PrepareFreePages(1);
+            pages.push_back(TakeFreePageLocked());
+        }
     }
 
     void PagedCacheManager::PreviewUnusedPageIndices(int count, std::vector<int> &pages) {
@@ -6395,12 +6410,17 @@ namespace fastllm {
     }
 
     void PagedCacheManager::RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages) {
+        RecordPrefix(hashes, pages, pages.size());
+    }
+
+    void PagedCacheManager::RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages,
+                                         size_t completePages) {
         auto *detail = inference_trace::CurrentDetail();
         inference_trace::DetailSpan pageTrace("pages.publish.lock", detail);
         std::lock_guard<std::mutex> guard(pageIndexLocker);
         pageTrace.Next("pages.publish.work");
         const long long access = ++currentTimestamp;
-        const int count = std::min(hashes.size(), pages.size());
+        const int count = std::min({hashes.size(), pages.size(), completePages});
         CacheTrieNode *cur = trieRoot;
         for (int i = 0; i < count; ++i) {
             uint64_t hash = hashes[i];

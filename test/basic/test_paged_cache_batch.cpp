@@ -12,7 +12,8 @@ struct Fixture {
     std::vector<Data *> leaves;
     std::vector<std::vector<uint64_t>> hashes;
     std::vector<PagedCacheBatchExecutor::Publication> jobs;
-    Fixture(int n) {
+    std::vector<PagedCacheBatchExecutor::BorrowedPublication> borrowed;
+    Fixture(int n, bool borrow = false) {
         hashes.resize(3);hashes[0].resize(640);
         std::iota(hashes[0].begin(),hashes[0].end(),11);
         hashes[1]=hashes[0];hashes[1].resize(128);
@@ -27,7 +28,13 @@ struct Fixture {
         for(auto &h:hashes)for(auto &p:pools) {
             auto d=std::make_unique<Data>();d->isPagedKVCache=true;d->pagedKVCacheData=p.get();
             for(size_t i=0;i<h.size();++i)d->pageIndex.push_back(p->GetUnusedPageIndex(true));
-            jobs.push_back({p.get(),&h,d->pageIndex});
+            // The final allocated page is partial and must never be published.
+            d->pageLen=p->pageLen; d->lastPageLen=17;
+            if (borrow) borrowed.push_back({p.get(),&h,d.get()});
+            else {
+                auto complete=d->pageIndex;complete.pop_back();
+                jobs.push_back({p.get(),&h,std::move(complete)});
+            }
             leaves.push_back(d.get());caches.push_back(std::move(d));
         }
     }
@@ -51,16 +58,16 @@ static void Equal(const Fixture &a,const Fixture &b) {
     }
 }
 static void Case(int managers,int threads,bool diagnostics) {
-    Fixture a(managers),b(managers);PagedCacheBatchExecutor serial,parallel;
+    Fixture a(managers),b(managers,true);PagedCacheBatchExecutor serial,parallel;
     inference_trace::HostDetail detail;
     serial.Publish(a.jobs,1);
     if(diagnostics)inference_trace::CurrentDetail()=&detail;
-    parallel.Publish(b.jobs,threads);
+    parallel.PublishBorrowed(b.borrowed,threads);
     Require(inference_trace::CurrentDetail()==(diagnostics?&detail:nullptr),"trace TLS changed");
     inference_trace::CurrentDetail()=nullptr;
     Equal(a,b);
     // Repeat publication, including a now-stale physical ancestor path.
-    serial.Publish(a.jobs,1);parallel.Publish(b.jobs,threads);Equal(a,b);
+    serial.Publish(a.jobs,1);parallel.PublishBorrowed(b.borrowed,threads);Equal(a,b);
     serial.ReleaseReferences(a.leaves,1);
     if(diagnostics)inference_trace::CurrentDetail()=&detail;
     parallel.ReleaseReferences(b.leaves,threads);
@@ -76,8 +83,17 @@ static void Case(int managers,int threads,bool diagnostics) {
         }
         // Force eviction/recycling. Selection sequence must preserve LRU, not
         // merely the count of free pages.
-        for(int j=0;j<1500;++j)
-            Require(a.pools[i]->GetUnusedPageIndex(true)==b.pools[i]->GetUnusedPageIndex(true),"eviction order changed");
+        std::vector<int> allocated;
+        for (int end : {1, 1, 49, 1500}) {
+            const size_t first = allocated.size();
+            b.pools[i]->ExtendPageIndices(allocated, end);
+            for (size_t j = first; j < allocated.size(); ++j) {
+                const int page = a.pools[i]->GetUnusedPageIndex(true);
+                Require(page == allocated[j], "batched eviction order changed");
+                Require(a.pools[i]->pageTimestamp[page] == b.pools[i]->pageTimestamp[page],
+                        "batched page generation changed");
+            }
+        }
     }
     a.caches.clear();b.caches.clear(); // Previously released Data must not release twice.
     Equal(a,b);

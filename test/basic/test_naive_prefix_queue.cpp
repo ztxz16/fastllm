@@ -73,6 +73,59 @@ public:
     void InvalidateFullKV() {
         pages.EvictTrieSubtree(pages.trieRoot); pages.trieRoot = nullptr;
     }
+    void CheckWarmGroupRotation() {
+        // Bind empty descriptors to the expected owner so this lifecycle test
+        // needs no CUDA topology or GPU storage. A different selected owner
+        // drops the queued checkpoint in OnResponseContextCreated.
+        attentionDP = 8;
+        tpDevices = {0, 1, 2, 3, 4, 5, 6, 7};
+        auto source = prefixHistory.front();
+        prefixHistory.clear();
+        for (int device : tpDevices) {
+            auto entry = std::make_shared<PrefixSnapshot>();
+            entry->ownerDevice = device;
+            entry->length = source->length; entry->tokens = source->tokens;
+            entry->tokenHash = source->tokenHash; entry->draftReady = true;
+            entry->fullPool = source->fullPool; entry->fullPage = source->fullPage;
+            entry->fullGeneration = source->fullGeneration;
+            prefixHistory.push_back(std::move(entry));
+        }
+        auto checkOwner = [&](int expected, int affinity) {
+            ResponseContext ctx;
+            ctx.Init(1, FLOAT32, FLOAT32);
+            ctx.pdPrefillGroup = affinity;
+            ctx.currentTokens.assign(160, 1);
+            auto &key = ctx.pastKeyValues.front().first;
+            key.multiDeviceData = true; key.dataDeviceIds = {expected};
+            OnResponseContextCreated(&ctx);
+            auto hit = activePrefixes.at(&key).queued;
+            Check(hit && hit->ownerDevice == expected, "warm prefix lost its DP round-robin owner");
+            InvalidateTensorParallelCache(&key);
+            OnResponseContextRemoved(&ctx);
+        };
+        for (int turn = 0; turn < 16; ++turn) {
+            if (turn == 3) checkOwner(6, 6);
+            checkOwner(turn % 8, -1);
+        }
+        tpDevices.clear();
+        attentionDP = 1;
+    }
+    void CheckLookupValidation() {
+        const auto real = prefixHistory.front();
+        const auto collision = prefixHistory.back();
+        collision->tokenHash = real->tokenHash;
+        ResponseContext hit;
+        Create(hit, 1);
+        Check(activePrefixes.at(&hit.pastKeyValues.front().first).queued == real,
+              "fingerprint collision selected unequal tokens");
+        OnResponseContextRemoved(&hit);
+        ++real->fullGeneration;
+        ResponseContext stale;
+        Create(stale, 1);
+        Check(!activePrefixes.at(&stale.pastKeyValues.front().first).queued,
+              "stale generation was accepted");
+        OnResponseContextRemoved(&stale);
+    }
     int FreePages() const { return pages.FreePageCount(); }
 };
 
@@ -81,6 +134,8 @@ using PrefixModel = NaiveN05PrefixCacheTestAccess;
 
 int main() {
     try {
+        { PrefixModel model(2); model.CheckWarmGroupRotation(); }
+        { PrefixModel model(2); model.CheckLookupValidation(); }
         for (bool draft : {false, true}) {
             PrefixModel model(2, draft);
             ResponseContext waiting, pressure;

@@ -1308,6 +1308,50 @@ void NaiveN05FlashModel::AppendDraftContext(Data &hidden, int start, DraftContex
 #endif
 }
 
+#ifdef USE_CUDA
+bool NaiveN05FlashModel::StageOwnerRestore(PDResidentRestore &job, std::function<void()> windowCopy,
+        const std::shared_ptr<PrefixSnapshot> &snapshot, const std::shared_ptr<DraftContext> &context, int rank) {
+    if (!draftKVOnly || !draftTP || !draftTP->dataParallel || draftTP->devices != tpDevices ||
+        !draftContextStorage || !context->workspace || context->deviceRank != rank ||
+        context->kv.size() != size_t(draftLayers) || !snapshot->draftReady ||
+        !FastllmCudaPeerAccessInit(draftTP->devices)) return false;
+    const auto &storage = context->workspace->prefixStorage;
+    const int rows = std::min(snapshot->length, draftWindow - 1);
+    const size_t bytes = size_t(rows) * embed_dim * sizeof(uint16_t);
+    const auto &shard = snapshot->pool->DraftShard(snapshot->slot);
+    if (rows <= 0 || shard.dataType != BFLOAT16 || !shard.cudaData ||
+        shard.dataDeviceIds != std::vector<int>{tpDevices[rank]} || storage.dataType != BFLOAT16 ||
+        storage.dataDeviceIds != std::vector<int>{tpDevices.front()} || !storage.cudaData ||
+        storage.expansionBytes < bytes) return false;
+    job.runRanks = [this](const std::function<void(int)> &run) {
+        draftTP->Run([&](int rank) {
+            try { run(rank); }
+            catch (...) { FastllmCudaSyncCurrentThreadStream(); throw; }
+            FastllmCudaSyncCurrentThreadStream();
+        });
+    };
+    job.work = [this, windowCopy = std::move(windowCopy), snapshot, context, rank, rows, bytes] {
+        windowCopy();
+        Data hidden;
+        hidden.FakeFrom(snapshot->pool->DraftShard(snapshot->slot), snapshot->pool->DraftOffset(snapshot->slot));
+        hidden.Resize({1, rows, embed_dim});
+        AppendDraftKVOnRank(hidden, snapshot->length - rows, *context, rank);
+        // The input checkpoint already lives on its draft owner. Only the
+        // bounded feature tail needed by a later short commit goes to the root.
+        Data &storage = context->workspace->prefixStorage;
+        const bool copied = rank ? FastllmCudaMemcpyPeerAsyncCurrentThread(tpDevices.front(), storage.cudaData,
+            tpDevices[rank], hidden.cudaData, bytes) :
+            FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(storage.cudaData, hidden.cudaData, bytes);
+        AssertInFastLLM(copied, "Cannot restore draft prefix features.");
+        ClearDraftPrefixHidden(context->prefixHidden);
+        context->prefixHidden.FakeFrom(storage, 0);
+        context->prefixHidden.Resize(hidden.dims);
+        context->committed = snapshot->length;
+    };
+    return true;
+}
+#endif
+
 void NaiveN05FlashModel::RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context) {
 #ifdef USE_CUDA
     ApplyDraftDevice();
@@ -1728,10 +1772,10 @@ bool NaiveN05FlashModel::CommitPrefillDraftOwners(TargetCapture &capture,
     });
     // All owner writes completed, including remote checkpoint and request storage.
     for (size_t i = 0; i < owners.size(); ++i) {
+        if (!collect[i]) continue;
         auto &context = *owners[i];
         context.committed += lengths[i];
         ClearDraftPrefixHidden(context.prefixHidden);
-        if (!collect[i]) continue;
         context.prefixHidden.FakeFrom(context.workspace->prefixStorage, 0);
         context.prefixHidden.Resize({1, keep, embed_dim});
         if (i < capture.prefixes.size()) for (const auto &snapshot : capture.prefixes[i]) {
@@ -3708,10 +3752,17 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         }
         auto tokens = ForwardTargetBatch(batch, inputIds, {}, positionIds, seqLens,
             pastKeyValues, configs, lastTokens, retLogits, &capture);
-        if (capture.collectHidden && CommitPrefillDraftOwners(capture, seqLens, collect, owners))
-            return tokens;
+        // Long rows overwrite their entire bounded draft history. A short
+        // continuation in the same batch still needs its inherited prefix.
+        auto ownerRows = collect;
+        const int keep = draftWindow + GetPageLen() - 1;
+        for (int i = 0; i < batch; ++i)
+            ownerRows[i] = collect[i] && seqLens[i] >= keep;
+        const bool ownersDone = std::find(ownerRows.begin(), ownerRows.end(), true) != ownerRows.end() &&
+            CommitPrefillDraftOwners(capture, seqLens, ownerRows, owners);
         int offset = 0;
         for (int i = 0; i < batch; offset += seqLens[i++]) {
+            if (ownersDone && ownerRows[i]) continue;
             if (!collect[i]) {
                 owners[i]->committed += seqLens[i];
                 ClearDraftPrefixHidden(owners[i]->prefixHidden);

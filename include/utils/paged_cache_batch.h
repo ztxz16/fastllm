@@ -86,6 +86,21 @@ namespace fastllm {
                 task.manager->RecordPrefix(*task.hashes, task.pages);
             });
         }
+        // Request descriptors remain live until the synchronous worker group joins.
+        struct BorrowedPublication {
+            PagedCacheManager *manager;
+            const std::vector<uint64_t> *hashes;
+            const Data *cache;
+            size_t PageCount() const {
+                return cache->pageIndex.size() - (!cache->pageIndex.empty() && cache->lastPageLen < cache->pageLen);
+            }
+        };
+        void PublishBorrowed(const std::vector<BorrowedPublication> &tasks, int threadLimit) {
+            Run(tasks, threadLimit, "paged_publish_workers_sum", [](const BorrowedPublication &task) {
+                inference_trace::DetailSpan trace("record.trie_publish");
+                task.manager->RecordPrefix(*task.hashes, task.cache->pageIndex, task.PageCount());
+            });
+        }
         void ReleaseReferences(const std::vector<Data *> &caches, int threadLimit) {
             struct Release {
                 PagedCacheManager *manager;

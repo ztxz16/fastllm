@@ -845,6 +845,7 @@ namespace fastllm {
 
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
+            void ExtendPageIndices(std::vector<int> &pages, int total);
             void EvictTrieSubtree(CacheTrieNode *node);
             void ReleasePageIndex(int pageIndex);
             void ReleasePageIndices(const std::vector<int> &pageIndices);
@@ -862,6 +863,7 @@ namespace fastllm {
             void QueryPrefix(const std::vector<uint64_t> &hashes, PagedPrefixMatch &match,
                              std::vector<int> &cachedPageIds);
             void RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages);
+            void RecordPrefix(const std::vector<uint64_t> &hashes, const std::vector<int> &pages, size_t completePages);
             bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
                                                std::vector<int> &unreferenced);
             bool PreviewUnreferencedPrefixPages(const PagedPrefixMatch &match, int pages,
@@ -897,6 +899,7 @@ namespace fastllm {
             void RemoveTriePage(int pageIndex);
             void ReleasePageIndexLocked(int pageIndex);
             void PrepareFreePages(int count);
+            int TakeFreePageLocked();
             uint64_t pressureEvictedPages = 0;
     };
 

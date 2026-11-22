@@ -158,6 +158,9 @@ struct NaiveN05PrefixCacheTestAccess {
 #endif
 namespace fastllm {
 struct NaiveN05GraphTestAccess {
+    static std::pair<int, bool> SwaLayout(const NaiveN05FlashModel &model) {
+        return {model.window, model.tpSwaRingCache};
+    }
     static void SamplingIdentity(NaiveN05FlashModel &model, const Data *root, uint64_t identity) {
         std::lock_guard<std::mutex> guard(model.tpRequestMutex);
         model.tpSamplingRequestIds[root] = identity;
@@ -931,7 +934,7 @@ class Fixture : public NaiveN05FlashModel {
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true, 256, 32, 512, PDDraftContextWeightNames());
         SetSaveHistoryChat(true);
     }
-    void CheckPDDraftOwnerCommit() {
+    void CheckPDDraftOwnerCommit(bool checkRing) {
         pdPrefillOnly = true;
         SetChunkedPrefillSize(2048);
         PreparePDGroupFixture(ranks, true);
@@ -964,7 +967,10 @@ class Fixture : public NaiveN05FlashModel {
             reference.push_back(snapshot(rank, lengths[rank]));
         }
         if (CommitPrefillDraftOwners(batch, {1, lengths[1]}, {true, true}, actual) ||
-            !CommitPrefillDraftOwners(batch, lengths, {true, true}, actual))
+            !CommitPrefillDraftOwners(batch, lengths, {true, false}, actual) ||
+            actual[1]->committed != 0 || !actual[1]->prefixHidden.dims.empty() ||
+            batch.prefixes[1].front()->draftReady ||
+            !CommitPrefillDraftOwners(batch, lengths, {false, true}, actual))
             throw std::runtime_error("unexpected owner commit dispatch");
         auto read = [](const Data &tensor) {
             Data host(tensor); ToDataType(host, FLOAT32); host.ToDevice(CPU);
@@ -1000,6 +1006,93 @@ class Fixture : public NaiveN05FlashModel {
                 RequireCloseLogits(read(a.first).data(), read(b.first), "draft K");
                 RequireCloseLogits(read(a.second).data(), read(b.second), "draft V");
             }
+        }
+        // Replay the published checkpoint into fresh logical requests with
+        // recycled backing, then compare each owner's result to scalar restore.
+        std::vector<PDResidentRestore> jobs(2);
+        std::vector<int> windows(2);
+        for (int rank = 0; rank < 2; ++rank) {
+            for (const auto &ctx : {actual[rank], expected[rank]}) {
+                ctx->committed = 0;
+                ctx->prefixHidden.FreeSpace(); ctx->prefixHidden.dims.clear();
+                for (auto &pair : ctx->kv) for (auto *data : {&pair.first, &pair.second})
+                    data->Resize({1, 0, data->dims[2]});
+            }
+            auto snap = batch.prefixes[rank].front();
+            if (!StageOwnerRestore(jobs[rank], [&, rank] { ++windows[rank]; }, snap, actual[rank], rank))
+                throw std::runtime_error("warmed owner restore unavailable");
+            RestoreDraftPrefix(*snap, snap->length, *expected[rank]);
+        }
+        jobs.front().runRanks([&](int rank) { if (rank < 2) jobs[rank].work(); });
+        for (int rank = 0; rank < 2; ++rank) {
+            if (windows[rank] != 1 || actual[rank]->committed != expected[rank]->committed ||
+                actual[rank]->prefixHidden.dims != expected[rank]->prefixHidden.dims)
+                throw std::runtime_error("incorrect owner restore state");
+            RequireCloseLogits(read(actual[rank]->prefixHidden).data(), read(expected[rank]->prefixHidden), "restored tail");
+            for (int layer = 0; layer < draftLayers; ++layer) {
+                const auto &a = actual[rank]->kv[layer], &b = expected[rank]->kv[layer];
+                if (a.first.dims != b.first.dims || a.second.dims != b.second.dims)
+                    throw std::runtime_error("restored draft KV shape");
+                RequireCloseLogits(read(a.first).data(), read(b.first), "restored K");
+                RequireCloseLogits(read(a.second).data(), read(b.second), "restored V");
+            }
+        }
+        // Check the entire deferred SWA + draft restore, including ring wrap,
+        // against two synchronous restores using the same immutable snapshots.
+        jobs.clear(); jobs.resize(2);
+        for (auto *set : {&actual, &expected})
+            for (auto &ctx : *set) idleDraftContexts.push_back(std::move(ctx));
+        ResponseContext scalarRestore[2], batchedRestore[2];
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto &snap = batch.prefixes[rank].front();
+            auto *source = (uint8_t *)pool->storage.at(rank).cudaData + size_t(pool->slots.Row(snap->slot)) * pool->slotBytes;
+            std::vector<uint8_t> pattern(pool->slotBytes);
+            for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = uint8_t(i * 13 + (i >> 8) + rank * 101);
+            FastllmCudaSetDevice(rank);
+            FastllmCudaCopyFromHostToDevice(source, pattern.data(), pattern.size());
+            for (auto *ctx : {&scalarRestore[rank], &batchedRestore[rank]}) {
+                ctx->Init(block_cnt, dataType, kvCacheDataType);
+                ctx->pdPrefillGroup = rank;
+                OnResponseContextCreated(ctx);
+                if (ctx == &batchedRestore[rank]) {
+                    ctx->prefillPreview = std::make_unique<PrefillPrefixPreview>();
+                    ctx->prefillPreview->restore = &jobs[rank];
+                }
+                if (!RestorePrefixWindow(ctx, snap)) throw std::runtime_error("window restore declined");
+                if (ctx->prefillPreview) ctx->prefillPreview->restore = nullptr;
+            }
+            if (!jobs[rank].work) throw std::runtime_error("SWA comparison did not use owner work");
+        }
+        jobs.front().runRanks([&](int rank) { if (rank < 2) jobs[rank].work(); });
+        for (int rank = 0; rank < 2; ++rank) {
+            FastllmCudaSetDevice(rank);
+            const int length = batch.prefixes[rank].front()->length;
+            const auto [windowSize, ring] = NaiveN05GraphTestAccess::SwaLayout(*this);
+            const int rows = std::min(length, windowSize - 1);
+            const int first = ring ? (length - rows) % windowSize : 0;
+            if (checkRing && (!ring || first + rows <= windowSize))
+                throw std::runtime_error("fixture did not cover a wrapped SWA window");
+            for (int layer = 0; layer < block_cnt; ++layer) if (GetKVCacheRetainedTokens(layer) >= 0)
+                for (int part = 0; part < 2; ++part) {
+                    auto local = [&](ResponseContext &ctx) {
+                        auto &pair = ctx.pastKeyValues[layer];
+                        return (part ? pair.second : pair.first).multiDeviceDatas.at(rank);
+                    };
+                    const auto *a = local(scalarRestore[rank]), *b = local(batchedRestore[rank]);
+                    if (a->dims != b->dims || a->dataType != b->dataType || a->cudaData == b->cudaData)
+                        throw std::runtime_error("owner SWA descriptors differ or alias");
+                    const size_t stride = a->dims[2] * a->unitSize;
+                    const int head = std::min(rows, windowSize - first);
+                    std::vector<uint8_t> left(rows * stride), right(rows * stride);
+                    auto download = [&](const Data *d, std::vector<uint8_t> &out) {
+                        FastllmCudaCopyFromDeviceToHost(out.data(), (char *)d->cudaData + first * stride, head * stride);
+                        if (rows > head) FastllmCudaCopyFromDeviceToHost(out.data() + head * stride, d->cudaData, (rows - head) * stride);
+                    };
+                    download(a, left); download(b, right);
+                    if (left != right) throw std::runtime_error("deferred SWA checkpoint bytes changed");
+                }
+            OnResponseContextRemoved(&scalarRestore[rank]);
+            OnResponseContextRemoved(&batchedRestore[rank]);
         }
         std::cout << "NAIVE PD OWNER COMMIT PASS max_relative=" << largestLogitRelative
                   << " max_abs=" << largestLogitAbsolute << std::endl;
@@ -5850,9 +5943,11 @@ int main(int argc, char **argv) {
             unsetenv("FASTLLM_DSPARK_TP"); return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "pd_owner_commit") {
-            SetCudaEmbedding(true); SetCudaGraph(false);
+            const bool ring = argc > 3 && std::string(argv[3]) == "ring";
+            if (ring) SetPageLen(32);
+            SetCudaEmbedding(true); SetCudaGraph(ring);
             Fixture fixture(ranks, false, true, true, true);
-            fixture.CheckPDDraftOwnerCommit();
+            fixture.CheckPDDraftOwnerCommit(ring);
             return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "pd_draft_tp_to_dp") {

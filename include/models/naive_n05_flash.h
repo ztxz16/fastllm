@@ -370,6 +370,8 @@ namespace fastllm {
         int CacheReserveCapacity(const GenerationConfig &config) const;
         void AppendCache(Data &cache, Data &input, DataType cacheType, int reserveCapacity = 0, bool usePool = true, bool expandFP8 = false);
         void ReserveCache(Data &cache, int capacity, int width, bool usePool = true, const Data *requestKey = nullptr);
+        void ReserveCache(Data &cache, int capacity, int width, bool usePool, const Data *requestKey,
+                          bool &invalidated);
         struct PageTableUpdate { Data *cache; size_t first; };
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
@@ -389,6 +391,9 @@ namespace fastllm {
         int DraftContextQueryHeads() const { return draftKVOnly ? 0 : draftHeads; }
         void AppendDraftContext(Data &hidden, int start, DraftContext &context);
         void RestoreDraftPrefix(const PrefixSnapshot &snapshot, int length, DraftContext &context);
+        bool StageOwnerRestore(PDResidentRestore &job, std::function<void()> windowCopy,
+                               const std::shared_ptr<PrefixSnapshot> &snapshot,
+                               const std::shared_ptr<DraftContext> &context, int rank);
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         bool NeedsDraftPrefillHidden(const Data &key, int end, int promptLength) const;
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,

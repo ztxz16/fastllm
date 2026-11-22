@@ -45,6 +45,20 @@ namespace fastllm {
     class basellm;
     class MimoToolVocabulary;
 
+    // Owned by one attention group for a single PD admission pass.
+    // Anchors are hints only. QueryPrefix validates their generation under the pool lock.
+    struct PDResidentPrefixHints {
+        std::vector<int> tokens;
+        std::map<PagedCacheManager *, PagedPrefixMatch> matches;
+    };
+
+    // GPU work for one admitted resident hit. The PD scheduler drains these
+    // jobs by owner before any request can enter its first forward.
+    struct PDResidentRestore {
+        std::function<void(const std::function<void(int)> &)> runRanks;
+        std::function<void()> work;
+    };
+
     struct PrefillPrefixPreview {
         // Query identity is checked once per request/pass, not once per layer.
         std::vector<int> tokens;
@@ -53,6 +67,7 @@ namespace fastllm {
         std::map<PagedCacheManager *, PagedPrefixMatch> matches;
         PagedPrefixPath budgetPath;
         std::shared_ptr<void> modelState; // metadata only; never owns KV or checkpoints
+        PDResidentRestore *restore = nullptr; // borrowed only during RestorePDResidentPrefix
         void Reset(const std::vector<int> &input) {
             if (tokens != input) {
                 tokens = input;
@@ -848,6 +863,7 @@ namespace fastllm {
         virtual bool HasPDResidentPrefixCache() const { return false; }
         int RestorePDResidentPrefix(ResponseContext *context);
         int RestorePDResidentPrefix(ResponseContext *context, int *fullMatch);
+        int RestorePDResidentPrefix(ResponseContext *context, int *fullMatch, PDResidentPrefixHints *hints);
         int PDBranchCheckpointEnd(const Data &key) const;
         // Metadata-only routing hint; does not pin pages or restore GPU state.
         int PreviewPDResidentPrefix(const std::vector<int> &tokens);

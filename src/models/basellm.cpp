@@ -834,7 +834,8 @@ namespace fastllm {
 
         recordTrace.Next("record.paged_publish");
         std::map<int, std::vector<uint64_t>> recordHashes;
-        std::vector<PagedCacheBatchExecutor::Publication> publications;
+        const bool reuseHashes = prefillPreview && !prefillPreview->pageHashes.empty() && prefillPreview->tokens == allTokens;
+        std::vector<PagedCacheBatchExecutor::BorrowedPublication> publications;
         std::function<void(Data&)> recordPagedCache = [&](Data &cache) {
             if (cache.multiDeviceData && !cache.multiDeviceDatas.empty()) {
                 bool recordedLocal = false;
@@ -851,15 +852,22 @@ namespace fastllm {
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
                 inference_trace::DetailSpan descriptorTrace("record.page_copy_hash", detail);
-                auto pages = cache.pageIndex;
-                if (cache.lastPageLen < cache.pageLen) pages.pop_back();
                 const int pageLen = cache.pagedKVCacheData->pageLen;
-                auto &hashes = recordHashes[pageLen];
-                const int count = std::min(this->allTokens.size() / pageLen, pages.size());
-                for (int i = hashes.size(); i < count; ++i)
-                    hashes.push_back(PagedCacheManager::HashTokenPage(this->allTokens.data() + i * pageLen, pageLen));
-                if (detail) detail->Count("record.page_count", pages.size());
-                publications.push_back({cache.pagedKVCacheData, &hashes, std::move(pages)});
+                const size_t pages = cache.pageIndex.size() - (cache.lastPageLen < cache.pageLen);
+                const std::vector<uint64_t> *hashes = nullptr;
+                if (reuseHashes) {
+                    auto cached = prefillPreview->pageHashes.find(pageLen);
+                    if (cached != prefillPreview->pageHashes.end()) hashes = &cached->second;
+                }
+                if (!hashes) {
+                    auto &computed = recordHashes[pageLen];
+                    const size_t count = std::min(allTokens.size() / pageLen, pages);
+                    for (size_t i = computed.size(); i < count; ++i)
+                        computed.push_back(PagedCacheManager::HashTokenPage(allTokens.data() + i * pageLen, pageLen));
+                    hashes = &computed;
+                }
+                if (detail) detail->Count("record.page_count", pages);
+                publications.push_back({cache.pagedKVCacheData, hashes, &cache});
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -876,7 +884,7 @@ namespace fastllm {
         }
         // Hashes are complete and stable before workers access them. Each
         // manager retains its lock, page-generation checks and publication LRU.
-        model->pagedCacheExecutor.Publish(publications, GetThreads());
+        model->pagedCacheExecutor.PublishBorrowed(publications, GetThreads());
     }
 
     PagedCacheManager* basellm::GetPagedKVCacheManager(int layerIndex, bool isKey) const {
@@ -1553,7 +1561,7 @@ namespace fastllm {
 
     // Both schedulers restore the same page references and model-specific
     // companion state. Called while scheduling is locked, between forwards.
-    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx, bool tryHost = true, int *fullMatch = nullptr) {
+    static PagedCacheManager *RestoreResidentPrefixImpl(basellm *model, ResponseContext *ctx, bool tryHost = true, int *fullMatch = nullptr, PDResidentPrefixHints *hints = nullptr) {
         if (fullMatch) *fullMatch = 0;
         if ((model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
             ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
@@ -1586,12 +1594,25 @@ namespace fastllm {
             if (!ctx->prefillPreview) ctx->prefillPreview = std::make_unique<PrefillPrefixPreview>();
             auto &preview = *ctx->prefillPreview;
             preview.Reset(ctx->currentTokens);
+            size_t common = 0;
+            if (hints) {
+                const size_t limit = std::min(preview.tokens.size(), hints->tokens.size());
+                common = std::mismatch(preview.tokens.begin(), preview.tokens.begin() + limit,
+                                       hints->tokens.begin()).first - preview.tokens.begin();
+            }
             std::map<PagedCacheManager*, std::vector<int> > queriedPages;
             auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
                 auto it = queriedPages.find(manager);
                 if (it == queriedPages.end()) {
                     std::vector<int> pages;
-                    manager->QueryPrefix(preview.Hashes(manager->pageLen), preview.matches[manager], pages);
+                    auto &match = preview.matches[manager];
+                    if (hints && common >= size_t(manager->pageLen)) {
+                        auto old = hints->matches.find(manager);
+                        if (old != hints->matches.end() && old->second.pages > match.pages &&
+                            size_t(old->second.pages) <= common / manager->pageLen)
+                            match = old->second;
+                    }
+                    manager->QueryPrefix(preview.Hashes(manager->pageLen), match, pages);
                     it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
                 }
                 return it->second;
@@ -1619,6 +1640,15 @@ namespace fastllm {
                 }
             }
 
+            if (hints) {
+                // Only seed endpoints covered by confirmed input tokens. Keep the
+                // shared portion in place when many requests hit the same prefix.
+                const size_t length = size_t(minCachedPages) * probeManager->pageLen;
+                hints->tokens.resize(std::min(common, length));
+                hints->tokens.insert(hints->tokens.end(), preview.tokens.begin() + hints->tokens.size(),
+                                     preview.tokens.begin() + length);
+                hints->matches = preview.matches;
+            }
             if (minCachedPages > 0) {
                 int cachedLen = minCachedPages * probeManager->pageLen;
                 if (cachedLen >= (int)ctx->currentTokens.size()) {
@@ -1639,7 +1669,7 @@ namespace fastllm {
                 // Optional L2 staging may have recycled unreferenced GPU pages.
                 // Never apply the directory entries observed before that attempt.
                 ctx->prefillPreview.reset();
-                return RestoreResidentPrefixImpl(model, ctx, false, fullMatch);
+                return RestoreResidentPrefixImpl(model, ctx, false, fullMatch, hints);
             }
             if (minCachedPages > 0) {
                 int cachedLen = minCachedPages * probeManager->pageLen;
@@ -1876,7 +1906,11 @@ namespace fastllm {
     }
 
     int basellm::RestorePDResidentPrefix(ResponseContext *context, int *fullMatch) {
-        RestoreResidentPrefixImpl(this, context, true, fullMatch);
+        return RestorePDResidentPrefix(context, fullMatch, nullptr);
+    }
+
+    int basellm::RestorePDResidentPrefix(ResponseContext *context, int *fullMatch, PDResidentPrefixHints *hints) {
+        RestoreResidentPrefixImpl(this, context, true, fullMatch, hints);
         return context->cacheLen;
     }
 

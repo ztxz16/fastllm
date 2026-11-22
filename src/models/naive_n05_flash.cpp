@@ -226,8 +226,17 @@ void NaiveN05FlashModel::AppendCache(Data &cache, Data &input, DataType cacheTyp
 }
 
 void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool usePool, const Data *requestKey) {
+    bool invalidated = false;
+    ReserveCache(cache, capacity, width, usePool, requestKey, invalidated);
+}
+
+void NaiveN05FlashModel::ReserveCache(Data &cache, int capacity, int width, bool usePool, const Data *requestKey,
+                                     bool &invalidated) {
     if (cache.expansionDims.size() == 3 && cache.expansionDims[1] >= capacity) return;
-    InvalidateTensorParallelCache(requestKey);
+    if (!invalidated) {
+        InvalidateTensorParallelCache(requestKey);
+        invalidated = true;
+    }
 #ifdef USE_CUDA
     auto pool = usePool && cache.dataDevice == DataDevice::CUDA && cache.dataDeviceIds.size() == 1
         ? tpKVPool.find(cache.dataDeviceIds[0]) : tpKVPool.end();
@@ -399,8 +408,7 @@ bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manag
         cache.pageIndex[last] = page;
         manager.ReleasePageIndex(old);
     }
-    while ((int)cache.pageIndex.size() < pages)
-        cache.pageIndex.push_back(manager.GetUnusedPageIndex(true));
+    manager.ExtendPageIndices(cache.pageIndex, pages);
     if (changed && !pendingPageTables && !cache.pageIndex.empty())
         FastllmCudaCopyFromHostToDevice(cache.cudaData, cache.pageIndex.data(), cache.pageIndex.size() * sizeof(int));
     cache.lastPageLen = previous ? (previous - 1) % cache.pageLen + 1 : 0;

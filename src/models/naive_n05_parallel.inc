@@ -310,11 +310,11 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                                 if (sparseKv) continue;
                                 const int capacity = tpSwaCacheCapacity;
                                 ReserveCache(local, capacity, std::max(1, cfg.kvHeads / AttentionTPSize()) *
-                                    (part ? cfg.valueDim : cfg.headDim), true, &key(seq, 0));
+                                    (part ? cfg.valueDim : cfg.headDim), true, &key(seq, 0), invalidated);
                             } else {
                                 const int past = root.dims.empty() ? 0 : root.dims[1];
                                 PreparePagedCache(local, *tpPagedCaches[rank][layer * 2 + part],
-                                    past + count, &pending, &key(seq, 0), ownedDecode ? &invalidated : nullptr);
+                                    past + count, &pending, &key(seq, 0), &invalidated);
                             }
                         }
                     }

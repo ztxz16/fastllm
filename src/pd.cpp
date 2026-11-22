@@ -462,6 +462,20 @@ struct PDRuntime {
         std::shared_ptr<fastkv::Cancellation> cancellation;
         std::shared_ptr<void> groupAdmission;
         std::unique_ptr<ResponseContext> context;
+        std::unique_ptr<ResponseContext> preparedInput;
+        std::shared_ptr<void> preparationSlot;
+
+        std::unique_ptr<ResponseContext> MakeInputContext(const basellm &model) const {
+            auto ctx = std::make_unique<ResponseContext>();
+            ctx->Init(model.block_cnt, model.dataType, model.kvCacheDataType);
+            ctx->currentTokens = ctx->allTokens = input;
+            ctx->inputTokens = input.size();
+            ctx->requestMetadata = metadata;
+            ctx->generationConfig.top_k = 1;
+            ctx->generationConfig.output_token_limit = 1;
+            ctx->generationConfig.input_token_length = input.size() + 1;
+            return ctx;
+        }
         fastkv::HostCache::Hit hostHit;
         std::future<fastkv::Message> hostRestore;
         std::chrono::steady_clock::time_point restoreBegin;
@@ -533,6 +547,7 @@ struct PDRuntime {
     std::unique_ptr<fastkv::PrefixCache> cache;
     std::unique_ptr<fastkv::HostCache> hostCache;
     std::unique_ptr<fastkv::BufferPool> exportPool;
+    std::unique_ptr<fastkv::Budget> preparationSlots;
     bool residentPrefix = false;
     // Only read during a synchronous model forward, on the prefill execution lane.
     std::unordered_map<const Data *, int> branchCheckpoints;
@@ -594,6 +609,22 @@ struct PDRuntime {
             if (PreferHostPrefix(cached, request->hostHit, workload->tokensPerSecond.load(), HostRestoreBytesPerSecond())) {
                 cached = request->hostHit.Tokens();
                 request->SetRestoreBytes(request->hostHit.Bytes());
+            }
+        }
+        // RPC workers can prepare immutable input while the model lane runs the
+        // preceding batch. No cache lookup, page reservation or model hook is
+        // performed here; admission observes the latest published state.
+        if (preparationSlots && !request->cancellation->Cancelled()) {
+            try { request->preparationSlot = preparationSlots->Reserve(1); }
+            catch (const fastkv::CapacityBusy &) { }
+            if (request->preparationSlot) {
+                auto ctx = request->MakeInputContext(model);
+                ctx->prefillPreview = std::make_unique<PrefillPrefixPreview>();
+                auto &preview = *ctx->prefillPreview;
+                preview.Reset(request->input);
+                preview.Hashes(ResidentPageTokens());
+                preview.TokenHash(request->input.size());
+                request->preparedInput = std::move(ctx);
             }
         }
         request->SetRemaining(request->input.size() - cached);
@@ -1088,6 +1119,14 @@ void PDRuntime::RunPrefill(basellm &model) {
                     for (const auto *queue : {&ranks[g].active, &ranks[g].prepared})
                         for (const auto &item : *queue) queuedTokens[g] += item->remaining;
             }
+            std::vector<PDResidentPrefixHints> prefixHints(residentPrefix && outstanding ? groups : 0);
+            struct RestoreJob {
+                Request request;
+                PDResidentRestore restore;
+                std::exception_ptr error;
+            };
+            std::vector<std::vector<RestoreJob>> restores(groups);
+            std::function<void(const std::function<void(int)> &)> runRestores;
             // Visit known session owners in turn before allocating a context.
             // A full rank or an oversized head cannot block another rank.
             while (outstanding && liveContexts < contextLimit && !stopping) {
@@ -1115,16 +1154,11 @@ void PDRuntime::RunPrefill(basellm &model) {
                         request->Reply(*hit.state, hit.tokens);
                         continue;
                     }
-                    request->context.reset(new ResponseContext);
+                    request->context = request->preparedInput ? std::move(request->preparedInput) :
+                        request->MakeInputContext(model);
+                    request->preparationSlot.reset();
                     auto &context = *request->context;
-                    context.Init(model.block_cnt, model.dataType, model.kvCacheDataType);
-                    context.requestMetadata = request->metadata;
                     context.pdPrefillGroup = request->affinity;
-                    context.currentTokens = context.allTokens = request->input;
-                    context.inputTokens = request->input.size();
-                    context.generationConfig.top_k = 1;
-                    context.generationConfig.output_token_limit = 1;
-                    context.generationConfig.input_token_length = request->input.size() + 1;
                     model.OnResponseContextCreated(&context);
                     int preferred = -1;
                     if (request->affinity < 0 && !queuedTokens.empty()) {
@@ -1168,7 +1202,21 @@ void PDRuntime::RunPrefill(basellm &model) {
                     request->hostHit = {}; // only an actually restored parent may supply inherited bytes
                     if (residentPrefix) {
                         int fullMatch;
-                        context.preTokens = model.RestorePDResidentPrefix(&context, &fullMatch);
+                        PDResidentRestore restore;
+                        if (!hit.state && !hostCache && groups > 1) {
+                            if (!context.prefillPreview) context.prefillPreview = std::make_unique<PrefillPrefixPreview>();
+                            context.prefillPreview->restore = &restore;
+                        }
+                        // The preview may be replaced if a host restore recycles pages.
+                        struct ClearRestore {
+                            ResponseContext &context;
+                            ~ClearRestore() { if (context.prefillPreview) context.prefillPreview->restore = nullptr; }
+                        } clear{context};
+                        context.preTokens = model.RestorePDResidentPrefix(&context, &fullMatch, &prefixHints[owner]);
+                        if (context.preTokens > 0 && restore.work) {
+                            if (!runRestores) runRestores = std::move(restore.runRanks);
+                            restores[owner].push_back({request, std::move(restore), {}});
+                        }
                         // The ordinary end checkpoint already covers the last partial page.
                         // Repair on demand, with at most one producer per attention group.
                         if (context.preTokens == 0 && fullMatch > 0 && request->input.size() - fullMatch > page &&
@@ -1209,6 +1257,35 @@ void PDRuntime::RunPrefill(basellm &model) {
                     retire(request);
                     request->result.set_exception(error);
                 }
+            }
+            if (runRestores) {
+                // Each request and its source checkpoint stay alive through the
+                // owner-stream fence, including requests cancelled during restore.
+                try {
+                    runRestores([&](int owner) {
+                        for (auto &job : restores.at(owner)) if (job.request->context) {
+                            try { job.restore.work(); }
+                            catch (...) { job.error = std::current_exception(); }
+                        }
+                    });
+                } catch (...) {
+                    const auto error = std::current_exception();
+                    for (auto &jobs : restores) for (auto &job : jobs) job.error = error;
+                }
+                for (int g = 0; g < groups; ++g) for (auto &job : restores[g]) {
+                    if (!job.error || !job.request->context) continue;
+                    auto &rank = ranks[g];
+                    for (auto *queue : {&rank.active, &rank.prepared}) {
+                        auto it = std::find(queue->begin(), queue->end(), job.request);
+                        if (it == queue->end()) continue;
+                        if (queue == &rank.prepared) rank.preparedTokens -= job.request->reservation;
+                        queue->erase(it);
+                        break;
+                    }
+                    retire(job.request);
+                    job.request->result.set_exception(job.error);
+                }
+                restores.clear();
             }
             // Cold requests can reach this queue before any peer publishes FULL KV.
             // Only split a real, page-aligned fork visible in the next forward.
@@ -1662,6 +1739,8 @@ void basellm::ConfigurePD(const json11::Json &config) {
             runtime->batchTokens = limits.batchTokens;
             runtime->rankRequests = limits.rankRequests;
             runtime->rankTokens = limits.rankTokens;
+            if (runtime->residentPrefix && limits.batchRequests > 1)
+                runtime->preparationSlots = std::make_unique<fastkv::Budget>(limits.batchRequests, "prefill input preparation");
             runtime->prefillReservations = ActivatePDPrefillMemory(limits);
             Check(!limits.workspaceLimitMiB || !runtime->prefillReservations.empty(),
                 "max_workspace_mib_per_rank requires a warmed GPU Naive attention-DP prefill worker without draft");

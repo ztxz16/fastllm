@@ -1365,12 +1365,130 @@ static void CheckLegacySessionPeer(bool sessionProtocol = false) {
     decode.StopPD(); legacy.Stop();
 }
 
+static void TestDeferredPDResidentRestore() {
+    struct Model : BatchStateModel {
+        PagedCacheManager pool;
+        using basellm::ShutdownRuntime;
+        ~Model() override { ShutdownRuntime(); }
+        std::atomic<bool> failDispatch{false};
+        int PDGroupCount() const override { return 2; }
+        int PDRequestGroup(const ResponseContext &ctx) const override { return ctx.allTokens.back() % 2; }
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+                int, bool, const ResponseContext *) const override {
+            return {{-1, const_cast<PagedCacheManager *>(&pool)}};
+        }
+        bool RestorePagedPrefixCacheExtra(ResponseContext *ctx, int length) const override {
+            Check(length == 4 && ctx->prefillPreview && ctx->prefillPreview->restore, "missing deferred hit");
+            auto &restore = *ctx->prefillPreview->restore;
+            restore.runRanks = [this](const auto &run) {
+                if (failDispatch) throw std::runtime_error("dispatch failed");
+                run(0); run(1);
+            };
+            restore.work = [ctx] {
+                if (ctx->allTokens.back() == 7) throw std::runtime_error("individual restore failed");
+                ctx->intParams["restored"] = 1;
+            };
+            return true;
+        }
+        int Forward(const Data &, const Data &, const Data &, std::vector<std::pair<Data, Data>> &,
+                    const GenerationConfig &, const LastTokensManager &, std::vector<float> *) override { return 0; }
+        std::vector<int> ForwardBatch(int batch, const Data &, const std::vector<Data *> &,
+                const std::vector<Data *> &, const std::vector<int> &, std::vector<std::pair<Data *, Data *>> &,
+                const std::vector<GenerationConfig> &, const LastTokensManager &,
+                std::vector<std::vector<float> *> *) override { return std::vector<int>(batch); }
+        fastkv::Message ExportPDState(ResponseContext &ctx) override {
+            Check(ctx.intParams.at("restored") == 1, "export preceded resident restore");
+            return {};
+        }
+    } model;
+    const int oldPage = GetPageLen(), oldTokens = GetMaxTokens();
+    SetPageLen(4); SetMaxTokens(64);
+    model.residentHistory = true;
+    model.pool.type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+    model.pool.pageLen = 4; model.pool.SetMaxPages(16); model.pool.Resize({16, 4, 1, 1});
+    std::vector<int> pages{model.pool.GetUnusedPageIndex(true)};
+    model.pool.Record({1, 2, 3, 4}, pages); model.pool.ReleasePageIndices(pages);
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    Check(model.SetPrefillBatching(4, 5, 2, 2), "configure deferred restore batch");
+    model.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","restore"},{"transport","tcp"},
+        {"listen",endpoint},{"chunk_tokens",2},{"cache_kv_bytes",0},{"cache_swa_bytes",0}});
+    fastkv::Options options; options.transport = fastkv::Transport::Tcp;
+    fastkv::Service client(options);
+    auto call = [&](int last) {
+        fastkv::Writer writer; writer.U32(1); writer.String("restore:gpu-state-v2:test-recurrent-state-v1");
+        writer.Ints({1,2,3,4,last});
+        return client.Submit(endpoint, {std::move(writer.bytes), {}});
+    };
+    for (bool fail : {false, true, false}) {
+        model.failDispatch = fail;
+        auto bad = call(7), good = call(8);
+        auto succeeded = [](auto &reply) {
+            try { reply.get(); return true; } catch (const std::exception &) { return false; }
+        };
+        Check(!succeeded(bad) && succeeded(good) == !fail, "deferred restore failure isolation");
+    }
+    model.ShutdownRuntime();
+    Check(model.live == 0 && model.pool.FreePageCount() == model.pool.maxPages, "deferred restore leaked a grant or page");
+    SetPageLen(oldPage); SetMaxTokens(oldTokens);
+    std::cout << "PASS PD deferred restore completion and failure isolation\n";
+}
+
+static void TestPDResidentPrefixHints() {
+    struct ResidentModel : StateModel {
+        PagedCacheManager pool;
+        ResidentModel() {
+            pool.type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+            pool.pageLen = 4;
+            pool.SetMaxPages(8);
+            pool.Resize({8, 4, 1, 1});
+        }
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+                int, bool, const ResponseContext *) const override {
+            return {{-1, const_cast<PagedCacheManager *>(&pool)}};
+        }
+    } model;
+    PDResidentPrefixHints hints;
+    std::vector<int> input{1, 2, 3, 4, 5, 6, 7, 8, 9};
+    auto publish = [&] {
+        std::vector<int> pages{model.pool.GetUnusedPageIndex(true), model.pool.GetUnusedPageIndex(true)};
+        model.pool.Record(input, pages);
+        model.pool.ReleasePageIndices(pages);
+        return pages;
+    };
+    auto restore = [&](const std::vector<int> &tokens, const std::vector<int> &expected) {
+        ResponseContext ctx;
+        ctx.Init(1, FLOAT32, FLOAT32);
+        ctx.currentTokens = tokens;
+        int match = -1;
+        int restored = model.RestorePDResidentPrefix(&ctx, &match, &hints);
+        Check(restored == int(expected.size()) * model.pool.pageLen && match == restored, "PD prefix length with hint");
+        Check(ctx.pastKeyValues[0].first.pageIndex == expected &&
+              ctx.pastKeyValues[0].second.pageIndex == expected, "PD hint returned stale physical pages");
+    };
+    auto pages = publish();
+    restore(input, pages);
+    auto divergent = input;
+    divergent[4] = 99;
+    restore(divergent, {pages.front()});
+    restore(input, pages);
+    // Replace the physical ancestor while the previous endpoint is still a hint.
+    auto rebound = publish();
+    Check(rebound != pages, "test must exercise a physical rebind");
+    restore(input, rebound);
+    divergent[0] = 37;
+    restore(divergent, {});
+}
+
 int main(int argc, char **argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "gpu_pressure") {
             TestGPUAllocatorPressure();
             return 0;
         }
+        TestPDResidentPrefixHints();
+        TestDeferredPDResidentRestore();
         TestAdmissionLifetime();
         CheckLegacySessionPeer();
         CheckLegacySessionPeer(true);

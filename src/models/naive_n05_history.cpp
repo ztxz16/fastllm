@@ -75,14 +75,15 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     RestoreTensorParallelCache(context);
     std::shared_ptr<PrefixSnapshot> queuedPrefix;
     int group = context->pdPrefillGroup, best = 0;
-    const int preferred = tpNextRequestId % attentionDP;
+    // A warm request changes the TP metadata generation both at creation
+    // and at restore. Placement must take one turn per anonymous request.
+    const int preferred = attentionDP > 1 ? AllocatePrefillGroup(group) : 0;
     if (saveHistoryChat && context->multimodalInput.empty()) {
         std::lock_guard<std::mutex> guard(historyMutex);
+        PrefillPrefixPreview *preview = nullptr;
         for (const auto &entry : prefixHistory) {
             if ((draftEnabled && !entry->draftReady) || entry->length < best ||
-                entry->tokens.size() >= context->currentTokens.size() ||
-                !entry->HasResidentPrefix() ||
-                !std::equal(entry->tokens.begin(), entry->tokens.end(), context->currentTokens.begin())) continue;
+                entry->tokens.size() >= context->currentTokens.size()) continue;
             int candidate = 0;
             if (attentionDP > 1) {
                 auto owner = std::find(tpDevices.begin(), tpDevices.end(), entry->ownerDevice);
@@ -90,9 +91,17 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
                 candidate = (owner - tpDevices.begin()) / AttentionTPSize();
                 if (context->pdPrefillGroup >= 0 && candidate != context->pdPrefillGroup) continue;
             }
-            if (entry->length > best || candidate == preferred) {
-                group = candidate; best = entry->length; queuedPrefix = entry;
+            if (entry->length == best && candidate != preferred) continue;
+            if (!preview) {
+                if (!context->prefillPreview) context->prefillPreview = std::make_unique<PrefillPrefixPreview>();
+                preview = context->prefillPreview.get();
+                preview->Reset(context->currentTokens);
             }
+            // The same fingerprint is reused by the subsequent page preview.
+            // Check physical residency and exact tokens only for candidates.
+            if (entry->tokenHash != preview->TokenHash(entry->tokens.size()) || !entry->HasResidentPrefix() ||
+                !std::equal(entry->tokens.begin(), entry->tokens.end(), context->currentTokens.begin())) continue;
+            group = candidate; best = entry->length; queuedPrefix = entry;
         }
     }
     if (attentionDP > 1) {
@@ -100,7 +109,7 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
         for (auto &layer : context->pastKeyValues) roots.emplace_back(&layer.first, &layer.second);
         // Keep continuations on their longest resident prefix; ties prefer RR.
         if (!roots.front().first->multiDeviceData)
-            InitAttentionParallelCache(roots, AllocatePrefillGroup(group));
+            InitAttentionParallelCache(roots, group >= 0 ? group : preferred);
         else if (queuedPrefix && queuedPrefix->ownerDevice != roots.front().first->dataDeviceIds.front())
             queuedPrefix.reset();
     }
@@ -433,7 +442,13 @@ void NaiveN05FlashModel::TryRecordResponseContext(ResponseContext *context) {
             tokenHashes.emplace(snapshot->length, 0);
     size_t hashed = 0;
     uint64_t tokenHash = 0;
+    const auto &preview = context->prefillPreview;
+    const bool prepared = preview && preview->tokens == context->allTokens;
     for (auto &entry : tokenHashes) {
+        if (prepared) {
+            entry.second = preview->TokenHash(entry.first);
+            continue;
+        }
         for (; hashed < (size_t)entry.first; ++hashed)
             tokenHash = tokenHash * PagedCacheManager::TokenHashMultiplier +
                         (uint64_t)context->allTokens[hashed];
@@ -548,12 +563,16 @@ std::vector<std::pair<int, PagedCacheManager *>> NaiveN05FlashModel::GetPagedKVC
 
 std::vector<std::pair<int, PagedCacheManager *>> NaiveN05FlashModel::GetPagedKVCacheManagersForRequest(
         int layer, bool key, const ResponseContext *context) const {
-    auto refs = GetPagedKVCacheManagers(layer, key);
-    if (attentionDP == 1 || !context || context->pastKeyValues.empty()) return refs;
+    if (attentionDP == 1 || !context || context->pastKeyValues.empty())
+        return GetPagedKVCacheManagers(layer, key);
+    if (layer < 0 || layer >= block_cnt || slidingLayers[layer]) return {};
     const auto &devices = context->pastKeyValues.front().first.dataDeviceIds;
-    refs.erase(std::remove_if(refs.begin(), refs.end(), [&](const auto &ref) {
-        return std::find(devices.begin(), devices.end(), ref.first) == devices.end();
-    }), refs.end());
+    std::vector<std::pair<int, PagedCacheManager *>> refs;
+    refs.reserve(devices.size());
+    for (size_t rank = 0; rank < tpPagedCaches.size(); ++rank) {
+        if (std::find(devices.begin(), devices.end(), tpDevices[rank]) != devices.end())
+            refs.emplace_back(tpDevices[rank], tpPagedCaches[rank][layer * 2 + !key].get());
+    }
     return refs;
 }
 
@@ -645,7 +664,9 @@ bool NaiveN05FlashModel::RestorePagedPrefixCacheExtra(ResponseContext *context, 
     auto *self = const_cast<NaiveN05FlashModel *>(this);
     std::shared_ptr<PrefixSnapshot> snapshot;
     if (length < 0 || (size_t)length > context->currentTokens.size()) return false;
-    const uint64_t tokenHash = PagedCacheManager::HashTokenPage(context->currentTokens.data(), length);
+    const auto &preview = context->prefillPreview;
+    const uint64_t tokenHash = preview && preview->tokens == context->currentTokens ?
+        preview->TokenHash(length) : PagedCacheManager::HashTokenPage(context->currentTokens.data(), length);
     {
         std::lock_guard<std::mutex> guard(historyMutex);
         for (auto it = self->prefixHistory.begin(); it != self->prefixHistory.end(); ++it) {
@@ -675,37 +696,46 @@ bool NaiveN05FlashModel::RestorePrefixWindow(ResponseContext *context,
     // Its private hot/SWA slot is attached when the scheduler admits it.
     if (!ReserveWindow(context->pastKeyValues.front().first)) return false;
     self->InvalidateTensorParallelCache(&context->pastKeyValues.front().first);
+    std::function<void()> ownerWindow;
+    int ownerRank = -1;
     if (!sparseKv) {
         const int rows = std::min(length, window - 1), ranks = tpDevices.size();
         const int capacity = tpSwaCacheCapacity ? tpSwaCacheCapacity :
             (window + (draftEnabled ? draftBlock : 0) + 127) / 128 * 128;
         const auto devices = attentionDP > 1 ? context->pastKeyValues.front().first.dataDeviceIds : tpDevices;
-        // Set up shared descriptors on the scheduler thread before rank workers
-        // touch their disjoint local caches. Do not mutate the root maps in parallel.
-        for (int layer = 0; layer < block_cnt; ++layer) {
-            if (!slidingLayers[layer]) continue;
-            for (int part = 0; part < 2; ++part) {
-                Data &root = part ? context->pastKeyValues[layer].second : context->pastKeyValues[layer].first;
-                const int dim = part ? sliding.valueDim : sliding.headDim;
-                root.multiDeviceData = true;
-                root.dataDevice = DataDevice::CUDA;
-                root.dataDeviceIds = devices;
-                root.dataType = AuxiliaryKVType(); root.UpdateUnitSize();
-                root.Resize({1, rows, sliding.kvHeads * dim});
-                root.expansionDims = {1, capacity, sliding.kvHeads * dim};
-                for (int device : devices) {
-                    Data *&cache = root.multiDeviceDatas[device];
-                    if (!cache) cache = new Data(AuxiliaryKVType());
+        const bool oneOwner = pdPrefillOnly && devices.size() == 1;
+        auto setupRoots = [this, context, devices, rows, capacity] {
+            for (int layer = 0; layer < block_cnt; ++layer) {
+                if (!slidingLayers[layer]) continue;
+                for (int part = 0; part < 2; ++part) {
+                    Data &root = part ? context->pastKeyValues[layer].second : context->pastKeyValues[layer].first;
+                    const int dim = part ? sliding.valueDim : sliding.headDim;
+                    root.multiDeviceData = true;
+                    root.dataDevice = DataDevice::CUDA;
+                    root.dataDeviceIds = devices;
+                    root.dataType = AuxiliaryKVType(); root.UpdateUnitSize();
+                    root.Resize({1, rows, sliding.kvHeads * dim});
+                    root.expansionDims = {1, capacity, sliding.kvHeads * dim};
+                    for (int device : devices) {
+                        Data *&cache = root.multiDeviceDatas[device];
+                        if (!cache) cache = new Data(AuxiliaryKVType());
+                    }
                 }
             }
-        }
-        std::vector<std::exception_ptr> errors(ranks);
-        self->tpWorkers.Run(tpDevices, [&](int rank) {
+        };
+        // Only a single owner may initialize a request's root descriptors.
+        // A TP restore initializes shared roots before any worker starts.
+        if (!oneOwner) setupRoots();
+        auto restoreRank = [this, self, context, snapshot, devices, rows, length, capacity, oneOwner, setupRoots](int rank) {
             if (std::find(devices.begin(), devices.end(), tpDevices[rank]) == devices.end()) return;
             FastllmCudaSetDevice(tpDevices[rank]);
+            if (oneOwner) setupRoots();
+            bool invalidated = true; // The owning request was invalidated before scheduling this copy.
             std::vector<void *> dsts;
             std::vector<const void *> srcs;
             std::vector<size_t> sizes;
+            const size_t segments = 2 * size_t(block_cnt) * (tpSwaRingCache ? 2 : 1);
+            dsts.reserve(segments); srcs.reserve(segments); sizes.reserve(segments);
             for (int layer = 0; layer < block_cnt; ++layer) {
                 if (!slidingLayers[layer]) continue;
                 for (int part = 0; part < 2; ++part) {
@@ -716,7 +746,7 @@ bool NaiveN05FlashModel::RestorePrefixWindow(ResponseContext *context,
                     cache->isKVCache = true;
                     cache->dataDevice = DataDevice::CUDA;
                     cache->dataDeviceIds = {tpDevices[rank]};
-                    self->ReserveCache(*cache, capacity, width, true, &context->pastKeyValues.front().first);
+                    self->ReserveCache(*cache, capacity, width, true, &context->pastKeyValues.front().first, invalidated);
                     cache->Resize({1, rows, width});
                     const size_t rowBytes = (size_t)width * cache->unitSize;
                     auto *source = (uint8_t *)snapshot->pool->storage.at(rank).cudaData +
@@ -733,12 +763,30 @@ bool NaiveN05FlashModel::RestorePrefixWindow(ResponseContext *context,
             }
             AssertInFastLLM(FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
                 dsts.data(), srcs.data(), sizes.data(), (int)sizes.size()), "GPU prefix restore failed.");
-            // Copies run concurrently on the persistent rank streams. Complete
-            // them before releasing the snapshot or allowing request cancellation
-            // to recycle destination storage; no device-wide barrier is needed.
+        };
+        auto restoreAndWait = [&](int rank) {
+            try { restoreRank(rank); }
+            catch (...) { FastllmCudaSyncCurrentThreadStream(); throw; }
             FastllmCudaSyncCurrentThreadStream();
-        }, errors);
-        for (auto error : errors) if (error) std::rethrow_exception(error);
+        };
+        if (pdPrefillOnly && devices.size() == 1) {
+            const auto owner = std::find(tpDevices.begin(), tpDevices.end(), devices.front());
+            AssertInFastLLM(owner != tpDevices.end(), "Unknown SWA restore device.");
+            // One owner writes this request. Keep admission synchronous and avoid
+            // waking unrelated rank workers for every shared-prefix hit.
+            struct RestoreDevice {
+                int previous;
+                ~RestoreDevice() { FastllmCudaSetDevice(previous); }
+            } previous{FastllmCudaGetDevice()};
+            ownerRank = int(owner - tpDevices.begin());
+            if (draftEnabled && !snapshot->branchOnly && context->prefillPreview && context->prefillPreview->restore)
+                ownerWindow = [restoreRank, ownerRank] { restoreRank(ownerRank); };
+            else restoreAndWait(ownerRank);
+        } else {
+            std::vector<std::exception_ptr> errors(ranks);
+            self->tpWorkers.Run(tpDevices, restoreAndWait, errors);
+            for (auto error : errors) if (error) std::rethrow_exception(error);
+        }
     }
     if (draftEnabled) {
         // Reconstruct the draft's bounded KV from the exact normalized inputs
@@ -750,7 +798,16 @@ bool NaiveN05FlashModel::RestorePrefixWindow(ResponseContext *context,
             draft = self->CreateDraftContext(context->pastKeyValues.front().first.dataDeviceIds);
             self->draftContexts[&context->pastKeyValues] = draft;
         }
-        self->RestoreDraftPrefix(*snapshot, length, *draft);
+        if (!ownerWindow || !self->StageOwnerRestore(*context->prefillPreview->restore, ownerWindow, snapshot, draft, ownerRank)) {
+            if (ownerWindow) {
+                const int previous = FastllmCudaGetDevice();
+                try { ownerWindow(); }
+                catch (...) { FastllmCudaSyncCurrentThreadStream(); FastllmCudaSetDevice(previous); throw; }
+                FastllmCudaSyncCurrentThreadStream();
+                FastllmCudaSetDevice(previous);
+            }
+            self->RestoreDraftPrefix(*snapshot, length, *draft);
+        }
     }
     context->preTokens = length;
     context->intParams["add_special_tokens"] = 0;
