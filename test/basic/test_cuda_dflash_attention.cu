@@ -129,6 +129,7 @@ int main(int argc,char **argv) {
         for(int runtime:{1,3,8}) for(int window:{8,128,2048,4096})
             runCase(8,window+129,runtime,window,4,2,device);
         for(int group:{1,2,8})runCase(8,257,8,128,group,2,device);
+        runCase(8, 65537, 8, 65600, 1, 1, device);
         // Unsupported query count goes through the complete baseline fallback.
         runCase(17,257,15,128,4,2,device);
         for(int q=1;q<=8;q++) for(int cached:{128,512,1024,2048,2559})

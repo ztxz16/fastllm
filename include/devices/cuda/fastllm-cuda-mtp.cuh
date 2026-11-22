@@ -2,6 +2,16 @@
 #include <cstdint>
 #include <cstddef>
 
+namespace fastllm { class Data; }
+
+// Use the verifier's top-k boundary tie rule and apply top-p on the retained mass.
+extern "C" bool FastllmCudaMtpSampleDraftDeviceTopKFirst(float *logits, float *proposalProbs,
+    float temperature, int topK, float topP, int *output, int vocabSize, fastllm::Data &workspace);
+
+extern "C" bool FastllmCudaMtpRejectionSamplingTopKFirstDeviceIds(float *logits, float *proposalProbs,
+        const float *temperatures, const int *topKs, const float *topPs, const int *deviceTokens,
+        int *output, int *accepted, int batch, int drafts, int vocab);
+
 // Persist q directly into per-request chain storage. A zero stride selects
 // contiguous vocabulary rows. Sampling uses identical probabilities and RNG.
 bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits,

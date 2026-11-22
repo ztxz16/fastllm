@@ -134,6 +134,62 @@ void DeviceFilterCase() {
         }
         cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
     }
+    // Equal target and draft logits must give identical support even when the k-th logit is tied.
+    // With three equal candidates, k=2 and p=0.6 keeps both surviving candidates, in token-ID order.
+    for (const std::vector<float> scores : {std::vector<float>{2, 1, .7f, .4f, 0}, {1, 1, 1, 0, -1}}) {
+        Buffer input(scores), filtered(scores.size());
+        fastllm::Data workspace;
+        auto expected = Oracle(scores, 1, 2, .6f, true);
+        Require(FastllmCudaMtpSampleDraftDeviceTopKFirst(input.p, filtered.p, 1, 2, .6f,
+                token, scores.size(), workspace), "top-k-first draft sampling failed");
+        auto actual = filtered.Read();
+        for (size_t i = 0; i < actual.size(); ++i)
+            Require(std::fabs(actual[i] - expected[i]) < 2e-5, "draft and target filter support differ");
+        std::vector<float> twoRows(scores);
+        twoRows.insert(twoRows.end(), scores.begin(), scores.end());
+        Buffer target(twoRows);
+        int sampled, out[2], accepted, topKs[2] = {2, 2};
+        float temperatures[2] = {1, 1}, topPs[2] = {.6f, .6f};
+        Check(cudaMemcpy(&sampled, token, sizeof(sampled), cudaMemcpyDeviceToHost));
+        Require(FastllmCudaMtpRejectionSamplingTopKFirst(target.p, filtered.p, temperatures, topKs,
+                topPs, &sampled, out, &accepted, 1, 1, scores.size()) && accepted == 1 && sampled == out[0],
+                "equal filtered logits rejected the draft");
+    }
+    // Wide/misaligned vocabulary, ties at k, stale q rows, and fewer than k finite logits.
+    for (int k : {1, 7, 40, 64, 65}) {
+        const int vocab = 200059;
+        std::vector<float> values(vocab);
+        for (int i = 0; i < vocab; ++i)
+            values[i] = k == 7 && i % 50000 ? -INFINITY : -float(i % 10003) * .25f;
+        Buffer input(values), filtered(std::vector<float>(vocab, 1.f));
+        fastllm::Data workspace;
+        for (float p : {.81f, 1.f}) {
+            auto expected = Oracle(values, .75f, k, p, true);
+            Require(FastllmCudaMtpSampleDraftDeviceTopKFirst(input.p, filtered.p, .75f, k, p,
+                    token, vocab, workspace), "compact proposal failed");
+            auto actual = filtered.Read();
+            int sampled;
+            Check(cudaMemcpy(&sampled, token, sizeof(int), cudaMemcpyDeviceToHost));
+            Require(sampled >= 0 && sampled < vocab && actual[sampled] > 0, "sample outside retained q");
+            double error = 0;
+            for (int i = 0; i < vocab; ++i) {
+                Require((actual[i] > 0) == (expected[i] > 0), "compact proposal support differs");
+                error += std::abs(actual[i] - expected[i]);
+            }
+            Require(error < 1.e-5, "compact proposal probabilities differ");
+        }
+    }
+    {
+        Buffer input(std::vector<float>(129, -INFINITY)), filtered(129);
+        fastllm::Data workspace;
+        Require(FastllmCudaMtpSampleDraftDeviceTopKFirst(input.p, filtered.p, 1.f, 40, .9f,
+                token, 129, workspace), "masked proposal failed");
+        int sampled;
+        Check(cudaMemcpy(&sampled, token, sizeof(int), cudaMemcpyDeviceToHost));
+        auto q = filtered.Read();
+        Require(sampled == 0 && std::all_of(q.begin(), q.end(), [](float p) { return p == 0.f; }),
+                "all-masked compact proposals must retain a safe token index and zero mass");
+    }
     cudaFree(token);
     std::puts("DEVICE_FILTER_GRAPH_PASS 24 distributions, 49152 replays, saved q and RNG checked");
 }
