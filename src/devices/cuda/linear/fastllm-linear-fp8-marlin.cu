@@ -904,6 +904,12 @@ bool FastllmCudaHasExactMxfp8Scales(const void *allocation, int device) {
     auto it = registry.mxfp8Scales.find(allocation);
     return it != registry.mxfp8Scales.end() && it->second.device == device && it->second.exact;
 }
+#else
+bool FastllmCudaMxfp8SwaQkv(void *, const void *, const float *, float, const fastllm::Data &,
+                            const float *, void *, int, const float *, float, void *) { return false; }
+const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &, int, int, int) {
+    return nullptr;
+}
 #endif
 
 extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {

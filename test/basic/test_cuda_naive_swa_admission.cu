@@ -15,7 +15,7 @@ int mallocCalls = 0, allocations = 0, frees = 0, memsetCalls = 0;
 int failMalloc = -1, failMemset = -1;
 bool failAttributes = false, failLayerShared = false, failRowsAttributes = false;
 int layerOccupancy = 1, outputRouterOccupancy = 1, rowsOccupancy = 1;
-int verifyFailure[3]{}, mmaFailure = 0, preparedFailure = 0, routedFailure = 0, vectorFailure = 0, directFailure = 0, rowsDirectFailure = 0, widePreparedFailure = 0;
+int verifyFailure[4]{}, mmaFailure = 0, preparedFailure = 0, routedFailure = 0, vectorFailure = 0, directFailure = 0, rowsDirectFailure = 0, widePreparedFailure = 0;
 size_t bytesAllocated = 0;
 const void *launched = nullptr;
 void Require(bool ok, const char *message) { if (!ok) throw std::runtime_error(message); }
@@ -28,7 +28,7 @@ void Env(const char *name, const char *value) {
 }
 void Reset() {
     currentDevice = 3; badDevice = -1; badArch = 103;
-    verifyFailure[0] = verifyFailure[1] = verifyFailure[2] = mmaFailure = preparedFailure = routedFailure = vectorFailure = directFailure = rowsDirectFailure = widePreparedFailure = 0;
+    verifyFailure[0] = verifyFailure[1] = verifyFailure[2] = verifyFailure[3] = mmaFailure = preparedFailure = routedFailure = vectorFailure = directFailure = rowsDirectFailure = widePreparedFailure = 0;
     cooperative = 1; multiprocessors = 148; occupancy = 4; ptx = 120; atomicPeer = 1;
     mallocCalls = allocations = frees = memsetCalls = 0;
     failMalloc = failMemset = -1; failAttributes = false; bytesAllocated = 0; launched = nullptr;
@@ -51,9 +51,12 @@ bool IsRowsKernel(const void *kernel) {
         if (kernel == fastllm_swa_output::OutputRowsKernel(rows)) return true;
     return false;
 }
+int VerifyRows(int variant) {
+    return variant == 1 || variant == 2 ? 64 : 8;
+}
 int VerifyVariant(const void *kernel) {
-    for (int variant = 0; variant < 3; ++variant)
-        if (kernel == fastllm_swa_verify::Kernel(variant ? 64 : 8, variant == 2)) return variant;
+    for (int variant = 0; variant < 4; ++variant)
+        if (kernel == fastllm_swa_verify::Kernel(VerifyRows(variant), variant == 2, variant == 3)) return variant;
     return -1;
 }
 cudaError_t Attributes(cudaFuncAttributes *a, const void *kernel) {
@@ -88,7 +91,7 @@ cudaError_t Occupancy(int *active, const void *kernel, int threads, size_t share
         return currentDevice == 5 && routedFailure == 5 ? cudaErrorInvalidValue : cudaSuccess;
     }
     if (variant >= 0) {
-        Require(shared == fastllm_swa_verify::SharedBytes(variant ? 64 : 8, variant == 2), "unexpected verify occupancy size");
+        Require(shared == fastllm_swa_verify::SharedBytes(VerifyRows(variant), variant == 2, variant == 3), "unexpected verify occupancy size");
         *active = currentDevice == 5 && verifyFailure[variant] == 3 ? 0 : 1;
     } else if (kernel == fastllm_swa_output::OutputRowsKernel(8, true)) {
         *active = currentDevice == 5 && mmaFailure == 2 ? 0 : 1;
@@ -99,7 +102,7 @@ cudaError_t Occupancy(int *active, const void *kernel, int threads, size_t share
 cudaError_t SetAttribute(const void *kernel, cudaFuncAttribute, int bytes) {
     const int variant = VerifyVariant(kernel);
     if (variant >= 0) {
-        Require(bytes == fastllm_swa_verify::SharedBytes(variant ? 64 : 8, variant == 2), "unexpected verify shared memory");
+        Require(bytes == fastllm_swa_verify::SharedBytes(VerifyRows(variant), variant == 2, variant == 3), "unexpected verify shared memory");
         return currentDevice == 5 && verifyFailure[variant] == 2 ? cudaErrorInvalidValue : cudaSuccess;
     }
     Require(bytes == 131072, "unexpected layer shared memory");
@@ -252,7 +255,7 @@ int main() {
             state->ReleaseAfterDrain(); state.reset();
             Require(allocations == frees && currentDevice == 3, "multi-row cleanup failed"); ++checks;
         }
-        for (int variant = 0; variant < 3; ++variant) for (int failure = 0; failure <= 5; ++failure) {
+        for (int variant = 0; variant < 4; ++variant) for (int failure = 0; failure <= 5; ++failure) {
             Reset(); verifyFailure[variant] = failure;
             auto state = SwaOutputState::Create(devices);
             Require(state && state->LayerSupported() && state->RowsSupported() && state->RowsMmaSupported(),
@@ -260,6 +263,10 @@ int main() {
             for (int rows : {1, 8, 9, 16, 36, 64})
                 Require(state->VerifySupported(rows) == (rows > 8 || failure == 0 || variant != 0),
                         "verification variant capability mismatch");
+            for (int rows : {1, 2, 8, 9})
+                Require(state->VerifySupported(rows, true) ==
+                        (rows >= 2 && rows <= 8 && (variant != 3 || failure == 0)),
+                        "MXFP8 verification capability mismatch");
             Require(!state->VerifySupported(0) && !state->VerifySupported(65), "unsupported row count accepted");
             fastllm_swa_verify::Args args{}; args.rows = 16;
             Require(state->LaunchVerify(args, 0, nullptr, nullptr, nullptr) == cudaErrorNotSupported,

@@ -3508,7 +3508,12 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
         return x <= y ? y - x >= a.bytes : x - y >= b.bytes;
     };
     const bool withRouter = routerWeight && router;
-    bool eligible = state.swaOutput->VerifySupported(rows) &&
+    const bool mx = qkvWeight.dataType == FP8_E4M3;
+    const auto *qkvScales = mx ? FastllmCudaVerifyMxfp8Scales(qkvWeight,1856,4096,deviceId) : nullptr;
+    const auto *outputScales = mx ? FastllmCudaVerifyMxfp8Scales(oWeight,4096,1024,deviceId) : nullptr;
+    const auto weightType = mx ? FP8_E4M3 : BFLOAT16;
+    bool eligible = state.swaOutput->VerifySupported(rows, mx) &&
+        (!mx || (qkvScales && outputScales)) &&
         (!prepared || (withRouter && state.swaOutput->PreparedRouterSupported(prepared->routed, rows) && prepared->Valid(rows))) &&
         c.heads == 8 && c.kvHeads == 1 && c.headDim == 192 && c.valueDim == 128 &&
         c.rotaryDim == 64 && c.window == 128 && std::isfinite(c.eps) && c.eps > 0 &&
@@ -3516,9 +3521,9 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
         tensor(hidden, BFLOAT16, elements) && hidden.dims.back() == 4096 &&
         tensor(branch, BFLOAT16, elements) && branch.dims == hidden.dims &&
         tensor(inputNorm, FLOAT32, 4096) && tensor(postNorm, FLOAT32, 4096) &&
-        tensor(qkvWeight, BFLOAT16, 1856 * 4096) && qkvBias.dims.empty() &&
+        tensor(qkvWeight, weightType, 1856 * 4096) && qkvBias.dims.empty() &&
         qkvWeight.dims == std::vector<int>({1856, 4096}) &&
-        tensor(oWeight, BFLOAT16, 4096 * 1024) && oWeight.dims == std::vector<int>({4096, 1024}) &&
+        tensor(oWeight, weightType, 4096 * 1024) && oWeight.dims == std::vector<int>({4096, 1024}) &&
         (sink.dims.empty() || tensor(sink, FLOAT32, 8, 4)) &&
         tensor(position, FLOAT32, rows, 4) && tensor(live, INT32, rows, 4) &&
         bool(routerWeight) == bool(router) &&
@@ -3537,10 +3542,14 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
     std::vector<Range> keys, values;
     std::vector<Range> reads{
         {branch.cudaData, elements * 2}, {inputNorm.cudaData, 4096 * 4},
-        {qkvWeight.cudaData, 1856 * 4096 * 2}, {oWeight.cudaData, 4096 * 1024 * 2},
+        {qkvWeight.cudaData, qkvWeight.GetBytes()}, {oWeight.cudaData, oWeight.GetBytes()},
         {postNorm.cudaData, 4096 * 4}, {sink.cudaData, sink.dims.empty() ? 0u : 32u},
         {position.cudaData, size_t(std::max(0, rows)) * 4},
         {live.cudaData, size_t(std::max(0, rows)) * 4}};
+    if (mx) {
+        reads.push_back({qkvScales,1856 * 4096 / 32 * sizeof(float)});
+        reads.push_back({outputScales,4096 * 1024 / 32 * sizeof(float)});
+    }
     if (withRouter) reads.push_back({routerWeight->cudaData, 256 * 4096 * 4});
     if (eligible) for (int i = 0; i < rows; ++i) {
         const auto &r = caches[i];
@@ -3607,6 +3616,7 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
     if (!FindOrRegisterCustomArPointers(state, rank, projected.cudaData, int(elements),
             BFLOAT16, eligible, registered)) return false;
     using BF16Value = fastllm_swa_output::BF16;
+    args.outputScales = outputScales;
     args.branch = (const BF16Value *)branch.cudaData;
     args.weight = (const BF16Value *)qkvWeight.cudaData;
     args.oWeight = (const BF16Value *)oWeight.cudaData;
@@ -3619,6 +3629,25 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
     args.bindings.length = (const int *)live.cudaData;
     args.sink = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
     args.rows = rows; args.eps = c.eps; args.theta = c.theta; args.scale = c.valueScale;
+    if (mx) {
+        // Preserve native QKV rounding before attention and O re-quantize
+        // its result. Borrow the larger projected buffer until the fused tail.
+        if (!FastllmCudaMxfp8SwaQkv(hidden.cudaData, branch.cudaData, args.gamma, c.eps,
+                                    qkvWeight, qkvScales, projected.cudaData, rows, args.positions, c.theta, normed.cudaData)) {
+            Data packed(BFLOAT16);
+            auto dims = hidden.dims;
+            dims.back() = 1856;
+            packed.Resize(dims);
+            packed.FakeFrom(projected, 0);
+            FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, inputNorm, c.eps, normed);
+            if (!FastllmCudaBFloat16MatMulFP8E4M3(normed, const_cast<Data &>(qkvWeight), qkvBias,
+                                                   packed, rows, 4096, 1856))
+                throw std::runtime_error("SWA MXFP8 QKV projection failed after collective admission");
+        } else {
+            args.rotary = static_cast<const __nv_bfloat162 *>(normed.cudaData);
+        }
+        args.branch = nullptr;
+    }
     const cudaError_t status = state.swaOutput->LaunchVerify(args, rank, (const float *)postNorm.cudaData,
         withRouter ? (const float *)routerWeight->cudaData : nullptr,
         withRouter ? (float *)router->cudaData : nullptr, prepared);

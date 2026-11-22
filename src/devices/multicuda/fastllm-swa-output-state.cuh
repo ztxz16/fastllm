@@ -18,7 +18,7 @@ class SwaOutputState {
     fastllm_swa_output::Peers peers;
     uint64_t *epochs[8]{};
     const void *const kernel = (const void *)fastllm_swa_output::OutputNorm<32>;
-    bool verifySupported[3]{};
+    bool verifySupported[4]{};
     bool layerSupported = false, outputRouterSupported = false, rowsSupported = false;
     bool rowsRouterExpertsSupported = false, rowsMmaSupported = false;
     bool preparedRouterSupported = false, routedRouterSupported = false;
@@ -139,7 +139,8 @@ public:
         }
         return cudaGetLastError();
     }
-    bool VerifySupported(int rows) const {
+    bool VerifySupported(int rows, bool mx = false) const {
+        if (mx) return rows >= 2 && rows <= 8 && verifySupported[3];
         return rows >= 1 && rows <= fastllm_swa_verify::RowLimit &&
             (rows <= 8 ? verifySupported[0] : verifySupported[1] || verifySupported[2]);
     }
@@ -149,9 +150,26 @@ public:
         args.peers = peers; args.epochs = epochs[rank]; args.rank = rank;
         void *params[] = {&args};
         const bool wide = args.rows > 8 && verifySupported[2];
-        cudaError_t status = cudaLaunchCooperativeKernel(fastllm_swa_verify::Kernel(args.rows, wide),
-            dim3(128), dim3(fastllm_swa_verify::Threads(args.rows)), params,
-            fastllm_swa_verify::SharedBytes(args.rows, wide), cudaStreamPerThread);
+        const bool mx = args.outputScales != nullptr;
+        const auto *kernel = fastllm_swa_verify::Kernel(args.rows, wide, mx);
+        const int threads = fastllm_swa_verify::Threads(args.rows);
+        const int shared = fastllm_swa_verify::SharedBytes(args.rows, wide, mx);
+        cudaError_t status;
+#if CUDART_VERSION >= 12000
+        if (args.rotary) {
+            cudaLaunchAttribute attrs[2]{};
+            attrs[0].id = cudaLaunchAttributeCooperative;
+            attrs[0].val.cooperative = 1;
+            attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[1].val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t cfg{};
+            cfg.gridDim = dim3(128); cfg.blockDim = dim3(threads);
+            cfg.dynamicSmemBytes = shared; cfg.stream = cudaStreamPerThread;
+            cfg.attrs = attrs; cfg.numAttrs = 2;
+            status = cudaLaunchKernelExC(&cfg, kernel, params);
+        } else
+#endif
+            status = cudaLaunchCooperativeKernel(kernel, dim3(128), dim3(threads), params, shared, cudaStreamPerThread);
         if (status != cudaSuccess) return status;
         return LaunchRowsNorm(args.hidden, normWeight, args.normed, args.eps,
                               routerWeight, router, args.rows, prepared);
@@ -238,19 +256,20 @@ private:
         // Every schedule reuses the established mailbox and must be resident
         // on all ranks. The direct-input query tile falls back to the original
         // N8 staging schedule when its required resources are unavailable.
-        for (int variant = 0; variant < 3; ++variant) {
+        for (int variant = 0; variant < 4; ++variant) {
             verifySupported[variant] = stagesEnabled;
             if (!stagesEnabled) continue;
-            const int rows = variant ? 64 : 8;
-            const void *entry = fastllm_swa_verify::Kernel(rows, variant == 2);
+            const int rows = variant == 1 || variant == 2 ? 64 : 8;
+            const void *entry = fastllm_swa_verify::Kernel(rows, variant == 2, variant == 3);
             const int threads = fastllm_swa_verify::Threads(rows);
-            const int shared = fastllm_swa_verify::SharedBytes(rows, variant == 2);
+            const int shared = fastllm_swa_verify::SharedBytes(rows, variant == 2, variant == 3);
             for (int device : requested) {
                 cudaDeviceProp p{}; cudaFuncAttributes a{}; int active = 0;
                 if (cudaSetDevice(device) != cudaSuccess ||
                     cudaGetDeviceProperties(&p, device) != cudaSuccess ||
                     cudaFuncSetAttribute(entry, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) != cudaSuccess ||
                     cudaFuncGetAttributes(&a, entry) != cudaSuccess || a.ptxVersion < 80 ||
+                    (variant == 3 && (p.major != 10 || p.minor != 3 || a.ptxVersion < 89)) ||
                     a.maxThreadsPerBlock < threads ||
                     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, entry, threads, shared) != cudaSuccess ||
                     active * p.multiProcessorCount < 128) {

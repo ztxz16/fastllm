@@ -5,6 +5,7 @@
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "utils/utils.h"
+#include "naive_n05_mxfp8_test.h"
 #include <cuda_runtime_api.h>
 #include <array>
 #include <algorithm>
@@ -27,6 +28,7 @@ void Require(bool ok, const char *why) {
 void Cuda(cudaError_t e) {
     Require(e == cudaSuccess, cudaGetErrorString(e));
 }
+bool testMxProjection = false;
 template <class F> void Parallel(F fn) {
     std::array<std::exception_ptr, 8> errors{};
     std::vector<std::thread> workers;
@@ -34,6 +36,9 @@ template <class F> void Parallel(F fn) {
         workers.emplace_back([&, r] {
             try {
                 FastllmCudaSetDevice(r);
+                std::shared_ptr<void> lease;
+                std::unique_ptr<FastllmCudaLinearGraphScope> scope;
+                if (testMxProjection) scope = std::make_unique<FastllmCudaLinearGraphScope>(lease);
                 fn(r);
             } catch (...) {
                 errors[r] = std::current_exception();
@@ -136,7 +141,7 @@ struct Tensors {
     bool hasSink = true, indirect = false, withRouter = true;
     std::array<double, 8> maxL2{};
     FastllmSwaLayerConfig config{8, 1, 192, 128, 64, 128, 1e-5f, 10000.f, 1.f};
-    Tensors(int rank, int count, bool ragged)
+    Tensors(int rank, int count, bool ragged, bool mx = false)
         : rows(count), requests(ragged ? 8 : (count + 7) / 8), actual(rank, count, requests),
           reference(rank, count, requests), alternate(rank, count, requests) {
         for (int seq = 0; int(owner.size()) < rows; ++seq)
@@ -150,6 +155,7 @@ struct Tensors {
                 std::swap(offset[i], offset[rows - 1 - i]);
             }
         Init(branch, {1, rows, 4096}, rank);
+        if (mx) { qkv.dataType = o.dataType = FP8_E4M3; qkv.UpdateUnitSize(); o.UpdateUnitSize(); }
         Init(qkv, {1856, 4096}, rank);
         Init(o, {4096, 1024}, rank);
         Init(routerWeight, {256, 4096}, rank);
@@ -158,8 +164,8 @@ struct Tensors {
         Init(sink, {8}, rank);
         Init(position, {rows}, rank);
         Init(live, {rows}, rank);
-        Fill(qkv, 31 + rank, .02f);
-        Fill(o, 93 + rank, .02f);
+        if (mx) { FillVerifyMxWeight(qkv,31+rank); FillVerifyMxWeight(o,93+rank); }
+        else { Fill(qkv,31+rank,.02f); Fill(o,93+rank,.02f); }
         Fill(inputNorm, 731, .2f, 1.f);
         Fill(postNorm, 83, .2f, 1.f);
         Fill(routerWeight, 582, .02f);
@@ -235,6 +241,12 @@ struct Tensors {
             Init(vTemp, {1, count, 128}, rank);
             std::vector<FastllmNaiveRopeCacheRow> chunk(bindings.begin() + first,
                                                         bindings.begin() + first + count);
+            if (qkv.dataType == FP8_E4M3) {
+                Init(scratch,{1,count,1856},rank);
+                Require(VerifyMxLinearReference(n,qkv,bias,scratch,count,4096,1856),"MXFP8 QKV");
+                Require(FastllmCudaNaiveBatchRopeAppendCache(q,kTemp,vTemp,p,chunk,l,8,1,192,128,64,
+                    config.theta,config.valueScale,128,&scratch,false),"MXFP8 reference RoPE");
+            } else
             Require(FastllmCudaNaiveBatchQkvRopeAppendCache(n, qkv, bias, q, kTemp, vTemp, p, chunk, l, 8, 1,
                                                             192, 128, 64, config.theta, config.valueScale,
                                                             128, false, scratch),
@@ -245,7 +257,7 @@ struct Tensors {
             attention.push_back(
                 {b.key->cudaData, b.value->cudaData, nullptr, false, true, 0, b.verifyOffset});
         FastllmCudaNaiveBatchSWADecode(s.q, hasSink ? sink : bias, attention, live, 8, 1, s.attn);
-        Require(FastllmCudaBFloat16MatMulBFloat16(s.attn, o, bias, s.projected, rows, 1024, 4096),
+        Require((o.dataType == FP8_E4M3 ? VerifyMxLinearReference : FastllmCudaBFloat16MatMulBFloat16)(s.attn, o, bias, s.projected, rows, 1024, 4096),
                 "reference projection failed");
         Require(FastllmCudaCustomAllReduceRows(s.projected.cudaData, s.projected.cudaData, rows * 4096, 4096,
                                                BFLOAT16, rank),
@@ -300,7 +312,8 @@ struct Tensors {
             if (invalid == 15)
                 bindings[1].verifyOffset = bindings[0].verifyOffset;
         }
-        return FastllmCudaSwaVerifyLayer(b, h, inputNorm, qw, bias, o, postNorm, hasSink ? sink : bias,
+        const bool useOwnedWeight = qkv.dataType == FP8_E4M3 && !(rank == 3 && (invalid == 2 || invalid == 11));
+        return FastllmCudaSwaVerifyLayer(b, h, inputNorm, useOwnedWeight ? qkv : qw, bias, o, postNorm, hasSink ? sink : bias,
                                          position, live, bindings, invalid == 13 && rank == 3 ? h : q, a, p,
                                          n, &feature, withRouter ? &routerWeight : nullptr,
                                          withRouter ? &router : nullptr, c, rank);
@@ -316,6 +329,10 @@ struct Tensors {
         for (size_t kind = 0; kind < 8; ++kind) {
             auto av = Read(*a[kind]), bv = Read(*b[kind]);
             const bool cache = kind == 5 || kind == 6;
+            // Native MXFP8 QKV and BF16 attention retain both rounding boundaries.
+            if (testMxProjection && (kind == 2 || kind == 3 || cache) && av != bv)
+                throw std::runtime_error(std::string(names[kind]) + " differs from native MXFP8 reference");
+
             const size_t width = cache ? (kind == 5 ? 192 : 128) : a[kind]->Count(0) / rows;
             for (int row = 0; row < rows; ++row) {
                 int length;
@@ -339,6 +356,8 @@ struct Tensors {
 } // namespace
 int main(int argc, char **argv) {
     try {
+        const bool mx = argc > 1 && std::strcmp(argv[1],"--mxfp8")==0;
+        testMxProjection = mx;
         const bool fusionDisabled = argc > 1 && std::strcmp(argv[1], "--disabled") == 0;
         const bool qkvDisabled = argc > 1 && std::strcmp(argv[1], "--qkv-disabled") == 0;
         const bool coreDisabled = argc > 1 && std::strcmp(argv[1], "--core-disabled") == 0;
@@ -360,13 +379,13 @@ int main(int argc, char **argv) {
             return 77;
         int cases = 0;
         std::array<double, 8> maximum{};
-        for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 36, 48, 63, 64, 8}) {
+        for (int rows : mx ? std::vector<int>{2, 3, 4, 5, 6, 7, 8} : std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 24, 31, 32, 33, 36, 48, 63, 64, 8}) {
             std::array<std::unique_ptr<Tensors>, 8> data;
             std::array<int, 8> accepted{};
             Parallel([&](int r) {
                 Require(disabled || FastllmCudaSwaVerifyLayerSupported(r, rows),
                         "verification backend unavailable");
-                data[r] = std::make_unique<Tensors>(r, rows, rows == 36);
+                data[r] = std::make_unique<Tensors>(r, rows, rows == 36 || (mx && (rows == 5 || rows == 7)), mx);
             });
             if (disabled) {
                 Parallel([&](int r) {
@@ -429,6 +448,7 @@ int main(int argc, char **argv) {
                     auto &d = *data[r];
                     d.indirect = true;
                     d.Bind(false);
+                    if (mx) Require(FastllmCudaVerifyMxfp8Scales(d.qkv,1856,4096,r),"cold MXFP8 scales");
                     Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
                     accepted[r] = d.Fused(r);
                     cudaGraph_t graph = nullptr;
@@ -438,7 +458,8 @@ int main(int argc, char **argv) {
                 });
                 for (int ok : accepted)
                     Require(ok, "warm graph capture rejected");
-                for (int past : {1, 128, 129, 8192, 63, -1}) {
+                // Replay across the committed-key staging boundary on the same graph.
+                for (int past : {1, 128, 129, 8192, 63, 95, 96, -1}) {
                     int seed = ++cases;
                     Parallel([&](int r) {
                         auto &d = *data[r];

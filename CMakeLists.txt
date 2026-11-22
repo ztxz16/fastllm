@@ -2800,6 +2800,11 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_swa_verify_layer naive_n05_swa_verify_layer_disabled
                 naive_n05_swa_verify_layer_qkv_disabled naive_n05_swa_verify_layer_core_disabled PROPERTIES
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 480)
+            if (TARGET fastllm_mxfp8_linear_sm103)
+                add_test(NAME naive_n05_swa_verify_mxfp8 COMMAND naive_n05_swa_verify_layer_test --mxfp8)
+                set_tests_properties(naive_n05_swa_verify_mxfp8 PROPERTIES
+                    LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            endif()
             add_executable(naive_n05_swa_layer_test test/basic/test_cuda_naive_swa_layer.cpp)
             target_link_libraries(naive_n05_swa_layer_test PRIVATE fastllm)
             target_include_directories(naive_n05_swa_layer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

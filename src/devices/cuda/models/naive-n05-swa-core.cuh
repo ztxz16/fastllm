@@ -3,12 +3,15 @@
 // The default PV keeps slot-ordered FP32 accumulation. Verification may select
 // Tensor Core PV: the same BF16 probabilities/values, with a different FP32 sum
 // order. Keep the scalar implementation for existing callers and older SMs.
+constexpr int PackedSwaStagedKeys = 96;
+
 template <int Threads = 1024, int Tile = 32, bool Dynamic = false, typename Binding = const void *const *,
-          bool MmaPV = false, bool ReuseShared = false, bool TensorQK = false>
+          bool MmaPV = false, bool ReuseShared = false, bool TensorQK = false, bool PackedVerify = false>
 __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *k, const BF16 *v,
                                                      const float *sink, BF16 *out, const int *live, int heads,
                                                      int kvHeads, const Binding &cache, int row, int head,
-                                                     int valueTile) {
+                                                     int valueTile, const BF16 *headQuery = nullptr,
+                                                     const uint64_t *epochs = nullptr, int writers = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr bool TensorPV = MmaPV;
 #else
@@ -17,7 +20,7 @@ __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *
     // Serving graphs bind request-owned rings through the stable four-pointer
     // table. Resolve it at replay; padded rows never dereference a null entry.
     constexpr bool Descriptors = std::is_same<Binding, BatchSwaKeys>::value;
-    q += (size_t)row * heads * 192;
+    q = headQuery ? headQuery : q + ((size_t)row * heads + head) * 192;
     out += (size_t)row * heads * 128;
     int length;
     if constexpr (Descriptors)
@@ -59,16 +62,25 @@ __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *
     __shared__ __align__(16) Value localValue[ReuseShared ? 1 : 128][Tile];
     extern __shared__ __align__(128) unsigned char stage[];
     Value(*value)[Tile] = ReuseShared ? reinterpret_cast<Value(*)[Tile]>(stage) : localValue;
-    for (int i = t; i < (TensorPV ? 128 : keys) * (Tile / 8); i += Threads) {
-        const int slot = i / (Tile / 8), col = i % (Tile / 8) * 8;
-        const uint4 packed =
-            !TensorPV || slot < keys
-                ? *reinterpret_cast<const uint4 *>(v + physical(slot) * kvHeads * 128 + kh * 128 + dim0 + col)
-                : make_uint4(0, 0, 0, 0);
-        // XOR-swizzled 8-element vectors avoid ldmatrix bank conflicts.
-        const int column = TensorPV ? col ^ ((slot & (Tile / 8 - 1)) * 8) : col;
-        *reinterpret_cast<uint4 *>(&value[slot][column]) = packed;
+    int committed = keys;
+    if constexpr (PackedVerify) {
+        static_assert(Descriptors && ReuseShared && MmaPV && !TensorQK);
+        committed = max(0, keys - max(0, cache.rows[row].verifyOffset + 1));
     }
+    auto loadValues = [&](int start, int stop) {
+        for (int i = start * (Tile / 8) + t; i < stop * (Tile / 8); i += Threads) {
+            const int slot = i / (Tile / 8), col = i % (Tile / 8) * 8;
+            const int column = TensorPV ? col ^ ((slot & (Tile / 8 - 1)) * 8) : col;
+            auto *dst = reinterpret_cast<uint4 *>(&value[slot][column]);
+            if (TensorPV && slot >= keys) {
+                *dst = make_uint4(0, 0, 0, 0);
+                continue;
+            }
+            const BF16 *src = v + physical(slot) * kvHeads * 128 + kh * 128 + dim0 + col;
+            *dst = *reinterpret_cast<const uint4 *>(src);
+        }
+    };
+    if constexpr (!PackedVerify) loadValues(0, TensorPV ? 128 : keys);
     if constexpr (TensorQK && TensorPV) {
         for (int task = warp; task < 8; task += Threads / 32) {
             const int group = lane / 4, quad = lane % 4;
@@ -81,7 +93,7 @@ __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *
                     a = *reinterpret_cast<const uint4 *>(k + physical(s0) * kvHeads * 192 + kh * 192 + ki);
                 if (s1 < keys)
                     b = *reinterpret_cast<const uint4 *>(k + physical(s1) * kvHeads * 192 + kh * 192 + ki);
-                uint4 x = *reinterpret_cast<const uint4 *>(q + h * 192 + ki);
+                uint4 x = *reinterpret_cast<const uint4 *>(q + ki);
                 fastllm_swa_mma::Step(c, a, b, x);
             }
             if (quad == 0) {
@@ -95,54 +107,125 @@ __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *
         float query[6];
 #pragma unroll
         for (int j = 0; j < 6; ++j)
-            query[j] = float(q[h * 192 + lane + j * 32]);
-        for (int slot = warp; slot < keys; slot += Threads / 32) {
-            float dot = 0.f;
+            query[j] = float(q[lane + j * 32]);
+        auto scoreRange = [&](int start, int stop) {
+            for (int slot = start + warp; slot < stop; slot += Threads / 32) {
+                float dot = 0.f;
 #pragma unroll
-            for (int j = 0; j < 6; ++j)
-                dot += query[j] * float(k[physical(slot) * kvHeads * 192 + kh * 192 + lane + j * 32]);
-            dot = WarpSum(dot);
-            if (lane == 0)
-                score[slot] = RoundBF16(RoundBF16(dot) * rsqrtf(192.f));
+                for (int j = 0; j < 6; ++j)
+                    dot += query[j] * float(k[physical(slot) * kvHeads * 192 + kh * 192 + lane + j * 32]);
+                dot = WarpSum(dot);
+                if (lane == 0)
+                    score[slot] = RoundBF16(RoundBF16(dot) * rsqrtf(192.f));
+            }
+        };
+        if constexpr (PackedVerify) {
+            static_assert(Threads == 1024);
+            if (committed >= PackedSwaStagedKeys) {
+                // Four independent key slots per warp. Interleave their loads
+                // without changing the six FP32 FMAs or the warp reduction.
+                float dots[4] = {};
+#pragma unroll
+                for (int j = 0; j < 6; ++j) {
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int slot = warp + i * 32;
+                        if (i < 3 || slot < committed) {
+                            const auto *key = reinterpret_cast<const BF16 *>(stage) + 128 * Tile;
+                            dots[i] += query[j] * float(key[slot * 192 + lane + j * 32]);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float dot = WarpSum(dots[i]);
+                    if (lane == 0 && warp + i * 32 < committed)
+                        score[warp + i * 32] = RoundBF16(RoundBF16(dot) * rsqrtf(192.f));
+                }
+            } else scoreRange(0, committed);
+        } else scoreRange(0, committed);
+        if constexpr (PackedVerify) {
+            // Only the candidate suffix is being written. The committed ring
+            // can supply QK and V while the producer CTAs publish the suffix.
+            if (t < writers) {
+                auto *flag = reinterpret_cast<const unsigned *>(epochs + 1 + t) + 1;
+                unsigned ready;
+                do {
+                    asm volatile("ld.acquire.gpu.global.u32 %0,[%1];" : "=r"(ready) : "l"(flag) : "memory");
+                } while (!ready);
+            }
+            __syncthreads();
+            loadValues(committed, 128);
+            scoreRange(committed, keys);
         }
     }
     __syncthreads();
     const float bias = sink ? sink[h] : -INFINITY;
-    if (t < 256)
-        scratch[t] = t < keys ? fmaxf(bias, score[t]) : bias;
-    __syncthreads();
-    if (t < 32) {
-        float a = fmaxf(scratch[t], scratch[t + 128]), b = fmaxf(scratch[t + 64], scratch[t + 192]);
-        float c = fmaxf(scratch[t + 32], scratch[t + 160]), d = fmaxf(scratch[t + 96], scratch[t + 224]);
-        float mx = fmaxf(fmaxf(a, b), fmaxf(c, d));
-        for (int offset = 16; offset; offset >>= 1)
-            mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, offset));
-        if (t == 0)
-            maximum = mx;
-    }
-    __syncthreads();
-    float p = t < keys ? expf(score[t] - maximum) : 0.f, sum = p;
-    if (t == 0 && sink)
-        sum += expf(bias - maximum);
-    if (t < 256)
-        scratch[t] = sum;
-    __syncthreads();
-    if (t < 32) {
-        float a = scratch[t] + scratch[t + 128], b = scratch[t + 64] + scratch[t + 192],
-              c = scratch[t + 32] + scratch[t + 160], d = scratch[t + 96] + scratch[t + 224];
-        float total = WarpSum((a + b) + (c + d));
-        if (t == 0)
-            denominator = total;
-    }
-    __syncthreads();
-    if (t < keys)
-        score[t] = denominator > 0 ? RoundBF16(p / denominator) : 0.f;
-    __syncthreads();
-    if constexpr (TensorPV) {
-        __shared__ __align__(16) BF16 probability[128];
-        if (t < 128)
-            probability[t] = __float2bfloat16_rn(t < keys ? score[t] : 0.f);
+    __shared__ __align__(16) BF16 probability[TensorPV ? 128 : 1];
+    if constexpr (PackedVerify && TensorPV) {
+        // A warp owns the 128 scores. Keep the same four-lane grouping and
+        // sink addition as the full-block reduction before rounding P to BF16.
+        if (t < 32) {
+            float vals[4], largest = bias;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int slot = t + i * 32;
+                vals[i] = slot < keys ? score[slot] : -INFINITY;
+                largest = fmaxf(largest, vals[i]);
+            }
+            for (int offset = 16; offset; offset >>= 1)
+                largest = fmaxf(largest, __shfl_down_sync(0xffffffff, largest, offset));
+            largest = __shfl_sync(0xffffffff, largest, 0);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                vals[i] = t + i * 32 < keys ? expf(vals[i] - largest) : 0.f;
+            float first = vals[0];
+            if (t == 0 && sink) first += expf(bias - largest);
+            const float total = WarpSum((first + vals[2]) + (vals[1] + vals[3]));
+            const float denom = __shfl_sync(0xffffffff, total, 0);
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                probability[t + i * 32] = __float2bfloat16_rn(denom > 0 ? vals[i] / denom : 0.f);
+        }
         __syncthreads();
+    } else {
+        if (t < 256)
+            scratch[t] = t < keys ? fmaxf(bias, score[t]) : bias;
+        __syncthreads();
+        if (t < 32) {
+            float a = fmaxf(scratch[t], scratch[t + 128]), b = fmaxf(scratch[t + 64], scratch[t + 192]);
+            float c = fmaxf(scratch[t + 32], scratch[t + 160]), d = fmaxf(scratch[t + 96], scratch[t + 224]);
+            float mx = fmaxf(fmaxf(a, b), fmaxf(c, d));
+            for (int offset = 16; offset; offset >>= 1)
+                mx = fmaxf(mx, __shfl_down_sync(0xffffffff, mx, offset));
+            if (t == 0)
+                maximum = mx;
+        }
+        __syncthreads();
+        float p = t < keys ? expf(score[t] - maximum) : 0.f, sum = p;
+        if (t == 0 && sink)
+            sum += expf(bias - maximum);
+        if (t < 256)
+            scratch[t] = sum;
+        __syncthreads();
+        if (t < 32) {
+            float a = scratch[t] + scratch[t + 128], b = scratch[t + 64] + scratch[t + 192],
+                  c = scratch[t + 32] + scratch[t + 160], d = scratch[t + 96] + scratch[t + 224];
+            float total = WarpSum((a + b) + (c + d));
+            if (t == 0)
+                denominator = total;
+        }
+        __syncthreads();
+        if (t < keys)
+            score[t] = denominator > 0 ? RoundBF16(p / denominator) : 0.f;
+        __syncthreads();
+        if constexpr (TensorPV) {
+            if (t < 128)
+                probability[t] = __float2bfloat16_rn(t < keys ? score[t] : 0.f);
+            __syncthreads();
+        }
+    }
+    if constexpr (TensorPV) {
         // One warp computes 16 output columns. Replicate P across the MMA's
         // eight columns and retain column zero; no extra global workspace.
         if (warp < Tile / 16) {

@@ -46,3 +46,12 @@ bool FastllmCudaMxfp8LinearSM103(const void *input, fastllm::Data &weight, void 
                                  int rows, int inner, int channels);
 void FastllmCudaRegisterMxfp8Scales(fastllm::Data &weight, void *allocation);
 bool FastllmCudaHasExactMxfp8Scales(const void *allocation, int device);
+
+// Graph-safe attention projection admission. Return borrowed K32 scales only when
+// the unfused Linear would also use block-quantized activations on this worker.
+const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &weight, int channels, int inner, int device);
+
+// Small-row SWA projection; false leaves the residual and scratch outputs untouched.
+bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma, float eps,
+                            const fastllm::Data &weight, const float *scales, void *output, int rows,
+                            const float *positions, float theta, void *rotary);

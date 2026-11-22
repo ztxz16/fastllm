@@ -4,6 +4,7 @@
 // Borrow original BF16 weights and existing graph-owned output/mailbox storage.
 // Rows are flattened queries, with per-request candidate offsets in [0,7].
 #include <cooperative_groups.h>
+#include "../cuda/models/naive-n05-mxfp8-projection.cuh"
 #include "fastllm-swa-output.cuh"
 #include "../cuda/models/naive-n05-swa-mma.cuh"
 namespace fastllm_swa_verify {
@@ -34,7 +35,8 @@ struct BatchSwaKeys {
 struct Args {
     const BF16 *branch, *weight, *oWeight;
     BF16 *hidden, *q, *attn, *projected, *feature, *normed;
-    const float *gamma, *positions, *sink;
+    const float *gamma, *positions, *sink, *outputScales;
+    const __nv_bfloat162 *rotary = nullptr;
     float eps, theta, scale;
     int rows, rank;
     BatchSwaKeys bindings;
@@ -333,8 +335,8 @@ __device__ __forceinline__ void Project(const Args &a, int first, unsigned char 
 }
 #include "../cuda/models/naive-n05-swa-core.cuh"
 
-template <int Threads, int Chunks = 1, bool DirectInput = false>
-__device__ __forceinline__ void Tail(const Args &a, int first) {
+template <int Threads, int Chunks = 1, bool DirectInput = false, bool Mx = false>
+__device__ __forceinline__ void Tail(const Args &a, int first, const fastllm_mxfp8_projection::WeightFragment *weights = nullptr) {
     constexpr int KWarps = Threads / 64;
     const int t = threadIdx.x, lane = t % 32, warp = t / 32, g = lane / 4, quad = lane % 4;
     const int rows = min(Chunks * 8, a.rows - first), column = blockIdx.x * 32,
@@ -349,6 +351,13 @@ __device__ __forceinline__ void Tail(const Args &a, int first) {
             *reinterpret_cast<uint4 *>(tile + (r / 8) * 16384 + InputOffset(r % 8, col)) =
                 r < rows ? *reinterpret_cast<const uint4 *>(a.attn + (first + r) * 1024 + col)
                          : make_uint4(0, 0, 0, 0);
+        }
+    }
+    __nv_bfloat162 prior{};
+    if constexpr (Mx) {
+        if (t < rows * 16) {
+            const int index = (first + t / 16) * 4096 + column + (t % 16) * 2;
+            prior = *reinterpret_cast<const __nv_bfloat162 *>(a.hidden + index);
         }
     }
     if (t < min(8, rows)) {
@@ -367,17 +376,26 @@ __device__ __forceinline__ void Tail(const Args &a, int first) {
 #pragma unroll
     for (int col = part * 32; col < 1024; col += KWarps * 32) {
         int k = col + quad * 8;
-        uint4 w0 = *reinterpret_cast<const uint4 *>(a.oWeight + size_t(column + group * 16 + g) * 1024 + k);
-        uint4 w1 = *reinterpret_cast<const uint4 *>(a.oWeight + size_t(column + group * 16 + g + 8) * 1024 + k);
+        uint4 w0, w1;
+        if constexpr (!Mx) {
+            w0 = *reinterpret_cast<const uint4 *>(a.oWeight + size_t(column + group * 16 + g) * 1024 + k);
+            w1 = *reinterpret_cast<const uint4 *>(a.oWeight + size_t(column + group * 16 + g + 8) * 1024 + k);
+        }
 #pragma unroll
         for (int chunk = 0; chunk < Chunks; ++chunk) {
             uint4 x;
             if constexpr (DirectInput) {
                 const int row = chunk * 8 + g;
-                x = row < rows ? *reinterpret_cast<const uint4 *>(a.attn + (first + row) * 1024 + k) : make_uint4(0, 0, 0, 0);
-            } else
+                x = row < rows ? *reinterpret_cast<const uint4 *>(a.attn + (first + row) * 1024 + k)
+                               : make_uint4(0, 0, 0, 0);
+            } else {
                 x = *reinterpret_cast<const uint4 *>(tile + chunk * 16384 + InputOffset(g, k));
-            Step(c[chunk], w0, w1, x);
+            }
+            if constexpr (Mx) {
+                fastllm_mxfp8_projection::Step(c[chunk], weights[col / (KWarps * 32)], x);
+            } else {
+                Step(c[chunk], w0, w1, x);
+            }
         }
     }
 #pragma unroll
@@ -411,7 +429,9 @@ __device__ __forceinline__ void Tail(const Args &a, int first) {
                 Store(a.peers.data[peer] + frame + row * 8 * SlotBytes + a.rank * SlotBytes + word * 8,
                       (uint64_t(bits) << 32) | (step[chunk][row] + 1));
             }
-            __syncthreads();
+            // MX uses a single N8 frame. Each load waits on its own tagged
+            // payload, including the local rank's publication.
+            if constexpr (!Mx) __syncthreads();
             for (int i = t; i < chunkRows * 8 * 16; i += Threads) {
                 int row = i / 128, peer = i / 16 % 8, pair = i % 16, word = column / 2 + pair;
                 size_t frame = (step[chunk][row] % Frames) * FrameBytes;
@@ -440,13 +460,21 @@ __device__ __forceinline__ void Tail(const Args &a, int first) {
                 }
             }
             int index = (first + chunk * 8 + row) * 4096 + column + pair * 2;
-            BF16 bx = __float2bfloat16_rn(x), by = __float2bfloat16_rn(y);
-            a.projected[index] = bx;
-            a.projected[index + 1] = by;
-            float h0 = RoundBF16(float(a.hidden[index]) + (a.branch ? float(a.branch[index]) : 0.f)),
-                  h1 = RoundBF16(float(a.hidden[index + 1]) + (a.branch ? float(a.branch[index + 1]) : 0.f));
-            a.hidden[index] = __float2bfloat16_rn(h0 + float(bx));
-            a.hidden[index + 1] = __float2bfloat16_rn(h1 + float(by));
+            if constexpr (Mx) {
+                static_assert(Chunks == 1);
+                const auto delta = __floats2bfloat162_rn(x, y);
+                *reinterpret_cast<__nv_bfloat162 *>(a.projected + index) = delta;
+                if (a.feature) *reinterpret_cast<__nv_bfloat162 *>(a.feature + index) = prior;
+                *reinterpret_cast<__nv_bfloat162 *>(a.hidden + index) = __hadd2(prior, delta);
+            } else {
+                BF16 bx = __float2bfloat16_rn(x), by = __float2bfloat16_rn(y);
+                a.projected[index] = bx;
+                a.projected[index + 1] = by;
+                float h0 = RoundBF16(float(a.hidden[index]) + (a.branch ? float(a.branch[index]) : 0.f)),
+                      h1 = RoundBF16(float(a.hidden[index + 1]) + (a.branch ? float(a.branch[index + 1]) : 0.f));
+                a.hidden[index] = __float2bfloat16_rn(h0 + float(bx));
+                a.hidden[index + 1] = __float2bfloat16_rn(h1 + float(by));
+            }
         }
         __syncthreads();
     }
@@ -520,10 +548,131 @@ __global__ __launch_bounds__(Threads, 1) void Layer(
     for (int first = 0; first < (Small ? 8 : a.rows); first += Chunks * 8)
         Tail<Threads, Chunks, DirectInput>(a, first);
 }
+// Packed native QKV needs no cross-CTA projection reduction. Stage the
+// current head locally, and publish all candidate KV slots once per layer.
+__device__ __forceinline__ void RotatePair(const BF16 *src, BF16 *dst, int d, const Args &a, int row) {
+    float cosine, sine;
+    if (a.rotary) {
+        const float2 pair = __bfloat1622float2(a.rotary[row * 32 + d]);
+        cosine = pair.x;
+        sine = pair.y;
+    } else {
+        const float angle = a.positions[row] * powf(a.theta, -2.f * d / 64.f);
+        cosine = RoundBF16(cosf(angle));
+        sine = RoundBF16(sinf(angle));
+    }
+    const float x = float(src[d]), y = float(src[d + 32]);
+    dst[d] = __float2bfloat16_rn(RoundBF16(x * cosine) - RoundBF16(y * sine));
+    dst[d + 32] = __float2bfloat16_rn(RoundBF16(y * cosine) + RoundBF16(x * sine));
+}
+
+// The QKV producer updates projected, hidden and the rotary table. Its
+// ordinary-stream preparation has already ordered the request descriptors
+// and committed ring. Only the candidate slots depend on this layer's QKV.
+template<int Tile>
+__device__ __forceinline__ void StageHistory(const Args &a, int row, int valueTile) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (row >= a.rows) return;
+    const int length = a.bindings.Live(row);
+    const auto &binding = a.bindings.rows[row];
+    const int candidates = binding.verifyOffset + 1;
+    if (length <= candidates) return;
+    const int committed = min(128, length) - candidates;
+    const int first = max(0, length - 128);
+    extern __shared__ __align__(1024) unsigned char storage[];
+    auto *values = reinterpret_cast<BF16 *>(storage);
+    const auto *v = binding.cache ? static_cast<const BF16 *>(binding.cache[1]) : binding.value;
+    for (int i = threadIdx.x; i < committed * (Tile / 8); i += blockDim.x) {
+        const int slot = i / (Tile / 8), vector = i % (Tile / 8);
+        const int physical = (first + slot) & 127;
+        const int col = (vector ^ (slot & (Tile / 8 - 1))) * 8;
+        unsigned dst = __cvta_generic_to_shared(values + slot * Tile + col);
+        asm volatile("cp.async.cg.shared.global [%0],[%1],16;" :: "r"(dst),
+                     "l"(v + physical * 128 + valueTile * Tile + vector * 8) : "memory");
+    }
+    if (committed >= PackedSwaStagedKeys) {
+        auto *keys = values + 128 * Tile;
+        const auto *k = binding.cache ? static_cast<const BF16 *>(binding.cache[0]) : binding.key;
+        for (int i = threadIdx.x; i < committed * 24; i += blockDim.x) {
+            const int slot = i / 24, col = i % 24 * 8;
+            unsigned dst = __cvta_generic_to_shared(keys + i * 8);
+            asm volatile("cp.async.cg.shared.global [%0],[%1],16;" :: "r"(dst),
+                         "l"(k + ((first + slot) & 127) * 192 + col) : "memory");
+        }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+#endif
+}
+template<int Threads>
+__global__ __launch_bounds__(Threads, 1) void PackedLayer(
+#if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+    const __grid_constant__
+#endif
+        Args a) {
+    const int t = threadIdx.x, task = blockIdx.x;
+    const int row = task / 16, head = task / 2 % 8, valueTile = task % 2;
+    StageHistory<64>(a, row, valueTile);
+    constexpr int KWarps = Threads / 64;
+    constexpr int Parts = 1024 / (KWarps * 32);
+    fastllm_mxfp8_projection::WeightFragment weights[Parts];
+    const int warp = t / 32, lane = t % 32;
+    const int out = task * 32 + warp / KWarps * 16 + lane / 4;
+#pragma unroll
+    for (int part = 0; part < Parts; ++part) {
+        const int k = (warp % KWarps + part * KWarps) * 32 + lane % 4 * 8;
+        weights[part] = fastllm_mxfp8_projection::LoadWeights(a.oWeight, a.outputScales, 1024, out, out + 8, k);
+    }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (a.rotary) cudaGridDependencySynchronize();
+#endif
+    auto flag = [&](int r) { return reinterpret_cast<unsigned *>(a.epochs + 1 + r) + 1; };
+    __shared__ __align__(16) BF16 query[192];
+    if (row < a.rows) {
+        // The first head publishes this row's candidate KV. Separate warps
+        // rotate Q and write KV, then share the barrier before the ready flag.
+        const bool writesKV = head == 0 && valueTile == 0;
+        const int kvLane = t - 192;
+        if (writesKV && kvLane >= 0 && kvLane < 288 && a.bindings.length[row] > 0) {
+            const auto &binding = a.bindings.rows[row];
+            const int slot = 128 + binding.verifyOffset;
+            const BF16 *kv = a.projected + row * 1856 + 1536;
+            if (kvLane < 160) {
+                auto *key = (binding.cache ? (BF16 *)binding.cache[0] : binding.key) + slot * 192;
+                if (kvLane < 32) RotatePair(kv, key, kvLane, a, row);
+                else key[kvLane + 32] = kv[kvLane + 32];
+            } else {
+                const int col = kvLane - 160;
+                auto *value = binding.cache ? (BF16 *)binding.cache[1] : binding.value;
+                value[slot * 128 + col] = __float2bfloat16_rn(float(kv[192 + col]) * RoundBF16(a.scale));
+            }
+        }
+        const BF16 *src = a.projected + row * 1856 + head * 192;
+        if (t < 192) {
+            if (a.bindings.length[row] <= 0) query[t] = __float2bfloat16_rn(0.f);
+            else if (t < 32) RotatePair(src, query, t, a, row);
+            else if (t >= 64) query[t] = src[t];
+        }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
+        __syncthreads();
+        if (writesKV && t == 0)
+            asm volatile("st.release.gpu.global.u32 [%0],1;" :: "l"(flag(row)) : "memory");
+        if (!valueTile && t < 24)
+            reinterpret_cast<uint4 *>(a.q + (row * 8 + head) * 192)[t] = reinterpret_cast<const uint4 *>(query)[t];
+        SwaAttentionBf16Body<Threads, 64, true, BatchSwaKeys, true, true, false, true>(
+            a.q, nullptr, nullptr, a.sink, a.attn, a.bindings.length, 8, 1, a.bindings, row, head, valueTile, query, a.epochs, a.rows);
+    }
+    // All candidate KV and QKV reads finish before Tail reuses projected.
+    cooperative_groups::this_grid().sync();
+    if (task == 127 && t < a.rows) *flag(t) = 0;
+    Tail<Threads, 1, true, true>(a, 0, weights);
+}
 inline int Threads(int rows) {
     return rows <= 8 ? 1024 : 512;
 }
-inline int SharedBytes(int rows, bool wide = false) {
+inline int SharedBytes(int rows, bool wide = false, bool mx = false) {
+    if (mx) return 128 * (64 + 192) * sizeof(BF16);
     if (wide && rows > 8) {
         // Direct QKV/O reads only need reduction scratch; attention reuses the
         // same storage for its 128x128 BF16 value tile.
@@ -533,7 +682,8 @@ inline int SharedBytes(int rows, bool wide = false) {
     }
     return InputBytes + Threads(rows) / 32 * 16 * 8 * sizeof(float);
 }
-inline const void *Kernel(int rows, bool wide = false) {
+inline const void *Kernel(int rows, bool wide = false, bool mx = false) {
+    if (mx) return (const void *)PackedLayer<1024>;
     // Two N8 tiles share QKV/O weight loads and read graph-owned inputs directly.
     // The original staging schedule remains available when admission fails.
     if (wide && rows > 8)
