@@ -68,7 +68,8 @@ cudaError_t PrepareNormLinear(const NormLinearShape &s, bool mirror, NormLinearP
         plan.kernel_ = mirror ? (dense ? Kernel<true,true>(plan.tile_) : Kernel<true,false>(plan.tile_))
                               : (dense ? Kernel<false,true>(plan.tile_) : Kernel<false,false>(plan.tile_));
         if ((error = cudaFuncGetAttributes(&attributes, plan.kernel_)) != cudaSuccess) return error;
-        if (attributes.maxThreadsPerBlock < 256 || attributes.ptxVersion < 70) return cudaErrorNotSupported;
+        if (attributes.ptxVersion < 70) return cudaErrorNotSupported;
+        if (attributes.maxThreadsPerBlock < 256) continue;
         plan.shared_ = size_t(plan.tile_) * s.inner * 2;
         if (plan.shared_ + attributes.sharedSizeBytes <= sharedLimit) break;
     }

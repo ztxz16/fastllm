@@ -105,7 +105,9 @@ int main(){try{int n=0;if(cudaGetDeviceCount(&n)!=cudaSuccess||!n)return 77;cuda
 #ifdef CUDA_NO_TENSOR_CORE
  const bool mma=false;
 #else
- const bool mma=p.major>=8;
+ cudaFuncAttributes image{};
+ C(cudaFuncGetAttributes(&image,ll::DenseGateUp<1024,256,false>));
+ const bool mma=p.major>=8 && image.binaryVersion>=80 && image.ptxVersion>=80;
 #endif
  if(mma){
  for(int rows:{1,2,4,8,9,17}){Dense<1024,256,true>(rows,s);Dense<1024,256,false>(rows,s);}

@@ -55,20 +55,21 @@ cudaError_t PrepareDense(const DenseShape &s, DensePlan &out, cudaStream_t strea
         if ((error = cudaFuncGetAttributes(&gate,p.gate_)) != cudaSuccess) return error;
         if ((error = cudaFuncGetAttributes(&down,p.down_)) != cudaSuccess) return error;
         if (gate.binaryVersion < 80 || down.binaryVersion < 80 ||
-            gate.ptxVersion < 80 || down.ptxVersion < 80 ||
-            gate.maxThreadsPerBlock < 256 || down.maxThreadsPerBlock < 256) return cudaErrorNotSupported;
+            gate.ptxVersion < 80 || down.ptxVersion < 80) return cudaErrorNotSupported;
+        if (gate.maxThreadsPerBlock < 256 || down.maxThreadsPerBlock < 256) continue;
         p.gateShared_ = size_t(p.tile_)*s.hidden*2+8*128*4+32*p.tile_*4;
         p.downShared_ = size_t(p.tile_)*s.intermediate*2+8*128*4;
         if (p.gateShared_+gate.sharedSizeBytes <= limit && p.downShared_+down.sharedSizeBytes <= limit) break;
     }
     if (!p.tile_ || (s.rows+p.tile_-1)/p.tile_ > properties.maxGridSize[1]) return cudaErrorNotSupported;
-    for (auto pair : {std::make_pair(p.gate_,p.gateShared_),std::make_pair(p.down_,p.downShared_)}) {
-        // Size is fixed for a given kernel template, so subsequent preparations
-        // cannot shrink an image's shared-memory allowance during graph replay.
-        if (pair.second > properties.sharedMemPerBlock &&
-            (error = cudaFuncSetAttribute(pair.first,cudaFuncAttributeMaxDynamicSharedMemorySize,pair.second)) != cudaSuccess)
-            return error;
-    }
+    // The default limit includes both static and dynamic shared memory.
+    auto optIn = [&](const void *kernel, size_t dynamic, size_t fixed) {
+        if (dynamic + fixed <= properties.sharedMemPerBlock) return cudaSuccess;
+        return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(dynamic));
+    };
+    if ((error = optIn(p.gate_, p.gateShared_, gate.sharedSizeBytes)) != cudaSuccess) return error;
+    if ((error = optIn(p.down_, p.downShared_, down.sharedSizeBytes)) != cudaSuccess) return error;
     p.shape_ = s;
     out = p;
     return cudaSuccess;

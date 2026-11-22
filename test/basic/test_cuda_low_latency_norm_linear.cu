@@ -149,7 +149,12 @@ int main() {
         }
         Check(BackendUnavailable(cudaErrorNotSupported) && BackendUnavailable(cudaErrorNoKernelImageForDevice),
               "capability miss must fall back");
-        Check(!BackendUnavailable(cudaErrorIllegalAddress) && !BackendUnavailable(cudaErrorMemoryAllocation) &&
+        Check(BackendUnavailable(cudaErrorUnsupportedPtxVersion) && BackendUnavailable(cudaErrorJitCompilerNotFound),
+              "unavailable PTX compiler must fall back");
+#if CUDART_VERSION >= 11060
+        Check(BackendUnavailable(cudaErrorJitCompilationDisabled), "disabled PTX JIT must fall back");
+#endif
+        Check(!BackendUnavailable(cudaErrorInvalidPtx) && !BackendUnavailable(cudaErrorIllegalAddress) && !BackendUnavailable(cudaErrorMemoryAllocation) &&
               !BackendUnavailable(cudaErrorLaunchFailure),"execution failure disguised as fallback");
         // A second prepare using the same kernel image must not lower its
         // shared-memory ceiling and invalidate an existing larger capture.

@@ -499,6 +499,7 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp32.cu
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
+        src/devices/cuda/linear/fastllm-decode-linear.cu
         src/devices/cuda/linear/fastllm-rmsnorm-small-linear.cu
         src/devices/cuda/linear/fastllm-norm-linear.cu
         src/devices/cuda/low_latency/norm_linear.cu
@@ -561,7 +562,8 @@ if (USE_CUDA)
     # HIP retains its current Dense operators; CUDA PTX is not a HIP backend.
     if (NOT USE_ROCM)
         list(APPEND FASTLLM_CUDA_SOURCES
-            src/devices/cuda/low_latency/dense.cu)
+            src/devices/cuda/low_latency/dense.cu
+            src/devices/cuda/linear/fastllm-decode-dense.cu)
     endif()
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
@@ -2693,6 +2695,13 @@ if (UNIT_TEST)
             "CUDA DECODE SAMPLING PASS" 120 152577)
         set_tests_properties(cuda_decode_sampling_large_vocab PROPERTIES RUN_SERIAL TRUE)
 
+        add_executable(cuda_decode_linear_test test/basic/test_cuda_decode_linear.cpp)
+        target_link_libraries(cuda_decode_linear_test PRIVATE fastllm ${FASTLLM_TEST_CUDART})
+        target_include_directories(cuda_decode_linear_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME cuda_decode_linear COMMAND cuda_decode_linear_test)
+        set_tests_properties(cuda_decode_linear PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "DECODE LINEAR PASS")
+
         add_executable(naive_n05_serving_metadata_test test/basic/test_naive_n05_serving_metadata.cpp)
         target_link_libraries(naive_n05_serving_metadata_test PRIVATE fastllm_tools)
         target_include_directories(naive_n05_serving_metadata_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -3533,6 +3542,25 @@ if (UNIT_TEST)
         set_tests_properties(cuda_norm_linear_adapter PROPERTIES LABELS cuda
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 90
             PASS_REGULAR_EXPRESSION "PASS norm linear Data adapter")
+
+        add_executable(cuda_decode_dense_adapter_test test/basic/test_cuda_decode_dense_adapter.cu)
+        target_include_directories(cuda_decode_dense_adapter_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(cuda_decode_dense_adapter_test PRIVATE fastllm)
+        set_target_properties(cuda_decode_dense_adapter_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_decode_dense_adapter COMMAND cuda_decode_dense_adapter_test)
+        set_tests_properties(cuda_decode_dense_adapter PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE TIMEOUT 90 PASS_REGULAR_EXPRESSION "PASS portable decode adapters and graph fallback")
+
+        if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+            add_executable(cuda_decode_image_fallback_test test/basic/test_cuda_decode_image_fallback.cu)
+            target_link_libraries(cuda_decode_image_fallback_test PRIVATE fastllm)
+            target_link_options(cuda_decode_image_fallback_test PRIVATE "LINKER:--wrap=cudaFuncGetAttributes")
+            set_target_properties(cuda_decode_image_fallback_test PROPERTIES
+                CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_ARCHITECTURES "75-real")
+            add_test(NAME cuda_decode_image_fallback COMMAND cuda_decode_image_fallback_test)
+            set_tests_properties(cuda_decode_image_fallback PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+                RUN_SERIAL TRUE TIMEOUT 90 PASS_REGULAR_EXPRESSION "PASS decode image fallback")
+        endif()
 
         # Raw CUDA operator tests deliberately do not link the FastLLM runtime.
         add_executable(cuda_low_latency_norm_linear_test

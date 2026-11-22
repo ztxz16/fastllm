@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-decode-dense.h"
 #include "naive_n05_flash.h"
 #include "naive_n05_tp.h"
 #include "naive_n05_parallel.h"
@@ -2184,15 +2185,27 @@ Data NaiveN05FlashModel::RunTarget(
             Data &w1 = workspace ? buf.denseGate : buf.w1;
             Data &w2 = workspace ? buf.denseDown : buf.w2;
             Data &w3 = workspace ? buf.denseUp : buf.w3;
-            auto project = [&](Data &input, Data &weight, Data &output) {
-                if (stablePrefill && FastllmCudaBFloat16PrefillLinear(input, weight, output)) return;
-                Linear(input, weight, Data(), output);
-            };
-            project(normed, localWeight(prefix + ".mlp.gate_proj.weight"), w1);
-            project(normed, localWeight(prefix + ".mlp.up_proj.weight"), w3);
-            Silu(w1, w1);
-            MulTo(w1, w3);
-            project(w1, localWeight(prefix + ".mlp.down_proj.weight"), w2);
+#ifndef USE_ROCM
+            // A specialized collective miss still retains the local fusion.
+            // The existing reduce/residual code owns all TP/DP semantics.
+            const bool portableDense = decodeWorkspace &&
+                FastllmCudaDecodeDense(normed, localWeight(prefix + ".mlp.gate_proj.weight"),
+                    localWeight(prefix + ".mlp.up_proj.weight"),
+                    localWeight(prefix + ".mlp.down_proj.weight"), w1, w2);
+#else
+            const bool portableDense = false;
+#endif
+            if (!portableDense) {
+                auto project = [&](Data &input, Data &weight, Data &output) {
+                    if (stablePrefill && FastllmCudaBFloat16PrefillLinear(input, weight, output)) return;
+                    Linear(input, weight, Data(), output);
+                };
+                project(normed, localWeight(prefix + ".mlp.gate_proj.weight"), w1);
+                project(normed, localWeight(prefix + ".mlp.up_proj.weight"), w3);
+                Silu(w1, w1);
+                MulTo(w1, w3);
+                project(w1, localWeight(prefix + ".mlp.down_proj.weight"), w2);
+            }
             // NCCL BF16 may round partial sums at different ranks as the message
             // grows. The row reduction accumulates ranks in FP32 and chunks large messages.
             const bool reduced = stablePrefill && FastllmCudaCustomAllReduceRows(

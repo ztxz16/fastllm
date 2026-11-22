@@ -16,7 +16,7 @@ static std::vector<float> Read(const Data &d) {
 int main() {
     try {
         int devices=0;if(cudaGetDeviceCount(&devices)!=cudaSuccess||!devices)return 77;
-        Cuda(cudaSetDevice(0));cudaDeviceProp p{};Cuda(cudaGetDeviceProperties(&p,0));if(p.major<8)return 77;
+        Cuda(cudaSetDevice(0));cudaDeviceProp p{};Cuda(cudaGetDeviceProperties(&p,0));if(p.major<7)return 77;
         cudaStream_t stream;Cuda(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking));
         for(int rows:{1,2,9}) {
             constexpr int K=256,N=17;Data x,r,g,w,out;

@@ -16,7 +16,11 @@ struct PrepareOptions {
 // Only pre-launch capability misses allow another implementation to run.
 // Allocation, driver and asynchronous execution errors must reach the caller.
 inline bool BackendUnavailable(cudaError_t error) {
+#if CUDART_VERSION >= 11060
+    if (error == cudaErrorJitCompilationDisabled) return true;
+#endif
     return error == cudaErrorNotSupported || error == cudaErrorNoKernelImageForDevice ||
-           error == cudaErrorInvalidDeviceFunction;
+           error == cudaErrorInvalidDeviceFunction || error == cudaErrorJitCompilerNotFound ||
+           error == cudaErrorUnsupportedPtxVersion;
 }
 } // namespace fastllm::cuda::low_latency

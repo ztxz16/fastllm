@@ -1,4 +1,5 @@
 #include "devices/cuda/low_latency/router.cuh"
+#include "devices/cuda/low_latency/execution.h"
 #include "devices/cuda/fastllm-cuda-norm.cuh"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -5115,14 +5116,45 @@ bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
         canBorrow ? (char *)arena.cudaData + used : nullptr, canBorrow ? arena.expansionBytes - used : 0);
 }
 
+namespace {
+template<auto Kernel, int Threads, typename... Extra>
+bool TryRouterKernel(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
+                     dim3 grid, Extra... extra) {
+    using namespace fastllm;
+    static thread_local int cachedDevice = -1;
+    static thread_local bool available = false;
+    const int device = input.dataDeviceIds[0];
+    if (cachedDevice != device) {
+        // This read-only image query also works on the first call inside capture.
+        cudaFuncAttributes attributes{};
+        const auto error = cudaFuncGetAttributes(&attributes, Kernel);
+        if (fastllm::cuda::low_latency::BackendUnavailable(error)) {
+            const auto pending = cudaGetLastError();
+            AssertInFastLLM(pending == cudaSuccess || pending == error, "Pending CUDA error during Router admission.");
+            available = false;
+        } else {
+            AssertInFastLLM(error == cudaSuccess, cudaGetErrorString(error));
+            available = attributes.maxThreadsPerBlock >= Threads;
+        }
+        cachedDevice = device;
+    }
+    if (!available) return false;
+    auto dims = input.dims;
+    dims.back() = weight.dims[0];
+    Output(output, FLOAT32, dims);
+    Kernel<<<grid, Threads>>>((const BF16 *)input.cudaData, (const float *)weight.cudaData,
+                              (float *)output.cudaData, extra...);
+    CheckLaunch();
+    return true;
+}
+} // namespace
+
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
     using namespace fastllm;
     const int rows = RouterRows(input, weight, output);
     if (!rows || (rows > 1 && rows >= FastllmCudaGetLinearExactBatchThreshold())) return false;
-    auto dims = input.dims;
-    dims.back() = weight.dims[0];
-    Output(output, FLOAT32, dims);
+    using namespace fastllm::cuda::low_latency;
     const int experts = weight.dims[0];
     const int arch = FastllmCudaRuntimeArch();
     const int rowTiles = 1 + (rows - 1) / kRouterTileRows;
@@ -5135,35 +5167,29 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
             int64_t(rowTiles) * (experts / wideExperts) >= 256;
         const int rowTile = tiled ? wideRows : (rows <= 4 ? 1 : 2);
         const int expertTile = tiled ? wideExperts : 1;
-        auto kernel = tiled ? RouterTile4096<wideRows, wideExperts> :
-            (rows <= 4 ? RouterPairs4096<1> : RouterPairs4096<2>);
-        kernel<<<dim3(experts / expertTile, (rows + rowTile - 1) / rowTile), 128>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
+        const dim3 grid(experts / expertTile, (rows + rowTile - 1) / rowTile);
+        if (tiled) {
+            if (TryRouterKernel<RouterTile4096<wideRows, wideExperts>, 128>(input, weight, output, grid, rows, experts)) return true;
+        } else if (rows <= 4) {
+            if (TryRouterKernel<RouterPairs4096<1>, 128>(input, weight, output, grid, rows, experts)) return true;
+        } else if (TryRouterKernel<RouterPairs4096<2>, 128>(input, weight, output, grid, rows, experts)) return true;
     }
-    else if (rows == 1)
-        fastllm::cuda::low_latency::RouterSigmoidSingle<4096><<<experts, 256>>>((const BF16 *)input.cudaData,
-            (const float *)weight.cudaData, (float *)output.cudaData);
-    else if (arch == 120 && experts % kRouterTileExperts == 0 &&
-             int64_t(experts / kRouterTileExperts) * rowTiles >= DeviceSMCount() &&
-             ((uintptr_t)input.cudaData & 7) == 0 && ((uintptr_t)weight.cudaData & 15) == 0)
-        RouterTile<<<dim3(experts / kRouterTileExperts, rowTiles), 256>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData, (float *)output.cudaData, rows, experts);
-    else if (rows >= 3 && arch == 90 &&
-             (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0)
-        BatchRouterSigmoid4096Vector<<<dim3(experts, (rows + 3) / 4), 128>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
-    else if (rows >= 4)
-        fastllm::cuda::low_latency::RouterSigmoidRows<4,4096><<<dim3(experts, (rows + 3) / 4), 256>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
-    else
-        fastllm::cuda::low_latency::RouterSigmoidRows<2,4096><<<dim3(experts, (rows + 1) / 2), 256>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
-    CheckLaunch();
-    return true;
+    if (rows > 1 && arch == 120 && experts % kRouterTileExperts == 0 &&
+        int64_t(experts / kRouterTileExperts) * rowTiles >= DeviceSMCount() &&
+        ((uintptr_t)input.cudaData & 7) == 0 && ((uintptr_t)weight.cudaData & 15) == 0 &&
+        TryRouterKernel<RouterTile, 256>(input, weight, output,
+            dim3(experts / kRouterTileExperts, rowTiles), rows, experts)) return true;
+    if (rows == 1)
+        return TryRouterKernel<RouterSigmoidSingle<4096>, 256>(input, weight, output, dim3(experts));
+    if (rows >= 3 && arch == 90 &&
+        (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0 &&
+        TryRouterKernel<BatchRouterSigmoid4096Vector, 128>(input, weight, output,
+            dim3(experts, (rows + 3) / 4), rows, experts)) return true;
+    if (rows >= 4)
+        return TryRouterKernel<RouterSigmoidRows<4,4096>, 256>(input, weight, output,
+            dim3(experts, (rows + 3) / 4), rows, experts);
+    return TryRouterKernel<RouterSigmoidRows<2,4096>, 256>(input, weight, output,
+        dim3(experts, (rows + 1) / 2), rows, experts);
 }
 
 bool FastllmCudaNaiveDecodeGraphSupported() { return DecodeTopKBlocks() > 0; }
