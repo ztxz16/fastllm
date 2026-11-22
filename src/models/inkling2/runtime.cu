@@ -12,6 +12,7 @@
 #include "attention/prefill.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -28,7 +29,6 @@
 #include <stdexcept>
 #include <type_traits>
 
-void FastllmCudaBf16ExactRows(const void *, const void *, void *, int, int, int);
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, int, int, int);
 
 bool LaunchFastllmGroupedBf16Projection(const __nv_bfloat16 *const *, const __nv_bfloat16 *, __nv_bfloat16 *,
@@ -351,7 +351,9 @@ template <typename T> Matrix convolutions(const Rows<T> &input, const float *wei
 }
 class Decoder final : public Runtime {
     Config c;
+    enum class Projection { Default, DecodeHead, AttentionMma, DraftHead };
     bool decodeArithmetic = false;
+    const FastllmBf16MmaProjections *bf16Mma = nullptr;
     Placement placement;
     basellm &model;
     WeightMap &weights;
@@ -401,7 +403,7 @@ class Decoder final : public Runtime {
         return static_cast<const float *>(w.cudaData);
     }
     template <typename T, typename U> void projectInto(const Rows<T> &x, const std::string &key, Rows<U> &out,
-                                            int offset, int groups) const {
+                                            int offset, int groups, Projection mode = Projection::Default) const {
         const int columns = out.cols;
         const auto &w = weights.weight.at("model.llm." + key);
         const auto type = std::is_same<T, half>::value ? FLOAT16 : BFLOAT16;
@@ -411,30 +413,34 @@ class Decoder final : public Runtime {
         const int n = x.rows / groups, m = x.cols;
         auto *matrix = static_cast<T *>(w.cudaData) + size_t(offset) * m;
         if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<U, T>) {
+            if (mode == Projection::DraftHead && bf16Mma &&
+                bf16Mma->draftLogits(x.p, matrix, out.p, n, m, columns))
+                return;
+            if (mode == Projection::AttentionMma && bf16Mma->attention(x.p, matrix, out.p, n, m, columns))
+                return;
+            if (mode == Projection::DecodeHead && FastllmCudaRuntimeArch() == 120 &&
+                FastllmCudaBf16DecodeProjection(x.p, matrix, out.p, n, m, columns))
+                return;
             if (decodeArithmetic && n > 1 && groups == 1 && FastllmCudaRuntimeArch() == 120 && m != 256) {
-                LaunchFastllmGemmBf16Bf16(x.p, matrix, out.p, nullptr, n, m, columns);
+                if (!FastllmCudaBf16ExactBatchProjection(x.p, matrix, out.p, n, m, columns))
+                    LaunchFastllmGemmBf16Bf16(x.p, matrix, out.p, nullptr, n, m, columns);
                 return;
             }
         }
-        // Verification preserves singleton reduction order. Q/K/V still use their parent row pitch.
-        const int rows = decodeArithmetic ? 1 : n;
         Data weightView(type, {groups * columns, m}, CUDA, matrix);
-        for (int row = 0; row < n; row += rows) {
-            Data input(type, {groups * rows, m}, CUDA, x.p + size_t(row) * m);
-            Data result(std::is_same_v<U, float> ? FLOAT32 : type, {groups * rows, columns}, CUDA,
-                        out.p + size_t(row) * columns);
-            if (groups == 1 && std::is_same_v<T, U>)
-                DoCudaLinear(input, weightView, *GetEmptyData(), result);
-            else
-                FastllmCudaBatchMatMulTransB(input, weightView, result, n * m, columns * m, n * columns,
-                                             m, m, groups, rows, m, columns, 1.f);
-        }
+        Data input(type, {groups * n, m}, CUDA, x.p);
+        Data result(std::is_same_v<U, float> ? FLOAT32 : type, {groups * n, columns}, CUDA, out.p);
+        if (groups == 1 && std::is_same_v<T, U>)
+            DoCudaLinear(input, weightView, *GetEmptyData(), result);
+        else
+            FastllmCudaBatchMatMulTransB(input, weightView, result, n * m, columns * m, n * columns, m, m, groups, n, m,
+                                         columns, 1.f);
     }
 
     template <typename T> Rows<T> linear(const Rows<T> &x, const std::string &key, int columns,
-                                         int groups = 1) const {
+                                         int groups = 1, Projection mode = Projection::Default) const {
         Rows<T> out(x.rows, columns);
-        projectInto(x, key, out, 0, groups);
+        projectInto(x, key, out, 0, groups, mode);
         return out;
     }
 
@@ -454,23 +460,8 @@ class Decoder final : public Runtime {
                 if (down.dataType == BFLOAT16 && down.dims.size() == 2 && down.dims[0] == count * c.rank &&
                     down.dims[1] == 2 * d && gate.dataType == BFLOAT16 && gate.dims.size() == 2 &&
                     gate.dims[0] == count * 2 * d && gate.dims[1] == c.rank) {
-                    auto prepare = count == 1 ? ControllerNormRows<true, T, T, 2304> : ControllerNormRows<true, T, T, 2304, true>;
-                    prepare<<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, nullptr, pair.p, c.eps);
-                    Rows<T> hidden(count * n, c.rank);
-                    if (count == 1)
-                        FastllmCudaBf16ExactRows(pair.p, down.cudaData, hidden.p, n, 2 * d, c.rank);
-                    else
-                        controllerDown<<<dim3(c.rank / 2, (n + 1) / 2, count), 128, 0, cudaStreamPerThread>>>(
-                            pair.p, static_cast<const T *>(down.cudaData), hidden.p, n, c.rank);
-                    Matrix gates(count * n, 2 * d);
-                    if (count == 1)
-                        controllerMlpGates<4><<<dim3(d / 16, (n + 3) / 4), 128, 0, cudaStreamPerThread>>>(
-                            hidden.p, static_cast<const T *>(gate.cudaData), gates.p, n, d);
-                    else
-                        controllerQkvGates<<<dim3(d / 64, (n + 7) / 8, count), 128, 0, cudaStreamPerThread>>>(
-                            hidden.p, static_cast<const T *>(gate.cudaData), gates.p, n, d);
-                    ControllerNormRows<false, T, Out, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(
-                        streams, gates.p, out.p, c.eps);
+                    launchBatchedController(streams, pair, out, static_cast<const T *>(down.cudaData),
+                                            static_cast<const T *>(gate.cudaData), count, c.rank, smCount, c.eps);
                     return out;
                 }
             }
@@ -542,15 +533,24 @@ class Decoder final : public Runtime {
         }
     };
 
+    Projection attentionProjection(const std::vector<Segment> &batch) const {
+        return bf16Mma && (decodeArithmetic || batch.front().decode) ? Projection::AttentionMma : Projection::Default;
+    }
+
     template<class T> AttentionProjection<T> projectAttention(const std::array<Rows<T>, 3> &inputs,
-                                                             const std::string &att, bool local) const {
+                                                             const std::string &att, bool local, Projection mode) const {
         const int q = c.heads * c.headDim, k = c.kvHeads * c.headDim, taps = local ? 0 : c.kvHeads * c.conv;
         AttentionProjection<T> result;
         result.widths = {q, c.heads * c.relative, q, c.heads, k, taps, k, taps};
+        // A shared input packs Q, K and V into one matrix. Use the same math when
+        // they are separate, including shapes whose individual views need the fallback.
+        if (mode == Projection::AttentionMma &&
+            ((inputs[0].cols | (2 * q + c.heads * (c.relative + 1)) | (k + taps)) & 7))
+            mode = Projection::Default;
         result.shared = inputs[0].p == inputs[1].p && inputs[0].p == inputs[2].p;
         result.storage = Rows<T>(inputs[0].rows, std::accumulate(result.widths.begin(), result.widths.end(), 0));
         if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-            if (decodeArithmetic && !result.shared && inputs[0].rows >= 4) {
+            if (mode != Projection::AttentionMma && decodeArithmetic && !result.shared && inputs[0].rows >= 4) {
                 const auto &w = weights.weight.at("model.llm." + att + "packed.weight");
                 const T *x[] = {inputs[0].p, inputs[1].p, inputs[2].p};
                 const int widths[] = {result.storage.cols - 2 * (k + taps), k + taps, k + taps};
@@ -561,7 +561,7 @@ class Decoder final : public Runtime {
             }
         }
         result.groups([&](Rows<T> part, int begin, int, int offset) {
-            projectInto(inputs[begin == 0 ? 0 : (begin == 4 ? 1 : 2)], att + "packed.weight", part, offset, 1);
+            projectInto(inputs[begin == 0 ? 0 : (begin == 4 ? 1 : 2)], att + "packed.weight", part, offset, 1, mode);
         });
         return result;
     }
@@ -574,7 +574,7 @@ class Decoder final : public Runtime {
         const Data &table = weight(att + "rel_logits_proj.proj");
         if (table.Count(0) != c.relative * c.extent)
             throw std::runtime_error("Inkling relative bias table shape");
-        auto projection = projectAttention(inputs, att, local);
+        auto projection = projectAttention(inputs, att, local, attentionProjection(batch));
         if ((batch.front().decode || decodeArithmetic) && aligned == d && c.relative <= threads) {
             const auto projected = projection.views();
             Rows<T> attended(inputs[0].rows, c.heads * d);
@@ -899,7 +899,7 @@ class Decoder final : public Runtime {
         else attended = attend<float, T>(inputs, att, local, batch, slot);
         const bool newBlock = physical % c.residualBlock == 0;
         auto residual =
-            convolutions(linear(attended, att + "wo_ud.weight", h), param(pre + "attn_sconv.weight", h * c.conv),
+            convolutions(linear(attended, att + "wo_ud.weight", h, 1, attentionProjection(batch)), param(pre + "attn_sconv.weight", h * c.conv),
                          {}, 1, c.conv, batch, slot, 2, newBlock ? Matrix{} : x);
         if (newBlock)
             blocks.push_back(x);
@@ -992,7 +992,20 @@ class Decoder final : public Runtime {
                                       cudaStreamPerThread));
             }
         }
-        auto projected = linear(castRows<T>(last), "unembed.weight", c.vocab);
+        const bool incremental = decodeArithmetic || batch.front().decode;
+        auto headInput = castRows<T>(last);
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            if (incremental && bf16Mma) {
+                const auto &head = weights.weight.at("model.llm.unembed.weight");
+                if (head.dataType == BFLOAT16 && head.dims.size() == 2 && head.dims[0] >= c.vocab &&
+                    head.dims[1] == h &&
+                    bf16Mma->cappedLogits(headInput.p, head.cudaData, logits.p, last.rows, h, c.vocab, c.logitCap))
+                    return;
+            }
+        }
+        Rows<T> projected(last.rows, c.vocab);
+        projectInto(headInput, "unembed.weight", projected, 0, 1,
+                    incremental ? Projection::DecodeHead : Projection::Default);
         size_t nLogits = size_t(logits.rows) * logits.cols;
         softcap<<<(nLogits + 255) / 256, 256, 0, cudaStreamPerThread>>>(projected.p, logits.p, nLogits, c.logitCap);
     }
@@ -1258,6 +1271,7 @@ class Decoder final : public Runtime {
         if (c.headDim > threads)
             throw std::runtime_error("Inkling attention head exceeds the native kernel width");
         check(cudaSetDevice(p.gpu));
+        bf16Mma = FastllmCudaGetBf16MmaProjections();
         graphInput = Buffer<DecodeInput>(1);
         hostVisits.resize(c.visits.size());
         graphVisits = Buffer<DecodeVisit>(hostVisits.size());

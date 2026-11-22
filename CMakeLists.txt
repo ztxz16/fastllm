@@ -660,6 +660,12 @@ if (USE_CUDA)
             src/devices/cuda/linear/fastllm-linear-fp8-mxfp8.cu
             src/devices/cuda/moe/fastllm-moe-mxfp4-sm120.cu
             src/devices/cuda/linear/fastllm-native-nvfp4-tma-sm120.cu)
+        if (NOT CUDA_NO_TENSOR_CORE AND
+            EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/gemm/device/gemm.h")
+            list(APPEND FASTLLM_CUDA_SM120_SOURCES src/devices/cuda/linear/fastllm-bf16-attention-sm120.cu)
+            set_property(SOURCE src/devices/cuda/linear/fastllm-linear-bf16.cu APPEND PROPERTY
+                COMPILE_DEFINITIONS FASTLLM_HAS_BF16_MMA_SM120)
+        endif()
         set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp src/models/deepseekv41_dspark.cpp
             src/devices/multicuda/multicudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)

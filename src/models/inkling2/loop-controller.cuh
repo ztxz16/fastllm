@@ -61,29 +61,53 @@ template <class T, class Out> __global__ void BlendRMSNorm(LoopStreams streams, 
     }
 }
 
-// Two rows and two output channels per block. Pair normalization packs the
-// eight successive inputs consumed by each lane into one aligned vector.
+// A warp reuses the same coefficient across independent rows. Preserve the
+// singleton's per-lane FMA order and final shuffle tree before BF16 rounding.
+template<int RowsPerWarp>
 __global__ void controllerDown(const __nv_bfloat16 *input, const __nv_bfloat16 *weight, __nv_bfloat16 *output,
                                int rows, int columns) {
-    constexpr int width = 4608;
+    constexpr int width = 4608, colsPerBlock = RowsPerWarp == 1 ? 2 : 4;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int row = blockIdx.y * 2 + warp / 2, col = blockIdx.x * 2 + warp % 2;
-    if (row >= rows) return;
-    const size_t index = size_t(blockIdx.z) * rows + row;
-    input += index * width;
+    const int first = (blockIdx.y * (4 / colsPerBlock) + warp / colsPerBlock) * RowsPerWarp;
+    const int col = blockIdx.x * colsPerBlock + warp % colsPerBlock;
+    if (first >= rows) return;
+    const size_t row = size_t(blockIdx.z) * rows + first;
+    input += row * width;
     weight += (size_t(blockIdx.z) * columns + col) * width;
-    float sum = 0.f;
+    float sum[RowsPerWarp]{};
 #pragma unroll
     for (int base = 0; base < width; base += 256) {
-        flashinfer::vec_t<__nv_bfloat16, 8> values;
-        values.load(input + base + lane * 8);
+        flashinfer::vec_t<__nv_bfloat16, 8> values[RowsPerWarp];
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
-            sum = fmaf(float(values[j]), float(weight[base + j * 32 + lane]), sum);
+        for (int r = 0; r < RowsPerWarp; ++r)
+            values[r].load(input + (first + r < rows ? r : 0) * width + base + lane * 8);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float w = float(weight[base + j * 32 + lane]);
+#if CUDART_VERSION >= 12080 && __CUDA_ARCH__ >= 1000
+            if constexpr (RowsPerWarp % 2 == 0) {
+#pragma unroll
+                for (int r = 0; r < RowsPerWarp; r += 2) {
+                    const float2 pair = __ffma2_rn({float(values[r][j]), float(values[r + 1][j])},
+                                                   {w, w}, {sum[r], sum[r + 1]});
+                    sum[r] = pair.x;
+                    sum[r + 1] = pair.y;
+                }
+            } else
+#endif
+            {
+#pragma unroll
+                for (int r = 0; r < RowsPerWarp; ++r)
+                    sum[r] = fmaf(float(values[r][j]), w, sum[r]);
+            }
+        }
     }
 #pragma unroll
-    for (int step = 16; step; step /= 2) sum += __shfl_down_sync(0xffffffff, sum, step);
-    if (!lane) output[index * columns + col] = __float2bfloat16_rn(sum);
+    for (int r = 0; r < RowsPerWarp; ++r) {
+#pragma unroll
+        for (int step = 16; step; step /= 2) sum[r] += __shfl_down_sync(0xffffffff, sum[r], step);
+        if (!lane && first + r < rows) output[(row + r) * columns + col] = __float2bfloat16_rn(sum[r]);
+    }
 }
 
 __device__ __forceinline__ float controllerMix(float dest, float msg, float gain, float forget) {
@@ -255,4 +279,32 @@ __global__ void ControllerNormRows(FASTLLM_ROW_PARAMETER LoopStreams streams, co
             }
         }
     }
+}
+
+template<typename Out>
+void launchBatchedController(LoopStreams streams, const Rows<__nv_bfloat16> &pair, Rows<Out> &out,
+                             const __nv_bfloat16 *down, const __nv_bfloat16 *gate,
+                             int count, int rank, int smCount, float eps) {
+    using T = __nv_bfloat16;
+    const int n = out.rows / count, d = out.cols;
+    auto prepare = count == 1 ? ControllerNormRows<true, T, T, 2304> : ControllerNormRows<true, T, T, 2304, true>;
+    prepare<<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, nullptr, pair.p, eps);
+    Rows<T> hidden(count * n, rank);
+    if (count == 1)
+        FastllmCudaBf16ExactRows(pair.p, down, hidden.p, n, 2 * d, rank);
+    else if (size_t(n / 4) * (rank / 4) * count >= size_t(smCount))
+        controllerDown<4><<<dim3(rank / 4, (n + 3) / 4, count), 128, 0, cudaStreamPerThread>>>(
+            pair.p, down, hidden.p, n, rank);
+    else
+        controllerDown<1><<<dim3(rank / 2, (n + 1) / 2, count), 128, 0, cudaStreamPerThread>>>(
+            pair.p, down, hidden.p, n, rank);
+    Matrix gates(count * n, 2 * d);
+    if (count == 1)
+        controllerMlpGates<4><<<dim3(d / 16, (n + 3) / 4), 128, 0, cudaStreamPerThread>>>(
+            hidden.p, gate, gates.p, n, d);
+    else
+        controllerQkvGates<<<dim3(d / 64, (n + 7) / 8, count), 128, 0, cudaStreamPerThread>>>(
+            hidden.p, gate, gates.p, n, d);
+    ControllerNormRows<false, T, Out, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(
+        streams, gates.p, out.p, eps);
 }

@@ -10,6 +10,23 @@ bool FastllmCudaBFloat16LinearFloat32(const fastllm::Data &input, const fastllm:
 // ordinary Linear loop. Output must already own enough CUDA storage.
 bool FastllmCudaBFloat16LinearFixedRows(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
+// Selected once on the current CUDA device. A null backend or a declined
+// shape leaves the caller on its ordinary Linear path.
+struct FastllmBf16MmaProjections {
+    using Project = bool (*)(const void *input, const void *weight, void *output, int rows, int width, int columns);
+    Project attention;
+    Project draftLogits;
+    bool (*cappedLogits)(const void *input, const void *weight, float *output, int rows, int width, int vocab, float cap);
+};
+const FastllmBf16MmaProjections *FastllmCudaGetBf16MmaProjections();
+void FastllmCudaBf16ExactRows(const void *input, const void *weight, void *output,
+                             int rows, int width, int columns);
+// Preserve the singleton GEMV tree when the projection feeds recurrent state or routing.
+bool FastllmCudaBf16ExactBatchProjection(const void *input, const void *weight, void *output,
+                                        int rows, int width, int columns);
+// Dense output head with the same cuBLASLt reduction for decode and verification.
+bool FastllmCudaBf16DecodeProjection(const void *input, const void *weight, void *output,
+                                    int rows, int width, int columns);
 // Packed BF16 prefill with a batch-independent reduction order.
 bool FastllmCudaBFloat16PrefillLinear(const fastllm::Data &input,
     const fastllm::Data &weight, fastllm::Data &output);
