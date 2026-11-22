@@ -663,6 +663,13 @@ if (USE_CUDA)
         if (NOT CUDA_NO_TENSOR_CORE AND
             EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/gemm/device/gemm.h")
             list(APPEND FASTLLM_CUDA_SM120_SOURCES src/devices/cuda/linear/fastllm-bf16-attention-sm120.cu)
+            if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include/cutlass/util/packed_stride.hpp")
+                list(APPEND FASTLLM_CUDA_SM120_SOURCES src/devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cu)
+                set_property(SOURCE src/devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cu APPEND PROPERTY
+                    INCLUDE_DIRECTORIES "${FASTLLM_CUTLASS_DIR}/tools/util/include")
+                set_property(SOURCE src/models/inkling2/experts.cu test/ops/cudaRoutedNvfp4Sm120.cu APPEND PROPERTY
+                    COMPILE_DEFINITIONS FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+            endif()
             set_property(SOURCE src/devices/cuda/linear/fastllm-linear-bf16.cu APPEND PROPERTY
                 COMPILE_DEFINITIONS FASTLLM_HAS_BF16_MMA_SM120)
         endif()

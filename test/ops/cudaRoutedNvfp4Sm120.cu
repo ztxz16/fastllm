@@ -2,6 +2,10 @@
 // Include shuffled routes, signed block scales and independently scaled experts.
 #include "../../src/models/inkling2/runtime.cuh"
 #include "../../src/devices/cuda/moe/fastllm-nvfp4-routed-sm120.cuh"
+#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+#include "../../src/devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cuh"
+#endif
+#include <cstring>
 #include <cstdio>
 #include <random>
 
@@ -25,8 +29,9 @@ double scale(unsigned byte) {
     double v = exp ? std::ldexp(1. + (a % 8) / 8., exp - 7) : a / 512.;
     return byte & 128 ? -v : v;
 }
-template <int TileRows> void test(int tokens, bool up, bool skew) {
-    const int experts = 6, top = 3, n = 48, k = 192, routes = tokens * top, div = up ? top : 1;
+template <int TileRows> void test(int tokens, bool up, bool skew, bool verify = false, bool grouped = false) {
+    const int experts = verify ? 97 : 6, top = verify ? 8 : 3, n = grouped ? 256 : 48;
+    const int k = grouped ? 320 : 192, routes = tokens * top, div = up ? top : 1;
     const int capacity = (routes + (TileRows - 1) * std::min(experts, routes)) / TileRows;
     std::mt19937 rng(107);
     std::vector<uint32_t> w(size_t(experts) * n * k / 8);
@@ -48,7 +53,7 @@ template <int TileRows> void test(int tokens, bool up, bool skew) {
         b.outer = float((i / (k / 16) + 1) % 9) / 7.f;
     }
     for (int i = 0; i < routes; ++i)
-        ids[i] = skew ? 4 : (i / top * 5 + i % top * 2) % experts;
+        ids[i] = skew ? (verify ? i % top : 4) : (i / top * 5 + i % top * 2) % experts;
     auto wi = copy(w);
     auto si = copy(sf);
     auto gi = copy(global);
@@ -72,8 +77,66 @@ template <int TileRows> void test(int tokens, bool up, bool skew) {
         check(cudaMemcpy(di.p, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
         check(cudaMemset(y.p, 0xff, size_t(routes) * n * sizeof(__nv_bfloat16)));
         std::vector<int> outputRows(routes);
+        std::vector<__nv_bfloat16> got(size_t(routes) * n);
         for (int i = 0; i < routes; ++i) outputRows[i] = i;
-        if (tokens == 1) {
+        if (verify) {
+            Buffer<__nv_bfloat16> ref(size_t(routes) * n);
+            op::decodeProject<4><<<dim3(n / 16, routes), 128>>>(view, xi.p, di.p, ref.p, n, k, div);
+#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+            if (grouped) {
+                int device, smCount;
+                check(cudaGetDevice(&device));
+                check(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
+                op::GroupedWeightMaps maps;
+                if (!op::makeGroupedWeightMaps(maps, view, experts, n, k)) throw std::runtime_error("Invalid weight maps");
+                auto scratch = op::groupedScratch(experts, smCount);
+                Buffer<int> offsets(experts + 1), ranks(routes);
+                Buffer<uint2> values(size_t(routes) * k / 16);
+                Buffer<uint8_t> scales(op::groupedScaleRows(routes, experts) * k / 16);
+                Buffer<float> sorted(size_t(routes) * n);
+                Buffer<uint8_t> metadata(scratch.metadata), gemm(scratch.gemm);
+                op::GroupedBuffers buffers{values.p, scales.p, sorted.p, metadata.p, gemm.p};
+                check(op::planGroupedRows(di.p, offsets.p, ranks.p, experts, routes, cudaStreamPerThread));
+                check(op::packGroupedInput(xi.p, di.p, offsets.p, ranks.p, buffers, routes, k, div, cudaStreamPerThread));
+                check(op::projectGroupedRows(view, maps, offsets.p, buffers, n, k, experts, smCount, cudaStreamPerThread));
+
+                std::vector<float> outer(routes), dots(got.size()), sums(size_t(tokens) * n);
+                std::vector<int> starts(experts + 1), rank(routes);
+                check(cudaMemcpy(dots.data(), sorted.p, dots.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(starts.data(), offsets.p, starts.size() * sizeof(int), cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(rank.data(), ranks.p, rank.size() * sizeof(int), cudaMemcpyDeviceToHost));
+                for (int i = 0; i < routes; ++i) outer[i] = x[size_t(i / div) * (k / 16)].outer;
+                auto rowScales = copy(outer);
+                Buffer<float> result(sums.size());
+                check(op::sumGroupedRows(sorted.p, result.p, di.p, offsets.p, ranks.p, gi.p, rowScales.p,
+                                         tokens, n, top, cudaStreamPerThread));
+                check(cudaMemcpy(sums.data(), result.p, sums.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                for (int i = 0; i < routes; ++i) {
+                    int expert = ids[i], row = starts[expert] + rank[i];
+                    for (int j = 0; j < n; ++j)
+                        got[i * n + j] = __float2bfloat16_rn(dots[row * n + j] * global[expert] * outer[i]);
+                }
+                for (int i = 0; i < tokens; ++i)
+                    for (int j = 0; j < n; ++j) {
+                        float sum = 0;
+                        for (int t = 0; t < top; ++t) sum += float(got[(i * top + t) * n + j]);
+                        if (sum != sums[i * n + j]) throw std::runtime_error("Incorrect grouped top-k sum");
+                    }
+            } else
+#endif
+            {
+                const int tile = op::decodeRouteTileRows(tokens, top);
+                if (!tile) throw std::runtime_error("Expected a multi-row decode tile");
+                op::decodeProject<4, true><<<dim3(n / 16, tile * top, (tokens + tile - 1) / tile), 128>>>(
+                    view, xi.p, di.p, y.p, n, k, div, routes, tile * top);
+            }
+            std::vector<__nv_bfloat16> expected(got.size());
+            const size_t bytes = expected.size() * sizeof(__nv_bfloat16);
+            check(cudaMemcpy(expected.data(), ref.p, bytes, cudaMemcpyDeviceToHost));
+            if (!grouped) check(cudaMemcpy(got.data(), y.p, bytes, cudaMemcpyDeviceToHost));
+            if (std::memcmp(got.data(), expected.data(), bytes))
+                throw std::runtime_error("Grouped decode differs from the single-route projection");
+        } else if (tokens == 1) {
             op::decodeProject<4><<<dim3(n / 16, routes), 128>>>(view, xi.p, di.p, y.p, n, k, div);
         } else {
             check(cudaMemsetAsync(used.p, 0, sizeof(op::PlanSize), cudaStreamPerThread));
@@ -103,8 +166,7 @@ template <int TileRows> void test(int tokens, bool up, bool skew) {
                 op::groupedProject<warps, columns, false><<<grid, threads>>>(
                     view, nullptr, scalesByRow.p, packed.p, plan.p, used.p, y.p, n, k, div);
         }
-        std::vector<__nv_bfloat16> got(routes * n);
-        check(cudaMemcpy(got.data(), y.p, got.size() * sizeof(got[0]), cudaMemcpyDeviceToHost));
+        if (!verify) check(cudaMemcpy(got.data(), y.p, got.size() * sizeof(got[0]), cudaMemcpyDeviceToHost));
         double error = 0, norm = 0;
         for (int i = 0; i < routes; ++i)
             for (int j = 0; j < n; ++j) {
@@ -119,9 +181,14 @@ template <int TileRows> void test(int tokens, bool up, bool skew) {
                 const double diff = float(got[outputRows[i] * n + j]) - ref;
                 error += diff * diff;
                 norm += ref * ref;
-                if (!std::isfinite(diff) || std::abs(diff) > std::abs(ref) * .004 + 1e-4)
+                // The wider grouped cases also check every BF16 bit against the
+                // decode kernel above. Use a norm for their independent FP64
+                // check because near-cancelling large terms can leave tiny dots.
+                if (!std::isfinite(diff) || (!grouped && std::abs(diff) > std::abs(ref) * .004 + 1e-4))
                     throw std::runtime_error("Incorrect routed NVFP4 output");
             }
+        if (grouped && error > .0025 * .0025 * norm)
+            throw std::runtime_error("Grouped NVFP4 error exceeds the FP64 reference tolerance");
         printf("tokens=%d gate=%d skew=%d pass=%d relL2=%.6g\n", tokens, up, skew, pass,
                std::sqrt(error / std::max(norm, 1e-30)));
     }
@@ -250,6 +317,22 @@ int main() {
                 test<32>(rows, up, skew);
                 test<64>(rows, up, skew);
             }
+    for (bool up : {false, true})
+        for (int rows : {5, 7, 8, 9, 12, 17})
+            for (bool skew : {false, true})
+                test<32>(rows, up, skew, true);
+#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+    op::GroupedWeightMaps invalidMaps{};
+    if (op::makeGroupedWeightMaps(invalidMaps, {}, 1, 48, 320) ||
+        op::makeGroupedWeightMaps(invalidMaps, {}, 1, 256, 96))
+        throw std::runtime_error("Expected the unaligned weight-map fallback");
+    if (op::useGroupedVerify(31, 8, 128, 2304, 1152) || !op::useGroupedVerify(33, 8, 128, 2304, 1152))
+        throw std::runtime_error("Incorrect grouped verification crossover");
+    for (bool up : {false, true})
+        for (bool skew : {false, true}) test<32>(73, up, skew, true, true);
+#endif
+    if (op::decodeRouteTileRows(4, 8) || op::decodeRouteTileRows(1, 40))
+        throw std::runtime_error("Expected the small-route decode fallback");
     testScatter<32>(192);
     testScatter<64>(2304);
     testPackedActivation<32>(192, true);

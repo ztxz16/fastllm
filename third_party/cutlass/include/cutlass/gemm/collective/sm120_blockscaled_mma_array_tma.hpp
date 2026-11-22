@@ -1,5 +1,5 @@
 /***************************************************************************************************
- * Copyright (c) 2025 - 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Redistribution and use in source and binary forms, with or without
@@ -203,10 +203,21 @@ struct CollectiveMma<
     append(stride(SmemLayoutAtomSFA{}), size(filter_zeros(SmemLayoutAtomSFA{})))
   ));
 
-  using SmemLayoutSFB = decltype(make_layout(
+  using SmemLayoutSFB_ = decltype(make_layout(
     append(shape(SmemLayoutAtomSFB{}), Int<DispatchPolicy::Stages>{}),
     append(stride(SmemLayoutAtomSFB{}), size(filter_zeros(SmemLayoutAtomSFB{})))
   ));
+
+  using TileShapeSFB = cute::conditional_t<size<1>(TileShape{}) < 128,
+    decltype(cute::make_shape(
+      shape<0>(TileShape{}),
+      Int<128>{},
+      shape<2>(TileShape{}))),
+    TileShape>;
+
+  using SmemLayoutSFB = cute::conditional_t<size<1>(TileShape{}) < 128,
+    decltype(cute::logical_divide(SmemLayoutSFB_{}, select<1,2>(TileShape{}))),
+    SmemLayoutSFB_>;
 
   static_assert(rank(SmemLayoutA{}) == 3, "Smem layout must be rank 3.");
   static_assert(rank(SmemLayoutB{}) == 3, "Smem layout must be rank 3.");
@@ -259,8 +270,8 @@ struct CollectiveMma<
     struct TensorStorage : cute::aligned_struct<128, _0> {
       alignas(1024) cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
       alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-      cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
-      cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
+      alignas(16)   cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
+      alignas(16)   cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
     } tensors;
 
     struct TensorMapStorage : cute::aligned_struct<128, _0> {
@@ -321,7 +332,7 @@ struct CollectiveMma<
         GmemTiledCopySFB{},
         make_tensor(static_cast<ElementSF const*>(nullptr), InternalLayoutSFB{}),
         SmemLayoutSFB{}(_,_,cute::Int<0>{}),
-        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
+        make_shape(shape<1>(TileShapeSFB{}), shape<2>(TileShapeSFB{})),
         _1{}));  // No programmatic multicast
 
     TMA_A tma_load_a;
@@ -417,7 +428,7 @@ struct CollectiveMma<
         GmemTiledCopySFB{},
         tensor_sfb,
         SmemLayoutSFB{}(_,_,cute::Int<0>{}),
-        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})),
+        make_shape(shape<1>(TileShapeSFB{}), shape<2>(TileShapeSFB{})),
         _1{}); // No programmatic multicast
 
     return {
@@ -670,6 +681,7 @@ struct CollectiveMma<
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Producer Perspective
   template <
+    class LoadA = void, class LoadParams,  // optional loader-specific tensor maps
     class TensorA, class TensorB,
     class TensorSFA, class TensorSFB,
     class TensorMapA, class TensorMapB,
@@ -678,7 +690,7 @@ struct CollectiveMma<
   >
   CUTLASS_DEVICE void
   load(
-      Params const& params,
+      LoadParams const& params,
       MainloopPipeline pipeline,
       PipelineState smem_pipe_write,
       cute::tuple<TensorA, TensorB, TensorSFA, TensorSFB> const& load_inputs,
@@ -687,7 +699,7 @@ struct CollectiveMma<
       KTileIterator k_tile_iter, int k_tile_count,
       int thread_idx,
       uint32_t block_rank_in_cluster,
-      TensorStorage& shared_tensors) {
+      TensorStorage& shared_tensors, int group_index = 0) {
     int lane_predicate = cute::elect_one_sync();
 
     if (lane_predicate) {
@@ -712,10 +724,15 @@ struct CollectiveMma<
       // Partition the inputs based on the current block coordinates.
       auto [m_coord, n_coord, k_coord, l_coord] = blk_coord;
 
+      auto broadcast_n = make_layout(
+        make_shape(Int<size<1>(TileShapeSFB{}) / size<1>(TileShape{})>{},
+                   Int<cute::numeric_limits<int>::max()>{}),
+        make_stride(_0{}, size<1>(TileShapeSFB{}) / size<1>(TileShape{})));
+
       Tensor gA =   gA_mkl(_,_,m_coord,_,l_coord);                                                     // (BLK_M,BLK_K,k)
       Tensor gB =   gB_nkl(_,_,n_coord,_,l_coord);                                                     // (BLK_N,BLK_K,k)
       Tensor gSFA = gSFA_mkl(_,_,m_coord,_,l_coord);                                                   // (BLK_M,BLK_K,k)
-      Tensor gSFB = gSFB_nkl(_,_,n_coord,_,l_coord);                                                   // (BLK_N,BLK_K,k)
+      Tensor gSFB = gSFB_nkl(_,_,broadcast_n(n_coord),_,l_coord);                                      // (BLK_N,BLK_K,k)
 
       // Partition source and destination tensors for tma copies
       Tensor tAgA = block_tma_a.partition_S(gA);                                              // (TMA,TMA_M,TMA_K,k)
@@ -744,10 +761,11 @@ struct CollectiveMma<
         BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
 
         int write_stage = smem_pipe_write.index();
-        copy(params.tma_load_a.with(get<0>(input_tensormaps),*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+        if constexpr (cute::is_same_v<LoadA, void>) copy(params.tma_load_a.with(get<0>(input_tensormaps),*tma_barrier), tAgA(_,_,_,*k_tile_iter), tAsA(_,_,_,write_stage));
+        else LoadA{}(params, blk_coord, group_index, int(*k_tile_iter), write_stage, shared_tensors, tma_barrier);
         copy(params.tma_load_b.with(get<1>(input_tensormaps),*tma_barrier), tBgB(_,_,_,*k_tile_iter), tBsB(_,_,_,write_stage));
 
-        copy(params.tma_load_sfa.with(get<2>(input_tensormaps),*tma_barrier), tAgSFA(_,_,_,*k_tile_iter), tAsSFA(_,_,_,write_stage));
+        if constexpr (cute::is_same_v<LoadA, void>) copy(params.tma_load_sfa.with(get<2>(input_tensormaps),*tma_barrier), tAgSFA(_,_,_,*k_tile_iter), tAsSFA(_,_,_,write_stage));
         copy(params.tma_load_sfb.with(get<3>(input_tensormaps),*tma_barrier), tBgSFB(_,_,_,*k_tile_iter), tBsSFB(_,_,_,write_stage));
 
         // Advance k tile
@@ -778,7 +796,9 @@ struct CollectiveMma<
   /// Perform a collective-scoped matrix multiply-accumulate
   /// Consumer Perspective
   template <
-    class FrgTensorC
+    int AccumulatorBanks = 1, class RegisterLoadA = void,
+    class FrgTensorC,
+    class BlockCoord = decltype(cute::make_coord(0,0,0,0))
   >
   CUTLASS_DEVICE void
   mma(MainloopPipeline pipeline,
@@ -787,7 +807,8 @@ struct CollectiveMma<
       int k_tile_count,
       int thread_idx,
       TensorStorage& shared_tensors,
-      [[maybe_unused]] Params const& params) {
+      [[maybe_unused]] Params const& params,
+      BlockCoord const& blk_coord = {}) {
     using namespace cute;
 
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
@@ -796,8 +817,17 @@ struct CollectiveMma<
 
     Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});         // (BLK_M,BLK_K,PIPE)
     Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});         // (BLK_N,BLK_K,PIPE)
-    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});  // (BLK_M,BLK_K,PIPE)
-    Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});  // (BLK_N,BLK_K,PIPE)
+    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});   // (BLK_M,BLK_K,PIPE)
+    Tensor sSFB = [&]() {
+      if constexpr (size<1>(TileShape{}) >= 128) {
+        return make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});      // (BLK_N,BLK_K,PIPE)
+      }
+      else {
+        Tensor temp = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});  // (BLK_SFB_N,BLK_K,PIPE)
+        auto n = get<1>(blk_coord);
+        return temp(make_coord(_,n % (size<1>(TileShapeSFB{}) / size<1>(TileShape{}))), _, _);
+      }
+    }();
 
     //
     // Define C accumulators and A/B partitioning
@@ -883,25 +913,35 @@ struct CollectiveMma<
     auto tCsSFA_stage = tCsSFA(_,_,_,read_stage);
     auto tCsSFB_stage = tCsSFB(_,_,_,read_stage);
 
+    int next_k_block = 0;
     auto copy_kblock = [&](auto k_block) {
-        // copy smem->rmem for A/B operand
-      copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
-      copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
-
-      // Left shift A,B for FP4
       using MMAOp = typename TiledMma::MMA_Op;
-      fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
+      if constexpr (cute::is_same_v<RegisterLoadA, void>) {
+        copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
+        fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
+        copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
+      }
+      else {
+        RegisterLoadA{}(params, blk_coord, thread_mma, tCrA, tCrSFA, k_block, next_k_block++, read_stage, thread_idx, shared_tensors);
+      }
+      copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
       fp4_shift_B(MMAOp{}, tCrB_copy_view(_,_,k_block));
-
-
-      // Copy smem->rmem for SFA/SFB operand
-      copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
       copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
     };
 
+    // Optional interleaved accumulators reproduce a split-K reduction without
+    // rereading the operands or materializing partial matrices in global memory.
+    FrgTensorC partial[AccumulatorBanks == 1 ? 1 : AccumulatorBanks];
+    if constexpr (AccumulatorBanks > 1) {
+      static_assert(decltype(K_BLOCK_MAX)::value % AccumulatorBanks == 0);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < AccumulatorBanks; ++i) clear(partial[i]);
+    }
     auto gemm_kblock = [&](auto k_block) {
-      // (V,M) x (V,N) => (V,M,N)
-      cute::gemm(tiled_mma, make_zip_tensor(tCrA(_,_,k_block), tCrSFA(_,_,k_block)), make_zip_tensor(tCrB(_,_,k_block), tCrSFB(_,_,k_block)), accum);
+      auto a = make_zip_tensor(tCrA(_,_,k_block), tCrSFA(_,_,k_block));
+      auto b = make_zip_tensor(tCrB(_,_,k_block), tCrSFB(_,_,k_block));
+      if constexpr (AccumulatorBanks == 1) cute::gemm(tiled_mma, a, b, accum);
+      else cute::gemm(tiled_mma, a, b, partial[decltype(k_block)::value % AccumulatorBanks]);
     };
 
     pipeline.consumer_wait(smem_pipe_read);
@@ -957,6 +997,14 @@ struct CollectiveMma<
       gemm_kblock(k_block);
 
     });
+    if constexpr (AccumulatorBanks > 1) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < AccumulatorBanks; ++i) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < size(accum); ++j) accum(j) += partial[i](j);
+      }
+    }
+
 }
 
   /// Perform a Consumer Epilogue to release all buffers

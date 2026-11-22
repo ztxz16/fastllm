@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 #endif
 #include <cstdint>
+#include <algorithm>
 #if CUDART_VERSION >= 12080 && !defined(CUDA_NO_TENSOR_CORE) && __has_include(<cute/arch/mma_sm120.hpp>)
 #include <cute/arch/mma_sm120.hpp>
 #endif
@@ -446,15 +447,48 @@ static __global__ void groupedProject(Weights w, const Block16 *input, const flo
     }
 #endif
 }
-// One warp computes sixteen output channels with a native 16x8x64 MMA.
-// Decode has one routed vector per expert. Split K between warps in a CTA.
-template <int Warps>
-static __global__ void decodeProject(Weights w, const Block16 *input, const int *ids, __nv_bfloat16 *out, int n,
-                                     int k, int divisor) {
+// One MMA has eight input columns. Two warp ballots can match up to 64 routes.
+// A single ballot of routes shows little reuse in small-batch verification.
+inline int decodeRouteTileRows(int rows, int topK) {
+    const int tile = std::min({rows, 8, 64 / topK});
+    return tile > 1 && tile * topK > 32 ? tile : 0;
+}
+
+// The bits encode route indices within one tile. Slots follow their original routing order.
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
-    const int route = blockIdx.y, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+__device__ __forceinline__ int matchingRoute(unsigned low, unsigned high, int slot) {
+    const int lowerCount = __popc(low);
+    return slot < lowerCount ? __fns(low, 0, slot + 1) : 32 + __fns(high, 0, slot - lowerCount + 1);
+}
+#endif
+// One warp computes sixteen output channels with a native 16x8x64 MMA.
+// Matching routes fill its input columns. Both paths split K between warps in a CTA.
+template <int Warps, bool MatchRoutes = false>
+static __global__ void decodeProject(Weights w, const Block16 *input, const int *ids, __nv_bfloat16 *out, int n,
+                                     int k, int divisor, int routes = 0, int capacity = 0) {
+#if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int first = MatchRoutes ? blockIdx.z * capacity : 0;
+    const int local = blockIdx.y, route = first + local;
+    if constexpr (MatchRoutes) {
+        if (route >= routes) return;
+    }
     const int expert = ids[route];
-    const Block16 *x = input + size_t(route / divisor) * (k / 16);
+    int src = route, count = 1;
+    unsigned low = 0, high = 0;
+    if constexpr (MatchRoutes) {
+        static_assert(Warps == 4);
+        const int live = min(capacity, routes - first);
+        if (live >= 32) {
+            low = __ballot_sync(0xffffffff, lane < live && ids[first + lane] == expert);
+            high = __ballot_sync(0xffffffff, lane + 32 < live && ids[first + 32 + lane] == expert);
+            const int leader = low ? __ffs(low) - 1 : 32 + __ffs(high) - 1;
+            if (local != leader) return;
+            count = __popc(low) + __popc(high);
+            if (count > 1) src = first + matchingRoute(low, high, min(lane / 4, count - 1));
+        }
+    }
+    const Block16 *x = input + size_t(src / divisor) * (k / 16);
     const size_t base = (size_t(expert) * (n / 16) + blockIdx.x) * (k / 64);
     float v[4] = {};
     for (int t = warp; t < k / 64; t += Warps) {
@@ -465,6 +499,26 @@ static __global__ void decodeProject(Weights w, const Block16 *input, const int 
         const unsigned sb =
             x[t * 4].scale | (x[t * 4 + 1].scale << 8) | (x[t * 4 + 2].scale << 16) | (x[t * 4 + 3].scale << 24);
         BlockMma::fma(v[0], v[1], v[2], v[3], a.x, a.y, a.z, a.w, b0, b1, v[0], v[1], v[2], v[3], sa, sb);
+    }
+    if constexpr (MatchRoutes) {
+        if (count > 1) {
+            // MMA columns hold different routes. Preserve the singleton's order of split-K reduction.
+            __shared__ float partials[Warps][4][32];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) partials[warp][j][lane] = v[j];
+            __syncthreads();
+            const int slot = 2 * (lane % 4) + (warp & 1);
+            if (slot < count) {
+                float sum = 0;
+#pragma unroll
+                for (int part = 0; part < Warps; ++part) sum += partials[part][warp][lane];
+                const int dst = first + matchingRoute(low, high, slot);
+                const float outer = input[size_t(dst / divisor) * (k / 16)].outer;
+                out[size_t(dst) * n + blockIdx.x * 16 + lane / 4 + 8 * (warp / 2)] =
+                    __float2bfloat16_rn(sum * w.outer[expert] * outer);
+            }
+            return;
+        }
     }
     __shared__ float partial[Warps][16];
     if (!(lane % 4)) {

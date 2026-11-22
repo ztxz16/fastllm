@@ -3,6 +3,9 @@
 // https://github.com/vllm-project/vllm/tree/fc1443152c0eb655f5c2762f56b540bebe93b196/vllm/models/inkling2/nvidia
 #include "runtime.cuh"
 #include "../../devices/cuda/moe/fastllm-nvfp4-routed-sm120.cuh"
+#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+#include "../../devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cuh"
+#endif
 #include "devices/cpu/computeutils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-activation.h"
@@ -129,8 +132,30 @@ struct PackedSiTU {
 #endif
 };
 
+__device__ void storeFp4Word(native::Block16 *out, int row, int col, int width,
+                              unsigned word, uint8_t scale, float outer) {
+    auto &block = out[(size_t(row) * width + col) / 16];
+    block.code[(col % 16) / 8] = word;
+    if (!(col % 16)) {
+        block.scale = scale;
+        block.outer = outer;
+    }
+}
+
+#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+struct GroupedFp4Output {
+    native::GroupedInputRow row;
+    float *outer;
+};
+__device__ void storeFp4Word(GroupedFp4Output out, int route, int col, int, unsigned word, uint8_t scale, float outer) {
+    reinterpret_cast<unsigned *>(out.row.codes)[col / 8] = word;
+    if (!(col % 16)) out.row.scale(col / 16) = scale;
+    if (!col) out.outer[route] = outer;
+}
+#endif
+
 template <bool fp4, typename Source, typename Out>
-__device__ void reconstructRow(Source src, Out *out, int d, bool cacheValues, unsigned tiles) {
+__device__ void reconstructRow(Source src, Out out, int d, bool cacheValues, unsigned tiles) {
     const int row = blockIdx.x;
     constexpr int tile = fp4 ? 512 : 256;
     constexpr bool plain = std::is_same_v<Source, InputRow>;
@@ -168,7 +193,7 @@ __device__ void reconstructRow(Source src, Out *out, int d, bool cacheValues, un
         float peak = fabsf(v);
         for (int delta = width / 2; delta; delta >>= 1)
             peak = fmaxf(peak, __shfl_xor_sync(__activemask(), peak, delta, width));
-        if constexpr (std::is_same_v<Out, native::Block16>) {
+        if constexpr (std::is_same_v<Out, native::Block16 *> || !std::is_pointer_v<Out>) {
 #if CUDART_VERSION >= 11080
             const Fp4Choice q = chooseFp4(v, peak, outer);
             // E2M1 magnitudes from one through six occupy consecutive half-exponent steps.
@@ -178,12 +203,7 @@ __device__ void reconstructRow(Source src, Out *out, int d, bool cacheValues, un
             unsigned word = nibble << (4 * (col % 8));
             for (int delta = 1; delta < 8; delta *= 2)
                 word |= __shfl_xor_sync(__activemask(), word, delta, 8);
-            auto &block = out[(size_t(row) * d + col) / 16];
-            if (!(col % 8)) block.code[(col % 16) / 8] = word;
-            if (!(col % 16)) {
-                block.scale = __nv_fp8_e4m3(q.scale).__x;
-                block.outer = outer;
-            }
+            if (!(col % 8)) storeFp4Word(out, row, col, d, word, __nv_fp8_e4m3(q.scale).__x, outer);
 #endif
         } else {
             float q = 0;
@@ -193,7 +213,7 @@ __device__ void reconstructRow(Source src, Out *out, int d, bool cacheValues, un
                 float scale = exp2f(ceilf(log2f(peak / 448.f)));
                 q = roundFp8(v / scale) * scale;
             }
-            if constexpr (std::is_same_v<Out, half>)
+            if constexpr (std::is_same_v<Out, half *>)
                 out[size_t(row) * d + col] = __float2half_rz(q);
             else
                 out[size_t(row) * d + col] = q;
@@ -205,6 +225,33 @@ template <bool fp4, typename Source, typename Out>
 __global__ void reconstructExpertRows(Source src, Out *out, int d, bool cacheValues) {
     reconstructRow<fp4>(src, out, d, cacheValues, gridDim.y);
 }
+
+#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+struct GroupedSiTU {
+    const float *dots;
+    float weightScale, inputScale, score, gateCap, upCap;
+    __device__ float get(size_t, int col, int width) const {
+        const float gate = native::scaledGroupedValue(dots[col], weightScale, inputScale);
+        const float up = native::scaledGroupedValue(dots[width + col], weightScale, inputScale);
+        return float(__float2bfloat16_rn(FastllmSiTUAndMul(gate, up, gateCap, upCap) * score));
+    }
+};
+
+__global__ void quantizeGroupedSiTU(native::GroupedBuffers buffers, const native::Block16 *input,
+                                    const float *weightScales, const float *scores, const int *ids,
+                                    const int *offsets, const int *ranks, float *midScales,
+                                    int hidden, int width, int topK, float gateCap, float upCap, bool cache) {
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    const int route = blockIdx.x, expert = ids[route], rank = ranks[route], start = offsets[expert];
+    const float *dots = buffers.accumulators + size_t(start + rank) * (2 * width);
+    const float inputScale = input[size_t(route / topK) * (hidden / 16)].outer;
+    GroupedSiTU act{dots, weightScales[expert], inputScale, scores[route], gateCap, upCap};
+    GroupedFp4Output dst{native::GroupedInputRow(buffers, start, expert, rank, width / 16), midScales};
+    reconstructRow<true>(act, dst, width, cache, gridDim.y);
+}
+#endif
 
 __global__ void sumNativeRoutes(const __nv_bfloat16 *routes, float *out, int rows, int width, int top) {
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -349,11 +396,22 @@ void prepareRoutedInput(InputRow src, Out *out, int rows, int d, int smCount, Ro
 #if CUDART_VERSION >= 12000
     if (scratch) {
         unsigned tiles = quantTiles<fp4>(rows, d, smCount);
-        constexpr int expertTile = 2;
-        projectSelectAndQuantize<fp4, Out, expertTile><<<dim3(rows, tiles + DecodeRouter::experts / expertTile),
-            fp4 ? 512 : 256, 0, cudaStreamPerThread>>>(src, out, d, route,
-                    packed, scratch, tiles);
-        return;
+        constexpr int threads = fp4 ? 512 : 256;
+        const int64_t work = int64_t(rows) * DecodeRouter::experts;
+        auto launch = [&](auto tile) {
+            constexpr int experts = decltype(tile)::value;
+            projectSelectAndQuantize<fp4, Out, experts>
+                <<<dim3(rows, tiles + DecodeRouter::experts / experts), threads, 0, cudaStreamPerThread>>>(
+                    src, out, d, route, packed, scratch, tiles);
+        };
+        // Each warp owns one expert dot. Use more warps per CTA when the
+        // batch has enough independent dots to still fill a wave of SMs.
+        if constexpr (fp4) {
+            if (work >= 16LL * smCount) return launch(std::integral_constant<int, 16>{});
+        }
+        if (work >= 8LL * smCount) return launch(std::integral_constant<int, 8>{});
+        if (work >= 4LL * smCount) return launch(std::integral_constant<int, 4>{});
+        return launch(std::integral_constant<int, 2>{});
     }
 #endif
     dim3 grid(rows, 1 + quantTiles<fp4>(rows, d, smCount));
@@ -407,6 +465,7 @@ struct HostTopology {
 #endif
     }
 };
+
 struct HostShard {
     std::shared_ptr<void> storage;
     uint8_t *values = nullptr;
@@ -420,6 +479,10 @@ struct Projection {
     Buffer<uint4> nativeCodes;
     Buffer<unsigned> nativeScales;
     Buffer<float> nativeOuter;
+#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+    native::GroupedWeightMaps groupedMaps{};
+    bool haveGroupedMaps = false;
+#endif
     native::Weights nativeView() const { return {nativeCodes.p, nativeScales.p, nativeOuter.p}; }
     std::vector<HostShard> shards;
     std::vector<Packed> host;
@@ -452,6 +515,9 @@ struct Projection {
             nativeCodes = Buffer<uint4>(raw.size() / 16);
             nativeScales = Buffer<unsigned>(scale.size() / 4);
             nativeOuter = Buffer<float>(e);
+#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+            haveGroupedMaps = native::makeGroupedWeightMaps(groupedMaps, nativeView(), e, r, c);
+#endif
             check(cudaMemcpy(nativeOuter.p, outer.data(), e * sizeof(float), cudaMemcpyHostToDevice));
             Buffer<unsigned> staging((bytes + groups) / sizeof(unsigned));
             for (int id = 0; id < e; ++id) {
@@ -656,6 +722,37 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
                 down.nativeView(), nullptr, scales.p, packed.p, tasks.p, used.p, projected, down.rows, down.cols, 1);
     }
 
+#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+    void groupedVerify(const Config &c, int rows, RouteSelection route, const native::Block16 *input, float *dst) const {
+        const int *ids = route.ids;
+        const int routes = rows * c.topK, width = std::max(gate.cols, down.cols);
+        Buffer<int> offsets(c.experts + 1), rank(routes);
+        check(native::planGroupedRows(ids, offsets.p, rank.p, c.experts, routes, cudaStreamPerThread));
+        Buffer<uint2> codes(size_t(routes) * (width / 16));
+        Buffer<uint8_t> scales(native::groupedScaleRows(routes, c.experts) * (width / 16));
+        Buffer<float> sorted(size_t(routes) * std::max(gate.rows, down.rows));
+        const auto space = native::groupedScratch(c.experts, smCount);
+        Buffer<uint8_t> metadata(space.metadata), workspace(space.gemm);
+        native::GroupedBuffers buffers{codes.p, scales.p, sorted.p, metadata.p, workspace.p};
+        check(native::packGroupedInput(input, ids, offsets.p, rank.p, buffers, routes, gate.cols, c.topK, cudaStreamPerThread));
+        auto project = [&](const Projection &w) {
+            check(native::projectGroupedRows(w.nativeView(), w.groupedMaps, offsets.p, buffers, w.rows, w.cols,
+                                             c.experts, smCount, cudaStreamPerThread));
+        };
+        project(gate);
+        Buffer<float> midScales(routes);
+        const size_t bytes = size_t(c.intermediate) * sizeof(float);
+        const bool cache = bytes + 16 * sizeof(float) <= 48 * 1024;
+        quantizeGroupedSiTU<<<dim3(routes, quantTiles<true>(routes, c.intermediate, smCount)), 512,
+                              cache ? bytes : 0, cudaStreamPerThread>>>(
+            buffers, input, gate.nativeOuter.p, route.scores, ids, offsets.p, rank.p, midScales.p,
+            c.hidden, c.intermediate, c.topK, gateCap, upCap, cache);
+        project(down);
+        check(native::sumGroupedRows(sorted.p, dst, ids, offsets.p, rank.p, down.nativeOuter.p, midScales.p,
+                                     rows, c.hidden, c.topK, cudaStreamPerThread));
+    }
+#endif
+
     // The routing score is applied inside SiTU before the second FP4 quantization.
     void runNative(const Config &c, InputRow source, int rows, RouteSelection route, DecodeRouter *scratch,
                    float *dstRows, bool decodeArithmetic) const {
@@ -664,7 +761,6 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
         // keeps at most two FP4 blocks in registers until its row scale is known.
         const bool ranked = !decodeArithmetic && routes / c.experts >= 32 && c.hidden <= native::QuantThreads * 2 * 16;
         Buffer<native::Block16> input(ranked ? 0 : size_t(rows) * c.hidden / 16);
-        Rows<__nv_bfloat16> pair(routes, 2 * c.intermediate), projected(routes, c.hidden);
         Buffer<int> ranks(ranked ? routes : 0), counts(ranked ? c.experts : 0);
         if (ranked) {
             check(cudaMemsetAsync(counts.p, 0, size_t(c.experts) * sizeof(int), cudaStreamPerThread));
@@ -675,10 +771,25 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
         } else {
             prepareRoutedInput<true>(source, input.p, rows, c.hidden, smCount, route, packedRouter.p, scratch);
         }
+#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+        if (decodeArithmetic && gate.haveGroupedMaps && down.haveGroupedMaps &&
+            native::useGroupedVerify(rows, c.topK, c.experts, c.hidden, c.intermediate)) {
+            groupedVerify(c, rows, route, input.p, dstRows);
+            return;
+        }
+#endif
+        Rows<__nv_bfloat16> pair(routes, 2 * c.intermediate), projected(routes, c.hidden);
         RoutedSiTU<__nv_bfloat16> act{pair.p, route.scores, gateCap, upCap};
         if (rows == 1 || decodeArithmetic) {
             Buffer<native::Block16> mid(size_t(routes) * c.intermediate / 16);
+            const int tileRows = native::decodeRouteTileRows(rows, c.topK);
             auto project = [&](const Projection &w, const native::Block16 *x, int divisor, __nv_bfloat16 *y) {
+                if (tileRows) {
+                    const int capacity = tileRows * c.topK, tiles = (rows + tileRows - 1) / tileRows;
+                    native::decodeProject<4, true><<<dim3(w.rows / 16, capacity, tiles), 128, 0, cudaStreamPerThread>>>(
+                        w.nativeView(), x, route.ids, y, w.rows, w.cols, divisor, routes, capacity);
+                    return;
+                }
                 native::decodeProject<4><<<dim3(w.rows / 16, routes), 128, 0, cudaStreamPerThread>>>(
                     w.nativeView(), x, route.ids, y, w.rows, w.cols, divisor);
             };

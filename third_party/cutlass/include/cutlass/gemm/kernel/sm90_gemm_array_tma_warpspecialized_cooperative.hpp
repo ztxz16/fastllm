@@ -105,6 +105,9 @@ public:
   using StrideB   = typename CollectiveMainloop::StrideB;
   using DispatchPolicy = typename CollectiveMainloop::DispatchPolicy;
   using Schedule = typename DispatchPolicy::Schedule;
+  template<int S> static constexpr bool needs_scale_tile_coord(KernelPtrArrayTmaWarpSpecializedCooperativeBlockScaledSm120<S>*) { return true; }
+  static constexpr bool needs_scale_tile_coord(void*) { return false; }
+
   using ElementAccumulator = typename CollectiveMainloop::ElementAccumulator;
   using ClusterShape = typename DispatchPolicy::ClusterShape;
   using MainloopArguments = typename CollectiveMainloop::Arguments;
@@ -937,15 +940,22 @@ public:
 
         if (TileScheduler::valid_warpgroup_in_work_tile(work_tile_info)) {
 
-          collective_mainloop.mma(
-            mainloop_pipeline,
-            mainloop_pipe_consumer_state,
-            accumulators,
-            work_k_tile_count,
-            mma_thread_idx,
-            shared_storage.tensors.mainloop,
-            params.mainloop
-          );
+          if constexpr (needs_scale_tile_coord(static_cast<Schedule*>(nullptr)) && size<1>(TileShape{}) < 128) {
+            collective_mainloop.mma(mainloop_pipeline, mainloop_pipe_consumer_state, accumulators,
+                                    work_k_tile_count, mma_thread_idx, shared_storage.tensors.mainloop,
+                                    params.mainloop, blk_coord);
+          }
+          else {
+            collective_mainloop.mma(
+              mainloop_pipeline,
+              mainloop_pipe_consumer_state,
+              accumulators,
+              work_k_tile_count,
+              mma_thread_idx,
+              shared_storage.tensors.mainloop,
+              params.mainloop
+            );
+          }
 
           // Make sure the math instructions are done and free buffers before entering the epilogue
           collective_mainloop.mma_tail(
