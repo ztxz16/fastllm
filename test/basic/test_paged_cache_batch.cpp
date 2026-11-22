@@ -1,3 +1,4 @@
+#include "models/basellm.h"
 #include "utils/paged_cache_batch.h"
 #include <iostream>
 #include <memory>
@@ -98,9 +99,48 @@ static void Case(int managers,int threads,bool diagnostics) {
     a.caches.clear();b.caches.clear(); // Previously released Data must not release twice.
     Equal(a,b);
 }
+static void LookaheadPages() {
+    PagedCacheManager pool;
+    pool.pageLen = 4; pool.SetMaxPages(8);
+    std::vector<int> active;
+    Require(pool.TryExtendFreePages(active, 3, 5), "free suffix unavailable");
+    pool.RecordPrefix({1,2,3}, active);
+    const auto generation = pool.pageTimestamp[active.back()];
+    Require(pool.MatchesPinnedPrefix(active, 3, generation), "fresh binding rejected");
+    std::vector<int> spare;
+    Require(!pool.TryExtendFreePages(spare, 2, 4) && spare.empty(), "lookahead consumed headroom");
+    const int replacement = pool.GetUnusedPageIndex(true);
+    pool.RecordPrefix({1}, {replacement});
+    Require(!pool.MatchesPinnedPrefix(active, 3, generation), "rebound ancestor accepted");
+    auto rebound = active; rebound.front() = replacement;
+    Require(pool.MatchesPinnedPrefix(rebound, 3, generation) &&
+        !pool.MatchesPinnedPrefix(rebound, 3, generation + 1), "page generation check failed");
+    // The prefix pins remain with the request when the next forward consumes
+    // fewer tokens than predicted. Only the unused lookahead suffix is freed.
+    Data cache;
+    cache.pageLen = pool.pageLen;
+    cache.pagedKVCacheData = &pool;
+    cache.pageIndex.swap(active);
+    PDPrefillPagePlan plan;
+    plan.tables.push_back({&cache, generation});
+    Require(!plan.Valid(12), "page plan ignored a rebound ancestor");
+    Require(pool.TryExtendFreePages(cache.pageIndex, 6, 0), "could not stage the test suffix");
+    const int unused = cache.pageIndex.back();
+    plan.Trim(17);
+    Require(cache.pageIndex.size() == 5 && plan.tables.empty() && pool.pageRefCount[unused] == 0 &&
+            pool.pageRefCount[cache.pageIndex.back()] == 1, "shorter batch leaked or freed a live page");
+    pool.ReleasePageIndices(cache.pageIndex);
+    cache.pageIndex.clear();
+    pool.ReleasePageIndex(replacement);
+    const auto before = pool.CacheStats();
+    Require(!pool.TryExtendFreePages(spare, 8, 0) && pool.CacheStats().pressureEvictedPages == before.pressureEvictedPages,
+        "lookahead evicted a cached page");
+}
+
 int main() {
     try {
         SetThreads(1);
+        LookaheadPages();
         for(int threads:{1,2,4,8,16})Case(16,threads,true);
         Case(1,8,false);Case(4,8,false);
         // Empty/small work retains the serial path without creating workers.

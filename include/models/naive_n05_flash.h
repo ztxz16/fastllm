@@ -373,6 +373,7 @@ namespace fastllm {
         void ReserveCache(Data &cache, int capacity, int width, bool usePool, const Data *requestKey,
                           bool &invalidated);
         struct PageTableUpdate { Data *cache; size_t first; };
+        void PreparePDPrefillTables(const std::vector<std::vector<PDPrefillPagePlan *>> &rows, int spare);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end);
         bool PreparePagedCache(Data &cache, PagedCacheManager &manager, int end,
                                std::vector<PageTableUpdate> *pendingPageTables, const Data *requestKey = nullptr,

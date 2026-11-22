@@ -1435,6 +1435,90 @@ static void TestDeferredPDResidentRestore() {
     std::cout << "PASS PD deferred restore completion and failure isolation\n";
 }
 
+// Two real RPCs arrive while the previous forward is held. Its publication
+// extends their prefix from one page to two before either can execute.
+static void TestPDPrefillLookahead() {
+    struct Model : BatchStateModel {
+        PagedCacheManager pool;
+        std::vector<int> pages;
+        std::atomic<int> planned{0}, confirmed{0};
+        std::atomic<bool> running{false}, published{false};
+        using basellm::ShutdownRuntime;
+        ~Model() override { ShutdownRuntime(); }
+        int PDGroupCount() const override { return 2; }
+        std::vector<int> PDDevices() const override { return {0, 0}; }
+        int PDRequestGroup(const ResponseContext &ctx) const override { return ctx.allTokens.back() % 2; }
+        std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+                int, bool, const ResponseContext *) const override {
+            return {{-1, const_cast<PagedCacheManager *>(&pool)}};
+        }
+        int Forward(const Data &, const Data &, const Data &, std::vector<std::pair<Data, Data>> &,
+                    const GenerationConfig &, const LastTokensManager &, std::vector<float> *) override { return 0; }
+        std::vector<int> ForwardBatch(int batch, const Data &, const std::vector<Data *> &,
+                const std::vector<Data *> &, const std::vector<int> &, std::vector<std::pair<Data *, Data *>> &,
+                const std::vector<GenerationConfig> &, const LastTokensManager &,
+                std::vector<std::vector<float> *> *) override {
+            if (++batches == 1) RunWithPDPrefillLookahead([&] {
+                running = true;
+                for (int i = 0; i < 3000 && planned < 2; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                Check(planned == 2, "next admission did not overlap the held forward");
+            }, [&](const auto &ranks, int) {
+                for (const auto &rank : ranks) {
+                    Check(rank.size() <= 1, "lookahead exceeded rank row limit");
+                    for (const auto *row : rank) {
+                        Check(!published && row->context->preTokens == 4 && row->end == 9,
+                              "lookahead used unpublished data or exceeded token limit");
+                        ++planned;
+                    }
+                }
+            });
+            return std::vector<int>(batch);
+        }
+        fastkv::Message ExportPDState(ResponseContext &ctx) override {
+            if (ctx.allTokens.back() < 20) {
+                pool.Record({1,2,3,4,5,6,7,8}, pages);
+                published = true;
+            } else {
+                Check(ctx.pdCachedInputTokens == 8, "lookahead missed a newly published prefix");
+                ++confirmed;
+            }
+            return {};
+        }
+    } model;
+    const int oldPage = GetPageLen(), oldTokens = GetMaxTokens();
+    SetPageLen(4); SetMaxTokens(96);
+    model.maxBatch = 8; model.residentHistory = true;
+    model.pool.type = PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE;
+    model.pool.pageLen = 4; model.pool.SetMaxPages(16); model.pool.Resize({16,4,1,1});
+    model.pool.ExtendPageIndices(model.pages, 2);
+    model.pool.Record({1,2,3,4}, {model.pages.front()});
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto endpoint = port.Address(); port.Stop();
+    Check(model.SetPrefillBatching(16, 100, 2, 2), "configure overlap test");
+    model.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","overlap"},{"transport","tcp"},
+        {"listen",endpoint},{"chunk_tokens",8},{"max_requests_per_rank",1},{"max_new_tokens_per_rank",8},
+        {"cache_kv_bytes",0},{"cache_swa_bytes",0}});
+    fastkv::Options options; options.transport = fastkv::Transport::Tcp;
+    fastkv::Service client(options);
+    auto call = [&](int last) {
+        fastkv::Writer writer; writer.U32(1); writer.String("overlap:gpu-state-v2:test-recurrent-state-v1");
+        writer.Ints({1,2,3,4,5,6,7,8,last});
+        return client.Submit(endpoint, {std::move(writer.bytes), {}});
+    };
+    auto a = call(10), b = call(11);
+    for (int i = 0; i < 2000 && !model.running; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(model.running, "first forward missing");
+    auto c = call(20), d = call(21);
+    a.get(); b.get(); c.get(); d.get();
+    model.ShutdownRuntime(); model.pool.ReleasePageIndices(model.pages);
+    Check(model.confirmed == 2 && model.live == 0 && model.pool.FreePageCount() == model.pool.maxPages,
+          "lookahead leaked request, grant or page");
+    SetPageLen(oldPage); SetMaxTokens(oldTokens);
+    std::cout << "PASS PD prefill lookahead overlap and late prefix revalidation\n";
+}
+
 static void TestPDResidentPrefixHints() {
     struct ResidentModel : StateModel {
         PagedCacheManager pool;
@@ -1489,6 +1573,7 @@ int main(int argc, char **argv) {
         }
         TestPDResidentPrefixHints();
         TestDeferredPDResidentRestore();
+        TestPDPrefillLookahead();
         TestAdmissionLifetime();
         CheckLegacySessionPeer();
         CheckLegacySessionPeer(true);

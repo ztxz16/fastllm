@@ -6304,6 +6304,30 @@ namespace fastllm {
         }
     }
 
+    // Lookahead may consume only genuinely free pages. Keep a forward's headroom
+    // and leave the prefix eviction policy entirely on the normal admission path.
+    bool PagedCacheManager::TryExtendFreePages(std::vector<int> &pages, int total, int spare) {
+        if (total <= int(pages.size())) return true;
+        pages.reserve(total);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        if (size_t(total) - pages.size() + size_t(std::max(0, spare)) > freePages.size()) return false;
+        while (int(pages.size()) < total) pages.push_back(TakeFreePageLocked());
+        return true;
+    }
+
+    bool PagedCacheManager::MatchesPinnedPrefix(const std::vector<int> &pages, int count, long long generation) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        if (count <= 0 || size_t(count) > pages.size()) return false;
+        const int last = pages[count - 1];
+        if (last < 0 || last >= maxPages || pageTimestamp[last] != generation) return false;
+        auto *node = pageToTrieNode[last];
+        for (int i = count - 1; i >= 0; --i) {
+            if (!node || node->pageId != pages[i] || node->timestamp != pageTimestamp[pages[i]]) return false;
+            node = node->parent;
+        }
+        return node == trieRoot;
+    }
+
     void PagedCacheManager::PreviewUnusedPageIndices(int count, std::vector<int> &pages) {
         std::lock_guard<std::mutex> guard(pageIndexLocker);
         PrepareFreePages(count);

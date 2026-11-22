@@ -846,6 +846,8 @@ namespace fastllm {
             void SetMaxPages(int maxPages);
             int GetUnusedPageIndex(bool pick);
             void ExtendPageIndices(std::vector<int> &pages, int total);
+            bool TryExtendFreePages(std::vector<int> &pages, int total, int spare);
+            bool MatchesPinnedPrefix(const std::vector<int> &pages, int count, long long generation);
             void EvictTrieSubtree(CacheTrieNode *node);
             void ReleasePageIndex(int pageIndex);
             void ReleasePageIndices(const std::vector<int> &pageIndices);

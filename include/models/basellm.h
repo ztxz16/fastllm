@@ -44,6 +44,17 @@ namespace fastllm {
 
     class basellm;
     class MimoToolVocabulary;
+    struct ResponseContext;
+
+    struct PDPrefillPagePlan {
+        ResponseContext *context = nullptr;
+        int end = 0;
+        struct Table { Data *cache; long long prefixGeneration; };
+        std::vector<Table> tables;
+        bool Valid(int past) const;
+        void Trim(int end);
+    };
+    using PDPrefillPageBuilder = std::function<void(const std::vector<std::vector<PDPrefillPagePlan *>> &, int)>;
 
     // Owned by one attention group for a single PD admission pass.
     // Anchors are hints only. QueryPrefix validates their generation under the pool lock.
@@ -861,6 +872,7 @@ namespace fastllm {
             return available.at(PDRequestGroup(context)) >= required;
         }
         virtual bool HasPDResidentPrefixCache() const { return false; }
+        void RunWithPDPrefillLookahead(const std::function<void()> &forward, const PDPrefillPageBuilder &build);
         int RestorePDResidentPrefix(ResponseContext *context);
         int RestorePDResidentPrefix(ResponseContext *context, int *fullMatch);
         int RestorePDResidentPrefix(ResponseContext *context, int *fullMatch, PDResidentPrefixHints *hints);

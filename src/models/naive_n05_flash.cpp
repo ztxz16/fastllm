@@ -328,6 +328,55 @@ void NaiveN05FlashModel::UploadPagedCacheTables(const std::vector<PageTableUpdat
 #endif
 }
 
+void NaiveN05FlashModel::PreparePDPrefillTables(
+        const std::vector<std::vector<PDPrefillPagePlan *>> &rows, int spare) {
+#ifdef USE_CUDA
+    std::vector<std::exception_ptr> errors(tpDevices.size());
+    tpWorkers.Run(tpDevices, [&](int rank) {
+        if (rows[rank].empty()) return;
+        const int device = tpDevices[rank];
+        FastllmCudaSetDevice(device);
+        std::vector<PageTableUpdate> pending;
+        for (auto *plan : rows[rank]) {
+            auto &ctx = *plan->context;
+            bool invalidated = false;
+            for (int layer = 0; layer < block_cnt; ++layer) if (!slidingLayers[layer]) {
+                for (Data *root : {&ctx.pastKeyValues[layer].first, &ctx.pastKeyValues[layer].second}) {
+                    auto &local = *root->multiDeviceDatas.at(device);
+                    auto *pool = local.pagedKVCacheData;
+                    if (!pool || !local.isPagedKVCache || local.cudaData || ctx.preTokens % pool->pageLen ||
+                        local.pageIndex.size() != size_t(ctx.preTokens / pool->pageLen)) continue;
+                    long long generation;
+                    {
+                        std::lock_guard<std::mutex> lock(pool->pageIndexLocker);
+                        generation = pool->pageTimestamp[local.pageIndex.back()];
+                    }
+                    plan->tables.push_back({&local, generation});
+                    const int endPages = (plan->end + pool->pageLen - 1) / pool->pageLen;
+                    if (!pool->TryExtendFreePages(local.pageIndex, endPages, spare)) {
+                        plan->tables.pop_back();
+                        continue;
+                    }
+                    try {
+                        PreparePagedCache(local, *pool, plan->end, &pending, &ctx.pastKeyValues.front().first, &invalidated);
+                    } catch (const CudaWorkspaceExhausted &) {
+                        // Optional metadata storage was busy. Return the fresh suffix and
+                        // let ordinary admission allocate this table after current exports.
+                        while (int(local.pageIndex.size()) > ctx.preTokens / pool->pageLen) {
+                            pool->ReleasePageIndex(local.pageIndex.back());
+                            local.pageIndex.pop_back();
+                        }
+                        plan->tables.pop_back();
+                    }
+                }
+            }
+        }
+        UploadPagedCacheTables(pending);
+    }, errors);
+    for (auto &error : errors) if (error) std::rethrow_exception(error);
+#endif
+}
+
 bool NaiveN05FlashModel::PreparePagedCache(Data &cache, PagedCacheManager &manager, int end) {
     return PreparePagedCache(cache, manager, end, nullptr);
 }
