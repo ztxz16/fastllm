@@ -10,6 +10,7 @@
 #include "devices/cuda/fastllm-cuda-token-constraint.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
+#include "devices/cuda/fastllm-cuda-event.h"
 #include "devices/cuda/fastllm-cuda-gdn.h"
 #include "fastllm-cuda-rope.cuh"
 #include "fastllm-cuda-activation.cuh"
@@ -26,6 +27,7 @@
 #include "attention/fastllm-kda-prefill.cuh"
 #endif
 #include "fastllm.h"
+#include "utils/decode_graph.h"
 #include "utils/utils.h"
 
 #include <cstdlib>
@@ -950,6 +952,21 @@ void FastllmCudaEventRecordCurrentThread(void *event) {
     checkCudaErrors("Error: CUDA error when recording event on the per-thread stream!", state);
 }
 
+// Materialize the dependency on the explicit stream. An event-only relay can
+// retain the original PTDS dependency and still hit the cross-device wait crash
+// reproduced on drivers 580/595 when new producer threads acquire PTDS streams.
+// No delay or host/device synchronization is needed; the launch itself provides
+// stream-local work for the published event to follow.
+static __global__ void FastllmCudaEventRelayKernel() {}
+
+void FastllmCudaEventRecordForPeer(void *event, void *sourceEvent, void *relayStream) {
+    FastllmCudaEventRecordCurrentThread(sourceEvent);
+    FastllmCudaStreamWaitEvent(relayStream, sourceEvent);
+    FastllmCudaEventRelayKernel<<<1, 1, 0, (cudaStream_t)relayStream>>>();
+    checkCudaErrors("Error: CUDA error when launching peer event relay!", cudaGetLastError());
+    FastllmCudaEventRecord(event, relayStream);
+}
+
 void FastllmCudaEventSynchronize(void *event) {
     cudaError_t state = cudaEventSynchronize((cudaEvent_t)event);
     checkCudaErrors("Error: CUDA error when synchronizing event!", state);
@@ -1029,6 +1046,7 @@ static bool FastllmCudaSwallowCaptureError(const char *stage, cudaError_t state)
 }
 
 bool FastllmCudaGraphBeginCapture() {
+    if (!fastllm::GraphCaptureScope::Allowed()) return false;
     cudaError_t state = cudaSuccess;
     if (fastllmCudaGraphPoolPhase.load(std::memory_order_acquire) ==
             FASTLLM_CUDA_GRAPH_POOL_CAPTURING) {

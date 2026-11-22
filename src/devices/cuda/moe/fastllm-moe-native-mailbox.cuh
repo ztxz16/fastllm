@@ -1,3 +1,4 @@
+#include "utils/decode_graph.h"
 #pragma once
 
 // Native, single-GPU decode handoff. A CPU dispatcher owns NUMA execution;
@@ -807,7 +808,8 @@ struct NativeMoeMailbox {
         }
         const auto &layout = group.LayerLayout(table);
         auto capture = [&](cudaGraphExec_t &exec, const std::function<bool()> &body) {
-            if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return false;
+            if (!fastllm::GraphCaptureScope::Allowed() ||
+            cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return false;
             const bool ok = body();
             cudaGraph_t graph = nullptr;
             const auto end = cudaStreamEndCapture(cudaStreamPerThread, &graph);
@@ -924,7 +926,7 @@ struct NativeMoeMailbox {
             Compute(w,layout,fullCopy->records,w.slots+w.routes,static_cast<const float *>(score.cudaData),cudaStreamPerThread,false);
             if(cudaStreamSynchronize(cudaStreamPerThread)!=cudaSuccess) return nullptr;
         }
-        if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return nullptr;
+        if (!fastllm::GraphCaptureScope::Allowed() || cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return nullptr;
         bool ok = [&] {
             if (w.standard) { if (!PublishStandard(w, layout, input, index, score)) return false; }
             else if (w.rows > 1) PublishNativeBatchMoe<<<1, 256, 0, cudaStreamPerThread>>>(w.mapped,

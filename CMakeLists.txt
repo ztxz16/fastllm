@@ -1177,6 +1177,7 @@ if (UNIT_TEST)
     add_test(NAME toolcall_constraint_cache COMMAND toolcall_constraint_cache_test)
     set_tests_properties(toolcall_constraint_cache PROPERTIES TIMEOUT 30)
     add_executable(decode_graph_batch_test test/basic/test_decode_graph_batch.cpp)
+    target_link_libraries(decode_graph_batch_test PRIVATE Threads::Threads)
     add_test(NAME decode_graph_batch COMMAND decode_graph_batch_test)
     add_executable(moe_expert_partition_test test/basic/test_moe_expert_partition.cpp)
     target_include_directories(moe_expert_partition_test PRIVATE src)
@@ -3574,6 +3575,14 @@ if (UNIT_TEST)
         set_tests_properties(cuda_low_latency_norm_linear PROPERTIES LABELS cuda
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "PASS generic norm linear")
+
+        add_executable(cuda_peer_event_test test/basic/test_cuda_peer_event.cu)
+        target_link_libraries(cuda_peer_event_test PRIVATE fastllm)
+        add_test(NAME cuda_peer_event COMMAND cuda_peer_event_test 2 0)
+        add_test(NAME cuda_peer_event_tp8 COMMAND cuda_peer_event_test 8 0)
+        add_test(NAME cuda_peer_event_offset COMMAND cuda_peer_event_test 2 1)
+        set_tests_properties(cuda_peer_event cuda_peer_event_tp8 cuda_peer_event_offset
+            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
 
         add_executable(cuda_low_latency_blocks_test test/basic/test_cuda_low_latency_blocks.cu
             src/devices/cuda/low_latency/dense.cu)

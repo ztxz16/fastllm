@@ -1,9 +1,30 @@
 #include "utils/decode_graph.h"
+#include "utils/persistent_worker_group.h"
 #undef NDEBUG
 #include <cassert>
 
 int main() {
     using namespace fastllm;
+    PersistentWorkerGroup workers;
+    std::vector<int> keys{0, 1};
+    std::vector<std::exception_ptr> errors(keys.size());
+    auto check = [](bool allowed) {
+        assert(GraphCaptureScope::Allowed() == allowed);
+        GraphCaptureScope nested(true);
+        assert(GraphCaptureScope::Allowed() == allowed);
+    };
+    {
+        GraphCaptureScope serving(false);
+        workers.Run(keys, [&](int) { check(false); }, errors);
+        workers.RunWithCaller(keys, [&](int) { check(false); }, errors);
+        std::thread unrelated([&] { check(true); }); unrelated.join();
+        check(false);
+    }
+    check(true);
+    workers.Run(keys, [&](int) { check(true); }, errors);
+    for (auto error : errors) assert(!error);
+    try { GraphCaptureScope serving(false); throw 1; } catch (int) {}
+    check(true);
     for (int alignment : {1, 2, 8, 16})
     for (int maximum = 1; maximum <= 256; ++maximum) {
         auto buckets = DecodeGraphBatchBuckets(maximum, alignment);

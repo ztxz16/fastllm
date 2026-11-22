@@ -1,3 +1,4 @@
+#include "utils/decode_graph.h"
 #pragma once
 #include "devices/cuda/fastllm-cuda-disk-v41-graph.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
@@ -349,7 +350,8 @@ FastllmCudaDiskV41Graph::Create(const fastllm::Data &input, const fastllm::Data 
     static_cast<disk_v41_graph::Control *>(p->host)->completed = 1;
     if (!launch() || cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)
         return {};
-    if (cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+    if (!fastllm::GraphCaptureScope::Allowed() ||
+            cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
         return {};
     const bool ok = launch();
     const auto ended = cudaStreamEndCapture(cudaStreamPerThread, &p->graph);

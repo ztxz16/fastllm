@@ -1,4 +1,5 @@
 #pragma once
+#include "utils/decode_graph.h"
 
 #include <cuda_runtime.h>
 #include <cublasLt.h>
@@ -381,7 +382,8 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     const bool blackwell = s.arch / 10 == 10;
     const bool stableBf16 = dtype == CUDA_R_16BF && (M == 1 || s.arch == 90 || blackwell);
     if (stableBf16 && blackwell && M > 1) PreferSplitK(candidates, int(end - candidates));
-    if (!stableBf16) {
+    const bool useHeuristic = stableBf16 || !fastllm::GraphCaptureScope::Allowed();
+    if (!useHeuristic) {
         CheckCuda(cudaEventCreate(&search.begin));
         CheckCuda(cudaEventCreate(&search.end));
     }
@@ -389,7 +391,7 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
     for (auto candidate = candidates; candidate != end; ++candidate) {
         const auto &algo = candidate->algo;
         if (!Run(s, p, algo, weight, input, output, s.eager->data)) continue;
-        if (stableBf16) {
+        if (useHeuristic) {
             p.algo = algo;
             p.valid = true;
             return;
