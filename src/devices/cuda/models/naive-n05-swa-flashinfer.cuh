@@ -1,4 +1,5 @@
 #pragma once
+#include "devices/cuda/fastllm-mxfp8-activation.cuh"
 #include "attention/default_prefill_params.cuh"
 #include "attention/prefill.cuh"
 #include "attention/variants.cuh"
@@ -10,6 +11,21 @@ struct Params : flashinfer::SinglePrefillParams<BF16, BF16, BF16> {
     using Base::Base;
     const float *sink = nullptr;
 };
+// Keep the normal BF16 output available if a sibling request needs fallback.
+struct PackedParams : Params {
+    FastllmMxfp8Activation packed;
+};
+struct StorePacked {
+    BF16 *base;
+    FastllmMxfp8Activation packed;
+    __device__ void operator()(BF16 *dst, uint4 value, uint32_t row) const {
+        *reinterpret_cast<uint4 *>(dst) = value;
+        int col = dst - (base + size_t(row) * packed.width);
+        fastllm_mxfp8::Store8(packed, row, col, value);
+    }
+};
+__device__ inline StorePacked prefill_output_store(const PackedParams &p) { return {p.o, p.packed}; }
+
 struct Attention : flashinfer::DefaultAttention<false, true, false, false> {
     using Base = flashinfer::DefaultAttention<false, true, false, false>;
     using Base::Base;
@@ -27,12 +43,12 @@ struct Attention : flashinfer::DefaultAttention<false, true, false, false> {
 // A 32-key tile limits wasted work at both edges of the 128-key window.
 // Use smaller query tiles until there are enough independent CTAs; retain
 // the general dispatcher for other architectures and head group sizes.
-template<int QueryTile>
-inline cudaError_t RunWindow(Params p, cudaStream_t stream) {
+template<int QueryTile, class P>
+inline cudaError_t RunWindow(P p, cudaStream_t stream) {
     using Traits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal,
         QueryTile, flashinfer::get_num_mma_q(QueryTile), 2, 12, 8, 4, 1,
         flashinfer::PosEncodingMode::kNone, BF16, BF16, BF16, float, int, Attention, false>;
-    auto kernel = flashinfer::SinglePrefillWithKVCacheKernel<Traits, Params>;
+    auto kernel = flashinfer::SinglePrefillWithKVCacheKernel<Traits, P>;
     constexpr size_t shared = sizeof(typename Traits::SharedStorageSingle);
     cudaError_t status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
     if (status != cudaSuccess) return status;
@@ -44,15 +60,25 @@ inline cudaError_t RunWindow(Params p, cudaStream_t stream) {
 }
 inline cudaError_t Run(const BF16 *q, const BF16 *k, const BF16 *v, const float *sink,
                        BF16 *out, int queries, int keys, int heads, int kvHeads,
-                       int keyStride, cudaStream_t stream = cudaStreamPerThread, int arch = 0) {
+                       int keyStride, cudaStream_t stream = cudaStreamPerThread, int arch = 0,
+                       FastllmMxfp8PrefillOutput output = {}) {
     Params p(const_cast<BF16 *>(q), const_cast<BF16 *>(k), const_cast<BF16 *>(v), nullptr,
              out, nullptr, nullptr, heads, kvHeads, queries, keys,
              heads * 192, 192, keyStride, 192, 192, 127, 0.0f, 1.0f / sqrtf(192.0f), 1.0f, 10000.0f);
     p.v_stride_n = kvHeads * 128;
     p.v_stride_h = 128;
     p.sink = sink;
-    if ((arch == 100 || arch == 103) && queries >= 1024 && heads == kvHeads * 8)
+    if ((arch == 100 || arch == 103) && queries >= 1024 && heads == kvHeads * 8) {
+        if (output.Accepts(queries, heads * 128)) {
+            PackedParams packed{p, output.slice};
+            // The packed epilogue increases register pressure. A 64-query tile
+            // retains the same 32-key softmax reduction and improves occupancy.
+            auto status = RunWindow<64>(packed, stream);
+            if (status == cudaSuccess) output.Complete();
+            return status;
+        }
         return queries >= 8192 ? RunWindow<128>(p, stream) : RunWindow<64>(p, stream);
+    }
     if ((arch == 90 || arch == 120) && queries >= 32 && heads == kvHeads * 8)
         return arch == 90 && queries >= 8192 ? RunWindow<128>(p, stream) : RunWindow<64>(p, stream);
     // A null scratch pointer disables split-KV so the sink is counted once.

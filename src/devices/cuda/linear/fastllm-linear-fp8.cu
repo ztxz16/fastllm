@@ -3016,7 +3016,7 @@ FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Bind(const fastllm::Data &
 }
 
 FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Borrow(const fastllm::Data &weight, int rows,
-        const fastllm::Data &scratch) const {
+        const fastllm::Data &scratch, bool prefill) const {
     if (weight.dims.size() != 2 || rows <= 0 || rows > INT_MAX - 3 ||
         scratch.dataDevice != fastllm::CUDA || scratch.dataDeviceIds != weight.dataDeviceIds ||
         !scratch.cudaData || (uintptr_t(scratch.cudaData) & 15)) return {};
@@ -3025,7 +3025,9 @@ FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Borrow(const fastllm::Data
     const int pitch = (rows + 3) / 4 * 4;
     const size_t bytes = size_t(pitch) * width;
     if (bytes + bytes / 32 > scratch.GetBytes()) return {};
-    if (rows > maxRows(weight, true)) return {};
+    if (prefill) {
+        if (!canPackPrefill || !canPackPrefill(weight, rows)) return {};
+    } else if (rows > maxRows(weight, true)) return {};
     auto *values = static_cast<uint8_t *>(scratch.cudaData);
     return {values, values + bytes, rows, width, pitch};
 }

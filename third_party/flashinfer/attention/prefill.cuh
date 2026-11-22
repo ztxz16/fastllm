@@ -2017,12 +2017,22 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
   }
 }
 
-template <typename KTraits>
+struct StorePrefillOutput {
+  template <typename T>
+  __device__ __forceinline__ void operator()(T* dst, b128_t value, uint32_t) const {
+    *reinterpret_cast<b128_t*>(dst) = value;
+  }
+};
+
+template <typename Params>
+__device__ __forceinline__ StorePrefillOutput prefill_output_store(const Params&) { return {}; }
+
+template <typename KTraits, typename Store = StorePrefillOutput>
 __device__ __forceinline__ void write_o_reg_gmem(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], smem_t<KTraits::SWIZZLE_MODE_Q>* o_smem,
     typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
     const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint_fastdiv group_size, const dim3 tid = threadIdx) {
+    const uint_fastdiv group_size, const dim3 tid = threadIdx, Store store = {}) {
   using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t UPCAST_STRIDE_O = KTraits::UPCAST_STRIDE_O;
   const uint32_t warp_idx_x = get_warp_idx_q<KTraits>(tid.y);
@@ -2096,7 +2106,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
 #pragma unroll
           for (uint32_t mma_do = 0; mma_do < KTraits::NUM_MMA_D_VO_TILE / 4; ++mma_do) {
             if (o_idx < qo_upper_bound) {
-              o_smem->store_128b(o_smem_offset_w, o_ptr);
+              store(o_ptr, o_smem->base[o_smem_offset_w], q);
             }
             o_ptr += 8 * upcast_size<DTypeO>();
             o_smem_offset_w = o_smem->template advance_offset_by_column<8>(o_smem_offset_w, mma_do);
@@ -2506,7 +2516,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                   qo_len,
                                   /*o_stride_n=*/
                                   partition_kv ? num_chunks * o_stride_n : o_stride_n,
-                                  /*o_stride_h=*/o_stride_h, group_size, tid);
+                                  /*o_stride_h=*/o_stride_h, group_size, tid, prefill_output_store(params));
       }
 
       // write lse (identical across VO tiles; redundant rewrite on later tiles is harmless)

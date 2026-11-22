@@ -268,8 +268,9 @@ __global__ void BuildTopKMask(const int *indices, uint32_t *bits, int keys, int 
 }
 
 // Model layout [row, KV head, group, dim]; FMHA layout [row, group, KV head, dim].
-template<bool Output>
-__global__ void ReorderHeads(const BF16 *src, BF16 *dst, const uint32_t *bits, int stride, int kvHeads, int firstHead = 0) {
+template<bool Output, bool Pack = false>
+__global__ void ReorderHeads(const BF16 *src, BF16 *dst, const uint32_t *bits, int stride, int kvHeads, int firstHead = 0,
+        FastllmMxfp8Activation projection = {}, int firstRow = 0) {
     constexpr int dim = Output ? ValueDim : QKDim;
     int row = blockIdx.x, kv = blockIdx.y;
     bool valid = !Output || bits[row * stride + stride - 1] != 0;
@@ -277,8 +278,12 @@ __global__ void ReorderHeads(const BF16 *src, BF16 *dst, const uint32_t *bits, i
         int group = i / (dim / 8), col = i % (dim / 8);
         size_t native = ((size_t(row) * kvHeads + kv + firstHead) * Group + group) * (dim / 8) + col;
         size_t packed = ((size_t(row) * Group + group) * gridDim.y + kv) * (dim / 8) + col;
-        ((uint4 *)dst)[Output ? native : packed] = valid
-            ? ((const uint4 *)src)[Output ? packed : native] : make_uint4(0,0,0,0);
+        uint4 value = valid ? ((const uint4 *)src)[Output ? packed : native] : make_uint4(0,0,0,0);
+        ((uint4 *)dst)[Output ? native : packed] = value;
+        if constexpr (Pack) {
+            const int column = (((kv + firstHead) * Group + group) * dim) + col * 8;
+            fastllm_mxfp8::Store8(projection, firstRow + row, column, value);
+        }
     }
 }
 
@@ -397,6 +402,8 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
     BF16 *key = (BF16 *)scratch.cudaData, *value = key + size_t(keys) * stripeHeads * dim;
     BF16 *query = key + kvElems, *out = query + qElems;
     cudaStream_t stream = cudaStreamPerThread;
+    const bool pack = item.packed.Accepts(rows, heads * valueDim);
+    auto reorderOutput = pack ? ReorderHeads<true, true> : ReorderHeads<true>;
     if (sparse) {
         auto *positions = (int *)(out + outElems);
         int groups = chunk / UnionRows;
@@ -442,12 +449,13 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
                                                lengths, TileScheduler::Work::Dense);
                     AssertInFastLLM(status == cudaSuccess, std::string("DSA dense prefill: ") + cudaGetErrorString(status));
                 }
-                ReorderHeads<true><<<grid,128,0,stream>>>(out, (BF16*)item.output->cudaData + size_t(first) * heads * valueDim,
-                    bits, UnionStride, kvHeads, head);
+                reorderOutput<<<grid,128,0,stream>>>(out, (BF16*)item.output->cudaData + size_t(first) * heads * valueDim,
+                    bits, UnionStride, kvHeads, head, item.packed.slice, first);
             }
         }
         status = cudaGetLastError();
         AssertInFastLLM(status == cudaSuccess, std::string("DSA compact prefill: ") + cudaGetErrorString(status));
+        if (pack) item.packed.Complete();
         return true;
     }
     auto *bitmap = scores ? (uint32_t *)ids.cudaData : (uint32_t *)(out + outElems);
@@ -468,11 +476,12 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
             query, nullptr, 0, kvHeads);
         status = Attention<Kernel>(query, key, value, out, Membership{mask, maskStride, item.past + first}, count, keys, kvHeads, sms, stream);
         AssertInFastLLM(status == cudaSuccess, std::string("DSA Blackwell prefill: ") + cudaGetErrorString(status));
-        ReorderHeads<true><<<grid,128,0,stream>>>(out, (BF16 *)item.output->cudaData + size_t(first) * heads * valueDim,
-            mask, maskStride, kvHeads);
+        reorderOutput<<<grid,128,0,stream>>>(out, (BF16 *)item.output->cudaData + size_t(first) * heads * valueDim,
+            mask, maskStride, kvHeads, 0, item.packed.slice, first);
     }
     status = cudaGetLastError();
     AssertInFastLLM(status == cudaSuccess, std::string("DSA Blackwell prefill: ") + cudaGetErrorString(status));
+    if (pack) item.packed.Complete();
     return true;
 }
 

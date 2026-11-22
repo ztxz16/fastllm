@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
 
 namespace fastllm { class Data; }
 
@@ -16,6 +17,25 @@ struct FastllmMxfp8Activation {
     }
 };
 
+// Each request writes at the parent matrix pitch. Only producers that enqueue
+// all their packed rows contribute to the count. A BF16 fallback leaves it unchanged.
+struct FastllmMxfp8PrefillOutput {
+    FastllmMxfp8Activation slice{};
+    int *completedRows = nullptr;
+
+    static FastllmMxfp8PrefillOutput ForRows(FastllmMxfp8Activation matrix, int first, int count, int &completed) {
+        if (!matrix.values || !matrix.scales || first < 0 || count <= 0 || first > matrix.rows - count) return {};
+        matrix.values += std::size_t(first) * matrix.width;
+        matrix.scales += std::size_t(first) * 4;
+        matrix.rows = count;
+        return {matrix, &completed};
+    }
+    bool Accepts(int rows, int width) const {
+        return completedRows && slice.rows == rows && slice.width == width;
+    }
+    void Complete() const { *completedRows += slice.rows; }
+};
+
 // Each CUDA backend opts in to the shared activation layout independently of
 // its weight layout. prepareWeight runs on the final shard before capture.
 struct FastllmMxfp8ProjectionBackend {
@@ -25,10 +45,15 @@ struct FastllmMxfp8ProjectionBackend {
     // Called on the shard's device. False must leave the output untouched.
     bool (*project)(FastllmMxfp8Activation input, const fastllm::Data &weight, void *output);
 
+    // Prefill producers can outlive a single request and borrow a much larger
+    // arena. A backend must admit its full matrix before any request packs rows.
+    bool (*canPackPrefill)(const fastllm::Data &weight, int rows) = nullptr;
+
     FastllmMxfp8Activation Bind(const fastllm::Data &weight, int rows, bool verifying,
                                 int maxWidth, fastllm::Data &storage) const;
-    // Verification may alias graph-owned scratch only between its producer and this projection.
-    FastllmMxfp8Activation Borrow(const fastllm::Data &weight, int rows, const fastllm::Data &scratch) const;
+    // Borrow existing storage only between the producer and its projection.
+    FastllmMxfp8Activation Borrow(const fastllm::Data &weight, int rows, const fastllm::Data &scratch,
+                                  bool prefill = false) const;
     bool TryProject(FastllmMxfp8Activation prepared, const fastllm::Data &input,
                     const fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output) const;
 };

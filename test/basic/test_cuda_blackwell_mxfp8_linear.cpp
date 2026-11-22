@@ -66,6 +66,7 @@ static void TestProjectionContract() {
     Check(cudaGraphDestroy(graph));
     Require(!cold.values && !arena.cudaData, "cold capture allocated projection storage");
     auto view = consumer.Bind(w, 20, true, 128, arena);
+    Require(!consumer.Borrow(w, 20, arena, true).values, "backend must opt into prefill packing");
     Require(consumer.TryProject(view, x, w, bias, y) && y.dims == std::vector<int>({20, 64}),
             "shared projection interface rejected a different consumer");
 }

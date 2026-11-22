@@ -296,6 +296,7 @@ struct FastllmNaivePrefillAttentionItem {
     const fastllm::Data *query, *key, *value, *indices;
     fastllm::Data *output;
     int past;
+    FastllmMxfp8PrefillOutput packed{};
 };
 // Causal full-attention batches. Existing specialized kernels remain preferred;
 // the materialized MMA path shares a bounded workspace across request tiles.
@@ -389,6 +390,7 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     const fastllm::Data &liveKeys, int heads, int kvHeads,
     fastllm::Data &output, FastllmMxfp8Activation *packed);
 bool FastllmCudaNaiveDecodeGraphSupported();
+inline constexpr int FastllmNaivePackedNormMinPrefillRows = 2048;
 // BF16 rows; update each residual and preserve RMSNorm rounding.
 // Optional in/out views are cleared if the producer emitted BF16 only.
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,

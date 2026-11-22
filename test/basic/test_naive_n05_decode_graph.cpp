@@ -3,6 +3,8 @@
 #endif
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
+#include "devices/cuda/naive-n05-swa-prefill.cuh"
 #include "fastllm.h"
 #include "blocks/baseblock.h"
 #include "utils/utils.h"
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <cuda_runtime_api.h>
 #include <cuda_fp8.h>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 using namespace fastllm;
@@ -51,10 +54,10 @@ struct PackedOutput {
         view = {static_cast<uint8_t *>(values.cudaData), static_cast<uint8_t *>(scales.cudaData),
                 rows, width, pitch};
     }
-    void Check(const Data &output) const {
+    void Check(const Data &output, int first = 0) const {
         auto bf16 = Read<uint16_t>(output);
         auto bytes = Read<uint8_t>(values), exponents = Read<uint8_t>(scales);
-        for (int row = 0; row < view.rows; ++row) for (int col = 0; col < view.width; col += 32) {
+        for (int row = 0; row < int(bf16.size() / view.width); ++row) for (int col = 0; col < view.width; col += 32) {
             float block[32], maximum = 0.f;
             for (int i = 0; i < 32; ++i) {
                 uint32_t bits = uint32_t(bf16[row * view.width + col + i]) << 16;
@@ -62,14 +65,56 @@ struct PackedOutput {
                 maximum = std::max(maximum, std::abs(block[i]));
             }
             int exponent = maximum ? std::max(-126, int(std::ceil(std::log2(maximum / 448.f)))) : -126;
-            Require(exponents[(col / 128 * view.pitch + row) * 4 + col / 32 % 4] == exponent + 127,
+            Require(exponents[(col / 128 * view.pitch + first + row) * 4 + col / 32 % 4] == exponent + 127,
                     "incorrect projection activation scale");
             for (int i = 0; i < 32; ++i)
-                Require(bytes[row * view.width + col + i] == __nv_fp8_e4m3(std::ldexp(block[i], -exponent)).__x,
+                Require(bytes[(first + row) * view.width + col + i] == __nv_fp8_e4m3(std::ldexp(block[i], -exponent)).__x,
                         "incorrect projection activation value");
         }
     }
 };
+static void TestPrefillProjection(bool swa) {
+    const int kvHeads = swa ? 1 : 2, heads = kvHeads * (swa ? 8 : 16), width = heads * 128;
+    // A short SWA request in the same batch must leave its slice unclaimed.
+    const std::vector<int> lengths = swa ? std::vector<int>{1025, 8192, 31} : std::vector<int>{129, 131};
+    PackedOutput packed;
+    packed.Init(std::accumulate(lengths.begin(), lengths.end(), 0), width);
+    int first = 0, completed = 0;
+    for (int rows : lengths) {
+        Data q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), ids(INT32), sink(FLOAT32);
+        Data scratch(FLOAT32), actual(BFLOAT16), expected(BFLOAT16);
+        // The second DSA request has a sparse history, multiple KV-head
+        // stripes and a partial last query chunk, all at a nonzero row offset.
+        const int keys = !swa && first ? 4096 : rows;
+        Upload(q, {1, rows, heads * 192}, 501 + first);
+        Upload(k, {1, keys, kvHeads * 192}, 502 + first);
+        Upload(v, {1, keys, kvHeads * 128}, 503 + first);
+        auto slice = FastllmMxfp8PrefillOutput::ForRows(packed.view, first, rows, completed);
+        if (swa) {
+            Upload(sink, {heads}, 504);
+            FastllmCudaNaivePrefillAttention(q, k, v, ids, sink, heads, kvHeads, 192, 128, 0, 128, expected, true, nullptr, nullptr);
+            FastllmCudaNaivePrefillAttention(q, k, v, ids, sink, heads, kvHeads, 192, 128, 0, 128, actual, true, nullptr, nullptr, slice);
+        } else {
+            Upload(scratch, {1536 * 1024}, 505);
+            ids.Resize({rows, 32}); ids.Allocate();
+            for (int i = 0; i < rows * 32; ++i)
+                reinterpret_cast<int *>(ids.cpuData)[i] = (i / 32) % 5 ? i % 32 : -1;
+            ids.ToDevice(CUDA, {0}, true);
+            FastllmNaivePrefillAttentionItem item{&q, &k, &v, &ids, &expected, keys - rows};
+            Require(FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, scratch), "DSA prefill reference");
+            item.output = &actual;
+            item.packed = slice;
+            Require(FastllmCudaTryNaiveIndexerAttention(item, sink, heads, kvHeads, 192, 128, scratch), "DSA prefill pack");
+        }
+        const bool packedRequest = !swa || rows != 31;
+        Require(completed == first + (packedRequest ? rows : 0), "incorrect prefill completion count");
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "prefill BF16 changed");
+        if (packedRequest) packed.Check(expected, first);
+        first += rows;
+    }
+    Require((completed == packed.view.rows) == !swa, "mixed prefill admitted an incomplete matrix");
+}
+
 struct Graph {
     void *graph = nullptr, *exec = nullptr;
     std::vector<void *> reserved;
@@ -1003,7 +1048,10 @@ int main(int argc, char **argv) {
             TestSwaBatch(1, 64, 8);
             if (FastllmCudaRuntimeArch() == 103) {
                 TestVerifySwaPacking();
+                TestPrefillProjection(true);
+                if (FastllmCudaHasBlackwellIndexerAttention()) TestPrefillProjection(false);
                 TestResidualNorm(4096, 128, false, true);
+                TestResidualNorm(4096, 2049, false, true);
                 TestPaddedAttention(257, 32, 192, 128, true, true, true);
             }
             for (int rows : {1, 4}) TestPaddedAttention(rows, 64, 192, 128, true, true, true);

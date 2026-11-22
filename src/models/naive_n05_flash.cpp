@@ -954,10 +954,13 @@ Data NaiveN05FlashModel::RunTarget(
         EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     else Embedding(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, DataType::BFLOAT16);
-    const auto *projectionBackend = attentionParallel && decodeWorkspace
+    const auto *projectionBackend = attentionParallel && (decodeWorkspace || (!verifying && !batchDecode && length > 1))
         ? FastllmCudaGetMxfp8ProjectionBackend() : nullptr;
     const int maxProjectionWidth = std::max({embed_dim, full.heads * full.valueDim, sliding.heads * sliding.valueDim});
     auto activationFor = [&](const Data &weight, int rows) {
+        // The local router arena is idle between a producer and its QKV/O GEMM.
+        // Prefill scores can still be live in indexed attention.
+        if (!decodeWorkspace) return projectionBackend->Borrow(weight, rows, routerInput, true);
         if (verifying) return buf.verifyProjectionScratch
             ? projectionBackend->Borrow(weight, rows, *buf.verifyProjectionScratch) : FastllmMxfp8Activation{};
         return projectionBackend->Bind(weight, rows, false, maxProjectionWidth, buf.projectionQuant);
@@ -1780,6 +1783,9 @@ Data NaiveN05FlashModel::RunTarget(
                 offset += size_t(batch->lengths[sequence]) * indexTopK * sizeof(int);
             }
         }
+        int packedPrefillRows = 0;
+        if (projectionBackend && !decodeWorkspace && (slidingLayers[layer] || dpPrefill))
+            preparedO = activationFor(localWeight(ap + "o_proj.weight"), length);
         std::vector<FastllmNaivePrefillAttentionItem> prefillAttention;
         std::vector<FastllmNaiveStagedSwa> stagedSwa;
         bool pairedPrefill = false;
@@ -1806,7 +1812,7 @@ Data NaiveN05FlashModel::RunTarget(
         Data &contextGather = buf.indexContextGather;
         auto attend = [&](Data &normed, Data &q, Data &k, Data &v, Data &qkv,
                           Data &positions, Data &cacheKey, Data &cacheValue,
-                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0) {
+                          TargetWorkspace &buf, int length, int globalPast, int reserveCapacity, Data &attn, int sequence = 0, int firstRow = 0) {
             Data &packed = buf.packed, &indexKey = buf.indexKey;
             Data &indices = packedIndices.empty() ? buf.indices : packedIndices[sequence];
             const bool sharedSwa = tensorParallel && slidingLayers[layer] &&
@@ -2127,7 +2133,8 @@ Data NaiveN05FlashModel::RunTarget(
             }
             if (dpPrefill) {
                 prefillAttention.push_back({retainPrefillView(q), &attentionKey, &attentionValue,
-                    retainPrefillView(*selected), retainPrefillView(attn), localPast});
+                    retainPrefillView(*selected), retainPrefillView(attn), localPast,
+                    FastllmMxfp8PrefillOutput::ForRows(preparedO, firstRow, length, packedPrefillRows)});
                 return;
             }
             if (batchedDSA) {
@@ -2216,7 +2223,8 @@ Data NaiveN05FlashModel::RunTarget(
                             localPast, slidingLayers[layer] ? window : 0, attn, true,
                             slidingLayers[layer] ? &normed : nullptr,
                             batch && batch->Size() > 1 && !verifying && q.isFake && attn.isFake && normed.isFake
-                                ? &stagedSwa : nullptr);
+                                ? &stagedSwa : nullptr,
+                            FastllmMxfp8PrefillOutput::ForRows(preparedO, firstRow, length, packedPrefillRows));
                     }
                 }
                 if (slidingLayers[layer] && capture && !capture->prefixes.empty()) {
@@ -2278,7 +2286,7 @@ Data NaiveN05FlashModel::RunTarget(
                            *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
                            batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
                            CacheReserveCapacity(batch->configs[sequence]), rowAttention,
-                           sequence);
+                           sequence, offset);
                     offset += count;
                 }
                 if (!stagedSwa.empty()) {
@@ -2479,6 +2487,7 @@ Data NaiveN05FlashModel::RunTarget(
                 if (attentionNormReady) trackCommunication(projected);
             }
 #endif
+            if (!decodeWorkspace && packedPrefillRows != length) preparedO = {};
             if (!attentionNormReady) projectAttention(attn, localWeight(ap + "o_proj.weight"), Data(), projected, preparedO);
         if (attentionParallel && AttentionTPSize() > 1) {
             auto &runtime = attentionParallel->runtime;
@@ -2570,20 +2579,20 @@ Data NaiveN05FlashModel::RunTarget(
             }
             if (!decodeWorkspace) {
                 if (needsReduce) reduce(branch);
-                if (fusePrefillNorm && mlpNormWeight)
-                    FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
-                        rms_norm_eps, *mlpNormOutput);
-                else AddTo(hidden, branch);
+                if (!fusePrefillNorm || !mlpNormWeight) {
+                    AddTo(hidden, branch);
+                    return;
+                }
+            } else if (needsReduce && reduce(branch, &hidden, mlpNormWeight, mlpNormOutput)) {
                 return;
             }
-            if (!needsReduce || !reduce(branch, &hidden, mlpNormWeight, mlpNormOutput)) {
-                if (projectionBackend && localMoe && layer + 1 < block_cnt && moeLayers[layer + 1]) {
-                    nextQkv = activationFor(localWeight("model.layers." + std::to_string(layer + 1) +
-                                                        ".self_attn.mergeqkv.weight"), length);
-                }
-                FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
-                    rms_norm_eps, *mlpNormOutput, &nextQkv);
+            if (projectionBackend && localMoe && layer + 1 < block_cnt && moeLayers[layer + 1] &&
+                (decodeWorkspace || length >= FastllmNaivePackedNormMinPrefillRows)) {
+                nextQkv = activationFor(localWeight("model.layers." + std::to_string(layer + 1) +
+                                                    ".self_attn.mergeqkv.weight"), length);
             }
+            FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
+                rms_norm_eps, *mlpNormOutput, &nextQkv);
         };
         if (!moeLayers[layer]) {
             // Dense and routed-expert scratch have independent lifetimes.

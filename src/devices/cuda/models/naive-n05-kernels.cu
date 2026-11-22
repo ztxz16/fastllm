@@ -5002,7 +5002,7 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
         const fastllm::Data &value, const fastllm::Data &indices, const fastllm::Data &sink,
         int heads, int kvHeads, int dim, int valueDim, int pastLength, int window,
         fastllm::Data &output, bool causal, const fastllm::Data *prefillScratch,
-        std::vector<FastllmNaiveStagedSwa> *pending) {
+        std::vector<FastllmNaiveStagedSwa> *pending, FastllmMxfp8PrefillOutput packed) {
     using namespace fastllm;
     int queries = query.dims[1], keys = key.dims[1];
     int count = indices.dims.empty() ? (window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys) : indices.dims[1];
@@ -5023,7 +5023,7 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
             (BF16 *)output.cudaData, queries, keys, heads, kvHeads, key.dims[2],
-            cudaStreamPerThread, FastllmCudaRuntimeArch());
+            cudaStreamPerThread, FastllmCudaRuntimeArch(), packed);
         AssertInFastLLM(status == cudaSuccess,
             std::string("Naive SWA FlashInfer: ") + cudaGetErrorString(status));
         CheckLaunch();
@@ -5090,7 +5090,7 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
                         auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
                             stagedKey, stagedValue, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
                             (BF16 *)output.cudaData, queries, rows, heads, kvHeads, key.dims[2],
-                            cudaStreamPerThread, arch);
+                            cudaStreamPerThread, arch, packed);
                         AssertInFastLLM(status == cudaSuccess,
                             std::string("Naive staged SWA prefill: ") + cudaGetErrorString(status));
                         CheckLaunch();
@@ -5651,6 +5651,59 @@ struct SaveNormalized {
     BF16 *values;
     __device__ void operator()(int, int col, BF16 value) const { values[col] = value; }
 };
+// Vectorize global transfers, then read the rounded residual from shared
+// memory in the original 256-lane order for an identical FP32 reduction.
+__global__ void AddRMSNormPackedRows(BF16 *hidden, const BF16 *branch, const float *gamma, BF16 *output,
+                                     float eps, FastllmMxfp8Activation packed) {
+    constexpr int width = 4096, threads = 256, parts = width / (threads * 8);
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const size_t base = size_t(row) * width;
+    __shared__ __align__(16) BF16 residual[width];
+    __shared__ float partial[8];
+    uint4 values[parts];
+#pragma unroll
+    for (int j = 0; j < parts; ++j) {
+        const int col = (tid + j * threads) * 8;
+        uint4 a = *reinterpret_cast<const uint4 *>(hidden + base + col);
+        uint4 b = *reinterpret_cast<const uint4 *>(branch + base + col);
+        auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&a);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            pairs[i] = __hadd2(pairs[i], reinterpret_cast<const __nv_bfloat162 *>(&b)[i]);
+        values[j] = a;
+        *reinterpret_cast<uint4 *>(residual + col) = a;
+        *reinterpret_cast<uint4 *>(hidden + base + col) = a;
+    }
+    __syncthreads();
+    float sum = 0.f;
+#pragma unroll
+    for (int col = tid; col < width; col += threads) {
+        float x = __bfloat162float(residual[col]);
+        sum += x * x;
+    }
+    sum = fastllm::cuda::WarpSum(sum);
+    if (tid % 32 == 0) partial[tid / 32] = sum;
+    __syncthreads();
+    sum = fastllm::cuda::WarpSum(tid % 32 < 8 ? partial[tid % 32] : 0.f);
+    const float inv = rsqrtf(sum / width + eps);
+#pragma unroll
+    for (int j = 0; j < parts; ++j) {
+        const int col = (tid + j * threads) * 8;
+        float4 affine[2] = {*reinterpret_cast<const float4 *>(gamma + col),
+                            *reinterpret_cast<const float4 *>(gamma + col + 4)};
+        uint4 value = values[j];
+        auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&value);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float2 x = __bfloat1622float2(pairs[i]);
+            x = __bfloat1622float2(__floats2bfloat162_rn(x.x * inv, x.y * inv));
+            const float2 w = reinterpret_cast<const float2 *>(affine)[i];
+            pairs[i] = __floats2bfloat162_rn(x.x * w.x, x.y * w.y);
+        }
+        *reinterpret_cast<uint4 *>(output + base + col) = value;
+        fastllm_mxfp8::Store8(packed, row, col, value);
+    }
+}
 __global__ void AddRMSNormMxfp8(BF16 *hidden, const BF16 *branch, const float *gamma, BF16 *output,
                                 float eps, FastllmMxfp8Activation packed) {
     __shared__ __align__(16) BF16 normalized[4096];
@@ -5677,7 +5730,11 @@ void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden, const fastllm::Data
     const int rows = hidden.Count(0) / channels;
     if (packed) {
         if (channels == 4096 && packed->Matches(rows, channels)) {
-            AddRMSNormMxfp8<<<rows, 256>>>((BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
+            const auto addresses = uintptr_t(hidden.cudaData) | uintptr_t(branch.cudaData) |
+                                   uintptr_t(output.cudaData) | uintptr_t(weight.cudaData);
+            auto kernel = rows >= FastllmNaivePackedNormMinPrefillRows && (addresses & 15) == 0
+                ? AddRMSNormPackedRows : AddRMSNormMxfp8;
+            kernel<<<rows, 256>>>((BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
                 (const float *)weight.cudaData, (BF16 *)output.cudaData, eps, *packed);
             CheckLaunch();
             return;
