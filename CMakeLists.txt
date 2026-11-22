@@ -3724,6 +3724,11 @@ if (UNIT_TEST)
             target_link_libraries(naive_n05_dsa_layer_test PRIVATE fastllm Threads::Threads)
             set_target_properties(naive_n05_dsa_layer_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
             foreach(format bf16 fp8)
+                if (TARGET fastllm_mxfp8_linear_sm103)
+                    add_test(NAME naive_n05_dsa_mxfp8_${format} COMMAND naive_n05_dsa_layer_test ${format} tp --mxfp8)
+                    set_tests_properties(naive_n05_dsa_mxfp8_${format} PROPERTIES
+                        LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+                endif()
                 foreach(mode local mixed streams tp router)
                     add_test(NAME naive_n05_dsa_layer_${format}_${mode} COMMAND naive_n05_dsa_layer_test ${format} ${mode})
                     set_tests_properties(naive_n05_dsa_layer_${format}_${mode} PROPERTIES

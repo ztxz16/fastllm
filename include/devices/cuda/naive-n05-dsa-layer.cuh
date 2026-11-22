@@ -28,7 +28,7 @@ struct FastllmNaiveDSALayerArgs {
     using B = __nv_bfloat16;
     const B *branch, *qkvWeight, *indexKeyWeight, *indexQueryWeight, *indexWeight, *outputWeight;
     B *hidden, *feature, *normed, *query, *attention, *projected;
-    const float *inputNorm, *indexNorm, *indexBias, *positions, *sink;
+    const float *inputNorm, *indexNorm, *indexBias, *positions, *sink, *qkvScales, *outputScales;
     unsigned char *workspace, *coreWorkspace;
     FastllmNaiveDSARow bindings[16];
     int requests[16], requestCount, rows, rank;

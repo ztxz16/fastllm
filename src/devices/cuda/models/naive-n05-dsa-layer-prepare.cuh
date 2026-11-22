@@ -22,14 +22,23 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
         }
         return stride == count;
     };
+    const bool mx = x.qkvWeight && x.qkvWeight->dataType == FP8_E4M3;
+    const float *qkvScales = nullptr, *outputScales = nullptr;
+    if (mx) {
+        if (rows < 2 || rows > 8 || !x.outputWeight) return false;
+        qkvScales = FastllmCudaVerifyMxfp8Scales(*x.qkvWeight,1856,4096,device);
+        outputScales = FastllmCudaVerifyMxfp8Scales(*x.outputWeight,4096,1024,device);
+        if (!qkvScales || !outputScales) return false;
+    }
+    const auto weightType = mx ? FP8_E4M3 : BFLOAT16;
     const size_t elements = size_t(rows) * 4096;
     if (!tensor(x.hidden, BFLOAT16, elements) || (x.branch && !tensor(x.branch, BFLOAT16, elements)) ||
         (x.feature && !tensor(x.feature, BFLOAT16, elements)) || !tensor(x.inputNorm, FLOAT32, 4096) ||
-        !tensor(x.postNorm, FLOAT32, 4096) || !tensor(x.qkvWeight, BFLOAT16, 1856 * 4096) ||
+        !tensor(x.postNorm, FLOAT32, 4096) || !tensor(x.qkvWeight, weightType, 1856 * 4096) ||
         (x.qkvBias && !x.qkvBias->dims.empty()) || !tensor(x.indexKeyWeight, BFLOAT16, 128 * 4096) ||
         !tensor(x.indexQueryWeight, BFLOAT16, 2048 * 4096) || !tensor(x.indexWeight, BFLOAT16, 16 * 4096) ||
         !tensor(x.indexNorm, FLOAT32, 128) || !tensor(x.indexBias, FLOAT32, 128) ||
-        !tensor(x.outputWeight, BFLOAT16, 4096 * 1024) ||
+        !tensor(x.outputWeight, weightType, 4096 * 1024) ||
         (x.sink && !x.sink->dims.empty() && !tensor(x.sink, FLOAT32, 8, 4)) ||
         !tensor(x.positions, FLOAT32, rows, 4) || !tensor(x.live, INT32, rows, 4))
         return false;
@@ -49,6 +58,8 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
         return false;
     a = {};
     bool fp8Key = x.caches.front().key && x.caches.front().key->kvCacheFp8Indexer;
+    if (mx && !(fp8Key ? fastllm_dsa_layer::GridSize<true,8,false,true>() :
+                        fastllm_dsa_layer::GridSize<false,8,false,true>())) return false;
     int stride = fp8Key ? 264 : 320;
     std::vector<const Data *> sources{x.hidden,      x.branch,    x.feature,        x.inputNorm,
                                       x.postNorm,    x.qkvWeight, x.indexKeyWeight, x.indexQueryWeight,
@@ -171,6 +182,8 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
     for (size_t i = 0; i < outputs.size(); ++i)
         writes.push_back({outputs[i]->cudaData, bytes[i]});
     for (size_t i = 0; i < writes.size(); ++i) {
+        if (mx && (!disjoint(writes[i],{qkvScales,1856*4096/32*sizeof(float)}) ||
+                   !disjoint(writes[i],{outputScales,4096*1024/32*sizeof(float)}))) return false;
         for (size_t j = 0; j < i; ++j)
             if (!disjoint(writes[i], writes[j]))
                 return false;
@@ -191,6 +204,7 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
     a.inputNorm = (const float *)x.inputNorm->cudaData;
     a.indexNorm = (const float *)x.indexNorm->cudaData;
     a.indexBias = (const float *)x.indexBias->cudaData;
+    a.qkvScales = qkvScales; a.outputScales = outputScales;
     a.qkvWeight = (const B *)x.qkvWeight->cudaData;
     a.indexKeyWeight = (const B *)x.indexKeyWeight->cudaData;
     a.indexQueryWeight = (const B *)x.indexQueryWeight->cudaData;

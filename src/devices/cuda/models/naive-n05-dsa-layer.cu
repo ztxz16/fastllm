@@ -2,6 +2,7 @@
 #include "devices/cuda/naive-n05-dsa-layer.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
 #include "naive-n05-dsa-fused-attention.cuh"
+#include "naive-n05-mxfp8-projection.cuh"
 #include "naivert/attn_dsa/body.cuh"
 #include "naivert/attn_dsa/projection.cuh"
 #include "../../multicuda/fastllm-swa-output.cuh"
@@ -63,6 +64,81 @@ struct RequestScratch {
 };
 static_assert(RequestScratch::kBytes * 2 <= fastllm_dsa_fused::AttnDsaScratchLayout::kBytes);
 
+struct PackedGroup {
+    uint2 values[8][4];
+    float scales[8];
+};
+// The layer's exported indices are produced only after projection. Reuse their
+// workspace for eight-row activation groups until all projection tiles finish.
+__device__ __forceinline__ PackedGroup *ActivationGroups(const Args &a) {
+    static_assert((4096 / 32) * sizeof(PackedGroup) <= Layout::Bytes - Layout::Indices);
+    return reinterpret_cast<PackedGroup *>(a.workspace + Layout::Indices);
+}
+__device__ __forceinline__ void PreparedStep(float (&acc)[4], fastllm_mxfp8_projection::WeightFragment w,
+                                             const PackedGroup &group, int rows) {
+    const int lane = threadIdx.x % 32, g = lane / 4, quad = lane % 4;
+    // Inactive N lanes can belong to an earlier request on graph replay.
+    const uint2 q = g < rows ? group.values[g][quad] : make_uint2(0, 0);
+    const float x0 = quad * 2 < rows ? group.scales[quad * 2] : 0.f;
+    const float x1 = quad * 2 + 1 < rows ? group.scales[quad * 2 + 1] : 0.f;
+    fastllm_mxfp8_projection::Accumulate(acc, w, q, x0, x1);
+}
+__device__ void NormalizePacked(const Args &a, int row, B *scratch) {
+    const int t = threadIdx.x;
+    const int lane = t % 32;
+    __shared__ float sums[8];
+    uint4 residual[2];
+    float square = 0;
+    if (t < 256) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int k = (i * 256 + t) * 8;
+            auto v = *reinterpret_cast<const uint4 *>(a.hidden + row * 4096 + k);
+            auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&v);
+            if (a.branch) {
+                const auto branch = *reinterpret_cast<const uint4 *>(a.branch + row * 4096 + k);
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    pairs[j] = __hadd2(pairs[j], reinterpret_cast<const __nv_bfloat162 *>(&branch)[j]);
+            }
+            residual[i] = v;
+            if (a.feature) *reinterpret_cast<uint4 *>(a.feature + row * 4096 + k) = v;
+            *reinterpret_cast<uint4 *>(scratch + k) = v;
+        }
+    }
+    __syncthreads();
+    if (t < 256) {
+        // Keep the original 256-lane RMS reduction order.
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            float value = float(scratch[t + j * 256]);
+            square += value * value;
+        }
+        square = WarpSum(square);
+        if (!lane) sums[t / 32] = square;
+    }
+    __syncthreads();
+    const float total = WarpSum(lane < 8 ? sums[lane] : 0.f);
+    const float inverse = rsqrtf(total / 4096 + a.eps);
+    if (t >= 256) return;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int k = (i * 256 + t) * 8;
+        const auto *v = reinterpret_cast<const B *>(&residual[i]);
+        uint4 norm;
+        float4 gamma[2] = {*reinterpret_cast<const float4 *>(a.inputNorm + k),
+                           *reinterpret_cast<const float4 *>(a.inputNorm + k + 4)};
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            reinterpret_cast<B *>(&norm)[j] = __float2bfloat16_rn(
+                Round(float(v[j]) * inverse) * reinterpret_cast<const float *>(gamma)[j]);
+        *reinterpret_cast<uint4 *>(a.normed + row * 4096 + k) = norm;
+        const auto packed = fastllm_mxfp8_projection::Quantize(norm);
+        auto &group = ActivationGroups(a)[k / 32];
+        group.values[row][t % 4] = packed.values;
+        if (!(t % 4)) group.scales[row] = packed.scale;
+    }
+}
 // One owner per row retains the existing 256-thread RMS tree. Projection
 // CTAs consume the materialized BF16 rows after a cooperative publication barrier.
 __device__ void NormalizeOwner(const Args &a) {
@@ -113,9 +189,46 @@ template <int Rows> __device__ void LoadNormalized(const Args &a, int first, B *
     __syncthreads();
 }
 
-template <int Rows> __device__ void Project(const Args &a, int first, ProjectionStorage<Rows> &s) {
+// A CTA owns two 16-output tiles with four K partitions per tile. The
+// Indexer uses its original BF16 weights; only the QKV/O tiles use MXFP8.
+template<int Width, bool Prepared = false, class Emit>
+__device__ void ProjectMx(const void *weight, const float *scales, int column,
+                          const B *input, float *partial, Emit emit,
+                          const PackedGroup *groups = nullptr, int rows = 8) {
+    constexpr int Splits = 4;
+    const int t = threadIdx.x, warp = t/32, g = t%32/4, q = t%4;
+    if (warp < 2*Splits) {
+        const int first = column + warp/Splits*16;
+        const int begin = warp%Splits*(Width/Splits);
+        float c[4]{};
+#pragma unroll 2
+        for (int base = begin; base < begin+Width/Splits; base += 32) {
+            const int k = base + q*8;
+            if constexpr (Prepared) {
+                auto w = fastllm_mxfp8_projection::LoadWeights(weight, scales, Width, first + g, first + g + 8, k);
+                PreparedStep(c, w, groups[base / 32], rows);
+            } else {
+                const uint4 x = *reinterpret_cast<const uint4 *>(input + fastllm_dsa_projection::input_offset(g,k));
+                fastllm_mxfp8_projection::Step(c,weight,scales,Width,first+g,first+g+8,k,x);
+            }
+        }
+        float *dst = partial+warp*128+g*8+q*2;
+        dst[0]=c[0]; dst[1]=c[1]; dst[64]=c[2]; dst[65]=c[3];
+    }
+    __syncthreads();
+    if (t < 256) {
+        const int tile = t/128, out = t%128/8, row = t%8;
+        float sum = 0.f;
+#pragma unroll
+        for (int split=0;split<Splits;++split)
+            sum += partial[(tile*Splits+split)*128+out*8+row];
+        emit(tile*16+out,row,sum);
+    }
+    __syncthreads();
+}
+template <int Rows, bool Mx> __device__ void Project(const Args &a, int first, ProjectionStorage<Rows> &s) {
     using namespace fastllm_dsa_projection;
-    LoadNormalized<Rows>(a, first, s.input);
+    if (!Mx || blockIdx.x >= 58) LoadNormalized<Rows>(a, first, s.input);
     auto pointer = [&](int col) {
         if (col < 1856)
             return a.qkvWeight + size_t(col) * 4096;
@@ -141,7 +254,17 @@ template <int Rows> __device__ void Project(const Args &a, int first, Projection
                 __float2bfloat16_rn(Round(value) * .25f);
     };
     // One wave covers QKV and all Indexer projections: two output tiles, four K splits each.
-    project_rows_mma<Rows, 4096, 4, 2, 12>(0, 253, pointer, s.input, s.partial, emit);
+    if constexpr (Mx) {
+        static_assert(Rows == 8);
+        if (blockIdx.x < 58) {
+            const int column = blockIdx.x*32;
+            auto output = [&](int col, int row, float value) { emit(column+col,row,value); };
+            ProjectMx<4096, true>(a.qkvWeight, a.qkvScales, column, s.input, s.partial, output,
+                                  ActivationGroups(a), a.rows);
+        } else {
+            project_rows_mma<Rows,4096,4,2,12>(1856,137,pointer,s.input,s.partial,emit,int(blockIdx.x)-58);
+        }
+    } else project_rows_mma<Rows, 4096, 4, 2, 12>(0, 253, pointer, s.input, s.partial, emit);
 }
 
 __device__ void NormalizeIndex(const Args &a, int row) {
@@ -248,7 +371,7 @@ template <bool Fp8Key> __device__ void Publish(const Args &a, int row) {
     __syncthreads();
 }
 
-template <int Rows> __device__ void Tail(const Args &a, int first, TailStorage<Rows> &s) {
+template <int Rows, bool Mx> __device__ void Tail(const Args &a, int first, TailStorage<Rows> &s) {
     using namespace fastllm_dsa_projection;
     using namespace fastllm_swa_output;
     const int t = threadIdx.x, col = blockIdx.x * 32;
@@ -261,7 +384,8 @@ template <int Rows> __device__ void Tail(const Args &a, int first, TailStorage<R
     auto pointer = [&](int column) { return a.outputWeight + size_t(col + column) * 1024; };
     auto emit = [&](int column, int row, float value) { s.local[row][column] = __float2bfloat16_rn(value); };
     // Two tiles share each attention load. Four K splits retain FP32 accumulation.
-    project_rows_mma<Rows, 1024, 4, 2, 12>(0, 2, pointer, s.input, s.partial, emit, 0);
+    if constexpr (Mx) ProjectMx<1024>(a.outputWeight,a.outputScales,col,s.input,s.partial,emit);
+    else project_rows_mma<Rows, 1024, 4, 2, 12>(0, 2, pointer, s.input, s.partial, emit, 0);
     // Reuse the established eight-row mailbox generations. Projection weights
     // are shared across sixteen rows; collective storage does not grow.
     for (int base = 0; base < Rows && first + base < a.rows; base += 8) {
@@ -379,18 +503,33 @@ template <bool Fp8Key> __device__ void PackPublishedQuery(const Args &a, int row
     }
 }
 
-template <bool Fp8Key, int Rows = 8, bool PairedAttention = false> __global__ __launch_bounds__(Threads, 1) void Layer(const __grid_constant__ Args a) {
+__device__ __forceinline__ void PrefetchWeights(const void *data, int bytes) {
+    const auto *p = static_cast<const unsigned char *>(data);
+    for (int i = threadIdx.x * 128; i < bytes; i += Threads * 128)
+        asm volatile("prefetch.global.L2 [%0];" :: "l"(p + i));
+}
+template <bool Fp8Key, int Rows = 8, bool PairedAttention = false, bool Mx = false> __global__ __launch_bounds__(Threads, 1) void Layer(const __grid_constant__ Args a) {
     extern __shared__ __align__(1024) unsigned char bytes[];
     auto &s = *reinterpret_cast<Storage<Fp8Key, Rows, PairedAttention> *>(bytes);
     auto grid = cooperative_groups::this_grid();
+    if constexpr (Mx) {
+        const int c = blockIdx.x;
+        if (c < 58) {
+            PrefetchWeights(reinterpret_cast<const unsigned char *>(a.qkvWeight) + c * 32 * 4096, 32 * 4096);
+            PrefetchWeights(a.qkvScales + c * 4096, 4096 * sizeof(float));
+        }
+    }
     // Single-request control is published by the existing frontend barrier.
     if (a.requestCount == 1)
         fastllm_dsa_fused::Body<Fp8Key, false>::initialize(CoreArguments(a, 0, 0));
-    if (blockIdx.x < a.rows)
-        NormalizeOwner(a);
+    if constexpr (Mx) {
+        const int row = int(gridDim.x - 1 - blockIdx.x);
+        // The low-index CTAs are already initializing the Indexer or prefetching QKV.
+        if (row < a.rows) NormalizePacked(a, row, s.projection.input);
+    } else if (blockIdx.x < a.rows) NormalizeOwner(a);
     grid.sync();
     for (int first = 0; first < a.rows; first += Rows)
-        Project(a, first, s.projection);
+        Project<Rows,Mx>(a, first, s.projection);
     grid.sync();
     if (blockIdx.x < a.rows) {
         Publish<Fp8Key>(a, blockIdx.x);
@@ -473,11 +612,11 @@ template <bool Fp8Key, int Rows = 8, bool PairedAttention = false> __global__ __
     }
     // Tail tiles own disjoint columns/mailbox slots; no grid reader follows them.
     for (int first = 0; first < a.rows; first += Rows) {
-        Tail(a, first, s.tail);
+        Tail<Rows,Mx>(a, first, s.tail);
     }
 }
 
-template <bool Fp8Key, int Rows = 8, bool PairedAttention = false> int GridSize() {
+template <bool Fp8Key, int Rows = 8, bool PairedAttention = false, bool Mx = false> int GridSize() {
     if (FastllmCudaRuntimeArch() != 103)
         return 0;
     static thread_local std::unordered_map<int, int> grids;
@@ -491,9 +630,9 @@ template <bool Fp8Key, int Rows = 8, bool PairedAttention = false> int GridSize(
     const int shared = sizeof(Storage<Fp8Key, Rows, PairedAttention>);
     if (cudaGetDeviceProperties(&p, device) != cudaSuccess || !p.cooperativeLaunch ||
         p.multiProcessorCount < 128 ||
-        cudaFuncSetAttribute(Layer<Fp8Key, Rows, PairedAttention>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) !=
+        cudaFuncSetAttribute(Layer<Fp8Key, Rows, PairedAttention, Mx>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) !=
             cudaSuccess ||
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, Layer<Fp8Key, Rows, PairedAttention>, Threads, shared) !=
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, Layer<Fp8Key, Rows, PairedAttention, Mx>, Threads, shared) !=
             cudaSuccess ||
         occupancy < 1) {
         cudaGetLastError();
@@ -512,6 +651,14 @@ bool FastllmCudaNaiveDSALayerSupported() {
 }
 cudaError_t FastllmCudaNaiveDSALayerLaunch(FastllmNaiveDSALayerArgs args) {
     using namespace fastllm_dsa_layer;
+    if (args.qkvScales) {
+        int grid = args.fp8Key ? GridSize<true,8,false,true>() : GridSize<false,8,false,true>();
+        if (!grid || args.rows > 8) return cudaErrorNotSupported;
+        const void *kernel = args.fp8Key ? (const void *)Layer<true,8,false,true> : (const void *)Layer<false,8,false,true>;
+        size_t bytes = args.fp8Key ? sizeof(Storage<true>) : sizeof(Storage<false>);
+        void *params[] = {&args};
+        return cudaLaunchCooperativeKernel(kernel,grid,Threads,params,bytes,cudaStreamPerThread);
+    }
     int grid = args.rows > 8 ? (args.fp8Key ? GridSize<true, 16>() : GridSize<false, 16>()) : 0;
     const bool wide = grid != 0;
     if (!wide) grid = args.fp8Key ? GridSize<true>() : GridSize<false>();

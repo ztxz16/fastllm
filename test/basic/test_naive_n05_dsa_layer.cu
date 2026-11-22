@@ -3,6 +3,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "utils/utils.h"
+#include "naive_n05_mxfp8_test.h"
 #include <cuda_fp8.h>
 #include <algorithm>
 #include <array>
@@ -169,7 +170,7 @@ struct Case {
     std::vector<FastllmNaiveVerifyIndexerItem> items;
     std::vector<Data> indexRequests;
     std::vector<FastllmNaiveDSARow> referenceRows;
-    Case(std::vector<int> requests, int capacity, bool paged, bool fp8, int device = 0)
+    Case(std::vector<int> requests, int capacity, bool paged, bool fp8, int device = 0, bool mx = false)
         : rows(0), capacity(capacity), device(device), fp8(fp8), paged(paged), requests(requests) {
         for (int n : requests)
             rows += n;
@@ -181,16 +182,16 @@ struct Case {
             Init(*d, FLOAT32, {4096});
             Fill(*d, 7, .1f, 1);
         }
-        Init(qkvWeight, BFLOAT16, {1856, 4096});
+        Init(qkvWeight, mx ? FP8_E4M3 : BFLOAT16, {1856, 4096});
         Init(ikWeight, BFLOAT16, {128, 4096});
         Init(iqWeight, BFLOAT16, {2048, 4096});
         Init(iwWeight, BFLOAT16, {16, 4096});
-        Init(oWeight, BFLOAT16, {4096, 1024});
-        Fill(qkvWeight, 13 + device, .03f);
+        Init(oWeight, mx ? FP8_E4M3 : BFLOAT16, {4096, 1024});
+        if (mx) FillVerifyMxWeight(qkvWeight,13+device); else Fill(qkvWeight,13 + device,.03f);
         Fill(ikWeight, 17, .03f);
         Fill(iqWeight, 19, .03f);
         Fill(iwWeight, 23, .03f);
-        Fill(oWeight, 29 + device, .03f);
+        if (mx) FillVerifyMxWeight(oWeight,29+device); else Fill(oWeight,29 + device,.03f);
         Init(ikNorm, FLOAT32, {128});
         Init(ikBias, FLOAT32, {128});
         Init(sink, FLOAT32, {8});
@@ -305,7 +306,7 @@ struct Case {
     void Legacy(bool tp = false) {
         FastllmCudaNaiveAddDecodeRMSNorm(referenceHidden, branch, gamma, input.eps, rnorm);
         CopyDevice(referenceFeature, referenceHidden);
-        Require(FastllmCudaBFloat16MatMulBFloat16(rnorm, qkvWeight, empty, raw, rows, 4096, 1856),
+        Require((qkvWeight.dataType == FP8_E4M3 ? VerifyMxLinearReference : FastllmCudaBFloat16MatMulBFloat16)(rnorm, qkvWeight, empty, raw, rows, 4096, 1856),
                 "QKV reference");
         Require(FastllmCudaBFloat16MatMulBFloat16(rnorm, ikWeight, empty, ik, rows, 4096, 128),
                 "IK reference");
@@ -323,7 +324,7 @@ struct Case {
         Require(FastllmCudaNaiveFusedDSAVerify(rq, iq, iw, sink, items, referenceRows, true, 8, 1, 192, 128,
                                                referenceScratch, rattn),
                 "core reference");
-        Require(FastllmCudaBFloat16MatMulBFloat16(rattn, oWeight, empty, rprojected, rows, 1024, 4096),
+        Require((oWeight.dataType == FP8_E4M3 ? VerifyMxLinearReference : FastllmCudaBFloat16MatMulBFloat16)(rattn, oWeight, empty, rprojected, rows, 1024, 4096),
                 "O reference");
         if (tp)
             Require(FastllmCudaCustomAllReduce(rprojected.cudaData, rprojected.cudaData, rows * 4096,
@@ -419,6 +420,7 @@ struct Case {
                 "fallback mutated data");
     }
 };
+bool testMxProjection = false;
 template <class F> void Parallel(F f) {
     std::array<std::exception_ptr, 8> errors{};
     std::vector<std::thread> workers;
@@ -426,6 +428,9 @@ template <class F> void Parallel(F f) {
         workers.emplace_back([&, rank] {
             try {
                 FastllmCudaSetDevice(rank);
+                std::shared_ptr<void> lease;
+                std::unique_ptr<FastllmCudaLinearGraphScope> scope;
+                if (testMxProjection) scope = std::make_unique<FastllmCudaLinearGraphScope>(lease);
                 f(rank);
             } catch (...) {
                 errors[rank] = std::current_exception();
@@ -437,12 +442,12 @@ template <class F> void Parallel(F f) {
         if (error)
             std::rethrow_exception(error);
 }
-void Tp(bool fp8) {
+void Tp(bool fp8, bool mx = false) {
     const std::vector<int> devices{0, 1, 2, 3, 4, 5, 6, 7};
     Require(FastllmInitNccl(devices) && FastllmCudaCustomAllReduceInit(devices), "TP init");
-    for (auto shape : std::vector<std::vector<int>>{{8}, {4, 4}, {8, 8}, {1, 8}, {7, 8}, {1, 2, 5, 8}}) {
+    for (auto shape : mx ? std::vector<std::vector<int>>{{4},{8},{4,4}} : std::vector<std::vector<int>>{{8}, {4, 4}, {8, 8}, {1, 8}, {7, 8}, {1, 2, 5, 8}}) {
         std::array<std::unique_ptr<Case>, 8> cases;
-        Parallel([&](int r) { cases[r] = std::make_unique<Case>(shape, 32768, false, fp8, r); });
+        Parallel([&](int r) { cases[r] = std::make_unique<Case>(shape, 32768, false, fp8, r, mx); });
         Parallel([&](int r) {
             auto &c = *cases[r];
             auto h = Read(c.hidden), k = Read(c.caches[0]->key), v = Read(c.caches[0]->value);
@@ -716,9 +721,10 @@ int main(int argc, char **argv) {
             }
             FastllmCudaSetDevice(0);
         }
+        testMxProjection = argc > 3 && std::strcmp(argv[3],"--mxfp8")==0;
         bool fp8 = argc > 1 && std::strcmp(argv[1], "fp8") == 0;
         if (argc > 2 && std::strcmp(argv[2], "tp") == 0)
-            Tp(fp8);
+            Tp(fp8, testMxProjection);
         else if (argc > 2 && std::strcmp(argv[2], "router") == 0)
             TpRouter(fp8);
         else if (argc > 2 && std::strcmp(argv[2], "streams") == 0)
