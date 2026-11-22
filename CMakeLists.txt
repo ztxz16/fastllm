@@ -1058,6 +1058,20 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DSA_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_dsa_fused>)
+    add_library(fastllm_draft_fused OBJECT src/devices/cuda/models/naive-n05-draft-fused.cu)
+    set_target_properties(fastllm_draft_fused PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_draft_fused BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_draft/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/devices/cuda"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_draft_fused PRIVATE
+        "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
+        "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
+    target_compile_definitions(fastllm_draft_fused PRIVATE
+        NAIVERT_SM_COUNT=148 NAIVERT_TP_RANKS=8 NAIVERT_HIDDEN=4096
+        NAIVERT_VOCAB_SHARD=19072 NAIVERT_NORM_EPS=1e-05)
+    list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_draft_fused>)
     add_library(fastllm_shared_flex_sm103 OBJECT
         src/devices/cuda/moe/fastllm-shared-flex-ep.cu
         src/devices/cuda/moe/fastllm-shared-flex-tp.cu)
