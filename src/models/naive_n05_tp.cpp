@@ -32,6 +32,7 @@
 #include "devices/cuda/fastllm-mxfp4-ep-graph.h"
 #include "devices/cuda/fastllm-mxfp4-ep-generic.h"
 #include "devices/cuda/fastllm-moe-weight-owner.h"
+#include "devices/cuda/fastllm-mxfp4-marlin-tp.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -44,6 +45,11 @@ bool FastllmCudaMergeMOEUsedGraphUnsafeFallback();
 
 namespace {
 #ifdef USE_CUDA
+bool NaiveMoeFusionEnabled() {
+    const char *value = std::getenv("FASTLLM_NAIVE_MOE_FUSION");
+    return !value || std::string(value) != "0";
+}
+
 // One reusable event set per rank worker. Created only for an enabled trace,
 // and never recorded while a CUDA Graph is being captured.
 struct InferenceTimingEvents {
@@ -224,8 +230,7 @@ bool NaiveN05FlashModel::InitTensorParallel() {
     const bool layout = block_cnt > 0 && embed_dim > 0 && embed_dim % 128 == 0 &&
         num_experts >= ranks && num_experts % ranks == 0 &&
         num_experts_per_tok > 0 && num_experts_per_tok <= num_experts;
-    const char *fusion = std::getenv("FASTLLM_NAIVE_MOE_FUSION");
-    const bool enabled = (!fusion || std::string(fusion) != "0") && ResidentMoePlacement();
+    const bool enabled = NaiveMoeFusionEnabled() && ResidentMoePlacement();
     const bool geometry = NaiveMoeGeometrySupported(embed_dim, num_experts,
         num_experts_per_tok, block_cnt, norm_topk_prob, routed_scaling_factor);
     const bool shared = NaiveSharedFlexMoe::Requested(), old = NaiveFlexMoe::Requested();
@@ -256,6 +261,8 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
             (dataType == BFLOAT16 && moeAtype == BFLOAT16 && norm_topk_prob && routed_scaling_factor == 1.0f &&
              (tpEp8MegaState || NaiveMoeGeometrySupported(embed_dim, num_experts, num_experts_per_tok, block_cnt, norm_topk_prob, routed_scaling_factor))),
             "Specialized MoE configuration changed after preparation; reload the model to change routing or activation type.");
+        AssertInFastLLM(tpMarlinRanks.empty() || (dataType == BFLOAT16 && moeAtype == BFLOAT16),
+                       "Prepared Marlin TP requires BF16 activations.");
         return;
     }
     const int ranks = tpDevices.size();
@@ -527,6 +534,29 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     // Once packing starts, a failure may have retired part of the source.
     // Keep retries closed until the complete prepared representation exists.
     tpMoePreparationFailed = releaseSources || (native && mxfp4Only);
+#ifndef USE_ROCM
+    if (tpMoeBackend == NaiveMoeBackend::LegacyTP && dataType == BFLOAT16 && moeAtype == BFLOAT16 &&
+        attentionDP == 1 && NaiveMoeFusionEnabled() && ResidentMoePlacement()) {
+        std::vector<std::shared_ptr<Mxfp4MarlinRank>> prepared(ranks);
+        const int previous = FastllmCudaGetDevice();
+        for (int r = 0; r < ranks; ++r) {
+            FastllmCudaSetDevice(tpDevices[r]);
+            prepared[r] = PrepareMxfp4MarlinRank(tpDevices[r], tpMoeWeights[r], embed_dim, num_experts, num_experts_per_tok);
+            if (!prepared[r]) break;
+        }
+        FastllmCudaSetDevice(previous);
+        if (prepared.back()) {
+            tpMoePreparationFailed = true;
+            std::vector<std::exception_ptr> errors(ranks);
+            tpWorkers.Run(tpDevices, [&](int r) {
+                FastllmCudaSetDevice(tpDevices[r]);
+                PackMxfp4MarlinRank(*prepared[r], tpMoeWeights[r]);
+            }, errors);
+            for (auto error : errors) if (error) std::rethrow_exception(error);
+            tpMarlinRanks = std::move(prepared);
+        }
+    }
+#endif
     if (tpMoeBackend == NaiveMoeBackend::LegacyFlexTP)
         tpFlexMoe = std::make_shared<NaiveFlexMoe>(tpDevices, tpMoeWeights);
     if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights, num_experts_per_tok);
@@ -548,7 +578,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         }
     }
     fprintf(stderr,"[Naive MoE prepared] backend=%s original_payload_pointers=%zu original_payload_bytes=%zu\n",
-        NaiveMoeBackendName(tpMoeBackend), sourcePointers, sourceBytes);
+        tpMarlinRanks.empty() ? NaiveMoeBackendName(tpMoeBackend) : "marlin-tp/mxfp4-w4a16", sourcePointers, sourceBytes);
     tpIndexerPeerAccess = indexerLayerSharding && tpEp8MegaState && FastllmCudaPeerAccessInit(tpDevices);
     tpSwaRingCache = (GetFastllmEnv().cudaGraph || (attentionDP > 1 && !draftEnabled)) &&
         FastllmNaiveKVType(AuxiliaryKVType()) &&
@@ -2474,20 +2504,28 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
             it->second->dataType != BFLOAT16) return false;
         // EP8 weights/descriptors were validated when its state was created.
         // The remaining checks apply only to resident indexed TP experts.
-        for (int layer = 0; !tpEp8MegaState && !tpSharedFlex && !tpFlexMoe && layer < block_cnt; ++layer) {
+        for (int layer = 0; tpMarlinRanks.empty() && !tpEp8MegaState && !tpSharedFlex && !tpFlexMoe && layer < block_cnt; ++layer) {
             if (!moeLayers[layer]) continue;
             auto &weights = tpMoeWeights[rank][layer];
             if (weights.size() < 4 || !weights[2] || !weights[3]) return false;
-            if (weights[2]->dataType == FP8_E4M3) {
-                if (rows != 1 || verifying || weights[0] || weights[1]) return false;
+            const DataType weightType = weights[2]->dataType;
+            const bool compactVerify = verifying && weightType == NVFP4;
+            if (compactVerify || weightType == FP8_E4M3) {
+                if (weights[0] || weights[1] || (weights.size() & 1)) return false;
+                if (compactVerify) {
+                    // The indexed FP4 kernels read routes on device. Warmup builds
+                    // their immutable expert table and rejects any host fallback.
+                    if (moeAtype != BFLOAT16 || rows > 64) return false;
+                } else if (rows != 1 || verifying) return false;
                 const int inter = weights[3]->dims.size() == 2 ? weights[3]->dims[1] : 0;
                 if (inter <= 0) return false;
                 for (size_t i = 2; i < weights.size(); ++i) {
                     Data *w = weights[i];
                     const std::vector<int> dims = i % 2 == 0
                         ? std::vector<int>{inter * 2, embed_dim} : std::vector<int>{embed_dim, inter};
-                    if (!w || w->dataType != FP8_E4M3 || w->dataDevice != DataDevice::CUDA ||
-                        !w->cudaData || w->dims != dims || w->blockM <= 0 || w->blockK <= 0)
+                    if (!w || w->dataType != weightType || w->dataDevice != DataDevice::CUDA ||
+                        !w->cudaData || w->dims != dims || w->blockM <= 0 || w->blockK <= 0 ||
+                        (compactVerify && !w->scales.empty()))
                         return false;
                 }
             } else {

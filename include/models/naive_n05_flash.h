@@ -16,6 +16,7 @@ struct FastllmCudaMimoEp8Mega;
 namespace fastkv { class HostCache; }
 
 namespace fastllm {
+    struct Mxfp4MarlinRank;
     struct NaiveFlexMoe;
     struct NaiveSharedFlexMoe;
     class CudaWorkspace;
@@ -723,6 +724,7 @@ namespace fastllm {
             return !HasSeparateIndexer() && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(AuxiliaryKVType()) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
+        std::vector<std::shared_ptr<Mxfp4MarlinRank>> tpMarlinRanks;
     };
 }
 #endif

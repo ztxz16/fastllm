@@ -5178,6 +5178,40 @@ static void VerifyChunkedRowAllReduce(int ranks) {
     auto cuda = [](cudaError_t error) {
         if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
     };
+#if CUDART_VERSION >= 12000 && !defined(USE_ROCM)
+    // A partially overlapping output on just one rank must reject the collective on every rank.
+    run([&](int rank) {
+        constexpr int rows = 3, hidden = 520, slots = 3;
+        Data partials(BFLOAT16, {rows, slots, hidden}), ids(INT32, {rows, slots}), out(BFLOAT16, {rows, hidden});
+        partials.Allocate(); ids.Allocate();
+        for (int row = 0; row < rows; ++row) {
+            for (int slot = 0; slot < slots; ++slot) {
+                const int index = row * slots + slot;
+                reinterpret_cast<int32_t *>(ids.cpuData)[index] = slot == row ? -1 : slot;
+                std::fill_n(reinterpret_cast<uint16_t *>(partials.cpuData) + index * hidden, hidden,
+                            Float32ToBFloat16RNEBits(float(3 * rank + slot)));
+            }
+        }
+        partials.ToDevice(CUDA, {rank}, true);
+        ids.ToDevice(CUDA, {rank}, true);
+        out.ToDevice(CUDA, {rank}, false); out.Allocate(false);
+        auto reduce = [&](void *dest) {
+            return FastllmCudaCustomAllReduceExpertRows(partials.cudaData,
+                static_cast<const int32_t *>(ids.cudaData), dest, rows, hidden, slots, rank);
+        };
+        if (reduce(rank == 0 ? static_cast<uint8_t *>(partials.cudaData) + 16 : out.cudaData))
+            throw std::runtime_error("overlapping expert reduction was accepted");
+        if (!reduce(out.cudaData)) throw std::runtime_error("disjoint expert reduction fell back");
+        std::vector<uint16_t> result(rows * hidden);
+        cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        cuda(cudaMemcpy(result.data(), out.cudaData, out.GetBytes(), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < rows * hidden; ++i) {
+            const float expected = ranks * (3 * (ranks - 1) + 3 - i / hidden);
+            if (result[i] != Float32ToBFloat16RNEBits(expected))
+                throw std::runtime_error("expert row reduction differs from rank sum");
+        }
+    });
+#endif
     int checks = 0;
     for (DataType type : {FLOAT16, BFLOAT16, FLOAT32}) {
         const int unit = type == FLOAT32 ? 4 : 2;

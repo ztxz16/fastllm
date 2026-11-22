@@ -17,6 +17,7 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #include "devices/cuda/fastllm-mxfp4-marlin-tp.h"
 #include "devices/cuda/fastllm-prefill-workspace.h"
 
@@ -3802,7 +3803,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                              const fastllm::Data *prequantizedInput = nullptr,
                              const fastllm::Data *sharedPartial = nullptr,
                              fastllm::Data *joinedOutput = nullptr, int parallelJoinLayer = -1,
-                             MarlinLayerCache *preparedRank = nullptr, uint8_t **expertTable = nullptr) {
+                             MarlinLayerCache *preparedRank = nullptr, uint8_t **expertTable = nullptr,
+                             bool *tpReduced = nullptr) {
     if (globalIndices == nullptr || scores == nullptr || topk <= 0 ||
         topk > 16 || ownerCount <= 0 ||
         input.dims.empty() || input.dataDevice != fastllm::DataDevice::CUDA) {
@@ -4092,7 +4094,13 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                 return false;
             }
 
-            reduceRows(chunkIndices, chunkOutput, count);
+            if (tpReduced && ownerRank == 0 && ownerCount == 1 && count == rows &&
+                FastllmCudaCustomAllReduceExpertRows(downOutput, chunkIndices, chunkOutput,
+                    rows, cache->hidden, topk, cache->device)) {
+                *tpReduced = true;
+            } else {
+                reduceRows(chunkIndices, chunkOutput, count);
+            }
             if (!checkStage("grouped EP row reduction")) return false;
         }
         return true;
@@ -4279,7 +4287,8 @@ void PackMxfp4MarlinRank(Mxfp4MarlinRank &rank, const std::vector<std::vector<Da
 }
 
 bool RunMxfp4MarlinTP(Mxfp4MarlinRank &rank, int layer, const Data &input,
-        const Data &ids, const Data &scores, Data &activation, Data &output) {
+        const Data &ids, const Data &scores, Data &activation, Data &output, bool *tpReduced) {
+    if (tpReduced) *tpReduced = false;
     auto &s = rank.scratch;
     if (layer < 0 || size_t(layer) >= rank.moeLayers.size() || !rank.moeLayers[layer] ||
         input.dataType != BFLOAT16 || input.dims.size() != 2 || ids.dataType != INT32 ||
@@ -4289,7 +4298,7 @@ bool RunMxfp4MarlinTP(Mxfp4MarlinRank &rank, int layer, const Data &input,
         ids.dims[1] != s.topk || scores.dims != ids.dims) return false;
     return fastllm_marlin_moe::RunMarlinMoe<__nv_bfloat16>(input, activation, output, nullptr, 0,
         (const int32_t *)ids.cudaData, (const float *)scores.cudaData, s.topk, 0, 1, false, 0.0f,
-        nullptr, nullptr, nullptr, -1, &s, rank.table + size_t(layer) * 2 * s.experts);
+        nullptr, nullptr, nullptr, -1, &s, rank.table + size_t(layer) * 2 * s.experts, tpReduced);
 }
 }
 

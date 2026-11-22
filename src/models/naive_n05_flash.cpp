@@ -32,6 +32,7 @@
 #include "devices/cuda/fastllm-linear-scratch.h"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
+#include "devices/cuda/fastllm-mxfp4-marlin-tp.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -461,6 +462,7 @@ NaiveN05FlashModel::~NaiveN05FlashModel() {
     tpBatchState.reset();
     tpBatchVerifyState.reset();
     tpBatchVerifyGraphs.clear();
+    tpMarlinRanks.clear();
     tpSharedFlex.reset();
     tpEp8MegaState.reset();
     tpFlexMoe.reset();
@@ -2686,11 +2688,18 @@ Data NaiveN05FlashModel::RunTarget(
             }
             normed.Reshape({length, embed_dim});
             if (!tensorParallel) ApplyMoeDeviceMapForLayer(layer);
-            bool moeNormReady = false;
+            bool moeNormReady = false, moeTpReduced = false;
             if (useSharedFlex) {
                 if (sharedRouting) tpSharedFlex->ForwardRouted(tpRank, layer, length, normed, router, routerBias,
                     expertIndex, expertScore, moeOutput, norm_topk_prob, routed_scaling_factor, attentionInputPrepared ? prepared : nullptr);
                 else tpSharedFlex->Forward(tpRank,layer,length,normed,expertIndex,expertScore,moeOutput);
+#ifndef USE_ROCM
+            } else if (tensorParallel && !tpMarlinRanks.empty()) {
+                AssertInFastLLM(RunMxfp4MarlinTP(*tpMarlinRanks.at(tpRank), layer, normed,
+                    expertIndex, expertScore, w1, moeOutput, verifying && !localMoe ? &moeTpReduced : nullptr),
+                    "Prepared MXFP4 Marlin TP execution failed.");
+                if (moeTpReduced) trackCommunication(moeOutput);
+#endif
             } else if (localMoe) {
                 FastllmCudaRunMimoEp8MegaLocal(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, maxLocalRows,
@@ -2777,7 +2786,7 @@ Data NaiveN05FlashModel::RunTarget(
             if (!tensorParallel) ApplyDeviceMap(deviceMap, layer + 1, block_cnt);
             moeOutput.Reshape(hidden.dims);
             if (!moeNormReady && (!localMoe || length))
-                addMlpResidual(moeOutput, !useSharedFlex && !(tensorParallel && tpEp8MegaState));
+                addMlpResidual(moeOutput, !moeTpReduced && !useSharedFlex && !(tensorParallel && tpEp8MegaState));
         }
         prefillNormReady = fusePrefillNorm && mlpNormWeight;
         const auto featureLayer = capture && capture->collectHidden

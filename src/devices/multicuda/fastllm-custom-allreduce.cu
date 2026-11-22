@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #include "fastllm-custom-allreduce-tagged.cuh"
@@ -1040,6 +1041,38 @@ __device__ __forceinline__ CustomArNormPacketType CustomArReducePacket(CustomArR
         result.data[i] = __float2bfloat16_rn(sum[i]);
     return result;
 }
+
+// Slot zero is no longer needed once this rank has summed the expert rows.
+// Each CTA publishes and consumes exactly its own packet range on every rank.
+template <int Ranks>
+__global__ void CustomArExpertRowsKernel(CustomArRankData *registered, CustomArRankSignals signals,
+        CustomArSignal *self, CustomArNormPacketType *local, const int32_t *ids, CustomArNormBF16 *out,
+        int rank, int packets, int rowPackets, int topk) {
+    const CustomArRankData peers = *registered;
+    const int packet = blockIdx.x * blockDim.x + threadIdx.x;
+    int first = 0;
+    if (packet < packets) {
+        const int row = packet / rowPackets;
+        first = row * topk * rowPackets + packet % rowPackets;
+        float sum[8] = {};
+        for (int slot = 0; slot < topk; ++slot) {
+            if (ids[row * topk + slot] < 0) continue;
+            const auto value = local[first + slot * rowPackets];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sum[i] += float(value.data[i]);
+        }
+        CustomArNormPacketType result;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) result.data[i] = __float2bfloat16_rn(sum[i]);
+        local[first] = result;
+    }
+    __syncthreads();
+    CustomArBarrierStart<Ranks>(signals, self, rank);
+    if (packet < packets)
+        reinterpret_cast<CustomArNormPacketType *>(out)[packet] = CustomArReducePacket<Ranks>(peers, first);
+    CustomArBarrierFinal<Ranks>(signals, self, rank);
+}
+
 template <int Ranks, bool Direct>
 __global__ __launch_bounds__(512, 1) void FastllmCustomAllReduceRMSNormKernel(
     CustomArRankData *data, CustomArRankSignals signals, CustomArSignal *self, CustomArRankScratch scratch,
@@ -1459,6 +1492,11 @@ private:
 
     CustomArState *state = nullptr;
 };
+
+bool CustomArBuffersDisjoint(const void *a, size_t bytesA, const void *b, size_t bytesB) {
+    const auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
+    return x <= y ? y - x >= bytesA : x - y >= bytesB;
+}
 
 size_t CustomArTypeBytes(int dataType) {
     if (dataType == fastllm::DataType::FLOAT16 ||
@@ -3715,6 +3753,48 @@ bool FastllmCudaNaiveDSALayer(const FastllmNaiveDSALayerInput &input,int deviceI
 }
 #endif
 
+bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, void *output,
+        int rows, int hidden, int topk, int deviceId) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+    constexpr int threads = 256;
+    if (rows <= 0 || hidden <= 0 || hidden % 8 || topk <= 0 || topk > 16 ||
+        (int64_t)rows * hidden > 8 * threads * kCustomArMaxBlocks) return false;
+    const int packets = rows * hidden / 8, blocks = (packets + threads - 1) / threads;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, size_t(hidden) * 2, fastllm::BFLOAT16, deviceId, true, rank)) return false;
+    CustomArRankData *peers = nullptr;
+    const size_t outputBytes = size_t(packets) * sizeof(CustomArNormPacketType);
+    const size_t partialBytes = outputBytes * topk, idBytes = size_t(rows) * topk * sizeof(*ids);
+    const bool eligible = partials && ids && output &&
+        ((uintptr_t(partials) | uintptr_t(output)) & 15) == 0 && uintptr_t(ids) % alignof(int32_t) == 0 &&
+        CustomArBuffersDisjoint(partials, partialBytes, output, outputBytes) &&
+        CustomArBuffersDisjoint(partials, partialBytes, ids, idBytes) &&
+        CustomArBuffersDisjoint(output, outputBytes, ids, idBytes);
+    if (!FindOrRegisterCustomArPointers(state, rank, partials, rows * hidden, fastllm::BFLOAT16,
+                                        eligible, peers)) return false;
+    auto launch = [&](auto ranks) {
+        CustomArExpertRowsKernel<decltype(ranks)::value><<<blocks, threads, 0, cudaStreamPerThread>>>(
+            peers, state.allSignals, state.allSignals.signals[rank],
+            static_cast<CustomArNormPacketType *>(partials), ids,
+            static_cast<CustomArNormBF16 *>(output), rank, packets, hidden / 8, topk);
+    };
+    switch (state.devices.size()) {
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        case 6: launch(std::integral_constant<int, 6>{}); break;
+        case 8: launch(std::integral_constant<int, 8>{}); break;
+        default: return false;
+    }
+    // The caller checks the launch error before consuming output. A single rank cannot retry a collective.
+    if (cudaPeekAtLastError() != cudaSuccess) FastllmCudaSetThreadError();
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
         const float *weight, void *output, int count, int channels,
         float eps, int dataType, int deviceId) {
@@ -3818,18 +3898,14 @@ bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
                        deviceId, true, rank)) return false;
     const int ranks = (int)state.devices.size();
     if (count % (ranks * 8)) return false;
-    auto disjoint = [](const void *a, size_t na, const void *b, size_t nb) {
-        uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
-        return x <= y ? y - x >= na : x - y >= nb;
-    };
     const size_t routedBytes = (size_t)count * 4, sharedBytes = (size_t)count * 2;
     // Rank-local eligibility must participate in the pointer rendezvous: no
     // rank can return early while other ranks wait for its pointer or barrier.
     const bool eligible = routed && dest && shared &&
         (((uintptr_t)routed | (uintptr_t)dest | (uintptr_t)shared) & 15u) == 0 &&
-        (routed == dest || disjoint(routed, routedBytes, dest, routedBytes)) &&
-        disjoint(routed, routedBytes, shared, sharedBytes) &&
-        disjoint(dest, routedBytes, shared, sharedBytes);
+        (routed == dest || CustomArBuffersDisjoint(routed, routedBytes, dest, routedBytes)) &&
+        CustomArBuffersDisjoint(routed, routedBytes, shared, sharedBytes) &&
+        CustomArBuffersDisjoint(dest, routedBytes, shared, sharedBytes);
     CustomArRankData *routedData = nullptr, *sharedData = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, routed, count,
             fastllm::FLOAT32, eligible, routedData) ||

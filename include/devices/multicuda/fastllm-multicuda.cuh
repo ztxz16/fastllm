@@ -53,6 +53,9 @@ bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId);
 // pointer registration and collective fallback checks remain unchanged.
 bool FastllmCudaCustomAllReduceWithSpin(void* data, void* dest, int count,
                                       int dataType, int deviceId, int hostSpinMicroseconds);
+// Combine local BF16 expert slots and the rank-ordered TP sum, reusing consumed slot storage.
+bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, void *output,
+        int rows, int hidden, int topk, int deviceId);
 // Reduce a block with the rank-ordered FP32 arithmetic selected for one row.
 // Uses the single-row enable policy; large blocks are split on complete rows.
 // All chunks are registered collectively before any output is modified.
