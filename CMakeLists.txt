@@ -30,6 +30,16 @@ option(BUILD_QWEN_IMAGE "build native Qwen-Image-2.1" OFF)
 option(BUILD_LINGBOT_WORLD "build native LingBot-World 2.0" OFF)
 option(BUILD_MINIMAX_H3 "build native MiniMax-H3" OFF)
 option(BUILD_DUO "build native Duo streaming realization backend" OFF)
+option(FASTLLM_MERGE_MEDIA "Link all media inference backends into the Linux CUDA wheel core" OFF)
+if(FASTLLM_MERGE_MEDIA)
+    if(NOT (MAKE_WHL_X86 AND USE_CUDA AND CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+        message(FATAL_ERROR "FASTLLM_MERGE_MEDIA requires a Linux x86 CUDA wheel build")
+    endif()
+    set(BUILD_DUO ON)
+    set(BUILD_HY_NOMAS ON)
+    set(BUILD_QWEN_IMAGE ON)
+    set(BUILD_LINGBOT_WORLD ON)
+endif()
 if(BUILD_DUO)
     set(BUILD_MINIMAX_H3 ON)
 endif()
@@ -214,6 +224,35 @@ else()
     endif()
 endif()
 
+
+if(FASTLLM_MERGE_MEDIA)
+    # Retain the wheel's static C++ ABI and a shared exception unwinder even
+    # for the C++20 live worker. The build host has newer GLIBCXX symbols.
+    string(REPLACE "-static-libstdc++" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    # The native ASR target also enables C. Its implicit link directories can
+    # precede the C++ driver's defaults when the system gcc has a different version.
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=libstdc++.a
+        OUTPUT_VARIABLE cxx_runtime OUTPUT_STRIP_TRAILING_WHITESPACE)
+    get_filename_component(cxx_runtime_dir "${cxx_runtime}" DIRECTORY)
+    add_link_options($<$<LINK_LANGUAGE:CXX>:-L${cxx_runtime_dir}> $<$<LINK_LANGUAGE:CXX>:-static-libstdc++>)
+    string(REPLACE "-static-libgcc" "-shared-libgcc" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REPLACE "--exclude-libs,ALL" "--exclude-libs,libstdc++.a:libgcc.a:libgcc_eh.a"
+        CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(FASTLLM_MODEL_LIBRARY_TYPE STATIC)
+else()
+    set(FASTLLM_MODEL_LIBRARY_TYPE SHARED)
+endif()
+
+# Tools, servers and test bridges consume the same runtime as the installed wheel.
+function(fastllm_link_model target access model)
+    if(FASTLLM_MERGE_MEDIA)
+        target_link_libraries(${target} ${access} fastllm_tools ${ARGN})
+    else()
+        target_link_libraries(${target} ${access} ${model} ${ARGN})
+    endif()
+endfunction()
 
 message(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
 file(GLOB GRAPH_MODEL_FILES "src/models/graph/*.cpp")
@@ -4389,7 +4428,27 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(fastllm_tools PRIVATE fastipc/fastipc.cpp)
 endif()
 target_link_libraries(fastllm_tools PRIVATE fastllm)
+if(FASTLLM_MERGE_MEDIA)
+    # ctypes entry points have no static callers. Retain all model objects and
+    # their embedded device images, including the architecture-specific kernels.
+    set(media_components fastllm_continuous fastllm_nomas fastllm_minimax_h3
+        fastllm_qwen_image fastllm_lingbot fastllm_duo)
+    target_link_libraries(fastllm_tools PRIVATE "-Wl,--whole-archive")
+    foreach(component IN LISTS media_components)
+        target_link_libraries(fastllm_tools PRIVATE "$<TARGET_FILE:${component}>")
+    endforeach()
+    target_link_libraries(fastllm_tools PRIVATE "-Wl,--no-whole-archive")
+    add_dependencies(fastllm_tools ${media_components})
+    target_include_directories(fastllm_tools INTERFACE "${PROJECT_SOURCE_DIR}/include"
+        "${PROJECT_SOURCE_DIR}/third_party/json11" "${PROJECT_SOURCE_DIR}/third_party/flashinfer")
+    set_target_properties(fastllm_tools PROPERTIES INSTALL_RPATH
+        "$ORIGIN;$ORIGIN/../nvidia/cuda_runtime/lib;$ORIGIN/../nvidia/cublas/lib;$ORIGIN/../nvidia/nccl/lib")
+endif()
 
+set(BUILD_INFO_MERGED_MEDIA "false")
+if(FASTLLM_MERGE_MEDIA)
+    set(BUILD_INFO_MERGED_MEDIA "true")
+endif()
 set(BUILD_INFO_USE_CUDA "false")
 set(BUILD_INFO_USE_ROCM "false")
 set(BUILD_INFO_USE_NUMAS "false")
@@ -4415,7 +4474,7 @@ if (USE_IVCOREX)
     set(BUILD_INFO_USE_IVCOREX "true")
 endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
-"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX}\n}\n")
+"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX},\n  \"merged_media\": ${BUILD_INFO_MERGED_MEDIA}\n}\n")
 
 # copy_directory overlays existing files. Replace each shipped EP package so
 # incremental builds cannot bundle CUBINs retired from its manifest.

@@ -14,7 +14,12 @@ endif()
 add_library(fastllm_continuous STATIC
     attention.cu runtime.cu parallel.cu tokenizer.cpp vision.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen_image/image.cpp
-    ${PROJECT_SOURCE_DIR}/third_party/json11/json11.cpp)
+    )
+if(FASTLLM_MERGE_MEDIA)
+    target_compile_definitions(fastllm_continuous PRIVATE FASTLLM_SHARED_DENSE_PREFILL)
+else()
+    target_sources(fastllm_continuous PRIVATE ${PROJECT_SOURCE_DIR}/third_party/json11/json11.cpp)
+endif()
 target_include_directories(fastllm_continuous PUBLIC
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/third_party/json11
@@ -45,7 +50,7 @@ if(UNIT_TEST)
         set(target continuous_${test})
         add_executable(${target} ${PROJECT_SOURCE_DIR}/test/hy_nomas/test_${test}.cpp)
         target_include_directories(${target} PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-        target_link_libraries(${target} PRIVATE fastllm_continuous cudart)
+        fastllm_link_model(${target} PRIVATE fastllm_continuous cudart)
         set_target_properties(${target} PROPERTIES CXX_STANDARD 17)
         add_test(NAME ${target} COMMAND ${target})
         set_tests_properties(${target} PROPERTIES LABELS cuda TIMEOUT 120 SKIP_RETURN_CODE 77)
@@ -56,7 +61,7 @@ if(UNIT_TEST)
 endif()
 
 if(BUILD_HY_NOMAS)
-    add_library(fastllm_nomas SHARED bindings.cpp model.cpp pipeline.cpp parallel_model.cpp noise.cu reference.cu)
+    add_library(fastllm_nomas ${FASTLLM_MODEL_LIBRARY_TYPE} bindings.cpp model.cpp pipeline.cpp parallel_model.cpp noise.cu reference.cu)
     target_link_libraries(fastllm_nomas PRIVATE fastllm_continuous)
     target_compile_options(fastllm_nomas PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
@@ -75,7 +80,7 @@ if(BUILD_HY_NOMAS)
         set_target_properties(nomas_world_noise PROPERTIES CXX_STANDARD 17)
         add_test(NAME nomas_world_noise COMMAND nomas_world_noise)
         add_executable(nomas_world_parallel EXCLUDE_FROM_ALL ${PROJECT_SOURCE_DIR}/test/hy_nomas/test_world_parallel.cpp)
-        target_link_libraries(nomas_world_parallel PRIVATE fastllm_nomas)
+        fastllm_link_model(nomas_world_parallel PRIVATE fastllm_nomas)
         target_include_directories(nomas_world_parallel PRIVATE ${PROJECT_SOURCE_DIR}/include)
         set_target_properties(nomas_world_parallel PROPERTIES CXX_STANDARD 17)
     endif()

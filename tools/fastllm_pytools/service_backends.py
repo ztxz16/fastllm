@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .env import env
 from .model_service import has_pika_adapter, identify_model
 from .world_residency import WEIGHT_RESIDENCY_MODES
 
@@ -343,6 +344,8 @@ class H3ImageBackend:
 
 
 def _native_library(name, builds):
+    if env.has_build_flag("merged_media"):
+        return PACKAGE / "libfastllm_tools.so"
     candidates = [PACKAGE / name, *_build_outputs(name, (*builds, "build", "build-cuda"))]
     candidates.extend(Path(root) / name for root in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
                       if root and os.path.isabs(root))

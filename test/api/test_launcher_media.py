@@ -209,6 +209,12 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(duo.executable(), str(packed))
             self.assertEqual(nomas.library(), package / lib.name)
 
+            core = package / "libfastllm_tools.so"
+            core.touch()
+            with patch.object(service_backends.env, "_build_info", {"merged_media": True}):
+                self.assertEqual(nomas.library(), core)
+                self.assertEqual(service_backends.BACKENDS["lingbot_world"].library(), core)
+
     def test_duo_tp_device_selection(self):
         from fastllm_pytools.cli import main
         mask = "7,6,5,4,3,2,1,0"

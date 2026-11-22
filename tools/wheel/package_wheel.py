@@ -74,15 +74,23 @@ def main():
                         package / 'licenses/flashinfer_sm120_ep')
         shutil.copy2(source / 'tools/fastllm_triton_server.py', package / 'fastllm_triton_server.py')
         shutil.copy2(source / 'tools/scripts/setup.py', stage / 'setup.py')
-        shutil.copy2(build / 'cuda/build_info.json', package / 'build_info.json')
+        build_info = build / 'cuda/build_info.json'
+        shutil.copy2(build_info, package / 'build_info.json')
+        merged = json.loads(build_info.read_text()).get('merged_media', False)
         shutil.copy2(build / 'cuda/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools.so')
         shutil.copy2(build / 'cpu/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools-cpu.so')
         for name in ('minimax_h3_server', 'minimax_h3_generate', 'minimax_h3_image_server', 'minimax_h3_image_generate'):
             shutil.copy2(build / 'cuda/src/models/minimax_h3' / name, package / name)
-        shutil.copy2(build / 'cuda/libfastllm_minimax_h3.so', package / 'libfastllm_minimax_h3.so')
         for name in ('qwen_image_server', 'qwen_image_generate'):
             shutil.copy2(build / 'cuda/src/models/qwen_image' / name, package / name)
-        shutil.copy2(build / 'cuda/libfastllm_qwen_image.so', package / 'libfastllm_qwen_image.so')
+        if merged:
+            shutil.copy2(build / 'cuda/src/models/duo/live/duo_live', package / 'duo_live')
+            licenses = package / 'licenses/duo'
+            shutil.copytree(source / 'tools/wheel/licenses/duo', licenses)
+            shutil.copy2(source / 'third_party/duo_solarx/LICENSE', licenses / 'SolarX-LICENSE')
+        else:
+            for name in ('libfastllm_minimax_h3.so', 'libfastllm_qwen_image.so'):
+                shutil.copy2(build / 'cuda' / name, package / name)
         demo_files = stage_demo_assets(source, package)
         numa = Path(output(args.cxx, '-print-file-name=libnuma.so').strip())
         if not numa.is_file():
@@ -112,11 +120,15 @@ def main():
             if archive.testzip() is not None:
                 raise RuntimeError('Wheel ZIP integrity check failed')
             expected = {'ftllm/libfastllm_tools.so', 'ftllm/libfastllm_tools-cpu.so',
-                        'ftllm/libnuma.so.1', 'ftllm/libfastllm_minimax_h3.so',
+                        'ftllm/libnuma.so.1',
                         'ftllm/minimax_h3_server', 'ftllm/minimax_h3_generate',
                         'ftllm/minimax_h3_image_server', 'ftllm/minimax_h3_image_generate',
-                        'ftllm/libfastllm_qwen_image.so', 'ftllm/qwen_image_server', 'ftllm/qwen_image_generate',
+                        'ftllm/qwen_image_server', 'ftllm/qwen_image_generate',
                         'ftllm/nomas_demo.html', 'ftllm/ui_plugins/studio/nomas-cafe.webp'}
+            if merged:
+                expected.add('ftllm/duo_live')
+            else:
+                expected.update(('ftllm/libfastllm_minimax_h3.so', 'ftllm/libfastllm_qwen_image.so'))
             missing = (expected | demo_files) - set(archive.namelist())
             if missing:
                 raise RuntimeError('Wheel is missing: ' + ', '.join(sorted(missing)))

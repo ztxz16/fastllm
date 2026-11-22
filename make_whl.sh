@@ -20,6 +20,9 @@ compatibility. This script does not install toolchains or change the host OS.
   --cuda-arch LIST          Semicolon-separated CMake architecture list
   --compression MODE        size, speed, balance, default, none, legacy (default: size)
   --max-glibc VERSION       Reject newer glibc dependencies (default: 2.31)
+  --all-backends            Merge all native media backends into the CUDA core.
+                            Set DUO_QWEN_ASR_SOURCE to the native ASR checkout
+                            and provide cuFFT and static x264/FFmpeg development libraries.
   --keep-ptx                Retain LLM PTX fallback (omitted by default)
   --no-strip                Keep debugging and static symbol tables
   -h, --help                Show this help
@@ -48,11 +51,13 @@ CUDA_ARCH_LIST=${CUDA_ARCH_LIST:-'60-real;70-real;75-real;80-real;86-real;89-rea
 COMPRESSION=size
 MAX_GLIBC=2.31
 DO_STRIP=1
+MERGE_MEDIA=OFF
 LLM_CUDA_PTX=OFF
 while (($#)); do
     case "$1" in
         --nightly) NIGHTLY=1; shift ;;
         --no-strip) DO_STRIP=0; shift ;;
+        --all-backends) MERGE_MEDIA=ON; shift ;;
         --keep-ptx) LLM_CUDA_PTX=ON; shift ;;
         -h|--help) usage; exit 0 ;;
         --build-dir|--output-dir|--cpu-jobs|--cuda-jobs|--nvcc-threads|--split-compile|--cuda-root|--cuda-arch|--compression|--max-glibc)
@@ -107,6 +112,14 @@ trap 'echo "Build failed at line $LINENO (exit $?). See $BUILD_DIR/build.log" >&
 export FASTLLM_NIGHTLY=$NIGHTLY
 export CUDA_HOME=$CUDA_ROOT
 export PATH="$CUDA_ROOT/bin:$PATH"
+media_options=(-DFASTLLM_MERGE_MEDIA="$MERGE_MEDIA")
+media_targets=()
+if [[ $MERGE_MEDIA == ON ]]; then
+    [[ -n ${DUO_QWEN_ASR_SOURCE:-} && -f $DUO_QWEN_ASR_SOURCE/qwen_asr_cuda.cu ]] ||
+        die 'Set DUO_QWEN_ASR_SOURCE to the native qwen-asr checkout.'
+    media_options+=("-DDUO_QWEN_ASR_SOURCE:PATH=$(cd -- "$DUO_QWEN_ASR_SOURCE" && pwd)")
+    media_targets+=(duo_live)
+fi
 START_SECONDS=$SECONDS
 printf 'Source: %s\nBuild: %s\nCompiler: %s\nCPU/CUDA jobs: %s/%s\n' "$SOURCE_DIR" "$BUILD_DIR" "$CXX" "$CPU_JOBS" "$CUDA_JOBS"
 
@@ -118,11 +131,11 @@ run "$CMAKE" --build "$BUILD_DIR/cpu" --target fastllm_tools --parallel "$CPU_JO
 printf 'CPU build: %s seconds\n' "$((SECONDS - START_SECONDS))"
 CUDA_START_SECONDS=$SECONDS
 run "$CMAKE" -S "$SOURCE_DIR" -B "$BUILD_DIR/cuda" "${COMMON[@]}" \
-    -DUSE_CUDA=ON -DBUILD_MINIMAX_H3=ON -DBUILD_QWEN_IMAGE=ON -DCUDA_ARCH="$CUDA_ARCH_LIST" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH_LIST" \
+    -DUSE_CUDA=ON "${media_options[@]}" -DBUILD_MINIMAX_H3=ON -DBUILD_QWEN_IMAGE=ON -DCUDA_ARCH="$CUDA_ARCH_LIST" -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH_LIST" \
     -DCMAKE_CUDA_HOST_COMPILER="$CXX" -DCMAKE_CUDA_COMPILER="$CUDA_COMPILER" \
     -DFASTLLM_CUDA_COMPRESSION="$COMPRESSION" -DFASTLLM_LLM_CUDA_PTX="$LLM_CUDA_PTX" \
     "-DCMAKE_CUDA_FLAGS=--threads=$NVCC_THREADS --split-compile=$NVCC_SPLIT_COMPILE"
-run "$CMAKE" --build "$BUILD_DIR/cuda" --target fastllm_tools minimax_h3_server minimax_h3_generate minimax_h3_image_server minimax_h3_image_generate qwen_image_server qwen_image_generate --parallel "$CUDA_JOBS"
+run "$CMAKE" --build "$BUILD_DIR/cuda" --target fastllm_tools minimax_h3_server minimax_h3_generate minimax_h3_image_server minimax_h3_image_generate qwen_image_server qwen_image_generate "${media_targets[@]}" --parallel "$CUDA_JOBS"
 printf 'CUDA build: %s seconds\n' "$((SECONDS - CUDA_START_SECONDS))"
 run "$PYTHON" "$SOURCE_DIR/tools/wheel/package_wheel.py" \
     --source-dir "$SOURCE_DIR" --build-dir "$BUILD_DIR" --output-dir "$OUTPUT_DIR" --max-glibc "$MAX_GLIBC" \
