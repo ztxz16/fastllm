@@ -3,10 +3,12 @@
 #endif
 // Standalone shared-library fixture (Linux): link against libfastllm_tools.so
 // with -ldl -Wl,-export-dynamic and CUDA's per-thread default stream.
-// Run eager, graph, failbegin and failinstantiate in separate processes:
+// Run eager and graph-requested modes in separate processes:
 //   test_naive_n05_tp_graph MODE OUTPUT.bin [legacy|paged]
-// All four outputs must match within each cache layout. Legacy tests allocation
-// ownership transfer; paged tests pool lifetime and request-owned page references.
+// This small head/window shape is outside startup graph admission: both modes
+// must match and never capture during requests. Legacy tests allocation ownership
+// transfer; paged tests pool lifetime and request-owned page references. Supported
+// graph replay and capture failures are covered by naive_n05_serving_* tests.
 #include "models/naive_n05_flash.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cmath>
@@ -16,7 +18,6 @@
 #include <fstream>
 #include <atomic>
 #include <dlfcn.h>
-static bool failBegin = false, failInstantiate = false;
 static std::atomic<int> captures{0};
 static std::atomic<size_t> downloadBytes{0};
 extern "C" void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t bytes) {
@@ -24,22 +25,8 @@ extern "C" void FastllmCudaCopyFromDeviceToHost(void *dst, void *src, size_t byt
     static auto fn = (void (*)(void *, void *, size_t))dlsym(RTLD_NEXT, "FastllmCudaCopyFromDeviceToHost");
     fn(dst, src, bytes);
 }
-extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
-    int device = 0;
-    cudaGetDevice(&device);
-    if (failInstantiate && device == 3) {
-        *exec = nullptr;
-        return false;
-    }
-    static auto fn = (bool (*)(void *, void **))dlsym(RTLD_NEXT, "FastllmCudaGraphInstantiate");
-    return fn(graph, exec);
-}
 extern "C" bool FastllmCudaGraphBeginCapture() {
     ++captures;
-    int device = 0;
-    cudaGetDevice(&device);
-    if (failBegin && device == 3)
-        return false;
     static auto fn = (bool (*)())dlsym(RTLD_NEXT, "FastllmCudaGraphBeginCapture");
     return fn();
 }
@@ -151,6 +138,7 @@ class Fixture : public NaiveN05FlashModel {
         // WarmUp enables the paged pool. The legacy fixture intentionally uses
         // direct Forward initialization to keep exercising standalone KV storage.
         if (paged) WarmUp();
+        const int startupCaptures = captures.load();
         std::ofstream out(path, std::ios::binary);
         for (int prompt : {3, 125, 254, 510, 2046, 2049}) {
             std::vector<std::pair<Data, Data>> kv;
@@ -175,8 +163,8 @@ class Fixture : public NaiveN05FlashModel {
                 int delta = launches.load() - before;
                 std::cout << "prompt=" << prompt << " step=" << step << " graph_launches=" << delta
                           << std::endl;
-                if (graphs && step == 6 && delta != ((failBegin || failInstantiate) ? 0 : 8))
-                    throw std::runtime_error("graph replay not reached");
+                if (delta || captures.load() != startupCaptures)
+                    throw std::runtime_error("unprepared shape captured or replayed during a request");
                 if (kv[0].first.dims[1] != past || kv[1].first.dims[1] != std::min(past, 7))
                     throw std::runtime_error("cache metadata mismatch");
             }
@@ -186,6 +174,8 @@ class Fixture : public NaiveN05FlashModel {
             RunRequests(out, graphs, paged);
         }
         RunSelections(out);
+        if (captures.load() != startupCaptures || launches.load() != 0)
+            throw std::runtime_error("request or sampling mode change captured an unprepared graph");
     }
     void RunSelections(std::ofstream &out) {
         eos_token_id = 17; eos_token_ids = {17, 23};
@@ -213,17 +203,13 @@ class Fixture : public NaiveN05FlashModel {
                     if (modes[step] == 7) { cfg.top_k = 4; cfg.top_p = .8f; cfg.temperature = .9f; }
                     LastTokensManager history(1, 64); history.units[0].Push(17); history.units[0].Push(17); history.units[0].Push(23);
                     std::vector<float> logits;
-                    int before = launches.load(); downloadBytes = 0;
+                    downloadBytes = 0;
                     srand(2026 + step);
                     int token = Forward(input, Data(), pos, kv, cfg, history, &logits);
                     if (reference) expected.push_back(token);
                     else {
                         if (token != expected[step]) throw std::runtime_error("greedy/sampling fallback token mismatch");
                         if (cfg.output_logits != !logits.empty()) throw std::runtime_error("output_logits contract changed");
-                        if (modes[step] == 0 && launches.load() - before == 8 && downloadBytes.load() != 64)
-                            throw std::runtime_error("greedy graph still downloads full vocabulary");
-                        if ((modes[step] == 2 || modes[step] == 7) && launches.load() - before == 8 && downloadBytes.load() != 256)
-                            throw std::runtime_error("sampling graph still downloads full vocabulary");
                         if (modes[step] != 0 && modes[step] != 2 && modes[step] != 7 && downloadBytes.load() < 256 * sizeof(float))
                             throw std::runtime_error("sampler did not retain full logits");
                         out.write((const char *)&token, sizeof(token));
@@ -281,7 +267,6 @@ class Fixture : public NaiveN05FlashModel {
                                 throw std::runtime_error("KV ownership or logical length was not reset");
                         }
             }
-            const bool expectReplay = restored && !failBegin && !failInstantiate;
             int beforeCaptures = captures.load(), past = 0;
             for (int step = 0; execute && step < 7; ++step) {
                 int n = step ? 1 : prompt;
@@ -298,8 +283,8 @@ class Fixture : public NaiveN05FlashModel {
                 Forward(input, Data(), pos, kv, context->generationConfig, LastTokensManager(), &logits);
                 out.write((const char *)logits.data(), logits.size() * sizeof(float));
                 past += n;
-                if (step == 1 && expectReplay && launches.load() - before != 8)
-                    throw std::runtime_error("second request did not replay on first decode");
+                if (launches.load() != before)
+                    throw std::runtime_error("unprepared request unexpectedly replayed a graph");
                 if (kv[0].first.dims[1] != past || kv[1].first.dims[1] != std::min(past, 7))
                     throw std::runtime_error("reused cache metadata mismatch");
                 for (const auto &pool : pools) {
@@ -316,12 +301,9 @@ class Fixture : public NaiveN05FlashModel {
                     if (pool.manager->cudaData != pool.storage)
                         throw std::runtime_error("request replaced model-owned KV pool storage");
                 }
-                if (paged && graphs && step == 6 &&
-                    launches.load() - before != ((failBegin || failInstantiate) ? 0 : 8))
-                    throw std::runtime_error("paged request did not reach graph replay or safe fallback");
             }
-            if (execute && expectReplay && captures.load() != beforeCaptures)
-                throw std::runtime_error("reused request unexpectedly recaptured");
+            if (captures.load() != beforeCaptures)
+                throw std::runtime_error("request unexpectedly captured a graph");
             previous.clear();
             for (auto &layer : kv)
                 for (Data *root : {&layer.first, &layer.second})
@@ -357,9 +339,9 @@ int main(int argc, char **argv) {
             return 2;
         const std::string cacheMode = argc == 4 ? argv[3] : "paged";
         if (cacheMode != "legacy" && cacheMode != "paged") return 2;
-        bool graph = std::string(argv[1]) != "eager";
-        failBegin = std::string(argv[1]) == "failbegin";
-        failInstantiate = std::string(argv[1]) == "failinstantiate";
+        const std::string mode = argv[1];
+        if (mode != "eager" && mode != "graph") return 2;
+        const bool graph = mode == "graph";
         SetCudaGraph(graph);
         SetCudaEmbedding(true);
         SetThreads(4);

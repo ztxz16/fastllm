@@ -106,9 +106,8 @@ void NaiveN05FlashModel::OnResponseContextCreated(ResponseContext *context) {
     }
     if (!context->pastKeyValues.empty()) {
         std::lock_guard<std::mutex> guard(tpRequestMutex);
-        const Data *key = &context->pastKeyValues.front().first;
-        tpRequestIds[key] = ++tpNextRequestId;
-        tpSamplingRequestIds[key] = tpNextRequestId;
+        const auto *key = &context->pastKeyValues.front().first;
+        tpRequestIds[key] = tpSamplingRequestIds[key] = ++tpNextRequestId;
     }
     std::lock_guard<std::mutex> guard(historyMutex);
     // Register ownership without touching CUDA. Batched prefill initializes
@@ -156,6 +155,7 @@ void NaiveN05FlashModel::OnResponseContextRemoved(ResponseContext *context) {
         return;
     }
     if (draft != draftContexts.end()) {
+        JoinDraftLookahead(draft->second.get());
         const auto &s = *draft->second;
         if (verbose && s.rounds)
             std::cout << "[Naive DSpark] rounds=" << s.rounds << " proposed=" << s.proposed

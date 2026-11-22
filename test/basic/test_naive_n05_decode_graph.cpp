@@ -729,6 +729,7 @@ static void TestRouterBatch(int batch, int pattern, int experts = 256) {
         Require(FastllmCudaNaiveRouterSigmoid(input, weight, actual), "batch router unsupported");
         Require(FastllmCudaSelectExpert(actual, &bias, indices, scores, 8, true, 1.7f), "batch experts unsupported");
     });
+    double maxRouterL2 = 0; float maxRouterAbsolute = 0;
     for (int replay = 0; replay < 2; ++replay) {
         if (replay) Cuda(cudaMemset(input.cudaData, 0, input.GetBytes()));
         graph.Run();
@@ -738,12 +739,30 @@ static void TestRouterBatch(int batch, int pattern, int experts = 256) {
             result.Resize({1, 1, experts}); result.FakeFrom(expected, (size_t)b * experts * sizeof(float));
             Require(FastllmCudaNaiveRouterSigmoid(row, weight, result), "reference router unsupported");
         }
-        Require(Read<float>(actual) == Read<float>(expected), "batch router probabilities changed");
+        const bool tiled = batch > 16 && FastllmCudaRuntimeArch() == 103;
+        auto close = [&](const Data &a, const Data &b, const char *what) {
+            auto x=Read<float>(const_cast<Data&>(a)), y=Read<float>(const_cast<Data&>(b));
+            if (!tiled) { Require(x==y,what); return; }
+            double se=0,ss=0; float maximum=0;
+            for(size_t i=0;i<x.size();++i) {
+                Require(std::isfinite(x[i]) && std::abs(x[i]-y[i])<1e-5f,what);
+                double e=double(x[i])-y[i]; se+=e*e; ss+=double(y[i])*y[i];
+                maximum=std::max(maximum,float(std::abs(e)));
+            }
+            const double relative = std::sqrt(se/std::max(ss,1e-30));
+            maxRouterL2=std::max(maxRouterL2,relative);
+            maxRouterAbsolute=std::max(maxRouterAbsolute,maximum);
+            Require(relative<1e-6,what);
+        };
+        close(actual,expected,"batch router probability error");
         Require(FastllmCudaSelectExpert(expected, &bias, referenceIndices, referenceScores, 8, true, 1.7f), "reference experts unsupported");
         Require(Read<int>(indices) == Read<int>(referenceIndices), "batch router expert order changed");
-        Require(Read<float>(scores) == Read<float>(referenceScores), "batch router expert scores changed");
+        close(scores,referenceScores,"batch router expert score error");
         ++checks;
     }
+    if(batch>16 && FastllmCudaRuntimeArch()==103)
+        printf("ROUTER rows=%d pattern=%d max_absolute=%.9g relative_l2=%.9g\n",
+            batch,pattern,maxRouterAbsolute,maxRouterL2);
     FastllmCudaSetLinearExactBatchThreshold(previous);
 }
 
@@ -837,12 +856,22 @@ static void TestIndexerKeyNorm(int rows) {
     Require(Read<uint16_t>(input) == before, "unsupported Indexer norm changed input");
 }
 
-int main() {
+static void TestRouters() {
+    for (int batch : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16, 17, 23, 24, 31, 32, 33, 48, 64, 65, 128})
+        for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
+}
+
+int main(int argc, char **argv) {
     try {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        if (argc == 2 && std::strcmp(argv[1], "--router-batch") == 0) {
+            TestRouters();
+            std::puts("ROUTER BATCH PASS");
+            return 0;
+        }
         for (int requests : {2, 70}) for (bool fp8 : {false, true}) TestBatchVerifyIndexer(requests, fp8);
         for (int requests : {1, 3, 128}) for (int width : {3, 4, 6, 8})
             TestBatchVerifyIndexer(requests, true, width);
@@ -863,6 +892,7 @@ int main() {
             for (int pattern = 0; pattern < 3; ++pattern) TestRouterBatch(batch, pattern);
         TestRouterBatch(33, 2, 255);
         TestVerifyRouter();
+        TestRouters();
         for (int batch : {1, 2, 3, 4, 17})
             for (int heads : {4, 8, 16})
                 TestSwaBatch(batch, heads, heads == 16 ? 2 : 1);

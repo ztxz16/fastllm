@@ -1044,6 +1044,8 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         NAIVERT_EXPERT_DOWN_W8A8=1
         NAIVERT_DSA_INDEX_HEADS=16
         NAIVERT_MLA_ROWS_ENABLE_PHASE_TIMERS=0)
+    set_property(SOURCE src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_FLEX_SM103)
     set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
     add_library(fastllm_naive_dsa_fused OBJECT src/devices/cuda/models/naive-n05-dsa-fused.cu
         src/devices/cuda/models/naive-n05-dsa-layer.cu)
@@ -1055,7 +1057,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_options(fastllm_naive_dsa_fused PRIVATE
         "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
         "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
-    set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
+    set_property(SOURCE src/models/naive_n05_flash.cpp src/devices/multicuda/fastllm-custom-allreduce.cu
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DSA_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_dsa_fused>)
     add_library(fastllm_draft_fused OBJECT src/devices/cuda/models/naive-n05-draft-fused.cu)
@@ -1071,6 +1073,8 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_definitions(fastllm_draft_fused PRIVATE
         NAIVERT_SM_COUNT=148 NAIVERT_TP_RANKS=8 NAIVERT_HIDDEN=4096
         NAIVERT_VOCAB_SHARD=19072 NAIVERT_NORM_EPS=1e-05)
+    set_property(SOURCE src/models/naive_n05_draft.cpp src/models/naive_n05_tp.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DRAFT_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_draft_fused>)
     add_library(fastllm_shared_flex_sm103 OBJECT
         src/devices/cuda/moe/fastllm-shared-flex-ep.cu
@@ -1256,6 +1260,10 @@ if (UNIT_TEST)
     target_link_libraries(toolcall_constraint_cache_test PRIVATE fastllm)
     add_test(NAME toolcall_constraint_cache COMMAND toolcall_constraint_cache_test)
     set_tests_properties(toolcall_constraint_cache PROPERTIES TIMEOUT 30)
+    add_executable(decode_pipeline_test test/basic/test_decode_pipeline.cpp)
+    target_link_libraries(decode_pipeline_test PRIVATE fastllm)
+    add_test(NAME decode_pipeline COMMAND decode_pipeline_test)
+    set_tests_properties(decode_pipeline PROPERTIES TIMEOUT 30)
     add_executable(decode_graph_batch_test test/basic/test_decode_graph_batch.cpp)
     target_link_libraries(decode_graph_batch_test PRIVATE Threads::Threads)
     add_test(NAME decode_graph_batch COMMAND decode_graph_batch_test)
@@ -1745,10 +1753,6 @@ if (UNIT_TEST)
     target_link_libraries(naive_prefix_queue_test PRIVATE fastllm)
     fastllm_add_checked_test(naive_prefix_queue naive_prefix_queue_test "ALL_PASS" 30)
     set_tests_properties(naive_prefix_queue PROPERTIES RUN_SERIAL TRUE)
-
-    add_executable(decode_pipeline_test test/basic/test_decode_pipeline.cpp)
-    target_link_libraries(decode_pipeline_test PRIVATE fastllm)
-    fastllm_add_checked_test(decode_pipeline decode_pipeline_test "DECODE PIPELINE PASS" 30)
 
     add_executable(pending_response_tokens_test test/basic/test_pending_response_tokens.cpp)
     target_link_libraries(pending_response_tokens_test PRIVATE fastllm)
@@ -2681,6 +2685,13 @@ if (UNIT_TEST)
         add_test(NAME cuda_qwen4_attention_fusion COMMAND cuda_qwen4_attention_fusion_test)
         set_tests_properties(cuda_qwen4_attention_fusion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
+        add_executable(cuda_peer_event_test test/basic/test_cuda_peer_event.cu)
+        target_link_libraries(cuda_peer_event_test PRIVATE fastllm)
+        add_test(NAME cuda_peer_event COMMAND cuda_peer_event_test 2 0)
+        add_test(NAME cuda_peer_event_tp8 COMMAND cuda_peer_event_test 8 0)
+        add_test(NAME cuda_peer_event_offset COMMAND cuda_peer_event_test 2 1)
+        set_tests_properties(cuda_peer_event cuda_peer_event_tp8 cuda_peer_event_offset
+            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         add_executable(naive_n05_speculative_bench tools/naive_n05_speculative_bench.cpp)
         target_link_libraries(naive_n05_speculative_bench PRIVATE fastllm)
         add_executable(naive_n05_draft_test test/basic/test_naive_n05_draft.cpp)
@@ -2711,6 +2722,46 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_swa_verify COMMAND naive_n05_swa_verify_test)
         set_tests_properties(naive_n05_swa_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         if (NOT USE_ROCM)
+            if (TARGET fastllm_shared_flex_sm103)
+                add_executable(naive_n05_owner_down_test test/basic/test_cuda_naive_owner_down.cu)
+                set_target_properties(naive_n05_owner_down_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
+                target_include_directories(naive_n05_owner_down_test BEFORE PRIVATE
+                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
+                target_compile_options(naive_n05_owner_down_test PRIVATE
+                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
+                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+                target_compile_definitions(naive_n05_owner_down_test PRIVATE FM_RELAXED_MAILBOX=1)
+                target_link_libraries(naive_n05_owner_down_test PRIVATE cuda)
+                add_test(NAME naive_n05_owner_down COMMAND naive_n05_owner_down_test)
+                set_tests_properties(naive_n05_owner_down PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+                add_executable(naive_n05_block128_gate_test test/basic/test_cuda_naive_block128_gate.cu)
+                set_target_properties(naive_n05_block128_gate_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
+                target_include_directories(naive_n05_block128_gate_test BEFORE PRIVATE
+                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
+                target_compile_options(naive_n05_block128_gate_test PRIVATE
+                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
+                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+                target_compile_definitions(naive_n05_block128_gate_test PRIVATE FM_RELAXED_MAILBOX=1)
+                target_link_libraries(naive_n05_block128_gate_test PRIVATE cuda)
+                add_test(NAME naive_n05_block128_gate COMMAND naive_n05_block128_gate_test)
+                set_tests_properties(naive_n05_block128_gate PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+                add_executable(naive_n05_moe_batch_test test/basic/test_cuda_naive_moe_batch.cu)
+                set_target_properties(naive_n05_moe_batch_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
+                target_include_directories(naive_n05_moe_batch_test BEFORE PRIVATE
+                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
+                target_compile_options(naive_n05_moe_batch_test PRIVATE
+                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
+                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+                target_compile_definitions(naive_n05_moe_batch_test PRIVATE FM_RELAXED_MAILBOX=1)
+                target_link_libraries(naive_n05_moe_batch_test PRIVATE cuda Threads::Threads)
+                add_test(NAME naive_n05_moe_batch COMMAND naive_n05_moe_batch_test)
+                add_test(NAME naive_n05_moe_batch_borrowed COMMAND naive_n05_moe_batch_test borrowed)
+                add_test(NAME naive_n05_moe_batch_mixed COMMAND naive_n05_moe_batch_test mixed)
+                add_test(NAME naive_n05_moe_batch_prepared COMMAND naive_n05_moe_batch_test prepared)
+                add_test(NAME naive_n05_moe_batch_transitions COMMAND naive_n05_moe_batch_test stress)
+                set_tests_properties(naive_n05_moe_batch naive_n05_moe_batch_borrowed naive_n05_moe_batch_mixed naive_n05_moe_batch_prepared naive_n05_moe_batch_transitions
+                    PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
+            endif()
             add_executable(naive_n05_prepared_router_test test/basic/test_cuda_naive_prepared_router.cu)
             target_link_libraries(naive_n05_prepared_router_test PRIVATE fastllm)
             add_test(NAME naive_n05_prepared_router COMMAND naive_n05_prepared_router_test)
@@ -2760,48 +2811,6 @@ if (UNIT_TEST)
                 naive_n05_swa_qkv_attention_disabled naive_n05_swa_qkv_attention_core_disabled
                 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         endif()
-        if (NOT USE_ROCM)
-            if (TARGET fastllm_shared_flex_sm103)
-                add_executable(naive_n05_owner_down_test test/basic/test_cuda_naive_owner_down.cu)
-                set_target_properties(naive_n05_owner_down_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
-                target_include_directories(naive_n05_owner_down_test BEFORE PRIVATE
-                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
-                target_compile_options(naive_n05_owner_down_test PRIVATE
-                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
-                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-                target_compile_definitions(naive_n05_owner_down_test PRIVATE FM_RELAXED_MAILBOX=1)
-                target_link_libraries(naive_n05_owner_down_test PRIVATE cuda)
-                add_test(NAME naive_n05_owner_down COMMAND naive_n05_owner_down_test)
-                set_tests_properties(naive_n05_owner_down PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
-                add_executable(naive_n05_block128_gate_test test/basic/test_cuda_naive_block128_gate.cu)
-                set_target_properties(naive_n05_block128_gate_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
-                target_include_directories(naive_n05_block128_gate_test BEFORE PRIVATE
-                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
-                target_compile_options(naive_n05_block128_gate_test PRIVATE
-                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
-                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-                target_compile_definitions(naive_n05_block128_gate_test PRIVATE FM_RELAXED_MAILBOX=1)
-                target_link_libraries(naive_n05_block128_gate_test PRIVATE cuda)
-                add_test(NAME naive_n05_block128_gate COMMAND naive_n05_block128_gate_test)
-                set_tests_properties(naive_n05_block128_gate PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
-                add_executable(naive_n05_moe_batch_test test/basic/test_cuda_naive_moe_batch.cu)
-                set_target_properties(naive_n05_moe_batch_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
-                target_include_directories(naive_n05_moe_batch_test BEFORE PRIVATE
-                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
-                target_compile_options(naive_n05_moe_batch_test PRIVATE
-                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
-                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-                target_compile_definitions(naive_n05_moe_batch_test PRIVATE FM_RELAXED_MAILBOX=1)
-                target_link_libraries(naive_n05_moe_batch_test PRIVATE cuda Threads::Threads)
-                add_test(NAME naive_n05_moe_batch COMMAND naive_n05_moe_batch_test)
-                add_test(NAME naive_n05_moe_batch_borrowed COMMAND naive_n05_moe_batch_test borrowed)
-                add_test(NAME naive_n05_moe_batch_mixed COMMAND naive_n05_moe_batch_test mixed)
-                add_test(NAME naive_n05_moe_batch_prepared COMMAND naive_n05_moe_batch_test prepared)
-                add_test(NAME naive_n05_moe_batch_transitions COMMAND naive_n05_moe_batch_test stress)
-                set_tests_properties(naive_n05_moe_batch naive_n05_moe_batch_borrowed naive_n05_moe_batch_mixed naive_n05_moe_batch_prepared naive_n05_moe_batch_transitions
-                    PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
-            endif()
-        endif()
         add_executable(naive_n05_logits_test test/basic/test_naive_n05_logits.cpp)
         target_link_libraries(naive_n05_logits_test PRIVATE fastllm)
         target_include_directories(naive_n05_logits_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2812,7 +2821,6 @@ if (UNIT_TEST)
         target_include_directories(naive_n05_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
-
         add_executable(naive_n05_dsa_front_test test/basic/test_naive_n05_dsa_front.cpp)
         target_link_libraries(naive_n05_dsa_front_test PRIVATE fastllm)
         target_include_directories(naive_n05_dsa_front_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2883,6 +2891,14 @@ if (UNIT_TEST)
         set_tests_properties(cuda_decode_linear PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "DECODE LINEAR PASS")
 
+        add_executable(naive_moe_placement_test tests/naive_moe_placement_test.cpp)
+        target_link_libraries(naive_moe_placement_test PRIVATE fastllm_tools ${FASTLLM_TEST_CUDART})
+        target_include_directories(naive_moe_placement_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        fastllm_add_checked_test(naive_moe_placement_host naive_moe_placement_test "PLACEMENT_PASS serial-cuda" 120)
+        if (TARGET fastllm_shared_flex_sm103)
+            fastllm_add_checked_test(naive_moe_placement_sm103_tp8 naive_moe_placement_test "PLACEMENT_PASS cache-disabled" 120 --sm103-tp8)
+            set_tests_properties(naive_moe_placement_sm103_tp8 PROPERTIES RUN_SERIAL TRUE)
+        endif()
         add_executable(naive_n05_serving_metadata_test test/basic/test_naive_n05_serving_metadata.cpp)
         target_link_libraries(naive_n05_serving_metadata_test PRIVATE fastllm_tools)
         target_include_directories(naive_n05_serving_metadata_test PRIVATE src/models ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -3025,14 +3041,13 @@ if (UNIT_TEST)
             endforeach()
 
             add_executable(naive_n05_tp_graph_test test/basic/test_naive_n05_tp_graph.cpp)
-            find_library(NAIVE_TP_GRAPH_CUDART cudart HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
             target_link_libraries(naive_n05_tp_graph_test PRIVATE
-                fastllm_tools ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
+                fastllm_tools ${FASTLLM_TEST_CUDART} ${CMAKE_DL_LIBS})
             set_target_properties(naive_n05_tp_graph_test PROPERTIES
                 ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_tp_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             target_link_libraries(naive_n05_verify_graph_test PRIVATE
-                fastllm_tools fastkv ${NAIVE_TP_GRAPH_CUDART} ${CMAKE_DL_LIBS})
+                fastllm_tools fastkv ${FASTLLM_TEST_CUDART} ${CMAKE_DL_LIBS})
             set_target_properties(naive_n05_verify_graph_test PROPERTIES ENABLE_EXPORTS ON LINKER_LANGUAGE CUDA)
             target_include_directories(naive_n05_verify_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             foreach(NAIVE_SPARSE_KV_TYPE bf16 fp8)
@@ -3333,6 +3348,18 @@ if (UNIT_TEST)
                 set_tests_properties(naive_n05_draft_tp_batch_${NAIVE_DRAFT_TP_FAILURE} PROPERTIES
                     LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
             endforeach()
+            add_test(NAME naive_n05_draft_unbound_fallback
+                COMMAND naive_n05_verify_graph_test 2 draft_batch merged 5 unbound)
+            set_tests_properties(naive_n05_draft_unbound_fallback PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            foreach(NAIVE_SPECULATIVE_MODE graph batch5 batch8 failbegin failinstantiate)
+                add_test(NAME naive_n05_speculative_serving_${NAIVE_SPECULATIVE_MODE}
+                    COMMAND naive_n05_verify_graph_test 2 speculative_serving ${NAIVE_SPECULATIVE_MODE})
+                set_tests_properties(naive_n05_speculative_serving_${NAIVE_SPECULATIVE_MODE}
+                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE
+                    PASS_REGULAR_EXPRESSION "SPECULATIVE SERVING PASS"
+                    ENVIRONMENT "FASTLLM_CUDA_SERVING_WARMUP=1;FASTLLM_DSPARK_TP=1")
+            endforeach()
             add_test(NAME naive_n05_verify_selection_graph COMMAND naive_n05_verify_graph_test 8 selection)
             set_tests_properties(naive_n05_verify_selection_graph
                 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
@@ -3389,13 +3416,6 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "PACKED PREFILL PASS")
             endforeach()
-            foreach(NAIVE_BATCH_FAILURE failbegin failinstantiate)
-                add_test(NAME naive_n05_batch_${NAIVE_BATCH_FAILURE}
-                    COMMAND naive_n05_verify_graph_test 2 batch ${NAIVE_BATCH_FAILURE})
-                set_tests_properties(naive_n05_batch_${NAIVE_BATCH_FAILURE}
-                    PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
-                    PASS_REGULAR_EXPRESSION "BATCH PASS")
-            endforeach()
             foreach(NAIVE_SERVING_RANKS 2 8)
                 foreach(NAIVE_INDEXER_KV bf16 fp8)
                     add_test(NAME naive_n05_indexer_storage_${NAIVE_SERVING_RANKS}_${NAIVE_INDEXER_KV}
@@ -3438,6 +3458,17 @@ if (UNIT_TEST)
                     PROPERTIES LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
                     PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
             endforeach()
+            foreach(NAIVE_PIPELINE_MODE serving_pipeline serving_pipeline_fallback serving_pipeline_nopeer)
+                add_test(NAME naive_n05_${NAIVE_PIPELINE_MODE} COMMAND naive_n05_verify_graph_test 2 ${NAIVE_PIPELINE_MODE})
+                set_tests_properties(naive_n05_${NAIVE_PIPELINE_MODE} PROPERTIES
+                    LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                    PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
+            endforeach()
+            add_test(NAME naive_n05_serving_selection_fallback
+                COMMAND naive_n05_verify_graph_test 2 serving_graph failselection)
+            set_tests_properties(naive_n05_serving_selection_fallback PROPERTIES
+                LABELS "cuda;multigpu" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                PASS_REGULAR_EXPRESSION "SERVING GRAPH PASS")
             add_test(NAME naive_n05_serving_invalidation
                 COMMAND naive_n05_verify_graph_test 2 serving_invalidation)
             add_test(NAME naive_n05_swa_dp_heads COMMAND naive_n05_swa_verify_test dp_heads)
@@ -3499,6 +3530,11 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_attention_dp_pipeline_8_bf16
                 PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
                 PASS_REGULAR_EXPRESSION "ATTENTION DP PIPELINE PASS")
+            add_test(NAME naive_n05_attention_dp_serving_1024
+                COMMAND naive_n05_verify_graph_test 8 attention_dp_serving_large 8)
+            set_tests_properties(naive_n05_attention_dp_serving_1024
+                PROPERTIES LABELS "cuda;naive" RUN_SERIAL TRUE TIMEOUT 600 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "ATTENTION DP SERVING PASS.*requests=1024")
             add_test(NAME naive_n05_attention_dp_serving_fallback
                 COMMAND naive_n05_verify_graph_test 8 attention_dp_serving 8 failinstantiate)
             set_tests_properties(naive_n05_attention_dp_serving_fallback
@@ -3647,6 +3683,9 @@ if (UNIT_TEST)
         add_executable(naive_n05_decode_graph_test test/basic/test_naive_n05_decode_graph.cpp)
         target_link_libraries(naive_n05_decode_graph_test PRIVATE fastllm)
         target_include_directories(naive_n05_decode_graph_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_router_batch COMMAND naive_n05_decode_graph_test --router-batch)
+        set_tests_properties(naive_n05_router_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "ROUTER BATCH PASS")
         add_test(NAME naive_n05_decode_graph COMMAND naive_n05_decode_graph_test)
         set_tests_properties(naive_n05_decode_graph PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "DECODE GRAPH PASS")
@@ -3795,13 +3834,6 @@ if (UNIT_TEST)
             SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "PASS generic norm linear")
 
-        add_executable(cuda_peer_event_test test/basic/test_cuda_peer_event.cu)
-        target_link_libraries(cuda_peer_event_test PRIVATE fastllm)
-        add_test(NAME cuda_peer_event COMMAND cuda_peer_event_test 2 0)
-        add_test(NAME cuda_peer_event_tp8 COMMAND cuda_peer_event_test 8 0)
-        add_test(NAME cuda_peer_event_offset COMMAND cuda_peer_event_test 2 1)
-        set_tests_properties(cuda_peer_event cuda_peer_event_tp8 cuda_peer_event_offset
-            PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
 
         add_executable(cuda_low_latency_blocks_test test/basic/test_cuda_low_latency_blocks.cu
             src/devices/cuda/low_latency/dense.cu)

@@ -596,6 +596,9 @@ namespace fastllm {
             model->model_struct == "qwen3_5" &&
             weightName.find(".mlp.experts.") != std::string::npos &&
             data.dataType == DataType::INT4_GROUP;
+        if (const auto *naive = dynamic_cast<const NaiveN05FlashModel *>(model))
+            data.cudaRepackSource = naive->UsesPackedMoeSource() &&
+                weightName.find(".mlp.experts.") != std::string::npos;
         if ((model->model_type == "deepseek_v4" ||
              model->model_type == "deepseek_v41") && routedExpert >= 0 &&
             !deepSeekV4TensorParallelExperts) {
