@@ -1,37 +1,22 @@
 // The embedded draft uses the Inkling2 rnn_hidden architecture. The target
 // feature convention and Markov recurrence follow the official Inkling2 model.
+// Request-owned handles borrow pages from the same manager as target attention.
 struct DraftKV {
-    Buffer<half> key, value;
-    int first = 0, capacity = 0;
-    void reserve(int begin, int past, int end, int heads, int dim, int window, int block) {
-        if (key.p && begin >= first && end - first <= capacity)
-            return;
-        int kept = std::max(0, past - begin);
-        int grown = std::max(32, capacity * 2);
-        if (window)
-            grown = std::min(grown, 2 * window + block);
-        int next = std::max(end - begin, grown);
-        Buffer<half> k(size_t(heads) * next * dim), v(size_t(heads) * next * dim);
-        if (kept) {
-            if (!key.p || begin < first || past - first > capacity)
-                throw std::runtime_error("Missing Inkling draft KV prefix");
-            for (auto side : {std::make_pair(k.p, key.p), std::make_pair(v.p, value.p)})
-                check(cudaMemcpy2DAsync(side.first, size_t(next) * dim * sizeof(half),
-                                        side.second + size_t(begin - first) * dim,
-                                        size_t(capacity) * dim * sizeof(half), size_t(kept) * dim * sizeof(half), heads,
-                                        cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-        }
-        key = std::move(k);
-        value = std::move(v);
-        capacity = next;
-        first = begin;
-    }
+    Data key, value;
+    VisitCache cache;
 };
-
+struct DraftView {
+    PageView pages;
+    float *context;
+    int past, begin;
+};
+struct DraftInput {
+    int anchor, topK, steps;
+    float temperature, topP;
+};
 struct DraftState {
-    std::vector<DraftKV> kv;
+    std::vector<std::unique_ptr<DraftKV>> kv;
     Matrix recurrentContext;
-    Data samplerWorkspace;
     double roundMs = 0;
     std::deque<std::pair<int, int>> pending;
     int rounds = 0, proposed = 0, accepted = 0;
@@ -78,51 +63,110 @@ __global__ void draftMix(const float *const *taps, const float *alpha, float *ou
     out[size_t(row) * width + i] = v;
 }
 
-// Uploaded before replay. A cache can grow or slide without invalidating the graph.
-struct DraftGraphKV {
-    half *key, *value;
-    int past, first, capacity, begin;
-};
-
-using DraftFlashParams = flashinfer::SinglePrefillParams<half, half, half>;
-using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone, 64, 1, 2, 8, 8, 4, 1,
+template<int Warps> using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone, 16 * Warps, 1, 2, 8, 8, Warps, 1,
     flashinfer::PosEncodingMode::kNone, half, half, half, float, int,
     flashinfer::DefaultAttention<false, false, false, false>>;
 
-// The cache view is already cropped to the visible window. Every query sees
-// the complete live draft block, including positions to its right.
-__global__ __launch_bounds__(128) void draftGraphAttention(DraftFlashParams p, const DraftGraphKV *view, int *indptr) {
+struct DraftPages : PrefillPages<half, 128> {
+    int begin;
+    __device__ size_t protective_get_kv_offset(unsigned token, unsigned head, unsigned, unsigned col, int) const {
+        return (size_t(begin + (token < length ? token : 0)) << 32) | (head * 128 + col);
+    }
+};
+struct DraftFlashParams : flashinfer::BatchPrefillPagedParams<half, half, half, int> {
+    DraftPages paged_kv;
+    const DraftView *views;
+    int block, maxSplits;
+    __host__ __device__ unsigned get_qo_len(unsigned) const { return block; }
+    __host__ __device__ unsigned get_kv_len(unsigned) const { return paged_kv.length; }
+};
+
+__device__ inline int draftChunk(int length, int splits) { return max(128, (length + splits - 1) / splits); }
+
+// Each request has its own logical position, window and page table. All requests
+// share one launch, including when they span different numbers of physical pages.
+template<class Traits>
+__global__ __launch_bounds__(Traits::NUM_THREADS) void draftGraphAttention(DraftFlashParams p) {
+    int tiles = (p.block * int(p.group_size) + Traits::CTA_TILE_Q - 1) / Traits::CTA_TILE_Q;
+    int b = blockIdx.x / tiles, tile = blockIdx.x % tiles, split = blockIdx.y, zero = 0;
+    auto v = p.views[b];
+    int length = v.past - v.begin + p.block, chunk = draftChunk(length, p.maxSplits);
+    if (split * chunk >= length) return;
+    p.q += size_t(b) * p.block * p.q_stride_n;
+    size_t offset = size_t(b) * p.block * p.maxSplits * p.num_qo_heads;
+    p.o += offset * 128;
+    p.lse += offset;
+    p.paged_kv.length = length;
+    p.paged_kv.begin = v.begin;
+    int keys[] = {0, length};
+    p.paged_kv.indptr = keys;
+    p.paged_kv.k_data = {v.pages, nullptr, 0, v.past, int(gridDim.z) * 128, false};
+    p.paged_kv.v_data = {v.pages, nullptr, 0, v.past, int(gridDim.z) * 128, true};
+    p.request_indices = p.q_indptr = p.o_indptr = &zero;
+    p.qo_tile_indices = &tile;
+    p.kv_tile_indices = &split;
+    p.kv_chunk_size_ptr = &chunk;
     extern __shared__ uint8_t smem[];
-    const auto v = *view;
-    p.kv_len = v.past - v.begin + p.qo_len;
-    const int splits = min(int(gridDim.y), 1 + (int(p.kv_len) - 1) / 128);
-    if (!blockIdx.x && !blockIdx.y && !blockIdx.z && threadIdx.x == 0 && threadIdx.z == 0)
-        for (unsigned i = threadIdx.y; i <= p.qo_len; i += blockDim.y) indptr[i] = i * splits;
-    if (int(blockIdx.y) >= splits) return;
-    p.k = v.key + size_t(v.begin - v.first) * 128;
-    p.v = v.value + size_t(v.begin - v.first) * 128;
-    p.k_stride_h = p.v_stride_h = v.capacity * 128;
-    p.partition_kv = splits > 1;
-    auto &storage = *reinterpret_cast<DraftFlashTraits::SharedStorageSingle *>(smem);
-    flashinfer::SinglePrefillWithKVCacheDevice<DraftFlashTraits>(p, storage, threadIdx, blockIdx.x,
-        blockIdx.y, blockIdx.z, splits, gridDim.z);
+    auto &storage = *reinterpret_cast<typename Traits::SharedStoragePaged *>(smem);
+    // Keep the logical partitions and FP16 partials independent of the launch grid.
+    for (; split * chunk < length; split += gridDim.y) {
+        flashinfer::BatchPrefillWithPagedKVCacheDevice<Traits>(p, storage, threadIdx, 0, blockIdx.z, gridDim.z);
+        if ((split + gridDim.y) * chunk < length) __syncthreads();
+    }
 }
 
-// Transpose to [head, position, channel] while applying per-head RMSNorm
-// and split-half RoPE. A null norm denotes V, which only needs the transpose.
-template <class T, int Side = -1>
-__global__ void draftHead(const T *src, half *dst, const float *norm, int heads, int dim, int past, int first,
-                          int capacity, float eps, float theta, const DraftGraphKV *view = nullptr) {
-    if constexpr (Side >= 0) {
-        past = view->past;
-        if constexpr (Side == 0) first = past;
-        else {
-            first = view->first;
-            capacity = view->capacity;
-            dst = Side == 1 ? view->key : view->value;
-        }
+// Portable paged fallback for devices without the tensor-core prefill kernel.
+__global__ void draftAttentionPartial(DraftFlashParams p, const DraftView *views, int kvHeads) {
+    int row = blockIdx.x, b = row / p.block, head = blockIdx.z, col = threadIdx.x;
+    auto v = views[b];
+    int len = v.past - v.begin + p.block, chunk = draftChunk(len, gridDim.y);
+    int first = blockIdx.y * chunk;
+    if (first >= len) return;
+    const int stride = kvHeads * 128, kv = head / int(p.group_size);
+    float q = float(p.q[(size_t(row) * p.num_qo_heads + head) * 128 + col]);
+    __shared__ float temp[128];
+    float m = -INFINITY, sum = 0.f, out = 0.f;
+    for (int i = first; i < min(len, first + chunk); ++i) {
+        auto token = v.begin + i;
+        float key = float(static_cast<half *>(v.pages.key)[v.pages.offset(token, false, stride) + kv * 128 + col]);
+        float score = blockSum(q * key, temp) * p.sm_scale, next = fmaxf(score, m);
+        float a = expf(m - next), w = expf(score - next);
+        out = out * a +
+              w * float(static_cast<half *>(v.pages.value)[v.pages.offset(token, true, stride) + kv * 128 + col]);
+        sum = sum * a + w;
+        m = next;
     }
-    int row = blockIdx.x, head = blockIdx.y, col = threadIdx.x;
+    int splits = (len + chunk - 1) / chunk;
+    size_t idx = ((size_t(b) * gridDim.y * p.block + (row % p.block) * splits + blockIdx.y) * p.num_qo_heads + head);
+    p.o[idx * 128 + col] = half(out / sum);
+    if (!col) p.lse[idx] = (m + logf(sum)) * flashinfer::math::log2e;
+}
+
+template <class T>
+__global__ void mergeDraftAttention(DraftFlashParams p, const DraftView *views, T *out, int maxSplits) {
+    int row = blockIdx.x, b = row / p.block, head = blockIdx.y, col = threadIdx.x;
+    int len = views[b].past - views[b].begin + p.block;
+    int splits = (len - 1) / draftChunk(len, maxSplits) + 1;
+    size_t base = (size_t(b) * p.block * maxSplits + (row % p.block) * splits) * p.num_qo_heads + head;
+    float maximum = -INFINITY, total = 0.f, value = 0.f;
+    for (int s = 0; s < splits; ++s) maximum = fmaxf(maximum, p.lse[base + s * p.num_qo_heads]);
+    for (int s = 0; s < splits; ++s) {
+        auto i = base + s * p.num_qo_heads;
+        float w = exp2f(p.lse[i] - maximum);
+        total += w;
+        value += w * float(p.o[i * 128 + col]);
+    }
+    out[(size_t(row) * p.num_qo_heads + head) * 128 + col] = T(float(half(value / total)));
+}
+
+// Side 0 produces token-major queries. Sides 1 and 2 append into request KV.
+template <class T, int Side>
+__global__ void draftHead(const T *src, half *query, const float *norm, int heads, int dim, float eps, float theta,
+                          int block, DraftView single, const DraftView *views, const int *accepted = nullptr) {
+    int row = blockIdx.x, b = row / block, pos = row % block, head = blockIdx.y, col = threadIdx.x;
+    if (accepted && pos > accepted[b]) return;
+    auto view = views ? views[b] : single;
+    int token = view.past + pos;
     const T *in = src + (size_t(row) * heads + head) * dim;
     float x = float(in[col]);
     if (norm) {
@@ -132,14 +176,38 @@ __global__ void draftHead(const T *src, half *dst, const float *norm, int heads,
         float y = float(T(float(in[paired]) * inv * norm[paired]));
         x = float(T(x * inv * norm[col]));
         float si, co;
-        sincosf((past + row) * powf(theta, -2.f * (col % (dim / 2)) / dim), &si, &co);
+        sincosf(token * powf(theta, -2.f * (col % (dim / 2)) / dim), &si, &co);
         x = float(T(x * co + (col < dim / 2 ? -y : y) * si));
     }
-    dst[(size_t(head) * capacity + past + row - first) * dim + col] = half(x);
+    if constexpr (Side == 0)
+        query[(size_t(row) * heads + head) * dim + col] = half(x);
+    else {
+        auto *dst = static_cast<half *>(Side == 1 ? view.pages.key : view.pages.value);
+        dst[view.pages.offset(token, Side == 2, heads * dim) + head * dim + col] = half(x);
+    }
 }
-template <class T> __global__ void draftUnpack(const half *in, T *out, int rows, int heads, int dim) {
-    int row = blockIdx.x, head = blockIdx.y, col = threadIdx.x;
-    out[(size_t(row) * heads + head) * dim + col] = T(float(in[(size_t(head) * rows + row) * dim + col]));
+
+template <class T> __global__ void draftBlockInput(const T *anchor, const float *mask, T *out, int block, int h) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    if (i < h) out[size_t(row) * h + i] = row % block ? T(mask[i]) : anchor[size_t(row / block) * h + i];
+}
+template <class T>
+__global__ void draftMarkovInput(T *state, const T *embed, const int *tokens, const T *hidden, const DraftView *views,
+                                 int step, int steps, int rank, int h) {
+    int b = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    state += size_t(b) * (2 * rank + 2 * h);
+    if (col < rank) {
+        if (!step) state[col] = T(0.f);
+        state[rank + col] = embed[size_t(tokens[b * (steps + 1) + step]) * rank + col];
+    }
+    if (col < h) {
+        state[2 * rank + col] = hidden[(size_t(b) * steps + step) * h + col];
+        if (!step) state[2 * rank + h + col] = T(views[b].context[col]);
+    }
+}
+__global__ void storeDraftContext(const float *source, const DraftView *views, const int *accepted, int chain, int h) {
+    int b = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < h) views[b].context[col] = source[(size_t(b) * chain + accepted[b]) * h + col];
 }
 template <class T> __global__ void draftAdd(T *dest, const T *add, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -153,28 +221,20 @@ template <class T> __global__ void draftSwiGLU(T *gate, const T *up, int size) {
         gate[i] = T(v / (1.f + expf(-v)) * float(up[i]));
     }
 }
-template <class T> __global__ void draftTokenInput(T *input, const T *embedding, const int *token, int rank) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col < rank)
-        input[rank + col] = embedding[size_t(*token) * rank + col];
-}
-template <class T> __global__ void draftRecur(const float *raw, const float *bias, T *state, T *latent, int rank) {
+template <class T>
+__global__ void draftRecur(const float *raw, const float *bias, T *state, T *latent, int rank, int pitch) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rank)
         return;
+    raw += size_t(blockIdx.y) * 3 * rank;
+    state += size_t(blockIdx.y) * pitch;
+    latent += size_t(blockIdx.y) * rank;
     float g = float(T(raw[i] + bias[i])), c = float(T(raw[i + rank] + bias[i + rank]));
     float o = float(T(raw[i + 2 * rank] + bias[i + 2 * rank]));
     g = float(T(1.f / (1.f + expf(-g))));
     state[i] = T(float(T(g * float(state[i]))) + float(T(float(T(1.f - g)) * float(T(tanhf(c))))));
     latent[i] = T(tanhf(o));
 }
-template <class T>
-__global__ void draftScores(const T *base, const T *adjust, const T *bias, float *out, int vocab, float cap) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < vocab)
-        out[i] = float(T(cap * tanhf(float(T(float(base[i]) + float(T(float(adjust[i]) + float(bias[i]))))) / cap)));
-}
-
 // One chronological panel per (layer visit, request, convolution) holds the old
 // history followed by every candidate input. Accepting k inputs advances the
 // history by k rows, including across physical KV page and window boundaries.
@@ -205,5 +265,25 @@ __global__ void verifyHistories(const DecodeVisit *source, DecodeVisit *rows, fl
                 rows[size_t(visit) * chain + r] = d;
             }
         }
+    }
+}
+
+__global__ void stageDraftInputs(const DraftInput *inputs, float *anchors, int *tokens, float *t, int *k, float *p,
+                                 int *live, int batch, int chain, int vocab) {
+    int b = blockIdx.x;
+    const auto x = inputs[b];
+    if (!threadIdx.x) {
+        live[b] = x.steps;
+        anchors[b] = float(x.anchor);
+        tokens[b * chain] = x.anchor;
+        t[b] = x.temperature;
+        k[b] = min(vocab, x.topK);
+        p[b] = x.topP;
+    }
+    for (int r = threadIdx.x; r < chain; r += blockDim.x) {
+        int i = batch + b * chain + r;
+        t[i] = x.temperature;
+        k[i] = min(vocab, x.topK);
+        p[i] = x.topP;
     }
 }

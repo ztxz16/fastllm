@@ -22,6 +22,26 @@ Inkling2Model::Inkling2Model() {
     SetKVCacheDataType(FLOAT16);
 }
 Inkling2Model::~Inkling2Model() { ShutdownRuntime(); }
+long long Inkling2Model::GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const {
+    const auto &d = cfg.draft;
+    if (!d.steps || deviceId != placement.gpu) return 0;
+    const auto layers = maxBatch > 0 ? std::count(d.local.begin(), d.local.end(), false) : d.layers;
+    return layers * 4LL * d.kvHeads * d.dim; // Separate FP16 K and V pools.
+}
+
+long long Inkling2Model::GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const {
+    const auto &d = cfg.draft;
+    if (!d.steps || deviceId != placement.gpu) return 0;
+    const int page = GetPageLen();
+    const auto bounded = maxBatch > 0 ? std::count(d.local.begin(), d.local.end(), true) : 0;
+    // Sliding histories can start inside a page. Global histories can cross
+    // a page boundary while a speculative suffix is reserved for verification.
+    const long long windowPages = (int64_t(d.window) + d.block + page - 2) / page + 1;
+    const long long extraPages = (int64_t(d.block) - 1 + page - 1) / page;
+    return (bounded * windowPages + (d.layers - bounded) * extraPages) * page * std::max(1, batch) * 4LL * d.kvHeads *
+           d.dim;
+}
+
 void Inkling2Model::SetKVCacheDataType(DataType type) {
     if (type != FLOAT16 && type != BFLOAT16 && type != FLOAT32)
         throw std::runtime_error("Inkling KV cache supports float16, bfloat16 and float32");

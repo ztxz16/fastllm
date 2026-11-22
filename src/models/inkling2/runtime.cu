@@ -39,6 +39,7 @@ namespace inkling2 {
 thread_local DecodeGraphScratch *DecodeGraphScratch::active = nullptr;
 
 std::shared_ptr<void> DecodeGraphScratch::Acquire(size_t bytes) {
+    auto &blocks = *backing;
     if (sealed) {
         if (cursor >= order.size()) throw std::runtime_error("Unexpected Inkling decode temporary");
         const auto &block = blocks[order[cursor++]];
@@ -1014,78 +1015,6 @@ class Decoder final : public Runtime {
     #include "draft-graph.cuh"
     #include "verify-graph.cuh"
 
-    template<class T>
-    std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anchors, int steps,
-                                 const std::vector<GenerationConfig> &sampling) {
-        const auto start = model.verbose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const int count = batch.size(), width = steps + 1, rows = count * width;
-        DraftGraph *draftPlan = count == 1 ? replayDraft<T>(*batch[0].request, int(anchors[batch[0].offset]),
-                                                          sampling[0]) : nullptr;
-        Matrix proposals = draftPlan ? draftPlan->probs.slice(0, steps) : Matrix(count * steps, c.vocab);
-        Matrix logits;
-        std::vector<float> input(draftPlan ? 0 : rows), temperature(rows), topP(rows);
-        std::vector<int> topK(rows), tokens(draftPlan ? 0 : count * steps), emitted(rows), accepted(count), result(count);
-        std::vector<Verification> commits(count);
-        std::vector<Segment> segments;
-        for (int b = 0; b < count; ++b) {
-            const int offset = b * width;
-            const int anchor = int(anchors[batch[b].offset]);
-            const auto &cfg = sampling[b];
-            if (!draftPlan) {
-                auto &req = *batch[b].request;
-                auto probs = proposals.slice(b * steps, steps);
-                Buffer<int> ids(width);
-                check(cudaMemcpyAsync(ids.p, &anchor, sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
-                propose<T>(req, steps, cfg, probs, ids.p, req.draft->recurrentContext, req.draft->samplerWorkspace, nullptr);
-                int *chain = tokens.data() + b * steps;
-                check(cudaMemcpy(chain, ids.p + 1, steps * sizeof(int), cudaMemcpyDeviceToHost));
-                input[offset] = float(anchor);
-                std::copy_n(chain, steps, input.begin() + offset + 1);
-            }
-            std::fill_n(temperature.begin() + offset, width, cfg.temperature);
-            std::fill_n(topP.begin() + offset, width, cfg.top_p);
-            std::fill_n(topK.begin() + offset, width, cfg.top_k);
-            segments.push_back({batch[b].request, offset, width, nullptr, &commits[b]});
-        }
-        std::vector<Matrix> features;
-        float *deviceIds = draftPlan ? draftPlan->ids.p : nullptr;
-        auto *plan = replayVerify(segments, input, logits, features, deviceIds);
-        if (!plan) {
-            Buffer<float> ids(deviceIds ? 0 : rows);
-            if (!deviceIds) check(cudaMemcpyAsync(ids.p, input.data(), rows * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
-            logits = Matrix(rows, c.vocab);
-            target(deviceIds ? deviceIds : ids.p, rows, segments, logits, &features);
-        }
-        auto reject = draftPlan ? FastllmCudaMtpRejectionSamplingTopKFirstDeviceIds : FastllmCudaMtpRejectionSamplingTopKFirst;
-        if (!reject(logits.p, proposals.p, temperature.data(), topK.data(), topP.data(),
-                    draftPlan ? draftPlan->tokens.p + 1 : tokens.data(), emitted.data(), accepted.data(), count, steps, c.vocab))
-            throw std::runtime_error("Inkling DSpark rejection sampling failed");
-
-        for (int prefix : accepted)
-            if (prefix < 0 || prefix > steps) throw std::runtime_error("Invalid Inkling DSpark acceptance length");
-        if (plan) finishVerify(*plan, segments, accepted);
-        for (int b = 0; b < count; ++b) {
-            const int prefix = accepted[b] + 1, offset = b * width;
-            auto &req = *batch[b].request;
-            auto &state = *req.draft;
-            for (auto &write : commits[b].writes) write(prefix);
-            storeFeatures<T>(req, features, b * (plan ? c.draft.steps + 1 : width), prefix);
-            req.length += prefix;
-            for (int i = 1; i < prefix; ++i)
-                state.pending.emplace_back(emitted[offset + i - 1], emitted[offset + i]);
-            if (model.verbose) {
-                ++state.rounds;
-                state.proposed += steps;
-                state.accepted += accepted[b];
-            }
-            result[b] = emitted[offset];
-        }
-        if (model.verbose) {
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-            for (const auto &s : batch) s.request->draft->roundMs += ms;
-        }
-        return result;
-    }
     void decodeBody() {
         auto *in = graphInput.p;
         target(&in->token, 1, {{nullptr, 0, 1, graphVisits.p}}, graphLogits);
@@ -1314,7 +1243,14 @@ class Decoder final : public Runtime {
             if (entry.first.compare(0, 10, "model.llm.") == 0)
                 entry.second.ToDevice(CUDA, std::vector<int>{p.gpu}, true);
         }
-        if (c.draft.steps) initDraft();
+        if (c.draft.steps) {
+            initDraft();
+            if (c.draft.block * (c.draft.heads / c.draft.kvHeads) <= DraftFlashTraits<2>::CTA_TILE_Q &&
+                configurePrefillKernel<DraftFlashTraits<2>, DraftFlashParams>(draftGraphAttention<DraftFlashTraits<2>>))
+                draftAttentionWarps = 2;
+            else if (configurePrefillKernel<DraftFlashTraits<4>, DraftFlashParams>(draftGraphAttention<DraftFlashTraits<4>>))
+                draftAttentionWarps = 4;
+        }
         experts = loadExperts(c, p, files, weights);
         getFastllmCublasHandle(); // initialize before graph capture
         int gpu = std::count(p.experts.begin(), p.experts.end(), ExpertDevice::Cuda);
@@ -1340,6 +1276,15 @@ class Decoder final : public Runtime {
         std::lock_guard<std::mutex> lock(mutex);
         check(cudaSetDevice(placement.gpu));
         initializeKV();
+        if (c.draft.steps) {
+            const bool bf16 = projectionType(placement.gpu) == BFLOAT16;
+            for (int b = std::max(1, model.maxBatch); b >= 1; --b) {
+                if (bf16)
+                    roundPlan<__nv_bfloat16>(b);
+                else
+                    roundPlan<half>(b);
+            }
+        }
     }
     std::vector<int> forward(const Data &ids, const std::vector<Data *> &positions,
                              const std::vector<int> &lengths,
@@ -1367,17 +1312,45 @@ class Decoder final : public Runtime {
                 buffered |= req && req->draft && !req->draft->pending.empty();
             }
             if (buffered) {
-                std::vector<int> result;
+                std::vector<int> result(lengths.size()), ready, sizes;
+                std::vector<float> tokens;
+                std::vector<Data *> pos;
+                std::vector<std::pair<Data *, Data *>> slots;
+                std::vector<GenerationConfig> configs;
+                std::vector<std::vector<float> *> outputs;
+                LastTokensManager histories;
                 int offset = 0;
-                for (size_t b = 0; b < lengths.size(); ++b) {
-                    const int n = lengths[b];
-                    auto first = cache.begin() + b * c.visits.size();
-                    std::vector<std::pair<Data *, Data *>> slots(first, first + c.visits.size());
-                    LastTokensManager historyRow;
-                    if (b < history.units.size()) historyRow.units.push_back(history.units[b]);
-                    std::vector<std::vector<float> *> outputs{logits && b < logits->size() ? (*logits)[b] : nullptr};
-                    result.push_back(forwardRows(values + offset, {positions[b]}, {n}, slots, {sampling[b]}, historyRow, &outputs)[0]);
+                for (size_t i = 0; i < lengths.size(); ++i) {
+                    const int n = lengths[i];
+                    auto first = cache.begin() + i * c.visits.size();
+                    auto *key = first->first;
+                    auto *req = key ? static_cast<Request *>(key->kvStorageOwner.get()) : nullptr;
+                    bool pending = n == 1 && req && req->draft && !req->draft->pending.empty();
+                    if (pending && positions.at(i)) {
+                        auto *position = positions[i];
+                        position->ToDevice(CPU);
+                        pending = position->dataType == FLOAT32 && position->Count(0) == 1 &&
+                                  *reinterpret_cast<const float *>(position->cpuData) ==
+                                      req->length - int(req->draft->pending.size());
+                    } else
+                        pending = false;
+                    if (pending) {
+                        popPending(*key, int(values[offset]), result[i]);
+                    } else {
+                        ready.push_back(i);
+                        sizes.push_back(n);
+                        tokens.insert(tokens.end(), values + offset, values + offset + n);
+                        pos.push_back(positions.at(i));
+                        configs.push_back(sampling.at(i));
+                        slots.insert(slots.end(), first, first + c.visits.size());
+                        histories.units.push_back(i < history.units.size() ? history.units[i] : LastTokensUnit{});
+                        outputs.push_back(logits && i < logits->size() ? (*logits)[i] : nullptr);
+                    }
                     offset += n;
+                }
+                if (!ready.empty()) {
+                    auto emitted = forwardRows(tokens.data(), pos, sizes, slots, configs, histories, &outputs);
+                    for (size_t r = 0; r < ready.size(); ++r) result[ready[r]] = emitted[r];
                 }
                 return result;
             }
@@ -1439,7 +1412,34 @@ class Decoder final : public Runtime {
                 req.promptLength = int(prompt);
                 if (c.draft.steps && prompt <= c.draft.maxPositions - c.draft.block && speculativeSampling(gen)) {
                     req.draft = std::make_unique<DraftState>();
-                    req.draft->kv.resize(c.draft.layers);
+                    Data draftDesc(FLOAT16, {c.draft.kvHeads, 1, c.draft.dim});
+                    draftDesc.dataDevice = CUDA;
+                    draftDesc.dataDeviceIds = {placement.gpu};
+                    for (int l = 0; l < c.draft.layers; ++l) {
+                        auto owned = std::make_unique<DraftKV>();
+                        auto &v = owned->cache;
+                        v.key = &owned->key;
+                        v.value = &owned->value;
+                        const int pool = 2 * (int(c.visits.size()) + l);
+                        const int64_t extra = c.draft.block - 1;
+                        const int maxBatch = std::max(1, model.maxBatch);
+                        int64_t pages = tokenLimit > 0 ? (int64_t(tokenLimit) + len - 1) / len +
+                                                             maxBatch * ((extra + len - 1) / len)
+                                                       : -1;
+                        int64_t perRequest =
+                            (std::min<int64_t>(limit, c.draft.maxPositions) + extra + len - 1) / len + 1;
+                        if (c.draft.local[l]) {
+                            int64_t windowPages = (int64_t(c.draft.window) + c.draft.block + len - 2) / len + 1;
+                            perRequest = std::min(perRequest, windowPages);
+                            if (model.maxBatch > 0)
+                                pages = pages < 0 ? windowPages * maxBatch : std::min(pages, windowPages * maxBatch);
+                        }
+                        int count = int(std::min<int64_t>(pages, INT_MAX));
+                        v.attach(owned->key, pool, draftDesc, count);
+                        v.attach(owned->value, pool + 1, draftDesc, count);
+                        v.reserveTable(int(std::min<int64_t>(perRequest, owned->key.pagedKVCacheData->maxPages)));
+                        req.draft->kv.push_back(std::move(owned));
+                    }
                 }
                 for (size_t slot = 0; slot < c.visits.size(); ++slot) {
                     auto &v = req.visits[slot];
@@ -1462,20 +1462,19 @@ class Decoder final : public Runtime {
         }
         bool sampledInGraph = false;
         const bool bf16 = weights.weight.at("model.llm.unembed.weight").dataType == BFLOAT16;
-        int steps = c.draft.steps;
-        for (size_t b = 0; steps > 0 && b < batch.size(); ++b) {
+        bool speculate = c.draft.steps > 0;
+        for (size_t b = 0; speculate && b < batch.size(); ++b) {
             const auto &s = batch[b];
             const auto &cfg = sampling[b];
             if (!s.request->draft || !s.request->draft->recurrentContext.p || s.length != 1 ||
                 cfg.prefill_chunk_remaining >= 0 || s.request->length < s.request->promptLength ||
                 s.request->length > c.draft.maxPositions - c.draft.block ||
                 !speculativeSampling(cfg) || (logits && b < logits->size() && (*logits)[b]))
-                steps = 0;
-            else steps = std::min(steps, s.request->limit - s.request->length - 2);
+                speculate = false;
         }
-        if (steps > 0)
-            return bf16 ? verifyRound<__nv_bfloat16>(batch, values, steps, sampling)
-                        : verifyRound<half>(batch, values, steps, sampling);
+        if (speculate)
+            return bf16 ? verifyRound<__nv_bfloat16>(batch, values, sampling)
+                        : verifyRound<half>(batch, values, sampling);
         bool collect = std::any_of(batch.begin(),batch.end(),[](const Segment &s){return bool(s.request->draft);});
         std::vector<Matrix> features;
         auto out = runTarget(values, offset, batch, sampling.front(), sampledInGraph, collect ? &features : nullptr);

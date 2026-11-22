@@ -16,7 +16,10 @@ inline void check(cudaError_t status) {
 // tensor view goes out of scope. Keep every backing address until graph teardown.
 class DecodeGraphScratch {
     struct Block { size_t bytes; std::shared_ptr<void> storage; };
-    std::vector<Block> blocks;
+    // Shapes replay serially on the decoder stream. They can own the same
+    // backing blocks while recording independent, immutable allocation orders.
+    using Blocks = std::vector<Block>;
+    std::shared_ptr<Blocks> backing = std::make_shared<Blocks>();
     std::vector<size_t> order;
     size_t cursor = 0;
     bool sealed = false;
@@ -28,6 +31,7 @@ public:
         ~Scope() { active = previous; }
         Scope(const Scope &) = delete;
     };
+    void ShareStorage(const DecodeGraphScratch &other) { backing = other.backing; }
     std::shared_ptr<void> Acquire(size_t bytes);
     template <class Body> void Warmup(Body &&body) {
         Scope scope(*this);
@@ -60,7 +64,7 @@ public:
     }
     size_t Bytes() const {
         size_t bytes = 0;
-        for (const auto &block : blocks) bytes += block.bytes;
+        for (const auto &block : *backing) bytes += block.bytes;
         return bytes;
     }
 };

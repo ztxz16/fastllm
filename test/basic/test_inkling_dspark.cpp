@@ -9,88 +9,84 @@
 
 using namespace fastllm;
 
+void forceInklingDraft(const int *ctrl, int *out, int stride, int step, int capacity);
+void forceInklingPrefix(int *ctrl, const int *tokens, int *result, int batch, int drafts, const int *live);
+
+void snapshotInklingDraft(const int *, const void *, int, const void *, const void *, float, bool, const float *, int,
+                          float *, int, int, int);
+
 namespace {
-int keep, draftPosition, suffix, expectedSteps = 7;
+int keep, suffix, verifyLaunches;
+int drawIndex = 0;
 bool controlled = false;
-int jointVerifications = 0;
-int verifyLaunches = 0;
-int capturedDraws = 0;
-int *forcedDraws = nullptr;
-cudaGraphExec_t proposalGraph = nullptr;
+int *control = nullptr;
+float *savedScores = nullptr, *savedDraft = nullptr;
+const float *targetLogits = nullptr;
 std::vector<std::vector<float>> verifyScores;
+constexpr int maxTestBatch = 8;
+int testVocab;
+bool inDraw = false;
+
+template <class F> F original(F current) {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void *>(current), &info) || !info.dli_sname)
+        throw std::runtime_error("Missing interposed symbol");
+    auto fn = reinterpret_cast<F>(dlsym(RTLD_NEXT, info.dli_sname));
+    if (!fn) throw std::runtime_error(info.dli_sname);
+    return fn;
+}
+
+void configure(int batch, int a = -1, int b = -1, bool capture = false) {
+    int params[] = {batch, keep, suffix, int(capture), a, b, -1};
+    if (cudaMemcpy(control, params, sizeof(params), cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("Failed to stage test parameters");
+    controlled = batch != 0;
+}
+void readScores(int batch, int steps) {
+    verifyScores.assign(batch * (steps + 1), std::vector<float>(testVocab));
+    for (int b = 0; b < batch; ++b)
+        for (int r = 0; r <= steps; ++r)
+            if (cudaMemcpy(verifyScores[b * (steps + 1) + r].data(), savedScores + size_t(b * 8 + r) * testVocab,
+                           testVocab * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("Failed to inspect target logits");
+}
 } // namespace
 
 extern "C" cudaError_t cudaGraphLaunch(cudaGraphExec_t graph, cudaStream_t stream) {
-    static const auto launch = reinterpret_cast<decltype(&cudaGraphLaunch)>(dlsym(RTLD_NEXT, "cudaGraphLaunch"));
-    if (capturedDraws) {
-        proposalGraph = graph;
-        capturedDraws = 0;
-    }
-    if (graph == proposalGraph && controlled) {
-        int draws[7];
-        for (int i = 0; i < 7; ++i) draws[i] = 128 + i * 13 + (i >= keep ? suffix : 0);
-        auto status = cudaMemcpyAsync(forcedDraws, draws, sizeof(draws), cudaMemcpyHostToDevice, stream);
-        if (status != cudaSuccess) return status;
-        draftPosition = expectedSteps;
-    } else if (controlled) ++verifyLaunches;
+    static const auto launch = original(&cudaGraphLaunch);
+    if (controlled) ++verifyLaunches;
     return launch(graph, stream);
 }
 
-extern "C" bool FastllmCudaMtpSampleDraftDeviceTopKFirst(float *scores, float *q, float temperature, int topK, float topP,
-                                                int *out, int vocab, Data &workspace) {
-    static const auto sample = reinterpret_cast<decltype(&FastllmCudaMtpSampleDraftDeviceTopKFirst)>(
-        dlsym(RTLD_NEXT, "FastllmCudaMtpSampleDraftDeviceTopKFirst"));
-    if (!sample(scores, q, temperature, topK, topP, out, vocab, workspace))
-        return false;
-    if (controlled) {
-        cudaStreamCaptureStatus capture;
-        if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess) return false;
-        if (capture == cudaStreamCaptureStatusActive) {
-            return cudaMemcpyAsync(out, forcedDraws + capturedDraws++, sizeof(int),
-                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess;
-        }
-        const int index = draftPosition++ % expectedSteps;
-        const int token = 128 + index * 13 + (index >= keep ? suffix : 0);
-        return cudaMemcpy(out, &token, sizeof(token), cudaMemcpyHostToDevice) == cudaSuccess;
-    }
-    return true;
+extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *ws, const void *base, int baseStride, const void *adjust,
+                                              const void *bias, float cap, bool bf16, const float *t, int *k, const float *p,
+                                              uint64_t *rng, int step, float *q, int qStride, int *out, int stride) {
+    static const auto draw = original(&FastllmCudaMtpGraphDrawMarkov);
+    inDraw = true;
+    bool ok = draw(ws, base, baseStride, adjust, bias, cap, bf16, t, k, p, rng, step, q, qStride, out, stride);
+    inDraw = false;
+    int index = drawIndex++ % 7;
+    snapshotInklingDraft(control, base, baseStride, adjust, bias, cap, bf16, q, qStride, savedDraft, index,
+                         testVocab, maxTestBatch);
+    forceInklingDraft(control, out, stride, index, maxTestBatch);
+    return ok;
 }
 
-extern "C" bool FastllmCudaMtpRejectionSamplingTopKFirst(float *p, float *q, const float *temperatures, const int *k,
-                                                         const float *topP, const int *ids, int *out, int *accepted,
-                                                         int batch, int steps, int vocab) {
-    if (controlled) {
-        if (steps != expectedSteps || draftPosition != batch * steps)
-            return false;
-        if (suffix == 0 && keep == steps) {
-            verifyScores.assign(batch * (steps + 1), std::vector<float>(vocab));
-            for (int row = 0; row < batch * (steps + 1); ++row)
-                if (cudaMemcpy(verifyScores[row].data(), p + size_t(row) * vocab, vocab * sizeof(float),
-                               cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-        }
-        for (int b = 0; b < batch; ++b) {
-            std::copy_n(ids + b * steps, keep, out + b * (steps + 1));
-            out[b * (steps + 1) + keep] = 512;
-            accepted[b] = keep;
-        }
-        return true;
-    }
-    jointVerifications += batch > 1;
-    static const auto reject = reinterpret_cast<decltype(&FastllmCudaMtpRejectionSamplingTopKFirst)>(
-        dlsym(RTLD_NEXT, "FastllmCudaMtpRejectionSamplingTopKFirst"));
-    return reject(p, q, temperatures, k, topP, ids, out, accepted, batch, steps, vocab);
+bool FastllmCudaMtpGraphDistribution(void *ws, float *logits, const float *t, int *k, const float *p, float **out) {
+    static const auto normalize = original(&FastllmCudaMtpGraphDistribution);
+    if (!inDraw) targetLogits = logits;
+    return normalize(ws, logits, t, k, p, out);
 }
-
-extern "C" bool FastllmCudaMtpRejectionSamplingTopKFirstDeviceIds(float *p, float *q, const float *t,
-        const int *k, const float *topP, const int *ids, int *out, int *accepted, int batch, int steps, int vocab) {
-    if (controlled) {
-        std::vector<int> host(batch * steps);
-        if (cudaMemcpy(host.data(), ids, host.size() * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) return false;
-        return FastllmCudaMtpRejectionSamplingTopKFirst(p, q, t, k, topP, host.data(), out, accepted, batch, steps, vocab);
-    }
-    static const auto reject = reinterpret_cast<decltype(&FastllmCudaMtpRejectionSamplingTopKFirstDeviceIds)>(
-        dlsym(RTLD_NEXT, "FastllmCudaMtpRejectionSamplingTopKFirstDeviceIds"));
-    return reject(p, q, t, k, topP, ids, out, accepted, batch, steps, vocab);
+extern "C" void FastllmCudaMtpGraphReject(const float *p, const float *q, const int *ids, int *result, void *partial,
+                                          int batch, int drafts, int vocab, const int *live, uint64_t seed,
+                                          unsigned long long *counter) {
+    static const auto reject = original(&FastllmCudaMtpGraphReject);
+    reject(p, q, ids, result, partial, batch, drafts, vocab, live, seed, counter);
+    if (!targetLogits || batch > maxTestBatch || vocab != testVocab) throw std::runtime_error("Bad oracle geometry");
+    if (cudaMemcpyAsync(savedScores, targetLogits, size_t(batch) * (drafts + 1) * vocab * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess)
+        throw std::runtime_error("Failed to snapshot logits");
+    forceInklingPrefix(control, ids, result, batch, drafts, live);
 }
 
 static int step(basellm &model, ResponseContext &ctx, int pos, const std::vector<int> &ids, const GenerationConfig &cfg,
@@ -144,6 +140,7 @@ static void checkBatch(basellm &model, const GenerationConfig &sample) {
         cfg.input_token_length = pos[b];
         token.push_back(step(model, ctx[b], 0, std::vector<int>(pos[b], 93 + b), cfg));
     }
+    cudaMemset(control + 7, 0, sizeof(int));
     for (int i = 0; i < 10; ++i) {
         Data x(FLOAT32, {1, 2}, std::vector<float>{float(token[0]), float(token[1])});
         Data p(FLOAT32, {1, 1}, std::vector<float>{float(pos[0])});
@@ -157,12 +154,15 @@ static void checkBatch(basellm &model, const GenerationConfig &sample) {
                     ++pos[b];
         }
     }
+    int jointVerifications = 0;
+    cudaMemcpy(&jointVerifications, control + 7, sizeof(int), cudaMemcpyDeviceToHost);
     if (!jointVerifications)
         throw std::runtime_error("The target failed to verify two requests in one batch");
     std::cout << "joint_verifications=" << jointVerifications << std::endl;
 }
 
-static void checkClippedRound(basellm &model, GenerationConfig sample, int steps, int batch, bool graph) {
+static void checkClippedRound(basellm &model, GenerationConfig sample, int steps, int batch, bool graph,
+                              bool mixed = false) {
     std::vector<ResponseContext> contexts(batch);
     std::vector<std::pair<Data *, Data *>> slots;
     std::vector<Data> positions;
@@ -174,7 +174,7 @@ static void checkClippedRound(basellm &model, GenerationConfig sample, int steps
         const int past = 1022 + b;
         auto &cfg = configs[b];
         cfg.input_token_length = past;
-        cfg.output_token_limit = steps + 2;
+        cfg.output_token_limit = (mixed && b == 0 ? 0 : steps) + 2;
         auto &ctx = contexts[b];
         ctx.pastKeyValues.resize(model.block_cnt);
         step(model, ctx, 0, std::vector<int>(past, 320 + b), cfg);
@@ -183,33 +183,132 @@ static void checkClippedRound(basellm &model, GenerationConfig sample, int steps
         positions.emplace_back(FLOAT32, std::vector<int>{1, 1}, std::vector<float>{float(past)});
         positionPtrs.push_back(&positions.back());
     }
-    keep = expectedSteps = steps;
-    suffix = draftPosition = verifyLaunches = 0;
-    controlled = true;
+    keep = steps;
+    suffix = verifyLaunches = 0;
+    configure(batch);
     Data input(FLOAT32, {1, batch}, anchors);
     model.ForwardV2(batch, input, {}, positionPtrs, std::vector<int>(batch, 1), slots, configs,
                     LastTokensManager(batch, 0), nullptr);
-    controlled = false;
-    if (verifyLaunches != int(graph) || int(verifyScores.size()) != batch * (steps + 1))
+    configure(0);
+    readScores(batch, steps);
+    if (verifyLaunches != 2 * int(graph) || int(verifyScores.size()) != batch * (steps + 1))
         throw std::runtime_error("Clipped verification did not use the expected target path");
-    for (int b = 0; b < batch; ++b) {
+    for (int b = batch - 1; b >= 0; --b) {
         auto teacher = configs[b];
         teacher.output_logits = true;
+        const int past = teacher.input_token_length, live = configs[b].output_token_limit - 2;
+        const int end = past + live + 1;
+        auto expected = committedKV(contexts.back(), end, past, live + 1);
+        contexts.pop_back(); // Release one request's pages for the independent decode.
         ResponseContext ordinary;
         ordinary.pastKeyValues.resize(model.block_cnt);
-        const int past = teacher.input_token_length;
         step(model, ordinary, 0, std::vector<int>(past, 320 + b), teacher);
-        for (int r = 0; r <= steps; ++r) {
+        for (int r = 0; r <= live; ++r) {
             std::vector<float> logits;
             step(model, ordinary, past + r, {r ? 128 + (r - 1) * 13 : int(anchors[b])}, teacher, &logits);
             if (logits != verifyScores[b * (steps + 1) + r])
                 throw std::runtime_error("Clipped verification logits disagree with ordinary decode");
         }
-        const int end = past + steps + 1;
-        if (committedKV(ordinary, end, past, steps + 1) != committedKV(contexts[b], end, past, steps + 1))
+        if (committedKV(ordinary, end, past, live + 1) != expected)
             throw std::runtime_error("Clipped verification committed incorrect KV");
     }
-    std::cout << "clipped_steps=" << steps << " batch=" << batch << " target_graphs=" << verifyLaunches << std::endl;
+    std::cout << "clipped_steps=" << steps << " batch=" << batch << " mixed=" << mixed
+              << " round_graphs=" << verifyLaunches << std::endl;
+}
+
+static void checkDraftBatch(basellm &model, GenerationConfig sample) {
+    const int vocab = testVocab;
+    std::vector<float> reference[2];
+    double maxError = 0, maxProbabilityError = 0;
+    for (const auto indices : {std::vector<int>{0, 1}, std::vector<int>{0}, std::vector<int>{1}}) {
+        const int count = indices.size();
+        std::vector<ResponseContext> ctx(count);
+        std::vector<int> past(count), token(count);
+        std::vector<GenerationConfig> configs(count, sample);
+        std::vector<std::pair<Data *, Data *>> slots;
+        for (int b = 0; b < count; ++b) {
+            int id = indices[b];
+            auto &cfg = configs[b];
+            cfg.temperature = id ? 1.3f : .75f;
+            cfg.top_k = id ? 97 : 31;
+            cfg.top_p = id ? .9f : .97f;
+            past[b] = id ? 1279 : 1022;
+            cfg.input_token_length = past[b];
+            ctx[b].pastKeyValues.resize(model.block_cnt);
+            step(model, ctx[b], 0, std::vector<int>(past[b], 650 + 125 * id), cfg);
+            token[b] = 235 + id;
+            for (auto &v : ctx[b].pastKeyValues) slots.emplace_back(&v.first, &v.second);
+        }
+        for (int round = 0; round < 2; ++round) {
+            std::vector<float> anchors(token.begin(), token.end());
+            std::vector<Data> position;
+            position.reserve(count);
+            std::vector<Data *> ptrs;
+            for (int i : past) {
+                position.emplace_back(FLOAT32, std::vector<int>{1, 1}, std::vector<float>{float(i)});
+                ptrs.push_back(&position.back());
+            }
+            Data input(FLOAT32, {1, count}, anchors);
+            keep = 7;
+            suffix = 0;
+            configure(count, indices[0] ? 5 : 2, count == 2 ? 5 : -1, true);
+            token = model.ForwardV2(count, input, {}, ptrs, std::vector<int>(count, 1), slots, configs,
+                                    LastTokensManager(count, 0), nullptr);
+            configure(0);
+            for (int b = 0; b < count; ++b) {
+                ++past[b];
+                while (model.PopPendingResponseToken(&ctx[b], token[b], token[b])) ++past[b];
+                std::vector<float> data(size_t(14) * vocab);
+                if (cudaMemcpy(data.data(), savedDraft + size_t(b) * data.size(), data.size() * sizeof(float),
+                               cudaMemcpyDeviceToHost) != cudaSuccess)
+                    throw std::runtime_error("Failed to inspect draft");
+                for (int i = 0; i < 7; ++i) {
+                    const float *scores = data.data() + size_t(2 * i) * vocab, *q = scores + vocab;
+                    std::vector<int> ids(vocab);
+                    std::iota(ids.begin(), ids.end(), 0);
+                    const auto &cfg = configs[b];
+                    int k = cfg.top_k;
+                    std::partial_sort(ids.begin(), ids.begin() + k, ids.end(), [&](int x, int y) {
+                        return scores[x] > scores[y] || (scores[x] == scores[y] && x < y);
+                    });
+                    std::vector<double> weights(k);
+                    double sum = 0;
+                    for (int j = 0; j < k; ++j)
+                        sum += weights[j] = std::exp(double(scores[ids[j]] - scores[ids[0]]) / cfg.temperature);
+                    double kept = 0, minWeight = 0;
+                    for (int j = 0; j < k; ++j) {
+                        if (kept >= sum * cfg.top_p && weights[j] < minWeight) break;
+                        kept += weights[j];
+                        minWeight = weights[j];
+                    }
+                    double mass = std::accumulate(q, q + vocab, 0.);
+                    if (!std::isfinite(mass) || std::abs(mass - 1) > 1e-5)
+                        throw std::runtime_error("Draft q is not normalized");
+                    for (int j = 0; j < k; ++j)
+                        maxProbabilityError =
+                            std::max(maxProbabilityError,
+                                     std::abs(q[ids[j]] - (weights[j] >= minWeight ? weights[j] / kept : 0.)));
+                    auto &saved = reference[indices[b]];
+                    if (count == 2)
+                        saved.insert(saved.end(), scores, scores + vocab);
+                    else {
+                        auto first = saved.begin() + size_t(round * 7 + i) * vocab;
+                        maxError = std::max(maxError, relativeL2({scores, scores + vocab}, {first, first + vocab}));
+                    }
+                }
+            }
+        }
+    }
+    const int layers = std::stoi(model.weight.dicts.at("mtp_config.num_hidden_layers"));
+    for (int i = 0; i < 2 * layers; ++i) {
+        auto *pool = GetPagedCacheManager(2 * model.block_cnt + i);
+        if (!pool || pool->FreePageCount() != pool->maxPages)
+            throw std::runtime_error("Draft pages were not returned to their pool");
+    }
+    std::cout << "batched_draft_max_l2=" << maxError << " max_q_error=" << maxProbabilityError
+              << " released_draft_pools=" << 2 * layers << std::endl;
+    if (maxError > .02 || maxProbabilityError > 2e-5)
+        throw std::runtime_error("Batched draft disagrees with reference");
 }
 
 int main(int argc, char **argv) {
@@ -218,13 +317,18 @@ int main(int argc, char **argv) {
     setenv("FASTLLM_DSPARK_TOKENS", "7", 1);
     SetDeviceMap({{"cuda:0", 1}});
     SetMoeDeviceMap({{"cuda:0", 1}});
-    SetMaxTokens(8192);
+    SetMaxTokens(16384);
     SetThreads(4);
     const bool graph = argc == 3;
     SetCudaGraph(graph);
-    if (cudaMalloc(&forcedDraws, 7 * sizeof(int)) != cudaSuccess) return 1;
+    if (cudaMalloc(&control, 8 * sizeof(int)) != cudaSuccess) return 1;
+    configure(0);
     auto model = CreateLLMModelFromHF(argv[1], BFLOAT16);
-    model->maxBatch = 3;
+    model->maxBatch = maxTestBatch;
+    testVocab = std::stoi(model->weight.dicts.at("text_config.unpadded_vocab_size"));
+    if (cudaMalloc(&savedScores, size_t(maxTestBatch) * 8 * testVocab * sizeof(float)) != cudaSuccess) return 1;
+    if (cudaMalloc(&savedDraft, size_t(maxTestBatch) * 14 * testVocab * sizeof(float)) != cudaSuccess) return 1;
+    if (graph) model->WarmUp();
     const std::vector<int> prompt(1022, 320);
     GenerationConfig sample;
     sample.do_sample = true;
@@ -259,14 +363,14 @@ int main(int argc, char **argv) {
             if (run == 2) {
                 step(*model, ctx, prompt.size(), committed, teacher);
             } else {
-                draftPosition = 0;
                 suffix = run * 4096;
-                controlled = true;
+                configure(1);
                 int token = step(*model, ctx, prompt.size(), {committed[0]}, sample);
                 std::vector<int> emitted{token};
                 while (model->PopPendingResponseToken(&ctx, token, token))
                     emitted.push_back(token);
-                controlled = false;
+                configure(0);
+                if (!suffix && keep == 7) readScores(1, 7);
                 std::vector<int> expected(committed.begin() + 1, committed.end());
                 expected.push_back(512);
                 if (emitted != expected)
@@ -306,9 +410,10 @@ int main(int argc, char **argv) {
     for (int steps : {1, 3, 6})
         for (int batch : {1, 2})
             checkClippedRound(*model, sample, steps, batch, graph);
-    int major = 0;
-    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess)
-        throw std::runtime_error("Cannot query draft graph support");
-    if (graph && major >= 8 && !proposalGraph) throw std::runtime_error("Missing full draft graph");
-    cudaFree(forcedDraws);
+    checkClippedRound(*model, sample, 7, 2, graph, true);
+    checkClippedRound(*model, sample, 7, maxTestBatch, graph);
+    checkDraftBatch(*model, sample);
+    cudaFree(savedDraft);
+    cudaFree(savedScores);
+    cudaFree(control);
 }

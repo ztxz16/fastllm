@@ -57,6 +57,8 @@ public:
     std::map<std::string, std::vector<std::pair<std::string, DataType>>>
     GetTensorMap(const std::vector<std::string> &names) override;
     std::map<std::string, inkling2::TensorRange> expertTensors;
+    long long GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const override;
+    long long GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const override;
     int GetKVCacheRetainedTokens(int slot) const override {
         return cfg.local.at(cfg.visits.at(slot)) ? cfg.window : -1;
     }
