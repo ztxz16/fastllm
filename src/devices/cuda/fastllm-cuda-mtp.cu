@@ -198,7 +198,7 @@ template<bool Indirect = false, bool Probability = false, bool HostIds = false>
 __global__ void AcceptKernel(const float *p, const float *logits, const float *lse,
         const int *draftIds, int *result, int drafts, int vocab, int batch,
         unsigned long long seed, const unsigned long long *counter,
-        const FastllmMtpProposalView *proposals = nullptr, HostDraftIds hostIds = {}) {
+        const FastllmMtpProposalView *proposals = nullptr, HostDraftIds hostIds = {}, const int *live = nullptr) {
     if (threadIdx.x) return;
     int b = blockIdx.x, offset = b * (drafts + 1), accepted = 0;
     const float *qLogits, *qLse;
@@ -216,7 +216,7 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
     curandStatePhilox4_32_10_t rng;
     // Keep acceptance uniforms disjoint from both draft and residual Gumbels.
     curand_init(seed ^ 0xd2b74407b1ce6e93ULL, b, *counter * (((uint64_t)drafts + 15) / 16 * 16), &rng);
-    for (int i = 0; i < drafts; ++i) {
+    for (int i = 0; i < (live ? live[b] : drafts); ++i) {
         int token = ids[i];
         if (token < 0 || token >= vocab) break;
         float target = p[(size_t)(offset + i) * vocab + token];
@@ -236,15 +236,15 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
     }
     result[batch * (drafts + 1) + b] = accepted;
 }
-template<bool Indirect = false, bool Probability = false>
-__global__ void ResidualKernel(const float *p, const float *logits, const float *lse,
-        const int *result, Partial *partials, int drafts, int vocab, int batch,
-        int blocks, unsigned long long seed, const unsigned long long *counter,
-        const FastllmMtpProposalView *proposals = nullptr) {
+template <bool Indirect = false, bool Probability = false>
+__global__ void ResidualKernel(const float *p, const float *logits, const float *lse, const int *result,
+                               Partial *partials, int drafts, int vocab, int batch, int blocks, unsigned long long seed,
+                               const unsigned long long *counter, const FastllmMtpProposalView *proposals = nullptr,
+                               const int *live = nullptr) {
     int b = blockIdx.y, tile = blockIdx.x, tid = threadIdx.x;
     int accepted = result[batch * (drafts + 1) + b];
     const float *target = p + (size_t)(b * (drafts + 1) + accepted) * vocab;
-    bool bonus = accepted == drafts;
+    bool bonus = accepted == (live ? live[b] : drafts);
     const float *proposal = nullptr;
     float normalizer = 0;
     if (!bonus) {
@@ -302,6 +302,21 @@ __global__ void FinishResidualKernel(const Partial *partials, int *result,
     }
 }
 } // namespace
+
+size_t FastllmCudaMtpGraphRejectBytes(int batch, int vocab) {
+    return size_t(batch) * ((vocab + Tile - 1) / Tile) * sizeof(Partial);
+}
+
+void FastllmCudaMtpGraphReject(const float *p, const float *q, const int *tokens, int *result, void *scratch, int batch,
+                               int drafts, int vocab, const int *live, uint64_t seed, unsigned long long *counter) {
+    auto *partials = static_cast<Partial *>(scratch);
+    const int blocks = (vocab + Tile - 1) / Tile;
+    AcceptKernel<false, true><<<batch, 32, 0, cudaStreamPerThread>>>(p, q, nullptr, tokens, result, drafts, vocab,
+                                                                     batch, seed, counter, nullptr, {}, live);
+    ResidualKernel<false, true><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+        p, q, nullptr, result, partials, drafts, vocab, batch, blocks, seed, counter, nullptr, live);
+    FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(partials, result, drafts, batch, blocks, counter);
+}
 
 bool FastllmCudaMtpSampleDraftLogits(const float *logits, float *saved, float *lse,
         int *output, float *floatOutput, const float *temperatures, int batch, int vocab) {

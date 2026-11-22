@@ -135,3 +135,16 @@ bool FastllmCudaMtpRejectionWithAccepted(float *logits, float *proposalProbs,
     const float *temperatures, const int *topKs, const float *topPs, const int *draftTokenIds,
     int *output, int *acceptedDraftTokens, int batch, int draftTokens, int vocabSize,
     FastllmMtpAcceptedCallback callback, void *context);
+
+// Fixed-address graph stages. Parameters and the live proposal count are device
+// inputs, so sampling settings and clipped tails do not change graph topology.
+extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *workspace, const void *base, int baseStride, const void *adjust,
+                                              const void *bias, float cap, bool bf16, const float *temperature,
+                                              int *topK, const float *topP, uint64_t *rng, int step, float *q,
+                                              int qStride, int *tokens, int tokenStride);
+bool FastllmCudaMtpGraphDistribution(void *workspace, float *logits, const float *temperature, int *topK,
+                                     const float *topP, float **probs);
+size_t FastllmCudaMtpGraphRejectBytes(int batch, int vocab);
+extern "C" void FastllmCudaMtpGraphReject(const float *p, const float *q, const int *tokens, int *result,
+                                          void *partials, int batch, int drafts, int vocab, const int *live,
+                                          uint64_t seed, unsigned long long *counter);

@@ -236,6 +236,61 @@ void IndexedBf16ProjectionCase() {
 }
 #endif
 
+// Several distinct input scores round to exactly the same softcap. The stable top-k
+// boundary follows token ID across that entire plateau, including after graph replay.
+void MarkovDrawPlateauCase() {
+    using namespace fastllm;
+    constexpr int rows = 3, vocab = 65539, pitch = vocab + 3;
+    const int peaks[rows] = {85, 300, 85};
+    std::vector<float> base(rows * pitch, -300.f);
+    for (int row = 0; row < rows; ++row)
+        for (int i = 0; i < peaks[row]; ++i) base[row * pitch + 10 * i + row] = float(300 + 2 * i);
+    for (DataType type : {BFLOAT16, FLOAT16}) {
+        auto upload = [&](const std::vector<float> &values) {
+            Data x(FLOAT32, {(int)values.size()}, values);
+            x.ToDevice(CUDA, {0}, true);
+            ToDataType(x, type);
+            return x;
+        };
+        auto b = upload(base), correction = upload(std::vector<float>(rows * vocab, -2.f));
+        auto bias = upload(std::vector<float>(vocab, 2.f));
+        Buffer temperature(std::vector<float>{.7f, 1.f, 1.3f}), topP(std::vector<float>(rows, .95f));
+        Buffer k(rows), seed(2), tokens(rows * 2), q(std::vector<float>(rows * pitch, -1.f));
+        Check(cudaMemsetAsync(seed.p, 0, sizeof(uint64_t), cudaStreamPerThread));
+        auto *workspace = FastllmCudaMtpCreateTargetDistribution(rows, vocab);
+        Require(workspace != nullptr, "Markov draw workspace");
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(FastllmCudaMtpGraphDrawMarkov(workspace, b.cudaData, pitch, correction.cudaData, bias.cudaData, 30.f,
+                    type == BFLOAT16, temperature.p, reinterpret_cast<int *>(k.p), topP.p,
+                    reinterpret_cast<uint64_t *>(seed.p), 0, q.p, pitch, reinterpret_cast<int *>(tokens.p), 2),
+                "Markov draw capture");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (std::vector<int> ks : {std::vector<int>{40, 40, vocab}, std::vector<int>{vocab, 1, 40}}) {
+            Check(cudaMemcpy(k.p, ks.data(), rows * sizeof(int), cudaMemcpyHostToDevice));
+            Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            auto probs = q.Read();
+            int ids[rows * 2];
+            Check(cudaMemcpy(ids, tokens.p, sizeof(ids), cudaMemcpyDeviceToHost));
+            for (int row = 0; row < rows; ++row) {
+                const int keep = std::min(ks[row], peaks[row]);
+                for (int i = 0; i < vocab; ++i) {
+                    const bool kept = i >= row && (i - row) % 10 == 0 && (i - row) / 10 < keep;
+                    Require(std::abs(probs[row * pitch + i] - (kept ? 1.f / keep : 0.f)) < 1.e-6f,
+                            "Markov draw changed the softcap plateau");
+                }
+                Require(probs[row * pitch + vocab] == -1.f, "Markov draw wrote into q padding");
+                Require(ids[2 * row] >= 0 && ids[2 * row] < vocab && probs[row * pitch + ids[2 * row]] > 0.f,
+                        "Markov draw sampled outside retained q");
+            }
+        }
+        Check(cudaGraphExecDestroy(exec));
+        Check(cudaGraphDestroy(graph));
+        FastllmCudaMtpDestroyTargetDistribution(workspace);
+    }
+}
 void MarkovGraphCase() {
     using namespace fastllm;
     const int vocab = 64, rank = 32;
@@ -716,6 +771,7 @@ int main() {
         IndexedBf16ProjectionCase();
 #endif
         MarkovGraphCase();
+        MarkovDrawPlateauCase();
         FullVocabularyCase();
         VerifyProposalLayoutCase();
         LargeVocabularyCase();

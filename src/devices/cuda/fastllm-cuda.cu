@@ -57,6 +57,7 @@
 #include <cuda_fp8.h>
 #include "attention/fastllm-fp4-kv.cuh"
 #include "sampling.cuh"
+#include "sampling/fastllm-markov-proposal.cuh"
 
 const float *FastllmCudaBFloat16SiluTable() {
     const int device = FastllmCudaGetDevice();
@@ -16194,8 +16195,9 @@ __global__ void FastllmNormalizeProposal(const float *sums, float *probs, int *s
 // the following normalization pass reuses those statistics from cache.
 template<int THREADS, int TILE>
 __global__ void FastllmTemperatureSoftmaxPartialKernel(const float *logits, float2 *partials,
-        const float *temperatures, float temperature, int vocab, int chunks) {
+        const float *temperatures, float temperature, int vocab, int chunks, const int *done = nullptr) {
     const int row = blockIdx.y, begin = blockIdx.x * TILE;
+    if (done && done[row]) return;
     const float invTemp = 1.0f / (temperatures ? temperatures[row] : temperature);
     float values[TILE / THREADS], maximum = -INFINITY;
     #pragma unroll
@@ -16220,8 +16222,9 @@ __global__ void FastllmTemperatureSoftmaxPartialKernel(const float *logits, floa
 
 template<int THREADS, int TILE>
 __global__ void FastllmTemperatureSoftmaxNormalizeKernel(const float *logits, float *probs,
-        const float2 *partials, const float *temperatures, float temperature, int vocab, int chunks) {
+        const float2 *partials, const float *temperatures, float temperature, int vocab, int chunks, const int *done = nullptr) {
     const int row = blockIdx.y, begin = blockIdx.x * TILE;
+    if (done && done[row]) return;
     const float invTemp = 1.0f / (temperatures ? temperatures[row] : temperature);
     const float2 *stats = partials + (size_t)row * chunks;
     float maximum = -INFINITY;
@@ -16428,7 +16431,8 @@ __device__ TopKBoundary TopKTileSummary(const float *row, int64_t begin, int64_t
     return TopKTieReduce(scratch).Reduce(item, JoinTopKBoundary{});
 }
 
-__global__ void CountTopKBoundaryTiles(const float *logits, int vocab, TopKBoundary *tiles) {
+__global__ void CountTopKBoundaryTiles(const float *logits, int vocab, TopKBoundary *tiles, const int *topKs) {
+    if (topKs[blockIdx.x] >= vocab) return;
     __shared__ TopKTieReduce::TempStorage scratch;
     const int64_t begin = int64_t(vocab) * blockIdx.y / gridDim.y;
     const int64_t end = int64_t(vocab) * (blockIdx.y + 1) / gridDim.y;
@@ -16486,7 +16490,7 @@ __global__ void TrimTopKBoundaryTies(float *logits, const int *topKs, int vocab,
         __syncthreads();
     }
 }
-bool MaskTopKFirstLogits(const float *logits, float *filtered, const float *temperatures, int *topKs,
+bool RadixMaskTopKLogits(const float *logits, float *filtered, const float *temperatures, int *topKs,
         int batch, int vocab, flashinfer::sampling::RadixRowState *states) {
     if (!logits || !filtered || !temperatures || !topKs || !states || batch <= 0 || vocab <= 0) return false;
     cudaStream_t stream = cudaStreamPerThread;
@@ -16497,7 +16501,10 @@ bool MaskTopKFirstLogits(const float *logits, float *filtered, const float *temp
     if (status == cudaSuccess)
         status = flashinfer::sampling::RadixTopKMaskLogitsMultiCTA<float, int>(
             filtered, filtered, topKs, batch, 0, vocab, states, stream);
-    if (status != cudaSuccess) return false;
+    return status == cudaSuccess;
+}
+bool TrimMaskedTopK(float *filtered, const int *topKs, int batch, int vocab, flashinfer::sampling::RadixRowState *states) {
+    auto stream = cudaStreamPerThread;
     // Reuse the radix workspace after its last read. Limit scratch, not vocab
     // or batch: the tile ranges grow to cover arbitrarily wide rows.
     constexpr int maxTiles = std::min<size_t>(TopKTieThreads, sizeof(*states) / sizeof(TopKBoundary));
@@ -16507,11 +16514,17 @@ bool MaskTopKFirstLogits(const float *logits, float *filtered, const float *temp
     } else {
         auto *summaries = reinterpret_cast<TopKBoundary *>(states);
         dim3 grid(batch, tiles);
-        CountTopKBoundaryTiles<<<grid, TopKTieThreads, 0, stream>>>(filtered, vocab, summaries);
+        CountTopKBoundaryTiles<<<grid, TopKTieThreads, 0, stream>>>(filtered, vocab, summaries, topKs);
         TrimTopKBoundaryTies<false><<<grid, TopKTieThreads, 0, stream>>>(filtered, topKs, vocab, summaries);
     }
     return cudaGetLastError() == cudaSuccess;
 }
+bool MaskTopKFirstLogits(const float *logits, float *filtered, const float *temperatures, int *topKs,
+                         int batch, int vocab, flashinfer::sampling::RadixRowState *states) {
+    return RadixMaskTopKLogits(logits, filtered, temperatures, topKs, batch, vocab, states) &&
+           TrimMaskedTopK(filtered, topKs, batch, vocab, states);
+}
+
 }
 
 static bool FastllmCudaTopKTopPSamplingImpl(
@@ -18067,11 +18080,12 @@ struct FastllmMtpTopPState {
     int count;
     float values[kMtpTopPCapacity];
 };
-__global__ void FastllmMtpTopPInit(FastllmMtpTopPState *states, float2 *cuts) {
+__global__ void FastllmMtpTopPInit(FastllmMtpTopPState *states, float2 *cuts, const int *done = nullptr) {
     states[blockIdx.x].count = 0;
-    cuts[blockIdx.x] = make_float2(0, 0);
+    cuts[blockIdx.x] = make_float2(done && done[blockIdx.x] ? INFINITY : 0.f, 0.f);
 }
-__global__ void FastllmMtpTopPCompact(const float *probs, FastllmMtpTopPState *states, int vocab) {
+__global__ void FastllmMtpTopPCompact(const float *probs, FastllmMtpTopPState *states, int vocab, const int *done = nullptr) {
+    if (done && done[blockIdx.y]) return;
     const int row = blockIdx.y, begin = blockIdx.x * 4096;
     int count = 0;
     float values[16];
@@ -18155,7 +18169,7 @@ __global__ void FastllmMtpTopPCut(FastllmMtpTopPState *states, const float *topP
 __global__ void FastllmMtpTopPApply(const float *probs, float *output, const float2 *cuts, int vocab) {
     const int row = blockIdx.y;
     const float2 cut = cuts[row];
-    if (cut.x <= 0) return;
+    if (cut.x <= 0 || cut.y == 0) return;
     for (int i = blockIdx.x * 256 + threadIdx.x; i < vocab; i += gridDim.x * 256) {
         float value = probs[(size_t)row * vocab + i];
         output[(size_t)row * vocab + i] = value >= cut.x ? value * cut.y : 0;
@@ -18290,6 +18304,18 @@ struct FastllmMtpSamplingWorkspace {
         }
         return true;
     }
+    cudaError_t RenormTopP(float *input, float *output, float *thresholds, int rows, const int *done = nullptr, float scalar = 1.f) {
+        auto stream = cudaStreamPerThread;
+        if (topPState) {
+            FastllmMtpTopPInit<<<rows, 1, 0, stream>>>(topPState, topPCuts, done);
+            dim3 grid((vocab + 4095) / 4096, rows);
+            FastllmMtpTopPCompact<<<grid, 256, 0, stream>>>(input, topPState, vocab, done);
+            FastllmMtpTopPCut<<<rows, 256, 0, stream>>>(topPState, thresholds, scalar, topPCuts);
+            FastllmMtpTopPApply<<<grid, 256, 0, stream>>>(input, output, topPCuts, vocab);
+        }
+        return flashinfer::sampling::TopPRenormProb<float>(input, output, thresholds, rows, scalar, vocab, stream,
+                                                           topPCuts);
+    }
     bool Normalize(float *logits, int rows, int vocab) {
         // A captured graph must always bind the same input/output scratch buffers.
         a = bufferA;
@@ -18321,15 +18347,7 @@ struct FastllmMtpSamplingWorkspace {
         if (state == cudaSuccess && needTopP) {
             // Dedicated samplers retain device parameters across graph replays.
             float *ps = !dedicated && !resident && uniformTopP ? nullptr : topPs;
-            if (topPState) {
-                FastllmMtpTopPInit<<<rows, 1, 0, stream>>>(topPState, topPCuts);
-                dim3 grid((vocab + 4095) / 4096, rows);
-                FastllmMtpTopPCompact<<<grid, 256, 0, stream>>>(a, topPState, vocab);
-                FastllmMtpTopPCut<<<rows, 256, 0, stream>>>(topPState, ps, scalarTopP, topPCuts);
-                FastllmMtpTopPApply<<<grid, 256, 0, stream>>>(a, b, topPCuts, vocab);
-            }
-            state = flashinfer::sampling::TopPRenormProb<float>(
-                a, b, ps, rows, scalarTopP, vocab, stream, topPCuts);
+            state = RenormTopP(a, b, ps, rows, nullptr, scalarTopP);
             std::swap(a, b);
         }
         if (state == cudaSuccess && needTopK && !topKFirst) {
@@ -18824,6 +18842,93 @@ bool FastllmCudaMtpNormalizeTargetDistribution(void *distribution,
     if (!ws.Normalize(logits, ws.rows, ws.vocab)) return false;
     *probabilities = ws.a;
     return true;
+}
+
+static bool NormalizeMaskedGraphRows(FastllmMtpSamplingWorkspace &ws, const float *topP,
+                                     float **probs, const int *done = nullptr) {
+    auto stream = cudaStreamPerThread;
+    if (ws.softmaxTiles && ws.rows <= 65535) {
+        dim3 grid(ws.softmaxTiles, ws.rows);
+        FastllmTemperatureSoftmaxPartialKernel<256, 4096>
+            <<<grid, 256, 0, stream>>>(ws.bufferB, ws.softmaxPartials, nullptr, 1.f, ws.vocab, ws.softmaxTiles, done);
+        FastllmTemperatureSoftmaxNormalizeKernel<256, 4096><<<grid, 256, 0, stream>>>(
+            ws.bufferB, ws.bufferA, ws.softmaxPartials, nullptr, 1.f, ws.vocab, ws.softmaxTiles, done);
+    } else {
+        FastllmTemperatureSoftmaxKernel<1024><<<ws.rows, 1024, 0, stream>>>(ws.bufferB, ws.bufferA, nullptr, ws.vocab);
+    }
+    *probs = ws.bufferB;
+    return ws.RenormTopP(ws.bufferA, ws.bufferB, const_cast<float *>(topP), ws.rows, done) == cudaSuccess;
+}
+
+bool FastllmCudaMtpGraphDistribution(void *workspace, float *logits, const float *temperature, int *topK,
+                                     const float *topP, float **probs) {
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(workspace);
+    return MaskTopKFirstLogits(logits, ws.bufferB, temperature, topK, ws.rows, ws.vocab, ws.rowStates) &&
+           NormalizeMaskedGraphRows(ws, topP, probs);
+}
+
+template<class T>
+static bool DrawGraphProposal16(FastllmMtpSamplingWorkspace &ws, fastllm_markov::MarkovProposalScores<T> scores,
+                                const float *temperature, int *topK, const float *topP, uint64_t *rng,
+                                int step, float *q, int qStride, int *tokens, int tokenStride) {
+    using namespace fastllm_markov;
+    float *probs;
+    auto stream = cudaStreamPerThread;
+    // At most one block per SM participates in the grid-wide radix barriers.
+    // 16K two-byte keys plus local counters fit the default shared-memory budget.
+    const int minBlocks = 1 + (ws.vocab - 1) / 16384;
+    int device, sms;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) return false;
+    if (ws.topPState && ws.softmaxTiles <= 256 && minBlocks <= sms && scores.cap > 0.f && std::isfinite(scores.cap)) {
+        const int groups = std::min(ws.rows, sms / minBlocks);
+        const int blocks = std::min(sms / groups, 1 + (ws.vocab - 1) / 2048);
+        const int chunk = 1 + (ws.vocab - 1) / blocks;
+        auto *pivots = reinterpret_cast<float *>(ws.topPCuts);
+        if (cudaMemsetAsync(ws.rowStates, 0, size_t(groups) * sizeof(*ws.rowStates), stream) != cudaSuccess ||
+            cudaMemsetAsync(ws.output, 0, size_t(ws.rows) * sizeof(int), stream) != cudaSuccess) return false;
+        const dim3 grid(ws.softmaxTiles, ws.rows);
+        SelectGraphDrawSupport<<<groups * blocks, kGraphRadixThreads, chunk * sizeof(T), stream>>>(
+            scores, temperature, topK, ws.output, reinterpret_cast<float2 *>(ws.bufferA), pivots, q, qStride,
+            ws.vocab, ws.rows, chunk, blocks, ws.rowStates);
+        SampleGraphDrawSupport<<<ws.rows, kCompactGraphDraw, 0, stream>>>(ws.bufferA, ws.output, topK, topP, rng,
+                                                    step, q, qStride, tokens, tokenStride, ws.accepted, ws.draftIds, ws.vocab);
+        MaterializeGraphDrawMask<<<grid, 256, 0, stream>>>(scores, temperature, pivots, ws.accepted, ws.bufferB, ws.vocab);
+        if (!TrimMaskedTopK(ws.bufferB, ws.draftIds, ws.rows, ws.vocab, ws.rowStates) ||
+            !NormalizeMaskedGraphRows(ws, topP, &probs, ws.accepted)) return false;
+        auto *mass = reinterpret_cast<double *>(ws.softmaxPartials);
+        FastllmRetainProposalTiles<<<grid, 256, 0, stream>>>(probs, q, qStride, ws.vocab, mass, ws.accepted);
+        FastllmDrawProposalTile<<<ws.rows, 256, 0, stream>>>(q, qStride, mass, ws.softmaxTiles, ws.vocab,
+                                                              rng, step, tokens, tokenStride, ws.accepted);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    const size_t n = size_t(ws.rows) * ws.vocab;
+    ExpandGraphDrawScores<<<(n + 255) / 256, 256, 0, stream>>>(scores, ws.bufferA, n);
+    if (!FastllmCudaMtpGraphDistribution(&ws, ws.bufferA, temperature, topK, topP, &probs)) return false;
+    if (cudaMemcpy2DAsync(q, size_t(qStride) * sizeof(float), probs, size_t(ws.vocab) * sizeof(float),
+                          size_t(ws.vocab) * sizeof(float), ws.rows, cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+        flashinfer::sampling::SamplingFromProb<float, int, 1>(probs, ws.output, ws.valid, nullptr, ws.rows, ws.vocab,
+                                                              true, rng, 0, nullptr, step, stream) != cudaSuccess)
+        return false;
+    return cudaMemcpy2DAsync(tokens, size_t(tokenStride) * sizeof(int), ws.output, sizeof(int), sizeof(int), ws.rows,
+                             cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
+}
+
+extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *workspace, const void *base, int baseStride, const void *adjust,
+                                              const void *bias, float cap, bool bf16, const float *temperature,
+                                              int *topK, const float *topP, uint64_t *rng, int step, float *q,
+                                              int qStride, int *tokens, int tokenStride) {
+    if (!workspace || !base || !adjust || !bias || !temperature || !topK || !topP || !rng || !q || !tokens)
+        return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(workspace);
+    if (ws.rows <= 0 || baseStride < ws.vocab || qStride < ws.vocab || tokenStride <= 0) return false;
+    auto draw = [&](auto typed) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(typed)>>;
+        fastllm_markov::MarkovProposalScores<T> scores{
+            static_cast<const T *>(base), typed, static_cast<const T *>(bias), baseStride, ws.vocab, cap};
+        return DrawGraphProposal16(ws, scores, temperature, topK, topP, rng, step, q, qStride, tokens, tokenStride);
+    };
+    return bf16 ? draw(static_cast<const __nv_bfloat16 *>(adjust)) : draw(static_cast<const half *>(adjust));
 }
 
 bool FastllmCudaMtpRejectionSamplingLogits(float *logits,
