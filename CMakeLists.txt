@@ -428,7 +428,6 @@ if (USE_CUDA)
         src/devices/cuda/fastllm-gguf-t8-extended-iq2.cu
         src/devices/cuda/fastllm-gguf-t8-extended-iq3.cu
         src/devices/cuda/fastllm-gguf-t8-tiled.cu
-        src/devices/cuda/fastllm-gguf-planar-t8.cu
         src/devices/cuda/fastllm-gguf-planar.cu
         src/devices/cuda/fastllm-gguf-planar-mixed.cu
         src/devices/cuda/gguf_mmq/fastllm-gguf-mmq.cu
@@ -4097,7 +4096,9 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_gguf_decode_fusions cuda_gguf_decode_fusions_test "PASS GGUF decode fusions" 600)
         set_tests_properties(cuda_gguf_decode_fusions PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
-        add_executable(cuda_gguf_planar_t8_test test/basic/test_cuda_gguf_planar_t8.cu)
+        add_executable(cuda_gguf_planar_t8_test
+            test/basic/test_cuda_gguf_planar_t8.cu
+            src/devices/cuda/fastllm-gguf-planar-t8.cu)
         target_link_libraries(cuda_gguf_planar_t8_test PRIVATE fastllm)
         set_target_properties(cuda_gguf_planar_t8_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
         fastllm_add_checked_test(cuda_gguf_planar_t8 cuda_gguf_planar_t8_test "PASS planar T8 cases=" 600)
