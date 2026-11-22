@@ -713,6 +713,207 @@ Graph replay 完成后记录新行，每卡批量暂存后统一下载，不将 
 历史归档及恢复包含 CPU/GPU 传输，有固定开销；命中 token 数不等于端到端收益。
 短前缀可能不比重新 prefill 更快，应按实际上下文和命中率测量首 token 延迟及生成速度。
 
+## SWA 验证的 Tensor Core PV
+
+以下分别说明独立算子及整层融合。模型优先尝试满足准入条件的整层路径，
+再按 QKV/core/O 分段回退；分段算子的行数调度不代表整层路径的选择。
+
+SM103 的 BF16 环形 SWA 验证在已有准入范围内，按 query/head 工作量选择输出 tile
+和线程数，并用 BF16 MMA 计算 PV。QK、256-lane softmax 归约树和 BF16 概率舍入
+保持原实现；PV 的 FP32 累加顺序不同，因此不保证与标量路径逐位一致。
+当前覆盖 Q/K=192、V=128、窗口128、每个 KV 头对应8个 query 头，及每卡
+8/16/32个 query 头。每行仍独立解析请求缓存、候选 offset 和运行期长度，
+空行不访问 KV；不假定 batch 等于8或只有一个请求。
+
+大 batch 保留先前的 bulk/query-reuse 调度。其他 SM、FP8 KV、非环形缓存和未满足
+准入条件的布局保留原回退；MMA 指令另有编译期 SM80 下限保护。普通单行调用默认
+继续用原 PV。没有新增环境变量、依赖库、权重副本或全局 scratch，也没有改变
+启动期捕图和运行期 Graph 复用的约定。
+
+`naive_n05_swa_verify` 覆盖因果窗口、候选提交/拒绝、动态缓存换绑、空行、多个请求
+及 KV 头布局。MMA 与标量参考按 BF16 误差界比较，缓存、回退和同一路径 Graph
+replay 仍要求逐位一致。单算子误差界不等于整模 logits 误差界；更换累加顺序时
+需分别报告真实激活上的算子误差及完整模型偏移，不能只用 top-1 一致作为精度结论。
+
+## SWA 验证的多行 QKV/RoPE
+
+SM103、每卡 Q 8 头/KV 1 头、BF16 输入/权重/缓存、Q/K=192、V=128、
+hidden=4096、rotary=64、环形窗口128的验证路径，2～16个候选行使用行间共享权重的
+MMA QKV/RoPE。一个 CTA 同时处理最多8行及16个投影通道，把旋转配对的两列安排在
+同一个 CTA 内，直接写 query 和私有候选 KV 槽，省去独立投影归约和 RoPE 节点。
+8行使用片上共享内存预取权重，以改善多层权重超过 L2 的访问；2～7和9～16行
+保留直接读取。预取资源不足时先退到直接读取，再按原有准入回退。
+各行仍携带自己的请求缓存、候选 offset 和运行期有效长度；支持不同请求、非满8行、
+Graph 指针换绑和失活行。权重保持原行主序，不增加权重副本或全局 scratch。
+
+分段 QKV/RoPE 的普通单行解码及单行验证保留原实现。更大行数、其他 SM、FP8 KV、分页/非环形布局、
+bias、别名或资源不满足要求时回退；已支持的1～7行精确 GEMV 仍作为资源回退。
+主机只在 SM103 准入，设备指令有 SM80 编译期保护，另检查实际 kernel image 的
+PTX 版本与动态共享内存配置。沿用 `FASTLLM_NAIVE_SWA_QKV_FUSION`，不新增开关、
+依赖库或运行期捕图流程。DSA 前端的行数准入不随 SWA 扩大。
+
+MMA 改变投影 FP32 累加顺序，保留投影、RoPE 乘积和 V 缩放的 BF16 舍入边界，
+不承诺整模逐位一致。`naive_n05_qkv_test` 对可精确表示的输入要求完整 query/cache
+逐位一致，并用随机输入分别检查每行 Q/K/V 的相对 L2，避免未写缓存稀释误差。
+还覆盖候选共享、窗口边界、失活行、Graph 重放及拒绝时无写入。
+
+## SWA 验证的分段 QKV 与 attention 融合
+
+上述 SM103 BF16 准入下，2～7 个候选行可以在同一 cooperative kernel 内完成
+QKV/RoPE/私有候选 KV 写入和 attention。每行保留独立的请求缓存、候选 offset、
+运行期有效长度和指针换绑；不要求来自同一个请求。候选 KV 全部写完后通过本卡
+cooperative grid 同步再读取；QKV 和 attention 顺序复用动态共享内存，不新增
+持久 scratch、权重副本或跨卡通信状态。
+
+启动前检查实际 kernel image/PTX、共享内存和整个 grid 的同时驻留能力；首次能力
+检查不在捕图中执行。输出须已经分配，输入/输出/缓存别名及布局在写入前检查。
+资源、形状、架构不满足时返回原 QKV/RoPE 和 attention 路径。8 行继续采用已有
+共享内存预取 QKV 和独立 attention，其独立实测更快；更大行数不进入本项融合。
+沿用 `FASTLLM_NAIVE_SWA_QKV_FUSION` 与 `FASTLLM_NAIVE_SWA_CORE`，任一关闭均回退。
+不新增依赖、环境变量或请求期间捕图逻辑。
+
+融合 QKV 使用 32 个 warp 分摊 K 维，分段路径使用 16 个，FP32 累加顺序不同；
+BF16 投影、RoPE 和 V 缩放边界不变。测试分别检查逐行 Q/K/V/attention 相对 L2，
+未写缓存保持逐位一致，并覆盖失活行、多请求、窗口边界、Graph 重放和无写入拒绝。
+此分段回退仍有前置 AddNorm 和后继 O/TP 边界；满足下文整层融合条件时优先使用整层路径。
+
+## SWA 验证的分段 O 投影与 TP 归约
+
+SWA 多行验证可显式允许 BF16 MMA 投影，将 O、TP 和残差相加合并到一个 kernel。
+当前准入为 SM103、TP8、2～8个连续展平行、O=[4096,1024]，输入/输出为 BF16。
+每行独立投影、归约和残差更新，不要求各行属于同一个请求。其他行数、布局、
+数据类型和架构沿用原投影/通信路径；普通解码与 DSA 不自动启用这项数值策略。
+
+保留原接口及其数值行为。带投影策略的接口只有显式允许时才选择 MMA，
+`orderedProjection` 优先，仍使用原补偿 GEMV或八行 GEMM。MMA 不可用时退回原路径，
+原路径的权重辅助缓存、输出布局和启动期准备要求仍然适用。新内核在初始化时统一
+检查8个设备的实际 kernel image、PTX 版本及整个 cooperative grid 的驻留能力，
+任何设备不支持均保留原实现，不在运行期重新捕图或更换捕获的内核。
+
+MMA 改变本卡投影的 FP32 累加顺序；本卡结果仍先舍入 BF16，通信仍打包两个 BF16，
+接收后按 rank 0～7 的顺序求和并舍入 BF16，残差相加的 BF16 边界也保持不变。
+沿用已有 mailbox、每行代际计数和图工作区；只在 CTA 的共享内存中暂存输入与部分和，
+没有新增常驻权重副本、通信缓冲、依赖库或环境变量。MMA 本身无需 BLAS bias cache，
+可直接读取借用的连续行主序权重。
+
+`naive_n05_swa_output_mma` 覆盖2～8行数值、Graph/eager逐位一致、借用权重、
+单个rank不满足准入时的集体拒绝、不同形状排队和代际回绕；另保留旧路径与
+禁用融合测试。真实激活误差及完整 logits 偏移需分别报告，单算子误差不能替代
+生成质量评估。
+
+## SWA 验证的整层融合
+
+SM103、TP8、BF16 的驻留验证路径可把上一层 FFN 残差、输入 RMSNorm、
+QKV/RoPE/候选 KV、SWA attention、O 投影、TP 归约与残差相加放入一个
+cooperative kernel。后继 post-attention RMSNorm/router 继续使用独立融合算子。
+使用原始行主序 BF16 权重、既有工作区和八行 mailbox，不生成权重副本或新增持久缓冲。
+
+算子支持 1～64 个展平查询行；模型默认仅在 1～16 行使用整层融合，超过 16 行
+保留原整块 GEMM 分派，避免大批次因查询分块重复读权重而变慢。
+每请求候选 offset 为 0～7，允许多个请求、不同候选长度、
+失活行及 GPU 指针表换绑。它不表示一个请求支持 64 个连续候选。
+1～8 行按 CTA 归一化并用 Tensor Core QK/PV；9～64 行优先逐行归一化一次，
+QKV 和 O 投影让每个原始权重片段服务两个 N8 查询块，attention 使用 Tensor Core QK/PV。
+归一化向量读取 residual 后仍按原逐线程顺序累加，保留 BF16 舍入边界；QKV/O 从现有
+normed/attention 工作区直接读入寄存器，动态 shared memory 为 32 KiB。
+任一 rank 不支持该实现时，整组回退原 N8 staging 与标量 QK 路径，继续使用同一个
+八行 mailbox；没有新增权重缓存或显存缓冲。所有候选写入完成后才允许相应 attention
+读取，最后一次 grid 同步保证更新 hidden 前所有输入读者已退出。
+草稿所需上一层特征在加入 attention 残差之前导出，保留 BF16 相加的数值边界。
+
+几何条件为 hidden=4096、每卡 Q=8/KV=1、QK=192/V=128、rotary=64、窗口128，
+环形 KV 至少容纳 136 行。整个 TP 组在写入前共同检查形状、类型、容量、布局、别名、
+实际 kernel image、共享内存及 cooperative grid 驻留能力。不支持时共同返回分段路径，
+补齐延迟残差、输入归一化和草稿特征，继续使用既有 QKV/core/O 逐级回退。
+更新 residual 的 MoE 后端不强制延迟，混推、其它 SM 和其它形状保留原来的调用方式。
+
+沿用 `FASTLLM_NAIVE_SWA_FUSION`、`FASTLLM_NAIVE_SWA_QKV_FUSION`、
+`FASTLLM_NAIVE_SWA_CORE`；任一关闭均不使用新的整层融合，没有新环境变量或外部库依赖。
+能力探测在 TP 初始化时完成；图所需缓冲、通信指针和草稿特征均在启动预热时准备，
+请求期间只重放既有图，不增加运行期捕图。
+
+`naive_n05_swa_verify_layer` 和禁用测试覆盖 TP8 数值、草稿特征、不同请求长度、
+单卡拒绝导致整组回退，以及一次捕图后的长度变化和 KV 换绑。数值检查按输出行和
+实际写入的候选 KV 行计算相对 L2（阈值0.3%），未写 KV 和草稿特征要求逐位一致。
+资源准入测试另覆盖可选 kernel 的 image、共享内存及驻留能力失败，确认旧后端仍可用。
+BF16 MMA 和归一化归约允许受控数值差异；完整 logits 和采样轨迹应另作模型级检查。
+
+
+## DSA 验证的多请求调度
+
+SM103 整层融合在 9～16 个展平查询行时使用两组 N8，共享 QKV、Indexer
+投影及 O 投影的权重读取。每行的 FP32 累加顺序和 BF16 舍入边界保持原样；
+TP 输出仍复用原来的八行 mailbox，并按两段完成通信，不扩展通信存储。
+
+两个请求的有效长度均不超过 16384、且 cooperative grid 能均分时，
+Indexer 和 Top-K 使用两个独立的 CTA 子组并行执行。每个子组保留自己的
+Top-K 分支和完成代数；即使一个请求为空，或两者分别走 local/grid Top-K，
+也不要求两个请求经过相同数量的同步点。其计数器在进入子组前通过全 grid
+同步初始化，子组中的 CTA 均由 cooperative launch 保证驻留。
+子组临时区把 logit stride 缩到 16K，并复用选择阶段尚未使用的 attention
+空间，两个视图仍落在原来的单请求 64K workspace 内。超过 16K、请求数不符
+或 grid 不能均分时，设备端自动恢复逐请求 Indexer/Top-K；Graph 重放也能跨越边界。
+
+所有请求的选中索引写入已有 layer workspace 后，attention 按查询行和 split
+统一分派。生产阶段不等待其他 CTA，全 grid 发布 partial 后再分派 head/value
+归约，避免任务数超过驻留 CTA 数时相互等待。它借用已经失活的 logit 区域，
+不新增 GPU allocation、权重副本、环境开关或 serving capture。
+输入仍使用各请求独立的 cache、页表和 live length；整体融合的行数上限及
+更大 batch 的既有回退保持不变。
+
+naive_n05_dsa_layer_test 覆盖不等长请求、多请求、独立 stream/Graph、TP8、
+分页及指针换绑，并重放 16K 和每子组单 tile 的边界两侧，以及两个请求使用
+不同 Top-K 分支的情形。误差准则仍为逐行 L2 <= 0.006*reference_L2 + 1e-6。
+
+两个完整的八行请求还可使用八个 attention split，每个 split 最多处理 256 个
+选中 token；归约 CTA 覆盖一个 head 的全部 128 个 value 通道。两阶段分别为
+128 个任务，减少在驻留 grid 上的第二波任务。partial 的物理 stride 仍为原来
+16 个 split，复用原空间；只扩大 CTA shared memory，不新增显存工作区。
+更高 shared memory 的可选 kernel 在预热时检查 image 和驻留能力；不满足时，
+或请求数/行数不是两个完整八行请求时，继续使用 16 split、64 通道的调度。
+这一改变调整 softmax 分段合并顺序，继续使用上述逐行 L2 阈值与独立 stream/TP 测试。
+
+## 草稿 Head 与 context 的请求分组
+
+TP8 融合草稿的 verification composite 将请求按两个一组执行 Head 投影，
+同一权重片段服务两个 N8 输入。每请求保持原来的八路 FP32 累加、BF16 舍入、
+Markov 七步采样、随机种子和 mailbox。第二组小输入直接读取，复用原 partial
+空间；仅 shared memory 多保留一组 logits。完整拒绝采样概率继续异步导出。
+
+prepared context 也按两个请求共享 FC 权重读取，保持每请求四路 FP32 累加顺序；
+TP 归约、归一化、五层 KV 投影和写入仍按请求顺序进行。两组 FC 暂存都放入原
+context shared memory 中，复用原 lane 工作区。每请求的接受长度、位置和 cache
+指针独立；若 cache 或输入/cache 区间存在交叉别名，设备端回退逐请求执行并
+在请求间完成全 grid 同步，保留原先的读写依赖。
+
+分组有固定上限，更多请求重复两请求组，奇数尾部用原单请求 kernel；所有设备
+必须通过可选 kernel 的 image/shared-memory/驻留探测，否则整组保留原路径。
+不新增权重副本、GPU allocation、环境变量或 serving capture。
+`tests/naive_n05_draft_fused/head.py` 检查 1～8 请求的采样和导出结果逐位一致；
+`context.py` 检查动态接受数、不同请求长度、奇数尾部、缓存历史/边界保护和两类
+别名回退，数值阈值仍为逐行相对 L2 <= 0.006。加 `--bench` 可测 composite 入口，
+该时间包含提交及跨卡等待，算子纯时间另用 NSYS 分析。
+
+## 多请求验证的分段算子分派
+
+超过整层融合的 16 行边界后，SM103 的分段验证路径按工作量选择 core：
+
+- BF16 环形 SWA、支持的 Q/KV head 比例和候选 offset 保持原准入。
+  32 行及以上、`Q heads × rows <= 320` 时优先使用现有逐行 Tensor Core core；
+  更大工作量继续使用 query-reuse/bulk 路径。描述符分块和请求独立 KV 绑定不变。
+- H4096、256 experts、16 字节对齐的 FP32 Router 权重，在超过 16 行且
+  exact-batch 策略允许时，每个 CTA 让 8 行共享 8 个 expert 的原始权重。
+  残差/RMSNorm 的 BF16 边界不变；Router FP32 点积改变归约顺序，按单算子
+  绝对误差 `<1e-5`、相对 L2 `<1e-6` 校验，并检查测试输入的 Top-K ID 一致。
+  小行数、其它架构、形状、对齐和 exact-batch 限制保留原分派。
+- DSA cooperative core 内部仍按最多 8 行依次处理。24～31 行且全部缓存
+  capacity 不超过 32768 时，选择既有批量 indexer＋attention 路径；更长
+  上下文继续使用原 cooperative core，32 行及以上沿用原批量路径。
+  分派只使用静态形状/容量，不读取设备上的实时长度，也不在请求期间重新捕图。
+
+这些分派不新增 GPU 工作区、权重副本或环境变量。测试覆盖独立请求、
+尾块、32 行边界、较大行数、动态长度、KV/page 换绑及并行 CUDA Graph；
+DSA 另检查 64K 容量仍可使用原融合路径。
 ### DSpark 工具约束采样图
 
 CUDA 的非贪婪 DSpark 采样支持 MiMo 工具语法约束，无需额外开关。

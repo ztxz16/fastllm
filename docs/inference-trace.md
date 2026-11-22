@@ -116,3 +116,99 @@ these rejections; fingerprint matches still require exact token equality, and
 residency is checked on every pass. Admission sorting captures request pointers
 under the request-table lock instead of looking them up for each comparison;
 queue-time, phase, length and handle ordering are unchanged.
+
+
+## Naive 无推测解码：启动准备与 GPU 交接
+
+Naive TP 的目标模型图在 `WarmUp()` 中一次性准备。启用 CUDA Graph 后，按照
+配置的最大 batch 和 KV 容量建立图表；batch 按既有 bucket 补齐，设备上的
+`liveKeys=0` 表示无效行。所有变体共享权重和 scratch，不复制权重。
+运行中只查询、重绑定、重放已准备的图；未覆盖的 batch/容量、混合 DSA 长度区间、
+2048 边界、设备/算子能力不支持或启动捕获失败，都走原有 eager 路径。
+启动后修改配置使图失效时，不再补捕图。Naive 的 draft/verification 路径也遵循下述启动准备策略；
+其他模型的默认图生命周期不变。
+
+启动日志分别打印模型图和 decode pipeline 在所有 TP rank 上准备成功的形状数。
+算子是否适合捕获由实际 warmup 和已有架构/布局检查决定，不再以 MegaMoE 后端
+名称作为前置条件。现有 SM 专用算子仍按各自支持范围调度；缺少专用实现时保留
+普通 CUDA 路径，不能安全捕获的路径使用 eager。
+
+普通 full-vocabulary top-p decode 使用两个结果槽：每 rank 的模型与 logits
+汇聚完成后记录 Event，采样流等待全部 rank；设备随机状态随请求推进，采样结果
+异步复制到 pinned 主机缓冲。下一步模型可以先提交，GPU 通过 Event 等待实际采样
+结果，再读取 token、更新 position/live length。P2P 可用时融合设备读取与状态更新；
+否则使用 CUDA 复制。两者都只在启动时准备图，不需要特定 SM 的 PDL 或设备端图启动。
+
+框架最多提前提交一轮目标模型计算，并非草稿推测。输出结束、取消、batch 变化、
+新请求加入或 KV 扩页边界会排空在途结果，再返回原调度路径。必须在排空后才能
+发布终止状态、回收 KV；结束请求的额外结果不发布，其余请求的有效结果正常提交。
+重复惩罚、grammar/mask、返回 logits、历史前缀存储等需要同步语义的请求，保持
+原同步 Forward。通用调度器的可选 `DecodePipeline` 接口默认关闭，其他模型不受影响。
+
+采样图和 GPU 交接统一遵循现有 CUDA Graph 配置，只有能力检查通过才使用，
+不提供独立实验开关。额外存储包括概率、参数、两个
+小 token 槽、Event 和图执行元数据；没有增加原始或 packed 权重副本。FlashInfer
+仅在已有源码内增加可选的逐请求 RNG 参数，默认模板参数维持旧调用行为，没有新增依赖。
+
+交接图的 trace `mode` 为 `cuda_graph_pipeline`。这一模式的 rank
+`model_gpu_ms` 包含设备输入更新和已组合的 logits 汇聚；`forward_ms` 记录提交路径，
+不包含后续消费者的 token 等待，不能用它倒数代替端到端 token 吞吐。采集 CUDA Event
+会等待模型完成，扰动异步流水，应使用关闭 trace 的结果作为正式速度。
+
+相关回归测试：
+
+```sh
+ctest --test-dir build-fastllm --output-on-failure -R \
+  '^(decode_pipeline|cuda_decode_sampling|naive_n05_serving_metadata|naive_n05_serving_pipeline|naive_n05_serving_pipeline_fallback|naive_n05_serving_graph_fallback|naive_n05_tp_graph)$'
+```
+
+其中模型流水测试检查实际交接图执行次数，并把 batch 1/3/5/9/16、请求缩减后的
+每一步完整 logits 与相同 token 历史的普通前向比较。采样测试独立检查请求重排、
+padding、RNG 推进和取消后的槽复用；不能把两次独立随机采样 token 相同作为唯一的
+正确性标准，BF16 舍入可能产生并列最高分。
+独立 TP fixture 使用未被启动图覆盖的小 head/window，检查 legacy/paged KV 的
+普通执行、请求回收和零运行期捕图；支持形状的重放及失败回退由 serving 测试覆盖。
+
+
+## Naive 推测解码：启动图与并发状态
+
+`WarmUp()` 在最终 KV 布局确定后准备 verification 图，以及草稿 backbone 和
+full-vocabulary proposal 图。草稿 KV 通过设备指针表重绑定，图不持有某个请求的
+KV 地址；候选 logits/hidden 使用模型持有的共享 activation 工作区，不复制权重。
+草稿模型保留原有短/长 attention 算法。图只覆盖准备成功的实际 batch、验证长度和
+容量；未覆盖形状及不支持的布局/算子走 eager，不在请求中捕获。
+verification 在捕获前遍历所有形状，直到共享工作区地址稳定且支持的形状均完成
+warmup，再统一 capture。最大形状未必覆盖小形状的工作区分支；后者新增分配会使
+前者的 warmup 状态失效。若有界准备仍不能稳定，保留 eager 回退，不在运行期补图。
+
+proposal 图执行多步 Markov 投影、温度采样和置信度计算，统一读回候选及置信度。
+超过首个置信度截断位置的计算结果全部丢弃，拒绝采样和 KV 提交仍只使用有效前缀。
+目标分布 p 继续应用用户 top-p 配置，q 保存的是实际用于抽取候选的温度 softmax。
+目标验证的 logits 汇聚使用 rank Event；主机提交线程不必先等待所有 GPU 执行完毕。
+输入使用固定容量的 pinned 缓冲异步上传，前一轮结果和提交完成后才能复用。
+
+单请求优先使用实际候选长度的验证图，置信度截断后无需固定补到 8 行；只有精确
+形状不可用而 8 行图可用时才补齐。置信度模式仅在相应 batch 的验证图已准备成功时
+合批，并在预算允许时做因果 padding。
+原始固定行数 TP Flex 后端保留 8 行限制；Shared Flex TP 使用既有的每 8 行分块适配，
+可以准备更大的验证图。在最大并发数和后端支持范围内，验证、草稿及 proposal 均准备
+1–8 请求的精确形状；更大未覆盖的请求数或混合尾部预算优先拆成已准备的批次，剩余请求
+独立处理。每个子批完成拒绝采样和 KV 提交后才复用共享工作区，不通过伪造请求或共享 KV
+来补齐。缩 batch、不同接受长度、请求加入、
+取消和尾部预算均通过实际请求的长度、独立 pending 队列和 KV 提交处理。
+整批 proposal 的 q 由该轮共同持有；逐请求回退使用各请求独立的概率缓冲，不能共享
+单轮 proposal 缓冲而覆盖此前请求的 q。
+
+`GraphCaptureScope` 将请求期的禁止捕图约束传递到 persistent workers，包括底层
+cuBLASLt 调优和 MoE 子图入口。未见过的 GEMM 在请求期采用受支持的 heuristic，
+不会临时捕获测量图。作用域只限制当前调用及其子任务，不改变全局开关或其他模型；
+异常退出和工作线程复用会恢复原策略。无新增环境变量或依赖库。
+
+新增 `naive_n05_speculative_serving_{graph,batch5,batch8,failbegin,failinstantiate}` 覆盖启动封存、
+完整 verification logits、请求并发/加入/不同预算、置信度截断、参数变化和捕获失败。
+其中 batch5 覆盖未对齐的最大并发数和单卡草稿的历史缓存；
+支持形状必须全部准备成功，并逐一检查多请求验证确实重放所有 rank 的图。
+batch8 对重排和逐步缩减到 1 请求的完整验证 logits、不同接受长度和 KV 回滚做独立 eager 对照。
+`naive_n05_draft_unbound_fallback` 强制不支持设备 KV 重绑定的 attention 回退，
+检查请求重排后的完整 hidden/KV 以及零 batch 图重放。
+直接算子捕获测试显式进入准备状态；正式 serving 测试要求请求期捕获计数保持不变。
