@@ -21,6 +21,7 @@ struct Workspace {
     int device = 0;
     Partial *partials = nullptr;
     int *results = nullptr, *hostResults = nullptr;
+    cudaEvent_t resultReady = nullptr;
     float *temperatures = nullptr;
     unsigned long long *counter = nullptr;
     void *descriptors = nullptr;
@@ -32,11 +33,14 @@ struct Workspace {
     ~Workspace() {
         int previous = device;
         cudaGetDevice(&previous); cudaSetDevice(device);
+        if (resultReady) cudaEventDestroy(resultReady);
         cudaFree(partials); cudaFree(results); cudaFreeHost(hostResults);
         cudaFree(temperatures); cudaFree(counter); cudaFree(descriptors);
         cudaSetDevice(previous);
     }
     bool Prepare(size_t partialCount, size_t resultCount) {
+        if (resultCount && !resultReady &&
+            cudaEventCreateWithFlags(&resultReady, cudaEventDisableTiming) != cudaSuccess) return false;
         if (!counter) {
             if (cudaMalloc(&counter, sizeof(*counter)) != cudaSuccess ||
                 cudaMemsetAsync(counter, 0, sizeof(*counter), cudaStreamPerThread) != cudaSuccess)
@@ -187,11 +191,14 @@ __global__ void FinishDraftKernel(const Partial *partials, float *lse, int *outp
         if (row == 0) ++*counter;
     }
 }
-template<bool Indirect = false, bool Probability = false>
+// Small host token batches travel in the launch packet. CUDA copies kernel
+// arguments before returning; no asynchronous reference to caller storage.
+struct HostDraftIds { int values[64]{}; };
+template<bool Indirect = false, bool Probability = false, bool HostIds = false>
 __global__ void AcceptKernel(const float *p, const float *logits, const float *lse,
         const int *draftIds, int *result, int drafts, int vocab, int batch,
         unsigned long long seed, const unsigned long long *counter,
-        const FastllmMtpProposalView *proposals = nullptr) {
+        const FastllmMtpProposalView *proposals = nullptr, HostDraftIds hostIds = {}) {
     if (threadIdx.x) return;
     int b = blockIdx.x, offset = b * (drafts + 1), accepted = 0;
     const float *qLogits, *qLse;
@@ -201,7 +208,9 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
         ids = proposals[b].tokens;
     } else {
         qLogits = logits + (size_t)b * drafts * vocab;
-        qLse = Probability ? nullptr : lse + b * drafts; ids = draftIds + b * drafts;
+        qLse = Probability ? nullptr : lse + b * drafts;
+        if constexpr (HostIds) ids = hostIds.values + b * drafts;
+        else ids = draftIds + b * drafts;
     }
     for (int i = 0; i <= drafts; ++i) result[offset + i] = -1;
     curandStatePhilox4_32_10_t rng;
@@ -310,25 +319,37 @@ bool FastllmCudaMtpSampleDraftLogits(const float *logits, float *saved, float *l
     return cudaGetLastError() == cudaSuccess;
 }
 
-template<bool Probability>
+template<bool Probability, bool HostIds = false>
 static bool FastllmMtpReject(const float *p, const float *logits,
         const float *lse, const int *draftIds, int *output, int *accepted,
-        int batch, int drafts, int vocab) {
+        int batch, int drafts, int vocab,
+        void (*enqueue)(const int *, void *) = nullptr, void *context = nullptr) {
     if (!p || !logits || (!Probability && !lse) || !draftIds || !output || !accepted ||
         batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
     auto &ws = GetWorkspace();
     int blocks = (vocab + Tile - 1) / Tile, count = batch * (drafts + 2);
     if (!ws.Prepare((size_t)batch * blocks, count)) return false;
-    AcceptKernel<false, Probability><<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse, draftIds,
-        ws.results, drafts, vocab, batch, ws.seed, ws.counter);
+    HostDraftIds hostIds;
+    if constexpr (HostIds) {
+        if (batch > int(sizeof(hostIds.values) / sizeof(int)) / drafts) return false;
+        std::copy_n(draftIds, batch * drafts, hostIds.values);
+    }
+    AcceptKernel<false, Probability, HostIds><<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse,
+        HostIds ? nullptr : draftIds, ws.results, drafts, vocab, batch, ws.seed, ws.counter, nullptr, hostIds);
     ResidualKernel<false, Probability><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
         p, logits, lse, ws.results, ws.partials, drafts, vocab, batch, blocks, ws.seed, ws.counter);
     FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
         ws.partials, ws.results, drafts, batch, blocks, ws.counter);
     if (cudaGetLastError() != cudaSuccess ||
         cudaMemcpyAsync(ws.hostResults, ws.results, count * sizeof(int), cudaMemcpyDeviceToHost,
-            cudaStreamPerThread) != cudaSuccess || cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)
-        return false;
+            cudaStreamPerThread) != cudaSuccess) return false;
+    if (enqueue) {
+        // Join only the result export; the callback may queue context work on
+        // this stream. Its request owner separately fences those consumers.
+        if (cudaEventRecord(ws.resultReady, cudaStreamPerThread) != cudaSuccess) return false;
+        enqueue(ws.results + batch * (drafts + 1), context);
+        if (cudaEventSynchronize(ws.resultReady) != cudaSuccess) return false;
+    } else if (cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) return false;
     std::copy_n(ws.hostResults, batch * (drafts + 1), output);
     std::copy_n(ws.hostResults + batch * (drafts + 1), batch, accepted);
     for (int b = 0; b < batch; ++b) {
@@ -348,6 +369,12 @@ bool FastllmCudaMtpRejectionFromProbs(const float *p, const float *logits,
 bool FastllmCudaMtpRejectionFromProbabilities(const float *p, const float *q,
         const int *draftIds, int *output, int *accepted, int batch, int drafts, int vocab) {
     return FastllmMtpReject<true>(p, q, nullptr, draftIds, output, accepted, batch, drafts, vocab);
+}
+
+bool FastllmCudaMtpRejectionFromHostProbabilities(const float *p, const float *q,
+        const int *draftIds, int *output, int *accepted, int batch, int drafts, int vocab,
+        void (*enqueue)(const int *, void *), void *context) {
+    return FastllmMtpReject<true, true>(p, q, nullptr, draftIds, output, accepted, batch, drafts, vocab, enqueue, context);
 }
 
 bool FastllmCudaMtpSampleDraftLogitsBatch(const float *logits,

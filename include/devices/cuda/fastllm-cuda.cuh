@@ -1888,6 +1888,16 @@ bool FastllmCudaMtpSampleDraftBatchDevice(float *logits, float *proposalProbs,
 bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
     float temperature, int topK, float topP, int *output, int vocabSize,
     fastllm::Data &workspace);
+// Optional device consumer, invoked synchronously after sampling is queued on
+// cudaStreamPerThread. Unsupported backends omit the callback and still return
+// ordinary host results. Counts contain one accepted-prefix length per request;
+// consumers must finish before this caller/device's next rejection sampling.
+// Cross-stream consumers must establish their own producer/completion fences.
+bool FastllmCudaMtpRejectionSamplingWithConsumer(float *logits, float *proposalProbs,
+    const float *temperatures, const int *topKs, const float *topPs,
+    const int *draftTokenIds, int *output, int *acceptedDraftTokens,
+    int batch, int draftTokens, int vocabSize,
+    void (*enqueue)(const int *, void *), void *context);
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,
@@ -1981,7 +1991,12 @@ bool FastllmCudaDFlashMergeTopK(
                                   int ranks, int localRows,
                                   int firstRow, int outputRows,
                                   int topk);
-// Token rows point to local/UVA peer results. Zero live lengths mark padding.
+// Advance active positions/live lengths in the three-plane decode input buffer.
+// tokens may be a UVA peer pointer only after peer access has been enabled.
+bool FastllmCudaAdvanceDecodeInput(void *storage, int stride, int rows,
+                                   const float *tokens = nullptr);
+// tokenRows is a device table of local/UVA peer token addresses, rebound only
+// while the decode pipeline is drained. Zero live lengths mark padded rows.
 bool FastllmCudaAdvanceMappedDecodeInput(void *storage, int stride, int rows,
         const float *const *tokenRows, float *localPositions, int *localLengths, int localRows);
 // Per-request seeds/counters preserve sampling across batch reorder and replay.
@@ -2002,6 +2017,16 @@ bool FastllmCudaTopKTopPSamplingToDevice(
                                   int penaltyTokens,
                                   int *output, float *floatOutput,
                                   int batch, int vocabSize);
+// Optional caller-owned scratch for long-vocabulary decode softmax. No allocation
+// or capture occurs in these calls; missing/undersized scratch keeps the old path.
+size_t FastllmCudaSamplingSoftmaxWorkspaceSize(int batch, int vocabSize);
+bool FastllmCudaTopKTopPSamplingWithWorkspace(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr, float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors, int penaltyTokens,
+                                  int *output, float *floatOutput, int batch, int vocabSize,
+                                  uint64_t *requestSeeds, uint64_t *requestOffsets,
+                                  void *softmaxWorkspace, size_t softmaxWorkspaceBytes);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
 bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,

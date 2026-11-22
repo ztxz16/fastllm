@@ -37,6 +37,82 @@ extern "C" bool FastllmCudaGraphInstantiate(void *graph, void **exec) {
 using namespace fastllm;
 static void Check(bool ok, const char *why) { if (!ok) throw std::runtime_error(why); }
 
+static void SoftmaxWorkspaceChecks() {
+    Check(FastllmCudaSamplingSoftmaxWorkspaceSize(0, 152576) == 0 &&
+          FastllmCudaSamplingSoftmaxWorkspaceSize(65, 152576) == 0 &&
+          FastllmCudaSamplingSoftmaxWorkspaceSize(1, 4096) == 0, "softmax fallback admission");
+    for (int rows : {1,3,8,65}) for (int vocab : {4096,65536,152577}) {
+        struct Buffers {
+            std::vector<void *> pointers;
+            void *Make(size_t bytes) { void *p=nullptr; Check(cudaMalloc(&p,bytes)==cudaSuccess,"test allocation"); pointers.push_back(p); return p; }
+            ~Buffers() { for(auto p:pointers) cudaFree(p); }
+        } buffers;
+        size_t count=(size_t)rows*vocab, bytes=count*sizeof(float);
+        std::vector<float> logits(count), temperatures(rows), topPs(rows,.95f), reference(count), result(count);
+        std::vector<int> topKs(rows,vocab), tokens(rows);
+        std::vector<uint64_t> seeds(rows,123), offsets(rows,0);
+        for(int r=0;r<rows;++r) {
+            temperatures[r]=r%3==0?.4f:r%3==1?1.f:2.f;
+            for(int v=0;v<vocab;++v) logits[(size_t)r*vocab+v]=v%97==0?-INFINITY:3.f*std::sin(v*.071f+r);
+        }
+        auto upload=[&](const void *host,size_t n) {void *p=buffers.Make(n);Check(cudaMemcpy(p,host,n,cudaMemcpyHostToDevice)==cudaSuccess,"test upload");return p;};
+        auto *x=(float*)upload(logits.data(),bytes), *y=(float*)buffers.Make(bytes);
+        auto *ts=(float*)upload(temperatures.data(),rows*4), *ps=(float*)upload(topPs.data(),rows*4);
+        auto *ks=(int*)upload(topKs.data(),rows*4), *out=(int*)buffers.Make(rows*4);
+        auto *fo=(float*)buffers.Make(rows*4);
+        auto *rs=(uint64_t*)upload(seeds.data(),rows*8), *ro=(uint64_t*)upload(offsets.data(),rows*8);
+        const size_t scratchBytes=FastllmCudaSamplingSoftmaxWorkspaceSize(rows,vocab);
+        void *scratch=buffers.Make(std::max<size_t>(scratchBytes+8,16));
+        for(int mode=0;mode<(rows==1 && vocab==65536?5:2);++mode) {
+            Check(cudaMemcpy(ro,offsets.data(),rows*8,cudaMemcpyHostToDevice)==cudaSuccess,"offset reset");
+            bool ok=mode==0 ? FastllmCudaTopKTopPSamplingToDeviceWithRng(x,y,ts,ks,ps,nullptr,nullptr,0,out,fo,rows,vocab,rs,ro) :
+                FastllmCudaTopKTopPSamplingWithWorkspace(x,y,ts,ks,ps,nullptr,nullptr,0,out,fo,rows,vocab,rs,ro,
+                    mode==4?nullptr:mode==3?(char*)scratch+1:scratch, mode==2?1:scratchBytes);
+            Check(ok && cudaStreamSynchronize(cudaStreamPerThread)==cudaSuccess,"workspace sampling launch");
+            Check(cudaMemcpy(result.data(),y,bytes,cudaMemcpyDeviceToHost)==cudaSuccess,"probability readback");
+            Check(cudaMemcpy(tokens.data(),out,rows*4,cudaMemcpyDeviceToHost)==cudaSuccess,"token readback");
+            if(mode==0) reference=result;
+            for(int r=0;r<rows;++r) {
+                double err=0,scale=0,sum=0;
+                for(int v=0;v<vocab;++v) {
+                    size_t i=(size_t)r*vocab+v;double a=result[i],b=reference[i];
+                    Check(std::isfinite(a)&&a>=0,"invalid probability");
+                    err+=(a-b)*(a-b);scale+=b*b;sum+=a;
+                }
+                Check(std::sqrt(err/scale)<5e-6 && std::abs(sum-1)<5e-6,"tiled softmax probability error");
+                Check(tokens[r]>=0 && tokens[r]<vocab,"workspace sampler token range");
+            }
+            if(mode>=2 || !scratchBytes) Check(result==reference,"workspace fallback changed arithmetic");
+        }
+    }
+}
+static void MixedSoftmaxBuckets() {
+    // The largest bucket uses the legacy softmax while the smaller one uses
+    // tiled softmax. Both must be ready before any request is submitted.
+    constexpr int rows = 65, vocab = 65536, expectedToken = 17;
+    std::vector<float> values(rows * vocab, -100.f);
+    for (int row = 0; row < rows; ++row) values[row * vocab + expectedToken] = 100.f;
+    Data logits(FLOAT32, {rows, vocab}, values);
+    logits.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
+    CudaDecodeSampling sampler;
+    Check(sampler.Prepare(logits, {1, rows}, 12345), "mixed softmax bucket prepare");
+#ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
+    const int captures = captureCalls.load(), instantiates = instantiateCalls.load();
+#endif
+    int step = 0;
+    for (int batch : {1, rows, 1}) {
+        std::vector<CudaDecodeSampling::Request> requests;
+        for (int row = 0; row < batch; ++row)
+            requests.push_back({uint64_t(row + 1), uint64_t(step), 1.f, .95f, vocab});
+        const int slot = step++ % 2;
+        Check(sampler.Submit(requests, slot), "mixed softmax bucket submit");
+        for (int token : sampler.Collect(slot)) Check(token == expectedToken, "mixed softmax bucket result");
+    }
+#ifdef FASTLLM_TEST_DECODE_SAMPLING_HOOKS
+    Check(captureCalls == captures && instantiateCalls == instantiates, "runtime softmax graph recapture");
+#endif
+}
+
 static void ConcurrentSamplers(int vocab) {
     std::exception_ptr failures[2];
     auto run=[&](int worker) {try {
@@ -57,9 +133,11 @@ static void ConcurrentSamplers(int vocab) {
     std::thread a(run,0),b(run,1);a.join();b.join();
     for(auto e:failures) if(e) std::rethrow_exception(e);
 }
-static void ConstraintSamplingChecks(bool sequentialTopK) {
-    constexpr int capacity = 4, vocab = 513;
-    auto words = std::make_shared<std::vector<std::string>>(vocab, "z");
+static void ConstraintSamplingChecks(int vocab, bool sequentialTopK) {
+    constexpr int capacity = 4;
+    auto words = std::make_shared<std::vector<std::string>>(513, "z");
+    // Empty padding produces wholly masked tiles in the large-vocabulary case.
+    words->resize(vocab);
     for (int i = 0; i < 256; ++i) (*words)[i] = std::string(1, char(i));
     const std::vector<std::string> extra = {"<tool_call>", "<function=A>", "<parameter=x>",
         "</parameter></function></tool_call>", "<eos>", "<think>", "</think>", "<function=B>", ""};
@@ -322,12 +400,17 @@ int main(int argc, char **argv) {
     if (cudaGetDeviceCount(&count) != cudaSuccess || !count) { std::cout << "FASTLLM_TEST_SKIP_NO_DEVICE\n"; return 0; }
     FastllmCudaSetDevice(0);
     const int rows = 8, vocab = argc>1?std::stoi(argv[1]):4096;
+    if (vocab > 4096) {
+        SoftmaxWorkspaceChecks();
+        MixedSoftmaxBuckets();
+    }
     Data logits(FLOAT32, {rows,vocab}, std::vector<float>(rows*vocab,0));
     logits.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     if(vocab>4096) ConcurrentSamplers(vocab);
     InPlaceSamplingChecks();
-    ConstraintSamplingChecks(false);
-    ConstraintSamplingChecks(true);
+    const int constraintVocab = vocab > 4096 ? 65536 : 513;
+    ConstraintSamplingChecks(constraintVocab, false);
+    ConstraintSamplingChecks(constraintVocab, true);
     SequentialSamplingChecks(vocab);
     ShardedSamplingChecks();
     ShardedSamplingChecks(true);
@@ -380,10 +463,15 @@ int main(int argc, char **argv) {
     // The input update uses zero live length as its padding contract.
     Data state(FLOAT32,{3,8},std::vector<float>(24,0));
     auto *p=(float*)state.cpuData;auto *n=(int*)(p+16);
-    p[8]=11;p[9]=101;n[0]=12;n[1]=102;
+    p[8]=10;p[9]=100;n[0]=11;n[1]=101;
     state.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     Data next(FLOAT32,{4},std::vector<float>{17,18,19,20});
     next.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
+    Check(FastllmCudaAdvanceDecodeInput(state.cudaData,8,4,(const float *)next.cudaData),"input advance");
+    state.ToDevice(DataDevice::CPU);
+    p=(float*)state.cpuData;n=(int*)(p+16);
+    Check(p[0]==17 && p[1]==18 && p[2]==0 && p[8]==11 && p[9]==101 && n[0]==12 && n[1]==102 && n[2]==0 && p[10]==0,"input advance/padding semantics");
+    state.ToDevice(DataDevice::CUDA, std::vector<int>{0}, true);
     const float *mapped[4]{(float *)next.cudaData + 3, (float *)next.cudaData, nullptr, nullptr};
     Data mapping(INT32, {int(sizeof(mapped) / sizeof(int))});
     mapping.ToDevice(DataDevice::CUDA, std::vector<int>{0}, false); mapping.Allocate();

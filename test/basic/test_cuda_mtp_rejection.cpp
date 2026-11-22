@@ -553,12 +553,63 @@ void LargeVocabularyCase() {
     }
     std::puts("large-vocabulary dispatch boundaries, masks, ties, joint filtering: PASS");
 }
+
+void AcceptedConsumerCase() {
+    // Point masses give an exact acceptance oracle, including ragged prefixes.
+    const int vocab = 16384;
+    for (int batch : {1, 2, 4, 8, 9, 16}) for (int drafts : {1, 3, 7, 8}) {
+        const int rows = batch * (drafts + 1);
+        std::vector<float> logits((size_t)rows * vocab, -INFINITY);
+        std::vector<float> probs((size_t)batch * drafts * vocab, 0);
+        std::vector<float> temperatures(rows, .4f), topPs(rows, .95f);
+        std::vector<int> topKs(rows, vocab), ids(batch * drafts), expected(batch);
+        for (int b = 0; b < batch; ++b) {
+            expected[b] = (b + drafts / 2) % (drafts + 1);
+            for (int d = 0; d <= drafts; ++d) {
+                int token = 3 + b * 23 + d;
+                logits[((size_t)b * (drafts + 1) + d) * vocab + token] = 0;
+                if (d < drafts) {
+                    int proposal = d < expected[b] ? token : token + 500;
+                    ids[b * drafts + d] = proposal;
+                    probs[((size_t)b * drafts + d) * vocab + proposal] = 1;
+                }
+            }
+        }
+        Buffer input(logits), proposal(probs), consumed(batch);
+        struct Consumer { int *output; int count; int calls = 0; };
+        Consumer consumer{reinterpret_cast<int *>(consumed.p), batch};
+        auto enqueue = [](const int *accepted, void *opaque) {
+            auto &c = *static_cast<Consumer *>(opaque);
+            ++c.calls;
+            Check(cudaMemcpyAsync(c.output, accepted, c.count * sizeof(int),
+                                  cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        };
+        std::vector<int> tokens(rows, -2), accepted(batch, -2), deviceCounts(batch, -2);
+        Require(FastllmCudaMtpRejectionSamplingWithConsumer(input.p, proposal.p,
+            temperatures.data(), topKs.data(), topPs.data(), ids.data(),
+            tokens.data(), accepted.data(), batch, drafts, vocab, enqueue, &consumer),
+            "accepted-prefix consumer sampling failed");
+        Check(cudaDeviceSynchronize());
+        Require(accepted == expected, "accepted prefix differs from exact oracle");
+        for (int b = 0; b < batch; ++b) for (int d = 0; d <= accepted[b]; ++d)
+            Require(tokens[b * (drafts + 1) + d] == 3 + b * 23 + d,
+                    "consumer path emitted an incorrect token");
+        Require(consumer.calls == (batch <= 8 ? 1 : 0),
+                "consumer capability fallback changed");
+        if (consumer.calls) {
+            Check(cudaMemcpy(deviceCounts.data(), consumed.p, batch * sizeof(int), cudaMemcpyDeviceToHost));
+            Require(deviceCounts == expected, "device prefix counts differ from host results");
+        }
+    }
+    std::puts("ACCEPTED_CONSUMER_PASS batch 1/2/4/8/9/16, drafts 1/3/7/8, exact ragged prefixes and fallback");
+}
 }
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || !n) return 77;
     try {
         Check(cudaSetDevice(0));
+        AcceptedConsumerCase();
         FilterCase();
         DeviceFilterCase();
         MarkovGraphCase();

@@ -16297,7 +16297,7 @@ __global__ void FastllmTemperatureSoftmaxNormalizeKernel(const float *logits, fl
 __global__ void FastllmMtpSoftmaxPartialKernel(const float *logits, const float *temperatures,
                                               float2 *partials, int vocab, int tiles) {
     const float *input = logits + (long long)blockIdx.y * vocab;
-    float invTemp = 1.0f / temperatures[blockIdx.y], maximum = -1e30f;
+    float invTemp = (temperatures ? 1.0f / temperatures[blockIdx.y] : 1.0f), maximum = -1e30f;
     float values[16];
     #pragma unroll
     for (int j = 0; j < 16; ++j) {
@@ -16340,7 +16340,7 @@ __global__ void FastllmMtpSoftmaxNormalizeKernel(const float *logits, const floa
     sum = Reduce(storage).Sum(sum);
     if (threadIdx.x == 0) invSum = 1.0f / sum;
     __syncthreads();
-    float invTemp = 1.0f / temperatures[blockIdx.y];
+    float invTemp = (temperatures ? 1.0f / temperatures[blockIdx.y] : 1.0f);
     for (int i = blockIdx.x * 4096 + threadIdx.x; i < min((int)(blockIdx.x + 1) * 4096, vocab); i += 256)
         output[i] = expf(input[i] * invTemp - rowMax) * invSum;
 }
@@ -17850,6 +17850,22 @@ __global__ void FastllmSamplingIdsToFloatKernel(
     }
 }
 
+__global__ void FastllmAdvanceDecodeInputKernel(float *input, float *positions,
+        int *lengths, const float *tokens, int rows) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows && lengths[row] > 0) {
+        if (tokens) input[row] = tokens[row];
+        positions[row] += 1.0f;
+        ++lengths[row];
+    }
+}
+bool FastllmCudaAdvanceDecodeInput(void *storage, int stride, int rows, const float *tokens) {
+    if (!storage || rows <= 0 || stride < rows) return false;
+    FastllmAdvanceDecodeInputKernel<<<(rows + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        (float *)storage, (float *)storage + stride, (int *)storage + 2 * stride, tokens, rows);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 __global__ void FastllmAdvanceMappedDecodeInputKernel(float *storage, int stride, int rows,
         const float *const *tokenRows, float *localPositions, int *localLengths, int localRows) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -17881,6 +17897,30 @@ __global__ void FastllmSamplingCommitKernel(const int *input, float *output,
     if (row < batch) {
         output[row] = (float)input[row];
         offsets[row] += uint64_t(1) << 32;
+    }
+}
+
+size_t FastllmCudaSamplingSoftmaxWorkspaceSize(int batch, int vocabSize) {
+    // Extra launches lose on short rows. Larger batches already expose enough
+    // independent CTAs; retain their established implementation.
+    if (batch <= 0 || batch > 64 || vocabSize < 65536) return 0;
+    return (size_t)batch * (1 + (vocabSize - 1) / 4096) * sizeof(float2);
+}
+
+static void SamplingSoftmaxWithWorkspace(float *logits, float *probs, float *temperatures,
+        int batch, int vocabSize, void *softmaxWorkspace, size_t softmaxWorkspaceBytes) {
+    const size_t required = FastllmCudaSamplingSoftmaxWorkspaceSize(batch, vocabSize);
+    if (required && softmaxWorkspace && softmaxWorkspaceBytes >= required &&
+        (uintptr_t)softmaxWorkspace % alignof(float2) == 0) {
+        const int tiles = 1 + (vocabSize - 1) / 4096;
+        auto *partials = (float2 *)softmaxWorkspace;
+        FastllmMtpSoftmaxPartialKernel<<<dim3(tiles, batch), 256>>>(
+            logits, temperatures, partials, vocabSize, tiles);
+        FastllmMtpSoftmaxNormalizeKernel<<<dim3(tiles, batch), 256>>>(
+            logits, temperatures, partials, probs, vocabSize, tiles);
+    } else {
+        FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(
+            logits, probs, temperatures, vocabSize);
     }
 }
 
@@ -17923,7 +17963,7 @@ static bool SampleTopKTopPProbsToDevice(float *probs, int *topKArr, float *topPA
     return true;
 }
 
-bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
+bool FastllmCudaTopKTopPSamplingWithWorkspace(
                                   float *logits, float *probs,
                                   float *temperatures, int *topKArr,
                                   float *topPArr,
@@ -17931,7 +17971,8 @@ bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
                                   int penaltyTokens,
                                   int *output, float *floatOutput,
                                   int batch, int vocabSize,
-                                  uint64_t *requestSeeds, uint64_t *requestOffsets) {
+                                  uint64_t *requestSeeds, uint64_t *requestOffsets,
+                                  void *softmaxWorkspace, size_t softmaxWorkspaceBytes) {
     if (logits == nullptr || probs == nullptr || temperatures == nullptr ||
         topKArr == nullptr || topPArr == nullptr || output == nullptr ||
         floatOutput == nullptr || batch <= 0 || vocabSize <= 0 ||
@@ -17946,10 +17987,23 @@ bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
             logits, penaltyIds, penaltyFactors,
             penaltyTokens, vocabSize);
     }
-    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(
-        logits, probs, temperatures, vocabSize);
+    SamplingSoftmaxWithWorkspace(logits, probs, temperatures, batch, vocabSize, softmaxWorkspace, softmaxWorkspaceBytes);
     return SampleTopKTopPProbsToDevice(probs, topKArr, topPArr, output, floatOutput,
                                        batch, vocabSize, requestSeeds, requestOffsets);
+}
+
+bool FastllmCudaTopKTopPSamplingToDeviceWithRng(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr,
+                                  float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors,
+                                  int penaltyTokens,
+                                  int *output, float *floatOutput,
+                                  int batch, int vocabSize,
+                                  uint64_t *requestSeeds, uint64_t *requestOffsets) {
+    return FastllmCudaTopKTopPSamplingWithWorkspace(logits, probs, temperatures,
+        topKArr, topPArr, penaltyIds, penaltyFactors, penaltyTokens,
+        output, floatOutput, batch, vocabSize, requestSeeds, requestOffsets, nullptr, 0);
 }
 
 bool FastllmCudaTopKFirstSamplingToDeviceWithRng(
@@ -17966,7 +18020,7 @@ bool FastllmCudaTopKFirstSamplingToDeviceWithRng(
             logits, penaltyIds, penaltyFactors, penaltyTokens, vocab);
     auto *states = static_cast<flashinfer::sampling::RadixRowState *>(workspace);
     if (!MaskTopKFirstLogits(logits, probs, temperatures, topKs, batch, vocab, states)) return false;
-    FastllmTemperatureSoftmaxKernel<1024><<<batch, 1024>>>(probs, probs, nullptr, vocab);
+    SamplingSoftmaxWithWorkspace(probs, probs, nullptr, batch, vocab, workspace, workspaceBytes);
     return SampleTopKTopPProbsToDevice(probs, topKs, topPs, output, floatOutput,
                                        batch, vocab, requestSeeds, requestOffsets);
 }
@@ -18030,9 +18084,9 @@ __global__ void FastllmMtpTopPCompact(const float *probs, FastllmMtpTopPState *s
         }
     }
 }
-__global__ void FastllmMtpTopPCut(FastllmMtpTopPState *states, const float *topPs, float2 *cuts) {
+__global__ void FastllmMtpTopPCut(FastllmMtpTopPState *states, const float *topPs, float topP, float2 *cuts) {
     const int row = blockIdx.x, count = states[row].count;
-    const float p = topPs[row];
+    const float p = topPs ? topPs[row] : topP;
     if (count <= 0 || count > kMtpTopPCapacity || p >= 1) return;
     using Sort = cub::BlockRadixSort<float, 256, 4>;
     using Scan = cub::BlockScan<double, 256>;
@@ -18103,11 +18157,12 @@ struct FastllmMtpSamplingWorkspace {
     uint8_t *scratch = nullptr;
     bool own = false, dedicated = false, resident = false, needTopP = false, needTopK = false;
     bool topKFirst = false;
+    bool uniformTemperature = true, uniformTopP = true, uniformTopK = true;
+    float scalarTemperature = 1.0f, scalarTopP = 1.0f;
+    int scalarTopK = 0;
     uint32_t *pinnedParameters = nullptr;
     std::vector<uint32_t> savedParameters;
     uint64_t parameterVersion = 0;
-    bool uniformTemperature = true;
-    float scalarTemperature = 1.0f;
     float *a, *bufferA, *bufferB, *temperatures, *topPs;
     uint64_t *seed;
     int *topKs, *output, *draftIds, *accepted, *emitted;
@@ -18179,14 +18234,18 @@ struct FastllmMtpSamplingWorkspace {
         if (rows <= 0 || rows > capacity || vocab != this->vocab) return false;
         std::vector<uint32_t> params((size_t)capacity * 3);
         needTopP = needTopK = false;
-        uniformTemperature = true;
+        uniformTemperature = uniformTopP = uniformTopK = true;
         scalarTemperature = hostTemperatures[0];
+        scalarTopP = hostTopPs[0];
+        scalarTopK = hostTopKs[0] <= 0 ? vocab : std::min(hostTopKs[0], vocab);
         for (int i = 0; i < rows; ++i) {
             if (!std::isfinite(hostTemperatures[i]) || hostTemperatures[i] <= 0 ||
                 !std::isfinite(hostTopPs[i]) || hostTopPs[i] <= 0 || hostTopPs[i] > 1)
                 return false;
             uniformTemperature &= hostTemperatures[i] == scalarTemperature;
             int topK = hostTopKs[i] <= 0 ? vocab : std::min(hostTopKs[i], vocab);
+            uniformTopP &= hostTopPs[i] == scalarTopP;
+            uniformTopK &= topK == scalarTopK;
             memcpy(&params[i], &hostTemperatures[i], sizeof(float));
             memcpy(&params[capacity + i], &topK, sizeof(int));
             memcpy(&params[2 * capacity + i], &hostTopPs[i], sizeof(float));
@@ -18211,9 +18270,9 @@ struct FastllmMtpSamplingWorkspace {
             const bool tiled = rows <= 64 && vocab >= 16384;
             if (!tiled || !uniformTemperature || (needTopK && topKFirst))
                 FastllmCudaCopyFromHostToDevice(temperatures, params.data(), rows * sizeof(float));
-            if (needTopK)
+            if (needTopK && (!uniformTopK || topKFirst))
                 FastllmCudaCopyFromHostToDevice(topKs, params.data() + capacity, rows * sizeof(int));
-            if (needTopP)
+            if (needTopP && !uniformTopP)
                 FastllmCudaCopyFromHostToDevice(topPs, params.data() + 2 * capacity, rows * sizeof(float));
         }
         return true;
@@ -18247,15 +18306,17 @@ struct FastllmMtpSamplingWorkspace {
         }
         cudaError_t state = cudaGetLastError();
         if (state == cudaSuccess && needTopP) {
+            // Dedicated samplers retain device parameters across graph replays.
+            float *ps = !dedicated && !resident && uniformTopP ? nullptr : topPs;
             if (topPState) {
                 FastllmMtpTopPInit<<<rows, 1, 0, stream>>>(topPState, topPCuts);
                 dim3 grid((vocab + 4095) / 4096, rows);
                 FastllmMtpTopPCompact<<<grid, 256, 0, stream>>>(a, topPState, vocab);
-                FastllmMtpTopPCut<<<rows, 256, 0, stream>>>(topPState, topPs, topPCuts);
+                FastllmMtpTopPCut<<<rows, 256, 0, stream>>>(topPState, ps, scalarTopP, topPCuts);
                 FastllmMtpTopPApply<<<grid, 256, 0, stream>>>(a, b, topPCuts, vocab);
             }
             state = flashinfer::sampling::TopPRenormProb<float>(
-                a, b, topPs, rows, 1.0f, vocab, stream, topPCuts);
+                a, b, ps, rows, scalarTopP, vocab, stream, topPCuts);
             std::swap(a, b);
         }
         if (state == cudaSuccess && needTopK && !topKFirst) {
@@ -18263,7 +18324,8 @@ struct FastllmMtpSamplingWorkspace {
                 rows * sizeof(flashinfer::sampling::RadixRowState), stream);
             if (state == cudaSuccess) {
                 state = flashinfer::sampling::RadixTopKRenormProbMultiCTA<float, int>(
-                    a, b, topKs, rows, 0, vocab, rowStates, stream);
+                    a, b, !dedicated && !resident && uniformTopK ? nullptr : topKs, rows,
+                    scalarTopK, vocab, rowStates, stream);
                 std::swap(a, b);
             }
         }
@@ -18535,7 +18597,8 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
                                     const float *topPs, const int *draftTokenIds,
                                     int *output, int *acceptedDraftTokens,
                                     int batch, int draftTokens, int vocabSize, bool topKFirst,
-                                    FastllmMtpAcceptedCallback callback = nullptr, void *context = nullptr) {
+                                    FastllmMtpAcceptedCallback callback = nullptr, void *context = nullptr,
+                                    void (*smallConsumer)(const int *, void *) = nullptr) {
     if (!logits || !proposalProbs || !temperatures || !topKs || !topPs ||
         !draftTokenIds || !output || !acceptedDraftTokens || batch <= 0 ||
         draftTokens <= 0 || vocabSize <= 0) return false;
@@ -18545,11 +18608,11 @@ static bool FastllmCudaMtpRejectionSamplingImpl(float *logits, float *proposalPr
     FastllmMtpSamplingWorkspace ws(rows, vocabSize);
     ws.topKFirst = topKFirst;
     if (!ws.Prepare(logits, temperatures, topKs, topPs, rows, vocabSize)) return false;
+    if (FastllmMtpUsesSmallRejection(batch, draftTokens, vocabSize))
+        return FastllmCudaMtpRejectionFromHostProbabilities(ws.a, proposalProbs,
+            draftTokenIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize, smallConsumer, context);
     FastllmCudaCopyFromHostToDevice(ws.draftIds, (void*)draftTokenIds,
                                    batch * draftTokens * sizeof(int));
-    if (FastllmMtpUsesSmallRejection(batch, draftTokens, vocabSize))
-        return FastllmCudaMtpRejectionFromProbabilities(ws.a, proposalProbs,
-            ws.draftIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize);
     cudaStream_t stream = cudaStreamPerThread;
     cudaError_t state = cudaMemsetAsync(ws.accepted, 0, batch * sizeof(int), stream);
     if (state == cudaSuccess)
@@ -18586,6 +18649,14 @@ bool FastllmCudaMtpRejectionWithAccepted(float *logits, float *proposalProbs,
     if (!callback || FastllmMtpUsesSmallRejection(batch, draftTokens, vocabSize)) return false;
     return FastllmCudaMtpRejectionSamplingImpl(logits, proposalProbs, temperatures, topKs, topPs,
         draftTokenIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize, true, callback, context);
+}
+
+bool FastllmCudaMtpRejectionSamplingWithConsumer(float *logits, float *proposalProbs,
+        const float *temperatures, const int *topKs, const float *topPs, const int *draftTokenIds,
+        int *output, int *acceptedDraftTokens, int batch, int draftTokens, int vocabSize,
+        void (*enqueue)(const int *, void *), void *context) {
+    return FastllmCudaMtpRejectionSamplingImpl(logits, proposalProbs, temperatures, topKs, topPs,
+        draftTokenIds, output, acceptedDraftTokens, batch, draftTokens, vocabSize, false, nullptr, context, enqueue);
 }
 
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,

@@ -77,6 +77,12 @@ bool FastllmCudaMtpRejectionSamplingLogitsBatch(float *targetLogits,
     const int *topKs, const float *topPs, int *output, int *accepted,
     int batch, int drafts, int vocab);
 
+// Equivalent small-batch path with host token IDs copied into kernel arguments.
+// Supports batch*drafts <= 64, drafts <= 8; larger shapes retain the device API.
+bool FastllmCudaMtpRejectionFromHostProbabilities(const float *targetProbs,
+    const float *proposalProbs, const int *hostDraftTokens,
+    int *output, int *accepted, int batch, int drafts, int vocab,
+    void (*enqueue)(const int *, void *) = nullptr, void *context = nullptr);
 // Request-owned target sampling, with stable normalization/scratch storage.
 // Enqueue borrows logits/proposals until Resolve and may replay a CUDA graph.
 // Resolve is the only host-result fence. A plan must not have overlapping calls;
