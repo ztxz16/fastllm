@@ -1,3 +1,4 @@
+#include "devices/cuda/low_latency/router.cuh"
 #include "devices/cuda/fastllm-cuda-norm.cuh"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -109,81 +110,6 @@ __device__ float WarpSum(float x) {
     for (int offset = 16; offset; offset >>= 1)
         x += __shfl_down_sync(0xffffffff, x, offset);
     return x;
-}
-
-// Preserve the 256-thread FP32 GEMV accumulation and ascending reduction
-// tree. Loading all 16 terms before arithmetic hides their memory latency.
-__global__ void RouterSigmoid4096(const BF16 *input, const float *weight,
-                                  float *output) {
-    int t = threadIdx.x, expert = blockIdx.x;
-    __shared__ float sums[8];
-    float values[16], weights[16], partial = 0;
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        values[i] = (float)input[t + i * 256];
-        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
-    }
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) partial += values[i] * weights[i];
-    #pragma unroll
-    for (int stride = 1; stride < 32; stride *= 2)
-        partial += __shfl_down_sync(0xffffffffu, partial, stride);
-    if (t % 32 == 0) sums[t / 32] = partial;
-    __syncthreads();
-    if (t < 32) {
-        partial = t < 8 ? sums[t] : 0;
-        #pragma unroll
-        for (int stride = 1; stride < 8; stride *= 2)
-            partial += __shfl_down_sync(0xffffffffu, partial, stride);
-        if (t == 0) {
-            float logit = partial + 0.0f;
-            // Match standalone FP32 sigmoid's double-precision division.
-            output[expert] = 1.0 / (1.0 + expf(-logit));
-        }
-    }
-}
-
-// Reuse each expert's weights across decode/verify rows with exact GEMV
-// accumulation. Each expert applies sigmoid before the batched TopK launch.
-template <int Rows>
-__global__ void BatchRouterSigmoid4096(const BF16 *input, const float *weight,
-        float *output, int rows, int experts) {
-    const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
-    __shared__ float sums[Rows][8];
-    float weights[16], values[Rows][16], partial[Rows]{};
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
-        #pragma unroll
-        for (int row = 0; row < Rows; ++row)
-            values[row][i] = first + row < rows
-                ? (float)input[(size_t)(first + row) * 4096 + t + i * 256] : 0;
-    }
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        #pragma unroll
-        for (int row = 0; row < Rows; ++row) partial[row] += values[row][i] * weights[i];
-    }
-    #pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        #pragma unroll
-        for (int stride = 1; stride < 32; stride *= 2)
-            partial[row] += __shfl_down_sync(0xffffffffu, partial[row], stride);
-        if (t % 32 == 0) sums[row][t / 32] = partial[row];
-    }
-    __syncthreads();
-    // Independent warps finish different rows, including the expensive sigmoid.
-    // Keep the reference GEMV's reduction and zero-bias addition exactly.
-    const int row = t / 32, lane = t % 32;
-    if (row < Rows) {
-        float value = lane < 8 ? sums[row][lane] : 0;
-        #pragma unroll
-        for (int stride = 1; stride < 8; stride *= 2)
-            value += __shfl_down_sync(0xffffffffu, value, stride);
-        if (lane == 0 && first + row < rows)
-            output[(size_t)(first + row) * experts + expert] =
-                1.0 / (1.0 + expf(-(value + 0.0f)));
-    }
 }
 
 // Vector loads pair adjacent lanes of the original 256-thread GEMV. Retain
@@ -5216,7 +5142,7 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
             (float *)output.cudaData, rows, experts);
     }
     else if (rows == 1)
-        RouterSigmoid4096<<<experts, 256>>>((const BF16 *)input.cudaData,
+        fastllm::cuda::low_latency::RouterSigmoidSingle<4096><<<experts, 256>>>((const BF16 *)input.cudaData,
             (const float *)weight.cudaData, (float *)output.cudaData);
     else if (arch == 120 && experts % kRouterTileExperts == 0 &&
              int64_t(experts / kRouterTileExperts) * rowTiles >= DeviceSMCount() &&
@@ -5229,11 +5155,11 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
             (float *)output.cudaData, rows, experts);
     else if (rows >= 4)
-        BatchRouterSigmoid4096<4><<<dim3(experts, (rows + 3) / 4), 256>>>(
+        fastllm::cuda::low_latency::RouterSigmoidRows<4,4096><<<dim3(experts, (rows + 3) / 4), 256>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
             (float *)output.cudaData, rows, experts);
     else
-        BatchRouterSigmoid4096<2><<<dim3(experts, (rows + 1) / 2), 256>>>(
+        fastllm::cuda::low_latency::RouterSigmoidRows<2,4096><<<dim3(experts, (rows + 1) / 2), 256>>>(
             (const BF16 *)input.cudaData, (const float *)weight.cudaData,
             (float *)output.cudaData, rows, experts);
     CheckLaunch();

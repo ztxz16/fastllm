@@ -20,6 +20,7 @@
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
 #include "fastllm-cuda-ordered-reduce.cuh"
+#include "fastllm-cuda-router-topk.cuh"
 #include "fastllm-rmsnorm-decode.cuh"
 #include "fastllm-cuda-norm.cuh"
 #include "attention/fastllm-kda-prefill.cuh"
@@ -12356,21 +12357,12 @@ __global__ void FastllmFusedSigmoidSelectExpert256Top10Kernel(
 // APPLY_SOFTMAX joins the established 256-thread FP32 softmax with
 // selection while reproducing its max/sum/division order exactly. One warp
 // then performs TopK; exact ties rebuild the original 64-thread lists and
-// merge tree so both instantiations remain compatible with the legacy path.
+// merge tree so all supported shapes remain compatible with the legacy path.
 template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK, bool APPLY_SIGMOID = false>
 __global__ void FastllmSelectExpertFixedTopKKernel(
         const float *logits, const float *bias, int32_t *index, float *score,
         int hasBias, int needNorm, float routeScale) {
-    constexpr int VALUES_PER_LANE = EXPERTS / 32;
-    constexpr int LEGACY_THREADS = 64;
-    constexpr float NEG_INF = -FLT_MAX;
-    constexpr unsigned int FULL_WARP_MASK = 0xffffffffu;
-
-    __shared__ float selectedKeys[TOPK];
-    __shared__ int selectedIds[TOPK];
-    __shared__ float selectedProbabilities[TOPK];
-    __shared__ float legacyKeys[LEGACY_THREADS][TOPK];
-    __shared__ float legacyIds[LEGACY_THREADS][TOPK];
+    __shared__ fastllm::cuda::RouterTopKScratch<TOPK> scratch;
     __shared__ float softmaxReduce[257];
     __shared__ __align__(16) float softmaxProbabilities[EXPERTS];
 
@@ -12419,205 +12411,8 @@ __global__ void FastllmSelectExpertFixedTopKKernel(
     if (tid >= 32) {
         return;
     }
-    int lane = tid;
-    int firstExpert = lane * VALUES_PER_LANE;
-    float choiceKeys[VALUES_PER_LANE];
-    float firstProbabilities[8], secondProbabilities[8];
-    if constexpr (EXPERTS != 288 && EXPERTS != 384) {
-        FastllmRouterLoad8(probabilityLogits + firstExpert, firstProbabilities);
-        if constexpr (VALUES_PER_LANE > 8)
-            FastllmRouterLoad8(probabilityLogits + firstExpert + 8, secondProbabilities);
-    }
-#pragma unroll
-    for (int part = 0; part < VALUES_PER_LANE; ++part) {
-        int expert = firstExpert + part;
-        float probability;
-        if constexpr (EXPERTS == 288 || EXPERTS == 384) probability = probabilityLogits[expert];
-        else probability = part < 8 ? firstProbabilities[part] : secondProbabilities[part - 8];
-        float key = probability + (hasBias ? bias[expert] : 0.0f);
-        choiceKeys[part] = isfinite(key) ? key : NEG_INF;
-    }
-
-#pragma unroll
-    for (int rank = 0; rank < TOPK; ++rank) {
-        auto winner = fastllm::cuda::WarpArgMax(choiceKeys, firstExpert, EXPERTS);
-
-        int owner = winner.index / VALUES_PER_LANE;
-        int ownerPart = winner.index % VALUES_PER_LANE;
-        // The selected row is already available in shared/global storage.
-        // A dynamic index into a per-thread array forces a local-memory stack.
-        float probability = probabilityLogits[winner.index];
-        if (lane == 0) {
-            selectedKeys[rank] = winner.value;
-            selectedIds[rank] = winner.index;
-            selectedProbabilities[rank] =
-                isfinite(probability) ? probability : 0.0f;
-        }
-        if (lane == owner) {
-#pragma unroll
-            for (int part = 0; part < VALUES_PER_LANE; ++part) {
-                if (part == ownerPart) {
-                    choiceKeys[part] = NEG_INF;
-                }
-            }
-        }
-    }
-
-    __syncwarp(FULL_WARP_MASK);
-    float cutoff = lane == 0 ? selectedKeys[TOPK - 1] : 0.0f;
-    cutoff = __shfl_sync(FULL_WARP_MASK, cutoff, 0);
-    int useLegacyMerge = 0;
-#pragma unroll
-    for (int part = 0; part < VALUES_PER_LANE; ++part) {
-        useLegacyMerge |= choiceKeys[part] == cutoff;
-    }
-    useLegacyMerge = __any_sync(FULL_WARP_MASK, useLegacyMerge);
-    if (lane == 0) {
-#pragma unroll
-        for (int rank = 1; rank < TOPK; ++rank) {
-            useLegacyMerge |= selectedKeys[rank] == selectedKeys[rank - 1];
-        }
-    }
-    useLegacyMerge = __shfl_sync(FULL_WARP_MASK, useLegacyMerge, 0);
-
-    if (!useLegacyMerge) {
-        float selectedSum = 1.0f;
-        if (lane == 0 && needNorm) {
-            selectedSum = 0.0f;
-#pragma unroll
-            for (int rank = 0; rank < TOPK; ++rank)
-                selectedSum += selectedProbabilities[rank];
-            if (!isfinite(selectedSum) || fabsf(selectedSum) < 1.0e-20f)
-                selectedSum = 1.0f;
-        }
-        selectedSum = __shfl_sync(FULL_WARP_MASK, selectedSum, 0);
-        if (lane < TOPK) {
-            index[lane] = selectedIds[lane];
-            score[lane] = selectedProbabilities[lane] / selectedSum * routeScale;
-        }
-        return;
-    }
-
-    // Restore winners consumed by the fast scan, then recreate the exact
-    // virtual-thread lists used by FastllmSelectExpertKernel.
-#pragma unroll
-    for (int rank = 0; rank < TOPK; ++rank) {
-        int expert = lane == 0 ? selectedIds[rank] : 0;
-        float key = lane == 0 ? selectedKeys[rank] : 0.0f;
-        expert = __shfl_sync(FULL_WARP_MASK, expert, 0);
-        key = __shfl_sync(FULL_WARP_MASK, key, 0);
-        int owner = expert / VALUES_PER_LANE;
-        int ownerPart = expert % VALUES_PER_LANE;
-        if (lane == owner) {
-#pragma unroll
-            for (int part = 0; part < VALUES_PER_LANE; ++part) {
-                if (part == ownerPart) {
-                    choiceKeys[part] = key;
-                }
-            }
-        }
-    }
-
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-        int virtualTid = lane + half * 32;
-#pragma unroll
-        for (int rank = 0; rank < TOPK; ++rank) {
-            legacyKeys[virtualTid][rank] = -1.0e100;
-            legacyIds[virtualTid][rank] = -1.0f;
-        }
-#pragma unroll
-        for (int part = 0; part < (EXPERTS + LEGACY_THREADS - 1) / LEGACY_THREADS; ++part) {
-            int expert = virtualTid + part * LEGACY_THREADS;
-            int owner = expert / VALUES_PER_LANE;
-            int ownerPart = expert % VALUES_PER_LANE;
-            float key = NEG_INF;
-#pragma unroll
-            for (int sourcePart = 0; sourcePart < VALUES_PER_LANE;
-                 ++sourcePart) {
-                float candidate = __shfl_sync(
-                    FULL_WARP_MASK, choiceKeys[sourcePart], owner);
-                if (sourcePart == ownerPart) {
-                    key = candidate;
-                }
-            }
-#pragma unroll
-            for (int rank = 0; rank < TOPK; ++rank) {
-                if (expert < EXPERTS && key > legacyKeys[virtualTid][rank]) {
-#pragma unroll
-                    for (int shift = TOPK - 1; shift > rank; --shift) {
-                        legacyKeys[virtualTid][shift] =
-                            legacyKeys[virtualTid][shift - 1];
-                        legacyIds[virtualTid][shift] =
-                            legacyIds[virtualTid][shift - 1];
-                    }
-                    legacyKeys[virtualTid][rank] = key;
-                    legacyIds[virtualTid][rank] = (float)expert;
-                    break;
-                }
-            }
-        }
-    }
-    __syncwarp(FULL_WARP_MASK);
-
-    for (int stride = 32; stride > 0; stride >>= 1) {
-        if (lane < stride) {
-            int pos0 = 0;
-            int pos1 = 0;
-            while (pos0 + pos1 < TOPK) {
-                if (legacyKeys[lane][pos0] >
-                    legacyKeys[lane + stride][pos1]) {
-                    ++pos0;
-                } else {
-                    ++pos1;
-                }
-            }
-            --pos0;
-            --pos1;
-            for (int position = TOPK - 1; position >= 0; --position) {
-                if (pos1 < 0 ||
-                    (pos0 >= 0 && legacyKeys[lane][pos0] <
-                                      legacyKeys[lane + stride][pos1])) {
-                    legacyKeys[lane][position] = legacyKeys[lane][pos0];
-                    legacyIds[lane][position] = legacyIds[lane][pos0];
-                    --pos0;
-                } else {
-                    legacyKeys[lane][position] =
-                        legacyKeys[lane + stride][pos1];
-                    legacyIds[lane][position] =
-                        legacyIds[lane + stride][pos1];
-                    --pos1;
-                }
-            }
-        }
-        __syncwarp(FULL_WARP_MASK);
-    }
-
-    if (lane == 0) {
-        float selectedSum = 1.0f;
-        if (needNorm) {
-            selectedSum = 0.0f;
-#pragma unroll
-            for (int rank = 0; rank < TOPK; ++rank) {
-                int expert = (int)legacyIds[0][rank];
-                float probability = probabilityLogits[expert];
-                if (isfinite(probability)) {
-                    selectedSum += probability;
-                }
-            }
-            if (!isfinite(selectedSum) || fabsf(selectedSum) < 1.0e-20f) {
-                selectedSum = 1.0f;
-            }
-        }
-#pragma unroll
-        for (int rank = 0; rank < TOPK; ++rank) {
-            int expert = (int)legacyIds[0][rank];
-            float probability = probabilityLogits[expert];
-            index[rank] = expert;
-            score[rank] = (isfinite(probability) ? probability : 0.0f) /
-                          selectedSum * routeScale;
-        }
-    }
+    fastllm::cuda::SelectRouterTopK<EXPERTS, TOPK>(probabilityLogits, bias,
+        index, score, hasBias, needNorm, routeScale, scratch);
 }
 #endif
 
@@ -13759,6 +13554,14 @@ __global__ void FastllmSelectExpertKernel(float *logits, float *bias, int32_t *i
     }
 }
 
+// Keep one launcher for the generic fallback and independent selector tests.
+void LaunchFastllmSelectExpertGeneric(float *logits, float *bias, int32_t *index, float *score,
+                                      int rows, int experts, int topk, int hasBias, bool needNorm,
+                                      float routeScale) {
+    FastllmSelectExpertKernel<64, 50><<<rows, 64>>>(
+        logits, bias, index, score, rows, experts, topk, hasBias, needNorm, routeScale);
+}
+
 bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *gateBias, 
     fastllm::Data &index, fastllm::Data &score, int topk, bool needNorm, float routeScale) {
     if (logits.dims.empty() || logits.dataType != fastllm::DataType::FLOAT32) {
@@ -13795,7 +13598,7 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
     // original MAXK=50 instantiation exactly: changing
     // its shared-memory row stride changes legacy merge behavior for prefill.
 #ifdef USE_ROCM
-    FastllmSelectExpertKernel<64, 50><<<n, 64>>>(
+    LaunchFastllmSelectExpertGeneric(
         cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
         topk, hasBias, needNorm, routeScale);
 #else
@@ -13804,6 +13607,7 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else if (numExperts == 256 && topk == 8) {
+        // Each CTA handles one row; this specialization has no batch-size limit.
         FastllmSelectExpertFixedTopKKernel<false, 256, 8><<<n, 32>>>(
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
@@ -13816,7 +13620,7 @@ bool FastllmCudaSelectExpert(const fastllm::Data &logits, const fastllm::Data *g
             cudaLogits, cudaBias, cudaIndex, cudaScore,
             hasBias, needNorm, routeScale);
     } else {
-        FastllmSelectExpertKernel<64, 50><<<n, 64>>>(
+        LaunchFastllmSelectExpertGeneric(
             cudaLogits, cudaBias, cudaIndex, cudaScore, n, numExperts,
             topk, hasBias, needNorm, routeScale);
     }

@@ -500,6 +500,8 @@ if (USE_CUDA)
         src/devices/cuda/linear/fastllm-linear-fp16.cu
         src/devices/cuda/linear/fastllm-linear-bf16.cu
         src/devices/cuda/linear/fastllm-rmsnorm-small-linear.cu
+        src/devices/cuda/linear/fastllm-norm-linear.cu
+        src/devices/cuda/low_latency/norm_linear.cu
         src/devices/cuda/linear/fastllm-native-lowbit-prefill.cu
         src/devices/cuda/linear/fastllm-native-nvfp4-layout.cu
         src/devices/cuda/linear/fastllm-gdn-prepare-wy.cu
@@ -553,6 +555,13 @@ if (USE_CUDA)
         set_property(SOURCE src/models/hy4_flash.cpp src/models/hy4_flash_gpu.cpp
             src/models/hy4_flash_hybrid.cpp src/models/hy4_flash_kv.cpp ${HY4_CUDA_SOURCES}
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_HY4_CUDA)
+    endif()
+
+    # Portable CUDA MMA/SIMT adapters have no specialized backend dependency.
+    # HIP retains its current Dense operators; CUDA PTX is not a HIP backend.
+    if (NOT USE_ROCM)
+        list(APPEND FASTLLM_CUDA_SOURCES
+            src/devices/cuda/low_latency/dense.cu)
     endif()
 
     set_source_files_properties(src/devices/cuda/models/deepseekv41-reference.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
@@ -3516,6 +3525,47 @@ if (UNIT_TEST)
         set_tests_properties(cuda_verify_multirow PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120
             PASS_REGULAR_EXPRESSION "VERIFY MULTIROW PASS")
 
+        add_executable(cuda_norm_linear_adapter_test test/basic/test_cuda_norm_linear_adapter.cu)
+        target_link_libraries(cuda_norm_linear_adapter_test PRIVATE fastllm)
+        set_target_properties(cuda_norm_linear_adapter_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_norm_linear_adapter COMMAND cuda_norm_linear_adapter_test)
+        set_tests_properties(cuda_norm_linear_adapter PROPERTIES LABELS cuda
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 90
+            PASS_REGULAR_EXPRESSION "PASS norm linear Data adapter")
+
+        # Raw CUDA operator tests deliberately do not link the FastLLM runtime.
+        add_executable(cuda_low_latency_norm_linear_test
+            test/basic/test_cuda_low_latency_norm_linear.cu
+            src/devices/cuda/low_latency/norm_linear.cu)
+        target_include_directories(cuda_low_latency_norm_linear_test PRIVATE include)
+        target_link_libraries(cuda_low_latency_norm_linear_test PRIVATE Threads::Threads)
+        set_target_properties(cuda_low_latency_norm_linear_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_low_latency_norm_linear COMMAND cuda_low_latency_norm_linear_test)
+        set_tests_properties(cuda_low_latency_norm_linear PROPERTIES LABELS cuda
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+            PASS_REGULAR_EXPRESSION "PASS generic norm linear")
+
+        add_executable(cuda_low_latency_blocks_test test/basic/test_cuda_low_latency_blocks.cu
+            src/devices/cuda/low_latency/dense.cu)
+        target_include_directories(cuda_low_latency_blocks_test PRIVATE include)
+        target_compile_options(cuda_low_latency_blocks_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+        set_target_properties(cuda_low_latency_blocks_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        add_test(NAME cuda_low_latency_blocks COMMAND cuda_low_latency_blocks_test)
+        set_tests_properties(cuda_low_latency_blocks PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE TIMEOUT 180 PASS_REGULAR_EXPRESSION "PASS portable router and dense fusions")
+
+        add_executable(cuda_low_latency_unavailable_test
+            test/basic/test_cuda_low_latency_unavailable.cu src/devices/cuda/low_latency/dense.cu)
+        target_include_directories(cuda_low_latency_unavailable_test PRIVATE include)
+        target_compile_options(cuda_low_latency_unavailable_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+        set_target_properties(cuda_low_latency_unavailable_test PROPERTIES
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_ARCHITECTURES "75-virtual")
+        add_test(NAME cuda_low_latency_unavailable COMMAND cuda_low_latency_unavailable_test)
+        set_tests_properties(cuda_low_latency_unavailable PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
+            RUN_SERIAL TRUE TIMEOUT 60 PASS_REGULAR_EXPRESSION "PASS unavailable image rejected before launch")
+
         add_executable(cuda_bf16_workspace_test test/basic/test_cuda_bf16_workspace.cu)
         target_include_directories(cuda_bf16_workspace_test PRIVATE src/devices/cuda/linear)
         target_link_libraries(cuda_bf16_workspace_test PRIVATE cublasLt Threads::Threads)
@@ -4539,6 +4589,20 @@ foreach(duo_asset IN ITEMS live.html avc-player.js presets/default.txt
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/tools/duo/${duo_asset}"
                    "${CMAKE_BINARY_DIR}/tools/ftllm/duo_assets/${duo_asset}" COPYONLY)
 endforeach()
+
+# Distribute attribution when building only the common projection stage.
+if (USE_CUDA AND NOT USE_ROCM)
+    foreach(dep naivert_projection)
+        file(GLOB attribution_files
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${dep}/LICENSE*"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${dep}/NOTICE*"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${dep}/UPSTREAM.json")
+        add_custom_command(TARGET fastllm_tools POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/${dep}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${attribution_files}
+                ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/${dep})
+    endforeach()
+endif()
 
 if (USE_CUDA AND NOT USE_ROCM)
     # A package-only update must refresh the POST_BUILD copy as well.

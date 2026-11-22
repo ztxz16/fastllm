@@ -34,6 +34,17 @@ def audit_elf(path, max_glibc):
             'rpath': re.findall(r'\((?:RUNPATH|RPATH)\).*?\[(.*?)\]', dynamic)}
 
 
+def stage_low_latency_licenses(source, package):
+    packaged = set()
+    for dep in ('naivert_projection',):
+        dest = package / 'licenses' / dep
+        dest.mkdir(parents=True, exist_ok=True)
+        for name in ('LICENSE', 'NOTICE', 'UPSTREAM.json'):
+            shutil.copy2(source / 'third_party' / dep / name, dest / name)
+            packaged.add((dest / name).relative_to(package.parent).as_posix())
+    return packaged
+
+
 def stage_demo_assets(source, package):
     # Copy from current sources even when the binaries were built earlier.
     demo_files = set()
@@ -92,6 +103,7 @@ def main():
             for name in ('libfastllm_minimax_h3.so', 'libfastllm_qwen_image.so'):
                 shutil.copy2(build / 'cuda' / name, package / name)
         demo_files = stage_demo_assets(source, package)
+        license_files = stage_low_latency_licenses(source, package)
         numa = Path(output(args.cxx, '-print-file-name=libnuma.so').strip())
         if not numa.is_file():
             raise RuntimeError('libnuma.so not found; install libnuma-dev in the build environment')
@@ -129,7 +141,7 @@ def main():
                 expected.add('ftllm/duo_live')
             else:
                 expected.update(('ftllm/libfastllm_minimax_h3.so', 'ftllm/libfastllm_qwen_image.so'))
-            missing = (expected | demo_files) - set(archive.namelist())
+            missing = (expected | demo_files | license_files) - set(archive.namelist())
             if missing:
                 raise RuntimeError('Wheel is missing: ' + ', '.join(sorted(missing)))
         target = dest / wheel.name
