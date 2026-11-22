@@ -2545,6 +2545,9 @@ bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data
                                        fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                        bool scoresOnCuda, int topk, int hidden, int inter);
 
+// Gather a single K=256 embedding row and multiply directly into a preallocated BF16 output.
+bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
+        const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 // Hopper BF16 Indexer, K=4096 and Q/K/score widths 2048/128/16. Wq owns the
 // packed allocation; Wk/weights borrow its trailing rows. Shapes and separate

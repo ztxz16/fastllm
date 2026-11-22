@@ -226,10 +226,14 @@ __global__ void FastllmBf16DecodeHead8(const __nv_bfloat16 *__restrict__ input,
 // At K=256, one warp computes each dot with the original compensated
 // reduction. Tiling output rows reuses its input vector without changing
 // the per-lane products or BF16 rounding.
-template <int RowsPerWarp = 1>
+template <int RowsPerWarp = 1, bool Indexed = false>
 __global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
-        const __nv_bfloat16 *bias, int outputs) {
+        const __nv_bfloat16 *bias, int outputs, const float *ids = nullptr) {
+    if constexpr (Indexed) {
+        const int row = __float2int_rz(*ids);
+        input += (size_t)(row >= 0 && row < outputs ? row : 0) * 256;
+    }
     const int lane = threadIdx.x & 31;
     const int first = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * RowsPerWarp;
     if (first >= outputs) return;
@@ -261,6 +265,28 @@ __global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
             output[first + r] = __float2bfloat16_rn(value);
         }
     }
+}
+
+bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    if (ids.dataType != FLOAT32 || ids.dims != std::vector<int>{1, 1} ||
+        table.dataType != BFLOAT16 || weight.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
+        table.dims.size() != 2 || table.dims[1] != 256 || table.dims != weight.dims ||
+        table.strides != std::vector<uint64_t>{256, 1} || weight.strides != table.strides ||
+        table.dims[0] < 1 || output.dims != std::vector<int>{1, 1, table.dims[0]} ||
+        output.strides.size() != 3 || output.strides.back() != 1 ||
+        ids.dataDevice != CUDA || table.dataDevice != CUDA || weight.dataDevice != CUDA || output.dataDevice != CUDA ||
+        ids.dataDeviceIds.size() != 1 || ids.dataDeviceIds.front() != FastllmCudaGetDevice() ||
+        ids.dataDeviceIds != table.dataDeviceIds || ids.dataDeviceIds != weight.dataDeviceIds ||
+        ids.dataDeviceIds != output.dataDeviceIds || !ids.cudaData || !table.cudaData || !weight.cudaData ||
+        !output.cudaData || ((uintptr_t(table.cudaData) | uintptr_t(weight.cudaData)) & 15)) return false;
+
+    const int rows = table.dims[0];
+    FastllmGemvBf16SmallK<1, true><<<(rows - 1) / 8 + 1, 256>>>(
+        (const __nv_bfloat16 *)table.cudaData, (const __nv_bfloat16 *)weight.cudaData,
+        (__nv_bfloat16 *)output.cudaData, nullptr, rows, (const float *)ids.cudaData);
+    return true;
 }
 
 // FP16 input × BF16 weight -> FP16 output (用于 FastllmCudaHalfMatMulBFloat16)

@@ -4,6 +4,7 @@
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "baseblock.h"
+#include "utils/utils.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -136,6 +137,49 @@ void DeviceFilterCase() {
     cudaFree(token);
     std::puts("DEVICE_FILTER_GRAPH_PASS 24 distributions, 49152 replays, saved q and RNG checked");
 }
+#ifndef USE_ROCM
+void IndexedBf16ProjectionCase() {
+    using namespace fastllm;
+    constexpr int vocab = 131, width = 256;
+    std::vector<float> embed(vocab * width), projection(embed.size());
+    for (int i = 0; i < vocab * width; ++i) {
+        embed[i] = (i * 13 % 19 - 9) / 32.f;
+        projection[i] = (i * 7 % 17 - 8) / 64.f;
+    }
+    Data table(FLOAT32, {vocab, width}, embed), weight(FLOAT32, {vocab, width}, projection);
+    for (auto *matrix : {&table, &weight}) {
+        matrix->ToDevice(CUDA, {0}, true);
+        ToDataType(*matrix, BFLOAT16);
+    }
+    Data id(FLOAT32, {1, 1}), output(BFLOAT16, {1, 1, vocab});
+    for (auto *buffer : {&id, &output}) {
+        buffer->ToDevice(CUDA, {0}, false);
+        buffer->Allocate(false);
+    }
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Require(FastllmCudaIndexedBf16Gemv(id, table, weight, output), "indexed BF16 projection capture");
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (int token : {0, 73, vocab - 1}) {
+        float input = token;
+        Check(cudaMemcpy(id.cudaData, &input, sizeof(input), cudaMemcpyHostToDevice));
+        Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        std::vector<uint16_t> result(vocab);
+        Check(cudaMemcpy(result.data(), output.cudaData, output.GetBytes(), cudaMemcpyDeviceToHost));
+        for (int row = 0; row < vocab; ++row) {
+            float sum = 0;
+            for (int col = 0; col < width; ++col)
+                sum += embed[token * width + col] * projection[row * width + col];
+            Require(result[row] == Float32ToBFloat16RNEBits(sum), "indexed BF16 projection differs from CPU");
+        }
+    }
+    Check(cudaGraphExecDestroy(exec));
+    Check(cudaGraphDestroy(graph));
+}
+#endif
+
 void MarkovGraphCase() {
     using namespace fastllm;
     const int vocab = 64, rank = 32;
@@ -612,6 +656,9 @@ int main() {
         AcceptedConsumerCase();
         FilterCase();
         DeviceFilterCase();
+#ifndef USE_ROCM
+        IndexedBf16ProjectionCase();
+#endif
         MarkovGraphCase();
         FullVocabularyCase();
         VerifyProposalLayoutCase();

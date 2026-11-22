@@ -115,7 +115,8 @@ static bool forceUnboundDraftAttention = false;
 bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         const std::vector<FastllmNaiveDraftRow> &requests, int heads, int kvHeads,
         int dim, int window, fastllm::Data &scores, fastllm::Data &output, const fastllm::Data *cacheBindings) {
-    if (forceUnboundDraftAttention) return false;
+    // A refusal on just the second TP rank must keep the whole group eager.
+    if (forceUnboundDraftAttention && FastllmCudaGetDevice() == 1) return false;
     static auto fn = (bool (*)(const fastllm::Data &, const std::vector<FastllmNaiveDraftRow> &,
         int, int, int, int, fastllm::Data &, fastllm::Data &, const fastllm::Data *))
         dlsym(RTLD_NEXT, "_Z35FastllmCudaNaiveBatchDraftAttentionRKN7fastllm4DataERKSt6vectorI20FastllmNaiveDraftRowSaIS4_EEiiiiRS0_S9_PS1_");
@@ -5912,6 +5913,40 @@ class DraftFixture : public NaiveN05FlashModel {
                 auto av = read(a), rv = read(r); RequireCloseLogits(av.data(), rv, "draft after batch commit");
                 ++checks;
             }
+        }
+        // Keep the batch shape fixed while replacing both KV addresses and
+        // crossing the short-attention boundary. Only the first pair may capture.
+        if (!failVerifyBegin && !failVerifyInstantiate) {
+            for (bool lowLatency : {false, true}) {
+                auto run = [&](const std::vector<int> &ids, const std::vector<DraftContext *> &rows, Data &result) {
+                    return lowLatency ? RunDraftLowLatencyBatch(ids, rows, result) : RunDraftBatch(ids, rows, result);
+                };
+                // Prepare a long/long pair once, then serve mixed, reordered,
+                // short/short and original owners with capture disabled.
+                const std::pair<int, int> pairs[] = {{1,2}, {0,2}, {2,0}, {0,5}, {1,2}};
+                preparingGraphs = draftCapturing = true;
+                for (const auto &pair : pairs) {
+                    const std::vector<int> ids{anchors[pair.first], anchors[pair.second]};
+                    const std::vector<DraftContext *> selected{contexts[pair.first], contexts[pair.second]};
+                    Data result, eager;
+                    SetCudaGraph(true);
+                    const int captures = verifyGraphCaptures, launches = verifyGraphLaunches;
+                    if (!run(ids, selected, result))
+                        throw std::runtime_error("draft request replacement failed");
+                    if ((!preparingGraphs || forceUnboundDraftAttention) && verifyGraphCaptures != captures)
+                        throw std::runtime_error("draft request replacement captured a graph");
+                    if ((verifyGraphLaunches != launches) == forceUnboundDraftAttention)
+                        throw std::runtime_error("draft request replacement used the wrong execution path");
+                    auto values = read(result);
+                    SetCudaGraph(false);
+                    if (!run(ids, selected, eager) || values != read(eager))
+                        throw std::runtime_error("draft request replacement used stale KV or lengths");
+                    ++checks;
+                    preparingGraphs = draftCapturing = false;
+                }
+            }
+            preparingGraphs = draftCapturing = true;
+            SetCudaGraph(true);
         }
         // Reorder and resize the active set, exceeding the bounded graph cache.
         // Each captured KV binding must remain isolated from the next request set.

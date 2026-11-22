@@ -2603,7 +2603,13 @@ __device__ DraftBatchRow ResolveDraftRow(DraftBatchRow r) {
     return r;
 }
 constexpr int kDraftBatchLimit = 32;
-struct DraftBatch { DraftBatchRow rows[kDraftBatchLimit]; };
+struct DraftBatch { DraftBatchRow rows[kDraftBatchLimit]; bool liveLengths = false; };
+__device__ __forceinline__ DraftBatchRow DraftAttentionRow(const DraftBatch &batch, int index, int rows, int window) {
+    auto row = ResolveDraftRow(batch.rows[index]);
+    if (batch.liveLengths && row.cacheTable)
+        row.shortAttention = DraftLength{row.live, window, rows} <= 256;
+    return row;
+}
 static_assert(sizeof(DraftBatch) < 3900, "Draft descriptors exceed generic CUDA argument limit");
 // Capture descriptors by value in a small upload node. Unlike a captured H2D
 // copy this never retains a pointer to a temporary host vector. The consuming
@@ -2699,7 +2705,7 @@ __global__ void BatchDraftQKV(Batch batch, const float *qNorm, const float *kNor
         blockIdx.x, blockIdx.y % rows, 0, 1);
 }
 __global__ void BatchDraftShort(DraftBatch batch, int rows, int heads, int kvHeads, int dim, int window) {
-    const auto r = ResolveDraftRow(batch.rows[blockIdx.y / rows]);
+    const auto r = DraftAttentionRow(batch, blockIdx.y / rows, rows, window);
     if (!r.shortAttention) return;
     DraftLength keys{r.live, window, rows}, past{r.live, window, 0};
     AttentionShortBody(r.input, FastllmNaiveKV(r.key), FastllmNaiveKV(r.value), nullptr, nullptr,
@@ -2708,7 +2714,7 @@ __global__ void BatchDraftShort(DraftBatch batch, int rows, int heads, int kvHea
 }
 template <int MaxDim, int KeyTile = 0, bool Hopper = false>
 __global__ void BatchDraftScores(DraftBatch batch, int rows, int heads, int kvHeads, int dim, int window) {
-    const auto r = ResolveDraftRow(batch.rows[blockIdx.y / rows]);
+    const auto r = DraftAttentionRow(batch, blockIdx.y / rows, rows, window);
     if (r.shortAttention) return;
     DraftLength keys{r.live, window, rows}, past{r.live, window, 0};
     if constexpr (Hopper)
@@ -2720,13 +2726,13 @@ __global__ void BatchDraftScores(DraftBatch batch, int rows, int heads, int kvHe
             keys, keys, past, window, false, blockIdx.x, blockIdx.y % rows, blockIdx.z, gridDim.z);
 }
 __global__ void BatchDraftSoftmax(DraftBatch batch, int rows, int heads, int window) {
-    const auto r = ResolveDraftRow(batch.rows[blockIdx.y]);
+    const auto r = DraftAttentionRow(batch, blockIdx.y, rows, window);
     if (r.shortAttention) return;
     AttentionSoftmaxBody(r.scores, nullptr, heads, DraftLength{r.live, window, rows}, blockIdx.x, 0, 0, 1);
 }
 template <int Columns = 16, int Padding = 8, bool Generic = false, int HeadTile = 1>
 __global__ void BatchDraftValues(DraftBatch batch, int rows, int heads, int kvHeads, int dim, int window) {
-    const auto r = ResolveDraftRow(batch.rows[blockIdx.y / rows]);
+    const auto r = DraftAttentionRow(batch, blockIdx.y / rows, rows, window);
     if (r.shortAttention) return;
     DraftLength keys{r.live, window, rows}, past{r.live, window, 0};
     if constexpr (Generic)
@@ -2973,12 +2979,20 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         descriptors[i].output = (BF16 *)output.cudaData + (size_t)i * rows * heads * dim;
         descriptors[i].scores = (float *)scores.cudaData + (size_t)i * rows * heads * capacity;
     }
+    const bool capturing = FastllmCudaGraphIsCapturingFast();
     const bool hopper = FastllmCudaRuntimeArch() == 90;
     for (int first = 0; first < count; first += kDraftBatchLimit) {
         const int n = std::min(kDraftBatchLimit, count - first);
         DraftBatch batch{}; std::copy_n(descriptors.begin() + first, n, batch.rows);
         bool shortRows = false, longRows = false;
-        for (int i = 0; i < n; ++i) (batch.rows[i].shortAttention ? shortRows : longRows) = true;
+        for (int i = 0; i < n; ++i) {
+            if (capturing && batch.rows[i].cacheTable) {
+                // Replays can cross the 256-key boundary with the same geometry.
+                batch.liveLengths = true;
+                shortRows = true;
+                longRows |= capacity > 256;
+            } else (batch.rows[i].shortAttention ? shortRows : longRows) = true;
+        }
         if (shortRows) BatchDraftShort<<<dim3(heads, rows * n), 256>>>(batch, rows, heads, kvHeads, dim, window);
         if (!longRows) continue;
         if (hopper && dim == 128 && window <= 1024 && (heads / kvHeads) % 4 == 0)
