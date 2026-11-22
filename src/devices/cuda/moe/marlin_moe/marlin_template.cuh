@@ -50,7 +50,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const bool m_block_size_8, const int stages,
           const int group_blocks, const bool is_zp_float,
           const bool nvfp4_gate_up = false,
-          const bool full_k = false, const bool fold_mxfp4_bias = false>
+          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false>
 __global__ void Marlin(
     const int4 *__restrict__ A, const int4 *__restrict__ B,
     int4 *__restrict__ C, int4 *__restrict__ C_tmp,
@@ -243,7 +243,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,  // A ScalarTy
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
           const bool nvfp4_gate_up = false,  // independent gate/up global scales
-          const bool full_k = false, const bool fold_mxfp4_bias = false
+          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -440,6 +440,7 @@ __global__ void Marlin(
   int block_id = -1;
   int64_t expert_id = 0;  // use int64 to avoid computation result overflow
   int old_expert_id = 0;
+  const int4 *const weights_base = B;
   int64_t B_expert_off = 0;
 
   float* sh_a_s = reinterpret_cast<float*>(sh);
@@ -557,8 +558,14 @@ __global__ void Marlin(
       global_scale_f32 = global_scale_ptr[expert_id * (nvfp4_gate_up ? 2 : 1)];
     }
 
-    B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
-    scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
+    if constexpr (indexed_mxfp4) {
+      // Each TP expert keeps its own allocation: packed nibbles followed by UE8M0 scales.
+      B = reinterpret_cast<const int4 *const *>(weights_base)[expert_id];
+      scales_ptr = B + int64_t(prob_n) * prob_k / (pack_factor * 4);
+    } else {
+      B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
+      scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
+    }
     if constexpr (has_zp) {
       zp_ptr += (expert_id - old_expert_id) * zp_expert_stride;
     }
