@@ -27,6 +27,8 @@ struct FastllmMxfp8ProjectionBackend {
 
     FastllmMxfp8Activation Bind(const fastllm::Data &weight, int rows, bool verifying,
                                 int maxWidth, fastllm::Data &storage) const;
+    // Verification may alias graph-owned scratch only between its producer and this projection.
+    FastllmMxfp8Activation Borrow(const fastllm::Data &weight, int rows, const fastllm::Data &scratch) const;
     bool TryProject(FastllmMxfp8Activation prepared, const fastllm::Data &input,
                     const fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output) const;
 };

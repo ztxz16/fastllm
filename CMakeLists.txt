@@ -3700,6 +3700,10 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_router_batch COMMAND naive_n05_decode_graph_test --router-batch)
         set_tests_properties(naive_n05_router_batch PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ROUTER BATCH PASS")
+        if (TARGET fastllm_mxfp8_linear_sm103)
+            add_test(NAME naive_n05_projection_pack COMMAND naive_n05_decode_graph_test --projection-pack)
+            set_tests_properties(naive_n05_projection_pack PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
         add_test(NAME naive_n05_decode_graph COMMAND naive_n05_decode_graph_test)
         set_tests_properties(naive_n05_decode_graph PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "DECODE GRAPH PASS")

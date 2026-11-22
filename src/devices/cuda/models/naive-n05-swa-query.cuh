@@ -1,4 +1,5 @@
 #pragma once
+#include "devices/cuda/fastllm-mxfp8-activation.cuh"
 #include "naive-n05-prefill-mma.cuh"
 #include "devices/cuda/naive-n05-swa-prefill.cuh"
 namespace naive_prefill_mma {
@@ -400,9 +401,10 @@ struct SwaFP8VerifyStorage {
     BF prob[4][8][136];
 };
 
+template<bool Pack>
 __device__ __forceinline__ void SwaVerifyFP8(const BF *q, const FastllmNaiveDSARow &row,
         int startRow, int count, const int *lengths, const int *offsets, int first, int end,
-        int prefix, const float *sink, BF *out, int heads, int kvHeads, int blockHead) {
+        int prefix, const float *sink, BF *out, int heads, int kvHeads, int blockHead, FastllmMxfp8Activation packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && CUDART_VERSION >= 12080
     using namespace naive_attention_bulk;
     extern __shared__ __align__(16) char buffer[];
@@ -508,19 +510,21 @@ __device__ __forceinline__ void SwaVerifyFP8(const BF *q, const FastllmNaiveDSAR
     for (int i = lane; i < 64; i += 32) {
         const int col = half * 64 + (i % 8) * 8;
         BF *dst = out + (size_t(startRow + query) * heads + head + i / 8) * 128 + col;
-        *reinterpret_cast<uint4 *>(dst) = *reinterpret_cast<const uint4 *>(&s.output[query][i / 8][col]);
+        const uint4 values = *reinterpret_cast<const uint4 *>(&s.output[query][i / 8][col]);
+        *reinterpret_cast<uint4 *>(dst) = values;
+        if constexpr (Pack) fastllm_mxfp8::Store8(packed, startRow + query, (head + i / 8) * 128 + col, values);
     }
 #endif
 }
 
 // The large descriptor argument and grid-constant ABI require SM70.
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
-template <int Queries, bool FP8, bool BlackwellFP8 = false>
+template <int Queries, bool FP8, bool BlackwellFP8 = false, bool Pack = false>
 __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
 #if CUDART_VERSION >= 12010
         const __grid_constant__
 #endif
-        SwaVerifyBatch batch, const float *sink, BF *out, int heads, int kvHeads) {
+        SwaVerifyBatch batch, const float *sink, BF *out, int heads, int kvHeads, FastllmMxfp8Activation packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(!BlackwellFP8 || (FP8 && Queries == 4));
     const auto &group = batch.groups[blockIdx.x];
@@ -542,7 +546,10 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
         if (end == 0) {
             for (int i = threadIdx.x; i < group.count * 128; i += blockDim.x) {
                 BF *dst = out + (size_t(group.first + i / 128) * heads + blockIdx.y * 8) * 128;
-                reinterpret_cast<uint4 *>(dst)[i % 128] = make_uint4(0, 0, 0, 0);
+                const auto zero = make_uint4(0, 0, 0, 0);
+                reinterpret_cast<uint4 *>(dst)[i % 128] = zero;
+                if constexpr (Pack) fastllm_mxfp8::StoreZero8(packed, group.first + i / 128,
+                    blockIdx.y * 1024 + (i % 128) * 8);
             }
             return;
         }
@@ -558,6 +565,14 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
             naive_attention_bulk::DecodeRow<128, true, FP8>(q, single, sink, out,
                 heads, kvHeads, group.first + r, blockIdx.y);
             __syncthreads();
+            if constexpr (Pack) {
+                // Singletons and rebound pages can select this path on any replay.
+                if (threadIdx.x < 128) {
+                    const int col = blockIdx.y * 1024 + threadIdx.x * 8;
+                    const auto *v = out + size_t(group.first + r) * heads * 128 + col;
+                    fastllm_mxfp8::Store8(packed, group.first + r, col, *reinterpret_cast<const uint4 *>(v));
+                }
+            }
         }
         return;
     }
@@ -566,8 +581,8 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
     for (int r = 0; r < Queries; ++r)
         offsets[r] = max(0, prefix + row.verifyOffset + r + 1 - 128) - first;
     if constexpr (BlackwellFP8) {
-        SwaVerifyFP8(q, row, group.first, group.count, lengths, offsets, first, end,
-                     prefix, sink, out, heads, kvHeads, blockIdx.y);
+        SwaVerifyFP8<Pack>(q, row, group.first, group.count, lengths, offsets, first, end,
+                     prefix, sink, out, heads, kvHeads, blockIdx.y, packed);
     } else {
         extern __shared__ __align__(16) char memory[];
         auto &s = *(SwaQueryStorage<Queries> *)memory;

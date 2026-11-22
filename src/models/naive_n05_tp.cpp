@@ -1079,6 +1079,10 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             if (!table.cudaData) throw CudaWorkspaceExhausted("Naive graph cache table pool exhausted.");
         } else allocate(storage->cacheTable, INT32, tableElements);
         allocate(storage->indexScores, INT32, (int)scoreElements);
+        // Index scores are dead before QKV and after attention. The graph owns
+        // this address across all shapes and request rebindings on this rank.
+        if (attentionParallel && serving->verifyWidth)
+            storage->buffers.verifyProjectionScratch = &storage->indexScores;
         if (indexerContextSharding)
             allocate(storage->indexExchange, INT32, maxLocalRows * stride * attentionRanks * indexTopK * 2);
         storage->buffers.cacheTable = (const void *const *)storage->cacheTable.cudaData;

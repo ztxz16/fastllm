@@ -9,6 +9,7 @@
 namespace fastllm {
 struct NaiveN05FlashModel::TargetWorkspace {
     Data hidden, normed, q, k, v, qkv, packed, packedIndexer, attn, projected;
+    const Data *verifyProjectionScratch = nullptr;
     Data projectionQuant, routerInput, router, expertIndex, expertScore;
     Data w1, w2, w3, tempInput, tempOutput, moeOutput, moeInputTemp, moeOutputTemp;
     Data indexQ, indexKey, indexKeyFloat, indexWeights, indices, indexBroadcast, positions;

@@ -958,7 +958,9 @@ Data NaiveN05FlashModel::RunTarget(
         ? FastllmCudaGetMxfp8ProjectionBackend() : nullptr;
     const int maxProjectionWidth = std::max({embed_dim, full.heads * full.valueDim, sliding.heads * sliding.valueDim});
     auto activationFor = [&](const Data &weight, int rows) {
-        return projectionBackend->Bind(weight, rows, verifying, maxProjectionWidth, buf.projectionQuant);
+        if (verifying) return buf.verifyProjectionScratch
+            ? projectionBackend->Borrow(weight, rows, *buf.verifyProjectionScratch) : FastllmMxfp8Activation{};
+        return projectionBackend->Bind(weight, rows, false, maxProjectionWidth, buf.projectionQuant);
     };
     auto projectAttention = [&](Data &input, Data &weight, const Data &bias, Data &output,
                                 FastllmMxfp8Activation prepared = {}) {

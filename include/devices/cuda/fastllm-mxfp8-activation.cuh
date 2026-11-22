@@ -64,4 +64,19 @@ __device__ __forceinline__ uint2 PackActivation(const __nv_bfloat162 *pairs, uin
     return encoded.word;
 }
 
+// Four adjacent lanes own one K32 block of already rounded BF16 values.
+__device__ __forceinline__ void Store8(FastllmMxfp8Activation dst, int row, int col, uint4 values) {
+    uint32_t exponent;
+    const auto bytes = PackActivation(reinterpret_cast<const __nv_bfloat162 *>(&values), exponent, 0xffffffffu);
+    *reinterpret_cast<uint2 *>(dst.values + size_t(row) * dst.width + col) = bytes;
+    if (col % 32 == 0)
+        dst.scales[(size_t(col / 128) * dst.pitch + row) * 4 + col / 32 % 4] = exponent;
+}
+
+__device__ __forceinline__ void StoreZero8(FastllmMxfp8Activation dst, int row, int col) {
+    *reinterpret_cast<uint2 *>(dst.values + size_t(row) * dst.width + col) = make_uint2(0, 0);
+    if (col % 32 == 0)
+        dst.scales[(size_t(col / 128) * dst.pitch + row) * 4 + col / 32 % 4] = 1;
+}
+
 } // namespace fastllm_mxfp8

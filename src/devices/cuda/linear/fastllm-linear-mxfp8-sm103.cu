@@ -289,6 +289,32 @@ bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma
     });
 }
 
+// Both packed producers and standalone Linear use the same tile geometry.
+static auto SelectProjection(int &count, int rows, int n, bool capturing, const ProjectionSupport &support) {
+    const int rowTiles = (count - 1) / 128 + 1;
+    const bool pairedM = rowTiles % 2 == 0;
+    const int64_t tiles = int64_t(count / 128) * (n / 256);
+    // Preserve the wide-column prefill path and use it in graphs when
+    // there are at least 64 complete 128x256 output tiles.
+    const bool enoughWork = tiles >= 64 || (!capturing && rows >= 1024);
+    const bool paired = ((n + 127) / 128) % 2 == 0;
+    auto run = paired ? Projection<32, 2>::Run : Projection<32, 1>::Run;
+    // Prefer a single well-occupied wave. Two adjacent M tiles must be
+    // present for weight multicast, including when the last tile is partial.
+    const int64_t tiles64 = int64_t(rowTiles) * (n / 64);
+    if (pairedM && tiles64 >= 96 && tiles64 <= kSMs && support.columns64) {
+        run = Projection<128, 2, 64>::Run;
+    } else if (pairedM && tiles64 > kSMs && tiles64 <= 2 * kSMs && n % 128 == 0 && support.columns128) {
+        run = Projection<128, 2, 128>::Run;
+    } else if (support.columns256 && n % 256 == 0 && count >= 256 && enoughWork && (pairedM || tiles >= kSMs)) {
+        if (!pairedM) count = count / 256 * 256;
+        run = Projection<128, 2, 256>::Run;
+    } else if (count <= 16) {
+        run = paired ? Projection<16, 2>::Run : Projection<16, 1>::Run;
+    }
+    return run;
+}
+
 bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int rows, int k, int n) {
     // Streaming measurements favor GEMV on narrow single-row TP shards.
     if (rows == 1 && (k < 4096 || n < 4096 || size_t(k) * n < (size_t(24) << 20))) return false;
@@ -337,34 +363,9 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     const int threads = smallTile ? 128 : 256;
     const int tilesPerRow = (k / 128 + tile - 1) / tile;
     auto prepare = smallTile ? PrepareOperands<16, 16, 128> : PrepareOperands<32, 32, 256>;
-    // A pair of CTAs must cover two complete N tiles. A trailing odd tile
-    // needs a single-CTA kernel or the multicast barrier cannot complete.
-    const bool paired = ((n + 127) / 128) % 2 == 0;
     for (int start = 0; start < rows;) {
         int count = std::min(rows - start, limit);
-        // Multicast needs an even number of M tiles. A partially filled
-        // second tile is legal. For a short, narrow GEMM, splitting off
-        // a lone tile costs more than using the existing single-launch path.
-        const int rowTiles = (count - 1) / 128 + 1;
-        const bool pairedM = rowTiles % 2 == 0;
-        const int64_t tiles = int64_t(count / 128) * (n / 256);
-        // Preserve the wide-column prefill path and use it in graphs when
-        // there are at least 64 complete 128x256 output tiles.
-        const bool enoughWork = tiles >= 64 || (!capturing && rows >= 1024);
-        auto run = paired ? Projection<32, 2>::Run : Projection<32, 1>::Run;
-        // Prefer a single well-occupied wave. Two adjacent M tiles must be
-        // present for weight multicast, including when the last tile is partial.
-        const int64_t tiles64 = int64_t(rowTiles) * (n / 64);
-        if (pairedM && tiles64 >= 96 && tiles64 <= kSMs && support.columns64) {
-            run = Projection<128, 2, 64>::Run;
-        } else if (pairedM && tiles64 > kSMs && tiles64 <= 2 * kSMs && n % 128 == 0 && support.columns128) {
-            run = Projection<128, 2, 128>::Run;
-        } else if (support.columns256 && n % 256 == 0 && count >= 256 && enoughWork && (pairedM || tiles >= kSMs)) {
-            if (!pairedM) count = count / 256 * 256;
-            run = Projection<128, 2, 256>::Run;
-        } else if (count <= 16) {
-            run = paired ? Projection<16, 2>::Run : Projection<16, 1>::Run;
-        }
+        auto run = SelectProjection(count, rows, n, capturing, support);
         const int pitch = (count + 3) / 4 * 4;
         const int weightTiles = !compact && start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;
         const int activationTiles = (size_t(count) * k / 8 + threads - 1) / threads;
@@ -423,13 +424,19 @@ void PrepareCompactScales(fastllm::Data &w) {
 }
 
 int PreparedProjectionRows(const fastllm::Data &w, bool verifying) {
-    return !verifying && FastllmCudaCompactMxfp8(w) ? kPreparedProjectionRows : 0;
+    if (!FastllmCudaCompactMxfp8(w)) return 0;
+    return verifying ? int(kWorkspace / (w.dims[1] + w.dims[1] / 32)) : kPreparedProjectionRows;
 }
 
 bool ProjectPrepared(FastllmMxfp8Activation input, const fastllm::Data &w, void *output) {
     auto *scales = const_cast<void *>(FastllmCudaCompactMxfp8(w));
-    if (!scales || input.rows > kPreparedProjectionRows) return false;
-    auto run = ((w.dims[0] + 127) / 128) % 2 ? Projection<16, 1>::Run : Projection<16, 2>::Run;
+    if (!scales) return false;
+    int count = input.rows;
+    const bool capturing = FastllmCudaGraphIsCapturing();
+    const auto support = GetProjectionSupport(FastllmCudaGetDevice(), capturing);
+    if (!support.smallRows) return false;
+    auto run = SelectProjection(count, input.rows, w.dims[0], capturing, support);
+    if (count != input.rows) return false; // Linear handles a separate trailing tile.
     return run(input.values, w.cudaData, input.scales, scales, output,
                input.rows, w.dims[0], input.width, input.pitch);
 }

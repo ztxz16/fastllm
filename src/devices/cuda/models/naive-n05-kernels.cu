@@ -5660,14 +5660,8 @@ __global__ void AddRMSNormMxfp8(BF16 *hidden, const BF16 *branch, const float *g
     // Four lanes share a K32 reduction. Two vector passes cover one whole row.
 #pragma unroll
     for (int col = threadIdx.x * 8; col < 4096; col += 256 * 8) {
-        alignas(16) BF16 group[8];
-        *reinterpret_cast<uint4 *>(group) = *reinterpret_cast<const uint4 *>(normalized + col);
-        uint32_t exponent;
-        uint2 value = fastllm_mxfp8::PackActivation(reinterpret_cast<const __nv_bfloat162 *>(group),
-                                                    exponent, 0xffffffffu);
-        *reinterpret_cast<uint2 *>(packed.values + blockIdx.x * 4096 + col) = value;
-        if (col % 32 == 0)
-            packed.scales[(col / 128 * packed.pitch + blockIdx.x) * 4 + col / 32 % 4] = exponent;
+        const uint4 value = *reinterpret_cast<const uint4 *>(normalized + col);
+        fastllm_mxfp8::Store8(packed, blockIdx.x, col, value);
     }
 }
 }
@@ -6942,7 +6936,8 @@ bool CompactAttentionSupported(const std::vector<FastllmNaiveDSARow> &rows) {
 #endif
 
 bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
-        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output,
+        FastllmMxfp8Activation target, FastllmMxfp8Activation *produced) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
     namespace swa = naive_prefill_mma;
     if (rows.empty() || rows.front().verifyOffset < 0) return false;
@@ -6950,12 +6945,13 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
     auto kernel = fp8 ? swa::SwaVerifyQueries<4, true> : swa::SwaVerifyQueries<4, false>;
     size_t shared = std::max(sizeof(swa::SwaQueryStorage<4>),
         fp8 ? sizeof(naive_attention_bulk::Storage<128, true>) : sizeof(naive_attention_bulk::Storage<128>));
-    bool supported = false;
+    bool supported = false, pack = false;
 #if CUDART_VERSION >= 12080
     if (fp8) {
         const int arch = FastllmCudaRuntimeArch();
         if (arch == 100 || arch == 103) {
-            auto specialized = swa::SwaVerifyQueries<4, true, true>;
+            pack = target.Matches(rows.size(), heads * 128);
+            auto specialized = pack ? swa::SwaVerifyQueries<4, true, true, true> : swa::SwaVerifyQueries<4, true, true>;
             const size_t bytes = std::max(sizeof(swa::SwaFP8VerifyStorage),
                                           sizeof(naive_attention_bulk::Storage<128, true>));
             if (BulkKernelSupported(specialized, bytes, 100)) {
@@ -6993,8 +6989,9 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
         swa::SwaVerifyBatch descriptors{};
         std::copy_n(groups.begin() + first, count, descriptors.groups);
         kernel<<<dim3(count, heads / 8), 256, shared>>>(
-            (const BF16 *)query.cudaData, descriptors, bias, (BF16 *)output.cudaData, heads, kvHeads);
+            (const BF16 *)query.cudaData, descriptors, bias, (BF16 *)output.cudaData, heads, kvHeads, target);
     }
+    if (pack && supported) *produced = target;
     return true;
 #else
     return false;
@@ -7271,12 +7268,12 @@ bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::
     const auto *bias = sink.dims.empty() ? nullptr : static_cast<const float *>(sink.cudaData);
     const int total = static_cast<int>(rows.size());
     const bool split = total < 32;
-    const bool pack = split && total <= naive_attention_bulk::BatchLimit && target.Matches(total, heads * valueDim);
-    auto kernel = split ? bw::Decode<true> : bw::Decode<false>;
+    const bool pack = target.Matches(total, heads * valueDim);
+    auto kernel = split ? bw::Decode<true> : pack ? bw::Decode<false, 1, true> : bw::Decode<false>;
     int groupsPerBlock = 1, sharedBytes = bw::Layout<1>::Bytes;
 #ifdef FASTLLM_ENABLE_BLACKWELL_DSA
     if (total >= 64 && kvHeads % 2 == 0) {
-        auto paired = bw::PairedDecodeKernel();
+        auto paired = bw::PairedDecodeKernel(pack);
         if (BulkKernelSupported(paired, bw::Layout<2>::Bytes, 100)) {
             kernel = paired;
             groupsPerBlock = 2;
@@ -7303,7 +7300,7 @@ bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::
         auto *out = static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128;
         kernel<<<dim3(count, kvHeads / groupsPerBlock, splits), (bw::NCW * groupsPerBlock + bw::NP) * 32, sharedBytes>>>(
             static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, bias,
-            out, heads, parts, stats);
+            out, heads, parts, stats, target, first);
         // All split rows fit a single descriptor batch.
         if (split) {
             if (pack)
@@ -7670,7 +7667,7 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
         const bool independent = FastllmCudaRuntimeArch() == 103 && !rows.front().fp8 &&
             rows.size() * size_t(heads / 8) <= 256;
         if (aligned && ((independent && BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output)) ||
-                        VerifySwaQueryReuse(query, bias, descriptors, heads, kvHeads, output) ||
+                        VerifySwaQueryReuse(query, bias, descriptors, heads, kvHeads, output, target, packed) ||
                         (!independent && BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output)))) {
             CheckLaunch(); return;
         }

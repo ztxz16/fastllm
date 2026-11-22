@@ -276,7 +276,7 @@ static void TestCache(int window) {
         ++checks;
     }
 }
-static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = false) {
+static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = false, bool verifyPack = false) {
     Data hidden(BFLOAT16), branch(BFLOAT16), weight(FLOAT32), actual(BFLOAT16);
     Data reference(BFLOAT16), expected(BFLOAT16);
     Upload(hidden, {1, rows, channels}, 91);
@@ -291,7 +291,7 @@ static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = 
     Upload(expected, {1, rows, channels}, 94);
     auto original = Read<uint16_t>(hidden);
     PackedOutput packed;
-    if (channels % 128 == 0 && rows <= 16) packed.Init(rows, channels);
+    if (channels % 128 == 0 && (rows <= 16 || verifyPack)) packed.Init(rows, channels);
     auto body = [&]() {
         auto view = packed.view;
         FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, weight, 1e-5f, actual, &view);
@@ -677,6 +677,52 @@ static void TestSwaBatch(int batch, int heads, int kvHeads) {
     }
 }
 
+// Replay one verification graph with shared prefixes, independently changing
+// lengths, a trailing singleton, and empty rows. Compare against the same BF16 attention.
+static void TestVerifySwaPacking() {
+    constexpr int rows = 129, heads = 16, kvHeads = 2;
+    Data q(BFLOAT16), sink(FLOAT32), live(INT32), key(INT32), value(INT32), reference, actual;
+    Upload(q, {1, rows, heads * 192}, 621);
+    Upload(sink, {heads}, 622);
+    Upload(live, {rows}, 623);
+    auto cache = [](Data &d, int width) {
+        Upload(d, {132, kvHeads * width / 4}, width);
+        std::vector<uint8_t> bytes(d.GetBytes());
+        for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = (i * 97 % 95) + 7;
+        Cuda(cudaMemcpy(d.cudaData, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+    };
+    cache(key, 192);
+    cache(value, 128);
+    std::vector<FastllmNaiveSWARow> desc(rows);
+    for (int i = 0; i < rows; ++i) {
+        desc[i].key = key.cudaData; desc[i].value = value.cudaData;
+        desc[i].fp8 = true; desc[i].verifyOffset = i % 4;
+    }
+    std::vector<int> lengths(rows);
+    PackedOutput packed;
+    packed.Init(rows, heads * 128);
+    auto bind = [&](int mode) {
+        for (int i = 0; i < rows; ++i)
+            lengths[i] = mode == 0 ? 128 + i % 4 : mode == 1 && i / 4 % 3 ? 37 + i % 2 : 0;
+        Cuda(cudaMemcpy(live.cudaData, lengths.data(), live.GetBytes(), cudaMemcpyHostToDevice));
+    };
+    bind(0);
+    Graph graph;
+    graph.Capture([&] {
+        auto view = packed.view;
+        FastllmCudaNaiveBatchSWADecode(q, sink, desc, live, heads, kvHeads, actual, &view);
+        Require(view.values, "FP8 verification SWA did not produce packed output");
+    });
+    for (int mode : {0, 1, 2, 0}) {
+        bind(mode);
+        graph.Run();
+        FastllmCudaNaiveBatchSWADecode(q, sink, desc, live, heads, kvHeads, reference);
+        Require(Read<uint16_t>(reference) == Read<uint16_t>(actual), "packed verification SWA changed BF16");
+        packed.Check(actual);
+        ++checks;
+    }
+}
+
 static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool sparse, bool fp8, bool online = false) {
     const int kvHeads = online ? heads / 16 : 1;
     const int capacity = online ? 2049 : sparse ? 2048 : 128;
@@ -740,7 +786,7 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
     bind(batch);
     FastllmNaiveDecodeScratch scratch;
     PackedOutput packed;
-    if (online && batch <= 16) packed.Init(batch, heads * vd);
+    if (online) packed.Init(batch, heads * vd);
     auto runOnline = [&] {
         auto view = packed.view;
         const bool ok = FastllmCudaNaiveOnlineDSADecode(query, sink, rows, heads, kvHeads, dim, vd, scratch, actual, &view);
@@ -773,6 +819,13 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
         for (size_t i = 0; i < result.size(); ++i)
             Require(result[i] == (i < (size_t)active * heads * vd ? reference[i] : 0),
                     "padding changed active attention or left inactive output nonzero");
+        ++checks;
+    }
+    if (online && packed.view.values) {
+        // A live row can also have an exactly zero K32 block.
+        Cuda(cudaMemset(value.cudaData, 0, value.GetBytes()));
+        graph.Run();
+        packed.Check(actual);
         ++checks;
     }
 }
@@ -948,6 +1001,11 @@ int main(int argc, char **argv) {
             TestResidualNorm(4096, 8);
             TestResidualNorm(2048, 2); // BF16 fallback clears the requested side output.
             TestSwaBatch(1, 64, 8);
+            if (FastllmCudaRuntimeArch() == 103) {
+                TestVerifySwaPacking();
+                TestResidualNorm(4096, 128, false, true);
+                TestPaddedAttention(257, 32, 192, 128, true, true, true);
+            }
             for (int rows : {1, 4}) TestPaddedAttention(rows, 64, 192, 128, true, true, true);
             std::printf("Projection pack PASS (%d graph checks)\n", checks);
             return 0;

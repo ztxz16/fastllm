@@ -488,5 +488,5 @@ bool FastllmCudaTryBlackwellScoreAttention(const FastllmNaivePrefillAttentionIte
 }
 
 namespace blackwell_decode {
-DecodeKernel PairedDecodeKernel() { return &Decode<false, 2>; }
+DecodeKernel PairedDecodeKernel(bool pack) { return pack ? &Decode<false, 2, true> : &Decode<false, 2>; }
 }
