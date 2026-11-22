@@ -7057,7 +7057,7 @@ bool FastllmCudaValidatePointerRange(const void *ptr, size_t bytes,
     return offset <= allocation && bytes <= allocation - offset;
 }
 
-void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
+static void CopyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size, bool callerOrdered) {
     if (size == 0 || dst == src) {
         return;
     }
@@ -7115,6 +7115,14 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
     }
     const char *failedStage = "cudaMemcpyPeerAsync";
     if (canPeerAccess) {
+        if (callerOrdered && (oriId == srcId || oriId == dstId)) {
+            state = cudaMemcpyPeerAsync(dst, dstId, src, srcId, size, cudaStreamPerThread);
+            if (state == cudaSuccess) {
+                checkCudaErrors("Ordered peer transfer failed", cudaStreamSynchronize(cudaStreamPerThread));
+                return;
+            }
+            cudaGetLastError();
+        }
         // Keep the synchronous handoff, but use an explicit stream for the
         // transfer. The synchronous peer API can fail inside the driver after
         // PP graph capture. Wait for producers on both devices before copying;
@@ -7204,6 +7212,14 @@ void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src,
     }
     checkCudaErrors("Error: CUDA error when copy Between GPUs!", state);
     FastllmCudaSetDevice(oriId);
+}
+
+void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size) {
+    CopyBetweenDevices(dstId, dst, srcId, src, size, false);
+}
+
+void FastllmCudaCopyOrderedPeer(int dstId, void *dst, int srcId, void *src, size_t size) {
+    CopyBetweenDevices(dstId, dst, srcId, src, size, true);
 }
 
 bool FastllmCudaMemcpyPeerAsyncCurrentThread(

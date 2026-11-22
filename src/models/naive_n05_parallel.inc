@@ -207,7 +207,12 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             group.batch.reset(); group.kv.clear(); group.configs.clear();
             group.lengths.clear(); group.positions.clear(); group.sequenceIndices.clear();
         }
-        std::vector<int> owners;
+        std::vector<int> sequenceOwners;
+        sequenceOwners.reserve(sequences);
+        std::vector<size_t> localOffsets(attentionDP);
+        std::vector<std::pair<Data *, Data *>> roots;
+        roots.reserve(block_cnt);
+        bool sameRows = state.transfer && state.rows.Rows() == total;
         int offset = 0;
         for (int seq = 0; seq < sequences; ++seq) {
             Data &first = key(seq, 0);
@@ -226,7 +231,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 auto begin = batch->kv.begin() + (size_t)seq * block_cnt;
                 local.kv.insert(local.kv.end(), begin, begin + block_cnt);
             } else {
-                std::vector<std::pair<Data *, Data *>> roots;
+                roots.clear();
                 for (int layer = 0; layer < block_cnt; ++layer) roots.emplace_back(&key(seq, layer), &value(seq, layer));
                 InitAttentionParallelCache(roots, group);
                 if (sparseKv) AttachSparseKv(roots);
@@ -237,22 +242,34 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             local.configs.push_back(batch ? batch->configs[seq] : config);
             const float *pos = (const float *)hostPositions.cpuData;
             local.positions.insert(local.positions.end(), pos + offset, pos + offset + count);
-            owners.insert(owners.end(), count, group);
+            sequenceOwners.push_back(group);
+            if (sameRows && count > 0) {
+                // localToGlobal is strictly increasing. Matching both ends of a
+                // contiguous request proves that every row in the range matches.
+                const auto &previous = state.rows.localToGlobal[group];
+                const size_t first = localOffsets[group];
+                sameRows = first + count <= previous.size() && previous[first] == offset &&
+                    previous[first + count - 1] == offset + count - 1;
+            }
+            localOffsets[group] += count;
             offset += count;
         }
         AssertInFastLLM(offset == total, "Naive attention DP row lengths do not match the input");
-        parallel::RowPartition nextRows(attentionDP, owners);
-        if (!state.servingPadded && state.rows.localToGlobal != nextRows.localToGlobal) {
-            // Row-transfer allocations and collective counts are graph operands.
-            // Drop the old graph before changing either; shape misses stay eager.
-            tpDecodeState.reset();
+        if (!sameRows) {
+            std::vector<int> owners;
+            owners.reserve(total);
+            for (int seq = 0; seq < sequences; ++seq)
+                owners.insert(owners.end(), batch ? batch->lengths[seq] : total, sequenceOwners[seq]);
+            parallel::RowPartition nextRows(attentionDP, owners);
+            if (!state.servingPadded && state.rows.localToGlobal != nextRows.localToGlobal)
+                tpDecodeState.reset();
+            state.rows = std::move(nextRows);
+            if (!state.transfer) {
+                state.transfer = std::make_unique<parallel::CudaRowTransfer>(state.runtime, state.rows);
+                if (state.servingPadded)
+                    state.transfer->ReserveFixed(tpServingState->batchBuckets.back() * std::max(1, tpServingState->verifyWidth), size_t(embed_dim) * 2);
+            } else state.transfer->Reset(state.rows);
         }
-        state.rows = std::move(nextRows);
-        if (!state.transfer) {
-            state.transfer = std::make_unique<parallel::CudaRowTransfer>(state.runtime, state.rows);
-            if (state.servingPadded)
-                state.transfer->ReserveFixed(tpServingState->batchBuckets.back() * std::max(1, tpServingState->verifyWidth), size_t(embed_dim) * 2);
-        } else state.transfer->Reset(state.rows);
         state.transfer->Reserve(size_t(embed_dim) * sizeof(uint16_t));
         for (auto &group : state.groups)
             group.batch = std::make_unique<TargetBatch>(TargetBatch{group.kv, group.configs, group.lengths, block_cnt});
@@ -407,6 +424,42 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     if (state.servingPadded && !graphDecode)
         throw AttentionParallelState::UnsupportedServingLayout{};
     if (!graphDecode && tpServingState && tpServingState->preparing) return Data();
+    // Each local MoE owner writes its own draft rows. The ordinary runtime.Run
+    // joins all producer streams before the scheduler consumes the root views.
+    if (!graphDecode && !verifying && batch && !batch->Decode() && total > 64 &&
+        capture && capture->borrowOutputs && capture->collectHidden &&
+        capture->tailRows.size() == size_t(sequences) && AttentionTPSize() == 1 &&
+        tpEp8MegaState && block_cnt > 1 && !moeLayers.front() &&
+        std::all_of(moeLayers.begin() + 1, moeLayers.end(), [](bool m) { return m; }) &&
+        std::find(draftTargetLayers.begin(), draftTargetLayers.end(), 0) == draftTargetLayers.end() &&
+        FastllmCudaPeerAccessInit(tpDevices)) {
+        auto &features = state.ranks.front().workspace.features;
+        for (int layer : draftTargetLayers) {
+            auto &backing = features[layer];
+            backing.dataType = BFLOAT16;
+            backing.UpdateUnitSize();
+            backing.Resize({1, total, embed_dim});
+            backing.ToDevice(CUDA, {tpDevices.front()}, false);
+            backing.Allocate(false);
+            auto &view = captures.front().hidden[layer];
+            view.FakeFrom(backing, 0);
+            view.Resize(backing.dims);
+        }
+        for (size_t rank = 0; rank < captures.size(); ++rank) {
+            auto &out = captures[rank];
+            out.peerFeatures = &features;
+            const auto &group = state.groups[rank];
+            int localEnd = 0;
+            for (size_t i = 0; i < group.lengths.size(); ++i) {
+                localEnd += group.lengths[i];
+                const int count = capture->tailRows[group.sequenceIndices[i]];
+                if (count) {
+                    const int first = localEnd - count;
+                    out.featureSlices.push_back({first, state.rows.localToGlobal[rank][first], count});
+                }
+            }
+        }
+    }
     std::vector<std::vector<CudaDecodeSampling::Request>> samplingRequests;
     bool asyncSampling = graphDecode && state.servingPadded && ownedDecode &&
         distributedSampling && tpServingState && tpServingState->pipelineReady &&
@@ -721,7 +774,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     const bool deferredVerify = ownedVerify && graphDecode && ringVerify && !preparingVerify;
     const bool committedMetadata = deferredVerify || (!verifying && graphDecode && bindingsUnchanged &&
         state.plan.AdvanceMetadata(window));
-    if (!committedMetadata) ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode, [&](int begin, int end) {
+    if (!committedMetadata) ForSequenceRanges(tpWorkers, tpDevices, sequences, graphDecode || (pdPrefillOnly && !verifying), [&](int begin, int end) {
         for (int seq = begin; seq < end; ++seq) {
             if (state.servingPadded && seq >= state.servingLiveRows) continue;
             if (!verifying && graphDecode && !retained.empty() && retained[seq] >= 0 &&

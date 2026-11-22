@@ -304,6 +304,12 @@ namespace fastllm {
             bool borrowOutputs = false;
             bool ringVerify = false; // Candidates are staged after the retained SWA ring.
             std::map<int, Data> hidden;
+            // Internal draft prefill consumes only these suffix lengths. Other
+            // capture callers require all world rows.
+            std::vector<int> tailRows;
+            struct FeatureSlice { int local, world, count; };
+            std::vector<FeatureSlice> featureSlices;
+            const std::map<int, Data> *peerFeatures = nullptr;
             std::vector<PrefixSnapshots> prefixes;
             // Optional per-request CUDA destinations, consumed before the next forward.
             std::vector<Data *> logitsDestinations;
@@ -399,6 +405,7 @@ namespace fastllm {
         void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length, bool planning = false);
         std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length, int device = -1);
         std::shared_ptr<DraftContext> ReservePDDraft(int length, int device);
+        void AppendDraftKVOnRank(Data &input, int start, DraftContext &context, int rank);
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
@@ -434,6 +441,9 @@ namespace fastllm {
         void CommitTargetCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
             const std::vector<int> &past, const std::vector<int> &counts, bool ringVerify,
             const std::vector<char> *written = nullptr);
+        bool CommitPrefillDraftOwners(TargetCapture &capture, const std::vector<int> &lengths,
+                                      const std::vector<bool> &collect,
+                                      const std::vector<std::shared_ptr<DraftContext>> &owners);
         bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
             const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
         struct DraftRound;

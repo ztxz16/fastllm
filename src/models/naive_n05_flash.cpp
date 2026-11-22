@@ -2441,6 +2441,11 @@ Data NaiveN05FlashModel::RunTarget(
         const auto featureLayer = capture && capture->collectHidden
             ? std::find(draftTargetLayers.begin(), draftTargetLayers.end(), layer) : draftTargetLayers.end();
         const bool captureHidden = featureLayer != draftTargetLayers.end();
+        // Between local MoE layers, only the draft consumer needs world order.
+        // Unpack directly to its persistent buffer on the rank that owns it.
+        const bool collectIntoFeature = localMoe && layer + 1 < block_cnt && tpRank == 0 &&
+            captureHidden && !capture->packedOutput && !capture->peerFeatures && workspace && capture->borrowOutputs &&
+            !decodeWorkspace && !capture->verifying;
         if (localMoe) {
             // The vocabulary head and draft feature consumers require world
             // order. No intermediate attention or MoE layer needs that gather.
@@ -2452,10 +2457,27 @@ Data NaiveN05FlashModel::RunTarget(
             }
             // Feature capture needs every row. Ordinary prefill passes only
             // the last local row of each sequence to the vocabulary head.
-            if ((captureHidden && !capture->packedOutput) || (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead))
-                attentionParallel->transfer->Collect(tpRank, hidden.cudaData, buf.hidden.cudaData, size_t(embed_dim) * 2);
+            if ((captureHidden && !capture->packedOutput && !capture->peerFeatures) ||
+                (layer + 1 == block_cnt && !decodeWorkspace && !compactPrefillHead)) {
+                Data &world = collectIntoFeature ? buf.features[layer] : buf.hidden;
+                if (collectIntoFeature) {
+                    world.dataType = buf.hidden.dataType;
+                    world.UpdateUnitSize();
+                    world.Resize(buf.hidden.dims);
+                    world.ToDevice(CUDA, {gpu}, false);
+                    world.Allocate(false);
+                }
+                attentionParallel->transfer->Collect(tpRank, hidden.cudaData, world.cudaData, size_t(embed_dim) * 2);
+            }
         }
-        if (captureHidden && capture->packedOutput) {
+        if (captureHidden && capture->peerFeatures) {
+            auto *dest = static_cast<uint16_t *>(capture->peerFeatures->at(layer).cudaData);
+            const auto *source = static_cast<const uint16_t *>(hidden.cudaData);
+            for (const auto &slice : capture->featureSlices)
+                AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(tpDevices.front(),
+                    dest + size_t(slice.world) * embed_dim, gpu, source + size_t(slice.local) * embed_dim,
+                    size_t(slice.count) * embed_dim * sizeof(*source)), "Cannot copy local draft prefill rows");
+        } else if (captureHidden && capture->packedOutput) {
             const size_t column = featureLayer - draftTargetLayers.begin();
             auto dst = (uint16_t *)capture->packedOutput->cudaData + column * embed_dim;
             const size_t rowBytes = (size_t)embed_dim * sizeof(uint16_t);
@@ -2468,7 +2490,7 @@ Data NaiveN05FlashModel::RunTarget(
                 // Internal prefill consumers finish before the next forward.
                 // Retain the feature storage just like the other TP scratch.
                 auto &backing = buf.features[layer];
-                Copy(featureHidden, backing);
+                if (!collectIntoFeature) Copy(featureHidden, backing);
                 auto &view = capture->hidden[layer];
                 view.FreeSpace(); view.FakeFrom(backing, 0); view.Resize(backing.dims);
             } else Copy(featureHidden, capture->hidden[layer]);

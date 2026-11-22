@@ -2833,6 +2833,10 @@ if (UNIT_TEST)
                         PASS_REGULAR_EXPRESSION "NAIVE PD STATE PASS")
                 endforeach()
             endforeach()
+            add_test(NAME naive_n05_pd_draft_owner_commit COMMAND naive_n05_verify_graph_test 2 pd_owner_commit)
+            set_tests_properties(naive_n05_pd_draft_owner_commit PROPERTIES LABELS "cuda;multigpu"
+                ENVIRONMENT "FASTLLM_CUDA_SERVING_WARMUP=1" RUN_SERIAL TRUE TIMEOUT 300 SKIP_RETURN_CODE 77
+                PASS_REGULAR_EXPRESSION "NAIVE PD OWNER COMMIT PASS")
             add_test(NAME naive_n05_pd_draft_dp COMMAND naive_n05_verify_graph_test 2 pd_draft fp8 replicated tcp 2)
             add_test(NAME naive_n05_pd_draft_tp_to_dp COMMAND naive_n05_verify_graph_test 4 pd_draft_tp_to_dp 2)
             set_tests_properties(naive_n05_pd_draft_dp naive_n05_pd_draft_tp_to_dp PROPERTIES

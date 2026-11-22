@@ -553,6 +553,9 @@ void FastllmCudaHostUnregister(void *ptr);
 // 将 host 端数据拷到 GPU 临时缓冲区，按数据类型加到 dst（GPU）上，len 为元素个数
 void FastllmCudaAddHostToDevice(void *dst, void *hostSrc, int len, fastllm::DataType dataType);
 void FastllmCudaMemcpyBetweenDevices(int dstId, void *dst, int srcId, void *src, size_t size);
+// Synchronous handoff when both endpoints are exclusively owned or already
+// ordered with the caller's stream on srcId or dstId.
+void FastllmCudaCopyOrderedPeer(int dstId, void *dst, int srcId, void *src, size_t size);
 bool FastllmCudaMemcpyPeerAsyncCurrentThread(
     int dstId, void *dst, int srcId, const void *src, size_t size);
 

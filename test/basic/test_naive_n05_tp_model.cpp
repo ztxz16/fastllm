@@ -931,6 +931,79 @@ class Fixture : public NaiveN05FlashModel {
         AddDraftTestWeights(weight, draftLayers, draftKvHeads, 256, true, 256, 32, 512, PDDraftContextWeightNames());
         SetSaveHistoryChat(true);
     }
+    void CheckPDDraftOwnerCommit() {
+        pdPrefillOnly = true;
+        SetChunkedPrefillSize(2048);
+        PreparePDGroupFixture(ranks, true);
+        const int keep = draftWindow + GetPageLen() - 1;
+        const std::vector<int> lengths{keep + 11, keep + 73};
+        TargetCapture batch;
+        const int total = lengths[0] + lengths[1];
+        for (int layer : draftTargetLayers) {
+            auto &hidden = batch.hidden[layer];
+            hidden.dataType = BFLOAT16; hidden.UpdateUnitSize();
+            hidden.Resize({1, total, embed_dim}); hidden.Allocate();
+            for (size_t j = 0; j < hidden.Count(0); ++j)
+                reinterpret_cast<uint16_t *>(hidden.cpuData)[j] = Float32ToBFloat16RNEBits(std::sin(j * .013f + layer));
+            hidden.ToDevice(CUDA, {0});
+        }
+        auto &pool = NaiveN05GraphTestAccess::DraftPrefixPool(*this);
+        if (!pool || !pool->draftSlotBytes) throw std::runtime_error("missing draft snapshot pool");
+        auto snapshot = [&](int rank, int length) {
+            auto s = std::make_shared<PrefixSnapshot>();
+            s->pool = pool; s->slot = pool->slots.Take(rank);
+            if (s->slot < 0) throw std::runtime_error("missing test checkpoint slot");
+            s->length = length / GetPageLen() * GetPageLen();
+            return s;
+        };
+        std::vector<std::shared_ptr<DraftContext>> actual, expected;
+        PrefixSnapshots reference;
+        for (int rank = 0; rank < 2; ++rank) {
+            actual.push_back(CreateDraftContext({rank})); expected.push_back(CreateDraftContext({rank}));
+            batch.prefixes.push_back({snapshot(rank, lengths[rank])});
+            reference.push_back(snapshot(rank, lengths[rank]));
+        }
+        if (CommitPrefillDraftOwners(batch, {1, lengths[1]}, {true, true}, actual) ||
+            !CommitPrefillDraftOwners(batch, lengths, {true, true}, actual))
+            throw std::runtime_error("unexpected owner commit dispatch");
+        auto read = [](const Data &tensor) {
+            Data host(tensor); ToDataType(host, FLOAT32); host.ToDevice(CPU);
+            const auto *p = reinterpret_cast<const float *>(host.cpuData);
+            return std::vector<float>(p, p + host.Count(0));
+        };
+        auto checkpoint = [&](const std::shared_ptr<PrefixSnapshot> &s) {
+            if (!s->draftReady) throw std::runtime_error("draft checkpoint unpublished");
+            Data view;
+            view.FakeFrom(pool->DraftShard(s->slot), pool->DraftOffset(s->slot));
+            view.Resize({1, draftWindow - 1, embed_dim});
+            return read(view);
+        };
+        std::vector<std::pair<Data, Data>> unused;
+        for (int rank = 0, offset = 0; rank < 2; offset += lengths[rank++]) {
+            TargetCapture scalar;
+            for (int layer : draftTargetLayers) {
+                auto &view = scalar.hidden[layer];
+                view.FakeFrom(batch.hidden.at(layer), size_t(offset) * embed_dim * sizeof(uint16_t));
+                view.Resize({1, lengths[rank], embed_dim});
+            }
+            scalar.prefixes = {{reference[rank]}};
+            CommitDraftContext(scalar, lengths[rank], *expected[rank], unused);
+            if (actual[rank]->committed != lengths[rank] ||
+                actual[rank]->prefixHidden.dims != expected[rank]->prefixHidden.dims)
+                throw std::runtime_error("incorrect draft length");
+            RequireCloseLogits(read(actual[rank]->prefixHidden).data(), read(expected[rank]->prefixHidden), "draft prefix");
+            RequireCloseLogits(checkpoint(batch.prefixes[rank].front()).data(), checkpoint(reference[rank]), "draft checkpoint");
+            for (int layer = 0; layer < draftLayers; ++layer) {
+                auto &a = actual[rank]->kv[layer], &b = expected[rank]->kv[layer];
+                if (a.first.dims != b.first.dims || a.second.dims != b.second.dims)
+                    throw std::runtime_error("draft KV shape");
+                RequireCloseLogits(read(a.first).data(), read(b.first), "draft K");
+                RequireCloseLogits(read(a.second).data(), read(b.second), "draft V");
+            }
+        }
+        std::cout << "NAIVE PD OWNER COMMIT PASS max_relative=" << largestLogitRelative
+                  << " max_abs=" << largestLogitAbsolute << std::endl;
+    }
     void PreparePDGroupFixture(int dp, bool draft = false) {
         if (dp > 1) ConfigureAttentionParallel(dp);
         if (draft) ConfigurePDDraft(dp);
@@ -5775,6 +5848,12 @@ int main(int argc, char **argv) {
             fixture.SetKVCacheDataType(BFLOAT16); fixture.SetIndexerDataType(FP8_E4M3);
             fixture.PDStateChecks(false, argc > 3 && std::string(argv[3]) == "rdma", false, true, ranks);
             unsetenv("FASTLLM_DSPARK_TP"); return 0;
+        }
+        if (argc > 2 && std::string(argv[2]) == "pd_owner_commit") {
+            SetCudaEmbedding(true); SetCudaGraph(false);
+            Fixture fixture(ranks, false, true, true, true);
+            fixture.CheckPDDraftOwnerCommit();
+            return 0;
         }
         if (argc > 2 && std::string(argv[2]) == "pd_draft_tp_to_dp") {
             SetCudaEmbedding(true); SetCudaGraph(true);
