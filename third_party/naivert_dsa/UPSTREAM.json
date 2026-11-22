@@ -34,5 +34,19 @@
     }
   },
   "changes": "Extracted cooperative TCgen05 Indexer and exact Top-K for SM103. Adapted BF16/FP8 native paged caches, causal lengths, FastLLM quantization/scale order and caller-owned scratch. Partial fusion retains score ordering and native attention arithmetic. Full layer adds native BF16 projections/RoPE/cache append, compact attention, token-ordered bitmap Top-K, seven cache producer warps, conditional first-histogram reuse and TP8 residual output. Removed unused upstream helpers, phase timers and unreachable histogram variants. The internal full-layer launch ABI/control flow is retained to preserve measured SM103 code generation. See README.txt for support, fallback and numerical contracts.",
-  "derived_adapters": {}
+  "derived_adapters": {
+    "src/devices/cuda/moe/fastllm-shared-flex-dense-sm103.cuh": {
+      "sources": {
+        "kernels/model_ops/extension/checkpoint_bf16_bindings.cu": "f7903e1ba91d667ee897a83573b933f0918eba8a5edf78fa3e9979d98bf965db",
+        "body/attn_common/rows_gemv_mma.cuh": "a0c94f893d7b62734b21dc5e1358fa77739a1eb40969910d42e9a4075fc6ac2f"
+      },
+      "installed_sha256": "c4461ba6e0678108708d101840b518b2c0c40a5aa2a5fc3d7ee1457c31072d0b",
+      "fragments": [
+        "vector RMS normalization",
+        "BF16 rows-MMA projection",
+        "SwiGLU and down/TP tiling"
+      ],
+      "changes": "Arithmetic extracted into include/devices/cuda/low_latency; this adapter retains only TP epoch/publication. See third_party/naivert_projection/UPSTREAM.json."
+    }
+  }
 }

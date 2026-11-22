@@ -113,5 +113,14 @@
     }
   },
   "local_patch": "PATCHES.diff",
-  "scope": "Vendored C++/CUDA header subset only; no upstream Python package, JIT service, or shared library."
+  "scope": "Vendored C++/CUDA header subset only; no upstream Python package, JIT service, or shared library.",
+  "native_block128_gate": {
+    "path": "src/devices/cuda/moe/fastllm-shared-flex-block128-sm103.cuh",
+    "source_commit": "79d5704ac32ff5fa756e9fb3a76829c236444d86",
+    "source_sha256": {
+      "naivert/body/expert_select_up_gate_silu_rows8_body.cuh": "3ad875e3d284916766d9104b3887dd7d6821557ad51b80dddc21132a622c6026",
+      "naivert/common/prepared_mlp_input_layout.hpp": "73b7f7fdf2e6e7ae625fdfb795ab451dcc2ce41fb479f49968f0faf8d5b1625b"
+    },
+    "changes": "Row-major TMA weights, FastLLM router semantics, in-place block-128 rebasing, paired MXFP8/32 output, balanced work distribution, compact expert-member scheduling for up to thirty-two rows and direct FP32 accumulation; no runtime dependency on NaiveRT."
+  }
 }

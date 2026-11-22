@@ -1010,6 +1010,56 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     set(FASTLLM_MXFP8_LINEAR_OBJECTS $<TARGET_OBJECTS:fastllm_mxfp8_linear_sm103>)
 endif()
 
+# FlexMoE is a separate optional TP8 backend. Reuse the existing
+# CUDA/CUTLASS toolchain and only the pinned NaiveRT arithmetic header subset.
+if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+    add_library(fastllm_naive_flex_sm103 OBJECT
+        src/devices/cuda/moe/fastllm-naive-flexmoe-sm103.cu)
+    set_target_properties(fastllm_naive_flex_sm103 PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_naive_flex_sm103 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_flex/include"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_naive_flex_sm103 PRIVATE
+        "--generate-code=arch=compute_103a,code=sm_103a"
+        "--expt-relaxed-constexpr" "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
+    target_compile_definitions(fastllm_naive_flex_sm103 PRIVATE
+        NAIVERT_EXPERT_DOWN_ALLREDUCE_NATIVE_PARALLEL_PEER_POLL=1
+        NAIVERT_TP_RANKS=8
+        NAIVERT_HIDDEN=4096
+        NAIVERT_SM_COUNT=148
+        NAIVERT_ROUTED_EXPERTS=256
+        NAIVERT_SHARED_EXPERTS=0
+        NAIVERT_SELECTED_EXPERTS=8
+        NAIVERT_ROUTE_KEPT_GROUPS=8
+        NAIVERT_ROUTE_SCALE=1.0
+        NAIVERT_NORM_EPS=1e-05
+        NAIVERT_DENSE_INTER=2048
+        NAIVERT_VOCAB_SHARD=19072
+        NAIVERT_EXPERT_WEIGHT_FORMAT=0
+        NAIVERT_EXPERT_DOWN_ALLREDUCE_OUTPUTS_PER_TILE=64
+        NAIVERT_DOWN_ALLREDUCE_OUTPUTS_PER_TILE=64
+        NAIVERT_UNPROJ_O_ALLREDUCE_OUTPUTS_PER_TILE=64
+        NAIVERT_UNPROJ_O_ALLREDUCE_PROJECTION_K=1024
+        NAIVERT_EXPERT_DOWN_W8A8=1
+        NAIVERT_DSA_INDEX_HEADS=16
+        NAIVERT_MLA_ROWS_ENABLE_PHASE_TIMERS=0)
+    set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
+    add_library(fastllm_shared_flex_sm103 OBJECT
+        src/devices/cuda/moe/fastllm-shared-flex-ep.cu
+        src/devices/cuda/moe/fastllm-shared-flex-tp.cu)
+    set_target_properties(fastllm_shared_flex_sm103 PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_shared_flex_sm103 BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/deep_gemm_blackwell/include"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_shared_flex_sm103 PRIVATE
+        "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr")
+    target_compile_definitions(fastllm_shared_flex_sm103 PRIVATE FM_RELAXED_MAILBOX=1)
+    list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_shared_flex_sm103>)
+    message(STATUS "Naive FlexMoE SM103 TP8: built-in, opt-in at runtime")
+endif()
+
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
     add_library(fastllm_glm53_flashinfer_sm120 OBJECT
         src/devices/cuda/models/glm5-next-dsa-sm120.cu)
@@ -1063,7 +1113,7 @@ if (PY_API)
 
     include_directories(third_party/pybind11/include)
     file(GLOB FASTLLM_CXX_HEADERS include/**/*.h)
-    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_DSA_BLACKWELL_OBJECTS} ${FASTLLM_NAIVE_INDEXER_OBJECTS} ${FASTLLM_MXFP8_LINEAR_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
+    add_library(pyfastllm MODULE src/pybinding.cpp ${FASTLLM_LARGE_MODEL_SOURCES} ${FASTLLM_CXX_SOURCES} ${FASTLLM_CXX_HEADERS} ${FASTLLM_CUDA_SOURCES} ${FASTLLM_CUDA_SM120_OBJECTS} ${FASTLLM_CUDA_SM90_OBJECTS} ${FASTLLM_DSA_BLACKWELL_OBJECTS} ${FASTLLM_NAIVE_INDEXER_OBJECTS} ${FASTLLM_MXFP8_LINEAR_OBJECTS} ${FASTLLM_MIMO_EP8_MEGA_OBJECTS} ${FASTLLM_NAIVE_FLEX_OBJECTS} ${FASTLLM_GLM53_FLASHINFER_OBJECTS} ${FASTLLM_DSV41_FLASHINFER_OBJECTS} ${FASTLLM_TFACC_SOURCES} ${FASTLLM_TOPS_SOURCES})
     target_link_libraries(pyfastllm PUBLIC pybind11::module ${FASTLLM_LINKED_LIBS})
     pybind11_extension(pyfastllm)
 else()
@@ -1089,6 +1139,9 @@ if (TARGET fastllm_mxfp8_linear_sm103)
 endif()
 if (FASTLLM_MIMO_EP8_MEGA_ENABLED)
     target_link_libraries(fastllm INTERFACE ${FASTLLM_MIMO_EP8_MEGA_OBJECTS})
+endif()
+if (TARGET fastllm_naive_flex_sm103)
+    target_link_libraries(fastllm INTERFACE ${FASTLLM_NAIVE_FLEX_OBJECTS})
 endif()
 if (FASTLLM_CUDA_SM90_SOURCES)
     target_link_libraries(fastllm INTERFACE $<TARGET_OBJECTS:fastllm_cuda_sm90>)
@@ -1192,6 +1245,9 @@ if (UNIT_TEST)
         set_tests_properties(${name} PROPERTIES TIMEOUT ${outer_timeout}
             SKIP_REGULAR_EXPRESSION "FASTLLM_TEST_SKIP_NO_DEVICE")
     endfunction()
+    add_executable(naive_moe_dispatch_test tests/naive_moe_dispatch_test.cpp)
+    target_include_directories(naive_moe_dispatch_test PRIVATE include)
+    fastllm_add_checked_test(naive_moe_dispatch naive_moe_dispatch_test "POLICY_PASS 384 combinations" 30)
     add_executable(deepseekV41StubKVRegression test/ops/deepseekV41StubKVRegression.cpp)
     target_link_libraries(deepseekV41StubKVRegression PRIVATE fastllm)
     fastllm_add_checked_test(deepseekV41StubKV deepseekV41StubKVRegression "PASS [0-9]+ scheduler stub states" 60)
@@ -2632,6 +2688,48 @@ if (UNIT_TEST)
             target_link_libraries(naive_n05_qkv_test PRIVATE fastllm)
             add_test(NAME naive_n05_qkv COMMAND naive_n05_qkv_test)
             set_tests_properties(naive_n05_qkv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
+        if (NOT USE_ROCM)
+            if (TARGET fastllm_shared_flex_sm103)
+                add_executable(naive_n05_owner_down_test test/basic/test_cuda_naive_owner_down.cu)
+                set_target_properties(naive_n05_owner_down_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
+                target_include_directories(naive_n05_owner_down_test BEFORE PRIVATE
+                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
+                target_compile_options(naive_n05_owner_down_test PRIVATE
+                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
+                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+                target_compile_definitions(naive_n05_owner_down_test PRIVATE FM_RELAXED_MAILBOX=1)
+                target_link_libraries(naive_n05_owner_down_test PRIVATE cuda)
+                add_test(NAME naive_n05_owner_down COMMAND naive_n05_owner_down_test)
+                set_tests_properties(naive_n05_owner_down PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+                add_executable(naive_n05_block128_gate_test test/basic/test_cuda_naive_block128_gate.cu)
+                set_target_properties(naive_n05_block128_gate_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
+                target_include_directories(naive_n05_block128_gate_test BEFORE PRIVATE
+                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
+                target_compile_options(naive_n05_block128_gate_test PRIVATE
+                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
+                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+                target_compile_definitions(naive_n05_block128_gate_test PRIVATE FM_RELAXED_MAILBOX=1)
+                target_link_libraries(naive_n05_block128_gate_test PRIVATE cuda)
+                add_test(NAME naive_n05_block128_gate COMMAND naive_n05_block128_gate_test)
+                set_tests_properties(naive_n05_block128_gate PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+                add_executable(naive_n05_moe_batch_test test/basic/test_cuda_naive_moe_batch.cu)
+                set_target_properties(naive_n05_moe_batch_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
+                target_include_directories(naive_n05_moe_batch_test BEFORE PRIVATE
+                    third_party/deep_gemm_blackwell/include ${FASTLLM_CUTLASS_DIR}/include)
+                target_compile_options(naive_n05_moe_batch_test PRIVATE
+                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>
+                    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+                target_compile_definitions(naive_n05_moe_batch_test PRIVATE FM_RELAXED_MAILBOX=1)
+                target_link_libraries(naive_n05_moe_batch_test PRIVATE cuda Threads::Threads)
+                add_test(NAME naive_n05_moe_batch COMMAND naive_n05_moe_batch_test)
+                add_test(NAME naive_n05_moe_batch_borrowed COMMAND naive_n05_moe_batch_test borrowed)
+                add_test(NAME naive_n05_moe_batch_mixed COMMAND naive_n05_moe_batch_test mixed)
+                add_test(NAME naive_n05_moe_batch_prepared COMMAND naive_n05_moe_batch_test prepared)
+                add_test(NAME naive_n05_moe_batch_transitions COMMAND naive_n05_moe_batch_test stress)
+                set_tests_properties(naive_n05_moe_batch naive_n05_moe_batch_borrowed naive_n05_moe_batch_mixed naive_n05_moe_batch_prepared naive_n05_moe_batch_transitions
+                    PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 300)
+            endif()
         endif()
         add_executable(naive_n05_logits_test test/basic/test_naive_n05_logits.cpp)
         target_link_libraries(naive_n05_logits_test PRIVATE fastllm)
