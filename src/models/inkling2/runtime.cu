@@ -8,6 +8,8 @@
 #include <cuda_runtime.h>
 #include "attention/variants.cuh"
 #include "attention/decode.cuh"
+#include "attention/default_prefill_params.cuh"
+#include "attention/prefill.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <algorithm>
 #include <array>
@@ -17,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <type_traits>
@@ -141,6 +144,7 @@ __global__ void conv(const float *x, const float *history, const float *weight, 
 }
 #include "paged-kv.cuh"
 #include "attention.cuh"
+#include "prefill.cuh"
 template <typename T, typename U> __device__ float updateConvChannel(const T *input, const DecodeVisit *visit, int index,
                            const float *weight, const U *dynamic, int d, int taps, int heads, int c) {
     float *history = visit->history[index];
@@ -332,6 +336,8 @@ class Decoder final : public Runtime {
     std::vector<DecodeVisit> hostVisits;
     Matrix graphLogits, unitScale, splitScratch;
     int sm120GlobalSplits = 0;
+    bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
+    bool bf16WindowBias = false;
 
     Data &weight(const std::string &key) const {
         auto &w = weights.weight.at("model.llm." + key);
@@ -395,47 +401,68 @@ class Decoder final : public Runtime {
         return out;
     }
 
-    template <typename T, typename U> std::array<Rows<U>, 8> projectAttention(const std::array<Rows<T>, 3> &inputs,
-                                                                 const std::string &att, bool local) const {
-        const int q = c.heads * c.headDim, k = c.kvHeads * c.headDim;
-        const int taps = local ? 0 : c.kvHeads * c.conv;
-        const int widths[] = {q, c.heads * c.relative, q, c.heads, k, taps, k, taps};
-        const bool shared = inputs[0].p == inputs[1].p && inputs[0].p == inputs[2].p;
-        const int rows = inputs[0].rows, total = std::accumulate(widths, widths + 8, 0);
-        Rows<T> packed(rows, total);
-        Rows<U> values;
-        if (rows > 1) values = Rows<U>(rows, total);
-        std::array<Rows<U>, 8> result;
-        int offset = 0;
-        auto project = [&](const Rows<T> &input, int begin, int end) {
-            const int stride = std::accumulate(widths + begin, widths + end, 0);
-            auto dest = packed;
-            dest.p += size_t(offset) * rows;
-            dest.cols = stride;
-            projectInto(input, att + "packed.weight", dest, offset, 1);
-            if (rows > 1) {
-                ProjectionParts parts{};
-                std::copy(widths + begin, widths + end, parts.widths);
-                const size_t size = size_t(rows) * stride;
-                unpackProjection<<<(size + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-                    dest.p, values.p + size_t(offset) * rows, parts, rows, stride);
+    template<class T> struct AttentionProjection {
+        Rows<T> storage;
+        std::array<int, 8> widths;
+        bool shared;
+
+        template<class F> void groups(F use) const {
+            int offset = 0;
+            for (int begin = 0; begin < 8;) {
+                int end = shared ? 8 : (begin == 0 ? 4 : begin + 2);
+                auto part = storage;
+                part.p += size_t(offset) * storage.rows;
+                part.cols = std::accumulate(widths.begin() + begin, widths.begin() + end, 0);
+                use(part, begin, end, offset);
+                offset += part.cols;
+                begin = end;
             }
-            offset += stride;
-        };
-        if (shared) {
-            project(inputs[0], 0, 8);
-        } else {
-            project(inputs[0], 0, 4);
-            project(inputs[1], 4, 6);
-            project(inputs[2], 6, 8);
         }
-        if (rows == 1) values = castRows<U>(packed);
-        for (int i = 0; i < 8; ++i) {
-            if (!widths[i]) continue;
-            result[i] = values;
-            result[i].cols = widths[i];
-            values.p += size_t(rows) * widths[i];
+        template<class U> std::array<Rows<U>, 8> unpack() const {
+            Rows<U> values;
+            if (storage.rows == 1) values = castRows<U>(storage);
+            else {
+                values = Rows<U>(storage.rows, storage.cols);
+                groups([&](const Rows<T> &part, int begin, int end, int offset) {
+                    ProjectionParts parts{};
+                    std::copy(widths.begin() + begin, widths.begin() + end, parts.widths);
+                    const size_t size = size_t(part.rows) * part.cols;
+                    unpackProjection<<<(size + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                        part.p, values.p + size_t(offset) * part.rows, parts, part.rows, part.cols);
+                });
+            }
+            std::array<Rows<U>, 8> result;
+            for (int i = 0; i < 8; ++i) {
+                if (!widths[i]) continue;
+                result[i] = values;
+                result[i].cols = widths[i];
+                values.p += size_t(storage.rows) * widths[i];
+            }
+            return result;
         }
+        PrefillParts<T> views() const {
+            PrefillParts<T> result{};
+            groups([&](const Rows<T> &part, int begin, int end, int) {
+                int col = 0;
+                for (int i = begin; i < end; ++i) {
+                    result.items[i] = {widths[i] ? part.p + col : nullptr, part.cols};
+                    col += widths[i];
+                }
+            });
+            return result;
+        }
+    };
+
+    template<class T> AttentionProjection<T> projectAttention(const std::array<Rows<T>, 3> &inputs,
+                                                             const std::string &att, bool local) const {
+        const int q = c.heads * c.headDim, k = c.kvHeads * c.headDim, taps = local ? 0 : c.kvHeads * c.conv;
+        AttentionProjection<T> result;
+        result.widths = {q, c.heads * c.relative, q, c.heads, k, taps, k, taps};
+        result.shared = inputs[0].p == inputs[1].p && inputs[0].p == inputs[2].p;
+        result.storage = Rows<T>(inputs[0].rows, std::accumulate(result.widths.begin(), result.widths.end(), 0));
+        result.groups([&](Rows<T> part, int begin, int, int offset) {
+            projectInto(inputs[begin == 0 ? 0 : (begin == 4 ? 1 : 2)], att + "packed.weight", part, offset, 1);
+        });
         return result;
     }
 
@@ -447,8 +474,9 @@ class Decoder final : public Runtime {
         const Data &table = weight(att + "rel_logits_proj.proj");
         if (table.Count(0) != c.relative * c.extent)
             throw std::runtime_error("Inkling relative bias table shape");
+        auto projection = projectAttention(inputs, att, local);
         if (batch.front().decode && aligned == d && c.relative <= threads) {
-            const auto projected = projectAttention<T, T>(inputs, att, local);
+            const auto projected = projection.template unpack<T>();
             Rows<T> attended(1, c.heads * d);
             const auto *visit = batch.front().decode + slot;
             Matrix q(1, c.heads * d), bias(c.heads, c.extent);
@@ -470,23 +498,101 @@ class Decoder final : public Runtime {
             else launchSplitRelative<64, KV>(args, splitScratch, projected[3].p, projected[2].p, attended.p);
             return attended;
         }
-        const auto projected = projectAttention<T, float>(inputs, att, local);
-        const auto &gates = projected[2], &sink = projected[3];
-        Matrix attended(projected[0].rows, c.heads * aligned);
-
-        auto q = norm(projected[0], param(att + "q_l2_clip.scale", c.heads * d), c.eps, d, c.heads, c.qClip);
-        auto r = norm(projected[1], param(att + "rel_l2_clip.scale", c.heads * c.relative),
-                      c.eps, c.relative, c.heads, c.rClip);
-        auto convKv = [&](int index, const std::string &name, int which) {
-            return convolutions(projected[index], param(att + name + (local ? ".weight" : ".static_w"), k * c.conv),
-                                projected[index + 1], c.kvHeads, c.conv, batch, slot, which);
-        };
-        auto key = norm(convKv(4, "k_sconv", 0), c.qClip > 0.f ? nullptr : unitScale.p, c.eps, d, 1, c.qClip);
-        auto val = norm(convKv(6, "v_sconv", 1), unitScale.p, c.eps, d);
-        q = resizeHeads(q, d, aligned);
-        key = resizeHeads(key, d, aligned);
-        val = resizeHeads(val, d, aligned);
-        auto typedKey = castRows<KV>(key), typedValue = castRows<KV>(val);
+        const int rows = inputs[0].rows;
+        const bool queryFits = !std::is_same_v<KV, half> || (c.qClip > 0 && c.qClip <= 65504.f);
+        const bool multi = tensorPrefill && queryFits && !std::is_same_v<KV, float> &&
+                           rows > 1 && !batch.front().decode &&
+                           std::all_of(batch.begin(), batch.end(), [](const Segment &s) { return s.length > 1; });
+        const bool compact = multi && std::is_same_v<KV, half> && (window ? gatedWindowPrefill : gatedGlobalPrefill);
+        // The BF16 projection input and table together fit in the original
+        // FP32 input workspace. Short prefills can keep their FP32 projection.
+        const bool narrowBias = compact && window && bf16WindowBias && std::is_same_v<T, __nv_bfloat16> &&
+                                size_t(rows) * c.heads >= size_t(c.extent);
+        const int relativeWidth = c.heads * c.relative;
+        Buffer<__nv_bfloat16> narrowRelative;
+        __nv_bfloat16 *table16 = nullptr;
+        Matrix q, r, sink, gates, attended(compact ? 0 : rows, c.heads * aligned);
+        Rows<T> gatedOutput(compact ? rows : 0, c.heads * d);
+        Rows<KV> typedQuery, typedKey, typedValue;
+        auto parts = projection.views();
+        if (multi) {
+            if (compact) {
+                typedQuery.owner = gatedOutput.owner;
+                typedQuery.p = reinterpret_cast<KV *>(gatedOutput.p);
+                typedQuery.rows = rows;
+                typedQuery.cols = gatedOutput.cols;
+            } else typedQuery = Rows<KV>(rows, c.heads * (2 * d));
+            typedKey = Rows<KV>(rows, k);
+            typedValue = Rows<KV>(rows, k);
+            if (narrowBias) {
+                const size_t inputElements = size_t(rows) * relativeWidth;
+                const size_t elements = size_t(c.relative) * c.extent;
+                // Reuse the FP32 projection allocation size across layer types
+                // to avoid an extra CUDA pool size class.
+                narrowRelative = Buffer<__nv_bfloat16>(2 * inputElements);
+                table16 = narrowRelative.p + inputElements;
+                castProjection<<<(elements + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                    static_cast<const float *>(table.cudaData), table16, elements);
+            } else {
+                r = Matrix(rows, relativeWidth);
+            }
+            sink = Matrix(rows, c.heads);
+            PrefillPreparation prep{param(att + "q_l2_clip.scale", c.heads * d),
+                param(att + "rel_l2_clip.scale", c.heads * c.relative),
+                {param(att + (local ? "k_sconv.weight" : "k_sconv.static_w"), k * c.conv),
+                 param(att + (local ? "v_sconv.weight" : "v_sconv.static_w"), k * c.conv)},
+                c.heads, c.kvHeads, d, c.relative, c.conv, c.qClip, c.rClip, c.eps};
+            for (const auto &seq : batch) {
+                auto &history = seq.request->visits[slot].convState;
+                const int count = c.conv - 1, keep = std::max(0, count - seq.length);
+                Matrix next[] = {Matrix(count, k), Matrix(count, k)};
+                for (int i = 0; i < 2 && keep; ++i) {
+                    const size_t bytes = size_t(keep) * k * sizeof(float);
+                    if (history[i].p)
+                        check(cudaMemcpyAsync(next[i].p, history[i].p + size_t(seq.length) * k,
+                                              bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                    else check(cudaMemsetAsync(next[i].p, 0, bytes, cudaStreamPerThread));
+                }
+                const int tasks = 2 * (c.heads + c.kvHeads);
+                const int groups = (tasks + 3) / 4;
+                dim3 grid(seq.length, groups);
+                if (compact) {
+                    const int rowsY = std::min(seq.length, 65535);
+                    grid = dim3(groups, rowsY, 1 + (seq.length - 1) / rowsY);
+                }
+                auto prepare = [&](auto kernel, auto *relative) {
+                    kernel<<<grid, 128, 0, cudaStreamPerThread>>>(
+                        parts, prep, seq.offset, seq.length, history[0].p, history[1].p, next[0].p, next[1].p,
+                        typedQuery.p, relative, sink.p, typedKey.p, typedValue.p);
+                };
+                if (narrowBias) prepare(preparePrefill<true, T, KV, __nv_bfloat16>, narrowRelative.p);
+                else if (compact) prepare(preparePrefill<true, T, KV>, r.p);
+                else prepare(preparePrefill<false, T, KV>, r.p);
+                history[0] = std::move(next[0]);
+                history[1] = std::move(next[1]);
+            }
+        } else {
+            const auto projected = projection.template unpack<float>();
+            projection.storage = {};
+            gates = projected[2];
+            sink = projected[3];
+            q = resizeHeads(norm(projected[0], param(att + "q_l2_clip.scale", c.heads * d),
+                                 c.eps, d, c.heads, c.qClip), d, aligned);
+            r = norm(projected[1], param(att + "rel_l2_clip.scale", c.heads * c.relative),
+                     c.eps, c.relative, c.heads, c.rClip);
+            auto convKv = [&](int index, const std::string &name, int which) {
+                return convolutions(projected[index], param(att + name + (local ? ".weight" : ".static_w"), k * c.conv),
+                                    projected[index + 1], c.kvHeads, c.conv, batch, slot, which);
+            };
+            auto key = norm(convKv(4, "k_sconv", 0), c.qClip > 0.f ? nullptr : unitScale.p, c.eps, d, 1, c.qClip);
+            auto val = norm(convKv(6, "v_sconv", 1), unitScale.p, c.eps, d);
+            typedKey = castRows<KV>(resizeHeads(key, d, aligned));
+            typedValue = castRows<KV>(resizeHeads(val, d, aligned));
+        }
+        const auto biasType = narrowBias ? BFLOAT16 : FLOAT32;
+        std::optional<Data> narrowTable;
+        if (narrowBias) narrowTable.emplace(BFLOAT16, table.dims, CUDA, table16);
+        const Data &relativeTable = narrowTable ? *narrowTable : table;
         for (const auto &seq : batch) {
             const DecodeVisit *decode = seq.decode ? seq.decode + slot : nullptr;
             VisitCache *cache = decode ? nullptr : &seq.request->visits[slot];
@@ -496,20 +602,47 @@ class Decoder final : public Runtime {
             const int distances = decode ? c.extent : std::min(c.extent, past + seq.length);
             // Bound temporary relative logits for long prefills. Each row
             // addresses the original complete suffix, including earlier tiles.
-            constexpr int tile = 64;
-            Matrix bias(std::min(seq.length, tile) * c.heads, distances);
+            const int tile = typedQuery.p ? 512 : 64;
+            const size_t biasElements = size_t(std::min(seq.length, tile)) * c.heads * distances;
+            Buffer<uint8_t> bias(biasElements * (narrowBias ? sizeof(__nv_bfloat16) : sizeof(float)));
             for (int first = 0; first < seq.length; first += tile) {
                 int count = std::min(tile, seq.length - first);
                 const int rows = count * c.heads;
-                Data input(FLOAT32, {rows, c.relative}, CUDA, r.slice(seq.offset + first, count).p);
-                Data output(FLOAT32, {rows, distances}, CUDA, bias.p);
-                FastllmCudaBatchMatMul(input, table, output, 0, 0, 0, c.relative, c.extent,
+                const size_t offset = size_t(seq.offset + first) * relativeWidth;
+                void *relative = narrowBias ? static_cast<void *>(narrowRelative.p + offset) : r.p + offset;
+                Data input(biasType, {rows, c.relative}, CUDA, relative);
+                Data output(biasType, {rows, distances}, CUDA, bias.p);
+                FastllmCudaBatchMatMul(input, relativeTable, output, 0, 0, 0, c.relative, c.extent,
                                        1, rows, c.relative, distances, 1.f);
-                AttentionRow args{q.slice(seq.offset, seq.length).p, currentKey.p, currentValue.p,
-                    cache ? cache->view() : PageView{}, bias.p,
-                    sink.slice(seq.offset, seq.length).p, attended.slice(seq.offset, seq.length).p,
+                AttentionRow args{multi ? nullptr : q.slice(seq.offset, seq.length).p, currentKey.p, currentValue.p,
+                    cache ? cache->view() : PageView{}, narrowBias ? nullptr : reinterpret_cast<float *>(bias.p),
+                    sink.slice(seq.offset, seq.length).p, compact ? nullptr : attended.slice(seq.offset, seq.length).p,
                     decode, past, first, c.heads, c.kvHeads, d, distances,
                     window, c.logFloor, c.logAlpha};
+                if constexpr (!std::is_same_v<KV, float>) {
+                    if (typedQuery.p) {
+                        auto *query = typedQuery.slice(seq.offset + first, count).p;
+                        if constexpr (std::is_same_v<KV, half>) {
+                            if (compact) {
+                                const auto gate = parts.items[2];
+                                const int row = seq.offset + first;
+                                auto launch = [&](auto kernel, auto *relativeBias) {
+                                    kernel(args, query, gatedOutput.p + size_t(row) * gatedOutput.cols,
+                                           gate.data + size_t(row) * gate.stride, gate.stride, count, relativeBias);
+                                };
+                                if (narrowBias) {
+                                    launch(launchGatedPrefill<true,T,__nv_bfloat16>, reinterpret_cast<__nv_bfloat16 *>(bias.p));
+                                } else {
+                                    launch(window ? launchGatedPrefill<true,T> : launchGatedPrefill<false,T>, args.relative);
+                                }
+                                continue;
+                            }
+                        }
+                        if (d == 128) launchPrefill<128, KV>(args, query, count);
+                        else launchPrefill<64, KV>(args, query, count);
+                        continue;
+                    }
+                }
                 if (aligned == 128) launchRelative<128, KV>(args, count, seq.length == 1, splitScratch);
                 else launchRelative<64, KV>(args, count, seq.length == 1, splitScratch);
             }
@@ -522,6 +655,13 @@ class Decoder final : public Runtime {
                 appendKv<<<(size_t(rows) * kvWidth + 255) / 256, 256, 0, cudaStreamPerThread>>>(
                     cache->view(), currentKey.p, currentValue.p, past, seq.length - rows, kvWidth, rows);
             }
+        }
+        if (compact) return gatedOutput;
+        if (multi) {
+            Rows<T> out(rows, c.heads * d);
+            gatePrefill<<<dim3(rows, (out.cols + 255) / 256), 256, 0, cudaStreamPerThread>>>(
+                attended.p, parts.items[2], out.p, out.cols);
+            return out;
         }
         attended = resizeHeads(attended, aligned, d);
         Data gated(FLOAT32, {attended.rows, attended.cols}, CUDA, attended.p);
@@ -885,7 +1025,20 @@ class Decoder final : public Runtime {
         hostVisits.resize(c.visits.size());
         graphVisits = Buffer<DecodeVisit>(hostVisits.size());
         int smCount;
+#ifndef CUDA_NO_TENSOR_CORE
+        int major;
+        check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, p.gpu));
+        if (major >= 8 && (c.headDim == 64 || c.headDim == 128) && c.relative <= threads) {
+            tensorPrefill = c.headDim == 128 ? configurePrefill<128, half>() && configurePrefill<128, __nv_bfloat16>()
+                                             : configurePrefill<64, half>() && configurePrefill<64, __nv_bfloat16>();
+        }
+#endif
         check(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, p.gpu));
+        if (tensorPrefill && c.headDim == 128) {
+            gatedGlobalPrefill = configureGatedPrefill<false, half>() && configureGatedPrefill<false, __nv_bfloat16>();
+            gatedWindowPrefill = configureGatedPrefill<true, half>() && configureGatedPrefill<true, __nv_bfloat16>();
+            bf16WindowBias = gatedWindowPrefill && configureGatedPrefill<true, __nv_bfloat16, __nv_bfloat16>();
+        }
         // The compensated FP16 query operands are finite under this L2 bound.
         if (c.headDim == 128 && c.heads == 3 * c.kvHeads && c.qClip > 0.f && c.qClip <= 65504.f &&
             supportsGlobalRelativeSm120(p.gpu)) {

@@ -18,8 +18,9 @@ template<class T> struct KVSegment {
     int first, past, stride;
     bool valueSide;
     __device__ const T *operator+(size_t element) const {
-        int token = first + int(element / stride);
-        size_t channel = element % stride;
+        return at(first + int(element / stride), element % stride);
+    }
+    __device__ const T *at(int token, unsigned channel) const {
         if (suffix && token >= past) return suffix + size_t(token - past) * stride + channel;
         const T *base = static_cast<const T *>(valueSide ? pages.value : pages.key);
         return base + pages.offset(token, valueSide, stride) + channel;

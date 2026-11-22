@@ -3,6 +3,8 @@
 #include "../../src/models/inkling2/runtime.cuh"
 #include "attention/variants.cuh"
 #include "attention/decode.cuh"
+#include "attention/default_prefill_params.cuh"
+#include "attention/prefill.cuh"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -15,6 +17,16 @@ namespace fastllm::inkling2 {
 namespace {
 #include "../../src/models/inkling2/paged-kv.cuh"
 #include "../../src/models/inkling2/attention.cuh"
+#include "../../src/models/inkling2/prefill.cuh"
+
+struct DisabledPrefillHooks {
+    static constexpr bool custom_output_store = false;
+    static constexpr bool custom_score_tile = false;
+    static constexpr bool defer_softmax_rescale = false;
+};
+static_assert(!flashinfer::prefill_custom_output_store<DisabledPrefillHooks>::value &&
+              !flashinfer::prefill_custom_score_tile<DisabledPrefillHooks>::value &&
+              !flashinfer::prefill_defer_softmax_rescale<DisabledPrefillHooks>::value);
 
 template<class T>
 Buffer<T> upload(const std::vector<T> &v) {
@@ -23,8 +35,8 @@ Buffer<T> upload(const std::vector<T> &v) {
     return gpu;
 }
 
-template<int D, class T>
-void compare(int group, int past, int rows, int window, int pageLen, bool committed, int splits = 28, bool deviceVisit = false, int sm120Splits = 0) {
+template<int D, class T, class Gate = void, class Bias = float>
+void compare(int group, int past, int rows, int window, int pageLen, bool committed, int splits = 28, bool deviceVisit = false, int sm120Splits = 0, bool prefill = false) {
     const int kv = 2, heads = group * kv, stride = D * kv, extent = 125;
     const int begin = window ? std::max(0, past - window) : 0;
     const int firstPage = begin / pageLen, end = past + rows;
@@ -57,12 +69,54 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
     AttentionRow a{dq.p, committed ? nullptr : dk.p + past * stride, committed ? nullptr : dv.p + past * stride,
                    p, dr.p, ds.p, output.p, (committed || deviceVisit) ? descriptor.p : nullptr,
                    past, 0, heads, kv, D, extent, window, 16, 0.3f};
-    if (split)
+    std::vector<float> result(rows * heads * D);
+    std::vector<float> compactGate;
+    const int gateStride = heads * D + 13;
+    if constexpr (!std::is_void_v<Gate>) {
+        static_assert(D == 128 && std::is_same_v<T, half>);
+        if (!(window ? configureGatedPrefill<true, Gate, Bias>() : configureGatedPrefill<false, Gate, Bias>())) return;
+        std::vector<half> query(q.begin(), q.end());
+        compactGate.resize(rows * gateStride);
+        fill(compactGate);
+        std::vector<Gate> typedGate(compactGate.begin(), compactGate.end());
+        Buffer<Bias> typedBias;
+        if constexpr (std::is_same_v<Bias, float>) typedBias = dr;
+        else typedBias = upload(std::vector<Bias>(rel.begin(), rel.end()));
+        auto fused = upload(query);
+        auto gating = upload(typedGate);
+        for (int first = 0; first < rows; first += 137) {
+            a.first = first;
+            half *input = fused.p + size_t(first) * heads * D;
+            auto launch = window ? launchGatedPrefill<true, Gate, Bias> : launchGatedPrefill<false, Gate, Bias>;
+            launch(a, input, reinterpret_cast<Gate *>(input), gating.p + size_t(first) * gateStride,
+                   gateStride, std::min(137, rows - first), typedBias.p + size_t(first) * heads * extent);
+        }
+        std::vector<Gate> values(q.size());
+        check(cudaMemcpy(values.data(), fused.p, values.size() * sizeof(Gate), cudaMemcpyDeviceToHost));
+        std::copy(values.begin(), values.end(), result.begin());
+    } else if (prefill) {
+        if constexpr (!std::is_same_v<T, float>) {
+            if (!configurePrefill<D,T>()) throw std::runtime_error("Insufficient prefill shared memory");
+            std::vector<T> packed(q.size() * 2);
+            for (size_t i = 0; i < q.size(); ++i) {
+                const size_t index = (i / D) * (2 * D) + i % D;
+                packed[index] = T(q[i]);
+                packed[index + D] = T(q[i] - float(packed[index]));
+            }
+            auto typed = upload(packed);
+            // A second query tile must see the first tile as part of its suffix.
+            for (int first = 0; first < rows; first += 35) {
+                a.first = first;
+                a.relative = dr.p + size_t(first) * heads * extent;
+                launchPrefill<D,T>(a, typed.p + size_t(first) * heads * (2 * D), std::min(35, rows - first));
+            }
+        }
+    } else if (split)
         launchSplitRelative<D,T>(a, scratch, ds.p, dg.p, output.p, sm120Splits);
     else
         launchRelative<D,T>(a, rows, split, scratch);
-    std::vector<float> result(rows * heads * D);
-    check(cudaMemcpy(result.data(), output.p, result.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    if constexpr (std::is_void_v<Gate>)
+        check(cudaMemcpy(result.data(), output.p, result.size() * sizeof(float), cudaMemcpyDeviceToHost));
     if (split && !sm120Splits) {
         if (group == 3) launchRelativeKernel<D,3,true,T>(a, 1, scratch.p, splits);
         else launchRelativeKernel<D,1,true,T>(a, 1, scratch.p, splits);
@@ -84,7 +138,7 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
                 int i = t * stride + (h / group) * D;
                 double dot = 0;
                 for (int j = 0; j < D; ++j) dot += q[base + j] * double(float(k[i + j]));
-                double bias = pos - t < extent ? rel[(r * heads + h) * extent + pos - t] : 0.;
+                double bias = pos - t < extent ? float(Bias(rel[(r * heads + h) * extent + pos - t])) : 0.;
                 double weight = std::exp((dot / std::sqrt(double(D)) + bias) * tau);
                 denom += weight;
                 for (int j = 0; j < D; ++j) sum[j] += weight * float(v[i + j]);
@@ -92,6 +146,8 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
             for (int j = 0; j < D; ++j) {
                 double ref = sum[j] / denom;
                 if (split) ref /= 1. + std::exp(-double(gate[h * D + j]));
+                if constexpr (!std::is_void_v<Gate>)
+                    ref /= 1. + std::exp(-double(float(Gate(compactGate[r * gateStride + h * D + j]))));
                 double delta = result[base + j] - ref;
                 diff += delta * delta;
                 norm += ref * ref;
@@ -102,8 +158,12 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
     const double error = std::sqrt(diff / norm);
     printf("D=%d group=%d past=%d rows=%d W=%d page=%d committed=%d sm120Splits=%d relL2=%.3g maxAbs=%.3g\n",
            D, group, past, rows, window, pageLen, committed, sm120Splits, error, maxAbs);
-    const double l2Tolerance = sm120Splits ? 3e-6 : 1e-4;
-    const double absTolerance = sm120Splits ? 1e-6 : 1e-5;
+    // The fused operator returns the model activation type. Compare that stored
+    // output, including its rounding, against the independently gated FP64 result.
+    const double l2Tolerance = std::is_same_v<Gate, half> ? 5e-4 :
+                               std::is_same_v<Gate, nv_bfloat16> ? 2e-3 : prefill ? 1e-5 : sm120Splits ? 3e-6 : 1e-4;
+    const double absTolerance = std::is_same_v<Gate, half> ? 5e-4 :
+                                std::is_same_v<Gate, nv_bfloat16> ? 2e-3 : prefill ? 2e-6 : sm120Splits ? 1e-6 : 1e-5;
     if (!(error < l2Tolerance && maxAbs < absTolerance)) throw std::runtime_error("Relative attention mismatch");
 }
 } // namespace
@@ -138,6 +198,26 @@ int testRelative() {
     compare<64, float>(1, 4099, 1, 0, 63, true, 21);
     int gpu;
     check(cudaGetDevice(&gpu));
+    int major;
+    check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gpu));
+    if (major >= 8 && configurePrefill<128, half>() && configurePrefill<128, nv_bfloat16>()) {
+        for (int group : {1, 3, 5}) {
+            compare<128, half, half>(group, 125, 151, 0, 37, false);
+            compare<128, half, nv_bfloat16>(group, 0, 143, 0, 128, false);
+        }
+        compare<128, half, half>(3, 8190, 19, 0, 127, false);
+        compare<128, half, half>(1, 0, 149, 1, 37, false);
+        compare<128, half, nv_bfloat16>(3, 1017, 159, 1024, 31, false);
+        compare<128, half, nv_bfloat16, nv_bfloat16>(3, 8173, 157, 1024, 31, false);
+        compare<128, half, half>(5, 8190, 145, 97, 37, false);
+        compare<128, half>(3, 65531, 5, 0, 127, false, 1, false, 0, true);
+        compare<128, half>(3, 8189, 17, 1024, 128, false, 1, false, 0, true);
+        for (int window : {0, 1024}) {
+            compare<128, half>(3, 0, 71, window, 37, false, 1, false, 0, true);
+            compare<128, nv_bfloat16>(3, 1051, 71, window, 31, false, 1, false, 0, true);
+            compare<64, half>(2, 2050, 39, window, 128, false, 1, false, 0, true);
+        }
+    }
     if (supportsGlobalRelativeSm120(gpu)) {
         // Partial warp tiles, a partially filled last split, odd page sizes,
         // long contexts, and independently permuted K/V.
