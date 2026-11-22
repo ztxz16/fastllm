@@ -176,19 +176,23 @@ __device__ __forceinline__ void FastllmBf16HeadAdd(float &value, float &correcti
 
 // One 64-thread group per vocabulary row. A lane owns four reference leaves
 // spaced 64 apart. Keep their partials in registers and share every weight
-// load across all eight requests. Only the 64-to-32 stage needs shared memory.
-__global__ void FastllmBf16DecodeHead8(const __nv_bfloat16 *__restrict__ input,
-        const __nv_bfloat16 *__restrict__ weight, __nv_bfloat16 *__restrict__ output, int vocab) {
-    constexpr int width = 4096, batch = 8;
+// load across the input rows. Only the 64-to-32 stage needs shared memory.
+template <int FixedWidth, int batch, bool Tail = false>
+__device__ __forceinline__ void FastllmBf16ExactTile(const __nv_bfloat16 *__restrict__ input,
+        const __nv_bfloat16 *__restrict__ weight, __nv_bfloat16 *__restrict__ output, int vocab,
+        int runtimeWidth, int firstColumn, int live = batch) {
+    const int width = FixedWidth ? FixedWidth : runtimeWidth;
     const int lane = threadIdx.x % 64, group = threadIdx.x / 64;
-    const int column = blockIdx.x * 2 + group;
+    const int column = firstColumn + group;
     const __nv_bfloat16 *row = weight + size_t(column) * width;
     float sums[4][batch], corrections[4][batch] = {};
     #pragma unroll
     for (int leaf = 0; leaf < 4; ++leaf) {
         #pragma unroll
         for (int half = 0; half < 2; ++half) {
-            const int offset = half * (width / 2) + (lane + 64 * leaf) * 8;
+            const int offset = half * 2048 + (lane + 64 * leaf) * 8;
+            if constexpr (FixedWidth != 4096)
+                if (offset >= width) continue;
             union_bf16_8 w;
             w.in = *reinterpret_cast<const uint4 *>(row + offset);
             float wfp32[8];
@@ -197,7 +201,7 @@ __global__ void FastllmBf16DecodeHead8(const __nv_bfloat16 *__restrict__ input,
             #pragma unroll
             for (int b = 0; b < batch; ++b) {
                 union_bf16_8 x;
-                x.in = *reinterpret_cast<const uint4 *>(input + b * width + offset);
+                x.in = *reinterpret_cast<const uint4 *>(input + (Tail ? min(b, live - 1) : b) * width + offset);
                 float partial = 0.0f;
                 #pragma unroll
                 for (int i = 0; i < 8; ++i)
@@ -224,9 +228,35 @@ __global__ void FastllmBf16DecodeHead8(const __nv_bfloat16 *__restrict__ input,
             #pragma unroll
             for (int step = 16; step; step >>= 1)
                 FastllmBf16HeadAdd(value, correction, __shfl_down_sync(0xffffffffu, value, step));
-            if (lane == 0) output[size_t(b) * vocab + column] = __float2bfloat16_rn(value);
+            if (lane == 0 && (!Tail || b < live)) output[size_t(b) * vocab + column] = __float2bfloat16_rn(value);
         }
     }
+}
+
+template <int FixedWidth, int batch, bool Tail = false>
+__global__ void FastllmBf16ExactProjection(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
+        __nv_bfloat16 *output, int vocab, int width = FixedWidth, int live = batch) {
+    FastllmBf16ExactTile<FixedWidth, batch, Tail>(input + size_t(blockIdx.y) * batch * width, weight,
+        output + size_t(blockIdx.y) * batch * vocab, vocab, width, blockIdx.x * 2, live);
+}
+
+// Packed weights can project separate Q, K and V activations in one grid.
+// Each group retains its own row pitch, including when Q is wider than K/V.
+struct FastllmBf16ProjectionInputs {
+    const __nv_bfloat16 *x[3];
+    int ends[3];
+};
+
+template <int Batch, int FixedWidth = 0>
+__global__ void FastllmBf16GroupedProjection(FastllmBf16ProjectionInputs inputs,
+        const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int width, int firstRow) {
+    const int column = blockIdx.x * 2;
+    const int group = (column >= inputs.ends[0]) + (column >= inputs.ends[1]);
+    const int begin = group ? inputs.ends[group - 1] : 0;
+    const int columns = inputs.ends[group] - begin;
+    const int row = firstRow + blockIdx.y * Batch;
+    FastllmBf16ExactTile<FixedWidth, Batch>(inputs.x[group] + size_t(row) * width, weight + size_t(begin) * width,
+        output + size_t(begin) * rows + size_t(row) * columns, columns, width, column - begin);
 }
 
 // At K=256, one warp computes each dot with the original compensated
@@ -1036,6 +1066,16 @@ void FastllmCudaBf16ExactRows(const void *input, const void *weight, void *outpu
             begin += 4 * groups;
         }
     }
+    if (columns == 4608 && outputs == 64 && FastllmCudaRuntimeArch() == 120) {
+        // With only 64 output channels, pairs of queries share weights while
+        // leaving enough independent blocks to fill the device.
+        while (rows - begin >= 2) {
+            const int groups = std::min(65535, (rows - begin) / 2);
+            FastllmGemvBf16Bf16Kernel2MultiRow<256, 2, true><<<dim3(outputs, groups), 256>>>(
+                a + size_t(begin) * columns, b, c + size_t(begin) * outputs, nullptr, columns, outputs);
+            begin += 2 * groups;
+        }
+    }
     while (begin < rows) {
         const int count = std::min(65535, rows - begin);
         FastllmGemvBf16Bf16Kernel2MultiRow<256, 1><<<dim3(outputs, count), 256>>>(
@@ -1044,7 +1084,62 @@ void FastllmCudaBf16ExactRows(const void *input, const void *weight, void *outpu
     }
 }
 
+bool LaunchFastllmGroupedBf16Projection(const __nv_bfloat16 *const *x, const __nv_bfloat16 *weight,
+        __nv_bfloat16 *out, int rows, int width, const int *columns) {
+    if (rows < 4 || rows % 4 || width < 2048 || width > 4096 || width % 8 ||
+        (reinterpret_cast<uintptr_t>(weight) & 15) || FastllmCudaRuntimeArch() != 120) return false;
+    FastllmBf16ProjectionInputs inputs{};
+    int total = 0;
+    for (int g = 0; g < 3; ++g) {
+        if (columns[g] < 1024 || columns[g] % 2 || (reinterpret_cast<uintptr_t>(x[g]) & 15)) return false;
+        inputs.x[g] = x[g];
+        inputs.ends[g] = total += columns[g];
+    }
+    int first = 0;
+    while (rows - first >= 8) {
+        const int tiles = std::min((rows - first) / 8, 65535);
+        if (width == 2304)
+            FastllmBf16GroupedProjection<8, 2304><<<dim3(total / 2, tiles), 128>>>(inputs, weight, out, rows, width, first);
+        else
+            FastllmBf16GroupedProjection<8><<<dim3(total / 2, tiles), 128>>>(inputs, weight, out, rows, width, first);
+        first += tiles * 8;
+    }
+    if (first < rows)
+        FastllmBf16GroupedProjection<4><<<total / 2, 128>>>(inputs, weight, out, rows, width, first);
+    return true;
+}
+
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+    // Two banks cover 256 eight-value leaves. Keep the singleton FMA and compensated
+    // reduction order while reusing each weight across a tile of independent rows.
+    if (!bias && n >= 4 && m >= 2048 && m <= 4096 && m % 8 == 0 && k >= 1024 && k % 2 == 0 &&
+        !(reinterpret_cast<uintptr_t>(input) & 15) && !(reinterpret_cast<uintptr_t>(weight) & 15) &&
+        FastllmCudaRuntimeArch() == 120) {
+        while (n >= 8) {
+            int tiles = std::min(n / 8, 65535);
+            if (m == 2304)
+                FastllmBf16ExactProjection<2304, 8><<<dim3(k / 2, tiles), 128>>>(input, weight, output, k);
+            else if (m == 3072)
+                FastllmBf16ExactProjection<3072, 8><<<dim3(k / 2, tiles), 128>>>(input, weight, output, k);
+            else
+                FastllmBf16ExactProjection<0, 8><<<dim3(k / 2, tiles), 128>>>(input, weight, output, k, m);
+            n -= tiles * 8;
+            input += size_t(tiles) * 8 * m;
+            output += size_t(tiles) * 8 * k;
+        }
+        if (n > 4) {
+            // A partial tile shares each vocabulary weight across the live rows.
+            FastllmBf16ExactProjection<0, 8, true><<<k / 2, 128>>>(input, weight, output, k, m, n);
+            return;
+        }
+        if (n >= 4) {
+            FastllmBf16ExactProjection<0, 4><<<k / 2, 128>>>(input, weight, output, k, m);
+            n -= 4;
+            input += size_t(4) * m;
+            output += size_t(4) * k;
+        }
+        if (!n) return;
+    }
     if ((n == 1 || n == 2) && k >= 256 && (m == 1024 || m == 2048 || m == 4096) &&
         (reinterpret_cast<uintptr_t>(input) & 15) == 0 &&
         (reinterpret_cast<uintptr_t>(weight) & 15) == 0 && FastllmCudaRuntimeArch() == 90) {
@@ -1337,7 +1432,7 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
             auto *x = cudaInput + size_t(row) * m;
             auto *y = cudaOutput + size_t(row) * k;
             if (rows == 8 && m == 4096 && k >= 65536 && k % 2 == 0 && !cudaBiasData) {
-                FastllmBf16DecodeHead8<<<k / 2, 128>>>(x, weightPtr, y, k);
+                FastllmBf16ExactProjection<4096, 8><<<k / 2, 128>>>(x, weightPtr, y, k);
             } else {
                 LaunchFastllmGemmBf16Bf16SmallBatch<256>(x, weightPtr, y, cudaBiasData, rows, m, k);
             }

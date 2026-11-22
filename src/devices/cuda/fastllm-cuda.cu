@@ -14280,6 +14280,8 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
     float *cudaInput0 = (float *) FastllmCudaPrepareInput(input0);
     float *cudaInput1 = (float *) FastllmCudaPrepareInput(input1);
     float *cudaOutput = (float *) FastllmCudaPrepareOutput(output);
+    // Packed callers may pass zero. Row views in a strided batch share their parent output pitch.
+    const int outputPitch = outputSpatial > 0 ? outputSpatial : k * n;
     float beta = 0;
     auto fastllmCublasHandle = getFastllmCublasHandle();
     cublasStatus_t status = CUBLAS_STATUS_NOT_SUPPORTED;
@@ -14291,14 +14293,14 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                        cudaInput1, input1Stride, input1Spatial,
                                        cudaInput0, input0Stride, input0Spatial,
                                        &beta,
-                                       cudaOutput, k, k * n, batch);
+                                       cudaOutput, k, outputPitch, batch);
     } else if (output.dataType == fastllm::FLOAT32 && input0.dataType == input1.dataType &&
                (input0.dataType == fastllm::BFLOAT16 || input0.dataType == fastllm::FLOAT16)) {
         const auto type = input0.dataType == fastllm::BFLOAT16 ? CUDA_R_16BF : CUDA_R_16F;
         status = cublasGemmStridedBatchedEx(fastllmCublasHandle, CUBLAS_OP_T, CUBLAS_OP_N,
                 k, n, m, &alpha, cudaInput1, type, input1Stride, input1Spatial,
                 cudaInput0, type, input0Stride, input0Spatial, &beta, cudaOutput, CUDA_R_32F,
-                k, k * n, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                k, outputPitch, batch, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     } else if (input0.dataType == fastllm::DataType::FLOAT16 && input1.dataType == fastllm::DataType::FLOAT16) {
         half h_alpha = __float2half(alpha), h_beta = __float2half(beta);
         status = cublasHgemmStridedBatched(fastllmCublasHandle,
@@ -14307,7 +14309,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                         (half*)cudaInput1, input1Stride, input1Spatial,
                                         (half*)cudaInput0, input0Stride, input0Spatial,
                                         &h_beta,
-                                        (half*)cudaOutput, k, k * n, batch);
+                                        (half*)cudaOutput, k, outputPitch, batch);
     } else if (input0.dataType == fastllm::DataType::BFLOAT16 &&
                input1.dataType == fastllm::DataType::BFLOAT16) {
         status = cublasGemmStridedBatchedEx(
@@ -14315,7 +14317,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                 k, n, m, &alpha,
                 cudaInput1, CUDA_R_16BF, input1Stride, input1Spatial,
                 cudaInput0, CUDA_R_16BF, input0Stride, input0Spatial,
-                &beta, cudaOutput, CUDA_R_16BF, k, k * n, batch,
+                &beta, cudaOutput, CUDA_R_16BF, k, outputPitch, batch,
                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     } else if (input0.dataType == fastllm::DataType::FLOAT32 && input1.dataType == fastllm::DataType::FLOAT16) {
         auto runHalfGemm = [&]() {
@@ -14353,7 +14355,12 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                             &h_beta,
                                             (half*)tempOutput, k, k * n, batch);
             if (halfStatus == CUBLAS_STATUS_SUCCESS) {
-                FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+                if (outputPitch == k * n) {
+                    FastllmHalfToFloat(tempOutput, cudaOutput, output.Count(0));
+                } else {
+                    for (int i = 0; i < batch; ++i)
+                        FastllmHalfToFloat(tempOutput + size_t(i) * k * n, cudaOutput + size_t(i) * outputPitch, k * n);
+                }
             }
             if (useWorkspace) {
                 FastllmReleaseCudaTempBuffer(workspace, workspaceOwn);
@@ -14376,7 +14383,7 @@ bool FastllmCudaBatchMatMulTransB(const fastllm::Data &input0, const fastllm::Da
                                             tempInput1, input1Stride, input1Spatial,
                                             cudaInput0, input0Stride, input0Spatial,
                                             &beta,
-                                            cudaOutput, k, k * n, batch);
+                                            cudaOutput, k, outputPitch, batch);
             FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);
         } else {
             FastllmReleaseCudaTempBuffer(tempInput1, workspaceOwn);

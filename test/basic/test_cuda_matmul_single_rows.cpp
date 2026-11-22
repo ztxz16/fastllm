@@ -2,6 +2,7 @@
 #include "executor.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_runtime_api.h>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -28,6 +29,30 @@ static void Fill(Data &data, DataType type, const std::vector<int> &dims, int se
     data.CopyFrom(Data(FLOAT32, dims, values));
     ToDataType(data, type);
     data.ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()});
+}
+// Row views of grouped Q/K/V projections write into a shared, padded output.
+static void CheckOutputPitch(DataType inputType, DataType weightType, DataType outputType) {
+    constexpr int batch = 3, rows = 2, inner = 32, width = 8, pitch = 32;
+    Data input, weight, expected, padded;
+    Fill(input, inputType, {batch, rows, inner}, 5);
+    Fill(weight, weightType, {batch, width, inner}, 11);
+    Fill(expected, outputType, {batch, rows, width}, 0);
+    Fill(padded, outputType, {batch, pitch}, 0);
+    Check(cudaMemset(padded.cudaData, 0xa5, padded.GetBytes()) == cudaSuccess, "CUDA fill failed");
+    const auto original = Read(padded);
+    Data view(outputType, expected.dims, CUDA, padded.cudaData);
+    auto project = [&](Data &out, int stride) {
+        Check(FastllmCudaBatchMatMulTransB(input, weight, out, rows * inner, width * inner, stride,
+                inner, inner, batch, rows, inner, width, 1.f), "strided output projection failed");
+    };
+    project(expected, 0);
+    project(view, pitch);
+    auto reference = original;
+    const auto packed = Read(expected);
+    const size_t bytes = packed.size() / batch;
+    for (int group = 0; group < batch; ++group)
+        std::copy_n(packed.begin() + group * bytes, bytes, reference.begin() + group * pitch * padded.unitSize);
+    Check(Read(padded) == reference, "strided projection differs from packed output or overwrites padding");
 }
 static void Reference(Data &input, Data &weight, Data &output, bool transpose, float alpha) {
     for (int row = 0; row < input.dims[1]; ++row) {
@@ -85,6 +110,11 @@ int main(int argc, char **argv) {
         for (int device = 0; device < count; ++device) {
             FastllmCudaSetDevice(device);
             static_cast<Executor *>(GetExecutor())->SetFirstDevice("cuda:" + std::to_string(device));
+            for (DataType type : {FLOAT32, FLOAT16, BFLOAT16}) {
+                CheckOutputPitch(type, type, type);
+                if (type != FLOAT32) CheckOutputPitch(type, type, FLOAT32);
+            }
+            CheckOutputPitch(FLOAT32, FLOAT16, FLOAT32);
             for (DataType type : {FLOAT32, FLOAT16, BFLOAT16})
                 for (int rows : {1,2,3,4,7,9,17})
                     for (bool transpose : {false, true}) Run(type, 3, rows, 32, 48, transpose);
