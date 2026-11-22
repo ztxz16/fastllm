@@ -12,6 +12,9 @@
 std::vector <long long> FastllmCudaGetFreeSizes();
 std::vector <long long> FastllmCudaGetTotalSizes();
 
+struct FastllmNaiveRopeCacheRow;
+struct FastllmMoePreparedInput;
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -58,6 +61,80 @@ bool FastllmCudaCustomAllReduceRows(void* data, void* dest, int count,
                                     int rowElements, int dataType, int deviceId);
 // Hopper BF16 decode: allreduce(data), BF16 residual addition and Kimi-style
 // RMSNorm (BF16 normalization followed by FP32 affine and BF16 output).
+// SM103 TP8 attention output for 1–8 flattened rows, enabled by default. Borrows BF16
+// row-major weights. The initialized group must support cooperative launch
+// and peer access; unsupported inputs return false collectively before writes.
+// Eight rows reuse ordinary GEMM and its mutable auxiliary caches; capture
+// requires eager preparation of that path and all destination buffers.
+bool FastllmCudaSwaOutputAddRMSNorm(const fastllm::Data &input,
+    fastllm::Data &weight, fastllm::Data &projected,
+    fastllm::Data &hidden, const fastllm::Data &normWeight,
+    fastllm::Data &normed, float eps, int deviceId,
+    const fastllm::Data *routerWeight = nullptr, fastllm::Data *router = nullptr,
+    bool orderedProjection = false);
+// Explicitly allowing MMA permits FP32 projection reassociation for 2–8 rows
+// and fuses projection with TP. orderedProjection takes precedence. Unsupported
+// MMA resources retain the original path; all ranks must follow the same call order.
+bool FastllmCudaSwaOutputAddRMSNormWithProjection(const fastllm::Data &input,
+    fastllm::Data &weight, fastllm::Data &projected,
+    fastllm::Data &hidden, const fastllm::Data &normWeight,
+    fastllm::Data &normed, float eps, int deviceId,
+    const fastllm::Data *routerWeight, fastllm::Data *router,
+    bool orderedProjection, bool allowMmaProjection);
+// Optional prepared FP8 activation output; unsupported inputs reject before writes.
+bool FastllmCudaSwaOutputAddRMSNormPrepared(const fastllm::Data &input,
+    fastllm::Data &weight, fastllm::Data &projected,
+    fastllm::Data &hidden, const fastllm::Data &normWeight,
+    fastllm::Data &normed, float eps, int deviceId,
+    const fastllm::Data *routerWeight, fastllm::Data *router,
+    bool orderedProjection, bool allowMmaProjection,
+    const FastllmMoePreparedInput *prepared);
+
+// SM103 TP8, one decode row. The group-wide capability is decided at startup.
+// The complete call rejects unsupported input collectively before any writes.
+struct FastllmSwaLayerConfig {
+    int heads, kvHeads, headDim, valueDim, rotaryDim, window;
+    float eps, theta, valueScale;
+};
+bool FastllmCudaSwaLayerSupported(int deviceId);
+bool FastllmCudaSwaLayer(const fastllm::Data &branch, fastllm::Data &hidden,
+    const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+    const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+    const fastllm::Data &postNorm, const fastllm::Data &routerWeight,
+    const fastllm::Data &sink, const fastllm::Data &position,
+    const fastllm::Data &live, const fastllm::Data &key, const fastllm::Data &value,
+    const void *const *cache, fastllm::Data &q, fastllm::Data &attn,
+    fastllm::Data &projected, fastllm::Data &normed, fastllm::Data &router,
+    FastllmSwaLayerConfig config, int deviceId);
+// SM103 TP8 verification, 1–64 flattened query rows with private candidate
+// offsets 0..7. Uses existing row-major weights and output-state storage.
+// All ranks reject together before writes when any input is unsupported.
+// feature, when provided, receives BF16(hidden + branch) before attention;
+// callers prepare it during startup. routerWeight/router are optional as a pair.
+bool FastllmCudaSwaPreparedRouterSupported(int deviceId, bool routed = false, int rows = 8);
+bool FastllmCudaSwaVerifyLayerSupported(int deviceId, int rows);
+bool FastllmCudaSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden,
+    const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+    const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+    const fastllm::Data &postNorm, const fastllm::Data &sink,
+    const fastllm::Data &position, const fastllm::Data &live,
+    const std::vector<FastllmNaiveRopeCacheRow> &caches,
+    fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
+    fastllm::Data &normed, fastllm::Data *feature,
+    const fastllm::Data *routerWeight, fastllm::Data *router,
+    FastllmSwaLayerConfig config, int deviceId);
+// Optional prepared FP8 activation output; unsupported inputs reject before writes.
+bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Data &hidden,
+    const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+    const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+    const fastllm::Data &postNorm, const fastllm::Data &sink,
+    const fastllm::Data &position, const fastllm::Data &live,
+    const std::vector<FastllmNaiveRopeCacheRow> &caches,
+    fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
+    fastllm::Data &normed, fastllm::Data *feature,
+    const fastllm::Data *routerWeight, fastllm::Data *router,
+    FastllmSwaLayerConfig config, int deviceId,
+    const FastllmMoePreparedInput *prepared);
 // Reads data without materializing its full reduction, updates residual, and
 // writes output. The three tensors must not overlap. Unsupported inputs or a
 // disabled custom collective return false before launching any work.

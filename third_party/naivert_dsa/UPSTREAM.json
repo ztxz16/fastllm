@@ -35,6 +35,16 @@
   },
   "changes": "Extracted cooperative TCgen05 Indexer and exact Top-K for SM103. Adapted BF16/FP8 native paged caches, causal lengths, FastLLM quantization/scale order and caller-owned scratch. Partial fusion retains score ordering and native attention arithmetic. Full layer adds native BF16 projections/RoPE/cache append, compact attention, token-ordered bitmap Top-K, seven cache producer warps, conditional first-histogram reuse and TP8 residual output. Removed unused upstream helpers, phase timers and unreachable histogram variants. The internal full-layer launch ABI/control flow is retained to preserve measured SM103 code generation. See README.txt for support, fallback and numerical contracts.",
   "derived_adapters": {
+    "src/devices/cuda/models/naive-n05-dsa-fused-attention.cuh": {
+      "source": "attn_dsa/attn_dsa_body.cuh",
+      "original_sha256": "af3dc1a1bca3d96071333371169798de4bed310533b31d6ccc020ce862d56933",
+      "installed_sha256": "529ebadd89efb8ea88f084d7a7d900d44c7abcee715058548d2e5794e602d5db",
+      "fragments": [
+        "qk_eight_heads",
+        "pv_eight_heads",
+        "compute_attention distributed combine"
+      ]
+    },
     "src/devices/cuda/moe/fastllm-shared-flex-dense-sm103.cuh": {
       "sources": {
         "kernels/model_ops/extension/checkpoint_bf16_bindings.cu": "f7903e1ba91d667ee897a83573b933f0918eba8a5edf78fa3e9979d98bf965db",

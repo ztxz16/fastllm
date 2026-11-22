@@ -7,6 +7,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
+#include "naive-n05-cuda.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -22,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -30,6 +32,7 @@
 #include <unordered_map>
 #include <vector>
 #include "fastllm-custom-allreduce-tagged.cuh"
+#include "fastllm-swa-output-state.cuh"
 
 namespace {
 
@@ -1253,6 +1256,7 @@ struct CustomArState {
     CustomArRankScratch allScratch{};
     CustomArPushWorkspaces allPushWorkspaces{};
     std::unique_ptr<CustomArTaggedPeer> taggedPeer;
+    std::unique_ptr<SwaOutputState> swaOutput;
     void *inplaceScratch[kCustomArMaxRanks]{};
     int pushBlocks = 0;
     bool pushAvailable = false;
@@ -1294,6 +1298,7 @@ struct CustomArAllocation {
     int device = -1;
     void *pointer = nullptr;
     std::unique_ptr<CustomArTaggedPeer> taggedPeer;
+    std::unique_ptr<SwaOutputState> swaOutput;
 };
 
 std::vector<CustomArAllocation> DetachCustomArAllocationsLocked(
@@ -1301,6 +1306,11 @@ std::vector<CustomArAllocation> DetachCustomArAllocationsLocked(
     std::vector<CustomArAllocation> allocations;
     if (state.taggedPeer) {
         allocations.push_back({-1, nullptr, std::move(state.taggedPeer)});
+    }
+    if (state.swaOutput) {
+        CustomArAllocation allocation;
+        allocation.swaOutput = std::move(state.swaOutput);
+        allocations.push_back(std::move(allocation));
     }
     auto collect = [&](int rank, void *pointer) {
         if (pointer != nullptr && rank >= 0 &&
@@ -1341,6 +1351,10 @@ void DrainAndReleaseCustomArAllocations(
         FastllmCudaSyncDevice(device);
     }
     for (const CustomArAllocation &allocation : allocations) {
+        if (allocation.swaOutput) {
+            allocation.swaOutput->ReleaseAfterDrain();
+            continue;
+        }
         if (allocation.taggedPeer) {
             allocation.taggedPeer->ReleaseAfterDrain();
             continue;
@@ -2940,6 +2954,7 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     }
     if (ok) {
         state.taggedPeer = CustomArTaggedPeer::Create(devices);
+        state.swaOutput = SwaOutputState::Create(devices);
     }
     FastllmCudaSetDevice(originalDevice);
     if (!ok) {
@@ -3087,6 +3102,618 @@ bool FastllmCudaCustomAllReduceRows(void *data, void *dest, int count,
     }
     return true;
 }
+
+
+// Preserve the original API and its accumulation policy for existing callers.
+bool FastllmCudaSwaOutputAddRMSNorm(const fastllm::Data &input,
+        fastllm::Data &weight, fastllm::Data &projected,
+        fastllm::Data &hidden, const fastllm::Data &normWeight,
+        fastllm::Data &normed, float eps, int deviceId,
+        const fastllm::Data *routerWeight, fastllm::Data *router, bool orderedProjection) {
+    return FastllmCudaSwaOutputAddRMSNormWithProjection(input, weight, projected, hidden,
+        normWeight, normed, eps, deviceId, routerWeight, router, orderedProjection, false);
+}
+
+bool FastllmCudaSwaOutputAddRMSNormWithProjection(const fastllm::Data &input,
+        fastllm::Data &weight, fastllm::Data &projected,
+        fastllm::Data &hidden, const fastllm::Data &normWeight,
+        fastllm::Data &normed, float eps, int deviceId,
+        const fastllm::Data *routerWeight, fastllm::Data *router, bool orderedProjection, bool allowMmaProjection) {
+    return FastllmCudaSwaOutputAddRMSNormPrepared(input, weight, projected, hidden,
+        normWeight, normed, eps, deviceId, routerWeight, router, orderedProjection, allowMmaProjection, nullptr);
+}
+
+bool FastllmCudaSwaOutputAddRMSNormPrepared(const fastllm::Data &input,
+        fastllm::Data &weight, fastllm::Data &projected,
+        fastllm::Data &hidden, const fastllm::Data &normWeight,
+        fastllm::Data &normed, float eps, int deviceId,
+        const fastllm::Data *routerWeight, fastllm::Data *router, bool orderedProjection, bool allowMmaProjection,
+        const FastllmMoePreparedInput *prepared) {
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, 8192, fastllm::BFLOAT16, deviceId, true, rank)) return false;
+    if (!state.swaOutput) return false; // A group-wide, immutable initialization result.
+    auto tensor = [&](const fastllm::Data &x, int type, size_t count) {
+        if (x.dataType != type || x.dataDevice != fastllm::DataDevice::CUDA ||
+            x.dataDeviceIds != std::vector<int>{deviceId} || !x.cudaData ||
+            (reinterpret_cast<uintptr_t>(x.cudaData) & 15) || x.dims.empty() ||
+            x.strides.size() != x.dims.size()) return false;
+        size_t stride = 1;
+        for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+            if (x.dims[i] <= 0 || x.strides[i] != stride ||
+                stride > count / size_t(x.dims[i])) return false;
+            stride *= x.dims[i];
+        }
+        return stride == count;
+    };
+    auto prepare = [&](fastllm::Data &x) {
+        x.dataType = fastllm::BFLOAT16; x.UpdateUnitSize();
+        x.Resize(hidden.dims); x.ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false);
+        x.Allocate(false);
+    };
+    auto disjoint = [](const void *a, size_t na, const void *b, size_t nb) {
+        uintptr_t x = uintptr_t(a), y = uintptr_t(b);
+        return x <= y ? y - x >= na : x - y >= nb;
+    };
+    int rows = input.dims.empty() || input.dims.back() != 1024 ? 0 : 1;
+    for (size_t i = 0; rows && i + 1 < input.dims.size(); ++i) {
+        if (input.dims[i] <= 0 || rows > fastllm_swa_output::MaxRows / input.dims[i]) rows = 0;
+        else rows *= input.dims[i];
+    }
+    const size_t elements = size_t(rows) * 4096, bytes = elements * 2;
+    const bool rowKernel = rows > 1 || orderedProjection;
+    const bool mma = allowMmaProjection && !orderedProjection && rows > 1 &&
+        state.swaOutput->RowsMmaSupported();
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const bool captureQueryOk = !rowKernel ||
+        cudaStreamIsCapturing(cudaStreamPerThread, &capture) == cudaSuccess;
+    if (!captureQueryOk) cudaGetLastError();
+    const bool withRouter = routerWeight && router;
+    bool eligible = captureQueryOk && rows > 0 &&
+        (!prepared || (withRouter && state.swaOutput->PreparedRouterSupported(prepared->routed, rows) && prepared->Valid(rows))) && (!rowKernel || state.swaOutput->RowsSupported()) &&
+        !hidden.dims.empty() && hidden.dims.back() == 4096 &&
+        bool(routerWeight) == bool(router) &&
+        (!withRouter || rows == 1 || rows < fastllm::FastllmCudaGetLinearExactBatchThreshold()) &&
+        (!withRouter || rowKernel || state.swaOutput->OutputRouterSupported()) &&
+        tensor(input, fastllm::BFLOAT16, size_t(rows) * 1024) &&
+        tensor(weight, fastllm::BFLOAT16, 4096 * 1024) &&
+        weight.dims == std::vector<int>({4096, 1024}) &&
+        // Ordinary Linear owns bias-cache preparation. In particular, do not
+        // attach new allocations to a temporary borrowed weight view here.
+        (mma || rows != 8 || weight.extraCudaData.size() >= 2) &&
+        tensor(hidden, fastllm::BFLOAT16, elements) &&
+        tensor(normWeight, fastllm::FLOAT32, 4096) && std::isfinite(eps) && eps > 0;
+    if (withRouter) {
+        eligible = eligible && &projected != routerWeight && &normed != routerWeight &&
+            tensor(*routerWeight, fastllm::FLOAT32, 256 * 4096) &&
+            routerWeight->dims == std::vector<int>({256, 4096});
+        for (const fastllm::Data *x : std::initializer_list<const fastllm::Data *>{
+                &input, &weight, &hidden, &normWeight, &projected, &normed, routerWeight})
+            eligible = eligible && router != x;
+        if (router->isFake || router->cudaDataBorrowed)
+            eligible = eligible && tensor(*router, fastllm::FLOAT32, size_t(rows) * 256);
+    }
+    // Validate sources before preparing destinations. In particular, an
+    // unsupported input or aliased Data object must not be resized/retagged.
+    eligible = eligible && &projected != &normed;
+    for (const fastllm::Data *source : std::initializer_list<const fastllm::Data *>{
+            &input, &weight, &hidden, &normWeight})
+        eligible = eligible && &projected != source && &normed != source;
+    for (const fastllm::Data *dest : {&projected, &normed})
+        if (dest->isFake || dest->cudaDataBorrowed)
+            eligible = eligible && tensor(*dest, fastllm::BFLOAT16, elements);
+    if (capture != cudaStreamCaptureStatusNone) {
+        // Capture may reuse a registered output with new weights or buffers.
+        // Reject collectively before any lazy allocation or GPU write. The
+        // ordinary eager path prepares the GEMM and its existing bias caches.
+        eligible = eligible && tensor(projected, fastllm::BFLOAT16, elements) &&
+            tensor(normed, fastllm::BFLOAT16, elements) &&
+            (!withRouter || tensor(*router, fastllm::FLOAT32, size_t(rows) * 256)) &&
+            (mma || rows != 8 || state.swaOutput->RowsGemmPrepared(rank));
+    }
+    if (eligible) {
+        prepare(projected); prepare(normed);
+        if (withRouter) {
+            auto dims = hidden.dims; dims.back() = 256;
+            router->dataType = fastllm::FLOAT32; router->UpdateUnitSize(); router->Resize(dims);
+            router->ToDevice(hidden.dataDevice, hidden.dataDeviceIds, false); router->Allocate(false);
+        }
+    }
+    eligible = eligible && tensor(projected, fastllm::BFLOAT16, elements) &&
+        tensor(normed, fastllm::BFLOAT16, elements);
+    const void *outputs[] = {projected.cudaData, hidden.cudaData, normed.cudaData};
+    for (int i = 0; i < 3; ++i) {
+        eligible = eligible && disjoint(outputs[i], bytes, input.cudaData, size_t(rows) * 2048) &&
+            disjoint(outputs[i], bytes, weight.cudaData, 4096 * 1024 * 2) &&
+            disjoint(outputs[i], bytes, normWeight.cudaData, 4096 * 4);
+        for (int j = 0; j < i; ++j)
+            eligible = eligible && disjoint(outputs[i], bytes, outputs[j], bytes);
+    }
+    if (withRouter) {
+        eligible = eligible && tensor(*router, fastllm::FLOAT32, size_t(rows) * 256);
+        for (const void *out : outputs)
+            eligible = eligible && disjoint(out, bytes, routerWeight->cudaData, 256 * 4096 * 4) &&
+                disjoint(out, bytes, router->cudaData, size_t(rows) * 256 * 4);
+        for (const fastllm::Data *source : std::initializer_list<const fastllm::Data *>{
+                &input, &weight, &normWeight, routerWeight})
+            eligible = eligible && disjoint(router->cudaData, size_t(rows) * 256 * 4, source->cudaData, source->GetBytes());
+    }
+    if (prepared) {
+        for (const fastllm::Data *x : std::initializer_list<const fastllm::Data *>{
+                &input, &weight, &hidden, &normWeight, &projected, &normed, routerWeight, router})
+            if (x) eligible = eligible && prepared->Disjoint(x->cudaData, x->GetBytes());
+    }
+    // Reuse the ordinary collective rendezvous and Graph pointer registration.
+    // A local layout/shape miss rejects the operation on all ranks before writes.
+    CustomArRankData *registered = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, projected.cudaData, int(elements),
+            fastllm::BFLOAT16, eligible, registered)) return false;
+    // Preserve the established eight-row GEMM algorithm and rounding. It is
+    // prepared on the same borrowed weights during ordinary startup warmup.
+    if (rows == 8 && !mma) {
+        fastllm::Data bias;
+        if (!FastllmCudaBFloat16MatMulBFloat16(input, weight, bias, projected, rows, 1024, 4096)) {
+            FastllmCudaSetThreadError();
+            throw std::runtime_error("attention output GEMM failed after collective admission");
+        }
+        if (capture == cudaStreamCaptureStatusNone) state.swaOutput->MarkRowsGemmPrepared(rank);
+    }
+    const cudaError_t status = rowKernel
+        ? state.swaOutput->LaunchRows(input.cudaData, weight.cudaData,
+            projected.cudaData, hidden.cudaData, (const float *)normWeight.cudaData,
+            normed.cudaData, eps, withRouter ? (const float *)routerWeight->cudaData : nullptr,
+            withRouter ? (float *)router->cudaData : nullptr, rank, rows, mma, prepared)
+        : withRouter
+        ? state.swaOutput->LaunchOutputRouter(input.cudaData, weight.cudaData,
+            projected.cudaData, hidden.cudaData, (const float *)normWeight.cudaData,
+            normed.cudaData, eps, (const float *)routerWeight->cudaData, (float *)router->cudaData, rank)
+        : state.swaOutput->Launch(input.cudaData, weight.cudaData,
+            projected.cudaData, hidden.cudaData, (const float *)normWeight.cudaData,
+            normed.cudaData, eps, rank);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(std::string("SWA fused output launch failed: ") + cudaGetErrorString(status));
+    }
+    return true;
+}
+
+bool FastllmCudaSwaLayerSupported(int deviceId) {
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease; int rank = -1;
+    return lease.Acquire(state, 8192, fastllm::BFLOAT16, deviceId, true, rank) &&
+        state.swaOutput && state.swaOutput->LayerSupported();
+}
+
+bool FastllmCudaSwaLayer(const fastllm::Data &branch, fastllm::Data &hidden,
+        const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+        const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+        const fastllm::Data &postNorm, const fastllm::Data &routerWeight,
+        const fastllm::Data &sink, const fastllm::Data &position,
+        const fastllm::Data &live, const fastllm::Data &key, const fastllm::Data &value,
+        const void *const *cache, fastllm::Data &q, fastllm::Data &attn,
+        fastllm::Data &projected, fastllm::Data &normed, fastllm::Data &router,
+        FastllmSwaLayerConfig c, int deviceId) {
+    using namespace fastllm;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, 8192, BFLOAT16, deviceId, true, rank) ||
+        !state.swaOutput || !state.swaOutput->LayerSupported()) return false;
+    auto located = [&](const Data &x, int type, size_t alignment = 16) {
+        return x.dataType == type && x.dataDevice == DataDevice::CUDA &&
+            x.dataDeviceIds.size() == 1 && x.dataDeviceIds.front() == deviceId && x.cudaData &&
+            !(uintptr_t(x.cudaData) & (alignment - 1)) && !x.dims.empty() &&
+            x.strides.size() == x.dims.size();
+    };
+    auto tensor = [&](const Data &x, int type, size_t count, size_t alignment = 16) {
+        if (!located(x, type, alignment)) return false;
+        size_t stride = 1;
+        for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+            if (x.dims[i] <= 0 || x.strides[i] != stride || stride > count / x.dims[i]) return false;
+            stride *= x.dims[i];
+        }
+        return stride == count;
+    };
+    auto ring = [&](const Data &x, int width) {
+        return located(x, BFLOAT16) && !x.isPagedKVCache &&
+            x.dims.size() == 3 && x.dims[0] == 1 && x.dims[2] == width &&
+            x.strides[2] == 1 && x.strides[1] == width &&
+            x.expansionDims.size() == 3 && x.expansionDims[1] >= 128;
+    };
+    bool eligible = c.heads == 8 && c.kvHeads == 1 && c.headDim == 192 &&
+        c.valueDim == 128 && c.rotaryDim == 64 && c.window == 128 &&
+        std::isfinite(c.eps) && c.eps > 0 && std::isfinite(c.theta) && c.theta > 0 &&
+        std::isfinite(c.valueScale) && tensor(hidden, BFLOAT16, 4096) && hidden.dims.back() == 4096 &&
+        tensor(branch, BFLOAT16, 4096) && branch.dims.back() == 4096 && tensor(inputNorm, FLOAT32, 4096) &&
+        tensor(qkvWeight, BFLOAT16, 1856 * 4096) && qkvBias.dims.empty() &&
+        qkvWeight.dims == std::vector<int>({1856,4096}) &&
+        tensor(oWeight, BFLOAT16, 4096 * 1024) && oWeight.dims == std::vector<int>({4096,1024}) &&
+        tensor(postNorm, FLOAT32, 4096) && tensor(routerWeight, FLOAT32, 256 * 4096) &&
+        routerWeight.dims == std::vector<int>({256,4096}) &&
+        (sink.dims.empty() || tensor(sink, FLOAT32, 8)) &&
+        tensor(position, FLOAT32, 1, 4) && tensor(live, INT32, 1, 4) &&
+        ring(key, 192) && ring(value, 128) && (!cache || !(uintptr_t(cache) & 7));
+    Data *outputs[] = {&q, &attn, &projected, &normed, &router};
+    const size_t counts[] = {1536,1024,4096,4096,256};
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; j < i; ++j) eligible = eligible && outputs[i] != outputs[j];
+        for (const Data *source : {&branch, (const Data *)&hidden, &inputNorm, &qkvWeight, &qkvBias,
+                &oWeight, &postNorm, &routerWeight, &sink, &position, &live, &key, &value})
+            eligible = eligible && outputs[i] != source;
+        if (outputs[i]->isFake || outputs[i]->cudaDataBorrowed)
+            eligible = eligible && tensor(*outputs[i], i == 4 ? FLOAT32 : BFLOAT16, counts[i]);
+    }
+    if (eligible) for (int i = 0; i < 5; ++i) {
+        auto &x = *outputs[i]; x.dataType = i == 4 ? FLOAT32 : BFLOAT16; x.UpdateUnitSize();
+        x.Resize({1,1,int(counts[i])}); x.ToDevice(DataDevice::CUDA, {deviceId}, false); x.Allocate(false);
+    }
+    auto disjoint = [](const void *a, size_t na, const void *b, size_t nb) {
+        uintptr_t x = uintptr_t(a), y = uintptr_t(b);
+        return x <= y ? y - x >= na : x - y >= nb;
+    };
+    std::pair<const void *, size_t> writes[8] = {{hidden.cudaData,8192},
+        {key.cudaData,128*192*2},{value.cudaData,128*128*2}};
+    for (int i = 0; i < 5; ++i) {
+        eligible = eligible && tensor(*outputs[i], i == 4 ? FLOAT32 : BFLOAT16, counts[i]);
+        writes[i + 3] = {outputs[i]->cudaData, counts[i] * (i == 4 ? 4 : 2)};
+    }
+    const std::pair<const void *, size_t> reads[] = {
+        {branch.cudaData,8192},{inputNorm.cudaData,16384},
+        {qkvWeight.cudaData,1856*4096*2},{oWeight.cudaData,4096*1024*2},
+        {postNorm.cudaData,16384},{routerWeight.cudaData,256*4096*4},
+        {sink.cudaData,sink.dims.empty()?0u:32u},{position.cudaData,4},{live.cudaData,4},{cache,cache?32u:0u}};
+    for (size_t i = 0; i < 8; ++i) {
+        for (const auto &r : reads) if (r.second)
+            eligible = eligible && disjoint(writes[i].first,writes[i].second,r.first,r.second);
+        for (size_t j = 0; j < i; ++j)
+            eligible = eligible && disjoint(writes[i].first,writes[i].second,writes[j].first,writes[j].second);
+    }
+    CustomArRankData *registered = nullptr;
+    if (!FindOrRegisterCustomArPointers(state,rank,projected.cudaData,4096,BFLOAT16,eligible,registered)) return false;
+    fastllm_swa_layer::Args args{};
+    args.branch = (const __nv_bfloat16 *)branch.cudaData;
+    args.qkvWeight = (const __nv_bfloat16 *)qkvWeight.cudaData;
+    args.oWeight = (const __nv_bfloat16 *)oWeight.cudaData;
+    args.hidden = (__nv_bfloat16 *)hidden.cudaData; args.normed = (__nv_bfloat16 *)normed.cudaData;
+    args.q = (__nv_bfloat16 *)q.cudaData; args.k = (__nv_bfloat16 *)key.cudaData;
+    args.v = (__nv_bfloat16 *)value.cudaData; args.attn = (__nv_bfloat16 *)attn.cudaData;
+    args.projected = (__nv_bfloat16 *)projected.cudaData;
+    args.inputNorm = (const float *)inputNorm.cudaData; args.postNorm = (const float *)postNorm.cudaData;
+    args.routerWeight = (const float *)routerWeight.cudaData; args.routerOut = (float *)router.cudaData;
+    args.sink = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+    args.position = (const float *)position.cudaData; args.live = (const int *)live.cudaData;
+    args.cache = cache; args.eps = c.eps; args.theta = c.theta; args.valueScale = c.valueScale;
+    const cudaError_t status = state.swaOutput->LaunchLayer(args,rank);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(std::string("SWA layer launch failed: ") + cudaGetErrorString(status));
+    }
+    return true;
+}
+
+bool FastllmCudaSwaPreparedRouterSupported(int deviceId, bool routed, int rows) {
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease; int rank = -1;
+    return lease.Acquire(state, 8192, fastllm::BFLOAT16, deviceId, true, rank) &&
+        state.swaOutput && state.swaOutput->PreparedRouterSupported(routed, rows);
+}
+
+bool FastllmCudaSwaVerifyLayerSupported(int deviceId, int rows) {
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease; int rank = -1;
+    return lease.Acquire(state, 8192, fastllm::BFLOAT16, deviceId, true, rank) &&
+        state.swaOutput && state.swaOutput->VerifySupported(rows);
+}
+
+bool FastllmCudaSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden,
+        const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+        const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+        const fastllm::Data &postNorm, const fastllm::Data &sink,
+        const fastllm::Data &position, const fastllm::Data &live,
+        const std::vector<FastllmNaiveRopeCacheRow> &caches,
+        fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
+        fastllm::Data &normed, fastllm::Data *feature,
+        const fastllm::Data *routerWeight, fastllm::Data *router,
+        FastllmSwaLayerConfig c, int deviceId) {
+    return FastllmCudaSwaVerifyLayerPrepared(branch, hidden, inputNorm, qkvWeight, qkvBias,
+        oWeight, postNorm, sink, position, live, caches, q, attn, projected, normed,
+        feature, routerWeight, router, c, deviceId, nullptr);
+}
+
+bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Data &hidden,
+        const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+        const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+        const fastllm::Data &postNorm, const fastllm::Data &sink,
+        const fastllm::Data &position, const fastllm::Data &live,
+        const std::vector<FastllmNaiveRopeCacheRow> &caches,
+        fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
+        fastllm::Data &normed, fastllm::Data *feature,
+        const fastllm::Data *routerWeight, fastllm::Data *router,
+        FastllmSwaLayerConfig c, int deviceId,
+        const FastllmMoePreparedInput *prepared) {
+    using namespace fastllm;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease; int rank = -1;
+    // Only group-wide state may reject before the collective rendezvous.
+    if (!lease.Acquire(state, 8192, BFLOAT16, deviceId, true, rank) || !state.swaOutput)
+        return false;
+    const int rows = int(caches.size());
+    const size_t elements = rows > 0 && rows <= fastllm_swa_verify::RowLimit ? size_t(rows) * 4096 : 0;
+    auto located = [&](const Data &x, int type, size_t alignment = 16) {
+        return x.dataType == type && x.dataDevice == DataDevice::CUDA &&
+            x.dataDeviceIds == std::vector<int>{deviceId} && x.cudaData &&
+            !(uintptr_t(x.cudaData) & (alignment - 1)) && !x.dims.empty() &&
+            x.strides.size() == x.dims.size();
+    };
+    auto tensor = [&](const Data &x, int type, size_t count, size_t alignment = 16) {
+        if (!located(x, type, alignment) || !count) return false;
+        size_t stride = 1;
+        for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+            if (x.dims[i] <= 0 || x.strides[i] != stride || stride > count / size_t(x.dims[i]))
+                return false;
+            stride *= x.dims[i];
+        }
+        return stride == count;
+    };
+    auto ring = [&](const Data &x, int width) {
+        const int capacity = x.expansionDims.size() == 3 ? x.expansionDims[1]
+            : x.dims.size() == 3 ? x.dims[1] : 0;
+        return located(x, BFLOAT16) && !x.isPagedKVCache && x.dims.size() == 3 &&
+            x.dims[0] == 1 && x.dims[2] == width && capacity >= 136 &&
+            x.strides[2] == 1 && x.strides[1] == size_t(width);
+    };
+    struct Range { const void *data; size_t bytes; };
+    auto disjoint = [](Range a, Range b) {
+        if (!a.bytes || !b.bytes) return true;
+        const uintptr_t x = uintptr_t(a.data), y = uintptr_t(b.data);
+        return x <= y ? y - x >= a.bytes : x - y >= b.bytes;
+    };
+    const bool withRouter = routerWeight && router;
+    bool eligible = state.swaOutput->VerifySupported(rows) &&
+        (!prepared || (withRouter && state.swaOutput->PreparedRouterSupported(prepared->routed, rows) && prepared->Valid(rows))) &&
+        c.heads == 8 && c.kvHeads == 1 && c.headDim == 192 && c.valueDim == 128 &&
+        c.rotaryDim == 64 && c.window == 128 && std::isfinite(c.eps) && c.eps > 0 &&
+        std::isfinite(c.theta) && c.theta > 0 && std::isfinite(c.valueScale) &&
+        tensor(hidden, BFLOAT16, elements) && hidden.dims.back() == 4096 &&
+        tensor(branch, BFLOAT16, elements) && branch.dims == hidden.dims &&
+        tensor(inputNorm, FLOAT32, 4096) && tensor(postNorm, FLOAT32, 4096) &&
+        tensor(qkvWeight, BFLOAT16, 1856 * 4096) && qkvBias.dims.empty() &&
+        qkvWeight.dims == std::vector<int>({1856, 4096}) &&
+        tensor(oWeight, BFLOAT16, 4096 * 1024) && oWeight.dims == std::vector<int>({4096, 1024}) &&
+        (sink.dims.empty() || tensor(sink, FLOAT32, 8, 4)) &&
+        tensor(position, FLOAT32, rows, 4) && tensor(live, INT32, rows, 4) &&
+        bool(routerWeight) == bool(router) &&
+        (!feature || (tensor(*feature, BFLOAT16, elements) && feature->dims == hidden.dims)) &&
+        (!withRouter || ((rows == 1 || rows < FastllmCudaGetLinearExactBatchThreshold()) &&
+            tensor(*routerWeight, FLOAT32, 256 * 4096) &&
+            routerWeight->dims == std::vector<int>({256, 4096})));
+    std::vector<const Data *> sources{&branch, &hidden, &inputNorm, &qkvWeight, &qkvBias,
+        &oWeight, &postNorm, &sink, &position, &live};
+    if (routerWeight) sources.push_back(routerWeight);
+    if (feature) sources.push_back(feature);
+    std::vector<Data *> outputs{&q, &attn, &projected, &normed};
+    std::vector<int> widths{1536, 1024, 4096, 4096};
+    if (withRouter) { outputs.push_back(router); widths.push_back(256); }
+    fastllm_swa_verify::Args args{};
+    std::vector<Range> keys, values;
+    std::vector<Range> reads{
+        {branch.cudaData, elements * 2}, {inputNorm.cudaData, 4096 * 4},
+        {qkvWeight.cudaData, 1856 * 4096 * 2}, {oWeight.cudaData, 4096 * 1024 * 2},
+        {postNorm.cudaData, 4096 * 4}, {sink.cudaData, sink.dims.empty() ? 0u : 32u},
+        {position.cudaData, size_t(std::max(0, rows)) * 4},
+        {live.cudaData, size_t(std::max(0, rows)) * 4}};
+    if (withRouter) reads.push_back({routerWeight->cudaData, 256 * 4096 * 4});
+    if (eligible) for (int i = 0; i < rows; ++i) {
+        const auto &r = caches[i];
+        if (!r.key || !r.value || !ring(*r.key, 192) || !ring(*r.value, 128) ||
+            (r.indexKey && !r.indexKey->dims.empty()) || r.indexCache || r.indexerContextRank ||
+            r.cacheOffset >= 0 || r.verifyOffset < 0 || r.verifyOffset >= 8 ||
+            (r.cache && uintptr_t(r.cache) % alignof(void *))) { eligible = false; break; }
+        sources.push_back(r.key); sources.push_back(r.value);
+        keys.push_back({r.key->cudaData, 136 * 192 * 2});
+        values.push_back({r.value->cudaData, 136 * 128 * 2});
+        if (r.cache) reads.push_back({r.cache, 2 * sizeof(void *)});
+        args.bindings.rows[i] = {(fastllm_swa_output::BF16 *)r.key->cudaData,
+            (fastllm_swa_output::BF16 *)r.value->cudaData, r.cache, r.verifyOffset};
+        // Request-owned tables may rebind at replay. Shared host views must
+        // have distinct candidate slots; partial or inconsistent aliases reject.
+        for (int j = 0; j < i; ++j) {
+            const bool sameKey = keys[i].data == keys[j].data;
+            const bool sameValue = values[i].data == values[j].data;
+            if ((!disjoint(keys[i], keys[j]) && !sameKey) ||
+                (!disjoint(values[i], values[j]) && !sameValue) ||
+                sameKey != sameValue ||
+                ((sameKey || (r.cache && r.cache == caches[j].cache)) &&
+                 r.verifyOffset == caches[j].verifyOffset)) eligible = false;
+        }
+    }
+    cudaStreamCaptureStatus capturing = cudaStreamCaptureStatusNone;
+    const bool captureOk = cudaStreamIsCapturing(cudaStreamPerThread, &capturing) == cudaSuccess;
+    if (!captureOk) cudaGetLastError();
+    eligible = eligible && captureOk;
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        const int type = i == 4 ? FLOAT32 : BFLOAT16;
+        for (const Data *source : sources) eligible = eligible && outputs[i] != source;
+        for (size_t j = 0; j < i; ++j) eligible = eligible && outputs[i] != outputs[j];
+        if (outputs[i]->isFake || outputs[i]->cudaDataBorrowed || capturing != cudaStreamCaptureStatusNone)
+            eligible = eligible && tensor(*outputs[i], type, size_t(rows) * widths[i]);
+    }
+    if (eligible) for (size_t i = 0; i < outputs.size(); ++i) {
+        auto &out = *outputs[i]; out.dataType = i == 4 ? FLOAT32 : BFLOAT16; out.UpdateUnitSize();
+        auto dims = hidden.dims; dims.back() = widths[i]; out.Resize(dims);
+        out.ToDevice(DataDevice::CUDA, {deviceId}, false); out.Allocate(false);
+    }
+    std::vector<Range> writes{{hidden.cudaData, elements * 2}};
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        eligible = eligible && tensor(*outputs[i], i == 4 ? FLOAT32 : BFLOAT16, size_t(rows) * widths[i]);
+        writes.push_back({outputs[i]->cudaData, size_t(std::max(0, rows)) * widths[i] * (i == 4 ? 4u : 2u)});
+    }
+    if (feature) writes.push_back({feature->cudaData, elements * 2});
+    for (size_t i = 0; i < writes.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) eligible = eligible && disjoint(writes[i], writes[j]);
+        for (auto r : reads) eligible = eligible && disjoint(writes[i], r);
+        for (auto k : keys) eligible = eligible && disjoint(writes[i], k);
+        for (auto v : values) eligible = eligible && disjoint(writes[i], v);
+    }
+    for (auto k : keys) {
+        for (auto r : reads) eligible = eligible && disjoint(k, r);
+        for (auto v : values) eligible = eligible && disjoint(k, v);
+    }
+    for (auto v : values) for (auto r : reads) eligible = eligible && disjoint(v, r);
+    if (prepared) {
+        for (const auto *ranges : {&reads, &writes, &keys, &values})
+            for (auto range : *ranges) eligible = eligible && prepared->Disjoint(range.data, range.bytes);
+    }
+    CustomArRankData *registered = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, projected.cudaData, int(elements),
+            BFLOAT16, eligible, registered)) return false;
+    using BF16Value = fastllm_swa_output::BF16;
+    args.branch = (const BF16Value *)branch.cudaData;
+    args.weight = (const BF16Value *)qkvWeight.cudaData;
+    args.oWeight = (const BF16Value *)oWeight.cudaData;
+    args.hidden = (BF16Value *)hidden.cudaData; args.q = (BF16Value *)q.cudaData;
+    args.attn = (BF16Value *)attn.cudaData; args.projected = (BF16Value *)projected.cudaData;
+    args.normed = (BF16Value *)normed.cudaData;
+    args.feature = feature ? (BF16Value *)feature->cudaData : nullptr;
+    args.gamma = (const float *)inputNorm.cudaData;
+    args.positions = (const float *)position.cudaData;
+    args.bindings.length = (const int *)live.cudaData;
+    args.sink = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+    args.rows = rows; args.eps = c.eps; args.theta = c.theta; args.scale = c.valueScale;
+    const cudaError_t status = state.swaOutput->LaunchVerify(args, rank, (const float *)postNorm.cudaData,
+        withRouter ? (const float *)routerWeight->cudaData : nullptr,
+        withRouter ? (float *)router->cudaData : nullptr, prepared);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(std::string("SWA verification layer launch failed: ") + cudaGetErrorString(status));
+    }
+    return true;
+}
+
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+bool FastllmCudaNaiveDSALayer(const FastllmNaiveDSALayerInput &input, int deviceId,
+                              const FastllmMoePreparedInput *prepared) {
+    return FastllmCudaNaiveDSALayer(input,deviceId,prepared,false);
+}
+bool FastllmCudaNaiveDSALayer(const FastllmNaiveDSALayerInput &input,int deviceId,
+                              const FastllmMoePreparedInput *prepared,bool deferPostNorm) {
+    using namespace fastllm;
+    CustomArState &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    if (!lease.Acquire(state, 8192, BFLOAT16, deviceId, true, rank) || !state.swaOutput)
+        return false;
+    const int rows = input.caches.size();
+    const bool withRouter = input.routerWeight && input.router;
+    FastllmNaiveDSALayerArgs args{};
+    const Data *const routerSources[] = {
+        input.branch,
+        input.inputNorm,
+        input.postNorm,
+        input.qkvWeight,
+        input.indexKeyWeight,
+        input.indexQueryWeight,
+        input.indexWeight,
+        input.indexNorm,
+        input.indexBias,
+        input.outputWeight,
+        input.sink,
+        input.positions,
+        input.live,
+        input.routerWeight,
+        input.hidden,
+        input.feature,
+        input.query,
+        input.attention,
+        input.projected,
+        input.normed,
+        input.scratch ? &input.scratch->dsaLayer : nullptr,
+        input.scratch ? &input.scratch->dsaFused : nullptr,
+    };
+    bool routerDisjoint = true;
+    if (input.router) {
+        for (const Data *d : routerSources)
+            routerDisjoint = routerDisjoint && input.router != d;
+        for (const auto &cache : input.caches)
+            routerDisjoint = routerDisjoint && input.router != cache.key && input.router != cache.value;
+    }
+    bool eligible = routerDisjoint && FastllmCudaNaiveDSALayerPrepare(input, deviceId, args) &&
+                    bool(input.routerWeight) == bool(input.router) &&
+                    (!prepared || (withRouter && state.swaOutput->PreparedRouterSupported(prepared->routed, rows) &&
+                                   prepared->Valid(rows)));
+    if (withRouter) {
+        const auto &w = *input.routerWeight;
+        eligible = eligible && (rows == 1 || rows < FastllmCudaGetLinearExactBatchThreshold()) &&
+                   w.dataType == FLOAT32 && w.dataDevice == CUDA && w.cudaData &&
+                   w.dataDeviceIds == std::vector<int>{deviceId} && w.dims == std::vector<int>({256, 4096}) &&
+                   uintptr_t(w.cudaData) % 16 == 0;
+        if (eligible) {
+            auto &out = *input.router;
+            if ((FastllmCudaGraphIsCapturingFast() || out.isFake || out.cudaDataBorrowed) &&
+                (!out.cudaData || out.dataType != FLOAT32 || out.Count(0) != size_t(rows) * 256))
+                eligible = false;
+            if (eligible) {
+                out.dataType = FLOAT32;
+                out.UpdateUnitSize();
+                auto dims = input.hidden->dims;
+                dims.back() = 256;
+                out.Resize(dims);
+                out.ToDevice(CUDA, {deviceId}, false);
+                out.Allocate(false);
+            }
+        }
+    }
+    if (eligible && withRouter) {
+        const uintptr_t start = uintptr_t(input.router->cudaData);
+        const size_t bytes = size_t(rows) * 256 * sizeof(float);
+        auto disjoint = [&](const Data *d) {
+            if (!d || !d->cudaData || d->dims.empty())
+                return true;
+            const uintptr_t other = uintptr_t(d->cudaData);
+            // Paged cache cudaData is an int page table, not the logical KV
+            // tensor described by dims/strides. The physical pools are checked
+            // separately below. Keep real table aliases on the fallback path.
+            if (d->isPagedKVCache && d->pageLen <= 0) return false;
+            const size_t count = d->isPagedKVCache
+                ? (size_t(input.capacity) + d->pageLen - 1) / d->pageLen * sizeof(int)
+                : d->Count(0) * d->unitSize;
+            return start <= other ? other - start >= bytes : start - other >= count;
+        };
+        eligible = !(start % 16);
+        for (const Data *d : routerSources)
+            eligible = eligible && disjoint(d);
+        for (const auto &c : input.caches) {
+            eligible = eligible && disjoint(c.key) && disjoint(c.value);
+            if (c.key->isPagedKVCache)
+                eligible =
+                    eligible && disjoint(c.key->pagedKVCacheData) && disjoint(c.value->pagedKVCacheData);
+        }
+    }
+    if (eligible && prepared) {
+        for (Data *d : {input.hidden, input.feature, input.query, input.attention, input.projected,
+                        input.normed, input.router, &input.scratch->dsaLayer, &input.scratch->dsaFused})
+            if (d)
+                eligible = eligible && prepared->Disjoint(d->cudaData, d->Count(0) * d->unitSize);
+    }
+    // Every rank participates even when a local weight/cache/layout rejects.
+    // The all-rank decision is complete before the fused writer is launched.
+    CustomArRankData *registered = nullptr;
+    if (!FindOrRegisterCustomArPointers(state, rank, input.projected ? input.projected->cudaData : nullptr,
+                                        rows >= 1 && rows <= 16 ? rows * 4096 : 0, BFLOAT16, eligible,
+                                        registered))
+        return false;
+    auto status =
+        state.swaOutput->LaunchDsa(args, rank, (const float *)input.postNorm->cudaData,
+                                   withRouter ? (const float *)input.routerWeight->cudaData : nullptr,
+                                   withRouter ? (float *)input.router->cudaData : nullptr, prepared, deferPostNorm && !withRouter);
+    if (status != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        throw std::runtime_error(std::string("DSA layer launch failed: ") + cudaGetErrorString(status));
+    }
+    return true;
+}
+#endif
 
 bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
         const float *weight, void *output, int count, int channels,

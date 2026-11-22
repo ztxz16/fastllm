@@ -682,6 +682,7 @@ static void InitMultiCudaLocalTensorMeta(const fastllm::Data &src, fastllm::Data
     dst.name = src.name;
     dst.isModelWeight = src.isModelWeight;
     dst.directMemory = src.directMemory;
+    dst.cudaRepackSource = src.cudaRepackSource;
     dst.group = src.group;
     dst.groupCnt = src.groupCnt;
     dst.blockK = src.blockK;

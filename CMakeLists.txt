@@ -1045,6 +1045,19 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         NAIVERT_DSA_INDEX_HEADS=16
         NAIVERT_MLA_ROWS_ENABLE_PHASE_TIMERS=0)
     set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
+    add_library(fastllm_naive_dsa_fused OBJECT src/devices/cuda/models/naive-n05-dsa-fused.cu
+        src/devices/cuda/models/naive-n05-dsa-layer.cu)
+    set_target_properties(fastllm_naive_dsa_fused PROPERTIES
+        CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(fastllm_naive_dsa_fused BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_dsa/include"
+        "${FASTLLM_CUTLASS_DIR}/include")
+    target_compile_options(fastllm_naive_dsa_fused PRIVATE
+        "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
+        "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
+    set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DSA_FUSED)
+    list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_dsa_fused>)
     add_library(fastllm_shared_flex_sm103 OBJECT
         src/devices/cuda/moe/fastllm-shared-flex-ep.cu
         src/devices/cuda/moe/fastllm-shared-flex-tp.cu)
@@ -2683,11 +2696,55 @@ if (UNIT_TEST)
         target_link_libraries(naive_n05_swa_verify_test PRIVATE fastllm)
         add_test(NAME naive_n05_swa_verify COMMAND naive_n05_swa_verify_test)
         set_tests_properties(naive_n05_swa_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
-        if ("src/devices/cuda/models/naive-n05-qkv.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES)
+        if (NOT USE_ROCM)
+            add_executable(naive_n05_prepared_router_test test/basic/test_cuda_naive_prepared_router.cu)
+            target_link_libraries(naive_n05_prepared_router_test PRIVATE fastllm)
+            add_test(NAME naive_n05_prepared_router COMMAND naive_n05_prepared_router_test)
+            set_tests_properties(naive_n05_prepared_router PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+            add_executable(naive_n05_swa_admission_test test/basic/test_cuda_naive_swa_admission.cu)
+            target_link_libraries(naive_n05_swa_admission_test PRIVATE fastllm)
+            add_test(NAME naive_n05_swa_admission COMMAND naive_n05_swa_admission_test)
+            set_tests_properties(naive_n05_swa_admission PROPERTIES LABELS cuda TIMEOUT 60)
+            add_executable(naive_n05_swa_output_test test/basic/test_cuda_naive_swa_output.cpp
+                test/basic/test_cuda_naive_swa_output_mailbox.cu)
+            target_link_libraries(naive_n05_swa_output_test PRIVATE fastllm)
+            target_include_directories(naive_n05_swa_output_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME naive_n05_swa_output COMMAND naive_n05_swa_output_test)
+            add_test(NAME naive_n05_swa_output_disabled COMMAND naive_n05_swa_output_test --disabled)
+            add_test(NAME naive_n05_swa_output_mma COMMAND naive_n05_swa_output_test --mma)
+            add_test(NAME naive_n05_swa_output_mma_disabled COMMAND naive_n05_swa_output_test --mma --disabled)
+            set_tests_properties(naive_n05_swa_output naive_n05_swa_output_disabled
+                naive_n05_swa_output_mma naive_n05_swa_output_mma_disabled PROPERTIES
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 480)
+            add_executable(naive_n05_swa_verify_layer_test test/basic/test_cuda_naive_swa_verify_layer.cpp)
+            target_link_libraries(naive_n05_swa_verify_layer_test PRIVATE fastllm)
+            target_include_directories(naive_n05_swa_verify_layer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME naive_n05_swa_verify_layer COMMAND naive_n05_swa_verify_layer_test)
+            add_test(NAME naive_n05_swa_verify_layer_disabled COMMAND naive_n05_swa_verify_layer_test --disabled)
+            add_test(NAME naive_n05_swa_verify_layer_qkv_disabled COMMAND naive_n05_swa_verify_layer_test --qkv-disabled)
+            add_test(NAME naive_n05_swa_verify_layer_core_disabled COMMAND naive_n05_swa_verify_layer_test --core-disabled)
+            set_tests_properties(naive_n05_swa_verify_layer naive_n05_swa_verify_layer_disabled
+                naive_n05_swa_verify_layer_qkv_disabled naive_n05_swa_verify_layer_core_disabled PROPERTIES
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 480)
+            add_executable(naive_n05_swa_layer_test test/basic/test_cuda_naive_swa_layer.cpp)
+            target_link_libraries(naive_n05_swa_layer_test PRIVATE fastllm)
+            target_include_directories(naive_n05_swa_layer_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME naive_n05_swa_layer COMMAND naive_n05_swa_layer_test)
+            add_test(NAME naive_n05_swa_layer_disabled COMMAND naive_n05_swa_layer_test --disabled)
+            set_tests_properties(naive_n05_swa_layer naive_n05_swa_layer_disabled PROPERTIES
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+        endif()
+        if ("src/devices/cuda/models/naive-n05-qkv.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES OR
+            "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
             add_executable(naive_n05_qkv_test test/basic/test_cuda_naive_qkv.cu)
             target_link_libraries(naive_n05_qkv_test PRIVATE fastllm)
             add_test(NAME naive_n05_qkv COMMAND naive_n05_qkv_test)
-            set_tests_properties(naive_n05_qkv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+            add_test(NAME naive_n05_swa_qkv_attention COMMAND naive_n05_qkv_test --attention)
+            add_test(NAME naive_n05_swa_qkv_attention_disabled COMMAND naive_n05_qkv_test --attention-disabled)
+            add_test(NAME naive_n05_swa_qkv_attention_core_disabled COMMAND naive_n05_qkv_test --attention-core-disabled)
+            set_tests_properties(naive_n05_qkv naive_n05_swa_qkv_attention
+                naive_n05_swa_qkv_attention_disabled naive_n05_swa_qkv_attention_core_disabled
+                PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         endif()
         if (NOT USE_ROCM)
             if (TARGET fastllm_shared_flex_sm103)
@@ -2741,6 +2798,17 @@ if (UNIT_TEST)
         target_include_directories(naive_n05_attention_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_attention COMMAND naive_n05_attention_test)
         set_tests_properties(naive_n05_attention PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+
+        add_executable(naive_n05_dsa_front_test test/basic/test_naive_n05_dsa_front.cpp)
+        target_link_libraries(naive_n05_dsa_front_test PRIVATE fastllm)
+        target_include_directories(naive_n05_dsa_front_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_dsa_front COMMAND naive_n05_dsa_front_test)
+        set_tests_properties(naive_n05_dsa_front PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_executable(naive_n05_dsa_split_test test/basic/test_naive_n05_dsa_split.cpp)
+        target_link_libraries(naive_n05_dsa_split_test PRIVATE fastllm)
+        target_include_directories(naive_n05_dsa_split_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME naive_n05_dsa_split COMMAND naive_n05_dsa_split_test)
+        set_tests_properties(naive_n05_dsa_split PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
 
         add_executable(naive_n05_topk_fused_test test/basic/test_naive_n05_topk_fused.cu)
         set_target_properties(naive_n05_topk_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
@@ -3568,6 +3636,45 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_decode_graph COMMAND naive_n05_decode_graph_test)
         set_tests_properties(naive_n05_decode_graph PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "DECODE GRAPH PASS")
+
+        if (TARGET fastllm_naive_dsa_fused)
+            add_executable(naive_n05_dsa_topk_test test/basic/test_naive_n05_dsa_topk.cu)
+            target_link_libraries(naive_n05_dsa_topk_test PRIVATE fastllm)
+            target_include_directories(naive_n05_dsa_topk_test BEFORE PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_dsa/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda/models"
+                "${FASTLLM_CUTLASS_DIR}/include")
+            set_target_properties(naive_n05_dsa_topk_test PROPERTIES
+                CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            target_compile_options(naive_n05_dsa_topk_test PRIVATE
+                "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
+                "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
+            add_test(NAME naive_n05_dsa_topk COMMAND naive_n05_dsa_topk_test)
+            set_tests_properties(naive_n05_dsa_topk PROPERTIES
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                PASS_REGULAR_EXPRESSION "DSA TOPK PASS")
+            add_executable(naive_n05_dsa_layer_test test/basic/test_naive_n05_dsa_layer.cu)
+            target_link_libraries(naive_n05_dsa_layer_test PRIVATE fastllm Threads::Threads)
+            set_target_properties(naive_n05_dsa_layer_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            foreach(format bf16 fp8)
+                foreach(mode local mixed streams tp router)
+                    add_test(NAME naive_n05_dsa_layer_${format}_${mode} COMMAND naive_n05_dsa_layer_test ${format} ${mode})
+                    set_tests_properties(naive_n05_dsa_layer_${format}_${mode} PROPERTIES
+                        LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240
+                        PASS_REGULAR_EXPRESSION "DSA LAYER PASS")
+                endforeach()
+            endforeach()
+            add_executable(naive_n05_dsa_fused_test test/basic/test_naive_n05_dsa_fused.cu)
+            target_link_libraries(naive_n05_dsa_fused_test PRIVATE fastllm)
+            target_include_directories(naive_n05_dsa_fused_test PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_dsa/include")
+            set_target_properties(naive_n05_dsa_fused_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            add_test(NAME naive_n05_dsa_fused_bf16 COMMAND naive_n05_dsa_fused_test bf16)
+            add_test(NAME naive_n05_dsa_fused_fp8 COMMAND naive_n05_dsa_fused_test)
+            set_tests_properties(naive_n05_dsa_fused_bf16 naive_n05_dsa_fused_fp8 PROPERTIES
+                LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
+                PASS_REGULAR_EXPRESSION "FUSED DSA PASS")
+        endif()
 
         add_executable(naive_n05_dsa_batch_test test/basic/test_naive_n05_dsa_batch.cpp)
         target_link_libraries(naive_n05_dsa_batch_test PRIVATE fastllm)
