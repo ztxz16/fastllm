@@ -764,7 +764,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
     } else if (pdPrefillOnly && !graphDecode && !verifying && batch && !batch->Decode() &&
                AttentionTPSize() == 1 && !sparseKv && !hostPrefixCache && !tpPagedCaches.empty()) {
         auto run = [&] { state.runtime.Run(forwardRank); };
-        RunWithPDPrefillLookahead(run, [&](const auto &rows, int spare) { PreparePDPrefillTables(rows, spare); });
+        RunWithPDPrefillLookahead(run, [&](const auto &rows, int spare) { PreparePDPrefillTables(rows, spare); },
+                                  !HasSeparateIndexer() && !kvMemConfig.enabled);
     } else state.runtime.Run(forwardRank);
     if (graphDecode) {
         tpDecodeState->warmed = true;

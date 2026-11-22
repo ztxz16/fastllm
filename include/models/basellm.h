@@ -179,6 +179,7 @@ namespace fastllm {
         void Init(int blocks, DataType dataType, DataType kvCacheDataType);
         void TryRecord(basellm *model);
         void TryRecordPagedCache(basellm *model);
+        void PublishPagedCacheTables(basellm *model);
     };
 
     struct ResponseContextDict {
@@ -872,7 +873,10 @@ namespace fastllm {
             return available.at(PDRequestGroup(context)) >= required;
         }
         virtual bool HasPDResidentPrefixCache() const { return false; }
-        void RunWithPDPrefillLookahead(const std::function<void()> &forward, const PDPrefillPageBuilder &build);
+        // Opt in only if the completed request's FULL descriptors and cache
+        // hooks are safe for a CPU publication worker until packing starts.
+        void RunWithPDPrefillLookahead(const std::function<void()> &forward, const PDPrefillPageBuilder &build,
+                                       bool independentFullPublication = false);
         int RestorePDResidentPrefix(ResponseContext *context);
         int RestorePDResidentPrefix(ResponseContext *context, int *fullMatch);
         int RestorePDResidentPrefix(ResponseContext *context, int *fullMatch, PDResidentPrefixHints *hints);

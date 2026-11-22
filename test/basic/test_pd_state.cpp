@@ -1435,14 +1435,16 @@ static void TestDeferredPDResidentRestore() {
     std::cout << "PASS PD deferred restore completion and failure isolation\n";
 }
 
-// Two real RPCs arrive while the previous forward is held. Its publication
-// extends their prefix from one page to two before either can execute.
-static void TestPDPrefillLookahead() {
+// Two RPCs arrive during the previous forward. A blocked publication extends
+// only matching prompts. Independent rows must run even in a mixed batch.
+static void TestPDPrefillLookahead(int independentRows, bool saturated = true) {
     struct Model : BatchStateModel {
         PagedCacheManager pool;
         std::vector<int> pages;
+        int independentRowsExpected = 0;
         std::atomic<int> planned{0}, confirmed{0};
         std::atomic<bool> running{false}, published{false};
+        std::atomic<bool> publishing{false}, allowPublish{false}, secondForward{false};
         using basellm::ShutdownRuntime;
         ~Model() override { ShutdownRuntime(); }
         int PDGroupCount() const override { return 2; }
@@ -1453,7 +1455,13 @@ static void TestPDPrefillLookahead() {
             return {{-1, const_cast<PagedCacheManager *>(&pool)}};
         }
         int Forward(const Data &, const Data &, const Data &, std::vector<std::pair<Data, Data>> &,
-                    const GenerationConfig &, const LastTokensManager &, std::vector<float> *) override { return 0; }
+                    const GenerationConfig &, const LastTokensManager &, std::vector<float> *) override {
+            if (!allowPublish) {
+                Check(independentRowsExpected == 1, "dependent singleton entered target before publication");
+                secondForward = true;
+            }
+            return 0;
+        }
         std::vector<int> ForwardBatch(int batch, const Data &, const std::vector<Data *> &,
                 const std::vector<Data *> &, const std::vector<int> &, std::vector<std::pair<Data *, Data *>> &,
                 const std::vector<GenerationConfig> &, const LastTokensManager &,
@@ -1472,20 +1480,36 @@ static void TestPDPrefillLookahead() {
                         ++planned;
                     }
                 }
-            });
+            }, true);
+            else if (!allowPublish) {
+                Check(batch == independentRowsExpected, "dependent row entered target before publication");
+                secondForward = true;
+            }
             return std::vector<int>(batch);
         }
-        fastkv::Message ExportPDState(ResponseContext &ctx) override {
-            if (ctx.allTokens.back() < 20) {
+        bool TryRecordPagedPrefixCacheExtra(ResponseContext *ctx) override {
+            if (ctx->allTokens.back() < 20) {
+                publishing = true;
+                for (int i = 0; i < 4000 && !allowPublish; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                Check(allowPublish, "stalled background FULL publication");
                 pool.Record({1,2,3,4,5,6,7,8}, pages);
                 published = true;
-            } else {
-                Check(ctx.pdCachedInputTokens == 8, "lookahead missed a newly published prefix");
-                ++confirmed;
             }
-            return {};
+            return false;
+        }
+        std::function<fastkv::Message()> PreparePDExport(ResponseContext &ctx) override {
+            return [this, &ctx] {
+                Check(published, "packed a request before its FULL publication");
+                if (ctx.allTokens.back() >= 20) {
+                    Check(ctx.pdCachedInputTokens == (ctx.allTokens[4] == 15 ? 4 : 8), "dependent admission missed published prefix");
+                    ++confirmed;
+                }
+                return fastkv::Message{};
+            };
         }
     } model;
+    model.independentRowsExpected = independentRows;
     const int oldPage = GetPageLen(), oldTokens = GetMaxTokens();
     SetPageLen(4); SetMaxTokens(96);
     model.maxBatch = 8; model.residentHistory = true;
@@ -1496,27 +1520,35 @@ static void TestPDPrefillLookahead() {
     fastkv::Service port;
     port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
     const auto endpoint = port.Address(); port.Stop();
-    Check(model.SetPrefillBatching(16, 100, 2, 2), "configure overlap test");
+    Check(model.SetPrefillBatching(16, 100, 2, saturated ? 2 : 4), "configure overlap test");
     model.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","overlap"},{"transport","tcp"},
-        {"listen",endpoint},{"chunk_tokens",8},{"max_requests_per_rank",1},{"max_new_tokens_per_rank",8},
+        {"listen",endpoint},{"chunk_tokens",8},{"max_requests_per_rank",saturated ? 1 : 2},{"max_new_tokens_per_rank",8},
         {"cache_kv_bytes",0},{"cache_swa_bytes",0}});
     fastkv::Options options; options.transport = fastkv::Transport::Tcp;
     fastkv::Service client(options);
     auto call = [&](int last) {
         fastkv::Writer writer; writer.U32(1); writer.String("overlap:gpu-state-v2:test-recurrent-state-v1");
-        writer.Ints({1,2,3,4,5,6,7,8,last});
+        writer.Ints({1,2,3,4,last >= 20 && last < 20 + independentRows ? 15 : 5,6,7,8,last});
         return client.Submit(endpoint, {std::move(writer.bytes), {}});
     };
     auto a = call(10), b = call(11);
     for (int i = 0; i < 2000 && !model.running; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     Check(model.running, "first forward missing");
     auto c = call(20), d = call(21);
+    for (int i = 0; i < 3000 && !model.publishing; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Check(model.publishing, "completed batch never started FULL publication");
+    if (saturated && independentRows) {
+        for (int i = 0; i < 2000 && !model.secondForward; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool enteredBeforePublish = model.secondForward;
+    model.allowPublish = true;
     a.get(); b.get(); c.get(); d.get();
+    Check(enteredBeforePublish == (saturated && independentRows > 0), "wrong dependency on blocked FULL publication");
     model.ShutdownRuntime(); model.pool.ReleasePageIndices(model.pages);
     Check(model.confirmed == 2 && model.live == 0 && model.pool.FreePageCount() == model.pool.maxPages,
           "lookahead leaked request, grant or page");
     SetPageLen(oldPage); SetMaxTokens(oldTokens);
-    std::cout << "PASS PD prefill lookahead overlap and late prefix revalidation\n";
+    std::cout << "PASS PD prefill lookahead and gated publication, independent rows=" << independentRows << ", saturated=" << saturated << "\n";
 }
 
 static void TestPDResidentPrefixHints() {
@@ -1573,7 +1605,10 @@ int main(int argc, char **argv) {
         }
         TestPDResidentPrefixHints();
         TestDeferredPDResidentRestore();
-        TestPDPrefillLookahead();
+        TestPDPrefillLookahead(0);
+        TestPDPrefillLookahead(1);
+        TestPDPrefillLookahead(2);
+        TestPDPrefillLookahead(2, false);
         TestAdmissionLifetime();
         CheckLegacySessionPeer();
         CheckLegacySessionPeer(true);

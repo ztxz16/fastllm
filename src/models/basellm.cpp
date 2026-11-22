@@ -757,10 +757,16 @@ namespace fastllm {
         inference_trace::DetailSpan recordTrace("record.model_history", detail);
         if (model->kvMemConfig.enabled && !model->SupportsKvMemPrefixCache()) return;
         if (model->DeferHistoryCacheRestore()) model->TryRecordResponseContext(this);
+        recordTrace.Stop();
+        PublishPagedCacheTables(model);
+    }
+
+    void ResponseContext::PublishPagedCacheTables(basellm *model) {
+        auto *detail = inference_trace::CurrentDetail();
+        inference_trace::DetailSpan recordTrace("record.descriptor_scan", detail);
         if (!this->multimodalInput.empty()) {
             return;
         }
-        recordTrace.Next("record.descriptor_scan");
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {

@@ -486,6 +486,7 @@ struct PDRuntime {
         double prefixRecordMs = 0;
         std::function<fastkv::Message()> pack;
         int exportGroup = 0;
+        size_t publicationOrder = 0;
         std::atomic<bool> exportFinished{false};
         std::chrono::steady_clock::time_point exportQueued;
         int affinity = -1;
@@ -641,7 +642,7 @@ struct PDRuntime {
         return result;
     }
     void RunPrefill(basellm &model);
-    std::function<void(const PDPrefillPageBuilder &, const std::atomic<bool> &)> prepareNext;
+    std::function<void(const PDPrefillPageBuilder &, const std::atomic<bool> &, bool)> prepareNext;
     void FlushAnnouncements() {
         if (!probes) return;
         std::lock_guard<std::mutex> lock(announceMutex);
@@ -786,6 +787,67 @@ struct PDRuntime {
     }
 };
 
+namespace {
+// Completed FULL tables publish in FIFO order within each owner. The scheduler
+// checks the producer's ticket before admitting a row that can reuse its prefix.
+class PrefixPublicationLane {
+    using Request = std::shared_ptr<PDRuntime::PrefillRequest>;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Request> queue;
+    size_t submitted = 0, completed = 0;
+    bool closing = false;
+    std::thread worker;
+
+public:
+    template <class Publish>
+    size_t Submit(const Request &request, const Publish &publish) {
+        if (!worker.joinable()) {
+            try {
+                worker = std::thread([this, publish] {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    for (;;) {
+                        cv.wait(lock, [&] { return closing || !queue.empty(); });
+                        if (queue.empty()) return;
+                        Request next = std::move(queue.front());
+                        queue.pop_front();
+                        lock.unlock();
+                        publish(next);
+                        lock.lock();
+                        ++completed;
+                        cv.notify_all();
+                    }
+                });
+            } catch (const std::system_error &) {
+                publish(request);
+                return 0;
+            }
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        queue.push_back(request);
+        cv.notify_all();
+        return ++submitted;
+    }
+
+    bool Published(size_t ticket) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return completed >= ticket;
+    }
+
+    void Wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return completed == submitted; });
+    }
+
+    ~PrefixPublicationLane() {
+        if (!worker.joinable()) return;
+        { std::lock_guard<std::mutex> lock(mutex); closing = true; }
+        cv.notify_all();
+        worker.join();
+    }
+};
+} // namespace
+
 int basellm::PDBranchCheckpointEnd(const Data &key) const {
     if (!pdRuntime) return 0;
     const auto it = pdRuntime->branchCheckpoints.find(&key);
@@ -810,17 +872,21 @@ void PDPrefillPagePlan::Trim(int end) {
             local.pageIndex.pop_back();
         }
     }
-    tables.clear();
+    *this = {};
 }
 
-void basellm::RunWithPDPrefillLookahead(const std::function<void()> &forward, const PDPrefillPageBuilder &build) {
+void basellm::RunWithPDPrefillLookahead(const std::function<void()> &forward, const PDPrefillPageBuilder &build,
+                                       bool independentFullPublication) {
     if (!pdRuntime || !pdRuntime->prepareNext) { forward(); return; }
     std::atomic<bool> done{false};
     auto &runtime = *pdRuntime;
     auto prepare = std::move(runtime.prepareNext);
     std::future<void> planner;
-    try { planner = std::async(std::launch::async, [&] { prepare(build, done); }); }
-    catch (const std::system_error &) { forward(); return; }
+    try { planner = std::async(std::launch::async, [&] { prepare(build, done, independentFullPublication); }); }
+    catch (const std::system_error &) {
+        forward();
+        return;
+    }
     auto finish = [&] {
         { std::lock_guard<std::mutex> lock(runtime.prefillMutex); done = true; }
         runtime.prefillCV.notify_all();
@@ -865,26 +931,7 @@ void PDRuntime::RunPrefill(basellm &model) {
             return count;
         }
     };
-    AdmissionBudget *admissionBudget = nullptr;
     std::vector<Request> published;
-    auto canPrepare = [&](size_t group, size_t count) {
-        const auto &rank = ranks[group];
-        const size_t candidates = rank.active.size() + rank.prepared.size();
-        if (admissionBudget && !admissionBudget->Fits(group)) return false;
-        return candidates < size_t(rankRequests) || (residentPrefix && candidates < rankContextLimit &&
-            rank.preparedTokens <= prepareBudget && count <= prepareBudget - rank.preparedTokens);
-    };
-    auto canAdmitFrom = [&](size_t lane, int affinity, size_t count) {
-        auto fits = [&](size_t group) {
-            return canPrepare(group, count) && count <= tokenCapacity - groupTokens[group]->Used();
-        };
-        if (affinity >= 0) return fits(affinity);
-        // A deferred anonymous request can still move if its owner's KV budget fills.
-        if (lane < ranks.size() && !canPrepare(lane, count)) return false;
-        for (size_t group = 0; group < ranks.size(); ++group)
-            if (fits(group)) return true;
-        return false;
-    };
     auto startHostRestore = [&](const Request &request) {
         auto placement = PDReceivePlacement(request->hostHit.Metadata(), request->hostHit.Payloads(), model.PDRequestDevices(*request->context));
         if (placement.empty()) placement.assign(request->hostHit.Payloads(), -1);
@@ -919,6 +966,7 @@ void PDRuntime::RunPrefill(basellm &model) {
     std::deque<Request> readyToPack;
     std::thread exportThread;
     std::atomic<bool> closeExports{false};
+    uint64_t exportGeneration = 0; // protected by prefillMutex
     const auto cancelled = std::make_exception_ptr(std::runtime_error("FastKV PD: request cancelled"));
     auto recordPrefix = [&](const Request &request) {
         if (!residentPrefix) return;
@@ -1010,17 +1058,52 @@ void PDRuntime::RunPrefill(basellm &model) {
                 it = pending.erase(it);
                 progressed = true;
             }
-            if (progressed) prefillCV.notify_one();
+            if (progressed) {
+                { std::lock_guard<std::mutex> lock(prefillMutex); ++exportGeneration; }
+                prefillCV.notify_one();
+            }
             else if (!pending.empty() && !stopping && !closeExports) {
                 try { exportPool->WaitForRelease(); }
                 catch (const std::runtime_error &) { return; } // StopPrefill closed the pool.
             }
         }
     };
-    auto startExport = [&](const Request &request) {
-        recordPrefix(request);
+    auto queuePack = [&](const Request &request) {
+        { std::lock_guard<std::mutex> lock(exportMutex); readyToPack.push_back(request); }
+        exportCV.notify_one();
+    };
+    auto publish = [&](const Request &request) {
+        try {
+            const auto begin = std::chrono::steady_clock::now();
+            request->context->PublishPagedCacheTables(&model);
+            request->prefixRecordMs += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count();
+            queuePack(request);
+        } catch (...) {
+            request->result.set_exception(std::current_exception());
+            request->exportFinished.store(true, std::memory_order_release);
+        }
+    };
+    std::vector<PrefixPublicationLane> lanes(std::min(groups, std::max(1, GetThreads())));
+    auto laneFor = [&](const Request &request) -> PrefixPublicationLane & {
+        return lanes[request->exportGroup % lanes.size()];
+    };
+    bool hasPublications = false;
+    auto finishPublication = [&] {
+        if (!hasPublications) return;
+        for (auto &lane : lanes) lane.Wait();
+        hasPublications = false;
+    };
+    auto startExport = [&](const Request &request, bool staged) {
+        if (staged) {
+            const auto begin = std::chrono::steady_clock::now();
+            if (model.DeferHistoryCacheRestore()) model.TryRecordResponseContext(request->context.get());
+            request->prefixRecordMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count();
+        } else recordPrefix(request);
         request->pack = model.PreparePDExport(*request->context);
         if (!request->pack) {
+            if (staged) request->context->PublishPagedCacheTables(&model);
             try {
                 complete(request, nullptr);
             } catch (const fastkv::CapacityBusy &) {
@@ -1034,13 +1117,39 @@ void PDRuntime::RunPrefill(basellm &model) {
         if (!exportThread.joinable()) exportThread = std::thread(runExports);
         exporting.push_back(request);
         try {
-            std::lock_guard<std::mutex> lock(exportMutex);
-            readyToPack.push_back(request);
+            if (staged) {
+                request->publicationOrder = laneFor(request).Submit(request, publish);
+                if (request->publicationOrder) hasPublications = true;
+            } else queuePack(request);
         } catch (...) {
             exporting.pop_back();
             throw;
         }
-        exportCV.notify_one();
+    };
+    // The scheduling lane, including its joined lookahead, owns retirement.
+    // A background pass handles fully packed sources only. A legacy export
+    // that still needs transfer credit stays on the ordinary completion path.
+    auto reapExports = [&](bool retryPending) {
+        for (auto it = exporting.begin(); it != exporting.end();) {
+            const auto request = *it;
+            if (request->pack) {
+                if (request->exportFinished.load(std::memory_order_acquire)) {
+                    retire(request);
+                    it = exporting.erase(it);
+                } else ++it;
+                continue;
+            }
+            if (!retryPending) { ++it; continue; }
+            try {
+                if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
+                complete(request, nullptr);
+            } catch (const fastkv::CapacityBusy &) { ++it; continue; }
+            catch (...) {
+                auto error = std::current_exception();
+                retire(request); request->result.set_exception(error);
+            }
+            it = exporting.erase(it);
+        }
     };
     auto drainInput = [&] {
         std::lock_guard<std::mutex> queueLock(prefillMutex);
@@ -1055,9 +1164,27 @@ void PDRuntime::RunPrefill(basellm &model) {
             waiting.pop_front();
         }
     };
-    auto admit = [&](bool early) {
+    auto admit = [&](AdmissionBudget *budget) {
+        auto canPrepare = [&](size_t group, size_t count) {
+            const auto &rank = ranks[group];
+            const size_t candidates = rank.active.size() + rank.prepared.size();
+            if (budget && !budget->Fits(group)) return false;
+            return candidates < size_t(rankRequests) || (residentPrefix && candidates < rankContextLimit &&
+                rank.preparedTokens <= prepareBudget && count <= prepareBudget - rank.preparedTokens);
+        };
+        auto canAdmitFrom = [&](size_t lane, int affinity, size_t count) {
+            auto fits = [&](size_t group) {
+                return canPrepare(group, count) && count <= tokenCapacity - groupTokens[group]->Used();
+            };
+            if (affinity >= 0) return fits(affinity);
+            // A deferred anonymous request can still move if its owner's KV budget fills.
+            if (lane < ranks.size() && !canPrepare(lane, count)) return false;
+            for (size_t group = 0; group < ranks.size(); ++group)
+                if (fits(group)) return true;
+            return false;
+        };
         auto fail = [&](const Request &request, std::exception_ptr error) {
-            if (early && !request->cancellation->Cancelled()) {
+            if (budget && !request->cancellation->Cancelled()) {
                 try { std::rethrow_exception(error); }
                 catch (const CudaWorkspaceExhausted &) {
                     const size_t lane = request->affinity < 0 ? groups : request->affinity;
@@ -1206,8 +1333,8 @@ void PDRuntime::RunPrefill(basellm &model) {
                     context.preTokens = hit.tokens;
                     context.allTokens = request->input;
                 }
-                request->ahead = early;
-                if (early) admissionBudget->Charge(owner, std::min<size_t>(chunk, request->input.size() - context.preTokens));
+                request->ahead = budget != nullptr;
+                if (budget) budget->Charge(owner, std::min<size_t>(chunk, request->input.size() - context.preTokens));
                 context.pdCachedInputTokens = context.preTokens;
                 request->SetRemaining(request->input.size() - context.preTokens);
                 if (model.verbose) {
@@ -1285,44 +1412,37 @@ void PDRuntime::RunPrefill(basellm &model) {
             // wait for the model or hold forwardLocker.
             std::unique_lock<std::mutex> lock(model.forwardLocker);
             drainInput();
-            // Completed contexts retain their pages and admission while waiting
-            // for a whole-message export reservation. Other requests can still
-            // forward; no owner worker waits on a transport buffer lease.
-            for (auto it = exporting.begin(); it != exporting.end();) {
-                const auto request = *it;
-                if (request->pack) {
-                    if (request->exportFinished.load(std::memory_order_acquire)) {
-                        retire(request);
-                        it = exporting.erase(it);
-                    } else ++it;
-                    continue;
-                }
-                try {
-                    if (request->cancellation->Cancelled()) std::rethrow_exception(cancelled);
-                    complete(request, nullptr);
-                } catch (const fastkv::CapacityBusy &) { ++it; continue; }
-                catch (...) {
-                    auto error = std::current_exception();
-                    retire(request); request->result.set_exception(error);
-                }
-                it = exporting.erase(it);
-            }
+            reapExports(true);
+            bool deferredPublication = false;
             for (auto &rank : ranks) for (auto *queue : {&rank.active, &rank.prepared}) {
                 for (auto it = queue->begin(); it != queue->end();) {
                     const auto request = *it;
-                    if (!request->ahead || request->cancellation->Cancelled()) { ++it; continue; }
+                    if (request->cancellation->Cancelled() || (!request->ahead &&
+                        (!hasPublications || request->context->preTokens != request->context->pdCachedInputTokens))) {
+                        ++it; continue;
+                    }
                     auto &ctx = *request->context;
                     bool stale = !request->pages.Valid(ctx.preTokens);
                     const size_t next = size_t(ctx.preTokens) + page;
+                    bool matchingSource = false;
                     if (!stale && next < request->input.size()) for (const auto &previous : published) {
+                        if (request->affinity >= 0 && previous->publicationOrder &&
+                            previous->exportGroup != request->affinity) continue;
                         if (previous->input.size() < next ||
                             !std::equal(request->input.begin() + ctx.preTokens, request->input.begin() + next,
                                         previous->input.begin() + ctx.preTokens) ||
                             !std::equal(request->input.begin(), request->input.begin() + ctx.preTokens,
                                         previous->input.begin())) continue;
-                        stale = model.PreviewPDResidentPrefix(request->input, request->affinity) > ctx.preTokens;
-                        if (stale) break;
+                        if (previous->publicationOrder && !laneFor(previous).Published(previous->publicationOrder)) {
+                            // Re-admit this row after its producer publishes. Other
+                            // ready rows can enter target while publication finishes.
+                            deferredPublication = stale = true;
+                            break;
+                        }
+                        matchingSource = true;
                     }
+                    if (!stale && matchingSource)
+                        stale = model.PreviewPDResidentPrefix(request->input, request->affinity) > ctx.preTokens;
                     if (!stale) { ++it; continue; }
                     if (queue == &rank.prepared) rank.preparedTokens -= request->reservation;
                     if (rank.branchProducer.lock() == request) rank.branchProducer.reset();
@@ -1390,7 +1510,19 @@ void PDRuntime::RunPrefill(basellm &model) {
                     }
                 }
             }
-            admit(false);
+            // Fresh admission must see every publication. If a dependent row
+            // was deferred, let any remaining ready row enter the target first.
+            const bool dispatchPrepared = hasPublications && (deferredPublication
+                ? std::any_of(ranks.begin(), ranks.end(), [](const RankQueue &rank) {
+                    return !rank.active.empty();
+                })
+                : std::all_of(ranks.begin(), ranks.end(), [&](const RankQueue &rank) {
+                    return rank.active.size() >= size_t(rankRequests);
+                }));
+            if (!dispatchPrepared) {
+                finishPublication();
+                admit(nullptr);
+            }
             // Cold requests can reach this queue before any peer publishes FULL KV.
             // Only split a real, page-aligned fork visible in the next forward.
             if (residentPrefix) for (auto &rank : ranks) {
@@ -1447,13 +1579,11 @@ void PDRuntime::RunPrefill(basellm &model) {
                 auto &request = *selected[i];
                 const int end = request.context->preTokens + lengths[i];
                 request.pages.Trim(end);
-                request.pages = {};
                 request.ahead = false;
             }
             for (int g = 0; g < groups; ++g) {
                 auto discard = [](const Request &r) {
-                    if (!r->pages.tables.empty()) r->pages.Trim(r->context->preTokens);
-                    r->pages = {};
+                    if (r->pages.context) r->pages.Trim(r->context->preTokens);
                 };
                 for (size_t i = sequences[g]; i < ranks[g].active.size(); ++i) discard(ranks[g].active[i]);
                 for (const auto &r : ranks[g].prepared) discard(r);
@@ -1498,8 +1628,20 @@ void PDRuntime::RunPrefill(basellm &model) {
                 PDRuntime &runtime;
                 ~ResetLookahead() { runtime.prepareNext = {}; }
             } reset{*this};
+            // Preserve the admission and cache-warming order while a burst
+            // ramps up. Use asynchronous retirement only on saturated forwards
+            // with existing resident prefixes and no new branch checkpoint.
+            bool publishInBackground = false;
+            const bool warmBatchFull = (batch == batchRequests || budget == 0) && branchCheckpoints.empty() &&
+                std::all_of(selected.begin(), selected.end(), [](const Request &row) {
+                    return row->context->pdCachedInputTokens > 0;
+                });
             if (batch > 1 && residentPrefix && groups > 1 && !hostCache && !cache) {
-                prepareNext = [&](const PDPrefillPageBuilder &build, const std::atomic<bool> &done) {
+                prepareNext = [&](const PDPrefillPageBuilder &build, const std::atomic<bool> &done, bool independentFullPublication) {
+                    publishInBackground = independentFullPublication && warmBatchFull;
+                    // The target is free to compute; admission for its successor
+                    // sees all prefix publications from the previous batch.
+                    finishPublication();
                     // The target owns only selected contexts until this callback joins.
                     // Its pages and checkpoint destinations have already been reserved.
                     AdmissionBudget next{std::vector<int>(groups, rankRequests),
@@ -1534,19 +1676,32 @@ void PDRuntime::RunPrefill(basellm &model) {
                         if (any) build(rows, (rankTokens + int(page) - 1) / int(page) + rankRequests);
                     };
                     planRows(); // Existing candidates precede fresh RPCs, including continuing chunks.
-                    while (!done && !stopping && liveContexts < contextLimit) {
+                    std::unique_lock<std::mutex> queueLock(prefillMutex);
+                    auto observedExports = exportGeneration;
+                    while (!done && !stopping) {
+                        queueLock.unlock();
                         bool room = false;
                         for (int g = 0; g < groups; ++g) room |= next.Fits(g);
-                        if (!room) break;
-                        drainInput();
-                        auto available = next;
-                        admissionBudget = &available;
-                        try { admit(true); }
-                        catch (...) { admissionBudget = nullptr; throw; }
-                        admissionBudget = nullptr;
-                        planRows();
-                        std::unique_lock<std::mutex> queueLock(prefillMutex);
-                        prefillCV.wait(queueLock, [&] { return done || stopping || !waiting.empty(); });
+                        const bool admitInput = room && liveContexts < contextLimit;
+                        if (admitInput) {
+                            drainInput();
+                            auto available = next;
+                            admit(&available);
+                            planRows();
+                        } else {
+                            // Reclaim only after the next batch has filled its
+                            // budget. Returning grants must not expand this
+                            // lookahead's admission window or alter cold routing.
+                            if (room || !publishInBackground || exporting.empty()) break;
+                            reapExports(false);
+                            if (exporting.empty()) break;
+                        }
+                        queueLock.lock();
+                        prefillCV.wait(queueLock, [&] {
+                            return done || stopping || (admitInput && !waiting.empty()) ||
+                                (!admitInput && exportGeneration != observedExports);
+                        });
+                        observedExports = exportGeneration;
                     }
                 };
             }
@@ -1583,6 +1738,9 @@ void PDRuntime::RunPrefill(basellm &model) {
                           << " queued=" << queued << " reserved_tokens=" << reserved
                           << " prepared_tokens=" << preparedTokens << std::endl;
             }
+            finishPublication(); // also covers a forward without the lookahead callback
+            const bool stageFull = publishInBackground &&
+                std::any_of(ranks.begin(), ranks.end(), [](const RankQueue &rank) { return !rank.prepared.empty(); });
             std::vector<Request> repairedBranches;
             for (int i = 0; i < batch; ++i) {
                 auto request = selected[i];
@@ -1609,7 +1767,7 @@ void PDRuntime::RunPrefill(basellm &model) {
                     continue;
                 }
                 try {
-                    startExport(request);
+                    startExport(request, stageFull);
                     if (residentPrefix && groups > 1) published.push_back(request);
                 } catch (...) {
                     auto error = std::current_exception();
@@ -1649,6 +1807,8 @@ void PDRuntime::RunPrefill(basellm &model) {
         throw std::runtime_error("FastKV PD: prefill cancelled by shutdown");
     } catch (...) {
         const auto error = std::current_exception();
+        // Drain publications before destroying the export lane or retiring sources.
+        lanes.clear();
         {
             std::lock_guard<std::mutex> lock(exportMutex);
             closeExports = true;
