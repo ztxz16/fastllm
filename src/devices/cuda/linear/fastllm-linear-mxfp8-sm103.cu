@@ -176,17 +176,18 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     const size_t scaleArea = (scaleCount + 255) & ~size_t(255);
     if (w.scales.size() != scaleCount) return false;
     const int device = FastllmCudaGetDevice();
-    // Look up the existing Linear lease without creating a handle, allocating
-    // a workspace or refilling the spare pool. CaptureWorkspace pins its owner.
-    auto *state = fastllm_bf16_lt::GetState(device, true);
-    if (!state) return false;
     const bool capturing = FastllmCudaGraphIsCapturing();
     const auto support = GetProjectionSupport(device, capturing);
     if (!support.smallRows || !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device)) return false;
-    auto *base = static_cast<uint8_t *>(capturing      ? fastllm_bf16_lt::CaptureWorkspace(*state)
-                                        : state->eager ? state->eager->data
-                                                       : nullptr);
-    size_t capacity = kWorkspace;
+    // Eager prefill can supply the entire workspace on a worker that has never
+    // run cuBLASLt. Graphs can only use storage pinned to the capture.
+    auto *state = fastllm_bf16_lt::GetState(device, true);
+    uint8_t *base = nullptr;
+    if (state) {
+        if (capturing) base = static_cast<uint8_t *>(fastllm_bf16_lt::CaptureWorkspace(*state));
+        else if (state->eager) base = static_cast<uint8_t *>(state->eager->data);
+    }
+    size_t capacity = base ? kWorkspace : 0;
     const auto *scratch = fastllm::CudaLinearScratchScope::Get();
     if (!capturing && rows >= 1024 && scratch && scratch->cudaData && !scratch->isFake &&
         !scratch->cudaDataBorrowed && (reinterpret_cast<uintptr_t>(scratch->cudaData) & 15) == 0 &&

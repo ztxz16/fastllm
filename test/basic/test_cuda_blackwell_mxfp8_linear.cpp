@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <future>
 #include <random>
 #include <stdexcept>
 #include <vector>
@@ -82,6 +83,17 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
     const bool quantized = !invalid && (m > 1 || wideGemv);
     Require(supported == quantized, "backend eligibility mismatch");
     Check(cudaDeviceSynchronize());
+    if (borrowScratch) {
+        // A serving worker may own prefill scratch without a thread-local cuBLASLt lease.
+        std::async(std::launch::async, [&] {
+            Check(cudaSetDevice(0));
+            CudaLinearScratchScope workerLoan(&scratch);
+            Check(cudaMemsetAsync(y.cudaData, 0, y.GetBytes(), cudaStreamPerThread));
+            Require(FastllmCudaMxfp8LinearSM103(x.cudaData, w, y.cudaData, m, k, n),
+                    "prefill worker rejected its own scratch");
+            Check(cudaStreamSynchronize(cudaStreamPerThread));
+        }).get();
+    }
     std::vector<uint16_t> eager;
     if (m >= 256 && n % 256 == 0) {
         eager.resize(size_t(m) * n);
