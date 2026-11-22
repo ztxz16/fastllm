@@ -3107,12 +3107,14 @@ bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
         uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
         return (x > y ? x - y : y - x) >= (size_t)count * 2;
     };
-    const bool eligible = aligned && FastllmCudaRuntimeArch() == 90 &&
+    const int arch = FastllmCudaRuntimeArch();
+    // The direct one-CTA-per-row kernel uses only portable packet loads and warp reductions.
+    const int rows = count / channels;
+    const bool eligible = aligned && ((rows <= 8 && arch >= 70) || arch == 90 || arch == 103) &&
         disjoint(data, residual) && disjoint(data, output) && disjoint(residual, output);
     CustomArRankData *pointers = nullptr;
     if (!FindOrRegisterCustomArPointers(state, rank, data, count, dataType,
                                       eligible, pointers)) return false;
-    const int rows = count / channels;
     auto *hidden = (CustomArNormBF16 *)residual;
     auto *normed = (CustomArNormBF16 *)output;
     const bool twoStage = CustomArUseTwoStage(state.devices.size(), (size_t)count * 2);

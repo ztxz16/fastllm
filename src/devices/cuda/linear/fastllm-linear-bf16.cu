@@ -1318,9 +1318,11 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
         // rounding and the unwarmed/unsupported fallbacks as well.
         // A single 4096-wide row with at most 2048 outputs is faster with the
         // native GEMV; Lt's split-K launch/reduction overhead dominates here.
+        // Wide SM103 heads also benefit from Lt at three through seven rows.
+        const int arch = FastllmCudaRuntimeArch();
         const bool useLt = n > 0 && m >= 1024 && k >= 1024 &&
             !(n == 1 && m == 4096 && k <= 2048) && bias.dims.empty() &&
-            FastllmCudaRuntimeArch() == 90;
+            (arch == 90 || (arch == 103 && n >= 3 && m >= 4096 && k >= 16384));
         if (!useLt || !fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
             LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
         }

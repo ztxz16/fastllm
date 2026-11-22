@@ -2470,6 +2470,12 @@ __global__ void FastllmGemvBF16FP8PairKernel(const __nv_bfloat16 *input,
         first ? bm0 : bm1, first ? bk0 : bk1, first ? blockIdx.x : blockIdx.x - blocks0);
 }
 
+static bool CanVectorizeBf16Fp8Rows(const __nv_bfloat16 *input, const uint8_t *weight, int m, int blockM) {
+    return m % 4 == 0 && blockM % 4 == 0 &&
+        reinterpret_cast<uintptr_t>(input) % alignof(uint2) == 0 &&
+        reinterpret_cast<uintptr_t>(weight) % alignof(uint32_t) == 0;
+}
+
 template <int PART>
 static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
         __nv_bfloat16 *input, uint8_t *weight, __nv_bfloat16 *output,
@@ -2480,9 +2486,7 @@ static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
     const bool alignedPowerOfTwoBlocks = m > 0 && k > 0 &&
         blockM > 0 && (blockM & (blockM - 1)) == 0 &&
         blockK > 0 && (blockK & (blockK - 1)) == 0 &&
-        m % 4 == 0 && blockM % 4 == 0 &&
-        reinterpret_cast<uintptr_t>(input) % alignof(uint2) == 0 &&
-        reinterpret_cast<uintptr_t>(weight) % 4 == 0;
+        CanVectorizeBf16Fp8Rows(input, weight, m, blockM);
     if (alignedPowerOfTwoBlocks) {
         if constexpr (PART == 2 || PART == 3) {
             // Short batches benefit from parallel input traversal with the
@@ -2518,9 +2522,7 @@ static void LaunchFastllmGemmBF16FP8E4M3SmallBatch(
         // Halving the resident warps wins when there is ample output-level
         // parallelism and each warp's two virtual halves stay short.  Keep
         // the 64-thread kernel for narrow or reduction-heavy projections.
-        if (k >= 2048 && m <= k / 2 && m % 4 == 0 && blockM % 4 == 0 &&
-            reinterpret_cast<uintptr_t>(input) % alignof(uint2) == 0 &&
-            reinterpret_cast<uintptr_t>(weight) % 4 == 0) {
+        if (k >= 2048 && m <= k / 2 && CanVectorizeBf16Fp8Rows(input, weight, m, blockM)) {
             constexpr int warpsPerBlock = 8;
             const int grid =
                 (k + warpsPerBlock - 1) / warpsPerBlock;
@@ -2609,8 +2611,12 @@ void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bf
         return;
     }
 
-    if (n > 1 &&
-        n < fastllm::FastllmCudaGetLinearExactBatchThreshold()) {
+    const bool exactBatch = n > 1 && n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
+    // The aligned MXFP8 small-row kernels reuse each weight across tokens
+    // while retaining the single-row dot product and compensated reduction.
+    const bool sharedExactTile = n <= 8 && blockM == 32 && blockK == 1 && m % 32 == 0 &&
+        CanVectorizeBf16Fp8Rows(input, weight, m, blockM);
+    if (exactBatch && !sharedExactTile) {
         if (n <= 65535) {
             FastllmGemvBF16FP8E4M3Kernel1MultiRow<64, 1, false>
                 <<<dim3(k, n), 64>>>(
@@ -2626,7 +2632,7 @@ void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bf
         }
         return;
     }
-    if (TryFastllmBlockFP8Batch(input, weight, output, bias, scales,
+    if (!exactBatch && TryFastllmBlockFP8Batch(input, weight, output, bias, scales,
             n, m, k, blockM, blockK)) return;
     // Bound register accumulators per CTA, not the logical batch. Reuse the
     // same tuned tile for every batch and dispatch its final partial tile.
