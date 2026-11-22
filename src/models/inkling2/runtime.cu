@@ -11,8 +11,12 @@
 #include "attention/default_prefill_params.cuh"
 #include "attention/prefill.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <deque>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -23,6 +27,12 @@
 #include <random>
 #include <stdexcept>
 #include <type_traits>
+
+void FastllmCudaBf16ExactRows(const void *, const void *, void *, int, int, int);
+void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, int, int, int);
+
+bool LaunchFastllmGroupedBf16Projection(const __nv_bfloat16 *const *, const __nv_bfloat16 *, __nv_bfloat16 *,
+                                      int, int, const int *);
 
 namespace fastllm {
 namespace inkling2 {
@@ -145,28 +155,42 @@ __global__ void conv(const float *x, const float *history, const float *weight, 
 #include "paged-kv.cuh"
 #include "attention.cuh"
 #include "prefill.cuh"
-template <typename T, typename U> __device__ float updateConvChannel(const T *input, const DecodeVisit *visit, int index,
-                           const float *weight, const U *dynamic, int d, int taps, int heads, int c) {
+template <bool Timeline = false, typename T, typename U> __device__ float updateConvChannel(const T *input, const DecodeVisit *visit, int index,
+                           const float *weight, const U *dynamic, int d, int taps, int heads, int c, int priorRows, int inputStride) {
     float *history = visit->history[index];
     float v = input[c];
     for (int t = 0; t < taps; ++t) {
-        float a = t ? history[(taps - 1 - t) * d + c] : float(input[c]);
+        float a;
+        if constexpr (Timeline)
+            a = t <= priorRows ? float(input[c - ptrdiff_t(t) * inputStride]) : history[(taps - 1 - t) * d + c];
+        else
+            a = t ? history[(taps - 1 - t) * d + c] : float(input[c]);
         float w = dynamic ? weight[t * d + c] + float(dynamic[(c / (d / heads)) * taps + t])
                           : weight[c * taps + taps - 1 - t];
         v += a * w;
     }
-    for (int t = 0; t + 1 < taps - 1; ++t)
-        history[t * d + c] = history[(t + 1) * d + c];
-    if (taps > 1)
-        history[(taps - 2) * d + c] = input[c];
+    if constexpr (Timeline) {
+        history[(taps - 1) * d + c] = input[c];
+    } else {
+        for (int t = 0; t + 1 < taps - 1; ++t)
+            history[t * d + c] = history[(t + 1) * d + c];
+        if (taps > 1)
+            history[(taps - 2) * d + c] = input[c];
+    }
     return v * rsqrtf(1.0f + taps * (dynamic ? 2 : 1));
 }
-template <typename T> __global__ void decodeConv(const T *input, const DecodeVisit *visit, int index, const float *weight,
-                           const float *dynamic, float *output, int d, int taps, int heads, const float *residual) {
+template <bool Timeline = false, typename T> __global__ void decodeConv(const T *input, const DecodeVisit *visit, int index, const float *weight,
+                           const float *dynamic, float *output, int d, int taps, int heads, const float *residual, int chain = 1) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= d)
         return;
-    float y = updateConvChannel(input, visit, index, weight, dynamic, d, taps, heads, c);
+    int row = Timeline ? blockIdx.y : 0;
+    size_t offset = size_t(row) * d;
+    if (dynamic) dynamic += size_t(row) * heads * taps;
+    if (residual) residual += offset;
+    output += offset;
+    float y = updateConvChannel<Timeline>(input + offset, visit + row, index, weight, dynamic, d, taps, heads, c,
+                                         row % chain, d);
     output[c] = residual ? __fadd_rn(y, residual[c]) : y;
 }
 template<class T> __global__ void storeDecodeKv(const DecodeVisit *visit, const T *key, const T *value, int width) {
@@ -251,11 +275,19 @@ bool ordinarySampling(const GenerationConfig &cfg) {
            !cfg.tool_call_token_mask && cfg.top_k > 0 && cfg.temperature > 0.f && cfg.top_p > 0.f &&
            cfg.top_p <= 1.f;
 }
+bool speculativeSampling(const GenerationConfig &s) {
+    return ordinarySampling(s) && !s.IsSimpleGreedy() && !s.output_logits && !s.tool_call_grammar &&
+           !s.tool_call_content_sampling_enabled && !s.tool_call_name_constraint_enabled &&
+           !s.tool_call_parameter_name_constraint_enabled && s.output_token_least == 0;
+}
 uint64_t newSamplingSeed() {
     static thread_local std::mt19937_64 gen(std::random_device{}());
     return gen();
 }
+#include "dspark.cuh"
 struct Request {
+    std::unique_ptr<DraftState> draft;
+    int promptLength = 0, limit = 0;
     int gpu;
     uint64_t seed = newSamplingSeed();
     explicit Request(int device) : gpu(device) {}
@@ -264,6 +296,10 @@ struct Request {
         cudaGetDevice(&previous);
         if (previous != gpu)
             cudaSetDevice(gpu);
+        if (draft && draft->rounds)
+            printf("[Inkling DSpark] rounds=%d proposed=%d accepted=%d mean_round_ms=%.3f\n",
+                   draft->rounds, draft->proposed, draft->accepted, draft->roundMs / draft->rounds);
+        draft.reset();
         visits.clear();
         if (previous != gpu)
             cudaSetDevice(previous);
@@ -275,9 +311,18 @@ struct Segment {
     Request *request;
     int offset, length;
     const DecodeVisit *decode = nullptr;
+    Verification *verify = nullptr;
+    const DecodeVisit *timeline = nullptr;
 };
 template <typename T> Matrix convolutions(const Rows<T> &input, const float *weight, const Matrix &dynamic, int heads, int taps,
                     const std::vector<Segment> &batch, size_t slot, int index, const Matrix &residual = {}) {
+    if (batch.front().timeline) {
+        Matrix out(input.rows, input.cols);
+        const auto *visits = batch.front().timeline + slot * input.rows;
+        decodeConv<true><<<dim3((input.cols + 255) / 256, input.rows), 256, 0, cudaStreamPerThread>>>(
+            input.p, visits, index, weight, dynamic.p, out.p, input.cols, taps, heads, residual.p, batch.front().length);
+        return out;
+    }
     if (batch.front().decode) {
         Matrix out(1, input.cols);
         decodeConv<<<(input.cols + 255) / 256, 256, 0, cudaStreamPerThread>>>(
@@ -291,7 +336,9 @@ template <typename T> Matrix convolutions(const Rows<T> &input, const float *wei
     for (const auto &seq : batch) {
         auto rows = x.slice(seq.offset, seq.length);
         auto dyn = dynamic.p ? dynamic.slice(seq.offset, seq.length) : Matrix{};
-        auto y = convolution(rows, weight, dyn, heads, taps, seq.request->visits[slot].convState[index],
+        auto &history = seq.request->visits[slot].convState[index];
+        if (seq.verify) seq.verify->history(history, history, rows, rows.p, rows.cols, rows.cols, rows.rows, taps-1);
+        auto y = convolution(rows, weight, dyn, heads, taps, history,
                              residual.p ? residual.p + size_t(seq.offset) * x.cols : nullptr);
         if (batch.size() == 1)
             return y;
@@ -303,6 +350,7 @@ template <typename T> Matrix convolutions(const Rows<T> &input, const float *wei
 }
 class Decoder final : public Runtime {
     Config c;
+    bool decodeArithmetic = false;
     Placement placement;
     basellm &model;
     WeightMap &weights;
@@ -335,9 +383,9 @@ class Decoder final : public Runtime {
     DecodeInput hostInput{};
     std::vector<DecodeVisit> hostVisits;
     Matrix graphLogits, unitScale, splitScratch;
-    int sm120GlobalSplits = 0;
+    int sm120GlobalSplits = 0, verifyGlobalSplits = 0;
     bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
-    bool bf16WindowBias = false;
+    bool bf16WindowBias = false, batchedController = false;
 
     Data &weight(const std::string &key) const {
         auto &w = weights.weight.at("model.llm." + key);
@@ -360,13 +408,25 @@ class Decoder final : public Runtime {
             offset < 0 || offset + groups * columns > w.dims[0] || x.rows % groups)
             throw std::runtime_error("Inkling packed projection shape or type: " + key);
         const int n = x.rows / groups, m = x.cols;
-        Data input(type, {x.rows, m}, CUDA, x.p), result(std::is_same<U, float>::value ? FLOAT32 : type, {x.rows, columns}, CUDA, out.p);
-        Data weightView(type, {groups * columns, m}, CUDA, static_cast<T *>(w.cudaData) + size_t(offset) * m);
-        if (groups == 1 && std::is_same<T, U>::value) {
-            DoCudaLinear(input, weightView, *GetEmptyData(), result);
-        } else {
-            FastllmCudaBatchMatMulTransB(input, weightView, result, n * m, columns * m, n * columns,
-                                         m, m, groups, n, m, columns, 1.f);
+        auto *matrix = static_cast<T *>(w.cudaData) + size_t(offset) * m;
+        if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<U, T>) {
+            if (decodeArithmetic && n > 1 && groups == 1 && FastllmCudaRuntimeArch() == 120 && m != 256) {
+                LaunchFastllmGemmBf16Bf16(x.p, matrix, out.p, nullptr, n, m, columns);
+                return;
+            }
+        }
+        // Verification preserves singleton reduction order. Q/K/V still use their parent row pitch.
+        const int rows = decodeArithmetic ? 1 : n;
+        Data weightView(type, {groups * columns, m}, CUDA, matrix);
+        for (int row = 0; row < n; row += rows) {
+            Data input(type, {groups * rows, m}, CUDA, x.p + size_t(row) * m);
+            Data result(std::is_same_v<U, float> ? FLOAT32 : type, {groups * rows, columns}, CUDA,
+                        out.p + size_t(row) * columns);
+            if (groups == 1 && std::is_same_v<T, U>)
+                DoCudaLinear(input, weightView, *GetEmptyData(), result);
+            else
+                FastllmCudaBatchMatMulTransB(input, weightView, result, n * m, columns * m, n * columns,
+                                             m, m, groups, rows, m, columns, 1.f);
         }
     }
 
@@ -385,10 +445,38 @@ class Decoder final : public Runtime {
         Rows<Out> out(count * n, d);
         for (int i = 0; i < count; ++i)
             streams.items[i] = {dest[i].p, messages.slice(i * n, n).p, norms[i]};
+        const auto path = prefix + (count == 1 ? "controllers.mlp." : "controllers.qkv.");
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            if (batchedController && decodeArithmetic && n > 1) {
+                const auto &down = weights.weight.at("model.llm." + path + "down_weight");
+                const auto &gate = weights.weight.at("model.llm." + path + "gates_weight");
+                if (down.dataType == BFLOAT16 && down.dims.size() == 2 && down.dims[0] == count * c.rank &&
+                    down.dims[1] == 2 * d && gate.dataType == BFLOAT16 && gate.dims.size() == 2 &&
+                    gate.dims[0] == count * 2 * d && gate.dims[1] == c.rank) {
+                    auto prepare = count == 1 ? ControllerNormRows<true, T, T, 2304> : ControllerNormRows<true, T, T, 2304, true>;
+                    prepare<<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, nullptr, pair.p, c.eps);
+                    Rows<T> hidden(count * n, c.rank);
+                    if (count == 1)
+                        FastllmCudaBf16ExactRows(pair.p, down.cudaData, hidden.p, n, 2 * d, c.rank);
+                    else
+                        controllerDown<<<dim3(c.rank / 2, (n + 1) / 2, count), 128, 0, cudaStreamPerThread>>>(
+                            pair.p, static_cast<const T *>(down.cudaData), hidden.p, n, c.rank);
+                    Matrix gates(count * n, 2 * d);
+                    if (count == 1)
+                        controllerMlpGates<4><<<dim3(d / 16, (n + 3) / 4), 128, 0, cudaStreamPerThread>>>(
+                            hidden.p, static_cast<const T *>(gate.cudaData), gates.p, n, d);
+                    else
+                        controllerQkvGates<<<dim3(d / 64, (n + 7) / 8, count), 128, 0, cudaStreamPerThread>>>(
+                            hidden.p, static_cast<const T *>(gate.cudaData), gates.p, n, d);
+                    ControllerNormRows<false, T, Out, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(
+                        streams, gates.p, out.p, c.eps);
+                    return out;
+                }
+            }
+        }
         if (d == 2304)
             ControllerNormRows<true, T, T, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, nullptr, pair.p, c.eps);
         else PairRMSNorm<<<count * n * 2, 512, 0, cudaStreamPerThread>>>(streams, pair.p, n, d, c.eps);
-        const auto path = prefix + (count == 1 ? "controllers.mlp." : "controllers.qkv.");
         auto hidden = linear(pair, path + "down_weight", c.rank, count);
         // Controller coefficients feed tanh and the FP32 residual blend directly.
         Matrix gates(count * n, 2 * d);
@@ -460,6 +548,17 @@ class Decoder final : public Runtime {
         result.widths = {q, c.heads * c.relative, q, c.heads, k, taps, k, taps};
         result.shared = inputs[0].p == inputs[1].p && inputs[0].p == inputs[2].p;
         result.storage = Rows<T>(inputs[0].rows, std::accumulate(result.widths.begin(), result.widths.end(), 0));
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            if (decodeArithmetic && !result.shared && inputs[0].rows >= 4) {
+                const auto &w = weights.weight.at("model.llm." + att + "packed.weight");
+                const T *x[] = {inputs[0].p, inputs[1].p, inputs[2].p};
+                const int widths[] = {result.storage.cols - 2 * (k + taps), k + taps, k + taps};
+                if (w.dataType == BFLOAT16 && w.dims.size() == 2 && w.dims[0] == result.storage.cols &&
+                    w.dims[1] == inputs[0].cols && LaunchFastllmGroupedBf16Projection(x, static_cast<const T *>(w.cudaData),
+                        result.storage.p, result.storage.rows, inputs[0].cols, widths))
+                    return result;
+            }
+        }
         result.groups([&](Rows<T> part, int begin, int, int offset) {
             projectInto(inputs[begin == 0 ? 0 : (begin == 4 ? 1 : 2)], att + "packed.weight", part, offset, 1);
         });
@@ -475,27 +574,87 @@ class Decoder final : public Runtime {
         if (table.Count(0) != c.relative * c.extent)
             throw std::runtime_error("Inkling relative bias table shape");
         auto projection = projectAttention(inputs, att, local);
-        if (batch.front().decode && aligned == d && c.relative <= threads) {
-            const auto projected = projection.template unpack<T>();
-            Rows<T> attended(1, c.heads * d);
-            const auto *visit = batch.front().decode + slot;
-            Matrix q(1, c.heads * d), bias(c.heads, c.extent);
-            RelativeInputs<T> in{projected[0].p, projected[1].p, projected[4].p, projected[6].p,
-                              projected[5].p, projected[7].p, param(att + "q_l2_clip.scale", c.heads * d),
-                              param(att + "rel_l2_clip.scale", c.heads * c.relative),
-                              param(att + (local ? "k_sconv.weight" : "k_sconv.static_w"), k * c.conv),
-                              param(att + (local ? "v_sconv.weight" : "v_sconv.static_w"), k * c.conv),
-                              static_cast<const float *>(table.cudaData), c.heads, c.kvHeads, d, c.relative,
-                              c.extent, c.conv, c.qClip, c.rClip, c.eps};
-            int tiles = (c.extent + threads - 1) / threads;
-            prepareRelative<KV><<<c.heads * (1 + tiles) + 2 * c.kvHeads, threads, 0, cudaStreamPerThread>>>(
-                visit, in, tiles, q.p, bias.p);
-            AttentionRow args{q.p, nullptr, nullptr, {}, bias.p, nullptr, nullptr,
-                              visit, 0, 0, c.heads, c.kvHeads, d, c.extent,
-                              window, c.logFloor, c.logAlpha};
-            if (d == 128) launchSplitRelative<128, KV>(args, splitScratch, projected[3].p, projected[2].p,
-                                                      attended.p, sm120GlobalSplits);
-            else launchSplitRelative<64, KV>(args, splitScratch, projected[3].p, projected[2].p, attended.p);
+        if ((batch.front().decode || decodeArithmetic) && aligned == d && c.relative <= threads) {
+            const auto projected = projection.views();
+            Rows<T> attended(inputs[0].rows, c.heads * d);
+            const int queries = batch.front().timeline ? attended.rows : 1;
+            Matrix q(queries, c.heads * d), bias(queries * c.heads, c.extent);
+            Matrix scratch = queries == 1 ? splitScratch : Matrix(splitScratch.rows, splitScratch.cols * queries);
+            auto evaluate = [&](int row, const DecodeVisit *visit) {
+                auto sources = projected;
+                for (auto &item : sources.items)
+                    if (item.data) item.data += size_t(row) * item.stride;
+                const auto &sink = sources.items[3], &gate = sources.items[2];
+                RelativeInputs<T> in{sources, param(att + "q_l2_clip.scale", c.heads * d),
+                                  param(att + "rel_l2_clip.scale", c.heads * c.relative),
+                                  param(att + (local ? "k_sconv.weight" : "k_sconv.static_w"), k * c.conv),
+                                  param(att + (local ? "v_sconv.weight" : "v_sconv.static_w"), k * c.conv),
+                                  static_cast<const float *>(table.cudaData), c.heads, c.kvHeads, d, c.relative,
+                                  c.extent, c.conv, c.qClip, c.rClip, c.eps};
+                int tiles = (c.extent + threads - 1) / threads;
+                const bool usePagedGlobal = !window && verifyGlobalSplits > 0 && std::is_same_v<KV, half>;
+                if (batch.front().timeline) {
+                    auto prepare = usePagedGlobal ? prepareRelative<KV, true, true, T> : prepareRelative<KV, true, false, T>;
+                    prepare<<<dim3(c.heads * (1 + tiles) + 2 * c.kvHeads, queries), threads, 0, cudaStreamPerThread>>>(
+                        visit, in, tiles, q.p, bias.p, batch.front().length);
+                } else {
+                    auto prepare = usePagedGlobal ? prepareRelative<KV, false, true, T> : prepareRelative<KV, false, false, T>;
+                    prepare<<<c.heads * (1 + tiles) + 2 * c.kvHeads, threads, 0, cudaStreamPerThread>>>(
+                        visit, in, tiles, q.p, bias.p, 1);
+                }
+                AttentionRow args{q.p, nullptr, nullptr, {}, bias.p, nullptr, nullptr,
+                                  visit, 0, 0, c.heads, c.kvHeads, d, c.extent,
+                                  window, c.logFloor, c.logAlpha, sink.stride, gate.stride};
+                if (usePagedGlobal) {
+                    launchVerifyGlobal(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
+                                       queries, batch.front().timeline ? batch.front().length : 1, verifyGlobalSplits);
+                } else if (d == 128) launchSplitRelative<128, KV>(args, scratch, sink.data, gate.data,
+                                                          attended.p + size_t(row) * attended.cols, sm120GlobalSplits,
+                                                          queries, batch.front().timeline ? batch.front().length : 1);
+                else launchSplitRelative<64, KV>(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols, 0, queries);
+            };
+            if (batch.front().timeline) {
+                const auto *visits = batch.front().timeline + slot * attended.rows;
+                evaluate(0, visits);
+                return attended;
+            }
+            if (batch.front().decode) {
+                evaluate(0, batch.front().decode + slot);
+                return attended;
+            }
+            for (const auto &seg : batch) {
+                auto &v = seg.request->visits[slot];
+                const int past = seg.request->length;
+                // Keep every page visible to the first query. No rejected row can evict its prefix.
+                v.prepare(past + seg.length, window ? window + seg.length - 1 : 0);
+                if (seg.verify) {
+                    for (int i = 0; i < 2 && c.conv > 1; ++i) {
+                        auto &history = v.convState[i];
+                        auto old = history;
+                        history = Matrix(old.rows, old.cols);
+                        check(cudaMemcpyAsync(history.p, old.p, size_t(old.rows) * old.cols * sizeof(float),
+                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                        const auto raw = projected.items[i ? 6 : 4];
+                        seg.verify->history(history, old, projection.storage, raw.data + size_t(seg.offset) * raw.stride,
+                                            raw.stride, k, seg.length, c.conv - 1);
+                    }
+                }
+                std::vector<DecodeVisit> host(seg.length);
+                Buffer<DecodeVisit> visits(seg.length);
+                for (int r = 0; r < seg.length; ++r) {
+                    auto &item = host[r];
+                    item.pages = v.view();
+                    item.past = past + r;
+                    for (int i = 0; i < 4; ++i) item.history[i] = v.convState[i].p;
+                }
+                check(cudaMemcpyAsync(visits.p, host.data(), host.size() * sizeof(DecodeVisit),
+                                      cudaMemcpyHostToDevice, cudaStreamPerThread));
+                for (int r = 0; r < seg.length; ++r) evaluate(seg.offset + r, visits.p + r);
+                if (seg.verify)
+                    seg.verify->writes.emplace_back([&v, past, window](int prefix) { v.prepare(past + prefix, window); });
+                else
+                    v.prepare(past + seg.length, window);
+            }
             return attended;
         }
         const int rows = inputs[0].rows;
@@ -546,6 +705,11 @@ class Decoder final : public Runtime {
                 auto &history = seq.request->visits[slot].convState;
                 const int count = c.conv - 1, keep = std::max(0, count - seq.length);
                 Matrix next[] = {Matrix(count, k), Matrix(count, k)};
+                if (seq.verify) for (int i = 0; i < 2; ++i) {
+                    const auto raw = parts.items[i ? 6 : 4];
+                    seq.verify->history(history[i], history[i], projection.storage, raw.data + size_t(seq.offset)*raw.stride,
+                                        raw.stride, k, seq.length, count);
+                }
                 for (int i = 0; i < 2 && keep; ++i) {
                     const size_t bytes = size_t(keep) * k * sizeof(float);
                     if (history[i].p)
@@ -650,10 +814,14 @@ class Decoder final : public Runtime {
                 storeDecodeKv<<<(kvWidth + 255) / 256, 256, 0, cudaStreamPerThread>>>(decode, currentKey.p,
                                                                                 currentValue.p, kvWidth);
             else {
-                cache->prepare(past + seq.length, window);
-                int rows = window ? std::min(seq.length, window) : seq.length;
-                appendKv<<<(size_t(rows) * kvWidth + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-                    cache->view(), currentKey.p, currentValue.p, past, seq.length - rows, kvWidth, rows);
+                auto store = [cache, past, window, currentKey, currentValue, kvWidth](int length) {
+                    cache->prepare(past + length, window);
+                    int rows = window ? std::min(length, window) : length;
+                    appendKv<<<(size_t(rows)*kvWidth+255)/256,256,0,cudaStreamPerThread>>>(
+                        cache->view(), currentKey.p, currentValue.p, past, length-rows, kvWidth, rows);
+                };
+                if (seq.verify) seq.verify->writes.emplace_back(std::move(store));
+                else store(seq.length);
             }
         }
         if (compact) return gatedOutput;
@@ -742,18 +910,25 @@ class Decoder final : public Runtime {
         } else {
             ffn = mix<T>(blocks, residual, &mlpQuery, 1, c.eps, c.normValues);
         }
-        auto m = experts[physical]->run(c, ffn, param(pre + "mlp.gate.bias", c.experts));
+        auto m = experts[physical]->run(c, ffn, param(pre + "mlp.gate.bias", c.experts), decodeArithmetic);
         return convolutions(m, param(pre + "mlp_sconv.weight", h * c.conv), {}, 1, c.conv,
                                   batch, slot, 3, residual);
     }
-    void target(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits) {
+    void target(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits, std::vector<Matrix> *features = nullptr) {
         if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16)
-            targetTyped<half>(ids, n, batch, logits);
+            targetTyped<half>(ids, n, batch, logits, features);
         else
-            targetTyped<__nv_bfloat16>(ids, n, batch, logits);
+            targetTyped<__nv_bfloat16>(ids, n, batch, logits, features);
     }
 
-    template <typename T> void targetTyped(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits) {
+    template <typename T> void targetTyped(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits, std::vector<Matrix> *features) {
+        // Incremental verification must use the same arithmetic as ordinary one-token decode.
+        // Fresh prompt chunks retain their tensor-core prefill kernels.
+        struct Restore { bool &mode; ~Restore() { mode = false; } } restore{decodeArithmetic};
+        decodeArithmetic = batch.front().timeline || (features && std::all_of(batch.begin(), batch.end(), [&](const Segment &s) {
+            return s.request && s.request->draft && s.request->length >= s.request->promptLength &&
+                   s.length <= c.draft.block;
+        }));
         int h = c.hidden;
         Matrix x(n, h);
         Data tokens(FLOAT32, {n}, CUDA, ids), result(FLOAT32, {n, h}, CUDA, x.p);
@@ -794,12 +969,16 @@ class Decoder final : public Runtime {
                 }
                 messages = messageTile.slice(4 * (i - firstMessage) * n, 4 * n);
             }
+            if (features && std::binary_search(c.draft.taps.begin(), c.draft.taps.end(), int(slot)))
+                features->push_back(x);
             x = layer<T>(x, blocks, messages, i, batch, slot);
         }
         Query outputQuery{param("attn_res.output_query", h), param("norm.weight", h)};
         auto output = mix(blocks, x, &outputQuery, 1, c.eps, c.normValues);
+        if (features) features->push_back(output);
         Matrix last;
-        if (batch.size() == 1)
+        if (batch.front().verify || batch.front().timeline) last = output;
+        else if (batch.size() == 1)
             last = output.slice(n - 1, 1);
         else {
             last = Matrix(batch.size(), h);
@@ -814,6 +993,82 @@ class Decoder final : public Runtime {
         softcap<<<(nLogits + 255) / 256, 256, 0, cudaStreamPerThread>>>(projected.p, logits.p, nLogits, c.logitCap);
     }
 
+    #include "dspark-forward.cuh"
+    #include "draft-graph.cuh"
+    #include "verify-graph.cuh"
+
+    template<class T>
+    std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anchors, int steps,
+                                 const std::vector<GenerationConfig> &sampling) {
+        const auto start = model.verbose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const int count = batch.size(), width = steps + 1, rows = count * width;
+        DraftGraph *draftPlan = count == 1 ? replayDraft<T>(*batch[0].request, int(anchors[batch[0].offset]),
+                                                          sampling[0]) : nullptr;
+        Matrix proposals = draftPlan ? draftPlan->probs.slice(0, steps) : Matrix(count * steps, c.vocab);
+        Matrix logits;
+        std::vector<float> input(draftPlan ? 0 : rows), temperature(rows), topP(rows);
+        std::vector<int> topK(rows), tokens(draftPlan ? 0 : count * steps), emitted(rows), accepted(count), result(count);
+        std::vector<Verification> commits(count);
+        std::vector<Segment> segments;
+        for (int b = 0; b < count; ++b) {
+            const int offset = b * width;
+            const int anchor = int(anchors[batch[b].offset]);
+            const auto &cfg = sampling[b];
+            if (!draftPlan) {
+                auto &req = *batch[b].request;
+                auto probs = proposals.slice(b * steps, steps);
+                Buffer<int> ids(width);
+                check(cudaMemcpyAsync(ids.p, &anchor, sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
+                propose<T>(req, steps, cfg, probs, ids.p, req.draft->recurrentContext, req.draft->samplerWorkspace, nullptr);
+                int *chain = tokens.data() + b * steps;
+                check(cudaMemcpy(chain, ids.p + 1, steps * sizeof(int), cudaMemcpyDeviceToHost));
+                input[offset] = float(anchor);
+                std::copy_n(chain, steps, input.begin() + offset + 1);
+            }
+            std::fill_n(temperature.begin() + offset, width, cfg.temperature);
+            std::fill_n(topP.begin() + offset, width, cfg.top_p);
+            std::fill_n(topK.begin() + offset, width, cfg.top_k);
+            segments.push_back({batch[b].request, offset, width, nullptr, &commits[b]});
+        }
+        std::vector<Matrix> features;
+        float *deviceIds = draftPlan ? draftPlan->ids.p : nullptr;
+        auto *plan = replayVerify(segments, input, logits, features, deviceIds);
+        if (!plan) {
+            Buffer<float> ids(deviceIds ? 0 : rows);
+            if (!deviceIds) check(cudaMemcpyAsync(ids.p, input.data(), rows * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
+            logits = Matrix(rows, c.vocab);
+            target(deviceIds ? deviceIds : ids.p, rows, segments, logits, &features);
+        }
+        auto reject = draftPlan ? FastllmCudaMtpRejectionSamplingTopKFirstDeviceIds : FastllmCudaMtpRejectionSamplingTopKFirst;
+        if (!reject(logits.p, proposals.p, temperature.data(), topK.data(), topP.data(),
+                    draftPlan ? draftPlan->tokens.p + 1 : tokens.data(), emitted.data(), accepted.data(), count, steps, c.vocab))
+            throw std::runtime_error("Inkling DSpark rejection sampling failed");
+
+        for (int prefix : accepted)
+            if (prefix < 0 || prefix > steps) throw std::runtime_error("Invalid Inkling DSpark acceptance length");
+        if (plan) finishVerify(*plan, segments, accepted);
+        for (int b = 0; b < count; ++b) {
+            const int prefix = accepted[b] + 1, offset = b * width;
+            auto &req = *batch[b].request;
+            auto &state = *req.draft;
+            for (auto &write : commits[b].writes) write(prefix);
+            storeFeatures<T>(req, features, b * (plan ? c.draft.steps + 1 : width), prefix);
+            req.length += prefix;
+            for (int i = 1; i < prefix; ++i)
+                state.pending.emplace_back(emitted[offset + i - 1], emitted[offset + i]);
+            if (model.verbose) {
+                ++state.rounds;
+                state.proposed += steps;
+                state.accepted += accepted[b];
+            }
+            result[b] = emitted[offset];
+        }
+        if (model.verbose) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            for (const auto &s : batch) s.request->draft->roundMs += ms;
+        }
+        return result;
+    }
     void decodeBody() {
         auto *in = graphInput.p;
         target(&in->token, 1, {{nullptr, 0, 1, graphVisits.p}}, graphLogits);
@@ -843,40 +1098,16 @@ class Decoder final : public Runtime {
         check(cudaMemcpyAsync(graphInput.p, &hostInput, sizeof(hostInput), cudaMemcpyHostToDevice, cudaStreamPerThread));
         check(cudaMemcpyAsync(graphVisits.p, hostVisits.data(), hostVisits.size() * sizeof(dummy),
                               cudaMemcpyHostToDevice, cudaStreamPerThread));
-        DecodeGraphScratch::Scope scope(pool);
-        decodeBody();
-        check(cudaStreamSynchronize(cudaStreamPerThread));
-        pool.sealed = true;
+        pool.Warmup([&] { decodeBody(); });
     }
     void captureDecode() {
         graphSample = Buffer<int>(1);
         graphLogits = Matrix(1, c.vocab);
         DecodeGraphScratch scratchPool;
         prepareDecodeScratch(scratchPool);
-        cudaGraph_t graph = nullptr;
-        check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-        bool capturing = true;
-        try {
-            {
-                DecodeGraphScratch::Scope scope(scratchPool);
-                decodeBody();
-            }
-            auto status = cudaStreamEndCapture(cudaStreamPerThread, &graph);
-            capturing = false;
-            check(status);
-            scratchPool.FinishCapture();
-            check(cudaGraphInstantiate(&decodeGraph, graph, nullptr, nullptr, 0));
-        } catch (...) {
-            if (capturing)
-                cudaStreamEndCapture(cudaStreamPerThread, &graph);
-            if (graph)
-                cudaGraphDestroy(graph);
-            throw;
-        }
-        graphScratch = std::move(scratchPool);
         size_t nodes = 0;
-        cudaGraphGetNodes(graph, nullptr, &nodes);
-        cudaGraphDestroy(graph);
+        scratchPool.Capture(decodeGraph, [&] { decodeBody(); }, &nodes);
+        graphScratch = std::move(scratchPool);
         printf("[Inkling] captured full single-request decode graph (%zu nodes, %zu visits, %zu scratch bytes)\n",
                nodes, c.visits.size(), graphScratch.Bytes());
     }
@@ -920,8 +1151,8 @@ class Decoder final : public Runtime {
                               cudaMemcpyHostToDevice, cudaStreamPerThread));
     }
     Matrix runTarget(const float *tokens, int count, const std::vector<Segment> &batch,
-                     const GenerationConfig &sampling, bool &sampledInGraph) {
-        if (batch.size() == 1 && count == 1 && batch[0].request->length > 0) {
+                     const GenerationConfig &sampling, bool &sampledInGraph, std::vector<Matrix> *features = nullptr) {
+        if (!features && batch.size() == 1 && count == 1 && batch[0].request->length > 0) {
             auto &req = *batch[0].request;
             sampledInGraph = decodeGraph && ordinarySampling(sampling) && !sampling.IsSimpleGreedy();
             stageDecode(req, tokens[0], sampling, sampledInGraph, hostInput, hostVisits.data(), false);
@@ -936,7 +1167,7 @@ class Decoder final : public Runtime {
         Buffer<float> ids(count);
         check(cudaMemcpyAsync(ids.p, tokens, size_t(count) * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
         Matrix logits(batch.size(), c.vocab);
-        target(ids.p, count, batch, logits);
+        target(ids.p, count, batch, logits, features);
         return logits;
     }
 
@@ -1013,6 +1244,8 @@ class Decoder final : public Runtime {
             s.tool_call_grammar || s.tool_call_content_sampling_enabled ||
             s.tool_call_name_constraint_enabled || s.tool_call_parameter_name_constraint_enabled)
             return nullptr;
+        const auto *req = static_cast<const Request *>(ctx.pastKeyValues.front().first.kvStorageOwner.get());
+        if (req && req->draft) return nullptr;
         return std::make_unique<Pipeline>(*this, ctx);
     }
     Decoder(const Config &config, const Placement &p, basellm &owner,
@@ -1028,6 +1261,11 @@ class Decoder final : public Runtime {
 #ifndef CUDA_NO_TENSOR_CORE
         int major;
         check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, p.gpu));
+        if (FastllmCudaRuntimeArch() == 120 && c.hidden == 2304 && c.rank == 64) {
+            cudaFuncAttributes attr{};
+            check(cudaFuncGetAttributes(&attr, controllerQkvGates));
+            batchedController = attr.binaryVersion >= 80 && attr.ptxVersion >= 80;
+        }
         if (major >= 8 && (c.headDim == 64 || c.headDim == 128) && c.relative <= threads) {
             tensorPrefill = c.headDim == 128 ? configurePrefill<128, half>() && configurePrefill<128, __nv_bfloat16>()
                                              : configurePrefill<64, half>() && configurePrefill<64, __nv_bfloat16>();
@@ -1048,6 +1286,10 @@ class Decoder final : public Runtime {
         const int parallelHeads = c.heads == 3 * c.kvHeads ? c.kvHeads : c.heads;
         splitScratch = Matrix(std::max(1, (2 * smCount + parallelHeads - 1) / parallelHeads),
                               c.heads * (attentionWidth(c.headDim) + 1));
+        if (tensorPrefill && c.headDim == 128 && c.qClip > 0.f && c.qClip <= 65504.f &&
+            configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyGlobal)) {
+            verifyGlobalSplits = std::min(splitScratch.rows, std::max(1, 2 * (smCount / c.kvHeads)));
+        }
         std::vector<float> ones(std::max(c.headDim, c.hidden), 1.f);
         unitScale = Matrix(1, ones.size());
         check(cudaMemcpy(unitScale.p, ones.data(), ones.size() * sizeof(float), cudaMemcpyHostToDevice));
@@ -1055,6 +1297,7 @@ class Decoder final : public Runtime {
             if (entry.first.compare(0, 10, "model.llm.") == 0)
                 entry.second.ToDevice(CUDA, std::vector<int>{p.gpu}, true);
         }
+        if (c.draft.steps) initDraft();
         experts = loadExperts(c, p, files, weights);
         getFastllmCublasHandle(); // initialize before graph capture
         int gpu = std::count(p.experts.begin(), p.experts.end(), ExpertDevice::Cuda);
@@ -1066,6 +1309,15 @@ class Decoder final : public Runtime {
         cudaSetDevice(placement.gpu);
         if (decodeGraph)
             cudaGraphExecDestroy(decodeGraph);
+    }
+    bool popPending(Data &key, int previous, int &token) override {
+        auto *req = static_cast<Request *>(key.kvStorageOwner.get());
+        if (!req || !req->draft || req->draft->pending.empty()) return false;
+        auto &pending = req->draft->pending;
+        if (pending.front().first != previous) throw std::runtime_error("Inkling verified prefix out of sync");
+        token = pending.front().second;
+        pending.pop_front();
+        return true;
     }
     void warmupDecodeGraph() override {
         std::lock_guard<std::mutex> lock(mutex);
@@ -1081,18 +1333,51 @@ class Decoder final : public Runtime {
         check(cudaSetDevice(placement.gpu));
         initializeKV();
         const_cast<Data &>(ids).ToDevice(CPU);
-        if (ids.dataType != FLOAT32 ||
+        if (ids.dataType != FLOAT32 || std::any_of(lengths.begin(), lengths.end(), [](int n) { return n <= 0; }) ||
             std::accumulate(lengths.begin(), lengths.end(), int64_t(0)) != ids.Count(0))
             throw std::runtime_error("Invalid Inkling input token layout");
         const float *values = reinterpret_cast<const float *>(ids.cpuData);
-        std::vector<Segment> batch;
         for (size_t i = 0; i < ids.Count(0); ++i)
             if (!(values[i] >= 0 && values[i] < c.vocab && values[i] == std::floor(values[i])))
                 throw std::runtime_error("Invalid Inkling input token");
+        // Direct callers may consume one result per forward instead of draining the scheduler queue.
+        // Split only those batches that still contain buffered tokens at distinct logical positions.
+        if (lengths.size() > 1 && c.draft.steps) {
+            bool buffered = false;
+            for (size_t b = 0; b < lengths.size(); ++b) {
+                auto *key = cache[b * c.visits.size()].first;
+                auto *req = key ? static_cast<const Request *>(key->kvStorageOwner.get()) : nullptr;
+                buffered |= req && req->draft && !req->draft->pending.empty();
+            }
+            if (buffered) {
+                std::vector<int> result;
+                int offset = 0;
+                for (size_t b = 0; b < lengths.size(); ++b) {
+                    const int n = lengths[b];
+                    auto first = cache.begin() + b * c.visits.size();
+                    std::vector<std::pair<Data *, Data *>> slots(first, first + c.visits.size());
+                    LastTokensManager historyRow;
+                    if (b < history.units.size()) historyRow.units.push_back(history.units[b]);
+                    std::vector<std::vector<float> *> outputs{logits && b < logits->size() ? (*logits)[b] : nullptr};
+                    result.push_back(forwardRows(values + offset, {positions[b]}, {n}, slots, {sampling[b]}, historyRow, &outputs)[0]);
+                    offset += n;
+                }
+                return result;
+            }
+        }
+        return forwardRows(values, positions, lengths, cache, sampling, history, logits);
+    }
+  private:
+    std::vector<int> forwardRows(const float *values, const std::vector<Data *> &positions,
+                             const std::vector<int> &lengths,
+                             const std::vector<std::pair<Data *, Data *>> &cache,
+                             const std::vector<GenerationConfig> &sampling, const LastTokensManager &history,
+                             std::vector<std::vector<float> *> *logits) {
+        std::vector<Segment> batch;
         int offset = 0;
         for (size_t b = 0; b < lengths.size(); ++b) {
             auto *handle = cache.at(b * c.visits.size()).first;
-            if (!handle || !positions.at(b) || lengths[b] <= 0)
+            if (!handle || !positions.at(b))
                 throw std::runtime_error("Invalid Inkling request");
             positions[b]->ToDevice(CPU);
             if (positions[b]->dataType != FLOAT32 || positions[b]->Count(0) != lengths[b])
@@ -1107,6 +1392,11 @@ class Decoder final : public Runtime {
             if (!handle->kvStorageOwner)
                 throw std::runtime_error("Inkling request state was not initialized");
             auto &req = *static_cast<Request *>(handle->kvStorageOwner.get());
+            if (lengths.size() == 1 && lengths[0] == 1 && req.draft && !req.draft->pending.empty() &&
+                past == req.length - int(req.draft->pending.size())) {
+                int token;
+                if (popPending(*handle, int(values[0]), token)) return {token};
+            }
             if (req.length != past)
                 throw std::runtime_error("Inkling convolution and KV prefix are missing or stale");
             const bool initializing = req.visits.empty();
@@ -1123,15 +1413,22 @@ class Decoder final : public Runtime {
                 desc.dataDeviceIds = {placement.gpu};
                 const int len = GetPageLen();
                 const auto &gen = sampling[b];
-                const int64_t prompt = int64_t(lengths[b]) + std::max(0, gen.prefill_chunk_remaining);
+                const int64_t prompt = std::max<int64_t>(gen.input_token_length,
+                        int64_t(lengths[b]) + std::max(0, gen.prefill_chunk_remaining));
                 const int64_t limit = gen.output_token_limit > 0
                     ? std::min<int64_t>(model.max_positions, prompt + gen.output_token_limit)
                     : model.max_positions;
+                req.limit = int(std::min<int64_t>(limit, tokenLimit > 0 ? tokenLimit : limit));
+                req.promptLength = int(prompt);
+                if (c.draft.steps && prompt <= c.draft.maxPositions - c.draft.block && speculativeSampling(gen)) {
+                    req.draft = std::make_unique<DraftState>();
+                    req.draft->kv.resize(c.draft.layers);
+                }
                 for (size_t slot = 0; slot < c.visits.size(); ++slot) {
                     auto &v = req.visits[slot];
                     int pages = tokenLimit > 0 ? int((int64_t(tokenLimit) + len - 1) / len) : -1;
                     if (c.local[c.visits[slot]] && model.maxBatch > 0) {
-                        const int64_t bounded = ((int64_t(c.window) + len - 2) / len + 1) * model.maxBatch;
+                        const int64_t bounded = ((int64_t(c.window) + std::max(0, c.draft.block - 1) + len - 2) / len + 1) * model.maxBatch;
                         pages = int(std::min<int64_t>(bounded, pages > 0 ? pages : std::numeric_limits<int>::max()));
                     }
                     v.attach(*v.key, int(2 * slot), desc, pages);
@@ -1139,7 +1436,7 @@ class Decoder final : public Runtime {
                     // Reserve only page IDs. Physical KV pages remain demand-allocated.
                     int64_t slots = (limit + len - 1) / len;
                     if (c.local[c.visits[slot]])
-                        slots = std::min(slots, (int64_t(c.window) + len - 2) / len + 1);
+                        slots = std::min(slots, (int64_t(c.window) + std::max(0, c.draft.block - 1) + len - 2) / len + 1);
                     v.reserveTable(int(std::min<int64_t>(slots, v.key->pagedKVCacheData->maxPages)));
                 }
             }
@@ -1147,7 +1444,28 @@ class Decoder final : public Runtime {
             offset += lengths[b];
         }
         bool sampledInGraph = false;
-        auto out = runTarget(values, offset, batch, sampling.front(), sampledInGraph);
+        const bool bf16 = weights.weight.at("model.llm.unembed.weight").dataType == BFLOAT16;
+        int steps = c.draft.steps;
+        for (size_t b = 0; steps > 0 && b < batch.size(); ++b) {
+            const auto &s = batch[b];
+            const auto &cfg = sampling[b];
+            if (!s.request->draft || !s.request->draft->recurrentContext.p || s.length != 1 ||
+                cfg.prefill_chunk_remaining >= 0 || s.request->length < s.request->promptLength ||
+                s.request->length > c.draft.maxPositions - c.draft.block ||
+                !speculativeSampling(cfg) || (logits && b < logits->size() && (*logits)[b]))
+                steps = 0;
+            else steps = std::min(steps, s.request->limit - s.request->length - 2);
+        }
+        if (steps > 0)
+            return bf16 ? verifyRound<__nv_bfloat16>(batch, values, steps, sampling)
+                        : verifyRound<half>(batch, values, steps, sampling);
+        bool collect = std::any_of(batch.begin(),batch.end(),[](const Segment &s){return bool(s.request->draft);});
+        std::vector<Matrix> features;
+        auto out = runTarget(values, offset, batch, sampling.front(), sampledInGraph, collect ? &features : nullptr);
+        for (const auto &s : batch) if (s.request->draft) {
+            if (bf16) storeFeatures<__nv_bfloat16>(*s.request,features,s.offset,s.length);
+            else storeFeatures<half>(*s.request,features,s.offset,s.length);
+        }
         std::vector<int> result(batch.size());
         bool greedy = std::all_of(sampling.begin(), sampling.end(),
                                   [](const GenerationConfig &cfg) { return cfg.IsSimpleGreedy(); });

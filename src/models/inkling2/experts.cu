@@ -278,6 +278,10 @@ __global__ void projectSelectAndQuantize(InputRow input, Out *out, int d, RouteS
         reconstructRow<fp4>(input, out, d, false, tiles);
         return;
     }
+    input.x += size_t(blockIdx.x) * d;
+    scratch += blockIdx.x;
+    route.ids += size_t(blockIdx.x) * route.top;
+    route.scores += size_t(blockIdx.x) * route.top;
     const int group = threadIdx.x / 32;
     if (group < ExpertTile) {
         const int expert = (blockIdx.y - tiles) * ExpertTile + group;
@@ -310,7 +314,7 @@ __global__ void projectSelectAndQuantize(InputRow input, Out *out, int d, RouteS
     __syncthreads();
     if (last && threadIdx.x < 32)
         cuda::SelectExpertFixedRow<false, DecodeRouter::experts, 8>(
-            scratch->probabilities, route.bias, route.ids, route.scores, route.bias != nullptr, true, route.scale);
+            scratch->probabilities, route.bias, route.ids, route.scores, route.bias != nullptr, true, route.scale, 0);
 }
 #endif
 
@@ -344,9 +348,9 @@ void prepareRoutedInput(InputRow src, Out *out, int rows, int d, int smCount, Ro
                         const uint4 *packed, DecodeRouter *scratch) {
 #if CUDART_VERSION >= 12000
     if (scratch) {
-        unsigned tiles = quantTiles<fp4>(1, d, smCount);
+        unsigned tiles = quantTiles<fp4>(rows, d, smCount);
         constexpr int expertTile = 2;
-        projectSelectAndQuantize<fp4, Out, expertTile><<<dim3(1, tiles + DecodeRouter::experts / expertTile),
+        projectSelectAndQuantize<fp4, Out, expertTile><<<dim3(rows, tiles + DecodeRouter::experts / expertTile),
             fp4 ? 512 : 256, 0, cudaStreamPerThread>>>(src, out, d, route,
                     packed, scratch, tiles);
         return;
@@ -654,11 +658,11 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
 
     // The routing score is applied inside SiTU before the second FP4 quantization.
     void runNative(const Config &c, InputRow source, int rows, RouteSelection route, DecodeRouter *scratch,
-                   float *dstRows) const {
+                   float *dstRows, bool decodeArithmetic) const {
         const int routes = rows * c.topK;
         // Dense routing amortizes the expert prefix pass. Each scatter lane
         // keeps at most two FP4 blocks in registers until its row scale is known.
-        const bool ranked = routes / c.experts >= 32 && c.hidden <= native::QuantThreads * 2 * 16;
+        const bool ranked = !decodeArithmetic && routes / c.experts >= 32 && c.hidden <= native::QuantThreads * 2 * 16;
         Buffer<native::Block16> input(ranked ? 0 : size_t(rows) * c.hidden / 16);
         Rows<__nv_bfloat16> pair(routes, 2 * c.intermediate), projected(routes, c.hidden);
         Buffer<int> ranks(ranked ? routes : 0), counts(ranked ? c.experts : 0);
@@ -672,7 +676,7 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
             prepareRoutedInput<true>(source, input.p, rows, c.hidden, smCount, route, packedRouter.p, scratch);
         }
         RoutedSiTU<__nv_bfloat16> act{pair.p, route.scores, gateCap, upCap};
-        if (rows == 1) {
+        if (rows == 1 || decodeArithmetic) {
             Buffer<native::Block16> mid(size_t(routes) * c.intermediate / 16);
             auto project = [&](const Projection &w, const native::Block16 *x, int divisor, __nv_bfloat16 *y) {
                 native::decodeProject<4><<<dim3(w.rows / 16, routes), 128, 0, cudaStreamPerThread>>>(
@@ -737,9 +741,14 @@ public:
     }
     ~GpuExperts() override { if (!gate.nativeCodes.p && !groupedFp8) ReleaseCudaMergeMOE(weights.data(), weights.size()); }
 
-    Matrix run(const Config &c, const Matrix &x, const float *bias) const override {
+    Matrix run(const Config &c, const Matrix &x, const float *bias, bool decodeArithmetic) const override {
         if (c.topK <= 0 || c.topK > 50 || c.topK > c.experts) throw std::runtime_error("Inkling expert routing geometry");
-        DecodeRouter *scratch = x.rows == 1 ? decodeRouter.p : nullptr;
+        Buffer<DecodeRouter> batchRouter(decodeArithmetic && x.rows > 1 && decodeRouter.p
+                                        ? x.rows : 0);
+        if (batchRouter.p)
+            check(cudaMemsetAsync(batchRouter.p, 0, sizeof(DecodeRouter) * x.rows,
+                                  cudaStreamPerThread));
+        DecodeRouter *scratch = x.rows == 1 ? decodeRouter.p : batchRouter.p;
         Matrix router = scratch ? Matrix{} : routeLogits(x, routerWeight);
         Matrix out(x.rows, c.hidden);
         const bool marlin = !gate.nativeCodes.p && weights[2]->dataType == NVFP4_BLOCK_16_E4M3;
@@ -754,7 +763,7 @@ public:
             RouteSelection route{scratch ? nullptr : router.p + size_t(start) * c.experts, bias, indices.p, scores.p,
                                  c.experts, c.topK, c.routeScale};
             if (gate.nativeCodes.p) {
-                runNative(c, source, rows, route, scratch, out.p + size_t(start) * c.hidden);
+                runNative(c, source, rows, route, scratch ? scratch + start : nullptr, out.p + size_t(start) * c.hidden, decodeArithmetic);
                 continue;
             }
             const auto type = groupedFp8 ? BFLOAT16 : marlin ? FLOAT16 : FLOAT32;
@@ -801,7 +810,7 @@ class HostExperts final : public RoutedExperts {
 public:
     using RoutedExperts::RoutedExperts;
 
-    Matrix run(const Config &c, const Matrix &x, const float *bias) const override {
+    Matrix run(const Config &c, const Matrix &x, const float *bias, bool decodeArithmetic) const override {
         const int rows = x.rows, top = c.topK;
         Buffer<int> indices(size_t(rows) * top);
         Matrix scores(rows, top);

@@ -1717,7 +1717,13 @@ def make_normal_llm_model(args, startup_progress = None):
                     speculative_algorithm = args.speculative_algorithm
                     _configure_dspark(args, dspark_tokens)
             if speculative_algorithm == "dspark":
-                if speculative_draft_path and not draft_is_dspark_gguf:
+                if architecture == "Inkling2LoopForConditionalGeneration":
+                    if speculative_draft_path:
+                        raise ValueError("Inkling DSpark uses the checkpoint's embedded mtp.safetensors")
+                    block = int(config.get("mtp_config", {}).get("block_size", 0))
+                    if not 1 <= dspark_tokens < block:
+                        raise ValueError(f"Inkling DSpark accepts 1 to {block - 1} proposals")
+                elif speculative_draft_path and not draft_is_dspark_gguf:
                     if (architecture != "KimiK3ForConditionalGeneration" and
                             model_type != "kimi_k3" and not is_naive_n05_model):
                         raise ValueError(

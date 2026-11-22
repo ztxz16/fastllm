@@ -15,7 +15,7 @@ namespace fastllm::cuda {
 template <bool APPLY_SOFTMAX, int EXPERTS, int TOPK, bool APPLY_SIGMOID = false>
 __device__ __forceinline__ void SelectExpertFixedRow(
         const float *logits, const float *bias, int32_t *index, float *score,
-        int hasBias, int needNorm, float routeScale) {
+        int hasBias, int needNorm, float routeScale, int token = blockIdx.x) {
     __shared__ fastllm::cuda::RouterTopKScratch<TOPK> scratch;
     __shared__ float softmaxReduce[257];
     __shared__ __align__(16) float softmaxProbabilities[EXPERTS];
@@ -25,7 +25,6 @@ __device__ __forceinline__ void SelectExpertFixedRow(
                   (!APPLY_SOFTMAX && ((EXPERTS == 128 && TOPK == 8) ||
                                       (EXPERTS == 288 && TOPK == 8) ||
                                       (EXPERTS == 384 && TOPK == 6))));
-    int token = blockIdx.x;
     const float *tokenLogits = logits + (size_t)token * EXPERTS;
     index += (size_t)token * TOPK;
     score += (size_t)token * TOPK;

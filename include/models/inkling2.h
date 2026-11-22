@@ -8,7 +8,15 @@ struct TensorRange {
     std::vector<int> shape;
     uint64_t start, end;
 };
+struct DraftConfig {
+    int steps = 0, block = 0, layers = 0, heads = 0, kvHeads = 0, dim = 0, rank = 0, intermediate = 0, window = 0;
+    int maxPositions = 0;
+    float theta = 0, eps = 0;
+    std::vector<int> taps;
+    std::vector<bool> local;
+};
 struct Config {
+    DraftConfig draft;
     int hidden, layers, heads, kvHeads, headDim, relative, extent, window, conv, residualBlock;
     int experts, topK, intermediate, start, end, passes, rank, vocab, logFloor;
     float eps, qClip, rClip, logAlpha, gateCap, upCap, routeScale, logitCap;
@@ -24,6 +32,7 @@ struct Placement {
 class Runtime {
 public:
     virtual ~Runtime() = default;
+    virtual bool popPending(Data &key, int previous, int &token) = 0;
     virtual void warmupDecodeGraph() = 0;
     virtual std::unique_ptr<basellm::DecodePipeline> pipeline(ResponseContext &context) = 0;
     virtual std::vector<int> forward(const Data &ids, const std::vector<Data *> &positions,
@@ -75,6 +84,11 @@ public:
     std::string MakeInput(const std::string &history, int round, const std::string &input) override;
     std::string MakeHistory(const std::string &history, int round, const std::string &input,
                             const std::string &output) override;
+    bool draftEnabled() const { return cfg.draft.steps > 0; }
+    bool PopPendingResponseToken(ResponseContext *ctx, int previous, int &token) override {
+        return draftEnabled() && ctx && !ctx->pastKeyValues.empty() &&
+               runtime->popPending(ctx->pastKeyValues[0].first, previous, token);
+    }
     bool SupportsDecodePipeline() const override;
     // Inkling has no restorable partial convolution history. The scheduler
     // drains terminal tickets before retiring their private KV.

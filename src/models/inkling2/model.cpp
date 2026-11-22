@@ -113,6 +113,49 @@ void Inkling2Model::InitParams() {
             cfg.visits.push_back(layer);
     for (int layer = cfg.end; layer < cfg.layers; ++layer)
         cfg.visits.push_back(layer);
+    auto &draft = cfg.draft;
+    draft = {};
+    const char *steps = std::getenv("FASTLLM_DSPARK_TOKENS");
+    draft.steps = steps ? std::stoi(steps) : 0;
+    if (draft.steps < 0) throw std::runtime_error("Negative Inkling proposal count");
+    if (draft.steps > 0) {
+        auto read = [&](const std::string &key) {
+            const auto it = weight.dicts.find("mtp_config." + key);
+            if (it == weight.dicts.end()) throw std::runtime_error("Missing Inkling draft setting: " + key);
+            std::string error;
+            auto value = json11::Json::parse(it->second, error);
+            if (!error.empty()) throw std::runtime_error("Invalid Inkling draft setting: " + key);
+            return value;
+        };
+        draft.block = read("block_size").int_value();
+        draft.maxPositions = read("max_position_embeddings").int_value();
+        draft.layers = read("num_hidden_layers").int_value();
+        draft.heads = read("num_attention_heads").int_value();
+        draft.kvHeads = read("num_key_value_heads").int_value();
+        draft.dim = read("head_dim").int_value();
+        draft.intermediate = read("intermediate_size").int_value();
+        draft.rank = read("markov_rank").int_value();
+        draft.window = read("sliding_window_size").int_value();
+        draft.theta = read("rope_theta").number_value();
+        draft.eps = read("rms_norm_eps").number_value();
+        if (draft.steps >= draft.block || draft.maxPositions < draft.block || draft.layers <= 0 || draft.heads <= 0 || draft.kvHeads <= 0 ||
+            draft.heads % draft.kvHeads || draft.dim != 128 || draft.rank <= 0 || draft.intermediate <= 0 ||
+            draft.theta <= 0 || draft.eps <= 0 || draft.window <= 0 || read("hidden_size").int_value()!=cfg.hidden ||
+            weight.dicts.at("mtp_config.markov_head_type") != "rnn_hidden" ||
+            read("q_bias").bool_value() || read("o_bias").bool_value())
+            throw std::runtime_error("Unsupported Inkling DSpark configuration or proposal count");
+        draft.local.assign(draft.layers, false);
+        auto local = read("local_layer_ids"), taps = read("target_layer_ids");
+        for (auto &i : local.array_items()) draft.local.at(i.int_value()) = true;
+        for (auto &i : taps.array_items()) {
+            int id = i.int_value();
+            if (id < 0 || (!draft.taps.empty() && id <= draft.taps.back()))
+                throw std::runtime_error("Invalid Inkling draft target visits");
+            draft.taps.push_back(id);
+        }
+        if (draft.taps.empty() || draft.taps.back() != int(cfg.visits.size()))
+            throw std::runtime_error("Inkling draft must include the final target normalization");
+    }
     placement.gpu = cudaId(SelectDeviceFromMap(deviceMap, 1, 1));
     for (const auto &item : deviceMap)
         if (cudaId(item.first) != placement.gpu)
@@ -163,6 +206,13 @@ Inkling2Model::GetTensorMap(const std::vector<std::string> &names) {
         dense.insert(prefix + ".controllers.mlp.down_weight");
     }
     for (const auto &name : names) {
+        if (draftEnabled() && name.rfind("inkling_draft.", 0) == 0) {
+            const std::string key = name.substr(14);
+            bool matrix = (key.find("_proj.weight") != std::string::npos ||
+                           key.find("_proj_ctx.weight") != std::string::npos ||
+                           key == "markov_head.hidden_out.weight" || key == "markov_head.markov_w1.weight");
+            result[name].emplace_back("model.llm.draft." + key, matrix ? denseType : FLOAT32);
+        }
         if (name.compare(0, 10, "model.llm.") == 0 && name.find(".mlp.experts.") == std::string::npos)
             result[name].emplace_back(name, dense.count(name) ? denseType : FLOAT32);
     }

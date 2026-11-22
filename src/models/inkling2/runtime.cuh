@@ -19,8 +19,8 @@ class DecodeGraphScratch {
     std::vector<Block> blocks;
     std::vector<size_t> order;
     size_t cursor = 0;
-public:
     bool sealed = false;
+public:
     static thread_local DecodeGraphScratch *active;
     struct Scope {
         DecodeGraphScratch *previous;
@@ -29,8 +29,33 @@ public:
         Scope(const Scope &) = delete;
     };
     std::shared_ptr<void> Acquire(size_t bytes);
-    void FinishCapture() {
-        if (cursor != order.size()) throw std::runtime_error("Inkling decode scratch plan was not consumed");
+    template <class Body> void Warmup(Body &&body) {
+        Scope scope(*this);
+        body();
+        check(cudaStreamSynchronize(cudaStreamPerThread));
+        sealed = true;
+    }
+    template <class Body> void Capture(cudaGraphExec_t &exec, Body &&body, size_t *nodes = nullptr) {
+        cudaGraph_t graph = nullptr;
+        check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        bool capturing = true;
+        try {
+            {
+                Scope scope(*this);
+                body();
+            }
+            auto status = cudaStreamEndCapture(cudaStreamPerThread, &graph);
+            capturing = false;
+            check(status);
+            if (cursor != order.size()) throw std::runtime_error("Inkling graph scratch plan was not consumed");
+            if (nodes) check(cudaGraphGetNodes(graph, nullptr, nodes));
+            check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        } catch (...) {
+            if (capturing) cudaStreamEndCapture(cudaStreamPerThread, &graph);
+            if (graph) cudaGraphDestroy(graph);
+            throw;
+        }
+        cudaGraphDestroy(graph);
         std::vector<size_t>().swap(order);
     }
     size_t Bytes() const {
@@ -96,7 +121,7 @@ __device__ inline float blockSum(float v, float *scratch) {
 class ExpertBackend {
 public:
     virtual ~ExpertBackend() = default;
-    virtual Matrix run(const Config &, const Matrix &input, const float *bias) const = 0;
+    virtual Matrix run(const Config &, const Matrix &input, const float *bias, bool decodeArithmetic = false) const = 0;
 };
 std::vector<std::unique_ptr<ExpertBackend>> loadExperts(const Config &, const Placement &,
                                                         const std::map<std::string, TensorRange> &, const WeightMap &);

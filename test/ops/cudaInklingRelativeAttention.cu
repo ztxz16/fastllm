@@ -35,8 +35,95 @@ Buffer<T> upload(const std::vector<T> &v) {
     return gpu;
 }
 
+// Two requests have different page mappings. End one chain early and compare
+// every verification row (including padding) to a standalone decode launch.
+template<int D, class T>
+void compareVerifyChain(AttentionRow a, PageView pages, std::vector<int2> ids, int past,
+                        int chain, int splits, int sm120Splits) {
+    const int rows = 2 * chain, width = a.heads * D;
+    std::reverse(ids.begin(), ids.end());
+    auto otherPages = upload(ids);
+    std::vector<DecodeVisit> descriptors(rows);
+    for (int r = 0; r < rows; ++r) {
+        auto &v = descriptors[r];
+        v.pages = pages;
+        v.past = past + r % chain;
+        v.verifyRemaining = chain - r % chain;
+        if (r >= chain) {
+            v.pages.ids = otherPages.p;
+            v.verifyRemaining = chain / 2 + 1 - r % chain;
+            v.past = past + 1 + std::min(r % chain, chain / 2);
+        }
+    }
+    auto visits = upload(descriptors);
+    a.visit = visits.p;
+    Matrix batchScratch(splits, rows * a.heads * (D + 1)), singleScratch(splits, a.heads * (D + 1));
+    Matrix batched(rows, width), single(rows, width);
+    // Gates and sinks share a packed projection row in the production graph.
+    // The standalone launches below use the original contiguous reference inputs.
+    a.sinkStride = a.gateStride = width + a.heads + 3;
+    Matrix packedGates(rows, a.gateStride);
+    float *gate = packedGates.p, *sink = gate + width;
+    check(cudaMemcpy2DAsync(gate, a.gateStride * sizeof(float), a.q, width * sizeof(float),
+                            width * sizeof(float), rows, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    check(cudaMemcpy2DAsync(sink, a.sinkStride * sizeof(float), a.sink, a.heads * sizeof(float),
+                            a.heads * sizeof(float), rows, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+    launchSplitRelative<D,T>(a, batchScratch, sink, gate, batched.p, sm120Splits, rows, chain);
+    for (int r = 0; r < rows; ++r) {
+        AttentionRow one = a;
+        one.visit += r;
+        one.q += r * width;
+        one.relative += r * a.heads * a.distances;
+        launchSplitRelative<D,T>(one, singleScratch, a.sink + r * a.heads, one.q, single.p + r * width, sm120Splits);
+    }
+    std::vector<float> actual(rows * width), expected(actual.size());
+    check(cudaMemcpy(actual.data(), batched.p, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(expected.data(), single.p, expected.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    if (std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)))
+        throw std::runtime_error("Verification attention differs from standalone decode");
+    if constexpr (D == 128 && std::is_same_v<T, half>) {
+        if (!a.window && configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyGlobal)) {
+            const float *referenceGate = a.q;
+            std::vector<float> query(size_t(rows) * width);
+            check(cudaMemcpy(query.data(), a.q, query.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            std::vector<half> packed(query.size() * 2);
+            for (size_t j = 0; j < query.size(); ++j) {
+                const size_t at = j / D * (2 * D) + j % D;
+                packed[at] = half(query[j]);
+                packed[at + D] = half(query[j] - float(packed[at]));
+            }
+            auto q = upload(packed);
+            a.q = reinterpret_cast<const float *>(q.p);
+            launchVerifyGlobal(a, batchScratch, sink, gate, batched.p, rows, chain, splits);
+            for (int r = 0; r < rows; ++r) {
+                auto one = a;
+                one.q += size_t(r) * width;
+                one.relative += size_t(r) * a.heads * a.distances;
+                one.visit += r;
+                launchVerifyGlobal(one, singleScratch, a.sink + size_t(r) * a.heads, referenceGate + size_t(r) * width,
+                                   single.p + size_t(r) * width, 1, 1, splits);
+            }
+            const auto baseline = expected;
+            check(cudaMemcpy(actual.data(), batched.p, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            check(cudaMemcpy(expected.data(), single.p, expected.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            double diff = 0., norm = 0.;
+            for (size_t j = 0; j < actual.size(); ++j) {
+                const bool live = descriptors[j / width].verifyRemaining > 0;
+                if (actual[j] != (live ? expected[j] : 0.f))
+                    throw std::runtime_error("Paged verification differs from singleton attention");
+                if (live) {
+                    diff += std::pow(double(actual[j]) - baseline[j], 2);
+                    norm += std::pow(double(baseline[j]), 2);
+                }
+            }
+            if (!(diff <= norm * 1e-8)) throw std::runtime_error("Paged attention differs from the decode reference");
+        }
+    }
+    printf("verification attention exact: window=%d past=%d chain=%d requests=2\n", a.window, past, chain);
+}
+
 template<int D, class T, class Gate = void, class Bias = float>
-void compare(int group, int past, int rows, int window, int pageLen, bool committed, int splits = 28, bool deviceVisit = false, int sm120Splits = 0, bool prefill = false) {
+void compare(int group, int past, int rows, int window, int pageLen, bool committed, int splits = 28, bool deviceVisit = false, int sm120Splits = 0, bool prefill = false, int chain = 0) {
     const int kv = 2, heads = group * kv, stride = D * kv, extent = 125;
     const int begin = window ? std::max(0, past - window) : 0;
     const int firstPage = begin / pageLen, end = past + rows;
@@ -69,6 +156,10 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
     AttentionRow a{dq.p, committed ? nullptr : dk.p + past * stride, committed ? nullptr : dv.p + past * stride,
                    p, dr.p, ds.p, output.p, (committed || deviceVisit) ? descriptor.p : nullptr,
                    past, 0, heads, kv, D, extent, window, 16, 0.3f};
+    if (chain) {
+        if (rows != 2 * chain || !committed) throw std::logic_error("Invalid verification fixture");
+        return compareVerifyChain<D,T>(a, p, ids, past, chain, splits, sm120Splits);
+    }
     std::vector<float> result(rows * heads * D);
     std::vector<float> compactGate;
     const int gateStride = heads * D + 13;
@@ -218,7 +309,17 @@ int testRelative() {
             compare<64, half>(2, 2050, 39, window, 128, false, 1, false, 0, true);
         }
     }
-    if (supportsGlobalRelativeSm120(gpu)) {
+    const bool sm120 = supportsGlobalRelativeSm120(gpu);
+    for (int chain : {3, 7, 8}) {
+        // Cross a partition-size boundary, then the point where the window starts sliding.
+        for (int past : {446, 1019})
+            compare<128, half>(3, past, 2 * chain, 1024, 37, true, 28, true, 0, false, chain);
+        for (int past : {14, 399, 4093})
+            compare<128, half>(3, past, 2 * chain, 0, 37, true, 28, true, sm120 ? 26 : 0, false, chain);
+    }
+    // Span different split grains and more than one query tile, including clipped padding.
+    compare<128, half>(3, 28 * 128 - 4, 46, 0, 37, true, 28, true, sm120 ? 26 : 0, false, 23);
+    if (sm120) {
         // Partial warp tiles, a partially filled last split, odd page sizes,
         // long contexts, and independently permuted K/V.
         for (int past : {0, 1, 14, 15, 16, 62, 63, 64, 1023, 4095, 4100, 8191, 8317})

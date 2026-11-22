@@ -10,7 +10,18 @@ struct AttentionRow {
     const DecodeVisit *visit;
     int past, first, heads, kvHeads, width, distances, window, floor;
     float alpha;
+    int sinkStride = heads, gateStride = heads * width;
 };
+
+// Keep each query's split boundaries and reduction order identical to decode.
+// Adjacent CTAs process consecutive queries against the same physical KV pages.
+template<int D>
+__device__ void selectSplitQuery(AttentionRow &a, float *&partial, int row, int splits) {
+    a.visit += row;
+    a.q += size_t(row) * a.heads * D;
+    a.relative += size_t(row) * a.heads * a.distances;
+    partial += size_t(row) * splits * a.heads * (D + 1);
+}
 
 template<class T> struct KVSegment {
     PageView pages;
@@ -118,14 +129,22 @@ __global__ void relativeAttention(AttentionRow a, float *partial) {
         2, 2, vector, lanes, G, groups, RelativeAttention>(p, attentionStorage, 0, blockIdx.y);
 }
 
-template<class T>
+template<class T, bool ToShared = false>
 __device__ void loadRelativeKV(PageView pages, int token, int stride, int channel, uint4 &k, uint4 &v) {
     const int page = pages.shift >= 0 ? token >> pages.shift : token / pages.pageLen;
     const int2 ids = pages.ids[page - pages.first];
     const size_t offset = size_t(token - page * pages.pageLen) * stride + channel;
     const size_t pageStride = size_t(pages.pageLen) * stride;
-    k = *reinterpret_cast<const uint4 *>(static_cast<const T *>(pages.key) + ids.x * pageStride + offset);
-    v = *reinterpret_cast<const uint4 *>(static_cast<const T *>(pages.value) + ids.y * pageStride + offset);
+    const auto *key = reinterpret_cast<const uint4 *>(static_cast<const T *>(pages.key) + ids.x * pageStride + offset);
+    const auto *value = reinterpret_cast<const uint4 *>(static_cast<const T *>(pages.value) + ids.y * pageStride + offset);
+    if constexpr (ToShared) {
+        using namespace flashinfer::cp_async;
+        load_128b<PrefetchMode::kNoPrefetch>(&k, key);
+        load_128b<PrefetchMode::kNoPrefetch>(&v, value);
+    } else {
+        k = *key;
+        v = *value;
+    }
 }
 
 // Score independent KV rows in parallel and consume V in chronological
@@ -134,8 +153,45 @@ __device__ void loadRelativeKV(PageView pages, int token, int stride, int channe
 constexpr int windowTileRows = 48;
 template<int D, int G> constexpr int windowThreads = D * G > 256 ? D * G : 256;
 
-template<int D, int G, class T, bool SingleTile>
+// Preserve the same online softmax and value accumulation order for a single
+// decode row and a window tile shared by several verification rows.
+template <int G, bool Prefetch, bool ClampTail, size_t channelsPerLane, int D, class T>
+__device__ __forceinline__ void accumulateRelativeValues(flashinfer::state_t<channelsPerLane> &state,
+                                                         const float *scores, const T (*values)[D], int channel,
+                                                         int n) {
+    constexpr int tile = 2 * G;
+    for (int base = 0; base < n; base += tile) {
+        flashinfer::vec_t<float, channelsPerLane> prefetched[tile];
+        if constexpr (Prefetch) {
+#pragma unroll
+            for (int t = 0; t < tile; ++t) prefetched[t].cast_load(&values[base + t][channel]);
+        }
+        float maximum = state.m;
+#pragma unroll
+        for (int t = 0; t < tile; ++t) maximum = fmaxf(maximum, scores[base + t]);
+        const float rescale = flashinfer::math::ptx_exp2(state.m - maximum);
+        state.m = maximum;
+        state.d *= rescale;
+#pragma unroll
+        for (int c = 0; c < channelsPerLane; ++c) state.o[c] = __fmul_rn(state.o[c], rescale);
+#pragma unroll
+        for (int t = 0; t < tile; ++t) {
+            const float w = flashinfer::math::ptx_exp2(scores[base + t] - maximum);
+            state.d += w;
+            flashinfer::vec_t<float, channelsPerLane> value;
+            if constexpr (!Prefetch)
+                value.cast_load(&values[ClampTail ? min(base + t, n - 1) : base + t][channel]);
+            else
+                value = prefetched[t];
+#pragma unroll
+            for (int c = 0; c < channelsPerLane; ++c) state.o[c] += w * value[c];
+        }
+    }
+}
+
+template<int D, int G, class T, bool SingleTile, bool Batched = false>
 __global__ void tiledRelative(AttentionRow a, float *partial) {
+    if constexpr (Batched) selectSplitQuery<D>(a, partial, blockIdx.x, gridDim.z);
     constexpr int vec = 16 / sizeof(T), lanes = D / vec, tile = 2 * G;
     constexpr int threads = SingleTile ? windowThreads<D,G> : 256, rowsPerPass = threads / lanes;
     // Global KV loads use two passes per stripe. Keep complete online-softmax
@@ -202,32 +258,7 @@ __global__ void tiledRelative(AttentionRow a, float *partial) {
         }
         __syncthreads();
         if (tid < G * D / channelsPerLane) {
-            for (int base = 0; base < n; base += tile) {
-                flashinfer::vec_t<float,channelsPerLane> prefetched[tile];
-                if constexpr (!SingleTile) {
-#pragma unroll
-                    for (int t = 0; t < tile; ++t)
-                        prefetched[t].cast_load(&values[base + t][channel]);
-                }
-                float maximum = state.m;
-#pragma unroll
-                for (int t = 0; t < tile; ++t) maximum = fmaxf(maximum, scores[h][base + t]);
-                const float rescale = flashinfer::math::ptx_exp2(state.m - maximum);
-                state.m = maximum;
-                state.d *= rescale;
-#pragma unroll
-                for (int c = 0; c < channelsPerLane; ++c) state.o[c] = __fmul_rn(state.o[c], rescale);
-#pragma unroll
-                for (int t = 0; t < tile; ++t) {
-                    const float w = flashinfer::math::ptx_exp2(scores[h][base + t] - maximum);
-                    state.d += w;
-                    flashinfer::vec_t<float,channelsPerLane> value;
-                    if constexpr (SingleTile) value.cast_load(&values[base + t][channel]);
-                    else value = prefetched[t];
-#pragma unroll
-                    for (int c = 0; c < channelsPerLane; ++c) state.o[c] += w * value[c];
-                }
-            }
+            accumulateRelativeValues<G, !SingleTile, false>(state, scores[h], values, channel, n);
         }
         if constexpr (SingleTile) break;
         if (offset + relativeTileRows < count) __syncthreads();
@@ -240,11 +271,22 @@ __global__ void tiledRelative(AttentionRow a, float *partial) {
     if (!channel) partial[size_t(splits) * a.heads * D + row] = state.get_lse();
 }
 
+#include "attention-verify.cuh"
+
 // Merge normalized partial outputs using their base-2 log normalizers.
 // The learned sink is a zero-valued token and contributes to the denominator once.
-template<int D, class Act, bool HeadMajor = false>
+template<int D, class Act, bool HeadMajor = false, bool Batched = false>
 __global__ void mergeRelative(AttentionRow a, const float *partial, int splits,
                               const Act *sinks, const Act *gate, Act *output) {
+    if constexpr (Batched) {
+        const int row = blockIdx.z;
+        a.visit += row;
+        partial += size_t(row) * splits * a.heads * (D + 1);
+        sinks += size_t(row) * a.sinkStride;
+        if (gate) gate += size_t(row) * a.gateStride;
+        output += size_t(row) * a.heads * D;
+    }
+
     const int past = a.visit ? a.visit->past : a.past;
     const int length = a.window ? min(past + 1, a.window) : past + 1;
     const int chunk = max(16, (length + splits - 1) / splits);
@@ -282,9 +324,18 @@ __global__ void mergeRelative(AttentionRow a, const float *partial, int splits,
 
 // Up to one warp of splits: prefetch the partials, broadcast normalizers
 // with shuffles, and accumulate in the same split order as mergeRelative.
-template<int D, class Act, bool HeadMajor = false>
+template<int D, class Act, bool HeadMajor = false, bool Batched = false>
 __global__ void mergeRelativeWarp(AttentionRow a, const float *partial, int splits,
                                   const Act *sinks, const Act *gate, Act *output) {
+    if constexpr (Batched) {
+        const int row = blockIdx.z;
+        a.visit += row;
+        partial += size_t(row) * splits * a.heads * (D + 1);
+        sinks += size_t(row) * a.sinkStride;
+        if (gate) gate += size_t(row) * a.gateStride;
+        output += size_t(row) * a.heads * D;
+    }
+
     const int head = blockIdx.x, lane = threadIdx.x % 32;
     const int channel = head * D + blockIdx.y * blockDim.x + threadIdx.x;
     const int past = a.visit ? a.visit->past : a.past;
@@ -326,13 +377,15 @@ void launchRelativeKernel(AttentionRow a, int rows, float *partial, int splits) 
 }
 
 template<int D, bool HeadMajor, int Channels = 64, class Act>
-void launchRelativeMerge(AttentionRow a, const Matrix &scratch, const Act *sink, const Act *gate, Act *out) {
+void launchRelativeMerge(AttentionRow a, const Matrix &scratch, const Act *sink, const Act *gate, Act *out, int rows = 1) {
     const int splits = scratch.rows;
     if (splits <= 32) {
         static_assert(D % Channels == 0);
-        mergeRelativeWarp<D,Act,HeadMajor><<<dim3(a.heads,D/Channels),Channels,0,cudaStreamPerThread>>>(a, scratch.p, splits, sink, gate, out);
+        auto kernel = rows > 1 ? mergeRelativeWarp<D,Act,HeadMajor,true> : mergeRelativeWarp<D,Act,HeadMajor>;
+        kernel<<<dim3(a.heads,D/Channels,rows),Channels,0,cudaStreamPerThread>>>(a, scratch.p, splits, sink, gate, out);
     } else {
-        mergeRelative<D,Act,HeadMajor><<<a.heads,D,splits*sizeof(float),cudaStreamPerThread>>>(a, scratch.p, splits, sink, gate, out);
+        auto kernel = rows > 1 ? mergeRelative<D,Act,HeadMajor,true> : mergeRelative<D,Act,HeadMajor>;
+        kernel<<<dim3(a.heads,1,rows),D,splits*sizeof(float),cudaStreamPerThread>>>(a, scratch.p, splits, sink, gate, out);
     }
 }
 
@@ -340,31 +393,47 @@ void launchRelativeMerge(AttentionRow a, const Matrix &scratch, const Act *sink,
 
 template<int D, class T, class Act>
 void launchSplitRelative(AttentionRow a, const Matrix &scratch, const Act *sink, const Act *gate, Act *out,
-                         int sm120Splits = 0) {
+                         int sm120Splits = 0, int rows = 1, int chain = 1) {
     const int splits = scratch.rows;
     const bool grouped = a.heads == 3 * a.kvHeads;
     if (a.visit && !a.key && !a.value) {
         if (a.window > 0 && a.window <= int64_t(windowTileRows) * splits) {
+            if constexpr (D == 128 && std::is_same_v<T, half>) {
+                if (grouped && chain > 1) {
+                    constexpr int tile = 4;
+                    const int blocks = (rows / chain) * ((chain + tile - 1) / tile);
+                    verifyWindowTile<tile><<<dim3(blocks, a.kvHeads, splits), tile * 3 * 32, 0, cudaStreamPerThread>>>(
+                        a, scratch.p, chain);
+                    launchRelativeMerge<D,true>(a, scratch, sink, gate, out, rows);
+                    return;
+                }
+            }
             if (grouped)
-                tiledRelative<D,3,T,true><<<dim3(1,a.kvHeads,splits),windowThreads<D,3>,0,cudaStreamPerThread>>>(a, scratch.p);
+                (rows > 1 ? tiledRelative<D,3,T,true,true> : tiledRelative<D,3,T,true>)<<<dim3(rows,a.kvHeads,splits),windowThreads<D,3>,0,cudaStreamPerThread>>>(a, scratch.p);
             else
-                tiledRelative<D,1,T,true><<<dim3(1,a.heads,splits),windowThreads<D,1>,0,cudaStreamPerThread>>>(a, scratch.p);
-            launchRelativeMerge<D,true>(a, scratch, sink, gate, out);
+                (rows > 1 ? tiledRelative<D,1,T,true,true> : tiledRelative<D,1,T,true>)<<<dim3(rows,a.heads,splits),windowThreads<D,1>,0,cudaStreamPerThread>>>(a, scratch.p);
+            launchRelativeMerge<D,true>(a, scratch, sink, gate, out, rows);
             return;
         }
         if constexpr (D == 128 && std::is_same_v<T, half>) {
             if (!a.window && sm120Splits > 0 && sm120Splits <= splits && grouped && a.width == D) {
-                globalRelativeSm120<<<dim3(1,a.kvHeads,sm120Splits),128,0,cudaStreamPerThread>>>(a, scratch.p);
-                launchRelativeMerge<D,true,32>(a, scratch.slice(0, sm120Splits), sink, gate, out);
+                const int tiles = (3 * chain + 3) / 4;
+                if (tiles < chain)
+                    globalRelativeSm120<true><<<dim3((rows / chain) * tiles, a.kvHeads, sm120Splits), 128, 0,
+                                                cudaStreamPerThread>>>(a, scratch.p, chain);
+                else
+                    globalRelativeSm120<false><<<dim3(rows, a.kvHeads, sm120Splits), 128, 0,
+                                                 cudaStreamPerThread>>>(a, scratch.p);
+                launchRelativeMerge<D,true,32>(a, scratch.slice(0, sm120Splits), sink, gate, out, rows);
                 return;
             }
         }
         // Long windows and global attention both consume stripes in chronological order.
         if (grouped)
-            tiledRelative<D,3,T,false><<<dim3(1,a.kvHeads,splits),256,0,cudaStreamPerThread>>>(a, scratch.p);
+            (rows > 1 ? tiledRelative<D,3,T,false,true> : tiledRelative<D,3,T,false>)<<<dim3(rows,a.kvHeads,splits),256,0,cudaStreamPerThread>>>(a, scratch.p);
         else
-            tiledRelative<D,1,T,false><<<dim3(1,a.heads,splits),256,0,cudaStreamPerThread>>>(a, scratch.p);
-        launchRelativeMerge<D,true,32>(a, scratch, sink, gate, out);
+            (rows > 1 ? tiledRelative<D,1,T,false,true> : tiledRelative<D,1,T,false>)<<<dim3(rows,a.heads,splits),256,0,cudaStreamPerThread>>>(a, scratch.p);
+        launchRelativeMerge<D,true,32>(a, scratch, sink, gate, out, rows);
         return;
     } else if (grouped) {
         launchRelativeKernel<D,3,true,T>(a, 1, scratch.p, splits);

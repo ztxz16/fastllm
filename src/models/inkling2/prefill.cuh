@@ -72,8 +72,7 @@ __global__ __launch_bounds__(Traits::NUM_THREADS) void pagedRelativePrefill(Para
 template<int D, class KV> using PrefillTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal, 64, 1, 2, 2*D/16, D/16, 4, 1,
         flashinfer::PosEncodingMode::kNone, KV, KV, float, float, int, PrefillRelative, false>;
 
-template<class Traits, class Params> bool configurePrefillKernel() {
-    auto kernel = pagedRelativePrefill<Traits, Params>;
+template<class Traits, class Params> bool configurePrefillKernel(void (*kernel)(Params) = pagedRelativePrefill<Traits, Params>) {
     cudaFuncAttributes attr{};
     auto status = cudaFuncGetAttributes(&attr, kernel);
     if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
@@ -128,6 +127,133 @@ template<int D, class KV> void launchPrefill(const AttentionRow &a, KV *query, i
     p.relative = a.relative;
     p.o = a.output + size_t(a.first) * a.heads * D;
     runPrefill<PrefillTraits<D, KV>, D>(p, a, query, rows);
+}
+
+// Split the paged prefill scan across the device for a short chain of
+// verification queries. The merge includes the sink exactly once per query.
+struct VerifyRelative : PrefillRelative {
+    using PrefillRelative::PrefillRelative;
+    REGISTER_OUTPUT_TRANSFORM(p, out, batch, row, head, m, d, scale, {
+        return d > 0.f ? out / d : 0.f;
+    })
+};
+using VerifyTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal, 32, 1, 2, 16, 8, 2, 1,
+    flashinfer::PosEncodingMode::kNone, half, half, float, float, int, VerifyRelative, false>;
+
+struct VerifyPrefillParams : PrefillParams<half, 128> {
+    const DecodeVisit *visits;
+    int chain, maxSplits;
+};
+
+// Partition by absolute position. Rows on opposite sides of a grain
+// boundary run as separate segments so their FP32 reduction order matches
+// single-token decode, even in a clipped, multi-request graph replay.
+struct VerifyPartition {
+    int chunk, first, end;
+    __device__ VerifyPartition(int past, int row, int live, int limit) {
+        constexpr int tile = VerifyTraits::CTA_TILE_KV;
+        const int tiles = (past + row) / tile + 1;
+        const int grain = max(4, (tiles - 1) / limit + 1);
+        chunk = grain * tile;
+        first = grain == 4 ? 0 : int(max(0LL, 1LL * (grain - 1) * tile * limit - past));
+        end = int(min(static_cast<long long>(live), 1LL * chunk * limit - past));
+    }
+};
+
+__device__ __forceinline__ void verifySegment(VerifyPrefillParams p, const DecodeVisit &visit, int first,
+                                              int rows, int tile, int split, int chunk) {
+    p.past = visit.past;
+    p.rows = rows;
+    const int length = p.past + rows;
+    if (tile * VerifyTraits::CTA_TILE_Q >= rows * unsigned(p.group_size) || split > (length - 1) / chunk) return;
+    p.relative += size_t(first) * p.num_qo_heads * p.distances;
+    p.q += size_t(first) * p.q_stride_n;
+    p.o += size_t(first) * p.maxSplits * p.num_qo_heads * 128;
+    p.lse += size_t(first) * p.maxSplits * p.num_qo_heads;
+    p.paged_kv.length = length;
+    const int stride = gridDim.z * 128;
+    p.paged_kv.k_data = {visit.pages, nullptr, 0, p.past, stride, false};
+    p.paged_kv.v_data = {visit.pages, nullptr, 0, p.past, stride, true};
+    int zero = 0, indptr[] = {0, length};
+    p.request_indices = p.q_indptr = p.o_indptr = &zero;
+    p.qo_tile_indices = &tile;
+    p.kv_tile_indices = &split;
+    p.kv_chunk_size_ptr = &chunk;
+    p.paged_kv.indptr = indptr;
+    extern __shared__ uint8_t smem[];
+    auto &storage = *reinterpret_cast<VerifyTraits::SharedStoragePaged *>(smem);
+    flashinfer::BatchPrefillWithPagedKVCacheDevice<VerifyTraits>(p, storage, threadIdx, 0, blockIdx.z, gridDim.z);
+}
+
+__global__ __launch_bounds__(VerifyTraits::NUM_THREADS) void pagedVerifyGlobal(VerifyPrefillParams p) {
+    const int group = p.group_size;
+    const int tiles = (p.chain * group + VerifyTraits::CTA_TILE_Q - 1) / VerifyTraits::CTA_TILE_Q;
+    const int first = blockIdx.x / tiles * p.chain, tile = blockIdx.x % tiles;
+    const DecodeVisit &visit = p.visits[first];
+    const int live = p.chain == 1 ? 1 : visit.verifyRemaining;
+    for (int row = 0; row < live;) {
+        const VerifyPartition part(visit.past, row, live, p.maxSplits);
+        verifySegment(p, p.visits[first + row], first + row, part.end - row, tile, blockIdx.y, part.chunk);
+        row = part.end;
+        if (row < live) __syncthreads();
+    }
+}
+
+template<class Act>
+__global__ void mergeVerifyGlobal(VerifyPrefillParams p, const Act *sinks, const Act *gate, Act *out,
+                                  int sinkStride, int gateStride) {
+    const int row = blockIdx.x, head = blockIdx.y, channel = threadIdx.x;
+    const int local = row % p.chain, first = row - local;
+    const size_t dst = (size_t(row) * p.num_qo_heads + head) * 128 + channel;
+    const DecodeVisit &visit = p.visits[first];
+    const int live = p.chain == 1 ? 1 : visit.verifyRemaining;
+    if (local >= live) {
+        out[dst] = Act(0.f);
+        return;
+    }
+    const VerifyPartition part(visit.past, local, live, p.maxSplits);
+    const int splits = (visit.past + part.end - 1) / part.chunk + 1, active = (visit.past + local) / part.chunk + 1;
+    const size_t base = (size_t(first + part.first) * p.maxSplits + size_t(local - part.first) * splits) * p.num_qo_heads + head;
+    const float sink = float(sinks[size_t(row) * sinkStride + head]) * RelativeAttention::sm_scale_log2;
+    float maximum = sink;
+    for (int s = 0; s < active; ++s) maximum = fmaxf(maximum, p.lse[base + s * p.num_qo_heads]);
+    float denom = exp2f(sink - maximum), sum = 0.f;
+    for (int s = 0; s < active; ++s) {
+        const size_t i = base + s * p.num_qo_heads;
+        const float w = exp2f(p.lse[i] - maximum);
+        denom += w;
+        sum += w * p.o[i * 128 + channel];
+    }
+    out[dst] = Act(sum / denom / (1.f + expf(-float(gate[size_t(row) * gateStride + head * 128 + channel]))));
+}
+
+template<class Act>
+void launchVerifyGlobal(const AttentionRow &a, const Matrix &scratch, const Act *sink, const Act *gate,
+                        Act *out, int rows, int chain, int maxSplits) {
+    VerifyPrefillParams p{};
+    p.q = reinterpret_cast<half *>(const_cast<float *>(a.q));
+    p.o = scratch.p;
+    p.lse = p.o + size_t(rows) * maxSplits * a.heads * 128;
+    p.visits = a.visit;
+    p.chain = chain;
+    p.maxSplits = maxSplits;
+    p.relative = a.relative;
+    p.distances = a.distances;
+    p.floor = a.floor;
+    p.alpha = a.alpha;
+    p.num_qo_heads = a.heads;
+    const int group = a.heads / a.kvHeads;
+    p.group_size = group;
+    p.q_stride_h = 256;
+    p.q_stride_n = a.heads * p.q_stride_h;
+    p.qkScale = 1.f / sqrtf(128.f);
+    p.sm_scale = 1.f;
+    p.window_left = -1;
+    p.partition_kv = true;
+    const int tiles = (chain * group + VerifyTraits::CTA_TILE_Q - 1) / VerifyTraits::CTA_TILE_Q;
+    pagedVerifyGlobal<<<dim3(rows / chain * tiles, maxSplits, a.kvHeads), dim3(32, VerifyTraits::NUM_WARPS_Q),
+                        sizeof(VerifyTraits::SharedStoragePaged), cudaStreamPerThread>>>(p);
+    mergeVerifyGlobal<<<dim3(rows, a.heads), 128, 0, cudaStreamPerThread>>>(p, sink, gate, out, a.sinkStride, a.gateStride);
 }
 
 // One warp owns 16 packed (query, head) rows. Each lane visits the same two

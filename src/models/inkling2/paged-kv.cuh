@@ -114,6 +114,7 @@ struct DecodeVisit {
     PageView pages;
     float *history[4];
     int past;
+    int verifyRemaining = 0;
 };
 
 template<class T>

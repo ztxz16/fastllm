@@ -4800,6 +4800,13 @@ if (UNIT_TEST)
         target_link_libraries(deepseekV41AttentionParallelRegression fastllm)
         target_include_directories(deepseekV41AttentionParallelRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         if(UNIX)
+            if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                # Model-backed check. Pass the checkpoint containing mtp.safetensors.
+                add_executable(inkling2DsparkRegression test/basic/test_inkling_dspark.cpp)
+                target_include_directories(inkling2DsparkRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+                target_link_libraries(inkling2DsparkRegression PRIVATE fastllm_tools fastkv ${FASTLLM_TEST_CUDART} ${CMAKE_DL_LIBS})
+                set_target_properties(inkling2DsparkRegression PROPERTIES ENABLE_EXPORTS ON)
+            endif()
             # Requires the TP fixture and eight otherwise idle GPUs; arguments
             # select DP topology, KV dtype, batch size and admission layout.
             add_executable(deepseekV41DsparkBatchRegression test/basic/test_deepseek_v41_dspark_batch.cpp)

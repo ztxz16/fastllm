@@ -5371,6 +5371,16 @@ namespace fastllm {
         }
         NormalizeSafeTensorSources(config["quantization_config"]["quant_method"].string_value(), safeTensors.itmeDict);
         if (auto *inkling = dynamic_cast<Inkling2Model *>(model)) {
+            if (inkling->draftEnabled()) {
+                const std::string draftFile = path + "mtp.safetensors";
+                AssertInFastLLM(FileExists(draftFile), "Inkling DSpark requires " + draftFile);
+                SafeTensors draft({draftFile});
+                for (const auto &entry : draft.itmeDict) {
+                    const std::string name = "inkling_draft." + entry.first;
+                    safeTensors.itmeDict[name] = entry.second;
+                    safeTensors.itmeDict[name].tensorName = name;
+                }
+            }
             for (const auto &entry : safeTensors.itmeDict) {
                 const auto &t = entry.second;
                 if (entry.first.find(".mlp.experts.") != std::string::npos)
