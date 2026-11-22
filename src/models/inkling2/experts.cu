@@ -86,12 +86,47 @@ template <typename T, bool Interleaved = false> struct RoutedSiTU {
     const T *pair;
     const float *scores;
     float gateCap, upCap;
-    __device__ float get(size_t row, int col, int d) const {
+    __device__ float get(size_t row, int col, int d) const { return get(row, row, col, d); }
+    __device__ float get(size_t row, size_t route, int col, int d) const {
         const T *gate = pair + row * (2 * d) + (Interleaved ? 2 * col : col);
         float g = float(__float2bfloat16_rn(float(gate[0])));
         float u = float(__float2bfloat16_rn(float(gate[Interleaved ? 1 : d])));
-        return float(__float2bfloat16_rn(FastllmSiTUAndMul(g, u, gateCap, upCap) * scores[row]));
+        return float(__float2bfloat16_rn(FastllmSiTUAndMul(g, u, gateCap, upCap) * scores[route]));
     }
+};
+
+// BF16 has only 65536 encodings. Cache the two exact FP32 factors once
+// per model so every routed row only needs a multiply and its routing score.
+__global__ void makeSiTUFactors(float *factors, float gateCap, float upCap) {
+    const int code = blockIdx.x * blockDim.x + threadIdx.x;
+    const float x = __uint_as_float(unsigned(code) << 16);
+    factors[code] = (gateCap * tanhf(x / gateCap)) * (1.f / (1.f + expf(-x)));
+    factors[65536 + code] = upCap > 0.f ? upCap * tanhf(x / upCap) : x;
+}
+struct PackedSiTU {
+    const __nv_bfloat16 *pair;
+    const float *scores, *factors;
+#if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    __device__ void loadBlock(int row, int route, int col, int width, float (&v)[16]) const {
+        const auto *p = pair + size_t(row) * 2 * width + col;
+        const float score = scores[route];
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            unsigned short gate[8], up[8];
+            uint4 g = reinterpret_cast<const uint4 *>(p)[part], u = reinterpret_cast<const uint4 *>(p + width)[part];
+            memcpy(gate, &g, sizeof(g));
+            memcpy(up, &u, sizeof(u));
+#pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                const float2 x = make_float2(factors[gate[i]], factors[gate[i + 1]]);
+                const float2 y = make_float2(factors[65536 + up[i]], factors[65536 + up[i + 1]]);
+                const float2 z = __fmul2_rn(__fmul2_rn(x, y), make_float2(score, score));
+                v[part * 8 + i] = float(__float2bfloat16_rn(z.x));
+                v[part * 8 + i + 1] = float(__float2bfloat16_rn(z.y));
+            }
+        }
+    }
+#endif
 };
 
 template <bool fp4, typename Source, typename Out>
@@ -189,23 +224,37 @@ struct RouteSelection {
     float scale;
 };
 
-// Each token has one independent routing CTA alongside its quantization tiles.
-// All consumers run afterwards on the same stream; no inter-block waits.
-template <bool fp4, int FixedExperts, typename Out>
-__global__ void selectAndQuantize(InputRow input, Out *out, int d, RouteSelection route) {
-    const unsigned tiles = gridDim.y - 1;
-    if (blockIdx.y != tiles) {
-        reconstructRow<fp4>(input, out, d, false, tiles);
-    } else if constexpr (FixedExperts) {
+template <int FixedExperts>
+__device__ void selectRow(RouteSelection route) {
+    if constexpr (FixedExperts) {
         if (threadIdx.x < 32)
             cuda::SelectExpertFixedRow<false, FixedExperts, 8, true>(
                 route.logits, route.bias, route.ids, route.scores, route.bias != nullptr, true, route.scale);
     } else {
         cuda::SelectExpertRow<64, 50, true>(route.logits, route.bias, route.ids, route.scores,
-            route.experts, route.top, route.bias != nullptr, true, route.scale);
+                                            route.experts, route.top, route.bias != nullptr, true, route.scale);
     }
 }
 
+// Each token has one independent routing CTA alongside its quantization tiles.
+template <bool fp4, int FixedExperts, typename Out>
+__global__ void selectAndQuantize(InputRow input, Out *out, int d, RouteSelection route) {
+    const unsigned tiles = gridDim.y - 1;
+    if (blockIdx.y != tiles)
+        reconstructRow<fp4>(input, out, d, false, tiles);
+    else
+        selectRow<FixedExperts>(route);
+}
+
+template <int FixedExperts>
+__global__ void selectRanked(RouteSelection route, int *ranks, int *counts) {
+    selectRow<FixedExperts>(route);
+    __syncthreads();
+    if (threadIdx.x < route.top) {
+        const int r = blockIdx.x * route.top + threadIdx.x;
+        ranks[r] = atomicAdd(counts + route.ids[r], 1);
+    }
+}
 // The last projection CTA sees all expert probabilities through the release sequence.
 // Quantization CTAs have independent outputs and never take part in the counter.
 struct DecodeRouter {
@@ -341,6 +390,7 @@ std::vector<T> readRange(const TensorRange &r, const std::vector<int> &shape, co
     return v;
 }
 struct HostTopology {
+    Buffer<float> situFactors;
     int nodes = 1, smCount = 0;
     bool marlin = false, nativeFp4 = false;
     void enable() {
@@ -539,6 +589,7 @@ public:
 
 };
 class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
+    Buffer<float> situFactors;
     Buffer<DecodeRouter> decodeRouter;
     Buffer<uint4> packedRouter;
     std::vector<Data *> weights;
@@ -561,40 +612,82 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
             throw std::runtime_error("Inkling expert activation dtype mismatch");
     }
 
+    template <int TileRows, int ColumnTiles>
+    void projectGrouped(const Config &c, int routes, RouteSelection route, const native::Block16 *input,
+                        const int *ranks, const int *counts, InputRow source,
+                        __nv_bfloat16 *pair, __nv_bfloat16 *projected, RoutedSiTU<__nv_bfloat16> act) const {
+        constexpr int warps = 8 / ColumnTiles, ctaColumns = 16 * warps * ColumnTiles;
+        constexpr int threads = 32 * warps * ((TileRows + native::WarpTileRows - 1) / native::WarpTileRows);
+        const int tiles = (routes + (TileRows - 1) * std::min(c.experts, routes)) / TileRows;
+        Buffer<native::RouteGroup<TileRows>> tasks(tiles);
+        Buffer<native::PlanSize> used(1);
+        Buffer<float> scales(routes);
+        Buffer<native::InputTile> packed(size_t(tiles) * (TileRows / 8) * (std::max(gate.cols, down.cols) / 64));
+        const dim3 upGrid((gate.rows + ctaColumns - 1) / ctaColumns, tiles);
+        if (ranks) {
+            Buffer<int2> starts(c.experts);
+            Buffer<float> inputScales(routes / c.topK);
+            native::expertOffsets<TileRows><<<1, 32, 0, cudaStreamPerThread>>>(counts, starts.p, c.experts, used.p);
+            native::scatterInput<TileRows><<<routes / c.topK, native::QuantThreads, 0, cudaStreamPerThread>>>(
+                source.x, gate.cols, route.ids, ranks, counts, starts.p, c.topK, tasks.p, packed.p, inputScales.p);
+            native::groupedProject<warps, ColumnTiles, true, TileRows, true><<<upGrid, threads, 0, cudaStreamPerThread>>>(
+                gate.nativeView(), nullptr, inputScales.p, packed.p, tasks.p, used.p, pair, gate.rows, gate.cols, c.topK);
+        } else {
+            check(cudaMemsetAsync(used.p, 0, sizeof(native::PlanSize), cudaStreamPerThread));
+            native::groupRoutes<<<c.experts, 256, 0, cudaStreamPerThread>>>(route.ids, routes, tasks.p, used.p);
+            native::packInput<<<dim3((gate.cols / 64 + 7) / 8, tiles, TileRows / 8), 256, 0, cudaStreamPerThread>>>(
+                tasks.p, used.p, input, packed.p, gate.cols, c.topK);
+            native::groupedProject<warps, ColumnTiles, true><<<upGrid, threads, 0, cudaStreamPerThread>>>(
+                gate.nativeView(), input, nullptr, packed.p, tasks.p, used.p, pair, gate.rows, gate.cols, c.topK);
+        }
+        if (situFactors.p && routes >= c.experts) {
+            const int threads = ((down.cols / 16 + 31) / 32) * 32;
+            native::activateBlocks<TileRows><<<tiles * TileRows, threads, 0, cudaStreamPerThread>>>(
+                PackedSiTU{pair, route.scores, situFactors.p}, tasks.p, used.p, down.cols, packed.p, scales.p);
+        } else {
+            native::launchPackedActivation(act, tasks.p, used.p, tiles, down.cols, packed.p, scales.p);
+        }
+        native::groupedProject<warps, ColumnTiles, false>
+            <<<dim3((down.rows + ctaColumns - 1) / ctaColumns, tiles), threads, 0, cudaStreamPerThread>>>(
+                down.nativeView(), nullptr, scales.p, packed.p, tasks.p, used.p, projected, down.rows, down.cols, 1);
+    }
+
     // The routing score is applied inside SiTU before the second FP4 quantization.
     void runNative(const Config &c, InputRow source, int rows, RouteSelection route, DecodeRouter *scratch,
                    float *dstRows) const {
         const int routes = rows * c.topK;
-        Buffer<native::Block16> input(size_t(rows) * c.hidden / 16), mid(size_t(routes) * c.intermediate / 16);
+        // Dense routing amortizes the expert prefix pass. Each scatter lane
+        // keeps at most two FP4 blocks in registers until its row scale is known.
+        const bool ranked = routes / c.experts >= 32 && c.hidden <= native::QuantThreads * 2 * 16;
+        Buffer<native::Block16> input(ranked ? 0 : size_t(rows) * c.hidden / 16);
         Rows<__nv_bfloat16> pair(routes, 2 * c.intermediate), projected(routes, c.hidden);
-        prepareRoutedInput<true>(source, input.p, rows, c.hidden, smCount, route, packedRouter.p, scratch);
-        const bool grouped = rows > 1;
-        const int tiles = grouped
-                              ? (routes + (native::RouteTile - 1) * std::min(c.experts, routes)) / native::RouteTile
-                              : routes;
-        Buffer<native::Tile> tasks(grouped ? tiles : 0);
-        Buffer<int> used(grouped ? 1 : 0);
-        if (grouped) {
-            check(cudaMemsetAsync(used.p, 0, sizeof(int), cudaStreamPerThread));
-            native::groupRoutes<<<c.experts, 256, 0, cudaStreamPerThread>>>(route.ids, routes, tasks.p, used.p);
+        Buffer<int> ranks(ranked ? routes : 0), counts(ranked ? c.experts : 0);
+        if (ranked) {
+            check(cudaMemsetAsync(counts.p, 0, size_t(c.experts) * sizeof(int), cudaStreamPerThread));
+            const auto select = c.topK == 8 && c.experts == 128 ? selectRanked<128> :
+                                c.topK == 8 && c.experts == 256 ? selectRanked<256> : selectRanked<0>;
+            const int threads = c.topK == 8 && (c.experts == 128 || c.experts == 256) ? 32 : 64;
+            select<<<rows, threads, 0, cudaStreamPerThread>>>(route, ranks.p, counts.p);
+        } else {
+            prepareRoutedInput<true>(source, input.p, rows, c.hidden, smCount, route, packedRouter.p, scratch);
         }
-        Buffer<native::InputTile> packed(
-            grouped ? size_t(tiles) * (native::RouteTile / 8) * (std::max(c.hidden, c.intermediate) / 64) : 0);
-        auto project = [&](const Projection &w, const native::Block16 *act, int divisor, __nv_bfloat16 *dst) {
-            if (grouped) {
-                native::packInput<<<dim3((w.cols / 64 + 7) / 8, tiles, native::RouteTile / 8), 256, 0,
-                                    cudaStreamPerThread>>>(tasks.p, used.p, act, packed.p, w.cols, divisor);
-                native::groupedProject<8><<<dim3((w.rows / 16 + 7) / 8, tiles), 256, 0, cudaStreamPerThread>>>(
-                    w.nativeView(), act, packed.p, tasks.p, used.p, dst, w.rows, w.cols, divisor);
-            } else {
-                native::decodeProject<4><<<dim3(w.rows / 16, tiles), 128, 0, cudaStreamPerThread>>>(
-                    w.nativeView(), act, route.ids, dst, w.rows, w.cols, divisor);
-            }
-        };
-        project(gate, input.p, c.topK, pair.p);
         RoutedSiTU<__nv_bfloat16> act{pair.p, route.scores, gateCap, upCap};
-        quantizeFp4Into(act, mid.p, routes, c.intermediate, smCount);
-        project(down, mid.p, 1, projected.p);
+        if (rows == 1) {
+            Buffer<native::Block16> mid(size_t(routes) * c.intermediate / 16);
+            auto project = [&](const Projection &w, const native::Block16 *x, int divisor, __nv_bfloat16 *y) {
+                native::decodeProject<4><<<dim3(w.rows / 16, routes), 128, 0, cudaStreamPerThread>>>(
+                    w.nativeView(), x, route.ids, y, w.rows, w.cols, divisor);
+            };
+            project(gate, input.p, c.topK, pair.p);
+            quantizeFp4Into(act, mid.p, routes, c.intermediate, smCount);
+            project(down, mid.p, 1, projected.p);
+        } else if (routes / c.experts >= 64) {
+            // At least one 64-row tile per expert on average amortizes the
+            // larger tile and lets each warp reuse activations across columns.
+            projectGrouped<64, 2>(c, routes, route, input.p, ranks.p, counts.p, source, pair.p, projected.p, act);
+        } else {
+            projectGrouped<32, 1>(c, routes, route, input.p, ranks.p, counts.p, source, pair.p, projected.p, act);
+        }
         sumNativeRoutes<<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             projected.p, dstRows, rows, c.hidden, c.topK);
     }
@@ -617,7 +710,17 @@ public:
             if (lossy) { packedRouter = {}; decodeRouter = {}; }
         }
 #endif
-        if (gate.nativeCodes.p) return;
+        if (gate.nativeCodes.p) {
+            if (down.cols <= native::QuantThreads * 16) {
+                if (!topology.situFactors.p) {
+                    topology.situFactors = Buffer<float>(2 * 65536);
+                    makeSiTUFactors<<<256, 256, 0, cudaStreamPerThread>>>(topology.situFactors.p, gateCap, upCap);
+                    check(cudaGetLastError());
+                }
+                situFactors = topology.situFactors;
+            }
+            return;
+        }
         for (int e = 0; e < c.experts; ++e) {
             weights[2 + 2 * e] = gate.resident[e].get();
             weights[3 + 2 * e] = down.resident[e].get();
@@ -640,9 +743,9 @@ public:
         Matrix router = scratch ? Matrix{} : routeLogits(x, routerWeight);
         Matrix out(x.rows, c.hidden);
         const bool marlin = !gate.nativeCodes.p && weights[2]->dataType == NVFP4_BLOCK_16_E4M3;
-        // Indexed GEMV has a 16-bit CUDA grid.y. Chunk independent tokens at
-        // the device limit without changing their routing or reduction order.
-        const int chunk = 65535 / c.topK;
+        // Indexed GEMV launches one grid.y entry per route. The native
+        // prefill grids index tiles, so a whole 64K-route scratch chunk fits.
+        const int chunk = (gate.nativeCodes.p ? 65536 : 65535) / c.topK;
         for (int start = 0; start < x.rows; start += chunk) {
             const int rows = std::min(chunk, x.rows - start), routes = rows * c.topK;
             Buffer<int> indices(routes);

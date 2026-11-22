@@ -25,9 +25,9 @@ double scale(unsigned byte) {
     double v = exp ? std::ldexp(1. + (a % 8) / 8., exp - 7) : a / 512.;
     return byte & 128 ? -v : v;
 }
-void test(int tokens, bool up, bool skew) {
+template <int TileRows> void test(int tokens, bool up, bool skew) {
     const int experts = 6, top = 3, n = 48, k = 192, routes = tokens * top, div = up ? top : 1;
-    const int capacity = (routes + (op::RouteTile - 1) * std::min(experts, routes)) / op::RouteTile;
+    const int capacity = (routes + (TileRows - 1) * std::min(experts, routes)) / TileRows;
     std::mt19937 rng(107);
     std::vector<uint32_t> w(size_t(experts) * n * k / 8);
     std::vector<unsigned char> sf(size_t(experts) * n * k / 16);
@@ -56,9 +56,9 @@ void test(int tokens, bool up, bool skew) {
     auto di = copy(ids);
     Buffer<uint4> codes(w.size() / 4);
     Buffer<uint32_t> scales(sf.size() / 4);
-    Buffer<op::Tile> plan(capacity);
-    Buffer<int> used(1);
-    Buffer<op::InputTile> packed(size_t(capacity) * (op::RouteTile / 8) * (k / 64));
+    Buffer<op::RouteGroup<TileRows>> plan(capacity);
+    Buffer<op::PlanSize> used(1);
+    Buffer<op::InputTile> packed(size_t(capacity) * (TileRows / 8) * (k / 64));
     Buffer<__nv_bfloat16> y(size_t(routes) * n);
     const size_t words = size_t(n) * k / 8;
     for (int e = 0; e < experts; ++e) {
@@ -71,15 +71,37 @@ void test(int tokens, bool up, bool skew) {
         std::reverse(ids.begin(), ids.end());
         check(cudaMemcpy(di.p, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
         check(cudaMemset(y.p, 0xff, size_t(routes) * n * sizeof(__nv_bfloat16)));
+        std::vector<int> outputRows(routes);
+        for (int i = 0; i < routes; ++i) outputRows[i] = i;
         if (tokens == 1) {
             op::decodeProject<4><<<dim3(n / 16, routes), 128>>>(view, xi.p, di.p, y.p, n, k, div);
         } else {
-            check(cudaMemsetAsync(used.p, 0, sizeof(int), cudaStreamPerThread));
+            check(cudaMemsetAsync(used.p, 0, sizeof(op::PlanSize), cudaStreamPerThread));
             op::groupRoutes<<<experts, 256>>>(di.p, routes, plan.p, used.p);
-            op::packInput<<<dim3((k / 64 + 7) / 8, capacity, op::RouteTile / 8), 256>>>(plan.p, used.p, xi.p,
+            op::packInput<<<dim3((k / 64 + 7) / 8, capacity, TileRows / 8), 256>>>(plan.p, used.p, xi.p,
                                                                                         packed.p, k, div);
-            op::groupedProject<8>
-                <<<dim3((n / 16 + 7) / 8, capacity), 256>>>(view, xi.p, packed.p, plan.p, used.p, y.p, n, k, div);
+            op::PlanSize size;
+            check(cudaMemcpy(&size, used.p, sizeof(size), cudaMemcpyDeviceToHost));
+            if (size.rows != routes || size.tiles > capacity) throw std::runtime_error("Invalid expert plan");
+            std::vector<op::RouteGroup<TileRows>> tasks(size.tiles);
+            check(cudaMemcpy(tasks.data(), plan.p, tasks.size() * sizeof(tasks[0]), cudaMemcpyDeviceToHost));
+            std::vector<float> rowScales(routes);
+            for (const auto &task : tasks)
+                for (int j = 0; j < task.count; ++j) {
+                    const int id = task.routes[j], row = task.first + j;
+                    if (up) outputRows[id] = row;
+                    rowScales[row] = x[size_t(id / div) * (k / 16)].outer;
+                }
+            auto scalesByRow = copy(rowScales);
+            constexpr int columns = TileRows == 32 ? 1 : 2, warps = 8 / columns;
+            constexpr int threads = warps * 32 * ((TileRows + op::WarpTileRows - 1) / op::WarpTileRows);
+            dim3 grid((n + 127) / 128, capacity);
+            if (up)
+                op::groupedProject<warps, columns, true><<<grid, threads>>>(
+                    view, xi.p, nullptr, packed.p, plan.p, used.p, y.p, n, k, div);
+            else
+                op::groupedProject<warps, columns, false><<<grid, threads>>>(
+                    view, nullptr, scalesByRow.p, packed.p, plan.p, used.p, y.p, n, k, div);
         }
         std::vector<__nv_bfloat16> got(routes * n);
         check(cudaMemcpy(got.data(), y.p, got.size() * sizeof(got[0]), cudaMemcpyDeviceToHost));
@@ -94,7 +116,7 @@ void test(int tokens, bool up, bool skew) {
                            fp4(w[expertRow * (k / 8) + c / 8], c % 8) * scale(sf[expertRow * (k / 16) + c / 16]);
                 }
                 ref *= global[ids[i]] * double(x[(i / div) * (k / 16)].outer);
-                const double diff = float(got[i * n + j]) - ref;
+                const double diff = float(got[outputRows[i] * n + j]) - ref;
                 error += diff * diff;
                 norm += ref * ref;
                 if (!std::isfinite(diff) || std::abs(diff) > std::abs(ref) * .004 + 1e-4)
@@ -102,6 +124,118 @@ void test(int tokens, bool up, bool skew) {
             }
         printf("tokens=%d gate=%d skew=%d pass=%d relL2=%.6g\n", tokens, up, skew, pass,
                std::sqrt(error / std::max(norm, 1e-30)));
+    }
+}
+
+// Exactly representable FP4 activations exercise both row mappings, tail
+// padding and the no-shared-cache path. Every block has magnitude 6 or 3.
+struct KnownActivation {
+    __host__ __device__ static unsigned code(int row, int route, int col) {
+        return ((col * 5 + route + row) & 7) | ((col + route) & 8);
+    }
+    __host__ __device__ static float gain(int route) { return float(route % 4); }
+    __host__ __device__ float get(int row, int route, int col, int) const {
+        const float levels[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+        const unsigned q = code(row, route, col);
+        return (q & 8 ? -1.f : 1.f) * levels[q & 7] * gain(route) * (col & 16 ? .5f : 1.f);
+    }
+    __device__ void loadBlock(int row, int route, int col, int width, float (&v)[16]) const {
+        for (int i = 0; i < 16; ++i) v[i] = get(row, route, col + i, width);
+    }
+};
+void checkBand(const op::InputTile &tile, int laneRow, int row, int route, int col) {
+    const int block = col % 64 / 16, half = col % 16 / 8;
+    const uint2 pair = tile.words[laneRow * 4 + (block % 2) * 2 + half];
+    const unsigned word = block < 2 ? pair.x : pair.y;
+    const unsigned q = (word >> ((col % 8) * 4)) & 15;
+    const unsigned scale = (tile.scales[laneRow] >> (block * 8)) & 255;
+    const bool nonzero = KnownActivation::gain(route) != 0;
+    if (q != (nonzero ? KnownActivation::code(row, route, col) : 0) ||
+        scale != (nonzero ? (block & 1 ? 0x70 : 0x78) : 0))
+        throw std::runtime_error("Incorrect packed activation codes or scales");
+}
+
+template <int T> void testScatter(int width) {
+    // Include empty experts, several tiles in the busiest expert, and padding.
+    const int tokens = 97, experts = 43, top = 3, routes = tokens * top;
+    const int capacity = (routes + (T - 1) * experts) / T;
+    std::vector<int> ids(routes), ranks(routes), counts(experts);
+    std::vector<float> data(size_t(tokens) * width);
+    for (int r = routes - 1; r >= 0; --r) {
+        ids[r] = (r % top) == 0 ? 42 : (r * 13) % 37;
+        ranks[r] = counts[ids[r]]++;
+    }
+    for (int row = 0; row < tokens; ++row)
+        for (int col = 0; col < width; ++col)
+            data[size_t(row) * width + col] = KnownActivation{}.get(row, row, col, width);
+    auto x = copy(data);
+    auto index = copy(ids), rank = copy(ranks), count = copy(counts);
+    Buffer<int2> starts(experts);
+    Buffer<op::PlanSize> used(1);
+    Buffer<op::RouteGroup<T>> tasks(capacity);
+    std::vector<op::InputTile> tiles(size_t(capacity) * (T / 8) * (width / 64));
+    Buffer<op::InputTile> packed(tiles.size());
+    Buffer<float> scales(tokens);
+    op::expertOffsets<T><<<1, 32>>>(count.p, starts.p, experts, used.p);
+    op::scatterInput<T><<<tokens, op::QuantThreads>>>(x.p, width, index.p, rank.p, count.p, starts.p, top,
+                                                  tasks.p, packed.p, scales.p);
+    op::PlanSize size;
+    check(cudaMemcpy(&size, used.p, sizeof(size), cudaMemcpyDeviceToHost));
+    int expected = 0;
+    for (int n : counts) expected += (n + T - 1) / T;
+    if (size.tiles != expected || size.rows != routes) throw std::runtime_error("Incorrect expert prefixes");
+    std::vector<float> outer(tokens);
+    std::vector<op::RouteGroup<T>> plan(size.tiles);
+    check(cudaMemcpy(plan.data(), tasks.p, plan.size() * sizeof(plan[0]), cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(outer.data(), scales.p, tokens * sizeof(float), cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(tiles.data(), packed.p, tiles.size() * sizeof(tiles[0]), cudaMemcpyDeviceToHost));
+    int tile = 0, first = 0;
+    for (int e = 0; e < experts; ++e) {
+        for (int start = 0; start < counts[e]; start += T, ++tile) {
+            const auto &task = plan[tile];
+            if (task.expert != e || task.first != first + start || task.count != std::min(T, counts[e] - start))
+                throw std::runtime_error("Incorrect expert tile header");
+            for (int local = 0; local < (task.count + 7) / 8 * 8; ++local) {
+                const int i = std::min(task.count - 1, local), r = task.routes[i];
+                if (r < 0 || r >= routes || ids[r] != e || ranks[r] != start + i)
+                    throw std::runtime_error("Incorrect route slot");
+                const int row = r / top;
+                if (outer[row] != KnownActivation::gain(row) / 256.f) throw std::runtime_error("Incorrect token scale");
+                for (int col = 0; col < width; ++col) {
+                    const size_t offset = (size_t(tile) * (width / 64) + col / 64) * (T / 8) + local / 8;
+                    checkBand(tiles[offset], local % 8, row, row, col);
+                }
+            }
+        }
+        first += counts[e];
+    }
+}
+template <int T> void testPackedActivation(int width, bool useRegisters = false) {
+    constexpr int count = T - 3;
+    op::RouteGroup<T> plan{};
+    plan.count = count;
+    for (int i = 0; i < count; ++i) plan.routes[i] = count - i - 1;
+    auto tasks = copy(std::vector<op::RouteGroup<T>>{plan});
+    auto used = copy(std::vector<op::PlanSize>{{1, count}});
+    const size_t tiles = size_t(T / 8) * (width / 64);
+    Buffer<op::InputTile> packed(tiles);
+    Buffer<float> scales(count);
+    if (useRegisters) {
+        op::activateBlocks<T><<<T, (width / 16 + 31) / 32 * 32>>>(KnownActivation{}, tasks.p, used.p,
+                                                                   width, packed.p, scales.p);
+    } else {
+        op::launchPackedActivation(KnownActivation{}, tasks.p, used.p, 1, width, packed.p, scales.p);
+    }
+    std::vector<op::InputTile> out(tiles);
+    std::vector<float> outer(count);
+    check(cudaMemcpy(out.data(), packed.p, tiles * sizeof(out[0]), cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(outer.data(), scales.p, count * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int row = 0; row < count; ++row) {
+        const int route = plan.routes[row];
+        const float gain = KnownActivation::gain(route);
+        if (outer[row] != gain / 256.f) throw std::runtime_error("Incorrect packed row scale");
+        for (int col = 0; col < width; ++col)
+            checkBand(out[(col / 64) * (T / 8) + row / 8], row % 8, row, route, col);
     }
 }
 }
@@ -112,6 +246,16 @@ int main() {
     if (!image) return 77;
     for (bool up : {false, true})
         for (int rows : {1, 3, 31, 257})
-            for (bool skew : {false, true})
-                test(rows, up, skew);
+            for (bool skew : {false, true}) {
+                test<32>(rows, up, skew);
+                test<64>(rows, up, skew);
+            }
+    testScatter<32>(192);
+    testScatter<64>(2304);
+    testPackedActivation<32>(192, true);
+    testPackedActivation<64>(1152, true);
+    testPackedActivation<64>(2048, true);
+    testPackedActivation<32>(192);
+    testPackedActivation<64>(1152);
+    testPackedActivation<64>(12288);
 }

@@ -3,6 +3,9 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#if CUDART_VERSION >= 12080
+#include <cuda_fp8.h>
+#endif
 #include <cstdint>
 #if CUDART_VERSION >= 12080 && !defined(CUDA_NO_TENSOR_CORE) && __has_include(<cute/arch/mma_sm120.hpp>)
 #include <cute/arch/mma_sm120.hpp>
@@ -47,13 +50,15 @@ static __global__ void pack(const uint32_t *raw, const uint32_t *scale, uint4 *d
                         raw[size_t(r1) * (k / 8) + col + 4] ^ signMask(s1, shift + 16));
     if (lane % 4 < 2) sf[tile * 16 + lane / 4 * 2 + lane % 4] = (lane % 4 ? s1 : s0) & 0x7f7f7f7fu;
 }
-constexpr int RouteTile = 32;
-struct Tile {
-    int expert, count, routes[RouteTile];
+template <int Rows> struct RouteGroup {
+    int expert, count, first, routes[Rows];
 };
+// Expert rows are compact. Only the MMA input tiles include tail padding.
+struct PlanSize { int tiles, rows; };
 // One CTA per expert gives each route a deterministic slot without host reads.
-static __global__ void groupRoutes(const int *ids, int routes, Tile *tiles, int *used) {
-    __shared__ int prefix[8], total, base;
+template <int TileRows>
+static __global__ void groupRoutes(const int *ids, int routes, RouteGroup<TileRows> *tiles, PlanSize *used) {
+    __shared__ int prefix[8], total, base, first;
     const int tid = threadIdx.x, expert = blockIdx.x;
     int count = 0;
     for (int i = tid; i < routes; i += blockDim.x)
@@ -67,13 +72,15 @@ static __global__ void groupRoutes(const int *ids, int routes, Tile *tiles, int 
         for (int w = 0; w < 8; ++w)
             n += prefix[w];
         total = n;
-        base = atomicAdd(used, (n + RouteTile - 1) / RouteTile);
+        first = atomicAdd(&used->rows, n);
+        base = atomicAdd(&used->tiles, (n + TileRows - 1) / TileRows);
     }
     __syncthreads();
     if (!total) return;
-    for (int i = tid; i < (total + RouteTile - 1) / RouteTile; i += blockDim.x) {
+    for (int i = tid; i < (total + TileRows - 1) / TileRows; i += blockDim.x) {
         tiles[base + i].expert = expert;
-        tiles[base + i].count = min(RouteTile, total - RouteTile * i);
+        tiles[base + i].first = first + i * TileRows;
+        tiles[base + i].count = min(TileRows, total - TileRows * i);
     }
     int offset = 0;
     for (int start = 0; start < routes; start += blockDim.x) {
@@ -88,7 +95,7 @@ static __global__ void groupRoutes(const int *ids, int routes, Tile *tiles, int 
         }
         if ((mask >> (tid % 32)) & 1u) {
             pos += __popc(mask & ((1u << (tid % 32)) - 1));
-            tiles[base + pos / RouteTile].routes[pos % RouteTile] = r;
+            tiles[base + pos / TileRows].routes[pos % TileRows] = r;
         }
         __syncthreads();
     }
@@ -98,57 +105,342 @@ struct InputTile {
     uint2 words[32];
     uint32_t scales[8];
 };
-static __global__ void packInput(const Tile *tasks, const int *used, const Block16 *input, InputTile *packed,
-                                 int k, int divisor) {
+template <int TileRows>
+static __global__ void packInput(const RouteGroup<TileRows> *tasks, const PlanSize *used, const Block16 *input,
+                                 InputTile *packed, int k, int divisor) {
     const int tile = blockIdx.y;
-    if (tile >= *used) return;
+    if (tile >= used->tiles) return;
     const int lane = threadIdx.x % 32;
     const int band = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (band >= k / 64) return;
-    const Tile &task = tasks[tile];
+    const auto &task = tasks[tile];
     const int group = blockIdx.z;
     if (8 * group >= task.count) return;
     const int route = task.routes[min(int(8 * group + lane / 4), task.count - 1)];
     const auto *src = input + size_t(route / divisor) * (k / 16) + band * 4;
-    auto &dst = packed[(size_t(tile) * (k / 64) + band) * (RouteTile / 8) + group];
+    auto &dst = packed[(size_t(tile) * (k / 64) + band) * (TileRows / 8) + group];
     dst.words[lane] = make_uint2(src[(lane % 4) / 2].code[lane % 2], src[2 + (lane % 4) / 2].code[lane % 2]);
     if (!(lane % 4))
         dst.scales[lane / 4] = src[0].scale | (src[1].scale << 8) | (src[2].scale << 16) | (src[3].scale << 24);
 }
-template <int Warps>
-static __global__ void groupedProject(Weights w, const Block16 *input, const InputTile *packed, const Tile *tasks,
-                                      const int *used, __nv_bfloat16 *out, int n, int k, int divisor) {
+// A lane handles columns i and i+8 of a 16-value scale block. The first
+// addition below and the following 8-lane butterfly preserve the error
+// reduction order used by the scalar four/six scale selector.
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
-    const int tile = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    const int outTile = blockIdx.x * Warps + warp;
-    if (tile >= *used || outTile >= n / 16) return;
-    const Tile &task = tasks[tile];
-    const int expert = task.expert;
-    const size_t base = (size_t(expert) * (n / 16) + outTile) * (k / 64);
-    constexpr int groups = RouteTile / 8;
-    float v[groups][4]{};
-    for (int t = 0; t < k / 64; ++t) {
-        uint4 a = w.codes[(base + t) * 32 + lane];
-        const unsigned sa = w.scales[(base + t) * 16 + lane / 4 * 2 + (lane & 1)];
+__device__ inline unsigned quantizePair(float2 v, float scale, float &error) {
+    float lo = scale ? v.x / scale : 0.f, hi = scale ? v.y / scale : 0.f;
+    unsigned byte, halves;
+    asm("{ .reg .b8 q; cvt.rn.satfinite.e2m1x2.f32 q, %3, %2; "
+        "cvt.u32.u8 %0, q; cvt.rn.f16x2.e2m1x2 %1, q; }"
+        : "=r"(byte), "=r"(halves) : "f"(lo), "f"(hi));
+    const float2 q = make_float2(__half2float(__ushort_as_half(halves)),
+                                 __half2float(__ushort_as_half(halves >> 16)));
+    const float2 reconstructed = __fmul2_rn(q, make_float2(scale, scale));
+    const float2 difference = __fadd2_rn(v, make_float2(-reconstructed.x, -reconstructed.y));
+    error = fabsf(difference.x) + fabsf(difference.y);
+    return byte;
+}
+__device__ inline unsigned roundPair(float2 v, float scale, float &error) {
+    const unsigned byte = quantizePair(v, scale, error);
+    for (int delta = 4; delta; delta >>= 1)
+        error += __shfl_xor_sync(0xffffffff, error, delta, 8);
+    return byte;
+}
+#endif
+
+// Keep activations in expert order between the two GEMMs. Each row writes
+// the four scale bytes and eight FP4 words in exactly the down-MMA layout.
+template <int TileRows, class Activation>
+static __global__ void activatePacked(Activation act, const RouteGroup<TileRows> *tasks, const PlanSize *used, int width,
+                                      InputTile *packed, float *rowScales, bool cache) {
+#if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    const int tile = blockIdx.x / TileRows, local = blockIdx.x % TileRows;
+    if (tile >= used->tiles) return;
+    const auto &task = tasks[tile];
+    if (local / 8 * 8 >= task.count) return;
+    const int index = min(local, task.count - 1), row = task.first + index, route = task.routes[index];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int bands = width / 64, part = lane / 8;
+    extern __shared__ float2 values[];
+    __shared__ float partial[4];
+    float peak = 0;
+    for (int b = warp; b < bands; b += 4) {
+        int col = b * 64 + part * 16 + lane % 8;
+        float2 v = make_float2(act.get(row, route, col, width), act.get(row, route, col + 8, width));
+        if (cache) values[b * 32 + lane] = v;
+        peak = fmaxf(peak, fmaxf(fabsf(v.x), fabsf(v.y)));
+    }
+    for (int d = 16; d; d >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, d));
+    if (lane == 0) partial[warp] = peak;
+    __syncthreads();
+    float outer = fmaxf(fmaxf(partial[0], partial[1]), fmaxf(partial[2], partial[3])) / 1536.f;
+    if (!threadIdx.x && local == index) rowScales[row] = outer;
+    for (int b = warp; b < bands; b += 4) {
+        int col = b * 64 + part * 16 + lane % 8;
+        float2 v = cache ? values[b * 32 + lane] :
+                   make_float2(act.get(row, route, col, width), act.get(row, route, col + 8, width));
+        float m = fmaxf(fabsf(v.x), fabsf(v.y));
+        for (int d = 4; d; d >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, d, 8));
+        float ratio = outer > 0 ? m / outer : 0;
+        __nv_fp8_e4m3 s4(fminf(448.f, ratio / 4)), s6(fminf(448.f, ratio / 6));
+        float err4, err6;
+        unsigned q4 = roundPair(v, float(s4) * outer, err4);
+        unsigned q6 = roundPair(v, float(s6) * outer, err6);
+        unsigned q = err4 < err6 ? q4 : q6;
+        unsigned scale = err4 < err6 ? s4.__x : s6.__x;
+        unsigned low = (q & 15) << (4 * (lane % 8)), high = (q >> 4) << (4 * (lane % 8));
+        for (int d = 1; d < 8; d <<= 1) {
+            low |= __shfl_xor_sync(0xffffffff, low, d, 8);
+            high |= __shfl_xor_sync(0xffffffff, high, d, 8);
+        }
+        InputTile &dst = packed[(size_t(tile) * bands + b) * (TileRows / 8) + local / 8];
+        const unsigned half = (lane & 1) ? high : low;
+        const int src = (lane & 2) * 4 + (lane & 1);
+        const uint2 words = make_uint2(__shfl_sync(0xffffffff, half, src),
+                                       __shfl_sync(0xffffffff, half, src + 16));
+        if (lane < 4) dst.words[(local % 8) * 4 + lane] = words;
+        scale <<= 8 * part;
+        scale |= __shfl_xor_sync(0xffffffff, scale, 8);
+        scale |= __shfl_xor_sync(0xffffffff, scale, 16);
+        if (!lane) dst.scales[local % 8] = scale;
+    }
+#endif
+}
+template <int TileRows, class Activation>
+static void launchPackedActivation(Activation act, const RouteGroup<TileRows> *tasks, const PlanSize *used, int tiles,
+                                   int width, InputTile *packed, float *rowScales) {
+    const size_t bytes = size_t(width) * sizeof(float);
+    const bool cache = bytes + 4 * sizeof(float) <= 48 * 1024;
+    activatePacked<<<tiles * TileRows, 128, cache ? bytes : 0, cudaStreamPerThread>>>(
+        act, tasks, used, width, packed, rowScales, cache);
+}
+
+// Register-resident quantization for a row that fits in a CTA. Each lane
+// owns whole 16-value scale blocks, including their two candidate encodings.
+constexpr int QuantThreads = 128;
+struct EncodedBlock { uint2 words; unsigned scale; };
+
+#if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+__device__ inline uint2 encodeCandidate(const float (&v)[16], float scale, float &error) {
+    float errors[8];
+    uint2 words{};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        unsigned byte = quantizePair(make_float2(v[i], v[i + 8]), scale, errors[i]);
+        words.x |= (byte & 15) << (4 * i);
+        words.y |= (byte >> 4) << (4 * i);
+    }
+    for (int step = 4; step; step /= 2) {
+#pragma unroll
+        for (int i = 0; i < step; ++i) errors[i] += errors[i + step];
+    }
+    error = errors[0];
+    return words;
+}
+__device__ inline EncodedBlock encodeBlock(const float (&values)[16], float peak, float outer) {
+    const float ratio = outer ? peak / outer : 0.f;
+    __nv_fp8_e4m3 s4(fminf(448.f, ratio / 4)), s6(fminf(448.f, ratio / 6));
+    float e4, e6;
+    uint2 q4 = encodeCandidate(values, float(s4) * outer, e4);
+    uint2 q6 = encodeCandidate(values, float(s6) * outer, e6);
+    return e4 < e6 ? EncodedBlock{q4, s4.__x} : EncodedBlock{q6, s6.__x};
+}
+// Four lanes form one 64-column MMA band. Shuffle once before replication to experts.
+__device__ inline EncodedBlock packBand(uint2 words, unsigned scale) {
+    const int lane = threadIdx.x % 4;
+    const uint2 pair = make_uint2(__shfl_sync(__activemask(), words.x, lane / 2, 4),
+                            __shfl_sync(__activemask(), words.x, 2 + lane / 2, 4));
+    const uint2 hi = make_uint2(__shfl_sync(__activemask(), words.y, lane / 2, 4),
+                          __shfl_sync(__activemask(), words.y, 2 + lane / 2, 4));
+    scale <<= (8 * lane);
+    scale |= __shfl_xor_sync(__activemask(), scale, 1, 4);
+    scale |= __shfl_xor_sync(__activemask(), scale, 2, 4);
+    return {lane & 1 ? hi : pair, scale};
+}
+__device__ inline void storeBand(InputTile &dst, int local, EncodedBlock band) {
+    const int lane = threadIdx.x % 4;
+    dst.words[local * 4 + lane] = band.words;
+    if (!lane) dst.scales[local] = band.scale;
+}
+#endif
+
+// A lane owns one complete FP4 block. Keep the BF16-rounded activation in
+// registers across the row scale reduction, then write the MMA layout directly.
+template <int TileRows, class Activation>
+static __global__ void activateBlocks(Activation act, const RouteGroup<TileRows> *tasks, const PlanSize *used,
+                                      int width, InputTile *packed, float *rowScales) {
+#if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    const int tile = blockIdx.x / TileRows, local = blockIdx.x % TileRows;
+    if (tile >= used->tiles) return;
+    const auto &task = tasks[tile];
+    if (local / 8 * 8 >= task.count) return;
+    const int idx = min(local, task.count - 1), row = task.first + idx, group = threadIdx.x;
+    float values[16], peak = 0;
+    if (group < width / 16) {
+        act.loadBlock(row, task.routes[idx], group * 16, width, values);
+#pragma unroll
+        for (float value : values) peak = fmaxf(peak, fabsf(value));
+    }
+    float maxValue = peak;
+    for (int d = 16; d; d /= 2) maxValue = fmaxf(maxValue, __shfl_xor_sync(0xffffffff, maxValue, d));
+    __shared__ float partial[QuantThreads / 32];
+    if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = maxValue;
+    __syncthreads();
+    for (int w = 0; w < blockDim.x / 32; ++w) maxValue = fmaxf(maxValue, partial[w]);
+    const float outer = maxValue / 1536.f;
+    if (!group && idx == local) rowScales[row] = outer;
+    if (group < width / 16) {
+        const auto enc = encodeBlock(values, peak, outer);
+        auto &dst = packed[(size_t(tile) * (width / 64) + group / 4) * (TileRows / 8) + local / 8];
+        storeBand(dst, local % 8, packBand(enc.words, enc.scale));
+    }
+#endif
+}
+
+// Prefixes over experts suffice once every selected route has its own local rank.
+template <int TileRows>
+static __global__ void expertOffsets(const int *counts, int2 *starts, int experts, PlanSize *size) {
+    int2 base = make_int2(0, 0);
+    const int lane = threadIdx.x;
+    for (int first = 0; first < experts; first += 32) {
+        int e = first + lane, rows = e < experts ? counts[e] : 0, tiles = (rows + TileRows - 1) / TileRows;
+        int r = rows, t = tiles;
+        for (int d = 1; d < 32; d *= 2) {
+            int a = __shfl_up_sync(0xffffffff, r, d), b = __shfl_up_sync(0xffffffff, t, d);
+            if (lane >= d) { r += a; t += b; }
+        }
+        if (e < experts) starts[e] = make_int2(base.x + r - rows, base.y + t - tiles);
+        base.x += __shfl_sync(0xffffffff, r, 31);
+        base.y += __shfl_sync(0xffffffff, t, 31);
+    }
+    if (!lane) *size = {base.y, base.x};
+}
+// A token is quantized once and its packed bands are written at their
+// final addresses in all selected experts, including the last partial band of rows.
+template <int TileRows>
+static __global__ void scatterInput(const float *x, int width, const int *ids, const int *ranks,
+                                    const int *counts, const int2 *starts, int top,
+                                    RouteGroup<TileRows> *tasks, InputTile *packed, float *rowScales) {
+#if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    constexpr int Threads = QuantThreads, Blocks = 2;
+    __shared__ int slots[64], repeats[64];
+    __shared__ float maxima[Threads / 32];
+    const int row = blockIdx.x, tid = threadIdx.x;
+    if (tid < top) {
+        const int r = row * top + tid, e = ids[r], rank = ranks[r], count = counts[e];
+        const int tile = starts[e].y + rank / TileRows, local = rank % TileRows;
+        auto &task = tasks[tile];
+        if (!local) {
+            task.expert = e;
+            task.first = starts[e].x + rank;
+            task.count = min(TileRows, count - rank);
+        }
+        task.routes[local] = r;
+        slots[tid] = tile * TileRows + local;
+        repeats[tid] = rank == count - 1 ? 8 - local % 8 : 1;
+    }
+    float values[Blocks][16], peaks[Blocks], peak = 0;
+#pragma unroll
+    for (int b = 0; b < Blocks; ++b) {
+        const int group = tid + b * Threads;
+        if (group >= width / 16) continue;
+        const float4 *src = reinterpret_cast<const float4 *>(x + size_t(row) * width + group * 16);
+        float m = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float4 v = src[i];
+            values[b][4*i] = v.x; values[b][4*i+1] = v.y;
+            values[b][4*i+2] = v.z; values[b][4*i+3] = v.w;
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+        }
+        peaks[b] = m;
+        peak = fmaxf(peak, m);
+    }
+    for (int d = 16; d; d /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, d));
+    if (!(tid % 32)) maxima[tid / 32] = peak;
+    __syncthreads();
+#pragma unroll
+    for (int w = 0; w < Threads / 32; ++w) peak = fmaxf(peak, maxima[w]);
+    const float outer = peak / 1536.f;
+    if (!tid) rowScales[row] = outer;
+#pragma unroll
+    for (int b = 0; b < Blocks; ++b) {
+        int group = tid + b * Threads;
+        if (group >= width / 16) continue;
+        const auto enc = encodeBlock(values[b], peaks[b], outer);
+        const auto band = packBand(enc.words, enc.scale);
+        for (int i = 0; i < top; ++i) {
+            int slot = slots[i], tile = slot / TileRows, local = slot % TileRows;
+            auto &dst = packed[(size_t(tile) * (width / 64) + group / 4) * (TileRows / 8) + local / 8];
+            for (int j = 0; j < repeats[i]; ++j)
+                storeBand(dst, local % 8 + j, band);
+        }
+    }
+#endif
+}
+
+constexpr int WarpTileRows = 64;
+// A warp reuses each activation fragment across ColumnTiles adjacent 16-column
+// weight tiles. Up writes compact expert rows; down restores the original routes.
+template <int Warps, int ColumnTiles, bool Up, int TileRows, bool Compact = false>
+static __global__ void groupedProject(Weights w, const Block16 *input, const float *rowScales,
+                                      const InputTile *packed, const RouteGroup<TileRows> *tasks, const PlanSize *used,
+                                      __nv_bfloat16 *out, int n, int k, int divisor) {
+#if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    static_assert(TileRows % 8 == 0 && (TileRows <= WarpTileRows || TileRows % WarpTileRows == 0));
+    constexpr int groups = (TileRows < WarpTileRows ? TileRows : WarpTileRows) / 8;
+    const int tile = blockIdx.y, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int rowGroup = (warp / Warps) * groups;
+    const int first = (blockIdx.x * Warps + warp % Warps) * ColumnTiles;
+    const int columns = n / 16, bands = k / 64;
+    if (tile >= used->tiles) return;
+    const auto &task = tasks[tile];
+    const int count = task.count;
+    if (rowGroup * 8 >= count || first >= columns) return;
+    const size_t base = (size_t(task.expert) * columns + first) * bands;
+    float sums[groups][ColumnTiles][4]{};
+    for (int band = 0; band < bands; ++band) {
+        uint4 weight[ColumnTiles];
+        unsigned scale[ColumnTiles];
+#pragma unroll
+        for (int c = 0; c < ColumnTiles; ++c) {
+            const size_t addr = base + min(c, columns - first - 1) * bands + band;
+            weight[c] = w.codes[addr * 32 + lane];
+            scale[c] = w.scales[addr * 16 + lane / 4 * 2 + (lane & 1)];
+        }
 #pragma unroll
         for (int g = 0; g < groups; ++g) {
-            if (g * 8 >= task.count) continue;
-            const InputTile &x = packed[(size_t(tile) * (k / 64) + t) * groups + g];
+            if ((rowGroup + g) * 8 >= count) continue;
+            const InputTile &x = packed[(size_t(tile) * bands + band) * (TileRows / 8) + rowGroup + g];
             const uint2 b = x.words[lane];
-            auto &c = v[g];
-            BlockMma::fma(c[0], c[1], c[2], c[3], a.x, a.y, a.z, a.w, b.x, b.y, c[0], c[1], c[2], c[3], sa,
-                          x.scales[lane / 4]);
+            const unsigned sb = x.scales[lane / 4];
+#pragma unroll
+            for (int c = 0; c < ColumnTiles; ++c) {
+                auto &v = sums[g][c];
+                const auto a = weight[c];
+                BlockMma::fma(v[0], v[1], v[2], v[3], a.x, a.y, a.z, a.w, b.x, b.y,
+                              v[0], v[1], v[2], v[3], scale[c], sb);
+            }
         }
     }
 #pragma unroll
     for (int g = 0; g < groups; ++g) {
         for (int j = 0; j < 2; ++j) {
-            const int col = g * 8 + 2 * (lane % 4) + j;
-            if (col < task.count) {
-                const int dest = task.routes[col], ch = outTile * 16 + lane / 4;
-                const float rowScale = input[size_t(dest / divisor) * (k / 16)].outer;
-                out[size_t(dest) * n + ch] = __float2bfloat16_rn(v[g][j] * w.outer[expert] * rowScale);
-                out[size_t(dest) * n + ch + 8] = __float2bfloat16_rn(v[g][j + 2] * w.outer[expert] * rowScale);
+            const int col = (rowGroup + g) * 8 + 2 * (lane % 4) + j;
+            if (col >= count) continue;
+            const int route = task.routes[col], row = task.first + col;
+            float outer;
+            if constexpr (!Up) outer = rowScales[row];
+            else if constexpr (Compact) outer = rowScales[route / divisor];
+            else outer = input[size_t(route / divisor) * (k / 16)].outer;
+#pragma unroll
+            for (int c = 0; c < ColumnTiles; ++c) {
+                if (first + c < columns) {
+                    auto *dst = out + size_t(Up ? row : route) * n + (first + c) * 16 + lane / 4;
+                    const auto &v = sums[g][c];
+                    dst[0] = __float2bfloat16_rn(v[j] * w.outer[task.expert] * outer);
+                    dst[8] = __float2bfloat16_rn(v[j + 2] * w.outer[task.expert] * outer);
+                }
             }
         }
     }
