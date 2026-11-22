@@ -44,7 +44,6 @@ def main(args):
     torch.manual_seed(123)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-    os.environ.setdefault("FASTLLM_NOMAS_PRECISION", "bf16")
     lib = C.CDLL(str(args.library))
     fp = C.POINTER(C.c_float)
     lib.fastllm_nomas_error.restype = C.c_char_p

@@ -95,7 +95,7 @@ template<class T> void prune(std::vector<std::weak_ptr<const T>> &states) {
 }
 }
 Pipeline::Pipeline(const std::string &directory,int device,bool bf16Decode)
-    :tensorPool_(device),rt_(device),vaeRt_(device),decoderRt_(device,bf16Decode),
+    :tensorPool_(device),rt_(device),vaeRt_(device,true),decoderRt_(device,bf16Decode),
     tokenizer_(directory+"/google/umt5-xxl"),text_(rt_,directory+"/native/t5.safetensors"),
     dit_(rt_,directory+"/transformers"),vae_(vaeRt_,directory+"/native/vae.safetensors"),
     decoder_(decoderRt_,directory+"/native/vae.safetensors"),schedule_(fastSchedule()) {}
