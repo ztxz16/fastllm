@@ -59,11 +59,11 @@
 // MMA bodies and runtime dispatch already guard the SM80-only instructions.
 #define FASTLLM_NAIVE_DSA_MMA
 #include "naive-n05-dsa-mma.cuh"
-#ifdef FASTLLM_NAIVE_BATCH_INDEXER
-#include "naive-n05-indexer-staged.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
 #include "naive-n05-indexer-sm100.cuh"
 #endif
+#ifdef FASTLLM_NAIVE_BATCH_INDEXER
+#include "naive-n05-indexer-staged.cuh"
 #if CUDART_VERSION >= 12040
 #include "naive-n05-indexer-compact.cuh"
 #endif
