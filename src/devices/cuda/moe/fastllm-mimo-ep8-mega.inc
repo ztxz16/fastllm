@@ -88,8 +88,11 @@ struct FastllmCudaMimoEp8Mega {
     }
 };
 
+bool FastllmCudaMimoEp8MegaWeights(FastllmCudaMimoEp8Mega &state, int rank, int layer, const void **out, bool *mxfp4) {
+    return state.builtin && FastllmCudaMimoEp8BuiltinMegaWeights(*state.builtin, rank, layer, out, mxfp4);
+}
 bool FastllmCudaMimoEp8MegaWeights(FastllmCudaMimoEp8Mega &state, int rank, int layer, const void **out) {
-    return state.builtin && FastllmCudaMimoEp8BuiltinMegaWeights(*state.builtin, rank, layer, out);
+    return FastllmCudaMimoEp8MegaWeights(state, rank, layer, out, nullptr);
 }
 bool FastllmCudaMimoEp8MegaOwnsPackedWeights(int device) {
     return FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(device);

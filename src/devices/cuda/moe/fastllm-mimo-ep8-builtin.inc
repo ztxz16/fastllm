@@ -53,9 +53,9 @@ struct FastllmCudaMimoEp8BuiltinMega {
         if (exchangeFailed) throw std::runtime_error("MiMo EP output exchange timed out.");
     }
 };
-bool FastllmCudaMimoEp8BuiltinMegaWeights(FastllmCudaMimoEp8BuiltinMega &state, int rank, int layer, const void **out) {
+bool FastllmCudaMimoEp8BuiltinMegaWeights(FastllmCudaMimoEp8BuiltinMega &state, int rank, int layer, const void **out, bool *mxfp4) {
     const auto &local = *state.ranks.at(rank);
-    return !local.hopperMxfp4 && fastllm_ep8_mega_moe_weights(local.layers.at(layer), out);
+    return !local.hopperMxfp4 && fastllm_ep8_mega_moe_weight_view(local.layers.at(layer), out, mxfp4);
 }
 bool FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(int device) {
     const int previous = FastllmCudaGetDevice();
@@ -505,7 +505,7 @@ bool FastllmCudaRunMimoEp8BuiltinMega(FastllmCudaMimoEp8BuiltinMega &state, int 
 }
 #else
 struct FastllmCudaMimoEp8BuiltinMega {};
-bool FastllmCudaMimoEp8BuiltinMegaWeights(FastllmCudaMimoEp8BuiltinMega &, int, int, const void **) { return false; }
+bool FastllmCudaMimoEp8BuiltinMegaWeights(FastllmCudaMimoEp8BuiltinMega &, int, int, const void **, bool *) { return false; }
 bool FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(int) { return false; }
 void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &, int, int, const fastllm::Data &,
     const fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, const int *, fastllm::Data *) {

@@ -2745,6 +2745,15 @@ if (UNIT_TEST)
                 target_link_libraries(naive_n05_block128_gate_test PRIVATE cuda)
                 add_test(NAME naive_n05_block128_gate COMMAND naive_n05_block128_gate_test)
                 set_tests_properties(naive_n05_block128_gate PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+                add_executable(naive_n05_flex_mxfp4_test test/basic/test_cuda_shared_flex_mxfp4.cu
+                    $<TARGET_OBJECTS:fastllm_shared_flex_sm103>)
+                set_target_properties(naive_n05_flex_mxfp4_test PROPERTIES CUDA_ARCHITECTURES OFF)
+                target_compile_options(naive_n05_flex_mxfp4_test PRIVATE
+                    $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_103a,code=sm_103a>)
+                target_compile_definitions(naive_n05_flex_mxfp4_test PRIVATE FASTLLM_ENABLE_NAIVE_FLEX_SM103)
+                target_link_libraries(naive_n05_flex_mxfp4_test PRIVATE cuda Threads::Threads)
+                add_test(NAME naive_n05_flex_mxfp4 COMMAND naive_n05_flex_mxfp4_test)
+                set_tests_properties(naive_n05_flex_mxfp4 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
                 add_executable(naive_n05_moe_batch_test test/basic/test_cuda_naive_moe_batch.cu)
                 set_target_properties(naive_n05_moe_batch_test PROPERTIES CUDA_ARCHITECTURES OFF CUDA_STANDARD 17)
                 target_include_directories(naive_n05_moe_batch_test BEFORE PRIVATE

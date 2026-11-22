@@ -37,7 +37,7 @@ void single_matmul(Rank a,const int*ids,const float*prob){
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.allocate(32,&tm);al.release_allocation_lock();}
   __syncthreads();
-  auto idesc=cute::UMMA::make_instr_desc_block_scaled<E4,E4,float,UE,128,8,cute::UMMA::Major::K,cute::UMMA::Major::K>();
+  auto idesc=fastllm_shared_flex::weight_instruction(a.mxfp4);
   unsigned phase=0,load_phase[2]={0,0};
   for(int task=blockIdx.x;task<(a.rows*K)*(NN/128)*SPLIT;task+=gridDim.x){
     int split=task%SPLIT,tile=task/SPLIT%(NN/128),job=task/((NN/128)*SPLIT);
@@ -48,7 +48,7 @@ void single_matmul(Rank a,const int*ids,const float*prob){
     auto load_tile=[&](int kg,int b){
       if(tid==0){
         unsigned mb=(unsigned)__cvta_generic_to_shared(&loaded[b]);
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(16384+512):"memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(fastllm_shared_flex::weight_tile_bytes(a.mxfp4)+512):"memory");
         tma3(wa[b],G?a.gmap:a.dmap,kg*128,tile*128,expert,&loaded[b]);
         bulk(sfa[b],scales+(size_t)expert*NN*(NK/32)+((size_t)kg*NN+tile*128)*4,512,&loaded[b]);
       }
@@ -152,7 +152,7 @@ void plain_matmul(Rank a,const int*ids,const float*prob){
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.allocate(BUFFERS<=3?32:BUFFERS<=7?64:128,&tm);al.release_allocation_lock();}
   MatmulSync<Subgroup>();
-  auto idesc=cute::UMMA::make_instr_desc_block_scaled<E4,E4,float,UE,128,8,cute::UMMA::Major::K,cute::UMMA::Major::K>();
+  auto idesc=fastllm_shared_flex::weight_instruction(a.mxfp4);
   unsigned phase=0,load_phase[BUFFERS]={};
   for(int task=blockIdx.x;task<*a.count*(NN/128)*SPLIT;task+=gridDim.x){
     int split=task%SPLIT,tile=task/SPLIT%(NN/128),job=a.jobs[task/((NN/128)*SPLIT)];
@@ -163,7 +163,7 @@ void plain_matmul(Rank a,const int*ids,const float*prob){
     auto load_tile=[&](int kg,int b){
       if(tid==0){
         unsigned mb=(unsigned)__cvta_generic_to_shared(&loaded[b]);
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(16384+512):"memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(fastllm_shared_flex::weight_tile_bytes(a.mxfp4)+512):"memory");
         tma3(wa[b],G?a.gmap:a.dmap,kg*128,tile*128,expert,&loaded[b]);
         bulk(sfa[b],scales+(size_t)expert*NN*(NK/32)+((size_t)kg*NN+tile*128)*4,512,&loaded[b]);
       }
@@ -265,7 +265,7 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.allocate(BUFFERS<=3?32:BUFFERS<=7?64:128,&tm);al.release_allocation_lock();}
   MatmulSync<Subgroup>();
-  auto idesc=cute::UMMA::make_instr_desc_block_scaled<E4,E4,float,UE,128,8,cute::UMMA::Major::K,cute::UMMA::Major::K>();
+  auto idesc=fastllm_shared_flex::weight_instruction(a.mxfp4);
   unsigned phase=0,load_phase[BUFFERS]={};
   for(int task=blockIdx.x*TaskGroup;task<*a.nuniq*(NN/128)*SPLIT;
       task+=task%TaskGroup==TaskGroup-1?(gridDim.x-1)*TaskGroup+1:1){
@@ -277,7 +277,7 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
     auto load_tile=[&](int kg,int b){
       if(tid==0){
         unsigned mb=(unsigned)__cvta_generic_to_shared(&loaded[b]);
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(16384+512):"memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(fastllm_shared_flex::weight_tile_bytes(a.mxfp4)+512):"memory");
         tma3(wa[b],G?a.gmap:a.dmap,kg*128,tile*128,expert,&loaded[b]);
         bulk(sfa[b],scales+(size_t)expert*NN*(NK/32)+((size_t)kg*NN+tile*128)*4,512,&loaded[b]);
       }

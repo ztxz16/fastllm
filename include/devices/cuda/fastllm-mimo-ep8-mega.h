@@ -48,6 +48,7 @@ bool FastllmCudaRunMimoEp8Mega(FastllmCudaMimoEp8Mega &state, int rank, int laye
     fastllm::Data *prefillScratch = nullptr, const int *liveKeys = nullptr);
 
 bool FastllmCudaMimoEp8MegaWeights(FastllmCudaMimoEp8Mega&,int,int,const void**);
+bool FastllmCudaMimoEp8MegaWeights(FastllmCudaMimoEp8Mega&,int,int,const void**,bool *mxfp4);
 // Dispatch rank-local token rows and return them in the same local order,
 // without an output AllGather. Every EP rank must pass the same maxRows;
 // local row counts may differ, including zero. Existing world-row dispatch

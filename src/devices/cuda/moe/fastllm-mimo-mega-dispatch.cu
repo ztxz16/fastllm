@@ -2,7 +2,7 @@
 #include "devices/cuda/fastllm-mimo-mega-backends.h"
 #include <cuda_runtime.h>
 #include <map>
-extern "C" int fastllm_sm100_mega_moe_weights(void*,const void**);
+extern "C" int fastllm_sm100_mega_moe_weight_view(void*,const void**,bool*);
 #include <memory>
 #include <string>
 
@@ -119,13 +119,16 @@ extern "C" void fastllm_ep8_mega_moe_destroy(void *p) {
     std::unique_ptr<Handle> h(handle(p)); h->api->destroy(h->inner);
 }
 
-extern "C" int fastllm_ep8_mega_moe_weights(void*p,const void**out){
+extern "C" int fastllm_ep8_mega_moe_weight_view(void*p,const void**out,bool *mxfp4){
 #ifdef FASTLLM_MIMO_MEGA_SM100
- auto*h=handle(p);if(h&&h->api==&blackwell)return fastllm_sm100_mega_moe_weights(h->inner,out);
+ auto*h=handle(p);if(h&&h->api==&blackwell)return fastllm_sm100_mega_moe_weight_view(h->inner,out,mxfp4);
 #endif
  return 0;
 }
 
+extern "C" int fastllm_ep8_mega_moe_weights(void *p, const void **out) {
+    return fastllm_ep8_mega_moe_weight_view(p,out,nullptr);
+}
 extern "C" int fastllm_ep8_mega_moe_owns_packed_weights() {
 #ifdef FASTLLM_MIMO_MEGA_SM100
     return select()==&blackwell;

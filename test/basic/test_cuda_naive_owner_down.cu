@@ -73,7 +73,7 @@ int main() {
     if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major != 10 || prop.minor != 3) return 77;
     try {
         check(cudaSetDevice(0));
-        check(cudaFuncSetAttribute(owner_down, cudaFuncAttributeMaxDynamicSharedMemorySize, OwnerDownBytes));
+        check(cudaFuncSetAttribute(owner_down<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, OwnerDownBytes));
         check(cudaFuncSetAttribute(multi_down<>, cudaFuncAttributeMaxDynamicSharedMemorySize, 36864));
         Arena arena;
         auto *w = arena.get<uint8_t>(size_t(Experts) * H * I);
@@ -103,9 +103,12 @@ int main() {
         cudaGraphExec_t exec[5][2]{};
         for (int rows = 4; rows <= 8; ++rows) for (int mode = 0; mode < 2; ++mode) {
             auto a = ranks[mode]; a.rows = rows; cudaGraph_t graph;
+            State state{};
+            state.ownerDownSupported = mode != 0;
+            state.packedOwnerDownSupported = false;
             check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
             inputs<<<128, 256, 0, cudaStreamPerThread>>>(a, seed);
-            launch_prepared_down(a, ids, nullptr, out[mode], cudaStreamPerThread, mode != 0);
+            launch_prepared_down(a, ids, nullptr, out[mode], cudaStreamPerThread, state);
             if (!mode) referenceLocal<<<dim3(H / 128, rows), 128, 0, cudaStreamPerThread>>>(a);
             check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
             check(cudaGraphInstantiate(&exec[rows - 4][mode], graph, 0)); check(cudaGraphDestroy(graph));

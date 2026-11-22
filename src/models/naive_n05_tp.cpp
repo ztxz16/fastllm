@@ -526,7 +526,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         }
     }
     if ((tpMoeBackend == NaiveMoeBackend::FlexTP || tpMoeBackend == NaiveMoeBackend::LegacyFlexTP) &&
-        !NaiveSharedFlexMoe::TPWeightsSupported(tpMoeWeights, tpDevices)) {
+        !NaiveSharedFlexMoe::TPWeightsSupported(tpMoeWeights, tpDevices, tpMoeBackend == NaiveMoeBackend::FlexTP)) {
         tpMoeBackend = NaiveMoeBackend::LegacyTP;
         tpPackedMoeSources = false;
         fprintf(stderr,"[Naive MoE fallback] unsupported TP shards; keep original weights and MoE.\n");
@@ -560,6 +560,11 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     if (tpMoeBackend == NaiveMoeBackend::LegacyFlexTP)
         tpFlexMoe = std::make_shared<NaiveFlexMoe>(tpDevices, tpMoeWeights);
     if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights, num_experts_per_tok);
+    if (tpMoeBackend == NaiveMoeBackend::FlexEP &&
+        !NaiveSharedFlexMoe::CanBorrowEpWeights(*tpEp8MegaState, tpMoeWeights)) {
+        tpMoeBackend = NaiveMoeBackend::MegaEP;
+        fprintf(stderr, "[Naive MoE fallback] Flex cannot use the packed EP layout; retaining MegaMoE.\n");
+    }
     if (tpMoeBackend == NaiveMoeBackend::FlexTP || tpMoeBackend == NaiveMoeBackend::FlexEP)
         tpSharedFlex = std::make_shared<NaiveSharedFlexMoe>(tpDevices, tpMoeWeights, tpEp8MegaState.get());
     // Parents retain only names/shapes and ownership of their metadata views.

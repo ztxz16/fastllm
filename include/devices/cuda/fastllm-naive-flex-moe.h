@@ -132,10 +132,17 @@ int fastshared_tp_prepared_input(void *state, int rank, int rows, FastllmMoePrep
 int fastshared_tp_run_prepared(void *state, int rank, int layer, int rows,
     const float *routerProbabilities, const float *bias, int *ids, float *scores,
     void *output, int needNorm, float routeScale);
+int fastshared_tp_residual_router_supported(void *state, int rank, int layer, int rows);
+int fastshared_tp_residual_router(void *state, int rank, int layer, int rows, void *hidden,
+    const void *branch, const float *gamma, float eps, void *normed, const float *weight,
+    float *router, const float *bias, int *ids, float *scores, int needNorm, float routeScale);
 // Uses membership emitted by the ordered router producer. No new preparation
 // or selection is launched; the original gate/down arithmetic is retained.
 int fastshared_tp_run_preselected(void *state, int rank, int layer, int rows,
     const int *ids, const float *scores, void *output);
+int fastshared_ep_bind_format(void *, int rank, int layer, const void *, const void *,
+                              const void *, const void *, bool mxfp4);
+int fastshared_tp_pack_mxfp4(void *, int rank, int layer, const uint64_t *expertPointers);
 int fastshared_tp_pack(void *, int rank, int layer, const uint64_t *, const float *, const float *);
 }
 #endif

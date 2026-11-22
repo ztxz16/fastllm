@@ -3,6 +3,7 @@
 // SM103 EP8 experiment. Borrows unmodified MegaMoE packed weights.
 #include <cuda.h>
 #include <deep_gemm/mma/sm100.cuh>
+#include "fastllm-shared-flex-weight.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -18,6 +19,7 @@ namespace fastllm_shared_flex_ep {
 constexpr int H=4096,I=2048,E=256,R=8,K=8,MAX_M=8;
 constexpr int G_SPLIT=8,D_SPLIT=8,USE_BATCH=1,STAGES=4,GRID=444;
 struct Rank {
+ bool mxfp4 = false;
  const __nv_bfloat16*raw_x;int rows,device,rank;int *uniq,*members,*rowcounts,*nuniq,*gcount,*jobs,*count;
  CUtensorMap *gmap,*dmap;float *gpartial,*dpartial;
  const uint8_t *gate,*down,*gs,*ds;uint8_t *xq,*xs,*mid,*ms;
@@ -28,10 +30,6 @@ void check(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErro
 void* alloc(size_t n){void*p=nullptr;check(cudaMalloc(&p,n));return p;}
 __device__ __forceinline__ unsigned exponent(float a){return max((__float_as_uint(a)+0x7fffffu-0x600000u)>>23,113u)-8;}
 __device__ __forceinline__ float sf(unsigned e){return __uint_as_float(e<<23);}
-__device__ __forceinline__ size_t sf_offset(int expert,int row,int kb,int n,int k){
-  int t=(row&~127)+(row%32)*4+(row%128)/32;
-  return (size_t)expert*n*(k/32)+((size_t)(kb/4)*n+t)*4+kb%4;
-}
 __device__ __forceinline__ void mma(float&d0,float&d1,float&d2,float&d3,
    unsigned a0,unsigned a1,unsigned a2,unsigned a3,unsigned b0,unsigned b1){
   asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
@@ -126,19 +124,38 @@ extern "C" int fastshared_ep_create(const int*devices,int layers,void**result){
   *result=s;return 0;
  }catch(const std::exception&e){fastshared_ep_destroy(s);fprintf(stderr,"EP create: %s\n",e.what());return 1;}
 }
-extern "C" int fastshared_ep_bind(void*state,int rank,int layer,const void*gate,const void*down,const void*gs,const void*ds){
- try {
-
- if(!state||rank<0||rank>=8||!gate||!down||!gs||!ds)return 1;
- auto*s=(fastllm_shared_flex_ep::State*)state;if(layer<0||layer>=(int)s->layers.size())return 1; auto&a=s->layers[layer][rank];if(a.gate)return 1;a=s->r[rank];a.gmap=nullptr;a.dmap=nullptr;a.gate=(const uint8_t*)gate;cudaSetDevice(a.device);a.gmap=(CUtensorMap*)fastllm_shared_flex_ep::alloc(128);a.dmap=(CUtensorMap*)fastllm_shared_flex_ep::alloc(128);a.gate=(const uint8_t*)gate;a.down=(const uint8_t*)down;a.gs=(const uint8_t*)gs;a.ds=(const uint8_t*)ds;
- if(cudaSetDevice(a.device)!=cudaSuccess)return 1;
- for(int which=0;which<2;++which){CUtensorMap map;int k=which?2048:4096;
-  cuuint64_t dims[]={(uint64_t)k,4096,32},strides[]={(uint64_t)k,(uint64_t)4096*k};cuuint32_t box[]={128,128,1},steps[]={1,1,1};
-  if(cuTensorMapEncodeTiled(&map,CU_TENSOR_MAP_DATA_TYPE_UINT8,3,(void*)(which?down:gate),dims,strides,box,steps,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE)!=CUDA_SUCCESS)return 1;
-  if(cudaMemcpy(which?a.dmap:a.gmap,&map,128,cudaMemcpyHostToDevice)!=cudaSuccess)return 1;
- }return 0;
-
- } catch (const std::exception &e) { fprintf(stderr,"Shared Flex bind: %s\n",e.what());return 1; }
+extern "C" int fastshared_ep_bind_format(void *state, int rank, int layer, const void *gate,
+        const void *down, const void *gs, const void *ds, bool mxfp4) {
+    using namespace fastllm_shared_flex_ep;
+    auto *s = static_cast<State *>(state);
+    if (!s || rank < 0 || rank >= R || layer < 0 || layer >= (int)s->layers.size() ||
+        !gate || !down || !gs || !ds) return 1;
+    auto &a = s->layers[layer][rank];
+    if (a.gate) return 1;
+    a = s->r[rank];
+    a.gmap = a.dmap = nullptr;
+    a.gate = static_cast<const uint8_t *>(gate);
+    a.down = static_cast<const uint8_t *>(down);
+    a.gs = static_cast<const uint8_t *>(gs);
+    a.ds = static_cast<const uint8_t *>(ds);
+    a.mxfp4 = mxfp4;
+    try {
+        check(cudaSetDevice(a.device));
+        for (int downProjection = 0; downProjection < 2; ++downProjection) {
+            CUtensorMap map;
+            if (fastllm_shared_flex::weight_map(&map, downProjection ? down : gate,
+                    downProjection ? I : H, downProjection ? H : 2 * I, E/R, mxfp4) != CUDA_SUCCESS)
+                return 1;
+            auto &dst = downProjection ? a.dmap : a.gmap;
+            dst = static_cast<CUtensorMap *>(alloc(sizeof(map)));
+            check(cudaMemcpy(dst, &map, sizeof(map), cudaMemcpyHostToDevice));
+        }
+        return 0;
+    } catch (const std::exception &e) { fprintf(stderr, "Shared Flex EP bind: %s\n", e.what()); return 1; }
+}
+extern "C" int fastshared_ep_bind(void *state, int rank, int layer, const void *gate,
+        const void *down, const void *gs, const void *ds) {
+    return fastshared_ep_bind_format(state, rank, layer, gate, down, gs, ds, false);
 }
 extern "C" int fastshared_ep_run(void*state,int rank,int layer,int rows,const void*x,const void*ids,const void*prob,void*y){
  using namespace fastllm_shared_flex_ep;

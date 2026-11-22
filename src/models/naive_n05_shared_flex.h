@@ -27,8 +27,9 @@ struct NaiveSharedFlexMoe {
         return false;
 #endif
     }
-    static bool TPWeightsSupported(const Weights &weights, const std::vector<int> &devices) {
+    static bool TPWeightsSupported(const Weights &weights, const std::vector<int> &devices, bool allowMxfp4 = true) {
         if (weights.size() != 8 || devices.size() != 8) return false;
+        int format = -1;
         for (size_t rank = 0; rank < weights.size(); ++rank) for (const auto &ws : weights[rank]) {
             if (ws.empty()) continue;
             if (ws.size() != 514 || ws[0] || ws[1]) return false;
@@ -38,11 +39,24 @@ struct NaiveSharedFlexMoe {
                     !(w->directMemory || (w->cudaRepackSource && FastllmCudaIsWeightSlabPointer(w->cudaData))) ||
                     w->dataDevice != DataDevice::CUDA || w->dataDeviceIds != std::vector<int>{devices[rank]} ||
                     !w->extraCudaData.empty() || !w->extraCudaHalfData.empty() ||
-                    w->dataType != FP8_E4M3 || w->blockK != 128 || w->blockM != 128 ||
-                    w->dims != (i % 2 ? std::vector<int>{4096, 256} : std::vector<int>{512, 4096}) ||
-                    w->scales.size() != (i % 2 ? 64u : 128u)) return false;
+                    w->dims != (i % 2 ? std::vector<int>{4096, 256} : std::vector<int>{512, 4096})) return false;
+                if (format < 0) format = w->dataType;
+                if (w->dataType != format) return false;
+                if (!(allowMxfp4 && FastllmCudaMimoIsMxfp4Expert(*w)) &&
+                    !(w->dataType == FP8_E4M3 && w->blockK == 128 && w->blockM == 128 &&
+                      w->scales.size() == (i % 2 ? 64u : 128u))) return false;
             }
         }
+        return true;
+    }
+    static bool CanBorrowEpWeights(FastllmCudaMimoEp8Mega &mega, const Weights &weights) {
+        for (size_t rank = 0; rank < weights.size(); ++rank)
+            for (size_t layer = 0; layer < weights[rank].size(); ++layer) {
+                if (weights[rank][layer].empty()) continue;
+                const void *p[4]{};
+                bool mxfp4 = false;
+                if (!FastllmCudaMimoEp8MegaWeights(mega, rank, layer, p, &mxfp4)) return false;
+            }
         return true;
     }
     // EP uses MegaMoE's same packed allocation for larger row counts. TP's
@@ -68,21 +82,26 @@ struct NaiveSharedFlexMoe {
                 ++layers;
                 for (int rank = 0; rank < 8; ++rank) {
                     if (ep) {
-                        const void *p[4]{};
-                        AssertInFastLLM(FastllmCudaMimoEp8MegaWeights(*mega, rank, layer, p) &&
-                            fastshared_ep_bind(state, rank, layer, p[0], p[1], p[2], p[3]) == 0,
+                        const void *p[4]{}; bool mxfp4 = false;
+                        AssertInFastLLM(FastllmCudaMimoEp8MegaWeights(*mega, rank, layer, p, &mxfp4) &&
+                            fastshared_ep_bind_format(state, rank, layer, p[0], p[1], p[2], p[3], mxfp4) == 0,
                             "Shared Flex cannot borrow Mega packed weights.");
                     } else {
                         const auto &ws = weights[rank][layer];
+                        const bool mxfp4 = FastllmCudaMimoIsMxfp4Expert(*ws[2]);
                         std::vector<uint64_t> pointers;
                         std::vector<float> gs, ds;
                         for (int i = 2; i < 514; ++i) {
                             pointers.push_back(reinterpret_cast<uint64_t>(ws[i]->cudaData));
-                            auto &scales = i % 2 ? ds : gs;
-                            scales.insert(scales.end(), ws[i]->scales.begin(), ws[i]->scales.end());
+                            if (!mxfp4) {
+                                auto &scales = i % 2 ? ds : gs;
+                                scales.insert(scales.end(), ws[i]->scales.begin(), ws[i]->scales.end());
+                            }
                         }
-                        AssertInFastLLM(fastshared_tp_pack(state, rank, layer,
-                            pointers.data(), gs.data(), ds.data()) == 0, "Shared Flex TP packing failed.");
+                        const int result = mxfp4
+                            ? fastshared_tp_pack_mxfp4(state, rank, layer, pointers.data())
+                            : fastshared_tp_pack(state, rank, layer, pointers.data(), gs.data(), ds.data());
+                        AssertInFastLLM(result == 0, "Shared Flex TP packing failed.");
                         for (int i = 2; i < 514; ++i) released += ReleasePackedMoeSource(*ws[i]);
                     }
                 }
@@ -148,6 +167,55 @@ struct NaiveSharedFlexMoe {
         input.bias = static_cast<const float *>(bias.cudaData);
         input.needNorm = needNorm; input.routeScale = routeScale; input.routed = true;
         if (!input.Valid(rows)) input.routed = false;
+        return true;
+#else
+        return false;
+#endif
+    }
+    bool PrepareResidualRouter(int rank, int layer, int rows, Data &hidden, const Data &branch,
+            const Data &gamma, float eps, Data &normed, const Data &weight, Data &router,
+            const Data &bias, Data &ids, Data &scores, bool needNorm, float routeScale) const {
+#ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
+        if (ep || !fastshared_tp_residual_router_supported(state, rank, layer, rows)) return false;
+        auto tensor = [&](const Data &x, DataType type, size_t elements) {
+            if (x.dataType != type || !x.cudaData || x.dataDevice != CUDA ||
+                x.dataDeviceIds != hidden.dataDeviceIds || (uintptr_t(x.cudaData) & 15) ||
+                x.Count(0) != elements) return false;
+            size_t stride = 1;
+            if (!x.strides.empty()) {
+                if (x.strides.size() != x.dims.size()) return false;
+                for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+                    if (x.strides[i] != stride) return false;
+                    stride *= x.dims[i];
+                }
+            }
+            return true;
+        };
+        const size_t elements = size_t(rows) * 4096;
+        if (hidden.dims.empty() || hidden.dims.back() != 4096 || branch.dims != hidden.dims ||
+            !tensor(hidden, BFLOAT16, elements) || !tensor(branch, BFLOAT16, elements) ||
+            !tensor(gamma, FLOAT32, 4096) || weight.dims != std::vector<int>{256, 4096} ||
+            !tensor(weight, FLOAT32, 256 * 4096) || !tensor(bias, FLOAT32, 256) ||
+            !std::isfinite(eps) || eps <= 0.f || !std::isfinite(routeScale)) return false;
+        for (Data *out : {&normed, &router, &ids, &scores}) {
+            const int width = out == &normed ? 4096 : out == &router ? 256 : 8;
+            const auto type = out == &normed ? BFLOAT16 : out == &ids ? INT32 : FLOAT32;
+            if ((out->isFake || out->cudaDataBorrowed) && !tensor(*out, type, size_t(rows) * width)) return false;
+        }
+        for (Data *out : {&normed, &router, &ids, &scores}) {
+            auto dims = out == &normed || out == &router ? hidden.dims : std::vector<int>{rows, 8};
+            if (out == &router) dims.back() = 256;
+            out->dataType = out == &normed ? BFLOAT16 : out == &ids ? INT32 : FLOAT32;
+            out->UpdateUnitSize(); out->Resize(dims); out->ToDevice(CUDA, hidden.dataDeviceIds, false); out->Allocate(false);
+        }
+        const Data *buffers[] = {&branch, &gamma, &weight, &bias, &hidden, &normed, &router, &ids, &scores};
+        for (int i = 4; i < 9; ++i) for (int j = 0; j < i; ++j)
+            if (!FastllmMoePreparedInput::Disjoint({buffers[i]->cudaData, buffers[i]->GetBytes()},
+                                                  {buffers[j]->cudaData, buffers[j]->GetBytes()})) return false;
+        AssertInFastLLM(fastshared_tp_residual_router(state, rank, layer, rows, hidden.cudaData, branch.cudaData,
+            static_cast<const float *>(gamma.cudaData), eps, normed.cudaData, static_cast<const float *>(weight.cudaData),
+            static_cast<float *>(router.cudaData), static_cast<const float *>(bias.cudaData), static_cast<int *>(ids.cudaData),
+            static_cast<float *>(scores.cudaData), needNorm, routeScale) == 0, "Shared Flex residual router launch failed.");
         return true;
 #else
         return false;

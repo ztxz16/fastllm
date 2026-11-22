@@ -1,11 +1,12 @@
 #pragma once
 // Each CTA owns 128 output features of one row and sums all eight experts in
-// the original order. The two-pane helper reads existing packed MXFP8 weights.
+// the original order. The two-pane helper reads packed FP8 or MXFP4 weights.
 // The producer publishes BF16 mailboxes without waiting for any peer; the
 // following receive kernel retains the established collective boundary.
 namespace fastllm_shared_flex_tp {
 constexpr int OwnerDownBytes = 70656;
 
+template<bool KeepExperts>
 __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, int row) {
     using E4 = cutlass::float_e4m3_t;
     using UE = cutlass::float_ue8m0_t;
@@ -18,6 +19,9 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
     auto inputScales = reinterpret_cast<uint8_t (*)[512]>(arena + 69632);
     __shared__ __align__(8) uint64_t ready[2], released[2], done;
     __shared__ unsigned tmem;
+    // The packed eight-row path leaves one N8 accumulator per expert in TMEM.
+    // Weight and scale panes can be refilled as soon as their MMA completes.
+    constexpr int TmemColumns = KeepExperts ? 128 : 32;
     const int tid = threadIdx.x;
     if (tid == 0) {
         for (int b = 0; b < 2; ++b) {
@@ -32,7 +36,7 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
     }
     if (tid < 32) {
         cute::TMEM::Allocator1Sm allocator;
-        allocator.allocate(32, &tmem);
+        allocator.allocate(TmemColumns, &tmem);
         allocator.release_allocation_lock();
     }
     __syncthreads();
@@ -45,7 +49,7 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
             if (lane == 0) {
                 unsigned mb = unsigned(__cvta_generic_to_shared(&ready[b]));
                 asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"
-                             :: "r"(mb), "r"(33792) : "memory");
+                             :: "r"(mb), "r"(2*(fastllm_shared_flex::weight_tile_bytes(a.mxfp4)+512)) : "memory");
             }
             __syncwarp();
             if (lane < 2) {
@@ -70,8 +74,7 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
     }
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     MatmulSync<true>();
-    auto descriptor = cute::UMMA::make_instr_desc_block_scaled<E4,E4,float,UE,128,8,
-        cute::UMMA::Major::K,cute::UMMA::Major::K>();
+    auto descriptor = fastllm_shared_flex::weight_instruction(a.mxfp4);
     float sum = 0.f;
     for (int expertSlot = 0; expertSlot < K; ++expertSlot) {
         const int b = expertSlot % 2;
@@ -83,7 +86,7 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
                 auto xb = dg::mma::sm100::make_umma_desc<cute::UMMA::Major::K,8,128,128>((E4 *)input[kg], 0, 0);
                 auto sa = dg::mma::sm100::make_sf_desc(weightScales[b][kg]);
                 auto sb = dg::mma::sm100::make_sf_desc(inputScales[kg]);
-                const unsigned ta = tmem + 8 + kg * 8, tb = tmem + 12 + kg * 8;
+                const unsigned ta = tmem + (KeepExperts ? 64 + b * 16 : 8) + kg * 8, tb = ta + 4;
                 if (tid == 0) {
                     cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sa, ta);
                     cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sb, tb);
@@ -93,64 +96,109 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
                     auto aa = wa, bb = xb;
                     aa.start_address_ += k * 2; bb.start_address_ += k * 2;
                     auto runtime = dg::mma::sm100::make_runtime_instr_desc_with_sf_id(descriptor, k, k);
-                    MMA::fma(aa, bb, tmem, kg != 0 || k != 0, runtime, ta, tb);
+                    MMA::fma(aa, bb, tmem + (KeepExperts ? expertSlot * 8 : 0), kg != 0 || k != 0, runtime, ta, tb);
                 }
             }
-            cutlass::arch::umma_arrive(&done);
+            if constexpr (KeepExperts) {
+                cutlass::arch::umma_arrive(&released[b]);
+                if (expertSlot == K - 1) cutlass::arch::umma_arrive(&done);
+            } else cutlass::arch::umma_arrive(&done);
         }
-        while (!parity_wait(&done, expertSlot & 1)) {}
-        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-        unsigned value;
-        cute::SM100_TMEM_LOAD_32dp32b1x::copy(tmem + expertSlot + (unsigned(tid / 32 * 32) << 16), value);
-        cutlass::arch::fence_view_async_tmem_load();
-        sum = __fadd_rn(sum, __uint_as_float(value));
-        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-        MatmulSync<true>();
-        if (tid == 0) {
-            unsigned mb = unsigned(__cvta_generic_to_shared(&released[b]));
-            asm volatile("mbarrier.arrive.shared::cta.b64 _,[%0];" :: "r"(mb) : "memory");
+        if constexpr (!KeepExperts) {
+            while (!parity_wait(&done, expertSlot & 1)) {}
+            asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+            unsigned value;
+            cute::SM100_TMEM_LOAD_32dp32b1x::copy(tmem + expertSlot + (unsigned(tid / 32 * 32) << 16), value);
+            cutlass::arch::fence_view_async_tmem_load();
+            sum = __fadd_rn(sum, __uint_as_float(value));
+            asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+            MatmulSync<true>();
+            if (tid == 0) {
+                unsigned mb = unsigned(__cvta_generic_to_shared(&released[b]));
+                asm volatile("mbarrier.arrive.shared::cta.b64 _,[%0];" :: "r"(mb) : "memory");
+            }
         }
     }
-    a.wlocal[row * H + tile * 128 + tid] = sum;
+    if constexpr (KeepExperts) {
+        while (!parity_wait(&done, 0)) {}
+        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+        const unsigned rowOffset = unsigned(tid / 32 * 32) << 16;
+        unsigned values[K];
+#pragma unroll
+        for (int slot = 0; slot < K; ++slot)
+            cute::SM100_TMEM_LOAD_32dp32b1x::copy(tmem + slot * 8 + slot + rowOffset, values[slot]);
+        cutlass::arch::fence_view_async_tmem_load();
+#pragma unroll
+        for (int slot = 0; slot < K; ++slot) sum = __fadd_rn(sum, __uint_as_float(values[slot]));
+        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+        MatmulSync<true>();
+    } else {
+        a.wlocal[row * H + tile * 128 + tid] = sum;
+    }
     const float other = __shfl_down_sync(0xffffffff, sum, 1);
-    if (tid % 2 == 0)
-        publish_bf16(a, row, tile * 64 + tid / 2, unsigned(*a.epoch), pack_bf16(sum, other));
+    if (tid % 2 == 0) {
+        const unsigned local = pack_bf16(sum, other);
+        const int pair = tile * 64 + tid / 2;
+        if constexpr (KeepExperts) reinterpret_cast<unsigned *>(a.wlocal)[row * (H / 2) + pair] = local;
+        publish_bf16(a, row, pair, unsigned(*a.epoch), local);
+    }
     if (tid < 32) {
         cute::TMEM::Allocator1Sm allocator;
-        allocator.free(tmem, 32);
+        allocator.free(tmem, TmemColumns);
     }
 }
 
-__global__ __launch_bounds__(160,2)
+template<bool KeepExperts> __global__ __launch_bounds__(160,2)
 void owner_down(Rank a, const int *ids, const float *prob) {
-    // Concentrated routes retain inter-row weight reuse and the old partials.
     if (*a.nuniq <= a.rows * 4) {
-        if (threadIdx.x >= 128) return;
-        batched_matmul<false,false,1,true>(a, ids, prob);
+        if (threadIdx.x < 128) batched_matmul<false,false,1,true>(a, ids, prob);
         return;
     }
     const int task = blockIdx.x;
-    if (task < a.rows * (H / 128))
-        OwnerDownBody(a, ids, task % (H / 128), task / (H / 128));
+    if (task >= a.rows * (H / 128)) return;
+    // Neighboring eight-row CTAs request the same output tile. Rows selecting
+    // the same expert can reuse those cache lines without a global partial.
+    const int tile = KeepExperts ? task / a.rows : task % (H / 128);
+    const int row = KeepExperts ? task % a.rows : task / (H / 128);
+    OwnerDownBody<KeepExperts>(a, ids, tile, row);
 }
 
-__global__ void owner_finish(Rank a, __nv_bfloat16 *output, int rows) {
+template<bool PackedLocal> __global__
+void owner_finish(Rank a, __nv_bfloat16 *output) {
     if (blockIdx.y == 0 && blockIdx.x < 4) a.gcount[blockIdx.x * 64 + threadIdx.x] = 0;
     const int pair = blockIdx.x * 64 + threadIdx.x, row = blockIdx.y;
     const unsigned generation = unsigned(*a.epoch);
-    float2 sum;
+    unsigned payload;
     if (*a.nuniq <= a.rows * 4) {
-        sum = make_float2(0.f, 0.f);
+        float2 sum = make_float2(0.f, 0.f);
 #pragma unroll
         for (int slot = 0; slot < K; ++slot) {
             float2 value = reinterpret_cast<const float2 *>(a.dpartial + size_t(row * K + slot) * H)[pair];
             sum.x = __fadd_rn(sum.x, value.x); sum.y = __fadd_rn(sum.y, value.y);
         }
-        publish_bf16(a, row, pair, generation, pack_bf16(sum.x, sum.y));
+        payload = pack_bf16(sum.x, sum.y);
+        publish_bf16(a, row, pair, generation, payload);
+    } else if constexpr (PackedLocal) {
+        payload = reinterpret_cast<const unsigned *>(a.wlocal)[row * (H / 2) + pair];
     } else {
-        sum = reinterpret_cast<const float2 *>(a.wlocal + row * H)[pair];
+        float2 sum = reinterpret_cast<const float2 *>(a.wlocal + row * H)[pair];
+        payload = pack_bf16(sum.x, sum.y);
     }
-    float2 total = collect_bf16(a, row, pair, generation, pack_bf16(sum.x, sum.y));
+    float2 total = collect_bf16(a, row, pair, generation, payload);
     reinterpret_cast<__nv_bfloat162 *>(output + row * H)[pair] = __floats2bfloat162_rn(total.x, total.y);
 }
+
+template<bool Packed>
+static bool SupportsOwnerDown(int smCount) {
+    cudaFuncAttributes producer{}, receiver{};
+    int producerBlocks = 0, receiverBlocks = 0;
+    return cudaFuncGetAttributes(&producer, owner_down<Packed>) == cudaSuccess &&
+        producer.binaryVersion == 103 && producer.maxThreadsPerBlock >= 160 &&
+        cudaFuncSetAttribute(owner_down<Packed>, cudaFuncAttributeMaxDynamicSharedMemorySize, OwnerDownBytes) == cudaSuccess &&
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&producerBlocks, owner_down<Packed>, 160, OwnerDownBytes) == cudaSuccess &&
+        producerBlocks > 0 && cudaFuncGetAttributes(&receiver, owner_finish<Packed>) == cudaSuccess &&
+        receiver.binaryVersion == 103 && receiver.maxThreadsPerBlock >= 64 &&
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&receiverBlocks, owner_finish<Packed>, 64, 0) == cudaSuccess &&
+        receiverBlocks * smCount >= MAX_M * (H / 128);
 }
+} // namespace fastllm_shared_flex_tp

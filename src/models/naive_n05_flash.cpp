@@ -2507,6 +2507,15 @@ Data NaiveN05FlashModel::RunTarget(
                 postAttentionNorm, rms_norm_eps, localNorm);
             prefillResidualSharded = true;
         } else if (decodeWorkspace || fusePrefillNorm) {
+            if (!attentionNormReady && useSharedFlex && verifying && moeLayers[layer] && num_experts_per_tok == 8 &&
+                tpSharedFlex->PrepareResidualRouter(tpRank, layer, length, hidden, projected, postAttentionNorm,
+                    rms_norm_eps, normed, localWeight(prefix + ".mlp.gate.weight"), router,
+                    localWeight(prefix + ".mlp.gate.e_score_correction_bias"), expertIndex, expertScore,
+                    norm_topk_prob, routed_scaling_factor)) {
+                attentionNormReady = attentionRouterReady = attentionInputPrepared = true;
+                preparedInput.routed = true;
+                prepared = &preparedInput;
+            }
             if (!attentionNormReady)
                 FastllmCudaNaiveAddDecodeRMSNorm(hidden, projected,
                     postAttentionNorm, rms_norm_eps, normed);
