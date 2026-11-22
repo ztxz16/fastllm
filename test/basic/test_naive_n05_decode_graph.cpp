@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cuda_runtime_api.h>
+#include <cuda_fp8.h>
 #include <stdexcept>
 #include <vector>
 using namespace fastllm;
@@ -39,6 +40,36 @@ template <typename T> static std::vector<T> Read(const Data &d) {
     Cuda(cudaMemcpy(v.data(), d.cudaData, d.GetBytes(), cudaMemcpyDeviceToHost));
     return v;
 }
+// Compare the producer's bytes with independent host quantization of its BF16 output.
+struct PackedOutput {
+    Data values{INT32}, scales{INT32};
+    FastllmMxfp8Activation view{};
+    void Init(int rows, int width) {
+        int pitch = (rows + 3) / 4 * 4;
+        Upload(values, {rows * width / 4}, 601);
+        Upload(scales, {pitch * width / 128}, 602);
+        view = {static_cast<uint8_t *>(values.cudaData), static_cast<uint8_t *>(scales.cudaData),
+                rows, width, pitch};
+    }
+    void Check(const Data &output) const {
+        auto bf16 = Read<uint16_t>(output);
+        auto bytes = Read<uint8_t>(values), exponents = Read<uint8_t>(scales);
+        for (int row = 0; row < view.rows; ++row) for (int col = 0; col < view.width; col += 32) {
+            float block[32], maximum = 0.f;
+            for (int i = 0; i < 32; ++i) {
+                uint32_t bits = uint32_t(bf16[row * view.width + col + i]) << 16;
+                std::memcpy(&block[i], &bits, sizeof(bits));
+                maximum = std::max(maximum, std::abs(block[i]));
+            }
+            int exponent = maximum ? std::max(-126, int(std::ceil(std::log2(maximum / 448.f)))) : -126;
+            Require(exponents[(col / 128 * view.pitch + row) * 4 + col / 32 % 4] == exponent + 127,
+                    "incorrect projection activation scale");
+            for (int i = 0; i < 32; ++i)
+                Require(bytes[row * view.width + col + i] == __nv_fp8_e4m3(std::ldexp(block[i], -exponent)).__x,
+                        "incorrect projection activation value");
+        }
+    }
+};
 struct Graph {
     void *graph = nullptr, *exec = nullptr;
     std::vector<void *> reserved;
@@ -259,7 +290,13 @@ static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = 
     } else Upload(weight, {channels}, 93);
     Upload(expected, {1, rows, channels}, 94);
     auto original = Read<uint16_t>(hidden);
-    auto body = [&]() { FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, weight, 1e-5f, actual); };
+    PackedOutput packed;
+    if (channels % 128 == 0 && rows <= 16) packed.Init(rows, channels);
+    auto body = [&]() {
+        auto view = packed.view;
+        FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, weight, 1e-5f, actual, &view);
+        Require(view.values == (channels == 4096 ? packed.view.values : nullptr), "unexpected RMSNorm projection admission");
+    };
     Graph graph;
     graph.Capture(body);
     for (int step = 0; step < 3; ++step) {
@@ -272,6 +309,7 @@ static void TestResidualNorm(int channels, int rows = 1, bool unalignedWeight = 
         graph.Run();
         Require(Read<uint16_t>(hidden) == Read<uint16_t>(reference), "fused residual differs");
         Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "fused norm differs");
+        if (channels == 4096 && packed.view.values) packed.Check(actual);
         original = Read<uint16_t>(reference);
         ++checks;
     }
@@ -590,9 +628,13 @@ static void TestSwaBatch(int batch, int heads, int kvHeads) {
     }
     std::vector<int> lengths(batch, 128);
     Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
+    PackedOutput packed;
+    if (heads == 64 && batch == 1) packed.Init(batch, heads * 128);
     Graph graph;
     graph.Capture([&]() {
-        FastllmCudaNaiveBatchSWADecode(query, sink, rows, live, heads, kvHeads, actual);
+        auto view = packed.view;
+        FastllmCudaNaiveBatchSWADecode(query, sink, rows, live, heads, kvHeads, actual, &view);
+        if (packed.view.values) Require(view.values, "SWA producer rejected eligible view");
     });
     for (int prefix : {1, 127, 707}) {
         for (int b = 0; b < batch; ++b) lengths[b] = prefix + b;
@@ -608,6 +650,29 @@ static void TestSwaBatch(int batch, int heads, int kvHeads) {
                 128, heads, kvHeads, 192, 128, 128, scratch, result, true);
         }
         Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "batched SWA differs from individual rows");
+        if (packed.view.values) packed.Check(actual);
+        ++checks;
+    }
+    if (!packed.view.values) return;
+    for (Data *cache : {&keys[0], &values[0]}) {
+        std::vector<uint8_t> bytes(cache->Count(0));
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = uint8_t((i * 37 % 73) | ((i % 11 < 4) ? 128 : 0));
+        Cuda(cudaMemcpy(cache->cudaData, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+    }
+    rows.front().fp8 = true;
+    Graph fp8Graph;
+    fp8Graph.Capture([&] {
+        auto view = packed.view;
+        FastllmCudaNaiveBatchSWADecode(query, sink, rows, live, heads, kvHeads, actual, &view);
+        Require(view.values, "FP8 ring did not prepare projection input");
+    });
+    for (int length : {0, 1, 127, 128, 707}) {
+        Cuda(cudaMemcpy(live.cudaData, &length, sizeof(length), cudaMemcpyHostToDevice));
+        FastllmCudaNaiveBatchSWADecode(query, sink, rows, live, heads, kvHeads, expected);
+        fp8Graph.Run();
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "FP8 SWA BF16 output differs");
+        packed.Check(actual);
         ++checks;
     }
 }
@@ -674,8 +739,13 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
     };
     bind(batch);
     FastllmNaiveDecodeScratch scratch;
+    PackedOutput packed;
+    if (online && batch <= 16) packed.Init(batch, heads * vd);
     auto runOnline = [&] {
-        return FastllmCudaNaiveOnlineDSADecode(query, sink, rows, heads, kvHeads, dim, vd, scratch, actual);
+        auto view = packed.view;
+        const bool ok = FastllmCudaNaiveOnlineDSADecode(query, sink, rows, heads, kvHeads, dim, vd, scratch, actual, &view);
+        Require(view.values == (ok ? packed.view.values : nullptr), "unexpected DSA projection admission");
+        return ok;
     };
     if (online && !runOnline()) return; // Optional device/image.
     Graph graph;
@@ -699,6 +769,7 @@ static void TestPaddedAttention(int batch, int heads, int dim, int vd, bool spar
     }
     for (int active : {batch - 1, 1, 0, batch / 2, batch}) {
         bind(active); graph.Run(); auto result = Read<uint16_t>(actual);
+        if (packed.view.values) packed.Check(actual);
         for (size_t i = 0; i < result.size(); ++i)
             Require(result[i] == (i < (size_t)active * heads * vd ? reference[i] : 0),
                     "padding changed active attention or left inactive output nonzero");
@@ -870,6 +941,15 @@ int main(int argc, char **argv) {
         if (argc == 2 && std::strcmp(argv[1], "--router-batch") == 0) {
             TestRouters();
             std::puts("ROUTER BATCH PASS");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--projection-pack") == 0) {
+            TestResidualNorm(4096, 1);
+            TestResidualNorm(4096, 8);
+            TestResidualNorm(2048, 2); // BF16 fallback clears the requested side output.
+            TestSwaBatch(1, 64, 8);
+            for (int rows : {1, 4}) TestPaddedAttention(rows, 64, 192, 128, true, true, true);
+            std::printf("Projection pack PASS (%d graph checks)\n", checks);
             return 0;
         }
         for (int requests : {2, 70}) for (bool fp8 : {false, true}) TestBatchVerifyIndexer(requests, fp8);

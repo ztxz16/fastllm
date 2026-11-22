@@ -30,6 +30,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-linear-scratch.h"
+#include "devices/cuda/fastllm-mxfp8-projection.h"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mxfp4-marlin-tp.h"
@@ -953,9 +954,17 @@ Data NaiveN05FlashModel::RunTarget(
         EmbeddingDirect(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     else Embedding(inputIds, localWeight("model.embed_tokens.weight"), hidden);
     ToDataType(hidden, DataType::BFLOAT16);
-    // The score and router arenas are both dead during QKV/O projection. Some
-    // serving layouts allocate only the latter. Borrow existing storage only.
-    auto projectAttention = [&](Data &input, Data &weight, const Data &bias, Data &output) {
+    const auto *projectionBackend = attentionParallel && decodeWorkspace
+        ? FastllmCudaGetMxfp8ProjectionBackend() : nullptr;
+    const int maxProjectionWidth = std::max({embed_dim, full.heads * full.valueDim, sliding.heads * sliding.valueDim});
+    auto activationFor = [&](const Data &weight, int rows) {
+        return projectionBackend->Bind(weight, rows, verifying, maxProjectionWidth, buf.projectionQuant);
+    };
+    auto projectAttention = [&](Data &input, Data &weight, const Data &bias, Data &output,
+                                FastllmMxfp8Activation prepared = {}) {
+        if (prepared.values && projectionBackend && projectionBackend->TryProject(prepared, input, weight, bias, output))
+            return;
+        // The score and router arenas are both dead during prefill QKV/O projection.
         if (!decodeWorkspace && !verifying && length >= 1024) {
             const Data *scratch = &routerInput;
             if (prefillScores && prefillScores->expansionBytes > routerInput.expansionBytes)
@@ -1055,7 +1064,11 @@ Data NaiveN05FlashModel::RunTarget(
     const bool attentionBatchDecode = attentionParallel ? attentionBatch && attentionBatch->Decode() : batchDecode;
     struct PrefillProjectionViews { Data key, value, attention; };
     std::optional<PrefillProjectionViews> projectionViews;
+    FastllmMxfp8Activation nextQkv{};
     for (int layer = 0; layer < block_cnt; layer++) {
+        const auto preparedQkv = nextQkv;
+        nextQkv = {};
+        FastllmMxfp8Activation preparedO{};
         const bool localMoe = localMoeRows && moeLayers[layer];
         auto *localDP = localMoe ? &attentionParallel->ranks[tpRank] : nullptr;
         const int length = localMoe ? attentionParallel->rows.localToGlobal[tpRank].size() : inputIds.dims[1];
@@ -1320,7 +1333,7 @@ Data NaiveN05FlashModel::RunTarget(
 #endif
         if (mergedQkv) {
                 if (!batchRope && !trySingleSwaQkv && !tryVerifyDsaFront && !tryVerifySwaQkv)
-                projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+                projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv, preparedQkv);
             // Q/K and V have different head widths. Read packed projection rows
             // directly in the RoPE/cache kernel instead of launching three Splits.
             for (auto item : {std::make_pair(&q, cfg.heads * cfg.headDim),
@@ -1507,7 +1520,7 @@ Data NaiveN05FlashModel::RunTarget(
 #endif
             if (!batchRopePrepared) {
                 if (mergedQkv)
-                    projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv);
+                    projectAttention(normed, localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"), qkv, preparedQkv);
                 batchRopePrepared = FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions,
                     caches, liveKeys, cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim,
                     rotaryDim, cfg.theta, valueScale, slidingLayers[layer] ? window : 0,
@@ -2431,15 +2444,18 @@ Data NaiveN05FlashModel::RunTarget(
             }
         } else if (batchedDSA && !dsaFrontPrepared && !fusedDsaPrepared) {
             Data &sink = localWeight(ap + "attention_sink_bias");
+            if (projectionBackend) preparedO = activationFor(localWeight(ap + "o_proj.weight"), dsaRows.size());
             if (!FastllmCudaNaiveOnlineDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
-                    cfg.headDim, cfg.valueDim, buf.decode, attn))
+                    cfg.headDim, cfg.valueDim, buf.decode, attn, &preparedO)) {
                 FastllmCudaNaiveBatchDSADecode(q, sink, dsaRows, cfg.heads, cfg.kvHeads,
                     cfg.headDim, cfg.valueDim, buf.decode, attn);
+            }
         }
         if (batchedSWA && !swaAttentionPrepared) {
             Data eagerLengths;
+            if (projectionBackend) preparedO = activationFor(localWeight(ap + "o_proj.weight"), swaRows.size());
             FastllmCudaNaiveBatchSWADecode(q, localWeight(ap + "attention_sink_bias"), swaRows,
-                eagerSwa || (verifySWA && !graphVerify) ? eagerLengths : liveKeys, cfg.heads, cfg.kvHeads, attn);
+                eagerSwa || (verifySWA && !graphVerify) ? eagerLengths : liveKeys, cfg.heads, cfg.kvHeads, attn, &preparedO);
         }
 #ifndef USE_ROCM
             // DSA and SWA share the same output-projection contract. The collective
@@ -2461,7 +2477,7 @@ Data NaiveN05FlashModel::RunTarget(
                 if (attentionNormReady) trackCommunication(projected);
             }
 #endif
-            if (!attentionNormReady) projectAttention(attn, localWeight(ap + "o_proj.weight"), Data(), projected);
+            if (!attentionNormReady) projectAttention(attn, localWeight(ap + "o_proj.weight"), Data(), projected, preparedO);
         if (attentionParallel && AttentionTPSize() > 1) {
             auto &runtime = attentionParallel->runtime;
             // Match the existing TP reduction: sum BF16 partials in FP32,
@@ -2558,9 +2574,14 @@ Data NaiveN05FlashModel::RunTarget(
                 else AddTo(hidden, branch);
                 return;
             }
-            if (!needsReduce || !reduce(branch, &hidden, mlpNormWeight, mlpNormOutput))
+            if (!needsReduce || !reduce(branch, &hidden, mlpNormWeight, mlpNormOutput)) {
+                if (projectionBackend && localMoe && layer + 1 < block_cnt && moeLayers[layer + 1]) {
+                    nextQkv = activationFor(localWeight("model.layers." + std::to_string(layer + 1) +
+                                                        ".self_attn.mergeqkv.weight"), length);
+                }
                 FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, *mlpNormWeight,
-                    rms_norm_eps, *mlpNormOutput);
+                    rms_norm_eps, *mlpNormOutput, &nextQkv);
+            }
         };
         if (!moeLayers[layer]) {
             // Dense and routed-expert scratch have independent lifetimes.

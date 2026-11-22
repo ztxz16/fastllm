@@ -9,7 +9,7 @@
 namespace fastllm {
 struct NaiveN05FlashModel::TargetWorkspace {
     Data hidden, normed, q, k, v, qkv, packed, packedIndexer, attn, projected;
-    Data routerInput, router, expertIndex, expertScore;
+    Data projectionQuant, routerInput, router, expertIndex, expertScore;
     Data w1, w2, w3, tempInput, tempOutput, moeOutput, moeInputTemp, moeOutputTemp;
     Data indexQ, indexKey, indexKeyFloat, indexWeights, indices, indexBroadcast, positions;
     Data indexContextGather, indexContextFull, indexContextExchange;
@@ -28,7 +28,7 @@ struct NaiveN05FlashModel::TargetWorkspace {
     std::vector<std::unique_ptr<TargetWorkspace>> sequences;
     void Pointers(std::vector<void *> &out) const {
         for (const Data *p : {&hidden, &normed, &q, &k, &v, &qkv, &packed, &packedIndexer,
-                &attn, &projected, &routerInput, &router, &expertIndex, &expertScore,
+                &attn, &projected, &projectionQuant, &routerInput, &router, &expertIndex, &expertScore,
                 &w1, &w2, &w3, &tempInput, &tempOutput, &moeOutput, &moeInputTemp, &moeOutputTemp,
                 &indexQ, &indexKey, &indexKeyFloat, &indexWeights, &indices, &indexBroadcast,
                 &positions, &indexContextGather, &indexContextFull, &indexContextExchange,

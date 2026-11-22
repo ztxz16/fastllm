@@ -350,6 +350,9 @@ struct FastllmNaiveDecodeScratch {
 bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
         FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, FastllmMxfp8Activation *packed);
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
     int heads, int kvHeads, int dim, int valueDim,
@@ -381,11 +384,19 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
     const fastllm::Data &liveKeys, int heads, int kvHeads,
     fastllm::Data &output);
+void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
+    const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
+    const fastllm::Data &liveKeys, int heads, int kvHeads,
+    fastllm::Data &output, FastllmMxfp8Activation *packed);
 bool FastllmCudaNaiveDecodeGraphSupported();
 // BF16 rows; update each residual and preserve RMSNorm rounding.
+// Optional in/out views are cleared if the producer emitted BF16 only.
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
     const fastllm::Data &branch, const fastllm::Data &weight,
     float eps, fastllm::Data &output);
+void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
+    const fastllm::Data &branch, const fastllm::Data &weight,
+    float eps, fastllm::Data &output, FastllmMxfp8Activation *packed);
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &newKey, const fastllm::Data &newValue,

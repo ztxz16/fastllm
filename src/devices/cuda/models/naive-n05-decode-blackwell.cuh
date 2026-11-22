@@ -4,6 +4,7 @@
 // Producers gather independent K/V pages; two MMA warps reduce disjoint
 // halves of each tile. The final normalization includes the attention sink.
 #include "naive-n05-attention-batch.cuh"
+#include "devices/cuda/fastllm-mxfp8-activation.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
 #if !defined(USE_ROCM) && CUDART_VERSION >= 12080
 namespace blackwell_decode {
@@ -391,8 +392,9 @@ __global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
 #endif
 // Keep the merge launch stub linkable in builds targeting only older GPUs.
 // One warp reduces four adjacent output channels per lane.
+template<bool Packed>
 static __global__ void Merge(const float *parts, const float2 *stats, const float *sink, __nv_bfloat16 *out, int heads,
-                      int splits) {
+                      int splits, FastllmMxfp8Activation packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     const int lane = threadIdx.x, head = blockIdx.x;
     const size_t row = size_t(blockIdx.y) * heads + head;
@@ -417,8 +419,12 @@ static __global__ void Merge(const float *parts, const float2 *stats, const floa
         }
     }
     const float inv = denom > 0.f ? 1.f / denom : 0.f;
-    for (int i = 0; i < 4; ++i)
-        out[row * 128 + 4 * lane + i] = __float2bfloat16(acc[i] * inv);
+    __nv_bfloat16 values[4];
+    for (int i = 0; i < 4; ++i) {
+        values[i] = __float2bfloat16(acc[i] * inv);
+        out[row * 128 + 4 * lane + i] = values[i];
+    }
+    if constexpr (Packed) fastllm_mxfp8::StoreGroup(packed, blockIdx.y, head * 128 + 4 * lane, values);
 #endif
 }
 // The paired producer/consumer warp groups require the architecture-specific cubin.
