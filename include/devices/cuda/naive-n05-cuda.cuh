@@ -1,5 +1,6 @@
 #pragma once
 #include "fastllm.h"
+#include "fastllm-mxfp8-projection.h"
 #include "devices/cuda/naive-n05-dsa.h"
 #include "models/naive_indexer_compute.h"
 

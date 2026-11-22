@@ -1,5 +1,5 @@
-// Native Blackwell MXFP8 Linear. Both GEMV and GEMM retain the original FP8
-// values and FP32 scales. The block-scaled operands live only in borrowed scratch.
+// Native Blackwell MXFP8 Linear. Attention shards can own a compact scale layout;
+// other weights use the original FP32 scales and the bounded Linear scratch.
 #include "fastllm-cuda.cuh"
 #include "fastllm-fp8-auxiliary.h"
 #include "fastllm-linear-scratch.h"
@@ -10,6 +10,7 @@
 #include <deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh>
 #include <algorithm>
 #include <map>
+#include <cstring>
 #include <stdexcept>
 
 namespace {
@@ -293,21 +294,24 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     if (rows == 1 && (k < 4096 || n < 4096 || size_t(k) * n < (size_t(24) << 20))) return false;
     if (w.dataType != fastllm::FP8_E4M3 || w.IsRepacked || w.isFake || w.blockK != 1 || w.blockM != 32 ||
         w.dims.size() != 2 || w.dims[0] != n || w.dims[1] != k) return false;
+    auto *compact = (uint32_t *)FastllmCudaCompactMxfp8(w);
     if (FastllmCudaRuntimeArch() != 103 || rows < 1 || k < 128 || k % 128 || n <= 0 || n % 64 || !x || !y ||
-        !w.cudaData || w.extraCudaData.empty() || !w.extraCudaData[0] ||
+        !w.cudaData || (!compact && (w.extraCudaData.empty() || !w.extraCudaData[0])) ||
         ((uintptr_t(x) | uintptr_t(y) | uintptr_t(w.cudaData) | uintptr_t(w.extraCudaData[0])) & 15))
         return false;
     const size_t scaleCount = size_t(n) * k / 32;
-    const size_t scaleArea = (scaleCount + 255) & ~size_t(255);
+    const size_t scaleArea = compact ? 0 : ((scaleCount + 255) & ~size_t(255));
     if (w.scales.size() != scaleCount) return false;
     const int device = FastllmCudaGetDevice();
-    // Look up the existing Linear lease without creating a handle, allocating
-    // a workspace or refilling the spare pool. CaptureWorkspace pins its owner.
-    auto *state = fastllm_bf16_lt::GetState(device, true);
-    if (!state) return false;
     const bool capturing = FastllmCudaGraphIsCapturing();
+    auto *state = fastllm_bf16_lt::GetState(device, true);
+    // The first eager request on a worker may precede any BF16 Linear. Use
+    // the bounded Linear pool instead of materializing another scale layout.
+    if (compact && !capturing && (!state || !state->eager))
+        state = fastllm_bf16_lt::GetState(device, false);
+    if (!state) return false;
     const auto support = GetProjectionSupport(device, capturing);
-    if (!support.smallRows || !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device)) return false;
+    if (!support.smallRows || (!compact && !FastllmCudaHasExactMxfp8Scales(w.extraCudaData[0], device))) return false;
     auto *base = static_cast<uint8_t *>(capturing      ? fastllm_bf16_lt::CaptureWorkspace(*state)
                                         : state->eager ? state->eager->data
                                                        : nullptr);
@@ -324,7 +328,7 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
     const size_t maxRows = (capacity - scaleArea) / (size_t(k) + k / 32) / 4 * 4;
     if (maxRows < 4) return false;
     const int limit = static_cast<int>(std::min<size_t>(rows, maxRows));
-    auto *packed = reinterpret_cast<uint32_t *>(base);
+    auto *packed = compact ? compact : reinterpret_cast<uint32_t *>(base);
     auto *qx = base + scaleArea;
     auto *sx = qx + ((size_t(limit) + 3) / 4 * 4) * k;
     // Smaller tiles distribute the scale transpose for wide input or output projections.
@@ -362,7 +366,7 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
             run = paired ? Projection<16, 2>::Run : Projection<16, 1>::Run;
         }
         const int pitch = (count + 3) / 4 * 4;
-        const int weightTiles = start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;
+        const int weightTiles = !compact && start == 0 ? tilesPerRow * ((n + tile - 1) / tile) : 0;
         const int activationTiles = (size_t(count) * k / 8 + threads - 1) / threads;
         prepare<<<weightTiles + activationTiles, threads, 0, cudaStreamPerThread>>>(
             static_cast<const float4 *>(w.extraCudaData[0]), packed,
@@ -374,4 +378,65 @@ bool FastllmCudaMxfp8LinearSM103(const void *x, fastllm::Data &w, void *y, int r
         start += count;
     }
     return true;
+}
+
+const void *FastllmCudaCompactMxfp8(const fastllm::Data &w) {
+    return w.dataType == fastllm::FP8_E4M3 && !w.isFake && !w.IsRepacked &&
+           w.blockK == 1 && w.blockM == 32 && w.extraCudaData.size() > FastllmCompactMxfp8Slot
+        ? w.extraCudaData[FastllmCompactMxfp8Slot] : nullptr;
+}
+
+namespace {
+constexpr int kPreparedProjectionRows = 16;
+
+void PrepareCompactScales(fastllm::Data &w) {
+    if (w.dataType != fastllm::FP8_E4M3 || w.isFake || w.IsRepacked || !w.cudaData ||
+        w.blockK != 1 || w.blockM != 32 || w.dims.size() != 2 || FastllmCudaCompactMxfp8(w) ||
+        (!w.extraCudaData.empty() && w.extraCudaData[0])) return;
+    const int n = w.dims[0], k = w.dims[1];
+    if (k < 4096 || n < 4096 || k % 128 || n % 64 || size_t(n) * k < (size_t(24) << 20) ||
+        w.scales.size() != size_t(n) * k / 32) return;
+    std::vector<uint32_t> packed(w.scales.size() / 4);
+    for (int row = 0; row < n; ++row) {
+        for (int group = 0; group < k / 128; ++group) {
+            uint32_t word = 0;
+            for (int i = 0; i < 4; ++i) {
+                uint32_t bits;
+                std::memcpy(&bits, &w.scales[size_t(row) * (k / 32) + group * 4 + i], sizeof(bits));
+                if ((bits & 0x807fffffu) || bits == 0 || bits >= 0x7f800000u) return;
+                word |= (bits >> 23) << (8 * i);
+            }
+            packed[size_t(group) * n + row] = word;
+        }
+    }
+    w.extraCudaData.resize(std::max(w.extraCudaData.size(), FastllmCompactMxfp8Slot + 1), nullptr);
+    void *scales = nullptr;
+    const size_t bytes = packed.size() * sizeof(uint32_t);
+    auto status = cudaMalloc(&scales, bytes);
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    status = cudaMemcpy(scales, packed.data(), bytes, cudaMemcpyHostToDevice);
+    if (status != cudaSuccess) {
+        cudaFree(scales);
+        throw std::runtime_error(cudaGetErrorString(status));
+    }
+    w.extraCudaData[FastllmCompactMxfp8Slot] = scales;
+}
+
+int PreparedProjectionRows(const fastllm::Data &w, bool verifying) {
+    return !verifying && FastllmCudaCompactMxfp8(w) ? kPreparedProjectionRows : 0;
+}
+
+bool ProjectPrepared(FastllmMxfp8Activation input, const fastllm::Data &w, void *output) {
+    auto *scales = const_cast<void *>(FastllmCudaCompactMxfp8(w));
+    if (!scales || input.rows > kPreparedProjectionRows) return false;
+    auto run = ((w.dims[0] + 127) / 128) % 2 ? Projection<16, 1>::Run : Projection<16, 2>::Run;
+    return run(input.values, w.cudaData, input.scales, scales, output,
+               input.rows, w.dims[0], input.width, input.pitch);
+}
+} // namespace
+
+const FastllmMxfp8ProjectionBackend *FastllmCudaBlackwellMxfp8Projection() {
+    static const FastllmMxfp8ProjectionBackend backend{PrepareCompactScales, PreparedProjectionRows, ProjectPrepared};
+    return GetProjectionSupport(FastllmCudaGetDevice(), FastllmCudaGraphIsCapturing()).smallRows
+        ? &backend : nullptr;
 }

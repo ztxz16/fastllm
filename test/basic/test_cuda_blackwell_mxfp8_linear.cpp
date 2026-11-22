@@ -1,6 +1,7 @@
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
+#include "devices/cuda/fastllm-mxfp8-projection.h"
 #include "devices/cuda/fastllm-linear-scratch.h"
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -43,6 +44,31 @@ static float RoundE4M3(float x) {
     return std::copysign(codes[i], x);
 }
 
+// Exercise the interface with a different row policy and no private weight layout.
+static void TestProjectionContract() {
+    const FastllmMxfp8ProjectionBackend consumer{
+        [](Data &) {},
+        [](const Data &, bool verifying) { return verifying ? 20 : 0; },
+        [](FastllmMxfp8Activation view, const Data &, void *output) {
+            return view.Matches(20, 128) && output != nullptr;
+        }
+    };
+    Data w(FP8_E4M3, {64, 128}), x(BFLOAT16, {20, 128}), arena, bias, y;
+    w.ToDevice(CUDA, {0}, false);
+    w.Allocate(false);
+    x.ToDevice(CUDA, {0}, false);
+    x.Allocate(false);
+    cudaGraph_t graph;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    auto cold = consumer.Bind(w, 20, true, 128, arena);
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphDestroy(graph));
+    Require(!cold.values && !arena.cudaData, "cold capture allocated projection storage");
+    auto view = consumer.Bind(w, 20, true, 128, arena);
+    Require(consumer.TryProject(view, x, w, bias, y) && y.dims == std::vector<int>({20, 64}),
+            "shared projection interface rejected a different consumer");
+}
+
 static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false, bool borrowScratch = false) {
     std::mt19937 rng(24816);
     std::vector<float> values(size_t(m) * k);
@@ -67,6 +93,21 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
         w.scales[i] = std::ldexp(1.f, int(i % 11) - 10);
     if (invalid) w.scales.back() = 1.25f;
     w.ToDevice(CUDA, {0}, true);
+    if (wideGemv) {
+        auto *backend = FastllmCudaGetMxfp8ProjectionBackend();
+        Require(backend, "expected prepared projection backend");
+        backend->prepareWeight(w);
+        Data storage;
+        Require(!backend->Bind(w, 17, false, k, storage).values &&
+                !backend->Bind(w, 1, true, k, storage).values && !storage.cudaData,
+                "declined shapes reserved projection storage");
+        const auto first = backend->Bind(w, 1, false, k, storage);
+        const auto last = backend->Bind(w, 16, false, k, storage);
+        Require(first.Matches(1, k) && last.Matches(16, k) &&
+                first.values == last.values && first.scales == last.scales,
+                "eligible rows did not share a stable projection arena");
+        Require(FastllmCudaCompactMxfp8(w), "eligible shard did not prepare compact scales");
+    }
     auto call = [&] {
         Require(FastllmCudaBFloat16MatMulFP8E4M3(x, w, bias, y, m, k, n), "public entry failed");
     };
@@ -153,6 +194,11 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
     }
     Check(cudaGraphExecDestroy(exec));
     Check(cudaGraphDestroy(graph));
+    if (wideGemv) {
+        Require(!w.extraCudaData[0], "projection also allocated legacy scales");
+        w.ToDevice(CPU);
+        Require(!FastllmCudaCompactMxfp8(w), "device move retained compact scales");
+    }
     if (m == 3) {
         // Changing placement invalidates the old device scales. Re-upload a
         // non-UE8M0 scale and verify the backend rejects the new allocation.
@@ -194,10 +240,12 @@ int main() {
     if (prop.major != 10 || prop.minor != 3 || prop.multiProcessorCount != 148) return 77;
     try {
         FastllmCudaSetDevice(0);
+        TestProjectionContract();
+        // Exercise a cold worker before any other Linear can provision its lease.
+        Run(1, 6784, 4096, false, true);
         std::shared_ptr<void> lease;
         FastllmCudaLinearGraphScope scope(lease);
         Run(1, 256, 512);
-        Run(1, 6784, 4096, false, true); // wide GEMV selects native MXFP8
         Run(3, 192, 256);
         Run(8, 1856, 4096);
         Run(32, 4096, 1024);

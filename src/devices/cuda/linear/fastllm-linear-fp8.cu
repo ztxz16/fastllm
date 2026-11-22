@@ -11,6 +11,7 @@
 
 #include "fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
+#include "devices/cuda/fastllm-mxfp8-projection.h"
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "devices/cuda/fastllm-awq-sm70.cuh"
@@ -2977,6 +2978,61 @@ static void LaunchSenseNovaFp8Verify(const __nv_bfloat16 *x, const uint8_t *w, c
         LaunchSenseNovaFp8Tiles<Step, 8>(x, w, scales, bias, y, rows, inner, columns);
 }
 
+// Select once per model forward on the rank's current device. Other CUDA
+// implementations of the K32 layout plug in here, including ones that keep
+// their original weight scales.
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+const FastllmMxfp8ProjectionBackend *FastllmCudaBlackwellMxfp8Projection();
+#endif
+const FastllmMxfp8ProjectionBackend *FastllmCudaGetMxfp8ProjectionBackend() {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    if (FastllmCudaRuntimeArch() == 103) return FastllmCudaBlackwellMxfp8Projection();
+#endif
+    return nullptr;
+}
+
+FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Bind(const fastllm::Data &weight,
+        int rows, bool verifying, int maxWidth, fastllm::Data &storage) const {
+    if (rows <= 0 || weight.dims.size() != 2) return {};
+    const int limit = maxRows(weight, verifying);
+    const int width = weight.dims[1];
+    if (rows > limit || width <= 0 || width % 128 || width > maxWidth || maxWidth % 128) return {};
+    const size_t capacity = (size_t(limit) + 3) / 4 * 4;
+    const size_t valueBytes = capacity * maxWidth;
+    const size_t bytes = valueBytes + valueBytes / 32;
+    // One address shared across layers. A later capture cannot grow an arena
+    // already referenced by another graph.
+    if (!storage.cudaData) {
+        if (bytes / 4 > INT_MAX || FastllmCudaGraphIsCapturing()) return {};
+        storage.dataType = fastllm::INT32;
+        storage.UpdateUnitSize();
+        storage.Resize({static_cast<int>(bytes / 4)});
+        storage.ToDevice(fastllm::CUDA, weight.dataDeviceIds, false);
+        storage.Allocate(false);
+    }
+    if (bytes > storage.expansionBytes || storage.dataDeviceIds != weight.dataDeviceIds) return {};
+    auto *values = static_cast<uint8_t *>(storage.cudaData);
+    return {values, values + valueBytes, rows, width, (rows + 3) / 4 * 4};
+}
+
+bool FastllmMxfp8ProjectionBackend::TryProject(FastllmMxfp8Activation prepared,
+        const fastllm::Data &input, const fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output) const {
+    if (!prepared.values || !bias.dims.empty() || input.dataType != fastllm::BFLOAT16 ||
+        input.dims.empty() || weight.dims.size() != 2 || input.dims.back() != weight.dims[1] ||
+        !prepared.Matches(prepared.rows, weight.dims[1]) ||
+        input.Count(0) != size_t(prepared.rows) * prepared.width ||
+        input.dataDeviceIds != weight.dataDeviceIds) return false;
+    auto shape = input.dims;
+    shape.back() = weight.dims[0];
+    output.dataType = fastllm::BFLOAT16;
+    output.UpdateUnitSize();
+    output.Resize(shape);
+    output.ToDevice(fastllm::CUDA, weight.dataDeviceIds, false);
+    output.Allocate(false);
+    return project(prepared, weight, output.cudaData);
+}
+
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
     // Native row-wise MXFP8 projections use W8A8 for batched decode/prefill.
@@ -2987,21 +3043,23 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
     if (n > 1 && bias.dims.empty() && weight.blockK == 1 &&
         FastllmCudaTryMxfp8QuantizedLinear(input, weight, output)) return true;
 #endif
-    FastllmCudaFP8E4M3EnsureScalesOnDevice(weight);
-    FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(weight, bias, k);
-
-    float *cudaScales = (float*)weight.extraCudaData[0];
-    __nv_bfloat16 *cudaBF16Bias = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *) weight.extraCudaHalfData[0];
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
 
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    const bool compact = FastllmCudaCompactMxfp8(weight) != nullptr;
+    if (!compact) FastllmCudaFP8E4M3EnsureScalesOnDevice(weight);
     if (bias.dims.empty() && FastllmCudaMxfp8LinearSM103(cudaInput, weight, cudaOutput, n, m, k)) {
         FastllmCudaFinishInput(input, cudaInput);
         FastllmCudaFinishOutput(output, cudaOutput);
         return true;
     }
 #endif
+
+    FastllmCudaFP8E4M3EnsureScalesOnDevice(weight);
+    FastllmCudaFP8E4M3EnsureBFloat16BiasOnDevice(weight, bias, k);
+    float *cudaScales = (float*)weight.extraCudaData[0];
+    __nv_bfloat16 *cudaBF16Bias = bias.dims.empty() ? nullptr : (__nv_bfloat16 *)weight.extraCudaHalfData[0];
 
     // Preserve the 2/3-row FP8 reduction of a single verifier. Independent
     // requests use the same launch for each wide projection.

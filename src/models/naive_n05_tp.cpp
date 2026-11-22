@@ -441,6 +441,20 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         if (mergedQkv)
             split(ap + "mergeqkv.weight", qkvScheme, 0, ap + "mergeqkv.bias");
         split(ap + "o_proj.weight", attentionScheme(cfg.heads * cfg.valueDim), 1);
+        if (attentionDP > 1) {
+            const auto qkvBias = weight.weight.find(ap + "mergeqkv.bias");
+            const bool biasFreeQkv = mergedQkv && (qkvBias == weight.weight.end() || qkvBias->second.dims.empty());
+            const int previous = FastllmCudaGetDevice();
+            for (int device : tpDevices) {
+                FastllmCudaSetDevice(device);
+                if (const auto *backend = FastllmCudaGetMxfp8ProjectionBackend()) {
+                    if (biasFreeQkv)
+                        backend->prepareWeight(*weight[ap + "mergeqkv.weight"].multiDeviceDatas.at(device));
+                    backend->prepareWeight(*weight[ap + "o_proj.weight"].multiDeviceDatas.at(device));
+                }
+            }
+            FastllmCudaSetDevice(previous);
+        }
         auto sinkIt = weight.weight.find(ap + "attention_sink_bias");
         if (sinkIt != weight.weight.end() && !sinkIt->second.dims.empty()) {
             ToDataType(sinkIt->second, FLOAT32);

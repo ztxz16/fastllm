@@ -47,6 +47,9 @@ bool FastllmCudaMxfp8LinearSM103(const void *input, fastllm::Data &weight, void 
 void FastllmCudaRegisterMxfp8Scales(fastllm::Data &weight, void *allocation);
 bool FastllmCudaHasExactMxfp8Scales(const void *allocation, int device);
 
+constexpr size_t FastllmCompactMxfp8Slot = 8; // Slots 0–7 hold legacy FP8 layouts.
+const void *FastllmCudaCompactMxfp8(const fastllm::Data &weight);
+
 // Graph-safe attention projection admission. Return borrowed K32 scales only when
 // the unfused Linear would also use block-quantized activations on this worker.
 const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &weight, int channels, int inner, int device);
