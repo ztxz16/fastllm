@@ -45,6 +45,33 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
     }
     int idx = task - in.heads;
     if (idx < in.heads * tiles) {
+        if (in.rel == 16 && in.extent % 4 == 0) {
+            const int head = idx / tiles, lane = col % 32;
+            const int dist = ((idx % tiles) * threads + col) * 4;
+            if ((idx % tiles) * threads * 4 > visit->past) return;
+            const int channel = head * in.rel + lane;
+            float x = lane < 16 ? in.sources.items[1].read(row, channel) : 0.f;
+            float w = lane < 16 ? in.rs[channel] : 0.f;
+            float scaled = in.rClip > 0 ? x * w : x;
+            float sum = scaled * scaled;
+#pragma unroll
+            for (int d = 8; d; d /= 2) sum += __shfl_down_sync(0xffffffffu, sum, d);
+            sum = __shfl_sync(0xffffffffu, sum, 0);
+            float norm = in.rClip > 0 ? fminf(1.f, in.rClip / (sqrtf(sum) + 1.e-6f)) : rsqrtf(sum / 16 + in.eps);
+            float rel = x * norm * w;
+            float4 dots{};
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                float weight = __shfl_sync(0xffffffffu, rel, j);
+                if (dist < in.extent) {
+                    float4 table = *reinterpret_cast<const float4 *>(in.table + j * in.extent + dist);
+                    dots.x += weight * table.x; dots.y += weight * table.y;
+                    dots.z += weight * table.z; dots.w += weight * table.w;
+                }
+            }
+            if (dist < in.extent) *reinterpret_cast<float4 *>(bias + head * in.extent + dist) = dots;
+            return;
+        }
         const int head = idx / tiles, dist = idx % tiles * threads + col;
         if (idx % tiles * threads > visit->past) return;
         int i = head * in.rel + col;

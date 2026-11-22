@@ -155,6 +155,7 @@ __global__ void conv(const float *x, const float *history, const float *weight, 
 #include "paged-kv.cuh"
 #include "attention.cuh"
 #include "prefill.cuh"
+#include "paged-verify-attention.cuh"
 template <bool Timeline = false, typename T, typename U> __device__ float updateConvChannel(const T *input, const DecodeVisit *visit, int index,
                            const float *weight, const U *dynamic, int d, int taps, int heads, int c, int priorRows, int inputStride) {
     float *history = visit->history[index];
@@ -383,7 +384,7 @@ class Decoder final : public Runtime {
     DecodeInput hostInput{};
     std::vector<DecodeVisit> hostVisits;
     Matrix graphLogits, unitScale, splitScratch;
-    int sm120GlobalSplits = 0, verifyGlobalSplits = 0;
+    int smCount = 0, sm120GlobalSplits = 0, verifyAttentionSplits = 0;
     bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
     bool bf16WindowBias = false, batchedController = false;
 
@@ -579,7 +580,10 @@ class Decoder final : public Runtime {
             Rows<T> attended(inputs[0].rows, c.heads * d);
             const int queries = batch.front().timeline ? attended.rows : 1;
             Matrix q(queries, c.heads * d), bias(queries * c.heads, c.extent);
-            Matrix scratch = queries == 1 ? splitScratch : Matrix(splitScratch.rows, splitScratch.cols * queries);
+            const bool usePagedVerify = verifyAttentionSplits > 0 && std::is_same_v<KV, half>;
+            const int splits = usePagedVerify ? verifySplitCount(verifyAttentionSplits, window, GetPageLen())
+                                              : splitScratch.rows;
+            Matrix scratch = queries == 1 ? splitScratch : Matrix(splits, splitScratch.cols * queries);
             auto evaluate = [&](int row, const DecodeVisit *visit) {
                 auto sources = projected;
                 for (auto &item : sources.items)
@@ -591,23 +595,23 @@ class Decoder final : public Runtime {
                                   param(att + (local ? "v_sconv.weight" : "v_sconv.static_w"), k * c.conv),
                                   static_cast<const float *>(table.cudaData), c.heads, c.kvHeads, d, c.relative,
                                   c.extent, c.conv, c.qClip, c.rClip, c.eps};
-                int tiles = (c.extent + threads - 1) / threads;
-                const bool usePagedGlobal = !window && verifyGlobalSplits > 0 && std::is_same_v<KV, half>;
+                const int biasTile = c.relative == 16 && c.extent % 4 == 0 ? 4 * threads : threads;
+                int tiles = (c.extent + biasTile - 1) / biasTile;
                 if (batch.front().timeline) {
-                    auto prepare = usePagedGlobal ? prepareRelative<KV, true, true, T> : prepareRelative<KV, true, false, T>;
+                    auto prepare = usePagedVerify ? prepareRelative<KV, true, true, T> : prepareRelative<KV, true, false, T>;
                     prepare<<<dim3(c.heads * (1 + tiles) + 2 * c.kvHeads, queries), threads, 0, cudaStreamPerThread>>>(
                         visit, in, tiles, q.p, bias.p, batch.front().length);
                 } else {
-                    auto prepare = usePagedGlobal ? prepareRelative<KV, false, true, T> : prepareRelative<KV, false, false, T>;
+                    auto prepare = usePagedVerify ? prepareRelative<KV, false, true, T> : prepareRelative<KV, false, false, T>;
                     prepare<<<c.heads * (1 + tiles) + 2 * c.kvHeads, threads, 0, cudaStreamPerThread>>>(
                         visit, in, tiles, q.p, bias.p, 1);
                 }
                 AttentionRow args{q.p, nullptr, nullptr, {}, bias.p, nullptr, nullptr,
                                   visit, 0, 0, c.heads, c.kvHeads, d, c.extent,
                                   window, c.logFloor, c.logAlpha, sink.stride, gate.stride};
-                if (usePagedGlobal) {
-                    launchVerifyGlobal(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
-                                       queries, batch.front().timeline ? batch.front().length : 1, verifyGlobalSplits);
+                if (usePagedVerify) {
+                    launchVerifyAttention(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
+                                       queries, batch.front().timeline ? batch.front().length : 1, splits, smCount);
                 } else if (d == 128) launchSplitRelative<128, KV>(args, scratch, sink.data, gate.data,
                                                           attended.p + size_t(row) * attended.cols, sm120GlobalSplits,
                                                           queries, batch.front().timeline ? batch.front().length : 1);
@@ -1257,7 +1261,6 @@ class Decoder final : public Runtime {
         graphInput = Buffer<DecodeInput>(1);
         hostVisits.resize(c.visits.size());
         graphVisits = Buffer<DecodeVisit>(hostVisits.size());
-        int smCount;
 #ifndef CUDA_NO_TENSOR_CORE
         int major;
         check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, p.gpu));
@@ -1287,8 +1290,8 @@ class Decoder final : public Runtime {
         splitScratch = Matrix(std::max(1, (2 * smCount + parallelHeads - 1) / parallelHeads),
                               c.heads * (attentionWidth(c.headDim) + 1));
         if (tensorPrefill && c.headDim == 128 && c.qClip > 0.f && c.qClip <= 65504.f &&
-            configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyGlobal)) {
-            verifyGlobalSplits = std::min(splitScratch.rows, std::max(1, 2 * (smCount / c.kvHeads)));
+            configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention)) {
+            verifyAttentionSplits = std::min(splitScratch.rows, std::max(1, 2 * (smCount / c.kvHeads)));
         }
         std::vector<float> ones(std::max(c.headDim, c.hidden), 1.f);
         unitScale = Matrix(1, ones.size());
