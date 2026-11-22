@@ -50,7 +50,7 @@ class H(BaseHTTPRequestHandler):
   if args.kind in ('duo','hy_nomas'):
    if self.path in ('/health', '/resolutions'): return self.answer({'ready':True})
    if self.path.endswith('/events'): return self.answer(b'data: {}\n\n',mime='text/event-stream')
-   if args.kind=='hy_nomas' and self.path.endswith(('/content','?format=mp4')): return self.answer(b'fake-mp4',mime='video/mp4')
+   if args.kind=='hy_nomas' and self.path.endswith(('/content','?format=mp4','.mp4')): return self.answer(b'fake-mp4',mime='video/mp4')
    if self.path.endswith('/avc'): return self.answer(b'frame',mime='application/octet-stream')
    return self.answer({'path':self.path})
   if self.path=='/health': return self.answer({'ready':time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')), 'reference_model_available':True, 'dit_precision':'fp8', 'reference_dit_precision':'gguf', 'dit_parallel_mode':'sp', 'dit_sequence_parallel_size':2, 'dit_tensor_parallel_size':1},200 if time.monotonic()-started>float(os.environ.get('READY_DELAY','.4')) else 503)
@@ -331,6 +331,9 @@ class ServiceTest(unittest.TestCase):
             self.assertEqual(self.client.get(path + "sessions").status_code, 404)
         response = self.client.post(f"/demos/{qwen}/v1/images/jobs", json={"prompt": "test"})
         self.assertEqual(response.status_code, 200, response.text)
+        clip = f"/demos/{world}/v1/worlds/files/job_{'a'*24}.mp4"
+        self.assertEqual(self.client.get(clip).content, b'fake-mp4')
+        self.assertEqual(self.client.get(clip.replace('.mp4', '.part.mp4')).status_code, 404)
         response = self.client.post(f"/demos/{world}/v1/worlds", json={"prompt": "test"})
         self.assertEqual(response.status_code, 200, response.text)
 

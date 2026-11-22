@@ -256,5 +256,18 @@ function tickAt(time) {
     element('leave-scene').onclick();
     assert.equal(vm.runInContext('queuedStep',context),null);
     assert.equal(vm.runInContext('exploring',context),false);
+    context.Option=class { constructor(text,value){this.text=text;this.value=value;} };
+    element('size').replaceChildren=(first)=>{element('size').value=first.value;};
+    vm.runInContext('configureLingBot();controls()',context);
+    assert.equal(element('enhance-option').hidden,true);
+    assert.equal(element('vertical-controls').hidden,false);
+    assert.deepEqual(Array.from(vm.runInContext('selectedResolution()',context)),[576,320]);
+    const movie={id:'job_test',world_id:'world_test',status:'completed',result:{
+        width:576,height:320,frame_count:12,fps:16,segment:1,format:'mp4',url:'/v1/worlds/files/job_test.mp4'}};
+    context.movie=movie;
+    const segment=vm.runInContext('lingJob(movie)',context);
+    assert.equal(segment.num_frames,12);
+    assert.equal(segment.segment_index,2);
+    assert.equal(segment.output.url,movie.result.url);
     console.log('PASS: playback, world controls, scene edits, PE capability/toggle/restore and submitted options');
 })().catch(error => {console.error(error);process.exitCode=1;});

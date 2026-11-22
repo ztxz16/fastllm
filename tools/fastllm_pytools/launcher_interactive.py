@@ -11,7 +11,7 @@ SESSION = r"sessions/[0-9a-f]{32}"
 ROUTES = {
     "qwen_image": QwenImageBackend.demo_routes,
     "lingbot_world": {
-        "GET": r"health|v1/worlds/world_[0-9a-f]{24}|v1/jobs/job_[0-9a-f]{24}|v1/worlds/files/job_[0-9a-f]{24}_[0-9]+\.png",
+        "GET": r"health|v1/worlds/world_[0-9a-f]{24}|v1/jobs/job_[0-9a-f]{24}|v1/worlds/files/job_[0-9a-f]{24}(?:_[0-9]+\.png|\.mp4)",
         "POST": r"v1/worlds|v1/worlds/world_[0-9a-f]{24}/actions",
         "DELETE": r"v1/worlds/world_[0-9a-f]{24}",
     },
@@ -58,11 +58,11 @@ def install_demo_routes(app, pool, cookie, cookie_token):
             if not path:
                 page = {"hy_nomas": PACKAGE / "nomas_demo.html", "duo": media_assets("duo") / "live.html",
                         "qwen_image": media_assets("qwen_image") / "demo.html",
-                        "lingbot_world": media_assets("lingbot_world") / "demo.html"}[backend]
+                        "lingbot_world": PACKAGE / "nomas_demo.html"}[backend]
                 return FileResponse(page, media_type="text/html", headers={"Content-Security-Policy":
                     "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
                     "img-src 'self' blob: data:; media-src 'self' blob:; object-src 'none'; frame-ancestors 'self'"})
-            if path == "nomas-cafe.webp" and backend == "hy_nomas":
+            if path == "nomas-cafe.webp" and backend in ("hy_nomas", "lingbot_world"):
                 return FileResponse(PACKAGE / "ui_plugins/studio/nomas-cafe.webp", media_type="image/webp")
             if path == "avc-player.js" and backend == "duo":
                 return FileResponse(media_assets("duo") / path, media_type="text/javascript")

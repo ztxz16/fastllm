@@ -37,6 +37,7 @@ struct Segment {
     std::vector<float> pixels; // THWC RGB in [-1,1]
     int frames=0,height=0,width=0;
 };
+std::vector<uint8_t> packSegmentRGB(const Segment &);
 std::vector<uint8_t> encodeFramePNG(const Segment &, int frame);
 using Progress = std::function<void(const std::string &,int,int)>;
 // Optional sampling snapshots used by the official differential tests.
@@ -82,6 +83,9 @@ void *fastllm_lingbot_world_create_png(void *,const char *prompt,const uint8_t *
 int fastllm_lingbot_world_destroy(void *pipeline,void *world);
 void *fastllm_lingbot_world_step(void *pipeline,void *world,const char *action,const char *prompt,
     LingBotProgress,void *user);
+void *fastllm_lingbot_world_step_rgb(void *pipeline,void *world,const char *action,const char *prompt,
+    LingBotProgress,void *user);
+const uint8_t *fastllm_lingbot_result_rgb(void *result, size_t *length);
 int fastllm_lingbot_result_frames(void *result);
 const uint8_t *fastllm_lingbot_result_png(void *result,int frame,size_t *length);
 void fastllm_lingbot_result_destroy(void *result);

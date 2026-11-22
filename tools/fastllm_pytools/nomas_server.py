@@ -11,24 +11,28 @@ import asyncio
 import ctypes as C
 from contextlib import asynccontextmanager
 import json
-import logging
 import os
 from pathlib import Path
 import queue
 import shutil
-import struct
-import subprocess
 import sys
 import threading
 import time
 from typing import Literal, Optional
 import uuid
-import zlib
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import uvicorn
+
+
+# Also support launching this module directly from a source checkout.
+if __package__:
+    from .world_media import encode_clip, find_video_encoder, png_rgb
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from world_media import encode_clip, find_video_encoder, png_rgb
 
 
 class Message(BaseModel):
@@ -208,47 +212,6 @@ class NativeBackend:
         if self.handle:
             self.lib.fastllm_nomas_pipeline_destroy(self.handle)
             self.handle = None
-
-
-def png_rgb(rgb, width, height):
-    if len(rgb) != width * height * 3:
-        raise ValueError("wrong RGB frame size")
-
-    def chunk(kind, data):
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind+data) & 0xffffffff)
-
-    scanlines = b"".join(b"\0" + rgb[y*width*3:(y+1)*width*3] for y in range(height))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(scanlines, 3)) + chunk(b"IEND", b""))
-
-
-def find_video_encoder():
-    ffmpeg = shutil.which("ffmpeg")
-    if ffmpeg:
-        try:
-            codecs = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True,
-                                    check=True, timeout=5).stdout.splitlines()
-            if any(line.split()[1:2] == [b"libx264"] for line in codecs):
-                return ffmpeg
-        except (OSError, subprocess.SubprocessError):
-            pass
-    return None
-
-
-def encode_clip(ffmpeg, rgb, job, path):
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
-               "-video_size", f"{job['width']}x{job['height']}", "-framerate", str(job["fps"]), "-i", "pipe:0",
-               "-filter_threads", "2", "-vf", "scale=out_color_matrix=bt709", "-c:v", "libx264", "-threads", "4",
-               "-preset", "veryfast", "-crf", "18", "-profile:v", "main", "-pix_fmt", "yuv420p",
-               "-colorspace", "bt709", "-movflags", "+faststart", str(path)]
-    try:
-        subprocess.run(command, input=rgb, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                       check=True, timeout=60)
-        return True
-    except (OSError, subprocess.SubprocessError) as exc:
-        logging.getLogger(__name__).warning("MP4 encoding failed for %s, saving PNG frames: %s", job["id"], exc)
-        path.unlink(missing_ok=True)
-        return False
 
 
 class Jobs:

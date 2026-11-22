@@ -34,7 +34,11 @@ struct PipelineHandle {
     std::unordered_map<void *,std::unique_ptr<fastllm::lingbot::WorldState>> worlds;
     PipelineHandle(const char *path,int device,bool bf16):model(path,device,bf16) {}
 };
-struct ResultHandle { std::vector<std::vector<uint8_t>> frames; };
+struct ResultHandle {
+    int frameCount = 0;
+    std::vector<std::vector<uint8_t>> frames;
+    std::vector<uint8_t> rgb;
+};
 fastllm::lingbot::Progress progressCallback(LingBotProgress callback,void *user) {
     if(!callback) return {};
     return [=](const std::string &stage,int current,int total) {
@@ -79,8 +83,8 @@ int fastllm_lingbot_world_destroy(void *p,void *world) {
         return 0;
     } catch(const std::exception &e) { error=e.what(); return -1; }
 }
-void *fastllm_lingbot_world_step(void *p,void *world,const char *action,const char *prompt,
-    LingBotProgress progress,void *user) {
+static void *worldStep(void *p,void *world,const char *action,const char *prompt,
+    LingBotProgress progress,void *user,bool raw) {
     try {
         error.clear(); if(!p || !world || !action) throw std::invalid_argument("invalid LingBot world step");
         auto &ctx=*static_cast<PipelineHandle *>(p); std::lock_guard<std::mutex> lock(ctx.mutex);
@@ -90,13 +94,32 @@ void *fastllm_lingbot_world_step(void *p,void *world,const char *action,const ch
         auto next=*found->second;
         auto segment=ctx.model.step(next,action,prompt?&text:nullptr,progressCallback(progress,user));
         auto result=std::make_unique<ResultHandle>();
-        for(int f=0;f<segment.frames;++f)
-            result->frames.push_back(fastllm::lingbot::encodeFramePNG(segment,f));
+        result->frameCount=segment.frames;
+        if(raw) {
+            result->rgb=fastllm::lingbot::packSegmentRGB(segment);
+        } else {
+            for(int f=0;f<segment.frames;++f)
+                result->frames.push_back(fastllm::lingbot::encodeFramePNG(segment,f));
+        }
         *found->second=std::move(next);
         return result.release();
     } catch(const std::exception &e) { error=e.what(); return nullptr; }
 }
-int fastllm_lingbot_result_frames(void *p) { return p?int(static_cast<ResultHandle *>(p)->frames.size()):0; }
+void *fastllm_lingbot_world_step(void *p,void *world,const char *action,const char *prompt,
+    LingBotProgress progress,void *user) {
+    return worldStep(p,world,action,prompt,progress,user,false);
+}
+void *fastllm_lingbot_world_step_rgb(void *p,void *world,const char *action,const char *prompt,
+    LingBotProgress progress,void *user) {
+    return worldStep(p,world,action,prompt,progress,user,true);
+}
+const uint8_t *fastllm_lingbot_result_rgb(void *p,size_t *length) {
+    if(!p || !length) return nullptr;
+    const auto &rgb=static_cast<ResultHandle *>(p)->rgb;
+    *length=rgb.size();
+    return rgb.data();
+}
+int fastllm_lingbot_result_frames(void *p) { return p?static_cast<ResultHandle *>(p)->frameCount:0; }
 const uint8_t *fastllm_lingbot_result_png(void *p,int frame,size_t *length) {
     if(!p || !length || frame<0 || frame>=int(static_cast<ResultHandle *>(p)->frames.size())) return nullptr;
     const auto &data=static_cast<ResultHandle *>(p)->frames[frame]; *length=data.size(); return data.data();

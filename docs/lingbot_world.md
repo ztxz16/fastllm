@@ -115,7 +115,9 @@ next_job = request('/v1/worlds/' + result['world_id'] + '/actions',
                    {'action': 'forward'})
 ```
 
-创建、动作和删除请求返回 HTTP 202 及任务对象。任务完成后的 `result` 包含世界 ID、片段序号、宽高、帧率、帧数量和 PNG URL 数组。按 URL 顺序与返回帧率播放；这些是视频帧，不是可在浏览器独立渲染的三维网格。
+创建、动作和删除请求返回 HTTP 202 及任务对象。生成结果包含世界 ID、片段序号、宽高、帧率和帧数。默认返回按播放顺序排列的 PNG 地址 `result.frames`。创建世界时传入 `"response_format": "mp4"` 可为该世界请求 H.264，每个动作也可单独指定格式。`result.format` 为 `mp4` 时，通过 `result.url` 获取整段视频，支持 HTTP Range。缺少 libx264 或编码失败时返回 PNG 帧。
+
+ftllm 启动器中的「交互 Demo」与 HY-NOMAS 共用播放器。选择起始图后可以移动、转视角、升降和发送新的完整场景描述。浏览器和服务都支持 H.264 时，播放器自动选择 MP4。
 
 失败任务的 `error` 包含原因。若返回 `world_deleted: true`，该会话已释放，需要重新创建；例如生成完成后输出目录写入失败，服务会释放已前进但无法交付画面的会话。
 

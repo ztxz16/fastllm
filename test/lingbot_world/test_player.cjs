@@ -26,6 +26,7 @@ const context = vm.createContext({document,URL,location:{href:'http://localhost/
   cancelAnimationFrame(id){timers.delete(id);},
   createImageBitmap:async()=>({id:++nextImage,width:576,height:320,close(){closed.push(this.id);}}),
   fetch:async(url,options)=>{
+    url=new URL(url,context.location.href).pathname;
     calls.push([url,options]);
     if (url.startsWith('/frame')) return {ok:true,blob:async()=>({})};
     return {ok:true,json:async()=>await reply(url,options)};
