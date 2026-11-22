@@ -1,122 +1,175 @@
 // Included by the Blackwell prefill translation unit after the FMHA types.
 namespace blackwell_dsa {
-constexpr int UnionRows = 16, UnionKeys = 2048, UnionCapacity = UnionRows * UnionKeys;
-constexpr int UnionWords = UnionCapacity / 32, UnionStride = UnionWords + 1;
+constexpr int UnionKeys = 2048, UnionCapacity = UnionRows * UnionKeys;
+constexpr int UnionWords = UnionCapacity / 32;
 
 // Compact positions and logical masks share the same workspace.
-constexpr int DenseWords = UnionCapacity / UnionRows;
+// Longer staged histories borrow one extra logical bitmap per query row.
+constexpr int MaxBitmapWords = 8192;
 constexpr int ValueLoadWarp = 15;
 struct UnionKV {
     const int *positions, *lengths;
     const uint32_t *bits;
     FastllmNaiveKV key, value;
-    int keyStride, kvHeads;
+    int keyStride, kvHeads, positionStride, maskStride;
     bool staged;
     CUtensorMap maps[2];
 };
 
-// Compact the selected logical positions in ascending order. The bitmap window
-// is bounded independently of context length. Only the per-row membership
-// and union positions survive this CTA.
-__global__ void BuildUnion(const int *ids, int rows, int keep, int past, int keys,
-        int *positions, int *lengths, uint32_t *bits, bool adaptive) {
-    using Scan = cub::BlockScan<int, 256>;
-    extern __shared__ uint32_t members[][UnionWords];
+// One CTA owns a group. Load and validate each TopK ID exactly once, then reuse
+// the registers to construct both the sorted union and its per-query memberships.
+__global__ __launch_bounds__(512) void BuildUnion(const int *indices, int *positions, int *lengths,
+        uint32_t *bits, TileSpan *spans, int rows, int past, int keep, int windowWords, bool adaptive,
+        int positionStride, int maskStride) {
+    constexpr int threads = 512, perThread = UnionCapacity / threads;
+    using Scan = cub::BlockScan<int, threads>;
     __shared__ typename Scan::TempStorage scan;
-    __shared__ uint32_t present[DenseWords];
-    __shared__ int offsets[DenseWords], total, low, high;
-    const int group = blockIdx.x, t = threadIdx.x;
-    const int first = group * UnionRows, n = min(UnionRows, rows - first);
-    const int end = past + first + n;
-    const bool singleWindow = end <= 32 * DenseWords;
-    if (!t) {
-        total = 0;
-        low = singleWindow ? 0 : keys;
-        high = singleWindow ? end - 1 : -1;
-    }
-    for (int i = t; i < UnionRows * UnionWords; i += blockDim.x)
-        members[i / UnionWords][i % UnionWords] = 0;
+    __shared__ int low, high;
+    extern __shared__ uint32_t memory[];
+    uint32_t *present = memory;
+    int *offset = reinterpret_cast<int *>(present + windowWords);
+    uint32_t *members = present + 2 * windowWords;
+    const int t = threadIdx.x, group = blockIdx.x, first = group * UnionRows;
+    const int n = min(UnionRows, rows - first);
+    if (!t) { low = INT_MAX; high = -1; }
     __syncthreads();
-    // Only longer prefixes need a pass to find the selected range.
-    if (!singleWindow) {
-        int lo = keys, hi = -1;
-        for (int i = t; i < n * keep; i += blockDim.x) {
-            int row = i / keep, id = ids[size_t(first) * keep + i];
-            if (id >= 0 && id < keys && id <= past + first + row) {
-                lo = min(lo, id); hi = max(hi, id);
-            }
-        }
-        for (int d = 16; d; d /= 2) {
-            lo = min(lo, __shfl_down_sync(0xffffffff, lo, d));
-            hi = max(hi, __shfl_down_sync(0xffffffff, hi, d));
-        }
-        if (!(t & 31)) { atomicMin(&low, lo); atomicMax(&high, hi); }
+    int held[perThread], lo = INT_MAX, hi = -1;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < perThread; ++i) {
+        int entry = i * threads + t, row = entry / UnionKeys;
+        const int col = entry % UnionKeys;
+        int k = row < n && col < keep ? indices[size_t(first + row) * keep + col] : -1;
+        k = k <= past + first + row ? k : -1;
+        held[i] = k;
+        if (k >= 0) { lo = min(lo,k); hi = max(hi,k); }
+    }
+    for (int step = 16; step; step /= 2) {
+        lo = min(lo,__shfl_down_sync(0xffffffff,lo,step));
+        hi = max(hi,__shfl_down_sync(0xffffffff,hi,step));
+    }
+    if (!(t % 32)) { atomicMin(&low,lo); atomicMax(&high,hi); }
+    __syncthreads();
+    const int firstKey = high < 0 ? 0 : low / 128 * 128;
+    const bool single = int64_t(high) < int64_t(firstKey) + 32 * windowWords;
+    int memberStride = UnionWords, total = 0;
+    if (!single) {
+        for (int i = t; i < n * memberStride; i += threads) members[i] = 0;
         __syncthreads();
     }
-    for (int64_t begin = low; begin <= high; begin += 32 * DenseWords) {
-        int span = min(int64_t(DenseWords * 32), int64_t(high) + 1 - begin);
-        int nw = (span + 31) / 32;
-        for (int w = t; w < nw; w += blockDim.x) present[w] = 0;
+    // A window bounds shared storage independently of the logical context.
+    // Even an empty group executes once to initialize its output mask.
+    for (int64_t start = firstKey; start <= max(firstKey,high); start += 32 * windowWords) {
+        const int64_t limit = min(int64_t(high) + 1, start + 32 * windowWords);
+        const int count = int((limit - start + 31) / 32);
+        for (int i = t; i < count; i += threads) present[i] = 0;
         __syncthreads();
-        for (int i = t; i < n * keep; i += blockDim.x) {
-            int id = ids[size_t(first) * keep + i], row = i / keep;
-            int64_t j = int64_t(id) - begin;
-            if (j >= 0 && j < span && id <= past + first + row)
-                atomicOr(present + (j >> 5), 1u << (j & 31));
-        }
-        __syncthreads();
-        // The contiguous kernel visits the causal prefix. Compare its span with
-        // the exact union size before materializing any compact positions.
-        if (adaptive && singleWindow) {
-            int pop = 0, before, unique;
-            for (int w = t; w < nw; w += blockDim.x) pop += __popc(present[w]);
-            Scan(scan).ExclusiveSum(pop, before, unique);
-            if (unique * 3 >= end) {
-                if (!t) lengths[group] = -1;
-                return;
-            }
-            __syncthreads();
-        }
-        for (int base = 0; base < nw; base += 256) {
-            int w = base + t;
-            unsigned mask = w < nw ? present[w] : 0;
-            int before, size;
-            Scan(scan).ExclusiveSum(__popc(mask), before, size);
-            int slot = total + before;
-            if (w < nw) {
-                offsets[w] = slot;
-                while (mask) {
-                    positions[size_t(group) * UnionCapacity + slot++] = int(begin + w * 32 + __ffs(mask) - 1);
-                    mask &= mask - 1;
-                }
-            }
-            __syncthreads();
-            if (!t) total += size;
-            __syncthreads();
-        }
-        for (int i = t; i < n * keep; i += blockDim.x) {
-            int id = ids[size_t(first) * keep + i], row = i / keep;
-            int64_t j = int64_t(id) - begin;
-            if (j >= 0 && j < span && id <= past + first + row) {
-                int slot = offsets[j >> 5] + __popc(present[j >> 5] & ((1u << (j & 31)) - 1));
-                atomicOr(&members[row][slot >> 5], 1u << (slot & 31));
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < perThread; ++i) {
+            if (held[i] >= start && held[i] < limit) {
+                const int k = held[i] - start;
+                atomicOr(present + k / 32,1u << (k % 32));
             }
         }
         __syncthreads();
+        const int perLane = (count + threads - 1) / threads;
+        const int begin = t * perLane, end = min(count,begin + perLane);
+        int num = 0, before, unique;
+        for (int i = begin; i < end; ++i) num += __popc(present[i]);
+        Scan(scan).ExclusiveSum(num, before, unique);
+        before += total;
+        total += unique;
+        const int tiles = max(1,(count + 3) / 4);
+        if (adaptive && total * 3 >= tiles * 256) {
+            if (!t) { lengths[group] = -1; spans[group] = {int(start / 128),tiles}; }
+            return;
+        }
+        for (int i = begin; i < end; ++i) {
+            offset[i] = before;
+            before += __popc(present[i]);
+        }
+        if (single) {
+            memberStride = max(1, (total + 127) / 128) * 4;
+            for (int i = t; i < n * memberStride; i += threads) members[i] = 0;
+        }
+        __syncthreads();
+        int *sorted = positions + size_t(group) * positionStride;
+        for (int w=t; w<count; w+=threads) {
+            int slot = offset[w];
+            for (uint32_t v = present[w]; v; v &= v-1)
+                sorted[slot++] = start + w * 32 + __ffs(v) - 1;
+        }
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < perThread; ++i) {
+            if (held[i] >= start && held[i] < limit) {
+                const int k = held[i] - start, w = k / 32;
+                const int slot = offset[w] + __popc(present[w] & ((1u << (k % 32)) - 1));
+                int row = (i * threads + t) / UnionKeys;
+                atomicOr(members + row * memberStride + slot / 32,1u << (slot % 32));
+            }
+        }
+        __syncthreads();
+    }
+    const int outWords = max(1, (total + 127) / 128) * 4;
+    if (!t) lengths[group] = total;
+    int row = t / 32, lane = t % 32;
+    if (row < n) {
+        uint32_t any = 0;
+        for (int w = lane; w < outWords; w += 32) {
+            uint32_t v = members[row * memberStride + w];
+            bits[size_t(first + row) * maskStride + w] = v; any |= v;
+        }
+        int valid = __any_sync(0xffffffff,any != 0);
+        if (!lane) bits[size_t(first + row) * maskStride + maskStride - 1] = valid;
+    }
+}
+
+// A paired score selector already owns one exact logical bitmap per query.
+// OR the 16 rows, scan each word once, then remap row membership into the
+// compact order. No ordered TopK list or second dense-mask build is needed.
+__global__ void BuildBitmapUnion(const uint32_t *input, int stride, int *positions,
+        int *lengths, uint32_t *bits, TileSpan *spans, int rows,
+        int positionStride, int maskStride, bool adaptive) {
+    constexpr int threads = 512;
+    using Scan = cub::BlockScan<int, threads>;
+    __shared__ typename Scan::TempStorage storage;
+    __shared__ int low, high;
+    const int t = threadIdx.x, group = blockIdx.x, first = group * UnionRows;
+    const int live = min(UnionRows, rows - first);
+    if (!t) { low = stride - 1; high = 0; }
+    __syncthreads();
+    input += size_t(first) * stride;
+    bits += size_t(first) * maskStride;
+    positions += size_t(group) * positionStride;
+    unsigned united = 0;
+    if (t < stride - 1)
+        for (int r = 0; r < live; ++r) united |= input[r * stride + t];
+    int offset, total;
+    Scan(storage).ExclusiveSum(__popc(united), offset, total);
+    // One atomic per nonempty warp, independent of the number of live keys.
+    unsigned occupied = __ballot_sync(0xffffffff, united != 0);
+    if (!(t % 32) && occupied) {
+        atomicMin(&low, t + __ffs(occupied) - 1);
+        atomicMax(&high, t + 31 - __clz(occupied));
+    }
+    if (t < live) bits[t * maskStride + maskStride - 1] = input[t * stride + stride - 1];
+    __syncthreads();
+    const int tiles = max(1, high / 4 - low / 4 + 1);
+    if (adaptive && total * 3 >= tiles * 256) {
+        if (!t) { lengths[group] = -1; spans[group] = {low / 4, tiles}; }
+        return;
     }
     if (!t) lengths[group] = total;
-    const int words = (total + 127) / 128 * 4;
-    const int row = t / 16, lane = t % 16;
-    if (row < n) {
-        unsigned valid = 0;
-        for (int w = lane; w < words; w += 16) {
-            uint32_t v = members[row][w];
-            bits[size_t(first + row) * UnionStride + w] = v;
-            valid |= v;
+    for (unsigned remaining = united; remaining; remaining &= remaining - 1)
+        positions[offset++] = t * 32 + __ffs(remaining) - 1;
+    __syncthreads();
+    const int padded = max(128, (total + 127) / 128 * 128);
+    for (int col = t; col - int(t % 32) < padded; col += threads) {
+        int key = col < total ? positions[col] : 0;
+        for (int r = 0; r < live; ++r) {
+            bool selected = col < total && (input[r * stride + key / 32] & (1u << (key % 32)));
+            unsigned word = __ballot_sync(0xffffffff, selected);
+            if (!(t % 32)) bits[r * maskStride + col / 32] = word;
         }
-        unsigned lanes = (t & 16) ? 0xffff0000u : 0xffffu;
-        int any = __any_sync(lanes, valid != 0);
-        if (!lane) bits[size_t(first + row) * UnionStride + UnionWords] = any;
     }
 }
 
@@ -132,19 +185,24 @@ struct UnionMask {
     template<class Acc, class Coords, class P>
     CUTLASS_DEVICE void apply_mask(Acc &a, const Coords &coords, const P &p) {
         int q = get<0>(coords(0));
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(a); i += 32) {
-            int slot = get<1>(coords(i));
-            unsigned mask = q < get<0>(p) && slot < get<4>(p).lengths[q / (UnionRows * Group)]
-                ? get<4>(p).bits[size_t(q / Group) * UnionStride + slot / 32] : 0;
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < 32; ++j) if (!(mask & (1u << j))) a(i + j) = -INFINITY;
+        // The builder zero-pads the last 128 columns. Each softmax thread
+        // owns this whole row fragment, so fetch its four mask words together.
+        static_assert(decltype(size(a))::value == 128);
+        uint4 masks = make_uint4(0,0,0,0);
+        if (q < get<0>(p)) {
+            int col = get<1>(coords(0));
+            masks = *reinterpret_cast<const uint4 *>(get<4>(p).bits + size_t(q / Group) * get<4>(p).maskStride + col / 32);
         }
+        if ((masks.x & masks.y & masks.z & masks.w) == ~0u) return;
+        unsigned words[] = {masks.x, masks.y, masks.z, masks.w};
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 128; ++i)
+            if (!(words[i / 32] & (1u << (i % 32)))) a(i) = -INFINITY;
     }
 };
 
 using UnionBase = Sm100FmhaFwdMainloopTmaWarpspecialized<Element, float, float,
-    Shape<_256,_128,_192>, Shape<_256,_128,_128>, StrideQ, StrideK, StrideV, UnionMask, Shape<_2,_1,_1>, 0, 1, true>;
+    Shape<_256,_128,_192>, Shape<_256,_128,_128>, StrideQ, StrideK, StrideV, UnionMask, Shape<_2,_1,_1>, 1, 0, true, true>;
 struct UnionMainloop : UnionBase {
     template<bool Value, class Smem, class Pipeline, class State>
     CUTLASS_DEVICE void gather(const UnionKV &u, int group, int head, int block, int live,
@@ -165,10 +223,11 @@ struct UnionMainloop : UnionBase {
         const int lane = threadIdx.x % 32;
         if (u.staged) {
             int row = lane * 4, slot = 128 * block + row;
-            const int *ids = u.positions + size_t(group) * UnionCapacity;
-            int pos[4];
-            CUTLASS_PRAGMA_UNROLL
-            for (int j = 0; j < 4; ++j) pos[j] = slot + j < live ? ids[slot+j] : 0;
+            const int *ids = u.positions + size_t(group) * u.positionStride;
+            int4 pos;
+            if (slot + 4 <= live) pos = *reinterpret_cast<const int4 *>(ids + slot);
+            else pos = make_int4(slot < live ? ids[slot] : 0, slot+1 < live ? ids[slot+1] : 0,
+                                 slot+2 < live ? ids[slot+2] : 0, 0);
             auto bar = cast_smem_ptr_to_uint(pipe.producer_get_barrier(state));
             CUTLASS_PRAGMA_UNROLL
             for (int col = 0; col < dim; col += 64) {
@@ -176,14 +235,14 @@ struct UnionMainloop : UnionBase {
                 asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes "
                     "[%0], [%1, {%2,%3,%4,%5,%6}], [%7];" ::
                     "r"(addr), "l"(&u.maps[Value ? 1 : 0]), "r"(head * dim + col),
-                    "r"(pos[0]), "r"(pos[1]), "r"(pos[2]), "r"(pos[3]), "r"(bar) : "memory");
+                    "r"(pos.x), "r"(pos.y), "r"(pos.z), "r"(pos.w), "r"(bar) : "memory");
             }
             ++state;
             return;
         }
         for (int row = lane / 8; row < 128; row += 4) {
             int slot = block * 128 + row;
-            int pos = slot < live ? u.positions[size_t(group) * UnionCapacity + slot] : 0;
+            int pos = slot < live ? u.positions[size_t(group) * u.positionStride + slot] : 0;
             auto data = Value ? u.value.Row(pos, u.kvHeads * ValueDim) : u.key.Row(pos, u.keyStride);
             CUTLASS_PRAGMA_UNROLL
             for (int col = (lane % 8) * 8; col < dim; col += 64) {

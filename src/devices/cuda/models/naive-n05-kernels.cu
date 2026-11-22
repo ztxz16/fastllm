@@ -4,6 +4,7 @@
 #include "utils.h"
 #include "naive-n05-topk.cuh"
 #include "naive-n05-topk-compact-sort.cuh"
+#include "naive-n05-topk-prefill.cuh"
 #include "naive-n05-topk-compact-select.cuh"
 #include "../linear/fastllm-native-lowbit-prefill.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
@@ -806,6 +807,18 @@ __global__ void SelectSortTop2048(const float *scores, int keys, int queryStart,
     const int row = blockIdx.x;
     const int count = queryStart + row + 1 + (partRows && row >= partRows ? gap : 0);
     SelectSortTop2048Row(scores + size_t(row) * keys, keys, count, indices + size_t(row) * 2048);
+}
+
+void LaunchSelectSortTop2048(const float *scores, int rows, int keys, int past, int *indices,
+                             int partRows = 0, int gap = 0) {
+    if (keys > 8192 && keys <= 16384 && past >= 2048 && rows >= 32) {
+        const int arch = FastllmCudaRuntimeArch();
+        if (arch == 100 || arch == 103) {
+            naive_topk::SelectSortPrefill16K<<<rows, 512>>>(scores, keys, past, indices, partRows, gap);
+            return;
+        }
+    }
+    SelectSortTop2048<<<rows, 256>>>(scores, keys, past, indices, partRows, gap);
 }
 
 // Keep long/short contexts on the original compiled kernel. The sample is
@@ -3223,7 +3236,7 @@ void FastllmCudaNaiveTopK(const fastllm::Data &scores, int queryStart, int topK,
                     sort<<<rows, 256>>>(selected, offsets, result + size_t(first) * topK, rows, stride, topK, keys);
                 }
             } else {
-                SelectSortTop2048<<<queries, 256>>>(values, keys, queryStart, result);
+                LaunchSelectSortTop2048(values, queries, keys, queryStart, result);
             }
             CheckLaunch();
             return;
@@ -4099,7 +4112,7 @@ bool FastllmCudaNaiveBalancedIndexer(const fastllm::Data &query, const fastllm::
     naive_dsa_mma::IndexerScores<true><<<dim3((past + second + part + 63) / 64, (rows + 31) / 32), 128>>>(
         (const BF16 *)q.cudaData, FastllmNaiveKV(keys), (const float *)scale.cudaData, (const BF16 *)w.cudaData,
         (float *)scores.cudaData, rows, count, start, keys.dims[2], part, gap);
-    SelectSortTop2048<<<rows, 256>>>((const float *)scores.cudaData, count, start,
+    LaunchSelectSortTop2048((const float *)scores.cudaData, rows, count, start,
                                      (int *)indices.cudaData, part, gap);
     CheckLaunch();
     return true;
@@ -4508,6 +4521,7 @@ bool FastllmCudaNaiveBalancedAttention(const fastllm::Data &query,
 
 #ifndef FASTLLM_ENABLE_BLACKWELL_DSA
 bool FastllmCudaHasBlackwellIndexerAttention() { return false; }
+bool FastllmCudaTryBlackwellSwa(const FastllmNaiveStagedSwa &, const float *, int, int) { return false; }
 bool FastllmCudaTryNaiveIndexerAttention(const FastllmNaivePrefillAttentionItem &,
         const fastllm::Data &, int, int, int, int, const fastllm::Data &) {
     return false;
@@ -4632,6 +4646,15 @@ void FastllmCudaNaiveFlushSwa(const std::vector<FastllmNaiveStagedSwa> &pending,
             tiles += (batch.entries[i].rows + tile - 1) / tile;
             batch.entries[i].endTile = tiles;
         }
+#ifdef FASTLLM_NAIVE_SWA_FLASHINFER
+        const int arch = FastllmCudaRuntimeArch();
+        if (arch == 100 || arch == 103) {
+            auto status = naive_swa_flashinfer::RunBatch<128>(batch, n,
+                sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, kvHeads);
+            fastllm::AssertInFastLLM(status == cudaSuccess, std::string("Naive batched SWA prefill: ") + cudaGetErrorString(status));
+            continue;
+        }
+#endif
         naive_prefill_mma::SwaContiguous<tile, limit><<<dim3(tiles, heads / 8), tile * 32,
             sizeof(naive_prefill_mma::ContigWindow<tile>)>>>(batch,
                 sink.dims.empty() ? nullptr : (const float *)sink.cudaData, heads, kvHeads);
@@ -4660,6 +4683,11 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
         dim == kSwaQkDim && valueDim == kSwaValueDim && key.dims[2] % 8 == 0 &&
         (size_t)query.cudaData % 16 == 0 && (size_t)key.cudaData % 16 == 0 &&
         (size_t)value.cudaData % 16 == 0 && FastllmCudaFlashInferDataTypeSupported(DataType::BFLOAT16)) {
+        if (queries >= 1024 && !key.isPagedKVCache && !value.isPagedKVCache && key.dims[2] == kvHeads * dim &&
+            value.dims[2] == kvHeads * valueDim && query.dataType == BFLOAT16 &&
+            FastllmCudaTryBlackwellSwa({query.cudaData, key.cudaData, value.cudaData, output.cudaData,
+                queries, key.dims[2], keys, pastLength, 0}, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                heads, kvHeads)) return;
         auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
@@ -4681,8 +4709,11 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
         (size_t)key.cudaData % 16 == 0 && (size_t)value.cudaData % 16 == 0) {
         // Neighboring causal windows overlap. Share their cache reads while
         // retaining each query's original MMA order and BF16 rounding.
-        const bool hopperStaging = FastllmCudaRuntimeArch() == 90 && queries >= 256 && prefillScratch;
-        if ((queries >= 1024 || hopperStaging) && pastLength >= 0 && count == 128 &&
+        const int arch = FastllmCudaRuntimeArch();
+        const bool hopperStaging = arch == 90 && queries >= 256 && prefillScratch;
+        const bool blackwellStaging = (arch == 100 || arch == 103) && queries >= 128 && prefillScratch &&
+            (key.dims[2] == kvHeads * dim || queries >= 8192);
+        if ((queries >= 1024 || hopperStaging || blackwellStaging) && pastLength >= 0 && count == 128 &&
             (int64_t)pastLength + queries <= keys) {
             auto grouped = naive_prefill_mma::SwaQueryTile<4>;
             size_t bytes = sizeof(naive_prefill_mma::SwaQueryStorage<4>);
@@ -4723,11 +4754,18 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
                     FastllmCudaNaiveReadCache({{&key, stagedKey, first, rows},
                                              {&value, stagedValue, first, rows}});
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
-                    const int arch = FastllmCudaRuntimeArch();
-                    if ((arch == 100 || arch == 103) && queries >= 8192 && value.dims[2] == kvHeads * valueDim &&
+                    if (blackwellStaging && value.dims[2] == kvHeads * valueDim &&
                         FastllmCudaFlashInferDataTypeSupported(BFLOAT16)) {
                         // The staged view starts at the oldest visible key. Its
                         // right-aligned causal window is identical to the cache's.
+                        FastllmNaiveStagedSwa item{query.cudaData, stagedKey, stagedValue, output.cudaData,
+                            queries, key.dims[2], rows, rows - queries, 0};
+                        const float *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+                        if (FastllmCudaTryBlackwellSwa(item, bias, heads, kvHeads)) return;
+                        if (pending) {
+                            pending->push_back(item);
+                            return;
+                        }
                         auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
                             stagedKey, stagedValue, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
                             (BF16 *)output.cudaData, queries, rows, heads, kvHeads, key.dims[2],

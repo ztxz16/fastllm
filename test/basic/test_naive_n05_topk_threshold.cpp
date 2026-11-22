@@ -31,8 +31,8 @@ static unsigned OrderedReference(float x) {
         b = 0;
     return b & 0x80000000u ? ~b : b ^ 0x80000000u;
 }
-static void AdversarialSamples(int keys, int past) {
-    const int rows = 5, top = 2048;
+static void AdversarialSamples(int keys, int past, int rows = 5) {
+    const int top = 2048;
     for (int mode = 0; mode < 6; ++mode) {
         std::vector<float> values((size_t)rows * keys);
         std::vector<int> expected((size_t)rows * top);
@@ -148,6 +148,8 @@ int main() {
     try {
         for (int keys : {4096, 4097, 7335, 8191, 8192, 16384, 82001, 131072, 131073, 200000})
             AdversarialSamples(keys, keys - 5);
+        AdversarialSamples(16342, 14208, 32);
+        AdversarialSamples(8193, 8161, 32);
         // Cold-prefix padding, the K boundary, and many identical candidates.
         for (int past : {0, 2046, 4094})
             AdversarialSamples(7335, past);

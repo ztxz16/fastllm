@@ -2018,11 +2018,13 @@ Data NaiveN05FlashModel::RunTarget(
                             tpDevices[IndexerOwnerRank(layer)], gpu);
                 }
                 if (dpPrefill && phase == 0) {
-                    pairedPrefill = idsInQkv && FastllmCudaHasBlackwellIndexerAttention() &&
+                    // Rank-local indices stay private through attention, including when
+                    // draft hidden capture places them outside the merged QKV buffer.
+                    pairedPrefill = rankIndexer && FastllmCudaHasBlackwellIndexerAttention() &&
                         prefillItems.size() == packedIndices.size();
                     for (size_t i = 0; pairedPrefill && i < prefillItems.size(); ++i)
                         pairedPrefill = prefillItems[i].indices == &packedIndices[i] &&
-                            prefillItems[i].keys->dims[1] <= 8192;
+                            prefillItems[i].keys->dims[1] <= 16384;
                     if (!pairedPrefill)
                         FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
                             indexFp8, prefillScores, indexerCompute);

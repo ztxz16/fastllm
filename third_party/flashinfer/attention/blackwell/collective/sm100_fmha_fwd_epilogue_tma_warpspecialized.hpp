@@ -38,7 +38,7 @@
 
 namespace cutlass::fmha::collective {
 
-template <class Element, class ElementAcc, class TileShape>
+template <class Element, class ElementAcc, class TileShape, bool SingleSequence = false>
 struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
   using ElementOut = Element;
   using Pipeline = cutlass::PipelineAsync<2>;
@@ -128,7 +128,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
     int o1_index = 2 * get<0>(blk_coord) + 1;
 
     int offs_0 = params.max_qo_len - qo_len;
-    int offs_2_1 = qo_segment_offset + qo_len;
+    int offs_2_1 = SingleSequence ? 0 : qo_segment_offset + qo_len;
     BlkCoord blk_coord_updated = blk_coord;
     get<2, 1>(blk_coord_updated) = 0;
 

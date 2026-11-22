@@ -53,7 +53,7 @@ template <class Element_, class ElementQK_, class ElementPV_, class TileShapeQK_
           // (1, 2, 1) means they sit side by side (best for small Q / large K)
           class ThreadShape = Shape<_2, _1, _1>,
           // Asymmetric head dimensions can leave room for one additional K or V stage.
-          int ExtraK = 0, int ExtraV = 0, bool ApproximateExp2 = false>
+          int ExtraK = 0, int ExtraV = 0, bool ApproximateExp2 = false, bool DelayRescale = false>
 struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using Element = Element_;
   using ElementQK = ElementQK_;
@@ -569,6 +569,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       row_max = ::fmax(row_max, row_max_3);
     }
 
+    if constexpr (DelayRescale) {
+      // BF16 probabilities can represent weights up to 2^8 above the old reference.
+      // Keeping that reference also avoids rescaling the preceding PV accumulator.
+      if (old_row_max != -INFINITY && (row_max - old_row_max) * params.scale_softmax_log2 <= 8.f)
+        row_max = old_row_max;
+    }
     ElementQK row_max_safe = row_max == -INFINITY ? 0 : row_max;
 
     Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
@@ -687,6 +693,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
   }
 
+  // A sink contributes exp(logit) to the denominator and zero to the numerator.
+  template <class M, class C, class P>
+  CUTLASS_DEVICE static auto init_softmax(M mask, const C &coord, const P &problem, float scale,
+                                         float &maximum, float &sum, int)
+      -> decltype(mask.init_softmax(coord, problem, scale, maximum, sum), void()) {
+    mask.init_softmax(coord, problem, scale, maximum, sum);
+  }
+  template <class M, class C, class P>
+  CUTLASS_DEVICE static void init_softmax(M, const C &, const P &, float, float &, float &, long) {}
+
   template <class Stage, class BlkCoord, class ProblemShape>
   CUTLASS_DEVICE auto softmax(Stage stage, BlkCoord const& blk_coord, Params const& params,
                               ProblemShape const& problem_shape, PipelineS& pipeline_s,
@@ -698,6 +714,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     ElementQK row_max = -INFINITY;
     ElementQK row_sum = 0;
+    init_softmax(Mask{}, blk_coord, problem_shape, params.scale_softmax, row_max, row_sum, 0);
 
     Tensor cS_base = make_identity_tensor(select<0, 1>(TileShapeQK{}));
     auto logical_offset = make_coord(get<0>(blk_coord) * get<0>(TileShape{}) +

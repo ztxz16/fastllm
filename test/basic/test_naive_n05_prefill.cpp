@@ -261,9 +261,10 @@ static void TestIndexerRaggedShards() {
 // Insufficient workspace must retain the same result without resizing storage.
 static void TestSwaPrefillScratch() {
     for (auto shape : {std::vector<int>{1025, 127, 16}, {4096, 65536, 64},
-                       {1025, 64, 16}, {4096, 0, 64}, {8193, 193, 16}}) {
+                       {1025, 64, 16}, {4096, 0, 64}, {8193, 193, 16}, {1027, 0, 16, 0}, {1153, 191, 16, 0}}) {
         const int rows=shape[0], past=shape[1], heads=shape[2], kvHeads=heads/8, keys=past+rows;
-        const int keyStride=kvHeads*192+16, valueStride=kvHeads*128;
+        const int padding = shape.size() == 4 ? shape[3] : 16;
+        const int keyStride=kvHeads*192+padding, valueStride=kvHeads*128;
         Data q(BFLOAT16), key(FP8_E4M3), value(FP8_E4M3), sink(FLOAT32), indices(INT32), reference, actual;
         Upload(q,{1,rows,heads*192},53); Upload(sink,{heads},71);
         auto uploadFp8 = [&](Data &data, int width, unsigned seed) {
@@ -290,7 +291,7 @@ static void TestSwaPrefillScratch() {
                 scratch.Resize({(int)(full?elements:elements-1)});
                 FastllmCudaNaiveAttention(q,key,value,indices,sink,heads,kvHeads,192,128,past,128,actual,true,&scratch);
                 const auto got = Read<uint16_t>(actual);
-                if (rows >= 8192 && full) {
+                if (full && (rows >= 8192 || (padding == 0 && FastllmCudaHasBlackwellIndexerAttention()))) {
                     double norm = 0, error = 0, maxAbs = 0;
                     for (size_t i = 0; i < got.size(); ++i) {
                         const double value = FromBits(expected[i]), delta = FromBits(got[i]) - value;
@@ -408,7 +409,7 @@ static void TestLocalPrefillBatch() {
 // Exercise the Indexer contract separately from arbitrary index lists. Tail
 // rows, empty/future selections, and shuffled KV pages must survive packing.
 static void TestBlackwellIndexerAttention() {
-    for (int keys : {1181, 2305, 32768, 65536, 65543, 131072}) {
+    for (int keys : {1181, 2305, 6144, 8192, 16384, 32768, 65536, 65543, 98305, 131072, 262209}) {
         const bool paged = keys != 1181 && keys != 32768;
         const int rows = keys > 2305 ? 149 : (paged ? 2051 : 149);
         const int kvHeads = paged ? 2 : 1, heads = 16 * kvHeads, topK = keys > 2305 ? 2048 : 512, pageLen = 64;
@@ -455,6 +456,8 @@ static void TestBlackwellIndexerAttention() {
             // a partial last group and a causal span crossing the bitmap capacity.
             int pattern = keys >= 32768 && (r / 16) % 2 ? (r / 16) * 16 : r;
             int k = (j * 97 + pattern * 37) % keys;
+            if (keys >= 6144 && (r / 16) % 3 == 0)
+                k = keys - rows - topK + j;  // Dense island with a nonzero physical tile offset.
             int id = k;
             if (r % 101 == 0) id = -1;  // Empty selection.
             else if (r % 11 == 0) id = j == 0 ? keys - rows + r : -1;
@@ -471,7 +474,8 @@ static void TestBlackwellIndexerAttention() {
         // and catch writes beyond the logical loan.
         constexpr int guard = 256;
         // Exercise full staging, head-striped staging and the cache reader.
-        const int bytes = keys == 32768 ? 100 << 20 : (keys == 65536 || keys == 65543) ? 52 << 20 : 12 << 20;
+        const int bytes = keys == 98305 ? 170 << 20 : keys == 32768 ? 100 << 20 :
+            (keys == 65536 || keys == 65543) ? 52 << 20 : keys >= 6144 && keys <= 16384 ? 38 << 20 : 12 << 20;
         Data storage(BFLOAT16, {(bytes + 2 * guard) / 2}), scratch(BFLOAT16, {bytes / 2});
         storage.ToDevice(DataDevice::CUDA, {0}, false);
         storage.Allocate(false);
@@ -577,9 +581,10 @@ static void TestColdWindowCacheWrite() {
     ++checks;
 }
 
-static void TestPairedPrefillAttention() {
+static void TestPairedPrefillAttention(int keys = 2017, int keep = 512) {
     if (!FastllmCudaHasBlackwellIndexerAttention()) return;
-    constexpr int rows = 257, keys = 2017, keep = 512, heads = 16, past = keys - rows;
+    constexpr int rows = 257, heads = 16;
+    const int past = keys - rows;
     Data iq(BFLOAT16), weights(BFLOAT16), ik(BFLOAT16), q(BFLOAT16), k(BFLOAT16), v(BFLOAT16);
     Data ordered(INT32), privateIds(INT32, {rows, keep}), sink, expected, actual;
     Upload(iq, {1, rows, 2048}, 43); Upload(weights, {1, rows, 16}, 53); Upload(ik, {1, keys, 128}, 59);
@@ -641,7 +646,7 @@ int main() {
         SetThreads(4);
         TestPackedPrefillRope();
         TestColdWindowCacheWrite();
-        TestPairedPrefillAttention();
+        TestPairedPrefillAttention(); TestPairedPrefillAttention(8193, 2048); TestPairedPrefillAttention(16342, 2048);
         TestBlackwellLocalRouter();
         TestBlackwellIndexerAttention();
         TestLocalPrefillBatch();

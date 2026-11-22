@@ -131,6 +131,13 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
   }
 
+  // A sparse mask may trim a contiguous interval of complete KV tiles.
+  template <class M, class C, class P>
+  CUTLASS_DEVICE static auto kv_tile(int i, M mask, const C& coord, const P& problem, int)
+      -> decltype(mask.kv_tile(i, coord, problem)) { return mask.kv_tile(i, coord, problem); }
+  template <class M, class C, class P>
+  CUTLASS_DEVICE static int kv_tile(int i, M, const C&, const P&, long) { return i; }
+
   template <class BlkCoord, class ProblemShape, class ParamsProblemShape>
   CUTLASS_DEVICE void load(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
                            Params const& params, ParamsProblemShape const& params_problem_shape,
@@ -206,11 +213,12 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     ++pipeline_q_producer_state;
 
     // K1
-    int k_index = 0;
+    auto physical_tile = [&](int i) { return kv_tile(i, Mask{}, blk_coord, problem_shape, 0); };
+    int k_index = 0, v_index = 0;
     pipeline_k.producer_acquire(pipeline_k_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_k.producer_get_barrier(pipeline_k_producer_state);
-      copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, k_index),
+      copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, physical_tile(k_index)),
            tKsK(_, pipeline_k_producer_state.index()));
     }
     ++pipeline_k_producer_state;
@@ -226,11 +234,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     ++pipeline_q_producer_state;
 
     // V1
-    int v_index = 0;
     pipeline_v.producer_acquire(pipeline_v_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_v.producer_get_barrier(pipeline_v_producer_state);
-      copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, v_index),
+      copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, physical_tile(v_index)),
            tVsV(_, pipeline_v_producer_state.index()));
     }
     ++pipeline_v_producer_state;
@@ -243,7 +250,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       pipeline_k.producer_acquire(pipeline_k_producer_state);
       if (lane_predicate) {
         auto tma_barrier = pipeline_k.producer_get_barrier(pipeline_k_producer_state);
-        copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, k_index),
+        copy(params.tma_load_K.with(*tma_barrier, 0), tKgK(_, physical_tile(k_index)),
              tKsK(_, pipeline_k_producer_state.index()));
       }
       ++pipeline_k_producer_state;
@@ -253,7 +260,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
       pipeline_v.producer_acquire(pipeline_v_producer_state);
       if (lane_predicate) {
         auto tma_barrier = pipeline_v.producer_get_barrier(pipeline_v_producer_state);
-        copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, v_index),
+        copy(params.tma_load_V.with(*tma_barrier, 0), tVgV(_, physical_tile(v_index)),
              tVsV(_, pipeline_v_producer_state.index()));
       }
       ++pipeline_v_producer_state;

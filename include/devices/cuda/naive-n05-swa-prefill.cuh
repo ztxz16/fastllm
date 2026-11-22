@@ -14,5 +14,7 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
     int kvHeads, int dim, int valueDim, int pastLength, int window, fastllm::Data &output,
     bool causal, const fastllm::Data *scratch, std::vector<FastllmNaiveStagedSwa> *pending);
 
+bool FastllmCudaTryBlackwellSwa(const FastllmNaiveStagedSwa &item, const float *sink, int heads, int kvHeads);
+
 void FastllmCudaNaiveFlushSwa(const std::vector<FastllmNaiveStagedSwa> &pending,
     const fastllm::Data &sink, int heads, int kvHeads);

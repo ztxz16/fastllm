@@ -1,6 +1,7 @@
 // Blackwell DSA prefill. Fold the 16 GQA heads sharing K/V into the MMA M
 // dimension. Each row's TopK bitmap masks logits before online softmax and PV.
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
+#include "devices/cuda/naive-n05-swa-prefill.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils/utils.h"
 #include "devices/cuda/naive-n05-kv.cuh"
@@ -13,11 +14,11 @@
 #include <cuda.h>
 #include <numeric>
 namespace blackwell_dsa {
-__global__ void SelectScoreMask(const float *scores, uint32_t *bits, int keys,
+template<int Threads> __global__ void SelectScoreMask(const float *scores, uint32_t *bits, int keys,
                                 int past, int keep, int stride) {
-    using Scan = cub::BlockScan<int, 256>;
+    using Scan = cub::BlockScan<int, Threads>;
     __shared__ typename Scan::TempStorage scan;
-    __shared__ unsigned histogram[256], equalWords[256], greaterWords[256], cutoff;
+    __shared__ unsigned histogram[256], equalWords[Threads], greaterWords[Threads], cutoff;
     __shared__ int remaining;
     const int t = threadIdx.x, row = blockIdx.x;
     const int count = min(keys, past + row + 1), words = stride - 1;
@@ -31,9 +32,9 @@ __global__ void SelectScoreMask(const float *scores, uint32_t *bits, int keys,
         return;
     }
     unsigned values[32];
-    const int stripes = (count + 255) / 256;
+    const int stripes = (count + Threads - 1) / Threads;
     for (int j = 0; j < stripes; ++j) {
-        int i = j * 256 + t;
+        int i = j * Threads + t;
         float x = i < count ? scores[size_t(row) * keys + i] : 0.f;
         unsigned u = x == 0.f ? 0 : __float_as_uint(x);
         values[j] = (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
@@ -44,16 +45,16 @@ __global__ void SelectScoreMask(const float *scores, uint32_t *bits, int keys,
     for (int shift = 24; shift >= 0; shift -= 8) {
         const unsigned prefix = cutoff;
         const int rank = remaining;
-        histogram[t] = 0;
+        if (t < 256) histogram[t] = 0;
         __syncthreads();
         for (int j = 0; j < stripes; ++j) {
             unsigned u = values[j];
-            int bucket = j * 256 + t < count && (u & tested) == prefix ? ((u >> shift) & 255u) : 256;
+            int bucket = j * Threads + t < count && (u & tested) == prefix ? ((u >> shift) & 255u) : 256;
             unsigned peers = __match_any_sync(0xffffffff, bucket);
             if (bucket < 256 && (t % 32) == __ffs(peers)-1) atomicAdd(histogram + bucket, __popc(peers));
         }
         __syncthreads();
-        const int size = histogram[255-t]; int before;
+        const int size = t < 256 ? histogram[255-t] : 0; int before;
         Scan(scan).ExclusiveSum(size, before);
         if (before < rank && rank <= before + size) {
             cutoff = prefix | (unsigned(255-t) << shift); remaining = rank - before;
@@ -61,12 +62,12 @@ __global__ void SelectScoreMask(const float *scores, uint32_t *bits, int keys,
         tested |= 255u << shift;
         __syncthreads();
     }
-    for (int j = 0; j < (words+7)/8; ++j) {
-        const bool valid = j * 256 + t < count;
+    for (int j = 0; j < (words + Threads/32 - 1)/(Threads/32); ++j) {
+        const bool valid = j * Threads + t < count;
         unsigned u = valid ? values[j] : 0;
         unsigned eq = __ballot_sync(0xffffffff, valid && u == cutoff);
         unsigned gt = __ballot_sync(0xffffffff, valid && u > cutoff);
-        int word = j * 8 + t / 32;
+        int word = j * (Threads/32) + t / 32;
         if (!(t % 32)) { equalWords[word] = eq; greaterWords[word] = gt; }
     }
     __syncthreads();
@@ -91,9 +92,15 @@ struct Length {
         CUTE_HOST_DEVICE int operator[](int batch) const { return batch * length; }
     } segment_offsets;
 };
+constexpr int UnionRows = 16;
+struct TileSpan { int first, count; };
 struct Membership {
     const uint32_t *bits;
     int stride, past;
+    const TileSpan *spans;
+    CUTLASS_DEVICE int physical_tile(int group, int index) const {
+        return spans ? spans[group].first + index : index;
+    }
 };
 }
 namespace cutlass::fmha::collective {
@@ -115,8 +122,13 @@ using BF16 = __nv_bfloat16;
 using Element = cutlass::bfloat16_t;
 
 struct TopKMask {
+    template<class Coord, class Problem>
+    CUTLASS_DEVICE int kv_tile(int index, const Coord &c, const Problem &p) const {
+        return get<4>(p).physical_tile(int(get<0>(c)), index);
+    }
     template<class Coord, class Tile, class Problem>
     CUTLASS_DEVICE int get_trip_count(const Coord &coord, const Tile &tile, const Problem &p) {
+        if (auto spans = get<4>(p).spans) return spans[int(get<0>(coord))].count;
         int end = get<4>(p).past + (int(get<0>(coord)) + 1) * int(get<0>(tile)) / Group;
         return ceil_div(min(get<1>(p), end), int(get<1>(tile)));
     }
@@ -132,9 +144,11 @@ struct TopKMask {
         // Each TMEM fragment holds consecutive keys from one packed query
         // head. One bitmap load masks 32 scores (the FA4 vector mask contract).
         int q = get<0>(coords(0));
+        int tile = get<1>(coords(0)) / 128;
+        int offset = (mask.physical_tile(q / (UnionRows * Group), tile) - tile) * 128;
         CUTLASS_PRAGMA_UNROLL
         for (int base = 0; base < size(acc); base += 32) {
-            int first = get<1>(coords(base));
+            int first = offset + get<1>(coords(base));
             uint32_t word = q < get<0>(p) && first < get<1>(p)
                 ? mask.bits[(q / Group) * mask.stride + first / 32] : 0;
             CUTLASS_PRAGMA_UNROLL
@@ -186,7 +200,7 @@ using StrideQ = tuple<int, _1, tuple<int, int>>;
 using StrideK = tuple<int, _1, tuple<_0, int>>;
 using StrideV = tuple<_1, int, tuple<_0, int>>;
 using Mainloop = Sm100FmhaFwdMainloopTmaWarpspecialized<Element, float, float,
-    Shape<_256,_128,_192>, Shape<_256,_128,_128>, StrideQ, StrideK, StrideV, TopKMask, Shape<_2,_1,_1>, 1, 0, true>;
+    Shape<_256,_128,_192>, Shape<_256,_128,_128>, StrideQ, StrideK, StrideV, TopKMask, Shape<_2,_1,_1>, 1, 0, true, true>;
 using Epilogue = Sm100FmhaFwdEpilogueTmaWarpspecialized<Element, float, typename Mainloop::TileShapePV>;
 using Kernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<Problem, Mainloop, Epilogue, TileScheduler>;
 static_assert(Kernel::SharedStorageSize <= 232448);
@@ -267,6 +281,31 @@ __global__ void BuildTopKMask(const int *indices, uint32_t *bits, int keys, int 
     if (!threadIdx.x) valid[size_t(row) * flagStride] = nonempty;
 }
 
+// A whole query tile can omit leading and trailing KV tiles that no row selected.
+// Keep the original per-row bitmap for exact masking inside this interval.
+__global__ void FindTileSpans(const uint32_t *bits, int stride, int rows, TileSpan *spans) {
+    __shared__ int lo, hi;
+    if (!threadIdx.x) { lo = INT_MAX; hi = -1; }
+    __syncthreads();
+    const int first = blockIdx.x * UnionRows, n = min(UnionRows, rows - first);
+    const int words = stride - 1;
+    int low = INT_MAX, high = -1;
+    for (int i = threadIdx.x; i < n * words; i += blockDim.x) {
+        const int word = i % words;
+        if (bits[size_t(first + i / words) * stride + word]) {
+            low = min(low, word / 4);
+            high = max(high, word / 4);
+        }
+    }
+    for (int step = 16; step; step /= 2) {
+        low = min(low, __shfl_down_sync(0xffffffff, low, step));
+        high = max(high, __shfl_down_sync(0xffffffff, high, step));
+    }
+    if (!(threadIdx.x % 32)) { atomicMin(&lo, low); atomicMax(&hi, high); }
+    __syncthreads();
+    if (!threadIdx.x) spans[blockIdx.x] = hi < 0 ? TileSpan{0,1} : TileSpan{lo,hi-lo+1};
+}
+
 // Model layout [row, KV head, group, dim]; FMHA layout [row, group, KV head, dim].
 template<bool Output>
 __global__ void ReorderHeads(const BF16 *src, BF16 *dst, const uint32_t *bits, int stride, int kvHeads, int firstHead = 0) {
@@ -295,6 +334,79 @@ bool FastllmCudaHasBlackwellIndexerAttention() {
     return false;
 }
 
+namespace blackwell_dsa {
+struct Window {
+    const float *sink;
+    int past;
+};
+struct WindowMask {
+    template<class C, class P>
+    CUTLASS_DEVICE int kv_tile(int tile, const C &coord, const P &p) const {
+        return tile + max(0, int(get<0>(coord)) * 256 + get<4>(p).past - 127) / 128;
+    }
+    template<class C, class T, class P>
+    CUTLASS_DEVICE int get_trip_count(const C &coord, const T &, const P &p) {
+        int end = min(int(get<1>(p)), (int(get<0>(coord)) + 1) * 256 + get<4>(p).past);
+        return (end + 127) / 128 - kv_tile(0, coord, p);
+    }
+    template<class C, class T, class P>
+    CUTLASS_DEVICE int get_unmasked_trip_count(const C &, const T &, const P &) { return 0; }
+    template<class C, class T, class P>
+    CUTLASS_DEVICE int get_masked_trip_count(const C &c, const T &t, const P &p) { return get_trip_count(c,t,p); }
+    template<class Acc, class Coords, class P>
+    CUTLASS_DEVICE void apply_mask(Acc &a, const Coords &c, const P &p) {
+        int row = get<0>(c(0)), end = row + get<4>(p).past;
+        int first = max(0, row / 256 * 256 + get<4>(p).past - 127) / 128 * 128 + get<1>(c(0));
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size(a); ++i)
+            if (first + i > end || first + i < end - 127) a(i) = -INFINITY;
+    }
+    template<class C, class P>
+    CUTLASS_DEVICE void init_softmax(const C &coord, const P &p, float scale, float &maximum, float &sum) const {
+        if (auto sink = get<4>(p).sink) {
+            maximum = sink[int(get<2,0>(coord))] / scale;
+            sum = 1;
+        }
+    }
+};
+using WindowProblem = tuple<Length, Length, int, tuple<tuple<int,int>,int>, Window>;
+using WindowLoop = Sm100FmhaFwdMainloopTmaWarpspecialized<Element, float, float, Shape<_256,_128,_192>,
+    Shape<_256,_128,_128>, StrideQ, StrideK, StrideV, WindowMask, Shape<_2,_1,_1>, 1, 0, true>;
+using WindowEpilogue = Sm100FmhaFwdEpilogueTmaWarpspecialized<Element, float, typename WindowLoop::TileShapePV, true>;
+using WindowKernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+    WindowProblem, WindowLoop, WindowEpilogue, TileScheduler>;
+}
+
+bool FastllmCudaTryBlackwellSwa(const FastllmNaiveStagedSwa &item, const float *sink, int heads, int kvHeads) {
+    using namespace blackwell_dsa;
+    if (item.rows < 1024 || kvHeads <= 0 || heads != kvHeads * 8 || item.past < 0 ||
+        int64_t(item.past) + item.rows != item.keys || !FastllmCudaHasBlackwellIndexerAttention() || FastllmCudaGraphIsCapturingFast())
+        return false;
+    const int rows = item.rows, keys = item.keys, group = heads / kvHeads;
+    auto h = make_shape(group, kvHeads);
+    auto p = make_tuple(Length{{rows}}, Length{{keys}}, QKDim, make_tuple(h,1), Window{sink,item.past});
+    auto lq = make_layout(make_shape(rows,QKDim,h), StrideQ{heads*QKDim,_1{},{QKDim,group*QKDim}});
+    auto lk = make_layout(make_shape(keys,QKDim,h), StrideK{item.stride,_1{},{_0{},QKDim}});
+    auto lv = make_layout(make_shape(ValueDim,keys,h), StrideV{_1{},kvHeads*ValueDim,{_0{},ValueDim}});
+    auto lo = make_layout(make_shape(rows,ValueDim,make_shape(h,1)),
+        make_stride(heads*ValueDim,_1{},make_stride(make_stride(ValueDim,group*ValueDim),heads*ValueDim)));
+    auto ll = make_layout(make_shape(rows,make_shape(heads,1)),make_stride(heads,make_stride(_1{},1)));
+    cutlass::KernelHardwareInfo hw{};
+    if (cudaDeviceGetAttribute(&hw.sm_count, cudaDevAttrMultiProcessorCount, FastllmCudaGetDevice()) != cudaSuccess)
+        return false;
+    using Op = cutlass::fmha::device::FMHA<WindowKernel>;
+    typename Op::Arguments args{p, {(Element *)item.query,lq,(Element *)item.key,lk,(Element *)item.value,lv,
+        1.f/sqrtf(float(QKDim)),1.f,1.f,1.f,1.f}, {(Element *)item.output,lo,nullptr,ll,rows},
+        {(rows+255)/256,heads,nullptr,TileScheduler::Work::All},hw};
+    auto attr = cudaFuncSetAttribute(cutlass::device_kernel<WindowKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     WindowKernel::SharedStorageSize);
+    if (attr != cudaSuccess) { cudaGetLastError(); return false; }
+    auto params = WindowKernel::to_underlying_arguments(args, nullptr);
+    auto result = Op::run(params, cudaStreamPerThread, false);
+    fastllm::AssertInFastLLM(result == cutlass::Status::kSuccess, "Naive Blackwell SWA prefill launch failed.");
+    return true;
+}
+
 static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
         const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim,
         const fastllm::Data &scratch, const fastllm::Data *scores) {
@@ -313,8 +425,9 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
     // to TopK. Longer histories traverse the union of selected positions.
     if (rows < 128 || int64_t(item.past) + rows > keys || ids.dataType != INT32 || ids.dims.size() != 2 ||
         ids.dims[0] != rows || ids.dims[1] <= 0) return false;
-    const bool sparse = keys > 16384 || keys > int64_t(ids.dims[1]) * 8;
-    if (sparse && (scores || ids.dims[1] > UnionKeys)) return false;
+    const bool sparse = keys > 16384 || keys > int64_t(ids.dims[1]) * 8 ||
+                        (ids.dims[1] == UnionKeys && keys > (scores ? 8192 : 3 * UnionKeys));
+    if (sparse && (ids.dims[1] > UnionKeys || (scores && (keys <= 8192 || ids.dims[1] != UnionKeys)))) return false;
     const int device = FastllmCudaGetDevice();
     auto resident = [device](const Data &d) {
         return d.dataDevice == DataDevice::CUDA && d.dataDeviceIds.size() == 1 && d.dataDeviceIds[0] == device &&
@@ -327,32 +440,59 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
     size_t bytes = scratch.isFake || scratch.cudaDataBorrowed ? scratch.GetBytes() : scratch.expansionBytes;
     bytes = std::min(bytes, size_t(256) << 20);
     int maskStride = (keys - 1) / 32 + 2;
-    if (scores && (keys > 8192 || maskStride > ids.dims[1] ||
+    if (scores && (keys > 16384 || (keys > 8192 && !sparse) || maskStride > ids.dims[1] ||
         scores->dataType != FLOAT32 || scores->dims != std::vector<int>({rows, keys}) ||
         !resident(*scores) || ids.cudaData == scores->cudaData)) return false;
     const size_t kvPerHead = size_t(keys) * (dim + valueDim);
+    int sms = 0;
+    auto status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) return false;
+    const int words = (keys - 1) / 32 + 1;
+    // A union contains at most one entry per logical key. Pad positions
+    // to a full MMA tile and preserve 16-byte alignment of membership rows.
+    const int positionStride = std::min<int64_t>(UnionCapacity, ((int64_t(keys) + 127) / 128) * 128);
+    const int unionStride = positionStride / 32 + 4;
+    const int denseStride = positionStride / UnionRows;
+    const bool externalBitmap = sparse && words > denseStride && words <= MaxBitmapWords;
+    // Span storage is per tile. Two words per row also cover alignment of each metadata plane.
+    constexpr size_t metadataPadding = sizeof(TileSpan) + 2 * sizeof(uint32_t);
     int stripeHeads = kvHeads;
     size_t rowBytes = size_t(heads) * (dim + valueDim) * sizeof(BF16) + (scores ? 0 : maskStride * sizeof(uint32_t));
     if (sparse) {
         // Independent KV heads can share the same staging allocation in turns.
-        const size_t metadata = sizeof(int) * (UnionCapacity / UnionRows + UnionStride + 1);
+        const size_t metadata = sizeof(int) * (positionStride / UnionRows + unionStride + 1 + (externalBitmap ? words : 0));
         const size_t perHead = Group * (dim + valueDim) * sizeof(BF16);
         const size_t reserve = 128 * metadata;
         int fit = std::min<size_t>(kvHeads, bytes > reserve ?
             (bytes - reserve) / (kvPerHead * sizeof(BF16) + 128 * perHead) : 0);
         // Equal stripes share a tensor map, including when the KV head count is odd.
         while (fit && kvHeads % fit) --fit;
+        // Leave room for at least one wave of query tiles when a full-head
+        // KV stage would force short, underfilled attention launches.
+        if (fit > 1 && rows >= 1024) {
+            int best = fit;
+            for (int h = fit; h > 0; --h) {
+                if (kvHeads % h) continue;
+                size_t waveRows = std::min<size_t>(rows, (sms + h - 1) / h * Group);
+                if (kvPerHead * h * sizeof(BF16) + waveRows * (metadata + perHead * h + metadataPadding) <= bytes) {
+                    best = h; break;
+                }
+            }
+            fit = best;
+        }
         stripeHeads = fit;
         rowBytes = metadata + perHead * (fit ? fit : kvHeads);
+        if (!fit && externalBitmap) rowBytes -= words * sizeof(uint32_t);
     }
+    rowBytes += metadataPadding;
     const size_t kvElems = kvPerHead * stripeHeads;
     if (bytes <= kvElems * sizeof(BF16)) return false;
-    int chunk = std::min<size_t>(rows, (bytes - kvElems * sizeof(BF16)) / rowBytes);
+    // Budget full metadata tiles even when the last one has fewer live rows.
+    // Keeping this tile in the same launch avoids a tiny second forward.
+    const int storageRows = sparse ? int(std::min<int64_t>(INT_MAX, (int64_t(rows) + UnionRows - 1) / UnionRows * UnionRows)) : rows;
+    int chunk = std::min<size_t>(storageRows, (bytes - kvElems * sizeof(BF16)) / rowBytes);
     if (chunk < (sparse ? UnionRows : 128)) return false;
     if (chunk < rows || sparse) chunk -= chunk % Group;
-    int sms = 0;
-    auto status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
-    if (status != cudaSuccess) return false;
     const int activeHeads = stripeHeads ? stripeHeads : kvHeads;
     if (chunk < rows && sparse) {
         // Cut each long-query chunk at a full wave of resident FMHA CTAs.
@@ -380,7 +520,7 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
         (uintptr_t(item.output->cudaData) % 16)) return false;
     if (sparse) {
         status = cudaFuncSetAttribute(BuildUnion, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                      UnionRows * UnionWords * sizeof(uint32_t));
+            (2 * MaxBitmapWords + UnionRows * UnionWords) * sizeof(uint32_t));
         if (status != cudaSuccess) { cudaGetLastError(); return false; }
         status = cudaFuncSetAttribute(cutlass::device_kernel<UnionKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                       UnionKernel::SharedStorageSize);
@@ -397,12 +537,15 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
     BF16 *key = (BF16 *)scratch.cudaData, *value = key + size_t(keys) * stripeHeads * dim;
     BF16 *query = key + kvElems, *out = query + qElems;
     cudaStream_t stream = cudaStreamPerThread;
+    auto *spans = reinterpret_cast<TileSpan *>(out + outElems);
+    auto *metadata = reinterpret_cast<uint32_t *>((uintptr_t(spans + (chunk + UnionRows - 1) / UnionRows) + 15) & ~uintptr_t(15));
     if (sparse) {
-        auto *positions = (int *)(out + outElems);
+        auto *positions = reinterpret_cast<int *>(metadata);
         int groups = chunk / UnionRows;
-        auto *lengths = positions + size_t(groups) * UnionCapacity;
-        auto *bits = (uint32_t *)(lengths + groups);
-        UnionKV u{positions, lengths, bits, FastllmNaiveKV(k), FastllmNaiveKV(v), k.dims[2], kvHeads, kvElems != 0, {}};
+        auto *lengths = positions + size_t(groups) * positionStride;
+        auto *bits = (uint32_t *)(lengths + ((groups + 3) & ~3));
+        auto *logical = externalBitmap ? bits + size_t(chunk) * unionStride : reinterpret_cast<uint32_t *>(positions);
+        UnionKV u{positions, lengths, bits, FastllmNaiveKV(k), FastllmNaiveKV(v), k.dims[2], kvHeads, positionStride, unionStride, kvElems != 0, {}};
         if (u.staged) {
             for (int i = 0; i < 2; ++i) {
                 const int width = stripeHeads * (i ? ValueDim : QKDim);
@@ -414,16 +557,28 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
                     return false;
             }
         }
+        // The private index buffer survives staging, even when the score
+        // matrix and the KV workspace are the same allocation.
+        auto *rowMask = static_cast<uint32_t *>(ids.cudaData);
+        if (scores) SelectScoreMask<512><<<rows,512,0,stream>>>(static_cast<const float *>(scores->cudaData),
+            rowMask, keys, item.past, ids.dims[1], maskStride);
         for (int head = 0; head < kvHeads; head += activeHeads) {
             if (u.staged) GatherKV<<<keys,128,0,stream>>>(u.key, u.value, key, value, kvHeads, k.dims[2],
                                                          head, activeHeads);
             for (int first = 0; first < rows; first += chunk) {
                 int count = std::min(chunk, rows - first);
                 // A dense group reuses its compact-position storage for the logical bitmap.
-                const bool adaptive = u.staged && item.past + first < DenseWords * 32;
-                BuildUnion<<<(count + UnionRows - 1) / UnionRows, 256, UnionRows * UnionWords * sizeof(uint32_t), stream>>>(
-                    (const int*)ids.cudaData + size_t(first) * ids.dims[1], count, ids.dims[1], item.past + first, keys,
-                    positions, lengths, bits, adaptive);
+                const bool adaptive = u.staged && words <= MaxBitmapWords;
+                const auto *selected = (const int*)ids.cudaData + size_t(first) * ids.dims[1];
+                const int windowWords = std::min(words, MaxBitmapWords);
+                const size_t shared = (2 * windowWords + UnionRows * UnionWords) * sizeof(uint32_t);
+                const auto *chunkMask = rowMask + size_t(first) * maskStride;
+                if (scores)
+                    BuildBitmapUnion<<<(count + UnionRows - 1) / UnionRows,512,0,stream>>>(chunkMask,
+                        maskStride, positions, lengths, bits, spans, count, positionStride, unionStride, adaptive);
+                else
+                    BuildUnion<<<(count + UnionRows - 1) / UnionRows,512,shared,stream>>>(selected, positions, lengths,
+                    bits, spans, count, item.past + first, ids.dims[1], windowWords, adaptive, positionStride, unionStride);
                 dim3 grid(count, activeHeads);
                 ReorderHeads<false><<<grid,128,0,stream>>>((const BF16*)q.cudaData + size_t(first) * heads * dim,
                     query, nullptr, 0, kvHeads, head);
@@ -433,27 +588,26 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
                 if (adaptive) {
                     // Bound the descriptor to this chunk, including a partial final group.
                     const int causalKeys = item.past + first + count;
-                    const int words = (std::min(keys, DenseWords * 32) + 31) / 32;
-                    BuildTopKMask<<<count,256,words * sizeof(uint32_t),stream>>>(
-                        (const int*)ids.cudaData + size_t(first) * ids.dims[1], (uint32_t *)positions,
-                        keys, ids.dims[1], item.past + first, words, DenseWords, bits + UnionWords, UnionStride, lengths);
-                    Membership mask{reinterpret_cast<const uint32_t *>(positions), DenseWords, item.past + first};
+                    const int stride = scores ? maskStride : (externalBitmap ? words : denseStride);
+                    if (!scores) BuildTopKMask<<<count,256,words * sizeof(uint32_t),stream>>>(selected, logical,
+                        keys, ids.dims[1], item.past + first, words, stride, bits + unionStride - 1, unionStride, lengths);
+                    Membership mask{scores ? chunkMask : logical, stride, item.past + first, spans};
                     status = Attention<Kernel>(query, key, value, out, mask, count, causalKeys, activeHeads, sms, stream,
                                                lengths, TileScheduler::Work::Dense);
                     AssertInFastLLM(status == cudaSuccess, std::string("DSA dense prefill: ") + cudaGetErrorString(status));
                 }
                 ReorderHeads<true><<<grid,128,0,stream>>>(out, (BF16*)item.output->cudaData + size_t(first) * heads * valueDim,
-                    bits, UnionStride, kvHeads, head);
+                    bits, unionStride, kvHeads, head);
             }
         }
         status = cudaGetLastError();
         AssertInFastLLM(status == cudaSuccess, std::string("DSA compact prefill: ") + cudaGetErrorString(status));
         return true;
     }
-    auto *bitmap = scores ? (uint32_t *)ids.cudaData : (uint32_t *)(out + outElems);
+    auto *bitmap = scores ? (uint32_t *)ids.cudaData : reinterpret_cast<uint32_t *>(metadata);
     if (scores) {
         // The loan may hold the scores. Finish selection before staging KV in it.
-        SelectScoreMask<<<rows, 256, 0, stream>>>((const float *)scores->cudaData,
+        SelectScoreMask<256><<<rows, 256, 0, stream>>>((const float *)scores->cudaData,
             bitmap, keys, item.past, ids.dims[1], maskStride);
     }
     GatherKV<<<keys,128,0,stream>>>(FastllmNaiveKV(k), FastllmNaiveKV(v), key, value, kvHeads, k.dims[2]);
@@ -466,7 +620,9 @@ static bool BlackwellAttention(const FastllmNaivePrefillAttentionItem &item,
         dim3 grid(count, kvHeads);
         ReorderHeads<false><<<grid,128,0,stream>>>((const BF16 *)q.cudaData + size_t(first) * heads * dim,
             query, nullptr, 0, kvHeads);
-        status = Attention<Kernel>(query, key, value, out, Membership{mask, maskStride, item.past + first}, count, keys, kvHeads, sms, stream);
+        const bool trim = keys > 2 * int64_t(ids.dims[1]);
+        if (trim) FindTileSpans<<<(count + UnionRows - 1) / UnionRows,128,0,stream>>>(mask, maskStride, count, spans);
+        status = Attention<Kernel>(query, key, value, out, Membership{mask, maskStride, item.past + first, trim ? spans : nullptr}, count, keys, kvHeads, sms, stream);
         AssertInFastLLM(status == cudaSuccess, std::string("DSA Blackwell prefill: ") + cudaGetErrorString(status));
         ReorderHeads<true><<<grid,128,0,stream>>>(out, (BF16 *)item.output->cudaData + size_t(first) * heads * valueDim,
             mask, maskStride, kvHeads);
