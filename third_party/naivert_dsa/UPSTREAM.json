@@ -1,0 +1,38 @@
+{
+  "repository": "https://github.com/NaiveAI-Labs/NaiveRT",
+  "commit": "79d5704ac32ff5fa756e9fb3a76829c236444d86",
+  "files": {
+    "args.cuh": {
+      "source": "attn_dsa/attn_dsa_args.hpp",
+      "original_sha256": "0b90e05f8d6553bffb2df8c60fa290d71a817d96d3fcd70de0b9511a14431868",
+      "installed_sha256": "efd7ac56debb15d6181529bdf6d231591d2a0a8c6396dc80e35ed0b81579b175"
+    },
+    "topk_grid_select.cuh": {
+      "source": "attn_dsa/topk_grid_select.cuh",
+      "original_sha256": "7247de381d1879851f57aeefcdd851dabcae7eaa03c29fc57a429731aed3e04e",
+      "installed_sha256": "318bc86469443f08adad50844cafea2c0927b59bc0bc95da1660591081f6feb3"
+    },
+    "topk_local_select.cuh": {
+      "source": "attn_dsa/topk_local_select.cuh",
+      "original_sha256": "99c3e864dcb6f90a4d9d30edaa0298e0962aa1d296751e64683f4030807fb0bd",
+      "installed_sha256": "749c427136ea9dd351c6b9f9a62dd39758671464e64f5e3aec321549805f98b5"
+    },
+    "index_sweep_tcgen05.cuh": {
+      "source": "attn_dsa/index_sweep_tcgen05.cuh",
+      "original_sha256": "1a6f9386f036b5f454d4c5aacea0c332a7a4cb4101a5d395cd9f93d05c3e4616",
+      "installed_sha256": "5b711e9ffd4714cb6c3f7b96db3276bd6759a8a3cecdcc182951b5ce20fac721"
+    },
+    "body.cuh": {
+      "source": "attn_dsa/attn_dsa_body.cuh",
+      "original_sha256": "af3dc1a1bca3d96071333371169798de4bed310533b31d6ccc020ce862d56933",
+      "installed_sha256": "1e89a50580ab4f0d756c8a2d127063bcbac94aa6e08b1065eea0e105c9e22941"
+    },
+    "projection.cuh": {
+      "source": "attn_common/rows_gemv_mma.cuh",
+      "original_sha256": "a0c94f893d7b62734b21dc5e1358fa77739a1eb40969910d42e9a4075fc6ac2f",
+      "installed_sha256": "30e50d9c603f89ac9f44849b965b7733ed8f7e3d8b2f9f9748af99b97be77d95"
+    }
+  },
+  "changes": "Extracted cooperative TCgen05 Indexer and exact Top-K for SM103. Adapted BF16/FP8 native paged caches, causal lengths, FastLLM quantization/scale order and caller-owned scratch. Partial fusion retains score ordering and native attention arithmetic. Full layer adds native BF16 projections/RoPE/cache append, compact attention, token-ordered bitmap Top-K, seven cache producer warps, conditional first-histogram reuse and TP8 residual output. Removed unused upstream helpers, phase timers and unreachable histogram variants. The internal full-layer launch ABI/control flow is retained to preserve measured SM103 code generation. See README.txt for support, fallback and numerical contracts.",
+  "derived_adapters": {}
+}

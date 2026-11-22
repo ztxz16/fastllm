@@ -1,0 +1,17 @@
+Derived from NaiveRT, https://github.com/NaiveAI-Labs/NaiveRT
+Commit 79d5704ac32ff5fa756e9fb3a76829c236444d86. Licensed under Apache-2.0.
+Adaptations for FastLLM: independent request descriptors, paged KV, existing
+FP8 rounding and scale order, attention sinks, workspace ownership and admission.
+Full-layer projection helpers derive from attn_common/rows_gemv_mma.cuh.
+The full-layer adapter uses FastLLM normalization, RoPE/cache semantics,
+TP mailbox transport and residual rounding. Its compact QK/PV fragments and
+distributed split combine adapt qk_eight_heads, pv_eight_heads and compute_attention
+from attn_dsa/attn_dsa_body.cuh. The original attention path remains available.
+
+The BF16 dense verification adapter in
+src/devices/cuda/moe/fastllm-shared-flex-dense-sm103.cuh adapts normalize_rows,
+project_rows_mma and checkpoint_bf16's SwiGLU/projection geometry from the same
+pinned NaiveRT commit. FastLLM modifications preserve its BF16 materialization
+boundaries, runtime row tails/chunking, existing weight/workspace ownership,
+collective admission and rank-ordered TP transport. The original license and
+attribution apply to these derived fragments as well.

@@ -36,11 +36,14 @@ def audit_elf(path, max_glibc):
 
 def stage_low_latency_licenses(source, package):
     packaged = set()
-    for dep in ('naivert_projection',):
+    for dep in ('naivert_projection', 'naivert_dsa', 'naivert_draft', 'naivert_flex'):
         dest = package / 'licenses' / dep
         dest.mkdir(parents=True, exist_ok=True)
-        for name in ('LICENSE', 'NOTICE', 'UPSTREAM.json'):
-            shutil.copy2(source / 'third_party' / dep / name, dest / name)
+        files = [(name, name) for name in ('LICENSE', 'NOTICE', 'UPSTREAM.json')]
+        if dep == 'naivert_flex':
+            files.append(('THIRD_PARTY_NOTICES.upstream.md', 'THIRD_PARTY_NOTICES.md'))
+        for source_name, name in files:
+            shutil.copy2(source / 'third_party' / dep / source_name, dest / name)
             packaged.add((dest / name).relative_to(package.parent).as_posix())
     return packaged
 

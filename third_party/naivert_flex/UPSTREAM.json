@@ -1,0 +1,117 @@
+{
+  "repository": "https://github.com/NaiveAI-Labs/NaiveRT",
+  "commit": "79d5704ac32ff5fa756e9fb3a76829c236444d86",
+  "source_stashes": [
+    "2abf3e98b1236a8ee3e0aa72066f1305487c5c3e"
+  ],
+  "changes": "Historical FlexMoE row scheduler, mailbox helpers, and already-sigmoid router adaptations; CUTLASS 4.1 MMA type-alias and CUDA 12.9 elect.sync/tcgen05 fence wrapper compatibility; whitespace cleanup.",
+  "headers": {
+    "naivert/entry/expert_down_runtime_domain.hpp": {
+      "original_sha256": "701a41402fc8665f66ec455a5bcd599f2fd6844e654996d68a86de0ceb9574da",
+      "installed_sha256": "701a41402fc8665f66ec455a5bcd599f2fd6844e654996d68a86de0ceb9574da",
+      "adapted": false
+    },
+    "naivert/common/tp8_mailbox.cuh": {
+      "original_sha256": "5ba94a0eec7eae4501a000c5db7aac83b1bd8e2723380a4d0a9d28d51a5224d1",
+      "installed_sha256": "5ba94a0eec7eae4501a000c5db7aac83b1bd8e2723380a4d0a9d28d51a5224d1",
+      "adapted": false
+    },
+    "naivert/common/model_geometry.cuh": {
+      "original_sha256": "d2e1084f7fa5987ab139d749521e0d0248335568a41cde452a226d70e53a0b1a",
+      "installed_sha256": "d2e1084f7fa5987ab139d749521e0d0248335568a41cde452a226d70e53a0b1a",
+      "adapted": false
+    },
+    "naivert/body/expert_down_allreduce/expert_down_allreduce_traits.cuh": {
+      "original_sha256": "f669c4a9cc7b362a1335445c6396228a64055f78f0651cea5730cd50c150d9f4",
+      "installed_sha256": "f669c4a9cc7b362a1335445c6396228a64055f78f0651cea5730cd50c150d9f4",
+      "adapted": false
+    },
+    "naivert/common/role_layout.hpp": {
+      "original_sha256": "dd9a7245eed441d2210b05b2532729cf10cebe2e0491d84c49288bd3ad643e95",
+      "installed_sha256": "dd9a7245eed441d2210b05b2532729cf10cebe2e0491d84c49288bd3ad643e95",
+      "adapted": false
+    },
+    "naivert/common/cuda_compat.hpp": {
+      "original_sha256": "509d8f680a04866d72f78b7c3c736334127d0987fd3453cecc4383f389803b8c",
+      "installed_sha256": "509d8f680a04866d72f78b7c3c736334127d0987fd3453cecc4383f389803b8c",
+      "adapted": false
+    },
+    "naivert/common/mx_scale.cuh": {
+      "original_sha256": "d519575df809174c3f1450365f907ce8938cec075bcbaf0b1590348745832345",
+      "installed_sha256": "d519575df809174c3f1450365f907ce8938cec075bcbaf0b1590348745832345",
+      "adapted": false
+    },
+    "naivert/common/executor_traits.hpp": {
+      "original_sha256": "ad48eeca4aa51d51d5fa5dc244382c9087f14a8f774d6587000d7963f62d6bee",
+      "installed_sha256": "ad48eeca4aa51d51d5fa5dc244382c9087f14a8f774d6587000d7963f62d6bee",
+      "adapted": false
+    },
+    "naivert/body/expert_down_allreduce/expert_down_allreduce_args.hpp": {
+      "original_sha256": "e9dc79bc57fccef54530f8265b1a30d8f1a07ed8a54a7cf9e184bfd630fd995a",
+      "installed_sha256": "e9dc79bc57fccef54530f8265b1a30d8f1a07ed8a54a7cf9e184bfd630fd995a",
+      "adapted": false
+    },
+    "naivert/common/expert_activation.hpp": {
+      "original_sha256": "a58e7279545afa9e76e4810ae3a7de21935e94d470afa331c0d6658fd0812276",
+      "installed_sha256": "a58e7279545afa9e76e4810ae3a7de21935e94d470afa331c0d6658fd0812276",
+      "adapted": false
+    },
+    "naivert/body/expert_select_up_gate_silu/expert_select_up_gate_silu_body.cuh": {
+      "original_sha256": "7f92210b5a323cb596f4538459985bf17f3140ecc1f38cd05c715c1e5e7929eb",
+      "installed_sha256": "a977f4e7a121f38d41d683246557726fd482a91efed42b7fc42060b7a06d01ed",
+      "adapted": true
+    },
+    "naivert/slot_ring/protocol.cuh": {
+      "original_sha256": "7e90292b6483d56cd83b70c4af45b93c22d9dd9a62cc0b320b9bc9b1baed2932",
+      "installed_sha256": "72a13d23e3fb5a4d78f48e85f8b40a3c0d7615d3fc21850168e157548942595d",
+      "adapted": true
+    },
+    "naivert/slot_ring/state.cuh": {
+      "original_sha256": "3d639cdfa4fb032284ba520498ed48b01567ea225120afeb0184ed5dad2f29ea",
+      "installed_sha256": "3d639cdfa4fb032284ba520498ed48b01567ea225120afeb0184ed5dad2f29ea",
+      "adapted": false
+    },
+    "naivert/body/expert_select_up_gate_silu/expert_select_up_gate_silu_traits.cuh": {
+      "original_sha256": "564728bd4c3a17256b3b9bafdd8d95766ba13473a04dffe74383eaafa52943bc",
+      "installed_sha256": "564728bd4c3a17256b3b9bafdd8d95766ba13473a04dffe74383eaafa52943bc",
+      "adapted": false
+    },
+    "naivert/common/block128_activation.cuh": {
+      "original_sha256": "c9e4846a3ba6a2857b9923ff3dcbf2d3be84380820b1212ab35d21cdc583129d",
+      "installed_sha256": "c9e4846a3ba6a2857b9923ff3dcbf2d3be84380820b1212ab35d21cdc583129d",
+      "adapted": false
+    },
+    "naivert/body/expert_select_up_gate_silu/expert_select_up_gate_silu_args.hpp": {
+      "original_sha256": "af43f112fa7c25778aa3b6b461e5295307bb26ec55161c39411414649b4fd134",
+      "installed_sha256": "af43f112fa7c25778aa3b6b461e5295307bb26ec55161c39411414649b4fd134",
+      "adapted": false
+    },
+    "naivert/pdl/grid_dependency.cuh": {
+      "original_sha256": "6e1724bdb8769554bb13956efa7c91cc1c2cc69a1bf50df0d71e7b255d6470dc",
+      "installed_sha256": "6e1724bdb8769554bb13956efa7c91cc1c2cc69a1bf50df0d71e7b255d6470dc",
+      "adapted": false
+    },
+    "naivert/body/expert_select_up_gate_silu_rows8_body.cuh": {
+      "original_sha256": "3ad875e3d284916766d9104b3887dd7d6821557ad51b80dddc21132a622c6026",
+      "installed_sha256": "0d10c59ab17337653179e0ba146a8052123375150d5ff802d86cf10a955cc0d5",
+      "adapted": true
+    },
+    "naivert/common/prepared_mlp_input_layout.hpp": {
+      "original_sha256": "73b7f7fdf2e6e7ae625fdfb795ab451dcc2ce41fb479f49968f0faf8d5b1625b",
+      "installed_sha256": "73b7f7fdf2e6e7ae625fdfb795ab451dcc2ce41fb479f49968f0faf8d5b1625b",
+      "adapted": false
+    },
+    "naivert/body/expert_down_allreduce/expert_down_allreduce_body.cuh": {
+      "original_sha256": "5b2fd54b9bd3f543388e75969169a06e10beb96e511f058d79c01ca5987eb6f7",
+      "installed_sha256": "f4379794b9fb8af774ea76369894a31417db11001c70efb21f9fca49595b94eb",
+      "adapted": true
+    },
+    "naivert/body/expert_down_allreduce/expert_down_w8a8.cuh": {
+      "original_sha256": "3e03bff2914d58405df0b3b0888a24d57c6b79ef6e1cce1e86cdb93caed3017a",
+      "installed_sha256": "d9b781f3a6c33b08e3ad09bb639df69946bcaec066be48d0e6fa086a2d74636d",
+      "adapted": true
+    }
+  },
+  "local_patch": "PATCHES.diff",
+  "scope": "Vendored C++/CUDA header subset only; no upstream Python package, JIT service, or shared library."
+}

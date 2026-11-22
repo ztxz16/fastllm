@@ -4633,9 +4633,9 @@ foreach(duo_asset IN ITEMS live.html avc-player.js presets/default.txt
                    "${CMAKE_BINARY_DIR}/tools/ftllm/duo_assets/${duo_asset}" COPYONLY)
 endforeach()
 
-# Distribute attribution when building only the common projection stage.
+# Distribute attribution for projections and optional low-latency backends.
 if (USE_CUDA AND NOT USE_ROCM)
-    foreach(dep naivert_projection)
+    foreach(dep naivert_projection naivert_dsa naivert_draft naivert_flex)
         file(GLOB attribution_files
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${dep}/LICENSE*"
             "${CMAKE_CURRENT_SOURCE_DIR}/third_party/${dep}/NOTICE*"
@@ -4645,6 +4645,9 @@ if (USE_CUDA AND NOT USE_ROCM)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${attribution_files}
                 ${CMAKE_BINARY_DIR}/tools/ftllm/licenses/${dep})
     endforeach()
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_flex/THIRD_PARTY_NOTICES.upstream.md"
+        "${CMAKE_BINARY_DIR}/tools/ftllm/licenses/naivert_flex/THIRD_PARTY_NOTICES.md" COPYONLY)
 endif()
 
 if (USE_CUDA AND NOT USE_ROCM)
