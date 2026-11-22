@@ -16,6 +16,11 @@ with safe_open(a.target_head,framework='pt',device='cpu') as f:
  h=f.get_tensor('lm_head.weight').bfloat16()
 heads=[h[r*19072:(r+1)*19072].contiguous().to(r) for r in range(8)];del h
 ptrs=(P*8)(*(x.data_ptr() for x in heads));sync()
+# A rejected budget must leave the same state usable for a later full preparation.
+budgeted=lib.FastllmDraftFusedHeadPrepareWithBudget
+budgeted.argtypes=lib.FastllmDraftFusedHeadPrepare.argtypes+[C.c_double]
+budgeted.restype=C.c_bool
+assert not budgeted(state,ptrs,w1.data_ptr(),w2.data_ptr(),cw.data_ptr(),cb.data_ptr(),0,1e-6)
 start=time.monotonic()
 assert lib.FastllmDraftFusedHeadPrepare(state,ptrs,w1.data_ptr(),w2.data_ptr(),cw.data_ptr(),cb.data_ptr(),0),lib.FastllmDraftFusedError()
 print('head prepared seconds',time.monotonic()-start,flush=True)

@@ -3709,6 +3709,9 @@ bool NaiveN05FlashModel::PrepareFusedDraftProposal(
         // Packing and the immutable bias table are startup work. Requests only
         // reuse this domain; unsupported geometry or memory keeps the old path.
         if (!preparingGraphs) return false;
+        // Give the configured KV capacity first claim on device memory. The
+        // early workspace warmup will retry after the physical pool exists.
+        if (!GetKVCacheInCPU() && tpKVPool.empty() && !sparseKv) return false;
         auto &head = weight["lm_head.weight"];
         auto &w1 = weight["dspark.markov_head.markov_w1.weight"], &w2 = weight["dspark.markov_head.markov_w2.weight"];
         auto &cw = weight["dspark.confidence_head.proj.weight"], &cb = weight["dspark.confidence_head.proj.bias"];
@@ -3731,8 +3734,8 @@ bool NaiveN05FlashModel::PrepareFusedDraftProposal(
         }
         if (supported) {
             for (Data *w : {&w1,&w2,&cw,&cb}) w->ToDevice(DataDevice::CUDA,std::vector<int>{owner});
-            supported = FastllmDraftFusedHeadPrepare(draftBatchStorage->fused,heads,w1.cudaData,w2.cudaData,
-                (const float*)cw.cudaData,(const float*)cb.cudaData,owner);
+            supported = FastllmDraftFusedHeadPrepareWithBudget(draftBatchStorage->fused,heads,w1.cudaData,w2.cudaData,
+                (const float*)cw.cudaData,(const float*)cb.cudaData,owner,GetGpuMemRatio());
         }
         draftBatchStorage->fusedHeadReady = supported;
         draftBatchStorage->fusedHeadUnavailable = !supported;

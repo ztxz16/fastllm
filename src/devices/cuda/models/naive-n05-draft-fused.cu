@@ -1873,7 +1873,12 @@ extern "C" bool FastllmDraftFusedVerificationInput(const int64_t *tokens, void *
 }
 extern "C" bool FastllmDraftFusedHeadPrepare(void *opaque,const void *const *heads,
         const void *w1,const void *w2,const float *confidenceWeight,const float *confidenceBias,int owner) {
-    if(!opaque || !heads || !w1 || !w2) return false;
+    return FastllmDraftFusedHeadPrepareWithBudget(opaque,heads,w1,w2,confidenceWeight,confidenceBias,owner,1.0);
+}
+extern "C" bool FastllmDraftFusedHeadPrepareWithBudget(void *opaque,const void *const *heads,
+        const void *w1,const void *w2,const float *confidenceWeight,const float *confidenceBias,
+        int owner,double gpuMemRatio) {
+    if(!opaque || !heads || !w1 || !w2 || !(gpuMemRatio>0.0 && gpuMemRatio<=1.0)) return false;
     auto &s=*static_cast<State*>(opaque);
     if(s.rows!=7 || owner!=s.ranks[0].device) return false;
     if(s.headReady) return true;
@@ -1885,7 +1890,12 @@ extern "C" bool FastllmDraftFusedHeadPrepare(void *opaque,const void *const *hea
             if(!heads[rank]) return false;
             auto &r=s.ranks[rank]; Check(cudaSetDevice(r.device));
             size_t free=0,total=0;Check(cudaMemGetInfo(&free,&total));
-            if(free<tableBytes+(size_t(1)<<30)) return false;
+            // The extra GiB covers the packed head, staging and bounded lane scratch.
+            const size_t reserve=static_cast<size_t>(total*(1.0-gpuMemRatio));
+            if(free<=reserve || free-reserve<tableBytes+(size_t(1)<<30)) {
+                Check(cudaSetDevice(owner));
+                return false;
+            }
             Check(cudaFuncSetAttribute(FusedDraftHeadProposal,cudaFuncAttributeMaxDynamicSharedMemorySize,HeadSmem));
             int active=0,sms=0;
             Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,FusedDraftHeadProposal,kHeadThreads,HeadSmem));

@@ -67,6 +67,10 @@ bool FastllmDraftFusedContextSharedUploadAccepted(void *state,const FastllmDraft
 bool FastllmDraftFusedContextSharedRun(void *state,int rank,int count,void *stream);
 bool FastllmDraftFusedHeadPrepare(void *state,const void *const *heads,const void *w1,const void *w2,
     const float *confidenceWeight,const float *confidenceBias,int owner);
+// Called after KV allocation. All ranks must fit the head while retaining
+// the configured fraction of total device memory for runtime use.
+bool FastllmDraftFusedHeadPrepareWithBudget(void *state,const void *const *heads,const void *w1,const void *w2,
+    const float *confidenceWeight,const float *confidenceBias,int owner,double gpuMemRatio);
 bool FastllmDraftFusedHeadRun(void *state,int rank,int request,const void *hidden,
     int anchor,uint64_t seed,float temperature,int steps,void *stream);
 const int64_t *FastllmDraftFusedHeadTokens(void *state, int rank, int request);
