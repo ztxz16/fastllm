@@ -157,7 +157,7 @@ function renderProfilePresentation() {
   elements.launchForm.classList.toggle("video-profile", media);
   document.getElementById("video-backend-fields").classList.toggle("hidden", !media);
   for (const [selector, visible] of [["[data-video-only]", video], ["[data-h3-only]", video || image],
-      ["[data-nomas-only]", nomas], ["[data-duo-only]", duo]]) {
+      ["[data-world-weights]", nomas || config.backend === "lingbot_world"], ["[data-nomas-only]", nomas], ["[data-duo-only]", duo]]) {
     for (const field of elements.launchForm.querySelectorAll(selector)) field.classList.toggle("hidden", !visible);
   }
   elements.serverHostField.classList.toggle("hidden", interactive || isWebui);

@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from .model_service import has_pika_adapter, identify_model
+from .world_residency import WEIGHT_RESIDENCY_MODES
 
 
 PACKAGE = Path(__file__).resolve().parent
@@ -377,6 +378,8 @@ class InteractiveBackend:
             add("端口必须在 1-65535 之间。", "port")
         if config.api_key.strip() and not self.accepts_api_key:
             add("交互服务通过启动器鉴权，请清空服务 API Key。", "api_key")
+        if self.id in ("hy_nomas", "lingbot_world") and config.world_weight_residency not in WEIGHT_RESIDENCY_MODES:
+            add("请选择自动、开启或关闭权重常驻。", "world_weight_residency")
         self.validate_runtime(config, add)
         return errors
 
@@ -430,8 +433,9 @@ class NomasBackend(InteractiveBackend):
         devices = logical_devices(config)
         argv = [sys.executable, str(PACKAGE / "nomas_server.py"), "--library", str(self.library()),
                 "--model", os.path.expanduser(config.model.strip()), "--text-encoder", str(self.encoder(config)),
-                "--output", self.output(config), "--precision", "bf16", "--host", config.host,
-                "--port", config.port.strip(), "--devices" if len(devices) > 1 else "--device", ",".join(devices)]
+                "--output", self.output(config), "--precision", "bf16", "--host", config.host, "--port", config.port.strip(),
+                "--devices" if len(devices) > 1 else "--device", ",".join(devices),
+                "--weight-residency", config.world_weight_residency]
         if config.nomas_pe_url.strip():
             argv.extend(["--prompt-enhancer-url", config.nomas_pe_url.strip(),
                          "--prompt-enhancer-model", config.nomas_pe_model.strip() or "Nomas-PE",
@@ -535,7 +539,8 @@ class LingBotBackend(InteractiveBackend):
     def argv(self, config):
         argv = [sys.executable, str(media_assets("lingbot_world") / "server.py"), "--model", config.model,
                 "--library", str(self.library()), "--device", "0", "--host", config.host,
-                "--port", config.port, "--output", self.output(config)]
+                "--port", config.port, "--output", self.output(config),
+                "--weight-residency", config.world_weight_residency]
         if config.api_key.strip():
             argv.extend(["--api-key", config.api_key.strip()])
         return argv

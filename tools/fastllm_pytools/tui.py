@@ -67,6 +67,7 @@ class DeployConfig:
     name: str = ""
     visible_gpus: str = ""
     base_model: str = ""
+    world_weight_residency: str = "auto"
     nomas_text_encoder: str = ""
     nomas_pe_url: str = ""
     nomas_pe_model: str = ""

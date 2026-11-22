@@ -30,9 +30,11 @@ import uvicorn
 # Also support launching this module directly from a source checkout.
 if __package__:
     from .world_media import encode_clip, find_video_encoder, png_rgb
+    from .world_residency import WEIGHT_RESIDENCY_MODES, WeightResidency
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from world_media import encode_clip, find_video_encoder, png_rgb
+    from world_residency import WEIGHT_RESIDENCY_MODES, WeightResidency
 
 
 class Message(BaseModel):
@@ -128,7 +130,7 @@ class WorldGenerationRequest(WorldRequest):
 class NativeBackend:
     callback_type = C.CFUNCTYPE(C.c_int, C.c_int, C.c_int, C.c_int, C.c_void_p)
 
-    def __init__(self, library, model, text_encoder, device=0, devices=None):
+    def __init__(self, library, model, text_encoder, device=0, devices=None, weight_residency="auto"):
         self.lib = C.CDLL(str(Path(library).resolve()))
         self.lib.fastllm_nomas_error.restype = C.c_char_p
         self.lib.fastllm_nomas_pipeline_create.argtypes = [C.c_char_p, C.c_char_p, C.c_int]
@@ -158,7 +160,16 @@ class NativeBackend:
         if not self.handle:
             raise RuntimeError(self.lib.fastllm_nomas_error().decode())
 
+        try:
+            self.residency = WeightResidency(self.lib, 'fastllm_nomas', self.handle, weight_residency)
+        except Exception:
+            self.close()
+            raise
+
     def generate(self, request, progress):
+        return self.residency.run(self._generate, request, progress)
+
+    def _generate(self, request, progress):
         size = request.width * request.height * request.num_frames * 3
         rgb = (C.c_uint8 * size)()
         callback_error = []
@@ -527,6 +538,7 @@ def create_app(backend, output, precision="bf16", enhancer=None):
     def health():
         return {"status": "ok", "backend": "native_cpp_cuda", "precision": precision,
                 "playback_formats": ["png_frames", "mp4"] if jobs.ffmpeg else ["png_frames"],
+                "weight_residency": backend.residency.status() if hasattr(backend, "residency") else None,
                 "precision_status": "default" if precision == "bf16" else "reference",
                 "prompt_enhancer": {"enabled": enhancer is not None, "model": enhancer.model if enhancer else None},
                 "torch_loaded": "torch" in sys.modules}
@@ -637,6 +649,7 @@ if __name__ == "__main__":
     devices = parser.add_mutually_exclusive_group()
     devices.add_argument("--device", type=int, default=0)
     devices.add_argument("--devices", help="CUDA-visible devices for parallel DiT and PixelUMM, e.g. 0,1")
+    parser.add_argument("--weight-residency", choices=WEIGHT_RESIDENCY_MODES, default="auto")
     parser.add_argument("--precision", choices=["fp32", "bf16"], default="bf16")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8007)
@@ -653,5 +666,5 @@ if __name__ == "__main__":
         enhancer = PromptEnhancer(args.prompt_enhancer_url, args.prompt_enhancer_model,
                                   args.prompt_enhancer_prompts, args.prompt_enhancer_timeout)
     os.environ["FASTLLM_NOMAS_PRECISION"] = args.precision
-    uvicorn.run(create_app(NativeBackend(args.library, args.model, args.text_encoder, args.device, args.devices), args.output, args.precision, enhancer),
+    uvicorn.run(create_app(NativeBackend(args.library, args.model, args.text_encoder, args.device, args.devices, args.weight_residency), args.output, args.precision, enhancer),
                 host=args.host, port=args.port, workers=1)

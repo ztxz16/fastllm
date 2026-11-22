@@ -210,6 +210,15 @@ void *fastllm_nomas_pipeline_create_parallel(const char *model,const char *text,
         return new PipelineHandle(model,text,devices);
     } catch(const std::exception &e) {lastError=e.what();return nullptr;}
 }
+int fastllm_nomas_pipeline_weight_residency(void *handle,int mode) {
+    try {
+        lastError.clear();
+        if(!handle) throw std::invalid_argument("null pipeline");
+        auto &ctx=*static_cast<PipelineHandle *>(handle);
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        return ctx.pipeline.configureWeightResidency(mode)?1:0;
+    } catch(const std::exception &e) { lastError=e.what(); return -1; }
+}
 void fastllm_nomas_pipeline_destroy(void *handle) { delete static_cast<PipelineHandle *>(handle); }
 int fastllm_nomas_generate(void *handle,const char *prompt,int width,int height,int frames,uint64_t seed,int steps,
                           uint8_t *rgb,size_t capacity,fastllm::nomas::Progress progress,void *user) {

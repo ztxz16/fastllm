@@ -99,6 +99,14 @@ Pipeline::Pipeline(const std::string &directory,int device,bool bf16Decode)
     tokenizer_(directory+"/google/umt5-xxl"),text_(rt_,directory+"/native/t5.safetensors"),
     dit_(rt_,directory+"/transformers"),vae_(vaeRt_,directory+"/native/vae.safetensors"),
     decoder_(decoderRt_,directory+"/native/vae.safetensors"),schedule_(fastSchedule()) {}
+bool Pipeline::configureWeightResidency(int mode) {
+    if(mode < -1 || mode > 1) throw std::invalid_argument("invalid weight residency mode");
+    // Allow room for the T5, DiT and VAE weights, world history and encoder workspace.
+    const bool enabled=mode==1 || (mode==-1 && rt_.availableMemory()>=(size_t(32)<<30));
+    if(keepWeights_ && !enabled) { text_.unload(); offloadState(); dit_.unload(); }
+    keepWeights_=enabled;
+    return enabled;
+}
 void Pipeline::offloadState() {
     rt_.activate();
     nomas::TensorPool::Scope allocations(tensorPool_);
@@ -122,16 +130,20 @@ void Pipeline::reserveWorkingMemory(size_t bytes) {
         return free+tensorPool_.reusableBytes();
     };
     if(available()>=bytes) return;
+    if(keepWeights_) {
+        text_.unload();
+        if(available()>=bytes) return;
+    }
     offloadState();
     if(available()<bytes) dit_.unload();
 }
 Tensor Pipeline::encodePrompt(const std::string &prompt) {
     if(prompt.size()>16384) throw std::invalid_argument("LingBot prompt exceeds 16384 bytes");
-    offloadState();
-    dit_.unload();
+    if(!keepWeights_) { offloadState(); dit_.unload(); }
     try {
-        auto features=text_.encode(tokenizer_.encode(prompt));
-        text_.unload(); return features;
+        auto features=text_.encode(tokenizer_.encode(prompt),keepWeights_);
+        if(!keepWeights_) text_.unload();
+        return features;
     } catch(...) { text_.unload(); throw; }
 }
 std::unique_ptr<WorldState> Pipeline::create(const std::string &prompt,const std::vector<float> &pixels,

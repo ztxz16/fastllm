@@ -23,6 +23,12 @@ ParallelModel::ParallelModel(const std::string &directory,const ParallelOptions 
 ParallelModel::~ParallelModel() {
     try {group_.run([&](int rank) {ranks_[rank].reset();});} catch(...) {}
 }
+std::vector<size_t> ParallelModel::availableMemory() {
+    std::vector<size_t> available(ranks_.size());
+    group_.run([&](int rank) { available[rank]=ranks_[rank]->rt.availableMemory(); });
+    return available;
+}
+
 void ParallelModel::prepareCamera(const Tensor &poses,int spatial) {
     group_.run([&](int rank) {
         auto &r=*ranks_[rank];

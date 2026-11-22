@@ -52,9 +52,11 @@ cmake --build build-nomas --target fastllm_nomas -j2
 CUDA_ARCH=native BUILD_JOBS=2 bash tools/hy_nomas/build.sh build-nomas
 ```
 
-`BUILD_HY_NOMAS` 默认关闭，构建此目标不会改变其他模型的推理入口。目前 HY-Nomas 使用下方独立服务，不通过 `ftllm server` 启动。
+`BUILD_HY_NOMAS` 默认关闭，构建此目标不会改变其他模型的推理入口。`ftllm server` 会识别 HY-Nomas 并启动原生服务。
 
 ## 4. 启动 HTTP 服务
+
+启动器识别模型后，可在启动配置中设置「权重常驻显存」，对应服务参数 `--weight-residency auto|on|off`。默认 `auto` 在显存充足时保留权重，减少连续建场景或修改提示词时的重复加载。单卡 BF16 的启动门槛为 56 GiB。多卡按每张卡的空闲显存判断，主卡另计文本编码器。自动模式遇到 GPU 内存分配失败时会关闭常驻并重试一次。
 
 将模型和输出路径替换为实际目录：
 

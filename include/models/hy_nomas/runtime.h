@@ -366,6 +366,7 @@ public:
     Pipeline(const std::string &modelDirectory, const std::string &textDirectory, int device);
     Pipeline(const std::string &, const std::string &, const ParallelOptions &);
     ~Pipeline();
+    bool configureWeightResidency(int mode);
     std::vector<uint8_t> generate(const std::string &prompt, int width, int height,
                                   int frames, uint64_t seed, int steps,
                                   Progress progress = nullptr, void *user = nullptr);
@@ -384,6 +385,7 @@ public:
 private:
     std::vector<uint8_t> advance(WorldState &, int action, Progress, void *, const std::string *,
                                  int frames, std::vector<float> latent);
+    bool keepWeights_ = false;
     std::string pixelCheckpoint_;
     Tensor encodeWorldPrompt(const std::string &prompt);
     void unloadModels();
@@ -428,6 +430,8 @@ void *fastllm_nomas_pipeline_create(const char *modelDirectory, const char *text
 // Sequence-parallel DiT and tensor-parallel PixelUMM, one worker per device.
 void *fastllm_nomas_pipeline_create_parallel(const char *modelDirectory, const char *textDirectory,
                                             const char *devices);
+// Configure on startup: -1 auto, 0 off, 1 on. Returns effective mode or -1 on error.
+int fastllm_nomas_pipeline_weight_residency(void *handle,int mode);
 void fastllm_nomas_pipeline_destroy(void *handle);
 int fastllm_nomas_generate(void *handle, const char *prompt, int width, int height,
                           int frames, uint64_t seed, int steps, uint8_t *rgb,

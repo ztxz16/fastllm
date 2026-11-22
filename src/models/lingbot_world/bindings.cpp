@@ -59,6 +59,15 @@ void *fastllm_lingbot_pipeline_create_ex(const char *path,int device,int bf16Dec
         return new PipelineHandle(path,device,bf16Decode!=0);
     } catch(const std::exception &e) { error=e.what(); return nullptr; }
 }
+int fastllm_lingbot_pipeline_weight_residency(void *handle,int mode) {
+    try {
+        error.clear();
+        if(!handle) throw std::invalid_argument("null pipeline");
+        auto &ctx=*static_cast<PipelineHandle *>(handle);
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        return ctx.model.configureWeightResidency(mode)?1:0;
+    } catch(const std::exception &e) { error=e.what(); return -1; }
+}
 void fastllm_lingbot_pipeline_destroy(void *p) { delete static_cast<PipelineHandle *>(p); }
 void *fastllm_lingbot_world_create_png(void *p,const char *prompt,const uint8_t *png,size_t length,
     int h,int w,uint64_t seed,const float *intrinsics,LingBotProgress progress,void *user) {

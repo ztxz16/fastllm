@@ -25,6 +25,24 @@ Pipeline::Pipeline(const std::string &model,const std::string &text,const Parall
         parallel_=std::make_unique<ParallelModel>(model,options,rt_.dtype());
 }
 Pipeline::~Pipeline()=default;
+bool Pipeline::configureWeightResidency(int mode) {
+    if(mode < -1 || mode > 1) throw std::invalid_argument("invalid weight residency mode");
+    bool enabled=mode==1;
+    if(mode==-1) {
+        const auto free=parallel_?parallel_->availableMemory():std::vector<size_t>{rt_.availableMemory()};
+        constexpr size_t GiB=size_t(1)<<30;
+        const size_t scale=rt_.dtype()==DType::FP32?2:1;
+        // BF16: ~30 GiB of sharded DiT/decoder weights, ~16 GiB of text
+        // weights on rank zero, plus working memory on every participating GPU.
+        const size_t shared=30*GiB*scale/free.size()+10*GiB;
+        enabled=true;
+        for(size_t rank=0;rank<free.size();++rank)
+            if(free[rank]<shared+(rank==0?16*GiB*scale:0)) enabled=false;
+    }
+    if(keepWeights_ && !enabled) { text_.unload(); unloadModels(); }
+    keepWeights_=enabled;
+    return enabled;
+}
 void Pipeline::unloadModels() {
     dit_.unload(); decoder_.unload();
     if(parallel_) parallel_->unload();
@@ -42,14 +60,13 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
     };
     NOMAS_TRACE_SCOPE(rt_);
     try {
-        // World sessions keep both networks resident between actions. Release
-        // those weights before encoding an independent video prompt as well.
-        unloadModels();
+        if(!keepWeights_) unloadModels();
         update(1,0,1);
         int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
         auto features=text_.encode(ids).rowSlice(crop,int(ids.size())-crop);
         NOMAS_TRACE("features",features);
-        text_.unload(); update(1,1,1);
+        if(!keepWeights_) text_.unload();
+        update(1,1,1);
         int t=frames/4,h=height/32,w=width/32,n=t*h*w;
         std::mt19937_64 generator(seed); std::normal_distribution<float> normal;
         std::vector<float> latent(size_t(n)*32);
@@ -67,14 +84,16 @@ std::vector<uint8_t> Pipeline::generate(const std::string &prompt,int width,int 
             for(size_t i=0;i<latent.size();++i) latent[i]+=velocity[i]*dt;
             NOMAS_TRACE("latent_"+std::to_string(step+1),latent);
         }
-        unloadModels(); update(2,steps,steps); update(3,0,1);
+        if(!keepWeights_) unloadModels();
+        update(2,steps,steps); update(3,0,1);
         auto noise=rt_.pixelNoise(seed,0,t,height,width);
         NOMAS_TRACE("pixel_noise",noise);
         auto input=rt_.upload(latent.data(),n,32);
         auto pixels=parallel_?parallel_->decode(input,noise,t,h,w):decoder_.forward(input,noise,t,h,w);
         NOMAS_TRACE("pixels",pixels);
         auto rgb=rt_.downloadPixelRGB(pixels,width,height,0,frames);
-        unloadModels(); update(3,1,1);
+        if(!keepWeights_) unloadModels();
+        update(3,1,1);
         update(4,1,1); return rgb;
     } catch(...) {
         text_.unload(); unloadModels(); throw;
@@ -159,7 +178,7 @@ Tensor Pipeline::encodeWorldPrompt(const std::string &prompt) {
     int crop=0; auto ids=tokenizer_.videoPrompt(prompt,crop);
     // Reuse the native encoder. Keep world KV/decoder history while switching
     // resident weights so that a live edit fits the same GPU memory budget.
-    unloadModels();
+    if(!keepWeights_) unloadModels();
     try {
         auto features=text_.encode(ids).rowSlice(crop,int(ids.size())-crop);
         // Encode the official camera-minimal continuation while Qwen is already
@@ -171,7 +190,7 @@ Tensor Pipeline::encodeWorldPrompt(const std::string &prompt) {
             cameraContinuationFeatures_=text_.encode(continuationIds).rowSlice(
                 continuationCrop,int(continuationIds.size())-continuationCrop);
         }
-        text_.unload();
+        if(!keepWeights_) text_.unload();
         rt_.synchronize(); // The returned world may next be used by another thread.
         return features;
     } catch(...) { text_.unload(); throw; }
@@ -181,7 +200,7 @@ std::vector<uint8_t> Pipeline::initializeReference(WorldState &world,const uint8
                                                    Progress progress,void *user) {
     if(world.frameOffset!=0) throw std::invalid_argument("an image can only initialize a fresh world");
     rt_.activate();
-    unloadModels();
+    if(!keepWeights_) unloadModels();
     if(progress && progress(1,0,1,user)) throw std::runtime_error("generation cancelled");
     auto latent=encodeReferenceImage(rt_.device(),pixelCheckpoint_,world.width,world.height,rgb,bytes);
     return advance(world,9,progress,user,nullptr,120,std::move(latent));

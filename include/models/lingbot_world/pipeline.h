@@ -54,6 +54,7 @@ public:
     // Release saved GPU state losslessly; all worlds and rollback snapshots
     // remain usable. Useful when yielding device memory to another model.
     void offloadState();
+    bool configureWeightResidency(int mode);
 private:
     Tensor encodePrompt(const std::string &);
     void reserveWorkingMemory(size_t bytes);
@@ -61,6 +62,7 @@ private:
     // lifetime of deleted worlds or snapshots from completed transactions.
     std::vector<std::weak_ptr<const HostDiTState>> cacheStates_;
     std::vector<std::weak_ptr<const HostVAEState>> vaeStates_;
+    bool keepWeights_ = false;
     nomas::TensorPool tensorPool_;
     Runtime rt_;
     VAERuntime vaeRt_, decoderRt_;
@@ -77,6 +79,8 @@ extern "C" {
 using LingBotProgress = int (*)(const char *stage,int current,int total,void *user);
 void *fastllm_lingbot_pipeline_create(const char *directory,int device);
 void *fastllm_lingbot_pipeline_create_ex(const char *directory,int device,int bf16Decode);
+// Configure on startup: -1 auto, 0 off, 1 on. Returns effective mode or -1 on error.
+int fastllm_lingbot_pipeline_weight_residency(void *handle,int mode);
 void fastllm_lingbot_pipeline_destroy(void *);
 void *fastllm_lingbot_world_create_png(void *,const char *prompt,const uint8_t *png,size_t length,
     int height,int width,uint64_t seed,const float *intrinsics,LingBotProgress,void *user);

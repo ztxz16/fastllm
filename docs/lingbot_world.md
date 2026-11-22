@@ -49,6 +49,8 @@ cmake --build build-lingbot --target fastllm_lingbot lingbot_world_generate -j
 
 ## 启动 HTTP 与 Demo
 
+启动器识别模型后，可在启动配置中设置「权重常驻显存」，对应服务参数 `--weight-residency auto|on|off`。默认 `auto` 在显存充足时保留权重，减少连续建场景或修改提示词时的重复加载。当前 1.3B 模型的启动门槛为 32 GiB 空闲显存。自动模式遇到 GPU 内存分配失败时会关闭常驻并重试一次。
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 tools/lingbot_world/server.py \
   --model "$MODEL_DIR" \

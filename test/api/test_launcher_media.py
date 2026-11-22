@@ -235,6 +235,53 @@ class ServiceTest(unittest.TestCase):
                 with self.subTest(flags=flags), self.assertRaises(SystemExit), patch("sys.stderr"):
                     main(base + flags)
 
+    def test_world_weight_residency_profile(self):
+        from fastllm_pytools.service_backends import BACKENDS
+        for family in ('hy_nomas', 'lingbot_world'):
+            config = config_from_dict(self.profile(family))
+            self.assertEqual(config.world_weight_residency, 'auto')
+            for mode in ('auto', 'on', 'off'):
+                config.world_weight_residency = mode
+                for argv in (build_fastllm_argv(config), BACKENDS[family].argv(config)):
+                    self.assertEqual(argv[argv.index('--weight-residency') + 1], mode)
+            config.world_weight_residency = 'invalid'
+            self.assertTrue(any('权重常驻' in error for error in validate_config(config)))
+        self.assertNotIn('--weight-residency', build_fastllm_argv(config_from_dict(self.profile('duo'))))
+
+    def test_weight_residency_fallback(self):
+        from unittest.mock import Mock
+        from fastllm_pytools.world_residency import WeightResidency
+        lib = Mock()
+        lib.model_pipeline_weight_residency.side_effect = lambda handle, value: int(value != 0)
+        for mode in ('auto', 'on', 'off'):
+            residency = WeightResidency(lib, 'model', 1, mode)
+            generate = Mock(side_effect=[RuntimeError('CUDA out of memory'), b'frame'])
+            if mode == 'auto':
+                self.assertEqual(residency.run(generate), b'frame')
+                self.assertEqual(residency.status(), {'requested': 'auto', 'effective': 'off'})
+            else:
+                with self.assertRaisesRegex(RuntimeError, 'out of memory'):
+                    residency.run(generate)
+                generate.assert_called_once()
+        for native_error in ('out of memory', 'HY-Nomas cuBLAS error 3', 'LingBot cuBLAS error: 3'):
+            with self.subTest(native_error=native_error):
+                residency = WeightResidency(lib, 'model', 1, 'auto')
+                generate = Mock(side_effect=[RuntimeError(native_error), b'frame'])
+                self.assertEqual(residency.run(generate), b'frame')
+                self.assertFalse(residency.enabled)
+        for native_error in ('host out of memory', 'LingBot cuBLAS error: 13'):
+            with self.subTest(native_error=native_error):
+                residency = WeightResidency(lib, 'model', 1, 'auto')
+                generate = Mock(side_effect=RuntimeError(native_error))
+                with self.assertRaises(RuntimeError):
+                    residency.run(generate)
+                generate.assert_called_once()
+                self.assertTrue(residency.enabled)
+        lib = SimpleNamespace()
+        self.assertFalse(WeightResidency(lib, 'model', 1, 'auto').enabled)
+        with self.assertRaisesRegex(RuntimeError, 'updated native library'):
+            WeightResidency(lib, 'model', 1, 'on')
+
     def test_nomas_prompt_enhancement_profile(self):
         from fastllm_pytools.service_backends import BACKENDS
         (self.directory / "tokenizer.json").touch()
@@ -275,7 +322,7 @@ class ServiceTest(unittest.TestCase):
                     config.visible_gpus = ""
                     self.assertEqual(BACKENDS[backend].argv(config)[-1], "single")
                 else:
-                    self.assertEqual(argv[-2:], ["--devices", "0,1,2,3"])
+                    self.assertEqual(argv[argv.index("--devices") + 1], "0,1,2,3")
                     self.assertIn("bf16", argv)
             def stub(cfg):
                 return [str(self.worker), "--host", "127.0.0.1", "--port", cfg.port, "--kind", backend]

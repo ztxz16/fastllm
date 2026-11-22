@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 _tools = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_tools / 'fastllm_pytools' if (_tools / 'fastllm_pytools').is_dir() else _tools))
 from world_media import encode_clip, find_video_encoder, png_rgb
+from world_residency import WEIGHT_RESIDENCY_MODES, WeightResidency
 
 MODEL = 'lingbot-world-2.0-1.3b'
 ACTIONS = {'stay', 'forward', 'backward', 'left', 'right', 'up', 'down',
@@ -27,7 +28,7 @@ CALLBACK = C.CFUNCTYPE(C.c_int, C.c_char_p, C.c_int, C.c_int, C.c_void_p)
 
 
 class Native:
-    def __init__(self, library, directory, device, decode_precision="bf16"):
+    def __init__(self, library, directory, device, decode_precision="bf16", weight_residency="auto"):
         self.lib = lib = C.CDLL(str(Path(library).resolve()))
         lib.fastllm_lingbot_error.restype = C.c_char_p
         lib.fastllm_lingbot_pipeline_create_ex.argtypes = [C.c_char_p, C.c_int, C.c_int]
@@ -53,10 +54,19 @@ class Native:
         if not self.handle:
             self.fail()
 
+        try:
+            self.residency = WeightResidency(lib, 'fastllm_lingbot', self.handle, weight_residency)
+        except Exception:
+            lib.fastllm_lingbot_pipeline_destroy(self.handle)
+            raise
+
     def fail(self):
         raise RuntimeError(self.lib.fastllm_lingbot_error().decode('utf-8', 'replace'))
 
     def create(self, options, progress):
+        return self.residency.run(self._create, options, progress)
+
+    def _create(self, options, progress):
         k = (C.c_float*4)(*options['intrinsics']) if options.get('intrinsics') else None
         handle = self.lib.fastllm_lingbot_world_create_png(self.handle, options['prompt'].encode(),
             options['png'], len(options['png']), options['height'], options['width'], options['seed'], k, progress, None)
@@ -65,6 +75,9 @@ class Native:
         return handle
 
     def step(self, world, options, progress):
+        return self.residency.run(self._step, world, options, progress)
+
+    def _step(self, world, options, progress):
         prompt = options.get('prompt')
         raw = options.get('response_format') == 'mp4' and self.raw_step
         step = self.raw_step if raw else self.lib.fastllm_lingbot_world_step
@@ -186,6 +199,7 @@ class Service:
         self.lock = threading.RLock()
         self.queue = queue.Queue(8)
         self.worlds, self.jobs = {}, {}
+        self.residency = None
         self.ffmpeg = None
         self.status, self.failure = 'loading', None
         self.output = Path(args.output).resolve()
@@ -228,7 +242,9 @@ class Service:
 
     def run(self):
         try:
-            native = Native(self.args.library, self.args.model, self.args.device, self.args.vae_decode_precision)
+            native = Native(self.args.library, self.args.model, self.args.device, self.args.vae_decode_precision,
+                            getattr(self.args, "weight_residency", "auto"))
+            self.residency = getattr(native, "residency", None)
             if getattr(native, 'raw_step', None):
                 self.ffmpeg = find_video_encoder()
             with self.lock:
@@ -374,6 +390,7 @@ def handler(service, demo):
             if self.command == 'GET':
                 if path == '/health':
                     return self.send(200, dict(status=service.status, error=service.failure, model=MODEL,
+                        weight_residency=service.residency.status() if service.residency else None,
                         playback_formats=['png_frames', 'mp4'] if service.ffmpeg else ['png_frames']))
                 if path == '/v1/models':
                     return self.send(200, dict(object='list', data=[dict(id=MODEL, object='model', owned_by='fastllm')]))
@@ -438,6 +455,7 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=18009)
     parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--weight-residency', choices=WEIGHT_RESIDENCY_MODES, default='auto')
     parser.add_argument('--vae-decode-precision', choices=['bf16', 'fp32'], default='bf16')
     parser.add_argument('--output', default='lingbot-http-output')
     parser.add_argument('--api-key', default='')

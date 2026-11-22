@@ -2,6 +2,10 @@
   "locale": "en-US",
   "name": "English",
   "static": {
+    "权重常驻显存": "Keep weights in GPU memory",
+    "自动（按空闲显存）": "Auto (available GPU memory)",
+    "始终开启": "Always on",
+    "始终关闭": "Always off",
     "多卡并行": "Multi-GPU parallelism",
     "权重精度自动识别。多卡量化模型默认使用 SP；显存较小时可选择 TP。INT8、GGUF 的 TP 支持 2、4 卡，8 卡请选择 SP。": "Weight precision is detected automatically. Quantized multi-GPU models default to SP. Choose TP for smaller GPUs. INT8 and GGUF support TP on two or four GPUs. Use SP on eight GPUs.",
     "场景交互（HY-Nomas）": "Scene interaction (HY-Nomas)",

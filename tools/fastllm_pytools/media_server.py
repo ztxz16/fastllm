@@ -9,6 +9,7 @@ OPTIONS = {
     "video_gpu_memory_limit": ("--gpu-memory-limit", H3),
     "video_host_memory_limit": ("--host-memory-limit", H3),
     "video_parallel_mode": ("--parallel-mode", H3),
+    "world_weight_residency": ("--weight-residency", ("hy_nomas", "lingbot_world")),
     "nomas_text_encoder": ("--text-encoder", ("hy_nomas",)),
     "nomas_pe_url": ("--prompt-enhancer-url", ("hy_nomas",)),
     "nomas_pe_model": ("--prompt-enhancer-model", ("hy_nomas",)),

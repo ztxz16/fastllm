@@ -72,6 +72,13 @@
                   <div id="video-backend-fields" class="form-grid two-columns hidden">
                     <label class="field span-2" data-video-only><span>MiniMax H3 基座目录（Pika 可选）</span><input data-field="base_model" data-path-input type="text" placeholder="/path/to/MiniMax-H3"><small>自动识别 Pika；基座放在相邻 MiniMax-H3 目录时可留空。</small></label>
                     <label class="field span-2" data-h3-only><span>多卡并行</span><select data-field="video_parallel_mode"><option value="auto">自动选择</option><option value="tp">TP · 分摊权重显存</option><option value="sp">SP · 分摊序列计算</option></select><small>权重精度自动识别。多卡量化模型默认使用 SP；显存较小时可选择 TP。INT8、GGUF 的 TP 支持 2、4 卡，8 卡请选择 SP。</small></label>
+                    <label class="field" data-world-weights><span>权重常驻显存</span>
+                      <select data-field="world_weight_residency">
+                        <option value="auto">自动（按空闲显存）</option>
+                        <option value="on">始终开启</option>
+                        <option value="off">始终关闭</option>
+                      </select>
+                    </label>
                     <label class="field span-2" data-nomas-only><span>文本编码器目录</span><input data-field="nomas_text_encoder" data-path-input type="text" placeholder="/path/to/Qwen2.5-VL-7B-Instruct"><small>与模型同目录存放的 Qwen2.5-VL-7B-Instruct 可自动识别。</small></label>
                     <label class="field span-2" data-nomas-only><span>提示词增强地址（可选）</span><input data-field="nomas_pe_url" type="url" placeholder="http://127.0.0.1:8008/v1/chat/completions"><small>接入 Nomas-PE 后，可在创建场景时开关提示词增强。</small></label>
                     <label class="field" data-nomas-only><span>增强模型名称</span><input data-field="nomas_pe_model" type="text" placeholder="Nomas-PE"></label>
