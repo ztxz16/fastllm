@@ -347,6 +347,13 @@ inline cudaGraph_t ForkNativeKV(cudaGraph_t core, cudaGraph_t prelude, cudaGraph
     cudaKernelNodeParams norm{}, kv{};
     auto parent = uniqueKernel(prelude, verify ? (void *)V41QKVNormPackedBf16Kernel :
                                                (void *)V41QKVNormQuantKernel<2,true>, norm);
+    int keyOutput = verify ? 4 : 6;
+    if (!parent && verify) {
+        // Six logical verifier rows per owner can also use block-scaled Q/KV.
+        // Its normalized K lives at argument 6, just as in ordinary decode.
+        parent = uniqueKernel(prelude, (void *)V41QKVNormQuantKernel<2,true>, norm);
+        keyOutput = 6;
+    }
     if (!parent) return nullptr;
     cudaGraph_t raw = nullptr;
     if (cudaGraphClone(&raw, core) != cudaSuccess) return nullptr;
@@ -357,7 +364,7 @@ inline cudaGraph_t ForkNativeKV(cudaGraph_t core, cudaGraph_t prelude, cudaGraph
                                            (void *)V41FullDecodePrepareKernel<true>, kv);
     size_t count = 0;
     if (!node || OwnerNeighbors<true>(node, nullptr, &count) != cudaSuccess || count ||
-        *static_cast<void **>(norm.kernelParams[verify ? 4 : 6]) != static_cast<FastllmV41FullDecodeBuffers *>(kv.kernelParams[1])->kv)
+        *static_cast<void **>(norm.kernelParams[keyOutput]) != static_cast<FastllmV41FullDecodeBuffers *>(kv.kernelParams[1])->kv)
         return nullptr;
     if (cudaGraphAddKernelNode(early, prelude, &parent, 1, &kv) != cudaSuccess) return nullptr;
     if (cudaGraphDestroyNode(node) != cudaSuccess) {
@@ -719,13 +726,13 @@ inline void *ForkOwnerMix(const void *const *children, int count, int rows,
         if (status != cudaSuccess) return reject();
         leaves.assign(1, next);
     }
-    if (!reducedDots && !postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_ATTENTION", rows)) {
+    if ((!reducedDots || rows == 6) && !postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_ATTENTION", rows)) {
         if (auto packed = PackAttentionInput(graph, norm, rows, quantize)) {
             cudaGraphDestroy(graph);
             graph = packed;
         }
     }
-    if (!reducedDots && !postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_QUERY", rows)) {
+    if ((!reducedDots || rows == 6) && !postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_QUERY", rows)) {
         if (auto packed = PackQueryInput(graph, rows, keepQuery)) {
             cudaGraphDestroy(graph); graph = packed;
         } else cudaGetLastError();

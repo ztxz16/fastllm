@@ -7,8 +7,11 @@
 #include <vector>
 
 // Separate causal layouts without a fixed batch-size offset or key collision.
-inline int64_t FastllmV41VerificationGraphKey(int rows, bool segmented) {
-    return -(int64_t(rows) * 2 + int(segmented));
+inline int64_t FastllmV41VerificationGraphKey(int rows, bool segmented, int logicalRows = 0) {
+    // Rank-local graphs bake in the projection precision selected by the
+    // global row count. The same six local rows can belong to B1 or B8.
+    const int64_t regime = logicalRows == 0 ? 0 : logicalRows == 1 ? 1 : logicalRows <= 8 ? 2 : 3;
+    return -((regime << 32) | (int64_t(rows) * 2 + int(segmented)));
 }
 
 // PP stages retain independent workspaces for decode and both causal layouts.
@@ -136,6 +139,7 @@ std::vector<void *> FastllmCudaV41CaptureNodes();
 void *FastllmCudaV41WithoutIndexProjections(const void *graph, const std::vector<void *> &nodes);
 void *FastllmCudaV41CaptureFrontier();
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+void *FastllmCudaV41FlatVerifyExec(void *source);
 bool FastllmCudaV41ComposeEngramForks(const std::vector<const void *> &parts,
         const std::vector<std::pair<int, int>> &forks, void **outGraph, void **outExec);
 void *FastllmCudaV41ForkIndexProjections(const void *const *children, int count, const void *original,

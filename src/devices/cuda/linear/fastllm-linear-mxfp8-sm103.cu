@@ -131,7 +131,8 @@ template <int M, int Cluster, bool FixedQA = false, bool PanelB = false, bool Ve
             !Descriptor(bs, sw, CU_TENSOR_MAP_DATA_TYPE_INT32, n, k / 128, 4, N, 1, false) ||
             !Descriptor(c, y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, n, rows, 2, 64, Prefill ? M : 16, true))
             return false;
-        cudaLaunchAttribute attr{};
+        cudaLaunchAttribute attributes[2]{};
+        auto &attr = attributes[0];
         attr.id = cudaLaunchAttributeClusterDimension;
         attr.val.clusterDim = {Cluster, 1, 1};
         cudaLaunchConfig_t cfg{};
@@ -139,10 +140,15 @@ template <int M, int Cluster, bool FixedQA = false, bool PanelB = false, bool Ve
         cfg.blockDim = dim3(256);
         cfg.dynamicSmemBytes = Shared;
         cfg.stream = cudaStreamPerThread;
-        cfg.attrs = &attr;
+        cfg.attrs = attributes;
         cfg.numAttrs = 1;
+        if constexpr (VerifyOB && OutputSlices == 1) {
+            attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attributes[1].val.programmaticStreamSerializationAllowed = 1;
+            cfg.numAttrs = 2;
+        }
         dg::EpilogueOperatorArgs ep{};
-        if constexpr (OutputSlices > 1) ep.directOutput = y;
+        if constexpr (VerifyOB) ep.directOutput = y;
         auto status = cudaLaunchKernelEx(&cfg, Kernel(), (int *)nullptr, (uint32_t)rows, (uint32_t)n,
                                          (uint32_t)k, ep, a, b, as, bs, c);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));

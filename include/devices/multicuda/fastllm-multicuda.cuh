@@ -47,6 +47,8 @@ bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
 // In-place unsigned maximum of one 8-byte value. Call on every active rank.
 // Alignment/capture-registration misses are rejected collectively before launch.
 bool FastllmCudaCustomMarkovWinner(void *value, int device, int *tokens, const void *embed, float *context);
+bool FastllmCudaCustomMarkovWinners(void *values, int device, int *tokens, const void *embed,
+                                     float *context, int batch, int steps);
 bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId);
 // Optional bounded host spin for dedicated decode submission cores. The
 // pointer registration and collective fallback checks remain unchanged.

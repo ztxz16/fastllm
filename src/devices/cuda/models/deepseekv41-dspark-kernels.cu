@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
+#include <stdexcept>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -64,11 +65,31 @@ namespace {
 
     // Input construction is pure copying and integer indexing. Keep it in the
     // graph so each replay only uploads the position and anchor (eight bytes).
+    struct DsparkWindowPointers {
+        static constexpr int capacity = 16;
+        void *privateRing[capacity][3], *batchRing[3];
+    };
+    template<bool Scatter>
+    __global__ void DsparkTransferWindows(DsparkWindowPointers p, size_t vectors, int first) {
+        const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (i >= vectors) return;
+        const auto b = blockIdx.y, layer = blockIdx.z;
+        auto *own = static_cast<uint4 *>(p.privateRing[b][layer]);
+        auto *packed = static_cast<uint4 *>(p.batchRing[layer]) + (first + b) * vectors;
+        if constexpr (Scatter) own[i] = packed[i];
+        else packed[i] = own[i];
+    }
+
     __global__ void DsparkInputKernel(const uint16_t *embedding, const int *metadata,
         int noiseToken, int block, int hcMult, int dim, int windowSize,
         uint16_t *hidden, float *preMix, int *indices, int *tokens) {
         const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-        const int anchor = metadata[1], width = windowSize + block - 1;
+        const int b = blockIdx.y;
+        const int anchor = metadata[gridDim.y + b], width = windowSize + block - 1;
+        hidden += size_t(b) * block * hcMult * dim;
+        preMix += size_t(b) * block * hcMult;
+        indices += size_t(b) * block * width;
+        tokens += size_t(b) * (block + 1);
         if (i < (int64_t)block * hcMult * dim) {
             const int row = i / ((int64_t)hcMult * dim), channel = i % dim;
             hidden[i] = embedding[(int64_t)(row ? noiseToken : anchor) * dim + channel];
@@ -77,7 +98,7 @@ namespace {
         if (i < (int64_t)block * width) {
             const int row = i / width, col = i % width;
             const int draft = col - windowSize;
-            indices[i] = col < windowSize ? (metadata[0] - windowSize + col) % windowSize
+            indices[i] = col < windowSize ? (metadata[b] - windowSize + col) % windowSize
                 : windowSize + draft + (draft >= row);
         }
         if (i == 0) tokens[0] = anchor;
@@ -243,7 +264,9 @@ namespace {
 
     __global__ void MarkovShardScore(
         const float *logits, const __nv_bfloat16 *embed, const __nv_bfloat16 *head,
-        const int *tokens, int step, int vocab, int start, int count, unsigned long long *bestKey) {
+        const int *tokens, int step, int vocab, int start, int count, unsigned long long *bestKey, int steps) {
+        logits += size_t(blockIdx.y) * steps * count;
+        tokens += blockIdx.y * (steps + 1);
         const DsBest best = DsMarkovGroupedBest(logits, embed, head, tokens, step, vocab, start, count);
         if (threadIdx.x == 0) {
             // Canonicalize signed zero; the low bits prefer the smaller token ID.
@@ -251,16 +274,18 @@ namespace {
             const unsigned bits = __float_as_uint(value);
             const unsigned ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
             const unsigned long long key = ((unsigned long long)ordered << 32) | (0xffffffffu - (unsigned)best.index);
-            atomicMax(bestKey + step, key);
+            atomicMax(bestKey + step * gridDim.y + blockIdx.y, key);
         }
     }
 
     __global__ void MarkovShardFinish(const unsigned long long *key, const __nv_bfloat16 *embed,
-        int *tokens, int step, float *outEmbeds) {
+        int *tokens, int step, float *outEmbeds, int steps) {
+        tokens += blockIdx.x * (steps + 1);
+        if (outEmbeds) outEmbeds += size_t(blockIdx.x) * steps * 256;
         const int previous = tokens[step];
         if (outEmbeds) outEmbeds[step * 256 + threadIdx.x] =
             __bfloat162float(embed[(int64_t)previous * 256 + threadIdx.x]);
-        if (threadIdx.x == 0) tokens[step + 1] = int(0xffffffffu - unsigned(key[step]));
+        if (threadIdx.x == 0) tokens[step + 1] = int(0xffffffffu - unsigned(key[step * gridDim.x + blockIdx.x]));
     }
 
     // 第二步：归约各块的结果，写下一个 token；顺便把本步用到的嵌入存给 confidence head
@@ -653,6 +678,23 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovFilteredSampleBatchDevice(const Data
         nullptr, outEmbeds, topK, topP, &samplingWorkspace, &scores);
 }
 
+extern "C" void FastllmCudaDsparkTransferWindows(void *const *requests, void *const *packed,
+        int batch, size_t bytes, bool scatter) {
+    const size_t vectors = bytes / sizeof(uint4);
+    for (int first = 0; first < batch; first += DsparkWindowPointers::capacity) {
+        const int n = std::min(DsparkWindowPointers::capacity, batch - first);
+        DsparkWindowPointers p{};
+        for (int l = 0; l < 3; ++l) {
+            p.batchRing[l] = packed[l];
+            for (int b = 0; b < n; ++b) p.privateRing[b][l] = requests[(first + b) * 3 + l];
+        }
+        const dim3 grid((vectors + 255) / 256, n, 3);
+        if (scatter) DsparkTransferWindows<true><<<grid, 256, 0, cudaStreamPerThread>>>(p, vectors, first);
+        else DsparkTransferWindows<false><<<grid, 256, 0, cudaStreamPerThread>>>(p, vectors, first);
+        const auto error = cudaGetLastError();
+        if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+    }
+}
 extern "C" bool FastllmCudaDeepSeekV41DraftInput(const Data &embedding, const Data &metadata,
     int noiseToken, int block, int hcMult, int windowSize,
     Data &hidden, Data &preMix, Data &indices, Data &tokens) {
@@ -662,16 +704,19 @@ extern "C" bool FastllmCudaDeepSeekV41DraftInput(const Data &embedding, const Da
         embedding.dims[1] <= 0 || embedding.strides.size() != 2 ||
         embedding.strides[0] != embedding.dims[1] || embedding.strides[1] != 1 ||
         !DsOnCuda(metadata) || metadata.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
-        metadata.dataType != DataType::INT32 || metadata.dims != std::vector<int>{2} ||
+        metadata.dataType != DataType::INT32 || metadata.dims.size() != 1 ||
+        metadata.dims[0] < 2 || metadata.dims[0] % 2 || metadata.dims[0] / 2 > 65535 ||
         metadata.strides.size() != 1 || metadata.strides[0] != 1 ||
         block <= 0 || hcMult <= 0 || windowSize <= 0 || block > INT_MAX - windowSize) return false;
     const int dim = embedding.dims[1], width = windowSize + block - 1;
-    if (!DsPrepareOutput(hidden, DataType::BFLOAT16, {1, block, hcMult, dim}) ||
-        !DsPrepareOutput(preMix, DataType::FLOAT32, {1, block, hcMult}) ||
-        !DsPrepareOutput(indices, DataType::INT32, {1, block, width}) ||
-        !DsPrepareOutput(tokens, DataType::INT32, {block + 1})) return false;
+    const int batch = metadata.dims[0] / 2;
+    if (size_t(batch) * (block + 1) > INT_MAX ||
+        !DsPrepareOutput(hidden, DataType::BFLOAT16, {batch, block, hcMult, dim}) ||
+        !DsPrepareOutput(preMix, DataType::FLOAT32, {batch, block, hcMult}) ||
+        !DsPrepareOutput(indices, DataType::INT32, {batch, block, width}) ||
+        !DsPrepareOutput(tokens, DataType::INT32, {batch * (block + 1)})) return false;
     const int64_t count = std::max((int64_t)block * hcMult * dim, (int64_t)block * width);
-    DsparkInputKernel<<<(count + 255) / 256, 256>>>((const uint16_t*)embedding.cudaData,
+    DsparkInputKernel<<<dim3((count + 255) / 256, batch), 256>>>((const uint16_t*)embedding.cudaData,
         (const int*)metadata.cudaData, noiseToken, block, hcMult, dim, windowSize,
         (uint16_t*)hidden.cudaData, (float*)preMix.cudaData, (int*)indices.cudaData, (int*)tokens.cudaData);
     return cudaGetLastError() == cudaSuccess;
@@ -755,18 +800,33 @@ extern "C" bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits,
     return true;
 }
 
+extern "C" bool FastllmCudaDsparkMarkovShardScoreBatch(const float *logits, const void *embed,
+    const void *head, const int *tokens, unsigned long long *keys,
+    int step, int vocab, int start, int count, int batch, int steps) {
+    MarkovShardScore<<<dim3(kDsparkMarkovGroupedChunks, batch), kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(logits,
+        (const __nv_bfloat16*)embed, (const __nv_bfloat16*)head,
+        tokens, step, vocab, start, count, keys, steps);
+    return cudaGetLastError() == cudaSuccess;
+}
+extern "C" bool FastllmCudaDsparkMarkovShardFinishBatch(const unsigned long long *keys,
+    const void *embed, int *tokens, float *outEmbeds, int step, int batch, int steps) {
+    MarkovShardFinish<<<batch, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(keys,
+        (const __nv_bfloat16*)embed, tokens, step, outEmbeds, steps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 extern "C" bool FastllmCudaDsparkMarkovShardScore(const float *logits, const void *embed,
     const void *head, const int *tokens, unsigned long long *keys,
     int step, int vocab, int start, int count) {
     MarkovShardScore<<<kDsparkMarkovGroupedChunks, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(logits,
         (const __nv_bfloat16*)embed, (const __nv_bfloat16*)head,
-        tokens, step, vocab, start, count, keys);
+        tokens, step, vocab, start, count, keys, 0);
     return cudaGetLastError() == cudaSuccess;
 }
 extern "C" bool FastllmCudaDsparkMarkovShardFinish(const unsigned long long *keys,
     const void *embed, int *tokens, float *outEmbeds, int step) {
     MarkovShardFinish<<<1, kDsparkMarkovThreads, 0, cudaStreamPerThread>>>(keys,
-        (const __nv_bfloat16*)embed, tokens, step, outEmbeds);
+        (const __nv_bfloat16*)embed, tokens, step, outEmbeds, 0);
     return cudaGetLastError() == cudaSuccess;
 }
 

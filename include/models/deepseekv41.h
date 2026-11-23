@@ -127,6 +127,7 @@ namespace fastllm {
         bool deferWindow = false;     // 滑窗写入延后到接受长度确定之后
         bool wantAllTokens = false;   // head 对本片段的每个位置计算目标 logits
         int mainHiddenStartPos = -1;  // bounded prefill 只采集末尾窗口，记录其绝对起点
+        const void *packedMainOwner = nullptr;
         Data packedMainHidden; // Optional owner-written [1, rows, features * dim] graph view.
         std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
         std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
@@ -495,6 +496,7 @@ namespace fastllm {
         using EngramPrefetch = DeepSeekV41EngramPrefetch;
         struct ForwardWorkspace;
         void RunAttentionParallel(ForwardWorkspace &, int layer);
+        bool CommitAttentionParallelBatch(const std::vector<DeepSeekV41Segment> &segments);
         void CommitAttentionParallel(DeepSeekV41RequestState &, DeepSeekV41SpecScratch &,
                                      int startPos, int accept, int forwarded);
         struct ForwardState;

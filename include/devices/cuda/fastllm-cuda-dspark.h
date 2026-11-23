@@ -5,6 +5,11 @@
 struct FastllmDsparkSamplePartial { float maximum, sum, best; int token; };
 static_assert(sizeof(FastllmDsparkSamplePartial) == 16, "Markov sampling gather packet must be 16 bytes");
 extern "C" {
+// requestWindows is request-major with three ring pointers per request.
+void FastllmCudaDsparkTransferWindows(void *const *requestWindows, void *const *batchWindows,
+    int batch, size_t bytesPerRing, bool scatter);
+bool FastllmCudaDsparkInverseRotaryBatch(fastllm::Data &x, int ropeDim, float ropeBase,
+    int originalSeqLen, float ropeFactor, int betaFast, int betaSlow, const int *positions);
 bool FastllmCudaDsparkDraftSparseAttention(const fastllm::Data &q, const fastllm::Data &kv,
     const fastllm::Data &table, const fastllm::Data &indices, fastllm::Data &sink,
     float scale, fastllm::Data &scratch, fastllm::Data &output);
@@ -15,6 +20,11 @@ bool FastllmCudaDsparkMarkovShardScore(const float *logits, const void *embed,
     int step, int vocab, int start, int count);
 bool FastllmCudaDsparkMarkovShardFinish(const unsigned long long *keys,
     const void *embed, int *tokens, float *outEmbeds, int step);
+bool FastllmCudaDsparkMarkovShardScoreBatch(const float *logits, const void *embed,
+    const void *head, const int *tokens, unsigned long long *keys,
+    int step, int vocab, int start, int count, int batch, int steps);
+bool FastllmCudaDsparkMarkovShardFinishBatch(const unsigned long long *keys,
+    const void *embed, int *tokens, float *outEmbeds, int step, int batch, int steps);
 // BF16/rank-256 sampling shards. partials has ceil(count/64) entries; packet
 // contains one entry per rank. Gather packet after Sample, then call Normalize.
 bool FastllmCudaDsparkMarkovShardSample(const float *logits, const void *embed,
@@ -26,7 +36,7 @@ bool FastllmCudaDsparkMarkovShardNormalize(float *scores,
     const FastllmDsparkSamplePartial *gathered, int *tokens,
     int ranks, int step, int count, int stride, float temperature);
 
-// Full-window graph inputs. metadata is INT32 [start position, anchor token];
+// Full-window graph inputs. metadata is INT32 [positions for B, anchors for B];
 // the caller supplies valid token IDs and start position >= windowSize.
 bool FastllmCudaDeepSeekV41DraftInput(const fastllm::Data &embedding,
     const fastllm::Data &metadata, int noiseToken, int block, int hcMult, int windowSize,

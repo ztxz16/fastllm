@@ -689,6 +689,7 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
         };
     }
     if (scratch.captureMain && g.packedMainHidden.cudaData) {
+        scratch.packedMainOwner = owner.get();
         auto &view = scratch.packedMainHidden;
         const size_t width = g.packedMainHidden.dims.back();
         view.FakeFrom(g.packedMainHidden, size_t(segment.offset) * width * sizeof(uint16_t));
@@ -744,7 +745,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         V41EnvFlag("FASTLLM_DSV41_LEGACY_ATTN") || V41EnvFlag("FASTLLM_DSV41_LEGACY_INDEXER") ||
         V41EnvFlag("FASTLLM_DSV41_LEGACY_TOPK") || V41EnvFlag("FASTLLM_DSV41_LEGACY_ROTARY"))
         return;
-    auto slot = v41CudaGraphSlots.find(verifying && !pipeline ? FastllmV41VerificationGraphKey(batch, segments.size() > 1) : graphKey);
+    auto slot = v41CudaGraphSlots.find(verifying && !pipeline ? FastllmV41VerificationGraphKey(batch, segments.size() > 1,
+        attentionOnly ? v41AttentionLogicalRows : 0) : graphKey);
     if (slot == v41CudaGraphSlots.end())
         return;
     auto state = V41GetCudaGraphState(slot->second);
@@ -808,7 +810,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 model.v41AttentionLogicalRows = batch;
                 const int count = rows.localToGlobal[runtime.Layout().AttentionOwner(rank)].size();
                 model.BuildFullDecodeGraph(count, local[rank]);
-                const int64_t key = verifying ? FastllmV41VerificationGraphKey(count, local[rank].size() > 1) : int64_t(count) * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
+                const int64_t key = verifying ? FastllmV41VerificationGraphKey(count, local[rank].size() > 1, batch) : int64_t(count) * 3 + (batch == 1 ? 0 : batch <= 8 ? 1 : 2);
                 auto found = model.v41CudaGraphSlots.find(key);
                 if (found == model.v41CudaGraphSlots.end()) return;
                 auto state = V41GetCudaGraphState(found->second);
@@ -967,7 +969,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     // The local expert graph already established all peer access. Each
     // request owner reads the immutable embedding and builds its four HC
     // channels directly, including the first layer's constant pre-mix.
-    if (!verifying && firstLayer == 0 && !g->ownerFfn.empty() && hc_mult == 4 &&
+    const bool multiVerify = verifying && segments.size() > 1;
+    if ((!verifying || multiVerify) && firstLayer == 0 && !g->ownerFfn.empty() && hc_mult == 4 &&
         embed_dim % 4 == 0 && V41EnvFlag("FASTLLM_DSV41_OWNER_EMBEDDING") &&
         std::find(engram_layer_ids.begin(),engram_layer_ids.end(),0) == engram_layer_ids.end() &&
         GetCudaEmbedding() && !GetLowMemMode() && !embeddingWeight.lockInCPU &&
@@ -1244,7 +1247,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
             // Each rank consumes its own token IDs and private Engram rows. The
             // preceding sampling fence protects the pinned source across replays.
-            if (!g->greedyMapped.empty() && V41EnvFlag("FASTLLM_DSV41_OWNER_INPUT_PACKET") &&
+            if ((multiVerify || !g->greedyMapped.empty()) && V41EnvFlag("FASTLLM_DSV41_OWNER_INPUT_PACKET") &&
                 std::all_of(g->engrams.begin(), g->engrams.end(), [&](const auto &entry) {
                     return entry.second->owners.size() == g->devices.size();
                 })) {
@@ -1403,9 +1406,10 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 });
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
                 // The selected rows and layer-owned WKV buffers are independent of the residual.
-                if (verifying && batch == 6 && !e.asyncGraph && e.owners.size() == children.size())
+                if (verifying && !e.asyncGraph && e.owners.size() == children.size())
                     for (size_t rank = 0; rank < children.size(); ++rank)
-                        if (e.owners[rank] && e.owners[rank]->nativeProjection && previousAttentionInput[rank] >= 0)
+                        if (e.owners[rank] && g->attentionGraphs[rank]->batch == 6 &&
+                            e.owners[rank]->nativeProjection && previousAttentionInput[rank] >= 0)
                             engramForks[rank].emplace_back(int(children[rank].size()) - 1, previousAttentionInput[rank]);
 #endif
             }
@@ -2000,10 +2004,19 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         if (verifying || g->captureGreedy) g->ready.resize(g->devices.size(), nullptr);
         auto compose = [&](const std::vector<const void *> &parts, size_t rank, void **graph, void **exec) {
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-            if (!engramForks[rank].empty() && FastllmCudaV41ComposeEngramForks(parts, engramForks[rank], graph, exec))
-                return true;
-#endif
+            const bool forked = !engramForks[rank].empty() &&
+                FastllmCudaV41ComposeEngramForks(parts, engramForks[rank], graph, exec);
+            if (!forked && !FastllmCudaGraphCompose(parts.data(), parts.size(), graph, exec)) return false;
+            if (multiVerify && g->attentionRuntime && !g->ownerFfn.empty() && g->devices.size() == 8) {
+                if (void *flat = FastllmCudaV41FlatVerifyExec(*graph)) {
+                    FastllmCudaGraphExecDestroy(*exec);
+                    *exec = flat;
+                }
+            }
+            return true;
+#else
             return FastllmCudaGraphCompose(parts.data(), parts.size(), graph, exec);
+#endif
         };
         for (size_t rank = 0; !attentionOnly && rank < g->devices.size(); ++rank) {
             FastllmCudaSetDevice(g->devices[rank]);
@@ -2020,7 +2033,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 throw std::runtime_error("full graph composition failed");
         }
         // Only replace complete rank-local source layers. A generic graph is always executable.
-        if (g->attentionRuntime && (!verifying || batch == 6) && !hybrid && candidate_source_layer_id >= 0 &&
+        const bool sixRowsPerOwner = verifying && std::all_of(g->attentionGraphs.begin(), g->attentionGraphs.end(),
+            [](const auto &owner) { return !owner || (owner->batch == 6 && !owner->layers[owner->firstLayer]->config.segmentedVerify); });
+        if (g->attentionRuntime && (!verifying || sixRowsPerOwner) && !hybrid && candidate_source_layer_id >= 0 &&
             candidate_source_layer_id < block_cnt && compress_ratios[candidate_source_layer_id] == 1 &&
             std::all_of(compress_ratios.begin(), compress_ratios.end(), [](int r) { return r >= 0 && r <= 2; }) &&
             int64_t(candidate_block_size) * candidate_topk_blocks >= int64_t(index_topk) * 2 &&

@@ -5897,7 +5897,8 @@ namespace fastllm {
                 // Verification and independent requests have different host metadata.
                 const int64_t graphKey = f.pipeline ? FastllmV41PipelineGraphKey(
                     f.pipeline->firstLayer, seqlen, verifyGraph, segments.size() > 1) :
-                    verifyGraph ? FastllmV41VerificationGraphKey(seqlen, segments.size() > 1) : v41AttentionRankRuntime ?
+                    verifyGraph ? FastllmV41VerificationGraphKey(seqlen, segments.size() > 1,
+                        v41AttentionRankRuntime ? v41AttentionLogicalRows : 0) : v41AttentionRankRuntime ?
                     seqlen * 3 + (v41AttentionLogicalRows == 1 ? 0 : v41AttentionLogicalRows <= 8 ? 1 : 2) : seqlen;
                 auto found = v41CudaGraphSlots.find(graphKey);
                 const int pipelineFirstLayer = f.pipeline ? f.pipeline->firstLayer : -1;

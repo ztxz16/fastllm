@@ -1711,7 +1711,7 @@ namespace {
     // quantMode == 0（q / 注意力输出的逆旋转）：只有末尾 ropeDim 个元素会变，
     // 旧 kernel 却把整行 load 到共享内存再原样写回（dim = 512、ropeDim = 128 时白读写 75%）。
     // 这里一个 block 处理多行的若干个旋转对，只碰真正需要旋转的元素。
-    template <typename T>
+    template <typename T, bool Batched = false>
     __global__ void V41RotaryOnlyKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
                                         int ropeDim, int startPos, int posStep, int inverse,
                                         uint64_t totalPairs, const int *devicePosition) {
@@ -1723,8 +1723,9 @@ namespace {
         const int r = (int)(idx / (uint64_t)pairs);
         const int d = (int)(idx - (uint64_t)r * pairs);
         const int token = r / rowsPerToken;
-        T *base = x + (uint64_t)r * dim + (dim - ropeDim) + 2 * d;
-        const float pos = (float)((devicePosition ? *devicePosition : startPos) + (long long)token * posStep);
+        const int request = Batched ? blockIdx.y : 0;
+        T *base = x + ((uint64_t)request * (totalPairs / pairs) + r) * dim + (dim - ropeDim) + 2 * d;
+        const float pos = (float)((devicePosition ? devicePosition[request] : startPos) + (long long)token * posStep);
         const float ang = pos * rope.invFreq[d];
         float c = cosf(ang), s = sinf(ang);
         if (inverse) {
@@ -5980,6 +5981,19 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int 
     return V41CheckLaunch("RotaryQuant");
 }
 
+extern "C" bool FastllmCudaDsparkInverseRotaryBatch(Data &x, int ropeDim, float ropeBase, int originalSeqLen,
+        float ropeFactor, int betaFast, int betaSlow, const int *positions) {
+    if (!positions || !V41OnCuda(x) || x.dataType != DataType::BFLOAT16 || x.dims.size() != 4 ||
+        x.dims[0] < 2 || x.dims[0] > 65535 || x.dims[1] <= 0 || x.dims[2] <= 0 || x.dims[3] <= 0 ||
+        x.Count(1) / x.dims[3] > INT_MAX || ropeDim <= 0 || ropeDim > 128 || ropeDim > x.dims[3] ||
+        ropeDim % 2 || V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH")) return false;
+    const uint64_t pairs = uint64_t(x.dims[1]) * x.dims[2] * (ropeDim / 2);
+    const auto rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
+    V41RotaryOnlyKernel<__nv_bfloat16, true><<<dim3((pairs + 255) / 256, x.dims[0]), 256>>>(
+        (__nv_bfloat16 *)x.cudaData, x.dims[2], x.dims[3], rope, ropeDim, 0, 1, 1, pairs, positions);
+    return V41CheckLaunch("DsparkInverseRotaryBatch");
+}
+
 extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const Data &window,
         int ropeDim, float ropeBase, int startPos, int originalSeqLen, float ropeFactor,
         int betaFast, int betaSlow, const int *devicePosition, Data &table) {
@@ -9232,6 +9246,139 @@ static void *V41BoundaryKernel(bool pack, bool quantize, bool packOnly) {
     if (pack) return quantize ? (void *)ExpertResidualNorm<true,true,true,Blocks,PackedOrder> : (void *)ExpertResidualNorm<true,false,true,Blocks,PackedOrder>;
     return quantize ? (void *)ExpertResidualNorm<false,true,true,Blocks,PackedOrder> : (void *)ExpertResidualNorm<false,false,true,Blocks,PackedOrder>;
 }
+// Rank-local verification graphs contain nested per-layer capture segments.
+// Keep the exact device dependencies when emitting a single-level graph.
+#if !defined(USE_ROCM) && CUDA_VERSION >= 13000
+namespace {
+struct V41GraphBoundary { int input, output; };
+
+struct V41GraphFlattener {
+    struct Node {
+        CUgraphNode source = nullptr, copy = nullptr;
+        std::vector<std::pair<int, CUgraphEdgeData>> incoming;
+    };
+    std::vector<Node> nodes;
+    CUcontext context = nullptr;
+    CUgraph graph = nullptr;
+    ~V41GraphFlattener() { if (graph) cuGraphDestroy(graph); }
+
+    int Append(CUgraphNode source = nullptr) {
+        nodes.emplace_back();
+        nodes.back().source = source;
+        return int(nodes.size()) - 1;
+    }
+    bool Expand(CUgraph source, V41GraphBoundary &bounds) {
+        bounds = {Append(), Append()};
+        size_t count = 0, edgeCount = 0;
+        if (cuGraphGetNodes(source, nullptr, &count) != CUDA_SUCCESS ||
+            cuGraphGetEdges(source, nullptr, nullptr, nullptr, &edgeCount) != CUDA_SUCCESS) return false;
+        std::vector<CUgraphNode> originals(count), from(edgeCount), to(edgeCount);
+        std::vector<CUgraphEdgeData> edges(edgeCount);
+        if ((count && cuGraphGetNodes(source, originals.data(), &count) != CUDA_SUCCESS) ||
+            (edgeCount && cuGraphGetEdges(source, from.data(), to.data(), edges.data(), &edgeCount) != CUDA_SUCCESS))
+            return false;
+        std::map<CUgraphNode,V41GraphBoundary> spans;
+        std::set<CUgraphNode> outgoing, incoming;
+        for (auto original : originals) {
+            CUgraphNodeType type;
+            if (cuGraphNodeGetType(original, &type) != CUDA_SUCCESS) return false;
+            if (type == CU_GRAPH_NODE_TYPE_GRAPH) {
+                CUgraph child;
+                if (cuGraphChildGraphNodeGetGraph(original, &child) != CUDA_SUCCESS ||
+                    !Expand(child, spans[original])) return false;
+            } else {
+                int i = Append(type == CU_GRAPH_NODE_TYPE_EMPTY ? nullptr : original);
+                spans[original] = {i, i};
+            }
+        }
+        for (size_t i = 0; i < edgeCount; ++i) {
+            nodes[spans.at(to[i]).input].incoming.emplace_back(spans.at(from[i]).output, edges[i]);
+            outgoing.insert(from[i]); incoming.insert(to[i]);
+        }
+        for (auto original : originals) {
+            auto span = spans.at(original);
+            if (!incoming.count(original)) nodes[span.input].incoming.push_back({bounds.input, {}});
+            if (!outgoing.count(original)) nodes[bounds.output].incoming.push_back({span.output, {}});
+        }
+        if (originals.empty()) nodes[bounds.output].incoming.push_back({bounds.input, {}});
+        return true;
+    }
+    bool Copy(Node &node) {
+        CUgraphNode n = node.source;
+        auto *out = &node.copy;
+        CUgraphNodeType type;
+        if (cuGraphNodeGetType(n, &type) != CUDA_SUCCESS) return false;
+        switch (type) {
+            case CU_GRAPH_NODE_TYPE_KERNEL: {
+                CUDA_KERNEL_NODE_PARAMS p{};
+                return cuGraphKernelNodeGetParams(n, &p) == CUDA_SUCCESS &&
+                    cuGraphAddKernelNode(out, graph, nullptr, 0, &p) == CUDA_SUCCESS &&
+                    cuGraphKernelNodeCopyAttributes(*out, n) == CUDA_SUCCESS;
+            }
+            case CU_GRAPH_NODE_TYPE_MEMCPY: {
+                CUDA_MEMCPY3D p{};
+                return cuGraphMemcpyNodeGetParams(n, &p) == CUDA_SUCCESS &&
+                    cuGraphAddMemcpyNode(out, graph, nullptr, 0, &p, context) == CUDA_SUCCESS;
+            }
+            case CU_GRAPH_NODE_TYPE_MEMSET: {
+                CUDA_MEMSET_NODE_PARAMS p{};
+                return cuGraphMemsetNodeGetParams(n, &p) == CUDA_SUCCESS &&
+                    cuGraphAddMemsetNode(out, graph, nullptr, 0, &p, context) == CUDA_SUCCESS;
+            }
+            case CU_GRAPH_NODE_TYPE_EVENT_RECORD:
+            case CU_GRAPH_NODE_TYPE_WAIT_EVENT: {
+                CUevent event;
+                if (type == CU_GRAPH_NODE_TYPE_EVENT_RECORD)
+                    return cuGraphEventRecordNodeGetEvent(n, &event) == CUDA_SUCCESS &&
+                        cuGraphAddEventRecordNode(out, graph, nullptr, 0, event) == CUDA_SUCCESS;
+                return cuGraphEventWaitNodeGetEvent(n, &event) == CUDA_SUCCESS &&
+                    cuGraphAddEventWaitNode(out, graph, nullptr, 0, event) == CUDA_SUCCESS;
+            }
+            default: return false;
+        }
+    }
+    // Ports on structural boundaries cannot be contracted unambiguously.
+    bool Resolve(int i, CUgraphEdgeData edge, std::map<int, CUgraphEdgeData> &parents) const {
+        if (nodes[i].source) {
+            auto result = parents.emplace(i, edge);
+            return result.second || std::memcmp(&result.first->second, &edge, sizeof(edge)) == 0;
+        }
+        if (edge.type || edge.from_port || edge.to_port) return false;
+        for (auto &p : nodes[i].incoming) if (!Resolve(p.first, p.second, parents)) return false;
+        return true;
+    }
+    CUgraphExec Build(CUgraph original) {
+        V41GraphBoundary top{};
+        if (cuCtxGetCurrent(&context) != CUDA_SUCCESS || !context || !Expand(original, top) ||
+            cuGraphCreate(&graph, 0) != CUDA_SUCCESS) return nullptr;
+        for (auto &node : nodes) if (node.source && !Copy(node)) return nullptr;
+        std::vector<CUgraphNode> from, to;
+        std::vector<CUgraphEdgeData> edges;
+        for (const auto &node : nodes) if (node.source) {
+            std::map<int, CUgraphEdgeData> parents;
+            for (auto &p : node.incoming) if (!Resolve(p.first, p.second, parents)) return nullptr;
+            for (auto &p : parents) {
+                from.push_back(nodes[p.first].copy); to.push_back(node.copy); edges.push_back(p.second);
+            }
+        }
+        CUgraphExec exec = nullptr;
+        if (cuGraphAddDependencies(graph, from.data(), to.data(), edges.data(), edges.size()) != CUDA_SUCCESS ||
+            cuGraphInstantiateWithFlags(&exec, graph, 0) != CUDA_SUCCESS) return nullptr;
+        return exec;
+    }
+};
+}
+#endif
+
+void *FastllmCudaV41FlatVerifyExec(void *source) {
+#if !defined(USE_ROCM) && CUDA_VERSION >= 13000
+    V41GraphFlattener builder;
+    return source ? builder.Build(static_cast<CUgraph>(source)) : nullptr;
+#else
+    return nullptr;
+#endif
+}
+
 bool FastllmCudaV41ComposeEngramForks(const std::vector<const void *> &parts,
         const std::vector<std::pair<int, int>> &forks, void **outGraph, void **outExec) {
     using namespace fastllm_v41_hc_graph;

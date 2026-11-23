@@ -398,6 +398,42 @@ void DeepSeekV41Model::RunAttentionParallel(ForwardWorkspace &f, int layer) {
         frame.transfer.Collect(rank, fields, 4);
     });
 }
+bool DeepSeekV41Model::CommitAttentionParallelBatch(const std::vector<DeepSeekV41Segment> &segments) {
+    if (segments.size() < 2 || !v41AttentionParallel) return false;
+    auto &parallel = *v41AttentionParallel;
+    const auto &layout = parallel.runtime.Layout();
+    if (layout.attentionTP != 1) return false;
+    std::vector<std::vector<DeepSeekV41Segment>> owned(layout.attentionDP);
+    std::vector<int> offsets(layout.attentionDP);
+    for (const auto &s : segments) {
+        if (!s.state || !s.spec || s.spec->kvCommitted || s.spec->acceptedDrafts < 0 ||
+            s.spec->acceptedDrafts >= s.seqlen || s.state->attentionRanks.size() != 1 ||
+            s.spec->attentionRanks.size() != 1 || !s.state->attentionRanks[0] ||
+            !s.spec->attentionRanks[0] || !s.spec->attentionRanks[0]->commitKV ||
+            s.spec->attentionRanks[0]->deviceCommitReady) return false;
+        const int owner = s.state->attentionGroup;
+        if (owner < 0 || owner >= layout.attentionDP) return false;
+        auto part = s;
+        part.offset = offsets[owner];
+        offsets[owner] += s.seqlen;
+        part.state = s.state->attentionRanks[0];
+        part.spec = s.spec->attentionRanks[0].get();
+        owned[owner].push_back(std::move(part));
+    }
+    for (const auto &s : segments) s.spec->attentionRanks[0]->acceptedDrafts = s.spec->acceptedDrafts;
+    // All owners publish once on their own streams. Requests sharing an owner
+    // can use the existing prefix-list kernel; each request keeps its own KV.
+    parallel.runtime.Run([&](int rank, int) {
+        auto &parts = owned[layout.AttentionOwner(rank)];
+        auto &model = *parallel.models[rank];
+        model.DsparkCommitBatch(parts);
+        for (const auto &s : parts)
+            model.DsparkCommitPrefix(*s.state, *s.spec, s.startPos, s.spec->acceptedDrafts + 1, s.seqlen);
+    });
+    for (const auto &s : segments) s.spec->kvCommitted = true;
+    return true;
+}
+
 void DeepSeekV41Model::CommitAttentionParallel(DeepSeekV41RequestState &state,
         DeepSeekV41SpecScratch &scratch, int startPos, int accept, int forwarded) {
     auto &parallel = *v41AttentionParallel;
@@ -419,6 +455,7 @@ void DeepSeekV41Model::CommitAttentionParallel(DeepSeekV41RequestState &state,
     else parallel.runtime.Run(commit);
 }
 #else
+bool DeepSeekV41Model::CommitAttentionParallelBatch(const std::vector<DeepSeekV41Segment> &) { return false; }
 void DeepSeekV41Model::ConfigureAttentionParallel(int dp) {
     if (dp != 1) throw std::invalid_argument("attention DP requires CUDA");
 }

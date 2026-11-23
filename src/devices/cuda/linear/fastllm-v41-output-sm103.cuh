@@ -5,12 +5,12 @@ constexpr int outputGroups = 8, groupColumns = 4096, groupRank = 1024;
 constexpr int attentionWidth = outputGroups * groupColumns, projectionWidth = outputGroups * groupRank;
 using GroupedMaps = std::array<Desc, 5>;
 
-auto GroupedOutputKernel() {
+template <bool Signal = false> auto GroupedOutputKernel() {
     return &dg::sm100_fp8_fp4_gemm_1d1d_impl<cute::UMMA::Major::K, cute::UMMA::Major::K, 32, 32, 32, 0, groupRank,
                                              groupColumns, 16, 128, 128, outputGroups, 128, 128, 128, 12, 2, 128,
                                              128, 2, true, kSMs, true, true, dg::GemmType::Batched, false,
                                              cutlass::float_e4m3_t, cutlass::float_e4m3_t, cutlass::float_e4m3_t,
-                                             dg::epilogue::operators::CastToFP8WithClamp>;
+                                             dg::epilogue::operators::CastToFP8WithClamp, false, Signal>;
 }
 
 bool GroupedDescriptor(Desc &d, void *p, int inner, int rows, int rowStride, int groupStride, int tileRows) {
@@ -131,11 +131,13 @@ std::shared_ptr<void> FastllmCudaV41PlanOutput(const std::shared_ptr<fastllm::Da
             p->bWeight = panels;
             p->panelMajor = true;
             if (m == 6) {
-                p->verifyOB = Projection<16, 1, false, true, true>::Configure();
+                p->verifyOB = Projection<16, 1, false, true, true>::Configure() &&
+                    cudaFuncSetAttribute(GroupedOutputKernel<true>(), cudaFuncAttributeMaxDynamicSharedMemorySize, 230204) == cudaSuccess;
+                if (!p->verifyOB) cudaGetLastError();
                 Desc descriptor{};
-                p->slicedOB = p->verifyOB && VerifyOutputPanels::WeightDescriptor(descriptor, panels, 5120, projectionWidth) &&
+                p->slicedOB = !p->verifyOB && VerifyOutputPanels::WeightDescriptor(descriptor, panels, 5120, projectionWidth) &&
                               VerifyOutputPanels::Configure();
-                if (!p->slicedOB) cudaGetLastError();
+                if (!p->verifyOB && !p->slicedOB) cudaGetLastError();
             }
         }
     }
@@ -178,7 +180,8 @@ bool FastllmCudaV41RunOutput(const std::shared_ptr<void> &handle) {
     cfg.stream = cudaStreamPerThread;
     cfg.attrs = &cluster;
     cfg.numAttrs = 1;
-    if (cudaLaunchKernelEx(&cfg, GroupedOutputKernel(), (int *)nullptr, uint32_t(p.rows), uint32_t(groupRank),
+    const auto oa = p.verifyOB ? GroupedOutputKernel<true>() : GroupedOutputKernel();
+    if (cudaLaunchKernelEx(&cfg, oa, (int *)nullptr, uint32_t(p.rows), uint32_t(groupRank),
                            uint32_t(groupColumns), ep, d[0], d[1], d[2], d[3], d[4]) != cudaSuccess)
         return false;
     auto run = V41SingleCtaProjection(p.rows, 5120, projectionWidth) ? Projection<16, 1>::Run : Projection<16, 2>::Run;

@@ -17,5 +17,15 @@ int main() {
                     key == FastllmV41VerificationGraphKey(rows, true))
                     throw std::runtime_error("PP graph layout key collision");
             }
+    std::set<int64_t> verification;
+    for (int rows : {1, 6, 32, INT_MAX})
+        for (bool segmented : {false, true})
+            for (int logical : {0, 1, 6, 48}) {
+                const auto key = FastllmV41VerificationGraphKey(rows, segmented, logical);
+                if (key >= 0 || !verification.insert(key).second)
+                    throw std::runtime_error("rank verifier precision key collision");
+            }
+    if (FastllmV41VerificationGraphKey(6, false, 48) != FastllmV41VerificationGraphKey(6, false, 96))
+        throw std::runtime_error("identical precision regimes should reuse the verifier");
     std::cout << "PASS: " << keys.size() << " independent PP graph layouts\n";
 }
