@@ -1,8 +1,11 @@
 #pragma once
 #include "inkling2.h"
-#include "devices/cuda/cudaworkspace.h"
+#include "devices/cuda/fastllm-hybrid-moe-graph.cuh"
+#include "devices/cuda/fastllm-prefill-workspace.h"
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <functional>
+#include <exception>
 
 namespace fastllm {
 namespace inkling2 {
@@ -12,8 +15,8 @@ inline void check(cudaError_t status) {
     if (status != cudaSuccess)
         throw std::runtime_error(std::string("Inkling CUDA: ") + cudaGetErrorString(status));
 }
-// A captured single-stream graph can reuse a block after its last host
-// tensor view goes out of scope. Keep every backing address until graph teardown.
+// Captured branches join before their tensor views go out of scope. Reuse the
+// block only after that join and keep its backing address until graph teardown.
 class DecodeGraphScratch {
     struct Block { size_t bytes; std::shared_ptr<void> storage; };
     // Shapes replay serially on the decoder stream. They can own the same
@@ -23,7 +26,18 @@ class DecodeGraphScratch {
     std::vector<size_t> order;
     size_t cursor = 0;
     bool sealed = false;
+    struct HostTask {
+        std::function<void()> run;
+        std::exception_ptr failure;
+        static void CUDART_CB invoke(void *data) noexcept {
+            auto &task = *static_cast<HostTask *>(data);
+            try { task.run(); }
+            catch (...) { task.failure = std::current_exception(); }
+        }
+    };
+    std::vector<std::unique_ptr<HostTask>> hostTasks;
 public:
+    std::unique_ptr<cuda::HybridMoeGraph> hybrid;
     static thread_local DecodeGraphScratch *active;
     struct Scope {
         DecodeGraphScratch *previous;
@@ -31,6 +45,23 @@ public:
         ~Scope() { active = previous; }
         Scope(const Scope &) = delete;
     };
+    bool recording() const { return sealed; }
+    void hostNode(std::function<void()> fn, cudaStream_t stream = cudaStreamPerThread) {
+        auto task = std::make_unique<HostTask>();
+        task->run = std::move(fn);
+        hostTasks.push_back(std::move(task));
+        check(cudaLaunchHostFunc(stream, HostTask::invoke, hostTasks.back().get()));
+    }
+    void finishHostTasks() {
+        if (hostTasks.empty()) return;
+        check(cudaStreamSynchronize(cudaStreamPerThread));
+        std::exception_ptr first;
+        for (auto &task : hostTasks) {
+            if (!first) first = task->failure;
+            task->failure = nullptr;
+        }
+        if (first) std::rethrow_exception(first);
+    }
     void ShareStorage(const DecodeGraphScratch &other) { backing = other.backing; }
     std::shared_ptr<void> Acquire(size_t bytes);
     template <class Body> void Warmup(Body &&body) {
@@ -41,6 +72,7 @@ public:
     }
     template <class Body> void Capture(cudaGraphExec_t &exec, Body &&body, size_t *nodes = nullptr) {
         cudaGraph_t graph = nullptr;
+        cudaGraphExec_t candidate = nullptr;
         check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
         bool capturing = true;
         try {
@@ -53,12 +85,15 @@ public:
             check(status);
             if (cursor != order.size()) throw std::runtime_error("Inkling graph scratch plan was not consumed");
             if (nodes) check(cudaGraphGetNodes(graph, nullptr, nodes));
-            check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+            check(cudaGraphInstantiate(&candidate, graph, nullptr, nullptr, 0));
+            if (hybrid) hybrid->seal(graph);
         } catch (...) {
             if (capturing) cudaStreamEndCapture(cudaStreamPerThread, &graph);
+            if (candidate) cudaGraphExecDestroy(candidate);
             if (graph) cudaGraphDestroy(graph);
             throw;
         }
+        exec = candidate;
         cudaGraphDestroy(graph);
         std::vector<size_t>().swap(order);
     }
@@ -72,13 +107,22 @@ template <typename T> struct Buffer {
     T *p = nullptr;
     std::shared_ptr<void> owner;
     Buffer() = default;
-    explicit Buffer(size_t n) {
+    explicit Buffer(size_t n, const std::shared_ptr<CudaWorkspace> &workspace = {}) {
         if (!n)
             return;
         if (DecodeGraphScratch::active) {
             owner = DecodeGraphScratch::active->Acquire(n * sizeof(T));
             p = static_cast<T *>(owner.get());
             return;
+        }
+        if (workspace) {
+            p = static_cast<T *>(workspace->Allocate(n * sizeof(T)));
+            if (p) {
+                owner = std::shared_ptr<void>(p, [workspace](void *ptr) {
+                    workspace->FreeAfterStream(ptr, cudaStreamPerThread);
+                });
+                return;
+            }
         }
 #if CUDART_VERSION >= 11020
         auto result = cudaMallocAsync(reinterpret_cast<void **>(&p), n * sizeof(T), cudaStreamPerThread);
@@ -97,7 +141,9 @@ template <typename T> struct Buffer {
 template <typename T> struct Rows : Buffer<T> {
     int rows = 0, cols = 0;
     Rows() = default;
-    Rows(int r, int c) : Buffer<T>(size_t(r) * c), rows(r), cols(c) {}
+    Rows(int r, int c, const std::shared_ptr<CudaWorkspace> &arena = {})
+        : Buffer<T>(size_t(r) * c, arena), rows(r), cols(c) {}
+    static Rows temporary(int r, int c) { return Rows(r, c, CurrentPrefillWorkspace()); }
     Rows slice(int first, int count) const {
         if (first < 0 || count < 0 || first > rows - count)
             throw std::runtime_error("Inkling row slice out of bounds");
@@ -122,12 +168,27 @@ __device__ inline float blockSum(float v, float *scratch) {
     return sum;
 }
 
+enum class ExpertPhase { Prefill, Decode, Verify };
+
 class ExpertBackend {
 public:
     virtual ~ExpertBackend() = default;
-    virtual Matrix run(const Config &, const Matrix &input, const float *bias, bool decodeArithmetic = false) const = 0;
+    virtual Matrix run(const Config &, const Matrix &input, const float *bias, ExpertPhase phase) const = 0;
 };
-std::vector<std::unique_ptr<ExpertBackend>> loadExperts(const Config &, const Placement &,
-                                                        const std::map<std::string, TensorRange> &, const WeightMap &);
+
+// A decode step spends one admission budget across all host layers and repeated visits.
+class ExpertCacheCycle {
+public:
+    virtual ~ExpertCacheCycle() = default;
+    virtual std::shared_ptr<CudaWorkspace> borrowPrefillWorkspace(size_t bytes, int keep) = 0;
+    virtual void beginStep() = 0;
+    virtual void endStep() = 0;
+};
+struct ExpertLayers {
+    std::unique_ptr<ExpertCacheCycle> cache;
+    std::vector<std::unique_ptr<ExpertBackend>> layers;
+};
+ExpertLayers loadExperts(const Config &, const Placement &, const std::map<std::string, TensorRange> &,
+                         const WeightMap &);
 } // namespace inkling2
 } // namespace fastllm

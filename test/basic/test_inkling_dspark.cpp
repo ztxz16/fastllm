@@ -1,6 +1,7 @@
 // Exercise production proposal sampling and verification. Interpose just the
 // sampler outputs to compare two continuations with different rejected suffixes.
 #include "model.h"
+#include "moe_cache_config.h"
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 #include <cmath>
@@ -348,7 +349,51 @@ static void checkDraftBatch(basellm &model, GenerationConfig sample) {
         throw std::runtime_error("Batched draft disagrees with reference");
 }
 
+// Zero resident slots forces every gate/down projection through the host.
+// Teacher-forced IDs keep the full vocabulary logits comparable across modes.
+static int checkHybridDecode(const char *path) {
+    setenv("FASTLLM_DSPARK_TOKENS", "0", 1);
+    SetDeviceMap({{"cuda:0", 1}});
+    SetMoeDeviceMap({{"cpu", 1}});
+    SetThreads(8);
+    SetMaxTokens(256);
+    SetMoeCudaCacheDeviceBytes(0, 0);
+    std::vector<std::vector<float>> reference;
+    for (bool graph : {false, true}) {
+        SetCudaGraph(graph);
+        auto model = CreateLLMModelFromHF(path, BFLOAT16);
+        model->maxBatch = 1;
+        model->WarmUp();
+        GenerationConfig cfg;
+        cfg.output_logits = true;
+        cfg.do_sample = true;
+        cfg.top_k = 40;
+        cfg.top_p = .95f;
+        cfg.temperature = 1.f;
+        cfg.input_token_length = 12;
+        cfg.output_token_limit = 12;
+        ResponseContext ctx;
+        ctx.pastKeyValues.resize(model->block_cnt);
+        step(*model, ctx, 0, std::vector<int>(12, 320), cfg);
+        controlled = true;
+        verifyLaunches = 0;
+        for (int i = 0; i < 6; ++i) {
+            std::vector<float> logits;
+            step(*model, ctx, 12 + i, {235 + 13 * i}, cfg, &logits);
+            if (!graph) reference.emplace_back(std::move(logits));
+            else if (logits != reference.at(i))
+                throw std::runtime_error("Inkling host-expert replay changed teacher-forced logits");
+        }
+        controlled = false;
+        if (verifyLaunches != (graph ? 6 : 0))
+            throw std::runtime_error("Expected one complete hybrid graph per incremental token");
+    }
+    std::cout << "PASS hybrid decode: six full replays matched eager logits" << std::endl;
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && std::string(argv[2]) == "--hybrid-decode") return checkHybridDecode(argv[1]);
     if (argc != 2 && (argc != 3 || std::string(argv[2]) != "--graph"))
         return 77;
     setenv("FASTLLM_DSPARK_TOKENS", "7", 1);

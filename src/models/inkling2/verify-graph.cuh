@@ -122,18 +122,16 @@ template <class T> RoundPlan &roundPlan(int batch) {
         auto entry = std::make_unique<RoundPlan>(batch, c);
         entry->draftPool.ShareStorage(roundScratch);
         entry->verifyPool.ShareStorage(roundScratch);
-        if (model.SupportsDecodePipeline() && timelineCompatible(batch)) {
+        if (GetFastllmEnv().cudaGraph && timelineCompatible(batch)) {
             try {
                 captureRound<T>(*entry);
             } catch (const std::exception &error) {
-                // The two stages share scratch. Retain the batched eager plan
-                // if either graph could not be instantiated for this shape.
+                // A completed draft graph can still feed an eager verifier.
                 cudaGetLastError();
                 check(cudaStreamSynchronize(cudaStreamPerThread));
-                if (entry->draftExec) check(cudaGraphExecDestroy(entry->draftExec));
-                if (entry->verifyExec) check(cudaGraphExecDestroy(entry->verifyExec));
-                entry->draftExec = entry->verifyExec = nullptr;
-                fprintf(stderr, "[Inkling] batched DSpark without graphs for %d requests: %s\n", batch, error.what());
+                fprintf(stderr, "[Inkling] %s for %d requests: %s\n",
+                        entry->draftExec ? "eager verification with captured draft" : "eager DSpark",
+                        batch, error.what());
             }
         }
         plan = std::move(entry);
@@ -206,16 +204,11 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
         }
     }
     uploadRound(p);
-    if (p.draftExec) {
-        check(cudaGraphLaunch(p.draftExec, cudaStreamPerThread));
-        check(cudaGraphLaunch(p.verifyExec, cudaStreamPerThread));
-    } else {
-        draftBody<T>(p);
-        if (timelineCompatible(b))
-            verifyBody<T>(p);
-        else
-            verifyUnaligned<T>(p, batch);
-    }
+    if (p.draftExec) check(cudaGraphLaunch(p.draftExec, cudaStreamPerThread));
+    else draftBody<T>(p);
+    if (p.verifyExec) launchTargetGraph(p.verifyExec, p.verifyPool);
+    else if (timelineCompatible(b)) verifyBody<T>(p);
+    else verifyUnaligned<T>(p, batch);
     std::vector<int> host(b * (p.chain + 1));
     check(cudaMemcpyAsync(host.data(), p.result.p, host.size() * sizeof(int), cudaMemcpyDeviceToHost,
                           cudaStreamPerThread));

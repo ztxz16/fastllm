@@ -261,9 +261,7 @@ void Inkling2Model::WarmUp() {
         runtime->warmupDecodeGraph();
 }
 bool Inkling2Model::SupportsDecodePipeline() const {
-    return runtime && GetFastllmEnv().cudaGraph &&
-           std::all_of(placement.experts.begin(), placement.experts.end(),
-                       [](inkling2::ExpertDevice d) { return d == inkling2::ExpertDevice::Cuda; });
+    return runtime && GetFastllmEnv().cudaGraph;
 }
 std::unique_ptr<basellm::DecodePipeline> Inkling2Model::CreateDecodePipeline(
         const std::vector<ResponseContext *> &contexts) {

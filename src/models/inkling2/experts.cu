@@ -9,6 +9,7 @@
 #include "devices/cpu/computeutils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-moe-activation.h"
+#include "devices/cuda/fastllm-hybrid-moe-admission.cuh"
 #include "devices/cuda/fastllm-cuda-activation.cuh"
 #include "devices/cuda/fastllm-cuda-select-expert.cuh"
 #include "devices/cpu/alivethreadpool.h"
@@ -24,6 +25,10 @@
 #include <cuda_fp8.h>
 #endif
 #include <algorithm>
+#include <chrono>
+#include <numeric>
+#include "utils/hybrid_moe_routes.h"
+#include "moe_cache_config.h"
 #include "utils/utils.h"
 #include <cmath>
 #include <fstream>
@@ -451,11 +456,11 @@ std::vector<T> readRange(const TensorRange &r, const std::vector<int> &shape, co
         throw std::runtime_error("Truncated Inkling expert tensor in " + r.file);
     return v;
 }
-struct HostTopology {
+struct ExpertLoadContext {
     Buffer<float> situFactors;
     int nodes = 1, smCount = 0;
     bool marlin = false, nativeFp4 = false;
-    void enable() {
+    void enableNuma() {
 #ifdef USE_NUMAS
         nodes = GetNumasMoeShardCount();
         if (nodes < 1)
@@ -469,7 +474,6 @@ struct HostTopology {
 struct HostShard {
     std::shared_ptr<void> storage;
     uint8_t *values = nullptr;
-    float *scales = nullptr;
 };
 struct Projection {
     int rows, cols, group;
@@ -487,7 +491,7 @@ struct Projection {
     std::vector<HostShard> shards;
     std::vector<Packed> host;
     Projection(const std::map<std::string, TensorRange> &files, const std::string &name, int e, int r, int c,
-               ExpertDevice where, HostTopology &topology, bool gateUp)
+               ExpertDevice where, ExpertLoadContext &topology, bool gateUp)
         : rows(r), cols(c), device(where) {
         const auto &weight = files.at(name);
         fp4 = weight.type == "U8";
@@ -539,8 +543,7 @@ struct Projection {
                 size_t per = (e + nodes - 1 - n) / nodes;
                 if (!per)
                     continue;
-                size_t offset = (per * bytes + 63) & ~size_t(63),
-                       total = offset + per * groups * sizeof(float);
+                const size_t total = per * (bytes + groups * sizeof(float));
                 auto &s = shards[n];
 #ifdef USE_NUMAS
                 if (where == ExpertDevice::Numa) {
@@ -552,7 +555,6 @@ struct Projection {
                 if (!s.storage)
                     throw std::bad_alloc();
                 s.values = static_cast<uint8_t *>(s.storage.get());
-                s.scales = reinterpret_cast<float *>(s.values + offset);
             }
         }
         std::vector<float> decoded(groups);
@@ -601,69 +603,35 @@ struct Projection {
                 resident.push_back(std::move(weight));
             } else {
                 auto &s = shards[id % nodes];
-                auto w = s.values + (id / nodes) * bytes;
-                auto a = s.scales + (id / nodes) * groups;
-                std::memcpy(w, raw.data() + size_t(id) * bytes, bytes);
-                std::memcpy(a, decoded.data(), groups * sizeof(float));
+                // NUMA and CUDA consume the same immutable per-expert record.
+                auto *w = s.values + (id / nodes) * (bytes + groups * sizeof(float));
+                auto *a = fp4 ? nullptr : reinterpret_cast<float *>(w + bytes);
+                const int rowBytes = bytes / r, rowGroups = c / group;
+                for (int row = 0; row < r; ++row) {
+                    const int src = gateUp ? 2 * (row % (r / 2)) + row / (r / 2) : row;
+                    auto *codes = raw.data() + size_t(id) * bytes + size_t(src) * rowBytes;
+                    auto *scales = decoded.data() + size_t(src) * rowGroups;
+                    if (fp4) {
+                        auto *dst = w + size_t(row) * rowGroups * 12;
+                        for (int block = 0; block < rowGroups; ++block) {
+                            std::memcpy(dst + 12 * block, codes + 8 * block, 8);
+                            std::memcpy(dst + 12 * block + 8, scales + block, sizeof(float));
+                        }
+                    } else {
+                        std::memcpy(w + size_t(row) * rowBytes, codes, rowBytes);
+                        std::copy_n(scales, rowGroups, a + size_t(row) * rowGroups);
+                    }
+                }
                 host[id] = {w, a};
             }
         }
     }
 };
-struct HostRows : MultiThreadBaseOp {
-    const Projection &w;
-    const std::vector<int> &ids;
-    float *input;
-    uint16_t *bf16Input;
-    float *output;
-    int top, node, nodes, worker, workers;
-    bool gate;
-
-    HostRows(const Projection &p, const std::vector<int> &routes, float *x, uint16_t *bx, float *y,
-             int k, int n, int nn, int thread, int count, bool up)
-        : w(p), ids(routes), input(x), bf16Input(bx), output(y), top(k), node(n), nodes(nn),
-          worker(thread), workers(count), gate(up) {}
-
-    void Run() override {
-        int first = w.rows * worker / workers, end = w.rows * (worker + 1) / workers;
-        for (size_t lane = 0; lane < ids.size(); ++lane) {
-            int e = ids[lane];
-            if (e % nodes != node) continue;
-            const auto &p = w.host[e];
-            size_t offset = (gate ? lane / top : lane) * w.cols;
-            auto *y = output + lane * w.rows;
-            if (w.fp4)
-                MultiThreadLinearFloat32NVFP4Op(input + offset, p.data, nullptr, y,
-                    1, w.cols, w.rows, first, end, p.scales, nullptr, 1, w.group).Run();
-            else
-                MultiThreadLinearBFloat16FP8E4M3Op(bf16Input + offset, p.data, nullptr, y,
-                    1, w.cols, w.rows, first, end, p.scales, 1, w.group).Run();
-        }
-    }
-};
-
-class RoutedExperts : public ExpertBackend {
+class RoutedExperts : public ExpertBackend, protected CudaMoeActivation {
 protected:
     const Data &routerWeight;
     Projection gate, down;
     const int smCount;
-public:
-    RoutedExperts(const std::map<std::string, TensorRange> &files, const std::string &name, const Config &c,
-                  ExpertDevice where, HostTopology &topology, const Data &routerWeight)
-        : routerWeight(routerWeight), gate(files, name + "w13_weight", c.experts, 2 * c.intermediate, c.hidden, where, topology, true),
-          down(files, name + "w2_weight", c.experts, c.hidden, c.intermediate, where, topology, false),
-          smCount(topology.smCount) {
-        if (gate.fp4 != down.fp4)
-            throw std::runtime_error("Inkling expert projection types disagree");
-    }
-
-};
-class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
-    Buffer<float> situFactors;
-    Buffer<DecodeRouter> decodeRouter;
-    Buffer<uint4> packedRouter;
-    std::vector<Data *> weights;
-    std::unique_ptr<CudaGroupedMxfp8Moe> groupedFp8;
     float gateCap, upCap;
 
     void Run(const Data &pair, const Data &scores, Data &mid, int rows, int width) const override {
@@ -681,6 +649,23 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
         else
             throw std::runtime_error("Inkling expert activation dtype mismatch");
     }
+
+public:
+    RoutedExperts(const std::map<std::string, TensorRange> &files, const std::string &name, const Config &c,
+                  ExpertDevice where, ExpertLoadContext &topology, const Data &routerWeight)
+        : routerWeight(routerWeight), gate(files, name + "w13_weight", c.experts, 2 * c.intermediate, c.hidden, where, topology, true),
+          down(files, name + "w2_weight", c.experts, c.hidden, c.intermediate, where, topology, false),
+          smCount(topology.smCount), gateCap(c.gateCap), upCap(c.upCap) {
+        if (gate.fp4 != down.fp4)
+            throw std::runtime_error("Inkling expert projection types disagree");
+    }
+};
+class GpuExperts final : public RoutedExperts {
+    Buffer<float> situFactors;
+    Buffer<DecodeRouter> decodeRouter;
+    Buffer<uint4> packedRouter;
+    std::vector<Data *> weights;
+    std::unique_ptr<CudaGroupedMxfp8Moe> groupedFp8;
 
     template <int TileRows, int ColumnTiles>
     void projectGrouped(const Config &c, int routes, RouteSelection route, const native::Block16 *input,
@@ -809,9 +794,8 @@ class GpuExperts final : public RoutedExperts, private CudaMoeActivation {
 
 public:
     GpuExperts(const std::map<std::string, TensorRange> &files, const std::string &name,
-               const Config &c, ExpertDevice where, HostTopology &topology, const Data &routerWeight)
-        : RoutedExperts(files, name, c, where, topology, routerWeight), weights(gate.nativeCodes.p ? 0 : 2 + 2 * c.experts),
-          gateCap(c.gateCap), upCap(c.upCap) {
+               const Config &c, ExpertLoadContext &topology, const Data &routerWeight)
+        : RoutedExperts(files, name, c, ExpertDevice::Cuda, topology, routerWeight), weights(gate.nativeCodes.p ? 0 : 2 + 2 * c.experts) {
 #if CUDART_VERSION >= 12000
         if (FastllmCudaRuntimeArch() == 120 && c.experts == DecodeRouter::experts && c.topK == 8 && c.hidden % 256 == 0) {
             decodeRouter = Buffer<DecodeRouter>(1);
@@ -852,7 +836,8 @@ public:
     }
     ~GpuExperts() override { if (!gate.nativeCodes.p && !groupedFp8) ReleaseCudaMergeMOE(weights.data(), weights.size()); }
 
-    Matrix run(const Config &c, const Matrix &x, const float *bias, bool decodeArithmetic) const override {
+    Matrix run(const Config &c, const Matrix &x, const float *bias, ExpertPhase phase) const override {
+        const bool decodeArithmetic = phase == ExpertPhase::Verify;
         if (c.topK <= 0 || c.topK > 50 || c.topK > c.experts) throw std::runtime_error("Inkling expert routing geometry");
         Buffer<DecodeRouter> batchRouter(decodeArithmetic && x.rows > 1 && decodeRouter.p
                                         ? x.rows : 0);
@@ -902,107 +887,32 @@ public:
         return out;
     }
 };
-class HostExperts final : public RoutedExperts {
-    void select(const Config &c, const Matrix &router, const float *bias, const Buffer<int> &ids,
-                const Matrix &scores) const {
-        Data logits(FLOAT32, {router.rows, c.experts}, CUDA, router.p);
-        Data biasView(FLOAT32, {c.experts}, CUDA, const_cast<float *>(bias));
-        Data indices(INT32, {router.rows, c.topK}, CUDA, ids.p);
-        Data scales(FLOAT32, indices.dims, CUDA, scores.p);
-        if (!FastllmCudaFusedSigmoidSelectExpert(logits, &biasView, indices, scales, c.topK, true, c.routeScale)) {
-            Matrix probabilities(router.rows, c.experts);
-            Data probs(FLOAT32, logits.dims, CUDA, probabilities.p);
-            if (!FastllmCudaSigmoid(logits, probs) ||
-                !FastllmCudaSelectExpert(probs, &biasView, indices, scales, c.topK, true, c.routeScale))
-                throw std::runtime_error("Inkling expert routing geometry");
-        }
-    }
-
-public:
-    using RoutedExperts::RoutedExperts;
-
-    Matrix run(const Config &c, const Matrix &x, const float *bias, bool decodeArithmetic) const override {
-        const int rows = x.rows, top = c.topK;
-        Buffer<int> indices(size_t(rows) * top);
-        Matrix scores(rows, top);
-        select(c, routeLogits(x, routerWeight), bias, indices, scores);
-        std::vector<int> hostIds(size_t(rows) * top);
-        check(cudaMemcpy(hostIds.data(), indices.p, hostIds.size() * sizeof(int), cudaMemcpyDeviceToHost));
-        auto project = [&](const Projection &w, auto source, bool up) {
-            Matrix input(up ? rows : rows * top, w.cols);
-            quantizeInto(source, input.p, input.rows, input.cols, w.fp4, smCount);
-            Matrix out(up ? rows * top : rows, w.rows);
-            std::vector<float> hostIn(size_t(input.rows) * input.cols), hostOut(size_t(rows) * top * w.rows);
-            check(cudaMemcpy(hostIn.data(), input.p, hostIn.size() * sizeof(float), cudaMemcpyDeviceToHost));
-            std::vector<uint16_t> bf16Input;
-            if (!w.fp4) {
-                bf16Input.resize(hostIn.size());
-                std::transform(hostIn.begin(), hostIn.end(), bf16Input.begin(), Float32ToBFloat16RNEBits);
-            }
-            auto *pool = GetAlivePool();
-            const auto interval = pool->curActivateThreadInterval;
-            std::vector<std::vector<int>> groups;
-#ifdef USE_NUMAS
-            if (w.device == ExpertDevice::Numa)
-                groups = GetNumasExpertWorkerIds();
-#endif
-            if (groups.empty() ||
-                std::any_of(groups.begin(), groups.end(), [](const auto &group) { return group.empty(); })) {
-                // With fewer workers than NUMA nodes, the active workers must cover every expert.
-                groups.assign(1, {});
-                for (int id = interval.first; id < interval.second; ++id)
-                    groups[0].push_back(id);
-            }
-            if (groups.front().empty())
-                throw std::runtime_error("Inkling host experts need an active CPU worker");
-            std::vector<HostRows> tasks;
-            tasks.reserve(interval.second - interval.first);
-            for (size_t node = 0; node < groups.size(); ++node) {
-                const auto &group = groups[node];
-                for (size_t pos = 0; pos < group.size(); ++pos) {
-                    tasks.emplace_back(w, hostIds, hostIn.data(), bf16Input.data(), hostOut.data(), top,
-                                       node, groups.size(), pos, group.size(), up);
-                    pool->PushOp(group[pos], &tasks.back());
-                }
-            }
-            for (const auto &group : groups)
-                for (int id : group)
-                    pool->Wait(id);
-            if (!up) {
-                for (int row = 0; row < rows; ++row) {
-                    float *dst = hostOut.data() + size_t(row) * w.rows;
-                    const float *first = hostOut.data() + size_t(row) * top * w.rows;
-                    for (int col = 0; col < w.rows; ++col) {
-                        float sum = first[col];
-                        for (int lane = 1; lane < top; ++lane) sum += first[size_t(lane) * w.rows + col];
-                        dst[col] = sum;
-                    }
-                }
-            }
-            check(cudaMemcpy(out.p, hostOut.data(), size_t(out.rows) * out.cols * sizeof(float), cudaMemcpyHostToDevice));
-            return out;
-        };
-        auto pair = project(gate, InputRow{x.p}, true);
-        RoutedSiTU<float, true> activation{pair.p, scores.p, c.gateCap, c.upCap};
-        return project(down, activation, false);
-    }
-};
+#include "hybrid-experts.cuh"
 } // namespace
-std::vector<std::unique_ptr<ExpertBackend>> loadExperts(const Config &c, const Placement &p,
-                                                        const std::map<std::string, TensorRange> &files, const WeightMap &weights) {
-    HostTopology topology;
+ExpertLayers loadExperts(const Config &c, const Placement &p, const std::map<std::string, TensorRange> &files,
+                         const WeightMap &weights) {
+    ExpertLoadContext topology;
+    ExpertLayers experts;
     check(cudaDeviceGetAttribute(&topology.smCount, cudaDevAttrMultiProcessorCount, p.gpu));
-    if (FastllmCudaRuntimeArch() == 120 && c.hidden % 64 == 0 && c.intermediate % 64 == 0) {
-        int image = 0;
-        check(cudaMemcpyFromSymbol(&image, native::nativeImage, sizeof(image)));
-        topology.nativeFp4 = image != 0;
-    }
-    if (std::find(p.experts.begin(), p.experts.end(), ExpertDevice::Cuda) != p.experts.end())
+    const int cudaLayers = std::count(p.experts.begin(), p.experts.end(), ExpertDevice::Cuda);
+    if (cudaLayers) {
+        if (FastllmCudaRuntimeArch() == 120 && c.hidden % 64 == 0 && c.intermediate % 64 == 0) {
+            int image = 0;
+            check(cudaMemcpyFromSymbol(&image, native::nativeImage, sizeof(image)));
+            topology.nativeFp4 = image != 0;
+        }
         topology.marlin = !topology.nativeFp4 && c.hidden % 128 == 0 && c.intermediate % 128 == 0 && c.topK <= 16 &&
                           FastllmCudaNVFP4E4M3GroupedMoeSupported(p.gpu);
-    if (std::find(p.experts.begin(), p.experts.end(), ExpertDevice::Numa) != p.experts.end())
-        topology.enable();
-    std::vector<std::unique_ptr<ExpertBackend>> layers;
+    }
+    int hostSlots = 0;
+    std::unique_ptr<HybridCacheCycle> cache;
+    std::shared_ptr<HybridGraphStorage> graphStorage;
+    if (cudaLayers < c.layers) {
+        if (std::find(p.experts.begin(), p.experts.end(), ExpertDevice::Numa) != p.experts.end())
+            topology.enableNuma();
+        cache = planHybridCache(c, p, files, hostSlots);
+        if (hostSlots < c.experts) graphStorage = std::make_shared<HybridGraphStorage>();
+    }
     for (int i = 0; i < c.layers; ++i) {
         auto mlp = "model.llm.layers." + std::to_string(i) + ".mlp.";
         const auto &router = weights.weight.at(mlp + "gate.weight");
@@ -1010,11 +920,13 @@ std::vector<std::unique_ptr<ExpertBackend>> loadExperts(const Config &c, const P
             throw std::runtime_error("Inkling router shape or dtype");
         auto prefix = mlp + "experts.";
         if (p.experts[i] == ExpertDevice::Cuda)
-            layers.push_back(std::make_unique<GpuExperts>(files, prefix, c, p.experts[i], topology, router));
+            experts.layers.push_back(std::make_unique<GpuExperts>(files, prefix, c, topology, router));
         else
-            layers.push_back(std::make_unique<HostExperts>(files, prefix, c, p.experts[i], topology, router));
+            experts.layers.push_back(std::make_unique<HostExperts>(files, prefix, c, p.experts[i], topology, router,
+                                                                   hostSlots, cache.get(), graphStorage));
     }
-    return layers;
+    experts.cache = std::move(cache);
+    return experts;
 }
 } // namespace inkling2
 } // namespace fastllm
