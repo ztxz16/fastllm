@@ -81,6 +81,15 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data &, const fastll
 
 namespace fastllm {
     namespace {
+        bool V41VerifyOwnerFfnEnabled() {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+            return V41EnvFlag("FASTLLM_DSV41_LOCAL_EP_GRAPH") && V41EnvFlag("FASTLLM_DSV41_VERIFY_OWNER_FFN") &&
+                !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
+#else
+            return false;
+#endif
+        }
+
         void V41ResizeScratchRows(std::vector<Data> &rows, size_t size) {
             // Data's copy constructor copies the root allocation, not the TP
             // replicas. Scratch contents are overwritten in this forward, so
@@ -4844,7 +4853,9 @@ namespace fastllm {
         }
         // Compatible decode requests share one layerwise verification batch.
         // Other phases/configurations retain the bounded per-request fallback.
-        const bool batchedVerify = v41DsparkEnabled && v41AttentionDP == 1 &&
+        const bool verifyAcrossOwners = executionMode == ExecutionMode::Gpu && v41AttentionDP == 8 &&
+            V41VerifyOwnerFfnEnabled();
+        const bool batchedVerify = v41DsparkEnabled && (v41AttentionDP == 1 || verifyAcrossOwners) &&
             std::all_of(segments.begin(), segments.end(), [&](const DeepSeekV41Segment &seg) {
                 const size_t i = &seg - segments.data();
                 return seg.seqlen == 1 && seg.startPos > 0 && seg.state->dspark &&
@@ -8497,6 +8508,10 @@ namespace fastllm {
                     std::vector<std::pair<int, int>> verifyShapes;
                     for (int batch : batches) if (batch <= this->maxBatch)
                         verifyShapes.emplace_back(batch, v41DsparkTokens + 1);
+                    // A request without a draft verifies just its anchor. Warm this
+                    // transient shape last so the first request uses the quantized FFN too.
+                    if (v41AttentionDP == 8 && V41VerifyOwnerFfnEnabled())
+                        verifyShapes.emplace_back(1, 1);
                     for (const auto &shape : verifyShapes) {
                         const int batch = shape.first, count = shape.second;
                         AssertInFastLLM(batch <= INT_MAX / count, "verification warmup rows overflow");

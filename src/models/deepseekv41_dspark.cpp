@@ -3271,7 +3271,13 @@ namespace fastllm {
 #endif
         };
 #ifdef USE_CUDA
-        if (!graphState || !DsRunDraftGraph(*graphState, backbone)) backbone();
+        // A growing single-request history does not reuse its exact-width graph.
+        // Run the same prepared kernels once, preserving the compact attention layout.
+        if (graphState && batch == 1 && valid < window_size && !randomDraft &&
+            !hybridDraft && !diskDraft && !DsEnvFlag("FASTLLM_DSPARK_COMPACT_WINDOW")) {
+            FastllmCudaGraphPreparation preparation;
+            backbone();
+        } else if (!graphState || !DsRunDraftGraph(*graphState, backbone)) backbone();
 #else
         backbone();
 #endif

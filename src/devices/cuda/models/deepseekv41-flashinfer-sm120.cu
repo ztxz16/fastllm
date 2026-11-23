@@ -7,6 +7,8 @@
 #include <memory>
 #include <map>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 using namespace flashinfer::sparse_mla_sm120;
@@ -18,9 +20,10 @@ struct Plan {
     void *storage = nullptr;
     std::shared_ptr<void> owner;
     int device = -1, gridY = 0;
-    bool gathered = false;
+    bool gathered = false, trimVerify = false;
     bf16 *decoded = nullptr;
     int32_t *decodedIndices = nullptr;
+    int32_t *extraLengths = nullptr;
     bf16 *mid = nullptr;
     float *midLse = nullptr;
     void BindStorage() {
@@ -29,6 +32,7 @@ struct Plan {
         midLse = reinterpret_cast<float *>(mid + count * 512);
         decoded = gathered ? reinterpret_cast<bf16 *>(midLse + count) : nullptr;
         decodedIndices = gathered ? reinterpret_cast<int32_t *>(decoded + size_t(batch) * (128 + width) * 512) : nullptr;
+        extraLengths = gathered && trimVerify ? decodedIndices + size_t(batch) * (128 + width) : nullptr;
     }
 };
 
@@ -55,13 +59,20 @@ __device__ inline void DecodeAttentionKVVector(const uint8_t *src, int d,
 template <bool Verify>
 __global__ void GatherAttentionKV(const FastllmV41FullDecodeRequest *requests,
         const int32_t *selected, bf16 *decoded, int32_t *indices,
-        int width, int rows, int ratio) {
+        int width, int rows, int ratio, int32_t *extraLengths) {
     const int count = 128 + width;
     const int task = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = task / 64, vector = task % 64;
     if (row >= rows * count) return;
     const int token = row / count, logical = row % count, d = vector * 8;
     const auto request = requests[token];
+    if constexpr (Verify) {
+        if (extraLengths && !logical && !vector) {
+            const int end = requests[request.chunkBegin].position +
+                (request.chunkLength > 0 ? request.chunkLength : rows);
+            extraLengths[token] = request.compressedKV && ratio > 0 ? min(end / ratio, width) : 0;
+        }
+    }
     const bool compressed = logical >= 128;
     int id = -1;
     if (compressed && request.compressedKV) {
@@ -79,6 +90,8 @@ __global__ void GatherAttentionKV(const FastllmV41FullDecodeRequest *requests,
         if (p >= 0 && p < end) id = p % 128;
     }
     if (!vector) indices[row] = id < 0 ? -1 : row;
+    // The attention consumer replaces a negative index with zero in registers.
+    if constexpr (Verify) if (extraLengths && id < 0) return;
     const auto *src = id < 0 ? nullptr :
         static_cast<const uint8_t *>(compressed ? request.compressedKV : request.windowKV)
             + size_t(id) * (compressed ? 288 : 528);
@@ -291,12 +304,15 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     p->heads = c.heads;
     p->batch = c.batch;
     p->verifying = c.verifying;
+    const char *fullWidth = std::getenv("FASTLLM_DSV41_FULL_VERIFY_KV");
+    p->trimVerify = c.verifying && !(fullWidth && !std::strcmp(fullWidth, "1"));
     p->scratchHeads = (c.heads + 15) / 16 * 16;
     // cudaMalloc aligns the BF16 split tensor; each split occupies 1024 bytes.
     const size_t midCount = size_t(c.batch) * p->scratchHeads * p->splits;
     const size_t selectedRows = p->gathered ? decodedRows : 0;
     const size_t baseBytes = midCount * (512 * sizeof(bf16) + sizeof(float));
-    const size_t bytes = baseBytes + selectedRows * (1024 + sizeof(int32_t));
+    const size_t bytes = baseBytes + selectedRows * (1024 + sizeof(int32_t)) +
+        (p->gathered && p->trimVerify ? size_t(c.batch) * sizeof(int32_t) : 0);
     if (cudaMalloc(&p->storage, bytes) != cudaSuccess) {
         cudaGetLastError();
         // Optional decoded KV must not make a formerly supported plan fail.
@@ -322,7 +338,7 @@ bool FastllmV41FlashInferShareWorkspace(void *handle, void *source) {
     auto *p = static_cast<Plan *>(handle), *q = static_cast<Plan *>(source);
     if (!p || !q || p->device != q->device || p->batch != q->batch ||
         p->scratchHeads != q->scratchHeads || p->splits != q->splits ||
-        p->width != q->width || p->gathered != q->gathered || !q->owner) return false;
+        p->width != q->width || p->gathered != q->gathered || p->trimVerify != q->trimVerify || !q->owner) return false;
     p->owner = q->owner;
     p->storage = p->owner.get();
     p->BindStorage();
@@ -342,14 +358,14 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
         const int n = p->batch * (128 + p->width);
         auto gather = p->verifying ? GatherAttentionKV<true> : GatherAttentionKV<false>;
         gather<<<(n * 64 + 255) / 256, 256, 0, stream>>>(request,
-            static_cast<const int32_t *>(b.topk), p->decoded, p->decodedIndices, p->width, p->batch, p->ratio);
+            static_cast<const int32_t *>(b.topk), p->decoded, p->decodedIndices, p->width, p->batch, p->ratio, p->extraLengths);
         const cudaError_t gathered = cudaGetLastError();
         if (gathered != cudaSuccess) return gathered;
         auto kernel = AttentionKernel<false, false, true>(p->heads, true);
         kernel<<<dim3(p->batch, p->scratchHeads / 16, p->splits), Dsv41Bf16Resources::BLOCK_THREADS, sizeof(Dsv41Bf16Smem), stream>>>(
             static_cast<const bf16 *>(b.q), reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices,
             p->mid, p->midLse, nullptr, reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices + 128,
-            nullptr, p->width, 1, 1024, p->batch, p->heads, 128, p->splits, 1, p->scale, 1024,
+            p->extraLengths, p->width, 1, 1024, p->batch, p->heads, 128, p->splits, 1, p->scale, 1024,
             128 + p->width, 128 + p->width, Dsv41Pages{1, false}, nullptr, nullptr, sizeof(void *), nullptr, 0, nullptr, nullptr);
     } else {
         auto kernel = p->verifying ? AttentionKernel<true>(p->heads, p->width != 0)

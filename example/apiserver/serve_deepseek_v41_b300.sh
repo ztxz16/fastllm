@@ -2,6 +2,11 @@
 # DeepSeek-V4.1 Flash on eight B300 GPUs, with one attention replica per rank.
 set -euo pipefail
 model=${1:?Usage: serve_deepseek_v41_b300.sh MODEL_PATH}
+dspark=${FASTLLM_DSV41_DSPARK:-0}
+if [[ "$dspark" != 0 ]]; then
+    export FASTLLM_DSV41_VERIFY_OWNER_FFN="${FASTLLM_DSV41_VERIFY_OWNER_FFN:-1}"
+    export FASTLLM_DSV41_VERIFY_PEER_AR="${FASTLLM_DSV41_VERIFY_PEER_AR:-1}"
+fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export FASTLLM_EXECUTION_MODE=gpu
 export FASTLLM_CUDA_GRAPH=1
@@ -58,6 +63,6 @@ export FASTLLM_DSV41_EARLY_MOE_PACK="${FASTLLM_DSV41_EARLY_MOE_PACK:-$boundary}"
 exec "${PYTHON:-python3}" -m ftllm.cli serve "$model" \
   --host 127.0.0.1 --port "${PORT:-18417}" --model_name deepseek-v41-flash-1017 \
   --tp 8 --attn-dp-size 8 --moe_device multicuda:0,1,2,3,4,5,6,7 --ngram_device cuda \
-  --atype float32 --kv_cache_dtype fp4_e2m1 --dspark 0 --no_fast_prefill \
+  --atype float32 --kv_cache_dtype fp4_e2m1 --dspark "$dspark" --speculative_dspark_confidence_threshold "${FASTLLM_DSPARK_CONFIDENCE_THRESHOLD:-0}" --no_fast_prefill \
   --max_batch 128 --tokens 131072 --max_context_length 8192 --chunked_prefill_size 2048 \
   --cache_history false --prefix_cache false

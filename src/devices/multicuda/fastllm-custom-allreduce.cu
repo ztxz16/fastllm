@@ -1897,7 +1897,7 @@ bool LaunchRegisteredCustomAr(CustomArState &state, CustomArRankData *rankData,
     const size_t policyBytes = rowElements
         ? (size_t)rowElements * CustomArTypeBytes(dataType) : bytes;
     if ((dataType == fastllm::DataType::BFLOAT16 || dataType == fastllm::DataType::FLOAT32) &&
-        state.taggedPeer && state.taggedPeer->CanUse(count)) {
+        state.taggedPeer && state.taggedPeer->CanUse(count, dataType == fastllm::DataType::FLOAT32)) {
         const bool launched = state.taggedPeer->Launch(
             data, dest, count, rank, dataType == fastllm::DataType::FLOAT32);
         if (cudaGetLastError() != cudaSuccess) {

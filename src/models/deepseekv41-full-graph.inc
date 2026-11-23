@@ -289,10 +289,12 @@ bool V41FullPartition(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &se
     const auto &topology = g.attentionRuntime->Layout();
     std::vector<int> owners;
     local.assign(topology.Size(), {});
+    if (g.verifying && segments.size() > 1 && !V41VerifyOwnerFfnEnabled()) return false;
     for (const auto &s : segments) {
-        const bool mode = g.verifying ? segments.size() == 1 && s.spec &&
-            s.spec->deferWindow && s.spec->wantAllTokens && s.seqlen == g.batch : !s.spec && s.seqlen == 1;
+        const bool mode = g.verifying ? s.spec && s.spec->deferWindow && s.spec->wantAllTokens &&
+            s.seqlen > 0 : !s.spec && s.seqlen == 1;
         if (!s.state || !mode || s.startPos < 1 ||
+            s.offset != int(owners.size()) || s.seqlen > g.batch - s.offset ||
             s.state->attentionGroup < 0 || s.state->attentionGroup >= topology.attentionDP ||
             s.state->attentionRanks.size() != size_t(topology.attentionTP)) return false;
         owners.insert(owners.end(), s.seqlen, s.state->attentionGroup);
@@ -303,16 +305,20 @@ bool V41FullPartition(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &se
             part.state = s.state->attentionRanks[t];
             if (g.verifying) part.spec = s.spec->attentionRanks[t].get();
             if (!part.state) return false;
-            part.offset = local[rank].size();
-            local[rank].push_back(std::move(part));
+            auto &parts = local[rank];
+            part.offset = parts.empty() ? 0 : parts.back().offset + parts.back().seqlen;
+            parts.push_back(std::move(part));
         }
     }
+    if (int(owners.size()) != g.batch) return false;
     rows = parallel::RowPartition(topology.attentionDP, owners);
     if (!g.attentionGraphs.empty()) for (int r = 0; r < topology.Size(); ++r) {
         const auto &graph = g.attentionGraphs[r];
         int count = 0;
         for (const auto &part : local[r]) count += part.seqlen;
         if (count != (graph ? graph->batch : 0)) return false;
+        if (graph && g.verifying && graph->layers[graph->firstLayer]->config.segmentedVerify !=
+                (local[r].size() > 1)) return false;
         if (graph && (!g.attentionStates[r]->captured || g.attentionStates[r]->disabled ||
             g.attentionStates[r]->fullDecode != graph)) return false;
     }
@@ -639,6 +645,10 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
     const bool attentionOnly = v41AttentionRankRuntime != nullptr;
     const bool verifying = !segments.empty() && std::all_of(segments.begin(), segments.end(),
         [](const DeepSeekV41Segment &s) { return s.spec && s.spec->deferWindow && s.spec->wantAllTokens; });
+    const auto capturesDraftInput = [&](int layer) {
+        return verifying && std::find(v41DsparkTargetLayerIds.begin(), v41DsparkTargetLayerIds.end(),
+                                      layer) != v41DsparkTargetLayerIds.end();
+    };
     const bool independentDecode = int(segments.size()) == batch &&
         std::all_of(segments.begin(), segments.end(),
             [](const DeepSeekV41Segment &s) { return s.seqlen == 1 && !s.spec; });
@@ -748,7 +758,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         size_t transferWidth = size_t(embed_dim) * sizeof(uint16_t) +
             size_t(2 * hc_mult + hc_mult * hc_mult) * sizeof(float);
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-        if (!hybrid && !pipeline && !verifying && runtime.Layout().attentionTP == 1 && g->devices.size() == 8 &&
+        if (!hybrid && !pipeline && (!verifying || V41VerifyOwnerFfnEnabled()) &&
+            runtime.Layout().attentionTP == 1 && g->devices.size() == 8 &&
             V41EnvFlag("FASTLLM_DSV41_LOCAL_EP_GRAPH") &&
             norm_topk_prob && num_experts_per_tok == 6 && embed_dim == 5120 &&
             std::all_of(g->attentionGraphs.begin(), g->attentionGraphs.end(), [](auto &x) {
@@ -1008,6 +1019,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         // weight replica on each rank. Select each owner's request metadata
         // before the lookup, without publishing hidden states at these layers.
         if (!g->ownerFfn.empty() && t.gpuTable && engram_layer_ids[i] > firstLayer &&
+            !capturesDraftInput(engram_layer_ids[i]) &&
             !V41EnvFlag("FASTLLM_DSV41_DISABLE_OWNER_ENGRAM")) {
             const auto prefix = "layers." + std::to_string(engram_layer_ids[i]) + ".engram.";
             auto &w = weight[prefix + "wkv.weight"];
@@ -1303,8 +1315,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                    weight[prefix + ".engram.k_weight"], &e.mask, rms_norm_eps);
                 });
             }
-            if (verifying && std::find(v41DsparkTargetLayerIds.begin(),
-                    v41DsparkTargetLayerIds.end(), l) != v41DsparkTargetLayerIds.end()) {
+            if (capturesDraftInput(l)) {
                 capture([&] {
                     V41HcApplyPre(ws.hiddenStates, ws.dsparkPreMix, g->mainHidden[l]);
                 });
@@ -1357,11 +1368,10 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 }
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
                 if (!g->ownerFfn.empty()) {
-                    // Hidden states, router scores and KV rows remain on the same
-                    // request owner. Only Engram boundaries and the head consume
-                    // a global sequence-ordered tensor. All ranks enter MegaMoE.
+                    // DSpark reads pre-attention hidden states in global token order.
+                    // Publish the previous layer before any of its features are sampled.
                     const auto nextEngram = g->engrams.find(l + 1);
-                    const bool publish = l + 1 == endLayer ||
+                    const bool publish = capturesDraftInput(l + 1) || l + 1 == endLayer ||
                         (nextEngram != g->engrams.end() && nextEngram->second->owners.empty());
                     capture([&] {
                         runtime.Enqueue([&](int rank, int device) {
@@ -1966,7 +1976,8 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             g->engramWorker.reset(new V41FullEngramWorker(std::move(asyncEntries)));
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
         if (!g->ownerFfn.empty())
-            fprintf(stderr, "[Fastllm] owner-local EP8 full decode batch=%d layers=%d\n", batch, endLayer-firstLayer);
+            fprintf(stderr, "[Fastllm] owner-local EP8 full %s batch=%d layers=%d\n",
+                    verifying ? "verify" : "decode", batch, endLayer-firstLayer);
 #endif
         state->fullDecode = g;
         if (!attentionOnly) fprintf(stderr,
@@ -2322,8 +2333,8 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         for (const auto &segment : f.inputSegments)
             V41FullBindVerify(g, segment, v41DsparkTargetLayerIds);
         if (g->attentionRuntime) g->attentionRuntime->Run([&](int rank, int) {
-            if (g->attentionGraphs[rank])
-                V41FullBindVerify(g->attentionGraphs[rank], attentionSegments[rank][0], {});
+            for (const auto &segment : attentionSegments[rank])
+                V41FullBindVerify(g->attentionGraphs[rank], segment, {});
         });
         if (f.pipeline) f.pipeline->fullVerify = true;
     }
