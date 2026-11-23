@@ -1,0 +1,161 @@
+#pragma once
+#include "models/hy4_flash.h"
+#include <array>
+#include <deque>
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+#include "devices/cuda/fastllm-mla-plan.h"
+#endif
+
+namespace fastllm {
+// A projection can consume an ordinary matrix or the contiguous matrix of a
+// selected expert. Scale blocks use the checkpoint's original storage type.
+struct Hy4View {
+    const void *data = nullptr, *scale = nullptr;
+    int type = 0, scaleType = 0, rows = 0, cols = 0;
+    bool floatMath = false;
+};
+void ReadEngramRow(const void *table, bool scalarFp8, int64_t row, uint16_t *out);
+struct Hy4Source {
+    std::string file, dtype;
+    uint64_t offset = 0, bytes = 0;
+    std::vector<int> dims;
+};
+struct Hy4FlashModel::Weights {
+    std::map<std::string, Hy4Source> meta;
+    std::map<std::string, std::vector<uint8_t>> host;
+    struct Allocation {
+        int device;
+        void *ptr;
+        ~Allocation();
+    };
+    std::map<std::pair<int, std::string>, std::unique_ptr<Allocation>> gpu;
+    json11::Json config;
+    // GGUF stores one E4M3 byte per Engram element and already folds the row quantizer.
+    bool gguf = false;
+    std::map<int, std::array<int64_t, 3>> engramFactors;
+    bool SkipEngram(int token) const {
+        // Every vocabulary entry in a HY4 GGUF has an explicit compressed ID.
+        return !gguf && (token == config["engram_pad_id"].int_value() || token == 120120 || token == 120124);
+    }
+    const void *Host(const std::string &name);
+    const void *Device(const std::string &name, int device);
+    Hy4View View(const std::string &name, int device);
+};
+#ifdef FASTLLM_ENABLE_HY4_CUDA
+namespace hy4 {
+inline constexpr int KVPageTokens = 128;
+// Updated once per step and GPU, before launching a reusable decode graph.
+struct StepInput {
+    int token, previous, older, position;
+};
+class KVPagePool;
+struct KVPools {
+    std::map<std::pair<int, int>, std::shared_ptr<KVPagePool>> layouts;
+};
+struct Scratch {
+    const StepInput *step = nullptr;
+    size_t generation = 0;
+    int device;
+    // Each intermediate is allocated at its maximum live size for this step.
+    // std::map nodes keep entries stable while independent ops request space.
+    struct Buffer {
+        float *ptr = nullptr;
+        size_t count = 0;
+    };
+    std::map<std::string, Buffer> buffers;
+    KVPools kvPools;
+    const bool mlaSupported;
+    std::map<std::pair<int, int>, std::shared_ptr<FastllmCudaMLAPlan>> mlaPlans; // (heads, query rows)
+
+    std::map<std::pair<int, int>, std::shared_ptr<void>> engramInputs;
+    explicit Scratch(int device) : device(device), mlaSupported(FastllmCudaMLAPagedPlanSupported(device)) {}
+    ~Scratch();
+    float *Get(const std::string &name, size_t count);
+};
+using Weights = Hy4FlashModel::Weights;
+const StepInput *UploadStep(Scratch &, const std::vector<StepInput> &);
+void CopyStageCaptured(float *dst, const float *src, size_t count);
+void ProjectHead(Weights &, Scratch &, float *streams, float *logits, Data *hidden, int pos, int width,
+                 int rows = 1);
+struct DraftMemory {
+    Data keys, values, recalled;
+};
+struct DraftRequest {
+    std::array<DraftMemory, 5> providers;
+    Data hidden;
+    std::deque<int> pending;
+    int expected = -1;
+    bool CanVerify(const GenerationConfig &config) const;
+};
+void DraftEmbed(Weights &, Scratch &, int anchor, int width, int mask, const float *targetHidden,
+                float *block);
+struct KVPage;
+void DraftLayer(Weights &, Scratch &, int draftLayer, int base, int width, DraftMemory &, float *block,
+                const KVPage *const *pages);
+// One request's conditional proposal rows, borrowed until target verification completes.
+struct DraftProposal {
+    float *logits = nullptr, *logsumexp = nullptr;
+    int *tokens = nullptr;
+};
+DraftProposal PrepareProposal(Scratch &, int request, int batch, int drafts, int vocab);
+std::vector<int> DraftReadout(Weights &, Scratch &, int anchor, int width, float *block,
+                              const GenerationConfig &, DraftProposal);
+float *TargetProbabilities(Scratch &, float *target, int rows, int vocab, const GenerationConfig &);
+std::vector<int> VerifyDraft(Scratch &, float *target, int width, int vocab, const GenerationConfig &,
+                             DraftProposal, const int *candidates);
+void SaveDraftHidden(Data &ring, int device, int position, int width, const float *hidden,
+                     const StepInput *step = nullptr);
+void Embed(Weights &, Scratch &, int token, float *streams);
+void HyperPreNorm(Weights &, Scratch &, const std::string &prefix, const std::string &normName,
+                  float *streams, float *input, float *posts, int rows);
+void HyperPostNorm(Weights &, Scratch &, const std::string &normName, float *streams, const float *branch,
+                   const float *posts, int rows, bool optional = false);
+enum class EngramRowStorage { Host, Pinned, Mapped };
+void Engram(Weights &, Scratch &, int layer, const std::array<int, 3> &ids, float *streams,
+            const uint16_t *rows = nullptr, EngramRowStorage storage = EngramRowStorage::Host);
+void PrepareEngramInput(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids);
+void RunPreparedEngram(Weights &, Scratch &, int layer, int row, const std::array<int, 3> &ids,
+                       float *streams);
+struct KVPage {
+    void *key, *value;
+};
+struct AttentionCache {
+    const KVPage *target, *draft;
+};
+void TruncateKV(Data &key, Data &value, int end);
+const KVPage *ReservePages(KVPools &, int device, Data &key, Data &value, int end, int retained, int keyWidth,
+                           int valueWidth);
+const AttentionCache *PrepareAttentionCaches(Weights &w, Scratch &s, int firstLayer, int endLayer,
+                                             int blockCount, const std::vector<int> &lengths,
+                                             const std::vector<std::pair<Data *, Data *>> &past,
+                                             const std::vector<int> &providers,
+                                             const std::vector<DraftRequest *> &states, int draftWidth);
+const AttentionCache *UploadAttentionCaches(Scratch &, const std::vector<AttentionCache> &);
+struct AttentionRow {
+    int position;
+    int draftWidth;
+    DraftMemory *draft;
+    int draftLayer;
+    const StepInput *step;
+    const AttentionCache *cache;
+};
+void PagedAttentionBatch(Weights &, Scratch &, int layer, const std::vector<AttentionRow> &, const float *,
+                         float *);
+void DenseMlpBatch(Weights &, Scratch &, const std::string &, const float *, float *, int rows);
+void RouteBatch(Weights &, Scratch &, int layer, const float *, int *, float *, float *, int rows);
+const float *SharedExpertsBatch(Weights &, Scratch &, int layer, const float *input, int rows);
+void JoinExpertsBatch(Weights &, Scratch &, int layer, const float *shared, const float *routed,
+                      float *out, int rows);
+void CombineExpertsBatch(Weights &, Scratch &, int layer, const float *, const float *, float *, int rows);
+void ResidentExperts(Weights &, Scratch &, int layer, const float *latent, const int *ids,
+                     const float *scores, float *result, int rows);
+void *Allocate(int device, size_t bytes);
+void Free(int device, void *ptr);
+void Select(int device);
+void CopyToHost(void *dst, const void *src, size_t bytes);
+void CopyToGPU(void *dst, const void *src, size_t bytes);
+void CopyStage(float *dst, int dstDevice, const float *src, int srcDevice, size_t count);
+std::array<int64_t, 16> EngramRows(Weights &, int layer, const std::array<int, 3> &ids);
+} // namespace hy4
+#endif
+} // namespace fastllm

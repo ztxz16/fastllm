@@ -1,5 +1,23 @@
 #include "fastllm-attention-common.cuh"
 
+#ifdef FASTLLM_ENABLE_FLASHINFER
+#include "devices/cuda/fastllm-dense-prefill.cuh"
+
+cudaError_t fastllm::DensePrefillHalf128(flashinfer::SinglePrefillParams<half, half, half> &params,
+                                          bool causal, cudaStream_t stream,
+                                          unsigned tileQ, unsigned mmaKvLimit) {
+    using namespace flashinfer;
+    using Attention = DefaultAttention<false, false, false, false>;
+    using Params = SinglePrefillParams<half, half, half>;
+    if (causal) {
+        return SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false,
+            MaskMode::kCausal, Attention, Params, false>(params, nullptr, stream);
+    }
+    return SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false,
+        MaskMode::kNone, Attention, Params, false>(params, nullptr, stream, tileQ, mmaKvLimit);
+}
+#endif
+
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
     half * __restrict__ a, half * __restrict__ b, half * __restrict__ c,
@@ -1219,8 +1237,6 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
                 break;
             }
             
-            // This path never splits KV; reflect that in the template dispatch below.
-            half *tmp = nullptr;
             cudaError_t status = cudaSuccess;
             // Pad/Split, the FastLLM allocator, and the consumers below all
             // use the per-thread default stream. Launch FlashInfer on that
@@ -1251,17 +1267,7 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
                 );
                 
                 // 调用 FlashInfer prefill 接口，根据 mask_mode 选择不同的 variant
-                if (mask_mode == MaskMode::kCausal) {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                        SinglePrefillParams<half, half, half>, false>(params, tmp, stream);
-                } else {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>,
-                        SinglePrefillParams<half, half, half>, false>(params, tmp, stream);
-                }
-            }
-            
-            if (tmp != nullptr) {
-                FastllmCudaFree(tmp);
+                status = fastllm::DensePrefillHalf128(params, mask_mode == MaskMode::kCausal, stream);
             }
             
             if (status != cudaSuccess) {
@@ -1654,6 +1660,11 @@ __global__ void ToHnd(const uint4 *input, uint4 *output, int heads, int queries)
     }
 }
 
+// Saturate the device without growing the split-KV workspace with context.
+inline int SplitCount(int visibleKeys) {
+    return std::min(128, 1 + (visibleKeys - 1) / 128);
+}
+
 template <int TileQ = 64>
 inline cudaError_t Run(const half *q, const half *k, const half *v, half *out, half *scratch,
                        int heads, int kvHeads, int queries, int keys, int kStrideH, int vStrideH,
@@ -1662,7 +1673,7 @@ inline cudaError_t Run(const half *q, const half *k, const half *v, half *out, h
     // exactly fills that tile; it avoids the 64-row tile's inactive Q work.
     // FlashInfer's half MMA uses m16n8k8 and synchronous shared loads on
     // SM75. Keep FP32 QK/softmax accumulation and the custom window mask.
-    constexpr int MmaKV = 2, Chunk = 128;
+    constexpr int MmaKV = 2;
     int trim = std::max(0, keys - queries - window + 1);
     k += trim * 128;
     v += trim * 128;
@@ -1682,7 +1693,7 @@ inline cudaError_t Run(const half *q, const half *k, const half *v, half *out, h
                              2 * sizeof(float) * MmaKV) < 256) :
         !Traits::IsInvalid());
     static_assert(sizeof(typename Traits::SharedStorageSingle) <= 49152);
-    int splits = (keys + Chunk - 1) / Chunk;
+    int splits = SplitCount(keys);
     half *nhd = scratch, *partition = scratch + heads * queries * 128;
     Params p;
     static_cast<flashinfer::SinglePrefillParams<half, half, half> &>(p) =
@@ -1778,7 +1789,7 @@ bool FastllmCudaDFlashAttention(
     // on. Unsupported shapes/architectures keep cuBLAS.
     if (queries > 0 && queries <= 16 && group <= 64 / queries &&
         heads > 0 && k.dims[0] <= 65535 &&
-        slidingWindow >= queries && slidingWindow <= 4096 &&
+        slidingWindow >= queries &&
         k.Count(1) <= std::numeric_limits<int>::max() &&
         v.Count(1) <= std::numeric_limits<int>::max() &&
         (useSm75Tile || useSm80Tile) &&
@@ -1786,7 +1797,7 @@ bool FastllmCudaDFlashAttention(
         // Crop keys invisible to every query, preserving the independent
         // physical K/V head strides after expansion or rollback.
         const size_t visibleKeys = std::min(cachedTokens, slidingWindow - 1) + queries;
-        const size_t chunks = (visibleKeys + 127) / 128;
+        const size_t chunks = fastllm_dflash_attention::SplitCount(visibleKeys);
         const size_t rows = (size_t)heads * queries;
         const size_t workspaceBytes = rows * 128 * sizeof(half) * (chunks + 1) +
                                       rows * chunks * sizeof(float);

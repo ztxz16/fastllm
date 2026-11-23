@@ -358,6 +358,33 @@ namespace fastllm {
             logits.dataDeviceIds = {rootDevice};
         }
 
+        static bool MergeGreedyShard(const std::vector<std::pair<int, int>> &ranges,
+                const int *ids, const float *scores, int vocabSize, int batch,
+                std::vector<float> &bestScores, std::vector<int> &tokens) {
+            for (int b = 0; b < batch; ++b) {
+                int localId = ids[b];
+                int localOffset = 0;
+                int globalId = -1;
+                for (const auto &range : ranges) {
+                    int len = range.second - range.first;
+                    if (localId >= localOffset && localId < localOffset + len) {
+                        globalId = range.first + localId - localOffset;
+                        break;
+                    }
+                    localOffset += len;
+                }
+                if (globalId < 0 || globalId >= vocabSize) {
+                    return false;
+                }
+                if (scores[b] > bestScores[b] ||
+                    (scores[b] == bestScores[b] && globalId < tokens[b])) {
+                    bestScores[b] = scores[b];
+                    tokens[b] = globalId;
+                }
+            }
+            return true;
+        }
+
         static bool SampleTensorParallelGreedyLogits(
                 Data &logits, int batch, std::vector<int> &tokens,
                 Data *precomputedIds, Data *precomputedScores,
@@ -595,30 +622,9 @@ namespace fastllm {
                 return false;
             }
 
-            for (int r = 0; r < (int)devices.size(); ++r) {
-                auto rangesIt = logits.tpRanges.find(devices[r]);
-                for (int b = 0; b < batch; ++b) {
-                    int localId = localIds[r][b];
-                    int localOffset = 0;
-                    int globalId = -1;
-                    for (const auto &range : rangesIt->second) {
-                        int len = range.second - range.first;
-                        if (localId >= localOffset && localId < localOffset + len) {
-                            globalId = range.first + localId - localOffset;
-                            break;
-                        }
-                        localOffset += len;
-                    }
-                    if (globalId < 0 || globalId >= vocabSize) {
-                        return false;
-                    }
-                    if (localScores[r][b] > bestScores[b] ||
-                        (localScores[r][b] == bestScores[b] && globalId < tokens[b])) {
-                        bestScores[b] = localScores[r][b];
-                        tokens[b] = globalId;
-                    }
-                }
-            }
+            for (int r = 0; r < (int)devices.size(); ++r)
+                if (!MergeGreedyShard(logits.tpRanges.at(devices[r]), localIds[r], localScores[r],
+                                     vocabSize, batch, bestScores, tokens)) return false;
             return true;
         }
 #endif
@@ -664,6 +670,37 @@ namespace fastllm {
         float *p = (float*)logits.cpuData;
         uint64_t count = logits.Count(0);
     }
+
+#ifdef USE_CUDA
+    static bool CanSampleShardedGreedy(const Data &logits, int batch,
+            const std::vector<GenerationConfig> &configs) {
+        if (!logits.IsTensorParallelSharded() || ShouldPrintLogits() || int(configs.size()) != batch) return false;
+        return std::all_of(configs.begin(), configs.end(), [](const GenerationConfig &config) {
+            return config.IsSimpleGreedy() && config.output_token_least <= 0 && !config.output_logits;
+        });
+    }
+
+    bool TrySamplePublishedGreedy(Data &logits, int batch,
+            const std::vector<GenerationConfig> &configs, const std::map<int, void *> &published,
+            const std::map<int, void *> &events, std::vector<int> &tokens) {
+        // Each mapped row is published by the original per-rank argmax kernel.
+        // Completion also makes full logits safe for a non-greedy fallback.
+        for (const auto &entry : events) FastllmCudaEventSynchronize(entry.second);
+        if (!CanSampleShardedGreedy(logits, batch, configs) || logits.dims.empty() ||
+            published.size() != logits.multiDeviceDatas.size() || events.size() != published.size())
+            return false;
+        tokens.assign(batch, 0);
+        std::vector<float> best(batch, -1.0e30f);
+        for (const auto &entry : published) {
+            auto ranges = logits.tpRanges.find(entry.first);
+            if (ranges == logits.tpRanges.end() || !entry.second || !events.count(entry.first)) return false;
+            const auto *ids = static_cast<const int *>(entry.second);
+            if (!MergeGreedyShard(ranges->second, ids, reinterpret_cast<const float *>(ids + batch),
+                                  logits.dims.back(), batch, best, tokens)) return false;
+        }
+        return true;
+    }
+#endif
 
     void LLMSamplingBlock (
         basellm *model,
@@ -713,14 +750,7 @@ namespace fastllm {
                             "Precomputed sampling logits must use FLOAT32.\n");
         }
 #ifdef USE_CUDA
-        bool canUseShardedGreedy = sourceLogits.IsTensorParallelSharded() &&
-            !ShouldPrintLogits();
-        for (int b = 0; b < batch && canUseShardedGreedy; ++b) {
-            canUseShardedGreedy = generationConfigs[b].IsSimpleGreedy() &&
-                generationConfigs[b].output_token_least <= 0 &&
-                !generationConfigs[b].output_logits;
-        }
-        if (canUseShardedGreedy &&
+        if (CanSampleShardedGreedy(sourceLogits, batch, generationConfigs) &&
             SampleTensorParallelGreedyLogits(
                 sourceLogits, batch, lastRet,
                 precomputedGreedyIds, precomputedGreedyScores,

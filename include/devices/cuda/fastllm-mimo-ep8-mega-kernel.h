@@ -38,6 +38,7 @@ int fastllm_ep8_mega_moe_run_prefill(void *, const void *const *, const void *, 
 void fastllm_ep8_mega_moe_destroy(void *);
 }
 
+extern "C" int fastllm_ep8_mega_moe_weight_view(void*,const void**,bool*);
 extern "C" int fastllm_ep8_mega_moe_weights(void*,const void**);
 
 extern "C" int fastllm_ep8_mega_moe_group_supported(const int*,int);

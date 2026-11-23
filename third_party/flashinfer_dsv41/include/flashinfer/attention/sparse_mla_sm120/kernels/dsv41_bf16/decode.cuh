@@ -11,9 +11,14 @@
 
 namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16 {
 
-template <int NUM_HEADS, bool EXTRA_FP4, bool REQUEST_INDICES = false, bool VERIFY = false, bool BF16_INPUT = false>
-__global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
-    sparse_mla_decode_dsv41_bf16_kernel(
+struct LoadBf16Query {
+  __device__ __forceinline__ uint4 operator()(const bf16 *q, int, int) const {
+    return *reinterpret_cast<const uint4 *>(q);
+  }
+};
+
+template <int NUM_HEADS, bool EXTRA_FP4, bool REQUEST_INDICES, bool VERIFY, bool BF16_INPUT, class LoadQuery>
+__device__ __forceinline__ void dsv41_attention_splits(
         const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
         const int32_t* __restrict__ indices, bf16* __restrict__ mid_out,
         float* __restrict__ mid_lse, const int* __restrict__ topk_length_ptr,
@@ -22,22 +27,22 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
         size_t extra_page_stride_bytes, int num_tokens, int num_heads, int topk,
         int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
         size_t indices_stride_elems, size_t extra_indices_stride_elems, Dsv41Pages pages,
-        void* const* kv_cache_ptr = nullptr, void* const* extra_kv_cache_ptr = nullptr,
-        size_t kv_ptr_stride_bytes = sizeof(void*),
-        const int* position_ptr = nullptr, int compression_ratio = 0,
-        const int* chunk_begin_ptr = nullptr, const int* chunk_length_ptr = nullptr) {
+        void* const* kv_cache_ptr, void* const* extra_kv_cache_ptr,
+        size_t kv_ptr_stride_bytes,
+        const int* position_ptr, int compression_ratio,
+        const int* chunk_begin_ptr, const int* chunk_length_ptr, LoadQuery load_query, uint3 tile) {
   // FastLLM adaptation: graph replays may select a different request's cache.
   // Optional request indices also fold the adapter's validity preparation into
   // this gather. Attention arithmetic is unchanged.
   if (kv_cache_ptr) KV_cache = static_cast<const uint8_t*>(*reinterpret_cast<void* const*>(
-      reinterpret_cast<const char*>(kv_cache_ptr) + size_t(blockIdx.x) * kv_ptr_stride_bytes));
+      reinterpret_cast<const char*>(kv_cache_ptr) + size_t(tile.x) * kv_ptr_stride_bytes));
   if (extra_kv_cache_ptr) extra_KV_cache = static_cast<const uint8_t*>(*reinterpret_cast<void* const*>(
-      reinterpret_cast<const char*>(extra_kv_cache_ptr) + size_t(blockIdx.x) * kv_ptr_stride_bytes));
+      reinterpret_cast<const char*>(extra_kv_cache_ptr) + size_t(tile.x) * kv_ptr_stride_bytes));
   using R = Dsv41Bf16Resources;
   const int main_page_block_size = pages.size;
   const bool interleaved = pages.interleaved;
   using Geometry = R::Geometry;
-  const int t = blockIdx.x, hs = blockIdx.y * R::HEADS_PER_CTA, split = blockIdx.z;
+  const int t = tile.x, hs = tile.y * R::HEADS_PER_CTA, split = tile.z;
   const int qh = NUM_HEADS ? NUM_HEADS : num_heads;
   const int mh = NUM_HEADS ? NUM_HEADS : int(gridDim.y) * R::HEADS_PER_CTA;
   const int vh = min(R::HEADS_PER_CTA, qh - hs);
@@ -60,7 +65,7 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
   for (int i = tidx; i < R::HEADS_PER_CTA * R::QK_VECTORS; i += R::BLOCK_THREADS) {
     const int h = i / R::QK_VECTORS, d = i % R::QK_VECTORS * R::VECTOR_ELEMS;
     uint4 data =
-        h < vh ? *reinterpret_cast<const uint4*>(Q + ((size_t)t * qh + hs + h) * Geometry::D_QK + d)
+        h < vh ? load_query(Q + ((size_t)t * qh + hs + h) * Geometry::D_QK + d, t, d)
                : make_uint4(0, 0, 0, 0);
     *reinterpret_cast<uint4*>(&sm.q[h][d]) = data;
   }
@@ -255,6 +260,29 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
             sum[h] > 0.f ? log2f(sum[h]) + m[h] : -1e30f;
     }
   }
+}
+
+template <int NUM_HEADS, bool EXTRA_FP4, bool REQUEST_INDICES = false, bool VERIFY = false, bool BF16_INPUT = false>
+__global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
+    sparse_mla_decode_dsv41_bf16_kernel(
+        const bf16* __restrict__ Q, const uint8_t* __restrict__ KV_cache,
+        const int32_t* __restrict__ indices, bf16* __restrict__ mid_out,
+        float* __restrict__ mid_lse, const int* __restrict__ topk_length_ptr,
+        const uint8_t* __restrict__ extra_KV_cache, const int32_t* __restrict__ extra_indices,
+        const int* __restrict__ extra_topk_length_ptr, int extra_topk, int pbs_extra,
+        size_t extra_page_stride_bytes, int num_tokens, int num_heads, int topk,
+        int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
+        size_t indices_stride_elems, size_t extra_indices_stride_elems, Dsv41Pages pages,
+        void* const* kv_cache_ptr = nullptr, void* const* extra_kv_cache_ptr = nullptr,
+        size_t kv_ptr_stride_bytes = sizeof(void*),
+        const int* position_ptr = nullptr, int compression_ratio = 0,
+        const int* chunk_begin_ptr = nullptr, const int* chunk_length_ptr = nullptr) {
+  dsv41_attention_splits<NUM_HEADS, EXTRA_FP4, REQUEST_INDICES, VERIFY, BF16_INPUT>(
+      Q, KV_cache, indices, mid_out, mid_lse, topk_length_ptr,
+      extra_KV_cache, extra_indices, extra_topk_length_ptr, extra_topk, pbs_extra, extra_page_stride_bytes,
+      num_tokens, num_heads, topk, scratch_split_stride, chunks_per_block, sm_scale,
+      page_stride_bytes, indices_stride_elems, extra_indices_stride_elems, pages, kv_cache_ptr, extra_kv_cache_ptr,
+      kv_ptr_stride_bytes, position_ptr, compression_ratio, chunk_begin_ptr, chunk_length_ptr, LoadBf16Query{}, blockIdx);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16

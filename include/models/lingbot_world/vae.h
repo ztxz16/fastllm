@@ -4,8 +4,8 @@
 
 namespace fastllm { namespace lingbot {
 
-// FP32 encoding preserves image conditioning. BF16 decoding follows CUDA
-// autocast: BF16 convolutions/attention, FP32 normalization and latent scaling.
+// In BF16 mode, convolutions and attention use BF16 while normalization
+// and latent scaling retain FP32 precision.
 class VAERuntime : public qwen_image::Runtime {
 public:
     explicit VAERuntime(int device, bool bf16 = false)

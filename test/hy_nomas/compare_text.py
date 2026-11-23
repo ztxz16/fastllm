@@ -15,7 +15,6 @@ from compare_block import metrics
 
 @torch.no_grad()
 def main(args):
-    os.environ.setdefault("FASTLLM_NOMAS_PRECISION", "bf16")
     lib = C.CDLL(str(args.library))
     lib.fastllm_nomas_error.restype = C.c_char_p
     lib.fastllm_nomas_text_create.argtypes = [C.c_char_p, C.c_int]

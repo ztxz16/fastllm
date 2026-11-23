@@ -11,9 +11,9 @@ FastLLM provides native C++ / CUDA inference for MiniMax-H3 / Pika H3 Flex audio
 | MiniMax-H3 | Text-to-audio/video, first/last frames, ordered image/video/audio references | Video backend in `ftllm launch` | `minimax_h3_server` / `minimax_h3_generate` |
 | Pika H3 Flex | H3 base plus official adapters, fixed six-step audio/video generation | Same video backend, selecting the Pika directory | Same H3 executables, with adapter detection |
 | MiniMax-H3-Image | Six-step image generation, single-image editing, multiple references | Image backend in `ftllm launch` | `minimax_h3_image_server` / `minimax_h3_image_generate` |
-| Qwen-Image-2.1 | Image generation and single/multiple-reference editing | `ftllm qwen-image server` and `/demo` | `ftllm qwen-image generate` |
+| Qwen-Image-2.1 | Image generation and single/multiple-reference editing | `ftllm server MODEL_PATH` and `/demo` | `ftllm qwen-image generate` |
 
-`ftllm server` serves language models. Use the dedicated backends above for generation; a vision LLM's `image_url` input does not generate images. Qwen-Image currently has no dedicated Launcher profile; use its CLI or standalone demo.
+The launcher and `ftllm server MODEL_PATH` detect the image or video service from local model metadata.
 
 World-model deployments have separate guides: [HY-Nomas](hy_nomas.md) and [LingBot World](lingbot_world.md), currently in Chinese.
 
@@ -42,7 +42,7 @@ Source builds are documented for [H3](../tools/minimax_h3/README.md#构建), [H3
 
 ### Launcher
 
-Add a launch profile and select **Video · MiniMax H3 / Pika H3**. Set the model, port, output directory, and available GPUs, then save and start. Release packages discover the executable automatically.
+Add a launch profile and select the MiniMax H3 or Pika model path. Set the port, output directory, and available GPUs, then save and start. Release packages discover the executable automatically.
 
 - For H3, select the complete original model directory.
 - For Pika, select the official adapter directory containing `fl2va/manifest.json`, `fl2va/adapter.safetensors`, `ref2va/manifest.json`, and `ref2va/adapter.safetensors`. A matching complete H3 base is still required. Set its path in the profile or add a `base_model` symlink inside the Pika directory. See the [Pika base revision and layout](../tools/minimax_h3/README.md#pika-h3-flex).
@@ -79,7 +79,7 @@ Keyframe requests use multipart `input_reference` / `first_frame` and `last_fram
 
 ## Images: MiniMax-H3-Image
 
-Choose **Image · MiniMax H3 Image** in Launcher and set the model, port, output directory, and GPUs. **Studio → Image generation** and the standalone demo support text prompts, ordered references, editing, progress, cancellation, and downloads.
+Select the MiniMax H3 Image model path in Launcher and set the port, output directory, and GPUs. **Studio → Image generation** and the standalone demo support text prompts, ordered references, editing, progress, cancellation, and downloads.
 
 BF16 uses the complete original directory. For supported FP8 / INT8 / NVFP4 / GGUF layouts, select the specific quantized file and keep the full original H3 Image base. A `base_model` directory/symlink inside the quantized directory avoids ambiguous discovery. The H3 video base cannot replace the image base.
 
@@ -118,7 +118,7 @@ curl http://127.0.0.1:8010/v1/images/edits \
 ### Server or direct generation
 
 ```sh
-ftllm qwen-image server --model /path/to/Qwen-Image-2.1 \
+ftllm server /path/to/Qwen-Image-2.1 \
   --devices 0 --host 127.0.0.1 --port 8008 --output ./qwen-image-output
 ```
 
@@ -130,7 +130,7 @@ ftllm qwen-image generate --model /path/to/Qwen-Image-2.1 --devices 0 \
   --width 1024 --height 1024 --steps 40 --seed 1234 --output apple.png
 ```
 
-Add `--image reference.png --reference-resolution 512` to edit a reference; repeat `--image` for multiple images. Use `ftllm qwen-image server --help` / `generate --help` for complete options.
+Add `--image reference.png --reference-resolution 512` to edit a reference; repeat `--image` for multiple images. Use `ftllm server --help` / `generate --help` for complete options.
 
 ### HTTP API
 
@@ -174,8 +174,8 @@ H3 / Pika quantized directories use `h3_quantization.json` to bind `base_model`,
 
 ```sh
 # Logical devices 0 and 1 refer to physical GPUs 2 and 3 selected here.
-CUDA_VISIBLE_DEVICES=2,3 ftllm qwen-image server \
-  --model /path/to/Qwen-Image-2.1 --devices 0,1 --port 8008
+CUDA_VISIBLE_DEVICES=2,3 ftllm server \
+  /path/to/Qwen-Image-2.1 --devices 0,1 --port 8008
 ```
 
 H3 executables also accept `--devices 0,1`; Launcher remaps selected GPUs automatically. H3 / H3 Image expose `--gpu-memory-limit GiB` per GPU and `--host-memory-limit GiB` shared by the service. Qwen-Image automatically selects residency or stage offload from free memory and the request. Model budgets are not hard isolation of all process allocations; allow space for CUDA, communication, activations, and media processing.

@@ -52,9 +52,11 @@ cmake --build build-nomas --target fastllm_nomas -j2
 CUDA_ARCH=native BUILD_JOBS=2 bash tools/hy_nomas/build.sh build-nomas
 ```
 
-`BUILD_HY_NOMAS` 默认关闭，构建此目标不会改变其他模型的推理入口。目前 HY-Nomas 使用下方独立服务，不通过 `ftllm server` 启动。
+`BUILD_HY_NOMAS` 默认关闭，构建此目标不会改变其他模型的推理入口。`ftllm server` 会识别 HY-Nomas 并启动原生服务。
 
 ## 4. 启动 HTTP 服务
+
+启动器识别模型后，可在启动配置中设置「权重常驻显存」，对应服务参数 `--weight-residency auto|on|off`。默认 `auto` 在显存充足时保留权重，减少连续建场景或修改提示词时的重复加载。单卡 BF16 的启动门槛为 56 GiB。多卡按每张卡的空闲显存判断，主卡另计文本编码器。自动模式遇到 GPU 内存分配失败时会关闭常驻并重试一次。
 
 将模型和输出路径替换为实际目录：
 
@@ -69,8 +71,9 @@ CUDA_VISIBLE_DEVICES=0 python3 tools/fastllm_pytools/nomas_server.py \
 ```
 
 - `CUDA_VISIBLE_DEVICES` 选择使用的 GPU；`--device 0` 表示可见 GPU 中的第一张。
-- `--output` 用于保存生成的 PNG 帧，服务进程需要有写入权限。
+- `--output` 用于保存生成的 MP4 短片或 PNG 帧，服务进程需要有写入权限。
 - 默认使用 `--precision bf16`：权重、主激活和 KV 使用 BF16，矩阵乘法累加、归一化内部计算及采样更新保留 FP32。需要精度排查时，可显式使用 `--precision fp32`。
+- BF16 交互世界按官方顺序从种子生成 120 秒的初始噪声，并用同一随机流给每段的历史 KV 加噪。每步 Euler 更新通过 FP32 计算后舍入到 BF16。跨后端回放时，长序列的镜头仍可能逐段偏离。
 - 从其他机器访问时，将 `--host` 改为 `0.0.0.0`，浏览器访问部署机器的 IP 和端口。服务没有内置认证，对外开放时可接入已有认证网关。
 
 启动后访问：
@@ -116,7 +119,7 @@ BF16 模式保留 FP32 GEMM 累加；PixelUMM 使用 BF16 部分输出及归约�
 
 ```bash
 mkdir -p /path/to/nomas-prompts
-for name in online_user_video_rewriter_system_prompt online_user_video_rewriter_first_turn; do
+for name in online_user_video_rewriter_system_prompt online_user_video_rewriter_first_turn online_user_video_rewriter_intermediate_turn; do
   curl -fL "https://raw.githubusercontent.com/Tencent-Hunyuan/Hy-Nomas/9d80c58616538eef721b9c489cb1ec4e12cdb2a3/apps/prompts/${name}.md" \
     -o "/path/to/nomas-prompts/${name}.md"
 done
@@ -145,19 +148,25 @@ CUDA_VISIBLE_DEVICES=0 ftllm server /path/to/Hy-Nomas/PE \
 
 若服务分别运行在容器中，应使用容器内可达的 PE 地址，并挂载提示词目录。`/health` 的 `prompt_enhancer.enabled` 表示是否配置扩写。调用只使用 Python 标准库 HTTP 客户端，PE 推理仍由 fastllm 执行。
 
-开启后，Demo 默认自动扩写，也可以在创建前取消勾选。“观察方式”仅在启用扩写时可选；没有配置 PE 时隐藏，取消勾选扩写后禁用。API 创建请求可传 `enhance_prompt: false` 关闭扩写；`perspective` 仅用于扩写，可选择 `auto`、`first-person`、`second-person`、`third-person follow`、`third-person observer`。`auto` 保留描述中明确的第一人称要求，否则使用外部观察视角；修改沿用当前场景视角。
+在启动器的 HY-Nomas 服务设置中，填写提示词增强地址，可选填增强模型名称和提示词目录。默认名称是 `Nomas-PE`，默认目录是模型下的 `prompts/`。启动服务后，Demo 默认勾选「提示词增强」，可以在创建前关闭。“观察方式”仅在启用扩写时可选；没有配置 PE 时隐藏，取消勾选扩写后禁用。场景创建后自动进入探索视图。用 WASD 或屏幕方向按钮移动，拖动或滑动画面后松开即可转向。单步探索时，当前片段生成期间最多保留一个后续动作，重新选择方向会替换它。在画面下方输入指令后按 Enter 发送，Shift+Enter 换行，按 / 可聚焦输入框。「纯画面」收起控件，点击「显示操作」恢复。「场景设置」可返回编辑器，再点「进入场景」继续同一个世界。
+
+API 创建请求可传 `enhance_prompt: false` 关闭扩写；`perspective` 仅用于扩写，可选择 `auto`、`first-person`、`second-person`、`third-person follow`、`third-person observer`。`auto` 保留描述中明确的第一人称要求，否则使用外部观察视角；修改沿用当前场景视角。
 
 扩写在后台任务中执行，进度阶段为 `prompt_enhancement`。创建和修改描述时调用 PE，移动、转向和重复按描述继续生成复用已完成的扩写。原始 `prompt` 保留用于编辑，`enhanced_prompt` 返回实际送入生成模型的场景 JSON；页面提供展开查看入口。扩写失败会令任务失败，不会悄悄退回原提示词。
 
-当前接入使用官方系统提示词和首轮格式，场景修改参考上一份扩写文本，尚未输入历史画面。原生 Demo 每次生成固定帧数，因此仅保留本次时间窗内的动作，不将 PE 的未来动作压缩到当前片段。场景文本最多接受 1200 个编码 token，超限会报错；这不是官方完整的多轮视觉扩写流程。
+首轮扩写记录人物和环境。后续扩写使用官方后续回合格式，把环境变化写入 `description_change`，人物动作写入 `contained_actions`。送进文本编码器前，动作起止时间换算为本段的相对时间。PE 可见首轮和上一轮的文本描述。场景文本最多接受 1200 个编码 token。
 
 ## 5. 使用网页 Demo
 
 输入场景描述并创建世界后，使用 W/A/S/D 移动、方向键调整视角，也可点击界面按钮。“连续探索”会自动提交后续动作，点击停止可结束自动探索。
 
-“修改当前场景”保留当前世界和历史，并在下一段应用新描述。修改成功后，移动和转向会继续探索该场景；“重建场景”则清空历史并创建新世界。场景修改和长期探索仍可能出现语义偏差或画面漂移。
+场景创建后，在“下一条指令”里输入环境变化或人物动作，点击“发送指令”即可沿着当前场景生成。展开“场景设置”可调整起始条件并重建场景。场景修改和长期探索仍可能出现语义偏差或画面漂移。
 
-默认分辨率为 384×224，可选最高 512×288；需要减少生成资源占用时可降低分辨率。切换到“独立短视频”可单独生成一段视频。网页以 PNG 帧播放结果，不输出可直接渲染的三维网格。
+场景设置提供最高 1280×704 的预设，也可自定义横屏、竖屏或方形画面。宽高均为 64 到 1280 之间的 32 倍数，总像素不超过 901120。高分辨率需要更多显存和生成时间。切换到“独立短视频”可单独生成一段视频。浏览器支持 H.264 且服务端 FFmpeg 提供 libx264 时，网页优先播放 H.264 短片（CRF 18、24 fps）。其他环境使用 PNG 帧。
+
+在交互世界中选取「起始参考图」并填写初始描述。浏览器按所选尺寸等比缩放并居中补黑边，把 RGB24 像素传给服务。C++/CUDA 编码器使用 PixelUMM_FT 权重中的 `encoder.*`，处理 120 个重复的像素帧，一次写入 30 帧潜变量的场景历史。页面显示解码结果的最后 12 帧。文本指令的初始帧数为 20，带参考图时为 120。可在「发送指令」旁为本条指令选择 20、40、60、80、100 或 120 帧。「按指令继续」沿用上次发送的帧数，移动和转向每次生成 20 帧。
+
+API 创建请求可传 `reference_rgb`（恰好 `width * height * 3` 字节的 RGB24，使用标准 Base64 编码）。`text_frames` 可选 20 到 120 之间的 20 的倍数，默认 20。场景的 `generated_frames` 统计可播放帧数，`model_frames` 包含完整的参考图历史。后续 PATCH 可直接传官方结构化提示词字符串，或用 `{"kind":"environment","prompt":"the falling rain stops"}`、`{"kind":"action","prompt":"lifts the white mug and offers it once"}` 指定指令类型。PATCH 可同时传 `text_frames`。随后提交 `follow_prompt` 应用修改，已在生成的片段沿用提交时的帧数。
 
 世界和任务索引保存在服务内存中，刷新页面可恢复当前服务中的场景，服务重启后需要重新创建。
 
@@ -171,7 +180,7 @@ curl http://127.0.0.1:8007/v1/worlds \
   -d '{"messages":[{"role":"user","content":"一间阳光明亮的木屋，中央有一张桌子。"}],"width":256,"height":160,"seed":42}'
 ```
 
-将 `VIDEO_ID` 替换为 `current_job`，查询生成结果；完成后 `output.frames` 提供按顺序排列的 PNG 地址：
+将 `VIDEO_ID` 替换为 `current_job`，查询生成结果；默认返回逐帧 PNG，完成后 `output.frames` 提供按顺序排列的地址。创建场景或视频时可以传入 `"response_format": "mp4"`。读取结果时以 `output.format` 为准，`mp4` 的短片地址在 `output.url`，编码不可用时服务返回 `png_frames`。查询示例：
 
 ```bash
 curl http://127.0.0.1:8007/v1/videos/VIDEO_ID

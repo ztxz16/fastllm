@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
     std::vector<int> devices;
     for (int rank = 0; rank < ranks; ++rank) {
         Check(cudaSetDevice(rank));
-        if (FastllmCudaRuntimeArch() != 90) return 77;
+        if (FastllmCudaRuntimeArch() != 90 && (gather || FastllmCudaRuntimeArch() != 103)) return 77;
         for (int peer = 0; peer < ranks; ++peer) if (peer != rank) {
             int enabled = 0; Check(cudaDeviceCanAccessPeer(&enabled, rank, peer)); if (!enabled) return 77;
         }

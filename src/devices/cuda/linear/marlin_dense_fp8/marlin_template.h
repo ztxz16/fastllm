@@ -244,7 +244,9 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool fuse_swiglu,
           const bool bf16_output,
           const bool parallel_fp32_reduce,
-          const bool fp32_output>
+          const bool fp32_output,
+          const bool verify_qb, const bool verify_qkv, const bool dspark_context,
+          const bool tile_global_scale>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -273,6 +275,31 @@ __global__ void Marlin(
     bool use_atomic_add_arg,   // whether to use atomic add to reduce
     bool use_fp32_reduce_arg,  // whether to use fp32 global reduce
     int max_shared_mem) {
+  // For six-row verification the first 148 output tiles are independent
+  // of the remaining 108. Two grid rows run these waves concurrently but
+  // retain the original 148-way K partitions and FP32 summation order.
+  if constexpr (verify_qb) {
+    prob_m = 6; prob_n = 32768; prob_k = lda = 1280; num_groups = 40;
+  }
+  // The B300 six-row joint projection has fourteen 128-column tiles.
+  // Preserve the general kernel's ten ordered, eight-K-tile partials per tile.
+  if constexpr (verify_qkv) {
+    prob_m = 6; prob_n = 1792; prob_k = lda = 5120; num_groups = 160;
+    if (blockIdx.x >= 140) return;
+  }
+  // Each grid row is an independent WKV. Use the original 512-column
+  // problem so both the MMA stripes and the FP32 reduction order stay fixed.
+  if constexpr (dspark_context) {
+    const unsigned layer = blockIdx.y;
+    const auto pointers = reinterpret_cast<const int4 *const *>(B);
+    B = pointers[2 * layer];
+    scales_ptr = pointers[2 * layer + 1];
+    prob_n = 512; prob_k = lda = 5120; num_groups = 160;
+    C0 += layer * prob_m * (512 / 8);
+    C_tmp += layer * gridDim.x * (2 * 16 * 128 / 4);
+    locks += layer * gridDim.x * 4;
+  }
+  const unsigned partitionBlocks = verify_qkv ? 148 : gridDim.x;
   static_assert(!parallel_fp32_reduce || (dense_fp32 && m_block_size_8 &&
       thread_m_blocks == 1 && a_type_id == vllm::kBFloat16.id() &&
       c_type_id == vllm::kBFloat16.id() && b_type_id == vllm::kFE4M3fn.id() &&
@@ -385,7 +412,7 @@ __global__ void Marlin(
   float global_scale_f32 = 1.0f;
 
   if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
-    global_scale_f32 = global_scale_ptr[0];
+    if constexpr (!tile_global_scale) global_scale_f32 = global_scale_ptr[0];
   }
 
   constexpr bool has_act_order = group_blocks == 0;
@@ -413,13 +440,16 @@ __global__ void Marlin(
   int part1_mn_iters = 0;
   bool in_part2 = false;
 
-  if (global_mn_tiles > gridDim.x) {
-    part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  if (global_mn_tiles > partitionBlocks) {
+    part2_mn_tiles = global_mn_tiles % partitionBlocks;
+    if (part2_mn_tiles * 3 <= partitionBlocks) part2_mn_tiles += partitionBlocks;
+    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / partitionBlocks;
   }
 
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+  if constexpr (verify_qb) {
+    if (blockIdx.y == 1) part1_mn_iters = 0;
+  }
+  int iters = div_ceil(k_tiles * part2_mn_tiles, partitionBlocks);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -444,7 +474,7 @@ __global__ void Marlin(
   int par_id = 0;
   int locks_off = 0;
 
-  if (part2_mn_tiles >= gridDim.x) {
+  if (part2_mn_tiles >= partitionBlocks) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
     locks_off = blockIdx.x;
@@ -476,7 +506,7 @@ __global__ void Marlin(
         if (col_off > 0) slice_idx--;
       }
     }
-    if (part2_mn_tiles >= gridDim.x) {
+    if (part2_mn_tiles >= partitionBlocks) {
       if (slice_count > 1 && slice_idx == slice_count - 1) {
         locks_off++;
       }
@@ -1676,7 +1706,7 @@ __global__ void Marlin(
     constexpr int th_size = thread_m_blocks * 8;
     // A stripe can split its starting and ending columns. A partial starting
     // at K=0 uses slot 1; a partial starting inside a column uses slot 0.
-    const int own_slot = 2 * blockIdx.x + (slice_row == 0);
+    const int own_slot = verify_qkv ? blockIdx.x : 2 * blockIdx.x + (slice_row == 0);
     if (threadIdx.x < active_threads) {
       int4* fragments = reinterpret_cast<int4*>(&frag_c);
       #pragma unroll
@@ -1685,7 +1715,9 @@ __global__ void Marlin(
     }
     // Publish every writer before the CTA leader's release. The acquire chain
     // on this counter and the following CTA barrier make all partials visible.
-    __threadfence();
+    // The CTA barrier orders all partial stores before the leader's GPU
+    // release. Last arrival acquires the chain before exposing it to its CTA.
+    if constexpr (!verify_qkv) __threadfence();
     __syncthreads();
     __shared__ int reduce_last;
     if (threadIdx.x == 0) {
@@ -1699,20 +1731,40 @@ __global__ void Marlin(
     if (!last_arrival) return false;
     if (threadIdx.x < active_threads) {
       int4* fragments = reinterpret_cast<int4*>(&frag_c);
-      const int column_start = slice_col_par * k_tiles;
-      const int first_block = column_start / iters;
-      const int last_block = div_ceil(column_start + k_tiles, iters) - 1;
-      for (int block = last_block; block >= first_block; --block) {
-        const int slot = 2 * block + (block * iters <= column_start);
+      if constexpr (verify_qkv) {
+        // The ten K stripes are contiguous and never span two output tiles.
+        // Load independent stripes ahead of their ordered FP32 additions.
+        const int first = (blockIdx.x / 10) * 10;
         #pragma unroll
         for (int k = 0; k < th_size; k += 2) {
-          int4 partial = C_tmp[slot * c_size + active_threads * k + threadIdx.x];
-          if (block == last_block) fragments[k] = partial;
-          else {
-            float* sum = reinterpret_cast<float*>(&fragments[k]);
-            const float* add = reinterpret_cast<const float*>(&partial);
+          const int offset = active_threads * k + threadIdx.x;
+          int4 sum = C_tmp[(first + 9) * c_size + offset];
+          #pragma unroll
+          for (int j = 8; j >= 0; --j) {
+            const int4 v = C_tmp[(first + j) * c_size + offset];
             #pragma unroll
-            for (int f = 0; f < 4; ++f) sum[f] = __fadd_rn(add[f], sum[f]);
+            for (int f = 0; f < 4; ++f)
+              reinterpret_cast<float*>(&sum)[f] = __fadd_rn(reinterpret_cast<const float*>(&v)[f],
+                                                            reinterpret_cast<float*>(&sum)[f]);
+          }
+          fragments[k] = sum;
+        }
+      } else {
+        const int column_start = slice_col_par * k_tiles;
+        const int first_block = column_start / iters;
+        const int last_block = div_ceil(column_start + k_tiles, iters) - 1;
+        for (int block = last_block; block >= first_block; --block) {
+          const int slot = 2 * block + (block * iters <= column_start);
+          #pragma unroll
+          for (int k = 0; k < th_size; k += 2) {
+            int4 partial = C_tmp[slot * c_size + active_threads * k + threadIdx.x];
+            if (block == last_block) fragments[k] = partial;
+            else {
+              float* sum = reinterpret_cast<float*>(&fragments[k]);
+              const float* add = reinterpret_cast<const float*>(&partial);
+              #pragma unroll
+              for (int f = 0; f < 4; ++f) sum[f] = __fadd_rn(add[f], sum[f]);
+            }
           }
         }
       }
@@ -1726,6 +1778,8 @@ __global__ void Marlin(
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
   auto write_result = [&](bool last) {
+    // Merged projections can retain a distinct tensor scale per output tile.
+    if constexpr (tile_global_scale) global_scale_f32 = global_scale_ptr[slice_col];
     int c_gl_stride = prob_n / 8;
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
@@ -2204,9 +2258,13 @@ __global__ void Marlin(
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
+      if constexpr (verify_qkv) return;
+      if constexpr (verify_qb) {
+        if (!in_part2) return;
+      }
       slice_row = 0;
       if (!in_part2) {
-        slice_col_par += gridDim.x;
+        slice_col_par += partitionBlocks;
       } else {
         slice_col_par++;
         slice_col++;

@@ -1,3 +1,4 @@
+#include "fastllm-mxfp4-weight-pack.cuh"
 // Blackwell MiMo EP4/EP8: pinned upstream FP8/MXFP4 MegaMoE, no Python/JIT dependency.
 // FP8/FP32 block128 source weights are explicitly requantized on load to the
 // FP8/UE8M0-per32 format used by the historical NaiveSglang SM103 adapter.
@@ -66,23 +67,6 @@ void descWeight(Desc &out,void *p,int n,int k,int localExperts,bool mxfp4) {
     cuuint32_t box[]={BK,BN,1,1};
     descriptor(out,mxfp4 ? CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B : CU_TENSOR_MAP_DATA_TYPE_UINT8,p,4,dims,strides,box,128);
 }
-__device__ int sourceRow(int row,int n,bool gate) {
-    return gate ? row/16*8+row%8+(row%16>=8 ? n/2 : 0) : row;
-}
-__device__ size_t scaleOffset(int row,int col,int n) {
-    int transposed=(row&~127)+(row%32)*4+(row%128)/32;
-    return ((size_t)(col/4)*n+transposed)*4+col%4;
-}
-// Native E2M1 nibbles and K32 UE8M0 exponents arrive in one allocation.
-// Only permute rows and scales; TMA unpacks the weights into shared memory.
-__global__ void packMxfp4(const uint8_t *src,uint8_t *dst,uint8_t *sf,int n,int k,bool gate) {
-    int group=blockIdx.x*blockDim.x+threadIdx.x;
-    if (group>=n*(k/32)) return;
-    int row=group/(k/32), col=group%(k/32);
-    int source=sourceRow(row,n,gate)*(k/32)+col;
-    reinterpret_cast<uint4 *>(dst)[group]=reinterpret_cast<const uint4 *>(src)[source];
-    sf[scaleOffset(row,col,n)]=src[(size_t)n*k/2+source];
-}
 // One warp per 32 source weights. Combine requantization, gate/up gran8
 // interleave and UTCCP scale transpose in one load-time pass.
 __global__ void pack(const uint8_t *src,const float *scales,uint8_t *dst,uint8_t *sf,
@@ -90,7 +74,7 @@ __global__ void pack(const uint8_t *src,const float *scales,uint8_t *dst,uint8_t
     int group=(blockIdx.x*blockDim.x+threadIdx.x)/32;
     if (group>=n*(k/32)) return;
     int lane=threadIdx.x%32, row=group/(k/32), col=group%(k/32);
-    int source=sourceRow(row,n,gate);
+    int source=fastllm_mxfp4::sourceRow(row,n,gate);
     __nv_fp8_e4m3 q; q.__x=src[(size_t)source*k+col*32+lane];
     float value=float(q)*scales[(source/128)*(k/128)+col/4];
     float amax=fabsf(value);
@@ -98,7 +82,7 @@ __global__ void pack(const uint8_t *src,const float *scales,uint8_t *dst,uint8_t
     uint32_t exponent=dg::math::get_ue8m0_sf_exp(amax);
     float inverse=dg::math::get_ue8m0_sf_inv<float>(exponent);
     dst[(size_t)row*k+col*32+lane]=__nv_fp8_e4m3(value*inverse).__x;
-    if (lane==0) sf[scaleOffset(row,col,n)]=exponent;
+    if (lane==0) sf[fastllm_mxfp4::scaleOffset(row,col,n)]=exponent;
 }
 __global__ void prepare(const __nv_bfloat16 *x,const int32_t *idx,const float *score,
     uint8_t *qx,uint8_t *sf,int64_t *qi,float *qs,int rows,const int *live,
@@ -221,7 +205,7 @@ template<int R> struct Mega {
                     auto *values=(uint8_t *)dst+(size_t)e*n*k/(mxfp4 ? 2 : 1);
                     auto *exponents=(uint8_t *)sf+(size_t)e*n*k/32;
                     if (mxfp4)
-                        packMxfp4<<<(n*k/32+127)/128,128,0,cudaStreamPerThread>>>(
+                        fastllm_mxfp4::packMxfp4<<<(n*k/32+127)/128,128,0,cudaStreamPerThread>>>(
                             (const uint8_t *)src,values,exponents,n,k,gate);
                     else
                         pack<<<(n*k+127)/128,128,0,cudaStreamPerThread>>>(
@@ -437,9 +421,10 @@ extern "C" void fastllm_sm100_mega_moe_destroy(void *p) {
     else delete static_cast<Mega<8>::Layer *>(p);
 }
 
-extern "C" int fastllm_sm100_mega_moe_weights(void*p,const void**out){
+extern "C" int fastllm_sm100_mega_moe_weight_view(void*p,const void**out,bool *mxfp4){
  if(!p||!out||static_cast<LayerBase*>(p)->ranks!=8)return 0;
  auto*l=static_cast<Mega<8>::Layer*>(p);
- if(l->mxfp4)return 0; // Flex consumes FP8 weight views.
+ if (!mxfp4 && l->mxfp4) return 0;
+ if (mxfp4) *mxfp4 = l->mxfp4;
  out[0]=l->gate;out[1]=l->down;out[2]=l->gateSf;out[3]=l->downSf;return 1;
 }

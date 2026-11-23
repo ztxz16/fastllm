@@ -2,12 +2,13 @@
 #include <stdexcept>
 
 namespace fastllm { namespace lingbot {
-Tensor TextEncoder::encode(const std::vector<int> &tokens) {
+Tensor TextEncoder::encode(const std::vector<int> &tokens) { return encode(tokens,false); }
+Tensor TextEncoder::encode(const std::vector<int> &tokens,bool keepWeights) {
     if(tokens.empty() || tokens.size()>512) throw std::invalid_argument("LingBot text must contain 1..512 tokens");
     auto padded=tokens; padded.resize(512,0);
     auto x=rt_.embedding(weights_.get("token_embedding.weight"),padded);
-    // Load only the current block so text encoding leaves room for world caches.
-    weights_.clear();
+    // Low-memory mode releases each block after its last use.
+    if(!keepWeights) weights_.clear();
     for(int i=0;i<24;++i) {
         auto p="blocks."+std::to_string(i)+".";
         auto y=rt_.t5Norm(x,weights_.get(p+"norm1.weight"));
@@ -22,7 +23,7 @@ Tensor TextEncoder::encode(const std::vector<int> &tokens) {
         y=rt_.multiply(gate,y);
         y=weights_.linear(y,p+"ffn.fc2");
         x=rt_.add(x,y);
-        weights_.clear();
+        if(!keepWeights) weights_.clear();
     }
     x=rt_.t5Norm(x,weights_.get("norm.weight"));
     return x.rowSlice(0,tokens.size());

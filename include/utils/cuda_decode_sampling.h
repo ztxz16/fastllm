@@ -77,6 +77,12 @@ public:
         if (!consumeLogits) allocate(probs, FLOAT32, {maxRows, vocab});
         if (topKFirst) allocate(topKWorkspace, INT8, {int(FastllmCudaTopKFirstSamplingWorkspaceBytes(maxRows))});
         cudaProbs = consumeLogits ? cudaLogits : (float *)probs.cudaData;
+        if (!topKFirst) {
+            size_t softmaxBytes = 0;
+            for (int rows : buckets)
+                softmaxBytes = std::max(softmaxBytes, FastllmCudaSamplingSoftmaxWorkspaceSize(rows, vocab));
+            if (softmaxBytes) allocate(softmaxScratch, FLOAT32, {(int)(softmaxBytes / sizeof(float))});
+        }
         allocate(params, INT32, {8, maxRows});
         allocate(tokens, INT32, {2, maxRows});
         allocate(floatTokens, FLOAT32, {2, maxRows});
@@ -244,11 +250,12 @@ private:
             (float *)floatTokens.cudaData + slot * maxRows, rows, width,
             (uint64_t *)(p + 4 * maxRows), (uint64_t *)(p + 6 * maxRows),
             topKWorkspace.cudaData, topKWorkspace.GetBytes())
-            : FastllmCudaTopKTopPSamplingToDeviceWithRng(cudaLogits, cudaProbs,
+            : FastllmCudaTopKTopPSamplingWithWorkspace(cudaLogits, cudaProbs,
             (float *)p, (int *)p + maxRows, (float *)p + 2 * maxRows,
             nullptr, nullptr, 0, (int *)tokens.cudaData + slot * maxRows,
             (float *)floatTokens.cudaData + slot * maxRows, rows, width,
-            (uint64_t *)(p + 4 * maxRows), (uint64_t *)(p + 6 * maxRows));
+            (uint64_t *)(p + 4 * maxRows), (uint64_t *)(p + 6 * maxRows),
+            softmaxScratch.cudaData, softmaxScratch.dims.empty() ? 0 : softmaxScratch.GetBytes());
         if (ok && sharded) return FastllmCudaRemapTopKTokens(shardCandidates, cudaProbs,
             (int *)tokens.cudaData + slot * maxRows, (float *)floatTokens.cudaData + slot * maxRows,
             rows, shardCount);
@@ -262,7 +269,7 @@ private:
     const FastllmCudaTopKShard *shardCandidates = nullptr;
     int shardCount = 0;
     bool topKFirst = false;
-    Data probs, params, tokens, floatTokens, topKWorkspace;
+    Data probs, params, tokens, floatTokens, topKWorkspace, softmaxScratch;
     std::shared_ptr<void> constraints;
     void *hostParams[2]{}, *ready[2]{}, *hostReady[2]{};
     int *hostTokens[2]{};

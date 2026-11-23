@@ -7,7 +7,7 @@
 
 namespace fastllm {
     struct DeepSeekV41HybridWorkspace;
-    enum class V41SharedExpertPartition : uint8_t { Replicated, OutputRows, Intermediate };
+    enum class V41SharedExpertPartition : uint8_t { Replicated, OutputRows, Intermediate, TokenRows };
     struct DeepSeekV41DecodeWorkspace {
         // Reuse request-row views and overwritten indexer outputs across
         // decode calls. Per-forward validity flags still start empty: retained
@@ -34,7 +34,7 @@ namespace fastllm {
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
         std::unique_ptr<DeepSeekV41HybridWorkspace> hybrid;
         Data quantizedActivation;
-        Data attnInputQuantized, qNormQuantized, ffnInputQuantized;
+        Data attnInputQuantized, qNormQuantized, ffnInputQuantized, mxQkvWorkspace;
         bool ffnInputQuantizedReady = false;
         // TP and CUDA graphs retain one buffer per weight.
         std::map<std::string, Data> quantizedActivations;
@@ -55,6 +55,7 @@ namespace fastllm {
         bool residentGraph = false; // Validated resident routed backend; routes stay on CUDA.
         bool parallelShared = false;  // Set only after resident graph buffers pass validation.
         std::function<void()> joinSharedSegment;
+        bool capturesWholeGpuMoe = false;
     };
 
     // Tensor-copy helpers shared with attention/KV code. They preserve graph

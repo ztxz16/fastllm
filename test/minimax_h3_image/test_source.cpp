@@ -54,7 +54,7 @@ void tensor(const fs::path &p, const std::string &dtype) {
     f << h << "00";
 }
 int main() {
-    auto root = fs::temp_directory_path() / ("h3-image-source-" + std::to_string(getpid()));
+    auto root = fs::canonical(fs::temp_directory_path()) / ("h3-image-source-" + std::to_string(getpid()));
     try {
         fs::create_directories(root);
         base(root / "MiniMax-H3-Image");
@@ -83,6 +83,9 @@ int main() {
         rejects([&] { resolveModelSource(file.string()); }, "multiple image bases");
         fs::remove_all(root / "quant/MiniMax-H3-Image");
         fs::remove(root / "quant/base_model");
+        base(root / "quant/base_model");
+        require(resolveModelSource(file.string()).directory == fs::canonical(root / "quant/base_model").string());
+        fs::remove_all(root / "quant/base_model");
         fs::remove_all(root / "MiniMax-H3-Image");
         rejects([&] { resolveModelSource(file.string()); }, "needs the complete");
         std::ofstream(file, std::ios::trunc) << "bad";

@@ -51,7 +51,7 @@ class GenerationBridge:
 
     def instructions(self):
         command = shlex.join([sys.executable, str(Path(__file__).resolve()),
-                              "--bridge", self.url, "--token", self.token])
+                              "--bridge", self.url, "--token=" + self.token])
         return ("\n\n你可以调用 Launcher 中已启动的生成模型。用户要求生成视频时，请实际调用，"
                 "不要只提供提示词。服务目录按 capabilities 区分模型能力。工具命令前缀：\n" + command +
                 "\n先运行 `前缀 catalog` 获取最新服务 ID、能力和默认参数。"

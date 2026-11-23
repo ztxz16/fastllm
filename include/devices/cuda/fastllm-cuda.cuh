@@ -664,6 +664,7 @@ bool FastllmCudaDeepSeekV41MoeHcPost(const fastllm::Data &input,
     const fastllm::Data &post, const fastllm::Data &comb, fastllm::Data &output);
 // Round each FP32 local branch to BF16, then round their sum to BF16.
 // The distinct output is ready for a BF16 collective; inputs are not modified.
+bool FastllmCudaDeepSeekV41JoinTokenRows(const float *routed, const void *shared, void *output, int count);
 bool FastllmCudaDeepSeekV41MoeJoinBFloat16(const float *routed, const float *shared,
                                         void *output, int count);
 // BF16 routed rows: preserve activation rounding before block-32 FP8 quantization.
@@ -1040,6 +1041,13 @@ bool FastllmCudaQwen4GatedDeltaRuleDecode(
     fastllm::Data &state, fastllm::Data &output,
     int keyHeads, int valueHeads, int keyDim, int valueDim,
     float recurrentEps, fastllm::Data *stateOutput = nullptr);
+bool FastllmCudaGatedDeltaRuleSequence(
+    const fastllm::Data &qkv, const fastllm::Data &alpha,
+    const fastllm::Data &beta,
+    const fastllm::Data &aLog, const fastllm::Data &dtBias,
+    fastllm::Data &state, fastllm::Data &output,
+    int keyHeads, int valueHeads, int keyDim, int valueDim,
+    float recurrentEps, fastllm::Data *stateOutput, bool betaIsProbability);
 // Single-token FP16 decode with the exact output norm/gate in the same kernel.
 // tiledOutput writes the local GGUF [value-within-group, key-head] layout.
 // Unsupported inputs return false before modifying recurrent state.
@@ -1884,6 +1892,16 @@ bool FastllmCudaMtpSampleDraftBatchDevice(float *logits, float *proposalProbs,
 bool FastllmCudaMtpSampleDraftDevice(float *logits, float *proposalProbs,
     float temperature, int topK, float topP, int *output, int vocabSize,
     fastllm::Data &workspace);
+// Optional device consumer, invoked synchronously after sampling is queued on
+// cudaStreamPerThread. Unsupported backends omit the callback and still return
+// ordinary host results. Counts contain one accepted-prefix length per request;
+// consumers must finish before this caller/device's next rejection sampling.
+// Cross-stream consumers must establish their own producer/completion fences.
+bool FastllmCudaMtpRejectionSamplingWithConsumer(float *logits, float *proposalProbs,
+    const float *temperatures, const int *topKs, const float *topPs,
+    const int *draftTokenIds, int *output, int *acceptedDraftTokens,
+    int batch, int draftTokens, int vocabSize,
+    void (*enqueue)(const int *, void *), void *context);
 bool FastllmCudaMtpRejectionSampling(float *logits, float *proposalProbs,
                                     const float *temperatures, const int *topKs,
                                     const float *topPs, const int *draftTokenIds,
@@ -1977,7 +1995,12 @@ bool FastllmCudaDFlashMergeTopK(
                                   int ranks, int localRows,
                                   int firstRow, int outputRows,
                                   int topk);
-// Token rows point to local/UVA peer results. Zero live lengths mark padding.
+// Advance active positions/live lengths in the three-plane decode input buffer.
+// tokens may be a UVA peer pointer only after peer access has been enabled.
+bool FastllmCudaAdvanceDecodeInput(void *storage, int stride, int rows,
+                                   const float *tokens = nullptr);
+// tokenRows is a device table of local/UVA peer token addresses, rebound only
+// while the decode pipeline is drained. Zero live lengths mark padded rows.
 bool FastllmCudaAdvanceMappedDecodeInput(void *storage, int stride, int rows,
         const float *const *tokenRows, float *localPositions, int *localLengths, int localRows);
 // Per-request seeds/counters preserve sampling across batch reorder and replay.
@@ -1998,6 +2021,16 @@ bool FastllmCudaTopKTopPSamplingToDevice(
                                   int penaltyTokens,
                                   int *output, float *floatOutput,
                                   int batch, int vocabSize);
+// Optional caller-owned scratch for long-vocabulary decode softmax. No allocation
+// or capture occurs in these calls; missing/undersized scratch keeps the old path.
+size_t FastllmCudaSamplingSoftmaxWorkspaceSize(int batch, int vocabSize);
+bool FastllmCudaTopKTopPSamplingWithWorkspace(
+                                  float *logits, float *probs,
+                                  float *temperatures, int *topKArr, float *topPArr,
+                                  int *penaltyIds, float *penaltyFactors, int penaltyTokens,
+                                  int *output, float *floatOutput, int batch, int vocabSize,
+                                  uint64_t *requestSeeds, uint64_t *requestOffsets,
+                                  void *softmaxWorkspace, size_t softmaxWorkspaceBytes);
 bool FastllmCudaGreedySampling(float *logits, int *output,
                                int batch, int vocabSize);
 bool FastllmCudaGreedySamplingWithFloatOutput(float *logits, int *output,
@@ -2147,6 +2180,7 @@ struct FastllmCudaMoeCacheLayer {
     // execution supplies its own ownership and does not use this restriction.
     int cacheDevice = -1;
     bool qwen38FlashNext = false; // Explicit caller profile; Standard arithmetic.
+    bool standardFp8Graph = false; // Opt in to FP32 routed FP8 decode and verification.
 };
 // One anchor plus up to eight speculative tokens. Larger prefill batches
 // keep using the configured MoE backend.
@@ -2243,6 +2277,7 @@ struct FastllmCudaMoeGGUFCacheView {
     // private. Null retains this view's ordinary workspace/input preparation.
     const void *preparedQ8Input = nullptr;
     bool exactSubwarp = false; // Qwen verification; other callers retain warp kernels.
+    float swigluLimit = 0.f;
 };
 bool FastllmCudaMoeGGUFCacheNeedsPreparation(const fastllm::Data &input,
     const FastllmCudaMoeGGUFCacheView &view, int topk);
@@ -2514,6 +2549,9 @@ bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data
                                        fastllm::Data **gateups, fastllm::Data **downs, const float *scores,
                                        bool scoresOnCuda, int topk, int hidden, int inter);
 
+// Gather a single K=256 embedding row and multiply directly into a preallocated BF16 output.
+bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
+        const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);
 // Hopper BF16 Indexer, K=4096 and Q/K/score widths 2048/128/16. Wq owns the
 // packed allocation; Wk/weights borrow its trailing rows. Shapes and separate

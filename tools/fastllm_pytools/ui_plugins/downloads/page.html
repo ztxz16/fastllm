@@ -1,92 +1,103 @@
 <section id="view-download" class="view">
-            <div class="view-hero download-hero">
-              <div>
-                <span class="eyebrow">MODELSCOPE DOWNLOAD</span>
-                <h1>把模型下载到本机</h1>
-                <p>按模型簇选择官方权重、GSQ 量化或混合推理模型；选中卡片会自动填入下载范围。</p>
-              </div>
-              <button id="download-use-last" class="hero-secondary hidden" type="button">用于启动配置</button>
+  <header class="download-header">
+    <h1>下载模型</h1>
+    <span id="download-catalog-count"></span>
+  </header>
+
+  <section id="download-transfer" class="download-transfer" aria-labelledby="download-status-title" hidden>
+    <div class="download-transfer-head">
+      <h2 id="download-status-title" role="status" tabindex="-1"></h2>
+      <strong id="download-progress-value"></strong>
+    </div>
+    <progress id="download-progress" class="progress-track" aria-label="模型总进度" max="100" value="0"></progress>
+    <p id="download-status-message"></p>
+    <div class="download-transfer-stats">
+      <span><span>已下载</span> <strong id="download-bytes"></strong></span>
+      <span><span>文件</span> <strong id="download-files"></strong></span>
+    </div>
+    <div class="download-transfer-footer">
+      <code id="download-destination"></code>
+      <button id="download-cancel" class="secondary-button danger hidden" type="button">取消下载</button>
+      <button id="download-use-model" class="primary-button hidden" type="button">使用这个模型启动</button>
+    </div>
+  </section>
+
+  <form id="download-form">
+    <fieldset id="download-category" class="download-categories">
+      <legend class="visually-hidden">模型类别</legend>
+    </fieldset>
+
+    <div class="download-layout">
+      <div id="download-catalog" class="download-catalog">
+        <section class="download-release">
+          <label id="download-family-field" class="download-family">
+            <span>模型</span>
+            <select id="download-family"></select>
+          </label>
+          <fieldset id="download-versions">
+            <legend>精度与版本</legend>
+            <div id="download-options"></div>
+            <p id="download-note"></p>
+          </fieldset>
+          <div class="form-grid" data-custom-download hidden>
+            <label class="field"><span>ModelScope 模型 ID <b>*</b></span>
+              <input data-download-field="modelId" type="text" placeholder="Qwen/Qwen3-0.6B" spellcheck="false">
+            </label>
+            <label class="field"><span>下载范围（可选）</span>
+              <input data-download-field="include" type="text" placeholder="Q2_0/*,mmproj-*.gguf" spellcheck="false">
+              <small>多个匹配规则用逗号分隔，留空下载整个仓库。</small>
+            </label>
+            <label class="field"><span>Revision</span>
+              <input data-download-field="revision" type="text" placeholder="master" spellcheck="false">
+            </label>
+          </div>
+        </section>
+        <details id="download-source-panel" open>
+          <summary><span>组件与下载来源</span><small id="download-source-count"></small></summary>
+          <ul id="download-sources"></ul>
+        </details>
+      </div>
+
+      <aside class="download-checkout" aria-labelledby="download-checkout-title">
+        <div class="download-receipt">
+          <h2 id="download-checkout-title" tabindex="-1">下载清单</h2>
+          <strong id="download-selection"></strong>
+          <div id="download-estimate"></div>
+        </div>
+        <div class="download-checkout-controls">
+          <label class="field" for="download-target"><span>保存目录 <b>*</b></span></label>
+          <div class="download-path">
+            <input id="download-target" data-download-field="targetDir" data-path-input data-directories-only type="text" list="path-suggestions" spellcheck="false">
+            <button id="download-browse" class="secondary-button" type="button">浏览</button>
+          </div>
+          <small id="download-cache-hint">已有权重校验后可复用。</small>
+          <div id="download-validation" class="validation-messages" hidden></div>
+          <div class="download-cart-action">
+            <button id="download-review" type="button">
+              <span id="download-review-label">查看下载清单</span><strong id="download-review-value"></strong>
+            </button>
+            <button id="download-start" class="primary-button" type="submit">
+              <svg class="icon" aria-hidden="true"><use href="#icon-download"/></svg><span>开始下载</span>
+            </button>
+          </div>
+          <details class="download-advanced">
+            <summary>高级下载设置</summary>
+            <div class="form-grid">
+              <label class="field"><span>并发下载数</span>
+                <input data-download-field="maxWorkers" type="number" min="1" max="64" inputmode="numeric">
+              </label>
+              <label class="field"><span>ModelScope Access Token</span>
+                <input data-download-field="token" type="password" autocomplete="off" placeholder="私有模型可选">
+              </label>
+              <small>同一保存位置可继续下载。组合模型需要空目录，公用组件缓存在同级 .ftllm-downloads 目录。</small>
             </div>
-
-            <section id="download-catalog" class="download-catalog" aria-label="模型簇"></section>
-
-            <div class="download-layout">
-              <form id="download-form" class="download-card">
-                <div class="card-heading">
-                  <div>
-                    <span>MODEL DOWNLOAD</span>
-                    <h2>下载设置</h2>
-                    <p>从常用模型中选择，或直接填写任意 ModelScope 模型 ID。</p>
-                  </div>
-                  <span id="download-badge" class="save-state">未开始</span>
-                </div>
-
-                <section class="form-section">
-                  <div class="form-grid two-columns">
-                    <label class="field span-2">
-                      <span>常用模型</span>
-                      <select id="download-preset">
-                        <option value="custom">自定义模型 ID</option>
-                      </select>
-                    </label>
-                    <label class="field span-2">
-                      <span>ModelScope 模型 ID <b>*</b></span>
-                      <input data-download-field="modelId" type="text" placeholder="Qwen/Qwen3-0.6B" spellcheck="false">
-                    </label>
-                    <label class="field span-2">
-                      <span>保存目录 <b>*</b></span>
-                      <input data-download-field="targetDir" data-path-input data-directories-only type="text" list="path-suggestions" placeholder="~/.cache/fastllm/modelscope/model-name" spellcheck="false">
-                      <small>目录已存在时会校验缓存并继续未完成的下载。</small>
-                    </label>
-                    <label class="field span-2">
-                      <span>下载范围（可选）</span>
-                      <input data-download-field="include" type="text" placeholder="Q2_0/*,mmproj-*.gguf" spellcheck="false">
-                      <small>多个匹配规则用逗号分隔；留空下载整个仓库。GSQ 量化建议选择页面中的版本卡片。</small>
-                    </label>
-                    <label class="field">
-                      <span>Revision</span>
-                      <input data-download-field="revision" type="text" placeholder="master" spellcheck="false">
-                    </label>
-                    <label class="field">
-                      <span>并发下载数</span>
-                      <input data-download-field="maxWorkers" type="number" min="1" max="64" inputmode="numeric">
-                    </label>
-                    <label class="field span-2">
-                      <span>Access Token</span>
-                      <input data-download-field="token" type="password" autocomplete="off" placeholder="私有模型可选">
-                      <small>Token 只保存在当前页面内存中，通过环境变量传给下载进程，不写入命令或配置文件。</small>
-                    </label>
-                  </div>
-                </section>
-
-                <section class="command-panel">
-                  <div><strong>实际下载命令</strong><small>参数不经过 Shell，Token 不显示</small></div>
-                  <pre id="download-command">正在生成命令…</pre>
-                  <div id="download-validation" class="validation-messages"></div>
-                </section>
-
-                <div class="form-actions">
-                  <button id="download-cancel" class="secondary-button danger hidden" type="button">取消下载</button>
-                  <button id="download-start" class="primary-button" type="submit">↓ 开始下载</button>
-                </div>
-              </form>
-
-              <aside class="download-status-card" aria-live="polite">
-                <div class="download-status-icon" id="download-status-icon">↓</div>
-                <span>DOWNLOAD STATUS</span>
-                <h2 id="download-status-title">尚未开始下载</h2>
-                <p id="download-status-message">模型文件可能占用较多磁盘空间，请先确认保存位置。</p>
-                <div class="download-progress-heading">
-                  <span>模型总进度</span>
-                  <strong id="download-progress-value">0%</strong>
-                </div>
-                <progress id="download-progress" class="progress-track" max="100" value="0"></progress>
-                <div class="download-stat-list">
-                  <div><span>已下载</span><strong id="download-bytes">—</strong></div>
-                  <div><span>文件</span><strong id="download-files">—</strong></div>
-                  <div><span>保存位置</span><strong id="download-destination">—</strong></div>
-                </div>
-                <button id="download-use-model" class="secondary-button hidden" type="button">使用这个模型启动</button>
-              </aside>
-            </div>
-          </section>
+          </details>
+          <details class="download-advanced">
+            <summary>实际下载命令</summary>
+            <pre id="download-command" dir="ltr">正在生成命令…</pre>
+          </details>
+        </div>
+      </aside>
+    </div>
+  </form>
+</section>

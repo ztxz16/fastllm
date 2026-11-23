@@ -143,7 +143,8 @@ static void Near(const Data &a, const Data &b, const char *name) {
     }
     ++checks;
 }
-static void FP8DSA(int batch, int length, bool sparse, bool paged, int heads = 8, int dim = 192,
+enum class Selection { Dense, TopK, Mixed };
+static void FP8DSA(int batch, int length, Selection selection, bool paged, int heads = 8, int dim = 192,
                    int vd = 128, int padding = 0, int kvHeads = 1) {
     const int width = kvHeads * dim + 128 + padding;
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), a, b;
@@ -165,7 +166,8 @@ static void FP8DSA(int batch, int length, bool sparse, bool paged, int heads = 8
         r.value = paged ? v.back()->pool.cudaData : v.back()->encoded.cudaData;
         r.fp8 = true;
         r.liveKeys = (const int *)live.cudaData + i;
-        r.capacity = length;
+        const bool indexed = selection == Selection::TopK || (selection == Selection::Mixed && i % 2);
+        r.capacity = selection == Selection::Mixed && !indexed ? 257 : length;
         r.keyStride = width;
         if (paged) {
             r.keyPages = (const int *)k.back()->table.cudaData;
@@ -173,7 +175,7 @@ static void FP8DSA(int batch, int length, bool sparse, bool paged, int heads = 8
             r.pageLen = 128;
             r.poolTokens = k.back()->pool.maxPages * 128;
         }
-        if (sparse) {
+        if (indexed) {
             idx[i].Resize({1, 2048});
             idx[i].Allocate();
             for (int j = 0; j < 2048; ++j)
@@ -194,13 +196,14 @@ static void FP8DSA(int batch, int length, bool sparse, bool paged, int heads = 8
     graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(q, sink, fp, heads, kvHeads, dim, vd, sa, a); });
     for (int pass = 0; pass < 2; ++pass) {
         for (int i = 0; i < batch; ++i)
-            ((int *)live.cpuData)[i] = pass ? std::max(1, length / 2 - i % 7) : length - i % 7;
+            ((int *)live.cpuData)[i] = pass ? std::max(0, fp[i].capacity / 2 - i % 7) : fp[i].capacity - i % 7;
+        if (pass && selection == Selection::Mixed) ((int *)live.cpuData)[batch - 1] = 0;
         Cuda(cudaMemcpy(live.cudaData, live.cpuData, batch * 4, cudaMemcpyHostToDevice));
         graph.Run();
         FastllmCudaNaiveBatchDSADecode(q, sink, bf, heads, kvHeads, dim, vd, sb, b);
         Near(a, b, "DSA");
     }
-    printf("FP8 DSA PASS batch=%d length=%d sparse=%d paged=%d stride=%d\n", batch, length, sparse, paged, width);
+    printf("FP8 DSA PASS batch=%d length=%d selection=%d paged=%d stride=%d\n", batch, length, int(selection), paged, width);
     fflush(stdout);
 }
 static void FP8Prefill(int length, bool paged) {
@@ -755,12 +758,17 @@ int main(int argc, char **argv) {
             for (bool paged : {false, true})
                 for (int heads : {16, 32, 64})
                     for (int batch : {1, 3, 4, 8, 16, 31, 32, 33})
-                        FP8DSA(batch, 4097, true, paged, heads, 192, 128, 0, heads / 16);
-            FP8DSA(16, 2047, false, true, 64, 192, 128, 0, 4);
-            FP8DSA(16, 4097, true, true, 64, 192, 128, 1, 4);
+                        FP8DSA(batch, 4097, Selection::TopK, paged, heads, 192, 128, 0, heads / 16);
+            FP8DSA(16, 2047, Selection::Dense, true, 64, 192, 128, 0, 4);
+            FP8DSA(16, 4097, Selection::TopK, true, 64, 192, 128, 1, 4);
             std::printf("WIDE HEAD FP8 DSA PASS %d checks\n", checks);
             return 0;
         }
+        // Small H20 batches cross over at 128 query heads across all rows.
+        // Check mixed selections against independently decoded BF16 K/V.
+        for (int heads : {8, 16, 32, 64})
+            FP8DSA(128 / heads, 2051, Selection::Mixed, true, heads, 192, 128, 0, std::max(1, heads / 16));
+        FP8DSA(64, 2051, Selection::Mixed, true, 16);
         MixedLongDecodeIndexer();
         int peerAccess = 0;
         if (devices > 1) {
@@ -794,13 +802,13 @@ int main(int argc, char **argv) {
         }
         for (bool paged : {false, true}) {
             for (int b : {1, 2, 4, 8, 32, 128, 256}) {
-                FP8DSA(b, 707, false, paged);
-                FP8DSA(b, 4097, true, paged);
+                FP8DSA(b, 707, Selection::Dense, paged);
+                FP8DSA(b, 4097, Selection::TopK, paged);
             }
             FP8Prefill(4097, paged);
-            FP8DSA(4, 4097, true, paged, 4, 128, 256);
+            FP8DSA(4, 4097, Selection::TopK, paged, 4, 128, 256);
             // An eight-element-aligned FP8 row cannot use 16-byte cp.async.
-            FP8DSA(32, 4097, true, paged, 8, 192, 128, 8);
+            FP8DSA(32, 4097, Selection::TopK, paged, 8, 192, 128, 8);
             FP8BatchIndexer(32, paged, 328);
         }
         for (int b : {1, 2, 4, 8, 32, 128, 256})

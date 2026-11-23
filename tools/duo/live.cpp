@@ -1,4 +1,5 @@
 #include "pipeline.h"
+#include "reference.h"
 #include "httplib.h"
 #include "avc_http.h"
 #include <condition_variable>
@@ -76,6 +77,12 @@ void sendPacket(int fd, const std::string &msg) {
     if (n != ssize_t(msg.size()))
         throw std::runtime_error("session worker disconnected");
 }
+void writeBytes(const fs::path &path, const std::string &bytes) {
+    std::ofstream out(path, std::ios::binary);
+    out.exceptions(std::ios::badbit | std::ios::failbit);
+    out.write(bytes.data(), bytes.size());
+    out.close();
+}
 int runWorker(char **argv) {
     // Each session owns its CUDA contexts. Shutdown reaps this process and its FFmpeg children.
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != std::stoi(argv[8]))
@@ -83,8 +90,12 @@ int runWorker(char **argv) {
     if (fcntl(workerSocket, F_SETFD, FD_CLOEXEC) < 0)
         return 1;
     try {
-        Pipeline pipeline(argv[2], argv[3], std::stoi(argv[5]), std::stoi(argv[6]),
-                          std::string(argv[7]) == "four", std::string(argv[9]) == "avc", argv[10]);
+        int w = std::stoi(argv[5]), h = std::stoi(argv[6]);
+        fs::path rgb = fs::path(argv[4]) / "reference.rgb";
+        if (fs::exists(rgb))
+            writeBytes(fs::path(argv[3]) / referencePreset(w, h), encodeReference(argv[2], readFile(rgb), w, h));
+        Pipeline pipeline(argv[2], argv[3], w, h,
+                          GpuLayout::fromProfile(argv[7]), std::string(argv[9]) == "avc", argv[10]);
         for (;;) {
             auto turn = receive(workerSocket);
             if (turn.empty())
@@ -200,7 +211,7 @@ int main(int argc, char **argv) {
     if (argc == 11 && std::string(argv[1]) == "--worker")
         return runWorker(argv);
     if (argc != 6 && (argc != 8 || std::string(argv[6]) != "--intent-cache")) {
-        std::cerr << "Usage: duo_live MODEL TOOLS_DUO_DIRECTORY SESSION_DIRECTORY PORT single|four "
+        std::cerr << "Usage: duo_live MODEL TOOLS_DUO_DIRECTORY SESSION_DIRECTORY PORT single|two|four|eight "
                      "[--intent-cache DIRECTORY]\n";
         return 2;
     }
@@ -209,7 +220,8 @@ int main(int argc, char **argv) {
         const fs::path assets = argv[2], sessions = argv[3];
         const fs::path intentCache = argc == 8 ? argv[7] : "";
         int port = std::stoi(argv[4]);
-        if ((profile != "single" && profile != "four") || port < 1 || port > 65535)
+        GpuLayout::fromProfile(profile);
+        if (port < 1 || port > 65535)
             throw std::invalid_argument("invalid serving configuration");
         const std::string html = readFile(assets / "live.html");
         const auto player = readFile(assets / "avc-player.js");
@@ -248,7 +260,7 @@ int main(int argc, char **argv) {
                         fs::remove_all(f.path(), ec);
             }
         };
-        server.Post("/sessions", [&](auto &q, auto &r) {
+        auto createSession = [&](const httplib::Request &q, httplib::Response &r) {
             std::lock_guard lock(state);
             if (current) {
                 std::lock_guard live(current->mutex);
@@ -266,18 +278,60 @@ int main(int argc, char **argv) {
                 response(r, 400, Json::object{{"detail", "不支持的回复分辨率"}});
                 return;
             }
+            const bool custom = q.path == "/sessions/custom";
+            auto image = q.files.find("reference_rgb"), description = q.files.find("description");
+            if (custom) {
+                if (!q.is_multipart_form_data() || q.files.empty() ||
+                    q.files.size() != size_t(image != q.files.end()) + size_t(description != q.files.end())) {
+                    response(r, 400, Json::object{{"detail", "请选择初始图片或填写角色说明"}});
+                    return;
+                }
+                if (image != q.files.end() && image->second.content.size() != size_t(w) * h * 3) {
+                    response(r, 400, Json::object{{"detail", "初始图片尺寸与回复分辨率不符"}});
+                    return;
+                }
+                if (description != q.files.end()) {
+                    const auto &text = description->second.content;
+                    if (text.size() > 2048 || text.find('\0') != std::string::npos ||
+                        text.find_first_not_of(" \t\r\n") == std::string::npos) {
+                        response(r, 400, Json::object{{"detail", "角色说明须为非空文本，最多 2048 字节"}});
+                        return;
+                    }
+                }
+            }
             if (current)
                 retire(current);
             current.reset();
             auto next = std::make_shared<Conversation>();
             next->id = uid();
             next->dir = sessions / next->id;
-            fs::create_directories(next->dir);
+            if (!fs::create_directory(next->dir))
+                throw std::runtime_error("session directory already exists");
             next->avc = q.get_param_value("playback") == "avc";
-            startWorker(*next, root, assets, w, h, profile, intentCache);
+            try {
+                auto role = assets;
+                if (custom) {
+                    role = next->dir / "role";
+                    fs::create_directories(role / "presets");
+                    if (description != q.files.end())
+                        writeBytes(role / "presets/default.txt", description->second.content);
+                    else
+                        fs::copy_file(assets / "presets/default.txt", role / "presets/default.txt");
+                    if (image != q.files.end())
+                        writeBytes(next->dir / "reference.rgb", image->second.content);
+                    else
+                        fs::copy_file(assets / referencePreset(w, h), role / referencePreset(w, h));
+                }
+                startWorker(*next, root, role, w, h, profile, intentCache);
+            } catch (const std::exception &) {
+                fs::remove_all(next->dir);
+                throw;
+            }
             current = next;
             response(r, 200, Json::object{{"id", next->id}});
-        });
+        };
+        server.Post("/sessions", createSession);
+        server.Post("/sessions/custom", createSession);
         server.Post(R"(/sessions/([a-f0-9]{32})/turns)", [&](const httplib::Request &q, httplib::Response &r,
                                                              const httplib::ContentReader &reader) {
             auto c = lookup(q.matches[1]);

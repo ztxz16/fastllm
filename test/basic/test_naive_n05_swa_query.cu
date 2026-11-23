@@ -171,7 +171,7 @@ template<bool FP8> static void RingCase(int requests, int width, int heads) {
             SwaVerifyBatch batch{};
             std::copy_n(groups.begin() + first, n, batch.groups);
             optimized<<<dim3(n, heads / 8), 256, shared, cudaStreamPerThread>>>(
-                q.data, batch, bias, actual.data, heads, kvHeads);
+                q.data, batch, bias, actual.data, heads, kvHeads, {});
         }
     };
     cudaGraph_t graph; cudaGraphExec_t exec;

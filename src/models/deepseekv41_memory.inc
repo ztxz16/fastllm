@@ -54,6 +54,7 @@ struct V41RequestStorage : std::enable_shared_from_this<V41RequestStorage> {
         auto lease = std::static_pointer_cast<Lease>(reservation);
         if (lease->owner.get() != this) throw std::logic_error("DeepSeekV41 request storage owner mismatch");
         const int slot = lease->slot;
+        ++state->storageRevision;
         state->storageLease = std::move(reservation);
         for (const auto &entry : entries) {
             auto &layer = state->layers.at(entry.layer);

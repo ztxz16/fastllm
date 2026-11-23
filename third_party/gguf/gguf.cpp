@@ -1,5 +1,6 @@
 #include <map>
 #include <limits>
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 
@@ -1094,11 +1095,26 @@ namespace fastllm {
 
             int type = ggufBuffer.Read <int> ();
             uint64_t offset = ggufBuffer.Read <uint64_t> ();
+            // HY4 assigns wire type 43 to scalar E4M3, while the native schema
+            // assigns it to block-scaled MXFP8. Keep this byte view local to HY4.
+            if (arch == "hy_v4_flash") {
+                const bool engram = tensorName == "per_layer_token_embd.weight";
+                if (type == 43 && engram)
+                    type = GGML_TYPE_I8;
+                else if (type == 43 || (engram && type != GGML_TYPE_BF16))
+                    throw std::runtime_error("Unsupported HY4 GGUF tensor type " + std::to_string(type) +
+                                             " for " + tensorName + " in " + fileName);
+            }
 
             {
-                tensors[i].first.type = (ggml_type)type;
-                const size_t  type_size = ggml_type_size(tensors[i].first.type);
-                const int64_t blck_size = ggml_blck_size(tensors[i].first.type);
+                const auto traits = type >= 0 && type < GGML_TYPE_COUNT
+                    ? type_traits.find(static_cast<ggml_type>(type)) : type_traits.end();
+                if (traits == type_traits.end() || !traits->second.type_size || traits->second.blck_size <= 0)
+                    throw std::runtime_error("Unsupported GGUF tensor type " + std::to_string(type) +
+                                             " for " + tensorName + " in " + fileName);
+                tensors[i].first.type = traits->first;
+                const size_t type_size = traits->second.type_size;
+                const int64_t blck_size = traits->second.blck_size;
 
                 // calculate byte offsets given the tensor shape and type
                 tensors[i].first.nb[0] = type_size;
@@ -1121,6 +1137,18 @@ namespace fastllm {
         uint64_t baseOffset = ftell(ggufBuffer.f);
         uint64_t curPos = baseOffset;
 
+        if (arch == "hy_v4_flash") {
+            const auto end = std::ifstream(fileName, std::ios::binary | std::ios::ate).tellg();
+            AssertInFastLLM(end >= 0, "Cannot read HY4 GGUF shard size: " + fileName);
+            const uint64_t size = static_cast<uint64_t>(end);
+            for (auto &item : tensors) {
+                AssertInFastLLM(baseOffset <= size && item.second <= size - baseOffset &&
+                                ggml_nbytes(&item.first) <= size - baseOffset - item.second,
+                                "Invalid HY4 GGUF tensor range: " + item.first.name);
+                tasks.emplace_back(item.first.name, nullptr, item.first, fileName, baseOffset + item.second);
+            }
+            return;
+        }
         std::vector <GGUFWeightReplaceRule> weightNameConverterRules = GetGGUFWeightReplaceRules(arch);
 
         for (int i = 0; i < tensorCount; i++) {

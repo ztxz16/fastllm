@@ -2387,8 +2387,12 @@ bool FastllmCudaHalfMatMulFloat16WithPath(
                                  int n, int m, int k, bool addTo,
                                  bool allowRouterSpecialization,
                                  FastllmCudaLinearFp16Path path) {
-    FastllmCudaFP16EnsureBiasOnDevice(weight, bias, k);
-    FastllmCudaFP16EnsureBiasHalfOnDevice(weight, bias, k);
+    // Bias-free Linear also accepts temporary views into merged weights.
+    // Creating a zero bias here would allocate during CUDA graph capture.
+    if (!bias.dims.empty()) {
+        FastllmCudaFP16EnsureBiasOnDevice(weight, bias, k);
+        FastllmCudaFP16EnsureBiasHalfOnDevice(weight, bias, k);
+    }
 
     half *cudaInput = (half *) FastllmCudaPrepareInput(input);
     half *cudaOutput = (half *) FastllmCudaPrepareOutput(output);

@@ -14,6 +14,24 @@ __device__ __forceinline__ void DependencyStart() {
 #endif
 }
 
+#if CUDART_VERSION >= 12000
+// Callers that already checked the producer and consumer can use this directly.
+template <auto Kernel, class... Args>
+inline cudaError_t LaunchProgrammatic(dim3 grid, dim3 block, size_t shared, cudaStream_t stream, Args... args) {
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = shared;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &attr;
+    cfg.numAttrs = 1;
+    return cudaLaunchKernelEx(&cfg, Kernel, args...);
+}
+#endif
+
 template <auto Kernel, class... Args>
 bool Launch(dim3 grid, dim3 block, size_t shared, cudaStream_t stream, Args... args) {
 #if CUDART_VERSION >= 12000
@@ -33,17 +51,7 @@ bool Launch(dim3 grid, dim3 block, size_t shared, cudaStream_t stream, Args... a
         previousDevice = device;
     }
     if (capable) {
-        cudaLaunchConfig_t cfg{};
-        cfg.gridDim = grid;
-        cfg.blockDim = block;
-        cfg.dynamicSmemBytes = shared;
-        cfg.stream = stream;
-        cudaLaunchAttribute attr{};
-        attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attr.val.programmaticStreamSerializationAllowed = 1;
-        cfg.attrs = &attr;
-        cfg.numAttrs = 1;
-        if (cudaLaunchKernelEx(&cfg, Kernel, args...) != cudaSuccess)
+        if (LaunchProgrammatic<Kernel>(grid, block, shared, stream, args...) != cudaSuccess)
             return false;
         return cudaGetLastError() == cudaSuccess;
     }

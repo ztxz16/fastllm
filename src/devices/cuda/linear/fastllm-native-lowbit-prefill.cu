@@ -3,7 +3,6 @@
 #ifdef FASTLLM_NATIVE_PREFILL_SM120
 #include "fastllm-native-nvfp4-tma.cuh"
 #endif
-#include <cstring>
 #include <limits>
 #if CUDART_VERSION >= 12080
 #include <cstdio>
@@ -21,8 +20,7 @@
 // Optional activation quantization. Decode retains its existing weight-only path.
 namespace fastllm_native_prefill {
 bool Enabled(const char *name) {
-    const char *v = std::getenv(name);
-    return v && (!std::strcmp(v, "1") || !std::strcmp(v, "true"));
+    return ResolvePrefillSwitch(std::getenv(name), false);
 }
 
 void CheckCuda(cudaError_t error, const char *operation) {
@@ -430,7 +428,7 @@ __global__ void ScaleFp8BFloat16(const float *input, __nv_bfloat16 *output,
     }
 }
 bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float *bias,
-                __nv_bfloat16 *output, int M, int N, int K) {
+                __nv_bfloat16 *output, int M, int N, int K, const float *rowScales) {
     // Reuse the existing opt-in for activation quantization. Weight-only FP8
     // and all existing BF16 defaults retain their original arithmetic.
     if (!Enabled("FASTLLM_CUDA_NATIVE_FP8_PREFILL")) return false;
@@ -439,13 +437,13 @@ bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float 
     if (FastllmCudaGetNcclForceSync() && !FastllmCudaGraphIsCapturingFast() && Supported(8)) GetState();
     if (M < std::max(128, fastllm::FastllmCudaGetLinearExactBatchThreshold()) || M > 4096 ||
         N <= 0 || K <= 0 || N % 16 || K % 16 || !input || !weight || !output ||
-        uintptr_t(weight) % 4 || uintptr_t(input) % 16 || uintptr_t(output) % 16 || !Supported(8)) return false;
+        uintptr_t(weight) % (rowScales ? 16 : 4) || (rowScales && uintptr_t(rowScales) % 16) || uintptr_t(input) % 16 || uintptr_t(output) % 16 || !Supported(8)) return false;
     cudaStreamCaptureStatus capture;
     if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
         capture != cudaStreamCaptureStatusNone) return false;
     auto align = [](size_t n) { return (n + 255) & ~size_t(255); };
-    const size_t wb = align(size_t(N) * K), xb = align(size_t(M) * K),
-        swb = align(size_t(N) * 4), sxb = align(size_t(M) * 4), ob = size_t(M) * N * 4;
+    const size_t wb = rowScales ? 0 : align(size_t(N) * K), xb = align(size_t(M) * K),
+        swb = rowScales ? 0 : align(size_t(N) * 4), sxb = align(size_t(M) * 4), ob = size_t(M) * N * 4;
     if (wb + xb + swb + sxb + ob > State::capacity) return false;
     State *s = GetState();
     if (!s) return false;
@@ -453,10 +451,14 @@ bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float 
     Plan *p = GetPlan(*s, 8, M, N, K);
     if (!p) return false;
     CheckCuda(cudaStreamWaitEvent(cudaStreamPerThread, s->ready, 0), "FP8 BF16 scratch dependency");
-    uint8_t *w = s->scratch, *x = w + wb;
+    const uint8_t *w = rowScales ? weight : s->scratch;
+    uint8_t *x = s->scratch + wb;
     float *sw = (float *)(x + xb), *sx = (float *)((uint8_t *)sw + swb),
           *tmp = (float *)((uint8_t *)sx + sxb);
-    UnpackFp8Channels<<<N,256,0,cudaStreamPerThread>>>(weight,w,sw,N,K);
+    if (!rowScales) {
+        UnpackFp8Channels<<<N,256,0,cudaStreamPerThread>>>(weight,s->scratch,sw,N,K);
+        rowScales = sw;
+    }
     QuantFp8BFloat16<<<M,256,0,cudaStreamPerThread>>>(input,x,sx,K);
     CheckCuda(cudaGetLastError(), "FP8 BF16 preparation");
     Tune(*s,*p,w,x,tmp);
@@ -467,9 +469,9 @@ bool Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float 
         // Keep coalesced float4 access while amortizing scheduling for wide rows.
         // Small shapes and unmeasured architectures retain the original launch.
         if (FastllmCudaRuntimeArch() == 90 && M >= 1024 && N >= 4096)
-            ScaleFp8BFloat16<4><<<dim3((N+4095)/4096,M),256,0,cudaStreamPerThread>>>(tmp,output,sx,sw,bias,N);
+            ScaleFp8BFloat16<4><<<dim3((N+4095)/4096,M),256,0,cudaStreamPerThread>>>(tmp,output,sx,rowScales,bias,N);
         else
-            ScaleFp8BFloat16<1><<<dim3((N+1023)/1024,M),256,0,cudaStreamPerThread>>>(tmp,output,sx,sw,bias,N);
+            ScaleFp8BFloat16<1><<<dim3((N+1023)/1024,M),256,0,cudaStreamPerThread>>>(tmp,output,sx,rowScales,bias,N);
     }
     CheckCuda(cudaGetLastError(), "FP8 BF16 output");
     CheckCuda(cudaEventRecord(s->ready,cudaStreamPerThread), "FP8 BF16 completion");
@@ -718,7 +720,7 @@ namespace fastllm_native_prefill {
 bool Enabled(const char *) { return false; }
 bool Supported(int) { return false; }
 bool Fp32(const float *, const float *, float *, int, int, int, void *, size_t) { return false; }
-bool Fp8BFloat16(const __nv_bfloat16 *, const uint8_t *, const float *, __nv_bfloat16 *, int, int, int) {
+bool Fp8BFloat16(const __nv_bfloat16 *, const uint8_t *, const float *, __nv_bfloat16 *, int, int, int, const float *) {
     return false;
 }
 bool Fp8(const half *, const uint8_t *, const float *, const half *, half *, int, int, int, int) {
@@ -730,3 +732,8 @@ bool Fp4(const half *, const uint32_t *, const uint8_t *, const float *, const h
 }
 } // namespace fastllm_native_prefill
 #endif
+
+bool fastllm_native_prefill::Fp8BFloat16(const __nv_bfloat16 *input, const uint8_t *weight, const float *bias,
+                __nv_bfloat16 *output, int m, int n, int k) {
+    return Fp8BFloat16(input, weight, bias, output, m, n, k, nullptr);
+}

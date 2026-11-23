@@ -4,6 +4,7 @@
 // Producers gather independent K/V pages; two MMA warps reduce disjoint
 // halves of each tile. The final normalization includes the attention sink.
 #include "naive-n05-attention-batch.cuh"
+#include "devices/cuda/fastllm-mxfp8-activation.cuh"
 #include "devices/cuda/naive-n05-kv.cuh"
 #if !defined(USE_ROCM) && CUDART_VERSION >= 12080
 namespace blackwell_decode {
@@ -82,9 +83,9 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const unsigned (&a)[4], 
 }
 
 #endif
-template <bool Split, int Groups, bool Prefill = false>
+template <bool Split, int Groups, bool Prefill = false, bool Pack = false>
 __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmNaiveDSARow &row,
-        const float *sink, __nv_bfloat16 *out, int q_heads, float *parts, float2 *stats) {
+        const float *sink, __nv_bfloat16 *out, int q_heads, float *parts, float2 *stats, FastllmMxfp8Activation packed, int firstRow) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     static_assert(Groups == 1 || (Groups == 2 && !Split));
     using L = Layout<Groups>;
@@ -102,6 +103,10 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
         } else {
             for (int i = threadIdx.x; i < Groups * 16 * 128; i += blockDim.x)
                 out[((size_t)b * q_heads + firstHead * 16) * 128 + i] = __float2bfloat16(0.f);
+            if constexpr (Pack) {
+                for (int col = threadIdx.x * 8; col < Groups * 16 * 128; col += blockDim.x * 8)
+                    fastllm_mxfp8::StoreZero8(packed, firstRow + b, firstHead * 16 * 128 + col);
+            }
         }
         return;
     }
@@ -384,7 +389,9 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
                     o.y = pack_bf16(v[2], v[3]);
                     o.z = pack_bf16(v[4], v[5]);
                     o.w = pack_bf16(v[6], v[7]);
-                    *reinterpret_cast<uint4 *>(out + ((long)b * q_heads + head) * 128 + 32 * j + 8 * c) = o;
+                    const int col = head * 128 + 32 * j + 8 * c;
+                    *reinterpret_cast<uint4 *>(out + size_t(b) * q_heads * 128 + col) = o;
+                    if constexpr (Pack) fastllm_mxfp8::Store8(packed, firstRow + b, col, o);
                 }
             }
         }
@@ -392,19 +399,20 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
 #endif
 }
 
-template <bool Split = false, int Groups = 1>
+template <bool Split = false, int Groups = 1, bool Pack = false>
 __global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
     Decode(const __nv_bfloat16 *q, const __grid_constant__ naive_attention_bulk::Batch batch, const float *sink,
-           __nv_bfloat16 *out, int q_heads, float *parts = nullptr, float2 *stats = nullptr) {
-    AttendRow<Split, Groups>(q, FastllmNaiveResolveDSARow(batch.rows[blockIdx.x]),
-                             sink, out, q_heads, parts, stats);
+           __nv_bfloat16 *out, int q_heads, float *parts, float2 *stats, FastllmMxfp8Activation packed, int firstRow) {
+    AttendRow<Split, Groups, false, Pack>(q, FastllmNaiveResolveDSARow(batch.rows[blockIdx.x]),
+                             sink, out, q_heads, parts, stats, packed, firstRow);
 }
 
 #endif
 // Keep the merge launch stub linkable in builds targeting only older GPUs.
 // One warp reduces four adjacent output channels per lane.
+template<bool Packed>
 static __global__ void Merge(const float *parts, const float2 *stats, const float *sink, __nv_bfloat16 *out, int heads,
-                      int splits) {
+                      int splits, FastllmMxfp8Activation packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     const int lane = threadIdx.x, head = blockIdx.x;
     const size_t row = size_t(blockIdx.y) * heads + head;
@@ -429,13 +437,17 @@ static __global__ void Merge(const float *parts, const float2 *stats, const floa
         }
     }
     const float inv = denom > 0.f ? 1.f / denom : 0.f;
-    for (int i = 0; i < 4; ++i)
-        out[row * 128 + 4 * lane + i] = __float2bfloat16(acc[i] * inv);
+    __nv_bfloat16 values[4];
+    for (int i = 0; i < 4; ++i) {
+        values[i] = __float2bfloat16(acc[i] * inv);
+        out[row * 128 + 4 * lane + i] = values[i];
+    }
+    if constexpr (Packed) fastllm_mxfp8::StoreGroup(packed, blockIdx.y, head * 128 + 4 * lane, values);
 #endif
 }
 // The paired producer/consumer warp groups require the architecture-specific cubin.
 using DecodeKernel = void (*)(const __nv_bfloat16 *, naive_attention_bulk::Batch, const float *,
-                              __nv_bfloat16 *, int, float *, float2 *);
-DecodeKernel PairedDecodeKernel();
+                              __nv_bfloat16 *, int, float *, float2 *, FastllmMxfp8Activation, int);
+DecodeKernel PairedDecodeKernel(bool pack);
 } // namespace blackwell_decode
 #endif

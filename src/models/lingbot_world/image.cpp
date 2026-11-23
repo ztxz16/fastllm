@@ -5,6 +5,9 @@
 
 namespace fastllm { namespace lingbot {
 namespace {
+uint8_t channelByte(float value) {
+    return uint8_t(std::nearbyint(std::clamp(value*.5f+.5f,0.f,1.f)*255.f));
+}
 float cubic(float x) {
     constexpr float a=-.75f;
     x=std::abs(x);
@@ -41,6 +44,11 @@ std::vector<float> prepareImage(const qwen_image::Image &image,int h,int w) {
     }
     return out;
 }
+std::vector<uint8_t> packSegmentRGB(const Segment &segment) {
+    std::vector<uint8_t> rgb(segment.pixels.size());
+    std::transform(segment.pixels.begin(),segment.pixels.end(),rgb.begin(),channelByte);
+    return rgb;
+}
 std::vector<uint8_t> encodeFramePNG(const Segment &segment,int frame) {
     if(segment.height<=0 || segment.width<=0 || frame<0 || frame>=segment.frames ||
        segment.pixels.size()!=size_t(segment.frames)*segment.height*segment.width*3)
@@ -50,8 +58,7 @@ std::vector<uint8_t> encodeFramePNG(const Segment &segment,int frame) {
     size_t pixels=size_t(image.width)*image.height;
     image.rgba.resize(pixels*4);
     for(size_t i=0;i<pixels;++i) {
-        for(int c=0;c<3;++c) image.rgba[i*4+c]=uint8_t(std::nearbyint(
-            std::clamp(segment.pixels[(size_t(frame)*pixels+i)*3+c]*.5f+.5f,0.f,1.f)*255.f));
+        for(int c=0;c<3;++c) image.rgba[i*4+c]=channelByte(segment.pixels[(size_t(frame)*pixels+i)*3+c]);
         image.rgba[i*4+3]=255;
     }
     return qwen_image::encodePNG(image);

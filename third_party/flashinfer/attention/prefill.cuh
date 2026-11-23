@@ -50,14 +50,19 @@ DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 DEFINE_HAS_MEMBER(maybe_k_cache_sf)
 DEFINE_HAS_MEMBER(maybe_v_cache_sf)
+DEFINE_HAS_MEMBER(output_gate)
 
-// Opt-in for models whose reference softmax sums the unrounded FP32
-// exponentials. Existing attention variants retain the Tensor Core rowsum.
-template <typename T, typename = void>
-struct prefill_fp32_softmax_sum : std::false_type {};
-template <typename T>
-struct prefill_fp32_softmax_sum<T, std::void_t<decltype(T::use_fp32_softmax_sum)>>
-    : std::bool_constant<T::use_fp32_softmax_sum> {};
+// Optional static flags default to false for other attention variants.
+#define FLASHINFER_PREFILL_FLAG(trait, member)                                             \
+  template <typename T, typename = void> struct trait : std::false_type {};                \
+  template <typename T> struct trait<T, std::void_t<decltype(T::member)>>                  \
+      : std::bool_constant<T::member> {};
+FLASHINFER_PREFILL_FLAG(prefill_fp32_softmax_sum, use_fp32_softmax_sum)
+FLASHINFER_PREFILL_FLAG(prefill_pv_residual, use_pv_residual)
+FLASHINFER_PREFILL_FLAG(prefill_custom_output_store, custom_output_store)
+FLASHINFER_PREFILL_FLAG(prefill_defer_softmax_rescale, defer_softmax_rescale)
+FLASHINFER_PREFILL_FLAG(prefill_custom_score_tile, custom_score_tile)
+#undef FLASHINFER_PREFILL_FLAG
 
 // Type trait to detect packed NVFP4 KV cache types (__nv_fp4x2_e2m1 stores 2 FP4 per byte).
 template <typename T>
@@ -578,9 +583,9 @@ __device__ __forceinline__ void produce_kv(smem_t<KTraits::SWIZZLE_MODE_KV> smem
   }
 }
 
-template <bool produce_v, typename KTraits, typename SmemStorage>
+template <bool produce_v, typename KTraits, typename SmemStorage, typename KVPointer>
 __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint32_t* smem_offset,
-                                                typename KTraits::DTypeKV* kv_ptr,
+                                                KVPointer kv_ptr,
                                                 const uint32_t kv_idx_base,
                                                 const size_t* thr_local_kv_offset,
                                                 const uint32_t kv_len, const uint32_t warp_idx,
@@ -609,9 +614,10 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
     static_assert(NUM_MMA_KV * 4 % NUM_WARPS_Q == 0);
 #pragma unroll
     for (uint32_t i = 0; i < NUM_MMA_KV * 4 / NUM_WARPS_Q; ++i) {
-      DType* gptr = kv_ptr + thr_local_kv_offset[i];
+      const auto row = kv_ptr + thr_local_kv_offset[i];
 #pragma unroll
       for (uint32_t j = 0; j < NUM_MMA_D / (8 / sizeof(DType)); ++j) {
+        const DType* gptr = row + j * (IS_FP4 ? 4 : 8) * upcast_size<DType>();
         if constexpr (IS_FP4) {
           // Load 64b from packed GMEM into lower 64b of 128b SMEM slot (upper 64b zeroed)
           smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
@@ -619,8 +625,6 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
           smem.load_128b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
         }
         *smem_offset = smem.template advance_offset_by_column<8>(*smem_offset, j);
-        // FP4: GMEM row is HEAD_DIM/2 bytes wide (packed), so advance by half
-        gptr += (IS_FP4 ? 4 : 8) * upcast_size<DType>();
       }
       kv_idx += NUM_WARPS * 4;
       *smem_offset =
@@ -634,7 +638,7 @@ __device__ __forceinline__ void page_produce_kv(SmemStorage* smem_storage, uint3
     static_assert(NUM_MMA_KV * 2 % NUM_WARPS_Q == 0);
 #pragma unroll
     for (uint32_t i = 0; i < NUM_MMA_KV * 2 / NUM_WARPS_Q; ++i) {
-      DType* gptr = kv_ptr + thr_local_kv_offset[i];
+      const DType* gptr = kv_ptr + thr_local_kv_offset[i];
       if constexpr (IS_FP4) {
         smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
       } else {
@@ -764,11 +768,11 @@ __device__ __forceinline__ void page_produce_kv_on_the_fly(
  * \param warp_idx            Global warp index within the CTA.
  * \param lane_idx            Lane index within the warp.
  */
-template <bool produce_v, typename KTraits, typename SmemStorage, typename IdType>
+template <bool produce_v, typename KTraits, typename SmemStorage, typename IdType, typename PageSize>
 __device__ __forceinline__ void page_produce_kv_sf(
     SmemStorage* smem_storage, uint8_t* sf_ptr, const uint32_t packed_page_iter_base,
     const uint32_t packed_kv_bound, const uint32_t kv_head_idx, const uint32_t sf_stride_page,
-    const uint32_t sf_stride_h, const uint32_t sf_stride_n, const uint_fastdiv& page_size,
+    const uint32_t sf_stride_h, const uint32_t sf_stride_n, const PageSize& page_size,
     const IdType* indices, const uint32_t kv_idx_base, const uint32_t kv_len,
     const uint32_t warp_idx, const uint32_t lane_idx) {
   // Wrap the whole body (not an early return) so that for non-FP4 KV the pointer arithmetic on the
@@ -1430,6 +1434,10 @@ __device__ __forceinline__ void logits_transform(
     const uint32_t kv_len, const uint_fastdiv group_size,
     DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], const dim3 tid = threadIdx,
     const uint32_t kv_head_idx = blockIdx.z) {
+  if constexpr (prefill_custom_score_tile<typename KTraits::AttentionVariant>::value) {
+    variant.template TransformScoreTile<KTraits>(params, kv_idx_base, s_frag);
+    return;
+  }
   const uint32_t lane_idx = tid.x;
   uint32_t q[KTraits::NUM_MMA_Q][2], r[KTraits::NUM_MMA_Q][2];
   float logits = 0., logitsTransformed = 0.;
@@ -1622,14 +1630,30 @@ __device__ __forceinline__ void update_mdo_states(
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x2));
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x1));
 
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m[mma_q][j] * sm_scale);
-          d[mma_q][j] *= o_scale;
+          // When the maximum is unchanged this rescale must be exactly one.
+          // An FMA on the two scaled maxima can introduce drift on long KV.
+          bool rescale = true;
+          if constexpr (prefill_defer_softmax_rescale<AttentionVariant>::value) {
+            // Delaying a small increase keeps FP16 probabilities <= e. The
+            // numerator and denominator share the same reference maximum.
+            rescale = m[mma_q][j] > m_prev + 1.f;
+            if (!rescale) m[mma_q][j] = m_prev;
+          }
+          if (rescale) {
+            float o_scale;
+            if constexpr (prefill_pv_residual<AttentionVariant>::value ||
+                          prefill_defer_softmax_rescale<AttentionVariant>::value)
+              o_scale = math::ptx_exp2((m_prev - m[mma_q][j]) * sm_scale);
+            else
+              o_scale = math::ptx_exp2(m_prev * sm_scale - m[mma_q][j] * sm_scale);
+            d[mma_q][j] *= o_scale;
 #pragma unroll
-          for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
-            o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
-            o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
-            o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
-            o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
+            for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
+              o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
+              o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
+              o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
+              o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
+            }
           }
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
@@ -1801,8 +1825,25 @@ __device__ __forceinline__ void compute_sfm_v(
 #pragma unroll
         for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
           if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
-            mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
-                o_frag[mma_q][mma_d_local], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
+            using T = typename KTraits::DTypeQ;
+            if constexpr (prefill_pv_residual<typename KTraits::AttentionVariant>::value) {
+              // Accumulate each MMA tile separately. Repeated MMA truncation of
+              // the long-lived output accumulator otherwise grows with context.
+              float tile[8] = {};
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<T>(
+                  tile, (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
+              alignas(16) T low[8];
+#pragma unroll
+              for (uint32_t j = 0; j < 8; ++j) {
+                low[j] = T(s_frag[mma_q][mma_kv][j] - float(s_frag_f16[mma_q][mma_kv][j]));
+              }
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<T>(tile, (uint32_t*)low, b_frag);
+#pragma unroll
+              for (uint32_t j = 0; j < 8; ++j) o_frag[mma_q][mma_d_local][j] += tile[j];
+            } else {
+              mma::mma_sync_m16n16k16_row_col_f16f16f32<T>(
+                  o_frag[mma_q][mma_d_local], (uint32_t*)s_frag_f16[mma_q][mma_kv], b_frag);
+            }
           } else {
             mma::mma_sync_m16n16k16_row_col_f16f16f32<typename KTraits::DTypeQ>(
                 o_frag[mma_q][mma_d_local], (uint32_t*)s_frag[mma_q][mma_kv], b_frag);
@@ -1873,6 +1914,12 @@ __device__ __forceinline__ void transform_output(
         o_frag[mma_q][mma_d][reg_id] = variant.OutputTransform(
             params, o_frag[mma_q][mma_d][reg_id], batch_idx, qo_idx, qo_head_idx,
             m[mma_q][(reg_id % 4) / 2], d[mma_q][(reg_id % 4) / 2], scale[mma_q][(reg_id % 4) / 2]);
+        if constexpr (has_output_gate_v<Params>) {
+          static_assert(KTraits::NUM_D_VO_TILES == 1, "The fused gate needs a complete output head");
+          const uint32_t col = 16 * mma_d + 8 * (reg_id / 4) + 2 * (lane_idx % 4) + reg_id % 2;
+          o_frag[mma_q][mma_d][reg_id] = params.GateOutput(qo_idx, qo_head_idx, col,
+                                                            o_frag[mma_q][mma_d][reg_id]);
+        }
       }
     }
   }
@@ -2017,12 +2064,22 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
   }
 }
 
-template <typename KTraits>
+struct StorePrefillOutput {
+  template <typename T>
+  __device__ __forceinline__ void operator()(T* dst, b128_t value, uint32_t) const {
+    *reinterpret_cast<b128_t*>(dst) = value;
+  }
+};
+
+template <typename Params>
+__device__ __forceinline__ StorePrefillOutput prefill_output_store(const Params&) { return {}; }
+
+template <typename KTraits, typename Store = StorePrefillOutput>
 __device__ __forceinline__ void write_o_reg_gmem(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_TILE][8], smem_t<KTraits::SWIZZLE_MODE_Q>* o_smem,
     typename KTraits::DTypeO* o_ptr_base, const uint32_t o_packed_idx_base,
     const uint32_t qo_upper_bound, const uint32_t o_stride_n, const uint32_t o_stride_h,
-    const uint_fastdiv group_size, const dim3 tid = threadIdx) {
+    const uint_fastdiv group_size, const dim3 tid = threadIdx, Store store = {}) {
   using DTypeO = typename KTraits::DTypeO;
   constexpr uint32_t UPCAST_STRIDE_O = KTraits::UPCAST_STRIDE_O;
   const uint32_t warp_idx_x = get_warp_idx_q<KTraits>(tid.y);
@@ -2096,7 +2153,7 @@ __device__ __forceinline__ void write_o_reg_gmem(
 #pragma unroll
           for (uint32_t mma_do = 0; mma_do < KTraits::NUM_MMA_D_VO_TILE / 4; ++mma_do) {
             if (o_idx < qo_upper_bound) {
-              o_smem->store_128b(o_smem_offset_w, o_ptr);
+              store(o_ptr, o_smem->base[o_smem_offset_w], q);
             }
             o_ptr += 8 * upcast_size<DTypeO>();
             o_smem_offset_w = o_smem->template advance_offset_by_column<8>(o_smem_offset_w, mma_do);
@@ -2506,7 +2563,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                   qo_len,
                                   /*o_stride_n=*/
                                   partition_kv ? num_chunks * o_stride_n : o_stride_n,
-                                  /*o_stride_h=*/o_stride_h, group_size, tid);
+                                  /*o_stride_h=*/o_stride_h, group_size, tid, prefill_output_store(params));
       }
 
       // write lse (identical across VO tiles; redundant rewrite on later tiles is harmless)
@@ -3640,7 +3697,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     DTypeO* o = params.o;
     float* lse = params.lse;
     bool* block_valid_mask = params.block_valid_mask;
-    const paged_kv_t<DTypeKV, IdType>& paged_kv = params.paged_kv;
+    const auto& paged_kv = params.paged_kv;
     const bool partition_kv = params.partition_kv;
     const uint_fastdiv& group_size = params.group_size;
 
@@ -4146,17 +4203,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         // threadblock synchronization
         threadblock_sync_mdo_states<KTraits>(o_frag, &smem_storage, m, d, warp_idx, lane_idx, tid);
 
-        // transform output
-        transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
-                                          kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx,
-                                          kv_head_idx, group_size);
+        if constexpr (prefill_custom_output_store<Params>::value) {
+          params.template StoreOutputTile<KTraits>(o_frag, m, d, qo_packed_idx_base, kv_head_idx, lane_idx);
+        } else {
+          // transform output
+          transform_output<KTraits, Params>(params, variant, o_frag, m, d, /*batch_idx=*/request_idx,
+                                            kv_tile_idx, qo_packed_idx_base, warp_idx, lane_idx,
+                                            kv_head_idx, group_size);
 
-        // write_back (o_ptr_base offset to this VO tile's columns: d_base mma * 16 elems)
-        write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
-                                  qo_len,
-                                  /*o_stride_n=*/
-                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
-                                  /*o_stride_h=*/o_stride_h, group_size, tid);
+          // write_back (o_ptr_base offset to this VO tile's columns: d_base mma * 16 elems)
+          write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base + d_base * 16, qo_packed_idx_base,
+                                    qo_len,
+                                    /*o_stride_n=*/
+                                    partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
+                                    /*o_stride_h=*/o_stride_h, group_size, tid);
+        }
       }
 
       // write lse (identical across VO tiles since m/d depend only on Q.K^T; the

@@ -36,6 +36,28 @@ __device__ __forceinline__ void V41TcRouterCopy(const __nv_bfloat16 *x, const __
     asm volatile("cp.async.commit_group;" ::: "memory");
 }
 
+template <int KTile>
+__device__ __forceinline__ void V41RouterMmaTile(const __nv_bfloat16 *tile, int lane, int q,
+        float &c0, float &c1, float &c2, float &c3) {
+#if __CUDA_ARCH__ >= 800
+    unsigned a0, a1, a2, a3, b0, b1;
+    unsigned ap =
+        __cvta_generic_to_shared(tile + V41TcRouterSwizzle<KTile>(lane % 16, q + (lane / 16) * 8));
+    unsigned bp = __cvta_generic_to_shared(
+        tile + V41TcRouterSwizzle<KTile>(16 + lane % 8, q + ((lane / 8) % 2) * 8));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                 : "r"(ap));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
+                 : "=r"(b0), "=r"(b1)
+                 : "r"(bp));
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+
 template <int Warps, int Splits, int KTile, int Stages, bool Cluster>
 __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, float *y, int rows, int n,
                                     int k, float invTemp) {
@@ -67,21 +89,7 @@ __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 
         const __nv_bfloat16 *tile = tiles[it % Stages];
 #pragma unroll
         for (int q = warp * 16; q < KTile; q += Warps * 16) {
-            unsigned a0, a1, a2, a3, b0, b1;
-            unsigned ap =
-                __cvta_generic_to_shared(tile + V41TcRouterSwizzle<KTile>(lane % 16, q + (lane / 16) * 8));
-            unsigned bp = __cvta_generic_to_shared(
-                tile + V41TcRouterSwizzle<KTile>(16 + lane % 8, q + ((lane / 8) % 2) * 8));
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-                         : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
-                         : "r"(ap));
-            asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-                         : "=r"(b0), "=r"(b1)
-                         : "r"(bp));
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                         : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            V41RouterMmaTile<KTile>(tile, lane, q, c0, c1, c2, c3);
         }
         __syncthreads();
     }
@@ -142,6 +150,58 @@ __global__ void V41TcRouterPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 
 #endif
 }
 
+// Six rows, 384 experts, K=5120. Each CTA covers two or three disjoint
+// K tiles. Stage all its immutable weights before waiting on the input.
+__global__ void V41VerifyRouterPartial(const __nv_bfloat16 *x, const __nv_bfloat16 *w, float *partial) {
+#if __CUDA_ARCH__ >= 900
+    constexpr int tileK = 128, n = 384, rows = 6, inner = 5120;
+    __shared__ __align__(16) __nv_bfloat16 tiles[3][24 * tileK];
+    const int t = threadIdx.x, lane = t % 32, warp = t / 32;
+    const int split = blockIdx.x, expert = 16 * blockIdx.y;
+    const int tilesUsed = split < 8 ? 3 : 2;
+    if (!t) cudaTriggerProgrammaticLaunchCompletion();
+#pragma unroll
+    for (int j = 0; j < 3; ++j) if (j < tilesUsed) {
+        const int k = (split + j * 16) * tileK;
+#pragma unroll
+        for (int i = t; i < 256; i += 128) {
+            int r = i / 16, col = i % 16 * 8;
+            unsigned dst = __cvta_generic_to_shared(tiles[j] + V41TcRouterSwizzle<128>(r, col));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(w + (expert + r) * inner + k + col) : "memory");
+        }
+    }
+    cudaGridDependencySynchronize();
+#pragma unroll
+    for (int j = 0; j < 3; ++j) if (j < tilesUsed) {
+        int r = t / 16, col = (t % 16) * 8;
+        const auto *src = x + (r < rows ? r : 0) * inner + (split + j * 16) * tileK + col;
+        unsigned dst = __cvta_generic_to_shared(tiles[j] + V41TcRouterSwizzle<128>(16 + r, col));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(r < rows ? 16 : 0) : "memory");
+    }
+    asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    float acc[4]{};
+#pragma unroll
+    for (int j = 0; j < 3; ++j) if (j < tilesUsed) {
+#pragma unroll
+        for (int q = warp * 16; q < tileK; q += 64) {
+            V41RouterMmaTile<tileK>(tiles[j], lane, q, acc[0], acc[1], acc[2], acc[3]);
+        }
+    }
+    __shared__ float parts[4][128];
+    const int idx = (lane / 4) * 8 + (lane % 4) * 2;
+#pragma unroll
+    for (int z = 0; z < 4; ++z) parts[warp][idx + (z / 2) * 64 + z % 2] = acc[z];
+    __syncthreads();
+    if (t % 8 < rows) {
+        float v = 0.f;
+#pragma unroll
+        for (int z = 0; z < 4; ++z) v += parts[z][t];
+        partial[(split * rows + t % 8) * n + expert + t / 8] = v;
+    }
+#endif
+}
+
 template <int Splits> __global__ void V41TcRouterFinish(const float *p, float *y, int count, float invTemp) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 #if __CUDA_ARCH__ >= 900
@@ -161,7 +221,7 @@ template <int Splits> __global__ void V41TcRouterFinish(const float *p, float *y
 
 template <int Warps, int Splits, int KTile, int Stages, bool Cluster>
 cudaError_t V41TcLaunchPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, float *p, float *y, int m,
-                                int n, int k, float invTemp, cudaStream_t stream, bool pdl) {
+                                int n, int k, float invTemp, cudaStream_t stream, bool pdl, bool deferFinish = false) {
 #if CUDART_VERSION >= 12000
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(Splits, (n + 15) / 16, (m + 7) / 8);
@@ -178,9 +238,16 @@ cudaError_t V41TcLaunchPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, 
         return cudaLaunchKernelEx(&cfg, V41TcRouterPipeline<Warps, Splits, KTile, Stages, true>, x, w, y, m,
                                   n, k, invTemp);
     else {
+        if constexpr (Warps == 4 && Splits == 16 && KTile == 128 && Stages == 2) {
+            if (deferFinish && pdl && m == 6 && n == 384 && k == 5120) {
+                const auto rc = cudaLaunchKernelEx(&cfg, V41VerifyRouterPartial, x, w, p);
+                if (rc == cudaSuccess) return rc;
+                cudaGetLastError();
+            }
+        }
         cudaError_t e = cudaLaunchKernelEx(&cfg, V41TcRouterPipeline<Warps, Splits, KTile, Stages, false>, x,
                                            w, p, m, n, k, invTemp);
-        if (e != cudaSuccess)
+        if (e != cudaSuccess || deferFinish)
             return e;
         cfg.gridDim = (m * n + 255) / 256;
         cfg.blockDim = 256;
@@ -198,31 +265,11 @@ cudaError_t V41TcLaunchPipeline(const __nv_bfloat16 *x, const __nv_bfloat16 *w, 
 #endif
 }
 
-// Each warp owns a row. Values and corrected selection scores stay in registers.
-template <int N, int TopK>
-__global__ void V41TcRouterTopK(const float *input, const float *bias, int *ids, float *weights,
-                                float scale) {
+template <int N, int TopK, bool Publish>
+__device__ __forceinline__ void V41SelectRouterWarp(float (&value)[N / 32], float (&score)[N / 32],
+        int row, int lane, int *ids, float *weights, float scale, int64_t *routeIds,
+        float *routeWeights, int *order) {
 #if __CUDA_ARCH__ >= 800
-    static_assert(N % 32 == 0 && TopK > 0 && N >= TopK);
-    int row = blockIdx.x, lane = threadIdx.x;
-    float value[N / 32], score[N / 32];
-#pragma unroll
-    for (int j = 0; j < N / 32; ++j)
-        score[j] = bias[j * 32 + lane];
-#if __CUDA_ARCH__ >= 900
-    if (lane == 0)
-        cudaTriggerProgrammaticLaunchCompletion();
-    cudaGridDependencySynchronize();
-#endif
-#pragma unroll
-    for (int j = 0; j < N / 32; ++j) {
-        int e = j * 32 + lane;
-        float v = input[row * N + e];
-        value[j] = v;
-        score[j] += v;
-        if (isnan(score[j]))
-            score[j] = -1e30f;
-    }
     float selected[TopK], total = 0;
     int chosen[TopK];
 #pragma unroll
@@ -260,5 +307,87 @@ __global__ void V41TcRouterTopK(const float *input, const float *bias, int *ids,
             ids[row * TopK + t] = chosen[t];
             weights[row * TopK + t] = selected[t] * (scale / (total > 0.f ? total : 1.f));
         }
+    if constexpr (Publish) {
+        static_assert(N == 384 && TopK == 6);
+        __syncwarp();
+        if (order) FastllmV41PublishOrder(ids + row * TopK, order + row);
+        if (lane < TopK) {
+            const int i = row * TopK + lane, id = ids[i];
+            routeIds[i] = id < 0 ? -1 : (id % 8) * 48 + id / 8;
+            routeWeights[i] = weights[i];
+        }
+    }
+#endif
+}
+
+// Each warp owns a row. Values and corrected selection scores stay in registers.
+template <int N, int TopK, bool RawLogits = false, bool Publish = false>
+__global__ void V41TcRouterTopK(float *input, const float *bias, int *ids, float *weights,
+                                float scale, float invTemp, int64_t *routeIds = nullptr,
+                                float *routeWeights = nullptr, int *order = nullptr) {
+#if __CUDA_ARCH__ >= 800
+    static_assert(N % 32 == 0 && TopK > 0 && N >= TopK);
+    int row = blockIdx.x, lane = threadIdx.x;
+    float value[N / 32], score[N / 32];
+#pragma unroll
+    for (int j = 0; j < N / 32; ++j)
+        score[j] = bias[j * 32 + lane];
+#if __CUDA_ARCH__ >= 900
+    if (lane == 0)
+        cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+#endif
+#pragma unroll
+    for (int j = 0; j < N / 32; ++j) {
+        int e = j * 32 + lane;
+        float v = input[row * N + e];
+        if constexpr (RawLogits) {
+            v = V41TcRouterTransform(v * invTemp);
+            input[row * N + e] = v;
+        }
+        value[j] = v;
+        score[j] += v;
+        if (isnan(score[j]))
+            score[j] = -1e30f;
+    }
+    V41SelectRouterWarp<N, TopK, Publish>(value, score, row, lane, ids, weights, scale,
+                                           routeIds, routeWeights, order);
+#endif
+}
+
+// One CTA owns all 384 experts for one real verification row. Each thread
+// consumes the original sixteen FP32 partials in order. Warp zero selects
+// from shared memory and publishes both local and EP8 routing formats.
+template <bool Publish>
+__global__ void V41VerifyRouterFinishTopK(const float *partial, float *logits, const float *bias,
+        int *ids, float *weights, int rows, float invTemp, float scale, int64_t *routeIds,
+        float *routeWeights, int *order) {
+#if __CUDA_ARCH__ >= 900
+    constexpr int experts = 384;
+    const int expert = threadIdx.x, row = blockIdx.x;
+    const float correction = bias[expert];
+    if (!expert) cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+    float sum = 0.f;
+#pragma unroll
+    for (int split = 0; split < 16; ++split)
+        sum += partial[(split * rows + row) * experts + expert];
+    const float v = V41TcRouterTransform(sum * invTemp);
+    logits[row * experts + expert] = v;
+    __shared__ float values[experts], scores[experts];
+    values[expert] = v;
+    const float corrected = correction + v;
+    scores[expert] = isnan(corrected) ? -1e30f : corrected;
+    __syncthreads();
+    if (expert < 32) {
+        float value[12], score[12];
+#pragma unroll
+        for (int group = 0; group < 12; ++group) {
+            value[group] = values[group * 32 + expert];
+            score[group] = scores[group * 32 + expert];
+        }
+        V41SelectRouterWarp<experts, 6, Publish>(value, score, row, expert, ids, weights, scale,
+                                                  routeIds, routeWeights, order);
+    }
 #endif
 }

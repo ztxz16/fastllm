@@ -21,6 +21,13 @@ docker run --rm -v "$PWD:/src" -w /src fastllm-wheel:cu129-u20 \
 绿色包构建环境也需安装这两个工具，打包流程会携带它们及非 glibc 动态库，目标机器无需另装。
 BF16 视频后端编译 SM80 及更新架构；LLM 核心库仍保留原来的全架构支持。
 
+要同时提供 HY-Nomas、LingBot-World、Duo、MiniMax-H3 和 Qwen-Image，可用
+`bash make_whl.sh --all-backends`。先按 `tools/duo/README.md` 准备原生 qwen-asr 源码，
+把 `DUO_QWEN_ASR_SOURCE` 指向该目录，并安装 cuFFT 开发库。Duo 的打包程序静态链接 x264、libavcodec、libavutil 和 libswscale；
+可用 `CMAKE_PREFIX_PATH` 指向包含这些静态库及头文件的安装目录。
+此模式将推理后端链接到 `libfastllm_tools.so`，同时打包服务程序和交互资源。
+安装 wheel 时 pip 会为 Duo 安装 cuFFT，模型可通过 `ftllm server` 或启动器运行。
+
 大内存、多核机器可使用 `--cpu-jobs 96 --cuda-jobs 24 --nvcc-threads 4 --split-compile 2`。
 NVCC 内部线程会叠加在 CUDA 并行任务上，普通机器应降低线程数。
 `--nightly` 生成 nightly 包；完整选项见 `bash make_whl.sh --help`。
@@ -31,7 +38,8 @@ NVCC 内部线程会叠加在 CUDA 并行任务上，普通机器应降低线程
 
 - 默认 `--max-glibc 2.31`，提前拒绝更新的构建环境，打包时再次审计 ELF 导入符号。
 - 使用 `linux_x86_64` 标签；glibc 检查不等同于 manylinux 认证。
-- 默认保留全架构和 PTX，以 CUDA `size` 压缩并 strip 暂存的动态库。
+- 默认保留从 SM60 开始的 LLM 目标架构，以 CUDA `size` 压缩并 strip 暂存的动态库。
+  如需 LLM 的 PTX 回退，添加 `--keep-ptx`。
   该压缩格式要求 CUDA 12.4 发布时期或更新的驱动，特定 GPU/PTX 可能要求更高版本。
   `--compression legacy` 可使用原压缩方式；普通 CMake 构建仍默认 legacy。
 - CPU/CUDA 库保留 `$ORIGIN` 搜索路径并附带 libnuma，CUDA 库由 pip 依赖和驱动提供。

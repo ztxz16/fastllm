@@ -125,6 +125,7 @@ namespace fastllm {
         DiskMoeV41Graph();
         ~DiskMoeV41Graph();
         static bool Supports(const std::vector<Data *> &weights);
+        static bool RegisterStandardFp8(const std::vector<Data *> &weights);
         void *Add(const Data &input, const Data &index, const Data &score, Data &output,
                   const std::vector<Data *> &weights, float limit);
         bool Launch(const std::function<bool()> &launch);

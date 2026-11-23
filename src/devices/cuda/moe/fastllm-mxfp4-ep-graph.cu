@@ -10,6 +10,7 @@ struct FastllmMxfp4EpNativeState {};
 std::shared_ptr<FastllmMxfp4EpNativeState> FastllmCudaCreateMxfp4EpNative(const std::vector<int> &,
     const std::vector<std::vector<std::vector<uint64_t>>> &) { return {}; }
 void FastllmCudaBindMxfp4EpNativeWeights(FastllmMxfp4EpNativeState &, int) {}
+std::array<void *, 2> FastllmCudaMxfp4EpPackedWeights(const FastllmMxfp4EpNativeState &, int, int) { return {}; }
 std::vector<FastllmMxfp4EpGraph> FastllmCudaPrepareMxfp4EpNative(FastllmMxfp4EpNativeState &, int, int) { return {}; }
 #endif
 

@@ -19,14 +19,14 @@ import urllib.error
 import urllib.request
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--binary', default=os.environ.get('FTLLM_H3_IMAGE_SERVER', ''))
+parser.add_argument('--binary', default='')
 args, remaining = parser.parse_known_args()
 BINARY = str(Path(args.binary).resolve()) if args.binary else ''
 ROOT = Path(__file__).resolve().parents[2]
 PNG = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5WQAAAAASUVORK5CYII=')
 
 
-@unittest.skipUnless(BINARY, 'Set --binary or FTLLM_H3_IMAGE_SERVER to run native HTTP tests')
+@unittest.skipUnless(BINARY, 'Set --binary to run native HTTP tests')
 class ServerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

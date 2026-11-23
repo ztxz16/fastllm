@@ -1,0 +1,3 @@
+# Provenance patches preserve upstream whitespace in context/deleted lines.
+third_party/deep_gemm_blackwell/PATCHES.diff -whitespace
+third_party/naivert_flex/PATCHES.diff -whitespace

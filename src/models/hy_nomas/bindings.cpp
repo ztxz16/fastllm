@@ -1,4 +1,5 @@
 #include "models/hy_nomas/runtime.h"
+#include "resolution.h"
 #include "models/hy_nomas/parallel.h"
 #include <algorithm>
 #include <cstring>
@@ -121,7 +122,7 @@ struct PipelineHandle {
                                                           fastllm::nomas::RowReduction::Activation}) {}
 };
 int checkedTokens(int t,int h,int w) {
-    if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>16384)
+    if(t<1 || h<1 || w<1 || t>64 || h>128 || w>128 || int64_t(t)*h*w>fastllm::nomas::maxGridTokens)
         throw std::invalid_argument("invalid or oversized HY-Nomas tensor grid");
     return t*h*w;
 }
@@ -209,11 +210,20 @@ void *fastllm_nomas_pipeline_create_parallel(const char *model,const char *text,
         return new PipelineHandle(model,text,devices);
     } catch(const std::exception &e) {lastError=e.what();return nullptr;}
 }
+int fastllm_nomas_pipeline_weight_residency(void *handle,int mode) {
+    try {
+        lastError.clear();
+        if(!handle) throw std::invalid_argument("null pipeline");
+        auto &ctx=*static_cast<PipelineHandle *>(handle);
+        std::lock_guard<std::mutex> lock(ctx.mutex);
+        return ctx.pipeline.configureWeightResidency(mode)?1:0;
+    } catch(const std::exception &e) { lastError=e.what(); return -1; }
+}
 void fastllm_nomas_pipeline_destroy(void *handle) { delete static_cast<PipelineHandle *>(handle); }
 int fastllm_nomas_generate(void *handle,const char *prompt,int width,int height,int frames,uint64_t seed,int steps,
                           uint8_t *rgb,size_t capacity,fastllm::nomas::Progress progress,void *user) {
     try {
-        lastError.clear(); if(!handle || !prompt || !rgb || width<1 || width>512 || height<1 || height>512 || frames<1 || frames>40 || capacity<size_t(width)*height*frames*3)
+        lastError.clear(); if(!handle || !prompt || !rgb || !fastllm::nomas::validResolution(width,height) || frames<1 || frames>40 || capacity<size_t(width)*height*frames*3)
             throw std::invalid_argument("invalid generation arguments or RGB buffer capacity");
         auto &ctx=*static_cast<PipelineHandle *>(handle); std::lock_guard<std::mutex> lock(ctx.mutex);
         auto result=ctx.pipeline.generate(prompt,width,height,frames,seed,steps,progress,user);
@@ -226,6 +236,32 @@ void *fastllm_nomas_world_create(void *pipeline,const char *prompt,int width,int
         auto &ctx=*static_cast<PipelineHandle *>(pipeline); std::lock_guard<std::mutex> lock(ctx.mutex);
         return ctx.pipeline.createWorld(prompt,width,height,seed,steps).release();
     } catch(const std::exception &e) { lastError=e.what(); return nullptr; }
+}
+int fastllm_nomas_world_reference(void *pipeline,void *world,const uint8_t *rgb,size_t bytes,
+                                  uint8_t *preview,size_t capacity,fastllm::nomas::Progress progress,void *user) {
+    try {
+        lastError.clear();
+        if(!pipeline || !world || !rgb || !preview) throw std::invalid_argument("missing reference buffer");
+        auto &ctx=*static_cast<PipelineHandle *>(pipeline); std::lock_guard<std::mutex> lock(ctx.mutex);
+        auto &state=*static_cast<fastllm::nomas::WorldState *>(world);
+        if(capacity<size_t(state.width)*state.height*3*12) throw std::invalid_argument("reference preview buffer too small");
+        auto pixels=ctx.pipeline.initializeReference(state,rgb,bytes,progress,user);
+        std::memcpy(preview,pixels.data(),pixels.size()); return 0;
+    } catch(const std::exception &e) { lastError=e.what(); return -1; }
+}
+int fastllm_nomas_world_text_segment(void *pipeline,void *world,const char *prompt,int frames,
+                                     uint8_t *rgb,size_t capacity,fastllm::nomas::Progress progress,void *user) {
+    try {
+        lastError.clear();
+        if(!pipeline || !world || !prompt || !rgb || frames<20 || frames>120 || frames%20)
+            throw std::invalid_argument("invalid text segment");
+        auto &ctx=*static_cast<PipelineHandle *>(pipeline); std::lock_guard<std::mutex> lock(ctx.mutex);
+        auto &state=*static_cast<fastllm::nomas::WorldState *>(world);
+        if(capacity<size_t(state.width)*state.height*3*frames) throw std::invalid_argument("segment RGB buffer too small");
+        std::string caption(prompt);
+        auto pixels=ctx.pipeline.stepWorld(state,9,progress,user,&caption,frames);
+        std::memcpy(rgb,pixels.data(),pixels.size()); return 0;
+    } catch(const std::exception &e) { lastError=e.what(); return -1; }
 }
 void fastllm_nomas_world_destroy(void *pipeline,void *world) {
     if(!pipeline) return;

@@ -21,7 +21,11 @@ struct DeepSeekV41Model::AttentionParallel {
         if (local) return local;
         auto restored = std::make_shared<DeepSeekV41RequestState>();
         restored->layers.resize(models[rank]->block_cnt);
-        models[rank]->PrepareRequestStorage(restored, std::move(state->storageLease));
+        // Admission reserves a slot on the first attention-TP rank. Peers
+        // must not concurrently move the same parent shared_ptr.
+        std::shared_ptr<void> reservation;
+        if (runtime.Layout().AttentionRank(rank) == 0) reservation = std::move(state->storageLease);
+        models[rank]->PrepareRequestStorage(restored, std::move(reservation));
         restored->totalLen = state->totalLen;
         if (state->totalLen) {
             for (int layer = 0; layer < models[rank]->block_cnt; ++layer) {
@@ -171,6 +175,16 @@ struct DeepSeekV41Model::AttentionParallelFrame {
                 AssertInFastLLM(local->totalLen == seg.startPos, "Attention DP request position mismatch");
                 DeepSeekV41Segment segment = seg;
                 segment.state = local; segment.offset = offset;
+                if (parent.model.v41DsparkEnabled && !parent.model.v41CudaGraphWarmingUp &&
+                    parent.numSegments == 1 && topology.attentionTP == 1 && seg.startPos == 0 && seg.seqlen > 1) {
+                    const auto &config = parent.generationConfigsIn[i];
+                    if (config.output_token_limit > 0) {
+                        const int prompt = std::max(seg.seqlen, config.input_token_length);
+                        const int64_t end = int64_t(prompt) + config.output_token_limit + parent.model.v41DsparkBlockSize;
+                        segment.verifyReserveTokens = int(std::min<int64_t>(end,
+                            parent.model.max_positions > 0 ? parent.model.max_positions : INT_MAX));
+                    }
+                }
                 segment.spec = seg.spec && seg.spec->deferWindow ?
                     seg.spec->attentionRanks.at(topology.AttentionRank(rank)).get() : nullptr;
                 step.segments.push_back(segment);
@@ -243,6 +257,9 @@ void DeepSeekV41Model::PrepareAttentionParallel() {
         auto local = std::make_unique<DeepSeekV41Model>();
         local->weight.dicts = weight.dicts;
         local->InitParams();
+        // Rank-local attention graphs use the same serving window as their parent.
+        local->max_positions = max_positions;
+        local->tokensLimit = tokensLimit;
         // basellm::InitParams imports the process default device maps. Override
         // them afterwards: a rank adapter must never dispatch world MultiCUDA.
         local->deviceMap = {{"cuda:" + std::to_string(devices[rank]), 1}};
@@ -381,6 +398,42 @@ void DeepSeekV41Model::RunAttentionParallel(ForwardWorkspace &f, int layer) {
         frame.transfer.Collect(rank, fields, 4);
     });
 }
+bool DeepSeekV41Model::CommitAttentionParallelBatch(const std::vector<DeepSeekV41Segment> &segments) {
+    if (segments.size() < 2 || !v41AttentionParallel) return false;
+    auto &parallel = *v41AttentionParallel;
+    const auto &layout = parallel.runtime.Layout();
+    if (layout.attentionTP != 1) return false;
+    std::vector<std::vector<DeepSeekV41Segment>> owned(layout.attentionDP);
+    std::vector<int> offsets(layout.attentionDP);
+    for (const auto &s : segments) {
+        if (!s.state || !s.spec || s.spec->kvCommitted || s.spec->acceptedDrafts < 0 ||
+            s.spec->acceptedDrafts >= s.seqlen || s.state->attentionRanks.size() != 1 ||
+            s.spec->attentionRanks.size() != 1 || !s.state->attentionRanks[0] ||
+            !s.spec->attentionRanks[0] || !s.spec->attentionRanks[0]->commitKV ||
+            s.spec->attentionRanks[0]->deviceCommitReady) return false;
+        const int owner = s.state->attentionGroup;
+        if (owner < 0 || owner >= layout.attentionDP) return false;
+        auto part = s;
+        part.offset = offsets[owner];
+        offsets[owner] += s.seqlen;
+        part.state = s.state->attentionRanks[0];
+        part.spec = s.spec->attentionRanks[0].get();
+        owned[owner].push_back(std::move(part));
+    }
+    for (const auto &s : segments) s.spec->attentionRanks[0]->acceptedDrafts = s.spec->acceptedDrafts;
+    // All owners publish once on their own streams. Requests sharing an owner
+    // can use the existing prefix-list kernel; each request keeps its own KV.
+    parallel.runtime.Run([&](int rank, int) {
+        auto &parts = owned[layout.AttentionOwner(rank)];
+        auto &model = *parallel.models[rank];
+        model.DsparkCommitBatch(parts);
+        for (const auto &s : parts)
+            model.DsparkCommitPrefix(*s.state, *s.spec, s.startPos, s.spec->acceptedDrafts + 1, s.seqlen);
+    });
+    for (const auto &s : segments) s.spec->kvCommitted = true;
+    return true;
+}
+
 void DeepSeekV41Model::CommitAttentionParallel(DeepSeekV41RequestState &state,
         DeepSeekV41SpecScratch &scratch, int startPos, int accept, int forwarded) {
     auto &parallel = *v41AttentionParallel;
@@ -388,15 +441,21 @@ void DeepSeekV41Model::CommitAttentionParallel(DeepSeekV41RequestState &state,
     AssertInFastLLM(state.attentionGroup >= 0 && state.attentionGroup < layout.attentionDP &&
         state.attentionRanks.size() == size_t(layout.attentionTP) &&
         scratch.attentionRanks.size() == size_t(layout.attentionTP), "invalid attention DP commit state");
-    parallel.runtime.Run([&](int rank, int) {
+    const bool onDevice = layout.attentionTP == 1 && scratch.attentionRanks.front() &&
+        scratch.attentionRanks.front()->deviceCommitReady && scratch.attentionRanks.front()->kvCommitted;
+    auto commit = [&](int rank, int) {
         if (layout.AttentionOwner(rank) != state.attentionGroup) return;
         const int t = layout.AttentionRank(rank);
         AssertInFastLLM(state.attentionRanks[t] && scratch.attentionRanks[t], "missing rank rollback state");
+        if (onDevice) FastllmCudaCurrentThreadStreamWaitEvent(scratch.attentionRanks[t]->deviceCommitReady);
         parallel.models[rank]->DsparkCommitPrefix(*state.attentionRanks[t], *scratch.attentionRanks[t],
             startPos, accept, forwarded);
-    });
+    };
+    if (onDevice) parallel.runtime.Enqueue(commit);
+    else parallel.runtime.Run(commit);
 }
 #else
+bool DeepSeekV41Model::CommitAttentionParallelBatch(const std::vector<DeepSeekV41Segment> &) { return false; }
 void DeepSeekV41Model::ConfigureAttentionParallel(int dp) {
     if (dp != 1) throw std::invalid_argument("attention DP requires CUDA");
 }

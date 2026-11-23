@@ -10,9 +10,16 @@ from pathlib import Path
 import queue
 import re
 import secrets
+import sys
 import threading
 import time
 from urllib.parse import urlsplit
+
+# The source tree and the wheel keep the shared player helpers in different directories.
+_tools = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_tools / 'fastllm_pytools' if (_tools / 'fastllm_pytools').is_dir() else _tools))
+from world_media import encode_clip, find_video_encoder, png_rgb
+from world_residency import WEIGHT_RESIDENCY_MODES, WeightResidency
 
 MODEL = 'lingbot-world-2.0-1.3b'
 ACTIONS = {'stay', 'forward', 'backward', 'left', 'right', 'up', 'down',
@@ -21,7 +28,7 @@ CALLBACK = C.CFUNCTYPE(C.c_int, C.c_char_p, C.c_int, C.c_int, C.c_void_p)
 
 
 class Native:
-    def __init__(self, library, directory, device, decode_precision="bf16"):
+    def __init__(self, library, directory, device, decode_precision="bf16", weight_residency="auto"):
         self.lib = lib = C.CDLL(str(Path(library).resolve()))
         lib.fastllm_lingbot_error.restype = C.c_char_p
         lib.fastllm_lingbot_pipeline_create_ex.argtypes = [C.c_char_p, C.c_int, C.c_int]
@@ -36,15 +43,30 @@ class Native:
         lib.fastllm_lingbot_result_frames.argtypes = [C.c_void_p]
         lib.fastllm_lingbot_result_png.argtypes = [C.c_void_p, C.c_int, C.POINTER(C.c_size_t)]
         lib.fastllm_lingbot_result_png.restype = C.c_void_p
+        self.raw_step = getattr(lib, 'fastllm_lingbot_world_step_rgb', None)
+        if self.raw_step:
+            self.raw_step.argtypes = lib.fastllm_lingbot_world_step.argtypes
+            self.raw_step.restype = C.c_void_p
+            lib.fastllm_lingbot_result_rgb.argtypes = [C.c_void_p, C.POINTER(C.c_size_t)]
+            lib.fastllm_lingbot_result_rgb.restype = C.c_void_p
         lib.fastllm_lingbot_result_destroy.argtypes = [C.c_void_p]
         self.handle = lib.fastllm_lingbot_pipeline_create_ex(str(Path(directory).resolve()).encode(), device, int(decode_precision == "bf16"))
         if not self.handle:
             self.fail()
 
+        try:
+            self.residency = WeightResidency(lib, 'fastllm_lingbot', self.handle, weight_residency)
+        except Exception:
+            lib.fastllm_lingbot_pipeline_destroy(self.handle)
+            raise
+
     def fail(self):
         raise RuntimeError(self.lib.fastllm_lingbot_error().decode('utf-8', 'replace'))
 
     def create(self, options, progress):
+        return self.residency.run(self._create, options, progress)
+
+    def _create(self, options, progress):
         k = (C.c_float*4)(*options['intrinsics']) if options.get('intrinsics') else None
         handle = self.lib.fastllm_lingbot_world_create_png(self.handle, options['prompt'].encode(),
             options['png'], len(options['png']), options['height'], options['width'], options['seed'], k, progress, None)
@@ -53,12 +75,21 @@ class Native:
         return handle
 
     def step(self, world, options, progress):
+        return self.residency.run(self._step, world, options, progress)
+
+    def _step(self, world, options, progress):
         prompt = options.get('prompt')
-        result = self.lib.fastllm_lingbot_world_step(self.handle, world, options['action'].encode(),
+        raw = options.get('response_format') == 'mp4' and self.raw_step
+        step = self.raw_step if raw else self.lib.fastllm_lingbot_world_step
+        result = step(self.handle, world, options['action'].encode(),
             prompt.encode() if prompt is not None else None, progress, None)
         if not result:
             self.fail()
         try:
+            if raw:
+                length = C.c_size_t()
+                data = self.lib.fastllm_lingbot_result_rgb(result, C.byref(length))
+                return C.string_at(data, length.value)
             frames = []
             for index in range(self.lib.fastllm_lingbot_result_frames(result)):
                 length = C.c_size_t()
@@ -83,7 +114,7 @@ def integer(body, key, default, lo, hi):
 def options(body, create):
     if not isinstance(body, dict):
         raise ValueError('expected a JSON object')
-    allowed = {'model', 'prompt', 'action'} | ({'image', 'width', 'height', 'seed', 'intrinsics'} if create else set())
+    allowed = {'model', 'prompt', 'action', 'response_format'} | ({'image', 'width', 'height', 'seed', 'intrinsics'} if create else set())
     unknown = set(body)-allowed
     if unknown:
         raise ValueError('unsupported parameters: '+', '.join(sorted(unknown)))
@@ -92,6 +123,10 @@ def options(body, create):
     result = {'action': body.get('action', 'stay')}
     if not isinstance(result['action'], str) or result['action'] not in ACTIONS:
         raise ValueError('unknown camera action')
+    if 'response_format' in body:
+        if body['response_format'] not in ('png_frames', 'mp4'):
+            raise ValueError('response_format must be png_frames or mp4')
+        result['response_format'] = body['response_format']
     if 'prompt' in body or create:
         prompt = body.get('prompt', '')
         if not isinstance(prompt, str) or '\0' in prompt or len(prompt.encode()) > 16384:
@@ -164,6 +199,8 @@ class Service:
         self.lock = threading.RLock()
         self.queue = queue.Queue(8)
         self.worlds, self.jobs = {}, {}
+        self.residency = None
+        self.ffmpeg = None
         self.status, self.failure = 'loading', None
         self.output = Path(args.output).resolve()
         self.output.mkdir(parents=True, exist_ok=True)
@@ -186,7 +223,7 @@ class Service:
                     raise BlockingIOError('world limit reached; delete an unused world first')
                 world_id = 'world_'+secrets.token_hex(12)
                 world = dict(id=world_id, object='world', width=opts['width'], height=opts['height'],
-                    prompt=opts['prompt'], seed=opts['seed'], segments=0, created=int(time.time()), pending=False, handle=None)
+                    prompt=opts['prompt'], seed=opts['seed'], response_format=opts.get('response_format', 'png_frames'), segments=0, created=int(time.time()), pending=False, handle=None)
             if self.queue.full():
                 raise BlockingIOError('generation queue is full')
             job_id = 'job_'+secrets.token_hex(12)
@@ -194,6 +231,7 @@ class Service:
                 current=0, total=0, created=int(time.time()), error=None, result=None)
             self.worlds[world_id] = world
             world['pending'] = True
+            world['current_job'] = job_id
             self.jobs[job_id] = job
             self.queue.put_nowait((job, world, opts, delete))
             # Retain bounded job metadata. Frame artifacts remain available on disk.
@@ -204,7 +242,11 @@ class Service:
 
     def run(self):
         try:
-            native = Native(self.args.library, self.args.model, self.args.device, self.args.vae_decode_precision)
+            native = Native(self.args.library, self.args.model, self.args.device, self.args.vae_decode_precision,
+                            getattr(self.args, "weight_residency", "auto"))
+            self.residency = getattr(native, "residency", None)
+            if getattr(native, 'raw_step', None):
+                self.ffmpeg = find_video_encoder()
             with self.lock:
                 self.status = 'ready'
             while True:
@@ -227,22 +269,17 @@ class Service:
                     else:
                         if created:
                             world['handle'] = native.create(opts, progress)
+                        fmt = opts.get('response_format', world['response_format'])
+                        opts['response_format'] = fmt if self.ffmpeg else 'png_frames'
                         frames = native.step(world['handle'], opts, progress)
                         advanced = True
-                        frame_urls = []
-                        for index, png in enumerate(frames):
-                            name = f'{job["id"]}_{index}.png'
-                            file = self.output/name
-                            files.append(file)
-                            file.write_bytes(png)
-                            frame_urls.append('/v1/worlds/files/'+name)
+                        result = self.save_segment(job['id'], world, frames, files)
                         with self.lock:
                             world['segments'] += 1
                             if 'prompt' in opts:
                                 world['prompt'] = opts['prompt']
-                            job['result'] = dict(world_id=world['id'], segment=world['segments']-1,
-                                width=world['width'], height=world['height'], fps=16, frames=frame_urls, frame_count=len(frames))
-                            world['last_result'] = job['result']
+                            job['result'] = result
+                            world['last_result'] = result
                     with self.lock:
                         world['pending'] = False
                         job.update(status='completed', stage='completed')
@@ -270,6 +307,31 @@ class Service:
             with self.lock:
                 self.status, self.failure = 'failed', str(e)
 
+    def save_segment(self, job_id, world, frames, files):
+        width, height = world['width'], world['height']
+        result = dict(world_id=world['id'], segment=world['segments'], width=width, height=height, fps=16)
+        base = '/v1/worlds/files/'
+        if isinstance(frames, bytes):
+            stride = width * height * 3
+            count, remainder = divmod(len(frames), stride)
+            if not count or remainder:
+                raise ValueError('invalid native RGB segment')
+            target = self.output / (job_id + '.mp4')
+            staging = target.with_suffix('.part.mp4')
+            files.extend([staging, target])
+            if encode_clip(self.ffmpeg, frames, result, staging):
+                staging.replace(target)
+                return dict(result, frame_count=count, format='mp4', url=base+target.name)
+            rgb = memoryview(frames)
+            frames = (png_rgb(rgb[i:i+stride], width, height) for i in range(0, len(rgb), stride))
+        urls = []
+        for index, data in enumerate(frames):
+            target = self.output / f'{job_id}_{index}.png'
+            files.append(target)
+            target.write_bytes(data)
+            urls.append(base + target.name)
+        return dict(result, frame_count=len(urls), format='png_frames', frames=urls)
+
     def get(self, kind, identifier):
         with self.lock:
             item = (self.worlds if kind == 'worlds' else self.jobs).get(identifier)
@@ -289,6 +351,35 @@ def handler(service, demo):
             self.end_headers()
             self.wfile.write(data)
 
+        def send_clip(self, path):
+            size = path.stat().st_size
+            start, end = 0, size - 1
+            requested = self.headers.get('Range')
+            if requested:
+                match = re.fullmatch(r'bytes=([0-9]*)-([0-9]*)', requested)
+                if match and any(match.groups()):
+                    left, right = match.groups()
+                    start = int(left) if left else max(0, size-int(right))
+                    end = min(int(right), end) if left and right else end
+                else:
+                    start = size
+                if not 0 <= start <= end:
+                    self.send_response(416)
+                    self.send_header('Content-Range', f'bytes */{size}')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+            self.send_response(206 if requested else 200)
+            self.send_header('Content-Type', 'video/mp4')
+            self.send_header('Accept-Ranges', 'bytes')
+            if requested:
+                self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+            self.send_header('Content-Length', str(end-start+1))
+            self.end_headers()
+            if size:
+                with path.open('rb') as video:
+                    self.connection.sendfile(video, offset=start, count=end-start+1)
+
         def route(self):
             path = urlsplit(self.path).path
             if self.command == 'GET' and path == '/':
@@ -298,17 +389,21 @@ def handler(service, demo):
                 return self.send(401, {'error': {'type': 'authentication_error', 'message': 'invalid API key'}})
             if self.command == 'GET':
                 if path == '/health':
-                    return self.send(200, dict(status=service.status, error=service.failure))
+                    return self.send(200, dict(status=service.status, error=service.failure, model=MODEL,
+                        weight_residency=service.residency.status() if service.residency else None,
+                        playback_formats=['png_frames', 'mp4'] if service.ffmpeg else ['png_frames']))
                 if path == '/v1/models':
                     return self.send(200, dict(object='list', data=[dict(id=MODEL, object='model', owned_by='fastllm')]))
                 match = re.fullmatch(r'/v1/(worlds|jobs)/((?:world|job)_[0-9a-f]{24})', path)
                 if match:
                     return self.send(200, service.get(*match.groups()))
-                match = re.fullmatch(r'/v1/worlds/files/(job_[0-9a-f]{24}_[0-9]+\.png)', path)
+                match = re.fullmatch(r'/v1/worlds/files/(job_[0-9a-f]{24}(?:_[0-9]+\.png|\.mp4))', path)
                 if match:
                     file = service.output/match[1]
                     if not file.is_file():
                         raise KeyError('frame not found')
+                    if file.suffix == '.mp4':
+                        return self.send_clip(file)
                     return self.send(200, file.read_bytes(), 'image/png')
             if self.command == 'DELETE':
                 match = re.fullmatch(r'/v1/worlds/(world_[0-9a-f]{24})', path)
@@ -360,6 +455,7 @@ def main():
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=18009)
     parser.add_argument('--device', type=int, default=0)
+    parser.add_argument('--weight-residency', choices=WEIGHT_RESIDENCY_MODES, default='auto')
     parser.add_argument('--vae-decode-precision', choices=['bf16', 'fp32'], default='bf16')
     parser.add_argument('--output', default='lingbot-http-output')
     parser.add_argument('--api-key', default='')

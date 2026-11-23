@@ -2,6 +2,16 @@
 #include <cstdint>
 #include <cstddef>
 
+namespace fastllm { class Data; }
+
+// Use the verifier's top-k boundary tie rule and apply top-p on the retained mass.
+extern "C" bool FastllmCudaMtpSampleDraftDeviceTopKFirst(float *logits, float *proposalProbs,
+    float temperature, int topK, float topP, int *output, int vocabSize, fastllm::Data &workspace);
+
+extern "C" bool FastllmCudaMtpRejectionSamplingTopKFirstDeviceIds(float *logits, float *proposalProbs,
+        const float *temperatures, const int *topKs, const float *topPs, const int *deviceTokens,
+        int *output, int *accepted, int batch, int drafts, int vocab);
+
 // Persist q directly into per-request chain storage. A zero stride selects
 // contiguous vocabulary rows. Sampling uses identical probabilities and RNG.
 bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits,
@@ -83,6 +93,12 @@ bool FastllmCudaMtpRejectionSamplingLogitsBatch(float *targetLogits,
     const int *topKs, const float *topPs, int *output, int *accepted,
     int batch, int drafts, int vocab);
 
+// Equivalent small-batch path with host token IDs copied into kernel arguments.
+// Supports batch*drafts <= 64, drafts <= 8; larger shapes retain the device API.
+bool FastllmCudaMtpRejectionFromHostProbabilities(const float *targetProbs,
+    const float *proposalProbs, const int *hostDraftTokens,
+    int *output, int *accepted, int batch, int drafts, int vocab,
+    void (*enqueue)(const int *, void *) = nullptr, void *context = nullptr);
 // Request-owned target sampling, with stable normalization/scratch storage.
 // Enqueue borrows logits/proposals until Resolve and may replay a CUDA graph.
 // Resolve is the only host-result fence. A plan must not have overlapping calls;
@@ -125,3 +141,16 @@ bool FastllmCudaMtpRejectionWithAccepted(float *logits, float *proposalProbs,
     const float *temperatures, const int *topKs, const float *topPs, const int *draftTokenIds,
     int *output, int *acceptedDraftTokens, int batch, int draftTokens, int vocabSize,
     FastllmMtpAcceptedCallback callback, void *context);
+
+// Fixed-address graph stages. Parameters and the live proposal count are device
+// inputs, so sampling settings and clipped tails do not change graph topology.
+extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *workspace, const void *base, int baseStride, const void *adjust,
+                                              const void *bias, float cap, bool bf16, const float *temperature,
+                                              int *topK, const float *topP, uint64_t *rng, int step, float *q,
+                                              int qStride, int *tokens, int tokenStride);
+bool FastllmCudaMtpGraphDistribution(void *workspace, float *logits, const float *temperature, int *topK,
+                                     const float *topP, float **probs);
+size_t FastllmCudaMtpGraphRejectBytes(int batch, int vocab);
+extern "C" void FastllmCudaMtpGraphReject(const float *p, const float *q, const int *tokens, int *result,
+                                          void *partials, int batch, int drafts, int vocab, const int *live,
+                                          uint64_t seed, unsigned long long *counter);

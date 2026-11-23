@@ -5,7 +5,7 @@
 // caches and a GQA group divisible by eight. Unsupported shapes retain the
 // existing attention kernels.
 // No global score or partial-output workspace is required.
-#include "devices/cuda/naive-n05-dsa.h"
+#include "naive-n05-attention-batch.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include <cstdint>
 #include <type_traits>
@@ -13,14 +13,10 @@
 #include <cuda_runtime.h>
 namespace pipeline_bulk {
 using BF = __nv_bfloat16;
-#if CUDART_VERSION >= 12010
-constexpr int BatchLimit = 256;
-#else
-constexpr int BatchLimit = (4096 - 128) / sizeof(FastllmNaiveDSARow);
-#endif
+using naive_attention_bulk::BatchLimit;
 constexpr int MaxBatchLimit =
     ((CUDART_VERSION >= 12010 ? 32764 : 4096) - 128) / sizeof(FastllmNaiveDSARow);
-// FP4 specialization: one KV head, QK=192/V=128, and 2048 selected keys.
+// FP4 specialization for QK=192/V=128 with up to 2048 keys.
 // Omit unused TMA fields and fixed layout fields to keep a serving batch in
 // one CUDA parameter block. Retain the device binding table for graph replay.
 struct FP4Row {
@@ -39,7 +35,7 @@ struct FP4Row {
         r.key = key; r.value = value; r.indices = indices; r.liveKeys = liveKeys;
         r.cache = cache; r.keyPages = keyPages; r.valuePages = valuePages;
         r.length = length; r.capacity = capacity; r.pageLen = pageLen;
-        r.keyStride = 192; r.selectedCount = 2048; r.fp4 = true;
+        r.selectedCount = 2048; r.fp4 = true; // The FP4 kernel knows its physical head count and stride.
         return r;
     }
 };
@@ -154,7 +150,7 @@ struct Storage : PackedStorage<Packed, FP4> {
 // Reuse the packed byte buffer after every thread has expanded its current
 // tile. The next global load then overlaps MMA on the separate BF16 tile.
 // Two small index arrays keep current validity flags stable until QK stores.
-template<bool Ring, bool Value, int Threads = 256, bool FP4 = false, class Shared>
+template<bool Ring, bool Value, int Threads = 256, int FP4KVHeads = 0, class Shared>
 __device__ __forceinline__ void Prefetch(const FastllmNaiveDSARow &r, Shared &s,
         int stage, int first, int len, int kh, int kvHeads, int t) {
     if (t < 128) {
@@ -164,7 +160,41 @@ __device__ __forceinline__ void Prefetch(const FastllmNaiveDSARow &r, Shared &s,
         s.selected[stage][t] = k;
     }
     __syncthreads();
-    if constexpr (FP4) {
+    if constexpr (FP4KVHeads > 1) {
+        // The scales follow all heads' packed values. Gather one head into the shared tile.
+        constexpr int Width = Value ? 128 : 192;
+        constexpr int Payload = Width / 2, Scales = Width / 16;
+        const auto *base = static_cast<const unsigned char *>(Value ? r.value : r.key);
+        constexpr int Segments = Payload / 16 + Scales / 4;
+        for (int i = t; i < 128 * Segments; i += Threads) {
+            const int row = i / Segments, segment = i % Segments;
+            const int k = s.selected[stage][row];
+            const auto *physical = base + size_t(max(k, 0)) * FP4KVHeads * (Payload + Scales);
+            if (segment < Payload / 16) {
+                const int d = segment * 16;
+                auto *dst = &s.packed[row][d];
+                const auto *src = physical + kh * Payload + d;
+                // Two K heads occupy 216 bytes. Odd physical rows start eight bytes
+                // off the 16-byte boundary; V and four-head K rows stay aligned.
+                if constexpr (FP4KVHeads == 2 && !Value) {
+                    if (k >= 0 && (k & 1)) {
+                        const unsigned address = (unsigned)__cvta_generic_to_shared(dst);
+                        asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n"
+                                     "cp.async.ca.shared.global [%0+8], [%1+8], 8;"
+                                     :: "r"(address), "l"(src) : "memory");
+                        continue;
+                    }
+                }
+                naive_dsa_decode::Copy<true>(dst, src, k >= 0);
+            } else {
+                const int d = (segment - Payload / 16) * 4;
+                const auto *src = physical + FP4KVHeads * Payload + kh * Scales + d;
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(&s.packed[row][Payload + d]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;"
+                             :: "r"(dst), "l"(src), "r"(k >= 0 ? 4 : 0) : "memory");
+            }
+        }
+    } else if constexpr (FP4KVHeads == 1) {
         // Packed rows are 108/72 bytes, so their starts need not be aligned.
         // Copy aligned 16-byte segments, zero-filling the final partial segment.
         // The preceding bytes remain inside the pool and are never decoded.
@@ -172,9 +202,10 @@ __device__ __forceinline__ void Prefetch(const FastllmNaiveDSARow &r, Shared &s,
         for (int i = t; i < 128 * Units; i += Threads) {
             const int row = i / Units, d = i % Units * 16;
             const int k = s.selected[stage][row];
-            const int offset = (max(k, 0) * RowBytes) & 15;
+            const size_t rowOffset = size_t(max(k, 0)) * RowBytes;
+            const int offset = rowOffset & 15;
             const unsigned char *source = (const unsigned char *)(Value ? r.value : r.key) +
-                (size_t)max(k, 0) * RowBytes - offset + d;
+                rowOffset - offset + d;
             unsigned destination = (unsigned)__cvta_generic_to_shared(&s.packed[row][d]);
             const int validBytes = k >= 0 ? max(0, min(16, offset + RowBytes - d)) : 0;
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;"
@@ -198,12 +229,12 @@ __device__ __forceinline__ void Prefetch(const FastllmNaiveDSARow &r, Shared &s,
 
 // K and V use the same block16 decoder with different row widths.
 // The packed tile is complete before entry; its row offset is 4-byte aligned.
-template<int Width, int Threads, int Stride, class Shared>
+template<int Width, int Threads, bool MultiKV, int Stride, class Shared>
 __device__ __forceinline__ void UnpackFP4Tile(Shared &s, BF (*tile)[Stride], const int *selected) {
     constexpr int Blocks = Width / 16, RowBytes = Blocks * 9;
     for (int i = threadIdx.x; i < 128 * Blocks; i += Threads) {
         const int row = i / Blocks, d = i % Blocks * 16;
-        const int offset = (max(selected[row], 0) * RowBytes) & 15;
+        const int offset = MultiKV ? 0 : (size_t(max(selected[row], 0)) * RowBytes) & 15;
         FastllmNaiveKVRow source(s.packed[row] + offset, false,
             s.packed[row] + offset + Width / 2, d);
         uint4 parts[2];
@@ -215,14 +246,14 @@ __device__ __forceinline__ void UnpackFP4Tile(Shared &s, BF (*tile)[Stride], con
 
 template <int Max, bool Ring, bool FP8, bool AsyncFP8 = true,
           bool PrefetchQK = true, bool PrefetchPV = true, bool HeadAdjacent = false,
-          int DescriptorLimit = BatchLimit, bool Share16Heads = false, bool FP4 = false>
+          int DescriptorLimit = BatchLimit, bool Share16Heads = false, int FP4KVHeads = 0>
 __global__ __launch_bounds__(Share16Heads ? 512 : 256) void Decode(const BF *q,
-        BatchT<DescriptorLimit, typename std::conditional<FP4, FP4Row, FastllmNaiveDSARow>::type> batch,
-        const float *sink, BF *out,
-                                              int heads, int kvHeads) {
+        BatchT<DescriptorLimit, typename std::conditional<(FP4KVHeads > 0), FP4Row, FastllmNaiveDSARow>::type> batch,
+        const float *sink, BF *out, int heads, int kvHeads) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr bool FP4 = FP4KVHeads > 0;
     static_assert(!FP4 || (!FP8 && !Ring && AsyncFP8 && PrefetchQK && PrefetchPV),
-                  "FP4 requires the sparse prefetched path");
+                  "FP4 requires prefetched K/V tiles");
     using namespace naive_dsa_decode;
     extern __shared__ __align__(16) char buffer[];
     constexpr int GroupHeads = Share16Heads ? 16 : 8;
@@ -242,7 +273,7 @@ __global__ __launch_bounds__(Share16Heads ? 512 : 256) void Decode(const BF *q,
     }
     const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
     if constexpr ((FP8 || FP4) && AsyncFP8 && PrefetchQK)
-        if (n > 0) Prefetch<Ring, false, Threads, FP4>(r, s, 0, 0, len, kh, kvHeads, t);
+        if (n > 0) Prefetch<Ring, false, Threads, FP4KVHeads>(r, s, 0, 0, len, kh, kvHeads, t);
     for (int first = 0; first < n; first += 128) {
         int *selected = s.selected[(first / 128) & 1];
         if constexpr (!((FP8 || FP4) && AsyncFP8 && PrefetchQK)) {
@@ -267,7 +298,7 @@ __global__ __launch_bounds__(Share16Heads ? 512 : 256) void Decode(const BF *q,
             asm volatile("cp.async.wait_group 0;" ::: "memory");
             __syncthreads();
             if constexpr (FP4) {
-                UnpackFP4Tile<192, Threads>(s, s.tile.keys, selected);
+                UnpackFP4Tile<192, Threads, (FP4KVHeads > 1)>(s, s.tile.keys, selected);
             } else {
                 for (int i = t; i < 128 * 24; i += Threads) {
                     int row = i / 24, d = i % 24 * 8;
@@ -284,7 +315,7 @@ __global__ __launch_bounds__(Share16Heads ? 512 : 256) void Decode(const BF *q,
         }
         if constexpr ((FP8 || FP4) && AsyncFP8 && PrefetchQK) {
             if (first + 128 < n)
-                Prefetch<Ring, false, Threads, FP4>(r, s, ((first / 128) & 1) ^ 1,
+                Prefetch<Ring, false, Threads, FP4KVHeads>(r, s, ((first / 128) & 1) ^ 1,
                     first + 128, len, kh, kvHeads, t);
             else __syncthreads();
         } else __syncthreads();
@@ -310,7 +341,7 @@ __global__ __launch_bounds__(Share16Heads ? 512 : 256) void Decode(const BF *q,
     __syncthreads();
     float acc[4] = {};
     if constexpr ((FP8 || FP4) && AsyncFP8 && PrefetchPV)
-        if (n > 0) Prefetch<Ring, true, Threads, FP4>(r, s, 0, 0, len, kh, kvHeads, t);
+        if (n > 0) Prefetch<Ring, true, Threads, FP4KVHeads>(r, s, 0, 0, len, kh, kvHeads, t);
     for (int first = 0; first < n; first += 128) {
         int *selected = s.selected[(first / 128) & 1];
         if constexpr (!((FP8 || FP4) && AsyncFP8 && PrefetchPV)) {
@@ -335,7 +366,7 @@ __global__ __launch_bounds__(Share16Heads ? 512 : 256) void Decode(const BF *q,
             asm volatile("cp.async.wait_group 0;" ::: "memory");
             __syncthreads();
             if constexpr (FP4) {
-                UnpackFP4Tile<128, Threads>(s, s.tile.values, selected);
+                UnpackFP4Tile<128, Threads, (FP4KVHeads > 1)>(s, s.tile.values, selected);
             } else {
                 for (int i = t; i < 128 * 16; i += Threads) {
                     int row = i / 16, d = i % 16 * 8;
@@ -352,7 +383,7 @@ __global__ __launch_bounds__(Share16Heads ? 512 : 256) void Decode(const BF *q,
         }
         if constexpr ((FP8 || FP4) && AsyncFP8 && PrefetchPV) {
             if (first + 128 < n)
-                Prefetch<Ring, true, Threads, FP4>(r, s, ((first / 128) & 1) ^ 1,
+                Prefetch<Ring, true, Threads, FP4KVHeads>(r, s, ((first / 128) & 1) ^ 1,
                     first + 128, len, kh, kvHeads, t);
             else __syncthreads();
         } else __syncthreads();

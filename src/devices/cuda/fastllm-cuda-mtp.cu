@@ -21,6 +21,7 @@ struct Workspace {
     int device = 0;
     Partial *partials = nullptr;
     int *results = nullptr, *hostResults = nullptr;
+    cudaEvent_t resultReady = nullptr;
     float *temperatures = nullptr;
     unsigned long long *counter = nullptr;
     void *descriptors = nullptr;
@@ -32,11 +33,14 @@ struct Workspace {
     ~Workspace() {
         int previous = device;
         cudaGetDevice(&previous); cudaSetDevice(device);
+        if (resultReady) cudaEventDestroy(resultReady);
         cudaFree(partials); cudaFree(results); cudaFreeHost(hostResults);
         cudaFree(temperatures); cudaFree(counter); cudaFree(descriptors);
         cudaSetDevice(previous);
     }
     bool Prepare(size_t partialCount, size_t resultCount) {
+        if (resultCount && !resultReady &&
+            cudaEventCreateWithFlags(&resultReady, cudaEventDisableTiming) != cudaSuccess) return false;
         if (!counter) {
             if (cudaMalloc(&counter, sizeof(*counter)) != cudaSuccess ||
                 cudaMemsetAsync(counter, 0, sizeof(*counter), cudaStreamPerThread) != cudaSuccess)
@@ -193,11 +197,14 @@ __global__ void FinishDraftKernel(const Partial *partials, float *lse, int *outp
         if (row == 0) ++*counter;
     }
 }
-template<bool Indirect = false, bool Probability = false>
+// Small host token batches travel in the launch packet. CUDA copies kernel
+// arguments before returning; no asynchronous reference to caller storage.
+struct HostDraftIds { int values[64]{}; };
+template<bool Indirect = false, bool Probability = false, bool HostIds = false>
 __global__ void AcceptKernel(const float *p, const float *logits, const float *lse,
         const int *draftIds, int *result, int drafts, int vocab, int batch,
         unsigned long long seed, const unsigned long long *counter,
-        const FastllmMtpProposalView *proposals = nullptr) {
+        const FastllmMtpProposalView *proposals = nullptr, HostDraftIds hostIds = {}, const int *live = nullptr) {
     if (threadIdx.x) return;
     int b = blockIdx.x, offset = b * (drafts + 1), accepted = 0;
     const float *qLogits, *qLse;
@@ -207,12 +214,14 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
         ids = proposals[b].tokens;
     } else {
         qLogits = logits + (size_t)b * drafts * vocab;
-        qLse = Probability ? nullptr : lse + b * drafts; ids = draftIds + b * drafts;
+        qLse = Probability ? nullptr : lse + b * drafts;
+        if constexpr (HostIds) ids = hostIds.values + b * drafts;
+        else ids = draftIds + b * drafts;
     }
     for (int i = 0; i <= drafts; ++i) result[offset + i] = -1;
     curandStatePhilox4_32_10_t rng;
     InitSmallAcceptanceRng(rng, seed, b, drafts, *counter);
-    for (int i = 0; i < drafts; ++i) {
+    for (int i = 0; i < (live ? live[b] : drafts); ++i) {
         int token = ids[i];
         if (token < 0 || token >= vocab) break;
         float target = p[(size_t)(offset + i) * vocab + token];
@@ -235,15 +244,15 @@ __global__ void AcceptKernel(const float *p, const float *logits, const float *l
     }
     result[batch * (drafts + 1) + b] = accepted;
 }
-template<bool Indirect = false, bool Probability = false>
-__global__ void ResidualKernel(const float *p, const float *logits, const float *lse,
-        const int *result, Partial *partials, int drafts, int vocab, int batch,
-        int blocks, unsigned long long seed, const unsigned long long *counter,
-        const FastllmMtpProposalView *proposals = nullptr) {
+template <bool Indirect = false, bool Probability = false>
+__global__ void ResidualKernel(const float *p, const float *logits, const float *lse, const int *result,
+                               Partial *partials, int drafts, int vocab, int batch, int blocks, unsigned long long seed,
+                               const unsigned long long *counter, const FastllmMtpProposalView *proposals = nullptr,
+                               const int *live = nullptr) {
     int b = blockIdx.y, tile = blockIdx.x, tid = threadIdx.x;
     int accepted = result[batch * (drafts + 1) + b];
     const float *target = p + (size_t)(b * (drafts + 1) + accepted) * vocab;
-    bool bonus = accepted == drafts;
+    bool bonus = accepted == (live ? live[b] : drafts);
     const float *proposal = nullptr;
     float normalizer = 0;
     if (!bonus) {
@@ -369,6 +378,21 @@ bool FastllmCudaMtpRecoverRoundedResidual(const float *p, const float *q, const 
         output >= 0 && output < vocab;
 }
 
+size_t FastllmCudaMtpGraphRejectBytes(int batch, int vocab) {
+    return size_t(batch) * ((vocab + Tile - 1) / Tile) * sizeof(Partial);
+}
+
+void FastllmCudaMtpGraphReject(const float *p, const float *q, const int *tokens, int *result, void *scratch, int batch,
+                               int drafts, int vocab, const int *live, uint64_t seed, unsigned long long *counter) {
+    auto *partials = static_cast<Partial *>(scratch);
+    const int blocks = (vocab + Tile - 1) / Tile;
+    AcceptKernel<false, true><<<batch, 32, 0, cudaStreamPerThread>>>(p, q, nullptr, tokens, result, drafts, vocab,
+                                                                     batch, seed, counter, nullptr, {}, live);
+    ResidualKernel<false, true><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
+        p, q, nullptr, result, partials, drafts, vocab, batch, blocks, seed, counter, nullptr, live);
+    FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(partials, result, drafts, batch, blocks, counter);
+}
+
 bool FastllmCudaMtpSampleDraftLogits(const float *logits, float *saved, float *lse,
         int *output, float *floatOutput, const float *temperatures, int batch, int vocab) {
     if (!logits || !saved || !lse || !output || !temperatures || batch <= 0 || vocab <= 0) return false;
@@ -385,25 +409,37 @@ bool FastllmCudaMtpSampleDraftLogits(const float *logits, float *saved, float *l
     return cudaGetLastError() == cudaSuccess;
 }
 
-template<bool Probability>
+template<bool Probability, bool HostIds = false>
 static bool FastllmMtpReject(const float *p, const float *logits,
         const float *lse, const int *draftIds, int *output, int *accepted,
-        int batch, int drafts, int vocab) {
+        int batch, int drafts, int vocab,
+        void (*enqueue)(const int *, void *) = nullptr, void *context = nullptr) {
     if (!p || !logits || (!Probability && !lse) || !draftIds || !output || !accepted ||
         batch <= 0 || drafts <= 0 || drafts > 8 || vocab <= 0) return false;
     auto &ws = GetWorkspace();
     int blocks = (vocab + Tile - 1) / Tile, count = batch * (drafts + 2);
     if (!ws.Prepare((size_t)batch * blocks, count)) return false;
-    AcceptKernel<false, Probability><<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse, draftIds,
-        ws.results, drafts, vocab, batch, ws.seed, ws.counter);
+    HostDraftIds hostIds;
+    if constexpr (HostIds) {
+        if (batch > int(sizeof(hostIds.values) / sizeof(int)) / drafts) return false;
+        std::copy_n(draftIds, batch * drafts, hostIds.values);
+    }
+    AcceptKernel<false, Probability, HostIds><<<batch, 32, 0, cudaStreamPerThread>>>(p, logits, lse,
+        HostIds ? nullptr : draftIds, ws.results, drafts, vocab, batch, ws.seed, ws.counter, nullptr, hostIds);
     ResidualKernel<false, Probability><<<dim3(blocks, batch), Threads, 0, cudaStreamPerThread>>>(
         p, logits, lse, ws.results, ws.partials, drafts, vocab, batch, blocks, ws.seed, ws.counter);
     FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
         ws.partials, ws.results, drafts, batch, blocks, ws.counter);
     if (cudaGetLastError() != cudaSuccess ||
         cudaMemcpyAsync(ws.hostResults, ws.results, count * sizeof(int), cudaMemcpyDeviceToHost,
-            cudaStreamPerThread) != cudaSuccess || cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)
-        return false;
+            cudaStreamPerThread) != cudaSuccess) return false;
+    if (enqueue) {
+        // Join only the result export; the callback may queue context work on
+        // this stream. Its request owner separately fences those consumers.
+        if (cudaEventRecord(ws.resultReady, cudaStreamPerThread) != cudaSuccess) return false;
+        enqueue(ws.results + batch * (drafts + 1), context);
+        if (cudaEventSynchronize(ws.resultReady) != cudaSuccess) return false;
+    } else if (cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) return false;
     std::copy_n(ws.hostResults, batch * (drafts + 1), output);
     std::copy_n(ws.hostResults + batch * (drafts + 1), batch, accepted);
     for (int b = 0; b < batch; ++b) {
@@ -429,6 +465,12 @@ bool FastllmCudaMtpRejectionFromProbs(const float *p, const float *logits,
 bool FastllmCudaMtpRejectionFromProbabilities(const float *p, const float *q,
         const int *draftIds, int *output, int *accepted, int batch, int drafts, int vocab) {
     return FastllmMtpReject<true>(p, q, nullptr, draftIds, output, accepted, batch, drafts, vocab);
+}
+
+bool FastllmCudaMtpRejectionFromHostProbabilities(const float *p, const float *q,
+        const int *draftIds, int *output, int *accepted, int batch, int drafts, int vocab,
+        void (*enqueue)(const int *, void *), void *context) {
+    return FastllmMtpReject<true, true>(p, q, nullptr, draftIds, output, accepted, batch, drafts, vocab, enqueue, context);
 }
 
 bool FastllmCudaMtpSampleDraftLogitsBatch(const float *logits,

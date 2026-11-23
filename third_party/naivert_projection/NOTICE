@@ -1,0 +1,7 @@
+Derived from NaiveRT, https://github.com/NaiveAI-Labs/NaiveRT
+Commit 79d5704ac32ff5fa756e9fb3a76829c236444d86. Licensed under Apache-2.0.
+BF16 rows-MMA projection, vector RMS normalization and SwiGLU projection
+geometry derive from attn_common/rows_gemv_mma.cuh and
+kernels/model_ops/extension/checkpoint_bf16_bindings.cu.
+FastLLM adaptations parameterize dimensions and row tiles and remove model,
+TP mailbox and epoch ownership from the common computational primitives.

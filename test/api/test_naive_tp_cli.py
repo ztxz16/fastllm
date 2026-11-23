@@ -202,6 +202,12 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'prefill'):
             self.configure([], saved={'prefill_batch_tokens': 2147483648})
 
+    def test_attention_dp_fp4_kv(self):
+        for dtype in ('fp4', 'fp4_e2m1', 'nvfp4'):
+            with self.subTest(dtype=dtype):
+                self.configure(['--tp', '4', '--attn-dp-size', '4', '--kv_cache_dtype', dtype])
+                self.assertEqual(self.model_options['kv_cache_dtype'], dtype)
+
     def test_attention_dp_default_budget_and_wait(self):
         for world, dp, chunk, limit, wait, expected in (
                 (4, 4, 4096, 32, 0, 16384), (8, 8, 4096, 64, 0, 32768),
@@ -323,6 +329,17 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
     def test_saved_explicit_zero(self):
         args = self.configure([], saved={"tp": "8", "cuda_slab": 0})
         self.assertEqual(args.cuda_slab, 0)
+
+    def test_inkling_history_defaults_and_opt_out(self):
+        config = {"architectures": ["Inkling2LoopForConditionalGeneration"]}
+        for option, enabled in (([], True), (["--cache_history", "false"], False)):
+            with self.subTest(option=option):
+                self.configure(["--device", "cuda:0", "--moe_device", "cuda:0", *option],
+                               model_type="inkling2_loop", config=config)
+                if enabled:
+                    self.loaded_model.set_save_history.assert_called_once_with(True)
+                else:
+                    self.loaded_model.set_save_history.assert_not_called()
 
     def test_mimo_dsa_tp_defaults(self):
         args = self.configure(["--tp", "8"], model_type="mimo_v2", config={

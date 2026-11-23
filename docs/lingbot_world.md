@@ -49,6 +49,8 @@ cmake --build build-lingbot --target fastllm_lingbot lingbot_world_generate -j
 
 ## 启动 HTTP 与 Demo
 
+启动器识别模型后，可在启动配置中设置「权重常驻显存」，对应服务参数 `--weight-residency auto|on|off`。默认 `auto` 在显存充足时保留权重，减少连续建场景或修改提示词时的重复加载。当前 1.3B 模型的启动门槛为 32 GiB 空闲显存。自动模式遇到 GPU 内存分配失败时会关闭常驻并重试一次。
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 tools/lingbot_world/server.py \
   --model "$MODEL_DIR" \
@@ -61,7 +63,7 @@ CUDA_VISIBLE_DEVICES=0 python3 tools/lingbot_world/server.py \
 
 可用 `--api-key` 设置 Bearer 密钥；页面的连接设置中填写同一密钥。`--max-worlds` 控制常驻世界数量，达到上限后先删除不用的会话。服务重启后会话需重新创建，输出 PNG 文件仍保留。
 
-默认采用混合精度：DiT 主矩阵乘、注意力、KV 缓存和 VAE 解码卷积、注意力使用 BF16，矩阵乘累加、归一化、采样更新与图像条件编码保留 FP32。HTTP 服务和命令行均可用 `--vae-decode-precision fp32` 切换到 FP32 解码进行精度排查；默认值为 `bf16`。这一设置只影响画面解码，不改变采样步数。
+默认采用混合精度。DiT 主矩阵乘、注意力、KV 缓存，以及 VAE 图像条件编码和解码中的卷积、注意力使用 BF16。矩阵乘累加、归一化和采样更新使用 FP32。HTTP 服务和命令行均可用 `--vae-decode-precision fp32` 切换到 FP32 解码进行精度排查；默认值为 `bf16`。这一设置只影响画面解码，不改变采样步数。
 
 历史缓存以原始精度保存在主机内存中，用于会话切换及失败恢复；显存充足时复用当前会话的 GPU 缓存，显存不足时自动释放并在需要时恢复。DiT 权重卸载后也会保留主机副本，避免反复读取和转换权重。部署时需同时预留系统内存；画面尺寸、历史长度和会话数量都会影响内存占用。
 
@@ -115,7 +117,9 @@ next_job = request('/v1/worlds/' + result['world_id'] + '/actions',
                    {'action': 'forward'})
 ```
 
-创建、动作和删除请求返回 HTTP 202 及任务对象。任务完成后的 `result` 包含世界 ID、片段序号、宽高、帧率、帧数量和 PNG URL 数组。按 URL 顺序与返回帧率播放；这些是视频帧，不是可在浏览器独立渲染的三维网格。
+创建、动作和删除请求返回 HTTP 202 及任务对象。生成结果包含世界 ID、片段序号、宽高、帧率和帧数。默认返回按播放顺序排列的 PNG 地址 `result.frames`。创建世界时传入 `"response_format": "mp4"` 可为该世界请求 H.264，每个动作也可单独指定格式。`result.format` 为 `mp4` 时，通过 `result.url` 获取整段视频，支持 HTTP Range。缺少 libx264 或编码失败时返回 PNG 帧。
+
+ftllm 启动器中的「交互 Demo」与 HY-NOMAS 共用播放器。选择起始图后可以移动、转视角、升降和发送新的完整场景描述。浏览器和服务都支持 H.264 时，播放器自动选择 MP4。
 
 失败任务的 `error` 包含原因。若返回 `world_deleted: true`，该会话已释放，需要重新创建；例如生成完成后输出目录写入失败，服务会释放已前进但无法交付画面的会话。
 

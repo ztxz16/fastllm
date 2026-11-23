@@ -34,7 +34,7 @@ __global__ void FastllmGemvFp32Fp32Kernel2(float *A, float *B, float *C, float *
         }
 
         if (tid == 0) {
-            C[p] = sdata[0] + bias[p];
+            C[p] = sdata[0] + (bias ? bias[p] : 0.0f);
         }
         __syncthreads();
     }
@@ -80,7 +80,7 @@ __global__ void FastllmGemvFp32GroupedRowsKernel(const float* __restrict__ input
                 if ((lane & (2 * offset - 1)) == 0) sum += other;
             }
             if (lane == 0 && first + r < n)
-                output[size_t(first + r) * k + expert] = sum + bias[expert];
+                output[size_t(first + r) * k + expert] = sum + (bias ? bias[expert] : 0.0f);
         }
     }
 }
@@ -135,35 +135,14 @@ __global__ void FastllmGemvFp32OutputTileUnpredicatedKernel(const float* __restr
                     sum+=other;
                 }
                 if(lane==0 && first+r<n && firstExpert+c<k)
-                    output[size_t(first+r)*k+firstExpert+c]=sum+bias[firstExpert+c];
+                    output[size_t(first+r)*k+firstExpert+c] = sum + (bias ? bias[firstExpert + c] : 0.0f);
             }
     }
 }
 
 
-static void FastllmCudaFloat32EnsureBiasOnDevice(fastllm::Data &weight, const fastllm::Data &bias, int k) {
-    // Auxiliary router caches reserve slots before the first ordinary Linear.
-    // A nonempty vector therefore does not imply that bias slot zero exists.
-    if (weight.extraCudaData.empty()) weight.extraCudaData.resize(1, nullptr);
-    if (weight.extraCudaData[0] == nullptr) {
-        cudaError_t state = cudaSuccess;
-        float *cudaBiasData;
-        state = cudaMalloc(&cudaBiasData, k * sizeof(float));
-        checkCudaErrors("Error: CUDA error when allocating bias!", state);
-        if (bias.dims.size() > 0) {
-            state = cudaMemcpy(cudaBiasData, (uint8_t*)bias.cudaData, k * sizeof(float), cudaMemcpyDeviceToDevice);
-        } else {
-            state = cudaMemset(cudaBiasData, 0, k * sizeof(float));
-        }
-        checkCudaErrors("Error: CUDA error when moving bias to device!", state);
-        weight.extraCudaData[0] = cudaBiasData;
-    }
-}
-
 bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    FastllmCudaFloat32EnsureBiasOnDevice(weight, bias, k);
-
-    float *cudaBiasData = (float*)weight.extraCudaData[0];
+    float *cudaBiasData = bias.dims.empty() ? nullptr : static_cast<float *>(bias.cudaData);
     float *cudaInput = (float*)FastllmCudaPrepareInput(input);
     float *cudaOutput = (float*)FastllmCudaPrepareOutput(output);
 
@@ -221,8 +200,8 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
             exit(0);
         }
 
-        if (bias.dims.size() > 0) {
-            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        if (cudaBiasData) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
     } else {
         FastllmGemvFp32Fp32Kernel2<256, 1> <<< k, 256 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, cudaBiasData, m, k);
@@ -234,9 +213,7 @@ bool FastllmCudaMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight,
 }
 
 bool FastllmCudaHalfMatMulFloat32(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
-    FastllmCudaFloat32EnsureBiasOnDevice(weight, bias, k);
-
-    float *cudaBiasData = (float*)weight.extraCudaData[0];
+    float *cudaBiasData = bias.dims.empty() ? nullptr : static_cast<float *>(bias.cudaData);
     float *cudaInput = (float*)FastllmCudaMalloc(input.Count(0) * sizeof(float));
     float *cudaOutput = (float*)FastllmCudaMalloc(output.Count(0) * sizeof(float));
     int inputLen = input.Count(0);
@@ -265,8 +242,8 @@ bool FastllmCudaHalfMatMulFloat32(const fastllm::Data &input, fastllm::Data &wei
             exit(0);
         }
 
-        if (bias.dims.size() > 0) {
-            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, (float*)weight.extraCudaData[0], k);
+        if (cudaBiasData) {
+            FastllmCudaBiasKernel <<< n, 256 >>> (cudaOutput, cudaBiasData, k);
         }
     } else {
         FastllmGemvFp32Fp32Kernel2<256, 1> <<< k, 256 >>>(cudaInput, (float *) weight.cudaData, cudaOutput, cudaBiasData, m, k);

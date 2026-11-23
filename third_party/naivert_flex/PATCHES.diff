@@ -1,0 +1,273 @@
+--- a/naivert/body/expert_select_up_gate_silu/expert_select_up_gate_silu_body.cuh
++++ b/naivert/body/expert_select_up_gate_silu/expert_select_up_gate_silu_body.cuh
+@@ -417,7 +417,7 @@
+     auto* route_scores = route_sigmoid_ptr(st);
+     auto* select = route_select_ptr(st);
+     float s = route_score(st, args, token, consumer_tid);
+-    float sig = 1.0f / (1.0f + fast_exp2(-s * 1.4426950408889634f));
++    float sig = s;
+     float select_value = sig + args.bias[consumer_tid];
+     route_scores[consumer_tid] = sig;
+     select[consumer_tid] = select_value;
+--- a/naivert/slot_ring/protocol.cuh
++++ b/naivert/slot_ring/protocol.cuh
+@@ -37,7 +37,11 @@
+ // full-mask form; bodies call this one under __activemask()).
+ __device__ inline bool elect_sync_compat(unsigned mask) {
+ #if defined(__CUDA_ARCH__)
+-  return cuda::ptx::elect_sync(mask);
++  // CUDA 12.9 lacks the C++ wrapper; emit the same SM90+ PTX instruction.
++  unsigned elected;
++  asm volatile("{ .reg .pred p; elect.sync _|p, %1; selp.b32 %0, 1, 0, p; }"
++               : "=r"(elected) : "r"(mask));
++  return elected != 0;
+ #else
+   (void)mask;
+   return true;
+--- a/naivert/body/expert_select_up_gate_silu_rows8_body.cuh
++++ b/naivert/body/expert_select_up_gate_silu_rows8_body.cuh
+@@ -227,8 +227,17 @@
+       if (helper == 0) {
+         auto* routing_barrier = route_barrier(shared);
+         Trans64::arrive_and_expect_tx(routing_barrier, kScoresBytes + kBiasBytes);
++        if (args.seq_len == 8) {
+         cuda::ptx::cp_async_bulk(cuda::ptx::space_shared_t{}, cuda::ptx::space_global_t{},
+                                  sigmoid(shared, 0), args.scores, kScoresBytes, routing_barrier);
++        } else {
++          for (int row=0;row<8;++row) {
++            int src=row < args.seq_len ? row : args.seq_len-1;
++            cuda::ptx::cp_async_bulk(cuda::ptx::space_shared_t{}, cuda::ptx::space_global_t{},
++                sigmoid(shared,row),args.scores+src*kRows8Experts,
++                std::uint32_t(kRows8Experts*4),routing_barrier);
++          }
++        }
+         cuda::ptx::cp_async_bulk(cuda::ptx::space_shared_t{}, cuda::ptx::space_global_t{},
+                                  bias_scratch(shared), args.bias, kBiasBytes, routing_barrier);
+         if constexpr (kPrepared) {
+@@ -244,9 +253,19 @@
+         const int half = helper - 2;
+         auto* barrier = activation_barriers(shared) + half;
+         Trans64::arrive_and_expect_tx(barrier, kRowsBytes);
++        if (args.seq_len == 8) {
+         cuda::ptx::cp_async_bulk(cuda::ptx::space_shared_t{}, cuda::ptx::space_global_t{},
+                                  pane(shared, helper), args.x + half * 4 * kRows8Hidden, kRowsBytes,
+                                  barrier);
++        } else {
++          for (int row=0;row<4;++row) {
++            int src=half*4+row;
++            src=src < args.seq_len ? src : args.seq_len-1;
++            cuda::ptx::cp_async_bulk(cuda::ptx::space_shared_t{}, cuda::ptx::space_global_t{},
++                pane(shared,helper)+row*kRows8Hidden*2,args.x+src*kRows8Hidden,
++                std::uint32_t(kRows8Hidden*2),barrier);
++          }
++        }
+       }
+       return;
+     }
+@@ -282,7 +301,7 @@
+     for (int item = 0; item < 8; ++item) {
+       const int expert = lane + item * 32;
+       const float score = sig[expert];
+-      probability[item] = 1.0f / (1.0f + fast_exp2(-score * 1.4426950408889634f));
++      probability[item] = score;
+       select_score[item] = probability[item] + bias[expert];
+     }
+     __syncwarp();
+--- a/naivert/body/expert_down_allreduce/expert_down_allreduce_body.cuh
++++ b/naivert/body/expert_down_allreduce/expert_down_allreduce_body.cuh
+@@ -32,7 +32,7 @@
+ namespace slot_ring = naivert;
+ 
+ template <bool kProfileWaitPoll, bool kWaitForPrimary = false,
+-          bool kParallelW8A8Epilogue = false>
++          bool kParallelW8A8Epilogue = false, bool kKeepTmem = false, bool kPublishOnly = false>
+ struct ExpertDownAllreduceBodyT;
+ // Production instantiations: one-row / multi-row target bodies and the wait-metric variant.
+ using ExpertDownAllreduceBody = ExpertDownAllreduceBodyT<false, false>;
+@@ -41,7 +41,7 @@
+ using ExpertDownAllreducePdlSecondaryBody = ExpertDownAllreduceBodyT<false, true>;
+ using ExpertDownAllreduceProfiledBody = ExpertDownAllreduceBodyT<true, false, true>;
+ 
+-template <bool kProfileWaitPoll, bool kWaitForPrimary, bool kParallelW8A8Epilogue>
++template <bool kProfileWaitPoll, bool kWaitForPrimary, bool kParallelW8A8Epilogue, bool kKeepTmem, bool kPublishOnly>
+ struct ExpertDownAllreduceBodyT {
+   // Four 32-output experts fill M128 in decode. Multirow retains two
+   // 64-output experts. Both use the existing 32-KiB payload allocation.
+@@ -167,7 +167,7 @@
+     return phys_row * kInter + phys_col;
+   }
+ 
+- private:
++ public:
+   __device__ static float* half1_partial(slot_ring::SlotRingState& st) {
+     return reinterpret_cast<float*>(st.scratch_base + kPartialOffset);
+   }
+@@ -281,7 +281,7 @@
+         (void)hidden_block1;
+       }
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+     float warp_partial0 = 0.0f;
+     float warp_partial1 = 0.0f;
+     float warp_partial2 = 0.0f;
+@@ -329,7 +329,7 @@
+         partial[warp_partial_base + row40 + 8] = warp_partial7;
+       }
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+     if (compute_warp && st.tid < kOutputsPerTile) {
+       float sum = partial[st.tid];
+ #pragma unroll
+@@ -338,7 +338,7 @@
+       }
+       partial[st.tid] = sum;
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+     float local_delta0 = 0.0f;
+     float local_delta8 = 0.0f;
+     if (compute_warp && k_half == 0 && tid4 == 0) {
+@@ -383,7 +383,7 @@
+                 }
+               }
+             }
+-            slot_ring::consumer_group_named_sync();
++            naivert::named_barrier_sync(256u,1u);
+                         publish_native_warp0_from_staged(
+                             st, args, output_tile, staged_payload);
+                         if constexpr (kProfileWaitPoll) {
+@@ -400,7 +400,7 @@
+                         }
+                         // Native Li1 uses BAR4 after the warp-0 mailbox reduction; helper
+                         // warps are not participants and can finish/exit independently.
+-                        slot_ring::consumer_group_named_sync();
++                        naivert::named_barrier_sync(256u,1u);
+ 
+           }
+ 
+@@ -560,7 +560,7 @@
+       peer_payload[st.tid] = naivert::tagged_payload(naivert::wait_tagged<false>(
+           mailbox.local_word(peer_slot, task, qword), mailbox.generation));
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+     if (st.tid >= kQwordPairs) {
+       return;
+     }
+--- a/naivert/body/expert_down_allreduce/expert_down_w8a8.cuh
++++ b/naivert/body/expert_down_allreduce/expert_down_w8a8.cuh
+@@ -49,7 +49,7 @@
+       *reinterpret_cast<unsigned*>(quant + index) = packed.__x;
+       if (st.lane_id == 0) scales[st.warp_id * 2 + group] = scale;
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+   }
+ 
+   __device__ static int w8a8_umma_offset(int row, int k) {
+@@ -90,10 +90,17 @@
+       for (int pass = 1; pass < kW8A8Passes; ++pass) sum = __fadd_rn(sum, weighted[pass * kComputeOutputs + st.tid]);
+       mixture[st.tid] = __float2bfloat16_rn(sum);
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+     const auto box = w8a8_mailbox<kTileWords>(args, 0);
+     const auto* pairs = reinterpret_cast<const unsigned*>(mixture);
+     if (st.tid < kTileWords) box.publish(tile, st.tid, pairs[st.tid]);
++    if constexpr (kPublishOnly) {
++      if (st.tid < kTileWords)
++        reinterpret_cast<unsigned*>(args.exp_out)[tile*kTileWords+st.tid] = pairs[st.tid];
++      naivert::named_barrier_sync(256u,1u);
++      return;
++    }
++
+     if (st.tid < kTileWords) {
+       // Issue the seven peer loads before inspecting any tag, so the
+       // arrival round trip is paid once instead of seven times in sequence
+@@ -131,15 +138,20 @@
+       *reinterpret_cast<__nv_bfloat162*>(result + hidden) = __floats2bfloat162_rn(
+           __fadd_rn(sum.x, residual.x), __fadd_rn(sum.y, residual.y));
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+   }
+ 
+   __device__ static void consume_output_tile_w8a8(
+       slot_ring::SlotRingState& st, const ExpertDownAllreduceArgs& args, int output_tile) {
+     using E4M3 = cutlass::float_e4m3_t;
+     using Atom = cute::UMMA::Layout_K_SW128_Atom<E4M3>;
++    // CUTLASS 4.1 exposes the same PTX wrapper without template parameters.
++#if CUTLASS_MAJOR == 4 && CUTLASS_MINOR == 1
++    using Mma = cute::SM100_MMA_F8F6F4_SS;
++#else
+     using Mma = cute::SM100_MMA_F8F6F4_SS<E4M3, E4M3, float, 128, 8,
+         cute::UMMA::Major::K, cute::UMMA::Major::K>;
++#endif
+     const auto outer_tx = st.tx;
+     auto* done = reinterpret_cast<std::uint64_t*>(st.scratch_base + kW8A8MmaBarrierOffset);
+     auto* tmem_slot = reinterpret_cast<unsigned*>(st.scratch_base + kW8A8TmemSlotOffset);
+@@ -147,7 +159,7 @@
+       naivert::Barrier::init(done, 1u);
+       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+     }
+-    if (st.warp_id == 0) {
++    if (st.warp_id == 0 && !kKeepTmem) {
+       cute::TMEM::Allocator1Sm allocator;
+       allocator.allocate(32, tmem_slot);
+       allocator.release_allocation_lock();
+@@ -178,7 +190,7 @@
+       for (int i = st.tid; i < kW8A8Passes * kComputeOutputs; i += kConsumerThreads) weighted[i] = 0.0f;
+     }
+     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+     // Only the four TMEM reader warps need the weight/MMA loop. They return
+     // all256 logical slot credits after actual MMA completion:128×2 arrivals.
+     // The other four consumer warps join them before the unchanged TP phase.
+@@ -209,7 +221,7 @@
+         Slot::consumer_wait(st);
+       }
+       if (st.warp_id == 0) {
+-        cuda::ptx::tcgen05_fence_after_thread_sync();
++        asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+ #pragma unroll
+         for (int kg = 0; kg < 2; ++kg) {
+           const auto a = cute::make_tensor(cute::make_smem_ptr(
+@@ -230,7 +242,7 @@
+         cutlass::arch::umma_arrive(done);
+       }
+       while (!naivert::Barrier::try_wait(done, unsigned((expert_base / kW8A8GroupExperts) & 1))) {}
+-      cuda::ptx::tcgen05_fence_after_thread_sync();
++      asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+       // The helper visits each expert once and has no outer refill. Only
+       // multirow groups with a later reuse return their weight slots. Decode
+       // preserves its existing releases and loop structure.
+@@ -258,7 +270,7 @@
+                                  activation_scales[expert_slot * 2 + kg]);
+           result = __fadd_rn(result, __fmul_rn(__uint_as_float(value), scale));
+         }
+-        cuda::ptx::tcgen05_fence_before_thread_sync();
++        asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+         // order -- weight by the route probability here, sum the experts in fp32 per rank.
+         if constexpr (kParallelW8A8Epilogue) {
+           weighted[pass * kComputeOutputs + row] = __fadd_rn(weighted[pass * kComputeOutputs + row],
+@@ -268,14 +280,14 @@
+                                            __fmul_rn(result, early_route));
+         }
+       }
+-      cutlass::arch::NamedBarrier::sync(128, 15 - cutlass::arch::NamedBarrier::ReservedNamedBarrierCount);
++      naivert::named_barrier_sync(128u,2u);
+     }
+     // Each compute lane owns its partial until this final publication.
+     if constexpr (!kParallelW8A8Epilogue) weighted[st.tid] = weighted_accumulator;
+     }
+-    slot_ring::consumer_group_named_sync();
++    naivert::named_barrier_sync(256u,1u);
+     combine_w8a8_m65_order(st, args, output_tile);
+-    if (st.warp_id == 0) {
++    if (st.warp_id == 0 && !kKeepTmem) {
+       cute::TMEM::Allocator1Sm allocator;
+       allocator.free(tmem, 32);
+     }

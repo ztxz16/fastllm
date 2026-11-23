@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-nvfp4-prefill.h"
 //
 // BFloat16 Linear: 小规模时使用自定义 GEMV kernel，大规模时使用 cublas (仿照 fastllm-linear-fp16.cu)
 //
@@ -11,6 +12,10 @@
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
+#endif
+
+#ifndef FASTLLM_HAS_BF16_MMA_SM120
+const FastllmBf16MmaProjections *FastllmCudaGetBf16MmaProjections() { return nullptr; }
 #endif
 
 FastllmCudaLinearGraphScope::FastllmCudaLinearGraphScope(std::shared_ptr<void> &workspace) {
@@ -40,15 +45,15 @@ typedef union __align__(16) _union_bf16_8 {
     __nv_bfloat162 out2[4];
 } union_bf16_8;
 
-template <int THREAD_PER_BLOCK, int PART>
+template <int THREAD_PER_BLOCK, int PART, bool GRID_BATCH = false>
 __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, __nv_bfloat16 *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
     // Large exact batches use grid.y for independent rows. Small batches
     // share each weight load across PART rows with the same per-row sums
     // and reduction tree as one-row decode.
-    if constexpr (PART == 1) {
-        const size_t gridRow = (size_t)blockIdx.y;
+    if constexpr (PART == 1 || GRID_BATCH) {
+        const size_t gridRow = (size_t)blockIdx.y * PART;
         A += gridRow * m;
         C += gridRow * k;
     }
@@ -158,13 +163,117 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     __syncthreads();
 }
 
+#ifndef USE_ROCM
+void *FastllmCudaV41IndexHeadGemvKernel() {
+    return (void *)FastllmGemvBf16Bf16Kernel2MultiRow<256, 6>;
+}
+#endif
+
+// The scalar reference has 256 leaves. Each leaf sums two eight-product
+// groups, then a compensated binary tree reduces the 256 partials to BF16.
+__device__ __forceinline__ void FastllmBf16HeadAdd(float &value, float &correction, float peer) {
+    const float add = peer - correction;
+    const float next = value + add;
+    correction = (next - value) - add;
+    value = next;
+}
+
+// One 64-thread group per vocabulary row. A lane owns four reference leaves
+// spaced 64 apart. Keep their partials in registers and share every weight
+// load across the input rows. Only the 64-to-32 stage needs shared memory.
+template <int FixedWidth, int batch, bool Tail = false>
+__device__ __forceinline__ void FastllmBf16ExactTile(const __nv_bfloat16 *__restrict__ input,
+        const __nv_bfloat16 *__restrict__ weight, __nv_bfloat16 *__restrict__ output, int vocab,
+        int runtimeWidth, int firstColumn, int live = batch) {
+    const int width = FixedWidth ? FixedWidth : runtimeWidth;
+    const int lane = threadIdx.x % 64, group = threadIdx.x / 64;
+    const int column = firstColumn + group;
+    const __nv_bfloat16 *row = weight + size_t(column) * width;
+    float sums[4][batch], corrections[4][batch] = {};
+    #pragma unroll
+    for (int leaf = 0; leaf < 4; ++leaf) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int offset = half * 2048 + (lane + 64 * leaf) * 8;
+            if constexpr (FixedWidth != 4096)
+                if (offset >= width) continue;
+            union_bf16_8 w;
+            w.in = *reinterpret_cast<const uint4 *>(row + offset);
+            float wfp32[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) wfp32[i] = __bfloat162float(w.out[i]);
+            #pragma unroll
+            for (int b = 0; b < batch; ++b) {
+                union_bf16_8 x;
+                x.in = *reinterpret_cast<const uint4 *>(input + (Tail ? min(b, live - 1) : b) * width + offset);
+                float partial = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    partial = fmaf(__bfloat162float(x.out[i]), wfp32[i], partial);
+                if (half == 0) sums[leaf][b] = partial;
+                else sums[leaf][b] += partial;
+            }
+        }
+    }
+    __shared__ float upper[2][batch][32];
+    #pragma unroll
+    for (int b = 0; b < batch; ++b) {
+        FastllmBf16HeadAdd(sums[0][b], corrections[0][b], sums[2][b]);
+        FastllmBf16HeadAdd(sums[1][b], corrections[1][b], sums[3][b]);
+        FastllmBf16HeadAdd(sums[0][b], corrections[0][b], sums[1][b]);
+        if (lane >= 32) upper[group][b][lane - 32] = sums[0][b];
+    }
+    __syncthreads();
+    if (lane < 32) {
+        #pragma unroll
+        for (int b = 0; b < batch; ++b) {
+            float value = sums[0][b], correction = corrections[0][b];
+            FastllmBf16HeadAdd(value, correction, upper[group][b][lane]);
+            #pragma unroll
+            for (int step = 16; step; step >>= 1)
+                FastllmBf16HeadAdd(value, correction, __shfl_down_sync(0xffffffffu, value, step));
+            if (lane == 0 && (!Tail || b < live)) output[size_t(b) * vocab + column] = __float2bfloat16_rn(value);
+        }
+    }
+}
+
+template <int FixedWidth, int batch, bool Tail = false>
+__global__ void FastllmBf16ExactProjection(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
+        __nv_bfloat16 *output, int vocab, int width = FixedWidth, int live = batch) {
+    FastllmBf16ExactTile<FixedWidth, batch, Tail>(input + size_t(blockIdx.y) * batch * width, weight,
+        output + size_t(blockIdx.y) * batch * vocab, vocab, width, blockIdx.x * 2, live);
+}
+
+// Packed weights can project separate Q, K and V activations in one grid.
+// Each group retains its own row pitch, including when Q is wider than K/V.
+struct FastllmBf16ProjectionInputs {
+    const __nv_bfloat16 *x[3];
+    int ends[3];
+};
+
+template <int Batch, int FixedWidth = 0>
+__global__ void FastllmBf16GroupedProjection(FastllmBf16ProjectionInputs inputs,
+        const __nv_bfloat16 *weight, __nv_bfloat16 *output, int rows, int width, int firstRow) {
+    const int column = blockIdx.x * 2;
+    const int group = (column >= inputs.ends[0]) + (column >= inputs.ends[1]);
+    const int begin = group ? inputs.ends[group - 1] : 0;
+    const int columns = inputs.ends[group] - begin;
+    const int row = firstRow + blockIdx.y * Batch;
+    FastllmBf16ExactTile<FixedWidth, Batch>(inputs.x[group] + size_t(row) * width, weight + size_t(begin) * width,
+        output + size_t(begin) * rows + size_t(row) * columns, columns, width, column - begin);
+}
+
 // At K=256, one warp computes each dot with the original compensated
 // reduction. Tiling output rows reuses its input vector without changing
 // the per-lane products or BF16 rounding.
-template <int RowsPerWarp = 1>
+template <int RowsPerWarp = 1, bool Indexed = false>
 __global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
         const __nv_bfloat16 *weight, __nv_bfloat16 *output,
-        const __nv_bfloat16 *bias, int outputs) {
+        const __nv_bfloat16 *bias, int outputs, const float *ids = nullptr) {
+    if constexpr (Indexed) {
+        const int row = __float2int_rz(*ids);
+        input += (size_t)(row >= 0 && row < outputs ? row : 0) * 256;
+    }
     const int lane = threadIdx.x & 31;
     const int first = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * RowsPerWarp;
     if (first >= outputs) return;
@@ -196,6 +305,28 @@ __global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
             output[first + r] = __float2bfloat16_rn(value);
         }
     }
+}
+
+bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    using namespace fastllm;
+    if (ids.dataType != FLOAT32 || ids.dims != std::vector<int>{1, 1} ||
+        table.dataType != BFLOAT16 || weight.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
+        table.dims.size() != 2 || table.dims[1] != 256 || table.dims != weight.dims ||
+        table.strides != std::vector<uint64_t>{256, 1} || weight.strides != table.strides ||
+        table.dims[0] < 1 || output.dims != std::vector<int>{1, 1, table.dims[0]} ||
+        output.strides.size() != 3 || output.strides.back() != 1 ||
+        ids.dataDevice != CUDA || table.dataDevice != CUDA || weight.dataDevice != CUDA || output.dataDevice != CUDA ||
+        ids.dataDeviceIds.size() != 1 || ids.dataDeviceIds.front() != FastllmCudaGetDevice() ||
+        ids.dataDeviceIds != table.dataDeviceIds || ids.dataDeviceIds != weight.dataDeviceIds ||
+        ids.dataDeviceIds != output.dataDeviceIds || !ids.cudaData || !table.cudaData || !weight.cudaData ||
+        !output.cudaData || ((uintptr_t(table.cudaData) | uintptr_t(weight.cudaData)) & 15)) return false;
+
+    const int rows = table.dims[0];
+    FastllmGemvBf16SmallK<1, true><<<(rows - 1) / 8 + 1, 256>>>(
+        (const __nv_bfloat16 *)table.cudaData, (const __nv_bfloat16 *)weight.cudaData,
+        (__nv_bfloat16 *)output.cudaData, nullptr, rows, (const float *)ids.cudaData);
+    return true;
 }
 
 // FP16 input × BF16 weight -> FP16 output (用于 FastllmCudaHalfMatMulBFloat16)
@@ -921,7 +1052,228 @@ bool FastllmCudaIndexerProjection(const fastllm::Data &input,
     return true;
 }
 
+// The narrow GDN gates are sensitive to a single BF16 rounding boundary.
+// Use the single-row decode reduction for every prompt row in one launch.
+void FastllmCudaBf16ExactRows(const void *input, const void *weight, void *output,
+                              int rows, int columns, int outputs) {
+    // In the narrow GDN prefill projection one CTA can share each weight
+    // vector across four token rows with the same compensated reduction.
+    auto *a = (__nv_bfloat16 *)input;
+    auto *b = (__nv_bfloat16 *)weight;
+    auto *c = (__nv_bfloat16 *)output;
+    int begin = 0;
+    if (columns == 4096 && outputs == 64) {
+        while (rows - begin >= 4) {
+            const int groups = std::min(65535, (rows - begin) / 4);
+            FastllmGemvBf16Bf16Kernel2MultiRow<256, 4, true><<<dim3(outputs, groups), 256>>>(
+                a + size_t(begin) * columns, b, c + size_t(begin) * outputs, nullptr, columns, outputs);
+            begin += 4 * groups;
+        }
+    }
+    if (columns == 4608 && outputs == 64 && FastllmCudaRuntimeArch() == 120) {
+        // With only 64 output channels, pairs of queries share weights while
+        // leaving enough independent blocks to fill the device.
+        while (rows - begin >= 2) {
+            const int groups = std::min(65535, (rows - begin) / 2);
+            FastllmGemvBf16Bf16Kernel2MultiRow<256, 2, true><<<dim3(outputs, groups), 256>>>(
+                a + size_t(begin) * columns, b, c + size_t(begin) * outputs, nullptr, columns, outputs);
+            begin += 2 * groups;
+        }
+    }
+    while (begin < rows) {
+        const int count = std::min(65535, rows - begin);
+        FastllmGemvBf16Bf16Kernel2MultiRow<256, 1><<<dim3(outputs, count), 256>>>(
+            a + size_t(begin) * columns, b, c + size_t(begin) * outputs, nullptr, columns, outputs);
+        begin += count;
+    }
+}
+
+// Each warp owns four tokens and four output channels. Neighboring dots share
+// both operand loads. A lane holds the eight leaves spaced 32 apart in the
+// original 256-leaf GEMV tree, so its BF16 result is independent of the batch.
+struct FastllmBf16WarpDots {
+    float values[4][4];
+
+    __device__ __forceinline__ void merge(FastllmBf16WarpDots &error, const FastllmBf16WarpDots &peer) {
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+                FastllmBf16HeadAdd(values[r][c], error.values[r][c], peer.values[r][c]);
+        }
+    }
+};
+
+template <int FixedWidth>
+__device__ __forceinline__ FastllmBf16WarpDots FastllmBf16WarpLeaf(
+        const __nv_bfloat16 *input, const __nv_bfloat16 *weight, int width, int offset, int live) {
+    if constexpr (FixedWidth) width = FixedWidth;
+    FastllmBf16WarpDots dots{};
+    #pragma unroll 2
+    for (int half = 0; half < width; half += 2048) {
+        if (half + offset >= width) break;
+        union_bf16_8 x[4], w[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            x[j].in = *reinterpret_cast<const uint4 *>(input + min(j, live - 1) * width + half + offset);
+            w[j].in = *reinterpret_cast<const uint4 *>(weight + j * width + half + offset);
+        }
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                float sum = 0;
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    sum = fmaf(__bfloat162float(x[r].out[i]), __bfloat162float(w[c].out[i]), sum);
+                dots.values[r][c] += sum;
+            }
+        }
+    }
+    return dots;
+}
+
+template <int FixedWidth, bool Grouped>
+__global__ void FastllmBf16WarpProjection(FastllmBf16ProjectionInputs inputs, const __nv_bfloat16 *weight,
+        __nv_bfloat16 *output, int rows, int width) {
+    if constexpr (FixedWidth) width = FixedWidth;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int row = blockIdx.y * 8 + (warp / 4) * 4;
+    const int column = blockIdx.x * 16 + (warp % 4) * 4;
+    if (row >= rows || column >= inputs.ends[2]) return;
+    const int group = Grouped ? (column >= inputs.ends[0]) + (column >= inputs.ends[1]) : 0;
+    const int begin = group ? inputs.ends[group - 1] : 0;
+    const int pitch = inputs.ends[group] - begin;
+    const auto *x = inputs.x[group] + size_t(row) * width;
+    const auto *w = weight + size_t(column) * width;
+    const int live = rows - row;
+
+    FastllmBf16WarpDots result{}, correction{};
+    #pragma unroll
+    for (int side = 0; side < 2; ++side) {
+        FastllmBf16WarpDots subtree{}, carry{};
+        #pragma unroll
+        for (int child = 0; child < 2; ++child) {
+            const int offset = (lane + 32 * (side + 2 * child)) * 8;
+            auto left = FastllmBf16WarpLeaf<FixedWidth>(x, w, width, offset, live);
+            auto right = FastllmBf16WarpLeaf<FixedWidth>(x, w, width, offset + 1024, live);
+            FastllmBf16WarpDots error{};
+            left.merge(error, right);
+            if (child == 0) { subtree = left; carry = error; }
+            else subtree.merge(carry, left);
+        }
+        if (side == 0) { result = subtree; correction = carry; }
+        else result.merge(correction, subtree);
+    }
+    #pragma unroll
+    for (int step = 16; step; step >>= 1) {
+        FastllmBf16WarpDots peer;
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            #pragma unroll
+            for (int c = 0; c < 4; ++c)
+                peer.values[r][c] = __shfl_down_sync(0xffffffff, result.values[r][c], step);
+        }
+        result.merge(correction, peer);
+    }
+    if (lane == 0) {
+        auto *out = output + size_t(begin) * rows + size_t(row) * pitch + column - begin;
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            if (r >= live) break;
+            #pragma unroll
+            for (int c = 0; c < 4; ++c) out[r * pitch + c] = __float2bfloat16_rn(result.values[r][c]);
+        }
+    }
+}
+
+template <bool Grouped>
+static bool LaunchBf16WarpProjection(const FastllmBf16ProjectionInputs &inputs, const __nv_bfloat16 *weight,
+                                     __nv_bfloat16 *out, int rows, int width) {
+    if (rows < 8 || rows > 8 * 65535 || width < 2048 || width > 4096 || width % 8 ||
+        (reinterpret_cast<uintptr_t>(weight) & 15)) return false;
+    for (int g = 0; g < (Grouped ? 3 : 1); ++g)
+        if (inputs.ends[g] % 4 || (reinterpret_cast<uintptr_t>(inputs.x[g]) & 15)) return false;
+    dim3 grid((inputs.ends[2] + 15) / 16, (rows + 7) / 8);
+    if (width == 2304)
+        FastllmBf16WarpProjection<2304, Grouped><<<grid, 256>>>(inputs, weight, out, rows, width);
+    else if (width == 3072)
+        FastllmBf16WarpProjection<3072, Grouped><<<grid, 256>>>(inputs, weight, out, rows, width);
+    else
+        FastllmBf16WarpProjection<0, Grouped><<<grid, 256>>>(inputs, weight, out, rows, width);
+    return true;
+}
+
+bool FastllmCudaBf16ExactBatchProjection(const void *input, const void *weight, void *output,
+                                        int rows, int width, int columns) {
+    FastllmBf16ProjectionInputs inputs{{static_cast<const __nv_bfloat16 *>(input)}, {columns, columns, columns}};
+    return LaunchBf16WarpProjection<false>(inputs, static_cast<const __nv_bfloat16 *>(weight),
+                                           static_cast<__nv_bfloat16 *>(output), rows, width);
+}
+
+bool FastllmCudaBf16DecodeProjection(const void *input, const void *weight, void *output,
+                                    int rows, int width, int columns) {
+    return fastllm_bf16_lt::Matmul(input, weight, output, rows, width, columns,
+                                   CUDA_R_16BF, fastllm_bf16_lt::prefillReferenceRows);
+}
+
+bool LaunchFastllmGroupedBf16Projection(const __nv_bfloat16 *const *x, const __nv_bfloat16 *weight,
+        __nv_bfloat16 *out, int rows, int width, const int *columns) {
+    if (rows < 4 || rows % 4 || width < 2048 || width > 4096 || width % 8 ||
+        (reinterpret_cast<uintptr_t>(weight) & 15) || FastllmCudaRuntimeArch() != 120) return false;
+    FastllmBf16ProjectionInputs inputs{};
+    int total = 0;
+    for (int g = 0; g < 3; ++g) {
+        if (columns[g] < 1024 || columns[g] % 2 || (reinterpret_cast<uintptr_t>(x[g]) & 15)) return false;
+        inputs.x[g] = x[g];
+        inputs.ends[g] = total += columns[g];
+    }
+    if (LaunchBf16WarpProjection<true>(inputs, weight, out, rows, width)) return true;
+    int first = 0;
+    while (rows - first >= 8) {
+        const int tiles = std::min((rows - first) / 8, 65535);
+        if (width == 2304)
+            FastllmBf16GroupedProjection<8, 2304><<<dim3(total / 2, tiles), 128>>>(inputs, weight, out, rows, width, first);
+        else
+            FastllmBf16GroupedProjection<8><<<dim3(total / 2, tiles), 128>>>(inputs, weight, out, rows, width, first);
+        first += tiles * 8;
+    }
+    if (first < rows)
+        FastllmBf16GroupedProjection<4><<<total / 2, 128>>>(inputs, weight, out, rows, width, first);
+    return true;
+}
+
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv_bfloat16 *output, __nv_bfloat16 *bias, int n, int m, int k) {
+    // Two banks cover 256 eight-value leaves. Keep the singleton FMA and compensated
+    // reduction order while reusing each weight across a tile of independent rows.
+    if (!bias && n >= 4 && m >= 2048 && m <= 4096 && m % 8 == 0 && k >= 1024 && k % 2 == 0 &&
+        !(reinterpret_cast<uintptr_t>(input) & 15) && !(reinterpret_cast<uintptr_t>(weight) & 15) &&
+        FastllmCudaRuntimeArch() == 120) {
+        while (n >= 8) {
+            int tiles = std::min(n / 8, 65535);
+            if (m == 2304)
+                FastllmBf16ExactProjection<2304, 8><<<dim3(k / 2, tiles), 128>>>(input, weight, output, k);
+            else if (m == 3072)
+                FastllmBf16ExactProjection<3072, 8><<<dim3(k / 2, tiles), 128>>>(input, weight, output, k);
+            else
+                FastllmBf16ExactProjection<0, 8><<<dim3(k / 2, tiles), 128>>>(input, weight, output, k, m);
+            n -= tiles * 8;
+            input += size_t(tiles) * 8 * m;
+            output += size_t(tiles) * 8 * k;
+        }
+        if (n > 4) {
+            // A partial tile shares each vocabulary weight across the live rows.
+            FastllmBf16ExactProjection<0, 8, true><<<k / 2, 128>>>(input, weight, output, k, m, n);
+            return;
+        }
+        if (n >= 4) {
+            FastllmBf16ExactProjection<0, 4><<<k / 2, 128>>>(input, weight, output, k, m);
+            n -= 4;
+            input += size_t(4) * m;
+            output += size_t(4) * k;
+        }
+        if (!n) return;
+    }
     if ((n == 1 || n == 2) && k >= 256 && (m == 1024 || m == 2048 || m == 4096) &&
         (reinterpret_cast<uintptr_t>(input) & 15) == 0 &&
         (reinterpret_cast<uintptr_t>(weight) & 15) == 0 && FastllmCudaRuntimeArch() == 90) {
@@ -1207,7 +1559,19 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
     __nv_bfloat16 *cudaBiasData = bias.dims.size() == 0 ? nullptr : (__nv_bfloat16 *)weight.extraCudaData[1];
     __nv_bfloat16 *weightPtr = (__nv_bfloat16 *)weight.cudaData;
 
-    if (n < 8) {
+    if (n >= 8 && m >= 1024 && FastllmCudaNvfp4Scope::IsBatched() &&
+        FastllmCudaRuntimeArch() == 120) {
+        for (int row = 0; row < n; row += 8) {
+            const int rows = std::min(8, n - row);
+            auto *x = cudaInput + size_t(row) * m;
+            auto *y = cudaOutput + size_t(row) * k;
+            if (rows == 8 && m == 4096 && k >= 65536 && k % 2 == 0 && !cudaBiasData) {
+                FastllmBf16ExactProjection<4096, 8><<<k / 2, 128>>>(x, weightPtr, y, k);
+            } else {
+                LaunchFastllmGemmBf16Bf16SmallBatch<256>(x, weightPtr, y, cudaBiasData, rows, m, k);
+            }
+        }
+    } else if (n < 8) {
         // Wide Hopper BF16 projections use FP32-accumulating Lt, including batched
         // decode/verify. The exact-row policy still applies to FP32 routers;
         // BF16 results may differ in rounding from the GEMV reduction tree.
@@ -1215,9 +1579,11 @@ bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data
         // rounding and the unwarmed/unsupported fallbacks as well.
         // A single 4096-wide row with at most 2048 outputs is faster with the
         // native GEMV; Lt's split-K launch/reduction overhead dominates here.
+        // Wide SM103 heads also benefit from Lt at three through seven rows.
+        const int arch = FastllmCudaRuntimeArch();
         const bool useLt = n > 0 && m >= 1024 && k >= 1024 &&
             !(n == 1 && m == 4096 && k <= 2048) && bias.dims.empty() &&
-            FastllmCudaRuntimeArch() == 90;
+            (arch == 90 || (arch == 103 && n >= 3 && m >= 4096 && k >= 16384));
         if (!useLt || !fastllm_bf16_lt::Matmul(cudaInput, weightPtr, cudaOutput, n, m, k)) {
             LaunchFastllmGemmBf16Bf16(cudaInput, weightPtr, cudaOutput, cudaBiasData, n, m, k);
         }

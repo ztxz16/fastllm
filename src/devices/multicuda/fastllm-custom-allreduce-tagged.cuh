@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 #include "fastllm-custom-allreduce-multicast.cuh"
@@ -288,12 +289,13 @@ public:
         return result;
     }
 
-    bool CanUse(int count) const {
+    bool CanUse(int count, bool fp32 = false) const {
+        if (verifySm103 && (fp32 || count != 6 * 5120)) return false;
         return ready && count > 0 && count <= kTaggedPeerMaxElements && count % 64 == 0;
     }
 
     bool Launch(const void *input, void *output, int count, int rank, bool fp32 = false) const {
-        if (!CanUse(count) || rank < 0 || rank >= 8) return false;
+        if (!CanUse(count, fp32) || rank < 0 || rank >= 8) return false;
         if (!fp32 && multicast) {
             TaggedPeerPointers mapped = peers;
             mapped.multicast = multicast->Broadcast(rank);
@@ -351,7 +353,7 @@ public:
     void ReleaseAfterDrain() { Release(false); }
 
 private:
-    bool ready = false;
+    bool ready = false, verifySm103 = false;
     TaggedPeerPointers peers{};
     std::unique_ptr<TaggedMulticastMemory> multicast;
     std::array<uint64_t *, 8> epochs{};
@@ -360,13 +362,20 @@ private:
     static constexpr size_t frameBytes = slotBytes * 8;
 
     bool Initialize(const std::vector<int> &requested) {
-        // This geometry is validated on eight Hopper GPUs with fast peer links.
-        // Other topologies/architectures retain the existing custom/NCCL paths.
+        // SM103 uses the measured BF16 six-row unicast reduction. Hopper also
+        // supports multicast, FP32 and joint collectives.
         if (requested.size() != 8) return false;
+        const char *setting = std::getenv("FASTLLM_DSV41_VERIFY_PEER_AR");
+        const bool enableVerify = setting && setting[0] == '1' && setting[1] == '\0';
         for (int device : requested) {
-            int major = 0, multiprocessors = 0;
-            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                                       device) != cudaSuccess || major != 9) return false;
+            int major = 0, minor = 0, multiprocessors = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess)
+                return false;
+            if (major != 9 && !(major == 10 && enableVerify &&
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
+                minor == 3)) return false;
+            if (device == requested.front()) verifySm103 = major == 10;
+            if (verifySm103 != (major == 10)) return false;
             // FP32 scatter/reduce/gather has dependencies between CTAs. Keep
             // the bounded grid resident even on devices with reduced SM counts.
             if (cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount,
@@ -387,7 +396,7 @@ private:
             ~RestoreDevice() { cudaSetDevice(device); }
         } restore{original};
         devices = requested;
-        multicast = TaggedMulticastMemory::Create(devices, frameBytes * kTaggedPeerBuffers);
+        if (!verifySm103) multicast = TaggedMulticastMemory::Create(devices, frameBytes * kTaggedPeerBuffers);
         for (size_t rank = 0; rank < devices.size(); ++rank) {
             if (cudaSetDevice(devices[rank]) != cudaSuccess) return false;
             // A build targeting pre-Volta PTX can run on Hopper via JIT, but

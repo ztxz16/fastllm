@@ -2,16 +2,16 @@
 #include "fastllm-gguf-planar-mixed.cuh"
 
 namespace fastllm_gguf_planar_mixed {
-template <ggml_type Gate, ggml_type Up, int T>
-void Launch(const void *gate, const void *up, const int8_t *qs, const half2 *ds, const short2 *sums,
-            half *output, int k, int n, int stride, cudaStream_t stream) {
+template <ggml_type First, ggml_type Second, int T>
+void LaunchOrdered(const void *firstWeight, const void *secondWeight, const int8_t *qs, const half2 *ds,
+                   const short2 *sums, half *output, int k, int n, int stride, cudaStream_t stream, bool gateIsSecond) {
     static thread_local int cachedDevice = -1, limit = 0;
-    constexpr int warps = BlockWarps<Gate, Up, T>;
+    constexpr int warps = BlockWarps<First, Second, T>;
     int device = -1, blocks = (n + warps - 1) / warps;
     if (cudaGetDevice(&device) == cudaSuccess) {
         if (device != cachedDevice) {
             int active = 0, sms = 0;
-            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, Project<Gate, Up, T>, warps * 32, 0) ==
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, Project<First, Second, T>, warps * 32, 0) ==
                     cudaSuccess &&
                 cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
                 active > 0 && sms > 0) {
@@ -22,7 +22,18 @@ void Launch(const void *gate, const void *up, const int8_t *qs, const half2 *ds,
         if (device == cachedDevice)
             blocks = std::min(blocks, limit);
     }
-    Project<Gate, Up, T><<<blocks, warps * 32, 0, stream>>>(gate, up, qs, ds, sums, output, k, n, stride);
+    Project<First, Second, T><<<blocks, warps * 32, 0, stream>>>(
+        firstWeight, secondWeight, qs, ds, sums, output, k, n, stride, gateIsSecond);
+}
+
+template <ggml_type Gate, ggml_type Up, int T>
+void Launch(const void *gate, const void *up, const int8_t *qs, const half2 *ds, const short2 *sums,
+            half *output, int k, int n, int stride, cudaStream_t stream) {
+    // Instantiate one kernel per unordered type pair. SwiGLU still needs the original gate.
+    if constexpr (Gate < Up)
+        LaunchOrdered<Gate, Up, T>(gate, up, qs, ds, sums, output, k, n, stride, stream, false);
+    else
+        LaunchOrdered<Up, Gate, T>(up, gate, qs, ds, sums, output, k, n, stride, stream, true);
 }
 
 template <ggml_type Gate, ggml_type Up>

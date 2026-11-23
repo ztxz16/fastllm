@@ -2,16 +2,25 @@
 // Third-party kernel provenance and the pointer-indirection patch are recorded
 // in third_party/flashinfer_dsv41/README.md. No Python runtime is required.
 #include "deepseekv41-flashinfer.cuh"
+#include "deepseekv41-verify-merge.cuh"
 #include <flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/decode.cuh>
+#include <cooperative_groups.h>
+#include <cuda_fp8.h>
 #include <cmath>
 #include <memory>
 #include <map>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 namespace {
 using namespace flashinfer::sparse_mla_sm120;
 using namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16;
+#include "deepseekv41-verify-attention.cuh"
+
 struct Plan {
+    float *verifyAngles = nullptr;
+    int cooperativeBlocks = 0;
     int width = 0, splits = 0, ratio = 0, heads = 0, batch = 0, scratchHeads = 0;
     float scale = 1.f;
     bool verifying = false;
@@ -21,6 +30,7 @@ struct Plan {
     bool gathered = false;
     bf16 *decoded = nullptr;
     int32_t *decodedIndices = nullptr;
+    int32_t *extraLengths = nullptr;
     bf16 *mid = nullptr;
     float *midLse = nullptr;
     void BindStorage() {
@@ -29,6 +39,7 @@ struct Plan {
         midLse = reinterpret_cast<float *>(mid + count * 512);
         decoded = gathered ? reinterpret_cast<bf16 *>(midLse + count) : nullptr;
         decodedIndices = gathered ? reinterpret_cast<int32_t *>(decoded + size_t(batch) * (128 + width) * 512) : nullptr;
+        extraLengths = gathered && verifying ? decodedIndices + size_t(batch) * (128 + width) : nullptr;
     }
 };
 
@@ -55,13 +66,20 @@ __device__ inline void DecodeAttentionKVVector(const uint8_t *src, int d,
 template <bool Verify>
 __global__ void GatherAttentionKV(const FastllmV41FullDecodeRequest *requests,
         const int32_t *selected, bf16 *decoded, int32_t *indices,
-        int width, int rows, int ratio) {
+        int width, int rows, int ratio, int32_t *extraLengths) {
     const int count = 128 + width;
     const int task = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = task / 64, vector = task % 64;
     if (row >= rows * count) return;
     const int token = row / count, logical = row % count, d = vector * 8;
     const auto request = requests[token];
+    if constexpr (Verify) {
+        if (extraLengths && !logical && !vector) {
+            const int end = requests[request.chunkBegin].position +
+                (request.chunkLength > 0 ? request.chunkLength : rows);
+            extraLengths[token] = request.compressedKV && ratio > 0 ? min(end / ratio, width) : 0;
+        }
+    }
     const bool compressed = logical >= 128;
     int id = -1;
     if (compressed && request.compressedKV) {
@@ -79,6 +97,8 @@ __global__ void GatherAttentionKV(const FastllmV41FullDecodeRequest *requests,
         if (p >= 0 && p < end) id = p % 128;
     }
     if (!vector) indices[row] = id < 0 ? -1 : row;
+    // The attention consumer replaces a negative index with zero in registers.
+    if constexpr (Verify) if (extraLengths && id < 0) return;
     const auto *src = id < 0 ? nullptr :
         static_cast<const uint8_t *>(compressed ? request.compressedKV : request.windowKV)
             + size_t(id) * (compressed ? 288 : 528);
@@ -159,75 +179,10 @@ __global__ void MergeCurrent(const bf16 *q, const bf16 *current, const bf16 *par
 __global__ void MergeVerify(const bf16 *q, const bf16 *chunk, const bf16 *partial, const float *lse,
                             const float *sink, bf16 *output, float scale, int heads, int scratchHeads,
                             int splits, int length, const FastllmV41FullDecodeRequest *requests = nullptr, int rowOffset = 0) {
-    const int h = blockIdx.x, rowIndex = rowOffset + blockIdx.y, t = threadIdx.x;
-    const int token = requests ? rowIndex - requests[rowIndex].chunkBegin : rowIndex % length;
-    const int lane = t & 31, warp = t / 32;
-    chunk += size_t(rowIndex - token) * 512;
-    q += (size_t(rowIndex) * heads + h) * 512;
-    partial += (size_t(rowIndex) * scratchHeads + h) * splits * 512;
-    lse += (size_t(rowIndex) * scratchHeads + h) * splits;
-    output += (size_t(rowIndex) * heads + h) * 512;
-    // The model has a 128-token sliding window, independent of batch/chunk size.
-    const int first = max(0, token - 127), count = token - first + 1;
-    __shared__ float prefixWeights[128], splitWeights[18];
-    for (int local = warp; local < count; local += 4) {
-        float dot = 0.f;
-#pragma unroll
-        for (int d = lane; d < 512; d += 32)
-            dot = fmaf(float(q[d]), float(chunk[size_t(first + local) * 512 + d]), dot);
-        for (int s = 16; s; s >>= 1)
-            dot += __shfl_down_sync(0xffffffff, dot, s);
-        if (!lane)
-            prefixWeights[local] = dot * scale * 1.4426950408889634f;
-    }
-    __syncthreads();
-    if (t < 32) {
-        const float sinkScore = sink[h] * 1.4426950408889634f;
-        float maximum = sinkScore;
-        for (int row = t; row < count; row += 32)
-            maximum = fmaxf(maximum, prefixWeights[row]);
-        for (int i = t; i < splits; i += 32)
-            maximum = fmaxf(maximum, lse[i]);
-        for (int s = 16; s; s >>= 1)
-            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, s));
-        float denominator = 0.f;
-        for (int row = t; row < count; row += 32) {
-            const float w = exp2f(prefixWeights[row] - maximum);
-            prefixWeights[row] = w;
-            denominator += w;
-        }
-        for (int i = t; i < splits; i += 32) {
-            const float w = lse[i] > -1e29f ? exp2f(lse[i] - maximum) : 0.f;
-            splitWeights[i] = w;
-            denominator += w;
-        }
-        for (int s = 16; s; s >>= 1)
-            denominator += __shfl_xor_sync(0xffffffff, denominator, s);
-        const float inv = 1.f / (denominator + exp2f(sinkScore - maximum));
-        for (int row = t; row < count; row += 32)
-            prefixWeights[row] *= inv;
-        for (int i = t; i < splits; i += 32)
-            splitWeights[i] *= inv;
-    }
-    __syncthreads();
-    float acc[4] = {};
-    for (int row = 0; row < count; ++row) {
-#pragma unroll
-        for (int d = 0; d < 4; ++d)
-            acc[d] = fmaf(prefixWeights[row], float(chunk[size_t(first + row) * 512 + t * 4 + d]), acc[d]);
-    }
-    for (int i = 0; i < splits; ++i) {
-        if (splitWeights[i] == 0.f)
-            continue;
-#pragma unroll
-        for (int d = 0; d < 4; ++d)
-            acc[d] = fmaf(splitWeights[i], float(partial[size_t(i) * 512 + t * 4 + d]), acc[d]);
-    }
-    uint2 result;
-    auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&result);
-    pairs[0] = __floats2bfloat162_rn(acc[0], acc[1]);
-    pairs[1] = __floats2bfloat162_rn(acc[2], acc[3]);
-    *reinterpret_cast<uint2 *>(output + t * 4) = result;
+    const uint2 values = fastllm_v41_verify::MergeValues(q, chunk, partial, lse, sink, scale,
+        heads, scratchHeads, splits, length, requests, rowOffset);
+    const size_t row = size_t(rowOffset + blockIdx.y) * heads + blockIdx.x;
+    reinterpret_cast<uint2 *>(output + row * 512)[threadIdx.x] = values;
 }
 
 template <bool Verify, bool Requests = true, bool Decoded = false>
@@ -256,7 +211,7 @@ bool KernelReady(int heads, bool compressed) {
     int major = 0, minor = 0;
     bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess &&
               cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) == cudaSuccess &&
-              major == 12 && minor >= 0 && minor <= 1;
+              ((major == 10 && minor == 3) || (major == 12 && minor >= 0 && minor <= 1));
     if (ok)
         ok = cudaFuncSetAttribute(AttentionKernel<Verify, Requests, Decoded>(heads, compressed),
             cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Dsv41Bf16Smem)) == cudaSuccess;
@@ -270,7 +225,7 @@ bool KernelReady(int heads, bool compressed) {
 void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     // Independent decode requests and one contiguous causal verification
     // chunk share the packed-cache kernel. Other cache formats retain native math.
-    if (c.batch < 1 || c.heads < 1 || c.heads > 128 || c.window != 128 ||
+    if (c.batch < 1 || (!c.verifying && c.batch > 128) || c.heads < 1 || c.heads > 128 || c.window != 128 ||
         c.ringMode != 1 || c.ringRowBytes != 528 || c.cmpMode != 3 || c.cmpRowBytes != 288 || c.ratio < 0 ||
         c.ratio > 2 || c.topK < 1 || c.topK > 1024 || !std::isfinite(c.softmaxScale) || c.softmaxScale <= 0.f)
         return nullptr;
@@ -296,7 +251,8 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     const size_t midCount = size_t(c.batch) * p->scratchHeads * p->splits;
     const size_t selectedRows = p->gathered ? decodedRows : 0;
     const size_t baseBytes = midCount * (512 * sizeof(bf16) + sizeof(float));
-    const size_t bytes = baseBytes + selectedRows * (1024 + sizeof(int32_t));
+    const size_t bytes = baseBytes + selectedRows * (1024 + sizeof(int32_t)) +
+        (p->gathered && p->verifying ? size_t(c.batch) * sizeof(int32_t) : 0);
     if (cudaMalloc(&p->storage, bytes) != cudaSuccess) {
         cudaGetLastError();
         // Optional decoded KV must not make a formerly supported plan fail.
@@ -314,6 +270,22 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
         int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
         cudaFree(data); cudaSetDevice(old);
     });
+    if (c.verifying && c.heads == 64 && c.ropeDim == 64 && c.batch <= 32) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, p->device);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, p->device);
+        const auto fused = c.ratio ? V41VerifySparseAttention<true> : V41VerifySparseAttention<false>;
+        int resident = 0, sms = 0, coop = 0;
+        if (major == 10 && minor == 3 && cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, p->device) == cudaSuccess && coop &&
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, p->device) == cudaSuccess &&
+            cudaFuncSetAttribute(fused, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 sizeof(Dsv41Bf16Smem)) == cudaSuccess &&
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, fused, 256, sizeof(Dsv41Bf16Smem)) == cudaSuccess &&
+            resident > 0 && cudaMalloc(&p->verifyAngles, size_t(c.batch) * 64 * sizeof(float)) == cudaSuccess) {
+            p->cooperativeBlocks = std::min(c.batch * 64, resident * sms);
+        }
+        if (!p->verifyAngles) cudaGetLastError();
+    }
     p->BindStorage();
     return p.release();
 }
@@ -322,7 +294,7 @@ bool FastllmV41FlashInferShareWorkspace(void *handle, void *source) {
     auto *p = static_cast<Plan *>(handle), *q = static_cast<Plan *>(source);
     if (!p || !q || p->device != q->device || p->batch != q->batch ||
         p->scratchHeads != q->scratchHeads || p->splits != q->splits ||
-        p->width != q->width || p->gathered != q->gathered || !q->owner) return false;
+        p->width != q->width || p->gathered != q->gathered || p->verifying != q->verifying || !q->owner) return false;
     p->owner = q->owner;
     p->storage = p->owner.get();
     p->BindStorage();
@@ -330,11 +302,33 @@ bool FastllmV41FlashInferShareWorkspace(void *handle, void *source) {
 }
 
 void FastllmV41FlashInferDestroy(void *plan) {
-    delete static_cast<Plan *>(plan);
+    auto *p = static_cast<Plan *>(plan);
+    if (p && p->verifyAngles) cudaFree(p->verifyAngles);
+    delete p;
+}
+
+float *FastllmV41FlashInferVerifyAngles(void *handle) {
+    const auto *p = static_cast<const Plan *>(handle);
+    return p ? p->verifyAngles : nullptr;
+}
+
+cudaError_t FastllmV41FlashInferVerifyFused(void *handle, const FastllmV41FullDecodeBuffers &b,
+        const FastllmV41FullDecodeRequest *requests, cudaStream_t stream, bool packedOutput) {
+    const auto *p = static_cast<const Plan *>(handle);
+    const auto fused = p->width ? V41VerifySparseAttention<true> : V41VerifySparseAttention<false>;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(p->cooperativeBlocks); cfg.blockDim = dim3(256);
+    cfg.dynamicSmemBytes = sizeof(Dsv41Bf16Smem); cfg.stream = stream;
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeCooperative; attr.val.cooperative = 1;
+    cfg.attrs = &attr; cfg.numAttrs = 1;
+    return cudaLaunchKernelEx(&cfg, fused, b, requests, p->mid, p->midLse, p->verifyAngles,
+                              p->batch, p->width, p->ratio, p->splits, p->scale, packedOutput);
 }
 
 cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuffers &b,
-                                    const FastllmV41FullDecodeRequest *request, cudaStream_t stream) {
+                                    const FastllmV41FullDecodeRequest *request, cudaStream_t stream,
+                                    FastllmV41FlashInferPartials *history) {
     auto *p = static_cast<Plan *>(handle);
     if (!p || !request || !b.q || !b.kv || !b.output || !b.sink || (p->width && !b.topk))
         return cudaErrorInvalidValue;
@@ -342,14 +336,14 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
         const int n = p->batch * (128 + p->width);
         auto gather = p->verifying ? GatherAttentionKV<true> : GatherAttentionKV<false>;
         gather<<<(n * 64 + 255) / 256, 256, 0, stream>>>(request,
-            static_cast<const int32_t *>(b.topk), p->decoded, p->decodedIndices, p->width, p->batch, p->ratio);
+            static_cast<const int32_t *>(b.topk), p->decoded, p->decodedIndices, p->width, p->batch, p->ratio, p->extraLengths);
         const cudaError_t gathered = cudaGetLastError();
         if (gathered != cudaSuccess) return gathered;
         auto kernel = AttentionKernel<false, false, true>(p->heads, true);
         kernel<<<dim3(p->batch, p->scratchHeads / 16, p->splits), Dsv41Bf16Resources::BLOCK_THREADS, sizeof(Dsv41Bf16Smem), stream>>>(
             static_cast<const bf16 *>(b.q), reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices,
             p->mid, p->midLse, nullptr, reinterpret_cast<const uint8_t *>(p->decoded), p->decodedIndices + 128,
-            nullptr, p->width, 1, 1024, p->batch, p->heads, 128, p->splits, 1, p->scale, 1024,
+            p->extraLengths, p->width, 1, 1024, p->batch, p->heads, 128, p->splits, 1, p->scale, 1024,
             128 + p->width, 128 + p->width, Dsv41Pages{1, false}, nullptr, nullptr, sizeof(void *), nullptr, 0, nullptr, nullptr);
     } else {
         auto kernel = p->verifying ? AttentionKernel<true>(p->heads, p->width != 0)
@@ -364,6 +358,10 @@ cudaError_t FastllmV41FlashInferRun(void *handle, const FastllmV41FullDecodeBuff
     const cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess)
         return status;
+    if (history) {
+        *history = {p->mid, p->midLse, p->scratchHeads, p->splits};
+        return cudaSuccess;
+    }
     // Keep a single-query graph on the ordinary one-token reduction order.
     for (int begin = 0; begin < p->batch;) {
     const int rows = std::min(p->batch - begin, p->gridY);

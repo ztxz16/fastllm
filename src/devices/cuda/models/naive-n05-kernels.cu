@@ -1,4 +1,7 @@
+#include "devices/cuda/low_latency/router.cuh"
+#include "devices/cuda/low_latency/execution.h"
 #include "devices/cuda/fastllm-cuda-norm.cuh"
+#include "devices/cuda/fastllm-mxfp8-activation.cuh"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "utils.h"
@@ -18,6 +21,7 @@
 #include "naive-n05-prefill-hopper.cuh"
 #include "naive-n05-prefill-split.cuh"
 #include "naive-n05-swa-query.cuh"
+#include "naive-n05-swa-mma.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
 #include "naive-n05-qkv.cuh"
 #endif
@@ -25,6 +29,7 @@
 #include "naive-n05-indexer.cuh"
 #endif
 #include <cuda_bf16.h>
+#include <cooperative_groups.h>
 #include <nccl.h>
 #include <cuda_fp8.h>
 #include <cub/block/block_scan.cuh>
@@ -38,6 +43,9 @@
 #include <algorithm>
 #include <cmath>
 #include <type_traits>
+#include "fastllm-bf16-ordered-dot.cuh"
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 // FlashInfer synchronization headers require SM70+. Keep the host pass
@@ -60,11 +68,14 @@
 // MMA bodies and runtime dispatch already guard the SM80-only instructions.
 #define FASTLLM_NAIVE_DSA_MMA
 #include "naive-n05-dsa-mma.cuh"
-#ifdef FASTLLM_NAIVE_BATCH_INDEXER
-#include "naive-n05-indexer-staged.cuh"
+#ifndef USE_ROCM
+#include "naive-n05-dsa-split.cuh"
+#endif
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
 #include "naive-n05-indexer-sm100.cuh"
 #endif
+#ifdef FASTLLM_NAIVE_BATCH_INDEXER
+#include "naive-n05-indexer-staged.cuh"
 #if CUDART_VERSION >= 12040
 #include "naive-n05-indexer-compact.cuh"
 #endif
@@ -110,81 +121,6 @@ __device__ float WarpSum(float x) {
     for (int offset = 16; offset; offset >>= 1)
         x += __shfl_down_sync(0xffffffff, x, offset);
     return x;
-}
-
-// Preserve the 256-thread FP32 GEMV accumulation and ascending reduction
-// tree. Loading all 16 terms before arithmetic hides their memory latency.
-__global__ void RouterSigmoid4096(const BF16 *input, const float *weight,
-                                  float *output) {
-    int t = threadIdx.x, expert = blockIdx.x;
-    __shared__ float sums[8];
-    float values[16], weights[16], partial = 0;
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        values[i] = (float)input[t + i * 256];
-        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
-    }
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) partial += values[i] * weights[i];
-    #pragma unroll
-    for (int stride = 1; stride < 32; stride *= 2)
-        partial += __shfl_down_sync(0xffffffffu, partial, stride);
-    if (t % 32 == 0) sums[t / 32] = partial;
-    __syncthreads();
-    if (t < 32) {
-        partial = t < 8 ? sums[t] : 0;
-        #pragma unroll
-        for (int stride = 1; stride < 8; stride *= 2)
-            partial += __shfl_down_sync(0xffffffffu, partial, stride);
-        if (t == 0) {
-            float logit = partial + 0.0f;
-            // Match standalone FP32 sigmoid's double-precision division.
-            output[expert] = 1.0 / (1.0 + expf(-logit));
-        }
-    }
-}
-
-// Reuse each expert's weights across decode/verify rows with exact GEMV
-// accumulation. Each expert applies sigmoid before the batched TopK launch.
-template <int Rows>
-__global__ void BatchRouterSigmoid4096(const BF16 *input, const float *weight,
-        float *output, int rows, int experts) {
-    const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
-    __shared__ float sums[Rows][8];
-    float weights[16], values[Rows][16], partial[Rows]{};
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        weights[i] = weight[(size_t)expert * 4096 + t + i * 256];
-        #pragma unroll
-        for (int row = 0; row < Rows; ++row)
-            values[row][i] = first + row < rows
-                ? (float)input[(size_t)(first + row) * 4096 + t + i * 256] : 0;
-    }
-    #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        #pragma unroll
-        for (int row = 0; row < Rows; ++row) partial[row] += values[row][i] * weights[i];
-    }
-    #pragma unroll
-    for (int row = 0; row < Rows; ++row) {
-        #pragma unroll
-        for (int stride = 1; stride < 32; stride *= 2)
-            partial[row] += __shfl_down_sync(0xffffffffu, partial[row], stride);
-        if (t % 32 == 0) sums[row][t / 32] = partial[row];
-    }
-    __syncthreads();
-    // Independent warps finish different rows, including the expensive sigmoid.
-    // Keep the reference GEMV's reduction and zero-bias addition exactly.
-    const int row = t / 32, lane = t % 32;
-    if (row < Rows) {
-        float value = lane < 8 ? sums[row][lane] : 0;
-        #pragma unroll
-        for (int stride = 1; stride < 8; stride *= 2)
-            value += __shfl_down_sync(0xffffffffu, value, stride);
-        if (lane == 0 && first + row < rows)
-            output[(size_t)(first + row) * experts + expert] =
-                1.0 / (1.0 + expf(-(value + 0.0f)));
-    }
 }
 
 // Vector loads pair adjacent lanes of the original 256-thread GEMV. Retain
@@ -895,6 +831,8 @@ __device__ void RopeHeadTo(const BF16 *x, Output out, float position,
     }
 }
 
+#include "naive-n05-swa-qkv.cuh"
+
 __device__ void RopeHead(BF16 *x, float position, int rotaryDim, float theta) {
     RopeHeadTo(x, x, position, rotaryDim, theta);
 }
@@ -1142,7 +1080,7 @@ __device__ void AppendRopeCacheRow(RopeCacheRow r, int token, int head,
             RopeHeadTo(src, rotated, positions[token], rotaryDim, theta);
             for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x) rotated[d] = src[d];
             __syncthreads();
-            FastllmNaiveStoreIndexer((float)rotated[threadIdx.x], dst.data);
+            FastllmNaiveStoreIndexer(threadIdx.x < 128 ? (float)rotated[threadIdx.x] : 0.f, dst.data);
         } else {
             RopeHeadTo(src, dst, positions[token], rotaryDim, theta);
             for (int d = rotaryDim + threadIdx.x; d < width; d += blockDim.x) dst[d] = src[d];
@@ -1269,6 +1207,13 @@ __global__ void IndexerKeyNorm(BF16 *input, const float *weight, const float *bi
     for (int i = t; i < 128; i += 64)
         input[i] = __float2bfloat16_rn(((float)input[i] - mean) / deviation * weight[i] + bias[i]);
 }
+
+// The fused descriptor uses grid-constant parameters, which require SM70+.
+#if defined(FASTLLM_NAIVE_DSA_MMA) && !defined(USE_ROCM) && CUDART_VERSION >= 12010 && \
+    (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+#define FASTLLM_NAIVE_DSA_FRONT
+#include "naive-n05-dsa-front.cuh"
+#endif
 
 __device__ void RoundIndexerRow(FastllmNaiveKV input, float *output, int stride,
                                 int offset, bool fp8, int row) {
@@ -2062,10 +2007,19 @@ constexpr int kSwaBatchLimit = 64;
 struct BatchSwaKeys {
     FastllmNaiveSWARow rows[kSwaBatchLimit];
     const int *length;
-    __device__ int Live() const { return length ? length[blockIdx.y] : rows[blockIdx.y].length; }
-    __device__ operator int() const { return min(Live(), kSwaWindow); }
+    __device__ int Live(int row) const { return length ? length[row] : rows[row].length; }
+    __device__ operator int() const { return min(Live(blockIdx.y), kSwaWindow); }
 };
 
+// Ordinary decode has no staged verification slots. Keep the descriptor short
+// and use the live length on device so a replay can switch requests.
+struct PackedSwaKeys {
+    FastllmNaiveSWARow row;
+    const int *length;
+    FastllmMxfp8Activation output;
+    __device__ int Live(int) const { return length ? *length : row.length; }
+    __device__ operator int() const { return min(Live(0), kSwaWindow); }
+};
 // Single-query attention with head dimensions 192/128 and up to 256 keys. Four
 // output slices spread the work across SMs; cooperative V loads avoid the
 // reference kernel's dependent global load for every output/slot pair.
@@ -2078,13 +2032,24 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
     // Handle inactive rows before binding KV or calculating the active-row
     // offsets, so padding does not extend their register lifetimes.
     if (keys <= 0) {
-        const int row = (Verify || std::is_same<Length, BatchSwaKeys>::value) ? blockIdx.y : 0;
+        const int row = (Verify || std::is_same_v<Length, BatchSwaKeys>) ? blockIdx.y : 0;
+        if constexpr (std::is_same_v<Length, PackedSwaKeys>) {
+            if (threadIdx.x < OutputTile) {
+                const BF16 v[] = {__float2bfloat16(0.f)};
+                fastllm_mxfp8::StoreGroup(liveKeys.output, row,
+                    blockIdx.x * kSwaValueDim + blockIdx.z * OutputTile + threadIdx.x, v);
+            }
+        }
         if (threadIdx.x < OutputTile)
             out[((size_t)row * heads + blockIdx.x) * kSwaValueDim +
                 blockIdx.z * OutputTile + threadIdx.x] = __float2bfloat16(0.f);
         return;
     }
-    if constexpr (std::is_same<Length, BatchSwaKeys>::value) {
+    if constexpr (std::is_same_v<Length, PackedSwaKeys>) {
+        const auto &cache = liveKeys.row;
+        k = FastllmNaiveKV(cache.cache ? cache.cache[0] : cache.key, nullptr, 0, cache.fp8);
+        v = FastllmNaiveKV(cache.cache ? cache.cache[1] : cache.value, nullptr, 0, cache.fp8);
+    } else if constexpr (std::is_same_v<Length, BatchSwaKeys>) {
         const int row = blockIdx.y;
         q += (size_t)row * heads * kSwaQkDim;
         out += (size_t)row * heads * kSwaValueDim;
@@ -2110,8 +2075,8 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
         if constexpr (Verify) {
             prefixEnd = *liveKeys.length - 1;
             firstKey = max(0, prefixEnd + (int)blockIdx.y + 1 - kSwaWindow);
-        } else if constexpr (std::is_same<Length, BatchSwaKeys>::value)
-            firstKey = max(0, liveKeys.Live() - kSwaWindow);
+        } else if constexpr (std::is_same_v<Length, BatchSwaKeys> || std::is_same_v<Length, PackedSwaKeys>)
+            firstKey = max(0, liveKeys.Live(blockIdx.y) - kSwaWindow);
         else firstKey = max(0, *liveKeys.length - kSwaWindow);
     }
     __shared__ float scores[MaxKeys], scratch[kSwaThreads], maximum, denominator;
@@ -2120,10 +2085,10 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
     int kvHead = h / (heads / kvHeads), firstDim = blockIdx.z * OutputTile;
     auto cacheRow = [&](int slot) {
         const int row = firstKey + slot;
-        if constexpr (std::is_same<Length, BatchSwaKeys>::value) {
+        if constexpr (std::is_same_v<Length, BatchSwaKeys>) {
             const auto &cache = liveKeys.rows[blockIdx.y];
             if (!cache.ring) return row;
-            const int prefix = liveKeys.Live() - cache.verifyOffset - 1;
+            const int prefix = liveKeys.Live(blockIdx.y) - cache.verifyOffset - 1;
             return cache.verifyOffset >= 0 && row >= prefix
                 ? kSwaWindow + row - prefix : row & (kSwaWindow - 1);
         }
@@ -2192,7 +2157,12 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
     __syncthreads();
     if (t < OutputTile) {
         float result = 0;
-        for (int first = 0; first < keys; first += 8) {
+        if (std::is_same_v<Length, PackedSwaKeys> && keys == MaxKeys) {
+            // Once the ring is full every slot is valid. Keep the original FMA order.
+#pragma unroll 8
+            for (int slot = 0; slot < MaxKeys; ++slot)
+                result = fmaf(scores[slot], float(values[slot][t]), result);
+        } else for (int first = 0; first < keys; first += 8) {
             float p[8], value[8];
             #pragma unroll
             for (int i = 0; i < 8; ++i) {
@@ -2205,8 +2175,22 @@ __global__ void AttentionShortDecode(const BF16 *q, FastllmNaiveKV k, FastllmNai
             for (int i = 0; i < 8; ++i)
                 if (first + i < keys) result += p[i] * value[i];
         }
-        out[(size_t)h * kSwaValueDim + firstDim + t] = __float2bfloat16(result);
+        const BF16 v[] = {__float2bfloat16(result)};
+        out[(size_t)h * kSwaValueDim + firstDim + t] = v[0];
+        if constexpr (std::is_same_v<Length, PackedSwaKeys>)
+            fastllm_mxfp8::StoreGroup(liveKeys.output, blockIdx.y, h * kSwaValueDim + firstDim + t, v);
     }
+}
+
+#include "naive-n05-swa-core.cuh"
+#include "naive-n05-swa-qkv-core.cuh"
+
+bool NaiveSwaCoreEnabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("FASTLLM_NAIVE_SWA_CORE");
+        return !value || std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
 }
 
 // Reuse a KV tile across four complete GQA heads without changing the
@@ -2290,6 +2274,19 @@ template <bool Verify>
 void LaunchShortAttention(const BF16 *q, FastllmNaiveKV k, FastllmNaiveKV v,
         const float *bias, BF16 *out, int rows, int heads, int kvHeads,
         int keyStride, DecodeKeys keys, bool sliding, bool ring = false) {
+    if constexpr (!Verify) {
+        if (NaiveSwaCoreEnabled() && FastllmCudaRuntimeArch() == 103 &&
+            rows == 1 && sliding && ring && keys.window == 128 && keys.length &&
+            ((heads == 8 && kvHeads == 1) || (heads == 16 && kvHeads == 2) ||
+             (heads == 32 && kvHeads == 4)) &&
+            keyStride == kvHeads * 192 && !k.pages && !v.pages &&
+            !k.fp8 && !v.fp8 && !k.fp4 && !v.fp4 && k.base && v.base &&
+            (reinterpret_cast<uintptr_t>(v.base + v.offset) & 15) == 0) {
+            NaiveSwaAttentionBf16<><<<dim3(heads, 1, 4), 1024>>>(
+                q, k.base + k.offset, v.base + v.offset, bias, out, keys.length, heads, kvHeads);
+            return;
+        }
+    }
     int threads = kSwaThreads, tile = kSwaOutputTile;
     auto kernel = sliding ? AttentionShortDecode<kSwaWindow, DecodeKeys, Verify>
                           : AttentionShortDecode<256, DecodeKeys, Verify>;
@@ -2642,9 +2639,23 @@ struct DraftBatchRow {
     float *scores;
     BF16 *output;
     bool shortAttention;
+    const void *const *cacheTable;
 };
+__device__ DraftBatchRow ResolveDraftRow(DraftBatchRow r) {
+    if (r.cacheTable) {
+        r.key = (BF16 *)r.cacheTable[0];
+        r.value = (BF16 *)r.cacheTable[1];
+    }
+    return r;
+}
 constexpr int kDraftBatchLimit = 32;
-struct DraftBatch { DraftBatchRow rows[kDraftBatchLimit]; };
+struct DraftBatch { DraftBatchRow rows[kDraftBatchLimit]; bool liveLengths = false; };
+__device__ __forceinline__ DraftBatchRow DraftAttentionRow(const DraftBatch &batch, int index, int rows, int window) {
+    auto row = ResolveDraftRow(batch.rows[index]);
+    if (batch.liveLengths && row.cacheTable)
+        row.shortAttention = DraftLength{row.live, window, rows} <= 256;
+    return row;
+}
 static_assert(sizeof(DraftBatch) < 3900, "Draft descriptors exceed generic CUDA argument limit");
 // Capture descriptors by value in a small upload node. Unlike a captured H2D
 // copy this never retains a pointer to a temporary host vector. The consuming
@@ -2690,10 +2701,10 @@ struct DeviceDraftBatch {
     const uint64_t *cacheBindings = nullptr;
 };
 __device__ __forceinline__ DraftBatchRow DraftRow(const DraftBatch &batch, int index) {
-    return batch.rows[index];
+    return ResolveDraftRow(batch.rows[index]);
 }
 __device__ __forceinline__ DraftBatchRow DraftRow(const DeviceDraftBatch &batch, int index) {
-    auto row = batch.rows[index];
+    auto row = ResolveDraftRow(batch.rows[index]);
     if (batch.cacheBindings) {
         row.key = (BF16 *)batch.cacheBindings[index * 2];
         row.value = (BF16 *)batch.cacheBindings[index * 2 + 1];
@@ -2740,7 +2751,7 @@ __global__ void BatchDraftQKV(Batch batch, const float *qNorm, const float *kNor
         blockIdx.x, blockIdx.y % rows, 0, 1);
 }
 __global__ void BatchDraftShort(DraftBatch batch, int rows, int heads, int kvHeads, int dim, int window) {
-    const auto &r = batch.rows[blockIdx.y / rows];
+    const auto r = DraftAttentionRow(batch, blockIdx.y / rows, rows, window);
     if (!r.shortAttention) return;
     DraftLength keys{r.live, window, rows}, past{r.live, window, 0};
     AttentionShortBody(r.input, FastllmNaiveKV(r.key), FastllmNaiveKV(r.value), nullptr, nullptr,
@@ -2749,7 +2760,7 @@ __global__ void BatchDraftShort(DraftBatch batch, int rows, int heads, int kvHea
 }
 template <int MaxDim, int KeyTile = 0, bool Hopper = false>
 __global__ void BatchDraftScores(DraftBatch batch, int rows, int heads, int kvHeads, int dim, int window) {
-    const auto &r = batch.rows[blockIdx.y / rows];
+    const auto r = DraftAttentionRow(batch, blockIdx.y / rows, rows, window);
     if (r.shortAttention) return;
     DraftLength keys{r.live, window, rows}, past{r.live, window, 0};
     if constexpr (Hopper)
@@ -2761,13 +2772,13 @@ __global__ void BatchDraftScores(DraftBatch batch, int rows, int heads, int kvHe
             keys, keys, past, window, false, blockIdx.x, blockIdx.y % rows, blockIdx.z, gridDim.z);
 }
 __global__ void BatchDraftSoftmax(DraftBatch batch, int rows, int heads, int window) {
-    const auto &r = batch.rows[blockIdx.y];
+    const auto r = DraftAttentionRow(batch, blockIdx.y, rows, window);
     if (r.shortAttention) return;
     AttentionSoftmaxBody(r.scores, nullptr, heads, DraftLength{r.live, window, rows}, blockIdx.x, 0, 0, 1);
 }
 template <int Columns = 16, int Padding = 8, bool Generic = false, int HeadTile = 1>
 __global__ void BatchDraftValues(DraftBatch batch, int rows, int heads, int kvHeads, int dim, int window) {
-    const auto &r = batch.rows[blockIdx.y / rows];
+    const auto r = DraftAttentionRow(batch, blockIdx.y / rows, rows, window);
     if (r.shortAttention) return;
     DraftLength keys{r.live, window, rows}, past{r.live, window, 0};
     if constexpr (Generic)
@@ -2934,7 +2945,7 @@ bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
                 query, heads, kvHeads, dim, window, eps, theta)) return false;
         descriptors.push_back({(const BF16 *)part.cudaData, (BF16 *)r.key->cudaData,
             (BF16 *)r.value->cudaData, nullptr, (const float *)r.positions->cudaData,
-            (const int *)r.liveKeys->cudaData, nullptr, nullptr, r.shortAttention});
+            (const int *)r.liveKeys->cudaData, nullptr, nullptr, r.shortAttention, r.cacheTable});
     }
     Output(query, BFLOAT16, {1, raw.dims[1], heads * dim});
     for (int i = 0; i < count; ++i) descriptors[i].query = (BF16 *)query.cudaData + (size_t)i * rows * heads * dim;
@@ -2989,7 +3000,7 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         }
         descriptors.push_back({(const BF16 *)query.cudaData + (size_t)i * rows * heads * dim,
             (BF16 *)r.key->cudaData, (BF16 *)r.value->cudaData, nullptr, nullptr,
-            (const int *)r.liveKeys->cudaData, nullptr, nullptr, r.shortAttention});
+            (const int *)r.liveKeys->cudaData, nullptr, nullptr, r.shortAttention, r.cacheTable});
     }
     Output(output, BFLOAT16, query.dims);
 
@@ -3014,12 +3025,20 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
         descriptors[i].output = (BF16 *)output.cudaData + (size_t)i * rows * heads * dim;
         descriptors[i].scores = (float *)scores.cudaData + (size_t)i * rows * heads * capacity;
     }
+    const bool capturing = FastllmCudaGraphIsCapturingFast();
     const bool hopper = FastllmCudaRuntimeArch() == 90;
     for (int first = 0; first < count; first += kDraftBatchLimit) {
         const int n = std::min(kDraftBatchLimit, count - first);
         DraftBatch batch{}; std::copy_n(descriptors.begin() + first, n, batch.rows);
         bool shortRows = false, longRows = false;
-        for (int i = 0; i < n; ++i) (batch.rows[i].shortAttention ? shortRows : longRows) = true;
+        for (int i = 0; i < n; ++i) {
+            if (capturing && batch.rows[i].cacheTable) {
+                // Replays can cross the 256-key boundary with the same geometry.
+                batch.liveLengths = true;
+                shortRows = true;
+                longRows |= capacity > 256;
+            } else (batch.rows[i].shortAttention ? shortRows : longRows) = true;
+        }
         if (shortRows) BatchDraftShort<<<dim3(heads, rows * n), 256>>>(batch, rows, heads, kvHeads, dim, window);
         if (!longRows) continue;
         if (hopper && dim == 128 && window <= 1024 && (heads / kvHeads) % 4 == 0)
@@ -3661,13 +3680,346 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
 #endif
 }
 
-bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
+bool FastllmCudaNaiveDSAFront(const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias,
+        const fastllm::Data &indexWeight, const fastllm::Data &indexNorm,
+        const fastllm::Data &indexBias, fastllm::Data &raw, fastllm::Data &index,
+        fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+        const std::vector<int> &capacities, const fastllm::Data &liveKeys,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool orderedProjection) {
+#ifdef FASTLLM_NAIVE_DSA_FRONT
+    using namespace fastllm;
+    namespace front = naive_dsa_front;
+    // This resource configuration has been measured on SM103. Other images,
+    // larger batches and alternate geometry keep the existing operators.
+    const int count = rows.size(), device = FastllmCudaGetDevice();
+    if (FastllmCudaRuntimeArch() != 103 || count < 1 || count > 8 || (orderedProjection && count > 7) ||
+        capacities.size() != rows.size() || heads != 8 || kvHeads != 1 ||
+        dim != 192 || valueDim != 128 || rotaryDim <= 0 || rotaryDim > 128 ||
+        rotaryDim % 2 || !bias.dims.empty()) return false;
+    auto tensor = [&](const Data &x, DataType type, const std::vector<int> &shape) {
+        if (x.dataType != type || x.dataDevice != DataDevice::CUDA ||
+            x.dataDeviceIds != std::vector<int>{device} || !x.cudaData ||
+            uintptr_t(x.cudaData) % 16 || x.dims != shape || x.strides.size() != shape.size()) return false;
+        size_t stride = 1;
+        for (int i = int(shape.size()) - 1; i >= 0; --i) {
+            if (x.strides[i] != stride) return false;
+            stride *= shape[i];
+        }
+        return true;
+    };
+    for (const Data *x : {&input, &weight, &bias, &indexWeight, &indexNorm, &indexBias,
+            (const Data *)&raw, (const Data *)&index, (const Data *)&q, &k, &v, &positions, &liveKeys, &sink})
+        if (&output == x) return false;
+    if ((output.isFake || output.cudaDataBorrowed) && !tensor(output, BFLOAT16, {1, count, 1024})) return false;
+    if (!tensor(input, BFLOAT16, {1, count, 4096}) ||
+        !tensor(weight, BFLOAT16, {1856, 4096}) ||
+        !tensor(indexWeight, BFLOAT16, {128, 4096}) ||
+        !tensor(indexNorm, FLOAT32, {128}) || !tensor(indexBias, FLOAT32, {128}) ||
+        !tensor(raw, BFLOAT16, {1, count, 1856}) ||
+        !tensor(index, BFLOAT16, {1, count, 128}) ||
+        (!sink.dims.empty() && !tensor(sink, FLOAT32, {8}))) return false;
+    for (const auto &row : rows) {
+        for (const Data *cache : {(const Data *)row.key, (const Data *)row.value, row.indexCache}) {
+            if (!cache) continue;
+            if (cache->isPagedKVCache && (!cache->pagedKVCacheData || cache->pageLen <= 0 ||
+                !cache->pagedKVCacheData->cudaData ||
+                cache->pagedKVCacheData->dataDevice != DataDevice::CUDA ||
+                cache->pagedKVCacheData->dataDeviceIds != std::vector<int>{device})) return false;
+        }
+    }
+    std::vector<RopeCacheRow> descriptors;
+    int indexDim = 0;
+    if (!PrepareBatchRopeCache(q, k, v, positions, rows, liveKeys, heads, kvHeads,
+            dim, valueDim, rotaryDim, theta, valueScale, 0, &raw, false,
+            descriptors, indexDim) || indexDim != 128) return false;
+    front::Args a{};
+    for (int b = 0; b < count; ++b) {
+        const auto &r = descriptors[b];
+        if (r.fp8 || r.fp4 || r.ringVerify || rows[b].cacheOffset >= 0 ||
+            rows[b].verifyOffset >= 0 || capacities[b] < 1 || capacities[b] > 2048 ||
+            capacities[b] > std::min(r.keyRows, r.valueRows) ||
+            r.indexKey != (const BF16 *)index.cudaData + b * 128 ||
+            uintptr_t(r.q) % 16 || uintptr_t(r.key) % 16 || uintptr_t(r.value) % 16 ||
+            (r.cache && uintptr_t(r.cache) % alignof(void *))) return false;
+        a.cache[b] = r;
+        for (int previous = 0; previous < b; ++previous) {
+            const auto &other = descriptors[previous];
+            a.sharedRows = a.sharedRows || (r.cache && r.cache == other.cache) ||
+                r.key == other.key || r.value == other.value;
+        }
+        auto &d = a.attention.rows[b];
+        d.key = r.key; d.value = r.value; d.liveKeys = r.length;
+        d.capacity = capacities[b]; d.length = capacities[b];
+        d.keyStride = 192 + (r.separateIndex ? 0 : r.scaledIndexer ? FastllmNaiveIndexerBytes / 2 : 128);
+        d.cache = r.cache; d.keyPages = r.keyPages; d.valuePages = r.valuePages;
+        d.pageLen = r.pageLen; d.poolTokens = std::min(r.keyRows, r.valueRows);
+    }
+    // Reject overlapping public views before allocating scratch or issuing any
+    // writes. Dynamic tables retain the caller's same disjoint binding contract.
+    struct Range { const void *p; size_t n; };
+    std::vector<Range> writes{{raw.cudaData, raw.GetBytes()}, {index.cudaData, index.GetBytes()},
+        {q.cudaData, q.GetBytes()}, {output.cudaData, output.cudaData ? size_t(count) * 1024 * 2 : 0}};
+    std::vector<Range> reads{{input.cudaData, input.GetBytes()}, {weight.cudaData, weight.GetBytes()},
+        {indexWeight.cudaData, indexWeight.GetBytes()}, {indexNorm.cudaData, indexNorm.GetBytes()},
+        {indexBias.cudaData, indexBias.GetBytes()}, {positions.cudaData, positions.GetBytes()},
+        {liveKeys.cudaData, liveKeys.GetBytes()}, {sink.cudaData, sink.GetBytes()}};
+    auto disjoint = [](Range x, Range y) {
+        if (!x.p || !y.p || !x.n || !y.n) return true;
+        uintptr_t a = uintptr_t(x.p), b = uintptr_t(y.p);
+        return a <= b ? b - a >= x.n : a - b >= y.n;
+    };
+    std::vector<Range> cacheWrites;
+    for (int row = 0; row < count; ++row) {
+        const auto &r = descriptors[row];
+        // Requests may share a physical pool. The cache allocator owns page
+        // exclusivity, including inactive padded rows and later table rebinding.
+        reads.push_back({r.cache, r.cache ? size_t(r.pageLen ? (r.separateIndex ? 5 : 4) : (r.separateIndex ? 3 : 2)) * sizeof(void *) : 0});
+        if (r.pageLen) {
+            size_t bytes = size_t((capacities[row] + r.pageLen - 1) / r.pageLen) * sizeof(int);
+            reads.push_back({r.keyPages, bytes}); reads.push_back({r.valuePages, bytes});
+        }
+        cacheWrites.push_back({r.key, r.pageLen ? rows[row].key->pagedKVCacheData->GetBytes() :
+            size_t(r.keyRows) * a.attention.rows[row].keyStride * 2});
+        cacheWrites.push_back({r.value, r.pageLen ? rows[row].value->pagedKVCacheData->GetBytes() :
+            size_t(r.valueRows) * 128 * 2});
+        if (r.separateIndex) cacheWrites.push_back({r.indexCache, r.pageLen ?
+            rows[row].indexCache->pagedKVCacheData->GetBytes() :
+            size_t(r.keyRows) * (r.scaledIndexer ? FastllmNaiveIndexerBytes : 256)});
+    }
+    for (size_t i = 0; i < writes.size(); ++i) {
+        for (const auto &r : reads) if (!disjoint(writes[i], r)) return false;
+        for (const auto &r : cacheWrites) if (!disjoint(writes[i], r)) return false;
+        for (size_t j = 0; j < i; ++j) if (!disjoint(writes[i], writes[j])) return false;
+    }
+    for (const auto &w : cacheWrites)
+        for (const auto &r : reads) if (!disjoint(w, r)) return false;
+    const int bucket = count <= 1 ? 1 : count <= 2 ? 2 : count <= 4 ? 4 : 8;
+    auto kernel = bucket == 1 ? front::Front<1> : bucket == 2 ? front::Front<2> :
+        bucket == 4 ? front::Front<4> : front::Front<8>;
+    if (orderedProjection) kernel = bucket == 1 ? front::Front<1, true> : bucket == 2 ? front::Front<2, true> :
+        bucket == 4 ? front::Front<4, true> : front::Front<8, true>;
+    const size_t shared = orderedProjection ? sizeof(naive_dsa_split::Storage) : bucket == 1 ? front::SharedBytes<1>() : bucket == 2 ? front::SharedBytes<2>() :
+        bucket == 4 ? front::SharedBytes<4>() : front::SharedBytes<8>();
+    static thread_local std::map<std::pair<int, int>, bool> support;
+    auto found = support.find({device, orderedProjection ? -bucket : bucket});
+    if (found == support.end()) {
+        cudaDeviceProp properties{};
+        int resident = 0;
+        cudaFuncAttributes attributes{};
+        bool ok = cudaFuncGetAttributes(&attributes, kernel) == cudaSuccess && attributes.ptxVersion >= 80 && cudaGetDeviceProperties(&properties, device) == cudaSuccess && properties.cooperativeLaunch &&
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) == cudaSuccess &&
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, front::Threads, shared) == cudaSuccess &&
+            resident * properties.multiProcessorCount >= front::Blocks;
+        if (!ok) cudaGetLastError();
+        found = support.emplace(std::make_pair(device, orderedProjection ? -bucket : bucket), ok).first;
+    }
+    if (!found->second) return false;
+    Output(output, BFLOAT16, {1, count, 1024});
+    Output(scratch.attentionPartial, FLOAT32, {FastllmNaiveDSABatchLimit, 1, naive_dsa_split::Scratch});
+    bool initialize = !scratch.attentionCompletion.cudaData ||
+        scratch.attentionCompletion.Count(0) < FastllmNaiveDSABatchLimit;
+    Output(scratch.attentionCompletion, INT32, {FastllmNaiveDSABatchLimit, 1});
+    if (initialize) AssertInFastLLM(cudaMemsetAsync(scratch.attentionCompletion.cudaData, 0,
+        FastllmNaiveDSABatchLimit * sizeof(unsigned), cudaStreamPerThread) == cudaSuccess,
+        "Cannot initialize fused DSA completion counters.");
+    const bool initReady = !scratch.dsaFrontReady.cudaData;
+    Output(scratch.dsaFrontReady, INT32, {front::Blocks + 8 * 10});
+    if (initReady) AssertInFastLLM(cudaMemsetAsync(scratch.dsaFrontReady.cudaData, 0,
+        scratch.dsaFrontReady.GetBytes(), cudaStreamPerThread) == cudaSuccess,
+        "Cannot initialize fused DSA readiness tags.");
+    a.ready = (unsigned *)scratch.dsaFrontReady.cudaData;
+    a.input = (const BF16 *)input.cudaData; a.weight = (const BF16 *)weight.cudaData;
+    a.indexWeight = (const BF16 *)indexWeight.cudaData;
+    a.normWeight = (const float *)indexNorm.cudaData; a.normBias = (const float *)indexBias.cudaData;
+    a.raw = (BF16 *)raw.cudaData; a.index = (BF16 *)index.cudaData; a.query = (BF16 *)q.cudaData;
+    a.sink = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+    a.output = (BF16 *)output.cudaData; a.partial = (float *)scratch.attentionPartial.cudaData;
+    a.completion = (unsigned *)scratch.attentionCompletion.cudaData;
+    a.rows = count; a.rotary = rotaryDim; a.theta = theta; a.valueScale = valueScale;
+    void *args[] = {&a};
+    AssertInFastLLM(cudaLaunchCooperativeKernel((const void *)kernel, front::Blocks, front::Threads,
+        args, shared, cudaStreamPerThread) == cudaSuccess, "Fused DSA cooperative launch failed.");
+    CheckLaunch();
+    return true;
+#else
+    return false;
+#endif
+}
+
+namespace {
+bool SwaQkvAttentionSupported() {
+    static thread_local std::map<int, bool> supported;
+    const int device = FastllmCudaGetDevice();
+    auto found = supported.find(device);
+    if (found != supported.end()) return found->second;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess || capture != cudaStreamCaptureStatusNone)
+        return false;
+    auto kernel = swa_qkv_core::QkvAttention;
+    cudaDeviceProp prop{}; int resident = 0;
+    const bool ok = BulkKernelSupported(kernel, swa_qkv_rows::InputBytes, 80) &&
+        cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.cooperativeLaunch &&
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, kernel, swa_qkv_core::Threads,
+            swa_qkv_rows::InputBytes) == cudaSuccess && resident * prop.multiProcessorCount >= swa_qkv_core::Blocks;
+    if (!ok) cudaGetLastError();
+    return supported.emplace(device, ok).first->second;
+}
+}
+
+static bool BatchQkvRopeAppendCache(const fastllm::Data &input,
         const fastllm::Data &weight, const fastllm::Data &bias,
         fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
         const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
         const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
         int rotaryDim, float theta, float valueScale, int window, bool ring,
-        fastllm::Data &scratch) {
+        fastllm::Data &scratch, const fastllm::Data *sink, fastllm::Data *attention) {
+    // SWA verification writes private candidate slots; no candidate overwrites
+    // the ring prefix. MMA shares weights across rows, with ordered GEMV fallback.
+    static const bool swaQkvEnabled = [] {
+        const char *v = std::getenv("FASTLLM_NAIVE_SWA_QKV_FUSION");
+        return !v || std::strcmp(v, "1") == 0;
+    }();
+    const int smallCount = rows.size();
+    // Reuse BF16 weights across candidate rows; larger batches retain GEMM.
+    const bool verify = !ring && smallCount >= 1 && smallCount <= 16 &&
+        std::all_of(rows.begin(), rows.end(), [](const auto &r) { return r.verifyOffset >= 0; });
+    // Eight rows retain the faster staged QKV and separate attention kernels.
+    if (attention && (!verify || smallCount < 2 || smallCount > 7 || !sink ||
+        !NaiveSwaCoreEnabled() || liveKeys.dataType != fastllm::INT32 || !liveKeys.cudaData ||
+        liveKeys.dataDevice != input.dataDevice || liveKeys.dataDeviceIds != input.dataDeviceIds ||
+        liveKeys.Count(0) != smallCount)) return false;
+    if (swaQkvEnabled && FastllmCudaRuntimeArch() == 103 &&
+        ((smallCount == 1 && ring) || verify) && heads == 8 && kvHeads == 1 &&
+        dim == 192 && valueDim == 128 && rotaryDim == 64 && window == 128 && bias.dims.empty()) {
+        auto matrix = [&](const fastllm::Data &x, const std::vector<int> &shape) {
+            if (x.dataType != fastllm::BFLOAT16 || x.dataDevice != fastllm::DataDevice::CUDA ||
+                x.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+                !x.cudaData || (reinterpret_cast<uintptr_t>(x.cudaData) & 15) ||
+                x.dims != shape || x.strides.size() != shape.size()) return false;
+            size_t stride = 1;
+            for (int i = int(shape.size()) - 1; i >= 0; --i) {
+                if (x.strides[i] != stride) return false;
+                stride *= shape[i];
+            }
+            return true;
+        };
+        std::vector<RopeCacheRow> descriptors;
+        int indexDim = 0;
+        if (matrix(input, {1, smallCount, 4096}) && matrix(weight, {1856, 4096}) &&
+            PrepareBatchRopeCache(q, k, v, positions, rows, liveKeys, heads, kvHeads,
+                dim, valueDim, rotaryDim, theta, valueScale, window, nullptr, ring,
+                descriptors, indexDim) && indexDim == 0 && std::isfinite(theta) &&
+            theta > 0 && std::isfinite(valueScale)) {
+            if (attention && (!matrix(*attention, {1, smallCount, 1024}) ||
+                (!sink->dims.empty() && (sink->dataType != fastllm::FLOAT32 ||
+                 sink->dims != std::vector<int>{8} || sink->strides != std::vector<uint64_t>{1} ||
+                 sink->dataDevice != input.dataDevice || sink->dataDeviceIds != input.dataDeviceIds ||
+                 !sink->cudaData || uintptr_t(sink->cudaData) % 4)))) return false;
+            struct Range { const void *p; size_t n; };
+            auto disjoint = [](Range a, Range b) {
+                if (!a.p || !b.p || !a.n || !b.n) return true;
+                uintptr_t x = uintptr_t(a.p), y = uintptr_t(b.p);
+                return x <= y ? y - x >= a.n : x - y >= b.n;
+            };
+            std::vector<Range> reads{{input.cudaData, input.GetBytes()}, {weight.cudaData, weight.GetBytes()},
+                {positions.cudaData, positions.GetBytes()}, {liveKeys.cudaData, liveKeys.GetBytes()}};
+            if (attention && !sink->dims.empty()) reads.push_back({sink->cudaData, sink->GetBytes()});
+            std::vector<Range> keys, values;
+            SwaQkvBatch batch{};
+            for (int i = 0; i < smallCount; ++i) {
+                const auto &r = descriptors[i];
+                if (r.fp8 || r.fp4 || r.pageLen || r.separateIndex || rows[i].cacheOffset >= 0 ||
+                    (!verify && rows[i].verifyOffset >= 0) || r.keyRows < 128 || r.valueRows < 128 ||
+                    uintptr_t(r.key) % 16 || uintptr_t(r.value) % 16 ||
+                    (r.cache && uintptr_t(r.cache) % alignof(void *))) return false;
+                keys.push_back({r.key, size_t(r.keyRows) * 192 * 2});
+                values.push_back({r.value, size_t(r.valueRows) * 128 * 2});
+                reads.push_back({r.cache, r.cache ? 2 * sizeof(void *) : 0});
+                batch.rows[i] = {r.key, r.value, r.cache, verify ? r.verifyOffset : -1};
+                // Shared candidates may alias only the identical cache view and
+                // must own distinct write slots. Dynamic rebinding obeys this contract.
+                for (int j = 0; j < i; ++j) {
+                    const bool sharedKey = r.key == descriptors[j].key;
+                    const bool sharedValue = r.value == descriptors[j].value;
+                    if ((!disjoint(keys[i], keys[j]) && !sharedKey) ||
+                        (!disjoint(values[i], values[j]) && !sharedValue) ||
+                        ((sharedKey || sharedValue || (r.cache && r.cache == descriptors[j].cache)) &&
+                         (!verify || r.verifyOffset == descriptors[j].verifyOffset))) return false;
+                }
+            }
+            const Range query{q.cudaData, q.GetBytes()};
+            if (uintptr_t(query.p) % 16) return false;
+            for (auto r : reads) {
+                if (!disjoint(query, r)) return false;
+                for (int i = 0; i < smallCount; ++i)
+                    if (!disjoint(keys[i], r) || !disjoint(values[i], r)) return false;
+            }
+            for (int i = 0; i < smallCount; ++i) {
+                if (!disjoint(query, keys[i]) || !disjoint(query, values[i])) return false;
+                for (int j = 0; j < smallCount; ++j) if (!disjoint(keys[i], values[j])) return false;
+            }
+            if (attention) {
+                const Range target{attention->cudaData, attention->GetBytes()};
+                if (!disjoint(target, query)) return false;
+                for (auto r : reads) if (!disjoint(target, r)) return false;
+                for (int i = 0; i < smallCount; ++i)
+                    if (!disjoint(target, keys[i]) || !disjoint(target, values[i])) return false;
+                if (!SwaQkvAttentionSupported()) return false;
+                BatchSwaKeys bindings{};
+                bindings.length = (const int *)liveKeys.cudaData;
+                for (int i = 0; i < smallCount; ++i) {
+                    const auto &r = descriptors[i];
+                    bindings.rows[i] = {r.key, r.value, r.cache, false, true, 0, r.verifyOffset};
+                }
+                auto *x = (const BF16 *)input.cudaData, *w = (const BF16 *)weight.cudaData;
+                auto *query = (BF16 *)q.cudaData, *out = (BF16 *)attention->cudaData;
+                auto *pos = (const float *)positions.cudaData;
+                auto *live = (const int *)liveKeys.cudaData;
+                const float *bias = sink->dims.empty() ? nullptr : (const float *)sink->cudaData;
+                int count = smallCount;
+                void *args[] = {&x, &w, &query, &out, &batch, &bindings, &pos, &live,
+                                &count, &theta, &valueScale, &bias};
+                fastllm::AssertInFastLLM(cudaLaunchCooperativeKernel((const void *)swa_qkv_core::QkvAttention,
+                    swa_qkv_core::Blocks, swa_qkv_core::Threads, args, swa_qkv_rows::InputBytes,
+                    cudaStreamPerThread) == cudaSuccess, "SWA QKV/attention cooperative launch failed.");
+                CheckLaunch();
+                return true;
+            }
+            const bool staged = verify && smallCount == 8 && BulkKernelSupported(
+                swa_qkv_rows::QkvRope<true>, swa_qkv_rows::StagingBytes, 80);
+            const bool mma = staged || (verify && smallCount >= 2 && BulkKernelSupported(
+                swa_qkv_rows::QkvRope<false>, swa_qkv_rows::InputBytes, 80));
+            // A lower-architecture image or insufficient shared memory must not
+            // silently execute the guarded MMA body. Keep ordered GEMV/GEMM.
+            if (verify && smallCount >= 8 && !mma) return false;
+            if (mma) {
+                auto kernel = staged ? swa_qkv_rows::QkvRope<true> : swa_qkv_rows::QkvRope<false>;
+                const int shared = staged ? swa_qkv_rows::StagingBytes : swa_qkv_rows::InputBytes;
+                kernel<<<dim3(116, (smallCount + 7) / 8), swa_qkv_rows::Threads,
+                    shared, cudaStreamPerThread>>>(
+                    (const BF16 *)input.cudaData, (const BF16 *)weight.cudaData, (BF16 *)q.cudaData,
+                    batch, (const float *)positions.cudaData, (const int *)liveKeys.cudaData,
+                    smallCount, theta, valueScale);
+            } else if (verify)
+                NaiveSwaQkvVerify<<<dim3(1568, smallCount), 32, 0, cudaStreamPerThread>>>(
+                    (const BF16 *)input.cudaData, (const BF16 *)weight.cudaData, (BF16 *)q.cudaData,
+                    batch, (const float *)positions.cudaData, (const int *)liveKeys.cudaData, theta, valueScale);
+            else {
+                const auto &r = descriptors.front();
+                NaiveSwaQkvRope<<<1568, 32, 0, cudaStreamPerThread>>>(
+                    (const BF16 *)input.cudaData, (const BF16 *)weight.cudaData, (BF16 *)q.cudaData,
+                    r.key, r.value, r.cache, (const float *)positions.cudaData,
+                    (const int *)liveKeys.cudaData, theta, valueScale);
+            }
+            CheckLaunch();
+            return true;
+        }
+    }
+    if (attention) return false;
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
     using namespace fastllm;
     const int count = rows.size();
@@ -3723,6 +4075,29 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
 #else
     return false;
 #endif
+}
+
+bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale, int window, bool ring,
+        fastllm::Data &scratch) {
+    return BatchQkvRopeAppendCache(input, weight, bias, q, k, v, positions, rows,
+        liveKeys, heads, kvHeads, dim, valueDim, rotaryDim, theta, valueScale, window, ring, scratch, nullptr, nullptr);
+}
+
+bool FastllmCudaNaiveSwaQkvAttention(const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale, int window,
+        const fastllm::Data &sink, fastllm::Data &attention) {
+    fastllm::Data unused;
+    return BatchQkvRopeAppendCache(input, weight, bias, q, k, v, positions, rows,
+        liveKeys, heads, kvHeads, dim, valueDim, rotaryDim, theta, valueScale, window, false, unused, &sink, &attention);
 }
 
 bool FastllmCudaNaiveIndexerKeyNorm(fastllm::Data &input,
@@ -4693,7 +5068,7 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
         const fastllm::Data &value, const fastllm::Data &indices, const fastllm::Data &sink,
         int heads, int kvHeads, int dim, int valueDim, int pastLength, int window,
         fastllm::Data &output, bool causal, const fastllm::Data *prefillScratch,
-        std::vector<FastllmNaiveStagedSwa> *pending) {
+        std::vector<FastllmNaiveStagedSwa> *pending, FastllmMxfp8PrefillOutput packed) {
     using namespace fastllm;
     int queries = query.dims[1], keys = key.dims[1];
     int count = indices.dims.empty() ? (window ? std::min(window + (causal ? 0 : queries - 1), keys) : keys) : indices.dims[1];
@@ -4719,7 +5094,7 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
             (const BF16 *)key.cudaData, (const BF16 *)value.cudaData,
             sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
             (BF16 *)output.cudaData, queries, keys, heads, kvHeads, key.dims[2],
-            cudaStreamPerThread, FastllmCudaRuntimeArch());
+            cudaStreamPerThread, FastllmCudaRuntimeArch(), packed);
         AssertInFastLLM(status == cudaSuccess,
             std::string("Naive SWA FlashInfer: ") + cudaGetErrorString(status));
         CheckLaunch();
@@ -4796,7 +5171,7 @@ void FastllmCudaNaivePrefillAttention(const fastllm::Data &query, const fastllm:
                         auto status = naive_swa_flashinfer::Run((const BF16 *)query.cudaData,
                             stagedKey, stagedValue, sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
                             (BF16 *)output.cudaData, queries, rows, heads, kvHeads, key.dims[2],
-                            cudaStreamPerThread, arch);
+                            cudaStreamPerThread, arch, packed);
                         AssertInFastLLM(status == cudaSuccess,
                             std::string("Naive staged SWA prefill: ") + cudaGetErrorString(status));
                         CheckLaunch();
@@ -5270,14 +5645,45 @@ bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
         canBorrow ? (char *)arena.cudaData + used : nullptr, canBorrow ? arena.expansionBytes - used : 0);
 }
 
+namespace {
+template<auto Kernel, int Threads, typename... Extra>
+bool TryRouterKernel(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
+                     dim3 grid, Extra... extra) {
+    using namespace fastllm;
+    static thread_local int cachedDevice = -1;
+    static thread_local bool available = false;
+    const int device = input.dataDeviceIds[0];
+    if (cachedDevice != device) {
+        // This read-only image query also works on the first call inside capture.
+        cudaFuncAttributes attributes{};
+        const auto error = cudaFuncGetAttributes(&attributes, Kernel);
+        if (fastllm::cuda::low_latency::BackendUnavailable(error)) {
+            const auto pending = cudaGetLastError();
+            AssertInFastLLM(pending == cudaSuccess || pending == error, "Pending CUDA error during Router admission.");
+            available = false;
+        } else {
+            AssertInFastLLM(error == cudaSuccess, cudaGetErrorString(error));
+            available = attributes.maxThreadsPerBlock >= Threads;
+        }
+        cachedDevice = device;
+    }
+    if (!available) return false;
+    auto dims = input.dims;
+    dims.back() = weight.dims[0];
+    Output(output, FLOAT32, dims);
+    Kernel<<<grid, Threads>>>((const BF16 *)input.cudaData, (const float *)weight.cudaData,
+                              (float *)output.cudaData, extra...);
+    CheckLaunch();
+    return true;
+}
+} // namespace
+
 bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output) {
     using namespace fastllm;
     const int rows = RouterRows(input, weight, output);
     if (!rows || (rows > 1 && rows >= FastllmCudaGetLinearExactBatchThreshold())) return false;
-    auto dims = input.dims;
-    dims.back() = weight.dims[0];
-    Output(output, FLOAT32, dims);
+    using namespace fastllm::cuda::low_latency;
     const int experts = weight.dims[0];
     const int arch = FastllmCudaRuntimeArch();
     const int rowTiles = 1 + (rows - 1) / kRouterTileRows;
@@ -5290,45 +5696,132 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
             int64_t(rowTiles) * (experts / wideExperts) >= 256;
         const int rowTile = tiled ? wideRows : (rows <= 4 ? 1 : 2);
         const int expertTile = tiled ? wideExperts : 1;
-        auto kernel = tiled ? RouterTile4096<wideRows, wideExperts> :
-            (rows <= 4 ? RouterPairs4096<1> : RouterPairs4096<2>);
-        kernel<<<dim3(experts / expertTile, (rows + rowTile - 1) / rowTile), 128>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
+        const dim3 grid(experts / expertTile, (rows + rowTile - 1) / rowTile);
+        if (tiled) {
+            if (TryRouterKernel<RouterTile4096<wideRows, wideExperts>, 128>(input, weight, output, grid, rows, experts)) return true;
+        } else if (rows <= 4) {
+            if (TryRouterKernel<RouterPairs4096<1>, 128>(input, weight, output, grid, rows, experts)) return true;
+        } else if (TryRouterKernel<RouterPairs4096<2>, 128>(input, weight, output, grid, rows, experts)) return true;
     }
-    else if (rows == 1)
-        RouterSigmoid4096<<<experts, 256>>>((const BF16 *)input.cudaData,
-            (const float *)weight.cudaData, (float *)output.cudaData);
-    else if (arch == 120 && experts % kRouterTileExperts == 0 &&
-             int64_t(experts / kRouterTileExperts) * rowTiles >= DeviceSMCount() &&
-             ((uintptr_t)input.cudaData & 7) == 0 && ((uintptr_t)weight.cudaData & 15) == 0)
-        RouterTile<<<dim3(experts / kRouterTileExperts, rowTiles), 256>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData, (float *)output.cudaData, rows, experts);
-    else if (rows >= 3 && arch == 90 &&
-             (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0)
-        BatchRouterSigmoid4096Vector<<<dim3(experts, (rows + 3) / 4), 128>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
-    else if (rows >= 4)
-        BatchRouterSigmoid4096<4><<<dim3(experts, (rows + 3) / 4), 256>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
-    else
-        BatchRouterSigmoid4096<2><<<dim3(experts, (rows + 1) / 2), 256>>>(
-            (const BF16 *)input.cudaData, (const float *)weight.cudaData,
-            (float *)output.cudaData, rows, experts);
-    CheckLaunch();
-    return true;
+    if (rows > 1 && arch == 120 && experts % kRouterTileExperts == 0 &&
+        int64_t(experts / kRouterTileExperts) * rowTiles >= DeviceSMCount() &&
+        ((uintptr_t)input.cudaData & 7) == 0 && ((uintptr_t)weight.cudaData & 15) == 0 &&
+        TryRouterKernel<RouterTile, 256>(input, weight, output,
+            dim3(experts / kRouterTileExperts, rowTiles), rows, experts)) return true;
+    if (rows == 1)
+        return TryRouterKernel<RouterSigmoidSingle<4096>, 256>(input, weight, output, dim3(experts));
+    if (rows >= 3 && arch == 90 &&
+        (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0 &&
+        TryRouterKernel<BatchRouterSigmoid4096Vector, 128>(input, weight, output,
+            dim3(experts, (rows + 3) / 4), rows, experts)) return true;
+    if (rows > 16 && experts == 256 && FastllmCudaRuntimeArch() == 103 &&
+        (uintptr_t)input.cudaData % 16 == 0 && (uintptr_t)weight.cudaData % 16 == 0 &&
+        TryRouterKernel<RouterSigmoidTiled<4, 8, 4096>, 256>(input, weight, output,
+            dim3(64, (rows + 7) / 8), rows, experts)) return true;
+    if (rows >= 4)
+        return TryRouterKernel<RouterSigmoidRows<4,4096>, 256>(input, weight, output,
+            dim3(experts, (rows + 3) / 4), rows, experts);
+    return TryRouterKernel<RouterSigmoidRows<2,4096>, 256>(input, weight, output,
+        dim3(experts, (rows + 1) / 2), rows, experts);
 }
 
 bool FastllmCudaNaiveDecodeGraphSupported() { return DecodeTopKBlocks() > 0; }
 
-void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
-        const fastllm::Data &branch, const fastllm::Data &weight,
-        float eps, fastllm::Data &output) {
+namespace {
+struct SaveNormalized {
+    BF16 *values;
+    __device__ void operator()(int, int col, BF16 value) const { values[col] = value; }
+};
+// Vectorize global transfers, then read the rounded residual from shared
+// memory in the original 256-lane order for an identical FP32 reduction.
+__global__ void AddRMSNormPackedRows(BF16 *hidden, const BF16 *branch, const float *gamma, BF16 *output,
+                                     float eps, FastllmMxfp8Activation packed) {
+    constexpr int width = 4096, threads = 256, parts = width / (threads * 8);
+    const int row = blockIdx.x, tid = threadIdx.x;
+    const size_t base = size_t(row) * width;
+    __shared__ __align__(16) BF16 residual[width];
+    __shared__ float partial[8];
+    uint4 values[parts];
+#pragma unroll
+    for (int j = 0; j < parts; ++j) {
+        const int col = (tid + j * threads) * 8;
+        uint4 a = *reinterpret_cast<const uint4 *>(hidden + base + col);
+        uint4 b = *reinterpret_cast<const uint4 *>(branch + base + col);
+        auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&a);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            pairs[i] = __hadd2(pairs[i], reinterpret_cast<const __nv_bfloat162 *>(&b)[i]);
+        values[j] = a;
+        *reinterpret_cast<uint4 *>(residual + col) = a;
+        *reinterpret_cast<uint4 *>(hidden + base + col) = a;
+    }
+    __syncthreads();
+    float sum = 0.f;
+#pragma unroll
+    for (int col = tid; col < width; col += threads) {
+        float x = __bfloat162float(residual[col]);
+        sum += x * x;
+    }
+    sum = fastllm::cuda::WarpSum(sum);
+    if (tid % 32 == 0) partial[tid / 32] = sum;
+    __syncthreads();
+    sum = fastllm::cuda::WarpSum(tid % 32 < 8 ? partial[tid % 32] : 0.f);
+    const float inv = rsqrtf(sum / width + eps);
+#pragma unroll
+    for (int j = 0; j < parts; ++j) {
+        const int col = (tid + j * threads) * 8;
+        float4 affine[2] = {*reinterpret_cast<const float4 *>(gamma + col),
+                            *reinterpret_cast<const float4 *>(gamma + col + 4)};
+        uint4 value = values[j];
+        auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&value);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float2 x = __bfloat1622float2(pairs[i]);
+            x = __bfloat1622float2(__floats2bfloat162_rn(x.x * inv, x.y * inv));
+            const float2 w = reinterpret_cast<const float2 *>(affine)[i];
+            pairs[i] = __floats2bfloat162_rn(x.x * w.x, x.y * w.y);
+        }
+        *reinterpret_cast<uint4 *>(output + base + col) = value;
+        fastllm_mxfp8::Store8(packed, row, col, value);
+    }
+}
+__global__ void AddRMSNormMxfp8(BF16 *hidden, const BF16 *branch, const float *gamma, BF16 *output,
+                                float eps, FastllmMxfp8Activation packed) {
+    __shared__ __align__(16) BF16 normalized[4096];
+    fastllm::cuda_norm::AddRMSNormBody<BF16, 4096, true, false>(
+        hidden, branch, gamma, output, 4096, eps, false, SaveNormalized{normalized});
+    __syncthreads();
+    // Four lanes share a K32 reduction. Two vector passes cover one whole row.
+#pragma unroll
+    for (int col = threadIdx.x * 8; col < 4096; col += 256 * 8) {
+        const uint4 value = *reinterpret_cast<const uint4 *>(normalized + col);
+        fastllm_mxfp8::Store8(packed, blockIdx.x, col, value);
+    }
+}
+}
+void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden, const fastllm::Data &branch,
+        const fastllm::Data &weight, float eps, fastllm::Data &output) {
+    FastllmCudaNaiveAddDecodeRMSNorm(hidden, branch, weight, eps, output, nullptr);
+}
+
+void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden, const fastllm::Data &branch,
+        const fastllm::Data &weight, float eps, fastllm::Data &output, FastllmMxfp8Activation *packed) {
     Output(output, fastllm::BFLOAT16, hidden.dims);
-    int channels = hidden.dims.back();
+    const int channels = hidden.dims.back();
     const int rows = hidden.Count(0) / channels;
+    if (packed) {
+        if (channels == 4096 && packed->Matches(rows, channels)) {
+            const auto addresses = uintptr_t(hidden.cudaData) | uintptr_t(branch.cudaData) |
+                                   uintptr_t(output.cudaData) | uintptr_t(weight.cudaData);
+            auto kernel = rows >= FastllmNaivePackedNormMinPrefillRows && (addresses & 15) == 0
+                ? AddRMSNormPackedRows : AddRMSNormMxfp8;
+            kernel<<<rows, 256>>>((BF16 *)hidden.cudaData, (const BF16 *)branch.cudaData,
+                (const float *)weight.cudaData, (BF16 *)output.cudaData, eps, *packed);
+            CheckLaunch();
+            return;
+        }
+        *packed = {};
+    }
     if (channels == 4096 && rows >= 128 &&
         ((uintptr_t)hidden.cudaData | (uintptr_t)branch.cudaData | (uintptr_t)output.cudaData) % 4 == 0 &&
         (uintptr_t)weight.cudaData % 8 == 0) {
@@ -5435,13 +5928,22 @@ void FastllmCudaNaivePackIndexer(const fastllm::Data &input, fastllm::Data &outp
 }
 namespace {
 __global__ void PagedWriteFP4(uint8_t *pool, const int *pages, const BF16 *input,
-        int start, int count, int width, int pageLen, const int *liveKeys, int capacity) {
-    if (liveKeys) { start = *liveKeys - count; if (start < 0 || *liveKeys > capacity) return; }
+        int start, int count, int width, int pageLen, const int *liveKeys, int capacity, bool verify) {
+    if (liveKeys && !verify) {
+        const int end = *liveKeys;
+        if (end < count || end > capacity) return;
+        start = end - count;
+    }
     const size_t block = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     const int blocksPerRow = width / 16;
     if (block >= (size_t)count * blocksPerRow) return;
     const int token = block / blocksPerRow, column = (block % blocksPerRow) * 16;
-    const int row = start + token;
+    int row = start + token;
+    if (verify) {
+        const int end = liveKeys[token];
+        if (end <= 0 || end > capacity) return;
+        row = end - 1;
+    }
     const size_t physical = pages ? (size_t)pages[row / pageLen] * pageLen + row % pageLen : row;
     FastllmWriteFP4KVBlock(pool + physical * (blocksPerRow * 9),
         input + (size_t)token * width + column, column, width);
@@ -5470,28 +5972,30 @@ __global__ void WriteFP8Rows(uint2 *cache, const int *pages, const uint4 *input,
                                  FastllmNaiveKVRow::ConvertPair(pairs[2]), FastllmNaiveKVRow::ConvertPair(pairs[3]));
 }
 static void NaivePagedWrite(fastllm::Data &cache, const fastllm::Data &input, int start,
-        const fastllm::Data *liveKeys, void *expanded) {
+        const fastllm::Data *liveKeys, void *expanded, bool verify = false) {
     using namespace fastllm;
     AssertInFastLLM(FastllmNaiveAttentionKVType(cache.dataType) && input.dataType == BFLOAT16 &&
         cache.dataDevice == DataDevice::CUDA && input.dataDevice == DataDevice::CUDA &&
         cache.dims.size() == 3 && input.dims.size() == 3 &&
         cache.kvCacheFp8Indexer == input.kvCacheFp8Indexer &&
         cache.dims[2] == input.dims[2] + (cache.kvCacheFp8Indexer
-            ? FastllmNaiveIndexerBytes / cache.unitSize - FastllmNaiveIndexerBytes / 2 : 0) && start >= 0 &&
-        start + input.dims[1] <= (cache.isPagedKVCache && !cache.isFake
-            ? (int)cache.pageIndex.size() * cache.pageLen
-            : (cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1])),
+            ? FastllmNaiveIndexerBytes / cache.unitSize - FastllmNaiveIndexerBytes / 2 : 0) && start >= 0,
         "Invalid Naive KV append.");
+    const int capacity = cache.isPagedKVCache && !cache.isFake ? (int)cache.pageIndex.size() * cache.pageLen
+        : (cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1]);
+    AssertInFastLLM(start <= capacity && input.dims[1] <= capacity - start, "Naive KV append exceeds capacity.");
     if (cache.dataType == FP4_E2M1) {
         AssertInFastLLM(!cache.kvCacheFp8Indexer && !input.kvCacheFp8Indexer && cache.dims[2] % 16 == 0,
                         "FP4 DSA KV stores block16-aligned K/V with a separate Indexer cache.");
+        // Serving graphs bind new pages on replay within the reserved capacity.
+        const int liveCapacity = cache.expansionDims.empty() ? capacity : cache.expansionDims[1];
         const size_t blocks = (size_t)input.dims[1] * (input.dims[2] / 16);
         if (blocks) PagedWriteFP4<<<(blocks + 127) / 128, 128>>>(
             (uint8_t *)(cache.isPagedKVCache ? cache.pagedKVCacheData->cudaData : cache.cudaData),
             cache.isPagedKVCache ? (const int *)cache.cudaData : nullptr,
             (const BF16 *)input.cudaData, start, input.dims[1], input.dims[2], cache.pageLen,
             liveKeys ? (const int *)liveKeys->cudaData : nullptr,
-            cache.expansionDims.empty() ? cache.dims[1] : cache.expansionDims[1]);
+            liveCapacity, verify);
         CheckLaunch();
         return;
     }
@@ -5843,7 +6347,8 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
         nativeScores = nativeScores && row.capacity <= naive_topk::kMaxKeys && row.key->dataType == cacheType &&
             row.key->kvCacheFp8Indexer == rows.front().key->kvCacheFp8Indexer &&
             row.key->dims[2] % (cacheType == FP8_E4M3 ? 16 : 8) == 0 &&
-            (uintptr_t)FastllmNaiveKV(*row.key).base % 16 == 0;
+            (uintptr_t)FastllmNaiveKV(*row.key).base % 16 == 0 &&
+            (!blackwell || !row.key->kvCacheFp8Indexer || row.key->isPagedKVCache);
     }
 
     auto prepareRow = [&](int index) {
@@ -6475,18 +6980,9 @@ bool PrefetchDSAAttention(const fastllm::Data &query, const float *bias,
         fastllm::Data &output) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = pipeline_bulk;
-    // Each CTA must remain within one KV group. The same pipeline works for
-    // any number of groups, including unsharded DP attention heads.
-    if (FastllmCudaRuntimeArch() != 90 || kvHeads <= 0 || heads % kvHeads ||
-        heads / kvHeads < 16 || (heads / kvHeads) % 16 || rows.size() < 32)
-        return false;
-    for (const auto &row : rows)
-        if (!row.fp8 || !row.indices || row.selectedCount != 2048 || row.keyStride % 16 ||
-            (uintptr_t)row.key % 16 || (uintptr_t)row.value % 16)
-            return false;
-    // Share KV loads across two eight-warp groups without changing per-head
-    // accumulation. Keep small batches and unsupported resources on the old path.
-    if (rows.size() >= 64) {
+    // Each 16-head CTA stays inside one KV group. Count independent groups
+    // across rows and KV heads to decide when sharing their loads pays off.
+    if ((heads / kvHeads) % 16 == 0 && rows.size() * kvHeads >= 64) {
         auto sharedHeads = bulk::Decode<2048, false, true, true, true, true, true,
             bulk::MaxBatchLimit, true>;
         constexpr size_t shared = sizeof(bulk::Storage<2048, true, 16>);
@@ -6578,7 +7074,8 @@ bool CompactAttentionSupported(const std::vector<FastllmNaiveDSARow> &rows) {
 #endif
 
 bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
-        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output) {
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, fastllm::Data &output,
+        FastllmMxfp8Activation target, FastllmMxfp8Activation *produced) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
     namespace swa = naive_prefill_mma;
     if (rows.empty() || rows.front().verifyOffset < 0) return false;
@@ -6586,12 +7083,13 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
     auto kernel = fp8 ? swa::SwaVerifyQueries<4, true> : swa::SwaVerifyQueries<4, false>;
     size_t shared = std::max(sizeof(swa::SwaQueryStorage<4>),
         fp8 ? sizeof(naive_attention_bulk::Storage<128, true>) : sizeof(naive_attention_bulk::Storage<128>));
-    bool supported = false;
+    bool supported = false, pack = false;
 #if CUDART_VERSION >= 12080
     if (fp8) {
         const int arch = FastllmCudaRuntimeArch();
         if (arch == 100 || arch == 103) {
-            auto specialized = swa::SwaVerifyQueries<4, true, true>;
+            pack = target.Matches(rows.size(), heads * 128);
+            auto specialized = pack ? swa::SwaVerifyQueries<4, true, true, true> : swa::SwaVerifyQueries<4, true, true>;
             const size_t bytes = std::max(sizeof(swa::SwaFP8VerifyStorage),
                                           sizeof(naive_attention_bulk::Storage<128, true>));
             if (BulkKernelSupported(specialized, bytes, 100)) {
@@ -6629,8 +7127,9 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
         swa::SwaVerifyBatch descriptors{};
         std::copy_n(groups.begin() + first, count, descriptors.groups);
         kernel<<<dim3(count, heads / 8), 256, shared>>>(
-            (const BF16 *)query.cudaData, descriptors, bias, (BF16 *)output.cudaData, heads, kvHeads);
+            (const BF16 *)query.cudaData, descriptors, bias, (BF16 *)output.cudaData, heads, kvHeads, target);
     }
+    if (pack && supported) *produced = target;
     return true;
 #else
     return false;
@@ -6639,24 +7138,27 @@ bool VerifySwaQueryReuse(const fastllm::Data &query, const float *bias,
 
 // FP4 uses the same BF16 MMA and global softmax as the FP8 fused path.
 // Dequantize only the current shared-memory tile; retain FP4 in the KV pool.
-template<bool Share16Heads>
+template<int KVHeads>
 bool PrefetchFP4DSAAttention(const fastllm::Data &query, const float *bias,
-        const std::vector<FastllmNaiveDSARow> &rows, fastllm::Data &output) {
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, fastllm::Data &output) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     namespace bulk = pipeline_bulk;
-    constexpr int Heads = Share16Heads ? 16 : 8, Threads = Share16Heads ? 512 : 256;
     constexpr int Limit = bulk::FP4BatchLimit;
-    constexpr size_t shared = sizeof(bulk::Storage<2048, true, Heads, true>);
-    auto kernel = bulk::Decode<2048, false, false, true, true, true, true,
-        Limit, Share16Heads, true>;
-    if (!BulkKernelSupported(kernel, shared, 90)) return false;
+    constexpr size_t shared16 = sizeof(bulk::Storage<2048, true, 16, true>);
+    constexpr size_t shared8 = sizeof(bulk::Storage<2048, true, 8, true>);
+    auto kernel16 = bulk::Decode<2048, false, false, true, true, true, true, Limit, true, KVHeads>;
+    auto kernel8 = bulk::Decode<2048, false, false, true, true, true, true, Limit, false, KVHeads>;
+    const bool share16 = heads / KVHeads == 16 && BulkKernelSupported(kernel16, shared16, 90);
+    if (!share16 && !BulkKernelSupported(kernel8, shared8, 90)) return false;
+    auto kernel = share16 ? kernel16 : kernel8;
+    const int blockHeads = share16 ? 16 : 8;
     for (int first = 0; first < (int)rows.size(); first += Limit) {
         const int count = std::min(Limit, (int)rows.size() - first);
         bulk::BatchT<Limit, bulk::FP4Row> descriptors{};
         std::copy_n(rows.begin() + first, count, descriptors.rows);
-        kernel<<<dim3(16 / Heads, count), Threads, shared>>>(
-            (const BF16 *)query.cudaData + (size_t)first * 16 * 192, descriptors, bias,
-            (BF16 *)output.cudaData + (size_t)first * 16 * 128, 16, 1);
+        kernel<<<dim3(heads / blockHeads, count), blockHeads * 32, share16 ? shared16 : shared8>>>(
+            (const BF16 *)query.cudaData + (size_t)first * heads * 192, descriptors, bias,
+            (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, KVHeads);
     }
     return true;
 #else
@@ -6668,14 +7170,9 @@ bool PrefetchFP4DSAAttention(const fastllm::Data &query, const float *bias,
 // complete GQA groups. Other layouts retain the existing attention paths.
 bool SmallDSAAttention(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads,
-        int dim, int valueDim, FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
     namespace small = naive_attention_small;
     using namespace fastllm;
-    if (rows.empty() || rows.size() >= 32 || dim != 192 || valueDim != 128 ||
-        heads < 16 || (heads / kvHeads) % 16 != 0) return false;
-    for (const auto &row : rows)
-        if (!row.indices || row.selectedCount != 2048 || row.fp4 || row.keyStride % 8 ||
-            (uintptr_t)row.key % 16 || (uintptr_t)row.value % 16) return false;
     if (!BulkKernelSupported(small::Scores<16>, sizeof(small::SparseScoreStorage<16>), 90) ||
         !BulkKernelSupported(small::Values, sizeof(small::ValueStorage), 90)) return false;
     const int count = rows.size();
@@ -6817,6 +7314,51 @@ bool HopperBulkAttention(const fastllm::Data &query, const float *bias,
 #endif
 }
 #endif
+#if defined(FASTLLM_NAIVE_DSA_MMA) && !defined(USE_ROCM)
+bool SplitDSAAttention(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads,
+        int dim, int valueDim, FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    using namespace fastllm;
+    // Keep established large-batch and quantized-KV paths above/below. The
+    // split kernel uses the same native descriptors, including device-side
+    // request rebinding, and admits every row before writing any output.
+    bool split = dim == naive_dsa_split::Dim && valueDim == naive_dsa_split::Values &&
+        (heads / kvHeads) % naive_dsa_split::Heads == 0 &&
+        heads / naive_dsa_split::Heads <= 65535 && (uintptr_t)query.cudaData % 16 == 0;
+    for (const auto &row : rows)
+        split = split && !row.fp8 && !row.fp4 && row.keyStride % 8 == 0 &&
+            (uintptr_t)row.key % 16 == 0 && (uintptr_t)row.value % 16 == 0 &&
+            (!(row.keyPages || row.valuePages) || row.pageLen > 0);
+    if (split && BulkKernelSupported(naive_dsa_split::Attention, sizeof(naive_dsa_split::Storage), 80)) {
+        constexpr int limit = FastllmNaiveDSABatchLimit;
+        const int groups = heads / naive_dsa_split::Heads;
+        Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
+        Output(scratch.attentionPartial, FLOAT32, {limit, groups, naive_dsa_split::Scratch});
+        const bool initialize = !scratch.attentionCompletion.cudaData ||
+            scratch.attentionCompletion.Count(0) < limit * groups;
+        Output(scratch.attentionCompletion, INT32, {limit, groups});
+        if (initialize)
+            AssertInFastLLM(cudaMemsetAsync(scratch.attentionCompletion.cudaData, 0,
+                (size_t)limit * groups * sizeof(unsigned), cudaStreamPerThread) == cudaSuccess,
+                "Cannot initialize split attention completion counters.");
+        const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
+        for (int first = 0; first < (int)rows.size(); first += limit) {
+            const int n = std::min(limit, (int)rows.size() - first);
+            FastllmNaiveDSABatch descriptors{};
+            std::copy_n(rows.begin() + first, n, descriptors.rows);
+            naive_dsa_split::Attention<<<dim3(naive_dsa_split::Splits, n, groups), naive_dsa_split::Threads,
+                sizeof(naive_dsa_split::Storage)>>>(
+                (const BF16 *)query.cudaData + (size_t)first * heads * dim, descriptors, bias,
+                (BF16 *)output.cudaData + (size_t)first * heads * valueDim,
+                (float *)scratch.attentionPartial.cudaData,
+                (unsigned *)scratch.attentionCompletion.cudaData, heads, kvHeads);
+        }
+        return true;
+    }
+    return false;
+}
+#endif
+
 } // namespace
 
 bool FastllmCudaNaiveDSAMapsSupported() {
@@ -6841,6 +7383,13 @@ bool FastllmCudaNaiveEncodeDSAMaps(void *host, const void *key, const void *valu
 bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
         FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    return FastllmCudaNaiveOnlineDSADecode(query, sink, rows, heads, kvHeads, dim, valueDim, scratch, output, nullptr);
+}
+bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, FastllmMxfp8Activation *packed) {
+    const auto target = packed ? *packed : FastllmMxfp8Activation{};
+    if (packed) *packed = {};
 #ifdef FASTLLM_NAIVE_BLACKWELL_DECODE
     using namespace fastllm;
     namespace bw = blackwell_decode;
@@ -6857,11 +7406,12 @@ bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::
     const auto *bias = sink.dims.empty() ? nullptr : static_cast<const float *>(sink.cudaData);
     const int total = static_cast<int>(rows.size());
     const bool split = total < 32;
-    auto kernel = split ? bw::Decode<true> : bw::Decode<false>;
+    const bool pack = target.Matches(total, heads * valueDim);
+    auto kernel = split ? bw::Decode<true> : pack ? bw::Decode<false, 1, true> : bw::Decode<false>;
     int groupsPerBlock = 1, sharedBytes = bw::Layout<1>::Bytes;
 #ifdef FASTLLM_ENABLE_BLACKWELL_DSA
     if (total >= 64 && kvHeads % 2 == 0) {
-        auto paired = bw::PairedDecodeKernel();
+        auto paired = bw::PairedDecodeKernel(pack);
         if (BulkKernelSupported(paired, bw::Layout<2>::Bytes, 100)) {
             kernel = paired;
             groupsPerBlock = 2;
@@ -6888,21 +7438,27 @@ bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::
         auto *out = static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128;
         kernel<<<dim3(count, kvHeads / groupsPerBlock, splits), (bw::NCW * groupsPerBlock + bw::NP) * 32, sharedBytes>>>(
             static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, bias,
-            out, heads, parts, stats);
+            out, heads, parts, stats, target, first);
         // All split rows fit a single descriptor batch.
-        if (split) bw::Merge<<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, splits);
+        if (split) {
+            if (pack)
+                bw::Merge<true><<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, splits, target);
+            else
+                bw::Merge<false><<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, splits, {});
+        }
     }
     CheckLaunch();
+    if (pack) *packed = target;
     return true;
 #else
     return false;
 #endif
 }
 
-void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
+static void RunBatchDSADecode(const fastllm::Data &query,
         const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
         int heads, int kvHeads, int dim, int valueDim,
-        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool allowSplitReduction) {
     using namespace fastllm;
     namespace dsa = naive_dsa_decode;
     AssertInFastLLM(!rows.empty() && heads > 0 && kvHeads > 0 && heads % kvHeads == 0 &&
@@ -6910,31 +7466,43 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
         query.dataType == BFLOAT16, "Unsupported batched DSA decode shape.");
     int count = 0;
     bool sparse = heads >= 4, dense = true;
-    bool hopper = FastllmCudaRuntimeArch() == 90 && dim == 192 && valueDim == 128;
+    const int groupHeads = heads / kvHeads;
+    const bool fusedShape = dim == 192 && valueDim == 128;
+    bool hopper = fusedShape && FastllmCudaRuntimeArch() == 90;
+    bool bulkLayout = fusedShape && groupHeads % 8 == 0;
+    bool hopperFP8 = hopper && (groupHeads == 8 || groupHeads % 16 == 0);
+    bool groupedFP4 = hopper && rows.size() >= 32 && heads == 16 && kvHeads == 1;
+    bool fusedFP4 = hopper && rows.size() >= 32 &&
+        ((kvHeads == 1 && (heads == 8 || heads == 16)) ||
+         (kvHeads == 2 && heads == 32) || (kvHeads == 4 && heads == 64));
     for (const auto &row : rows) {
         AssertInFastLLM(row.key && row.value && row.capacity >= 0 &&
             row.keyStride >= kvHeads * dim && row.selectedCount >= 0,
             "Invalid batched DSA cache.");
         count = std::max(count, row.indices ? row.selectedCount : row.capacity);
-        sparse = sparse && row.indices && row.selectedCount == 2048;
+        const bool topK = row.indices && row.selectedCount == 2048;
+        const bool valueAligned = uintptr_t(row.value) % 16 == 0;
+        const bool aligned = valueAligned && uintptr_t(row.key) % 16 == 0;
+        sparse = sparse && topK;
         dense = dense && !row.indices;
-        hopper = hopper && (uintptr_t)row.value % 16 == 0;
+        hopper = hopper && valueAligned;
+        bulkLayout = bulkLayout && aligned && !row.fp4 && row.keyStride % 8 == 0;
+        hopperFP8 = hopperFP8 && row.fp8 && row.keyStride % 16 == 0 && (!row.indices || topK);
+        groupedFP4 = groupedFP4 && valueAligned && topK && row.fp4 && row.keyStride % 16 == 0;
+        fusedFP4 = fusedFP4 && aligned && row.fp4 && !row.fp8 && row.keyStride == kvHeads * dim &&
+            (!row.indices || topK);
     }
     AssertInFastLLM(count <= 2048, "Batched DSA supports at most 2048 selected keys.");
-    if (SmallDSAAttention(query, sink, rows, heads, kvHeads, dim, valueDim, scratch, output)) {
-        CheckLaunch(); return;
-    }
-    // Keep the established small-batch kernels. Eight heads share KV only
-    // when the complete GQA group and cache vectors satisfy the MMA layout.
-    bool bulk = rows.size() >= 32 && dim == 192 && valueDim == 128 &&
-        (heads / kvHeads) % 8 == 0 && count > 0;
-    for (const auto &row : rows)
-        bulk = bulk && !row.fp4 && row.keyStride % 8 == 0 && (uintptr_t)row.key % 16 == 0 &&
-            (uintptr_t)row.value % 16 == 0;
-    if (bulk) {
+    // A narrow batch can fill the fused kernel across query heads. Below
+    // this crossover the split kernels have more parallelism over keys.
+    const bool smallFP8 = hopperFP8 && groupHeads <= 16 && rows.size() * heads >= 128;
+    if (bulkLayout && count > 0 && (rows.size() >= 32 || smallFP8)) {
         Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        bool launched = sparse &&
+        // Mixed batches gather each row's own dense range or TopK list. For
+        // large all-sparse groups of eight, the compact bulk kernel wins.
+        const bool prefetch = hopperFP8 && !dense && !(sparse && groupHeads == 8 && rows.size() > 128);
+        bool launched = prefetch &&
             PrefetchDSAAttention(query, bias, rows, heads, kvHeads, output);
 #if CUDART_VERSION >= 12010
         if (!launched && dense && kvHeads == 1)
@@ -6949,18 +7517,25 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
                                      : BulkAttention<2048, false>(query, bias, rows, heads, kvHeads, output);
         if (launched) { CheckLaunch(); return; }
     }
-    bool groupedFP4 = hopper && sparse && heads == 16 && kvHeads == 1 && rows.size() >= 32;
-    bool fusedFP4 = groupedFP4;
-    for (const auto &row : rows) {
-        groupedFP4 = groupedFP4 && row.fp4 && row.keyStride % 16 == 0;
-        fusedFP4 = fusedFP4 && row.fp4 && !row.fp8 && row.keyStride == 192 &&
-            (uintptr_t)row.key % 16 == 0 && (uintptr_t)row.value % 16 == 0;
+#if defined(FASTLLM_NAIVE_DSA_MMA) && !defined(USE_ROCM)
+    if (allowSplitReduction && SplitDSAAttention(query, sink, rows, heads, kvHeads, dim, valueDim, scratch, output)) {
+        CheckLaunch(); return;
+    }
+#endif
+    if (bulkLayout && sparse && rows.size() < 32 && groupHeads % 16 == 0 &&
+        SmallDSAAttention(query, sink, rows, heads, kvHeads, scratch, output)) {
+        CheckLaunch(); return;
     }
     if (fusedFP4) {
         Output(output, BFLOAT16, {1, (int)rows.size(), heads * valueDim});
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        if (PrefetchFP4DSAAttention<true>(query, bias, rows, output) ||
-            PrefetchFP4DSAAttention<false>(query, bias, rows, output)) {
+        bool launched;
+        switch (kvHeads) {
+            case 1: launched = PrefetchFP4DSAAttention<1>(query, bias, rows, heads, output); break;
+            case 2: launched = PrefetchFP4DSAAttention<2>(query, bias, rows, heads, output); break;
+            default: launched = PrefetchFP4DSAAttention<4>(query, bias, rows, heads, output); break;
+        }
+        if (launched) {
             CheckLaunch();
             return;
         }
@@ -7137,6 +7712,13 @@ void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     CheckLaunch();
 }
 
+void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
+        const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
+        int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
+    RunBatchDSADecode(query, sink, rows, heads, kvHeads, dim, valueDim, scratch, output, true);
+}
+
 void FastllmCudaNaiveVerifyLengths(const fastllm::Data &positions, fastllm::Data &lengths) {
     fastllm::AssertInFastLLM(positions.dataType == fastllm::FLOAT32 &&
         positions.dataDevice == fastllm::DataDevice::CUDA, "Invalid verification positions.");
@@ -7151,6 +7733,14 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
         const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
         const fastllm::Data &liveKeys, int heads, int kvHeads,
         fastllm::Data &output) {
+    FastllmCudaNaiveBatchSWADecode(query, sink, rows, liveKeys, heads, kvHeads, output, nullptr);
+}
+void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
+        const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
+        const fastllm::Data &liveKeys, int heads, int kvHeads,
+        fastllm::Data &output, FastllmMxfp8Activation *packed) {
+    const FastllmMxfp8Activation target = packed ? *packed : FastllmMxfp8Activation{};
+    if (packed) *packed = {};
     using namespace fastllm;
     AssertInFastLLM(!rows.empty() && heads > 0 && kvHeads > 0 && heads % kvHeads == 0 &&
         query.dataType == BFLOAT16 && query.dims == std::vector<int>({1, (int)rows.size(), heads * kSwaQkDim}) &&
@@ -7159,6 +7749,44 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     Output(output, BFLOAT16, {1, (int)rows.size(), heads * kSwaValueDim});
     const bool ringRows = std::all_of(rows.begin(), rows.end(),
         [](const FastllmNaiveSWARow &r) { return r.ring; });
+    // Reuse the BF16 ring core for causal candidate rows. Descriptor
+    // chunks carry per-row request bindings instead of assuming adjacent
+    // request tables; inactive padded rows return before touching KV.
+    // Small verification workloads avoid the larger query-reuse pipeline.
+    // Keep that pipeline for wider heads/batches, where its parallelism wins.
+    if (NaiveSwaCoreEnabled() && FastllmCudaRuntimeArch() == 103 && ringRows &&
+        rows.size() < 32 &&
+        ((heads == 8 && kvHeads == 1) || (heads == 16 && kvHeads == 2) ||
+         (heads == 32 && kvHeads == 4)) &&
+        std::any_of(rows.begin(), rows.end(), [](const auto &r) { return r.verifyOffset >= 0; })) {
+        bool supported = true;
+        for (const auto &r : rows)
+            supported = supported && !r.fp8 && r.verifyOffset < 8 && r.key && r.value &&
+                ((reinterpret_cast<uintptr_t>(r.key) | reinterpret_cast<uintptr_t>(r.value)) & 15) == 0;
+        if (supported) {
+            for (int first = 0; first < (int)rows.size(); first += kSwaBatchLimit) {
+                const int count = std::min(kSwaBatchLimit, (int)rows.size() - first);
+                BatchSwaKeys bindings{};
+                std::copy_n(rows.begin() + first, count, bindings.rows);
+                bindings.length = liveKeys.dims.empty() ? nullptr : (const int *)liveKeys.cudaData + first;
+                // Select by query/head work, independent of request or draft
+                // count. Wider tiles reuse QK/softmax; Tensor Core PV uses the
+                // same BF16 inputs with a different FP32 accumulation order.
+                const int work = heads * count;
+                const int tile = work <= 72 ? 64 : 128;
+                const int threads = work <= 288 ? 1024 : 512;
+                auto kernel = tile == 64 ? NaiveSwaAttentionBf16<1024, 64, true, BatchSwaKeys, true>
+                    : threads == 1024 ? NaiveSwaAttentionBf16<1024, 128, true, BatchSwaKeys, true>
+                    : NaiveSwaAttentionBf16<512, 128, true, BatchSwaKeys, true>;
+                kernel<<<dim3(heads, count, 128 / tile), threads>>>(
+                    (const BF16 *)query.cudaData + (size_t)first * heads * kSwaQkDim, nullptr, nullptr,
+                    sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                    (BF16 *)output.cudaData + (size_t)first * heads * kSwaValueDim,
+                    nullptr, heads, kvHeads, bindings);
+            }
+            CheckLaunch(); return;
+        }
+    }
     if (ringRows && rows.size() >= 32 && (heads / kvHeads) % 8 == 0) {
         std::vector<FastllmNaiveDSARow> descriptors(rows.size());
         bool aligned = true;
@@ -7171,8 +7799,37 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
             aligned = aligned && r.key && r.value && (uintptr_t)r.key % 16 == 0 && (uintptr_t)r.value % 16 == 0;
         }
         const auto *bias = sink.dims.empty() ? nullptr : (const float *)sink.cudaData;
-        if (aligned && (VerifySwaQueryReuse(query, bias, descriptors, heads, kvHeads, output) ||
-                        BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output))) {
+        // Small BF16 query grids are latency limited: grouping four rows
+        // strands most SMs. Independent query CTAs retain the same BF16 MMA
+        // boundaries and allow more requests/heads to execute concurrently.
+        const bool independent = FastllmCudaRuntimeArch() == 103 && !rows.front().fp8 &&
+            rows.size() * size_t(heads / 8) <= 256;
+        if (aligned && ((independent && BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output)) ||
+                        VerifySwaQueryReuse(query, bias, descriptors, heads, kvHeads, output, target, packed) ||
+                        (!independent && BulkAttention<128, true>(query, bias, descriptors, heads, kvHeads, output)))) {
+            CheckLaunch(); return;
+        }
+    }
+    // Preserve the tuned ring kernel when startup serving uses a batch binding
+    // table, including batch one. Cache pointers are read by the GPU, so request
+    // replacement/compaction does not require recapturing this graph.
+    if (NaiveSwaCoreEnabled() && FastllmCudaRuntimeArch() == 103 && ringRows &&
+        !liveKeys.dims.empty() && rows.front().cache &&
+        ((heads == 8 && kvHeads == 1) || (heads == 16 && kvHeads == 2) ||
+         (heads == 32 && kvHeads == 4))) {
+        bool supported = true;
+        const auto *table = rows.front().cache;
+        for (size_t row = 0; row < rows.size(); ++row) {
+            const auto &r = rows[row];
+            supported = supported && !r.fp8 && r.verifyOffset < 0 &&
+                r.cache == table + row * 4 && r.key && r.value &&
+                ((reinterpret_cast<uintptr_t>(r.key) | reinterpret_cast<uintptr_t>(r.value)) & 15) == 0;
+        }
+        if (supported) {
+            NaiveSwaAttentionBf16<1024, 32, true><<<dim3(heads, rows.size(), 4), 1024>>>(
+                (const BF16 *)query.cudaData, nullptr, nullptr,
+                sink.dims.empty() ? nullptr : (const float *)sink.cudaData,
+                (BF16 *)output.cudaData, (const int *)liveKeys.cudaData, heads, kvHeads, table);
             CheckLaunch(); return;
         }
     }
@@ -7233,6 +7890,16 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
         BatchSwaKeys keys{};
         std::copy_n(rows.begin() + first, count, keys.rows);
         keys.length = liveKeys.dims.empty() ? nullptr : (const int *)liveKeys.cudaData + first;
+        if (target.Matches(1, heads * kSwaValueDim) && rows.size() == 1 &&
+            rows.front().ring && rows.front().verifyOffset < 0 && threads == kSwaThreads && !wideTile) {
+            PackedSwaKeys bound{rows.front(), keys.length, target};
+            AttentionShortDecode<kSwaWindow, PackedSwaKeys, false, kSwaThreads, kSwaOutputTile, true>
+                <<<dim3(heads, count, kSwaValueDim / kSwaOutputTile), kSwaThreads>>>(
+                (const BF16 *)query.cudaData, nullptr, nullptr, bias, (BF16 *)output.cudaData,
+                heads, kvHeads, kvHeads * kSwaQkDim, bound);
+            *packed = target;
+            CheckLaunch(); return;
+        }
         kernel<<<dim3(heads, count, kSwaValueDim / outputTile), threads>>>(
             (const BF16 *)query.cudaData + (size_t)first * heads * kSwaQkDim,
             nullptr, nullptr, bias, (BF16 *)output.cudaData + (size_t)first * heads * kSwaValueDim,
@@ -7330,6 +7997,14 @@ void FastllmCudaNaiveAppendVerifyCache(fastllm::Data &key, fastllm::Data &value,
         const fastllm::Data &newKey, const fastllm::Data &newValue,
         const fastllm::Data &liveKeys, int window, bool ringVerify) {
     const int kc = key.dims[2], vc = value.dims[2], rows = newKey.dims[1];
+    if (key.dataType == fastllm::FP4_E2M1) {
+        fastllm::AssertInFastLLM(value.dataType == key.dataType && !window && !ringVerify &&
+            liveKeys.dataType == fastllm::INT32 && liveKeys.cudaData && liveKeys.Count(0) == rows,
+            "FP4 target verification requires one device length per DSA query.");
+        NaivePagedWrite(key, newKey, 0, &liveKeys, nullptr, true);
+        NaivePagedWrite(value, newValue, 0, &liveKeys, nullptr, true);
+        return;
+    }
     if (key.kvCacheFp8Indexer) {
         WriteIndexerCache<<<rows, 128>>>(FastllmNaiveKV(key), (const BF16 *)newKey.cudaData,
             kc, 0, (const int *)liveKeys.cudaData, FastllmNaiveKV(value), (const BF16 *)newValue.cudaData, vc);
@@ -7431,7 +8106,7 @@ __global__ void LogitsTop1Partial(const float *logits, float2 *partial, int voca
         partial[(size_t)blockIdx.y * gridDim.x + blockIdx.x] =
             make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
 }
-__global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int count) {
+__global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int count, float emptyId) {
     float best = -INFINITY;
     int bestId = INT_MAX;
     for (int i = threadIdx.x; i < count; i += 256) {
@@ -7442,7 +8117,7 @@ __global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int coun
     }
     Top1BlockMax(best, bestId);
     if (!threadIdx.x)
-        output[blockIdx.x] = make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
+        output[blockIdx.x] = make_float2(bestId == INT_MAX ? emptyId : (float)bestId, best);
 }
 // A tile sorts 1024 scores, retaining only its first K. The second stage
 // merges sorted tile heads; no vocabulary-sized host transfer or allocation.
@@ -7530,6 +8205,42 @@ __global__ void DraftConcatRows(DraftHiddenInputs inputs, DraftRowIndices indice
 }
 }
 
+// Shared by sharded selection and the verifier's full-vocabulary Top-1.
+static void LaunchLogitsTop1(const fastllm::Data &logits, int vocabOffset, int rows, int blocks,
+                             fastllm::Data &partial, fastllm::Data &output, float emptyId) {
+    LogitsTop1Partial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
+        (float2 *)partial.cudaData, logits.dims.back(), vocabOffset);
+    LogitsTop1Finish<<<rows, 256>>>((const float2 *)partial.cudaData,
+        (float2 *)output.cudaData, blocks, emptyId);
+}
+
+bool FastllmCudaFullLogitsTop1(const fastllm::Data &logits, fastllm::Data &output) {
+    using namespace fastllm;
+    if (logits.dataDevice != CUDA || logits.dataType != FLOAT32 || logits.multiDeviceData ||
+        !logits.cudaData || logits.dims.empty() || logits.dims.back() < 16384 ||
+        !FastllmNaiveCanSelectLogits(logits.dims.back(), 0, 1, true)) return false;
+    if (logits.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        logits.strides.size() != logits.dims.size()) return false;
+    uint64_t stride = 1;
+    for (int axis = int(logits.dims.size()) - 1; axis >= 0; --axis) {
+        if (logits.dims[axis] <= 0 || (logits.dims[axis] > 1 && logits.strides[axis] != stride)) return false;
+        stride *= logits.dims[axis];
+    }
+    const int vocab = logits.dims.back();
+    const auto rows = logits.Count(0) / vocab;
+    if (!rows || rows > 65535) return false;
+    const int blocks = (vocab + 1023) / 1024;
+    Data partial;
+    auto dims = logits.dims;
+    dims.back() = 2;
+    Output(partial, FLOAT32, {int(rows), blocks, 2});
+    Output(output, FLOAT32, dims);
+    // Full Top-1 returns index zero when every value is NaN or -infinity.
+    LaunchLogitsTop1(logits, 0, rows, blocks, partial, output, 0.f);
+    CheckLaunch();
+    return true;
+}
+
 void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
     int count, bool greedy, float invTemperature,
     fastllm::Data &partial, fastllm::Data &output) {
@@ -7544,10 +8255,7 @@ void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
     Output(partial, FLOAT32, {rows, blocks, count, 2});
     Output(output, FLOAT32, {rows, count * 2});
     if (greedy) {
-        LogitsTop1Partial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
-            (float2 *)partial.cudaData, vocab, vocabOffset);
-        LogitsTop1Finish<<<rows, 256>>>((const float2 *)partial.cudaData,
-            (float2 *)output.cudaData, blocks);
+        LaunchLogitsTop1(logits, vocabOffset, rows, blocks, partial, output, -1.f);
     } else {
         LogitsTopKPartial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
             (float2 *)partial.cudaData, vocab, vocabOffset, count, invTemperature);
@@ -7855,6 +8563,7 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
             // request length: a restored prefix can reference any pool page.
             r.poolTokens = key.isPagedKVCache ? key.pagedKVCacheData->maxPages * key.pageLen : 0;
             r.fp8 = k.fp8;
+            r.fp4 = k.fp4;
             r.capacity = capacity;
             r.keyStride = key.dims[2];
             r.liveKeys = (const int *)liveKeys.cudaData + row;
@@ -7863,8 +8572,8 @@ void FastllmCudaNaiveGraphVerifyAttention(const fastllm::Data &query,
                 r.selectedCount = 2048;
             }
         }
-        FastllmCudaNaiveBatchDSADecode(query, sink, batch, heads, kvHeads,
-                                      dim, valueDim, scratch, output);
+        // Graph verification preserves the BF16 rounding of per-row eager attention.
+        RunBatchDSADecode(query, sink, batch, heads, kvHeads, dim, valueDim, scratch, output, false);
         return;
     }
     const bool grouped = heads % kvHeads == 0 && (heads / kvHeads) % 4 == 0;

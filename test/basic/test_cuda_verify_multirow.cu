@@ -5,7 +5,6 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +14,10 @@
 using namespace fastllm;
 void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, int, int,
                                int);
+// Call the generic launcher directly: the public dispatcher may select
+// the same fixed-topK implementation as the fused path for any row count.
+void LaunchFastllmSelectExpertGeneric(float *, float *, int32_t *, float *, int, int, int, int, bool,
+                                      float);
 static int checks = 0;
 static void Check(bool ok, const char *why) {
     if (!ok)
@@ -61,13 +64,13 @@ static void Linear(int rows, int m, int k, bool bias, int pattern) {
     Check(Read<uint16_t>(c) == Read<uint16_t>(r), "BF16 multirow differs bitwise from single rows");
     ++checks;
 }
-static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
+static void Router(int rows, int pattern, bool bias, bool norm, float scale, int experts) {
     int n = rows;
-    Data x(FLOAT32, {n, 256}), p(FLOAT32, {n, 256}), b(FLOAT32, {256});
+    Data x(FLOAT32, {n, experts}), p(FLOAT32, {n, experts}), b(FLOAT32, {experts});
     Data i(INT32, {n, 8}), s(FLOAT32, {n, 8}), ri(INT32, {n, 8}), rs(FLOAT32, {n, 8});
     for (Data *d : {&x, &p, &b, &i, &s, &ri, &rs})
         Allocate(*d);
-    std::vector<float> v(n * 256), bv(256);
+    std::vector<float> v(n * experts), bv(experts);
     unsigned rng = 1327;
     for (size_t j = 0; j < v.size(); ++j) {
         rng = 1664525u * rng + 1013904223u;
@@ -85,7 +88,7 @@ static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
         if (pattern == 6)
             v[j] = -1000; // zero normalization denominator
     }
-    for (int j = 0; j < 256; ++j) {
+    for (int j = 0; j < experts; ++j) {
         bv[j] = pattern == 1 ? 0.f : (int(j % 13) - 6) * .015625f;
         if (pattern == 4 && j % 11 == 0)
             bv[j] = INFINITY;
@@ -93,42 +96,32 @@ static void Router(int rows, int pattern, bool bias, bool norm, float scale) {
     Cuda(cudaMemcpy(x.cudaData, v.data(), x.GetBytes(), cudaMemcpyHostToDevice));
     Cuda(cudaMemcpy(b.cudaData, bv.data(), b.GetBytes(), cudaMemcpyHostToDevice));
     Check(FastllmCudaSigmoid(x, p), "sigmoid reference failed");
-    // A padded, never-selected expert forces the unchanged generic selector.
-    // Row count alone no longer selects that implementation. Every pattern
-    // has at least eight finite keys above the padding key, including ties.
-    Data referenceP(FLOAT32, {n, 257}), referenceBias(FLOAT32, {257});
-    Allocate(referenceP); Allocate(referenceBias);
-    Cuda(cudaMemset(referenceP.cudaData, 0, referenceP.GetBytes()));
-    Cuda(cudaMemcpy2D(referenceP.cudaData, 257 * sizeof(float), p.cudaData, 256 * sizeof(float),
-        256 * sizeof(float), n, cudaMemcpyDeviceToDevice));
-    std::vector<float> referenceB(257, 0.f);
-    if (bias) std::copy(bv.begin(), bv.end(), referenceB.begin());
-    referenceB.back() = -std::numeric_limits<float>::max();
-    Cuda(cudaMemcpy(referenceBias.cudaData, referenceB.data(), referenceBias.GetBytes(), cudaMemcpyHostToDevice));
-    Check(FastllmCudaSelectExpert(referenceP, &referenceBias, ri, rs, 8, norm, scale), "router reference failed");
-    // The fused kernel uses the requested row count, including the one-row case.
-    x.Resize({rows, 256});
-    i.Resize({rows, 8});
-    s.Resize({rows, 8});
+    LaunchFastllmSelectExpertGeneric(
+        (float *)p.cudaData, bias ? (float *)b.cudaData : nullptr, (int32_t *)ri.cudaData,
+        (float *)rs.cudaData, n, experts, 8, bias, norm, scale);
+    Cuda(cudaGetLastError());
     Check(FastllmCudaFusedSigmoidSelectExpert(x, bias ? &b : nullptr, i, s, 8, norm, scale),
           "fused router failed");
     auto a = Read<int>(i), ref = Read<int>(ri);
     auto sc = Read<unsigned>(s), sr = Read<unsigned>(rs);
-    Check(std::equal(a.begin(), a.end(), ref.begin()), "fused router indices differ");
-    Check(std::equal(sc.begin(), sc.end(), sr.begin()), "fused router scores differ bitwise");
-    p.Resize({rows, 256});
+    Check(a == ref, "fused router indices differ");
+    Check(sc == sr, "fused router scores differ bitwise");
     Check(FastllmCudaSelectExpert(p, bias ? &b : nullptr, i, s, 8, norm, scale), "unfused router failed");
     a = Read<int>(i);
     sc = Read<unsigned>(s);
     Check(std::equal(a.begin(), a.end(), ref.begin()), "unfused router indices differ");
     Check(std::equal(sc.begin(), sc.end(), sr.begin()), "unfused router scores differ bitwise");
-    cudaGraph_t graph; cudaGraphExec_t exec;
-    Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-    Check(FastllmCudaSelectExpert(p, bias ? &b : nullptr, i, s, 8, norm, scale), "captured router failed");
-    Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
-    Cuda(cudaGraphInstantiate(&exec, graph, 0)); Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
-    Check(Read<int>(i) == a && Read<unsigned>(s) == sc, "captured router changed output");
-    Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+    for (bool fused : {false, true}) {
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Cuda(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        bool ok = fused ? FastllmCudaFusedSigmoidSelectExpert(x, bias ? &b : nullptr, i, s, 8, norm, scale)
+                        : FastllmCudaSelectExpert(p, bias ? &b : nullptr, i, s, 8, norm, scale);
+        Check(ok, "captured router failed");
+        Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Cuda(cudaGraphInstantiate(&exec, graph, 0)); Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
+        Check(Read<int>(i) == a && Read<unsigned>(s) == sc, "captured router changed output");
+        Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
+    }
     ++checks;
 }
 int main() {
@@ -142,18 +135,14 @@ int main() {
                 for (bool bias : {false, true})
                     for (int pattern : {0, 1})
                         Linear(rows, m, 257, bias, pattern);
-            for (int pattern = 0; pattern < 7; ++pattern)
-                for (bool bias : {false, true})
-                    for (bool norm : {false, true})
-                        for (float scale : {1.f, 2.5f})
-                            Router(rows, pattern, bias, norm, scale);
         }
-        for (int rows : {9, 16, 32, 64, 128, 256, 1024})
+        for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 64, 128, 512, 1024})
             for (int pattern = 0; pattern < 7; ++pattern)
                 for (bool bias : {false, true})
                     for (bool norm : {false, true})
                         for (float scale : {1.f, 2.5f})
-                            Router(rows, pattern, bias, norm, scale);
+                            for (int experts : {128, 256})
+                                Router(rows, pattern, bias, norm, scale, experts);
         Cuda(cudaDeviceSynchronize());
         printf("VERIFY MULTIROW PASS checks=%d\n", checks);
         return 0;

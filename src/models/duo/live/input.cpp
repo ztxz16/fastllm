@@ -1,7 +1,4 @@
 #include "input.h"
-#include <ATen/ops/_upsample_bicubic2d_aa.h>
-#include <c10/core/InferenceMode.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -134,13 +131,13 @@ struct ResidentSpeech {
     int device;
     qwen_ctx_t *ctx;
     ResidentSpeech(const std::string &path, int gpu) : device(gpu) {
-        c10::cuda::CUDAGuard guard(at::Device(at::kCUDA, device));
+        native::DeviceGuard guard(device);
         ctx = qwen_load(path.c_str());
         if (!ctx)
             throw std::runtime_error("cannot load Qwen3-ASR recognizer");
     }
     ~ResidentSpeech() {
-        c10::cuda::CUDAGuard guard(at::Device(at::kCUDA, device));
+        native::DeviceGuard guard(device);
         qwen_free(ctx);
     }
 };
@@ -148,7 +145,7 @@ InputWorker::InputWorker(std::string model, int speech, int vision)
     : root(std::move(model)), speechDevice(speech), visionDevice(vision) {}
 InputWorker::~InputWorker() = default;
 std::string InputWorker::recognize(const std::vector<float> &pcm) {
-    c10::cuda::CUDAGuard dev(at::Device(at::kCUDA, speechDevice));
+    native::DeviceGuard dev(speechDevice);
     if (!recognizer)
         recognizer = std::make_unique<ResidentSpeech>(root + "/speech/recognizer", speechDevice);
     std::unique_ptr<char, decltype(&std::free)> text(
@@ -162,7 +159,7 @@ std::string InputWorker::recognize(const std::vector<float> &pcm) {
 }
 Input InputWorker::prepare(const fs::path &file, const fs::path &dir, const Tokenizer &tokens,
                            const std::function<void(const std::string &)> &transcribed) {
-    c10::InferenceMode mode;
+
     command({"ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height",
              "-of", "json", file},
             dir / "probe.json");
@@ -266,6 +263,57 @@ Input InputWorker::prepare(const fs::path &file, const fs::path &dir, const Toke
     }
     return result;
 }
+namespace {
+// Separable antialiased Keys cubic filter with half-pixel centers and uint8
+// rounding after each pass, as used by the released vision preprocessing.
+struct Tap {
+    int index;
+    double weight;
+};
+std::vector<std::vector<Tap>> cubicTaps(int input, int output) {
+    std::vector<std::vector<Tap>> taps(output);
+    const double scale = double(input) / output, support = std::max(1., scale);
+    for (int dst = 0; dst < output; ++dst) {
+        const double center = (dst + .5) * scale - .5;
+        double sum = 0;
+        for (int src = std::max(0, int(std::ceil(center - 2 * support)));
+             src <= std::min(input - 1, int(std::floor(center + 2 * support))); ++src) {
+            double a = std::abs((src - center) / support);
+            double w = a < 1 ? ((1.5 * a - 2.5) * a) * a + 1 : ((-.5 * a + 2.5) * a - 4) * a + 2;
+            taps[dst].push_back({src, w});
+            sum += w;
+        }
+        for (auto &tap : taps[dst])
+            tap.weight /= sum;
+    }
+    return taps;
+}
+std::vector<uint8_t> resizeRGB(const std::vector<uint8_t> &src, int frames, int width, int height, int w,
+                               int h) {
+    auto xs = cubicTaps(width, w), ys = cubicTaps(height, h);
+    std::vector<uint8_t> dst(size_t(frames) * w * h * 3), tmp(size_t(height) * w * 3);
+    auto pixel = [](double v) { return uint8_t(std::clamp(int(std::floor(v + .5)), 0, 255)); };
+    for (int f = 0; f < frames; ++f) {
+        for (int y = 0; y < height; ++y)
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    double sum = 0;
+                    for (auto tap : xs[x])
+                        sum += tap.weight * src[((size_t(f) * height + y) * width + tap.index) * 3 + c];
+                    tmp[(y * w + x) * 3 + c] = pixel(sum);
+                }
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    double sum = 0;
+                    for (auto tap : ys[y])
+                        sum += tap.weight * tmp[(tap.index * w + x) * 3 + c];
+                    dst[((size_t(f) * h + y) * w + x) * 3 + c] = pixel(sum);
+                }
+    }
+    return dst;
+}
+} // namespace
 Visual InputWorker::vision(const std::vector<uint8_t> &pixels, int width, int height) {
     if (width <= 0 || height <= 0 || width > 4096 || height > 4096 ||
         pixels.size() != size_t(17) * width * height * 3)
@@ -273,16 +321,14 @@ Visual InputWorker::vision(const std::vector<uint8_t> &pixels, int width, int he
     double scale = std::sqrt(18. * width * height / 16384.);
     int w = std::max(32, int(std::floor(width / scale / 32)) * 32),
         h = std::max(32, int(std::floor(height / scale / 32)) * 32);
-    auto rgb = at::from_blob(const_cast<uint8_t *>(pixels.data()), {17, height, width, 3}, at::kByte)
-                   .permute({0, 3, 1, 2});
-    auto resized = at::_upsample_bicubic2d_aa(rgb, {h, w}, false).permute({0, 2, 3, 1}).contiguous();
-    c10::cuda::CUDAGuard dev(at::Device(at::kCUDA, visionDevice));
+    auto resized = resizeRGB(pixels, 17, width, height, w, h);
+    native::DeviceGuard dev(visionDevice);
     if (!visionRuntime) {
         visionRuntime = std::make_unique<nomas::Runtime>(visionDevice, nomas::DType::BF16);
         visionWeights = std::make_unique<nomas::Weights>(*visionRuntime, root + "/intent");
     }
     auto rgba = [&](int f) {
-        auto ptr = resized[f].data_ptr<uint8_t>();
+        auto ptr = resized.data() + size_t(f) * w * h * 3;
         std::vector<uint8_t> a(w * h * 4, 255);
         for (int i = 0; i < w * h; ++i)
             std::memcpy(a.data() + 4 * i, ptr + 3 * i, 3);
@@ -292,11 +338,11 @@ Visual InputWorker::vision(const std::vector<uint8_t> &pixels, int width, int he
     for (int j = 0; j < 17; j += 2) {
         auto a = rgba(j), b = rgba(std::min(16, j + 1));
         auto out = nomas::qwenVision(*visionRuntime, *visionWeights, w, h, a, {}, &b);
-        std::array<at::Tensor, 4> embeds;
+        std::array<native::Tensor, 4> embeds;
         for (int i = 0; i < 4; ++i) {
             auto host = visionRuntime->download(out[i]);
-            embeds[i] = at::from_blob(host.data(), {out[i].rows, out[i].cols}, at::kFloat)
-                            .to(dev.current_device(), at::kBFloat16);
+            embeds[i] = native::from_blob(host.data(), {out[i].rows, out[i].cols}, native::kFloat)
+                            .to(visionDevice, native::kBFloat16);
         }
         v.pairs.push_back(std::move(embeds));
     }

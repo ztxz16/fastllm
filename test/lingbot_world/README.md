@@ -68,7 +68,7 @@ node test/lingbot_world/test_player.cjs
 python3 test/lingbot_world/test_server.py
 ```
 
-`test_player.cjs` 使用 Node 内置模块检查页面实际脚本的播放、移动、编辑和错误恢复，不替代浏览器的视觉验收。VAE 对照默认使用 BF16 autocast 解码、FP32 编码；BF16 单算子用 `compare_vae_ops.py --precision bf16` 检查，相对 L2 门槛为 0.005。解码与整段重建同时报告相对 L2 和 PSNR，门槛采用像素范围归一化 RMSE < 0.01（PSNR > 40 dB），避免接近零的低对比度输出使相对 L2 失真；编码与分块一致性仍使用相对 L2 < 0.001。传入 `--decode-precision fp32` 可回归原有 FP32 路径（全部门槛为 0.001）。连续推演对照读取 trace 中的 `vae_decode_precision`，使用相同精度解码；旧 trace 缺省为 FP32。
+`test_player.cjs` 使用 Node 内置模块检查页面实际脚本的播放、移动、编辑和错误恢复，不替代浏览器的视觉验收。VAE 对照默认使用 BF16 autocast 解码、FP32 编码；BF16 单算子用 `compare_vae_ops.py --precision bf16` 检查，相对 L2 门槛为 0.005。解码与整段重建同时报告相对 L2 和 PSNR，门槛采用像素范围归一化 RMSE < 0.01（PSNR > 40 dB），避免接近零的低对比度输出使相对 L2 失真；编码与分块一致性仍使用相对 L2 < 0.001。传入 `--decode-precision fp32` 可回归原有 FP32 路径（全部门槛为 0.001）。连续推演对照按 trace 中的 `vae_encode_precision` 和 `vae_decode_precision` 选择相同精度的参考条件和解码器。旧 trace 缺少的精度字段按 FP32 处理。使用新版 trace 时，请用当前版本的 `prepare_inputs.py` 生成含 BF16 图像条件的输入。
 
 VAE 对照可额外传入 `--condition-inputs "$RESULT_DIR/inputs.npz"`，验证真实起始图片后接零帧的图像条件，并记录转成 BF16 后不同的值数。
 

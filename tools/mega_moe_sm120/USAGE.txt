@@ -2,14 +2,19 @@ Native SM120 MXFP4 EP kernel packages
 ===================================
 
 Expert weights are repacked and their source allocations are retired one layer
-at a time before serving. Only the native layout remains resident; temporary
-duplication is bounded to one layer. This applies to both EP4 and EP8.
+at a time before serving. The native and grouped EP8 paths share the FP4 values. Each retains its own
+scale layout. Temporary copies of the original weights are bounded to one layer.
 
-For the tuned path, inference loads a matching package from
-ftllm/kernels/mxfp4_ep/. This backend needs CUDA 12.9+ on Linux, a compatible
-CUDA driver, and direct peer access between all EP GPUs. It does not import
-FlashInfer, Torch, Triton, cuda-python, or CUTLASS DSL at inference time.
-FastLLM's existing dependencies for other operators are unchanged.
+On the shipped 110-SM EP8 geometry, auto uses grouped MoE for up to 128
+collective rows per rank. With four ranks on each of two NUMA nodes and the
+prefill pipeline enabled, it also uses grouped for fully dense prefill at
+129–288, 384, 448, 480–768, and 2048 rows. The log reports
+backend=sm120-auto-grouped-and-native. Above 128 rows all other shapes,
+including uneven slices and masked verification, use native. EP4 uses native.
+Set FASTLLM_SM120_EP_BACKEND=grouped or native to force a backend.
+
+Packages in ftllm/kernels/mxfp4_ep/ require CUDA 12.9+ on Linux, a compatible
+driver and direct peer access. Inference runs without the Python export tools.
 
 SM120 builds with the grouped MXFP4 Tensor Core kernel also support EP when
 the package or its model geometry does not match. Naive --ep 4/8 selects this
@@ -19,8 +24,9 @@ widths must be multiples of 128. The number of SMs, expert count and top-k are
 runtime parameters. The load log reports backend=sm120-grouped-ep. This path
 is linked into FastLLM and requires no standalone cubin. Each rank sends one
 quantized token per selected owner. Each owner computes only its routed rows.
-Workspace and packed weights are prepared before capture; requests larger
-than the 128-row per-rank workspace repeat the collective on all ranks.
+Workspace and packed weights are prepared before capture. Tuned EP8 prefill
+uses 1024-row chunks and can prefetch the following chunk on a copy stream. Set FASTLLM_SM120_EP_PREFILL_PIPELINE=0 for the 128-row workspace.
+Other supported geometries use the 128-row workspace.
 
 Currently shipped and tested packages:
   SM120, 110 SMs/GPU, EP4 and EP8, hidden=4096, intermediate=2048,

@@ -215,21 +215,42 @@ static KernelFn PickBf16Mxfp8Kernel(int rows, int tile, bool parallelReduce = fa
 #endif
 }
 
+#if defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
+template<int Stages> static KernelFn VerifyQueryProjection() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    return nullptr;
+#else
+    return MARLIN_NAMESPACE_NAME::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+        128, 1, 8, 4, true, Stages, 2, false, false, false, false, false, false, false, true>;
+#endif
+}
+template<int Stages> static KernelFn VerifyQkvProjection() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    return nullptr;
+#else
+    return MARLIN_NAMESPACE_NAME::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+        128, 1, 8, 4, true, Stages, 2, false, true, false, false, false, true, false, false, true>;
+#endif
+}
+#endif
+
 // Exact storage layout of the BF16/E4M3/E8M0 kernel above. B and the
 // reduction tile alias; scales and the four-stage A pipeline follow them.
 // Reserving the device's entire shared memory prevents other graph branches
 // from occupying the same SM even when most of that reservation is unused.
-static int Bf16Mxfp8SharedBytes(int rows, int tile) {
+static int Bf16Mxfp8SharedBytes(int rows, int tile, int stages = 4) {
     const int threadN = tile == 1 ? 64 : 128;
     const int threadK = tile == 0 ? 64 : 128;
     const int mBlocks = rows <= 8 ? 1 : std::min(4, (rows + 15) / 16);
     const int tileM = rows <= 8 ? 8 : 16 * mBlocks;
-    const int bPipeline = 4 * threadN * threadK;
+    const int bPipeline = stages * threadN * threadK;
     const int reduction = (2 * (threadN / 16) + 1) * 16 * mBlocks * 16;
     const int bReductionBias = std::max(std::max(bPipeline, reduction),
         std::min(bPipeline, reduction) + threadN * 2);
-    const int scales = 4 * (threadK / 32) * threadN;
-    const int aPipeline = 4 * tileM * threadK * 2;
+    const int scales = stages * (threadK / 32) * threadN;
+    const int aPipeline = stages * tileM * threadK * 2;
     return bReductionBias + scales + aPipeline;
 }
 
@@ -744,7 +765,7 @@ static bool BFloat16MXFP8Gemm(
     const int tile = columns % 128 != 0 ? 1 : 0;
     // Configure every tail specialization before entering a capture. A later
     // prefill may have a different tail, but the captured scratch never moves.
-    static thread_local std::set<int> prepared;
+    static thread_local std::map<int, bool> prepared;
     if (!prepared.count(device)) {
         cudaStreamCaptureStatus capture;
         if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
@@ -769,7 +790,15 @@ static bool BFloat16MXFP8Gemm(
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     Bf16Mxfp8SharedBytes(8, 2)) != cudaSuccess) return false;
         }
-        prepared.emplace(device);
+        bool verifyEightStages = false;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (arch == 103 && sms == 148 && Bf16Mxfp8SharedBytes(6, 0, 8) <= shared) {
+            verifyEightStages = cudaFuncSetAttribute(VerifyQkvProjection<8>(),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, Bf16Mxfp8SharedBytes(6, 0, 8)) == cudaSuccess;
+            if (!verifyEightStages) cudaGetLastError();
+        }
+#endif
+        prepared.emplace(device, verifyEightStages);
     }
     for (int row = 0; row < rows;) {
         int count = rows - row;
@@ -789,9 +818,24 @@ static bool BFloat16MXFP8Gemm(
         const bool parallelReduce = !floatOutput && count <= 8 && inner >= 512 &&
                                     columns / threadN <= sms / 4;
         KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile, parallelReduce, floatOutput);
-        const int launchShared = Bf16Mxfp8SharedBytes(count, chunkTile);
+        int launchShared = Bf16Mxfp8SharedBytes(count, chunkTile);
         if (launchShared > shared) return false;
-        kernel<<<sms, chunkTile == 2 ? 256 : 128, launchShared, cudaStreamPerThread>>>(
+        dim3 grid(sms);
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (arch == 103 && sms == 148 && rows == 6 && columns == 32768 && inner == 1280 && !floatOutput) {
+            kernel = VerifyQueryProjection<4>();
+            grid.y = 2;
+        } else if (arch == 103 && sms == 148 && rows == 6 && columns == 1792 && inner == 5120 && !floatOutput) {
+            if (prepared.at(device)) {
+                // All eight 64-K tiles in a stripe can be in flight together.
+                kernel = VerifyQkvProjection<8>();
+                launchShared = Bf16Mxfp8SharedBytes(6, 0, 8);
+            } else {
+                kernel = VerifyQkvProjection<4>();
+            }
+        }
+#endif
+        kernel<<<grid, chunkTile == 2 ? 256 : 128, launchShared, cudaStreamPerThread>>>(
             reinterpret_cast<const int4 *>(static_cast<const uint16_t *>(a) + (size_t)row * inner),
             reinterpret_cast<const int4 *>(weight),
             reinterpret_cast<int4 *>(static_cast<char *>(c) + (size_t)row * columns * (floatOutput ? 4 : 2)),
@@ -803,6 +847,49 @@ static bool BFloat16MXFP8Gemm(
         row += count;
     }
     return true;
+}
+
+extern "C" bool FastllmCudaDsparkContextProjection(const void *a, const void *weights, void *output, int rows) {
+#if defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+    if (!a || !weights || !output || rows < 2 || rows > 8) return false;
+    KernelFn kernel = MARLIN_NAMESPACE_NAME::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+        128, 1, 8, 4, true, 4, 2, false, true, false, false, false, true, false, false, false, true>;
+    constexpr int sms = 148;
+    const int shared = Bf16Mxfp8SharedBytes(rows, 0);
+    static thread_local std::map<int, bool> devices;
+    int device = FastllmCudaGetDevice();
+    if (!devices.count(device)) {
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        int arch = 0, count = 0;
+        bool ready = DeviceOk(&arch) && arch == 103 &&
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess && count == sms &&
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) == cudaSuccess;
+        if (!ready) cudaGetLastError();
+        devices.emplace(device, ready);
+    }
+    if (!devices.at(device)) return false;
+    // Each captured invocation owns its partials and locks, including when two
+    // different requests execute concurrently on the same device.
+    constexpr size_t partialBytes = 3 * 2 * sms * 16 * 128 * sizeof(float);
+    constexpr size_t lockBytes = 3 * sms * 4 * sizeof(int);
+    void *scratch = nullptr;
+    if (FastllmCudaTryMalloc(&scratch, partialBytes + lockBytes) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    int *locks = reinterpret_cast<int *>(static_cast<char *>(scratch) + partialBytes);
+    cudaError_t status = cudaMemsetAsync(locks, 0, lockBytes, cudaStreamPerThread);
+    if (status == cudaSuccess) {
+        kernel<<<dim3(sms, 3), 128, shared, cudaStreamPerThread>>>(
+            static_cast<const int4 *>(a), static_cast<const int4 *>(weights), static_cast<int4 *>(output),
+            static_cast<int4 *>(scratch), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            160, rows, 512, 5120, 5120, locks, false, false, true, shared);
+        status = cudaGetLastError();
+    }
+    if (!FastllmCudaFreeAfterCurrentThreadStream(scratch)) FastllmCudaFree(scratch);
+    if (status != cudaSuccess) FastllmCudaSetThreadError();
+    return status == cudaSuccess;
+#else
+    return false;
+#endif
 }
 
 extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(

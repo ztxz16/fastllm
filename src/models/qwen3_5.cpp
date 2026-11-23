@@ -803,7 +803,7 @@ namespace fastllm {
         return stats;
     }
 
-    static int Qwen35MtpDraftsPerStep() {
+    int Qwen35ConfiguredMtpDrafts() {
         const char *env = std::getenv("FASTLLM_QWEN35_ENABLE_MTP");
         if (env == nullptr || env[0] == '\0') {
             return 0;
@@ -811,8 +811,11 @@ namespace fastllm {
         if (Qwen35MoeIsTrueString(env)) {
             return 1;
         }
-        int value = atoi(env);
-        return std::max(0, std::min(value, QWEN35_MTP_MAX_DRAFTS));
+        return atoi(env);
+    }
+
+    static int Qwen35MtpDraftsPerStep() {
+        return std::max(0, std::min(Qwen35ConfiguredMtpDrafts(), QWEN35_MTP_MAX_DRAFTS));
     }
 
     static bool Qwen35MtpDisabledByEnv() {
@@ -893,7 +896,7 @@ namespace fastllm {
         return enabled;
     }
 
-    static int Qwen35MtpProfileInterval() {
+    int Qwen35MtpProfileInterval() {
         static int interval = []() {
             const char *env = std::getenv("FASTLLM_QWEN35_MTP_PROFILE");
             if (env == nullptr || env[0] == '\0') {
@@ -17979,38 +17982,15 @@ namespace fastllm {
                                                         rows * sizeof(int));
                     } else {
                         MtpKvCache *proposal = speculativeMtpSamplingContexts[b];
-                        AssertInFastLLM(proposal != nullptr && proposal->sampleProposal &&
-                            drafts > 0 && (int)proposal->proposalTokens.size() >= drafts &&
-                            proposal->proposalProbs.dataDevice == DataDevice::CUDA &&
-                            proposal->proposalProbs.dataDeviceIds == std::vector<int>{devices[0]} &&
-                            proposal->proposalProbs.dims.size() == 2 &&
-                            proposal->proposalProbs.dims.back() == vocabSize &&
-                            proposal->proposalProbs.dims[0] >= drafts,
-                            "MTP rejection sampling is missing the actual proposal distribution.\n");
+                        AssertInFastLLM(proposal && (int)proposal->proposalTokens.size() >= drafts,
+                                        "Missing MTP proposal tokens.\n");
                         for (int i = 0; i < drafts; ++i) {
                             AssertInFastLLM(proposal->proposalTokens[i] ==
                                 (int)(input[offset + i + 1] + 1.0e-3f),
                                 "MTP rejection sampling proposal is out of sync.\n");
                         }
-                        std::vector<float> temperatures(rows, config.temperature), topPs(rows, config.top_p);
-                        std::vector<int> topKs(rows, config.top_k);
-                        int accepted = 0;
-                        bool ok;
-                        if (proposal->proposalUsesLogits) {
-                            ok = FastllmCudaMtpRejectionSamplingLogits(rowLogits,
-                                (float*)proposal->proposalProbs.cudaData,
-                                (float*)proposal->proposalLogsumexp.cudaData,
-                                (int*)proposal->proposalDeviceTokens.cudaData,
-                                temperatures.data(), topKs.data(), topPs.data(),
-                                sampled.data() + offset, &accepted, 1, drafts, vocabSize);
-                        } else {
-                            ok = FastllmCudaMtpRejectionSampling(
-                                rowLogits, (float*)proposal->proposalProbs.cudaData,
-                                temperatures.data(), topKs.data(), topPs.data(),
-                                proposal->proposalTokens.data(), sampled.data() + offset,
-                                &accepted, 1, drafts, vocabSize);
-                        }
-                        AssertInFastLLM(ok, "MTP CUDA rejection sampling failed.\n");
+                        const int accepted = VerifyMtpSamplingRows(rowLogits, vocabSize, devices[0],
+                            *proposal, drafts, config, sampled.data() + offset);
                         for (int i = 0; i < accepted; ++i)
                             speculativeMtpAccepted[offset + i] = 1;
                     }
@@ -28919,9 +28899,8 @@ namespace fastllm {
     // Quantized draft projections keep their original BF16 activation boundary.
     // The existing NVFP4 Marlin route consumes FP16; never feed its packed
     // weights to the generic BF16 GEMV implementation.
-    void Qwen3_5Model::RunDFlashLinear(Data &input, Data &originalWeight, const Data &bias, Data &output, Data *halfInputScratch) {
-        const auto it = dflashNvfp4ViewWeights.find(originalWeight.name);
-        Data &linearWeight = it == dflashNvfp4ViewWeights.end() ? originalWeight : it->second;
+    static void Qwen35DraftLinear(Data &input, Data &linearWeight, const Data &bias,
+                                  Data &output, Data *halfInputScratch = nullptr) {
         if (linearWeight.dataType != DataType::NVFP4_BLOCK_16) {
             Linear(input, linearWeight, bias, output);
             return;
@@ -28935,6 +28914,12 @@ namespace fastllm {
         }
         Linear(*source, linearWeight, bias, output);
         ToDataType(output, input.dataType);
+    }
+
+    void Qwen3_5Model::RunDFlashLinear(Data &input, Data &originalWeight, const Data &bias, Data &output, Data *halfInputScratch) {
+        const auto it = dflashNvfp4ViewWeights.find(originalWeight.name);
+        Data &linearWeight = it == dflashNvfp4ViewWeights.end() ? originalWeight : it->second;
+        Qwen35DraftLinear(input, linearWeight, bias, output, halfInputScratch);
     }
 
 #ifdef USE_CUDA
@@ -32403,6 +32388,38 @@ namespace fastllm {
 #endif
     }
 
+#ifdef USE_CUDA
+    int Qwen3_5Model::VerifyMtpSamplingRows(float *targetLogits, int vocab, int device,
+            const MtpKvCache &proposal, int drafts, const GenerationConfig &config, int *output) {
+        AssertInFastLLM(proposal.sampleProposal && drafts > 0 &&
+            (int)proposal.proposalTokens.size() >= drafts && proposal.proposalProbs.cudaData &&
+            proposal.proposalProbs.dataDevice == DataDevice::CUDA &&
+            proposal.proposalProbs.dataDeviceIds == std::vector<int>{device} &&
+            proposal.proposalProbs.dims.size() == 2 && proposal.proposalProbs.dims.back() == vocab &&
+            proposal.proposalProbs.dims.front() >= drafts, "Missing MTP proposal distribution.\n");
+        const int rows = drafts + 1;
+        std::vector<float> temperatures(rows, config.temperature), topPs(rows, config.top_p);
+        std::vector<int> topKs(rows, config.top_k);
+        int accepted = 0;
+        bool ok;
+        if (proposal.proposalUsesLogits) {
+            ok = FastllmCudaMtpRejectionSamplingLogits(targetLogits, (float*)proposal.proposalProbs.cudaData,
+                (float*)proposal.proposalLogsumexp.cudaData, (int*)proposal.proposalDeviceTokens.cudaData,
+                temperatures.data(), topKs.data(), topPs.data(), output, &accepted, 1, drafts, vocab);
+        } else {
+            ok = FastllmCudaMtpRejectionSampling(targetLogits, (float*)proposal.proposalProbs.cudaData,
+                temperatures.data(), topKs.data(), topPs.data(), proposal.proposalTokens.data(),
+                output, &accepted, 1, drafts, vocab);
+        }
+        AssertInFastLLM(ok && accepted >= 0 && accepted <= drafts, "MTP CUDA rejection sampling failed.\n");
+        return accepted;
+    }
+#endif
+
+    int Qwen3_5Model::MtpKvCache::ProposalCapacity() const {
+        return proposalDepth > 0 ? proposalDepth : std::max(1, Qwen35MtpDraftsPerStep());
+    }
+
     std::vector<int> Qwen3_5Model::SampleMtpDraftLogits(
             int device, Data &logits, const std::vector<MtpKvCache*> &caches) {
 #ifndef USE_CUDA
@@ -32421,7 +32438,7 @@ namespace fastllm {
             if (caches[b]->sampleProposal) {
                 MtpKvCache &cache = *caches[b];
                 const int slot = cache.proposalTokens.size();
-                const int capacity = std::max(1, Qwen35MtpDraftsPerStep());
+                const int capacity = cache.ProposalCapacity();
                 AssertInFastLLM(slot < capacity, "MTP proposal probability cache overflow.\n");
                 if (cache.proposalProbs.dims != std::vector<int>({capacity, vocab})) {
                     AssertInFastLLM(slot == 0, "MTP proposal changed vocabulary mid-chain.\n");
@@ -32446,7 +32463,7 @@ namespace fastllm {
                 for (int b = 0; b < batch; ++b) {
                     MtpKvCache &cache = *caches[b];
                     const int slot = cache.proposalTokens.size();
-                    const int capacity = std::max(1, Qwen35MtpDraftsPerStep());
+                    const int capacity = cache.ProposalCapacity();
                     auto prepare = [&](Data &data, DataType type) {
                         data.dataType = type; data.UpdateUnitSize();
                         Qwen3CudaPrepareLocalOutput(data, device);
@@ -32473,7 +32490,7 @@ namespace fastllm {
             }
             for (int b = 0; b < batch; ++b) {
                 MtpKvCache &cache = *caches[b];
-                const int capacity = std::max(1, Qwen35MtpDraftsPerStep());
+                const int capacity = cache.ProposalCapacity();
                 const int slot = cache.proposalTokens.size();
                 auto prepare = [&](Data &data, DataType type) {
                     data.dataType = type; data.UpdateUnitSize();
@@ -32906,9 +32923,12 @@ namespace fastllm {
 #ifdef USE_CUDA
         const std::string mode = Qwen35DraftQuantMode();
         if (mode == "off") return;
-        // Match the TP MTP fast path: unlike DFlash, MTP has no activation
-        // adapter for using the FP16 Marlin layout with BF16/FP32 inputs.
-        if (num_experts != 0 || this->dataType != DataType::FLOAT16) return;
+        // SenseNova's compact BF16 path uses the same activation adapter as
+        // DFlash for a separate draft head. Target verification stays BF16.
+        auto down = weight.weight.find(language_prefix + "layers.0.mlp.down_proj.weight");
+        const bool bf16Head = model_type == "sensenova_loop" && dataType == BFLOAT16 &&
+            down != weight.weight.end() && down->second.dataType == NVFP4_BLOCK_16_E4M3_PACKED;
+        if (num_experts != 0 || (dataType != FLOAT16 && !bf16Head)) return;
         FastllmCudaSetDevice(device);
         // This preparation destructively packs draft weights for an A16
         // backend. Restrict the new SM70 route to FP16 model activations and
@@ -32923,7 +32943,7 @@ namespace fastllm {
                 w.dataDevice == DataDevice::CUDA && w.cudaData &&
                 supportedShape(w.dims[0], w.dims[1]);
         };
-        if (mode == "nvfp4") {
+        if (mode == "nvfp4" && !bf16Head) {
             std::vector<std::string> names = {"mtp.fc.weight"};
             for (int layer = 0; layer < mtp_num_hidden_layers; ++layer) {
                 const std::string prefix = "mtp.layers." + std::to_string(layer) + ".";
@@ -34160,7 +34180,10 @@ namespace fastllm {
             const bool shortlist = !mtpDraftTokenIds.empty() && !cache.sampleProposal;
             Data &draftHead = mtpNvfp4DraftLmHead.dims.empty() ||
                 (!mtpDraftTokenIds.empty() && cache.sampleProposal) ? lmHead : mtpNvfp4DraftLmHead;
-            Linear(*sampleHiddenPtr, draftHead, *GetEmptyData(), logits);
+            if (sampleHiddenPtr->dataType == BFLOAT16 && &draftHead == &mtpNvfp4DraftLmHead)
+                Qwen35DraftLinear(*sampleHiddenPtr, draftHead, *GetEmptyData(), logits);
+            else
+                Linear(*sampleHiddenPtr, draftHead, *GetEmptyData(), logits);
             auto sampleHostToken = [&]() {
                 int draft = sampleDraftFromCudaLogits(logits);
                 if (shortlist) {
@@ -34173,7 +34196,7 @@ namespace fastllm {
             if (cache.deferProposalTokens && !cache.sampleProposal) {
                 // Argmax preserves shortlist-index tie breaking, then publishes
                 // the full-vocabulary ID for the next device-side embedding.
-                const int capacity = std::max(1, Qwen35MtpDraftsPerStep());
+                const int capacity = cache.ProposalCapacity();
                 const int slot = (int)cache.proposalTokens.size();
                 AssertInFastLLM(slot < capacity, "MTP greedy token buffer overflow.\n");
                 for (Data *out : {&cache.proposalDeviceTokens, &cache.proposalFloatTokens}) {

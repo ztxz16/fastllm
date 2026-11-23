@@ -15,7 +15,7 @@ export function renderImageStudio(active) {
       endpoint: (serviceId) => services().find((service) => service.sessionId === serviceId)?.endpoint,
     });
   const items = services()
-    .filter((item) => item.capabilities?.includes("image.generate"))
+    .filter((item) => item.capabilities?.includes("image.generate") && !item.capabilities?.includes("interactive.demo"))
     .map((item) => ({
       id: item.sessionId,
       name: item.profileName || item.modelName,

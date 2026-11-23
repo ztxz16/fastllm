@@ -34,7 +34,7 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
-          typename epilogue_operator_t>
+          typename epilogue_operator_t, bool kPanelMajorB = false, bool kSignalDependent = false, uint32_t kOutputSlices = 1>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
@@ -131,10 +131,24 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : void();
 
     // Utils
+    static_assert(kOutputSlices == 1 || ((kOutputSlices == 2 || kOutputSlices == 4) &&
+        kGemmType == GemmType::Normal && kPanelMajorB && kNumMulticast == 1 && kSwapAB &&
+        SHAPE_M == 6 && SHAPE_N == 5120 && SHAPE_K == 8192 && BLOCK_K == 128 && BLOCK_N == 128 &&
+        kNumUMMAStoreThreads == 128 && kNumSMs == SHAPE_N / BLOCK_N));
+    constexpr bool kNarrowVerifyOutput = kSignalDependent && kOutputSlices == 1 &&
+        kGemmType == GemmType::Normal && kPanelMajorB && kSwapAB && kNumMulticast == 1 &&
+        SHAPE_M == 6 && SHAPE_N == 5120 && SHAPE_K == 8192;
+    const uint32_t outputOffset = kOutputSlices > 1 ? blockIdx.z * (BLOCK_N / kOutputSlices) : 0;
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto lane_idx = ptx::get_lane_idx();
     const auto epilogue_warp_idx = warp_idx - kNumNonEpilogueThreads / 32;
+
+    // The six-row O-B grid leaves room for the following mHC cluster to initialize.
+    // The consumer waits for all stores before reading the projection.
+    if constexpr (kSignalDependent) {
+        if (threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+    }
 
     // Prefetch TMA descriptors at the very beginning
     if (warp_idx == 0) {
@@ -188,13 +202,31 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
     }
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
-    // Wait for primary kernel completion
-    cudaGridDependencySynchronize();
+    if constexpr (!kNarrowVerifyOutput) cudaGridDependencySynchronize();
 
     // Block scheduler
     uint32_t m_block_idx, n_block_idx;
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4>(
         shape_m, shape_n, shape_k, grouped_layout);
+    // O-A produces activations and their scales. The first four immutable B tiles
+    // may move to their final pipeline slots before that dependency is satisfied.
+    constexpr uint32_t kEarlyWeights = 4;
+    if constexpr (kNarrowVerifyOutput) {
+        static_assert(kNumStages >= kEarlyWeights && kNumSMs == SHAPE_N / BLOCK_N);
+        if (warp_idx == 0 && cute::elect_one_sync()) {
+            auto first = scheduler;
+            uint32_t m, n;
+            if (first.get_next_block(m, n)) {
+                #pragma unroll
+                for (uint32_t stage = 0; stage < kEarlyWeights; ++stage) {
+                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, false>(
+                        &tensor_map_b, &smem.full_barriers[stage], smem.b[stage], 0,
+                        (n * (SHAPE_K / BLOCK_K) + stage) * LOAD_BLOCK_N, 1, 0);
+                }
+            }
+        }
+        cudaGridDependencySynchronize();
+    }
     epilogue_operator_t epilogue_operator(epilogue_args);
 
     // Pipeline and TMA phases
@@ -266,7 +298,7 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                     sf_arrival_bytes += sizeof(smem.sfa[0]);
                 }
                 if (k_block_idx % kNumSFBStagesPerLoad == 0) {
-                    uint32_t sfb_n_idx = n_block_idx * BLOCK_N;
+                    uint32_t sfb_n_idx = n_block_idx * BLOCK_N + outputOffset;
                     uint32_t sfb_k_idx = scheduler.template get_global_idx<true, sched::IndexType::SF_K>(
                         shape_sfb_k, SF_BLOCK_K, k_block_idx / kNumSFBStagesPerLoad, m_block_idx);
                     tma::copy<SF_BLOCK_N, SF_BLOCK_K, 0>(&tensor_map_sfb, &smem.sf_full_barriers[stage_idx], smem.sfb[stage_idx], sfb_n_idx, sfb_k_idx);
@@ -281,9 +313,19 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
                 if constexpr (kMajorA == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_M, BLOCK_K, kSwizzleAMode, a_dtype_t, kIsBatchedMM>(
                         &tensor_map_a, &smem.full_barriers[stage_idx], smem.a[stage_idx], m_idx, k_a_idx, kNumMulticast, batch_idx);
-                if constexpr (kMajorB == cute::UMMA::Major::K)
-                    tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
-                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], k_b_idx, n_idx, kNumMulticast, batch_idx);
+                if constexpr (kOutputSlices > 1) {
+                    // The descriptor pads unused physical MMA rows. Each CTA reads just its
+                    // own output channels from HBM and visits the complete K dimension in order.
+                    tma::copy_nd<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, 5>(
+                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], 1,
+                        0, 0, blockIdx.z, k_b_idx / BLOCK_K, n_block_idx);
+                } else if constexpr (kMajorB == cute::UMMA::Major::K) {
+                    if (!kNarrowVerifyOutput || k_block_idx >= kEarlyWeights)
+                        tma::copy<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
+                        &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], kPanelMajorB ? 0u : k_b_idx,
+                        kPanelMajorB ? n_idx * (shape_k / BLOCK_K) + (k_b_idx / BLOCK_K) * LOAD_BLOCK_N : n_idx,
+                        kNumMulticast, batch_idx);
+                }
                 if constexpr (kMajorB == cute::UMMA::Major::MN)
                     tma::copy<LOAD_BLOCK_N, BLOCK_K, kSwizzleBMode, b_dtype_t, kIsBatchedMM>(
                         &tensor_map_b, &smem.full_barriers[stage_idx], smem.b[stage_idx], n_idx, k_b_idx, kNumMulticast, batch_idx);
@@ -349,7 +391,8 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
 
             // Dynamic update of UMMA N based on effective M, when swap-AB is enabled
             if constexpr (kSwapAB) {
-                uint32_t umma_n = scheduler.get_aligned_effective_m_in_block(m_block_idx);
+                // Six verification rows fit one 128 x 8 MMA. Keep all K steps in order.
+                uint32_t umma_n = kNarrowVerifyOutput ? 8 : scheduler.get_aligned_effective_m_in_block(m_block_idx);
                 mma::sm100::update_instr_desc_with_umma_n(instr_desc, umma_n);
             }
 
@@ -523,7 +566,22 @@ sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
             const auto base_n_idx = n_block_idx * BLOCK_N;
             const bool is_empty_group = is_k_grouped_contiguous(kGemmType) and scheduler.current_shape_k == 0;
 
-            if constexpr (kSwapAB) {
+            if constexpr (kNarrowVerifyOutput || kOutputSlices > 1) {
+                uint32_t values[8];
+                cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_base_addr, values[0], values[1], values[2], values[3],
+                                                                      values[4], values[5], values[6], values[7]);
+                cutlass::arch::fence_view_async_tmem_load();
+                const uint32_t column = epilogue_warp_idx * 32 + lane_idx;
+                if (column < BLOCK_N / kOutputSlices) {
+                    auto *out = static_cast<__nv_bfloat16 *>(epilogue_args.directOutput);
+                    #pragma unroll
+                    for (uint32_t row = 0; row < SHAPE_M; ++row)
+                        out[row * SHAPE_N + base_n_idx + outputOffset + column] =
+                            __float2bfloat16_rn(__uint_as_float(values[row]));
+                }
+                ptx::tcgen05_before_thread_sync();
+                smem.tmem_empty_barriers[accum_stage_idx].arrive();
+            } else if constexpr (kSwapAB) {
                 const auto effective_m = scheduler.get_aligned_effective_m_in_block(m_block_idx);
                 epilogue::sm100_store_cd_swap_ab<
                     BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,

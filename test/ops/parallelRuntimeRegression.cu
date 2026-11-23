@@ -256,9 +256,10 @@ int main() {
         const size_t wideFields[] = {2064, 0, 256, 512};
         const size_t wideBytes = wideFields[0] + wideFields[2] + wideFields[3];
         if (dp >= 4) transfer.ReserveFixed(513, wideBytes);
-        for (int n : {0, 1, 2, 7, 8, 9, 32, 33, 129, 513, 2, 0, 9}) for (bool skew : {false, true}) {
-            const size_t *widths = n == 33 ? wideFields : smallFields;
-            const size_t rowBytes = n == 33 ? wideBytes : 37;
+        for (int n : {0, 1, 2, 7, 8, 9, 32, 33, 128, 129, 513, 2, 0, 9}) for (bool skew : {false, true}) {
+            const bool aligned = n == 1 || n == 33 || n == 128;
+            const size_t *widths = aligned ? wideFields : smallFields;
+            const size_t rowBytes = aligned ? wideBytes : 37;
             std::vector<int> owners(n);
             for (int i = 0; i < n; ++i) owners[i] = skew ? dp - 1 : (i * 7) % dp;
             RowPartition rows(dp, owners);

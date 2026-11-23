@@ -69,9 +69,21 @@ CUDA_HOME=/path/to/cuda-13.1 CUDA_VISIBLE_DEVICES=0 \
 
 ## 仅关闭 Marlin 的回退对照
 
-进程启动前设置 `FASTLLM_CUDA_NVFP4_MARLIN=0` 禁止 NVFP4 权重转换成 Marlin 布局；默认值为1。已经转换的权重仍必须由理解其布局的路径处理，因此需要重启服务切换，不能在线改变布局。
+FP16 激活路径默认原地转换 NVFP4 权重。启动进程前设置 `FASTLLM_CUDA_NVFP4_MARLIN=0` 可关闭转换。已转换的权重需要对应的 kernel 读取，切换布局时需要重启服务。
 
 这是原始格式 GEMV / 解量化后 FP16 GEMM 的回退对照，当前不等价于原生 NVFP4 TMA prefill。设置 `FASTLLM_CUDA_FP8_MARLIN=0` 可同时禁用 FP8 Marlin（SM120上默认已关闭）。不引入任何权重副本缓存。
+
+## SenseNova-Loop-9B 的 BF16 激活、NVFP4 权重 decode
+
+在 SM120 上，使用 `FASTLLM_CUDA_NVFP4_MARLIN=1 ftllm server <模型目录> --mtp 0`，可为单请求和批量文本 decode 启用 Marlin。紧凑 BF16 路径默认保留原布局。显式启用后，prefill 仍读取原权重，decode 另缓存一份 Marlin 权重，该模型约增加 3.62 GiB 显存。由于 FP32 归约顺序不同，对比 batch 和单请求 logits 时应使用相同设置。
+
+使用 `--mtp 1` 或 `--mtp 2` 可启用模型自带的草稿头。设置 `FASTLLM_QWEN35_MTP_PROFILE=1` 后，每条使用 MTP 的 SenseNova 请求结束时会打印提议数、接受数和按位置统计的接受数。
+
+## SenseNova-Loop-9B 的 FP8 文本 prefill
+
+`igerry/SenseNova-Loop-9B-FP8` 的权重是 E4M3。默认以 BF16 激活计算。关闭 MTP 时，2 到 8 个等长请求可以共享展开后的 BF16 权重，每条请求沿用单独 prefill 的 GEMM 形状。此路径要求每条输入至少 128 tokens，合计最多 4096 tokens。
+
+在 SM120 上，启动服务时传入 `--fp8_prefill true` 可在支持的 prefill 形状上启用 W8A8。该路径按 token 量化激活，直接读取 E4M3 权重与独立的行 scale，再用 FP32 累加并输出 BF16。激活量化会改变 logits。进程首次遇到某个矩阵形状时会对 cuBLASLt 候选算法测速，重启后可能选中不同算法，贪心输出也可能随之变化。
 
 ## SM120 共用 NVFP4 权重布局
 

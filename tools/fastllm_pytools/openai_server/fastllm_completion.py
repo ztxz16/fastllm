@@ -14,6 +14,7 @@ import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from functools import cached_property
 from http import HTTPStatus
 from typing import (Any, AsyncGenerator, AsyncIterator, Dict, Iterable, List,
                     Optional, Tuple, Union)
@@ -80,6 +81,7 @@ ConversationContent = Union[str, List[Dict[str, Any]]]
 _input_preparation_executor = ThreadPoolExecutor(
     max_workers=min(4, os.cpu_count() or 1), thread_name_prefix="fastllm-input")
 
+_THINK_TAGS = ("<think>", "</think>")
 _KIMI_K3_THINK_OPEN = "<|open|>think<|sep|>"
 _KIMI_K3_THINK_CLOSE = "<|close|>think<|sep|>"
 _KIMI_K3_RESPONSE_OPEN = "<|open|>response<|sep|>"
@@ -464,8 +466,33 @@ class FastLLmCompletion:
       return (enable_thinking and self._is_dots3_note_model()
               and not getattr(self.model, "force_chat_template", False))
 
-  def _uses_tagged_reasoning_response(self, enable_thinking: bool) -> bool:
-      return (self._is_deepseek_v4_reasoning_response(enable_thinking)
+  @cached_property
+  def _hy4_think_tags(self):
+      # Each official tokenizer has its own namespace for these two tokens.
+      if getattr(self.model, "force_chat_template", False):
+          return None
+      if getattr(self.model, "get_type", lambda: None)() != "hy_v4_flash":
+          return None
+      tokenizer = getattr(self.model, "hf_tokenizer", None)
+      if tokenizer is None:
+          return None
+      tokens = tokenizer.get_added_vocab()
+      for token in tokens:
+          if token.startswith("<think:") and token.endswith(">"):
+              end = "</" + token[1:]
+              if end in tokens:
+                  return token, end
+      return None
+
+  def _uses_inkling_messages(self):
+      config = getattr(self.model, "config", None)
+      return isinstance(config, dict) and config.get("model_type") == "inkling2_loop"
+
+  def _uses_tagged_reasoning_response(self, enable_thinking: bool, template_kwargs=None) -> bool:
+      if self._hy4_think_tags:
+          return (template_kwargs or {}).get("reasoning_effort", "high") != "no_think"
+      return (self._uses_inkling_messages()
+              or self._is_deepseek_v4_reasoning_response(enable_thinking)
               or self._is_poolside_reasoning_response(enable_thinking)
               or self._is_kimi_k3_reasoning_response(enable_thinking)
               or self._is_glm5_next_reasoning_response()
@@ -573,7 +600,16 @@ class FastLLmCompletion:
       request: ChatCompletionRequest,
       qwen3_5_reasoning_effort: Optional[str],
       glm5_next_reasoning_effort: Optional[str] = None,
+      enable_thinking: Optional[bool] = None,
   ) -> Optional[Dict[str, Any]]:
+      if self._hy4_think_tags:
+          kwargs = dict(request.chat_template_kwargs or {})
+          effort = request.reasoning_effort or kwargs.get("reasoning_effort")
+          if enable_thinking is False or effort == "none":
+              effort = "no_think"
+          if effort is not None:
+              kwargs["reasoning_effort"] = effort
+          return kwargs
       if (request.chat_template_kwargs is None
               and qwen3_5_reasoning_effort is None
               and glm5_next_reasoning_effort is None):
@@ -891,9 +927,9 @@ class FastLLmCompletion:
           return "</think>"
       return text
 
-  def _strip_optional_think_start(self, text: str) -> str:
-      if text.startswith("<think>"):
-          text = text[len("<think>"):]
+  def _strip_optional_think_start(self, text: str, tag="<think>") -> str:
+      if text.startswith(tag):
+          text = text[len(tag):]
           if text.startswith("\n"):
               text = text[1:]
       return text
@@ -906,12 +942,15 @@ class FastLLmCompletion:
       return 0
 
   def _new_reasoning_state(self, emit_reasoning_content, preserve_xtml=False):
+      if self._uses_inkling_messages():
+          return {"format": "inkling", "phase": "content", "buffer": "", "tools": preserve_xtml}
       reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
       return {
           "active": emit_reasoning_content,
           "buffer": "",
           "started": False,
           "format": reasoning_format,
+          "think_tags": self._hy4_think_tags or _THINK_TAGS,
           "phase": "reasoning" if emit_reasoning_content else "content",
           "reasoning_started": False,
           "preserve_xtml": preserve_xtml,
@@ -922,6 +961,13 @@ class FastLLmCompletion:
 
   def _split_reasoning_response(self, result, emit_reasoning_content,
                                preserve_xtml=False):
+      if self._uses_inkling_messages():
+          from .inkling_messages import consume
+          state = {"phase": "content", "buffer": ""}
+          parts = list(consume(result, state))
+          parts.append((state["phase"], state["buffer"]))
+          return ("".join(text for channel, text in parts if channel == "content" or (preserve_xtml and channel in ("tool", "tool_json"))),
+                  "".join(text for channel, text in parts if channel == "reasoning") or None)
       if self._is_kimi_k3_model():
           if emit_reasoning_content:
               result, reasoning_content = self._split_kimi_k3_reasoning(
@@ -932,10 +978,10 @@ class FastLLmCompletion:
               reasoning_content = None
               if not preserve_xtml:
                   result = self._strip_kimi_k3_response_wrapper(result)
-      elif (self._is_qwen_reasoning_model()
+      elif (self._hy4_think_tags or self._is_qwen_reasoning_model()
             or self._is_dots3_note_model() or self._is_naive_n05_model()):
           result, reasoning_content = self._split_qwen3_5_reasoning(
-              result, emit_reasoning_content)
+              result, emit_reasoning_content, self._hy4_think_tags or _THINK_TAGS)
       elif self._is_glm5_next_model():
           result, reasoning_content = self._split_glm5_next_reasoning(
               result, emit_reasoning_content)
@@ -964,11 +1010,12 @@ class FastLLmCompletion:
       self,
       result: str,
       emit_reasoning_content: bool,
+      tags=_THINK_TAGS,
   ) -> Tuple[str, Optional[str]]:
       if not emit_reasoning_content:
           return result, None
-      result = self._strip_optional_think_start(result)
-      think_end = "</think>"
+      think_start, think_end = tags
+      result = self._strip_optional_think_start(result, think_start)
       think_end_idx = result.find(think_end)
       if think_end_idx < 0:
           # The Qwen3.5 generation prompt ends inside <think>. A truncated
@@ -1002,10 +1049,9 @@ class FastLLmCompletion:
       if not state.get("active"):
           return [], delta_text
 
-      think_end = "</think>"
+      think_start, think_end = state.get("think_tags", _THINK_TAGS)
       state["buffer"] = state.get("buffer", "") + delta_text
       if not state.get("started"):
-          think_start = "<think>"
           if state["buffer"].startswith(think_start):
               state["buffer"] = state["buffer"][len(think_start):]
               state["started"] = True
@@ -1180,11 +1226,30 @@ class FastLLmCompletion:
               reasoning_content=reasoning_delta)], ""
       return [], ""
 
+  def _finish_reasoning_delta(self, state):
+      tail = state["buffer"]
+      if not tail:
+          return None
+      if state["format"] == "inkling":
+          if state["phase"] == "content":
+              return DeltaMessage(content=tail)
+          if state["phase"] == "reasoning":
+              return DeltaMessage(reasoning_content=tail)
+          return None
+      if state["format"] != "kimi_k3" and state["active"]:
+          return DeltaMessage(reasoning_content=tail)
+      return None
+
   def _consume_tagged_reasoning_delta(
       self,
       delta_text: str,
       state: Dict[str, Any],
   ) -> Tuple[List[DeltaMessage], str]:
+      if state.get("format") == "inkling":
+          from .inkling_messages import consume
+          parts = list(consume(delta_text, state))
+          return ([DeltaMessage(reasoning_content=text) for channel, text in parts if channel == "reasoning"],
+                  "".join(text for channel, text in parts if channel == "content" or (state["tools"] and channel in ("tool", "tool_json"))))
       if state.get("format") == "kimi_k3":
           return self._consume_kimi_k3_reasoning_delta(
               delta_text, state)
@@ -3156,9 +3221,6 @@ class FastLLmCompletion:
           if thinking_effort is None:
               thinking_effort = self._resolve_deepseek_v41_reasoning_effort(
                   reasoning_request)
-          template_kwargs = self._resolve_chat_template_kwargs(
-              reasoning_request, self._resolve_qwen3_5_reasoning_effort(reasoning_request),
-              self._resolve_glm5_next_reasoning_effort(reasoning_request))
           enable_thinking = self.enable_thinking
           if reasoning_request.reasoning_effort is not None:
               enable_thinking = reasoning_request.reasoning_effort != "none"
@@ -3167,6 +3229,9 @@ class FastLLmCompletion:
               if thinking_type not in {"enabled", "adaptive", "disabled"}:
                   raise ValueError("thinking.type must be enabled, adaptive, or disabled")
               enable_thinking = thinking_type != "disabled"
+          template_kwargs = self._resolve_chat_template_kwargs(
+              reasoning_request, self._resolve_qwen3_5_reasoning_effort(reasoning_request),
+              self._resolve_glm5_next_reasoning_effort(reasoning_request), enable_thinking)
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
           return self.create_error_response(str(error))
@@ -3218,7 +3283,7 @@ class FastLLmCompletion:
       result_generator = self._stream_response_handle_with_statistics(
           handle, response_statistics)
 
-      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
+      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking, template_kwargs)
       if request.stream:
           return (self.anthropic_message_stream_generator(
               request, raw_request, result_generator, request_id,
@@ -3377,7 +3442,7 @@ class FastLLmCompletion:
           return self.create_error_response(str(error))
       chat_template_kwargs = self._resolve_chat_template_kwargs(
           request, qwen3_5_reasoning_effort,
-          glm5_next_reasoning_effort)
+          glm5_next_reasoning_effort, enable_thinking)
       tool_choice = self._serialize_tool_choice(request.tool_choice)
 
       #logging.info(request)
@@ -3396,6 +3461,17 @@ class FastLLmCompletion:
       messages = self._apply_kimi_k3_required_tool_guidance(
           messages, tools, tool_choice)
       try:
+          if self._uses_inkling_messages():
+              # Inkling's template declares every supplied tool and has no
+              # tool_choice field. Limit declarations to the selected functions.
+              name = self._named_tool_choice(tool_choice)
+              if tool_choice == "none":
+                  tools = None
+                  request = request.model_copy(update={"tools": None})
+              elif name is not None:
+                  tools = [tool for tool in tools or [] if tool["function"]["name"] == name]
+                  if not tools:
+                      raise ValueError(f"tool_choice requests unknown function {name!r}")
           messages, tools = self._apply_dots_tool_choice(
               messages, tools, tool_choice)
           messages, tools = self._apply_qwen_xml_tool_choice(
@@ -3454,7 +3530,7 @@ class FastLLmCompletion:
       # --think 是用户显式指定"在输出前补 <think>\n 起始标签"的开关，
       # 严格按用户意愿执行，与 enable_thinking（是否进入思考模式）解耦。
       need_think_prefix = self.think
-      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
+      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking, chat_template_kwargs)
       # Streaming response
       if request.stream:
           stream = self.chat_completion_stream_generator(
@@ -3874,13 +3950,11 @@ class FastLLmCompletion:
                     data = chunk.model_dump_json(exclude_unset=True)
                 yield f"data: {data}\n\n"
 
-        if (emit_reasoning_content
-                and reasoning_state.get("format") != "kimi_k3"
-                and reasoning_state.get("active")
-                and reasoning_state.get("buffer")):
+        tail = self._finish_reasoning_delta(reasoning_state)
+        if tail is not None:
             choice_data = ChatCompletionResponseStreamChoice(
                 index = 0,
-                delta = DeltaMessage(reasoning_content = reasoning_state["buffer"]),
+                delta = tail,
                 logprobs = None,
                 finish_reason = None)
             chunk = ChatCompletionStreamResponseWithUsage(
@@ -4140,12 +4214,9 @@ class FastLLmCompletion:
               # A terminal native handle may be reused before we yield the
               # parser's last buffered call or the closing SSE events.
               self._release_conversation_handle(request_id, handle)
-              if (emit_reasoning_content
-                      and reasoning_state.get("format") != "kimi_k3"
-                      and reasoning_state.get("active")
-                      and reasoning_state.get("buffer")):
-                  yield DeltaMessage(reasoning_content=reasoning_state["buffer"])
-                  reasoning_state["buffer"] = ""
+              tail = self._finish_reasoning_delta(reasoning_state)
+              if tail is not None:
+                  yield tail
               if tool_parser is None:
                   return
               usage = self._anthropic_usage(

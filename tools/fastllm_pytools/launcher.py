@@ -1,4 +1,5 @@
 import argparse
+import errno
 import hashlib
 import hmac
 import importlib.util
@@ -24,15 +25,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .modelscope_download import PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX
 from .agent_runtime_install import AgentRuntimeInstaller
 from .launcher_harness import HarnessRuntime
 from .launcher_opencode import OpenCodeRuntime
 from .launcher_codex import CodexRuntime
 from .launcher_claude import ClaudeRuntime
 from .launcher_mtp import detect_mtp_support, _dspark_config
-from .model_catalog import MODELSCOPE_DOWNLOAD_GROUPS
-from .modelscope_download import _filter_file_sizes
+from .model_catalog import DOWNLOAD_BUNDLES, MODELSCOPE_DOWNLOAD_GROUPS
+from .modelscope_download import (
+    PROGRESS_PREFIX as MODELSCOPE_PROGRESS_PREFIX,
+    _filter_file_sizes, bundle_receipt, preparation_error, uses_modelscope,
+)
 from .startup_progress import PROGRESS_PREFIX
 from .ui_hardware import detect_hardware
 from .ui_plugins import BUNDLED_PLUGINS, PluginRegistry, install_plugin_routes, mount_studio_assets
@@ -131,6 +134,7 @@ MOE_MODEL_TYPES = frozenset({
     "glm5_next_text",
     "glm_moe_dsa",
     "hy_v3",
+    "hy_v4_flash",
     "kimi_k3",
     "laguna",
     "minimax_m1",
@@ -161,6 +165,8 @@ TP_UNSUPPORTED_ARCHITECTURES = frozenset({
     "DeepseekV3ForCausalLM",
     "Glm4MoeForCausalLM",
     "GlmMoeDsaForCausalLM",
+    "HYV4FlashForConditionalGeneration",
+    "SenseNovaLoopForConditionalGeneration",
     "Step3p5ForCausalLM",
     "Step3p7ForConditionalGeneration",
 })
@@ -198,6 +204,7 @@ class DownloadConfig:
     max_workers: int = 4
     token: str = ""
     include: str = ""
+    bundle: str = ""
 
 
 def _modelscope_is_available() -> bool:
@@ -233,9 +240,16 @@ def _coerce_config(payload: Any) -> DeployConfig:
     if not isinstance(payload, dict):
         raise LauncherError("Invalid configuration format.")
     config = config_from_dict(payload)
+    config.model = _local_launch_entry(config.model)
+    if config.backend != "llm":
+        config.command = "server"
     if config.command not in ("server", "webui"):
         raise LauncherError("The browser launcher supports only ftllm server or ftllm webui.")
     return config
+
+
+def _profile_view(config):
+    return {**asdict(config), "backend": config.backend}
 
 
 def _coerce_download_config(payload: Any) -> DownloadConfig:
@@ -268,6 +282,7 @@ def _coerce_download_config(payload: Any) -> DownloadConfig:
         max_workers=max_workers,
         token=token,
         include=include,
+        bundle=text_value("bundle").strip(),
     )
 
 
@@ -311,6 +326,19 @@ def _validate_download_config(config: DownloadConfig) -> List[str]:
         errors.append("Download file patterns may contain at most 64 entries.")
     elif any(len(pattern) > 512 or pattern.startswith("-") for pattern in include_patterns):
         errors.append("Each download file pattern must be at most 512 characters and cannot start with '-'.")
+    if config.bundle:
+        recipe = DOWNLOAD_BUNDLES.get(config.bundle)
+        if not recipe or recipe["id"] != config.model_id or config.include or config.revision != "master":
+            errors.append("Bundle source, revision and file selection are fixed by the catalog.")
+        elif problem := preparation_error(recipe):
+            errors.append(problem)
+    if config.target_dir and not errors:
+        try:
+            bundle_receipt(Path(config.target_dir), config.bundle)
+        except (ValueError, OSError) as error:
+            errors.append(str(error))
+    if uses_modelscope(DOWNLOAD_BUNDLES.get(config.bundle)) and not _modelscope_is_available():
+        errors.append(MODELSCOPE_INSTALL_ERROR)
     return errors
 
 
@@ -330,6 +358,8 @@ def _download_arguments(config: DownloadConfig) -> List[str]:
         "--max-workers",
         str(config.max_workers),
     ]
+    if config.bundle:
+        arguments.extend(("--bundle", config.bundle))
     for pattern in _download_include_patterns(config.include):
         arguments.extend(("--include", pattern))
     return arguments
@@ -346,14 +376,9 @@ def _download_display_command(config: DownloadConfig) -> str:
     return " ".join(shlex.quote(part) for part in argv) + suffix
 
 
-def _downloaded_model_path(config: DownloadConfig) -> str:
-    """Choose an unambiguous GGUF entry point, keeping HF directories intact."""
-    root = Path(config.target_dir)
-    patterns = _download_include_patterns(config.include)
-    if not patterns and (root / "config.json").is_file():
-        return str(root)
+def _single_gguf_entry(root, files, patterns=()):
     candidates = []
-    for path in root.rglob("*.gguf"):
+    for path in files:
         if not path.is_file() or path.name.lower().startswith("mmproj"):
             continue
         if not _filter_file_sizes({path.relative_to(root).as_posix(): 0}, patterns):
@@ -366,13 +391,43 @@ def _downloaded_model_path(config: DownloadConfig) -> str:
     return str(candidates[0]) if len(candidates) == 1 else str(root)
 
 
-def _display_endpoint(config: DeployConfig) -> str:
-    host = (
-        "127.0.0.1"
-        if config.command == "webui"
-        else config.host.strip() or "127.0.0.1"
-    )
-    return f"http://{_browser_host(host)}:{config.port.strip()}"
+def _local_launch_entry(model):
+    if not model:
+        return model
+    root = Path(model).expanduser()
+    if not root.is_dir():
+        return model
+    marker = root / ".ftllm-bundle.json"
+    try:
+        if marker.is_file() and marker.stat().st_size <= MODEL_CONFIG_SIZE_LIMIT:
+            receipt = json.loads(marker.read_text(encoding="utf-8"))
+            preset = receipt.get("preset") if isinstance(receipt, dict) else None
+            recipe = DOWNLOAD_BUNDLES.get(preset) if isinstance(preset, str) else None
+            if recipe and recipe["entry"]:
+                return str(root / recipe["entry"])
+        if (root / "config.json").is_file() or not any(root.glob("*.gguf")):
+            return model
+        from .model_service import identify_model
+        if identify_model(str(root)).backend == "llm":
+            return _single_gguf_entry(root, root.glob("*.gguf"))
+    except (OSError, ValueError):
+        pass
+    return model
+
+
+def _downloaded_model_path(config: DownloadConfig) -> str:
+    """Keep service bundles intact, including pipelines with a single GGUF component."""
+    from .model_service import identify_model
+    root = Path(config.target_dir)
+    if config.bundle:
+        return str(root / DOWNLOAD_BUNDLES[config.bundle]["entry"])
+    service = identify_model(str(root))
+    if service.backend != "llm":
+        return str(root)
+    patterns = _download_include_patterns(config.include)
+    if not patterns and (root / "config.json").is_file():
+        return str(root)
+    return _single_gguf_entry(root, root.rglob("*.gguf"), patterns)
 
 
 def _redacted_command(
@@ -525,7 +580,7 @@ class LauncherRuntime:
         self._shutdown_callback = callback
 
     def profiles(self) -> List[Dict[str, Any]]:
-        return [asdict(config) for config in load_saved_configs(self.config_path)]
+        return [_profile_view(config) for config in load_saved_configs(self.config_path)]
 
     def default_profile(self) -> Dict[str, Any]:
         configs = load_saved_configs(self.config_path)
@@ -533,7 +588,7 @@ class LauncherRuntime:
         config.command = "server"
         config.config_mode = "auto"
         config.device = "auto"
-        return asdict(config)
+        return _profile_view(config)
 
     def _close_webui_locked(self):
         if self._webui_app is not None:
@@ -587,8 +642,8 @@ class LauncherRuntime:
             from .service_backends import BACKENDS
             backend = BACKENDS[self._state.get("backend", "llm")]
             contract = backend.api_contract(self._state) if backend.kind != "llm" else {}
-            return {**contract, "sessionId": self._state["sessionId"],
-                    "baseUrl": self._state["endpoint"].rstrip("/") + "/v1",
+            return {"baseUrl": self._state["endpoint"].rstrip("/") + "/v1",
+                    **contract, "sessionId": self._state["sessionId"],
                     "model": self._state["modelName"], "apiKey": self._service_api_key}
 
     def open_agent(self, agent_id, launcher_host, browser_origin, *, install=False):
@@ -626,8 +681,7 @@ class LauncherRuntime:
             {
                 "id": group["id"],
                 "label": group["label"],
-                "description": group.get("description", ""),
-                "accent": group.get("accent", "slate"),
+                "category": group.get("category", "language"),
                 "models": [dict(model) for model in group.get("models", ())],
             }
             for group in MODELSCOPE_DOWNLOAD_GROUPS
@@ -650,8 +704,8 @@ class LauncherRuntime:
         save_saved_configs(configs, self.config_path)
         return {
             "index": saved_index,
-            "profile": asdict(config),
-            "profiles": [asdict(item) for item in configs],
+            "profile": _profile_view(config),
+            "profiles": [_profile_view(item) for item in configs],
         }
 
     def delete_profile(self, index: int) -> Dict[str, Any]:
@@ -661,11 +715,12 @@ class LauncherRuntime:
         deleted = configs.pop(index)
         save_saved_configs(configs, self.config_path)
         return {
-            "deleted": asdict(deleted),
-            "profiles": [asdict(item) for item in configs],
+            "deleted": _profile_view(deleted),
+            "profiles": [_profile_view(item) for item in configs],
         }
 
     def preview(self, payload: Any) -> Dict[str, Any]:
+        from .service_backends import BACKENDS, launcher_host
         config = _coerce_config(payload)
         field_errors = []
         errors = validate_config(config, field_errors)
@@ -684,9 +739,14 @@ class LauncherRuntime:
             active = self._state["phase"] in ("starting", "running", "stopping")
             matches = (signature == self._launch_signature
                        if active and signature is not None and self._launch_signature is not None else None)
+        backend_id = config.backend
+        backend = BACKENDS.get(backend_id)
+        host = launcher_host(config, backend)
         return {
             "command": command,
-            "endpoint": _display_endpoint(config),
+            "backend": backend_id,
+            "backendLabel": backend.label if backend else "",
+            "endpoint": f"http://{_browser_host(host)}:{config.port.strip()}",
             "errors": errors,
             "fieldErrors": field_errors,
             "runtimeSessionId": session,
@@ -696,8 +756,6 @@ class LauncherRuntime:
     def preview_download(self, payload: Any) -> Dict[str, Any]:
         config = _coerce_download_config(payload)
         errors = _validate_download_config(config)
-        if not _modelscope_is_available():
-            errors.append(MODELSCOPE_INSTALL_ERROR)
         return {
             "command": _download_display_command(config) if not errors else "",
             "destination": config.target_dir,
@@ -724,8 +782,6 @@ class LauncherRuntime:
     def start_download(self, payload: Any) -> Dict[str, Any]:
         config = _coerce_download_config(payload)
         errors = _validate_download_config(config)
-        if not _modelscope_is_available():
-            errors.append(MODELSCOPE_INSTALL_ERROR)
         if errors:
             raise LauncherError("\n".join(errors))
 
@@ -758,6 +814,7 @@ class LauncherRuntime:
                 "phase": "starting",
                 "pid": None,
                 "modelId": config.model_id,
+                "stage": "", "component": "", "failure": "",
                 "destination": config.target_dir,
                 "modelPath": "",
                 "progress": 0.0,
@@ -829,11 +886,19 @@ class LauncherRuntime:
             except Exception:
                 pass
 
-    def _handle_download_progress(self, event: Dict[str, int], generation: int):
+    def _handle_download_progress(self, event: Dict[str, Any], generation: int):
         with self._lock:
             if generation != self._download_generation:
                 return
+            if "error" in event:
+                self._download_state["failure"] = event["error"]
+                if self._download_state["phase"] == "failed":
+                    self._download_state["message"] = event["error"]
+                self._append_log("modelscope", "error", event["error"])
+                return
             total_bytes = event["totalBytes"]
+            if self._download_state["phase"] not in ("starting", "downloading"):
+                return
             downloaded_bytes = event["downloadedBytes"]
             total_files = event["totalFiles"]
             completed_files = event["completedFiles"]
@@ -855,6 +920,8 @@ class LauncherRuntime:
                 "totalBytes": total_bytes,
                 "completedFiles": completed_files,
                 "totalFiles": total_files,
+                "stage": event.get("stage", ""),
+                "component": event.get("component", ""),
                 "message": f"Downloading model... Overall progress {progress:.1f}%",
             })
 
@@ -885,7 +952,7 @@ class LauncherRuntime:
                     if completed
                     else "Download cancelled. It can be resumed from the same directory."
                     if cancelling
-                    else f"Model download failed (code={exit_code})"
+                    else self._download_state.get("failure") or f"Model download failed (code={exit_code})"
                 ),
                 "exitCode": exit_code,
                 "modelPath": model_path if completed else "",
@@ -959,14 +1026,12 @@ class LauncherRuntime:
 
     def start(self, payload: Any) -> Dict[str, Any]:
         config = _coerce_config(payload)
-        from .service_backends import get_backend
+        from .service_backends import get_backend, launcher_host
         errors = validate_config(config)
         if errors:
             raise LauncherError("\n".join(errors))
         backend = get_backend(config)
-        port_host = (
-            "127.0.0.1" if config.command == "webui" else config.host.strip()
-        )
+        port_host = launcher_host(config, backend)
         argv = build_fastllm_argv(config)
         api_key = config.api_key.strip()
         for index, value in enumerate(argv):
@@ -977,7 +1042,7 @@ class LauncherRuntime:
         environment_overrides = build_fastllm_env(config)
         launch_signature = (tuple(argv), tuple(sorted(environment_overrides.items())))
         display_command = _redacted_command(argv, environment_overrides)
-        endpoint = _display_endpoint(config)
+        endpoint = f"http://{_browser_host(port_host)}:{config.port.strip()}"
         argv = list(argv)
         if backend.kind == "llm" and config.command == "server" and "--startup-progress" not in argv:
             argv.extend(["--startup-progress", "ndjson"])
@@ -996,7 +1061,7 @@ class LauncherRuntime:
         with self._lock:
             if self._process is not None and self._process.poll() is None:
                 raise LauncherError("A model service is already running. Stop it first.")
-            if not _port_is_available(port_host, int(config.port)):
+            if not _port_is_available(port_host, int(config.port), interactive=backend.kind == "interactive"):
                 raise LauncherError(
                     f"Service port {port_host}:{config.port.strip()} is already in use."
                 )
@@ -1338,19 +1403,31 @@ class LauncherRuntime:
         self.stop()
 
 
-def _port_is_available(host: str, port: int) -> bool:
+def _port_is_available(host: str, port: int, *, interactive: bool = False) -> bool:
     host = host or "0.0.0.0"
     normalized_host = host.strip("[]")
     family = socket.AF_INET6 if ":" in normalized_host else socket.AF_INET
     try:
         with socket.socket(family, socket.SOCK_STREAM) as listener:
+            # Uvicorn uses REUSEADDR and duo_live uses REUSEPORT on Linux.
+            # Match them so a just-closed stream in TIME_WAIT permits restart.
+            if os.name != "nt" or interactive:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if interactive and hasattr(socket, "SO_REUSEPORT"):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             listener.bind((normalized_host, port))
+        if interactive:
+            # REUSEPORT can bind beside a live listener. Close our own probe
+            # socket before connecting so we only test an existing service.
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                return probe.connect_ex((normalized_host, port)) == errno.ECONNREFUSED
         return True
     except (OSError, OverflowError):
         return False
 
 
-def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
+def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, Any]]:
     value = str(line).strip()
     if not value.startswith(MODELSCOPE_PROGRESS_PREFIX):
         return None
@@ -1358,6 +1435,9 @@ def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
         payload = json.loads(value[len(MODELSCOPE_PROGRESS_PREFIX):])
     except (json.JSONDecodeError, TypeError):
         return None
+    if (isinstance(payload, dict) and payload.get("version") == 1 and payload.get("type") == "download.error"
+            and isinstance(payload.get("error"), str) and payload["error"]):
+        return {"error": payload["error"][:1000]}
     if (
         not isinstance(payload, dict)
         or payload.get("version") != 1
@@ -1376,6 +1456,9 @@ def _parse_modelscope_download_progress(line: str) -> Optional[Dict[str, int]]:
     result["completedFiles"] = min(
         result["completedFiles"], result["totalFiles"]
     )
+    if payload.get("stage") in ("fetch", "verify", "convert"):
+        result["stage"] = payload["stage"]
+        result["component"] = str(payload.get("component", ""))[:512]
     return result
 
 
@@ -1476,6 +1559,13 @@ def _positive_number(value: Any) -> float:
 
 def _read_model_config_for_recommendation(model_path: str) -> Dict[str, Any]:
     path = Path(os.path.abspath(os.path.expanduser(model_path)))
+    if path.is_file() and path.suffix.lower() == ".gguf":
+        from .gguf_metadata import read_gguf_metadata
+        try:
+            if read_gguf_metadata(path, {"general.architecture"}).get("general.architecture") == "hy_v4_flash":
+                return {"model_type": "hy_v4_flash", "architectures": ["HYV4FlashForConditionalGeneration"]}
+        except (ValueError, OSError):
+            pass
     if path.is_dir():
         config_path = path / "config.json"
     elif path.name.lower() == "config.json":
@@ -1503,6 +1593,10 @@ def _sum_model_weight_bytes(model_path: str) -> int:
     path = Path(os.path.abspath(os.path.expanduser(model_path)))
     try:
         if path.is_file():
+            split = re.fullmatch(r"(.+)-\d{5}-of-(\d{5})\.gguf", path.name, re.IGNORECASE)
+            if split:
+                siblings = re.compile(re.escape(split[1]) + r"-\d{5}-of-" + split[2] + r"\.gguf", re.IGNORECASE)
+                return sum(shard.stat().st_size for shard in path.parent.iterdir() if siblings.fullmatch(shard.name))
             return path.stat().st_size if _is_model_weight_file(path) else 0
         if not path.is_dir():
             return 0
@@ -1548,6 +1642,8 @@ def _detect_model_quantization(
         quantization = text_config.get("quantization_config")
     if not isinstance(quantization, dict):
         quantization = {}
+    if "NVFP4" in str(quantization.get("quant_algo", "")).upper():
+        return {"name": "NVFP4", "dtype": "auto", "sourceBytesPerParameter": 0.65, "convertible": False}
     lower_identity = f"{identity} {model_path}".lower()
     bits = int(_positive_number(quantization.get("bits")))
     group_size = int(_positive_number(quantization.get("group_size")))
@@ -1815,7 +1911,7 @@ def recommend_launch_config(
     model_path = str(model_path or "").strip()[:4096]
     if not model_path:
         raise LauncherError("Model path is required for automatic configuration.")
-    expanded_path = os.path.abspath(os.path.expanduser(model_path))
+    expanded_path = os.path.abspath(os.path.expanduser(_local_launch_entry(model_path)))
     if not os.path.exists(expanded_path):
         raise LauncherError("Model path does not exist; choose a local model first.")
     metadata = inspect_launch_model(expanded_path, str(name or "")[:512])
@@ -1858,7 +1954,19 @@ def recommend_launch_config(
     }
     strategy = "automatic"
     gpu_plan = _choose_gpu_launch_plan(metadata, normalized_hardware)
-    if gpu_plan:
+    model_type = metadata["modelType"]
+    if model_type in ("hy_v4_flash", "sensenova_loop") and (
+            not normalized_hardware["gpus"] or normalized_hardware["build"].get("USE_ROCM")):
+        raise LauncherError("This model requires an NVIDIA CUDA GPU.")
+    if model_type == "sensenova_loop" and not gpu_plan:
+        raise LauncherError("SenseNova Loop requires enough free memory on one CUDA GPU.")
+    if model_type == "hy_v4_flash":
+        config["device"] = "cuda"
+        config["cuda_device_id"] = str(normalized_hardware["gpus"][0]["index"])
+        config["enable_moe_hybrid"] = True
+        config["moe_device"] = "numa" if normalized_hardware["numaNodes"] > 1 else "cpu"
+        strategy = "hybrid_" + config["moe_device"]
+    elif gpu_plan:
         selected = sorted(gpu_plan["gpus"], key=lambda gpu: gpu["index"])
         if len(selected) == 1:
             strategy = "cuda"
@@ -2039,12 +2147,13 @@ def create_launcher_app(
     @app.middleware("http")
     async def protect_launcher(request: Request, call_next):
         is_webui = request.url.path.startswith("/webui/")
+        is_demo = request.url.path.startswith("/demos/")
         # Opaque plugin frames cannot send the session's SameSite cookie for
         # their scripts. These static resources contain no host credentials;
         # every service call still goes through the authenticated parent.
         is_plugin_asset = bool(re.match(
             r"^/webui/[^/]+/(?:plugin-runtime/|plugin-preview/|plugin-core/sdk\.js$)", request.url.path))
-        if is_webui and not is_plugin_asset:
+        if is_demo or (is_webui and not is_plugin_asset):
             supplied = request.cookies.get(webui_cookie, "")
             if not hmac.compare_digest(supplied, webui_token):
                 return JSONResponse({"detail": "Open WebUI from the Launcher."}, status_code=403)
@@ -2068,7 +2177,7 @@ def create_launcher_app(
                     status_code=403,
                 )
         response = await call_next(request)
-        if is_webui:
+        if is_webui or is_demo:
             # Downloaded resources must not become executable documents.
             response.headers.setdefault("Content-Security-Policy", (
                 "default-src 'self'; script-src 'none'; style-src 'self'; "
@@ -2088,7 +2197,7 @@ def create_launcher_app(
             response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if is_webui or request.url.path.startswith("/api/"):
+        if is_webui or is_demo or request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -2301,7 +2410,9 @@ def create_launcher_app(
 
     from .launcher_services import LauncherServicePool, install_service_routes
     if isinstance(runtime, LauncherServicePool):
+        from .launcher_interactive import install_demo_routes
         install_service_routes(app, runtime)
+        install_demo_routes(app, runtime, webui_cookie, webui_token)
 
     @app.post("/api/download/preview")
     async def preview_download(request: Request):

@@ -10,7 +10,7 @@ function element(id) {
     if (!elements.has(id)) elements.set(id, {
         value: id === 'speed' ? '1' : '0', textContent: '', hidden: true,
         setAttribute(name, value) { this[name] = value; },
-        setPointerCapture() {},
+        setPointerCapture() {}, focus() {},
         classList: {toggle() {}},
         getContext() { return {drawImage(image) { assert.ok(image, 'frame must exist'); drawn.push(image.src); }}; }
     });
@@ -90,7 +90,7 @@ function tickAt(time) {
     assert.equal(element('forward').disabled,true);
     assert.equal(element('generate').disabled,true);
     await moving;
-    assert.equal(calls[0][0],'/v1/worlds/world_test/actions');
+    assert.equal(calls[0][0],'./v1/worlds/world_test/actions');
     assert.equal(JSON.parse(calls[0][1].body).action,'forward');
     assert.equal(element('forward').disabled,false);
     assert.equal(element('session-info').textContent,'当前场景');
@@ -138,8 +138,10 @@ function tickAt(time) {
     // Editing an established scene uses PATCH + a continuation, never DELETE
     // or POST /worlds. Refresh must preserve the user's current draft.
     calls.length=0;
-    vm.runInContext("world={id:'world_test',status:'ready',segments:2,generated_frames:40,prompt:'Old room',prompt_revision:1,applied_prompt_revision:1};",context);
-    element('prompt').value='The same room with blue walls';
+    vm.runInContext("world={id:'world_test',status:'ready',segments:2,generated_frames:40,text_frames:120,prompt:'Old room',prompt_revision:1,applied_prompt_revision:1};",context);
+    element('prompt').value='Old room';
+    element('edit-frames').value='40';
+    element('instruction').value='The same room with blue walls';
     context.fetch=async(url,options={})=>{
         calls.push([url,options]);
         return {ok:true,json:async()=>options.method==='PATCH'?
@@ -150,16 +152,21 @@ function tickAt(time) {
     };
     await element('apply-scene').onclick();
     assert.deepEqual(calls.map(([url,opts])=>[url,opts.method||'GET']),[
-        ['/v1/worlds/world_test','PATCH'],['/v1/worlds/world_test/actions','POST'],['/v1/worlds/world_test','GET']]);
+        ['./v1/worlds/world_test','PATCH'],['./v1/worlds/world_test/actions','POST'],['./v1/worlds/world_test','GET']]);
     assert.equal(JSON.parse(calls[0][1].body).prompt,'The same room with blue walls');
+    assert.equal(JSON.parse(calls[0][1].body).text_frames,40);
     assert.equal(JSON.parse(calls[1][1].body).action,'follow_prompt');
     assert.equal(vm.runInContext('world.segments',context),3);
-    assert.equal(element('prompt').value,'The same room with blue walls');
+    assert.equal(element('instruction').value,'');
+    assert.equal(element('prompt').value,'Old room');
     // During generation text remains editable; accepting a replacement must
     // not start a second job or clobber the current world status.
     calls.length=0;
     vm.runInContext('busy=true;continuous=true;controls();',context);
-    assert.equal(element('prompt').disabled,false);
+    element('instruction').value='It stops raining';
+    element('instruction').oninput();
+    assert.equal(element('prompt').disabled,true);
+    assert.equal(element('instruction').disabled,false);
     assert.equal(element('apply-scene').disabled,false);
     await element('apply-scene').onclick();
     assert.equal(calls.length,1);
@@ -173,7 +180,8 @@ function tickAt(time) {
     element('prompt').value='A quiet room';element('perspective').value='first-person';
     element('enhance-prompt').checked=true;
     element('enhance-prompt').onchange();
-    assert.equal(element('enhance-option').hidden,true);
+    assert.equal(element('enhancer-hint').hidden,false);
+    assert.equal(element('enhance-prompt').disabled,true);
     assert.equal(element('perspective-option').hidden,true);
     assert.equal(element('perspective').disabled,true);
     context.fetch=async(url,options)=>{
@@ -184,7 +192,7 @@ function tickAt(time) {
         calls.length=0;
         await element('form').onsubmit({preventDefault(){}});
         assert.equal(calls.length,1);
-        assert.equal(calls[0][0],'/v1/videos');
+        assert.equal(calls[0][0],'./v1/videos');
         return JSON.parse(calls[0][1].body);
     }
     let options=await submittedOptions();
@@ -203,8 +211,63 @@ function tickAt(time) {
     options=await submittedOptions();
     assert.equal(options.enhance_prompt,true);
     assert.equal(options.perspective,'first-person');
+    element('size').value='custom';
+    element('custom-width').value='736';element('custom-height').value='416';
+    element('size').onchange();
+    assert.equal(element('custom-size').hidden,false);
+    options=await submittedOptions();
+    assert.deepEqual([options.width,options.height],[736,416]);
+    for(const invalid of [[720,416],[1280,1280]]){
+        element('custom-width').value=String(invalid[0]);element('custom-height').value=String(invalid[1]);
+        calls.length=0;
+        await element('form').onsubmit({preventDefault(){}});
+        assert.equal(calls.length,0);
+        assert.match(element('status').textContent,/宽高/);
+    }
+    element('size').value='1280 × 704';element('size').onchange();
+    assert.equal(element('custom-size').hidden,true);
+    options=await submittedOptions();
+    assert.deepEqual([options.width,options.height],[1280,704]);
+    element('mode').value='world';
     vm.runInContext("world={id:'world_restore',status:'ready',segments:1,width:128,height:128,seed:42,enhance_prompt:false,perspective:'third-person observer'};restoreWorldInputs();controls();",context);
     assert.equal(element('enhance-prompt').checked,false);
     assert.equal(element('perspective').disabled,true);
+    vm.runInContext("world.segments=2;busy=true;active='video_next';controls();",context);
+    const drag=(type,x,y)=>element('video')['onpointer'+type]({
+        pointerId:2,button:0,isPrimary:true,clientX:x,clientY:y
+    });
+    drag('down',100,100);drag('up',106,105);
+    assert.equal(vm.runInContext('queuedStep',context),null);
+    drag('down',100,100);drag('move',200,105);
+    assert.equal(element('gesture-hint').textContent,'松开右转');
+    drag('up',200,105);
+    assert.equal(vm.runInContext('queuedStep',context),'look_right');
+    element('forward').onclick();
+    assert.equal(vm.runInContext('queuedStep',context),'forward');
+    vm.runInContext("queuedStep='follow_prompt'",context);
+    element('right').onclick();
+    assert.equal(vm.runInContext('queuedStep',context),'follow_prompt');
+    let submitted=0;
+    element('apply-scene').disabled=false;element('apply-scene').click=()=>submitted++;
+    for(const extra of [{isComposing:true},{keyCode:229},{shiftKey:true},{repeat:true},{}]){
+        element('instruction').onkeydown({key:'Enter',preventDefault(){},...extra});
+    }
+    assert.equal(submitted,1);
+    element('leave-scene').onclick();
+    assert.equal(vm.runInContext('queuedStep',context),null);
+    assert.equal(vm.runInContext('exploring',context),false);
+    context.Option=class { constructor(text,value){this.text=text;this.value=value;} };
+    element('size').replaceChildren=(first)=>{element('size').value=first.value;};
+    vm.runInContext('configureLingBot();controls()',context);
+    assert.equal(element('enhance-option').hidden,true);
+    assert.equal(element('vertical-controls').hidden,false);
+    assert.deepEqual(Array.from(vm.runInContext('selectedResolution()',context)),[576,320]);
+    const movie={id:'job_test',world_id:'world_test',status:'completed',result:{
+        width:576,height:320,frame_count:12,fps:16,segment:1,format:'mp4',url:'/v1/worlds/files/job_test.mp4'}};
+    context.movie=movie;
+    const segment=vm.runInContext('lingJob(movie)',context);
+    assert.equal(segment.num_frames,12);
+    assert.equal(segment.segment_index,2);
+    assert.equal(segment.output.url,movie.result.url);
     console.log('PASS: playback, world controls, scene edits, PE capability/toggle/restore and submitted options');
 })().catch(error => {console.error(error);process.exitCode=1;});

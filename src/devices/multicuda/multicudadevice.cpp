@@ -10,6 +10,9 @@
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "devices/cuda/fastllm-cuda-v41-gguf.h"
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+#include "devices/cuda/fastllm-dsv41-mega.h"
+#endif
 #include "devices/multicuda/multicudadevice.h"
 
 #include "fastllm-multicuda.cuh"
@@ -4107,7 +4110,7 @@ namespace fastllm {
     struct MultiCudaDsparkMarkovWorkspace {
         const Data *embed = nullptr, *head = nullptr;
         void *embedPointer = nullptr, *headPointer = nullptr;
-        int rows = 0, vocab = 0;
+        int rows = 0, vocab = 0, batch = 0;
         bool sampling = false;
         std::vector<int> devices;
         DivisionScheme ranges;
@@ -4125,7 +4128,10 @@ namespace fastllm {
         const int root = projection.devices.front(), rows = projection.rows, vocab = projection.vocab;
         // Small vocabularies are faster on one device: collective latency
         // dominates once the full Markov matrix fits in cache.
-        if (rows < 1 || rows > 8 || vocab < 65536 || projection.devices.size() > 8 ||
+        const int batch = request.tokens.dims.size() == 1 ? request.tokens.dims[0] - rows : 0;
+        if (batch < 1 || batch > 65535 || rows % batch || (request.proposalProbs && batch != 1)) return nullptr;
+        const int steps = rows / batch;
+        if (steps < 1 || steps > 8 || vocab < 65536 || projection.devices.size() > 8 ||
             projection.type != DataType::BFLOAT16) return nullptr;
         auto valid = [&](const Data &data) {
             return data.dataType == DataType::BFLOAT16 && data.dataDevice == DataDevice::CUDA &&
@@ -4136,7 +4142,7 @@ namespace fastllm {
         if (!valid(embed) || !valid(head) || request.tokens.dataType != DataType::INT32 ||
             request.tokens.dataDevice != DataDevice::CUDA || request.tokens.strides.size() != 1 ||
             request.tokens.strides[0] != 1 ||
-            request.tokens.dims != std::vector<int>{rows + 1} || request.tokens.multiDeviceData ||
+            request.tokens.dims != std::vector<int>{batch * (steps + 1)} || request.tokens.multiDeviceData ||
             !request.tokens.cudaData || GetPointerDeviceId(request.tokens.cudaData) != root) return nullptr;
         if (request.proposalProbs) {
             const auto &probs = *request.proposalProbs;
@@ -4154,7 +4160,7 @@ namespace fastllm {
         auto state = std::static_pointer_cast<MultiCudaDsparkMarkovWorkspace>(request.workspace);
         if (state && (state->embed != &embed || state->head != &head || state->embedPointer != embed.cudaData ||
             state->headPointer != head.cudaData || state->rows != rows || state->vocab != vocab ||
-            state->sampling != (request.proposalProbs != nullptr) ||
+            state->batch != batch || state->sampling != (request.proposalProbs != nullptr) ||
             state->devices != projection.devices || state->ranges != projection.ranges)) return nullptr;
         auto allocate = [&](Data &data, DataType type, const std::vector<int> &dims, int device) {
             data.dataType = type; data.UpdateUnitSize(); data.Resize(dims);
@@ -4163,20 +4169,20 @@ namespace fastllm {
         };
         if (request.outEmbeds.dims.empty()) {
             if (FastllmCudaGraphIsCapturingFast()) return nullptr;
-            allocate(request.outEmbeds, DataType::FLOAT32, {1, rows, 256}, root);
+            allocate(request.outEmbeds, DataType::FLOAT32, {batch, steps, 256}, root);
         }
         if (request.outEmbeds.dataType != DataType::FLOAT32 || request.outEmbeds.multiDeviceData ||
             request.outEmbeds.dataDevice != DataDevice::CUDA || request.outEmbeds.strides.size() != 3 ||
-            request.outEmbeds.strides[0] != (uint64_t)rows * 256 ||
+            request.outEmbeds.strides[0] != (uint64_t)steps * 256 ||
             request.outEmbeds.strides[1] != 256 || request.outEmbeds.strides[2] != 1 ||
-            request.outEmbeds.dims != std::vector<int>{1, rows, 256} || !request.outEmbeds.cudaData ||
+            request.outEmbeds.dims != std::vector<int>{batch, steps, 256} || !request.outEmbeds.cudaData ||
             GetPointerDeviceId(request.outEmbeds.cudaData) != root) return nullptr;
         if (!state) {
             if (FastllmCudaGraphIsCapturingFast()) return nullptr;
             state = std::make_shared<MultiCudaDsparkMarkovWorkspace>();
             state->embed = &embed; state->head = &head; state->embedPointer = embed.cudaData;
             state->headPointer = head.cudaData; state->rows = rows; state->vocab = vocab;
-            state->sampling = request.proposalProbs != nullptr;
+            state->sampling = request.proposalProbs != nullptr; state->batch = batch;
             state->devices = projection.devices; state->ranges = projection.ranges;
             FastllmCudaSetDevice(root); FastllmCudaSyncCurrentThreadStream();
             for (int device : projection.devices) {
@@ -4188,7 +4194,7 @@ namespace fastllm {
                 const size_t rowBytes = 256 * sizeof(uint16_t);
                 if (device != root) {
                     allocate(rank->embed, DataType::BFLOAT16, embed.dims, device);
-                    allocate(rank->tokens, DataType::INT32, {rows + 1}, device);
+                    allocate(rank->tokens, DataType::INT32, {batch * (steps + 1)}, device);
                     FastllmCudaMemcpy2DDeviceToDeviceAuto(rank->embed.cudaData, rowBytes, embed.cudaData,
                         rowBytes, rowBytes, embed.dims[0], device, root);
                 }
@@ -4306,9 +4312,10 @@ namespace fastllm {
                 auto &chain = *markovState->ranks[index];
                 const void *embed = device == root ? markov->embed.cudaData : chain.embed.cudaData;
                 int *tokens = device == root ? (int*)markov->tokens.cudaData : (int*)chain.tokens.cudaData;
-                FastllmNcclBroadcastFrom(markov->tokens.cudaData, tokens, 1, DataType::INT32, root, device);
+                const int batch = markovState->batch, steps = state->rows / batch;
+                FastllmNcclBroadcastFrom(markov->tokens.cudaData, tokens, batch == 1 ? 1 : batch * (steps + 1), DataType::INT32, root, device);
                 if (!markovState->sampling) FastllmCudaMemset0(chain.keys.cudaData, chain.keys.GetBytes());
-                for (int step = 0; step < state->rows; ++step) {
+                for (int step = 0; step < steps; ++step) {
                     if (markovState->sampling) {
                         auto *statistics = (FastllmDsparkSamplePartial*)chain.statistics.cudaData;
                         AssertInFastLLM(FastllmCudaDsparkMarkovShardSample((float*)rank.output.cudaData,
@@ -4330,13 +4337,16 @@ namespace fastllm {
                         continue;
                     }
                     auto *keys = (unsigned long long*)chain.keys.cudaData;
-                    AssertInFastLLM(FastllmCudaDsparkMarkovShardScore((float*)rank.output.cudaData,
+                    AssertInFastLLM(FastllmCudaDsparkMarkovShardScoreBatch((float*)rank.output.cudaData,
                         embed, chain.head.cudaData, tokens, keys,
-                        step, state->vocab, chain.start, chain.count), "Markov shard scoring failed.");
-                    AssertInFastLLM(FastllmNcclAllReduceMaxUint64(keys + step, 1, device),
+                        step, state->vocab, chain.start, chain.count, batch, steps), "Markov shard scoring failed.");
+                    auto *context = device == root ? static_cast<float *>(markov->outEmbeds.cudaData) : nullptr;
+                    if (FastllmCudaCustomMarkovWinners(keys + step * batch, device, tokens + step, embed,
+                            context ? context + step * 256 : nullptr, batch, steps)) continue;
+                    AssertInFastLLM(FastllmNcclAllReduceMaxUint64(keys + step * batch, batch, device),
                                     "Markov global argmax failed.");
-                    AssertInFastLLM(FastllmCudaDsparkMarkovShardFinish(keys, embed, tokens,
-                        device == root ? (float*)markov->outEmbeds.cudaData : nullptr, step),
+                    AssertInFastLLM(FastllmCudaDsparkMarkovShardFinishBatch(keys, embed, tokens,
+                        device == root ? (float*)markov->outEmbeds.cudaData : nullptr, step, batch, steps),
                         "Markov shard finish failed.");
                 }
                 if (!markovState->sampling) return;
@@ -7112,10 +7122,274 @@ auto st = std::chrono::system_clock::now();
         return result;
     }
 
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+    // This cache owns all ranks together: a collective backend must never fall
+    // back independently on one rank. Prepare outside capture and retain the
+    // existing Marlin cache so larger batches continue to use that backend.
+    struct Dsv41MegaGroup {
+        int experts = 0;
+        std::vector<int> devices;
+        std::array<void *, 8> workspaces{}, draftFence{};
+        std::array<FastllmDsv41MegaLayer *, 8> layers{};
+        bool sharedReady = false;
+        ~Dsv41MegaGroup() {
+            const int previous = FastllmCudaGetDevice();
+            for (int r = 0; r < (int)devices.size(); ++r) {
+                FastllmCudaSetDevice(devices[r]);
+                FastllmDsv41MegaDestroy(layers[r]);
+                if (workspaces[r]) FastllmCudaDirectFree(workspaces[r]);
+                if (draftFence[r]) FastllmCudaDirectFree(draftFence[r]);
+            }
+            FastllmCudaSetDevice(previous);
+        }
+    };
+    static std::mutex &Dsv41MegaMutex() { static std::mutex m; return m; }
+    static std::map<const Data *, std::unique_ptr<Dsv41MegaGroup>> &Dsv41MegaGroups() {
+        static std::map<const Data *, std::unique_ptr<Dsv41MegaGroup>> groups;
+        return groups;
+    }
+    static Dsv41MegaGroup *PrepareDsv41Mega(Data **weights, int count,
+                                          const std::vector<int> &devices, int experts = 384) {
+        if (!MultiCudaEnvFlagEnabled("FASTLLM_DSV41_SM100_MEGA") || devices.size() != 8 ||
+            (experts != 384 && experts != 128) || count != 2 + 2 * experts || !weights || !weights[2])
+            return nullptr;
+        std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+        auto &entry = Dsv41MegaGroups()[weights[2]];
+        if (entry) {
+            return entry->experts == experts && entry->devices == devices ? entry.get() : nullptr;
+        }
+        if (FastllmCudaGraphIsCapturingFast() || !FastllmDsv41MegaCanPrepare(devices.data(), devices.size()))
+            return nullptr;
+        std::array<std::array<const void *, 48>, 8> gate{}, down{};
+        std::array<const Data *, 8> localKeys{};
+        for (int e = 0; e < experts; ++e) for (int part = 0; part < 2; ++part) {
+            Data *root = weights[2 + e * 2 + part];
+            if (!root) return nullptr;
+            auto it = root->multiDeviceDatas.find(devices[e % 8]);
+            if (it == root->multiDeviceDatas.end() || !it->second) return nullptr;
+            Data *w = it->second;
+            const std::vector<int> shape = part ? std::vector<int>{5120, 2304} : std::vector<int>{4608, 5120};
+            const size_t elements = (size_t)shape[0] * shape[1];
+            if (w->dataType != NVFP4 || w->dims != shape || w->blockM != 32 || w->blockK != 1 ||
+                w->IsRepacked || !w->cudaData || !w->directMemory || !w->scales.empty() ||
+                w->expansionBytes < elements / 2 + elements / 32) return nullptr;
+            (part ? down : gate)[e % 8][e / 8] = w->cudaData;
+            if (e < 8 && part == 0) localKeys[e] = w;
+        }
+        const int previous = FastllmCudaGetDevice();
+        auto state = std::make_unique<Dsv41MegaGroup>();
+        state->devices = devices;
+        state->experts = experts;
+        try {
+            // Drain outstanding TP work before cold cudaMalloc; never allocate
+            // while only some ranks have entered a peer collective.
+            for (int device : devices) { FastllmCudaSetDevice(device); ForceDeviceSync(); }
+            const size_t bytes = FastllmDsv41MegaWorkspaceBytes();
+            for (int r = 0; r < 8; ++r) {
+                FastllmCudaSetDevice(devices[r]);
+                state->workspaces[r] = FastllmCudaDirectMalloc(bytes);
+                if (experts == 128) {
+                    state->draftFence[r] = FastllmCudaDirectMalloc(sizeof(uint64_t));
+                    FastllmCudaMemset0(state->draftFence[r], sizeof(uint64_t));
+                }
+                FastllmDsv41MegaInitWorkspace(state->workspaces[r], devices.data(), r);
+            }
+            for (int r = 0; r < 8; ++r) {
+                FastllmCudaSetDevice(devices[r]);
+                state->layers[r] = FastllmDsv41MegaCreate(gate[r].data(), down[r].data(),
+                    state->workspaces.data(), r, experts == 384 ? localKeys[r] : nullptr, experts);
+            }
+            entry = std::move(state);
+            printf("DSV41_MEGA backend=builtin-sm100 ep=8 source_rows=1..%d shared=tp workspace_per_gpu=%zu layer=%s\n",
+                FastllmDsv41MegaMaxRows, bytes, weights[2]->name.c_str());
+            fflush(stdout);
+        } catch (...) { FastllmCudaSetDevice(previous); throw; }
+        FastllmCudaSetDevice(previous);
+        return entry.get();
+    }
+#endif
+
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+    // Assemble the two MXFP8 shared expert matrices once. All ranks agree on
+    // placement and exact UE8M0 scales before any rank enters the collective.
+    static bool PrepareDsv41Shared(Dsv41MegaGroup &group, Data &gate, Data &down, bool rootWeights = false) {
+        std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+        if (group.sharedReady) return true;
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        std::array<std::vector<uint8_t>, 2> scales;
+        Data *weights[] = {&gate, &down};
+        std::array<std::array<const void *, 8>, 2> sources{};
+        for (int part = 0; part < 2; ++part) {
+            Data &w = *weights[part];
+            const auto expected = part ? std::vector<int>{5120,2304} : std::vector<int>{4608,5120};
+            if (w.dims != expected || w.dataType != FP8_E4M3 || w.blockK != 32 || w.blockM != 32 ||
+                w.isFake || w.IsRepacked) return false;
+            if (rootWeights && !w.multiDeviceData) {
+                if (w.dataDevice != CUDA || w.dataDeviceIds != std::vector<int>{group.devices.front()} ||
+                    !w.cudaData) return false;
+                sources[part].fill(w.cudaData);
+            } else {
+                if (!w.multiDeviceData) PrepareMultiCudaReplicatedData(w, group.devices, true);
+                if (!w.IsTensorParallelReplicated()) return false;
+                for (int r = 0; r < 8; ++r) {
+                    const auto found = w.multiDeviceDatas.find(group.devices[r]);
+                    if (found == w.multiDeviceDatas.end() || !found->second || !found->second->cudaData ||
+                        found->second->dims != expected || found->second->IsRepacked) return false;
+                    sources[part][r] = found->second->cudaData;
+                }
+            }
+            const auto &f = w.scales.empty() && w.multiDeviceData ?
+                w.multiDeviceDatas.at(group.devices.front())->scales : w.scales;
+            if (f.size() != size_t(expected[0]/32)*(expected[1]/32)) return false;
+            scales[part].reserve(f.size());
+            for (float value : f) {
+                int exponent = 0;
+                if (std::frexp(value, &exponent) != 0.5f || exponent < -125 || exponent > 128) return false;
+                scales[part].push_back(uint8_t(exponent + 126));
+            }
+        }
+        const bool ok = MultiCudaRunDeviceCallbacks(group.devices, [&](int r, int device) {
+            FastllmDsv41MegaEnableShared(group.layers[r], sources[0][r], scales[0].data(), sources[1][r], scales[1].data());
+        });
+        AssertInFastLLM(ok, "DSV41 shared MegaMoE packing failed");
+        group.sharedReady = true;
+        printf("DSV41_MEGA shared=mxfp8 ep=8 layer=%s\n", gate.name.c_str());
+        fflush(stdout);
+        return true;
+    }
+    std::vector<FastllmDsv41MegaLayer *> MultiCudaDsv41SharedLayers(const Data *key,
+            const std::vector<int> &devices) {
+        std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+        auto it = Dsv41MegaGroups().find(key);
+        if (it == Dsv41MegaGroups().end() || !it->second || !it->second->sharedReady ||
+            it->second->devices != devices) return {};
+        return {it->second->layers.begin(), it->second->layers.end()};
+    }
+    bool MultiCudaDsv41DraftExperts(Data &input, Data &ids, Data &scores, Data &residual, Data &post,
+            Data &comb, Data &output, std::vector<Data *> &weights, const std::vector<int> &devices) {
+        if (weights.size() != 258 || !weights[0] || !weights[1] || devices.size() != 8 ||
+            input.dims.size() != 2 || input.dims[1] != 5120) return false;
+        const int rows = input.dims[0];
+        // Each EP owner has capacity for 32 rows. Split larger packed drafts
+        // across all owners; their disjoint inputs and outputs are peer-visible.
+        const bool striped = rows > FastllmDsv41MegaMaxRows / 8;
+        if (rows < 1 || rows > FastllmDsv41MegaMaxRows ||
+            ids.dims != std::vector<int>({rows, 3}) || scores.dims != ids.dims ||
+            input.dataType != BFLOAT16 || ids.dataType != INT32 || scores.dataType != FLOAT32 ||
+            residual.dataType != BFLOAT16 || post.dataType != FLOAT32 || comb.dataType != FLOAT32 ||
+            residual.Count(0) != size_t(rows)*4*5120 || post.Count(0) != size_t(rows)*4 ||
+            comb.Count(0) != size_t(rows)*16) return false;
+        for (const Data *v : {&input, &ids, &scores, &residual, &post, &comb}) {
+            if (v->dataDevice != CUDA || !v->cudaData || v->multiDeviceData ||
+                v->dataDeviceIds != std::vector<int>{devices.front()} || !IsContiguousCopyData(*v)) return false;
+        }
+        if (striped && !FastllmInitNccl(devices)) return false;
+        auto *g = PrepareDsv41Mega(weights.data(), weights.size(), devices, 128);
+        if (!g || !PrepareDsv41Shared(*g, *weights[0], *weights[1], true)) return false;
+        output.dataType = BFLOAT16;
+        output.UpdateUnitSize();
+        output.Resize(residual.dims);
+        output.ToDevice(CUDA, {devices.front()}, false);
+        output.Allocate(false);
+        // Match the TP draft's fork/join streams during eager execution and capture.
+        const bool async = MultiCudaSetPersistentAsyncDispatch(true);
+        const bool ordered = MultiCudaSetWorkerOrderedCapture(false);
+        struct RestoreDispatch {
+            bool async, ordered;
+            ~RestoreDispatch() {
+                MultiCudaSetWorkerOrderedCapture(ordered);
+                MultiCudaSetPersistentAsyncDispatch(async);
+            }
+        } restore{async, ordered};
+        AssertInFastLLM(MultiCudaRunDeviceCallbacks(devices, [&](int r, int device) {
+            FastllmCudaGraphRecordCollective();
+            const int start = striped ? r * (rows / 8) + std::min(r, rows % 8) : 0;
+            const int count = striped ? rows / 8 + (r < rows % 8) : (r == 0 ? rows : 0);
+            auto fence = [&] {
+                AssertInFastLLM(FastllmNcclAllReduceMaxUint64(g->draftFence[r], 1, device),
+                                "DSpark distributed draft row fence failed");
+            };
+            // The rank graphs replay independently. Publish root activations before
+            // peer reads and join all peer stores before the next root mHC.
+            if (striped) fence();
+            FastllmDsv41MegaDraftPost(g->layers[r],
+                static_cast<const uint16_t *>(input.cudaData) + size_t(start) * 5120,
+                static_cast<const int *>(ids.cudaData) + start * 3,
+                static_cast<const float *>(scores.cudaData) + start * 3,
+                static_cast<const uint16_t *>(residual.cudaData) + size_t(start) * 4 * 5120,
+                static_cast<const float *>(post.cudaData) + start * 4,
+                static_cast<const float *>(comb.cudaData) + start * 16,
+                static_cast<uint16_t *>(output.cudaData) + size_t(start) * 4 * 5120, count);
+            if (striped) fence();
+        }), "DSpark MegaMoE dispatch failed");
+        return true;
+    }
+
+    bool MultiCudaDsv41CombinedExperts(Data &input, Data &ids, Data &scores, std::vector<Data *> &routed,
+            Data &gate, Data &down, Data &output, const std::vector<int> &devices, bool runDecode) {
+        if (devices.size() != 8 || input.dims.size() != 2 || input.dims[1] != 5120 ||
+            input.dataType != BFLOAT16 || ids.dataType != INT32 || scores.dataType != FLOAT32 ||
+            MultiCudaEnvFlagEnabled("FASTLLM_DISABLE_NCCL")) return false;
+        const int rows = input.dims[0];
+        if (!(rows == 1 || (rows >= 8 && rows <= FastllmDsv41MegaMaxRows && rows%8 == 0)) ||
+            ids.Count(0) != size_t(rows)*6 || scores.Count(0) != ids.Count(0)) return false;
+        for (Data *v : {&input,&ids,&scores}) {
+            if (!v->IsTensorParallelReplicated()) return false;
+            for (int device : devices) {
+                const auto local = v->multiDeviceDatas.find(device);
+                if (local == v->multiDeviceDatas.end() || !local->second || !local->second->cudaData ||
+                    local->second->Count(0) != v->Count(0)) return false;
+            }
+        }
+        auto *g = PrepareDsv41Mega(routed.data(), routed.size(), devices);
+        // Warm immutable packed weights eagerly, while leaving prompt-token
+        // arithmetic on the original prefill implementation.
+        if (!g || !PrepareDsv41Shared(*g, gate, down) || !runDecode || !FastllmInitNccl(devices)) return false;
+        output.dataType = BFLOAT16;
+        output.UpdateUnitSize();
+        output.Resize(input.dims);
+        output.dataDevice = CUDA;
+        output.dataDeviceIds = {devices.front()};
+        EnsureReplicatedMultiCudaTensor(output, devices, false);
+        SyncReplicatedLocalShapeFromRoot(output, devices);
+        const int count = rows == 1 ? 5120 : rows/8*5120;
+        AssertInFastLLM(MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+            Data &result = *output.multiDeviceDatas.at(device);
+            result.dataType = BFLOAT16;
+            result.UpdateUnitSize();
+            result.Allocate(false);
+            auto *out = static_cast<uint16_t *>(result.cudaData);
+            auto *local = rows == 1 ? out : out + rank*count;
+            FastllmCudaGraphRecordCollective();
+            FastllmDsv41MegaRunShared(g->layers[rank], input.multiDeviceDatas.at(device)->cudaData,
+                static_cast<int32_t *>(ids.multiDeviceDatas.at(device)->cudaData),
+                static_cast<float *>(scores.multiDeviceDatas.at(device)->cudaData), local, rows, nullptr);
+            if (rows == 1) {
+                FastllmNcclBroadcast(out, count, BFLOAT16, devices.front(), device);
+                AssertInFastLLM(!FastllmCudaGetThreadError(), "DSV41 shared expert broadcast failed");
+            } else {
+                AssertInFastLLM(FastllmNcclAllGather(local, out, count, BFLOAT16, device),
+                    "DSV41 shared expert all-gather failed");
+            }
+        }), "DSV41 combined experts dispatch failed");
+        return true;
+    }
+#endif
+
     void MultiCudaReleaseMoeWeightCaches(const Data *layerKey) {
         if (layerKey == nullptr) {
             return;
         }
+
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+        std::unique_ptr<Dsv41MegaGroup> retiredMega;
+        {
+            std::lock_guard<std::mutex> lock(Dsv41MegaMutex());
+            auto &groups = Dsv41MegaGroups();
+            auto it = groups.find(layerKey);
+            if (it != groups.end()) { retiredMega = std::move(it->second); groups.erase(it); }
+        }
+#endif
 
         // Persistent worker threads cannot have their thread_local maps erased
         // from the model-destruction thread. Bump a generation so each worker
@@ -7161,10 +7435,15 @@ auto st = std::chrono::system_clock::now();
         bool deepSeekV41 = false;
         const Data *prequantizedInput = nullptr;
         bool deferRankReduction = false;
+        bool ownedTokenRows = false;
         const Data *joinSharedPartial = nullptr;
         Data *joinOutput = nullptr;
         int parallelJoinLayer = -1;
         bool sharedJoined = false;
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+        FastllmDsv41MegaLayer *megaLayer = nullptr;
+        bool megaOwnsRows = false;
+#endif
         Data *output;
         Data *pairedReduceInput;
         int rootDeviceId;
@@ -7227,6 +7506,18 @@ auto st = std::chrono::system_clock::now();
 
         bool RunMarlin(const Data &routedInput, Data **localWeights, int localCount,
                        const int32_t *indices, const float *scores, int topk) {
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+            if (megaLayer) {
+                const int rows = routedInput.Count(0) / routedInput.dims.back();
+                megaOwnsRows = rows >= 16 && rows % expertOwnerCount == 0 && doNcclReduce &&
+                    (!deferRankReduction || ownedTokenRows) && !reduceToRoot && !pairedReduceInput && !joinOutput &&
+                    output->dataType == FLOAT32;
+                FastllmCudaGraphRecordCollective();
+                FastllmDsv41MegaRun(megaLayer, routedInput.cudaData, indices, scores,
+                    (float *)output->cudaData, rows, nullptr, megaOwnsRows);
+                return true;
+            }
+#endif
             if (joinOutput && FastllmCudaV41MarlinExpertParallelShared(
                     routedInput, *w1, *output, localWeights, localCount, indices, scores, topk,
                     expertOwnerRank, expertOwnerCount, swigluLimit, prequantizedInput,
@@ -7613,7 +7904,28 @@ auto st = std::chrono::system_clock::now();
             }
 
             // The caller joins the shared branch before the joint collective.
+            if (ownedTokenRows) {
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+                if (megaOwnsRows) return;
+#endif
+                // General expert kernels produce partials for every token.
+                // Reduce just the slice this rank will join to its shared expert.
+                const int count = output->Count(0) / expertOwnerCount;
+                auto *data = static_cast<float *>(output->cudaData);
+                AssertInFastLLM(FastllmNcclReduceScatter(data, data + expertOwnerRank * count,
+                    count, FLOAT32, deviceId), "DeepSeek V4.1 routed reduce-scatter failed");
+                return;
+            }
             if (deferRankReduction) return;
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+            if (megaOwnsRows) {
+                const int count = output->Count(0) / expertOwnerCount;
+                auto *values = static_cast<float *>(output->cudaData);
+                AssertInFastLLM(FastllmNcclAllGather(values + expertOwnerRank * count, values,
+                    count, FLOAT32, deviceId), "DeepSeek V4.1 routed row gather failed");
+                return;
+            }
+#endif
             if (doNcclReduce) {
                 if (pairedReduceInput != nullptr) {
                     AssertInFastLLM(
@@ -7854,7 +8166,10 @@ auto st = std::chrono::system_clock::now();
              MultiCudaEnvFlagEnabled("FASTLLM_MULTICUDA_MOE_EXPERT_PARALLEL"));
         const bool deferRankReduction = intParams.count("deferRankReduction") &&
             intParams.at("deferRankReduction");
-        AssertInFastLLM(!deferRankReduction || (deepSeekV41 && n >= 1 && n <= 8 && useExpertParallel &&
+        const bool ownedRows = intParams.count("v41OwnedTokenRows") && intParams.at("v41OwnedTokenRows");
+        const bool validRows = ownedRows ? (devices.size() == 8 && n >= 16 && n <= 256 && n % 8 == 0) :
+                                          (n >= 1 && n <= 8);
+        AssertInFastLLM(!deferRankReduction || (deepSeekV41 && validRows && useExpertParallel &&
             input.multiDeviceData && input.IsTensorParallelReplicated() &&
             input.dataType == DataType::BFLOAT16 && !hasSharedExpert && !pairedReduceInput),
             "Deferred MoE reduction requires native BF16 small-batch EP replicas.\n");
@@ -7923,6 +8238,11 @@ auto st = std::chrono::system_clock::now();
                 }
             }
         }
+
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+        Dsv41MegaGroup *mega = deepSeekV41 && useExpertParallel && !hasSharedExpert &&
+            topk == 6 && swigluLimit == 10.f ? PrepareDsv41Mega(weights, wBatch, devices) : nullptr;
+#endif
 
         // Routed expert outputs are BF16, but their local/EP sum stays FP32
         // until the model adds the shared expert and rounds once.
@@ -8263,6 +8583,15 @@ auto st = std::chrono::system_clock::now();
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
                 op->deferRankReduction = deferRankReduction;
+                op->ownedTokenRows = ownedRows;
+                AssertInFastLLM(!op->ownedTokenRows || (deepSeekV41 && useExpertParallel && deferRankReduction &&
+                    n % devices.size() == 0), "Invalid DeepSeek V4.1 owned-token partition");
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+                // Eager prefills also contain small row counts. Keep their canonical Marlin arithmetic.
+                if (mega && (ownedRows || FastllmCudaGraphIsCapturingFast()) &&
+                    n >= 16 && n <= FastllmDsv41MegaMaxRows && input.dataType == BFLOAT16)
+                    op->megaLayer = mega->layers[i];
+#endif
                 auto joinShared = datas.find("v41JoinSharedPartial");
                 auto joinOut = datas.find("v41JoinOutput");
                 if (joinShared != datas.end() && joinOut != datas.end()) {

@@ -144,6 +144,12 @@ namespace fastllm {
     输入: hiddenStates
     输出: lastRet (采样得到的 token id)
     */
+#ifdef USE_CUDA
+    bool TrySamplePublishedGreedy(Data &logits, int batch,
+            const std::vector<GenerationConfig> &configs, const std::map<int, void *> &published,
+            const std::map<int, void *> &events, std::vector<int> &tokens);
+#endif
+
     void LLMSamplingBlock (
         basellm *model,
         Data *hiddenStates,

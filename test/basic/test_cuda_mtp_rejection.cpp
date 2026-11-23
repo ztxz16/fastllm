@@ -4,6 +4,7 @@
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "baseblock.h"
+#include "utils/utils.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -133,8 +134,162 @@ void DeviceFilterCase() {
         }
         cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
     }
+    // Equal target and draft logits must give identical support even when the k-th logit is tied.
+    // With three equal candidates, k=2 and p=0.6 keeps both surviving candidates, in token-ID order.
+    for (const std::vector<float> scores : {std::vector<float>{2, 1, .7f, .4f, 0}, {1, 1, 1, 0, -1}}) {
+        Buffer input(scores), filtered(scores.size());
+        fastllm::Data workspace;
+        auto expected = Oracle(scores, 1, 2, .6f, true);
+        Require(FastllmCudaMtpSampleDraftDeviceTopKFirst(input.p, filtered.p, 1, 2, .6f,
+                token, scores.size(), workspace), "top-k-first draft sampling failed");
+        auto actual = filtered.Read();
+        for (size_t i = 0; i < actual.size(); ++i)
+            Require(std::fabs(actual[i] - expected[i]) < 2e-5, "draft and target filter support differ");
+        std::vector<float> twoRows(scores);
+        twoRows.insert(twoRows.end(), scores.begin(), scores.end());
+        Buffer target(twoRows);
+        int sampled, out[2], accepted, topKs[2] = {2, 2};
+        float temperatures[2] = {1, 1}, topPs[2] = {.6f, .6f};
+        Check(cudaMemcpy(&sampled, token, sizeof(sampled), cudaMemcpyDeviceToHost));
+        Require(FastllmCudaMtpRejectionSamplingTopKFirst(target.p, filtered.p, temperatures, topKs,
+                topPs, &sampled, out, &accepted, 1, 1, scores.size()) && accepted == 1 && sampled == out[0],
+                "equal filtered logits rejected the draft");
+    }
+    // Wide/misaligned vocabulary, ties at k, stale q rows, and fewer than k finite logits.
+    for (int k : {1, 7, 40, 64, 65}) {
+        const int vocab = 200059;
+        std::vector<float> values(vocab);
+        for (int i = 0; i < vocab; ++i)
+            values[i] = k == 7 && i % 50000 ? -INFINITY : -float(i % 10003) * .25f;
+        Buffer input(values), filtered(std::vector<float>(vocab, 1.f));
+        fastllm::Data workspace;
+        for (float p : {.81f, 1.f}) {
+            auto expected = Oracle(values, .75f, k, p, true);
+            Require(FastllmCudaMtpSampleDraftDeviceTopKFirst(input.p, filtered.p, .75f, k, p,
+                    token, vocab, workspace), "compact proposal failed");
+            auto actual = filtered.Read();
+            int sampled;
+            Check(cudaMemcpy(&sampled, token, sizeof(int), cudaMemcpyDeviceToHost));
+            Require(sampled >= 0 && sampled < vocab && actual[sampled] > 0, "sample outside retained q");
+            double error = 0;
+            for (int i = 0; i < vocab; ++i) {
+                Require((actual[i] > 0) == (expected[i] > 0), "compact proposal support differs");
+                error += std::abs(actual[i] - expected[i]);
+            }
+            Require(error < 1.e-5, "compact proposal probabilities differ");
+        }
+    }
+    {
+        Buffer input(std::vector<float>(129, -INFINITY)), filtered(129);
+        fastllm::Data workspace;
+        Require(FastllmCudaMtpSampleDraftDeviceTopKFirst(input.p, filtered.p, 1.f, 40, .9f,
+                token, 129, workspace), "masked proposal failed");
+        int sampled;
+        Check(cudaMemcpy(&sampled, token, sizeof(int), cudaMemcpyDeviceToHost));
+        auto q = filtered.Read();
+        Require(sampled == 0 && std::all_of(q.begin(), q.end(), [](float p) { return p == 0.f; }),
+                "all-masked compact proposals must retain a safe token index and zero mass");
+    }
     cudaFree(token);
     std::puts("DEVICE_FILTER_GRAPH_PASS 24 distributions, 49152 replays, saved q and RNG checked");
+}
+#ifndef USE_ROCM
+void IndexedBf16ProjectionCase() {
+    using namespace fastllm;
+    constexpr int vocab = 131, width = 256;
+    std::vector<float> embed(vocab * width), projection(embed.size());
+    for (int i = 0; i < vocab * width; ++i) {
+        embed[i] = (i * 13 % 19 - 9) / 32.f;
+        projection[i] = (i * 7 % 17 - 8) / 64.f;
+    }
+    Data table(FLOAT32, {vocab, width}, embed), weight(FLOAT32, {vocab, width}, projection);
+    for (auto *matrix : {&table, &weight}) {
+        matrix->ToDevice(CUDA, {0}, true);
+        ToDataType(*matrix, BFLOAT16);
+    }
+    Data id(FLOAT32, {1, 1}), output(BFLOAT16, {1, 1, vocab});
+    for (auto *buffer : {&id, &output}) {
+        buffer->ToDevice(CUDA, {0}, false);
+        buffer->Allocate(false);
+    }
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Require(FastllmCudaIndexedBf16Gemv(id, table, weight, output), "indexed BF16 projection capture");
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (int token : {0, 73, vocab - 1}) {
+        float input = token;
+        Check(cudaMemcpy(id.cudaData, &input, sizeof(input), cudaMemcpyHostToDevice));
+        Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        std::vector<uint16_t> result(vocab);
+        Check(cudaMemcpy(result.data(), output.cudaData, output.GetBytes(), cudaMemcpyDeviceToHost));
+        for (int row = 0; row < vocab; ++row) {
+            float sum = 0;
+            for (int col = 0; col < width; ++col)
+                sum += embed[token * width + col] * projection[row * width + col];
+            Require(result[row] == Float32ToBFloat16RNEBits(sum), "indexed BF16 projection differs from CPU");
+        }
+    }
+    Check(cudaGraphExecDestroy(exec));
+    Check(cudaGraphDestroy(graph));
+}
+#endif
+
+// Several distinct input scores round to exactly the same softcap. The stable top-k
+// boundary follows token ID across that entire plateau, including after graph replay.
+void MarkovDrawPlateauCase() {
+    using namespace fastllm;
+    constexpr int rows = 3, vocab = 65539, pitch = vocab + 3;
+    const int peaks[rows] = {85, 300, 85};
+    std::vector<float> base(rows * pitch, -300.f);
+    for (int row = 0; row < rows; ++row)
+        for (int i = 0; i < peaks[row]; ++i) base[row * pitch + 10 * i + row] = float(300 + 2 * i);
+    for (DataType type : {BFLOAT16, FLOAT16}) {
+        auto upload = [&](const std::vector<float> &values) {
+            Data x(FLOAT32, {(int)values.size()}, values);
+            x.ToDevice(CUDA, {0}, true);
+            ToDataType(x, type);
+            return x;
+        };
+        auto b = upload(base), correction = upload(std::vector<float>(rows * vocab, -2.f));
+        auto bias = upload(std::vector<float>(vocab, 2.f));
+        Buffer temperature(std::vector<float>{.7f, 1.f, 1.3f}), topP(std::vector<float>(rows, .95f));
+        Buffer k(rows), seed(2), tokens(rows * 2), q(std::vector<float>(rows * pitch, -1.f));
+        Check(cudaMemsetAsync(seed.p, 0, sizeof(uint64_t), cudaStreamPerThread));
+        auto *workspace = FastllmCudaMtpCreateTargetDistribution(rows, vocab);
+        Require(workspace != nullptr, "Markov draw workspace");
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(FastllmCudaMtpGraphDrawMarkov(workspace, b.cudaData, pitch, correction.cudaData, bias.cudaData, 30.f,
+                    type == BFLOAT16, temperature.p, reinterpret_cast<int *>(k.p), topP.p,
+                    reinterpret_cast<uint64_t *>(seed.p), 0, q.p, pitch, reinterpret_cast<int *>(tokens.p), 2),
+                "Markov draw capture");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+        for (std::vector<int> ks : {std::vector<int>{40, 40, vocab}, std::vector<int>{vocab, 1, 40}}) {
+            Check(cudaMemcpy(k.p, ks.data(), rows * sizeof(int), cudaMemcpyHostToDevice));
+            Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            auto probs = q.Read();
+            int ids[rows * 2];
+            Check(cudaMemcpy(ids, tokens.p, sizeof(ids), cudaMemcpyDeviceToHost));
+            for (int row = 0; row < rows; ++row) {
+                const int keep = std::min(ks[row], peaks[row]);
+                for (int i = 0; i < vocab; ++i) {
+                    const bool kept = i >= row && (i - row) % 10 == 0 && (i - row) / 10 < keep;
+                    Require(std::abs(probs[row * pitch + i] - (kept ? 1.f / keep : 0.f)) < 1.e-6f,
+                            "Markov draw changed the softcap plateau");
+                }
+                Require(probs[row * pitch + vocab] == -1.f, "Markov draw wrote into q padding");
+                Require(ids[2 * row] >= 0 && ids[2 * row] < vocab && probs[row * pitch + ids[2 * row]] > 0.f,
+                        "Markov draw sampled outside retained q");
+            }
+        }
+        Check(cudaGraphExecDestroy(exec));
+        Check(cudaGraphDestroy(graph));
+        FastllmCudaMtpDestroyTargetDistribution(workspace);
+    }
 }
 void MarkovGraphCase() {
     using namespace fastllm;
@@ -608,15 +763,70 @@ void LargeVocabularyCase() {
     }
     std::puts("large-vocabulary dispatch boundaries, masks, ties, joint filtering: PASS");
 }
+
+void AcceptedConsumerCase() {
+    // Point masses give an exact acceptance oracle, including ragged prefixes.
+    const int vocab = 16384;
+    for (int batch : {1, 2, 4, 8, 9, 16}) for (int drafts : {1, 3, 7, 8}) {
+        const int rows = batch * (drafts + 1);
+        std::vector<float> logits((size_t)rows * vocab, -INFINITY);
+        std::vector<float> probs((size_t)batch * drafts * vocab, 0);
+        std::vector<float> temperatures(rows, .4f), topPs(rows, .95f);
+        std::vector<int> topKs(rows, vocab), ids(batch * drafts), expected(batch);
+        for (int b = 0; b < batch; ++b) {
+            expected[b] = (b + drafts / 2) % (drafts + 1);
+            for (int d = 0; d <= drafts; ++d) {
+                int token = 3 + b * 23 + d;
+                logits[((size_t)b * (drafts + 1) + d) * vocab + token] = 0;
+                if (d < drafts) {
+                    int proposal = d < expected[b] ? token : token + 500;
+                    ids[b * drafts + d] = proposal;
+                    probs[((size_t)b * drafts + d) * vocab + proposal] = 1;
+                }
+            }
+        }
+        Buffer input(logits), proposal(probs), consumed(batch);
+        struct Consumer { int *output; int count; int calls = 0; };
+        Consumer consumer{reinterpret_cast<int *>(consumed.p), batch};
+        auto enqueue = [](const int *accepted, void *opaque) {
+            auto &c = *static_cast<Consumer *>(opaque);
+            ++c.calls;
+            Check(cudaMemcpyAsync(c.output, accepted, c.count * sizeof(int),
+                                  cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        };
+        std::vector<int> tokens(rows, -2), accepted(batch, -2), deviceCounts(batch, -2);
+        Require(FastllmCudaMtpRejectionSamplingWithConsumer(input.p, proposal.p,
+            temperatures.data(), topKs.data(), topPs.data(), ids.data(),
+            tokens.data(), accepted.data(), batch, drafts, vocab, enqueue, &consumer),
+            "accepted-prefix consumer sampling failed");
+        Check(cudaDeviceSynchronize());
+        Require(accepted == expected, "accepted prefix differs from exact oracle");
+        for (int b = 0; b < batch; ++b) for (int d = 0; d <= accepted[b]; ++d)
+            Require(tokens[b * (drafts + 1) + d] == 3 + b * 23 + d,
+                    "consumer path emitted an incorrect token");
+        Require(consumer.calls == (batch <= 8 ? 1 : 0),
+                "consumer capability fallback changed");
+        if (consumer.calls) {
+            Check(cudaMemcpy(deviceCounts.data(), consumed.p, batch * sizeof(int), cudaMemcpyDeviceToHost));
+            Require(deviceCounts == expected, "device prefix counts differ from host results");
+        }
+    }
+    std::puts("ACCEPTED_CONSUMER_PASS batch 1/2/4/8/9/16, drafts 1/3/7/8, exact ragged prefixes and fallback");
+}
 }
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || !n) return 77;
     try {
         Check(cudaSetDevice(0));
+        AcceptedConsumerCase();
         FilterCase();
         DeviceFilterCase();
+#ifndef USE_ROCM
+        IndexedBf16ProjectionCase();
+#endif
         MarkovGraphCase();
+        MarkovDrawPlateauCase();
         FullVocabularyCase();
         VerifyProposalLayoutCase();
         LargeVocabularyCase();

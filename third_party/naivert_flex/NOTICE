@@ -1,0 +1,17 @@
+NaiveRT
+Copyright 2026 NaiveAI
+
+This product includes software developed at NaiveAI.
+Licensed under the Apache License, Version 2.0; see LICENSE.
+
+Third-party components vendored in this distribution and their licenses are listed in
+THIRD_PARTY_NOTICES.md.
+
+
+The SM103 block-128 gate implementation in
+src/devices/cuda/moe/fastllm-shared-flex-block128-sm103.cuh also adapts the
+prepared rows8 page pipeline and warp-MMA fragments from NaiveRT commit
+79d5704ac32ff5fa756e9fb3a76829c236444d86 (Copyright 2026 NaiveAI).
+FastLLM modifications include row-major TMA weight reads, exact FastLLM routing,
+in-place power-of-two rebasing, paired MXFP8/32 output, balanced CTA scheduling,
+and accumulation-order changes. The upstream Apache-2.0 license applies.

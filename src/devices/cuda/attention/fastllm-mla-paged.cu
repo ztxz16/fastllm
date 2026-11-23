@@ -1,5 +1,34 @@
 #include "fastllm-attention-workspace.cuh"
 
+#include "fastllm-mla-plan.h"
+
+#ifdef FASTLLM_ENABLE_FLASHINFER
+template <class Params>
+static void BindMlaPlan(Params &params, const flashinfer::MLAPlanInfo &plan_info, void *int_plan,
+                        void *partials) {
+    params.q_indptr = (int32_t *)((uint8_t *)int_plan + plan_info.q_indptr_offset);
+    params.kv_indptr = (int32_t *)((uint8_t *)int_plan + plan_info.kv_indptr_offset);
+    params.partial_indptr = (int32_t *)((uint8_t *)int_plan + plan_info.partial_indptr_offset);
+    params.q_len = (int32_t *)((uint8_t *)int_plan + plan_info.q_len_offset);
+    params.kv_len = (int32_t *)((uint8_t *)int_plan + plan_info.kv_len_offset);
+    params.q_start = (int32_t *)((uint8_t *)int_plan + plan_info.q_start_offset);
+    params.kv_start = (int32_t *)((uint8_t *)int_plan + plan_info.kv_start_offset);
+    params.kv_end = (int32_t *)((uint8_t *)int_plan + plan_info.kv_end_offset);
+    params.work_indptr = (int32_t *)((uint8_t *)int_plan + plan_info.work_indptr_offset);
+    params.merge_packed_offset_start =
+        (int32_t *)((uint8_t *)int_plan + plan_info.merge_packed_offset_start_offset);
+    params.merge_packed_offset_end =
+        (int32_t *)((uint8_t *)int_plan + plan_info.merge_packed_offset_end_offset);
+    params.merge_partial_packed_offset_start =
+        (int32_t *)((uint8_t *)int_plan + plan_info.merge_partial_packed_offset_start_offset);
+    params.merge_partial_packed_offset_end =
+        (int32_t *)((uint8_t *)int_plan + plan_info.merge_partial_packed_offset_end_offset);
+    params.merge_partial_stride = (int32_t *)((uint8_t *)int_plan + plan_info.merge_partial_stride_offset);
+    params.partial_o = (typename Params::DTypeO *)((uint8_t *)partials + plan_info.partial_o_offset);
+    params.partial_lse = (float *)((uint8_t *)partials + plan_info.partial_lse_offset);
+}
+#endif
+
 static bool FastllmCudaMLAPagedImpl(const fastllm::Data &qNope, const fastllm::Data &qPe,
         const std::vector<const fastllm::Data*> &peCaches,
         const std::vector<const fastllm::Data*> &latentCaches,
@@ -161,23 +190,8 @@ static bool FastllmCudaMLAPagedImpl(const fastllm::Data &qNope, const fastllm::D
         params.kpe = (scalar_t*)peCache.pagedKVCacheData->cudaData;
         params.final_o = (scalar_t*)output.cudaData;
         params.final_lse = nullptr;
-        params.q_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.q_indptr_offset);
-        params.kv_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.kv_indptr_offset);
-        params.partial_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.partial_indptr_offset);
         params.kv_indices = d_kv_indices;
-        params.q_len = (int32_t*)((uint8_t*)int_plan + plan_info.q_len_offset);
-        params.kv_len = (int32_t*)((uint8_t*)int_plan + plan_info.kv_len_offset);
-        params.q_start = (int32_t*)((uint8_t*)int_plan + plan_info.q_start_offset);
-        params.kv_start = (int32_t*)((uint8_t*)int_plan + plan_info.kv_start_offset);
-        params.kv_end = (int32_t*)((uint8_t*)int_plan + plan_info.kv_end_offset);
-        params.work_indptr = (int32_t*)((uint8_t*)int_plan + plan_info.work_indptr_offset);
-        params.merge_packed_offset_start = (int32_t*)((uint8_t*)int_plan + plan_info.merge_packed_offset_start_offset);
-        params.merge_packed_offset_end = (int32_t*)((uint8_t*)int_plan + plan_info.merge_packed_offset_end_offset);
-        params.merge_partial_packed_offset_start = (int32_t*)((uint8_t*)int_plan + plan_info.merge_partial_packed_offset_start_offset);
-        params.merge_partial_packed_offset_end = (int32_t*)((uint8_t*)int_plan + plan_info.merge_partial_packed_offset_end_offset);
-        params.merge_partial_stride = (int32_t*)((uint8_t*)int_plan + plan_info.merge_partial_stride_offset);
-        params.partial_o = (scalar_t*)((uint8_t*)workspace.d_float_workspace + plan_info.partial_o_offset);
-        params.partial_lse = (float*)((uint8_t*)workspace.d_float_workspace + plan_info.partial_lse_offset);
+        BindMlaPlan(params, plan_info, int_plan, workspace.d_float_workspace);
         params.num_heads = num_heads_div;
         params.block_size = block_size_div;
         // qNope / output layout is [h, b*s, c].
@@ -232,4 +246,83 @@ bool FastllmCudaMLAPagedBatch(const fastllm::Data &qNope, const fastllm::Data &q
     if (peCaches.size() <= 1) return false;
     return FastllmCudaMLAPagedImpl(qNope, qPe, peCaches, latentCaches,
         kvLengths, physicalTokenIndices, output, softmaxScale);
+}
+
+#ifdef FASTLLM_ENABLE_FLASHINFER
+struct FastllmCudaMLAPlan {
+    int heads;
+    flashinfer::MLAPlanInfo info;
+    FastllmCudaTempDeviceBuffer metadata, partials;
+    FastllmCudaMLAPlan(int device, int heads) : heads(heads), metadata(device), partials(device) {}
+};
+
+struct TokenRowMlaParams : flashinfer::MLAParams<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16, int32_t> {
+    const FastllmCudaMLAToken *token_rows;
+    const int *row_lengths;
+};
+#endif
+
+bool FastllmCudaMLAPagedPlanSupported(int device) {
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    cudaDeviceProp prop{};
+    return cudaGetDeviceProperties(&prop, device) == cudaSuccess && prop.major >= 8 &&
+           prop.cooperativeLaunch && prop.sharedMemPerMultiprocessor >= 92672;
+#else
+    return false;
+#endif
+}
+
+std::shared_ptr<FastllmCudaMLAPlan> FastllmCudaPrepareMLAPaged(int rows, int heads, int candidates) {
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    int device;
+    checkCudaErrors("MLA plan device", cudaGetDevice(&device));
+
+    auto plan = std::make_shared<FastllmCudaMLAPlan>(device, heads);
+    std::vector<int> q(rows + 1), kv(rows + 1), lengths(rows, candidates);
+    for (int r = 0; r <= rows; ++r) {
+        q[r] = r;
+        kv[r] = r * candidates;
+    }
+    flashinfer::MLAHostWorkspace storage;
+    checkCudaErrors("MLA sparse plan",
+                    flashinfer::MLAPlan<int>(nullptr, 0, nullptr, nullptr, 0, plan->info, q.data(), kv.data(),
+                                             lengths.data(), rows, heads, 512, false, cudaStreamPerThread,
+                                             true, &storage));
+    plan->metadata.data = FastllmCudaDirectMalloc(storage.metadata.size());
+    plan->partials.data = FastllmCudaDirectMalloc(storage.partial_bytes);
+    checkCudaErrors("MLA plan copy", cudaMemcpyAsync(plan->metadata.data, storage.metadata.data(),
+                                                     storage.metadata.size(), cudaMemcpyHostToDevice,
+                                                     cudaStreamPerThread));
+    checkCudaErrors("MLA plan ready", cudaStreamSynchronize(cudaStreamPerThread));
+    return plan;
+#else
+    return {};
+#endif
+}
+
+bool FastllmCudaMLAPaged(const FastllmCudaMLAPlan &plan, const void *query, const void *queryPe,
+                         const FastllmCudaMLAToken *tokens, const int *lengths, float scale, void *output,
+                         float *naturalLogSumExp) {
+#ifdef FASTLLM_ENABLE_FLASHINFER
+    TokenRowMlaParams p{};
+    BindMlaPlan(p, plan.info, plan.metadata.data, plan.partials.data);
+    p.q_nope = (__nv_bfloat16 *)query;
+    p.q_pe = (__nv_bfloat16 *)queryPe;
+    p.final_o = (__nv_bfloat16 *)output;
+    p.final_lse = naturalLogSumExp;
+    p.return_lse_base_on_e = true;
+    p.sm_scale = scale;
+    p.num_heads = flashinfer::uint_fastdiv(plan.heads);
+    p.block_size = flashinfer::uint_fastdiv(1);
+    p.q_nope_stride_n = p.o_stride_n = plan.heads * 512;
+    p.q_nope_stride_h = p.o_stride_h = 512;
+    p.q_pe_stride_n = plan.heads * 64;
+    p.q_pe_stride_h = 64;
+    p.token_rows = tokens;
+    p.row_lengths = lengths;
+    return flashinfer::mla::BatchMLAPagedAttention<flashinfer::MaskMode::kNone,512,64>(
+        p, plan.info.num_blks_x, plan.info.num_blks_y, cudaStreamPerThread) == cudaSuccess;
+#else
+    return false;
+#endif
 }

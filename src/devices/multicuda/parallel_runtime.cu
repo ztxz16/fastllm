@@ -89,6 +89,52 @@ void CopyField(const void *source, void *dest, const int *indices, int rows,
     Check(cudaGetLastError());
 }
 
+// Contiguous uint4 fields share one row permutation and one collective record.
+// Pass addresses by value so a graph replay depends only on the device row map.
+struct RowRecord4 {
+    uint4 *field[4];
+    int units[4], firstBlock[5], offsets[4], stride;
+};
+
+template<bool Pack>
+__global__ void TransferRowRecord4(RowRecord4 record, uint4 *buffer, const int *indices, int validRows) {
+    const int row = blockIdx.y;
+    const int f = (blockIdx.x >= record.firstBlock[1]) + (blockIdx.x >= record.firstBlock[2]) +
+                  (blockIdx.x >= record.firstBlock[3]);
+    const int column = (int(blockIdx.x) - record.firstBlock[f]) * blockDim.x + threadIdx.x;
+    if (column >= record.units[f]) return;
+    const size_t fieldIndex = size_t(row) * record.units[f] + column;
+    const int packedRow = Pack ? row : indices[row];
+    const size_t packedIndex = size_t(packedRow) * record.stride + record.offsets[f] + column;
+    if constexpr (Pack) {
+        buffer[packedIndex] = row < validRows ? record.field[f][fieldIndex] : make_uint4(0, 0, 0, 0);
+    } else {
+        record.field[f][fieldIndex] = buffer[packedIndex];
+    }
+}
+
+template<bool Pack>
+bool TransferFourFields(const CudaRowTransfer::Field *fields, size_t count, size_t rowBytes,
+                        void *packed, const int *indices, int rows, int validRows) {
+    if (count != 4 || rows <= 0 || rows > 65535 || rowBytes > size_t(std::numeric_limits<int>::max()) ||
+        (uintptr_t(packed) & 15)) return false;
+    RowRecord4 record{};
+    for (int f = 0; f < 4; ++f) {
+        void *ptr = Pack ? const_cast<void *>(fields[f].local) : fields[f].global;
+        if ((fields[f].rowBytes | uintptr_t(ptr)) & 15) return false;
+        record.field[f] = static_cast<uint4 *>(ptr);
+        record.units[f] = fields[f].rowBytes / sizeof(uint4);
+        record.offsets[f] = record.stride;
+        record.stride += record.units[f];
+        record.firstBlock[f+1] = record.firstBlock[f] + (record.units[f] + 127) / 128;
+    }
+    if (!record.stride) return false;
+    TransferRowRecord4<Pack><<<dim3(record.firstBlock[4], rows), 128, 0, cudaStreamPerThread>>>(
+        record, static_cast<uint4 *>(packed), indices, validRows);
+    Check(cudaGetLastError());
+    return true;
+}
+
 void Copy(const void *source, void *dest, const int *indices, int rows, size_t rowBytes) {
     const size_t bytes = Bytes(rows, rowBytes);
     if (!bytes) return;
@@ -466,6 +512,10 @@ void CudaRowTransfer::ReserveFixed(size_t maxRows, size_t maxRowBytes) {
     impl->fixedRows = maxRows; impl->fixedRowBytes = maxRowBytes;
     impl->Initialize();
 }
+const int *CudaRowTransfer::LocalToGlobal(int rank) const {
+    return impl->scratch.at(rank).select;
+}
+
 void CudaRowTransfer::Select(int rank, const void *global, void *local, size_t rowBytes) {
     if (activeRuntime != impl->runtime.impl.get() || activeRank != rank)
         throw std::logic_error("row select outside owning worker");
@@ -496,19 +546,36 @@ void CudaRowTransfer::Collect(int rank, const Field *fields, size_t count) {
     if (!rows.Rows() || !rowBytes) return;
     const size_t sendBytes = Bytes(rows.bucket, rowBytes), gatherBytes = Bytes(rows.PaddedRows(), rowBytes);
     if (s.capacity < gatherBytes) throw std::logic_error("row transfer scratch not reserved");
-    if (topology.AttentionRank(rank) == 0) {
-        if (localRows < size_t(rows.bucket))
-            Check(cudaMemsetAsync(static_cast<unsigned char *>(s.send) + localRows * rowBytes, 0,
-                (rows.bucket - localRows) * rowBytes, cudaStreamPerThread));
-        size_t offset = 0;
-        for (size_t i = 0; i < count; ++i) {
-            CopyField(fields[i].local, static_cast<unsigned char *>(s.send) + offset, nullptr,
-                localRows, fields[i].rowBytes, fields[i].rowBytes, rowBytes);
-            offset += fields[i].rowBytes;
-        }
-        impl->runtime.AllGather(topology.leaders, rank, s.send, s.gather, sendBytes, ScalarType::Byte);
+    // With all rows on one owner, broadcast its records directly into the padded
+    // slot selected by the replayable unpack map. Every leader uses the same root.
+    int owner = -1;
+    for (int group = 0; group < topology.attentionDP; ++group) {
+        if (rows.localToGlobal[group].size() == size_t(rows.Rows())) { owner = group; break; }
     }
-    impl->runtime.Broadcast(topology.attention[topology.AttentionOwner(rank)], rank, s.gather, gatherBytes, ScalarType::Byte);
+    auto *broadcastSlot = static_cast<unsigned char *>(s.gather) + (owner < 0 ? 0 : size_t(owner) * sendBytes);
+    if (topology.AttentionRank(rank) == 0) {
+        if (owner < 0 || localRows) {
+            void *target = owner < 0 ? s.send : broadcastSlot;
+            if (!TransferFourFields<true>(fields, count, rowBytes, target, nullptr, rows.bucket, localRows)) {
+                if (localRows < size_t(rows.bucket))
+                    Check(cudaMemsetAsync(static_cast<unsigned char *>(target) + localRows * rowBytes, 0,
+                        (rows.bucket - localRows) * rowBytes, cudaStreamPerThread));
+                size_t offset = 0;
+                for (size_t i = 0; i < count; ++i) {
+                    CopyField(fields[i].local, static_cast<unsigned char *>(target) + offset, nullptr,
+                        localRows, fields[i].rowBytes, fields[i].rowBytes, rowBytes);
+                    offset += fields[i].rowBytes;
+                }
+            }
+        }
+        if (owner >= 0)
+            impl->runtime.Broadcast(topology.leaders, rank, broadcastSlot, sendBytes, ScalarType::Byte, owner);
+        else
+            impl->runtime.AllGather(topology.leaders, rank, s.send, s.gather, sendBytes, ScalarType::Byte);
+    }
+    impl->runtime.Broadcast(topology.attention[topology.AttentionOwner(rank)], rank,
+        owner < 0 ? s.gather : broadcastSlot, owner < 0 ? gatherBytes : sendBytes, ScalarType::Byte);
+    if (TransferFourFields<false>(fields, count, rowBytes, s.gather, s.unpack, rows.Rows(), rows.Rows())) return;
     size_t offset = 0;
     for (size_t i = 0; i < count; ++i) {
         CopyField(static_cast<unsigned char *>(s.gather) + offset, fields[i].global, s.unpack,

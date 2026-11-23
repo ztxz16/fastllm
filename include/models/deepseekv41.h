@@ -90,11 +90,15 @@ namespace fastllm {
     };
 
     struct DeepSeekV41DsparkWorkspace;
+    struct DeepSeekV41BatchProposal;
+    struct DeepSeekV41SpecScratch;
     struct DeepSeekV41DsparkState {
         ~DeepSeekV41DsparkState();
         void Reset(int startPos);
         void ClearProposal();
         std::shared_ptr<DeepSeekV41DsparkWorkspace> workspace;
+        std::shared_ptr<void> nextVerifyPages; // request-private CUDA descriptor packet
+        int nextVerifyPosition = -1;
         std::map<int, std::shared_ptr<DeepSeekV41DsparkWorkspace>> contextWorkspaces;
         // Only model-owned batched storage uses this immediate handoff list.
         std::vector<DeepSeekV41DsparkState *> contextRequests;
@@ -115,6 +119,8 @@ namespace fastllm {
         // 已经校验通过、等待调度器逐个取走的 token：(期望的输入 token, 应返回的 token)
         std::deque<std::pair<int, int> > pending;
         uint64_t rounds = 0, proposed = 0, accepted = 0;
+        std::shared_ptr<DeepSeekV41BatchProposal> batchProposal;
+        int proposalRow = -1;
     };
 
     // 一次"校验前向"里需要额外记录的信息：延后的滑窗写入、压缩缓存的回滚点、
@@ -124,6 +130,8 @@ namespace fastllm {
         bool deferWindow = false;     // 滑窗写入延后到接受长度确定之后
         bool wantAllTokens = false;   // head 对本片段的每个位置计算目标 logits
         int mainHiddenStartPos = -1;  // bounded prefill 只采集末尾窗口，记录其绝对起点
+        const void *packedMainOwner = nullptr;
+        Data packedMainHidden; // Optional owner-written [1, rows, features * dim] graph view.
         std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
         std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
         std::vector<Data> rawKV, rawScore;    // kv source 层：压缩器的原始输入流（含旧 rawTail）
@@ -132,7 +140,18 @@ namespace fastllm {
         std::function<void(int)> commitKV;
         const void *commitGroup = nullptr;
         std::function<void(const std::vector<std::pair<int, int>> &)> commitBatchKV;
+        // Producer-owned until sampling completes. The host mirrors the proposal only
+        // after graph submission, or before the ordinary frontend on a fallback.
+        std::function<void()> resolveDraftIds;
+        const void *verifyPacket = nullptr;
+        size_t verifyPacketBytes = 0;
+        int verifyProducer = -1;
+        void *verifyReady = nullptr, *deviceCommitReady = nullptr;
+        std::function<bool(std::shared_ptr<void> &, int)> stageNextPages;
+        std::function<bool(int, const int *)> commitDeviceSpan;
+        bool deviceDecision = false, earlyContext = false, earlyDraft = false;
         bool kvCommitted = false;
+        bool targetRowsReady = false; // Full verify joined all producers before sampling readback.
         // Attention DP: target KV and rollback scratch belong to the request's
         // TP ranks. The parent alone owns sampling and draft/main features.
         std::vector<std::shared_ptr<DeepSeekV41SpecScratch>> attentionRanks;
@@ -140,6 +159,8 @@ namespace fastllm {
         std::vector<int> prevBlocks;          // kv source 层：前向之前的压缩块数
         std::vector<int> tokens, draftTokens;
         int acceptedDrafts = -1;      // 采样校验给出接受前缀长度；-1 表示按 greedy token 比较
+        const int *ownerDraftIds = nullptr; // Five device candidates, excluding the scheduler anchor.
+        int ownerAnchor = -1;
     };
 
     struct DeepSeekV41EngramPrefetch;
@@ -147,6 +168,7 @@ namespace fastllm {
     struct DeepSeekV41RequestState {
         // Released after layer views; the lease owns a bounded serving KV slot.
         std::shared_ptr<void> storageLease;
+        uint64_t storageRevision = 0;
         // MLA state is replicated only inside this request's attention TP group.
         int attentionGroup = -1;
         std::vector<std::shared_ptr<DeepSeekV41RequestState>> attentionRanks;
@@ -201,6 +223,7 @@ namespace fastllm {
         DeepSeekV41SpecScratch *spec = nullptr;
         // Internal chunked-prefill step: update KV sources, defer the decoder tail/head.
         bool prefillCacheOnly = false;
+        int verifyReserveTokens = 0; // Optional first-allocation headroom for this request.
     };
 
     // Engram 哈希元数据（由 tokenizer 归一化派生，Python 侧生成 JSON，此处加载）
@@ -212,6 +235,8 @@ namespace fastllm {
         std::vector<std::vector<int64_t> > multipliers;  // [engramLayer][maxNgram]
         std::vector<std::vector<int64_t> > primes;       // [engramLayer][(maxNgram-1)*heads]
         std::vector<std::vector<int64_t> > offsets;      // [engramLayer][(maxNgram-1)*heads]
+        bool AppendVerifyHashParameters(int layer, int ngram, int heads, int64_t tableRows,
+                                        std::vector<int64_t> &parameters) const;
     };
 
     struct DeepSeekV41MoeContext;
@@ -338,6 +363,7 @@ namespace fastllm {
         std::shared_ptr<AttentionParallel> v41AttentionParallel;
         int v41AttentionDP = 1;
         parallel::CudaRuntime *v41AttentionRankRuntime = nullptr;
+        std::map<std::pair<int, bool>, std::shared_ptr<Data>> v41OutputWeights;
         int v41AttentionRank = -1;
         int v41AttentionLogicalRows = 0;
         void PrepareAttentionParallel();
@@ -357,7 +383,7 @@ namespace fastllm {
         void LinearWithActivationQuant(Data &input, const std::string &weightName,
                                        Data &output, bool replicated = false, Data *scratch = nullptr,
                                        bool inputQuantized = false, Data *reductionScratch = nullptr,
-                                       bool preserveQuantizedInput = false);
+                                       bool preserveQuantizedInput = false, bool decodeProjection = false);
 
         // -------- 跨层共享 --------
         std::vector<int> kv_source_layer_ids;
@@ -477,10 +503,15 @@ namespace fastllm {
         using EngramPrefetch = DeepSeekV41EngramPrefetch;
         struct ForwardWorkspace;
         void RunAttentionParallel(ForwardWorkspace &, int layer);
+        bool CommitAttentionParallelBatch(const std::vector<DeepSeekV41Segment> &segments);
         void CommitAttentionParallel(DeepSeekV41RequestState &, DeepSeekV41SpecScratch &,
                                      int startPos, int accept, int forwarded);
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
+        void PrepareTokenHistory(ForwardWorkspace &);
+        void StageDsparkVerify(DeepSeekV41RequestState &, const DeepSeekV41SpecScratch &);
+        bool ReadPublishedDsparkIds(const DeepSeekV41Segment &);
+        void PublishDsparkDecision(const DeepSeekV41Segment &, const GenerationConfig &, const Data &);
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
         bool TryFullDecodeGraph(ForwardWorkspace &, bool inputsPrepared);
@@ -595,6 +626,8 @@ namespace fastllm {
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         // The verifier's full graph gathers TP vocabulary shards itself.
         void DsparkProjectHead(Data &input, Data &output, bool persistent = false, bool sharded = false);
+        std::map<int, Data> v41DsparkContextWeights;
+        bool DsparkProjectContext(Data &main, DeepSeekV41DsparkState &state, int batch, int rows, const int *positions);
         bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,
                               Data &raw, Data &qNorm, Data &qQuant, Data &kv, bool inputQuantized = false,
                               Data *joinedWeight = nullptr);
@@ -617,8 +650,8 @@ namespace fastllm {
         int DsparkTakePending(DeepSeekV41RequestState &state, const Data &inputIds, int seqlen);
         int DsparkTakePending(DeepSeekV41RequestState &state, int previousToken);
         // 若 state 有可用的候选，把 inputIds 扩展成 [anchor, draft...]，返回 draft 个数
-        int DsparkBuildVerifyInput(DeepSeekV41RequestState &state, const Data &inputIds,
-                                   int startPos, Data &verifyIds, std::vector<int> &drafts);
+        int DsparkBuildVerifyInput(DeepSeekV41RequestState &state, int anchor,
+                                   int startPos, std::vector<int> &drafts);
         // 把本次前向的前 accept 个位置提交进各层缓存，其余回滚
         bool DsparkCommitBatch(const std::vector<DeepSeekV41Segment> &segments);
         void DsparkCommitPrefix(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
@@ -634,7 +667,7 @@ namespace fastllm {
         bool DsparkRunDraft(DeepSeekV41DsparkState &storage,
                            const std::vector<int> &positions, const std::vector<int> &anchors,
                            const std::vector<int> &validRows, std::vector<int> &tokens,
-                           std::vector<float> &confidence, const GenerationConfig &config);
+                           std::vector<float> &confidence, const GenerationConfig &config, bool deferGreedy = false);
         void DsparkBuildMoeWeights();
         void DsparkReportStats();
 
