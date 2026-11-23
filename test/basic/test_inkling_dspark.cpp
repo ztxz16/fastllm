@@ -17,7 +17,7 @@ void snapshotInklingDraft(const int *, const void *, int, const void *, const vo
                           float *, int, int, int);
 
 namespace {
-int keep, suffix, verifyLaunches;
+int keep, suffix, verifyLaunches, captures;
 int drawIndex = 0;
 bool controlled = false;
 int *control = nullptr;
@@ -57,6 +57,20 @@ extern "C" cudaError_t cudaGraphLaunch(cudaGraphExec_t graph, cudaStream_t strea
     static const auto launch = original(&cudaGraphLaunch);
     if (controlled) ++verifyLaunches;
     return launch(graph, stream);
+}
+
+// CUDA selects the capture entry point at compile time according to the
+// default stream mode used to build the library under test.
+#undef cudaStreamEndCapture
+extern "C" cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t *graph) {
+    static const auto end = original(&cudaStreamEndCapture);
+    if (controlled) ++captures;
+    return end(stream, graph);
+}
+extern "C" cudaError_t cudaStreamEndCapture_ptsz(cudaStream_t stream, cudaGraph_t *graph) {
+    static const auto end = original(&cudaStreamEndCapture_ptsz);
+    if (controlled) ++captures;
+    return end(stream, graph);
 }
 
 extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *ws, const void *base, int baseStride, const void *adjust,
@@ -392,7 +406,71 @@ static int checkHybridDecode(const char *path) {
     return 0;
 }
 
+// Exercise non-power-of-two admission, padding and request reordering across a
+// window/page boundary. A single target replay must serve the whole live set.
+static int checkBatchDecode(const char *path, int capacity) {
+    if (capacity < 2) return 2;
+    setenv("FASTLLM_DSPARK_TOKENS", "0", 1);
+    SetDeviceMap({{"cuda:0", 1}});
+    SetMoeDeviceMap({{"cuda:0", 1}});
+    SetMaxTokens(8192);
+    SetPageLen(16);
+    SetCudaGraph(true);
+    auto model = CreateLLMModelFromHF(path, BFLOAT16);
+    model->SetKVCacheDataType(FLOAT16);
+    const int vocab = std::stoi(model->weight.dicts.at("text_config.unpadded_vocab_size"));
+    model->maxBatch = capacity;
+    model->WarmUp();
+    std::vector<ResponseContext> contexts(capacity);
+    std::vector<GenerationConfig> configs(capacity);
+    std::vector<int> positions(capacity);
+    for (int i = 0; i < capacity; ++i) {
+        int n = i == 0 ? 1023 : 13 + i % 9;
+        positions[i] = n;
+        contexts[i].pastKeyValues.resize(model->block_cnt);
+        auto &cfg = configs[i];
+        cfg.input_token_length = n;
+        cfg.output_token_limit = 32;
+        cfg.do_sample = true;
+        cfg.top_k = i % 2 ? 40 : 1;
+        cfg.temperature = .9f;
+        cfg.top_p = .95f;
+        step(*model, contexts[i], 0, std::vector<int>(n, 220 + i), cfg);
+    }
+    int iteration = 0;
+    for (int n : {capacity, capacity - 1, (capacity + 1) / 2, 2, 1, capacity}) {
+        std::vector<float> ids;
+        std::vector<Data> storage;
+        std::vector<Data *> pos;
+        std::vector<std::pair<Data *, Data *>> slots;
+        std::vector<GenerationConfig> sampling;
+        storage.reserve(n);
+        for (int j = 0; j < n; ++j) {
+            int i = (j + iteration) % capacity;
+            ids.push_back(float(300 + i + iteration));
+            storage.emplace_back(FLOAT32, std::vector<int>{1, 1}, std::vector<float>{float(positions[i]++)});
+            pos.push_back(&storage.back());
+            for (auto &kv : contexts[i].pastKeyValues) slots.emplace_back(&kv.first, &kv.second);
+            sampling.push_back(configs[i]);
+        }
+        Data input(FLOAT32, {1, n}, ids);
+        captures = verifyLaunches = 0;
+        controlled = true;
+        auto out = model->ForwardV2(n, input, {}, pos, std::vector<int>(n, 1), slots, sampling,
+                                    LastTokensManager(n, 0), nullptr);
+        controlled = false;
+        if (captures || verifyLaunches != 1)
+            throw std::runtime_error("Inkling batch decode must replay one prewarmed graph");
+        if (int(out.size()) != n || std::any_of(out.begin(), out.end(), [vocab](int id) { return id < 0 || id >= vocab; }))
+            throw std::runtime_error("Inkling batch decode returned invalid token IDs");
+        ++iteration;
+    }
+    std::cout << "PASS full batch decode at capacity " << capacity << std::endl;
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 4 && std::string(argv[2]) == "--batch-decode") return checkBatchDecode(argv[1], std::stoi(argv[3]));
     if (argc == 3 && std::string(argv[2]) == "--hybrid-decode") return checkHybridDecode(argv[1]);
     if (argc != 2 && (argc != 3 || std::string(argv[2]) != "--graph"))
         return 77;

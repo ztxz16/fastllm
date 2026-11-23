@@ -13,14 +13,22 @@ struct AttentionRow {
     int sinkStride = heads, gateStride = heads * width;
 };
 
+// FlashInfer stores float4 partials. Its split-major layout needs an aligned
+// row start even when an odd number of LSE values follows the output vectors.
+template<int D, bool SplitMajor>
+__host__ __device__ int splitChannels(int heads) {
+    const int channels = heads * (D + 1);
+    return SplitMajor ? (channels + 3) & ~3 : channels;
+}
+
 // Keep each query's split boundaries and reduction order identical to decode.
 // Adjacent CTAs process consecutive queries against the same physical KV pages.
-template<int D>
+template<int D, bool SplitMajor = false>
 __device__ void selectSplitQuery(AttentionRow &a, float *&partial, int row, int splits) {
     a.visit += row;
     a.q += size_t(row) * a.heads * D;
     a.relative += size_t(row) * a.heads * a.distances;
-    partial += size_t(row) * splits * a.heads * (D + 1);
+    partial += size_t(row) * splits * splitChannels<D, SplitMajor>(a.heads);
 }
 
 template<class T> struct KVSegment {
@@ -88,11 +96,12 @@ struct RelativeAttention : flashinfer::AttentionVariantBase {
     }
 };
 
-template<int D, int G, bool Split, class T>
+template<int D, int G, bool Split, class T, bool Batched = false>
 __global__ void relativeAttention(AttentionRow a, float *partial) {
     constexpr int vector = 16 / sizeof(T), lanes = D / vector, groups = Split ? 1 : 128 / lanes;
+    if constexpr (Batched) selectSplitQuery<D, true>(a, partial, blockIdx.x, gridDim.z);
     const int past = a.visit ? a.visit->past : a.past;
-    const int row = a.first + blockIdx.x, pos = past + row;
+    const int row = Batched ? 0 : a.first + blockIdx.x, pos = past + row;
     const int begin = a.window ? max(0, pos + 1 - a.window) : 0;
     const int length = pos - begin + 1;
     const int split = Split ? blockIdx.z : 0;
@@ -102,7 +111,7 @@ __global__ void relativeAttention(AttentionRow a, float *partial) {
     RelativeParams<T> p{};
     p.q = a.q + size_t(row) * a.heads * D;
     if constexpr (!Split) p.o = a.output + size_t(row) * a.heads * D;
-    p.relative = a.relative + size_t(blockIdx.x) * a.heads * a.distances;
+    p.relative = Batched ? a.relative : a.relative + size_t(blockIdx.x) * a.heads * a.distances;
     if constexpr (!Split) p.sink = a.sink + size_t(row) * a.heads;
     p.num_qo_heads = a.heads;
     p.q_stride_h = D;
@@ -281,7 +290,7 @@ __global__ void mergeRelative(AttentionRow a, const float *partial, int splits,
     if constexpr (Batched) {
         const int row = blockIdx.z;
         a.visit += row;
-        partial += size_t(row) * splits * a.heads * (D + 1);
+        partial += size_t(row) * splits * splitChannels<D, !HeadMajor>(a.heads);
         sinks += size_t(row) * a.sinkStride;
         if (gate) gate += size_t(row) * a.gateStride;
         output += size_t(row) * a.heads * D;
@@ -330,7 +339,7 @@ __global__ void mergeRelativeWarp(AttentionRow a, const float *partial, int spli
     if constexpr (Batched) {
         const int row = blockIdx.z;
         a.visit += row;
-        partial += size_t(row) * splits * a.heads * (D + 1);
+        partial += size_t(row) * splits * splitChannels<D, !HeadMajor>(a.heads);
         sinks += size_t(row) * a.sinkStride;
         if (gate) gate += size_t(row) * a.gateStride;
         output += size_t(row) * a.heads * D;
@@ -367,12 +376,12 @@ __global__ void mergeRelativeWarp(AttentionRow a, const float *partial, int spli
     output[channel] = Act(out);
 }
 
-template<int D, int G, bool Split, class T>
+template<int D, int G, bool Split, class T, bool Batched = false>
 void launchRelativeKernel(AttentionRow a, int rows, float *partial, int splits) {
     constexpr int vector = 16 / sizeof(T), lanes = D / vector, groups = Split ? 1 : 128 / lanes;
     constexpr int tile = 2 * G * groups;
     constexpr size_t storage = 2 * 2 * tile * D * sizeof(T) + tile * lanes * sizeof(size_t);
-    relativeAttention<D,G,Split,T><<<dim3(rows, a.heads / G, splits), dim3(lanes,G,groups),
+    relativeAttention<D,G,Split,T,Batched><<<dim3(rows, a.heads / G, splits), dim3(lanes,G,groups),
                                    storage, cudaStreamPerThread>>>(a, partial);
 }
 
@@ -387,6 +396,16 @@ void launchRelativeMerge(AttentionRow a, const Matrix &scratch, const Act *sink,
         auto kernel = rows > 1 ? mergeRelative<D,Act,HeadMajor,true> : mergeRelative<D,Act,HeadMajor>;
         kernel<<<dim3(a.heads,1,rows),D,splits*sizeof(float),cudaStreamPerThread>>>(a, scratch.p, splits, sink, gate, out);
     }
+}
+
+template<int D, class KV>
+void launchBatchDecodeAttention(AttentionRow a, int rows, int splits) {
+    Matrix scratch(splits, rows * splitChannels<D, true>(a.heads));
+    if (a.heads == 3 * a.kvHeads)
+        launchRelativeKernel<D,3,true,KV,true>(a, rows, scratch.p, scratch.rows);
+    else
+        launchRelativeKernel<D,1,true,KV,true>(a, rows, scratch.p, scratch.rows);
+    launchRelativeMerge<D,false>(a, scratch, a.sink, static_cast<const float *>(nullptr), a.output, rows);
 }
 
 #include "attention-sm120.cuh"
