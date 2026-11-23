@@ -2909,16 +2909,10 @@ class model:
         multimodal_images = list(images or [])
         multimodal_videos = list(videos or [])
         if (len(multimodal_images) > 0 or len(multimodal_videos) > 0):
-            architecture = ""
-            try:
-                architecture = self.config["architectures"][0]
-            except:
-                print("Error: can't detect architectures for this model.")
-                exit(0)
+            architecture = self._get_architecture()
             if (architecture == "CogVLMForCausalLM"):
                 if (len(multimodal_videos) > 0):
-                    print("Error: CogVLM multimodal only supports images.")
-                    exit(0)
+                    raise ValueError("CogVLM does not support video input.")
                 image_channels = int(self.config["vision_config"]["in_channels"])
                 image_size = int(self.config["vision_config"]["image_size"])
                 configs = {
@@ -2975,10 +2969,11 @@ class model:
                 )
                 return handle
             elif (architecture == "Gemma4ForConditionalGeneration"):
+                if multimodal_videos:
+                    raise ValueError("Gemma4 does not support video input.")
                 tokenizer = self.hf_tokenizer
                 if tokenizer is None:
-                    print("Error: Gemma4 multimodal needs a Hugging Face tokenizer.")
-                    exit(0)
+                    raise ValueError("Gemma4 multimodal input requires a Hugging Face tokenizer.")
 
                 gemma_conversation = None
                 if (conversation != None and len(conversation) != 0):
@@ -3097,8 +3092,7 @@ class model:
                 )
                 return handle
             else:
-                print("Error: can't support architectures: " + architecture)
-                exit(0)
+                raise ValueError(f"{architecture or 'This model'} does not support image or video input.")
 
         if (self._can_apply_hf_chat_template() or
                 self._uses_hf_deepseek_v4_tokenizer()):
