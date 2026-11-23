@@ -2983,7 +2983,8 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             candidateResult && r.selectionExec ? r.selectionExec : r.exec;
 #ifdef FASTLLM_ENABLE_DRAFT_FUSED
         if (r.draftVerification && inputSlot < 0 && !(candidateResult && r.selectionExec))
-            exec=FastllmDraftFusedVerificationExec(r.draftVerification.get(),capture && capture->compositeDraft);
+            exec=FastllmDraftFusedVerificationExecReady(r.draftVerification.get(),capture && capture->compositeDraft,
+                capture && !capture->draftInputs.empty() && capture->draftInputs.front().proposed);
 #endif
         AssertInFastLLM(FastllmCudaGraphLaunch(exec), "Naive TP decode graph launch failed.");
         // Startup can exercise a logits graph even if its optional greedy

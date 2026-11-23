@@ -122,9 +122,11 @@ struct NaiveN05FlashModel::DraftWorkspace {
         // The CUDA graph allocation pool has one capture session per process.
         // DP owners can replay independently after their captures finish.
         inline static std::mutex captureMutex;
-        void *graph = nullptr, *exec = nullptr;
+        void *graph = nullptr, *exec = nullptr, *acceptedExec = nullptr;
         std::vector<void *> reserved;
         void Clear() {
+            FastllmCudaGraphExecDestroy(acceptedExec);
+            acceptedExec = nullptr;
             FastllmCudaGraphExecDestroy(exec);
             FastllmCudaGraphDestroy(graph);
             exec = graph = nullptr;
@@ -248,6 +250,9 @@ struct NaiveN05FlashModel::DraftWorkspace {
     std::vector<int> nextAnchors, nextLengths;
     bool nextReady = false, nextInFlight = false, nextConsumed = false;
     std::vector<std::shared_ptr<DraftContext>> nextRetained;
+    bool nextProposed = false;
+    uint64_t predictedSeed = 0;
+    float lastHeadTemperature = 0, predictedTemperature = 0;
     void *backboneReady = nullptr; // Borrowed from the current producer.
     void *prefetchStream = nullptr, *prefetchReady = nullptr;
     bool prefetchSubmitted = false;
@@ -292,7 +297,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
             rank->prefetchSubmitted = false;
         }
         FastllmCudaSetDevice(previous);
-        nextInFlight = nextConsumed = false; nextRetained.clear();
+        nextReady = nextInFlight = nextConsumed = false; nextRetained.clear();
     }
 #endif
     std::vector<void *> inputs;
@@ -1813,6 +1818,7 @@ bool NaiveN05FlashModel::CommitSpeculativeCaches(TargetCapture &capture,
     if (storage) {
         // Acceptance has already joined the previous head and its backbone.
         // No host event wait is needed on this normal consumption path.
+        if (!prefetched) storage->nextProposed = false;
         storage->nextReady = storage->nextInFlight = storage->nextConsumed = false;
         storage->nextRetained.clear();
         for (auto &rank : storage->tpRanks) rank->prefetchSubmitted = false;
@@ -1926,13 +1932,22 @@ bool NaiveN05FlashModel::CommitFusedDraftContextsImpl(TargetCapture &capture,
     }
     auto &storage = *draftBatchStorage;
     const int *sampled = nullptr;
-    if (deviceAccepted && !preparingGraphs && GetFastllmEnv().cudaGraph &&
+    if (deviceAccepted && GetFastllmEnv().cudaGraph &&
         (!storage.nextInFlight || storage.nextConsumed) && storage.CanPrefetch(count) &&
         std::all_of(lengths.begin(),lengths.end(),[&](int n) { return n == draftTokens+1; }) &&
         std::all_of(contexts.begin(),contexts.end(),[&](const auto *c) {
             return c->committed < max_positions - draftTokens - 2;
         })) {
         sampled = FastllmCudaMtpSmallResultRows(deviceAccepted,count,draftTokens);
+    }
+    const bool propose = sampled && count==1 && draftTokens==7 && storage.lastHeadTemperature>0 &&
+        std::isfinite(storage.lastHeadTemperature) &&
+        std::all_of(storage.nextGraph->tpRanks.begin(),storage.nextGraph->tpRanks.end(),
+            [](const auto &rank) { return rank->graphs[0].acceptedExec != nullptr; });
+    if (propose) {
+        auto random=contexts.front()->random;
+        storage.predictedSeed=random();  // Commit the RNG only on actual consumption.
+        storage.predictedTemperature=storage.lastHeadTemperature;
     }
     const bool targetFirst = enqueueTarget && !draftBatchStorage->targetCommitReady;
     if (deviceAccepted) {
@@ -1950,6 +1965,10 @@ bool NaiveN05FlashModel::CommitFusedDraftContextsImpl(TargetCapture &capture,
                     next.anchors[rank] = static_cast<float *>(storage.tpRanks[rank]->id.cudaData);
                     next.lengths[rank] = static_cast<int *>(storage.tpRanks[rank]->live.cudaData);
                 }
+                if (propose) {
+                    next.seed = storage.predictedSeed;
+                    next.temperature = storage.predictedTemperature;
+                }
                 uploaded = FastllmDraftFusedContextUploadNext(storage.fused,requests.data(),count,deviceAccepted,next,nullptr);
             } else if (deviceAccepted)
                 uploaded = FastllmDraftFusedContextSharedUploadAccepted(storage.fused,requests.data(),count,deviceAccepted,nullptr);
@@ -1962,6 +1981,18 @@ bool NaiveN05FlashModel::CommitFusedDraftContextsImpl(TargetCapture &capture,
             // collective. Subsequent commits may overlap host preparation.
             if (targetFirst) enqueueTarget(rank);
             auto &scratch = *draftBatchStorage->tpRanks[rank];
+            if (propose) {
+                auto &body=storage.nextGraph->tpRanks[rank]->graphs[0];
+                auto *kvDone=draftContextStorage->tpRanks[rank]->done;
+                FastllmCudaEventRecordCurrentThread(kvDone);
+                FastllmCudaStreamWaitEvent(scratch.prefetchStream,kvDone);
+                AssertInFastLLM(FastllmDraftFusedAcceptedBodyRun(storage.fused,body.acceptedExec,scratch.prefetchStream),
+                    "Cannot replay accepted context and draft body.");
+                FastllmCudaEventRecord(scratch.prefetchReady,scratch.prefetchStream);
+                FastllmCudaCurrentThreadStreamWaitEvent(kvDone);
+                scratch.backboneReady=scratch.prefetchReady;
+                return;
+            }
             if (queued) {
                 // This rank's stream already owns the accepted context update.
                 // Append KV commit/lookahead without submitting it twice.
@@ -1980,9 +2011,10 @@ bool NaiveN05FlashModel::CommitFusedDraftContextsImpl(TargetCapture &capture,
             if (enqueueTarget && !targetFirst) enqueueTarget(rank);
             FastllmCudaEventRecordCurrentThread(draftContextStorage->tpRanks[rank]->done);
             if (sampled) {
+                auto &body = storage.nextGraph->tpRanks[rank]->graphs[0];
                 FastllmCudaStreamWaitEvent(scratch.prefetchStream,draftContextStorage->tpRanks[rank]->done);
-                AssertInFastLLM(FastllmCudaGraphLaunchOnStream(storage.nextGraph->tpRanks[rank]->graphs[0].exec,
-                    scratch.prefetchStream),"Cannot launch sampled draft backbone.");
+                AssertInFastLLM(FastllmCudaGraphLaunchOnStream(body.exec,scratch.prefetchStream),
+                    "Cannot launch sampled draft backbone.");
                 FastllmCudaEventRecord(scratch.prefetchReady,scratch.prefetchStream);
                 scratch.backboneReady = scratch.prefetchReady;
             }
@@ -2003,6 +2035,7 @@ bool NaiveN05FlashModel::CommitFusedDraftContextsImpl(TargetCapture &capture,
     }
     if (deviceAccepted) {
         storage.pendingBackbone = sampled != nullptr;
+        storage.nextProposed = propose;
         return true;
     }
     storage.DrainPendingBackbone();
@@ -4029,10 +4062,19 @@ bool NaiveN05FlashModel::PrepareFusedDraftProposal(
     auto &probabilities = draftProposalStorage->sampling.probabilities;
     std::vector<uint64_t> seeds;
     for (auto *r : rounds) seeds.push_back(r->context.random());
+    auto &draftStorage=*draftBatchStorage;
+    const bool hasProposal=count==1 && rounds.front()->limit==7 && draftStorage.nextInFlight &&
+        draftStorage.nextConsumed && draftStorage.nextOwners.size()==1 &&
+        draftStorage.nextOwners.front().lock().get()==&rounds.front()->context &&
+        draftStorage.nextLengths.front()==rounds.front()->oldLength+1 &&
+        draftStorage.nextAnchors.front()==rounds.front()->anchor &&
+        draftStorage.predictedSeed==seeds.front() && draftStorage.predictedTemperature==rounds.front()->config.temperature &&
+        draftStorage.nextProposed;
+    if (count==1) draftStorage.lastHeadTemperature=rounds.front()->config.temperature;
     auto launchHead = [&]() { draftTP->Run([&](int rank) {
         auto &local = *draftBatchStorage->tpRanks[rank];
         if (local.backboneReady) FastllmCudaCurrentThreadStreamWaitEvent(local.backboneReady);
-        for (int row = 0; row < count; ++row)
+        if (!hasProposal) for (int row = 0; row < count; ++row)
             AssertInFastLLM(FastllmDraftFusedHeadRun(draftBatchStorage->fused,rank,row,
                 (const uint16_t*)local.normalized.cudaData+(size_t)row*7*4096,
                 rounds[row]->anchor,seeds[row],rounds[row]->config.temperature,rounds[row]->limit,nullptr),
@@ -4058,7 +4100,8 @@ bool NaiveN05FlashModel::PrepareFusedDraftProposal(
             inputs.push_back({ids,draftBatchStorage->tpRanks[rank]->done,rounds[row]->oldLength,
                 rounds[row]->anchor,seeds[row],rounds[row]->config.temperature,
                 draftBatchStorage->tpRanks[rank]->normalized.cudaData,
-                draftBatchStorage->tpRanks[rank]->backboneReady,draftBatchStorage->fused,rounds[row]->limit+1});
+                draftBatchStorage->tpRanks[rank]->backboneReady,draftBatchStorage->fused,rounds[row]->limit+1,
+                hasProposal});
         }
         if (supported) {
             rounds.front()->enqueueVerification(inputs,launchHead); submitted=true;
@@ -6152,6 +6195,21 @@ void NaiveN05FlashModel::PrepareLowLatencyDraftServingMemory(bool history) {
             hidden.push_back(rank->normalized.cudaData); ready.push_back(rank->done);
         }
         ApplyDraftDevice();
+        if (draftContextStorage && draftContextStorage->tpRanks.size() == 8) {
+            for (auto &state : draftBatchWorkspaces) {
+                if (!state->lowLatencyBody || state->rankRows != std::vector<int>(8,1) ||
+                    state->tpRanks.size() != 8) continue;
+                for (int rank=0; rank<8; ++rank) {
+                    auto &local = *state->tpRanks[rank];
+                    auto &body = local.graphs[0];
+                    if (!body.exec || body.acceptedExec) continue;
+                    FastllmCudaSetDevice(local.device);
+                    body.acceptedExec = FastllmDraftFusedAcceptedBodyCreate(draftBatchStorage->fused,rank,
+                        body.graph,draftContextStorage->tpRanks[rank]->done);
+                }
+            }
+            ApplyDraftDevice();
+        }
         PrepareDraftVerificationGraphs(draftBatchStorage->fused,hidden,ready);
     }
 #endif

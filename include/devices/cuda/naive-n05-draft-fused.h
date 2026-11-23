@@ -33,12 +33,12 @@ bool FastllmDraftFusedRun(void *state, int rank, int requests, void *hidden,
 // Retains the raw body output and writes an independent normalized output.
 // Hidden, normalized and FP32 gamma must be 16-byte aligned and non-aliasing.
 // Unsupported layouts keep Run followed by the ordinary normalization path.
+bool FastllmDraftFusedRunNormalized(void *state,int rank,int requests,void *hidden,
+    const int *live,const void *const *cacheTable,const float *gamma,void *normalized,void *stream);
 // Builds the first padded draft block from device token IDs and shared embeddings.
 bool FastllmDraftFusedRunEmbedded(void *state, int rank, int requests, void *hidden,
     const float *ids, const void *embedding, const void *mask, const int *live,
     const void *const *cacheTable, const float *gamma, void *normalized, void *stream);
-bool FastllmDraftFusedRunNormalized(void *state,int rank,int requests,void *hidden,
-    const int *live,const void *const *cacheTable,const float *gamma,void *normalized,void *stream);
 bool FastllmDraftFusedMlpBatchProbe(void *state,int rank,int requests,int layer,
     const void *input,void *output,void *stream);
 bool FastllmDraftFusedMlpProbe(void *state, int rank, int request, int layer,
@@ -73,10 +73,14 @@ struct FastllmDraftNextInputs {
     int stride;
     float *anchors[8];
     int *lengths[8];
+    uint64_t seed;       // Used by the prepared singleton proposal.
+    float temperature;
 };
 // The context graph binds the next body inputs before its completion event.
 bool FastllmDraftFusedContextUploadNext(void *state,const FastllmDraftContextRequest *requests,
     int count,const int *accepted,const FastllmDraftNextInputs &next,void *producerStream);
+void *FastllmDraftFusedAcceptedBodyCreate(void *state,int rank,void *body,void *contextDone);
+bool FastllmDraftFusedAcceptedBodyRun(void *state,void *body,void *stream);
 bool FastllmDraftFusedContextSharedRun(void *state,int rank,int count,void *stream);
 bool FastllmDraftFusedHeadPrepare(void *state,const void *const *heads,const void *w1,const void *w2,
     const float *confidenceWeight,const float *confidenceBias,int owner);
@@ -96,6 +100,7 @@ void *FastllmDraftFusedVerificationCreate(void *state,int rank,int count,const v
 void FastllmDraftFusedVerificationDestroy(void *plan);
 // The same executable serves ordinary verification with its head prefix disabled.
 void *FastllmDraftFusedVerificationExec(void *plan,bool head);
+void *FastllmDraftFusedVerificationExecReady(void *plan,bool head,bool proposed);
 bool FastllmDraftFusedVerificationUpload(void *plan,const FastllmDraftHeadRequest *requests,
     int count,void *stream);
 // Join all rank completion events on the owner stream before Submit or Finish.

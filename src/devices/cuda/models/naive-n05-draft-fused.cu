@@ -26,6 +26,28 @@ thread_local std::string error;
 void Check(cudaError_t result) {
     if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
 }
+// Parent kernels publish immutable-preload work with CUDA's programmatic
+// launch edge. Consumers fence their first dependent read inside the kernel.
+cudaGraphNode_t AddDraftKernel(cudaGraph_t graph,cudaGraphNode_t parent,
+        const cudaKernelNodeParams &params,bool early) {
+    cudaGraphNode_t node;
+#if CUDART_VERSION >= 12030
+    if (parent && early) {
+        Check(cudaGraphAddKernelNode(&node,graph,nullptr,0,&params));
+        cudaGraphEdgeData edge{};
+        edge.type=cudaGraphDependencyTypeProgrammatic;
+        edge.from_port=cudaGraphKernelNodePortProgrammatic;
+#if CUDART_VERSION >= 13000
+        Check(cudaGraphAddDependencies(graph,&parent,&node,&edge,1));
+#else
+        Check(cudaGraphAddDependencies_v2(graph,&parent,&node,&edge,1));
+#endif
+        return node;
+    }
+#endif
+    Check(cudaGraphAddKernelNode(&node,graph,parent?&parent:nullptr,parent?1:0,&params));
+    return node;
+}
 struct Allocation {
     void *ptr = nullptr; int device = -1;
     Allocation(size_t bytes, int gpu) : device(gpu) {
@@ -65,9 +87,7 @@ struct ContextPlans {
         for (auto exec : execs) if (exec) cudaGraphExecDestroy(exec);
     }
 };
-// The device packet includes an optional accepted count without growing the
-// existing allocation. Rows <= 8 and oldLength <= 1023 fit in 16 bits; the
-// public host descriptor ABI and its full-width validation remain unchanged.
+// Compact lengths leave room for the accepted count pointer in each descriptor.
 struct PreparedContextRequest {
     const void *features;
     const void *const *cacheTable;
@@ -83,7 +103,7 @@ struct ContextInputs {
     unsigned *alias=nullptr;
     cudaStream_t stream=nullptr;
     cudaEvent_t ready=nullptr,acceptedReady=nullptr;
-    bool inFlight=false,hasAccepted=false;
+    bool inFlight=false,hasAccepted=false,hasProposal=false;
     explicit ContextInputs(int d):device(d) {}
     ~ContextInputs() {
         cudaSetDevice(device);
@@ -263,6 +283,23 @@ __global__ __launch_bounds__(kThreads, 1) void FusedDraftContextPrepared(
     extern __shared__ __align__(128) unsigned char memory[];
     ContextPreparedBody<true>(memory,base,request,window,theta);
 }
+// Stage attention weights while context computes KV. Its dependency wait covers
+// both the KV writes and retirement of this rank's previous mailbox readers.
+__global__ __launch_bounds__(kThreads,1) void ContinuationContext(
+        const __grid_constant__ FcCtxKvArgs base,const PreparedContextRequest *request,int window,float theta) {
+    extern __shared__ __align__(128) unsigned char memory[];
+    naivert::pdl::trigger_dependents<true>();
+    ContextPreparedBody<true>(memory,base,request,window,theta);
+    if (blockIdx.x==0 && threadIdx.x==0) {
+        const auto &fc=base.fc;
+        const unsigned epoch=unsigned(*fc.replay_generation);
+        rendezvous_announce(fc.mailbox_peers,fc.rank,epoch);
+        rendezvous_wait(fc.mailbox_peers[fc.rank],fc.rank,epoch,
+            naivert::MailboxWatchdog{fc.watchdog_limit_ns,fc.watchdog_flag});
+        *fc.replay_generation=int(epoch+1);
+        if (*fc.watchdog_flag & naivert::kMailboxWatchdogTripped) asm volatile("trap;");
+    }
+}
 struct ContextTileArgs { FcCtxKvArgs requests[2]; };
 __device__ bool ContextOverlap(const void *a,size_t na,const void *b,size_t nb) {
     const uintptr_t x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
@@ -403,6 +440,16 @@ struct BeginArgs {
     float *samplingParams = nullptr;
     int anchor = 0; uint64_t seed = 0; float inverseTemperature = 1;
 };
+__device__ __forceinline__ void PrepareBodyPositions(const BeginArgs &a,int live,int first,int stride) {
+    for (int i = first; i < 8 * 128; i += stride) {
+        int row = i / 128, col = i % 128;
+        int position = live - 1 + row;
+        float angle = float(position) * powf(a.theta, -2.f * (col % 64) / 128.f);
+        a.cosine[i] = float(__float2bfloat16_rn(cosf(angle)));
+        a.sine[i] = float(__float2bfloat16_rn(sinf(angle)));
+        if (!col) a.positions[row] = position;
+    }
+}
 template<bool Distribute = false> __device__ __forceinline__ void BeginBody(BeginArgs a) {
     naivert::pdl::trigger_dependents<true>();
     // The preceding kernel boundary retires every old mailbox reader. Publish
@@ -425,14 +472,7 @@ template<bool Distribute = false> __device__ __forceinline__ void BeginBody(Begi
                 a.output[i] = i < a.rows * 4096 ? a.input[i] : __float2bfloat16_rn(0.f);
         }
     }
-    if (a.live) for (int i = first; i < 8 * 128; i += stride) {
-        int row = i / 128, col = i % 128;
-        int position = *a.live - 1 + row;
-        float angle = float(position) * powf(a.theta, -2.f * (col % 64) / 128.f);
-        a.cosine[i] = float(__float2bfloat16_rn(cosf(angle)));
-        a.sine[i] = float(__float2bfloat16_rn(sinf(angle)));
-        if (!col) a.positions[row] = position;
-    }
+    if (a.live) PrepareBodyPositions(a,*a.live,first,stride);
     if (!first) {
         rendezvous_wait(a.peers[a.rank],a.rank,old,
             naivert::MailboxWatchdog{5000000000ull,a.watchdog});
@@ -447,9 +487,9 @@ struct EmbeddedInput {
     const float *ids;
     const B *embedding, *mask;
 };
-__global__ void BeginEmbedded(BeginArgs a, EmbeddedInput input) {
+__device__ __forceinline__ void PrepareBodyEmbedding(const BeginArgs &a,EmbeddedInput input,int id) {
     const int first = blockIdx.x * blockDim.x + threadIdx.x;
-    const auto *token = reinterpret_cast<const uint4 *>(input.embedding + size_t(int(*input.ids)) * 4096);
+    const auto *token = reinterpret_cast<const uint4 *>(input.embedding + size_t(id) * 4096);
     const auto *mask = reinterpret_cast<const uint4 *>(input.mask);
     auto *dst = reinterpret_cast<uint4 *>(a.output);
     // Sixteen CTAs write the eight padded rows, each in 16-byte vectors.
@@ -457,7 +497,26 @@ __global__ void BeginEmbedded(BeginArgs a, EmbeddedInput input) {
         const int row = i / 512, col = i % 512;
         dst[i] = row == 0 ? token[col] : row < a.rows ? mask[col] : make_uint4(0, 0, 0, 0);
     }
+}
+__global__ void BeginEmbedded(BeginArgs a, EmbeddedInput input) {
+    PrepareBodyEmbedding(a,input,int(*input.ids));
     BeginBody<true>(a);
+}
+// Prepared singleton context computes its own RoPE from the descriptor.
+// The next body can therefore fill its padded input and positions while FC
+// and the accepted KV projection are still running on the other stream.
+__global__ void PrepareAcceptedEmbedding(BeginArgs a,EmbeddedInput input,
+        const PreparedContextRequest *request,const FastllmDraftNextInputs *next) {
+    const int accepted = *request->accepted;
+    if (accepted < 0 || accepted >= request->rows || accepted >= next->stride) { asm volatile("trap;"); return; }
+    const int id = next->tokens[accepted];
+    if (id < 0 || id >= kHeadVocab * 8) { asm volatile("trap;"); return; }
+    if (!blockIdx.x && !threadIdx.x) {
+        next->anchors[a.rank][0]=float(id);
+        next->lengths[a.rank][0]=request->position+accepted+2;
+    }
+    PrepareBodyEmbedding(a,input,id);
+    PrepareBodyPositions(a,request->position+accepted+2,blockIdx.x*blockDim.x+threadIdx.x,gridDim.x*blockDim.x);
 }
 __global__ void Begin(BeginArgs a) { BeginBody<true>(a); }
 __global__ void BeginHeadPrepared(BeginArgs a,const FastllmDraftHeadRequest *request) {
@@ -537,7 +596,7 @@ __global__ void FinishResult(const B *input, B *output, int count, const unsigne
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) output[i] = input[i];
 }
-__global__ void FinishNormalized(const B *input,B *output,B *normalized,
+__device__ __forceinline__ void NormalizeDraftOutput(const B *input,B *output,B *normalized,
         const float *gamma,float eps,const unsigned *watchdog) {
     if (*watchdog & naivert::kMailboxWatchdogTripped) asm volatile("trap;");
     const int row=blockIdx.x,tid=threadIdx.x;
@@ -590,6 +649,16 @@ __global__ void FinishNormalized(const B *input,B *output,B *normalized,
         *reinterpret_cast<uint4*>(output+base+part*8)=raw[part];
         *reinterpret_cast<uint4*>(normalized+base+part*8)=packed;
     }
+}
+__global__ void FinishNormalized(const B *input,B *output,B *normalized,
+        const float *gamma,float eps,const unsigned *watchdog) {
+    NormalizeDraftOutput(input,output,normalized,gamma,eps,watchdog);
+}
+__global__ void FinishPipelinedNormalized(const B *input,B *output,B *normalized,
+        const float *gamma,float eps,const unsigned *watchdog) {
+    naivert::pdl::trigger_dependents<true>();
+    naivert::pdl::wait_for_primary<true>();
+    NormalizeDraftOutput(input,output,normalized,gamma,eps,watchdog);
 }
 template<class Kernel,class... Args>
 void LaunchDependent(bool enabled,Kernel kernel,dim3 grid,dim3 block,int shared,
@@ -1257,8 +1326,9 @@ void PrepareContextPlans(State &s, int requests) {
         if(!s.contextInputs) {
             s.contextInputs.reset(new ContextInputs(s.ranks[0].device));
             auto &p=*s.contextInputs;Check(cudaSetDevice(p.device));
-            Check(cudaMallocHost(&p.host,8*64*sizeof(*p.host)+sizeof(FastllmDraftNextInputs)));
-            Check(cudaMalloc(&p.gpu,8*64*sizeof(*p.gpu)+sizeof(FastllmDraftNextInputs)));
+            const size_t bytes = 8 * 64 * sizeof(*p.host) + sizeof(FastllmDraftNextInputs);
+            Check(cudaMallocHost(&p.host, bytes));
+            Check(cudaMalloc(&p.gpu, bytes));
             Check(cudaMalloc(&p.alias,sizeof(unsigned)));
             Check(cudaStreamCreateWithFlags(&p.stream,cudaStreamNonBlocking));
             Check(cudaEventCreateWithFlags(&p.ready,cudaEventDisableTiming));
@@ -1330,10 +1400,10 @@ void PrepareContextPlans(State &s, int requests) {
                             add((void*)FusedDraftContextPrepared,kCtas,kThreads,ContextSmem,body);
                         }
                         for(int request=first;request<first+requests;++request) {
-                            auto *requests=s.contextInputs->gpu+rank*count;
+                            auto *descriptors=s.contextInputs->gpu+rank*count;
                             auto *next=reinterpret_cast<FastllmDraftNextInputs *>(s.contextInputs->gpu+8*count);
                             auto *watchdog=r.lanes[request].watchdog;
-                            void *finish[]={&requests,&next,&rank,&request,&watchdog};
+                            void *finish[]={&descriptors,&next,&rank,&request,&watchdog};
                             add((void*)FinishDraftContextResult,1,32,0,finish);
                         }
                         first+=requests;
@@ -1416,10 +1486,9 @@ bool UploadContextDescriptors(void *opaque,const FastllmDraftContextRequest *req
         // The per-rank destinations follow this shape's descriptors and share
         // their upload. A null token pointer disables all optional outputs.
         const size_t bytes = 8*count*sizeof(*p.host);
-        FastllmDraftNextInputs packet{};
-        if (next) packet = *next;
-        const size_t extra = next ? sizeof(packet) : sizeof(packet.tokens);
-        std::memcpy(p.host+8*count,&packet,extra);
+        const FastllmDraftNextInputs empty{};
+        const size_t extra = next ? sizeof(*next) : sizeof(empty.tokens);
+        std::memcpy(p.host + 8*count, next ? next : &empty, extra);
         Check(cudaMemcpyAsync(p.gpu,p.host,bytes+extra,cudaMemcpyHostToDevice,p.stream));
         if(count>=8) {
             Check(cudaMemsetAsync(p.alias,0,sizeof(unsigned),p.stream));
@@ -1430,6 +1499,7 @@ bool UploadContextDescriptors(void *opaque,const FastllmDraftContextRequest *req
         // peer waits never inherit a newly created per-thread stream dependency.
         Check(cudaEventRecord(p.ready,p.stream));p.inFlight=true;
         p.hasAccepted=accepted!=nullptr;
+        p.hasProposal=next && count==1 && next->stride==8 && next->temperature>0 && std::isfinite(next->temperature);
         if(accepted) {
             auto producer=producerStream?static_cast<cudaStream_t>(producerStream):cudaStreamPerThread;
             Check(cudaEventRecord(p.acceptedReady,producer));
@@ -1451,6 +1521,118 @@ extern "C" bool FastllmDraftFusedContextUploadNext(void *opaque,const FastllmDra
     if (!accepted || !next.tokens || next.stride < 2 || next.stride > 8) return false;
     for (int rank = 0; rank < 8; ++rank) if (!next.anchors[rank] || !next.lengths[rank]) return false;
     return UploadContextDescriptors(opaque,requests,count,accepted,producerStream,&next);
+}
+namespace fastllm_draft_fused {
+__global__ void BeginAcceptedHead(BeginArgs a,const FastllmDraftNextInputs *next) {
+    naivert::pdl::trigger_dependents<true>();
+    a.anchor = int(next->anchors[a.rank][0]);
+    a.seed = next->seed;
+    a.inverseTemperature = __fdiv_rn(1.f, next->temperature);
+    naivert::pdl::wait_for_primary<true>();
+    BeginBody(a);
+}
+void AppendAcceptedHead(State &s,int rank,cudaGraph_t graph,cudaGraphNode_t norm,
+                        const B *normalized,FastllmDraftNextInputs *next);
+}
+// Clone only a captured embedded singleton. The clone shares all tensors with
+// its source graph and is retired whenever that graph's bindings are retired.
+extern "C" void *FastllmDraftFusedAcceptedBodyCreate(void *opaque,int rank,void *body,void *contextDone) {
+    if (!opaque || rank < 0 || rank >= 8 || !body || !contextDone) return nullptr;
+    auto &s = *static_cast<State *>(opaque);
+    if (s.rows!=7 || !s.headReady || !s.programmatic || !s.contextInputs || !FastllmDraftFusedContextSharedSupported(opaque,1)) return nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    try {
+        Check(cudaGraphClone(&graph,static_cast<cudaGraph_t>(body)));
+        size_t n = 0;
+        Check(cudaGraphGetNodes(graph,nullptr,&n));
+        std::vector<cudaGraphNode_t> nodes(n);
+        Check(cudaGraphGetNodes(graph,nodes.data(),&n));
+        cudaGraphNode_t begin = nullptr, norm = nullptr, firstAttention = nullptr;
+        const B *normalized = nullptr;
+        BeginArgs args{};
+        EmbeddedInput embedding{};
+        for (auto node : nodes) {
+            cudaGraphNodeType type;
+            Check(cudaGraphNodeGetType(node,&type));
+            if (type != cudaGraphNodeTypeKernel) continue;
+            cudaKernelNodeParams p{};
+            Check(cudaGraphKernelNodeGetParams(node,&p));
+            if (p.func == reinterpret_cast<void *>(FusedDraftAttention) && p.kernelParams &&
+                static_cast<SwaAttnArgs *>(p.kernelParams[0])->layer==0) firstAttention=node;
+            if (p.func == reinterpret_cast<void *>(FinishNormalized)) {
+                if (norm || !p.kernelParams) throw std::runtime_error("Unsupported draft normalization");
+                norm = node;
+                normalized = *static_cast<B **>(p.kernelParams[2]);
+            }
+            if (p.func != reinterpret_cast<void *>(BeginEmbedded)) continue;
+            if (begin || !p.kernelParams) throw std::runtime_error("Unsupported draft body graph");
+            begin = node;
+            args = *static_cast<BeginArgs *>(p.kernelParams[0]);
+            embedding = *static_cast<EmbeddedInput *>(p.kernelParams[1]);
+        }
+        if (!begin) throw std::runtime_error("Draft body has no embedded input");
+        cudaKernelNodeParams p{};
+        auto *request = s.contextInputs->gpu+rank;
+        auto *next = reinterpret_cast<FastllmDraftNextInputs *>(s.contextInputs->gpu+8);
+        void *prepareArgs[] = {&args,&embedding,&request,&next};
+        p.func = reinterpret_cast<void *>(PrepareAcceptedEmbedding);
+        p.gridDim = dim3(16); p.blockDim = dim3(256); p.kernelParams = prepareArgs;
+        if (!firstAttention || !ConfigureOptionalKernel(s.ranks[rank].device,ContinuationContext,kThreads,ContextSmem,kCtas))
+            throw std::runtime_error("Draft context overlap unavailable");
+        cudaGraphNode_t prepare, published;
+        Check(cudaGraphAddKernelNode(&prepare,graph,nullptr,0,&p));
+        Check(FastllmCudaGraphAddDependencies(graph,&prepare,&firstAttention,1));
+        auto fc=ContextArguments(s,rank,0);
+        void *contextArgs[]={&fc,&request,&s.window,&s.theta};
+        p.func=reinterpret_cast<void *>(ContinuationContext);
+        p.gridDim=dim3(kCtas);p.blockDim=dim3(kThreads);p.sharedMemBytes=ContextSmem;p.kernelParams=contextArgs;
+        Check(cudaGraphKernelNodeSetParams(begin,&p));
+        Check(cudaGraphAddEventRecordNode(&published,graph,&begin,1,static_cast<cudaEvent_t>(contextDone)));
+        if (!norm || !normalized) throw std::runtime_error("Missing draft normalization");
+        // In a singleton body the final normalization has exactly one producer,
+        // the last MLP. Replace it only in this clone so no unrelated capture or
+        // batch inherits the changed scheduling.
+        size_t parents=0;
+        Check(FastllmCudaGraphNodeGetDependencies(norm,nullptr,&parents));
+        if (parents!=1) throw std::runtime_error("Unsupported draft normalization dependencies");
+        cudaGraphNode_t mlp;
+        Check(FastllmCudaGraphNodeGetDependencies(norm,&mlp,&parents));
+        cudaKernelNodeParams mp{},np{};
+        Check(cudaGraphKernelNodeGetParams(mlp,&mp));
+        Check(cudaGraphKernelNodeGetParams(norm,&np));
+        if (mp.func!=reinterpret_cast<void *>(FusedDraftMlp))
+            throw std::runtime_error("Unsupported last draft MLP");
+        size_t children=0;
+        Check(FastllmCudaGraphNodeGetDependentNodes(norm,nullptr,&children));
+        if (children) throw std::runtime_error("Unsupported draft normalization consumers");
+        np.func=reinterpret_cast<void *>(FinishPipelinedNormalized);
+        auto earlyNorm=AddDraftKernel(graph,mlp,np,true);
+        Check(cudaGraphDestroyNode(norm)); norm=earlyNorm;
+        AppendAcceptedHead(s,rank,graph,norm,normalized,next);
+        Check(cudaGraphInstantiateWithFlags(&exec,graph,0));
+        Check(cudaGraphUpload(exec,cudaStreamPerThread));
+        Check(cudaStreamSynchronize(cudaStreamPerThread));
+        Check(cudaGraphDestroy(graph));
+        return exec;
+    } catch (const std::exception &e) {
+        if (exec) cudaGraphExecDestroy(exec);
+        if (graph) cudaGraphDestroy(graph);
+        error=e.what(); cudaGetLastError(); return nullptr;
+    }
+}
+extern "C" bool FastllmDraftFusedAcceptedBodyRun(void *opaque,void *body,void *rawStream) {
+    if (!opaque || !body || !rawStream) return false;
+    auto *state=static_cast<State *>(opaque);
+    if (!state->contextInputs || !state->contextInputs->hasProposal) return false;
+    auto &inputs=*state->contextInputs;
+    auto stream=static_cast<cudaStream_t>(rawStream);
+    try {
+        Check(cudaStreamWaitEvent(stream,inputs.ready,0));
+        Check(cudaStreamWaitEvent(stream,inputs.acceptedReady,0));
+        Check(cudaGraphLaunch(static_cast<cudaGraphExec_t>(body),stream));
+        return true;
+    } catch (const std::exception &e) { error=e.what(); return false; }
 }
 extern "C" bool FastllmDraftFusedContextSharedRun(void *opaque,int rank,int count,void *rawStream) {
     if(rank<0 || rank>=8 || !FastllmDraftFusedContextSharedSupported(opaque,count))return false;
@@ -1520,6 +1702,38 @@ __global__ __launch_bounds__(kHeadThreads,1) void FusedDraftHeadProposal(
     HeadBody::run<true,HeadStride>(memory,h,nullptr,steps);
     markov_cooperative_steps<160,false,HeadStride>(m,
         reinterpret_cast<const float*>(memory+kHeadSmem),control,control+2*kHeadCtas,steps);
+}
+void BindHeadLane(State &s, int rank, int row, const B *input,
+        BeginArgs &begin, HeadArgs &head, MarkovArgs &markov) {
+    auto &r = s.ranks[rank];
+    auto &lane = r.lanes[row];
+    begin.rank = markov.rank = rank;
+    markov.replay_generation = begin.epoch = lane.epoch;
+    begin.watchdog = head.watchdog_flag = markov.watchdog_flag = lane.watchdog;
+    begin.headIds = markov.block_ids = lane.headIds;
+    markov.sampling_state = begin.sampling = lane.sampling;
+    markov.sampling_params = begin.samplingParams = lane.samplingParams;
+    head.resid_in = input; head.lm_head = r.head; head.logits = lane.headLogits;
+    head.watchdog_limit_ns = markov.watchdog_limit_ns = 5000000000ull;
+    markov.draft_tokens = lane.headIds + 1; markov.prev_token = lane.headIds + 7;
+    markov.logit_trace = lane.corrected; markov.bias_table = r.biasTable; markov.apply_markov = 1;
+    for (int peer = 0; peer < 8; ++peer)
+        begin.peers[peer] = markov.mailbox_peers[peer] = s.ranks[peer].lanes[row].mailbox;
+}
+void AppendAcceptedHead(State &s,int rank,cudaGraph_t graph,cudaGraphNode_t norm,
+        const B *normalized,FastllmDraftNextInputs *next) {
+    auto &l = s.ranks[rank].lanes[0];
+    BeginArgs b{}; HeadArgs h{}; MarkovArgs m{};
+    BindHeadLane(s, rank, 0, normalized, b, h, m);
+    auto add=[&](void *function,int blocks,int threads,unsigned smem,void **args,cudaGraphNode_t parent) {
+        cudaKernelNodeParams p{};p.func=function;p.gridDim=dim3(blocks);p.blockDim=dim3(threads);
+        p.sharedMemBytes=smem;p.kernelParams=args;
+        return AddDraftKernel(graph,parent,p,true);
+    };
+    void *inputs[]={&b,&next};
+    auto begin=add((void*)BeginAcceptedHead,1,32,0,inputs,norm);
+    int steps=7;void *head[]={&h,&m,&l.headControl,&steps};
+    add((void*)FusedDraftHeadProposal,kHeadCtas,kHeadThreads,HeadSmem,head,begin);
 }
 struct HeadTileArgs {
     HeadArgs head[2];
@@ -1822,7 +2036,9 @@ struct VerificationPlan {
     cudaGraphExec_t exec=nullptr;
     cudaGraph_t graph=nullptr;
     std::vector<cudaGraphNode_t> prefix;
-    bool inFlight=false,head=true;
+    bool inFlight=false;
+    int mode=1;
+    cudaGraphNode_t inputOnly=nullptr;
     ~VerificationPlan() {
         cudaSetDevice(device);
         if(inFlight) cudaEventSynchronize(uploaded);
@@ -1860,22 +2076,8 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
             cudaKernelNodeParams params{};
             params.func=function;params.gridDim=dim3(blocks);params.blockDim=dim3(threads);
             params.sharedMemBytes=smem;params.kernelParams=args;
-            cudaGraphNode_t node;
-#if CUDART_VERSION >= 12030
-            if (dependent && s.programmatic) {
-                Check(cudaGraphAddKernelNode(&node,p->graph,nullptr,0,&params));
-                cudaGraphEdgeData edge{};
-                edge.type = cudaGraphDependencyTypeProgrammatic;
-                edge.from_port = cudaGraphKernelNodePortProgrammatic;
-#if CUDART_VERSION >= 13000
-                Check(cudaGraphAddDependencies(p->graph,&previous,&node,&edge,1));
-#else
-                Check(cudaGraphAddDependencies_v2(p->graph,&previous,&node,&edge,1));
-#endif
-            } else
-#endif
-                Check(cudaGraphAddKernelNode(&node,p->graph,previous?&previous:nullptr,previous?1:0,&params));
-            previous=node;p->prefix.push_back(node);
+            previous=AddDraftKernel(p->graph,previous,params,dependent && s.programmatic);
+            p->prefix.push_back(previous);
         };
         if(count>=8 && count<=r.headCapacity && r.headBatch) {
             auto *lanes=r.headBatch;auto *requests=p->gpu;int steps=verifyRows-1;
@@ -1899,19 +2101,11 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
                 const int row=first+requestIndex;
                 auto &l=r.lanes[row];auto *request=p->gpu+row;
                 BeginArgs b{};
-                for(int peer=0;peer<8;++peer)b.peers[peer]=s.ranks[peer].lanes[row].mailbox;
-                b.rank=rank;b.epoch=l.epoch;b.watchdog=l.watchdog;
                 const B *headInput=static_cast<const B*>(hidden)+size_t(row)*7*4096;
                 b.input=requests==1 ? nullptr : headInput;b.output=l.padded;b.rows=tile.steps;
-                b.headIds=l.headIds;b.sampling=l.sampling;b.samplingParams=l.samplingParams;
+                BindHeadLane(s, rank, row, requests==1 ? headInput : l.padded, b,
+                    tile.head[requestIndex], tile.markov[requestIndex]);
                 void *begin[]={&b,&request};add((void*)BeginHeadPrepared,1,256,0,begin);
-                auto &h=tile.head[requestIndex];h.resid_in=requests==1 ? headInput : l.padded;h.lm_head=r.head;h.logits=l.headLogits;
-                h.watchdog_limit_ns=5000000000ull;h.watchdog_flag=l.watchdog;h.first_logit_row=0;
-                auto &m=tile.markov[requestIndex];m.block_ids=l.headIds;m.draft_tokens=l.headIds+1;m.prev_token=l.headIds+7;
-                m.logit_trace=l.corrected;m.bias_table=r.biasTable;m.replay_generation=l.epoch;
-                m.rank=rank;m.apply_markov=1;m.watchdog_limit_ns=5000000000ull;m.watchdog_flag=l.watchdog;
-                m.sampling_state=l.sampling;m.sampling_params=l.samplingParams;
-                for(int peer=0;peer<8;++peer)m.mailbox_peers[peer]=s.ranks[peer].lanes[row].mailbox;
                 tile.control[requestIndex]=l.headControl;
             }
             if(requests==4) {
@@ -1930,6 +2124,7 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
                 int offset=row*verifyRows;auto *packed=static_cast<float*>(input);
                 void *adapter[]={&l.headIds,&packed,&stride,&offset,&request,&verifyRows,&l.watchdog};
                 add((void*)VerificationInputPrepared,1,32,0,adapter);
+                if (count==1) p->inputOnly=previous;
             }
             first+=requests;
         }
@@ -1945,16 +2140,23 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
     }
 }
 extern "C" void FastllmDraftFusedVerificationDestroy(void *p) { delete static_cast<VerificationPlan*>(p); }
-extern "C" void *FastllmDraftFusedVerificationExec(void *opaque,bool head) {
+extern "C" void *FastllmDraftFusedVerificationExecReady(void *opaque,bool head,bool proposed) {
     if(!opaque)return nullptr;
     auto &p=*static_cast<VerificationPlan*>(opaque);
+    const int mode=!head ? 0 : proposed && p.inputOnly ? 2 : 1;
     try {
-        if(p.head!=head) {
-            for(auto node:p.prefix)Check(cudaGraphNodeSetEnabled(p.exec,node,head?1u:0u));
-            p.head=head;
+        if(p.mode!=mode) {
+            for(auto node:p.prefix) {
+                const bool enabled=mode==1 || (mode==2 && node==p.inputOnly);
+                Check(cudaGraphNodeSetEnabled(p.exec,node,enabled));
+            }
+            p.mode=mode;
         }
         return p.exec;
     }catch(const std::exception &e){error=e.what();return nullptr;}
+}
+extern "C" void *FastllmDraftFusedVerificationExec(void *opaque,bool head) {
+    return FastllmDraftFusedVerificationExecReady(opaque,head,false);
 }
 extern "C" bool FastllmDraftFusedVerificationUpload(void *opaque,const FastllmDraftHeadRequest *requests,
         int count,void *rawStream) {
@@ -2063,17 +2265,10 @@ extern "C" bool FastllmDraftFusedHeadRun(void *opaque,int rank,int request,const
         auto &s=*static_cast<State*>(opaque);auto &r=s.ranks[rank];
         if(!s.headReady || request<0 || request>=int(r.lanes.size())) return false;
         auto &l=r.lanes[request];cudaStream_t stream=rawStream?static_cast<cudaStream_t>(rawStream):cudaStreamPerThread;
-        BeginArgs b{};for(int peer=0;peer<8;++peer)b.peers[peer]=s.ranks[peer].lanes[request].mailbox;
-        b.rank=rank;b.epoch=l.epoch;b.watchdog=l.watchdog;b.rows=steps;
-        b.headIds=l.headIds;b.sampling=l.sampling;b.samplingParams=l.samplingParams;b.anchor=anchor;b.seed=seed;b.inverseTemperature=1.f/temperature;
+        BeginArgs b{}; HeadArgs h{}; MarkovArgs m{};
+        BindHeadLane(s, rank, request, static_cast<const B *>(hidden), b, h, m);
+        b.anchor=anchor;b.seed=seed;b.inverseTemperature=1.f/temperature;
         Begin<<<1,256,0,stream>>>(b);
-        HeadArgs h{};h.resid_in=static_cast<const B*>(hidden);h.lm_head=r.head;h.logits=l.headLogits;
-        h.watchdog_limit_ns=5000000000ull;h.watchdog_flag=l.watchdog;h.first_logit_row=0;
-        MarkovArgs m{};m.block_ids=l.headIds;m.draft_tokens=l.headIds+1;m.prev_token=l.headIds+7;
-        m.logit_trace=l.corrected;m.bias_table=r.biasTable;m.replay_generation=l.epoch;
-        m.rank=rank;m.apply_markov=1;m.watchdog_limit_ns=5000000000ull;m.watchdog_flag=l.watchdog;
-        m.sampling_state=l.sampling;m.sampling_params=l.samplingParams;
-        for(int peer=0;peer<8;++peer)m.mailbox_peers[peer]=s.ranks[peer].lanes[request].mailbox;
         FusedDraftHeadProposal<<<kHeadCtas,kHeadThreads,HeadSmem,stream>>>(h,m,l.headControl,steps);
         FinishResult<<<1,32,0,stream>>>(nullptr,nullptr,0,l.watchdog);
         Check(cudaGetLastError());return true;

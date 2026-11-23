@@ -13,7 +13,7 @@ lib.FastllmDraftFusedContextSharedRun.argtypes=[P,C.c_int,C.c_int,P];lib.Fastllm
 lib.FastllmDraftFusedContextSharedUploadAccepted.argtypes=[P,P,C.c_int,P,P]
 lib.FastllmDraftFusedContextSharedUploadAccepted.restype=C.c_bool
 class NextInputs(C.Structure):
-    _fields_=[('tokens',P),('stride',C.c_int),('anchors',P*8),('lengths',P*8)]
+    _fields_=[('tokens',P),('stride',C.c_int),('anchors',P*8),('lengths',P*8),('seed',C.c_uint64),('temperature',C.c_float)]
 lib.FastllmDraftFusedContextUploadNext.argtypes=[P,P,C.c_int,P,C.POINTER(NextInputs),P]
 lib.FastllmDraftFusedContextUploadNext.restype=C.c_bool
 with safe_open(a.draft,framework='pt',device='cpu') as f:

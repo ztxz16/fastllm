@@ -339,6 +339,7 @@ namespace fastllm {
                 void *inputReady = nullptr;
                 void *fused = nullptr;
                 int rows = 0; // Anchor plus this request's verification prefix.
+                bool proposed = false;
             };
             // Root capture: rank-major requests. Rank capture: its own requests.
             // The proposal owner keeps tokens/events alive until verification joins.
