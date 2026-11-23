@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <numeric>
 #include <map>
 #include <stdexcept>
@@ -764,10 +765,9 @@ void LargeVocabularyCase() {
     std::puts("large-vocabulary dispatch boundaries, masks, ties, joint filtering: PASS");
 }
 
-void AcceptedConsumerCase() {
+void AcceptedConsumerCase(int vocab, std::initializer_list<int> draftCounts) {
     // Point masses give an exact acceptance oracle, including ragged prefixes.
-    const int vocab = 16384;
-    for (int batch : {1, 2, 4, 8, 9, 16}) for (int drafts : {1, 3, 7, 8}) {
+    for (int batch : {1, 2, 4, 8, 9, 16}) for (int drafts : draftCounts) {
         const int rows = batch * (drafts + 1);
         std::vector<float> logits((size_t)rows * vocab, -INFINITY);
         std::vector<float> probs((size_t)batch * drafts * vocab, 0);
@@ -811,7 +811,7 @@ void AcceptedConsumerCase() {
             Require(deviceCounts == expected, "device prefix counts differ from host results");
         }
     }
-    std::puts("ACCEPTED_CONSUMER_PASS batch 1/2/4/8/9/16, drafts 1/3/7/8, exact ragged prefixes and fallback");
+    std::printf("ACCEPTED_CONSUMER_PASS vocab=%d, exact ragged prefixes and fallback\n", vocab);
 }
 }
 int main() {
@@ -819,7 +819,8 @@ int main() {
     if (cudaGetDeviceCount(&n) != cudaSuccess || !n) return 77;
     try {
         Check(cudaSetDevice(0));
-        AcceptedConsumerCase();
+        AcceptedConsumerCase(16384, {1, 3, 7, 8});
+        AcceptedConsumerCase(152576, {3}); // Sparse top-p with a singleton nucleus.
         FilterCase();
         DeviceFilterCase();
 #ifndef USE_ROCM

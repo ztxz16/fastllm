@@ -18198,7 +18198,8 @@ __global__ void FastllmMtpTopPCut(FastllmMtpTopPState *states, const float *topP
 __global__ void FastllmMtpTopPApply(const float *probs, float *output, const float2 *cuts, int vocab) {
     const int row = blockIdx.y;
     const float2 cut = cuts[row];
-    if (cut.x <= 0 || cut.y == 0) return;
+    // A finite singleton still needs writing. +infinity marks a completed row.
+    if (cut.x <= 0 || cut.x == CUDART_INF_F) return;
     for (int i = blockIdx.x * 256 + threadIdx.x; i < vocab; i += gridDim.x * 256) {
         float value = probs[(size_t)row * vocab + i];
         output[(size_t)row * vocab + i] = value >= cut.x ? (cut.y == 0 ? 1.0f : value * cut.y) : 0;
