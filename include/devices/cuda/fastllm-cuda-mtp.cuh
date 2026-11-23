@@ -93,6 +93,9 @@ bool FastllmCudaMtpRejectionSamplingLogitsBatch(float *targetLogits,
     const int *topKs, const float *topPs, int *output, int *accepted,
     int batch, int drafts, int vocab);
 
+// Borrow the sampled rows of this small-rejection callback on its producer
+// device. The next use of the sampling workspace may overwrite the rows.
+const int *FastllmCudaMtpSmallResultRows(const int *accepted,int batch,int drafts);
 // Equivalent small-batch path with host token IDs copied into kernel arguments.
 // Supports batch*drafts <= 64, drafts <= 8; larger shapes retain the device API.
 bool FastllmCudaMtpRejectionFromHostProbabilities(const float *targetProbs,

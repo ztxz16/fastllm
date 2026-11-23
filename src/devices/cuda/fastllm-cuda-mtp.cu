@@ -467,6 +467,14 @@ bool FastllmCudaMtpRejectionFromProbabilities(const float *p, const float *q,
     return FastllmMtpReject<true>(p, q, nullptr, draftIds, output, accepted, batch, drafts, vocab);
 }
 
+const int *FastllmCudaMtpSmallResultRows(const int *accepted,int batch,int drafts) {
+    if (!accepted || batch <= 0 || drafts < 1 || drafts > 8) return nullptr;
+    auto &ws = GetWorkspace();
+    const size_t tokens = size_t(batch) * (drafts + 1);
+    return ws.results && tokens + batch <= ws.resultCapacity && ws.results + tokens == accepted
+        ? ws.results : nullptr;
+}
+
 bool FastllmCudaMtpRejectionFromHostProbabilities(const float *p, const float *q,
         const int *draftIds, int *output, int *accepted, int batch, int drafts, int vocab,
         void (*enqueue)(const int *, void *), void *context) {
