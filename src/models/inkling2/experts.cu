@@ -636,7 +636,7 @@ protected:
 
     void Run(const Data &pair, const Data &scores, Data &mid, int rows, int width) const override {
         auto launch = [&](const auto *pairData, auto *out) {
-            using T = std::remove_cv_t<std::remove_pointer_t<decltype(pairData)>>;
+            using T = std::remove_pointer_t<decltype(out)>;
             RoutedSiTU<T> source{pairData, static_cast<const float *>(scores.cudaData), gateCap, upCap};
             quantizeInto(source, out, rows, width, gate.fp4, smCount);
         };
