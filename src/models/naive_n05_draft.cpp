@@ -3508,19 +3508,11 @@ bool NaiveN05FlashModel::RunDraftLowLatencyBatch(const std::vector<int> &anchors
             }
         };
         Data &embedding = w("model.embed_tokens.weight"), &mask = w("dspark.mask_embedding");
-        struct Request { Data positions, live; };
-        std::vector<Request> requests(localContexts.size());
         auto append = [](Data &batch, Data &part, bool first) {
             if (first) Copy(part, batch);
             else { Data joined; Cat(batch, part, 1, joined); Copy(joined, batch); }
         };
         Data &hidden = r.hidden, &positions = r.positions, &normed = r.combined;
-        FastllmCudaNaiveDraftInput(ids, embedding, mask, live, draftBlock, hidden, positions);
-        for (size_t row = 0; row < localContexts.size(); ++row) {
-            requests[row].positions.Resize({1, draftBlock});
-            requests[row].positions.FakeFrom(positions, row * draftBlock * sizeof(float));
-            requests[row].live.Resize({1}); requests[row].live.FakeFrom(live, row * sizeof(int));
-        }
 #ifdef FASTLLM_ENABLE_DRAFT_FUSED
         // Wider batches share projections and collectives across every request.
         // Keep the resident four-request kernels for small shapes.
@@ -3530,23 +3522,47 @@ bool NaiveN05FlashModel::RunDraftLowLatencyBatch(const std::vector<int> &anchors
             if (!reduce) return;
             auto &gamma = w("dspark.norm.weight");
             gamma.ToDevice(DataDevice::CUDA,std::vector<int>{devices[rank]});
-            if (gamma.dataType == FLOAT32 && gamma.Count(0) == 4096 && gamma.strides.back() == 1 &&
-                    !((reinterpret_cast<uintptr_t>(gamma.cudaData) |
-                       reinterpret_cast<uintptr_t>(hidden.cudaData)) & 15)) {
+            const int count = int(localContexts.size());
+            AssertInFastLLM(ids.Count(0) == count && live.Count(0) == count, "Draft input length count mismatch.");
+            const bool normalizedGamma = gamma.dataType == FLOAT32 && gamma.Count(0) == 4096 &&
+                gamma.strides.back() == 1 && !(reinterpret_cast<uintptr_t>(gamma.cudaData) & 15);
+            const bool embedded = normalizedGamma && embedding.dataType == BFLOAT16 &&
+                embedding.dims.back() == 4096 && mask.dataType == BFLOAT16 && mask.Count(0) == 4096 &&
+                embedding.cudaData && mask.cudaData &&
+                !((reinterpret_cast<uintptr_t>(embedding.cudaData) | reinterpret_cast<uintptr_t>(mask.cudaData)) & 15);
+            if (embedded) {
+                hidden.dataType = BFLOAT16; hidden.UpdateUnitSize(); hidden.Resize({1, draftBlock * count, 4096});
+                hidden.ToDevice(DataDevice::CUDA,{devices[rank]},false); hidden.Allocate(false);
+            }
+            const bool buildInput = embedded && !(reinterpret_cast<uintptr_t>(hidden.cudaData) & 15);
+            if (!buildInput) FastllmCudaNaiveDraftInput(ids, embedding, mask, live, draftBlock, hidden, positions);
+            auto *lengths = static_cast<const int *>(live.cudaData);
+            auto *table = static_cast<const void *const *>(r.cacheTable.cudaData);
+            if (normalizedGamma && !(reinterpret_cast<uintptr_t>(hidden.cudaData) & 15)) {
                 result.dataType = BFLOAT16; result.UpdateUnitSize(); result.Resize(hidden.dims);
                 result.ToDevice(DataDevice::CUDA,{devices[rank]},false); result.Allocate(false);
-                AssertInFastLLM(FastllmDraftFusedRunNormalized(draftBatchStorage->fused,rank,contexts.size(),
-                    hidden.cudaData,(const int *)live.cudaData,(const void *const *)r.cacheTable.cudaData,
-                    (const float *)gamma.cudaData,result.cudaData,nullptr),"Normalized fused draft backbone launch failed.");
+                auto *norm = static_cast<const float *>(gamma.cudaData);
+                bool ok = buildInput ? FastllmDraftFusedRunEmbedded(draftBatchStorage->fused,rank,count,hidden.cudaData,
+                    static_cast<const float *>(ids.cudaData),embedding.cudaData,mask.cudaData,lengths,table,norm,result.cudaData,nullptr)
+                    : FastllmDraftFusedRunNormalized(draftBatchStorage->fused,rank,count,hidden.cudaData,
+                        lengths,table,norm,result.cudaData,nullptr);
+                AssertInFastLLM(ok,"Normalized fused draft backbone launch failed.");
             } else {
-                AssertInFastLLM(FastllmDraftFusedRun(draftBatchStorage->fused, rank, contexts.size(),
-                    hidden.cudaData, (const int *)live.cudaData, (const void *const *)r.cacheTable.cudaData,
-                    nullptr), "Fused draft backbone launch failed.");
+                AssertInFastLLM(FastllmDraftFusedRun(draftBatchStorage->fused,rank,count,hidden.cudaData,
+                    lengths,table,nullptr),"Fused draft backbone launch failed.");
                 KimiK3RMSNorm(hidden,gamma,draftEps,result);
             }
             return;
         }
 #endif
+        struct Request { Data positions, live; };
+        std::vector<Request> requests(localContexts.size());
+        FastllmCudaNaiveDraftInput(ids, embedding, mask, live, draftBlock, hidden, positions);
+        for (size_t row = 0; row < localContexts.size(); ++row) {
+            requests[row].positions.Resize({1, draftBlock});
+            requests[row].positions.FakeFrom(positions, row * draftBlock * sizeof(float));
+            requests[row].live.Resize({1}); requests[row].live.FakeFrom(live, row * sizeof(int));
+        }
         KimiK3RMSNorm(hidden, w("dspark.layers.0.input_layernorm.weight"), draftEps, normed);
         for (int layer = 0; layer < draftLayers; ++layer) {
             const std::string p = "dspark.layers." + std::to_string(layer) + ".";

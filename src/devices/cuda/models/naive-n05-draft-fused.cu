@@ -1,5 +1,5 @@
 #include "naive-n05-draft-fused.h"
-#include "fastllm-cuda.cuh"
+#include "fastllm-cuda-graph-api.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
@@ -205,33 +205,57 @@ __global__ __launch_bounds__(kThreads, 1) void FusedDraftContext(const __grid_co
     extern __shared__ __align__(128) unsigned char memory[];
     __syncthreads(); FcCtxKvBody::run(memory, a);
 }
+template<bool GridTrim = false>
 __device__ void ContextPreparedBody(unsigned char *memory, const FcCtxKvArgs &base, const PreparedContextRequest *request,
         int window, float theta) {
     const auto &d = *request;
     const int rows = d.accepted ? *d.accepted+1 : d.rows;
     if (rows < 1 || rows > d.rows) { asm volatile("trap;"); return; }
     const int keep = min(int(d.oldLength),window-1-rows), drop = d.oldLength-keep;
-    static_assert(ContextSmem >= 1024*32*2);
-    if (blockIdx.x < 40 && keep && drop)
-        ContextTrimBody(d.cacheTable,d.tableRequests,d.tableRequest,keep,drop,
-            reinterpret_cast<uint4 *>(memory));
-    // FC consumes the request's immutable features directly and pads in each
-    // CTA's shared memory. No cross-CTA input preparation remains. Join only
-    // local trim readers before reusing shared memory; FC's existing grid join
-    // retires every trim before any later KV output can overwrite its source.
-    __syncthreads();
+    // The singleton grid covers ten caches. Each lane holds its prefix until
+    // FC's existing grid join retires the source reads. New KV starts at keep.
+    constexpr int caches = 5 * 2, vectorsPerRow = 128 / 8;
+    constexpr int minThreads = (kCtas / caches) * kThreads;
+    static_assert(minThreads > 0);
+    constexpr int chunks = (1024 * vectorsPerRow + minThreads - 1) / minThreads;
+    const int cache = blockIdx.x % caches;
+    const int first = (blockIdx.x / caches) * kThreads + threadIdx.x;
+    const int stride = ((kCtas + caches - 1 - cache) / caches) * kThreads;
+    uint4 saved[chunks], *kv = nullptr;
+    if constexpr (GridTrim) {
+        kv = reinterpret_cast<uint4 *>(const_cast<void *>(
+            d.cacheTable[((cache / 2) * d.tableRequests + d.tableRequest) * 2 + cache % 2]));
+#pragma unroll
+        for (int i = 0; i < chunks; ++i) {
+            const int at = first + i * stride;
+            if (drop && at < keep * vectorsPerRow) saved[i] = kv[at + drop * vectorsPerRow];
+        }
+    } else {
+        static_assert(ContextSmem >= 1024 * 32 * 2);
+        if (blockIdx.x < 40 && keep && drop)
+            ContextTrimBody(d.cacheTable, d.tableRequests, d.tableRequest, keep, drop,
+                reinterpret_cast<uint4 *>(memory));
+        __syncthreads();
+    }
     FcCtxKvArgs a = base;
     a.fc.target_hidden=static_cast<const B*>(d.features);
     a.kv.cache_table = request->cacheTable;
     a.kv.table_requests = request->tableRequests; a.kv.table_request = request->tableRequest;
     FcCtxKvBody::run<true>(memory,a,{rows,d.position,keep,window,theta});
+    if constexpr (GridTrim) {
+#pragma unroll
+        for (int i = 0; i < chunks; ++i) {
+            const int at = first + i * stride;
+            if (drop && at < keep * vectorsPerRow) kv[at] = saved[i];
+        }
+    }
 }
 __global__ __launch_bounds__(kThreads, 1) void FusedDraftContextPrepared(
         const __grid_constant__ FcCtxKvArgs base, const PreparedContextRequest *request,
         int window, float theta,const unsigned *fallback=nullptr) {
     if(fallback && !*fallback)return;
     extern __shared__ __align__(128) unsigned char memory[];
-    ContextPreparedBody(memory,base,request,window,theta);
+    ContextPreparedBody<true>(memory,base,request,window,theta);
 }
 struct ContextTileArgs { FcCtxKvArgs requests[2]; };
 __device__ bool ContextOverlap(const void *a,size_t na,const void *b,size_t nb) {
@@ -373,26 +397,29 @@ struct BeginArgs {
     float *samplingParams = nullptr;
     int anchor = 0; uint64_t seed = 0; float inverseTemperature = 1;
 };
-__device__ __forceinline__ void BeginBody(BeginArgs a) {
+template<bool Distribute = false> __device__ __forceinline__ void BeginBody(BeginArgs a) {
     naivert::pdl::trigger_dependents<true>();
     // The preceding kernel boundary retires every old mailbox reader. Publish
     // that fact before local preparation so the peer round trip can overlap it.
     // The next collective still waits for this entire kernel to complete.
-    const unsigned old = !threadIdx.x ? *a.epoch : 0;
-    if (!threadIdx.x) rendezvous_announce(a.peers,a.rank,old);
+    const int block = Distribute ? int(blockIdx.x) : 0;
+    const int first = block * blockDim.x + threadIdx.x;
+    const int stride = (Distribute ? int(gridDim.x) : 1) * blockDim.x;
+    const unsigned old = !first ? *a.epoch : 0;
+    if (!first) rendezvous_announce(a.peers,a.rank,old);
     if (a.input) {
         if (!(reinterpret_cast<uintptr_t>(a.input) & 15) &&
             !(reinterpret_cast<uintptr_t>(a.output) & 15)) {
             const auto *input = reinterpret_cast<const uint4 *>(a.input);
             auto *output = reinterpret_cast<uint4 *>(a.output);
-            for (int i = threadIdx.x; i < 8 * 512; i += blockDim.x)
+            for (int i = first; i < 8 * 512; i += stride)
                 output[i] = i < a.rows * 512 ? input[i] : make_uint4(0,0,0,0);
         } else {
-            for (int i = threadIdx.x; i < 8 * 4096; i += blockDim.x)
+            for (int i = first; i < 8 * 4096; i += stride)
                 a.output[i] = i < a.rows * 4096 ? a.input[i] : __float2bfloat16_rn(0.f);
         }
     }
-    if (a.live) for (int i = threadIdx.x; i < 8 * 128; i += blockDim.x) {
+    if (a.live) for (int i = first; i < 8 * 128; i += stride) {
         int row = i / 128, col = i % 128;
         int position = *a.live - 1 + row;
         float angle = float(position) * powf(a.theta, -2.f * (col % 64) / 128.f);
@@ -400,7 +427,7 @@ __device__ __forceinline__ void BeginBody(BeginArgs a) {
         a.sine[i] = float(__float2bfloat16_rn(sinf(angle)));
         if (!col) a.positions[row] = position;
     }
-    if (!threadIdx.x) {
+    if (!first) {
         rendezvous_wait(a.peers[a.rank],a.rank,old,
             naivert::MailboxWatchdog{5000000000ull,a.watchdog});
         *a.epoch = int(old + 1);
@@ -410,7 +437,23 @@ __device__ __forceinline__ void BeginBody(BeginArgs a) {
         }
     }
 }
-__global__ void Begin(BeginArgs a) { BeginBody(a); }
+struct EmbeddedInput {
+    const float *ids;
+    const B *embedding, *mask;
+};
+__global__ void BeginEmbedded(BeginArgs a, EmbeddedInput input) {
+    const int first = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto *token = reinterpret_cast<const uint4 *>(input.embedding + size_t(int(*input.ids)) * 4096);
+    const auto *mask = reinterpret_cast<const uint4 *>(input.mask);
+    auto *dst = reinterpret_cast<uint4 *>(a.output);
+    // Sixteen CTAs write the eight padded rows, each in 16-byte vectors.
+    for (int i = first; i < 8 * 512; i += blockDim.x * gridDim.x) {
+        const int row = i / 512, col = i % 512;
+        dst[i] = row == 0 ? token[col] : row < a.rows ? mask[col] : make_uint4(0, 0, 0, 0);
+    }
+    BeginBody<true>(a);
+}
+__global__ void Begin(BeginArgs a) { BeginBody<true>(a); }
 __global__ void BeginHeadPrepared(BeginArgs a,const FastllmDraftHeadRequest *request) {
     a.anchor=request->anchor; a.seed=request->seed; a.inverseTemperature=__fdiv_rn(1.f,request->temperature);
     BeginBody(a);
@@ -579,14 +622,21 @@ bool ConfigureOptionalKernel(int device, Kernel kernel, int threads, int shared,
     }
     return blocks * sms >= ctas;
 }
-void Start(State &s, int rank, int request, const int *live, cudaStream_t stream, const B *input) {
+void Start(State &s, int rank, int request, const int *live, cudaStream_t stream, const B *input, const EmbeddedInput *embedded = nullptr) {
     auto &l = s.ranks[rank].lanes[request];
     BeginArgs a{};
     for (int i = 0; i < 8; ++i) a.peers[i] = s.ranks[i].lanes[request].mailbox;
     a.rank = rank; a.epoch = l.epoch; a.watchdog = l.watchdog; a.live = live;
     a.positions = l.positions; a.cosine = l.cosine; a.sine = l.sine; a.theta = s.theta;
     a.input = input; a.output = l.padded; a.rows = s.rows;
-    Begin<<<1, 256, 0, stream>>>(a);
+    if (embedded) {
+        EmbeddedInput local = *embedded;
+        local.ids += request;
+        a.input = nullptr;
+        BeginEmbedded<<<16, 256, 0, stream>>>(a, local);
+    } else {
+        Begin<<<16, 256, 0, stream>>>(a);
+    }
     Check(cudaGetLastError());
 }
 SwaAttnArgs AttentionArguments(State &s,int rank,int request,int layer,const B *input,B *output) {
@@ -664,12 +714,12 @@ void MlpQuad(State &s,int rank,int first,int layer,bool probe,cudaStream_t strea
         MlpRowsBody<4>::kSharedBytes,stream,tile);
 }
 void RunBody(State &s,int rank,int requests,B *hidden,const int *live,
-        const void *const *table,const float *gamma,B *normalized,cudaStream_t stream) {
+        const void *const *table,const float *gamma,B *normalized,cudaStream_t stream, const EmbeddedInput *embedded = nullptr) {
     for(int first=0;first<requests;) {
         const int count=s.batchMlp4 && first+3<requests ? 4 :
             (s.batchMlp || s.batchAttention) && first+1<requests ? 2 : 1;
         for(int request=first;request<first+count;++request)
-            Start(s,rank,request,live+request,stream,hidden+size_t(request)*s.rows*4096);
+            Start(s,rank,request,live+request,stream,hidden+size_t(request)*s.rows*4096,embedded);
         for(int layer=0;layer<s.layers;++layer) {
             if(count==4 && s.batchAttention4) AttentionShared<4>(s,rank,first,layer,live,table,requests,stream);
             else if(count>=2 && s.batchAttention) {
@@ -832,8 +882,8 @@ extern "C" bool FastllmDraftFusedRun(void *opaque, int rank, int requests, void 
         return true;
     } catch (const std::exception &e) { error = e.what(); return false; }
 }
-extern "C" bool FastllmDraftFusedRunNormalized(void *opaque,int rank,int requests,void *hidden,
-        const int *live,const void *const *table,const float *gamma,void *normalized,void *rawStream) {
+static bool RunNormalized(void *opaque,int rank,int requests,void *hidden,
+        const int *live,const void *const *table,const float *gamma,void *normalized,void *rawStream,const EmbeddedInput *embedding) {
     if(!opaque || rank<0 || rank>=8 || !hidden || !live || !table || !gamma || !normalized ||
         hidden==normalized || ((reinterpret_cast<uintptr_t>(hidden)|reinterpret_cast<uintptr_t>(normalized)|
         reinterpret_cast<uintptr_t>(gamma))&15))return false;
@@ -841,9 +891,21 @@ extern "C" bool FastllmDraftFusedRunNormalized(void *opaque,int rank,int request
         auto &s=*static_cast<State*>(opaque);auto &r=s.ranks[rank];
         if(requests<1 || requests>int(r.lanes.size()))return false;
         auto stream=rawStream?static_cast<cudaStream_t>(rawStream):cudaStreamPerThread;
-        RunBody(s,rank,requests,static_cast<B*>(hidden),live,table,gamma,static_cast<B*>(normalized),stream);
+        RunBody(s,rank,requests,static_cast<B*>(hidden),live,table,gamma,static_cast<B*>(normalized),stream,embedding);
         return true;
     }catch(const std::exception &e){error=e.what();return false;}
+}
+extern "C" bool FastllmDraftFusedRunNormalized(void *opaque,int rank,int requests,void *hidden,
+        const int *live,const void *const *table,const float *gamma,void *normalized,void *rawStream) {
+    return RunNormalized(opaque,rank,requests,hidden,live,table,gamma,normalized,rawStream,nullptr);
+}
+extern "C" bool FastllmDraftFusedRunEmbedded(void *opaque,int rank,int requests,void *hidden,
+        const float *ids,const void *embedding,const void *mask,const int *live,const void *const *table,
+        const float *gamma,void *normalized,void *rawStream) {
+    if (!ids || !embedding || !mask ||
+        ((reinterpret_cast<uintptr_t>(embedding) | reinterpret_cast<uintptr_t>(mask)) & 15)) return false;
+    const EmbeddedInput input{ids, static_cast<const B *>(embedding), static_cast<const B *>(mask)};
+    return RunNormalized(opaque,rank,requests,hidden,live,table,gamma,normalized,rawStream,&input);
 }
 extern "C" bool FastllmDraftFusedMlpProbe(void *opaque, int rank, int request, int layer,
         const void *input, void *output, void *rawStream) {
@@ -1709,7 +1771,8 @@ __global__ void VerificationInput(const int64_t *tokens, float *input, int strid
     }
 }
 __global__ void VerificationInputPrepared(const int64_t *tokens,float *input,int stride,int offset,
-        const FastllmDraftHeadRequest *request,int rows) {
+        const FastllmDraftHeadRequest *request,int rows,const unsigned *watchdog) {
+    if (*watchdog & naivert::kMailboxWatchdogTripped) asm volatile("trap;");
     const int row=threadIdx.x, position=request->position;
     if(row<rows) {
         input[offset+row]=float(tokens[row]); input[stride+offset+row]=float(position+row);
@@ -1789,10 +1852,11 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
                 BeginArgs b{};
                 for(int peer=0;peer<8;++peer)b.peers[peer]=s.ranks[peer].lanes[row].mailbox;
                 b.rank=rank;b.epoch=l.epoch;b.watchdog=l.watchdog;
-                b.input=static_cast<const B*>(hidden)+size_t(row)*7*4096;b.output=l.padded;b.rows=tile.steps;
+                const B *headInput=static_cast<const B*>(hidden)+size_t(row)*7*4096;
+                b.input=requests==1 ? nullptr : headInput;b.output=l.padded;b.rows=tile.steps;
                 b.headIds=l.headIds;b.sampling=l.sampling;b.samplingParams=l.samplingParams;
                 void *begin[]={&b,&request};add((void*)BeginHeadPrepared,1,256,0,begin);
-                auto &h=tile.head[requestIndex];h.resid_in=l.padded;h.lm_head=r.head;h.logits=l.headLogits;
+                auto &h=tile.head[requestIndex];h.resid_in=requests==1 ? headInput : l.padded;h.lm_head=r.head;h.logits=l.headLogits;
                 h.watchdog_limit_ns=5000000000ull;h.watchdog_flag=l.watchdog;h.first_logit_row=0;
                 auto &m=tile.markov[requestIndex];m.block_ids=l.headIds;m.draft_tokens=l.headIds+1;m.prev_token=l.headIds+7;
                 m.logit_trace=l.corrected;m.bias_table=r.biasTable;m.replay_generation=l.epoch;
@@ -1813,10 +1877,8 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
             }
             for(int requestIndex=0;requestIndex<requests;++requestIndex) {
                 const int row=first+requestIndex;auto &l=r.lanes[row];auto *request=p->gpu+row;
-                B *none=nullptr;int zero=0;
-                void *finish[]={&none,&none,&zero,&l.watchdog};add((void*)FinishResult,1,32,0,finish);
                 int offset=row*verifyRows;auto *packed=static_cast<float*>(input);
-                void *adapter[]={&l.headIds,&packed,&stride,&offset,&request,&verifyRows};
+                void *adapter[]={&l.headIds,&packed,&stride,&offset,&request,&verifyRows,&l.watchdog};
                 add((void*)VerificationInputPrepared,1,32,0,adapter);
             }
             first+=requests;
@@ -1952,10 +2014,10 @@ extern "C" bool FastllmDraftFusedHeadRun(void *opaque,int rank,int request,const
         if(!s.headReady || request<0 || request>=int(r.lanes.size())) return false;
         auto &l=r.lanes[request];cudaStream_t stream=rawStream?static_cast<cudaStream_t>(rawStream):cudaStreamPerThread;
         BeginArgs b{};for(int peer=0;peer<8;++peer)b.peers[peer]=s.ranks[peer].lanes[request].mailbox;
-        b.rank=rank;b.epoch=l.epoch;b.watchdog=l.watchdog;b.input=static_cast<const B*>(hidden);b.output=l.padded;b.rows=steps;
+        b.rank=rank;b.epoch=l.epoch;b.watchdog=l.watchdog;b.rows=steps;
         b.headIds=l.headIds;b.sampling=l.sampling;b.samplingParams=l.samplingParams;b.anchor=anchor;b.seed=seed;b.inverseTemperature=1.f/temperature;
         Begin<<<1,256,0,stream>>>(b);
-        HeadArgs h{};h.resid_in=l.padded;h.lm_head=r.head;h.logits=l.headLogits;
+        HeadArgs h{};h.resid_in=static_cast<const B*>(hidden);h.lm_head=r.head;h.logits=l.headLogits;
         h.watchdog_limit_ns=5000000000ull;h.watchdog_flag=l.watchdog;h.first_logit_row=0;
         MarkovArgs m{};m.block_ids=l.headIds;m.draft_tokens=l.headIds+1;m.prev_token=l.headIds+7;
         m.logit_trace=l.corrected;m.bias_table=r.biasTable;m.replay_generation=l.epoch;

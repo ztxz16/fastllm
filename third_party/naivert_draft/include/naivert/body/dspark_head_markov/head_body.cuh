@@ -95,8 +95,20 @@ struct HeadBody {
       __syncwarp();
     }
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    for (int i = tid; i < 8 * 4096; i += kHeadThreads)
-      x[(i / 4096) * kQueryStride + i % 4096] = args.resid_in[i];
+    // A singleton may point directly to an unpadded prefix. Only its valid
+    // rows are readable; paired/four-request inputs keep the padded layout.
+    const int rows = Requests == 1 ? args.first_logit_row + logitRows : kHeadWindow;
+    if (Requests == 1 && !(reinterpret_cast<uintptr_t>(args.resid_in) & 15)) {
+      for (int i = tid; i < kHeadWindow * (kHeadHidden / 8); i += kHeadThreads) {
+        const int row = i / (kHeadHidden / 8), col = i % (kHeadHidden / 8);
+        reinterpret_cast<uint4 *>(x + row * kQueryStride)[col] = row < rows
+            ? reinterpret_cast<const uint4 *>(args.resid_in)[i] : make_uint4(0, 0, 0, 0);
+      }
+    } else {
+      for (int i = tid; i < kHeadWindow * kHeadHidden; i += kHeadThreads)
+        x[(i / kHeadHidden) * kQueryStride + i % kHeadHidden] =
+            Requests != 1 || i < rows * kHeadHidden ? args.resid_in[i] : __float2bfloat16_rn(0.f);
+    }
     __syncthreads();
     if (kExportDiagnostics && blockIdx.x == 0) {
       for (int i = tid; i < 8 * 4096; i += kHeadThreads)

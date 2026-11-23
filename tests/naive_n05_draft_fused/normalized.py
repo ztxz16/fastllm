@@ -17,6 +17,13 @@ cuda.cudaGraphGetEdges_v2.argtypes=[P,P,P,P,C.POINTER(C.c_size_t)]
 cuda.cudaGraphDestroy.argtypes=[P];cuda.cudaGraphExecDestroy.argtypes=[P]
 class Edge(C.Structure):
     _fields_=[('from_port',C.c_ubyte),('to_port',C.c_ubyte),('type',C.c_ubyte),('reserved',C.c_ubyte*5)]
+embedded = lib.FastllmDraftFusedRunEmbedded
+embedded.argtypes = [P, C.c_int, C.c_int] + [P] * 9
+embedded.restype = C.c_bool
+weights = torch.randn(19, 4096).bfloat16()
+mask = torch.randn(4096).bfloat16()
+embeddings = [weights.to(rank) for rank in range(8)]
+masks = [mask.to(rank) for rank in range(8)]
 for count in [1,2,4,8]:
     initial=torch.randn(count*a.rows,4096).bfloat16()
     old=[initial.to(r) for r in range(8)];new=[v.clone() for v in old]
@@ -74,6 +81,36 @@ for count in [1,2,4,8]:
         torch.cuda.set_device(rank)
         assert cuda.cudaGraphExecDestroy(executable)==0
         assert cuda.cudaGraphDestroy(graph)==0
+    if count < 8:
+        # Replay the same graph after replacing its token IDs. Compare both
+        # outputs to the normalized body with an independently assembled input.
+        ids = [torch.zeros(count, device=r) for r in range(8)]
+        embedded_graphs = []
+        for r in range(8):
+            with torch.cuda.device(r):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=streams[r]):
+                    assert embedded(state, r, count, new[r].data_ptr(), ids[r].data_ptr(),
+                        embeddings[r].data_ptr(), masks[r].data_ptr(), lives[r].data_ptr(),
+                        tables[r].data_ptr(), gammas[r].data_ptr(), normalized[r].data_ptr(),
+                        streams[r].cuda_stream)
+                embedded_graphs.append(graph)
+        for offset in (1, 5):
+            tokens = torch.arange(count) + offset
+            inputs = mask.expand(count, a.rows, 4096).clone()
+            inputs[:, 0] = weights[tokens]
+            for r in range(8):
+                with torch.cuda.device(r), torch.cuda.stream(streams[r]):
+                    old[r].copy_(inputs.reshape(-1, 4096))
+                    ids[r].copy_(tokens)
+                    assert lib.FastllmDraftFusedRunNormalized(state, r, count, old[r].data_ptr(),
+                        lives[r].data_ptr(), tables[r].data_ptr(), gammas[r].data_ptr(),
+                        saved[r].data_ptr(), streams[r].cuda_stream)
+                    embedded_graphs[r].replay()
+            sync()
+            for r in range(8):
+                assert torch.equal(old[r], new[r]) and torch.equal(saved[r], normalized[r]), (count, r)
+        del embedded_graphs
     del graphs
 Path(a.out).write_text(json.dumps(results,indent=2))
 lib.FastllmDraftFusedDestroy(state)

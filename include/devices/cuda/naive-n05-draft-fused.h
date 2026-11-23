@@ -33,6 +33,10 @@ bool FastllmDraftFusedRun(void *state, int rank, int requests, void *hidden,
 // Retains the raw body output and writes an independent normalized output.
 // Hidden, normalized and FP32 gamma must be 16-byte aligned and non-aliasing.
 // Unsupported layouts keep Run followed by the ordinary normalization path.
+// Builds the first padded draft block from device token IDs and shared embeddings.
+bool FastllmDraftFusedRunEmbedded(void *state, int rank, int requests, void *hidden,
+    const float *ids, const void *embedding, const void *mask, const int *live,
+    const void *const *cacheTable, const float *gamma, void *normalized, void *stream);
 bool FastllmDraftFusedRunNormalized(void *state,int rank,int requests,void *hidden,
     const int *live,const void *const *cacheTable,const float *gamma,void *normalized,void *stream);
 bool FastllmDraftFusedMlpBatchProbe(void *state,int rank,int requests,int layer,

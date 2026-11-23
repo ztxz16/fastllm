@@ -63,7 +63,7 @@
     "naivert/body/dspark_context/kv_body.cuh": "7ed5e11a072ca1a2a3b2d4d45e627c96cfbd7f88efab4938db15e73c867c5aa2",
     "naivert/body/dspark_head_markov/args.hpp": "27ddeb03857e73a1f9fb9a951cf0667b84fdaa25369092510ce744023ec6704a",
     "naivert/body/dspark_head_markov/cooperative.cuh": "445996f3b32f9a8fc3c6a4e3d5a5889b0eddf83d4b9bee1287ae7621ee9cb54e",
-    "naivert/body/dspark_head_markov/head_body.cuh": "07d35816f1d59a3907062fb5c44ee4dcc06e43db0f7bde23f3ece2d3899385a1",
+    "naivert/body/dspark_head_markov/head_body.cuh": "d5470f09445143ba4e5d9f28348e1a3fe81dc5affeafe30eedbd35651682a239",
     "naivert/body/dspark_head_markov/markov_body.cuh": "d2614f026bbd43b73255c21d6902163408f49ad5e091df591d7ea135766b1753",
     "naivert/body/dspark_mlp/args.hpp": "64fb96944eba0875d869ec571a93728c41b161ac99639046c81d3627dcb057d6",
     "naivert/body/dspark_mlp/body.cuh": "25545e8fcd6d02f303935cf4de6f68e3a19e03ee6464fc2b25bb9b6ad4d18f05",
