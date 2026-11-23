@@ -56,7 +56,8 @@ int verifySplitCount(int limit, int window, int pageLen, int minTiles) {
 }
 
 __device__ __forceinline__ void verifySegment(VerifyPrefillParams p, const DecodeVisit &visit, int first,
-                                              int rows, int tile, int split, const VerifyPartition &part) {
+                                              int rows, int tile, int split, const VerifyPartition &part,
+                                              int kvHead, int kvHeads) {
     int chunk = part.chunk;
     p.paged_kv.origin = part.origin;
     p.past = visit.past - part.origin;
@@ -68,7 +69,7 @@ __device__ __forceinline__ void verifySegment(VerifyPrefillParams p, const Decod
     p.o += size_t(first) * p.maxSplits * p.num_qo_heads * 128;
     p.lse += size_t(first) * p.maxSplits * p.num_qo_heads;
     p.paged_kv.length = length;
-    const int stride = gridDim.z * 128;
+    const int stride = kvHeads * 128;
     p.paged_kv.k_data = {visit.pages, nullptr, 0, visit.past, stride, false};
     p.paged_kv.v_data = {visit.pages, nullptr, 0, visit.past, stride, true};
     int zero = 0, indptr[] = {0, length};
@@ -79,7 +80,7 @@ __device__ __forceinline__ void verifySegment(VerifyPrefillParams p, const Decod
     p.paged_kv.indptr = indptr;
     extern __shared__ uint8_t smem[];
     auto &storage = *reinterpret_cast<VerifyTraits::SharedStoragePaged *>(smem);
-    flashinfer::BatchPrefillWithPagedKVCacheDevice<VerifyTraits>(p, storage, threadIdx, 0, blockIdx.z, gridDim.z);
+    flashinfer::BatchPrefillWithPagedKVCacheDevice<VerifyTraits>(p, storage, threadIdx, 0, kvHead, kvHeads);
 }
 
 __global__ __launch_bounds__(VerifyTraits::NUM_THREADS) void pagedVerifyAttention(VerifyPrefillParams p) {
@@ -90,25 +91,37 @@ __global__ __launch_bounds__(VerifyTraits::NUM_THREADS) void pagedVerifyAttentio
     const int live = p.chain == 1 ? 1 : visit.verifyRemaining;
     for (int row = 0; row < live;) {
         const VerifyPartition part(visit, row, live, p.maxSplits, p.window_left, p.minTilesPerSplit);
-        verifySegment(p, p.visits[first + row], first + row, part.end - row, tile, blockIdx.y, part);
+        verifySegment(p, p.visits[first + row], first + row, part.end - row, tile, blockIdx.y, part, blockIdx.z, gridDim.z);
         row = part.end;
         if (row < live) __syncthreads();
     }
 }
 
-template<class Act, bool WarpPerHead>
+// A single window query needs one query tile. Put adjacent KV heads in grid.x
+// so the SMs can scan the same page across heads before advancing the split.
+__global__ __launch_bounds__(VerifyTraits::NUM_THREADS) void pagedWindowDecode(VerifyPrefillParams p) {
+#if CUDART_VERSION >= 12080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+    const DecodeVisit &visit = *p.visits;
+    const VerifyPartition part(visit, 0, 1, p.maxSplits, p.window_left, p.minTilesPerSplit);
+    // FlashInfer waits for preparation before reading the packed query, bias or KV.
+    verifySegment(p, visit, 0, 1, 0, blockIdx.y, part, blockIdx.x, gridDim.x);
+}
+
+template<class Act, bool WarpPerHead, bool WindowDecode = false>
 __global__ void mergeVerifyAttention(VerifyPrefillParams p, const Act *sinks, const Act *gate, Act *out,
                                   int sinkStride, int gateStride) {
     constexpr int channels = WarpPerHead ? 4 : 1;
     const int lane = threadIdx.x % 32;
-    const int row = blockIdx.x;
+    const int row = WindowDecode ? 0 : blockIdx.x;
     const int head = WarpPerHead ? blockIdx.y * 4 + threadIdx.x / 32 : blockIdx.y;
     if (head >= p.num_qo_heads) return;
     const int channel = WarpPerHead ? lane * channels : threadIdx.x;
-    const int local = row % p.chain, first = row - local;
+    const int local = WindowDecode ? 0 : row % p.chain, first = row - local;
     const size_t dst = (size_t(row) * p.num_qo_heads + head) * 128 + channel;
     const DecodeVisit &visit = p.visits[first];
-    const int live = p.chain == 1 ? 1 : visit.verifyRemaining;
+    const int live = WindowDecode || p.chain == 1 ? 1 : visit.verifyRemaining;
     if (local >= live) {
 #pragma unroll
         for (int j = 0; j < channels; ++j) out[dst + j] = Act(0.f);
@@ -117,11 +130,15 @@ __global__ void mergeVerifyAttention(VerifyPrefillParams p, const Act *sinks, co
     const VerifyPartition part(visit, local, live, p.maxSplits, p.window_left, p.minTilesPerSplit);
     const int past = visit.past - part.origin;
     const int splits = (past + part.end - 1) / part.chunk + 1, active = (past + local) / part.chunk + 1;
-    const size_t base = (size_t(first + part.first) * p.maxSplits + size_t(local - part.first) * splits) * p.num_qo_heads + head;
+    const size_t base = WindowDecode ? size_t(head) : (size_t(first + part.first) * p.maxSplits + size_t(local - part.first) * splits) * p.num_qo_heads + head;
     const float sink = float(sinks[size_t(row) * sinkStride + head]) * RelativeAttention::sm_scale_log2;
     const int firstSplit = p.window_left < 0 ? 0 : max(0, past + local - p.window_left) / part.chunk;
     float maximum = sink, laneWeight = 0.f;
-    if constexpr (WarpPerHead) {
+#if CUDART_VERSION >= 12080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // The visit and sink precede this pipeline. Only partial results depend on the scan.
+    if constexpr (WindowDecode) asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    if constexpr (WarpPerHead || WindowDecode) {
         const float lse = lane >= firstSplit && lane < active ? p.lse[base + lane * p.num_qo_heads] : -INFINITY;
         maximum = fmaxf(sink, lse);
 #pragma unroll
@@ -134,7 +151,7 @@ __global__ void mergeVerifyAttention(VerifyPrefillParams p, const Act *sinks, co
     float denom = exp2f(sink - maximum), sum[channels]{};
     for (int s = firstSplit; s < active; ++s) {
         const size_t i = base + s * p.num_qo_heads;
-        const float w = WarpPerHead ? __shfl_sync(0xffffffff, laneWeight, s) : exp2f(p.lse[i] - maximum);
+        const float w = (WarpPerHead || WindowDecode) ? __shfl_sync(0xffffffff, laneWeight, s) : exp2f(p.lse[i] - maximum);
         denom += w;
         if constexpr (WarpPerHead) {
             const float4 v = reinterpret_cast<const float4 *>(p.o + i * 128)[lane];
@@ -155,7 +172,7 @@ __global__ void mergeVerifyAttention(VerifyPrefillParams p, const Act *sinks, co
 
 template<class Act>
 void launchVerifyAttention(const AttentionRow &a, const Matrix &scratch, const Act *sink, const Act *gate,
-                        Act *out, int rows, int chain, int maxSplits, int smCount, int minTiles) {
+                        Act *out, int rows, int chain, int maxSplits, int smCount, int minTiles, bool pipelineWindow = false) {
     VerifyPrefillParams p{};
     p.q = reinterpret_cast<half *>(const_cast<float *>(a.q));
     p.o = scratch.p;
@@ -177,6 +194,27 @@ void launchVerifyAttention(const AttentionRow &a, const Matrix &scratch, const A
     p.sm_scale = 1.f;
     p.window_left = a.window ? a.window - 1 : -1;
     p.partition_kv = true;
+#if CUDART_VERSION >= 12080
+    if (pipelineWindow) {
+        cudaLaunchAttribute attribute{};
+        attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attribute.val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config{};
+        config.stream = cudaStreamPerThread;
+        config.attrs = &attribute;
+        config.numAttrs = 1;
+        config.gridDim = dim3(a.kvHeads, maxSplits);
+        config.blockDim = dim3(32, VerifyTraits::NUM_WARPS_Q);
+        config.dynamicSmemBytes = sizeof(VerifyTraits::SharedStoragePaged);
+        check(cudaLaunchKernelEx(&config, pagedWindowDecode, p));
+        config.gridDim = dim3(1, a.heads);
+        config.blockDim = 128;
+        config.dynamicSmemBytes = 0;
+        check(cudaLaunchKernelEx(&config, mergeVerifyAttention<Act, false, true>, p, sink, gate, out,
+                                 a.sinkStride, a.gateStride));
+        return;
+    }
+#endif
     const int tiles = (chain * group + VerifyTraits::CTA_TILE_Q - 1) / VerifyTraits::CTA_TILE_Q;
     pagedVerifyAttention<<<dim3(rows / chain * tiles, maxSplits, a.kvHeads), dim3(32, VerifyTraits::NUM_WARPS_Q),
                         sizeof(VerifyTraits::SharedStoragePaged), cudaStreamPerThread>>>(p);

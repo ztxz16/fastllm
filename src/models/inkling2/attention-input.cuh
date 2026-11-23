@@ -16,8 +16,11 @@ __device__ float headScale(float v, float clip, int width, float eps, float *scr
     return clip > 0 ? fminf(1.f, clip / (sqrtf(sum) + 1e-6f)) : rsqrtf(sum / width + eps);
 }
 
-template<class T, bool Timeline = false, bool PackQuery = false, class Act>
+template<class T, bool Timeline = false, bool PackQuery = false, class Act, bool PipelineWindow = false>
 __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in, int tiles, float *q, float *bias, int chain = 1) {
+#if CUDART_VERSION >= 12080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (PipelineWindow) asm volatile("griddepcontrol.launch_dependents;");
+#endif
     int row = 0, priorRows = 0;
     if constexpr (Timeline) {
         row = blockIdx.y;

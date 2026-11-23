@@ -211,6 +211,7 @@ template<class T> __global__ void storeDecodeKv(const DecodeVisit *visit, const 
     }
 }
 #include "attention-input.cuh"
+#include "window-decode.cuh"
 template <class T, class Residual>
 Rows<Residual> convolution(const Rows<T> &x, const float *w, const Matrix &dyn, int heads, int taps, Matrix &hist, const Residual *residual) {
     const int count = taps - 1, d = x.cols;
@@ -421,6 +422,8 @@ class Decoder final : public Runtime {
     DecodeInput hostInput{};
     std::vector<DecodeVisit> hostVisits;
     Matrix graphLogits, unitScale, splitScratch;
+    WindowDecodeKernel windowDecodeKernel = WindowDecodeKernel::Paged;
+    bool windowDecodePdl = false;
     int smCount = 0, sm120GlobalSplits = 0, verifyAttentionSplits = 0;
     bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
     bool bf16WindowBias = false, batchedController = false, fusedPrefillController = false;
@@ -636,13 +639,17 @@ class Decoder final : public Runtime {
             const auto projected = projection.views();
             Rows<T> attended(inputs[0].rows, c.heads * d);
             const int queries = batch.front().timeline ? attended.rows : 1;
-            Matrix q(queries, c.heads * d), bias(queries * c.heads, c.extent);
             const bool usePagedVerify = verifyAttentionSplits > 0 && std::is_same_v<KV, half>;
             // One window query can spread its KV tiles across more SMs. A speculative
             // target keeps the same partitions for both singleton and chain evaluation.
             const int minTiles = window && !usesVerifyArithmetic(batch) ? 1 : VerifyPartition::minTiles;
             const int splits = usePagedVerify ? verifySplitCount(verifyAttentionSplits, window, GetPageLen(), minTiles)
                                               : splitScratch.rows;
+            const bool singleWindow = usePagedVerify && window && batch.front().decode && !batch.front().timeline &&
+                attended.rows == 1 && !usesVerifyArithmetic(batch);
+            const bool fusedWindow = singleWindow && std::is_same_v<T, __nv_bfloat16> && windowDecodeKernel != WindowDecodeKernel::Paged;
+            const bool pipelineWindow = singleWindow && windowDecodePdl && splits <= 32;
+            Matrix q(fusedWindow ? 0 : queries, c.heads * d), bias(fusedWindow ? 0 : queries * c.heads, c.extent);
             Matrix scratch = queries == 1 ? splitScratch : Matrix(splits, splitScratch.cols * queries);
             auto evaluate = [&](int row, const DecodeVisit *visit) {
                 auto sources = projected;
@@ -655,6 +662,12 @@ class Decoder final : public Runtime {
                                   param(att + (local ? "v_sconv.weight" : "v_sconv.static_w"), k * c.conv),
                                   static_cast<const float *>(table.cudaData), c.heads, c.kvHeads, d, c.relative,
                                   c.extent, c.conv, c.qClip, c.rClip, c.eps};
+                if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+                    if (fusedWindow) {
+                        launchFusedWindow(windowDecodeKernel, visit, in, window, splits, scratch, attended.p);
+                        return;
+                    }
+                }
                 const int biasTile = c.relative == 16 && c.extent % 4 == 0 ? 4 * threads : threads;
                 int tiles = (c.extent + biasTile - 1) / biasTile;
                 if (batch.front().timeline) {
@@ -663,6 +676,7 @@ class Decoder final : public Runtime {
                         visit, in, tiles, q.p, bias.p, batch.front().length);
                 } else {
                     auto prepare = usePagedVerify ? prepareRelative<KV, false, true, T> : prepareRelative<KV, false, false, T>;
+                    if (pipelineWindow) prepare = prepareRelative<KV, false, true, T, true>;
                     prepare<<<c.heads * (1 + tiles) + 2 * c.kvHeads, threads, 0, cudaStreamPerThread>>>(
                         visit, in, tiles, q.p, bias.p, 1);
                 }
@@ -671,7 +685,7 @@ class Decoder final : public Runtime {
                                   window, c.logFloor, c.logAlpha, sink.stride, gate.stride};
                 if (usePagedVerify) {
                     launchVerifyAttention(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
-                                       queries, batch.front().timeline ? batch.front().length : 1, splits, smCount, minTiles);
+                                       queries, batch.front().timeline ? batch.front().length : 1, splits, smCount, minTiles, pipelineWindow);
                 } else if (d == 128) launchSplitRelative<128, KV>(args, scratch, sink.data, gate.data,
                                                           attended.p + size_t(row) * attended.cols, sm120GlobalSplits,
                                                           queries, batch.front().timeline ? batch.front().length : 1);
@@ -1374,6 +1388,12 @@ class Decoder final : public Runtime {
         if (tensorPrefill && c.headDim == 128 && c.qClip > 0.f && c.qClip <= 65504.f &&
             configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention)) {
             verifyAttentionSplits = std::min(splitScratch.rows, std::max(1, 2 * (smCount / c.kvHeads)));
+            if (c.window > 0 && c.heads == 3 * c.kvHeads && c.relative == 16 && c.extent % 4 == 0)
+                windowDecodeKernel = configureWindowDecode(p.gpu, c.kvHeads, verifyAttentionSplits);
+#if CUDART_VERSION >= 12080
+            windowDecodePdl = sm120GlobalSplits > 0 &&
+                configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedWindowDecode);
+#endif
         }
         std::vector<float> ones(std::max(c.headDim, c.hidden), 1.f);
         unitScale = Matrix(1, ones.size());
