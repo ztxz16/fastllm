@@ -22,8 +22,12 @@ namespace block128_gate_detail {
 // The fixed 256-expert gate avoids generic bounds/owner branches and keeps
 // the ordered probability sum in a register. Hardware reductions preserve
 // every FP32 key bit. Equal keys use the existing legacy-list selector.
+template<bool UseShortlist=false>
 __device__ __forceinline__ void SelectGateRoutes(const float *input,const float *bias,
     int *ids,float *prob,int needNorm,float routeScale,fastllm::cuda::RouterTopKScratch<8> &scratch) {
+    if constexpr (UseShortlist) {
+        if (SelectShortlist(input,bias,ids,prob,needNorm,routeScale,scratch)) return;
+    }
     constexpr unsigned Mask=0xffffffffu;
     const int lane=threadIdx.x%32,first=lane*8;
     float key[8],values[8];fastllm::cuda::LoadRouter8(input+first,values);
@@ -63,7 +67,8 @@ __device__ __forceinline__ void SelectGateRoutes(const float *input,const float 
     if(lane<8)prob[lane]=scratch.probabilities[lane]/sum*routeScale;
 }
 
-template<int Capacity=8> struct Body {
+template<int Capacity=8, bool Primary=false> struct Body {
+  static_assert(!Primary || Capacity==8);
   static_assert(Capacity==8 || Capacity==16 || Capacity==32 || Capacity==64);
   static constexpr bool Compact=Capacity>8;
   static constexpr int kRows8BarrierOffset=0x0000,kRows8ReleaseBarrierOffset=0x0040;
@@ -185,7 +190,7 @@ template<int Capacity=8> struct Body {
     using Scratch = fastllm::cuda::RouterTopKScratch<8>;
     auto &scratch = reinterpret_cast<Scratch*>(shared + kRows8PaneBaseOffset)[token];
     static_assert(sizeof(Scratch) * Capacity < 4 * kRows8PaneStride);
-    SelectGateRoutes(sigmoid(shared,token),args.bias?bias_scratch(shared):nullptr,
+    SelectGateRoutes<Primary>(sigmoid(shared,token),args.bias?bias_scratch(shared):nullptr,
         selected(shared)+token*8,scratch.probabilities,args.needNorm,args.route_scale,scratch);
     const int lane = threadIdx.x % 32;
     if (blockIdx.x == 0 && lane < 8) {
@@ -327,6 +332,16 @@ template<int Capacity=8> struct Body {
     consumer_sync();
   }
 
+  __device__ static __forceinline__ void load_weight_page(unsigned char *destination,
+      const CUtensorMap *weightMap, std::uint64_t *barrier, int group, int page, int expert) {
+    unsigned dst=unsigned(__cvta_generic_to_shared(destination));
+    unsigned bar=unsigned(__cvta_generic_to_shared(barrier));
+    uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.L2::evict_unchanged.b64 %0, 1.0;":"=l"(policy));
+    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0],[%1,{0,%2,%3,%4}],[%5],%6;"
+      ::"r"(dst),"l"(weightMap),"r"(group*32),"r"(page*8),"r"(expert),"r"(bar),"l"(policy):"memory");
+  }
+
   __device__ static void helper_pages(unsigned char*shared,const CUtensorMap*weightMap,const uint8_t*weightScales) {
     const int t=threadIdx.x,lane=t%32;
     if(t<256)return;
@@ -340,6 +355,12 @@ template<int Capacity=8> struct Body {
       for(int page=page_parity;page<4;page+=2){
         const int sequence=local*2+page/2;
         while(!Trans64::try_wait(release_barriers(shared)+helper,sequence&1)){}
+        if constexpr (Primary) {
+          if (lane == 0) {
+            Trans64::expect_transaction(barrier,32768);
+            load_weight_page(pane(shared,helper),weightMap,barrier,group,page,expert);
+          }
+        }
         if(lane<16){
           const int branch=lane/8,sg=lane%8;
           const unsigned e=weightScales[fastllm_shared_flex_tp::sf_offset(expert,
@@ -349,13 +370,13 @@ template<int Capacity=8> struct Body {
         asm volatile("fence.proxy.async.shared::cta;":::"memory");
         __syncwarp();
         if(lane==0){
-          Trans64::arrive_and_expect_tx(barrier,32768);
-          unsigned dst=unsigned(__cvta_generic_to_shared(pane(shared,helper)));
-          unsigned bar=unsigned(__cvta_generic_to_shared(barrier));
-          uint64_t policy;
-          asm volatile("createpolicy.fractional.L2::evict_first.L2::evict_unchanged.b64 %0, 1.0;":"=l"(policy));
-          asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0],[%1,{0,%2,%3,%4}],[%5],%6;"
-            ::"r"(dst),"l"(weightMap),"r"(group*32),"r"(page*8),"r"(expert),"r"(bar),"l"(policy):"memory");
+          if constexpr (Primary) {
+            // Publish the page once both the weight transfer and the scale stores finish.
+            Trans64::arrive(barrier);
+          } else {
+            Trans64::arrive_and_expect_tx(barrier,32768);
+            load_weight_page(pane(shared,helper),weightMap,barrier,group,page,expert);
+          }
         }
       }
     }
@@ -577,6 +598,18 @@ template<int Capacity=8> struct Body {
     consumer_sync();
     build_item_list(shared,args.rank.rows);
     publish_routes(args,shared);
+    if constexpr (Primary) {
+      if (blockIdx.x == 0) {
+        // Join every route writer before publishing to Down. The prepared
+        // router clears gcount before this launch; the FP8 Gate uses no splits.
+        consumer_sync();
+        if (t == 0) {
+          asm volatile("st.release.gpu.global.u32 [%0], %1;" ::
+                       "l"(args.rank.gcount), "r"(1u) : "memory");
+          cudaTriggerProgrammaticLaunchCompletion();
+        }
+      }
+    }
     if constexpr(Capacity>=32) {
       consumer_sync();split_expert_work(shared);
       if constexpr(Capacity==64)choose_workers(shared);
@@ -620,6 +653,12 @@ __global__ __launch_bounds__(384,1)
 void block128_gate(const __grid_constant__ Block128GateArgs args) {
     extern __shared__ __align__(1024) unsigned char block128Arena[];
     block128_gate_detail::Body<>::run(args,block128Arena);
+}
+__global__ __launch_bounds__(384,1)
+void block128_gate_primary(const __grid_constant__ Block128GateArgs args) {
+    if (blockIdx.x) cudaTriggerProgrammaticLaunchCompletion();
+    extern __shared__ __align__(1024) unsigned char block128Arena[];
+    block128_gate_detail::Body<8,true>::run(args, block128Arena);
 }
 constexpr int Block128WideGateBytes=0x27400+16*4112;
 __global__ __launch_bounds__(384,1)

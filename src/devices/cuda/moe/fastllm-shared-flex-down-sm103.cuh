@@ -6,8 +6,8 @@
 namespace fastllm_shared_flex_tp {
 constexpr int OwnerDownBytes = 70656;
 
-template<bool KeepExperts, bool PDL = false>
-__device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, int row) {
+template<bool KeepExperts, bool PDL = false, bool BorrowTmem = false>
+__device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, int row, unsigned external = 0) {
     using E4 = cutlass::float_e4m3_t;
     using UE = cutlass::float_ue8m0_t;
     using MMA = cute::SM100_MMA_MXF8F6F4_SS<E4,E4,float,UE,128,8,
@@ -18,7 +18,7 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
     auto input = reinterpret_cast<uint8_t (*)[1024]>(arena + 67584);
     auto inputScales = reinterpret_cast<uint8_t (*)[512]>(arena + 69632);
     __shared__ __align__(8) uint64_t ready[2], released[2], done;
-    __shared__ unsigned tmem;
+    __shared__ unsigned localTmem;
     // The packed eight-row path leaves one N8 accumulator per expert in TMEM.
     // Weight and scale panes can be refilled as soon as their MMA completes.
     constexpr int TmemColumns = KeepExperts ? 128 : 32;
@@ -34,12 +34,13 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
         asm volatile("mbarrier.init.shared::cta.b64 [%0],1; fence.mbarrier_init.release.cluster;"
                      :: "r"(d) : "memory");
     }
-    if (tid < 32) {
+    if (!BorrowTmem && tid < 32) {
         cute::TMEM::Allocator1Sm allocator;
-        allocator.allocate(TmemColumns, &tmem);
+        allocator.allocate(TmemColumns, &localTmem);
         allocator.release_allocation_lock();
     }
     __syncthreads();
+    const unsigned tmem = BorrowTmem ? external : localTmem;
     if (tid >= 128) {
         const int lane = tid - 128;
         for (int expertSlot = 0; expertSlot < K; ++expertSlot) {
@@ -145,7 +146,7 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
         if constexpr (KeepExperts) reinterpret_cast<unsigned *>(a.wlocal)[row * (H / 2) + pair] = local;
         publish_bf16(a, row, pair, unsigned(*a.epoch), local);
     }
-    if (tid < 32) {
+    if (!BorrowTmem && tid < 32) {
         cute::TMEM::Allocator1Sm allocator;
         allocator.free(tmem, TmemColumns);
     }
@@ -164,6 +165,40 @@ void owner_down(Rank a, const int *ids, const float *prob) {
     const int tile = KeepExperts ? task / a.rows : task % (H / 128);
     const int row = KeepExperts ? task % a.rows : task / (H / 128);
     OwnerDownBody<KeepExperts, PDL>(a, ids, tile, row);
+}
+
+// Route metadata is released independently of the activation tile. Down can
+// stage the expert weights early and still wait before consuming activations.
+__global__ __launch_bounds__(160,2)
+void block128_owner_down(Rank a, const int *ids, const float *prob) {
+    __shared__ unsigned tm;
+    if (threadIdx.x < 32) {
+        cute::TMEM::Allocator1Sm allocator;
+        allocator.allocate(128, &tm);
+        allocator.release_allocation_lock();
+    }
+    __shared__ unsigned routesReady;
+    if (threadIdx.x == 0) {
+        unsigned ready;
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(ready) : "l"(a.gcount) : "memory");
+        routesReady = ready;
+    }
+    __syncthreads();
+    // A secondary may launch before the primary publishes its route list.
+    // Fall back to the ordinary dependency wait in that case, without spinning.
+    if (!routesReady) cudaGridDependencySynchronize();
+    // Grouped GEMM reuses weights across rows. Dispersed routes keep one
+    // accumulator per expert until the row's ordered local reduction.
+    if (*a.nuniq <= a.rows * 4) {
+        if (threadIdx.x < 128) batched_matmul<false, true, 1, true, true>(a, ids, prob, tm);
+    } else if (blockIdx.x < a.rows * (H / 128)) {
+        OwnerDownBody<true, true, true>(a, ids, blockIdx.x / a.rows, blockIdx.x % a.rows, tm);
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        cute::TMEM::Allocator1Sm allocator;
+        allocator.free(tm, 128);
+    }
 }
 
 template<bool PackedLocal> __global__

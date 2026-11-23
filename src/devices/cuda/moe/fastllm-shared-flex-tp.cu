@@ -59,6 +59,7 @@ struct State {
     // Rank workers can bind MXFP4 layers concurrently and disable the FP8-only layout.
     std::atomic<bool> gate128Supported{true};
     bool preparedDownPdl = true;
+    bool block128DownPdl = true;
     bool clusterGateSupported = true;
     bool compactSinglePdl = true, swizzledSinglePdl = true;
     Rank r[R]; std::vector<std::array<Rank,R>> layers; std::vector<void*> owned[R]; };
@@ -305,6 +306,14 @@ extern "C" int fastshared_tp_create(const int*devices,int layers,void**result){
       }
       if (!SupportsOwnerDown<true>(prop.multiProcessorCount)) {
           s->packedOwnerDownSupported = false;
+          cudaGetLastError();
+      }
+      int pdlBlocks = 0;
+      if (!s->packedOwnerDownSupported ||
+          cudaFuncSetAttribute(block128_gate_primary, cudaFuncAttributeMaxDynamicSharedMemorySize, Block128GateBytes) != cudaSuccess ||
+          cudaFuncSetAttribute(block128_owner_down, cudaFuncAttributeMaxDynamicSharedMemorySize, OwnerDownBytes) != cudaSuccess ||
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&pdlBlocks, block128_owner_down, 160, OwnerDownBytes) != cudaSuccess || pdlBlocks == 0) {
+          s->block128DownPdl = false;
           cudaGetLastError();
       }
       cudaFuncAttributes route{}, gate{};
@@ -760,6 +769,14 @@ extern "C" int fastshared_tp_run_prepared(void *state,int rank,int layer,int row
     grouped_tma_gate<<<444,128,GroupedGateBytes,stream>>>(a,ids,prob);
   } else if(input.block128 && a.gate128map) {
     Block128GateArgs args{a,router,bias,ids,prob,needNorm,routeScale,a.gate128map,a.gs,input.block128};
+    if (!a.mxfp4 && rows == 8 && s->block128DownPdl) {
+      block128_gate_primary<<<a.gate128ctas, 384, Block128GateBytes, stream>>>(args);
+      const auto err = fastllm::cuda_launch::LaunchProgrammatic<block128_owner_down>(
+          dim3(444), dim3(160), OwnerDownBytes, stream, a, ids, prob);
+      if (err != cudaSuccess) return err;
+      owner_finish<true><<<dim3(32, rows), 64, 0, stream>>>(a, static_cast<__nv_bfloat16 *>(output));
+      return cudaGetLastError();
+    }
     block128_gate<<<a.gate128ctas,384,Block128GateBytes,stream>>>(args);
   } else routed_gate<<<296,256,RoutedGateBytes,stream>>>(a,router,bias,ids,prob,needNorm,routeScale);
   return launch_prepared_down(a, ids, prob, output, stream, *s, pipeline);

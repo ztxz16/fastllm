@@ -274,8 +274,8 @@ void plain_matmul(Rank a,const int*ids,const float*prob){
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.free(tm,BUFFERS<=3?32:BUFFERS<=7?64:128);}
 }
-template<bool G,bool PDL=false,int TaskGroup=1,bool Subgroup=false> __device__ __forceinline__
-void batched_matmul(Rank a,const int*ids,const float*prob){
+template<bool G,bool PDL=false,int TaskGroup=1,bool Subgroup=false,bool BorrowTmem=false> __device__ __forceinline__
+void batched_matmul(Rank a,const int*ids,const float*prob,unsigned external=0){
   static_assert(TaskGroup==1 || (G && TaskGroup==2));
   using E4=cutlass::float_e4m3_t;using UE=cutlass::float_ue8m0_t;
   using MMA=cute::SM100_MMA_MXF8F6F4_SS<E4,E4,float,UE,128,8,cute::UMMA::Major::K,cute::UMMA::Major::K>;
@@ -286,7 +286,7 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
   auto sfa=reinterpret_cast<uint8_t(*)[512]>(arena+BUFFERS*(16384+1024));
   auto sfb=reinterpret_cast<uint8_t(*)[512]>(arena+BUFFERS*(16384+1024+512));
   __shared__ __align__(8) uint64_t loaded[BUFFERS],done;
-  __shared__ unsigned tm; __shared__ int last;
+  __shared__ unsigned localTmem; __shared__ int last;
   int tid=threadIdx.x;
   if(blockIdx.x*TaskGroup>=*a.nuniq*(NN/128)*SPLIT)return;
   if(tid==0){
@@ -295,8 +295,14 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
     unsigned d=(unsigned)__cvta_generic_to_shared(&done);
     asm volatile("mbarrier.init.shared::cta.b64 [%0],1; fence.mbarrier_init.release.cluster;"::"r"(d):"memory");
   }
-  if(tid<32){cute::TMEM::Allocator1Sm al;al.allocate(BUFFERS<=3?32:BUFFERS<=7?64:128,&tm);al.release_allocation_lock();}
+  constexpr int TmemColumns = BUFFERS <= 3 ? 32 : BUFFERS <= 7 ? 64 : 128;
+  if (!BorrowTmem && tid < 32) {
+    cute::TMEM::Allocator1Sm allocator;
+    allocator.allocate(TmemColumns, &localTmem);
+    allocator.release_allocation_lock();
+  }
   MatmulSync<Subgroup>();
+  const unsigned tm = BorrowTmem ? external : localTmem;
   auto idesc=fastllm_shared_flex::weight_instruction(a.mxfp4);
   unsigned phase=0,load_phase[BUFFERS]={};
   for(int task=blockIdx.x*TaskGroup;task<*a.nuniq*(NN/128)*SPLIT;
@@ -386,7 +392,10 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
     }
     MatmulSync<Subgroup>();
   }
-  if(tid<32){cute::TMEM::Allocator1Sm al;al.free(tm,BUFFERS<=3?32:BUFFERS<=7?64:128);}
+  if (!BorrowTmem && tid < 32) {
+    cute::TMEM::Allocator1Sm allocator;
+    allocator.free(tm, TmemColumns);
+  }
 }
 
 template<bool PDL=false> __global__ __launch_bounds__(128,2)
