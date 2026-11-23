@@ -1,5 +1,5 @@
 #include "devices/moe_decode_scheduler.h"
-#include "devices/moe_frequency_policy.h"
+#include "utils/hybrid_moe_routes.h"
 #include "devices/moe_prefill_policy.h"
 #include <random>
 #include <set>
@@ -9,6 +9,32 @@
 
 static void Require(bool ok, const char *message) {
     if (!ok) throw std::runtime_error(message);
+}
+
+static void TestHybridRouteGrouping() {
+    using namespace fastllm;
+    MoeFrequencyPolicy frequency({0,0,0,0}, {0}, 1);
+    int resident = 1;
+    frequency.SetResidents(&resident);
+    MoeDecodeOverlapScheduler scheduler;
+    std::vector<int> ids{3, 1, 0, 3, 2, 1, 3};
+    frequency.BeginStep();
+    HybridMoeRoutes plan(ids, 4, 1, 0, false, &frequency, scheduler, 1);
+    Require(plan.hits == std::vector<int>{1} && plan.residentRows == 2, "resident routes were lost");
+    Require(plan.misses == std::vector<int>({3,0,2}) && plan.staged == 1 && plan.stagedRows == 3,
+            "staging a reused expert must cost a single upload");
+    Require(plan.grouped[3] == std::vector<int>({0,3,6}), "grouping reordered routes within an expert");
+    HybridMoeRoutes host(ids, 4, 1, 0, true, nullptr, scheduler, 0);
+    Require(host.residentRows == 0 && host.staged == 0 && host.misses.size() == 4,
+            "zero-budget CPU routing dropped experts");
+
+    MoeFrequencyPolicy sparse(std::vector<int>(8, 0), {0}, 1);
+    resident = 7;
+    sparse.SetResidents(&resident);
+    HybridMoeRoutes live({0, 7, 6, 6, 6, 6}, 8, 1, 0, true, &sparse, scheduler, 1);
+    Require(live.selectPrefill(sparse, 0, 6).slot < 0, "prefill evicted an active high-ID expert");
+    HybridMoeRoutes idle({0, 6, 6, 6, 6}, 8, 1, 0, true, &sparse, scheduler, 1);
+    Require(idle.selectPrefill(sparse, 0, 6).slot == 0, "prefill failed to reuse the inactive slot");
 }
 
 static void TestFrequencyAdmission() {
@@ -710,6 +736,7 @@ static void TestPrefillCpuFeedback() {
 }
 
 int main() {
+    TestHybridRouteGrouping();
     TestPrefillCpuFeedback();
     TestPrefillThresholdSearch();
     TestWorkspaceSlots();

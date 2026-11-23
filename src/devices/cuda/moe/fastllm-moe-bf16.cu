@@ -6,8 +6,7 @@
 #include <chrono>
 #include <algorithm>
 #include "moe_cache_config.h"
-#include "devices/moe_frequency_policy.h"
-#include "devices/moe_decode_scheduler.h"
+#include "utils/hybrid_moe_routes.h"
 #include <stdexcept>
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
@@ -231,34 +230,18 @@ void HybridMoeBF16::Run(const Data &input, const Data &index, const Data &score,
     CudaBF16(cudaMemcpyAsync(w.indices.data(), index.cudaData, index.GetBytes(), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CudaBF16(cudaMemcpyAsync(w.scores.data(), score.cudaData, score.GetBytes(), cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CudaBF16(cudaStreamSynchronize(cudaStreamPerThread));
-    for (int e : w.indices) CheckBF16(e >= 0 && e < w.experts, "invalid expert id");
-    std::vector<std::vector<int>> grouped(w.experts);
-    for (int r = 0; r < routes; ++r) grouped[w.indices[r]].push_back(r);
-    std::vector<int> resident, misses, reuse, packedRoutes;
     auto &timing = w.timings[layer];
-    int selected = 0, residentRoutes = 0, stagedRoutes = 0;
+    if (w.frequency && !w.prefill && layer == w.firstLayer) w.frequency->BeginStep();
+    HybridMoeRoutes plan(w.indices, w.experts, rows, layer * w.experts, w.prefill, w.frequency.get(), timing, w.staging);
+    const auto &grouped = plan.grouped;
+    const auto &misses = plan.misses;
+    const int selected = plan.staged, residentRoutes = plan.residentRows, stagedRoutes = plan.stagedRows;
+    std::vector<int> packedRoutes;
     if (w.frequency) {
-        if (!w.prefill && layer == w.firstLayer) w.frequency->BeginStep();
-        std::vector<int> unique;
-        for (int e = 0; e < w.experts; ++e) if (!grouped[e].empty()) unique.push_back(e);
-        if (w.prefill) {
-            std::vector<int> counts(w.experts);
-            for (int e : unique) counts[e] = grouped[e].size();
-            w.frequency->ObservePrefill(layer * w.experts, counts, rows, true);
-        } else w.frequency->Observe(layer * w.experts, unique.data(), unique.size());
-        for (int e : unique) {
-            if (w.frequency->Slot(layer * w.experts + e) >= 0) resident.push_back(e);
-            else misses.push_back(e);
-        }
-        std::stable_sort(misses.begin(), misses.end(), [&](int a, int b) { return grouped[a].size() > grouped[b].size(); });
-        for (int e : resident) residentRoutes += grouped[e].size();
-        for (int e : misses) reuse.push_back(grouped[e].size());
-        selected = std::min(w.staging, timing.SelectMisses(misses.size(), residentRoutes, reuse.data()));
-        for (int i = 0; i < selected; ++i) stagedRoutes += grouped[misses[i]].size();
         auto append = [&](int e, int slot) {
             for (int r : grouped[e]) { w.owners[r] = slot; packedRoutes.push_back(r); }
         };
-        for (int e : resident) append(e, w.frequency->Slot(layer * w.experts + e));
+        for (int e : plan.hits) append(e, w.frequency->Slot(layer * w.experts + e));
         for (int i = 0; i < selected; ++i) append(misses[i], w.slots + i);
         PrepareBF16(w.gpuResults, FLOAT32, {routes, w.hidden}, w.device);
         PrepareBF16(w.gpuOwners, INT32, {routes}, w.device);
@@ -336,11 +319,8 @@ void HybridMoeBF16::Run(const Data &input, const Data &index, const Data &score,
             }
         }
         if (w.prefill) {
-            std::vector<int> active;
-            for (int e = 0; e < w.experts; ++e) if (!grouped[e].empty()) active.push_back(e);
             for (int i = 0; i < selected; ++i) {
-                const auto admission = w.frequency->SelectPrefill(layer * w.experts + misses[i],
-                    layer * w.experts, active, w.frequency->HasDecodeHistory());
+                const auto admission = plan.selectPrefill(*w.frequency, layer * w.experts, misses[i]);
                 if (admission.slot < 0) continue;
                 // Promote a record already uploaded for useful GPU work;
                 // CPU-only prefill experts incur no speculative PCIe copies.
