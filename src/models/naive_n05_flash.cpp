@@ -702,7 +702,8 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
     TargetBatch requests{pastKeyValues, configs, seqLens, block_cnt};
     std::vector<float> packedPositions;
     packedPositions.reserve(inputIds.Count(0));
-    auto selection = SelectLogits(configs[0]);
+    LogitsSelection selection;
+    bool hasSamplingRow = false;
     for (int b = 0; b < batch; ++b) {
         AssertInFastLLM(seqLens[b] > 0 && positionIds[b] &&
             (b >= (int)attentionMask.size() || !attentionMask[b] || attentionMask[b]->dims.empty()),
@@ -729,7 +730,14 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
             const float *values = (const float *)positions.cpuData;
             packedPositions.insert(packedPositions.end(), values, values + seqLens[b]);
         }
+        // An intermediate chunk writes KV and hidden state but has no next token.
+        if (configs[b].prefill_chunk_remaining > 0) continue;
         auto other = SelectLogits(configs[b]);
+        if (!hasSamplingRow) {
+            selection = std::move(other);
+            hasSamplingRow = true;
+            continue;
+        }
         selection.cudaSampling = selection.cudaSampling && other.cudaSampling;
         selection.cudaLogits = selection.cudaLogits || other.cudaLogits;
         if (selection.count != other.count || selection.greedy != other.greedy ||
@@ -739,7 +747,7 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
         inputIds.dataType == FLOAT32, "Naive batch input must pack the unpadded sequences in order.");
     Data positions(FLOAT32, inputIds.dims, DataDevice::CPU, packedPositions.data());
     if (std::any_of(configs.begin(), configs.end(), [](const GenerationConfig &cfg) { return cfg.output_logits; })) {
-        selection.cudaLogits = false; selection.cudaSampling = false;
+        selection.count = 0; selection.cudaLogits = false; selection.cudaSampling = false;
     } else if (selection.cudaLogits) selection.cudaSampling = false;
     // The batch descriptor references response-owned KV. No KV payload or
     // ownership is copied into the legacy single-sequence argument.
@@ -751,18 +759,17 @@ std::vector<int> NaiveN05FlashModel::ForwardTargetBatch(int batch, const Data &i
     if (!selection.sampledTokens.empty()) return selection.sampledTokens;
     std::vector<int> tokens(batch);
     if (!selection.candidates.dims.empty()) {
-        for (int b = 0; b < batch; ++b)
+        for (int b = 0; b < batch; ++b) {
+            if (configs[b].prefill_chunk_remaining > 0) continue;
             tokens[b] = selection.greedy
                 ? (int)((float *)selection.candidates.cpuData)[b * 2]
                 : LLMSamplingOnly(selection.candidates, b, configs[b]);
+        }
         return tokens;
     }
     if (logits.dataDevice == CUDA) {
         ResetLogitsOfEOS(batch, &logits, pastKeyValues, configs);
-        auto sampled = SampleCudaLogits(logits, configs, &lastTokens);
-        for (int row = 0; row < batch; ++row)
-            if (configs[row].prefill_chunk_remaining > 0) sampled[row] = 0;
-        return sampled;
+        return SampleCudaLogits(logits, configs, &lastTokens);
     }
     const int vocab = logits.dims.back();
     for (int b = 0; b < batch; ++b)
@@ -2656,15 +2663,12 @@ bool NaiveN05FlashModel::SupportsCudaRejectionSampling(const GenerationConfig &c
     return config.top_k > 1 && GetLogitsOptions(config, false).cudaSampling;
 }
 
-std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
-        Data &logits, const std::vector<GenerationConfig> &configs, const LastTokensManager *lastTokens) {
 #ifdef USE_CUDA
-    AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
-        logits.Count(0) / logits.dims.back() == configs.size(), "Naive CUDA sampling: invalid logits.");
-    FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
-    const int rows = configs.size(), vocab = logits.dims.back();
+static void SampleNaiveCudaRows(Data &logits, const GenerationConfig *configs, int rows,
+                                const LastTokensManager *lastTokens, int firstRow, int *tokens) {
+    const int vocab = logits.dims.back();
     std::vector<float> temperatures(rows), topPs(rows);
-    std::vector<int> topKs(rows, vocab), tokens(rows);
+    std::vector<int> topKs(rows, vocab);
     for (int row = 0; row < rows; ++row) {
         temperatures[row] = configs[row].top_k <= 1 ? 1.0f : configs[row].temperature;
         topPs[row] = configs[row].top_p;
@@ -2673,7 +2677,7 @@ std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
     // Combine explicit allow-lists with grammar masks before GPU selection.
     // An empty standalone allow-list intersection keeps the established
     // unconstrained fallback; an impossible grammar remains an error.
-    std::vector<GenerationConfig> masked(configs);
+    std::vector<GenerationConfig> masked(configs, configs + rows);
     for (int row = 0; row < rows; ++row) if (!configs[row].tool_call_allowed_token_ids.empty()) {
         auto mask = std::make_shared<std::vector<uint32_t>>((vocab + 31) / 32, 0);
         bool any = false;
@@ -2687,10 +2691,10 @@ std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
     ApplyToolTokenMasks(logits, masked);
     std::vector<std::vector<std::pair<int, float>>> penalties(rows);
     size_t maxPenalty = 0;
-    if (lastTokens) for (int row = 0; row < rows && row < (int)lastTokens->units.size(); ++row) {
+    if (lastTokens) for (int row = 0; row < rows && firstRow + row < (int)lastTokens->units.size(); ++row) {
         if (std::abs(configs[row].repeat_penalty - 1.0f) <= 1e-8f) continue;
         std::map<int, int> counts;
-        for (int id : lastTokens->units[row].tokenSet) if (id >= 0 && id < vocab) ++counts[id];
+        for (int id : lastTokens->units[firstRow + row].tokenSet) if (id >= 0 && id < vocab) ++counts[id];
         for (auto entry : counts) penalties[row].push_back({entry.first,
             std::pow(configs[row].repeat_penalty, configs[row].last_n <= 0 ? 1 : entry.second)});
         maxPenalty = std::max(maxPenalty, penalties[row].size());
@@ -2729,12 +2733,37 @@ std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
             (int *)gpu + 3 * rows, (float *)gpu + 3 * rows + rows * maxPenalty, int(maxPenalty),
             (int *)w.output.cudaData, (float *)w.floatOutput.cudaData, rows, vocab,
             nullptr, nullptr, w.topK.cudaData, w.topK.GetBytes()), "GPU penalized sampling failed.");
-        FastllmCudaCopyFromDeviceToHost(tokens.data(), w.output.cudaData, rows * sizeof(int));
-        return tokens;
+        FastllmCudaCopyFromDeviceToHost(tokens, w.output.cudaData, rows * sizeof(int));
+        return;
     }
     AssertInFastLLM(FastllmCudaTopKFirstSampling((float *)logits.cudaData,
-        temperatures.data(), topKs.data(), topPs.data(), tokens.data(), rows, vocab),
+        temperatures.data(), topKs.data(), topPs.data(), tokens, rows, vocab),
         "Naive CUDA top-p sampling failed.");
+}
+#endif
+
+std::vector<int> NaiveN05FlashModel::SampleCudaLogits(
+        Data &logits, const std::vector<GenerationConfig> &configs, const LastTokensManager *lastTokens) {
+#ifdef USE_CUDA
+    AssertInFastLLM(logits.dataDevice == DataDevice::CUDA && logits.dataType == FLOAT32 &&
+        logits.Count(0) / logits.dims.back() == configs.size(), "Naive CUDA sampling: invalid logits.");
+    FastllmCudaSetDevice(logits.dataDeviceIds.at(0));
+    const int rows = configs.size(), vocab = logits.dims.back();
+    std::vector<int> tokens(rows, 0);
+    for (int first = 0; first < rows;) {
+        if (configs[first].prefill_chunk_remaining > 0) {
+            ++first;
+            continue;
+        }
+        int end = first + 1;
+        while (end < rows && configs[end].prefill_chunk_remaining <= 0) ++end;
+        // Sample a view of consecutive final rows without gathering full-vocabulary logits.
+        Data view;
+        view.FakeFrom(logits, size_t(first) * vocab * sizeof(float));
+        view.Resize({end - first, vocab});
+        SampleNaiveCudaRows(view, configs.data() + first, end - first, lastTokens, first, tokens.data() + first);
+        first = end;
+    }
     return tokens;
 #else
     ErrorInFastLLM("Naive CUDA sampling requires CUDA.");

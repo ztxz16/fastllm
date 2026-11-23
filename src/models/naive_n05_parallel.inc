@@ -365,7 +365,8 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         samplingRows.resize(attentionDP);
         for (int group = 0; group < attentionDP; ++group) {
             for (int seq : state.groups[group].sequenceIndices)
-                if (seq < liveRows) samplingRows[group].push_back(seq);
+                if (seq < liveRows && (!batch || batch->Config(seq).prefill_chunk_remaining <= 0))
+                    samplingRows[group].push_back(seq);
             state.samplingLogits[group].Resize({(int)samplingRows[group].size(), vocab});
         }
     }

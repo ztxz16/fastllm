@@ -2305,6 +2305,11 @@ class Fixture : public NaiveN05FlashModel {
             auto actual=SampleCudaLogits(logits,cs,&history);
             if (actual!=std::vector<int>({7,7,3,9,9,3}) || logits.dataDevice!=CUDA)
                 throw std::runtime_error("GPU penalty/allow-list/greedy semantics");
+            // Row 1 must still read its own repeated-token history after skipping row 0.
+            for (int row : {0, 2, 5}) cs[row].prefill_chunk_remaining = 1;
+            Data mixed(FLOAT32,{rows,vocab},values); mixed.ToDevice(CUDA,std::vector<int>{0},true);
+            if (SampleCudaLogits(mixed,cs,&history)!=std::vector<int>({0,7,0,9,9,0}))
+                throw std::runtime_error("GPU mixed prefill sampling lost the original row indices");
         }
         // Exercise partial mask words and mixed masked/unmasked rows without
         // involving sampling (an empty support is valid for this mask API).
@@ -3116,6 +3121,31 @@ class Fixture : public NaiveN05FlashModel {
         for (int b = 0; b < 3 && !cacheOnly; ++b) {
             if (actual[b].size() != expected[b].size()) throw std::runtime_error("prefill logits missing");
             RequireCloseLogits(actual[b].data(), expected[b], "packed prefill logits");
+        }
+        if (!longPrefill && !cacheOnly) {
+            // Constrain final rows to distinct tokens, including across an intermediate row.
+            const int vocab = weight["lm_head.weight"].dims[0];
+            for (int middle = 0; middle < 3; ++middle) {
+                std::vector<GenerationConfig> mixed(3);
+                std::vector<std::vector<std::pair<Data, Data>>> caches(3);
+                std::vector<std::pair<Data *, Data *>> bindings;
+                std::vector<int> want(3);
+                for (int row = 0; row < 3; ++row) {
+                    caches[row].resize(block_cnt);
+                    for (auto &layer : caches[row]) bindings.emplace_back(&layer.first, &layer.second);
+                    mixed[row].top_k = vocab;
+                    mixed[row].top_p = 0.95f;
+                    mixed[row].prefill_chunk_remaining = row == middle ? 1 : 0;
+                    auto mask = std::make_shared<std::vector<uint32_t>>((vocab + 31) / 32, 0);
+                    if (row != middle) {
+                        want[row] = 5 + row;
+                        (*mask)[0] = 1u << want[row];
+                    }
+                    mixed[row].tool_call_token_mask = mask;
+                }
+                if (ForwardBatch(3, input, {}, positionPtrs, lengths, bindings, mixed, LastTokensManager()) != want)
+                    throw std::runtime_error("Incorrect first-token row in mixed chunked prefill");
+            }
         }
         // Mixed lengths become a three-request decode batch with independent KV.
         for (int b = 0; b < 3; ++b) {
