@@ -32,6 +32,8 @@ struct Placement {
 class Runtime {
 public:
     virtual ~Runtime() = default;
+    virtual int prefix(ResponseContext &, int limit, bool restore) = 0;
+    virtual void setPrefixCache(bool enabled) = 0;
     virtual bool popPending(Data &key, int previous, int &token) = 0;
     virtual void warmupDecodeGraph() = 0;
     virtual std::unique_ptr<basellm::DecodePipeline> pipeline(ResponseContext &context) = 0;
@@ -92,12 +94,18 @@ public:
                runtime->popPending(ctx->pastKeyValues[0].first, previous, token);
     }
     bool SupportsDecodePipeline() const override;
-    // Inkling has no restorable partial convolution history. The scheduler
-    // drains terminal tickets before retiring their private KV.
     bool SupportsDecodePipelineHistory() const override { return true; }
     std::unique_ptr<DecodePipeline> CreateDecodePipeline(const std::vector<ResponseContext *> &contexts) override;
-    // A KV prefix alone cannot restore the four convolution histories per visit.
-    int QueryPagedPrefixCacheExtra(ResponseContext *, int) const override { return 0; }
+    bool SetSaveHistoryChat(bool save) override;
+    int QueryPagedPrefixCacheExtra(ResponseContext *ctx, int limit) const override;
+    bool RestorePagedPrefixCacheExtra(ResponseContext *ctx, int length) const override;
+    std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+        int layer, bool key, const ResponseContext *ctx) const override {
+        // Sliding windows rotate in-place and must have private writable pages.
+        if (GetKVCacheRetainedTokens(layer) >= 0) return {};
+        return basellm::GetPagedKVCacheManagersForRequest(layer, key, ctx);
+    }
+    bool DeferHistoryCacheRestore() const override { return saveHistoryChat; }
     bool UseGenericHistoryCache() const override { return false; }
 
 private:

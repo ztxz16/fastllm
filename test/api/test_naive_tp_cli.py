@@ -319,6 +319,17 @@ class NaiveTensorParallelCliTest(unittest.TestCase):
         args = self.configure([], saved={"tp": "8", "cuda_slab": 0})
         self.assertEqual(args.cuda_slab, 0)
 
+    def test_inkling_history_defaults_and_opt_out(self):
+        config = {"architectures": ["Inkling2LoopForConditionalGeneration"]}
+        for option, enabled in (([], True), (["--cache_history", "false"], False)):
+            with self.subTest(option=option):
+                self.configure(["--device", "cuda:0", "--moe_device", "cuda:0", *option],
+                               model_type="inkling2_loop", config=config)
+                if enabled:
+                    self.loaded_model.set_save_history.assert_called_once_with(True)
+                else:
+                    self.loaded_model.set_save_history.assert_not_called()
+
     def test_mimo_dsa_tp_defaults(self):
         args = self.configure(["--tp", "8"], model_type="mimo_v2", config={
             "architectures": ["MiMoV2ForCausalLM"], "enable_dsa": True})

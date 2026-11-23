@@ -2,6 +2,7 @@
 // https://huggingface.co/thinkingmachines/Inkling-2-Mini
 // https://vllm-project.github.io/2026/11/20/inkling2-mini.html
 #include "runtime.cuh"
+#include "utils/recurrent_prefix_cache.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda-attn-res.cuh"
@@ -15,6 +16,7 @@
 #include "devices/cuda/fastllm-cuda-linear-output.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -287,7 +289,12 @@ uint64_t newSamplingSeed() {
     return gen();
 }
 #include "dspark.cuh"
+#include "prefix-cache.cuh"
 struct Request {
+    std::shared_ptr<InklingPrefix> restored;
+    std::vector<int> prefixTokens;
+    long long prefixId = 0;
+    int64_t nextDecodeCheckpoint = 0;
     std::unique_ptr<DraftState> draft;
     int promptLength = 0, limit = 0;
     int gpu;
@@ -361,6 +368,10 @@ class Decoder final : public Runtime {
     DataType kvType = DATA_AUTO_NONE;
     std::vector<std::unique_ptr<ExpertBackend>> experts;
     std::mutex mutex;
+    std::mutex prefixMutex;
+    std::atomic<bool> prefixEnabled;
+    RecurrentPrefixStore<InklingPrefix> prefixes;
+    long long prefixSerial = 0;
     cudaGraphExec_t decodeGraph = nullptr;
     DecodeGraphScratch graphScratch;
     Buffer<DecodeInput> graphInput;
@@ -989,6 +1000,7 @@ class Decoder final : public Runtime {
         Query outputQuery{param("attn_res.output_query", h), param("norm.weight", h)};
         auto output = mix(blocks, x, &outputQuery, 1, c.eps, c.normValues);
         if (features) features->push_back(output);
+        if (!logits.p) return;
         Matrix last;
         if (batch.front().verify || batch.front().timeline) last = output;
         else if (batch.size() == 1)
@@ -1105,8 +1117,8 @@ class Decoder final : public Runtime {
                               cudaMemcpyHostToDevice, cudaStreamPerThread));
     }
     Matrix runTarget(const float *tokens, int count, const std::vector<Segment> &batch,
-                     const GenerationConfig &sampling, bool &sampledInGraph, std::vector<Matrix> *features = nullptr) {
-        if (!features && batch.size() == 1 && count == 1 && batch[0].request->length > 0) {
+                     const GenerationConfig &sampling, bool &sampledInGraph, std::vector<Matrix> *features = nullptr, bool needLogits = true) {
+        if (needLogits && !features && batch.size() == 1 && count == 1 && batch[0].request->length > 0) {
             auto &req = *batch[0].request;
             sampledInGraph = decodeGraph && ordinarySampling(sampling) && !sampling.IsSimpleGreedy();
             stageDecode(req, tokens[0], sampling, sampledInGraph, hostInput, hostVisits.data(), false);
@@ -1120,7 +1132,7 @@ class Decoder final : public Runtime {
         }
         Buffer<float> ids(count);
         check(cudaMemcpyAsync(ids.p, tokens, size_t(count) * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
-        Matrix logits(batch.size(), c.vocab);
+        Matrix logits(needLogits ? batch.size() : 0, c.vocab);
         target(ids.p, count, batch, logits, features);
         return logits;
     }
@@ -1177,6 +1189,12 @@ class Decoder final : public Runtime {
             auto &t = decoder.tickets[slot];
             check(cudaEventSynchronize(t.ready));
             pending[slot] = false;
+            auto &req = *static_cast<Request *>(context.pastKeyValues.front().first.kvStorageOwner.get());
+            const size_t committed = req.length - int(pending[1 - slot]);
+            if (req.prefixId && req.prefixTokens.size() + 1 == committed && context.allTokens.size() == committed) {
+                req.prefixTokens.push_back(context.allTokens.back());
+                if (!pending[1 - slot]) decoder.checkpointDecode(req);
+            }
             return {t.host->token};
         }
         void Drain() override {
@@ -1204,7 +1222,7 @@ class Decoder final : public Runtime {
     }
     Decoder(const Config &config, const Placement &p, basellm &owner,
             const std::map<std::string, TensorRange> &files)
-        : c(config), placement(p), model(owner), weights(owner.weight) {
+        : c(config), placement(p), model(owner), weights(owner.weight), prefixEnabled(owner.saveHistoryChat && RecurrentPrefixCacheEnabled()) {
         if (c.headDim > threads)
             throw std::runtime_error("Inkling attention head exceeds the native kernel width");
         check(cudaSetDevice(p.gpu));
@@ -1280,6 +1298,14 @@ class Decoder final : public Runtime {
         pending.pop_front();
         return true;
     }
+#include "prefix-forward.cuh"
+    void storeDraftFeatures(const std::vector<Segment> &batch, const std::vector<Matrix> &features, bool bf16) {
+        for (const auto &s : batch) if (s.request->draft) {
+            if (bf16) storeFeatures<__nv_bfloat16>(*s.request, features, s.offset, s.length);
+            else storeFeatures<half>(*s.request, features, s.offset, s.length);
+        }
+    }
+
     void warmupDecodeGraph() override {
         std::lock_guard<std::mutex> lock(mutex);
         check(cudaSetDevice(placement.gpu));
@@ -1412,19 +1438,24 @@ class Decoder final : public Runtime {
                 const int len = GetPageLen();
                 const auto &gen = sampling[b];
                 const int64_t prompt = std::max<int64_t>(gen.input_token_length,
-                        int64_t(lengths[b]) + std::max(0, gen.prefill_chunk_remaining));
+                        int64_t(past) + lengths[b] + std::max(0, gen.prefill_chunk_remaining));
                 const int64_t limit = gen.output_token_limit > 0
                     ? std::min<int64_t>(model.max_positions, prompt + gen.output_token_limit)
                     : model.max_positions;
                 req.limit = int(std::min<int64_t>(limit, tokenLimit > 0 ? tokenLimit : limit));
                 req.promptLength = int(prompt);
+                if (prefixEnabled) {
+                    req.prefixId = ++prefixSerial;
+                    req.nextDecodeCheckpoint = (prompt / len + 1) * len;
+                }
                 if (c.draft.steps && prompt <= c.draft.maxPositions - c.draft.block && speculativeSampling(gen)) {
-                    req.draft = std::make_unique<DraftState>();
+                    if (!req.draft) req.draft = std::make_unique<DraftState>();
                     Data draftDesc(FLOAT16, {c.draft.kvHeads, 1, c.draft.dim});
                     draftDesc.dataDevice = CUDA;
                     draftDesc.dataDeviceIds = {placement.gpu};
                     for (int l = 0; l < c.draft.layers; ++l) {
-                        auto owned = std::make_unique<DraftKV>();
+                        if (int(req.draft->kv.size()) <= l) req.draft->kv.push_back(std::make_unique<DraftKV>());
+                        auto &owned = req.draft->kv[l];
                         auto &v = owned->cache;
                         v.key = &owned->key;
                         v.value = &owned->value;
@@ -1443,10 +1474,17 @@ class Decoder final : public Runtime {
                                 pages = pages < 0 ? windowPages * maxBatch : std::min(pages, windowPages * maxBatch);
                         }
                         int count = int(std::min<int64_t>(pages, INT_MAX));
-                        v.attach(owned->key, pool, draftDesc, count);
-                        v.attach(owned->value, pool + 1, draftDesc, count);
+                        if (!req.restored || c.draft.local[l]) {
+                            v.attach(owned->key, pool, draftDesc, count);
+                            v.attach(owned->value, pool + 1, draftDesc, count);
+                        } else v.shift = pageShift(len);
                         v.reserveTable(int(std::min<int64_t>(perRequest, owned->key.pagedKVCacheData->maxPages)));
-                        req.draft->kv.push_back(std::move(owned));
+                        if (req.restored) {
+                            if (c.draft.local[l]) {
+                                v.prepare(past, c.draft.window);
+                                req.restored->draftWindows[l].transfer(v, true);
+                            } else v.syncTable();
+                        }
                     }
                 }
                 for (size_t slot = 0; slot < c.visits.size(); ++slot) {
@@ -1456,13 +1494,27 @@ class Decoder final : public Runtime {
                         const int64_t bounded = ((int64_t(c.window) + std::max(0, c.draft.block - 1) + len - 2) / len + 1) * model.maxBatch;
                         pages = int(std::min<int64_t>(bounded, pages > 0 ? pages : std::numeric_limits<int>::max()));
                     }
-                    v.attach(*v.key, int(2 * slot), desc, pages);
-                    v.attach(*v.value, int(2 * slot + 1), desc, pages);
+                    if (!req.restored || c.local[c.visits[slot]]) {
+                        v.attach(*v.key, int(2 * slot), desc, pages);
+                        v.attach(*v.value, int(2 * slot + 1), desc, pages);
+                    } else v.shift = pageShift(len);
                     // Reserve only page IDs. Physical KV pages remain demand-allocated.
                     int64_t slots = (limit + len - 1) / len;
                     if (c.local[c.visits[slot]])
                         slots = std::min(slots, (int64_t(c.window) + std::max(0, c.draft.block - 1) + len - 2) / len + 1);
                     v.reserveTable(int(std::min<int64_t>(slots, v.key->pagedKVCacheData->maxPages)));
+                    if (req.restored) {
+                        for (int j = 0; j < 4; ++j) v.convState[j] = req.restored->conv[slot][j].load();
+                        if (c.local[c.visits[slot]]) {
+                            v.prepare(past, c.window);
+                            req.restored->windows[slot].transfer(v, true);
+                        } else v.syncTable();
+                    }
+                }
+                if (req.restored) {
+                    if (req.draft) req.draft->recurrentContext = req.restored->draftContext.load();
+                    check(cudaStreamSynchronize(cudaStreamPerThread));
+                    req.restored.reset();
                 }
             }
             batch.push_back({&req, offset, lengths[b]});
@@ -1483,13 +1535,14 @@ class Decoder final : public Runtime {
         if (speculate)
             return bf16 ? verifyRound<__nv_bfloat16>(batch, values, sampling)
                         : verifyRound<half>(batch, values, sampling);
+        std::vector<float> suffix;
+        const bool checkpoint = prefixEnabled &&
+            std::any_of(batch.begin(), batch.end(), [](const Segment &s) { return s.request->length < s.request->promptLength; });
+        if (checkpoint && offset > 1) checkpointPrompt(values, batch, offset, sampling.front(), bf16, suffix);
         bool collect = std::any_of(batch.begin(),batch.end(),[](const Segment &s){return bool(s.request->draft);});
         std::vector<Matrix> features;
         auto out = runTarget(values, offset, batch, sampling.front(), sampledInGraph, collect ? &features : nullptr);
-        for (const auto &s : batch) if (s.request->draft) {
-            if (bf16) storeFeatures<__nv_bfloat16>(*s.request,features,s.offset,s.length);
-            else storeFeatures<half>(*s.request,features,s.offset,s.length);
-        }
+        storeDraftFeatures(batch, features, bf16);
         std::vector<int> result(batch.size());
         bool greedy = std::all_of(sampling.begin(), sampling.end(),
                                   [](const GenerationConfig &cfg) { return cfg.IsSimpleGreedy(); });
@@ -1527,7 +1580,13 @@ class Decoder final : public Runtime {
                     result[b] = LLMSampling(scores, 0, sampling.at(b),
                                             b < history.units.size() ? history.units[b] : LastTokensUnit{});
             }
-            req.length += lengths[b];
+            const auto &s = batch[b];
+            if (req.prefixId && size_t(req.length) == req.prefixTokens.size())
+                req.prefixTokens.insert(req.prefixTokens.end(), values + s.offset, values + s.offset + s.length);
+            req.length += s.length;
+            if (checkpoint && req.length <= req.promptLength && req.length % GetPageLen() == 0 &&
+                req.prefixTokens.size() == size_t(req.length)) savePrefix(req);
+            else checkpointDecode(req);
         }
         return result;
     }

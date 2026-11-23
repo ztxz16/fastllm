@@ -245,6 +245,17 @@ void Inkling2Model::OnModelWeightsLoaded() {
     throw std::runtime_error("Inkling 2 Mini requires a CUDA build");
 #endif
 }
+bool Inkling2Model::SetSaveHistoryChat(bool save) {
+    std::lock_guard<std::mutex> lock(dictLocker);
+    if (runtime) runtime->setPrefixCache(save);
+    return basellm::SetSaveHistoryChat(save);
+}
+int Inkling2Model::QueryPagedPrefixCacheExtra(ResponseContext *ctx, int limit) const {
+    return saveHistoryChat && runtime && ctx ? runtime->prefix(*ctx, limit, false) : 0;
+}
+bool Inkling2Model::RestorePagedPrefixCacheExtra(ResponseContext *ctx, int length) const {
+    return length > 0 && saveHistoryChat && runtime && ctx && runtime->prefix(*ctx, length, true) == length;
+}
 void Inkling2Model::WarmUp() {
     if (SupportsDecodePipeline())
         runtime->warmupDecodeGraph();

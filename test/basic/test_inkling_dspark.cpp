@@ -216,6 +216,43 @@ static void checkClippedRound(basellm &model, GenerationConfig sample, int steps
               << " round_graphs=" << verifyLaunches << std::endl;
 }
 
+// Replay the same proposal chain after restoring both target and draft state.
+static void checkDraftPrefix(basellm &model, GenerationConfig sample) {
+    const int page = GetPageLen();
+    const int length = std::max(1024, 2 * page) + page + 3;
+    std::vector<int> prompt(length);
+    for (int i = 0; i < length; ++i) prompt[i] = 320 + i % 31;
+    sample.input_token_length = length;
+    model.SetSaveHistoryChat(true);
+    std::vector<float> draftReference;
+    std::vector<std::vector<float>> targetReference;
+    for (int run = 0; run < 2; ++run) {
+        ResponseContext ctx;
+        ctx.pastKeyValues.resize(model.block_cnt);
+        ctx.currentTokens = prompt;
+        ctx.generationConfig = sample;
+        const int cached = model.RestorePDResidentPrefix(&ctx);
+        if (cached != (run ? (length - 1) / page * page : 0))
+            throw std::runtime_error("Unexpected Inkling DSpark prefix hit");
+        step(model, ctx, cached, ctx.currentTokens, sample);
+        keep = 3;
+        suffix = 0;
+        configure(1, 3, -1, true);
+        step(model, ctx, length, {235}, sample);
+        configure(0);
+        readScores(1, 7);
+        std::vector<float> draft(size_t(14) * testVocab);
+        if (cudaMemcpy(draft.data(), savedDraft, draft.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+            throw std::runtime_error("Failed to inspect restored draft");
+        if (run && (draft != draftReference || verifyScores != targetReference))
+            throw std::runtime_error("Restored Inkling draft or verification scores changed");
+        draftReference = std::move(draft);
+        targetReference = verifyScores;
+    }
+    model.SetSaveHistoryChat(false);
+    std::cout << "shared prefix: draft distributions and verification logits matched" << std::endl;
+}
+
 static void checkDraftBatch(basellm &model, GenerationConfig sample) {
     const int vocab = testVocab;
     std::vector<float> reference[2];
@@ -413,6 +450,7 @@ int main(int argc, char **argv) {
     checkClippedRound(*model, sample, 7, 2, graph, true);
     checkClippedRound(*model, sample, 7, maxTestBatch, graph);
     checkDraftBatch(*model, sample);
+    checkDraftPrefix(*model, sample);
     cudaFree(savedDraft);
     cudaFree(savedScores);
     cudaFree(control);

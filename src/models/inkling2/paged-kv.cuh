@@ -39,17 +39,23 @@ struct VisitCache {
                                               desc, -1, maxPages);
         if (mgr->dataType != desc.dataType || mgr->dims[2] != desc.dims[0] || mgr->dims[3] != desc.dims[2])
             throw std::runtime_error("Incompatible Inkling KV pool");
+        bind(dst, mgr, {});
+    }
+
+    void bind(Data &dst, PagedCacheManager *mgr, std::vector<int> pages) {
         dst.dataType = mgr->dataType;
         dst.UpdateUnitSize();
         dst.isKVCache = dst.isPagedKVCache = true;
         dst.pagedKVCacheData = mgr;
         dst.pageLen = mgr->pageLen;
         shift = pageShift(dst.pageLen);
-        dst.lastPageLen = 0;
+        dst.pageIndex = std::move(pages);
+        if (!dst.pageIndex.empty()) mgr->Pick(dst.pageIndex);
+        dst.lastPageLen = dst.pageIndex.empty() ? 0 : dst.pageLen;
         dst.dataDevice = mgr->dataDevice;
         dst.dataDeviceIds = mgr->dataDeviceIds;
         dst.expansionDims.clear();
-        dst.Resize({desc.dims[0], 0, desc.dims[2]});
+        dst.Resize({mgr->dims[2], int(dst.pageIndex.size()) * dst.pageLen, mgr->dims[3]});
     }
 
     void reserveTable(int n) {
@@ -57,6 +63,14 @@ struct VisitCache {
             table = Buffer<int2>(n);
             capacity = n;
         }
+    }
+
+    void syncTable() {
+        ids.resize(key->pageIndex.size());
+        reserveTable(int(ids.size()));
+        for (size_t i = 0; i < ids.size(); ++i) ids[i] = make_int2(key->pageIndex[i], value->pageIndex[i]);
+        if (!ids.empty()) check(cudaMemcpyAsync(table.p, ids.data(), ids.size() * sizeof(int2),
+                                               cudaMemcpyHostToDevice, cudaStreamPerThread));
     }
 
     void prepare(int end, int window) {
@@ -70,7 +84,7 @@ struct VisitCache {
             if (count > capacity) {
                 reserveTable(std::max(count, 2 * capacity));
             }
-            ids.resize(count);
+
             for (Data *side : {key, value}) side->pageIndex.reserve(count);
             try {
                 for (Data *side : {key, value}) {
@@ -97,10 +111,7 @@ struct VisitCache {
                     pages.pop_back();
                 }
             }
-            for (int i = 0; i < count; ++i)
-                ids[i] = make_int2(key->pageIndex[i], value->pageIndex[i]);
-            check(cudaMemcpyAsync(table.p, ids.data(), count * sizeof(int2), cudaMemcpyHostToDevice,
-                                  cudaStreamPerThread));
+            syncTable();
             first = next;
         }
         for (Data *side : {key, value}) {

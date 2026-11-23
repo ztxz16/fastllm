@@ -1647,6 +1647,8 @@ def make_normal_llm_model(args, startup_progress = None):
             architectures = config.get("architectures", [])
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
+            is_inkling_model = (architecture == "Inkling2LoopForConditionalGeneration" or
+                                model_type == "inkling2_loop")
             is_clover_model = model_type == "clover_moe"
             is_hy4_flash_model = model_type == "hy_v4_flash"
             is_naive_n05_model = _is_naive_n05_family(config)
@@ -1717,7 +1719,7 @@ def make_normal_llm_model(args, startup_progress = None):
                     speculative_algorithm = args.speculative_algorithm
                     _configure_dspark(args, dspark_tokens)
             if speculative_algorithm == "dspark":
-                if architecture == "Inkling2LoopForConditionalGeneration":
+                if is_inkling_model:
                     if speculative_draft_path:
                         raise ValueError("Inkling DSpark uses the checkpoint's embedded mtp.safetensors")
                     block = int(config.get("mtp_config", {}).get("block_size", 0))
@@ -1818,10 +1820,10 @@ def make_normal_llm_model(args, startup_progress = None):
                           text_model_type == 'step3p5')
             is_step3p7 = (architecture == 'Step3p7ForConditionalGeneration' or
                           model_type == 'step3p7')
+            if args.cache_history == "" and (is_moe_model or is_step3p5 or is_inkling_model):
+                args.cache_history = "true"
             if is_step3p5:
                 is_thread_tp_moe_model = True
-                if (args.cache_history == ""):
-                    args.cache_history = "true"
                 if (args.moe_device == "" and not(args.device and args.device != "")):
                     total_mem_gib = _total_memory_gib()
                     can_hold_cpu_moe = total_mem_gib >= 220.0
@@ -1875,8 +1877,6 @@ def make_normal_llm_model(args, startup_progress = None):
                     text_model_type == 'deepseek_v41_text'):
                 is_deepseek_v41_model = True
             if (is_moe_model):
-                if (args.cache_history == ""):
-                    args.cache_history = "true"
                 if ((not(args.device and args.device != ""))):
                     args.device = "cuda"
                     if (not user_set_moe_device):

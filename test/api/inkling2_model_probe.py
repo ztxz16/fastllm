@@ -8,7 +8,7 @@ from ftllm import llm
 from tokenizers import Tokenizer
 
 
-def generate(model, prompts, steps, vocab, sample=False):
+def generate(model, prompts, steps, vocab, sample=False, hits=None):
     lib = llm.fastllm_lib
     handles = []
     for ids in prompts:
@@ -24,6 +24,8 @@ def generate(model, prompts, steps, vocab, sample=False):
             token = lib.fetch_response_logits_llm_model(model.model, handle, buffer)
             if token == -1:
                 break
+            if not ids and hits is not None:
+                hits.append(model.get_response_statistics(handle)["cached_input_tokens"])
             assert token >= 0, token
             logits = np.ctypeslib.as_array(buffer).copy()
             assert 0 <= token < vocab and np.isfinite(logits).all()
@@ -42,6 +44,7 @@ def main():
     parser.add_argument("--window", action="store_true", help="Also exercise the 1024-token KV wrap")
     parser.add_argument("--graph", action="store_true", help="Capture the pure-GPU single-request decode graph")
     parser.add_argument("--sample", action="store_true", help="Use top-k/top-p sampling and verify the sampled prefix")
+    parser.add_argument("--prefix-cache", action="store_true", help="Check shared-prefix forks and cached logits")
     args = parser.parse_args()
     llm.set_cuda_graph(args.graph)
     llm.set_device_map({"cuda:0": 1})
@@ -74,6 +77,32 @@ def main():
         cosine = np.dot(decoded[1], prefetched[0]) / (np.linalg.norm(decoded[1]) * np.linalg.norm(prefetched[0]))
         assert cosine > 0.98, cosine
         print("window boundary cosine", cosine)
+    if args.prefix_cache:
+        # Different suffixes cross the sliding window; each fork needs private
+        # writable window pages and convolution state even when its global KV is shared.
+        length = model.config["text_config"]["sliding_window_size"] + 137
+        prefix = (prompts[0] * (length // len(prompts[0]) + 1))[:length]
+        forks = [prefix + p for p in prompts]
+        # Compare identical submission patterns. Single-row graph and batched
+        # eager decode have distinct arithmetic even with a cold cache.
+        for requests in ([forks[0]], forks):
+            model.set_save_history(False)
+            model.set_save_history(True)
+            cold_hits, hits = [], []
+            cold = generate(model, requests, 2, vocab, hits=cold_hits)
+            hot = generate(model, requests, 2, vocab, hits=hits)
+            assert 0 in cold_hits, cold_hits
+            for cached, (ids, a), (ref, b) in zip(hits, hot, cold):
+                assert 0 < cached <= length and ids == ref, (cached, ids, ref)
+                for actual, expected in zip(a, b):
+                    relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+                    print("cached fork", cached, "relative L2", float(relative_l2))
+                    assert relative_l2 < 0.01, relative_l2
+        model.set_save_history(False)
+        hits = []
+        generate(model, [forks[0]], 1, vocab, hits=hits)
+        assert hits == [0], hits
+        print("prefix cache fork logits matched")
     print(args.experts, "PASS")
 
 

@@ -230,10 +230,15 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
         auto *out = host.data() + i * p.chain;
         for (int j = 0; j <= accepted; ++j)
             if (out[j] < 0 || out[j] >= c.vocab) throw std::runtime_error("Invalid Inkling DSpark token");
+        if (req.prefixId && req.prefixTokens.size() == size_t(req.length)) {
+            req.prefixTokens.push_back(p.hostInputs[i].anchor);
+            req.prefixTokens.insert(req.prefixTokens.end(), out, out + accepted);
+        }
         req.length += accepted + 1;
         for (int l = 0; l < slots; ++l) req.visits[l].prepare(req.length, c.local[c.visits[l]] ? c.window : 0);
         for (int l = 0; l < c.draft.layers; ++l)
             state.kv[l]->cache.prepare(req.length, c.draft.local[l] ? c.draft.window : 0);
+        checkpointDecode(req);
         for (int j = 0; j < accepted; ++j) state.pending.emplace_back(out[j], out[j + 1]);
         result[i] = out[0];
         if (model.verbose) {
