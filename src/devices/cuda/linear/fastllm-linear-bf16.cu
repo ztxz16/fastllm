@@ -158,6 +158,12 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     __syncthreads();
 }
 
+#ifndef USE_ROCM
+void *FastllmCudaV41IndexHeadGemvKernel() {
+    return (void *)FastllmGemvBf16Bf16Kernel2MultiRow<256, 6>;
+}
+#endif
+
 // At K=256, one warp computes each dot with the original compensated
 // reduction. Tiling output rows reuses its input vector without changing
 // the per-lane products or BF16 rounding.

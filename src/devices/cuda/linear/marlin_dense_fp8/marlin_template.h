@@ -1693,7 +1693,7 @@ __global__ void Marlin(
     constexpr int th_size = thread_m_blocks * 8;
     // A stripe can split its starting and ending columns. A partial starting
     // at K=0 uses slot 1; a partial starting inside a column uses slot 0.
-    const int own_slot = 2 * blockIdx.x + (slice_row == 0);
+    const int own_slot = verify_qkv ? blockIdx.x : 2 * blockIdx.x + (slice_row == 0);
     if (threadIdx.x < active_threads) {
       int4* fragments = reinterpret_cast<int4*>(&frag_c);
       #pragma unroll
@@ -1702,7 +1702,9 @@ __global__ void Marlin(
     }
     // Publish every writer before the CTA leader's release. The acquire chain
     // on this counter and the following CTA barrier make all partials visible.
-    __threadfence();
+    // The CTA barrier orders all partial stores before the leader's GPU
+    // release. Last arrival acquires the chain before exposing it to its CTA.
+    if constexpr (!verify_qkv) __threadfence();
     __syncthreads();
     __shared__ int reduce_last;
     if (threadIdx.x == 0) {
@@ -1716,20 +1718,40 @@ __global__ void Marlin(
     if (!last_arrival) return false;
     if (threadIdx.x < active_threads) {
       int4* fragments = reinterpret_cast<int4*>(&frag_c);
-      const int column_start = slice_col_par * k_tiles;
-      const int first_block = column_start / iters;
-      const int last_block = div_ceil(column_start + k_tiles, iters) - 1;
-      for (int block = last_block; block >= first_block; --block) {
-        const int slot = 2 * block + (block * iters <= column_start);
+      if constexpr (verify_qkv) {
+        // The ten K stripes are contiguous and never span two output tiles.
+        // Load independent stripes ahead of their ordered FP32 additions.
+        const int first = (blockIdx.x / 10) * 10;
         #pragma unroll
         for (int k = 0; k < th_size; k += 2) {
-          int4 partial = C_tmp[slot * c_size + active_threads * k + threadIdx.x];
-          if (block == last_block) fragments[k] = partial;
-          else {
-            float* sum = reinterpret_cast<float*>(&fragments[k]);
-            const float* add = reinterpret_cast<const float*>(&partial);
+          const int offset = active_threads * k + threadIdx.x;
+          int4 sum = C_tmp[(first + 9) * c_size + offset];
+          #pragma unroll
+          for (int j = 8; j >= 0; --j) {
+            const int4 v = C_tmp[(first + j) * c_size + offset];
             #pragma unroll
-            for (int f = 0; f < 4; ++f) sum[f] = __fadd_rn(add[f], sum[f]);
+            for (int f = 0; f < 4; ++f)
+              reinterpret_cast<float*>(&sum)[f] = __fadd_rn(reinterpret_cast<const float*>(&v)[f],
+                                                            reinterpret_cast<float*>(&sum)[f]);
+          }
+          fragments[k] = sum;
+        }
+      } else {
+        const int column_start = slice_col_par * k_tiles;
+        const int first_block = column_start / iters;
+        const int last_block = div_ceil(column_start + k_tiles, iters) - 1;
+        for (int block = last_block; block >= first_block; --block) {
+          const int slot = 2 * block + (block * iters <= column_start);
+          #pragma unroll
+          for (int k = 0; k < th_size; k += 2) {
+            int4 partial = C_tmp[slot * c_size + active_threads * k + threadIdx.x];
+            if (block == last_block) fragments[k] = partial;
+            else {
+              float* sum = reinterpret_cast<float*>(&fragments[k]);
+              const float* add = reinterpret_cast<const float*>(&partial);
+              #pragma unroll
+              for (int f = 0; f < 4; ++f) sum[f] = __fadd_rn(add[f], sum[f]);
+            }
           }
         }
       }

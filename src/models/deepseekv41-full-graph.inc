@@ -201,7 +201,7 @@ struct V41FullGraph {
     std::vector<int> rankMoeFirstLayer;
     Data routedOutput;
     std::unique_ptr<DiskMoeV41Graph> diskMoe;
-    Data inputIds, embedding, deferredHcMix;
+    Data inputIds, embedding, deferredHcMix, indexHeadWeights;
     std::vector<std::unique_ptr<Data>> ownerInputIds;
     std::vector<std::vector<int>> ownerHostIds;
     const void *embeddingWeightAddress = nullptr;
@@ -857,7 +857,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     if (useCluster || FastllmV41HcEnabledAtRows("FASTLLM_DSV41_HC_OVERLAP", m))
                         reserve(a->mixScratch, FLOAT32, {m, 8, 25});
                     if (a->mixScratch.cudaData && embed_dim == 5120 && hc_mult == 4 &&
-                        useCluster && !verifying)
+                        useCluster && (!verifying || m == 6))
                         a->clusterMix = FastllmCudaV41CreateOwnerStream(m);
                     g->ownerFfn[rank] = std::move(a);
                 });
@@ -1493,7 +1493,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                     packetReady = FastllmDsv41PackLocalInput(g->ownerExperts[l][rank], a->input.cudaData, m);
                                 auto &rw = w(".ffn.gate.weight"), &bias = w(".ffn.gate.bias");
                                 if (packetReady) packet = FastllmDsv41OwnerInputPacket(g->ownerExperts[l][rank], m);
-                                if ((packetReady || mixReady) && packet.routeIds && m >= 16)
+                                if ((packetReady || mixReady) && packet.routeIds && (m == 6 || m >= 16))
                                     routesReady = FastllmCudaV41OwnerRouterPacket(a->input,rw,bias,gate_temp,
                                         routed_scaling_factor,a->logits,a->ids,a->scores,packet);
                                 if (!routesReady && !FastllmCudaV41OwnerRouterSelect(a->input,rw,bias,gate_temp,routed_scaling_factor,
@@ -1684,13 +1684,13 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                 "full graph initial metadata rejected");
             });
             auto captureAttention = [&](bool allIndices) {
-                const bool publish = allIndices &&
+                const bool publish = (allIndices || verifying) &&
                     std::all_of(layer.plans.begin(), layer.plans.end(), FastllmCudaV41CanPublishSource);
                 capture([&] {
                     V41FullDispatch(*g, [&](int rank, int) {
                         auto *plan = layer.plans[rank];
-                        const bool prepared = allIndices ? FastllmCudaV41PrepareAllIndices(plan, publish) :
-                                                          FastllmCudaV41PrepareFullDecode(plan);
+                        const bool prepared = publish ? FastllmCudaV41PrepareSource(plan, allIndices) :
+                            allIndices ? FastllmCudaV41PrepareAllIndices(plan, false) : FastllmCudaV41PrepareFullDecode(plan);
                         AssertInFastLLM(prepared, "full graph prepare failed");
                     });
                     if (layer.config.kvSource && layer.config.indexSource) {
@@ -1700,7 +1700,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     }
                     V41FullDispatch(*g, [&](int rank, int) {
                         auto *plan = layer.plans[rank];
-                        const bool finished = publish ? FastllmCudaV41FinishSource(plan) :
+                        const bool finished = publish ? FastllmCudaV41FinishSource(plan, allIndices) :
                             allIndices ? FastllmCudaV41FinishAllIndices(plan) : FastllmCudaV41FinishFullDecode(plan);
                         AssertInFastLLM(finished, "full graph attention failed");
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
@@ -1748,16 +1748,31 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     if (g->deferredHcMix.dims.empty())
                         alloc(g->deferredHcMix, FLOAT32, {batch * 8 * 25});
                     FastllmCudaSetDevice(g->devices.front());
-                    if (void *fork = FastllmCudaV41ForkOwnerMixQuery(input.data(), input.size(), batch,
-                            static_cast<float *>(g->deferredHcMix.cudaData), nullptr, nullptr, &g->attentionMixGemm, g->layers[l]->config.indexSource)) {
+                    auto &layer = *g->layers[l];
+                    auto *mix = static_cast<float *>(g->deferredHcMix.cudaData);
+                    void *fork = nullptr;
+                    if (verifying && batch == 6 && layer.config.indexSource && layer.config.indexHeads == 32) {
+                        if (g->indexHeadWeights.dims.empty())
+                            alloc(g->indexHeadWeights, BFLOAT16, {batch, layer.config.indexHeads});
+                        fork = FastllmCudaV41ForkIndexProjections(input.data(), input.size(), prelude.graphs[0],
+                            prelude.indexProjectionNodes, layer.plans[0], g->indexHeadWeights.cudaData, mix, &g->attentionMixGemm);
+                    }
+                    if (!fork)
+                        fork = FastllmCudaV41ForkOwnerMixQuery(input.data(), input.size(), batch, mix, nullptr, nullptr,
+                                                              &g->attentionMixGemm, layer.config.indexSource);
+                    if (fork) {
                         g->splitAttentionChildren.push_back(fork);
                         // Both versions must have exactly the same mHC dependency and FP32 reduction.
                         if (input.size() > 1 && g->allIndexChildren.count(input[1])) {
                             auto alternative = input;
                             auto replacement = g->allIndexChildren.at(input[1]);
                             alternative[1] = replacement.second;
-                            auto prefixGraph = prelude.indexProjectionNodes.empty() ? nullptr :
-                                FastllmCudaV41WithoutIndexProjections(prelude.graphs[0], prelude.indexProjectionNodes);
+                            void *prefixGraph = nullptr;
+                            if (verifying && prelude.compressorInput && prelude.beforeCompressor)
+                                prefixGraph = FastllmCudaV41GraphPrefix(prelude.graphs[0], prelude.beforeIndexProjection,
+                                    prelude.compressorInput, prelude.beforeCompressor);
+                            if (!prefixGraph && !prelude.indexProjectionNodes.empty())
+                                prefixGraph = FastllmCudaV41WithoutIndexProjections(prelude.graphs[0], prelude.indexProjectionNodes);
                             if (V41DecodeCudaGraphVerbose() && batch >= 16 && g->devices.front() == 0)
                                 printf("[Fastllm] short index prelude layer=%d rows=%d projection_nodes=%zu trimmed=%d frontier=%d\n",
                                     l, batch, prelude.indexProjectionNodes.size(), int(prefixGraph != nullptr),

@@ -240,17 +240,17 @@ template<int Stages> static KernelFn VerifyQkvProjection() {
 // reduction tile alias; scales and the four-stage A pipeline follow them.
 // Reserving the device's entire shared memory prevents other graph branches
 // from occupying the same SM even when most of that reservation is unused.
-static int Bf16Mxfp8SharedBytes(int rows, int tile) {
+static int Bf16Mxfp8SharedBytes(int rows, int tile, int stages = 4) {
     const int threadN = tile == 1 ? 64 : 128;
     const int threadK = tile == 0 ? 64 : 128;
     const int mBlocks = rows <= 8 ? 1 : std::min(4, (rows + 15) / 16);
     const int tileM = rows <= 8 ? 8 : 16 * mBlocks;
-    const int bPipeline = 4 * threadN * threadK;
+    const int bPipeline = stages * threadN * threadK;
     const int reduction = (2 * (threadN / 16) + 1) * 16 * mBlocks * 16;
     const int bReductionBias = std::max(std::max(bPipeline, reduction),
         std::min(bPipeline, reduction) + threadN * 2);
-    const int scales = 4 * (threadK / 32) * threadN;
-    const int aPipeline = 4 * tileM * threadK * 2;
+    const int scales = stages * (threadK / 32) * threadN;
+    const int aPipeline = stages * tileM * threadK * 2;
     return bReductionBias + scales + aPipeline;
 }
 
@@ -765,7 +765,7 @@ static bool BFloat16MXFP8Gemm(
     const int tile = columns % 128 != 0 ? 1 : 0;
     // Configure every tail specialization before entering a capture. A later
     // prefill may have a different tail, but the captured scratch never moves.
-    static thread_local std::set<int> prepared;
+    static thread_local std::map<int, bool> prepared;
     if (!prepared.count(device)) {
         cudaStreamCaptureStatus capture;
         if (cudaStreamIsCapturing(cudaStreamPerThread, &capture) != cudaSuccess ||
@@ -790,7 +790,15 @@ static bool BFloat16MXFP8Gemm(
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     Bf16Mxfp8SharedBytes(8, 2)) != cudaSuccess) return false;
         }
-        prepared.emplace(device);
+        bool verifyEightStages = false;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (arch == 103 && sms == 148 && Bf16Mxfp8SharedBytes(6, 0, 8) <= shared) {
+            verifyEightStages = cudaFuncSetAttribute(VerifyQkvProjection<8>(),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, Bf16Mxfp8SharedBytes(6, 0, 8)) == cudaSuccess;
+            if (!verifyEightStages) cudaGetLastError();
+        }
+#endif
+        prepared.emplace(device, verifyEightStages);
     }
     for (int row = 0; row < rows;) {
         int count = rows - row;
@@ -810,7 +818,7 @@ static bool BFloat16MXFP8Gemm(
         const bool parallelReduce = !floatOutput && count <= 8 && inner >= 512 &&
                                     columns / threadN <= sms / 4;
         KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile, parallelReduce, floatOutput);
-        const int launchShared = Bf16Mxfp8SharedBytes(count, chunkTile);
+        int launchShared = Bf16Mxfp8SharedBytes(count, chunkTile);
         if (launchShared > shared) return false;
         dim3 grid(sms);
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
@@ -818,7 +826,13 @@ static bool BFloat16MXFP8Gemm(
             kernel = VerifyQueryProjection<4>();
             grid.y = 2;
         } else if (arch == 103 && sms == 148 && rows == 6 && columns == 1792 && inner == 5120 && !floatOutput) {
-            kernel = VerifyQkvProjection<4>();
+            if (prepared.at(device)) {
+                // All eight 64-K tiles in a stripe can be in flight together.
+                kernel = VerifyQkvProjection<8>();
+                launchShared = Bf16Mxfp8SharedBytes(6, 0, 8);
+            } else {
+                kernel = VerifyQkvProjection<4>();
+            }
         }
 #endif
         kernel<<<grid, chunkTile == 2 ? 256 : 128, launchShared, cudaStreamPerThread>>>(

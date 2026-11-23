@@ -70,12 +70,18 @@ __device__ __forceinline__ void PostNormBody(const Pair *attention, const Pair *
     residual += size_t(row) * 4 * width; hidden += size_t(row) * 4 * width;
     const int route = Experts ? (PackedOrder ? boundary.ids[row] : FastllmV41RouteOrder(boundary.ids + row * 6)) : 0;
     float2 normWeight[3];
-    if constexpr (MoeInput) {
+    if constexpr (MoeInput || (PackedOrder && Experts)) {
 #pragma unroll
         for (int k = 0; k < 3; ++k) {
             const int d = tid + k * 1024;
-            if (d < width)
-                asm volatile("ld.global.v2.f32 {%0,%1}, [%2];" : "=f"(normWeight[k].x), "=f"(normWeight[k].y) : "l"(weight + 2 * d));
+            if (d < width) {
+                if constexpr (MoeInput)
+                    asm volatile("ld.global.v2.f32 {%0,%1}, [%2];" : "=f"(normWeight[k].x), "=f"(normWeight[k].y) : "l"(weight + 2 * d));
+                else {
+                    asm volatile("ld.global.f32 %0, [%1];" : "=f"(normWeight[k].x) : "l"(weight + 2 * d));
+                    asm volatile("ld.global.f32 %0, [%1];" : "=f"(normWeight[k].y) : "l"(weight + 2 * d + 1));
+                }
+            }
         }
     }
     float2 saved[3];
@@ -140,8 +146,8 @@ __device__ __forceinline__ void PostNormBody(const Pair *attention, const Pair *
     for (int k = 0; k < 3; ++k) {
         const int d = tid + k * 1024;
         if (d < width) {
-            const Pair value = __floats2bfloat162_rn(saved[k].x * scale * (MoeInput ? normWeight[k].x : weight[2 * d]),
-                                                     saved[k].y * scale * (MoeInput ? normWeight[k].y : weight[2 * d + 1]));
+            const Pair value = __floats2bfloat162_rn(saved[k].x * scale * ((MoeInput || PackedOrder) ? normWeight[k].x : weight[2 * d]),
+                                                     saved[k].y * scale * ((MoeInput || PackedOrder) ? normWeight[k].y : weight[2 * d + 1]));
             if constexpr (WriteNorm) normalized[row * width + d] = value;
             if constexpr (MoeInput) {
                 const auto v = __bfloat1622float2(value);
@@ -199,6 +205,8 @@ __global__ __launch_bounds__(256) void ExpertResidualNorm(
                                             hidden, normalized, boundary);
 }
 
+#include "deepseekv41-verify-post.cuh"
+
 // Same square-sum tree and high/low BF16 dot addition as V41HcJoinTensorDots.
 __global__ void TensorSinkhorn(const Bf *x, const float *projected, const float *scale,
         const float *base, int iterations, float mixEps, float normEps, float *pre, float *post, float *comb) {
@@ -233,6 +241,7 @@ struct StreamPlan {
     int blocks = 4;
     fastllm_v41_hc_graph::OwnerMixGemm gemm;
     cudaEvent_t ready = nullptr, done = nullptr;
+    bool verifyPacket = false;
     ~StreamPlan() {
         if (done) cudaEventDestroy(done);
         if (ready) cudaEventDestroy(ready);
@@ -267,6 +276,7 @@ void *FastllmCudaV41CreateOwnerStream(int rows) {
         else
             cudaGetLastError();
     }
+    p->verifyPacket = rows == 6 && p->packetCluster8 && VerifyPostCluster((const void *)VerifyPostPacket);
     if (cudaGetDevice(&p->device) != cudaSuccess || !p->gemm.Prepare(rows >= 16) ||
         cudaEventCreateWithFlags(&p->ready, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&p->done, cudaEventDisableTiming) != cudaSuccess) {
@@ -314,7 +324,13 @@ void *FastllmCudaV41OwnerClusterPacket(void *plan, int rows, float *scratch,
         attr.val.clusterDim.x = 8;
         cfg.gridDim.x = 8;
         cfg.blockDim.x = 128;
-        check(cudaLaunchKernelEx(&cfg, PostNormPacket, (const Pair *)attention.cudaData,
+        auto packetKernel = PostNormPacket;
+        if (p.verifyPacket && VerifyPostAligned({attention.cudaData, residual.cudaData, weight.cudaData,
+                                                  hidden.cudaData, normalized.cudaData, packet->codes})) {
+            cfg.blockDim.x = 192;
+            packetKernel = VerifyPostPacket;
+        }
+        check(cudaLaunchKernelEx(&cfg, packetKernel, (const Pair *)attention.cudaData,
             (const Pair *)residual.cudaData, (const float *)oldPost.cudaData, (const float *)oldComb.cudaData,
             (const float *)oldPre.cudaData, (const float *)weight.cudaData, normEps, (Pair *)hidden.cudaData,
             (Pair *)normalized.cudaData, *packet));
@@ -335,14 +351,20 @@ void *FastllmCudaV41OwnerClusterPacket(void *plan, int rows, float *scratch,
             (float *)pre.cudaData, (float *)post.cudaData, (float *)comb.cudaData);
     } else {
         cudaKernelNodeParams dots{};
-        if (V41SelectStagedDots(rows, dots)) {
+        // Six rows expose all 25 dot products in a single grid. The kernel
+        // preserves the per-lane FMA order and sums the eight warps in order.
+        if (rows == 6) {
+            V41HcDecodeDotsTiled<40><<<dim3(25, rows), kHcThreads, 0, p.gemm.stream>>>(
+                (const Bf *)hidden.cudaData, (const float *)fn.cudaData, 20480, scratch);
+        } else if (V41SelectStagedDots(rows, dots)) {
             void *args[] = {&hidden.cudaData, &fn.cudaData, &scratch};
             check(cudaLaunchKernel(dots.func, dots.gridDim, dots.blockDim, args, 0, p.gemm.stream));
         } else {
             V41HcWarpDots5120<<<dim3(25, rows, 8), 32, 0, p.gemm.stream>>>(
                 (const Bf *)hidden.cudaData, (const float *)fn.cudaData, scratch);
         }
-        fastllm_v41_hc_graph::FinishOwnerMix<8><<<rows, 32, 0, p.gemm.stream>>>(scratch,
+        auto finish = rows == 6 ? fastllm_v41_hc_graph::FinishOwnerMix<1> : fastllm_v41_hc_graph::FinishOwnerMix<8>;
+        finish<<<rows, 32, 0, p.gemm.stream>>>(scratch,
             (const float *)scale.cudaData, (const float *)base.cudaData, iterations, mixEps, normEps,
             (float *)pre.cudaData, (float *)post.cudaData, (float *)comb.cudaData);
     }

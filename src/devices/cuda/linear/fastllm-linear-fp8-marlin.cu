@@ -13,6 +13,9 @@
 #include "fastllm-cublas-prefill.cuh"
 #include "devices/cuda/fastllm-cuda-fp8.h"
 #include "fastllm-fp8-marlin-gemv.cuh"
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+#include "fastllm-verify-qkv.cuh"
+#endif
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -45,6 +48,7 @@ struct BFloatFp8Auxiliary {
     int device = -1;
     void *packed = nullptr, *scales = nullptr, *locks = nullptr, *dequantized = nullptr;
     size_t dequantizedBytes = 0;
+    void *verifyPanel = nullptr;
 };
 struct BFloatFp8AuxiliaryRegistry {
     std::mutex mutex;
@@ -680,6 +684,11 @@ extern "C" bool FastllmCudaPrepareMarlinBFloat16FP8(fastllm::Data &weight,
             FastllmCudaClearThreadError();
             return false;
         }
+        void *verifyPanel = nullptr;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (arch == 103 && sms == 148 && columns == fastllm_verify_qkv::Columns && inner == fastllm_verify_qkv::Inner)
+            verifyPanel = fastllm_verify_qkv::Prepare(packed);
+#endif
         if (weight.extraCudaData.size() <= locksIndex)
             weight.extraCudaData.resize(locksIndex + 1, nullptr);
         weight.extraCudaData[packedIndex] = packed;
@@ -687,7 +696,7 @@ extern "C" bool FastllmCudaPrepareMarlinBFloat16FP8(fastllm::Data &weight,
         weight.extraCudaData[locksIndex] = locks;
         auto &registry = BFloatFp8Registry();
         std::lock_guard<std::mutex> lock(registry.mutex);
-        registry.weights[&weight] = {device, packed, deviceScales, locks, nullptr, 0};
+        registry.weights[&weight] = {device, packed, deviceScales, locks, nullptr, 0, verifyPanel};
     }
     return true;
 }
@@ -697,6 +706,19 @@ static bool TryMarlinBFloat16MatMulFP8E4M3(
         int rows, int inner, int columns, bool floatOutput) {
     constexpr int packedIndex = 4, scalesIndex = 5, locksIndex = 6;
     if (!FastllmCudaPrepareMarlinBFloat16FP8(weight, rows, inner, columns)) return false;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    if (!floatOutput && rows == fastllm_verify_qkv::Rows && columns == fastllm_verify_qkv::Columns &&
+        inner == fastllm_verify_qkv::Inner) {
+        auto &registry = BFloatFp8Registry();
+        void *panel = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            auto it = registry.weights.find(&weight);
+            if (it != registry.weights.end()) panel = it->second.verifyPanel;
+        }
+        if (panel && fastllm_verify_qkv::Run(input, panel, weight.extraCudaData[scalesIndex], output)) return true;
+    }
+#endif
     if (floatOutput) return FastllmCudaMarlinBFloat16MXFP8GemmToFloat(input,
         (const uint32_t *)weight.extraCudaData[packedIndex],
         (const uint8_t *)weight.extraCudaData[scalesIndex], (float *)output,
@@ -1076,6 +1098,7 @@ extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (panelWeight) checkCudaErrors("Release MXFP8 output panels", cudaFree(panelWeight));
     if (blockScales) checkCudaErrors("Release MXFP8 block scales", cudaFree(blockScales));
     if (rowScales) checkCudaErrors("Release MXFP8 weight scales", cudaFree(rowScales));
+    if (owned.verifyPanel) FastllmCudaDirectFree(owned.verifyPanel);
     void *pointers[] = {owned.packed, owned.scales, owned.locks, owned.dequantized};
     for (int i = 0; i < 4; ++i) {
         if (pointers[i]) FastllmCudaDirectFree(pointers[i]);

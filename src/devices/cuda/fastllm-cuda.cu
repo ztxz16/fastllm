@@ -2511,6 +2511,13 @@ __global__ void FastllmMulKernel(float* a, float *b, float v, int len) {
     }
 }
 
+#ifndef USE_ROCM
+void FastllmCudaV41IndexWeightKernels(void *&convert, void *&multiply) {
+    convert = (void *)FastllmCudaBF162FloatKernel;
+    multiply = (void *)static_cast<void (*)(float *, float *, float, int)>(FastllmMulKernel);
+}
+#endif
+
 __global__ void FastllmMulKernel(half* a, half *b, half v, int len) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     if (idx < len) {
