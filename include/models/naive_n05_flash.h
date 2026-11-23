@@ -522,7 +522,7 @@ namespace fastllm {
                                     int rank, int rows);
         bool PrepareDraftBatchLocal(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
         bool PrepareDraftBatchGraph(const std::vector<DraftRound *> &rounds, const Data &baseLogits,
-                                   int rank, int reserveRows = 0);
+                                   int rank, int reserveRows = 0, bool warmGrammar = false);
         bool PrepareFusedDraftProposal(const std::vector<DraftRound *> &rounds, const Data &hidden);
         void JoinDraftVerification(TargetCapture &capture);
         bool RunDraftLowLatencyBatch(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts, Data &normalized);

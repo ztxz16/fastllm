@@ -26719,11 +26719,15 @@ void FastllmCudaTokenConstraintAdvance(void *handle, int step, float *tokens, bo
     checkCudaErrors("Constraint advance", cudaGetLastError());
 }
 void FastllmCudaTokenConstraintApply(void *handle, float *logits, int steps) {
+    FastllmCudaTokenConstraintApplySpan(handle, logits, steps, 0, static_cast<TokenConstraintBatch *>(handle)->count);
+}
+void FastllmCudaTokenConstraintApplySpan(void *handle, float *logits, int steps, int first, int rows) {
     auto &b = *static_cast<TokenConstraintBatch *>(handle);
-    fastllm::AssertInFastLLM(steps >= 0 && steps <= b.steps, "Constraint verification out of bounds.");
-    TokenConstraintApplyKernel<<<dim3(((b.vocab + 31) / 32 + 255) / 256, b.count * (steps + 1)), 256, 0, cudaStreamPerThread>>>(
-        (TokenConstraintDeviceView *)b.descriptors.cudaData, (int *)b.states.cudaData,
-        logits, b.count, steps, b.capacity, b.vocab);
+    fastllm::AssertInFastLLM(steps >= 0 && steps <= b.steps && first >= 0 && rows > 0 && rows <= b.count - first,
+        "Constraint verification span out of bounds.");
+    TokenConstraintApplyKernel<<<dim3(((b.vocab + 31) / 32 + 255) / 256, rows * (steps + 1)), 256, 0, cudaStreamPerThread>>>(
+        (TokenConstraintDeviceView *)b.descriptors.cudaData + first, (int *)b.states.cudaData + first,
+        logits, rows, steps, b.capacity, b.vocab);
     checkCudaErrors("Constraint verification mask", cudaGetLastError());
 }
 

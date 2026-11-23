@@ -13,6 +13,7 @@
 #include <cstring>
 #include <numeric>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
@@ -184,6 +185,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
         bool disabled = false;
         float *hostIds = nullptr;
         void *idsReady = nullptr;
+        void PrepareConstraintRows(const std::vector<DraftRound *> &rounds, int vocab);
         void ProjectMarkovStep(int step, Data &embedding, Data &projection, bool needLatent) {
             Data tokens(FLOAT32, {1, rows});
             tokens.FakeFrom(ids, size_t(step) * rows * sizeof(float));
@@ -4218,12 +4220,28 @@ void NaiveN05FlashModel::PrepareDraftSamplingMemory(int count, int steps, int vo
 #endif
 }
 
+#ifdef USE_CUDA
+void NaiveN05FlashModel::DraftWorkspace::SamplingProposal::PrepareConstraintRows(
+        const std::vector<DraftRound *> &rounds, int vocab) {
+    // Replay replaces the entire bucket, including unrestricted and padding rows.
+    std::vector<std::shared_ptr<const TokenConstraintProgram>> programs(rows);
+    std::vector<int> states(rows);
+    for (size_t i = 0; i < rounds.size(); ++i) {
+        const auto &round = *rounds[i];
+        if (!round.config.tool_call_grammar) continue;
+        auto config = round.config;
+        round.model.PrepareToolCallConstraint(config);
+        std::tie(programs[i], states[i]) = config.tool_call_grammar->Compile(config.tool_call_grammar_state);
+    }
+    FastllmCudaPrepareTokenConstraintBatch(constraints.get(), programs, states, vocab);
+}
+#endif
+
 bool NaiveN05FlashModel::PrepareDraftBatchGraph(
-        const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank, int reserveRows) {
+        const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank, int reserveRows, bool warmGrammar) {
 #ifdef USE_CUDA
     const int live = rounds.size(), vocab = baseLogits.dims.back();
-    const bool bucketed = draftTP && draftTP->dataParallel && !draftConfidenceThreshold &&
-        std::none_of(rounds.begin(), rounds.end(), [](const DraftRound *r) { return bool(r->config.tool_call_grammar); });
+    const bool bucketed = draftTP && draftTP->dataParallel && !draftConfidenceThreshold;
     const int count = bucketed ? DraftGraphBucket(std::max(reserveRows, live),
         WindowRequestsPerGroup(maxBatch > 0 ? maxBatch : 512, draftTP->devices.size())) : live;
     const int steps = bucketed ? std::min(draftTokens, draftBlock) : rounds.front()->limit;
@@ -4232,7 +4250,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
     if (!GetFastllmEnv().cudaGraph || steps < 1 || vocab <= 0 || steps > INT_MAX / vocab ||
         baseLogits.dims[1] != baseRows || vocab >= (1 << 24)) return false;
     std::vector<float> temperatures;
-    bool constrained = false;
+    bool constrained = warmGrammar;
     for (auto &owner : rounds) {
         const auto &r = *owner;
         if ((bucketed ? (r.limit <= 0 || r.limit > steps) : r.limit != steps) || DraftIsGreedy(r.config) || r.config.output_token_least > 0 ||
@@ -4316,19 +4334,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
     if (!bucketed && variants.size() > 4) variants.erase(variants.begin());
     auto &p = state->sampling;
     if (p.disabled || (!p.graphs.front().exec && !preparingGraphs)) return false;
-    if (constrained) {
-        std::vector<std::shared_ptr<const TokenConstraintProgram>> programs;
-        std::vector<int> states;
-        for (auto &r : rounds) {
-            if (r->config.tool_call_grammar) {
-                auto config = r->config;
-                PrepareToolCallConstraint(config);
-                auto compiled = config.tool_call_grammar->Compile(config.tool_call_grammar_state);
-                programs.push_back(compiled.first); states.push_back(compiled.second);
-            } else { programs.push_back(nullptr); states.push_back(0); }
-        }
-        FastllmCudaPrepareTokenConstraintBatch(p.constraints.get(), programs, states, vocab);
-    }
+    if (constrained) p.PrepareConstraintRows(rounds, vocab);
     temperatures.resize(count, 1.0f);
     p.base.FakeFrom(*base, 0); p.base.Resize(base->dims);
     std::vector<float> anchors;
@@ -4454,19 +4460,7 @@ bool NaiveN05FlashModel::PrepareLowLatencyProposalGraph(
     }
     auto &p = state->sampling;
     if (p.disabled || (!p.graphs.front().exec && !preparingGraphs)) return false;
-    if (constrained) {
-        std::vector<std::shared_ptr<const TokenConstraintProgram>> programs;
-        std::vector<int> states;
-        for (auto &r : rounds) {
-            if (r->config.tool_call_grammar) {
-                auto config = r->config;
-                PrepareToolCallConstraint(config);
-                auto compiled = config.tool_call_grammar->Compile(config.tool_call_grammar_state);
-                programs.push_back(compiled.first); states.push_back(compiled.second);
-            } else { programs.push_back(nullptr); states.push_back(0); }
-        }
-        FastllmCudaPrepareTokenConstraintBatch(p.constraints.get(), programs, states, vocab);
-    }
+    if (constrained) p.PrepareConstraintRows(rounds, vocab);
     std::vector<int> topKs(count, 0);
     std::vector<float> topPs(count, 1.f);
     // Temperatures are replay inputs; only the shape selects a graph variant.
@@ -4914,16 +4908,29 @@ void NaiveN05FlashModel::PrepareDraftAcceptanceLocal(const std::vector<DraftRoun
     std::vector<int> offsets;
     std::map<std::pair<bool, int>, std::vector<int>> groups;
     auto owner = rounds.front()->proposalOwner;
-    const bool deviceMasks = owner && owner->sampling.constrained && owner->sampling.rows == (int)rounds.size() &&
-        owner->sampling.steps == steps && std::all_of(rounds.begin(), rounds.end(), [&](const auto &r) {
-            return r->proposalOwner == owner && (int)r->proposed.size() == steps;
-        });
-    if (deviceMasks) FastllmCudaTokenConstraintApply(owner->sampling.constraints.get(), (float *)logits.cudaData, steps);
+    const bool deviceMasks = owner && owner->sampling.constrained &&
+        std::all_of(rounds.begin(), rounds.end(), [&](const auto *r) { return r->proposalOwner == owner; });
+    int maskedUntil = 0;
     int offset = 0;
     for (int i = 0; i < (int)rounds.size(); ++i) {
         auto &r = *rounds[i]; offsets.push_back(offset); offset += verifyLengths ? verifyLengths->at(i) : r.proposed.size() + 1;
         if (r.vocab != vocab || (!r.greedy && !r.selection.cudaLogits)) continue;
         r.MaskGreedyStops(logits, offsets.back());
+        if (deviceMasks && i >= maskedUntil) {
+            // Target logits are packed by live widths, grammar cursors by proposal slot.
+            // A contiguous run of equal widths needs one launch even for a partially filled bucket.
+            const int width = r.proposed.size() + 1;
+            const size_t stride = size_t(owner->sampling.steps) * vocab;
+            const int first = r.proposalOffset / stride;
+            maskedUntil = i + 1;
+            while (maskedUntil < (int)rounds.size() &&
+                   (!verifyLengths || verifyLengths->at(maskedUntil - 1) == width) &&
+                   (int)rounds[maskedUntil]->proposed.size() + 1 == width &&
+                   rounds[maskedUntil]->proposalOffset == rounds[maskedUntil - 1]->proposalOffset + stride)
+                ++maskedUntil;
+            FastllmCudaTokenConstraintApplySpan(owner->sampling.constraints.get(),
+                (float *)logits.cudaData + size_t(offsets[i]) * vocab, width - 1, first, maskedUntil - i);
+        }
         if (r.config.tool_call_grammar && !deviceMasks) {
             auto config = r.config;
             for (int row = 0; row <= (int)r.proposed.size(); ++row) {
@@ -5885,6 +5892,7 @@ void NaiveN05FlashModel::PrepareDraftServingMemory(bool history) {
                     staged.FakeFrom(storage.samplingInput, 0); staged.Resize({1, n * steps, vocab});
                     FastllmCudaMemset0(staged.cudaData, staged.GetBytes());
                     PrepareDraftBatchGraph(selected, staged, rank, bucket);
+                    PrepareDraftBatchGraph(selected, staged, rank, bucket, true);
                 }
             });
             ApplyDraftDevice();

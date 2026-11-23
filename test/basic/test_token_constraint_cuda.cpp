@@ -87,6 +87,22 @@ static void Correctness(int steps) {
                 float v = values[((size_t)row * (steps + 1) + step) * vocab + id];
                 Check(valid ? v == 1.f : v == -std::numeric_limits<float>::infinity(), "verifier branch mask mismatch");
             }
+
+        // Verify a short, packed subrange inside a larger proposal bucket.
+        const int first = 3, live = 5, width = steps;  // one fewer verification row
+        std::fill(values.begin(), values.end(), 1.f);
+        FastllmCudaCopyFromHostToDevice(logits.cudaData, values.data(), values.size() * sizeof(float));
+        FastllmCudaTokenConstraintApplySpan(batch.get(), (float *)logits.cudaData + vocab, width - 1, first, live);
+        FastllmCudaCopyFromDeviceToHost(values.data(), logits.cudaData, values.size() * sizeof(float));
+        for (size_t i = 0; i < values.size(); ++i) {
+            const int packed = int(i / vocab) - 1, token = i % vocab;
+            bool allowed = true;
+            if (packed >= 0 && packed < live * width) {
+                const int row = first + packed / width, step = packed % width;
+                allowed = expected[(size_t(step) * count + row) * words + token / 32] & (uint32_t(1) << (token % 32));
+            }
+            Check(values[i] == (allowed ? 1.f : -std::numeric_limits<float>::infinity()), "packed verifier span mismatch");
+        }
     }
     Cuda(cudaGraphExecDestroy(exec)); Cuda(cudaGraphDestroy(graph));
 }
