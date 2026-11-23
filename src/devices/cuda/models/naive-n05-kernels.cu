@@ -7112,7 +7112,7 @@ __global__ void LogitsTop1Partial(const float *logits, float2 *partial, int voca
         partial[(size_t)blockIdx.y * gridDim.x + blockIdx.x] =
             make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
 }
-__global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int count) {
+__global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int count, float emptyId) {
     float best = -INFINITY;
     int bestId = INT_MAX;
     for (int i = threadIdx.x; i < count; i += 256) {
@@ -7123,7 +7123,7 @@ __global__ void LogitsTop1Finish(const float2 *partial, float2 *output, int coun
     }
     Top1BlockMax(best, bestId);
     if (!threadIdx.x)
-        output[blockIdx.x] = make_float2(bestId == INT_MAX ? -1.0f : (float)bestId, best);
+        output[blockIdx.x] = make_float2(bestId == INT_MAX ? emptyId : (float)bestId, best);
 }
 // A tile sorts 1024 scores, retaining only its first K. The second stage
 // merges sorted tile heads; no vocabulary-sized host transfer or allocation.
@@ -7211,6 +7211,42 @@ __global__ void DraftConcatRows(DraftHiddenInputs inputs, DraftRowIndices indice
 }
 }
 
+// Shared by sharded selection and the verifier's full-vocabulary Top-1.
+static void LaunchLogitsTop1(const fastllm::Data &logits, int vocabOffset, int rows, int blocks,
+                             fastllm::Data &partial, fastllm::Data &output, float emptyId) {
+    LogitsTop1Partial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
+        (float2 *)partial.cudaData, logits.dims.back(), vocabOffset);
+    LogitsTop1Finish<<<rows, 256>>>((const float2 *)partial.cudaData,
+        (float2 *)output.cudaData, blocks, emptyId);
+}
+
+bool FastllmCudaFullLogitsTop1(const fastllm::Data &logits, fastllm::Data &output) {
+    using namespace fastllm;
+    if (logits.dataDevice != CUDA || logits.dataType != FLOAT32 || logits.multiDeviceData ||
+        !logits.cudaData || logits.dims.empty() || logits.dims.back() < 16384 ||
+        !FastllmNaiveCanSelectLogits(logits.dims.back(), 0, 1, true)) return false;
+    if (logits.dataDeviceIds != std::vector<int>{FastllmCudaGetDevice()} ||
+        logits.strides.size() != logits.dims.size()) return false;
+    uint64_t stride = 1;
+    for (int axis = int(logits.dims.size()) - 1; axis >= 0; --axis) {
+        if (logits.dims[axis] <= 0 || (logits.dims[axis] > 1 && logits.strides[axis] != stride)) return false;
+        stride *= logits.dims[axis];
+    }
+    const int vocab = logits.dims.back();
+    const auto rows = logits.Count(0) / vocab;
+    if (!rows || rows > 65535) return false;
+    const int blocks = (vocab + 1023) / 1024;
+    Data partial;
+    auto dims = logits.dims;
+    dims.back() = 2;
+    Output(partial, FLOAT32, {int(rows), blocks, 2});
+    Output(output, FLOAT32, dims);
+    // Full Top-1 returns index zero when every value is NaN or -infinity.
+    LaunchLogitsTop1(logits, 0, rows, blocks, partial, output, 0.f);
+    CheckLaunch();
+    return true;
+}
+
 void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
     int count, bool greedy, float invTemperature,
     fastllm::Data &partial, fastllm::Data &output) {
@@ -7225,10 +7261,7 @@ void FastllmCudaNaiveLogitsSelect(const fastllm::Data &logits, int vocabOffset,
     Output(partial, FLOAT32, {rows, blocks, count, 2});
     Output(output, FLOAT32, {rows, count * 2});
     if (greedy) {
-        LogitsTop1Partial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
-            (float2 *)partial.cudaData, vocab, vocabOffset);
-        LogitsTop1Finish<<<rows, 256>>>((const float2 *)partial.cudaData,
-            (float2 *)output.cudaData, blocks);
+        LaunchLogitsTop1(logits, vocabOffset, rows, blocks, partial, output, -1.f);
     } else {
         LogitsTopKPartial<<<dim3(blocks, rows), 256>>>((const float *)logits.cudaData,
             (float2 *)partial.cudaData, vocab, vocabOffset, count, invTemperature);

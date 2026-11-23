@@ -175,6 +175,16 @@ struct DeepSeekV41Model::AttentionParallelFrame {
                 AssertInFastLLM(local->totalLen == seg.startPos, "Attention DP request position mismatch");
                 DeepSeekV41Segment segment = seg;
                 segment.state = local; segment.offset = offset;
+                if (parent.model.v41DsparkEnabled && !parent.model.v41CudaGraphWarmingUp &&
+                    parent.numSegments == 1 && topology.attentionTP == 1 && seg.startPos == 0 && seg.seqlen > 1) {
+                    const auto &config = parent.generationConfigsIn[i];
+                    if (config.output_token_limit > 0) {
+                        const int prompt = std::max(seg.seqlen, config.input_token_length);
+                        const int64_t end = int64_t(prompt) + config.output_token_limit + parent.model.v41DsparkBlockSize;
+                        segment.verifyReserveTokens = int(std::min<int64_t>(end,
+                            parent.model.max_positions > 0 ? parent.model.max_positions : INT_MAX));
+                    }
+                }
                 segment.spec = seg.spec && seg.spec->deferWindow ?
                     seg.spec->attentionRanks.at(topology.AttentionRank(rank)).get() : nullptr;
                 step.segments.push_back(segment);

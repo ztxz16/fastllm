@@ -245,7 +245,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool bf16_output,
           const bool parallel_fp32_reduce,
           const bool fp32_output,
-          const bool verify_qb, const bool verify_qkv>
+          const bool verify_qb, const bool verify_qkv, const bool dspark_context>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -285,6 +285,18 @@ __global__ void Marlin(
   if constexpr (verify_qkv) {
     prob_m = 6; prob_n = 1792; prob_k = lda = 5120; num_groups = 160;
     if (blockIdx.x >= 140) return;
+  }
+  // Each grid row is an independent WKV. Use the original 512-column
+  // problem so both the MMA stripes and the FP32 reduction order stay fixed.
+  if constexpr (dspark_context) {
+    const unsigned layer = blockIdx.y;
+    const auto pointers = reinterpret_cast<const int4 *const *>(B);
+    B = pointers[2 * layer];
+    scales_ptr = pointers[2 * layer + 1];
+    prob_n = 512; prob_k = lda = 5120; num_groups = 160;
+    C0 += layer * prob_m * (512 / 8);
+    C_tmp += layer * gridDim.x * (2 * 16 * 128 / 4);
+    locks += layer * gridDim.x * 4;
   }
   const unsigned partitionBlocks = verify_qkv ? 148 : gridDim.x;
   static_assert(!parallel_fp32_reduce || (dense_fp32 && m_block_size_8 &&

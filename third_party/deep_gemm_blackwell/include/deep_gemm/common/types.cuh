@@ -45,7 +45,10 @@ enum class KernelType {
 // Host-provided epilogue parameters. Operators keep their per-thread state separately;
 // only the fields consumed by the selected operator are meaningful.
 struct EpilogueOperatorArgs {
-    uint32_t* sfd = nullptr;
+    union {
+        uint32_t* sfd = nullptr;
+        void *directOutput;
+    };
     uint32_t sfd_stride = 0;
     uint32_t shape_m = 0, shape_n = 0;
     float alpha = 1.0f;

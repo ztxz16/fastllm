@@ -4,7 +4,6 @@ set -euo pipefail
 model=${1:?Usage: serve_deepseek_v41_b300.sh MODEL_PATH}
 dspark=${FASTLLM_DSV41_DSPARK:-0}
 if [[ "$dspark" != 0 ]]; then
-    export FASTLLM_DSV41_VERIFY_OWNER_FFN="${FASTLLM_DSV41_VERIFY_OWNER_FFN:-1}"
     export FASTLLM_DSV41_VERIFY_PEER_AR="${FASTLLM_DSV41_VERIFY_PEER_AR:-1}"
 fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"

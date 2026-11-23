@@ -55,12 +55,14 @@ __global__ void PackOutputWeight(const __nv_bfloat16 *bf, const uint8_t *fp8, co
     }
 }
 
+using VerifyOutputPanels = Projection<16, 1, false, true, true, 2>;
+
 struct OutputPlan {
     std::shared_ptr<fastllm::Data> weight;
     fastllm::Data scratch;
     GroupedMaps grouped;
     int rows, pitch;
-    bool panelMajor = false;
+    bool panelMajor = false, verifyOB = false, slicedOB = false;
     void *codes, *scales, *bWeight, *bScales, *out;
 };
 } // namespace
@@ -128,6 +130,13 @@ std::shared_ptr<void> FastllmCudaV41PlanOutput(const std::shared_ptr<fastllm::Da
         if (void *panels = FastllmCudaV41OutputPanels(b, device)) {
             p->bWeight = panels;
             p->panelMajor = true;
+            if (m == 6) {
+                p->verifyOB = Projection<16, 1, false, true, true>::Configure();
+                Desc descriptor{};
+                p->slicedOB = p->verifyOB && VerifyOutputPanels::WeightDescriptor(descriptor, panels, 5120, projectionWidth) &&
+                              VerifyOutputPanels::Configure();
+                if (!p->slicedOB) cudaGetLastError();
+            }
         }
     }
     p->bScales = bs;
@@ -174,5 +183,7 @@ bool FastllmCudaV41RunOutput(const std::shared_ptr<void> &handle) {
         return false;
     auto run = V41SingleCtaProjection(p.rows, 5120, projectionWidth) ? Projection<16, 1>::Run : Projection<16, 2>::Run;
     if (p.panelMajor) run = Projection<16, 1, false, true>::Run;
+    if (p.verifyOB) run = Projection<16, 1, false, true, true>::Run;
+    if (p.slicedOB) run = VerifyOutputPanels::Run;
     return run(p.codes, p.bWeight, p.scales, p.bScales, p.out, p.rows, 5120, projectionWidth, p.pitch);
 }

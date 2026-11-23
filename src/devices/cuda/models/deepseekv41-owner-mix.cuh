@@ -315,7 +315,9 @@ void *FastllmCudaV41OwnerClusterPacket(void *plan, int rows, float *scratch,
     auto check = [](cudaError_t e) {
         if (e != cudaSuccess) throw std::runtime_error(std::string("owner mHC: ") + cudaGetErrorString(e));
     };
-    cudaLaunchAttribute attr{}; attr.id = cudaLaunchAttributeClusterDimension; attr.val.clusterDim = {static_cast<unsigned>(p.blocks), 1, 1};
+    cudaLaunchAttribute attributes[2]{};
+    auto &attr = attributes[0];
+    attr.id = cudaLaunchAttributeClusterDimension; attr.val.clusterDim = {static_cast<unsigned>(p.blocks), 1, 1};
     cudaLaunchConfig_t cfg{}; cfg.gridDim = dim3(p.blocks, rows); cfg.blockDim = dim3(1024 / p.blocks);
     cfg.stream = cudaStreamPerThread; cfg.attrs = &attr; cfg.numAttrs = 1;
     auto kernel = p.blocks == 8 ? PostNormCluster<true,8> : (p.pushSums ? PostNormCluster<true> : PostNormCluster<false>);
@@ -329,6 +331,11 @@ void *FastllmCudaV41OwnerClusterPacket(void *plan, int rows, float *scratch,
                                                   hidden.cudaData, normalized.cudaData, packet->codes})) {
             cfg.blockDim.x = 192;
             packetKernel = VerifyPostPacket;
+#if CUDART_VERSION >= 12000
+            attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attributes[1].val.programmaticStreamSerializationAllowed = 1;
+            cfg.numAttrs = 2;
+#endif
         }
         check(cudaLaunchKernelEx(&cfg, packetKernel, (const Pair *)attention.cudaData,
             (const Pair *)residual.cudaData, (const float *)oldPost.cudaData, (const float *)oldComb.cudaData,

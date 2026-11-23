@@ -1790,7 +1790,7 @@ namespace {
     __global__ void V41DraftRotaryTableKernel(__nv_bfloat16 *q, __nv_bfloat16 *kv,
             const __nv_bfloat16 *window, __nv_bfloat16 *table, V41RopeTable rope,
             int heads, int tokens, int windowRows, int ropeDim, int startPos,
-            const int *devicePosition, int qBlocks) {
+            const int *devicePosition, int qBlocks, const int *changed) {
         constexpr int dim = 512;
         const int blocksPerRequest = qBlocks + tokens + (windowRows + 7) / 8;
         const int request = blockIdx.x / blocksPerRequest;
@@ -1833,7 +1833,8 @@ namespace {
             table[(size_t)(windowRows + row) * dim + d] = result;
         } else {
             const size_t idx = (size_t)(block - qBlocks - tokens) * blockDim.x + threadIdx.x;
-            if (idx < (size_t)windowRows * (dim / 8))
+            if (idx < (size_t)windowRows * (dim / 8) &&
+                (!changed || changed[size_t(request) * windowRows + idx / (dim / 8)]))
                 ((uint4*)table)[idx] = ((const uint4*)window)[idx];
         }
     }
@@ -3959,6 +3960,48 @@ namespace {
         float sc[kMmaHeads][kQkPrefetchCandidates];
     };
 
+    // One warp computes eight candidate scores for all eight TP-local draft
+    // heads. Keep the two alternating K accumulators used by the generic MMA.
+    // Padded score slots are masked by the value kernel.
+    template <int Heads>
+    __global__ void V41DraftScores(const __nv_bfloat16 *q, const __nv_bfloat16 *current,
+            const __nv_bfloat16 *history, const int32_t *indices, float *scores) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        const int token = blockIdx.x, lane = threadIdx.x;
+        const int row = lane / 4, pair = (lane % 4) * 2;
+        const int slot = blockIdx.y * 8 + row;
+        const int index = slot > 0 && slot < 133 ? indices[token * 132 + slot - 1] : -1;
+        const auto *key = slot == 0 ? current + size_t(token) * 512 :
+            index >= 0 && index < 133 ? history + (size_t(token / 5) * 133 + index) * 512 : nullptr;
+        const int head = blockIdx.z * 16 + row;
+        const auto *query = q + (size_t(token) * Heads + head) * 512 + pair;
+        float even[4] = {}, odd[4] = {};
+        auto step = [&](int k, float (&acc)[4]) {
+            uint32_t a[4] = {*reinterpret_cast<const uint32_t *>(query + k), 0,
+                *reinterpret_cast<const uint32_t *>(query + k + 8), 0};
+            if constexpr (Heads >= 16) {
+                a[1] = *reinterpret_cast<const uint32_t *>(query + 8 * 512 + k);
+                a[3] = *reinterpret_cast<const uint32_t *>(query + 8 * 512 + k + 8);
+            }
+            uint32_t b[2] = {key ? *reinterpret_cast<const uint32_t *>(key + k + pair) : 0,
+                key ? *reinterpret_cast<const uint32_t *>(key + k + pair + 8) : 0};
+            V41MmaBf16(acc, a, b);
+        };
+#pragma unroll 2
+        for (int k = 0; k < 512; k += 32) {
+            step(k, even);
+            step(k + 16, odd);
+        }
+        float *out = scores + (size_t(token) * Heads + head) * 192 + blockIdx.y * 8 + pair;
+        out[0] = even[0] + odd[0];
+        out[1] = even[1] + odd[1];
+        if constexpr (Heads >= 16) {
+            out[8 * 192] = even[2] + odd[2];
+            out[8 * 192 + 1] = even[3] + odd[3];
+        }
+#endif
+    }
+
     template<bool BATCHED = false, bool PREFETCH = false>
     __global__ void __launch_bounds__(PREFETCH ? kQkPrefetchCandidates * 4 : kMmaThreads)
     V41SparseAttentionScoresKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
@@ -4911,6 +4954,85 @@ __global__ void V41QuantizeActivationVectorKernel(const __nv_bfloat16 *input, __
                             output + (uint64_t)row * rowBytes, dim, quantMode, blockSize);
     }
 
+    struct DsparkAttentionPacket {
+        const int *src[4];
+        int *dest[4];
+        int words[4];
+    };
+
+    // A window can be recycled, rewound or replaced at the same position.
+    // Exact row comparisons make graph replay independent of request history.
+    __global__ void DsparkPackAttention(DsparkAttentionPacket packet, const uint4 *window,
+            uint4 *shadow, int *valid, int *changed, int rows) {
+        const int row = blockIdx.x, lane = threadIdx.x;
+        if (row < rows) {
+            constexpr int vectors = 512 * sizeof(__nv_bfloat16) / sizeof(uint4);
+            const int idx = row * vectors + lane;
+            const bool known = valid[row] != 0;
+            bool different = !known;
+            uint4 value;
+            if (lane < vectors) {
+                value = window[idx];
+                if (known) {
+                    const uint4 old = shadow[idx];
+                    different = (value.x != old.x || value.y != old.y || value.z != old.z || value.w != old.w);
+                }
+            }
+            const bool dirty = __syncthreads_or(different);
+            if (dirty && lane < vectors) shadow[idx] = value;
+            if (lane == 0) {
+                valid[row] = 1;
+                changed[row] = dirty;
+            }
+        } else {
+            const int block = row - rows, field = block % 4;
+            for (int i = (block / 4) * blockDim.x + lane; i < packet.words[field]; i += 8 * blockDim.x)
+                packet.dest[field][i] = packet.src[field][i];
+        }
+    }
+
+    struct DsparkContextStoreArgs {
+        const __nv_bfloat162 *kv[3];
+        const float2 *norm[3];
+        __nv_bfloat162 *ring[3];
+    };
+
+    __global__ void DsparkContextStore(DsparkContextStoreArgs a, const int *positions, int batch,
+            int rows, int window, int stride, float eps, V41RopeTable rope, int ropeDim) {
+        const int row = blockIdx.x, layer = blockIdx.y, b = row / rows, i = row % rows;
+        const int count = positions[batch + b];
+        if (i >= count || i < count - window) return;
+        const int tid = threadIdx.x, lane = tid % 32;
+        const auto pair = a.kv[layer][size_t(row) * stride + tid];
+        float x = __bfloat162float(pair.x), y = __bfloat162float(pair.y);
+        // Match the existing 512-thread RMSNorm: its upper eight warps contribute zero.
+        float sum = x * x + y * y;
+        for (int k = 16; k; k >>= 1) sum += __shfl_down_sync(0xffffffff, sum, k);
+        __shared__ float sums[8];
+        if (!lane) sums[tid / 32] = sum;
+        __syncthreads();
+        sum = lane < 8 ? sums[lane] : 0.f;
+        for (int k = 16; k; k >>= 1) sum += __shfl_down_sync(0xffffffff, sum, k);
+        const float inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / 512.f + eps);
+        const auto w = a.norm[layer][tid];
+        x = V41StorageRound<__nv_bfloat16>(x * inv * w.x);
+        y = V41StorageRound<__nv_bfloat16>(y * inv * w.y);
+        const int64_t pos = (int64_t)positions[b] + i;
+        if (tid >= (512 - ropeDim) / 2) {
+            const float angle = (float)pos * rope.invFreq[tid - (512 - ropeDim) / 2];
+            const float cs = cosf(angle), sn = sinf(angle);
+            const float re = x * cs - y * sn, im = x * sn + y * cs;
+            x = V41StorageRound<__nv_bfloat16>(re);
+            y = V41StorageRound<__nv_bfloat16>(im);
+        }
+        float peak = fmaxf(fabsf(x), fabsf(y));
+        for (int k = 8; k; k >>= 1)
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, k, 16));
+        const float scale = V41QuantScaleDev(peak, 1);
+        a.ring[layer][(size_t(b) * window + pos % window) * 256 + tid] =
+            __floats2bfloat162_rn(V41QuantValueDev(x, scale, 1), V41QuantValueDev(y, scale, 1));
+    }
+
     // ---------------- WindowStore ----------------
 
     __global__ void V41WindowStoreKernel(const uint8_t *chunk, uint8_t *ring, int seqlen, int rowBytes,
@@ -5367,9 +5489,9 @@ extern "C" bool FastllmCudaV41RouterScores(const Data &input, Data &weight,
 
 // Small BF16 decode batches retain the original FP32 dot accumulation;
 // finish and normalization use independent CTAs in one launch, preserving arithmetic.
-extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &previousPre, Data &fn,
+static bool V41MixPreNormImpl(const Data &x, const Data &previousPre, Data &fn,
         Data &scale, Data &base, Data &normWeight, int sinkhornIters, float mixEps,
-        float normEps, Data &pre, Data &post, Data &comb, Data &output, Data *quantizedOutput) {
+        float normEps, Data &pre, Data &post, Data &comb, Data &output, Data *quantizedOutput, FastllmDsparkHcBranch *branch) {
     if (!V41OnCuda(x) || !V41OnCuda(previousPre) || previousPre.dataType != DataType::FLOAT32 ||
         x.multiDeviceData || previousPre.multiDeviceData || x.dataType != DataType::BFLOAT16 ||
         x.dims.size() != 4 || x.dims[2] != 4 || x.dims[0] * x.dims[1] < 1 ||
@@ -5383,7 +5505,9 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
         scale.Count(0) != 3 || base.Count(0) != 24) return false;
     for (Data *w : {&fn, &scale, &base, &normWeight})
         w->ToDevice(DataDevice::CUDA, std::vector<int>{FastllmCudaGetDevice()}, true);
-    Data scratch;
+    if (branch && (!quantizedOutput || d != 5120 || tokens < 1 || tokens > 8 || !V41IsSm<10, 3>())) return false;
+    Data localScratch;
+    Data &scratch = branch ? branch->scratch : localScratch;
     const bool splitDots = tokens <= 4 && d == 5120 && V41IsSm<10, 3>();
     const bool tensor = V41HcTensorCandidate(x, tokens);
     if (tokens >= 16 && !tensor) return false;
@@ -5395,6 +5519,25 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
         !V41PrepareOutput(output, DataType::BFLOAT16, {b, n, d})) return false;
     if (quantizedOutput != nullptr &&
         !V41PrepareOutput(*quantizedOutput, DataType::BFLOAT16, {b, n, d})) return false;
+    if (branch) {
+        auto stream = static_cast<cudaStream_t>(branch->stream);
+        FastllmCudaEventRecordCurrentThread(branch->begin);
+        FastllmCudaStreamWaitEvent(stream, branch->begin);
+        const auto *input = static_cast<const __nv_bfloat16 *>(x.cudaData);
+        auto *mix = static_cast<float *>(scratch.cudaData);
+        // Each token keeps the same 256-lane accumulation and warp reduction tree.
+        V41HcDecodeDots<<<dim3(25, tokens), kHcThreads, 0, stream>>>(input,
+            static_cast<const float *>(fn.cudaData), 4 * d, mix);
+        V41HcDecodeFinish<<<tokens, 32, 0, stream>>>(mix, (const float *)scale.cudaData,
+            (const float *)base.cudaData, 4*d, sinkhornIters, mixEps, normEps,
+            (float *)pre.cudaData, (float *)post.cudaData, (float *)comb.cudaData);
+        FastllmCudaEventRecord(branch->done, stream);
+        V41HcPreNormKernel<1024,3,false,true><<<tokens,1024>>>(input, (const float *)previousPre.cudaData,
+            (const float *)normWeight.cudaData, (__nv_bfloat16 *)output.cudaData, 4, d, normEps,
+            nullptr, nullptr, nullptr, 0, 0.f, nullptr, nullptr, nullptr,
+            (__nv_bfloat16 *)quantizedOutput->cudaData);
+        return V41CheckLaunch("DsparkHcFork");
+    }
     if (tokens == 1 && d == 5120 && V41IsSm<12, 0>()) {
         const auto kernel = quantizedOutput ? V41HcDotsPreNormKernel<true> : V41HcDotsPreNormKernel<false>;
         kernel<<<26, 1024>>>((const __nv_bfloat16*)x.cudaData, (const float*)fn.cudaData,
@@ -5431,6 +5574,18 @@ extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &pr
 #undef V41_MIX_NORM
 #undef V41_MIX_NORM_W
     return V41CheckLaunch("HcMixPreNorm");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41HcMixPreNorm(const Data &x, const Data &previousPre, Data &fn,
+        Data &scale, Data &base, Data &normWeight, int sinkhornIters, float mixEps,
+        float normEps, Data &pre, Data &post, Data &comb, Data &output, Data *quantizedOutput) {
+    return V41MixPreNormImpl(x, previousPre, fn, scale, base, normWeight, sinkhornIters, mixEps, normEps, pre, post, comb, output, quantizedOutput, nullptr);
+}
+
+extern "C" bool FastllmCudaDsparkHcFork(const Data &x, const Data &previousPre, Data &fn,
+        Data &scale, Data &base, Data &normWeight, int sinkhornIters, float mixEps,
+        float normEps, Data &pre, Data &post, Data &comb, Data &output, Data *quantizedOutput, FastllmDsparkHcBranch &branch) {
+    return V41MixPreNormImpl(x, previousPre, fn, scale, base, normWeight, sinkhornIters, mixEps, normEps, pre, post, comb, output, quantizedOutput, &branch);
 }
 
 // Fused attention post + next mHC projection, followed by the existing
@@ -5828,6 +5983,13 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuantPosition(fastllm::Data &x, int 
 extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const Data &window,
         int ropeDim, float ropeBase, int startPos, int originalSeqLen, float ropeFactor,
         int betaFast, int betaSlow, const int *devicePosition, Data &table) {
+    return FastllmCudaDsparkDraftRotaryTable(q, kv, window, ropeDim, ropeBase, startPos, originalSeqLen,
+        ropeFactor, betaFast, betaSlow, devicePosition, table, nullptr);
+}
+
+extern "C" bool FastllmCudaDsparkDraftRotaryTable(Data &q, Data &kv, const Data &window,
+        int ropeDim, float ropeBase, int startPos, int originalSeqLen, float ropeFactor,
+        int betaFast, int betaSlow, const int *devicePosition, Data &table, const int *changed) {
     if (V41LegacyRotary() || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") ||
         V41EnvOn("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
         q.dims.size() != 4 || kv.dims.size() != 3 || window.dims.size() != 3 ||
@@ -5849,7 +6011,7 @@ extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const 
     };
     for (int i = 0; i < 3; ++i) {
         const Data &x = *inputs[i];
-        if (!V41OnCuda(x) || x.multiDeviceData || x.dataType != DataType::BFLOAT16 || x.dataDeviceIds != device ||
+        if (!V41OnCuda(x) || x.multiDeviceData || x.dataType != DataType::BFLOAT16 || ((i != 2 || !changed) && x.dataDeviceIds != device) ||
             &x == &table || overlaps(x, table, tableBytes)) return false;
         uint64_t stride = 1;
         if (x.strides.size() != x.dims.size()) return false;
@@ -5865,7 +6027,7 @@ extern "C" bool FastllmCudaDeepSeekV41DraftRotaryTable(Data &q, Data &kv, const 
     V41DraftRotaryTableKernel<<<unsigned(blocks), 512>>>(
         (__nv_bfloat16*)q.cudaData, (__nv_bfloat16*)kv.cudaData, (const __nv_bfloat16*)window.cudaData,
         (__nv_bfloat16*)table.cudaData, rope, q.dims[2], q.dims[1], window.dims[1], ropeDim,
-        startPos, devicePosition, qBlocks);
+        startPos, devicePosition, qBlocks, changed);
     return V41CheckLaunch("DraftRotaryTable");
 }
 
@@ -6189,7 +6351,7 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
 }
 
 // Hybrid workspaces require dense tensors on the selected CUDA device.
-static bool Glm5HybridDense(const fastllm::Data &x) {
+static bool V41DenseCuda(const fastllm::Data &x) {
     if (!V41OnCuda(x) || x.multiDeviceData || x.dims.size() != x.strides.size()) return false;
     uint64_t stride = 1;
     for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
@@ -6202,7 +6364,7 @@ static bool Glm5HybridDense(const fastllm::Data &x) {
 static bool Glm5HybridIndexerScore(const fastllm::Data &query,
         const fastllm::Data &weights, const fastllm::Data &keys, fastllm::Data &output,
         const fastllm::Data *position) {
-    if (!Glm5HybridDense(query) || !Glm5HybridDense(keys) || !Glm5HybridDense(weights) ||
+    if (!V41DenseCuda(query) || !V41DenseCuda(keys) || !V41DenseCuda(weights) ||
         &output == &query || &output == &keys || &output == &weights ||
         query.dataDeviceIds != keys.dataDeviceIds || query.dataDeviceIds != weights.dataDeviceIds ||
         query.dataType != DataType::BFLOAT16 || keys.dataType != DataType::BFLOAT16 ||
@@ -6210,7 +6372,7 @@ static bool Glm5HybridIndexerScore(const fastllm::Data &query,
         query.dims[0] != 1 || query.dims[1] < 1 || query.dims[2] != 32 || query.dims[3] != 128 ||
         keys.dims.size() != 3 || keys.dims[0] != 1 || keys.dims[1] < 1 || keys.dims[2] != 128 ||
         weights.Count(0) != size_t(query.dims[1]) * 32 || !V41IsSm75()) return false;
-    if (position && (query.dims[1] != 1 || !Glm5HybridDense(*position) ||
+    if (position && (query.dims[1] != 1 || !V41DenseCuda(*position) ||
         position->dataType != DataType::INT32 || position->Count(0) != 1 ||
         position->dataDeviceIds != query.dataDeviceIds)) return false;
     const int rows = query.dims[1], candidates = keys.dims[1], heads = 32;
@@ -6258,7 +6420,7 @@ bool FastllmCudaHybridDsaSupported() { return V41IsSm75(); }
 bool FastllmCudaGlm5NextHybridSparseAttention(const fastllm::Data &query,
         const fastllm::Data &latent, const fastllm::Data &indices,
         float scale, fastllm::Data &output) {
-    if (!Glm5HybridDense(query) || !Glm5HybridDense(latent) || !Glm5HybridDense(indices) ||
+    if (!V41DenseCuda(query) || !V41DenseCuda(latent) || !V41DenseCuda(indices) ||
         query.dataType != DataType::BFLOAT16 || latent.dataType != DataType::BFLOAT16 ||
         indices.dataType != DataType::INT32 || query.dims.size() != 4 ||
         query.dims[0] != 1 || query.dims[1] < 1 ||
@@ -6515,6 +6677,42 @@ extern "C" bool FastllmCudaDeepSeekV41HybridSparseAttention(const fastllm::Data 
         (const float *)attnSink.cudaData, count, cap, heads, softmaxScale,
         (__nv_bfloat16 *)output.cudaData, ring, chunk, windowSize, startPos);
     return V41CheckLaunch("HybridDecodeValues");
+}
+
+bool FastllmCudaDsparkDraftSparseAttention(const fastllm::Data &q, const fastllm::Data &kv,
+        const fastllm::Data &table, const fastllm::Data &indices, fastllm::Data &sink,
+        float scale, fastllm::Data &scratch, fastllm::Data &output) {
+    const int batch = q.dims.size() == 4 ? q.dims[0] : 0;
+    const int heads = batch > 0 ? q.dims[2] : 0;
+    if (batch > 0 && (heads == 8 || heads == 64) && q.dims == std::vector<int>({batch, 5, heads, 512}) &&
+        kv.dims == std::vector<int>({batch, 5, 512}) && table.dims == std::vector<int>({batch, 133, 512}) &&
+        indices.dims == std::vector<int>({batch, 5, 132}) && q.dataType == DataType::BFLOAT16 &&
+        kv.dataType == q.dataType && table.dataType == q.dataType && indices.dataType == DataType::INT32 &&
+        sink.dataType == DataType::FLOAT32 && sink.Count(0) >= heads &&
+        (scratch.dims.empty() || (scratch.dataType == DataType::FLOAT32 &&
+         scratch.Count(0) >= size_t(batch) * 5 * heads * 192 && V41OnCuda(scratch))) && V41OnCuda(q) && V41OnCuda(kv) &&
+        V41OnCuda(table) && V41OnCuda(indices) && V41OnCuda(sink) &&
+        !V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH") && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN") &&
+        V41IsSm<10, 3>() && V41MmaKernelReady<V41SparseAttentionMmaKernel<8, true, false, true>,
+            kMmaThreads, sizeof(V41MmaPvPipelineShared<8>)>()) {
+        if (scratch.dims.empty() && !V41PrepareOutput(scratch, DataType::FLOAT32, {batch, 5, heads, 192})) return false;
+        if (!V41PrepareOutput(output, DataType::BFLOAT16, q.dims)) return false;
+        const auto *query = static_cast<const __nv_bfloat16 *>(q.cudaData);
+        const auto *current = static_cast<const __nv_bfloat16 *>(kv.cudaData);
+        const auto *history = static_cast<const __nv_bfloat16 *>(table.cudaData);
+        const auto *idx = static_cast<const int32_t *>(indices.cudaData);
+        auto *scores = static_cast<float *>(scratch.cudaData);
+        if (heads == 64) V41DraftScores<64><<<dim3(batch * 5, 24, 4), 32>>>(query, current, history, idx, scores);
+        else V41DraftScores<8><<<dim3(batch * 5, 24), 32>>>(query, current, history, idx, scores);
+        if (!V41CheckLaunch("DraftScores")) return false;
+        V41SparseAttentionMmaKernel<8, true, false, true>
+            <<<dim3(batch * 5, (heads + 15) / 16, 8), kMmaThreads, sizeof(V41MmaPvPipelineShared<8>)>>>(
+                query, current, nullptr, history, nullptr, nullptr, idx, static_cast<const float *>(sink.cudaData),
+                5, heads, 1, 133, 132, 0, scale, static_cast<__nv_bfloat16 *>(output.cudaData), 1, 0, 1, 0, 0, scores);
+        return V41CheckLaunch("DraftValues");
+    }
+    if (FastllmCudaGetThreadError()) return false;
+    return FastllmCudaDeepSeekV41SparseAttention(q, kv, nullptr, &table, &indices, sink, 1, 0, scale, output);
 }
 
 extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
@@ -6782,7 +6980,9 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
         const int tokens = bsz * seqlen;
         const int headBlocks = (heads + kMmaHeads - 1) / kMmaHeads;
         const bool smallVerify = tokens >= 2 && tokens <= 8 && startPos > 0 && !ringFp8 && !cmpFp8;
-        const bool splitValues = tokens == 1 || smallVerify;
+        const bool draftValues = seqlen == 5 && heads == 8 && startPos == 0 && windowSize == 1 &&
+            !ringKV && hasCmp && !cmpFp8 && cap == 133 && topWidth == 132 && V41IsSm<10, 3>();
+        const bool splitValues = tokens == 1 || smallVerify || draftValues;
         bool launched = false;
         auto launch = [&](auto splitTag, auto pipelineTag) {
             constexpr int splits = decltype(splitTag)::value;
@@ -6945,6 +7145,53 @@ static bool V41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int 
 extern "C" bool FastllmCudaDeepSeekV41WindowStorePosition(const fastllm::Data &chunk, fastllm::Data &ring,
                                                         int startPos, int windowSize, const int *devicePosition) {
     return V41WindowStore(chunk, ring, startPos, windowSize, devicePosition, -1);
+}
+
+extern "C" void FastllmCudaDsparkPackAttention(const Data &query, const Data &kv, const Data &window,
+        const Data &indices, const Data &position, Data &shadow, Data &valid, const size_t *offsets,
+        Data &packet) {
+    DsparkAttentionPacket fields{};
+    const Data *src[] = {&query, &kv, &indices, &position};
+    char *dst = static_cast<char *>(packet.cudaData);
+    for (int i = 0; i < 4; ++i) {
+        fields.src[i] = static_cast<const int *>(src[i]->cudaData);
+        fields.dest[i] = reinterpret_cast<int *>(dst + offsets[i < 2 ? i : i + 1]);
+        fields.words[i] = i == 3 ? 1 : int(src[i]->GetBytes() / sizeof(int));
+    }
+    DsparkPackAttention<<<window.dims[1] + 32, 128>>>(fields, static_cast<const uint4 *>(window.cudaData),
+        static_cast<uint4 *>(shadow.cudaData), static_cast<int *>(valid.cudaData),
+        reinterpret_cast<int *>(dst + offsets[2]), window.dims[1]);
+    V41CheckLaunch("DsparkPackAttention");
+}
+
+extern "C" bool FastllmCudaDsparkContextStore(const Data *const projected[3], const Data *const norms[3],
+        Data *const rings[3], bool stacked, int batch, int rows, const int *positions, float eps,
+        int ropeDim, float ropeBase, float ropeFactor, int betaFast, int betaSlow) {
+    if (!positions || batch <= 0 || rows <= 0 || int64_t(batch) * rows > INT_MAX ||
+        ropeDim < 2 || ropeDim > 128 || ropeDim % 2 || V41LegacyRotary() ||
+        V41EnvOn("FASTLLM_DSV41_DISABLE_FAKE_QUANT") || V41EnvOn("FASTLLM_DSV41_REFERENCE_MATH")) return false;
+    const std::vector<int> device{FastllmCudaGetDevice()};
+    DsparkContextStoreArgs args{};
+    int window = 0;
+    const int stride = stacked ? 1536 : 512;
+    for (int l = 0; l < 3; ++l) {
+        const auto &kv = *projected[stacked ? 0 : l], &norm = *norms[l], &ring = *rings[l];
+        if (!V41DenseCuda(kv) || !V41DenseCuda(norm) || !V41DenseCuda(ring) || kv.dataDeviceIds != device ||
+            norm.dataDeviceIds != device || ring.dataDeviceIds != device ||
+            (uintptr_t(kv.cudaData) % 4) || (uintptr_t(ring.cudaData) % 4) || (uintptr_t(norm.cudaData) % 8) || kv.dataType != DataType::BFLOAT16 || norm.dataType != DataType::FLOAT32 ||
+            ring.dataType != DataType::BFLOAT16 || kv.dims.empty() || kv.dims.back() != stride ||
+            kv.Count(0) != uint64_t(batch) * rows * stride || norm.Count(0) != 512 ||
+            ring.dims.size() != 3 || ring.dims[0] != batch || ring.dims[1] <= 0 ||
+            ring.dims[2] != 512 || (l && ring.dims[1] != window)) return false;
+        window = ring.dims[1];
+        args.kv[l] = (const __nv_bfloat162 *)kv.cudaData + (stacked ? 256 * l : 0);
+        args.norm[l] = (const float2 *)norm.cudaData;
+        args.ring[l] = (__nv_bfloat162 *)ring.cudaData;
+    }
+    auto rope = V41BuildRope(ropeDim, ropeBase, 0, ropeFactor, betaFast, betaSlow);
+    DsparkContextStore<<<dim3(batch * rows, 3), 256>>>(args, positions, batch, rows, window,
+        stride / 2, eps, rope, ropeDim);
+    return V41CheckLaunch("DsparkContextStore");
 }
 
 extern "C" bool FastllmCudaDeepSeekV41WindowStoreBatchPrefix(const fastllm::Data &chunk, fastllm::Data &ring,
@@ -8217,6 +8464,40 @@ bool FastllmCudaV41ConsumeVerifyPages(void *handle, void *destination) {
 }
 
 namespace {
+__global__ void V41PublishVerifyInputs(const uint32_t *pages, uint32_t *pageDestination, int pageWords,
+        const uint32_t *packet, uint32_t *packetDestination, int packetWords) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < pageWords) pageDestination[i] = pages[i];
+    if (i < packetWords) packetDestination[i] = packet[i];
+}
+}
+
+bool FastllmCudaV41PublishVerifyInputs(void *handle, void *pageDestination, void *packetDestination,
+        const void *packet, size_t packetBytes, void *packetReady, void *lastPageRead, void *lastPacketRead) {
+    auto *s = static_cast<V41VerifyPageSlot *>(handle);
+    if (!s || !s->published || !pageDestination || !packetDestination || !packet || !packetReady ||
+        !lastPageRead || !lastPacketRead || s->device != FastllmCudaGetDevice() ||
+        packetBytes % sizeof(uint32_t) || packetBytes > INT_MAX) return false;
+    static_assert(sizeof(*s->expanded) % sizeof(uint32_t) == 0);
+    const int pageWords = sizeof(*s->expanded) / sizeof(uint32_t) * s->rows * s->count;
+    const int packetWords = int(packetBytes / sizeof(uint32_t));
+    // Local attention graph slots can be shared by differently sized parent
+    // graphs. Fence both destinations before publishing on the page producer.
+    for (auto event : {packetReady, lastPageRead, lastPacketRead})
+        if (cudaStreamWaitEvent(s->stream, static_cast<cudaEvent_t>(event)) != cudaSuccess) return false;
+    V41PublishVerifyInputs<<<(std::max(pageWords, packetWords) + 127) / 128, 128, 0, s->stream>>>(
+        reinterpret_cast<const uint32_t *>(s->expanded), static_cast<uint32_t *>(pageDestination), pageWords,
+        static_cast<const uint32_t *>(packet), static_cast<uint32_t *>(packetDestination), packetWords);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    // A failed event operation must finish the side write before a caller
+    // can republish the same destinations via the ordinary ordered path.
+    if (cudaEventRecord(s->consumed, s->stream) == cudaSuccess &&
+        cudaStreamWaitEvent(cudaStreamPerThread, s->consumed) == cudaSuccess) return true;
+    cudaStreamSynchronize(s->stream);
+    return false;
+}
+
+namespace {
 __global__ void V41ResolveDraft(const float *target, int stride, const int *draft, int rows, int position,
         int offset, int maxAccepted, FastllmV41VerifyStops stops, int *packet) {
     int accepted = 0;
@@ -8240,14 +8521,21 @@ bool FastllmCudaV41ResolveDraft(const float *target, int stride, const int *draf
     return V41CheckLaunch("ResolveDraft");
 }
 
+bool FastllmCudaV41DraftVerifyPacketOnStream(const int *ids, int anchor, int rows, const int *map,
+        int vocab, int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
+        FastllmV41VerifyHistory history, void *packet, void *stream) {
+    if (!ids || !map || !parameters || !packet || rows < 1 || layers < 1 || ngram < 2 ||
+        ngram > 9 || heads < 1 || anchor < 0 || anchor >= vocab) return false;
+    V41DraftVerifyPacket<<<dim3(rows, layers), 64, 0, stream ? (cudaStream_t)stream : cudaStreamPerThread>>>(ids, anchor, rows, map, vocab,
+        pad, imageToken, parameters, layers, ngram, heads, history, static_cast<int64_t *>(packet));
+    return V41CheckLaunch("DraftVerifyPacket");
+}
+
 bool FastllmCudaV41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *map,
         int vocab, int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
         FastllmV41VerifyHistory history, void *packet) {
-    if (!ids || !map || !parameters || !packet || rows < 1 || layers < 1 || ngram < 2 ||
-        ngram > 9 || heads < 1 || anchor < 0 || anchor >= vocab) return false;
-    V41DraftVerifyPacket<<<dim3(rows, layers), 64, 0, cudaStreamPerThread>>>(ids, anchor, rows, map, vocab,
-        pad, imageToken, parameters, layers, ngram, heads, history, static_cast<int64_t *>(packet));
-    return V41CheckLaunch("DraftVerifyPacket");
+    return FastllmCudaV41DraftVerifyPacketOnStream(ids, anchor, rows, map, vocab, pad, imageToken,
+        parameters, layers, ngram, heads, history, packet, nullptr);
 }
 
 bool FastllmCudaV41UploadFullDecode(void *handle, const FastllmV41FullDecodeRequest *requests, size_t count) {
@@ -8944,6 +9232,59 @@ static void *V41BoundaryKernel(bool pack, bool quantize, bool packOnly) {
     if (pack) return quantize ? (void *)ExpertResidualNorm<true,true,true,Blocks,PackedOrder> : (void *)ExpertResidualNorm<true,false,true,Blocks,PackedOrder>;
     return quantize ? (void *)ExpertResidualNorm<false,true,true,Blocks,PackedOrder> : (void *)ExpertResidualNorm<false,false,true,Blocks,PackedOrder>;
 }
+bool FastllmCudaV41ComposeEngramForks(const std::vector<const void *> &parts,
+        const std::vector<std::pair<int, int>> &forks, void **outGraph, void **outExec) {
+    using namespace fastllm_v41_hc_graph;
+    if (!V41IsSm<10, 3>() || forks.empty()) return false;
+    cudaGraph_t graph = nullptr;
+    auto reject = [] { cudaGetLastError(); return false; };
+    if (cudaGraphCreate(&graph, 0) != cudaSuccess) return reject();
+    OwnerGraph result(graph, &cudaGraphDestroy);
+    std::vector<cudaGraphNode_t> nodes(parts.size());
+    auto fork = forks.begin();
+    for (int i = 0; i < int(parts.size()); ++i) {
+        auto child = reinterpret_cast<cudaGraph_t>(const_cast<void *>(parts[i]));
+        if (fork == forks.end() || fork->first != i) {
+            if (cudaGraphAddChildGraphNode(&nodes[i], graph, i ? &nodes[i-1] : nullptr, i ? 1 : 0, child) != cudaSuccess)
+                return reject();
+            continue;
+        }
+        // Only the gate updates hidden. Keep every other dependency inside the captured preparation.
+        if (fork->second < 0 || fork->second >= i-1) return false;
+        size_t count = 0;
+        if (cudaGraphGetNodes(child, nullptr, &count) != cudaSuccess || count < 2) return reject();
+        std::vector<cudaGraphNode_t> sequence(count);
+        if (cudaGraphGetNodes(child, sequence.data(), &count) != cudaSuccess) return reject();
+        cudaGraphNode_t gate = nullptr;
+        cudaKernelNodeParams gateParams{};
+        for (auto node : sequence) {
+            size_t users = 0;
+            cudaGraphNodeType type;
+            if (cudaGraphNodeGetType(node, &type) != cudaSuccess || type != cudaGraphNodeTypeKernel ||
+                OwnerNeighbors<false>(node, nullptr, &users) != cudaSuccess) return reject();
+            if (users) continue;
+            if (gate || cudaGraphKernelNodeGetParams(node, &gateParams) != cudaSuccess ||
+                gateParams.func != (void *)V41EngramApplyKernel<__nv_bfloat16, __nv_bfloat16>) return reject();
+            gate = node;
+        }
+        cudaGraph_t raw = nullptr;
+        if (!gate || cudaGraphClone(&raw, child) != cudaSuccess) return reject();
+        OwnerGraph prep(raw, &cudaGraphDestroy);
+        cudaGraphNode_t tail = nullptr, branch = nullptr;
+        if (cudaGraphNodeFindInClone(&tail, gate, raw) != cudaSuccess || cudaGraphDestroyNode(tail) != cudaSuccess ||
+            cudaGraphAddChildGraphNode(&branch, graph, &nodes[fork->second], 1, raw) != cudaSuccess) return reject();
+        cudaGraphNode_t inputs[] = {nodes[i-1], branch};
+        if (cudaGraphAddKernelNode(&nodes[i], graph, inputs, 2, &gateParams) != cudaSuccess ||
+            cudaGraphKernelNodeCopyAttributes(nodes[i], gate) != cudaSuccess) return reject();
+        ++fork;
+    }
+    cudaGraphExec_t exec = nullptr;
+    if (fork != forks.end() || cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) != cudaSuccess) return reject();
+    *outExec = exec;
+    *outGraph = result.release();
+    return true;
+}
+
 void *FastllmCudaV41ForkIndexProjections(const void *const *children, int count, const void *original,
         const std::vector<void *> &projectionNodes, const void *plan, void *rawWeights,
         float *mixScratch, void **ownerGemm) {
@@ -9069,19 +9410,37 @@ bool FastllmCudaV41FuseExpertBoundary(const void *previous, const void *attentio
     auto args = params.kernelParams;
     if (!combine || !args || params.extra || *static_cast<void **>(args[2]) != a.input ||
         *static_cast<int *>(args[3]) != rows || *static_cast<int *>(args[4]) != 0 ||
-        fastllm_v41_hc_graph::OwnerNeighbors<false>(combine, nullptr, &count) != cudaSuccess || count) return false;
+        fastllm_v41_hc_graph::OwnerNeighbors<false>(combine, nullptr, &count) != cudaSuccess || count > 1) return false;
+    VerifyDraftFeature feature{};
+    cudaGraphNode_t publish = nullptr;
+    if (count == 1) {
+        if (rows != 6 || fastllm_v41_hc_graph::OwnerNeighbors<false>(combine, &publish, &count) != cudaSuccess)
+            return false;
+        cudaKernelNodeParams p{};
+        if (cudaGraphKernelNodeGetParams(publish, &p) != cudaSuccess || p.func != (void *)V41PublishDraftFeature ||
+            p.extra || !p.kernelParams || fastllm_v41_hc_graph::OwnerNeighbors<true>(publish, nullptr, &count) != cudaSuccess ||
+            count != 1 || fastllm_v41_hc_graph::OwnerNeighbors<false>(publish, nullptr, &count) != cudaSuccess || count)
+            return false;
+        auto v = p.kernelParams;
+        if (*static_cast<void **>(v[0]) != a.input || *static_cast<int *>(v[3]) != 5120) return false;
+        feature = {*static_cast<Pair **>(v[1]), *static_cast<const int **>(v[2]),
+                   *static_cast<int *>(v[4]), *static_cast<int *>(v[5])};
+        if (!feature.packed || !feature.globalRows || feature.slot < 0 || feature.slot >= feature.features) return false;
+    }
     ExpertBoundary ep{*static_cast<const Pair **>(args[0]), *static_cast<const int **>(args[1]),
                       static_cast<Pair *>(a.rounded), static_cast<uint8_t *>(a.codes), static_cast<uint8_t *>(a.scales), a.pitch};
-    void *fused[] = {args[5],args[6],args[7],&a.pre,&a.weight,&a.eps,args[2],&a.out,&ep};
+    void *fused[] = {args[5],args[6],args[7],&a.pre,&a.weight,&a.eps,args[2],&a.out,&ep,&feature};
     const bool wide = V41EnvOn("FASTLLM_DSV41_WIDE_CLUSTER");
     const int *order = *static_cast<const int **>(args[8]);
+    void *vectorKernel = publish ? (void *)VerifyExpertFeatureNorm : (void *)VerifyExpertNorm;
     const bool vectorized = rows == 6 && order && !wide && !a.pack && !a.quantize &&
         VerifyPostAligned({ep.slots, *static_cast<void **>(args[5]), a.input, a.out, a.weight}) &&
-        VerifyPostCluster((const void *)VerifyExpertNorm);
+        VerifyPostCluster(vectorKernel);
+    if (publish && (!vectorized || cudaGraphDestroyNode(publish) != cudaSuccess)) return false;
     const unsigned blocks = (wide || vectorized) ? 8 : 4;
     if (vectorized) {
         ep.ids = order;
-        params.func = (void *)VerifyExpertNorm;
+        params.func = vectorKernel;
     } else if (order && !wide) {
         ep.ids = order;
         params.func = V41BoundaryKernel<4,true>(a.pack, a.quantize, packOnly);

@@ -849,6 +849,49 @@ static bool BFloat16MXFP8Gemm(
     return true;
 }
 
+extern "C" bool FastllmCudaDsparkContextProjection(const void *a, const void *weights, void *output, int rows) {
+#if defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+    if (!a || !weights || !output || rows < 2 || rows > 8) return false;
+    KernelFn kernel = MARLIN_NAMESPACE_NAME::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+        128, 1, 8, 4, true, 4, 2, false, true, false, false, false, true, false, false, false, true>;
+    constexpr int sms = 148;
+    const int shared = Bf16Mxfp8SharedBytes(rows, 0);
+    static thread_local std::map<int, bool> devices;
+    int device = FastllmCudaGetDevice();
+    if (!devices.count(device)) {
+        if (FastllmCudaGraphIsCapturingFast()) return false;
+        int arch = 0, count = 0;
+        bool ready = DeviceOk(&arch) && arch == 103 &&
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) == cudaSuccess && count == sms &&
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) == cudaSuccess;
+        if (!ready) cudaGetLastError();
+        devices.emplace(device, ready);
+    }
+    if (!devices.at(device)) return false;
+    // Each captured invocation owns its partials and locks, including when two
+    // different requests execute concurrently on the same device.
+    constexpr size_t partialBytes = 3 * 2 * sms * 16 * 128 * sizeof(float);
+    constexpr size_t lockBytes = 3 * sms * 4 * sizeof(int);
+    void *scratch = nullptr;
+    if (FastllmCudaTryMalloc(&scratch, partialBytes + lockBytes) != FASTLLM_CUDA_TRY_MALLOC_SUCCESS) return false;
+    int *locks = reinterpret_cast<int *>(static_cast<char *>(scratch) + partialBytes);
+    cudaError_t status = cudaMemsetAsync(locks, 0, lockBytes, cudaStreamPerThread);
+    if (status == cudaSuccess) {
+        kernel<<<dim3(sms, 3), 128, shared, cudaStreamPerThread>>>(
+            static_cast<const int4 *>(a), static_cast<const int4 *>(weights), static_cast<int4 *>(output),
+            static_cast<int4 *>(scratch), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            160, rows, 512, 5120, 5120, locks, false, false, true, shared);
+        status = cudaGetLastError();
+    }
+    if (!FastllmCudaFreeAfterCurrentThreadStream(scratch)) FastllmCudaFree(scratch);
+    if (status != cudaSuccess) FastllmCudaSetThreadError();
+    return status == cudaSuccess;
+#else
+    return false;
+#endif
+}
+
 extern "C" bool FastllmCudaMarlinBFloat16MXFP8Gemm(
         const void *a, const uint32_t *weight, const uint8_t *scales,
         void *c, int rows, int columns, int inner, int *workspace) {

@@ -45,6 +45,9 @@
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "fastllm-cuda-graph-workspace.h"
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+#include "devices/cuda/fastllm-dsv41-mega.h"
+#endif
 #include "devices/cuda/fastllm-cuda-dspark.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/cuda/fastllm-draft-head.cuh"
@@ -110,17 +113,19 @@ namespace fastllm {
         std::map<int, std::shared_ptr<void>> attentionTp;
 #ifdef USE_CUDA
         std::vector<void*> graphs, execs, starts, ends, reserved;
+        FastllmDsparkHcBranch hcBranch;
         void *replayReady = nullptr;
         std::vector<void *> replayDone;
         int *hostProposal = nullptr;
-        void *proposalReady = nullptr;
+        void *proposalReady = nullptr, *mirrorStream = nullptr;
         int pendingCount = 0, packetPosition = -1;
         Data verifyTokenMap, verifyHash, verifyPacket, verifyDecision;
         int nextMetadataAt = -1, nextMetadataAnchor = -1, fullStreak = 0;
         int reusableDraftAt = -1, reusableDraftAnchor = -1;
         float *hostTop1 = nullptr;
         void *top1Ready = nullptr, *kvReady = nullptr;
-        void *verifyReady = nullptr;
+        void *verifyReady = nullptr, *packetStream = nullptr;
+        bool rootWinnerRecorded = false;
 
         void FinishProposal(std::vector<int> *output = nullptr) {
             if (!pendingCount) return;
@@ -132,9 +137,20 @@ namespace fastllm {
             if (!proposalReady) proposalReady = FastllmCudaEventCreate();
             if (!hostProposal) hostProposal = static_cast<int *>(FastllmCudaHostMalloc(block * sizeof(int)));
             if (!hostProposal || !proposalReady || pendingCount || count != block) return false;
-            if (!FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(hostProposal,
-                    static_cast<int *>(markovTokens.cudaData) + 1, count * sizeof(int))) return false;
-            FastllmCudaEventRecordCurrentThread(proposalReady);
+            const int *source = static_cast<const int *>(markovTokens.cudaData) + 1;
+            bool copied = false;
+            if (rootWinnerRecorded && !replayDone.empty()) {
+                if (!mirrorStream) mirrorStream = FastllmCudaStreamCreate();
+                if (mirrorStream) {
+                    FastllmCudaStreamWaitEvent(mirrorStream, replayDone.front());
+                    copied = FastllmCudaCopyFromDeviceToPinnedHostAsync(hostProposal, source, count * sizeof(int), mirrorStream);
+                    if (copied) FastllmCudaEventRecord(proposalReady, mirrorStream);
+                }
+            }
+            if (!copied) {
+                if (!FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(hostProposal, source, count * sizeof(int))) return false;
+                FastllmCudaEventRecordCurrentThread(proposalReady);
+            }
             pendingCount = count;
             packetPosition = -1;
             return true;
@@ -154,6 +170,11 @@ namespace fastllm {
                 if (i < replayDone.size() && replayDone[i]) FastllmCudaEventDestroy(replayDone[i]);
             }
             replayDone.clear();
+            rootWinnerRecorded = false;
+            if (!devices.empty()) FastllmCudaSetDevice(devices.front());
+            if (hcBranch.stream) { FastllmCudaStreamDestroy(hcBranch.stream); hcBranch.stream = nullptr; }
+            if (hcBranch.begin) { FastllmCudaEventDestroy(hcBranch.begin); hcBranch.begin = nullptr; }
+            if (hcBranch.done) { FastllmCudaEventDestroy(hcBranch.done); hcBranch.done = nullptr; }
             if (proposalReady && !devices.empty()) FastllmCudaSetDevice(devices.front());
             if (kvReady) { FastllmCudaEventDestroy(kvReady); kvReady = nullptr; }
             if (top1Ready) { FastllmCudaEventDestroy(top1Ready); top1Ready = nullptr; }
@@ -163,6 +184,8 @@ namespace fastllm {
                 FastllmCudaEventDestroy(verifyReady);
                 verifyReady = nullptr;
             }
+            if (mirrorStream) { FastllmCudaStreamDestroy(mirrorStream); mirrorStream = nullptr; }
+            if (packetStream) { FastllmCudaStreamDestroy(packetStream); packetStream = nullptr; }
             packetPosition = -1;
             if (proposalReady) { FastllmCudaEventDestroy(proposalReady); proposalReady = nullptr; }
             if (hostProposal) { FastllmCudaHostFree(hostProposal); hostProposal = nullptr; }
@@ -237,12 +260,17 @@ namespace fastllm {
 
         bool DsRunDraftGraph(DeepSeekV41DsparkWorkspace &state, const std::function<void()> &body, bool streamJoin = false) {
             const int root = state.devices.front();
+            state.rootWinnerRecorded = false;
             auto launch = [&]() {
                 if (state.devices.size() > 1) {
                     const auto replay = [&] {
                         std::vector<int> ok(state.devices.size(), 0);
                         FastllmCudaSetDevice(root);
                         if (!state.replayReady) state.replayReady = FastllmCudaEventCreate();
+                        // A rejected or early proposal can reuse the same token buffer.
+                        // Only the next writer of that buffer must wait for its CPU mirror.
+                        if (state.pendingCount && state.mirrorStream)
+                            FastllmCudaCurrentThreadStreamWaitEvent(state.proposalReady);
                         // The caller has updated draft context and input metadata.
                         // Join that producer before replay, then drain only the
                         // graph streams, leaving target cache admissions running.
@@ -260,6 +288,7 @@ namespace fastllm {
                         };
                         const bool queued = MultiCudaRunDeviceCallbacksEnqueueOnly(state.devices, runRank);
                         if (queued && events) {
+                            state.rootWinnerRecorded = true;
                             // The caller can submit the next graph while the workers run.
                             // Peer-local consumers and the root proposal copy both retain their dependencies.
                             for (size_t r = 1; r < state.devices.size(); ++r) {
@@ -558,6 +587,8 @@ namespace fastllm {
             std::vector<std::vector<int>> inputShapes;
             std::vector<int> devices;
             std::vector<size_t> offsets;
+            Data windowShadow, windowValid;
+            bool residentWindow = false;
             int bytes = 0;
             bool ready = false;
         };
@@ -653,8 +684,15 @@ namespace fastllm {
                 }
                 w->weights = std::move(weights);
                 w->inputShapes = {queryInput.dims, kv.dims, window.dims, indices.dims, position.dims};
+                w->residentWindow = count == 8 && rows == 5 && window.dims[1] == 128 &&
+                    getCudaInfos()->cudaArch == 1030 && FastllmCudaPeerAccessInit(devices);
+                if (w->residentWindow) {
+                    alloc(w->windowShadow, DataType::BFLOAT16, window.dims, devices.front());
+                    alloc(w->windowValid, DataType::INT32, {window.dims[1]}, devices.front());
+                    FastllmCudaMemset0(w->windowValid.cudaData, w->windowValid.GetBytes());
+                }
                 size_t bytes = 0;
-                for (size_t size : {queryInput.GetBytes(), kv.GetBytes(), window.GetBytes(),
+                for (size_t size : {queryInput.GetBytes(), kv.GetBytes(), w->residentWindow ? w->windowValid.GetBytes() : window.GetBytes(),
                                     indices.GetBytes(), sizeof(int32_t)}) {
                     w->offsets.push_back(bytes);
                     bytes = (bytes + size + 255) & ~size_t(255);
@@ -692,7 +730,10 @@ namespace fastllm {
                                                                indices.dims, position.dims})
                 return false;
             FastllmCudaSetDevice(devices.front());
-            for (int i = 0; i < 5; ++i)
+            if (w.residentWindow) {
+                FastllmCudaDsparkPackAttention(queryInput, kv, window, indices, position, w.windowShadow,
+                    w.windowValid, w.offsets.data(), w.ranks[0]->packet);
+            } else for (int i = 0; i < 5; ++i)
                 FastllmCudaCopyFromDeviceToDevice((char *)w.ranks[0]->packet.cudaData + w.offsets[i],
                                                   sources[i]->cudaData,
                                                   i == 4 ? sizeof(int32_t) : sources[i]->GetBytes());
@@ -720,14 +761,14 @@ namespace fastllm {
                                     data(0), *w.weights->wq.multiDeviceDatas.at(device), r.query.cudaData,
                                     rows, inner, localHeads * 512),
                                 "Draft TP Wq_b failed.");
-                AssertInFastLLM(FastllmCudaDeepSeekV41DraftRotaryTable(
-                                    r.query, localKv, localWindow, rope.ropeDim, rope.base, startPos,
-                                    rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow, pos,
-                                    r.table),
+                AssertInFastLLM(FastllmCudaDsparkDraftRotaryTable(r.query, localKv,
+                                    w.residentWindow ? window : localWindow, rope.ropeDim, rope.base, startPos,
+                                    rope.originalSeqLen, rope.factor, rope.betaFast, rope.betaSlow, pos, r.table,
+                                    w.residentWindow ? reinterpret_cast<const int *>(data(2)) : nullptr),
                                 "Draft TP rotary failed.");
-                AssertInFastLLM(FastllmCudaDeepSeekV41SparseAttention(r.query, localKv, nullptr, &r.table,
-                                                                      &localIndices, r.sink, 1, 0, scale,
-                                                                      r.attention),
+                // The rank-local reduction scratch is idle until after O-B on this stream.
+                AssertInFastLLM(FastllmCudaDsparkDraftSparseAttention(r.query, localKv, r.table,
+                                    localIndices, r.sink, scale, r.floatSum, r.attention),
                                 "Draft TP attention failed.");
                 AssertInFastLLM(
                     FastllmCudaDeepSeekV41RotaryQuantPosition(r.attention, rope.ropeDim, rope.base, startPos,
@@ -745,7 +786,9 @@ namespace fastllm {
                 const int elements = rows * woB.dims[0];
                 // Match row-parallel BF16 output: local GEMM rounds once,
                 // reduction accumulates in FP32, then rounds its final sum.
-                if (!FastllmCudaCustomAllReduce(r.partial.cudaData, r.partial.cudaData, elements,
+                const bool reduced = w.residentWindow && FastllmCudaCustomReduceOwnerBF16(
+                    r.partial.cudaData, elements, devices.front(), device);
+                if (!reduced && !FastllmCudaCustomAllReduce(r.partial.cudaData, r.partial.cudaData, elements,
                                                 DataType::BFLOAT16, device)) {
                     AssertInFastLLM(FastllmBF16ToFloat(r.partial.cudaData, r.floatSum.cudaData, elements),
                                     "Draft TP cast failed.");
@@ -2022,16 +2065,29 @@ namespace fastllm {
         if (!w.hostTop1) w.hostTop1 = static_cast<float *>(FastllmCudaHostMalloc(rows * 2 * sizeof(float)));
         if (!w.top1Ready) w.top1Ready = FastllmCudaEventCreate();
         if (!w.kvReady) w.kvReady = FastllmCudaEventCreate();
+        const bool packetAllocated = w.verifyPacket.cudaData != nullptr;
         allocate(w.verifyPacket, rows * (sizeof(int64_t) * layers * cols + sizeof(float) * (layers + 1)));
         if (!w.verifyReady) w.verifyReady = FastllmCudaEventCreate();
         FastllmV41VerifyHistory prefix{};
         for (int j = 0; j < ngram - 1; ++j)
             prefix.previous[j] = ds.committed > j ? state.engramHistory[ds.committed-1-j] : -1;
-        if (w.verifyReady && FastllmCudaV41DraftVerifyPacket(static_cast<const int *>(w.markovTokens.cudaData),
+        // Only the owner's final Markov token is read. Keep every rank's existing
+        // graph completion dependency for reusing collective buffers.
+        void *packetStream = nullptr;
+        if (packetAllocated && w.rootWinnerRecorded && !w.replayDone.empty()) {
+            if (!w.packetStream) w.packetStream = FastllmCudaStreamCreate();
+            packetStream = w.packetStream;
+            if (packetStream) FastllmCudaStreamWaitEvent(packetStream, w.replayDone.front());
+        }
+        if (w.verifyReady && FastllmCudaV41DraftVerifyPacketOnStream(static_cast<const int *>(w.markovTokens.cudaData),
                 ds.anchor, rows, static_cast<const int *>(w.verifyTokenMap.cudaData), engramMeta.tokenMap.size(),
                 engramMeta.padCompressedId, image_token_id, static_cast<const int64_t *>(w.verifyHash.cudaData),
-                layers, ngram, heads, prefix, w.verifyPacket.cudaData)) {
-            FastllmCudaEventRecordCurrentThread(w.verifyReady);
+                layers, ngram, heads, prefix, w.verifyPacket.cudaData, packetStream)) {
+            if (packetStream) {
+                FastllmCudaEventRecord(w.verifyReady, packetStream);
+                // A discarded proposal or a change of batch may reuse markovTokens.
+                FastllmCudaCurrentThreadStreamWaitEvent(w.verifyReady);
+            } else FastllmCudaEventRecordCurrentThread(w.verifyReady);
             w.packetPosition = ds.committed;
             ds.nextVerifyPosition = -1;
             if (previous.attentionRanks.size() == 1 && previous.attentionRanks.front()->stageNextPages &&
@@ -2496,6 +2552,69 @@ namespace fastllm {
         return slot;
     }
 
+#ifdef USE_CUDA
+    bool DeepSeekV41Model::DsparkProjectContext(Data &main, DeepSeekV41DsparkState &state, int batch,
+                                                int rows, const int *positions) {
+        if (!positions || state.layers.size() != 3 || head_dim_full != 512 || main.dataType != BFLOAT16 ||
+            main.multiDeviceData || main.dataDevice != CUDA || !main.cudaData ||
+            DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") || DsEnvFlag("FASTLLM_DSV41_DISABLE_FAKE_QUANT") ||
+            DsEnvFlag("FASTLLM_DSV41_LEGACY_ROTARY")) return false;
+        const int device = FastllmCudaGetDevice(), tokens = batch * rows;
+        Data *weights[3], *rings[3];
+        const Data *norms[3], *projected[3];
+        Data separate[3], joined;
+        bool grouped = tokens >= 2 && tokens <= 8;
+        for (int l = 0; l < 3; ++l) {
+            const auto pre = "mtp." + std::to_string(l) + ".attn.";
+            Data &w = weight[pre + "wkv.weight"], &n = weight[pre + "kv_norm.weight"];
+            if (n.multiDeviceData || n.dataType != FLOAT32 || n.Count(0) != 512 ||
+                w.multiDeviceData || w.dims != std::vector<int>{512, embed_dim}) return false;
+            n.ToDevice(CUDA, {device}, true);
+            rings[l] = &state.layers[l].windowKV;
+            norms[l] = &n;
+            weights[l] = &w;
+            grouped = grouped && quantizedLinearNames.count(pre + "wkv.weight") &&
+                FastllmCudaCanUseMarlinBFloat16FP8(w, tokens, embed_dim, 512);
+        }
+        if (grouped && embed_dim == 5120 && getCudaInfos()->cudaArch == 1030) {
+            auto &descriptor = v41DsparkContextWeights[device];
+            if (!descriptor.cudaData && !FastllmCudaGraphIsCapturingFast()) {
+                const void *pointers[6];
+                for (int i = 0; i < 3 && grouped; ++i) {
+                    weights[i]->ToDevice(CUDA, {device}, true);
+                    grouped = FastllmCudaPrepareMarlinBFloat16FP8(*weights[i], tokens, embed_dim, 512);
+                    if (grouped) {
+                        pointers[2 * i] = weights[i]->extraCudaData[4];
+                        pointers[2 * i + 1] = weights[i]->extraCudaData[5];
+                    }
+                }
+                if (grouped) {
+                    descriptor.dataType = INT8; descriptor.UpdateUnitSize(); descriptor.Resize({int(sizeof(pointers))});
+                    descriptor.ToDevice(CUDA, {device}, false); descriptor.Allocate(false);
+                    FastllmCudaCopyFromHostToDevice(descriptor.cudaData, pointers, sizeof(pointers));
+                }
+            }
+            grouped = descriptor.cudaData != nullptr;
+            if (grouped) {
+                joined.dataType = BFLOAT16; joined.UpdateUnitSize(); joined.Resize({3, tokens, 512});
+                joined.ToDevice(CUDA, {device}, false); joined.Allocate(false);
+                grouped = FastllmCudaDsparkContextProjection(main.cudaData, descriptor.cudaData, joined.cudaData, tokens);
+                if (grouped) for (int i = 0; i < 3; ++i) {
+                    separate[i].FakeFrom(joined, size_t(i) * tokens * 512 * 2);
+                    separate[i].Resize({tokens, 512});
+                    projected[i] = &separate[i];
+                }
+            }
+        } else grouped = false;
+        if (!grouped) for (int l = 0; l < 3; ++l) {
+            LinearWithActivationQuant(main, "mtp." + std::to_string(l) + ".attn.wkv.weight", separate[l]);
+            projected[l] = &separate[l];
+        }
+        return FastllmCudaDsparkContextStore(projected, norms, rings, false, batch, rows, positions,
+            rms_norm_eps, qk_rope_head_dim, rope_base, rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow);
+    }
+#endif
+
     bool DeepSeekV41Model::DsparkAdvanceBatch(const std::vector<DeepSeekV41Segment> &segments) {
         v41DsparkContextReady.reset();
 #ifdef USE_CUDA
@@ -2580,6 +2699,7 @@ namespace fastllm {
             main.Reshape({1, batch * rows, embed_dim});
             DsRopeParams rope = {qk_rope_head_dim, rope_base, 0, rope_factor, rope_scaling_beta_fast, rope_scaling_beta_slow};
             const auto *positions = (const int *)position.cudaData;
+            if (DsparkProjectContext(main, *storage, batch, rows, positions)) return;
             for (int l = 0; l < v41DsparkLayers; ++l) {
                 const std::string prefix = "mtp." + std::to_string(l);
                 Data kv;
@@ -2766,6 +2886,9 @@ namespace fastllm {
             DsRMSNormBF16(mainProj, weight[stage0 + ".main_norm.weight"], rms_norm_eps, mainX);
             mainX.Reshape({1, rows, embed_dim});
 
+#ifdef USE_CUDA
+            if (DsparkProjectContext(mainX, dspark, 1, rows, devicePosition)) return;
+#endif
             // 2) 每个草稿层用自己的 wkv / kv_norm 把 main_x 写进滑窗环形缓冲
             DsRopeParams windowRope = {qk_rope_head_dim, rope_base, 0, rope_factor,
                                        rope_scaling_beta_fast, rope_scaling_beta_slow};
@@ -2938,6 +3061,16 @@ namespace fastllm {
                 dspark.anchor = anchorToken; dspark.anchorPos = startPos;
                 return true;
             }
+        }
+#endif
+#ifdef USE_CUDA
+        if (dspark.workspace) {
+            auto &w = *dspark.workspace;
+            if (w.pendingCount && w.mirrorStream) {
+                FastllmCudaSetDevice(w.devices.front());
+                FastllmCudaCurrentThreadStreamWaitEvent(w.proposalReady);
+            }
+            w.rootWinnerRecorded = false;
         }
 #endif
         ApplyDsparkDevice();
@@ -3126,6 +3259,12 @@ namespace fastllm {
             if (!dspark.workspace->disabled) {
                 graphState = dspark.workspace.get();
                 graphState->sharedExperts.resize(v41DsparkLayers);
+                if (deviceInputs && dim == 5120 && rows == 5 && getCudaInfos()->cudaArch == 1030) {
+                    auto &branch = graphState->hcBranch;
+                    if (!branch.stream) branch.stream = FastllmCudaStreamCreate();
+                    if (!branch.begin) branch.begin = FastllmCudaEventCreate();
+                    if (!branch.done) branch.done = FastllmCudaEventCreate();
+                }
                 auto upload = [&](Data &dst, DataType type, const std::vector<int> &dims, const void *data) {
                     if (dst.dims.empty()) {
                         dst.dataType = type; dst.UpdateUnitSize(); dst.Resize(dims);
@@ -3232,7 +3371,17 @@ namespace fastllm {
                     quantizedLinearNames.count(pre + ".attn.wq_a.weight") &&
                     quantizedLinearNames.count(pre + ".attn.wkv.weight") &&
                     quantizedLinearNames.count(pre + ".attn.wq_b.weight");
-                const bool inputQuantized = DsHcMixPreNorm(*curHidden, layerPreMix, weight[pre + ".hc_attn_fn"],
+                bool forked = false;
+#ifdef USE_CUDA
+                if (graphState && graphState->hcBranch.stream && graphState->hcBranch.begin &&
+                    graphState->hcBranch.done && quantizeInput && DsFusedHcEnabled()) {
+                    forked = FastllmCudaDsparkHcFork(*curHidden, layerPreMix, weight[pre + ".hc_attn_fn"],
+                        weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
+                        weight[pre + ".attn_norm.weight"], hc_sinkhorn_iters, hc_eps, rms_norm_eps,
+                        attnPre, attnPost, attnComb, attnInput, &attnQuant, graphState->hcBranch);
+                }
+#endif
+                const bool inputQuantized = forked || DsHcMixPreNorm(*curHidden, layerPreMix, weight[pre + ".hc_attn_fn"],
                     weight[pre + ".hc_attn_scale"], weight[pre + ".hc_attn_base"],
                     weight[pre + ".attn_norm.weight"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                     attnPre, attnPost, attnComb, x, attnInput, quantizeInput ? &attnQuant : nullptr);
@@ -3245,7 +3394,10 @@ namespace fastllm {
                 }
                 bool parallelAttention = false;
 #ifdef USE_CUDA
-                if (graphState && graphState->devices.size() > 1 && qkvPrepared && graphState->deviceInputs) {
+                const bool ownerAttention = qkvPrepared && block == 5 && width == 132 &&
+                    num_attention_heads == 64 && FastllmCudaRuntimeArch() == 103 &&
+                    !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH") && !DsEnvFlag("FASTLLM_DSV41_LEGACY_ATTN");
+                if (!ownerAttention && graphState && graphState->devices.size() > 1 && qkvPrepared && graphState->deviceInputs) {
                     parallelAttention = DsParallelAttention(
                         graphState->devices, qQuant, kv, dspark.layers[stage].windowKV, attentionIndices,
                         graphState->position, weight[pre + ".attn.wq_b.weight"],
@@ -3289,6 +3441,11 @@ namespace fastllm {
                     }
                     AssertInFastLLM(table.dims.size() == 3 && table.dims[1] == tableRows,
                                     "DeepSeekV41 DSpark: draft attention gather table has a wrong size.");
+#ifdef USE_CUDA
+                    Data scores;
+                    if (!ownerAttention || !FastllmCudaDsparkDraftSparseAttention(q, kv, table, attentionIndices,
+                            weight[pre + ".attn.attn_sink"], softmaxScale, scores, attnOut))
+#endif
                     DsSparseAttention(q, kv, nullptr, &table, &attentionIndices,
                                       weight[pre + ".attn.attn_sink"], 1, 0, softmaxScale, attnOut);
                     rotate(attnOut, true, 0);
@@ -3298,6 +3455,7 @@ namespace fastllm {
                 }
                 bool fusedPost = false;
 #ifdef USE_CUDA
+                if (forked) FastllmCudaCurrentThreadStreamWaitEvent(graphState->hcBranch.done);
                 fusedPost = DsHcPostMixPreNorm(attnProj, *curHidden, attnPre, attnPost, attnComb,
                     weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
                     weight[pre + ".hc_ffn_base"], weight[pre + ".ffn_norm.weight"],
@@ -3389,7 +3547,14 @@ namespace fastllm {
                     }
                 }
 
-                {
+                bool expertPostReady = false;
+#ifdef FASTLLM_ENABLE_DSV41_SM100_MEGA
+                if (GetCudaSharedExpert() && swiglu_limit == 10.f && v41DsparkTopk == 3 &&
+                    !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH"))
+                    expertPostReady = MultiCudaDsv41DraftExperts(ffnInput, expertIndex, expertScore,
+                        *curHidden, ffnPost, ffnComb, *nextHidden, v41DsparkMoeWeights[stage], v41DsparkTpDevices);
+#endif
+                if (!expertPostReady) {
                     std::vector<Data*> moeWeights = v41DsparkMoeWeights[stage];
 #ifdef USE_NUMAS
                     HostMoePlacementScope placement(moeWeights.size() > 2 ? moeWeights[2] : nullptr);
@@ -3498,21 +3663,31 @@ namespace fastllm {
                         if (dsparkCapturing && graphState->parallelExperts) FastllmCudaGraphMarkParallelJoin(stage);
 #endif
                         ffnOut.ToDevice(shared.output.dataDevice);
-                        // Grouped GGUF experts accumulate into FP32; the shared expert
-                        // is BF16. Add in FP32 before the model's BF16 MoE boundary.
-                        Data *sharedOutput = &shared.output;
-                        if (shared.output.dataType != ffnOut.dataType) {
-                            ToDataType(shared.output, shared.floatOutput, ffnOut.dataType);
-                            sharedOutput = &shared.floatOutput;
+#ifdef USE_CUDA
+                        const auto &owner = curHidden->dataDeviceIds;
+                        if (!ffnOut.multiDeviceData && !shared.output.multiDeviceData &&
+                            owner.size() == 1 && owner.front() == FastllmCudaGetDevice() &&
+                            ffnOut.dataDeviceIds == owner && shared.output.dataDeviceIds == owner &&
+                            ffnPost.dataDeviceIds == owner && ffnComb.dataDeviceIds == owner) {
+                            expertPostReady = FastllmCudaDeepSeekV41MoeHcPost(ffnOut, shared.output,
+                                *curHidden, ffnPost, ffnComb, *nextHidden);
                         }
-                        AddTo(ffnOut, *sharedOutput);
+#endif
+                        if (!expertPostReady) {
+                            Data *sharedOutput = &shared.output;
+                            if (shared.output.dataType != ffnOut.dataType) {
+                                ToDataType(shared.output, shared.floatOutput, ffnOut.dataType);
+                                sharedOutput = &shared.floatOutput;
+                            }
+                            AddTo(ffnOut, *sharedOutput);
+                        }
                     }
                 }
-                if (ffnOut.dataType != DataType::BFLOAT16) {
-                    ToDataType(ffnOut, DataType::BFLOAT16);
+                if (!expertPostReady) {
+                    if (ffnOut.dataType != DataType::BFLOAT16) ToDataType(ffnOut, DataType::BFLOAT16);
+                    ffnOut.Reshape(ffnDims);
+                    DsHcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
                 }
-                ffnOut.Reshape(ffnDims);
-                DsHcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
                 std::swap(curHidden, nextHidden);
                 layerPreMix.CopyFrom(ffnPre);
             }

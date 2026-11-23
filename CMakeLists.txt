@@ -964,7 +964,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
         "--ptxas-options=--register-usage-level=10")
     set_property(SOURCE src/devices/multicuda/multicudadevice.cpp src/devices/cuda/fastllm-cuda.cu
-        src/models/deepseekv41_gpu.cpp APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_SM100_MEGA)
+        src/models/deepseekv41_gpu.cpp src/models/deepseekv41_dspark.cpp APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DSV41_SM100_MEGA)
     set(FASTLLM_MXFP8_LINEAR_OBJECTS $<TARGET_OBJECTS:fastllm_mxfp8_linear_sm103>
         $<TARGET_OBJECTS:fastllm_dsv41_mega_sm103>)
 endif()

@@ -13,7 +13,7 @@ size_t FastllmDsv41MegaWorkspaceBytes();
 void FastllmDsv41MegaInitWorkspace(void *workspace, const int *devices, int rank);
 FastllmDsv41MegaLayer *FastllmDsv41MegaCreate(
     const void *const *gate, const void *const *down,
-    void *const *workspaces, int rank, const void *cacheKey = nullptr);
+    void *const *workspaces, int rank, const void *cacheKey = nullptr, int experts = 384);
 bool FastllmDsv41MegaGraphReady(const void *cacheKey, int rows);
 void FastllmDsv41MegaDestroy(FastllmDsv41MegaLayer *layer);
 void FastllmDsv41MegaRun(FastllmDsv41MegaLayer *layer, const void *inputBf16,
@@ -31,6 +31,9 @@ void FastllmDsv41MegaRunShared(FastllmDsv41MegaLayer *layer, const void *inputBf
 // launch the same expert collective and need no operand buffers.
 void FastllmDsv41MegaRunLocal(FastllmDsv41MegaLayer *layer, const void *input,
     const int32_t *ids, const float *scores, void *output, int localRows, void *stream);
+void FastllmDsv41MegaDraftPost(FastllmDsv41MegaLayer *layer, const void *input,
+    const int32_t *ids, const float *scores, const void *residual, const float *post,
+    const float *comb, void *hidden, int rows);
 const void *FastllmDsv41OwnerPostKernel();
 const void *FastllmDsv41PrepareKernel();
 void FastllmDsv41MegaRunLocalPost(FastllmDsv41MegaLayer *layer, const void *input,
@@ -57,6 +60,8 @@ namespace fastllm {
 class Data;
 std::vector<FastllmDsv41MegaLayer *> MultiCudaDsv41SharedLayers(const Data *key,
     const std::vector<int> &devices);
+bool MultiCudaDsv41DraftExperts(Data &input, Data &ids, Data &scores, Data &residual, Data &post,
+    Data &comb, Data &output, std::vector<Data *> &weights, const std::vector<int> &devices);
 bool MultiCudaDsv41CombinedExperts(Data &input, Data &ids, Data &scores,
     std::vector<Data *> &routed, Data &gate, Data &down, Data &output,
     const std::vector<int> &devices, bool runDecode);

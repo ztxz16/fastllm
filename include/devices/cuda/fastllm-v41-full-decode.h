@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 // Separate causal layouts without a fixed batch-size offset or key collision.
@@ -72,6 +73,8 @@ void *FastllmCudaV41CreateVerifyPages(const FastllmV41FullDecodeRequest *layers,
 void FastllmCudaV41DestroyVerifyPages(void *slot);
 bool FastllmCudaV41StageVerifyPages(void *slot, int position);
 bool FastllmCudaV41ConsumeVerifyPages(void *slot, void *graphRequests);
+bool FastllmCudaV41PublishVerifyInputs(void *slot, void *pageDestination, void *packetDestination,
+    const void *packet, size_t packetBytes, void *packetReady, void *lastPageRead, void *lastPacketRead);
 
 struct FastllmV41VerifyStops {
     int size = 0;
@@ -88,6 +91,9 @@ struct FastllmV41VerifyHistory {
 bool FastllmCudaV41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *tokenMap,
     int vocab, int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
     FastllmV41VerifyHistory history, void *packet);
+bool FastllmCudaV41DraftVerifyPacketOnStream(const int *ids, int anchor, int rows, const int *tokenMap,
+    int vocab, int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
+    FastllmV41VerifyHistory history, void *packet, void *stream);
 
 struct FastllmV41VerifyCommitLayer {
     const FastllmV41FullDecodeRequest *requests = nullptr;
@@ -130,6 +136,8 @@ std::vector<void *> FastllmCudaV41CaptureNodes();
 void *FastllmCudaV41WithoutIndexProjections(const void *graph, const std::vector<void *> &nodes);
 void *FastllmCudaV41CaptureFrontier();
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+bool FastllmCudaV41ComposeEngramForks(const std::vector<const void *> &parts,
+        const std::vector<std::pair<int, int>> &forks, void **outGraph, void **outExec);
 void *FastllmCudaV41ForkIndexProjections(const void *const *children, int count, const void *original,
         const std::vector<void *> &projectionNodes, const void *plan, void *rawWeights,
         float *mixScratch, void **ownerGemm);

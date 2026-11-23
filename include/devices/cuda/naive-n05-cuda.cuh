@@ -64,6 +64,8 @@ inline bool FastllmNaiveCanSelectLogits(int vocab, int offset, int count, bool g
                                vocab <= kNaiveLogitsMaxShard);
 }
 
+bool FastllmCudaFullLogitsTop1(const fastllm::Data &logits, fastllm::Data &output);
+
 // Contiguous FP32 vocabulary shards. Output [rows, count * 2] holds global
 // ID/score pairs. Missing candidates use ID -1; greedy ignores NaN/-infinity.
 // Greedy retains the legacy Top1 tie order. Sampling returns score-descending,

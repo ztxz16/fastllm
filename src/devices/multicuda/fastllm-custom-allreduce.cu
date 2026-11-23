@@ -374,9 +374,9 @@ void FastllmCustomAllReduceAndGatherKernel(CustomArRankData *routedData,
 }
 
 // Scalar uint64 maximum: exact integer ordering, including encoded argmax keys.
-template <int Ranks>
+template <int Ranks, bool Markov>
 __global__ void FastllmCustomScalarMaxUint64Kernel(CustomArRankData *data,
-        CustomArRankSignals signals, CustomArSignal *self, unsigned long long *output, int rank) {
+        CustomArRankSignals signals, CustomArSignal *self, unsigned long long *output, int rank, int *tokens, const __nv_bfloat16 *embed, float *context) {
     const CustomArRankData pointers = *data;
     CustomArBarrierStart<Ranks>(signals, self, rank);
     unsigned long long value = threadIdx.x < Ranks ?
@@ -388,10 +388,20 @@ __global__ void FastllmCustomScalarMaxUint64Kernel(CustomArRankData *data,
     }
     CustomArBarrierFinal<Ranks>(signals, self, rank);
     __syncthreads();
+    if constexpr (Markov) {
+        // tokens[0] is the preceding winner. Only the owner consumes embeddings.
+        if (context) {
+            const auto previous = static_cast<int64_t>(tokens[0]);
+#pragma unroll
+            for (int i = 0; i < 256; i += 32)
+                context[i + threadIdx.x] = __bfloat162float(embed[previous * 256 + i + threadIdx.x]);
+        }
+        if (threadIdx.x == 0) tokens[1] = int(0xffffffffu - unsigned(value));
+    }
     if (threadIdx.x == 0) *output = value;
 }
 
-template <typename T, int Ranks>
+template <typename T, int Ranks, bool OwnerOnly = false>
 __global__ __launch_bounds__(kCustomArThreads, 1)
 void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
                                   CustomArRankSignals allSignals,
@@ -406,7 +416,7 @@ void FastllmCustomAllReduceKernel(CustomArRankData *rankData,
     P deferredResult;
     int deferredIndex = -1;
     for (int index = blockIdx.x * blockDim.x + threadIdx.x;
-         index < packedCount; index += gridDim.x * blockDim.x) {
+         (!OwnerOnly || rank == 0) && index < packedCount; index += gridDim.x * blockDim.x) {
         const P *first = reinterpret_cast<const P *>(pointers.ptrs[0]);
         P firstValue = first[index];
         A sum;
@@ -3037,6 +3047,32 @@ bool FastllmCudaCustomAllReduce(void *data, void *dest, int count,
     return RunCustomArCandidate(data, dest, count, dataType, deviceId, true);
 }
 
+// The consumer lives on the first device. Peers publish their BF16 inputs
+// and keep them alive through the final barrier without reading other shards.
+bool FastllmCudaCustomReduceOwnerBF16(void *data, int count, int owner, int device) {
+    if (count <= 0 || count % 8 || size_t(count) * 2 > CustomArMaxBytes()) return false;
+    auto &state = GetCustomArState();
+    CustomArCallLease lease;
+    int rank = -1;
+    const int type = fastllm::DataType::BFLOAT16;
+    if (!lease.Acquire(state, size_t(count) * 2, type, device, true, rank) ||
+        state.devices.size() != 8 || state.devices.front() != owner) return false;
+    CustomArRankData *pointers = nullptr;
+    const bool eligible = data && (reinterpret_cast<uintptr_t>(data) % 16 == 0);
+    if (!FindOrRegisterCustomArPointers(state, rank, data, count, type, eligible, pointers)) return false;
+    const int packed = count / 8;
+    const int threads = 128;
+    const int blocks = std::min(kCustomArMaxBlocks, (packed + threads - 1) / threads);
+    FastllmCustomAllReduceKernel<__nv_bfloat16, 8, true><<<blocks, threads, 0, cudaStreamPerThread>>>(
+        pointers, state.allSignals, state.allSignals.signals[rank], static_cast<__nv_bfloat16 *>(data),
+        rank, packed, false);
+    if (cudaGetLastError() != cudaSuccess) {
+        FastllmCudaSetThreadError();
+        return false;
+    }
+    return true;
+}
+
 bool FastllmCudaCustomAllReduceWithSpin(void *data, void *dest, int count,
                                       int dataType, int deviceId, int hostSpinMicroseconds) {
     return RunCustomArCandidate(data, dest, count, dataType, deviceId, true, 0,
@@ -3401,7 +3437,8 @@ bool FastllmCudaCustomAllReduceAdd(void *data, void *dest, int count,
                                    true);
 }
 
-bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId) {
+template <bool Markov>
+static bool CustomScalarMax(void *value, int deviceId, int *tokens, const void *embed, float *context) {
     CustomArState &state = GetCustomArState();
     CustomArCallLease lease;
     int rank = -1;
@@ -3411,13 +3448,14 @@ bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId) {
                        deviceId, true, rank)) return false;
     CustomArRankData *pointers = nullptr;
     // A distinct rendezvous tag prevents pairing a mismatched SUM/MAX round.
-    constexpr int scalarMaxRegistration = -2;
-    const bool eligible = value && (((uintptr_t)value & 7u) == 0);
+    constexpr int scalarMaxRegistration = Markov ? -7 : -2;
+    const bool eligible = (!Markov || (tokens && (!context || embed))) && value && (((uintptr_t)value & 7u) == 0);
     if (!FindOrRegisterCustomArPointers(state, rank, value, 1,
             scalarMaxRegistration, eligible, pointers)) return false;
-#define CUSTOM_MAX_CASE(N) case N: FastllmCustomScalarMaxUint64Kernel<N> \
+#define CUSTOM_MAX_CASE(N) case N: FastllmCustomScalarMaxUint64Kernel<N, Markov> \
         <<<1, 32, 0, cudaStreamPerThread>>>(pointers, state.allSignals, \
-            state.allSignals.signals[rank], (unsigned long long*)value, rank); break
+            state.allSignals.signals[rank], (unsigned long long*)value, rank, tokens, \
+            static_cast<const __nv_bfloat16 *>(embed), context); break
     switch (state.devices.size()) {
         CUSTOM_MAX_CASE(2);
         CUSTOM_MAX_CASE(4);
@@ -3428,4 +3466,12 @@ bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId) {
 #undef CUSTOM_MAX_CASE
     if (cudaGetLastError() != cudaSuccess) { FastllmCudaSetThreadError(); return false; }
     return true;
+}
+
+bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId) {
+    return CustomScalarMax<false>(value, deviceId, nullptr, nullptr, nullptr);
+}
+
+bool FastllmCudaCustomMarkovWinner(void *value, int device, int *tokens, const void *embed, float *context) {
+    return CustomScalarMax<true>(value, device, tokens, embed, context);
 }

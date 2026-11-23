@@ -92,20 +92,32 @@ bool Descriptor(Desc &d, void *ptr, CUtensorMapDataType type, int inner, int out
                CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-template <int M, int Cluster, bool FixedQA = false, bool PanelB = false> struct Projection {
+template <int M, int Cluster, bool FixedQA = false, bool PanelB = false, bool VerifyOB = false, int OutputSlices = 1> struct Projection {
     // Large-M prefill uses the 128x256x128, five-stage Blackwell configuration
     // with B multicast. Small rows use the transposed MMA and A multicast.
     static constexpr bool Prefill = M == 128;
     static constexpr int N = Prefill ? 256 : 128;
-    static constexpr int Grid = FixedQA ? 1792 / N : kSMs;
-    static constexpr int Stages = FixedQA ? 10 : Prefill ? 5 : M == 16 ? (Cluster == 2 ? 12 : 11) : 10;
+    static constexpr int Grid = VerifyOB ? 5120 / N : FixedQA ? 1792 / N : kSMs;
+    static constexpr int Stages = OutputSlices > 1 ? 11 : FixedQA ? 10 : Prefill ? 5 : M == 16 ? (Cluster == 2 ? 12 : 11) : 10;
     static constexpr int Shared = Prefill ? 205116 : 230204;
     static auto Kernel() {
-        return &dg::sm100_fp8_fp4_gemm_1d1d_impl<cute::UMMA::Major::K, cute::UMMA::Major::K, 32, 32, 32, 0, FixedQA ? 1792 : 0,
-                                                 FixedQA ? 5120 : 0, M, N, 128, 1, 128, 128, 128, Stages, 2, 128, 128, Cluster,
+        return &dg::sm100_fp8_fp4_gemm_1d1d_impl<cute::UMMA::Major::K, cute::UMMA::Major::K, 32, 32, 32, VerifyOB ? 6 : 0, VerifyOB ? 5120 : FixedQA ? 1792 : 0,
+                                                 VerifyOB ? 8192 : FixedQA ? 5120 : 0, M, N, 128, 1, 128, 128, 128, Stages, 2, 128, 128, Cluster,
                                                  (!Prefill && Cluster == 2), Grid, !Prefill, true, dg::GemmType::Normal, false,
                                                  cutlass::float_e4m3_t, cutlass::float_e4m3_t,
-                                                 cutlass::bfloat16_t, dg::epilogue::operators::Identity, PanelB>;
+                                                 cutlass::bfloat16_t, dg::epilogue::operators::Identity, PanelB, VerifyOB, OutputSlices>;
+    }
+    static bool WeightDescriptor(Desc &map, void *weight, int n, int k) {
+        if constexpr (OutputSlices > 1) {
+            const cuuint64_t dims[] = {128, 128 / OutputSlices, OutputSlices, uint64_t(k / 128), uint64_t(n / 128)};
+            const cuuint64_t strides[] = {128, 16384 / OutputSlices, 16384, uint64_t(128) * k};
+            const cuuint32_t tile[] = {128, 128, 1, 1, 1}, step[] = {1, 1, 1, 1, 1};
+            return cuTensorMapEncodeTiled(reinterpret_cast<CUtensorMap *>(&map), CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                5, weight, dims, strides, tile, step, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+        }
+        return Descriptor(map, weight, CU_TENSOR_MAP_DATA_TYPE_UINT8, PanelB ? 128 : k,
+                          PanelB ? n * (k / 128) : n, 1, 128, 128, true);
     }
     static bool Configure() {
         return cudaFuncSetAttribute(Kernel(), cudaFuncAttributeMaxDynamicSharedMemorySize, Shared) ==
@@ -114,7 +126,7 @@ template <int M, int Cluster, bool FixedQA = false, bool PanelB = false> struct 
     static bool Run(void *q, void *w, void *sa, void *sw, void *y, int rows, int n, int k, int pitch) {
         Desc a, b, as, bs, c;
         if (!Descriptor(a, q, CU_TENSOR_MAP_DATA_TYPE_UINT8, k, rows, 1, 128, Prefill ? M : M / Cluster, true) ||
-            !Descriptor(b, w, CU_TENSOR_MAP_DATA_TYPE_UINT8, PanelB ? 128 : k, PanelB ? n * (k / 128) : n, 1, 128, 128, true) ||
+            !WeightDescriptor(b, w, n, k) ||
             !Descriptor(as, sa, CU_TENSOR_MAP_DATA_TYPE_INT32, pitch, k / 128, 4, 128, 1, false) ||
             !Descriptor(bs, sw, CU_TENSOR_MAP_DATA_TYPE_INT32, n, k / 128, 4, N, 1, false) ||
             !Descriptor(c, y, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, n, rows, 2, 64, Prefill ? M : 16, true))
@@ -123,14 +135,16 @@ template <int M, int Cluster, bool FixedQA = false, bool PanelB = false> struct 
         attr.id = cudaLaunchAttributeClusterDimension;
         attr.val.clusterDim = {Cluster, 1, 1};
         cudaLaunchConfig_t cfg{};
-        cfg.gridDim = dim3(Grid);
+        cfg.gridDim = dim3(Grid, 1, OutputSlices);
         cfg.blockDim = dim3(256);
         cfg.dynamicSmemBytes = Shared;
         cfg.stream = cudaStreamPerThread;
         cfg.attrs = &attr;
         cfg.numAttrs = 1;
+        dg::EpilogueOperatorArgs ep{};
+        if constexpr (OutputSlices > 1) ep.directOutput = y;
         auto status = cudaLaunchKernelEx(&cfg, Kernel(), (int *)nullptr, (uint32_t)rows, (uint32_t)n,
-                                         (uint32_t)k, dg::EpilogueOperatorArgs{}, a, b, as, bs, c);
+                                         (uint32_t)k, ep, a, b, as, bs, c);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         return true;
     }

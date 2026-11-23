@@ -2,10 +2,16 @@
 // and its three K stripes. Cooperative vector loads feed those same lanes.
 struct alignas(8) VerifyPairs { Pair data[2]; };
 
-template <bool Experts>
+struct VerifyDraftFeature {
+    Pair *packed;
+    const int *globalRows;
+    int slot, features;
+};
+
+template <bool Experts, bool Publish = false>
 __device__ __forceinline__ void VerifyPostBody(const Pair *attention, const Pair *residual,
         const float *post, const float *comb, const float *pre, const float *weight, float eps,
-        Pair *hidden, Pair *normalized, ExpertBoundary ep, FastllmDsv41InputPacket packet) {
+        Pair *hidden, Pair *normalized, ExpertBoundary ep, FastllmDsv41InputPacket packet, VerifyDraftFeature feature = {}) {
 #if __CUDA_ARCH__ == 1030
     using Vec = VerifyPairs;
     constexpr int V = 2, Blocks = 8;
@@ -25,6 +31,8 @@ __device__ __forceinline__ void VerifyPostBody(const Pair *attention, const Pair
     }
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 
+    // Cluster storage is private. All reads of upstream tensors follow this wait.
+    if constexpr (!Experts) cudaGridDependencySynchronize();
     float2 x[V]{}, folded[V]{};
     float4 normWeights;
     float squares[V]{};
@@ -32,16 +40,20 @@ __device__ __forceinline__ void VerifyPostBody(const Pair *attention, const Pair
         normWeights = reinterpret_cast<const float4 *>(weight)[vector];
         if constexpr (Experts) {
             const unsigned order = ep.ids[row];
+            // Independent slot loads can overlap before the ordered FP32 sum.
+            Vec contributions[6]{};
+#pragma unroll
+            for (int k = 0; k < 6; ++k) {
+                const unsigned entry = order >> (5 * k);
+                if (entry & 8)
+                    contributions[k] = reinterpret_cast<const Vec *>(ep.slots)[
+                        (((entry & 7) * (FastllmDsv41MegaMaxRows / 8) + row) * width / V) + vector];
+            }
             float2 partial[V]{};
 #pragma unroll
             for (int k = 0; k < 6; ++k) {
                 const unsigned entry = order >> (5 * k);
-                Vec val{};
-                if (entry & 8) {
-                    const int slot = entry & 7;
-                    val = reinterpret_cast<const Vec *>(ep.slots)[
-                        ((slot * (FastllmDsv41MegaMaxRows / 8) + row) * width / V) + vector];
-                }
+                const Vec val = contributions[k];
 #pragma unroll
                 for (int i = 0; i < V; ++i) {
                     partial[i] = __fadd2_rn(partial[i], __bfloat1622float2(val.data[i]));
@@ -63,6 +75,7 @@ __device__ __forceinline__ void VerifyPostBody(const Pair *attention, const Pair
 #pragma unroll
             for (int i = 0; i < V; ++i) x[i] = __bfloat1622float2(v.data[i]);
         }
+        float2 mean[V]{};
         Vec residuals[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i)
@@ -78,12 +91,19 @@ __device__ __forceinline__ void VerifyPostBody(const Pair *attention, const Pair
                     mix = MixMultiplyAdd(comb[row * 16 + 4 * k + j], __bfloat1622float2(residuals[k].data[i]), mix);
                 mix = MixMultiplyAdd(post[row * 4 + j], x[i], mix);
                 updated.data[i] = __floats2bfloat162_rn(mix.x, mix.y);
-                folded[i] = MixMultiplyAdd(pre[row * 4 + j], __bfloat1622float2(updated.data[i]), folded[i]);
+                const float2 rounded = __bfloat1622float2(updated.data[i]);
+                folded[i] = MixMultiplyAdd(pre[row * 4 + j], rounded, folded[i]);
+                if constexpr (Publish)
+                    mean[i] = __fadd2_rn(mean[i], __fmul2_rn(make_float2(.25f, .25f), rounded));
             }
             reinterpret_cast<Vec *>(hidden)[(row * 4 + j) * width / V + vector] = updated;
         }
 #pragma unroll
         for (int i = 0; i < V; ++i) {
+            if constexpr (Publish) {
+                const size_t dest = size_t(feature.globalRows[row]) * feature.features + feature.slot;
+                feature.packed[dest * width + vector * V + i] = __floats2bfloat162_rn(mean[i].x, mean[i].y);
+            }
             auto v = __bfloat1622float2(__floats2bfloat162_rn(folded[i].x, folded[i].y));
             folded[i] = v;
             squares[i] = v.x * v.x + v.y * v.y;
@@ -172,6 +192,12 @@ __global__ __launch_bounds__(192) void VerifyExpertNorm(const Pair *residual, co
         const float *comb, const float *pre, const float *weight, float eps, Pair *hidden,
         Pair *normalized, ExpertBoundary boundary) {
     VerifyPostBody<true>(nullptr, residual, post, comb, pre, weight, eps, hidden, normalized, boundary, {});
+}
+
+__global__ __launch_bounds__(192) void VerifyExpertFeatureNorm(const Pair *residual, const float *post,
+        const float *comb, const float *pre, const float *weight, float eps, Pair *hidden,
+        Pair *normalized, ExpertBoundary boundary, VerifyDraftFeature feature) {
+    VerifyPostBody<true, true>(nullptr, residual, post, comb, pre, weight, eps, hidden, normalized, boundary, {}, feature);
 }
 
 inline bool VerifyPostCluster(const void *kernel) {

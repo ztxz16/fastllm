@@ -41,10 +41,12 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int>& devices);
 // Disable the published policy, drain the old device group and release all
 // group-owned signal, scratch and pointer-registration allocations.
 void FastllmCudaCustomAllReduceReset();
+bool FastllmCudaCustomReduceOwnerBF16(void *data, int count, int owner, int device);
 bool FastllmCudaCustomAllReduce(void* data, void* dest, int count,
                                 int dataType, int deviceId);
 // In-place unsigned maximum of one 8-byte value. Call on every active rank.
 // Alignment/capture-registration misses are rejected collectively before launch.
+bool FastllmCudaCustomMarkovWinner(void *value, int device, int *tokens, const void *embed, float *context);
 bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId);
 // Optional bounded host spin for dedicated decode submission cores. The
 // pointer registration and collective fallback checks remain unchanged.

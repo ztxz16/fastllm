@@ -42,6 +42,7 @@ extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data &, const fastll
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
 #include "fastllm-v41-decode.cuh"
+#include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "devices/cuda/fastllm-cuda-linear-shared.h"
 #include "devices/cuda/fastllm-append-only-cuda-rows.h"
@@ -83,8 +84,7 @@ namespace fastllm {
     namespace {
         bool V41VerifyOwnerFfnEnabled() {
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-            return V41EnvFlag("FASTLLM_DSV41_LOCAL_EP_GRAPH") && V41EnvFlag("FASTLLM_DSV41_VERIFY_OWNER_FFN") &&
-                !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
+            return V41EnvFlag("FASTLLM_DSV41_LOCAL_EP_GRAPH") && !V41EnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
 #else
             return false;
 #endif
@@ -1938,7 +1938,7 @@ namespace fastllm {
         // 在 axis=1 上追加行（预扩容 + CatDirect），cache 需为 [b, cap, d]
         // 张量并行时缓存是每卡一份：扩容必须逐卡执行，root 只保留形状信息。
         void V41AppendRows(Data &cache, const Data &rows,
-                           const std::vector<int> &tpDevices = std::vector<int>()) {
+                           const std::vector<int> &tpDevices = std::vector<int>(), int reserveRows = 0) {
             const int unitLen = 256;
             if (cache.dims.size() == 0 && cache.expansionDims.size() == 0) {
                 cache.dataType = rows.dataType;
@@ -1967,6 +1967,36 @@ namespace fastllm {
             const int needRows = haveRows + rows.dims[1];
             AssertInFastLLM(!cache.isFake || V41CacheRowCapacity(cache) >= needRows,
                 "DeepSeekV41 fixed KV context capacity exceeded");
+#ifdef USE_CUDA
+            // At the first append, a known generation budget can cross the next
+            // compressed-KV slab. Allocate at most one extra slab before the
+            // first output, so a live verifier keeps stable page addresses.
+            const int64_t rounded = (int64_t(needRows) + unitLen - 1) / unitLen * unitLen;
+            if (reserveRows > rounded && rounded + unitLen <= INT_MAX && !tp && !cache.isFake &&
+                cache.dims.empty() && cache.expansionDims.empty() && !cache.cudaData && !cache.cpuData &&
+                !cache.multiDeviceData && !rows.multiDeviceData && rows.dataDevice == CUDA && rows.dims[0] == 1 &&
+                (rows.dataType == INT8 || rows.dataType == BFLOAT16) &&
+                (rows.dataDeviceIds.empty() || rows.dataDeviceIds == std::vector<int>{FastllmCudaGetDevice()})) {
+                const int capacity = int(rounded) + unitLen;
+                const uint64_t elements = uint64_t(capacity) * rows.dims[2];
+                void *buffer = nullptr;
+                const auto status = FastllmCudaTryMalloc(&buffer, elements * rows.unitSize);
+                AssertInFastLLM(status != FASTLLM_CUDA_TRY_MALLOC_ERROR, "DeepSeekV41 initial verifier KV reserve failed");
+                if (status == FASTLLM_CUDA_TRY_MALLOC_SUCCESS) {
+                    cache.cudaData = buffer;
+                    cache.directMemory = false;
+                    cache.dataDevice = CUDA;
+                    cache.dataDeviceIds = {FastllmCudaGetDevice()};
+                    cache.Resize({1, capacity, rows.dims[2]});
+                    cache.expansionDims = cache.dims;
+                    cache.expansionSize = elements;
+                    cache.expansionBytes = elements * rows.unitSize;
+                    cache.Resize({1, 0, rows.dims[2]});
+                }
+                // On a capacity miss, the ordinary append below requests only
+                // the rows needed by this forward.
+            }
+#endif
             while (V41CacheRowCapacity(cache) < needRows) {
                 std::vector<int> newDims;
                 if (cache.Count(0) == 0 || cache.dims.size() == 0) {
@@ -7002,18 +7032,18 @@ namespace fastllm {
                                 if (quantKV) {
                                     Data kIdxQ;
                                     V41QuantizeKV(kIdx, kIdxQ, idxQuantMode, idxQuantBlock);
-                                    V41AppendRows(cache.indexK, kIdxQ, tpDevices);
+                                    V41AppendRows(cache.indexK, kIdxQ, tpDevices, seg.verifyReserveTokens / ratio);
                                 } else {
-                                    V41AppendRows(cache.indexK, kIdx, tpDevices);
+                                    V41AppendRows(cache.indexK, kIdx, tpDevices, seg.verifyReserveTokens / ratio);
                                 }
                             }
                             V41RotaryQuant(latent, rope, blockStart * ratio, ratio, false, 3, 16);
                             if (quantKV) {
                                 Data latentQ;
                                 V41QuantizeKV(latent, latentQ, cmpQuantMode, cmpQuantBlock);
-                                V41AppendRows(cache.compressedKV, latentQ, tpDevices);
+                                V41AppendRows(cache.compressedKV, latentQ, tpDevices, seg.verifyReserveTokens / ratio);
                             } else {
-                                V41AppendRows(cache.compressedKV, latent, tpDevices);
+                                V41AppendRows(cache.compressedKV, latent, tpDevices, seg.verifyReserveTokens / ratio);
                             }
                             cache.compressedBlocks += blocks;
                         }
@@ -7785,7 +7815,10 @@ namespace fastllm {
                     DsparkSampleVerify(*logits, *seg.state->dspark, scratch, sampling);
                 } else {
                     DsparkMaskToolLogits(*logits, sampling, scratch.draftTokens);
-                    TopK(*logits, topk, 1);
+#ifdef USE_CUDA
+                    if (!FastllmCudaFullLogitsTop1(*logits, topk))
+#endif
+                        TopK(*logits, topk, 1);
 #ifdef USE_CUDA
                     if (numSegments == 1 && f.fullGraphLogits && f.graphLock.owns_lock())
                         PublishDsparkDecision(seg, generationConfigsIn[i], topk);

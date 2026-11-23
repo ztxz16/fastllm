@@ -217,6 +217,7 @@ namespace fastllm {
         DeepSeekV41SpecScratch *spec = nullptr;
         // Internal chunked-prefill step: update KV sources, defer the decoder tail/head.
         bool prefillCacheOnly = false;
+        int verifyReserveTokens = 0; // Optional first-allocation headroom for this request.
     };
 
     // Engram 哈希元数据（由 tokenizer 归一化派生，Python 侧生成 JSON，此处加载）
@@ -616,6 +617,8 @@ namespace fastllm {
         void DsparkEmbedInput(const Data &inputIds, Data &hiddenStates);
         // The verifier's full graph gathers TP vocabulary shards itself.
         void DsparkProjectHead(Data &input, Data &output, bool persistent = false, bool sharded = false);
+        std::map<int, Data> v41DsparkContextWeights;
+        bool DsparkProjectContext(Data &main, DeepSeekV41DsparkState &state, int batch, int rows, const int *positions);
         bool DsparkPrepareQkv(int stage, const Data &input, Data &inputQuant,
                               Data &raw, Data &qNorm, Data &qQuant, Data &kv, bool inputQuantized = false,
                               Data *joinedWeight = nullptr);
