@@ -1,4 +1,5 @@
 #include "naive-n05-draft-fused.h"
+#include "fastllm-cuda.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cublas_v2.h>
@@ -1567,8 +1568,8 @@ void AddBlasNodes(cudaGraph_t graph,cudaGraphNode_t &previous,std::vector<cudaGr
         while(!pending.empty()) {
             bool progress=false;
             for(auto it=pending.begin();it!=pending.end();) {
-                size_t n=0;Check(cudaGraphNodeGetDependencies(*it,nullptr,&n));
-                std::vector<cudaGraphNode_t> deps(n);Check(cudaGraphNodeGetDependencies(*it,deps.data(),&n));
+                size_t n=0;Check(FastllmCudaGraphNodeGetDependencies(*it,nullptr,&n));
+                std::vector<cudaGraphNode_t> deps(n);Check(FastllmCudaGraphNodeGetDependencies(*it,deps.data(),&n));
                 bool ready=true;for(auto dep:deps)if(std::find(done.begin(),done.end(),dep)==done.end())ready=false;
                 if(!ready){++it;continue;}
                 cudaGraphNodeType type;Check(cudaGraphNodeGetType(*it,&type));cudaGraphNode_t node;
