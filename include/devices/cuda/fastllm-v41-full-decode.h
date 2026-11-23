@@ -66,6 +66,29 @@ struct FastllmV41FullDecodeRequest {
 
 // Immutable per-layer pointers to a full verifier's saved rows and dynamic
 // request metadata. Descriptors remain valid for the lifetime of that graph.
+// A request-private descriptor template and a side stream. The stream
+// never writes into a captured graph or reads mutable request state.
+void *FastllmCudaV41CreateVerifyPages(const FastllmV41FullDecodeRequest *layers, int count, int rows);
+void FastllmCudaV41DestroyVerifyPages(void *slot);
+bool FastllmCudaV41StageVerifyPages(void *slot, int position);
+bool FastllmCudaV41ConsumeVerifyPages(void *slot, void *graphRequests);
+
+struct FastllmV41VerifyStops {
+    int size = 0;
+    int ids[16];
+};
+// Six integers per request: commit count/offset, context start/write count,
+// next draft position/anchor. A full-width context graph skips all writes on a partial accept.
+bool FastllmCudaV41ResolveDraft(const float *target, int stride, const int *draft, int rows,
+    int position, int offset, int maxAccepted, FastllmV41VerifyStops stops, int *packet);
+
+struct FastllmV41VerifyHistory {
+    int previous[8]; // newest first, already compressed, -1 at image/sequence boundaries
+};
+bool FastllmCudaV41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *tokenMap,
+    int vocab, int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
+    FastllmV41VerifyHistory history, void *packet);
+
 struct FastllmV41VerifyCommitLayer {
     const FastllmV41FullDecodeRequest *requests = nullptr;
     const void *savedKV = nullptr, *savedRawKV = nullptr, *savedRawScore = nullptr;

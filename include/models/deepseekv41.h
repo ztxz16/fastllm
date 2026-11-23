@@ -90,11 +90,14 @@ namespace fastllm {
     };
 
     struct DeepSeekV41DsparkWorkspace;
+    struct DeepSeekV41SpecScratch;
     struct DeepSeekV41DsparkState {
         ~DeepSeekV41DsparkState();
         void Reset(int startPos);
         void ClearProposal();
         std::shared_ptr<DeepSeekV41DsparkWorkspace> workspace;
+        std::shared_ptr<void> nextVerifyPages; // request-private CUDA descriptor packet
+        int nextVerifyPosition = -1;
         std::map<int, std::shared_ptr<DeepSeekV41DsparkWorkspace>> contextWorkspaces;
         // Only model-owned batched storage uses this immediate handoff list.
         std::vector<DeepSeekV41DsparkState *> contextRequests;
@@ -133,6 +136,16 @@ namespace fastllm {
         std::function<void(int)> commitKV;
         const void *commitGroup = nullptr;
         std::function<void(const std::vector<std::pair<int, int>> &)> commitBatchKV;
+        // Producer-owned until sampling completes. The host mirrors the proposal only
+        // after graph submission, or before the ordinary frontend on a fallback.
+        std::function<void()> resolveDraftIds;
+        const void *verifyPacket = nullptr;
+        size_t verifyPacketBytes = 0;
+        int verifyProducer = -1;
+        void *verifyReady = nullptr, *deviceCommitReady = nullptr;
+        std::function<bool(std::shared_ptr<void> &, int)> stageNextPages;
+        std::function<bool(int, const int *)> commitDeviceSpan;
+        bool deviceDecision = false, earlyContext = false, earlyDraft = false;
         bool kvCommitted = false;
         bool targetRowsReady = false; // Full verify joined all producers before sampling readback.
         // Attention DP: target KV and rollback scratch belong to the request's
@@ -485,6 +498,10 @@ namespace fastllm {
                                      int startPos, int accept, int forwarded);
         struct ForwardState;
         void PrepareForward(ForwardWorkspace &);
+        void PrepareTokenHistory(ForwardWorkspace &);
+        void StageDsparkVerify(DeepSeekV41RequestState &, const DeepSeekV41SpecScratch &);
+        bool ReadPublishedDsparkIds(const DeepSeekV41Segment &);
+        void PublishDsparkDecision(const DeepSeekV41Segment &, const GenerationConfig &, const Data &);
         void PrepareForwardInputs(ForwardWorkspace &);
 #ifdef USE_CUDA
         bool TryFullDecodeGraph(ForwardWorkspace &, bool inputsPrepared);

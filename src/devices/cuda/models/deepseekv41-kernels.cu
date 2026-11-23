@@ -8057,6 +8057,127 @@ bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size
     return FastllmCudaV41UploadFullDecodeInputs(storage, plans, layers, requests, batch, nullptr, 0);
 }
 
+namespace {
+__global__ void V41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *map, int vocab,
+        int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
+        FastllmV41VerifyHistory history, int64_t *result) {
+    const int row = blockIdx.x, layer = blockIdx.y, cols = (ngram - 1) * heads;
+    const int token = row ? ids[row] : anchor;
+    float *masks = reinterpret_cast<float *>(result + size_t(layers) * rows * cols);
+    auto compress = [&](int id) { return id >= 0 && id < vocab && id != imageToken ? map[id] : -1; };
+    if (threadIdx.x == 0) {
+        masks[layer * rows + row] = compress(token) < 0 ? 0.f : 1.f;
+        if (layer == 0) masks[layers * rows + row] = float(token);
+    }
+    const int64_t *mul = parameters + layer * (ngram + 2 * cols);
+    for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+        uint64_t hash = 0;
+        bool blocked = false;
+        for (int shift = 0; shift <= col / heads + 1; ++shift) {
+            const int i = row - shift;
+            const int compressed = i < 0 ? history.previous[-1-i] : compress(i ? ids[i] : anchor);
+            blocked |= compressed < 0;
+            hash ^= uint64_t(blocked ? pad : compressed) * uint64_t(mul[shift]);
+        }
+        const int64_t prime = mul[ngram + col];
+        const int64_t bucket = int64_t(hash) % prime;
+        result[(layer * rows + row) * cols + col] = mul[ngram + cols + col] + (bucket < 0 ? bucket + prime : bucket);
+    }
+}
+}
+namespace {
+struct V41VerifyPageSlot {
+    FastllmV41FullDecodeRequest *layers = nullptr, *expanded = nullptr;
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ready = nullptr, consumed = nullptr;
+    int device = -1, count = 0, rows = 0;
+    bool published = false;
+    ~V41VerifyPageSlot() {
+        int old = 0; cudaGetDevice(&old); cudaSetDevice(device);
+        if (stream) cudaStreamSynchronize(stream);
+        if (consumed) { cudaEventSynchronize(consumed); cudaEventDestroy(consumed); }
+        if (ready) cudaEventDestroy(ready);
+        if (stream) cudaStreamDestroy(stream);
+        if (layers) cudaFree(layers);
+        cudaSetDevice(old);
+    }
+};
+__global__ void V41StageVerifyPages(const FastllmV41FullDecodeRequest *layers,
+        FastllmV41FullDecodeRequest *expanded, int count, int rows, int position) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count * rows) return;
+    auto r = layers[i / rows];
+    r.position = position + i % rows; r.chunkBegin = 0; r.chunkLength = rows;
+    expanded[i] = r;
+}
+}
+void *FastllmCudaV41CreateVerifyPages(const FastllmV41FullDecodeRequest *layers, int count, int rows) {
+    if (!layers || count < 1 || rows < 1 || int64_t(count) * (rows + 1LL) > INT_MAX) return nullptr;
+    auto slot = std::make_unique<V41VerifyPageSlot>();
+    slot->device = FastllmCudaGetDevice(); slot->count = count; slot->rows = rows;
+    if (cudaStreamCreateWithFlags(&slot->stream, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&slot->ready, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&slot->consumed, cudaEventDisableTiming) != cudaSuccess ||
+        cudaMalloc(&slot->layers, sizeof(*layers)*count*(rows+1)) != cudaSuccess ||
+        cudaMemcpy(slot->layers, layers, sizeof(*layers)*count, cudaMemcpyHostToDevice) != cudaSuccess) return nullptr;
+    slot->expanded = slot->layers + count;
+    return slot.release();
+}
+void FastllmCudaV41DestroyVerifyPages(void *slot) { delete static_cast<V41VerifyPageSlot *>(slot); }
+bool FastllmCudaV41StageVerifyPages(void *handle, int position) {
+    auto *s = static_cast<V41VerifyPageSlot *>(handle);
+    if (!s || s->device != FastllmCudaGetDevice() || position < 1 || int64_t(position)+s->rows > INT_MAX ||
+        cudaStreamWaitEvent(s->stream, s->consumed) != cudaSuccess) return false;
+    V41StageVerifyPages<<<(s->rows*s->count+127)/128,128,0,s->stream>>>(s->layers,s->expanded,s->count,s->rows,position);
+    s->published = cudaGetLastError() == cudaSuccess && cudaEventRecord(s->ready,s->stream) == cudaSuccess;
+    return s->published;
+}
+bool FastllmCudaV41ConsumeVerifyPages(void *handle, void *destination) {
+    auto *s = static_cast<V41VerifyPageSlot *>(handle);
+    if (!s || !destination || !s->published || FastllmCudaGetDevice()!=s->device) return false;
+    if (cudaStreamWaitEvent(cudaStreamPerThread,s->ready) != cudaSuccess ||
+        cudaMemcpyAsync(destination,s->expanded,sizeof(*s->expanded)*s->rows*s->count,
+                        cudaMemcpyDeviceToDevice,cudaStreamPerThread) != cudaSuccess) return false;
+    if (cudaEventRecord(s->consumed,cudaStreamPerThread) != cudaSuccess) {
+        cudaStreamSynchronize(cudaStreamPerThread); return false;
+    }
+    return true;
+}
+
+namespace {
+__global__ void V41ResolveDraft(const float *target, int stride, const int *draft, int rows, int position,
+        int offset, int maxAccepted, FastllmV41VerifyStops stops, int *packet) {
+    int accepted = 0;
+    int token = int(target[0] + 1e-3f);
+    while (accepted < maxAccepted && token == draft[accepted + 1]) {
+        bool stopped = false;
+        for (int i = 0; i < stops.size; ++i) stopped |= stops.ids[i] == token;
+        if (stopped) break;
+        token = int(target[++accepted * stride] + 1e-3f);
+    }
+    packet[0] = accepted + 1; packet[1] = offset;
+    packet[2] = position; packet[3] = accepted + 1 == rows ? rows : 0;
+    packet[4] = position + accepted + 1; packet[5] = token;
+}
+}
+bool FastllmCudaV41ResolveDraft(const float *target, int stride, const int *draft, int rows, int position,
+        int offset, int maxAccepted, FastllmV41VerifyStops stops, int *packet) {
+    if (!target || !draft || !packet || stride < 1 || rows < 1 || maxAccepted < 0 ||
+        maxAccepted >= rows || stops.size < 0 || stops.size > 16 || position < 0 || offset < 0) return false;
+    V41ResolveDraft<<<1, 1, 0, cudaStreamPerThread>>>(target, stride, draft, rows, position, offset, maxAccepted, stops, packet);
+    return V41CheckLaunch("ResolveDraft");
+}
+
+bool FastllmCudaV41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *map,
+        int vocab, int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
+        FastllmV41VerifyHistory history, void *packet) {
+    if (!ids || !map || !parameters || !packet || rows < 1 || layers < 1 || ngram < 2 ||
+        ngram > 9 || heads < 1 || anchor < 0 || anchor >= vocab) return false;
+    V41DraftVerifyPacket<<<dim3(rows, layers), 64, 0, cudaStreamPerThread>>>(ids, anchor, rows, map, vocab,
+        pad, imageToken, parameters, layers, ngram, heads, history, static_cast<int64_t *>(packet));
+    return V41CheckLaunch("DraftVerifyPacket");
+}
+
 bool FastllmCudaV41UploadFullDecode(void *handle, const FastllmV41FullDecodeRequest *requests, size_t count) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (FastllmCudaGraphIsCapturingFast() || !V41ValidateFullDecodeRequests(p, requests, count) ||

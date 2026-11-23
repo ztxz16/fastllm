@@ -5507,7 +5507,14 @@ namespace fastllm {
     void DeepSeekV41Model::ForwardState::PrepareInputs() { work->model.PrepareForwardInputs(*work); }
     bool DeepSeekV41Model::ForwardState::FullGraph(bool inputsPrepared) {
 #ifdef USE_CUDA
-        return work->model.TryFullDecodeGraph(*work, inputsPrepared);
+        const bool replayed = work->model.TryFullDecodeGraph(*work, inputsPrepared);
+        auto *scratch = work->inputSegments.front().spec;
+        if (scratch && scratch->resolveDraftIds) {
+            auto resolve = std::move(scratch->resolveDraftIds);
+            resolve();
+            work->model.PrepareTokenHistory(*work);
+        }
+        return replayed;
 #else
         return false;
 #endif
@@ -6022,27 +6029,8 @@ namespace fastllm {
         }
 #endif
 
-        // ---- Engram 历史 ----
-        f.tokenIds = V41ReadTokenIds(inputIds);
-        const auto &tokenIds = f.tokenIds;
-        AssertInFastLLM((int)tokenIds.size() == total, "DeepSeekV41Model::ForwardSegments: inputIds length mismatch.");
-        if (!engram_layer_ids.empty() && (!f.pipeline || f.pipeline->firstLayer == 0)) {
-            for (auto &seg : segments) {
-                AssertInFastLLM((int)seg.state->engramHistory.size() == seg.startPos,
-                                "DeepSeekV41: engram history is out of sync with the cache.");
-                for (int i = 0; i < seg.seqlen; i++) {
-                    int tok = tokenIds[seg.offset + i];
-                    int compressed = -1;
-                    bool isImage = tok == image_token_id ||
-                                   (imageMask != nullptr && (int)imageMask->size() > seg.offset + i &&
-                                    (*imageMask)[seg.offset + i] != 0);
-                    if (!isImage && engramMeta.loaded && tok >= 0 && tok < (int)engramMeta.tokenMap.size()) {
-                        compressed = engramMeta.tokenMap[tok];
-                    }
-                    seg.state->engramHistory.push_back(compressed);
-                }
-            }
-        }
+        if (f.inputSegments.size() != 1 || !f.inputSegments.front().spec || !f.inputSegments.front().spec->resolveDraftIds)
+            PrepareTokenHistory(f);
 
         dim = embed_dim;
         headDim = head_dim_full;
@@ -6055,6 +6043,30 @@ namespace fastllm {
                                       rope_scaling_beta_fast, rope_scaling_beta_slow};
 
         PrepareForwardWeights();
+    }
+    void DeepSeekV41Model::PrepareTokenHistory(ForwardWorkspace &f) {
+        // ---- Engram 历史 ----
+        f.tokenIds = V41ReadTokenIds(f.inputIds);
+        const auto &tokenIds = f.tokenIds;
+        AssertInFastLLM((int)tokenIds.size() == f.total, "DeepSeekV41Model::ForwardSegments: inputIds length mismatch.");
+        if (!engram_layer_ids.empty() && (!f.pipeline || f.pipeline->firstLayer == 0)) {
+            for (auto &seg : f.inputSegments) {
+                AssertInFastLLM((int)seg.state->engramHistory.size() == seg.startPos,
+                                "DeepSeekV41: engram history is out of sync with the cache.");
+                for (int i = 0; i < seg.seqlen; i++) {
+                    int tok = tokenIds[seg.offset + i];
+                    int compressed = -1;
+                    bool isImage = tok == image_token_id ||
+                                   (f.imageMask != nullptr && (int)f.imageMask->size() > seg.offset + i &&
+                                    (*f.imageMask)[seg.offset + i] != 0);
+                    if (!isImage && engramMeta.loaded && tok >= 0 && tok < (int)engramMeta.tokenMap.size()) {
+                        compressed = engramMeta.tokenMap[tok];
+                    }
+                    seg.state->engramHistory.push_back(compressed);
+                }
+            }
+        }
+
     }
     void DeepSeekV41Model::PrepareHybridPrefill() {
         PrepareForwardWeights();
@@ -7774,11 +7786,17 @@ namespace fastllm {
                 } else {
                     DsparkMaskToolLogits(*logits, sampling, scratch.draftTokens);
                     TopK(*logits, topk, 1);
-                    topk.ToDevice(DataDevice::CPU);
-                    const int stride = topk.dims.back();
-                    const float *topkData = (const float*)topk.cpuData;
-                    for (int row = 0; row < seg.seqlen; ++row)
-                        scratch.tokens[row] = (int)(topkData[(uint64_t)row * stride] + 1e-3);
+#ifdef USE_CUDA
+                    if (numSegments == 1 && f.fullGraphLogits && f.graphLock.owns_lock())
+                        PublishDsparkDecision(seg, generationConfigsIn[i], topk);
+#endif
+                    if (!ReadPublishedDsparkIds(seg)) {
+                        topk.ToDevice(DataDevice::CPU);
+                        const int stride = topk.dims.back();
+                        const float *topkData = (const float*)topk.cpuData;
+                        for (int row = 0; row < seg.seqlen; ++row)
+                            scratch.tokens[row] = (int)(topkData[(uint64_t)row * stride] + 1e-3);
+                    }
                 }
                 const int last = scratch.acceptedDrafts >= 0 ? scratch.acceptedDrafts : seg.seqlen - 1;
                 verified[i] = scratch.tokens[last];

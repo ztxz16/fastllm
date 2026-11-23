@@ -395,13 +395,18 @@ void DeepSeekV41Model::CommitAttentionParallel(DeepSeekV41RequestState &state,
     AssertInFastLLM(state.attentionGroup >= 0 && state.attentionGroup < layout.attentionDP &&
         state.attentionRanks.size() == size_t(layout.attentionTP) &&
         scratch.attentionRanks.size() == size_t(layout.attentionTP), "invalid attention DP commit state");
-    parallel.runtime.Run([&](int rank, int) {
+    const bool onDevice = layout.attentionTP == 1 && scratch.attentionRanks.front() &&
+        scratch.attentionRanks.front()->deviceCommitReady && scratch.attentionRanks.front()->kvCommitted;
+    auto commit = [&](int rank, int) {
         if (layout.AttentionOwner(rank) != state.attentionGroup) return;
         const int t = layout.AttentionRank(rank);
         AssertInFastLLM(state.attentionRanks[t] && scratch.attentionRanks[t], "missing rank rollback state");
+        if (onDevice) FastllmCudaCurrentThreadStreamWaitEvent(scratch.attentionRanks[t]->deviceCommitReady);
         parallel.models[rank]->DsparkCommitPrefix(*state.attentionRanks[t], *scratch.attentionRanks[t],
             startPos, accept, forwarded);
-    });
+    };
+    if (onDevice) parallel.runtime.Enqueue(commit);
+    else parallel.runtime.Run(commit);
 }
 #else
 void DeepSeekV41Model::ConfigureAttentionParallel(int dp) {

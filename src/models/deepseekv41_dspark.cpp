@@ -50,6 +50,7 @@
 #include "devices/cuda/fastllm-draft-head.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-v41-decode.cuh"
+#include "devices/cuda/fastllm-v41-full-decode.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
@@ -113,7 +114,13 @@ namespace fastllm {
         std::vector<void *> replayDone;
         int *hostProposal = nullptr;
         void *proposalReady = nullptr;
-        int pendingCount = 0;
+        int pendingCount = 0, packetPosition = -1;
+        Data verifyTokenMap, verifyHash, verifyPacket, verifyDecision;
+        int nextMetadataAt = -1, nextMetadataAnchor = -1, fullStreak = 0;
+        int reusableDraftAt = -1, reusableDraftAnchor = -1;
+        float *hostTop1 = nullptr;
+        void *top1Ready = nullptr, *kvReady = nullptr;
+        void *verifyReady = nullptr;
 
         void FinishProposal(std::vector<int> *output = nullptr) {
             if (!pendingCount) return;
@@ -129,6 +136,7 @@ namespace fastllm {
                     static_cast<int *>(markovTokens.cudaData) + 1, count * sizeof(int))) return false;
             FastllmCudaEventRecordCurrentThread(proposalReady);
             pendingCount = count;
+            packetPosition = -1;
             return true;
         }
         void ClearGraphs() {
@@ -147,6 +155,15 @@ namespace fastllm {
             }
             replayDone.clear();
             if (proposalReady && !devices.empty()) FastllmCudaSetDevice(devices.front());
+            if (kvReady) { FastllmCudaEventDestroy(kvReady); kvReady = nullptr; }
+            if (top1Ready) { FastllmCudaEventDestroy(top1Ready); top1Ready = nullptr; }
+            if (hostTop1) { FastllmCudaHostFree(hostTop1); hostTop1 = nullptr; }
+            if (verifyReady) {
+                FastllmCudaEventSynchronize(verifyReady);
+                FastllmCudaEventDestroy(verifyReady);
+                verifyReady = nullptr;
+            }
+            packetPosition = -1;
             if (proposalReady) { FastllmCudaEventDestroy(proposalReady); proposalReady = nullptr; }
             if (hostProposal) { FastllmCudaHostFree(hostProposal); hostProposal = nullptr; }
             if (replayReady) {
@@ -190,10 +207,17 @@ namespace fastllm {
     }
 
     void DeepSeekV41DsparkState::Reset(int startPos) {
+#ifdef USE_CUDA
+        if (workspace) {
+            workspace->fullStreak = 0;
+            workspace->reusableDraftAt = workspace->nextMetadataAt = workspace->packetPosition = -1;
+        }
+#endif
         committed = startPos;
         filled = 0;
         disabled = false;
         contextRequests.clear();
+        nextVerifyPosition = -1;
         ClearProposal();
         pending.clear();
         rounds = proposed = accepted = 0;
@@ -1568,6 +1592,14 @@ namespace fastllm {
         return true;
     }
 
+    static int DsPublishableDrafts(int accepted, const GenerationConfig &config, int startPos) {
+        if (startPos >= 0 && config.output_token_limit > 0 && config.input_token_length > 0) {
+            const int64_t emitted = int64_t(startPos) - config.input_token_length + 1;
+            accepted = int(std::min<int64_t>(accepted, std::max<int64_t>(0, int64_t(config.output_token_limit) - emitted - 1)));
+        }
+        return accepted;
+    }
+
     int DeepSeekV41Model::DsparkAcceptedDraftCount(const DeepSeekV41SpecScratch &scratch,
             const GenerationConfig &config, int startPos) const {
         int accepted = scratch.acceptedDrafts;
@@ -1579,11 +1611,7 @@ namespace fastllm {
         // Keep the verifier's existing proposal shape at the output limit.
         // Only the publishable prefix may advance KV/history or enter pending;
         // evaluating later causal rows must not extend the request's state.
-        if (startPos >= 0 && config.output_token_limit > 0 && config.input_token_length > 0) {
-            const int64_t emitted = int64_t(startPos) - config.input_token_length + 1;
-            const int64_t remaining = std::max<int64_t>(0, int64_t(config.output_token_limit) - emitted - 1);
-            accepted = int(std::min<int64_t>(accepted, remaining));
-        }
+        accepted = DsPublishableDrafts(accepted, config, startPos);
         // EOS/stop is returned to the scheduler, but is not appended to
         // allTokens. Commit only the inputs preceding that output. Otherwise
         // the cache can run beyond allTokens and cannot be snapshotted.
@@ -1861,6 +1889,158 @@ namespace fastllm {
         return -1;
     }
 
+    bool DeepSeekV41Model::ReadPublishedDsparkIds(const DeepSeekV41Segment &seg) {
+#ifdef USE_CUDA
+        if (!seg.spec->deviceDecision) return false;
+        auto &w = *seg.state->dspark->workspace;
+        FastllmCudaEventSynchronize(w.top1Ready);
+        for (int i = 0; i < seg.seqlen; ++i) seg.spec->tokens[i] = int(w.hostTop1[2*i] + 1e-3f);
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void DeepSeekV41Model::PublishDsparkDecision(const DeepSeekV41Segment &seg,
+            const GenerationConfig &config, const Data &topk) {
+#ifdef USE_CUDA
+        auto &scratch = *seg.spec;
+        if (!scratch.verifyPacket || !seg.state->dspark) return;
+        auto &ds = *seg.state->dspark;
+        auto w = ds.workspace;
+        if (!w || !w->verifyDecision.cudaData || !w->deviceInputs ||
+            topk.dataType != FLOAT32 || topk.dataDevice != CUDA || !topk.cudaData || topk.dims.empty() ||
+            topk.Count(0) != size_t(seg.seqlen) * topk.dims.back() || ds.committed != seg.startPos ||
+            topk.dims.back() != 2 || !w->hostTop1 || !w->top1Ready ||
+            w->devices.front() != FastllmCudaGetDevice() || scratch.attentionRanks.size() != 1 ||
+            !scratch.attentionRanks.front()->commitDeviceSpan) return;
+        FastllmV41VerifyStops stops{};
+        auto addStop = [&](int id) {
+            if (std::find(stops.ids, stops.ids + stops.size, id) != stops.ids + stops.size) return true;
+            if (stops.size == 16) return false;
+            stops.ids[stops.size++] = id;
+            return true;
+        };
+        addStop(eos_token_id);
+        for (int id : eos_token_ids) if (!addStop(id)) return;
+        for (int id : config.stop_token_ids) if (!addStop(id)) return;
+        int *packet = static_cast<int *>(w->verifyDecision.cudaData);
+        if (!FastllmCudaV41ResolveDraft(static_cast<const float *>(topk.cudaData), topk.dims.back(),
+                static_cast<const int *>(w->markovTokens.cudaData), seg.seqlen, seg.startPos, 0,
+                DsPublishableDrafts(seg.seqlen-1, config, seg.startPos), stops, packet)) return;
+        // The readback event precedes reusable context/draft work on the root
+        // stream. Sampling waits just for the verifier IDs, never the next draft.
+        if (!FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(w->hostTop1, topk.cudaData, topk.GetBytes())) return;
+        FastllmCudaEventRecordCurrentThread(w->top1Ready);
+        scratch.deviceDecision = true;
+        auto &local = *scratch.attentionRanks.front();
+        local.kvCommitted = w->kvReady && local.commitDeviceSpan(w->devices.front(), packet);
+        if (local.kvCommitted) {
+            FastllmCudaEventRecordCurrentThread(w->kvReady);
+            local.deviceCommitReady = w->kvReady;
+        }
+        // Only reuse an existing, exact-shape context graph. The full-width
+        // writes are predicated on accepting all rows; partial prefixes replay
+        // the ordinary graph for their actual row count and reduction order.
+        auto found = ds.contextWorkspaces.find(seg.seqlen);
+        if (found == ds.contextWorkspaces.end() || !found->second || ds.disabled) return;
+        auto &ctx = *found->second;
+        if (ctx.devices.size() != 1 || ctx.devices.front() != w->devices.front() || ctx.execs.size() != 1 ||
+            ctx.disabled || !ctx.execs.front() || ctx.cachePointers.size() != ds.layers.size() ||
+            ctx.position.Count(0) != 2 || !ctx.position.cudaData || !ctx.input.cudaData) return;
+        for (size_t i = 0; i < ds.layers.size(); ++i)
+            if (ctx.cachePointers[i] != ds.layers[i].windowKV.cudaData) return;
+        const auto &source = scratch.packedMainHidden;
+        if (source.dims.size() == 3 && source.cudaData && source.dims == ctx.input.dims &&
+            source.dataType == ctx.input.dataType) {
+            if (!FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(ctx.input.cudaData, source.cudaData, ctx.input.GetBytes()))
+                return;
+        } else {
+            std::vector<const Data *> inputs;
+            for (const auto &hidden : scratch.mainHidden) {
+                const Data *h = &hidden;
+                if (h->multiDeviceData) {
+                    auto it = h->multiDeviceDatas.find(w->devices.front());
+                    if (it == h->multiDeviceDatas.end()) return;
+                    h = it->second;
+                }
+                inputs.push_back(h);
+            }
+            if (inputs.empty() || !FastllmCudaNaiveDraftConcat(inputs, seg.seqlen, ctx.input)) return;
+        }
+        if (!FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(ctx.position.cudaData, packet + 2, 2*sizeof(int))) return;
+        AssertInFastLLM(FastllmCudaGraphLaunch(ctx.execs.front()), "DSpark early context graph launch failed");
+        scratch.earlyContext = true;
+        // The resident full-window greedy graph has a request-private output.
+        // If acceptance is partial its context stores were masked and the output
+        // will be discarded. Skip this work after a recent rejection or near EOS.
+        if (w->fullStreak < 2 || DsPublishableDrafts(seg.seqlen-1,config,seg.startPos) != seg.seqlen-1 ||
+            ds.filled != window_size || !w->deviceInputs || w->sampledMarkov || w->hybridExperts ||
+            w->diskExperts || w->disabled || w->execs.empty() || !w->position.cudaData ||
+            config.tool_call_name_constraint_enabled || config.tool_call_parameter_name_constraint_enabled) return;
+        if (!FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(w->position.cudaData, packet + 4, 2*sizeof(int))) return;
+        DsRunDraftGraph(*w, [] {}, true);
+        scratch.earlyDraft = true;
+#endif
+    }
+
+    void DeepSeekV41Model::StageDsparkVerify(DeepSeekV41RequestState &state, const DeepSeekV41SpecScratch &previous) {
+#ifdef USE_CUDA
+        if (!state.dspark || !state.dspark->workspace || executionMode != ExecutionMode::Gpu ||
+            v41AttentionDP <= 1 || !engramMeta.loaded || engram_layer_ids.empty()) return;
+        auto &ds = *state.dspark;
+        auto &w = *ds.workspace;
+        const int layers = engram_layer_ids.size(), ngram = engram_max_ngram_size, heads = engram_n_heads;
+        if (w.pendingCount != 5 || ds.committed != state.totalLen || w.devices.empty() ||
+            int(state.engramHistory.size()) != ds.committed || ngram < 2 || ngram > 9 || heads <= 0 ||
+            !std::is_sorted(engram_layer_ids.begin(), engram_layer_ids.end())) return;
+        const int rows = w.pendingCount + 1, cols = (ngram - 1) * heads;
+        const int root = w.devices.front();
+        FastllmCudaSetDevice(root);
+        auto allocate = [&](Data &data, size_t bytes) {
+            if (data.cudaData) return;
+            data.dataType = INT8; data.UpdateUnitSize(); data.Resize({int(bytes)});
+            data.ToDevice(CUDA, {root}, false); data.Allocate(false);
+        };
+        if (!w.verifyHash.cudaData) {
+            std::vector<int64_t> params;
+            if (engramMeta.multipliers.size() != layers || engramMeta.offsets.size() != layers ||
+                engramMeta.primes.size() != layers || engramMeta.tokenMap.empty()) return;
+            for (int l = 0; l < layers; ++l) {
+                const auto &m = engramMeta.multipliers[l], &p = engramMeta.primes[l], &o = engramMeta.offsets[l];
+                if (m.size() != ngram || p.size() != cols || o.size() != cols ||
+                    std::any_of(p.begin(), p.end(), [](int64_t v) { return v <= 0; })) return;
+                params.insert(params.end(), m.begin(), m.end()); params.insert(params.end(), p.begin(), p.end());
+                params.insert(params.end(), o.begin(), o.end());
+            }
+            allocate(w.verifyTokenMap, engramMeta.tokenMap.size() * sizeof(int));
+            allocate(w.verifyHash, params.size() * sizeof(int64_t));
+            FastllmCudaCopyFromHostToDevice(w.verifyTokenMap.cudaData, engramMeta.tokenMap.data(), w.verifyTokenMap.GetBytes());
+            FastllmCudaCopyFromHostToDevice(w.verifyHash.cudaData, params.data(), w.verifyHash.GetBytes());
+        }
+        allocate(w.verifyDecision, 6 * sizeof(int));
+        if (!w.hostTop1) w.hostTop1 = static_cast<float *>(FastllmCudaHostMalloc(rows * 2 * sizeof(float)));
+        if (!w.top1Ready) w.top1Ready = FastllmCudaEventCreate();
+        if (!w.kvReady) w.kvReady = FastllmCudaEventCreate();
+        allocate(w.verifyPacket, rows * (sizeof(int64_t) * layers * cols + sizeof(float) * (layers + 1)));
+        if (!w.verifyReady) w.verifyReady = FastllmCudaEventCreate();
+        FastllmV41VerifyHistory prefix{};
+        for (int j = 0; j < ngram - 1; ++j)
+            prefix.previous[j] = ds.committed > j ? state.engramHistory[ds.committed-1-j] : -1;
+        if (w.verifyReady && FastllmCudaV41DraftVerifyPacket(static_cast<const int *>(w.markovTokens.cudaData),
+                ds.anchor, rows, static_cast<const int *>(w.verifyTokenMap.cudaData), engramMeta.tokenMap.size(),
+                engramMeta.padCompressedId, image_token_id, static_cast<const int64_t *>(w.verifyHash.cudaData),
+                layers, ngram, heads, prefix, w.verifyPacket.cudaData)) {
+            FastllmCudaEventRecordCurrentThread(w.verifyReady);
+            w.packetPosition = ds.committed;
+            ds.nextVerifyPosition = -1;
+            if (previous.attentionRanks.size() == 1 && previous.attentionRanks.front()->stageNextPages &&
+                previous.attentionRanks.front()->stageNextPages(ds.nextVerifyPages, ds.committed))
+                ds.nextVerifyPosition = ds.committed;
+        }
+#endif
+    }
+
     int DeepSeekV41Model::DsparkBuildVerifyInput(DeepSeekV41RequestState &state, int anchor,
                                                  int startPos, std::vector<int> &drafts) {
         drafts.clear();
@@ -1982,8 +2162,30 @@ namespace fastllm {
             for (int i = 0; i < numSegments; ++i) {
                 auto &segment = segments[i];
                 auto &scratch = scratches[i];
-                int drafts = DsparkBuildVerifyInput(*segment.state, anchors[segment.offset],
-                                                    segment.startPos, scratch.draftTokens);
+                const int anchor = anchors[segment.offset];
+                auto &proposal = *segment.state->dspark;
+                int drafts = 0;
+#ifdef USE_CUDA
+                const auto w = proposal.workspace;
+                if (numSegments == 1 && w && w->pendingCount == 5 && w->packetPosition == segment.startPos &&
+                    proposal.anchor == anchor && proposal.anchorPos == segment.startPos && proposal.committed == segment.startPos &&
+                    !proposal.disabled && !std::getenv("FASTLLM_DSPARK_FORCE_DRAFTS") && !std::getenv("FASTLLM_DSPARK_PROBE_EVERY") &&
+                    (max_positions <= 0 || int64_t(segment.startPos) + 6 <= max_positions) &&
+                    (tokensLimit <= 0 || int64_t(segment.startPos) + 6 <= tokensLimit)) {
+                    drafts = w->pendingCount;
+                    scratch.draftTokens.resize(drafts);
+                    scratch.verifyPacket = w->verifyPacket.cudaData; scratch.verifyPacketBytes = w->verifyPacket.GetBytes();
+                    scratch.verifyProducer = w->devices.front(); scratch.verifyReady = w->verifyReady;
+                    scratch.resolveDraftIds = [w, &proposal, &scratch, &verifyIds]() {
+                        w->FinishProposal(&scratch.draftTokens);
+                        proposal.proposalTokens = scratch.draftTokens;
+                        auto *ids = static_cast<float *>(static_cast<void *>(verifyIds.cpuData));
+                        for (size_t i = 0; i < scratch.draftTokens.size(); ++i) ids[1+i] = float(scratch.draftTokens[i]);
+                    };
+                    DsProfiler().AddProposal(drafts, drafts);
+                } else
+#endif
+                    drafts = DsparkBuildVerifyInput(*segment.state, anchor, segment.startPos, scratch.draftTokens);
                 // Output limits constrain commit, not the verification shape.
                 // Context capacity is still a hard bound on speculative reads.
                 int64_t capacity = max_positions;
@@ -2065,6 +2267,7 @@ namespace fastllm {
                 }
             }
             DsparkGenerateDrafts(draftStates, draftAnchors, draftConfigs);
+            if (numSegments == 1 && draftStates.size() == 1) StageDsparkVerify(*segments.front().state, scratches.front());
             return ret;
         }
 
@@ -2087,6 +2290,7 @@ namespace fastllm {
             }
         }
         DsparkGenerateDrafts(draftStates, draftAnchors, draftConfigs);
+        if (numSegments == 1 && draftStates.size() == 1) StageDsparkVerify(*segments.front().state, scratches.front());
         return ret;
     }
 
@@ -2425,6 +2629,22 @@ namespace fastllm {
             return;
         }
         const int rows = committed - startPos;
+#ifdef USE_CUDA
+        if (scratch.deviceDecision && dspark.workspace && scratch.acceptedDrafts >= 0) {
+            auto &w = *dspark.workspace;
+            const bool full = rows == int(scratch.draftTokens.size()) + 1;
+            w.fullStreak = full ? std::min(2,w.fullStreak + 1) : 0;
+            w.reusableDraftAt = scratch.earlyDraft && full ? committed : -1;
+            w.reusableDraftAnchor = scratch.tokens[scratch.acceptedDrafts];
+            dspark.workspace->nextMetadataAt = committed;
+            dspark.workspace->nextMetadataAnchor = scratch.tokens[scratch.acceptedDrafts];
+        }
+        if (scratch.earlyContext && rows == int(scratch.draftTokens.size()) + 1) {
+            dspark.committed = committed;
+            dspark.filled = std::min(dspark.filled + rows, window_size);
+            return;
+        }
+#endif
         const bool packed = scratch.packedMainHidden.dims.size() == 3;
         if (rows <= 0 || (packed ? rows > scratch.packedMainHidden.dims[1] :
                 scratch.mainHidden.size() != v41DsparkTargetLayerIds.size())) {
@@ -2486,10 +2706,11 @@ namespace fastllm {
                 contextState = slot.get();
                 Data &position = contextState->position;
                 if (position.dims.empty()) {
-                    position.dataType = DataType::INT32; position.UpdateUnitSize(); position.Resize({1});
+                    position.dataType = DataType::INT32; position.UpdateUnitSize(); position.Resize({2});
                     position.ToDevice(DataDevice::CUDA, devices, false); position.Allocate();
                 }
-                FastllmCudaCopyFromHostToDevice(position.cudaData, &startPos, sizeof(int));
+                int metadata[] = {startPos, rows};
+                FastllmCudaCopyFromHostToDevice(position.cudaData, metadata, sizeof(metadata));
             }
         }
 #endif
@@ -2557,8 +2778,8 @@ namespace fastllm {
                 DsRotaryQuant(kv, windowRope, startPos, 1, false, 1, 32, -1, devicePosition);
 #ifdef USE_CUDA
                 if (devicePosition) {
-                    AssertInFastLLM(FastllmCudaDeepSeekV41WindowStorePosition(kv, dspark.layers[stage].windowKV,
-                        startPos, window_size, devicePosition), "DeepSeekV41 DSpark dynamic window store failed.");
+                    AssertInFastLLM(FastllmCudaDeepSeekV41WindowStoreBatchPrefix(kv, dspark.layers[stage].windowKV,
+                        window_size, devicePosition, devicePosition + 1), "DeepSeekV41 DSpark dynamic window store failed.");
                 } else
 #endif
                 DsWindowStore(kv, dspark.layers[stage].windowKV, startPos, window_size);
@@ -2705,6 +2926,20 @@ namespace fastllm {
         const int startPos = positions.front();    // 草稿的 RoPE 位置从 committed 开始
         const int valid = validRows.front();
         DsparkBuildMoeWeights();
+#ifdef USE_CUDA
+        auto cached = dspark.workspace;
+        if (deferGreedy && batch == 1 && validRows.front() == window_size && cached &&
+            cached->reusableDraftAt == startPos && cached->reusableDraftAnchor == anchorToken) {
+            // Only this invocation can consume the preceding verified proposal.
+            // Its root stream already joins the context and all draft producers.
+            ApplyDsparkDevice(true);
+            cached->reusableDraftAt = cached->nextMetadataAt = -1;
+            if (cached->QueueProposal(block)) {
+                dspark.anchor = anchorToken; dspark.anchorPos = startPos;
+                return true;
+            }
+        }
+#endif
         ApplyDsparkDevice();
         const int dim = embed_dim;
         const int headDim = head_dim_full;
@@ -2899,8 +3134,17 @@ namespace fastllm {
                     FastllmCudaCopyFromHostToDevice(dst.cudaData, const_cast<void*>(data), dst.GetBytes());
                 };
                 const int metadata[2] = {startPos, anchorToken};
-                upload(graphState->position, DataType::INT32, {deviceInputs ? 2 : batch},
-                       deviceInputs ? metadata : positions.data());
+                graphState->reusableDraftAt = -1;
+                if (deviceInputs && graphState->position.cudaData && graphState->nextMetadataAt == startPos &&
+                    graphState->nextMetadataAnchor == anchorToken && graphState->verifyDecision.cudaData) {
+                    AssertInFastLLM(FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(graphState->position.cudaData,
+                        static_cast<const int *>(graphState->verifyDecision.cudaData) + 4, sizeof(metadata)),
+                        "DSpark device anchor handoff failed");
+                } else {
+                    upload(graphState->position, DataType::INT32, {deviceInputs ? 2 : batch},
+                           deviceInputs ? metadata : positions.data());
+                }
+                graphState->nextMetadataAt = -1;
                 if (!deviceInputs) {
                     graphState->input.CopyFrom(embedded);
                     upload(graphState->preMix, DataType::FLOAT32, preMix.dims, preMix.cpuData);
