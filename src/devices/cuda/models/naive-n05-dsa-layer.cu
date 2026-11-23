@@ -83,7 +83,7 @@ __device__ __forceinline__ void PreparedStep(float (&acc)[4], fastllm_mxfp8_proj
     const float x1 = quad * 2 + 1 < rows ? group.scales[quad * 2 + 1] : 0.f;
     fastllm_mxfp8_projection::Accumulate(acc, w, q, x0, x1);
 }
-__device__ void NormalizePacked(const Args &a, int row, B *scratch) {
+template <bool Pack> __device__ void NormalizeOwner(const Args &a, int row, B *scratch) {
     const int t = threadIdx.x;
     const int lane = t % 32;
     __shared__ float sums[8];
@@ -95,8 +95,10 @@ __device__ void NormalizePacked(const Args &a, int row, B *scratch) {
             const int k = (i * 256 + t) * 8;
             auto v = *reinterpret_cast<const uint4 *>(a.hidden + row * 4096 + k);
             auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&v);
-            if (a.branch) {
-                const auto branch = *reinterpret_cast<const uint4 *>(a.branch + row * 4096 + k);
+            // The BF16 projection rounds residual + 0 even without a branch.
+            if (a.branch || !Pack) {
+                const uint4 branch = a.branch ? *reinterpret_cast<const uint4 *>(a.branch + row * 4096 + k)
+                                              : make_uint4(0, 0, 0, 0);
 #pragma unroll
                 for (int j = 0; j < 4; ++j)
                     pairs[j] = __hadd2(pairs[j], reinterpret_cast<const __nv_bfloat162 *>(&branch)[j]);
@@ -133,57 +135,26 @@ __device__ void NormalizePacked(const Args &a, int row, B *scratch) {
             reinterpret_cast<B *>(&norm)[j] = __float2bfloat16_rn(
                 Round(float(v[j]) * inverse) * reinterpret_cast<const float *>(gamma)[j]);
         *reinterpret_cast<uint4 *>(a.normed + row * 4096 + k) = norm;
-        const auto packed = fastllm_mxfp8_projection::Quantize(norm);
-        auto &group = ActivationGroups(a)[k / 32];
-        group.values[row][t % 4] = packed.values;
-        if (!(t % 4)) group.scales[row] = packed.scale;
+        if constexpr (Pack) {
+            const auto packed = fastllm_mxfp8_projection::Quantize(norm);
+            auto &group = ActivationGroups(a)[k / 32];
+            group.values[row][t % 4] = packed.values;
+            if (!(t % 4)) group.scales[row] = packed.scale;
+        }
     }
 }
-// One owner per row retains the existing 256-thread RMS tree. Projection
-// CTAs consume the materialized BF16 rows after a cooperative publication barrier.
-__device__ void NormalizeOwner(const Args &a) {
-    const int t = threadIdx.x, row = blockIdx.x;
-    __shared__ float sums[8];
-    float values[16], square = 0;
-#pragma unroll
-    for (int j = 0; j < 16; ++j)
-        if (t < 256) {
-            int col = t + j * 256;
-            float x = Round(float(a.hidden[row * 4096 + col]) +
-                            (a.branch ? float(a.branch[row * 4096 + col]) : 0.f));
-            values[j] = x;
-            square += x * x;
-        }
-    square = WarpSum(square);
-    if (t < 256 && !(t & 31))
-        sums[t / 32] = square;
-    __syncthreads();
-    float total = WarpSum(t < 8 ? sums[t] : 0.f);
-    if (!t)
-        sums[0] = total;
-    __syncthreads();
-    float inv = rsqrtf(sums[0] / 4096 + a.eps);
-#pragma unroll
-    for (int j = 0; j < 16; ++j)
-        if (t < 256) {
-            int col = t + j * 256;
-            a.normed[row * 4096 + col] = __float2bfloat16_rn(Round(values[j] * inv) * a.inputNorm[col]);
-            if (a.feature)
-                a.feature[row * 4096 + col] = __float2bfloat16_rn(values[j]);
-        }
-    __syncthreads();
-}
-template <int Rows> __device__ void LoadNormalized(const Args &a, int first, B *output) {
-    for (int i = threadIdx.x; i < Rows * 512; i += Threads) {
-        int r = i / 512, col = i % 512 * 8;
-        B *target = output + (r / 8) * 8 * 4096 + fastllm_dsa_projection::input_offset(r % 8, col);
-        if (first + r < a.rows) {
+template <int Rows, int Width> __device__ void LoadProjectionInput(const B *input, int rows, B *output) {
+    constexpr int vectorsPerRow = Width / 8;
+    for (int i = threadIdx.x; i < Rows * vectorsPerRow; i += Threads) {
+        int row = i / vectorsPerRow, col = (i % vectorsPerRow) * 8;
+        B *target = output + (row / 8) * 8 * Width + fastllm_dsa_projection::input_offset(row % 8, col);
+        if (row < rows) {
             unsigned dst = unsigned(__cvta_generic_to_shared(target));
-            asm volatile("cp.async.cg.shared.global [%0],[%1],16;" ::"r"(dst),
-                         "l"(a.normed + (first + r) * 4096 + col)
+            asm volatile("cp.async.cg.shared.global [%0],[%1],16;" : : "r"(dst), "l"(input + row * Width + col)
                          : "memory");
-        } else
+        } else {
             *reinterpret_cast<uint4 *>(target) = make_uint4(0, 0, 0, 0);
+        }
     }
     asm volatile("cp.async.commit_group;cp.async.wait_group 0;" ::: "memory");
     __syncthreads();
@@ -228,7 +199,8 @@ __device__ void ProjectMx(const void *weight, const float *scales, int column,
 }
 template <int Rows, bool Mx> __device__ void Project(const Args &a, int first, ProjectionStorage<Rows> &s) {
     using namespace fastllm_dsa_projection;
-    if (!Mx || blockIdx.x >= 58) LoadNormalized<Rows>(a, first, s.input);
+    if (!Mx || blockIdx.x >= 58)
+        LoadProjectionInput<Rows, 4096>(a.normed + size_t(first) * 4096, a.rows - first, s.input);
     auto pointer = [&](int col) {
         if (col < 1856)
             return a.qkvWeight + size_t(col) * 4096;
@@ -307,19 +279,23 @@ __device__ __forceinline__ void RotateWarp(const B *source, B *output, int dim, 
     for (int col = 64 + lane; col < dim; col += 32)
         output[col] = source[col];
 }
-template <bool Fp8Key> __device__ void Publish(const Args &a, int row) {
+enum class PublishPart { Qkv, IndexKey, IndexQuery };
+template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPart part) {
     const int t = threadIdx.x;
     auto r = FastllmNaiveResolveDSARow(a.bindings[row]);
     int length = r.liveKeys ? *r.liveKeys : r.length;
     if (length <= 0 || length > r.capacity) {
-        for (int i = t; i < 1536; i += Threads)
-            a.query[row * 1536 + i] = __float2bfloat16_rn(0.f);
+        if (part == PublishPart::Qkv) {
+            for (int i = t; i < 1536; i += Threads)
+                a.query[row * 1536 + i] = __float2bfloat16_rn(0.f);
+        }
         return;
     }
     const B *raw = (const B *)(a.workspace + Layout::Qkv) + row * 1856;
     B *iq = (B *)(a.workspace + Layout::IndexQuery) + row * 2048;
     const int lane = t % 32, warp = t / 32;
-    NormalizeIndex(a, row);
+    if (part == PublishPart::IndexKey)
+        NormalizeIndex(a, row);
     __shared__ float cosine[32], sine[32];
     __shared__ B index[128];
     if (t < 32) {
@@ -331,19 +307,28 @@ template <bool Fp8Key> __device__ void Publish(const Args &a, int row) {
     }
     __syncthreads();
     const float cs = cosine[lane], sn = sine[lane];
+    if (part == PublishPart::IndexQuery) {
+        for (int head = warp; head < 16; head += Threads / 32)
+            RotateWarp(iq + head * 128, iq + head * 128, 128, cs, sn);
+        // Packing can read a head rotated by another warp in this CTA.
+        __syncthreads();
+        return;
+    }
     B *k = (B *)r.key + size_t(FastllmNaivePhysicalRow(r, length - 1)) * r.keyStride;
-    B *v = (B *)r.value + size_t(FastllmNaivePhysicalRow(r, length - 1, true)) * 128;
-    if (warp < 8)
-        RotateWarp(raw + warp * 192, a.query + row * 1536 + warp * 192, 192, cs, sn);
-    else if (warp == 8)
-        RotateWarp(raw + 1536, k, 192, cs, sn);
-    else if (warp == 9)
-        for (int col = lane; col < 128; col += 32)
-            v[col] = __float2bfloat16_rn(float(raw[1728 + col]) * Round(a.valueScale));
-    else if (warp == 10)
+    if (part == PublishPart::Qkv) {
+        if (warp < 8)
+            RotateWarp(raw + warp * 192, a.query + row * 1536 + warp * 192, 192, cs, sn);
+        else if (warp == 8)
+            RotateWarp(raw + 1536, k, 192, cs, sn);
+        else if (warp == 9) {
+            B *v = (B *)r.value + size_t(FastllmNaivePhysicalRow(r, length - 1, true)) * 128;
+            for (int col = lane; col < 128; col += 32)
+                v[col] = __float2bfloat16_rn(float(raw[1728 + col]) * Round(a.valueScale));
+        }
+        return;
+    }
+    if (warp == 0)
         RotateWarp((B *)(a.workspace + Layout::IndexKey) + row * 128, index, 128, cs, sn);
-    for (int head = warp; head < 16; head += 12)
-        RotateWarp(iq + head * 128, iq + head * 128, 128, cs, sn);
     __syncthreads();
     if constexpr (Fp8Key) {
         // Reduce the 128 Indexer values, then publish the per-row FP8 scale.
@@ -377,10 +362,14 @@ template <int Rows, bool Mx> __device__ void Tail(const Args &a, int first, Tail
     const int t = threadIdx.x, col = blockIdx.x * 32;
     if (blockIdx.x >= 128)
         return;
-    for (int i = t; i < Rows * 1024; i += Threads)
-        s.input[(i / (8 * 1024)) * 8 * 1024 + fastllm_dsa_projection::input_offset((i / 1024) % 8, i % 1024)] =
-            first + i / 1024 < a.rows ? a.attention[first * 1024 + i] : __float2bfloat16_rn(0.f);
-    __syncthreads();
+    if (!Mx && Rows == 8 && (reinterpret_cast<uintptr_t>(a.attention) & 15) == 0) {
+        LoadProjectionInput<Rows, 1024>(a.attention + size_t(first) * 1024, a.rows - first, s.input);
+    } else {
+        for (int i = t; i < Rows * 1024; i += Threads)
+            s.input[(i / (8 * 1024)) * 8 * 1024 + fastllm_dsa_projection::input_offset((i / 1024) % 8, i % 1024)] =
+                first + i / 1024 < a.rows ? a.attention[first * 1024 + i] : __float2bfloat16_rn(0.f);
+        __syncthreads();
+    }
     auto pointer = [&](int column) { return a.outputWeight + size_t(col + column) * 1024; };
     auto emit = [&](int column, int row, float value) { s.local[row][column] = __float2bfloat16_rn(value); };
     // Two tiles share each attention load. Four K splits retain FP32 accumulation.
@@ -522,19 +511,21 @@ template <bool Fp8Key, int Rows = 8, bool PairedAttention = false, bool Mx = fal
     // Single-request control is published by the existing frontend barrier.
     if (a.requestCount == 1)
         fastllm_dsa_fused::Body<Fp8Key, false>::initialize(CoreArguments(a, 0, 0));
-    if constexpr (Mx) {
-        const int row = int(gridDim.x - 1 - blockIdx.x);
-        // The low-index CTAs are already initializing the Indexer or prefetching QKV.
-        if (row < a.rows) NormalizePacked(a, row, s.projection.input);
-    } else if (blockIdx.x < a.rows) NormalizeOwner(a);
+    // Low-index CTAs initialize the Indexer; the last CTAs own RMS rows.
+    const int ownerRow = int(gridDim.x - 1 - blockIdx.x);
+    if (ownerRow < a.rows)
+        NormalizeOwner<Mx>(a, ownerRow, s.projection.input);
     grid.sync();
     for (int first = 0; first < a.rows; first += Rows)
         Project<Rows,Mx>(a, first, s.projection);
     grid.sync();
-    if (blockIdx.x < a.rows) {
-        Publish<Fp8Key>(a, blockIdx.x);
-        if (a.requestCount == 1)
-            PackPublishedQuery<Fp8Key>(a, blockIdx.x);
+    // Three independent publishers per row join at the existing grid barrier.
+    const int publishRow = blockIdx.x / 3;
+    if (publishRow < a.rows) {
+        const auto part = static_cast<PublishPart>(blockIdx.x % 3);
+        Publish<Fp8Key>(a, publishRow, part);
+        if (part == PublishPart::IndexQuery && a.requestCount == 1)
+            PackPublishedQuery<Fp8Key>(a, publishRow);
     }
     grid.sync();
     if (a.phaseStop == 1)
