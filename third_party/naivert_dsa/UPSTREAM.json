@@ -10,7 +10,7 @@
     "topk_grid_select.cuh": {
       "source": "attn_dsa/topk_grid_select.cuh",
       "original_sha256": "7247de381d1879851f57aeefcdd851dabcae7eaa03c29fc57a429731aed3e04e",
-      "installed_sha256": "318bc86469443f08adad50844cafea2c0927b59bc0bc95da1660591081f6feb3"
+      "installed_sha256": "6689487fc74153d7afc5f76917cc3368792ba2a58c707e2ec7352c9729bb144b"
     },
     "topk_local_select.cuh": {
       "source": "attn_dsa/topk_local_select.cuh",
@@ -33,7 +33,7 @@
       "installed_sha256": "30e50d9c603f89ac9f44849b965b7733ed8f7e3d8b2f9f9748af99b97be77d95"
     }
   },
-  "changes": "Extracted cooperative TCgen05 Indexer and exact Top-K for SM103. Adapted BF16/FP8 native paged caches, causal lengths, FastLLM quantization/scale order and caller-owned scratch. Partial fusion retains score ordering and native attention arithmetic. Full layer adds native BF16 projections/RoPE/cache append, compact attention, token-ordered bitmap Top-K, seven cache producer warps, conditional first-histogram reuse and TP8 residual output. Removed unused upstream helpers, phase timers and unreachable histogram variants. The internal full-layer launch ABI/control flow is retained to preserve measured SM103 code generation. See README.txt for support, fallback and numerical contracts.",
+  "changes": "Extracted cooperative TCgen05 Indexer and exact Top-K for SM103. Adapted BF16/FP8 native paged caches, causal lengths, FastLLM quantization/scale order and caller-owned scratch. Partial fusion retains score ordering and native attention arithmetic. Full layer adds native BF16 projections/RoPE/cache append, compact attention, token-ordered bitmap Top-K, seven cache producer warps, conditional first-histogram reuse and TP8 residual output. For intermediate lengths, full-layer Top-K partitions each query across resident CTAs and scatters winners in token order using existing scratch. Removed unused upstream helpers, phase timers and unreachable histogram variants. The internal full-layer launch ABI/control flow is retained to preserve measured SM103 code generation. See README.txt for support, fallback and numerical contracts.",
   "derived_adapters": {
     "src/devices/cuda/models/naive-n05-dsa-fused-attention.cuh": {
       "source": "attn_dsa/attn_dsa_body.cuh",

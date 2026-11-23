@@ -64,7 +64,7 @@ int main() {
         cudaGraph_t graphs[2] = {};
         cudaGraphExec_t executables[2] = {};
         int cases = 0;
-        for (int visible : {2049, 8192, 16384, 16391, 32768, 65536}) {
+        for (int visible : {2049, 8192, 12288, 12289, 16384, 16391, 24576, 24577, 32768, 65536}) {
             for (int pattern = 0; pattern < 4; ++pattern) {
                 std::vector<float> logits(8 * Layout::kMaxSeqLen, 0.f);
                 std::vector<unsigned> histogram(8 * 256);

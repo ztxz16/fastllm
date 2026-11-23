@@ -546,6 +546,108 @@ __device__ static void topk_grid_query_finish(int *selections, unsigned *grid_ba
   } // original radix-sort finish
 }
 
+// At intermediate lengths sixteen CTAs cover a row and keep their consecutive
+// positions in registers through all radix passes. The final scatter needs only
+// two counts per CTA, including the lower-position tie break at the cutoff.
+static constexpr int kSelectShards = 16;
+static constexpr int kShardItems = 4;
+static constexpr int kShardedMaxVisible = kSelectShards * kThreads * kShardItems;
+__device__ static void select_per_query_topk_sharded(const float *logits, int *selections,
+                                                      unsigned *base, const int *lengths,
+                                                      unsigned *shared, bool firstReady) {
+  auto grid = make_grid(reinterpret_cast<unsigned char *>(base) - Scratch::kTopKGridOffset);
+  const int query = cta_index() / kSelectShards, shard = cta_index() % kSelectShards;
+  const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
+  const int visible = query < Scratch::kQueryRows ? lengths[query] : 0;
+  const bool sparse = visible > Scratch::kIndexTopK;
+  const int span = (visible + kSelectShards * 32 - 1) / (kSelectShards * 32) * 32;
+  const int first = shard * span + warp * kShardItems * 32 + lane;
+  const int end = min((shard + 1) * span, visible);
+  unsigned keys[kShardItems];
+#pragma unroll
+  for (int i = 0; i < kShardItems; ++i) {
+    const int token = first + i * 32;
+    keys[i] = sparse && token < end ? ordered_float_key(logits[size_t(query) * Scratch::kMaxSeqLen + token]) : 0u;
+    if (!sparse && token < end)
+      selections[query * Scratch::kIndexTopK + token] = token;
+  }
+
+  unsigned prefix = 0, mask = 0, wanted = Scratch::kIndexTopK;
+  for (int pass = 0; pass < kTopKGridPasses; ++pass) {
+    const int shift = 24 - pass * 8;
+    if (pass || !firstReady) {
+      if (sparse) {
+        if (tid < kTopKGridBins) shared[tid] = 0;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < kShardItems; ++i) {
+          const unsigned digit = (keys[i] >> shift) & 255u;
+          const bool match = first + i * 32 < end && (keys[i] & mask) == prefix;
+          const unsigned live = __ballot_sync(0xffffffffu, match);
+          if (match) {
+            const unsigned peers = __match_any_sync(live, digit);
+            if (lane == __ffs(peers) - 1) atomicAdd(shared + digit, unsigned(__popc(peers)));
+          }
+        }
+        __syncthreads();
+        if (tid < kTopKGridBins && shared[tid])
+          atomicAdd(topk_grid_hist(base, query, pass) + tid, shared[tid]);
+      }
+      grid.sync();
+    }
+    if (sparse) {
+      unsigned *cut = shared + kTopKGridBins;
+      if (warp == 0) topk_grid_find_bin_warp(topk_grid_hist(base, query, pass), wanted, lane, cut);
+      __syncthreads();
+      prefix |= cut[0] << shift;
+      mask |= 255u << shift;
+      wanted = cut[1];
+    }
+  }
+
+  unsigned greater[kShardItems], equal[kShardItems];
+  unsigned *warpGreater = shared, *warpEqual = shared + kWmmaWarps;
+  if (sparse) {
+    unsigned nGreater = 0, nEqual = 0;
+#pragma unroll
+    for (int i = 0; i < kShardItems; ++i) {
+      const bool live = first + i * 32 < end;
+      greater[i] = __ballot_sync(0xffffffffu, live && keys[i] > prefix);
+      equal[i] = __ballot_sync(0xffffffffu, live && keys[i] == prefix);
+      nGreater += __popc(greater[i]);
+      nEqual += __popc(equal[i]);
+    }
+    if (!lane) {
+      warpGreater[warp] = nGreater;
+      warpEqual[warp] = nEqual;
+    }
+    __syncthreads();
+    nGreater = __reduce_add_sync(0xffffffffu, lane < kWmmaWarps ? warpGreater[lane] : 0u);
+    nEqual = __reduce_add_sync(0xffffffffu, lane < kWmmaWarps ? warpEqual[lane] : 0u);
+    if (!tid) {
+      topk_grid_count_gt(base, query)[shard] = nGreater;
+      topk_grid_count_eq(base, query)[shard] = nEqual;
+    }
+  }
+  grid.sync();
+  if (sparse) {
+    unsigned beforeG = __reduce_add_sync(0xffffffffu, lane < shard ? topk_grid_count_gt(base, query)[lane] : 0u);
+    unsigned beforeE = __reduce_add_sync(0xffffffffu, lane < shard ? topk_grid_count_eq(base, query)[lane] : 0u);
+    beforeG += __reduce_add_sync(0xffffffffu, lane < warp ? warpGreater[lane] : 0u);
+    beforeE += __reduce_add_sync(0xffffffffu, lane < warp ? warpEqual[lane] : 0u);
+    const unsigned prior = (1u << lane) - 1u;
+#pragma unroll
+    for (int i = 0; i < kShardItems; ++i) {
+      const unsigned g = beforeG + __popc(greater[i] & prior), e = beforeE + __popc(equal[i] & prior);
+      if ((greater[i] & (1u << lane)) || ((equal[i] & (1u << lane)) && e < wanted))
+        selections[query * Scratch::kIndexTopK + g + min(e, wanted)] = first + i * 32;
+      beforeG += __popc(greater[i]);
+      beforeE += __popc(equal[i]);
+    }
+  }
+  grid.sync();
+}
+
 __device__ static void select_per_query_topk_grid(const float *logits, int *selections, unsigned *grid_base,
                                                   const int *lengths, unsigned *shared_words,
                                                   TopKBlockRadixSort::TempStorage *sort_storage,
@@ -564,6 +666,13 @@ __device__ static void select_per_query_topk_grid(const float *logits, int *sele
   const int items = Scratch::kQueryRows * chunks;
   const int scan_chunks = (max_visible + kTopKScanChunk - 1) / kTopKScanChunk;
   const int scan_items = Scratch::kQueryRows * scan_chunks;
+  if constexpr (!PreserveScoreOrder && Scratch::kQueryRows == 8 && Groups == 1) {
+    if (max_visible > kTopKLocalMaxVisible && max_visible <= kShardedMaxVisible &&
+        cta_count() >= kSelectShards * Scratch::kQueryRows) {
+      select_per_query_topk_sharded(logits, selections, grid_base, lengths, shared_words, firstReady);
+      return;
+    }
+  }
   if (max_visible <= kTopKLocalMaxVisible) {
     // One CTA per query selects in shared memory; one grid barrier instead of 4-7.
     if (int(cta_index()) < Scratch::kQueryRows) {
