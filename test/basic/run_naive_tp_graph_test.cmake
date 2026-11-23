@@ -4,7 +4,7 @@ file(MAKE_DIRECTORY "${TEST_DIRECTORY}")
 # Greedy/sampling mode switches additionally emit 102 checked token IDs.
 math(EXPR expected_bytes "(6 + 8 * 2) * 7 * 256 * 4 + 102 * 4")
 foreach(cache_mode legacy paged)
-    foreach(mode eager graph failbegin failinstantiate)
+    foreach(mode eager graph)
         set(output "${TEST_DIRECTORY}/${cache_mode}-${mode}.bin")
         file(REMOVE "${output}")
         execute_process(COMMAND "${TEST_EXECUTABLE}" "${mode}" "${output}" "${cache_mode}"

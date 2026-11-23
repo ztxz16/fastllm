@@ -24,12 +24,13 @@ def apply_model_defaults(args, metadata):
     explicit = set(getattr(args, "_auto_explicit", ()))
     speculation = {"mtp", "dspark", "speculative_algorithm", "speculative_draft_model_path",
                    "draft_tokens", "speculative_num_draft_tokens", "speculative_dspark_block_size"}
-    if family in ("qwen3_5", "qwen3_5_text"):
+    loop_model = metadata.get("model_type") == "sensenova_loop"
+    if loop_model or family in ("qwen3_5", "qwen3_5_text"):
         if "max_batch" not in explicit and args.max_batch <= 0:
-            args.max_batch = 4
+            args.max_batch = 1 if loop_model else 4
         if "cuda_embedding" not in explicit:
             args.cuda_embedding = True
-        if (not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
+        if (not loop_model and not explicit & speculation and not (args.mtp or args.dspark or args.speculative_algorithm or
                                                 args.speculative_draft_model_path) and
                 int(config.get("mtp_num_hidden_layers", 0)) == 1 and
                 (Path(args.path) / "mtp.safetensors").is_file()):
@@ -50,6 +51,8 @@ def apply_model_defaults(args, metadata):
 
 def default_kv_dtype(model, metadata):
     """Pack V4.1's already fake-quantized KV without another rounding step."""
+    if metadata.get("model_type") == "sensenova_loop":
+        return "bfloat16"
     if model.family != "deepseek_v41":
         return "float16"
     config = metadata.get("text_config", metadata)
@@ -418,7 +421,10 @@ def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, 
     target = (base.max_context_length if "max_context_length" in explicit else
               min(model.context, base.max_context_length))
     topology = list(topologies(base, explicit, info, gpu, family="qwen35"))
-    if not ({"tp", "device"} & explicit):
+    loop_model = metadata.get("model_type") == "sensenova_loop"
+    if loop_model:
+        topology = [entry for entry in topology if len(entry[3]) == 1 and entry[2] != "tp"]
+    elif not ({"tp", "device"} & explicit):
         parallel = [entry for entry in topology if entry[2] == "tp"]
         if parallel:
             topology = parallel
@@ -480,7 +486,7 @@ def _resolve_dense_qwen35(args, base, explicit, metadata, tensors, model, info, 
     verify_graph_env = "FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH"
     if trial.mtp > 0 and trial.max_batch > 1 and verify_graph_env not in os.environ:
         os.environ[verify_graph_env] = "0"
-    result["automatic"] = {"policy": "qwen35-longest-context-pure-cuda-tp",
+    result["automatic"] = {"policy": "sensenova-loop-single-cuda" if loop_model else "qwen35-longest-context-pure-cuda-tp",
                            "mtp": trial.mtp, "cuda_embedding": trial.cuda_embedding,
                            "cuda_graph": os.environ.get("FASTLLM_CUDA_GRAPH", "1") != "0",
                            "mtp_verify_cuda_graph": os.environ.get(verify_graph_env, "1") != "0",
@@ -594,16 +600,24 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
 
 def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     """Resolve one --auto invocation transactionally, before model allocation."""
-    config_path = Path(args.path) / "config.json"
+    path = Path(args.path)
+    config_path = path / "config.json"
+    family = None
     if config_path.is_file():
         with config_path.open() as stream:
             config = json.load(stream)
+        family = config.get("model_type")
         if config.get("model_type") == "clover_moe":
             from .clover_config import resolve as resolve_clover
             trial = copy.copy(args)
             result = resolve_clover(trial, query_gpu, config, hardware=hardware, ram=ram)
             vars(args).update(vars(trial))
             return result
+    elif path.suffix.lower() == ".gguf" and path.is_file():
+        family = memory.gguf.read_gguf_metadata(path, {"general.architecture"}).get("general.architecture")
+    if family == "hy_v4_flash":
+        from .hy4_config import resolve as resolve_hy4
+        return resolve_hy4(args, query_gpu, hardware, ram, use_numa)
     from .env import env
     from .util import _fastllm_env_flag_enabled
     graph_enabled = ("FASTLLM_CUDA_GRAPH" not in os.environ or
@@ -698,7 +712,8 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     if base.tokens <= 0:
         base.tokens = base.max_context_length * base.max_batch
     if "atype" not in explicit and model.family != "deepseek_v41":
-        base.atype = "bfloat16" if model.family == "glm5" else "float16"
+        use_bf16 = model.family == "glm5" or metadata.get("model_type") == "sensenova_loop"
+        base.atype = "bfloat16" if use_bf16 else "float16"
     if "kv_cache_dtype" not in explicit:
         base.kv_cache_dtype = default_kv_dtype(model, metadata)
     # Re-evaluate geometry with the selected defaults (explicit precisions win).

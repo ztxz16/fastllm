@@ -312,6 +312,10 @@ int main() {
         for (int batch : {32, 128, 193, 257, 1025}) for (bool merged : {false, true})
             for (bool fp8 : {false, true}) RunBatch(batch, merged, false, true, true, fp8);
         RunBatch(33, true, false, true, true, true, 64, 8);
+        for (bool packed : {false, true}) {
+            RunBatch(81, packed, false, false, false, true, 37);
+            RunBatch(193, packed, false, true, true, true, 37);
+        }
         std::printf("Naive RoPE/cache: %d checks passed\n", checks);
         return 0;
     } catch (const std::exception &e) {

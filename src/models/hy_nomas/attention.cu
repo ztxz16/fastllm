@@ -3,6 +3,9 @@
 // it does not install or link another attention runtime.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#ifdef FASTLLM_SHARED_DENSE_PREFILL
+#include "devices/cuda/fastllm-dense-prefill.cuh"
+#endif
 #include "attention/prefill.cuh"
 #include "attention/default_prefill_params.cuh"
 #include "attention/variants.cuh"
@@ -48,15 +51,22 @@ template<class T,int D,bool FP32Sum,bool Batched=false> cudaError_t dispatchAtte
     if(tile && (height>tile*3 || width>tile*3))
         return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
             MaskMode::kCustom,LocalAttention<Attention>,Params<T>,false>(p,nullptr,stream);
-    if(causal)
-        return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
-            MaskMode::kCausal,Attention,Params<T>,false>(p,nullptr,stream);
-    const bool smallQuery = D==128 && heads==kvHeads &&
+    const bool smallQuery = !causal && D==128 && heads==kvHeads &&
         ((FP32Sum && queries>64 && queries<=256 && keys>=512) ||
          (!FP32Sum && queries>=512 && queries<=2304 && heads<=8 && qStride>heads*3*D)) &&
         GetCudaComputeCapability().first==12;
-    return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
-        MaskMode::kNone,Attention,Params<T>,false>(p,nullptr,stream,smallQuery?64:0,smallQuery?2:0);
+#ifdef FASTLLM_SHARED_DENSE_PREFILL
+    if constexpr (std::is_same_v<T, __half> && D == 128 && !FP32Sum) {
+        return fastllm::DensePrefillHalf128(p, causal, stream, smallQuery ? 64 : 0, smallQuery ? 2 : 0);
+    } else
+#endif
+    {
+        if(causal)
+            return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
+                MaskMode::kCausal,Attention,Params<T>,false>(p,nullptr,stream);
+        return SinglePrefillWithKVCacheDispatched<D,D,PosEncodingMode::kNone,false,
+            MaskMode::kNone,Attention,Params<T>,false>(p,nullptr,stream,smallQuery?64:0,smallQuery?2:0);
+    }
 }
 } // namespace
 cudaError_t fusedAttention(const void *q,const void *k,const void *v,void *out,

@@ -440,6 +440,10 @@ fastllm_lib.launch_response_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ct
                                                   ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 fastllm_lib.launch_response_llm_model.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "enable_dfly2_llm_model"):
+    fastllm_lib.enable_dfly2_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+    fastllm_lib.enable_dfly2_llm_model.restype = ctypes.c_bool
+
 if hasattr(fastllm_lib, "launch_response_clover_llm_model"):
     fastllm_lib.launch_response_clover_llm_model.argtypes = [
         ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p]
@@ -1495,7 +1499,10 @@ class model:
                   rope_scaling = None,
                   indexer_dtype: str = "auto",
                   indexer_tp_storage: str = "replicated",
-                  indexer_compute_dtype: str = "auto", pd_prefill: bool = False):
+                  indexer_compute_dtype: str = "auto", pd_prefill: bool = False,
+                  dfly2_block_size: int = 0):
+        if dfly2_block_size and not hasattr(fastllm_lib, "enable_dfly2_llm_model"):
+            raise RuntimeError("The loaded FastLLM library requires a rebuild for DFly2")
         if indexer_compute_dtype not in ("auto", "fp8", "fp8_direct"):
             raise ValueError("indexer_compute_dtype must be auto, fp8 or fp8_direct")
         if indexer_compute_dtype != "auto" and not hasattr(fastllm_lib, "set_model_indexer_compute_dtype"):
@@ -1733,6 +1740,9 @@ class model:
             atype = "bfloat16"
         if atype and (architecture == "Qwen3_5ForConditionalGeneration" or model_type.startswith("qwen3_5")):
             self.set_atype(atype)
+
+        if dfly2_block_size and not fastllm_lib.enable_dfly2_llm_model(self.model, dfly2_block_size):
+            raise ValueError("DFly2 requires compatible HY4-Flash draft weights and a block size of 2–16")
 
         self.direct_query = False;
         self.system_prompt = system_prompt;

@@ -1,11 +1,16 @@
-// Hopper QKV/RoPE fusion regression: exact dyadic projection, shared graph
+// QKV/RoPE fusion regression: exact dyadic projection, shared graph
 // workspace, mutable page tables, ring wrap, and rejection without side effects.
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cmath>
+#include <cstring>
+#include <cstdlib>
+#include <algorithm>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <vector>
 using namespace fastllm;
@@ -39,6 +44,7 @@ std::vector<uint8_t> Read(const Data &x) {
 struct Case {
     int batch, capacity, pageLen, width;
     bool ring;
+    int verifyGroup;
     Data x{BFLOAT16}, q{BFLOAT16}, k{BFLOAT16}, v{BFLOAT16}, packed{BFLOAT16}, index{BFLOAT16};
     Data positions{FLOAT32}, lengths{INT32}, pages{INT32}, table{INT32};
     Data key{BFLOAT16}, value{BFLOAT16}, otherKey{BFLOAT16}, otherValue{BFLOAT16};
@@ -46,9 +52,9 @@ struct Case {
     std::vector<std::unique_ptr<Data>> keys, values, indices;
     std::vector<FastllmNaiveRopeCacheRow> rows;
     cudaGraphExec_t graph = nullptr;
-    Case(int batch, bool ring, int pageLen = 64, DataType cacheType = BFLOAT16)
-        : batch(batch), capacity(ring ? 128 : pageLen * 4), pageLen(ring ? 0 : pageLen),
-          width(ring ? 192 : 320), ring(ring) {
+    Case(int batch, bool ring, int pageLen = 64, DataType cacheType = BFLOAT16, int verifyGroup = 0)
+        : batch(batch), capacity(ring ? (verifyGroup ? 136 : 128) : pageLen * 4), pageLen(ring ? 0 : pageLen),
+          width(ring ? 192 : 320), ring(ring), verifyGroup(verifyGroup) {
         Init(x, {1, batch, 4096}); Init(q, {1, batch, 1536});
         Init(k, {1, batch, 192}); Init(v, {1, batch, 128});
         Init(packed, {1, batch, 1856}); Init(index, {1, batch, 128});
@@ -77,6 +83,12 @@ struct Case {
             }
             rows.push_back({keys.back().get(), values.back().get(), ring ? nullptr : indices.back().get(),
                            (const void *const *)table.cudaData + b * 4});
+            if (verifyGroup) {
+                int first = b / verifyGroup * verifyGroup;
+                rows.back().key = keys[first].get(); rows.back().value = values[first].get();
+                rows.back().cache = (const void *const *)table.cudaData + first * 4;
+                rows.back().verifyOffset = b % verifyGroup;
+            }
         }
         Fill(x, batch + 17); Fill(index, batch + 37); Update(0);
     }
@@ -99,6 +111,11 @@ struct Case {
             bindings[b * 4 + 2] = (int *)pages.cudaData + b * 8;
             bindings[b * 4 + 3] = (int *)pages.cudaData + b * 8 + 4;
         }
+        if (verifyGroup) for (int b = 0; b < batch; ++b) {
+            int past = iteration == 0 ? 0 : iteration == 1 ? 127 : iteration == 2 ? 128 : 200003;
+            pos[b] = past + b % verifyGroup;
+            live[b] = iteration == 3 && b % verifyGroup >= (verifyGroup + 1) / 2 ? 0 : past + b % verifyGroup + 1;
+        }
         Check(cudaMemcpy(positions.cudaData, pos.data(), batch * sizeof(float), cudaMemcpyHostToDevice));
         Check(cudaMemcpy(lengths.cudaData, live.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
         Check(cudaMemcpy(pages.cudaData, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice));
@@ -113,15 +130,251 @@ struct Case {
     }
     bool Fused(Data &weight, Data &scratch, const Data &bias = Data()) {
         return FastllmCudaNaiveBatchQkvRopeAppendCache(x, weight, bias, q, k, v, positions, rows,
-            lengths, 8, 1, 192, 128, 64, ring ? 10000.f : 10000000.f, .707f, ring ? 128 : 0, ring, scratch);
+            lengths, 8, 1, 192, 128, 64, ring ? 10000.f : 10000000.f, .707f, ring ? 128 : 0, ring && !verifyGroup, scratch);
     }
     void Reference(Data &weight) {
         Data bias;
         Require(FastllmCudaBFloat16MatMulBFloat16(x, weight, bias, packed, batch, 4096, 1856), "Linear failed");
         Require(FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions, rows, lengths,
-            8, 1, 192, 128, 64, ring ? 10000.f : 10000000.f, .707f, ring ? 128 : 0, &packed, ring), "RoPE failed");
+            8, 1, 192, 128, 64, ring ? 10000.f : 10000000.f, .707f, ring ? 128 : 0, &packed, ring && !verifyGroup), "RoPE failed");
     }
 };
+void VerifyProjection(Data &weight, int rows, int group) {
+    Case c(rows, true, 64, BFLOAT16, group); Data scratch(BFLOAT16);
+    if (rows > 16) {
+        auto before = c.Output();
+        Require(!c.Fused(weight, scratch), "large-row GEMM fallback was replaced");
+        Require(before == c.Output(), "fallback changed output");
+        return;
+    }
+    Require(c.Fused(weight, scratch), "verification QKV rejected");
+    cudaGraph_t graph;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Require(c.Fused(weight, scratch), "verification QKV capture rejected");
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    Check(cudaGraphInstantiate(&c.graph, graph, 0)); Check(cudaGraphDestroy(graph));
+    for (int pass = 0; pass < 4; ++pass) {
+        c.Update(pass); c.Reset(); Check(cudaGraphLaunch(c.graph, cudaStreamPerThread));
+        auto actual = c.Output(); c.Reset(); c.Reference(weight);
+        Require(actual == c.Output(), "verification QKV bits, candidate slot or graph rebinding differs");
+    }
+    c.Update(1);
+    auto bench = [&](bool fused) {
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        for (int repeat = 0; repeat < 100; ++repeat) {
+            if (fused) Require(c.Fused(weight, scratch), "benchmark rejected");
+            else c.Reference(weight);
+        }
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&exec, graph, 0)); Check(cudaGraphDestroy(graph));
+        cudaEvent_t a, b; Check(cudaEventCreate(&a)); Check(cudaEventCreate(&b));
+        std::vector<float> samples;
+        for (int i = 0; i < 8; ++i) {
+            Check(cudaEventRecord(a, cudaStreamPerThread)); Check(cudaGraphLaunch(exec, cudaStreamPerThread));
+            Check(cudaEventRecord(b, cudaStreamPerThread)); Check(cudaEventSynchronize(b));
+            float ms; Check(cudaEventElapsedTime(&ms, a, b)); if (i >= 2) samples.push_back(ms * 10);
+        }
+        std::sort(samples.begin(), samples.end());
+        Check(cudaEventDestroy(a)); Check(cudaEventDestroy(b)); Check(cudaGraphExecDestroy(exec));
+        return samples[samples.size()/2];
+    };
+    printf("VERIFY QKV rows=%d group=%d old_us=%.3f fused_us=%.3f exact_graph=4\n", rows, group, bench(false), bench(true));
+    auto before = c.Output(); c.rows.back().verifyOffset = 8;
+    Require(!c.Fused(weight, scratch), "invalid verification offset accepted");
+    Require(before == c.Output(), "invalid verification offset wrote output");
+}
+void VerifyProjectionNumerics() {
+    Data weight(BFLOAT16), scratch(BFLOAT16);
+    Init(weight, {1856, 4096});
+    std::mt19937 random(197);
+    auto fill = [&](Data &x, float scale) {
+        std::uniform_real_distribution<float> uniform(-scale, scale);
+        std::vector<__nv_bfloat16> values(x.Count(0));
+        for (auto &v : values) v = __float2bfloat16_rn(uniform(random));
+        Check(cudaMemcpy(x.cudaData, values.data(), values.size() * 2, cudaMemcpyHostToDevice));
+    };
+    fill(weight, .1f);
+    auto value = [](const std::vector<uint8_t> &bytes, size_t i) {
+        unsigned short bits;
+        std::memcpy(&bits, bytes.data() + i * 2, 2);
+        return __bfloat162float(__ushort_as_bfloat16(bits));
+    };
+    double maximum = 0;
+    for (int count : {2, 3, 7, 8, 9, 13, 16}) {
+        Case c(count, true, 64, BFLOAT16, 8);
+        fill(c.x, count == 7 ? 16.f : 1.f);
+        Require(c.Fused(weight, scratch), "numeric verification QKV rejected");
+        cudaGraph_t graph;
+        Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+        Require(c.Fused(weight, scratch), "numeric verification capture rejected");
+        Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+        Check(cudaGraphInstantiate(&c.graph, graph, 0)); Check(cudaGraphDestroy(graph));
+        for (int pass = 0; pass < 4; ++pass) {
+            c.Update(pass); c.Reset(); c.Reference(weight); auto reference = c.Output();
+            c.Reset(); Check(cudaGraphLaunch(c.graph, cudaStreamPerThread)); auto actual = c.Output();
+            for (int row = 0; row < count; ++row) for (int kind = 0; kind < 3; ++kind) {
+                const bool active = !(pass == 3 && row % 8 >= 4);
+                if (kind && !active) continue;
+                const int array = kind ? (pass % 2 ? kind + 2 : kind) : 0;
+                const int width = kind == 0 ? 1536 : kind == 1 ? 192 : 128;
+                const size_t first = kind ? (size_t(row / 8 * 8) * c.capacity + 128 + row % 8) * width : size_t(row) * width;
+                double error = 0, norm = 0;
+                for (int i = 0; i < width; ++i) {
+                    const float a = value(reference[array], first + i), b = value(actual[array], first + i);
+                    Require(std::isfinite(a) && std::isfinite(b), "nonfinite QKV output");
+                    const double difference = double(a) - b;
+                    error += difference * difference; norm += double(a) * a;
+                }
+                const double l2 = std::sqrt(error / std::max(norm, 1e-30));
+                Require(l2 < .003, "QKV per-row Q/K/V relative L2 exceeded tolerance");
+                maximum = std::max(maximum, l2);
+            }
+        }
+    }
+    printf("VERIFY QKV random maximum_per_row_L2=%.9g\n", maximum);
+}
+
+void VerifyQkvAttention(bool disabled) {
+    Data weight(BFLOAT16), scratch(BFLOAT16), sink(FLOAT32);
+    Init(weight, {1856, 4096});
+    Init(sink, {8});
+    std::vector<float> bias(8, -1.f);
+    Check(cudaMemcpy(sink.cudaData, bias.data(), 32, cudaMemcpyHostToDevice));
+    std::mt19937 rng(7213);
+    auto randomFill = [&](Data &x, float scale) {
+        std::uniform_real_distribution<float> d(-scale, scale);
+        std::vector<__nv_bfloat16> v(x.Count(0));
+        for (auto &z : v)
+            z = __float2bfloat16_rn(d(rng));
+        Check(cudaMemcpy(x.cudaData, v.data(), v.size() * 2, cudaMemcpyHostToDevice));
+    };
+    auto value = [](const std::vector<uint8_t> &x, size_t i) {
+        unsigned short bits;
+        std::memcpy(&bits, x.data() + i * 2, 2);
+        return float(__ushort_as_bfloat16(bits));
+    };
+    double maximum[4] = {};
+    int checks = 0;
+    for (int numeric = 0; numeric < 2; ++numeric) {
+        if (numeric)
+            randomFill(weight, .1f);
+        else
+            Fill(weight, 191);
+        for (int count : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16})
+            for (int group : {3, 8}) {
+                Case c(count, true, 64, BFLOAT16, group);
+                Data out(BFLOAT16);
+                Init(out, {1, count, 1024});
+                Check(cudaMemset(out.cudaData, 0x3d, out.GetBytes()));
+                if (numeric)
+                    randomFill(c.x, count == 7 ? 16.f : 1.f);
+                auto fused = [&]() {
+                    return FastllmCudaNaiveSwaQkvAttention(c.x, weight, Data(), c.q, c.k, c.v, c.positions,
+                                                           c.rows, c.lengths, 8, 1, 192, 128, 64, 10000.f,
+                                                           .707f, 128, sink, out);
+                };
+                std::vector<FastllmNaiveSWARow> rows;
+                for (const auto &r : c.rows)
+                    rows.push_back(
+                        {r.key->cudaData, r.value->cudaData, r.cache, false, true, 0, r.verifyOffset});
+                auto reference = [&]() {
+                    Require(c.Fused(weight, scratch), "reference QKV rejected");
+                    FastllmCudaNaiveBatchSWADecode(c.q, sink, rows, c.lengths, 8, 1, out);
+                };
+                auto before = c.Output(), beforeOut = std::vector<std::vector<uint8_t>>{Read(out)};
+                if (count == 2 && group == 3 && !numeric && !disabled) {
+                    cudaGraph_t cold;
+                    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                    Require(!fused(), "cold QKV/attention resources prepared during capture");
+                    Check(cudaStreamEndCapture(cudaStreamPerThread, &cold));
+                    size_t nodes = 0;
+                    Check(cudaGraphGetNodes(cold, nullptr, &nodes));
+                    Require(nodes == 0, "cold rejection added graph nodes");
+                    Check(cudaGraphDestroy(cold));
+                }
+                bool accepted = fused();
+                if (disabled || count < 2 || count > 7) {
+                    Require(!accepted, "unsupported QKV/attention accepted");
+                    Require(before == c.Output() && beforeOut[0] == Read(out),
+                            "QKV/attention rejection wrote output");
+                    continue;
+                }
+                Require(accepted, "supported QKV/attention rejected");
+                cudaGraph_t graph;
+                Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+                Require(fused(), "QKV/attention capture rejected");
+                Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+                size_t nodes = 0;
+                Check(cudaGraphGetNodes(graph, nullptr, &nodes));
+                Require(nodes == 1, "QKV/attention is not one node");
+                Check(cudaGraphInstantiate(&c.graph, graph, 0));
+                Check(cudaGraphDestroy(graph));
+                for (int pass = 0; pass < 4; ++pass) {
+                    c.Update(pass);
+                    c.Reset();
+                    reference();
+                    auto ref = c.Output();
+                    auto refOut = Read(out);
+                    c.Reset();
+                    Check(cudaGraphLaunch(c.graph, cudaStreamPerThread));
+                    auto actual = c.Output();
+                    auto actualOut = Read(out);
+                    if (!numeric)
+                        Require(ref == actual && refOut == actualOut, "dyadic QKV/attention differs");
+                    for (int row = 0; row < count; ++row)
+                        for (int kind = 0; kind < 4; ++kind) {
+                            const bool active = !(pass == 3 && row % group >= (group + 1) / 2);
+                            if ((kind == 1 || kind == 2) && !active)
+                                continue;
+                            const int array = kind == 0 ? 0 : pass % 2 ? kind + 2 : kind;
+                            const int width = kind == 0 ? 1536 : kind == 1 ? 192 : kind == 2 ? 128 : 1024;
+                            const size_t first =
+                                (kind == 0 || kind == 3)
+                                    ? size_t(row) * width
+                                    : (size_t(row / group * group) * c.capacity + 128 + row % group) * width;
+                            const auto &a = kind == 3 ? refOut : ref[array],
+                                       &b = kind == 3 ? actualOut : actual[array];
+                            double error = 0, norm = 0;
+                            for (int j = 0; j < width; ++j) {
+                                double x = value(a, first + j), y = value(b, first + j);
+                                Require(std::isfinite(x) && std::isfinite(y), "nonfinite QKV/attention");
+                                error += (x - y) * (x - y);
+                                norm += x * x;
+                            }
+                            const double l2 = std::sqrt(error / std::max(norm, 1e-30));
+                            Require(l2 < .003, "QKV/attention per-row L2 exceeded tolerance");
+                            maximum[kind] = std::max(maximum[kind], l2);
+                            if (kind == 1 || kind == 2)
+                                std::copy_n(ref[array].begin() + first * 2, width * 2,
+                                            actual[array].begin() + first * 2);
+                        }
+                    for (size_t i = 1; i < ref.size(); ++i)
+                        Require(ref[i] == actual[i], "untouched cache changed");
+                    ++checks;
+                }
+                before = c.Output();
+                auto untouched = Read(out);
+                ++out.strides[1];
+                Require(!fused(), "noncontiguous attention output accepted");
+                --out.strides[1];
+                void *save = out.cudaData;
+                out.cudaData = c.x.cudaData;
+                bool alias = fused();
+                out.cudaData = save;
+                Require(!alias, "attention/input alias accepted");
+                ++sink.strides[0];
+                Require(!fused(), "bad sink layout accepted");
+                --sink.strides[0];
+                c.rows.back().verifyOffset = 8;
+                Require(!fused(), "invalid final candidate accepted");
+                Require(before == c.Output() && untouched == Read(out), "failed preflight wrote output");
+            }
+    }
+    printf("PASS QKV/attention checks=%d max_Q=%g max_K=%g max_V=%g max_attention=%g disabled=%d\n", checks,
+           maximum[0], maximum[1], maximum[2], maximum[3], disabled);
+}
+
 void VerifyBatch(int requests, int mode, DataType type) {
     constexpr int heads = 8, dim = 192, vd = 128, width = 1856;
     const int rows = 6, total = requests * rows, capacity = mode == 2 ? 136 : 512;
@@ -192,16 +445,34 @@ void VerifyBatch(int requests, int mode, DataType type) {
 }
 
 }
-int main() {
+int main(int argc,char**argv) {
     try {
+        const bool attention=argc>1 && std::strncmp(argv[1], "--attention", 11)==0;
+        const bool disabled=attention && std::strcmp(argv[1], "--attention")!=0;
+        if (disabled) {
+            const char *name = std::strcmp(argv[1], "--attention-core-disabled") == 0
+                ? "FASTLLM_NAIVE_SWA_CORE" : "FASTLLM_NAIVE_SWA_QKV_FUSION";
+#ifdef _WIN32
+            _putenv_s(name, "0");
+#else
+            setenv(name, "0", 1);
+#endif
+        }
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         Check(cudaSetDevice(0));
+        if(attention){if(FastllmCudaRuntimeArch()!=103)return 77;VerifyQkvAttention(disabled);return 0;}
         for (auto type : {BFLOAT16, FP8_E4M3})
             for (int mode : {0, 1, 2}) for (int batch : {2, 8, 40}) VerifyBatch(batch, mode, type);
-        if (FastllmCudaRuntimeArch() != 90) { puts("SKIP: requires SM90 fusion build"); return 77; }
+        const int arch = FastllmCudaRuntimeArch();
+        if (arch != 90 && arch != 103) { puts("SKIP: requires SM90 or SM103 fusion build"); return 77; }
         Data weight(BFLOAT16), scratch(BFLOAT16);
         Init(weight, {1856, 4096}); Fill(weight, 191);
+        if (arch == 103) for (int rows : {1,2,3,4,5,6,7,8,9,13,16,17,24,32,64}) {
+            VerifyProjection(weight, rows, std::min(rows, 8));
+            if (rows > 3) VerifyProjection(weight, rows, 3);
+        }
+        if (arch == 103) VerifyProjectionNumerics();
         std::vector<std::unique_ptr<Case>> cases;
         const int batches[] = {256, 129, 128, 65, 64, 33, 32, 17, 16, 8, 7, 6, 5, 4, 3, 2, 1};
         void *address = nullptr;
@@ -209,6 +480,13 @@ int main() {
         for (int batch : batches) for (bool ring : {false, true}) {
             cases.emplace_back(new Case(batch, ring, 64, type));
             auto &c = *cases.back();
+            if (arch == 103 && (batch != 1 || !ring || type != BFLOAT16)) {
+                auto before = c.Output();
+                Require(!c.Fused(weight, scratch), "unsupported SM103 shape accepted");
+                Require(before == c.Output(), "unsupported shape changed output");
+                cases.pop_back();
+                continue;
+            }
             Require(c.Fused(weight, scratch), "supported fusion rejected");
             if (!address) address = scratch.cudaData;
             Require(scratch.cudaData == address, "smaller batch relocated graph scratch");
@@ -234,6 +512,15 @@ int main() {
                 Require(!c.Fused(weight, scratch), "bad stride incorrectly accepted");
                 --c.x.strides[1];
                 Require(actual == c.Output(), "rejected fusion modified outputs");
+                if (arch == 103) {
+                    // An aligned output view can still alias a read-only input.
+                    void *original = c.q.cudaData;
+                    c.q.cudaData = c.x.cudaData;
+                    bool accepted = c.Fused(weight, scratch);
+                    c.q.cudaData = original;
+                    Require(!accepted, "aliased Q/input accepted");
+                    Require(actual == c.Output(), "alias rejection changed outputs");
+                }
                 ++checks;
             }
         }

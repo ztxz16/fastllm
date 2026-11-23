@@ -60,3 +60,15 @@ std::shared_ptr<fastllm::Data> FastllmCudaV41PackOutputWeight(fastllm::Data &wei
 std::shared_ptr<void> FastllmCudaV41PlanOutput(const std::shared_ptr<fastllm::Data> &weight,
         fastllm::Data &outputWeight, fastllm::Data &output, int rows, int pitch, void *codes, void *scales);
 bool FastllmCudaV41RunOutput(const std::shared_ptr<void> &plan);
+
+constexpr size_t FastllmCompactMxfp8Slot = 8; // Slots 0–7 hold legacy FP8 layouts.
+const void *FastllmCudaCompactMxfp8(const fastllm::Data &weight);
+
+// Graph-safe attention projection admission. Return borrowed K32 scales only when
+// the unfused Linear would also use block-quantized activations on this worker.
+const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &weight, int channels, int inner, int device);
+
+// Small-row SWA projection; false leaves the residual and scratch outputs untouched.
+bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma, float eps,
+                            const fastllm::Data &weight, const float *scales, void *output, int rows,
+                            const float *positions, float theta, void *rotary);

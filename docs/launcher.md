@@ -10,6 +10,10 @@ ftllm launch
 
 新增启动项 → 选择模型 → 自动配置 → 保存并启动。常用操作是下载模型、预览命令、查看日志和打开工作室。
 
+## 交互模型 Demo
+
+在「模型管理」新增启动项，填写 HY-Nomas 或 Duo 的权重目录并选择 GPU。启动器自动查找已安装或在标准目录构建的原生运行库和服务程序。HY-Nomas 使用 Qwen2.5-VL-7B-Instruct 文本编码器。Duo 使用 duo_live 和 Duo-1.0-distill-quant，支持 1、2、4 或 8 张 GPU，可指定角色资源和预先生成的 Intent NF4 缓存。服务就绪后点击「交互 Demo」，可在工作室内上传参考图、连续编辑场景，或向 Duo 上传、录制视频并播放回复。两个服务使用不同端口即可分别管理。远程使用只需转发启动器端口，摄像头录制需要 localhost 或 HTTPS。原生运行时的编译方法见 [HY-Nomas](hy_nomas.md) 和 [Duo](../tools/duo/README.md)。
+
 ## 启动与访问
 
 `ftllm`（或 `ftllm launch`）默认仅监听 `127.0.0.1:8000`，并在服务就绪后自动打开浏览器；使用 `ftllm launch --no-browser` 可以关闭自动打开。页面可以从 ModelScope 下载模型、保存启动配置、预览命令，并选择托管 `ftllm server` 或聊天 `ftllm webui`。新增启动项选择本地模型和“自动配置”后，启动时由 `--auto` 规划推理参数。需要调整时展开“资源限制”或“模型参数”；Chunk 和最大并发留空即可恢复自动规划。参数说明见 [`--auto` 调节指南](auto.md#启动器自动模式)。也可切换到自定义配置。界面支持简体中文和英文，会优先使用上次选择的语言，否则跟随浏览器语言；`ftllm launch` 的终端日志固定使用英文。需要从局域网访问时使用 `ftllm launch --host 0.0.0.0`；终端和 Launcher 页面随后会列出本机、局域网以及网卡上直接配置的公网访问地址（若有）。公网访问还需要放行主机防火墙及云安全组，经过 NAT 时还需配置端口映射；Launcher 不会自动探测 NAT 的公网地址。非本机监听使用未加密 HTTP，请仅在可信网络中使用。它与终端向导共用配置文件；关闭 Launcher 时，由它托管的下载和模型进程也会停止。使用 `ftllm launch --help` 查看其他选项。
@@ -38,7 +42,13 @@ ftllm launch
 
 ## 并行服务、GPU 选择与图片 / 视频生成
 
-启动项的「模型类型 / 后端」支持 LLM、**MiniMax H3 / Pika H3 视频**和 **MiniMax H3 Image 图像**。模型准备、量化、多卡与 API 示例见[图片与视频生成指南](image-video.md)。Qwen-Image-2.1 当前使用专用 CLI / Demo，不通过这些启动项加载。
+选择模型路径后，启动器会根据本地元数据识别服务。MiniMax H3、Pika H3 Flex、MiniMax H3 Image、Qwen-Image-2.1、HY-Nomas、LingBot World 和 Duo 共用命令入口。例如：
+
+```sh
+ftllm server /workspace2/hfmodels/Duo-1.0-distill-quant --devices 2 --port 8080
+```
+
+H3 视频量化包可选含 `h3_quantization.json` 的目录或清单本身。H3 Image 的目录中有多个量化权重时，请选择具体文件。模型准备、多卡与 API 示例见[图片与视频生成指南](image-video.md)。
 多个启动项可以同时运行，各自使用不同端口。顶部「当前服务」选择器决定 API 信息、
 停止按钮和外部 Agent 连接哪个服务；启动项卡片也可以直接管理或停止对应服务。
 停止一个模型不会停止其他模型，退出 Launcher 则停止全部托管进程。
@@ -56,11 +66,9 @@ Harness、OpenCode、Codex、Claude 共用各自的安装和工作目录，每�
 
 视频启动流程：
 
-1. 发布 wheel 和绿色包内置 `minimax_h3_server`，可将可执行文件路径留空。
-   源码安装或旧版 wheel 按 [H3 构建说明](../tools/minimax_h3/README.md#构建) 编译该服务。
-   在启动项中填写该可执行文件的绝对路径，也可将其加入 `PATH`，或设置
-   `FTLLM_H3_SERVER=/path/to/minimax_h3_server`。源码 `build` / `build-cuda` 目录也会自动查找。
-2. 选择视频后端，填写 H3 或 Pika 模型目录、监听地址、端口、API Key 和可用 GPU。
+1. 启动器自动查找发布包中的 `minimax_h3_server`、系统 `PATH` 和源码 `build`、`build-cuda` 目录。
+   源码安装或旧版 wheel 可按 [H3 构建说明](../tools/minimax_h3/README.md#构建) 编译该服务。
+2. 填写 H3 或 Pika 模型目录、监听地址、端口、API Key 和可用 GPU。
    Pika 自动识别，无需 `--pika`；基座不在相邻 `MiniMax-H3` 目录或 `base_model` 链接下时，
    填写「MiniMax H3 基座目录」。Pika 仍需完整基座。视频输出目录默认是
    `~/.local/share/fastllm/videos/<端口>`。
@@ -75,7 +83,7 @@ Harness、OpenCode、Codex、Claude 共用各自的安装和工作目录，每�
    Pika 固定 6 步，H3 默认 50 步。任务支持进度、取消、预览和 MP4 下载；刷新页面会重新读取
    服务中的任务列表。参考素材模式支持有序图片、视频和音频，工作室素材总量限制为 255 MiB；具体模式与上传约束见 [H3 API](../tools/minimax_h3/README.md#http-与-demo)。工作室单个结果下载限制为 256 MiB。
 
-图像启动流程：选择 **图像（MiniMax H3 Image）**，填写完整模型目录或已支持的量化文件、端口与 GPU，保存并启动。量化文件仍需匹配的原始基座。打开 **工作室 → 图像生成** 或 **图像 Demo**，可生成、编辑、上传多张参考图并下载 PNG；发布包会自动找到 `minimax_h3_image_server`。详细操作见[H3 Image 使用说明](image-video.md#图片生成minimax-h3-image)。
+图像启动流程：选择 MiniMax H3 Image 完整模型目录或支持的量化文件，填写端口并选择 GPU，保存并启动。量化文件仍需匹配的原始基座。打开 **工作室 → 图像生成** 或 **图像 Demo**，可生成、编辑、上传多张参考图并下载 PNG；发布包会自动找到 `minimax_h3_image_server`。详细操作见[H3 Image 使用说明](image-video.md#图片生成minimax-h3-image)。
 
 工作室的「对话 / 工作区」有独立的对话模型选择器，切换顶部服务或查看视频不会切断聊天。
 同时启动 LLM 和视频模型，安装 Pi 运行时并新建一个工作目录 Agent 后，可以直接说：

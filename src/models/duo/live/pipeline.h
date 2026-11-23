@@ -6,9 +6,16 @@
 #include <mutex>
 namespace fastllm::duo::live {
 using Emit = std::function<void(json11::Json::object)>;
+struct GpuLayout {
+    int intent, speech, codec;
+    std::vector<int> tilePeers;
+    int ffnPeer = -1;
+    static GpuLayout fromProfile(const std::string &profile);
+};
+
 class Pipeline {
   public:
-    Pipeline(std::string root, std::filesystem::path assets, int w, int h, bool four, bool streamAvc = false,
+    Pipeline(std::string root, std::filesystem::path assets, int w, int h, GpuLayout layout, bool streamAvc = false,
              std::filesystem::path intentCache = {});
     void turn(const std::filesystem::path &input, const std::filesystem::path &dir, const Emit &emit);
 
@@ -19,7 +26,8 @@ class Pipeline {
   private:
     std::string root;
     std::filesystem::path assets, intentCache;
-    int w, h, intentDev, codecDev, global = 0;
+    int w, h, global = 0;
+    GpuLayout devices;
     bool streamAvc;
     Tokenizer tokens;
     InputWorker inputs;

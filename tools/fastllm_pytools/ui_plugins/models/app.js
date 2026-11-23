@@ -116,8 +116,8 @@ function collectForm() {
   return config;
 }
 
-function isSimpleNewProfile() {
-  return (collectForm().backend || "llm") === "llm" && state.currentIndex === null && collectForm().config_mode !== "custom";
+function isSimpleNewProfile(config = collectForm()) {
+  return (config.backend || "llm") === "llm" && state.currentIndex === null && config.config_mode !== "custom";
 }
 
 function renderProfilePresentation() {
@@ -125,7 +125,7 @@ function renderProfilePresentation() {
   const mode = config.config_mode;
   const isWebui = config.command === "webui";
   const runtimeAuto = mode === "auto";
-  const simple = isSimpleNewProfile() || runtimeAuto;
+  const simple = isSimpleNewProfile(config) || runtimeAuto;
   elements.launchForm.classList.toggle("simple-profile", simple);
   elements.launchForm.classList.toggle("runtime-auto-profile", runtimeAuto);
   elements.profileParameters.classList.toggle("hidden", simple && !runtimeAuto);
@@ -145,11 +145,27 @@ function renderProfilePresentation() {
   elements.configurationModeDescription.textContent = configurationModeDescription(mode);
   const video = config.backend === "minimax_h3";
   const image = config.backend === "minimax_h3_image";
-  elements.launchForm.classList.toggle("video-profile", video || image);
-  document.getElementById("video-backend-fields").classList.toggle("hidden", !video && !image);
-  for (const field of elements.launchForm.querySelectorAll("[data-video-only]")) field.classList.toggle("hidden", !video);
-  elements.launchForm.querySelector('[data-field="server_binary"]').placeholder = image ? "/path/to/minimax_h3_image_server" : "/path/to/minimax_h3_server";
-  elements.launchForm.querySelector('[data-field="output_dir"]').placeholder = image ? "~/.local/share/fastllm/images/port" : "~/.local/share/fastllm/videos/port";
+  const nomas = config.backend === "hy_nomas";
+  const duo = config.backend === "duo";
+  const interactive = nomas || duo || config.backend === "lingbot_world";
+  const media = config.backend && config.backend !== "llm";
+  const catalog = state.runtime?.backends || [];
+  const detected = catalog.find(item => item.id === config.backend);
+  document.getElementById("model-backend").textContent = config.model
+    ? (config.model === state.detectedModelPath ? state.preview?.backendLabel : detected?.label) || "" : "";
+  elements.launchForm.querySelector('[data-field="command"]').disabled = Boolean(media);
+  elements.launchForm.classList.toggle("video-profile", media);
+  document.getElementById("video-backend-fields").classList.toggle("hidden", !media);
+  for (const [selector, visible] of [["[data-video-only]", video], ["[data-h3-only]", video || image],
+      ["[data-world-weights]", nomas || config.backend === "lingbot_world"], ["[data-nomas-only]", nomas], ["[data-duo-only]", duo]]) {
+    for (const field of elements.launchForm.querySelectorAll(selector)) field.classList.toggle("hidden", !visible);
+  }
+  elements.serverHostField.classList.toggle("hidden", interactive || isWebui);
+  elements.serverApiKeyField.classList.toggle("hidden", ((nomas || duo) && !config.api_key) || isWebui);
+  const folder = interactive ? config.backend : (image || config.backend === "qwen_image") ? "images" : "videos";
+  elements.launchForm.querySelector('[data-field="output_dir"]').placeholder = `~/.local/share/fastllm/${folder}/port`;
+  if (nomas) elements.profileEditorDescription.textContent = t("Start HY-Nomas to create a scene from a reference image and guide it with successive instructions.");
+  if (duo) elements.profileEditorDescription.textContent = t("Select Duo-1.0-distill-quant and one, two, four or eight GPUs for audiovisual conversation.");
   if (video) elements.profileEditorDescription.textContent = t("Start a video API alongside your chat models. Pika is detected automatically.");
   if (image) elements.profileEditorDescription.textContent = t("MiniMax H3 Image · text-to-image and reference editing. Select a model directory or FP8 / INT8 / NVFP4 safetensors or GGUF; precision is detected automatically.");
 }
@@ -221,10 +237,10 @@ function handleFormChange(event) {
   if (!event.target.matches("[data-field]")) return;
   const changedField = event.target.dataset.field;
   if (changedField === "visible_gpus") renderGpuChoices();
-  if (changedField === "backend") {
-    cancelPendingAutomaticConfiguration();
+  if (changedField === "model") {
+    window.clearTimeout(state.automaticConfigTimer);
+    state.automaticConfigRequestId += 1;
     state.automaticConfigStatus = {phase: "idle"};
-    elements.launchForm.querySelector('[data-field="command"]').value = "server";
   }
   if (changedField === "use_external_draft") {
     const enabled = event.target.checked;
@@ -292,8 +308,6 @@ function handleFormChange(event) {
   if (changedField === "enable_speculative_decoding") {
     prepareAutomaticConfigurationForNewProfile();
     if (state.automaticConfigPending) scheduleAutomaticConfiguration(0);
-  } else if (changedField === "model" && state.automaticConfigPending) {
-    scheduleAutomaticConfiguration();
   } else if (
     state.automaticConfigPending
     && AUTOMATIC_CONFIGURATION_FIELDS.has(changedField)
@@ -355,13 +369,11 @@ function updateConditionalFields() {
     !config.enable_moe_hybrid || config.moe_device !== "custom"
   );
   elements.serverModelNameField.classList.toggle("hidden", isWebui);
-  elements.serverHostField.classList.toggle("hidden", isWebui);
   elements.webuiMaxTokenField.classList.toggle("hidden", !isWebui);
   elements.webuiThinkField.classList.toggle("hidden", !isWebui);
   elements.serverContextField.classList.toggle("hidden", isWebui);
   elements.serverSamplingTitle.classList.toggle("hidden", isWebui);
   elements.serverSamplingFields.classList.toggle("hidden", isWebui);
-  elements.serverApiKeyField.classList.toggle("hidden", isWebui);
   elements.serverHideInputField.classList.toggle("hidden", isWebui);
   elements.launchCommandKicker.textContent = isWebui ? "FTLLM WEBUI" : "FTLLM SERVER";
   renderProfilePresentation();
@@ -800,7 +812,9 @@ function renderProfiles() {
     titleRow.append(title);
     const metadata = document.createElement("div");
     metadata.className = "profile-metadata";
-    for (const value of [profileDeviceLabel(profile), profile.config_mode === "auto" ? "auto" : profile.dtype || "auto", t("Port {port}", { port: profile.port || "—" })]) {
+    const backendLabel = {hy_nomas: "HY-Nomas · BF16", duo: "Duo", lingbot_world: "LingBot World", qwen_image: "Qwen-Image-2.1"};
+    const precision = profile.config_mode === "auto" ? "auto" : profile.dtype || "auto";
+    for (const value of [profileDeviceLabel(profile), backendLabel[profile.backend] || precision, t("Port {port}", { port: profile.port || "—" })]) {
       const detail = document.createElement("span");
       detail.textContent = value;
       metadata.append(detail);
@@ -869,8 +883,9 @@ function profileActionButton(action, index, label, variant = "") {
 
 function profileDeviceLabel(profile) {
   if (profile.visible_gpus) return `GPU ${profile.visible_gpus}`;
+  if (["duo", "hy_nomas", "lingbot_world"].includes(profile.backend)) return "GPU 0";
   if (profile.backend === "minimax_h3") return t("Video generation");
-  if (profile.backend === "minimax_h3_image") return t("Image generation");
+  if (["minimax_h3_image", "qwen_image"].includes(profile.backend)) return t("Image generation");
   if (profile.config_mode === "auto") return t("Automatic configuration");
   const devices = {
     auto: t("Auto device"),
@@ -1120,12 +1135,25 @@ function schedulePreview(delay = 160) {
 
 async function updatePreview(requestId) {
   try {
+    const config = collectForm();
     const preview = await request("/api/preview", {
       method: "POST",
-      body: JSON.stringify(collectForm())
+      body: JSON.stringify(config)
     });
     if (requestId !== state.previewRequestId) return;
     state.preview = preview;
+    if (preview.backend && state.editingConfig) {
+      const changedModel = state.detectedModelPath !== config.model;
+      state.detectedModelPath = config.model;
+      state.editingConfig.backend = preview.backend;
+      if (preview.backend !== "llm") {
+        cancelPendingAutomaticConfiguration();
+        elements.launchForm.querySelector('[data-field="command"]').value = "server";
+      } else if (changedModel && state.automaticConfigPending) {
+        scheduleAutomaticConfiguration();
+      }
+      updateConditionalFields();
+    }
     elements.commandPreview.textContent = preview.command || t("Complete a valid configuration first.");
     renderLaunchValidation(preview.errors || []);
     renderSaveState();

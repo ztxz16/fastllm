@@ -9,7 +9,7 @@ class Aligner {
 
   private:
     Weights weights;
-    at::Tensor mel(const std::vector<float> &pcm);
-    at::Tensor encode(const at::Tensor &features);
+    native::Tensor mel(const std::vector<float> &pcm);
+    native::Tensor encode(const native::Tensor &features);
 };
 } // namespace fastllm::duo::live

@@ -1032,10 +1032,23 @@ const uint32_t *FastllmCudaBlock32PackedScales(fastllm::Data &w, int device, boo
     entry.packed = ptr;
     return ptr;
 }
+#else
+bool FastllmCudaMxfp8SwaQkv(void *, const void *, const float *, float, const fastllm::Data &,
+                            const float *, void *, int, const float *, float, void *) { return false; }
+const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &, int, int, int) {
+    return nullptr;
+}
 #endif
 
 extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (weight.isFake) return;
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    if (weight.dataType == fastllm::FP8_E4M3 && weight.extraCudaData.size() > FastllmCompactMxfp8Slot &&
+        weight.extraCudaData[FastllmCompactMxfp8Slot]) {
+        checkCudaErrors("Release compact MXFP8 scales", cudaFree(weight.extraCudaData[FastllmCompactMxfp8Slot]));
+        weight.extraCudaData[FastllmCompactMxfp8Slot] = nullptr;
+    }
+#endif
 #ifdef FASTLLM_ENABLE_DEEPGEMM_FP8_SM90
     FastllmCudaReleasePerChannelW8A16(weight);
 #endif

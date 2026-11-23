@@ -20,6 +20,23 @@ from fastllm_pytools.util import make_normal_llm_model, make_normal_parser
 
 
 class SpeculativeDraftCliAliasesTest(unittest.TestCase):
+    def test_dfly2_width_is_scoped_to_the_requested_model(self):
+        with tempfile.TemporaryDirectory() as target, tempfile.TemporaryDirectory() as other:
+            self.write_draft_config(target, {"model_type": "hy_v4_flash", "architectures": ["HYV4FlashForCausalLM"]})
+            self.write_draft_config(other, {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"]})
+            api = types.ModuleType("ftllm")
+            api.llm = MagicMock()
+            def load(directory, *options):
+                args = make_normal_parser("test").parse_args([directory, "--device", "cuda", *options])
+                make_normal_llm_model(args)
+                return api.llm.model.call_args.kwargs
+            with patch.dict(sys.modules, {"ftllm": api}), patch.dict(os.environ, {}, clear=True), redirect_stdout(io.StringIO()):
+                self.assertEqual(load(target, "--speculative_algorithm", "dfly2", "--draft_tokens", "5")["dfly2_block_size"], 6)
+                self.assertNotIn("dfly2_block_size", load(target))
+                self.assertNotIn("dfly2_block_size", load(other))
+                with self.assertRaisesRegex(ValueError, "requires a HY4-Flash"):
+                    load(other, "--speculative_algorithm", "dfly2")
+
     def test_dspark_parallel_aliases_and_limits(self):
         parser = make_normal_parser("test")
         for mode in ("tp", "dp"):
@@ -146,7 +163,9 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                             args = self.configure_without_target([
                                 "--draft", draft_path, flag, str(tokens),
                                 "--speculative_dspark_block_size", str(block),
+                                "--speculative_dspark_confidence_threshold", "0",
                             ])
+                            self.assertEqual(os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"], "0.0")
                             self.assertEqual(args.draft_tokens, tokens)
                             self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], str(tokens))
                             self.assertEqual(os.environ["FASTLLM_DSPARK_MODEL_PATH"], draft_path)
@@ -163,6 +182,7 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
                 (["--dspark", "10"], "checkpoint block_size"),
                 (["--dspark", "3", "--draft_tokens", "5"], "different token counts"),
                 (["--dspark", "3", "--speculative_dspark_block_size", "3"], "match the checkpoint"),
+                (["--speculative_dspark_confidence_threshold", "nan"], "confidence_threshold"),
             ]
             for options, message in cases:
                 with self.subTest(options=options), patch.dict(os.environ, {}, clear=True):
@@ -179,6 +199,7 @@ class SpeculativeDraftCliAliasesTest(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 self.configure_without_target(["--draft", draft_path])
                 self.assertNotIn("FASTLLM_DSPARK_TOKENS", os.environ)
+                self.assertEqual(os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"], "0.5")
 
     def test_embedded_dspark_accepts_draft_tokens(self):
         with patch.dict(os.environ, {}, clear=True):

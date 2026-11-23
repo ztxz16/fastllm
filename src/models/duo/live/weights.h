@@ -1,5 +1,5 @@
 #pragma once
-#include <ATen/ATen.h>
+#include "tensor.h"
 #include <map>
 #include <string>
 #include <vector>
@@ -9,13 +9,13 @@ namespace fastllm::duo::live {
 // Only selected components are materialized. No Python model loader is involved.
 class Weights {
   public:
-    explicit Weights(at::Device device) : device(device) {}
+    explicit Weights(int device) : device(device) {}
     void load(const std::string &file, const std::vector<std::string> &prefixes,
-              at::ScalarType precision = at::kBFloat16,
-              const std::function<void(const std::string &, at::Tensor &)> &transform = {});
-    const at::Tensor &get(const std::string &name) const;
-    at::Tensor linear(const at::Tensor &x, const std::string &name) const;
-    at::Device device;
-    std::map<std::string, at::Tensor> tensors;
+              native::Type precision = native::kBFloat16,
+              const std::function<void(const std::string &, native::Tensor &)> &transform = {});
+    const native::Tensor &get(const std::string &name) const;
+    native::Tensor linear(const native::Tensor &x, const std::string &name) const;
+    int device;
+    std::map<std::string, native::Tensor> tensors;
 };
 } // namespace fastllm::duo::live

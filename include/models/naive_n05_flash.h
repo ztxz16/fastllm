@@ -3,6 +3,7 @@
 
 #include "basellm.h"
 #include "models/naive_indexer_compute.h"
+#include "models/naive_moe_dispatch.h"
 #include "parallel/model.h"
 #include <algorithm>
 #include <atomic>
@@ -15,11 +16,18 @@ struct FastllmCudaMimoEp8Mega;
 namespace fastkv { class HostCache; }
 
 namespace fastllm {
+    struct Mxfp4MarlinRank;
+    struct NaiveFlexMoe;
+    struct NaiveSharedFlexMoe;
     class CudaWorkspace;
     class PDStateWriter;
     class PDStateReader;
     class NaiveN05FlashModel : public basellm, public parallel::AttentionParallelModel {
     protected:
+        static constexpr int MaxTPDecodeBatch = 512;
+        // Ordinary serving captures one token per request. Keep its shape
+        // budget independent of speculative verification and KVMem admission.
+        static constexpr int MaxServingDecodeBatch = 1024;
         struct TargetCapture;
         struct LogitsSelection;
         struct TargetBatch;
@@ -295,7 +303,29 @@ namespace fastllm {
             bool borrowOutputs = false;
             bool ringVerify = false; // Candidates are staged after the retained SWA ring.
             std::map<int, Data> hidden;
+            std::vector<std::map<int, Data>> rankHidden;
             std::vector<PrefixSnapshots> prefixes;
+            struct DraftInput {
+                const int64_t *tokens = nullptr;
+                void *ready = nullptr;
+                int position = 0;
+                int anchor = 0;
+                uint64_t seed = 0;
+                float temperature = 1.f;
+                const void *hidden = nullptr;
+                void *inputReady = nullptr;
+                void *fused = nullptr;
+                int rows = 0; // Anchor plus this request's verification prefix.
+            };
+            // Root capture: rank-major requests. Rank capture: its own requests.
+            // The proposal owner keeps tokens/events alive until verification joins.
+            std::vector<DraftInput> draftInputs;
+            bool deferOutputWait = false;
+            std::vector<void *> outputReady;
+            void *draftFused = nullptr;
+            bool compositeDraft = false;
+            // Synchronous fallback only; cleared before target submission.
+            std::function<void()> prepareDraft;
             // Optional per-request CUDA destinations, consumed before the next forward.
             std::vector<Data *> logitsDestinations;
             // Graph-owned, token-major features. Each live request borrows its first row.
@@ -312,9 +342,13 @@ namespace fastllm {
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
+        bool draftFusedContextFeatures = false;
         bool draftSingleDeviceLogged = false;
         struct DraftWorkspace;
-        // Bounded LRU; graph-owned inputs are refreshed on every replay.
+        struct DraftMoeScratch;
+        void RunDraftMoe(int layer, int rank, const Data &input, Data &output,
+                         DraftMoeScratch &scratch, int collectiveRows, bool communicate);
+        // Startup graph variants plus a bounded eager LRU; inputs are refreshed at replay.
         std::vector<std::shared_ptr<DraftWorkspace>> draftBatchWorkspaces;
         // Graph variants execute serially and share their large activation buffers.
         std::shared_ptr<DraftWorkspace> draftBatchStorage, draftContextStorage;
@@ -400,6 +434,7 @@ namespace fastllm {
         struct DraftHeadShards {
             const std::vector<int> &limits;
             std::vector<Data> &inputs, &logits;
+            bool collectiveDynamicKV = false;
         };
         bool RunDraftBatch(const std::vector<int> &anchors,
                            const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows = 0,
@@ -424,10 +459,27 @@ namespace fastllm {
         void CommitTargetCaches(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
             const std::vector<int> &past, const std::vector<int> &counts, bool ringVerify,
             const std::vector<char> *written = nullptr);
+        void SubmitTargetCacheUpdates(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts, int device);
+        void PublishTargetCacheLengths(const std::vector<std::vector<std::pair<Data, Data>> *> &caches,
+            const std::vector<int> &past, const std::vector<int> &counts);
+        void JoinDraftLookahead(DraftContext *context = nullptr);
+        bool CommitSpeculativeCaches(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts,
+            const std::vector<std::vector<std::pair<Data, Data>> *> &caches, const std::vector<int> &past,
+            const std::vector<int> &nextAnchors = {});
+        bool CommitFusedDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
+        bool CommitFusedDraftContextsImpl(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts,
+            const std::function<void(int)> &enqueueTarget, const std::function<void(int)> &enqueueNext = {},
+            const int *deviceAccepted = nullptr);
+        struct DraftContextFence;
+        void DrainPendingDraftContext();
         bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
             const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
         struct DraftRound;
-        void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
+        void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr, const Data *preparedHidden = nullptr);
         bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
                                int reserveRows = 0, bool *backboneReady = nullptr);
         bool ProjectDraftKVWeights(Data &input, int device, int heads, int width, Data &raw, Data &pointers);
@@ -436,9 +488,16 @@ namespace fastllm {
         bool PrepareDraftBatchLocal(const std::vector<DraftRound *> &rounds, const Data &baseLogits, int rank);
         bool PrepareDraftBatchGraph(const std::vector<DraftRound *> &rounds, const Data &baseLogits,
                                    int rank, int reserveRows = 0);
+        bool PrepareFusedDraftProposal(const std::vector<DraftRound *> &rounds, const Data &hidden);
+        void JoinDraftVerification(TargetCapture &capture);
+        bool RunDraftLowLatencyBatch(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts, Data &normalized);
+        bool PrepareLowLatencyProposalGraph(const std::vector<DraftRound *> &rounds, const Data &logits, const Data *hidden = nullptr, int rank = -1);
+        void PrepareLowLatencyDraftServingMemory(bool history);
         void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth, int rank = -1);
-        void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits);
-        void PrepareDraftAcceptanceLocal(const std::vector<DraftRound *> &rounds, Data &logits, int rank);
+        void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
+            const std::vector<int> *verifyLengths = nullptr, TargetCapture *capture = nullptr);
+        void PrepareDraftAcceptanceLocal(const std::vector<DraftRound *> &rounds, Data &logits, int rank,
+            const std::vector<int> *verifyLengths = nullptr, TargetCapture *capture = nullptr);
         int FinishDraftRound(DraftRound &round, Data &logits, TargetCapture &capture,
                              std::vector<std::pair<Data, Data>> &kv);
         std::vector<int> ForwardDraftBatch(int batch, const Data &inputIds,
@@ -451,7 +510,16 @@ namespace fastllm {
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
                          std::vector<float> *retLogits);
         std::string draftParallelLayout;
+        // Set only by WarmUp. Serving may replay these graphs or execute eagerly,
+        // but never captures a graph in response to a request or shape change.
+        bool preparingGraphs = false, draftCapturing = false;
+        int draftPrepareCapacity = 0;
+        void PrepareTensorParallelVerification();
+        void PrepareDraftVerificationGraphs(void *fused,const std::vector<const void *> &hidden,
+                                            const std::vector<void *> &ready);
         bool draftEnabled = false;
+        int draftExperts = 0, draftTopK = 0, draftExpertWidth = 0;
+        float draftRouteScale = 1.0f;
         int draftLayers = 0, draftBlock = 0, draftTokens = 0;
         int draftHeads = 0, draftKvHeads = 0, draftHeadDim = 0, draftWindow = 0;
         float draftEps = 1e-5f, draftTheta = 10000;
@@ -525,15 +593,16 @@ namespace fastllm {
         std::vector<std::shared_ptr<TPDecodeState>> tpBatchVerifyGraphs;
         std::shared_ptr<TPDecodeState> tpBatchVerifyStorage;
         Data tpSamplingLogits{FLOAT32};
-        struct TargetDecodePipeline;
         struct TPServingState;
+        struct TargetDecodePipeline;
         std::shared_ptr<TPServingState> tpServingState;
         std::atomic<uint64_t> tpCacheEpoch{0};
         // A fresh identity protects both request lifetime and owned KV layout.
         // Unknown/global changes still invalidate every plan through tpCacheEpoch.
         mutable std::mutex tpRequestMutex;
         std::unordered_map<const Data *, uint64_t> tpRequestIds;
-        // Sampling identity survives KV rebinding and lasts until request removal.
+        // Sampling identity follows request lifetime, independently of KV page
+        // growth, graph fallback, or batch compaction/layout invalidation.
         std::unordered_map<const Data *, uint64_t> tpSamplingRequestIds;
         uint64_t tpNextRequestId = 0;
         void InvalidateTensorParallelCache(const Data *requestKey = nullptr);
@@ -544,8 +613,9 @@ namespace fastllm {
         void PrepareTensorParallelServing();
         bool PrepareTensorParallelServingDecode(const Data &inputIds,
             const LogitsSelection &selection, std::vector<int *> &cacheLengths,
-            const TargetBatch *batch, bool collectHidden);
-        bool HasVerificationGraph() const;
+            const TargetBatch *batch, bool collectHidden,
+            std::shared_ptr<TPDecodeState> *preview = nullptr);
+        bool HasVerificationGraph(int sequences, int rows) const;
         bool PrepareTensorParallelDecode(const Data &inputIds,
                                         std::vector<std::pair<Data, Data>> &kv, bool verifying,
                                         const LogitsSelection &selection, std::vector<int *> &cacheLengths,
@@ -592,13 +662,16 @@ namespace fastllm {
         struct GpuPDPools;
         std::shared_ptr<GpuPDPools> pdReceivePools;
         bool tpPrepared = false;
-        bool tpMoePreparationFailed = false;
-        bool tpPackedMoeSources = false;
+        bool tpMoePreparationFailed = false; // Retired sources cannot be retried after a failed pack.
         // Fixed at TP preparation so toggling CUDA Graph cannot change live KV
         // layout. Prefill/eager fallback temporarily uses chronological rows.
         bool tpSwaRingCache = false;
         bool tpEp8Mega = false;
+        NaiveMoeBackend tpMoeBackend = NaiveMoeBackend::LegacyTP;
+        bool tpPackedMoeSources = false; // Hopper borrows its original layout.
         std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
+        std::shared_ptr<NaiveFlexMoe> tpFlexMoe;
+        std::shared_ptr<NaiveSharedFlexMoe> tpSharedFlex;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpPrefillWorkspaces;
@@ -651,6 +724,7 @@ namespace fastllm {
             return !HasSeparateIndexer() && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(AuxiliaryKVType()) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
+        std::vector<std::shared_ptr<Mxfp4MarlinRank>> tpMarlinRanks;
     };
 }
 #endif

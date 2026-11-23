@@ -43,6 +43,13 @@ def main():
     camera_module = importlib.import_module('wan.utils.cam_utils')
     meta = json.loads((a.trace/'metadata.json').read_text())
     inputs = np.load(a.inputs)
+    encode_precision = meta.get('vae_encode_precision', 'fp32')
+    if encode_precision not in ('bf16', 'fp32'):
+        raise ValueError('invalid trace encode precision')
+    condition_key = 'condition_bf16' if encode_precision == 'bf16' else 'condition'
+    if condition_key not in inputs:
+        raise ValueError(f'{condition_key} is missing. Regenerate the inputs with prepare_inputs.py')
+    conditions = inputs[condition_key]
     f, h, w = 3, meta['height']//8, meta['width']//8
     n, nt = f*h*w//4, len(inputs['text'])
     def read(name, shape):
@@ -102,7 +109,7 @@ def main():
     final_latents = []
     pose = torch.eye(4, dtype=torch.float32)
     for segment, action in enumerate(meta['actions']):
-        condition = inputs['condition'][segment*3:segment*3+3]
+        condition = conditions[segment*3:segment*3+3]
         record(f'{segment}.condition', read(f'{segment}.condition', condition.shape), condition)
         old = pose.clone()
         poses = []
@@ -169,7 +176,7 @@ def main():
     # Whole denoising gates remain separate from the more sensitive pixel decoder.
     component_ok = all(r['finite'] and r['relative_l2'] < .01 for name, r in results.items() if not name.endswith('.pixels'))
     pixels_ok = all(r['finite'] and r['relative_l2'] < .03 for name, r in results.items() if name.endswith('.pixels'))
-    report = dict(decode_precision=decode_precision, schedule_exact=bool(schedule_ok), reference_weight_offload=a.offload_reference,
+    report = dict(encode_precision=encode_precision, decode_precision=decode_precision, schedule_exact=bool(schedule_ok), reference_weight_offload=a.offload_reference,
                   results=results, passed=bool(schedule_ok and component_ok and pixels_ok))
     a.output.write_text(json.dumps(report, indent=2))
     if not report['passed']:

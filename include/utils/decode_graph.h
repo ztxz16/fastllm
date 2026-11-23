@@ -7,6 +7,20 @@
 
 namespace fastllm {
 
+// A serving call can forbid capture (including operator autotuning) without
+// changing the process-wide CUDA Graph option or another model's policy.
+// Nested scopes cannot re-enable capture; worker groups propagate the value.
+class GraphCaptureScope {
+    inline static thread_local bool allowed = true;
+    bool previous;
+public:
+    explicit GraphCaptureScope(bool permit) : previous(allowed) { allowed = allowed && permit; }
+    ~GraphCaptureScope() { allowed = previous; }
+    GraphCaptureScope(const GraphCaptureScope &) = delete;
+    GraphCaptureScope &operator=(const GraphCaptureScope &) = delete;
+    static bool Allowed() { return allowed; }
+};
+
 // Graph shapes and request counts are deliberately separate. The scheduler,
 // cache ownership and sampling use actualRows; captured kernels use graphRows.
 // Model adapters must supply device metadata marking the tail inactive and

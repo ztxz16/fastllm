@@ -14,7 +14,7 @@ public:
         float *input, *output;
         int32_t *ids, *resident;
         float *scores;
-        const uint8_t **records;
+        const uint8_t **records, **downRecords;
     };
     static std::unique_ptr<FastllmCudaDiskV41Graph>
     Create(const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,

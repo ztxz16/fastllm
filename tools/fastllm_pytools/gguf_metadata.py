@@ -319,27 +319,32 @@ def get_gguf_model_config(path):
 
 
 _GPT2_PRETOKENIZER_PATTERNS = {
+    "hy_v4": (
+        r"\p{N}{1,3}",
+        r"[一-龥぀-ゟ゠-ヿ]+",
+        r"""[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+""",
+    ),
     "glm4": (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
         r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
         r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
-        r"\s+(?!\S)|\s+"
+        r"\s+(?!\S)|\s+",
     ),
     "qwen35": (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
         r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
         r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|"
-        r"\s+(?!\S)|\s+"
+        r"\s+(?!\S)|\s+",
     ),
     "qwen2": (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
         r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|"
         r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
-        r"\s+(?!\S)|\s+"
+        r"\s+(?!\S)|\s+",
     ),
     "gpt-2": (
         r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+|"
-        r" ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+        r" ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
     ),
 }
 
@@ -394,11 +399,10 @@ def try_load_gguf_tokenizer(path):
                 if pair is not None:
                     merges.append(pair)
             backend = Tokenizer(models.BPE(vocab=vocab, merges=merges))
-            pattern = _GPT2_PRETOKENIZER_PATTERNS.get(tokenizer_pre)
-            if pattern is not None:
+            patterns = _GPT2_PRETOKENIZER_PATTERNS.get(tokenizer_pre, ())
+            if patterns:
                 backend.pre_tokenizer = pre_tokenizers.Sequence([
-                    pre_tokenizers.Split(
-                        Regex(pattern), behavior="isolated", invert=False),
+                    *(pre_tokenizers.Split(Regex(p), behavior="isolated", invert=False) for p in patterns),
                     pre_tokenizers.ByteLevel(
                         add_prefix_space=False,
                         trim_offsets=False,

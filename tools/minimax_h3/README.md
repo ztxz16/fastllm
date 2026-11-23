@@ -107,7 +107,7 @@ INT8 / GGUF 的 TP 分片需满足 H256 / 块边界，H3 支持 TP2/TP4；TP8 �
 量化路径复用 `--gpu-memory-limit` / `--host-memory-limit`。默认根据空闲显存与实际投影
 字节数选择驻留或逐层加载；显式预算仍由统一内存池约束，取消或异常清空设备缓存。
 
-`ftllm launch` 选择视频后端和模型目录即可；多卡方式可保留自动。视频工作室、独立 Demo
+`ftllm launch` 选择 H3 或 Pika 模型目录即可；多卡方式可保留自动。视频工作室、独立 Demo
 随文字/参考模式展示对应精度和实际并行方式，生成请求参数与 BF16 完全相同。
 `/health` 新增 `dit_precision`、`reference_dit_precision`、`dit_parallel_mode`、
 `dit_tensor_parallel_size`、`dit_sequence_parallel_size`。原 `tensor_parallel_size` 继续表示

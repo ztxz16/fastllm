@@ -1,38 +1,348 @@
 <!doctype html>
-<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>HY-Nomas · 交互世界 · fastllm</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#101419;color:#e7edf2;font:15px system-ui,sans-serif}main{max-width:1180px;margin:28px auto;padding:24px}h1{font-size:30px;margin:0 0 8px}.muted{color:#a6b4c1;line-height:1.7}.layout{display:grid;grid-template-columns:330px 1fr;gap:24px;margin-top:24px}.card{background:#1a222c;border:1px solid #334150;border-radius:16px;padding:22px}label{display:block;margin:14px 0 7px}textarea,input,select,button{font:inherit;border-radius:8px;border:1px solid #47596c;padding:10px}textarea,input,select{background:#101820;color:#fff;width:100%}textarea{height:140px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}button{background:#8fd9ce;color:#132321;font-weight:600;cursor:pointer;margin:16px 6px 0 0}button.secondary{background:transparent;color:#ddd}button[aria-pressed="true"]{outline:2px solid #b4fff0;background:#c8fff6}button:disabled{opacity:.4;cursor:default}button:focus-visible,canvas:focus-visible{outline:2px solid #b4fff0;outline-offset:3px}canvas{display:block;width:100%;background:#0c1015;border-radius:8px;image-rendering:auto}progress{width:100%;margin:16px 0 10px;accent-color:#8fd9ce}a{color:#8fd9ce}#status{min-height:25px;line-height:1.6}[hidden]{display:none!important}.player-controls{display:flex;align-items:center;gap:12px;margin-top:12px}.player-controls button{margin:0;min-width:76px}.player-controls label{margin:0;white-space:nowrap}.player-controls select{width:auto;margin-left:auto}#seek{padding:0;accent-color:#8fd9ce}#frame-info{font-variant-numeric:tabular-nums;font-size:12px;margin:6px 0;color:#a6b4c1}.navigation{display:grid;grid-template-columns:1fr 1fr;gap:18px;border-top:1px solid #334150;margin-top:18px;padding-top:16px}.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.pad button{margin:0;padding:9px 3px;font-size:13px}.pad .up{grid-column:2}.pad .left{grid-column:1}.pad-title{color:#a6b4c1;margin-bottom:10px;font-size:13px}details summary{cursor:pointer;color:#a6b4c1;font-size:13px;margin-top:10px}.session{font-size:13px;color:#8fd9ce;margin-bottom:12px}kbd{font:12px monospace;color:#b4c8d7}.hint{font-size:13px;margin-bottom:0;line-height:1.7}@media(max-width:800px){.layout{grid-template-columns:1fr}.layout.has-world .viewer{grid-row:1}.layout.has-world canvas{max-height:38vh;object-fit:contain}.layout.has-world .navigation{margin-top:10px;padding-top:10px}main{margin:0 auto;padding:18px}.navigation{gap:12px}}
-</style>
-<main><h1>HY-Nomas <span class="muted">/ fastllm</span></h1>
-<p class="muted">创建场景，通过移动和转向探索模型生成的世界。</p>
-<div class="layout" id="layout"><section class="card"><form id="form">
-<label for="mode">模式</label><select id="mode"><option value="world">交互世界</option><option value="video">独立短视频</option></select>
-<label for="prompt">场景描述</label><textarea id="prompt" required>First-person view inside a spacious wooden cabin, a table and chairs in the center, large windows overlooking a green forest, warm daylight, realistic details.</textarea>
-<label id="enhance-option" hidden><input id="enhance-prompt" type="checkbox" checked style="width:auto"> 自动扩写场景描述</label>
-<div id="perspective-option" hidden><label for="perspective">观察方式</label><select id="perspective" disabled><option value="auto">根据描述选择</option><option value="first-person">第一人称</option><option value="second-person">正面近景</option><option value="third-person follow">跟随主体</option><option value="third-person observer">外部观察</option></select></div>
-<details id="expanded" hidden><summary>查看扩写后的场景描述</summary><p id="expanded-text" class="muted hint" style="white-space:pre-wrap;overflow-wrap:anywhere"></p></details>
-<div class="row"><div><label for="size">画面尺寸</label><select id="size"><option>128 × 128</option><option>256 × 160</option><option>256 × 256</option><option selected>384 × 224</option><option>512 × 288</option></select></div><div><label for="frames">每次帧数</label><select id="frames"><option value="20">20 帧</option><option value="16">16 帧</option><option value="32">32 帧</option><option value="40">40 帧</option></select></div></div>
-<label for="seed">随机种子</label><input id="seed" type="number" min="0" max="4294967295" value="42" required>
-<button id="apply-scene" type="button" disabled>修改当前场景</button><p id="prompt-status" class="muted hint">创建场景后，可修改描述来调整场景。</p>
-<button id="generate">创建场景</button><button id="cancel" class="secondary" type="button" disabled>取消</button><button id="reset" class="secondary" type="button" disabled>结束场景</button></form>
-<p class="muted hint">点击按钮，或点击画面后使用 W/A/S/D 移动、方向键转向。开启连续探索后，按住按键或按钮持续移动，松开后原地观察。</p>
-<p class="muted hint">编辑描述后，点击“修改当前场景”。修改完成后可继续探索；点击“按描述继续生成”可继续调整场景。</p>
-<p><a href="/docs" target="_blank">HTTP API 文档</a></p></section>
-<section class="card viewer"><div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px"><div class="session" id="session-info" style="margin:0">尚未创建场景</div><button id="edit-scene" class="secondary" type="button" style="margin:0;white-space:nowrap" disabled>修改场景描述</button></div><canvas id="video" width="640" height="400" tabindex="0" aria-label="交互世界画面，点击后使用 W A S D 移动和方向键转向"></canvas>
-<details id="player" hidden><summary>回放 / 播放速度</summary><div class="player-controls"><button id="play" type="button">播放</button><label for="speed">速度</label><select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option></select></div><label for="seek">本次操作的画面进度</label><input id="seek" type="range" min="0" max="0" step="1" value="0"><div id="frame-info"></div></details>
-<progress id="progress" value="0" max="100"></progress><div id="status">创建场景后即可移动、转向</div>
-<div id="navigation" class="navigation"><div><div class="pad-title">移动 · W / A / S / D</div><div class="pad"><button id="forward" class="up" type="button" disabled>前进 W</button><button id="left" class="left" type="button" disabled>左移 A</button><button id="backward" type="button" disabled>后退 S</button><button id="right" type="button" disabled>右移 D</button></div></div><div><div class="pad-title">视角 · 方向键</div><div class="pad"><button id="look_up" class="up" type="button" disabled>抬头 ↑</button><button id="look_left" class="left" type="button" disabled>左转 ←</button><button id="look_down" type="button" disabled>低头 ↓</button><button id="look_right" type="button" disabled>右转 →</button></div></div><button id="stay" class="secondary" type="button" disabled>原地观察</button><button id="follow_prompt" type="button" disabled>按描述继续生成</button></div>
-<div><button id="continuous" type="button" disabled>连续探索</button><label style="display:inline;font-size:13px"><input id="paced" type="checkbox" checked style="width:auto">自适应播放速度</label></div><p class="muted hint" id="control-info"></p></section></div></main>
+:root { color-scheme: light; --ink: #1d2924; --muted: #5f6c64; --line: #d8dfd8; --green: #345c49; }
+* { box-sizing: border-box; } [hidden] { display: none !important; }
+body { margin: 0; background: #f4f6f2; color: var(--ink); font: 14px/1.5 "DM Sans","PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+main { max-width: 1260px; margin: auto; padding: clamp(16px,2.7vw,40px); }
+header,.identity,.actions,.player-controls,.file-title { display: flex; align-items: center; gap: 9px; }
+header { margin-bottom: clamp(14px,2vw,26px); justify-content: space-between; }
+.identity { gap: 12px; }
+.mark { position: relative; width: 42px; height: 42px; border-radius: 13px; background: #204739; }
+.mark::before,.mark::after { content: ""; position: absolute; inset: 10px 13px 15px 9px; border: 2px solid #d4ecba; border-radius: 3px; transform: skewY(-10deg); }
+.mark::after { inset: 15px 9px 10px 13px; background: #204739; }
+h1,h2,p { margin: 0; }
+h1 { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; font-size: clamp(23px,3vw,34px); letter-spacing: -.045em; line-height: 1.2; }
+h1 span { font-size: 14px; color: var(--muted); font-weight: 550; letter-spacing: normal; }
+h2,summary { font-size: 16px; font-weight: 650; }
+a { color: var(--green); text-underline-offset: 3px; } #api-docs { font-size: 12px; }
+.layout { display: grid; grid-template-columns: minmax(0,1fr) clamp(248px,29%,330px); gap: 16px; align-items: start; }
+aside { grid-column: 2; grid-row: 1; display: grid; gap: 14px; }
+.card { border: 1px solid var(--line); border-radius: 17px; background: white; padding: clamp(14px,2vw,21px); min-width: 0; }
+.viewer { grid-column: 1; grid-row: 1; padding: 0; overflow: hidden; }
+summary { cursor: pointer; }
+label { display: block; font-size: 13px; font-weight: 550; margin: 13px 0 5px; }
+button,select,input,textarea { font: inherit; }
+button,select,textarea,input[type=number] { border: 1px solid var(--line); border-radius: 8px; min-height: 36px; padding: 7px 10px; color: var(--ink); background: white; }
+button { background: var(--green); border-color: var(--green); color: white; cursor: pointer; font-weight: 550; }
+button:hover:enabled { filter: brightness(.92); }
+button.secondary { color: var(--ink); border-color: var(--line); background: white; }
+button[aria-pressed=true] { background: #cee9bf; color: #173926; }
+button:disabled,input:disabled,select:disabled,textarea:disabled { opacity: .55; cursor: default; }
+:focus-visible,.file-pick:focus-within { outline: 2px solid #51836b; outline-offset: 2px; }
+select,textarea,input[type=number] { width: 100%; } textarea { resize: vertical; min-height: 72px; line-height: 1.6; }
+.row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.actions { flex-wrap: wrap; margin-top: 13px; }
+#generate,#apply-scene { flex: 1; }
+.subsection { margin-top: 13px; padding-top: 12px; border-top: 1px solid var(--line); }
+.subsection summary { font-size: 13px; color: var(--muted); }
+.file-title { justify-content: space-between; }
+.file-pick { border: 1px dashed #a8baad; background: #f6f9f5; border-radius: 8px; color: #3e614e; min-height: 42px; display: grid; place-items: center; position: relative; margin: 0; padding: 6px 10px; text-align: center; cursor: pointer; overflow-wrap: anywhere; }
+.file-pick input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: inherit; }
+#remove-reference { border: 0; background: none; color: var(--green); font-size: 12px; min-height: 0; padding: 0; }
+.hint,#frame-info,#control-info,#session-info { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.hint:not(:empty),#frame-info,#control-info:not(:empty) { margin-top: 7px; }
+.stage { position: relative; display: grid; overflow: hidden; background: #12241d; }
+#video { display: block; width: 100%; height: auto; max-height: clamp(245px,62vh,570px); object-fit: contain; }
+#reference-preview,#placeholder { position: absolute; inset: 0; height: 100%; width: 100%; }
+#reference-preview { object-fit: contain; background: #15201b; pointer-events: none; }
+#placeholder { display: flex; align-items: flex-end; background: radial-gradient(ellipse at 55% 35%,#3b5b4a,#192d25 78%); color: #fff; }
+#placeholder img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 44%; }
+.poster-copy { position: relative; width: 100%; display: flex; align-items: end; justify-content: space-between; gap: 12px; padding: 56px clamp(16px,3vw,32px) 22px; background: linear-gradient(transparent,#111c18df); }
+.poster-copy small { color: #e4eadf; font-size: 12px; }
+.poster-copy strong { display: block; margin-top: 2px; font-size: clamp(21px,2.7vw,30px); line-height: 1.25; }
+#use-sample { border: 1px solid #ffffff75; color: white; background: #213027cc; white-space: nowrap; }
+.viewer-body { padding: 15px clamp(14px,2vw,21px); } #status { font-size: 13px; }
+progress { width: 100%; height: 6px; accent-color: var(--green); margin: 10px 0 0; }
+.player-controls { margin-top: 8px; } .player-controls input { min-width: 34px; flex: 1; accent-color: var(--green); } .player-controls select { width: auto; }
+.pad-title { color: var(--muted); font-size: 12px; margin: 9px 0 6px; }
+.check { display: inline-flex; align-items: center; gap: 5px; margin: 0; }
+@media (prefers-color-scheme: dark) {
+  :root { color-scheme: dark; --ink: #eaf2eb; --muted: #b4c2b7; --line: #39483e; --green: #39634d; }
+  body { background: #151b17; } .card,button.secondary,select,textarea,input[type=number] { background: #242d27; }
+  .file-pick { background: #2c3830; color: #d6e7d7; } a,#remove-reference { color: #b9dfc3; }
+  button[aria-pressed=true] { background: #bed8b6; color: #173926; }
+}
+@media (max-width: 690px) {
+  main { padding: 14px; } .layout { grid-template-columns: minmax(0,1fr); gap: 12px; }
+  aside,.viewer { grid-column: 1; grid-row: auto; } .viewer { order: -1; }
+  #video { max-height: 47vh; } .poster-copy { padding: 36px 14px 14px; }
+}
+.scene-bar,.scene-state,.composer,.scene-dock,#navigation,.step-pad,.look-pad { display: flex; align-items: center; gap: 8px; }
+.scene-bar { padding: 8px 14px; min-height: 43px; }
+.scene-bar button,.dock-tool summary { font-size: 13px; }
+.scene-bar button { padding: 5px 10px; min-height: 32px; }
+.scene-state { flex: 1; min-width: 0; flex-wrap: wrap; gap: 2px 10px; }
+#ambient { display: none; }
+#video { position: relative; }
+.viewer-body:has(#command-panel[hidden]):has(#player[hidden]):has(#expanded[hidden]) { display: none; }
+.composer { border: 1px solid var(--line); border-radius: 12px; padding: 5px; }
+.composer select,.composer textarea { border: 0; background: transparent; color: inherit; }
+.composer textarea { flex: 1; width: 0; min-width: 55px; min-height: 38px; height: 38px; resize: none; }
+.composer #edit-frames { width: auto; flex: none; }
+.composer #apply-scene { flex: 0 0 auto; }
+.scene-dock { position: relative; flex-wrap: wrap; margin-top: 8px; }
+#navigation { flex-wrap: wrap; }
+.step-pad,.look-pad { gap: 3px; }
+.step-pad button { min-width: 36px; font-size: 17px; padding: 4px; }
+.input-guide { display: none; font-size: 12px; color: var(--muted); }
+.exploring .input-guide { display: inline; }
+.dock-tool summary { padding: 8px; }
+.tool-sheet { padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper,#fff); }
+.tool-sheet .check { margin-top: 10px; } .tool-sheet .pad-title { margin-top: 0; }
+.has-world .tool-sheet { position: absolute; z-index: 3; right: 0; bottom: calc(100% + 5px); width: min(100%,370px); max-height: 44vh; overflow: auto; box-shadow: 0 8px 25px #1113; }
+#progress { position: absolute; z-index: 1; inset: auto 0 0; margin: 0; width: 100%; height: 4px; border: 0; }
+#gesture-hint { position: absolute; z-index: 1; top: 12px; left: 50%; transform: translateX(-50%); border-radius: 18px; padding: 5px 14px; background: #11251de8; color: white; pointer-events: none; }
+#control-info:empty { display: none; }
+.layout.exploring {
+  --ink: #ecf2ed; --muted: #b3c2b8; --line: #435249; --paper: #202e26; --green: #bbddaa;
+  position: fixed; inset: 0; z-index: 5; display: block; color-scheme: dark; background: #0e1813; color: var(--ink);
+}
+body:has(.exploring) { overflow: hidden; }
+.exploring.view-only .viewer { grid-template-rows: minmax(0,1fr); }
+.exploring.view-only .scene-bar,.exploring.view-only .viewer-body,.exploring.view-only .stage::after { display: none; }
+#show-tools { position: absolute; top: max(8px,env(safe-area-inset-top)); right: max(8px,env(safe-area-inset-right)); opacity: .8; }
+#show-tools:hover,#show-tools:focus-visible { opacity: 1; }
+body:has(.exploring) main > header,.exploring aside { display: none; }
+.exploring .viewer { display: grid; grid-template-rows: auto minmax(0,1fr) auto; width: 100%; height: 100%; background: transparent; border: 0; border-radius: 0; }
+.exploring .scene-bar { min-height: 42px; padding: 5px max(12px,env(safe-area-inset-right)) 5px max(12px,env(safe-area-inset-left)); }
+.exploring .scene-state { justify-content: center; text-align: center; }
+.exploring #session-info { color: #d8edcf; }
+.exploring #status { color: var(--muted); }
+.exploring .stage { min-height: 0; background: #0c130f; isolation: isolate; }
+.exploring #ambient { display: block; position: absolute; inset: -6%; width: 112%; height: 112%; object-fit: cover; filter: blur(32px) brightness(.38) saturate(.75); pointer-events: none; }
+.exploring #video { width: 100%; height: 100%; min-height: 0; max-height: none; object-fit: contain; touch-action: none; cursor: grab; }
+.exploring #video:active { cursor: grabbing; }
+.exploring .viewer-body { padding: 8px max(12px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left)); background: #101b15; max-height: 50dvh; }
+.exploring .composer,.exploring .scene-dock,.exploring #control-info,.exploring #prompt-status,.exploring #expanded { max-width: 930px; margin-inline: auto; }
+.exploring .composer { background: #24332a; }
+.exploring button,.exploring summary { background: #25352b; border-color: #425146; color: #f0f6ed; }
+.exploring :is(#apply-scene,#follow_prompt),.exploring button[aria-pressed=true] { background: #c3e5ad; border-color: transparent; color: #193020; }
+.exploring .scene-dock { justify-content: space-between; }
+.exploring .scene-dock summary { border-radius: 7px; }
+.exploring .tool-sheet { background: #1c2921; }
+.exploring #expanded { font-size: 12px; max-height: 16vh; overflow: auto; }
+.exploring #prompt-status { max-height: 3em; overflow: auto; }
+@media (prefers-color-scheme: dark) { .tool-sheet { background: #242d27; } }
+@media (max-width: 690px) {
+  .exploring .input-guide { display: none; }
+  .exploring .stage:has(#gesture-hint[hidden])::after { content: "滑动画面转向"; position: absolute; bottom: 6px; right: 8px; pointer-events: none; color: white; background: #102018b8; border-radius: 6px; padding: 2px 6px; font-size: 11px; }
+  .scene-bar { padding-inline: 8px; } .scene-bar #session-info { display: none; }
+  .composer { gap: 3px; } .composer select { max-width: 88px; } .composer button { padding-inline: 8px; }
+  .scene-dock,#navigation { gap: 4px; } .step-pad button { min-width: 34px; }
+  .exploring .viewer-body { padding-inline: 7px; } .exploring .scene-dock { justify-content: flex-start; }
+}
+</style></head>
+<body><main>
+<header><div class="identity"><div class="mark" aria-hidden="true"></div><h1><b id="model-name">HY-Nomas</b> <span>交互场景</span></h1></div><a id="api-docs" href="docs" target="_blank" rel="noopener">API 文档 ↗</a></header>
+<div class="layout" id="layout">
+
+<section class="card viewer" id="viewer" aria-label="场景画面">
+  <div class="scene-bar">
+    <button id="leave-scene" type="button" hidden>‹ 场景设置</button>
+    <div class="scene-state"><strong id="session-info"></strong><span id="status" role="status">等待创建场景</span></div>
+    <button id="cancel" type="button" hidden>取消生成</button>
+    <button id="enter-scene" type="button" hidden>进入场景 ↗</button>
+    <button id="view-only" type="button" hidden>纯画面</button>
+    <button id="screen-toggle" type="button" hidden>全屏</button>
+  </div>
+  <div class="stage" id="stage">
+    <canvas id="ambient" aria-hidden="true" hidden></canvas>
+    <canvas id="video" width="512" height="384" tabindex="0" aria-label="场景画面。用 W A S D 移动，按方向键或拖动画面转向。"></canvas>
+    <img id="reference-preview" hidden alt="所选起始参考图"><div id="placeholder">
+      <img id="sample-image" src="nomas-cafe.webp" alt="">
+      <div class="poster-copy"><div><small id="poster-label">示例参考图</small><strong id="poster-title">雨夜咖啡馆</strong></div>
+        <button id="use-sample" type="button">使用此图</button></div>
+    </div>
+    <button id="show-tools" type="button" hidden>显示操作</button>
+    <span id="gesture-hint" hidden></span>
+    <progress id="progress" value="0" max="100" aria-label="生成进度" hidden></progress>
+  </div>
+  <div class="viewer-body">
+    <section id="command-panel" aria-label="下一条场景指令" hidden>
+      <div class="composer">
+        <div id="edit-type-option" hidden><select id="edit-kind" aria-label="指令类型"><option value="environment">环境变化</option><option value="action">人物动作</option><option value="prompt">完整描述</option></select></div>
+        <textarea id="instruction" rows="1" aria-label="下一条场景指令" placeholder="例如，让窗外的雨停下来"></textarea>
+        <select id="edit-frames" aria-label="本条指令的生成帧数" title="本条指令的生成帧数" hidden>
+          <option value="20">20 帧</option><option value="40">40 帧</option><option value="60">60 帧</option>
+          <option value="80">80 帧</option><option value="100">100 帧</option><option value="120">120 帧</option>
+        </select>
+        <button id="apply-scene" type="button" disabled>发送指令</button>
+      </div>
+      <p id="prompt-status" class="hint" role="status"></p>
+    </section>
+    <div class="scene-dock">
+      <div id="navigation" hidden>
+        <div class="step-pad" role="group" aria-label="移动">
+          <button id="left" type="button" aria-label="左移 A" title="左移 · A">←</button>
+          <button id="forward" type="button" aria-label="前进 W" title="前进 · W">↑</button>
+          <button id="backward" type="button" aria-label="后退 S" title="后退 · S">↓</button>
+          <button id="right" type="button" aria-label="右移 D" title="右移 · D">→</button>
+        </div>
+        <span class="input-guide"><span>WASD 移动 · </span>拖动画面转向</span>
+        <button id="continuous" type="button" class="secondary">连续探索</button>
+        <details id="look-tools" class="dock-tool">
+          <summary>操控</summary>
+          <div class="tool-sheet">
+            <p class="pad-title">视角 · 方向键</p>
+            <div class="look-pad">
+              <button id="look_left" class="secondary" type="button">左转</button><button id="look_up" class="secondary" type="button">抬头</button>
+              <button id="look_down" class="secondary" type="button">低头</button><button id="look_right" class="secondary" type="button">右转</button>
+            </div>
+            <div id="vertical-controls" class="actions" hidden><button id="up" type="button">上移 Q</button><button id="down" type="button">下移 E</button></div>
+            <div class="actions"><button id="follow_prompt" type="button">按指令继续</button><button id="stay" class="secondary" type="button">原地观察</button></div>
+            <label class="check"><input id="paced" type="checkbox" checked> 自适应播放速度</label>
+          </div>
+        </details>
+      </div>
+      <details id="player" class="dock-tool" hidden><summary>回放</summary>
+        <div class="tool-sheet"><div class="player-controls"><button id="play" type="button" class="secondary">播放</button><input id="seek" type="range" aria-label="本段播放位置" min="0" max="0" step="1" value="0">
+        <select id="speed" aria-label="播放速度"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option></select></div><p id="frame-info"></p></div>
+      </details>
+    </div>
+    <p id="control-info" role="status"></p>
+    <details class="subsection" id="expanded" hidden><summary>实际生成描述</summary><p id="expanded-text" class="hint" style="white-space:pre-wrap;overflow-wrap:anywhere"></p></details>
+  </div>
+</section>
+<aside>
+  <details class="card" id="setup" open><summary>场景设置</summary>
+    <form id="form">
+      <label id="mode-label" for="mode">模式</label><select id="mode"><option value="world">交互世界</option><option value="video">独立短视频</option></select>
+      <div id="image-option">
+        <div class="file-title"><label id="reference-label" for="reference-image">起始参考图（可选）</label><button id="remove-reference" type="button" hidden>移除图片</button></div>
+        <label class="file-pick"><span id="reference-name">选择图片</span><input id="reference-image" type="file" aria-label="选择起始参考图" accept="image/png,image/jpeg,image/webp"></label>
+      </div>
+      <label for="prompt">起始场景描述</label><textarea id="prompt" rows="3" required>A quiet café at night. A waitress stands behind a wooden counter. A white mug rests between her hands. Rain falls outside the window.</textarea>
+      <div id="enhance-option"><label><input id="enhance-prompt" type="checkbox" checked> 提示词增强（Nomas-PE）</label><small class="hint" id="enhancer-hint" hidden>请在启动器的 HY-Nomas 服务设置中配置提示词增强地址。</small></div>
+      <div id="perspective-option" hidden><label for="perspective">观察方式</label><select id="perspective" disabled><option value="auto">根据描述选择</option><option value="first-person">第一人称</option><option value="second-person">正面近景</option><option value="third-person follow">跟随主体</option><option value="third-person observer">外部观察</option></select></div>
+      <label for="size">画面尺寸</label><select id="size"><option>128 × 128</option><option>256 × 160</option><option>256 × 256</option><option>384 × 224</option><option>512 × 288</option><option selected>512 × 384</option><option>768 × 448</option><option>960 × 544</option><option>1280 × 704</option><option value="custom">自定义</option></select>
+      <div id="custom-size" hidden>
+        <div class="row"><label>宽度（像素）<input id="custom-width" type="number" min="64" max="1280" step="32" value="512"></label>
+        <label>高度（像素）<input id="custom-height" type="number" min="64" max="1280" step="32" value="384"></label></div>
+        <small id="size-hint" class="hint">宽高分别为 64–1280 的 32 倍数，最多 901120 像素。</small>
+      </div>
+      <details class="subsection"><summary>生成参数</summary>
+        <div class="row"><div><label for="seed">随机种子</label><input id="seed" type="number" min="0" max="4294967295" value="42" required></div>
+        <div id="frame-option"><label for="frames">视频帧数</label><select id="frames"><option value="20">20 帧</option><option value="16">16 帧</option><option value="32">32 帧</option><option value="40">40 帧</option></select></div></div>
+      </details>
+      <div class="actions"><button type="submit" id="generate">创建场景</button><button id="reset" class="secondary" type="button" hidden>结束场景</button></div>
+    </form>
+  </details>
+</aside>
+</div></main>
 <script>
 const $=id=>document.getElementById(id);
 const actions={forward:'前进',backward:'后退',left:'左移',right:'右移',look_left:'左转',look_right:'右转',look_up:'抬头',look_down:'低头',stay:'原地观察',follow_prompt:'按描述继续生成'};
 let active=null,world=null,busy=false,images=[],timer=null,playing=false,currentFrame=0,fps=24,epoch=0,originFrame=0,loop=true;
 let continuous=false,desiredAction="stay",pendingAction=null,adaptiveRate=1,promptUpdate=null,promptError='',activePromptRevision=0;
-let enhancerAvailable=null;
+let enhancerAvailable=null,preferClip=false,lingBot=false;
+let nextWorldPrompt=null;
+let clip=null,frameCount=0;
+const sampleURL='nomas-cafe.webp';
+let referenceURL=null;
+let exploring=false,queuedStep=null,gesture=null;
+function setViewOnly(enabled){
+  $('layout').classList.toggle('view-only',enabled);
+  $('show-tools').hidden=!enabled;
+  if(enabled){dismissTools();$('video').focus({preventScroll:true});}
+}
+$('view-only').onclick=()=>setViewOnly(true);
+$('show-tools').onclick=()=>{setViewOnly(false);$('view-only').focus();};
+function setExploring(enabled) {
+  exploring=Boolean(enabled&&world&&$('mode').value==='world');
+  $('layout').classList.toggle('exploring',exploring);
+  setViewOnly(false);
+  $('view-only').hidden=!exploring;
+  $('leave-scene').hidden=!exploring;
+  $('screen-toggle').hidden=!exploring||!document.fullscreenEnabled;
+  $('look-tools').open=false;
+  clearGesture();
+  if(!exploring){
+    stopContinuous();
+    if(document.fullscreenElement===$('layout'))document.exitFullscreen().catch(()=>{});
+  }
+  controls();
+  (exploring?$('video'):world?$('enter-scene'):$('generate')).focus({preventScroll:true});
+}
+$('enter-scene').onclick=()=>setExploring(true);
+$('leave-scene').onclick=()=>setExploring(false);
+$('screen-toggle').onclick=async()=>{
+  try {
+    if(document.fullscreenElement)await document.exitFullscreen();
+    else await $('layout').requestFullscreen();
+  } catch { $('status').textContent='浏览器未允许全屏，可继续在当前画面操作。'; }
+};
+document.addEventListener('fullscreenchange',()=>{
+  $('screen-toggle').textContent=document.fullscreenElement?'退出全屏':'全屏';
+});
+function dismissTools() {
+  $('look-tools').open=false;
+  if(world)$('player').open=false;
+}
+$('look-tools').ontoggle=()=>{if($('look-tools').open)$('player').open=false;};
+$('player').ontoggle=()=>{if(world&&$('player').open)$('look-tools').open=false;};
+function canBufferStep(){
+  return exploring&&busy&&world?.segments>0&&active&&!continuous;
+}
+function requestStep(action){
+  if(continuous){pendingAction=action;showControl();return;}
+  if(canBufferStep()&&!promptUpdate){
+    // Preserve an accepted text edit until it has had a turn of its own.
+    if(queuedStep!=='follow_prompt')queuedStep=action;
+    showControl();
+    return;
+  }
+  return move(action);
+}
+function drainStep(){
+  if(busy||promptUpdate||!queuedStep||world?.status!=='ready')return;
+  if(!exploring&&!(lingBot&&queuedStep==='follow_prompt'))return;
+  const next=queuedStep;
+  queuedStep=null;
+  move(next);
+}
+function clearGesture(){
+  gesture=null;
+  $('gesture-hint').hidden=true;
+}
+function lookDirection(event){
+  const dx=event.clientX-gesture.x,dy=event.clientY-gesture.y;
+  if(Math.max(Math.abs(dx),Math.abs(dy))<30)return null;
+  return Math.abs(dx)>Math.abs(dy)?(dx>0?'look_right':'look_left'):(dy>0?'look_down':'look_up');
+}
+$('video').onpointerdown=event=>{
+  if(!exploring||!event.isPrimary||event.button!==0||!world?.segments)return;
+  dismissTools();
+  gesture={id:event.pointerId,x:event.clientX,y:event.clientY};
+  $('video').setPointerCapture(event.pointerId);
+};
+$('video').onpointermove=event=>{
+  if(gesture?.id!==event.pointerId)return;
+  const action=lookDirection(event);
+  $('gesture-hint').hidden=!action;
+  if(action)$('gesture-hint').textContent='松开'+actions[action];
+};
+$('video').onpointerup=event=>{
+  if(gesture?.id!==event.pointerId)return;
+  const action=lookDirection(event);
+  clearGesture();
+  if(action)requestStep(action);
+  else if(!$('show-tools').hidden)setViewOnly(false);
+};
+$('video').onpointercancel=$('video').onlostpointercapture=clearGesture;
+$('instruction').onkeydown=event=>{
+  if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing&&event.keyCode!==229){
+    event.preventDefault();
+    if(!event.repeat&&!$('apply-scene').disabled)$('apply-scene').click();
+  }
+};
+
 function configureEnhancer(available){
   enhancerAvailable=Boolean(available);
-  $('enhance-option').hidden=!enhancerAvailable;
+  $('enhancer-hint').hidden=enhancerAvailable;
+  if(!enhancerAvailable)$('enhance-prompt').checked=false;
   $('perspective-option').hidden=!enhancerAvailable;
   controls();
 }
@@ -41,39 +351,78 @@ function showEnhancement(item){
   if(!item?.enhanced_prompt){$('expanded-text').textContent='';return;}
   try{
     const scene=JSON.parse(item.enhanced_prompt),segment=scene.segments?.[0]||{};
-    $('expanded-text').textContent=[...(scene.subject_list||[]).map(s=>s.subject_attribute),segment.visual_description_long,
+    $('expanded-text').textContent=[...(scene.subject_list||[]).map(s=>s.subject_attribute),segment.visual_description_long,segment.description_change,
       ...(segment.contained_actions||[]).map(a=>a.action_description.replace(/<\/?Action\d+>/g,'').replaceAll('<|Subject1|>',scene.subject_list?.[0]?.display_name||'Subject'))].filter(Boolean).join('\n\n');
   }catch{$('expanded-text').textContent=item.enhanced_prompt;}
 }
 const heldActions=new Map();
 const frameLoads=new Map();
 const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+// The same player also runs beneath the launcher’s per-service URL.
+const serviceUrl=url=>url.startsWith('/')?'.'+url:url;
+if(location.pathname?.startsWith('/demos/')) $('api-docs').href='openapi.json';
 async function api(url,options={}) {
-  const response=await fetch(url,options),data=await response.json();
+  const response=await fetch(serviceUrl(url),options),data=await response.json();
   if(!response.ok)throw Error(data.error?.message||JSON.stringify(data.detail||data));
   return data;
 }
 const post=(url,body)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+function configureLingBot(){
+  lingBot=true;
+  actions.up='上移';actions.down='下移';
+  bindAction('up');bindAction('down');
+  document.title='LingBot World · 交互场景 · fastllm';
+  $('model-name').textContent='LingBot World';
+  $('mode').value='world';$('mode').hidden=true;$('mode-label').hidden=true;
+  $('vertical-controls').hidden=false;
+  $('enhance-option').hidden=true;$('api-docs').hidden=true;
+  $('reference-label').textContent='起始参考图（必选）';
+  $('prompt').required=false;$('prompt').value='';$('prompt').placeholder='描述起始场景';
+  $('size').replaceChildren(...['576 × 320','832 × 480','320 × 576','自定义'].map((title,index)=>new Option(title,index===3?'custom':title)));
+  for(const id of ['custom-width','custom-height']){$(id).max=832;$(id).step=16;}
+  $('custom-width').value=576;$('custom-height').value=320;
+  $('size-hint').textContent='宽高分别为 64–832 的 16 倍数。';previewSize();
+}
 function controls() {
   const interactive=$('mode').value==='world';
+  $('edit-type-option').hidden=lingBot||!interactive||!world||world.enhance_prompt;
+  $('instruction').placeholder=lingBot?'输入更新后的完整场景描述':!$('edit-type-option').hidden&&$('edit-kind').value==='action'?
+    '例如，拿起白杯递给我':'例如，让窗外的雨停下来';
+  $('enter-scene').hidden=exploring||!interactive||!world;
+  $('image-option').hidden=!interactive;
+  $('frame-option').hidden=interactive;
+  $('command-panel').hidden=!interactive||!world;
+  $('reset').hidden=!interactive||!world;
+  $('cancel').hidden=lingBot||!active;
+  $('progress').hidden=!busy;
+  $('placeholder').hidden=Boolean(frameCount)||Boolean(interactive&&(referenceURL||exploring));
+  $('sample-image').hidden=!interactive;
+  $('use-sample').hidden=!interactive||busy;
+  $('poster-title').textContent=interactive?'雨夜咖啡馆':'等待生成视频';
+  $('poster-label').textContent=interactive?'示例参考图':'独立短视频';
+  $('remove-reference').hidden=!referenceURL;
+  $('remove-reference').disabled=busy;
+  $('reference-preview').hidden=!interactive||!referenceURL||Boolean(frameCount);
+  $('reference-image').disabled=busy;
   $('layout').classList.toggle('has-world',Boolean(world)&&interactive);
   for(const id of ['generate','mode','size','seed'])$(id).disabled=busy||Boolean(promptUpdate);
-  $('generate').disabled=busy||Boolean(promptUpdate)||enhancerAvailable===null;
+  const custom=$('size').value==='custom';
+  $('custom-size').hidden=!custom;
+  for(const id of ['custom-width','custom-height'])$(id).disabled=!custom||busy||Boolean(promptUpdate);
+  $('generate').disabled=busy||Boolean(promptUpdate)||enhancerAvailable===null||(lingBot&&!referenceURL);
   $('enhance-prompt').disabled=busy||Boolean(promptUpdate)||Boolean(world)||!enhancerAvailable;
   $('perspective').disabled=$('enhance-prompt').disabled||!$('enhance-prompt').checked;
-  $('prompt').disabled=busy&&!(interactive&&world);
+  $('prompt').disabled=busy;
+  $('instruction').disabled=Boolean(promptUpdate);
+  $('edit-frames').hidden=!interactive||world?.text_frames==null;
+  $('edit-frames').disabled=Boolean(promptUpdate);
   $('apply-scene').hidden=!interactive;
-  $('edit-scene').hidden=!interactive;
-  $('edit-scene').disabled=!interactive||!world;
-  $('apply-scene').disabled=!interactive||!world||!['ready','generating'].includes(world.status)||Boolean(promptUpdate)||!$('prompt').value.trim();
-  $('prompt-status').hidden=!interactive;
-  $('prompt-status').textContent=promptError||(promptUpdate?'正在保存新描述…':world?
-    (world.prompt!==undefined&&$('prompt').value!==world.prompt?'描述已编辑，点击“修改当前场景”后生效。':
-     world.prompt_revision===1&&world.applied_prompt_revision===0?'正在创建场景…':
-     world.prompt_revision>world.applied_prompt_revision?
-       (active&&activePromptRevision===world.prompt_revision?'正在更新场景…':'新描述已保存，将在当前操作完成后应用。'):
-     '可修改描述来调整当前场景。'):
-    '创建场景后，可修改描述来调整场景。');
+  $('apply-scene').textContent=busy&&!continuous?'保存下一段指令':'发送指令';
+  $('apply-scene').disabled=!interactive||!world||!['ready','generating'].includes(world.status)||Boolean(promptUpdate)||!$('instruction').value.trim();
+  $('prompt-status').textContent=promptError||(nextWorldPrompt!==null?'下一段将使用新的场景描述。':promptUpdate?'正在保存指令…':
+    world?.prompt_revision>world?.applied_prompt_revision && world?.prompt_revision>1?
+      (activePromptRevision===world.prompt_revision?'正在应用指令…':continuous?'下一段将应用这条指令。':'指令已保存，下一段生成时生效。'):
+    world?.applied_prompt_revision>1?'已应用「'+world.prompt+'」':'');
   $('frames').disabled=busy||interactive;
   if(interactive)$('frames').value='20';
   $('cancel').disabled=!active;
@@ -81,96 +430,171 @@ function controls() {
   $('continuous').disabled=(!continuous&&(busy||Boolean(promptUpdate)))||!interactive||!world||world.segments===0||['failed','complete'].includes(world.status);
   $('continuous').textContent=continuous?'停止连续探索':'连续探索';
   $('generate').textContent=interactive?(world?'重建场景':'创建场景'):'生成视频';
-  $('navigation').hidden=!interactive;
-  for(const action of Object.keys(actions))$(action).disabled=Boolean(promptUpdate)||(!continuous&&busy)||!interactive||!world||(!continuous&&world.status!=='ready')||world.segments===0;
+  $('navigation').hidden=!interactive||!world||!world.segments;
+  for(const action of Object.keys(actions))$(action).disabled=Boolean(promptUpdate)||!interactive||!world||!world.segments||(!continuous&&!canBufferStep()&&(busy||world.status!=='ready'));
   showControl();
-  $('session-info').textContent=world?'当前场景':(interactive?'尚未创建场景':'独立短视频');
+  $('session-info').textContent=interactive&&world?'当前场景':(interactive?(referenceURL?'起始参考图':''):'独立短视频');
 }
 function drawFrame(index) {
-  if(!images.length)return;
-  currentFrame=Math.max(0,Math.min(images.length-1,index));
+  if(!frameCount)return;
+  currentFrame=Math.max(0,Math.min(frameCount-1,index));
   const canvas=$('video');
-  canvas.getContext('2d').drawImage(images[currentFrame],0,0,canvas.width,canvas.height);
+  canvas.getContext('2d').drawImage(clip||images[currentFrame],0,0,canvas.width,canvas.height);
   $('seek').value=currentFrame;
-  $('frame-info').textContent=`第 ${currentFrame+1} / ${images.length} 帧 · ${(currentFrame/fps).toFixed(2)} / ${(images.length/fps).toFixed(2)} 秒`;
+  $('frame-info').textContent=`第 ${currentFrame+1} / ${frameCount} 帧 · ${(currentFrame/fps).toFixed(2)} / ${(frameCount/fps).toFixed(2)} 秒`;
+}
+function seekFrame(index) {
+  if(clip){
+    clip.currentTime=(Math.max(0,Math.min(frameCount-1,index))+.5)/fps;
+  } else drawFrame(index);
 }
 function tick() {
-  if(!playing||!images.length)return;
+  if(!playing||!frameCount)return;
   const rate=Number($('speed').value)*adaptiveRate,elapsed=Math.max(0,performance.now()-epoch);
+  if(clip){
+    if(!clip.seeking)drawFrame(Math.floor(clip.currentTime*fps));
+    timer=setTimeout(tick,1000/(fps*clip.playbackRate));
+    return;
+  }
   const index=originFrame+Math.floor(elapsed*fps*rate/1000);
-  if(!loop&&index>=images.length-1){drawFrame(images.length-1);setPlaying(false);return;}
-  drawFrame(index%images.length);
+  if(!loop&&index>=frameCount-1){drawFrame(frameCount-1);setPlaying(false);return;}
+  drawFrame(index%frameCount);
   timer=setTimeout(tick,1000/(fps*rate));
 }
 function setPlaying(value) {
   clearTimeout(timer);timer=null;
-  playing=Boolean(value&&images.length);
+  playing=Boolean(value&&frameCount);
   epoch=performance.now();originFrame=currentFrame;
   $('play').textContent=playing?'暂停':'播放';
   $('play').setAttribute('aria-label',playing?'暂停播放':'开始播放');
+  if(clip){
+    if(playing){
+      const activeClip=clip;
+      clip.playbackRate=Math.max(.0625,Math.min(16,Number($('speed').value)*adaptiveRate));
+      clip.play().catch(error=>{
+        if(activeClip===clip&&playing&&error.name!=='AbortError'){setPlaying(false);$('status').textContent=error.message;}
+      });
+    } else clip.pause();
+  }
   if(playing)tick();
 }
-$('play').onclick=()=>{stopContinuous();if(!playing&&!loop&&currentFrame===images.length-1)drawFrame(0);setPlaying(!playing);};
-$('seek').oninput=()=>{stopContinuous();setPlaying(false);drawFrame(Number($('seek').value));};
+$('play').onclick=()=>{stopContinuous();if(!playing&&!loop&&currentFrame===frameCount-1)seekFrame(0);setPlaying(!playing);};
+$('seek').oninput=()=>{stopContinuous();setPlaying(false);seekFrame(Number($('seek').value));};
 $('speed').onchange=()=>setPlaying(playing);
 document.addEventListener('visibilitychange',()=>{if(document.hidden){stopContinuous();}else if(playing)setPlaying(true);});
 function preload(job){
   for(const url of job.output?.frames||[])if(!frameLoads.has(url)){
-    const promise=new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=()=>reject(Error('读取画面失败，可刷新页面重试'));image.src=url;});
+    const promise=new Promise((resolve,reject)=>{const image=new Image();image.onload=()=>resolve(image);image.onerror=()=>reject(Error('读取画面失败，可刷新页面重试'));image.src=serviceUrl(url);});
     promise.catch(()=>{});frameLoads.set(url,promise);
   }
+}
+function loadClip(url){
+  return new Promise((resolve,reject)=>{
+    const video=document.createElement('video');
+    video.muted=true;video.playsInline=true;video.preload='auto';
+    video.onloadeddata=()=>resolve(video);
+    video.onerror=()=>reject(Error('读取视频失败，请刷新页面重试'));
+    video.src=serviceUrl(url);
+  });
+}
+function releaseClip(){
+  if(!clip)return;
+  clip.onended=null;clip.onseeked=null;clip.onerror=null;clip.onloadeddata=null;
+  clip.removeAttribute('src');clip.load();clip=null;
 }
 async function showResult(job) {
   showEnhancement(job);
   $('status').textContent='正在加载画面…';
   preload(job);
-  const loaded=await Promise.all(job.output.frames.map(url=>frameLoads.get(url)));
-  while(continuous&&playing)await sleep(25); // At most one segment waits for playback.
+  const nextClip=job.output?.format==='mp4'?await loadClip(job.output.url):null;
+  const loaded=nextClip?[]:await Promise.all((job.output?.frames||[]).map(url=>frameLoads.get(url)));
+  while((continuous||exploring)&&job.world_id&&!loop&&playing)await sleep(25); // Finish the current view before the next segment.
   frameLoads.clear();
-  if(!loaded.length)throw Error('生成结果没有画面');
-  setPlaying(false);images=loaded;fps=Number(job.fps)||24;
-  adaptiveRate=continuous&&$('paced').checked&&job.segment_index>1?Math.min(1,images.length/(fps*Math.max(.01,job.total_seconds||job.generation_seconds)*1.05)):1;
+  if(!nextClip&&!loaded.length)throw Error('生成结果没有画面');
+  setPlaying(false);releaseClip();
+  clip=nextClip;images=loaded;frameCount=clip?job.num_frames:loaded.length;fps=Number(job.fps)||24;
+  adaptiveRate=continuous&&$('paced').checked&&job.segment_index>1?Math.min(1,frameCount/(fps*Math.max(.01,job.total_seconds||job.generation_seconds)*1.05)):1;
   currentFrame=0;loop=!job.world_id;
-  $('video').width=job.width;$('video').height=job.height;$('seek').max=images.length-1;$('player').hidden=false;$('player').open=!job.world_id;$('progress').value=100;
-  $('status').textContent=job.world_id?`${job.segment_index===1?'场景已创建':(actions[job.action]||'操作')+'完成'}，可继续移动或转向`:'视频已生成，正在循环播放';
+  $('video').width=job.width;$('video').height=job.height;$('seek').max=frameCount-1;$('player').hidden=false;$('player').open=!job.world_id;$('progress').value=100;
+  $('status').textContent=job.world_id?
+    (job.segment_index===1?'场景已创建，可以发送第一条指令。':'第 '+job.segment_index+' 段已生成。'):
+    '视频已生成，正在循环播放。';
+  $('placeholder').hidden=true;$('reference-preview').hidden=true;
+  if(clip){
+    clip.loop=loop;
+    clip.onseeked=()=>drawFrame(Math.floor(clip.currentTime*fps));
+    clip.onended=()=>{drawFrame(frameCount-1);setPlaying(false);};
+  }
+  if(job.world_id){
+    const ambient=$('ambient');ambient.width=160;ambient.height=Math.round(160*job.height/job.width);
+    ambient.getContext('2d').drawImage(clip||images[0],0,0,ambient.width,ambient.height);ambient.hidden=false;
+  }
   drawFrame(0);setPlaying(true);
 }
+async function getWorld(id){
+  const item=await api('/v1/worlds/'+id);
+  if(lingBot)item.status=item.pending?'generating':'ready';
+  return item;
+}
 async function refreshWorld() {
-  if(world)world=await api('/v1/worlds/'+world.id);
+  if(world)world=await getWorld(world.id);
+}
+function lingJob(job) {
+  const result=job.result;
+  return {...job,error:job.error?{message:job.error}:null,
+    progress:job.total?Math.round(100*job.current/job.total):0,
+    ...(result?{width:result.width,height:result.height,fps:result.fps,num_frames:result.frame_count,
+      segment_index:result.segment+1,output:result}: {})};
+}
+async function deleteWorld(id) {
+  const job=await api('/v1/worlds/'+id,{method:'DELETE'});
+  if(lingBot){
+    const done=await awaitJob(lingJob(job));
+    if(done.status!=='completed')throw Error(done.error?.message||'结束场景失败');
+  }
 }
 function showProgress(job){
   const stages={queued:'排队中…',prompt_enhancement:'正在扩写场景描述…',text_encoding:'准备场景…',denoising:job.world_id?'生成场景…':'生成视频…',decoding:'处理画面…',saving:'加载画面…'};
-  $('status').textContent=(continuous?'连续探索 · '+(actions[job.action]||'')+' · ':'')+(stages[job.stage]||job.status);$('progress').value=job.progress;preload(job);
+  $('status').textContent=(job.world_id&&actions[job.action]?actions[job.action]+' · ':'')+(stages[job.stage]||job.status);$('progress').value=job.progress;preload(job);
+}
+async function getJob(id){
+  const path=encodeURIComponent(id);
+  return lingBot?lingJob(await api('/v1/jobs/'+path)):await api('/v1/videos/'+path);
 }
 async function awaitJob(job){
   const terminal=j=>['completed','failed','cancelled'].includes(j.status);
-  if(!terminal(job)&&typeof EventSource==='function'){
+  if(!lingBot&&!terminal(job)&&typeof EventSource==='function'){
     try{return await new Promise((resolve,reject)=>{
-      const source=new EventSource(job.events_url||'/v1/videos/'+job.id+'/events');
+      const source=new EventSource(serviceUrl(job.events_url||'/v1/videos/'+job.id+'/events'));
       source.onmessage=event=>{try{const next=JSON.parse(event.data);showProgress(next);if(terminal(next)){source.close();resolve(next);}}catch(error){source.close();reject(error);}};
       source.onerror=()=>{source.close();reject(Error('事件连接中断'));};
       source.addEventListener('expired',()=>{source.close();reject(Error('任务已过期'));});
     });}catch{} // Polling also recovers through HTTP proxies without SSE support.
   }
-  while(!terminal(job)){showProgress(job);await sleep(250);job=await api('/v1/videos/'+encodeURIComponent(job.id));}
+  while(!terminal(job)){showProgress(job);await sleep(lingBot?40:250);job=await getJob(job.id);}
   return job;
 }
 async function followJob(job) {
+  const started=performance.now();
   frameLoads.clear();
   active=job.id;activePromptRevision=job.prompt_revision||0;controls();
   history.replaceState(null,'',job.world_id?'?world='+encodeURIComponent(job.world_id):'?video='+encodeURIComponent(job.id));
   try {
     job=await awaitJob(job);
-    if(job.status==='failed')throw Error(job.error?.message||'生成失败');
+    if(job.status==='failed'){stopContinuous();throw Error(job.error?.message||'生成失败');}
     if(job.status==='cancelled'){stopContinuous();$('status').textContent='已取消，本次操作未推进场景';return;}
+    if(lingBot)job.total_seconds=(performance.now()-started)/1000;
     await showResult(job);
-  } finally {await refreshWorld();}
+  } finally {
+    if(lingBot&&job.world_deleted){world=null;clearPlayback();setExploring(false);$('setup').open=true;}
+    else await refreshWorld();
+  }
 }
-function idle(){active=null;activePromptRevision=0;busy=false;controls();}
+function idle(){active=null;activePromptRevision=0;busy=false;controls();drainStep();}
 function showControl(){
   const selected=pendingAction||desiredAction;
-  $('control-info').textContent=continuous?`下一步：${actions[selected]}`:'';
-  for(const action of Object.keys(actions))$(action).setAttribute('aria-pressed',String(continuous&&selected===action));
+  $('control-info').textContent=queuedStep?'下一段：'+actions[queuedStep]:continuous?`下一步：${actions[selected]}`:'';
+  for(const action of Object.keys(actions))$(action).setAttribute('aria-pressed',String(queuedStep===action||(continuous&&selected===action)));
 }
 function pressAction(source,action){
   heldActions.delete(source);heldActions.set(source,action);
@@ -181,7 +605,7 @@ function releaseAction(source){
   desiredAction=Array.from(heldActions.values()).at(-1)||'stay';showControl();
 }
 function takeAction(){const action=pendingAction||desiredAction;pendingAction=null;showControl();return action;}
-function stopContinuous(){continuous=false;desiredAction='stay';pendingAction=null;heldActions.clear();controls();}
+function stopContinuous(){queuedStep=null;continuous=false;desiredAction='stay';pendingAction=null;heldActions.clear();controls();}
 $('continuous').onclick=async()=>{
   if(continuous){stopContinuous();$('status').textContent='正在停止连续探索，当前操作完成后停止。';return;}
   if(busy||!world||world.status!=='ready')return;
@@ -194,41 +618,155 @@ $('continuous').onclick=async()=>{
   }
   stopContinuous();
 };
+async function fitReference(file,width,height){
+  const image=await createImageBitmap(file);
+  try {
+    const canvas=document.createElement('canvas');
+    if(lingBot){
+      // LingBot applies its native image preprocessing to the original pixels.
+      canvas.width=image.width;canvas.height=image.height;
+      canvas.getContext('2d').drawImage(image,0,0);
+      return canvas.toDataURL('image/png');
+    }
+    canvas.width=width;canvas.height=height;
+    const ctx=canvas.getContext('2d');ctx.fillStyle='black';ctx.fillRect(0,0,width,height);
+    const scale=Math.min(width/image.width,height/image.height);
+    const w=Math.round(scale*image.width),h=Math.round(scale*image.height);
+    ctx.imageSmoothingQuality='high';ctx.drawImage(image,Math.floor((width-w)/2),Math.floor((height-h)/2),w,h);
+    const rgba=ctx.getImageData(0,0,width,height).data;
+    const rgb=new Uint8Array(width*height*3);
+    for(let i=0,j=0;i<rgba.length;i+=4){rgb[j++]=rgba[i];rgb[j++]=rgba[i+1];rgb[j++]=rgba[i+2];}
+    const parts=[];
+    for(let i=0;i<rgb.length;i+=8192)parts.push(String.fromCharCode(...rgb.subarray(i,i+8192)));
+    return btoa(parts.join(''));
+  } finally {image.close();}
+}
 $('form').onsubmit=async event=>{
   event.preventDefault();if(busy||promptUpdate||enhancerAvailable===null)return;
   busy=true;controls();setPlaying(false);$('progress').value=0;$('status').textContent='正在提交…';
   try {
-    const [width,height]=$('size').value.split(' × ').map(Number);
+    const [width,height]=selectedResolution();
     const enhancePrompt=enhancerAvailable&&$('enhance-prompt').checked;
-    const body={model:'hy-nomas',messages:[{role:'user',content:$('prompt').value}],width,height,num_frames:Number($('frames').value),seed:Number($('seed').value),steps:8,enhance_prompt:enhancePrompt,perspective:enhancePrompt?$('perspective').value:'auto'};
+    const body=lingBot?{prompt:$('prompt').value,width,height,seed:Number($('seed').value)}:{model:'hy-nomas',messages:[{role:'user',content:$('prompt').value}],width,height,num_frames:Number($('frames').value),seed:Number($('seed').value),steps:8,enhance_prompt:enhancePrompt,perspective:enhancePrompt?$('perspective').value:'auto'};
+    if(preferClip)body.response_format='mp4';
     if($('mode').value==='world') {
-      if(world){await api('/v1/worlds/'+world.id,{method:'DELETE'});world=null;}
-      world=await post('/v1/worlds',body);
-      await followJob(await api('/v1/videos/'+world.current_job));
+      let reference=$('reference-image').files[0];
+      if(referenceURL===sampleURL){
+        const response=await fetch(sampleURL);
+        if(!response.ok)throw Error('示例图加载失败，请重新选择图片。');
+        reference=await response.blob();
+      }
+      if(reference){
+        const image=await fitReference(reference,width,height);
+        if(lingBot)body.image=image;
+        else {body.reference_rgb=image;body.text_frames=120;}
+      }else if(lingBot)throw Error('请选择一张起始参考图。');
+      if(world){await deleteWorld(world.id);world=null;}
+      nextWorldPrompt=null;
+      const created=await post('/v1/worlds',body);
+      world=lingBot?await getWorld(created.world_id):created;
+      $('edit-frames').value=String(world.text_frames??20);
+      clearPlayback();previewSize();
+      $('setup').open=false;$('instruction').value='';promptError='';
+      setExploring(true);
+      await followJob(lingBot?lingJob(created):await getJob(world.current_job));
     } else await followJob(await post('/v1/videos',body));
   } catch(error){$('status').textContent=error.message;}
   finally{idle();}
 };
 async function move(action) {
   if(busy||promptUpdate||!world||world.status!=='ready'||world.segments===0)return;
-  busy=true;controls();if(!continuous){setPlaying(false);drawFrame(images.length-1);}$('progress').value=0;$('status').textContent=(actions[action]||'操作')+'…';
-  try{await followJob(await post('/v1/worlds/'+world.id+'/actions',{action}));}
-  catch(error){stopContinuous();$('status').textContent=error.message;try{await refreshWorld();}catch{}}
+  busy=true;controls();if(!continuous&&!exploring){setPlaying(false);seekFrame(frameCount-1);}$('progress').value=0;$('status').textContent=(actions[action]||'操作')+'…';
+  const body={action:lingBot&&action==='follow_prompt'?'stay':action};
+  if(lingBot&&nextWorldPrompt!==null){body.prompt=nextWorldPrompt;nextWorldPrompt=null;}
+  try{
+    const job=await post('/v1/worlds/'+world.id+'/actions',body);
+    await followJob(lingBot?lingJob(job):job);
+  }
+  catch(error){
+    stopContinuous();$('status').textContent=error.message;
+    if(body.prompt&&!$('instruction').value)$('instruction').value=body.prompt;
+    try{await refreshWorld();}catch{}
+  }
   finally{idle();}
 }
-$('prompt').oninput=()=>{promptError='';controls();};
-$('edit-scene').onclick=()=>{$('prompt').focus({preventScroll:true});$('prompt').scrollIntoView({behavior:'smooth',block:'center'});};
+function clearPlayback(){
+  queuedStep=null;$('ambient').hidden=true;
+  setPlaying(false);
+  releaseClip();images=[];frameCount=0;currentFrame=0;
+  const canvas=$('video');
+  canvas.getContext('2d').clearRect(0,0,canvas.width,canvas.height);
+  $('player').hidden=true;showEnhancement(null);
+  $('progress').value=0;
+}
+function setReference(url, name){
+  if(referenceURL?.startsWith('blob:'))URL.revokeObjectURL(referenceURL);
+  referenceURL=url;
+  $('reference-name').textContent=name||'选择图片';
+  const preview=$('reference-preview');
+  if(url)preview.src=url;
+  else preview.removeAttribute('src');
+  if(!world && frameCount)clearPlayback();
+  previewSize();controls();
+}
+$('reference-image').onchange=()=>{
+  const file=$('reference-image').files[0];
+  setReference(file?URL.createObjectURL(file):null,file?.name);
+};
+$('use-sample').onclick=()=>{
+  $('reference-image').value='';
+  setReference(sampleURL,'雨夜咖啡馆');
+};
+$('remove-reference').onclick=()=>{
+  $('reference-image').value='';
+  setReference(null,'');
+};
+function selectedResolution(){
+  const size=$('size').value==='custom'
+    ? [Number($('custom-width').value),Number($('custom-height').value)]
+    : $('size').value.split(' × ').map(Number);
+  if(lingBot){
+    if(size.length!==2||size.some(n=>!Number.isInteger(n)||n<64||n>832||n%16))
+      throw Error('宽高须为 64–832 的 16 倍数。');
+    return size;
+  }
+  if(size.length!==2||size.some(n=>!Number.isInteger(n)||n<64||n>1280||n%32)||size[0]*size[1]>1280*704)
+    throw Error('宽高须为 64–1280 的 32 倍数，且总像素不超过 1280 × 704。');
+  return size;
+}
+function previewSize(){
+  if(frameCount)return;
+  let width,height;
+  try{[width,height]=selectedResolution();}catch{return;}
+  $('video').width=width;$('video').height=height;
+}
+$('size').onchange=()=>{controls();previewSize();};
+$('custom-width').oninput=$('custom-height').oninput=previewSize;
+$('instruction').oninput=()=>{promptError='';controls();};
+$('edit-kind').onchange=controls;
 $('apply-scene').onclick=async()=>{
   if(promptUpdate||!world||!['ready','generating'].includes(world.status))return;
-  const id=world.id,prompt=$('prompt').value;
+  const id=world.id,prompt=$('instruction').value;
   if(!prompt.trim())return;
+  if(lingBot){
+    nextWorldPrompt=prompt;$('instruction').value='';promptError='';
+    if(continuous){pendingAction='follow_prompt';controls();}
+    else if(busy){queuedStep='follow_prompt';controls();}
+    else await move('follow_prompt');
+    return;
+  }
+  const edit={prompt};
+  if(!world.enhance_prompt&&['environment','action'].includes($('edit-kind').value))edit.kind=$('edit-kind').value;
+  if(world.text_frames!=null)edit.text_frames=Number($('edit-frames').value);
   promptError='';
   promptUpdate=(async()=>{
     try{
-      const accepted=await api('/v1/worlds/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});
+      const accepted=await api('/v1/worlds/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(edit)});
       // Do not let a delayed PATCH response overwrite newer generation state.
       if(world?.id!==id)return false;
-      world.prompt=accepted.prompt;world.prompt_revision=accepted.prompt_revision;return true;
+      world.prompt=accepted.prompt;world.prompt_revision=accepted.prompt_revision;world.text_frames=accepted.text_frames;
+      if($('instruction').value===prompt)$('instruction').value='';
+      return true;
     }
     catch(error){promptError=error.message;return false;}
   })();
@@ -238,30 +776,43 @@ $('apply-scene').onclick=async()=>{
   // job keeps its original conditions; the next continuous segment uses text.
   if(accepted&&world?.id===id){
     if(continuous){pendingAction='follow_prompt';showControl();}
+    else if(exploring&&busy){queuedStep='follow_prompt';showControl();}
     else if(!busy&&world.status==='ready')await move('follow_prompt');
   }
+  drainStep();
 };
-for(const action of Object.keys(actions)){
+function bindAction(action){
   const button=$(action);
-  button.onclick=event=>{if(continuous){if(!event||event.detail===0){pendingAction=action;showControl();}return;}return move(action);};
+  button.onclick=event=>{if(continuous){if(!event||event.detail===0){pendingAction=action;showControl();}return;}return requestStep(action);};
   button.onpointerdown=event=>{if(!continuous)return;event.preventDefault();button.setPointerCapture(event.pointerId);pressAction('pointer:'+event.pointerId,action);};
   button.onpointerup=button.onpointercancel=button.onlostpointercapture=event=>releaseAction('pointer:'+event.pointerId);
 }
+Object.keys(actions).forEach(bindAction);
 document.addEventListener('keydown',event=>{
+  if(event.defaultPrevented||event.isComposing||event.keyCode===229)return;
+  if(event.key==='Escape'&&exploring){
+    if(!$('show-tools').hidden){setViewOnly(false);return;}
+    if($('look-tools').open||$('player').open){dismissTools();$('video').focus();}
+    else setExploring(false);
+    return;
+  }
   if(event.repeat||event.ctrlKey||event.metaKey||event.altKey||/^(INPUT|TEXTAREA|SELECT)$/.test(event.target.tagName)||$('mode').value!=='world')return;
+  if(exploring&&event.key==='/'){event.preventDefault();setViewOnly(false);$('instruction').focus();return;}
+  if(!world?.segments)return;
   const keys={w:'forward',s:'backward',a:'left',d:'right',ArrowLeft:'look_left',ArrowRight:'look_right',ArrowUp:'look_up',ArrowDown:'look_down'};
+  if(lingBot){keys.q='up';keys.e='down';}
   const action=keys[event.key]||keys[event.key.toLowerCase()];
-  if(action){event.preventDefault();if(continuous){pressAction('key:'+(event.code||event.key.toLowerCase()),action);}else move(action);}
+  if(action){event.preventDefault();if(continuous){pressAction('key:'+(event.code||event.key.toLowerCase()),action);}else requestStep(action);}
 });
 document.addEventListener('keyup',event=>releaseAction('key:'+(event.code||event.key.toLowerCase())));
-window.addEventListener('blur',stopContinuous);
+window.addEventListener('blur',()=>{clearGesture();stopContinuous();});
 $('reset').onclick=async()=>{
   if(busy||!world)return;busy=true;controls();
-  try{await api('/v1/worlds/'+world.id,{method:'DELETE'});world=null;history.replaceState(null,'',location.pathname);setPlaying(false);$('status').textContent='场景已结束，可以创建新场景';}
+  try{await deleteWorld(world.id);nextWorldPrompt=null;world=null;setExploring(false);$('setup').open=true;$('instruction').value='';promptError='';history.replaceState(null,'',location.pathname);clearPlayback();previewSize();$('status').textContent='场景已结束，可以创建新场景';}
   catch(error){$('status').textContent=error.message;}
   finally{idle();}
 };
-$('mode').onchange=controls;
+$('mode').onchange=()=>{controls();if(!busy&&!frameCount)$('status').textContent=$('mode').value==='world'?'等待创建场景':'等待生成视频';};
 $('enhance-prompt').onchange=controls;
 $('cancel').onclick=async()=>{
   stopContinuous();
@@ -273,23 +824,40 @@ async function restore() {
   if(!savedWorld&&!savedVideo)return;
   busy=true;controls();
   try {
-    if(savedWorld&&/^world_[a-f0-9]{32}$/.test(savedWorld)) {
-      $('mode').value='world';world=await api('/v1/worlds/'+savedWorld);restoreWorldInputs();
+    if(lingBot&&/^world_[a-f0-9]{24}$/.test(savedWorld||'')){
+      world=await getWorld(savedWorld);restoreWorldInputs();
+      if(world.pending)await followJob(await getJob(world.current_job));
+      else if(world.last_result)await showResult(lingJob({status:'completed',world_id:world.id,result:world.last_result}));
+    }else if(!lingBot&&savedWorld&&/^world_[a-f0-9]{32}$/.test(savedWorld)) {
+      $('mode').value='world';world=await getWorld(savedWorld);restoreWorldInputs();
       const video=world.status==='generating'?world.current_job:world.latest_video;
-      if(video)await followJob(await api('/v1/videos/'+video));
-    } else if(savedVideo&&/^video_[a-f0-9]{32}$/.test(savedVideo)) {
-      const job=await api('/v1/videos/'+savedVideo);$('mode').value=job.world_id?'world':'video';
-      if(job.world_id){world=await api('/v1/worlds/'+job.world_id);restoreWorldInputs();}
+      if(video)await followJob(await getJob(video));
+    } else if(!lingBot&&savedVideo&&/^video_[a-f0-9]{32}$/.test(savedVideo)) {
+      const job=await getJob(savedVideo);$('mode').value=job.world_id?'world':'video';
+      if(job.world_id){world=await getWorld(job.world_id);restoreWorldInputs();}
       await followJob(job);
     }
   } catch(error){$('status').textContent=error.message;}
   finally{idle();}
 }
 function restoreWorldInputs(){
-  if(world.prompt!==undefined)$('prompt').value=world.prompt;
+  $('setup').open=false;setExploring(true);
+  const initial=world.prompt_revision>1?world.initial_scene:world.prompt;
+  if(typeof initial==='string')$('prompt').value=initial;
+  if(world.edit_kind)$('edit-kind').value=world.edit_kind;
+  $('edit-frames').value=String(world.text_frames??20);
   $('enhance-prompt').checked=Boolean(world.enhance_prompt);$('perspective').value=world.perspective||'auto';showEnhancement(world);
-  $('size').value=`${world.width} × ${world.height}`;$('seed').value=world.seed;
+  const size=`${world.width} × ${world.height}`;
+  $('size').value=size;
+  if($('size').value!==size){
+    $('size').value='custom';$('custom-width').value=world.width;$('custom-height').value=world.height;
+  }
+  $('seed').value=world.seed;
 }
-api('/health').then(health=>configureEnhancer(health.prompt_enhancer?.enabled)).catch(()=>configureEnhancer(false));
-controls();restore();
+api('/health').then(health=>{
+  if(health.model==='lingbot-world-2.0-1.3b')configureLingBot();
+  preferClip=health.playback_formats?.includes('mp4')&&Boolean(document.createElement('video').canPlayType('video/mp4; codecs="avc1.4D4028"'));
+  configureEnhancer(health.prompt_enhancer?.enabled);
+}).catch(()=>configureEnhancer(false)).then(restore);
+controls();
 </script></html>

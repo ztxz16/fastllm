@@ -14,6 +14,7 @@ public:
                    std::vector<DiTCache> *workspace = nullptr);
     Tensor decode(const Tensor &, const Tensor &, int, int, int);
     void unload();
+    std::vector<size_t> availableMemory();
 private:
     struct Rank;
     ParallelGroup group_;

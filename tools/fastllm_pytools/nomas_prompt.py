@@ -21,32 +21,43 @@ def timestamp(value):
     return int(minutes) * 60 + float(seconds)
 
 
-def shape_scene(item, duration):
-    """Keep the released inference fields and the current segment's actions.
-
-    The native demo generates a fixed frame window. Future actions in a PE
-    response must not be squeezed into that window or replayed on navigation.
-    """
-    if not isinstance(item, dict) or item.get("perspective_view") not in PERSPECTIVES:
-        raise ValueError("missing or invalid perspective_view")
-    if item.get("Style") not in ("real-world footage", "animation/anime", "CG", "video game",
-                                 "software/web/app/computer screen recording", "slideshow"):
-        raise ValueError("missing or invalid Style")
-    subjects, segments = item.get("subject_list"), item.get("segments")
-    if not isinstance(subjects, list) or len(subjects) != 1 or not isinstance(subjects[0], dict):
-        raise ValueError("expected exactly one controlled subject")
-    subject = subjects[0]
-    if subject.get("subject_id") != "<|Subject1|>":
-        raise ValueError("expected Subject1")
-    for key in ("display_name", "subject_attribute"):
-        if not isinstance(subject.get(key), str) or not subject[key].strip():
-            raise ValueError("missing subject " + key)
+def shape_scene(item, duration, *, continuation=False):
+    """Shape the first scene or an incremental change for the released encoder."""
+    if not isinstance(item, dict):
+        raise ValueError("expected a scene object")
+    segments = item.get("segments")
     if not isinstance(segments, list) or len(segments) != 1 or not isinstance(segments[0], dict):
         raise ValueError("expected one scene segment")
     segment = segments[0]
-    description = segment.get("visual_description_long")
-    if not isinstance(description, str) or not description.strip():
-        raise ValueError("missing scene description")
+    if continuation:
+        shaped = {}
+        description = segment.get("description_change")
+        if description is not None and not isinstance(description, str):
+            raise ValueError("invalid scene change")
+        scene = {"description_change": description} if description else {}
+        if not scene and not segment.get("contained_actions"):
+            raise ValueError("expected a scene change or an action")
+    else:
+        if item.get("perspective_view") not in PERSPECTIVES:
+            raise ValueError("missing or invalid perspective_view")
+        if item.get("Style") not in ("real-world footage", "animation/anime", "CG", "video game",
+                                     "software/web/app/computer screen recording", "slideshow"):
+            raise ValueError("missing or invalid Style")
+        subjects = item.get("subject_list")
+        if not isinstance(subjects, list) or len(subjects) != 1 or not isinstance(subjects[0], dict):
+            raise ValueError("expected exactly one controlled subject")
+        subject = subjects[0]
+        if subject.get("subject_id") != "<|Subject1|>":
+            raise ValueError("expected Subject1")
+        for key in ("display_name", "subject_attribute"):
+            if not isinstance(subject.get(key), str) or not subject[key].strip():
+                raise ValueError("missing subject " + key)
+        description = segment.get("visual_description_long")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("missing scene description")
+        shaped = {"perspective_view": item["perspective_view"], "Style": item["Style"],
+                  "subject_list": [{key: subject[key] for key in ("subject_id", "display_name", "subject_attribute")}]}
+        scene = {"visual_description_long": description}
     actions = segment.get("contained_actions", [])
     if not isinstance(actions, list):
         raise ValueError("contained_actions must be a list")
@@ -62,11 +73,8 @@ def shape_scene(item, duration):
             kept.append({"start_time": f"00:{begin:06.3f}",
                          "end_time": f"00:{min(end, duration):06.3f}",
                          "action_description": action["action_description"]})
-    # Match the released keep_keywords: segment timestamps and first-turn
-    # description_change are omitted from the text encoder's input.
-    shaped = {"perspective_view": item["perspective_view"], "Style": item["Style"],
-              "subject_list": [{key: subject[key] for key in ("subject_id", "display_name", "subject_attribute")}],
-              "segments": [{"visual_description_long": description, "contained_actions": kept}]}
+    scene["contained_actions"] = kept
+    shaped["segments"] = [scene]
     prompt = json.dumps(shaped, ensure_ascii=False)
     if len(prompt.encode()) > 16384:
         raise ValueError("expanded scene is too long")
@@ -80,6 +88,7 @@ class PromptEnhancer:
         self.url, self.model, self.timeout = url, model, timeout
         directory = Path(prompts)
         self.system = (directory / "online_user_video_rewriter_system_prompt.md").read_text(encoding="utf-8")
+        self.directory = directory
         self.first = (directory / "online_user_video_rewriter_first_turn.md").read_text(encoding="utf-8")
 
     def complete(self, messages, seed, cancelled):
@@ -119,10 +128,10 @@ class PromptEnhancer:
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content)
         return json.loads(content)
 
-    def enhance(self, caption, *, seed, num_frames, perspective="auto", previous=None, cancelled=lambda: False):
+    def enhance(self, caption, *, seed, num_frames, perspective="auto", previous=None, initial_scene=None, model_frames=0, cancelled=lambda: False):
         if perspective == "auto":
             if previous:
-                perspective = json.loads(previous)["perspective_view"]
+                perspective = json.loads(initial_scene or previous).get("perspective_view", "third-person observer")
             else:
                 perspective = "first-person" if re.search(r"first[ -]person|第一人称", caption, re.I) else "third-person observer"
         duration = num_frames / 24
@@ -134,17 +143,20 @@ class PromptEnhancer:
                  "Resolve specialized terms by their precise meaning in context; do not substitute a "
                  "related object or activity, change quantities, or duplicate the main subject. "
                  "Return raw JSON in the required schema.")
-        subject, environment = caption, caption
+        template = self.first
         if previous:
-            rules += (" This is a scene edit. Preserve the previous scene's static setting and identities unless "
-                      "the new request changes them. Apply the new request once; do not replay previous actions. "
-                      "Return the resulting scene description, not instructions to the user. "
-                      "Previous scene JSON:\n" + previous)
-            subject = "Apply this scene edit: " + caption
-            environment = "Preserve the previous environment except for changes requested in the scene edit."
-        user_input = {"perspective_view": perspective, "subject_description": subject,
-                      "environment_description": environment}
-        base = self.first + "\n\n" + rules + "\n\nCurrent user input JSON:\n" + json.dumps(user_input, ensure_ascii=False)
+            turn = self.directory / "online_user_video_rewriter_intermediate_turn.md"
+            # Older deployments supplied only the system and first-turn files.
+            template = turn.read_text(encoding="utf-8") if turn.is_file() else "Use the subsequent text-turn schema in the system prompt."
+            rules += (f" The current segment starts at {model_frames/24:.3f} seconds on the model timeline. "
+                      "Use absolute action timestamps and the subsequent-turn schema. "
+                      "Environment edits belong in description_change; write the subject's action once in contained_actions."
+                      "\nInitial scene JSON:\n" + (initial_scene or previous) + "\nPrevious turn JSON:\n" + previous)
+            user_input = {"subsequent_text_prompt": caption}
+        else:
+            user_input = {"perspective_view": perspective, "subject_description": caption,
+                          "environment_description": caption}
+        base = template + "\n\n" + rules + "\n\nCurrent user input JSON:\n" + json.dumps(user_input, ensure_ascii=False)
         error = None
         for attempt in range(2):
             if cancelled():
@@ -153,8 +165,8 @@ class PromptEnhancer:
             try:
                 item = self.complete([{"role": "system", "content": self.system},
                                       {"role": "user", "content": text}], seed, cancelled)
-                prompt = shape_scene(item, duration)
-                if item["perspective_view"] != perspective:
+                prompt = shape_scene(item, duration, continuation=previous is not None)
+                if not previous and item["perspective_view"] != perspective:
                     raise ValueError("preserve the requested perspective_view")
                 return {"model": self.model, "prompt": prompt, "source_prompt": caption, "attempts": attempt + 1}
             except (ValueError, KeyError, TypeError) as exc:

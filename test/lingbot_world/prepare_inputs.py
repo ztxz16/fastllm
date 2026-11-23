@@ -58,6 +58,9 @@ def main():
     msk = torch.zeros(4, latent_frames, a.height//8, a.width//8, device='cuda')
     msk[:, 0] = 1
     condition = torch.cat([msk, encoded]).permute(1, 2, 3, 0).contiguous().cpu().numpy()
+    with torch.autocast('cuda', dtype=torch.bfloat16):
+        encoded = vae.model.encode(pixels[None], vae.scale)[0]
+    condition_bf16 = torch.cat([msk, encoded.float()]).permute(1, 2, 3, 0).contiguous().cpu().numpy()
     del vae, pixels, encoded, msk
     gc.collect()
     torch.cuda.empty_cache()
@@ -72,7 +75,7 @@ def main():
     camera = camera_module.get_plucker_embeddings(poses.cuda(), intrinsics[:1].repeat(latent_frames, 1).cuda(), a.height, a.width)
     camera = camera.reshape(latent_frames, a.height//8, 8, a.width//8, 8, 6).permute(0, 1, 3, 5, 2, 4)
     camera = camera.reshape(latent_frames, a.height//8, a.width//8, 384).bfloat16().float().cpu().numpy()
-    np.savez(a.output, text=text, tokens=ids[0, :count].numpy(), condition=condition, camera=camera,
+    np.savez(a.output, text=text, tokens=ids[0, :count].numpy(), condition=condition, condition_bf16=condition_bf16, camera=camera,
              prompt=prompt, first_image=image.permute(1, 2, 0).numpy(), poses=poses.numpy(), intrinsics=intrinsics[0].numpy())
     print('saved', a.output, flush=True)
 

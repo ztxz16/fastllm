@@ -158,6 +158,13 @@ template <int H, int M> void TestNativeFullGraph(bool large) {
         FastllmCudaSetDevice(device);
         Fixture<H, M, 8> f(false, true);
         Require(DiskMoeV41Graph::Supports(f.disk), "native disk graph eligibility");
+        Require(!DiskMoeV41Graph::RegisterStandardFp8(f.disk), "NVFP4 must use the V4.1 disk graph");
+        Data gate(FP8_E4M3, {256, 128}), down(FP8_E4M3, {128, 128});
+        gate.isDiskWeight = down.isDiskWeight = true;
+        gate.blockK = gate.blockM = down.blockK = down.blockM = 128;
+        const std::vector<Data *> fp8{nullptr, nullptr, &gate, &down};
+        Require(DiskMoeV41Graph::RegisterStandardFp8(fp8) && !DiskMoeV41Graph::Supports(fp8),
+                "standard FP8 disk graphs require explicit opt-in");
         Require(!DiskMoeV41Graph::Supports(f.memory), "non-disk weights admitted");
         f.disk[2]->blockM = 16;
         Require(!DiskMoeV41Graph::Supports(f.disk), "wrong FP4 scale block admitted");

@@ -46,6 +46,7 @@ class TextEncoder {
 public:
     TextEncoder(Runtime &rt, const std::string &path) : rt_(rt), weights_(rt, path) {}
     Tensor encode(const std::vector<int> &tokens);
+    Tensor encode(const std::vector<int> &tokens,bool keepWeights);
     void unload() { weights_.clear(); }
 private:
     Runtime &rt_;

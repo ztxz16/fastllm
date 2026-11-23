@@ -118,7 +118,7 @@ struct Cache {
     PagedCacheManager pool;
     std::vector<int> ids;
     std::vector<uint8_t> expected;
-    Cache(int length, int width, int seed) : length(length), width(width), rowBytes(width / 16 * 9) {
+    Cache(int length, int width, int seed, int headWidth = 0) : length(length), width(width), rowBytes(width / 16 * 9) {
         const int pages = (length + pageLen - 1) / pageLen;
         ids.resize(pages);
         std::iota(ids.begin(), ids.end(), 0);
@@ -143,6 +143,12 @@ struct Cache {
         Allocate(dense, {1, length, width});
         Require(pool.GetBytes() == size_t(pages) * pageLen * rowBytes, "FP4 byte accounting");
         auto input = Input(length * width, seed);
+        if (headWidth && width > headWidth) {
+            // Give odd-numbered KV heads different block scales.
+            for (size_t i = 0; i < input.size(); ++i)
+                if ((i % width / headWidth) % 2)
+                    input[i] = Float32ToBFloat16RNEBits(Float(input[i]) * 0.25f);
+        }
         Data data(BFLOAT16);
         Allocate(data, {1, length, width});
         Upload(data, input);
@@ -255,6 +261,16 @@ void PrefixCopy() {
         Cuda(cudaMemcpy(&devicePage, cache.cudaData, 4, cudaMemcpyDeviceToHost));
         Require(devicePage == copied && pool.pageRefCount[old] == 1 && pool.pageRefCount[copied] == 1,
                 "prefix copy metadata/refcounts");
+        // An owning page table can describe reserved space without expansion metadata.
+        cache.expansionDims.clear();
+        Data next(BFLOAT16);
+        Allocate(next, {1, 1, width});
+        auto input = Input(width, 13);
+        Upload(next, input);
+        FastllmCudaNaivePagedWrite(cache, next, 63);
+        auto packed = Quantize(input.data(), width);
+        std::copy(packed.begin(), packed.end(), original.begin() + copied * bytes + 63 * packed.size());
+        Require(Read<uint8_t>(pool) == original, "append to the reserved FP4 prefix page");
         // Data owns the page table; the test owns physical-page references.
         pool.ReleasePageIndex(old);
         pool.ReleasePageIndex(copied);
@@ -277,8 +293,33 @@ void ReadWrite() {
         Require(Read<uint16_t>(restored) == c.Decode(), "FP4 paged prefill/history decode");
     }
 }
-void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, bool uniform = false) {
-    Cache k(length, 192, 71), v(length, 128, 79), k2(length, 192, 83), v2(length, 128, 89);
+void VerifyPagedBlock() {
+    Cache k(513, 192, 71), v(513, 128, 79);
+    Data nk(BFLOAT16), nv(BFLOAT16), q(BFLOAT16), lengths(INT32), empty, actual, expected;
+    Allocate(nk, {1, 4, 192}); Allocate(nv, {1, 4, 128});
+    Allocate(q, {1, 4, 8 * 192}); Allocate(lengths, {4});
+    const auto keys = Input(4 * 192, 19), values = Input(4 * 128, 23);
+    Upload(nk, keys); Upload(nv, values); Upload(q, Input(4 * 8 * 192, 31));
+    const int live[] = {127, 128, 129, 130};
+    Cuda(cudaMemcpy(lengths.cudaData, live, sizeof(live), cudaMemcpyHostToDevice));
+    FastllmCudaNaiveAppendVerifyCache(k.view, v.view, nk, nv, lengths, 0);
+    k.ReferenceWrite(keys, 126); v.ReferenceWrite(values, 126);
+    k.Verify(); v.Verify(); k.RefreshDense(); v.RefreshDense();
+    FastllmNaiveDecodeScratch sa, sb;
+    auto verify = [&](const Data &key, const Data &value, FastllmNaiveDecodeScratch &scratch, Data &out) {
+        FastllmCudaNaiveGraphVerifyAttention(q, key, value, empty, empty, lengths, 513, 8, 1,
+                                            192, 128, 0, scratch, out, false);
+    };
+    Graph graph;
+    graph.Capture([&] { verify(k.view, v.view, sa, actual); });
+    graph.Run();
+    verify(k.dense, v.dense, sb, expected);
+    Near(actual, expected);
+}
+enum class Selection { Dense, TopK, Mixed };
+void DSA(int batch, int length, Selection selection, int heads, bool withSink = false, bool uniform = false, int kvHeads = 1) {
+    Cache k(length, kvHeads * 192, 71, 192), v(length, kvHeads * 128, 79, 128);
+    Cache k2(length, kvHeads * 192, 83, 192), v2(length, kvHeads * 128, 89, 128);
     Data q(BFLOAT16), live(INT32), indices(INT32), table(INT32), a, b, sink;
     Allocate(q, {1, batch, heads * 192});
     Upload(q, uniform ? std::vector<uint16_t>(batch * heads * 192, 0) : Input(batch * heads * 192, 97));
@@ -298,14 +339,13 @@ void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, b
     std::vector<FastllmNaiveDSARow> packed(batch), reference(batch);
     auto bind = [&](Cache &key, Cache &value, bool padded) {
         std::vector<const void *> pointers;
-        std::vector<int> lengths(batch, length);
-        if (padded)
-            lengths.back() = 0;
+        std::vector<int> lengths(batch);
         for (int i = 0; i < batch; ++i) {
             pointers.insert(pointers.end(), {key.pool.cudaData, value.pool.cudaData, key.table.cudaData,
                                              value.table.cudaData});
             auto &r = reference[i];
             r = packed[i];
+            lengths[i] = padded && i == batch - 1 ? 0 : r.length;
             r.cache = nullptr;
             r.key = key.dense.cudaData;
             r.value = value.dense.cudaData;
@@ -321,14 +361,15 @@ void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, b
         auto &r = packed[i];
         r.key = k.pool.cudaData;
         r.value = v.pool.cudaData;
-        r.keyStride = 192;
-        r.length = r.capacity = length;
+        r.keyStride = kvHeads * 192;
+        const bool denseRow = selection == Selection::Mixed && i % 2 == 0;
+        r.length = r.capacity = denseRow ? 257 : length;
         r.fp4 = true;
         r.pageLen = 128;
         r.poolTokens = k.ids.size() * 128;
         r.cache = (const void *const *)table.cudaData + i * 4;
         r.liveKeys = (const int *)live.cudaData + i;
-        if (sparse) {
+        if (selection != Selection::Dense && !denseRow) {
             r.indices = (const int *)indices.cudaData + i * 2048;
             r.selectedCount = 2048;
         }
@@ -336,13 +377,13 @@ void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, b
     bind(k, v, false);
     FastllmNaiveDecodeScratch sa, sb;
     Graph graph;
-    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(q, sink, packed, heads, 1, 192, 128, sa, a); });
+    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(q, sink, packed, heads, kvHeads, 192, 128, sa, a); });
     for (int pass = 0; pass < 2; ++pass) {
         bind(pass ? k2 : k, pass ? v2 : v, pass != 0);
         graph.Run();
-        FastllmCudaNaiveBatchDSADecode(q, sink, reference, heads, 1, 192, 128, sb, b);
+        FastllmCudaNaiveBatchDSADecode(q, sink, reference, heads, kvHeads, 192, 128, sb, b);
         Near(a, b);
-        if (FastllmCudaRuntimeArch() == 90 && sparse && heads == 16 && batch >= 32) {
+        if (FastllmCudaRuntimeArch() == 90 && batch >= 32) {
             // Tensor Core accumulation may differ from the scalar fallback.
             // Keep the existing bounded-error check against both references,
             // including graph rebind, descriptor boundaries and inactive rows.
@@ -355,7 +396,7 @@ void DSA(int batch, int length, bool sparse, int heads, bool withSink = false, b
                 singleQuery.FakeFrom(q, size_t(row) * heads * 192 * 2);
                 FastllmNaiveDecodeScratch singleScratch;
                 FastllmCudaNaiveBatchDSADecode(singleQuery, sink, {packed[row]},
-                    heads, 1, 192, 128, singleScratch, singleOutput);
+                    heads, kvHeads, 192, 128, singleScratch, singleOutput);
                 Data actualRow(BFLOAT16, {1, 1, heads * 128});
                 actualRow.FakeFrom(a, size_t(row) * heads * 128 * 2);
                 Near(actualRow, singleOutput);
@@ -688,6 +729,7 @@ int main() {
         FastllmCudaSetDevice(0);
         LengthMetadata();
         ReadWrite();
+        VerifyPagedBlock();
         PrefillChunks();
         Prefill();
         PrefixCopy();
@@ -697,12 +739,20 @@ int main() {
         for (int batch : {79, 80, 193, 448, 449}) RopeBatch(batch, 0, true, true);
         SparseRoundTrip();
         for (int heads : {8, 16}) for (int batch : {1, 4, 7, 32, 33, 64, 256, 257, 360, 380}) {
-            DSA(batch, 257, false, heads);
-            DSA(batch, 4097, true, heads);
+            DSA(batch, 257, Selection::Dense, heads);
+            DSA(batch, 4097, Selection::TopK, heads);
         }
-        DSA(449, 4097, true, 16); // Cross the compact descriptor boundary.
-        DSA(64, 8193, true, 16, true);
-        DSA(64, 8193, true, 16, true, true);
+        DSA(33, 1025, Selection::Dense, 64, true, false, 4);
+        DSA(33, 4097, Selection::TopK, 64, true, false, 4);
+        for (int heads : {8, 16, 32}) {
+            const int kvHeads = heads == 32 ? 2 : 1;
+            DSA(449, 4097, Selection::Mixed, heads, true, false, kvHeads);
+        }
+        DSA(32, 1025, Selection::Dense, 32, true, false, 2);
+        DSA(32, 4097, Selection::TopK, 32, true, false, 2);
+        DSA(449, 4097, Selection::TopK, 16); // Cross the compact descriptor boundary.
+        DSA(64, 8193, Selection::TopK, 16, true);
+        DSA(64, 8193, Selection::TopK, 16, true, true);
         Cuda(cudaDeviceSynchronize());
         std::puts("ALL FP4 DSA CHECKS PASSED");
         return 0;

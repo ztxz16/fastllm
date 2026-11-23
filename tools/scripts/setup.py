@@ -1,4 +1,6 @@
 import email
+import json
+from pathlib import Path
 import os
 from setuptools import setup
 
@@ -48,6 +50,10 @@ def resolve_package_info():
     return PACKAGE_INFO["release"]
 
 
+build_info = Path('ftllm/build_info.json')
+merged_media = build_info.is_file() and json.loads(build_info.read_text()).get('merged_media', False)
+media_require = ['nvidia-cufft-cu12'] if merged_media else []
+
 package_info = resolve_package_info()
 package_name = package_info["name"]
 package_version = package_info["version"]
@@ -72,7 +78,8 @@ setup (
              'launcher_assets/locales/*.json', 'webui_assets/*',
              'ui_plugins/*/*', 'plugin_assets/*', 'minimax_h3_server', 'minimax_h3_generate', 'h3_assets/*',
              'minimax_h3_image_server', 'minimax_h3_image_generate', 'h3_image_assets/*',
-             'qwen_image_server', 'qwen_image_generate', 'qwen_image_assets/*']
+             'qwen_image_server', 'qwen_image_generate', 'qwen_image_assets/*',
+             'duo_live', 'duo_assets/*', 'duo_assets/presets/*', 'lingbot_world_assets/*']
     },
     install_requires=[
         'pyreadline3',
@@ -82,7 +89,7 @@ setup (
         'nvidia-cuda-runtime-cu12',
         'nvidia-cublas-cu12',
         'nvidia-nccl-cu12'
-    ] + all_require,
+    ] + media_require + all_require,
     extras_require={
         'all': all_require + ['aiohttp'],
         'server': server_require,

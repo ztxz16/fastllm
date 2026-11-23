@@ -17,6 +17,8 @@
  */
 
 #include "fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "devices/cuda/fastllm-mxfp4-marlin-tp.h"
 #include "devices/cuda/fastllm-prefill-workspace.h"
 
 #include <cuda_bf16.h>
@@ -55,7 +57,15 @@ using MarlinMoeKernelFn = void (*)(
     int, bool, int, int, int, int, int *, bool, bool, bool);
 
 static MarlinMoeKernelFn GetMarlinMoeKernel(int threadK, int threadN,
-                                            int &threads, int tileRows = 8, bool foldBias = false) {
+                                            int &threads, int tileRows = 8, bool foldBias = false, bool indexed = false) {
+    if (indexed) {
+        if (threadK != 64 || threadN != 128 || tileRows != 8) return nullptr;
+        threads = 128;
+        return marlin_kernel::Marlin<
+            marlin_types::kBFloat16.id(), marlin_types::kFE2M1f.id(),
+            marlin_types::kBFloat16.id(), marlin_types::kFE8M0fnu.id(),
+            128, 1, 8, 4, true, 4, 2, false, false, false, false, true>;
+    }
     if (tileRows == 32 && threadK == 64 && threadN == 128) {
         threads = 128;
         return marlin_kernel::Marlin<
@@ -352,11 +362,11 @@ static bool LaunchMarlinMoe(
         int topk, bool multiplyTopkWeights, int numGroups, int rows,
         int outputColumns, int inputColumns, int *workspace,
         cudaStream_t stream, int threadK, int threadN, int sms,
-        int blocksPerSm, int tileRows = 8, bool foldBias = false) {
+        int blocksPerSm, int tileRows = 8, bool foldBias = false, uint8_t *const *expertTable = nullptr) {
     int threads = 0;
-    MarlinMoeKernelFn kernel = GetMarlinMoeKernel(threadK, threadN, threads, tileRows, foldBias);
-    if (kernel == nullptr || activation == nullptr || weight == nullptr ||
-        output == nullptr || temporaryOutput == nullptr || scales == nullptr ||
+    MarlinMoeKernelFn kernel = GetMarlinMoeKernel(threadK, threadN, threads, tileRows, foldBias, expertTable != nullptr);
+    if (kernel == nullptr || activation == nullptr || (!expertTable && (!weight || !scales)) ||
+        output == nullptr || temporaryOutput == nullptr ||
         sortedTokenIds == nullptr || expertIds == nullptr ||
         numTokensPadded == nullptr || topkWeights == nullptr ||
         workspace == nullptr || rows <= 0 || outputColumns <= 0 ||
@@ -369,7 +379,7 @@ static bool LaunchMarlinMoe(
     kernel<<<sms * blocksPerSm, threads,
              GetMarlinMoeSharedMemorySize(threadK, threadN, tileRows), stream>>>(
         reinterpret_cast<const int4 *>(activation),
-        reinterpret_cast<const int4 *>(weight),
+        expertTable ? reinterpret_cast<const int4 *>(expertTable) : reinterpret_cast<const int4 *>(weight),
         reinterpret_cast<int4 *>(output),
         reinterpret_cast<int4 *>(temporaryOutput),
         nullptr, nullptr, reinterpret_cast<const int4 *>(scales), nullptr,
@@ -1680,17 +1690,53 @@ MarlinLayerCache::~MarlinLayerCache() {
     ReleaseCacheStorage(*this);
 }
 
-static bool ValidateWeight(const fastllm::Data *weight, int rows, int columns) {
+static bool ValidateWeight(const fastllm::Data *weight, int rows, int columns, bool requireDirect = true) {
     if (weight == nullptr || weight->dataType != fastllm::DataType::NVFP4 ||
         weight->dims.size() != 2 || weight->dims[0] != rows ||
         weight->dims[1] != columns || weight->blockK != 1 ||
         weight->blockM != 32 || !weight->scales.empty() ||
-        weight->cudaData == nullptr || !weight->directMemory) {
+        weight->cudaData == nullptr || (requireDirect && !weight->directMemory)) {
         return false;
     }
     size_t weightBytes = (size_t)rows * columns / 2;
     size_t scaleBytes = (size_t)rows * (columns / 32);
     return weight->expansionBytes >= weightBytes + scaleBytes;
+}
+
+// TP can still execute the compact kernels if the rank workspace does not fit.
+static void *TryAllocateMarlinStorage(size_t bytes) {
+    void *p = nullptr;
+    if (FastllmCudaTryDirectMalloc(&p, bytes) == FASTLLM_CUDA_TRY_MALLOC_ERROR)
+        throw std::runtime_error("CUDA error preparing the MXFP4 Marlin workspace.");
+    return p;
+}
+
+static bool AllocateMarlinMoeScratch(MarlinLayerCache &cache, size_t packScratchBytes = 0) {
+    const auto allocate = packScratchBytes ? TryAllocateMarlinStorage : AllocateDirect;
+    const int experts = cache.experts, topk = cache.topk, sms = cache.sms;
+    const int hidden = cache.hidden, intermediate = cache.intermediate;
+    constexpr size_t scalarBytes = sizeof(uint16_t);
+    const int routeCapacity = topk * cache.batchRows;
+    // In the worst case every route belongs to a different expert and needs
+    // its own eight-row Marlin block.
+    const int paddedRouteCapacity = routeCapacity * 8;
+
+    cache.sortedTokenIds = (int32_t *)allocate(
+        (size_t)paddedRouteCapacity * sizeof(int32_t));
+    cache.expertIds = (int32_t *)allocate(
+        (size_t)routeCapacity * sizeof(int32_t));
+    cache.expertCounts = (int32_t *)allocate((size_t)experts * sizeof(int32_t));
+    cache.expertStarts = (int32_t *)allocate((size_t)experts * sizeof(int32_t));
+    cache.numTokensPadded = (int32_t *)allocate(sizeof(int32_t));
+    cache.workspace = (int *)allocate((size_t)sms * 4 * sizeof(int));
+    size_t temporaryFloats = (size_t)sms * 4 * 8 * 256 * 2;
+    cache.temporaryOutput = (float *)allocate(std::max(temporaryFloats * sizeof(float), packScratchBytes));
+    cache.gateOutput = allocate(
+        (size_t)routeCapacity * intermediate * 2 * scalarBytes);
+    cache.downOutput = allocate(
+        (size_t)routeCapacity * hidden * scalarBytes);
+    return cache.sortedTokenIds && cache.expertIds && cache.expertCounts && cache.expertStarts &&
+           cache.numTokensPadded && cache.workspace && cache.temporaryOutput && cache.gateOutput && cache.downOutput;
 }
 
 static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
@@ -1740,12 +1786,6 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
     size_t downWeightBytes = (size_t)hidden * intermediate / 2;
     size_t gateScaleBytes = (size_t)intermediate * 2 * (hidden / 32);
     size_t downScaleBytes = (size_t)hidden * (intermediate / 32);
-    constexpr size_t scalarBytes = sizeof(uint16_t);
-    const int routeCapacity = topk * cache.batchRows;
-    // In the worst case every route belongs to a different expert and needs
-    // its own eight-row Marlin block.
-    const int paddedRouteCapacity = routeCapacity * 8;
-
     cache.device = device;
     cudaDeviceGetAttribute(&cache.computeMajor, cudaDevAttrComputeCapabilityMajor, device);
     cache.experts = experts;
@@ -1763,27 +1803,8 @@ static bool BuildLayerCache(fastllm::Data **weights, int weightsBatch,
     cache.downWeight = (uint8_t *)AllocateDirect(downWeightBytes * experts);
     cache.gateScale = (uint8_t *)AllocateDirect(gateScaleBytes * experts);
     cache.downScale = (uint8_t *)AllocateDirect(downScaleBytes * experts);
-    cache.sortedTokenIds = (int32_t *)AllocateDirect(
-        (size_t)paddedRouteCapacity * sizeof(int32_t));
-    cache.expertIds = (int32_t *)AllocateDirect(
-        (size_t)routeCapacity * sizeof(int32_t));
-    cache.expertCounts = (int32_t *)AllocateDirect((size_t)experts * sizeof(int32_t));
-    cache.expertStarts = (int32_t *)AllocateDirect((size_t)experts * sizeof(int32_t));
-    cache.numTokensPadded = (int32_t *)AllocateDirect(sizeof(int32_t));
-    cache.workspace = (int *)AllocateDirect((size_t)sms * 4 * sizeof(int));
-    size_t temporaryFloats = (size_t)sms * 4 * 8 * 256 * 2;
-    cache.temporaryOutput = (float *)AllocateDirect(temporaryFloats * sizeof(float));
-    cache.gateOutput = AllocateDirect(
-        (size_t)routeCapacity * intermediate * 2 * scalarBytes);
-    cache.downOutput = AllocateDirect(
-        (size_t)routeCapacity * hidden * scalarBytes);
-    if (cache.gateWeight == nullptr || cache.downWeight == nullptr ||
-        cache.gateScale == nullptr || cache.downScale == nullptr ||
-        cache.sortedTokenIds == nullptr || cache.expertIds == nullptr ||
-        cache.expertCounts == nullptr || cache.expertStarts == nullptr ||
-        cache.numTokensPadded == nullptr || cache.workspace == nullptr ||
-        cache.temporaryOutput == nullptr || cache.gateOutput == nullptr ||
-        cache.downOutput == nullptr) {
+    if (!cache.gateWeight || !cache.downWeight || !cache.gateScale || !cache.downScale ||
+        !AllocateMarlinMoeScratch(cache)) {
         ReleaseCacheStorage(cache);
         return false;
     }
@@ -3781,7 +3802,9 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                              float swigluLimit = 0.0f,
                              const fastllm::Data *prequantizedInput = nullptr,
                              const fastllm::Data *sharedPartial = nullptr,
-                             fastllm::Data *joinedOutput = nullptr, int parallelJoinLayer = -1) {
+                             fastllm::Data *joinedOutput = nullptr, int parallelJoinLayer = -1,
+                             MarlinLayerCache *preparedRank = nullptr, uint8_t **expertTable = nullptr,
+                             bool *tpReduced = nullptr) {
     if (globalIndices == nullptr || scores == nullptr || topk <= 0 ||
         topk > 16 || ownerCount <= 0 ||
         input.dims.empty() || input.dataDevice != fastllm::DataDevice::CUDA) {
@@ -3793,9 +3816,9 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         return false;
     }
 
-    std::shared_ptr<MarlinLayerCache> cache =
-        GetOrBuildLayerCache(weights, weightsBatch, topk,
+    auto owner = preparedRank ? nullptr : GetOrBuildLayerCache(weights, weightsBatch, topk,
             deepSeekV41 ? MarlinLayerCache::kV41BatchRows : MarlinLayerCache::kSmallBatchRows);
+    auto *cache = preparedRank ? preparedRank : owner.get();
     if (cache == nullptr || !cache->ready || input.dims.back() != cache->hidden) {
         return false;
     }
@@ -3868,8 +3891,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
         gemmInput = &quantized;
     }
 
-    const bool groupedRows = rows > 1 &&
-        (deepSeekV41 || rows <= MarlinLayerCache::kSmallBatchRows);
+    const bool groupedRows = expertTable || (rows > 1 &&
+        (deepSeekV41 || rows <= MarlinLayerCache::kSmallBatchRows));
     int chunkRows = std::min(rows, cache->batchRows);
     int tileRows = 8;
     auto *sortedTokenIds = cache->sortedTokenIds;
@@ -4048,8 +4071,8 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                     sortedTokenIds, expertIds,
                     cache->numTokensPadded, chunkScores, topk, false, gateGroups,
                     count, cache->intermediate * 2, cache->hidden,
-                    cache->workspace, cudaStreamPerThread, tileRows == 32 || compactRoutes ? 64 : gateThreadK,
-                    gateThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : gateBlocksPerSm, tileRows, foldMxfp4Bias) ||
+                    cache->workspace, cudaStreamPerThread, expertTable || tileRows == 32 || compactRoutes ? 64 : gateThreadK,
+                    gateThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : gateBlocksPerSm, tileRows, foldMxfp4Bias, expertTable) ||
                 !checkStage("grouped gate/up GEMM")) {
                 return false;
             }
@@ -4065,12 +4088,19 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
                     cache->numTokensPadded, chunkScores, 1, !deepSeekV41, downGroups,
                     routes, cache->hidden, cache->intermediate,
                     cache->workspace, cudaStreamPerThread, downThreadK,
-                    downThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : downBlocksPerSm, tileRows, foldMxfp4Bias) ||
+                    downThreadN, cache->sms, h20Compact ? 4 : tileRows == 32 ? 2 : downBlocksPerSm, tileRows, foldMxfp4Bias,
+                    expertTable ? expertTable + cache->experts : nullptr) ||
                 !checkStage("grouped down GEMM")) {
                 return false;
             }
 
-            reduceRows(chunkIndices, chunkOutput, count);
+            if (tpReduced && ownerRank == 0 && ownerCount == 1 && count == rows &&
+                FastllmCudaCustomAllReduceExpertRows(downOutput, chunkIndices, chunkOutput,
+                    rows, cache->hidden, topk, cache->device)) {
+                *tpReduced = true;
+            } else {
+                reduceRows(chunkIndices, chunkOutput, count);
+            }
             if (!checkStage("grouped EP row reduction")) return false;
         }
         return true;
@@ -4148,6 +4178,129 @@ static bool RunMarlinMoe(const fastllm::Data &input, fastllm::Data &w1,
 }
 
 }  // namespace fastllm_marlin_moe
+
+namespace fastllm {
+using fastllm_marlin_moe::MarlinLayerCache;
+
+struct Mxfp4MarlinRank {
+    MarlinLayerCache scratch;
+    uint8_t **table = nullptr;
+    std::vector<std::pair<void *, bool>> owned;
+    std::vector<bool> moeLayers;
+
+    ~Mxfp4MarlinRank() {
+        if (scratch.device < 0) return;
+        int previous = FastllmCudaGetDevice();
+        FastllmCudaSetDevice(scratch.device);
+        fastllm_marlin_moe::ReleaseDirect(table);
+        for (auto &allocation : owned) {
+            if (allocation.second) FastllmCudaDirectFree(allocation.first);
+            else FastllmCudaFree(allocation.first);
+        }
+        FastllmCudaSetDevice(previous);
+    }
+};
+
+std::shared_ptr<Mxfp4MarlinRank> PrepareMxfp4MarlinRank(int device,
+        const std::vector<std::vector<Data *>> &layers, int hidden, int experts, int topk) {
+    using namespace fastllm_marlin_moe;
+#ifdef CUDA_NO_TENSOR_CORE
+    return {};
+#endif
+    const int arch = FastllmCudaRuntimeArch();
+    if (arch < 80 || hidden <= 0 || hidden % 128 ||
+        experts <= 0 || topk <= 0 || topk > std::min(experts, 16)) return {};
+    int inter = 0;
+    std::set<void *> unique;
+    std::vector<uint8_t *> pointers(layers.size() * 2 * experts, nullptr);
+    for (size_t layer = 0; layer < layers.size(); ++layer) {
+        const auto &ws = layers[layer];
+        if (ws.empty()) continue;
+        if (ws.size() != 2u * (experts + 1) || ws[0] || ws[1] || !ws[3] || ws[3]->dims.size() != 2) return {};
+        if (!inter) inter = ws[3]->dims[1];
+        if (inter <= 0 || inter % 128 || inter > INT_MAX / (2LL * hidden)) return {};
+        for (int e = 0; e < experts; ++e) for (int part = 0; part < 2; ++part) {
+            const Data *w = ws[2 + 2 * e + part];
+            if (!ValidateWeight(w, part ? hidden : 2 * inter, part ? inter : hidden, false) ||
+                w->dataDevice != CUDA || w->dataDeviceIds != std::vector<int>{device} ||
+                w->isFake || w->cudaDataBorrowed || w->IsRepacked || w->cudaNativeNvfp4Layout ||
+                !w->extraCudaData.empty() || !w->extraCudaHalfData.empty() ||
+                !unique.insert(w->cudaData).second) return {};
+            pointers[(layer * 2 + part) * experts + e] = (uint8_t *)w->cudaData;
+        }
+    }
+    if (!inter) return {};
+    const int smem = GetMarlinMoeSharedMemorySize(64, 128);
+    int threads = 0, sms = 0;
+    auto kernel = GetMarlinMoeKernel(64, 128, threads, 8, false, true);
+    cudaFuncAttributes image{};
+    if (!kernel || cudaFuncGetAttributes(&image, kernel) != cudaSuccess ||
+        (image.ptxVersion ? image.ptxVersion : image.binaryVersion) < 80 ||
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || sms <= 0) {
+        cudaGetLastError();
+        return {};
+    }
+    auto rank = std::make_shared<Mxfp4MarlinRank>();
+    auto &s = rank->scratch;
+    s.device = device; s.computeMajor = arch / 10; s.sms = sms;
+    s.hidden = hidden; s.intermediate = inter; s.experts = experts; s.topk = topk;
+    rank->owned.reserve(unique.size());
+    for (const auto &ws : layers) rank->moeLayers.push_back(!ws.empty());
+    rank->table = (uint8_t **)TryAllocateMarlinStorage(pointers.size() * sizeof(uint8_t *));
+    if (!rank->table || !AllocateMarlinMoeScratch(s, size_t(hidden) * inter) ||
+        cudaMemcpyAsync(rank->table, pointers.data(), pointers.size() * sizeof(uint8_t *),
+                        cudaMemcpyHostToDevice, cudaStreamPerThread) != cudaSuccess ||
+        cudaMemsetAsync(s.workspace, 0, size_t(sms) * 4 * sizeof(int), cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess) return {};
+    return rank;
+}
+
+void PackMxfp4MarlinRank(Mxfp4MarlinRank &rank, const std::vector<std::vector<Data *>> &layers) {
+    using namespace fastllm_marlin_moe;
+    auto *scratch = reinterpret_cast<uint32_t *>(rank.scratch.temporaryOutput);
+    auto stream = cudaStreamPerThread;
+    for (const auto &ws : layers) for (size_t slot = 2; slot < ws.size(); ++slot) {
+        auto &w = *ws[slot];
+        const int n = w.dims[0], k = w.dims[1];
+        const int words = n * (k / 8), scales = n * (k / 32);
+        auto *q = static_cast<uint32_t *>(w.cudaData);
+        auto *scale = reinterpret_cast<uint8_t *>(q + words);
+        // The rank's existing reduction workspace stages one permutation at a time.
+        // Both the packed matrix and its permuted scales land at their original addresses.
+        TransposePackedFp4Kernel<<<(words + 255) / 256, 256, 0, stream>>>(q, scratch, n, k / 8);
+        if (cudaGetLastError() != cudaSuccess || !FastllmCudaGptqMarlinRepackStream(scratch, q, k, n, stream))
+            throw std::runtime_error("Failed to repack MXFP4 TP weights in place.");
+        PermuteMxfp4ScalesKernel<<<(scales + 255) / 256, 256, 0, stream>>>(scale, (uint8_t *)scratch, n, k / 32);
+        if (cudaGetLastError() != cudaSuccess ||
+            cudaMemcpyAsync(scale, scratch, scales, cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+            throw std::runtime_error("Failed to permute MXFP4 TP scales in place.");
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("MXFP4 TP weight repack failed.");
+    for (const auto &ws : layers) for (size_t slot = 2; slot < ws.size(); ++slot) {
+        Data &w = *ws[slot];
+        rank.owned.emplace_back(w.cudaData, w.directMemory);
+        w.cudaData = nullptr;
+        w.FreeSpace();
+    }
+    rank.scratch.ready = true;
+}
+
+bool RunMxfp4MarlinTP(Mxfp4MarlinRank &rank, int layer, const Data &input,
+        const Data &ids, const Data &scores, Data &activation, Data &output, bool *tpReduced) {
+    if (tpReduced) *tpReduced = false;
+    auto &s = rank.scratch;
+    if (layer < 0 || size_t(layer) >= rank.moeLayers.size() || !rank.moeLayers[layer] ||
+        input.dataType != BFLOAT16 || input.dims.size() != 2 || ids.dataType != INT32 ||
+        ids.dataDevice != CUDA || scores.dataDevice != CUDA || input.dataDeviceIds != ids.dataDeviceIds ||
+        input.dataDeviceIds != scores.dataDeviceIds || input.dataDeviceIds.size() != 1 || input.dataDeviceIds[0] != s.device ||
+        scores.dataType != FLOAT32 || ids.dims.size() != 2 || ids.dims[0] != input.dims[0] ||
+        ids.dims[1] != s.topk || scores.dims != ids.dims) return false;
+    return fastllm_marlin_moe::RunMarlinMoe<__nv_bfloat16>(input, activation, output, nullptr, 0,
+        (const int32_t *)ids.cudaData, (const float *)scores.cudaData, s.topk, 0, 1, false, 0.0f,
+        nullptr, nullptr, nullptr, -1, &s, rank.table + size_t(layer) * 2 * s.experts, tpReduced);
+}
+}
 
 bool FastllmCudaNVFP4E4M3GroupedMoeSupported(int device) {
 #ifdef CUDA_NO_TENSOR_CORE

@@ -1034,7 +1034,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='Naive Hopper FP8 Indexer prefill，需 FP8 Q/K。auto 使用默认计算，fp8 使用 BF16 候选精排，fp8_direct 直接按 FP8 分数选位，可能改变输出')
     parser.add_argument('--indexer_tp_storage', choices=['replicated', 'layer_shard', 'context_shard'], default='replicated',
                         help='Naive DSA TP Indexer 存储；layer_shard 将各层权重和 K 缓存轮流放到一张卡，广播 TopK，降低显存占用；context_shard 按上下文分片并合并全局 TopK，支持纯显存 KV 和 KVMem；默认各卡复制')
-    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3（含 Naive N0.5 CUDA）或fp4（Qwen3.5 CUDA、DeepSeek-V4.1，或 Naive TP KVMem 的 DSA KV；Naive SWA/Indexer 保持 FP8）')
+    parser.add_argument('--kv_cache_dtype', type = str, default = "auto", help = 'KV Cache类型，可使用auto、float16、bfloat16、fp8_e4m3或fp4。Qwen3.5 CUDA、DeepSeek-V4.1 和 Naive CUDA TP/Attention DP 支持 fp4；Naive 仅压缩 DSA KV，SWA/Indexer 保持 FP8。')
     parser.add_argument('--cuda_embedding', action = 'store_true', help = '在cuda上进行embedding')
     parser.add_argument('--kvmem', type=str, default=None,
                         help='启用主机 KV 缓存；JSON 参数，如 {"max_tokens":32768,"retrieval_interval":64}。默认关闭（--auto 可按预算启用 Qwen4 精确换页），Qwen3/3.5 单请求稀疏检索；Qwen4/QSA 混合推理精确换页；MiMo/Naive CUDA TP 支持多请求精确 DSA KV 缓存，需先设置 --max_batch')
@@ -1078,7 +1078,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = 'Qwen3.5/Qwen4 视觉编码器设备: auto/cpu/cuda/cuda:N；Qwen3.5 CUDA视觉随普通TP设备与比例，多卡时cuda:N不单独覆盖')
     parser.add_argument('--multimodal', action = 'store_true',
                         help = 'Qwen3.5/Qwen3.8启动时加载视觉权重并预分配工作区，再分配KV cache；按processor的图片/视频像素上限预热')
-    parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto')
+    parser.add_argument('--tp', type = str, default = "", help = '线程级张量并行设备；裸数字X表示使用前X张卡，0表示0号卡，也可写 0,1 或 auto。Duo 用此参数选择流水线和视频分块的 GPU，支持 1、2、4、8 张卡。')
     parser.add_argument('--attn-dp-size', type=int, default=1,
                         help='Attention DP组数；组内TP宽度为--tp总卡数/此值，支持DeepSeek V4.1及Naive/MiMo GPU路径')
     parser.add_argument('--ep', type = int, choices = (1, 4, 8), default = None,
@@ -1158,12 +1158,12 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help = "启用 DSpark 并指定每轮候选数；外置草稿配合 --draft 使用，保留 checkpoint 的训练 block size")
     draft_parallel = parser.add_mutually_exclusive_group()
     draft_parallel.add_argument("--dspark_tp_size", "--dspark-tp-size", type = _positive_int, default = None,
-                        help = "Naive/MiMo 外置 DSpark 草稿 TP 数，1 为单卡；默认跟随主模型 CUDA TP，布局不支持时回退单卡；兼容 FASTLLM_DSPARK_TP")
+                        help = "Naive/MiMo 外置 DSpark 草稿 TP 数，1 为单卡；默认使用主模型 CUDA TP 的卡数，dense 草稿用 TP，MoE 草稿用 DP，布局不支持时回退单卡；兼容 FASTLLM_DSPARK_TP")
     draft_parallel.add_argument("--dspark_dp_size", "--dspark-dp-size", type = _positive_int, default = None,
                         help = "Naive/MiMo 外置 DSpark 草稿 DP 副本数；按完整请求分摊计算，增加 BF16 权重副本，KV 按请求分配；与草稿 TP 参数互斥")
     parser.add_argument("--speculative_algorithm", "--speculative-algorithm",
                         dest = "speculative_algorithm", type = str, default = "",
-                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、clover")
+                        help = "投机解码算法；off 关闭，或选择 mtp、dspark、dflash、dfly2、clover")
     parser.add_argument("--speculative_draft_model_path", "--speculative-draft-model-path",
                         "--draft", "--draft_model_path", "--dspark_model",
                         dest = "speculative_draft_model_path", type = str, default = "",
@@ -1174,7 +1174,7 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help="DeepSeek-V4.1 DSpark 草稿专家显存策略：1 要求全驻留，0 关闭全驻留优先；未指定保持现有策略。支持单卡/PP/TP，需 MXFP4 草稿；--auto 会检查预算，显存不足时报错")
     parser.add_argument("--speculative_num_draft_tokens", "--speculative-num-draft-tokens",
                         dest = "speculative_num_draft_tokens", type = int, default = -1,
-                        help = "DFlash/Clover 每轮 block token 数（含 anchor）")
+                        help = "DFlash/DFly2/Clover 每轮 block token 数（含 anchor）")
     parser.add_argument("--speculative_dspark_block_size", "--speculative-dspark-block-size",
                         dest = "speculative_dspark_block_size", type = int, default = -1,
                         help = "外置 DSpark 的训练 block size 校验值；必须与 draft config 一致，候选数使用 --draft_tokens")
@@ -1202,7 +1202,7 @@ def add_server_args(parser):
     parser.add_argument("--model_name", type = str, default = '', help = "部署的模型名称, 调用api时会进行名称核验")
     parser.add_argument("--host", type = str, default="0.0.0.0", help = "API server host")
     parser.add_argument("--port", type = int, default = 8080, help = "API server port")
-    parser.add_argument("--api_key", type = str, default = "", help = "API Key")
+    parser.add_argument("--api_key", "--api-key", type = str, default = "", help = "API Key")
     parser.add_argument("--temperature", type = float, default = None, help = "覆盖服务端默认 temperature，未指定则使用模型默认值")
     parser.add_argument("--top_p", type = float, default = None, help = "覆盖服务端默认 top_p，未指定则使用模型默认值")
     parser.add_argument("--top_k", type = int, default = None, help = "覆盖服务端默认 top_k，未指定则使用模型默认值")
@@ -1236,11 +1236,12 @@ def expand_cudapp_device(device_str):
     return str({f'cuda:{i}': w for i, w in enumerate(weights)})
 
 
-def _configure_embedded_dspark(args):
-    threshold = float(args.speculative_dspark_confidence_threshold)
+def _configure_dspark(args, tokens):
+    threshold = float(getattr(args, "speculative_dspark_confidence_threshold", 0.5))
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("--speculative_dspark_confidence_threshold must be in [0, 1]")
-    os.environ["FASTLLM_DSPARK_TOKENS"] = str(args.dspark)
+    if tokens > 0:
+        os.environ["FASTLLM_DSPARK_TOKENS"] = str(tokens)
     os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(threshold)
     args.speculative_algorithm = "dspark"
 
@@ -1430,9 +1431,18 @@ def make_normal_llm_model(args, startup_progress = None):
                 "--draft_tokens and --dspark specify different token counts")
         dspark_tokens = draft_tokens
         args.dspark = dspark_tokens
-    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash", "clover"):
+    if speculative_algorithm and speculative_algorithm not in ("mtp", "dspark", "dflash", "clover", "dfly2"):
         raise ValueError(
-            "--speculative_algorithm currently supports off, mtp, dspark, dflash or clover")
+            "--speculative_algorithm currently supports off, mtp, dspark, dflash, dfly2 or clover")
+    dfly2_block_size = 0
+    if speculative_algorithm == "dfly2":
+        if mtp or dspark_tokens or speculative_draft_path:
+            raise ValueError("HY4-Flash DFly2 uses the checkpoint's embedded draft weights")
+        width = int(getattr(args, "speculative_num_draft_tokens", -1))
+        width = width if width > 0 else (draft_tokens + 1 if draft_tokens > 0 else 4)
+        if not 2 <= width <= 16 or (draft_tokens > 0 and draft_tokens + 1 != width):
+            raise ValueError("DFly2 requires 2–16 verification rows, including the anchor")
+        dfly2_block_size = width
     if speculative_algorithm == "clover" and (mtp or dspark_tokens or speculative_draft_path or draft_tokens > 0):
         raise ValueError("Clover shares the target model; use --speculative_num_draft_tokens for its block width")
     if speculative_algorithm == "dspark" and mtp > 0:
@@ -1527,7 +1537,7 @@ def make_normal_llm_model(args, startup_progress = None):
         dspark_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or draft_config["dspark_block_size"]
         args.dspark = dspark_tokens
         args.speculative_draft_model_path = speculative_draft_path
-        _configure_embedded_dspark(args)
+        _configure_dspark(args, dspark_tokens)
     elif speculative_draft_path:
         if not os.path.isdir(speculative_draft_path):
             raise ValueError(
@@ -1560,20 +1570,11 @@ def make_normal_llm_model(args, startup_progress = None):
         if getattr(args, "dspark_tp_size", None) is not None and getattr(args, "dspark_dp_size", None) is not None:
             raise ValueError("dspark_tp_size and dspark_dp_size are mutually exclusive")
         if draft_tokens > 0:
-            os.environ["FASTLLM_DSPARK_TOKENS"] = str(draft_tokens)
             args.draft_tokens = draft_tokens
-        confidence_threshold = float(getattr(
-            args, "speculative_dspark_confidence_threshold", 0.5))
-        if not 0.0 <= confidence_threshold <= 1.0:
-            raise ValueError(
-                "--speculative_dspark_confidence_threshold must be in [0, 1]")
-        os.environ["FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"] = str(
-            confidence_threshold)
         args.speculative_draft_model_path = speculative_draft_path
-        args.speculative_algorithm = "dspark"
-    else:
-        if dspark_tokens > 0:
-            _configure_embedded_dspark(args)
+        _configure_dspark(args, draft_tokens)
+    elif dspark_tokens > 0:
+        _configure_dspark(args, dspark_tokens)
 
     usenuma = False
     try:
@@ -1630,6 +1631,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_deepseek_v4_model = False
     is_dots3_note_model = False
     is_clover_model = False
+    is_hy4_flash_model = False
     if (os.path.exists(config_path) or gguf_config is not None):
         try:
             if gguf_config is None:
@@ -1646,6 +1648,7 @@ def make_normal_llm_model(args, startup_progress = None):
             architecture = architectures[0] if architectures else ""
             model_type = config.get("model_type", "")
             is_clover_model = model_type == "clover_moe"
+            is_hy4_flash_model = model_type == "hy_v4_flash"
             is_naive_n05_model = _is_naive_n05_family(config)
             if is_naive_n05_model:
                 is_thread_tp_moe_model = True
@@ -1657,7 +1660,13 @@ def make_normal_llm_model(args, startup_progress = None):
             text_model_type = ""
             if isinstance(config.get("text_config"), dict):
                 text_model_type = config["text_config"].get("model_type", "")
-            is_qwen35_model = (
+            is_loop_model = model_type == "sensenova_loop"
+            if is_loop_model:
+                if args.dtype == "auto":
+                    args.dtype = "bfloat16"
+                if args.atype == "auto":
+                    args.atype = "bfloat16"
+            is_qwen35_model = not is_loop_model and (
                 architecture in (
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
@@ -1665,7 +1674,7 @@ def make_normal_llm_model(args, startup_progress = None):
                 model_type in ("qwen3_5", "qwen3_5_moe") or
                 text_model_type in ("qwen3_5_text", "qwen3_5_moe_text")
             )
-            if is_qwen35_model and getattr(args, "auto", False):
+            if (is_qwen35_model or is_loop_model) and getattr(args, "auto", False):
                 from .auto_config import apply_model_defaults
                 apply_model_defaults(args, config)
                 mtp = args.mtp
@@ -1706,7 +1715,7 @@ def make_normal_llm_model(args, startup_progress = None):
                 if dspark_tokens > 0:
                     # Also refresh defaults for explicit --dspark / GGUF drafts.
                     speculative_algorithm = args.speculative_algorithm
-                    _configure_embedded_dspark(args)
+                    _configure_dspark(args, dspark_tokens)
             if speculative_algorithm == "dspark":
                 if speculative_draft_path and not draft_is_dspark_gguf:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -1770,20 +1779,10 @@ def make_normal_llm_model(args, startup_progress = None):
                             "checkpoint training block size "
                             "(requested=%d, checkpoint=%d)" %
                             (mtp, checkpoint_block))
-                    confidence_threshold = float(getattr(
-                        args, "speculative_dspark_confidence_threshold", 0.5))
-                    if not 0.0 <= confidence_threshold <= 1.0:
-                        raise ValueError(
-                            "--speculative_dspark_confidence_threshold must be "
-                            "in [0, 1]")
                     dspark_tokens = mtp
                     args.dspark = mtp
-                    os.environ["FASTLLM_DSPARK_TOKENS"] = str(mtp)
-                    os.environ[
-                        "FASTLLM_DSPARK_CONFIDENCE_THRESHOLD"
-                    ] = str(confidence_threshold)
-                    args.speculative_algorithm = "dspark"
-                    speculative_algorithm = "dspark"
+                    _configure_dspark(args, dspark_tokens)
+                    speculative_algorithm = args.speculative_algorithm
                     print(
                         "[Fastllm] DeepSeek-V4 --mtp uses the checkpoint's "
                         "embedded DSpark draft weights.",
@@ -1794,9 +1793,11 @@ def make_normal_llm_model(args, startup_progress = None):
                         raise ValueError(
                             "GLM-5.3 MTP uses the checkpoint's embedded "
                             "next-token prediction layer and does not accept an external draft")
-                elif not (is_qwen35_model or is_qwen38_flash_next_model):
+                elif is_loop_model and mtp not in (1, 2):
+                    raise ValueError("SenseNova Loop supports one or two embedded MTP draft tokens")
+                elif not (is_qwen35_model or is_loop_model or is_qwen38_flash_next_model):
                     raise ValueError(
-                        "MTP currently requires a Qwen3.5, Qwen3.8-Flash-Next or GLM-5.3 target, got "
+                        "MTP currently requires a SenseNova-Loop, Qwen3.5, Qwen3.8-Flash-Next or GLM-5.3 target, got "
                         "architecture=%s model_type=%s" %
                         (architecture, model_type))
                 if (not is_deepseek_v4_model and speculative_draft_path and not (
@@ -1898,6 +1899,8 @@ def make_normal_llm_model(args, startup_progress = None):
             if speculative_algorithm:
                 raise
             pass
+    if dfly2_block_size and not is_hy4_flash_model:
+        raise ValueError("--speculative_algorithm dfly2 requires a HY4-Flash checkpoint")
     if is_clover_model:
         from .clover_config import prepare as prepare_clover
         prepare_clover(args, config)
@@ -2125,8 +2128,8 @@ def make_normal_llm_model(args, startup_progress = None):
             raise ValueError("Attention DP requires a DeepSeek V4.1 or Naive/MiMo adapter")
         if is_naive_n05_model and indexer_storage == "layer_shard":
             raise ValueError("Naive Attention DP supports replicated or context_shard Indexer storage")
-        if is_naive_n05_model and args.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
-            raise ValueError("Naive Attention DP supports BF16 or FP8 KV")
+        if is_naive_n05_model and args.kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3", "fp4", "nvfp4", "fp4_e2m1"):
+            raise ValueError("Naive Attention DP supports BF16, FP8 or FP4 KV")
         world = _thread_tp_cuda_device_count(getattr(args, "tp", ""))
         if world < attention_dp or world % attention_dp:
             raise ValueError("--attn-dp-size must divide the total --tp device count")
@@ -2308,7 +2311,8 @@ def make_normal_llm_model(args, startup_progress = None):
                             indexer_dtype = getattr(args, "indexer_dtype", "auto"),
                             indexer_compute_dtype = getattr(args, "indexer_compute_dtype", "auto"),
                             indexer_tp_storage = indexer_storage,
-                            pd_prefill = pd_prefill)
+                            pd_prefill = pd_prefill,
+                            **({"dfly2_block_size": dfly2_block_size} if dfly2_block_size else {}))
         if hybrid_auto_plan is not None:
             model.hybrid_auto_plan = hybrid_auto_plan
         if is_clover_model:

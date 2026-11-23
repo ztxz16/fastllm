@@ -48,7 +48,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool fp32_output = false,
           const bool verify_qb = false,
           const bool verify_qkv = false,
-          const bool dspark_context = false>
+          const bool dspark_context = false,
+          const bool tile_global_scale = false>
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }

@@ -44,14 +44,17 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kBKMajor = true,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
-          uint32_t kSplitKFactor = 1, bool kDeviceGroupedRows = false, bool kScatterRows = false>
+          uint32_t kSplitKFactor = 1, bool kDeviceGroupedRows = false, bool kScatterRows = false,
+          typename GroupedOutput = void, typename RowSelection = void>
 CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const*, cd_dtype_t*> gmem_d,
+sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, void>,
+                                                  cute::conditional_t<kScatterRows, cd_dtype_t* const*, cd_dtype_t*>,
+                                                  GroupedOutput> gmem_d,
                              const cd_dtype_t* gmem_c,
                              __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
                              int* grouped_layout,
                              cute::TmaDescriptor* tensor_map_buffer,
-                             float* gmem_workspace,
+                             cute::conditional_t<cute::is_same_v<RowSelection, void>, float*, RowSelection> gmem_workspace,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
                              const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
@@ -86,7 +89,8 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
     static constexpr uint32_t kKSteps = BLOCK_K / MMA_K;
 
     // Cooperative warp layout: warps split across M and N dimensions
-    static constexpr uint32_t kNWarps = 2;
+    // A 16-row EP tile has only one MMA tile along M. Partition its four math warps along N.
+    static constexpr uint32_t kNWarps = kDeviceGroupedRows && BLOCK_M == MMA_M ? kNumMathWarps : 2;
     static constexpr uint32_t kMWarps = kNumMathWarps / kNWarps;
     static constexpr uint32_t kMTilesPerWarp = BLOCK_M / kMWarps / MMA_M;
     static constexpr uint32_t kNTilesPerWarp = kNTiles / kNWarps;
@@ -111,6 +115,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
     static_assert(!kScatterRows || (kDeviceGroupedRows && kUseTMAStoreEpilogue && !kWithAccumulation &&
                                    kSplitKFactor == 1 && cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>));
     static constexpr uint32_t kNumEpiMSubs = kUseTMAStoreEpilogue ? (BLOCK_M / kEpiSubM) : 0;
+    static constexpr bool kCustomOutput = !cute::is_same_v<GroupedOutput, void>;
     static constexpr uint32_t SMEM_D = kUseTMAStoreEpilogue
         ? static_cast<uint32_t>((BLOCK_N * sizeof(cd_dtype_t) / kSwizzleCDMode) * kSwizzleCDMode * kEpiSubM)
         : 0u;
@@ -145,6 +150,9 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
     if constexpr (kDeviceGroupedRows) {
         static_assert(kGemmType == GemmType::MGroupedContiguous && SHAPE_M == 0);
         shape_m = __ldg(grouped_layout - 1);
+        if constexpr (!cute::is_same_v<RowSelection, void>) {
+            if (shape_m == 0) return;
+        }
     }
     shape_m = SHAPE_M != 0 ? SHAPE_M : shape_m;
     shape_n = SHAPE_N != 0 ? SHAPE_N : shape_n;
@@ -194,7 +202,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
         cute::prefetch_tma_descriptor(&tensor_map_b_base);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
-        if constexpr (!kScatterRows) cute::prefetch_tma_descriptor(&tensor_map_cd);
+        if constexpr (!kScatterRows && !kCustomOutput) cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
     __syncwarp();
 
@@ -215,11 +223,16 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
 
     cudaGridDependencySynchronize();
 
+    constexpr bool kSelectRows = !cute::is_same_v<RowSelection, void>;
+    static_assert(!kSelectRows || (kDeviceGroupedRows && kSplitKFactor == 1));
     // Persistent scheduler
     uint32_t m_block_idx, n_block_idx;
     static constexpr uint32_t kSFKAlignment = (kGranKA > kGranKB ? kGranKA : kGranKB) * 4;
+    // Work on adjacent row tiles so FC2 can consume completed FC1 output early.
+    constexpr uint32_t blocksPerGroup = kSelectRows ? 2 :
+        sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, false>();
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, 1, false, kNumSMs,
-        false, 128u, kSFKAlignment, sched::get_num_1d_blocks_per_group<kGemmType, BLOCK_M, BLOCK_N, kNumSMs, false>(), kSplitKFactor>(
+        false, 128u, kSFKAlignment, blocksPerGroup, kSplitKFactor>(
         shape_m, shape_n, shape_k, grouped_layout);
     const auto get_pipeline = [=](const uint32_t& iter_idx) -> cute::tuple<uint32_t, uint32_t> {
         return {iter_idx % kNumStages, (iter_idx / kNumStages) & 1};
@@ -235,6 +248,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
         if (is_tma_leader) {
             uint32_t last_group_idx = kNumGroups;
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if constexpr (kScatterRows && kSelectRows) {
+                    if (!gmem_workspace.accept(m_block_idx)) continue;
+                    asm volatile("fence.proxy.async.global;" ::: "memory");
+                }
                 // Skip empty/padding tiles in the contiguous grouped layout: m_indices
                 // is -1 for blocks with no routed tokens. The worst-case M_sum reserves a
                 // block per local expert, but at decode only a few are routed; processing
@@ -360,6 +377,10 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
         uint32_t iter_idx = 0;
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+            if constexpr (kScatterRows && kSelectRows) {
+                bool selected = lane_idx == 0 && gmem_workspace.accept(m_block_idx);
+                if (!__shfl_sync(0xffffffff, static_cast<int>(selected), 0)) continue;
+            }
             // Skip empty/padding tiles (m_indices == -1); see the matching check in the
             // producer loop. Both warp groups skip identically, so barriers stay in sync.
             if constexpr (kGemmType == GemmType::MGroupedContiguous) {
@@ -1202,7 +1223,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
             const int64_t cd_batch_offset = kIsBatchedEpilogue
                 ? static_cast<int64_t>(scheduler.current_group_idx) * stride_cd_batch : 0;
 
-            if constexpr (kUseTMAStoreEpilogue) {
+            if constexpr (kCustomOutput) {
+                static_assert(kDeviceGroupedRows && !kScatterRows && !kWithAccumulation && kUseTMAStoreEpilogue);
+                gmem_d.template store<BLOCK_M, BLOCK_N, kMTilesPerWarp, kNTilesPerWarp, kNumMathThreads>(
+                    smem_d_base, shape_n, m_base, n_base, m_tile_base, n_tile_base, lane_idx, accum);
+            } else if constexpr (kUseTMAStoreEpilogue) {
                 #pragma unroll
                 for (uint32_t ms = 0; ms < kNumEpiMSubs; ++ms) {
                     const uint32_t epi_m_start = ms * kEpiSubM;
@@ -1258,18 +1283,36 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
                                 auto* smem_d_bytes = reinterpret_cast<char*>(smem_d_base);
                                 const uint32_t sub_base = sub_tile * kSwizzleCDMode * kEpiSubM;
                                 using pair_store_t = cute::conditional_t<sizeof(cd_dtype_t) <= 2, uint32_t, uint64_t>;
-                                *reinterpret_cast<pair_store_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
-                                    *reinterpret_cast<const pair_store_t*>(p0);
-                                *reinterpret_cast<pair_store_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
-                                    *reinterpret_cast<const pair_store_t*>(p1);
+                                if constexpr (kScatterRows && kSelectRows) {
+                                    *reinterpret_cast<pair_store_t*>(smem_d_base + sub_row0 * BLOCK_N + local_col) =
+                                        *reinterpret_cast<const pair_store_t*>(p0);
+                                    *reinterpret_cast<pair_store_t*>(smem_d_base + sub_row1 * BLOCK_N + local_col) =
+                                        *reinterpret_cast<const pair_store_t*>(p1);
+                                } else {
+                                    *reinterpret_cast<pair_store_t*>(smem_d_bytes + sub_base + sub_row0 * kSwizzleCDMode + sw0) =
+                                        *reinterpret_cast<const pair_store_t*>(p0);
+                                    *reinterpret_cast<pair_store_t*>(smem_d_bytes + sub_base + sub_row1 * kSwizzleCDMode + sw1) =
+                                        *reinterpret_cast<const pair_store_t*>(p1);
+                                }
                             }
                         }
                     }
 
-                    if constexpr (!kScatterRows) cute::tma_store_fence();
+                    if constexpr (!kScatterRows || kSelectRows) cute::tma_store_fence();
                     cutlass::arch::NamedBarrier::sync(kNumMathThreads, 0);
 
-                    if constexpr (kScatterRows) {
+                    if constexpr (kScatterRows && kSelectRows) {
+                        for (uint32_t row = threadIdx.x; row < kEpiSubM; row += kNumMathThreads) {
+                            auto *dst = gmem_d[m_base + epi_m_start + row];
+                            if (!dst) continue;
+                            auto *src = smem_d_base + row * BLOCK_N;
+                            uint32_t size = min(BLOCK_N, shape_n - n_base) * sizeof(cd_dtype_t);
+                            unsigned addr = __cvta_generic_to_shared(src);
+                            asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                                :: "l"(dst + n_base), "r"(addr), "r"(size) : "memory");
+                        }
+                        asm volatile("cp.async.bulk.commit_group; cp.async.bulk.wait_group 0;" ::: "memory");
+                    } else if constexpr (kScatterRows) {
                         // EP return slots belong to the requesting ranks. Null entries mark padded rows.
                         constexpr uint32_t elems = sizeof(uint4) / sizeof(cd_dtype_t);
                         constexpr uint32_t vectors = BLOCK_N / elems;
@@ -1370,7 +1413,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<kScatterRows, cd_dtype_t* const
         } // persistent loop
 
         // Final TMA store drain
-        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1 and !kScatterRows) {
+        if constexpr (kUseTMAStoreEpilogue and kSplitKFactor == 1 and !kScatterRows and !kCustomOutput) {
             if (math_warp_idx == 0 and lane_idx == 0)
                 cute::tma_store_wait<0>();
         }

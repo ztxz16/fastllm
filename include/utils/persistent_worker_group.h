@@ -1,6 +1,7 @@
 #ifndef FASTLLM_PERSISTENT_WORKER_GROUP_H
 #define FASTLLM_PERSISTENT_WORKER_GROUP_H
 
+#include "utils/decode_graph.h"
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -42,7 +43,10 @@ namespace fastllm {
             EnsureLocked(workerKeys);
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                currentTask = task;
+                currentTask = [task, allowed = GraphCaptureScope::Allowed()](int rank) {
+                    GraphCaptureScope capturePolicy(allowed);
+                    task(rank);
+                };
                 currentErrors = &errors;
                 activeCount = (int)workerKeys.size();
                 finishedCount = 0;
@@ -76,7 +80,10 @@ namespace fastllm {
             EnsureLocked(workerKeys, 1);
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                currentTask = task;
+                currentTask = [task, allowed = GraphCaptureScope::Allowed()](int rank) {
+                    GraphCaptureScope capturePolicy(allowed);
+                    task(rank);
+                };
                 currentErrors = &errors;
                 activeCount = (int)workerKeys.size() - 1;
                 finishedCount = 0;

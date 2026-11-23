@@ -43,7 +43,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
             Check(plan.RetainInOrder(&counts) == std::vector<int>({0, -1, 2}), "stable batch retained stale sharing");
             for (auto &key : keys) { pool.ReleasePageIndices(key.pageIndex); key.pagedKVCacheData = nullptr; }
         }
-        for (int count : {1, 256, 512, 513, 1024}) {
+        for (int count : {1, 256, 512, 513, 1024, 1025}) {
             std::vector<Data> roots(count);
             std::vector<std::pair<Data *, Data *>> kv;
             std::vector<GenerationConfig> configs(count);
@@ -226,6 +226,15 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
         ReorderTensorParallelServingCache(&batch.target);
         std::vector<int *> lengths;
         LogitsSelection selection;
+        const auto oldExpected = tpServingState->expectedLengths;
+        const auto oldBindings = tpServingState->cachePointers;
+        const auto oldActive = tpDecodeState;
+        std::shared_ptr<TPDecodeState> preview;
+        Check(PrepareTensorParallelServingDecode(batch.ids, selection, lengths, &batch.target, false, &preview),
+              "graph admission preview failed");
+        Check(preview && tpServingState->expectedLengths == oldExpected &&
+              tpServingState->cachePointers == oldBindings && tpDecodeState == oldActive && lengths.empty(),
+              "admission preview changed live KV bindings or advanced a token");
         Check(PrepareTensorParallelServingDecode(batch.ids, selection, lengths, &batch.target, false),
               "graph preparation failed");
         const int rows = batch.target.Size();

@@ -1,5 +1,23 @@
 #include "fastllm-attention-common.cuh"
 
+#ifdef FASTLLM_ENABLE_FLASHINFER
+#include "devices/cuda/fastllm-dense-prefill.cuh"
+
+cudaError_t fastllm::DensePrefillHalf128(flashinfer::SinglePrefillParams<half, half, half> &params,
+                                          bool causal, cudaStream_t stream,
+                                          unsigned tileQ, unsigned mmaKvLimit) {
+    using namespace flashinfer;
+    using Attention = DefaultAttention<false, false, false, false>;
+    using Params = SinglePrefillParams<half, half, half>;
+    if (causal) {
+        return SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false,
+            MaskMode::kCausal, Attention, Params, false>(params, nullptr, stream);
+    }
+    return SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false,
+        MaskMode::kNone, Attention, Params, false>(params, nullptr, stream, tileQ, mmaKvLimit);
+}
+#endif
+
 template <int BN, int BM, int BK>
 __global__ void HalfFC(
     half * __restrict__ a, half * __restrict__ b, half * __restrict__ c,
@@ -1219,8 +1237,6 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
                 break;
             }
             
-            // This path never splits KV; reflect that in the template dispatch below.
-            half *tmp = nullptr;
             cudaError_t status = cudaSuccess;
             // Pad/Split, the FastLLM allocator, and the consumers below all
             // use the per-thread default stream. Launch FlashInfer on that
@@ -1251,17 +1267,7 @@ bool FastllmCudaHalfAttention(const fastllm::Data &q, const fastllm::Data &k, co
                 );
                 
                 // 调用 FlashInfer prefill 接口，根据 mask_mode 选择不同的 variant
-                if (mask_mode == MaskMode::kCausal) {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kCausal, DefaultAttention<false, false, false, false>,
-                        SinglePrefillParams<half, half, half>, false>(params, tmp, stream);
-                } else {
-                    status = SinglePrefillWithKVCacheDispatched<128, 128, PosEncodingMode::kNone, false, MaskMode::kNone, DefaultAttention<false, false, false, false>,
-                        SinglePrefillParams<half, half, half>, false>(params, tmp, stream);
-                }
-            }
-            
-            if (tmp != nullptr) {
-                FastllmCudaFree(tmp);
+                status = fastllm::DensePrefillHalf128(params, mask_mode == MaskMode::kCausal, stream);
             }
             
             if (status != cudaSuccess) {

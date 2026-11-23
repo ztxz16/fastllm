@@ -143,9 +143,24 @@ template<bool FP8> static void RingCase(int requests, int width, int heads) {
         for (int j = 0; j < width; j += 4)
             groups.push_back({rows[r * width + j], r * width + j, std::min(4, width - j)});
     }
-    constexpr size_t shared = sizeof(SwaQueryStorage<4>) > sizeof(naive_attention_bulk::Storage<128, FP8>)
-        ? sizeof(SwaQueryStorage<4>) : sizeof(naive_attention_bulk::Storage<128, FP8>);
+    size_t shared = std::max(sizeof(SwaQueryStorage<4>), sizeof(naive_attention_bulk::Storage<128, FP8>));
     auto optimized = SwaVerifyQueries<4, FP8>;
+#if CUDART_VERSION >= 12080
+    if constexpr (FP8) {
+        cudaDeviceProp prop{};
+        Check(cudaGetDeviceProperties(&prop, 0));
+        cudaFuncAttributes attr{};
+        auto specialized = SwaVerifyQueries<4, true, true>;
+        if (prop.major == 10 && (prop.minor == 0 || prop.minor == 3)) {
+            Check(cudaFuncGetAttributes(&attr, specialized));
+            if (attr.ptxVersion >= 100) {
+                optimized = specialized;
+                shared = std::max(sizeof(SwaFP8VerifyStorage), sizeof(naive_attention_bulk::Storage<128, true>));
+            }
+        }
+    }
+#endif
+    const float *bias = width == 3 ? nullptr : sink.data;
     auto original = naive_attention_bulk::Decode<128, true, FP8>;
     Check(cudaFuncSetAttribute(optimized, cudaFuncAttributeMaxDynamicSharedMemorySize, shared));
     Check(cudaFuncSetAttribute(original, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -156,7 +171,7 @@ template<bool FP8> static void RingCase(int requests, int width, int heads) {
             SwaVerifyBatch batch{};
             std::copy_n(groups.begin() + first, n, batch.groups);
             optimized<<<dim3(n, heads / 8), 256, shared, cudaStreamPerThread>>>(
-                q.data, batch, sink.data, actual.data, heads, kvHeads);
+                q.data, batch, bias, actual.data, heads, kvHeads, {});
         }
     };
     cudaGraph_t graph; cudaGraphExec_t exec;
@@ -165,7 +180,7 @@ template<bool FP8> static void RingCase(int requests, int width, int heads) {
     Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
     Check(cudaGraphInstantiate(&exec, graph, 0));
     int pass = 0;
-    for (int prefix : {0, 123, 127, 128, 707, 200000, 200001}) {
+    for (int prefix : {0, 123, 127, 128, 707, 200000, 200001, 200002}) {
         std::vector<int> lengths(count);
         std::vector<const void *> ptrs(requests * 2);
         for (int r = 0; r < requests; ++r) {
@@ -178,6 +193,7 @@ template<bool FP8> static void RingCase(int requests, int width, int heads) {
                 if (pass == 4 && i % 7 == 0) lengths[i] = 0;
                 if (pass == 5) lengths[i] = i % 11 ? lengths[i] + (j % 3 ? 0 : 7) : 0;
                 if (pass == 6 && j >= (width + 1) / 2) lengths[i] = 0;
+                if (pass == 7) lengths[i] = 0;
             }
         }
         if (pass == 6) {
@@ -195,7 +211,7 @@ template<bool FP8> static void RingCase(int requests, int width, int heads) {
             naive_attention_bulk::Batch batch{};
             std::copy_n(rows.begin() + first, n, batch.rows);
             original<<<dim3(n, heads / 8), 256, sizeof(naive_attention_bulk::Storage<128, FP8>), cudaStreamPerThread>>>(
-                q.data + size_t(first) * heads * 192, batch, sink.data,
+                q.data + size_t(first) * heads * 192, batch, bias,
                 expected.data + size_t(first) * heads * 128, heads, kvHeads);
         }
         Check(cudaGraphLaunch(exec, cudaStreamPerThread));
@@ -223,6 +239,7 @@ int main() {
             RingCase<false>(17, width, 8);
             RingCase<true>(17, width, 16);
         }
+        RingCase<true>(64, 4, 64);
         RingCase<false>(128, 11, 16);
         RingCase<true>(128, 11, 16);
         for (bool fp8 : {false, true}) {

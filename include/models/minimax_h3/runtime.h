@@ -40,6 +40,10 @@ class Runtime : public nomas::Runtime {
     std::pair<Tensor, Tensor> qkNormRotary(const Tensor &q, const Tensor &k, const Tensor &qWeight,
                                          const Tensor &kWeight, float eps, const Tensor &cos,
                                          const Tensor &sin, int headDim);
+    // Unpack [token, head, Q/K/V, 128] into separate BF16 matrices. Apply optional RoPE to normalized Q/K.
+    std::array<Tensor, 3> unpackHeadQkvNormRotary128(const Tensor &qkv, const Tensor &qWeight,
+                                                     const Tensor &kWeight, float eps,
+                                                     const Tensor *cos = nullptr, const Tensor *sin = nullptr);
     // BF16, 128-wide heads in [Q,K,V] rows. Null cos/sin normalizes refiner Q/K only.
     void qkvNormRotaryInPlace(Tensor &, const Tensor &qWeight, const Tensor &kWeight, float eps,
                               const Tensor *cos = nullptr, const Tensor *sin = nullptr);

@@ -80,7 +80,7 @@ int main(int argc,char **argv) {
         for(const auto &a:commands) commandJson.push_back(a);
         for(float v:world->intrinsics) kJson.push_back(v);
         auto metadata=Json(Json::object{{"prompt",prompt},{"width",width},{"height",height},{"seed",double(seed)},
-            {"vae_decode_precision",bf16Decode?"bf16":"fp32"},{"fps",16},{"actions",commandJson},{"intrinsics",kJson},{"schedule",schedule}}).dump();
+            {"vae_encode_precision","bf16"},{"vae_decode_precision",bf16Decode?"bf16":"fp32"},{"fps",16},{"actions",commandJson},{"intrinsics",kJson},{"schedule",schedule}}).dump();
         write(output+"/metadata.json",metadata.data(),metadata.size());
         if(!traceDir.empty()) {
             write(traceDir+"/metadata.json",metadata.data(),metadata.size());

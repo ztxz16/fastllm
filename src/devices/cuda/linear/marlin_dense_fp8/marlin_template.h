@@ -245,7 +245,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool bf16_output,
           const bool parallel_fp32_reduce,
           const bool fp32_output,
-          const bool verify_qb, const bool verify_qkv, const bool dspark_context>
+          const bool verify_qb, const bool verify_qkv, const bool dspark_context,
+          const bool tile_global_scale>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -411,7 +412,7 @@ __global__ void Marlin(
   float global_scale_f32 = 1.0f;
 
   if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
-    global_scale_f32 = global_scale_ptr[0];
+    if constexpr (!tile_global_scale) global_scale_f32 = global_scale_ptr[0];
   }
 
   constexpr bool has_act_order = group_blocks == 0;
@@ -1777,6 +1778,8 @@ __global__ void Marlin(
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
   auto write_result = [&](bool last) {
+    // Merged projections can retain a distinct tensor scale per output tile.
+    if constexpr (tile_global_scale) global_scale_f32 = global_scale_ptr[slice_col];
     int c_gl_stride = prob_n / 8;
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));

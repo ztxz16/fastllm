@@ -56,7 +56,8 @@ static float Compare(const std::vector<float> &actual,
 }
 
 static void Run(int batch, int keyHeads, int valueHeads, int sequence,
-                DataType gateType, bool outOfPlace, int passes = 1, bool graph = false) {
+                DataType gateType, bool outOfPlace, int passes = 1, bool graph = false,
+                bool preactivated = false) {
     const int channels = (2 * keyHeads + valueHeads) * 128;
     std::vector<float> x(batch * sequence * channels);
     std::vector<float> a(batch * sequence * valueHeads), beta(a.size());
@@ -84,6 +85,17 @@ static void Run(int batch, int keyHeads, int valueHeads, int sequence,
     const std::vector<int> stateShape{batch, valueHeads, 128, 128};
     Init(q, {batch, sequence, channels}, x);
     Init(alpha, {batch, sequence, valueHeads}, a);
+    // These sigmoid results are exactly representable in BF16. A second
+    // sigmoid or use of the raw logits will change both output and state.
+    Data probabilities(gateType);
+    if (preactivated) {
+        std::vector<float> values(beta.size());
+        for (size_t i = 0; i < beta.size(); ++i) {
+            beta[i] = (int(i % 3) - 1) * 100.f;
+            values[i] = (i % 3) * .5f;
+        }
+        Init(probabilities, {batch, sequence, valueHeads}, values);
+    }
     Init(b, {batch, sequence, valueHeads}, beta);
     Init(alog, {valueHeads}, log); Init(dt, {valueHeads}, bias);
     Init(st, stateShape, state); Init(referenceState, stateShape, state);
@@ -93,6 +105,9 @@ static void Run(int batch, int keyHeads, int valueHeads, int sequence,
     Data reference(FLOAT32);
     Init(reference, output.dims, std::vector<float>(output.Count(0)));
     auto candidate = [&]() {
+        if (preactivated)
+            return FastllmCudaGatedDeltaRuleSequence(q, alpha, probabilities, alog, dt, st, output,
+                keyHeads, valueHeads, 128, 128, 1e-6f, outOfPlace ? &next : nullptr, true);
         return FastllmCudaQwen4GatedDeltaRuleDecode(q, alpha, b, alog, dt, st, output,
             keyHeads, valueHeads, 128, 128, 1e-6f, outOfPlace ? &next : nullptr);
     };
@@ -259,6 +274,8 @@ int main() {
             for (bool outOfPlace : {false, true})
                 for (int sequence : {1, 2, 3, 5, 9, 17, 33})
                     Run(sequence % 2 + 1, 4, 12, sequence, dtype, outOfPlace);
+        for (int sequence : {1, 17, 65})
+            Run(1, 4, 12, sequence, BFLOAT16, false, 1, false, true);
         Run(1, 16, 48, 5, FLOAT16, true);
         Run(8, 8, 32, 5, FLOAT32, false);
         for (DataType dtype : {FLOAT32, FLOAT16, BFLOAT16}) {

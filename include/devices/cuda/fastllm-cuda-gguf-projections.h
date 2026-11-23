@@ -1,9 +1,16 @@
 #pragma once
 #include <functional>
+#include <cstddef>
 
 namespace fastllm {
 class Data;
 }
+
+// Project packed Q8_0 weights with float activations and caller-owned Q8_1
+// scratch (rows * columns / 32 blocks). Scratch may be retained in a graph.
+std::size_t FastllmCudaQ8ProjectionScratchBytes(int rows, int columns);
+void FastllmCudaProjectQ8_0(const float *input, const void *weight, float *output, void *scratch,
+                            int rows, int columns, int outputs);
 
 // Resident, bias-free FP16/BF16 projections of the same input.
 // Any number of projections >= 2 may share the call-local Q8 workspace.

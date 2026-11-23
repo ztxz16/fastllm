@@ -11,7 +11,6 @@ import ast
 import ctypes as C
 import functools
 import json
-import os
 from pathlib import Path
 import time
 import typing
@@ -60,7 +59,6 @@ def run(args):
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     torch.manual_seed(42)
     env = official_symbols(args.official)
-    os.environ.setdefault("FASTLLM_NOMAS_PRECISION", "bf16")
     lib = C.CDLL(str(args.library))
     fp = C.POINTER(C.c_float)
     bp = C.POINTER(C.c_uint8)

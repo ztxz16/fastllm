@@ -54,6 +54,22 @@ class AutoConfigTest(unittest.TestCase):
         self.costs = ([4 * GiB] * 8, [1 << 20] * 8, 1 << 20, 1 << 20, 4 * GiB, False)
         self.ram = {'total': 32 * GiB, 'available': 30 * GiB}
 
+    def test_hy4_auto_uses_its_embedded_engram_and_respects_cache_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'config.json').write_text(json.dumps({'model_type': 'hy_v4_flash',
+                'text_config': {'engram_layer_ids': [1]}}))
+            header = json.dumps({'model.layers.1.engram_layer.multi_head_embedding.embedding.weight': {
+                'dtype': 'BF16', 'shape': [1], 'data_offsets': [0, 2]}}).encode()
+            (root / 'model.safetensors').write_bytes(len(header).to_bytes(8, 'little') + header + bytes(2))
+            args = self.args('-p', directory, '--device', 'cuda:1', '--tp', 'off', '--moe_cuda_cache', '0')
+            plan = self.resolve(args)
+            self.assertEqual((args.device, args.moe_device, args.moe_cuda_cache), ('cuda:1', 'numa', 0))
+            self.assertEqual(plan['automatic']['policy'], 'hy4-single-cuda-host-experts')
+            args = self.args('-p', directory, '--auto_gpu_memory_limit', '1g')
+            with self.assertRaisesRegex(ValueError, 'enough memory'):
+                self.resolve(args)
+
     def test_exl3_uses_canonical_numa_weights_with_shared_cuda_cache(self):
         self.mixed_fixture()
         self.ram = {'total':128*GiB, 'available':120*GiB}
@@ -633,6 +649,25 @@ class AutoConfigTest(unittest.TestCase):
             p = auto.resolve(self.args(), self.gpu.__getitem__, hardware=self.hardware, ram=self.ram, use_numa=True)
             self.assertEqual(os.environ['FASTLLM_CUDA_GRAPH'], '1')
             self.assertTrue(p['automatic']['cuda_graph'])
+
+    def test_sensenova_loop_counts_cache_per_visit_and_keeps_explicit_batch(self):
+        config = dict(model_type='qwen3_5_text', num_hidden_layers=4, hidden_size=512,
+                      num_attention_heads=4, num_key_value_heads=2, head_dim=128,
+                      intermediate_size=1024, max_position_embeddings=4096,
+                      linear_num_key_heads=2, linear_num_value_heads=4,
+                      linear_key_head_dim=32, linear_value_head_dim=64,
+                      linear_conv_kernel_dim=4, mtp_num_hidden_layers=1,
+                      layer_types=['full_attention', 'linear_attention'] * 2)
+        metadata = dict(model_type='sensenova_loop', text_config=config,
+                        loop_settings=dict(start=1, end=3, eval_count=2))
+        kv = 2 * 128 * 2 * 2
+        gdn = 4 * (4 * 32 * 64 + (2 * 2 * 32 + 4 * 64) * 4)
+        geometry = memory.geometry(metadata, 'bfloat16', 2)
+        self.assertEqual(geometry.kv, [kv, 0, 2 * kv, 0, kv])
+        self.assertEqual(geometry.state[:4], [0, 6 * gdn, 0, 3 * gdn])
+        for args, batch in ((self.args(), 1), (self.args('--max_batch', '8'), 8)):
+            auto.apply_model_defaults(args, metadata)
+            self.assertEqual((args.max_batch, args.cuda_embedding, args.mtp), (batch, True, 0))
 
     def test_qwen35_auto_uses_embedded_mtp_tp_and_native_context(self):
         config = dict(model_type='qwen3_5_text', num_hidden_layers=64, hidden_size=5120,

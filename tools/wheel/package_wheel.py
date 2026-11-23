@@ -34,6 +34,40 @@ def audit_elf(path, max_glibc):
             'rpath': re.findall(r'\((?:RUNPATH|RPATH)\).*?\[(.*?)\]', dynamic)}
 
 
+def stage_low_latency_licenses(source, package):
+    packaged = set()
+    for dep in ('naivert_projection', 'naivert_dsa', 'naivert_draft', 'naivert_flex'):
+        dest = package / 'licenses' / dep
+        dest.mkdir(parents=True, exist_ok=True)
+        files = [(name, name) for name in ('LICENSE', 'NOTICE', 'UPSTREAM.json')]
+        if dep == 'naivert_flex':
+            files.append(('THIRD_PARTY_NOTICES.upstream.md', 'THIRD_PARTY_NOTICES.md'))
+        for source_name, name in files:
+            shutil.copy2(source / 'third_party' / dep / source_name, dest / name)
+            packaged.add((dest / name).relative_to(package.parent).as_posix())
+    return packaged
+
+
+def stage_demo_assets(source, package):
+    # Copy from current sources even when the binaries were built earlier.
+    demo_files = set()
+    for src, folder, names in (
+        ('qwen_image', 'qwen_image_assets', ('demo.html', 'openapi.json')),
+        ('lingbot_world', 'lingbot_world_assets', ('demo.html', 'server.py', 'convert_assets.py')),
+        ('duo', 'duo_assets', ('live.html', 'avc-player.js', 'presets/default.txt',
+                               'presets/default-256x192.bf16', 'presets/default-512x384.bf16')),
+        ('minimax_h3', 'h3_assets', ('demo.html', 'openapi.json')),
+        ('minimax_h3_image', 'h3_image_assets', ('demo.html', 'openapi.json')),
+        ('fastllm_pytools/ui_plugins/studio', 'h3_image_assets', ('image-workspace.js', 'image-workspace.css')),
+    ):
+        for name in names:
+            target = package / folder / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source / 'tools' / src / name, target)
+            demo_files.add(target.relative_to(package.parent).as_posix())
+    return demo_files
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ['source-dir', 'build-dir', 'output-dir', 'max-glibc', 'cxx', 'strip', 'do-strip']:
@@ -54,26 +88,25 @@ def main():
                         package / 'licenses/flashinfer_sm120_ep')
         shutil.copy2(source / 'tools/fastllm_triton_server.py', package / 'fastllm_triton_server.py')
         shutil.copy2(source / 'tools/scripts/setup.py', stage / 'setup.py')
-        shutil.copy2(build / 'cuda/build_info.json', package / 'build_info.json')
+        build_info = build / 'cuda/build_info.json'
+        shutil.copy2(build_info, package / 'build_info.json')
+        merged = json.loads(build_info.read_text()).get('merged_media', False)
         shutil.copy2(build / 'cuda/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools.so')
         shutil.copy2(build / 'cpu/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools-cpu.so')
         for name in ('minimax_h3_server', 'minimax_h3_generate', 'minimax_h3_image_server', 'minimax_h3_image_generate'):
             shutil.copy2(build / 'cuda/src/models/minimax_h3' / name, package / name)
-        shutil.copy2(build / 'cuda/libfastllm_minimax_h3.so', package / 'libfastllm_minimax_h3.so')
         for name in ('qwen_image_server', 'qwen_image_generate'):
             shutil.copy2(build / 'cuda/src/models/qwen_image' / name, package / name)
-        shutil.copy2(build / 'cuda/libfastllm_qwen_image.so', package / 'libfastllm_qwen_image.so')
-        (package / 'qwen_image_assets').mkdir()
-        for name in ('demo.html', 'openapi.json'):
-            shutil.copy2(source / 'tools/qwen_image' / name, package / 'qwen_image_assets' / name)
-        (package / 'h3_assets').mkdir()
-        for name in ('demo.html', 'openapi.json'):
-            shutil.copy2(source / 'tools/minimax_h3' / name, package / 'h3_assets' / name)
-        (package / 'h3_image_assets').mkdir()
-        for name in ('demo.html', 'openapi.json'):
-            shutil.copy2(source / 'tools/minimax_h3_image' / name, package / 'h3_image_assets' / name)
-        for name in ('image-workspace.js', 'image-workspace.css'):
-            shutil.copy2(source / 'tools/fastllm_pytools/ui_plugins/studio' / name, package / 'h3_image_assets' / name)
+        if merged:
+            shutil.copy2(build / 'cuda/src/models/duo/live/duo_live', package / 'duo_live')
+            licenses = package / 'licenses/duo'
+            shutil.copytree(source / 'tools/wheel/licenses/duo', licenses)
+            shutil.copy2(source / 'third_party/duo_solarx/LICENSE', licenses / 'SolarX-LICENSE')
+        else:
+            for name in ('libfastllm_minimax_h3.so', 'libfastllm_qwen_image.so'):
+                shutil.copy2(build / 'cuda' / name, package / name)
+        demo_files = stage_demo_assets(source, package)
+        license_files = stage_low_latency_licenses(source, package)
         numa = Path(output(args.cxx, '-print-file-name=libnuma.so').strip())
         if not numa.is_file():
             raise RuntimeError('libnuma.so not found; install libnuma-dev in the build environment')
@@ -102,16 +135,18 @@ def main():
             if archive.testzip() is not None:
                 raise RuntimeError('Wheel ZIP integrity check failed')
             expected = {'ftllm/libfastllm_tools.so', 'ftllm/libfastllm_tools-cpu.so',
-                        'ftllm/libnuma.so.1', 'ftllm/libfastllm_minimax_h3.so',
+                        'ftllm/libnuma.so.1',
                         'ftllm/minimax_h3_server', 'ftllm/minimax_h3_generate',
-                        'ftllm/h3_assets/demo.html', 'ftllm/h3_assets/openapi.json',
                         'ftllm/minimax_h3_image_server', 'ftllm/minimax_h3_image_generate',
-                        'ftllm/h3_image_assets/demo.html', 'ftllm/h3_image_assets/openapi.json',
-                        'ftllm/h3_image_assets/image-workspace.js', 'ftllm/h3_image_assets/image-workspace.css',
-                        'ftllm/libfastllm_qwen_image.so', 'ftllm/qwen_image_server', 'ftllm/qwen_image_generate',
-                        'ftllm/qwen_image_assets/demo.html', 'ftllm/qwen_image_assets/openapi.json'}
-            if not expected <= set(archive.namelist()):
-                raise RuntimeError('Wheel is missing required native libraries')
+                        'ftllm/qwen_image_server', 'ftllm/qwen_image_generate',
+                        'ftllm/nomas_demo.html', 'ftllm/ui_plugins/studio/nomas-cafe.webp'}
+            if merged:
+                expected.add('ftllm/duo_live')
+            else:
+                expected.update(('ftllm/libfastllm_minimax_h3.so', 'ftllm/libfastllm_qwen_image.so'))
+            missing = (expected | demo_files | license_files) - set(archive.namelist())
+            if missing:
+                raise RuntimeError('Wheel is missing: ' + ', '.join(sorted(missing)))
         target = dest / wheel.name
         # Publish only after the complete wheel passes the audit and archive checks.
         with tempfile.NamedTemporaryFile(prefix='.wheel-', dir=dest, delete=False) as tmp:

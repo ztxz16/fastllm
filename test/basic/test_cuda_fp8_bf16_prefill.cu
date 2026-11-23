@@ -60,6 +60,24 @@ static void Case(int M, int N, int K, bool bias) {
     FastllmCudaSyncCurrentThreadStream();
     std::vector<__nv_bfloat16> y(size_t(M) * N);
     Check(cudaMemcpy(y.data(), dy.p, y.size() * 2, cudaMemcpyDeviceToHost) == cudaSuccess, "copy");
+    // Compare the same tensor with scales interleaved in the checkpoint or
+    // stored separately. Small cases cover both the bias and bias-free paths.
+    if (M < 512) {
+        Memory plain(size_t(N) * K), scales(size_t(N) * sizeof(float));
+        Check(cudaMemcpy2D(plain.p, K, w.data(), K + 4, K, N, cudaMemcpyHostToDevice) == cudaSuccess,
+              "copy contiguous E4M3 weights");
+        Check(cudaMemcpy(scales.p, ws.data(), size_t(N) * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess,
+              "copy row scales");
+        Check(cudaMemset(dy.p, 0xff, y.size() * sizeof(y[0])) == cudaSuccess, "clear separate-scale output");
+        Check(fastllm_native_prefill::Fp8BFloat16((const __nv_bfloat16 *)dx.p, (const uint8_t *)plain.p,
+                  bias ? biasData : nullptr, (__nv_bfloat16 *)dy.p, M, N, K, (const float *)scales.p),
+              "separate-scale prefill");
+        FastllmCudaSyncCurrentThreadStream();
+        std::vector<__nv_bfloat16> actual(y.size());
+        Check(cudaMemcpy(actual.data(), dy.p, y.size() * sizeof(y[0]), cudaMemcpyDeviceToHost) == cudaSuccess &&
+              std::memcmp(actual.data(), y.data(), y.size() * sizeof(y[0])) == 0,
+              "packed and separate row scales must agree");
+    }
     double err = 0, norm = 0, maxabs = 0;
     int samples = 0;
     for (int r : {0, 1, M / 2, M - 1})

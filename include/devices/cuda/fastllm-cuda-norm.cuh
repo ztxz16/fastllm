@@ -62,9 +62,12 @@ __global__ void RMSNorm(const T *input, const float *weight,
 // Preserve the original 256-thread RMS reduction and 16-bit residual boundary.
 // The common hidden width keeps rounded values in registers, avoiding a
 // global read-after-write dependency before the normalized output store.
-template<typename T, int Width, bool RoundNormalized = false, bool PDL = true>
-__global__ void AddRMSNorm(T *residual, const T *input,
-        const float *weight, T *output, int width, float eps, bool zeroCentered) {
+struct NoNormSideOutput {
+    template<class T> __device__ void operator()(int, int, T) const {}
+};
+template<typename T, int Width, bool RoundNormalized, bool PDL, class Write>
+__device__ __forceinline__ void AddRMSNormBody(T *residual, const T *input, const float *weight,
+        T *output, int width, float eps, bool zeroCentered, Write write) {
     if constexpr (PDL) DependencyStart();
     __shared__ float scratch[8];
     const int columns = Width ? Width : width;
@@ -89,11 +92,20 @@ __global__ void AddRMSNorm(T *residual, const T *input,
             x = values[j];
             residual[offset + d] = Cast<T>(x);
         } else x = Float(residual[offset + d]);
+        T value;
         if constexpr (RoundNormalized) {
             float w = Width ? affine[j] : weight[d];
-            output[offset + d] = Cast<T>(Float(Cast<T>(x * inv)) * w);
-        } else output[offset + d] = Cast<T>(x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f)));
+            value = Cast<T>(Float(Cast<T>(x * inv)) * w);
+        } else value = Cast<T>(x * inv * (weight[d] + (zeroCentered ? 1.f : 0.f)));
+        output[offset + d] = value;
+        write(blockIdx.x, d, value);
     }
+}
+template<typename T, int Width, bool RoundNormalized = false, bool PDL = true>
+__global__ void AddRMSNorm(T *residual, const T *input,
+        const float *weight, T *output, int width, float eps, bool zeroCentered) {
+    AddRMSNormBody<T, Width, RoundNormalized, PDL>(residual, input, weight, output, width, eps,
+                                                  zeroCentered, NoNormSideOutput{});
 }
 // Two original reduction lanes share one physical thread. Keep their partial
 // sums separate until the last virtual-warp addition, preserving the 256-lane

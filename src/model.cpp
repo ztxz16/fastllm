@@ -4,6 +4,7 @@
 #include "model.h"
 #include "fastllm.h"
 #include "weights/safetensors_source.h"
+#include "weights/hy4_flash_experts.h"
 #include "weights/row_concat.h"
 #include "executor.h"
 #ifdef USE_NUMAS
@@ -34,10 +35,12 @@
 #include "qwen3.h"
 #include "qwen3_moe.h"
 #include "hy_v3.h"
+#include "hy4_flash.h"
 #include "qwen3_next.h"
 #include "qwen4_exp.h"
 #include "kimi_k3.h"
 #include "qwen3_5.h"
+#include "sensenova_loop.h"
 #include "clover.h"
 #include "step3p5.h"
 #include "laguna.h"
@@ -593,6 +596,9 @@ namespace fastllm {
             model->model_struct == "qwen3_5" &&
             weightName.find(".mlp.experts.") != std::string::npos &&
             data.dataType == DataType::INT4_GROUP;
+        if (const auto *naive = dynamic_cast<const NaiveN05FlashModel *>(model))
+            data.cudaRepackSource = naive->UsesPackedMoeSource() &&
+                weightName.find(".mlp.experts.") != std::string::npos;
         if ((model->model_type == "deepseek_v4" ||
              model->model_type == "deepseek_v41") && routedExpert >= 0 &&
             !deepSeekV4TensorParallelExperts) {
@@ -976,6 +982,8 @@ namespace fastllm {
             model = (basellm*)(new MoeModel());
         } else if (modelType == "qwen3_moe") {
             model = (basellm*)(new Qwen3MOEModel());
+        } else if (modelType == "hy_v4_flash") {
+            model = new Hy4FlashModel();
         } else if (modelType == "hy_v3" || modelType == "HYV3ForCausalLM") {
             model = (basellm*)(new HyV3Model());
             model->model_type = "hy_v3";
@@ -1018,6 +1026,8 @@ namespace fastllm {
         } else if (modelType == "qwen3") {
             model = new Qwen3Model();
             model->model_type = "qwen3";
+        } else if (modelType == "sensenova_loop") {
+            model = new SenseNovaLoopModel();
         } else if (modelType == "qwen3_5" || modelType == "qwen3_5_moe" || modelType == "qwen3_5_moe_text") {
             model = new Qwen3_5Model();
             model->model_type = modelType;
@@ -1880,6 +1890,32 @@ namespace fastllm {
             return ret;
         }
     };
+
+    // Some W4A16 releases serialize E4M3 block scales as raw U8 bytes.
+    // Their build manifest identifies exactly which matrices use that encoding.
+    static void NormalizeRawNVFP4Scales(const std::string &path, SafeTensors &tensors) {
+        const std::string file = path + "nvfp4_build.json";
+        if (!FileExists(file)) return;
+        std::string error;
+        const auto manifest = json11::Json::parse(ReadAllFile(file), error);
+        if (manifest["format"].string_value() != "nvfp4-w4a16-g16") return;
+        for (const auto &entry : manifest["quantized"].array_items()) {
+            const std::string name = entry.string_value() + ".weight";
+            auto w = tensors.itmeDict.find(name);
+            auto scale = tensors.itmeDict.find(name + "_scale");
+            auto global = tensors.itmeDict.find(name + "_scale_2");
+            AssertInFastLLM(w != tensors.itmeDict.end() && scale != tensors.itmeDict.end() &&
+                            global != tensors.itmeDict.end(), "Missing NVFP4 tensors for " + name);
+            const auto &packed = w->second;
+            auto &block = scale->second;
+            AssertInFastLLM(packed.dtype == "U8" && packed.shape.size() == 2 &&
+                            (block.dtype == "U8" || block.dtype == "F8_E4M3") && block.shape.size() == 2 &&
+                            block.shape[0] == packed.shape[0] && block.shape[1] * 8 == packed.shape[1] &&
+                            global->second.dtype == "F32" && global->second.len == 1,
+                            "Invalid NVFP4 group-16 weights or scales for " + name);
+            block.dtype = "F8_E4M3";
+        }
+    }
 
     static bool IsPackedFP4StorageDType(const std::string &dtype) {
         return dtype == "I8" || dtype == "U8";
@@ -3253,7 +3289,7 @@ namespace fastllm {
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
             {"qwen35moe", "qwen3_5_moe"}, {"qwen3_5_moe", "qwen3_5_moe"},
-            {"qwen4exp", "qwen4_exp"},
+            {"qwen4exp", "qwen4_exp"}, {"hy_v4_flash", "hy_v4_flash"},
             {"glm4_moe", "glm4_moe"}, // glm4_moe
             {"glm-dsa", "glm_moe_dsa"}, {"glm_moe_dsa", "glm_moe_dsa"}, // glm_moe_dsa
             {"glm5next", "glm5_next"}, {"glm5-next", "glm5_next"},
@@ -3355,6 +3391,11 @@ namespace fastllm {
             addAlias(alias.first, alias.second);
         }
 
+        if (model->model_struct == "hy_v4_flash") {
+            const auto heads = GetGGUFArchParam(params, arch, "attention.head_count").array_items();
+            AssertInFastLLM(!heads.empty() && heads.front().int_value() > 0, "Invalid HY4 GGUF head counts.");
+            model->weight.AddDict("num_attention_heads", std::to_string(heads.front().int_value()));
+        }
         if (model->model_struct == "deepseek_v41") {
             for (const auto &alias : std::vector<std::pair<std::string, std::string>>{
                      {"o_lora_rank", "attention.output_lora_rank"}, {"o_groups", "attention.output_group_count"},
@@ -3556,7 +3597,7 @@ namespace fastllm {
             mergeScores.reserve(mergeItems.size());
             for (size_t i = 0; i < mergeItems.size(); i++) {
                 const std::string &pair = mergeItems[i].string_value();
-                if (model->weight.tokenizer.preTokenizer == "joyai-llm")
+                if (model->weight.tokenizer.preTokenizer == "joyai-llm" || model->weight.tokenizer.preTokenizer == "hy_v4")
                     model->weight.tokenizer.bpeMergeRanks.emplace(pair, int(i));
                 const size_t separator = pair.find(' ', 1);
                 if (separator == std::string::npos) {
@@ -4271,6 +4312,8 @@ namespace fastllm {
         }
 
         arch = ConvertGGUFTypeToFastllmType(arch);
+        AssertInFastLLM((arch == "hy_v4_flash") == (params["general.architecture"].string_value() == "hy_v4_flash"),
+                        "HY4 GGUF architecture does not match the original model configuration.");
         if (arch == "deepseek_v41") {
             model->weight.AddDict("model_directory", ParentDirectoryWithSlash(ggufFileNames[0]));
         }
@@ -4321,6 +4364,13 @@ namespace fastllm {
         ReportModelLoadProgress("weights_prepare", 0, 1);
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
+        }
+        if (arch == "hy_v4_flash") {
+            auto *hy = dynamic_cast<Hy4FlashModel *>(model);
+            AssertInFastLLM(hy && hy->UsesHostExperts(), "HY4 GGUF requires hybrid expert placement.");
+            hy->ImportGGUF(params, readGGUFTasks);
+            hy->OnModelWeightsLoaded();
+            return modelOwner;
         }
         if (arch == "deepseek_v41" && params["deepseek41.engram.present"].bool_value()) {
             const std::string name = params["deepseek41.engram.file"].string_value();
@@ -5102,6 +5152,7 @@ namespace fastllm {
             }
         }
         SafeTensors safeTensors(stFiles);
+        NormalizeRawNVFP4Scales(path, safeTensors);
 
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";
@@ -5316,13 +5367,30 @@ namespace fastllm {
                 safeTensors.itmeDict[item.first] = item.second;
         }
         NormalizeSafeTensorSources(config["quantization_config"]["quant_method"].string_value(), safeTensors.itmeDict);
-        {
+        if (config["model_type"].string_value() == "hy_v4_flash") {
+            const auto &text = config["text_config"];
+            for (const auto &layer : text["engram_layer_ids"].array_items()) {
+                const std::string name = "model.layers." + std::to_string(layer.int_value() - 1) +
+                                         ".engram_layer.";
+                AssertInFastLLM(safeTensors.itmeDict.count(name + "multi_head_embedding.embedding.weight") &&
+                                safeTensors.itmeDict.count(name + "lookup_table"),
+                                "Missing HY4-Flash Engram tensors at " + name);
+            }
+        } else {
             const auto &textConfig = config["text_config"].is_object() ? config["text_config"] : config;
             for (const auto &layer : textConfig["engram_layer_ids"].array_items()) {
                 const std::string name = "layers." + std::to_string(layer.int_value()) + ".engram.embed.";
                 AssertInFastLLM(safeTensors.itmeDict.count(name + "weight") && safeTensors.itmeDict.count(name + "scale"),
                     "Checkpoint is missing Engram tables; supply --engram-path or FASTLLM_DSV41_ENGRAM_PATH.");
             }
+        }
+        if (auto *hy = dynamic_cast<Hy4FlashModel *>(model)) {
+            hy->SetConfig(config);
+            for (const auto &entry : safeTensors.itmeDict) {
+                const auto &t = entry.second;
+                hy->AddSource(entry.first, t.fileName, t.dtype, t.intShape, t.data_offsets.at(0), t.bytes);
+            }
+            if (hy->UsesHostExperts()) SplitHy4FlashExperts(safeTensors.itmeDict, config["text_config"]);
         }
         auto tensors = safeTensors.GetSortedItemNames();
         
@@ -5413,6 +5481,16 @@ namespace fastllm {
             }
         }
 
+        auto defaultLinearType = [&](DataType mapped, const std::string &name) {
+            DataType source;
+            if (model->model_type == "sensenova_loop" && mapped == DATA_AUTO_LINEAR &&
+                name.rfind("model.language_model.layers.", 0) == 0 &&
+                TryGetPackedFP4DataType(safeTensors, name, source) && source == NVFP4_BLOCK_16) {
+                return NVFP4_BLOCK_16_E4M3_PACKED;
+            }
+            return mapped;
+        };
+
         int cur = 0;
         long long totalBytes = 0;
         std::set <std::string> allWeightNames; // 所有创建了的weight name
@@ -5439,9 +5517,9 @@ namespace fastllm {
             for (auto &it : tensorMap[tensorName]) {
                 std::string weightName = it.first;
                 allWeightNames.insert(weightName);
-                auto dataType = it.second;
+                auto dataType = defaultLinearType(it.second, tensorName);
                 int ggmlType = -1;
-                if (canApplyDtypeRule(weightName, dataType) &&
+                if (canApplyDtypeRule(weightName, it.second) &&
                     dtypeRules.size() > 0) {
                     int groupCnt = -1;
                     ParseDataType(weightName, dtypeRules, dataType, groupCnt, ggmlType);
@@ -5653,7 +5731,7 @@ namespace fastllm {
                                 std::lock_guard<std::mutex> weightGuard(locker);
                                 destinationWeight = &model->weight.weight.at(weightName);
                             }
-                            auto dataType = it.second;
+                            auto dataType = defaultLinearType(it.second, tensorName);
                             int ggmlType = -1;
 
                             bool isMoeLinear = model->moeLinears.find(weightName) != model->moeLinears.end();
@@ -5665,7 +5743,7 @@ namespace fastllm {
                                     ? ((isAwqModel && !useMoeDataType) ? awqGroupCnt : moeGroupCnt)
                                     : groupCnt;
 
-                            if (canApplyDtypeRule(weightName, dataType) &&
+                            if (canApplyDtypeRule(weightName, it.second) &&
                                 dtypeRules.size() > 0) {
                                 ParseDataType(weightName, dtypeRules, dataType, curGroupCnt, ggmlType);
 /*
@@ -6276,6 +6354,7 @@ namespace fastllm {
             }
         }
         SafeTensors safeTensors(stFiles);
+        NormalizeRawNVFP4Scales(path, safeTensors);
 
         // 2. 创建网络基本信息
         std::string configFile = path + "config.json";

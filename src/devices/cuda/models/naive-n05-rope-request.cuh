@@ -1,4 +1,4 @@
-// One CTA handles one request. All heads use the same BF16-rounded angles;
+// A CTA handles one request or a tile of its query heads. All heads use the same BF16-rounded angles;
 // each multiply, subtraction and final BF16 conversion matches RopeHeadTo.
 template<class Output>
 __device__ __forceinline__ void RotateCachedPair(const BF16 *src, Output dst,
@@ -9,7 +9,7 @@ __device__ __forceinline__ void RotateCachedPair(const BF16 *src, Output dst,
     dst[d + rd / 2] = __float2bfloat16(RoundBF16(b * c) + RoundBF16(a * s));
 }
 
-template<bool Packed, class Batch = RopeCacheBatch, int FixedKvHeads = 0, bool FP4 = false>
+template<bool Packed, class Batch = RopeCacheBatch, int FixedKvHeads = 0, bool FP4 = false, int QueryTile = 0>
 __global__ __launch_bounds__(128) void RequestRope(
 #if CUDART_VERSION >= 12010
         const __grid_constant__
@@ -20,17 +20,25 @@ __global__ __launch_bounds__(128) void RequestRope(
     static_assert(!FP4 || FixedKvHeads == 1, "FP4 compact RoPE requires one KV head");
     const int heads = FixedKvHeads ? 16 : headsArg;
     const int kvHeads = FixedKvHeads ? FixedKvHeads : kvHeadsArg;
-    const int dim = FixedKvHeads ? 192 : dimArg, vd = FixedKvHeads ? 128 : vdArg;
+    const int dim = FixedKvHeads || QueryTile ? 192 : dimArg, vd = FixedKvHeads || QueryTile ? 128 : vdArg;
     const int id = FixedKvHeads ? (FixedKvHeads == 2 ? 0 : 128) : idArg;
-    const int rd = FixedKvHeads ? 64 : rdArg;
+    const int rd = FixedKvHeads || QueryTile ? 64 : rdArg;
     const int window = FixedKvHeads ? (FixedKvHeads == 2 ? 128 : 0) : windowArg;
     const bool ring = FixedKvHeads ? FixedKvHeads == 2 : ringArg;
-    const auto r = RopeRequestRow(batch, blockIdx.x);
+    RopeCacheRow r;
+#if CUDART_VERSION >= 12010
+    if constexpr (std::is_same_v<Batch, VerifyRopeBatch>)
+        r = VerifyRopeRow(batch, blockIdx.x, heads, kvHeads, dim, vd);
+    else
+#endif
+        r = RopeRequestRow(batch, blockIdx.x);
+    const int firstHead = QueryTile ? blockIdx.y * QueryTile : 0;
+    const int queryHeads = QueryTile ? min(QueryTile, heads - firstHead) : heads;
     const int t = threadIdx.x;
     const int past = r.length ? (window ? min(*r.length - 1, window - 1) : *r.length - 1) : r.cachePast;
-    const int row = ring ? ((*r.length - 1) & (kSwaWindow - 1)) : past;
+    const int row = r.ringVerify ? kSwaWindow + r.verifyOffset : ring ? ((*r.length - 1) & (kSwaWindow - 1)) : past;
     if (past < 0) {
-        for (int i = t; i < heads * dim; i += 128) r.q[i] = __float2bfloat16(0.f);
+        for (int i = t; i < queryHeads * dim; i += 128) r.q[firstHead * dim + i] = __float2bfloat16(0.f);
         return;
     }
     if (row >= r.keyRows || row >= r.valueRows) return;
@@ -42,17 +50,27 @@ __global__ __launch_bounds__(128) void RequestRope(
         sine[t] = RoundBF16(sinf(angle));
     }
     __syncthreads();
-    for (int i = t; i < heads * (rd / 2); i += 128) {
-        const int h = i / (rd / 2), d = i % (rd / 2);
+    for (int i = t; i < queryHeads * (rd / 2); i += 128) {
+        const int h = firstHead + i / (rd / 2), d = i % (rd / 2);
         BF16 *dst = r.q + h * dim;
         const BF16 *src = Packed ? r.qkv + h * dim : dst;
         RotateCachedPair(src, dst, d, rd, cosine, sine);
     }
-    if constexpr (Packed) {
+    if constexpr (Packed && QueryTile) {
+        // Eight BF16 elements per lane; the packed 192/128 layout is vector aligned.
+        constexpr int vectors = (192 - 64) / 8;
+        for (int i = t; i < queryHeads * vectors; i += 128) {
+            const int offset = (firstHead + i / vectors) * 192 + 64 + (i % vectors) * 8;
+            *reinterpret_cast<uint4 *>(r.q + offset) = *reinterpret_cast<const uint4 *>(r.qkv + offset);
+        }
+    } else if constexpr (Packed) {
         for (int i = t; i < heads * (dim - rd); i += 128) {
             const int h = i / (dim - rd), d = rd + i % (dim - rd);
             r.q[h * dim + d] = r.qkv[h * dim + d];
         }
+    }
+    if constexpr (QueryTile) {
+        if (blockIdx.y != 0) return; // Only one CTA writes this row's KV and Indexer fields.
     }
     const int *kp = r.pageLen && r.cache ? (const int *)r.cache[2] : r.keyPages;
     const int *vp = r.pageLen && r.cache ? (const int *)r.cache[3] : r.valuePages;

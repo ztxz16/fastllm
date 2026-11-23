@@ -1189,6 +1189,13 @@ namespace fastllm {
             Data &state, int keyHeads, int valueHeads,
             int keyDim, int valueDim, float recurrentEps, Data &output,
             Data *stateOutput = nullptr);
+    // Use a gate already activated in the model dtype (e.g. Qwen3.5 BF16 sigmoid).
+    void GatedDeltaRuleSequence(
+            const Data &qkv, const Data &alpha, const Data &beta,
+            const Data &aLog, const Data &dtBias,
+            Data &state, int keyHeads, int valueHeads,
+            int keyDim, int valueDim, float recurrentEps, Data &output,
+            Data *stateOutput, bool betaIsProbability);
 
     // Qwen4-Exp hyper-connection primitives.  Keeping these behind the regular
     // executor lets CPU and CUDA share one model path while avoiding the many

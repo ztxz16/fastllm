@@ -1,5 +1,6 @@
 #pragma once
 #include "fastllm.h"
+#include "fastllm-mxfp8-projection.h"
 #include "devices/cuda/naive-n05-dsa.h"
 #include "models/naive_indexer_compute.h"
 
@@ -109,6 +110,7 @@ struct FastllmNaiveDraftRow {
     fastllm::Data *key, *value;
     const fastllm::Data *positions, *liveKeys;
     bool shortAttention = false;
+    const void *const *cacheTable = nullptr; // Optional device pair: key, value.
 };
 // Dynamic KV bindings are an INT32 [requests, 4] GPU tensor containing two
 // uint64 pointers (K, V) per request. Update it before replay; the graph owns
@@ -187,6 +189,17 @@ bool FastllmCudaNaiveBatchQkvRopeAppendCache(const fastllm::Data &input,
     const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
     int rotaryDim, float theta, float valueScale, int window, bool ring,
     fastllm::Data &scratch);
+// SM103 BF16 verification, 2–7 independent candidate rows: QKV/RoPE/KV and
+// attention in one cooperative launch. Output storage must already be prepared.
+// Unsupported shapes/resources return false before writes; eight rows retain
+// the faster staged QKV path. All KV bindings remain request-owned.
+bool FastllmCudaNaiveSwaQkvAttention(const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+        const fastllm::Data &liveKeys, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale, int window,
+        const fastllm::Data &sink, fastllm::Data &attention);
 // Convert the retained suffix between chronological and 128-slot ring layout.
 // Uses shared memory only, preserves allocations and host dimensions.
 void FastllmCudaNaiveSwaCacheLayout(fastllm::Data &key, fastllm::Data &value,
@@ -285,6 +298,7 @@ struct FastllmNaivePrefillAttentionItem {
     const fastllm::Data *query, *key, *value, *indices;
     fastllm::Data *output;
     int past;
+    FastllmMxfp8PrefillOutput packed{};
 };
 // Causal full-attention batches. Existing specialized kernels remain preferred;
 // the materialized MMA path shares a bounded workspace across request tiles.
@@ -328,6 +342,7 @@ void FastllmCudaNaiveVerifyAttention(const fastllm::Data &query,
 struct FastllmNaiveDecodeScratch {
     fastllm::Data indexQuery, indexScale, indexScores, topk;
     fastllm::Data attentionScores, attentionPartial, windowKey, windowValue;
+    fastllm::Data attentionCompletion, dsaFrontReady, dsaFused, dsaLayer;
 };
 // One query per independent sequence, up to 2048 selected keys. KV stays in
 // place, and descriptors are kernel arguments. Graph replay reads device lengths
@@ -338,10 +353,25 @@ struct FastllmNaiveDecodeScratch {
 bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
         FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
+        const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, FastllmMxfp8Activation *packed);
 void FastllmCudaNaiveBatchDSADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveDSARow> &rows,
     int heads, int kvHeads, int dim, int valueDim,
     FastllmNaiveDecodeScratch &scratch, fastllm::Data &output);
+// SM103 BF16 DSA front, 1..8 independent rows, short dense KV.
+// False means unsupported, before GPU writes; existing operators remain valid.
+bool FastllmCudaNaiveDSAFront(const fastllm::Data &input,
+        const fastllm::Data &weight, const fastllm::Data &bias,
+        const fastllm::Data &indexWeight, const fastllm::Data &indexNorm,
+        const fastllm::Data &indexBias, fastllm::Data &raw, fastllm::Data &index,
+        fastllm::Data &q, const fastllm::Data &k, const fastllm::Data &v,
+        const fastllm::Data &positions, const std::vector<FastllmNaiveRopeCacheRow> &rows,
+        const std::vector<int> &capacities, const fastllm::Data &liveKeys,
+        const fastllm::Data &sink, int heads, int kvHeads, int dim, int valueDim,
+        int rotaryDim, float theta, float valueScale,
+        FastllmNaiveDecodeScratch &scratch, fastllm::Data &output, bool orderedProjection = false);
 // Independent 128-token SWA rings (QK=192, V=128). Cache descriptors are
 // kernel arguments; liveKeys contains one absolute length per sequence.
 struct FastllmNaiveSWARow {
@@ -357,11 +387,20 @@ void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
     const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
     const fastllm::Data &liveKeys, int heads, int kvHeads,
     fastllm::Data &output);
+void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,
+    const fastllm::Data &sink, const std::vector<FastllmNaiveSWARow> &rows,
+    const fastllm::Data &liveKeys, int heads, int kvHeads,
+    fastllm::Data &output, FastllmMxfp8Activation *packed);
 bool FastllmCudaNaiveDecodeGraphSupported();
+inline constexpr int FastllmNaivePackedNormMinPrefillRows = 2048;
 // BF16 rows; update each residual and preserve RMSNorm rounding.
+// Optional in/out views are cleared if the producer emitted BF16 only.
 void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
     const fastllm::Data &branch, const fastllm::Data &weight,
     float eps, fastllm::Data &output);
+void FastllmCudaNaiveAddDecodeRMSNorm(fastllm::Data &hidden,
+    const fastllm::Data &branch, const fastllm::Data &weight,
+    float eps, fastllm::Data &output, FastllmMxfp8Activation *packed);
 
 void FastllmCudaNaiveAppendDecodeCache(fastllm::Data &key, fastllm::Data &value,
     const fastllm::Data &newKey, const fastllm::Data &newValue,
@@ -504,6 +543,10 @@ void FastllmCudaNaiveClearExpertPrefill();
 // an independent, dead MoE arena until expert dispatch on this stream.
 bool FastllmCudaNaivePrefillRouter(const fastllm::Data &input, const fastllm::Data &weight,
     fastllm::Data &scratch, fastllm::Data &output);
+// Large verification rows use transient BF16 terms in the rank's idle attention arena.
+bool FastllmCudaNaiveVerifyRouter(const fastllm::Data &input, const fastllm::Data &weight,
+    const fastllm::Data &bias, const fastllm::Data &scratch, fastllm::Data &indices, fastllm::Data &scores,
+    int topk, bool normalize, float scale);
 bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
         const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
@@ -518,3 +561,12 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
 void *FastllmCudaNaiveDraftTPCreate(const std::vector<int> &devices);
 void FastllmCudaNaiveDraftTPDestroy(void *group);
 void FastllmCudaNaiveDraftTPReduce(void *group, int rank, fastllm::Data &data);
+
+// NaiveRT-derived SM103 verification indexer + sparse attention. Unsupported
+// configurations return false before writes; scratch belongs to the caller.
+bool FastllmCudaNaiveFusedDSAVerify(const fastllm::Data &query, const fastllm::Data &indexQuery,
+                                    const fastllm::Data &weights, const fastllm::Data &sink,
+                                    const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+                                    const std::vector<FastllmNaiveDSARow> &rows, bool fp8Query, int heads,
+                                    int kvHeads, int dim, int valueDim, FastllmNaiveDecodeScratch &scratch,
+                                    fastllm::Data &output);

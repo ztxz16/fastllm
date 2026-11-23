@@ -9,7 +9,7 @@ import {
   closeFolderPicker, loadFolderPicker, renderFolderPicker, selectCurrentFolder
 } from "../ui_plugins/models/app.js";
 import {
-  renderDownloadValidation, renderDownloadCatalog, fillDownloadForm, selectDownloadPreset,
+  renderDownloadValidation, renderDownloadCatalog, fillDownloadForm, handleCatalogChange,
   handleDownloadChange, scheduleDownloadPreview, startDownload, cancelDownload, refreshDownload,
   renderDownload, useDownloadedModel
 } from "../ui_plugins/downloads/app.js";
@@ -23,7 +23,7 @@ import {
   renderAgentRuntime, refreshAgentRuntime, installAgentRuntime, renderWebUIAvailability,
   openEmbeddedWebUI
 } from "../ui_plugins/studio/launcher.js";
-import {openVideoService, openImageService} from "../ui_plugins/studio/video.js";
+import {openVideoService, openImageService, openInteractiveService} from "../ui_plugins/studio/video.js";
 
 import {
   mountPluginHost
@@ -183,9 +183,11 @@ function cacheElements() {
     "confirmation-modal", "confirmation-icon", "confirmation-kicker",
     "confirmation-title", "confirmation-message", "confirmation-cancel",
     "confirmation-confirm",
-    "toast-region", "download-activity", "download-catalog", "download-form", "download-preset",
-    "download-badge", "download-command", "download-validation", "download-start",
-    "download-cancel", "download-use-model", "download-use-last", "download-status-icon",
+    "toast-region", "download-activity", "download-catalog", "download-form", "download-category", "download-family",
+    "download-versions", "download-options", "download-sources", "download-note", "download-source-panel", "download-source-count",
+    "download-catalog-count", "download-transfer", "download-cache-hint", "download-selection", "download-estimate",
+    "download-target", "download-browse", "download-review", "download-review-value", "download-review-label", "download-command", "download-validation", "download-start",
+    "download-cancel", "download-use-model",
     "download-status-title", "download-status-message", "download-progress-value",
     "download-progress", "download-bytes", "download-files", "download-destination",
     "launcher-address-list", "language-select", "theme-select"
@@ -240,7 +242,6 @@ async function initialize() {
     state.logs = Array.isArray(initialLogs.entries) ? initialLogs.entries : [];
     state.lastLogId = Number(initialLogs.lastId || 0);
     fillForm(state.editingConfig);
-    renderDownloadCatalog();
     renderLauncherAddresses();
     fillDownloadForm(state.downloadDefaults);
     renderRuntime();
@@ -499,7 +500,14 @@ function bindEvents() {
     event.preventDefault();
     await startDownload();
   });
-  elements.downloadPreset.addEventListener("change", selectDownloadPreset);
+  elements.downloadForm.addEventListener("change", handleCatalogChange);
+  elements.downloadReview.addEventListener("click", () => {
+    const target = document.getElementById(elements.downloadReview.getAttribute("aria-controls"));
+    target.scrollIntoView({block: "start"});
+    target.focus({preventScroll: true});
+  });
+  elements.downloadBrowse.addEventListener("click", () =>
+    openFolderPicker(null, elements.downloadBrowse, {input: elements.downloadTarget, directoriesOnly: true}));
   elements.launchForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     await startRuntime();
@@ -610,7 +618,6 @@ function bindEvents() {
   elements.shutdownLauncher.addEventListener("click", shutdownLauncher);
   elements.downloadCancel.addEventListener("click", cancelDownload);
   elements.downloadUseModel.addEventListener("click", useDownloadedModel);
-  elements.downloadUseLast.addEventListener("click", useDownloadedModel);
   elements.languageSelect.addEventListener("change", (event) => changeLocale(event.target.value));
 }
 
@@ -776,7 +783,7 @@ function renderRuntime() {
   elements.openApiInfo.disabled = !runtime.ready || isWebui;
   if (elements.apiInfoDialog.open && (!runtime.ready || isWebui
       || elements.apiInfoDialog.dataset.sessionId !== runtime.sessionId)) elements.apiInfoDialog.close();
-  elements.openEndpoint.textContent = runtime.kind === "image" ? t("Image demo") : runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
+  elements.openEndpoint.textContent = runtime.kind === "interactive" ? t("Interactive demo") : runtime.kind === "image" ? t("Image demo") : runtime.kind === "video" ? t("Video demo") : isWebui ? t("Open WebUI") : t("Open API documentation");
   renderInferenceSpeed();
   renderContextWindow();
   renderWebUIAvailability();
@@ -870,6 +877,11 @@ function basename(value) {
 
 function openEndpoint() {
   if (!state.runtime?.endpoint || !state.runtime.ready) return;
+  if (state.runtime.capabilities?.includes("interactive.demo")) {
+    openInteractiveService(state.runtime.sessionId);
+    switchView("webui");
+    return;
+  }
   if (state.runtime.kind === "image") {
     openImageService(state.runtime.sessionId);
     switchView("webui");
@@ -895,8 +907,8 @@ async function openApiInfo() {
     elements.apiInfoKey.value = info.apiKey;
     const contract = document.getElementById("api-contract");
     const media = info.kind === "video" || info.kind === "image";
-    document.getElementById("api-contract-field").classList.toggle("hidden", !media);
-    contract.value = media ? [info.create, info.status, info.content, info.cancel,
+    document.getElementById("api-contract-field").classList.toggle("hidden", !media && !info.routes);
+    contract.value = info.routes ? info.routes.join("\n") : media ? [info.create, info.status, info.content, info.cancel,
       ...(info.edit ? [info.edit] : []), ...(info.conditioning_health ? [info.conditioning_health] : []),
       "", JSON.stringify(info.request, null, 2),
       ...(info.references ? ["", JSON.stringify({modes: info.modes, keyframes: info.keyframes,
