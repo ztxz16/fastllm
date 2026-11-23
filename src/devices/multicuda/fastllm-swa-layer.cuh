@@ -1,6 +1,6 @@
 #pragma once
-// SM103 TP8 single-row SWA. Existing BF16 weights, ring cache and mailbox are
-// borrowed. QKV, PV and O use BF16 tensor cores without repacking weights.
+// TP8 single-row SWA. QKV and O borrow BF16 or row-major K32 E4M3 weights.
+// Activations and the existing ring cache remain BF16.
 // QKV producers publish per-tile readiness; each attention head waits only for
 // its own Q tiles and the shared K/V tiles. Keep the remaining cooperative barrier
 // before O so all heads have finished consuming the temporary QKV projection.
@@ -12,6 +12,7 @@ using namespace fastllm_swa_output;
 using fastllm::cuda::WarpSum;
 
 constexpr int LayerThreads = 512, LayerBlocks = 128, StagingBytes = 131072;
+constexpr int MxStagingBytes = 128 * 128 * sizeof(BF16); // SWA value staging only.
 constexpr int QkvTiles = 116, RouterThreads = 256, Experts = 256;
 static_assert(QkvTiles + 1 <= MaxBlocks, "QKV readiness must fit the existing epoch allocation");
 __device__ __forceinline__ float RoundBF16(float x) {
@@ -42,10 +43,34 @@ __device__ __forceinline__ void SwaMma(float (&c)[4], unsigned a0, unsigned a1,
 __device__ __forceinline__ int SwaMmaOffset(int row, int k, int rows) {
     return (k / 64) * (rows * 128) + row * 128 + (((k % 64) / 8) ^ (row & 7)) * 16;
 }
+// W8A16 uses the original BF16 activation. Apply the per-K32 weight scale
+// to the FP32 dot, without quantizing the activation or expanding the weight in HBM.
+__device__ __forceinline__ unsigned E4m3Pair(unsigned short packed) {
+    unsigned halfBits = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halfBits) : "h"(packed));
+#endif
+    const auto pair = __float22bfloat162_rn(__half22float2(reinterpret_cast<const __half2 &>(halfBits)));
+    return reinterpret_cast<const unsigned &>(pair);
+}
+__device__ __forceinline__ void MxDot32(float (&sum)[4], const BF16 *weight,
+        const float *scales, int stride, int row, int k, uint4 x) {
+    const auto *bytes = reinterpret_cast<const uint8_t *>(weight);
+    const size_t lo = size_t(row) * stride + k, hi = lo + 8 * stride;
+    const uint2 a = *reinterpret_cast<const uint2 *>(bytes + lo);
+    const uint2 b = *reinterpret_cast<const uint2 *>(bytes + hi);
+    float dot[4] = {};
+    SwaMma(dot, E4m3Pair(a.x), E4m3Pair(b.x), E4m3Pair(a.x >> 16), E4m3Pair(b.x >> 16), x.x, x.y);
+    SwaMma(dot, E4m3Pair(a.y), E4m3Pair(b.y), E4m3Pair(a.y >> 16), E4m3Pair(b.y >> 16), x.z, x.w);
+    // Only lanes 0 mod 4 publish these two accumulator rows.
+    sum[0] = fmaf(dot[0], scales[lo / 32], sum[0]);
+    sum[2] = fmaf(dot[2], scales[hi / 32], sum[2]);
+}
+template<bool Mx = false>
 __device__ __forceinline__ void Output(
         const BF16 *input, const BF16 *weight, BF16 *projected,
         BF16 *hidden,
-        Peers peers, uint64_t *epochs, int rank, const BF16 *branch) {
+        Peers peers, uint64_t *epochs, int rank, const BF16 *branch, const float *scales = nullptr) {
     constexpr int Tile = 32;
     __shared__ BF16 partial[Tile];
     __shared__ uint64_t step;
@@ -61,7 +86,7 @@ __device__ __forceinline__ void Output(
         *generation = step + 1 == Period ? 0 : step + 1;
     }
     // Split K across eight warps for each set of 16 output rows. Read the
-    // original row-major BF16 matrix directly; no packed copy or extra stage.
+    // original row-major matrix directly; no packed copy or extra stage.
     __shared__ float partialO[16][16];
     const int rowGroup = warp / 8, part = warp % 8;
     const int group = lane / 4, quad = lane % 4;
@@ -69,13 +94,17 @@ __device__ __forceinline__ void Output(
 #pragma unroll
     for (int col = part * 32; col < Inner; col += 256) {
         const int k = col + quad * 8;
-        uint4 a0 = *reinterpret_cast<const uint4 *>(
-            weight + size_t(first + rowGroup * 16 + group) * Inner + k);
-        uint4 a1 = *reinterpret_cast<const uint4 *>(
-            weight + size_t(first + rowGroup * 16 + group + 8) * Inner + k);
         uint4 x = *reinterpret_cast<const uint4 *>(input + k);
-        SwaMma(accum, a0.x, a1.x, a0.y, a1.y, x.x, x.y);
-        SwaMma(accum, a0.z, a1.z, a0.w, a1.w, x.z, x.w);
+        if constexpr (Mx) {
+            MxDot32(accum, weight, scales, Inner, first + rowGroup * 16 + group, k, x);
+        } else {
+            uint4 a0 = *reinterpret_cast<const uint4 *>(
+                weight + size_t(first + rowGroup * 16 + group) * Inner + k);
+            uint4 a1 = *reinterpret_cast<const uint4 *>(
+                weight + size_t(first + rowGroup * 16 + group + 8) * Inner + k);
+            SwaMma(accum, a0.x, a1.x, a0.y, a1.y, x.x, x.y);
+            SwaMma(accum, a0.z, a1.z, a0.w, a1.w, x.z, x.w);
+        }
     }
     if (quad == 0) {
         partialO[warp][group] = accum[0];
@@ -273,6 +302,7 @@ __device__ __forceinline__ void AttendStaged(
 // The host launcher also uses these arguments for the following norm/router.
 struct Args {
     const BF16 *branch, *qkvWeight, *oWeight;
+    const float *qkvScales, *oScales;
     BF16 *hidden, *normed, *q, *k, *v, *attn, *projected;
     const float *inputNorm, *postNorm, *sink, *position;
     const int *live;
@@ -305,13 +335,14 @@ __device__ __forceinline__ void WaitQkv(uint64_t *epochs, int tile) {
     } while (!ready);
 #endif
 }
+template<bool Mx>
 static __global__ __launch_bounds__(LayerThreads, 1) void Layer(Args a) {
     auto grid = cooperative_groups::this_grid();
     const int t = threadIdx.x, lane = t % 32, warp = t / 32, g = lane / 4, quad = lane % 4;
     extern __shared__ __align__(128) unsigned char staging[];
     __shared__ __align__(16) BF16 normalized[4096];
     __shared__ float sums[8], partial[LayerThreads / 32][16];
-    if (blockIdx.x < QkvTiles) {
+    if (!Mx && blockIdx.x < QkvTiles) {
         for (int item = t; item < 16 * 512; item += LayerThreads) {
             int row = item / 512, k = item % 512 * 8;
             unsigned dst = unsigned(__cvta_generic_to_shared(staging + SwaMmaOffset(row, k, 16)));
@@ -346,11 +377,15 @@ static __global__ __launch_bounds__(LayerThreads, 1) void Layer(Args a) {
 #pragma unroll 4
         for (int col = warp * 32; col < 4096; col += LayerThreads) {
             int k = col + quad * 8;
-            uint4 a0 = *reinterpret_cast<const uint4 *>(staging + SwaMmaOffset(g, k, 16));
-            uint4 a1 = *reinterpret_cast<const uint4 *>(staging + SwaMmaOffset(g + 8, k, 16));
             uint4 x = *reinterpret_cast<const uint4 *>(normalized + k);
-            SwaMma(c, a0.x, a1.x, a0.y, a1.y, x.x, x.y);
-            SwaMma(c, a0.z, a1.z, a0.w, a1.w, x.z, x.w);
+            if constexpr (Mx) {
+                MxDot32(c, a.qkvWeight, a.qkvScales, 4096, blockIdx.x * 16 + g, k, x);
+            } else {
+                uint4 a0 = *reinterpret_cast<const uint4 *>(staging + SwaMmaOffset(g, k, 16));
+                uint4 a1 = *reinterpret_cast<const uint4 *>(staging + SwaMmaOffset(g + 8, k, 16));
+                SwaMma(c, a0.x, a1.x, a0.y, a1.y, x.x, x.y);
+                SwaMma(c, a0.z, a1.z, a0.w, a1.w, x.z, x.w);
+            }
         }
         if (quad == 0) { partial[warp][g] = c[0]; partial[warp][g + 8] = c[2]; }
         __syncthreads();
@@ -382,7 +417,7 @@ static __global__ __launch_bounds__(LayerThreads, 1) void Layer(Args a) {
     // QKV/attention readers finish before Output overwrites projected and
     // applies the deferred branch residual, preserving its BF16 boundary.
     grid.sync();
-    Output(a.attn, a.oWeight, a.projected, a.hidden, a.peers, a.epochs, a.rank, a.branch);
+    Output<Mx>(a.attn, a.oWeight, a.projected, a.hidden, a.peers, a.epochs, a.rank, a.branch, a.oScales);
 }
 
 // Reuse the same TP mailbox and BF16 boundaries for DSA. Norm belongs to
@@ -391,6 +426,29 @@ static __global__ __launch_bounds__(LayerThreads, 1) void OutputResidual(
         const BF16 *input, const BF16 *weight, BF16 *projected, BF16 *hidden,
         Peers peers, uint64_t *epochs, int rank) {
     Output(input, weight, projected, hidden, peers, epochs, rank, nullptr);
+}
+
+// Same O/TP operation as the full layer, also usable after standalone DSA.
+static __global__ __launch_bounds__(LayerThreads, 1) void MxOutput(
+        const BF16 *input, const BF16 *weight, const float *scales, BF16 *projected,
+        BF16 *hidden, Peers peers, uint64_t *epochs, int rank,
+        const float *gamma, BF16 *normed, float eps) {
+    Output<true>(input, weight, projected, hidden, peers, epochs, rank, nullptr, scales);
+    if (!normed) return; // The following router performs post-norm.
+    cooperative_groups::this_grid().sync();
+    if (blockIdx.x != 0) return;
+    __shared__ float sums[8];
+    float square = 0;
+    const int t = threadIdx.x;
+    if (t < 256) {
+        for (int d = t; d < Width; d += 256) {
+            float x = float(hidden[d]);
+            square += x * x;
+        }
+    }
+    const float inv = rsqrtf(SumWide(square, sums) / Width + eps);
+    for (int d = t; d < Width; d += LayerThreads)
+        normed[d] = __float2bfloat16_rn(RoundBF16(float(hidden[d]) * inv) * gamma[d]);
 }
 
 static __global__ void NormRouter4096(const BF16 *input, const float *weight,

@@ -7,6 +7,8 @@
 #include "utils/utils.h"
 #include <cuda_runtime_api.h>
 #include <array>
+#include "naive_n05_mxfp8_test.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -60,7 +62,7 @@ std::vector<uint8_t> Read(const Data &x) {
 void CopyDevice(Data &dst, const Data &src) {
     Cuda(cudaMemcpy(dst.cudaData, src.cudaData, src.GetBytes(), cudaMemcpyDeviceToDevice));
 }
-void Compare(const Data &actual, const Data &reference, const char *name) {
+double Compare(const Data &actual, const Data &reference, const char *name) {
     auto a = Read(actual), b = Read(reference);
     double error = 0, magnitude = 0;
     for (size_t i = 0; i < actual.Count(0); ++i) {
@@ -77,9 +79,11 @@ void Compare(const Data &actual, const Data &reference, const char *name) {
     }
     // BF16 MMA changes accumulation order, but not the documented BF16
     // materialization boundaries. Use relative L2, including zero outputs.
+    const double relative = std::sqrt(error / (magnitude + 1e-30));
     if (std::sqrt(error) > .003 * std::sqrt(magnitude) + 1e-7)
         throw std::runtime_error(std::string(name) + " relative L2=" +
-                                 std::to_string(std::sqrt(error / (magnitude + 1e-30))));
+                                 std::to_string(relative));
+    return relative;
 }
 struct State {
     Data hidden{BFLOAT16}, normed{BFLOAT16}, q{BFLOAT16}, attn{BFLOAT16}, projected{BFLOAT16};
@@ -100,15 +104,21 @@ struct Tensors {
     State actual, reference, alternate;
     const void **table = nullptr;
     cudaGraphExec_t graph = nullptr;
+    double maxL2 = 0;
     bool hasSink = true, indirect = false;
     FastllmSwaLayerConfig config{8, 1, 192, 128, 64, 128, 1e-6f, 10000.f, 1.f};
-    explicit Tensors(int rank) : actual(rank), reference(rank), alternate(rank) {
+    Tensors(int rank, bool mx) : qkv(mx ? FP8_E4M3 : BFLOAT16), o(mx ? FP8_E4M3 : BFLOAT16), actual(rank), reference(rank), alternate(rank) {
         Init(branch, {1, 1, 4096}, rank); Init(qkv, {1856, 4096}, rank);
         Init(o, {4096, 1024}, rank); Init(routerWeight, {256, 4096}, rank);
         Init(inputNorm, {4096}, rank); Init(postNorm, {4096}, rank); Init(sink, {8}, rank);
         Init(position, {1}, rank); Init(live, {1}, rank);
         Init(kTemp, {1, 1, 192}, rank); Init(vTemp, {1, 1, 128}, rank);
-        Fill(qkv, 31 + rank, .02f); Fill(o, 93 + rank, .02f);
+        if (mx) {
+            FillVerifyMxWeight(qkv, 31 + rank); FillVerifyMxWeight(o, 93 + rank);
+            Init(scratch, {1, 1, 1856}, rank);
+        } else {
+            Fill(qkv, 31 + rank, .02f); Fill(o, 93 + rank, .02f);
+        }
         Fill(inputNorm, 731, .2f, 1.f); Fill(postNorm, 83, .2f, 1.f);
         Fill(routerWeight, 582, .02f); Fill(sink, 17);
         Cuda(cudaMalloc(reinterpret_cast<void **>(&table), 2 * sizeof(void *)));
@@ -133,12 +143,22 @@ struct Tensors {
     void Legacy(State &s, int rank) {
         FastllmCudaNaiveAddDecodeRMSNorm(s.hidden, branch, inputNorm, config.eps, s.normed);
         std::vector<FastllmNaiveRopeCacheRow> rows{{&s.key, &s.value, nullptr}};
-        Require(FastllmCudaNaiveBatchQkvRopeAppendCache(s.normed, qkv, bias, s.q, kTemp, vTemp,
-            position, rows, live, 8, 1, 192, 128, 64, config.theta, config.valueScale, 128, true, scratch),
-            "reference QKV/RoPE failed");
+        const bool mx = qkv.dataType == FP8_E4M3;
+        if (mx) {
+            Require(FastllmCudaBFloat16MatMulFP8E4M3(s.normed, qkv, bias, scratch, 1, 4096, 1856),
+                    "reference MXFP8 QKV failed");
+            Require(FastllmCudaNaiveBatchRopeAppendCache(s.q, kTemp, vTemp, position, rows, live,
+                    8, 1, 192, 128, 64, config.theta, config.valueScale, 128, &scratch, true),
+                    "reference RoPE failed");
+        } else {
+            Require(FastllmCudaNaiveBatchQkvRopeAppendCache(s.normed, qkv, bias, s.q, kTemp, vTemp,
+                position, rows, live, 8, 1, 192, 128, 64, config.theta, config.valueScale, 128, true, scratch),
+                "reference QKV/RoPE failed");
+        }
         std::vector<FastllmNaiveSWARow> attention{{s.key.cudaData, s.value.cudaData}};
         FastllmCudaNaiveBatchSWADecode(s.q, hasSink ? sink : bias, attention, live, 8, 1, s.attn);
-        Require(FastllmCudaBFloat16MatMulBFloat16(s.attn, o, bias, s.projected, 1, 1024, 4096),
+        Require(mx ? FastllmCudaBFloat16MatMulFP8E4M3(s.attn, o, bias, s.projected, 1, 1024, 4096) :
+                     FastllmCudaBFloat16MatMulBFloat16(s.attn, o, bias, s.projected, 1, 1024, 4096),
                 "reference projection failed");
         Require(FastllmCudaCustomAllReduce(s.projected.cudaData, s.projected.cudaData, 4096, BFLOAT16, rank),
                 "reference collective failed");
@@ -169,7 +189,7 @@ struct Tensors {
             if (kind == 11) qw.cudaData = nullptr;
             if (kind == 12) p.cudaData = b.cudaData;
         }
-        return FastllmCudaSwaLayer(b, h, inputNorm, qw, bias, o, postNorm, routerWeight,
+        return FastllmCudaSwaLayer(b, h, inputNorm, rank == 3 && (kind == 2 || kind == 11) ? qw : qkv, bias, o, postNorm, routerWeight,
             hasSink ? sink : bias, position, live, k, v, indirect ? table : nullptr,
             kind == 13 && rank == 3 ? h : q, a, p, n, router, c, rank);
     }
@@ -177,13 +197,14 @@ struct Tensors {
         const char *names[] = {"hidden", "normed", "q", "attention", "projection", "key", "value", "router"};
         auto a = actual.Outputs(), b = reference.Outputs();
         if (rebound) { a[5] = &alternate.key; a[6] = &alternate.value; }
-        for (size_t i = 0; i < a.size(); ++i) Compare(*a[i], *b[i], names[i]);
+        for (size_t i = 0; i < a.size(); ++i) maxL2 = std::max(maxL2, Compare(*a[i], *b[i], names[i]));
     }
 };
 }
 int main(int argc, char **argv) {
     try {
         bool disabled = argc > 1 && std::strcmp(argv[1], "--disabled") == 0;
+        const bool mx = argc > 1 && std::strcmp(argv[1], "--mxfp8") == 0;
         Env("FASTLLM_NAIVE_SWA_FUSION", disabled ? "0" : nullptr);
         Env("FASTLLM_NAIVE_SWA_CORE", nullptr); Env("FASTLLM_NAIVE_SWA_QKV_FUSION", nullptr);
         int count = 0;
@@ -200,7 +221,7 @@ int main(int argc, char **argv) {
         }
         std::array<std::unique_ptr<Tensors>, 8> data;
         std::array<int, 8> accepted{};
-        Parallel([&](int r) { data[r] = std::make_unique<Tensors>(r); });
+        Parallel([&](int r) { data[r] = std::make_unique<Tensors>(r, mx); });
         int cases = 0;
         for (int sink : {0, 1}) for (int length : {0, 1, 63, 127, 128, 129, 8192}) {
             int seed = ++cases;
@@ -256,10 +277,12 @@ int main(int argc, char **argv) {
             if (data[r]->graph) Cuda(cudaGraphExecDestroy(data[r]->graph));
             Cuda(cudaFree(data[r]->table));
         });
+        double maxL2 = 0;
+        for (const auto &rank : data) maxL2 = std::max(maxL2, rank->maxL2);
         FastllmCudaCustomAllReduceReset();
         Parallel([&](int r) { data[r].reset(); });
-        std::printf("SWA layer PASS: enabled=%d, %d reference cases, collective rejection and fixed Graph replay\n",
-                    !disabled, cases);
+        std::printf("SWA layer PASS: enabled=%d, %d reference cases, max relative L2=%.8g, collective rejection and fixed Graph replay\n",
+                    !disabled, cases, maxL2);
         return 0;
     } catch (const std::exception &e) { std::fprintf(stderr, "SWA layer FAIL: %s\n", e.what()); return 1; }
 }

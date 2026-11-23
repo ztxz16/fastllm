@@ -19,7 +19,7 @@ class SwaOutputState {
     uint64_t *epochs[8]{};
     const void *const kernel = (const void *)fastllm_swa_output::OutputNorm<32>;
     bool verifySupported[4]{};
-    bool layerSupported = false, outputRouterSupported = false, rowsSupported = false;
+    bool layerSupported = false, mxLayerSupported = false, mxOutputSupported = false, outputRouterSupported = false, rowsSupported = false;
     bool rowsRouterExpertsSupported = false, rowsMmaSupported = false;
     bool preparedRouterSupported = false, routedRouterSupported = false;
     bool preparedVectorRouterSupported = false, rowsDirectRouterSupported = false;
@@ -43,6 +43,21 @@ public:
                         &eps, &peers, &epochs[rank], &rank};
         return cudaLaunchCooperativeKernel(kernel,
             dim3(128), dim3(256), args, 0, cudaStreamPerThread);
+    }
+    bool MxOutputSupported() const { return mxOutputSupported; }
+    cudaError_t LaunchMxOutput(const void *input, const void *weight, const float *scales,
+            void *projected, void *hidden, const float *gamma, void *normed, float eps,
+            const float *routerWeight, float *router, int rank) {
+        using namespace fastllm_swa_layer;
+        void *standaloneNorm = routerWeight ? nullptr : normed;
+        void *args[] = {&input, &weight, &scales, &projected, &hidden, &peers,
+                        &epochs[rank], &rank, &gamma, &standaloneNorm, &eps};
+        auto status = cudaLaunchCooperativeKernel((const void *)MxOutput,
+            dim3(LayerBlocks), dim3(LayerThreads), args, 0, cudaStreamPerThread);
+        if (status != cudaSuccess || !routerWeight) return status;
+        NormRouter4096<<<Experts, RouterThreads, 0, cudaStreamPerThread>>>(
+            (const BF16 *)hidden, routerWeight, router, gamma, (BF16 *)normed, eps, nullptr);
+        return cudaGetLastError();
     }
     bool OutputRouterSupported() const { return outputRouterSupported; }
     cudaError_t LaunchOutputRouter(const void *input, const void *weight, void *projected,
@@ -189,7 +204,7 @@ public:
                               prepared);
     }
 #endif
-    bool LayerSupported() const { return layerSupported; }
+    bool LayerSupported(bool mx = false) const { return mx ? mxLayerSupported : layerSupported; }
     cudaError_t LaunchLayer(fastllm_swa_layer::Args args, int rank) {
         using namespace fastllm_swa_layer;
         args.peers = peers;
@@ -197,8 +212,8 @@ public:
         args.rank = rank;
         void *params[] = {&args};
         cudaError_t status = cudaLaunchCooperativeKernel(
-            (const void *)Layer, dim3(LayerBlocks), dim3(LayerThreads),
-            params, StagingBytes, cudaStreamPerThread);
+            args.qkvScales ? (const void *)Layer<true> : (const void *)Layer<false>, dim3(LayerBlocks), dim3(LayerThreads),
+            params, args.qkvScales ? MxStagingBytes : StagingBytes, cudaStreamPerThread);
         if (status != cudaSuccess) return status;
         NormRouter4096<<<Experts, RouterThreads, 0, cudaStreamPerThread>>>(
             args.hidden, args.routerWeight, args.routerOut, args.postNorm,
@@ -237,22 +252,25 @@ private:
             const char *value = std::getenv(name);
             if (value && std::strcmp(value, "1") != 0) stagesEnabled = false;
         }
-        layerSupported = stagesEnabled;
-        if (layerSupported) for (int device : requested) {
+        auto canLaunchLayer = [&](const void *full, int shared, int minPtx) {
             using namespace fastllm_swa_layer;
-            const void *full = (const void *)fastllm_swa_layer::Layer;
-            cudaDeviceProp p{}; cudaFuncAttributes attributes{}; int active = 0;
-            if (cudaSetDevice(device) != cudaSuccess ||
-                cudaGetDeviceProperties(&p, device) != cudaSuccess ||
-                cudaFuncSetAttribute(full, cudaFuncAttributeMaxDynamicSharedMemorySize, StagingBytes) != cudaSuccess ||
-                cudaFuncGetAttributes(&attributes, full) != cudaSuccess ||
-                attributes.ptxVersion < 80 ||
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, full, LayerThreads, StagingBytes) != cudaSuccess ||
-                active * p.multiProcessorCount < LayerBlocks) {
-                layerSupported = false;
-                cudaGetLastError();
+            if (!stagesEnabled) return false;
+            for (int device : requested) {
+                cudaDeviceProp p{}; cudaFuncAttributes attributes{}; int active = 0;
+                if (cudaSetDevice(device) != cudaSuccess || cudaGetDeviceProperties(&p, device) != cudaSuccess ||
+                    cudaFuncSetAttribute(full, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) != cudaSuccess ||
+                    cudaFuncGetAttributes(&attributes, full) != cudaSuccess || attributes.ptxVersion < minPtx ||
+                    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, full, LayerThreads, shared) != cudaSuccess ||
+                    active * p.multiProcessorCount < LayerBlocks) {
+                    cudaGetLastError();
+                    return false;
+                }
             }
-        }
+            return true;
+        };
+        layerSupported = canLaunchLayer((const void *)fastllm_swa_layer::Layer<false>, fastllm_swa_layer::StagingBytes, 80);
+        mxLayerSupported = canLaunchLayer((const void *)fastllm_swa_layer::Layer<true>, fastllm_swa_layer::MxStagingBytes, 89);
+        mxOutputSupported = canLaunchLayer((const void *)fastllm_swa_layer::MxOutput, 0, 89);
         // Every schedule reuses the established mailbox and must be resident
         // on all ranks. The direct-input query tile falls back to the original
         // N8 staging schedule when its required resources are unavailable.

@@ -6,6 +6,7 @@
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "utils/utils.h"
 #include <cuda_runtime_api.h>
+#include "naive_n05_mxfp8_test.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -59,14 +60,16 @@ struct Tensors {
     int rows = 1;
     cudaGraphExec_t graph = nullptr;
     double maxL2 = 0;
-    explicit Tensors(int rank, int count, bool exact = false) : ordered(exact), rows(count) {
+    explicit Tensors(int rank, int count, bool exact = false, bool mx = false) : w(mx ? FP8_E4M3 : BFLOAT16), ordered(exact), rows(count) {
         // Two logical requests also use the same flattened-row contract.
         auto shape = [&](int width) { return rows == 8 ? std::vector<int>{2, 4, width} : std::vector<int>{1, rows, width}; };
         Init(x, shape(1024), rank); Init(w, {4096, 1024}, rank); Init(n, {4096}, rank);
         for (auto *a : {&p, &h, &y, &referenceP, &referenceH, &referenceY}) Init(*a, shape(4096), rank);
         Init(routerWeight, {256, 4096}, rank); Init(router, shape(256), rank); Init(referenceRouter, shape(256), rank);
         Fill(routerWeight, 89, .01f);
-        Fill(w, 19 + rank, .02f); Fill(n, 731, 1.f);
+        if (mx) FillVerifyMxWeight(w, 19 + rank);
+        else Fill(w, 19 + rank, .02f);
+        Fill(n, 731, 1.f);
     }
     void Reset(int seed, int rank) {
         Fill(x, seed * 17 + rank, seed % 3 == 0 ? 10.f : 1.f);
@@ -80,7 +83,8 @@ struct Tensors {
         auto &out = reference ? referenceP : p;
         auto &hidden = reference ? referenceH : h;
         auto &normed = reference ? referenceY : y;
-        Require(FastllmCudaBFloat16MatMulBFloat16(x, w, empty, out, rows, 1024, 4096), "reference projection failed");
+        Require(w.dataType == FP8_E4M3 ? FastllmCudaBFloat16MatMulFP8E4M3(x,w,empty,out,rows,1024,4096) :
+                FastllmCudaBFloat16MatMulBFloat16(x, w, empty, out, rows, 1024, 4096), "reference projection failed");
         Require(FastllmCudaCustomAllReduceRows(out.cudaData, out.cudaData, rows * 4096, 4096, BFLOAT16, rank), "reference collective failed");
         FastllmCudaNaiveAddDecodeRMSNorm(hidden, out, n, 1e-6f, normed);
         if (withRouter) Require(FastllmCudaNaiveRouterSigmoid(normed, routerWeight, reference ? referenceRouter : router), "reference router");
@@ -141,7 +145,7 @@ struct Tensors {
             beforeY == Read(y) && beforeRouter == Read(router), "cold capture was not a clean fallback");
     }
     void Compare() {
-        if (!withRouter && rows == 1) {
+        if (!withRouter && rows == 1 && w.dataType == BFLOAT16) {
             Require(Read(p) == Read(referenceP), "projection/reduction differs");
             Require(Read(h) == Read(referenceH), "residual differs");
             Require(Read(y) == Read(referenceY), "norm differs");
@@ -182,10 +186,11 @@ struct Tensors {
 }
 int main(int argc, char **argv) {
     try {
-        bool disabled = false, benchmark = false, mma = false;
+        bool disabled = false, benchmark = false, mma = false, mx = false;
         for (int i = 1; i < argc; ++i) {
             disabled |= std::strcmp(argv[i], "--disabled") == 0;
             benchmark |= std::strcmp(argv[i], "--bench") == 0;
+            mx |= std::strcmp(argv[i], "--mxfp8") == 0;
             mma |= std::strcmp(argv[i], "--mma") == 0;
         }
 #ifdef _WIN32
@@ -210,11 +215,13 @@ int main(int argc, char **argv) {
         const std::vector<int> devices{0, 1, 2, 3, 4, 5, 6, 7};
         if (!FastllmInitNccl(devices) || !FastllmCudaCustomAllReduceInit(devices)) return 77;
         bool firstCase = true, firstEightRows = true;
-        for (int shape : {1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 8, -3, -8, 1, 0}) {
+        const std::vector<int> shapes = mx ? std::vector<int>{1} :
+            std::vector<int>{1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 8, -3, -8, 1, 0};
+        for (int shape : shapes) {
             const int rows = shape ? std::abs(shape) : 1;
             const bool ordered = shape <= 0;
             std::array<std::unique_ptr<Tensors>, 8> data;
-            Parallel([&](int r) { data[r] = std::make_unique<Tensors>(r, rows, ordered); data[r]->allowMma = mma; });
+            Parallel([&](int r) { data[r] = std::make_unique<Tensors>(r, rows, ordered, mx); data[r]->allowMma = mma; });
             std::array<int, 8> accepted{};
             const bool expect = supported && !disabled && rows <= 8;
             if (firstCase) {
@@ -344,7 +351,7 @@ int main(int argc, char **argv) {
             Parallel([&](int r) { data[r].reset(); });
             std::printf("Attention output PASS: rows=%d enabled=%d max_row_L2=%.9g; numerical/collective rejection/Graph replay\n", rows, expect, maxL2);
         }
-        if (supported && !disabled) {
+        if (supported && !disabled && !mx) {
             // Queue different row counts without intervening host/GPU waits.
             // All graphs share the same epoch/mailbox, including OutputNorm's
             // one-row completion counter. Keep their tensors alive throughout.
