@@ -199,6 +199,10 @@ __global__ void fusedWindowDecode(VerifyPrefillParams p, WindowInput in, __nv_bf
 #if CUDART_VERSION >= 12080 && __CUDA_ARCH__ == 1200
     if constexpr (Cluster) asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
 #endif
+#if CUDART_VERSION >= 12080 && __CUDA_ARCH__ >= 900
+    // Let the output projection fetch weights during the window scan.
+    if constexpr (Cluster) asm volatile("griddepcontrol.launch_dependents;");
+#endif
     __syncthreads(); // Only the owner of the newest split reads the appended token.
     if (split >= firstSplit && split < active) {
         const int begin = part.origin + split * part.chunk;

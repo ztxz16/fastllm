@@ -19,6 +19,9 @@ struct FastllmBf16MmaProjections {
     bool (*cappedLogits)(const void *input, const void *weight, float *output, int rows, int width, int vocab, float cap);
 };
 const FastllmBf16MmaProjections *FastllmCudaGetBf16MmaProjections();
+// A one-row BF16 projection can stage its weights before its producer finishes.
+// Returns nullptr when the compiled kernel cannot wait on a programmatic dependency.
+FastllmBf16MmaProjections::Project FastllmCudaGetPdlBf16Gemv();
 void FastllmCudaBf16ExactRows(const void *input, const void *weight, void *output,
                              int rows, int width, int columns);
 // Preserve the singleton GEMV tree when the projection feeds recurrent state or routing.

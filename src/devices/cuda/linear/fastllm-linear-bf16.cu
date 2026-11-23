@@ -45,7 +45,7 @@ typedef union __align__(16) _union_bf16_8 {
     __nv_bfloat162 out2[4];
 } union_bf16_8;
 
-template <int THREAD_PER_BLOCK, int PART, bool GRID_BATCH = false>
+template <int THREAD_PER_BLOCK, int PART, bool GRID_BATCH = false, bool Pdl = false>
 __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat16 *B, __nv_bfloat16 *C, __nv_bfloat16 *bias, int m, int k) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
@@ -66,11 +66,25 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0;
 
     const __nv_bfloat16 *baseB = B + p * m;
+    // Weight-first PDL scheduling follows Basalt v0.5.6 native_mmvq.cu (third_party/basalt/LICENSE).
+    // A single decode row has at most two vector loads per lane in this variant.
+    // Weights are immutable. Wait before reading the activation or writing output.
+    uint4 firstWeight, secondWeight;
+    if constexpr (Pdl) {
+        static_assert(PART == 1 && !GRID_BATCH);
+        if (tid * 8 < m) firstWeight = *reinterpret_cast<const uint4 *>(baseB + tid * 8);
+        if ((tid + THREAD_PER_BLOCK) * 8 < m)
+            secondWeight = *reinterpret_cast<const uint4 *>(baseB + (tid + THREAD_PER_BLOCK) * 8);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+    }
 
     if (m % 8 == 0) {
 #pragma unroll
         for (int i = tid * 8; i < m; i += THREAD_PER_BLOCK * 8) {
-            regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
+            if constexpr (Pdl) regB.in = i < THREAD_PER_BLOCK * 8 ? firstWeight : secondWeight;
+            else regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 regA.in = *reinterpret_cast<const uint4 *>(A + x * m + i);
@@ -168,6 +182,36 @@ void *FastllmCudaV41IndexHeadGemvKernel() {
     return (void *)FastllmGemvBf16Bf16Kernel2MultiRow<256, 6>;
 }
 #endif
+
+// Selected during model initialization, outside CUDA graph capture.
+FastllmBf16MmaProjections::Project FastllmCudaGetPdlBf16Gemv() {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080
+    cudaFuncAttributes attributes{};
+    if (cudaFuncGetAttributes(&attributes, FastllmGemvBf16Bf16Kernel2MultiRow<256, 1, false, true>) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    if (attributes.ptxVersion >= 90 && attributes.binaryVersion >= 90)
+        return [](const void *input, const void *weight, void *output, int rows, int width, int columns) {
+            if (rows != 1 || width <= 256 || width > 4096 || width % 8 || columns < 1 ||
+                ((reinterpret_cast<uintptr_t>(weight) | reinterpret_cast<uintptr_t>(input)) & 15)) return false;
+            cudaLaunchAttribute attr{};
+            attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attr.val.programmaticStreamSerializationAllowed = 1;
+            cudaLaunchConfig_t config{};
+            config.gridDim = columns;
+            config.blockDim = 256;
+            config.stream = cudaStreamPerThread;
+            config.attrs = &attr;
+            config.numAttrs = 1;
+            auto status = cudaLaunchKernelEx(&config, FastllmGemvBf16Bf16Kernel2MultiRow<256, 1, false, true>,
+                (__nv_bfloat16 *)input, (__nv_bfloat16 *)weight, (__nv_bfloat16 *)output, (__nv_bfloat16 *)nullptr, width, columns);
+            if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+            return true;
+        };
+#endif
+    return nullptr;
+}
 
 // The scalar reference has 256 leaves. Each leaf sums two eight-product
 // groups, then a compensated binary tree reduces the 256 partials to BF16.

@@ -383,7 +383,7 @@ template <typename Residual = float, typename T> Rows<Residual> convolutions(con
 }
 class Decoder final : public Runtime {
     Config c;
-    enum class Projection { Default, DecodeHead, AttentionMma, DraftHead };
+    enum class Projection { Default, WindowOutput, DecodeHead, AttentionMma, DraftHead };
     bool decodeArithmetic = false;
     const FastllmBf16MmaProjections *bf16Mma = nullptr;
     Placement placement;
@@ -424,6 +424,7 @@ class Decoder final : public Runtime {
     Matrix graphLogits, unitScale, splitScratch;
     WindowDecodeKernel windowDecodeKernel = WindowDecodeKernel::Paged;
     bool windowDecodePdl = false;
+    FastllmBf16MmaProjections::Project windowOutputGemv = nullptr;
     int smCount = 0, sm120GlobalSplits = 0, verifyAttentionSplits = 0;
     bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
     bool bf16WindowBias = false, batchedController = false, fusedPrefillController = false;
@@ -451,6 +452,8 @@ class Decoder final : public Runtime {
         const int n = x.rows / groups, m = x.cols;
         auto *matrix = static_cast<T *>(w.cudaData) + size_t(offset) * m;
         if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<U, T>) {
+            if (mode == Projection::WindowOutput && windowOutputGemv(x.p, matrix, out.p, n, m, columns))
+                return;
             if (mode == Projection::DraftHead && bf16Mma &&
                 bf16Mma->draftLogits(x.p, matrix, out.p, n, m, columns))
                 return;
@@ -994,8 +997,10 @@ class Decoder final : public Runtime {
         else if (kvType == BFLOAT16) attended = attend<__nv_bfloat16, T>(inputs, att, local, batch, slot);
         else attended = attend<float, T>(inputs, att, local, batch, slot);
         const bool newBlock = physical % c.residualBlock == 0;
+        const bool overlapWindow = windowOutputGemv && local && kvType == FLOAT16 && x.rows == 1 &&
+            batch.front().decode && !batch.front().timeline && !usesVerifyArithmetic(batch);
         auto residual =
-            convolutions(linear(attended, att + "wo_ud.weight", h, 1, attentionProjection(batch)), param(pre + "attn_sconv.weight", h * c.conv),
+            convolutions(linear(attended, att + "wo_ud.weight", h, 1, overlapWindow ? Projection::WindowOutput : attentionProjection(batch)), param(pre + "attn_sconv.weight", h * c.conv),
                          {}, 1, c.conv, batch, slot, 2, newBlock ? Rows<R>{} : x);
         if (newBlock)
             blocks.push_back(x);
@@ -1391,6 +1396,7 @@ class Decoder final : public Runtime {
             if (c.window > 0 && c.heads == 3 * c.kvHeads && c.relative == 16 && c.extent % 4 == 0)
                 windowDecodeKernel = configureWindowDecode(p.gpu, c.kvHeads, verifyAttentionSplits);
 #if CUDART_VERSION >= 12080
+            if (windowDecodeKernel == WindowDecodeKernel::Cluster) windowOutputGemv = FastllmCudaGetPdlBf16Gemv();
             windowDecodePdl = sm120GlobalSplits > 0 &&
                 configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedWindowDecode);
 #endif
