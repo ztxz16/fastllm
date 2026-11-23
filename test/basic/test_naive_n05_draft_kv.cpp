@@ -127,7 +127,8 @@ static void CheckMaskedCommit() {
     Data norm(FLOAT32, {dim}, std::vector<float>(dim, 0.75f));
     norm.ToDevice(CUDA, std::vector<int>{device});
     Data scratch = BF({1, 512}, 123);
-    Data targetPairs(INT32, {batch, 2}); targetPairs.Allocate();
+    constexpr int bucket = batch + 3;
+    Data targetPairs(INT32, {bucket, 2}); targetPairs.Allocate();
     targetPairs.ToDevice(CUDA, std::vector<int>{device});
     for (int i = 0; i < batch; ++i) {
         Data initial = BF({1, window - 1, width}, i * 71);
@@ -164,7 +165,7 @@ static void CheckMaskedCommit() {
                 auto off = (size_t)pair.first.dims[1] * width;
                 auto *v = (uint16_t *)pair.second.cudaData + off;
                 slots.push_back({(uint16_t *)pair.first.cudaData + off, v, (float *)norm.cudaData,
-                                 live[i].committed, (int *)targetPairs.cudaData + 2 * i});
+                                 live[i].committed, (int *)targetPairs.cudaData + 2 * i, i + 1 == batch ? bucket - batch : 0});
                 if (emitted[i] == 0 && !l) probe = v + width;
                 auto &ref = reference[i].kv[l];
                 updates.push_back({&slices[l], &norm, &ref.first, &ref.second, live[i].committed,
@@ -172,6 +173,7 @@ static void CheckMaskedCommit() {
             }
         }
         Check(cudaMemcpy(&guard, probe, sizeof(guard), cudaMemcpyDeviceToHost) == cudaSuccess, "read tail guard");
+        Check(cudaMemset(targetPairs.cudaData, 0xff, targetPairs.GetBytes()) == cudaSuccess, "seed unused rows");
         Check(FastllmCudaNaivePrepareDraftKVSlots(slots, scratch), "masked slots upload");
         FastllmCudaNaiveWriteAcceptedDraftKV(raw, scratch.cudaData, (const int *)counts.cudaData, batch,
             rows, layers, heads, dim, 1e-5f, 10000.0f);
@@ -179,9 +181,10 @@ static void CheckMaskedCommit() {
               "rejected row overwritten");
         Check(FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, reserve, 1e-5f, 10000.0f),
               "masked reference append");
-        int pairs[batch * 2];
+        int pairs[bucket * 2];
         Check(cudaMemcpy(pairs, targetPairs.cudaData, sizeof(pairs), cudaMemcpyDeviceToHost) == cudaSuccess,
               "read target commit pairs");
+        for (int i = batch * 2; i < bucket * 2; ++i) Check(pairs[i] == 0, "stale padding commit");
         for (int i = 0; i < batch; ++i)
             Check(pairs[2 * i] == live[i].committed && pairs[2 * i + 1] == emitted[i] + 1,
                   "target cache acceptance differs from draft");

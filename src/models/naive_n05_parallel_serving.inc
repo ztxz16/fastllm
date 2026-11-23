@@ -115,7 +115,7 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
                 batch->proposals && !batch->proposals->rows.empty();
             if (batch->proposals && !deviceIds) batch->proposals->materialize();
             std::vector<std::pair<Data *, Data *>> pointers = batch->kv;
-            std::vector<GenerationConfig> configs = batch->configs;
+            pointers.reserve(size_t(slots) * block_cnt);
             std::vector<int> lengths(slots, width);
             std::vector<float> ids(graph->rows, 0), pos(graph->rows, -1);
             int source = 0;
@@ -132,9 +132,9 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
                     auto &pair = dp.padding[group * block_cnt + layer];
                     pointers.emplace_back(&pair.first, &pair.second);
                 }
-                configs.push_back(config);
             }
-            TargetBatch padded{pointers, configs, lengths, block_cnt, deviceIds ? batch->proposals : nullptr};
+            TargetBatch padded{pointers, batch->configs, lengths, block_cnt,
+                               deviceIds ? batch->proposals : nullptr, nullptr, &config};
             return ForwardAttentionParallel(Data(FLOAT32, {1, graph->rows}, ids),
                 Data(FLOAT32, {1, graph->rows}, pos), kv, config, capture, &all, &padded);
         };
@@ -172,7 +172,7 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
                     const auto *src = (const uint16_t *)graph->ranks[rank]->features.packedOutput->cudaData;
                     const auto &seqs = dp.groups[topology.AttentionOwner(rank)].sequenceIndices;
                     const auto &storage = *graph->ranks[rank]->storage;
-                    auto node = storage.commitGraphs.find(counts[rank]);
+                    auto node = storage.commitGraphs.lower_bound(counts[rank]);
                     const bool bound = capture->ringVerify && dp.plan.valid && node != storage.commitGraphs.end();
                     for (int row = 0; row < counts[rank]; ++row) {
                         auto &f = capture->packedRows.at(seqs[row]);
@@ -181,6 +181,7 @@ bool NaiveN05FlashModel::ForwardAttentionParallelServing(const Data &inputIds,
                             f.targetPair = (int *)storage.inputStorage.cudaData + 2 * row;
                             f.targetCommit = node->second;
                             f.targetRows = counts[rank];
+                            if (row + 1 == counts[rank]) f.paddingAfter = node->first - counts[rank];
                         }
                     }
                 }

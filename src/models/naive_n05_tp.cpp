@@ -3082,7 +3082,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
         std::vector<Reservation> reservations;
         for (int sequence = 0; sequence < sequences; ++sequence) {
             const int length = batch ? batch->lengths[sequence] : inputIds.dims[1];
-            const int reserve = CacheReserveCapacity(batch ? batch->configs[sequence] : config);
+            const int reserve = CacheReserveCapacity(batch ? batch->Config(sequence) : config);
             for (int layer = 0; layer < block_cnt; ++layer) {
                 const auto &cfg = slidingLayers[layer] ? sliding : full;
                 for (Data *cache : {&key(sequence, layer), &value(sequence, layer)}) {

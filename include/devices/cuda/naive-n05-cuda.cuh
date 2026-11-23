@@ -203,6 +203,7 @@ struct FastllmNaiveDraftKVSlot {
     const float *norm;
     int position;
     int *targetPair = nullptr;
+    int paddingAfter = 0;
 };
 bool FastllmCudaNaivePrepareDraftKVSlots(const std::vector<FastllmNaiveDraftKVSlot> &slots, fastllm::Data &scratch);
 void FastllmCudaNaiveWriteAcceptedDraftKV(const fastllm::Data &raw, const void *slots, const int *emitted,

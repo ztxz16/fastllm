@@ -3519,13 +3519,17 @@ namespace fastllm {
                         ? std::min(prefillChunk, std::max(1, prefillBatchLimit / prefillGroups)) : prefillChunk;
                     PrefillDecodeBudget decodeBudget;
                     bool replanEager = false;
+                    std::vector<std::pair<Data *, Data *>> pastKeyValues;
+                    std::vector<uint64_t> bindingGenerations;
+                    const bool reuseBindings = fastDecodeInput && model->IsPDDecode();
+                    if (reuseBindings) bindingGenerations.resize(maxBatch);
+                    pastKeyValues.reserve(size_t(maxBatch) * model->block_cnt);
                     while (true) {
                         std::unique_ptr<inference_trace::Step> trace;
                         if (traceInference) trace.reset(new inference_trace::Step());
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
                         std::vector <Data*> ownedPositionIds;
-                        std::vector <std::pair <Data*, Data*> > pastKeyValues;
                         std::vector <float> ids;
                         std::vector <int> seqLens;
                         int prefillTokens = 0;
@@ -3535,7 +3539,6 @@ namespace fastllm {
                         std::vector <std::vector <float>* > logits;
                         attentionMasks.reserve(maxBatch);
                         positionIds.reserve(maxBatch);
-                        pastKeyValues.reserve((size_t)maxBatch * model->block_cnt);
                         ids.reserve(maxBatch);
                         seqLens.reserve(maxBatch);
                         handles.reserve(maxBatch);
@@ -4193,9 +4196,18 @@ namespace fastllm {
                                     }
                                 }
                                 it.second->preTokens += seqLens.back();
-                                for (int i = 0; i < model->block_cnt; i++) {
-                                    pastKeyValues.push_back(std::make_pair(&it.second->pastKeyValues[i].first,
-                                                                           &it.second->pastKeyValues[i].second));
+                                const size_t row = handles.size() - 1, begin = row * model->block_cnt;
+                                const size_t end = begin + model->block_cnt;
+                                const auto &cache = it.second->pastKeyValues;
+                                if (!reuseBindings || pastKeyValues.size() < end ||
+                                    bindingGenerations[row] != it.second->generation ||
+                                    pastKeyValues[begin].first != &cache.front().first) {
+                                    if (pastKeyValues.size() < end) pastKeyValues.resize(end);
+                                    for (int layer = 0; layer < model->block_cnt; ++layer) {
+                                        auto &pair = it.second->pastKeyValues[layer];
+                                        pastKeyValues[begin + layer] = {&pair.first, &pair.second};
+                                    }
+                                    if (reuseBindings) bindingGenerations[row] = it.second->generation;
                                 }
                                 if (isPrompt) {
                                     cnt += scheduledPrefill ? chunkTokens : it.second->currentTokens.size();
@@ -4215,6 +4227,7 @@ namespace fastllm {
                                 }
                             }
                         }
+                        pastKeyValues.resize(handles.size() * model->block_cnt);
                         tokensManager.units.resize(handles.size());
                         if (trace) trace->Mark("batch_input_build_ms");
                         if (seqLens.size() > 0) {

@@ -3025,7 +3025,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
 
 
 bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds,
-        Data &baseLogits, int reserveRows, bool *backboneReady) {
+        Data &baseLogits, int reserveRows, bool *backboneReady, const std::function<void()> &prepareVerify) {
 #ifdef USE_CUDA
     std::vector<int> anchors, limits;
     std::vector<DraftContext *> contexts;
@@ -3163,6 +3163,7 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
             round->targetLogits->Resize({(int)round->proposed.size() + 1, vocab});
             targetRow += round->proposed.size() + 1;
         }
+        if (rank == 0 && prepareVerify) prepareVerify();
         if (groups[rank].front()->proposalRow < 0) FastllmCudaSyncCurrentThreadStream();
     });
     return true;
@@ -3494,7 +3495,8 @@ void NaiveN05FlashModel::PrepareDraftAcceptanceLocal(const std::vector<DraftRoun
                     const auto &pair = c.kv[l];
                     const size_t offset = (size_t)pair.first.dims[1] * kvWidth;
                     slots.push_back({(uint16_t *)pair.first.cudaData + offset, (uint16_t *)pair.second.cudaData + offset,
-                                     (const float *)norm.cudaData, c.committed, write.targetGraph ? rounds[i]->feature.targetPair : nullptr});
+                                     (const float *)norm.cudaData, c.committed, write.targetGraph ? rounds[i]->feature.targetPair : nullptr,
+                                     rounds[i]->feature.paddingAfter});
                 }
             }
             // The FC output is dead after hidden norm, and its stream orders
@@ -3880,7 +3882,28 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         }
     }
     Data headLogits;
-    const bool preparedBatch = PrepareDraftBatch(rounds, headLogits);
+    // Positions and KV ownership depend only on committed lengths. Stage them
+    // on the caller while the draft workers finish their device submissions.
+    auto preparePositions = [&](const std::vector<int> &widths) {
+        verifyPositions.clear();
+        for (size_t row = 0; row < selected.size(); ++row) {
+            const int start = owners[selected[row]]->committed;
+            for (int j = 0; j < widths[row]; ++j) verifyPositions.push_back(float(start + j));
+        }
+    };
+    auto prepareVerify = [&] {
+        lengths.reserve(selected.size());
+        for (int n : limits) lengths.push_back(n + 1);
+        preparePositions(lengths);
+        if (!fullBatch) for (int i : selected) {
+            verifyConfigs.push_back(configs[i]);
+            auto first = pastKeyValues.begin() + size_t(i) * block_cnt;
+            verifyCaches.insert(verifyCaches.end(), first, first + block_cnt);
+        }
+    };
+    const bool preparedBatch = PrepareDraftBatch(rounds, headLogits, 0, nullptr, prepareVerify);
+    if (lengths.empty()) prepareVerify();
+    bool changedWidths = false;
     size_t headOffset = 0;
     for (size_t row = 0; row < selected.size(); ++row) {
         const int i = selected[row];
@@ -3901,17 +3924,13 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         round.selection.cudaSampling = false;
         round.selection.cudaLogits = true;
         pending.push_back(context.pending.size());
-        lengths.push_back(round.proposed.size() + 1);
+        const int width = int(round.proposed.size()) + 1;
+        changedWidths |= lengths[row] != width;
+        lengths[row] = width;
         verifyIds.push_back((float)round.anchor);
         for (int token : round.proposed) verifyIds.push_back((float)token);
-        for (int j = 0; j < lengths.back(); ++j)
-            verifyPositions.push_back((float)(context.committed + j));
-        if (!fullBatch) {
-            verifyConfigs.push_back(configs[i]);
-            auto first = pastKeyValues.begin() + size_t(i) * block_cnt;
-            verifyCaches.insert(verifyCaches.end(), first, first + block_cnt);
-        }
     }
+    if (changedWidths) preparePositions(lengths);
     Data input(FLOAT32, {1, (int)verifyIds.size()}, verifyIds);
     Data positions(FLOAT32, {1, (int)verifyPositions.size()}, verifyPositions);
     // Selection preserves scheduler order. Full batches can borrow the validated
@@ -3972,21 +3991,16 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     const int vocab = rounds.front()->vocab;
     int offset = 0;
 #ifdef USE_CUDA
-    // Commit on the sampler stream only for a complete, homogeneous set of
-    // owner-local rows. A shrinking batch, mixed proposal widths or a changed
-    // binding keeps its single coordinated cache commit on the normal path.
+    // The sampler checks the entire local group before submitting its commit graph.
     if (fullBatch && capture.packedRows.size() == rounds.size()) {
-        bool local = true;
-        for (size_t i = 0; local && i < rounds.size(); ++i) {
+        for (size_t i = 0; i < rounds.size(); ++i) {
             const auto &feature = capture.packedRows[i];
-            const auto &r = *rounds[i];
-            local = !r.greedy && r.samplingRank >= 0 && r.samplingRank == r.context.deviceRank &&
+            auto &r = *rounds[i];
+            if (!r.greedy && r.samplingRank >= 0 && r.samplingRank == r.context.deviceRank &&
                 feature.targetCommit && feature.targetRows > kFastllmMtpSmallRejectionMaxBatch &&
-                r.oldLength == r.context.committed &&
-                feature.device == tpDevices.at(r.samplingRank) && lengths[i] == lengths.front();
+                r.oldLength == r.context.committed && feature.device == tpDevices.at(r.samplingRank))
+                r.feature = feature;
         }
-        if (local)
-            for (size_t i = 0; i < rounds.size(); ++i) rounds[i]->feature = capture.packedRows[i];
     }
 #endif
     PrepareDraftAcceptance(rounds, logits);

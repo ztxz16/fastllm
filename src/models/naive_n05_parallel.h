@@ -162,11 +162,9 @@ struct NaiveN05FlashModel::AttentionParallelState {
     std::vector<int> previousBindingRows;
     struct GroupBatch {
         std::vector<std::pair<Data *, Data *>> kv;
-        std::vector<GenerationConfig> configs;
         std::vector<int> lengths;
         std::vector<float> positions;
         std::vector<int> sequenceIndices;
-        std::unique_ptr<TargetBatch> batch;
     };
     struct Rank {
         Data hidden, normalized, projected, reduction, positions, liveKeys;

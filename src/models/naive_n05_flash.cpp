@@ -1064,7 +1064,14 @@ Data NaiveN05FlashModel::RunTarget(
         AttentionTPSize() == 1 && (!capture || (!capture->collectHidden && capture->prefixes.empty())) &&
         FastllmCudaHasBlackwellIndexerAttention();
     const int dpGroup = attentionParallel ? attentionParallel->runtime.Layout().AttentionOwner(tpRank) : 0;
-    const TargetBatch *attentionBatch = attentionParallel ? attentionParallel->groups[dpGroup].batch.get() : batch;
+    const std::vector<GenerationConfig> noConfigs;
+    std::optional<TargetBatch> groupBatch;
+    if (attentionParallel) {
+        const auto &group = attentionParallel->groups[dpGroup];
+        groupBatch.emplace(TargetBatch{group.kv, batch ? batch->configs : noConfigs, group.lengths,
+            block_cnt, nullptr, &group.sequenceIndices, batch && batch->paddingConfig ? batch->paddingConfig : &config});
+    }
+    const TargetBatch *attentionBatch = groupBatch ? &*groupBatch : batch;
     const bool attentionBatchDecode = attentionParallel ? attentionBatch && attentionBatch->Decode() : batchDecode;
     struct PrefillProjectionViews { Data key, value, attention; };
     std::optional<PrefillProjectionViews> projectionViews;
@@ -2038,7 +2045,7 @@ Data NaiveN05FlashModel::RunTarget(
                            *batch->Key(sequence, layer).multiDeviceDatas.at(gpu),
                            *batch->Value(sequence, layer).multiDeviceDatas.at(gpu), part, count,
                            batch->Key(sequence, 0).dims.empty() ? 0 : batch->Key(sequence, 0).dims[1],
-                           CacheReserveCapacity(batch->configs[sequence]), rowAttention,
+                           CacheReserveCapacity(batch->Config(sequence)), rowAttention,
                            sequence, offset);
                     offset += count;
                 }

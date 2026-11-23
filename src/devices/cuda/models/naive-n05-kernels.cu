@@ -430,9 +430,14 @@ __global__ void DraftNormRopeWriteAccepted(const BF16 *raw, const FastllmNaiveDr
     // The anchor is committed even when every draft token was rejected.
     if (row > emitted[request]) return;
     const auto slot = slots[(size_t)layer * batch + request];
-    if (slot.targetPair && !layer && !row && !head && !threadIdx.x) {
-        slot.targetPair[0] = slot.position;
-        slot.targetPair[1] = emitted[request] + 1;
+    if (slot.targetPair && !layer && !row && !head) {
+        if (!threadIdx.x) {
+            slot.targetPair[0] = slot.position;
+            slot.targetPair[1] = emitted[request] + 1;
+        }
+        // Only the last live row clears the captured graph's inactive slots.
+        for (int i = threadIdx.x; i < slot.paddingAfter; i += blockDim.x)
+            reinterpret_cast<int2 *>(slot.targetPair)[1 + i] = make_int2(0, 0);
     }
     const int width = heads * dim;
     const auto key = raw + ((size_t)layer * batch * rows + token) * 2 * width + head * dim;

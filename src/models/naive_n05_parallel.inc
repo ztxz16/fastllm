@@ -197,14 +197,11 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         for (auto &group : state.groups)
             for (size_t row = 0; row < group.sequenceIndices.size(); ++row) {
                 const int seq = group.sequenceIndices[row];
-                // Sampling/grammar constraints and positions can change without
-                // changing KV ownership. Never cache these request values.
-                group.configs[row] = batch->configs[seq];
                 std::copy_n(pos + seq * width, width, group.positions.begin() + row * width);
             }
     } else {
         for (auto &group : state.groups) {
-            group.batch.reset(); group.kv.clear(); group.configs.clear();
+            group.kv.clear();
             group.lengths.clear(); group.positions.clear(); group.sequenceIndices.clear();
         }
         std::vector<int> sequenceOwners;
@@ -239,7 +236,6 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             }
             local.lengths.push_back(count);
             local.sequenceIndices.push_back(seq);
-            local.configs.push_back(batch ? batch->configs[seq] : config);
             const float *pos = (const float *)hostPositions.cpuData;
             local.positions.insert(local.positions.end(), pos + offset, pos + offset + count);
             sequenceOwners.push_back(group);
@@ -271,8 +267,6 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             } else state.transfer->Reset(state.rows);
         }
         state.transfer->Reserve(size_t(embed_dim) * sizeof(uint16_t));
-        for (auto &group : state.groups)
-            group.batch = std::make_unique<TargetBatch>(TargetBatch{group.kv, group.configs, group.lengths, block_cnt});
     }
     if (tpEp8MegaState) {
         const int ranks = tpDevices.size();
@@ -470,12 +464,12 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
         for (int group = 0; group < attentionDP && asyncSampling; ++group) {
             if (samplingRows[group].empty()) continue;
             const bool constrained = std::any_of(samplingRows[group].begin(), samplingRows[group].end(),
-                [&](int seq) { return bool(batch->configs[seq].tool_call_grammar); });
+                [&](int seq) { return bool(batch->Config(seq).tool_call_grammar); });
             if (!state.sampling[group] || !state.sampling[group]->Supports(samplingRows[group].size(), constrained)) {
                 asyncSampling = false; break;
             }
             for (int seq : samplingRows[group]) {
-                const auto &cfg = batch->configs[seq];
+                const auto &cfg = batch->Config(seq);
                 auto identity = tpSamplingRequestIds.find(&key(seq, 0));
                 if (identity == tpSamplingRequestIds.end() || (cfg.tool_call_token_mask && !cfg.tool_call_grammar) ||
                     cfg.tool_call_name_constraint_enabled || cfg.tool_call_parameter_name_constraint_enabled ||
@@ -895,7 +889,7 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
             const auto &rows = samplingRows[group];
             if (rows.empty()) return;
             std::vector<GenerationConfig> configs;
-            for (int seq : rows) configs.push_back(batch ? batch->configs[seq] : config);
+            for (int seq : rows) configs.push_back(batch ? batch->Config(seq) : config);
             auto tokens = SampleCudaLogits(state.samplingLogits[group], configs);
             for (size_t row = 0; row < rows.size(); ++row) selection->sampledTokens[rows[row]] = tokens[row];
         });

@@ -150,6 +150,13 @@ namespace fastllm {
             const std::vector<int> &lengths;
             int layers;
             const DraftVerifyInput *proposals = nullptr;
+            // DP groups borrow request sampling state for the duration of a forward.
+            const std::vector<int> *configRows = nullptr;
+            const GenerationConfig *paddingConfig = nullptr;
+            const GenerationConfig &Config(int row) const {
+                if (configRows) row = configRows->at(row);
+                return paddingConfig && size_t(row) >= configs.size() ? *paddingConfig : configs.at(row);
+            }
             int Size() const { return lengths.size(); }
             bool Decode() const {
                 return std::all_of(lengths.begin(), lengths.end(), [](int n) { return n == 1; });
@@ -322,7 +329,7 @@ namespace fastllm {
                 int device = -1;
                 int *targetPair = nullptr;
                 void *targetCommit = nullptr;
-                int targetRows = 0;
+                int targetRows = 0, paddingAfter = 0;
             };
             std::vector<FeatureRows> packedRows;
         };
@@ -456,7 +463,8 @@ namespace fastllm {
         struct DraftRound;
         void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr);
         bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
-                               int reserveRows = 0, bool *backboneReady = nullptr);
+                               int reserveRows = 0, bool *backboneReady = nullptr,
+                               const std::function<void()> &prepareVerify = {});
         bool ProjectDraftKVWeights(Data &input, int device, int heads, int width, Data &raw, Data &pointers);
         bool ProjectVerifyDraftRows(const std::vector<DraftRound *> &rounds, const std::vector<int> &group,
                                     int rank, int rows);
