@@ -12,6 +12,10 @@ lib.FastllmDraftFusedContextSharedUpload.argtypes=[P,P,C.c_int];lib.FastllmDraft
 lib.FastllmDraftFusedContextSharedRun.argtypes=[P,C.c_int,C.c_int,P];lib.FastllmDraftFusedContextSharedRun.restype=C.c_bool
 lib.FastllmDraftFusedContextSharedUploadAccepted.argtypes=[P,P,C.c_int,P,P]
 lib.FastllmDraftFusedContextSharedUploadAccepted.restype=C.c_bool
+class NextInputs(C.Structure):
+    _fields_=[('tokens',P),('stride',C.c_int),('anchors',P*8),('lengths',P*8)]
+lib.FastllmDraftFusedContextUploadNext.argtypes=[P,P,C.c_int,P,C.POINTER(NextInputs),P]
+lib.FastllmDraftFusedContextUploadNext.restype=C.c_bool
 with safe_open(a.draft,framework='pt',device='cpu') as f:
     fc=f.get_tensor('fc.weight').bfloat16().to(0)
     hn=f.get_tensor('hidden_norm.weight').float().to(0)
@@ -30,7 +34,16 @@ def prepared_matches_eager(features,caches,before,tables,ns,starts,references):
     global prepared_cases,prepared_exact_cases
     count=len(ns)
     expected=[[x.clone() for x in row] for row in caches]
-    for device_counts in (False, True):
+    stride=8
+    tokens=torch.arange(32,32+count*stride,dtype=torch.int32,device=0).view(count,stride)
+    anchors=[torch.empty(count+1,dtype=torch.float32,device=r) for r in range(8)]
+    lengths=[torch.empty(count+1,dtype=torch.int32,device=r) for r in range(8)]
+    next_inputs=NextInputs(tokens.data_ptr(),stride,(P*8)(*(x.data_ptr() for x in anchors)),
+        (P*8)(*(x.data_ptr() for x in lengths)))
+    for device_counts,bind_next in ((True,True),(True,False),(False,False)):
+        for anchor_out,length_out in zip(anchors,lengths):
+            anchor_out.fill_(-1)
+            length_out.fill_(-1)
         for r in range(8):
             for dst,src in zip(caches[r],before[r]):dst.copy_(src)
         sync()
@@ -49,13 +62,22 @@ def prepared_matches_eager(features,caches,before,tables,ns,starts,references):
             with torch.cuda.device(0),torch.cuda.stream(streams[0]):
                 torch.cuda._sleep(100000)
                 accepted.copy_(source)
-                assert lib.FastllmDraftFusedContextSharedUploadAccepted(state,descriptors,count,accepted.data_ptr(),streams[0].cuda_stream),lib.FastllmDraftFusedError()
+                if bind_next:
+                    assert lib.FastllmDraftFusedContextUploadNext(state,descriptors,count,accepted.data_ptr(),
+                        C.byref(next_inputs),streams[0].cuda_stream),lib.FastllmDraftFusedError()
+                else:
+                    assert lib.FastllmDraftFusedContextSharedUploadAccepted(state,descriptors,count,accepted.data_ptr(),streams[0].cuda_stream),lib.FastllmDraftFusedError()
         else:
             assert lib.FastllmDraftFusedContextSharedUpload(state,descriptors,count),lib.FastllmDraftFusedError()
         for r in range(8):
             with torch.cuda.device(r),torch.cuda.stream(streams[r]):
                 assert lib.FastllmDraftFusedContextSharedRun(state,r,count,streams[r].cuda_stream),lib.FastllmDraftFusedError()
         sync()
+        for anchor_out,length_out in zip(anchors,lengths):
+            expected_anchors=[32+j*stride+n-1 for j,n in enumerate(ns)] if bind_next else [-1]*count
+            expected_lengths=[start+n+1 for start,n in zip(starts,ns)] if bind_next else [-1]*count
+            assert anchor_out.tolist()==expected_anchors+[-1]
+            assert length_out.tolist()==expected_lengths+[-1]
         exact=True
         for r in range(8):
             for i,(got,want) in enumerate(zip(caches[r],expected[r])):
@@ -70,7 +92,7 @@ def prepared_matches_eager(features,caches,before,tables,ns,starts,references):
                 m=metrics(got[keep:end],ref,torch.zeros_like(ref))
                 assert m['max_row_l2']<=.006,('shared reference',count,r,i,m)
                 delta=metrics(got[keep:end],want[keep:end],torch.zeros_like(ref))
-                prepared_results.append(dict(device_counts=device_counts,batch=count,rows=ns[request],start=starts[request],
+                prepared_results.append(dict(device_counts=device_counts,bind_next=bind_next,batch=count,rows=ns[request],start=starts[request],
                     rank=r,layer=i//(2*count),request=request,kind=i%2,eager_row_l2=delta['max_row_l2'],**m))
         assert not lib.FastllmDraftFusedWatchdog(state)
         prepared_cases+=1

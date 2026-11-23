@@ -68,6 +68,15 @@ bool FastllmDraftFusedContextSharedUpload(void *state,const FastllmDraftContextR
 // callers retain the counts until all rank consumers complete.
 bool FastllmDraftFusedContextSharedUploadAccepted(void *state,const FastllmDraftContextRequest *requests,
     int count,const int *accepted,void *producerStream);
+struct FastllmDraftNextInputs {
+    const int *tokens;
+    int stride;
+    float *anchors[8];
+    int *lengths[8];
+};
+// The context graph binds the next body inputs before its completion event.
+bool FastllmDraftFusedContextUploadNext(void *state,const FastllmDraftContextRequest *requests,
+    int count,const int *accepted,const FastllmDraftNextInputs &next,void *producerStream);
 bool FastllmDraftFusedContextSharedRun(void *state,int rank,int count,void *stream);
 bool FastllmDraftFusedHeadPrepare(void *state,const void *const *heads,const void *w1,const void *w2,
     const float *confidenceWeight,const float *confidenceBias,int owner);

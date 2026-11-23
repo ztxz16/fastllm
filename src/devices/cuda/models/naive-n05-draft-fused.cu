@@ -208,6 +208,12 @@ __global__ __launch_bounds__(kThreads, 1) void FusedDraftContext(const __grid_co
 template<bool GridTrim = false>
 __device__ void ContextPreparedBody(unsigned char *memory, const FcCtxKvArgs &base, const PreparedContextRequest *request,
         int window, float theta) {
+    // Kernel entry already retires this rank's previous mailbox readers.
+    // Let peers observe readiness while we retain the rolling KV prefix.
+    if constexpr (GridTrim) {
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            rendezvous_announce(base.fc.mailbox_peers, base.fc.rank, unsigned(*base.fc.replay_generation));
+    }
     const auto &d = *request;
     const int rows = d.accepted ? *d.accepted+1 : d.rows;
     if (rows < 1 || rows > d.rows) { asm volatile("trap;"); return; }
@@ -241,7 +247,7 @@ __device__ void ContextPreparedBody(unsigned char *memory, const FcCtxKvArgs &ba
     a.fc.target_hidden=static_cast<const B*>(d.features);
     a.kv.cache_table = request->cacheTable;
     a.kv.table_requests = request->tableRequests; a.kv.table_request = request->tableRequest;
-    FcCtxKvBody::run<true>(memory,a,{rows,d.position,keep,window,theta});
+    FcCtxKvBody::run<true,false,GridTrim>(memory,a,{rows,d.position,keep,window,theta});
     if constexpr (GridTrim) {
 #pragma unroll
         for (int i = 0; i < chunks; ++i) {
@@ -1230,6 +1236,20 @@ void AddWideContext(State &s,int rank,int count,cudaGraph_t graph,cudaGraphNode_
     add((void*)ContextBatchKVFinish,dim3(5*count*8),256,0);
 }
 
+__global__ void FinishDraftContextResult(const PreparedContextRequest *requests,
+        const FastllmDraftNextInputs *next,int rank,int row,const unsigned *watchdog) {
+    if (threadIdx.x != 0) return;
+    if (*watchdog & naivert::kMailboxWatchdogTripped) { asm volatile("trap;"); return; }
+    if (!next->tokens) return;
+    const auto &request = requests[row];
+    const int accepted = *request.accepted;
+    if (accepted < 0 || accepted >= request.rows || accepted >= next->stride) { asm volatile("trap;"); return; }
+    const int token = next->tokens[row*next->stride+accepted];
+    if (token < 0 || token >= kHeadVocab*8) { asm volatile("trap;"); return; }
+    next->anchors[rank][row] = float(token);
+    next->lengths[rank][row] = request.position + accepted + 2;
+}
+
 void PrepareContextPlans(State &s, int requests) {
     // All addresses are per-request lanes. Only this bounded descriptor array
     // changes between launches; graphs never retain caller-owned host memory.
@@ -1237,8 +1257,8 @@ void PrepareContextPlans(State &s, int requests) {
         if(!s.contextInputs) {
             s.contextInputs.reset(new ContextInputs(s.ranks[0].device));
             auto &p=*s.contextInputs;Check(cudaSetDevice(p.device));
-            Check(cudaMallocHost(&p.host,8*64*sizeof(*p.host)));
-            Check(cudaMalloc(&p.gpu,8*64*sizeof(*p.gpu)));
+            Check(cudaMallocHost(&p.host,8*64*sizeof(*p.host)+sizeof(FastllmDraftNextInputs)));
+            Check(cudaMalloc(&p.gpu,8*64*sizeof(*p.gpu)+sizeof(FastllmDraftNextInputs)));
             Check(cudaMalloc(&p.alias,sizeof(unsigned)));
             Check(cudaStreamCreateWithFlags(&p.stream,cudaStreamNonBlocking));
             Check(cudaEventCreateWithFlags(&p.ready,cudaEventDisableTiming));
@@ -1310,8 +1330,11 @@ void PrepareContextPlans(State &s, int requests) {
                             add((void*)FusedDraftContextPrepared,kCtas,kThreads,ContextSmem,body);
                         }
                         for(int request=first;request<first+requests;++request) {
-                            auto &l=r.lanes[request];B *none=nullptr;int zero=0;
-                            void *finish[]={&none,&none,&zero,&l.watchdog};add((void*)FinishResult,1,32,0,finish);
+                            auto *requests=s.contextInputs->gpu+rank*count;
+                            auto *next=reinterpret_cast<FastllmDraftNextInputs *>(s.contextInputs->gpu+8*count);
+                            auto *watchdog=r.lanes[request].watchdog;
+                            void *finish[]={&requests,&next,&rank,&request,&watchdog};
+                            add((void*)FinishDraftContextResult,1,32,0,finish);
                         }
                         first+=requests;
                     }
@@ -1375,7 +1398,7 @@ extern "C" bool FastllmDraftFusedContextSharedSupported(void *opaque,int count) 
 }
 namespace {
 bool UploadContextDescriptors(void *opaque,const FastllmDraftContextRequest *requests,
-        int count,const int *accepted,void *producerStream) {
+        int count,const int *accepted,void *producerStream,const FastllmDraftNextInputs *next=nullptr) {
     if(!requests || !FastllmDraftFusedContextSharedSupported(opaque,count))return false;
     for(int i=0;i<8*count;++i) {
         const auto &d=requests[i];
@@ -1390,7 +1413,14 @@ bool UploadContextDescriptors(void *opaque,const FastllmDraftContextRequest *req
             p.host[i]={d.features,d.cacheTable,accepted?accepted+i%count:nullptr,d.position,
                 uint16_t(d.rows),uint16_t(d.oldLength),d.tableRequests,d.tableRequest};
         }
-        Check(cudaMemcpyAsync(p.gpu,p.host,8*count*sizeof(*p.host),cudaMemcpyHostToDevice,p.stream));
+        // The per-rank destinations follow this shape's descriptors and share
+        // their upload. A null token pointer disables all optional outputs.
+        const size_t bytes = 8*count*sizeof(*p.host);
+        FastllmDraftNextInputs packet{};
+        if (next) packet = *next;
+        const size_t extra = next ? sizeof(packet) : sizeof(packet.tokens);
+        std::memcpy(p.host+8*count,&packet,extra);
+        Check(cudaMemcpyAsync(p.gpu,p.host,bytes+extra,cudaMemcpyHostToDevice,p.stream));
         if(count>=8) {
             Check(cudaMemsetAsync(p.alias,0,sizeof(unsigned),p.stream));
             ContextBatchAliases<<<8,256,0,p.stream>>>(p.gpu,count,p.alias);
@@ -1415,6 +1445,12 @@ extern "C" bool FastllmDraftFusedContextSharedUpload(void *opaque,
 extern "C" bool FastllmDraftFusedContextSharedUploadAccepted(void *opaque,
         const FastllmDraftContextRequest *requests,int count,const int *accepted,void *producerStream) {
     return accepted && UploadContextDescriptors(opaque,requests,count,accepted,producerStream);
+}
+extern "C" bool FastllmDraftFusedContextUploadNext(void *opaque,const FastllmDraftContextRequest *requests,
+        int count,const int *accepted,const FastllmDraftNextInputs &next,void *producerStream) {
+    if (!accepted || !next.tokens || next.stride < 2 || next.stride > 8) return false;
+    for (int rank = 0; rank < 8; ++rank) if (!next.anchors[rank] || !next.lengths[rank]) return false;
+    return UploadContextDescriptors(opaque,requests,count,accepted,producerStream,&next);
 }
 extern "C" bool FastllmDraftFusedContextSharedRun(void *opaque,int rank,int count,void *rawStream) {
     if(rank<0 || rank>=8 || !FastllmDraftFusedContextSharedSupported(opaque,count))return false;
@@ -1820,12 +1856,25 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
         Check(cudaEventCreateWithFlags(&p->uploaded,cudaEventDisableTiming));
         Check(cudaGraphCreate(&p->graph,0));
         cudaGraphNode_t previous=nullptr;
-        auto add=[&](void *function,dim3 blocks,int threads,int smem,void **args) {
+        auto add=[&](void *function,dim3 blocks,int threads,int smem,void **args, bool dependent = false) {
             cudaKernelNodeParams params{};
             params.func=function;params.gridDim=dim3(blocks);params.blockDim=dim3(threads);
             params.sharedMemBytes=smem;params.kernelParams=args;
             cudaGraphNode_t node;
-            Check(cudaGraphAddKernelNode(&node,p->graph,previous?&previous:nullptr,previous?1:0,&params));
+#if CUDART_VERSION >= 12030
+            if (dependent && s.programmatic) {
+                Check(cudaGraphAddKernelNode(&node,p->graph,nullptr,0,&params));
+                cudaGraphEdgeData edge{};
+                edge.type = cudaGraphDependencyTypeProgrammatic;
+                edge.from_port = cudaGraphKernelNodePortProgrammatic;
+#if CUDART_VERSION >= 13000
+                Check(cudaGraphAddDependencies(p->graph,&previous,&node,&edge,1));
+#else
+                Check(cudaGraphAddDependencies_v2(p->graph,&previous,&node,&edge,1));
+#endif
+            } else
+#endif
+                Check(cudaGraphAddKernelNode(&node,p->graph,previous?&previous:nullptr,previous?1:0,&params));
             previous=node;p->prefix.push_back(node);
         };
         if(count>=8 && count<=r.headCapacity && r.headBatch) {
@@ -1873,7 +1922,8 @@ extern "C" void *FastllmDraftFusedVerificationCreate(void *opaque,int rank,int c
                 void *head[]={&pair};add((void*)FusedDraftHeadTile,kHeadCtas,kHeadThreads,HeadTileSmem,head);
             } else {
                 void *head[]={tile.head,tile.markov,tile.control,&tile.steps};
-                add((void*)FusedDraftHeadProposal,kHeadCtas,kHeadThreads,HeadSmem,head);
+                // The head stages immutable weights before waiting for the new mailbox epoch.
+                add((void*)FusedDraftHeadProposal,kHeadCtas,kHeadThreads,HeadSmem,head,true);
             }
             for(int requestIndex=0;requestIndex<requests;++requestIndex) {
                 const int row=first+requestIndex;auto &l=r.lanes[row];auto *request=p->gpu+row;

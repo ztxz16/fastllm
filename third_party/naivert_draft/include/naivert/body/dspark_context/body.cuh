@@ -27,7 +27,7 @@ static_assert(kD12FinishOffset + sizeof(D12FinishCoefficients) <= kD12WeightOffs
 static_assert(kThreads - kWindow * 32 == kHeadDim && kHeadDim == kKvRowsR);
 struct FcCtxKvBody {
   struct InputMetadata { int rows,position,keep,window; float theta; };
-  template<bool PreparedInput = false, bool PrecomputedFc = false>
+  template<bool PreparedInput = false, bool PrecomputedFc = false, bool Announced = false>
   __device__ static void run(unsigned char* smem_raw,const FcCtxKvArgs& args,
       InputMetadata input = {8,0,0,1024,10000.f}, float fc_value = 0.f) {
     static_assert(kCtas == kCtasD2);
@@ -63,7 +63,7 @@ struct FcCtxKvBody {
       }
       cutlass::arch::cp_async_fence();
     };
-    FcCtxBody::run<true,PreparedInput,decltype(prefetch),PrecomputedFc>(smem_raw, args.fc, prefetch,input.rows,fc_value);
+    FcCtxBody::run<true,PreparedInput,decltype(prefetch),PrecomputedFc,Announced>(smem_raw, args.fc, prefetch,input.rows,fc_value);
     auto* ctx_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     auto* finish = reinterpret_cast<D12FinishCoefficients*>(smem_raw + kD12FinishOffset);
     // These four warps do not normalize query rows. Immutable finish inputs

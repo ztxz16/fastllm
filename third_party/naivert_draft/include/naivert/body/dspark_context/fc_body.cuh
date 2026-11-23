@@ -87,7 +87,7 @@ static_assert(kCtas < NAIVERT_SM_COUNT,
 // and wide GEMMs, without retaining another packed weight payload.
 struct FcBeforeReduce { __device__ void operator()() const {} };
 struct FcCtxBody {
-  template <bool kConsumerNorm = false, bool PreparedInput = false, class BeforeReduce = FcBeforeReduce, bool Precomputed = false>
+  template <bool kConsumerNorm = false, bool PreparedInput = false, class BeforeReduce = FcBeforeReduce, bool Precomputed = false, bool Announced = false>
   __device__ static void run(unsigned char* smem_raw, const FcCtxArgs& args,
       BeforeReduce before_reduce = {}, int valid_rows = 8, float precomputed = 0.f) {
     constexpr int stride = kHidden + (kConsumerNorm ? 32 : 0);
@@ -109,7 +109,7 @@ struct FcCtxBody {
     // of being paid in series. `k` is the same single read of the counter every mailbox site below
     // uses -- see the salt table's "D1 READS the counter ONCE".
     const unsigned k = static_cast<unsigned>(*args.replay_generation);
-    if (!Precomputed && cta == 0 && tid == 0) {
+    if (!Precomputed && !Announced && cta == 0 && tid == 0) {
       rendezvous_announce(args.mailbox_peers, args.rank, k);
     }
 
@@ -161,7 +161,7 @@ struct FcCtxBody {
     auto* gathered = reinterpret_cast<naivert::PayloadPair*>(smem_raw);
     if (tid < kWindow * kColsPerCta) exact[tid] = Precomputed ? precomputed : stage[tid];
     __syncthreads();
-    before_reduce();
+
     const naivert::MailboxWatchdog watchdog{args.watchdog_limit_ns,args.watchdog_flag};
     if (tid == 0) rendezvous_wait(args.mailbox_peers[args.rank], args.rank, k, watchdog);
     __syncthreads();
@@ -174,6 +174,9 @@ struct FcCtxBody {
       auto* target=mailbox.remote_word(naivert::mailbox_peer_rank(peer,args.rank),cta,pair*2);
       naivert::store_tagged_pair(target,naivert::tagged_word(gen,payload.x),naivert::tagged_word(gen,payload.y));
     }
+    // KV weights are independent of the mailbox. Issue their async loads
+    // after publishing this rank's FP32 partials, while peers are filling ours.
+    before_reduce();
     for (int job=tid;job<(kRanks-1)*items;job+=kThreads) {
       const int slot=job/items,item=job%items,row=item/pairs,pair=item%pairs;
       const auto mailbox=naivert::TileMailbox<FcCtxLayout>::make(

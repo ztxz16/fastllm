@@ -251,6 +251,38 @@ struct NaiveN05FlashModel::DraftWorkspace {
     void *backboneReady = nullptr; // Borrowed from the current producer.
     void *prefetchStream = nullptr, *prefetchReady = nullptr;
     bool prefetchSubmitted = false;
+    bool pendingBackbone = false;
+    bool CanPrefetch(int count) const {
+        if (!nextGraph || nextGraph->disabled || nextGraph->rankRows.empty() ||
+            nextGraph->rankRows.front() != count || tpRanks.size() != 8 ||
+            nextGraph->tpRanks.size() != tpRanks.size()) return false;
+        for (size_t rank = 0; rank < tpRanks.size(); ++rank) {
+            const auto &local = *tpRanks[rank];
+            if (!nextGraph->tpRanks[rank]->graphs[0].exec || local.inputCapacity < count ||
+                !local.prefetchStream || !local.prefetchReady) return false;
+        }
+        return true;
+    }
+    void DrainPendingBackbone() {
+        if (!pendingBackbone) return;
+        const int previous = FastllmCudaGetDevice();
+        for (auto &local : tpRanks) {
+            FastllmCudaSetDevice(local->device);
+            FastllmCudaEventSynchronize(local->prefetchReady);
+        }
+        FastllmCudaSetDevice(previous);
+        pendingBackbone = false;
+    }
+    bool ConsumeLookahead(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts) {
+        if (!nextReady || nextAnchors != anchors || nextOwners.size() != contexts.size() ||
+            nextLengths.size() != contexts.size() || fusedContexts.size() != contexts.size()) return false;
+        for (size_t row = 0; row < contexts.size(); ++row)
+            if (!contexts[row] || nextOwners[row].lock().get() != contexts[row] ||
+                fusedContexts[row] != contexts[row] || contexts[row]->committed + 1 != nextLengths[row]) return false;
+        nextReady = false;
+        nextConsumed = true;
+        return true;
+    }
     void JoinLookahead() {
         if (!nextInFlight) return;
         const int previous = FastllmCudaGetDevice();
@@ -710,6 +742,7 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
 void NaiveN05FlashModel::DrainPendingDraftContext() {
 #ifdef FASTLLM_ENABLE_DRAFT_FUSED
     if (!draftBatchStorage || !draftBatchStorage->pendingContext) return;
+    draftBatchStorage->DrainPendingBackbone();
     const int previous = FastllmCudaGetDevice();
     for (size_t rank = 0; rank < draftTP->devices.size(); ++rank) {
         FastllmCudaSetDevice(draftTP->devices[rank]);
@@ -1758,10 +1791,8 @@ bool NaiveN05FlashModel::CommitSpeculativeCaches(TargetCapture &capture,
     for (size_t row = 0; row < contexts.size(); ++row)
         if (!contexts[row] || !caches[row] || contexts[row]->committed != past[row]) return false;
     auto graph = storage ? storage->nextGraph : nullptr;
-    bool prepareNext = !preparingGraphs && GetFastllmEnv().cudaGraph && graph && !graph->disabled &&
-        nextAnchors.size() == contexts.size() && !graph->rankRows.empty() &&
-        graph->rankRows.front() == (int)contexts.size() &&
-        graph->tpRanks.size() == tpDevices.size() && storage->tpRanks.size() == tpDevices.size();
+    bool prepareNext = !preparingGraphs && GetFastllmEnv().cudaGraph && storage &&
+        nextAnchors.size() == contexts.size() && storage->CanPrefetch(contexts.size());
     std::vector<int> nextLengths;
     std::vector<std::weak_ptr<DraftContext>> nextOwners;
     std::vector<std::shared_ptr<DraftContext>> nextRetained;
@@ -1775,11 +1806,10 @@ bool NaiveN05FlashModel::CommitSpeculativeCaches(TargetCapture &capture,
             nextLengths.push_back(committed+1); nextOwners.push_back(owner->second);
             nextRetained.push_back(owner->second);
         }
-        for (size_t rank = 0; rank < tpDevices.size(); ++rank)
-            prepareNext = prepareNext && graph->tpRanks[rank]->graphs[0].exec &&
-                storage->tpRanks[rank]->inputCapacity >= (int)contexts.size() &&
-                storage->tpRanks[rank]->prefetchStream && storage->tpRanks[rank]->prefetchReady;
     }
+    const bool prefetched = prepareNext && storage->pendingBackbone &&
+        storage->pendingContext == &capture && storage->pendingContextOwners == contexts;
+    if (storage && !prefetched) storage->DrainPendingBackbone();
     if (storage) {
         // Acceptance has already joined the previous head and its backbone.
         // No host event wait is needed on this normal consumption path.
@@ -1791,7 +1821,12 @@ bool NaiveN05FlashModel::CommitSpeculativeCaches(TargetCapture &capture,
     if (prepareNext) {
         storage->nextRetained = std::move(nextRetained);
         storage->nextInFlight = true;
-        enqueueNext = [&](int rank) {
+        if (prefetched) {
+            // The sampling callback queued exactly these owners' token rows.
+            // The host has now checked stop tokens, lengths and the next budget.
+            storage->pendingBackbone = false;
+            for (auto &local : storage->tpRanks) local->prefetchSubmitted = true;
+        } else enqueueNext = [&](int rank) {
             auto &local = *storage->tpRanks[rank];
             local.UploadInputs(nextAnchors,nextLengths,maxBatch > 0 ? maxBatch : 512);
             // inputUploaded follows this rank's context/KV commit on its
@@ -1889,16 +1924,39 @@ bool NaiveN05FlashModel::CommitFusedDraftContextsImpl(TargetCapture &capture,
                 (const void *const *)scratch.cacheTable.cudaData,counts[row],contexts[row]->committed,
                 old[row],count,row});
     }
+    auto &storage = *draftBatchStorage;
+    const int *sampled = nullptr;
+    if (deviceAccepted && !preparingGraphs && GetFastllmEnv().cudaGraph &&
+        (!storage.nextInFlight || storage.nextConsumed) && storage.CanPrefetch(count) &&
+        std::all_of(lengths.begin(),lengths.end(),[&](int n) { return n == draftTokens+1; }) &&
+        std::all_of(contexts.begin(),contexts.end(),[&](const auto *c) {
+            return c->committed < max_positions - draftTokens - 2;
+        })) {
+        sampled = FastllmCudaMtpSmallResultRows(deviceAccepted,count,draftTokens);
+    }
     const bool targetFirst = enqueueTarget && !draftBatchStorage->targetCommitReady;
     if (deviceAccepted) {
         draftBatchStorage->pendingContext = &capture;
         draftBatchStorage->pendingContextOwners = contexts;
     }
     try {
-        if (shared && !queued) AssertInFastLLM(deviceAccepted ?
-            FastllmDraftFusedContextSharedUploadAccepted(draftBatchStorage->fused,requests.data(),count,deviceAccepted,nullptr) :
-            FastllmDraftFusedContextSharedUpload(draftBatchStorage->fused,requests.data(),count),
-            "Shared context descriptor upload failed.");
+        if (shared && !queued) {
+            bool uploaded;
+            if (sampled) {
+                FastllmDraftNextInputs next{};
+                next.tokens = sampled;
+                next.stride = draftTokens + 1;
+                for (int rank = 0; rank < 8; ++rank) {
+                    next.anchors[rank] = static_cast<float *>(storage.tpRanks[rank]->id.cudaData);
+                    next.lengths[rank] = static_cast<int *>(storage.tpRanks[rank]->live.cudaData);
+                }
+                uploaded = FastllmDraftFusedContextUploadNext(storage.fused,requests.data(),count,deviceAccepted,next,nullptr);
+            } else if (deviceAccepted)
+                uploaded = FastllmDraftFusedContextSharedUploadAccepted(storage.fused,requests.data(),count,deviceAccepted,nullptr);
+            else
+                uploaded = FastllmDraftFusedContextSharedUpload(storage.fused,requests.data(),count);
+            AssertInFastLLM(uploaded,"Shared context descriptor upload failed.");
+        }
         draftTP->Run([&](int rank) {
             // Preserve first-use loading before any peer can enter a resident
             // collective. Subsequent commits may overlap host preparation.
@@ -1916,26 +1974,38 @@ bool NaiveN05FlashModel::CommitFusedDraftContextsImpl(TargetCapture &capture,
                     counts[row],contexts[row]->committed,old[row],
                     (const void *const *)scratch.cacheTable.cudaData,count,row,nullptr),
                     "Fused draft context launch failed.");
-            // Target KV and draft KV are disjoint. Queue context first so its
-            // GPU work can overlap host preparation of the target descriptors.
-            // The done event still covers both commits on the same stream.
-            if (enqueueTarget && !targetFirst) enqueueTarget(rank);
-            // The next body waits for this rank's committed KV/input packet.
-            // Its separate completion is retained across the public boundary
-            // and joined before any cancellation/reuse can recycle storage.
+            // The draft body reads its own KV. Release it before submitting the
+            // independent target cache update; the public event still covers both.
             if (enqueueNext) enqueueNext(rank);
+            if (enqueueTarget && !targetFirst) enqueueTarget(rank);
             FastllmCudaEventRecordCurrentThread(draftContextStorage->tpRanks[rank]->done);
+            if (sampled) {
+                FastllmCudaStreamWaitEvent(scratch.prefetchStream,draftContextStorage->tpRanks[rank]->done);
+                AssertInFastLLM(FastllmCudaGraphLaunchOnStream(storage.nextGraph->tpRanks[rank]->graphs[0].exec,
+                    scratch.prefetchStream),"Cannot launch sampled draft backbone.");
+                FastllmCudaEventRecord(scratch.prefetchReady,scratch.prefetchStream);
+                scratch.backboneReady = scratch.prefetchReady;
+            }
         });
     } catch (...) {
         // A partial submission cannot fall back. Retain borrowed request/cache
         // storage until every producer stream has drained, then propagate.
         draftTP->Run([&](int) { FastllmCudaSyncCurrentThreadStream(); });
+        if (sampled) draftTP->Run([&](int rank) {
+            auto &local = *storage.tpRanks[rank];
+            FastllmCudaEventRecord(local.prefetchReady,local.prefetchStream);
+            FastllmCudaEventSynchronize(local.prefetchReady);
+        });
         // The lookahead callback is only supplied by CommitSpeculativeCaches,
         // which holds historyMutex across submission and exception cleanup.
         if (enqueueNext) draftBatchStorage->JoinLookahead();
         throw;
     }
-    if (deviceAccepted) return true;
+    if (deviceAccepted) {
+        storage.pendingBackbone = sampled != nullptr;
+        return true;
+    }
+    storage.DrainPendingBackbone();
     for (int rank = 1; rank < 8; ++rank)
         FastllmCudaCurrentThreadStreamWaitEvent(draftContextStorage->tpRanks[rank]->done);
     FastllmCudaSyncCurrentThreadStream();
@@ -3200,6 +3270,25 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
 #endif
 }
 
+bool NaiveN05FlashModel::BorrowDraftLookahead(const std::vector<int> &anchors,
+        const std::vector<DraftContext *> &contexts, Data &hidden) {
+#if defined(USE_CUDA) && defined(FASTLLM_ENABLE_DRAFT_FUSED)
+    std::lock_guard<std::mutex> guard(historyMutex);
+    if (!draftBatchStorage || !draftBatchStorage->ConsumeLookahead(anchors, contexts)) return false;
+    ApplyDraftDevice();
+    // The view is consumed within this forward. Keep the cross-rank join for
+    // consumers which fall back after inspecting the request's sampling mode.
+    for (const auto &rank : draftBatchStorage->tpRanks)
+        FastllmCudaCurrentThreadStreamWaitEvent(rank->prefetchReady);
+    const auto &source = draftBatchStorage->tpRanks.front()->normalized;
+    hidden.FakeFrom(source, 0);
+    hidden.Resize(source.dims);
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool NaiveN05FlashModel::RunDraftLowLatencyBatch(const std::vector<int> &anchors,
         const std::vector<DraftContext *> &contexts, Data &normalized) {
     GraphCaptureScope capturePolicy(preparingGraphs);
@@ -3209,25 +3298,14 @@ bool NaiveN05FlashModel::RunDraftLowLatencyBatch(const std::vector<int> &anchors
 
     if (draftBatchStorage) {
         auto &storage = *draftBatchStorage;
-        bool reuse = storage.nextReady && storage.nextAnchors == anchors &&
-            storage.nextOwners.size() == contexts.size() && storage.nextLengths.size() == contexts.size() &&
-            storage.fusedContexts.size() == contexts.size();
-        storage.nextReady = false;
-        for (size_t row = 0; reuse && row < contexts.size(); ++row)
-            reuse = contexts[row] && storage.nextOwners[row].lock().get() == contexts[row] &&
-                storage.fusedContexts[row] == contexts[row] && contexts[row]->committed+1 == storage.nextLengths[row];
-        if (reuse) {
-            storage.nextConsumed = true;
+        if (storage.ConsumeLookahead(anchors, contexts)) {
             ApplyDraftDevice();
-            // Queue a dependency for local consumers, without blocking CPU
-            // target preparation while the other stream finishes the body.
-            // Keep the owner-side fan-in: downstream setup/exports share this
-            // stream across ranks, including transitions into fallback work.
             for (const auto &rank : storage.tpRanks)
                 FastllmCudaCurrentThreadStreamWaitEvent(rank->prefetchReady);
-            Copy(storage.tpRanks.front()->normalized,normalized);
+            Copy(storage.tpRanks.front()->normalized, normalized);
             return true;
         }
+        storage.nextReady = false;
         storage.JoinLookahead();
         storage.nextGraph.reset(); storage.nextOwners.clear();
         storage.fusedContexts.clear();
@@ -4050,7 +4128,11 @@ void NaiveN05FlashModel::PrepareDraftRound(DraftRound &round, const Data *prepar
     auto &context = round.context;
     const auto &config = round.config;
     const int anchor = round.anchor, limit = round.limit, oldLength = round.oldLength;
-    Data draftHidden = preparedLogits ? Data() : RunDraft(anchor, context);
+    Data borrowedHidden;
+    const bool borrowed = !preparedLogits && !preparedHidden && round.standalone &&
+        BorrowDraftLookahead({anchor}, {&context}, borrowedHidden);
+    Data ownedHidden = preparedLogits || preparedHidden || borrowed ? Data() : RunDraft(anchor, context);
+    Data &draftHidden = borrowed ? borrowedHidden : ownedHidden;
     if (preparedHidden) {
         draftHidden.FakeFrom(*preparedHidden, 0); draftHidden.Resize(preparedHidden->dims);
     }
@@ -4588,7 +4670,8 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
     const bool sharded = distributed && CanShardDraftHead();
     Data hidden;
     DraftHeadShards headShards{limits, tpDraftHeadInputs, tpDraftHeadLogits};
-    const bool ready = RunDraftBatch(anchors, contexts, hidden, reserveRows, sharded ? &headShards : nullptr);
+    const bool ready = (!distributed && BorrowDraftLookahead(anchors, contexts, hidden)) ||
+        RunDraftBatch(anchors, contexts, hidden, reserveRows, sharded ? &headShards : nullptr);
     if (backboneReady) *backboneReady = ready;
     if (!ready) return false;
     if (draftFusedContextFeatures && !distributed) {
