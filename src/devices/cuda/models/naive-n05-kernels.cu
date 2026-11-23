@@ -826,18 +826,21 @@ void LaunchSelectSortTop2048(const float *scores, int rows, int keys, int past, 
     SelectSortTop2048<<<rows, 256>>>(scores, keys, past, indices, partRows, gap);
 }
 
-// Keep long/short contexts on the original compiled kernel. The sample is
-// useful when its upper tail has enough observations to bracket K reliably.
+// The wide Blackwell scan also handles long histories. A sampled cutoff is
+// used only when the full scan proves its candidates contain the exact TopK.
 void LaunchSelectTopKCompact(const float *scores, unsigned long long *selected, int *offsets,
                             int queries, int keys, int queryStart, int topK, int capacity,
                             int partRows = 0, int gap = 0) {
-    if ((int64_t)keys >= 4LL * capacity && (int64_t)keys <= 32LL * capacity && topK >= 256) {
+    if ((int64_t)keys >= 4LL * capacity && topK >= 256) {
         // A wider vectorized scan amortizes its histogram over a long live
         // prefix. The sample only proposes a cutoff; all candidates are checked.
         const int arch = FastllmCudaRuntimeArch();
         const bool wide = queries >= 128 && ((topK > capacity / 2 && keys >= 32768 && arch == 90) ||
             (topK == 2048 && capacity == 4096 && queryStart >= 32768 && (arch == 100 || arch == 103)));
-        if (wide)
+        if ((int64_t)keys > 32LL * capacity && !(wide && (arch == 100 || arch == 103)))
+            SelectTopKCompact<false><<<queries, 256>>>(scores, selected, offsets, queries,
+                keys, queryStart, topK, capacity, partRows, gap);
+        else if (wide)
             SelectTopKCompact<true, 2, 1024><<<queries, 1024>>>(scores, selected, offsets, queries,
                 keys, queryStart, topK, capacity, partRows, gap);
         else if (topK > capacity / 2)
@@ -3844,7 +3847,7 @@ struct PairedIndexerAttention {
 static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weights,
                             const fastllm::Data &packedKeys, int heads, int dim,
                             int queryStart, int topK, bool fp8Query, fastllm::Data &indices, bool peerKeys, fastllm::Data *scoreScratch, fastllm::NaiveIndexerCompute compute,
-        const PairedIndexerAttention *paired) {
+        const PairedIndexerAttention *paired, bool longPrefill = false) {
     using namespace fastllm;
     // Indexer quantization is defined on 128-element blocks. The score kernel
     // has a general head-count path, but a different block width is unsupported.
@@ -3877,8 +3880,9 @@ static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weight
             tileQuery.FakeFrom(query, size_t(first) * heads * dim * query.unitSize);
             tileWeights.FakeFrom(weights, size_t(first) * heads * weights.unitSize);
             tileIndices.FakeFrom(indices, size_t(first) * topK * sizeof(int));
-            FastllmCudaNaiveIndexer(tileQuery, tileWeights, packedKeys, heads, dim,
-                queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch, compute);
+            NaiveIndexer(tileQuery, tileWeights, packedKeys, heads, dim,
+                queryStart + first, topK, fp8Query, tileIndices, peerKeys, scoreScratch, compute,
+                nullptr, longPrefill);
             first += count;
         }
         return false;
@@ -3906,11 +3910,26 @@ static bool NaiveIndexer(const fastllm::Data &query, const fastllm::Data &weight
         const int arch = queries > 1 ? FastllmCudaRuntimeArch() : 0;
         bool scored = false;
 #ifdef FASTLLM_ENABLE_NAIVE_INDEXER_SM100
-        if (!peerKeys && (arch == 100 || arch == 103))
+        if (!peerKeys && (arch == 100 || arch == 103)) {
+            void *packed = q.cudaData;
+            size_t packedBytes = q.GetBytes();
+            // On long paged histories the query allocation only fits a small
+            // slice of K. Borrow the dead score tail to pack a larger K tile;
+            // TopK can reuse it as soon as scoring finishes on this stream.
+            const size_t used = (scores.GetBytes() + 127) & ~size_t(127);
+            if (longPrefill && scoreScratch && !scores.isFake && !scores.cudaDataBorrowed &&
+                    scores.expansionBytes > used) {
+                const size_t available = std::min<size_t>(scores.expansionBytes - used, size_t(32) << 20);
+                if (available > packedBytes) {
+                    packed = static_cast<char *>(scores.cudaData) + used;
+                    packedBytes = available;
+                }
+            }
             scored = FastllmCudaNaivePrefillIndexerSm100(static_cast<const BF16 *>(query.cudaData),
                 static_cast<const BF16 *>(weights.cudaData), FastllmNaiveKV(packedKeys), stride, queries, keys,
-                queryStart, q.cudaData, q.GetBytes(), static_cast<float *>(qScale.cudaData),
+                queryStart, packed, packedBytes, static_cast<float *>(qScale.cudaData),
                 static_cast<float *>(scores.cudaData), cudaStreamPerThread);
+        }
 #endif
         if (!scored) {
             naive_dsa_mma::QuantizeIndexer<<<queries * heads, 128>>>(
@@ -4047,8 +4066,11 @@ void FastllmCudaNaivePrefillIndexedAttention(const FastllmNaivePrefillIndexerIte
         int heads, int kvHeads, int dim, int valueDim, fastllm::Data *scoreScratch,
         const fastllm::Data &attentionScratch) {
     const PairedIndexerAttention paired{attention, sink, attentionScratch, heads, kvHeads, dim, valueDim};
+    const bool longPrefill = topK == 2048 && index.keys->dims[1] > 16384 &&
+        index.indices == attention.indices && FastllmCudaHasBlackwellIndexerAttention();
     const bool consumed = NaiveIndexer(*index.query, *index.weights, *index.keys, indexHeads, indexDim,
-        index.past, topK, fp8Query, *index.indices, false, scoreScratch, compute, &paired);
+        index.past, topK, fp8Query, *index.indices, false, scoreScratch, compute,
+        longPrefill ? nullptr : &paired, longPrefill);
     if (!consumed) FastllmCudaNaiveBatchIndexerAttention({attention}, sink, heads, kvHeads, dim, valueDim, attentionScratch);
 }
 

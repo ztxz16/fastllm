@@ -590,7 +590,8 @@ static void TestPairedPrefillAttention(int keys = 2017, int keep = 512) {
     Upload(iq, {1, rows, 2048}, 43); Upload(weights, {1, rows, 16}, 53); Upload(ik, {1, keys, 128}, 59);
     Upload(q, {1, rows, heads * 192}, 67); Upload(k, {1, keys, 192}, 71); Upload(v, {1, keys, 128}, 73);
     privateIds.ToDevice(DataDevice::CUDA, {0}, false); privateIds.Allocate(false);
-    Data loan(FLOAT32, {4 * 1024 * 1024});
+    // Leave room after the score matrix for the long selector's candidates.
+    Data loan(FLOAT32, {keys > 16384 ? rows * (keys + 8192 + 3) + 2 : 4 * 1024 * 1024});
     loan.ToDevice(DataDevice::CUDA, {0}, false); loan.Allocate(false);
     for (bool tied : {false, true}) {
         if (tied) Require(cudaMemset(weights.cudaData, 0, weights.GetBytes()) == cudaSuccess, "zero Indexer weights");
@@ -602,7 +603,7 @@ static void TestPairedPrefillAttention(int keys = 2017, int keep = 512) {
         FastllmNaivePrefillAttentionItem attention{&q, &k, &v, &privateIds, &actual, past};
         FastllmCudaNaivePrefillIndexedAttention(index, attention, sink, 16, 128, keep, true,
             false, heads, 1, 192, 128, &loan, loan);
-        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "score bitmap changed ordered TopK attention");
+        Require(Read<uint16_t>(actual) == Read<uint16_t>(expected), "paired prefill changed ordered TopK attention");
         ++checks;
     }
 }
@@ -647,6 +648,7 @@ int main() {
         TestPackedPrefillRope();
         TestColdWindowCacheWrite();
         TestPairedPrefillAttention(); TestPairedPrefillAttention(8193, 2048); TestPairedPrefillAttention(16342, 2048);
+        TestPairedPrefillAttention(65537, 2048);
         TestBlackwellLocalRouter();
         TestBlackwellIndexerAttention();
         TestLocalPrefillBatch();

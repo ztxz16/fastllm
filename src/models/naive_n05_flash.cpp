@@ -2087,8 +2087,7 @@ Data NaiveN05FlashModel::RunTarget(
                     pairedPrefill = rankIndexer && FastllmCudaHasBlackwellIndexerAttention() &&
                         prefillItems.size() == packedIndices.size();
                     for (size_t i = 0; pairedPrefill && i < prefillItems.size(); ++i)
-                        pairedPrefill = prefillItems[i].indices == &packedIndices[i] &&
-                            prefillItems[i].keys->dims[1] <= 16384;
+                        pairedPrefill = prefillItems[i].indices == &packedIndices[i];
                     if (!pairedPrefill)
                         FastllmCudaNaiveBatchIndexer(prefillItems, indexHeads, indexDim, indexTopK,
                             indexFp8, prefillScores, indexerCompute);

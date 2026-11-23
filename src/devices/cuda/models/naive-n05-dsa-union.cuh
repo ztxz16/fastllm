@@ -19,7 +19,7 @@ struct UnionKV {
 // One CTA owns a group. Load and validate each TopK ID exactly once, then reuse
 // the registers to construct both the sorted union and its per-query memberships.
 __global__ __launch_bounds__(512) void BuildUnion(const int *indices, int *positions, int *lengths,
-        uint32_t *bits, TileSpan *spans, int rows, int past, int keep, int windowWords, bool adaptive,
+        uint32_t *bits, TileSpan *spans, int rows, int past, int keep, int windowWords, bool adaptive, bool direct,
         int positionStride, int maskStride) {
     constexpr int threads = 512, perThread = UnionCapacity / threads;
     using Scan = cub::BlockScan<int, threads>;
@@ -80,7 +80,13 @@ __global__ __launch_bounds__(512) void BuildUnion(const int *indices, int *posit
         total += unique;
         const int tiles = max(1,(count + 3) / 4);
         if (adaptive && total * 3 >= tiles * 256) {
-            if (!t) { lengths[group] = -1; spans[group] = {int(start / 128),tiles}; }
+            if (!t) { lengths[group] = DenseRows; spans[group] = {int(start / 128),tiles}; }
+            return;
+        }
+        // A scattered union this wide costs more FMHA tiles than reading
+        // each row's own TopK. Dense islands above still use contiguous TMA.
+        if (direct && total >= 6 * UnionKeys) {
+            if (!t) lengths[group] = DirectRows;
             return;
         }
         for (int i = begin; i < end; ++i) {
@@ -155,7 +161,7 @@ __global__ void BuildBitmapUnion(const uint32_t *input, int stride, int *positio
     __syncthreads();
     const int tiles = max(1, high / 4 - low / 4 + 1);
     if (adaptive && total * 3 >= tiles * 256) {
-        if (!t) { lengths[group] = -1; spans[group] = {low / 4, tiles}; }
+        if (!t) { lengths[group] = DenseRows; spans[group] = {low / 4, tiles}; }
         return;
     }
     if (!t) lengths[group] = total;

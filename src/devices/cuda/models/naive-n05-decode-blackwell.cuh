@@ -82,10 +82,9 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const unsigned (&a)[4], 
 }
 
 #endif
-template <bool Split = false, int Groups = 1>
-__global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
-    Decode(const __nv_bfloat16 *q, const __grid_constant__ naive_attention_bulk::Batch batch, const float *sink,
-           __nv_bfloat16 *out, int q_heads, float *parts = nullptr, float2 *stats = nullptr) {
+template <bool Split, int Groups, bool Prefill = false>
+__device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmNaiveDSARow &row,
+        const float *sink, __nv_bfloat16 *out, int q_heads, float *parts, float2 *stats) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     static_assert(Groups == 1 || (Groups == 2 && !Split));
     using L = Layout<Groups>;
@@ -93,7 +92,6 @@ __global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
     const int b = blockIdx.x, firstHead = blockIdx.y * Groups;
     const int group = (threadIdx.x / 32) / NCW;
     const int hg = firstHead + group;
-    const FastllmNaiveDSARow row = FastllmNaiveResolveDSARow(batch.rows[b]);
     const int length = naive_dsa_decode::Length(row);
     if (length == 0) {
         if constexpr (Split) {
@@ -227,9 +225,14 @@ __global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int token = g * 16 + nt * 8 + 2 * c + (i & 1);
-                // Preserve the model's two BF16 roundings before the online softmax.
-                const float dot = __bfloat162float(__float2bfloat16_rn(sc[nt][i]));
-                const float score = __bfloat162float(__float2bfloat16_rn(dot * qkScale));
+                // Match the caller: Blackwell prefill scales FP32 logits;
+                // the decode path rounds both the dot product and scaled score.
+                float score;
+                if constexpr (Prefill) score = sc[nt][i] * qkScale;
+                else {
+                    const float dot = __bfloat162float(__float2bfloat16_rn(sc[nt][i]));
+                    score = __bfloat162float(__float2bfloat16_rn(dot * qkScale));
+                }
                 sc[nt][i] = (valid >> token) & 1u ? score * 1.4426950408889634f : -INFINITY;
             }
         }
@@ -388,6 +391,15 @@ __global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
     }
 #endif
 }
+
+template <bool Split = false, int Groups = 1>
+__global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
+    Decode(const __nv_bfloat16 *q, const __grid_constant__ naive_attention_bulk::Batch batch, const float *sink,
+           __nv_bfloat16 *out, int q_heads, float *parts = nullptr, float2 *stats = nullptr) {
+    AttendRow<Split, Groups>(q, FastllmNaiveResolveDSARow(batch.rows[blockIdx.x]),
+                             sink, out, q_heads, parts, stats);
+}
+
 #endif
 // Keep the merge launch stub linkable in builds targeting only older GPUs.
 // One warp reduces four adjacent output channels per lane.
