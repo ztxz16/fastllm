@@ -246,6 +246,8 @@ class ToolParserManager:
         if (force_type not in ['auto', '']):
             # 如果指定了tool_parser类型，那么直接使用
             return cls.get_tool_parser(force_type)
+        if "<|content_invoke_tool_json|>" in chat_template or (not force_chat_template and model_type == "inkling2_loop"):
+            return cls.get_tool_parser("inkling2_loop")
         if (force_chat_template):
             # 如果指定了强制指定了chat_template，那么尝试检测tool调用类型
             target = ""

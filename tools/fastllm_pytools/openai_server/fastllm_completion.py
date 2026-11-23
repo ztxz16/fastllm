@@ -916,7 +916,7 @@ class FastLLmCompletion:
 
   def _new_reasoning_state(self, emit_reasoning_content, preserve_xtml=False):
       if self._uses_inkling_messages():
-          return {"format": "inkling", "phase": "content", "active": False, "buffer": ""}
+          return {"format": "inkling", "phase": "content", "buffer": "", "tools": preserve_xtml}
       reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
       return {
           "active": emit_reasoning_content,
@@ -939,7 +939,7 @@ class FastLLmCompletion:
           state = {"phase": "content", "buffer": ""}
           parts = list(consume(result, state))
           parts.append((state["phase"], state["buffer"]))
-          return ("".join(text for channel, text in parts if channel == "content"),
+          return ("".join(text for channel, text in parts if channel == "content" or (preserve_xtml and channel in ("tool", "tool_json"))),
                   "".join(text for channel, text in parts if channel == "reasoning") or None)
       if self._is_kimi_k3_model():
           if emit_reasoning_content:
@@ -1203,9 +1203,13 @@ class FastLLmCompletion:
       tail = state["buffer"]
       if not tail:
           return None
-      if state["format"] == "inkling" and state["phase"] == "content":
-          return DeltaMessage(content=tail)
-      if state["format"] == "inkling" or (state["format"] != "kimi_k3" and state["active"]):
+      if state["format"] == "inkling":
+          if state["phase"] == "content":
+              return DeltaMessage(content=tail)
+          if state["phase"] == "reasoning":
+              return DeltaMessage(reasoning_content=tail)
+          return None
+      if state["format"] != "kimi_k3" and state["active"]:
           return DeltaMessage(reasoning_content=tail)
       return None
 
@@ -1218,7 +1222,7 @@ class FastLLmCompletion:
           from .inkling_messages import consume
           parts = list(consume(delta_text, state))
           return ([DeltaMessage(reasoning_content=text) for channel, text in parts if channel == "reasoning"],
-                  "".join(text for channel, text in parts if channel == "content"))
+                  "".join(text for channel, text in parts if channel == "content" or (state["tools"] and channel in ("tool", "tool_json"))))
       if state.get("format") == "kimi_k3":
           return self._consume_kimi_k3_reasoning_delta(
               delta_text, state)
@@ -3454,6 +3458,17 @@ class FastLLmCompletion:
       messages = self._apply_kimi_k3_required_tool_guidance(
           messages, tools, tool_choice)
       try:
+          if self._uses_inkling_messages():
+              # Inkling's template declares every supplied tool and has no
+              # tool_choice field. Limit declarations to the selected functions.
+              name = self._named_tool_choice(tool_choice)
+              if tool_choice == "none":
+                  tools = None
+                  request = request.model_copy(update={"tools": None})
+              elif name is not None:
+                  tools = [tool for tool in tools or [] if tool["function"]["name"] == name]
+                  if not tools:
+                      raise ValueError(f"tool_choice requests unknown function {name!r}")
           messages, tools = self._apply_dots_tool_choice(
               messages, tools, tool_choice)
           messages, tools = self._apply_qwen_xml_tool_choice(
