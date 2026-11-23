@@ -1213,18 +1213,6 @@ namespace fastllm {
             return profiler;
         }
 
-        // FASTLLM_DSPARK_PROBE_EVERY=N：每 N 轮故意不带候选走一次普通单 token 前向，
-        // 给"校验 N 个候选"提供一个同等缓存状态下的对照基线。N=0（默认）关闭。
-        // 只在诊断时打开：这些轮次不投机，会按比例损失一点吞吐。
-        bool DsProbeThisRound() {
-            static int every = DsEnvInt("FASTLLM_DSPARK_PROBE_EVERY", 0);
-            if (every <= 0) {
-                return false;
-            }
-            static std::atomic<long long> counter{0};
-            return (counter.fetch_add(1) % every) == 0;
-        }
-
         // 计时开销可以忽略，但关掉统计时连时钟都不读
         inline double DsTick() {
             return DsProfiler().On() ? DsNowMs() : 0.0;
@@ -2157,11 +2145,6 @@ namespace fastllm {
                 }
             }
         }
-        if (DsProbeThisRound()) {
-            // 对照轮：丢掉候选走普通前向（下一轮 DsparkAdvance 会重新生成）
-            dspark.drafts.clear();
-            return 0;
-        }
         DsProfiler().AddProposal(generated, count);
         if (count <= 0) {
             dspark.drafts.clear();
@@ -2249,7 +2232,7 @@ namespace fastllm {
                 const auto w = proposal.workspace;
                 if (numSegments == 1 && w && w->pendingCount == 5 && w->packetPosition == segment.startPos &&
                     proposal.anchor == anchor && proposal.anchorPos == segment.startPos && proposal.committed == segment.startPos &&
-                    !proposal.disabled && !std::getenv("FASTLLM_DSPARK_FORCE_DRAFTS") && !std::getenv("FASTLLM_DSPARK_PROBE_EVERY") &&
+                    !proposal.disabled && !std::getenv("FASTLLM_DSPARK_FORCE_DRAFTS") &&
                     (max_positions <= 0 || int64_t(segment.startPos) + 6 <= max_positions) &&
                     (tokensLimit <= 0 || int64_t(segment.startPos) + 6 <= tokensLimit)) {
                     drafts = w->pendingCount;
@@ -3862,7 +3845,7 @@ namespace fastllm {
         // A growing single-request history does not reuse its exact-width graph.
         // Run the same prepared kernels once, preserving the compact attention layout.
         if (graphState && batch == 1 && valid < window_size && !fixedPartialHistory && !randomDraft &&
-            !hybridDraft && !diskDraft && !DsEnvFlag("FASTLLM_DSPARK_COMPACT_WINDOW")) {
+            !hybridDraft && !diskDraft) {
             FastllmCudaGraphPreparation preparation;
             backbone();
         } else if (!graphState || !DsRunDraftGraph(*graphState, backbone,

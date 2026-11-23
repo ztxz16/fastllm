@@ -27,7 +27,7 @@ struct Plan {
     void *storage = nullptr;
     std::shared_ptr<void> owner;
     int device = -1, gridY = 0;
-    bool gathered = false, trimVerify = false;
+    bool gathered = false;
     bf16 *decoded = nullptr;
     int32_t *decodedIndices = nullptr;
     int32_t *extraLengths = nullptr;
@@ -39,7 +39,7 @@ struct Plan {
         midLse = reinterpret_cast<float *>(mid + count * 512);
         decoded = gathered ? reinterpret_cast<bf16 *>(midLse + count) : nullptr;
         decodedIndices = gathered ? reinterpret_cast<int32_t *>(decoded + size_t(batch) * (128 + width) * 512) : nullptr;
-        extraLengths = gathered && trimVerify ? decodedIndices + size_t(batch) * (128 + width) : nullptr;
+        extraLengths = gathered && verifying ? decodedIndices + size_t(batch) * (128 + width) : nullptr;
     }
 };
 
@@ -246,15 +246,13 @@ void *FastllmV41FlashInferCreate(const FastllmV41FullDecodeConfig &c) {
     p->heads = c.heads;
     p->batch = c.batch;
     p->verifying = c.verifying;
-    const char *fullWidth = std::getenv("FASTLLM_DSV41_FULL_VERIFY_KV");
-    p->trimVerify = c.verifying && !(fullWidth && !std::strcmp(fullWidth, "1"));
     p->scratchHeads = (c.heads + 15) / 16 * 16;
     // cudaMalloc aligns the BF16 split tensor; each split occupies 1024 bytes.
     const size_t midCount = size_t(c.batch) * p->scratchHeads * p->splits;
     const size_t selectedRows = p->gathered ? decodedRows : 0;
     const size_t baseBytes = midCount * (512 * sizeof(bf16) + sizeof(float));
     const size_t bytes = baseBytes + selectedRows * (1024 + sizeof(int32_t)) +
-        (p->gathered && p->trimVerify ? size_t(c.batch) * sizeof(int32_t) : 0);
+        (p->gathered && p->verifying ? size_t(c.batch) * sizeof(int32_t) : 0);
     if (cudaMalloc(&p->storage, bytes) != cudaSuccess) {
         cudaGetLastError();
         // Optional decoded KV must not make a formerly supported plan fail.
@@ -296,7 +294,7 @@ bool FastllmV41FlashInferShareWorkspace(void *handle, void *source) {
     auto *p = static_cast<Plan *>(handle), *q = static_cast<Plan *>(source);
     if (!p || !q || p->device != q->device || p->batch != q->batch ||
         p->scratchHeads != q->scratchHeads || p->splits != q->splits ||
-        p->width != q->width || p->gathered != q->gathered || p->trimVerify != q->trimVerify || !q->owner) return false;
+        p->width != q->width || p->gathered != q->gathered || p->verifying != q->verifying || !q->owner) return false;
     p->owner = q->owner;
     p->storage = p->owner.get();
     p->BindStorage();

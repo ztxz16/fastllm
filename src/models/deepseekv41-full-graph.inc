@@ -1247,7 +1247,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
             // Each rank consumes its own token IDs and private Engram rows. The
             // preceding sampling fence protects the pinned source across replays.
-            if ((multiVerify || !g->greedyMapped.empty()) && V41EnvFlag("FASTLLM_DSV41_OWNER_INPUT_PACKET") &&
+            if ((multiVerify || !g->greedyMapped.empty()) &&
                 std::all_of(g->engrams.begin(), g->engrams.end(), [&](const auto &entry) {
                     return entry.second->owners.size() == g->devices.size();
                 })) {
