@@ -299,7 +299,7 @@ void HybridMoeBF16::Run(const Data &input, const Data &index, const Data &score,
         CudaBF16(cudaStreamSynchronize(cudaStreamPerThread));
         CudaBF16(cudaStreamSynchronize(w.copyStream));
         auto elapsed = [&](cudaEvent_t a, cudaEvent_t b) { float ms; CudaBF16(cudaEventElapsedTime(&ms, a, b)); return ms * 1000.; };
-        if (cpuRoutes) timing.cpuExpert.Observe(cpuUs / cpuRoutes);
+        HybridMoeRoutes::ObserveCpu(timing, rows, cpuRoutes, cpuUs);
         if (residentRoutes) timing.residentExpert.Observe(elapsed(w.residentStart, w.residentDone) / residentRoutes);
         if (selected) {
             timing.copiedExpert.Observe(elapsed(w.copyStart, w.copyDone) / selected);

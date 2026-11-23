@@ -24,6 +24,18 @@ static void TestHybridRouteGrouping() {
     Require(plan.misses == std::vector<int>({3,0,2}) && plan.staged == 1 && plan.stagedRows == 3,
             "staging a reused expert must cost a single upload");
     Require(plan.grouped[3] == std::vector<int>({0,3,6}), "grouping reordered routes within an expert");
+    HybridMoeRoutes coldDecode({1, 0, 2}, 4, 1, 0, false, &frequency, scheduler, 1);
+    Require(coldDecode.staged == 0, "cold single-row decode must measure its CPU subset");
+    HybridMoeRoutes probe({1, 0, 2}, 4, 1, 0, false, &frequency, scheduler, 1, true);
+    HybridMoeRoutes noRoom({1, 0, 2}, 4, 1, 0, false, &frequency, scheduler, 0, true);
+    HybridMoeRoutes allHits({1}, 4, 1, 0, false, &frequency, scheduler, 1, true);
+    Require(probe.staged == 1 && noRoom.staged == 0 && allHits.staged == 0,
+            "timed probes must use real misses and respect the staging budget");
+    HybridMoeRoutes::ObserveCpu(scheduler, 2, 2, 80);
+    Require(!scheduler.decodeCpu[2].initialized, "batched rows polluted single-row CPU costs");
+    HybridMoeRoutes::ObserveCpu(scheduler, 1, 2, 50);
+    HybridMoeRoutes warmDecode({1, 0, 2}, 4, 1, 0, false, &frequency, scheduler, 1);
+    Require(scheduler.DecodeCpuUs(2) == 50 && warmDecode.staged == 1, "decode did not probe a GPU split");
     HybridMoeRoutes host(ids, 4, 1, 0, true, nullptr, scheduler, 0);
     Require(host.residentRows == 0 && host.staged == 0 && host.misses.size() == 4,
             "zero-budget CPU routing dropped experts");

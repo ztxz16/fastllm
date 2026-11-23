@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cuda_runtime.h>
+#include "fastllm-cuda-driver-entry.h"
 #include <cuda.h>
 #include <algorithm>
 #include <cstring>
@@ -10,6 +10,7 @@
 #include <utility>
 #include <condition_variable>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <vector>
 #include <deque>
@@ -27,10 +28,17 @@ class HostCopyPool {
     std::mutex submit_, mutex_;
     std::condition_variable work_, complete_;
     std::thread helper_;
-    void *destination_ = nullptr;
-    const void *source_ = nullptr;
-    size_t bytes_ = 0;
-    bool pending_ = false, stopping_ = false;
+    using Task = void (*)(const void *) noexcept;
+    Task task_ = nullptr;
+    const void *argument_ = nullptr;
+    bool stopping_ = false;
+    void start(Task task, const void *argument) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        complete_.wait(lock, [&] { return !task_; });
+        task_ = task;
+        argument_ = argument;
+        work_.notify_one();
+    }
 public:
     explicit HostCopyPool(const std::vector<int> &cpus) {
         unsigned available = std::thread::hardware_concurrency();
@@ -51,11 +59,12 @@ public:
 #endif
                 std::unique_lock<std::mutex> lock(mutex_);
                 for (;;) {
-                    work_.wait(lock, [&] { return pending_ || stopping_; });
-                    if (stopping_) return;
-                    void *dst = destination_; const void *src = source_; const size_t bytes = bytes_;
-                    lock.unlock(); std::memcpy(dst, src, bytes); lock.lock();
-                    pending_ = false; complete_.notify_one();
+                    work_.wait(lock, [&] { return task_ || stopping_; });
+                    if (!task_) return;
+                    const auto task = task_;
+                    const auto argument = argument_;
+                    lock.unlock(); task(argument); lock.lock();
+                    task_ = nullptr; complete_.notify_all();
                 }
             });
         } catch (const std::system_error &) { /* Resource limits retain inline memcpy. */ }
@@ -65,22 +74,29 @@ public:
         work_.notify_one();
         if (helper_.joinable()) helper_.join();
     }
+    // The graph owns the descriptor until its staged branch joins. Jobs only
+    // access host memory and publish their own completion to the device.
+    void Submit(Task task, const void *argument) {
+        if (!helper_.joinable()) { task(argument); return; }
+        std::lock_guard<std::mutex> submission(submit_);
+        start(task, argument);
+    }
     void Copy(void *destination, const void *source, size_t bytes) {
         if (!helper_.joinable() || bytes < (1ULL << 20)) { std::memcpy(destination, source, bytes); return; }
         // Concurrent admission and graph staging may share this helper. No
         // CUDA call or GPU wait is allowed while this CPU-only lock is held.
         std::lock_guard<std::mutex> submission(submit_);
         const size_t first = (bytes / 2) & ~size_t(63);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            destination_ = static_cast<unsigned char *>(destination) + first;
-            source_ = static_cast<const unsigned char *>(source) + first;
-            bytes_ = bytes - first; pending_ = true;
-        }
-        work_.notify_one();
+        struct Block { void *dst; const void *src; size_t bytes; };
+        Block upper{static_cast<unsigned char *>(destination) + first,
+                    static_cast<const unsigned char *>(source) + first, bytes - first};
+        start([](const void *argument) noexcept {
+            const auto &b = *static_cast<const Block *>(argument);
+            std::memcpy(b.dst, b.src, b.bytes);
+        }, &upper);
         std::memcpy(destination, source, first);
         std::unique_lock<std::mutex> lock(mutex_);
-        complete_.wait(lock, [&] { return !pending_; });
+        complete_.wait(lock, [&] { return !task_; });
     }
 };
 
@@ -280,9 +296,10 @@ class ImmutableHostUploadRing {
     std::shared_ptr<HostUploadProducer> producer_;
 public:
     bool Init(int device) {
-        if (cudaGetDriverEntryPoint("cuStreamWaitValue32", reinterpret_cast<void **>(&wait_), cudaEnableDefault) != cudaSuccess ||
-            cudaGetDriverEntryPoint("cuStreamWriteValue32", reinterpret_cast<void **>(&write_), cudaEnableDefault) != cudaSuccess ||
-            !wait_ || !write_) { cudaGetLastError(); return false; }
+        if (!DriverEntry("cuStreamWaitValue32", 11070, wait_) || !DriverEntry("cuStreamWriteValue32", 11070, write_)) {
+            cudaGetLastError();
+            return false;
+        }
         for (auto &s : slots_) {
             if (cudaHostAlloc(&s.host, sizeof(HostUploadSignal) + chunkBytes,
                     cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess ||

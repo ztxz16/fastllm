@@ -2512,7 +2512,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     }
     // Recalibrate initially and periodically without putting timing nodes on
     // every replay. CPU cost observations continue on every token.
-    const bool timed = !g->untimedExec || g->replays < 8 || (g->replays % 32 == 0);
+    const bool timed = !g->untimedExec || SampleHybridMoeReplay(g->replays);
     std::vector<int> uploaded(g->devices.size(), 0), ok(g->devices.size(), 0);
     std::atomic<int> ready{0};
     int indexVariant = -1;
@@ -2572,7 +2572,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
                 rankStep.Begin(table.data(), table.size(), num_experts_per_tok);
                 AssertInFastLLM(bool(rankStep), "TP full graph cache policy unavailable");
             }
-            const bool rankTimed = g->replays < 8 || g->replays % 32 == 0 || !g->rankUntimedExecs[rank];
+            const bool rankTimed = SampleHybridMoeReplay(g->replays) || !g->rankUntimedExecs[rank];
             void *exec = g->tensorParallel
                 ? (rankTimed ? g->execs[rank] : g->rankUntimedExecs[rank])
                 : (timed ? g->execs[rank] : g->untimedExec);

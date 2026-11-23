@@ -14,6 +14,7 @@
 #include "deepseekv41_execution.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-v41-full-decode.h"
+#include "utils/hybrid_moe_routes.h"
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
 #include "devices/cuda/fastllm-dsv41-mega.h"
 extern "C" bool FastllmCudaDeepSeekV41HcPost(const fastllm::Data &, const fastllm::Data &,

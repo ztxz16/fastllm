@@ -11,6 +11,9 @@
 
 #include "fastllm-cuda.cuh"
 #include "fastllm-cuda-v41-gguf.h"
+#if defined(USE_NUMAS) && !defined(USE_ROCM) && CUDART_VERSION >= 11070
+#include "devices/cuda/fastllm-moe-graph-timing.cuh"
+#endif
 #include "devices/cuda/fastllm-cuda-moe-cache-stats.h"
 #include "fastllm-cuda-expert-cache.cuh"
 #include "fastllm-cuda-cache-layout.h"

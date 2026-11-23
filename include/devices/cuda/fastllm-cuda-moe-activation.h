@@ -2,6 +2,8 @@
 
 #include "fastllm.h"
 
+struct CUstream_st;
+
 namespace fastllm {
 // Both projections and route reduction belong to MergeMOE. A model can
 // supply the intermediate activation when it includes quantization and
@@ -32,6 +34,20 @@ void DoCudaMergeMOE(const Data &input, Data &output, const Data &indices, const 
 bool RunCudaMarlinMoeWithActivation(const Data &input, Data &output, const Data &indices, const Data &scores,
                                    Data &gateUp, Data &middle, Data **weights, int weightsBatch,
                                    const CudaMoeActivation &activation);
+// Stable slot tables for indexed FP32 projection. Owners may refill the payload
+// between calls. NVFP4 uses block-16 records; FP8 uses separate block scales.
+struct CudaIndexedMoeSlots {
+    uint8_t **gate, **down;
+    float **gateScales, **downScales;
+    int gateBlockM, gateBlockK, downBlockM, downBlockK;
+};
+void CudaMoeGraphSlotGate(const CudaIndexedMoeSlots &, float *input, const int *slots, float *output,
+                          int rows, int top, int hidden, int intermediate, CUstream_st *stream);
+void CudaMoeGraphSlotDown(const CudaIndexedMoeSlots &, float *middle, const int *slots, float *output,
+                          int routes, int hidden, int intermediate, CUstream_st *stream);
+bool RunCudaIndexedMoeSlots(const CudaIndexedMoeSlots &slots, const Data &input, const Data &indices,
+                            const Data &scores, Data &gateUp, Data &middle, Data &output,
+                            int intermediate, const CudaMoeActivation &activation);
 bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data &indices,
                                      const Data &scores, Data &gateUp, Data &middle, Data **weights,
                                      int weightsBatch, const CudaMoeActivation &activation);

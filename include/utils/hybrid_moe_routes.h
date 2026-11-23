@@ -8,6 +8,11 @@
 #include <vector>
 
 namespace fastllm {
+// Observe early replays and periodically refresh costs after warmup.
+inline bool SampleHybridMoeReplay(uint64_t replays) {
+    return replays < 8 || (replays % 32) == 0;
+}
+
 // Preserve route order within each expert. Charge a missed expert one transfer,
 // even when multiple requests or verification rows reuse it.
 struct HybridMoeRoutes {
@@ -16,7 +21,7 @@ struct HybridMoeRoutes {
     int residentRows = 0, stagedRows = 0, staged = 0;
 
     HybridMoeRoutes(const std::vector<int> &ids, int experts, int rows, int keyBase, bool prefill,
-                    MoeFrequencyPolicy *frequency, const MoeDecodeOverlapScheduler &timing, int stagingSlots)
+                    MoeFrequencyPolicy *frequency, const MoeDecodeOverlapScheduler &timing, int stagingSlots, bool probeUpload = false)
         : grouped(experts) {
         for (int r = 0; r < int(ids.size()); ++r) {
             if (ids[r] < 0 || ids[r] >= experts) throw std::out_of_range("Hybrid MoE expert index");
@@ -49,8 +54,19 @@ struct HybridMoeRoutes {
         std::vector<int> reuse;
         reuse.reserve(misses.size());
         for (int e : misses) reuse.push_back(grouped[e].size());
-        staged = std::min(stagingSlots, timing.SelectMisses(misses.size(), residentRows, reuse.data()));
+        const bool decode = !prefill && rows == 1 && hits.size() + misses.size() == ids.size();
+        const int selected = decode ? timing.SelectDecodeMisses(misses.size(), residentRows)
+                                    : timing.SelectMisses(misses.size(), residentRows, reuse.data());
+        // Match an infrequently used transfer to a timed replay. Use one of the
+        // actual misses, preserving the cache capacity and the uniqueness order.
+        staged = std::min(stagingSlots, std::max(selected, int(probeUpload && !misses.empty())));
         stagedRows = std::accumulate(reuse.begin(), reuse.begin() + staged, 0);
+    }
+
+    static void ObserveCpu(MoeDecodeOverlapScheduler &timing, int rows, int routes, double us) {
+        if (!routes) return;
+        if (rows == 1 && routes < int(timing.decodeCpu.size())) timing.ObserveDecodeCpu(routes, us);
+        else timing.cpuExpert.Observe(us / routes);
     }
 
     MoeFrequencyPolicy::Admission selectPrefill(const MoeFrequencyPolicy &frequency, int keyBase, int expert) const {

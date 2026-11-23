@@ -30,6 +30,9 @@ SOFTWARE.
 #endif
 #include "deepseekv41-router-tc.cuh"
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11070
+#include "devices/cuda/fastllm-cuda-driver-entry.h"
+#endif
 #include "devices/cuda/fastllm-v41-full-decode.h"
 #include "fastllm-v41-decode.cuh"
 #include "devices/cuda/fastllm-dsv41-mega.h"
@@ -9157,10 +9160,11 @@ bool FastllmCudaV41CreateHostCopy(void *dst, size_t bytes, void **hostData,
     *hostData = nullptr; *ready = nullptr; *result = nullptr;
     decltype(&cuCtxGetCurrent) context = nullptr;
     decltype(&cuGraphAddBatchMemOpNode) add = nullptr;
-    if (cudaGetDriverEntryPoint("cuCtxGetCurrent", reinterpret_cast<void **>(&context),
-            cudaEnableDefault) != cudaSuccess || !context ||
-        cudaGetDriverEntryPoint("cuGraphAddBatchMemOpNode", reinterpret_cast<void **>(&add),
-            cudaEnableDefault) != cudaSuccess || !add) { cudaGetLastError(); return false; }
+    if (!fastllm::cuda::DriverEntry("cuCtxGetCurrent", 4000, context) ||
+        !fastllm::cuda::DriverEntry("cuGraphAddBatchMemOpNode", 11070, add)) {
+        cudaGetLastError();
+        return false;
+    }
     void *host = nullptr, *mapped = nullptr;
     cudaGraph_t graph = nullptr;
     CUcontext ctx = nullptr;

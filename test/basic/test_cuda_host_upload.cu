@@ -1,6 +1,8 @@
-#include "devices/cuda/fastllm-cuda-host-upload.h"
+#include "devices/cuda/fastllm-hybrid-moe-admission.cuh"
 #include "devices/cuda/fastllm-cuda-mapped-host.h"
+#include <chrono>
 #include <cstdio>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 
@@ -8,16 +10,84 @@ static void Check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 
+// Replay the same reader graph across a slot replacement. The existing
+// unpinned test runs this again with the asynchronous upload ring unavailable.
+static void CheckPublishedSlot() {
+    fastllm::cuda::HybridMoeAdmissions admissions;
+    fastllm::cuda::HybridMoeAdmissions::Publication layer;
+    admissions.attach(layer);
+    fastllm::MoeCacheConfig config;
+    config.halfLife = 1;
+    config.replacementMargin = 0;
+    fastllm::MoeFrequencyPolicy policy({0, 0}, {0}, 1, config);
+    cudaStream_t writer, reader;
+    unsigned char *slot, *snapshot;
+    Check(cudaStreamCreateWithFlags(&writer, cudaStreamNonBlocking));
+    Check(cudaStreamCreateWithFlags(&reader, cudaStreamNonBlocking));
+    Check(cudaMalloc(&slot, 1));
+    Check(cudaMalloc(&snapshot, 1));
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    Check(cudaStreamBeginCapture(reader, cudaStreamCaptureModeThreadLocal));
+    layer.wait(reader, true);
+    Check(cudaMemcpyAsync(snapshot, slot, 1, cudaMemcpyDeviceToDevice, reader));
+    Check(cudaStreamEndCapture(reader, &graph));
+    Check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    for (int key = 0; key < 2; ++key) {
+        policy.BeginStep();
+        policy.Observe(0, &key, 1);
+        admissions.publish(policy, writer, [](int) { return 0; },
+            [&](auto entry, cudaStream_t stream, fastllm::cuda::ImmutableHostUploadRing *) -> auto & {
+                if (entry.key != key || entry.slot != 0) throw std::runtime_error("wrong expert admission");
+                if (!layer.ready) {
+                    Check(cudaLaunchHostFunc(stream, [](void *) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }, nullptr));
+                }
+                Check(cudaMemsetAsync(slot, key + 1, 1, stream));
+                return layer;
+            });
+        if (!layer.ready) Check(cudaStreamQuery(writer));
+        Check(cudaGraphLaunch(exec, reader));
+        Check(cudaStreamSynchronize(reader));
+        unsigned char result = 0;
+        Check(cudaMemcpy(&result, snapshot, 1, cudaMemcpyDeviceToHost));
+        if (result != key + 1) throw std::runtime_error("graph read stale expert slot");
+    }
+    Check(cudaGraphExecDestroy(exec));
+    Check(cudaGraphDestroy(graph));
+    Check(cudaFree(snapshot));
+    Check(cudaFree(slot));
+    Check(cudaStreamDestroy(reader));
+    Check(cudaStreamDestroy(writer));
+}
+
 int main() {
     try {
         int devices = 0;
         Check(cudaGetDeviceCount(&devices));
         if (!devices) return 77;
+        CheckPublishedSlot();
         // Cross more than four ring slots, include an unaligned tail, and
         // immediately overwrite each ordinary source after Copy returns.
         const size_t bytes = (21ULL << 20) + 37;
         std::vector<unsigned char> source(bytes), expected(bytes), actual(bytes);
         for (size_t i = 0; i < bytes; ++i) expected[i] = (i * 17 + i / 65537) % 251;
+        // A graph refill and a synchronous admission can share the copy worker.
+        struct Copy { void *out; const void *in; size_t size; } job{source.data(), expected.data(), bytes};
+        auto run = [](const void *context) noexcept {
+            const auto &copy = *static_cast<const Copy *>(context);
+            std::memcpy(copy.out, copy.in, copy.size);
+        };
+        {
+            fastllm::cuda::HostCopyPool pool({});
+            pool.Submit(run, &job);
+            pool.Copy(actual.data(), expected.data(), bytes);
+            if (actual != expected || source != expected) throw std::runtime_error("shared host copy lost a job");
+            std::fill(source.begin(), source.end(), 0);
+            pool.Submit(run, &job);
+        }
+        if (source != expected) throw std::runtime_error("host copy worker dropped its final refill");
         for (int device = 0; device < std::min(devices, 2); ++device) {
             Check(cudaSetDevice(device));
             cudaStream_t streams[2];

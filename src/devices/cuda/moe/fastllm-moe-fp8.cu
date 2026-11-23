@@ -1830,7 +1830,7 @@ __global__ __launch_bounds__(256) void FastllmGemvTypedFP8E4M3TopKDownReduceInde
     }
 }
 
-template <typename T, int THREAD_PER_BLOCK, bool PROJECT_ONLY = false>
+template <typename T, int THREAD_PER_BLOCK, bool PROJECT_ONLY = false, bool HOST_ROWS = false>
 __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel(T *A, const int32_t *indices,
                                                                          uint8_t **weights, float **scalesPtrs,
                                                                          T *C, int batch, int topk, int m, int k,
@@ -1846,6 +1846,7 @@ __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel(T *A, c
     }
 
     int expertIdx = indices[task];
+    if constexpr (HOST_ROWS) { if (expertIdx < 0) return; }
     uint8_t *B = weights[expertIdx];
     float *scales = scalesPtrs[expertIdx];
     T *tokenInput = A + (size_t)token * m;
@@ -1892,7 +1893,7 @@ __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel(T *A, c
     }
 }
 
-template <typename T, int THREAD_PER_BLOCK, bool PREWEIGHTED = false>
+template <typename T, int THREAD_PER_BLOCK, bool PREWEIGHTED = false, bool HOST_ROWS = false>
 __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKDownReduceIndexedKernel(T *A, const int32_t *indices,
                                                                              uint8_t **weights, float **scalesPtrs,
                                                                              T *C, const float *scores, int batch, int topk,
@@ -1917,6 +1918,7 @@ __global__ void FastllmGemvTypedFP8E4M3SmallBatchTopKDownReduceIndexedKernel(T *
     for (int topkSlot = 0; topkSlot < topk; topkSlot++) {
         int task = token * topk + topkSlot;
         int expertIdx = indices[task];
+        if constexpr (HOST_ROWS) { if (expertIdx < 0) return; }
         uint8_t *B = weights[expertIdx];
         float *scales = scalesPtrs[expertIdx];
         const uint8_t *baseB = B + (size_t)st * m;
@@ -2478,7 +2480,7 @@ __global__ void FastllmGemvTypedNVFP4Block16TopKDownReduceIndexedParallelKernel(
     }
 }
 
-template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK, bool PROJECT_ONLY = false>
+template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK, bool PROJECT_ONLY = false, bool HOST_ROWS = false>
 __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel(T *A, const int32_t *indices,
                                                                               uint8_t **weights, T *C,
                                                                               int batch, int topk, int m, int k,
@@ -2494,6 +2496,7 @@ __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel(T 
     }
 
     int expertIdx = indices[task];
+    if constexpr (HOST_ROWS) { if (expertIdx < 0) return; }
     uint8_t *B = weights[expertIdx];
     T *tokenInput = A + (size_t)token * m;
     const uint8_t *baseGate = B + (size_t)p * perRow;
@@ -2527,7 +2530,7 @@ __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel(T 
     }
 }
 
-template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK, bool PREWEIGHTED = false>
+template <fastllm::DataType SCALE_FORMAT, typename T, int THREAD_PER_BLOCK, bool PREWEIGHTED = false, bool HOST_ROWS = false>
 __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKernel(T *A, const int32_t *indices,
                                                                                   uint8_t **weights, T *C,
                                                                                   const float *scores, int batch, int topk,
@@ -2549,6 +2552,7 @@ __global__ void FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKerne
     for (int topkSlot = 0; topkSlot < topk; topkSlot++) {
         int task = token * topk + topkSlot;
         int expertIdx = indices[task];
+        if constexpr (HOST_ROWS) { if (expertIdx < 0) return; }
         uint8_t *B = weights[expertIdx];
         const uint8_t *baseB = B + (size_t)st * perRow;
         T *expertInput = A + (size_t)task * m;
@@ -6380,41 +6384,77 @@ void ReleaseCudaIndexedMoeWeights(Data **weights) {
     }
 }
 
-bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data &indices,
-        const Data &scores, Data &gateUp, Data &middle, Data **weights, int count,
-        const CudaMoeActivation &activation) {
+// Negative slots belong to a host projection. The masked down launch uses top=1
+// so its output has one row per route, in the same order as the host results.
+template<bool hostRows> static void indexedSlotGate(const CudaIndexedMoeSlots &slots, float *x,
+        const int *ids, float *gate, int rows, int top, int hidden, int inter, cudaStream_t stream) {
+    const dim3 grid(inter, rows * top);
+    if (slots.gateScales)
+        FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel<float,64,true,hostRows>
+            <<<grid,64,0,stream>>>(x, ids, slots.gate, slots.gateScales, gate,
+                rows, top, hidden, inter, slots.gateBlockM, slots.gateBlockK);
+    else
+        FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel<NVFP4_BLOCK_16,float,64,true,hostRows>
+            <<<grid,64,0,stream>>>(x, ids, slots.gate, gate, rows, top, hidden, inter,
+                FastllmMoeNVFP4Block16BytesPerRow(hidden, NVFP4_BLOCK_16));
+}
+template<bool hostRows> static void indexedSlotDown(const CudaIndexedMoeSlots &slots, float *mid,
+        const int *ids, float *out, int rows, int top, int hidden, int inter, cudaStream_t stream) {
+    const dim3 grid(hidden, rows);
+    if (slots.gateScales)
+        FastllmGemvTypedFP8E4M3SmallBatchTopKDownReduceIndexedKernel<float,64,true,hostRows>
+            <<<grid,64,0,stream>>>(mid, ids, slots.down, slots.downScales, out, nullptr,
+                rows, top, inter, hidden, slots.downBlockM, slots.downBlockK);
+    else
+        FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKernel<NVFP4_BLOCK_16,float,64,true,hostRows>
+            <<<grid,64,0,stream>>>(mid, ids, slots.down, out, nullptr, rows, top, inter,
+                hidden, FastllmMoeNVFP4Block16BytesPerRow(inter, NVFP4_BLOCK_16));
+}
+
+void CudaMoeGraphSlotGate(const CudaIndexedMoeSlots &slots, float *x, const int *ids, float *gate,
+                          int rows, int top, int hidden, int inter, cudaStream_t stream) {
+    indexedSlotGate<true>(slots, x, ids, gate, rows, top, hidden, inter, stream);
+}
+void CudaMoeGraphSlotDown(const CudaIndexedMoeSlots &slots, float *mid, const int *ids, float *out,
+                          int routes, int hidden, int inter, cudaStream_t stream) {
+    indexedSlotDown<true>(slots, mid, ids, out, routes, 1, hidden, inter, stream);
+}
+
+bool RunCudaIndexedMoeSlots(const CudaIndexedMoeSlots &slots, const Data &input, const Data &indices,
+                            const Data &scores, Data &gateUp, Data &middle, Data &output,
+                            int inter, const CudaMoeActivation &activation) {
     const int rows = input.dims[0], hidden = input.dims[1], top = indices.dims[1];
-    const int inter = weights[2]->dims[0] / 2;
     const auto *ids = static_cast<const int32_t *>(indices.cudaData);
     auto *x = static_cast<float *>(input.cudaData), *gate = static_cast<float *>(gateUp.cudaData);
     auto *mid = static_cast<float *>(middle.cudaData), *out = static_cast<float *>(output.cudaData);
-    if (rows > 65535 / top || hidden != weights[2]->dims[1] || gateUp.dataType != FLOAT32 ||
-        middle.dataType != FLOAT32 || (weights[2]->dataType != FP8_E4M3 &&
-        weights[2]->dataType != NVFP4_BLOCK_16)) return false;
+    if (top < 1 || rows < 1 || rows > 65535 / top || gateUp.dataType != FLOAT32 || middle.dataType != FLOAT32) return false;
     const int routes = rows * top;
     if (gateUp.Count(0) < size_t(routes) * 2 * inter || middle.Count(0) < size_t(routes) * inter)
         return false;
+    indexedSlotGate<false>(slots, x, ids, gate, rows, top, hidden, inter, cudaStreamPerThread);
+    activation.Run(gateUp, scores, middle, routes, inter);
+    indexedSlotDown<false>(slots, mid, ids, out, rows, top, hidden, inter, cudaStreamPerThread);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data &indices,
+        const Data &scores, Data &gateUp, Data &middle, Data **weights, int count,
+        const CudaMoeActivation &activation) {
+    const int hidden = input.dims[1];
+    const int inter = weights[2]->dims[0] / 2;
+    if (hidden != weights[2]->dims[1]) return false;
+    CudaIndexedMoeSlots slots{};
     if (weights[2]->dataType == FP8_E4M3) {
         FastllmMoeFp8ExpertTable *table = nullptr;
         if (!FastllmGetMoeFp8ExpertTable(weights, count, hidden, inter, table)) return false;
-        FastllmGemvTypedFP8E4M3SmallBatchTopKSwigluIndexedKernel<float,64,true>
-            <<<dim3(inter, routes),64>>>(x, ids, table->gateWeights, table->gateScales, gate,
-                rows, top, hidden, inter, table->gateBlockM, table->gateBlockK);
-        activation.Run(gateUp, scores, middle, routes, inter);
-        FastllmGemvTypedFP8E4M3SmallBatchTopKDownReduceIndexedKernel<float,64,true>
-            <<<dim3(hidden, rows),64>>>(mid, ids, table->downWeights, table->downScales, out, nullptr,
-                rows, top, inter, hidden, table->downBlockM, table->downBlockK);
-    } else {
+        slots = {table->gateWeights, table->downWeights, table->gateScales, table->downScales,
+                 table->gateBlockM, table->gateBlockK, table->downBlockM, table->downBlockK};
+    } else if (weights[2]->dataType == NVFP4_BLOCK_16) {
         FastllmMoeNVFP4ExpertTable *table = nullptr;
         if (!FastllmGetMoeNVFP4ExpertTable(weights, count, hidden, inter, table)) return false;
-        FastllmGemvTypedNVFP4Block16SmallBatchTopKSwigluIndexedKernel<NVFP4_BLOCK_16,float,64,true>
-            <<<dim3(inter, routes),64>>>(x, ids, table->gateWeights, gate, rows, top, hidden, inter,
-                table->gatePerRow);
-        activation.Run(gateUp, scores, middle, routes, inter);
-        FastllmGemvTypedNVFP4Block16SmallBatchTopKDownReduceIndexedKernel<NVFP4_BLOCK_16,float,64,true>
-            <<<dim3(hidden, rows),64>>>(mid, ids, table->downWeights, out, nullptr, rows, top, inter,
-                hidden, table->downPerRow);
-    }
-    return cudaPeekAtLastError() == cudaSuccess;
+        slots.gate = table->gateWeights;
+        slots.down = table->downWeights;
+    } else return false;
+    return RunCudaIndexedMoeSlots(slots, input, indices, scores, gateUp, middle, output, inter, activation);
 }
 }
