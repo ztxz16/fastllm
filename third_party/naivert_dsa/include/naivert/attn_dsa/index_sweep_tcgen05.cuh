@@ -55,11 +55,12 @@ __device__ __forceinline__ static void tc_fence_before() {
 __device__ __forceinline__ static void tc_wait_ld() {
   asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
 }
-template <class ArgsLike>
+template <bool Early = false, class ArgsLike>
 __device__ static void compute_index_logits_tcgen05(const ArgsLike &args, const unsigned char *iq_image,
                                                     const float *index_weights_scaled, float *logits,
                                                     const int *lengths, SweepStorage &sw,
-                                                    bool releaseAllocationPermit, bool firstReady) {
+                                                    bool releaseAllocationPermit, bool firstReady,
+                                                    bool prepared = false) {
   using S = SweepStorage;
   // With eight query rows and sixteen index heads only warps 4..7 read TMEM.
   // The full layer uses the otherwise idle warps 2,3,8..11 to assist the producer.
@@ -142,22 +143,24 @@ __device__ static void compute_index_logits_tcgen05(const ArgsLike &args, const 
     }
     int i = 0;
     for (int tile = int(cta_index()); tile < tiles; tile += int(cta_count()), ++i) {
-      const int stage = i % S::kStages;
+      const int stage = (i + (Early ? 2 : 0)) % S::kStages;
       if (lane == 0)
         tc_mbar_wait(sw.empty + stage, unsigned(((i / S::kStages) & 1) ^ 1));
       __syncwarp();
-      constexpr int pieces = Fp8Key ? 8 : 16;
-      for (int piece = (PreserveScoreOrder ? 0 : (warp < 4 ? warp - 1 : warp - 5)) * 32 + lane;
-           piece < S::kTileM * pieces; piece += kProducers * 32) {
-        int row = piece / pieces, token = tile * S::kTileM + row;
-        int dimension = (piece % pieces) * (Fp8Key ? 16 : 8);
-        int d = dimension * (Fp8Key ? 1 : 2);
-        const auto *src =
-            (const unsigned char *)key.IndexRow(min(token, max_visible - 1), args.indexStride).data + d;
-        auto *dst = sw.a_ring + stage * S::kTileBytes + ImageOffset(row, dimension, S::kTileM);
-        cp_async_16(dst, src, token < max_visible ? 16 : 0);
+      if (!(Early && prepared && i == 0)) {
+        constexpr int pieces = Fp8Key ? 8 : 16;
+        for (int piece = (PreserveScoreOrder ? 0 : (warp < 4 ? warp - 1 : warp - 5)) * 32 + lane;
+             piece < S::kTileM * pieces; piece += kProducers * 32) {
+          int row = piece / pieces, token = tile * S::kTileM + row;
+          int dimension = (piece % pieces) * (Fp8Key ? 16 : 8);
+          int d = dimension * (Fp8Key ? 1 : 2);
+          const auto *src =
+              (const unsigned char *)key.IndexRow(min(token, max_visible - 1), args.indexStride).data + d;
+          auto *dst = sw.a_ring + stage * S::kTileBytes + ImageOffset(row, dimension, S::kTileM);
+          cp_async_16(dst, src, token < max_visible ? 16 : 0);
+        }
+        cp_async_wait_all();
       }
-      cp_async_wait_all();
       __syncwarp();
       asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
       if (lane == 0)
@@ -169,7 +172,7 @@ __device__ static void compute_index_logits_tcgen05(const ArgsLike &args, const 
     tc_fence_after();
     int i = 0;
     for (int tile = int(cta_index()); tile < tiles; tile += int(cta_count()), ++i) {
-      const int s = i % S::kStages;
+      const int s = (i+(Early?2:0)) % S::kStages;
       tc_mbar_wait(sw.full + s, unsigned((i / S::kStages) & 1));
       tc_fence_after();
       auto tA = cute::make_tensor(
@@ -277,4 +280,137 @@ __device__ static void compute_index_logits_tcgen05(const ArgsLike &args, const 
     cute::TMEM::Allocator1Sm allocator;
     allocator.free(tmem_base, S::kTmemCols);
   }
+}
+
+template <class A>
+__device__ static void score_one(const A &args, const int *lengths, SweepStorage &sw, bool prepared) {
+    using S = SweepStorage;
+    using Element = cutlass::bfloat16_t;
+    constexpr int bytes = sizeof(Element) * 128 * 128, kStep = 16;
+    static_assert(!Fp8Key && S::kPasses == 1 && S::kPassN == 128);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int tile = blockIdx.x;
+    const int max_visible = lengths[8], stage = prepared ? 2 : 0;
+    auto *iq = args.workspace + Scratch::kIqPackedOffset;
+    auto *sc = (const float *)(args.workspace + Scratch::kIndexWeightsScaledOffset);
+    auto *logits = (float *)(args.workspace + Scratch::kIndexLogitsOffset);
+    if (warp == 1 && !lane) {
+        tc_mbar_init(&sw.b_full, 1);
+        tc_mbar_init(sw.acc_full, 1);
+        asm volatile("fence.mbarrier_init.release.cluster; fence.proxy.async.global;" ::: "memory");
+        tc_mbar_expect_tx(&sw.b_full, bytes);
+        tc_bulk_g2s(sw.b_image, iq, bytes, &sw.b_full);
+    }
+    if (warp == 0) {
+        cute::TMEM::Allocator1Sm alloc;
+        alloc.allocate(S::kTmemCols, &sw.tmem_slot);
+        alloc.release_allocation_lock();
+    }
+    if (tid < 128) {
+        sw.weights[tid] = float(args.weights[tid]);
+        sw.scales[tid] = sc[tid];
+    }
+    if (!prepared) {
+        auto key = args.indexKey;
+        key.Bind(args.indexCache);
+        for (int i = tid; i < 128 * 16; i += kThreads) {
+            const int row = i / 16, d = i % 16 * 8, tok = tile * 128 + row;
+            auto src = (const __nv_bfloat16 *)key.IndexRow(min(tok, max_visible - 1), args.indexStride).data;
+            cp_async_16(sw.a_ring + ImageOffset(row, d, 128), src + d, tok < max_visible ? 16 : 0);
+        }
+    }
+    asm volatile("cp.async.commit_group; cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    const unsigned tmem_base = sw.tmem_slot;
+    using AtomK = cute::UMMA::Layout_K_SW128_Atom<Element>; // BF16, 128-byte shared-memory swizzle
+    auto a_layout = cute::tile_to_shape(AtomK{}, cute::Shape<cute::Int<S::kTileM>, cute::Int<64>>{});
+    auto b_layout = cute::tile_to_shape(AtomK{}, cute::Shape<cute::Int<S::kPassN>, cute::Int<64>>{});
+    const cute::UMMA::InstrDescriptor idesc = cute::UMMA::make_instr_desc<Element, Element, float, S::kTileM, S::kPassN,
+                                                                          cute::UMMA::Major::K, cute::UMMA::Major::K>();
+    const unsigned long long idescE = static_cast<unsigned long long>(static_cast<unsigned>(idesc)) << 32;
+    using Mma = cute::SM100_MMA_F16BF16_SS<Element, Element, float, S::kTileM, S::kPassN, cute::UMMA::Major::K,
+                                           cute::UMMA::Major::K>;
+
+    if (warp == 0) {
+        tc_mbar_wait(&sw.b_full, 0);
+        tc_fence_after();
+        auto tA = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<Element *>(sw.a_ring + stage * S::kTileBytes)),
+                                    a_layout);
+        const cute::UMMA::SmemDescriptor da = cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(tA);
+        for (int p = 0; p < S::kPasses; ++p) {
+
+            tc_fence_after();
+            auto tB = cute::make_tensor(cute::make_smem_ptr(reinterpret_cast<Element *>(
+                                            sw.b_image + p * S::kPassN * Scratch::kIndexDim * sizeof(Element))),
+                                        b_layout);
+            const cute::UMMA::SmemDescriptor db = cute::UMMA::make_umma_desc<cute::UMMA::Major::K>(tB);
+            const unsigned tmem_c = tmem_base + unsigned(p * S::kPassN);
+#pragma unroll
+            for (int k = 0; k < Scratch::kIndexDim / kStep; ++k) {
+                cute::UMMA::SmemDescriptor dak = da;
+                cute::UMMA::SmemDescriptor dbk = db;
+                dak.start_address_ = static_cast<unsigned short>(
+                    da.start_address_ + (ImageOffset(0, k * kStep, S::kTileM)) / 16); // +32 B per K step
+                dbk.start_address_ =
+                    static_cast<unsigned short>(db.start_address_ + (ImageOffset(0, k * kStep, S::kPassN)) / 16);
+                Mma::fma(static_cast<unsigned long long>(dak), static_cast<unsigned long long>(dbk), tmem_c,
+                         unsigned(k > 0), idescE);
+            }
+            if (lane == 0) {
+
+                tc_umma_commit(sw.acc_full);
+            }
+        }
+    } else if (warp >= 4 && warp < 8) {
+        constexpr int p = 0;
+        const int q = warp - 4;
+        tc_mbar_wait(sw.acc_full, 0);
+        tc_fence_after();
+        const unsigned addr = tmem_base + (unsigned(32 * q) << 16) + unsigned(p * S::kPassN);
+        constexpr int kRowsPerPass = S::kPassN / Scratch::kIndexHeads;
+        float row_sum[kRowsPerPass];
+#pragma unroll
+        for (int r = 0; r < kRowsPerPass; ++r) {
+            row_sum[r] = 0.0f;
+        }
+#pragma unroll
+        for (int chunk = 0; chunk < S::kPassN / 32; ++chunk) {
+            unsigned v[32];
+            cute::SM100_TMEM_LOAD_32dp32b32x::copy(addr + unsigned(chunk * 32), v[0], v[1], v[2], v[3], v[4], v[5],
+                                                   v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13], v[14], v[15],
+                                                   v[16], v[17], v[18], v[19], v[20], v[21], v[22], v[23], v[24], v[25],
+                                                   v[26], v[27], v[28], v[29], v[30], v[31]);
+            tc_wait_ld();
+            const float *w = sw.weights + p * S::kPassN + chunk * 32;
+            constexpr int kGroup = Scratch::kIndexHeads < 32 ? Scratch::kIndexHeads : 32;
+#pragma unroll
+            for (int first = 0; first < 32; first += kGroup) {
+                const int r = (chunk * 32 + first) / Scratch::kIndexHeads;
+                float acc = 0.0f;
+#pragma unroll
+                for (int j = first; j < first + kGroup; ++j) {
+                    acc =
+                        fmaf(fmaxf(__uint_as_float(v[j]) * sw.scales[p * S::kPassN + chunk * 32 + j], 0.0f), w[j], acc);
+                }
+                row_sum[r] += acc;
+            }
+        }
+
+        const int pos = tile * S::kTileM + 32 * q + lane;
+#pragma unroll
+        for (int r = 0; r < kRowsPerPass; ++r) {
+            const int query = p * kRowsPerPass + r;
+            if (query < Scratch::kQueryRows && pos < lengths[query]) {
+                float value = row_sum[r];
+                logits[std::size_t(query) * Scratch::kMaxSeqLen + pos] = value;
+            }
+        }
+        tc_fence_before();
+    }
+    __syncthreads();
+    if (warp == 0) {
+        cute::TMEM::Allocator1Sm alloc;
+        alloc.free(tmem_base, S::kTmemCols);
+    }
 }

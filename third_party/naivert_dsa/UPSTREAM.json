@@ -20,7 +20,7 @@
     "index_sweep_tcgen05.cuh": {
       "source": "attn_dsa/index_sweep_tcgen05.cuh",
       "original_sha256": "1a6f9386f036b5f454d4c5aacea0c332a7a4cb4101a5d395cd9f93d05c3e4616",
-      "installed_sha256": "5b711e9ffd4714cb6c3f7b96db3276bd6759a8a3cecdcc182951b5ce20fac721"
+      "installed_sha256": "cc901e1f8f9dca5ba10fb918862e8c0a8f5dd79ec25b22cd292a734a72c47a43"
     },
     "body.cuh": {
       "source": "attn_dsa/attn_dsa_body.cuh",
@@ -33,12 +33,12 @@
       "installed_sha256": "30e50d9c603f89ac9f44849b965b7733ed8f7e3d8b2f9f9748af99b97be77d95"
     }
   },
-  "changes": "Extracted cooperative TCgen05 Indexer and exact Top-K for SM103. Adapted BF16/FP8 native paged caches, causal lengths, FastLLM quantization/scale order and caller-owned scratch. Partial fusion retains score ordering and native attention arithmetic. Full layer adds native BF16 projections/RoPE/cache append, compact attention, token-ordered bitmap Top-K, seven cache producer warps, conditional first-histogram reuse and TP8 residual output. For intermediate lengths, full-layer Top-K partitions each query across resident CTAs and scatters winners in token order using existing scratch. Removed unused upstream helpers, phase timers and unreachable histogram variants. The internal full-layer launch ABI/control flow is retained to preserve measured SM103 code generation. See README.txt for support, fallback and numerical contracts.",
+  "changes": "Extracted cooperative TCgen05 Indexer and exact Top-K for SM103. Adapted BF16/FP8 native paged caches, causal lengths, FastLLM quantization/scale order and caller-owned scratch. Partial fusion retains score ordering and native attention arithmetic. Full layer adds native BF16 projections/RoPE/cache append, compact attention, token-ordered bitmap Top-K, seven cache producer warps, conditional first-histogram reuse and TP8 residual output. For intermediate lengths, full-layer Top-K partitions each query across resident CTAs and scatters winners in token order using existing scratch. Removed unused upstream helpers, phase timers and unreachable histogram variants. The internal full-layer launch ABI/control flow is retained to preserve measured SM103 code generation. See README.txt for support, fallback and numerical contracts. Eight-row MX verification can use a cooperative score kernel, exact cluster selection, and a sparse attention/output kernel with reused Indexer scratch.",
   "derived_adapters": {
     "src/devices/cuda/models/naive-n05-dsa-fused-attention.cuh": {
       "source": "attn_dsa/attn_dsa_body.cuh",
       "original_sha256": "af3dc1a1bca3d96071333371169798de4bed310533b31d6ccc020ce862d56933",
-      "installed_sha256": "529ebadd89efb8ea88f084d7a7d900d44c7abcee715058548d2e5794e602d5db",
+      "installed_sha256": "a2ece31d29314f4bff9cdce5d925aa1273a5e9d9f550892c144510386b86a308",
       "fragments": [
         "qk_eight_heads",
         "pv_eight_heads",
@@ -57,6 +57,13 @@
         "SwiGLU and down/TP tiling"
       ],
       "changes": "Arithmetic extracted into include/devices/cuda/low_latency; this adapter retains only TP epoch/publication. See third_party/naivert_projection/UPSTREAM.json."
+    },
+    "src/devices/cuda/models/naive-n05-dsa-split-cluster.cuh": {
+      "source": "naivert/body/attn_dsa/cluster_select.cuh",
+      "source_commit": "1f29706edb0faae9d3b58ff0ac48bb2637117dce",
+      "original_sha256": "343974d759a91fc959e7f947886e971f1307ae4f111a608b52a8e022f9c5a5c8",
+      "installed_sha256": "f81256bf0c6aaba60eedc910896615d50b2026d8f7f7a59d9725159d97989b5a",
+      "changes": "Uses FastLLM causal lengths, output buffers and exact per-query retry in the cluster selector."
     }
   }
 }

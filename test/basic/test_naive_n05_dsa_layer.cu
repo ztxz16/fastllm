@@ -481,8 +481,12 @@ void Tp(bool fp8, bool mx = false) {
             Require(FastllmCudaNaiveDSALayer(c.input, r), "TP graph capture rejected");
             Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
             Cuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
-            for (int replay = 0; replay < 3; ++replay) {
-                c.Lengths(8192 + replay * 1024, false);
+            // Replay the same MX verification graph across short, boundary and long contexts.
+            const std::vector<int> lengths = mx && shape == std::vector<int>{8}
+                ? std::vector<int>{121, 2045, 8192, 16384, 24576, 32760}
+                : std::vector<int>{8192, 9216, 10240};
+            for (size_t replay = 0; replay < lengths.size(); ++replay) {
+                c.Lengths(lengths[replay], false);
                 c.Rebind(replay % 2);
                 c.Reset();
                 c.Legacy(true);

@@ -13,6 +13,11 @@ cache append, query quantization, index scoring, exact Top-K, sparse attention,
 output projection, TP8 reduction and the attention residual. Post-attention
 norm/router use the existing shared FastLLM preparation path.
 
+For eight MX projection rows from one request, the Blackwell path can split
+scoring, exact selection and sparse attention/output into three graph nodes.
+It reads the interleaved BF16 Indexer cache and reuses the layer scratch.
+The device, cluster, shape and output layout checks run before graph replay.
+
 Partial fusion combines query quantization, index scoring, exact Top-K, score
 ordering and sparse attention. It remains useful when the full-layer adapter
 rejects the input. Rejection retains the complete native fallback; neither path

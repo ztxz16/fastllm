@@ -10,6 +10,10 @@
 #include <stdexcept>
 #include <vector>
 
+namespace cluster_test {
+#include "naive-n05-dsa-split-cluster.cuh"
+}
+
 using Body = fastllm_dsa_fused::Body<false, false>;
 using Layout = Body::Scratch;
 
@@ -56,13 +60,24 @@ int main() {
         Check(cudaMalloc(&cpu_histogram, 8 * 256 * sizeof(unsigned)));
         const unsigned *first_hist = nullptr;
         void *args[] = {&workspace, &first_hist};
-        auto launch = [&] {
+        // Exercise the regular selector with and without a prepared histogram, plus the cluster selector.
+        const bool cluster = cluster_test::cluster_sel::Supported(0);
+        if (!cluster) cudaGetLastError();
+        auto launch = [&](int mode) {
+            if (mode == 2) {
+                Check(cluster_test::cluster_sel::Launch(
+                    reinterpret_cast<float *>(workspace + Layout::kIndexLogitsOffset),
+                    reinterpret_cast<int *>(workspace + Layout::kIndexSelectsOffset),
+                    reinterpret_cast<unsigned *>(workspace + Layout::kTopKGridOffset),
+                    reinterpret_cast<int *>(workspace + Layout::kRadixControlOffset), cudaStreamPerThread));
+                return;
+            }
             Check(cudaLaunchCooperativeKernel(reinterpret_cast<void *>(Select),
                                               dim3(prop.multiProcessorCount), dim3(384), args,
                                               sizeof(Body::SharedStorage), cudaStreamPerThread));
         };
-        cudaGraph_t graphs[2] = {};
-        cudaGraphExec_t executables[2] = {};
+        cudaGraph_t graphs[3] = {};
+        cudaGraphExec_t executables[3] = {};
         int cases = 0;
         for (int visible : {2049, 8192, 12288, 12289, 16384, 16391, 24576, 24577, 32768, 65536}) {
             for (int pattern = 0; pattern < 4; ++pattern) {
@@ -73,6 +88,8 @@ int main() {
                 std::vector<int> expected(8 * 2048, -1);
                 for (int query = 0; query < 8; ++query) {
                     lengths[query] = visible - query;
+                    if (visible == 16391 && query >= 5)
+                        lengths[query] = (query - 5) * 1024;
                     float *row = logits.data() + query * Layout::kMaxSeqLen;
                     for (int token = 0; token < lengths[query]; ++token) {
                         unsigned hash = unsigned(token + 17 * query) * 1664525u + 1013904223u;
@@ -107,15 +124,15 @@ int main() {
                                  cudaMemcpyHostToDevice));
                 Check(cudaMemcpy(cpu_histogram, histogram.data(), 8 * 256 * sizeof(unsigned),
                                  cudaMemcpyHostToDevice));
-                for (int ready = 0; ready < 2; ++ready) {
-                    first_hist = ready ? cpu_histogram : nullptr;
-                    auto &graph = graphs[ready];
-                    auto &executable = executables[ready];
+                for (int mode = 0; mode < (cluster ? 3 : 2); ++mode) {
+                    first_hist = mode == 1 ? cpu_histogram : nullptr;
+                    auto &graph = graphs[mode];
+                    auto &executable = executables[mode];
                     if (!executable) {
-                        launch();
+                        launch(mode);
                         Check(cudaStreamSynchronize(cudaStreamPerThread));
                         Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
-                        launch();
+                        launch(mode);
                         Check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
                         Check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
                     }
@@ -128,25 +145,25 @@ int main() {
                         Check(cudaMemcpy(actual.data(), workspace + Layout::kIndexSelectsOffset,
                                          actual.size() * sizeof(int), cudaMemcpyDeviceToHost));
                         for (int query = 0; query < 8; ++query)
-                            for (int i = 0; i < std::min(lengths[query], 2048); ++i)
+                            for (int i = 0; i < (mode == 2 && lengths[query] == 0 ? 2048 : std::min(lengths[query], 2048)); ++i)
                                 if (actual[query * 2048 + i] != expected[query * 2048 + i]) {
                                     std::fprintf(stderr,
-                                                 "Mismatch visible=%d pattern=%d first_ready=%d query=%d "
+                                                 "Mismatch visible=%d pattern=%d mode=%d query=%d "
                                                  "slot=%d got=%d expected=%d\n",
-                                                 visible, pattern, ready, query, i, actual[query * 2048 + i],
+                                                 visible, pattern, mode, query, i, actual[query * 2048 + i],
                                                  expected[query * 2048 + i]);
                                     throw std::runtime_error("exact Top-K mismatch");
                                 }
                     }
                     ++cases;
-                    std::printf("TOPK visible=%d pattern=%d first_ready=%d graph_replays=2 PASS\n", visible,
-                                pattern, ready);
+                    std::printf("TOPK visible=%d pattern=%d mode=%d graph_replays=2 PASS\n", visible,
+                                pattern, mode);
                 }
             }
         }
-        for (int ready = 0; ready < 2; ++ready) {
-            Check(cudaGraphExecDestroy(executables[ready]));
-            Check(cudaGraphDestroy(graphs[ready]));
+        for (int mode = 0; mode < (cluster ? 3 : 2); ++mode) {
+            Check(cudaGraphExecDestroy(executables[mode]));
+            Check(cudaGraphDestroy(graphs[mode]));
         }
         Check(cudaFree(cpu_histogram));
         Check(cudaFree(workspace));

@@ -4,6 +4,7 @@
 // NaiveRT's eight-head QK/PV fragments and distributed combine; see NOTICE.
 // Both paths retain BF16 probabilities, attention sinks and caller-owned scratch.
 #include <cuda/atomic>
+#include <type_traits>
 namespace fastllm_dsa_fused::native_attention {
 using BF16 = __nv_bfloat16;
 __device__ __forceinline__ void Load4(uint32_t (&r)[4], const void *p) {
@@ -66,10 +67,16 @@ template <bool Fast> __device__ __forceinline__ float Exponential(float x) {
 // Split phases let a cooperative caller schedule more tasks than resident
 // CTAs. Its grid join must publish all partials before any Combine call.
 enum class Phase { Fused, Produce, Combine };
-template <bool Compact = false, Phase Mode = Phase::Fused, int MaxSplits = Splits, int CombineColumns = 64, int Tokens = 128>
+
+struct NoOutputEpilogue {
+    __device__ __forceinline__ void operator()(int, int, BF16) const {}
+};
+template <bool Compact = false, Phase Mode = Phase::Fused, int MaxSplits = Splits, int CombineColumns = 64, int Tokens = 128,
+          bool CachePhysical = false, bool FullSelection = false, class OutputEpilogue = NoOutputEpilogue>
 __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow descriptor, const float *sink,
                                        BF16 *output, float *scratch, unsigned *completion, int heads,
-                                       int kvHeads, int row, int group, int split, StorageFor<Tokens> &s) {
+                                       int kvHeads, int row, int group, int split, StorageFor<Tokens> &s,
+                                       OutputEpilogue epilogue = {}) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     static_assert(Mode == Phase::Fused || Compact, "split production/fold uses compact arithmetic");
     const int t = threadIdx.x, warp = t / 32, lane = t % 32;
@@ -77,8 +84,12 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
     const int work = row * (heads / Heads) + group;
     const auto r = FastllmNaiveResolveDSARow(descriptor);
     const int length = max(0, min(r.capacity, r.liveKeys ? *r.liveKeys : r.length));
-    const int count = length ? (r.indices ? r.selectedCount : length) : 0;
+    const int count = length ? (FullSelection ? 2048 : (r.indices ? r.selectedCount : length)) : 0;
     if (!count) {
+        if constexpr (!std::is_same_v<OutputEpilogue, NoOutputEpilogue>) {
+            if (t < CombineColumns)
+                epilogue(row, h0 * Values + split * CombineColumns + t, __float2bfloat16(0.f));
+        }
         if (!split)
             for (int i = t; i < Heads * Values; i += Threads)
                 output[(size_t)row * heads * Values + h0 * Values + i] = __float2bfloat16(0.f);
@@ -97,24 +108,33 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
         const int end = tiles * (split + 1) / active * 16;
         const int tokens = end - begin;
 
+        // A selected token supplies 24 K vectors and 16 V vectors. Resolve
+        // each page table once and share its physical row across these loads.
+        __shared__ int physicalValue[CachePhysical ? Tokens : 1];
         for (int i = t; i < tokens; i += Threads) {
             const int slot = begin + i;
             const int key = slot < count ? (r.indices ? r.indices[slot] : slot) : -1;
-            s.valid[i] = key >= 0 && key < length ? key : -1;
+            if constexpr (CachePhysical) {
+                const bool valid = key >= 0 && key < length;
+                s.valid[i] = valid ? FastllmNaivePhysicalRow(r, key) : -1;
+                physicalValue[i] = valid ? FastllmNaivePhysicalRow(r, key, true) : -1;
+            } else {
+                s.valid[i] = key >= 0 && key < length ? key : -1;
+            }
         }
         __syncthreads();
         for (int i = t; i < tokens * 24; i += Threads) {
             const int k = s.valid[i / 24], d = i % 24 * 8;
             const auto *src = static_cast<const BF16 *>(r.key);
             if (k >= 0)
-                src += (size_t)FastllmNaivePhysicalRow(r, k) * r.keyStride + kh * Dim + d;
+                src += size_t(CachePhysical ? k : FastllmNaivePhysicalRow(r, k)) * r.keyStride + kh * Dim + d;
             Copy(&s.key[i / 24][d], src, k >= 0);
         }
         for (int i = t; i < tokens * 16; i += Threads) {
-            const int k = s.valid[i / 16], d = i % 16 * 8;
+            const int k = CachePhysical ? physicalValue[i / 16] : s.valid[i / 16], d = i % 16 * 8;
             const auto *src = static_cast<const BF16 *>(r.value);
             if (k >= 0)
-                src += (size_t)FastllmNaivePhysicalRow(r, k, true) * kvHeads * Values + kh * Values + d;
+                src += size_t(CachePhysical ? k : FastllmNaivePhysicalRow(r, k, true)) * kvHeads * Values + kh * Values + d;
             Copy(&s.value[i / 16][d], src, k >= 0);
         }
         for (int i = t; i < Heads * 24; i += Threads)
@@ -339,8 +359,9 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
             for (int k = 0; k < active; ++k)
                 value = fmaf(received[k * CombineColumns + t], correction[k], value);
             float denominator = correction[Splits];
-            output[((size_t)row * heads + h0 + head) * Values + dimensionBegin + t] =
-                __float2bfloat16(denominator > 0 ? value / denominator : 0.f);
+            const auto rounded = __float2bfloat16(denominator > 0 ? value / denominator : 0.f);
+            output[((size_t)row * heads + h0 + head) * Values + dimensionBegin + t] = rounded;
+            epilogue(row, (h0 + head) * Values + dimensionBegin + t, rounded);
         }
     }
 #endif
