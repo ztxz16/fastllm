@@ -136,6 +136,8 @@ class ChatCompletionStreamResponseWithUsage(BaseModel):
     usage: Optional[UsageInfo] = Field(default = None)
 
 class FastLLmCompletion:
+  chat_input_pool = None
+
   def __init__(self,
                model_name,
                model,
@@ -155,6 +157,31 @@ class FastLLmCompletion:
     
   def init_fast_llm_model(self):
     pass
+
+  async def _launch_api_request(self, messages, options, raw_request, constraint_request):
+      headers = getattr(raw_request, "headers", {})
+      session = headers.get("x-session-id") or headers.get("x-smg-routing-key")
+      if session:
+          options["session_key"] = session
+      images, videos = options.get("images"), options.get("videos")
+      template = {key: options.get(key) for key in (
+          "enable_thinking", "tools", "thinking_effort", "tool_choice", "chat_template_kwargs")}
+
+      def launch():
+          if constraint_request is not None:
+              self._attach_tool_call_constraint_if_supported(options, constraint_request)
+          ids = options.get("_prepared_input_ids")
+          size = len(ids) if ids is not None else self._compute_multimodal_input_token_len(
+              messages, images=images, videos=videos, **template)
+          return size, self.model.launch_stream_response(messages, **options)
+
+      if images or videos:
+          return launch()
+      if self.chat_input_pool is not None and messages:
+          ids = await self.chat_input_pool.prepare(messages, template, session)
+          if ids is not None:
+              options["_prepared_input_ids"] = ids
+      return await self._prepare_text_request(launch)
 
   async def _prepare_text_request(self, prepare):
       # Counting, one-shot tokenization reuse and native constraint/launch
@@ -1419,15 +1446,6 @@ class FastLLmCompletion:
       if isinstance(content, dict):
           return json.dumps(content, ensure_ascii = False), media
       return str(content), media
-
-  def _count_launch_input_tokens(self, messages, launch_kwargs):
-      # Count the exact template configuration used for generation. Request
-      # defaults (e.g. tool_choice="auto") need not be forwarded by every model;
-      # a mismatch would discard llm.py's one-shot token IDs before launch.
-      return self._compute_multimodal_input_token_len(
-          messages, **{key: launch_kwargs.get(key) for key in (
-              "enable_thinking", "images", "videos", "tools",
-              "thinking_effort", "tool_choice", "chat_template_kwargs")})
 
   def _compute_multimodal_input_token_len(
       self,
@@ -3162,46 +3180,31 @@ class FastLLmCompletion:
       model_images = media.images if media.images else None
       model_videos = media.videos if media.videos else None
 
-      def prepare_and_launch_text_request():
-          launch_kwargs = {
-              "max_length": max_length,
-              "min_length": 0,
-              "do_sample": do_sample,
-              "top_p": top_p,
-              "top_k": top_k,
-              "temperature": temperature,
-              "repeat_penalty": frequency_penalty,
-              "tools": model_tools,
-              "one_by_one": True,
-              "enable_thinking": enable_thinking,
-              "images": model_images,
-              "videos": model_videos,
-          }
-          if template_kwargs is not None:
-              launch_kwargs["chat_template_kwargs"] = template_kwargs
-          if self._is_kimi_k3_model():
-              launch_kwargs["thinking_effort"] = thinking_effort
-          elif (self._is_deepseek_v41_model()
-                and thinking_effort is not None):
-              launch_kwargs["thinking_effort"] = thinking_effort
-          if parser_request is not None:
-              self._attach_tool_call_constraint_if_supported(
-                  launch_kwargs, parser_request)
-          headers = getattr(raw_request, "headers", {})
-          session_key = headers.get("x-session-id") or headers.get("x-smg-routing-key")
-          if session_key:
-              launch_kwargs["session_key"] = session_key
-          input_token_len = self._count_launch_input_tokens(messages, launch_kwargs)
-          handle = self.model.launch_stream_response(
-              messages, **launch_kwargs)
-          return input_token_len, handle
+      launch_kwargs = {
+          "max_length": max_length,
+          "min_length": 0,
+          "do_sample": do_sample,
+          "top_p": top_p,
+          "top_k": top_k,
+          "temperature": temperature,
+          "repeat_penalty": frequency_penalty,
+          "tools": model_tools,
+          "one_by_one": True,
+          "enable_thinking": enable_thinking,
+          "images": model_images,
+          "videos": model_videos,
+      }
+      if template_kwargs is not None:
+          launch_kwargs["chat_template_kwargs"] = template_kwargs
+      if self._is_kimi_k3_model():
+          launch_kwargs["thinking_effort"] = thinking_effort
+      elif (self._is_deepseek_v41_model()
+            and thinking_effort is not None):
+          launch_kwargs["thinking_effort"] = thinking_effort
 
       try:
-          if not model_images and not model_videos:
-              input_token_len, handle = await self._prepare_text_request(
-                  prepare_and_launch_text_request)
-          else:
-              input_token_len, handle = prepare_and_launch_text_request()
+          input_token_len, handle = await self._launch_api_request(
+              messages, launch_kwargs, raw_request, parser_request)
       except (ValueError, TemplateError) as error:
           # Deterministic input/template failures must reach the SDK as a 400.
           # An uncaught exception becomes a 500, which Claude Code retries.
@@ -3431,29 +3434,10 @@ class FastLLmCompletion:
           # llm.py forwards this to encoding_dsv41.encode_messages as
           # reasoning_effort.
           launch_kwargs["thinking_effort"] = thinking_effort
-      self._attach_tool_call_constraint_if_supported(
-          launch_kwargs, effective_request)
-
-      def prepare_and_launch_text_request():
-          # Token counting and launch both apply the chat template.  Keep them
-          # on one worker thread so llm.py can reuse the one-shot tokenization,
-          # while independent HTTP requests prepare concurrently instead of
-          # serializing the FastAPI event loop.
-          input_len = self._count_launch_input_tokens(messages, launch_kwargs)
-          headers = getattr(raw_request, "headers", {})
-          session_key = headers.get("x-session-id") or headers.get("x-smg-routing-key")
-          if session_key:
-              launch_kwargs["session_key"] = session_key
-          launched_handle = self.model.launch_stream_response(
-              messages, **launch_kwargs)
-          return input_len, launched_handle
 
       try:
-          if not model_images and not model_videos:
-              input_token_len, handle = await self._prepare_text_request(
-                  prepare_and_launch_text_request)
-          else:
-              input_token_len, handle = prepare_and_launch_text_request()
+          input_token_len, handle = await self._launch_api_request(
+              messages, launch_kwargs, raw_request, effective_request)
       except (ValueError, TemplateError) as error:
           # Invalid input must not trigger the client's HTTP 500 retry loop.
           return self.create_error_response(

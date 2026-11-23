@@ -1,4 +1,5 @@
 """Counted chat requests must launch those exact IDs with native KV history on."""
+from array import array
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
@@ -104,6 +105,24 @@ class CountedHistoryTokensTest(unittest.TestCase):
         m._apply_tool_call_constraint_to_native = lambda constraint: None
         m.set_save_history(True)
         self.messages = [{'role': 'user', 'content': 'ab'}]
+
+    def test_prepared_chat_ids_bypass_old_request_and_keep_native_options(self):
+        m = self.model
+        m.get_input_token_len(self.messages)
+        m.current_tokenizer_cache[42] = [['stale'], [[7]]]
+        self.native.launch_response_llm_model_with_session = Mock(return_value=42)
+        constraint = {'request': 'tool'}
+        with patch.object(m, 'trans_conversation', side_effect=AssertionError('Repeated preparation')), \
+             patch.object(m, '_apply_tool_call_constraint_to_native') as apply:
+            ids = array('i', [9, 8, 7])
+            handle = m.launch_stream_response(self.messages, _prepared_input_ids=ids,
+                                               session_key='session', tool_call_constraint=constraint)
+        args = self.native.launch_response_llm_model_with_session.call_args.args
+        self.assertEqual((handle, args[1], list(args[2]), args[-1]), (42, 3, [9, 8, 7], b'session'))
+        self.assertEqual(ctypes.addressof(args[2]), ids.buffer_info()[0])
+        self.assertNotIn(42, m.current_tokenizer_cache)
+        self.assertIsNone(m.thread_local_obj.pending_text_input_token_cache)
+        apply.assert_called_once_with(constraint)
 
     def test_counted_ids_win_over_old_fragment_cache(self):
         m = self.model

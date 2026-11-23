@@ -324,6 +324,9 @@ def _fastllm_server(args, startup_progress):
                                            think = (args.think.lower() != "false"),
                                            enable_thinking = getattr(model, "enable_thinking", True),
                                            hide_input = args.hide_input)
+    if args.max_batch >= 128 and model.supports_prepared_chat_ids():
+        from .chat_input import ChatInputPool
+        fastllm_completion.chat_input_pool = ChatInputPool.for_model(model)
     fastllm_embed = FastLLmEmbed(model_name = args.model_name, model = model)
     fastllm_reranker = FastLLmReranker(model_name = args.model_name, model = model)
     fastllm_model = FastLLmModel(model_name = args.model_name, model = model)
@@ -344,6 +347,13 @@ def _fastllm_server(args, startup_progress):
         api_thread_pool_workers = default_workers
     api_thread_pool_workers = max(1, min(256, api_thread_pool_workers))
     set_ulimit()
+    try:
+        return _run_api_server(args, startup_progress)
+    finally:
+        if fastllm_completion.chat_input_pool is not None:
+            fastllm_completion.chat_input_pool.close()
+
+def _run_api_server(args, startup_progress):
     if getattr(args, 'deploy_fastipc', None):
         from .deploy.ipc_server import serve_worker
         from .llm import disable_cuda_malloc

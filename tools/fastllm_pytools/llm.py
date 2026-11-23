@@ -18,6 +18,11 @@ from collections import OrderedDict
 from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
+    from .chat_template import apply_hf_chat_template, normalize_conversation
+except ImportError:
+    from chat_template import apply_hf_chat_template, normalize_conversation
+
+try:
     from .generation_errors import PromptTooLongError
 except ImportError:
     from generation_errors import PromptTooLongError
@@ -1358,44 +1363,6 @@ def _same_template_input(left, right):
                 all(_same_template_input(a, b) for a, b in zip(left, right)))
     return left == right
 
-def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True,
-                           tokenize = False, enable_thinking = None, tools = None,
-                           thinking_alias = False, thinking_effort = None,
-                           tool_choice = None, chat_template_kwargs = None):
-    kwargs = {
-        "add_generation_prompt": add_generation_prompt,
-        "tokenize": tokenize,
-    }
-    if chat_template_kwargs:
-        kwargs.update(chat_template_kwargs)
-    if enable_thinking is not None:
-        kwargs["enable_thinking"] = enable_thinking
-        if thinking_alias:
-            kwargs["thinking"] = enable_thinking
-    if tools is not None:
-        kwargs["tools"] = tools
-    if thinking_effort is not None:
-        kwargs["thinking_effort"] = thinking_effort
-    if tool_choice is not None:
-        kwargs["tool_choice"] = tool_choice
-    try:
-        ret = tokenizer.apply_chat_template(conversation, **kwargs)
-    except TypeError:
-        kwargs.pop("thinking", None)
-        try:
-            ret = tokenizer.apply_chat_template(conversation, **kwargs)
-        except TypeError:
-            kwargs.pop("enable_thinking", None)
-            kwargs.pop("thinking_effort", None)
-            kwargs.pop("tool_choice", None)
-            kwargs.pop("tools", None)
-            ret = tokenizer.apply_chat_template(conversation, **kwargs)
-    if tokenize and hasattr(ret, "keys") and "input_ids" in ret.keys():
-        ret = ret["input_ids"]
-    if tokenize and hasattr(ret, "tolist"):
-        ret = ret.tolist()
-    return ret
-
 # transformers 会对这些模型真的去修补 pre_tokenizer 的正则，别去动它们。
 _MISTRAL_TOKENIZER_MODEL_TYPES = {
     "mistral", "mistral3", "voxtral", "ministral", "pixtral",
@@ -2310,44 +2277,15 @@ class model:
             return ctypes.c_int(len(stop_token_ids)), (ctypes.c_int * len(stop_token_ids))(*stop_token_ids)
     
     def trans_conversation(self, conversation: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        model_struct = self.get_struct()
-        if (model_struct in ["minimax", "minimax_m2"]):
-            for i in range(len(conversation)):
-                if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
-                    conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
-        elif model_struct in ("dots3_note", "glm5_next", "naive_n05_flash"):
-            # These chat templates iterate over argument objects, while the
-            # OpenAI wire protocol stores function.arguments as a JSON string.
-            # Normalize assistant tool-call history before rendering so a
-            # tool-result round trip can be fed back into the model.
-            conversation = copy.deepcopy(conversation)
-            for message in conversation:
-                if (not isinstance(message, dict) or
-                        message.get("role") != "assistant"):
-                    continue
-                for tool_call in message.get("tool_calls") or []:
-                    if not isinstance(tool_call, dict):
-                        continue
-                    function = tool_call.get("function", tool_call)
-                    if not isinstance(function, dict):
-                        continue
-                    arguments = function.get("arguments")
-                    if isinstance(arguments, str):
-                        try:
-                            arguments = (json.loads(arguments)
-                                         if arguments.strip() else {})
-                        except json.JSONDecodeError as error:
-                            raise ValueError(
-                                f"{model_struct} tool-call history contains "
-                                "invalid JSON arguments") from error
-                    elif arguments is None:
-                        arguments = {}
-                    if not isinstance(arguments, dict):
-                        raise ValueError(
-                            f"{model_struct} tool-call arguments must decode to "
-                            "a JSON object")
-                    function["arguments"] = arguments
-        return conversation
+        return normalize_conversation(self.get_struct(), conversation)
+
+    def supports_prepared_chat_ids(self):
+        tokenizer = self.hf_tokenizer
+        return (self._can_apply_hf_chat_template() and
+                getattr(self.trans_conversation, "__func__", None) is model.trans_conversation and
+                not self._uses_hf_deepseek_v4_tokenizer() and
+                not (getattr(tokenizer, "name", None) == "GLMTokenizer" and
+                     hasattr(tokenizer, "build_chat_input")))
 
     def get_input_token_len(self, conversation: List[Dict[str, str]], add_generation_prompt = True,
                             enable_thinking = None, images: List = None, videos: List = None,
@@ -2867,7 +2805,7 @@ class model:
                         chat_template_kwargs = None,
                         tool_call_constraint: Optional[Dict[str, Any]] = None,
                         clover_options: Optional[Dict[str, Any]] = None,
-                        session_key: Optional[str] = None):
+                        session_key: Optional[str] = None, _prepared_input_ids = None):
         session_bytes = (session_key or "").encode("utf-8")
         if len(session_bytes) > 512 or b"\0" in session_bytes:
             raise ValueError("session key must contain at most 512 UTF-8 bytes without NUL")
@@ -2898,7 +2836,7 @@ class model:
         self.thread_local_obj.pending_text_input_token_cache = None
         self._apply_tool_call_constraint_to_native(tool_call_constraint)
         conversation = None
-        if (isinstance(query, List)):
+        if _prepared_input_ids is None and isinstance(query, list):
             conversation = query
             conversation = self.trans_conversation(conversation)
 
@@ -3105,7 +3043,10 @@ class model:
             if (not(history)):
                 history = [];
             can_reuse_token_count = False
-            if (type == "ChatGLM3"):
+            if _prepared_input_ids is not None:
+                input = _prepared_input_ids
+                can_reuse_token_count = True
+            elif (type == "ChatGLM3"):
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
                 prompt = ""

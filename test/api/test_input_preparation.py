@@ -89,6 +89,27 @@ class InputPreparationTest(unittest.IsolatedAsyncioTestCase):
         self.assertCountEqual(launched, [str(i) for i in range(32)])
         self.assertEqual(len(instance.conversation_handles), 32)
 
+    async def test_cancel_during_tokenization_creates_no_native_handle(self):
+        entered = asyncio.Event()
+        instance = completion(FakeQwen35Model())
+
+        class Pool:
+            async def prepare(self, messages, options, session):
+                entered.set()
+                await asyncio.Event().wait()
+
+        instance.chat_input_pool = Pool()
+        with patch.object(instance.model, "launch_stream_response") as launch:
+            task = asyncio.create_task(instance.create_chat_completion(
+                request(messages=[{"role": "user", "content": "cancel"}], stream=True),
+                RawRequest()))
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            launch.assert_not_called()
+            self.assertFalse(instance.conversation_handles)
+
     async def test_input_preparation_does_not_wait_for_token_fetch_executor(self):
         loop = asyncio.get_running_loop()
         loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
