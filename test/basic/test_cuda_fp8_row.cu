@@ -180,6 +180,9 @@ int main() {
     Run<T>(1024, 4096, 1, false, true, false)
         RUN(half);
         RUN(__nv_bfloat16);
+        // K32 attention projections use a separate single-row BF16/FP8 path.
+        Run<__nv_bfloat16>(4096, 1856, 1, false, false, false, 32);
+        Run<__nv_bfloat16>(4096, 1856, 1, true, false, false, 32);
         Run<half>(512, 4099, 1, true, false, true);
         Run<__nv_bfloat16>(512, 4099, 1, true, false, true);
         Run<half>(32768, 4099, 1, true, false, true);

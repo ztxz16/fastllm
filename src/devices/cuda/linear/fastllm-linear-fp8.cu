@@ -2356,6 +2356,75 @@ __global__ void FastllmGemvBF16FP8E4M3KernelWarpRows(
     }
 }
 
+__device__ __forceinline__ float GemvCompensatedReduce64(float sum, float other, int lane) {
+    float tmp = sum + other;
+    float diff = (tmp - sum) - other;
+    sum = tmp;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const float source = __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane < offset) {
+            other = source - diff;
+            tmp = sum + other;
+            diff = (tmp - sum) - other;
+            sum = tmp;
+        }
+    }
+    return sum;
+}
+
+#ifndef USE_ROCM
+// Decode two weights using the same sign/exponent placement and power-of-two
+// scaling as RegisterRows, including its handling of reserved byte patterns.
+__device__ __forceinline__ float2 GemvBlock32DecodePair(uint16_t codes) {
+    const unsigned lanes = __byte_perm(unsigned(codes), 0, 0x4140);
+    const unsigned bits = ((lanes & 0x007f007fu) << 4) | ((lanes & 0x00800080u) << 8);
+    const auto decoded = __hmul2(reinterpret_cast<const __nv_bfloat162 &>(bits), __float2bfloat162_rn(0x1p120f));
+    return __bfloat1622float2(decoded);
+}
+
+// Four warps per channel read eight consecutive weights per lane. Stage each
+// four-element dot before replaying the original 64 partials in the same order.
+__global__ void FastllmGemvBf16Block32SplitLoad(const __nv_bfloat16 *__restrict__ input,
+        const uint8_t *__restrict__ weight, const float *__restrict__ scales,
+        const __nv_bfloat16 *__restrict__ bias, __nv_bfloat16 *__restrict__ output) {
+    constexpr int inner = 4096, threadsPerRow = 128;
+    const int row = threadIdx.x / threadsPerRow, tid = threadIdx.x % threadsPerRow;
+    const int channel = blockIdx.x * 2 + row;
+    __shared__ float dots[2][inner / 4], rowScales[2][inner / 32];
+    rowScales[row][tid] = scales[size_t(channel) * (inner / 32) + tid];
+#pragma unroll
+    for (int col = tid * 8; col < inner; col += threadsPerRow * 8) {
+        const uint2 w = *reinterpret_cast<const uint2 *>(weight + size_t(channel) * inner + col);
+        const uint4 x = *reinterpret_cast<const uint4 *>(input + col);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const unsigned codes = half ? w.y : w.x;
+            const float2 lo = GemvBlock32DecodePair(uint16_t(codes));
+            const float2 hi = GemvBlock32DecodePair(uint16_t(codes >> 16));
+            const float2 a = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 &>(half ? x.z : x.x));
+            const float2 b = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 &>(half ? x.w : x.y));
+            dots[row][col / 4 + half] = a.x * lo.x + a.y * lo.y + b.x * hi.x + b.y * hi.y;
+        }
+    }
+    __syncthreads();
+    float sum = 0;
+    if (tid < 64) {
+#pragma unroll
+        for (int i = tid; i < inner / 4; i += 64)
+            sum = fmaf(dots[row][i], rowScales[row][i / 8], sum);
+        if (tid >= 32) dots[row][tid] = sum;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        float result = GemvCompensatedReduce64(sum, dots[row][tid + 32], tid);
+        if (tid == 0) {
+            if (bias) result += __bfloat162float(bias[channel]);
+            output[channel] = __float2bfloat16_rn(result);
+        }
+    }
+}
+#endif
+
 // Group output channels without serializing their two 32-thread partials.
 // The input traversal, FMA order and compensated 64-thread reduction match
 // Kernel1MultiRow. Callers guarantee four-element input/weight alignment.
@@ -2428,20 +2497,7 @@ __device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
     if (tid >= 32) return;
 #pragma unroll
     for (int x = 0; x < PART; x++) {
-        float sum = partial[x];
-        float other = high[row][x][lane];
-        float tmp = sum + other;
-        float diff = (tmp - sum) - other;
-        sum = tmp;
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            const float source = __shfl_down_sync(0xffffffffu, sum, offset);
-            if (lane < offset) {
-                other = source - diff;
-                tmp = sum + other;
-                diff = (tmp - sum) - other;
-                sum = tmp;
-            }
-        }
+        float sum = GemvCompensatedReduce64(partial[x], high[row][x][lane], lane);
         if (lane == 0 && outputRow < k) {
             float result = sum;
             if (bias != nullptr) result += __bfloat162float(bias[st]);
@@ -2611,6 +2667,18 @@ void LaunchFastllmGemmBF16FP8E4M3(__nv_bfloat16 *input, uint8_t *weight, __nv_bf
     if (TryFastllmRowFP8(input, weight, output, bias, scales, n, m, k, blockM, blockK)) {
         return;
     }
+
+#ifndef USE_ROCM
+    if (n == 1 && m == 4096 && blockM == 32 && blockK == 1 && k >= 512 && k <= 4096 &&
+            k % 2 == 0 && reinterpret_cast<uintptr_t>(input) % alignof(uint4) == 0 &&
+            reinterpret_cast<uintptr_t>(weight) % alignof(uint2) == 0) {
+        const int arch = FastllmCudaRuntimeArch();
+        if (arch >= 100 && arch < 110) {
+            FastllmGemvBf16Block32SplitLoad<<<k / 2, 256>>>(input, weight, scales, bias, output);
+            return;
+        }
+    }
+#endif
 
     const bool exactBatch = n > 1 && n < fastllm::FastllmCudaGetLinearExactBatchThreshold();
     // The aligned MXFP8 small-row kernels reuse each weight across tokens
