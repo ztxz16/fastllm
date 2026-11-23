@@ -3115,7 +3115,7 @@ class FastLLmCompletion:
           self._cleanup_temp_paths(media.temp_paths if "media" in locals() else [])
           return self.create_error_response(str(e))
 
-      request_id = f"msg_{shortuuid.random()}"
+      request_id = f"msg_{shortuuid.encode(uuid.uuid4())}"
       parser_tools, model_tools = self._convert_anthropic_tools(request.tools)
       parser_request = self._build_anthropic_parser_request(
           request, messages, parser_tools)
