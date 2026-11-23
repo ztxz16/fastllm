@@ -397,6 +397,7 @@ int main() {
         Case(64, 8704, 400, 256);
         Case(128, 20480, 144, 128);
         Case(32, 32768, 144, 128, true, true, 4);
+        Case(32, 98304, 144, 128, true, true, 4);
         Case(64, 8704, 1680, 128, false);
         Case(8, 8704, 1792, 128, false, false);
         Case(16, 8704, 1792, 128, false, false);

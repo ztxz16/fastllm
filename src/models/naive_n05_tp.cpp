@@ -915,8 +915,11 @@ void NaiveN05FlashModel::RememberVerifyCommit(
 std::vector<int> NaiveN05FlashModel::LocalServingGraphBuckets(int maxRequests) const {
     // Ordinary decode admits at most this many live requests to each KV owner.
     // Speculative verification also uses the owner's reserved window slots.
-    return draftEnabled ? SpeculativeGraphBuckets(WindowRequestsPerGroup(maxRequests)) :
-        DecodeGraphBatchBuckets(RunningRequestsPerGroup(maxRequests));
+    if (!draftEnabled) return DecodeGraphBatchBuckets(RunningRequestsPerGroup(maxRequests));
+    auto buckets = SpeculativeGraphBuckets(WindowRequestsPerGroup(maxRequests));
+    if (attentionDP > 1 && buckets.back() > 48)
+        buckets.insert(std::lower_bound(buckets.begin(), buckets.end(), 48), 48);
+    return buckets;
 }
 
 void NaiveN05FlashModel::PrepareTensorParallelServing() {

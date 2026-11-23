@@ -110,7 +110,7 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     NaiveN05PrefixCacheTestAccess() {
         for (int groups : {1, 2, 4, 8}) {
             attentionDP = groups;
-            for (int requests : {1, 17, 513, 769, 1024, 1025, 1536, 2048, 2049, 3072, 4097}) {
+            for (int requests : {1, 17, 73, 75, 77, 513, 769, 1024, 1025, 1536, 2048, 2049, 3072, 4097}) {
                 const int peak = (requests + groups - 1) / groups;
                 draftEnabled = false;
                 const auto buckets = LocalServingGraphBuckets(requests);
@@ -121,8 +121,14 @@ struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
                 }
                 draftEnabled = true;
                 const int window = std::min(requests, peak + (peak + 3) / 4);
-                Check(LocalServingGraphBuckets(requests) == SpeculativeGraphBuckets(window),
-                      "verification graph must cover the reserved owner window");
+                const auto verify = LocalServingGraphBuckets(requests);
+                const auto base = SpeculativeGraphBuckets(window);
+                for (int live = 1; live <= window; ++live) {
+                    const int expected = groups > 1 && window >= 48 && live > 32 && live <= 48
+                        ? 48 : *std::lower_bound(base.begin(), base.end(), live);
+                    Check(DecodeGraphBatch::Select(live, verify).graphRows == expected,
+                          "verification graph selected the wrong owner batch size");
+                }
             }
         }
         draftEnabled = false;

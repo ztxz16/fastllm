@@ -5942,7 +5942,7 @@ bool FastllmCudaNaiveBatchDecodeIndexer(const fastllm::Data &query,
     namespace ordered = naive_indexer_ordered_topk;
     const bool wideShape = blackwell && nativeScores && rows.size() > sm::BatchLimit &&
         (cacheType == FP8_E4M3 || rows.front().key->kvCacheFp8Indexer) &&
-        localCapacity > 16384 && localCapacity <= 65536;
+        localCapacity > 16384 && localCapacity <= 262144;
     constexpr size_t sortBytes = naive_indexer_sortpack::SortBytes<256, 5, true, false>();
     auto sort = naive_indexer_sortpack::SortPack<256, 5, true, false, VerifyTopK>;
     const bool orderedTopK = wideShape && BulkKernelSupported(ordered::OrderedTopK, ordered::SharedBytes, 90);
