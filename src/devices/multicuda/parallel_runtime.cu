@@ -512,6 +512,10 @@ void CudaRowTransfer::ReserveFixed(size_t maxRows, size_t maxRowBytes) {
     impl->fixedRows = maxRows; impl->fixedRowBytes = maxRowBytes;
     impl->Initialize();
 }
+const int *CudaRowTransfer::LocalToGlobal(int rank) const {
+    return impl->scratch.at(rank).select;
+}
+
 void CudaRowTransfer::Select(int rank, const void *global, void *local, size_t rowBytes) {
     if (activeRuntime != impl->runtime.impl.get() || activeRank != rank)
         throw std::logic_error("row select outside owning worker");

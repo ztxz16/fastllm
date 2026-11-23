@@ -215,7 +215,7 @@ inline bool ForkTensorProjection(cudaGraph_t graph, cudaGraphNode_t marker,
 // FastLLM assembles request pages after Q-B. Attach the stats branch to the
 // page producer inside the core graph so FlashMLA and mHC become siblings.
 inline cudaGraph_t ForkAtMlaPages(cudaGraph_t source, cudaGraphNode_t stats, cudaGraphNode_t sinkhorn,
-                                  int rows, cudaGraph_t standalone) {
+                                  int rows, cudaGraph_t standalone, bool verifying) {
     cudaGraph_t graph = nullptr;
     if (cudaGraphClone(&graph, source) != cudaSuccess) return nullptr;
     auto reject = [&]() -> cudaGraph_t { cudaGraphDestroy(graph); return nullptr; };
@@ -224,6 +224,7 @@ inline cudaGraph_t ForkAtMlaPages(cudaGraph_t source, cudaGraphNode_t stats, cud
     std::vector<cudaGraphNode_t> nodes(count);
     if (cudaGraphGetNodes(graph, nodes.data(), &count) != cudaSuccess) return reject();
     cudaGraphNode_t pages = nullptr;
+    bool fusedVerify = false;
     for (auto node : nodes) {
         cudaGraphNodeType type;
         if (cudaGraphNodeGetType(node, &type) != cudaSuccess) return reject();
@@ -232,23 +233,44 @@ inline cudaGraph_t ForkAtMlaPages(cudaGraph_t source, cudaGraphNode_t stats, cud
         auto status = cudaGraphKernelNodeGetParams(node, &params);
         if (status == cudaErrorInvalidDeviceFunction) { cudaGetLastError(); continue; }
         if (status != cudaSuccess) return reject();
-        if (!FastllmV41IsMlaPageKernel(params.func)) continue;
-        if (pages || params.gridDim.y != rows) return reject();
+        if (verifying) {
+            const bool packed = params.func == (void *)V41FullDecodePrepareKernel<true, false, true> ||
+                                params.func == (void *)V41FullDecodePrepareKernel<false, false, true>;
+            fusedVerify |= packed;
+            if (!packed && params.func != (void *)V41FullVerifyPackWindow) continue;
+            if ((packed ? params.gridDim.y : params.gridDim.x) != rows || !params.kernelParams || params.extra ||
+                !static_cast<const FastllmV41FullDecodeConfig *>(params.kernelParams[0])->verifying)
+                return reject();
+        } else {
+            if (!FastllmV41IsMlaPageKernel(params.func)) continue;
+            if (params.gridDim.y != rows) return reject();
+        }
+        if (pages) return reject();
         pages = node;
     }
     if (!pages || OwnerNeighbors<false>(pages, nullptr, &count) != cudaSuccess || count != 1) return reject();
+    // The stats branch reads the prelude residual, independently of KV.
+    // Give it the page writer's predecessors in the cooperative verifier:
+    // the small page writer can admit the dots before the resident MMA grid.
+    std::vector<cudaGraphNode_t> after{pages};
+    if (fusedVerify && rows == 6) {
+        if (OwnerNeighbors<true>(pages, nullptr, &count) != cudaSuccess) return reject();
+        after.resize(count);
+        if (count && OwnerNeighbors<true>(pages, after.data(), &count) != cudaSuccess) return reject();
+    }
+    const auto parents = after.empty() ? nullptr : after.data();
     cudaGraphNode_t copied = nullptr;
     cudaGraphNodeType type;
     if (cudaGraphNodeGetType(stats, &type) != cudaSuccess) return reject();
     if (type == cudaGraphNodeTypeGraph) {
         // CUDA does not allow reparenting the read-only graph owned by a child
         // node. Keep the original cuBLAS capture alive until both copies exist.
-        if (!standalone || cudaGraphAddChildGraphNode(&copied, graph, &pages, 1, standalone) != cudaSuccess)
+        if (!standalone || cudaGraphAddChildGraphNode(&copied, graph, parents, after.size(), standalone) != cudaSuccess)
             return reject();
     } else {
         cudaKernelNodeParams params{};
         if (type != cudaGraphNodeTypeKernel || cudaGraphKernelNodeGetParams(stats, &params) != cudaSuccess ||
-            cudaGraphAddKernelNode(&copied, graph, &pages, 1, &params) != cudaSuccess) return reject();
+            cudaGraphAddKernelNode(&copied, graph, parents, after.size(), &params) != cudaSuccess) return reject();
     }
     cudaKernelNodeParams epilogue{};
     cudaGraphNode_t finish = nullptr;
@@ -302,7 +324,7 @@ inline cudaGraph_t MoveHistoryToPrelude(cudaGraph_t core, cudaGraph_t prelude, c
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
 // The direct-query kernel only consumes the normalized K value and immutable per-step
 // request metadata. Its published ring slot is disjoint from the early history gather.
-inline cudaGraph_t ForkNativeKV(cudaGraph_t core, cudaGraph_t prelude, cudaGraphNode_t *early) {
+inline cudaGraph_t ForkNativeKV(cudaGraph_t core, cudaGraph_t prelude, cudaGraphNode_t *early, bool verify) {
     auto uniqueKernel = [](cudaGraph_t g, const void *symbol, cudaKernelNodeParams &params) {
         size_t count = 0;
         cudaGraphNode_t found = nullptr;
@@ -323,15 +345,19 @@ inline cudaGraph_t ForkNativeKV(cudaGraph_t core, cudaGraph_t prelude, cudaGraph
         return found;
     };
     cudaKernelNodeParams norm{}, kv{};
-    auto parent = uniqueKernel(prelude, (void *)V41QKVNormQuantKernel<2,true>, norm);
+    auto parent = uniqueKernel(prelude, verify ? (void *)V41QKVNormPackedBf16Kernel :
+                                               (void *)V41QKVNormQuantKernel<2,true>, norm);
     if (!parent) return nullptr;
     cudaGraph_t raw = nullptr;
     if (cudaGraphClone(&raw, core) != cudaSuccess) return nullptr;
     OwnerGraph copy(raw, &cudaGraphDestroy);
-    auto node = uniqueKernel(raw, (void *)V41FullDecodePrepareKernel<true>, kv);
+    // A native-query verifier reads K and per-row metadata here. Q-B and
+    // the index projections write independent buffers, consumed in the child.
+    auto node = uniqueKernel(raw, verify ? (void *)V41FullDecodePrepareKernel<true,false,true> :
+                                           (void *)V41FullDecodePrepareKernel<true>, kv);
     size_t count = 0;
     if (!node || OwnerNeighbors<true>(node, nullptr, &count) != cudaSuccess || count ||
-        *static_cast<void **>(norm.kernelParams[6]) != static_cast<FastllmV41FullDecodeBuffers *>(kv.kernelParams[1])->kv)
+        *static_cast<void **>(norm.kernelParams[verify ? 4 : 6]) != static_cast<FastllmV41FullDecodeBuffers *>(kv.kernelParams[1])->kv)
         return nullptr;
     if (cudaGraphAddKernelNode(early, prelude, &parent, 1, &kv) != cudaSuccess) return nullptr;
     if (cudaGraphDestroyNode(node) != cudaSuccess) {
@@ -559,11 +585,18 @@ inline void *ForkOwnerMix(const void *const *children, int count, int rows,
     if (cudaGraphNodeGetType(producer, &producerType) != cudaSuccess || producerType != cudaGraphNodeTypeKernel ||
         cudaGraphKernelNodeGetParams(producer, &prod) != cudaSuccess || !prod.kernelParams || prod.extra)
         return reject();
-    const bool plainDots = prod.func == (void *)V41HcWarpDots5120;
+    const bool warpDots = prod.func == (void *)V41HcWarpDots5120;
+    // A small multi-row verifier uses one CTA per (row, dot), writing
+    // the same 25 reduced FP32 values consumed by FinishOwnerMix<1>.
+    const bool reducedDots = !postKernel && !split &&
+        prod.func == (void *)V41HcDecodeDots<__nv_bfloat16> && prod.gridDim.x == 25 &&
+        prod.gridDim.y == rows && prod.blockDim.x == kHcThreads &&
+        *static_cast<int *>(prod.kernelParams[2]) == 4 * 5120;
+    const bool plainDots = warpDots || reducedDots;
     const bool postDots = prod.func == (void *)V41HcPostWarpDots<5120, 2> ||
                           prod.func == (void *)V41HcPostWarpDots<5120, 4>;
-    if (split ? !(postKernel ? postDots : plainDots) : prod.func != (void *)V41HcJoinTensorDots) return reject();
-    const int outputArg = postDots ? 6 : 2;
+    if (split ? !(postKernel ? postDots : plainDots) : !reducedDots && prod.func != (void *)V41HcJoinTensorDots) return reject();
+    const int outputArg = postDots ? 6 : (reducedDots ? 3 : 2);
     if (*static_cast<void **>(prod.kernelParams[outputArg]) != *static_cast<void **>(normal.kernelParams[7]) ||
         OwnerNeighbors<false>(producer, nullptr, &n) != cudaSuccess || n != 1) return reject();
 
@@ -583,7 +616,9 @@ inline void *ForkOwnerMix(const void *const *children, int count, int rows,
         std::copy_n(prod.kernelParams, outputArg + 1, producerArgs);
         producerArgs[outputArg] = &scratch;
         prod.kernelParams = producerArgs;
-        if (plainDots) V41SelectStagedDots(rows, prod);
+        if (warpDots) V41SelectStagedDots(rows, prod);
+        if (reducedDots && rows == 6 && V41IsSm<10, 3>())
+            prod.func = (void *)V41HcDecodeDotsTiled<40>;
         if (cudaGraphKernelNodeSetParams(producer, &prod) != cudaSuccess) return reject();
     }
 
@@ -646,17 +681,20 @@ inline void *ForkOwnerMix(const void *const *children, int count, int rows,
                 OwnerNeighbors<false>(producer, nullptr, &n) != cudaSuccess || n != 1 ||
                 OwnerNeighbors<false>(producer, &only, &n) != cudaSuccess || only != finish ||
                 OwnerNeighbors<false>(finish, nullptr, &n) != cudaSuccess || n != 0) return reject();
-            moved = ForkAtMlaPages(part, producer, finish, rows, tensorSource.get());
-            if (!moved) return reject();
-            if (cudaGraphDestroyNode(finish) != cudaSuccess || cudaGraphDestroyNode(producer) != cudaSuccess) {
-                cudaGraphDestroy(moved);
-                return reject();
-            }
-            part = moved;
+            moved = ForkAtMlaPages(part, producer, finish, rows, tensorSource.get(), reducedDots);
+            if (moved) {
+                if (cudaGraphDestroyNode(finish) != cudaSuccess || cudaGraphDestroyNode(producer) != cudaSuccess) {
+                    cudaGraphDestroy(moved);
+                    return reject();
+                }
+                part = moved;
+            } else if (reducedDots) {
+                cudaGetLastError(); // Retain the independent prelude branch for other verify layouts.
+            } else return reject();
         }
 #endif
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
-        if (i == 1 && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_EARLY_HISTORY", rows)) {
+        if (!reducedDots && i == 1 && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_EARLY_HISTORY", rows)) {
             cudaGraphNode_t history = nullptr;
             if (auto shortened = MoveHistoryToPrelude(part, graph, &history)) {
                 if (moved) cudaGraphDestroy(moved);
@@ -666,9 +704,10 @@ inline void *ForkOwnerMix(const void *const *children, int count, int rows,
         }
 #endif
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
-        if (i == 1 && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_DIRECT_QUERY", rows)) {
+        if (i == 1 && ((!reducedDots && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_DIRECT_QUERY", rows)) ||
+                       (reducedDots && rows == 6))) {
             cudaGraphNode_t early = nullptr;
-            if (auto shortened = ForkNativeKV(part, graph, &early)) {
+            if (auto shortened = ForkNativeKV(part, graph, &early, reducedDots)) {
                 if (moved) cudaGraphDestroy(moved);
                 part = moved = shortened;
                 leaves.push_back(early);
@@ -680,13 +719,13 @@ inline void *ForkOwnerMix(const void *const *children, int count, int rows,
         if (status != cudaSuccess) return reject();
         leaves.assign(1, next);
     }
-    if (!postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_ATTENTION", rows)) {
+    if (!reducedDots && !postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_ATTENTION", rows)) {
         if (auto packed = PackAttentionInput(graph, norm, rows, quantize)) {
             cudaGraphDestroy(graph);
             graph = packed;
         }
     }
-    if (!postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_QUERY", rows)) {
+    if (!reducedDots && !postKernel && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_PACK_QUERY", rows)) {
         if (auto packed = PackQueryInput(graph, rows, keepQuery)) {
             cudaGraphDestroy(graph); graph = packed;
         } else cudaGetLastError();
@@ -799,7 +838,7 @@ inline bool Compose(const void *const *children, int count, const int *start, co
             int flatDim = 20480;
             void *dotArgs[] = {&x, &fn, &flatDim, &destination};
             cudaKernelNodeParams dot{};
-            dot.func = reinterpret_cast<void *>(V41HcDecodeDotsSm90<16>);
+            dot.func = reinterpret_cast<void *>(V41HcDecodeDotsTiled<16>);
             dot.gridDim = dim3(25);
             dot.blockDim = dim3(256);
             dot.kernelParams = dotArgs;

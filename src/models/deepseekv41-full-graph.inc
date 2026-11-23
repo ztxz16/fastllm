@@ -216,6 +216,7 @@ struct V41FullGraph {
     std::map<int, void *> greedyHost, greedyMapped;
     bool captureGreedy = false;
     std::map<int, Data> mainHidden;
+    Data packedMainHidden;
     std::vector<void *> ready;
     std::vector<Data> commitDescriptors;
     Data commitSpans;
@@ -372,7 +373,7 @@ bool V41FullReserve(V41FullGraph &g, const std::vector<DeepSeekV41Segment> &segm
     }
     g.haveFixedUpload = false;
     g.fixedRows.clear();
-    if (fixedOnly && (g.tensorParallel || g.verifying || g.devices.size() != 1)) return false;
+    if (fixedOnly && (g.tensorParallel || g.devices.size() != 1)) return false;
     int totalRows = 0;
     for (const auto &s : segments) {
         if (s.offset != totalRows || s.seqlen < 1) return false;
@@ -630,7 +631,12 @@ void V41FullBindVerify(const std::shared_ptr<V41FullGraph> &owner, const DeepSee
                 "full verifier batched KV commit failed");
         };
     }
-    if (scratch.captureMain) {
+    if (scratch.captureMain && g.packedMainHidden.cudaData) {
+        auto &view = scratch.packedMainHidden;
+        const size_t width = g.packedMainHidden.dims.back();
+        view.FakeFrom(g.packedMainHidden, size_t(segment.offset) * width * sizeof(uint16_t));
+        view.Resize({1, segment.seqlen, int(width)});
+    } else if (scratch.captureMain) {
         scratch.mainHidden.resize(targetLayers.size());
         for (size_t i = 0; i < targetLayers.size(); ++i)
             if (targetLayers[i] >= g.firstLayer && targetLayers[i] < g.endLayer)
@@ -851,6 +857,25 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
         V41AllocLike(data, dtype, dims, ws.hiddenStates, g->devices);
     };
 
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    // Hidden features preceding an Engram must include that layer's embedding.
+    // The ordinary gather handles such checkpoints and partial pipeline graphs.
+    const bool ownerFeatures = verifying && !g->ownerFfn.empty() && hc_mult == 4 &&
+        firstLayer == 0 && endLayer == block_cnt && !v41DsparkTpDevices.empty() &&
+        v41DsparkTpDevices.front() == g->devices.front() && !v41DsparkTargetLayerIds.empty() &&
+        std::all_of(v41DsparkTargetLayerIds.begin(), v41DsparkTargetLayerIds.end(), [&](int l) {
+            return l > firstLayer && l < endLayer &&
+                std::count(v41DsparkTargetLayerIds.begin(), v41DsparkTargetLayerIds.end(), l) == 1 &&
+                std::find(engram_layer_ids.begin(), engram_layer_ids.end(), l) == engram_layer_ids.end();
+        }) && FastllmCudaPeerAccessInit(g->devices);
+    if (ownerFeatures) {
+        FastllmCudaSetDevice(g->devices.front());
+        auto &packed = g->packedMainHidden;
+        packed.dataType = BFLOAT16; packed.UpdateUnitSize();
+        packed.Resize({1, batch, embed_dim * int(v41DsparkTargetLayerIds.size())});
+        packed.ToDevice(CUDA, {g->devices.front()}, false); packed.Allocate(false);
+    }
+#endif
     // LLMSamplingBlock can merge per-rank candidates with one host read.
     // Other sampling policies and logit requests still consume the full logits.
     g->captureGreedy = !attentionOnly && !verifying && distributedAttention && g->tensorParallel &&
@@ -1315,7 +1340,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                    weight[prefix + ".engram.k_weight"], &e.mask, rms_norm_eps);
                 });
             }
-            if (capturesDraftInput(l)) {
+            if (capturesDraftInput(l) && !g->packedMainHidden.cudaData) {
                 capture([&] {
                     V41HcApplyPre(ws.hiddenStates, ws.dsparkPreMix, g->mainHidden[l]);
                 });
@@ -1371,7 +1396,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     // DSpark reads pre-attention hidden states in global token order.
                     // Publish the previous layer before any of its features are sampled.
                     const auto nextEngram = g->engrams.find(l + 1);
-                    const bool publish = capturesDraftInput(l + 1) || l + 1 == endLayer ||
+                    const auto feature = std::find(v41DsparkTargetLayerIds.begin(), v41DsparkTargetLayerIds.end(), l + 1);
+                    const bool saveFeature = ownerFeatures && feature != v41DsparkTargetLayerIds.end();
+                    const bool publish = (capturesDraftInput(l + 1) && !saveFeature) || l + 1 == endLayer ||
                         (nextEngram != g->engrams.end() && nextEngram->second->owners.empty());
                     capture([&] {
                         runtime.Enqueue([&](int rank, int device) {
@@ -1438,6 +1465,11 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                                 a ? static_cast<float *>(a->post.cudaData) : nullptr,
                                 a ? static_cast<float *>(a->comb.cudaData) : nullptr,
                                 a ? local->hiddenStates.cudaData : nullptr, m, nullptr, mixReady, packetReady, mixReady && packet.codes, routesReady);
+                            if (saveFeature && a)
+                                AssertInFastLLM(FastllmCudaV41PublishDraftFeature(local->hiddenStates.cudaData,
+                                    g->packedMainHidden.cudaData, g->rowTransfer->LocalToGlobal(rank), m, embed_dim,
+                                    int(feature - v41DsparkTargetLayerIds.begin()), int(v41DsparkTargetLayerIds.size())),
+                                    "owner-local draft feature publication failed");
                             if (publish) {
                                 parallel::CudaRowTransfer::Field fields[] = {
                                     {a ? local->hiddenStates.cudaData : nullptr,
@@ -1577,7 +1609,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
             if (!plansOk)
                 throw std::runtime_error("full graph dynamic plan rejected");
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-            if (attentionOnly && g->devices.size() == 1 && !verifying &&
+            if (attentionOnly && g->devices.size() == 1 && (!verifying || batch == 6) &&
                 V41EnvFlag("FASTLLM_DSV41_MLA_OUTPUT")) {
                 void *codes = nullptr, *scales = nullptr;
                 int pitch = 0;
@@ -1629,7 +1661,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 });
             };
             captureAttention(false);
-            if (attentionOnly && !verifying && layer.config.indexSource && V41EnvFlag("FASTLLM_DSV41_SHORT_INDEX")) {
+            if (attentionOnly && (!verifying || batch == 6) && layer.config.indexSource && V41EnvFlag("FASTLLM_DSV41_SHORT_INDEX")) {
                 const auto ordinary = children[0].back();
                 captureAttention(true);
                 auto selected = children[0].back();
@@ -1647,7 +1679,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 if (!g->layers[l]->outputProjection)
                     children[0].push_back(state->segments[l * 4 + 1].graphs[0]);
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-                if (!verifying && g->devices.size() == 1 && V41EnvFlag("FASTLLM_DSV41_LOCAL_EP_GRAPH") &&
+                if ((!verifying || batch <= 8) && g->devices.size() == 1 && V41EnvFlag("FASTLLM_DSV41_LOCAL_EP_GRAPH") &&
                     v41AttentionRankRuntime && FastllmV41HcEnabledAtRows("FASTLLM_DSV41_HC_OVERLAP", batch)) {
                     // The existing B1 optimization may already have cloned the
                     // prelude. Start from its captured, unmodified template.
@@ -1655,7 +1687,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     std::vector<const void *> input(parts.begin() + attentionInputChild, parts.end());
                     const auto &prelude = state->segments[l * 4];
                     input.front() = prelude.graphs[0];
-                    if (prelude.beforeCompressor && prelude.compressorInput && prelude.beforeIndexProjection) {
+                    if ((!verifying || batch == 6) && prelude.beforeCompressor && prelude.compressorInput && prelude.beforeIndexProjection) {
                         if (auto branched = FastllmCudaV41GraphPrefix(prelude.graphs[0], prelude.beforeIndexProjection,
                                 prelude.compressorInput, prelude.beforeCompressor, false)) {
                             input.front() = branched;
@@ -1893,7 +1925,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                 throw std::runtime_error("full graph composition failed");
         }
         // Only replace complete rank-local source layers. A generic graph is always executable.
-        if (g->attentionRuntime && !verifying && !hybrid && candidate_source_layer_id >= 0 &&
+        if (g->attentionRuntime && (!verifying || batch == 6) && !hybrid && candidate_source_layer_id >= 0 &&
             candidate_source_layer_id < block_cnt && compress_ratios[candidate_source_layer_id] == 1 &&
             std::all_of(compress_ratios.begin(), compress_ratios.end(), [](int r) { return r >= 0 && r <= 2; }) &&
             int64_t(candidate_block_size) * candidate_topk_blocks >= int64_t(index_topk) * 2 &&
@@ -2159,7 +2191,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     if (g->attentionRuntime) {
         parallel::RowPartition rows(v41AttentionDP, {});
         if (!V41FullPartition(*g, f.inputSegments, attentionSegments, rows)) return false;
-        bool fixed = !g->verifying;
+        bool fixed = true;
         for (size_t rank = 0; fixed && rank < g->attentionGraphs.size(); ++rank)
             if (g->attentionGraphs[rank])
                 fixed = V41FullReserve(*g->attentionGraphs[rank], attentionSegments[rank], true);
@@ -2180,7 +2212,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
             for (size_t i = 0; i < order.size(); ++i) g->ownerHostIds[r][i] = f.tokenIds[order[i]];
         }
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-        residentInputs = fixed && !g->inputPackets.empty();
+        residentInputs = !g->verifying && fixed && !g->inputPackets.empty();
         for (size_t r = 0; residentInputs && r < g->devices.size(); ++r) {
             const auto &owner = g->attentionGraphs[r];
             residentInputs = !owner || (g->inputPackets[r] && g->inputPackets[r]->positionOffset &&
@@ -2332,10 +2364,11 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         for (void *event : g->ready) FastllmCudaCurrentThreadStreamWaitEvent(event);
         for (const auto &segment : f.inputSegments)
             V41FullBindVerify(g, segment, v41DsparkTargetLayerIds);
-        if (g->attentionRuntime) g->attentionRuntime->Run([&](int rank, int) {
+        // Rank-local verify views and their commit closures are host metadata.
+        // Their GPU producers are already joined on the sampling stream above.
+        for (size_t rank = 0; rank < attentionSegments.size(); ++rank)
             for (const auto &segment : attentionSegments[rank])
                 V41FullBindVerify(g->attentionGraphs[rank], segment, {});
-        });
         if (f.pipeline) f.pipeline->fullVerify = true;
     }
     ++g->replays;

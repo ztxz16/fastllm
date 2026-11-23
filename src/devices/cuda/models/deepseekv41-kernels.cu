@@ -48,6 +48,7 @@ SOFTWARE.
 #include "deepseekv41-reference.cuh"
 #ifndef USE_ROCM
 #include "deepseekv41-flashinfer.cuh"
+#include "deepseekv41-verify-merge.cuh"
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
 #include "deepseekv41-flashmla.cuh"
 #endif
@@ -991,10 +992,10 @@ namespace {
         mix += (uint64_t)blockIdx.y * 25;
         float acc = 0.0f;
         int k = threadIdx.x;
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1200)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1030)
         // Exactly 256 threads participate in these dots, including the dot
         // CTAs of the combined SM120 kernel. Expose their range to NVCC.
-        k &= kHcThreads - 1;
+        if constexpr (TILE > 0 || __CUDA_ARCH__ != 1030) k &= kHcThreads - 1;
         if constexpr (TILE > 0) {
             // Tiled launchers check shape eligibility. Preserve each lane's
             // FMA order; partial tiles use the original loop below.
@@ -1030,11 +1031,11 @@ namespace {
         V41HcDecodeDotsBody(x, fn, flatDim, mix);
     }
 
-    // Small SM90 grids benefit from registers for independent loads. Larger
-    // batches use a smaller tile to leave room for more resident CTAs.
+    // Stage independent loads in registers while keeping each lane's FMA
+    // order. Callers choose the tile for the target SM and row count.
     template <int TILE>
     __global__ __launch_bounds__(kHcThreads, 1)
-    void V41HcDecodeDotsSm90(const __nv_bfloat16 *x, const float *fn, int flatDim, float *mix) {
+    void V41HcDecodeDotsTiled(const __nv_bfloat16 *x, const float *fn, int flatDim, float *mix) {
         V41HcDecodeDotsBody<__nv_bfloat16, TILE>(x, fn, flatDim, mix);
     }
 
@@ -4597,9 +4598,9 @@ namespace {
         const dim3 grid(25, tokens);
         if (tokens <= 8 && flatDim >= 16384 && flatDim <= 32768 && V41IsSm<9, 0>()) {
             if (tokens <= 3)
-                V41HcDecodeDotsSm90<64><<<grid, kHcThreads>>>(x, fn, flatDim, mix);
+                V41HcDecodeDotsTiled<64><<<grid, kHcThreads>>>(x, fn, flatDim, mix);
             else
-                V41HcDecodeDotsSm90<16><<<grid, kHcThreads>>>(x, fn, flatDim, mix);
+                V41HcDecodeDotsTiled<16><<<grid, kHcThreads>>>(x, fn, flatDim, mix);
         } else {
             V41HcDecodeDots<<<grid, kHcThreads>>>(x, fn, flatDim, mix);
         }
@@ -7273,6 +7274,45 @@ extern "C" bool FastllmCudaV41DecodeIndexerBatch(
 }
 
 namespace {
+#if defined(FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE) && defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
+// One CTA merges a (request row, attention head) and emits O-A's rounded
+// block-scaled BF16 input. Chunk boundaries come from each request descriptor.
+__global__ void V41VerifyMergeRotaryOutput(FastllmV41FullDecodeBuffers b, FastllmV41FlashInferPartials history,
+        const FastllmV41FullDecodeRequest *requests, V41RopeTable rope, float scale,
+        int heads, int rows, int begin) {
+    const int row = begin + blockIdx.y, h = blockIdx.x, d = threadIdx.x * 4;
+    uint2 packed = fastllm_v41_verify::MergeValues(static_cast<const __nv_bfloat16 *>(b.q),
+        static_cast<const __nv_bfloat16 *>(b.kv), static_cast<const __nv_bfloat16 *>(history.values),
+        history.lse, static_cast<const float *>(b.sink), scale, heads, history.heads,
+        history.splits, rows, requests, begin);
+    auto *pairs = reinterpret_cast<__nv_bfloat162 *>(&packed);
+    float values[4];
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair) {
+        float2 v = __bfloat1622float2(pairs[pair]);
+        if (d >= 448) {
+            const float angle = float(requests[row].position) * rope.invFreq[(d - 448) / 2 + pair];
+            const float c = cosf(angle), s = -sinf(angle);
+            // Same contraction and BF16 rounding as V41DecodeTransformRow (mode 1).
+            const float x = v.x * c - v.y * s, y = v.x * s + v.y * c;
+            v.x = V41Bf16Round(x); v.y = V41Bf16Round(y);
+        }
+        values[2 * pair] = v.x; values[2 * pair + 1] = v.y;
+    }
+    float peak = fmaxf(fmaxf(fabsf(values[0]), fabsf(values[1])), fmaxf(fabsf(values[2]), fabsf(values[3])));
+#pragma unroll
+    for (int stride = 4; stride; stride >>= 1)
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, stride));
+    const float factor = V41QuantScaleDev(peak, 1);
+#pragma unroll
+    for (int pair = 0; pair < 2; ++pair)
+        pairs[pair] = __floats2bfloat162_rn(V41QuantValueDev(values[2 * pair], factor, 1),
+                                           V41QuantValueDev(values[2 * pair + 1], factor, 1));
+    auto *out = static_cast<__nv_bfloat16 *>(b.output) + (size_t(row) * heads + h) * 512;
+    reinterpret_cast<uint2 *>(out)[threadIdx.x] = packed;
+}
+#endif
+
 constexpr int kFullDecodeTransforms = 5;
 
 struct V41FullDecodePlan {
@@ -7287,6 +7327,7 @@ struct V41FullDecodePlan {
     std::shared_ptr<FastllmV41MlaWorkspace> mla;
     bool directMlaOutput = false;
 #endif
+    bool packVerify = false;
     bool directRing = false, earlyHistory = false, shortPages = false;
     bool scalarAttention = false, scalarIndex = false;
     bool indexPairs = false, indexPairNarrow = false;
@@ -7409,7 +7450,7 @@ struct V41DecodeKeyNorm {
     float eps;
 };
 
-template<bool NativeQuery = false, bool NormalizeKey = false>
+template<bool NativeQuery = false, bool NormalizeKey = false, bool PackVerify = false>
 __global__ void V41FullDecodePrepareKernel(
         FastllmV41FullDecodeConfig c, FastllmV41FullDecodeBuffers b,
         const FastllmV41FullDecodeRequest *requests, V41DecodeTransformDescriptor *transforms,
@@ -7453,6 +7494,14 @@ __global__ void V41FullDecodePrepareKernel(
     const V41DecodeTransformDescriptor item{
         input, nullptr, 1, 512, requests[token].position, kv ? 1 : 0, 0, 32};
     V41DecodeTransformRow(item, 0, threadIdx.x, rope, c.ropeDim, c.window);
+    if constexpr (PackVerify) {
+        if (kv) {
+            __syncthreads();
+            if (threadIdx.x < kKvQuantThreads)
+                V41QuantizeKVRow(input, static_cast<uint8_t *>(b.savedKV) + size_t(token) * c.ringRowBytes,
+                                 512, 1, 32);
+        }
+    }
     if (kv && directRing) {
         // The preceding 127 positions cannot use position % 128. The
         // current token remains BF16 in the separate attention merge.
@@ -7608,6 +7657,7 @@ __global__ void V41FullDecodeStorePackedRing(FastllmV41FullDecodeConfig c,
 
 // Verification never overwrites the committed ring or compressor tail.
 // Save a contiguous [old tail, current chunk] stream for any accepted prefix.
+template<bool Compress = false>
 __global__ void V41FullVerifyGather(FastllmV41FullDecodeConfig c,
         FastllmV41FullDecodeBuffers b, const FastllmV41FullDecodeRequest *requests) {
     const int row = blockIdx.x, d = threadIdx.x;
@@ -7615,26 +7665,43 @@ __global__ void V41FullVerifyGather(FastllmV41FullDecodeConfig c,
     const int begin = r.chunkBegin, localRow = row - begin;
     const int tail = requests[begin].position % c.ratio;
     const size_t savedRow = size_t(2) * begin + tail + localRow;
-    const float value = static_cast<const float *>(b.rawKV)[(size_t)row * 512 + d];
+    float value = static_cast<const float *>(b.rawKV)[(size_t)row * 512 + d];
     static_cast<float *>(b.savedRawKV)[(size_t)savedRow * 512 + d] = value;
     if (c.ratio == 1) {
-        static_cast<float *>(b.joined)[(size_t)row * 512 + d] = value;
-        return;
+        if constexpr (!Compress) static_cast<float *>(b.joined)[size_t(row) * 512 + d] = value;
+    } else {
+        const float score = static_cast<const float *>(b.rawScore)[(size_t)row * 512 + d];
+        const bool ready = (r.position + 1) % c.ratio == 0;
+        const float previous = localRow ? static_cast<const float *>(b.rawKV)[(size_t)(row - 1) * 512 + d]
+                                   : (tail ? static_cast<const float *>(r.rawTailKV)[d] : value);
+        const float previousScore = localRow ? static_cast<const float *>(b.rawScore)[(size_t)(row - 1) * 512 + d]
+                                        : (tail ? static_cast<const float *>(r.rawTailScore)[d] : score);
+        if constexpr (Compress) {
+            const float left = ready ? previous : value, leftScore = ready ? previousScore : score;
+            const float peak = fmaxf(fmaxf(-FLT_MAX, leftScore), score);
+            const float a = __expf(leftScore - peak), z = __expf(score - peak);
+            float acc = 0.f;
+            acc += a * left;
+            acc += z * value;
+            value = acc / (a + z);
+        } else {
+            static_cast<float *>(b.joined)[(size_t)row * 1024 + d] = ready ? previous : value;
+            static_cast<float *>(b.joined)[(size_t)row * 1024 + 512 + d] = value;
+            static_cast<float *>(b.scores)[(size_t)row * 1024 + d] = ready ? previousScore : score;
+            static_cast<float *>(b.scores)[(size_t)row * 1024 + 512 + d] = score;
+        }
+        static_cast<float *>(b.savedRawScore)[(size_t)savedRow * 512 + d] = score;
+        if (localRow == 0 && tail) {
+            static_cast<float *>(b.savedRawKV)[size_t(2) * begin * 512 + d] = previous;
+            static_cast<float *>(b.savedRawScore)[size_t(2) * begin * 512 + d] = previousScore;
+        }
     }
-    const float score = static_cast<const float *>(b.rawScore)[(size_t)row * 512 + d];
-    const bool ready = (r.position + 1) % c.ratio == 0;
-    const float previous = localRow ? static_cast<const float *>(b.rawKV)[(size_t)(row - 1) * 512 + d]
-                               : (tail ? static_cast<const float *>(r.rawTailKV)[d] : value);
-    const float previousScore = localRow ? static_cast<const float *>(b.rawScore)[(size_t)(row - 1) * 512 + d]
-                                    : (tail ? static_cast<const float *>(r.rawTailScore)[d] : score);
-    static_cast<float *>(b.joined)[(size_t)row * 1024 + d] = ready ? previous : value;
-    static_cast<float *>(b.joined)[(size_t)row * 1024 + 512 + d] = value;
-    static_cast<float *>(b.scores)[(size_t)row * 1024 + d] = ready ? previousScore : score;
-    static_cast<float *>(b.scores)[(size_t)row * 1024 + 512 + d] = score;
-    static_cast<float *>(b.savedRawScore)[(size_t)savedRow * 512 + d] = score;
-    if (localRow == 0 && tail) {
-        static_cast<float *>(b.savedRawKV)[size_t(2) * begin * 512 + d] = previous;
-        static_cast<float *>(b.savedRawScore)[size_t(2) * begin * 512 + d] = previousScore;
+    if constexpr (Compress) {
+        __shared__ float partial[32];
+        value = V41Bf16Round(value);
+        const float ss = V41BlockSum<512>(value * value, partial);
+        static_cast<__nv_bfloat16 *>(b.latents)[size_t(row) * 512 + d] =
+            __float2bfloat16_rn(static_cast<const float *>(b.compressNorm)[d] * value * rsqrtf(ss / 512.f + c.normEps));
     }
 }
 
@@ -7796,6 +7863,8 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
 #ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
     if (FastllmV41FlashInferEnabled())
         p->flashInfer = FastllmV41FlashInferCreate(c);
+    p->packVerify = p->flashInfer && c.verifying && c.heads == 64 && c.ropeDim == 64 &&
+        c.batch <= 32 && V41IsSm<10,3>();
     p->directRing = p->flashInfer && !c.verifying && c.window == 128 && c.ringMode == 1 &&
         V41IsSm<10,3>() && !V41EnvOn("FASTLLM_DSV41_DISABLE_FUSED_RING");
 #endif
@@ -7816,6 +7885,17 @@ void *FastllmCudaV41CreateFullDecode(const FastllmV41FullDecodeConfig &c,
 bool FastllmCudaV41MlaOutput(void *handle, void *&codes, void *&scales, int &pitch, bool &headMajor) {
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
     auto *p = static_cast<V41FullDecodePlan *>(handle);
+#if defined(FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE) && defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
+    if (p && p->config.batch == 6 && FastllmV41FlashInferVerifyAngles(p->flashInfer)) {
+        // This graph slot normally holds BF16 [rows,64,512]. Its packed codes
+        // and K128-major UE8M0 words fit in the same aligned allocation.
+        codes = p->buffers.output;
+        scales = static_cast<uint8_t *>(codes) + size_t(p->config.batch) * 64 * 512;
+        pitch = (p->config.batch + 3) / 4 * 4;
+        headMajor = true;
+        return true;
+    }
+#endif
     if (p && p->mla) {
         codes = p->mla->codes; scales = p->mla->scales; pitch = p->mla->scalePitch; headMajor = p->mla->headMajor;
         return true;
@@ -8054,20 +8134,30 @@ static bool V41PrepareDecode(void *handle, bool allIndices, bool publish) {
 #ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
     nativeQuery = p->mla && p->mla->nativeQuery;
 #endif
+#if defined(FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE) && defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
+    if (auto *verifyAngles = FastllmV41FlashInferVerifyAngles(p->flashInfer)) {
+        nativeQuery = true;
+        angles = verifyAngles;
+    }
+#endif
     V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
         auto prepare = nativeQuery ? V41FullDecodePrepareKernel<true> : V41FullDecodePrepareKernel<false>;
+        if (p->packVerify) prepare = nativeQuery ? V41FullDecodePrepareKernel<true, false, true> :
+                                                     V41FullDecodePrepareKernel<false, false, true>;
         prepare<<<dim3(nativeQuery ? 1 : c.heads + 1, rows), 512, 0, cudaStreamPerThread>>>(
             c, b, p->requests, p->transforms, p->index, p->attention,
             p->indexScores, p->blockScores, p->attentionScores, p->tiles, p->rope,
             p->candidateBlocks, p->candidateCounts, begin, p->directRing, packedQuery, angles, mlaRing, V41DecodeKeyNorm{});
     });
-    if (c.ringMode && !p->directRing)
+    if (c.ringMode && !p->directRing && !p->packVerify)
         V41FullVerifyPackWindow<<<c.batch, kKvQuantThreads, 0, cudaStreamPerThread>>>(c, b);
     if (publish) {
         V41PublishCompressed<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests, p->rope);
+    } else if (c.kvSource && p->packVerify) {
+        V41FullVerifyGather<true><<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
     } else if (c.kvSource) {
         if (c.verifying)
-            V41FullVerifyGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
+            V41FullVerifyGather<false><<<c.batch, 512, 0, cudaStreamPerThread>>>(c, b, p->requests);
         else
             V41FullDecodeGather<<<c.batch, 512, 0, cudaStreamPerThread>>>(p->requests,
                 static_cast<const float *>(b.rawKV), static_cast<const float *>(b.rawScore),
@@ -8184,6 +8274,16 @@ __global__ void V41DecodeAllIndices(int *indices, int width) {
     for (int i = threadIdx.x; i < width; i += blockDim.x)
         indices[size_t(blockIdx.x) * width + i] = i;
 }
+// A verify chunk owns one selection per real row. Future compressed keys
+// in the same chunk are masked even when the whole chunk fits in Top-K.
+__global__ void V41VerifyAllIndices(int *indices, const FastllmV41FullDecodeRequest *requests,
+                                    int width, int ratio) {
+    const int row = blockIdx.x;
+    const int visible = (requests[row].position + 1) / ratio;
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        indices[size_t(row) * width + i] = i < visible ? i : -1;
+}
+
 static bool V41FinishDecode(void *handle, bool allIndices, bool publish = false) {
     auto *p = static_cast<V41FullDecodePlan *>(handle);
     if (!p || FastllmCudaGetDevice() != p->device) return false;
@@ -8200,7 +8300,10 @@ static bool V41FinishDecode(void *handle, bool allIndices, bool publish = false)
             static_cast<const __nv_bfloat16 *>(b.latents), static_cast<const __nv_bfloat16 *>(b.newIndexKeys), c.ratio, c.indexSource);
     }
     if (allIndices && c.indexSource) {
-        if (!p->shortPages)
+        if (c.verifying)
+            V41VerifyAllIndices<<<c.batch, 128, 0, cudaStreamPerThread>>>(
+                static_cast<int *>(b.topk), p->requests, c.topK, c.ratio);
+        else if (!p->shortPages)
             V41DecodeAllIndices<<<c.batch, 128, 0, cudaStreamPerThread>>>(static_cast<int *>(b.topk), c.topK);
     } else if (c.indexSource) {
         V41FullDecodeTransforms(*p, 4, (c.indexHeads + 3) / 4);
@@ -8314,6 +8417,25 @@ static bool V41FinishDecode(void *handle, bool allIndices, bool publish = false)
         return FastllmV41RunMla(*p->mla, c, b, p->requests, cudaStreamPerThread, !p->directMlaOutput,
                 p->earlyHistory || (allIndices && p->shortPages && !c.kvSource), allIndices && p->shortPages) == cudaSuccess;
 #endif
+#if defined(FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE) && defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
+    if (p->flashInfer && c.verifying && c.ropeDim == 64 && V41IsSm<10,3>()) {
+        if (FastllmV41FlashInferVerifyAngles(p->flashInfer)) {
+            bool packed = false;
+#ifdef FASTLLM_ENABLE_DSV41_FLASHMLA
+            packed = p->directMlaOutput;
+#endif
+            return FastllmV41FlashInferVerifyFused(p->flashInfer, b, p->requests, cudaStreamPerThread, packed) == cudaSuccess;
+        }
+        FastllmV41FlashInferPartials history{};
+        if (FastllmV41FlashInferRun(p->flashInfer, b, p->requests, cudaStreamPerThread, &history) != cudaSuccess)
+            return false;
+        V41FullDecodeRowTiles(c.batch, p->gridY, [&](int begin, int rows) {
+            V41VerifyMergeRotaryOutput<<<dim3(c.heads, rows), 128, 0, cudaStreamPerThread>>>(
+                b, history, p->requests, p->rope, c.softmaxScale, c.heads, c.batch, begin);
+        });
+        return V41CheckLaunch("FullVerifyMergeRotaryOutput");
+    }
+#endif
     const bool attentionOk =
 #ifdef FASTLLM_ENABLE_DSV41_FLASHINFER_DECODE
         p->flashInfer ? FastllmV41FlashInferRun(p->flashInfer, b, p->requests, cudaStreamPerThread) == cudaSuccess :
@@ -8346,6 +8468,32 @@ static bool V41FinishDecode(void *handle, bool allIndices, bool publish = false)
     return V41CheckLaunch("FullDecodeFinish");
 }
 
+
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+// Owners write disjoint (global row, feature slot) pairs on the draft device.
+// The target's existing all-rank completion events publish the buffer to sampling.
+static __global__ void V41PublishDraftFeature(const __nv_bfloat16 *hidden, __nv_bfloat16 *packed,
+        const int *globalRows, int dim, int slot, int features) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= dim) return;
+    const int row = blockIdx.y;
+    float value = 0.0f;
+#pragma unroll
+    for (int hc = 0; hc < 4; ++hc)
+        value = __fadd_rn(value, __fmul_rn(0.25f, __bfloat162float(hidden[(size_t(row) * 4 + hc) * dim + col])));
+    packed[(size_t(globalRows[row]) * features + slot) * dim + col] = __float2bfloat16_rn(value);
+}
+
+bool FastllmCudaV41PublishDraftFeature(const void *hidden, void *packed, const int *globalRows,
+                                      int rows, int dim, int slot, int features) {
+    if (!hidden || !packed || !globalRows || rows < 1 || rows > 32 || dim <= 0 || slot < 0 || slot >= features)
+        return false;
+    V41PublishDraftFeature<<<dim3((dim + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const __nv_bfloat16 *>(hidden), static_cast<__nv_bfloat16 *>(packed),
+        globalRows, dim, slot, features);
+    return V41CheckLaunch("PublishDraftFeature");
+}
+#endif
 
 bool FastllmCudaV41FinishFullDecode(void *handle) { return V41FinishDecode(handle, false); }
 bool FastllmCudaV41FinishSource(void *handle) {

@@ -6727,7 +6727,7 @@ namespace fastllm {
                 std::vector<void *> preceding;
                 if (f.graphCapture && v41AttentionRankRuntime && V41EnvFlag("FASTLLM_DSV41_SHORT_INDEX")) {
                     beforeIndexProjection = FastllmCudaV41CaptureFrontier();
-                    if (seqlen >= 16 && V41EnvFlag("FASTLLM_DSV41_INDEX_PROJECTIONS"))
+                    if ((seqlen == 6 || seqlen >= 16) && V41EnvFlag("FASTLLM_DSV41_INDEX_PROJECTIONS"))
                         preceding = FastllmCudaV41CaptureNodes();
                 }
 #endif
@@ -7787,8 +7787,10 @@ namespace fastllm {
             // Both samplers finish with a blocking result readback. Full
             // verification joins every rank onto that stream before sampling,
             // so teardown needs no second device-wide barrier.
-            if (f.fullGraphLogits && f.tpDecodeDispatch && !FastllmCudaGetThreadError())
-                f.tpDecodeDispatch->MarkDeviceWorkComplete();
+            if (f.fullGraphLogits && !FastllmCudaGetThreadError()) {
+                if (f.tpDecodeDispatch) f.tpDecodeDispatch->MarkDeviceWorkComplete();
+                for (auto &segment : segments) segment.spec->targetRowsReady = true;
+            }
 #endif
             for (auto &seg : segments) {
                 seg.state->totalLen += seg.seqlen;

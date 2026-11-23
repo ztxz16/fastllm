@@ -244,7 +244,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool fuse_swiglu,
           const bool bf16_output,
           const bool parallel_fp32_reduce,
-          const bool fp32_output>
+          const bool fp32_output,
+          const bool verify_qb, const bool verify_qkv>
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -273,6 +274,19 @@ __global__ void Marlin(
     bool use_atomic_add_arg,   // whether to use atomic add to reduce
     bool use_fp32_reduce_arg,  // whether to use fp32 global reduce
     int max_shared_mem) {
+  // For six-row verification the first 148 output tiles are independent
+  // of the remaining 108. Two grid rows run these waves concurrently but
+  // retain the original 148-way K partitions and FP32 summation order.
+  if constexpr (verify_qb) {
+    prob_m = 6; prob_n = 32768; prob_k = lda = 1280; num_groups = 40;
+  }
+  // The B300 six-row joint projection has fourteen 128-column tiles.
+  // Preserve the general kernel's ten ordered, eight-K-tile partials per tile.
+  if constexpr (verify_qkv) {
+    prob_m = 6; prob_n = 1792; prob_k = lda = 5120; num_groups = 160;
+    if (blockIdx.x >= 140) return;
+  }
+  const unsigned partitionBlocks = verify_qkv ? 148 : gridDim.x;
   static_assert(!parallel_fp32_reduce || (dense_fp32 && m_block_size_8 &&
       thread_m_blocks == 1 && a_type_id == vllm::kBFloat16.id() &&
       c_type_id == vllm::kBFloat16.id() && b_type_id == vllm::kFE4M3fn.id() &&
@@ -413,13 +427,16 @@ __global__ void Marlin(
   int part1_mn_iters = 0;
   bool in_part2 = false;
 
-  if (global_mn_tiles > gridDim.x) {
-    part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  if (global_mn_tiles > partitionBlocks) {
+    part2_mn_tiles = global_mn_tiles % partitionBlocks;
+    if (part2_mn_tiles * 3 <= partitionBlocks) part2_mn_tiles += partitionBlocks;
+    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / partitionBlocks;
   }
 
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+  if constexpr (verify_qb) {
+    if (blockIdx.y == 1) part1_mn_iters = 0;
+  }
+  int iters = div_ceil(k_tiles * part2_mn_tiles, partitionBlocks);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -444,7 +461,7 @@ __global__ void Marlin(
   int par_id = 0;
   int locks_off = 0;
 
-  if (part2_mn_tiles >= gridDim.x) {
+  if (part2_mn_tiles >= partitionBlocks) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
     locks_off = blockIdx.x;
@@ -476,7 +493,7 @@ __global__ void Marlin(
         if (col_off > 0) slice_idx--;
       }
     }
-    if (part2_mn_tiles >= gridDim.x) {
+    if (part2_mn_tiles >= partitionBlocks) {
       if (slice_count > 1 && slice_idx == slice_count - 1) {
         locks_off++;
       }
@@ -2204,9 +2221,13 @@ __global__ void Marlin(
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
+      if constexpr (verify_qkv) return;
+      if constexpr (verify_qb) {
+        if (!in_part2) return;
+      }
       slice_row = 0;
       if (!in_part2) {
-        slice_col_par += gridDim.x;
+        slice_col_par += partitionBlocks;
       } else {
         slice_col_par++;
         slice_col++;

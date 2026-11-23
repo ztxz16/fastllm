@@ -124,6 +124,7 @@ namespace fastllm {
         bool deferWindow = false;     // 滑窗写入延后到接受长度确定之后
         bool wantAllTokens = false;   // head 对本片段的每个位置计算目标 logits
         int mainHiddenStartPos = -1;  // bounded prefill 只采集末尾窗口，记录其绝对起点
+        Data packedMainHidden; // Optional owner-written [1, rows, features * dim] graph view.
         std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
         std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
         std::vector<Data> rawKV, rawScore;    // kv source 层：压缩器的原始输入流（含旧 rawTail）
@@ -133,6 +134,7 @@ namespace fastllm {
         const void *commitGroup = nullptr;
         std::function<void(const std::vector<std::pair<int, int>> &)> commitBatchKV;
         bool kvCommitted = false;
+        bool targetRowsReady = false; // Full verify joined all producers before sampling readback.
         // Attention DP: target KV and rollback scratch belong to the request's
         // TP ranks. The parent alone owns sampling and draft/main features.
         std::vector<std::shared_ptr<DeepSeekV41SpecScratch>> attentionRanks;
@@ -619,8 +621,8 @@ namespace fastllm {
         int DsparkTakePending(DeepSeekV41RequestState &state, const Data &inputIds, int seqlen);
         int DsparkTakePending(DeepSeekV41RequestState &state, int previousToken);
         // 若 state 有可用的候选，把 inputIds 扩展成 [anchor, draft...]，返回 draft 个数
-        int DsparkBuildVerifyInput(DeepSeekV41RequestState &state, const Data &inputIds,
-                                   int startPos, Data &verifyIds, std::vector<int> &drafts);
+        int DsparkBuildVerifyInput(DeepSeekV41RequestState &state, int anchor,
+                                   int startPos, std::vector<int> &drafts);
         // 把本次前向的前 accept 个位置提交进各层缓存，其余回滚
         bool DsparkCommitBatch(const std::vector<DeepSeekV41Segment> &segments);
         void DsparkCommitPrefix(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
@@ -636,7 +638,7 @@ namespace fastllm {
         bool DsparkRunDraft(DeepSeekV41DsparkState &storage,
                            const std::vector<int> &positions, const std::vector<int> &anchors,
                            const std::vector<int> &validRows, std::vector<int> &tokens,
-                           std::vector<float> &confidence, const GenerationConfig &config);
+                           std::vector<float> &confidence, const GenerationConfig &config, bool deferGreedy = false);
         void DsparkBuildMoeWeights();
         void DsparkReportStats();
 

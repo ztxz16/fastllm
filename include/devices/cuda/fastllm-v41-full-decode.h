@@ -131,6 +131,9 @@ void FastllmCudaV41UseMlaOutput(void *plan);
 // Validated, fixed independent decode rows on the same rank stream.
 bool FastllmCudaV41AdvancePositions(void *storage, size_t count);
 
+bool FastllmCudaV41PublishDraftFeature(const void *hidden, void *packed, const int *globalRows,
+                                      int rows, int dim, int slot, int features);
+
 bool FastllmCudaV41OwnerEmbedding(const void *weight, bool fp32, const int *ids, void *hidden,
                                   float *firstMix, int rows, int dim, int vocab);
 bool FastllmCudaV41OwnerEmbedding(const void *weight, bool fp32, const int *ids, void *hidden,

@@ -950,7 +950,8 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_options(fastllm_mxfp8_linear_sm103 PRIVATE
         "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr")
     set_property(SOURCE src/devices/cuda/linear/fastllm-linear-fp8.cu
-        src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu src/devices/cuda/models/deepseekv41-kernels.cu
+        src/devices/cuda/linear/fastllm-linear-fp8-marlin.cu src/devices/cuda/linear/fastllm-marlin-fp8-dense.cu
+        src/devices/cuda/models/deepseekv41-kernels.cu
         src/models/deepseekv41.cpp
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
     add_library(fastllm_dsv41_mega_sm103 OBJECT src/devices/cuda/moe/fastllm-dsv41-mega.cu)

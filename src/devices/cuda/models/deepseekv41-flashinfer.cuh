@@ -17,8 +17,18 @@ void FastllmV41FlashInferDestroy(void *plan);
 // Call before capture and only for plans whose executions are strictly ordered.
 // Matching layouts share storage ownership; either plan may be destroyed first.
 bool FastllmV41FlashInferShareWorkspace(void *plan, void *source);
+float *FastllmV41FlashInferVerifyAngles(void *plan);
+cudaError_t FastllmV41FlashInferVerifyFused(void *plan, const FastllmV41FullDecodeBuffers &buffers,
+    const FastllmV41FullDecodeRequest *requests, cudaStream_t stream, bool packedOutput);
+struct FastllmV41FlashInferPartials {
+    const void *values;
+    const float *lse;
+    int heads, splits;
+};
+// A caller supplying history owns the causal merge and output epilogue.
 cudaError_t FastllmV41FlashInferRun(void *plan, const FastllmV41FullDecodeBuffers &buffers,
-                                    const FastllmV41FullDecodeRequest *requests, cudaStream_t stream);
+                                    const FastllmV41FullDecodeRequest *requests, cudaStream_t stream,
+                                    FastllmV41FlashInferPartials *history = nullptr);
 
 // Ordinary sparse-attention entry. Indices are already causally filtered by
 // the model's indexer, exactly as for the native sparse-attention operator.

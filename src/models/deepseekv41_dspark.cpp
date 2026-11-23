@@ -110,8 +110,30 @@ namespace fastllm {
 #ifdef USE_CUDA
         std::vector<void*> graphs, execs, starts, ends, reserved;
         void *replayReady = nullptr;
+        std::vector<void *> replayDone;
+        int *hostProposal = nullptr;
+        void *proposalReady = nullptr;
+        int pendingCount = 0;
+
+        void FinishProposal(std::vector<int> *output = nullptr) {
+            if (!pendingCount) return;
+            FastllmCudaEventSynchronize(proposalReady);
+            if (output) output->assign(hostProposal, hostProposal + pendingCount);
+            pendingCount = 0;
+        }
+        bool QueueProposal(int count) {
+            if (!proposalReady) proposalReady = FastllmCudaEventCreate();
+            if (!hostProposal) hostProposal = static_cast<int *>(FastllmCudaHostMalloc(block * sizeof(int)));
+            if (!hostProposal || !proposalReady || pendingCount || count != block) return false;
+            if (!FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(hostProposal,
+                    static_cast<int *>(markovTokens.cudaData) + 1, count * sizeof(int))) return false;
+            FastllmCudaEventRecordCurrentThread(proposalReady);
+            pendingCount = count;
+            return true;
+        }
         void ClearGraphs() {
             const int original = FastllmCudaGetDevice();
+            FinishProposal();
             for (size_t i = 0; i < devices.size(); ++i) {
                 FastllmCudaSetDevice(devices[i]);
                 if (i < execs.size() && execs[i]) {
@@ -121,7 +143,12 @@ namespace fastllm {
                 if (i < graphs.size() && graphs[i]) FastllmCudaGraphDestroy(graphs[i]);
                 if (i < starts.size() && starts[i]) FastllmCudaEventDestroy(starts[i]);
                 if (i < ends.size() && ends[i]) FastllmCudaEventDestroy(ends[i]);
+                if (i < replayDone.size() && replayDone[i]) FastllmCudaEventDestroy(replayDone[i]);
             }
+            replayDone.clear();
+            if (proposalReady && !devices.empty()) FastllmCudaSetDevice(devices.front());
+            if (proposalReady) { FastllmCudaEventDestroy(proposalReady); proposalReady = nullptr; }
+            if (hostProposal) { FastllmCudaHostFree(hostProposal); hostProposal = nullptr; }
             if (replayReady) {
                 FastllmCudaSetDevice(devices.front());
                 FastllmCudaEventDestroy(replayReady);
@@ -151,6 +178,9 @@ namespace fastllm {
     }
 
     void DeepSeekV41DsparkState::ClearProposal() {
+#ifdef USE_CUDA
+        if (workspace) workspace->FinishProposal();
+#endif
         drafts.clear();
         confidence.clear();
         proposalTokens.clear();
@@ -181,7 +211,7 @@ namespace fastllm {
 #ifdef USE_CUDA
         thread_local bool dsparkCapturing = false;
 
-        bool DsRunDraftGraph(DeepSeekV41DsparkWorkspace &state, const std::function<void()> &body) {
+        bool DsRunDraftGraph(DeepSeekV41DsparkWorkspace &state, const std::function<void()> &body, bool streamJoin = false) {
             const int root = state.devices.front();
             auto launch = [&]() {
                 if (state.devices.size() > 1) {
@@ -193,14 +223,29 @@ namespace fastllm {
                         // Join that producer before replay, then drain only the
                         // graph streams, leaving target cache admissions running.
                         FastllmCudaEventRecordCurrentThread(state.replayReady);
+                        const bool events = streamJoin && !state.diskExperts && !state.hybridExperts &&
+                            state.replayDone.size() == state.devices.size() &&
+                            std::all_of(state.replayDone.begin(), state.replayDone.end(), [](void *e) { return e != nullptr; });
                         auto runRank = [&](int rank, int) {
                             FastllmCudaCurrentThreadStreamWaitEvent(state.replayReady);
                             ok[rank] = rank == 0 && !state.moeHandles.empty()
                                 ? FastllmCudaLaunchNativeMoeFullGraph(state.execs[rank],
                                     state.moeHandles.data(), int(state.moeHandles.size()))
                                 : FastllmCudaGraphLaunch(state.execs[rank]);
+                            if (events) FastllmCudaEventRecordCurrentThread(state.replayDone[rank]);
                         };
                         const bool queued = MultiCudaRunDeviceCallbacksEnqueueOnly(state.devices, runRank);
+                        if (queued && events) {
+                            // The caller can submit the next graph while the workers run.
+                            // Peer-local consumers and the root proposal copy both retain their dependencies.
+                            for (size_t r = 1; r < state.devices.size(); ++r) {
+                                FastllmCudaSetDevice(state.devices[r]);
+                                FastllmCudaCurrentThreadStreamWaitEvent(state.replayDone[r]);
+                            }
+                            FastllmCudaSetDevice(root);
+                            for (void *event : state.replayDone) FastllmCudaCurrentThreadStreamWaitEvent(event);
+                            return std::all_of(ok.begin(), ok.end(), [](int v) { return v != 0; });
+                        }
                         const bool dispatched = queued
                             ? MultiCudaSynchronizeDeviceCallbacks(state.devices)
                             : MultiCudaRunDeviceCallbacks(state.devices, runRank);
@@ -246,6 +291,7 @@ namespace fastllm {
             }
             state.graphs.assign(count, nullptr); state.execs.assign(count, nullptr);
             state.starts.assign(count, nullptr); state.ends.assign(count, nullptr);
+            if (streamJoin) state.replayDone.assign(count, nullptr);
             bool ok = true;
             for (int i = 0; i < count; ++i) {
                 FastllmCudaSetDevice(state.devices[i]);
@@ -253,6 +299,7 @@ namespace fastllm {
                 ok = FastllmCudaGraphPrepareCaptureDevice() && ok;
                 state.starts[i] = FastllmCudaEventCreate();
                 state.ends[i] = FastllmCudaEventCreate();
+                if (streamJoin) state.replayDone[i] = FastllmCudaEventCreate();
                 ok = state.starts[i] && state.ends[i] && ok;
             }
             const bool pool = ok && FastllmCudaGraphMemoryPoolBegin();
@@ -305,7 +352,7 @@ namespace fastllm {
                             state.ClearGraphs();
                             state.parallelExperts = false;
                             FastllmCudaSetDevice(root);
-                            return DsRunDraftGraph(state, body);
+                            return DsRunDraftGraph(state, body, streamJoin);
                         }
                         ok = parallel >= 0;
                     }
@@ -1814,9 +1861,16 @@ namespace fastllm {
         return -1;
     }
 
-    int DeepSeekV41Model::DsparkBuildVerifyInput(DeepSeekV41RequestState &state, const Data &inputIds,
-                                                 int startPos, Data &verifyIds, std::vector<int> &drafts) {
+    int DeepSeekV41Model::DsparkBuildVerifyInput(DeepSeekV41RequestState &state, int anchor,
+                                                 int startPos, std::vector<int> &drafts) {
         drafts.clear();
+#ifdef USE_CUDA
+        if (state.dspark && state.dspark->workspace && state.dspark->workspace->pendingCount) {
+            auto &proposal = *state.dspark;
+            proposal.workspace->FinishProposal(&proposal.drafts);
+            proposal.proposalTokens = proposal.drafts;
+        }
+#endif
         if (!state.dspark || state.dspark->disabled || state.dspark->drafts.empty()) {
             DsProfiler().AddNoProposal();
             return 0;
@@ -1827,8 +1881,7 @@ namespace fastllm {
             DsProfiler().AddNoProposal();
             return 0;
         }
-        std::vector<int> ids = DsReadIds(inputIds);
-        if (ids.size() != 1 || ids[0] != dspark.anchor) {
+        if (anchor != dspark.anchor) {
             dspark.drafts.clear();
             DsProfiler().AddNoProposal();
             return 0;
@@ -1874,14 +1927,6 @@ namespace fastllm {
                 dspark.proposalTokens = forced;
             }
         }
-        std::vector<float> values;
-        values.reserve(count + 1);
-        values.push_back((float)dspark.anchor);
-        for (int t : drafts) {
-            values.push_back((float)t);
-        }
-        // Data 没有深拷贝赋值，必须用 CopyFrom，否则临时对象析构后缓冲区悬空
-        verifyIds.CopyFrom(Data(DataType::FLOAT32, {1, count + 1}, values));
         dspark.drafts.clear();
         return count;
     }
@@ -1937,10 +1982,8 @@ namespace fastllm {
             for (int i = 0; i < numSegments; ++i) {
                 auto &segment = segments[i];
                 auto &scratch = scratches[i];
-                Data anchor(DataType::FLOAT32, {1, 1}, std::vector<float>{float(anchors[segment.offset])});
-                Data proposalIds;
-                int drafts = DsparkBuildVerifyInput(*segment.state, anchor, segment.startPos,
-                    proposalIds, scratch.draftTokens);
+                int drafts = DsparkBuildVerifyInput(*segment.state, anchors[segment.offset],
+                                                    segment.startPos, scratch.draftTokens);
                 // Output limits constrain commit, not the verification shape.
                 // Context capacity is still a hard bound on speculative reads.
                 int64_t capacity = max_positions;
@@ -2382,7 +2425,9 @@ namespace fastllm {
             return;
         }
         const int rows = committed - startPos;
-        if (rows <= 0 || (int)scratch.mainHidden.size() != (int)v41DsparkTargetLayerIds.size()) {
+        const bool packed = scratch.packedMainHidden.dims.size() == 3;
+        if (rows <= 0 || (packed ? rows > scratch.packedMainHidden.dims[1] :
+                scratch.mainHidden.size() != v41DsparkTargetLayerIds.size())) {
             dspark.disabled = true;
             return;
         }
@@ -2397,7 +2442,7 @@ namespace fastllm {
         // Full verification joins every rank before sampling, and prefix
         // commit joins its worker streams before returning. The target's
         // hidden states are ready; do not also wait for cache admissions.
-        ApplyDsparkDevice(bool(scratch.commitKV));
+        ApplyDsparkDevice(scratch.targetRowsReady || bool(scratch.commitKV));
 
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
@@ -2419,8 +2464,55 @@ namespace fastllm {
 #endif
             inputs.push_back(hidden);
         }
+        DeepSeekV41DsparkWorkspace *contextState = nullptr;
 #ifdef USE_CUDA
-        const bool joinedOnDevice = FastllmCudaNaiveDraftConcat(inputs, rows, combined);
+        std::unique_lock<std::mutex> contextLock(v41CudaGraphMutex, std::defer_lock);
+        std::vector<void*> caches;
+        bool cacheReady = true;
+        for (auto &layer : dspark.layers) {
+            caches.push_back(layer.windowKV.cudaData);
+            cacheReady &= layer.windowKV.dataDevice == DataDevice::CUDA && layer.windowKV.cudaData;
+        }
+        if (DsDraftGraphEnabled() && rows <= v41DsparkBlockSize + 1 && cacheReady &&
+            (packed || (!inputs.empty() && inputs.front()->dataDevice == DataDevice::CUDA)) && contextLock.try_lock()) {
+            auto &slot = dspark.contextWorkspaces[rows];
+            const std::vector<int> devices{v41DsparkTpDevices.empty() ? FastllmCudaGetDevice() : v41DsparkTpDevices.front()};
+            if (slot && (slot->devices != devices || slot->cachePointers != caches)) slot.reset();
+            if (!slot) {
+                slot = std::make_shared<DeepSeekV41DsparkWorkspace>();
+                slot->devices = devices; slot->cachePointers = caches;
+            }
+            if (!slot->disabled) {
+                contextState = slot.get();
+                Data &position = contextState->position;
+                if (position.dims.empty()) {
+                    position.dataType = DataType::INT32; position.UpdateUnitSize(); position.Resize({1});
+                    position.ToDevice(DataDevice::CUDA, devices, false); position.Allocate();
+                }
+                FastllmCudaCopyFromHostToDevice(position.cudaData, &startPos, sizeof(int));
+            }
+        }
+#endif
+#ifdef USE_CUDA
+        // Keep the input address captured by the context graph stable across requests.
+        // Gathering directly also avoids a second device copy of all accepted rows.
+        bool joinedOnDevice = packed;
+        if (packed) {
+            Data &source = scratch.packedMainHidden;
+            const int width = source.dims.back();
+            if (contextState) {
+                Data &input = contextState->input;
+                input.dataType = BFLOAT16; input.UpdateUnitSize(); input.Resize({1, rows, width});
+                input.ToDevice(CUDA, source.dataDeviceIds, false); input.Allocate(false);
+                const size_t bytes = size_t(rows) * width * sizeof(uint16_t);
+                AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
+                    input.cudaData, bytes, source.cudaData, bytes, bytes, 1), "draft graph input copy failed");
+            } else {
+                combined.FakeFrom(source, 0); combined.Resize({1, rows, width});
+            }
+        } else {
+            joinedOnDevice = FastllmCudaNaiveDraftConcat(inputs, rows, contextState ? contextState->input : combined);
+        }
 #else
         const bool joinedOnDevice = false;
 #endif
@@ -2439,34 +2531,8 @@ namespace fastllm {
                 combined.CopyFrom(tmp);
             }
         }
-        DeepSeekV41DsparkWorkspace *contextState = nullptr;
 #ifdef USE_CUDA
-        std::unique_lock<std::mutex> contextLock(v41CudaGraphMutex, std::defer_lock);
-        std::vector<void*> caches;
-        bool cacheReady = true;
-        for (auto &layer : dspark.layers) {
-            caches.push_back(layer.windowKV.cudaData);
-            cacheReady &= layer.windowKV.dataDevice == DataDevice::CUDA && layer.windowKV.cudaData;
-        }
-        if (DsDraftGraphEnabled() && rows <= v41DsparkBlockSize + 1 && cacheReady &&
-            combined.dataDevice == DataDevice::CUDA && contextLock.try_lock()) {
-            auto &slot = dspark.contextWorkspaces[rows];
-            const std::vector<int> devices{v41DsparkTpDevices.empty() ? FastllmCudaGetDevice() : v41DsparkTpDevices.front()};
-            if (slot && (slot->devices != devices || slot->cachePointers != caches)) slot.reset();
-            if (!slot) {
-                slot = std::make_shared<DeepSeekV41DsparkWorkspace>();
-                slot->devices = devices; slot->cachePointers = caches;
-            }
-            if (!slot->disabled) {
-                contextState = slot.get(); contextState->input.CopyFrom(combined);
-                Data &position = contextState->position;
-                if (position.dims.empty()) {
-                    position.dataType = DataType::INT32; position.UpdateUnitSize(); position.Resize({1});
-                    position.ToDevice(DataDevice::CUDA, devices, false); position.Allocate();
-                }
-                FastllmCudaCopyFromHostToDevice(position.cudaData, &startPos, sizeof(int));
-            }
-        }
+        if (contextState && !joinedOnDevice) contextState->input.CopyFrom(combined);
 #endif
         auto contextBody = [&]() {
             Data &contextInput = contextState ? contextState->input : combined;
@@ -2499,7 +2565,7 @@ namespace fastllm {
             }
         };
 #ifdef USE_CUDA
-        if (!contextState || !DsRunDraftGraph(*contextState, contextBody)) contextBody();
+        if (!contextState || !DsRunDraftGraph(*contextState, contextBody, scratch.targetRowsReady || bool(scratch.commitKV))) contextBody();
         if (contextLock.owns_lock()) contextLock.unlock();
 #else
         contextBody();
@@ -2614,7 +2680,7 @@ namespace fastllm {
                 std::vector<int> tokens;
                 std::vector<float> confidence;
                 DsparkRunDraft(state, {state.committed}, {anchors[request]}, {valid},
-                               tokens, confidence, configs[request]);
+                               tokens, confidence, configs[request], states.size() == 1);
                 publish(request, tokens, confidence);
                 if (DsProfiler().On()) DsProfiler().AddDraft(DsElapsed(requestBegin), DsDraftTimingSlot());
             }
@@ -2624,7 +2690,7 @@ namespace fastllm {
     bool DeepSeekV41Model::DsparkRunDraft(DeepSeekV41DsparkState &dspark,
             const std::vector<int> &positions, const std::vector<int> &anchors,
             const std::vector<int> &validRows, std::vector<int> &tokens,
-            std::vector<float> &confidence, const GenerationConfig &config) {
+            std::vector<float> &confidence, const GenerationConfig &config, bool deferGreedy) {
         tokens.clear();
         confidence.clear();
         const int block = v41DsparkBlockSize;
@@ -2646,7 +2712,9 @@ namespace fastllm {
         DsRopeParams windowRope = {qk_rope_head_dim, rope_base, 0, rope_factor,
                                    rope_scaling_beta_fast, rope_scaling_beta_slow};
 
-        const int tableRows = window_size + block, width = (batch == 1 ? valid : window_size) + block - 1;
+        const int tableRows = window_size + block;
+        const int compactWidth = (batch == 1 ? valid : window_size) + block - 1;
+        int width = compactWidth;
         Data embedded, preMix, cmpIdxHost, cmpIdx;
         bool inputsPrepared = false;
         auto prepareInputs = [&]() {
@@ -2766,6 +2834,19 @@ namespace fastllm {
             fusedMarkovAllowed && (!randomDraft || sampledMarkov) &&
             (residentDraft || hybridDraft || diskDraft || v41DsparkTpDevices.size() > 1) &&
             !DsEnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") && !DsEnvFlag("FASTLLM_DISABLE_NCCL");
+        // On a short prompt, the growing history previously invalidated the
+        // graph at each acceptance. Keep indices in compact order and mask the
+        // unused suffix with -1 as in the regular multi-request gather.
+        const bool fixedPartialHistory = graphEligible && batch == 1 && valid < window_size &&
+            !randomDraft && v41DsparkTpDevices.size() > 1 && window_size == 128 && block == 5 &&
+            FastllmCudaRuntimeArch() == 103 && !DsEnvFlag("FASTLLM_DSV41_LEGACY_ATTN") &&
+            !DsEnvFlag("FASTLLM_DSV41_REFERENCE_MATH");
+        if (fixedPartialHistory) {
+            // The self row occupies one lane in the 64-candidate MMA tile.
+            // Pad only that tile, preserving its partial sums and tile count.
+            const int tiledWidth = ((compactWidth + 1 + 63) / 64) * 64 - 1;
+            width = std::min(tiledWidth, window_size + block - 1);
+        }
         if (graphEligible && randomDraft) prepareProposalProbs(FastllmCudaGetDevice(), vocab);
         const Data &embedding = weight["embed.weight"];
         const bool deviceInputs = batch == 1 && graphEligible && valid == window_size && embedding.dataType == DataType::BFLOAT16 &&
@@ -2851,6 +2932,12 @@ namespace fastllm {
         }
         if (graphState && graphState->hybridExperts && !draftStep) {
             graphState->disabled = true; graphState = nullptr;
+        }
+#endif
+#ifdef USE_CUDA
+        if (!graphState && fixedPartialHistory) {
+            width = compactWidth;
+            inputsPrepared = false;
         }
 #endif
         if (batch > 1 && !graphState) return false;
@@ -3273,11 +3360,12 @@ namespace fastllm {
 #ifdef USE_CUDA
         // A growing single-request history does not reuse its exact-width graph.
         // Run the same prepared kernels once, preserving the compact attention layout.
-        if (graphState && batch == 1 && valid < window_size && !randomDraft &&
+        if (graphState && batch == 1 && valid < window_size && !fixedPartialHistory && !randomDraft &&
             !hybridDraft && !diskDraft && !DsEnvFlag("FASTLLM_DSPARK_COMPACT_WINDOW")) {
             FastllmCudaGraphPreparation preparation;
             backbone();
-        } else if (!graphState || !DsRunDraftGraph(*graphState, backbone)) backbone();
+        } else if (!graphState || !DsRunDraftGraph(*graphState, backbone,
+            deferGreedy && !randomDraft && !confidenceWeight && !hybridDraft && !diskDraft)) backbone();
 #else
         backbone();
 #endif
@@ -3297,6 +3385,16 @@ namespace fastllm {
                             "DeepSeekV41 DSpark: random draft logits must be on CUDA.");
             const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
             prepareProposalProbs(device, logits.dims.back());
+        }
+        // Only a request-owned greedy graph may keep its readback in flight across
+        // the scheduler call. Acceptance, force hooks and context bounds still run
+        // when the same request consumes the proposal. Reset/discard drains its slot.
+        if (deferGreedy && batch == 1 && !randomDraft && !confidenceWeight && !hybridDraft && !diskDraft &&
+            graphState && !graphState->execs.empty() && dspark.workspace.get() == graphState &&
+            graphState->QueueProposal(block)) {
+            dspark.anchor = anchorToken;
+            dspark.anchorPos = dspark.committed;
+            return true;
         }
         if (graphState) {
             std::vector<int> allTokens(batch * (block + 1));

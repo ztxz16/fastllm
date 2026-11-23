@@ -215,6 +215,27 @@ static KernelFn PickBf16Mxfp8Kernel(int rows, int tile, bool parallelReduce = fa
 #endif
 }
 
+#if defined(FASTLLM_ENABLE_MXFP8_LINEAR_SM103)
+template<int Stages> static KernelFn VerifyQueryProjection() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    return nullptr;
+#else
+    return MARLIN_NAMESPACE_NAME::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+        128, 1, 8, 4, true, Stages, 2, false, false, false, false, false, false, false, true>;
+#endif
+}
+template<int Stages> static KernelFn VerifyQkvProjection() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    return nullptr;
+#else
+    return MARLIN_NAMESPACE_NAME::Marlin<
+        vllm::kBFloat16.id(), vllm::kFE4M3fn.id(), vllm::kBFloat16.id(), vllm::kFE8M0fnu.id(),
+        128, 1, 8, 4, true, Stages, 2, false, true, false, false, false, true, false, false, true>;
+#endif
+}
+#endif
+
 // Exact storage layout of the BF16/E4M3/E8M0 kernel above. B and the
 // reduction tile alias; scales and the four-stage A pipeline follow them.
 // Reserving the device's entire shared memory prevents other graph branches
@@ -791,7 +812,16 @@ static bool BFloat16MXFP8Gemm(
         KernelFn kernel = PickBf16Mxfp8Kernel(count, chunkTile, parallelReduce, floatOutput);
         const int launchShared = Bf16Mxfp8SharedBytes(count, chunkTile);
         if (launchShared > shared) return false;
-        kernel<<<sms, chunkTile == 2 ? 256 : 128, launchShared, cudaStreamPerThread>>>(
+        dim3 grid(sms);
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (arch == 103 && sms == 148 && rows == 6 && columns == 32768 && inner == 1280 && !floatOutput) {
+            kernel = VerifyQueryProjection<4>();
+            grid.y = 2;
+        } else if (arch == 103 && sms == 148 && rows == 6 && columns == 1792 && inner == 5120 && !floatOutput) {
+            kernel = VerifyQkvProjection<4>();
+        }
+#endif
+        kernel<<<grid, chunkTile == 2 ? 256 : 128, launchShared, cudaStreamPerThread>>>(
             reinterpret_cast<const int4 *>(static_cast<const uint16_t *>(a) + (size_t)row * inner),
             reinterpret_cast<const int4 *>(weight),
             reinterpret_cast<int4 *>(static_cast<char *>(c) + (size_t)row * columns * (floatOutput ? 4 : 2)),

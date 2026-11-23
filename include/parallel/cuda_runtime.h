@@ -59,6 +59,8 @@ public:
     // Reserve the worst DP skew before graph capture/serving. Later layouts
     // must stay within these bounds; their buffer addresses never change.
     void ReserveFixed(size_t maxRows, size_t maxRowBytes);
+    // Current worker-device mapping, updated in place by Reset before graph replay.
+    const int *LocalToGlobal(int rank) const;
     void Select(int rank, const void *global, void *local, size_t rowBytes);
     void Collect(int rank, const void *local, void *global, size_t rowBytes);
     struct Field { const void *local; void *global; size_t rowBytes; };
