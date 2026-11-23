@@ -1219,14 +1219,23 @@ bool FastllmCudaBf16DecodeProjection(const void *input, const void *weight, void
 
 bool LaunchFastllmGroupedBf16Projection(const __nv_bfloat16 *const *x, const __nv_bfloat16 *weight,
         __nv_bfloat16 *out, int rows, int width, const int *columns) {
-    if (rows < 4 || rows % 4 || width < 2048 || width > 4096 || width % 8 ||
-        (reinterpret_cast<uintptr_t>(weight) & 15) || FastllmCudaRuntimeArch() != 120) return false;
+    if (width < 2048 || width > 4096 || width % 8 || (reinterpret_cast<uintptr_t>(weight) & 15)) return false;
+    if (rows != 1 && (rows < 4 || rows % 4 || FastllmCudaRuntimeArch() != 120)) return false;
     FastllmBf16ProjectionInputs inputs{};
     int total = 0;
     for (int g = 0; g < 3; ++g) {
         if (columns[g] < 1024 || columns[g] % 2 || (reinterpret_cast<uintptr_t>(x[g]) & 15)) return false;
         inputs.x[g] = x[g];
         inputs.ends[g] = total += columns[g];
+    }
+    if (rows == 1) {
+        // The same compensated dot product as three separate GEMVs. Each CTA
+        // selects its input from its output channels, with no activation copy.
+        if (width == 2304)
+            FastllmBf16GroupedProjection<1, 2304><<<total / 2, 128>>>(inputs, weight, out, rows, width, 0);
+        else
+            FastllmBf16GroupedProjection<1><<<total / 2, 128>>>(inputs, weight, out, rows, width, 0);
+        return true;
     }
     if (LaunchBf16WarpProjection<true>(inputs, weight, out, rows, width)) return true;
     int first = 0;

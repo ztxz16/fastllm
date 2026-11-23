@@ -607,7 +607,7 @@ class Decoder final : public Runtime {
         result.shared = inputs[0].p == inputs[1].p && inputs[0].p == inputs[2].p;
         result.storage = Rows<T>::temporary(inputs[0].rows, std::accumulate(result.widths.begin(), result.widths.end(), 0));
         if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-            if (mode != Projection::AttentionMma && decodeArithmetic && !result.shared && inputs[0].rows >= 4) {
+            if (mode != Projection::AttentionMma && !result.shared && (inputs[0].rows == 1 || decodeArithmetic)) {
                 const auto &w = weights.weight.at("model.llm." + att + "packed.weight");
                 const T *x[] = {inputs[0].p, inputs[1].p, inputs[2].p};
                 const int widths[] = {result.storage.cols - 2 * (k + taps), k + taps, k + taps};
