@@ -138,6 +138,7 @@ namespace fastllm {
         // A committed handoff retains its PD marker and leases for the request
         // lifetime, but no longer blocks decoding. Read under the context lock.
         bool HasPendingPD() const;
+        int PDTransferLength() const;
         // An admitted transfer can progress independently of the model thread.
         // A ready result must return to the scheduler for atomic state import.
         bool IsPDTransferPending() const;
@@ -851,6 +852,9 @@ namespace fastllm {
         bool IsPDDecode() const;
         void BeginPD(ResponseContext *context);
         bool PollPD(ResponseContext *context);
+        void FlushPDAnnouncements();
+        bool PollPendingPD(ResponseContext *context, int maxTotalLens);
+        bool CommitGeneratedToken(ResponseContext &context, int token, int maxTotalLens);
         // Submit an unstarted transfer under dictLocker and forwardLocker.
         // PollPD imports its result before admission to decode.
         void PreparePendingPD(ResponseContext *context);
@@ -859,6 +863,7 @@ namespace fastllm {
         // Native caches stay in their original layout.
         virtual std::string PDAlternateLayout() const { return {}; }
         virtual fastkv::Message PDAlternateState(const fastkv::Message &state) const;
+        virtual bool SupportsPDFirstToken() const { return false; }
         virtual bool SupportsPDKvMemDecode() const { return false; }
         virtual std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) { return {}; }
         virtual std::vector<int> PDDevices() const;

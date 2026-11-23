@@ -306,12 +306,14 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
     fastkv::Bytes expected;
     std::shared_ptr<DraftContext> draft;
     fastkv::Buffer draftArena;
+    Data transientTail;
+    Data &WireTail() { return transientTail.cudaData ? transientTail : draft->prefixHidden; }
     std::vector<std::pair<fastkv::Buffer, fastkv::Buffer>> draftCopies;
     int length;
     bool received = false, committed = false;
 
     GpuPDReceive(NaiveN05FlashModel &m, ResponseContext &context)
-        : model(m), devices(m.PDRequestDevices(context)), length(context.allTokens.size() - 1) {
+        : model(m), devices(m.PDRequestDevices(context)), length(context.PDTransferLength()) {
         RestorePDDevice restoreDevice;
         CheckPD(length > 0 && length <= model.max_positions, "invalid GPU receive length");
         if (!model.pdReceivePools) model.pdReceivePools = std::make_shared<GpuPDPools>();
@@ -437,7 +439,21 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
         }
         metadata.U32(model.draftEnabled);
         if (model.draftEnabled) {
-            draft = model.ReservePDDraft(length, devices.front());
+            // Decode consumes the transmitted draft KV. Only prefix recording or
+            // re-export needs the normalized prefill tail beyond this transfer.
+            const bool keepTail = !model.IsPDDecode() || model.saveHistoryChat;
+            draft = model.ReservePDDraft(length, devices.front(), keepTail);
+            if (!keepTail) {
+                const int rows = std::min(length, model.draftWindow + GetPageLen() - 1);
+                const size_t tailOffset = 2 * model.draftLayers * GetDataBytes(BFLOAT16,
+                    std::min(length, model.draftWindow - 1), model.draftKvHeads * model.draftHeadDim);
+                transientTail.dataType = BFLOAT16; transientTail.UpdateUnitSize();
+                transientTail.Resize({1, rows, model.embed_dim});
+                transientTail.cudaData = draftArena.Slice(tailOffset, transientTail.GetBytes()).MutableData();
+                transientTail.cudaDataBorrowed = true;
+                transientTail.dataDevice = CUDA;
+                transientTail.dataDeviceIds = {devices.front()};
+            }
             metadata.U32(length); metadata.U32(model.draftLayers); metadata.U32(1);
         }
         expected = std::move(metadata.bytes);
@@ -461,13 +477,14 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
                 auto destination = PDBindTensor(reader, tensor, draft, boundedAxis);
                 auto staging = draftArena.Slice(offset, destination.Size());
                 offset += destination.Size();
-                draftCopies.emplace_back(std::move(destination), staging);
+                if (destination.Data() != staging.Data() || destination.Device() != staging.Device())
+                    draftCopies.emplace_back(std::move(destination), staging);
                 result.push_back({std::move(staging)});
             };
             for (auto &pair : draft->kv) { bind(pair.first); bind(pair.second); }
             const auto hasTail = reader.U32();
             CheckPD(hasTail <= 1, "invalid draft tail flag");
-            if (hasTail) bind(draft->prefixHidden, 1);
+            if (hasTail) bind(WireTail(), 1);
             else {
                 draft->prefixHidden.dims.clear();
                 draft->prefixHidden.strides.clear();
@@ -488,7 +505,7 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
         const int committed = header.U32(), tailRows = header.U32();
         header.End();
         CheckPD(!received && draft && devices.size() == 1 && state.layout == model.PDLayout() &&
-                committed == length && tailRows >= 0 && tailRows <= draft->prefixHidden.dims[1],
+                committed == length && tailRows >= 0 && tailRows <= WireTail().dims[1],
                 "incompatible sharded checkpoint");
         std::map<std::string, PDRowDestination> parts;
         size_t slot = 0;
@@ -514,8 +531,8 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
             bind("dv" + std::to_string(layer), draft->kv[layer].second);
         }
         if (tailRows) {
-            draft->prefixHidden.Resize({1, tailRows, model.embed_dim});
-            bind("hidden", draft->prefixHidden);
+            WireTail().Resize({1, tailRows, model.embed_dim});
+            bind("hidden", WireTail());
         } else {
             draft->prefixHidden.dims.clear();
             draft->prefixHidden.strides.clear();
@@ -1006,7 +1023,7 @@ void NaiveN05FlashModel::ImportPDState(ResponseContext &context, const fastkv::M
     fastkv::Reader metadata(message.metadata);
     CheckPD(metadata.String() == PDLayout(), "incompatible state layout or TP size");
     const int length = metadata.U32();
-    CheckPD(length > 0 && length == int(context.allTokens.size()) - 1, "prompt length mismatch");
+    CheckPD(length > 0 && length == context.PDTransferLength(), "prompt length mismatch");
     const auto devices = PDRequestDevices(context);
     InvalidateTensorParallelCache(attentionParallel ? &context.pastKeyValues.front().first : nullptr);
     const bool tp = tpDevices.size() > 1;

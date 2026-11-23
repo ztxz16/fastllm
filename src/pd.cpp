@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cmath>
+#include <cstring>
 #include <condition_variable>
 #include <deque>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <thread>
 #ifdef USE_CUDA
@@ -38,11 +41,51 @@ uint64_t TensorBytes(const Data &data) {
 constexpr uint32_t PDWireMagic = 0x32564450;
 // This probe negotiates a per-request cache-hit count after the reply's model metadata.
 constexpr uint32_t PDUsageProbe = 10, PDPrefillWithUsage = 9, PDShardPrefill = 11;
+constexpr uint32_t PDFirstTokenProbe = 12, PDFirstTokenPrefill = 13;
+
+// Only the effective first-step distribution crosses the wire. The grammar
+// state machine and its output history remain owned by the decode request.
+void WriteFirstTokenSampling(fastkv::Writer &writer, const GenerationConfig &cfg) {
+    writer.U32(cfg.do_sample);
+    writer.Ints({cfg.top_k});
+    for (float x : {cfg.temperature, cfg.top_p, cfg.repeat_penalty}) {
+        uint32_t bits;
+        std::memcpy(&bits, &x, sizeof(bits));
+        writer.U32(bits);
+    }
+    writer.Ints(cfg.tool_call_allowed_token_ids);
+    const auto &mask = cfg.tool_call_token_mask;
+    writer.U32(mask ? mask->size() : 0);
+    if (mask) for (uint32_t word : *mask) writer.U32(word);
+}
+
+GenerationConfig ReadFirstTokenSampling(fastkv::Reader &reader) {
+    GenerationConfig cfg;
+    const auto sample = reader.U32();
+    const auto top = reader.Ints(1);
+    Check(sample <= 1 && top.size() == 1, "invalid first-token sampler");
+    cfg.do_sample = sample; cfg.top_k = top.front();
+    for (float *out : {&cfg.temperature, &cfg.top_p, &cfg.repeat_penalty}) {
+        const uint32_t bits = reader.U32();
+        std::memcpy(out, &bits, sizeof(bits));
+        Check(std::isfinite(*out), "invalid first-token sampling value");
+    }
+    cfg.tool_call_allowed_token_ids = reader.Ints();
+    const uint32_t words = reader.U32();
+    Check(words <= (1u << 17) && words <= reader.Remaining() / 4, "invalid first-token mask");
+    if (words) {
+        auto mask = std::make_shared<std::vector<uint32_t>>(words);
+        for (auto &word : *mask) word = reader.U32();
+        cfg.tool_call_token_mask = std::move(mask);
+    }
+    return cfg;
+}
+
 template<class Receive>
-Receive WithoutPDUsageTrailer(Receive receive) {
-    return [receive = std::move(receive)](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
-        Check(metadata.size() >= sizeof(uint32_t), "missing PD cache usage");
-        return receive(fastkv::Bytes(metadata.begin(), metadata.end() - sizeof(uint32_t)), sizes);
+Receive WithoutPDUsageTrailer(Receive receive, size_t bytes) {
+    return [receive = std::move(receive), bytes](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
+        Check(metadata.size() >= bytes, "missing PD reply trailer");
+        return receive(fastkv::Bytes(metadata.begin(), metadata.end() - bytes), sizes);
     };
 }
 constexpr size_t PDTransferArenaBytes = size_t(64) << 20;
@@ -417,13 +460,17 @@ struct PDPending {
     std::shared_ptr<fastkv::Cancellation> cancellation = std::make_shared<fastkv::Cancellation>();
     int length = 0;
     size_t reservation = 0;
-    bool committed = false, reportUsage = false, sharded = false;
+    bool committed = false, reportUsage = false, sharded = false, firstToken = false;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
     ~PDPending() {
         cancellation->Cancel();
         for (const auto &probe : probeCancellations) if (probe) probe->Cancel();
     }
 };
+
+int ResponseContext::PDTransferLength() const {
+    return pdPending ? pdPending->length : int(allTokens.size()) - 1;
+}
 
 bool ResponseContext::HasPendingPD() const {
     return pdPending && !pdPending->committed;
@@ -449,12 +496,18 @@ struct PDRuntime {
         RequestMetadata metadata;
         std::promise<fastkv::Message> result;
         bool reportUsage = false;
+        std::optional<GenerationConfig> sampling;
+        int firstToken = -1;
         const basellm *shardAdapter = nullptr;
         void Reply(fastkv::Message state, uint32_t cachedTokens) {
             if (shardAdapter) state = shardAdapter->PDAlternateState(state);
             if (reportUsage) {
                 fastkv::Writer trailer;
                 trailer.bytes = std::move(state.metadata);
+                if (sampling) {
+                    Check(firstToken >= 0, "missing sampled first token");
+                    trailer.U32(firstToken);
+                }
                 trailer.U32(cachedTokens);
                 state.metadata = std::move(trailer.bytes);
             }
@@ -476,7 +529,8 @@ struct PDRuntime {
             ctx->requestMetadata = metadata;
             ctx->generationConfig.top_k = 1;
             ctx->generationConfig.output_token_limit = 1;
-            ctx->generationConfig.input_token_length = input.size() + 1;
+            if (sampling) ctx->generationConfig = *sampling;
+            ctx->generationConfig.input_token_length = input.size() + (sampling ? 0 : 1);
             return ctx;
         }
         fastkv::HostCache::Hit hostHit;
@@ -596,11 +650,12 @@ struct PDRuntime {
     }
     std::future<fastkv::Message> Prefill(basellm &model, std::vector<int> input,
                                         std::shared_ptr<fastkv::Cancellation> cancellation, RequestMetadata metadata,
-                                        uint32_t kind) {
+                                        uint32_t kind, std::optional<GenerationConfig> sampling) {
         auto request = std::make_shared<PrefillRequest>();
         request->input = std::move(input);
         request->metadata = std::move(metadata);
-        request->reportUsage = kind == PDPrefillWithUsage || kind == PDShardPrefill;
+        request->sampling = std::move(sampling);
+        request->reportUsage = request->sampling.has_value() || kind == PDPrefillWithUsage || kind == PDShardPrefill;
         request->shardAdapter = kind == PDShardPrefill ? &model : nullptr;
         request->cancellation = std::move(cancellation);
         request->work = workload;
@@ -681,7 +736,7 @@ struct PDRuntime {
         a.complete.resize(peers.size()); a.attempts.resize(peers.size()); a.replies.resize(peers.size());
         for (size_t i = 0; i < peers.size(); ++i) a.complete[i] = pending.probeKinds[i] < 6;
     }
-    bool SelectPeer(PDPending &pending, bool verbose) {
+    bool SelectPeer(PDPending &pending, basellm &model, ResponseContext &context, bool verbose) {
         if (!pending.peer.empty()) return true;
         if (!pending.probes.empty()) {
             bool submissionBusy = false;
@@ -767,11 +822,20 @@ struct PDRuntime {
             pending.placement = placement.owner == peers[chosen.peer] ? placement :
                 fastkv::SessionDirectory::Record{placement.version + 1, peers[chosen.peer]};
         }
-        pending.reportUsage = probeKind == PDUsageProbe;
+        pending.firstToken = probeKind == PDFirstTokenProbe;
+        pending.reportUsage = probeKind >= PDUsageProbe;
         pending.sharded = !pending.shardedPeers.empty() && pending.shardedPeers[chosen.peer];
         if (pending.reportUsage || (!pending.sessionKey.empty() && probeKind >= 4)) {
             pending.request.metadata[0] = pending.sharded ? PDShardPrefill : pending.reportUsage ? PDPrefillWithUsage : 3;
             fastkv::Writer suffix; suffix.String(pending.sessionKey);
+            if (pending.firstToken) {
+                pending.request.metadata[0] = PDFirstTokenPrefill;
+                suffix.U32(context.allTokens.back());
+                auto sampling = context.generationConfig;
+                model.PrepareToolCallConstraint(&context, sampling);
+                WriteFirstTokenSampling(suffix, sampling);
+                ++pending.length;
+            }
             pending.request.metadata.insert(pending.request.metadata.end(), suffix.bytes.begin(), suffix.bytes.end());
         }
         pending.peer = peers[chosen.peer]; pending.route = std::move(chosen.lease);
@@ -1595,6 +1659,7 @@ void PDRuntime::RunPrefill(basellm &model) {
             std::vector<float> packed;
             if (batch > 1)
                 packed.reserve(batchTokens - budget);
+            bool sampleFinalRows = false;
             for (int i = 0; i < batch; ++i) {
                 auto &context = *selected[i]->context;
                 const int start = context.preTokens, end = start + lengths[i];
@@ -1614,16 +1679,19 @@ void PDRuntime::RunPrefill(basellm &model) {
                 }
                 maskRefs.push_back(&masks[i]); positionRefs.push_back(&positions[i]);
                 configs.push_back(context.generationConfig);
+                const bool final = selected[i]->sampling && size_t(end) == selected[i]->input.size();
+                configs.back().prefill_chunk_remaining = final ? 0 : std::max(1, int(selected[i]->input.size()) - end);
+                sampleFinalRows |= final;
                 for (auto &kv : context.pastKeyValues) past.emplace_back(&kv.first, &kv.second);
             }
             struct Intermediate {
                 basellm &model;
                 bool previous;
-                explicit Intermediate(basellm &m) : model(m), previous(m.isIntermediateChunkedPrefill) {
-                    model.isIntermediateChunkedPrefill = true;
+                Intermediate(basellm &m, bool intermediate) : model(m), previous(m.isIntermediateChunkedPrefill) {
+                    model.isIntermediateChunkedPrefill = intermediate;
                 }
                 ~Intermediate() { model.isIntermediateChunkedPrefill = previous; }
-            } intermediate(model);
+            } intermediate(model, !sampleFinalRows);
             struct ResetLookahead {
                 PDRuntime &runtime;
                 ~ResetLookahead() { runtime.prepareNext = {}; }
@@ -1707,16 +1775,22 @@ void PDRuntime::RunPrefill(basellm &model) {
             }
             const auto begin = std::chrono::steady_clock::now();
             LastTokensManager last(batch, 0);
+            std::vector<int> sampled;
             if (batch == 1) {
-                model.Forward(ids[0], masks[0], positions[0], selected[0]->context->pastKeyValues,
-                              configs[0], last, nullptr);
+                sampled = {model.Forward(ids[0], masks[0], positions[0], selected[0]->context->pastKeyValues,
+                              configs[0], last, nullptr)};
             } else {
                 Data inputIds(FLOAT32, {1, int(packed.size())}, packed);
                 if (model.use_new_engine) {
                     if (model.CanUseGPUForward())
-                        model.ForwardGPU(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
-                    else model.ForwardV2(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
-                } else model.ForwardBatch(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
+                        sampled = model.ForwardGPU(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
+                    else sampled = model.ForwardV2(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
+                } else sampled = model.ForwardBatch(batch, inputIds, maskRefs, positionRefs, lengths, past, configs, last);
+            }
+            if (sampleFinalRows) {
+                Check(sampled.size() == selected.size(), "invalid PD first-token batch");
+                for (size_t i = 0; i < selected.size(); ++i)
+                    if (configs[i].prefill_chunk_remaining == 0) selected[i]->firstToken = sampled[i];
             }
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
             if (seconds > 0) workload->tokensPerSecond.store(
@@ -2092,22 +2166,31 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 fastkv::Reader reader(request.metadata);
                 const auto kind = reader.U32();
                 const auto requested = reader.String();
-                Check((kind == 1 || kind == 3 || kind == PDPrefillWithUsage || kind == PDShardPrefill) &&
+                Check((kind == 1 || kind == 3 || kind == PDPrefillWithUsage || kind == PDShardPrefill || kind == PDFirstTokenPrefill) &&
                       raw->Accepts(requested) && ((kind == PDShardPrefill) == (requested != raw->identity)),
                       "incompatible checkpoint or state layout");
                 auto tokens = reader.Ints(size_t(max_positions));
                 RequestMetadata metadata;
                 if (kind != 1) metadata.sessionKey = reader.String(512);
+                std::optional<GenerationConfig> sampling;
+                if (kind == PDFirstTokenPrefill) {
+                    Check(SupportsPDFirstToken() && raw->residentPrefix && !raw->hostCache && !raw->cache,
+                          "sampled PD handoff unsupported");
+                    const auto last = reader.U32();
+                    Check(last <= INT_MAX, "invalid final prompt token");
+                    tokens.push_back(last);
+                    sampling = ReadFirstTokenSampling(reader);
+                }
                 reader.End();
                 Check(request.buffers.empty() && !tokens.empty() && tokens.size() < size_t(max_positions),
                       "invalid prefill request");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds the prefill token pool");
-                return raw->Prefill(*this, std::move(tokens), std::move(cancellation), std::move(metadata), kind);
+                return raw->Prefill(*this, std::move(tokens), std::move(cancellation), std::move(metadata), kind, std::move(sampling));
             }, [this, raw = runtime.get()](const fastkv::Message &request, fastkv::Message &reply) {
                 if (request.metadata.size() < 4) return false;
                 fastkv::Reader reader(request.metadata);
                 const auto kind = reader.U32();
-                if (kind != 2 && kind != 4 && kind != 6 && kind != 7 && kind != 8 && kind != PDUsageProbe) return false;
+                if (kind != 2 && kind != 4 && kind != 6 && kind != 7 && kind != 8 && kind != PDUsageProbe && kind != PDFirstTokenProbe) return false;
                 const auto requested = reader.String();
                 // Only the usage probe can negotiate a sharded response.
                 Check(requested == raw->identity || ((kind == PDUsageProbe || kind == 7) && raw->Accepts(requested)),
@@ -2128,6 +2211,9 @@ void basellm::ConfigurePD(const json11::Json &config) {
                 const auto session = kind >= 6 ? reader.String(512) : std::string(); reader.End();
                 Check(!tokens.empty() && tokens.size() < size_t(max_positions), "invalid routing prompt");
                 Check(tokens.size() <= raw->tokenCapacity, "prompt exceeds routing peer capacity");
+                if (kind == PDFirstTokenProbe)
+                    Check(SupportsPDFirstToken() && raw->residentPrefix && !raw->hostCache && !raw->cache &&
+                          tokens.size() < raw->tokenCapacity, "sampled PD handoff unsupported");
                 fastkv::Writer writer;
                 const size_t resident = raw->CachedTokens(*this, tokens, session);
                 const auto forwardRate = uint64_t(std::max(1.0, raw->workload->tokensPerSecond.load()));
@@ -2192,7 +2278,9 @@ void basellm::BeginPD(ResponseContext *context) {
     pending->probes.resize(pdRuntime->peers.size());
     pending->probeCancellations.resize(pdRuntime->peers.size());
     pending->probed.resize(pdRuntime->peers.size(), false);
-    pending->probeKinds.resize(pdRuntime->peers.size(), PDUsageProbe);
+    const auto &config = context->generationConfig;
+    const bool canSample = SupportsPDFirstToken() && !config.output_logits && config.output_token_least <= 0;
+    pending->probeKinds.resize(pdRuntime->peers.size(), canSample ? PDFirstTokenProbe : PDUsageProbe);
     for (auto &e : pending->estimates) e.available = false;
     pending->request.metadata = std::move(writer.bytes);
     context->pdPending = std::move(pending);
@@ -2210,7 +2298,7 @@ void basellm::PreparePendingPD(ResponseContext *context) {
             context->pdAdmission = admission;
             pending->admission = std::move(admission);
         }
-        if (!pdRuntime->SelectPeer(*pending, verbose)) return;
+        if (!pdRuntime->SelectPeer(*pending, *this, *context, verbose)) return;
         if (!pending->receiver) {
             const auto begin = std::chrono::steady_clock::now();
             pending->receiver = PreparePDReceive(*context);
@@ -2224,13 +2312,13 @@ void basellm::PreparePendingPD(ResponseContext *context) {
             target = [receiver = pending->receiver](const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) {
                 return receiver->Targets(metadata, sizes);
             };
-            if (pending->reportUsage) target = WithoutPDUsageTrailer(std::move(target));
+            if (pending->reportUsage) target = WithoutPDUsageTrailer(std::move(target), pending->firstToken ? 8 : 4);
         } else {
             placement = [devices = PDRequestDevices(*context)](const fastkv::Bytes &metadata,
                                                                 const std::vector<size_t> &sizes) {
                 return PDReceivePlacement(metadata, sizes.size(), devices);
             };
-            if (pending->reportUsage) placement = WithoutPDUsageTrailer(std::move(placement));
+            if (pending->reportUsage) placement = WithoutPDUsageTrailer(std::move(placement), pending->firstToken ? 8 : 4);
         }
         // Transient transport pressure must preserve the prompt for retry.
         // The Exchange also holds admission until cancellation/I/O drains.
@@ -2249,8 +2337,16 @@ void basellm::PreparePendingPD(ResponseContext *context) {
     }
 }
 
-bool basellm::PollPD(ResponseContext *context) {
+void basellm::FlushPDAnnouncements() {
     if (pdRuntime) pdRuntime->FlushAnnouncements();
+}
+
+bool basellm::PollPD(ResponseContext *context) {
+    FlushPDAnnouncements();
+    return PollPendingPD(context, 0);
+}
+
+bool basellm::PollPendingPD(ResponseContext *context, int maxTotalLens) {
     if (!context->pdPending)
         return true;
     auto pending = context->pdPending;
@@ -2265,7 +2361,7 @@ bool basellm::PollPD(ResponseContext *context) {
         return false;
     try {
         auto state = pending->result.get();
-        int cachedTokens = -1;
+        int cachedTokens = -1, firstToken = -1;
         if (pending->reportUsage) {
             Check(state.metadata.size() >= sizeof(uint32_t), "missing PD cache usage");
             const size_t size = state.metadata.size() - sizeof(uint32_t);
@@ -2273,6 +2369,13 @@ bool basellm::PollPD(ResponseContext *context) {
             Check(count <= uint32_t(pending->length), "invalid PD cached token count");
             cachedTokens = int(count);
             state.metadata.resize(size);
+            if (pending->firstToken) {
+                Check(size >= 4, "missing sampled PD first token");
+                const auto token = fastkv::Reader(state.metadata.data() + size - 4, 4).U32();
+                Check(token <= INT_MAX, "invalid sampled PD token");
+                firstToken = int(token);
+                state.metadata.resize(size - 4);
+            }
         }
         pending->route.reset();
         std::lock_guard<std::mutex> lock(forwardLocker);
@@ -2289,9 +2392,9 @@ bool basellm::PollPD(ResponseContext *context) {
             << " kv_d2h_bytes=" << fastkv::Buffer::Traffic().deviceToHost
             << " kv_h2d_bytes=" << fastkv::Buffer::Traffic().hostToDevice << std::endl;
         context->preTokens = pending->length;
-        context->currentTokens = {context->allTokens.back()};
+        if (!pending->firstToken) context->currentTokens = {context->allTokens.back()};
         context->intParams = {
-            {"promptLen", context->inputTokens}, {"index", -1}, {"add_special_tokens", 0}};
+            {"promptLen", context->inputTokens}, {"index", pending->firstToken ? 0 : -1}, {"add_special_tokens", 0}};
         if (verbose) {
             double ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pending->start)
@@ -2303,6 +2406,7 @@ bool basellm::PollPD(ResponseContext *context) {
                       << " handoff_ms=" << ms << std::endl;
         }
         pending->committed = true;
+        if (pending->firstToken) CommitGeneratedToken(*context, firstToken, maxTotalLens);
         pdRuntime->CommitPlacement(*pending);
         pdRuntime->FlushAnnouncements();
     } catch (const std::exception &error) {

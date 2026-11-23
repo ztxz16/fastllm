@@ -55,7 +55,7 @@ class StateModel : public basellm {
     }
     void ImportPDState(ResponseContext &context, const fastkv::Message &message) override {
         PDStateReader reader(message);
-        Check(reader.metadata.U32() == context.allTokens.size() - 1, "prefix length mismatch");
+        Check(reader.metadata.U32() == context.PDTransferLength(), "prefix length mismatch");
         reader.Tensor(context.pastKeyValues[0].first);
         reader.End();
     }
@@ -1551,6 +1551,60 @@ static void TestPDPrefillLookahead(int independentRows, bool saturated = true) {
     std::cout << "PASS PD prefill lookahead and gated publication, independent rows=" << independentRows << ", saturated=" << saturated << "\n";
 }
 
+static void TestSampledFirstToken() {
+    struct Model : StateModel {
+        bool SupportsPDFirstToken() const override { return true; }
+        int Forward(const Data &ids, const Data &mask, const Data &pos,
+                    std::vector<std::pair<Data, Data>> &kv, const GenerationConfig &cfg,
+                    const LastTokensManager &last, std::vector<float> *logits) override {
+            StateModel::Forward(ids, mask, pos, kv, cfg, last, logits);
+            if (cfg.prefill_chunk_remaining == 0) {
+                Check(cfg.do_sample && cfg.top_k == 7 && cfg.temperature == 0.75f &&
+                      cfg.top_p == 0.875f && cfg.repeat_penalty == 1.25f, "first-step sampling changed");
+                Check(cfg.tool_call_token_mask && cfg.tool_call_token_mask->at(0) == (1u << 17),
+                      "first-step mask changed");
+            }
+            return 17;
+        }
+    } p, d;
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    const auto address = port.Address();
+    port.Stop();
+    p.residentHistory = true;
+    p.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","sample"},{"transport","tcp"},
+                                      {"listen",address},{"cache_bytes",0},{"chunk_tokens",2}});
+    d.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","sample"},{"transport","tcp"},
+                                      {"prefill",json11::Json::array{address}}});
+    for (int mode = 0; mode < 4; ++mode) {
+        ResponseContext ctx;
+        ctx.Init(1, FLOAT32, FLOAT32);
+        ctx.allTokens = ctx.currentTokens = {1, 2, 3, 4, 5};
+        ctx.inputTokens = ctx.allTokens.size();
+        auto &cfg = ctx.generationConfig;
+        cfg.do_sample = true; cfg.top_k = 7; cfg.temperature = 0.75f;
+        cfg.top_p = 0.875f; cfg.repeat_penalty = 1.25f;
+        cfg.tool_call_token_mask = std::make_shared<std::vector<uint32_t>>(1, 1u << 17);
+        cfg.output_token_limit = mode == 1 ? 1 : 3;
+        if (mode == 2) cfg.stop_token_ids.insert(17);
+        if (mode == 3) cfg.output_logits = true;
+        d.BeginPD(&ctx);
+        for (int i = 0; i < 3000 && ctx.HasPendingPD() && !ctx.isEnding; ++i) {
+            d.PollPD(&ctx);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Check(ctx.error == ResponseContextErrorNone && !ctx.HasPendingPD(), "first-token handoff failed");
+        const bool sampled = mode != 3;
+        Check(ctx.preTokens == (sampled ? 5 : 4) && d.forwards == 0, "incorrect first-token KV boundary");
+        Check(((float *)ctx.pastKeyValues[0].first.cpuData)[0] == (sampled ? 55 : 30), "incorrect target state");
+        Check(ctx.isEnding == (mode == 1 || mode == 2), "incorrect first-token stopping condition");
+        d.PollPD(&ctx);
+        Check(ctx.resultTokenQueue.size() == (mode < 2 ? 1 : 0), "unexpected first-token count");
+        if (mode < 2) Check(ctx.currentTokens == std::vector<int>{17} && ctx.allTokens.back() == 17 &&
+                            ctx.curTokens == 1 && ctx.intParams["index"] == 0, "incorrect next decode input");
+    }
+}
+
 static void TestPDResidentPrefixHints() {
     struct ResidentModel : StateModel {
         PagedCacheManager pool;
@@ -1603,6 +1657,7 @@ int main(int argc, char **argv) {
             TestGPUAllocatorPressure();
             return 0;
         }
+        TestSampledFirstToken();
         TestPDResidentPrefixHints();
         TestDeferredPDResidentRestore();
         TestPDPrefillLookahead(0);

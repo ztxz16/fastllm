@@ -95,6 +95,7 @@ namespace fastllm {
         std::string PDLayout() const override;
         std::string PDAlternateLayout() const override;
         fastkv::Message PDAlternateState(const fastkv::Message &state) const override;
+        bool SupportsPDFirstToken() const override { return attentionDP > 1 && !sparseKv; }
         bool SupportsPDKvMemDecode() const override { return true; }
         std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &context) override;
         std::vector<int> PDDevices() const override { return tpDevices; }
@@ -410,7 +411,7 @@ namespace fastllm {
                                     PDExportPlan &plan, bool independent);
         void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length, bool planning = false);
         std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length, int device = -1);
-        std::shared_ptr<DraftContext> ReservePDDraft(int length, int device);
+        std::shared_ptr<DraftContext> ReservePDDraft(int length, int device, bool keepTail);
         void AppendDraftKVOnRank(Data &input, int start, DraftContext &context, int rank);
         bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);

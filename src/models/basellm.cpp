@@ -723,6 +723,28 @@ namespace fastllm {
         config.tool_call_token_mask.reset();
     }
 
+    bool basellm::CommitGeneratedToken(ResponseContext &ctx, int token, int maxTotalLens) {
+        if (token == eos_token_id || eos_token_ids.count(token) || ctx.generationConfig.stop_token_ids.count(token)) {
+            ctx.isEnding = true;
+            ctx.TryRecord(this);
+            return false;
+        }
+        UpdateToolCallConstraintState(&ctx, token);
+        if (ctx.curTokens && ctx.currentTokens.size() == 1) ctx.currentTokens.front() = token;
+        else ctx.currentTokens = std::vector<int>{token};
+        ctx.resultTokenQueue.push(token);
+        ctx.allTokens.push_back(token);
+        if (ctx.generationConfig.NeedsTokenHistory()) ctx.tokens.Push(token);
+        ++ctx.curTokens;
+        if (ctx.curTokens == ctx.generationConfig.output_token_limit ||
+            (maxTotalLens > 0 && ctx.allTokens.size() >= size_t(maxTotalLens)) ||
+            ctx.allTokens.size() >= size_t(max_positions)) {
+            ctx.isEnding = true;
+            ctx.TryRecord(this);
+        }
+        return true;
+    }
+
     void basellm::UpdateToolCallConstraintState(ResponseContext *context, int tokenId) {
         if (context && context->generationConfig.tool_call_grammar && tokenId >= 0) {
             AdvanceToolCallGrammar(context->generationConfig, tokenId);
@@ -2404,6 +2426,7 @@ namespace fastllm {
             if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens, &lastRecordTime)) continue;
             auto &forwardLocker = model->forwardLocker;
 
+            model->FlushPDAnnouncements();
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
             std::vector <int> abortHandles;
             int busyPages = 0, currentActivate = 0;
@@ -2435,7 +2458,7 @@ namespace fastllm {
                     }
                     continue;
                 }
-                if (!model->PollPD(it.second)) {
+                if (!model->PollPendingPD(it.second, maxTotalLens)) {
                     pendingPD |= bool(it.second->pdPending);
                     continue;
                 }
@@ -3545,11 +3568,12 @@ namespace fastllm {
                             model->RemoveResponseContext(it);
                         }
 
+                        model->FlushPDAnnouncements();
                         std::set<int> waitingPD;
                         bool hasPrefillRequests = false;
                         for (auto &entry : model->responseContextDict.dicts) {
                             if (entry.second->isEnding) continue;
-                            if (!model->PollPD(entry.second) && entry.second->pdPending)
+                            if (!model->PollPendingPD(entry.second, maxTotalLens) && entry.second->pdPending)
                                 waitingPD.insert(entry.first);
                             else if (entry.second->NeedsPrefill())
                                 hasPrefillRequests = true;
@@ -4391,38 +4415,9 @@ namespace fastllm {
                                 it.second->replayingKV = false;
                                 int curRet = ret[i];
                                 do {
-                                    if (curRet == model->eos_token_id || model->eos_token_ids.find(curRet) != model->eos_token_ids.end()) {
-                                        it.second->isEnding = true;
-                                        it.second->TryRecord(model);
-                                    } else {
-                                        auto itStopTk = it.second->generationConfig.stop_token_ids.find(curRet);
-                                        if (itStopTk != it.second->generationConfig.stop_token_ids.end()) {
-                                            it.second->isEnding = true;
-                                            it.second->TryRecord(model);
-                                        }
-                                    }
-                                    if (it.second->isEnding == false) {
-                                        tokenTrace.Next("token_state_and_queue");
-                                        model->UpdateToolCallConstraintState(it.second, curRet);
-                                        if (it.second->curTokens > 0 && it.second->currentTokens.size() == 1)
-                                            it.second->currentTokens[0] = curRet;
-                                        else
-                                            // Release a potentially large prompt buffer once.
-                                            it.second->currentTokens = std::vector<int>{curRet};
-                                        it.second->resultTokenQueue.push(curRet);
+                                    tokenTrace.Next("token_state_and_queue");
+                                    if (model->CommitGeneratedToken(*it.second, curRet, maxTotalLens))
                                         QueueGeneratedResultLogits(it.second, logits, i);
-                                        it.second->allTokens.push_back(curRet);
-                                        if (it.second->generationConfig.NeedsTokenHistory())
-                                            it.second->tokens.Push(curRet);
-                                        it.second->curTokens++;
-                                        tokenTrace.Next("limit_check_and_record");
-                                        if (it.second->curTokens == it.second->generationConfig.output_token_limit
-                                            || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
-                                            || it.second->allTokens.size() >= model->max_positions) {
-                                            it.second->isEnding = true;
-                                            it.second->TryRecord(model);
-                                        }
-                                    }
                                     if (it.second->isEnding || !model->PopPendingResponseToken(it.second, curRet, curRet)) break;
                                     ++it.second->intParams["index"];
                                     ++it.second->preTokens;

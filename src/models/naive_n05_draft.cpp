@@ -639,7 +639,7 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ImportDraf
 }
 
 #ifdef USE_CUDA
-std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ReservePDDraft(int length, int device) {
+std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ReservePDDraft(int length, int device, bool keepTail) {
     std::shared_ptr<DraftContext> draft;
     {
         std::lock_guard<std::mutex> guard(historyMutex);
@@ -653,11 +653,13 @@ std::shared_ptr<NaiveN05FlashModel::DraftContext> NaiveN05FlashModel::ReservePDD
     }
     // The normalized prefill features are consumed on the projection device.
     // Keep the optional wire tail within the existing per-request workspace.
-    Data &tail = draft->workspace->prefixStorage;
-    tail.dataType = BFLOAT16; tail.UpdateUnitSize();
-    tail.Resize({1,std::min(length, draftWindow + GetPageLen() - 1),embed_dim});
-    tail.ToDevice(CUDA, std::vector<int>{draftTP->devices.front()}, false); tail.Allocate(false);
-    draft->prefixHidden.FakeFrom(tail, 0); draft->prefixHidden.Resize(tail.dims);
+    if (keepTail) {
+        Data &tail = draft->workspace->prefixStorage;
+        tail.dataType = BFLOAT16; tail.UpdateUnitSize();
+        tail.Resize({1,std::min(length, draftWindow + GetPageLen() - 1),embed_dim});
+        tail.ToDevice(CUDA, std::vector<int>{draftTP->devices.front()}, false); tail.Allocate(false);
+        draft->prefixHidden.FakeFrom(tail, 0); draft->prefixHidden.Resize(tail.dims);
+    }
     draft->committed = length;
     return draft;
 }
