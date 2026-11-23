@@ -10,7 +10,7 @@ namespace fastllm_shared_flex_tp {
 constexpr int GroupedGateBuffers = 4;
 constexpr int GroupedGateBytes = GroupedGateBuffers * (16384 + 1024 + 512 + 512);
 
-template<bool Subgroup=false, int Splits=1, bool PDL=false> __device__ __forceinline__
+template<bool Subgroup=false, int Splits=1, bool PDL=false, bool Cluster=false> __device__ __forceinline__
 void GroupedTmaGate(Rank a,const float*prob,const CUtensorMap *xmap){
   using E4=cutlass::float_e4m3_t;using UE=cutlass::float_ue8m0_t;
   using MMA=cute::SM100_MMA_MXF8F6F4_SS<E4,E4,float,UE,128,8,cute::UMMA::Major::K,cute::UMMA::Major::K>;
@@ -38,7 +38,12 @@ void GroupedTmaGate(Rank a,const float*prob,const CUtensorMap *xmap){
   MatmulSync<Subgroup>();
   // Barrier and TMEM setup can overlap selection. The expert schedule and
   // probabilities become visible only after this dependency wait.
-  if constexpr (PDL) cudaGridDependencySynchronize();
+  if constexpr (PDL) {
+    cudaGridDependencySynchronize();
+    // Selection has finished publishing routes. The Down helper can prefetch
+    // expert weights while Gate computes the quantized activations.
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
   auto idesc=fastllm_shared_flex::weight_instruction(a.mxfp4);
   for(int task=blockIdx.x;task<*a.nuniq*(NN/128)*Splits;task+=gridDim.x){
     int split=task%Splits, tile=(task/Splits)%(NN/128), job=task/(Splits*(NN/128));
@@ -106,7 +111,7 @@ void GroupedTmaGate(Rank a,const float*prob,const CUtensorMap *xmap){
     cutlass::arch::fence_view_async_tmem_load();
     // All K pages have retired; this pane can now hold the eight output rows.
     float *scratch=reinterpret_cast<float*>(wa[0]);
-    if constexpr (Splits==1) {
+    if constexpr (Splits==1 || Cluster) {
       #pragma unroll
       for(int col=0;col<8;++col)if(col<a.rows)
         scratch[col*128+tid]=__uint_as_float(values[col]);
@@ -132,19 +137,36 @@ void GroupedTmaGate(Rank a,const float*prob,const CUtensorMap *xmap){
       }
     }
     asm volatile("tcgen05.fence::before_thread_sync;":::"memory");
-    MatmulSync<Subgroup>();
-    if (Splits==1 || finalSplit) for(int col=tid/64;col<member_count;col+=2){
-      int outputLane=tid%64,source_job=a.members[job*8+col];
+    if constexpr (Cluster) {
+      static_assert(Splits == 2 && !Subgroup);
+      cooperative_groups::this_cluster().sync();
+    } else {
+      MatmulSync<Subgroup>();
+    }
+    // A cluster CTA finishes one K32 group per member. Other paths finish both.
+    constexpr int lanesPerMember = Cluster ? 32 : 64;
+    if (Cluster || Splits == 1 || finalSplit) for (int col = tid / lanesPerMember;
+        col < member_count; col += 128 / lanesPerMember) {
+      int outputLane = tid % lanesPerMember + (Cluster ? split * 32 : 0);
+      int source_job = a.members[job * 8 + col];
       int i=tile*64+outputLane,g=(outputLane/8)*16+outputLane%8;
       int sourceCol=source_job/8;
-      float gv=__bfloat162float(__float2bfloat16_rn(scratch[sourceCol*128+g]));
-      float uv=__bfloat162float(__float2bfloat16_rn(scratch[sourceCol*128+g+8]));
+      const float *local = scratch + sourceCol * 128 + g;
+      float gate = local[0], up = local[8];
+      if constexpr (Cluster) {
+        const float *peer = cooperative_groups::this_cluster().map_shared_rank(local, split ^ 1);
+        gate = __fadd_rn(gate, peer[0]);
+        up = __fadd_rn(up, peer[8]);
+      }
+      float gv=__bfloat162float(__float2bfloat16_rn(gate));
+      float uv=__bfloat162float(__float2bfloat16_rn(up));
       float v=__fmul_rn(__fmul_rn(gv/(1.f+__expf(-gv)),uv),prob[source_job]),mx=fabsf(v);
       for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,d));
       unsigned e=exponent(mx);a.mid[source_job*I+i]=__nv_fp8_e4m3(v*sf(254-e)).__x;
       if(tid%32==0)a.ms[source_job*(I/32)+i/32]=e;
     }
-    MatmulSync<Subgroup>();
+    if constexpr (Cluster) cooperative_groups::this_cluster().sync();
+    else MatmulSync<Subgroup>();
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.free(tm,64);}
 }
@@ -168,5 +190,25 @@ void grouped_tma_gate(Rank a,const int *ids,const float *prob){
 __global__ __launch_bounds__(128,2) void prepared_gate(Rank a, const float *prob) {
     a.mxfp4 = true;
     GroupedTmaGate<false,2,true>(a, prob, a.xmap);
+}
+// An even grid stride keeps both K partitions of an expert tile in one cluster.
+constexpr int PreparedGateBlocks = 444;
+static_assert(PreparedGateBlocks % 2 == 0);
+__global__ __launch_bounds__(128, 2) void __cluster_dims__(2, 1, 1)
+prepared_cluster_gate(Rank a, const float *prob) {
+    a.mxfp4 = true;
+    GroupedTmaGate<false, 2, true, true>(a, prob, a.xmap);
+}
+
+inline bool SupportsPreparedClusterGate(int device) {
+    int supported = 0, active = 0;
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(PreparedGateBlocks);
+    config.blockDim = dim3(128);
+    config.dynamicSmemBytes = GroupedGateBytes;
+    return cudaDeviceGetAttribute(&supported, cudaDevAttrClusterLaunch, device) == cudaSuccess && supported &&
+        cudaFuncSetAttribute(prepared_cluster_gate, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             GroupedGateBytes) == cudaSuccess &&
+        cudaOccupancyMaxActiveClusters(&active, prepared_cluster_gate, &config) == cudaSuccess && active > 0;
 }
 } // namespace fastllm_shared_flex_tp

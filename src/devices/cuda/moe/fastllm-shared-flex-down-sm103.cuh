@@ -6,7 +6,7 @@
 namespace fastllm_shared_flex_tp {
 constexpr int OwnerDownBytes = 70656;
 
-template<bool KeepExperts>
+template<bool KeepExperts, bool PDL = false>
 __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, int row) {
     using E4 = cutlass::float_e4m3_t;
     using UE = cutlass::float_ue8m0_t;
@@ -63,6 +63,9 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
     }
     // All expert activations share an immutable N8 image. Each expert's
     // epilogue reads its own column, without broadcasting or requantizing.
+    // Gate signalled after selection. Only its activation bytes and scales
+    // depend on its completion, so the weight-loading warp can run ahead.
+    if constexpr (PDL) cudaGridDependencySynchronize();
     for (int kg = 0; kg < 2; ++kg) {
         for (int j = tid; j < 256; j += 128) {
             const int slot = j / 32, k = j % 32 * 4;
@@ -148,10 +151,10 @@ __device__ __forceinline__ void OwnerDownBody(Rank a, const int *ids, int tile, 
     }
 }
 
-template<bool KeepExperts> __global__ __launch_bounds__(160,2)
+template<bool KeepExperts, bool PDL = false> __global__ __launch_bounds__(160,2)
 void owner_down(Rank a, const int *ids, const float *prob) {
     if (*a.nuniq <= a.rows * 4) {
-        if (threadIdx.x < 128) batched_matmul<false,false,1,true>(a, ids, prob);
+        if (threadIdx.x < 128) batched_matmul<false, PDL, 1, true>(a, ids, prob);
         return;
     }
     const int task = blockIdx.x;
@@ -160,7 +163,7 @@ void owner_down(Rank a, const int *ids, const float *prob) {
     // the same expert can reuse those cache lines without a global partial.
     const int tile = KeepExperts ? task / a.rows : task % (H / 128);
     const int row = KeepExperts ? task % a.rows : task / (H / 128);
-    OwnerDownBody<KeepExperts>(a, ids, tile, row);
+    OwnerDownBody<KeepExperts, PDL>(a, ids, tile, row);
 }
 
 template<bool PackedLocal> __global__

@@ -17,7 +17,7 @@ __device__ __forceinline__ void bulk(void*dst,const void*src,int bytes,uint64_t*
   asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1],%2,[%3];"
     ::"r"(d),"l"(src),"r"(bytes),"r"(b):"memory");
 }
-template<bool G,bool PDL=false> __global__ __launch_bounds__(128,2)
+template<bool G,bool PDL=false,bool Paired=false> __global__ __launch_bounds__(128,2)
 void single_matmul(Rank a,const int*ids,const float*prob){
   if constexpr(PDL) cudaTriggerProgrammaticLaunchCompletion();
   using E4=cutlass::float_e4m3_t;using UE=cutlass::float_ue8m0_t;
@@ -27,7 +27,8 @@ void single_matmul(Rank a,const int*ids,const float*prob){
   __shared__ __align__(8) uint64_t loaded[2],done;
   __shared__ unsigned tm; __shared__ int last;
   int tid=threadIdx.x;
-  if((a.rows*K)==0)return;
+  static_assert(!Paired || (G && PDL));
+  if((a.rows*K)==0 || (Paired && blockIdx.x>=K*(NN/128)*SPLIT))return;
   if(G&&tid==0&&blockIdx.x==0&&a.rows==1)++*a.epoch;
   if(tid==0){
     for(int b=0;b<2;++b){unsigned l=(unsigned)__cvta_generic_to_shared(&loaded[b]);
@@ -37,7 +38,7 @@ void single_matmul(Rank a,const int*ids,const float*prob){
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.allocate(32,&tm);al.release_allocation_lock();}
   __syncthreads();
-  auto idesc=fastllm_shared_flex::weight_instruction(a.mxfp4);
+  auto idesc=fastllm_shared_flex::weight_instruction(Paired || a.mxfp4);
   unsigned phase=0,load_phase[2]={0,0};
   for(int task=blockIdx.x;task<(a.rows*K)*(NN/128)*SPLIT;task+=gridDim.x){
     int split=task%SPLIT,tile=task/SPLIT%(NN/128),job=task/((NN/128)*SPLIT);
@@ -45,14 +46,17 @@ void single_matmul(Rank a,const int*ids,const float*prob){
     const uint8_t*x=G?a.xq+row*H:a.mid+job*I;
     const uint8_t*xs=G?a.xs+row*(H/32):a.ms+job*(I/32);
     const uint8_t*scales=G?a.gs:a.ds;
-    auto load_tile=[&](int kg,int b){
+    auto load_weights=[&](int kg,int b){
+      auto *ready=&loaded[Paired?0:b];
       if(tid==0){
-        unsigned mb=(unsigned)__cvta_generic_to_shared(&loaded[b]);
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(fastllm_shared_flex::weight_tile_bytes(a.mxfp4)+512):"memory");
-        tma3(wa[b],G?a.gmap:a.dmap,kg*128,tile*128,expert,&loaded[b]);
-        bulk(sfa[b],scales+(size_t)expert*NN*(NK/32)+((size_t)kg*NN+tile*128)*4,512,&loaded[b]);
+        unsigned mb=(unsigned)__cvta_generic_to_shared(ready);
+        if(!Paired || b==0)asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"((Paired?2:1)*(fastllm_shared_flex::weight_tile_bytes(Paired || a.mxfp4)+512)):"memory");
+        tma3(wa[b],G?a.gmap:a.dmap,kg*128,tile*128,expert,ready);
+        bulk(sfa[b],scales+(size_t)expert*NN*(NK/32)+((size_t)kg*NN+tile*128)*4,512,ready);
       }
-      if(G&&a.rows==1){
+    };
+    auto pack_input=[&](int kg,int b){
+      if(Paired || (G&&a.rows==1)){
         float v=__bfloat162float(a.raw_x[kg*128+tid]),mx=fabsf(v);
         #pragma unroll
         for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffff,mx,d));
@@ -70,31 +74,59 @@ void single_matmul(Rank a,const int*ids,const float*prob){
         *reinterpret_cast<unsigned*>(xb[b]+br*128+(k^((br&7)*16)))=ld4(x+kg*128+k);}
       reinterpret_cast<unsigned*>(sfb[b])[tid]=ld4(xs+kg*4);
       }
-      asm volatile("fence.proxy.async.shared::cta;":::"memory");
     };
-    load_tile(split*PAGES,0);__syncthreads();
-    for(int page=0;page<PAGES;++page){
-      int b=page&1;
-      if(tid<32){
-        while(!parity_wait(&loaded[b],load_phase[b])){}
-        asm volatile("tcgen05.fence::after_thread_sync;":::"memory");
+    auto issue_page=[&](int page,int b){
+        unsigned scaleTm=tm+8+(Paired?b*8:0);
         auto ad=dg::mma::sm100::make_umma_desc<cute::UMMA::Major::K,128,128,128>((E4*)wa[b],0,0);
         auto bd=dg::mma::sm100::make_umma_desc<cute::UMMA::Major::K,8,128,128>((E4*)xb[b],0,0);
         auto sd1=dg::mma::sm100::make_sf_desc(sfa[b]),sd2=dg::mma::sm100::make_sf_desc(sfb[b]);
-        if(tid==0){cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sd1,tm+8);cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sd2,tm+12);}
+        if(tid==0){cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sd1,scaleTm);cute::SM100_UTCCP_4x32dp128bit_1cta::copy(sd2,scaleTm+4);}
         #pragma unroll
         for(int kk=0;kk<4;++kk){
           auto aa=ad,bb=bd;aa.start_address_+=kk*2;bb.start_address_+=kk*2;
           auto desc=dg::mma::sm100::make_runtime_instr_desc_with_sf_id(idesc,kk,kk);
-          MMA::fma(aa,bb,tm,page!=0||kk!=0,desc,tm+8,tm+12);
+          MMA::fma(aa,bb,tm,page!=0||kk!=0,desc,scaleTm,scaleTm+4);
         }
-        cutlass::arch::umma_arrive(&done);
+    };
+    if constexpr (Paired) {
+      // Both resident pages have disjoint TMEM scales. One completion barrier
+      // protects both buffers while UMMA accumulates in the original K order.
+      #pragma unroll
+      for(int page=0;page<PAGES;page+=2){
+        load_weights(split*PAGES+page,0);load_weights(split*PAGES+page+1,1);
+        pack_input(split*PAGES+page,0);pack_input(split*PAGES+page+1,1);
+        asm volatile("fence.proxy.async.shared::cta;":::"memory");
+        __syncthreads();
+        if(tid<32){
+          while(!parity_wait(&loaded[0],page/2)){}
+          asm volatile("tcgen05.fence::after_thread_sync;":::"memory");
+          issue_page(page,0);issue_page(page+1,1);
+          cutlass::arch::umma_arrive(&done);
+        }
+        while(!parity_wait(&done,page/2)){}
+        asm volatile("tcgen05.fence::after_thread_sync;":::"memory");
+        __syncthreads();
       }
-      // Load the next K page while the current UMMA reads the other buffer.
-      if(page+1<PAGES)load_tile(split*PAGES+page+1,b^1);
-      while(!parity_wait(&done,phase)){}
-      asm volatile("tcgen05.fence::after_thread_sync;":::"memory");
-      __syncthreads();phase^=1;load_phase[b]^=1;
+    } else {
+      auto load_tile=[&](int kg,int b){
+        load_weights(kg,b);pack_input(kg,b);
+        asm volatile("fence.proxy.async.shared::cta;":::"memory");
+      };
+      load_tile(split*PAGES,0);__syncthreads();
+      for(int page=0;page<PAGES;++page){
+        int b=page&1;
+        if(tid<32){
+          while(!parity_wait(&loaded[b],load_phase[b])){}
+          asm volatile("tcgen05.fence::after_thread_sync;":::"memory");
+          issue_page(page,b);
+          cutlass::arch::umma_arrive(&done);
+        }
+        // Load the next K page while the current UMMA reads the other buffer.
+        if(page+1<PAGES)load_tile(split*PAGES+page+1,b^1);
+        while(!parity_wait(&done,phase)){}
+        asm volatile("tcgen05.fence::after_thread_sync;":::"memory");
+        __syncthreads();phase^=1;load_phase[b]^=1;
+      }
     }
     unsigned value;cute::SM100_TMEM_LOAD_32dp32b1x::copy(tm+(unsigned(tid/32*32)<<16),value);
     cutlass::arch::fence_view_async_tmem_load();
@@ -420,11 +452,20 @@ __global__ void down_finish(Rank a,__nv_bfloat16*y,int rows){
  float2 total=collect_bf16(a,row,pair,generation,payload);
  reinterpret_cast<__nv_bfloat162*>(y+row*H)[pair]=__floats2bfloat162_rn(total.x,total.y);
 }
-template<bool FUSED,bool PDL=false> __global__ __launch_bounds__(256,3)
+constexpr int CompactDownWeightBytes = K * 32 * (I / 2);
+constexpr int CompactDownSharedBytes = CompactDownWeightBytes + K * 2 * 512;
+// Four contiguous E2M1 nibbles -> four exact E4M3 MMA operands.
+__device__ __forceinline__ unsigned unpack_e2m1x4(const uint8_t *bytes) {
+    const unsigned p = *reinterpret_cast<const uint16_t *>(bytes);
+    const unsigned signs = __byte_perm(p << 4, p, 0x5140) & 0x80808080u;
+    return __byte_perm(0x3c383000u, 0x4c484440u, p & 0x7777u) | signs;
+}
+template<bool FUSED,bool PDL=false,bool Compact=false,bool Swizzled=false> __global__ __launch_bounds__(256,3)
 void warp_down(Rank a,const int*ids,__nv_bfloat16*y,int rows){
   extern __shared__ __align__(1024) uint8_t arena[];
   auto w=reinterpret_cast<uint8_t(*)[2][4096]>(arena);
-  auto sc=reinterpret_cast<uint8_t(*)[2][512]>(arena+65536);
+  constexpr int weightBytes = Compact ? CompactDownWeightBytes : 65536;
+  auto sc=reinterpret_cast<uint8_t(*)[2][512]>(arena+weightBytes);
   __shared__ __align__(8) uint64_t loaded;
   __shared__ float partial[128];
   int tid=threadIdx.x,warp=tid/32,lane=tid%32,group=warp%2,part=warp/2;
@@ -433,12 +474,20 @@ void warp_down(Rank a,const int*ids,__nv_bfloat16*y,int rows){
     if (FUSED && row == 0 && tile == 0) a.gcount[tid] = 0;
   }
   if(tid==0){unsigned mb=(unsigned)__cvta_generic_to_shared(&loaded);
-    asm volatile("mbarrier.init.shared::cta.b64 [%0],1; fence.mbarrier_init.release.cluster; mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(73728):"memory");}
+    asm volatile("mbarrier.init.shared::cta.b64 [%0],1; fence.mbarrier_init.release.cluster; mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(weightBytes + K * 2 * 512):"memory");}
   __syncthreads();
   if(lane==0){int slot=warp,expert=ids[row*8+slot];
+    if constexpr (Swizzled) {
+      // TMA rearranges 16-byte sectors in shared memory. Global weights stay packed.
+      tma3(arena + slot * 32 * (I / 2), a.warpmap, 0, tile * 32, expert, &loaded);
+    } else if constexpr (Compact) {
+      // All 32 output rows for this expert are contiguous in the owned nibble layout.
+      bulk(arena + slot * 32 * I / 2, a.down + (size_t(expert) * H + tile * 32) * (I / 2),
+           32 * I / 2, &loaded);
+    }
     #pragma unroll
     for(int kg=0;kg<2;++kg){
-      tma3(w[slot][kg],a.warpmap,kg*128,tile*32,expert,&loaded);
+      if constexpr (!Compact) tma3(w[slot][kg],a.warpmap,kg*128,tile*32,expert,&loaded);
       bulk(sc[slot][kg],a.ds+(size_t)expert*H*8+((size_t)kg*H+(tile*32&~127))*4,512,&loaded);
     }
   }
@@ -451,6 +500,18 @@ void warp_down(Rank a,const int*ids,__nv_bfloat16*y,int rows){
     if(FUSED&&row==0&&tile==0)a.gcount[tid]=0;
   }
   int lr=lane/4,q=lane%4,wr=group*16+lr;
+  // Four lanes gather each expert's activation and then broadcast to the lanes
+  // doing that expert's MMA. The producer has completed its quantized writes.
+  unsigned xLo[2], xHi[2], xScale[2];
+  if constexpr (Swizzled) {
+    static_assert(Compact && PDL && FUSED);
+    #pragma unroll
+    for (int kg=0; kg<2; ++kg) {
+      int slot=lane/4, kb=kg*4+part;
+      const uint8_t *x=a.mid+slot*I+kb*32+q*4;
+      xLo[kg]=ld4(x); xHi[kg]=ld4(x+16); xScale[kg]=a.ms[slot*8+kb];
+    }
+  }
   float d0=0,d2=0;
   #pragma unroll
   for(int slot=0;slot<8;++slot){
@@ -459,10 +520,30 @@ void warp_down(Rank a,const int*ids,__nv_bfloat16*y,int rows){
       int kg=kb/4,k=(kb%4)*32+q*4;
       const uint8_t*ww=w[slot][kg],*x=a.mid+(row*8+slot)*I+kb*32;
       float p0=0,p1=0,p2=0,p3=0;
-      mma(p0,p1,p2,p3,
-          ld4(ww+wr*128+(k^((wr&7)*16))),ld4(ww+(wr+8)*128+(k^(((wr+8)&7)*16))),
-          ld4(ww+wr*128+((k+16)^((wr&7)*16))),ld4(ww+(wr+8)*128+((k+16)^(((wr+8)&7)*16))),ld4(x+q*4),ld4(x+q*4+16));
-      float xs=sf(a.ms[(row*8+slot)*8+kb]);
+      unsigned a0, a1, a2, a3;
+      if constexpr (Compact) {
+        const int byteOffset = ((kg * 128 + k) / 2) ^ (Swizzled ? (wr & 7) * 16 : 0);
+        const uint8_t *lo = arena + (slot * 32 + wr) * (I / 2) + byteOffset;
+        const uint8_t *hi = lo + 8 * (I / 2);
+        a0 = unpack_e2m1x4(lo); a1 = unpack_e2m1x4(hi);
+        a2 = unpack_e2m1x4(lo + 8); a3 = unpack_e2m1x4(hi + 8);
+      } else {
+        a0 = ld4(ww + wr * 128 + (k ^ ((wr & 7) * 16)));
+        a1 = ld4(ww + (wr + 8) * 128 + (k ^ (((wr + 8) & 7) * 16)));
+        a2 = ld4(ww + wr * 128 + ((k + 16) ^ ((wr & 7) * 16)));
+        a3 = ld4(ww + (wr + 8) * 128 + ((k + 16) ^ (((wr + 8) & 7) * 16)));
+      }
+      unsigned b0,b1,scale;
+      if constexpr (Swizzled) {
+        int source=slot*4+q;
+        b0=__shfl_sync(0xffffffffu,xLo[kg],source);
+        b1=__shfl_sync(0xffffffffu,xHi[kg],source);
+        scale=__shfl_sync(0xffffffffu,xScale[kg],source);
+      } else {
+        b0=ld4(x+q*4); b1=ld4(x+q*4+16); scale=a.ms[(row*8+slot)*8+kb];
+      }
+      mma(p0,p1,p2,p3,a0,a1,a2,a3,b0,b1);
+      float xs=sf(scale);
       int g0=((wr%32)*4+(tile%4))*4+kb%4;
       int g2=(((wr+8)%32)*4+(tile%4))*4+kb%4;
       d0=__fadd_rn(d0,__fmul_rn(p0,__fmul_rn(xs,sf(sc[slot][kg][g0]))));

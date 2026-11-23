@@ -11,6 +11,7 @@
 // Multiple rows: GPU expert-membership dispatch, with nonwaiting producer
 // fallback if the fused down grid exceeds measured residency capacity.
 #include <cuda.h>
+#include <cooperative_groups.h>
 #include "fastllm-norm-rows-router.cuh"
 #include "fastllm-cuda-launch.cuh"
 #include "fastllm-naive-flex-moe.h"
@@ -57,6 +58,9 @@ struct State {
     bool routerSupported = true, preparedSupported = true;
     // Rank workers can bind MXFP4 layers concurrently and disable the FP8-only layout.
     std::atomic<bool> gate128Supported{true};
+    bool preparedDownPdl = true;
+    bool clusterGateSupported = true;
+    bool compactSinglePdl = true, swizzledSinglePdl = true;
     Rank r[R]; std::vector<std::array<Rank,R>> layers; std::vector<void*> owned[R]; };
 void check(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
 void* alloc(size_t n){void*p=nullptr;check(cudaMalloc(&p,n));return p;}
@@ -221,6 +225,24 @@ extern "C" int fastshared_tp_create(const int*devices,int layers,void**result){
           blocks * prop.multiProcessorCount >= 128;
       if (a.pdl) a.pdl_warp_capacity = blocks * prop.multiProcessorCount;
       else cudaGetLastError();
+      if (!a.pdl ||
+          cudaFuncGetAttributes(&consumer, warp_down<true, true, true>) != cudaSuccess ||
+          consumer.binaryVersion < 90 || consumer.ptxVersion < 90 ||
+          cudaFuncSetAttribute(warp_down<true, true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, CompactDownSharedBytes) != cudaSuccess ||
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, warp_down<true, true, true>, 256, CompactDownSharedBytes) != cudaSuccess ||
+          blocks * prop.multiProcessorCount < 128) {
+          s->compactSinglePdl = false;
+          cudaGetLastError();
+      }
+      if (s->compactSinglePdl &&
+          (cudaFuncGetAttributes(&producer,single_matmul<true,true,true>) != cudaSuccess ||
+           producer.binaryVersion < 90 || producer.ptxVersion < 90 ||
+           cudaFuncSetAttribute(warp_down<true,true,true,true>, cudaFuncAttributeMaxDynamicSharedMemorySize, CompactDownSharedBytes) != cudaSuccess ||
+           cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, warp_down<true,true,true,true>, 256, CompactDownSharedBytes) != cudaSuccess ||
+           blocks * prop.multiProcessorCount < H / 32)) {
+          s->swizzledSinglePdl = false;
+          cudaGetLastError();
+      }
       a.multi_pdl = a.pdl &&
           cudaFuncGetAttributes(&producer, multi_gate<true>) == cudaSuccess &&
           producer.binaryVersion >= 90 && producer.ptxVersion >= 90 &&
@@ -294,6 +316,18 @@ extern "C" int fastshared_tp_create(const int*devices,int layers,void**result){
           s->routePipelineSupported = false;
           cudaGetLastError();
       }
+      cudaFuncAttributes down{};
+      if (!s->packedOwnerDownSupported || !s->routePipelineSupported ||
+          cudaFuncGetAttributes(&down, owner_down<true, true>) != cudaSuccess ||
+          down.binaryVersion < 90 || down.ptxVersion < 90 ||
+          cudaFuncSetAttribute(owner_down<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, OwnerDownBytes) != cudaSuccess) {
+          s->preparedDownPdl = false;
+          cudaGetLastError();
+      }
+      if (!s->routePipelineSupported || !SupportsPreparedClusterGate(devices[r])) {
+          s->clusterGateSupported = false;
+          cudaGetLastError();
+      }
       cudaFuncAttributes denseUp{},denseDown{}; int denseBlocks=0;
       if(!prop.cooperativeLaunch ||
           cudaFuncGetAttributes(&denseUp,dense_up_gate)!=cudaSuccess || denseUp.binaryVersion!=103 ||
@@ -363,7 +397,27 @@ static int bind_tp(void *state, int rank, int layer, const void *gate, const voi
     dst=static_cast<CUtensorMap *>(alloc(sizeof(map)));
     check(cudaMemcpy(dst,&map,sizeof(map),cudaMemcpyHostToDevice));
   }
-  if (mxfp4) return 0;
+  if (mxfp4) {
+    if (s->compactSinglePdl && s->swizzledSinglePdl) {
+      // The one-row warp decoder views each packed row as I/2 bytes.
+      CUtensorMap map;
+      cuuint64_t dims[]={I/2,H,E}, strides[]={I/2,H*(I/2)};
+      cuuint32_t box[]={I/2,32,1}, steps[]={1,1,1};
+      if (cuTensorMapEncodeTiled(&map,CU_TENSOR_MAP_DATA_TYPE_UINT8,3,const_cast<void*>(down),
+              dims,strides,box,steps,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_128B,
+              CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE)==CUDA_SUCCESS) {
+        CUtensorMap *deviceMap=nullptr;
+        if (cudaMalloc(&deviceMap,sizeof(map))==cudaSuccess &&
+            cudaMemcpy(deviceMap,&map,sizeof(map),cudaMemcpyHostToDevice)==cudaSuccess) {
+          a.warpmap=deviceMap;
+        } else {
+          cudaGetLastError();
+          if (deviceMap) cudaFree(deviceMap);
+        }
+      }
+    }
+    return 0;
+  }
   a.warpmap=static_cast<CUtensorMap *>(alloc(sizeof(CUtensorMap)));
   CUtensorMap map;cuuint64_t dims[]={256,4096,256},strides[]={256,4096*256};cuuint32_t box[]={128,32,1},steps[]={1,1,1};
   if(cuTensorMapEncodeTiled(&map,CU_TENSOR_MAP_DATA_TYPE_UINT8,3,(void*)down,dims,strides,box,steps,CU_TENSOR_MAP_INTERLEAVE_NONE,CU_TENSOR_MAP_SWIZZLE_128B,CU_TENSOR_MAP_L2_PROMOTION_L2_256B,CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE)!=CUDA_SUCCESS)return 1;
@@ -377,8 +431,9 @@ extern "C" int fastshared_tp_bind(void *state,int rank,int layer,const void *gat
     return bind_tp(state,rank,layer,gate,down,gs,ds,false);
 }
 
-static void launch_prepared_down(const fastllm_shared_flex_tp::Rank &a,
-    const int *ids,const float *prob,void *output,cudaStream_t stream,const fastllm_shared_flex_tp::State &state);
+static cudaError_t launch_prepared_down(const fastllm_shared_flex_tp::Rank &a,
+    const int *ids,const float *prob,void *output,cudaStream_t stream,const fastllm_shared_flex_tp::State &state,
+    bool pipeline = false);
 namespace fastllm_shared_flex_tp {
 // Reuse the existing gate arena; preserve the FP8/32 -> block-128 rounding
 // of the router producer, including padded rows. For 32 rows, select routes
@@ -506,7 +561,21 @@ static int run_tp(void*state,int rank,int layer,int rows,const void*x,const void
           const_cast<int*>(ii),const_cast<float*>(pp),needNorm,routeScale,a.gate128map,a.gs,
           reinterpret_cast<uint8_t*>(a.gpartial)};
       fastllm_shared_flex_tp::block128_gate<<<a.gate128ctas,384,fastllm_shared_flex_tp::Block128GateBytes,stream>>>(args);
-      launch_prepared_down(a,ii,pp,yy,stream,*s);
+      auto err = launch_prepared_down(a,ii,pp,yy,stream,*s);
+      if (err != cudaSuccess) return err;
+      continue;
+    }
+    if (a.mxfp4 && rows == 1 && !router && s->compactSinglePdl) {
+      using namespace fastllm_shared_flex_tp;
+      if (a.warpmap) {
+        single_matmul<true,true,true><<<K*(2*I/128)*8,128,0,stream>>>(a,ii,pp);
+        if (!fastllm::cuda_launch::Launch<warp_down<true,true,true,true>>(
+                dim3(H/32),dim3(256),CompactDownSharedBytes,stream,a,ii,yy,1)) return 1;
+      } else {
+        single_matmul<true,true><<<296,128,0,stream>>>(a,ii,pp);
+        if (!fastllm::cuda_launch::Launch<warp_down<true,true,true>>(
+                dim3(128),dim3(256),CompactDownSharedBytes,stream,a,ii,yy,1)) return 1;
+      }
       continue;
     }
     if (n > 1 || router || a.mxfp4) {
@@ -520,7 +589,8 @@ static int run_tp(void*state,int rank,int layer,int rows,const void*x,const void
       using namespace fastllm_shared_flex_tp;
       if (n>=4 && a.xmap) grouped_tma_gate<<<444,128,GroupedGateBytes,stream>>>(a,ii,pp);
       else multi_gate<><<<444,128,73728,stream>>>(a,ii,pp);
-      launch_prepared_down(a,ii,pp,yy,stream,*s);
+      auto err = launch_prepared_down(a,ii,pp,yy,stream,*s);
+      if (err != cudaSuccess) return err;
       continue;
     }
     if (n == 1 && a.pdl) {
@@ -606,12 +676,19 @@ extern "C" int fastshared_tp_prepared_input(void *state,int rank,int rows,Fastll
   input->experts=a.uniq;input->members=a.members;input->rowCounts=a.rowcounts;return 1;
 }
 // Prepared producer variants share the optional down/communication dispatch.
-static void launch_prepared_down(const fastllm_shared_flex_tp::Rank &a,
-    const int *ids,const float *prob,void *output,cudaStream_t stream,const fastllm_shared_flex_tp::State &state){
+static cudaError_t launch_prepared_down(const fastllm_shared_flex_tp::Rank &a,
+    const int *ids,const float *prob,void *output,cudaStream_t stream,const fastllm_shared_flex_tp::State &state,
+    bool pipeline){
   using namespace fastllm_shared_flex_tp;
   const int rows=a.rows;
   if (state.packedOwnerDownSupported && a.mxfp4 && rows == 8) {
-    owner_down<true><<<444,160,OwnerDownBytes,stream>>>(a,ids,prob);
+    if (pipeline && state.preparedDownPdl) {
+      auto err = fastllm::cuda_launch::LaunchProgrammatic<owner_down<true, true>>(
+          dim3(444), dim3(160), OwnerDownBytes, stream, a, ids, prob);
+      if (err != cudaSuccess) return err;
+    } else {
+      owner_down<true><<<444,160,OwnerDownBytes,stream>>>(a,ids,prob);
+    }
     owner_finish<true><<<dim3(32,rows),64,0,stream>>>(a,(__nv_bfloat16*)output);
   } else if(state.ownerDownSupported && rows>=4 && rows<=8){
     owner_down<false><<<444,160,OwnerDownBytes,stream>>>(a,ids,prob);
@@ -624,6 +701,7 @@ static void launch_prepared_down(const fastllm_shared_flex_tp::Rank &a,
     multi_down<><<<444,128,36864,stream>>>(a,ids,prob);
     down_finish<<<dim3(32,rows),64,0,stream>>>(a,(__nv_bfloat16*)output,rows);
   }
+  return cudaGetLastError();
 }
 extern "C" int fastshared_tp_residual_router_supported(void *state, int rank, int layer, int rows) {
     using namespace fastllm_shared_flex_tp;
@@ -668,10 +746,14 @@ extern "C" int fastshared_tp_run_prepared(void *state,int rank,int layer,int row
     launch_wide(args,(__nv_bfloat16*)output,stream);
     return cudaGetLastError();
   }
-  if (s->routePipelineSupported && a.mxfp4 && a.xmap && rows == 8) {
+  const bool pipeline = s->routePipelineSupported && a.mxfp4 && a.xmap && rows == 8;
+  if (pipeline) {
     SelectPreparedRoutes<true><<<1,256,0,stream>>>(a,router,bias,ids,prob,needNorm,routeScale);
-    cudaError_t err = fastllm::cuda_launch::LaunchProgrammatic<prepared_gate>(
-        dim3(444), dim3(128), GroupedGateBytes, stream, a, prob);
+    cudaError_t err = s->clusterGateSupported
+        ? fastllm::cuda_launch::LaunchProgrammatic<prepared_cluster_gate>(
+              dim3(PreparedGateBlocks), dim3(128), GroupedGateBytes, stream, a, prob)
+        : fastllm::cuda_launch::LaunchProgrammatic<prepared_gate>(
+              dim3(PreparedGateBlocks), dim3(128), GroupedGateBytes, stream, a, prob);
     if (err != cudaSuccess) return err;
   } else if (a.mxfp4 && a.xmap && rows>=4) {
     SelectPreparedRoutes<false><<<1,256,0,stream>>>(a,router,bias,ids,prob,needNorm,routeScale);
@@ -680,8 +762,7 @@ extern "C" int fastshared_tp_run_prepared(void *state,int rank,int layer,int row
     Block128GateArgs args{a,router,bias,ids,prob,needNorm,routeScale,a.gate128map,a.gs,input.block128};
     block128_gate<<<a.gate128ctas,384,Block128GateBytes,stream>>>(args);
   } else routed_gate<<<296,256,RoutedGateBytes,stream>>>(a,router,bias,ids,prob,needNorm,routeScale);
-  launch_prepared_down(a, ids, prob, output, stream, *s);
-  return cudaGetLastError();
+  return launch_prepared_down(a, ids, prob, output, stream, *s, pipeline);
 }
 extern "C" int fastshared_tp_run_preselected(void *state,int rank,int layer,int rows,
     const int *ids,const float *prob,void *output){
@@ -693,8 +774,7 @@ extern "C" int fastshared_tp_run_preselected(void *state,int rank,int layer,int 
   auto stream=cudaStreamPerThread;
   if(a.xmap && (rows>=7 || (a.mxfp4 && rows>=4)))grouped_tma_gate<<<444,128,GroupedGateBytes,stream>>>(a,ids,prob);
   else multi_gate<><<<444,128,73728,stream>>>(a,ids,prob);
-  launch_prepared_down(a, ids, prob, output, stream, *s);
-  return cudaGetLastError();
+  return launch_prepared_down(a, ids, prob, output, stream, *s);
 }
 extern "C" size_t fastshared_tp_workspace_bytes(){
 return 128+8*8*4*4+256+8*8*8*8*512*4+8*8*4096*4+8*4096+8*4096/32+8*8*256+8*8*256/32+8*8*4+4+8+2*8*8*(4096/2)*8+64*4+64*8*4+64*4+4+128+8*4096*4;

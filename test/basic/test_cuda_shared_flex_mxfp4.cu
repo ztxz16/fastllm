@@ -205,7 +205,8 @@ void test(bool ep) {
         if (!ep) a.router=a.allocate<float>(MaxRows*256);
         for (auto &y:a.y) y=a.allocate<BF>(MaxRows*Hidden);
     }
-    for (int variant:{1,2,8,9,17,-4,-8}) onRanks([&](int r) {
+    // Return to one row after a prepared batch to cover reused counters and mailbox generations.
+    for (int variant:{1,2,8,9,17,-4,-8,1}) onRanks([&](int r) {
         const bool prepared=variant<0;
         if (prepared && ep) return;
         const int rows=std::abs(variant);
