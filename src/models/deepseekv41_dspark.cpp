@@ -77,6 +77,63 @@
 namespace fastllm {
     // Per-request inputs and outputs have stable addresses. Temporary tensors
     // created while capturing are owned by the graph allocator until teardown.
+#ifdef USE_CUDA
+    // A request can leave the batch while another request still needs its row.
+    // Keep an immutable generation until every request has consumed or discarded it.
+    struct DeepSeekV41BatchProposal {
+        Data ids;
+        int producer = -1, rows = 0, width = 0;
+        int *host = nullptr;
+        void *idsReady = nullptr, *mirrorReady = nullptr;
+        bool copied = false;
+        std::atomic<bool> hostReady{false};
+
+        bool Queue(const Data &source, int batch, int count, int device) {
+            FastllmCudaSetDevice(device);
+            if (producer < 0) {
+                producer = device;
+                rows = batch;
+                width = count;
+                ids.dataType = INT32; ids.UpdateUnitSize(); ids.Resize({batch, count});
+                ids.ToDevice(CUDA, {device}, false); ids.Allocate(false);
+                host = static_cast<int *>(FastllmCudaHostMalloc(ids.GetBytes()));
+                idsReady = FastllmCudaEventCreate(); mirrorReady = FastllmCudaEventCreate();
+            }
+            if (!host || !idsReady || !mirrorReady || !source.cudaData || source.dataType != INT32 ||
+                source.dataDeviceIds != ids.dataDeviceIds || producer != device || width != count ||
+                rows != batch || source.GetBytes() != ids.GetBytes()) return false;
+            if (copied) FastllmCudaCurrentThreadStreamWaitEvent(mirrorReady);
+            if (!FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(ids.cudaData, source.cudaData, ids.GetBytes())) return false;
+            FastllmCudaEventRecordCurrentThread(idsReady);
+            if (!FastllmCudaCopyFromDeviceToHostAsyncCurrentThread(host, ids.cudaData, ids.GetBytes())) {
+                FastllmCudaEventSynchronize(idsReady);
+                return false;
+            }
+            FastllmCudaEventRecordCurrentThread(mirrorReady);
+            copied = true; hostReady = false;
+            return true;
+        }
+        void Read(int row, std::vector<int> &tokens) {
+            AssertInFastLLM(row >= 0 && row < rows, "DSpark proposal row out of range");
+            if (!hostReady.load(std::memory_order_acquire)) {
+                FastllmCudaEventSynchronize(mirrorReady);
+                hostReady.store(true, std::memory_order_release);
+            }
+            const auto *begin = host + size_t(row) * width;
+            tokens.assign(begin + 1, begin + width);
+        }
+        ~DeepSeekV41BatchProposal() {
+            if (producer < 0) return;
+            const int previous = FastllmCudaGetDevice();
+            FastllmCudaSetDevice(producer);
+            if (copied) FastllmCudaEventSynchronize(mirrorReady);
+            if (mirrorReady) FastllmCudaEventDestroy(mirrorReady);
+            if (idsReady) FastllmCudaEventDestroy(idsReady);
+            if (host) FastllmCudaHostFree(host);
+            FastllmCudaSetDevice(previous);
+        }
+    };
+#endif
     struct DeepSeekV41DsparkWorkspace {
         int block = 0, width = 0;
         bool disabled = false, parallelExperts = true, deviceInputs = false, parallelAttention = false;
@@ -126,6 +183,7 @@ namespace fastllm {
         void *top1Ready = nullptr, *kvReady = nullptr;
         void *verifyReady = nullptr, *packetStream = nullptr;
         bool rootWinnerRecorded = false;
+        std::shared_ptr<DeepSeekV41BatchProposal> batchResult;
 
         void FinishProposal(std::vector<int> *output = nullptr) {
             if (!pendingCount) return;
@@ -218,6 +276,8 @@ namespace fastllm {
     }
 
     void DeepSeekV41DsparkState::ClearProposal() {
+        batchProposal.reset();
+        proposalRow = -1;
 #ifdef USE_CUDA
         if (workspace) workspace->FinishProposal();
 #endif
@@ -275,6 +335,15 @@ namespace fastllm {
                         // Join that producer before replay, then drain only the
                         // graph streams, leaving target cache admissions running.
                         FastllmCudaEventRecordCurrentThread(state.replayReady);
+                        // Completion events belong to replay. The same graph may first run
+                        // with a host consumer and later publish proposals to device owners.
+                        if (streamJoin && !state.diskExperts && !state.hybridExperts && state.replayDone.empty()) {
+                            for (int device : state.devices) {
+                                FastllmCudaSetDevice(device);
+                                state.replayDone.push_back(FastllmCudaEventCreate());
+                            }
+                            FastllmCudaSetDevice(root);
+                        }
                         const bool events = streamJoin && !state.diskExperts && !state.hybridExperts &&
                             state.replayDone.size() == state.devices.size() &&
                             std::all_of(state.replayDone.begin(), state.replayDone.end(), [](void *e) { return e != nullptr; });
@@ -344,7 +413,6 @@ namespace fastllm {
             }
             state.graphs.assign(count, nullptr); state.execs.assign(count, nullptr);
             state.starts.assign(count, nullptr); state.ends.assign(count, nullptr);
-            if (streamJoin) state.replayDone.assign(count, nullptr);
             bool ok = true;
             for (int i = 0; i < count; ++i) {
                 FastllmCudaSetDevice(state.devices[i]);
@@ -352,7 +420,6 @@ namespace fastllm {
                 ok = FastllmCudaGraphPrepareCaptureDevice() && ok;
                 state.starts[i] = FastllmCudaEventCreate();
                 state.ends[i] = FastllmCudaEventCreate();
-                if (streamJoin) state.replayDone[i] = FastllmCudaEventCreate();
                 ok = state.starts[i] && state.ends[i] && ok;
             }
             const bool pool = ok && FastllmCudaGraphMemoryPoolBegin();
@@ -2059,15 +2126,9 @@ namespace fastllm {
         };
         if (!w.verifyHash.cudaData) {
             std::vector<int64_t> params;
-            if (engramMeta.multipliers.size() != layers || engramMeta.offsets.size() != layers ||
-                engramMeta.primes.size() != layers || engramMeta.tokenMap.empty()) return;
-            for (int l = 0; l < layers; ++l) {
-                const auto &m = engramMeta.multipliers[l], &p = engramMeta.primes[l], &o = engramMeta.offsets[l];
-                if (m.size() != ngram || p.size() != cols || o.size() != cols ||
-                    std::any_of(p.begin(), p.end(), [](int64_t v) { return v <= 0; })) return;
-                params.insert(params.end(), m.begin(), m.end()); params.insert(params.end(), p.begin(), p.end());
-                params.insert(params.end(), o.begin(), o.end());
-            }
+            if (engramMeta.tokenMap.empty()) return;
+            for (int l = 0; l < layers; ++l)
+                if (!engramMeta.AppendVerifyHashParameters(l, ngram, heads, INT64_MAX, params)) return;
             allocate(w.verifyTokenMap, engramMeta.tokenMap.size() * sizeof(int));
             allocate(w.verifyHash, params.size() * sizeof(int64_t));
             FastllmCudaCopyFromHostToDevice(w.verifyTokenMap.cudaData, engramMeta.tokenMap.data(), w.verifyTokenMap.GetBytes());
@@ -2113,6 +2174,13 @@ namespace fastllm {
                                                  int startPos, std::vector<int> &drafts) {
         drafts.clear();
 #ifdef USE_CUDA
+        if (state.dspark && state.dspark->batchProposal) {
+            auto &s = *state.dspark;
+            s.batchProposal->Read(s.proposalRow, s.drafts);
+            s.proposalTokens = s.drafts;
+            s.batchProposal.reset();
+            s.proposalRow = -1;
+        }
         if (state.dspark && state.dspark->workspace && state.dspark->workspace->pendingCount) {
             auto &proposal = *state.dspark;
             proposal.workspace->FinishProposal(&proposal.drafts);
@@ -2222,6 +2290,24 @@ namespace fastllm {
         if (verifyStep) {
             const auto anchors = DsReadIds(inputIds);
             std::vector<float> tokens;
+#ifdef USE_CUDA
+            const int proposalRows = FastllmV41OwnerVerifyRows;
+            const char *forced = std::getenv("FASTLLM_DSPARK_FORCE_DRAFTS");
+            const bool fullProposal = (!forced || !*forced) && v41DsparkTokens == proposalRows - 1 &&
+                std::all_of(segments.begin(), segments.end(), [&](const auto &seg) {
+                    const auto &ds = *seg.state->dspark;
+                    const int64_t end = int64_t(seg.startPos) + proposalRows;
+                    return !ds.disabled && ds.committed == seg.startPos && ds.anchorPos == seg.startPos &&
+                        ds.anchor == anchors[seg.offset] && (max_positions <= 0 || end <= max_positions) &&
+                        (tokensLimit <= 0 || end <= tokensLimit);
+                });
+            const bool batchPacket = fullProposal && numSegments == v41AttentionDP && numSegments > 1 &&
+                executionMode == ExecutionMode::Gpu && std::all_of(segments.begin(), segments.end(), [&](const auto &seg) {
+                    const auto &ds = *seg.state->dspark;
+                    return ds.batchProposal && ds.batchProposal->width == proposalRows && ds.proposalRow >= 0 &&
+                        ds.proposalRow < ds.batchProposal->rows;
+                });
+#endif
             for (int i = 0; i < numSegments; ++i) {
                 auto &segment = segments[i];
                 auto &scratch = scratches[i];
@@ -2230,20 +2316,37 @@ namespace fastllm {
                 int drafts = 0;
 #ifdef USE_CUDA
                 const auto w = proposal.workspace;
-                if (numSegments == 1 && w && w->pendingCount == 5 && w->packetPosition == segment.startPos &&
-                    proposal.anchor == anchor && proposal.anchorPos == segment.startPos && proposal.committed == segment.startPos &&
-                    !proposal.disabled && !std::getenv("FASTLLM_DSPARK_FORCE_DRAFTS") &&
-                    (max_positions <= 0 || int64_t(segment.startPos) + 6 <= max_positions) &&
-                    (tokensLimit <= 0 || int64_t(segment.startPos) + 6 <= tokensLimit)) {
-                    drafts = w->pendingCount;
+                const bool singlePacket = numSegments == 1 && fullProposal && !proposal.batchProposal && w &&
+                    w->pendingCount == proposalRows - 1 && w->packetPosition == segment.startPos;
+                if (batchPacket || singlePacket) {
+                    drafts = proposalRows - 1;
                     scratch.draftTokens.resize(drafts);
-                    scratch.verifyPacket = w->verifyPacket.cudaData; scratch.verifyPacketBytes = w->verifyPacket.GetBytes();
-                    scratch.verifyProducer = w->devices.front(); scratch.verifyReady = w->verifyReady;
-                    scratch.resolveDraftIds = [w, &proposal, &scratch, &verifyIds]() {
-                        w->FinishProposal(&scratch.draftTokens);
+                    auto batch = proposal.batchProposal;
+                    const int row = proposal.proposalRow;
+                    if (batchPacket) {
+                        scratch.ownerDraftIds = static_cast<const int *>(batch->ids.cudaData) + size_t(row) * proposalRows + 1;
+                        scratch.ownerAnchor = anchor;
+                        scratch.verifyProducer = batch->producer;
+                        scratch.verifyReady = batch->idsReady;
+                    } else {
+                        scratch.verifyPacket = w->verifyPacket.cudaData;
+                        scratch.verifyPacketBytes = w->verifyPacket.GetBytes();
+                        scratch.verifyProducer = w->devices.front();
+                        scratch.verifyReady = w->verifyReady;
+                    }
+                    const size_t offset = tokens.size() + 1;
+                    scratch.resolveDraftIds = [batch, row, w, offset, &proposal, &scratch, &verifyIds]() {
+                        if (batch) {
+                            batch->Read(row, scratch.draftTokens);
+                            proposal.batchProposal.reset();
+                            proposal.proposalRow = -1;
+                        } else {
+                            w->FinishProposal(&scratch.draftTokens);
+                        }
+                        scratch.ownerDraftIds = nullptr;
                         proposal.proposalTokens = scratch.draftTokens;
-                        auto *ids = static_cast<float *>(static_cast<void *>(verifyIds.cpuData));
-                        for (size_t i = 0; i < scratch.draftTokens.size(); ++i) ids[1+i] = float(scratch.draftTokens[i]);
+                        auto *ids = reinterpret_cast<float *>(verifyIds.cpuData) + offset;
+                        std::copy(scratch.draftTokens.begin(), scratch.draftTokens.end(), ids);
                     };
                     DsProfiler().AddProposal(drafts, drafts);
                 } else
@@ -3037,9 +3140,24 @@ namespace fastllm {
                     }
                     std::vector<int> tokens;
                     std::vector<float> confidence;
+                    storage.batchProposal.reset();
+                    // A partial batch uses the ordinary producer and host handoff, including its
+                    // original stream join. Only a full owner set can consume the device snapshot.
+                    const bool deviceHandoff = batchGreedyTp && batch == v41AttentionDP &&
+                        executionMode == ExecutionMode::Gpu && v41DsparkTokens + 1 == FastllmV41OwnerVerifyRows;
                     completed = DsparkRunDraft(storage, positions, batchAnchors, valid,
-                                               tokens, confidence, configs[group.front()]);
-                    if (completed) {
+                                               tokens, confidence, configs[group.front()], deviceHandoff);
+                    if (completed && storage.batchProposal) {
+                        for (int b = 0; b < batch; ++b) {
+                            auto &state = *states[group[b]];
+                            state.batchProposal = storage.batchProposal;
+                            state.proposalRow = b;
+                            state.sampledProposal = false;
+                            state.anchor = anchors[group[b]];
+                            state.anchorPos = state.committed;
+                        }
+                        storage.batchProposal.reset();
+                    } else if (completed) {
                         const int block = v41DsparkBlockSize;
                         AssertInFastLLM(tokens.size() == size_t(batch) * block && confidence.size() == tokens.size(),
                                        "DeepSeekV41 DSpark: invalid batched proposal shape.");
@@ -3870,11 +3988,19 @@ namespace fastllm {
             const int device = logits.dataDeviceIds.empty() ? FastllmCudaGetDevice() : logits.dataDeviceIds[0];
             prepareProposalProbs(device, logits.dims.back());
         }
-        // Only a request-owned greedy graph may keep its readback in flight across
-        // the scheduler call. Acceptance, force hooks and context bounds still run
-        // when the same request consumes the proposal. Reset/discard drains its slot.
-        if (deferGreedy && batch == 1 && !randomDraft && !confidenceWeight && !hybridDraft && !diskDraft &&
-            graphState && !graphState->execs.empty() && dspark.workspace.get() == graphState &&
+        // Publish an immutable device snapshot for a batch, or the request-owned mirror for B1.
+        const bool deferred = deferGreedy && !randomDraft && !confidenceWeight && !hybridDraft && !diskDraft &&
+            graphState && !graphState->execs.empty();
+        if (deferred && batch > 1 && block + 1 == FastllmV41OwnerVerifyRows && graphState->rootWinnerRecorded) {
+            auto &result = graphState->batchResult;
+            if (!result || result.use_count() != 1) result = std::make_shared<DeepSeekV41BatchProposal>();
+            if (result->Queue(graphState->markovTokens, batch, block + 1, graphState->devices.front())) {
+                dspark.batchProposal = result;
+                return true;
+            }
+            result.reset();
+        }
+        if (deferred && batch == 1 && dspark.workspace.get() == graphState &&
             graphState->QueueProposal(block)) {
             dspark.anchor = anchorToken;
             dspark.anchorPos = dspark.committed;

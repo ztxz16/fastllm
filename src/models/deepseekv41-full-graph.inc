@@ -53,6 +53,7 @@ struct V41FullLayer {
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
 struct V41OwnerInputPacket {
     Data device;
+    Data verifyMap, verifyHash;
     void *host = nullptr;
     size_t positionOffset = 0;
     std::vector<int> order;
@@ -286,6 +287,53 @@ struct V41FullGraph {
         FastllmCudaSetDevice(old);
     }
 };
+
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+// Bind the CUDA writer only if its layout exactly matches every captured owner view.
+void V41PrepareOwnerVerifyPacket(V41OwnerInputPacket &p, const V41FullGraph &g, size_t rank,
+                                 const DeepSeekV41EngramMeta &meta, int ngram, int heads) {
+    constexpr int rows = FastllmV41OwnerVerifyRows;
+    if (!meta.loaded || meta.tokenMap.empty() || ngram < 2 || ngram > 9 || heads < 1) return;
+    const size_t rowBytes = size_t(rows) * (ngram - 1) * heads * sizeof(int64_t);
+    size_t offset = rows * sizeof(int) * (p.positionOffset ? 2 : 1);
+    std::vector<int64_t> params;
+    for (const auto &entry : g.engrams) {
+        const auto &e = *entry.second;
+        const auto &owner = *e.owners[rank];
+        if (!e.table->gpuTable || owner.rowOffset != offset || owner.maskOffset != offset + rowBytes ||
+            !meta.AppendVerifyHashParameters(e.index, ngram, heads, e.table->rows, params)) return;
+        offset = owner.maskOffset + rows * sizeof(float);
+    }
+    if (offset != p.device.GetBytes()) return;
+    auto upload = [&](Data &dst, const void *source, size_t bytes) {
+        dst.dataType = INT8;
+        dst.UpdateUnitSize();
+        dst.Resize({int(bytes)});
+        dst.ToDevice(CUDA, {g.devices[rank]}, false);
+        dst.Allocate(false);
+        FastllmCudaCopyFromHostToDevice(dst.cudaData, const_cast<void *>(source), bytes);
+    };
+    upload(p.verifyMap, meta.tokenMap.data(), meta.tokenMap.size() * sizeof(int));
+    upload(p.verifyHash, params.data(), params.size() * sizeof(int64_t));
+    // Capture includes a warm execution of embedding before any request is published.
+    FastllmCudaCopyFromHostToDevice(p.device.cudaData, p.host, offset);
+}
+
+bool V41PublishOwnerDraft(V41OwnerInputPacket &p, int device, const DeepSeekV41Segment &seg,
+                          const DeepSeekV41EngramMeta &meta, int imageToken, int layers, int ngram, int heads) {
+    const auto &scratch = *seg.spec;
+    FastllmV41VerifyHistory history{};
+    for (int j = 0; j < ngram - 1; ++j)
+        history.previous[j] = seg.startPos > j ? seg.state->engramHistory[seg.startPos - 1 - j] : -1;
+    FastllmCudaCurrentThreadStreamWaitEvent(scratch.verifyReady);
+    return FastllmCudaMemcpyPeerAsyncCurrentThread(device, static_cast<int *>(p.device.cudaData) + 1,
+               scratch.verifyProducer, scratch.ownerDraftIds, (FastllmV41OwnerVerifyRows - 1) * sizeof(int)) &&
+           FastllmCudaV41BuildOwnerVerifyPacket(p.device.cudaData, p.positionOffset != 0, seg.startPos,
+               scratch.ownerAnchor, static_cast<const int *>(p.verifyMap.cudaData), meta.tokenMap.size(),
+               meta.padCompressedId, imageToken, static_cast<const int64_t *>(p.verifyHash.cudaData),
+               layers, ngram, heads, history);
+}
+#endif
 
 // Match the captured row counts, but not request identities or their order.
 // KV pointers and positions are uploaded anew; the persistent permutation is
@@ -1275,6 +1323,9 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
                     p.host = FastllmCudaHostMalloc(bytes);
                     if (!p.host) { g->inputPackets.clear(); break; }
                     std::memset(p.host, 0, bytes);
+                    if (multiVerify && owner.batch == FastllmV41OwnerVerifyRows &&
+                        !g->engrams.empty() && g->engrams.size() == engram_layer_ids.size())
+                        V41PrepareOwnerVerifyPacket(p, *g, r, engramMeta, engram_max_ngram_size, engram_n_heads);
                     for (auto &entry : g->engrams) {
                         auto &o = *entry.second->owners[r];
                         o.packetMask.FakeFrom(p.device, o.maskOffset);
@@ -1296,7 +1347,7 @@ void DeepSeekV41Model::BuildFullDecodeGraph(
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
                     if (!g->inputPackets.empty()) {
                         auto &p = *g->inputPackets[rank];
-                        AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                        if (!p.verifyMap.cudaData) AssertInFastLLM(FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
                             p.device.cudaData, p.host, p.device.GetBytes()), "owner input packet copy failed");
                         ids = static_cast<const int *>(p.device.cudaData);
                         if (p.positionOffset) {
@@ -2290,6 +2341,31 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     V41FullCallerAffinity affinity(g->coordinatorCpus);
     const auto *staged = f.inputSegments.size() == 1 ? f.inputSegments.front().spec : nullptr;
     if (staged && !staged->resolveDraftIds) staged = nullptr;
+    const bool batchPacket = std::any_of(f.inputSegments.begin(), f.inputSegments.end(),
+        [](const auto &seg) { return seg.spec && seg.spec->ownerDraftIds && seg.spec->resolveDraftIds; });
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+    std::vector<const DeepSeekV41Segment *> ownerDrafts;
+#endif
+    if (batchPacket) {
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+        if (!g->verifying || !g->capturesInput || !g->attentionRuntime ||
+            g->attentionRuntime->Layout().attentionTP != 1 || g->engramWorker ||
+            g->inputPackets.size() != g->devices.size() || f.inputSegments.size() != g->devices.size()) return false;
+        ownerDrafts.resize(g->devices.size());
+        for (const auto &seg : f.inputSegments) {
+            const int owner = seg.state->attentionGroup;
+            if (owner < 0 || size_t(owner) >= ownerDrafts.size() || ownerDrafts[owner] ||
+                !g->inputPackets[owner] || !g->inputPackets[owner]->verifyMap.cudaData ||
+                seg.seqlen != FastllmV41OwnerVerifyRows || !seg.spec || !seg.spec->ownerDraftIds ||
+                !seg.spec->verifyReady || seg.spec->ownerAnchor < 0 ||
+                size_t(seg.spec->ownerAnchor) >= engramMeta.tokenMap.size() ||
+                seg.startPos < 0 || seg.state->engramHistory.size() != size_t(seg.startPos)) return false;
+            ownerDrafts[owner] = &seg;
+        }
+#else
+        return false;
+#endif
+    }
     if (staged) {
         const size_t offset = size_t(block_cnt) * g->batch * sizeof(FastllmV41FullDecodeRequest);
         if (!g->verifying || !g->capturesInput || !g->attentionRuntime || !g->ownerInputIds.empty() ||
@@ -2297,7 +2373,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
             g->requests.GetBytes() != offset + staged->verifyPacketBytes || g->engrams.size() != engram_layer_ids.size() ||
             std::any_of(g->engrams.begin(), g->engrams.end(), [](const auto &e) { return !e.second->table->gpuTable; })) return false;
     }
-    if (g->capturesInput && !staged) {
+    if (g->capturesInput && !staged && !batchPacket) {
         if ((int)f.tokenIds.size() != g->batch) return false;
         const int vocab = weight["embed.weight"].dims[0];
         for (int i = 0; i < g->batch; ++i) {
@@ -2339,7 +2415,8 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
             if (!g->inputPackets.empty() && g->inputPackets[r]) g->inputPackets[r]->order = order;
 #endif
-            for (size_t i = 0; i < order.size(); ++i) g->ownerHostIds[r][i] = f.tokenIds[order[i]];
+            if (!batchPacket)
+                for (size_t i = 0; i < order.size(); ++i) g->ownerHostIds[r][i] = f.tokenIds[order[i]];
         }
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
         residentInputs = !g->verifying && fixed && !g->inputPackets.empty();
@@ -2361,7 +2438,7 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
                    entry.second->table->gpuTable && !entry.second->asyncGraph;
         });
 #endif
-    if (!directHash && !staged) {
+    if (!directHash && !staged && !batchPacket) {
         const auto snapshots = V41SnapshotSegments(f.inputSegments, engram_max_ngram_size);
         for (auto &entry : g->engrams) {
             auto &e = *entry.second;
@@ -2375,15 +2452,15 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
         }
     }
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
-    for (size_t r = 0; r < g->inputPackets.size(); ++r) if (g->inputPackets[r]) {
+    for (size_t r = 0; !batchPacket && r < g->inputPackets.size(); ++r) if (g->inputPackets[r]) {
         auto &p = *g->inputPackets[r];
         auto *data = static_cast<uint8_t *>(p.host);
         const auto &ids = g->ownerHostIds[r];
         std::memcpy(data, ids.data(), ids.size() * sizeof(int));
         if (p.positionOffset) {
             auto *positions = reinterpret_cast<int *>(data + p.positionOffset);
-            for (size_t i = 0; i < p.order.size(); ++i)
-                positions[i] = f.inputSegments[p.order[i]].startPos;
+            for (const auto &seg : attentionSegments[r])
+                for (int i = 0; i < seg.seqlen; ++i) positions[seg.offset + i] = seg.startPos + i;
         }
         for (const auto &entry : g->engrams) {
             const auto &e = *entry.second;
@@ -2448,6 +2525,16 @@ bool DeepSeekV41Model::TryFullDecodeGraph(ForwardWorkspace &f, bool inputsPrepar
     auto dispatchReplay = [&] { return V41FullDispatch(*g, [&](int rank, int device) {
         if (!residentInputs) {
             uploaded[rank] = staged || V41FullUploadRank(*g, f.inputSegments, rank, device);
+#ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
+            if (!g->inputPackets.empty() && g->inputPackets[rank] && g->inputPackets[rank]->verifyMap.cudaData) {
+                auto &p = *g->inputPackets[rank];
+                if (batchPacket) {
+                    uploaded[rank] &= V41PublishOwnerDraft(p, device, *ownerDrafts[rank], engramMeta,
+                        image_token_id, g->engrams.size(), engram_max_ngram_size, engram_n_heads);
+                } else uploaded[rank] &= FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(
+                    p.device.cudaData, p.host, p.device.GetBytes());
+            }
+#endif
             auto *packetDestination = staged ? static_cast<uint8_t *>(V41FullLocal(g->requests, device).cudaData) +
                 size_t(block_cnt) * g->batch * sizeof(FastllmV41FullDecodeRequest) : nullptr;
             bool published = false;

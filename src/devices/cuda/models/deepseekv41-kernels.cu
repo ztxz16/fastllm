@@ -8391,17 +8391,13 @@ bool FastllmCudaV41UploadFullDecodeBatch(void *storage, void *const *plans, size
 }
 
 namespace {
-__global__ void V41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *map, int vocab,
-        int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
-        FastllmV41VerifyHistory history, int64_t *result) {
-    const int row = blockIdx.x, layer = blockIdx.y, cols = (ngram - 1) * heads;
-    const int token = row ? ids[row] : anchor;
-    float *masks = reinterpret_cast<float *>(result + size_t(layers) * rows * cols);
+// Both packet formats use the same compressed history, signed modulo and padding rule.
+__device__ void V41VerifyEngramRow(const int *ids, int anchor, int row, const int *map,
+        int vocab, int pad, int imageToken, const int64_t *parameters, int layer, int ngram, int heads,
+        FastllmV41VerifyHistory history, int64_t *buckets, float *mask) {
+    const int cols = (ngram - 1) * heads;
     auto compress = [&](int id) { return id >= 0 && id < vocab && id != imageToken ? map[id] : -1; };
-    if (threadIdx.x == 0) {
-        masks[layer * rows + row] = compress(token) < 0 ? 0.f : 1.f;
-        if (layer == 0) masks[layers * rows + row] = float(token);
-    }
+    if (!threadIdx.x) *mask = compress(row ? ids[row] : anchor) < 0 ? 0.f : 1.f;
     const int64_t *mul = parameters + layer * (ngram + 2 * cols);
     for (int col = threadIdx.x; col < cols; col += blockDim.x) {
         uint64_t hash = 0;
@@ -8414,7 +8410,34 @@ __global__ void V41DraftVerifyPacket(const int *ids, int anchor, int rows, const
         }
         const int64_t prime = mul[ngram + col];
         const int64_t bucket = int64_t(hash) % prime;
-        result[(layer * rows + row) * cols + col] = mul[ngram + cols + col] + (bucket < 0 ? bucket + prime : bucket);
+        buckets[col] = mul[ngram + cols + col] + (bucket < 0 ? bucket + prime : bucket);
+    }
+}
+
+__global__ void V41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *map, int vocab,
+        int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
+        FastllmV41VerifyHistory history, int64_t *result) {
+    const int row = blockIdx.x, layer = blockIdx.y, cols = (ngram - 1) * heads;
+    const size_t index = size_t(layer) * rows + row;
+    auto *masks = reinterpret_cast<float *>(result + size_t(layers) * rows * cols);
+    V41VerifyEngramRow(ids, anchor, row, map, vocab, pad, imageToken, parameters, layer, ngram, heads,
+                       history, result + index * cols, masks + index);
+    if (!layer && !threadIdx.x) masks[layers * rows + row] = float(row ? ids[row] : anchor);
+}
+
+__global__ void V41OwnerVerifyPacket(int *ids, int anchor, bool positions, int start, const int *map,
+        int vocab, int pad, int imageToken, const int64_t *parameters, int ngram, int heads,
+        FastllmV41VerifyHistory history) {
+    constexpr int rows = FastllmV41OwnerVerifyRows;
+    const int row = blockIdx.x, layer = blockIdx.y, cols = (ngram - 1) * heads;
+    auto *result = reinterpret_cast<int64_t *>(ids + (positions ? 2 * rows : rows));
+    auto *layerRows = result + size_t(layer) * (rows * cols + rows / 2);
+    auto *masks = reinterpret_cast<float *>(layerRows + rows * cols);
+    V41VerifyEngramRow(ids, anchor, row, map, vocab, pad, imageToken, parameters, layer, ngram, heads,
+                       history, layerRows + row * cols, masks + row);
+    if (!layer && !threadIdx.x) {
+        if (!row) ids[0] = anchor;
+        if (positions) ids[rows + row] = start + row;
     }
 }
 }
@@ -8543,6 +8566,17 @@ bool FastllmCudaV41DraftVerifyPacketOnStream(const int *ids, int anchor, int row
     V41DraftVerifyPacket<<<dim3(rows, layers), 64, 0, stream ? (cudaStream_t)stream : cudaStreamPerThread>>>(ids, anchor, rows, map, vocab,
         pad, imageToken, parameters, layers, ngram, heads, history, static_cast<int64_t *>(packet));
     return V41CheckLaunch("DraftVerifyPacket");
+}
+
+bool FastllmCudaV41BuildOwnerVerifyPacket(void *packet, bool positions, int start, int anchor,
+        const int *map, int vocab, int pad, int imageToken, const int64_t *parameters,
+        int layers, int ngram, int heads, FastllmV41VerifyHistory history) {
+    if (!packet || !map || !parameters || layers < 1 || ngram < 2 || ngram > 9 || heads < 1 ||
+        start < 0 || anchor < 0 || anchor >= vocab) return false;
+    V41OwnerVerifyPacket<<<dim3(FastllmV41OwnerVerifyRows, layers), 64, 0, cudaStreamPerThread>>>(
+        static_cast<int *>(packet), anchor, positions, start, map, vocab, pad, imageToken,
+        parameters, ngram, heads, history);
+    return V41CheckLaunch("OwnerVerifyPacket");
 }
 
 bool FastllmCudaV41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *map,

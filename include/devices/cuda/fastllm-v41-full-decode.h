@@ -91,6 +91,12 @@ bool FastllmCudaV41ResolveDraft(const float *target, int stride, const int *draf
 struct FastllmV41VerifyHistory {
     int previous[8]; // newest first, already compressed, -1 at image/sequence boundaries
 };
+// Owner-local layout: integer IDs, optional positions, then (int64 buckets, float masks) per layer.
+// The caller has copied five proposed IDs to slots 1..5. Slot 0 is the scheduler anchor.
+constexpr int FastllmV41OwnerVerifyRows = 6;
+bool FastllmCudaV41BuildOwnerVerifyPacket(void *packet, bool positions, int start, int anchor,
+    const int *tokenMap, int vocab, int pad, int imageToken, const int64_t *parameters,
+    int layers, int ngram, int heads, FastllmV41VerifyHistory history);
 bool FastllmCudaV41DraftVerifyPacket(const int *ids, int anchor, int rows, const int *tokenMap,
     int vocab, int pad, int imageToken, const int64_t *parameters, int layers, int ngram, int heads,
     FastllmV41VerifyHistory history, void *packet);

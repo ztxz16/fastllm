@@ -3455,6 +3455,21 @@ namespace fastllm {
 
     // ==================== Engram 前向 ====================
 
+    bool DeepSeekV41EngramMeta::AppendVerifyHashParameters(int layer, int ngram, int heads, int64_t tableRows,
+                                                           std::vector<int64_t> &parameters) const {
+        if (layer < 0 || size_t(layer) >= multipliers.size() || size_t(layer) >= primes.size() ||
+            size_t(layer) >= offsets.size() || ngram < 2 || ngram > 9 || heads <= 0) return false;
+        const size_t cols = size_t(ngram - 1) * heads;
+        const auto &m = multipliers[layer], &p = primes[layer], &o = offsets[layer];
+        if (m.size() != size_t(ngram) || p.size() != cols || o.size() != cols) return false;
+        for (size_t i = 0; i < cols; ++i)
+            if (p[i] <= 0 || o[i] < 0 || o[i] > tableRows - p[i]) return false;
+        parameters.insert(parameters.end(), m.begin(), m.end());
+        parameters.insert(parameters.end(), p.begin(), p.end());
+        parameters.insert(parameters.end(), o.begin(), o.end());
+        return true;
+    }
+
     namespace {
         // 自由函数版的哈希计算：预取线程不持有 model，只需要元数据与两个尺寸。
         void V41ComputeEngramHashes(const DeepSeekV41EngramMeta &engramMeta, int engramLayerIndex,
@@ -5538,12 +5553,14 @@ namespace fastllm {
     bool DeepSeekV41Model::ForwardState::FullGraph(bool inputsPrepared) {
 #ifdef USE_CUDA
         const bool replayed = work->model.TryFullDecodeGraph(*work, inputsPrepared);
-        auto *scratch = work->inputSegments.front().spec;
-        if (scratch && scratch->resolveDraftIds) {
-            auto resolve = std::move(scratch->resolveDraftIds);
+        bool resolved = false;
+        for (const auto &segment : work->inputSegments) {
+            if (!segment.spec || !segment.spec->resolveDraftIds) continue;
+            auto resolve = std::move(segment.spec->resolveDraftIds);
             resolve();
-            work->model.PrepareTokenHistory(*work);
+            resolved = true;
         }
+        if (resolved) work->model.PrepareTokenHistory(*work);
         return replayed;
 #else
         return false;
@@ -6060,8 +6077,9 @@ namespace fastllm {
         }
 #endif
 
-        if (f.inputSegments.size() != 1 || !f.inputSegments.front().spec || !f.inputSegments.front().spec->resolveDraftIds)
-            PrepareTokenHistory(f);
+        if (std::none_of(f.inputSegments.begin(), f.inputSegments.end(), [](const auto &s) {
+                return s.spec && s.spec->resolveDraftIds;
+            })) PrepareTokenHistory(f);
 
         dim = embed_dim;
         headDim = head_dim_full;

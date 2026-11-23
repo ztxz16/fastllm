@@ -90,6 +90,7 @@ namespace fastllm {
     };
 
     struct DeepSeekV41DsparkWorkspace;
+    struct DeepSeekV41BatchProposal;
     struct DeepSeekV41SpecScratch;
     struct DeepSeekV41DsparkState {
         ~DeepSeekV41DsparkState();
@@ -118,6 +119,8 @@ namespace fastllm {
         // 已经校验通过、等待调度器逐个取走的 token：(期望的输入 token, 应返回的 token)
         std::deque<std::pair<int, int> > pending;
         uint64_t rounds = 0, proposed = 0, accepted = 0;
+        std::shared_ptr<DeepSeekV41BatchProposal> batchProposal;
+        int proposalRow = -1;
     };
 
     // 一次"校验前向"里需要额外记录的信息：延后的滑窗写入、压缩缓存的回滚点、
@@ -156,6 +159,8 @@ namespace fastllm {
         std::vector<int> prevBlocks;          // kv source 层：前向之前的压缩块数
         std::vector<int> tokens, draftTokens;
         int acceptedDrafts = -1;      // 采样校验给出接受前缀长度；-1 表示按 greedy token 比较
+        const int *ownerDraftIds = nullptr; // Five device candidates, excluding the scheduler anchor.
+        int ownerAnchor = -1;
     };
 
     struct DeepSeekV41EngramPrefetch;
@@ -230,6 +235,8 @@ namespace fastllm {
         std::vector<std::vector<int64_t> > multipliers;  // [engramLayer][maxNgram]
         std::vector<std::vector<int64_t> > primes;       // [engramLayer][(maxNgram-1)*heads]
         std::vector<std::vector<int64_t> > offsets;      // [engramLayer][(maxNgram-1)*heads]
+        bool AppendVerifyHashParameters(int layer, int ngram, int heads, int64_t tableRows,
+                                        std::vector<int64_t> &parameters) const;
     };
 
     struct DeepSeekV41MoeContext;
