@@ -534,8 +534,13 @@ class Decoder final : public Runtime {
         }
     };
 
+    bool usesVerifyArithmetic(const std::vector<Segment> &batch) const {
+        // A draft-enabled target must agree across singleton decode and multi-row verification.
+        return decodeArithmetic || (c.draft.steps > 0 && batch.front().decode);
+    }
+
     Projection attentionProjection(const std::vector<Segment> &batch) const {
-        return bf16Mma && (decodeArithmetic || batch.front().decode) ? Projection::AttentionMma : Projection::Default;
+        return bf16Mma && usesVerifyArithmetic(batch) ? Projection::AttentionMma : Projection::Default;
     }
 
     template<class T> AttentionProjection<T> projectAttention(const std::array<Rows<T>, 3> &inputs,
@@ -582,7 +587,10 @@ class Decoder final : public Runtime {
             const int queries = batch.front().timeline ? attended.rows : 1;
             Matrix q(queries, c.heads * d), bias(queries * c.heads, c.extent);
             const bool usePagedVerify = verifyAttentionSplits > 0 && std::is_same_v<KV, half>;
-            const int splits = usePagedVerify ? verifySplitCount(verifyAttentionSplits, window, GetPageLen())
+            // One window query can spread its KV tiles across more SMs. A speculative
+            // target keeps the same partitions for both singleton and chain evaluation.
+            const int minTiles = window && !usesVerifyArithmetic(batch) ? 1 : VerifyPartition::minTiles;
+            const int splits = usePagedVerify ? verifySplitCount(verifyAttentionSplits, window, GetPageLen(), minTiles)
                                               : splitScratch.rows;
             Matrix scratch = queries == 1 ? splitScratch : Matrix(splits, splitScratch.cols * queries);
             auto evaluate = [&](int row, const DecodeVisit *visit) {
@@ -612,7 +620,7 @@ class Decoder final : public Runtime {
                                   window, c.logFloor, c.logAlpha, sink.stride, gate.stride};
                 if (usePagedVerify) {
                     launchVerifyAttention(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
-                                       queries, batch.front().timeline ? batch.front().length : 1, splits, smCount);
+                                       queries, batch.front().timeline ? batch.front().length : 1, splits, smCount, minTiles);
                 } else if (d == 128) launchSplitRelative<128, KV>(args, scratch, sink.data, gate.data,
                                                           attended.p + size_t(row) * attended.cols, sm120GlobalSplits,
                                                           queries, batch.front().timeline ? batch.front().length : 1);
@@ -993,10 +1001,10 @@ class Decoder final : public Runtime {
                                       cudaStreamPerThread));
             }
         }
-        const bool incremental = decodeArithmetic || batch.front().decode;
+        const bool verifyMath = usesVerifyArithmetic(batch);
         auto headInput = castRows<T>(last);
         if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-            if (incremental && bf16Mma) {
+            if (verifyMath && bf16Mma) {
                 const auto &head = weights.weight.at("model.llm.unembed.weight");
                 if (head.dataType == BFLOAT16 && head.dims.size() == 2 && head.dims[0] >= c.vocab &&
                     head.dims[1] == h &&
@@ -1006,7 +1014,7 @@ class Decoder final : public Runtime {
         }
         Rows<T> projected(last.rows, c.vocab);
         projectInto(headInput, "unembed.weight", projected, 0, 1,
-                    incremental ? Projection::DecodeHead : Projection::Default);
+                    verifyMath ? Projection::DecodeHead : Projection::Default);
         size_t nLogits = size_t(logits.rows) * logits.cols;
         softcap<<<(nLogits + 255) / 256, 256, 0, cudaStreamPerThread>>>(projected.p, logits.p, nLogits, c.logitCap);
     }

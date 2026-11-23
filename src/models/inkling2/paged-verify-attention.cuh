@@ -20,7 +20,7 @@ using VerifyTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal, 32,
 
 struct VerifyPrefillParams : PrefillParams<half, 128> {
     const DecodeVisit *visits;
-    int chain, maxSplits;
+    int chain, maxSplits, minTilesPerSplit;
 };
 
 // Partition by absolute position. Rows on opposite sides of a grain
@@ -29,7 +29,7 @@ struct VerifyPrefillParams : PrefillParams<half, 128> {
 struct VerifyPartition {
     static constexpr int minTiles = 4;
     int origin, chunk, first, end;
-    __device__ VerifyPartition(const DecodeVisit &visit, int row, int live, int limit, int windowLeft) {
+    __device__ VerifyPartition(const DecodeVisit &visit, int row, int live, int limit, int windowLeft, int minimum) {
         // Keep the same origin in a packed chain and in single-row decode.
         // Only pages intersecting the window are addressed, even after eviction.
         int past = visit.past;
@@ -37,9 +37,9 @@ struct VerifyPartition {
         past -= origin;
         constexpr int tile = VerifyTraits::CTA_TILE_KV;
         const int tiles = (past + row) / tile + 1;
-        const int grain = max(minTiles, (tiles - 1) / limit + 1);
+        const int grain = max(minimum, (tiles - 1) / limit + 1);
         chunk = grain * tile;
-        first = grain == minTiles ? 0 : int(max(0LL, 1LL * (grain - 1) * tile * limit - past));
+        first = grain == minimum ? 0 : int(max(0LL, 1LL * (grain - 1) * tile * limit - past));
         end = int(min(static_cast<long long>(live), 1LL * chunk * limit - past));
         if (windowLeft >= 0) {
             if (origin) first = max(first, windowLeft - past);
@@ -49,9 +49,9 @@ struct VerifyPartition {
 };
 
 // The first visible key may lie partway through its page.
-int verifySplitCount(int limit, int window, int pageLen) {
+int verifySplitCount(int limit, int window, int pageLen, int minTiles) {
     if (!window) return limit;
-    constexpr int grain = VerifyPartition::minTiles * VerifyTraits::CTA_TILE_KV;
+    const int grain = minTiles * VerifyTraits::CTA_TILE_KV;
     return int(std::min<int64_t>(limit, (int64_t(window) - 1 + pageLen + grain - 1) / grain));
 }
 
@@ -89,7 +89,7 @@ __global__ __launch_bounds__(VerifyTraits::NUM_THREADS) void pagedVerifyAttentio
     const DecodeVisit &visit = p.visits[first];
     const int live = p.chain == 1 ? 1 : visit.verifyRemaining;
     for (int row = 0; row < live;) {
-        const VerifyPartition part(visit, row, live, p.maxSplits, p.window_left);
+        const VerifyPartition part(visit, row, live, p.maxSplits, p.window_left, p.minTilesPerSplit);
         verifySegment(p, p.visits[first + row], first + row, part.end - row, tile, blockIdx.y, part);
         row = part.end;
         if (row < live) __syncthreads();
@@ -114,7 +114,7 @@ __global__ void mergeVerifyAttention(VerifyPrefillParams p, const Act *sinks, co
         for (int j = 0; j < channels; ++j) out[dst + j] = Act(0.f);
         return;
     }
-    const VerifyPartition part(visit, local, live, p.maxSplits, p.window_left);
+    const VerifyPartition part(visit, local, live, p.maxSplits, p.window_left, p.minTilesPerSplit);
     const int past = visit.past - part.origin;
     const int splits = (past + part.end - 1) / part.chunk + 1, active = (past + local) / part.chunk + 1;
     const size_t base = (size_t(first + part.first) * p.maxSplits + size_t(local - part.first) * splits) * p.num_qo_heads + head;
@@ -155,7 +155,7 @@ __global__ void mergeVerifyAttention(VerifyPrefillParams p, const Act *sinks, co
 
 template<class Act>
 void launchVerifyAttention(const AttentionRow &a, const Matrix &scratch, const Act *sink, const Act *gate,
-                        Act *out, int rows, int chain, int maxSplits, int smCount) {
+                        Act *out, int rows, int chain, int maxSplits, int smCount, int minTiles) {
     VerifyPrefillParams p{};
     p.q = reinterpret_cast<half *>(const_cast<float *>(a.q));
     p.o = scratch.p;
@@ -163,6 +163,7 @@ void launchVerifyAttention(const AttentionRow &a, const Matrix &scratch, const A
     p.visits = a.visit;
     p.chain = chain;
     p.maxSplits = maxSplits;
+    p.minTilesPerSplit = minTiles;
     p.relative = a.relative;
     p.distances = a.distances;
     p.floor = a.floor;
