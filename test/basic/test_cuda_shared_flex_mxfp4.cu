@@ -75,7 +75,7 @@ struct RankData {
     template<class T> T *allocate(size_t count) {
         T *ptr=nullptr; check(cudaMalloc(&ptr,count*sizeof(T))); buffers.push_back(ptr); return ptr;
     }
-    BF *x, *y[2]; int *ids; float *probs, *router;
+    BF *x, *y[2]; int *ids; float *probs, *router, *bias;
 };
 // Check the producer in isolation, including graph replay with different inputs.
 __global__ void referenceRouterSelection(const float *router, const float *bias, int *ids, float *prob) {
@@ -168,13 +168,14 @@ void testResidualRouter(void *fp4, void *fp8, RankData &data) {
     }
     std::puts("residual router: BF16 residual/norm, K32 bytes, top-k, graph replay PASS");
 }
-void test(bool ep) {
+void test(bool ep, bool verifyPages = false) {
     const int experts=ep?32:256, inter=ep?2048:256;
     std::array<RankData,Ranks> data;
     std::array<double,Ranks> peak{};
     int devices[]={0,1,2,3,4,5,6,7};
     void *states[2]{};
     auto create=ep?fastshared_ep_create:fastshared_tp_create;
+    auto pack = verifyPages ? fastshared_tp_pack_mxfp4_verify : fastshared_tp_pack_mxfp4;
     auto bind=ep?fastshared_ep_bind:fastshared_tp_bind;
     auto run=ep?fastshared_ep_run:fastshared_tp_run;
     auto destroy=ep?fastshared_ep_destroy:fastshared_tp_destroy;
@@ -199,10 +200,14 @@ void test(bool ep) {
         check(cudaStreamSynchronize(cudaStreamPerThread));
         require(bind(states[0],r,0,values[0],values[1],scales[0],scales[1])==0,"reference bind");
         require((ep?fastshared_ep_bind_format(states[1],r,0,compact[0],compact[1],epScale[0],epScale[1],true)
-                   :fastshared_tp_pack_mxfp4(states[1],r,0,pointers.data()))==0,"MXFP4 bind");
+                   :pack(states[1],r,0,pointers.data()))==0,"MXFP4 bind");
         a.x=a.allocate<BF>(MaxRows*Hidden); a.ids=a.allocate<int>(MaxRows*TopK);
         a.probs=a.allocate<float>(MaxRows*TopK);
-        if (!ep) a.router=a.allocate<float>(MaxRows*256);
+        if (!ep) {
+            a.router=a.allocate<float>(MaxRows*256);
+            a.bias=a.allocate<float>(256);
+            check(cudaMemset(a.bias,0,256*sizeof(float)));
+        }
         for (auto &y:a.y) y=a.allocate<BF>(MaxRows*Hidden);
     }
     // Return to one row after a prepared batch to cover reused counters and mailbox generations.
@@ -216,14 +221,14 @@ void test(bool ep) {
             check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
             if (!prepared) require(run(states[j],r,0,rows,a.x,a.ids,a.probs,a.y[j])==0,"capture");
             else if (!j) {
-                require(fastshared_tp_run_router(states[j],r,0,rows,a.x,a.router,nullptr,
+                require(fastshared_tp_run_router(states[j],r,0,rows,a.x,a.router,rows==8 ? a.bias : nullptr,
                     a.ids,a.probs,a.y[j],1,1.f)==0,"reference routing");
             } else {
                 FastllmMoePreparedInput input{};
                 require(fastshared_tp_prepared_input(states[j],r,rows,&input) && !input.block128,
                     "native K32 prepared input");
                 prepareInput<<<rows*Hidden/256,256,0,cudaStreamPerThread>>>(a.x,input);
-                require(fastshared_tp_run_prepared(states[j],r,0,rows,a.router,nullptr,
+                require(fastshared_tp_run_prepared(states[j],r,0,rows,a.router,rows==8 ? a.bias : nullptr,
                     a.ids,a.probs,a.y[j],1,1.f)==0,"prepared routing");
             }
             check(cudaStreamEndCapture(cudaStreamPerThread,&graph));
@@ -267,7 +272,7 @@ void test(bool ep) {
         }
         for (auto graph:graphs) check(cudaGraphExecDestroy(graph));
     });
-    printf("%s all_rank_max_row_l2=%.8g\n",ep?"EP":"TP",*std::max_element(peak.begin(),peak.end()));
+    printf("%s all_rank_max_row_l2=%.8g\n",ep?"EP":verifyPages?"TP-pages":"TP",*std::max_element(peak.begin(),peak.end()));
     if (!ep) testResidualRouter(states[1],states[0],data[0]);
     for (auto state:states) destroy(state);
     onRanks([&](int r) { for (auto p:data[r].buffers) check(cudaFree(p)); });
@@ -276,6 +281,6 @@ void test(bool ep) {
 int main() {
     int devices[]={0,1,2,3,4,5,6,7};
     if (!fastshared_tp_supported(devices,8) || !fastshared_ep_supported(devices,8)) return 77;
-    try { test(false); test(true); }
+    try { test(false); test(false,true); test(true); }
     catch (const std::exception &e) { fprintf(stderr,"%s\n",e.what()); return 1; }
 }

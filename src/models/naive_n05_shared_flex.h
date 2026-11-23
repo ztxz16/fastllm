@@ -64,7 +64,7 @@ struct NaiveSharedFlexMoe {
     bool Supports(int rows) const { return rows > 0 && (!ep || rows <= 8); }
 
     NaiveSharedFlexMoe(const std::vector<int> &devices, const Weights &weights,
-                       FastllmCudaMimoEp8Mega *mega) : ep(mega != nullptr) {
+                       FastllmCudaMimoEp8Mega *mega, bool preferVerifyPages) : ep(mega != nullptr) {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         AssertInFastLLM(DeviceSupported(devices) && weights.size() == 8 &&
             (ep || TPWeightsSupported(weights, devices)), "Shared Flex admission was not completed.");
@@ -98,8 +98,9 @@ struct NaiveSharedFlexMoe {
                                 scales.insert(scales.end(), ws[i]->scales.begin(), ws[i]->scales.end());
                             }
                         }
+                        auto packMx = preferVerifyPages ? fastshared_tp_pack_mxfp4_verify : fastshared_tp_pack_mxfp4;
                         const int result = mxfp4
-                            ? fastshared_tp_pack_mxfp4(state, rank, layer, pointers.data())
+                            ? packMx(state, rank, layer, pointers.data())
                             : fastshared_tp_pack(state, rank, layer, pointers.data(), gs.data(), ds.data());
                         AssertInFastLLM(result == 0, "Shared Flex TP packing failed.");
                         for (int i = 2; i < 514; ++i) released += ReleasePackedMoeSource(*ws[i]);

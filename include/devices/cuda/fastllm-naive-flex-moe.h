@@ -13,6 +13,7 @@ struct FastllmMoePreparedInput {
     bool routed = false;
     // Consumer preference decided during backend setup, before graph capture.
     bool preferFusedSelection = false;
+    bool overlapVerifyGate = false;
     int *indices = nullptr, *jobs = nullptr, *count = nullptr;
     int *unique = nullptr, *experts = nullptr, *members = nullptr, *rowCounts = nullptr;
     float *scores = nullptr;
@@ -142,6 +143,7 @@ int fastshared_tp_run_preselected(void *state, int rank, int layer, int rows,
     const int *ids, const float *scores, void *output);
 int fastshared_ep_bind_format(void *, int rank, int layer, const void *, const void *,
                               const void *, const void *, bool mxfp4);
+int fastshared_tp_pack_mxfp4_verify(void *, int rank, int layer, const uint64_t *expertPointers);
 int fastshared_tp_pack_mxfp4(void *, int rank, int layer, const uint64_t *expertPointers);
 int fastshared_tp_pack(void *, int rank, int layer, const uint64_t *, const float *, const float *);
 }

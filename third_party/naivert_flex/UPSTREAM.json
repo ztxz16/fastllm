@@ -122,5 +122,31 @@
       "naivert/common/prepared_mlp_input_layout.hpp": "73b7f7fdf2e6e7ae625fdfb795ab451dcc2ce41fb479f49968f0faf8d5b1625b"
     },
     "changes": "Row-major TMA weights, FastLLM router semantics, in-place block-128 rebasing, paired MXFP8/32 output, balanced work distribution, compact expert-member scheduling for up to thirty-two rows and direct FP32 accumulation; no runtime dependency on NaiveRT."
+  },
+  "mxfp4_verify8": {
+    "source_commit": "1f29706edb0faae9d3b58ff0ac48bb2637117dce",
+    "changes": "Eight-row W4A8 gate, down and TP reduction. Reads native MXFP4 weights or packs verification pages directly from the checkpoint. Full and partial batches reuse the owned weights, K32 scales, activations and TP mailboxes. Preserves ordered routing, BF16 activation rounding and pre-quantization route weights.",
+    "adapters": {
+      "src/devices/cuda/moe/fastllm-shared-flex-verify8.cu": {
+        "source": "naivert/entry/moe_rows8_entry.cu",
+        "original_sha256": "99a352040bb5254788a0950bd4507fb435cd973dc0106d1e10ad6a6874289e37",
+        "installed_sha256": "ad230a8290dfcdfcc63d4aedf3e2d3b74840ec8d066096dd3e615e2f950a1ac5"
+      },
+      "src/devices/cuda/moe/verify8/gate.cuh": {
+        "source": "naivert/body/moe_rows8/select_gate_up.cuh",
+        "original_sha256": "b28e394ba95cab83b793f5cd2d3b6909f50f98d701000c981316a00c024da7b8",
+        "installed_sha256": "c130573e61755759a9b0988228bf1333a59e9dff4fc60b744557a937dfc1c4d2"
+      },
+      "src/devices/cuda/moe/verify8/down-layout.cuh": {
+        "source": "naivert/body/moe_rows8/down_common.cuh",
+        "original_sha256": "ef913bcccbbf73077749f29f916cb5262e247ad4c6b4f903e66d9ce1959c8ca7",
+        "installed_sha256": "b1877dd3d914077a3f738e17e30cd19d9f65df99d9b702fe70a41bc83b6fd60d"
+      },
+      "src/devices/cuda/moe/verify8/down.cuh": {
+        "source": "naivert/body/moe_rows8/down_per_token.cuh",
+        "original_sha256": "1caa38c40b679ca7c0980ece31be9af884fc476d660168b5dc4f7edda9260793",
+        "installed_sha256": "d9b46c048c8be4da3883ec0b10cb6f81f5b6288f82d45bd15496f2605fb76f86"
+      }
+    }
   }
 }

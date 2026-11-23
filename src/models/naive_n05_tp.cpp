@@ -580,7 +580,8 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         fprintf(stderr, "[Naive MoE fallback] Flex cannot use the packed EP layout; retaining MegaMoE.\n");
     }
     if (tpMoeBackend == NaiveMoeBackend::FlexTP || tpMoeBackend == NaiveMoeBackend::FlexEP)
-        tpSharedFlex = std::make_shared<NaiveSharedFlexMoe>(tpDevices, tpMoeWeights, tpEp8MegaState.get());
+        tpSharedFlex = std::make_shared<NaiveSharedFlexMoe>(tpDevices, tpMoeWeights, tpEp8MegaState.get(),
+            draftEnabled && std::min(draftTokens, draftBlock) == 7);
     // Parents retain only names/shapes and ownership of their metadata views.
     // Retire CPU payload/scales after every local source has been consumed.
     size_t sourceBytes = 0, sourcePointers = 0;

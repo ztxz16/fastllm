@@ -56,6 +56,10 @@ static __global__ void NormRowsRouterDirect(
         const BF16 *input, const float *weight, float *output,
         const float *gamma, BF16 *normed, float eps, int rows,
         FastllmMoePreparedInput prepared, const BF16 *branch = nullptr, BF16 *sumOutput = nullptr) {
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (Prepare && !Residual && Experts == 8 && Rows == 2 && Capacity == 8)
+        if (prepared.overlapVerifyGate) cudaTriggerProgrammaticLaunchCompletion();
+#endif
     constexpr int Chunks = 2, Warps = 8;
     const int t = threadIdx.x, lane = t % 32, warp = t / 32;
     const int expert = blockIdx.x * Experts, first = blockIdx.y * Rows;

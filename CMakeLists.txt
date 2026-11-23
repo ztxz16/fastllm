@@ -1057,8 +1057,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_options(fastllm_naive_flex_sm103 PRIVATE
         "--generate-code=arch=compute_103a,code=sm_103a"
         "--expt-relaxed-constexpr" "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
-    target_compile_definitions(fastllm_naive_flex_sm103 PRIVATE
-        NAIVERT_EXPERT_DOWN_ALLREDUCE_NATIVE_PARALLEL_PEER_POLL=1
+    set(FASTLLM_NAIVE_FLEX_GEOMETRY
         NAIVERT_TP_RANKS=8
         NAIVERT_HIDDEN=4096
         NAIVERT_SM_COUNT=148
@@ -1070,7 +1069,10 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         NAIVERT_NORM_EPS=1e-05
         NAIVERT_DENSE_INTER=2048
         NAIVERT_VOCAB_SHARD=19072
-        NAIVERT_EXPERT_WEIGHT_FORMAT=0
+        NAIVERT_EXPERT_WEIGHT_FORMAT=0)
+    target_compile_definitions(fastllm_naive_flex_sm103 PRIVATE
+        ${FASTLLM_NAIVE_FLEX_GEOMETRY}
+        NAIVERT_EXPERT_DOWN_ALLREDUCE_NATIVE_PARALLEL_PEER_POLL=1
         NAIVERT_EXPERT_DOWN_ALLREDUCE_OUTPUTS_PER_TILE=64
         NAIVERT_DOWN_ALLREDUCE_OUTPUTS_PER_TILE=64
         NAIVERT_UNPROJ_O_ALLREDUCE_OUTPUTS_PER_TILE=64
@@ -1112,7 +1114,12 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_draft_fused>)
     add_library(fastllm_shared_flex_sm103 OBJECT
         src/devices/cuda/moe/fastllm-shared-flex-ep.cu
-        src/devices/cuda/moe/fastllm-shared-flex-tp.cu)
+        src/devices/cuda/moe/fastllm-shared-flex-tp.cu
+        src/devices/cuda/moe/fastllm-shared-flex-verify8.cu)
+    set_property(SOURCE src/devices/cuda/moe/fastllm-shared-flex-verify8.cu APPEND PROPERTY
+        COMPILE_DEFINITIONS ${FASTLLM_NAIVE_FLEX_GEOMETRY})
+    set_property(SOURCE src/devices/cuda/moe/fastllm-shared-flex-verify8.cu APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_flex/include;${CMAKE_CURRENT_SOURCE_DIR}/src/devices/cuda/moe")
     set_target_properties(fastllm_shared_flex_sm103 PROPERTIES
         CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_shared_flex_sm103 BEFORE PRIVATE
