@@ -72,7 +72,7 @@ __global__ __launch_bounds__(Traits::NUM_THREADS) void pagedRelativePrefill(Para
 template<int D, class KV> using PrefillTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal, 64, 1, 2, 2*D/16, D/16, 4, 1,
         flashinfer::PosEncodingMode::kNone, KV, KV, float, float, int, PrefillRelative, false>;
 
-template<size_t SharedBytes, class Kernel> bool configureTensorCoreKernel(Kernel kernel, int blockThreads = 0) {
+template<size_t SharedBytes, int MinArch = 80, class Kernel> bool configureTensorCoreKernel(Kernel kernel, int blockThreads = 0) {
     cudaFuncAttributes attr{};
     auto status = cudaFuncGetAttributes(&attr, kernel);
     if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
@@ -80,9 +80,8 @@ template<size_t SharedBytes, class Kernel> bool configureTensorCoreKernel(Kernel
         return false;
     }
     check(status);
-    // A legacy PTX image JIT-compiled on a newer GPU still contains the
-    // pre-SM80 implementation selected at compile time.
-    if (attr.ptxVersion < 80 || attr.binaryVersion < 80 || attr.maxThreadsPerBlock < blockThreads) return false;
+    // JIT on a newer GPU preserves the instruction path selected by the PTX target.
+    if (attr.ptxVersion < MinArch || attr.binaryVersion < MinArch || attr.maxThreadsPerBlock < blockThreads) return false;
     const size_t totalBytes = SharedBytes + attr.sharedSizeBytes;
     if (totalBytes <= 48 * 1024) return true;
     int device, limit;
@@ -93,8 +92,8 @@ template<size_t SharedBytes, class Kernel> bool configureTensorCoreKernel(Kernel
     return true;
 }
 
-template<class Traits, class Params> bool configurePrefillKernel(void (*kernel)(Params) = pagedRelativePrefill<Traits, Params>) {
-    return configureTensorCoreKernel<sizeof(typename Traits::SharedStoragePaged)>(kernel);
+template<class Traits, class Params, int MinArch = 80> bool configurePrefillKernel(void (*kernel)(Params) = pagedRelativePrefill<Traits, Params>) {
+    return configureTensorCoreKernel<sizeof(typename Traits::SharedStoragePaged), MinArch>(kernel, Traits::NUM_THREADS);
 }
 
 template<int D, class KV> bool configurePrefill() {
@@ -139,6 +138,10 @@ template<bool Windowed, class Bias> struct GatedPrefillRelative : PrefillRelativ
     static constexpr bool use_pv_residual = false;
     static constexpr bool defer_softmax_rescale = true;
     static constexpr bool custom_score_tile = true;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    // Before stmatrix, lanes exchange the global kernel's 16-bit output through scalar shared stores.
+    static constexpr bool dflash_sync_output = !Windowed;
+#endif
     float tau[2];
     unsigned pos[2];
     const Bias *bias[2];
@@ -241,7 +244,9 @@ template<bool Windowed, class T, class Bias = float> using GatedPrefillTraits = 
     64, 1, 4, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone, half, half, T, float, int, GatedPrefillRelative<Windowed,Bias>>;
 
 template<bool Windowed, class T, class Bias = float> bool configureGatedPrefill() {
-    return configurePrefillKernel<GatedPrefillTraits<Windowed, T, Bias>, GatedParams<Windowed, T, Bias>>();
+    // Both masks use FP16 MMA. The BF16 bias projection needs SM80.
+    constexpr int minArch = std::is_same_v<Bias, float> ? 75 : 80;
+    return configurePrefillKernel<GatedPrefillTraits<Windowed, T, Bias>, GatedParams<Windowed, T, Bias>, minArch>();
 }
 
 template<bool Windowed, class T, class Bias = float>

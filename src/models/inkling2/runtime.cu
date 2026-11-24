@@ -706,10 +706,11 @@ class Decoder final : public Runtime {
         }
         const int rows = inputs[0].rows;
         const bool queryFits = !std::is_same_v<KV, half> || (c.qClip > 0 && c.qClip <= 65504.f);
-        const bool multi = tensorPrefill && queryFits && !std::is_same_v<KV, float> &&
+        const bool canFuseGate = std::is_same_v<KV, half> && (window ? gatedWindowPrefill : gatedGlobalPrefill);
+        const bool multi = (tensorPrefill || canFuseGate) && queryFits && !std::is_same_v<KV, float> &&
                            rows > 1 && !batch.front().decode &&
                            std::all_of(batch.begin(), batch.end(), [](const Segment &s) { return s.length > 1; });
-        const bool compact = multi && std::is_same_v<KV, half> && (window ? gatedWindowPrefill : gatedGlobalPrefill);
+        const bool compact = multi && canFuseGate;
         // The BF16 projection input and table together fit in the original
         // FP32 input workspace. Short prefills can keep their FP32 projection.
         const bool narrowBias = compact && window && bf16WindowBias && std::is_same_v<T, __nv_bfloat16> &&
@@ -1307,25 +1308,29 @@ class Decoder final : public Runtime {
         hostVisits.resize(c.visits.size());
         graphVisits = Buffer<DecodeVisit>(hostVisits.size());
 #ifndef CUDA_NO_TENSOR_CORE
-        int major;
-        check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, p.gpu));
-        if (FastllmCudaRuntimeArch() == 120 && c.hidden == controllerWidth && c.rank == controllerRank) {
+        const int arch = FastllmCudaRuntimeArch();
+        if (arch == 120 && c.hidden == controllerWidth && c.rank == controllerRank) {
             batchedController = configureTensorCoreKernel<0>(controllerQkvGates, 128);
             fusedPrefillController =
                 configureTensorCoreKernel<controllerSharedBytes>(prefillControllerMix<__nv_bfloat16>, controllerThreads) &&
                 configureTensorCoreKernel<controllerSharedBytes>(prefillControllerMix<float>, controllerThreads);
         }
-        if (major >= 8 && (c.headDim == 64 || c.headDim == 128) && c.relative <= threads) {
+        if (arch >= 80 && (c.headDim == 64 || c.headDim == 128) && c.relative <= threads) {
             tensorPrefill = c.headDim == 128 ? configurePrefill<128, half>() && configurePrefill<128, __nv_bfloat16>()
                                              : configurePrefill<64, half>() && configurePrefill<64, __nv_bfloat16>();
         }
+        if (arch >= 75 && c.headDim == 128 && c.relative <= threads) {
+            if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16) {
+                gatedGlobalPrefill = configureGatedPrefill<false, half>();
+                gatedWindowPrefill = configureGatedPrefill<true, half>();
+            } else if (arch >= 80) {
+                gatedGlobalPrefill = configureGatedPrefill<false, __nv_bfloat16>();
+                gatedWindowPrefill = configureGatedPrefill<true, __nv_bfloat16>();
+                bf16WindowBias = gatedWindowPrefill && configureGatedPrefill<true, __nv_bfloat16, __nv_bfloat16>();
+            }
+        }
 #endif
         check(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, p.gpu));
-        if (tensorPrefill && c.headDim == 128) {
-            gatedGlobalPrefill = configureGatedPrefill<false, half>() && configureGatedPrefill<false, __nv_bfloat16>();
-            gatedWindowPrefill = configureGatedPrefill<true, half>() && configureGatedPrefill<true, __nv_bfloat16>();
-            bf16WindowBias = gatedWindowPrefill && configureGatedPrefill<true, __nv_bfloat16, __nv_bfloat16>();
-        }
         // The compensated FP16 query operands are finite under this L2 bound.
         if (c.headDim == 128 && c.heads == 3 * c.kvHeads && c.qClip > 0.f && c.qClip <= 65504.f &&
             supportsGlobalRelativeSm120(p.gpu)) {

@@ -18,6 +18,7 @@ namespace {
 #include "../../src/models/inkling2/paged-kv.cuh"
 #include "../../src/models/inkling2/attention.cuh"
 #include "../../src/models/inkling2/prefill.cuh"
+#include "../../src/models/inkling2/paged-verify-attention.cuh"
 
 struct DisabledPrefillHooks {
     static constexpr bool custom_output_store = false;
@@ -82,7 +83,10 @@ void compareVerifyChain(AttentionRow a, PageView pages, std::vector<int2> ids, i
     if (std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)))
         throw std::runtime_error("Verification attention differs from standalone decode");
     if constexpr (D == 128 && std::is_same_v<T, half>) {
-        if (!a.window && configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyGlobal)) {
+        if (!a.window && configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention)) {
+            int device, smCount;
+            check(cudaGetDevice(&device));
+            check(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
             const float *referenceGate = a.q;
             std::vector<float> query(size_t(rows) * width);
             check(cudaMemcpy(query.data(), a.q, query.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -94,14 +98,14 @@ void compareVerifyChain(AttentionRow a, PageView pages, std::vector<int2> ids, i
             }
             auto q = upload(packed);
             a.q = reinterpret_cast<const float *>(q.p);
-            launchVerifyGlobal(a, batchScratch, sink, gate, batched.p, rows, chain, splits);
+            launchVerifyAttention(a, batchScratch, sink, gate, batched.p, rows, chain, splits, smCount, VerifyPartition::minTiles);
             for (int r = 0; r < rows; ++r) {
                 auto one = a;
                 one.q += size_t(r) * width;
                 one.relative += size_t(r) * a.heads * a.distances;
                 one.visit += r;
-                launchVerifyGlobal(one, singleScratch, a.sink + size_t(r) * a.heads, referenceGate + size_t(r) * width,
-                                   single.p + size_t(r) * width, 1, 1, splits);
+                launchVerifyAttention(one, singleScratch, a.sink + size_t(r) * a.heads, referenceGate + size_t(r) * width,
+                                      single.p + size_t(r) * width, 1, 1, splits, smCount, VerifyPartition::minTiles);
             }
             const auto baseline = expected;
             check(cudaMemcpy(actual.data(), batched.p, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -291,16 +295,23 @@ int testRelative() {
     check(cudaGetDevice(&gpu));
     int major;
     check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gpu));
+    // Each gated case checks its own compiled kernel and shared-memory limit.
+    compare<128, half, half>(3, 0, 513, 0, 128, false);
+    compare<128, half, half>(5, 8190, 39, 0, 127, false);
+    compare<128, half, half>(1, 0, 149, 1, 37, false);
+    compare<128, half, half>(3, 1017, 513, 1024, 31, false);
+    compare<128, half, half>(5, 8190, 145, 97, 37, false);
+    if (major >= 8) {
+        compare<128, half, nv_bfloat16>(3, 8190, 39, 0, 127, false);
+        compare<128, half, nv_bfloat16>(3, 1017, 159, 1024, 31, false);
+    }
     if (major >= 8 && configurePrefill<128, half>() && configurePrefill<128, nv_bfloat16>()) {
         for (int group : {1, 3, 5}) {
             compare<128, half, half>(group, 125, 151, 0, 37, false);
             compare<128, half, nv_bfloat16>(group, 0, 143, 0, 128, false);
         }
         compare<128, half, half>(3, 8190, 19, 0, 127, false);
-        compare<128, half, half>(1, 0, 149, 1, 37, false);
-        compare<128, half, nv_bfloat16>(3, 1017, 159, 1024, 31, false);
         compare<128, half, nv_bfloat16, nv_bfloat16>(3, 8173, 157, 1024, 31, false);
-        compare<128, half, half>(5, 8190, 145, 97, 37, false);
         compare<128, half>(3, 65531, 5, 0, 127, false, 1, false, 0, true);
         compare<128, half>(3, 8189, 17, 1024, 128, false, 1, false, 0, true);
         for (int window : {0, 1024}) {
