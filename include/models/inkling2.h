@@ -15,7 +15,15 @@ struct DraftConfig {
     std::vector<int> taps;
     std::vector<bool> local;
 };
+constexpr int imageContentToken = 200005, imagePatchToken = 200054;
+struct VisionConfig {
+    int width = 0, layers = 0, heads = 0, patch = 0, merge = 0, grid = 0, projection = 0;
+    float eps = 0;
+    std::pair<int, int> tokenGrid(int height, int width) const;
+};
+using ImageInputs = std::map<std::string, std::vector<Data *>>;
 struct Config {
+    VisionConfig vision;
     DraftConfig draft;
     int hidden, layers, heads, kvHeads, headDim, relative, extent, window, conv, residualBlock;
     int experts, topK, intermediate, start, end, passes, rank, vocab, logFloor;
@@ -43,7 +51,7 @@ public:
                                      const std::vector<std::pair<Data *, Data *>> &cache,
                                      const std::vector<GenerationConfig> &sampling,
                                      const LastTokensManager &history,
-                                     std::vector<std::vector<float> *> *logits) = 0;
+                                     std::vector<std::vector<float> *> *logits, const ImageInputs *images = nullptr) = 0;
 };
 DataType projectionType(int gpu);
 std::unique_ptr<Runtime> create(const Config &, const Placement &, basellm &,
@@ -87,6 +95,13 @@ public:
                                std::vector<std::pair<Data *, Data *>> &cache,
                                const std::vector<GenerationConfig> &configs, const LastTokensManager &last,
                                std::vector<std::vector<float> *> *logits) override;
+    // Count with output == nullptr, or expand the processor's one placeholder per image.
+    int PrepareImagePrompt(const int *tokens, int n, const int *sizes, int images,
+                           int *output, int capacity, int *offsets) const;
+    std::vector<int> ForwardMultimodal(const Data &ids, const Data &mask, const Data &positions,
+                std::vector<std::pair<Data, Data>> &cache, const inkling2::ImageInputs &images,
+                const GenerationConfig &sampling, const LastTokensManager &history,
+                std::vector<std::vector<float> *> *logits) override;
     std::string MakeInput(const std::string &history, int round, const std::string &input) override;
     std::string MakeHistory(const std::string &history, int round, const std::string &input,
                             const std::string &output) override;

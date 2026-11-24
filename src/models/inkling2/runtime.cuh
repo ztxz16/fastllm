@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdexcept>
+#include <type_traits>
 #include <functional>
 #include <exception>
 
@@ -154,7 +155,24 @@ template <typename T> struct Rows : Buffer<T> {
         return v;
     }
 };
+template <typename T, typename U>
+__global__ void castProjection(const T *input, U *output, size_t n) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) output[i] = U(input[i]);
+}
+
+template <typename U, typename T> Rows<U> castRows(const Rows<T> &x) {
+    if constexpr (std::is_same<T, U>::value) return x;
+    Rows<U> out(x.rows, x.cols);
+    const size_t n = size_t(x.rows) * x.cols;
+    castProjection<<<(n + 255) / 256, 256, 0, cudaStreamPerThread>>>(x.p, out.p, n);
+    return out;
+}
+
 using Matrix = Rows<float>;
+struct ImageSpan { int start; Matrix features; };
+std::vector<ImageSpan> encodeImages(const ImageInputs &, const Config &, WeightMap &, int gpu,
+                                    DataType precision, int promptLength);
 constexpr int threads = 128;
 __device__ inline float blockSum(float v, float *scratch) {
     scratch[threadIdx.x] = v;

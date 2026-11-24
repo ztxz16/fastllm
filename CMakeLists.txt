@@ -544,7 +544,7 @@ if (USE_CUDA)
         src/devices/cuda/models/naive-n05-kernels.cu
         src/devices/cuda/models/naive-n05-experts.cu
         src/devices/cuda/models/sensenova-loop.cu
-        src/models/inkling2/runtime.cu src/models/inkling2/experts.cu
+        src/models/inkling2/runtime.cu src/models/inkling2/experts.cu src/models/inkling2/vision.cu
         src/devices/cuda/models/deepseekv4-kernels.cu
         src/devices/cuda/models/deepseekv41-kernels.cu
         src/devices/cuda/models/deepseekv41-commit.cu

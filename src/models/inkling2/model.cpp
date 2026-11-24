@@ -1,6 +1,7 @@
 #include "inkling2.h"
 #include "json11.hpp"
 #include <algorithm>
+#include <climits>
 
 namespace fastllm {
 namespace {
@@ -75,6 +76,12 @@ void Inkling2Model::InitParams() {
         return v;
     };
     cfg.hidden = positive("hidden_size");
+    if (weight.dicts.count("vision_config.hidden_size")) {
+        auto dim = [&](const char *key) { return std::stoi(weight.dicts.at(std::string("vision_config.") + key)); };
+        cfg.vision = {dim("hidden_size"), dim("num_hidden_layers"), dim("num_attention_heads"),
+                      dim("native_patch_size"), dim("adapter_merge_size"), dim("posemb_grid_size"),
+                      dim("projection_hidden_dim"), std::stof(weight.dicts.at("vision_config.layer_norm_eps"))};
+    }
     cfg.layers = positive("num_hidden_layers");
     cfg.heads = positive("num_attention_heads");
     cfg.kvHeads = positive("num_key_value_heads");
@@ -235,6 +242,13 @@ Inkling2Model::GetTensorMap(const std::vector<std::string> &names) {
         dense.insert(prefix + ".controllers.mlp.down_weight");
     }
     for (const auto &name : names) {
+        if (name.rfind("model.visual.", 0) == 0) {
+            // Linear weights follow the language backbone precision. Small affine parameters
+            // and the learned position table are read by FP32 accumulation kernels.
+            bool matrix = name.size() >= 7 && name.compare(name.size() - 7, 7, ".weight") == 0 &&
+                          name.find(".ln_") == std::string::npos;
+            result[name].emplace_back(name, matrix ? denseType : FLOAT32);
+        }
         if (draftEnabled() && name.rfind("inkling_draft.", 0) == 0) {
             const std::string key = name.substr(14);
             bool matrix = (key.find("_proj.weight") != std::string::npos ||
@@ -350,6 +364,47 @@ std::string Inkling2Model::MakeHistory(const std::string &history, int round, co
                        ? output
                        : "<|message_model|><|content_text|>" + output + "<|end_message|>";
     return MakeInput(history, round, input) + message + "<|content_model_end_sampling|>";
+}
+std::pair<int, int> inkling2::VisionConfig::tokenGrid(int height, int width) const {
+    if (height <= 0 || width <= 0 || patch <= 0 || merge <= 0 || patch > INT_MAX / merge)
+        throw std::invalid_argument("Invalid Inkling image dimensions");
+    const int side = patch * merge;
+    return {1 + (height - 1) / side, 1 + (width - 1) / side};
+}
+
+int Inkling2Model::PrepareImagePrompt(const int *tokens, int n, const int *sizes, int images,
+                                      int *output, int capacity, int *offsets) const {
+    if (!tokens || !sizes || images <= 0 || n <= 0 || capacity < 0 ||
+        !weight.weight.count("model.visual.proj_out.weight"))
+        throw std::invalid_argument("Inkling image input requires images and a checkpoint with vision weights");
+    int length = 0, index = 0;
+    for (int i = 0; i < n; ++i) {
+        int64_t repeat = 1;
+        if (i && tokens[i - 1] == inkling2::imageContentToken && tokens[i] == inkling2::imagePatchToken) {
+            if (index >= images) throw std::invalid_argument("Unexpected Inkling image placeholder");
+            auto [rows, cols] = cfg.vision.tokenGrid(sizes[2 * size_t(index)], sizes[2 * size_t(index) + 1]);
+            repeat = int64_t(rows) * cols;
+            if (offsets) offsets[index] = length;
+            ++index;
+        }
+        if (repeat > INT_MAX - length || (output && repeat > capacity - length))
+            throw std::length_error("Inkling image prompt exceeds token buffer");
+        if (output) std::fill_n(output + length, repeat, tokens[i]);
+        length += int(repeat);
+    }
+    if (index != images) throw std::invalid_argument("Inkling image count does not match the template");
+    return length;
+}
+
+std::vector<int> Inkling2Model::ForwardMultimodal(const Data &ids, const Data &, const Data &pos,
+        std::vector<std::pair<Data, Data>> &cache, const inkling2::ImageInputs &images,
+        const GenerationConfig &sampling, const LastTokensManager &history, std::vector<std::vector<float> *> *logits) {
+    if (!runtime || cache.size() != size_t(block_cnt))
+        throw std::runtime_error("Invalid Inkling image request cache");
+    std::vector<std::pair<Data *, Data *>> slots;
+    for (auto &kv : cache) slots.emplace_back(&kv.first, &kv.second);
+    return runtime->forward(ids, {const_cast<Data *>(&pos)}, {int(ids.Count(0))}, slots,
+                            {sampling}, history, logits, &images);
 }
 std::vector<int> Inkling2Model::ForwardV2(int batch, const Data &ids, const std::vector<Data *> &,
                                           const std::vector<Data *> &pos, const std::vector<int> &lengths,

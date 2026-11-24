@@ -113,20 +113,6 @@ template <typename T> __global__ void softcap(const T *projected, float *logits,
     if (i < n) logits[i] = limit * tanhf(float(projected[i]) / limit);
 }
 
-template <typename T, typename U>
-__global__ void castProjection(const T *input, U *output, size_t n) {
-    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) output[i] = U(input[i]);
-}
-
-template <typename U, typename T> Rows<U> castRows(const Rows<T> &x) {
-    if constexpr (std::is_same<T, U>::value) return x;
-    Rows<U> out(x.rows, x.cols);
-    const size_t n = size_t(x.rows) * x.cols;
-    castProjection<<<(n + 255) / 256, 256, 0, cudaStreamPerThread>>>(x.p, out.p, n);
-    return out;
-}
-
 // Split row-major packed output into contiguous [tokens, channels] tensors in
 // the same pass that widens to the attention accumulator type.
 struct ProjectionParts { int widths[8]; };
@@ -332,6 +318,7 @@ uint64_t newSamplingSeed() {
 #include "dspark.cuh"
 #include "prefix-cache.cuh"
 struct Request {
+    std::vector<ImageSpan> images;
     std::shared_ptr<InklingPrefix> restored;
     std::vector<int> prefixTokens;
     long long prefixId = 0;
@@ -351,6 +338,7 @@ struct Request {
             printf("[Inkling DSpark] rounds=%d proposed=%d accepted=%d mean_round_ms=%.3f\n",
                    draft->rounds, draft->proposed, draft->accepted, draft->roundMs / draft->rounds);
         draft.reset();
+        images.clear();
         visits.clear();
         if (previous != gpu)
             cudaSetDevice(previous);
@@ -1320,7 +1308,8 @@ class Decoder final : public Runtime {
         }
         return convolutions(m, expertConv, {}, 1, c.conv, batch, slot, 3, residual, decodePdl);
     }
-    void target(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits, std::vector<Matrix> *features = nullptr) {
+    void target(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits,
+                std::vector<Matrix> *features = nullptr, const std::vector<ImageSpan> &images = {}) {
         // Only eager prompts borrow payload storage. A leased feature may outlive
         // target() until storeFeatures consumes it, still under the decoder mutex.
         std::optional<PrefillWorkspaceScope> workspace;
@@ -1340,15 +1329,16 @@ class Decoder final : public Runtime {
         const auto run = [&](auto projection) {
             using T = decltype(projection);
             if (residualType == BFLOAT16)
-                targetTyped<T, __nv_bfloat16>(ids, n, batch, logits, features);
+                targetTyped<T, __nv_bfloat16>(ids, n, batch, logits, features, images);
             else
-                targetTyped<T, float>(ids, n, batch, logits, features);
+                targetTyped<T, float>(ids, n, batch, logits, features, images);
         };
         if (!backboneBf16) run(half{});
         else run(__nv_bfloat16{});
     }
 
-    template <typename T, typename R> void targetTyped(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits, std::vector<Matrix> *features) {
+    template <typename T, typename R> void targetTyped(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits,
+                                                       std::vector<Matrix> *features, const std::vector<ImageSpan> &images) {
         // Incremental verification must use the same arithmetic as ordinary one-token decode.
         // Fresh prompt chunks retain their tensor-core prefill kernels.
         struct Restore { bool &mode; ~Restore() { mode = false; } } restore{decodeArithmetic};
@@ -1367,7 +1357,14 @@ class Decoder final : public Runtime {
         auto embedding = Matrix::temporary(n, h);
         Data tokens(FLOAT32, {n}, CUDA, ids), result(FLOAT32, {n, h}, CUDA, embedding.p);
         FastllmCudaEmbeddingDirect(tokens, weight("embed.weight"), result);
-        auto x = castRows<R>(norm(embedding, param("embed_norm.weight", h), c.eps));
+        auto normalized = norm(embedding, param("embed_norm.weight", h), c.eps);
+        for (const auto &image : images) {
+            check(cudaMemcpyAsync(normalized.p + size_t(image.start) * h, image.features.p,
+                                  size_t(image.features.rows) * h * sizeof(float),
+                                  cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        }
+        auto x = castRows<R>(normalized);
+        normalized = {};
         embedding = {};
         Rows<R> prelude, previous;
         Matrix messageTile;
@@ -1573,7 +1570,7 @@ class Decoder final : public Runtime {
     }
     Matrix runTarget(const float *tokens, int count, const std::vector<Segment> &batch,
                      const GenerationConfig &sampling, bool &sampledOnDevice, std::vector<Matrix> *features = nullptr, bool needLogits = true) {
-        if (needLogits && !features && batch.size() == 1 && count == 1 && batch[0].request->length > 0) {
+        if (needLogits && !features && batch.size() == 1 && count == 1 && batch[0].request->length > 0 && batch[0].request->images.empty()) {
             auto &req = *batch[0].request;
             sampledOnDevice = graphSample.p && ordinarySampling(sampling) && !sampling.IsSimpleGreedy();
             stageDecode(req, tokens[0], sampling, sampledOnDevice, hostInput, hostVisits.data(), false);
@@ -1586,10 +1583,26 @@ class Decoder final : public Runtime {
             launchTargetGraph(decodeGraph, graphScratch);
             return graphLogits;
         }
+        // Image offsets are absolute within a request. Only pass the portion of
+        // each image covered by this prefill chunk to the language backbone.
+        std::vector<ImageSpan> images;
+        for (const auto &seg : batch) {
+            const int past = seg.request->length;
+            for (const auto &span : seg.request->images) {
+                const int first = std::max(past, span.start);
+                const int end = std::min(past + seg.length, span.start + span.features.rows);
+                if (first >= end) continue;
+                const int offset = seg.offset + (first - past), rows = end - first;
+                if (!std::all_of(tokens + offset, tokens + offset + rows,
+                                 [](float id) { return id == imagePatchToken; }))
+                    throw std::runtime_error("Inkling image span does not match the tokenized prompt");
+                images.push_back({offset, span.features.slice(first - span.start, rows)});
+            }
+        }
         Buffer<float> ids(count);
         check(cudaMemcpyAsync(ids.p, tokens, size_t(count) * sizeof(float), cudaMemcpyHostToDevice, cudaStreamPerThread));
         Matrix logits(needLogits ? batch.size() : 0, c.vocab);
-        target(ids.p, count, batch, logits, features);
+        target(ids.p, count, batch, logits, features, images);
         return logits;
     }
 
@@ -1812,7 +1825,7 @@ class Decoder final : public Runtime {
                              const std::vector<int> &lengths,
                              const std::vector<std::pair<Data *, Data *>> &cache,
                              const std::vector<GenerationConfig> &sampling, const LastTokensManager &history,
-                             std::vector<std::vector<float> *> *logits) override {
+                             std::vector<std::vector<float> *> *logits, const ImageInputs *images = nullptr) override {
         std::lock_guard<std::mutex> lock(mutex);
         check(cudaSetDevice(placement.gpu));
         if (publishedPlan && publicationThread != std::this_thread::get_id()) finishPublication();
@@ -1878,14 +1891,14 @@ class Decoder final : public Runtime {
                 return result;
             }
         }
-        return forwardRows(values, positions, lengths, cache, sampling, history, logits);
+        return forwardRows(values, positions, lengths, cache, sampling, history, logits, images);
     }
   private:
     std::vector<int> forwardRows(const float *values, const std::vector<Data *> &positions,
                              const std::vector<int> &lengths,
                              const std::vector<std::pair<Data *, Data *>> &cache,
                              const std::vector<GenerationConfig> &sampling, const LastTokensManager &history,
-                             std::vector<std::vector<float> *> *logits) {
+                             std::vector<std::vector<float> *> *logits, const ImageInputs *images = nullptr) {
         std::vector<Segment> batch;
         int offset = 0;
         for (size_t b = 0; b < lengths.size(); ++b) {
@@ -1933,7 +1946,11 @@ class Decoder final : public Runtime {
                     : model.max_positions;
                 req.limit = int(std::min<int64_t>(limit, tokenLimit > 0 ? tokenLimit : limit));
                 req.promptLength = int(prompt);
-                if (prefixEnabled) {
+                if (images && !images->empty()) {
+                    if (past || lengths.size() != 1)
+                        throw std::runtime_error("Inkling image request must start with a fresh KV cache");
+                    req.images = encodeImages(*images, c, weights, placement.gpu, placement.denseType, req.promptLength);
+                } else if (prefixEnabled) {
                     req.prefixId = ++prefixSerial;
                     req.nextDecodeCheckpoint = (prompt / len + 1) * len;
                 }
@@ -2024,6 +2041,22 @@ class Decoder final : public Runtime {
             return bf16 ? verifyRound<__nv_bfloat16>(batch, values, sampling)
                         : verifyRound<half>(batch, values, sampling);
         finishPublication();
+        if (images && !batch.front().request->images.empty()) {
+            auto &segment = batch.front();
+            auto &req = *segment.request;
+            const int chunk = std::max(1, model.GetChunkedPrefillSize());
+            while (segment.length > chunk) {
+                const std::vector<Segment> part{{&req, 0, chunk}};
+                std::vector<Matrix> features;
+                bool sampled = false;
+                runTarget(values, chunk, part, sampling.front(), sampled, req.draft ? &features : nullptr, false);
+                storeDraftFeatures(part, features, bf16);
+                req.length += chunk;
+                values += chunk;
+                offset -= chunk;
+                segment.length -= chunk;
+            }
+        }
         std::vector<float> suffix;
         const bool checkpoint = prefixEnabled &&
             std::any_of(batch.begin(), batch.end(), [](const Segment &s) { return s.request->length < s.request->promptLength; });
@@ -2089,6 +2122,7 @@ class Decoder final : public Runtime {
             if (req.prefixId && size_t(req.length) == req.prefixTokens.size())
                 req.prefixTokens.insert(req.prefixTokens.end(), values + s.offset, values + s.offset + s.length);
             req.length += s.length;
+            if (!req.images.empty() && req.length >= req.promptLength) req.images.clear();
             if (checkpoint && req.length <= req.promptLength && req.length % GetPageLen() == 0 &&
                 req.prefixTokens.size() == size_t(req.length)) savePrefix(req);
             else checkpointDecode(req);
