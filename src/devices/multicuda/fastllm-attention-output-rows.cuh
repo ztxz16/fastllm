@@ -249,7 +249,7 @@ static __global__ void NormRowsRouter(const BF16 *input, const float *weight,
 using fastllm_norm_rows::StoreGateBlock128;
 using fastllm_norm_rows::ClearGateBlock128Tail;
 
-template<int Experts = 4, bool Prepare = false>
+template<int Experts = 4, bool Prepare = false, bool AfterSwa = false>
 static __device__ __forceinline__ void NormRowsRouterExpertsBody(const BF16 *input,const float *weight,float *output,
         const float *gamma,BF16 *normed,float eps,int rows, FastllmMoePreparedInput prepared = {}) {
     constexpr int Rows = 2;
@@ -264,6 +264,19 @@ static __device__ __forceinline__ void NormRowsRouterExpertsBody(const BF16 *inp
     float affine[16];
     #pragma unroll
     for(int i=0;i<16;++i)affine[i]=gamma[t+i*256];
+    float cached[AfterSwa ? Experts : 1][16];
+    if constexpr (AfterSwa) {
+#pragma unroll
+        for (int e = 0; e < Experts; ++e)
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+                cached[e][i] = weight[size_t(expert + e) * Width + t + i * 256];
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        // The residual is produced by SWA. Only gamma and weights are immutable.
+        cudaGridDependencySynchronize();
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    }
     #pragma unroll
     for(int row=0;row<Rows;++row){
         float x[16],square=0;
@@ -312,7 +325,7 @@ static __device__ __forceinline__ void NormRowsRouterExpertsBody(const BF16 *inp
     for(int i=0;i<16;++i){
         float w[Experts];
         #pragma unroll
-        for(int e=0;e<Experts;++e)w[e]=weight[size_t(expert+e)*Width+t+i*256];
+        for(int e=0;e<Experts;++e)w[e]=AfterSwa ? cached[e][i] : weight[size_t(expert+e)*Width+t+i*256];
         #pragma unroll
         for(int row=0;row<Rows;++row){
             float x=normalized[row][i];
@@ -338,10 +351,10 @@ static __device__ __forceinline__ void NormRowsRouterExpertsBody(const BF16 *inp
     }
 }
 
-template<int Experts = 4, bool Prepare = false>
+template<int Experts = 4, bool Prepare = false, bool AfterSwa = false>
 static __global__ void NormRowsRouterExperts(const BF16 *input,const float *weight,float *output,
         const float *gamma,BF16 *normed,float eps,int rows,FastllmMoePreparedInput prepared = {}) {
-    NormRowsRouterExpertsBody<Experts,Prepare>(input,weight,output,gamma,normed,eps,rows,prepared);
+    NormRowsRouterExpertsBody<Experts,Prepare,AfterSwa>(input,weight,output,gamma,normed,eps,rows,prepared);
 }
 // All CTA outputs are published by grid.sync before one CTA selects routes.
 // The launch must be admitted for complete grid residency before capture.
