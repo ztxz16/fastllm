@@ -1198,7 +1198,7 @@ Data NaiveN05FlashModel::RunTarget(
         int rotaryDim = (int)(cfg.headDim * partialRotary);
 #ifndef USE_ROCM
         if (handoff && moeLayers[layer] &&
-            handoff->PreparedInput(tpRank, length, preparedInput, expertIndex, expertScore,
+            handoff->PreparedInput(tpRank, layer, length, preparedInput, expertIndex, expertScore,
                 localWeight(prefix + ".mlp.gate.e_score_correction_bias"), hidden,
                 norm_topk_prob, routed_scaling_factor) &&
             FastllmCudaSwaPreparedRouterSupported(gpu, false, length)) {
@@ -1206,7 +1206,7 @@ Data NaiveN05FlashModel::RunTarget(
             // selection is unavailable on any rank of this TP group.
             if (preparedInput.routed && !FastllmCudaSwaPreparedRouterSupported(gpu, true))
                 preparedInput.routed = false;
-            prepared = &preparedInput;
+            if (preparedInput.epRank<0 || preparedInput.routed) prepared = &preparedInput;
         }
 #endif
 #ifndef USE_ROCM

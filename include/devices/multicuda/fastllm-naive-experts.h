@@ -18,7 +18,7 @@ struct FastllmExpertHandoff {
     virtual ~FastllmExpertHandoff() = default;
     virtual bool HasVerifyReduce(int rank, int layer, int rows) const = 0;
     virtual bool CanRoute(int rows, const Data &router, const Data &bias) const = 0;
-    virtual bool PreparedInput(int rank, int rows, FastllmMoePreparedInput &input,
+    virtual bool PreparedInput(int rank, int layer, int rows, FastllmMoePreparedInput &input,
             Data &ids, Data &scores, const Data &bias, const Data &hidden,
             bool needNorm, float routeScale) const = 0;
     virtual bool PrepareResidualRouter(int rank, int layer, int rows, Data &hidden, const Data &branch,

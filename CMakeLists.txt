@@ -1105,6 +1105,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         NAIVERT_DSA_INDEX_HEADS=16
         NAIVERT_MLA_ROWS_ENABLE_PHASE_TIMERS=0)
     set_property(SOURCE src/devices/multicuda/fastllm-naive-experts.cpp
+        src/devices/multicuda/fastllm-custom-allreduce.cu
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_FLEX_SM103)
     set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
     add_library(fastllm_naive_dsa_fused OBJECT src/devices/cuda/models/naive-n05-dsa-fused.cu

@@ -11,6 +11,8 @@ struct FastllmMoePreparedInput {
     uint64_t *epoch = nullptr;
     int rows = 0;
     bool routed = false;
+    // An EP consumer owns 32 full experts and consumes swizzled eight-row K32 tiles.
+    int epRank = -1;
     // Consumer preference decided during backend setup, before graph capture.
     bool preferFusedSelection = false;
     bool overlapVerifyGate = false;
@@ -29,19 +31,20 @@ struct FastllmMoePreparedInput {
     struct Range { const void *data; size_t bytes; };
     void Ranges(Range (&ranges)[4]) const {
         ranges[0] = {values, size_t(values && rows > 0 ? rows : 0) * 4096};
-        ranges[1] = {scales, size_t(scales && rows > 0 ? rows : 0) * 128};
-        ranges[2] = {counters, 256 * sizeof(int)};
+        ranges[1] = {scales, size_t(scales && rows > 0 ? rows : 0) * (epRank >= 0 ? 2048 : 128)};
+        ranges[2] = {counters, size_t(epRank >= 0 ? 2048 : 256) * sizeof(int)};
         ranges[3] = {epoch, sizeof(uint64_t)};
     }
     void RoutingRanges(Range (&ranges)[9]) const {
         ranges[0] = {indices, size_t(rows > 0 ? rows : 0) * 8 * sizeof(int)};
         ranges[1] = {scores, size_t(rows > 0 ? rows : 0) * 8 * sizeof(float)};
-        ranges[2] = {jobs, 64 * sizeof(int)};
-        ranges[3] = {count, sizeof(int)};
+        ranges[2] = {jobs, size_t(epRank >= 0 ? 0 : 64) * sizeof(int)};
+        ranges[3] = {count, epRank >= 0 ? 0 : sizeof(int)};
         ranges[4] = {unique, sizeof(int)};
-        ranges[5] = {experts, 64 * sizeof(int)};
-        ranges[6] = {members, 512 * sizeof(int)};
-        ranges[7] = {rowCounts, 64 * sizeof(int)};
+        const size_t maxExperts = epRank >= 0 ? 32 : 64;
+        ranges[5] = {experts, maxExperts * sizeof(int)};
+        ranges[6] = {members, maxExperts * 8 * sizeof(int)};
+        ranges[7] = {rowCounts, size_t(epRank >= 0 ? 0 : 64) * sizeof(int)};
         ranges[8] = {bias, bias ? 256 * sizeof(float) : 0};
     }
     static bool Disjoint(Range a, Range b) {
@@ -60,6 +63,7 @@ struct FastllmMoePreparedInput {
         return true;
     }
     bool Valid(int count) const {
+        if (epRank < -1 || (epRank >= 0 && (epRank >= 8 || count != 8 || !routed || block128))) return false;
         if (count < 2 || count > 16 || rows != count || !counters || !epoch ||
             (uintptr_t(values) & 15) || (uintptr_t(scales) & 3) ||
             (uintptr_t(counters) & 3) || (uintptr_t(epoch) & 7)) return false;
@@ -122,6 +126,15 @@ int fastshared_tp_dense_admit(void *state,int rank,int rows,int eligible);
 int fastshared_tp_run_dense(void *state,int rank,int rows,const void *input,
     const void *gate,const void *up,const void *down,const float *gamma,float eps,void *silu,void *output);
 
+// EP routing supports 2..8 rows. The prepared-input path requires an eight-row MXFP4 layer.
+int fastshared_ep_router_supported(void *state);
+int fastshared_ep_prepared_input(void *state,int rank,int layer,int rows,FastllmMoePreparedInput *out);
+int fastshared_ep_prepared_norm(const void *x,const float *weight,float *router,const float *gamma,
+    void *normed,float eps,FastllmMoePreparedInput input,bool afterSwa);
+int fastshared_ep_run_prepared(void *state,int rank,int layer,const int *ids,const float *scores,void *out);
+int fastshared_ep_run_router(void *state, int rank, int layer, int rows, const void *x,
+    const float *routerProbabilities, const float *bias, int *ids, float *scores,
+    void *output, int needNorm, float routeScale);
 // Optional TP routing fusion: 2..8 BF16 rows, dense FP32 [rows,256]
 // sigmoid probabilities (16-byte aligned), optional FP32 [256] correction bias.
 // Select before capture/launch; unsupported inputs retain standalone selection.

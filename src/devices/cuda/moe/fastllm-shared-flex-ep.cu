@@ -9,6 +9,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include "fastllm-cuda-launch.cuh"
+#include "fastllm-norm-rows-router.cuh"
+#include "fastllm-shared-flex-router-sm103.cuh"
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -38,8 +40,8 @@ struct VerifyOperand {
  static constexpr int GateSplit = 2, DownSplit = 2, Stages = 2;
  static constexpr int ReadyOffset=(E/R)*(2*I/128);
  static constexpr int ReadyEnd=ReadyOffset+(E/R);
- static constexpr int CounterCount=MAX_M*K*(2*I/128);
- static_assert(ReadyEnd <= CounterCount);
+ static constexpr int CounterCount=MAX_M*K*(2*I/128), RouterArrival=CounterCount-1;
+ static_assert(ReadyEnd <= RouterArrival); // Keep the router CTA election separate.
  static constexpr int GateBytes = H / Width * (Values + Scales);
  static constexpr int DownBytes = I / Width * (Values + Scales);
  static constexpr size_t ScratchFloats = MAX_M * K * GateSplit * (2 * I);
@@ -63,7 +65,7 @@ struct VerifyOperand {
  }
 };
 struct State {
- bool pairedGateSupported = true;
+ bool pairedGateSupported = true, routerSupported = true, preparedRouterSupported = true;
  Rank r[R];
  std::vector<std::array<Rank,R>> layers;
 };
@@ -72,7 +74,91 @@ void* alloc(size_t n){void*p=nullptr;check(cudaMalloc(&p,n));return p;}
 __device__ __forceinline__ unsigned exponent(float a){return max((__float_as_uint(a)+0x7fffffu-0x600000u)>>23,113u)-8;}
 __device__ __forceinline__ float sf(unsigned e){return __uint_as_float(e<<23);}
 __device__ __forceinline__ unsigned ld4(const uint8_t*p){return *reinterpret_cast<const unsigned*>(p);}
-__global__ void prepare(Rank a,const __nv_bfloat16*x,const int*ids,int rows){
+// Both EP routing entry points use the same shortlist and tie fallback.
+__device__ __forceinline__ void selectRoutes(const float *router,const float *bias,int *ids,float *scores,
+        int needNorm,float scale,fastllm::cuda::RouterTopKScratch<K> &scratch) {
+ if (!fastllm_shared_flex_tp::SelectShortlist(router,bias,ids,scores,needNorm,scale,scratch))
+  fastllm::cuda::SelectRouterTopK<E,K>(router,bias,ids,scores,bias!=nullptr,needNorm,scale,scratch);
+}
+struct EpVerifyRoutes {
+ __device__ static void store(const FastllmMoePreparedInput &p,int row,int col,uint2 q,unsigned scale) {
+  int page=col/VerifyOperand::Width, lane=(col%VerifyOperand::Width)/8;
+  *reinterpret_cast<uint2*>(p.values+page*VerifyOperand::Values+row*VerifyOperand::Width+((col%VerifyOperand::Width)^(row*16)))=q;
+  unsigned scales=0;
+  #pragma unroll
+  for(int g=0;g<4;++g) scales|=__shfl_sync(0xffffffffu,scale,4*g,16)<<(8*g);
+  reinterpret_cast<unsigned*>(p.scales+page*VerifyOperand::Scales)[(row+8*(lane%4))*4+lane/4]=scales;
+ }
+ __device__ static void complete(const FastllmMoePreparedInput &p,const float *router) {
+  // Only the last router CTA reads the full logits. All earlier CTAs return;
+  // no resident block waits for an unscheduled producer.
+  __shared__ unsigned last;
+  __shared__ fastllm::cuda::RouterTopKScratch<K> scratch[MAX_M];
+  __shared__ int selected[MAX_M*K];
+  __shared__ unsigned owners[MAX_M];
+  int t=threadIdx.x,row=t/32,lane=t%32;
+  __syncthreads();
+  if(t==0){
+   unsigned previous,limit=gridDim.x*gridDim.y-1;
+   asm volatile("atom.acq_rel.gpu.global.inc.u32 %0,[%1],%2;":"=r"(previous):"l"(p.counters+VerifyOperand::RouterArrival),"r"(limit):"memory");
+   last=previous==limit;
+  }
+  __syncthreads();if(!last)return;
+  int *ids=selected+row*K;
+  selectRoutes(router+row*E,p.bias,ids,p.scores+row*K,p.needNorm,p.routeScale,scratch[row]);
+  __syncwarp();
+  if(lane<K)p.indices[row*K+lane]=ids[lane];
+  int route=-1;
+  #pragma unroll
+  for(int slot=0;slot<K;++slot)if(ids[slot]==p.epRank*32+lane)route=row*K+slot;
+  unsigned present=__ballot_sync(0xffffffffu,route>=0);
+  if(lane==0)owners[row]=present;
+  for(int i=t;i<VerifyOperand::ReadyEnd;i+=256)p.counters[i]=0;
+  __syncthreads();
+  unsigned all=0;
+  #pragma unroll
+  for(int r=0;r<MAX_M;++r)all|=owners[r];
+  if(all&(1u<<lane)){
+   int item=__popc(all&((1u<<lane)-1));
+   p.members[item*MAX_M+row]=route;
+   if(row==0)p.experts[item]=lane;
+  }
+  if(t==0)*p.unique=__popc(all);
+ }
+};
+struct RouteSelection {
+ const float *router, *bias;
+ int *ids;
+ float *scores;
+ int needNorm;
+ float scale;
+};
+template<bool Select = false>
+__global__ void prepare(Rank a,const __nv_bfloat16*x,const int*ids,int rows, RouteSelection selection = {}){
+ // Only CTA zero builds the EP schedule. Its warps select independent rows
+ // into shared memory; other CTAs can quantize the activation concurrently.
+ if constexpr (Select) {
+  __shared__ fastllm::cuda::RouterTopKScratch<K> scratch[MAX_M];
+  __shared__ int selected[MAX_M*K];
+  __shared__ float scores[MAX_M*K];
+  // Logits, bias and the normalized input may all be produced on this stream.
+  cudaGridDependencySynchronize();
+  if (blockIdx.x == 0) {
+   int row = threadIdx.x / 32;
+   if (row < rows) {
+    auto *idsOut = selected + row*K;
+    auto *scoresOut = scores + row*K;
+    const float *router = selection.router + row*E;
+    selectRoutes(router,selection.bias,idsOut,scoresOut,selection.needNorm,selection.scale,scratch[row]);
+   }
+   __syncthreads();
+   if (threadIdx.x < rows*K) {
+    selection.ids[threadIdx.x] = selected[threadIdx.x];
+    selection.scores[threadIdx.x] = scores[threadIdx.x];
+   }
+   ids = selected;
+  }
+ }
  int t=blockIdx.x*blockDim.x+threadIdx.x,lane=threadIdx.x%32;
  if(blockIdx.x==0){
   __shared__ int totals[2];int j=threadIdx.x;
@@ -155,11 +241,23 @@ extern "C" int fastshared_ep_create(const int*devices,int layers,void**result){
   for(int r=0;r<R;++r){check(cudaSetDevice(devices[r]));auto&a=s->r[r];a.device=devices[r];a.rank=r;
    for(int q=0;q<R;++q)if(q!=r){auto e=cudaDeviceEnablePeerAccess(devices[q],0);if(e==cudaErrorPeerAccessAlreadyEnabled)cudaGetLastError();else check(e);}
    cudaFuncAttributes attrs{};
+   if (cudaFuncGetAttributes(&attrs, prepare<true>) != cudaSuccess ||
+       attrs.maxThreadsPerBlock < 256 || attrs.ptxVersion < 90 || attrs.binaryVersion < 90) {
+    s->routerSupported = false;
+    cudaGetLastError();
+   }
    int clusterLaunch=0;
    if(cudaDeviceGetAttribute(&clusterLaunch,cudaDevAttrClusterLaunch,devices[r])!=cudaSuccess ||
       !clusterLaunch || cudaFuncGetAttributes(&attrs,paired_gate_rows8)!=cudaSuccess){
     s->pairedGateSupported=false; cudaGetLastError();
    }
+   using namespace fastllm_norm_rows;
+   for(const void *kernel : {reinterpret_cast<const void*>(NormRowsRouterDirect<8,2,true,8,false,false,EpVerifyRoutes>),
+                             reinterpret_cast<const void*>(NormRowsRouterDirect<8,2,true,8,false,true,EpVerifyRoutes>)})
+    if(cudaFuncGetAttributes(&attrs,kernel)!=cudaSuccess || attrs.maxThreadsPerBlock<256 ||
+       attrs.ptxVersion<90 || attrs.binaryVersion<90){
+     s->preparedRouterSupported=false;cudaGetLastError();
+    }
    constexpr int gb=STAGES,db=STAGES;
    check(cudaFuncSetAttribute(single_execute,cudaFuncAttributeMaxDynamicSharedMemorySize,gb*18432));
    check(cudaFuncSetAttribute(execute<true>,cudaFuncAttributeMaxDynamicSharedMemorySize,gb*18432));
@@ -210,19 +308,29 @@ extern "C" int fastshared_ep_bind(void *state, int rank, int layer, const void *
         const void *down, const void *gs, const void *ds) {
     return fastshared_ep_bind_format(state, rank, layer, gate, down, gs, ds, false);
 }
-extern "C" int fastshared_ep_run(void*state,int rank,int layer,int rows,const void*x,const void*ids,const void*prob,void*y){
+static int runEp(void*state,int rank,int layer,int rows,const void*x,const void*ids,const void*prob,void*y,
+                 fastllm_shared_flex_ep::RouteSelection selection,bool prepared=false) {
  using namespace fastllm_shared_flex_ep;
  auto *s=static_cast<State*>(state);
  if(!s||rank<0||rank>=R||rows<0)return 1;
  if(!rows)return 0;
- if(layer<0||layer>=int(s->layers.size())||!x||!ids||!prob||!y)return 1;
+ if(layer<0||layer>=int(s->layers.size())||(!prepared&&!x)||!ids||!prob||!y)return 1;
  const auto &a=s->layers[layer][rank];
  if(!a.gate||!a.down)return 1;
+ if(prepared && !(s->routerSupported && s->preparedRouterSupported && VerifyOperand::supports(a.mxfp4,rows)))return 1;
  auto stream=cudaStreamPerThread;
  constexpr int gb=STAGES,db=STAGES;
  for(size_t off=0;off<(size_t)rows;off+=8){int n=rows-off<8?rows-off:8;
-  auto xx=(const __nv_bfloat16*)x+off*H;auto ii=(const int*)ids+off*K;auto pp=(const float*)prob+off*K;auto yy=(__nv_bfloat16*)y+off*H;
-  if(n>1)prepare<<<n*16,256,0,stream>>>(a,xx,ii,n);
+  auto xx=x?(const __nv_bfloat16*)x+off*H:nullptr;auto ii=(const int*)ids+off*K;auto pp=(const float*)prob+off*K;auto yy=(__nv_bfloat16*)y+off*H;
+  if (n > 1 && !prepared) {
+   if (selection.router) {
+    auto rc = fastllm::cuda_launch::LaunchProgrammatic<prepare<true>>(
+        dim3(n*16), dim3(256), 0, stream, a, xx, ii, n, selection);
+    if (rc != cudaSuccess) return rc;
+   } else {
+    prepare<false><<<n*16,256,0,stream>>>(a,xx,ii,n);
+   }
+  }
   if (VerifyOperand::supports(a.mxfp4,n)) {
    constexpr int blocks = 8 * EP_SMS, smem = VerifyOperand::Stages * 18432;
    if(s->pairedGateSupported){
@@ -248,6 +356,47 @@ extern "C" int fastshared_ep_run(void*state,int rank,int layer,int rows,const vo
   execute<false><<<GRID,128,db*18432,stream>>>(a,ii,pp);
   finish<<<dim3(16,n),128,0,stream>>>(a,yy,ii,n);
  }return cudaGetLastError();
+}
+extern "C" int fastshared_ep_prepared_input(void *state,int rank,int layer,int rows,FastllmMoePreparedInput *p) {
+ using namespace fastllm_shared_flex_ep;
+ auto *s=static_cast<State*>(state);
+ if(!p||!s||!s->routerSupported||!s->preparedRouterSupported||rank<0||rank>=R||layer<0||layer>=int(s->layers.size()))return 0;
+ const auto &a=s->layers[layer][rank];
+ if(!VerifyOperand::supports(a.mxfp4,rows))return 0;
+ *p={}; p->rows=rows;p->epRank=rank;p->overlapVerifyGate=true;
+ p->values=reinterpret_cast<uint8_t*>(a.gpartial+VerifyOperand::ScratchFloats);
+ p->scales=p->values+MAX_M*H;p->counters=a.gcount;p->epoch=a.epoch;
+ p->unique=a.nuniq;p->experts=a.uniq;p->members=a.members;
+ return 1;
+}
+extern "C" int fastshared_ep_prepared_norm(const void *x,const float *weight,float *router,const float *gamma,
+        void *normed,float eps,FastllmMoePreparedInput p,bool afterSwa) {
+ using namespace fastllm_shared_flex_ep;
+ using namespace fastllm_norm_rows;
+ if(!p.Valid(8)||p.epRank<0||!x||!weight||!router||!gamma||!normed||!std::isfinite(eps)||eps<=0||
+    ((uintptr_t(x)|uintptr_t(weight)|uintptr_t(gamma)|uintptr_t(normed)|uintptr_t(router))&15u))
+  return cudaErrorInvalidValue;
+ if(afterSwa)return fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterDirect<8,2,true,8,false,true,EpVerifyRoutes>>(
+    dim3(32,4),dim3(256),0,cudaStreamPerThread,static_cast<const BF16*>(x),weight,router,gamma,
+    static_cast<BF16*>(normed),eps,8,p,(const BF16*)nullptr,(BF16*)nullptr);
+ NormRowsRouterDirect<8,2,true,8,false,false,EpVerifyRoutes><<<dim3(32,4),256,0,cudaStreamPerThread>>>(
+    static_cast<const BF16*>(x),weight,router,gamma,static_cast<BF16*>(normed),eps,8,p);
+ return cudaGetLastError();
+}
+extern "C" int fastshared_ep_run_prepared(void *state,int rank,int layer,const int *ids,const float *prob,void *y) {
+ return runEp(state,rank,layer,8,nullptr,ids,prob,y,{},true);
+}
+extern "C" int fastshared_ep_run(void*state,int rank,int layer,int rows,const void*x,const void*ids,const void*prob,void*y) {
+ return runEp(state,rank,layer,rows,x,ids,prob,y,{});
+}
+extern "C" int fastshared_ep_router_supported(void *state) {
+ return state && static_cast<fastllm_shared_flex_ep::State *>(state)->routerSupported;
+}
+extern "C" int fastshared_ep_run_router(void *state, int rank, int layer, int rows, const void *x,
+        const float *router, const float *bias, int *ids, float *scores, void *out, int needNorm, float scale) {
+ if (!fastshared_ep_router_supported(state) || rows < 2 || rows > fastllm_shared_flex_ep::MAX_M ||
+     !router || reinterpret_cast<uintptr_t>(router) % 16) return 1;
+ return runEp(state, rank, layer, rows, x, ids, scores, out, {router, bias, ids, scores, needNorm, scale});
 }
 extern "C" size_t fastshared_ep_workspace_bytes(){using namespace fastllm_shared_flex_ep;return 32*4+32*8*4+32*4+4+VerifyOperand::CounterCount*sizeof(int)+MAX_M*K*4+4+MAX_M*K*(G_SPLIT+D_SPLIT)*4096*4+MAX_M*H+MAX_M*H/32+MAX_M*K*I+MAX_M*K*I/32+8+2*MAX_M*R*(H/2)*8;}
 extern "C" void fastshared_ep_destroy(void*state){auto*s=(fastllm_shared_flex_ep::State*)state;if(!s)return;

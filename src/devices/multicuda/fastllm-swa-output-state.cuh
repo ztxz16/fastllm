@@ -118,6 +118,13 @@ public:
                 dim3(32, 4), 256, 0, cudaStreamPerThread, (const BF16 *)hidden, routerWeight,
                 router, normWeight, (BF16 *)normed, eps, rows, FastllmMoePreparedInput{});
 #endif
+        if (prepared && prepared->epRank>=0) {
+#ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
+            return static_cast<cudaError_t>(fastshared_ep_prepared_norm(hidden,routerWeight,router,normWeight,normed,eps,*prepared,afterSwa));
+#else
+            return cudaErrorNotSupported;
+#endif
+        }
         if (routerWeight && prepared && prepared->routed) {
             FastllmMoePreparedInput input = *prepared;
             void *params[] = {&hidden, &routerWeight, &router, &normWeight,
@@ -179,7 +186,7 @@ public:
             const FastllmMoePreparedInput *prepared = nullptr) {
         args.peers = peers; args.epochs = epochs[rank]; args.rank = rank;
         args.overlapRouter = args.rotary && args.rows == 8 && routerWeight &&
-            (prepared ? swaRouterPdlSupported && prepared->overlapVerifyGate && !prepared->routed
+            (prepared ? swaRouterPdlSupported && prepared->overlapVerifyGate && (!prepared->routed || prepared->epRank>=0)
                       : unpreparedRouterPdlSupported);
         void *params[] = {&args};
         const bool wide = args.rows > 8 && verifySupported[2];
