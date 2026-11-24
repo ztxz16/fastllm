@@ -43,7 +43,8 @@ PD 分离拟支持 P/D 两端 KV 分布不同时的重分片，包括不同 TP �
 - 非 PD 场景选择一个实例完成整个请求；PD 场景分别选择 P、D 实例，
   增加 P/D 配对与 Prefill→Decode 的交接协调。
 - Router/Proxy 的服务级策略按下述[Router 策略支持](#router-策略支持)要求推进，
-  不沿用 FT 实例内部的轮询、前缀匹配、`load` 三种策略体系；Router 默认策略仍待讨论。
+  不沿用 FT 实例内部的轮询、前缀匹配、`load` 三种策略体系；默认采用 `cache_aware`，
+  默认策略及相关配置项对齐 vLLM Router。
 - 完整推理服务以及 P、D 服务内部的副本选择，按[实例内部请求路由统一](TODO.md#实例内部请求路由统一)
   要求推进；默认 `load` 和健康副本轮询等约定限定于实例内部，不决定 Router 的服务级策略。
 - P、D 保留各自实例内部的请求排队、Batch 组织和计算调度，复用现有 TP、
@@ -72,10 +73,40 @@ PD 分离的服务级 Router 拟支持以下八种策略，借鉴 vLLM Router �
 - `cache_aware` 的历史匹配是缓存估计，不代表 KV 必然仍驻留；`kv_aware` 使用缓存事件维护状态。
 - `sticky_least_loaded` 的活跃会话数与未完成请求数分开统计；`rendezvous_hash` 的哈希值不是负载分数。
 - 本条规定服务级策略范围，不修改实例内部 DP 副本选择的既定策略与默认 `load` 要求。
-- Router 默认策略、具体配置参数、P/D 负载统计与评分、阈值及会话生命周期方案后续补充，
-  不因 vLLM Router 默认使用 `cache_aware` 而直接确定 FT 的默认值。
+- Router 默认策略与相关配置按下述要求对齐 vLLM Router；其他策略的负载统计、评分及
+  会话生命周期等具体实现方案后续补充。
 
-记录日期：2026-11-24。状态：需求已确认，八种策略均待实现，尚无功能或性能验收结果。
+### 默认策略与配置
+
+FT 的 PD Router 采用以下命令行配置项与默认值：
+
+| 配置项 | 默认值 | 含义 |
+|---|---|---|
+| `--policy` | `cache_aware` | P、D 共用的默认服务级路由策略，可显式选择上述八种策略。 |
+| `--prefill-policy` | 未指定，继承 `--policy` | 单独覆盖 P 端策略。 |
+| `--decode-policy` | 未指定，继承 `--policy` | 单独覆盖 D 端策略。 |
+| `--cache-threshold` | `0.3` | 前缀匹配比例阈值，即 30%。 |
+| `--balance-abs-threshold` | `64` | 同一候选池中最大负载与最小负载的差值阈值。 |
+| `--balance-rel-threshold` | `1.5` | 同一候选池中最大负载相对于最小负载的倍数阈值。 |
+
+- 配置优先级为：显式指定的 P/D 策略 > 公共 `--policy` > 默认 `cache_aware`。
+  所有策略参数均未指定时，P、D 都使用 `cache_aware`；仅覆盖一端时，另一端继续继承公共策略。
+- `cache_aware` 的负载按 Router 维护的未完成请求数统计。分别在 P、D 各自的健康候选池内
+  取最大、最小负载，不把 P、D 的负载混在一起比较。
+- “明显失衡”须同时满足 `max_load - min_load > balance_abs_threshold` 和
+  `max_load > min_load * balance_rel_threshold`；默认即差值严格大于 64，且最大负载
+  严格大于最小负载的 1.5 倍。
+- 未明显失衡且最高前缀匹配比例严格大于 `cache_threshold` 时，优先选择前缀匹配最多的服务；
+  匹配比例不足或负载明显失衡时选择负载最低的服务。默认匹配比例恰好为 30% 时不触发前缀优先。
+- 上述阈值可通过命令行调整，仅用于启用 `cache_aware` 的阶段；P、D 分别判断各自候选池。
+  这些服务级默认值不改变实例内部 `--dp-routing` 默认 `load` 的既定要求。
+
+参考：[vLLM Router 默认策略，main.rs:126](https://github.com/vllm-project/router/blob/main/src/main.rs#L126)、
+[阈值默认配置，main.rs:183](https://github.com/vllm-project/router/blob/main/src/main.rs#L183)、
+[前缀选择条件，cache_aware.rs:365](https://github.com/vllm-project/router/blob/main/src/policies/cache_aware.rs#L365)、
+[失衡条件，cache_aware.rs:445](https://github.com/vllm-project/router/blob/main/src/policies/cache_aware.rs#L445)。
+
+更新日期：2026-11-24。状态：八种策略、默认策略与相关配置要求已确认，均待实现，尚无功能或性能验收结果。
 
 ## Router/Proxy 有条件请求重试
 
