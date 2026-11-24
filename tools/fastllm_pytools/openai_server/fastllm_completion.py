@@ -1277,10 +1277,16 @@ class FastLLmCompletion:
       ]
       return "\n".join([text for text in text_parts if text != ""])
 
+  def _decoded_image(self, image: Image.Image) -> Image.Image:
+      if self._uses_inkling_messages():
+          # The native encoder composites transparent pixels on the checkpoint's checkerboard.
+          return image.copy()
+      return image.convert("RGB")
+
   def _load_image_from_bytes(self, image_bytes: bytes) -> Image.Image:
       try:
           with Image.open(io.BytesIO(image_bytes)) as image:
-              return image.convert("RGB")
+              return self._decoded_image(image)
       except Exception as exc:
           raise ValueError("Invalid image bytes.") from exc
 
@@ -1311,7 +1317,7 @@ class FastLLmCompletion:
                       and file_path[2] == ":"):
                   file_path = file_path[1:]
               with Image.open(file_path) as image:
-                  return image.convert("RGB")
+                  return self._decoded_image(image)
       except ValueError:
           raise
       except Exception as exc:

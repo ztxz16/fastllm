@@ -6,6 +6,7 @@
 #include "models/mimo_tool_grammar.h"
 #include "models/naive_n05_flash.h"
 #include "models/clover.h"
+#include "models/inkling2.h"
 #include "models/hy4_flash.h"
 #include "parallel/model.h"
 #include "devices/disk/diskdevice.h"
@@ -1255,6 +1256,17 @@ extern "C" {
             temperature, repeat_penalty, output_logits, stop_token_len, stop_token_ids, nullptr);
     }
 
+    DLL_EXPORT int prepare_inkling_image_prompt(int modelId, const int *tokens, int n, const int *sizes,
+                                              int images, int *output, int capacity, int *offsets) {
+        const auto *model = dynamic_cast<fastllm::Inkling2Model *>(models.GetModel(modelId));
+        if (!model) return -1;
+        try {
+            return model->PrepareImagePrompt(tokens, n, sizes, images, output, capacity, offsets);
+        } catch (const std::exception &) {
+            return -1;
+        }
+    }
+
     DLL_EXPORT int launch_response_llm_model_multimodal(int modelId, int len, int *values, 
                                   char *multimodal_json, uint8_t *multimodal_data,
                                   int max_length, int min_length, bool do_sample, float top_p, int top_k,
@@ -1276,8 +1288,8 @@ extern "C" {
         std::vector <float> imageInput;
         std::map <std::string, std::vector <fastllm::Data*> > *multimodalInput = new std::map <std::string, std::vector <fastllm::Data*> > ();
         std::string mode = multimodal_config["mode"].string_value();
-        if (mode == "deepseek_v41") {
-            // V4.1 receives already-expanded image token spans. Speculative
+        if (mode == "deepseek_v41" || mode == "inkling2") {
+            // These models receive already-expanded image token spans. Speculative
             // decoding needs the complete prompt length to honor output limits.
             config.input_token_length = input.size();
         }
@@ -1312,7 +1324,8 @@ extern "C" {
             tensorData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, shape, values));
             (*multimodalInput)[name].push_back(tensorData);
         };
-        auto parseDataType = [](const std::string &dtype) {
+        auto parseDataType = [&](const std::string &dtype) {
+            if (mode == "inkling2" && dtype == "uint8") return fastllm::DataType::INT8;
             if (dtype == "float32") {
                 return fastllm::DataType::FLOAT32;
             }
@@ -1330,6 +1343,8 @@ extern "C" {
         };
         auto dataTypeBytes = [](fastllm::DataType dataType) -> int {
             switch (dataType) {
+                case fastllm::DataType::INT8:
+                    return 1;
                 case fastllm::DataType::FLOAT32:
                 case fastllm::DataType::INT32:
                     return 4;
@@ -1387,7 +1402,7 @@ extern "C" {
             fastllm::Data *mmTokenTypeIdsData = new fastllm::Data();
             mmTokenTypeIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, mmTypeShape, mmTokenTypeIds));
             (*multimodalInput)["mm_token_type_ids"].push_back(mmTokenTypeIdsData);
-        } else if (mode == "qwen35" || mode == "deepseek_v41") {
+        } else if (mode == "qwen35" || mode == "deepseek_v41" || mode == "inkling2") {
             if (multimodal_config["tensors"].is_array()) {
                 for (auto &tensorNode : multimodal_config["tensors"].array_items()) {
                     addTypedPayloadTensor(

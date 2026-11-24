@@ -19,8 +19,10 @@ from typing import Optional, Tuple, Union, List, Callable, Dict, Any;
 
 try:
     from .chat_template import apply_hf_chat_template, normalize_conversation
+    from .inkling2_multimodal import image_messages, image_payload
 except ImportError:
     from chat_template import apply_hf_chat_template, normalize_conversation
+    from inkling2_multimodal import image_messages, image_payload
 
 try:
     from .generation_errors import PromptTooLongError
@@ -458,6 +460,12 @@ if hasattr(fastllm_lib, "launch_response_clover_llm_model"):
     fastllm_lib.configure_clover_llm_model.restype = ctypes.c_bool
     fastllm_lib.get_clover_error.argtypes = []
     fastllm_lib.get_clover_error.restype = ctypes.c_char_p
+
+if hasattr(fastllm_lib, "prepare_inkling_image_prompt"):
+    fastllm_lib.prepare_inkling_image_prompt.argtypes = [
+        ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+    fastllm_lib.prepare_inkling_image_prompt.restype = ctypes.c_int
 
 fastllm_lib.launch_response_llm_model_multimodal.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
                                                             ctypes.c_char_p, ctypes.c_void_p, 
@@ -2097,6 +2105,31 @@ class model:
         messages.insert(0, {"role": "system", "tools": tools})
         return messages
 
+    def _inkling_image_prompt(self, conversation, images, videos, add_generation_prompt, enable_thinking,
+                              tools, thinking_effort, tool_choice, chat_template_kwargs, count_only=False):
+        if videos:
+            raise ValueError("Inkling 2 Mini accepts still images")
+        if not self._has_hf_chat_template():
+            raise ValueError("Inkling image input requires the checkpoint tokenizer and chat template")
+        messages = image_messages(conversation, images)
+        ids = apply_hf_chat_template(self.hf_tokenizer, messages, tokenize=True,
+                                     add_generation_prompt=add_generation_prompt, enable_thinking=enable_thinking,
+                                     tools=tools, thinking_effort=thinking_effort, tool_choice=tool_choice,
+                                     chat_template_kwargs=chat_template_kwargs)
+        tokens = (ctypes.c_int * len(ids))(*ids)
+        sizes = (ctypes.c_int * (2 * len(images)))(*(dim for image in images for dim in (image.height, image.width)))
+        prepare = fastllm_lib.prepare_inkling_image_prompt
+        length = prepare(self.model, tokens, len(ids), sizes, len(images), None, 0, None)
+        if length < 0:
+            raise ValueError("Inkling image prompt needs matching image placeholders, valid dimensions and vision weights")
+        if count_only:
+            return length
+        expanded = (ctypes.c_int * length)()
+        offsets = (ctypes.c_int * len(images))()
+        if prepare(self.model, tokens, len(ids), sizes, len(images), expanded, length, offsets) != length:
+            raise ValueError("Failed to expand the Inkling image prompt")
+        return expanded, offsets
+
     def _prepare_deepseek_v41_multimodal(self, conversation, images, tools, enable_thinking,
                                          reasoning_effort = None):
         """DeepSeek-V4.1 图文输入：官方 encode_messages 渲染带占位符的 prompt，再展开图像 span。
@@ -2308,13 +2341,10 @@ class model:
         multimodal_images = list(images or [])
         multimodal_videos = list(videos or [])
         if multimodal_images or multimodal_videos:
-            architecture = ""
-            try:
-                architecture = self.config["architectures"][0]
-            except:
-                architecture = ""
+            architecture = self._get_architecture()
             if architecture == "Inkling2LoopForConditionalGeneration":
-                raise ValueError("Inkling 2 Mini currently supports text inputs only")
+                return self._inkling_image_prompt(self.trans_conversation(conversation), multimodal_images, multimodal_videos,
+                    add_generation_prompt, enable_thinking, tools, thinking_effort, tool_choice, chat_template_kwargs, count_only=True)
             if self._is_deepseek_v41():
                 if multimodal_videos:
                     raise ValueError("DeepSeek-V4.1 does not support video input.")
@@ -2861,7 +2891,17 @@ class model:
         if (len(multimodal_images) > 0 or len(multimodal_videos) > 0):
             architecture = self._get_architecture()
             if architecture == "Inkling2LoopForConditionalGeneration":
-                raise ValueError("Inkling 2 Mini currently supports text inputs only")
+                if conversation is None:
+                    conversation = self._build_messages(query, history)
+                ids, offsets = self._inkling_image_prompt(conversation, multimodal_images, multimodal_videos,
+                    add_generation_prompt, enable_thinking, tools, thinking_effort, tool_choice, chat_template_kwargs)
+                config, payload = image_payload(multimodal_images, offsets)
+                stops, stop_ids = self.stop_token_ctypes(stop_token_ids)
+                return fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(ids), ids,
+                    json.dumps(config).encode(), payload,
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stops, stop_ids)
             if (architecture == "CogVLMForCausalLM"):
                 if (len(multimodal_videos) > 0):
                     raise ValueError("CogVLM does not support video input.")
