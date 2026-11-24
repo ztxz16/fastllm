@@ -2,6 +2,9 @@
 // https://huggingface.co/thinkingmachines/Inkling-2-Mini
 // https://vllm-project.github.io/2026/11/20/inkling2-mini.html
 #include "runtime.cuh"
+#include "gguf.h"
+#include "devices/cuda/fastllm-cuda-launch.cuh"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "utils/recurrent_prefix_cache.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
@@ -15,6 +18,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
+#include "devices/cuda/fastllm-bf16-warp-dot.cuh"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -137,7 +141,9 @@ __global__ void unpackProjection(const T *src, U *dst, ProjectionParts parts, in
     }
 }
 
+#include "q8-decode.cuh"
 #include "loop-controller.cuh"
+#include "q8-controller.cuh"
 
 template <class T, class Residual> __global__ void conv(const T *x, const float *history, const float *weight, const float *dynamic,
                      Residual *out, int n, int width, int taps, int heads, const Residual *residual) {
@@ -184,8 +190,12 @@ template <bool Timeline = false, typename T, typename U> __device__ float update
     }
     return v * rsqrtf(1.0f + taps * (dynamic ? 2 : 1));
 }
-template <bool Timeline = false, typename T, typename Residual> __global__ void decodeConv(const T *input, const DecodeVisit *visit, int index, const float *weight,
+
+#include "decode-finish.cuh"
+
+template <bool Timeline = false, typename T, typename Residual, bool Pdl = false> __global__ void decodeConv(const T *input, const DecodeVisit *visit, int index, const float *weight,
                            const float *dynamic, Residual *output, int d, int taps, int heads, const Residual *residual, int chain = 1) {
+    if constexpr (Pdl) cuda_launch::DependencyStart();
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= d)
         return;
@@ -212,6 +222,7 @@ template<class T> __global__ void storeDecodeKv(const DecodeVisit *visit, const 
 }
 #include "attention-input.cuh"
 #include "window-decode.cuh"
+#include "basalt-window.cuh"
 template <class T, class Residual>
 Rows<Residual> convolution(const Rows<T> &x, const float *w, const Matrix &dyn, int heads, int taps, Matrix &hist, const Residual *residual) {
     const int count = taps - 1, d = x.cols;
@@ -347,7 +358,7 @@ struct Segment {
     const DecodeVisit *timeline = nullptr;
 };
 template <typename Residual = float, typename T> Rows<Residual> convolutions(const Rows<T> &input, const float *weight, const Matrix &dynamic, int heads, int taps,
-                    const std::vector<Segment> &batch, size_t slot, int index, const Rows<Residual> &residual = {}) {
+                    const std::vector<Segment> &batch, size_t slot, int index, const Rows<Residual> &residual = {}, bool pdl = false) {
     if (batch.front().timeline) {
         Rows<Residual> out(input.rows, input.cols);
         const auto *visits = batch.front().timeline + slot * input.rows;
@@ -359,6 +370,12 @@ template <typename Residual = float, typename T> Rows<Residual> convolutions(con
     }
     if (batch.front().decode) {
         Rows<Residual> out(1, input.cols);
+        if (pdl) {
+            if (!cuda_launch::Launch<decodeConv<false, T, Residual, true>>((input.cols + 255) / 256, 256, 0, cudaStreamPerThread,
+                    input.p, batch.front().decode + slot, index, weight, dynamic.p, out.p, input.cols, taps, heads, residual.p, 1))
+                throw std::runtime_error("Inkling residual convolution launch failed");
+            return out;
+        }
         decodeConv<<<(input.cols + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             input.p, batch.front().decode + slot, index, weight, dynamic.p, out.p, input.cols, taps, heads, residual.p);
         return out;
@@ -383,7 +400,7 @@ template <typename Residual = float, typename T> Rows<Residual> convolutions(con
 }
 class Decoder final : public Runtime {
     Config c;
-    enum class Projection { Default, WindowOutput, DecodeHead, AttentionMma, DraftHead };
+    enum class Projection { Default, PdlDecode, DecodeHead, AttentionMma, DraftHead };
     bool decodeArithmetic = false;
     const FastllmBf16MmaProjections *bf16Mma = nullptr;
     Placement placement;
@@ -423,11 +440,13 @@ class Decoder final : public Runtime {
     std::vector<DecodeVisit> hostVisits;
     Matrix graphLogits, unitScale, splitScratch;
     WindowDecodeKernel windowDecodeKernel = WindowDecodeKernel::Paged;
-    bool windowDecodePdl = false;
-    FastllmBf16MmaProjections::Project windowOutputGemv = nullptr;
+    bool pagedDecodePdl = false;
+    size_t q8WindowSmem = 0, bf16WindowSmem = 0;
+    FastllmBf16MmaProjections::Project decodeBf16Gemv = nullptr;
+    bool backboneBf16 = false;
     int smCount = 0, sm120GlobalSplits = 0, verifyAttentionSplits = 0;
     bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
-    bool bf16WindowBias = false, batchedController = false, fusedPrefillController = false;
+    bool bf16WindowBias = false, batchedController = false, fusedPrefillController = false, singletonControllerPdl = false;
 
     Data &weight(const std::string &key) const {
         auto &w = weights.weight.at("model.llm." + key);
@@ -441,18 +460,65 @@ class Decoder final : public Runtime {
             throw std::runtime_error("Inkling tensor shape mismatch: " + key);
         return static_cast<const float *>(w.cudaData);
     }
+    static bool q8Projection(const Data &w) {
+        return w.dataType == DATA_GGUF_FORMAT && w.ggmlType == GGML_TYPE_Q8_0;
+    }
+    template<class T, class U> void projectQ8(const Rows<T> &x, const Data &w, int offset, Rows<U> &out, bool window = false, float cap = 0.f) const {
+        if (window && singletonControllerPdl && x.cols % 32 == 0 && x.rows <= 65535) {
+            Rows<InklingQ81> encoded(x.rows, x.cols / 32);
+            if (!cuda_launch::Launch<encodeQ8Row<T>>(dim3((x.cols/4+127)/128, x.rows), 128, 0, cudaStreamPerThread,
+                    x.p, encoded.p, x.cols))
+                throw std::runtime_error("Inkling Q8 input quantization failed");
+            const auto *weights = static_cast<const InklingQ80 *>(w.cudaData) + size_t(offset) * (x.cols / 32);
+            if (cap > 0.f)
+                launchQ8Window<U, true>(weights, encoded.p, out.p, x.rows, x.cols, out.cols, out.cols, out.cols, cap);
+            else
+                launchQ8Window(weights, encoded.p, out.p, x.rows, x.cols, out.cols, out.cols, out.cols);
+            return;
+        }
+        auto input = castRows<float>(x);
+        Matrix tmp;
+        float *dst;
+        if constexpr (std::is_same_v<U, float>) dst = out.p;
+        else { tmp = Matrix(out.rows, out.cols); dst = tmp.p; }
+        const size_t bytes = FastllmCudaQ8ProjectionScratchBytes(x.rows, x.cols);
+        Buffer<uint8_t> scratch(bytes);
+        const auto stride = w.GetBytes() / w.dims[0];
+        FastllmCudaProjectQ8_0(input.p, static_cast<const uint8_t *>(w.cudaData) + offset * stride,
+                               dst, scratch.p, x.rows, x.cols, out.cols);
+        if (cap > 0.f) {
+            const size_t n = size_t(out.rows) * out.cols;
+            softcap<<<(n + 255) / 256, 256, 0, cudaStreamPerThread>>>(dst, dst, n, cap);
+        }
+        if constexpr (!std::is_same_v<U, float>) {
+            const size_t n = size_t(out.rows) * out.cols;
+            castProjection<<<(n + 255) / 256, 256, 0, cudaStreamPerThread>>>(dst, out.p, n);
+        }
+    }
     template <typename T, typename U> void projectInto(const Rows<T> &x, const std::string &key, Rows<U> &out,
                                             int offset, int groups, Projection mode = Projection::Default) const {
         const int columns = out.cols;
-        const auto &w = weights.weight.at("model.llm." + key);
+        auto &w = weights.weight.at("model.llm." + key);
         const auto type = std::is_same<T, half>::value ? FLOAT16 : BFLOAT16;
-        if (w.dataType != type || w.dims.size() != 2 || w.dims[1] != x.cols || columns < 1 ||
+        if (w.dims.size() != 2 || w.dims[1] != x.cols || columns < 1 ||
             offset < 0 || offset + groups * columns > w.dims[0] || x.rows % groups)
             throw std::runtime_error("Inkling packed projection shape or type: " + key);
         const int n = x.rows / groups, m = x.cols;
+        if (groups == 1 && q8Projection(w)) {
+            projectQ8(x, w, offset, out);
+            return;
+        }
+        if constexpr (std::is_same_v<T, U>) {
+            if (w.dataType == NVFP4_BLOCK_16 && !offset && groups == 1 && columns == w.dims[0]) {
+                Data input(type, {n, m}, CUDA, x.p), result(type, {n, columns}, CUDA, out.p);
+                DoCudaLinear(input, w, *GetEmptyData(), result);
+                return;
+            }
+        }
+        if (w.dataType != type) throw std::runtime_error("Unsupported Inkling projection dtype: " + key);
         auto *matrix = static_cast<T *>(w.cudaData) + size_t(offset) * m;
         if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<U, T>) {
-            if (mode == Projection::WindowOutput && windowOutputGemv(x.p, matrix, out.p, n, m, columns))
+            if (mode == Projection::PdlDecode && decodeBf16Gemv && decodeBf16Gemv(x.p, matrix, out.p, n, m, columns))
                 return;
             if (mode == Projection::DraftHead && bf16Mma &&
                 bf16Mma->draftLogits(x.p, matrix, out.p, n, m, columns))
@@ -486,11 +552,10 @@ class Decoder final : public Runtime {
     }
 
     template <typename T, typename Out> Rows<Out> control(const Matrix *dest, const Matrix &messages, const float *const *norms,
-                                         int count, const std::string &prefix) const {
+                                         int count, const std::string &prefix, InklingQ81 *encoded = nullptr, bool pdl = false) const {
         const int n = dest[0].rows, d = dest[0].cols;
         LoopStreams streams{};
-        auto pair = Rows<T>::temporary(count * n, 2 * d);
-        auto out = Rows<Out>::temporary(count * n, d);
+        auto out = Rows<Out>::temporary(encoded ? 0 : count * n, d);
         for (int i = 0; i < count; ++i)
             streams.items[i] = {dest[i].p, messages.slice(i * n, n).p, norms[i]};
         const auto path = prefix + (count == 1 ? "controllers.mlp." : "controllers.qkv.");
@@ -500,17 +565,46 @@ class Decoder final : public Runtime {
                 return nullptr;
             return static_cast<const __nv_bfloat16 *>(w.cudaData);
         };
+        auto blendDecode = [&](const Matrix &gates) {
+            auto launch = [&](auto *result) {
+                using Result = std::remove_pointer_t<decltype(result)>;
+                return cuda_launch::Launch<ControllerNormRows<false, T, Result, 2304, false, true>>(
+                    dim3(n, count), 512, 0, cudaStreamPerThread, streams, gates.p, result, c.eps);
+            };
+            if (!(encoded ? launch(encoded) : launch(out.p)))
+                throw std::runtime_error("Inkling controller blend launch failed");
+        };
+        if (pdl && singletonControllerPdl && c.rank == 64 && n == 1 && d == 2304) {
+            const auto &down = weights.weight.at("model.llm." + path + "down_weight");
+            const auto &up = weights.weight.at("model.llm." + path + "gates_weight");
+            if (down.dataType == BFLOAT16 && up.dataType == BFLOAT16 &&
+                down.dims == std::vector<int>{count * c.rank, 2 * d} && up.dims == std::vector<int>{count * 2 * d, c.rank}) {
+                Matrix hidden = Matrix::temporary(count, c.rank), gates = Matrix::temporary(count, 2 * d);
+                if (!cuda_launch::Launch<singletonControllerDown>(dim3(c.rank, count), 256, 0, cudaStreamPerThread,
+                        streams, static_cast<const __nv_bfloat16 *>(down.cudaData), hidden.p, c.rank, c.eps) ||
+                    !cuda_launch::Launch<singletonControllerGates>(dim3(2 * d / 32, count), 256, 0, cudaStreamPerThread,
+                        hidden.p, static_cast<const __nv_bfloat16 *>(up.cudaData), gates.p, d))
+                    throw std::runtime_error("Inkling fused controller launch failed");
+                blendDecode(gates);
+                return out;
+            }
+        }
+        auto pair = Rows<T>::temporary(count * n, 2 * d);
         if constexpr (std::is_same_v<T, __nv_bfloat16>) {
             if (batchedController && decodeArithmetic && n > 1) {
                 const auto *down = bf16Weight("down_weight", count * c.rank, 2 * d);
                 const auto *gate = bf16Weight("gates_weight", count * 2 * d, c.rank);
                 if (down && gate) {
-                    launchBatchedController(streams, pair, out, down, gate, count, c.rank, smCount, c.eps);
+                    launchBatchedController(streams, pair, out, down, gate, count, c.rank, smCount, c.eps, encoded);
                     return out;
                 }
             }
         }
-        if (d == 2304)
+        if (pdl) {
+            if (!cuda_launch::Launch<ControllerNormRows<true, T, T, 2304, false, true>>(
+                    dim3(n, count), 512, 0, cudaStreamPerThread, streams, static_cast<const float *>(nullptr), pair.p, c.eps))
+                throw std::runtime_error("Inkling controller pair launch failed");
+        } else if (d == 2304)
             ControllerNormRows<true, T, T, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, nullptr, pair.p, c.eps);
         else PairRMSNorm<<<count * n * 2, 512, 0, cudaStreamPerThread>>>(streams, pair.p, n, d, c.eps);
         auto hidden = linear(pair, path + "down_weight", c.rank, count);
@@ -532,7 +626,11 @@ class Decoder final : public Runtime {
         auto gates = Matrix::temporary(count * n, 2 * d);
         projectInto(hidden, path + "gates_weight", gates, 0, count);
         const size_t bytes = size_t(d) * sizeof(float);
-        if (d == 2304)
+        if (pdl) {
+            blendDecode(gates);
+        } else if (encoded)
+            ControllerNormRows<false, T, InklingQ81, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, gates.p, encoded, c.eps);
+        else if (d == 2304)
             ControllerNormRows<false, T, Out, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, gates.p, out.p, c.eps);
         else BlendRMSNorm<T, Out><<<count * n, 512, bytes <= 16384 ? bytes : 0, cudaStreamPerThread>>>(
             streams, gates.p, out.p, n, d, c.eps);
@@ -600,8 +698,39 @@ class Decoder final : public Runtime {
         return bf16Mma && usesVerifyArithmetic(batch) ? Projection::AttentionMma : Projection::Default;
     }
 
+    template<class R, class Launch> void withDecodeSources(const std::vector<Rows<R>> &blocks, const Rows<R> &x, Launch launch) const {
+        cuda_attn_res::SourceList<R> src{};
+        int count = 0;
+        for (auto &b : blocks) src.items[count++] = b.p;
+        src.items[count++] = x.p;
+        cuda_attn_res::WithRegisterSources(count, [&](auto size) { launch(size, src); });
+    }
+    template<class T, class Out, class R> void mixDecodeInto(const std::vector<Rows<R>> &blocks, const Rows<R> &x, const Query *q, int nq,
+                                   Out *out, bool normalizeValues) const {
+        cuda_attn_res::Queries queries{};
+        std::copy_n(q, nq, queries.items);
+        auto launch = [&](auto tag, const cuda_attn_res::SourceList<R> &src) {
+            constexpr int N = decltype(tag)::value;
+            using Store = std::conditional_t<std::is_same_v<Out, InklingQ81>, Q8RowStore, void>;
+            if (!cuda_launch::Launch<cuda_attn_res::AttnResRegisterRows<N, T, Out, 2304, (N > 4), Store, true, R>>(
+                    dim3(x.rows, nq), 512, 0, cudaStreamPerThread, src, queries, x.rows, 2304, c.eps, normalizeValues, out, false))
+                throw std::runtime_error("Inkling decode AttnRes launch failed");
+        };
+        withDecodeSources(blocks, x, launch);
+    }
+
+    template<class Round, class Out = float, class R>
+    Rows<Out> mixLayerInputs(const std::vector<Rows<R>> &blocks, const Rows<R> &last, const Query *queries,
+                             int count, bool decodePdl) const {
+        if (!decodePdl || blocks.size() >= 8)
+            return mix<Round, Out>(blocks, last, queries, count, c.eps, c.normValues);
+        auto result = Rows<Out>::temporary(count * last.rows, last.cols);
+        mixDecodeInto<Round>(blocks, last, queries, count, result.p, c.normValues);
+        return result;
+    }
+
     template<class T> AttentionProjection<T> projectAttention(const std::array<Rows<T>, 3> &inputs,
-                                                             const std::string &att, bool local, Projection mode) const {
+                                                             const std::string &att, bool local, Projection mode, const Rows<InklingQ81> &encoded, int rows) const {
         const int q = c.heads * c.headDim, k = c.kvHeads * c.headDim, taps = local ? 0 : c.kvHeads * c.conv;
         AttentionProjection<T> result;
         result.widths = {q, c.heads * c.relative, q, c.heads, k, taps, k, taps};
@@ -610,9 +739,44 @@ class Decoder final : public Runtime {
         if (mode == Projection::AttentionMma &&
             ((inputs[0].cols | (2 * q + c.heads * (c.relative + 1)) | (k + taps)) & 7))
             mode = Projection::Default;
-        result.shared = inputs[0].p == inputs[1].p && inputs[0].p == inputs[2].p;
-        result.storage = Rows<T>::temporary(inputs[0].rows, std::accumulate(result.widths.begin(), result.widths.end(), 0));
+        result.shared = encoded.p ? encoded.rows == rows : inputs[0].p == inputs[1].p && inputs[0].p == inputs[2].p;
+        result.storage = Rows<T>::temporary(rows, std::accumulate(result.widths.begin(), result.widths.end(), 0));
+        if (encoded.p) {
+            const auto &w = weights.weight.at("model.llm." + att + "packed.weight");
+            const int width = result.storage.cols, kEnd = width - (k + taps), qEnd = kEnd - (k + taps);
+            if (w.dims.size() != 2 || w.dims[0] != width || w.dims[1] != 2304)
+                throw std::runtime_error("Invalid Inkling Q8 packed projection");
+            const auto *weight = static_cast<const InklingQ80 *>(w.cudaData);
+            if (rows > 1) {
+                launchQ8Verify(weight, encoded.p, result.storage.p, rows, 2304,
+                               result.shared ? width : qEnd, result.shared ? width : kEnd, width);
+                return result;
+            }
+            auto launch = [&](auto segmented) {
+                return cuda_launch::Launch<q8DecodeProjection<2304, decltype(segmented)::value, T>>(
+                    width, 128, 0, cudaStreamPerThread, weight, encoded.p, qEnd, kEnd, result.storage.p, 0.f);
+            };
+            if (!(result.shared ? launch(std::false_type{}) : launch(std::true_type{})))
+                throw std::runtime_error("Inkling Q8 QKV launch failed");
+            return result;
+        }
         if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            if (mode == Projection::AttentionMma && !result.shared) {
+                const auto &w = weights.weight.at("model.llm." + att + "packed.weight");
+                const void *x[] = {inputs[0].p, inputs[1].p, inputs[2].p};
+                const int widths[] = {result.storage.cols - 2 * (k + taps), k + taps, k + taps};
+                if (w.dataType == BFLOAT16 && w.dims == std::vector<int>{result.storage.cols, inputs[0].cols} &&
+                    bf16Mma->segmentedAttention(x, w.cudaData, result.storage.p, rows, inputs[0].cols, widths))
+                    return result;
+            }
+            if (mode == Projection::PdlDecode && result.storage.rows == 1) {
+                const auto &w = weights.weight.at("model.llm." + att + "packed.weight");
+                const int width = result.storage.cols, kEnd = width - (k + taps), qEnd = kEnd - (k + taps);
+                if (w.dataType == BFLOAT16 && w.dims.size() == 2 && w.dims[0] == width &&
+                    w.dims[1] == inputs[0].cols && FastllmCudaBf16PdlProjection(inputs[0].p, inputs[1].p,
+                        inputs[2].p, w.cudaData, result.storage.p, w.dims[1], qEnd, kEnd, width, 0.f))
+                    return result;
+            }
             if (mode != Projection::AttentionMma && !result.shared && (inputs[0].rows == 1 || decodeArithmetic)) {
                 const auto &w = weights.weight.at("model.llm." + att + "packed.weight");
                 const T *x[] = {inputs[0].p, inputs[1].p, inputs[2].p};
@@ -630,17 +794,23 @@ class Decoder final : public Runtime {
     }
 
     template<class KV, class T> Rows<T> attend(const std::array<Rows<T>, 3> &inputs, const std::string &att,
-                                      bool local, const std::vector<Segment> &batch, size_t slot) {
+                                      bool local, const std::vector<Segment> &batch, size_t slot, const Rows<InklingQ81> &encoded, InklingQ81 *packedOutput) {
         const int d = c.headDim, k = c.kvHeads * d;
         const int aligned = attentionWidth(d), kvWidth = c.kvHeads * aligned;
         const int window = local ? c.window : 0;
         const Data &table = weight(att + "rel_logits_proj.proj");
         if (table.Count(0) != c.relative * c.extent)
             throw std::runtime_error("Inkling relative bias table shape");
-        auto projection = projectAttention(inputs, att, local, attentionProjection(batch));
+        const bool singleDecodePdl = singletonControllerPdl && batch.size() == 1 && batch.front().decode &&
+            !batch.front().timeline && !usesVerifyArithmetic(batch);
+        const int projectionRows = !encoded.p ? inputs[0].rows :
+            (batch.front().timeline ? int(batch.size()) * batch.front().length : 1);
+        auto projection = projectAttention(inputs, att, local,
+            singleDecodePdl ? Projection::PdlDecode : attentionProjection(batch), encoded, projectionRows);
         if ((batch.front().decode || decodeArithmetic) && aligned == d && c.relative <= threads) {
             const auto projected = projection.views();
-            Rows<T> attended(inputs[0].rows, c.heads * d);
+            Rows<T> attended(packedOutput ? 0 : projection.storage.rows, c.heads * d);
+            attended.rows = projection.storage.rows;
             const int queries = batch.front().timeline ? attended.rows : 1;
             const bool usePagedVerify = verifyAttentionSplits > 0 && std::is_same_v<KV, half>;
             // One window query can spread its KV tiles across more SMs. A speculative
@@ -651,8 +821,10 @@ class Decoder final : public Runtime {
             const bool singleWindow = usePagedVerify && window && batch.front().decode && !batch.front().timeline &&
                 attended.rows == 1 && !usesVerifyArithmetic(batch);
             const bool fusedWindow = singleWindow && std::is_same_v<T, __nv_bfloat16> && windowDecodeKernel != WindowDecodeKernel::Paged;
-            const bool pipelineWindow = singleWindow && windowDecodePdl && splits <= 32;
-            Matrix q(fusedWindow ? 0 : queries, c.heads * d), bias(fusedWindow ? 0 : queries * c.heads, c.extent);
+            const bool pipelineAttention = pagedDecodePdl && ((singleWindow && splits <= 32) ||
+                (!window && singleDecodePdl && usePagedVerify && attended.rows == 1));
+            Matrix q(fusedWindow ? 0 : queries, c.heads * d);
+            Matrix bias(fusedWindow ? 0 : queries * c.heads, c.extent);
             Matrix scratch = queries == 1 ? splitScratch : Matrix(splits, splitScratch.cols * queries);
             auto evaluate = [&](int row, const DecodeVisit *visit) {
                 auto sources = projected;
@@ -666,20 +838,45 @@ class Decoder final : public Runtime {
                                   static_cast<const float *>(table.cudaData), c.heads, c.kvHeads, d, c.relative,
                                   c.extent, c.conv, c.qClip, c.rClip, c.eps};
                 if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+                    if (window && packedOutput && !batch.front().timeline) {
+                        basalt_window::launch(visit, in, window, packedOutput, q8WindowSmem);
+                        return;
+                    }
                     if (fusedWindow) {
-                        launchFusedWindow(windowDecodeKernel, visit, in, window, splits, scratch, attended.p);
+                        if (bf16WindowSmem)
+                            basalt_window::launch(visit, in, window, attended.p, bf16WindowSmem);
+                        else
+                            launchFusedWindow(windowDecodeKernel, visit, in, window, splits, scratch, attended.p);
                         return;
                     }
                 }
                 const int biasTile = c.relative == 16 && c.extent % 4 == 0 ? 4 * threads : threads;
                 int tiles = (c.extent + biasTile - 1) / biasTile;
-                if (batch.front().timeline) {
+                if (batch.front().timeline && usePagedVerify && pagedDecodePdl) {
+                    auto prepare = [&](auto heads) {
+                        constexpr int perTile = decltype(heads)::value;
+                        constexpr int headsPerBlock = perTile > 1 ? threads / 32 : 1;
+                        const int biasTasks = (c.heads + perTile - 1) / perTile * tiles;
+                        const int tasks = (c.heads + headsPerBlock - 1) / headsPerBlock + biasTasks +
+                                          (2 * c.kvHeads + headsPerBlock - 1) / headsPerBlock;
+                        return cuda_launch::Launch<prepareRelative<KV, true, true, T, true, perTile>>(
+                            dim3(tasks, queries), threads, 0, cudaStreamPerThread,
+                            visit, in, tiles, q.p, bias.p, batch.front().length);
+                    };
+                    const bool full = d == 128 && c.relative == 16 && c.extent % 4 == 0 && queries >= smCount;
+                    if (!(full ? prepare(std::integral_constant<int, 4>{}) : prepare(std::integral_constant<int, 1>{})))
+                        throw std::runtime_error("Inkling verify preparation failed");
+                } else if (batch.front().timeline) {
                     auto prepare = usePagedVerify ? prepareRelative<KV, true, true, T> : prepareRelative<KV, true, false, T>;
                     prepare<<<dim3(c.heads * (1 + tiles) + 2 * c.kvHeads, queries), threads, 0, cudaStreamPerThread>>>(
                         visit, in, tiles, q.p, bias.p, batch.front().length);
+                } else if (packedOutput || pipelineAttention) {
+                    if (!cuda_launch::Launch<prepareRelative<KV, false, true, T, true>>(
+                            c.heads * (1 + tiles) + 2 * c.kvHeads, threads, 0, cudaStreamPerThread,
+                            visit, in, tiles, q.p, bias.p, 1))
+                        throw std::runtime_error("Inkling paged decode attention preparation failed");
                 } else {
                     auto prepare = usePagedVerify ? prepareRelative<KV, false, true, T> : prepareRelative<KV, false, false, T>;
-                    if (pipelineWindow) prepare = prepareRelative<KV, false, true, T, true>;
                     prepare<<<c.heads * (1 + tiles) + 2 * c.kvHeads, threads, 0, cudaStreamPerThread>>>(
                         visit, in, tiles, q.p, bias.p, 1);
                 }
@@ -687,8 +884,8 @@ class Decoder final : public Runtime {
                                   visit, 0, 0, c.heads, c.kvHeads, d, c.extent,
                                   window, c.logFloor, c.logAlpha, sink.stride, gate.stride};
                 if (usePagedVerify) {
-                    launchVerifyAttention(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
-                                       queries, batch.front().timeline ? batch.front().length : 1, splits, smCount, minTiles, pipelineWindow);
+                    launchVerifyAttention(args, scratch, sink.data, gate.data, packedOutput ? nullptr : attended.p + size_t(row) * attended.cols,
+                                       queries, batch.front().timeline ? batch.front().length : 1, splits, smCount, minTiles, pipelineAttention, packedOutput, batch.front().timeline && pagedDecodePdl);
                 } else if (d == 128) launchSplitRelative<128, KV>(args, scratch, sink.data, gate.data,
                                                           attended.p + size_t(row) * attended.cols, sm120GlobalSplits,
                                                           queries, batch.front().timeline ? batch.front().length : 1);
@@ -738,7 +935,7 @@ class Decoder final : public Runtime {
             }
             return attended;
         }
-        const int rows = inputs[0].rows;
+        const int rows = projection.storage.rows;
         const bool queryFits = !std::is_same_v<KV, half> || (c.qClip > 0 && c.qClip <= 65504.f);
         const bool canFuseGate = std::is_same_v<KV, half> && (window ? gatedWindowPrefill : gatedGlobalPrefill);
         const bool multi = (tensorPrefill || canFuseGate) && queryFits && !std::is_same_v<KV, float> &&
@@ -942,7 +1139,7 @@ class Decoder final : public Runtime {
 
     // The previous pass's sources stay fixed throughout the next core pass.
     // Compute consecutive layers' independent controller messages together.
-    template <class R> Matrix crossPassMessages(const std::vector<Rows<R>> &bank, const Rows<R> &previous, int first, int layers) {
+    template <class R> Matrix crossPassMessages(const std::vector<Rows<R>> &bank, const Rows<R> &previous, int first, int layers, bool pipeline) {
         const int h = c.hidden, count = 2 * (c.end - c.start) * h;
         const int offset = 2 * (first - c.start) * h;
         const float *main = param("middle_cycle_cross_pass_queries", count) + offset;
@@ -955,6 +1152,11 @@ class Decoder final : public Runtime {
             queries[4 * i + 3] = {main + h};
             main += 2 * h;
             kv += 2 * h;
+        }
+        if (pipeline && bank.size() < 8) {
+            auto out = Matrix::temporary(4 * layers * previous.rows, c.hidden);
+            mixDecodeInto<float>(bank, previous, queries.data(), 4 * layers, out.p, true);
+            return out;
         }
         return mix(bank, previous, queries.data(), 4 * layers, c.eps, true);
     }
@@ -973,51 +1175,123 @@ class Decoder final : public Runtime {
             norms[i] = param(pre + (local ? "attn_norm.weight" : fullNorms[i]), h);
             queries[i] = {aq ? aq + i * h : nullptr, messages.p ? nullptr : norms[i]};
         }
+        const bool singleDecode = x.rows == 1 && batch.front().decode && !batch.front().timeline && !usesVerifyArithmetic(batch);
+        const bool bf16Decode = singleDecode && std::is_same_v<T, __nv_bfloat16>;
+        const bool verifyWindow = batch.front().timeline && phase == ExpertPhase::Verify && x.rows <= 65535 && singletonControllerPdl;
+        const bool decodeMix = (bf16Decode || (verifyWindow && std::is_same_v<T, __nv_bfloat16>)) && h == 2304 && blocks.size() < 8;
+        const bool verifyConv = verifyWindow && batch.front().length > 1 && std::is_same_v<T, __nv_bfloat16>;
+        const bool batchConv = batch.front().timeline && phase == ExpertPhase::Decode && batch.front().length == 1 &&
+            singletonControllerPdl && std::is_same_v<T, __nv_bfloat16>;
+        const bool fuseConv = (bf16Decode || verifyConv || batchConv) && c.conv == 4;
+        const DecodeVisit *convVisits = (verifyConv || batchConv) ? batch.front().timeline + slot * x.rows :
+                                        singleDecode ? batch.front().decode + slot : nullptr;
+        const bool q8 = decodeMix && q8Projection(weights.weight.at("model.llm." + att + "packed.weight"));
+        const bool decodePdl = decodeMix && (q8 || singletonControllerPdl);
+        Rows<InklingQ81> encoded(q8 ? x.rows * (messages.p ? 3 : nq) : 0, h / 32);
         std::array<Rows<T>, 3> inputs;
         if (messages.p) {
-            Matrix dest = aq ? mix(blocks, x, queries, nq, c.eps, c.normValues) : castRows<float>(x);
+            Matrix dest = aq ? mixLayerInputs<float>(blocks, x, queries, nq, decodePdl) : castRows<float>(x);
             Matrix streams[3];
             for (int i = 0; i < 3; ++i) {
                 const int stream = local ? 0 : i;
                 streams[i] = dest.slice(aq ? stream * x.rows : 0, x.rows);
                 norms[i] = norms[stream];
             }
-            auto blended = control<T, T>(streams, messages, norms, 3, pre);
-            for (int i = 0; i < 3; ++i) inputs[i] = blended.slice(i * x.rows, x.rows);
+            auto blended = control<T, T>(streams, messages, norms, 3, pre, encoded.p, decodePdl);
+            if (!q8) {
+                for (int i = 0; i < 3; ++i) inputs[i] = blended.slice(i * x.rows, x.rows);
+            }
+        } else if (q8) {
+            if (aq) mixDecodeInto<T>(blocks, x, queries, nq, encoded.p, c.normValues);
+            else for (int i = 0; i < nq; ++i)
+                normalizeDecodeRow<T><<<x.rows, 512, 0, cudaStreamPerThread>>>(x.p, norms[i], encoded.p + size_t(i) * x.rows * encoded.cols, h, c.eps);
         } else if (aq) {
-            auto dest = mix<T, T>(blocks, x, queries, nq, c.eps, c.normValues);
+            auto dest = mixLayerInputs<T, T>(blocks, x, queries, nq, decodePdl);
             for (int i = 0; i < 3; ++i) inputs[i] = dest.slice((local ? 0 : i) * x.rows, x.rows);
         } else {
-            const auto wide = castRows<float>(x);
-            for (int i = 0; i < 3; ++i)
-                inputs[i] = local && i ? inputs[0] : castRows<T>(norm(wide, norms[i], c.eps));
+            for (int i = 0; i < nq; ++i) {
+                if (decodePdl) {
+                    inputs[i] = Rows<T>::temporary(x.rows, h);
+                    normalizeDecodeRow<T><<<x.rows, 512, 0, cudaStreamPerThread>>>(x.p, norms[i], inputs[i].p, h, c.eps);
+                } else inputs[i] = castRows<T>(norm(castRows<float>(x), norms[i], c.eps));
+            }
+            if (local) inputs[1] = inputs[2] = inputs[0];
         }
+        const auto &wo = weights.weight.at("model.llm." + att + "wo_ud.weight");
+        const int outWidth = c.heads * c.headDim;
+        const bool q8Out = q8 && q8Projection(wo) && outWidth == 3072 &&
+            wo.dims.size() == 2 && wo.dims[0] == h && wo.dims[1] == outWidth;
+        const bool packedAttention = q8Out && kvType == FLOAT16 &&
+            (verifyWindow ? pagedDecodePdl && verifyAttentionSplits > 0 && c.headDim == 128 && c.relative <= threads :
+             (local ? q8WindowSmem != 0 : pagedDecodePdl && c.headDim == 128 && c.relative <= threads));
+        Rows<InklingQ81> packed(q8Out ? x.rows : 0, outWidth / 32);
+        auto *packedOutput = packedAttention ? packed.p : nullptr;
         Rows<T> attended;
-        if (kvType == FLOAT16) attended = attend<half, T>(inputs, att, local, batch, slot);
-        else if (kvType == BFLOAT16) attended = attend<__nv_bfloat16, T>(inputs, att, local, batch, slot);
-        else attended = attend<float, T>(inputs, att, local, batch, slot);
+        if (kvType == FLOAT16) attended = attend<half, T>(inputs, att, local, batch, slot, encoded, packedOutput);
+        else if (kvType == BFLOAT16) attended = attend<__nv_bfloat16, T>(inputs, att, local, batch, slot, encoded, nullptr);
+        else attended = attend<float, T>(inputs, att, local, batch, slot, encoded, nullptr);
         const bool newBlock = physical % c.residualBlock == 0;
-        const bool overlapWindow = windowOutputGemv && local && kvType == FLOAT16 && x.rows == 1 &&
-            batch.front().decode && !batch.front().timeline && !usesVerifyArithmetic(batch);
-        auto residual =
-            convolutions(linear(attended, att + "wo_ud.weight", h, 1, overlapWindow ? Projection::WindowOutput : attentionProjection(batch)), param(pre + "attn_sconv.weight", h * c.conv),
-                         {}, 1, c.conv, batch, slot, 2, newBlock ? Rows<R>{} : x);
+        const bool overlapProjection = decodeBf16Gemv && kvType == FLOAT16 && singleDecode;
+        Rows<T> projected;
+        if (q8Out) {
+            if (!packedAttention)
+                encodeQ8Row<<<dim3((outWidth/4+127)/128, x.rows),128,0,cudaStreamPerThread>>>(attended.p, packed.p, outWidth);
+            projected = Rows<T>(x.rows, h);
+            if (x.rows > 1)
+                launchQ8Verify(static_cast<const InklingQ80 *>(wo.cudaData), packed.p, projected.p, x.rows, outWidth, h, h, h);
+            else if (!cuda_launch::Launch<q8DecodeProjection<3072, false, T>>(h, 128, 0, cudaStreamPerThread,
+                    static_cast<const InklingQ80 *>(wo.cudaData), packed.p, h, h, projected.p, 0.f))
+                throw std::runtime_error("Inkling Q8 output projection launch failed");
+        } else projected = linear(attended, att + "wo_ud.weight", h, 1,
+                                  overlapProjection ? Projection::PdlDecode : attentionProjection(batch));
+        const float *attnConv = param(pre + "attn_sconv.weight", h * c.conv);
+        const R *skip = newBlock ? nullptr : x.p;
         if (newBlock)
             blocks.push_back(x);
         const float *mlpNorm = param(pre + "mlp_norm.weight", h);
         Query mlpQuery{param("attn_res.mlp_queries." + std::to_string(physical), h), messages.p ? nullptr : mlpNorm};
-        // Router and expert input share one rounded activation. Round on the
-        // final producer only; the loop controller still consumes the FP32 mixture.
+        Rows<R> residual;
         Matrix ffn;
-        if (messages.p) {
-            auto dest = mix(blocks, residual, &mlpQuery, 1, c.eps, c.normValues);
-            ffn = control<T, float>(&dest, messages.slice(3 * x.rows, x.rows), &mlpNorm, 1, pre);
+        if (fuseConv && h == 2304 && blocks.size() < 8) {
+            residual = Rows<R>(x.rows, h);
+            ffn = Matrix(x.rows, h);
+            withDecodeSources(blocks, residual, [&](auto tag, const cuda_attn_res::SourceList<R> &sources) {
+                constexpr int slots = decltype(tag)::value;
+                auto launch = [&](auto round) {
+                    auto mix = [&](auto timeline) {
+                        return cuda_launch::Launch<postAttentionMix<slots, T, decltype(round), decltype(timeline)::value, R>>(
+                            x.rows, 512, 0, cudaStreamPerThread, projected.p, convVisits, attnConv, c.conv, h, skip,
+                            residual.p, sources, mlpQuery, c.eps, c.normValues, ffn.p, batch.front().length);
+                    };
+                    return verifyConv ? mix(std::true_type{}) : mix(std::false_type{});
+                };
+                if (!(messages.p ? launch(float{}) : launch(T{})))
+                    throw std::runtime_error("Inkling attention residual mix launch failed");
+            });
         } else {
-            ffn = mix<T>(blocks, residual, &mlpQuery, 1, c.eps, c.normValues);
+            residual = convolutions(projected, attnConv, {}, 1, c.conv, batch, slot, 2, newBlock ? Rows<R>{} : x, decodePdl);
+            ffn = messages.p ? mixLayerInputs<float>(blocks, residual, &mlpQuery, 1, decodePdl)
+                             : mixLayerInputs<T>(blocks, residual, &mlpQuery, 1, decodePdl);
         }
-        auto m = experts.layers[physical]->run(c, ffn, param(pre + "mlp.gate.bias", c.experts), phase);
-        return convolutions(m, param(pre + "mlp_sconv.weight", h * c.conv), {}, 1, c.conv,
-                                  batch, slot, 3, residual);
+        if (messages.p)
+            ffn = control<T, float>(&ffn, messages.slice(3 * x.rows, x.rows), &mlpNorm, 1, pre, nullptr, decodePdl);
+        Rows<__nv_bfloat16> routes;
+        auto m = experts.layers[physical]->run(c, ffn, param(pre + "mlp.gate.bias", c.experts), phase,
+                                               fuseConv && !batchConv ? &routes : nullptr);
+        const float *expertConv = param(pre + "mlp_sconv.weight", h * c.conv);
+        if (routes.p) {
+            bool ok = verifyConv ? cuda_launch::Launch<finishVerifyRoutes<R>>(
+                dim3((h + verifyRouteChannels - 1) / verifyRouteChannels,
+                     (batch.front().length + verifyRouteRows - 1) / verifyRouteRows, batch.size()),
+                dim3(verifyRouteChannels, verifyRouteRows), 0, cudaStreamPerThread, routes.p, c.topK, convVisits,
+                expertConv, h, c.conv, batch.front().length, residual.p) :
+                cuda_launch::Launch<finishExpertRoutes<R>>((h + 255) / 256, 256, 0, cudaStreamPerThread,
+                    routes.p, c.topK, convVisits, expertConv, h, c.conv, residual.p);
+            if (!ok)
+                throw std::runtime_error("Inkling expert residual launch failed");
+            return residual;
+        }
+        return convolutions(m, expertConv, {}, 1, c.conv, batch, slot, 3, residual, decodePdl);
     }
     void target(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits, std::vector<Matrix> *features = nullptr) {
         // Only eager prompts borrow payload storage. A leased feature may outlive
@@ -1043,7 +1317,7 @@ class Decoder final : public Runtime {
             else
                 targetTyped<T, float>(ids, n, batch, logits, features);
         };
-        if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16) run(half{});
+        if (!backboneBf16) run(half{});
         else run(__nv_bfloat16{});
     }
 
@@ -1071,6 +1345,9 @@ class Decoder final : public Runtime {
         Rows<R> prelude, previous;
         Matrix messageTile;
         int firstMessage = 0, endMessage = 0;
+        const bool pipeline = ((n == 1 && batch.front().decode && !batch.front().timeline && !usesVerifyArithmetic(batch)) ||
+                               (batch.front().timeline && decodeArithmetic)) &&
+            c.hidden == 2304 && singletonControllerPdl;
         std::vector<Rows<R>> blocks, preludeBlocks, bank;
         for (size_t slot = 0; slot < c.visits.size(); ++slot) {
             int i = c.visits[slot];
@@ -1100,7 +1377,7 @@ class Decoder final : public Runtime {
                     firstMessage = i;
                     endMessage = i + layers;
                     messageTile = {};
-                    messageTile = crossPassMessages(bank, previous, i, layers);
+                    messageTile = crossPassMessages(bank, previous, i, layers, pipeline);
                 }
                 messages = messageTile.slice(4 * (i - firstMessage) * n, 4 * n);
             }
@@ -1116,7 +1393,28 @@ class Decoder final : public Runtime {
             for (auto &block : blocks) block = block.slice(n - 1, 1);
         }
         Query outputQuery{param("attn_res.output_query", h), param("norm.weight", h)};
-        auto output = mix(blocks, x, &outputQuery, 1, c.eps, c.normValues);
+        const auto &unembed = weights.weight.at("model.llm.unembed.weight");
+        if (pipeline && !features && logits.p && blocks.size() < 8 && q8Projection(unembed) &&
+            unembed.dims.size() == 2 && unembed.dims[1] == h && unembed.dims[0] >= logits.cols) {
+            Rows<InklingQ81> packed(1, h / 32);
+            mixDecodeInto<float>(blocks, x, &outputQuery, 1, packed.p, c.normValues);
+            if (!cuda_launch::Launch<q8DecodeProjection<2304, false, float, true>>(
+                    logits.cols, 128, 0, cudaStreamPerThread, static_cast<const InklingQ80 *>(unembed.cudaData),
+                    packed.p, 0, 0, logits.p, c.logitCap))
+                throw std::runtime_error("Inkling Q8 decode head launch failed");
+            return;
+        }
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            if (pipeline && !features && logits.p && blocks.size() < 8 && unembed.dataType == BFLOAT16 &&
+                c.logitCap > 0.f && unembed.dims.size() == 2 && unembed.dims[1] == h && unembed.dims[0] >= logits.cols &&
+                !(logits.cols & 1)) {
+                Rows<T> input(1, h);
+                mixDecodeInto<float>(blocks, x, &outputQuery, 1, input.p, c.normValues);
+                if (FastllmCudaBf16PdlProjection(input.p, input.p, input.p, unembed.cudaData, logits.p,
+                        h, logits.cols, logits.cols, logits.cols, c.logitCap)) return;
+            }
+        }
+        auto output = mixLayerInputs<float>(blocks, x, &outputQuery, 1, pipeline && blocks.size() < 8);
         if (features) features->push_back(output);
         if (!logits.p) return;
         Matrix last;
@@ -1132,9 +1430,13 @@ class Decoder final : public Runtime {
             }
         }
         const bool verifyMath = usesVerifyArithmetic(batch);
+        if (q8Projection(unembed)) {
+            projectQ8(last, unembed, 0, logits, batch.front().timeline != nullptr, c.logitCap);
+            return;
+        }
         auto headInput = castRows<T>(last);
         if constexpr (std::is_same_v<T, __nv_bfloat16>) {
-            if (verifyMath && bf16Mma) {
+            if ((verifyMath || batch.front().timeline) && bf16Mma) {
                 const auto &head = weights.weight.at("model.llm.unembed.weight");
                 if (head.dataType == BFLOAT16 && head.dims.size() == 2 && head.dims[0] >= c.vocab &&
                     head.dims[1] == h &&
@@ -1353,12 +1655,20 @@ class Decoder final : public Runtime {
         if (c.headDim > threads)
             throw std::runtime_error("Inkling attention head exceeds the native kernel width");
         check(cudaSetDevice(p.gpu));
+        backboneBf16 = projectionType(p.gpu) == BFLOAT16;
         bf16Mma = FastllmCudaGetBf16MmaProjections();
         graphInput = Buffer<DecodeInput>(1);
         hostVisits.resize(c.visits.size());
         graphVisits = Buffer<DecodeVisit>(hostVisits.size());
 #ifndef CUDA_NO_TENSOR_CORE
         const int arch = FastllmCudaRuntimeArch();
+#if CUDART_VERSION >= 12000
+        if (arch >= 90 && c.hidden == 2304 && c.rank == 64) {
+            cudaFuncAttributes attr{};
+            check(cudaFuncGetAttributes(&attr, singletonControllerDown));
+            singletonControllerPdl = attr.binaryVersion >= 90 && attr.ptxVersion >= 90;
+        }
+#endif
         if (arch == 120 && c.hidden == controllerWidth && c.rank == controllerRank) {
             batchedController = configureTensorCoreKernel<0>(controllerQkvGates, 128);
             fusedPrefillController =
@@ -1391,14 +1701,19 @@ class Decoder final : public Runtime {
         splitScratch = Matrix(std::max(1, (2 * smCount + parallelHeads - 1) / parallelHeads),
                               c.heads * (attentionWidth(c.headDim) + 1));
         if (tensorPrefill && c.headDim == 128 && c.qClip > 0.f && c.qClip <= 65504.f &&
-            configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention)) {
+            configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention<VerifyTraits>)) {
             verifyAttentionSplits = std::min(splitScratch.rows, std::max(1, 2 * (smCount / c.kvHeads)));
+            if (c.window > 0 && c.window <= 1024 && c.heads == 24 && c.kvHeads == 8 &&
+                c.relative == 16 && c.rClip > 0 && c.conv == 4 && c.extent % 4 == 0) {
+                q8WindowSmem = basalt_window::configure<InklingQ81>(p.gpu, c.kvHeads);
+                bf16WindowSmem = basalt_window::configure<__nv_bfloat16>(p.gpu, c.kvHeads);
+            }
             if (c.window > 0 && c.heads == 3 * c.kvHeads && c.relative == 16 && c.extent % 4 == 0)
                 windowDecodeKernel = configureWindowDecode(p.gpu, c.kvHeads, verifyAttentionSplits);
 #if CUDART_VERSION >= 12080
-            if (windowDecodeKernel == WindowDecodeKernel::Cluster) windowOutputGemv = FastllmCudaGetPdlBf16Gemv();
-            windowDecodePdl = sm120GlobalSplits > 0 &&
-                configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedWindowDecode);
+            if (singletonControllerPdl) decodeBf16Gemv = FastllmCudaGetPdlBf16Gemv();
+            pagedDecodePdl = sm120GlobalSplits > 0 &&
+                configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedSingletonDecode);
 #endif
         }
         std::vector<float> ones(std::max(c.headDim, c.hidden), 1.f);
@@ -1663,7 +1978,7 @@ class Decoder final : public Runtime {
             batch.push_back({&req, offset, lengths[b]});
             offset += lengths[b];
         }
-        const bool bf16 = weights.weight.at("model.llm.unembed.weight").dataType == BFLOAT16;
+        const bool bf16 = backboneBf16;
         bool speculate = c.draft.steps > 0;
         for (size_t b = 0; speculate && b < batch.size(); ++b) {
             const auto &s = batch[b];

@@ -154,15 +154,15 @@ __device__ inline float RowRmsScale(float local, int width, float eps, float *wa
 // One CTA handles the entire row. Independent 128-lane reductions preserve
 // the original per-source dot and square-sum trees, in parallel. The mixed
 // channels remain in registers through the following RMSNorm.
-template <int Slots, class Round, class Out, int FixedWidth = 0, bool Preload = false, class In = float>
-__global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources, FASTLLM_ROW_PARAMETER Queries queries, int rows, int width,
-                                    float eps, bool normalizeValues, Out *output, bool queryFirst) {
+template <int Slots, class Round, class Out, int FixedWidth, bool Preload, class Store, class In>
+__device__ __forceinline__ void AttnResRegisterBody(const SourceList<In> &sources, Query query, int qi, int row,
+        int rows, int width, float eps, bool normalizeValues, Out *output, const In *lastSource = nullptr) {
     constexpr int threads = 512, packs = 2;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    const int qi = queryFirst ? blockIdx.x : blockIdx.y;
-    const int row = queryFirst ? blockIdx.y : blockIdx.x;
     const int cols = (FixedWidth ? FixedWidth : width) / 4;
-    const Query query = queries.items[qi];
+    const auto source = [&](int slot) {
+        return lastSource && slot == Slots - 1 ? lastSource : sources.items[slot] + size_t(row) * width;
+    };
     float4 acc[packs]{};
     // A second scoring round leaves a gap in which the mix inputs can be
     // loaded. With a single round it is faster to load them directly below.
@@ -170,7 +170,7 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources
     if constexpr (Preload) {
 #pragma unroll
         for (int s = 0; s < Slots; ++s) {
-            const In *x = sources.items[s] + size_t(row) * width;
+            const In *x = source(s);
 #pragma unroll
             for (int i = 0; i < packs; ++i)
                 if (tid + i * threads < cols) values[s][i] = LoadChannels4(x, tid + i * threads);
@@ -179,7 +179,7 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources
     __shared__ float2 partial[Slots][128], scores[Slots];
     __shared__ float normScratch[threads / 32];
     for (int s = tid / 128; s < Slots; s += threads / 128) {
-        const In *src = sources.items[s] + size_t(row) * width;
+        const In *src = source(s);
         float sq = 0.f, dot = 0.f;
         if constexpr (FixedWidth) {
             // Unsigned offsets avoid sign extension in the unrolled loads on SM75.
@@ -226,7 +226,7 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources
     if (normalizeValues && lane < Slots) weight *= scores[lane].y;
 #pragma unroll
     for (int s = 0; s < Slots; ++s) {
-        const In *x = sources.items[s] + size_t(row) * width;
+        const In *x = source(s);
         const float w = __shfl_sync(0xffffffffu, weight, s);
 #pragma unroll
         for (int i = 0; i < packs; ++i) {
@@ -247,7 +247,7 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources
             sq += Square4(acc[i]);
         scale = RowRmsScale(sq, width, eps, normScratch);
     }
-    auto out = reinterpret_cast<Channels4<Out> *>(output) + (size_t(qi) * rows + row) * cols;
+    const size_t base = (size_t(qi) * rows + row) * cols;
 #pragma unroll
     for (int i = 0; i < packs; ++i) {
         const int j = tid + i * threads;
@@ -258,8 +258,35 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources
             float4 w = reinterpret_cast<const float4 *>(query.norm)[j];
             v = make_float4(v.x * scale * w.x, v.y * scale * w.y, v.z * scale * w.z, v.w * scale * w.w);
         }
-        out[j] = {Out(Round(v.x)), Out(Round(v.y)), Out(Round(v.z)), Out(Round(v.w))};
+        if constexpr (std::is_void_v<Store>)
+            reinterpret_cast<Channels4<Out> *>(output)[base + j] = {Out(Round(v.x)), Out(Round(v.y)), Out(Round(v.z)), Out(Round(v.w))};
+        else Store::template store<Round>(output, base + j, v);
     }
+}
+
+template <int Slots, class Round, class Out, int FixedWidth = 0, bool Preload = false, class Store = void, bool Pdl = false, class In = float>
+__global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources, FASTLLM_ROW_PARAMETER Queries queries, int rows, int width,
+                                    float eps, bool normalizeValues, Out *output, bool queryFirst) {
+    const int qi = queryFirst ? blockIdx.x : blockIdx.y;
+    const int row = queryFirst ? blockIdx.y : blockIdx.x;
+    const Query query = queries.items[qi];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12000
+    if constexpr (Pdl) {
+        // Query and norm are immutable. Prior residuals are read-only in this
+        // mix. Prefetch hints never consume a value from an unfinished writer.
+        for (int j = 32 * threadIdx.x; j < width; j += 32 * blockDim.x) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(query.values + j));
+            if (query.norm) asm volatile("prefetch.global.L2 [%0];" :: "l"(query.norm + j));
+#pragma unroll
+            for (int s = 0; s < Slots - 1; ++s)
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(sources.items[s] + size_t(row) * width + j));
+        }
+        cudaGridDependencySynchronize();
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
+    AttnResRegisterBody<Slots, Round, Out, FixedWidth, Preload, Store>(
+        sources, query, qi, row, rows, width, eps, normalizeValues, output);
 }
 
 // Output layout is [query, token, channel]. Vector loads require aligned row views. Query batches and source tiles only
@@ -271,6 +298,21 @@ inline bool NeedsStaging(int count, const Query *queries, int nq, int width) {
     if constexpr (std::is_same_v<Out, float>) return false;
     return count > Sources::Inline || (size_t(width) * sizeof(float) > 16384 &&
         std::any_of(queries, queries + nq, [](const Query &q) { return q.norm != nullptr; }));
+}
+
+template <class Select>
+inline decltype(auto) WithRegisterSources(int count, Select select) {
+    switch (count) {
+        case 1: return select(std::integral_constant<int, 1>{});
+        case 2: return select(std::integral_constant<int, 2>{});
+        case 3: return select(std::integral_constant<int, 3>{});
+        case 4: return select(std::integral_constant<int, 4>{});
+        case 5: return select(std::integral_constant<int, 5>{});
+        case 6: return select(std::integral_constant<int, 6>{});
+        case 7: return select(std::integral_constant<int, 7>{});
+        case 8: return select(std::integral_constant<int, 8>{});
+        default: throw std::invalid_argument("AttnRes register source count must be between 1 and 8");
+    }
 }
 
 template <class Round = float, class Out = float, class In>
@@ -308,20 +350,11 @@ inline void Launch(SourceList<In> sources, int count, const Query *queries, int 
                     // Single-token latency benefits from preloading across
                     // scoring rounds. Multi-token tiles keep their occupancy.
                     if constexpr (w && nsrc > 4) {
-                        if (rows == 1) return AttnResRegisterRows<nsrc, Round, Out, w, true, In>;
+                        if (rows == 1) return AttnResRegisterRows<nsrc, Round, Out, w, true, void, false, In>;
                     }
-                    return AttnResRegisterRows<nsrc, Round, Out, w, false, In>;
+                    return AttnResRegisterRows<nsrc, Round, Out, w, false, void, false, In>;
                 };
-                switch (count) {
-                    case 1: return select(std::integral_constant<int, 1>{});
-                    case 2: return select(std::integral_constant<int, 2>{});
-                    case 3: return select(std::integral_constant<int, 3>{});
-                    case 4: return select(std::integral_constant<int, 4>{});
-                    case 5: return select(std::integral_constant<int, 5>{});
-                    case 6: return select(std::integral_constant<int, 6>{});
-                    case 7: return select(std::integral_constant<int, 7>{});
-                    default: return select(std::integral_constant<int, 8>{});
-                }
+                return WithRegisterSources(count, select);
             };
             const auto kernel = width == 2304 ? kernelFor(std::integral_constant<int, 2304>{})
                                               : kernelFor(std::integral_constant<int, 0>{});

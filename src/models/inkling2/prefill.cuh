@@ -134,9 +134,7 @@ template<int D, class KV> void launchPrefill(const AttentionRow &a, KV *query, i
 
 // One warp owns 16 packed (query, head) rows. Each lane visits the same two
 // rows throughout the KV scan, so its two position scales live in registers.
-template<bool Windowed, class Bias> struct GatedPrefillRelative : PrefillRelative {
-    static constexpr bool use_pv_residual = false;
-    static constexpr bool defer_softmax_rescale = true;
+template<bool Windowed, class Bias, bool MaskWindow = false> struct RelativeScoreTile {
     static constexpr bool custom_score_tile = true;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     // Before stmatrix, lanes exchange the global kernel's 16-bit output through scalar shared stores.
@@ -145,9 +143,8 @@ template<bool Windowed, class Bias> struct GatedPrefillRelative : PrefillRelativ
     float tau[2];
     unsigned pos[2];
     const Bias *bias[2];
-    template<class P> __device__ GatedPrefillRelative(const P &p, unsigned batch, uint8_t *smem)
-        : PrefillRelative(p, batch, smem) {
-        const unsigned first = (blockIdx.x * blockDim.y + threadIdx.y) * 16 + threadIdx.x / 4;
+    template<class P> __device__ RelativeScoreTile(const P &p, unsigned tile) {
+        const unsigned first = (tile * blockDim.y + threadIdx.y) * 16 + threadIdx.x / 4;
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             unsigned row, head;
@@ -182,10 +179,20 @@ template<bool Windowed, class Bias> struct GatedPrefillRelative : PrefillRelativ
                 const float relative = distance < p.distances && bias[j] ? float(bias[j][distance]) : 0.f;
                 float value = score[0][k][i] * p.qkScale + relative;
                 if constexpr (!Windowed) value *= tau[j];
+                if constexpr (MaskWindow) {
+                    if (int(distance) > p.window_left) value = -flashinfer::math::inf;
+                }
                 score[0][k][i] = value;
             }
         }
     }
+};
+
+template<bool Windowed, class Bias> struct GatedPrefillRelative : PrefillRelative, RelativeScoreTile<Windowed, Bias> {
+    static constexpr bool use_pv_residual = false;
+    static constexpr bool defer_softmax_rescale = true;
+    template<class P> __device__ GatedPrefillRelative(const P &p, unsigned batch, uint8_t *smem)
+        : PrefillRelative(p, batch, smem), RelativeScoreTile<Windowed, Bias>(p, blockIdx.x) {}
 };
 
 template<class T, class Bias> struct GatedPrefillParams : PrefillParams<half,128,T,Bias> {

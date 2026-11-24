@@ -1602,7 +1602,7 @@ __device__ __forceinline__ void logits_mask_multi_item_scoring(
   }
 }
 
-template <typename KTraits>
+template <typename KTraits, bool round_rescale = false>
 __device__ __forceinline__ void update_mdo_states(
     typename KTraits::AttentionVariant variant,
     typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
@@ -1646,13 +1646,18 @@ __device__ __forceinline__ void update_mdo_states(
               o_scale = math::ptx_exp2((m_prev - m[mma_q][j]) * sm_scale);
             else
               o_scale = math::ptx_exp2(m_prev * sm_scale - m[mma_q][j] * sm_scale);
-            d[mma_q][j] *= o_scale;
+            // Some consumers require the same rounded tile boundary as their decode kernel.
+            auto rescale_value = [=](float v) {
+              if constexpr (round_rescale) return __fmul_rn(v, o_scale);
+              return v * o_scale;
+            };
+            d[mma_q][j] = rescale_value(d[mma_q][j]);
 #pragma unroll
             for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
-              o_frag[mma_q][mma_d][j * 2 + 0] *= o_scale;
-              o_frag[mma_q][mma_d][j * 2 + 1] *= o_scale;
-              o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
-              o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
+              o_frag[mma_q][mma_d][j * 2 + 0] = rescale_value(o_frag[mma_q][mma_d][j * 2 + 0]);
+              o_frag[mma_q][mma_d][j * 2 + 1] = rescale_value(o_frag[mma_q][mma_d][j * 2 + 1]);
+              o_frag[mma_q][mma_d][j * 2 + 4] = rescale_value(o_frag[mma_q][mma_d][j * 2 + 4]);
+              o_frag[mma_q][mma_d][j * 2 + 5] = rescale_value(o_frag[mma_q][mma_d][j * 2 + 5]);
             }
           }
 #pragma unroll
