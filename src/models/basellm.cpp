@@ -4318,7 +4318,8 @@ namespace fastllm {
                                         *pastKeyValue1, generationConfigs[0], tokensManager,
                                         logits[0], chunkedPrefillToken)) {
                                     ret = {chunkedPrefillToken};
-                                } else if (seqLens[0] > first) {
+                                } else if (isSingleText && seqLens[0] > first) {
+                                    // A multimodal model owns its chunking and must receive the image payload.
                                     int len = seqLens[0];
                                     for (int st = 0; st < len; ) {
                                         auto chunkStartTime = std::chrono::steady_clock::now();
