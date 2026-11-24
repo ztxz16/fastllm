@@ -314,6 +314,14 @@ struct NaiveN05FlashModel::DraftWorkspace {
     std::vector<std::pair<Data, Data>> tpKV;
     void *ready = nullptr, *done = nullptr;
     void *readySource = nullptr, *readyStream = nullptr;
+    // A different device may wait after the producer changes CPU threads.
+    // Publish from a stable explicit stream on the owning device.
+    void RecordPeerEvent(void *&event) {
+        if (!event) event = FastllmCudaEventCreate();
+        if (!readySource) readySource = FastllmCudaEventCreate();
+        if (!readyStream) readyStream = FastllmCudaStreamCreate();
+        FastllmCudaEventRecordForPeer(event, readySource, readyStream);
+    }
     std::vector<void *> Pointers() const {
         std::vector<void *> out;
         for (const Data *p : {&id, &live, &positions, &hidden, &normalized, &combined, &cacheTable, &batchKV})
@@ -650,9 +658,6 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
         draftContextStorage = std::make_shared<DraftWorkspace>();
         draftContextStorage->device = tp.devices.front();
         draftContextStorage->done = FastllmCudaEventCreate();
-        draftContextStorage->ready = FastllmCudaEventCreate();
-        draftContextStorage->readySource = FastllmCudaEventCreate();
-        draftContextStorage->readyStream = FastllmCudaStreamCreate();
         for (int device : tp.devices) {
             auto rank = std::make_shared<DraftWorkspace>(); rank->device = device;
             rank->contextLayers.resize(draftLayers);
@@ -673,7 +678,7 @@ bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftCont
         selected = &ws.contextSelected;
     }
     // Publish the root PTDS writes before another device reads the selected rows.
-    if (!tp.dataParallel || context.deviceRank != 0) FastllmCudaEventRecordForPeer(ws.ready, ws.readySource, ws.readyStream);
+    if (!tp.dataParallel || context.deviceRank != 0) ws.RecordPeerEvent(ws.ready);
     tp.Run([&](int rank) {
         if (tp.dataParallel && rank != context.deviceRank) return;
         auto &r = *ws.tpRanks[rank];
@@ -2494,7 +2499,9 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
         auto &ws = *draftContextStorage;
         const bool waitForRoot = capture.packedRows.empty() && std::any_of(rankRequests.begin() + 1,
             rankRequests.end(), [](const auto &requests) { return !requests.empty(); });
-        if (waitForRoot) FastllmCudaEventRecordCurrentThread(ws.done);
+        // Peers read the root's packed features only on this fallback path.
+        // Publish them from a stable stream even when the caller changes threads.
+        if (waitForRoot) ws.RecordPeerEvent(ws.done);
         draftTP->Run([&](int rank) {
             auto &r = *ws.tpRanks[rank];
             const auto &requests = rankRequests[rank];
@@ -2535,8 +2542,10 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
             project(rank, *input);
             FastllmCudaEventRecordCurrentThread(r.done);
         });
+        // This commit already returns synchronously. Join each producer without
+        // publishing its per-thread stream event to a different device.
         for (int rank = 1; rank < ranks; ++rank)
-            FastllmCudaCurrentThreadStreamWaitEvent(ws.tpRanks[rank]->done);
+            FastllmCudaEventSynchronize(ws.tpRanks[rank]->done);
     } else project(0, hidden);
     for (size_t i = 0; i < contexts.size(); ++i) {
         contexts[i]->committed += counts[i];
@@ -3043,7 +3052,8 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
                 if (preparingGraphs && !entry.disabled) graph.Capture([&] { body(rank); }, entry.disabled);
             }
             if (graph.exec) AssertInFastLLM(FastllmCudaGraphLaunch(graph.exec), "Cannot replay draft DP graph");
-            FastllmCudaEventRecordCurrentThread(entry.done);
+            if (ranks > 1) scratch(rank).RecordPeerEvent(entry.done);
+            else FastllmCudaEventRecordCurrentThread(entry.done);
         });
         if (!headShards) for (int rank = 1; rank < ranks; ++rank) if (!rankRequests[rank].empty())
             FastllmCudaCurrentThreadStreamWaitEvent(localState(rank).done);
@@ -3112,7 +3122,8 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             auto &r = localState(rank);
             if (useGraph) AssertInFastLLM(FastllmCudaGraphLaunch(r.graphs[0].exec), "Naive batch draft graph launch failed.");
             else body(rank);
-            if (draftTP) FastllmCudaEventRecordCurrentThread(r.done);
+            if (ranks > 1) scratch(rank).RecordPeerEvent(r.done);
+            else if (draftTP) FastllmCudaEventRecordCurrentThread(r.done);
         });
         if (!useGraph) invalidateMoved();
         if (draftTP && !headShards) for (int rank = 1; rank < ranks; ++rank)
@@ -3154,9 +3165,7 @@ bool NaiveN05FlashModel::RunDraftBatch(const std::vector<int> &anchors,
             if (offsets.back() > 1) MatMulTransB(input, head, headShards->logits[rank]);
             else Linear(input, head, Data(), headShards->logits[rank]);
             // Separate from the backbone event: a slower peer can still be enqueueing its input reads.
-            auto &ready = scratch(rank).done;
-            if (!ready) ready = FastllmCudaEventCreate();
-            FastllmCudaEventRecordCurrentThread(ready);
+            scratch(rank).RecordPeerEvent(scratch(rank).done);
         });
         return true;
     }
@@ -4368,6 +4377,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
     // for publication and eager fallback without blocking target preparation.
     if (rank >= 0 && rounds.front()->deferIds && FastllmCudaMtpReadDraftIdsAsync(
             (float *)p.ids.cudaData + count, size_t(steps) * count, p.hostIds, p.idsReady)) {
+        draftSamplingRanks[rank]->RecordPeerEvent(state->done);
         for (int row = 0; row < live; ++row) {
             rounds[row]->proposalRow = row;
             rounds[row]->proposed.resize(rounds[row]->limit);
@@ -5555,7 +5565,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         if (round->proposalRow < 0) continue;
         const auto &p = round->proposalOwner->sampling;
         // Each sampling owner records one event for its whole group.
-        if (round->proposalRow == 0) proposals.ready.push_back(p.idsReady);
+        if (round->proposalRow == 0) proposals.ready.push_back(round->proposalOwner->done);
         proposals.rows.push_back((const float *)p.ids.cudaData + round->proposalRow);
         proposals.strides.push_back(p.rows);
     }
