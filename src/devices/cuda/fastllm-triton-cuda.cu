@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-inkling-window.h"
 #include "fastllm-cuda.cuh"
 #include "fastllm-bfloat16-silu.cuh"
 #include "fastllm.h"
@@ -1616,6 +1617,20 @@ extern "C" bool FastllmCudaTritonDeepSeekV4SparseAttentionDecodeGraph(
         mergeArgs);
     return CheckCu(
         mergeResult, "cuLaunchKernel deepseek_v4_sparse_decode_merge");
+}
+
+extern "C" void *FastllmCudaLoadWindowVerify(const char *cubin, const char *name, int shared) {
+    return LoadTritonKernel(cubin, name, shared, true);
+}
+
+extern "C" bool FastllmCudaLaunchWindowVerify(fastllm::InklingWindowKernel kernel, int tiles, int kvHeads,
+    int requests, const void *visits, const void *q, const void *bias, const void *sink, const void *gate,
+    void *output, int visitBytes, int pastOffset, int chain, int sinkStride, int gateStride) {
+    CUdeviceptr globalScratch = 0, profileScratch = 0;
+    void *args[] = {&visits, &q, &bias, &sink, &gate, &output, &visitBytes, &pastOffset, &chain,
+                    &sinkStride, &gateStride, &globalScratch, &profileScratch};
+    return CheckCu(LaunchTritonKernel(static_cast<LoadedTritonKernel *>(kernel.handle), tiles, kvHeads, requests,
+                                     128, kernel.shared, args, CU_STREAM_PER_THREAD), "Inkling window verification");
 }
 
 extern "C" bool FastllmCudaTritonSmallProjection(const char *cubin, const char *name, int shared,

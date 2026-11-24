@@ -1,6 +1,7 @@
 // Inkling 2 Mini fixed-loop inference. Architecture and checkpoint layout:
 // https://huggingface.co/thinkingmachines/Inkling-2-Mini
 // https://vllm-project.github.io/2026/11/20/inkling2-mini.html
+#include "devices/cuda/fastllm-inkling-window.h"
 #include "runtime.cuh"
 #include "gguf.h"
 #include "devices/cuda/fastllm-cuda-launch.cuh"
@@ -441,6 +442,8 @@ class Decoder final : public Runtime {
     Matrix graphLogits, unitScale, splitScratch;
     WindowDecodeKernel windowDecodeKernel = WindowDecodeKernel::Paged;
     bool pagedDecodePdl = false;
+    std::optional<InklingWindowKernel> compactWindow;
+    std::vector<Buffer<__nv_bfloat16>> windowTables;
     size_t q8WindowSmem = 0, bf16WindowSmem = 0;
     FastllmBf16MmaProjections::Project decodeBf16Gemv = nullptr;
     bool backboneBf16 = false;
@@ -823,9 +826,16 @@ class Decoder final : public Runtime {
             const bool fusedWindow = singleWindow && std::is_same_v<T, __nv_bfloat16> && windowDecodeKernel != WindowDecodeKernel::Paged;
             const bool pipelineAttention = pagedDecodePdl && ((singleWindow && splits <= 32) ||
                 (!window && singleDecodePdl && usePagedVerify && attended.rows == 1));
-            Matrix q(fusedWindow ? 0 : queries, c.heads * d);
-            Matrix bias(fusedWindow ? 0 : queries * c.heads, c.extent);
-            Matrix scratch = queries == 1 ? splitScratch : Matrix(splits, splitScratch.cols * queries);
+            const int chain = batch.front().length;
+            const bool compact = compactWindow && compactWindow->handle && usePagedVerify && window && batch.front().timeline &&
+                chain > 1 && !packedOutput && std::is_same_v<T, __nv_bfloat16> &&
+                batch.size() <= 65535 && int64_t(batch.size()) * c.kvHeads >= smCount &&
+                !projected.items[5].data && !projected.items[7].data &&
+                !((reinterpret_cast<uintptr_t>(projected.items[2].data) |
+                   reinterpret_cast<uintptr_t>(projected.items[3].data)) & 15);
+            Matrix q(fusedWindow || compact ? 0 : queries, c.heads * d);
+            Matrix bias(fusedWindow || compact ? 0 : queries * c.heads, c.extent);
+            Matrix scratch = queries == 1 || compact ? splitScratch : Matrix(splits, splitScratch.cols * queries);
             auto evaluate = [&](int row, const DecodeVisit *visit) {
                 auto sources = projected;
                 for (auto &item : sources.items)
@@ -848,6 +858,16 @@ class Decoder final : public Runtime {
                         else
                             launchFusedWindow(windowDecodeKernel, visit, in, window, splits, scratch, attended.p);
                         return;
+                    }
+                }
+                if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<KV, half>) {
+                    if (compact) {
+                        // The prologue writes BF16 query and key-ordered biases. Each CTA in the
+                        // consumer owns its complete window, including sink and output gating.
+                        if (launchCompactWindow(in, visit, slot, queries, chain, attended.p)) return;
+                        q = Matrix(queries, c.heads * d);
+                        bias = Matrix(queries * c.heads, c.extent);
+                        scratch = Matrix(splits, splitScratch.cols * queries);
                     }
                 }
                 const int biasTile = c.relative == 16 && c.extent % 4 == 0 ? 4 * threads : threads;

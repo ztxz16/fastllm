@@ -116,9 +116,52 @@ bool timelineCompatible(int batch) const {
            int64_t(batch) * (c.draft.steps + 1) <= 65535;
 }
 
+bool launchCompactWindow(RelativeInputs<__nv_bfloat16> in, const DecodeVisit *visit, size_t slot,
+                         int queries, int chain, __nv_bfloat16 *out) {
+    const auto &sink = in.sources.items[3], &gate = in.sources.items[2];
+    in.windowTable = windowTables[c.visits[slot]].p;
+    Matrix narrowQ(queries, c.heads * c.headDim / 2), narrowBias(queries * c.heads, c.extent / 2);
+    const int tiles = (c.extent + 255) / 256;
+    const int rowTasks = (c.heads + 3) / 4 + (c.heads + 15) / 16 * tiles;
+    const int kvTasks = (2 * c.kvHeads + 3) / 4;
+    const dim3 grid(2 * rowTasks + kvTasks, (queries / chain) * ((chain + 1) / 2));
+    const int tokensPerTile = 32 / (c.heads / c.kvHeads);
+    static_assert(offsetof(DecodeVisit, pages) == 0 && offsetof(PageView, key) == 0 &&
+        offsetof(PageView, value) == 8 && offsetof(PageView, ids) == 16 &&
+        offsetof(PageView, first) == 24 && offsetof(PageView, pageLen) == 28 &&
+        offsetof(DecodeVisit, verifyRemaining) == offsetof(DecodeVisit, past) + sizeof(int));
+    return cuda_launch::Launch<prepareRelative<half, true, true, __nv_bfloat16, true, 16, true>>(
+            grid, threads, 0, cudaStreamPerThread, visit, in, tiles, narrowQ.p, narrowBias.p, chain) &&
+        FastllmCudaLaunchWindowVerify(*compactWindow, (chain + tokensPerTile - 1) / tokensPerTile,
+            c.kvHeads, queries / chain, visit, narrowQ.p, narrowBias.p, sink.data, gate.data,
+            out, sizeof(DecodeVisit), offsetof(DecodeVisit, past), chain, sink.stride, gate.stride);
+}
+
+// Resolve the optional kernel and pack each physical layer's table before
+// warming the first sufficiently large plan. All subsequent captures share them.
+void prepareWindowVerification(int batch) {
+    if (compactWindow || !backboneBf16 || !pagedDecodePdl || c.relative != 16 || c.headDim != 128 ||
+        c.conv != 4 || c.kvHeads <= 0 || c.heads % c.kvHeads || int64_t(batch) * c.kvHeads < smCount)
+        return;
+    auto kernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen());
+    if (kernel.handle) {
+        std::vector<Buffer<__nv_bfloat16>> tables(c.layers);
+        for (int layer = 0; layer < c.layers; ++layer) {
+            if (!c.local[layer]) continue;
+            const auto *src = param("layers." + std::to_string(layer) + ".attn.rel_logits_proj.proj", 16 * c.extent);
+            tables[layer] = Buffer<__nv_bfloat16>(size_t(16) * c.extent);
+            packWindowTable<<<(16 * c.extent + 255) / 256, 256, 0, cudaStreamPerThread>>>(src, tables[layer].p, c.extent);
+            check(cudaGetLastError());
+        }
+        windowTables = std::move(tables);
+    }
+    compactWindow = kernel;
+}
+
 template <class T> RoundPlan &roundPlan(int batch) {
     auto &plan = roundPlans[batch];
     if (!plan) {
+        if (timelineCompatible(batch)) prepareWindowVerification(batch);
         auto entry = std::make_unique<RoundPlan>(batch, c);
         entry->draftPool.ShareStorage(roundScratch);
         entry->verifyPool.ShareStorage(roundScratch);
