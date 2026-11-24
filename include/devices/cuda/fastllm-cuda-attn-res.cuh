@@ -182,10 +182,10 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources
         const In *src = sources.items[s] + size_t(row) * width;
         float sq = 0.f, dot = 0.f;
         if constexpr (FixedWidth) {
-            // Independent loads can be issued ahead of the ordered FMA chains.
+            // Unsigned offsets avoid sign extension in the unrolled loads on SM75.
 #pragma unroll
             for (int item = 0; item < FixedWidth / 128; ++item) {
-                const int j = item * 128 + tid % 128;
+                const unsigned j = item * 128u + (threadIdx.x & 127u);
                 float v = src[j];
                 sq += v * v;
                 dot += v * query.values[j];
