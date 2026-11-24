@@ -294,10 +294,10 @@ inline int Alignment(const void *p) {
 }
 
 inline bool Run(State &s, Plan &p, const cublasLtMatmulAlgo_t &algo,
-                const void *weight, const void *input, void *output, void *workspace) {
+                const void *weight, const void *input, void *output, void *workspace, cudaStream_t stream = cudaStreamPerThread) {
     float alpha = 1.0f, beta = 0.0f;
     return CheckBlas(cublasLtMatmul(s.handle, p.op, &alpha, weight, p.a, input, p.b,
-        &beta, output, p.c, output, p.c, &algo, workspace, workspace ? workspaceBytes : 0, cudaStreamPerThread));
+        &beta, output, p.c, output, p.c, &algo, workspace, workspace ? workspaceBytes : 0, stream));
 }
 
 inline bool MakeLayouts(Plan &p, const Key &key) {
@@ -461,12 +461,12 @@ inline void MakePlan(State &s, Plan &p, const Key &key,
 }
 
 inline bool Matmul(const void *input, const void *weight, void *output, int M, int K, int N,
-                   cudaDataType_t storage = CUDA_R_16BF, int referenceRows = 0) {
+                   cudaDataType_t storage = CUDA_R_16BF, int referenceRows = 0, bool heuristicOnly = false) {
     // This bounds tuning cost, not model/architecture-specific dispatch.
     const bool prefill = referenceRows == prefillReferenceRows;
     if (M <= 0 || N <= 0 || K <= 0) return false;
     if (storage == CUDA_R_16BF) {
-        if (!prefill && (M > (referenceRows ? 256 : 32) ||
+        if (!prefill && !heuristicOnly && (M > (referenceRows ? 256 : 32) ||
             (referenceRows && (referenceRows != 32 || M % referenceRows)))) return false;
     } else if (storage == CUDA_R_16F) {
         // Large decode heads amortize tuning and saturate Hopper bandwidth.
@@ -478,9 +478,9 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
     CheckCuda(cudaStreamIsCapturing(cudaStreamPerThread, &capture));
     int device = 0;
     CheckCuda(cudaGetDevice(&device));
-    State *s = GetState(device, capture != cudaStreamCaptureStatusNone, !prefill);
+    State *s = GetState(device, capture != cudaStreamCaptureStatusNone, !prefill && !heuristicOnly);
     if (!s || (referenceRows && s->arch != (prefill ? 120 : 90))) return false;
-    Key key{M, N, K, Alignment(weight), Alignment(input), Alignment(output), static_cast<int>(storage), referenceRows};
+    Key key{M, N, K, Alignment(weight), Alignment(input), Alignment(output), static_cast<int>(storage), heuristicOnly ? -2 : referenceRows};
     if (prefill) {
         if (std::min({key[3], key[4], key[5]}) < 16) return false;
         key[3] = key[4] = key[5] = 16;
@@ -512,13 +512,13 @@ inline bool Matmul(const void *input, const void *weight, void *output, int M, i
                     plan->a, plan->b, plan->c, plan->c, &plan->algo, &checked)) &&
                     checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize <= (prefill ? 0 : workspaceBytes);
             }
-        } else MakePlan(*s, *plan, key, weight, input, output);
+        } else MakePlan(*s, *plan, key, weight, input, output, heuristicOnly);
         found = s->plans.emplace(key, std::move(plan)).first;
     }
     Plan &p = *found->second;
     p.lastUse = ++s->planClock;
     if (!p.valid) return false;
-    if (prefill) return Run(*s, p, p.algo, weight, input, output, nullptr);
+    if (prefill || heuristicOnly) return Run(*s, p, p.algo, weight, input, output, nullptr);
     void *workspace = capture == cudaStreamCaptureStatusNone
         ? s->eager->data : CaptureWorkspace(*s);
     return workspace && Run(*s, p, p.algo, weight, input, output, workspace);

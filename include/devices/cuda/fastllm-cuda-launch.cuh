@@ -7,11 +7,19 @@ namespace fastllm { namespace cuda_launch {
 // all CTAs trigger before any early return. Ordinary stream launches and
 // pre-SM90 code retain the original ordering.
 // https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/programmatic-dependent-launch.html
-__device__ __forceinline__ void DependencyStart() {
+__device__ __forceinline__ void DependencyWait() {
 #if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    cudaGridDependencySynchronize();
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void TriggerDependents() {
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
+}
+__device__ __forceinline__ void DependencyStart() {
+    DependencyWait();
+    TriggerDependents();
 }
 
 #if CUDART_VERSION >= 12000
