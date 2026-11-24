@@ -187,6 +187,34 @@ FT 的 PD Router 采用以下命令行配置项与默认值：
   D 的实际分配由 D 内部调度与 KV 池管理器完成；Router 的容量信息用于选路和准入，
   不能替代 D 的实际分配结果。容量不足时的排队限额、超时及跨请求背压规则后续补充。
 
+### D 端容量准入与 Decode 增长预算
+
+- D 的 KV 容量保护采用 SGLang 的处理方式：接收新请求前，先为已接纳请求的后续
+  Decode 留出增长预算，再判断能否分配新请求的完整接收空间及其自身增长额度。
+  推送与拉取共用该准入规则；请求分发和 D 分配的时间顺序仍按 vLLM NIXL 要求执行。
+- 支持 `--num-reserved-decode-tokens`，默认每个活跃请求保留 **512 Token** 的增长预算，
+  支持显式配置。活跃请求统计覆盖运行中、已接收待执行以及已占用 D 接收空间的在途请求，
+  同一请求不能重复计数；新接纳请求也须计入后续预算。
+- 增长预算是准入时从可分配容量中扣除的额度，不要求提前给每个请求实际分配 512 Token
+  的 KV 页面。接收 Prompt KV 所需的页面仍须实际分配；预算按模型、精度、并行分片及
+  页面布局换算，同时核算已有 KV 占用、可安全回收的缓存和等待恢复请求的空间需求。
+- D 统一执行容量检查及分配状态更新。预算不足时，新请求在 D 的待分配队列等待，
+  不登记不可用的接收位置，也不提交对应 KV 读写；Router 根据承接能力限制后续准入。
+  已算完的 P 按交接生命周期保留源 KV，等待仍受取消和超时规则约束。
+- 增长预算不保证所有请求一直生成到输出上限都无需释放空间。运行中仍不足时，支持
+  回撤部分 Decode 请求，保留可恢复的 KV 与续跑状态后释放相应占用；优先恢复这些请求，
+  仍有等待恢复请求时暂缓新接收空间分配。已开始的传输继续推进，实际结束后才能回收。
+  无可用恢复路径时明确报错；KV 备份、恢复后端及回撤选择规则后续补充。
+
+参考：[SGLang 默认增长预算，disagg.py:115](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/arg_groups/fields/disagg.py#L115)、
+[活跃请求预算，decode.py:2754](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/decode.py#L2754)、
+[容量扣除，decode.py:2823](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/decode.py#L2823)、
+[回撤处理，schedule_batch.py:3028](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/schedule_batch.py#L3028)、
+[优先恢复，decode.py:4561](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/decode.py#L4561)。
+
+记录日期：2026-11-24。状态：需求已确认，待实现，尚无容量准入与回撤恢复的验收结果。
+下一步：补充预算与页面换算、队列衔接及回撤恢复方案，验证并发准入、增长保护和异常清理。
+
 ## KV 回传与多轮复用
 
 - 支持 D 产生的 KV 在后续会话轮次中供 P 复用，减少历史 Token 的重复 Prefill。
@@ -231,6 +259,8 @@ FT 的 PD Router 采用以下命令行配置项与默认值：
   D 自身已知加载的模型及布局，交接前仍需确认两端兼容。
 - D 容量不足时，请求等待 D 分配；已经完成 Prefill 的 P 按交接生命周期保留源 KV，
   未成功分配或登记的目标空间不能用于传输。等待仍受取消、超时及背压规则约束。
+  容量判断采用 [D 端容量准入与 Decode 增长预算](#d-端容量准入与-decode-增长预算)，
+  为已有请求保留增长额度后，才允许新请求占用接收空间。
 - 两种模式的 KV 数据均从 P 直接传到 D，统一入口只转交请求和元数据。
   D 向 P 登记接收位置属于推送的准备步骤，不等同于 D 发起 KV 读取。
 - 两种模式复用统一 KV 交接模块、请求状态交接、重分片与生命周期管理；
