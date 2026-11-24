@@ -6354,15 +6354,25 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, f
 }
 
 namespace fastllm {
-bool PrepareCudaIndexedMoeWeights(Data **weights, int count) {
-    int h = weights[2]->dims.at(1), inter = weights[2]->dims.at(0) / 2;
+bool GetCudaIndexedMoeSlots(Data **weights, int count, CudaIndexedMoeSlots &slots) {
+    if (!weights || count < 4 || !weights[2] || weights[2]->dims.size() != 2) return false;
+    const int hidden = weights[2]->dims[1], inter = weights[2]->dims[0] / 2;
     if (weights[2]->dataType == FP8_E4M3) {
         FastllmMoeFp8ExpertTable *table = nullptr;
-        return FastllmGetMoeFp8ExpertTable(weights, count, h, inter, table);
-    }
-    FastllmMoeNVFP4ExpertTable *table = nullptr;
-    return weights[2]->dataType == NVFP4_BLOCK_16 &&
-        FastllmGetMoeNVFP4ExpertTable(weights, count, h, inter, table);
+        if (!FastllmGetMoeFp8ExpertTable(weights, count, hidden, inter, table)) return false;
+        slots = {table->gateWeights, table->downWeights, table->gateScales, table->downScales,
+                 table->gateBlockM, table->gateBlockK, table->downBlockM, table->downBlockK};
+    } else if (weights[2]->dataType == NVFP4_BLOCK_16) {
+        FastllmMoeNVFP4ExpertTable *table = nullptr;
+        if (!FastllmGetMoeNVFP4ExpertTable(weights, count, hidden, inter, table)) return false;
+        slots = {table->gateWeights, table->downWeights};
+    } else return false;
+    return true;
+}
+
+bool PrepareCudaIndexedMoeWeights(Data **weights, int count) {
+    CudaIndexedMoeSlots slots{};
+    return GetCudaIndexedMoeSlots(weights, count, slots);
 }
 
 void ReleaseCudaIndexedMoeWeights(Data **weights) {
@@ -6440,21 +6450,11 @@ bool RunCudaIndexedMoeSlots(const CudaIndexedMoeSlots &slots, const Data &input,
 bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data &indices,
         const Data &scores, Data &gateUp, Data &middle, Data **weights, int count,
         const CudaMoeActivation &activation) {
-    const int hidden = input.dims[1];
-    const int inter = weights[2]->dims[0] / 2;
-    if (hidden != weights[2]->dims[1]) return false;
+    if (input.dims.size() != 2 || !weights || count < 4 || !weights[2] ||
+        weights[2]->dims.size() != 2 || input.dims[1] != weights[2]->dims[1]) return false;
     CudaIndexedMoeSlots slots{};
-    if (weights[2]->dataType == FP8_E4M3) {
-        FastllmMoeFp8ExpertTable *table = nullptr;
-        if (!FastllmGetMoeFp8ExpertTable(weights, count, hidden, inter, table)) return false;
-        slots = {table->gateWeights, table->downWeights, table->gateScales, table->downScales,
-                 table->gateBlockM, table->gateBlockK, table->downBlockM, table->downBlockK};
-    } else if (weights[2]->dataType == NVFP4_BLOCK_16) {
-        FastllmMoeNVFP4ExpertTable *table = nullptr;
-        if (!FastllmGetMoeNVFP4ExpertTable(weights, count, hidden, inter, table)) return false;
-        slots.gate = table->gateWeights;
-        slots.down = table->downWeights;
-    } else return false;
-    return RunCudaIndexedMoeSlots(slots, input, indices, scores, gateUp, middle, output, inter, activation);
+    if (!GetCudaIndexedMoeSlots(weights, count, slots)) return false;
+    return RunCudaIndexedMoeSlots(slots, input, indices, scores, gateUp, middle, output,
+                                  weights[2]->dims[0] / 2, activation);
 }
 }

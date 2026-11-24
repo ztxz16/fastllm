@@ -411,6 +411,16 @@ if (USE_CUDA)
             set(FASTLLM_CUTLASS_FP8_SM121_ENABLED ON)
         endif()
     endforeach()
+    if (NOT CUDA_NO_TENSOR_CORE AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0 AND
+        EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/gemm/device/gemm_grouped.h" AND
+        (FASTLLM_CUDA_ARCHITECTURES MATCHES "(^|;)75(-real|-virtual)?(;|$)" OR
+         ("native" IN_LIST FASTLLM_CUDA_ARCHITECTURES AND CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "(^|;)75(-real|-virtual)?(;|$)")))
+        set(FASTLLM_INKLING_GROUPED_SM75 ON)
+        set_property(SOURCE src/models/inkling2/experts.cu test/ops/cudaGroupedMxfp8Sm75.cu APPEND PROPERTY
+            INCLUDE_DIRECTORIES "${FASTLLM_CUTLASS_DIR}/include")
+        set_property(SOURCE src/models/inkling2/experts.cu APPEND PROPERTY
+            COMPILE_DEFINITIONS FASTLLM_INKLING_GROUPED_SM75)
+    endif()
     if (FASTLLM_CUTLASS_FP8_SM89_ENABLED AND
         CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.4)
         set(FASTLLM_CUTLASS_FP8_ARCH_ENABLED ON)
@@ -4681,6 +4691,9 @@ if (UNIT_TEST)
             ENVIRONMENT "FASTLLM_FORCE_NATIVE_ATTN=1;FASTLLM_PAGED_NO_SPLIT=1")
 
         set(inkling_op_tests cudaInklingRelativeAttention cudaAttnResRegression cudaRoutedNvfp4Sm120)
+        if (FASTLLM_INKLING_GROUPED_SM75)
+            list(APPEND inkling_op_tests cudaGroupedMxfp8Sm75)
+        endif()
         if (FASTLLM_INKLING_GROUPED_SOURCES)
             list(APPEND inkling_op_tests cudaGroupedMxfp8Sm120)
         endif()

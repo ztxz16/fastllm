@@ -2,6 +2,9 @@
 // Reference for the NVFP4 reconstruction policy and the position of the routing weights:
 // https://github.com/vllm-project/vllm/tree/fc1443152c0eb655f5c2762f56b540bebe93b196/vllm/models/inkling2/nvidia
 #include "runtime.cuh"
+#ifdef FASTLLM_INKLING_GROUPED_SM75
+#include "mxfp8-sm75.cuh"
+#endif
 #include "../../devices/cuda/moe/fastllm-nvfp4-routed-sm120.cuh"
 #ifdef FASTLLM_INKLING_GROUPED_SM120
 #include "../../devices/cuda/moe/fastllm-grouped-sm120.cuh"
@@ -63,6 +66,12 @@ __device__ float roundFp8(float x) {
     return copysignf(rintf(a / step) * step, x);
 #endif
 }
+__device__ float reconstructMxfp8(float value, float blockMax) {
+    if (!(blockMax > 0)) return 0.f;
+    const float scale = exp2f(ceilf(log2f(blockMax / 448.f)));
+    return roundFp8(value / scale) * scale;
+}
+
 struct Fp4Choice {
     float value, scale, reconstructed;
 };
@@ -143,7 +152,38 @@ __global__ void packMxfp8Routes(Source source, uint8_t *codes, uint8_t *scales,
     }
 }
 
-__global__ void sumMxfp8Routes(const __nv_bfloat16 *sorted, float *output, const int *ids,
+#endif
+
+#ifdef FASTLLM_INKLING_GROUPED_SM75
+template<class Source>
+__global__ void packSm75Routes(Source src, half *out, const int *ids, const int *offsets,
+                               const int *ranks, int width) {
+    constexpr bool input = std::is_same_v<Source, InputRow>;
+    constexpr int copies = input ? 8 : 1;
+    const int row = blockIdx.x;
+    __shared__ int sorted[copies];
+    if (threadIdx.x < copies) {
+        int route = row * copies + threadIdx.x;
+        sorted[threadIdx.x] = offsets[ids[route]] + ranks[route];
+    }
+    __syncthreads();
+    for (int col = threadIdx.x; col < width; col += blockDim.x) {
+        float v;
+        if constexpr (input) v = src.get(row, col, width);
+        else v = src.get(sorted[0], row, col, width);
+        float peak = fabsf(v);
+        for (int delta = 16; delta; delta >>= 1)
+            peak = fmaxf(peak, __shfl_xor_sync(__activemask(), peak, delta));
+        const half value = __float2half_rn(reconstructMxfp8(v, peak));
+        #pragma unroll
+        for (int j = 0; j < copies; ++j) out[size_t(sorted[j]) * width + col] = value;
+    }
+}
+#endif
+
+#if defined(FASTLLM_INKLING_GROUPED_SM75) || defined(FASTLLM_INKLING_GROUPED_SM120)
+template<class T>
+__global__ void sumMxfp8Routes(const T *sorted, float *output, const int *ids,
                                const int *offsets, const int *ranks, int n, int top) {
     const int token = blockIdx.x;
     for (int col = threadIdx.x; col < n; col += blockDim.x) {
@@ -265,13 +305,7 @@ __device__ void reconstructRow(Source src, Out out, int d, bool cacheValues, uns
             if (!(col % 8)) storeFp4Word(out, row, col, d, word, __nv_fp8_e4m3(q.scale).__x, outer);
 #endif
         } else {
-            float q = 0;
-            if constexpr (fp4) {
-                q = chooseFp4(v, peak, outer).reconstructed;
-            } else if (peak > 0) {
-                float scale = exp2f(ceilf(log2f(peak / 448.f)));
-                q = roundFp8(v / scale) * scale;
-            }
+            const float q = fp4 ? chooseFp4(v, peak, outer).reconstructed : reconstructMxfp8(v, peak);
             if constexpr (std::is_same_v<Out, half *>)
                 out[size_t(row) * d + col] = __float2half_rz(q);
             else
@@ -532,6 +566,9 @@ struct HostShard {
 struct Projection {
     int rows, cols, group;
     bool fp4;
+#ifdef FASTLLM_INKLING_GROUPED_SM75
+    bool exactHalfWeights = false;
+#endif
     ExpertDevice device;
     std::vector<std::unique_ptr<Data>> resident;
     Buffer<uint4> nativeCodes;
@@ -554,6 +591,12 @@ struct Projection {
             throw std::runtime_error("Inkling expert columns are not group aligned");
         auto raw = readRange<uint8_t>(weight, {e, r, fp4 ? c / 2 : c}, fp4 ? "U8" : "F8_E4M3");
         auto scale = readRange<uint8_t>(files.at(name + "_scale"), {e, r, c / group}, fp4 ? "F8_E4M3" : "U8");
+#ifdef FASTLLM_INKLING_GROUPED_SM75
+        if (where == ExpertDevice::Cuda && !fp4 && FastllmCudaRuntimeArch() == 75) {
+            // Every finite E4M3 value times 2^exp fits FP16 exactly for -15 <= exp <= 7.
+            exactHalfWeights = std::all_of(scale.begin(), scale.end(), [](uint8_t x) { return x >= 112 && x <= 134; });
+        }
+#endif
         std::vector<float> outer(e, 1);
         if (fp4) {
             outer = readRange<float>(files.at(name + "_amax"), {e}, "F32");
@@ -722,6 +765,39 @@ class GpuExperts final : public RoutedExperts {
     std::unique_ptr<CudaGroupedMxfp8Moe> groupedFp8;
 #ifdef FASTLLM_INKLING_GROUPED_SM120
     bool nativeMxfp8 = false;
+#endif
+
+#ifdef FASTLLM_INKLING_GROUPED_SM75
+    CudaIndexedMoeSlots sm75Weights{};
+    int sm75Blocks = 0, sm75LargeBlocks = 0;
+
+    void sm75Prefill(const Config &c, const Matrix &x, const float *logits, const float *bias, float *dst) const {
+        const int rows = x.rows, routes = rows * c.topK;
+        const auto stream = cudaStreamPerThread;
+        Buffer<sm75::Plan> plan(1);
+        Buffer<int> indices(routes), ranks(routes);
+        Matrix scores(rows, c.topK);
+        Buffer<half> input(size_t(routes) * std::max(gate.cols, down.cols));
+        Buffer<float> sorted(size_t(routes) * std::max(gate.rows, down.rows));
+        RouteSelection route{logits, bias, indices.p, scores.p, c.experts, c.topK, c.routeScale};
+        check(cudaMemsetAsync(plan.p->counts, 0, sizeof(plan.p->counts), stream));
+        selectRanked<sm75::Experts><<<rows, 32, 0, stream>>>(route, ranks.p, plan.p->counts);
+        sm75::prefixRoutes<<<1, 1, 0, stream>>>(plan.p);
+        auto project = [&](const Projection &p, uint8_t **codes, float **scales, int count, auto source) {
+            packSm75Routes<<<count, 256, 0, stream>>>(
+                source, input.p, indices.p, plan.p->offsets, ranks.p, p.cols);
+            if (rows < 1024) {
+                sm75::project<16>(plan.p, input.p, sorted.p, codes, scales, p.rows, p.cols, sm75Blocks, stream);
+            } else {
+                sm75::project<128>(plan.p, input.p, sorted.p, codes, scales, p.rows, p.cols, sm75LargeBlocks, stream);
+            }
+        };
+        project(gate, sm75Weights.gate, sm75Weights.gateScales, rows, InputRow{x.p});
+        project(down, sm75Weights.down, sm75Weights.downScales, routes,
+                RoutedSiTU<float>{sorted.p, route.scores, gateCap, upCap});
+        sumMxfp8Routes<<<rows, 256, 0, stream>>>(sorted.p, dst, indices.p, plan.p->offsets, ranks.p, down.rows, c.topK);
+        check(cudaGetLastError());
+    }
 #endif
 
     template <int TileRows, int ColumnTiles>
@@ -912,6 +988,14 @@ public:
             weights[2 + 2 * e] = gate.resident[e].get();
             weights[3 + 2 * e] = down.resident[e].get();
         }
+#ifdef FASTLLM_INKLING_GROUPED_SM75
+        if (gate.exactHalfWeights && down.exactHalfWeights && c.experts == sm75::Experts && c.topK == 8) {
+            sm75Blocks = sm75::Grouped<16>::Op::sufficient();
+            sm75LargeBlocks = sm75::Grouped<128>::Op::sufficient();
+            if (sm75Blocks && sm75LargeBlocks && GetCudaIndexedMoeSlots(weights.data(), weights.size(), sm75Weights)) return;
+            sm75Blocks = 0;
+        }
+#endif
         if (!gate.fp4) groupedFp8 = PrepareCudaGroupedMxfp8Moe(weights.data(), weights.size());
         if (groupedFp8) {
 #ifdef FASTLLM_INKLING_GROUPED_SM120
@@ -945,20 +1029,28 @@ public:
         // prefill grids index tiles, so a whole 64K-route scratch chunk fits.
         const int chunk = (gate.nativeCodes.p ? 65536 : 65535) / c.topK;
         int start = 0;
-#ifdef FASTLLM_INKLING_GROUPED_SM120
-        if (nativeMxfp8 && phase == ExpertPhase::Prefill) {
-            // Amortize unpacking a projection over at least 4096 input tokens.
-            while (x.rows - start >= 4096) {
-                const int rows = std::min(16384, x.rows - start);
-                try {
-                    mxfp8Prefill(c, x.slice(start, rows), router.p + size_t(start) * c.experts,
-                                 bias, out.p + size_t(start) * c.hidden);
-                } catch (const CudaWorkspaceExhausted &) {
-                    cudaGetLastError();
-                    break; // Retry these rows with the smaller Marlin workspace.
+#if defined(FASTLLM_INKLING_GROUPED_SM75) || defined(FASTLLM_INKLING_GROUPED_SM120)
+        if (phase == ExpertPhase::Prefill) {
+            auto groupedPrefill = [&](int minRows, auto project) {
+                while (x.rows - start >= minRows) {
+                    const int rows = std::min(16384, x.rows - start);
+                    try {
+                        (this->*project)(c, x.slice(start, rows), router.p + size_t(start) * c.experts,
+                                         bias, out.p + size_t(start) * c.hidden);
+                    } catch (const CudaWorkspaceExhausted &) {
+                        cudaGetLastError();
+                        break; // Retry the remaining rows through the smaller fallback below.
+                    }
+                    start += rows;
                 }
-                start += rows;
-            }
+            };
+#ifdef FASTLLM_INKLING_GROUPED_SM75
+            if (sm75Blocks) groupedPrefill(16, &GpuExperts::sm75Prefill);
+#endif
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+            // Amortize unpacking a projection over at least 4096 input tokens.
+            if (nativeMxfp8) groupedPrefill(4096, &GpuExperts::mxfp8Prefill);
+#endif
         }
 #endif
         for (; start < x.rows; start += chunk) {

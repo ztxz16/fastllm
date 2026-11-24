@@ -58,6 +58,7 @@ bool RunCudaIndexedMoeSlots(const CudaIndexedMoeSlots &slots, const Data &input,
 bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data &indices,
                                      const Data &scores, Data &gateUp, Data &middle, Data **weights,
                                      int weightsBatch, const CudaMoeActivation &activation);
+bool GetCudaIndexedMoeSlots(Data **weights, int weightsBatch, CudaIndexedMoeSlots &slots);
 bool PrepareCudaIndexedMoeWeights(Data **weights, int weightsBatch);
 void ReleaseCudaIndexedMoeWeights(Data **weights);
 }
