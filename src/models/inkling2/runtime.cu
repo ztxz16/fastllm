@@ -32,6 +32,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -321,9 +322,12 @@ bool speculativeSampling(const GenerationConfig &s) {
            !s.tool_call_content_sampling_enabled && !s.tool_call_name_constraint_enabled &&
            !s.tool_call_parameter_name_constraint_enabled && s.output_token_least == 0;
 }
-uint64_t newSamplingSeed() {
+std::mt19937_64 &samplingRng() {
     static thread_local std::mt19937_64 gen(std::random_device{}());
-    return gen();
+    return gen;
+}
+uint64_t newSamplingSeed() {
+    return samplingRng()();
 }
 #include "dspark.cuh"
 #include "prefix-cache.cuh"
@@ -342,6 +346,7 @@ struct Request {
         cudaGetDevice(&previous);
         if (previous != gpu)
             cudaSetDevice(gpu);
+        if (draft && draft->reader) cudaEventSynchronize(draft->reader->event);
         if (draft && draft->rounds)
             printf("[Inkling DSpark] rounds=%d proposed=%d accepted=%d mean_round_ms=%.3f\n",
                    draft->rounds, draft->proposed, draft->accepted, draft->roundMs / draft->rounds);
@@ -1604,6 +1609,7 @@ class Decoder final : public Runtime {
             if (!lock.owns_lock()) {
                 lock.lock();
                 check(cudaSetDevice(decoder.placement.gpu));
+                decoder.finishPublication();
             }
             if (!decoder.decodeGraph) return false;
             auto &cache = context.pastKeyValues;
@@ -1762,6 +1768,7 @@ class Decoder final : public Runtime {
     }
     ~Decoder() override {
         cudaSetDevice(placement.gpu);
+        if (draftQueued) cudaEventSynchronize(publishedPlan->publication.tail->event);
         if (decodeGraph)
             cudaGraphExecDestroy(decodeGraph);
     }
@@ -1785,6 +1792,7 @@ class Decoder final : public Runtime {
     void warmupDecodeGraph() override {
         std::lock_guard<std::mutex> lock(mutex);
         check(cudaSetDevice(placement.gpu));
+        finishPublication();
         initializeKV();
         if (!c.draft.steps && model.maxBatch > 1) {
             for (int b = model.maxBatch; b > 1; b = decodeCapacity(b / 2 + b % 2))
@@ -1807,6 +1815,7 @@ class Decoder final : public Runtime {
                              std::vector<std::vector<float> *> *logits) override {
         std::lock_guard<std::mutex> lock(mutex);
         check(cudaSetDevice(placement.gpu));
+        if (publishedPlan && publicationThread != std::this_thread::get_id()) finishPublication();
         initializeKV();
         const_cast<Data &>(ids).ToDevice(CPU);
         if (ids.dataType != FLOAT32 || std::any_of(lengths.begin(), lengths.end(), [](int n) { return n <= 0; }) ||
@@ -2014,6 +2023,7 @@ class Decoder final : public Runtime {
         if (speculate)
             return bf16 ? verifyRound<__nv_bfloat16>(batch, values, sampling)
                         : verifyRound<half>(batch, values, sampling);
+        finishPublication();
         std::vector<float> suffix;
         const bool checkpoint = prefixEnabled &&
             std::any_of(batch.begin(), batch.end(), [](const Segment &s) { return s.request->length < s.request->promptLength; });

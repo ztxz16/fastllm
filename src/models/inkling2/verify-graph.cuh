@@ -164,7 +164,11 @@ template <class T> RoundPlan &roundPlan(int batch) {
         if (timelineCompatible(batch)) prepareWindowVerification(batch);
         const bool nativeProjections = batch == 1 && !quantizedFold && singletonControllerPdl &&
             std::is_same_v<T, __nv_bfloat16> && GetFastllmEnv().cudaGraph;
-        auto entry = std::make_unique<RoundPlan>(batch, c, nativeProjections);
+        const bool earlyPublication = GetFastllmEnv().cudaGraph && timelineCompatible(batch) &&
+            batch > 1 && draftAttentionWarps && (c.draft.window >= c.draft.steps + 1 ||
+                          std::none_of(c.draft.local.begin(), c.draft.local.end(), [](bool v) { return v; })) &&
+            std::all_of(placement.experts.begin(), placement.experts.end(), [](auto d) { return d == ExpertDevice::Cuda; });
+        auto entry = std::make_unique<RoundPlan>(batch, c, nativeProjections, earlyPublication);
         entry->draftPool.ShareStorage(roundScratch);
         entry->verifyPool.ShareStorage(roundScratch);
         if (GetFastllmEnv().cudaGraph && timelineCompatible(batch)) {
@@ -227,6 +231,11 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
     const auto start = std::chrono::steady_clock::now();
     const int b = batch.size(), slots = c.visits.size();
     auto &p = roundPlan<T>(b);
+    const bool sameBatch = publishedPlan == &p && int(publicationOwners.size()) == b &&
+        std::equal(batch.begin(), batch.end(), publicationOwners.begin(),
+                   [](const Segment &s, const auto &owner) { return s.request == owner.lock().get(); });
+    bool reuse = sameBatch && draftQueued;
+    bool queue = sameBatch && p.draftExec;
     std::vector<VisitCache *> pendingTables;
     pendingTables.reserve(size_t(b) * (slots + c.draft.layers));
 
@@ -234,13 +243,19 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
         auto &req = *batch[i].request;
         const auto &cfg = sampling[i];
         const int steps = std::clamp(req.limit - req.length - 2, 0, p.steps);
-        p.hostInputs[i] = {int(anchors[batch[i].offset]), cfg.top_k, steps, cfg.temperature, cfg.top_p};
+        const auto &last = p.hostInputs[i];
+        const int anchor = int(anchors[batch[i].offset]);
+        reuse = reuse && p.nextPast[i] == req.length && p.nextAnchor[i] == anchor && last.steps == steps &&
+                 last.topK == cfg.top_k && last.topP == cfg.top_p && last.temperature == cfg.temperature;
+        queue &= int64_t(req.length) + p.chain <= c.draft.maxPositions - c.draft.block &&
+                 int64_t(req.length) + p.chain + p.steps + 2 <= req.limit;
+        p.hostInputs[i] = {anchor, cfg.top_k, steps, cfg.temperature, cfg.top_p};
         for (int l = 0; l < c.draft.layers; ++l) {
             auto &kv = req.draft->kv[l]->cache;
             bool local = c.draft.local[l];
             kv.reservePages(req.length + c.draft.block, local ? c.draft.window + c.draft.block : 0);
             p.draftViews[l * b + i] = {kv.view(&pendingTables), req.draft->recurrentContext.p, req.length,
-                                       local ? std::max(0, req.length - c.draft.window) : 0};
+                                       local ? std::max(0, req.length - c.draft.window) : 0, local ? c.draft.window : 0};
         }
         for (int l = 0; l < slots; ++l) {
             auto &v = req.visits[l];
@@ -254,15 +269,49 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
     }
     roundPageTables.upload(pendingTables);
     uploadRound(p);
-    if (p.draftExec) check(cudaGraphLaunch(p.draftExec, cudaStreamPerThread));
-    else draftBody<T>(p);
+    if (reuse) reuse = std::equal(p.hostSeeds.begin(), p.hostSeeds.end(), p.publication.seeds.begin());
+    if (!reuse) {
+        if (p.draftExec) check(cudaGraphLaunch(p.draftExec, cudaStreamPerThread));
+        else draftBody<T>(p);
+    }
     if (p.verifyExec) launchTargetGraph(p.verifyExec, p.verifyPool);
     else if (timelineCompatible(b)) verifyBody<T>(p);
     else verifyUnaligned<T>(p, batch);
-    std::vector<int> host(b * (p.chain + 1));
-    check(cudaMemcpyAsync(host.data(), p.result.p, host.size() * sizeof(int), cudaMemcpyDeviceToHost,
-                          cudaStreamPerThread));
-    check(cudaStreamSynchronize(cudaStreamPerThread));
+
+    // The current verifier is queued before waiting for an older draft lease.
+    // A cancelled cohort can now release its KV without delaying this graph.
+    finishPublication();
+    std::vector<int> fallback;
+    int *host = p.publication.tokens.data();
+    if (p.publication.tokens.empty()) {
+        fallback.resize(size_t(b) * (p.chain + 1));
+        host = fallback.data();
+    }
+    check(cudaMemcpyAsync(host, p.result.p, size_t(b) * (p.chain + 1) * sizeof(int),
+                          cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    if (p.publication.verified && p.verifyExec) {
+        check(cudaEventRecord(p.publication.verified, cudaStreamPerThread));
+        publicationOwners.reserve(b);
+        for (const auto &s : batch)
+            publicationOwners.emplace_back(std::static_pointer_cast<Request>(s.request->visits.front().key->kvStorageOwner));
+        publishedPlan = &p;
+        publicationThread = std::this_thread::get_id();
+        if (queue) {
+            // Preview the RNG without advancing it. The real scheduler call
+            // validates and consumes these seeds even when it reuses the draft.
+            auto rng = samplingRng();
+            std::generate(p.publication.seeds.begin(), p.publication.seeds.end(), [&] { return rng(); });
+            check(cudaMemcpyAsync(p.seeds.p, p.publication.seeds.data(), size_t(p.steps) * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice, cudaStreamPerThread));
+            advanceDraft<<<b, 32, 0, cudaStreamPerThread>>>(p.result.p, p.inputs.p, p.views.p, b, p.chain, c.draft.layers);
+            check(cudaGetLastError());
+            check(cudaGraphLaunch(p.draftExec, cudaStreamPerThread));
+            check(cudaEventRecord(p.publication.tail->event, cudaStreamPerThread));
+            for (const auto &s : batch) s.request->draft->reader = p.publication.tail;
+            draftQueued = true;
+        }
+        check(cudaEventSynchronize(p.publication.verified));
+    } else check(cudaStreamSynchronize(cudaStreamPerThread));
     std::vector<int> result(b);
     for (int i = 0; i < b; ++i) {
         auto &req = *batch[i].request;
@@ -270,7 +319,7 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
         int accepted = host[b * p.chain + i];
         if (accepted < 0 || accepted > p.hostInputs[i].steps)
             throw std::runtime_error("Invalid Inkling DSpark accepted length");
-        auto *out = host.data() + i * p.chain;
+        auto *out = host + i * p.chain;
         for (int j = 0; j <= accepted; ++j)
             if (out[j] < 0 || out[j] >= c.vocab) throw std::runtime_error("Invalid Inkling DSpark token");
         if (req.prefixId && req.prefixTokens.size() == size_t(req.length)) {
@@ -278,6 +327,10 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
             req.prefixTokens.insert(req.prefixTokens.end(), out, out + accepted);
         }
         req.length += accepted + 1;
+        if (queue) {
+            p.nextPast[i] = req.length;
+            p.nextAnchor[i] = out[accepted];
+        }
         for (int l = 0; l < slots; ++l) req.visits[l].prepare(req.length, c.local[c.visits[l]] ? c.window : 0);
         for (int l = 0; l < c.draft.layers; ++l)
             state.kv[l]->cache.prepare(req.length, c.draft.local[l] ? c.draft.window : 0);

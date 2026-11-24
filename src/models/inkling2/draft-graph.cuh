@@ -1,6 +1,23 @@
 // Both graphs bind the same request-major chain. Only descriptors, sampling
 // parameters and fresh RNG seeds are uploaded between replays.
+// Return verified tokens while the next draft reads the committed prefix.
+struct RoundPublication {
+    RoundHostVector<int> tokens;
+    RoundHostVector<uint64_t> seeds;
+    cudaEvent_t verified = nullptr;
+    std::shared_ptr<DraftFence> tail;
+    void allocate(size_t count, int steps) {
+        tokens.resize(count);
+        seeds.resize(steps);
+        check(cudaEventCreateWithFlags(&verified, cudaEventDisableTiming));
+        tail = std::make_shared<DraftFence>();
+    }
+    ~RoundPublication() {
+        if (verified) cudaEventDestroy(verified);
+    }
+};
 struct RoundPlan {
+    RoundPublication publication;
     int batch, steps, chain;
     Buffer<DraftView> views;
     Buffer<DraftInput> inputs;
@@ -20,11 +37,12 @@ struct RoundPlan {
     DecodeGraphScratch draftPool, verifyPool;
     Buffer<DecodeVisit> source, visits;
     Buffer<float> panels;
+    std::vector<int> nextAnchor, nextPast;
     RoundHostVector<DraftInput> hostInputs;
     RoundHostVector<uint64_t> hostSeeds;
     RoundHostVector<DraftView> draftViews;
     RoundHostVector<DecodeVisit> descriptors;
-    RoundPlan(int b, const Config &c, bool nativeProjections)
+    RoundPlan(int b, const Config &c, bool nativeProjections, bool earlyPublication)
         : batch(b), steps(c.draft.steps), chain(steps + 1), views(b * c.draft.layers), inputs(b),
           temperature(b * chain + b), topP(b * chain + b), ids(b * chain), topK(b * chain + b), tokens(b * chain),
           draftIds(b * steps), live(b), result(b * (chain + 1)), seeds(steps), counter(1),
@@ -33,12 +51,13 @@ struct RoundPlan {
           groupPointers(nativeProjections ? 6 * c.draft.layers : 0), groups(nativeProjections ? c.draft.layers : 0), source(b * c.visits.size()),
           visits(b * chain * c.visits.size()),
           panels(size_t(b) * c.visits.size() * (c.conv - 1 + chain) * 2 * (c.kvHeads * c.headDim + c.hidden)),
-          hostInputs(b), hostSeeds(steps),
+          nextAnchor(earlyPublication ? b : 0), nextPast(earlyPublication ? b : 0), hostInputs(b), hostSeeds(steps),
           draftViews(b * c.draft.layers), descriptors(b * c.visits.size()) {
         check(cudaMemsetAsync(counter.p, 0, sizeof(*counter.p), cudaStreamPerThread));
         for (size_t i = 0; i < groups.size(); ++i) {
             groups[i].device = groupPointers.p + 6 * i;
         }
+        if (earlyPublication) publication.allocate(size_t(b) * (chain + 1), steps);
         if (proposalSupport.p) check(cudaMemsetAsync(proposalSupport.p, 0xfe, size_t(b) * steps *
                 FastllmFoldSelection::maxCandidates * sizeof(int), cudaStreamPerThread));
         sampler = FastllmCudaMtpCreateTargetDistribution(b, c.vocab);
@@ -59,6 +78,24 @@ struct RoundPlan {
 };
 DecodeGraphScratch roundScratch;
 std::map<int, std::unique_ptr<RoundPlan>> roundPlans;
+RoundPlan *publishedPlan = nullptr;
+bool draftQueued = false;
+std::thread::id publicationThread;
+std::vector<std::weak_ptr<Request>> publicationOwners;
+
+void finishPublication() {
+    if (!publishedPlan) return;
+    if (draftQueued) {
+        check(cudaEventSynchronize(publishedPlan->publication.tail->event));
+        for (auto &weak : publicationOwners) {
+            if (auto owner = weak.lock()) owner->draft->reader.reset();
+        }
+    }
+    publishedPlan = nullptr;
+    draftQueued = false;
+    publicationOwners.clear();
+}
+
 // The cold branch starts from the original anchor and immutable base/context
 // terms. Its private states, tokens and q can therefore be overwritten before
 // publication without advancing any request KV or RNG counter.
@@ -138,7 +175,7 @@ template <class T> void draftBody(RoundPlan &p) {
     for (int i = 0; i < d.layers; ++i) {
         std::string pre = "draft.layers." + std::to_string(i) + ".";
         auto a = draftAttention(draftGraphNorm(x, pre + "input_layernorm.weight", pending), i,
-                                pre + "self_attn.", p.views.p + i * b, p.groups.empty() ? nullptr : &p.projectionFork, false);
+                                pre + "self_attn.", p.views.p + i * b, p.groups.empty() ? nullptr : &p.projectionFork, p.publication.verified != nullptr);
         auto in = draftGraphNorm(x, pre + "post_attention_layernorm.weight", a);
         auto pair = draftProjections<T, 2>(in, pre + "mlp.", {"gate_proj.weight", "up_proj.weight"},
                                            {d.intermediate, d.intermediate}, p.groups.empty() ? nullptr : &p.groups[i]);

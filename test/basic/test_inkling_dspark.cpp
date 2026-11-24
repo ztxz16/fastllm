@@ -22,7 +22,7 @@ int keep, suffix, verifyLaunches, captures;
 int drawIndex = 0;
 bool controlled = false;
 int *control = nullptr;
-float *savedScores = nullptr, *savedDraft = nullptr;
+float *savedScores = nullptr, *savedDraft = nullptr, *pendingDraft = nullptr;
 const float *targetLogits = nullptr;
 std::vector<std::vector<float>> verifyScores;
 constexpr int maxTestBatch = 8;
@@ -62,7 +62,7 @@ static void recordFold(const void *base, const void *adjust, const void *bias, f
     const int step = int(token - firstFoldToken);
     if (step < 0 || step >= 7) throw std::runtime_error("Unexpected folded draft token slot");
     snapshotInklingDraft(control, base, testVocab, adjust, bias, cap, true, q, testVocab,
-                         savedDraft, step, testVocab, 1, stream);
+                         pendingDraft, step, testVocab, 1, stream);
     forceInklingDraft(control, token, 1, step, 1, stream);
 }
 
@@ -113,7 +113,7 @@ extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *ws, const void *base, int ba
     bool ok = draw(ws, base, baseStride, adjust, bias, cap, bf16, t, k, p, rng, step, q, qStride, out, stride);
     inDraw = false;
     int index = drawIndex++ % 7;
-    snapshotInklingDraft(control, base, baseStride, adjust, bias, cap, bf16, q, qStride, savedDraft, index,
+    snapshotInklingDraft(control, base, baseStride, adjust, bias, cap, bf16, q, qStride, pendingDraft, index,
                          testVocab, maxTestBatch);
     forceInklingDraft(control, out, stride, index, maxTestBatch);
     return ok;
@@ -133,6 +133,11 @@ extern "C" void FastllmCudaMtpGraphReject(const float *p, const float *q, const 
     if (cudaMemcpyAsync(savedScores, targetLogits, size_t(batch) * (drafts + 1) * vocab * sizeof(float),
                         cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess)
         throw std::runtime_error("Failed to snapshot logits");
+    // A queued next draft can overwrite provisional scores before the host
+    // reads them. Snapshot the proposal that actually reached this verifier.
+    if (cudaMemcpyAsync(savedDraft, pendingDraft, size_t(batch) * 2 * drafts * vocab * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cudaStreamPerThread) != cudaSuccess)
+        throw std::runtime_error("Failed to snapshot verified proposal");
     forceInklingPrefix(control, ids, result, batch, drafts, live);
 }
 
@@ -323,7 +328,15 @@ static void checkDraftBatch(basellm &model, GenerationConfig sample) {
             token[b] = 235 + id;
             for (auto &v : ctx[b].pastKeyValues) slots.emplace_back(&v.first, &v.second);
         }
-        for (int round = 0; round < 2; ++round) {
+        for (int round = 0; round < 4; ++round) {
+            if (round == 2) {
+                // Invalidate a queued proposal, including a sparse-to-dense
+                // top-k transition. Both widths must match the singleton oracle.
+                for (int b = 0; b < count; ++b) {
+                    configs[b].top_k = indices[b] ? 17 : 129;
+                    configs[b].top_p = indices[b] ? .96f : .88f;
+                }
+            }
             std::vector<float> anchors(token.begin(), token.end());
             std::vector<Data> position;
             position.reserve(count);
@@ -338,6 +351,9 @@ static void checkDraftBatch(basellm &model, GenerationConfig sample) {
             configure(count, indices[0] ? 5 : 2, count == 2 ? 5 : -1, true);
             token = model.ForwardV2(count, input, {}, ptrs, std::vector<int>(count, 1), slots, configs,
                                     LastTokensManager(count, 0), nullptr);
+            // The test's forced tokens live in device memory. Keep the oracle
+            // inputs immutable until an already-queued draft has read them.
+            if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error("Draft replay failed");
             configure(0);
             for (int b = 0; b < count; ++b) {
                 ++past[b];
@@ -524,6 +540,7 @@ int main(int argc, char **argv) {
     testVocab = std::stoi(model->weight.dicts.at("text_config.unpadded_vocab_size"));
     if (cudaMalloc(&savedScores, size_t(maxTestBatch) * 8 * testVocab * sizeof(float)) != cudaSuccess) return 1;
     if (cudaMalloc(&savedDraft, size_t(maxTestBatch) * 14 * testVocab * sizeof(float)) != cudaSuccess) return 1;
+    if (cudaMalloc(&pendingDraft, size_t(maxTestBatch) * 14 * testVocab * sizeof(float)) != cudaSuccess) return 1;
     if (graph) model->WarmUp();
     const std::vector<int> prompt(1022, 320);
     GenerationConfig sample;
@@ -610,6 +627,7 @@ int main(int argc, char **argv) {
     checkClippedRound(*model, sample, 7, maxTestBatch, graph);
     checkDraftBatch(*model, sample);
     checkDraftPrefix(*model, sample);
+    cudaFree(pendingDraft);
     cudaFree(savedDraft);
     cudaFree(savedScores);
     cudaFree(control);

@@ -14,7 +14,38 @@ struct DraftInput {
     int anchor, topK, steps;
     float temperature, topP;
 };
+// The verifier's output contains the exact next anchor and committed length.
+// Draft-only K/V lives in graph scratch. Rejected or cancelled lookahead
+// therefore cannot publish tokens, histories or writes to request pages.
+__global__ void advanceDraft(const int *result, DraftInput *inputs, DraftView *views,
+                             int batch, int chain, int layers) {
+    const int row = blockIdx.x, accepted = result[batch * chain + row];
+    if (accepted < 0 || accepted >= chain) return;
+    if (!threadIdx.x) inputs[row].anchor = result[row * chain + accepted];
+    for (int l = threadIdx.x; l < layers; l += blockDim.x) {
+        auto &v = views[l * batch + row];
+        v.past += accepted + 1;
+        v.begin = v.window ? max(0, v.past - v.window) : 0;
+    }
+}
+// A request may be cancelled while a queued draft still reads its private KV.
+struct DraftFence {
+    cudaEvent_t event = nullptr;
+    int gpu;
+    DraftFence() {
+        check(cudaGetDevice(&gpu));
+        check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+    }
+    ~DraftFence() {
+        int old = gpu;
+        cudaGetDevice(&old);
+        if (old != gpu) cudaSetDevice(gpu);
+        cudaEventDestroy(event);
+        if (old != gpu) cudaSetDevice(old);
+    }
+};
 struct DraftState {
+    std::shared_ptr<DraftFence> reader;
     std::vector<std::unique_ptr<DraftKV>> kv;
     Matrix recurrentContext;
     double roundMs = 0;
