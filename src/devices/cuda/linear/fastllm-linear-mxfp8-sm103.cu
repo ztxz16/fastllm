@@ -68,6 +68,7 @@ __global__ void PrepareOperands(const float4 *src, uint32_t *dst, const __nv_bfl
 
 // One CTA per verification row preserves AddRMSNorm's 256-lane reduction and
 // both BF16 rounding points. The other CTAs transpose immutable weight scales.
+template<bool AfterExpertReduce>
 __global__ void PrepareSwaQkv(__nv_bfloat16 *hidden, const __nv_bfloat16 *branch,
                               const float *gamma, float eps, const float4 *weightScales,
                               uint32_t *packed, uint8_t *qx, uint8_t *sx, int rows, int pitch,
@@ -75,6 +76,11 @@ __global__ void PrepareSwaQkv(__nv_bfloat16 *hidden, const __nv_bfloat16 *branch
     // The GEMM can initialize its descriptors and tensor memory while these
     // CTAs prepare the operands. It waits before issuing its first TMA read.
     cudaTriggerProgrammaticLaunchCompletion();
+    // Scale tiles only touch private scratch. Residual and rotary tiles need the previous output.
+    if constexpr (AfterExpertReduce) {
+        if (blockIdx.x < rows || blockIdx.x == gridDim.x - 1)
+            cudaGridDependencySynchronize();
+    }
     constexpr int width = 4096, channels = 1856, threads = 512;
     const int row = blockIdx.x, t = threadIdx.x;
     if (row == rows + channels / 16) {
@@ -356,7 +362,7 @@ const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &w, int channels, 
 
 bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma, float eps,
                             const fastllm::Data &weight, const float *scales, void *output, int rows,
-                            const float *positions, float theta, void *rotary) {
+                            const float *positions, float theta, void *rotary, bool afterExpertReduce) {
     constexpr int k = 4096, n = 1856;
     constexpr size_t scaleBytes = size_t(n) * k / 32;
     static_assert(scaleBytes + 8 * (k + k / 32) <= kWorkspace);
@@ -374,11 +380,22 @@ bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma
     // 1856 output channels end on an unpaired N tile. Encode the same
     // descriptors as native Linear before the first residual write.
     return Projection<16, 1>::RunPrepared<true>(qx, weight.cudaData, sx, scratch, output, rows, n, k, pitch, [&] {
-        PrepareSwaQkv<<<rows + n / 16 + 1, 512, 0, cudaStreamPerThread>>>(
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = dim3(rows + n / 16 + 1);
+        cfg.blockDim = dim3(512);
+        cfg.stream = cudaStreamPerThread;
+        cudaLaunchAttribute attr{};
+        if (afterExpertReduce) {
+            attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attr.val.programmaticStreamSerializationAllowed = 1;
+            cfg.attrs = &attr;
+            cfg.numAttrs = 1;
+        }
+        auto kernel = afterExpertReduce ? PrepareSwaQkv<true> : PrepareSwaQkv<false>;
+        const auto status = cudaLaunchKernelEx(&cfg, kernel,
             static_cast<__nv_bfloat16 *>(hidden), static_cast<const __nv_bfloat16 *>(branch),
             gamma, eps, reinterpret_cast<const float4 *>(scales), reinterpret_cast<uint32_t *>(scratch),
             qx, sx, rows, pitch, positions, theta, static_cast<__nv_bfloat162 *>(rotary));
-        const auto status = cudaGetLastError();
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     });
 }

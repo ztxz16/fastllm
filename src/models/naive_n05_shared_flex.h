@@ -63,6 +63,14 @@ struct NaiveSharedFlexMoe {
     // ordered eight-row adapter covers all positive row counts itself.
     bool Supports(int rows) const { return rows > 0 && (!ep || rows <= 8); }
 
+    bool HasVerifyReduce(int rank, int layer, int rows) const {
+#ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
+        return !ep && rows == 8 && fastshared_tp_uses_verify_reduce(state, rank, layer);
+#else
+        return false;
+#endif
+    }
+
     NaiveSharedFlexMoe(const std::vector<int> &devices, const Weights &weights,
                        FastllmCudaMimoEp8Mega *mega, bool preferVerifyPages) : ep(mega != nullptr) {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103

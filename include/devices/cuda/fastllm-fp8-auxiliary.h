@@ -72,3 +72,6 @@ const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &weight, int chann
 bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma, float eps,
                             const fastllm::Data &weight, const float *scales, void *output, int rows,
                             const float *positions, float theta, void *rotary);
+bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma, float eps,
+                            const fastllm::Data &weight, const float *scales, void *output, int rows,
+                            const float *positions, float theta, void *rotary, bool afterExpertReduce);

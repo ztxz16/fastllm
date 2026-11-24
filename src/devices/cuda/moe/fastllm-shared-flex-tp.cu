@@ -713,6 +713,12 @@ extern "C" int fastshared_tp_run(void*state,int rank,int layer,int rows,
     const void*x,const void*ids,const void*p,void*y){
   return run_tp(state,rank,layer,rows,x,ids,p,y);
 }
+extern "C" int fastshared_tp_uses_verify_reduce(void *state, int rank, int layer) {
+    using namespace fastllm_shared_flex_tp;
+    const auto *s = static_cast<const State *>(state);
+    return s && rank >= 0 && rank < R && layer >= 0 && size_t(layer) < s->layers.size() &&
+           s->layers[layer][rank].verifyPages;
+}
 extern "C" int fastshared_tp_router_supported(void*state){
   return state&&static_cast<fastllm_shared_flex_tp::State*>(state)->routerSupported;
 }

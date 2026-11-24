@@ -142,6 +142,8 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
     const fastllm::Data *routerWeight, fastllm::Data *router,
     FastllmSwaLayerConfig config, int deviceId,
     const FastllmMoePreparedInput *prepared);
+// Paged eight-row expert TP reduce publishes a programmatic launch signal.
+decltype(FastllmCudaSwaVerifyLayerPrepared) FastllmCudaSwaVerifyLayerAfterExpertReduce;
 // Reads data without materializing its full reduction, updates residual, and
 // writes output. The three tensors must not overlap. Unsupported inputs or a
 // disabled custom collective return false before launching any work.

@@ -1333,7 +1333,9 @@ Data NaiveN05FlashModel::RunTarget(
                     }
                 }
                 const bool withRouter = length == 1 || length < FastllmCudaGetLinearExactBatchThreshold();
-                attentionLayerReady = FastllmCudaSwaVerifyLayerPrepared(*pendingMlp, hidden,
+                const auto verifyLayer = useSharedFlex && tpSharedFlex->HasVerifyReduce(tpRank, layer - 1, length)
+                    ? FastllmCudaSwaVerifyLayerAfterExpertReduce : FastllmCudaSwaVerifyLayerPrepared;
+                attentionLayerReady = verifyLayer(*pendingMlp, hidden,
                     localWeight(prefix + ".input_layernorm.weight"),
                     localWeight(ap + "mergeqkv.weight"), localWeight(ap + "mergeqkv.bias"),
                     localWeight(ap + "o_proj.weight"),

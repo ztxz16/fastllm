@@ -117,6 +117,7 @@ FASTLLM_SHARED_FLEX_ABI(ep)
 // returns false for the whole group. run_dense borrows every allocation and
 // uses the state's exclusive ordered per-rank streams, chunking rows by eight.
 int fastshared_tp_dense_supported(void *state);
+int fastshared_tp_uses_verify_reduce(void *state, int rank, int layer);
 int fastshared_tp_dense_admit(void *state,int rank,int rows,int eligible);
 int fastshared_tp_run_dense(void *state,int rank,int rows,const void *input,
     const void *gate,const void *up,const void *down,const float *gamma,float eps,void *silu,void *output);

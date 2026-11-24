@@ -1034,11 +1034,18 @@ const uint32_t *FastllmCudaBlock32PackedScales(fastllm::Data &w, int device, boo
 }
 #else
 bool FastllmCudaMxfp8SwaQkv(void *, const void *, const float *, float, const fastllm::Data &,
-                            const float *, void *, int, const float *, float, void *) { return false; }
+                            const float *, void *, int, const float *, float, void *, bool) { return false; }
 const float *FastllmCudaVerifyMxfp8Scales(const fastllm::Data &, int, int, int) {
     return nullptr;
 }
 #endif
+
+bool FastllmCudaMxfp8SwaQkv(void *hidden, const void *branch, const float *gamma, float eps,
+                            const fastllm::Data &weight, const float *scales, void *output, int rows,
+                            const float *positions, float theta, void *rotary) {
+    return FastllmCudaMxfp8SwaQkv(hidden, branch, gamma, eps, weight, scales, output, rows,
+                                  positions, theta, rotary, false);
+}
 
 extern "C" void FastllmCudaReleaseBFloat16FP8Auxiliary(fastllm::Data &weight) {
     if (weight.isFake) return;

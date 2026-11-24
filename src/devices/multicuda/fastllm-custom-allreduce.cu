@@ -3542,22 +3542,7 @@ bool FastllmCudaSwaVerifyLayerSupported(int deviceId, int rows) {
         state.swaOutput && state.swaOutput->VerifySupported(rows);
 }
 
-bool FastllmCudaSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden,
-        const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
-        const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
-        const fastllm::Data &postNorm, const fastllm::Data &sink,
-        const fastllm::Data &position, const fastllm::Data &live,
-        const std::vector<FastllmNaiveRopeCacheRow> &caches,
-        fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
-        fastllm::Data &normed, fastllm::Data *feature,
-        const fastllm::Data *routerWeight, fastllm::Data *router,
-        FastllmSwaLayerConfig c, int deviceId) {
-    return FastllmCudaSwaVerifyLayerPrepared(branch, hidden, inputNorm, qkvWeight, qkvBias,
-        oWeight, postNorm, sink, position, live, caches, q, attn, projected, normed,
-        feature, routerWeight, router, c, deviceId, nullptr);
-}
-
-bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Data &hidden,
+static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden,
         const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
         const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
         const fastllm::Data &postNorm, const fastllm::Data &sink,
@@ -3567,7 +3552,7 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
         fastllm::Data &normed, fastllm::Data *feature,
         const fastllm::Data *routerWeight, fastllm::Data *router,
         FastllmSwaLayerConfig c, int deviceId,
-        const FastllmMoePreparedInput *prepared) {
+        const FastllmMoePreparedInput *prepared, bool afterExpertReduce) {
     using namespace fastllm;
     CustomArState &state = GetCustomArState();
     CustomArCallLease lease; int rank = -1;
@@ -3731,7 +3716,8 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
         // Preserve native QKV rounding before attention and O re-quantize
         // its result. Borrow the larger projected buffer until the fused tail.
         if (!FastllmCudaMxfp8SwaQkv(hidden.cudaData, branch.cudaData, args.gamma, c.eps,
-                                    qkvWeight, qkvScales, projected.cudaData, rows, args.positions, c.theta, normed.cudaData)) {
+                                    qkvWeight, qkvScales, projected.cudaData, rows, args.positions, c.theta, normed.cudaData,
+                                    afterExpertReduce)) {
             Data packed(BFLOAT16);
             auto dims = hidden.dims;
             dims.back() = 1856;
@@ -3754,6 +3740,53 @@ bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Dat
         throw std::runtime_error(std::string("SWA verification layer launch failed: ") + cudaGetErrorString(status));
     }
     return true;
+}
+
+bool FastllmCudaSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden,
+        const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+        const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+        const fastllm::Data &postNorm, const fastllm::Data &sink,
+        const fastllm::Data &position, const fastllm::Data &live,
+        const std::vector<FastllmNaiveRopeCacheRow> &caches,
+        fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
+        fastllm::Data &normed, fastllm::Data *feature,
+        const fastllm::Data *routerWeight, fastllm::Data *router,
+        FastllmSwaLayerConfig c, int deviceId) {
+    return RunSwaVerifyLayer(branch, hidden, inputNorm, qkvWeight, qkvBias,
+        oWeight, postNorm, sink, position, live, caches, q, attn, projected, normed,
+        feature, routerWeight, router, c, deviceId, nullptr, false);
+}
+
+bool FastllmCudaSwaVerifyLayerPrepared(const fastllm::Data &branch, fastllm::Data &hidden,
+        const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+        const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+        const fastllm::Data &postNorm, const fastllm::Data &sink,
+        const fastllm::Data &position, const fastllm::Data &live,
+        const std::vector<FastllmNaiveRopeCacheRow> &caches,
+        fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
+        fastllm::Data &normed, fastllm::Data *feature,
+        const fastllm::Data *routerWeight, fastllm::Data *router,
+        FastllmSwaLayerConfig c, int deviceId,
+        const FastllmMoePreparedInput *prepared) {
+    return RunSwaVerifyLayer(branch, hidden, inputNorm, qkvWeight, qkvBias, oWeight,
+        postNorm, sink, position, live, caches, q, attn, projected, normed,
+        feature, routerWeight, router, c, deviceId, prepared, false);
+}
+
+bool FastllmCudaSwaVerifyLayerAfterExpertReduce(const fastllm::Data &branch, fastllm::Data &hidden,
+        const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
+        const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
+        const fastllm::Data &postNorm, const fastllm::Data &sink,
+        const fastllm::Data &position, const fastllm::Data &live,
+        const std::vector<FastllmNaiveRopeCacheRow> &caches,
+        fastllm::Data &q, fastllm::Data &attn, fastllm::Data &projected,
+        fastllm::Data &normed, fastllm::Data *feature,
+        const fastllm::Data *routerWeight, fastllm::Data *router,
+        FastllmSwaLayerConfig c, int deviceId,
+        const FastllmMoePreparedInput *prepared) {
+    return RunSwaVerifyLayer(branch, hidden, inputNorm, qkvWeight, qkvBias, oWeight,
+        postNorm, sink, position, live, caches, q, attn, projected, normed,
+        feature, routerWeight, router, c, deviceId, prepared, true);
 }
 
 #ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
