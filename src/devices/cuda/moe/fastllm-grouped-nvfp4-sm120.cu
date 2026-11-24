@@ -1,9 +1,28 @@
 // Same expert-sorted, swap-AB SM120 grouped GEMM as FlashInfer/SGLang's
 // inkling2_grouped_sm120. Keep FastLLM's four FP32 accumulation lanes.
-#include "fastllm-grouped-nvfp4-sm120.cuh"
+#include "fastllm-grouped-sm120.cuh"
 #include "fastllm-nvfp4-routed-sm120.cuh"
 #include "flashinfer/gemm/group_gemm_nvfp4_groupwise_sm120.cuh"
 #include <limits>
+
+namespace fastllm::cuda::grouped_sm120 {
+namespace {
+__global__ void prefixGroupedRoutes(int *offset, int experts) {
+    int sum = 0;
+    for (int e = 0; e < experts; ++e) {
+        int n = offset[e];
+        offset[e] = sum;
+        sum += n;
+    }
+    offset[experts] = sum;
+}
+}
+
+cudaError_t prefixRouteCounts(int *offsets, int experts, cudaStream_t stream) {
+    prefixGroupedRoutes<<<1, 1, 0, stream>>>(offsets, experts);
+    return cudaGetLastError();
+}
+} // namespace fastllm::cuda::grouped_sm120
 
 namespace fastllm::cuda::routed_fp4 {
 namespace {
@@ -81,24 +100,11 @@ struct Mainloop : StandardMainloop {
 };
 using Kernel = kernel::GemmUniversal<ShapeMNK, Mainloop, Epilogue>;
 using Gemm = device::GemmUniversalAdapter<Kernel>;
-using StrideA = Kernel::InternalStrideA;
-using StrideB = Kernel::InternalStrideB;
-using StrideD = Kernel::InternalStrideD;
-using LayoutA = Mainloop::InternalLayoutSFA;
-using LayoutB = Mainloop::InternalLayoutSFB;
+using Metadata = grouped_sm120::Metadata<Gemm>;
 
 __global__ void countGroupedRoutes(const int *ids, int *counts, int *rank, int routes) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r < routes) rank[r] = atomicAdd(counts + ids[r], 1);
-}
-__global__ void prefixGroupedRoutes(int *offset, int experts) {
-    int sum = 0;
-    for (int e = 0; e < experts; ++e) {
-        int n = offset[e];
-        offset[e] = sum;
-        sum += n;
-    }
-    offset[experts] = sum;
 }
 __global__ void packGroupedRows(const Block16 *src, const int *ids, const int *offset, const int *rank,
                                 GroupedBuffers buffers, int k, int topK) {
@@ -127,28 +133,6 @@ __global__ void sumGroupedProjections(const float *sorted, float *output, const 
     output[size_t(token) * width + col] = sum;
 }
 
-// The CUTLASS pointer and layout arrays live in graph-owned scratch. Count
-// and bind with the same layout so changing a CUTLASS type also changes its budget.
-struct Metadata {
-    char *base;
-    size_t bytes = 0;
-    int groups;
-    template<class T> T *take() {
-        T *ptr = base ? reinterpret_cast<T *>(base + bytes) : nullptr;
-        bytes += (sizeof(T) * groups + 15) / 16 * 16;
-        return ptr;
-    }
-    ShapeMNK::UnderlyingProblemShape *shape = take<ShapeMNK::UnderlyingProblemShape>();
-    const Fp4 **a = take<const Fp4 *>(), **b = take<const Fp4 *>();
-    const Scale **sa = take<const Scale *>(), **sb = take<const Scale *>();
-    float **d = take<float *>();
-    StrideA *da = take<StrideA>();
-    StrideB *db = take<StrideB>();
-    StrideD *dd = take<StrideD>();
-    LayoutA *la = take<LayoutA>();
-    LayoutB *lb = take<LayoutB>();
-    Metadata(void *storage, int groups) : base(static_cast<char *>(storage)), groups(groups) {}
-};
 } // namespace
 
 // One map spans all expert stripes. Keep K as an independent coordinate so
@@ -168,20 +152,15 @@ bool makeGroupedWeightMaps(GroupedWeightMaps &maps, const Weights &weights, int 
     return encode(maps.codes, weights.codes, 128) && encode(maps.scales, weights.scales, 16);
 }
 
-GroupedScratch groupedScratch(int groups, int smCount) {
-    typename Gemm::Arguments args{};
-    args.mode = GemmUniversalMode::kGrouped;
-    args.problem_shape = {groups, nullptr, nullptr};
-    args.hw_info.sm_count = smCount;
-    return {Metadata(nullptr, groups).bytes, Gemm::get_workspace_size(args)};
+grouped_sm120::Scratch groupedScratch(int groups, int smCount) {
+    return Metadata::scratchSize(groups, smCount);
 }
 
 cudaError_t planGroupedRows(const int *ids, int *offsets, int *ranks, int experts, int routes, cudaStream_t stream) {
     auto status = cudaMemsetAsync(offsets, 0, sizeof(int) * experts, stream);
     if (status != cudaSuccess) return status;
     countGroupedRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(ids, offsets, ranks, routes);
-    prefixGroupedRoutes<<<1, 1, 0, stream>>>(offsets, experts);
-    return cudaGetLastError();
+    return grouped_sm120::prefixRouteCounts(offsets, experts, stream);
 }
 
 cudaError_t packGroupedInput(const Block16 *input, const int *ids, const int *offsets, const int *ranks,
@@ -195,7 +174,7 @@ cudaError_t projectGroupedRows(const Weights &weights, const GroupedWeightMaps &
     Metadata meta(buffers.metadata, groups);
     auto prepare = flashinfer::group_gemm::compute_sm120_cutlass_nvfp4_group_gemm_args<
         true, 16, Mainloop::Sm1xxBlkScaledConfig, Fp4, Fp4, Scale, Scale, float,
-        ShapeMNK::UnderlyingProblemShape, StrideA, StrideB, StrideD, LayoutA, LayoutB>;
+        Metadata::Shape, Metadata::StrideA, Metadata::StrideB, Metadata::StrideD, Metadata::LayoutA, Metadata::LayoutB>;
     cudaLaunchAttribute attr{};
     attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr.val.programmaticStreamSerializationAllowed = 1;

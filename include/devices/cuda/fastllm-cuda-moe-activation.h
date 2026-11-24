@@ -14,6 +14,11 @@ struct CudaMoeActivation {
     virtual ~CudaMoeActivation() = default;
 };
 
+struct CudaMarlinMxfp8Weights {
+    const uint32_t *codes;
+    const uint8_t *scales;
+};
+
 // A prepared layout owns the grouped expert matrices. Scratch belongs to the
 // call so graphs and concurrent requests never share mutable routing state.
 struct CudaGroupedMxfp8Moe {
@@ -21,6 +26,8 @@ struct CudaGroupedMxfp8Moe {
     virtual void Run(const Data &input, Data &output, const Data &indices, const Data &scores,
                      Data &gateUp, Data &middle, int *scratch, const CudaMoeActivation &activation) const = 0;
     virtual ~CudaGroupedMxfp8Moe() = default;
+    // Backends with grouped Marlin weights can share them with native prefill.
+    virtual CudaMarlinMxfp8Weights MarlinWeights(bool downProjection) const { return {}; }
 };
 std::unique_ptr<CudaGroupedMxfp8Moe> PrepareCudaGroupedMxfp8Moe(Data **weights, int count);
 

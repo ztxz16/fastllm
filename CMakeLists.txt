@@ -664,11 +664,14 @@ if (USE_CUDA)
             EXISTS "${FASTLLM_CUTLASS_DIR}/include/cutlass/gemm/device/gemm.h")
             list(APPEND FASTLLM_CUDA_SM120_SOURCES src/devices/cuda/linear/fastllm-bf16-attention-sm120.cu)
             if (EXISTS "${FASTLLM_CUTLASS_DIR}/tools/util/include/cutlass/util/packed_stride.hpp")
-                list(APPEND FASTLLM_CUDA_SM120_SOURCES src/devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cu)
-                set_property(SOURCE src/devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cu APPEND PROPERTY
+                set(FASTLLM_INKLING_GROUPED_SOURCES
+                    src/devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cu
+                    src/devices/cuda/moe/fastllm-grouped-mxfp8-sm120.cu)
+                list(APPEND FASTLLM_CUDA_SM120_SOURCES ${FASTLLM_INKLING_GROUPED_SOURCES})
+                set_property(SOURCE ${FASTLLM_INKLING_GROUPED_SOURCES} APPEND PROPERTY
                     INCLUDE_DIRECTORIES "${FASTLLM_CUTLASS_DIR}/tools/util/include")
                 set_property(SOURCE src/models/inkling2/experts.cu test/ops/cudaRoutedNvfp4Sm120.cu APPEND PROPERTY
-                    COMPILE_DEFINITIONS FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+                    COMPILE_DEFINITIONS FASTLLM_INKLING_GROUPED_SM120)
             endif()
             set_property(SOURCE src/devices/cuda/linear/fastllm-linear-bf16.cu APPEND PROPERTY
                 COMPILE_DEFINITIONS FASTLLM_HAS_BF16_MMA_SM120)
@@ -4677,7 +4680,11 @@ if (UNIT_TEST)
         set_tests_properties(cuda_fp4_kv_native_no_split PROPERTIES LABELS cuda SKIP_RETURN_CODE 77
             ENVIRONMENT "FASTLLM_FORCE_NATIVE_ATTN=1;FASTLLM_PAGED_NO_SPLIT=1")
 
-        foreach(op_test IN ITEMS cudaInklingRelativeAttention cudaAttnResRegression cudaRoutedNvfp4Sm120)
+        set(inkling_op_tests cudaInklingRelativeAttention cudaAttnResRegression cudaRoutedNvfp4Sm120)
+        if (FASTLLM_INKLING_GROUPED_SOURCES)
+            list(APPEND inkling_op_tests cudaGroupedMxfp8Sm120)
+        endif()
+        foreach(op_test IN LISTS inkling_op_tests)
             add_executable(${op_test} test/ops/${op_test}.cu)
             target_link_libraries(${op_test} PRIVATE fastllm)
             add_test(NAME ${op_test} COMMAND ${op_test})

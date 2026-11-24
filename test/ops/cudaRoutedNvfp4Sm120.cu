@@ -2,8 +2,8 @@
 // Include shuffled routes, signed block scales and independently scaled experts.
 #include "../../src/models/inkling2/runtime.cuh"
 #include "../../src/devices/cuda/moe/fastllm-nvfp4-routed-sm120.cuh"
-#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
-#include "../../src/devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cuh"
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+#include "../../src/devices/cuda/moe/fastllm-grouped-sm120.cuh"
 #endif
 #include <cstring>
 #include <cstdio>
@@ -82,7 +82,7 @@ template <int TileRows> void test(int tokens, bool up, bool skew, bool verify = 
         if (verify) {
             Buffer<__nv_bfloat16> ref(size_t(routes) * n);
             op::decodeProject<4><<<dim3(n / 16, routes), 128>>>(view, xi.p, di.p, ref.p, n, k, div);
-#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+#ifdef FASTLLM_INKLING_GROUPED_SM120
             if (grouped) {
                 int device, smCount;
                 check(cudaGetDevice(&device));
@@ -92,7 +92,7 @@ template <int TileRows> void test(int tokens, bool up, bool skew, bool verify = 
                 auto scratch = op::groupedScratch(experts, smCount);
                 Buffer<int> offsets(experts + 1), ranks(routes);
                 Buffer<uint2> values(size_t(routes) * k / 16);
-                Buffer<uint8_t> scales(op::groupedScaleRows(routes, experts) * k / 16);
+                Buffer<uint8_t> scales(fastllm::cuda::grouped_sm120::scaleRows(routes, experts) * k / 16);
                 Buffer<float> sorted(size_t(routes) * n);
                 Buffer<uint8_t> metadata(scratch.metadata), gemm(scratch.gemm);
                 op::GroupedBuffers buffers{values.p, scales.p, sorted.p, metadata.p, gemm.p};
@@ -321,7 +321,7 @@ int main() {
         for (int rows : {5, 7, 8, 9, 12, 17})
             for (bool skew : {false, true})
                 test<32>(rows, up, skew, true);
-#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+#ifdef FASTLLM_INKLING_GROUPED_SM120
     op::GroupedWeightMaps invalidMaps{};
     if (op::makeGroupedWeightMaps(invalidMaps, {}, 1, 48, 320) ||
         op::makeGroupedWeightMaps(invalidMaps, {}, 1, 256, 96))

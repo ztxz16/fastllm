@@ -3,8 +3,8 @@
 // https://github.com/vllm-project/vllm/tree/fc1443152c0eb655f5c2762f56b540bebe93b196/vllm/models/inkling2/nvidia
 #include "runtime.cuh"
 #include "../../devices/cuda/moe/fastllm-nvfp4-routed-sm120.cuh"
-#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
-#include "../../devices/cuda/moe/fastllm-grouped-nvfp4-sm120.cuh"
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+#include "../../devices/cuda/moe/fastllm-grouped-sm120.cuh"
 #endif
 #include "devices/cpu/computeutils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -103,6 +103,60 @@ template <typename T, bool Interleaved = false> struct RoutedSiTU {
     }
 };
 
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+namespace mx = fastllm::cuda::routed_mxfp8;
+template<class Source>
+__global__ void packMxfp8Routes(Source source, uint8_t *codes, uint8_t *scales,
+                                const int *ids, const int *offsets, const int *ranks, int k) {
+    constexpr bool input = std::is_same_v<Source, InputRow>;
+    constexpr int copies = input ? 8 : 1;
+    __shared__ int sorted[copies], scaleRow[copies];
+    if (threadIdx.x < copies) {
+        const int r = input ? blockIdx.x * copies + threadIdx.x : blockIdx.x;
+        const int e = ids[r], start = offsets[e];
+        sorted[threadIdx.x] = start + ranks[r];
+        scaleRow[threadIdx.x] = cuda::grouped_sm120::scaleRow(start, e, ranks[r]);
+    }
+    __syncthreads();
+    // Each input token is quantized once and scattered to its eight experts.
+    // The down projection consumes the already sorted gate/up output.
+    for (int col = 4 * threadIdx.x; col < k; col += 4 * blockDim.x) {
+        float4 v;
+        if constexpr (input) {
+            v = *reinterpret_cast<const float4 *>(source.x + size_t(blockIdx.x) * k + col);
+        } else {
+            v = make_float4(source.get(sorted[0], blockIdx.x, col, k), source.get(sorted[0], blockIdx.x, col + 1, k),
+                            source.get(sorted[0], blockIdx.x, col + 2, k), source.get(sorted[0], blockIdx.x, col + 3, k));
+        }
+        float peak = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+        const unsigned mask = __activemask();
+        for (int delta = 4; delta; delta /= 2) peak = fmaxf(peak, __shfl_xor_sync(mask, peak, delta, 8));
+        // Inkling rounds peak/448 up to a power of two for each block of 32.
+        const int exponent = peak > 0 ? max(-127, min(127, int(ceilf(log2f(peak / 448.f))))) : 0;
+        const float inv = ldexpf(1.f, -exponent);
+        const auto bytes = __nv_fp8x4_e4m3(make_float4(v.x * inv, v.y * inv, v.z * inv, v.w * inv)).__x;
+        #pragma unroll
+        for (int j = 0; j < copies; ++j) {
+            reinterpret_cast<uint32_t *>(codes)[(size_t(sorted[j]) * k + col) / 4] = bytes;
+            if (!(col % 32)) scales[cuda::grouped_sm120::scaleOffset(scaleRow[j], col / 32, k / 32)] = exponent + 127;
+        }
+    }
+}
+
+__global__ void sumMxfp8Routes(const __nv_bfloat16 *sorted, float *output, const int *ids,
+                               const int *offsets, const int *ranks, int n, int top) {
+    const int token = blockIdx.x;
+    for (int col = threadIdx.x; col < n; col += blockDim.x) {
+        float sum = 0;
+        for (int j = 0; j < top; ++j) {
+            const int r = token * top + j;
+            sum += float(sorted[size_t(offsets[ids[r]] + ranks[r]) * n + col]);
+        }
+        output[size_t(token) * n + col] = sum;
+    }
+}
+#endif
+
 // BF16 has only 65536 encodings. Cache the two exact FP32 factors once
 // per model so every routed row only needs a multiply and its routing score.
 __global__ void makeSiTUFactors(float *factors, float gateCap, float upCap) {
@@ -147,7 +201,7 @@ __device__ void storeFp4Word(native::Block16 *out, int row, int col, int width,
     }
 }
 
-#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+#if defined(FASTLLM_INKLING_GROUPED_SM120)
 struct GroupedFp4Output {
     native::GroupedInputRow row;
     float *outer;
@@ -231,7 +285,7 @@ __global__ void reconstructExpertRows(Source src, Out *out, int d, bool cacheVal
     reconstructRow<fp4>(src, out, d, cacheValues, gridDim.y);
 }
 
-#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+#if defined(FASTLLM_INKLING_GROUPED_SM120)
 struct GroupedSiTU {
     const float *dots;
     float weightScale, inputScale, score, gateCap, upCap;
@@ -483,7 +537,7 @@ struct Projection {
     Buffer<uint4> nativeCodes;
     Buffer<unsigned> nativeScales;
     Buffer<float> nativeOuter;
-#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+#ifdef FASTLLM_INKLING_GROUPED_SM120
     native::GroupedWeightMaps groupedMaps{};
     bool haveGroupedMaps = false;
 #endif
@@ -519,7 +573,7 @@ struct Projection {
             nativeCodes = Buffer<uint4>(raw.size() / 16);
             nativeScales = Buffer<unsigned>(scale.size() / 4);
             nativeOuter = Buffer<float>(e);
-#ifdef FASTLLM_INKLING_GROUPED_NVFP4_SM120
+#ifdef FASTLLM_INKLING_GROUPED_SM120
             haveGroupedMaps = native::makeGroupedWeightMaps(groupedMaps, nativeView(), e, r, c);
 #endif
             check(cudaMemcpy(nativeOuter.p, outer.data(), e * sizeof(float), cudaMemcpyHostToDevice));
@@ -666,6 +720,9 @@ class GpuExperts final : public RoutedExperts {
     Buffer<uint4> packedRouter;
     std::vector<Data *> weights;
     std::unique_ptr<CudaGroupedMxfp8Moe> groupedFp8;
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+    bool nativeMxfp8 = false;
+#endif
 
     template <int TileRows, int ColumnTiles>
     void projectGrouped(const Config &c, int routes, RouteSelection route, const native::Block16 *input,
@@ -707,14 +764,45 @@ class GpuExperts final : public RoutedExperts {
                 down.nativeView(), nullptr, scales.p, packed.p, tasks.p, used.p, projected, down.rows, down.cols, 1);
     }
 
-#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+#if defined(FASTLLM_INKLING_GROUPED_SM120)
+    void mxfp8Prefill(const Config &c, const Matrix &x, const float *logits, const float *bias, float *dst) const {
+        const int rows = x.rows, routes = rows * c.topK;
+        Buffer<int> offsets(c.experts + 1), ranks(routes), indices(routes);
+        Matrix scores(rows, c.topK);
+        RouteSelection route{logits, bias, indices.p, scores.p, c.experts, c.topK, c.routeScale};
+        const auto stream = cudaStreamPerThread;
+        const int k = std::max(gate.cols, down.cols);
+        // Gate/up has twice as many weights as down and both projections reuse the buffer.
+        const size_t weightBytes = size_t(c.experts) * gate.rows * gate.cols;
+        Buffer<uint8_t> codes(size_t(routes) * k), scales(cuda::grouped_sm120::scaleRows(routes, c.experts) * (k / 32));
+        Buffer<uint8_t> weight(weightBytes + weightBytes / 32);
+        Buffer<__nv_bfloat16> sorted(size_t(routes) * std::max(gate.rows, down.rows));
+        const auto need = mx::scratchSize(c.experts, smCount);
+        Buffer<uint8_t> metadata(need.metadata), work(need.gemm);
+        mx::Buffers buffers{codes.p, scales.p, weight.p, sorted.p, metadata.p, work.p};
+        // This dispatch is restricted to the 128-expert, top-8 router.
+        check(cudaMemsetAsync(offsets.p, 0, c.experts * sizeof(int), stream));
+        selectRanked<128><<<rows, 32, 0, stream>>>(route, ranks.p, offsets.p);
+        check(cuda::grouped_sm120::prefixRouteCounts(offsets.p, c.experts, stream));
+        auto project = [&](const Projection &p, bool isDown, auto source) {
+            packMxfp8Routes<<<isDown ? routes : rows, 128, 0, stream>>>(
+                source, codes.p, scales.p, route.ids, offsets.p, ranks.p, p.cols);
+            check(mx::project(groupedFp8->MarlinWeights(isDown), buffers, offsets.p, p.rows, p.cols,
+                              c.experts, smCount, stream));
+        };
+        project(gate, false, InputRow{x.p});
+        project(down, true, RoutedSiTU<__nv_bfloat16>{sorted.p, route.scores, gateCap, upCap});
+        sumMxfp8Routes<<<rows, 256, 0, stream>>>(sorted.p, dst, route.ids, offsets.p, ranks.p, down.rows, c.topK);
+        check(cudaGetLastError());
+    }
+
     void groupedVerify(const Config &c, int rows, RouteSelection route, const native::Block16 *input, float *dst) const {
         const int *ids = route.ids;
         const int routes = rows * c.topK, width = std::max(gate.cols, down.cols);
         Buffer<int> offsets(c.experts + 1), rank(routes);
         check(native::planGroupedRows(ids, offsets.p, rank.p, c.experts, routes, cudaStreamPerThread));
         Buffer<uint2> codes(size_t(routes) * (width / 16));
-        Buffer<uint8_t> scales(native::groupedScaleRows(routes, c.experts) * (width / 16));
+        Buffer<uint8_t> scales(cuda::grouped_sm120::scaleRows(routes, c.experts) * (width / 16));
         Buffer<float> sorted(size_t(routes) * std::max(gate.rows, down.rows));
         const auto space = native::groupedScratch(c.experts, smCount);
         Buffer<uint8_t> metadata(space.metadata), workspace(space.gemm);
@@ -756,7 +844,7 @@ class GpuExperts final : public RoutedExperts {
         } else {
             prepareRoutedInput<true>(source, input.p, rows, c.hidden, smCount, route, packedRouter.p, scratch);
         }
-#if defined(FASTLLM_INKLING_GROUPED_NVFP4_SM120)
+#if defined(FASTLLM_INKLING_GROUPED_SM120)
         if (decodeArithmetic && gate.haveGroupedMaps && down.haveGroupedMaps &&
             native::useGroupedVerify(rows, c.topK, c.experts, c.hidden, c.intermediate)) {
             groupedVerify(c, rows, route, input.p, dstRows);
@@ -826,6 +914,11 @@ public:
         }
         if (!gate.fp4) groupedFp8 = PrepareCudaGroupedMxfp8Moe(weights.data(), weights.size());
         if (groupedFp8) {
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+            nativeMxfp8 = FastllmCudaRuntimeArch() == 120 && c.experts == 128 && c.topK == 8 &&
+                          c.intermediate % 128 == 0 && groupedFp8->MarlinWeights(false).codes &&
+                          groupedFp8->MarlinWeights(true).codes;
+#endif
             // Both packed projections are ready. There are no other users of these private weights.
             for (size_t i = 2; i < weights.size(); ++i) {
                 weights[i]->FreeSpace();
@@ -851,7 +944,24 @@ public:
         // Indexed GEMV launches one grid.y entry per route. The native
         // prefill grids index tiles, so a whole 64K-route scratch chunk fits.
         const int chunk = (gate.nativeCodes.p ? 65536 : 65535) / c.topK;
-        for (int start = 0; start < x.rows; start += chunk) {
+        int start = 0;
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+        if (nativeMxfp8 && phase == ExpertPhase::Prefill) {
+            // Amortize unpacking a projection over at least 4096 input tokens.
+            while (x.rows - start >= 4096) {
+                const int rows = std::min(16384, x.rows - start);
+                try {
+                    mxfp8Prefill(c, x.slice(start, rows), router.p + size_t(start) * c.experts,
+                                 bias, out.p + size_t(start) * c.hidden);
+                } catch (const CudaWorkspaceExhausted &) {
+                    cudaGetLastError();
+                    break; // Retry these rows with the smaller Marlin workspace.
+                }
+                start += rows;
+            }
+        }
+#endif
+        for (; start < x.rows; start += chunk) {
             const int rows = std::min(chunk, x.rows - start), routes = rows * c.topK;
             Buffer<int> indices(routes);
             Matrix scores(rows, c.topK);

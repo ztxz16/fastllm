@@ -3012,6 +3012,11 @@ public:
     GroupedMxfp8Moe(int experts, int sms, int hidden, int inter)
         : experts(experts), sms(sms), gate{2 * inter, hidden}, down{hidden, inter} {}
 
+    fastllm::CudaMarlinMxfp8Weights MarlinWeights(bool downProjection) const override {
+        const auto &p = downProjection ? down : gate;
+        return {static_cast<const uint32_t *>(p.storage.get()), p.scales};
+    }
+
     size_t WorkspaceInts(int rows, int topk) const override {
         if (rows == 1 && topk <= DirectMarlinRows::MaxTopK) return 0;
         const size_t padded = size_t(rows) * topk + size_t(experts) * 31;
