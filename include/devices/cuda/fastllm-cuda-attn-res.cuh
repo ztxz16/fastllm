@@ -149,10 +149,11 @@ template<class T> struct alignas(4 * sizeof(T)) Channels4 { T x, y, z, w; };
 
 template <int Slots, class Round, class Out, int FixedWidth = 0, bool Preload = false>
 __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER Sources sources, FASTLLM_ROW_PARAMETER Queries queries, int rows, int width,
-                                    float eps, bool normalizeValues, Out *output) {
+                                    float eps, bool normalizeValues, Out *output, bool queryFirst) {
     constexpr int threads = 512, packs = 2;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
-    const int qi = blockIdx.y, row = blockIdx.x;
+    const int qi = queryFirst ? blockIdx.x : blockIdx.y;
+    const int row = queryFirst ? blockIdx.y : blockIdx.x;
     const int cols = (FixedWidth ? FixedWidth : width) / 4;
     const Query query = queries.items[qi];
     float4 acc[packs]{};
@@ -317,7 +318,10 @@ inline void Launch(Sources sources, int count, const Query *queries, int nq, int
             };
             const auto kernel = width == 2304 ? kernelFor(std::integral_constant<int, 2304>{})
                                               : kernelFor(std::integral_constant<int, 0>{});
-            kernel<<<dim3(rows, n), 512, 0, stream>>>(sources, group, rows, width, eps, normalizeValues, dst);
+            // Adjacent query blocks reuse the same source row. CUDA grid.y permits at most 65535 rows.
+            const bool queryFirst = n > 1 && rows > 1 && rows <= 65535;
+            const dim3 grid = queryFirst ? dim3(n, rows) : dim3(rows, n);
+            kernel<<<grid, 512, 0, stream>>>(sources, group, rows, width, eps, normalizeValues, dst, queryFirst);
         } else {
             const auto kernel = width % 4 ? AttnResRows<false, Round, Out> : AttnResRows<true, Round, Out>;
             kernel<<<rows * n, 256, scratch, stream>>>(sources, count, group, n, rows, width, eps, normalizeValues,

@@ -148,19 +148,23 @@ int main() {
     if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
     try {
         double worst = 0.;
+        int cases = 0;
         for (bool norm : {false, true})
             for (auto shape : std::vector<std::array<int, 5>>{{1, 2304, 2, 4, 0},
                                                               {1, 2304, 2, Queries::Inline + 1, 0},
                                                               {1, 2304, 5, 1, 0},
                                                               {4, 2304, 5, 3, 0},
+                                                              {65535, 4, 2, 2, 0},
+                                                              {65536, 4, 2, 2, 0},
                                                               {9, 2303, 7, 2, 0},
                                                               {3, 256, 19, 6, 1},
                                                               {16, 1, 1, 1, 0},
                                                               {2, 5003, 35, 5, 0},
                                                               {1, 256, 4, 1, 1}}) {
                 worst = std::max(worst, compare(shape[0], shape[1], shape[2], shape[3], norm, shape[4]));
+                ++cases;
             }
-        std::printf("18 shapes/modes, CUDA graph replay, worst relative L2 %.9g\n", worst);
+        std::printf("%d shapes/modes, CUDA graph replay, worst relative L2 %.9g\n", cases, worst);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;
