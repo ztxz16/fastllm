@@ -523,6 +523,38 @@ void RoundedResidualCase() {
                 correction, 0, 0, 1, 2, 42, nullptr) && correction == -1,
             "an empty target must clear the previous correction");
 }
+void RoundedResidualConsumerCase() {
+    constexpr int batch = 3, drafts = 7, vocab = 2, stride = drafts + 1;
+    const int prefixes[batch] = {0, 3, drafts};
+    std::vector<float> p(batch * stride * vocab, 0.f), q(batch * drafts * vocab, 0.f);
+    std::vector<int> ids(batch * drafts, 1);
+    for (int b = 0; b < batch; ++b) {
+        for (int step = 0; step <= drafts; ++step) p[(b * stride + step) * vocab + 1] = 1.f;
+        for (int step = 0; step < drafts; ++step) q[(b * drafts + step) * vocab + 1] = 1.f;
+        if (prefixes[b] < drafts) {
+            const int i = b * drafts + prefixes[b];
+            ids[i] = 0;
+            q[i * vocab] = 1e-8f;  // In FP32 the other entry still rounds to one.
+        }
+    }
+    Buffer target(p), proposal(q), observed(batch * stride);
+    auto capture = [](const int *counts, void *dst) {
+        const int *rows = FastllmCudaMtpSmallResultRows(counts, batch, drafts);
+        Require(rows != nullptr, "missing small rejection token rows");
+        Check(cudaMemcpyAsync(dst, rows, batch * stride * sizeof(int), cudaMemcpyDeviceToDevice,
+                              cudaStreamPerThread));
+    };
+    std::vector<int> tokens(batch * stride), counts(batch), captured(batch * stride);
+    Require(FastllmCudaMtpRejectionFromHostProbabilities(target.p, proposal.p, ids.data(),
+                tokens.data(), counts.data(), batch, drafts, vocab, capture, observed.p),
+            "rounded probability sampling failed");
+    Check(cudaMemcpy(captured.data(), observed.p, captured.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    Require(captured == tokens, "early consumer observed unfinished token rows");
+    for (int b = 0; b < batch; ++b) {
+        Require(counts[b] == prefixes[b] && tokens[b * stride + counts[b]] == 1,
+                "rounded recovery changed the accepted prefix or correction");
+    }
+}
 void GraphTopPCase() {
     for (int vocab : {65535, 65536, 152576}) {
         for (int parameter = 0; parameter < 6; ++parameter) {
@@ -836,6 +868,7 @@ int main() {
         GraphTopPCase();
         PointMassCase();
         RoundedResidualCase();
+        RoundedResidualConsumerCase();
         for (int drafts : {1, 3, 5, 7})
             ChainCase("unfiltered-q filtered-p", {.55f, .30f, .15f}, {.10f, .40f, .50f},
                   drafts, 32, .7f, 2, .8f);

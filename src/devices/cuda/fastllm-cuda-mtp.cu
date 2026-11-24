@@ -312,11 +312,10 @@ __global__ void FinishResidualKernel(const Partial *partials, int *result,
 // Normally the residual contains positive mass whenever a draft is rejected.
 // Two separately rounded distributions can instead satisfy p <= q everywhere.
 // Recheck that row with its original acceptance draw and FP64 row masses.
-__global__ void RecoverRoundedResidual(const float *p, const float *q, const int *id,
-        int *result, int vocab, int row, int step, int drafts, unsigned long long seed,
+__device__ int RecoverRoundedResidualRow(const float *p, const float *q, int token,
+        int vocab, int row, int step, int drafts, unsigned long long seed,
         const unsigned long long *counter) {
     const int tid = threadIdx.x;
-    if (tid == 0) *result = -1;
     double2 sums = make_double2(0, 0);
     for (int i = tid; i < vocab; i += Threads) {
         const float x = p[i], y = q[i];
@@ -334,9 +333,9 @@ __global__ void RecoverRoundedResidual(const float *p, const float *q, const int
         __syncthreads();
     }
     const double ps = totals[0].x, qs = totals[0].y;
-    const int token = *id;
-    if (!(ps > 0 && qs > 0) || token < 0 || token >= vocab || !(q[token] > 0)) return;
+    if (!(ps > 0 && qs > 0) || token < 0 || token >= vocab || !(q[token] > 0)) return -1;
     const unsigned long long round = counter ? *counter - 1 : 0;
+    bool accept = false;
     if (tid == 0) {
         curandStatePhilox4_32_10_t rng;
         if (counter) InitSmallAcceptanceRng(rng, seed, row, drafts, round);
@@ -345,10 +344,9 @@ __global__ void RecoverRoundedResidual(const float *p, const float *q, const int
         for (int i = 0; i <= step; ++i) u = counter ? Uniform(curand(&rng)) : curand_uniform(&rng);
         const double target = double(p[token]) * qs, proposal = double(q[token]) * ps;
         // Emit the token as the correction. The already submitted KV prefix stays valid.
-        if (target > 0 && (target >= proposal || double(u) * proposal < target)) *result = token;
+        accept = target > 0 && (target >= proposal || double(u) * proposal < target);
     }
-    __syncthreads();
-    if (*result >= 0) return;
+    if (__syncthreads_or(accept)) return token;
     curandStatePhilox4_32_10_t rng;
     curand_init(seed ^ 0x1571c9d23eacf083ULL, (uint64_t)row * Threads + tid, round * 4, &rng);
     Partial best{-INFINITY, 0, -INFINITY, INT_MAX};
@@ -360,7 +358,30 @@ __global__ void RecoverRoundedResidual(const float *p, const float *q, const int
     }
     __shared__ Partial shared[Threads];
     best = Reduce(best, shared);
-    if (tid == 0 && isfinite(best.best)) *result = best.token;
+    return isfinite(best.best) ? best.token : -1;
+}
+
+__global__ void RecoverRoundedResidual(const float *p, const float *q, const int *id,
+        int *result, int vocab, int row, int step, int drafts, unsigned long long seed,
+        const unsigned long long *counter) {
+    const int next = RecoverRoundedResidualRow(p, q, *id, vocab, row, step, drafts, seed, counter);
+    if (threadIdx.x == 0) *result = next;
+}
+
+// Finalize rare rounded rows on the producer stream before either the host or
+// an early draft consumer borrows the results. Host IDs travel in the launch packet.
+__global__ void FinalizeSmallProbabilityRows(const float *p, const float *q, HostDraftIds ids,
+        int *results, int batch, int drafts, int vocab, unsigned long long seed,
+        const unsigned long long *counter) {
+    const int row = blockIdx.x;
+    const int step = results[batch * (drafts + 1) + row];
+    if (step < 0 || step >= drafts) return;
+    const size_t target = size_t(row) * (drafts + 1) + step;
+    if (results[target] != -1) return;
+    const size_t proposal = size_t(row) * drafts + step;
+    const int next = RecoverRoundedResidualRow(p + target * vocab, q + proposal * vocab,
+        ids.values[proposal], vocab, row, step, drafts, seed, counter);
+    if (threadIdx.x == 0) results[target] = next;
 }
 } // namespace
 
@@ -430,6 +451,9 @@ static bool FastllmMtpReject(const float *p, const float *logits,
         p, logits, lse, ws.results, ws.partials, drafts, vocab, batch, blocks, ws.seed, ws.counter);
     FinishResidualKernel<<<batch, Threads, 0, cudaStreamPerThread>>>(
         ws.partials, ws.results, drafts, batch, blocks, ws.counter);
+    if constexpr (HostIds && Probability)
+        FinalizeSmallProbabilityRows<<<batch, Threads, 0, cudaStreamPerThread>>>(p, logits, hostIds,
+            ws.results, batch, drafts, vocab, ws.seed, ws.counter);
     if (cudaGetLastError() != cudaSuccess ||
         cudaMemcpyAsync(ws.hostResults, ws.results, count * sizeof(int), cudaMemcpyDeviceToHost,
             cudaStreamPerThread) != cudaSuccess) return false;
@@ -444,7 +468,7 @@ static bool FastllmMtpReject(const float *p, const float *logits,
     std::copy_n(ws.hostResults + batch * (drafts + 1), batch, accepted);
     for (int b = 0; b < batch; ++b) {
         if (accepted[b] < 0 || accepted[b] > drafts) return false;
-        if constexpr (Probability) {
+        if constexpr (Probability && !HostIds) {
             int &next = output[b * (drafts + 1) + accepted[b]];
             if (next == -1 && accepted[b] < drafts &&
                 !FastllmCudaMtpRecoverRoundedResidual(p, logits, draftIds, ws.results, next,
