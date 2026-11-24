@@ -19,6 +19,7 @@
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
+#include "devices/cuda/fastllm-fold-sampling.cuh"
 #include "devices/cuda/fastllm-bf16-warp-dot.cuh"
 #include <algorithm>
 #include <array>
@@ -143,6 +144,7 @@ __global__ void unpackProjection(const T *src, U *dst, ProjectionParts parts, in
 }
 
 #include "q8-decode.cuh"
+#include "draft-fold.cuh"
 #include "loop-controller.cuh"
 #include "q8-controller.cuh"
 

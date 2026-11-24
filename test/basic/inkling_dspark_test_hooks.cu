@@ -17,8 +17,8 @@ __global__ void forcePrefix(int *ctrl, const int *tokens, int *result, int batch
 }
 } // namespace
 
-void forceInklingDraft(const int *ctrl, int *out, int stride, int step, int capacity) {
-    forceDraft<<<capacity, 1, 0, cudaStreamPerThread>>>(ctrl, out, stride, step);
+void forceInklingDraft(const int *ctrl, int *out, int stride, int step, int capacity, cudaStream_t stream) {
+    forceDraft<<<capacity, 1, 0, stream>>>(ctrl, out, stride, step);
 }
 void forceInklingPrefix(int *ctrl, const int *tokens, int *result, int batch, int drafts, const int *live) {
     forcePrefix<<<batch, 1, 0, cudaStreamPerThread>>>(ctrl, tokens, result, batch, drafts, live);
@@ -38,11 +38,12 @@ template<class T> __global__ void snapshot(const int *ctrl, const T *base, int b
 }
 } // namespace
 void snapshotInklingDraft(const int *ctrl, const void *base, int baseStride, const void *adjust, const void *bias,
-                          float cap, bool bf16, const float *q, int stride, float *saved, int step, int vocab, int capacity) {
+                          float cap, bool bf16, const float *q, int stride, float *saved, int step, int vocab,
+                          int capacity, cudaStream_t stream) {
     const dim3 grid((vocab + 255) / 256, capacity);
     auto launch = [&](auto typed) {
         using T = decltype(typed);
-        snapshot<<<grid, 256, 0, cudaStreamPerThread>>>(ctrl, static_cast<T>(base), baseStride, typed,
+        snapshot<<<grid, 256, 0, stream>>>(ctrl, static_cast<T>(base), baseStride, typed,
             static_cast<T>(bias), cap, q, stride, saved, step, vocab);
     };
     if (bf16) launch(static_cast<const __nv_bfloat16 *>(adjust));

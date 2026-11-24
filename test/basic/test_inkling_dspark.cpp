@@ -2,6 +2,7 @@
 // sampler outputs to compare two continuations with different rejected suffixes.
 #include "model.h"
 #include "moe_cache_config.h"
+#include "devices/cuda/fastllm-fold-sampling.cuh"
 #include <cuda_runtime.h>
 #include <dlfcn.h>
 #include <cmath>
@@ -10,11 +11,11 @@
 
 using namespace fastllm;
 
-void forceInklingDraft(const int *ctrl, int *out, int stride, int step, int capacity);
+void forceInklingDraft(const int *ctrl, int *out, int stride, int step, int capacity, cudaStream_t = cudaStreamPerThread);
 void forceInklingPrefix(int *ctrl, const int *tokens, int *result, int batch, int drafts, const int *live);
 
 void snapshotInklingDraft(const int *, const void *, int, const void *, const void *, float, bool, const float *, int,
-                          float *, int, int, int);
+                          float *, int, int, int, cudaStream_t = cudaStreamPerThread);
 
 namespace {
 int keep, suffix, verifyLaunches, captures;
@@ -27,6 +28,7 @@ std::vector<std::vector<float>> verifyScores;
 constexpr int maxTestBatch = 8;
 int testVocab;
 bool inDraw = false;
+int *firstFoldToken = nullptr;
 
 template <class F> F original(F current) {
     Dl_info info{};
@@ -52,6 +54,36 @@ void readScores(int batch, int steps) {
                 throw std::runtime_error("Failed to inspect target logits");
 }
 } // namespace
+
+// The singleton BF16 graph publishes its proposal through either the tiled
+// draw or its conditional repair. Observe the branch on its actual stream.
+static void recordFold(const void *base, const void *adjust, const void *bias, float cap, float *q,
+                       int *token, cudaStream_t stream) {
+    const int step = int(token - firstFoldToken);
+    if (step < 0 || step >= 7) throw std::runtime_error("Unexpected folded draft token slot");
+    snapshotInklingDraft(control, base, testVocab, adjust, bias, cap, true, q, testVocab,
+                         savedDraft, step, testVocab, 1, stream);
+    forceInklingDraft(control, token, 1, step, 1, stream);
+}
+
+bool FastllmCudaMtpDrawBf16Fold(void *ws, const void *base, const void *adjust, const void *bias,
+        const FastllmFoldSelection &selection, float cap, const float *t, const int *k, const float *p,
+        const uint64_t *seed, float *q, int *token, int *complete, bool first) {
+    static const auto draw = original(&FastllmCudaMtpDrawBf16Fold);
+    if (!draw(ws, base, adjust, bias, selection, cap, t, k, p, seed, q, token, complete, first)) return false;
+    if (first) firstFoldToken = token;
+    recordFold(base, adjust, bias, cap, q, token, cudaStreamPerThread);
+    return true;
+}
+
+bool FastllmCudaMtpRepairBf16Fold(void *ws, const void *base, const void *adjust, const void *bias,
+        float cap, const float *t, int *k, const float *p, uint64_t *seed, float *q, int *token,
+        int vocab, cudaStream_t stream) {
+    static const auto repair = original(&FastllmCudaMtpRepairBf16Fold);
+    if (!repair(ws, base, adjust, bias, cap, t, k, p, seed, q, token, vocab, stream)) return false;
+    recordFold(base, adjust, bias, cap, q, token, stream);
+    return true;
+}
 
 extern "C" cudaError_t cudaGraphLaunch(cudaGraphExec_t graph, cudaStream_t stream) {
     static const auto launch = original(&cudaGraphLaunch);

@@ -67,7 +67,7 @@ __global__ void FastllmDrawProposalTile(const float *q, int qStride, const doubl
 
 // Pack the finite support after stable top-k masking. Rows with a broader
 // support continue through the dense normalizer in the same captured graph.
-constexpr int kCompactGraphDraw = 128;
+constexpr int kCompactGraphDraw = FastllmFoldSelection::maxCandidates;
 template<bool Descending>
 __device__ __forceinline__ unsigned long long SortGraphDrawKeys(unsigned long long key, unsigned long long *shared) {
     const unsigned lane = threadIdx.x;
@@ -96,6 +96,8 @@ template<class T> struct MarkovProposalScores {
     int baseStride, vocab;
     float cap;
     __device__ T raw(int row, int id) const {
+        if constexpr (std::is_same_v<T, float>)
+            return (base[size_t(row) * baseStride + id] + adjust[size_t(row) * vocab + id]) + bias[id];
         const T correction = T(float(adjust[size_t(row) * vocab + id]) + float(bias[id]));
         return T(float(base[size_t(row) * baseStride + id]) + float(correction));
     }
@@ -109,10 +111,13 @@ constexpr int kGraphRadixThreads = 512;
 template<class T>
 __global__ void SelectGraphDrawSupport(MarkovProposalScores<T> scores, const float *temperatures, const int *topK, int *counts,
                                        float2 *support, float *pivots, float *q, int stride, int vocab, int rows,
-                                       int chunk, int blocksPerRow, flashinfer::sampling::RadixRowState *states) {
+                                       int chunk, int blocksPerRow, flashinfer::sampling::RadixRowState *states,
+                                       const int *previous = nullptr, int supportStride = 0) {
     using namespace flashinfer::sampling;
     using Traits = RadixTopKTraits<T>;
-    extern __shared__ uint16_t ordered[];
+    using Key = typename Traits::OrderedType;
+    extern __shared__ uint32_t storage[];
+    auto *ordered = reinterpret_cast<Key *>(storage);
     __shared__ uint32_t histogram[256], suffix[256], scalars[2];
     const int group = blockIdx.x / blocksPerRow, tile = blockIdx.x % blocksPerRow;
     const int begin = tile * chunk, length = min(chunk, vocab - begin);
@@ -133,17 +138,21 @@ __global__ void SelectGraphDrawSupport(MarkovProposalScores<T> scores, const flo
             RadixSelectOneRound<kGraphRadixThreads, false>(ordered, length, histogram, suffix, scalars, states + group,
                 prefix, remaining, digit, selection, phase, blocksPerRow, tile, threadIdx.x, &prefix, &remaining);
         ++selection;
-        const float cutoff = float(scores.softcap(Traits::FromOrdered(uint16_t(prefix)))) * inv;
+        const float cutoff = float(scores.softcap(Traits::FromOrdered(Key(prefix)))) * inv;
         if (!tile && !threadIdx.x) pivots[row] = cutoff;
         if (k <= kCompactGraphDraw) {
+            const int *ids = previous ? previous + size_t(row) * supportStride : nullptr;
+            const bool clearAll = !ids || ids[0] < -1;
+            if (!clearAll && tile == 0 && threadIdx.x < kCompactGraphDraw && ids[threadIdx.x] >= 0)
+                q[size_t(row) * stride + ids[threadIdx.x]] = 0.f;
             // A raw score below the pivot can round onto its softcap plateau. Probe a
             // lower key: only prune below it if its final score is strictly smaller.
-            const int lowest = Traits::ToOrdered(Traits::NegInf());
-            const int probe = max(lowest, int(prefix) - warpSize);
-            const int firstEligible = float(scores.softcap(Traits::FromOrdered(uint16_t(probe)))) * inv < cutoff
+            const uint32_t lowest = Traits::ToOrdered(Traits::NegInf());
+            const uint32_t probe = prefix - min(prefix - lowest, uint32_t(warpSize));
+            const uint32_t firstEligible = float(scores.softcap(Traits::FromOrdered(Key(probe)))) * inv < cutoff
                 ? probe + 1 : lowest;
             for (int i = threadIdx.x; i < length; i += blockDim.x) {
-                q[size_t(row) * stride + begin + i] = 0.f;
+                if (clearAll) q[size_t(row) * stride + begin + i] = 0.f;
                 if (ordered[i] >= firstEligible) {
                     const float score = float(scores.softcap(Traits::FromOrdered(ordered[i]))) * inv;
                     if (!(score >= cutoff)) continue;
@@ -172,14 +181,31 @@ __global__ void MaterializeGraphDrawMask(MarkovProposalScores<T> scores, const f
     }
 }
 
+template<bool Round = false>
 __global__ void SampleGraphDrawSupport(const float *scratch, const int *counts, const int *topK, const float *topP,
                                        const uint64_t *seed, int step, float *q, int stride, int *tokens,
-                                       int tokenStride, int *done, int *fallbackK, int vocab) {
+                                       int tokenStride, int *done, int *fallbackK, int vocab, bool first = false,
+                                       int *previous = nullptr, int supportStride = 0) {
     constexpr int N = kCompactGraphDraw;
     const int row = blockIdx.x, lane = threadIdx.x, k = topK[row];
-    if (!lane) { done[row] = 0; fallbackK[row] = k; }
+    if (previous) {
+        previous += size_t(row) * supportStride;
+        if (!lane) previous[0] = -2; // Dense repair may populate the whole row.
+    }
+    if (!lane) {
+        if constexpr (Round) {
+            if (first) *done = 1;
+            *tokens = 0; // A provisional step must always leave a valid embedding index.
+        } else {
+            done[row] = 0;
+            fallbackK[row] = k;
+        }
+    }
     const int count = counts[row];
-    if (k < 1 || k > count || count > N) return;
+    if (k < 1 || k > count || count > N) {
+        if constexpr (Round) if (!lane) *done = 0;
+        return;
+    }
     using Scan = cub::BlockScan<double, N>;
     __shared__ union { unsigned long long sort[N]; Scan::TempStorage scan; } tmp;
     __shared__ float maximum, cutoff;
@@ -192,6 +218,14 @@ __global__ void SampleGraphDrawSupport(const float *scratch, const int *counts, 
         key = (static_cast<unsigned long long>(bits) << 32) | ~__float_as_uint(x.y);
     }
     key = SortGraphDrawKeys<true>(key, tmp.sort);
+    if constexpr (Round) {
+        // Drop extra radix-bucket entries before the token-ID prefix scan, so
+        // its FP64 reduction sees exactly the same inputs as the full selection.
+        __shared__ unsigned kth;
+        if (lane == k-1) kth = unsigned(key >> 32);
+        __syncthreads();
+        if ((key >> 32) < kth) key = 0;
+    }
     unsigned bits = key >> 32;
     float score = __uint_as_float(bits ^ ((bits >> 31) ? 0x80000000u : ~0u));
     const int id = ~unsigned(key);
@@ -208,10 +242,14 @@ __global__ void SampleGraphDrawSupport(const float *scratch, const int *counts, 
     // Use the dense implementation on ambiguous FP32 nucleus boundaries.
     if (topP[row] < 1.f && __syncthreads_or(lane < k && weight > 0.f &&
             (fabs((prefix + weight) - threshold) <= 2.e-6 * total ||
-             (weight != cutoff && fabsf(weight - cutoff) <= 2.e-6f * cutoff)))) return;
+             (weight != cutoff && fabsf(weight - cutoff) <= 2.e-6f * cutoff)))) {
+        if constexpr (Round) if (!lane) *done = 0;
+        return;
+    }
     const double kept = weight >= cutoff ? weight : 0.f;
     Scan(tmp.scan).ExclusiveSum(kept, prefix, total);
     const float probability = float(kept / total);
+    if (previous) previous[lane] = probability > 0.f ? id : -1;
     if (probability > 0.f) q[size_t(row) * stride + id] = probability;
     // The ordinary Philox draw traverses token IDs in ascending order.
     key = (static_cast<unsigned long long>(unsigned(id)) << 32) | __float_as_uint(probability);
@@ -224,11 +262,46 @@ __global__ void SampleGraphDrawSupport(const float *scratch, const int *counts, 
         curandStatePhilox4_32_10_t state;
         curand_init(*seed, row, step, &state);
         draw = fmin(double(curand_uniform(&state)), 1.0 - 0x1p-33) * total;
-        done[row] = 1;
-        fallbackK[row] = vocab;
+        if constexpr (!Round) {
+            done[row] = 1;
+            fallbackK[row] = vocab;
+        }
     }
     __syncthreads();
     if (prefix < draw && draw <= prefix + mass) tokens[size_t(row) * tokenStride] = int(key >> 32);
+}
+
+// Two radix digits identify a guaranteed lower bound on the kth FP32 score.
+// All scores in or above that bucket are collected. Only a complete candidate
+// set fits the compact draw; otherwise the original sampler resolves the tail.
+__global__ void CollectFoldSupport(const float *scores, int vocab, const int *topK, int *count, float2 *support,
+                                   flashinfer::sampling::RadixRowState *state, int chunk, const int *done, bool first) {
+    using namespace flashinfer::sampling;
+    using Traits = RadixTopKTraits<float>;
+    const int k = *topK;
+    if (k < 1 || k > kCompactGraphDraw || k >= vocab || (!first && !*done)) return;
+    const int begin = blockIdx.x * chunk, length = min(chunk, vocab - begin);
+    extern __shared__ unsigned ordered[];
+    __shared__ unsigned hist[256], suffix[256], scalars[2];
+    bool invalid = false;
+    for (int i = threadIdx.x; i < length; i += blockDim.x) {
+        const float v = scores[begin + i];
+        invalid |= !isfinite(v);
+        ordered[i] = Traits::ToOrdered(v == 0.f ? 0.f : v);
+    }
+    if (__syncthreads_or(invalid) && !threadIdx.x) atomicAdd(count, kCompactGraphDraw + 1);
+    unsigned prefix = 0, remaining = k;
+    int phase = 0;
+#pragma unroll
+    for (unsigned digit = 0; digit < 2; ++digit)
+        RadixSelectOneRound<kGraphRadixThreads, false>(ordered, length, hist, suffix, scalars, state,
+            prefix, remaining, digit, 0, phase, gridDim.x, blockIdx.x, threadIdx.x, &prefix, &remaining);
+    for (int i = threadIdx.x; i < length; i += blockDim.x) {
+        if (ordered[i] < prefix) continue;
+        const int at = atomicAdd(count, 1);
+        if (at < kCompactGraphDraw)
+            support[at] = make_float2(Traits::FromOrdered(ordered[i]), __int_as_float(begin + i));
+    }
 }
 
 template<class T>

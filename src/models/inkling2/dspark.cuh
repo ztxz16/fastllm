@@ -8,7 +8,7 @@ struct DraftKV {
 struct DraftView {
     PageView pages;
     float *context;
-    int past, begin;
+    int past, begin, window = 0;
 };
 struct DraftInput {
     int anchor, topK, steps;
@@ -77,6 +77,7 @@ struct DraftFlashParams : flashinfer::BatchPrefillPagedParams<half, half, half, 
     DraftPages paged_kv;
     const DraftView *views;
     int block, maxSplits;
+    const half *keySuffix, *valueSuffix;
     __host__ __device__ unsigned get_qo_len(unsigned) const { return block; }
     __host__ __device__ unsigned get_kv_len(unsigned) const { return paged_kv.length; }
 };
@@ -87,6 +88,7 @@ __device__ inline int draftChunk(int length, int splits) { return max(128, (leng
 // share one launch, including when they span different numbers of physical pages.
 template<class Traits>
 __global__ __launch_bounds__(Traits::NUM_THREADS) void draftGraphAttention(DraftFlashParams p) {
+    cuda_launch::DependencyStart();
     int tiles = (p.block * int(p.group_size) + Traits::CTA_TILE_Q - 1) / Traits::CTA_TILE_Q;
     int b = blockIdx.x / tiles, tile = blockIdx.x % tiles, split = blockIdx.y, zero = 0;
     auto v = p.views[b];
@@ -100,8 +102,10 @@ __global__ __launch_bounds__(Traits::NUM_THREADS) void draftGraphAttention(Draft
     p.paged_kv.begin = v.begin;
     int keys[] = {0, length};
     p.paged_kv.indptr = keys;
-    p.paged_kv.k_data = {v.pages, nullptr, 0, v.past, int(gridDim.z) * 128, false};
-    p.paged_kv.v_data = {v.pages, nullptr, 0, v.past, int(gridDim.z) * 128, true};
+    const int stride = int(gridDim.z) * 128;
+    const size_t row = size_t(b) * p.block * stride;
+    p.paged_kv.k_data = {v.pages, p.keySuffix ? p.keySuffix + row : nullptr, 0, v.past, stride, false};
+    p.paged_kv.v_data = {v.pages, p.valueSuffix ? p.valueSuffix + row : nullptr, 0, v.past, stride, true};
     p.request_indices = p.q_indptr = p.o_indptr = &zero;
     p.qo_tile_indices = &tile;
     p.kv_tile_indices = &split;
@@ -117,6 +121,7 @@ __global__ __launch_bounds__(Traits::NUM_THREADS) void draftGraphAttention(Draft
 
 // Portable paged fallback for devices without the tensor-core prefill kernel.
 __global__ void draftAttentionPartial(DraftFlashParams p, const DraftView *views, int kvHeads) {
+    cuda_launch::DependencyStart();
     int row = blockIdx.x, b = row / p.block, head = blockIdx.z, col = threadIdx.x;
     auto v = views[b];
     int len = v.past - v.begin + p.block, chunk = draftChunk(len, gridDim.y);
@@ -144,6 +149,7 @@ __global__ void draftAttentionPartial(DraftFlashParams p, const DraftView *views
 
 template <class T>
 __global__ void mergeDraftAttention(DraftFlashParams p, const DraftView *views, T *out, int maxSplits) {
+    cuda_launch::DependencyStart();
     int row = blockIdx.x, b = row / p.block, head = blockIdx.y, col = threadIdx.x;
     int len = views[b].past - views[b].begin + p.block;
     int splits = (len - 1) / draftChunk(len, maxSplits) + 1;
@@ -161,9 +167,9 @@ __global__ void mergeDraftAttention(DraftFlashParams p, const DraftView *views, 
 
 // Side 0 produces token-major queries. Sides 1 and 2 append into request KV.
 template <class T, int Side>
-__global__ void draftHead(const T *src, half *query, const float *norm, int heads, int dim, float eps, float theta,
-                          int block, DraftView single, const DraftView *views, const int *accepted = nullptr) {
-    int row = blockIdx.x, b = row / block, pos = row % block, head = blockIdx.y, col = threadIdx.x;
+__device__ __forceinline__ void draftHeadBody(const T *src, half *query, const float *norm, int heads, int dim, float eps, float theta,
+                          int block, DraftView single, const DraftView *views, const int *accepted, int head, half *suffix = nullptr) {
+    int row = blockIdx.x, b = row / block, pos = row % block, col = threadIdx.x;
     if (accepted && pos > accepted[b]) return;
     auto view = views ? views[b] : single;
     int token = view.past + pos;
@@ -182,9 +188,52 @@ __global__ void draftHead(const T *src, half *query, const float *norm, int head
     if constexpr (Side == 0)
         query[(size_t(row) * heads + head) * dim + col] = half(x);
     else {
+        if (suffix) {
+            suffix[(size_t(row) * heads + head) * dim + col] = half(x);
+            return;
+        }
         auto *dst = static_cast<half *>(Side == 1 ? view.pages.key : view.pages.value);
         dst[view.pages.offset(token, Side == 2, heads * dim) + head * dim + col] = half(x);
     }
+}
+
+template<class T, int Side>
+__global__ void draftHead(const T *src, half *query, const float *norm, int heads, int dim, float eps, float theta,
+                          int block, DraftView single, const DraftView *views, const int *accepted = nullptr) {
+    draftHeadBody<T, Side>(src, query, norm, heads, dim, eps, theta, block, single, views, accepted, blockIdx.y);
+}
+
+template<class T> __global__ void draftPrepareQkv(const T *q, const T *k, const T *v, half *query,
+        const float *qn, const float *kn, int heads, int kvHeads, int dim, float eps, float theta,
+        int block, const DraftView *views, half *keySuffix, half *valueSuffix) {
+    cuda_launch::DependencyStart();
+    const int head = blockIdx.y;
+    if (head < heads)
+        draftHeadBody<T, 0>(q, query, qn, heads, dim, eps, theta, block, {}, views, nullptr, head);
+    else if (head < heads + kvHeads)
+        draftHeadBody<T, 1>(k, nullptr, kn, kvHeads, dim, eps, theta, block, {}, views, nullptr, head - heads, keySuffix);
+    else
+        draftHeadBody<T, 2>(v, nullptr, nullptr, kvHeads, dim, eps, theta, block, {}, views, nullptr, head - heads - kvHeads, valueSuffix);
+}
+
+template<class T, bool Add> __global__ void draftResidualNorm(T *x, const T *delta, const float *weights,
+                                                             T *out, int width, float eps) {
+    cuda_launch::DependencyStart();
+    const size_t first = size_t(blockIdx.x) * width;
+    __shared__ float scratch[threads];
+    float squares = 0.f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        float v = float(x[first + i]);
+        if constexpr (Add) {
+            const T sum = T(v + float(delta[first + i]));
+            x[first + i] = sum;
+            v = float(sum);
+        }
+        squares += v * v;
+    }
+    const float scale = rsqrtf(blockSum(squares, scratch) / width + eps);
+    for (int i = threadIdx.x; i < width; i += blockDim.x)
+        out[first + i] = T(float(x[first + i]) * scale * weights[i]);
 }
 
 template <class T> __global__ void draftBlockInput(const T *anchor, const float *mask, T *out, int block, int h) {
@@ -194,6 +243,7 @@ template <class T> __global__ void draftBlockInput(const T *anchor, const float 
 template <class T>
 __global__ void draftMarkovInput(T *state, const T *embed, const int *tokens, const T *hidden, const DraftView *views,
                                  int step, int steps, int rank, int h) {
+    cuda_launch::DependencyStart();
     int b = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
     state += size_t(b) * (2 * rank + 2 * h);
     if (col < rank) {
@@ -215,25 +265,70 @@ template <class T> __global__ void draftAdd(T *dest, const T *add, int size) {
         dest[i] = T(float(dest[i]) + float(add[i]));
 }
 template <class T> __global__ void draftSwiGLU(T *gate, const T *up, int size) {
+    cuda_launch::DependencyStart();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
         float v = float(gate[i]);
         gate[i] = T(v / (1.f + expf(-v)) * float(up[i]));
     }
 }
+template<class T> __device__ void draftRecurOutput(float gate, float candidate, float out, T previous,
+                                                   T &state, T &latent) {
+    float g = float(T(gate)), c = float(T(candidate)), o = float(T(out));
+    g = float(T(1.f / (1.f + expf(-g))));
+    state = T(float(T(g * float(previous))) + float(T(float(T(1.f - g)) * float(T(tanhf(c))))));
+    latent = T(tanhf(o));
+}
 template <class T>
 __global__ void draftRecur(const float *raw, const float *bias, T *state, T *latent, int rank, int pitch) {
+    cuda_launch::DependencyStart();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rank)
         return;
     raw += size_t(blockIdx.y) * 3 * rank;
     state += size_t(blockIdx.y) * pitch;
     latent += size_t(blockIdx.y) * rank;
-    float g = float(T(raw[i] + bias[i])), c = float(T(raw[i + rank] + bias[i + rank]));
-    float o = float(T(raw[i + 2 * rank] + bias[i + 2 * rank]));
-    g = float(T(1.f / (1.f + expf(-g))));
-    state[i] = T(float(T(g * float(state[i]))) + float(T(float(T(1.f - g)) * float(T(tanhf(c))))));
-    latent[i] = T(tanhf(o));
+    draftRecurOutput(raw[i] + bias[i], raw[i + rank] + bias[i + rank], raw[i + 2 * rank] + bias[i + 2 * rank],
+                     state[i], state[i], latent[i]);
+}
+
+template<class T> __global__ void draftMarkovContext(const DraftView *views, T *out, int h) {
+    cuda_launch::DependencyStart();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < h) out[size_t(blockIdx.y) * h + i] = T(views[blockIdx.y].context[i]);
+}
+
+// Only the previous state and token embedding vary serially. The wider
+// hidden and context projections have already been computed for the window.
+template<class T> __global__ void draftMarkovStep(const T *weights, const T *embed, const int *tokens,
+        const float *hidden, const float *context, const float *bias, const T *previous,
+        T *next, T *latent, int rank, int pitch, int steps, int step) {
+    cuda_launch::DependencyStart();
+    int i = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    if (i >= rank) return;
+    const int lane = threadIdx.x % 32, b = blockIdx.y;
+    const T *word = embed + size_t(tokens[size_t(b) * (steps + 1) + step]) * rank;
+    previous += size_t(b) * rank;
+    const T *row = weights + size_t(i) * pitch;
+    float dot[3]{};
+    for (int k = lane; k < rank; k += 32) {
+        const float v = step ? float(previous[k]) : 0.f, w = float(word[k]);
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const T *a = row + size_t(j) * rank * pitch;
+            dot[j] = fmaf(v, float(a[k]), dot[j]);
+            dot[j] = fmaf(w, float(a[rank+k]), dot[j]);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        for (int d = 16; d; d /= 2) dot[j] += __shfl_down_sync(0xffffffffu, dot[j], d);
+        int col = j * rank + i;
+        if (!lane) dot[j] += hidden[(size_t(b) * steps + step) * (3 * rank) + col]
+                            + context[size_t(b) * (3 * rank) + col] + bias[col];
+    }
+    if (!lane) draftRecurOutput(dot[0], dot[1], dot[2], step ? previous[i] : T(0.f),
+                                next[size_t(b)*rank+i], latent[size_t(b)*rank+i]);
 }
 // One chronological panel per (layer visit, request, convolution) holds the old
 // history followed by every candidate input. Accepting k inputs advances the

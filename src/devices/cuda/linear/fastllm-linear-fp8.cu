@@ -1,3 +1,5 @@
+#include "devices/cuda/fastllm-cuda-launch.cuh"
+#include "devices/cuda/fastllm-cuda-linear-output.h"
 #include "devices/cuda/fastllm-kernel-benchmark.cuh"
 #include <climits>
 #include "devices/cuda/fastllm-nvfp4-prefill.h"
@@ -32,6 +34,9 @@
 
 #ifdef __CUDACC__
 #include <cuda_bf16.h>
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12000
+#include <cooperative_groups.h>
+#endif
 #endif
 
 typedef union __align__(16) _union_bf16_4_fp8 {
@@ -4131,11 +4136,10 @@ __global__ void FastllmGemvNVFP4Kernel1MultiRow(InputT *A, uint8_t *packedWeight
 
 template <int THREAD_PER_BLOCK, int PART, bool SCALE_E8M0,
           bool BLOCK32, bool PLANAR, bool COMPACT = false, typename InputT, typename OutputT, typename BiasT>
-__global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, OutputT *C,
-                                                       BiasT *bias, int m, int k, int perRow) {
+__device__ __forceinline__ void NVFP4MultiRowBody(InputT *A, uint8_t *B, OutputT *C,
+                                                       BiasT *bias, int m, int k, int perRow, int row) {
     __shared__ float sdata[PART][THREAD_PER_BLOCK];
     unsigned int tid = threadIdx.x;
-    int row = blockIdx.x;
 
 #pragma unroll
     for (int x = 0; x < PART; x++) sdata[x][tid] = 0.0f;
@@ -4209,6 +4213,225 @@ __global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, Ou
             C[row + (size_t)k * x] = FastllmCudaNVFP4FloatToValue<OutputT>(sdata[x][0] + biasValue);
         }
     }
+}
+
+template <int THREAD_PER_BLOCK, int PART, bool SCALE_E8M0,
+          bool BLOCK32, bool PLANAR, bool COMPACT = false, typename InputT, typename OutputT, typename BiasT>
+__global__ void FastllmGemvNVFP4Block16Kernel1MultiRow(InputT *A, uint8_t *B, OutputT *C,
+                                                       BiasT *bias, int m, int k, int perRow) {
+    NVFP4MultiRowBody<THREAD_PER_BLOCK, PART, SCALE_E8M0, BLOCK32, PLANAR, COMPACT>(
+        A, B, C, bias, m, k, perRow, blockIdx.x);
+}
+
+struct NVFP4Siblings {
+    uint8_t *weights[3];
+    void *outputs[3];
+    int columns[3];
+};
+
+template<class T> __global__ void NVFP4SiblingGemv(const T *input, NVFP4Siblings args, int width) {
+    int col = blockIdx.x, part = 0;
+    while (col >= args.columns[part]) col -= args.columns[part++];
+    constexpr int tile = 8;
+    const size_t first = size_t(blockIdx.y) * tile;
+    fastllm::cuda_launch::DependencyStart();
+    NVFP4MultiRowBody<64, tile, false, false, false>(
+        const_cast<T *>(input) + first * width, args.weights[part], static_cast<T *>(args.outputs[part]) + first * args.columns[part],
+        static_cast<T *>(nullptr), width, args.columns[part], width / 16 * 12, col);
+}
+
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+// One exact BF16 encoding per E2M1 nibble. Each lane feeds two K positions
+// into MMA; the original FP32 scale is applied to each 16-element dot.
+__device__ __forceinline__ unsigned NVFP4BfloatPair(unsigned byte) {
+    const unsigned select = byte & 0x77;
+    const unsigned hi = __byte_perm(0x3f3f3f00u, 0x40404040u, select);
+    const unsigned lo = __byte_perm(0xc0800000u, 0xc0804000u, select);
+    return __byte_perm(lo, hi, 0x5140) | ((byte & 8) << 12) | ((byte & 128) << 24);
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ float NVFP4WindowPartial(const uint8_t *w, size_t rowBytes, const unsigned *x,
+                                                     int sliceBlocks, float (&partial)[8][8][16]) {
+    constexpr int warps = 8;
+    const int warp = threadIdx.x / 32, group = (threadIdx.x % 32) / 4, pair = threadIdx.x % 4;
+    float sum[4]{};
+    for (int k = warp; k < sliceBlocks; k += warps) {
+        const auto *a = w + k * 12;
+        const auto *b = a + 8 * rowBytes;
+        const unsigned a0 = NVFP4BfloatPair(a[pair]), a1 = NVFP4BfloatPair(b[pair]);
+        const unsigned a2 = NVFP4BfloatPair(a[pair + 4]), a3 = NVFP4BfloatPair(b[pair + 4]);
+        float dot[4];
+        asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%10,%10,%10};"
+            : "=f"(dot[0]), "=f"(dot[1]), "=f"(dot[2]), "=f"(dot[3])
+            : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(x[k*8+pair]),"r"(x[k*8+pair+4]),"f"(0.f));
+        const float s0 = *reinterpret_cast<const float *>(a + 8), s1 = *reinterpret_cast<const float *>(b + 8);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) sum[j] = fmaf(dot[j], j < 2 ? s0 : s1, sum[j]);
+    }
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) partial[warp][pair*2 + j%2][group + (j/2)*8] = sum[j];
+    __syncthreads();
+    const int item = threadIdx.x;
+    if (item < 128) {
+        float value = partial[0][item/16][item%16];
+#pragma unroll
+        for (int i = 1; i < warps; ++i) value += partial[i][item/16][item%16];
+        return value;
+    }
+    return 0.f;
+}
+#endif
+
+__global__ void NVFP4SiblingWindowMma(const __nv_bfloat16 *input, NVFP4Siblings args, int width) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int warps = 8;
+    int firstCol = blockIdx.x * 16, part = 0;
+    while (firstCol >= args.columns[part]) firstCol -= args.columns[part++];
+    const int group = (threadIdx.x % 32) / 4, blocks = width / 16;
+    const size_t rowBytes = size_t(blocks) * 12;
+    const auto *w = args.weights[part] + (firstCol + group) * rowBytes;
+    const auto *x = reinterpret_cast<const unsigned *>(input + (size_t(blockIdx.y) * 8 + group) * width);
+    fastllm::cuda_launch::DependencyStart();
+    __shared__ float partial[warps][8][16];
+    const float value = NVFP4WindowPartial(w, rowBytes, x, blocks, partial);
+    const int item = threadIdx.x;
+    if (item < 128) {
+        static_cast<__nv_bfloat16 *>(args.outputs[part])[(size_t(blockIdx.y)*8+item/16)*args.columns[part]
+                                                          + firstCol + item%16] = __float2bfloat16_rn(value);
+    }
+#endif
+}
+#if CUDART_VERSION >= 12000
+// Cluster-local split K keeps FP32 partials on chip and writes BF16 only once.
+// Only immutable weight blocks can be copied before the PDL dependency resolves.
+__global__ void NVFP4WindowSplitK(const __nv_bfloat16 *input, const uint8_t *weight, __nv_bfloat16 *output,
+                                 int width, int columns, int splits) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    namespace cg = cooperative_groups;
+    const auto cluster = cg::this_cluster();
+    const int rank = cluster.block_rank(), firstCol = blockIdx.x / splits * 16;
+    const int units = width / 64;
+    const int begin = units * rank / splits, end = units * (rank + 1) / splits;
+    const int vectors = (end - begin) * 3, pitch = vectors + 1;
+    extern __shared__ uint4 packed[];
+    const uint4 *source = reinterpret_cast<const uint4 *>(weight) + size_t(firstCol) * units * 3 + begin * 3;
+    for (int i = threadIdx.x; i < 16 * vectors; i += blockDim.x) {
+        const int row = i / vectors, col = i % vectors;
+        const unsigned dst = static_cast<unsigned>(__cvta_generic_to_shared(packed + row * pitch + col));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                     :: "r"(dst), "l"(source + size_t(row) * units * 3 + col) : "memory");
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    fastllm::cuda_launch::DependencyStart();
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    const int group = (threadIdx.x % 32) / 4;
+    const auto *x = reinterpret_cast<const unsigned *>(input + (size_t(blockIdx.y) * 8 + group) * width + begin * 64);
+    __shared__ float partial[8][8][16];
+    __shared__ float tile[128];
+    const float value = NVFP4WindowPartial(reinterpret_cast<const uint8_t *>(packed + group * pitch),
+                                           pitch * sizeof(uint4), x, (end - begin) * 4, partial);
+    const int item = threadIdx.x;
+    if (item < 128) tile[item] = value;
+    cluster.sync();
+    if (rank == 0 && item < 128) {
+        float total = value;
+        for (int other = 1; other < splits; ++other) total += *cluster.map_shared_rank(tile + item, other);
+        output[(size_t(blockIdx.y) * 8 + item / 16) * columns + firstCol + item % 16] = __float2bfloat16_rn(total);
+    }
+    // A peer may still be reading this CTA's shared memory.
+    cluster.sync();
+#endif
+}
+
+static bool TryNVFP4WindowSplitK(const __nv_bfloat16 *input, const NVFP4Siblings &args, int rows, int width) {
+    const int columns = args.columns[0];
+    if (width % 64 || width / 2 < columns || reinterpret_cast<uintptr_t>(args.weights[0]) % alignof(uint4))
+        return false;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local int lastDevice = -1, sms = 0;
+    if (lastDevice != device) {
+        cudaFuncAttributes image{};
+        int cluster = 0;
+        sms = 0;
+        if (cudaFuncGetAttributes(&image, NVFP4WindowSplitK) == cudaSuccess && image.ptxVersion >= 90 &&
+            image.binaryVersion >= 90 && cudaDeviceGetAttribute(&cluster, cudaDevAttrClusterLaunch, device) == cudaSuccess &&
+            cluster) cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+        lastDevice = device;
+    }
+    const int tiles = columns / 16 * (rows / 8);
+    int splits = 1;
+    while (splits < 4 && tiles * splits < 4 * sms && width / (2 * splits) >= 512) splits *= 2;
+    if (splits < 2) return false;
+    const size_t shared = 16 * sizeof(uint4) * (3 * ((width / 64 + splits - 1) / splits) + 1);
+    if (shared + (8 + 1) * 128 * sizeof(float) > 48 * 1024) return false;
+    cudaLaunchConfig_t cfg{};
+    cfg.gridDim = dim3(columns / 16 * splits, rows / 8);
+    cfg.blockDim = dim3(256);
+    cfg.dynamicSmemBytes = shared;
+    cfg.stream = cudaStreamPerThread;
+    cudaLaunchAttribute attrs[2]{};
+    attrs[0].id = cudaLaunchAttributeClusterDimension;
+    attrs[0].val.clusterDim = {static_cast<unsigned>(splits), 1, 1};
+    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[1].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 2;
+    // The maximum cluster size may be smaller on a partitioned device.
+    int maxCluster = 0;
+    if (cudaOccupancyMaxPotentialClusterSize(&maxCluster, NVFP4WindowSplitK, &cfg) != cudaSuccess ||
+        maxCluster < splits) return false;
+    if (cudaLaunchKernelEx(&cfg, NVFP4WindowSplitK, input, static_cast<const uint8_t *>(args.weights[0]),
+                           static_cast<__nv_bfloat16 *>(args.outputs[0]), width, columns, splits) != cudaSuccess)
+        throw std::runtime_error("NVFP4 split-K window launch failed");
+    return true;
+}
+#endif
+#endif
+
+bool FastllmCudaNVFP4SiblingProjections(const void *input, bool bf16, int rows, int width,
+                                        const fastllm::Data *const *weights, void *const *outputs, int count) {
+    if (!FastllmCudaNVFP4UseGemv(rows) || rows <= 0 || rows % 8 || width <= 0 || width % 16 ||
+        count < 1 || count > 3) return false;
+    NVFP4Siblings args{};
+    int columns = 0;
+    for (int i = 0; i < count; ++i) {
+        const auto &w = *weights[i];
+        if (w.dataType != fastllm::NVFP4_BLOCK_16 || !w.cudaData || w.IsRepacked || w.dims.size() != 2 ||
+            w.dims[1] != width || w.dims[0] <= 0 || !outputs[i]) return false;
+        args.weights[i] = static_cast<uint8_t *>(w.cudaData);
+        args.outputs[i] = outputs[i];
+        columns += args.columns[i] = w.dims[0];
+    }
+#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
+    if (bf16 && !(args.columns[0] % 16 || args.columns[1] % 16 || args.columns[2] % 16) &&
+        FastllmCudaRuntimeArch() >= 80) {
+        cudaFuncAttributes image{};
+        if (cudaFuncGetAttributes(&image, NVFP4SiblingWindowMma) == cudaSuccess && image.binaryVersion >= 80 &&
+            image.ptxVersion >= 80) {
+#if CUDART_VERSION >= 12000
+            if (count == 1 && TryNVFP4WindowSplitK(static_cast<const __nv_bfloat16 *>(input), args, rows, width))
+                return true;
+#endif
+            if (!fastllm::cuda_launch::Launch<NVFP4SiblingWindowMma>(dim3(columns / 16, rows / 8), 256, 0,
+                    cudaStreamPerThread, static_cast<const __nv_bfloat16 *>(input), args, width))
+                throw std::runtime_error("NVFP4 window MMA launch failed");
+            return true;
+        }
+    }
+#endif
+    auto run = [&](auto typed) {
+        using T = std::remove_const_t<std::remove_pointer_t<decltype(typed)>>;
+        return fastllm::cuda_launch::Launch<NVFP4SiblingGemv<T>>(dim3(columns, rows / 8), 64, 0,
+                                                                 cudaStreamPerThread, typed, args, width);
+    };
+    if (!(bf16 ? run(static_cast<const __nv_bfloat16 *>(input)) : run(static_cast<const half *>(input))))
+        throw std::runtime_error("NVFP4 sibling projection launch failed");
+    return true;
 }
 
 // Float-scale NVFP4 stores each 16-weight block as 8 packed bytes followed by one

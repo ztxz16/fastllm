@@ -162,7 +162,9 @@ template <class T> RoundPlan &roundPlan(int batch) {
     auto &plan = roundPlans[batch];
     if (!plan) {
         if (timelineCompatible(batch)) prepareWindowVerification(batch);
-        auto entry = std::make_unique<RoundPlan>(batch, c);
+        const bool nativeProjections = batch == 1 && !quantizedFold && singletonControllerPdl &&
+            std::is_same_v<T, __nv_bfloat16> && GetFastllmEnv().cudaGraph;
+        auto entry = std::make_unique<RoundPlan>(batch, c, nativeProjections);
         entry->draftPool.ShareStorage(roundScratch);
         entry->verifyPool.ShareStorage(roundScratch);
         if (GetFastllmEnv().cudaGraph && timelineCompatible(batch)) {

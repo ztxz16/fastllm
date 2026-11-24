@@ -60,3 +60,7 @@ bool FastllmCudaTryPackBFloat16Weights(const fastllm::Data &first,
 bool FastllmCudaBFloat16LinearPairFloat32(const fastllm::Data &input,
     const fastllm::Data &packed, int firstWidth, fastllm::Data &first,
     fastllm::Data &second, fastllm::Data &scratch);
+
+// Shared-input projections into separate row-major outputs. Unsupported layouts use standard Linear.
+bool FastllmCudaNVFP4SiblingProjections(const void *input, bool bf16, int rows, int width,
+                                        const fastllm::Data *const *weights, void *const *outputs, int count);

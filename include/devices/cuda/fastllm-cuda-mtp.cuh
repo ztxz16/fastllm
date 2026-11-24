@@ -123,6 +123,7 @@ bool FastllmCudaMtpVerifierResolve(void *plan, int *output, int *accepted);
 
 // Shared implementation between the normalization and rejection CUDA units.
 void *FastllmCudaMtpCreateTargetDistribution(int rows, int vocab);
+void FastllmCudaMtpBindProposalSupport(void *workspace, float *probs, int *ids, int steps);
 void FastllmCudaMtpDestroyTargetDistribution(void *distribution);
 bool FastllmCudaMtpPrepareTargetDistribution(void *distribution,
     const float *temperatures, const int *topKs, const float *topPs, bool *changed);
@@ -147,6 +148,10 @@ bool FastllmCudaMtpRejectionWithAccepted(float *logits, float *proposalProbs,
 
 // Fixed-address graph stages. Parameters and the live proposal count are device
 // inputs, so sampling settings and clipped tails do not change graph topology.
+bool FastllmCudaMtpGraphDrawMarkovFloat(void *workspace, const float *base, int baseStride, const float *adjust,
+                                       const float *bias, float cap, const float *temperature, int *topK,
+                                       const float *topP, uint64_t *rng, int step, float *q,
+                                       int qStride, int *tokens, int tokenStride);
 extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *workspace, const void *base, int baseStride, const void *adjust,
                                               const void *bias, float cap, bool bf16, const float *temperature,
                                               int *topK, const float *topP, uint64_t *rng, int step, float *q,
