@@ -28,6 +28,7 @@ enum class ExpertDevice { Cuda, Cpu, Numa };
 struct Placement {
     int gpu;
     std::vector<ExpertDevice> experts;
+    DataType denseType = BFLOAT16;
 };
 class Runtime {
 public:
@@ -53,6 +54,7 @@ public:
     Inkling2Model();
     ~Inkling2Model() override;
     void InitParams() override;
+    void SetDataType(DataType type) override;
     void SetKVCacheDataType(DataType type) override;
     void OnModelWeightsLoaded() override;
     void WarmUp() override;

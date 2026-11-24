@@ -16,6 +16,7 @@ int cudaId(const std::string &device) {
 } // namespace
 Inkling2Model::Inkling2Model() {
     model_type = model_struct = "inkling2_loop";
+    dataType = BFLOAT16;
     canDoBatchForward = true;
     // K and V are normalized per head. FP16 gives these bounded values
     // more mantissa precision at the same bandwidth as BF16.
@@ -40,6 +41,13 @@ long long Inkling2Model::GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int 
     const long long extraPages = (int64_t(d.block) - 1 + page - 1) / page;
     return (bounded * windowPages + (d.layers - bounded) * extraPages) * page * std::max(1, batch) * 4LL * d.kvHeads *
            d.dim;
+}
+
+void Inkling2Model::SetDataType(DataType type) {
+    if (type != DATA_AUTO_NONE && type != BFLOAT16 && type != FLOAT32)
+        throw std::runtime_error("Inkling activations support auto, bfloat16 and float32");
+    // Older GPUs use FP16 projections and keep the accumulated residual stream in FP32.
+    dataType = type != FLOAT32 && placement.denseType == BFLOAT16 ? BFLOAT16 : FLOAT32;
 }
 
 void Inkling2Model::SetKVCacheDataType(DataType type) {
@@ -177,6 +185,10 @@ void Inkling2Model::InitParams() {
             throw std::runtime_error("Inkling draft must include the final target normalization");
     }
     placement.gpu = cudaId(SelectDeviceFromMap(deviceMap, 1, 1));
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+    placement.denseType = inkling2::projectionType(placement.gpu);
+#endif
+    SetDataType(dataType);
     for (const auto &item : deviceMap)
         if (cudaId(item.first) != placement.gpu)
             throw std::runtime_error("Inkling currently supports one backbone GPU");
@@ -211,10 +223,7 @@ void Inkling2Model::InitParams() {
 std::map<std::string, std::vector<std::pair<std::string, DataType>>>
 Inkling2Model::GetTensorMap(const std::vector<std::string> &names) {
     std::map<std::string, std::vector<std::pair<std::string, DataType>>> result;
-    DataType denseType = BFLOAT16;
-#if defined(USE_CUDA) && !defined(USE_ROCM)
-    denseType = inkling2::projectionType(placement.gpu);
-#endif
+    const DataType denseType = placement.denseType;
     std::set<std::string> dense{"model.llm.unembed.weight"};
     for (const auto &group : weightMergeRules) {
         dense.insert(group.allInputs.begin(), group.allInputs.end());

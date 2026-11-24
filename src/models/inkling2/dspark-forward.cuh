@@ -27,7 +27,7 @@ template <class T> void foldDraftHead() {
 }
 
 void initDraft() {
-    if (projectionType(placement.gpu) == BFLOAT16)
+    if (placement.denseType == BFLOAT16)
         foldDraftHead<__nv_bfloat16>();
     else
         foldDraftHead<half>();

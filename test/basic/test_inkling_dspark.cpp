@@ -406,6 +406,10 @@ int main(int argc, char **argv) {
     if (cudaMalloc(&control, 8 * sizeof(int)) != cudaSuccess) return 1;
     configure(0);
     auto model = CreateLLMModelFromHF(argv[1], BFLOAT16);
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) return 1;
+    if (model->dataType != (major >= 8 ? BFLOAT16 : FLOAT32))
+        throw std::runtime_error("Unexpected default Inkling activation dtype");
     model->maxBatch = maxTestBatch;
     testVocab = std::stoi(model->weight.dicts.at("text_config.unpadded_vocab_size"));
     if (cudaMalloc(&savedScores, size_t(maxTestBatch) * 8 * testVocab * sizeof(float)) != cudaSuccess) return 1;

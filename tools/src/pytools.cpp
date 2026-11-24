@@ -864,7 +864,8 @@ extern "C" {
 #ifdef USE_ROCM
             model->SetDataType(fastllm::DataType::FLOAT32);
 #else
-            if (model->model_type == "laguna" ||
+            if (model->model_type == "inkling2_loop" ||
+                model->model_type == "laguna" ||
                 model->model_type == "kimi_k3" ||
                 model->model_type == "dots3_note" ||
                 model->model_type == "naive_n05_flash") {

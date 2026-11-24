@@ -17,15 +17,17 @@ namespace fastllm {
 namespace cuda_attn_res {
 // Fusion reference: vLLM's Inkling ops/attn_res.py (Apache-2.0).
 // https://github.com/vllm-project/vllm/blob/fc1443152c0eb655f5c2762f56b540bebe93b196/vllm/models/inkling2/nvidia/ops/attn_res.py
-// Sources are independent [tokens, width] FP32 matrices. The small list can
-// travel as a graph kernel argument; larger lists live on the device.
-struct Sources {
+// Sources are independent [tokens, width] matrices with a common storage type.
+// Small lists travel as graph kernel arguments; larger lists live on the device.
+template <class T> struct SourceList {
     static constexpr int Inline = 16;
-    const float *items[Inline]{};
-    const float *const *table = nullptr;
+    const T *items[Inline]{};
+    const T *const *table = nullptr;
 
-    __device__ const float *get(int index) const { return table ? table[index] : items[index]; }
+    __device__ const T *get(int index) const { return table ? table[index] : items[index]; }
 };
+using Sources = SourceList<float>;
+
 // Queries are unscaled. A null output norm returns the FP32 mixture directly.
 struct Query {
     const float *values = nullptr;
@@ -36,15 +38,21 @@ struct Queries {
     Query items[Inline]{};
 };
 
-static __global__ void StoreSources(const float **dst, Sources src, int n) {
+template <class T> static __global__ void StoreSources(const T **dst, SourceList<T> src, int n) {
     if (threadIdx.x < n)
         dst[threadIdx.x] = src.items[threadIdx.x];
 }
 
+template<class T> struct alignas(4 * sizeof(T)) Channels4 { T x, y, z, w; };
+template <class T> __device__ inline float4 LoadChannels4(const T *src, size_t i) {
+    const auto v = reinterpret_cast<const Channels4<T> *>(src)[i];
+    return make_float4(float(v.x), float(v.y), float(v.z), float(v.w));
+}
+
 // Split a row's warps across residual sources. Each source's two reductions
 // run in parallel. Only the first warp computes softmax and its value scales.
-template <bool Vectorized, class Round, class Out>
-__global__ void AttnResRows(FASTLLM_ROW_PARAMETER Sources sources, int count, FASTLLM_ROW_PARAMETER Queries queries, int nq, int rows, int width, float eps,
+template <bool Vectorized, class Round, class Out, class In>
+__global__ void AttnResRows(FASTLLM_ROW_PARAMETER SourceList<In> sources, int count, FASTLLM_ROW_PARAMETER Queries queries, int nq, int rows, int width, float eps,
                             bool normalizeValues, Out *output, float *staging) {
     constexpr int tile = Sources::Inline;
     const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
@@ -65,20 +73,21 @@ __global__ void AttnResRows(FASTLLM_ROW_PARAMETER Sources sources, int count, FA
     for (int first = 0; first < count; first += tile) {
         const int n = min(count - first, tile);
         for (int s = warp; s < n; s += 8) {
-            const float *x = sources.get(first + s) + offset;
+            const In *x = sources.get(first + s) + offset;
             float sq = 0.f, dot = 0.f;
             if (Vectorized &&
                 ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(query.values)) & 15) == 0) {
                 for (int j = lane; j < width / 4; j += 32) {
-                    float4 v = reinterpret_cast<const float4 *>(x)[j];
+                    float4 v = LoadChannels4(x, j);
                     float4 k = reinterpret_cast<const float4 *>(query.values)[j];
                     sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
                     dot += v.x * k.x + v.y * k.y + v.z * k.z + v.w * k.w;
                 }
             } else {
                 for (int j = lane; j < width; j += 32) {
-                    sq += x[j] * x[j];
-                    dot += x[j] * query.values[j];
+                    const float v = float(x[j]);
+                    sq += v * v;
+                    dot += v * query.values[j];
                 }
             }
             sq = cuda::WarpSum(sq);
@@ -111,7 +120,7 @@ __global__ void AttnResRows(FASTLLM_ROW_PARAMETER Sources sources, int count, FA
         for (int j = tid; j < width; j += blockDim.x) {
             float acc = first ? prior * buffer[j] : 0.f;
             for (int s = 0; s < n; ++s)
-                acc += coeff[s] * sources.get(first + s)[offset + j];
+                acc += coeff[s] * float(sources.get(first + s)[offset + j]);
             if (query.norm || first + n < count) buffer[j] = acc;
             else out[j] = Out(Round(acc));
             if (query.norm && first + n == count)
@@ -145,10 +154,8 @@ __device__ inline float RowRmsScale(float local, int width, float eps, float *wa
 // One CTA handles the entire row. Independent 128-lane reductions preserve
 // the original per-source dot and square-sum trees, in parallel. The mixed
 // channels remain in registers through the following RMSNorm.
-template<class T> struct alignas(4 * sizeof(T)) Channels4 { T x, y, z, w; };
-
-template <int Slots, class Round, class Out, int FixedWidth = 0, bool Preload = false>
-__global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER Sources sources, FASTLLM_ROW_PARAMETER Queries queries, int rows, int width,
+template <int Slots, class Round, class Out, int FixedWidth = 0, bool Preload = false, class In = float>
+__global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources, FASTLLM_ROW_PARAMETER Queries queries, int rows, int width,
                                     float eps, bool normalizeValues, Out *output, bool queryFirst) {
     constexpr int threads = 512, packs = 2;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
@@ -163,16 +170,16 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER Sources sources, FASTL
     if constexpr (Preload) {
 #pragma unroll
         for (int s = 0; s < Slots; ++s) {
-            const auto *x = reinterpret_cast<const float4 *>(sources.items[s]) + size_t(row) * cols;
+            const In *x = sources.items[s] + size_t(row) * width;
 #pragma unroll
             for (int i = 0; i < packs; ++i)
-                if (tid + i * threads < cols) values[s][i] = x[tid + i * threads];
+                if (tid + i * threads < cols) values[s][i] = LoadChannels4(x, tid + i * threads);
         }
     }
     __shared__ float2 partial[Slots][128], scores[Slots];
     __shared__ float normScratch[threads / 32];
     for (int s = tid / 128; s < Slots; s += threads / 128) {
-        const float *src = sources.items[s] + size_t(row) * width;
+        const In *src = sources.items[s] + size_t(row) * width;
         float sq = 0.f, dot = 0.f;
         if constexpr (FixedWidth) {
             // Independent loads can be issued ahead of the ordered FMA chains.
@@ -219,13 +226,13 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER Sources sources, FASTL
     if (normalizeValues && lane < Slots) weight *= scores[lane].y;
 #pragma unroll
     for (int s = 0; s < Slots; ++s) {
-        const float4 *x = reinterpret_cast<const float4 *>(sources.items[s]) + size_t(row) * cols;
+        const In *x = sources.items[s] + size_t(row) * width;
         const float w = __shfl_sync(0xffffffffu, weight, s);
 #pragma unroll
         for (int i = 0; i < packs; ++i) {
             if (tid + i * threads >= cols)
                 break;
-            float4 v = Preload ? values[s][i] : x[tid + i * threads];
+            float4 v = Preload ? values[s][i] : LoadChannels4(x, tid + i * threads);
             acc[i].x += w * v.x;
             acc[i].y += w * v.y;
             acc[i].z += w * v.z;
@@ -266,8 +273,8 @@ inline bool NeedsStaging(int count, const Query *queries, int nq, int width) {
         std::any_of(queries, queries + nq, [](const Query &q) { return q.norm != nullptr; }));
 }
 
-template <class Round = float, class Out = float>
-inline void Launch(Sources sources, int count, const Query *queries, int nq, int rows, int width, float eps,
+template <class Round = float, class Out = float, class In>
+inline void Launch(SourceList<In> sources, int count, const Query *queries, int nq, int rows, int width, float eps,
                    bool normalizeValues, Out *out, cudaStream_t stream, float *staging = nullptr) {
     if constexpr (!std::is_same_v<Out, float>) {
         if (!staging && NeedsStaging<Out>(count, queries, nq, width))
@@ -301,9 +308,9 @@ inline void Launch(Sources sources, int count, const Query *queries, int nq, int
                     // Single-token latency benefits from preloading across
                     // scoring rounds. Multi-token tiles keep their occupancy.
                     if constexpr (w && nsrc > 4) {
-                        if (rows == 1) return AttnResRegisterRows<nsrc, Round, Out, w, true>;
+                        if (rows == 1) return AttnResRegisterRows<nsrc, Round, Out, w, true, In>;
                     }
-                    return AttnResRegisterRows<nsrc, Round, Out, w>;
+                    return AttnResRegisterRows<nsrc, Round, Out, w, false, In>;
                 };
                 switch (count) {
                     case 1: return select(std::integral_constant<int, 1>{});
@@ -323,7 +330,7 @@ inline void Launch(Sources sources, int count, const Query *queries, int nq, int
             const dim3 grid = queryFirst ? dim3(n, rows) : dim3(rows, n);
             kernel<<<grid, 512, 0, stream>>>(sources, group, rows, width, eps, normalizeValues, dst, queryFirst);
         } else {
-            const auto kernel = width % 4 ? AttnResRows<false, Round, Out> : AttnResRows<true, Round, Out>;
+            const auto kernel = width % 4 ? AttnResRows<false, Round, Out, In> : AttnResRows<true, Round, Out, In>;
             kernel<<<rows * n, 256, scratch, stream>>>(sources, count, group, n, rows, width, eps, normalizeValues,
                 dst, staging ? staging + size_t(first) * rows * width : nullptr);
         }

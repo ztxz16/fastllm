@@ -138,8 +138,8 @@ __global__ void unpackProjection(const T *src, U *dst, ProjectionParts parts, in
 
 #include "loop-controller.cuh"
 
-template <class T> __global__ void conv(const T *x, const float *history, const float *weight, const float *dynamic,
-                     float *out, int n, int width, int taps, int heads, const float *residual) {
+template <class T, class Residual> __global__ void conv(const T *x, const float *history, const float *weight, const float *dynamic,
+                     Residual *out, int n, int width, int taps, int heads, const Residual *residual) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * width)
         return;
@@ -153,7 +153,7 @@ template <class T> __global__ void conv(const T *x, const float *history, const 
         v += a * w;
     }
     float y = v * rsqrtf(1.0f + taps * (dynamic ? 2 : 1));
-    out[i] = residual ? __fadd_rn(y, residual[i]) : y;
+    out[i] = residual ? __fadd_rn(y, float(residual[i])) : y;
 }
 #include "paged-kv.cuh"
 #include "attention.cuh"
@@ -183,8 +183,8 @@ template <bool Timeline = false, typename T, typename U> __device__ float update
     }
     return v * rsqrtf(1.0f + taps * (dynamic ? 2 : 1));
 }
-template <bool Timeline = false, typename T> __global__ void decodeConv(const T *input, const DecodeVisit *visit, int index, const float *weight,
-                           const float *dynamic, float *output, int d, int taps, int heads, const float *residual, int chain = 1) {
+template <bool Timeline = false, typename T, typename Residual> __global__ void decodeConv(const T *input, const DecodeVisit *visit, int index, const float *weight,
+                           const float *dynamic, Residual *output, int d, int taps, int heads, const Residual *residual, int chain = 1) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= d)
         return;
@@ -195,7 +195,7 @@ template <bool Timeline = false, typename T> __global__ void decodeConv(const T 
     output += offset;
     float y = updateConvChannel<Timeline>(input + offset, visit + row, index, weight, dynamic, d, taps, heads, c,
                                          row % chain, d);
-    output[c] = residual ? __fadd_rn(y, residual[c]) : y;
+    output[c] = residual ? __fadd_rn(y, float(residual[c])) : y;
 }
 template<class T> __global__ void storeDecodeKv(const DecodeVisit *visit, const T *key, const T *value, int width) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -206,15 +206,15 @@ template<class T> __global__ void storeDecodeKv(const DecodeVisit *visit, const 
     }
 }
 #include "attention-input.cuh"
-template <class T>
-Matrix convolution(const Rows<T> &x, const float *w, const Matrix &dyn, int heads, int taps, Matrix &hist, const float *residual) {
+template <class T, class Residual>
+Rows<Residual> convolution(const Rows<T> &x, const float *w, const Matrix &dyn, int heads, int taps, Matrix &hist, const Residual *residual) {
     const int count = taps - 1, d = x.cols;
     if (!hist.p) {
         hist = Matrix(count, d);
         if (count)
             check(cudaMemsetAsync(hist.p, 0, size_t(count) * d * sizeof(float), cudaStreamPerThread));
     }
-    auto out = Matrix::temporary(x.rows, d);
+    auto out = Rows<Residual>::temporary(x.rows, d);
     conv<<<(x.rows * d + 255) / 256, 256, 0, cudaStreamPerThread>>>(x.p, hist.p, w, dyn.p, out.p, x.rows, d,
                                                                     taps, heads, residual);
     if (count) {
@@ -251,11 +251,12 @@ Matrix resizeHeads(const Matrix &input, int from, int to) {
     return out;
 }
 using cuda_attn_res::Query;
-template <class Round = float, class Out = float> Rows<Out> mix(const std::vector<Matrix> &states, const Matrix &last, const Query *queries, int nq,
+template <class Round = float, class Out = float, class In>
+Rows<Out> mix(const std::vector<Rows<In>> &states, const Rows<In> &last, const Query *queries, int nq,
            float eps, bool normalizeValues) {
-    using cuda_attn_res::Sources;
+    using Sources = cuda_attn_res::SourceList<In>;
     int count = int(states.size()) + 1;
-    Buffer<const float *> table(count > Sources::Inline ? count : 0);
+    Buffer<const In *> table(count > Sources::Inline ? count : 0);
     Sources sources{};
     for (int first = 0; first < count; first += Sources::Inline) {
         int n = std::min(Sources::Inline, count - first);
@@ -328,24 +329,24 @@ struct Segment {
     Verification *verify = nullptr;
     const DecodeVisit *timeline = nullptr;
 };
-template <typename T> Matrix convolutions(const Rows<T> &input, const float *weight, const Matrix &dynamic, int heads, int taps,
-                    const std::vector<Segment> &batch, size_t slot, int index, const Matrix &residual = {}) {
+template <typename Residual = float, typename T> Rows<Residual> convolutions(const Rows<T> &input, const float *weight, const Matrix &dynamic, int heads, int taps,
+                    const std::vector<Segment> &batch, size_t slot, int index, const Rows<Residual> &residual = {}) {
     if (batch.front().timeline) {
-        Matrix out(input.rows, input.cols);
+        Rows<Residual> out(input.rows, input.cols);
         const auto *visits = batch.front().timeline + slot * input.rows;
         decodeConv<true><<<dim3((input.cols + 255) / 256, input.rows), 256, 0, cudaStreamPerThread>>>(
             input.p, visits, index, weight, dynamic.p, out.p, input.cols, taps, heads, residual.p, batch.front().length);
         return out;
     }
     if (batch.front().decode) {
-        Matrix out(1, input.cols);
+        Rows<Residual> out(1, input.cols);
         decodeConv<<<(input.cols + 255) / 256, 256, 0, cudaStreamPerThread>>>(
             input.p, batch.front().decode + slot, index, weight, dynamic.p, out.p, input.cols, taps, heads, residual.p);
         return out;
     }
-    Matrix result;
+    Rows<Residual> result;
     if (batch.size() > 1)
-        result = Matrix(input.rows, input.cols);
+        result = Rows<Residual>(input.rows, input.cols);
     for (const auto &seq : batch) {
         auto rows = input.slice(seq.offset, seq.length);
         auto dyn = dynamic.p ? dynamic.slice(seq.offset, seq.length) : Matrix{};
@@ -356,7 +357,7 @@ template <typename T> Matrix convolutions(const Rows<T> &input, const float *wei
         if (batch.size() == 1)
             return y;
         check(cudaMemcpyAsync(result.p + size_t(seq.offset) * input.cols, y.p,
-                              size_t(seq.length) * input.cols * sizeof(float), cudaMemcpyDeviceToDevice,
+                              size_t(seq.length) * input.cols * sizeof(Residual), cudaMemcpyDeviceToDevice,
                               cudaStreamPerThread));
     }
     return result;
@@ -369,7 +370,7 @@ class Decoder final : public Runtime {
     Placement placement;
     basellm &model;
     WeightMap &weights;
-    DataType kvType = DATA_AUTO_NONE;
+    DataType kvType = DATA_AUTO_NONE, residualType = DATA_AUTO_NONE;
     ExpertLayers experts;
     std::mutex mutex;
     std::mutex prefixMutex;
@@ -868,7 +869,7 @@ class Decoder final : public Runtime {
 
     // The previous pass's sources stay fixed throughout the next core pass.
     // Compute consecutive layers' independent controller messages together.
-    Matrix crossPassMessages(const std::vector<Matrix> &bank, const Matrix &previous, int first, int layers) {
+    template <class R> Matrix crossPassMessages(const std::vector<Rows<R>> &bank, const Rows<R> &previous, int first, int layers) {
         const int h = c.hidden, count = 2 * (c.end - c.start) * h;
         const int offset = 2 * (first - c.start) * h;
         const float *main = param("middle_cycle_cross_pass_queries", count) + offset;
@@ -885,7 +886,7 @@ class Decoder final : public Runtime {
         return mix(bank, previous, queries.data(), 4 * layers, c.eps, true);
     }
 
-    template <typename T> Matrix layer(const Matrix &x, std::vector<Matrix> &blocks, const Matrix &messages,
+    template <typename T, class R> Rows<R> layer(const Rows<R> &x, std::vector<Rows<R>> &blocks, const Matrix &messages,
                  int physical, const std::vector<Segment> &batch, size_t slot, ExpertPhase phase) {
         const std::string pre = "layers." + std::to_string(physical) + ".", att = pre + "attn.";
         bool local = c.local[physical];
@@ -901,11 +902,11 @@ class Decoder final : public Runtime {
         }
         std::array<Rows<T>, 3> inputs;
         if (messages.p) {
-            Matrix dest = aq ? mix(blocks, x, queries, nq, c.eps, c.normValues) : x;
+            Matrix dest = aq ? mix(blocks, x, queries, nq, c.eps, c.normValues) : castRows<float>(x);
             Matrix streams[3];
             for (int i = 0; i < 3; ++i) {
                 const int stream = local ? 0 : i;
-                streams[i] = aq ? dest.slice(stream * x.rows, x.rows) : x;
+                streams[i] = dest.slice(aq ? stream * x.rows : 0, x.rows);
                 norms[i] = norms[stream];
             }
             auto blended = control<T, T>(streams, messages, norms, 3, pre);
@@ -914,8 +915,9 @@ class Decoder final : public Runtime {
             auto dest = mix<T, T>(blocks, x, queries, nq, c.eps, c.normValues);
             for (int i = 0; i < 3; ++i) inputs[i] = dest.slice((local ? 0 : i) * x.rows, x.rows);
         } else {
+            const auto wide = castRows<float>(x);
             for (int i = 0; i < 3; ++i)
-                inputs[i] = local && i ? inputs[0] : castRows<T>(norm(x, norms[i], c.eps));
+                inputs[i] = local && i ? inputs[0] : castRows<T>(norm(wide, norms[i], c.eps));
         }
         Rows<T> attended;
         if (kvType == FLOAT16) attended = attend<half, T>(inputs, att, local, batch, slot);
@@ -924,7 +926,7 @@ class Decoder final : public Runtime {
         const bool newBlock = physical % c.residualBlock == 0;
         auto residual =
             convolutions(linear(attended, att + "wo_ud.weight", h, 1, attentionProjection(batch)), param(pre + "attn_sconv.weight", h * c.conv),
-                         {}, 1, c.conv, batch, slot, 2, newBlock ? Matrix{} : x);
+                         {}, 1, c.conv, batch, slot, 2, newBlock ? Rows<R>{} : x);
         if (newBlock)
             blocks.push_back(x);
         const float *mlpNorm = param(pre + "mlp_norm.weight", h);
@@ -951,19 +953,26 @@ class Decoder final : public Runtime {
                 return !s.timeline && !s.verify && !s.decode && s.request && s.request->length < s.request->promptLength;
             })) {
             // Size for saved residuals/draft taps, live layer projections, and a relative attention tile.
-            const size_t savedRows = c.visits.size() / c.residualBlock + (features ? c.draft.taps.size() : 0);
             const size_t hiddenBytes = size_t(n) * c.hidden * sizeof(float);
+            const size_t residualBytes = residualType == BFLOAT16 ? hiddenBytes / 2 : hiddenBytes;
+            const size_t savedBytes = c.visits.size() / c.residualBlock * residualBytes;
+            const size_t liveBytes = (12 + (features ? c.draft.taps.size() : 0)) * hiddenBytes;
             const size_t biasBytes = size_t(std::min(n, 512)) * c.heads * c.extent * sizeof(float);
-            auto arena = experts.cache->borrowPrefillWorkspace(hiddenBytes * (savedRows + 12) + biasBytes, c.topK);
+            auto arena = experts.cache->borrowPrefillWorkspace(savedBytes + liveBytes + biasBytes, c.topK);
             if (arena) workspace.emplace(std::move(arena));
         }
-        if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16)
-            targetTyped<half>(ids, n, batch, logits, features);
-        else
-            targetTyped<__nv_bfloat16>(ids, n, batch, logits, features);
+        const auto run = [&](auto projection) {
+            using T = decltype(projection);
+            if (residualType == BFLOAT16)
+                targetTyped<T, __nv_bfloat16>(ids, n, batch, logits, features);
+            else
+                targetTyped<T, float>(ids, n, batch, logits, features);
+        };
+        if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16) run(half{});
+        else run(__nv_bfloat16{});
     }
 
-    template <typename T> void targetTyped(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits, std::vector<Matrix> *features) {
+    template <typename T, typename R> void targetTyped(float *ids, int n, const std::vector<Segment> &batch, Matrix &logits, std::vector<Matrix> *features) {
         // Incremental verification must use the same arithmetic as ordinary one-token decode.
         // Fresh prompt chunks retain their tensor-core prefill kernels.
         struct Restore { bool &mode; ~Restore() { mode = false; } } restore{decodeArithmetic};
@@ -979,13 +988,15 @@ class Decoder final : public Runtime {
         auto *cacheCycle = phase == ExpertPhase::Prefill || DecodeGraphScratch::active ? nullptr : experts.cache.get();
         if (cacheCycle) cacheCycle->beginStep();
         int h = c.hidden;
-        auto x = Matrix::temporary(n, h);
-        Data tokens(FLOAT32, {n}, CUDA, ids), result(FLOAT32, {n, h}, CUDA, x.p);
+        auto embedding = Matrix::temporary(n, h);
+        Data tokens(FLOAT32, {n}, CUDA, ids), result(FLOAT32, {n, h}, CUDA, embedding.p);
         FastllmCudaEmbeddingDirect(tokens, weight("embed.weight"), result);
-        x = norm(x, param("embed_norm.weight", h), c.eps);
-        Matrix prelude, previous, messageTile;
+        auto x = castRows<R>(norm(embedding, param("embed_norm.weight", h), c.eps));
+        embedding = {};
+        Rows<R> prelude, previous;
+        Matrix messageTile;
         int firstMessage = 0, endMessage = 0;
-        std::vector<Matrix> blocks, preludeBlocks, bank;
+        std::vector<Rows<R>> blocks, preludeBlocks, bank;
         for (size_t slot = 0; slot < c.visits.size(); ++slot) {
             int i = c.visits[slot];
             if (i == c.start) {
@@ -1019,7 +1030,7 @@ class Decoder final : public Runtime {
                 messages = messageTile.slice(4 * (i - firstMessage) * n, 4 * n);
             }
             if (features && std::binary_search(c.draft.taps.begin(), c.draft.taps.end(), int(slot)))
-                features->push_back(x);
+                features->push_back(castRows<float>(x));
             x = layer<T>(x, blocks, messages, i, batch, slot, phase);
         }
         if (cacheCycle) cacheCycle->endStep();
@@ -1123,9 +1134,12 @@ class Decoder final : public Runtime {
         if (kvType != DATA_AUTO_NONE) {
             if (kvType != model.kvCacheDataType)
                 throw std::runtime_error("Inkling KV dtype changed after the cache was initialized");
+            if (residualType != model.dataType)
+                throw std::runtime_error("Inkling residual dtype changed after the cache was initialized");
             return;
         }
         kvType = model.kvCacheDataType;
+        residualType = model.dataType;
         if (GetFastllmEnv().cudaGraph) graphSample = Buffer<int>(1);
         if (model.SupportsDecodePipeline()) {
             try {
@@ -1355,7 +1369,7 @@ class Decoder final : public Runtime {
         check(cudaSetDevice(placement.gpu));
         initializeKV();
         if (c.draft.steps) {
-            const bool bf16 = projectionType(placement.gpu) == BFLOAT16;
+            const bool bf16 = placement.denseType == BFLOAT16;
             for (int b = std::max(1, model.maxBatch); b >= 1; --b) {
                 if (bf16)
                     roundPlan<__nv_bfloat16>(b);

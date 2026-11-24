@@ -41,6 +41,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model")
     parser.add_argument("--experts", choices=["cuda:0", "cpu", "numa"], required=True)
+    parser.add_argument("--atype", choices=["auto", "float32", "bfloat16"])
     parser.add_argument("--window", action="store_true", help="Also exercise the 1024-token KV wrap")
     parser.add_argument("--graph", action="store_true", help="Enable CUDA graphs for device-resident stages")
     parser.add_argument("--expert-cache-mib", type=int, default=0, help="CUDA expert-cache budget for CPU/NUMA placement")
@@ -55,6 +56,8 @@ def main():
     llm.set_device_map({args.experts: 1}, is_moe=True)
     llm.set_max_tokens(4096)
     model = llm.model(args.model, dtype="bfloat16", tokenizer_type="fastllm")
+    if args.atype is not None:
+        model.set_atype(args.atype)
     model.set_max_batch(2)
     tokenizer = Tokenizer.from_file(args.model + "/tokenizer.json")
     vocab = model.config["text_config"]["unpadded_vocab_size"]

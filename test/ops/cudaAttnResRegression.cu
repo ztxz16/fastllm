@@ -23,8 +23,8 @@ template <class T> struct Device {
 
 // The controller may request a rounded FP32 row for the router or a
 // physically narrow row for Linear. Compare both with an explicit cast.
-template<class T>
-static void checkOutputTypes(Sources sources, int ns, const Query *queries, int nq, int rows, int width,
+template<class T, class In>
+static void checkOutputTypes(SourceList<In> sources, int ns, const Query *queries, int nq, int rows, int width,
                              float eps, bool normalized, const std::vector<float> &reference) {
     const size_t n = reference.size();
     Device<T> narrow(n);
@@ -45,6 +45,7 @@ static void checkOutputTypes(Sources sources, int ns, const Query *queries, int 
     }
 }
 
+template <class In = float>
 static double compare(int rows, int width, int ns, int nq, bool normalized, bool unaligned) {
     constexpr float eps = 1.e-6f;
     const size_t stride = size_t(rows) * width, skip = unaligned;
@@ -63,20 +64,23 @@ static double compare(int rows, int width, int ns, int nq, bool normalized, bool
     for (int j = 0; j < width; ++j)
         q[skip + j] *= 75.f;
 
-    Device<float> dx(x.size()), dq(q.size()), dw(norm.size()), dy(nq * stride);
-    check(cudaMemcpy(dx.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice));
+    std::vector<In> stored(x.begin(), x.end());
+    std::copy(stored.begin(), stored.end(), x.begin()); // Compare to FP64 on the values actually stored.
+    Device<In> dx(stored.size());
+    Device<float> dq(q.size()), dw(norm.size()), dy(nq * stride);
+    check(cudaMemcpy(dx.p, stored.data(), stored.size() * sizeof(In), cudaMemcpyHostToDevice));
     check(cudaMemcpy(dq.p, q.data(), q.size() * 4, cudaMemcpyHostToDevice));
     check(cudaMemcpy(dw.p, norm.data(), norm.size() * 4, cudaMemcpyHostToDevice));
-    Sources sources{};
-    std::vector<const float *> pointers(ns);
-    Device<const float *> table(ns);
+    SourceList<In> sources{};
+    std::vector<const In *> pointers(ns);
+    Device<const In *> table(ns);
     for (int s = 0; s < ns; ++s) {
         pointers[s] = dx.p + skip + s * stride;
         if (s < Sources::Inline)
             sources.items[s] = pointers[s];
     }
     if (ns > Sources::Inline) {
-        check(cudaMemcpy(table.p, pointers.data(), ns * sizeof(float *), cudaMemcpyHostToDevice));
+        check(cudaMemcpy(table.p, pointers.data(), ns * sizeof(const In *), cudaMemcpyHostToDevice));
         sources.table = table.p;
     }
     std::vector<Query> queries(nq);
@@ -164,6 +168,13 @@ int main() {
                 worst = std::max(worst, compare(shape[0], shape[1], shape[2], shape[3], norm, shape[4]));
                 ++cases;
             }
+        for (bool norm : {false, true}) {
+            // Exercise packed loads, scalar tails, and the external pointer table on BF16 residuals.
+            worst = std::max(worst, compare<__nv_bfloat16>(4, 2304, 5, 3, norm, false));
+            worst = std::max(worst, compare<__nv_bfloat16>(2, 259, 3, 2, norm, true));
+            worst = std::max(worst, compare<__nv_bfloat16>(3, 256, 19, 6, norm, false));
+            cases += 3;
+        }
         std::printf("%d shapes/modes, CUDA graph replay, worst relative L2 %.9g\n", cases, worst);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s\n", e.what());
