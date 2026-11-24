@@ -138,7 +138,7 @@ __global__ void unpackProjection(const T *src, U *dst, ProjectionParts parts, in
 
 #include "loop-controller.cuh"
 
-__global__ void conv(const float *x, const float *history, const float *weight, const float *dynamic,
+template <class T> __global__ void conv(const T *x, const float *history, const float *weight, const float *dynamic,
                      float *out, int n, int width, int taps, int heads, const float *residual) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * width)
@@ -147,7 +147,7 @@ __global__ void conv(const float *x, const float *history, const float *weight, 
     float v = x[i];
     for (int t = 0; t < taps; ++t) {
         int r = row - t;
-        float a = r < 0 ? history[(taps - 1 + r) * width + c] : x[r * width + c];
+        float a = r < 0 ? history[(taps - 1 + r) * width + c] : float(x[r * width + c]);
         float w = dynamic ? weight[t * width + c] + dynamic[(row * heads + c / (width / heads)) * taps + t]
                           : weight[c * taps + taps - 1 - t];
         v += a * w;
@@ -206,7 +206,8 @@ template<class T> __global__ void storeDecodeKv(const DecodeVisit *visit, const 
     }
 }
 #include "attention-input.cuh"
-Matrix convolution(const Matrix &x, const float *w, const Matrix &dyn, int heads, int taps, Matrix &hist, const float *residual) {
+template <class T>
+Matrix convolution(const Rows<T> &x, const float *w, const Matrix &dyn, int heads, int taps, Matrix &hist, const float *residual) {
     const int count = taps - 1, d = x.cols;
     if (!hist.p) {
         hist = Matrix(count, d);
@@ -222,9 +223,13 @@ Matrix convolution(const Matrix &x, const float *w, const Matrix &dyn, int heads
         if (keep)
             check(cudaMemcpyAsync(next.p, hist.p + size_t(x.rows) * d, size_t(keep) * d * sizeof(float),
                                   cudaMemcpyDeviceToDevice, cudaStreamPerThread));
-        check(cudaMemcpyAsync(next.p + size_t(keep) * d, x.p + size_t(std::max(0, x.rows - count)) * d,
-                              size_t(count - keep) * d * sizeof(float), cudaMemcpyDeviceToDevice,
-                              cudaStreamPerThread));
+        const auto *tail = x.p + size_t(std::max(0, x.rows - count)) * d;
+        auto *dst = next.p + size_t(keep) * d;
+        const size_t elements = size_t(count - keep) * d;
+        if constexpr (std::is_same_v<T, float>)
+            check(cudaMemcpyAsync(dst, tail, elements * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        else
+            castProjection<<<(elements + 255) / 256, 256, 0, cudaStreamPerThread>>>(tail, dst, elements);
         hist = std::move(next);
     }
     return out;
@@ -338,21 +343,20 @@ template <typename T> Matrix convolutions(const Rows<T> &input, const float *wei
             input.p, batch.front().decode + slot, index, weight, dynamic.p, out.p, input.cols, taps, heads, residual.p);
         return out;
     }
-    const auto x = castRows<float>(input);
     Matrix result;
     if (batch.size() > 1)
-        result = Matrix(x.rows, x.cols);
+        result = Matrix(input.rows, input.cols);
     for (const auto &seq : batch) {
-        auto rows = x.slice(seq.offset, seq.length);
+        auto rows = input.slice(seq.offset, seq.length);
         auto dyn = dynamic.p ? dynamic.slice(seq.offset, seq.length) : Matrix{};
         auto &history = seq.request->visits[slot].convState[index];
         if (seq.verify) seq.verify->history(history, history, rows, rows.p, rows.cols, rows.cols, rows.rows, taps-1);
         auto y = convolution(rows, weight, dyn, heads, taps, history,
-                             residual.p ? residual.p + size_t(seq.offset) * x.cols : nullptr);
+                             residual.p ? residual.p + size_t(seq.offset) * input.cols : nullptr);
         if (batch.size() == 1)
             return y;
-        check(cudaMemcpyAsync(result.p + size_t(seq.offset) * x.cols, y.p,
-                              size_t(seq.length) * x.cols * sizeof(float), cudaMemcpyDeviceToDevice,
+        check(cudaMemcpyAsync(result.p + size_t(seq.offset) * input.cols, y.p,
+                              size_t(seq.length) * input.cols * sizeof(float), cudaMemcpyDeviceToDevice,
                               cudaStreamPerThread));
     }
     return result;
@@ -1019,6 +1023,12 @@ class Decoder final : public Runtime {
             x = layer<T>(x, blocks, messages, i, batch, slot, phase);
         }
         if (cacheCycle) cacheCycle->endStep();
+        if (!features && !logits.p) return;
+        // Ordinary single-request prefill only consumes the final row in the vocabulary head.
+        if (!features && n > 1 && batch.size() == 1 && !batch.front().verify && !batch.front().timeline) {
+            x = x.slice(n - 1, 1);
+            for (auto &block : blocks) block = block.slice(n - 1, 1);
+        }
         Query outputQuery{param("attn_res.output_query", h), param("norm.weight", h)};
         auto output = mix(blocks, x, &outputQuery, 1, c.eps, c.normValues);
         if (features) features->push_back(output);
@@ -1026,7 +1036,7 @@ class Decoder final : public Runtime {
         Matrix last;
         if (batch.front().verify || batch.front().timeline) last = output;
         else if (batch.size() == 1)
-            last = output.slice(n - 1, 1);
+            last = output.slice(output.rows - 1, 1);
         else {
             last = Matrix(batch.size(), h);
             for (size_t b = 0; b < batch.size(); ++b) {
