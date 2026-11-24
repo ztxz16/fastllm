@@ -312,6 +312,15 @@ struct NaiveN05FlashModel::GpuPDReceive : PDReceiveState {
     int length;
     bool received = false, committed = false;
 
+    void Recycle() override {
+        // Commit transfers the draft to the live request. Only an abandoned
+        // receive still owns it here, and all transport writes have finished.
+        if (!draft) return;
+        std::lock_guard<std::mutex> guard(model.historyMutex);
+        if (model.idleDraftContexts.size() < size_t(model.maxBatch > 0 ? model.maxBatch : 512))
+            model.idleDraftContexts.push_back(std::move(draft));
+    }
+
     GpuPDReceive(NaiveN05FlashModel &m, ResponseContext &context)
         : model(m), devices(m.PDRequestDevices(context)), length(context.PDTransferLength()) {
         RestorePDDevice restoreDevice;

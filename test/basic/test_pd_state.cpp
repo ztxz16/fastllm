@@ -129,6 +129,67 @@ static void TestAlternateLayout() {
     consumer.StopPD(); producer.StopPD();
 }
 
+// Drop the request while a real FastKV worker still holds its receive target.
+// Its last transport reference must never run a GPU-owning destructor.
+static void TestPDReceiveRetirement() {
+    struct Decode : StateModel {
+        std::promise<void> entered, resume;
+        std::promise<std::thread::id> destroyed;
+        bool recycled = false;
+        ~Decode() override { ShutdownRuntime(); }
+        struct Receive : PDReceiveState {
+            Decode &model;
+            explicit Receive(Decode &m) : model(m) {}
+            ~Receive() override { model.destroyed.set_value(std::this_thread::get_id()); }
+            std::vector<std::vector<fastkv::Buffer>> Targets(const fastkv::Bytes &,
+                    const std::vector<size_t> &sizes) override {
+                model.entered.set_value();
+                Check(model.resume.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready,
+                      "timed out waiting for receive cancellation");
+                std::vector<std::vector<fastkv::Buffer>> buffers;
+                for (auto size : sizes) buffers.push_back({fastkv::Buffer::Allocate(size)});
+                return buffers;
+            }
+            void Commit(ResponseContext &) override { throw std::logic_error("committed cancelled receive"); }
+            void Recycle() override { model.recycled = true; }
+        };
+        std::shared_ptr<PDReceiveState> PreparePDReceive(ResponseContext &) override {
+            return std::make_shared<Receive>(*this);
+        }
+    };
+    StateModel prefill;
+    Decode decode;
+    fastkv::Service port;
+    port.Start("127.0.0.1:0", [](const fastkv::Message &m) { return m; });
+    auto endpoint = port.Address();
+    port.Stop();
+    prefill.ConfigurePD(json11::Json::object{{"role","prefill"},{"model_id","retire"},
+        {"transport","tcp"},{"listen",endpoint}});
+    decode.ConfigurePD(json11::Json::object{{"role","decode"},{"model_id","retire"},
+        {"transport","tcp"},{"prefill",json11::Json::array{endpoint}}});
+    auto entered = decode.entered.get_future();
+    auto destroyed = decode.destroyed.get_future();
+    ResponseContext ctx;
+    ctx.Init(1, FLOAT32, FLOAT32);
+    ctx.allTokens = {3,7,11}; ctx.inputTokens = ctx.allTokens.size();
+    decode.BeginPD(&ctx);
+    for (int i = 0; i < 3000 && entered.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready; ++i)
+        decode.PollPD(&ctx);
+    Check(entered.wait_for(std::chrono::seconds(0)) == std::future_status::ready, "receive callback did not start");
+    ctx.pdPending.reset();
+    decode.PollPD(&ctx);
+    Check(!decode.recycled && destroyed.wait_for(std::chrono::seconds(0)) != std::future_status::ready,
+          "recycled receive during transport");
+    decode.resume.set_value();
+    for (int i = 0; i < 3000 && destroyed.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready; ++i)
+        decode.PollPD(&ctx);
+    Check(destroyed.wait_for(std::chrono::seconds(0)) == std::future_status::ready,
+          "cancelled receive was retained after transfer");
+    Check(destroyed.get() == std::this_thread::get_id(), "receive destructor ran outside the model lane");
+    Check(decode.recycled, "cancelled receive storage was not recycled");
+    decode.StopPD(); prefill.StopPD();
+}
+
 // Opt-in: this test deliberately fills one GPU. It uses the production PD
 // allocator to recover idle engine memory that raw FastKV CUDA cannot reclaim.
 static void TestGPUAllocatorPressure() {
@@ -1665,6 +1726,7 @@ int main(int argc, char **argv) {
         TestPDPrefillLookahead(2);
         TestPDPrefillLookahead(2, false);
         TestAdmissionLifetime();
+        TestPDReceiveRetirement();
         CheckLegacySessionPeer();
         CheckLegacySessionPeer(true);
         // Packed FP4 rows include E4M3 scales. Transfer all stored bytes

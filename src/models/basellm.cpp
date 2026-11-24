@@ -2423,6 +2423,7 @@ namespace fastllm {
             // Pair the shutdown check with the condition variable's lock so
             // its notification cannot be lost before an idle wait.
             if (model->isFree) break;
+            const bool pendingReceivers = model->ReapPDReceivers();
             if (model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens, &lastRecordTime)) continue;
             auto &forwardLocker = model->forwardLocker;
 
@@ -3151,7 +3152,7 @@ namespace fastllm {
             }
 
             if (seqLens.size() == 0) {
-                if (!orders.empty() || pendingPD) {
+                if (!orders.empty() || pendingPD || pendingReceivers) {
                     model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                 } else {
                     model->dictCV.wait(dictLocker);
@@ -3554,6 +3555,7 @@ namespace fastllm {
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
                         if (trace) trace->Mark("dict_lock_ms");
                         if (model->isFree) break;
+                        const bool pendingReceivers = model->ReapPDReceivers();
                         const bool tryPipeline = !replanEager;
                         replanEager = false;
                         if (tryPipeline && model->RunDecodePipeline(dictLocker, maxBatch, maxTotalLens, &genTokens, &lastRecordTime)) continue;
@@ -4471,7 +4473,7 @@ namespace fastllm {
                                         return entry.second->isEnding && allocatedTokens(
                                             entry.second->pastKeyValues[model->kvCacheId].first) > 0;
                                     })) {
-                                if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                                if (!waitingPD.empty() || pendingReceivers) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                                 else model->dictCV.wait(dictLocker);
                                 continue;
                             }
@@ -4501,7 +4503,7 @@ namespace fastllm {
                         if (trace) trace->Mark("cleanup_ms");
 
                         if (seqLens.size() == 0) {
-                            if (!waitingPD.empty()) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
+                            if (!waitingPD.empty() || pendingReceivers) model->dictCV.wait_for(dictLocker, std::chrono::milliseconds(10));
                             else model->dictCV.wait(dictLocker);
                         }
                     }

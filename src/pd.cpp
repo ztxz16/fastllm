@@ -563,6 +563,9 @@ struct PDRuntime {
         std::chrono::steady_clock::time_point queued = std::chrono::steady_clock::now();
     };
     std::unique_ptr<fastkv::Service> service;
+    // Keep the last owner on the model lane. A cancelled receive may outlive
+    // its request while FastKV finishes DMA or destroys the exchange.
+    std::vector<std::shared_ptr<PDReceiveState>> receivers;
     std::unique_ptr<fastkv::Service> probes;
     std::unique_ptr<fastkv::PrefillRouter> router;
     std::unique_ptr<fastkv::SessionDirectory> sessions;
@@ -1951,6 +1954,8 @@ void basellm::StopPD() {
         pdRuntime->StopPrefill();
         if (pdRuntime->probes) pdRuntime->probes->Stop();
         pdRuntime->service->Stop();
+        std::lock_guard<std::mutex> lock(forwardLocker);
+        pdRuntime->receivers.clear();
     }
 }
 
@@ -2288,6 +2293,7 @@ void basellm::BeginPD(ResponseContext *context) {
 
 void basellm::PreparePendingPD(ResponseContext *context) {
     auto pending = context->pdPending;
+    if (pdRuntime->stopping) return;
     // Admission precedes P work and receive allocation. Waiting requests
     // do not consume model pages or block the scheduler on a network call.
     try {
@@ -2302,6 +2308,7 @@ void basellm::PreparePendingPD(ResponseContext *context) {
         if (!pending->receiver) {
             const auto begin = std::chrono::steady_clock::now();
             pending->receiver = PreparePDReceive(*context);
+            if (pending->receiver) pdRuntime->receivers.push_back(pending->receiver);
             if (pending->receiver && verbose) std::cout << "[FastKV PD timing] receive_prepare_ms="
                 << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count()
                 << std::endl;
@@ -2341,7 +2348,20 @@ void basellm::FlushPDAnnouncements() {
     if (pdRuntime) pdRuntime->FlushAnnouncements();
 }
 
+bool basellm::ReapPDReceivers() {
+    if (!IsPDDecode()) return false;
+    std::lock_guard<std::mutex> lock(forwardLocker);
+    auto &receivers = pdRuntime->receivers;
+    receivers.erase(std::remove_if(receivers.begin(), receivers.end(), [](const auto &receiver) {
+        if (receiver.use_count() != 1) return false;
+        receiver->Recycle();
+        return true;
+    }), receivers.end());
+    return !receivers.empty();
+}
+
 bool basellm::PollPD(ResponseContext *context) {
+    ReapPDReceivers();
     FlushPDAnnouncements();
     return PollPendingPD(context, 0);
 }

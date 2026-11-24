@@ -15,6 +15,8 @@ class PDReceiveState {
         const fastkv::Bytes &metadata, const std::vector<size_t> &sizes) = 0;
     virtual void Commit(ResponseContext &context) = 0;
     virtual void CommitShards(ResponseContext &, const fastkv::Message &);
+    // Called on the model lane after the request and transport release their leases.
+    virtual void Recycle() {}
 };
 
 // Logical payload metadata contains placement ranks, never allocator pointers.

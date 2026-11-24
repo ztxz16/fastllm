@@ -853,6 +853,7 @@ namespace fastllm {
         void BeginPD(ResponseContext *context);
         bool PollPD(ResponseContext *context);
         void FlushPDAnnouncements();
+        bool ReapPDReceivers();
         bool PollPendingPD(ResponseContext *context, int maxTotalLens);
         bool CommitGeneratedToken(ResponseContext &context, int token, int maxTotalLens);
         // Submit an unstarted transfer under dictLocker and forwardLocker.
