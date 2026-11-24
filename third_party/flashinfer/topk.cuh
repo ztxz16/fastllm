@@ -1429,6 +1429,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
   uint32_t total_iterations = (batch_size + num_groups - 1) / num_groups;
 
   int barrier_phase = 0;
+  // Rows that bypass selection do not advance the triple-buffered histogram.
+  uint32_t radix_row = 0;
 
   // Persistent loop over rows
   for (uint32_t iter = 0; iter < total_iterations; iter++) {
@@ -1445,32 +1447,21 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
     DType pivot = Traits::NegInf();
 
     if (k >= vocab_size) {
-      // k >= vocab_size: no masking needed, just copy
-      vec_t<DType, VEC_SIZE> logits_vec_copy;
-      const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
+      if (masked_logits != logits) {
+        vec_t<DType, VEC_SIZE> logits_vec_copy;
+        const uint32_t aligned_size = (actual_chunk_size / VEC_SIZE) * VEC_SIZE;
 #pragma unroll 2
-      for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
-        logits_vec_copy.cast_load(logits + row_idx * vocab_size + chunk_start + i);
-        logits_vec_copy.store(masked_logits + row_idx * vocab_size + chunk_start + i);
-      }
-      // Handle tail
-      for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-        masked_logits[row_idx * vocab_size + chunk_start + i] =
-            logits[row_idx * vocab_size + chunk_start + i];
+        for (uint32_t i = tx * VEC_SIZE; i < aligned_size; i += BLOCK_THREADS * VEC_SIZE) {
+          logits_vec_copy.cast_load(logits + row_idx * vocab_size + chunk_start + i);
+          logits_vec_copy.store(masked_logits + row_idx * vocab_size + chunk_start + i);
+        }
+        // Handle tail
+        for (uint32_t i = aligned_size + tx; i < actual_chunk_size; i += BLOCK_THREADS) {
+          masked_logits[row_idx * vocab_size + chunk_start + i] =
+              logits[row_idx * vocab_size + chunk_start + i];
+        }
       }
 
-      // Clear histogram for next iteration (in case it's k < vocab_size)
-      // Only needed for multi-CTA mode; single-CTA uses shared memory cleared each iteration
-      if constexpr (!SINGLE_CTA) {
-        constexpr uint32_t NUM_ROUNDS = sizeof(OrderedType) * 8 / 8;  // ORDERED_BITS / RADIX_BITS
-        uint32_t next_first_hist_idx = ((iter + 1) * NUM_ROUNDS) % 3;
-        if (cta_in_group == 0) {
-          for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-            state->histogram[next_first_hist_idx][i] = 0;
-          }
-        }
-        // No sync needed - next iteration's barrier will ensure visibility
-      }
       continue;
     }
 
@@ -1481,7 +1472,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) RadixTopKMaskLogitsKernel_Multi
         RadixSelectFindPivot<BLOCK_THREADS, VEC_SIZE, SINGLE_CTA, false, DType>(
             logits + row_idx * vocab_size, shared_ordered, local_histogram, suffix_sum,
             shared_scalars, state, chunk_start, actual_chunk_size, k, barrier_phase, ctas_per_group,
-            cta_in_group, tx, iter, local_gt_count, local_eq_count);
+            cta_in_group, tx, radix_row++, local_gt_count, local_eq_count);
 
     pivot = Traits::FromOrdered(ordered_pivot);
 

@@ -16531,8 +16531,8 @@ bool RadixMaskTopKLogits(const float *logits, float *filtered, const float *temp
             filtered, filtered, topKs, batch, 0, vocab, states, stream);
     return status == cudaSuccess;
 }
-bool TrimMaskedTopK(float *filtered, const int *topKs, int batch, int vocab, flashinfer::sampling::RadixRowState *states) {
-    auto stream = cudaStreamPerThread;
+bool TrimMaskedTopK(float *filtered, const int *topKs, int batch, int vocab, flashinfer::sampling::RadixRowState *states,
+                    cudaStream_t stream = cudaStreamPerThread) {
     // Reuse the radix workspace after its last read. Limit scratch, not vocab
     // or batch: the tile ranges grow to cover arbitrarily wide rows.
     constexpr int maxTiles = std::min<size_t>(TopKTieThreads, sizeof(*states) / sizeof(TopKBoundary));
@@ -18334,8 +18334,8 @@ struct FastllmMtpSamplingWorkspace {
         }
         return true;
     }
-    cudaError_t RenormTopP(float *input, float *output, float *thresholds, int rows, const int *done = nullptr, float scalar = 1.f) {
-        auto stream = cudaStreamPerThread;
+    cudaError_t RenormTopP(float *input, float *output, float *thresholds, int rows, const int *done = nullptr, float scalar = 1.f,
+                           cudaStream_t stream = cudaStreamPerThread) {
         if (topPState) {
             FastllmMtpTopPInit<<<rows, 1, 0, stream>>>(topPState, topPCuts, done);
             dim3 grid((vocab + 4095) / 4096, rows);
@@ -18880,8 +18880,7 @@ bool FastllmCudaMtpNormalizeTargetDistribution(void *distribution,
 }
 
 static bool NormalizeMaskedGraphRows(FastllmMtpSamplingWorkspace &ws, const float *topP,
-                                     float **probs, const int *done = nullptr) {
-    auto stream = cudaStreamPerThread;
+                                     float **probs, const int *done = nullptr, cudaStream_t stream = cudaStreamPerThread) {
     if (ws.softmaxTiles && ws.rows <= 65535) {
         dim3 grid(ws.softmaxTiles, ws.rows);
         FastllmTemperatureSoftmaxPartialKernel<256, 4096>
@@ -18892,12 +18891,90 @@ static bool NormalizeMaskedGraphRows(FastllmMtpSamplingWorkspace &ws, const floa
         FastllmTemperatureSoftmaxKernel<1024><<<ws.rows, 1024, 0, stream>>>(ws.bufferB, ws.bufferA, nullptr, ws.vocab);
     }
     *probs = ws.bufferB;
-    return ws.RenormTopP(ws.bufferA, ws.bufferB, const_cast<float *>(topP), ws.rows, done) == cudaSuccess;
+    return ws.RenormTopP(ws.bufferA, ws.bufferB, const_cast<float *>(topP), ws.rows, done, 1.f, stream) == cudaSuccess;
+}
+
+namespace {
+struct TargetLeaders {
+    float first, second;
+    int id;
+};
+struct MergeTargetLeaders {
+    __device__ TargetLeaders operator()(TargetLeaders a, TargetLeaders b) const {
+        if (a.id == -2 || b.id == -2) return {0.f, 0.f, -2};
+        if (b.first > a.first) return {b.first, fmaxf(a.first, b.second), b.id};
+        return {a.first, fmaxf(a.second, b.first), a.id};
+    }
+};
+
+constexpr int targetTile = 4096;
+using TargetReduce = cub::BlockReduce<TargetLeaders, 256>;
+
+__global__ void TargetTileLeaders(const float *logits, const float *temperature,
+                                  TargetLeaders *tiles, int vocab) {
+    const unsigned row = blockIdx.y;
+    const float inv = 1.f / temperature[row];
+    TargetLeaders best{-INFINITY, -INFINITY, -1};
+    for (int i = blockIdx.x * targetTile + threadIdx.x;
+         i < min(int(blockIdx.x + 1) * targetTile, vocab); i += blockDim.x) {
+        float x = logits[size_t(row) * vocab + i] * inv;
+        if (!isfinite(x)) { best.id = -2; break; }
+        if (x > best.first) best = {x, best.first, i};
+        else best.second = fmaxf(best.second, x);
+    }
+    __shared__ TargetReduce::TempStorage temp;
+    best = TargetReduce(temp).Reduce(best, MergeTargetLeaders{});
+    if (!threadIdx.x) tiles[size_t(row) * gridDim.x + blockIdx.x] = best;
+}
+
+__global__ void TargetNucleusRows(const TargetLeaders *tiles, int count, const int *topK,
+                                  const float *topP, int *winner, int *maskK, int vocab) {
+    unsigned row = blockIdx.x;
+    TargetLeaders best{-INFINITY, -INFINITY, -1};
+    for (int i = threadIdx.x; i < count; i += blockDim.x)
+        best = MergeTargetLeaders{}(best, tiles[size_t(row) * count + i]);
+    __shared__ TargetReduce::TempStorage temp;
+    best = TargetReduce(temp).Reduce(best, MergeTargetLeaders{});
+    if (threadIdx.x) return;
+    const int k = topK[row];
+    const float p = topP[row];
+    // Bound the total normalized mass of the other k-1 entries. Ambiguous
+    // cutoffs, ties, or non-finite scaled scores follow the full sampler.
+    const bool sole = best.id >= 0 && best.first > best.second && k > 0 && k <= 1024 &&
+        p > 2e-6f && 1. / (1. + (k-1) * exp(double(best.second) - best.first)) > double(p) + 1e-5;
+    winner[row] = sole ? best.id + 1 : 0;
+    maskK[row] = sole ? vocab : k;
+}
+
+__global__ void MaterializeTargetRows(const float *logits, float *masked, const float *temperature,
+                                      const int *winner, int vocab) {
+    const unsigned row = blockIdx.y;
+    const int id = winner[row] - 1;
+    const float inv = 1.f / temperature[row];
+    for (int i = blockIdx.x * targetTile + threadIdx.x;
+         i < min(int(blockIdx.x + 1) * targetTile, vocab); i += blockDim.x)
+        masked[size_t(row) * vocab + i] = id >= 0 ? float(i == id) : logits[size_t(row) * vocab + i] * inv;
+}
 }
 
 bool FastllmCudaMtpGraphDistribution(void *workspace, float *logits, const float *temperature, int *topK,
                                      const float *topP, float **probs) {
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(workspace);
+    if (ws.topPState && ws.rows >= 32 && logits != ws.bufferA && logits != ws.bufferB) {
+        cudaStream_t stream = cudaStreamPerThread;
+        const dim3 grid(ws.softmaxTiles, ws.rows);
+        auto *tiles = reinterpret_cast<TargetLeaders *>(ws.bufferA);
+        TargetTileLeaders<<<grid, 256, 0, stream>>>(logits, temperature, tiles, ws.vocab);
+        TargetNucleusRows<<<ws.rows, 256, 0, stream>>>(tiles, ws.softmaxTiles, topK, topP,
+                                                       ws.accepted, ws.draftIds, ws.vocab);
+        MaterializeTargetRows<<<grid, 256, 0, stream>>>(logits, ws.bufferB, temperature, ws.accepted, ws.vocab);
+        return cudaGetLastError() == cudaSuccess &&
+               cudaMemsetAsync(ws.rowStates, 0, size_t(ws.rows) * sizeof(*ws.rowStates), stream) == cudaSuccess &&
+               flashinfer::sampling::RadixTopKMaskLogitsMultiCTA<float,int>(
+                   ws.bufferB, ws.bufferB, ws.draftIds, ws.rows, 0, ws.vocab, ws.rowStates, stream) == cudaSuccess &&
+               TrimMaskedTopK(ws.bufferB, ws.draftIds, ws.rows, ws.vocab, ws.rowStates, stream) &&
+               NormalizeMaskedGraphRows(ws, topP, probs, ws.accepted);
+    }
     return MaskTopKFirstLogits(logits, ws.bufferB, temperature, topK, ws.rows, ws.vocab, ws.rowStates) &&
            NormalizeMaskedGraphRows(ws, topP, probs);
 }

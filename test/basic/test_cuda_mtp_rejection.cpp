@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <numeric>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -797,6 +798,40 @@ void LargeVocabularyCase() {
     std::puts("large-vocabulary dispatch boundaries, masks, ties, joint filtering: PASS");
 }
 
+// Persistent radix groups alternate between rows that bypass the histogram
+// and rows with a finite top-k. Both the support and its weights must survive.
+void MixedTargetMaskCase() {
+    constexpr int rows = 193, vocab = 65536;
+    std::vector<float> logits(size_t(rows) * vocab, -1000.f), topP(rows);
+    std::vector<int> topK(rows), peaks(rows), support(rows);
+    for (int row = 0; row < rows; ++row) {
+        const int kind = (row + row / 5) % 3;
+        peaks[row] = (row * 977) % (vocab - 4);
+        support[row] = kind == 0 ? 1 : kind == 1 ? 2 : 4;
+        topK[row] = kind == 0 ? 40 : kind == 1 ? 2 : vocab;
+        topP[row] = kind == 0 ? .95f : 1.f;
+        auto *peak = logits.data() + size_t(row) * vocab + peaks[row];
+        std::fill_n(peak, 4, 0.f);
+        if (kind == 0) *peak = 24.f;
+    }
+    Buffer input(logits), temperature(std::vector<float>(rows, 1.f)), p(topP), k(rows);
+    Check(cudaMemcpy(k.p, topK.data(), rows * sizeof(int), cudaMemcpyHostToDevice));
+    std::unique_ptr<void, decltype(&FastllmCudaMtpDestroyTargetDistribution)> ws(
+        FastllmCudaMtpCreateTargetDistribution(rows, vocab), FastllmCudaMtpDestroyTargetDistribution);
+    float *out = nullptr;
+    Require(ws && FastllmCudaMtpGraphDistribution(ws.get(), input.p, temperature.p,
+            reinterpret_cast<int *>(k.p), p.p, &out), "mixed graph target normalization");
+    Check(cudaMemcpy(logits.data(), out, logits.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (int row = 0; row < rows; ++row) {
+        for (int id = 0; id < vocab; ++id) {
+            float expected = id >= peaks[row] && id < peaks[row] + support[row] ? 1.f / support[row] : 0.f;
+            Require(std::abs(logits[size_t(row) * vocab + id] - expected) < 1e-6f,
+                    "mixed radix bypass changed target distribution");
+        }
+    }
+    std::puts("mixed target radix bypass: PASS");
+}
+
 void AcceptedConsumerCase(int vocab, std::initializer_list<int> draftCounts) {
     // Point masses give an exact acceptance oracle, including ragged prefixes.
     for (int batch : {1, 2, 4, 8, 9, 16}) for (int drafts : draftCounts) {
@@ -863,6 +898,7 @@ int main() {
         FullVocabularyCase();
         VerifyProposalLayoutCase();
         LargeVocabularyCase();
+        MixedTargetMaskCase();
         GraphSamplerCase();
         ResizableGraphSamplerCase();
         GraphTopPCase();
