@@ -65,7 +65,7 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
 
     bool HasVerifyReduce(int rank, int layer, int rows) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
-        return !ep && rows == 8 && fastshared_tp_uses_verify_reduce(state, rank, layer);
+        return rows == 8 && (ep || fastshared_tp_uses_verify_reduce(state, rank, layer));
 #else
         return false;
 #endif
