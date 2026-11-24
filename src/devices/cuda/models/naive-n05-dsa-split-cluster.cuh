@@ -81,12 +81,13 @@ template <uint32_t kBits> __device__ __forceinline__ float coarse_bin_lower_boun
 } // namespace topk
 constexpr unsigned kRanks = 8, kTopK = 2048, kThreads = 1024, kWarps = kThreads / 32;
 constexpr unsigned kBins = 4096, kChunk = 32, kChunks = kBins / kChunk; // chunk c = bins [32c, 32c + 32)
-constexpr unsigned kKeep = 4;                                           // blocks per warp held between the two passes
+constexpr unsigned kKeep = 2;                                           // blocks per warp held between the two passes
 constexpr unsigned kRegion = 512;                                       // candidates per source rank
 constexpr unsigned kWords = Scratch::kMaxSeqLen / (32u * kRanks), kBlocks = kWords / 4u;
 constexpr unsigned kCutBins = 1024, kCutShift = 8; // the tie cut's radix bins: relative key bits 17..8
 constexpr unsigned kWriteBlocks = 8; // up to 32 x this many blocks, warp w writes the w-th 32nd a bit per lane
 static_assert(kChunks == 4u * kWarps);
+static_assert(kBlocks <= kKeep * kWarps);
 
 __device__ __forceinline__ unsigned smem_u32(const void *p) { return unsigned(__cvta_generic_to_shared(p)); }
 __device__ __forceinline__ unsigned remote(const void *p, unsigned rank) {
@@ -117,18 +118,19 @@ __device__ __forceinline__ void st_async(unsigned addr, uint4 v, unsigned bar) {
         "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "r"(bar)
         : "memory");
 }
-// The sum of v over the lanes in mask, by bit planes (one ballot each): exact for v < 2^kBits.
-template <unsigned kBits> __device__ __forceinline__ unsigned lanes_sum(unsigned v, unsigned mask) {
-    unsigned s = 0u;
+// Exclusive warp prefix in ascending or descending lane order. Rank totals
+// sum to at most the number of visible keys, so unsigned addition is exact.
+template <bool Above> __device__ __forceinline__ unsigned warp_prefix(unsigned value) {
+    const int lane = threadIdx.x & 31;
+    unsigned sum = value;
 #pragma unroll
-    for (unsigned k = 0; k < kBits; ++k)
-        s += unsigned(__popc(__ballot_sync(0xffffffffu, (v >> k) & 1u) & mask)) << k;
-    return s;
-}
-// The sum of min(v, 4095) over the lanes in mask: exact for deciding whether a cut at <= 2048 keys
-// lies above or within these lanes.
-__device__ __forceinline__ unsigned lanes_sum_cut(unsigned v, unsigned mask) {
-    return lanes_sum<12>(min(v, 4095u), mask);
+    for (int step = 1; step < 32; step *= 2) {
+        const unsigned other = Above ? __shfl_down_sync(0xffffffffu, sum, step)
+                                     : __shfl_up_sync(0xffffffffu, sum, step);
+        if (Above ? lane + step < 32 : lane >= step)
+            sum += other;
+    }
+    return sum - value;
 }
 
 struct Select {
@@ -154,7 +156,6 @@ struct Select {
         unsigned match[3];                            // the tie cut: bin, keys over it, keys in it
         unsigned members;                             // the cut bin's keys in member
         alignas(16) uint2 member[kRanks * kRegion];   // the cut bin's {key - the bin's lowest, token}
-        alignas(16) float4 stage[kKeep * kWarps][32]; // the kept blocks, per lane, for the classify pass
     };
 
     static __device__ __forceinline__ unsigned ordered(float v) { return topk::extract_exact_bin(v); }
@@ -185,7 +186,7 @@ struct Select {
             }
             return;
         }
-        const unsigned above_mask = ~((2u << lane) - 1u), below_mask = (1u << lane) - 1u;
+        const unsigned below_mask = (1u << lane) - 1u;
         {
             // bar-0, waited before the first remote write: every rank's barriers (all it publishes; the rest is
             // sent with st.async), so it is arrived relaxed, first thing.
@@ -235,31 +236,9 @@ struct Select {
                 kept[i] = load(warp + 32u * i);
         __syncthreads();
 
-        // Every block g of this rank, warp uniform: the kept blocks from registers in the histogram pass (which
-        // stages them, each lane its own) and from the stage in the classify pass's rolled loop, the rest
-        // streamed through a four-deep queue in both.
+        // At 64K each rank has at most 64 blocks. Two per warp fit in registers
+        // across both histogram and classification passes.
         const unsigned held = blocks > warp ? min((blocks - warp + 31u) / 32u, kKeep) : 0u;
-        auto stream = [&](auto &&fn) {
-            unsigned g = warp + 32u * kKeep;
-            if (g >= blocks)
-                return;
-            float4 x0 = load(g), x1, x2, x3;
-            if (g + 32u < blocks)
-                x1 = load(g + 32u);
-            if (g + 64u < blocks)
-                x2 = load(g + 64u);
-            if (g + 96u < blocks)
-                x3 = load(g + 96u);
-#pragma unroll 1
-            for (; g < blocks; g += 32u) {
-                fn(x0, g);
-                x0 = x1;
-                x1 = x2;
-                x2 = x3;
-                if (g + 128u < blocks)
-                    x3 = load(g + 128u);
-            }
-        };
         auto tally = [&](const float4 &x, unsigned g) {
             const unsigned t = 128u * g + lane;
             const uint2 b01 = coarse2(x.x, x.y), b23 = coarse2(x.z, x.w);
@@ -276,9 +255,7 @@ struct Select {
         for (unsigned i = 0; i < kKeep; ++i)
             if (i < held) {
                 tally(kept[i], warp + 32u * i);
-                s.stage[warp + 32u * i][lane] = kept[i];
             }
-        stream(tally);
         __syncthreads();
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); // bar-0
 
@@ -307,7 +284,7 @@ struct Select {
                 if (r < rank)
                     low[0] += p.x, low[1] += p.y, low[2] += p.z, low[3] += p.w;
             }
-            unsigned above = lanes_sum_cut(v[0] + v[1] + v[2] + v[3], above_mask), chunk = ~0u, chunk_above = 0u;
+            unsigned above = warp_prefix<true>(v[0] + v[1] + v[2] + v[3]), chunk = ~0u, chunk_above = 0u;
 #pragma unroll
             for (int j = 3; j >= 0; --j) {
                 if (above < kTopK && above + v[j] >= kTopK) {
@@ -347,7 +324,7 @@ struct Select {
                 if (r < rank)
                     c_low += cr[r];
             }
-            const unsigned b = kChunk * chunk + lane, over = chunk_above + lanes_sum_cut(c, above_mask);
+            const unsigned b = kChunk * chunk + lane, over = chunk_above + warp_prefix<true>(c);
             // A bin over 2^18 ordered keys is too wide for the radix round (zero / inf / NaN edges). Every
             // lane's bounds, overlapping the loads.
             const float bin_lo = topk::coarse_bin_lower_bound<12>(b), bin_hi = topk::coarse_bin_lower_bound<12>(b + 1u);
@@ -371,7 +348,7 @@ struct Select {
             const unsigned flag = __any_sync(0xffffffffu, eq > kRegion) || wide_at != 0u ? 1u : 0u;
             const unsigned remain = kTopK - __shfl_sync(0xffffffffu, over, int(at));
             const unsigned exchange = flag == 0u && total != remain ? 1u : 0u;
-            const unsigned first_l = lanes_sum<10>(kept_l, below_mask);
+            const unsigned first_l = warp_prefix<false>(kept_l);
             const unsigned bytes =
                 __reduce_add_sync(0xffffffffu, lane < kRanks && lane != rank ? 16u * ((kept_l + 1u) / 2u) : 0u);
             if (lane < kRanks) {
@@ -422,16 +399,10 @@ struct Select {
                 s.bcount[g] = __popc(w0) + __popc(w1) + __popc(w2) + __popc(w3);
             }
         };
-        if (held != 0u) {
-            float4 x = s.stage[warp][lane];
-#pragma unroll 1
-            for (unsigned i = 0; i < held; ++i) {
-                const float4 next = i + 1u < held ? s.stage[warp + 32u * (i + 1u)][lane] : x;
-                classify(x, warp + 32u * i);
-                x = next;
-            }
-        }
-        stream(classify);
+#pragma unroll
+        for (unsigned i = 0; i < kKeep; ++i)
+            if (i < held)
+                classify(kept[i], warp + 32u * i);
         __syncthreads();
         const uint4 layout = *reinterpret_cast<const uint4 *>(s.layout);
         const unsigned total = layout.x, over = s.bin[1], remain = kTopK - over;
@@ -500,10 +471,10 @@ struct Select {
             }
             __syncthreads();
             if (warp == 0) {
-                const unsigned sum = s.cut_coarse[lane], above = lanes_sum_cut(sum, above_mask);
+                const unsigned sum = s.cut_coarse[lane], above = warp_prefix<true>(sum);
                 const unsigned chunk = __ffs(__ballot_sync(0xffffffffu, above < remain && above + sum >= remain)) - 1u;
                 const unsigned chunk_above = __shfl_sync(0xffffffffu, above, int(chunk));
-                const unsigned c = s.cut_hist[32u * chunk + lane], over_c = chunk_above + lanes_sum_cut(c, above_mask);
+                const unsigned c = s.cut_hist[32u * chunk + lane], over_c = chunk_above + warp_prefix<true>(c);
                 if (over_c < remain && over_c + c >= remain) {
                     s.match[0] = 32u * chunk + lane;
                     s.match[1] = over_c;
@@ -600,7 +571,7 @@ struct Select {
                 w[j] = j < per && base_word + j < words ? s.bitmap[base_word + j] : 0u;
                 count += __popc(w[j]);
             }
-            const unsigned before = lanes_sum<8>(count, below_mask); // count <= 128
+            const unsigned before = warp_prefix<false>(count); // count <= 128
             if (lane == 31u)
                 s.warp_sum[warp] = before + count;
             __syncthreads();

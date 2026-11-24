@@ -800,9 +800,8 @@ __device__ __forceinline__ void FrontWait(const unsigned *p, unsigned n) {
     }
     __syncthreads();
 }
-__device__ void ProjectPair(const Args &a, ProjectionStorage<8> &s) {
+__device__ void ProjectPair(const Args &a, float *partial) {
     const int t = threadIdx.x, warp = t / 32, lane = t % 32, g = lane / 4, q = lane % 4, c = blockIdx.x;
-    float *partial = s.partial;
     float acc[4]{};
     if (warp < 4 && c < 116) {
         const int col = c * 16, first = warp * 1024;
@@ -860,31 +859,56 @@ __device__ void ProjectPair(const Args &a, ProjectionStorage<8> &s) {
     __syncthreads();
 }
 
+// One query block covers at most four key tiles per CTA on the admitted grid.
+// The first three use the sweep ring. Only shared memory is needed for the fourth.
+constexpr int ScoreTileRows = SplitBody::SweepStorage::kTileM;
+constexpr int MaxScoreTiles = 4;
+constexpr int SplitScoreBytes = sizeof(Storage<false>) + SplitBody::SweepStorage::kTileBytes;
+static_assert(SplitLayout::kMaxSeqLen <= (143 - 2) * ScoreTileRows * MaxScoreTiles);
+
 __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant__ Args a) {
     extern __shared__ __align__(1024) unsigned char bytes[];
     auto &s = *reinterpret_cast<Storage<false> *>(bytes);
-
+    auto *fourth = bytes + sizeof(Storage<false>);
     using Sweep = SplitBody::SweepStorage;
-    static_assert(offsetof(Sweep, a_ring) + 2 * Sweep::kTileBytes >= sizeof(ProjectionStorage<8>));
-    int earliest = 0x7fffffff;
+    // The RMS row and projection partials use the beginning of B storage before
+    // the packed query arrives. Historical key loads can fill all A slots.
+    static_assert(offsetof(Sweep, a_ring) >= 4096 * sizeof(B));
+    static_assert(offsetof(Sweep, a_ring) >= 8 * 128 * sizeof(float));
+    int earliest = 0x7fffffff, latest = 0;
 #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        const auto &r = a.bindings[i];
-        const int length = r.liveKeys ? *r.liveKeys : r.length;
-        earliest = min(earliest, min(r.capacity, length));
+    for (int row = 0; row < 8; ++row) {
+        const auto &binding = a.bindings[row];
+        const int length = max(0, min(binding.capacity, binding.liveKeys ? *binding.liveKeys : binding.length));
+        earliest = min(earliest, length);
+        latest = max(latest, length);
     }
-    // The first tile may be prefetched as soon as all its tokens precede the
-    // earliest write. The page table and live lengths are resolved on replay.
-    const bool prepared = (int(blockIdx.x) + 1) * 128 < earliest;
+    const int total = (latest + ScoreTileRows - 1) / ScoreTileRows;
+    const int tailBlocks = total > int(gridDim.x) ? 2 : 0;
+    const int stride = int(gridDim.x) - tailBlocks;
+    const int block = int(blockIdx.x);
+    const bool tail = block >= stride;
+    // Give the two newest tiles their own CTAs. Waiting for a current append
+    // then leaves the preceding waves of historical tiles free to issue MMA.
+    const int first = tail ? total - tailBlocks + block - stride : block;
+    const int tiles = tail ? 1 : max(0, (total - tailBlocks - first + stride - 1) / stride);
+    const int history = max(0, (earliest - 1) / ScoreTileRows);
+    const int prepared = min(tiles, max(0, (history - first + stride - 1) / stride));
     if (prepared) {
-        auto view = CoreArguments(a, 0, 0);
+        const auto view = CoreArguments(a, 0, 0);
         auto key = view.indexKey;
         key.Bind(view.indexCache);
-        auto *dest = s.core.sweep.a_ring + 2 * Sweep::kTileBytes;
-        for (int i = threadIdx.x; i < 128 * 16; i += Threads) {
-            const int row = i / 16, d = (i % 16) * 8;
-            auto src = (const B *)key.IndexRow(blockIdx.x * 128 + row, view.indexStride).data;
-            SplitBody::cp_async_16(dest + SplitBody::ImageOffset(row, d, 128), src + d, 16);
+        for (int j = 0; j < prepared; ++j) {
+            const int token = (first + j * stride) * ScoreTileRows;
+            auto *dest = SplitBody::score_tile_image(s.core.sweep, fourth, j);
+            const B *base = static_cast<const B *>(key.IndexRow(token, view.indexStride).data);
+            const bool singlePage = !key.pages || key.pageLen % ScoreTileRows == 0;
+            for (int i = threadIdx.x; i < ScoreTileRows * 16; i += Threads) {
+                const int row = i / 16, dim = i % 16 * 8;
+                const B *src = singlePage ? base + row * view.indexStride
+                    : static_cast<const B *>(key.IndexRow(token + row, view.indexStride).data);
+                SplitBody::cp_async_16(dest + SplitBody::ImageOffset(row, dim, ScoreTileRows), src + dim, 16);
+            }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     }
@@ -920,7 +944,7 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
     // Four warps compute the main projection tile and four compute its paired
     // Indexer projection. Both preserve the original four-way K reduction.
     if (blockIdx.x < 137)
-        ProjectPair(a, s.projection);
+        ProjectPair(a, reinterpret_cast<float *>(bytes));
 
     if (c < 116)
         FrontSignal(ready);
@@ -940,10 +964,9 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
         WriteIndexKeyWarp(a, c - 135);
         FrontSignal(ready + 4);
     }
-    // Historical tiles need only the quantized query. A subsequent tile in a
-    // strided sweep may contain an appended key, so retain its dependency.
+    // A CTA reading only historical keys can start as soon as its query is ready.
     FrontWait(ready + 3, 8);
-    if (!(prepared && ((const int *)(a.coreWorkspace + SplitLayout::kRadixControlOffset))[8] <= int(gridDim.x) * 128)) {
+    if (prepared < tiles) {
         FrontWait(ready + 4, 8);
     }
     if (prepared) {
@@ -955,15 +978,8 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
     unsigned char *ws = a.coreWorkspace;
     const int *lengths = (const int *)(ws + SplitLayout::kRadixControlOffset);
 
-    if (lengths[8] <= int(gridDim.x) * 128) {
-        if (int(blockIdx.x) * 128 < lengths[8])
-            SplitBody::score_one(core, lengths, s.core.sweep, prepared);
-        return;
-    }
-    if (lengths[8] > 0)
-        SplitBody::compute_index_logits_tcgen05<true>(
-            core, ws + SplitLayout::kIqPackedOffset, (float *)(ws + SplitLayout::kIndexWeightsScaledOffset),
-            (float *)(ws + SplitLayout::kIndexLogitsOffset), lengths, s.core.sweep, true, false, prepared);
+    if (tiles)
+        SplitBody::score_tiles(core, lengths, s.core.sweep, prepared, fourth, first, stride, tiles);
 }
 template <bool DirectSelection>
 __global__ __launch_bounds__(Threads, 1) void SplitAttentionOutput(const __grid_constant__ Args a) {
@@ -1009,9 +1025,10 @@ static bool SplitAvailable(int device, bool directSelection = false) {
             return false;
         constexpr int shared = sizeof(Storage<false>);
         auto resident = [=](const void *kernel) {
+            const int bytes = kernel == (const void *)SplitScores ? SplitScoreBytes : shared;
             int blocks = 0;
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared) == cudaSuccess &&
-                   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, Threads, shared) == cudaSuccess &&
+            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) == cudaSuccess &&
+                   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, Threads, bytes) == cudaSuccess &&
                    blocks >= 1;
         };
         const bool admitted = resident((const void *)SplitScores) && resident((const void *)SplitAttentionOutput<false>) &&
@@ -1044,7 +1061,7 @@ static cudaError_t RunSplit(Args &args, int grid) {
     constexpr size_t shared = sizeof(Storage<false>);
     auto stream = cudaStreamPerThread;
     const void *scores = (const void *)SplitScores;
-    cudaError_t error = cudaLaunchCooperativeKernel(scores, grid, Threads, params, shared, stream);
+    cudaError_t error = cudaLaunchCooperativeKernel(scores, grid, Threads, params, SplitScoreBytes, stream);
     if (error != cudaSuccess)
         return error;
     const bool direct = DirectSelections(args) && SplitAvailable(FastllmCudaGetDevice(), true);

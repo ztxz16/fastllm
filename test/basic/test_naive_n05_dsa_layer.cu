@@ -332,7 +332,7 @@ struct Case {
                     "TP reference");
         FastllmCudaNaiveAddDecodeRMSNorm(referenceHidden, rprojected, post, input.eps, rnorm);
     }
-    double Check(bool tp = false) {
+    double Check(bool tp = false, bool checkProjectedResidual = false) {
         // Projection rounding can change sparse Top-K membership. Verify the
         // attention body with identical projected operands/cache, then compare
         // the complete residual against the independent unfused implementation.
@@ -396,6 +396,19 @@ struct Case {
         }
         printf("ATTENTION rows=%d relative_l2=%.8g exact_topk_set=PASS\n", rows, attentionError);
         Require(Read(feature) == Read(referenceFeature), "exported feature differs");
+        if (checkProjectedResidual) {
+            // Isolate the sparse pipeline beyond 32K. Small projection rounding differences
+            // can move a key across the cutoff. Compare the full O, TP and residual chain
+            // on the independent attention reference for the same projected operands.
+            Require(tp && qkvWeight.dataType == FP8_E4M3, "MX TP reference expected");
+            Require(VerifyMxLinearReference(exactAttention, oWeight, empty, rprojected, rows, 1024, 4096),
+                    "identical-input O projection");
+            Require(FastllmCudaCustomAllReduce(rprojected.cudaData, rprojected.cudaData, rows * 4096, BFLOAT16, device),
+                    "identical-input TP reduction");
+            CopyDevice(referenceHidden, initial);
+            FastllmCudaNaiveAddDecodeRMSNorm(referenceHidden, branch, gamma, input.eps, rnorm);
+            FastllmCudaNaiveAddDecodeRMSNorm(referenceHidden, rprojected, post, input.eps, rnorm);
+        }
         double err = Compare(hidden, referenceHidden, rows, "hidden");
         if (tp)
             Compare(normed, rnorm, rows, "post norm");
@@ -447,7 +460,8 @@ void Tp(bool fp8, bool mx = false) {
     Require(FastllmInitNccl(devices) && FastllmCudaCustomAllReduceInit(devices), "TP init");
     for (auto shape : mx ? std::vector<std::vector<int>>{{4},{8},{4,4}} : std::vector<std::vector<int>>{{8}, {4, 4}, {8, 8}, {1, 8}, {7, 8}, {1, 2, 5, 8}}) {
         std::array<std::unique_ptr<Case>, 8> cases;
-        Parallel([&](int r) { cases[r] = std::make_unique<Case>(shape, 32768, false, fp8, r, mx); });
+        const bool fullMx = mx && shape == std::vector<int>{8};
+        Parallel([&](int r) { cases[r] = std::make_unique<Case>(shape, fullMx ? 65536 : 32768, false, fp8, r, mx); });
         Parallel([&](int r) {
             auto &c = *cases[r];
             auto h = Read(c.hidden), k = Read(c.caches[0]->key), v = Read(c.caches[0]->value);
@@ -482,12 +496,22 @@ void Tp(bool fp8, bool mx = false) {
             Cuda(cudaStreamEndCapture(cudaStreamPerThread, &graph));
             Cuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
             // Replay the same MX verification graph across short, boundary and long contexts.
-            const std::vector<int> lengths = mx && shape == std::vector<int>{8}
-                ? std::vector<int>{121, 2045, 8192, 16384, 24576, 32760}
+            const std::vector<int> lengths = fullMx
+                ? std::vector<int>{121, 2045, 8192, 16384, 18940, 24576, 32760, 49152, 65528}
                 : std::vector<int>{8192, 9216, 10240};
             for (size_t replay = 0; replay < lengths.size(); ++replay) {
                 c.Lengths(lengths[replay], false);
                 c.Rebind(replay % 2);
+                c.Reset();
+                c.Legacy(true);
+                Cuda(cudaGraphLaunch(executable, cudaStreamPerThread));
+                Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+                c.Check(true, fullMx && lengths[replay] > 32768);
+            }
+            if (fullMx) {
+                // Force cutoff ties at 64K so both independently projected paths select
+                // the same keys. Check the original unfused end-to-end residual as well.
+                Cuda(cudaMemsetAsync(c.iwWeight.cudaData, 0, c.iwWeight.Count(0) * sizeof(B), cudaStreamPerThread));
                 c.Reset();
                 c.Legacy(true);
                 Cuda(cudaGraphLaunch(executable, cudaStreamPerThread));
