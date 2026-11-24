@@ -96,17 +96,31 @@ FT 的 PD Router 采用以下命令行配置项与默认值：
 - “明显失衡”须同时满足 `max_load - min_load > balance_abs_threshold` 和
   `max_load > min_load * balance_rel_threshold`；默认即差值严格大于 64，且最大负载
   严格大于最小负载的 1.5 倍。
-- 未明显失衡且最高前缀匹配比例严格大于 `cache_threshold` 时，优先选择前缀匹配最多的服务；
-  匹配比例不足或负载明显失衡时选择负载最低的服务。默认匹配比例恰好为 30% 时不触发前缀优先。
 - 上述阈值可通过命令行调整，仅用于启用 `cache_aware` 的阶段；P、D 分别判断各自候选池。
   这些服务级默认值不改变实例内部 `--dp-routing` 默认 `load` 的既定要求。
+
+### cache_aware 三种情况的选择规则
+
+启用 `cache_aware` 时，P、D 在各自的健康候选池内按以下三种情况选择服务：
+
+| 情况 | 判定条件 | 处理 |
+|---|---|---|
+| 负载比较均衡，前缀匹配比例超过阈值 | 未达到明显失衡条件，且最高前缀匹配比例严格大于 `cache_threshold`。 | 选择前缀匹配最多的服务。 |
+| 前缀匹配不足 | 未达到明显失衡条件，且最高前缀匹配比例小于或等于 `cache_threshold`。 | 选择负载最低的服务。 |
+| 实例之间负载明显失衡 | 同时超过负载差值阈值和负载比例阈值。 | 不论前缀匹配比例多高，均优先选择负载最低的服务。 |
+
+先判断负载是否明显失衡；未明显失衡时，再按前缀匹配比例区分前两种情况。
+“最高前缀匹配比例”指当前请求在该候选池中的最高估计匹配比例；“匹配不足”是所有候选服务
+都未超过阈值，不要求完全没有匹配。默认最高匹配比例恰好为 30% 时，也按匹配不足处理。
+用户修改阈值后，三种情况均按实际配置值判断。
 
 参考：[vLLM Router 默认策略，main.rs:126](https://github.com/vllm-project/router/blob/main/src/main.rs#L126)、
 [阈值默认配置，main.rs:183](https://github.com/vllm-project/router/blob/main/src/main.rs#L183)、
 [前缀选择条件，cache_aware.rs:365](https://github.com/vllm-project/router/blob/main/src/policies/cache_aware.rs#L365)、
 [失衡条件，cache_aware.rs:445](https://github.com/vllm-project/router/blob/main/src/policies/cache_aware.rs#L445)。
 
-更新日期：2026-11-24。状态：八种策略、默认策略与相关配置要求已确认，均待实现，尚无功能或性能验收结果。
+更新日期：2026-11-24。状态：八种策略、默认配置及 `cache_aware` 三种情况的处理要求已确认，
+均待实现，尚无功能或性能验收结果。
 
 ## Router/Proxy 有条件请求重试
 
