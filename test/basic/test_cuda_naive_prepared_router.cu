@@ -1,6 +1,7 @@
 // Validate BF16/FP8 preparation and the FP32 router error contract.
 // Includes unprepared four-row reuse, ragged tiles, guards, routing and changing-input Graph replay.
 #include <cuda_runtime.h>
+#include "devices/cuda/fastllm-cuda-launch.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include "../../src/devices/multicuda/fastllm-attention-output-rows.cuh"
@@ -50,6 +51,62 @@ void CheckBlock128(const FastllmMoePreparedInput &p,int rows) {
  for(auto v:read(p.block128-64,64))need(v==0x55,"block128 prefix guard");
  for(auto v:read(p.block128+33920,64))need(v==0x55,"block128 suffix guard");
 }
+#if CUDART_VERSION >= 12000
+static __global__ void DelayedResidual(const uint4 *input, uint4 *hidden) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+    const auto start = clock64();
+    while (clock64() - start < 40000) __nanosleep(64);
+#endif
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    hidden[index] = input[index];
+}
+
+static void CheckRouterDependency(BF16 *input, const float *weights, const float *gamma,
+        BF16 *norm[2], float *scores[2], FastllmMoePreparedInput prepared[2]) {
+    constexpr int rows = 8, width = 4096;
+    constexpr auto consumer = NormRowsRouterDirect<8, 2, true, 8, false, true>;
+    cudaFuncAttributes attributes{};
+    ck(cudaFuncGetAttributes(&attributes, consumer));
+    if (attributes.ptxVersion < 90 || attributes.binaryVersion < 90) return;
+    BF16 *hidden = alloc<BF16>(rows * width);
+    for (int i = 0; i < 2; ++i) {
+        prepared[i].block128 = nullptr;
+        prepared[i].overlapVerifyGate = true;
+        ck(cudaMemset(prepared[i].epoch, 0, sizeof(uint64_t)));
+    }
+    auto stream = cudaStreamPerThread;
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    DelayedResidual<<<128, 32, 0, stream>>>((const uint4 *)input, (uint4 *)hidden);
+    ck(fastllm::cuda_launch::LaunchProgrammatic<consumer>(dim3(32, 4), 256, 0, stream,
+        hidden, weights, scores[1], gamma, norm[1], 1e-6f, rows, prepared[1],
+        (const BF16 *)nullptr, (BF16 *)nullptr));
+    ck(cudaStreamEndCapture(stream, &graph));
+    ck(cudaGraphInstantiate(&exec, graph, 0));
+    std::vector<BF16> values(rows * width);
+    for (int replay = 0; replay < 4; ++replay) {
+        for (int i = 0; i < rows * width; ++i)
+            values[i] = __float2bfloat16_rn(float((i + 7 * replay) % 31 - 15));
+        ck(cudaMemcpyAsync(input, values.data(), values.size() * sizeof(BF16), cudaMemcpyHostToDevice, stream));
+        ck(cudaMemsetAsync(hidden, 0xff, values.size() * sizeof(BF16), stream));
+        NormRowsRouterDirect<8><<<dim3(32, 4), 256, 0, stream>>>(input, weights, scores[0],
+            gamma, norm[0], 1e-6f, rows, prepared[0]);
+        ck(cudaGraphLaunch(exec, stream));
+        ck(cudaStreamSynchronize(stream));
+        need(SameBits(read(scores[0], rows * 256), read(scores[1], rows * 256)), "PDL router scores");
+        need(SameBits(read(norm[0], values.size()), read(norm[1], values.size())), "PDL normalized rows");
+        need(read(prepared[0].values, rows * width) == read(prepared[1].values, rows * width), "PDL FP8 values");
+        need(read(prepared[0].scales, rows * 128) == read(prepared[1].scales, rows * 128), "PDL FP8 scales");
+        need(read(prepared[0].epoch, 1) == read(prepared[1].epoch, 1), "PDL routing epoch");
+    }
+    ck(cudaGraphExecDestroy(exec));
+    ck(cudaGraphDestroy(graph));
+    ck(cudaFree(hidden));
+}
+#endif
+
 void ValidateWideRouter();
 int main(){try{
  int devices=0;cudaDeviceProp prop{};
@@ -120,6 +177,9 @@ int main(){try{
    ck(cudaGraphExecDestroy(ex));ck(cudaGraphDestroy(g));}
  }
  }
+#if CUDART_VERSION >= 12000
+ CheckRouterDependency(x, w, gamma, norm, out, prepared);
+#endif
  ValidateWideRouter();
  printf("ROUTER_VALIDATE_PASS cases=%d max_row_router_rel_l2=%.9g max_abs=%.9g norm_fp8_scale_guard_bitwise=1 dynamic_graph_rows=%zu\n",cases,maxL2,maxAbs,rowCount);
 }catch(const std::exception&e){fprintf(stderr,"FAIL %s\n",e.what());return 1;}}

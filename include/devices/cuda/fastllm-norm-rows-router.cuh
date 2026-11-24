@@ -51,13 +51,13 @@ static __device__ __forceinline__ void ClearGateBlock128Tail(uint8_t *dest, int 
 // FP32 dot accumulation has a separate operator-L2 validation contract.
 // Four unprepared rows share the same weights without allocating an FP8 image.
 // With a residual branch, stage the rounded sum until every router tile has read the input.
-template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false>
+template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false>
 static __global__ void NormRowsRouterDirect(
         const BF16 *input, const float *weight, float *output,
         const float *gamma, BF16 *normed, float eps, int rows,
         FastllmMoePreparedInput prepared, const BF16 *branch = nullptr, BF16 *sumOutput = nullptr) {
 #if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    if constexpr (Prepare && !Residual && Experts == 8 && Rows == 2 && Capacity == 8)
+    if constexpr (Prepare && !Residual && !WaitForSwa && Experts == 8 && Rows == 2 && Capacity == 8)
         if (prepared.overlapVerifyGate) cudaTriggerProgrammaticLaunchCompletion();
 #endif
     constexpr int Chunks = 2, Warps = 8;
@@ -80,6 +80,13 @@ static __global__ void NormRowsRouterDirect(
             cached[e][i] = *reinterpret_cast<const float4 *>(weight + size_t(expert + e) * Width + col);
         }
     }
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if constexpr (WaitForSwa) {
+        // Only immutable router weights and gamma can be loaded before the SWA residual is ready.
+        cudaGridDependencySynchronize();
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
     float partial[Experts][Rows]{};
     if constexpr (Prepare) if (blockIdx.x == 0 && blockIdx.y == 0) {
         prepared.counters[t] = 0;

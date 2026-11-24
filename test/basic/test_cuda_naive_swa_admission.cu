@@ -3,6 +3,7 @@
 #include "devices/cuda/fastllm-bf16-ordered-dot.cuh"
 #include "../../src/devices/multicuda/fastllm-attention-output-rows.cuh"
 #include "../../src/devices/multicuda/fastllm-swa-verify-layer.cuh"
+#include "../../src/devices/multicuda/fastllm-swa-layer.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -105,7 +106,10 @@ cudaError_t SetAttribute(const void *kernel, cudaFuncAttribute, int bytes) {
         Require(bytes == fastllm_swa_verify::SharedBytes(VerifyRows(variant), variant == 2, variant == 3), "unexpected verify shared memory");
         return currentDevice == 5 && verifyFailure[variant] == 2 ? cudaErrorInvalidValue : cudaSuccess;
     }
-    Require(bytes == 131072, "unexpected layer shared memory");
+    const int expected = kernel == (const void *)fastllm_swa_layer::MxOutput ? 0 :
+        kernel == (const void *)fastllm_swa_layer::Layer<true> ? fastllm_swa_layer::MxStagingBytes :
+        fastllm_swa_layer::StagingBytes;
+    Require(bytes == expected, "unexpected layer shared memory");
     return failLayerShared ? cudaErrorInvalidValue : cudaSuccess;
 }
 cudaError_t Peer(int *value, cudaDeviceP2PAttr, int, int) { *value = atomicPeer; return cudaSuccess; }

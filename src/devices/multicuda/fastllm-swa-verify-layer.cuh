@@ -39,6 +39,7 @@ struct Args {
     const __nv_bfloat162 *rotary = nullptr;
     float eps, theta, scale;
     int rows, rank;
+    bool overlapRouter = false;
     BatchSwaKeys bindings;
     Peers peers;
     uint64_t *epochs;
@@ -665,6 +666,9 @@ __global__ __launch_bounds__(Threads, 1) void PackedLayer(
     }
     // All candidate KV and QKV reads finish before Tail reuses projected.
     cooperative_groups::this_grid().sync();
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    if (a.overlapRouter) cudaTriggerProgrammaticLaunchCompletion();
+#endif
     if (task == 127 && t < a.rows) *flag(t) = 0;
     Tail<Threads, 1, true, true>(a, 0, weights);
 }

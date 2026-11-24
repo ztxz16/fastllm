@@ -2,6 +2,7 @@
 #include "fastllm-swa-output.cuh"
 #include "fastllm-swa-layer.cuh"
 #include "fastllm-swa-verify-layer.cuh"
+#include "fastllm-cuda-launch.cuh"
 #include "fastllm-attention-output-rows.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
 #include "devices/cuda/naive-n05-dsa-layer.cuh"
@@ -22,6 +23,7 @@ class SwaOutputState {
     bool layerSupported = false, mxLayerSupported = false, mxOutputSupported = false, outputRouterSupported = false, rowsSupported = false;
     bool rowsRouterExpertsSupported = false, rowsMmaSupported = false;
     bool preparedRouterSupported = false, routedRouterSupported = false;
+    bool swaRouterPdlSupported = false;
     bool preparedVectorRouterSupported = false, rowsDirectRouterSupported = false;
     bool widePreparedRouterSupported = false;
     // A registered output tuple alone does not establish that the eight-row
@@ -107,7 +109,7 @@ public:
     }
     cudaError_t LaunchRowsNorm(const void *hidden, const float *normWeight, void *normed,
             float eps, const float *routerWeight, float *router, int rows,
-            const FastllmMoePreparedInput *prepared = nullptr) {
+            const FastllmMoePreparedInput *prepared = nullptr, bool afterSwa = false) {
         using namespace fastllm_swa_output;
         if (routerWeight && prepared && prepared->routed) {
             FastllmMoePreparedInput input = *prepared;
@@ -127,6 +129,12 @@ public:
                 (reinterpret_cast<uintptr_t>(normWeight) % 16 == 0) &&
                 (reinterpret_cast<uintptr_t>(routerWeight) % 16 == 0) &&
                 (reinterpret_cast<uintptr_t>(prepared->values) % 8 == 0)) {
+#if CUDART_VERSION >= 12000
+                if (afterSwa)
+                    return fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterDirect<8, 2, true, 8, false, true>>(
+                        dim3(32, 4), 256, 0, cudaStreamPerThread, (const BF16 *)hidden, routerWeight, router,
+                        normWeight, (BF16 *)normed, eps, rows, *prepared, (const BF16 *)nullptr, (BF16 *)nullptr);
+#endif
                 if (rows >= 7)
                     NormRowsRouterDirect<8><<<dim3(32, (rows + 1) / 2), 256, 0, cudaStreamPerThread>>>(
                         (const BF16 *)hidden, routerWeight, router, normWeight, (BF16 *)normed, eps, rows, *prepared);
@@ -163,6 +171,8 @@ public:
             const float *normWeight, const float *routerWeight, float *router,
             const FastllmMoePreparedInput *prepared = nullptr) {
         args.peers = peers; args.epochs = epochs[rank]; args.rank = rank;
+        args.overlapRouter = swaRouterPdlSupported && args.rotary && args.rows == 8 && routerWeight &&
+                             prepared && prepared->overlapVerifyGate && !prepared->routed;
         void *params[] = {&args};
         const bool wide = args.rows > 8 && verifySupported[2];
         const bool mx = args.outputScales != nullptr;
@@ -187,7 +197,7 @@ public:
             status = cudaLaunchCooperativeKernel(kernel, dim3(128), dim3(threads), params, shared, cudaStreamPerThread);
         if (status != cudaSuccess) return status;
         return LaunchRowsNorm(args.hidden, normWeight, args.normed, args.eps,
-                              routerWeight, router, args.rows, prepared);
+                              routerWeight, router, args.rows, prepared, args.overlapRouter);
     }
 #ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
     cudaError_t LaunchDsa(FastllmNaiveDSALayerArgs args, int rank, const float *postNorm,
@@ -419,6 +429,21 @@ private:
                 }
             }
         }
+#if CUDART_VERSION >= 12000
+        swaRouterPdlSupported = preparedVectorRouterSupported && verifySupported[3];
+        for (int device : requested) {
+            if (!swaRouterPdlSupported) break;
+            // Both ends must have been compiled with grid dependency instructions.
+            const void *producer = fastllm_swa_verify::Kernel(8, false, true);
+            const void *consumer = (const void *)fastllm_swa_output::NormRowsRouterDirect<8, 2, true, 8, false, true>;
+            cudaFuncAttributes src{}, dst{};
+            swaRouterPdlSupported = cudaSetDevice(device) == cudaSuccess &&
+                cudaFuncGetAttributes(&src, producer) == cudaSuccess && src.ptxVersion >= 90 && src.binaryVersion >= 90 &&
+                cudaFuncGetAttributes(&dst, consumer) == cudaSuccess && dst.ptxVersion >= 90 && dst.binaryVersion >= 90 &&
+                dst.maxThreadsPerBlock >= 256;
+            if (!swaRouterPdlSupported) cudaGetLastError();
+        }
+#endif
         devices = requested;
         for (int r = 0; r < 8; ++r) {
             cudaSetDevice(devices[r]);
