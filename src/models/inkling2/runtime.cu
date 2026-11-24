@@ -1621,7 +1621,7 @@ class Decoder final : public Runtime {
                             v.attach(owned->key, pool, draftDesc, count);
                             v.attach(owned->value, pool + 1, draftDesc, count);
                         } else v.shift = pageShift(len);
-                        v.reserveTable(int(std::min<int64_t>(perRequest, owned->key.pagedKVCacheData->maxPages)));
+                        v.reserveTable(std::min<int64_t>(perRequest, owned->key.pagedKVCacheData->maxPages), c.draft.local[l]);
                         if (req.restored) {
                             if (c.draft.local[l]) {
                                 v.prepare(past, c.draft.window);
@@ -1645,7 +1645,7 @@ class Decoder final : public Runtime {
                     int64_t slots = (limit + len - 1) / len;
                     if (c.local[c.visits[slot]])
                         slots = std::min(slots, (int64_t(c.window) + std::max(0, c.draft.block - 1) + len - 2) / len + 1);
-                    v.reserveTable(int(std::min<int64_t>(slots, v.key->pagedKVCacheData->maxPages)));
+                    v.reserveTable(std::min<int64_t>(slots, v.key->pagedKVCacheData->maxPages), c.local[c.visits[slot]]);
                     if (req.restored) {
                         for (int j = 0; j < 4; ++j) v.convState[j] = req.restored->conv[slot][j].load();
                         if (c.local[c.visits[slot]]) {

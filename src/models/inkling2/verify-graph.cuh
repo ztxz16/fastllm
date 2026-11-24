@@ -174,12 +174,16 @@ template <class T> void verifyUnaligned(RoundPlan &p, const std::vector<Segment>
     }
 }
 
+PageTableBatch roundPageTables;
+
 template <class T>
 std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anchors,
                              const std::vector<GenerationConfig> &sampling) {
     const auto start = std::chrono::steady_clock::now();
     const int b = batch.size(), slots = c.visits.size();
     auto &p = roundPlan<T>(b);
+    std::vector<VisitCache *> pendingTables;
+    pendingTables.reserve(size_t(b) * (slots + c.draft.layers));
 
     for (int i = 0; i < b; ++i) {
         auto &req = *batch[i].request;
@@ -189,20 +193,21 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
         for (int l = 0; l < c.draft.layers; ++l) {
             auto &kv = req.draft->kv[l]->cache;
             bool local = c.draft.local[l];
-            kv.prepare(req.length + c.draft.block, local ? c.draft.window + c.draft.block : 0);
-            p.draftViews[l * b + i] = {kv.view(), req.draft->recurrentContext.p, req.length,
+            kv.reservePages(req.length + c.draft.block, local ? c.draft.window + c.draft.block : 0);
+            p.draftViews[l * b + i] = {kv.view(&pendingTables), req.draft->recurrentContext.p, req.length,
                                        local ? std::max(0, req.length - c.draft.window) : 0};
         }
         for (int l = 0; l < slots; ++l) {
             auto &v = req.visits[l];
-            v.prepare(req.length + steps + 1, c.local[c.visits[l]] ? c.window + steps : 0);
+            v.reservePages(req.length + steps + 1, c.local[c.visits[l]] ? c.window + steps : 0);
             auto &dest = p.descriptors[l * b + i];
-            dest.pages = v.view();
+            dest.pages = v.view(&pendingTables);
             dest.past = req.length;
             dest.verifyRemaining = steps + 1;
             for (int s = 0; s < 4; ++s) dest.history[s] = v.convState[s].p;
         }
     }
+    roundPageTables.upload(pendingTables);
     uploadRound(p);
     if (p.draftExec) check(cudaGraphLaunch(p.draftExec, cudaStreamPerThread));
     else draftBody<T>(p);

@@ -16,10 +16,10 @@ struct RoundPlan {
     DecodeGraphScratch draftPool, verifyPool;
     Buffer<DecodeVisit> source, visits;
     Buffer<float> panels;
-    std::vector<DraftInput> hostInputs;
-    std::vector<uint64_t> hostSeeds;
-    std::vector<DraftView> draftViews;
-    std::vector<DecodeVisit> descriptors;
+    RoundHostVector<DraftInput> hostInputs;
+    RoundHostVector<uint64_t> hostSeeds;
+    RoundHostVector<DraftView> draftViews;
+    RoundHostVector<DecodeVisit> descriptors;
     RoundPlan(int b, const Config &c)
         : batch(b), steps(c.draft.steps), chain(steps + 1), views(b * c.draft.layers), inputs(b),
           temperature(b * chain + b), topP(b * chain + b), ids(b * chain), topK(b * chain + b), tokens(b * chain),
