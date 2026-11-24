@@ -28,6 +28,10 @@ struct CudaGroupedMxfp8Moe {
     virtual ~CudaGroupedMxfp8Moe() = default;
     // Backends with grouped Marlin weights can share them with native prefill.
     virtual CudaMarlinMxfp8Weights MarlinWeights(bool downProjection) const { return {}; }
+    // Leaves contiguous [token, route, hidden] BF16 down-projection rows in gateUp.
+    // Callers can combine route reduction with the next operation.
+    virtual void ProjectRoutes(const Data &input, const Data &indices, const Data &scores, Data &gateUp,
+                               Data &middle, int *scratch, const CudaMoeActivation &activation) const = 0;
 };
 std::unique_ptr<CudaGroupedMxfp8Moe> PrepareCudaGroupedMxfp8Moe(Data **weights, int count);
 

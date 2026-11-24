@@ -23,6 +23,7 @@
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
+#include "devices/cuda/fastllm-cuda-launch.cuh"
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
 #include "dequant.cuh"
@@ -50,7 +51,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const bool m_block_size_8, const int stages,
           const int group_blocks, const bool is_zp_float,
           const bool nvfp4_gate_up = false,
-          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false>
+          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false, const bool pdl = false>
 __global__ void Marlin(
     const int4 *__restrict__ A, const int4 *__restrict__ B,
     int4 *__restrict__ C, int4 *__restrict__ C_tmp,
@@ -243,7 +244,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,  // A ScalarTy
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
           const bool nvfp4_gate_up = false,  // independent gate/up global scales
-          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false
+          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false, const bool pdl = false
           >
 __global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
@@ -278,6 +279,7 @@ __global__ void Marlin(
     bool use_atomic_add,  // whether to use atomic add to reduce
     bool use_fp32_reduce  // whether to use fp32 global reduce
 ) {
+  if constexpr (pdl) fastllm::cuda_launch::DependencyStart();
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM

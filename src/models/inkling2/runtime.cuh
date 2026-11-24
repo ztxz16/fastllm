@@ -3,6 +3,7 @@
 #include "devices/cuda/fastllm-hybrid-moe-graph.cuh"
 #include "devices/cuda/fastllm-prefill-workspace.h"
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <stdexcept>
 #include <functional>
 #include <exception>
@@ -173,7 +174,8 @@ enum class ExpertPhase { Prefill, Decode, Verify };
 class ExpertBackend {
 public:
     virtual ~ExpertBackend() = default;
-    virtual Matrix run(const Config &, const Matrix &input, const float *bias, ExpertPhase phase) const = 0;
+    virtual Matrix run(const Config &, const Matrix &input, const float *bias, ExpertPhase phase,
+                       Rows<__nv_bfloat16> *unreduced = nullptr) const = 0;
 };
 
 // A decode step spends one admission budget across all host layers and repeated visits.

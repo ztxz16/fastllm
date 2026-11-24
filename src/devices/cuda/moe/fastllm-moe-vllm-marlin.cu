@@ -2946,12 +2946,17 @@ static __device__ __align__(16) DirectMarlinRows directMarlinRows{};
 // MXFP8 W8A16 uses the same BF16 tensor cores, scale permutation and GPU
 // routing as the FP4 Marlin path. Full-K tiles need no split-K locks or
 // partial outputs and give each routed row a batch-independent reduction.
+static constexpr auto Mxfp8DecodeKernel = marlin_kernel::Marlin<
+    marlin_types::kBFloat16.id(), marlin_types::kFE4M3fn.id(),
+    marlin_types::kBFloat16.id(), marlin_types::kFE8M0fnu.id(), 128, 1, 8, 4, true, 4, 2,
+    false, false, true, false, false, true>;
+
+static constexpr auto Mxfp8BatchKernel = marlin_kernel::Marlin<
+    marlin_types::kBFloat16.id(), marlin_types::kFE4M3fn.id(), marlin_types::kBFloat16.id(),
+    marlin_types::kFE8M0fnu.id(), 128, 2, 8, 4, false, 4, 2, false, false, true, false, false, true>;
+
 static MarlinMoeKernelFn Mxfp8GroupedKernel(int tile) {
-    using namespace marlin_types;
-    if (tile == 8) return marlin_kernel::Marlin<kBFloat16.id(), kFE4M3fn.id(),
-        kBFloat16.id(), kFE8M0fnu.id(), 128, 1, 8, 4, true, 4, 2, false, false, true>;
-    return marlin_kernel::Marlin<kBFloat16.id(), kFE4M3fn.id(),
-        kBFloat16.id(), kFE8M0fnu.id(), 128, 2, 8, 4, false, 4, 2, false, false, true>;
+    return tile == 8 ? Mxfp8DecodeKernel : Mxfp8BatchKernel;
 }
 
 struct MarlinDeviceFree { void operator()(void *p) const { cudaFree(p); } };
@@ -3026,6 +3031,17 @@ public:
     void Run(const fastllm::Data &input, fastllm::Data &output, const fastllm::Data &ids,
              const fastllm::Data &scores, fastllm::Data &gateOut, fastllm::Data &middle,
              int *scratch, const fastllm::CudaMoeActivation &activation) const override {
+        ProjectRoutes(input, ids, scores, gateOut, middle, scratch, activation);
+        const int rows = input.dims[0], top = ids.dims[1];
+        SumAwqMoeRowsFloatKernel<<<(rows * down.n + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(gateOut.cudaData), static_cast<float *>(output.cudaData),
+            rows, top, down.n);
+        if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("MXFP8 route reduction failed");
+    }
+
+    void ProjectRoutes(const fastllm::Data &input, const fastllm::Data &ids, const fastllm::Data &scores,
+                       fastllm::Data &gateOut, fastllm::Data &middle, int *scratch,
+                       const fastllm::CudaMoeActivation &activation) const override {
         int rows = input.dims[0], top = ids.dims[1], routes = rows * top;
         int tile = rows == 1 && top <= DirectMarlinRows::MaxTopK ? 8 : 32;
         const auto *expertIds = static_cast<const int *>(ids.cudaData);
@@ -3043,9 +3059,14 @@ public:
         }
         auto project = [&](const GroupedMxfp8Projection &p, const void *a, void *c, int m, int topk) {
             const int blocks = tile == 8 ? routes * (p.n / 128) : sms * 2;
-            auto kernel = Mxfp8GroupedKernel(tile);
-            kernel<<<blocks, 128, GetMarlinMoeSharedMemorySize(64, 128, tile, 4), stream>>>(
-                static_cast<const int4 *>(a), static_cast<const int4 *>(p.storage.get()), static_cast<int4 *>(c),
+            const int shared = GetMarlinMoeSharedMemorySize(64, 128, tile, 4);
+            auto launch = [&](auto... args) {
+                bool ok = tile == 8 ?
+                    fastllm::cuda_launch::Launch<Mxfp8DecodeKernel>(blocks, 128, shared, stream, args...) :
+                    fastllm::cuda_launch::Launch<Mxfp8BatchKernel>(blocks, 128, shared, stream, args...);
+                if (!ok) throw std::runtime_error("MXFP8 projection launch failed");
+            };
+            launch(static_cast<const int4 *>(a), static_cast<const int4 *>(p.storage.get()), static_cast<int4 *>(c),
                 nullptr, nullptr, nullptr, reinterpret_cast<const int4 *>(p.scales), nullptr, nullptr, nullptr,
                 sorted, expertIds, padded, static_cast<const float *>(scores.cudaData), topk, false,
                 p.k / 32, m, p.n, p.k, nullptr, false, false, false);
@@ -3053,9 +3074,6 @@ public:
         project(gate, input.cudaData, gateOut.cudaData, rows, top);
         activation.Run(gateOut, scores, middle, routes, down.k);
         project(down, middle.cudaData, gateOut.cudaData, routes, 1);
-        SumAwqMoeRowsFloatKernel<<<(rows * down.n + 255) / 256, 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16 *>(gateOut.cudaData), static_cast<float *>(output.cudaData),
-            rows, top, down.n);
         if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("MXFP8 grouped Marlin launch failed");
     }
 };

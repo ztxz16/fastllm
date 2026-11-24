@@ -3,6 +3,7 @@
 #include "fastllm-grouped-sm120.cuh"
 #include "fastllm-nvfp4-routed-sm120.cuh"
 #include "flashinfer/gemm/group_gemm_nvfp4_groupwise_sm120.cuh"
+#include <cub/block/block_scan.cuh>
 #include <limits>
 
 namespace fastllm::cuda::grouped_sm120 {
@@ -102,9 +103,59 @@ using Kernel = kernel::GemmUniversal<ShapeMNK, Mainloop, Epilogue>;
 using Gemm = device::GemmUniversalAdapter<Kernel>;
 using Metadata = grouped_sm120::Metadata<Gemm>;
 
+constexpr int routePlanThreads = 256;
+
+// A small verify batch fits in one CTA. Keep the histogram in shared memory
+// and publish the exclusive expert offsets and each route's rank together.
+__global__ void planGroupedRoutes(const int *ids, int *offsets, int *ranks, int experts, int routes) {
+    using Scan = cub::BlockScan<int, routePlanThreads>;
+    __shared__ int counts[routePlanThreads];
+    __shared__ typename Scan::TempStorage scan;
+    const int lane = threadIdx.x;
+    counts[lane] = 0;
+    __syncthreads();
+    for (int r = lane; r < routes; r += routePlanThreads)
+        ranks[r] = atomicAdd(counts + ids[r], 1);
+    __syncthreads();
+    int start;
+    Scan(scan).ExclusiveSum(counts[lane], start);
+    if (lane < experts) offsets[lane] = start;
+    if (lane == 0) offsets[experts] = routes;
+}
+
 __global__ void countGroupedRoutes(const int *ids, int *counts, int *rank, int routes) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r < routes) rank[r] = atomicAdd(counts + ids[r], 1);
+}
+// Each CTA owns a warp of experts. Their offsets can be found independently
+// by counting all routes to earlier experts while ranking this tile's routes.
+__global__ void planGroupedRouteTiles(const int *ids, int *offsets, int *ranks, int experts, int routes) {
+    constexpr int tile = 32;
+    using Scan = cub::BlockScan<int, routePlanThreads>;
+    __shared__ typename Scan::TempStorage scan;
+    __shared__ int counts[tile], base;
+    const int thread = threadIdx.x, first = blockIdx.x * tile;
+    if (thread < tile) counts[thread] = 0;
+    __syncthreads();
+    int earlier = 0;
+    for (int r = thread; r < routes; r += routePlanThreads) {
+        const int e = ids[r] - first;
+        earlier += e < 0;
+        if (unsigned(e) < tile) ranks[r] = atomicAdd(counts + e, 1);
+    }
+    int prefix;
+    Scan(scan).InclusiveSum(earlier, prefix);
+    if (thread == routePlanThreads - 1) base = prefix;
+    __syncthreads();
+    if (thread < tile) {
+        int cumulative = counts[thread];
+        for (int d = 1; d < tile; d *= 2) {
+            int previous = __shfl_up_sync(0xffffffffu, cumulative, d);
+            if (thread >= d) cumulative += previous;
+        }
+        if (first + thread < experts) offsets[first + thread] = base + cumulative - counts[thread];
+        if (first + thread == experts - 1) offsets[experts] = routes;
+    }
 }
 __global__ void packGroupedRows(const Block16 *src, const int *ids, const int *offset, const int *rank,
                                 GroupedBuffers buffers, int k, int topK) {
@@ -157,6 +208,16 @@ grouped_sm120::Scratch groupedScratch(int groups, int smCount) {
 }
 
 cudaError_t planGroupedRows(const int *ids, int *offsets, int *ranks, int experts, int routes, cudaStream_t stream) {
+    if (experts <= routePlanThreads && routes <= 4 * routePlanThreads) {
+        planGroupedRoutes<<<1, routePlanThreads, 0, stream>>>(ids, offsets, ranks, experts, routes);
+        return cudaGetLastError();
+    }
+    // Each tile scans all routes. Bound the number scanned per thread before
+    // switching to the grid-wide counter for larger batches.
+    if (experts <= routePlanThreads && routes <= 16 * routePlanThreads) {
+        planGroupedRouteTiles<<<(experts + 31) / 32, routePlanThreads, 0, stream>>>(ids, offsets, ranks, experts, routes);
+        return cudaGetLastError();
+    }
     auto status = cudaMemsetAsync(offsets, 0, sizeof(int) * experts, stream);
     if (status != cudaSuccess) return status;
     countGroupedRoutes<<<(routes + 255) / 256, 256, 0, stream>>>(ids, offsets, ranks, routes);

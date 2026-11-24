@@ -2,6 +2,7 @@
 // once in SM120 MMA register order. Decode and grouped prefill share the layout.
 #pragma once
 #include <cuda_runtime.h>
+#include "devices/cuda/fastllm-cuda-launch.cuh"
 #include <cuda_bf16.h>
 #if CUDART_VERSION >= 12080
 #include <cuda_fp8.h>
@@ -463,10 +464,13 @@ __device__ __forceinline__ int matchingRoute(unsigned low, unsigned high, int sl
 #endif
 // One warp computes sixteen output channels with a native 16x8x64 MMA.
 // Matching routes fill its input columns. Both paths split K between warps in a CTA.
-template <int Warps, bool MatchRoutes = false>
+enum class DecodeDependency { Serial, Gate, Down };
+template <int Warps, bool MatchRoutes = false, DecodeDependency Edge = DecodeDependency::Serial>
 static __global__ void decodeProject(Weights w, const Block16 *input, const int *ids, __nv_bfloat16 *out, int n,
                                      int k, int divisor, int routes = 0, int capacity = 0) {
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    static_assert(!MatchRoutes || Edge != DecodeDependency::Down);
+    if constexpr (Edge == DecodeDependency::Gate) cuda_launch::DependencyStart();
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int first = MatchRoutes ? blockIdx.z * capacity : 0;
     const int local = blockIdx.y, route = first + local;
@@ -490,10 +494,22 @@ static __global__ void decodeProject(Weights w, const Block16 *input, const int 
     }
     const Block16 *x = input + size_t(src / divisor) * (k / 16);
     const size_t base = (size_t(expert) * (n / 16) + blockIdx.x) * (k / 64);
+    // The gate waited for the router and the activation waited for the gate.
+    // Only the down input is outstanding here. Stage the selected expert's
+    // first weight tile while that activation is still being produced.
+    uint4 firstWeight{};
+    unsigned firstScale = 0;
+    if constexpr (Edge == DecodeDependency::Down) {
+        if (warp < k / 64) {
+            firstWeight = w.codes[(base + warp) * 32 + lane];
+            firstScale = w.scales[(base + warp) * 16 + lane / 4 * 2 + (lane & 1)];
+        }
+        cuda_launch::DependencyStart();
+    }
     float v[4] = {};
     for (int t = warp; t < k / 64; t += Warps) {
-        const uint4 a = w.codes[(base + t) * 32 + lane];
-        const unsigned sa = w.scales[(base + t) * 16 + lane / 4 * 2 + (lane & 1)];
+        const uint4 a = Edge == DecodeDependency::Down && t == warp ? firstWeight : w.codes[(base + t) * 32 + lane];
+        const unsigned sa = Edge == DecodeDependency::Down && t == warp ? firstScale : w.scales[(base + t) * 16 + lane / 4 * 2 + (lane & 1)];
         const unsigned b0 = x[t * 4 + (lane % 4) / 2].code[lane & 1],
                        b1 = x[t * 4 + 2 + (lane % 4) / 2].code[lane & 1];
         const unsigned sb =
