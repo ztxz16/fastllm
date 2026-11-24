@@ -72,7 +72,7 @@ __global__ __launch_bounds__(Traits::NUM_THREADS) void pagedRelativePrefill(Para
 template<int D, class KV> using PrefillTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal, 64, 1, 2, 2*D/16, D/16, 4, 1,
         flashinfer::PosEncodingMode::kNone, KV, KV, float, float, int, PrefillRelative, false>;
 
-template<class Traits, class Params> bool configurePrefillKernel(void (*kernel)(Params) = pagedRelativePrefill<Traits, Params>) {
+template<size_t SharedBytes, class Kernel> bool configureTensorCoreKernel(Kernel kernel, int blockThreads = 0) {
     cudaFuncAttributes attr{};
     auto status = cudaFuncGetAttributes(&attr, kernel);
     if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
@@ -82,15 +82,19 @@ template<class Traits, class Params> bool configurePrefillKernel(void (*kernel)(
     check(status);
     // A legacy PTX image JIT-compiled on a newer GPU still contains the
     // pre-SM80 implementation selected at compile time.
-    if (attr.ptxVersion < 80 || attr.binaryVersion < 80) return false;
-    constexpr size_t bytes = sizeof(typename Traits::SharedStoragePaged);
-    if constexpr (bytes <= 48 * 1024) return true;
+    if (attr.ptxVersion < 80 || attr.binaryVersion < 80 || attr.maxThreadsPerBlock < blockThreads) return false;
+    const size_t totalBytes = SharedBytes + attr.sharedSizeBytes;
+    if (totalBytes <= 48 * 1024) return true;
     int device, limit;
     check(cudaGetDevice(&device));
     check(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-    if (bytes > size_t(limit)) return false;
-    check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    if (totalBytes > size_t(limit)) return false;
+    check(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes));
     return true;
+}
+
+template<class Traits, class Params> bool configurePrefillKernel(void (*kernel)(Params) = pagedRelativePrefill<Traits, Params>) {
+    return configureTensorCoreKernel<sizeof(typename Traits::SharedStoragePaged)>(kernel);
 }
 
 template<int D, class KV> bool configurePrefill() {

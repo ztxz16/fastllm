@@ -6,6 +6,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda-attn-res.cuh"
+#include "devices/cuda/low_latency/bf16_projection.cuh"
 #include <cuda_runtime.h>
 #include "attention/variants.cuh"
 #include "attention/decode.cuh"
@@ -405,7 +406,7 @@ class Decoder final : public Runtime {
     Matrix graphLogits, unitScale, splitScratch;
     int smCount = 0, sm120GlobalSplits = 0, verifyAttentionSplits = 0;
     bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
-    bool bf16WindowBias = false, batchedController = false;
+    bool bf16WindowBias = false, batchedController = false, fusedPrefillController = false;
 
     Data &weight(const std::string &key) const {
         auto &w = weights.weight.at("model.llm." + key);
@@ -470,15 +471,18 @@ class Decoder final : public Runtime {
         for (int i = 0; i < count; ++i)
             streams.items[i] = {dest[i].p, messages.slice(i * n, n).p, norms[i]};
         const auto path = prefix + (count == 1 ? "controllers.mlp." : "controllers.qkv.");
+        auto bf16Weight = [&](const char *name, int rows, int cols) -> const __nv_bfloat16 * {
+            const auto &w = weights.weight.at("model.llm." + path + name);
+            if (w.dataType != BFLOAT16 || w.dims.size() != 2 || w.dims[0] != rows || w.dims[1] != cols)
+                return nullptr;
+            return static_cast<const __nv_bfloat16 *>(w.cudaData);
+        };
         if constexpr (std::is_same_v<T, __nv_bfloat16>) {
             if (batchedController && decodeArithmetic && n > 1) {
-                const auto &down = weights.weight.at("model.llm." + path + "down_weight");
-                const auto &gate = weights.weight.at("model.llm." + path + "gates_weight");
-                if (down.dataType == BFLOAT16 && down.dims.size() == 2 && down.dims[0] == count * c.rank &&
-                    down.dims[1] == 2 * d && gate.dataType == BFLOAT16 && gate.dims.size() == 2 &&
-                    gate.dims[0] == count * 2 * d && gate.dims[1] == c.rank) {
-                    launchBatchedController(streams, pair, out, static_cast<const T *>(down.cudaData),
-                                            static_cast<const T *>(gate.cudaData), count, c.rank, smCount, c.eps);
+                const auto *down = bf16Weight("down_weight", count * c.rank, 2 * d);
+                const auto *gate = bf16Weight("gates_weight", count * 2 * d, c.rank);
+                if (down && gate) {
+                    launchBatchedController(streams, pair, out, down, gate, count, c.rank, smCount, c.eps);
                     return out;
                 }
             }
@@ -487,6 +491,20 @@ class Decoder final : public Runtime {
             ControllerNormRows<true, T, T, 2304><<<dim3(n, count), 512, 0, cudaStreamPerThread>>>(streams, nullptr, pair.p, c.eps);
         else PairRMSNorm<<<count * n * 2, 512, 0, cudaStreamPerThread>>>(streams, pair.p, n, d, c.eps);
         auto hidden = linear(pair, path + "down_weight", c.rank, count);
+        if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+            // Eight tokens per block need a long prompt to occupy the SMs.
+            if (fusedPrefillController && !decodeArithmetic && n >= 1024) {
+                if (const auto *gate = bf16Weight("gates_weight", count * 2 * d, c.rank)) {
+                    Buffer<ControllerGateTile> packed(count * 2 * controllerTiles, CurrentPrefillWorkspace());
+                    packControllerGates<<<dim3(controllerTiles, count * 2, 4), 128, 0, cudaStreamPerThread>>>(
+                        gate, packed.p);
+                    const dim3 grid((n + controllerRows - 1) / controllerRows, count);
+                    prefillControllerMix<Out><<<grid, controllerThreads, controllerSharedBytes, cudaStreamPerThread>>>(
+                        streams, hidden.p, packed.p, out.p, n, c.eps);
+                    return out;
+                }
+            }
+        }
         // Controller coefficients feed tanh and the FP32 residual blend directly.
         auto gates = Matrix::temporary(count * n, 2 * d);
         projectInto(hidden, path + "gates_weight", gates, 0, count);
@@ -1291,10 +1309,11 @@ class Decoder final : public Runtime {
 #ifndef CUDA_NO_TENSOR_CORE
         int major;
         check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, p.gpu));
-        if (FastllmCudaRuntimeArch() == 120 && c.hidden == 2304 && c.rank == 64) {
-            cudaFuncAttributes attr{};
-            check(cudaFuncGetAttributes(&attr, controllerQkvGates));
-            batchedController = attr.binaryVersion >= 80 && attr.ptxVersion >= 80;
+        if (FastllmCudaRuntimeArch() == 120 && c.hidden == controllerWidth && c.rank == controllerRank) {
+            batchedController = configureTensorCoreKernel<0>(controllerQkvGates, 128);
+            fusedPrefillController =
+                configureTensorCoreKernel<controllerSharedBytes>(prefillControllerMix<__nv_bfloat16>, controllerThreads) &&
+                configureTensorCoreKernel<controllerSharedBytes>(prefillControllerMix<float>, controllerThreads);
         }
         if (major >= 8 && (c.headDim == 64 || c.headDim == 128) && c.relative <= threads) {
             tensorPrefill = c.headDim == 128 ? configurePrefill<128, half>() && configurePrefill<128, __nv_bfloat16>()

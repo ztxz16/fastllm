@@ -114,6 +114,15 @@ __device__ __forceinline__ float controllerMix(float dest, float msg, float gain
     return fmaf(1.f - tanhf(forget), dest, __fmul_rn(tanhf(gain), msg));
 }
 
+// The MLP consumes FP32 storage containing the same rounded values as Q/K/V.
+template<class Round, class Out>
+__device__ __forceinline__ cuda_attn_res::Channels4<Out> controllerNorm4(float4 x, float inv, float4 w) {
+    return {Out(Round(x.x * inv * w.x)), Out(Round(x.y * inv * w.y)),
+            Out(Round(x.z * inv * w.z)), Out(Round(x.w * inv * w.w))};
+}
+
+using cuda::low_latency::projection::mma_bf16_16816;
+
 // The three-matrix singleton controller uses BF16 tensor cores. Keep its
 // K=16 accumulation boundaries and reuse each weight tile across queries.
 __global__ void controllerQkvGates(const __nv_bfloat16 *hidden,
@@ -133,12 +142,7 @@ __global__ void controllerQkvGates(const __nv_bfloat16 *hidden,
 #pragma unroll
         for (int side = 0; side < 2; ++side) {
             const auto *w = weight + side * width * rank + k;
-            auto &v = gates[side];
-            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
-                : "+f"(v[0]), "+f"(v[1]), "+f"(v[2]), "+f"(v[3])
-                : "r"(load(w)), "r"(load(w + 8 * rank)), "r"(load(w + 8)),
-                  "r"(load(w + 8 * rank + 8)), "r"(b0), "r"(b1));
+            mma_bf16_16816(gates[side], load(w), load(w + 8 * rank), load(w + 8), load(w + 8 * rank + 8), b0, b1);
         }
     }
 #pragma unroll
@@ -148,6 +152,96 @@ __global__ void controllerQkvGates(const __nv_bfloat16 *hidden,
         const size_t offset = (size_t(stream) * rows + row) * (2 * width) + channel + (i / 2) * 8;
         out[offset] = gates[0][i];
         out[offset + width] = gates[1][i];
+    }
+#endif
+}
+
+// Reorder the checkpoint's [stream, gain/forget, channel, rank] weights into
+// warp fragments. Interleave four 16-channel fragments for float4 residual loads.
+struct ControllerGateTile {
+    uint4 fragment[4][4][32]; // rank tile, channel tile, warp lane
+};
+constexpr int controllerWidth = 2304, controllerRank = 64, controllerRows = 8;
+constexpr int controllerTiles = controllerWidth / 64, controllerThreads = controllerWidth / 4;
+constexpr int controllerPitch = controllerWidth + 4;
+constexpr int controllerSharedBytes = controllerRows * controllerPitch * sizeof(float);
+
+__global__ void packControllerGates(const __nv_bfloat16 *weight, ControllerGateTile *tiles) {
+    const int lane = threadIdx.x % 32, tile = threadIdx.x / 32;
+    const int channel = blockIdx.x * 64 + (lane / 4) * 4 + tile;
+    const int k = blockIdx.z * 16 + (lane % 4) * 2;
+    const auto *w = weight + (blockIdx.y * controllerWidth + channel) * controllerRank + k;
+    auto pair = [](const __nv_bfloat16 *p) { return *reinterpret_cast<const unsigned *>(p); };
+    tiles[blockIdx.y * controllerTiles + blockIdx.x].fragment[blockIdx.z][tile][lane] =
+        make_uint4(pair(w), pair(w + 32 * controllerRank), pair(w + 8), pair(w + 32 * controllerRank + 8));
+}
+
+// One block owns eight complete rows. Gain and forget never leave registers,
+// and the mixed FP32 rows stay on chip until the output normalization.
+template<class Out>
+__global__ void prefillControllerMix(FASTLLM_ROW_PARAMETER LoopStreams streams, const __nv_bfloat16 *hidden,
+                                     const ControllerGateTile *weights, Out *out, int rows, float eps) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    extern __shared__ __align__(16) float mixed[][controllerPitch];
+    __shared__ float partial[controllerRows][16];
+    const int first = blockIdx.x * controllerRows, stream = blockIdx.y;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const LoopStream &s = streams.items[stream];
+    const size_t hiddenRow = size_t(stream) * rows + min(first + lane / 4, rows - 1);
+    const auto *h = hidden + hiddenRow * controllerRank + (lane % 4) * 2;
+    uint2 activation[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const auto *p = reinterpret_cast<const unsigned *>(h + k * 16);
+        activation[k] = make_uint2(p[0], p[4]);
+    }
+#pragma unroll
+    for (int group = warp; group < controllerTiles; group += controllerThreads / 32) {
+        const auto *gate = weights + 2 * stream * controllerTiles + group;
+        float gain[4][4]{}, forget[4][4]{};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+#pragma unroll
+            for (int tile = 0; tile < 4; ++tile) {
+                const uint4 g = gate[0].fragment[k][tile][lane], f = gate[controllerTiles].fragment[k][tile][lane];
+                mma_bf16_16816(gain[tile], g.x, g.y, g.z, g.w, activation[k].x, activation[k].y);
+                mma_bf16_16816(forget[tile], f.x, f.y, f.z, f.w, activation[k].x, activation[k].y);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int row = lane % 4 * 2 + i % 2, col = group * 64 + lane / 4 * 4 + i / 2 * 32;
+            const size_t offset = size_t(min(first + row, rows - 1)) * controllerWidth + col;
+            const float4 x = *reinterpret_cast<const float4 *>(s.dest + offset);
+            const float4 m = *reinterpret_cast<const float4 *>(s.msg + offset);
+            *reinterpret_cast<float4 *>(&mixed[row][col]) = make_float4(
+                controllerMix(x.x, m.x, gain[0][i], forget[0][i]), controllerMix(x.y, m.y, gain[1][i], forget[1][i]),
+                controllerMix(x.z, m.z, gain[2][i], forget[2][i]), controllerMix(x.w, m.w, gain[3][i], forget[3][i]));
+        }
+    }
+    __syncthreads();
+    // Match the 512-thread ControllerNormRows summation tree and its BF16 rounding.
+    float4 values[controllerRows];
+#pragma unroll
+    for (int r = 0; r < controllerRows; ++r) {
+        const auto *v = reinterpret_cast<const float4 *>(mixed[r]);
+        values[r] = v[threadIdx.x];
+        if (warp < 16) {
+            float sq = cuda_attn_res::Square4(values[r]);
+            if (threadIdx.x < controllerThreads - 512) sq += cuda_attn_res::Square4(v[threadIdx.x + 512]);
+            sq = cuda::WarpSum(sq);
+            if (lane == 0) partial[r][warp] = sq;
+        }
+    }
+    __syncthreads();
+    const float4 w = reinterpret_cast<const float4 *>(s.norm)[threadIdx.x];
+#pragma unroll
+    for (int r = 0; r < controllerRows; ++r) {
+        if (first + r >= rows) break;
+        const float inv = rsqrtf(cuda::WarpSum(lane < 16 ? partial[r][lane] : 0.f) / controllerWidth + eps);
+        const size_t offset = (size_t(stream) * rows + first + r) * controllerWidth;
+        auto *y = reinterpret_cast<cuda_attn_res::Channels4<Out> *>(out + offset);
+        y[threadIdx.x] = controllerNorm4<__nv_bfloat16, Out>(values[r], inv, w);
     }
 #endif
 }
@@ -274,8 +368,7 @@ __global__ void ControllerNormRows(FASTLLM_ROW_PARAMETER LoopStreams streams, co
                 y[cols + j] = {Out(v.x * sb), Out(v.y * sb), Out(v.z * sb), Out(v.w * sb)};
             } else {
                 float4 w = reinterpret_cast<const float4 *>(stream.norm)[j];
-                y[j] = {Out(T(v.x * sa * w.x)), Out(T(v.y * sa * w.y)),
-                        Out(T(v.z * sa * w.z)), Out(T(v.w * sa * w.w))};
+                y[j] = controllerNorm4<T, Out>(v, sa, w);
             }
         }
     }
