@@ -150,6 +150,7 @@ int main() {
             AdversarialSamples(keys, keys - 5);
         AdversarialSamples(16342, 14208, 32);
         AdversarialSamples(8193, 8161, 32);
+        AdversarialSamples(8704, 8192, 32);
         // Cold-prefix padding, the K boundary, and many identical candidates.
         for (int past : {0, 2046, 4094})
             AdversarialSamples(7335, past);

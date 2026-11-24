@@ -70,7 +70,9 @@ __global__ void SelectSortPrefill16K(const float *scores, int keys, int past,
     const unsigned cutoff = prefix;
     const bool trimTies = candidates > capacity;
     if (trimTies) {
-        #pragma unroll
+        // Fully unrolling the rare tie scan with CUDA 12.9 on Blackwell can
+        // produce misaligned shared accesses in the subsequent compaction.
+        #pragma unroll 1
         for (int j = 0; j < items; ++j) {
             unsigned equal = __ballot_sync(0xffffffff, j * threads + t < count && values[j] == cutoff);
             if (!(t % 32)) counts[j * (threads / 32) + t / 32] = __popc(equal);
