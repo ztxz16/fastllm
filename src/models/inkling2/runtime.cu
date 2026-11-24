@@ -352,7 +352,7 @@ template <typename Residual = float, typename T> Rows<Residual> convolutions(con
         Rows<Residual> out(input.rows, input.cols);
         const auto *visits = batch.front().timeline + slot * input.rows;
         const int chain = batch.front().length;
-        auto kernel = chain == 1 ? decodeConv<false, T> : decodeConv<true, T>;
+        auto kernel = chain == 1 ? decodeConv<false, T, Residual> : decodeConv<true, T, Residual>;
         kernel<<<dim3((input.cols + 255) / 256, input.rows), 256, 0, cudaStreamPerThread>>>(
             input.p, visits, index, weight, dynamic.p, out.p, input.cols, taps, heads, residual.p, chain);
         return out;
