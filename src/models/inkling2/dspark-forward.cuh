@@ -5,26 +5,28 @@ Buffer<uint16_t> foldedHead, foldedBias;
 const Data *quantizedFold = nullptr;
 const float *quantizedFoldBias = nullptr;
 
+int draftVocabRows() const { return placement.world > 1 ? placement.vocabRows : c.vocab; }
+
 template <class T> void foldDraftHead() {
-    const int h = c.hidden, rank = c.draft.rank;
+    const int h = c.hidden, rank = c.draft.rank, vocab = draftVocabRows();
     const auto type = std::is_same_v<T, half> ? FLOAT16 : BFLOAT16;
     auto &head = weights.weight.at("model.llm.unembed.weight");
     auto &project = weights.weight.at("model.llm.draft.markov_head.hidden_out.weight");
     auto saved = weights.weight.find("model.llm.draft.markov_head.folded.weight");
     if (saved != weights.weight.end()) {
-        if (!q8Projection(saved->second) || saved->second.dims != std::vector<int>{c.vocab, rank} ||
+        if (!q8Projection(saved->second) || saved->second.dims != std::vector<int>{vocab, rank} ||
             !q8Projection(head)) throw std::runtime_error("Invalid quantized Inkling draft head");
         quantizedFold = &saved->second;
-        quantizedFoldBias = param("draft.markov_head.folded.bias", c.vocab);
+        quantizedFoldBias = param("draft.markov_head.folded.bias", vocab);
         return;
     }
-    if (head.dims.size() != 2 || head.dims[0] < c.vocab || head.dims[1] != h ||
+    if (head.dims.size() != 2 || head.dims[0] < vocab || head.dims[1] != h ||
         project.dims != std::vector<int>{h, rank} || head.dataType != type || project.dataType != type)
         throw std::runtime_error("Invalid Inkling draft output projection");
-    foldedHead = Buffer<uint16_t>(size_t(c.vocab) * rank);
-    foldedBias = Buffer<uint16_t>(c.vocab);
-    Data out(type, {c.vocab, rank}, CUDA, foldedHead.p);
-    if (!FastllmCudaBatchMatMul(head, project, out, 0, 0, 0, h, rank, 1, c.vocab, h, rank, 1.f))
+    foldedHead = Buffer<uint16_t>(size_t(vocab) * rank);
+    foldedBias = Buffer<uint16_t>(vocab);
+    CudaView out(type, {vocab, rank}, foldedHead.p);
+    if (!FastllmCudaBatchMatMul(head, project, out, 0, 0, 0, h, rank, 1, vocab, h, rank, 1.f))
         throw std::runtime_error("Inkling draft head folding failed");
     Rows<T> bias(1, h);
     castProjection<<<(h + 255) / 256, 256, 0, cudaStreamPerThread>>>(param("draft.markov_head.hidden_out.bias", h),
@@ -32,7 +34,7 @@ template <class T> void foldDraftHead() {
     Rows<T> folded;
     folded.p = reinterpret_cast<T *>(foldedBias.p);
     folded.rows = 1;
-    folded.cols = c.vocab;
+    folded.cols = vocab;
     projectInto(bias, "unembed.weight", folded, 0, 1);
 }
 
@@ -133,7 +135,7 @@ struct DraftProjectionGroup {
 bool draftBf16GateUp(const Rows<__nv_bfloat16> &input, const std::array<const Data *, 2> &w,
                      const std::array<void *, 2> &out, int columns, DraftProjectionGroup &plan) {
     auto *pool = DecodeGraphScratch::active;
-    if (!pool || !plan.device || !singletonControllerPdl) return false;
+    if (!pool || !plan.device || !decodePdlSupported) return false;
     const std::array<void *, 6> pointers{w[0]->cudaData, w[1]->cudaData, input.p, input.p, out[0], out[1]};
     if (pool->recording()) {
         if (!plan.ready || plan.pointers != pointers) return false;
@@ -183,7 +185,7 @@ std::array<Rows<T>, N> draftProjections(const Rows<T> &input, const std::string 
         }
     }
     if constexpr (std::is_same_v<T, __nv_bfloat16> && N > 1) {
-        const bool native = fullWidths && DecodeGraphScratch::active && singletonControllerPdl &&
+        const bool native = fullWidths && DecodeGraphScratch::active && decodePdlSupported &&
             std::all_of(weightsIn.begin(), weightsIn.end(), [](const Data *w) {
                 return w->dataType == BFLOAT16 && w->cudaData && !w->IsRepacked;
             });

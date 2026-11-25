@@ -37,6 +37,7 @@ const FastllmBf16MmaProjections *FastllmCudaGetBf16MmaProjections();
 // A one-row BF16 projection can stage its weights before its producer finishes.
 // Returns nullptr when the compiled kernel cannot wait on a programmatic dependency.
 FastllmBf16MmaProjections::Project FastllmCudaGetPdlBf16Gemv();
+FastllmBf16MmaProjections::Project FastllmCudaGetPdlBf16FloatGemv();
 // Positive cap requests FP32 logits after the reference BF16 result is rounded.
 bool FastllmCudaBf16PdlProjection(const void *q, const void *k, const void *v, const void *weights,
         void *out, int width, int qEnd, int kEnd, int columns, float cap);

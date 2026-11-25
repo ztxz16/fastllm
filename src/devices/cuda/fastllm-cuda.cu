@@ -19213,7 +19213,7 @@ static bool DrawGraphProposal(FastllmMtpSamplingWorkspace &ws, fastllm_markov::M
     int device, sms;
     if (cudaGetDevice(&device) != cudaSuccess ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) return false;
-    if (ws.topPState && ws.softmaxTiles <= 256 && minBlocks <= sms && scores.cap > 0.f && std::isfinite(scores.cap)) {
+    if (ws.topPState && ws.softmaxTiles <= 256 && minBlocks <= sms && (!scores.adjust || (scores.cap > 0.f && std::isfinite(scores.cap)))) {
         int residency = 1;
         if (ws.proposalSupport && ws.rows > sms / minBlocks &&
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&residency, SelectGraphDrawSupport<T>,
@@ -19256,6 +19256,18 @@ static bool DrawGraphProposal(FastllmMtpSamplingWorkspace &ws, fastllm_markov::M
                                        q, qStride, tokens, tokenStride);
 }
 
+bool FastllmCudaMtpGraphDrawLogits(void *workspace, const void *logits, bool bf16, const float *temperature,
+                                  int *topK, const float *topP, uint64_t *rng, float *q, int qStride,
+                                  int *tokens, int tokenStride) {
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(workspace);
+    auto draw = [&](auto *typed) {
+        using T = std::remove_cv_t<std::remove_pointer_t<decltype(typed)>>;
+        fastllm_markov::MarkovProposalScores<T> scores{typed, nullptr, nullptr, ws.vocab, ws.vocab, 0.f};
+        return DrawGraphProposal(ws, scores, temperature, topK, topP, rng, 0, q, qStride, tokens, tokenStride);
+    };
+    return bf16 ? draw(static_cast<const __nv_bfloat16 *>(logits)) : draw(static_cast<const half *>(logits));
+}
+
 extern "C" bool FastllmCudaMtpGraphDrawMarkov(void *workspace, const void *base, int baseStride, const void *adjust,
                                               const void *bias, float cap, bool bf16, const float *temperature,
                                               int *topK, const float *topP, uint64_t *rng, int step, float *q,
@@ -19285,14 +19297,6 @@ bool FastllmCudaMtpGraphDrawMarkovFloat(void *workspace, const float *base, int 
     return DrawGraphProposal(ws, scores, temperature, topK, topP, rng, step, q, qStride, tokens, tokenStride);
 }
 
-bool FastllmCudaMtpRepairFold(void *workspace, const float *base, const float *adjust, const float *bias,
-        float cap, const float *t, int *k, const float *p, uint64_t *seed, float *q, int *token, int vocab,
-        cudaStream_t stream) {
-    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(workspace);
-    fastllm_markov::MarkovProposalScores<float> scores{base, adjust, bias, vocab, vocab, cap};
-    return DrawGraphProposal(ws, scores, t, k, p, seed, 0, q, vocab, token, 1, stream, true);
-}
-
 bool FastllmCudaMtpRepairBf16Fold(void *workspace, const void *base, const void *adjust, const void *bias,
         float cap, const float *t, int *k, const float *p, uint64_t *seed, float *q, int *token, int vocab,
         cudaStream_t stream) {
@@ -19312,18 +19316,6 @@ bool FastllmCudaMtpFoldSelection(void *workspace, int sms, FastllmFoldSelection 
     selection = {reinterpret_cast<unsigned *>(ws.rowStates), int(sizeof(*ws.rowStates) / sizeof(unsigned)),
                  ws.output, std::min(sms, (ws.vocab + 2047) / 2048)};
     return true;
-}
-
-bool FastllmCudaMtpDrawFoldScores(void *workspace, const float *scores, const FastllmFoldSelection &selection,
-        const int *k, const float *p, const uint64_t *seed, float *q, int *token, int *complete, bool first) {
-    using namespace fastllm_markov;
-    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(workspace);
-    const int chunk = (ws.vocab + selection.blocks - 1) / selection.blocks;
-    CollectFoldSupport<<<selection.blocks, kGraphRadixThreads, chunk * sizeof(unsigned), cudaStreamPerThread>>>(
-        scores, ws.vocab, k, ws.output, reinterpret_cast<float2 *>(ws.bufferA), ws.rowStates, chunk, complete, first);
-    SampleGraphDrawSupport<true><<<1, kCompactGraphDraw, 0, cudaStreamPerThread>>>(
-        ws.bufferA, ws.output, k, p, seed, 0, q, ws.vocab, token, 1, complete, nullptr, ws.vocab, first);
-    return cudaGetLastError() == cudaSuccess;
 }
 
 bool FastllmCudaMtpDrawBf16Fold(void *workspace, const void *base, const void *adjust, const void *bias,

@@ -429,7 +429,7 @@ public:
             cycle->layers.push_back({cache, gate, down});
         }
     }
-    Matrix run(const Config &c, const Matrix &x, const float *bias, ExpertPhase phase, Rows<__nv_bfloat16> *) const override {
+    Matrix run(const Config &c, const Matrix &x, const float *bias, ExpertPhase phase, Rows<__nv_bfloat16> *, Rows<__nv_bfloat16> *, int) const override {
         Matrix out(x.rows, c.hidden);
         // The gather and indexed GEMVs use a grid.y entry per route. Keep the
         // packed CPU/GPU scratch bounded independently of total prompt length.

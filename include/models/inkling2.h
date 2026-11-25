@@ -3,6 +3,11 @@
 
 namespace fastllm {
 namespace inkling2 {
+inline bool ordinarySampling(const GenerationConfig &cfg) {
+    return cfg.repeat_penalty == 1.f && cfg.tool_call_allowed_token_ids.empty() &&
+           !cfg.tool_call_token_mask && cfg.top_k > 0 && cfg.temperature > 0.f && cfg.top_p > 0.f &&
+           cfg.top_p <= 1.f;
+}
 struct TensorRange {
     std::string file, type;
     std::vector<int> shape;
@@ -35,17 +40,21 @@ struct Config {
 enum class ExpertDevice { Cuda, Cpu, Numa };
 struct Placement {
     int gpu;
+    std::vector<int> tensorDevices;
     std::vector<ExpertDevice> experts;
     DataType denseType = BFLOAT16;
+    int world = 1, rank = 0, vocabRows = 0;
+    int cacheSlot(int slot) const { return world == 1 ? slot : slot * world + rank; }
 };
 class Runtime {
 public:
     virtual ~Runtime() = default;
+    virtual bool hasRankCaches() const { return false; }
     virtual int prefix(ResponseContext &, int limit, bool restore) = 0;
     virtual void setPrefixCache(bool enabled) = 0;
     virtual bool popPending(Data &key, int previous, int &token) = 0;
     virtual void warmupDecodeGraph() = 0;
-    virtual std::unique_ptr<basellm::DecodePipeline> pipeline(ResponseContext &context) = 0;
+    virtual std::unique_ptr<basellm::DecodePipeline> pipeline(const std::vector<ResponseContext *> &contexts) = 0;
     virtual std::vector<int> forward(const Data &ids, const std::vector<Data *> &positions,
                                      const std::vector<int> &lengths,
                                      const std::vector<std::pair<Data *, Data *>> &cache,
@@ -120,12 +129,20 @@ public:
         int layer, bool key, const ResponseContext *ctx) const override {
         // Sliding windows rotate in-place and must have private writable pages.
         if (GetKVCacheRetainedTokens(layer) >= 0) return {};
+        if (runtime && runtime->hasRankCaches()) {
+            std::vector<std::pair<int, PagedCacheManager *>> managers;
+            for (size_t i = 0; i < placement.tensorDevices.size(); ++i)
+                managers.emplace_back(placement.tensorDevices[i],
+                    GetPagedCacheManager(2 * (layer * placement.tensorDevices.size() + i) + (key ? 0 : 1)));
+            return managers;
+        }
         return basellm::GetPagedKVCacheManagersForRequest(layer, key, ctx);
     }
     bool DeferHistoryCacheRestore() const override { return saveHistoryChat; }
     bool UseGenericHistoryCache() const override { return false; }
 
 private:
+    int draftKvHeadsOnDevice(int deviceId) const;
     inkling2::Config cfg{};
     inkling2::Placement placement{};
     std::unique_ptr<inkling2::Runtime> runtime;

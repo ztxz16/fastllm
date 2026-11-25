@@ -5,7 +5,8 @@ struct InklingWindowKernel {
     void *handle = nullptr;
     int shared = 0;
 };
-InklingWindowKernel PrepareInklingWindowKernel(int heads, int group, int window, int extent, int page);
+InklingWindowKernel PrepareInklingWindowKernel(int heads, int group, int window, int extent, int page,
+                                              bool decode = false, int splits = 1);
 }
 
 extern "C" void *FastllmCudaLoadWindowVerify(const char *cubin, const char *name, int shared);

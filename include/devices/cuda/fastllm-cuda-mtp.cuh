@@ -154,6 +154,9 @@ bool FastllmCudaMtpRejectionWithAccepted(float *logits, float *proposalProbs,
 
 // Fixed-address graph stages. Parameters and the live proposal count are device
 // inputs, so sampling settings and clipped tails do not change graph topology.
+bool FastllmCudaMtpGraphDrawLogits(void *workspace, const void *logits, bool bf16, const float *temperature,
+                                  int *topK, const float *topP, uint64_t *rng, float *q, int qStride,
+                                  int *tokens, int tokenStride);
 bool FastllmCudaMtpGraphDrawMarkovFloat(void *workspace, const float *base, int baseStride, const float *adjust,
                                        const float *bias, float cap, const float *temperature, int *topK,
                                        const float *topP, uint64_t *rng, int step, float *q,

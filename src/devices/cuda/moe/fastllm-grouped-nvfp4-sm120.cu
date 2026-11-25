@@ -115,17 +115,17 @@ __global__ void planGroupedRoutes(const int *ids, int *offsets, int *ranks, int 
     counts[lane] = 0;
     __syncthreads();
     for (int r = lane; r < routes; r += routePlanThreads)
-        ranks[r] = atomicAdd(counts + ids[r], 1);
+        if (ids[r] >= 0) ranks[r] = atomicAdd(counts + ids[r], 1);
     __syncthreads();
     int start;
     Scan(scan).ExclusiveSum(counts[lane], start);
     if (lane < experts) offsets[lane] = start;
-    if (lane == 0) offsets[experts] = routes;
+    if (lane == experts - 1) offsets[experts] = start + counts[lane];
 }
 
 __global__ void countGroupedRoutes(const int *ids, int *counts, int *rank, int routes) {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r < routes) rank[r] = atomicAdd(counts + ids[r], 1);
+    if (r < routes && ids[r] >= 0) rank[r] = atomicAdd(counts + ids[r], 1);
 }
 // Each CTA owns a warp of experts. Their offsets can be found independently
 // by counting all routes to earlier experts while ranking this tile's routes.
@@ -140,7 +140,7 @@ __global__ void planGroupedRouteTiles(const int *ids, int *offsets, int *ranks, 
     int earlier = 0;
     for (int r = thread; r < routes; r += routePlanThreads) {
         const int e = ids[r] - first;
-        earlier += e < 0;
+        earlier += ids[r] >= 0 && e < 0;
         if (unsigned(e) < tile) ranks[r] = atomicAdd(counts + e, 1);
     }
     int prefix;
@@ -154,13 +154,14 @@ __global__ void planGroupedRouteTiles(const int *ids, int *offsets, int *ranks, 
             if (thread >= d) cumulative += previous;
         }
         if (first + thread < experts) offsets[first + thread] = base + cumulative - counts[thread];
-        if (first + thread == experts - 1) offsets[experts] = routes;
+        if (first + thread == experts - 1) offsets[experts] = base + cumulative;
     }
 }
 __global__ void packGroupedRows(const Block16 *src, const int *ids, const int *offset, const int *rank,
                                 GroupedBuffers buffers, int k, int topK) {
     cudaTriggerProgrammaticLaunchCompletion();
     const int r = blockIdx.x, expert = ids[r], groups = k / 16;
+    if (expert < 0) return;
     GroupedInputRow dst(buffers, offset[expert], expert, rank[r], groups);
     for (int g = threadIdx.x; g < groups; g += blockDim.x) {
         const auto &x = src[size_t(r / topK) * groups + g];
@@ -169,19 +170,29 @@ __global__ void packGroupedRows(const Block16 *src, const int *ids, const int *o
     }
 }
 
-__global__ void sumGroupedProjections(const float *sorted, float *output, const int *ids,
+template<class T, int N> struct alignas(N * sizeof(T)) GroupedChannels { T v[N]; };
+
+template<int Channels, class Out>
+__global__ void sumGroupedProjections(const float *sorted, Out *output, const int *ids,
                                       const int *offsets, const int *ranks, const float *weights,
-                                      const float *rowScales, int width, int topK) {
+                                      const float *rowScales, int vectors, int topK) {
     const int token = blockIdx.x, col = blockIdx.y * blockDim.x + threadIdx.x;
-    if (col >= width) return;
-    float sum = 0;
+    if (col >= vectors) return;
+    float sum[Channels]{};
     // Sum in original top-k order, irrespective of the atomic rank within an expert.
     for (int j = 0; j < topK; ++j) {
         const int route = token * topK + j, expert = ids[route];
+        if (expert < 0) continue;
         const int row = offsets[expert] + ranks[route];
-        sum += scaledGroupedValue(sorted[size_t(row) * width + col], weights[expert], rowScales[route]);
+        const auto dots = reinterpret_cast<const GroupedChannels<float, Channels> *>(sorted)[size_t(row) * vectors + col];
+        const float weight = weights[expert], scale = rowScales[route];
+#pragma unroll
+        for (int c = 0; c < Channels; ++c) sum[c] += scaledGroupedValue(dots.v[c], weight, scale);
     }
-    output[size_t(token) * width + col] = sum;
+    GroupedChannels<Out, Channels> result;
+#pragma unroll
+    for (int c = 0; c < Channels; ++c) result.v[c] = Out(sum[c]);
+    reinterpret_cast<GroupedChannels<Out, Channels> *>(output)[size_t(token) * vectors + col] = result;
 }
 
 } // namespace
@@ -264,10 +275,21 @@ cudaError_t projectGroupedRows(const Weights &weights, const GroupedWeightMaps &
     return cudaGetLastError();
 }
 
-cudaError_t sumGroupedRows(const float *sorted, float *output, const int *ids, const int *offsets, const int *ranks,
+template<class Out> cudaError_t sumGroupedRows(const float *sorted, Out *output, const int *ids, const int *offsets, const int *ranks,
                            const float *weightScales, const float *rowScales, int rows, int n, int topK, cudaStream_t stream) {
-    sumGroupedProjections<<<dim3(rows, (n + 255) / 256), 256, 0, stream>>>(
+    if constexpr (std::is_same_v<Out, __nv_bfloat16>) {
+        if (n % 4 == 0) {
+            sumGroupedProjections<4><<<dim3(rows, (n / 4 + 127) / 128), 128, 0, stream>>>(
+                sorted, output, ids, offsets, ranks, weightScales, rowScales, n / 4, topK);
+            return cudaGetLastError();
+        }
+    }
+    sumGroupedProjections<1><<<dim3(rows, (n + 255) / 256), 256, 0, stream>>>(
         sorted, output, ids, offsets, ranks, weightScales, rowScales, n, topK);
     return cudaGetLastError();
 }
+template cudaError_t sumGroupedRows(const float *, float *, const int *, const int *, const int *, const float *,
+                                    const float *, int, int, int, cudaStream_t);
+template cudaError_t sumGroupedRows(const float *, __nv_bfloat16 *, const int *, const int *, const int *, const float *,
+                                    const float *, int, int, int, cudaStream_t);
 } // namespace fastllm::cuda::routed_fp4

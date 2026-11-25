@@ -1284,32 +1284,35 @@ namespace fastllm {
         return false;
     }
 
-    InklingWindowKernel PrepareInklingWindowKernel(int heads, int group, int window, int extent, int page) {
+    InklingWindowKernel PrepareInklingWindowKernel(int heads, int group, int window, int extent, int page, bool decode, int splits) {
         if (FastllmCudaGraphIsCapturing()) return {};
         const int arch = CudaTritonRuntimeArch();
         if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON", arch == 120) || (arch != 120 && arch != 121) ||
-            group < 1 || group > 32 || heads < group || heads % group ||
+            group < 1 || group > (decode ? 16 : 32) || heads < group || heads % group ||
             window < 1 || extent < 16 || (extent & (extent - 1)) || page < 1) return {};
         const std::string dir = CudaTritonCacheDir();
-        const std::string op = "inkling_window_verify";
+        const bool split = splits > 1;
+        if (split && (!decode || (splits != 16 && splits != 32) || window > 1024)) return {};
+        const std::string op = split ? "inkling_window_split" : (decode ? "inkling_window_decode" : "inkling_window_verify");
+        const std::string name = "fastllm_" + op;
         const std::string spec = op + "_v1_sm" + std::to_string(arch) + "_h" + std::to_string(heads) +
             "_g" + std::to_string(group) + "_w" + std::to_string(window) + "_e" + std::to_string(extent) +
-            "_p" + std::to_string(page);
+            "_p" + std::to_string(page) + (split ? "_s" + std::to_string(splits) : "");
         const std::string cubin = CudaTritonJoinPath(dir, spec + ".cubin");
         std::string body, error;
         if (!CudaTritonReadTextFile(CudaTritonJoinPath(dir, spec + ".json"), body) || !CudaTritonFileExists(cubin)) {
             if (!CudaTritonEnsureServer()) return {};
             json11::Json request = json11::Json::object{{"op", op}, {"cache_dir", dir}, {"arch", arch},
-                {"heads", heads}, {"group", group}, {"window", window}, {"extent", extent}, {"page", page}};
+                {"heads", heads}, {"group", group}, {"window", window}, {"extent", extent}, {"page", page}, {"splits", splits}};
             int status = 0;
             if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) || status != 200) return {};
         }
         auto meta = json11::Json::parse(body, error);
         int shared = meta["shared"].int_value();
         if (!error.empty() || !meta["ok"].bool_value() || meta["op"].string_value() != op ||
-            meta["spec"].string_value() != spec || meta["kernel"].string_value() != "fastllm_inkling_window_verify" ||
+            meta["spec"].string_value() != spec || meta["kernel"].string_value() != name ||
             !meta["shared"].is_number() || shared < 0 || shared > 101376 || meta["num_warps"].int_value() != 4) return {};
-        return {FastllmCudaLoadWindowVerify(cubin.c_str(), "fastllm_inkling_window_verify", shared), shared};
+        return {FastllmCudaLoadWindowVerify(cubin.c_str(), name.c_str(), shared), shared};
     }
 
     bool TryCudaTritonSmallProjection(const Data &input, Data &weight, Data &output, int groups) {
@@ -4664,7 +4667,7 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
-    InklingWindowKernel PrepareInklingWindowKernel(int, int, int, int, int) { return {}; }
+    InklingWindowKernel PrepareInklingWindowKernel(int, int, int, int, int, bool, int) { return {}; }
     bool CanUseCudaTritonSwigluLinear(int, bool, bool) {
         return false;
     }

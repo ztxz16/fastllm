@@ -12,12 +12,7 @@ struct FastllmFoldSelection {
     int blocks;
 };
 bool FastllmCudaMtpFoldSelection(void *workspace, int sms, FastllmFoldSelection &selection);
-bool FastllmCudaMtpDrawFoldScores(void *workspace, const float *scores, const FastllmFoldSelection &selection,
-        const int *k, const float *p, const uint64_t *seed, float *q, int *token, int *complete, bool first);
 bool FastllmCudaMtpFoldFallback(const int *complete, const std::function<bool(cudaStream_t)> &body);
-bool FastllmCudaMtpRepairFold(void *workspace, const float *base, const float *adjust, const float *bias,
-        float cap, const float *t, int *k, const float *p, uint64_t *seed, float *q, int *token, int vocab,
-        cudaStream_t stream);
 bool FastllmCudaMtpRepairBf16Fold(void *workspace, const void *base, const void *adjust, const void *bias,
         float cap, const float *t, int *k, const float *p, uint64_t *seed, float *q, int *token, int vocab,
         cudaStream_t stream);

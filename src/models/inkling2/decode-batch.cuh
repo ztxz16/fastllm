@@ -26,10 +26,21 @@ struct BatchDecodePlan {
     int rows;
     DecodeGraphScratch scratch;
     cudaGraphExec_t exec = nullptr;
+    std::function<void()> launchEager;
     Matrix logits;
     Buffer<DecodeInput> inputs;
     Buffer<DecodeVisit> visits;
     Buffer<int> sampled;
+    struct OutputTicket {
+        RoundHostVector<int> tokens;
+        cudaEvent_t ready = nullptr;
+        void init(int rows) {
+            if (ready) return;
+            tokens.resize(rows);
+            check(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+        }
+        ~OutputTicket() { if (ready) cudaEventDestroy(ready); }
+    } tickets[2];
     DecodePadding padding;
     std::vector<DecodeInput> hostInputs;
     std::vector<DecodeVisit> hostVisits;
@@ -48,7 +59,7 @@ struct BatchDecodePlan {
                               cudaMemcpyHostToDevice, cudaStreamPerThread));
     }
 };
-std::map<int, std::unique_ptr<BatchDecodePlan>> batchDecodePlans;
+std::map<std::pair<int,bool>, std::unique_ptr<BatchDecodePlan>> batchDecodePlans;
 
 int decodeCapacity(int count) const {
     int capacity = 1;
@@ -57,17 +68,27 @@ int decodeCapacity(int count) const {
     return capacity;
 }
 
-BatchDecodePlan &batchDecodePlan(int rows) {
-    auto it = batchDecodePlans.lower_bound(rows);
-    if (it != batchDecodePlans.end() && it->first == rows) return *it->second;
+BatchDecodePlan &batchDecodePlan(int rows, bool bounded = false) {
+    const auto key = std::make_pair(rows, bounded);
+    auto it = batchDecodePlans.find(key);
+    if (it != batchDecodePlans.end()) return *it->second;
+    it = batchDecodePlans.lower_bound({rows, false});
+    if (!decodeWindow && useWindowDecodeTile(rows) && backboneBf16 && kvType == FLOAT16 &&
+        c.headDim == 128 && c.qClip > 0.f &&
+        c.qClip <= 65504.f && c.kvHeads > 0 && c.heads % c.kvHeads == 0) {
+        decodeWindow = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen(), true);
+    }
     // Warmup visits the largest capacity first. Serial replays can write
     // into the same logits allocation without changing any captured address.
-    Matrix logits = it == batchDecodePlans.end() ? Matrix(rows, c.vocab) : it->second->logits.slice(0, rows);
+    Matrix logits;
+    if (bounded) logits = Matrix(rows, placement.world * shardCandidates);
+    else if (it != batchDecodePlans.end() && !it->first.second) logits = it->second->logits.slice(0, rows);
+    else logits = Matrix(rows, c.vocab);
     auto entry = std::make_unique<BatchDecodePlan>(rows, c, std::move(logits));
     auto &p = *entry;
     p.scratch.ShareStorage(roundScratch);
     p.upload();
-    auto body = [&] {
+    auto body = [this, &p, rows, bounded] {
         Buffer<float> ids(rows), temperature(rows), topP(rows);
         Buffer<int> topK(rows);
         Buffer<uint64_t> seeds(rows), offsets(rows);
@@ -75,18 +96,28 @@ BatchDecodePlan &batchDecodePlan(int rows) {
             p.inputs.p, rows, ids.p, topK.p, temperature.p, topP.p, seeds.p, offsets.p);
         std::vector<Segment> segments(rows);
         for (int i = 0; i < rows; ++i) segments[i] = {nullptr, i, 1, nullptr, nullptr, p.visits.p};
-        target(ids.p, rows, segments, p.logits);
-        Matrix probabilities(rows, c.vocab);
+        const int width = p.logits.cols;
+        Buffer<int> tokenMap(bounded ? rows * width : 0);
+        target(ids.p, rows, segments, p.logits, nullptr, {}, bounded ? temperature.p : nullptr, tokenMap.p);
+        Matrix probabilities(rows, width);
         size_t bytes = FastllmCudaTopKFirstSamplingWorkspaceBytes(rows);
         Buffer<uint8_t> workspace(bytes);
         if (!FastllmCudaTopKFirstSamplingToDeviceWithRng(p.logits.p, probabilities.p, temperature.p, topK.p,
-                topP.p, nullptr, nullptr, 0, p.sampled.p, ids.p, rows, c.vocab, seeds.p, offsets.p, workspace.p, bytes))
+                topP.p, nullptr, nullptr, 0, p.sampled.p, ids.p, rows, width, seeds.p, offsets.p, workspace.p, bytes))
             throw std::runtime_error("Inkling batch decode sampling failed");
+        if (bounded)
+            remapBatchSamples<<<(rows+255)/256,256,0,cudaStreamPerThread>>>(tokenMap.p,p.sampled.p,rows,width);
     };
+    if (!placement.tensorDevices.empty()) {
+        // Keep the packed batch and GPU sampler while submitting cross-device
+        // dependencies explicitly on the two rank streams.
+        p.launchEager = std::move(body);
+        return *batchDecodePlans.emplace_hint(it, key, std::move(entry))->second;
+    }
     p.scratch.Warmup(body);
     p.scratch.Capture(p.exec, body);
     printf("[Inkling] captured full batch decode graph (%d rows)\n", rows);
-    return *batchDecodePlans.emplace_hint(it, rows, std::move(entry))->second;
+    return *batchDecodePlans.emplace_hint(it, key, std::move(entry))->second;
 }
 
 BatchDecodePlan &replayBatchDecode(const std::vector<Segment> &batch, const float *tokens,
@@ -103,6 +134,7 @@ BatchDecodePlan &replayBatchDecode(const std::vector<Segment> &batch, const floa
             p.hostVisits[slot * p.rows + i] = live ? decodeVisit(*batch[i].request, slot) : p.padding.visits[i];
     }
     p.upload();
-    launchTargetGraph(p.exec, p.scratch);
+    if (p.launchEager) p.launchEager();
+    else launchTargetGraph(p.exec, p.scratch);
     return p;
 }

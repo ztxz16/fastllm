@@ -134,7 +134,7 @@ template<int D, class KV> void launchPrefill(const AttentionRow &a, KV *query, i
 
 // One warp owns 16 packed (query, head) rows. Each lane visits the same two
 // rows throughout the KV scan, so its two position scales live in registers.
-template<bool Windowed, class Bias, bool MaskWindow = false> struct RelativeScoreTile {
+template<bool Windowed, class Bias, bool MaskWindow = false, bool FoldScale = true> struct RelativeScoreTile {
     static constexpr bool custom_score_tile = true;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
     // Before stmatrix, lanes exchange the global kernel's 16-bit output through scalar shared stores.
@@ -164,7 +164,10 @@ template<bool Windowed, class Bias, bool MaskWindow = false> struct RelativeScor
 #pragma unroll
                 for (int k = 0; k < Traits::NUM_MMA_KV; ++k) {
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) score[0][k][i] *= tau[(i >> 1) & 1] * p.qkScale;
+                    for (int i = 0; i < 8; ++i) {
+                        if constexpr (FoldScale) score[0][k][i] *= tau[(i >> 1) & 1] * p.qkScale;
+                        else score[0][k][i] = (score[0][k][i] * p.qkScale) * tau[(i >> 1) & 1];
+                    }
                 }
                 return;
             }

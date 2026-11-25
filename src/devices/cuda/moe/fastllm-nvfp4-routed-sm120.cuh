@@ -1,4 +1,4 @@
-// Single-device routed NVFP4 projections. Each 16x64 weight tile is packed
+// Routed NVFP4 projections. Each 16x64 weight tile is packed
 // once in SM120 MMA register order. Decode and grouped prefill share the layout.
 #pragma once
 #include <cuda_runtime.h>
@@ -319,7 +319,7 @@ static __global__ void expertOffsets(const int *counts, int2 *starts, int expert
 }
 // A token is quantized once and its packed bands are written at their
 // final addresses in all selected experts, including the last partial band of rows.
-template <int TileRows>
+template <int TileRows, bool Local = false>
 static __global__ void scatterInput(const float *x, int width, const int *ids, const int *ranks,
                                     const int *counts, const int2 *starts, int top,
                                     RouteGroup<TileRows> *tasks, InputTile *packed, float *rowScales) {
@@ -328,8 +328,14 @@ static __global__ void scatterInput(const float *x, int width, const int *ids, c
     __shared__ int slots[64], repeats[64];
     __shared__ float maxima[Threads / 32];
     const int row = blockIdx.x, tid = threadIdx.x;
-    if (tid < top) {
-        const int r = row * top + tid, e = ids[r], rank = ranks[r], count = counts[e];
+    const int r = row * top + tid;
+    const int e = tid < top ? ids[r] : -1;
+    if constexpr (Local) {
+        if (!__syncthreads_or(e >= 0)) return;
+        if (tid < top && e < 0) slots[tid] = -1;
+    }
+    if (tid < top && (!Local || e >= 0)) {
+        const int rank = ranks[r], count = counts[e];
         const int tile = starts[e].y + rank / TileRows, local = rank % TileRows;
         auto &task = tasks[tile];
         if (!local) {
@@ -372,7 +378,9 @@ static __global__ void scatterInput(const float *x, int width, const int *ids, c
         const auto enc = encodeBlock(values[b], peaks[b], outer);
         const auto band = packBand(enc.words, enc.scale);
         for (int i = 0; i < top; ++i) {
-            int slot = slots[i], tile = slot / TileRows, local = slot % TileRows;
+            const int slot = slots[i];
+            if constexpr (Local) if (slot < 0) continue;
+            const int tile = slot / TileRows, local = slot % TileRows;
             auto &dst = packed[(size_t(tile) * (width / 64) + group / 4) * (TileRows / 8) + local / 8];
             for (int j = 0; j < repeats[i]; ++j)
                 storeBand(dst, local % 8 + j, band);
@@ -387,7 +395,7 @@ constexpr int WarpTileRows = 64;
 template <int Warps, int ColumnTiles, bool Up, int TileRows, bool Compact = false>
 static __global__ void groupedProject(Weights w, const Block16 *input, const float *rowScales,
                                       const InputTile *packed, const RouteGroup<TileRows> *tasks, const PlanSize *used,
-                                      __nv_bfloat16 *out, int n, int k, int divisor) {
+                                      __nv_bfloat16 *out, int n, int k, int divisor, int outputStride = 0) {
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
     static_assert(TileRows % 8 == 0 && (TileRows <= WarpTileRows || TileRows % WarpTileRows == 0));
     constexpr int groups = (TileRows < WarpTileRows ? TileRows : WarpTileRows) / 8;
@@ -438,7 +446,7 @@ static __global__ void groupedProject(Weights w, const Block16 *input, const flo
 #pragma unroll
             for (int c = 0; c < ColumnTiles; ++c) {
                 if (first + c < columns) {
-                    auto *dst = out + size_t(Up ? row : route) * n + (first + c) * 16 + lane / 4;
+                    auto *dst = out + size_t(Up ? row : route) * (outputStride ? outputStride : n) + (first + c) * 16 + lane / 4;
                     const auto &v = sums[g][c];
                     dst[0] = __float2bfloat16_rn(v[j] * w.outer[task.expert] * outer);
                     dst[8] = __float2bfloat16_rn(v[j + 2] * w.outer[task.expert] * outer);
@@ -465,9 +473,9 @@ __device__ __forceinline__ int matchingRoute(unsigned low, unsigned high, int sl
 // One warp computes sixteen output channels with a native 16x8x64 MMA.
 // Matching routes fill its input columns. Both paths split K between warps in a CTA.
 enum class DecodeDependency { Serial, Gate, Down };
-template <int Warps, bool MatchRoutes = false, DecodeDependency Edge = DecodeDependency::Serial>
+template <int Warps, bool MatchRoutes = false, DecodeDependency Edge = DecodeDependency::Serial, bool LocalExperts = false>
 static __global__ void decodeProject(Weights w, const Block16 *input, const int *ids, __nv_bfloat16 *out, int n,
-                                     int k, int divisor, int routes = 0, int capacity = 0) {
+                                     int k, int divisor, int routes = 0, int capacity = 0, int outputStride = 0) {
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
     static_assert(!MatchRoutes || Edge != DecodeDependency::Down);
     if constexpr (Edge == DecodeDependency::Gate) cuda_launch::DependencyStart();
@@ -478,6 +486,14 @@ static __global__ void decodeProject(Weights w, const Block16 *input, const int 
         if (route >= routes) return;
     }
     const int expert = ids[route];
+    if constexpr (LocalExperts) {
+        if (expert < 0) {
+            if constexpr (Edge == DecodeDependency::Down) cuda_launch::DependencyStart();
+            if (threadIdx.x < 16)
+                out[size_t(route) * n + blockIdx.x * 16 + threadIdx.x] = __float2bfloat16_rn(0.f);
+            return;
+        }
+    }
     int src = route, count = 1;
     unsigned low = 0, high = 0;
     if constexpr (MatchRoutes) {
@@ -530,7 +546,7 @@ static __global__ void decodeProject(Weights w, const Block16 *input, const int 
                 for (int part = 0; part < Warps; ++part) sum += partials[part][warp][lane];
                 const int dst = first + matchingRoute(low, high, slot);
                 const float outer = input[size_t(dst / divisor) * (k / 16)].outer;
-                out[size_t(dst) * n + blockIdx.x * 16 + lane / 4 + 8 * (warp / 2)] =
+                out[size_t(dst) * (outputStride ? outputStride : n) + blockIdx.x * 16 + lane / 4 + 8 * (warp / 2)] =
                     __float2bfloat16_rn(sum * w.outer[expert] * outer);
             }
             return;
@@ -547,7 +563,7 @@ static __global__ void decodeProject(Weights w, const Block16 *input, const int 
 #pragma unroll
         for (int i = 0; i < Warps; ++i)
             sum += partial[i][lane];
-        out[size_t(route) * n + blockIdx.x * 16 + lane] = __float2bfloat16_rn(sum * w.outer[expert] * x[0].outer);
+        out[size_t(route) * (outputStride ? outputStride : n) + blockIdx.x * 16 + lane] = __float2bfloat16_rn(sum * w.outer[expert] * x[0].outer);
     }
 #endif
 }

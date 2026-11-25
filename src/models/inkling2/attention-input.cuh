@@ -10,6 +10,8 @@ template<class Act> struct RelativeInputs {
     int heads, kvHeads, dim, rel, extent, taps;
     float qClip, rClip, eps;
     const __nv_bfloat16 *windowTable = nullptr;
+    float *batchGates = nullptr, *batchSinks = nullptr;
+    bool splitBias = false;
 };
 
 template<bool FullBatch = false>
@@ -51,14 +53,14 @@ __device__ float prefillScale(const float (&v)[4], float clip, int width, float 
 
 #include "window-verify-input.cuh"
 
-template<class T, bool Timeline = false, bool PackQuery = false, class Act, bool Pdl = false, int BiasHeads = 1, bool Compact = false>
+template<class T, bool Timeline = false, bool PackQuery = false, class Act, bool Pdl = false, int BiasHeads = 1, bool Compact = false, bool OrdinaryBatch = false>
 __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in, int tiles, float *q, float *bias, int chain = 1) {
 #if CUDART_VERSION >= 12080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     if constexpr (Pdl) cuda_launch::DependencyStart();
 #endif
     int row = 0, priorRows = 0;
     int task = blockIdx.x;
-    if constexpr (Timeline) {
+    if constexpr (Timeline || OrdinaryBatch) {
         row = blockIdx.y;
         if constexpr (Compact) {
             static_assert(BiasHeads == 16 && PackQuery);
@@ -77,7 +79,7 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
         priorRows = row % chain;
         visit += row;
         q += size_t(row) * in.heads * in.dim / (Compact ? 2 : 1);
-        bias += size_t(row) * in.heads * in.extent / (Compact ? 2 : 1);
+        bias += size_t(row) * in.heads * (OrdinaryBatch && !in.splitBias ? in.rel : in.extent) / (Compact ? 2 : 1);
     }
     __shared__ float scratch[threads], relative[threads];
     const int col = threadIdx.x;
@@ -106,6 +108,11 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
             const int channel = lane + 32*j;
             if (channel >= in.dim) continue;
             const float value = values[j] * scale * weights[j];
+            if constexpr (OrdinaryBatch) {
+                if (in.batchGates) in.batchGates[(size_t(row) * in.heads + head) * in.dim + channel] =
+                    in.sources.items[2].read(row, head * in.dim + channel);
+                if (in.batchSinks && channel == 0) in.batchSinks[size_t(row) * in.heads + head] = in.sources.items[3].read(row, head);
+            }
             if constexpr (Compact) {
                 reinterpret_cast<__nv_bfloat16 *>(q)[head * in.dim + channel] = __nv_bfloat16(value);
             } else if constexpr (PackQuery) {
@@ -119,6 +126,20 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
     int idx = task - queryTasks;
     const int biasTasks = (in.heads + BiasHeads - 1) / BiasHeads * tiles;
     if (idx < biasTasks) {
+        if (OrdinaryBatch && !in.splitBias) {
+            const int h = idx * 4 + warp;
+            if (h < in.heads) {
+                const int ch = h * 16 + lane;
+                float x = lane < 16 ? in.sources.items[1].read(row, ch) : 0.f;
+                float w = lane < 16 ? in.rs[ch] : 0.f;
+                float v = x * w;
+                float sum = v * v;
+                for (int step = 8; step; step /= 2) sum += __shfl_down_sync(0xffffffffu, sum, step);
+                float scale = fminf(1.f, in.rClip / (sqrtf(__shfl_sync(0xffffffffu, sum, 0)) + 1.e-6f));
+                if (lane < 16) bias[h * 16 + lane] = x * scale * w;
+            }
+            return;
+        }
         if constexpr (Compact) {
             if (visit->verifyRemaining > 0)
                 projectWindowBias(in, row, idx / tiles * BiasHeads, idx % tiles, visit->past,
@@ -130,7 +151,7 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
             const int dist = ((idx % tiles) * threads + col) * 4;
             if ((idx % tiles) * threads * 4 > visit->past) return;
             float rel[BiasHeads];
-            float4 dots[BiasHeads]{};
+            float4 dots[BiasHeads]{}, totals[OrdinaryBatch ? BiasHeads : 1]{};
 #pragma unroll
             for (int h = 0; h < BiasHeads; ++h) {
                 const int channel = (firstHead + h) * in.rel + lane;
@@ -151,6 +172,7 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
 #pragma unroll
                 for (int h = 0; h < BiasHeads; ++h) {
                     float w = __shfl_sync(0xffffffffu, rel[h], j);
+                    if constexpr (OrdinaryBatch) if (!(j % 4)) dots[h] = float4{};
 #if CUDART_VERSION >= 12080 && __CUDA_ARCH__ >= 1000
                     if constexpr (BiasHeads > 1) {
                         float2 a = __ffma2_rn({w, w}, {table.x, table.y}, {dots[h].x, dots[h].y});
@@ -162,12 +184,19 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
                         dots[h].x += w * table.x; dots[h].y += w * table.y;
                         dots[h].z += w * table.z; dots[h].w += w * table.w;
                     }
+                    if constexpr (OrdinaryBatch) {
+                        // cuBLAS' 768 x 1024 x 16 SIMT kernel accumulates four groups of four FMAs.
+                        if (j % 4 == 3) {
+                            totals[h].x = __fadd_rn(totals[h].x,dots[h].x); totals[h].y = __fadd_rn(totals[h].y,dots[h].y);
+                            totals[h].z = __fadd_rn(totals[h].z,dots[h].z); totals[h].w = __fadd_rn(totals[h].w,dots[h].w);
+                        }
+                    }
                 }
             }
 #pragma unroll
             for (int h = 0; h < BiasHeads; ++h)
                 if (firstHead + h < in.heads && dist < in.extent)
-                    *reinterpret_cast<float4 *>(bias + (firstHead + h) * in.extent + dist) = dots[h];
+                    *reinterpret_cast<float4 *>(bias + (firstHead + h) * in.extent + dist) = OrdinaryBatch ? totals[h] : dots[h];
             return;
         }
         const int head = idx / tiles, dist = idx % tiles * threads + col;
@@ -198,7 +227,20 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
             which ? in.vw : in.kw, dynamic.data ? dynamic.data + size_t(row) * dynamic.stride : nullptr,
             width, in.taps, in.kvHeads, base + channel, priorRows, input.stride) : 0.f;
     }
-    float scale = normalize(values, which ? 0.f : in.qClip);
+    float scale;
+    if constexpr (OrdinaryBatch) {
+        // The unfused value projection uses a warp RMS reduction over four channels per lane.
+        if (which) {
+            __shared__ float valuesByChannel[4][128];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) valuesByChannel[warp][32*j+lane] = values[j];
+            __syncwarp();
+            float consecutive[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) consecutive[j] = valuesByChannel[warp][4*lane+j];
+            scale = prefillScale(consecutive, 0.f, 128, in.eps, true);
+        } else scale = prefillScale(values, in.qClip, 128, in.eps, false);
+    } else scale = normalize(values, which ? 0.f : in.qClip);
     if (!Timeline || visit->verifyRemaining > 0) {
         auto dst = static_cast<T *>(which ? visit->pages.value : visit->pages.key) + visit->pages.offset(visit->past, which, width);
 #pragma unroll

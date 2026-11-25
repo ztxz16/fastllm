@@ -154,14 +154,14 @@ __device__ inline float RowRmsScale(float local, int width, float eps, float *wa
 // One CTA handles the entire row. Independent 128-lane reductions preserve
 // the original per-source dot and square-sum trees, in parallel. The mixed
 // channels remain in registers through the following RMSNorm.
-template <int Slots, class Round, class Out, int FixedWidth, bool Preload, class Store, class In>
+template <int Slots, class Round, class Out, int FixedWidth, bool Preload, class In>
 __device__ __forceinline__ void AttnResRegisterBody(const SourceList<In> &sources, Query query, int qi, int row,
-        int rows, int width, float eps, bool normalizeValues, Out *output, const In *lastSource = nullptr) {
+        int rows, int width, float eps, bool normalizeValues, Out *output) {
     constexpr int threads = 512, packs = 2;
     const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     const int cols = (FixedWidth ? FixedWidth : width) / 4;
     const auto source = [&](int slot) {
-        return lastSource && slot == Slots - 1 ? lastSource : sources.items[slot] + size_t(row) * width;
+        return sources.items[slot] + size_t(row) * width;
     };
     float4 acc[packs]{};
     // A second scoring round leaves a gap in which the mix inputs can be
@@ -258,13 +258,11 @@ __device__ __forceinline__ void AttnResRegisterBody(const SourceList<In> &source
             float4 w = reinterpret_cast<const float4 *>(query.norm)[j];
             v = make_float4(v.x * scale * w.x, v.y * scale * w.y, v.z * scale * w.z, v.w * scale * w.w);
         }
-        if constexpr (std::is_void_v<Store>)
-            reinterpret_cast<Channels4<Out> *>(output)[base + j] = {Out(Round(v.x)), Out(Round(v.y)), Out(Round(v.z)), Out(Round(v.w))};
-        else Store::template store<Round>(output, base + j, v);
+        reinterpret_cast<Channels4<Out> *>(output)[base + j] = {Out(Round(v.x)), Out(Round(v.y)), Out(Round(v.z)), Out(Round(v.w))};
     }
 }
 
-template <int Slots, class Round, class Out, int FixedWidth = 0, bool Preload = false, class Store = void, bool Pdl = false, class In = float>
+template <int Slots, class Round, class Out, int FixedWidth = 0, bool Preload = false, bool Pdl = false, class In = float>
 __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources, FASTLLM_ROW_PARAMETER Queries queries, int rows, int width,
                                     float eps, bool normalizeValues, Out *output, bool queryFirst) {
     const int qi = queryFirst ? blockIdx.x : blockIdx.y;
@@ -285,7 +283,7 @@ __global__ void AttnResRegisterRows(FASTLLM_ROW_PARAMETER SourceList<In> sources
         cudaTriggerProgrammaticLaunchCompletion();
     }
 #endif
-    AttnResRegisterBody<Slots, Round, Out, FixedWidth, Preload, Store>(
+    AttnResRegisterBody<Slots, Round, Out, FixedWidth, Preload>(
         sources, query, qi, row, rows, width, eps, normalizeValues, output);
 }
 
@@ -350,9 +348,9 @@ inline void Launch(SourceList<In> sources, int count, const Query *queries, int 
                     // Single-token latency benefits from preloading across
                     // scoring rounds. Multi-token tiles keep their occupancy.
                     if constexpr (w && nsrc > 4) {
-                        if (rows == 1) return AttnResRegisterRows<nsrc, Round, Out, w, true, void, false, In>;
+                        if (rows == 1) return AttnResRegisterRows<nsrc, Round, Out, w, true, false, In>;
                     }
-                    return AttnResRegisterRows<nsrc, Round, Out, w, false, void, false, In>;
+                    return AttnResRegisterRows<nsrc, Round, Out, w, false, false, In>;
                 };
                 return WithRegisterSources(count, select);
             };

@@ -39,10 +39,10 @@ __device__ __forceinline__ void stageVerifyKV(const PageView &pages, int begin, 
     flashinfer::cp_async::commit_group();
 }
 
-__device__ __forceinline__ void scanVerifyWindow(VerifyPrefillParams p, const DecodeVisit &visit,
+template<class Traits>
+__device__ __forceinline__ void scanVerifyTile(VerifyPrefillParams p, const DecodeVisit &visit,
         int first, int rows, int tile, int split, const VerifyPartition &part, int kvHead, int kvHeads) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    using Traits = WindowVerifyTraits;
     static_assert(Traits::CTA_TILE_Q == 32 && Traits::CTA_TILE_KV == 32 && Traits::NUM_WARPS_Q == 2);
     const int begin = split * part.chunk, past = visit.past - part.origin, length = past + rows;
     const int end = min(length, begin + part.chunk);
@@ -55,7 +55,7 @@ __device__ __forceinline__ void scanVerifyWindow(VerifyPrefillParams p, const De
     p.qo_tile_indices = &tile;
     extern __shared__ uint4 verifyStorage[];
     VerifyTileMemory key(verifyStorage), value(verifyStorage + verifyTileVectors);
-    WindowVerifyRelative relative(p, 0, reinterpret_cast<uint8_t *>(verifyStorage));
+    typename Traits::AttentionVariant relative(p, 0, reinterpret_cast<uint8_t *>(verifyStorage));
     const unsigned lane = threadIdx.x;
     unsigned query[16][4], queryRow[2], queryHead[2];
 #pragma unroll
@@ -89,7 +89,7 @@ __device__ __forceinline__ void scanVerifyWindow(VerifyPrefillParams p, const De
                 flashinfer::mma::mma_sync_m16n16k16_row_col_f16f16f32<half>(score[0][n], query[i], k);
             }
         }
-        relative.TransformScoreTile<Traits>(p, token, score);
+        relative.template TransformScoreTile<Traits>(p, token, score);
         if (token + 31 > past) {
 #pragma unroll
             for (int n = 0; n < 2; ++n) {

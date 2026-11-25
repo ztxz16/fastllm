@@ -1,9 +1,18 @@
-void rejectDraft(RoundPlan &p, float *logits) {
+void rejectDraft(RoundPlan &p, float *logits, const int *tokenMap = nullptr) {
     const int b = p.batch;
     float *probs;
     if (!FastllmCudaMtpGraphDistribution(p.targetSampler, logits, p.temperature.p + b, p.topK.p + b, p.topP.p + b,
                                          &probs))
         throw std::runtime_error("Inkling batched target normalization failed");
+    Matrix expanded;
+    if (tokenMap) {
+        const int rows = b * p.chain;
+        expanded = Matrix(rows, c.vocab);
+        check(cudaMemsetAsync(expanded.p, 0, size_t(rows) * c.vocab * sizeof(float), cudaStreamPerThread));
+        publishCandidateProbabilities<<<rows,p.targetVocab,0,cudaStreamPerThread>>>(
+            probs, tokenMap, expanded.p, c.vocab, p.targetVocab);
+        probs = expanded.p;
+    }
     FastllmCudaMtpGraphReject(probs, p.probs.p, p.draftIds.p, p.result.p, p.partials.p, b, p.steps, c.vocab, p.live.p,
                               p.rejectSeed, p.counter.p);
 }
@@ -18,10 +27,11 @@ template <class T> void verifyBody(RoundPlan &p) {
                                                                                 nullptr, b, chain, depth, kv, h);
     std::vector<Segment> segments(b);
     for (int i = 0; i < b; ++i) segments[i] = {nullptr, i * chain, chain, nullptr, nullptr, p.visits.p};
-    Matrix logits(rows, c.vocab);
+    Matrix logits(rows, p.targetVocab);
+    Buffer<int> tokenMap(p.targetVocab < c.vocab ? rows * p.targetVocab : 0);
     std::vector<Matrix> features;
-    target(p.ids.p, rows, segments, logits, &features);
-    rejectDraft(p, logits.p);
+    target(p.ids.p, rows, segments, logits, &features, {}, tokenMap.p ? p.temperature.p + b : nullptr, tokenMap.p);
+    rejectDraft(p, logits.p, tokenMap.p);
     verifyHistories<true><<<dim3(slots * b, 4), 256, 0, cudaStreamPerThread>>>(p.source.p, p.visits.p, p.panels.p,
                                                                                accepted, b, chain, depth, kv, h);
 
@@ -68,7 +78,11 @@ void uploadRound(RoundPlan &p) {
     upload(p.source.p, p.descriptors);
     upload(p.views.p, p.draftViews);
     upload(p.inputs.p, p.hostInputs);
-    std::generate(p.hostSeeds.begin(), p.hostSeeds.end(), newSamplingSeed);
+    if (placement.world > 1) {
+        // The scheduler supplies one fresh seed to every rank for this forward.
+        std::mt19937_64 rng(requestSeed);
+        std::generate(p.hostSeeds.begin(), p.hostSeeds.end(), [&] { return rng(); });
+    } else std::generate(p.hostSeeds.begin(), p.hostSeeds.end(), newSamplingSeed);
     upload(p.seeds.p, p.hostSeeds);
 }
 
@@ -106,6 +120,7 @@ template <class T> void captureRound(RoundPlan &p) {
     auto verify = [&] { verifyBody<T>(p); };
     p.draftPool.Warmup(draft);
     p.draftPool.Capture(p.draftExec, draft);
+    if (!placement.tensorDevices.empty()) return;
     p.verifyPool.Warmup(verify);
     p.verifyPool.Capture(p.verifyExec, verify);
     printf("[Inkling] captured full draft and verification graphs (%d requests x %d rows)\n", b, p.chain);
@@ -158,23 +173,52 @@ void prepareWindowVerification(int batch) {
     compactWindow = kernel;
 }
 
-template <class T> RoundPlan &roundPlan(int batch) {
+template <class T> RoundPlan &roundPlan(int batch, bool bounded = false) {
+    const bool tp = placement.world > 1 || !placement.tensorDevices.empty();
+    const bool persistent = !tp || batch == 1 || batch == model.maxBatch;
+    if (tp && roundPlans.find(batch) == roundPlans.end()) {
+        // Each shape owns full-vocabulary draft and rejection workspaces. A
+        // shrinking cohort can visit every size before the next request arrives.
+        // TP verify rounds have joined both streams before changing cohorts.
+        for (auto i = roundPlans.begin(); i != roundPlans.end();) {
+            if (i->first != 1 && i->first != model.maxBatch) {
+                if (publishedPlan == i->second.get()) finishPublication();
+                i = roundPlans.erase(i);
+            }
+            else ++i;
+        }
+    }
     auto &plan = roundPlans[batch];
+    const int targetVocab = bounded ? placement.world * shardCandidates : c.vocab;
+    uint64_t seed = 0;
+    std::optional<unsigned long long> previousCounter;
+    if (plan && plan->targetVocab != targetVocab) {
+        if (publishedPlan == plan.get()) finishPublication();
+        seed = plan->rejectSeed;
+        previousCounter.emplace();
+        check(cudaMemcpyAsync(&*previousCounter, plan->counter.p, sizeof(*previousCounter),
+                              cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        check(cudaStreamSynchronize(cudaStreamPerThread));
+        plan.reset();
+    }
     if (!plan) {
         if (timelineCompatible(batch)) prepareWindowVerification(batch);
-        const bool nativeProjections = batch == 1 && !quantizedFold && singletonControllerPdl &&
+        const bool nativeProjections = batch == 1 && !quantizedFold && decodePdlSupported &&
             std::is_same_v<T, __nv_bfloat16> && GetFastllmEnv().cudaGraph;
-        const bool earlyPublication = GetFastllmEnv().cudaGraph && timelineCompatible(batch) &&
+        const bool earlyPublication = !tp && GetFastllmEnv().cudaGraph && timelineCompatible(batch) &&
             batch > 1 && draftAttentionWarps && (c.draft.window >= c.draft.steps + 1 ||
                           std::none_of(c.draft.local.begin(), c.draft.local.end(), [](bool v) { return v; })) &&
             std::all_of(placement.experts.begin(), placement.experts.end(), [](auto d) { return d == ExpertDevice::Cuda; });
-        auto entry = std::make_unique<RoundPlan>(batch, c, nativeProjections, earlyPublication);
+        if (!previousCounter) seed = placement.world > 1 ? requestSeed ^ uint64_t(batch) : newSamplingSeed();
+        auto entry = std::make_unique<RoundPlan>(batch, c, nativeProjections, earlyPublication, seed, targetVocab);
         entry->draftPool.ShareStorage(roundScratch);
         entry->verifyPool.ShareStorage(roundScratch);
-        if (GetFastllmEnv().cudaGraph && timelineCompatible(batch)) {
+        if (persistent && GetFastllmEnv().cudaGraph && timelineCompatible(batch)) {
             try {
                 captureRound<T>(*entry);
             } catch (const std::exception &error) {
+                // A collective graph must be captured or abandoned by all ranks together.
+                if (placement.world > 1) throw;
                 // A completed draft graph can still feed an eager verifier.
                 cudaGetLastError();
                 check(cudaStreamSynchronize(cudaStreamPerThread));
@@ -182,6 +226,11 @@ template <class T> RoundPlan &roundPlan(int batch) {
                         entry->draftExec ? "eager verification with captured draft" : "eager DSpark",
                         batch, error.what());
             }
+        }
+        if (previousCounter) {
+            check(cudaMemcpyAsync(entry->counter.p, &*previousCounter, sizeof(*previousCounter),
+                                  cudaMemcpyHostToDevice, cudaStreamPerThread));
+            check(cudaStreamSynchronize(cudaStreamPerThread));
         }
         plan = std::move(entry);
     }
@@ -230,7 +279,12 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
                              const std::vector<GenerationConfig> &sampling) {
     const auto start = std::chrono::steady_clock::now();
     const int b = batch.size(), slots = c.visits.size();
-    auto &p = roundPlan<T>(b);
+    const bool bounded = placement.world > 1 && placement.world <= 8 && placement.world * shardCandidates < c.vocab &&
+        b > 1 && timelineCompatible(b) && int64_t(b) * c.draft.block <= 65535 &&
+        std::all_of(sampling.begin(), sampling.end(), [](const GenerationConfig &s) {
+            return s.top_k > 0 && s.top_k <= shardCandidates && std::isfinite(s.temperature) && s.temperature > 0.f;
+        });
+    auto &p = roundPlan<T>(b, bounded);
     const bool sameBatch = publishedPlan == &p && int(publicationOwners.size()) == b &&
         std::equal(batch.begin(), batch.end(), publicationOwners.begin(),
                    [](const Segment &s, const auto &owner) { return s.request == owner.lock().get(); });

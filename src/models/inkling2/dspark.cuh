@@ -413,3 +413,15 @@ __global__ void stageDraftInputs(const DraftInput *inputs, float *anchors, int *
         p[i] = x.topP;
     }
 }
+
+// Match the activation-precision correction, addition and softcap before
+// exchanging the vocabulary shards. Padding is excluded by the full-vocab sampler.
+template<class T> __global__ void mergeDraftScores(const T *base, int stride, T *adjust, const T *bias,
+                                                   int vocab, size_t count, float cap) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int col = i % vocab;
+    const T correction = T(float(adjust[i]) + float(bias[col]));
+    const T score = T(float(base[(i / vocab) * stride + col]) + float(correction));
+    adjust[i] = T(cap * tanhf(float(score) / cap));
+}
