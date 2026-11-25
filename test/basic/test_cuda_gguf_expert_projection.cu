@@ -65,6 +65,32 @@ static void CheckRoutedGemv(ggml_type type, int cols, bool useOuter, int copies)
     Cuda(cudaDeviceSynchronize());
     std::vector<float> actual(routes * rows);
     Cuda(cudaMemcpy(actual.data(), y.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    // Interleave another projection's payload and permute expert-to-slot ownership.
+    // The host branch owns two routes; its outputs must survive the GPU projection.
+    const size_t payload = rows * stride, scaleOffset = (payload + 3) & ~size_t(3);
+    const size_t pitch = (scaleOffset + sizeof(float) + 255) & ~size_t(255);
+    std::vector<uint8_t> records(experts * pitch);
+    std::vector<int> slots = ids;
+    for (int e = 0; e < experts; ++e) {
+        auto *record = records.data() + (experts - 1 - e) * pitch;
+        std::memcpy(record, packed.data() + e * payload, payload);
+        const float factor = useOuter ? outer[e] : 1.f;
+        std::memcpy(record + scaleOffset, &factor, sizeof(factor));
+    }
+    for (int &slot : slots) if (slot >= 0) slot = experts - 1 - slot;
+    Data cache(INT8, {int(records.size())}), slotIds(INT32, {routes});
+    Allocate(cache); Upload(cache, records); Allocate(slotIds); Upload(slotIds, slots);
+    std::vector<float> expectedSlots(routes * rows, -1234.f);
+    Upload(y, expectedSlots);
+    FastllmCudaGetGGUFSlotProjection(type)(static_cast<uint8_t *>(cache.cudaData), pitch,
+        static_cast<int *>(slotIds.cudaData), static_cast<float *>(x.cudaData), static_cast<float *>(y.cudaData),
+        routes, copies, cols, rows, stride, cudaStreamPerThread);
+    Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+    for (int r = 0; r < routes; ++r) if (slots[r] >= 0)
+        std::copy_n(actual.data() + r * rows, rows, expectedSlots.data() + r * rows);
+    std::vector<float> slotResult(routes * rows);
+    Cuda(cudaMemcpy(slotResult.data(), y.cudaData, slotResult.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    Check(slotResult == expectedSlots, "Masked GGUF slot projection mismatch");
     double diff = 0, norm = 0;
     for (int r = 0; r < routes; ++r) for (int j = 0; j < rows; ++j) {
         if (ids[r] < 0) {

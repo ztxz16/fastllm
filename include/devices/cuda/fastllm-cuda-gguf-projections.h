@@ -68,6 +68,13 @@ using FastllmGGUFExpertProjection = void (*)(const void *weights, const float *o
         const float *input, float *output, int routes, int routesPerInput, int cols, int rows, size_t rowBytes);
 FastllmGGUFExpertProjection FastllmCudaGetGGUFExpertProjection(int type);
 
+// A cache slot contains packed GGUF rows followed by its expert's float scale.
+// Negative slots belong to another execution branch and leave output untouched.
+struct CUstream_st;
+using FastllmGGUFSlotProjection = void (*)(const uint8_t *base, size_t stride, const int *slots,
+        const float *input, float *output, int routes, int copies, int cols, int rows, size_t rowBytes, CUstream_st *);
+FastllmGGUFSlotProjection FastllmCudaGetGGUFSlotProjection(int type);
+
 // One input shared by all top-k routes. Uses caller-owned Q8_1 scratch.
 bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, const float *outer, const int *ids,
         const float *input, float *output, void *scratch, int topk, int cols, int width, size_t rowBytes);

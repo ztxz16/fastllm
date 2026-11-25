@@ -1384,17 +1384,18 @@ bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::D
 }
 
 namespace {
-template <ggml_type Type>
+template <ggml_type Type, bool Slots>
 __global__ void ggufExpertProjection(const uint8_t *weights, const float *outer, const int *experts, const float *input,
-                                     float *out, int copies, int cols, int rows, size_t rowBytes) {
+                                     float *out, int copies, int cols, int rows, size_t rowBytes, size_t stride) {
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= rows) return;
     const int route = blockIdx.y, expert = experts[route];
     if (expert < 0) {
-        if (!lane) out[size_t(route) * rows + row] = 0.f;
+        if (!Slots && !lane) out[size_t(route) * rows + row] = 0.f;
         return;
     }
-    const uint8_t *w = weights + (size_t(expert) * rows + row) * rowBytes;
+    const uint8_t *record = weights + size_t(expert) * (Slots ? stride : rows * rowBytes);
+    const uint8_t *w = record + row * rowBytes;
     const float *x = input + size_t(route / copies) * cols;
     float sum = 0;
     if constexpr (Type == GGML_TYPE_BF16) {
@@ -1416,36 +1417,58 @@ __global__ void ggufExpertProjection(const uint8_t *weights, const float *outer,
     }
     for (int delta = 16; delta; delta /= 2)
         sum += __shfl_down_sync(0xffffffff, sum, delta);
-    if (!lane) out[size_t(route) * rows + row] = outer ? sum * outer[expert] : sum;
+    if (!lane) {
+        if constexpr (Slots) sum *= *reinterpret_cast<const float *>(record + ((rows * rowBytes + 3) & ~size_t(3)));
+        else if (outer) sum *= outer[expert];
+        out[size_t(route) * rows + row] = sum;
+    }
 }
 
 template <ggml_type Type>
 void launchExpertProjection(const void *weights, const float *outer, const int *experts, const float *input,
                             float *output, int routes, int routesPerInput, int cols, int rows, size_t rowBytes) {
-    ggufExpertProjection<Type><<<dim3((rows + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
-        static_cast<const uint8_t *>(weights), outer, experts, input, output, routesPerInput, cols, rows, rowBytes);
+    ggufExpertProjection<Type, false><<<dim3((rows + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
+        static_cast<const uint8_t *>(weights), outer, experts, input, output, routesPerInput, cols, rows, rowBytes, 0);
+}
+template <ggml_type Type>
+void launchSlotProjection(const uint8_t *base, size_t stride, const int *slots, const float *input,
+                          float *out, int routes, int copies, int cols, int rows, size_t rowBytes, CUstream_st *stream) {
+    ggufExpertProjection<Type, true><<<dim3((rows + 3) / 4, routes), 128, 0, stream>>>(
+        base, nullptr, slots, input, out, copies, cols, rows, rowBytes, stride);
+}
+
+template<bool Slots, ggml_type Type> auto projectionLauncher() {
+    if constexpr (Slots) return launchSlotProjection<Type>;
+    else return launchExpertProjection<Type>;
+}
+
+template<bool Slots> auto expertProjection(int type) {
+    switch (type) {
+        case GGML_TYPE_BF16: return projectionLauncher<Slots, GGML_TYPE_BF16>();
+        case GGML_TYPE_Q5_0: return projectionLauncher<Slots, GGML_TYPE_Q5_0>();
+        case GGML_TYPE_MXFP4: return projectionLauncher<Slots, GGML_TYPE_MXFP4>();
+        case GGML_TYPE_NVFP4: return projectionLauncher<Slots, GGML_TYPE_NVFP4>();
+        case GGML_TYPE_IQ1_S: return projectionLauncher<Slots, GGML_TYPE_IQ1_S>();
+        case GGML_TYPE_IQ2_XXS: return projectionLauncher<Slots, GGML_TYPE_IQ2_XXS>();
+        case GGML_TYPE_IQ2_XS: return projectionLauncher<Slots, GGML_TYPE_IQ2_XS>();
+        case GGML_TYPE_IQ2_S: return projectionLauncher<Slots, GGML_TYPE_IQ2_S>();
+        case GGML_TYPE_IQ3_XXS: return projectionLauncher<Slots, GGML_TYPE_IQ3_XXS>();
+        case GGML_TYPE_IQ3_S: return projectionLauncher<Slots, GGML_TYPE_IQ3_S>();
+        case GGML_TYPE_IQ4_NL: return projectionLauncher<Slots, GGML_TYPE_IQ4_NL>();
+        case GGML_TYPE_IQ4_XS: return projectionLauncher<Slots, GGML_TYPE_IQ4_XS>();
+        case GGML_TYPE_Q2_0: return projectionLauncher<Slots, GGML_TYPE_Q2_0>();
+        case GGML_TYPE_Q3_K: return projectionLauncher<Slots, GGML_TYPE_Q3_K>();
+        case GGML_TYPE_Q4_K: return projectionLauncher<Slots, GGML_TYPE_Q4_K>();
+        case GGML_TYPE_Q5_K: return projectionLauncher<Slots, GGML_TYPE_Q5_K>();
+        case GGML_TYPE_Q8_0: return projectionLauncher<Slots, GGML_TYPE_Q8_0>();
+        default: throw std::runtime_error("Unsupported GGUF expert projection type " + std::to_string(type));
+    }
 }
 } // namespace
 
 FastllmGGUFExpertProjection FastllmCudaGetGGUFExpertProjection(int type) {
-    switch (type) {
-        case GGML_TYPE_BF16: return launchExpertProjection<GGML_TYPE_BF16>;
-        case GGML_TYPE_Q5_0: return launchExpertProjection<GGML_TYPE_Q5_0>;
-        case GGML_TYPE_MXFP4: return launchExpertProjection<GGML_TYPE_MXFP4>;
-        case GGML_TYPE_NVFP4: return launchExpertProjection<GGML_TYPE_NVFP4>;
-        case GGML_TYPE_IQ1_S: return launchExpertProjection<GGML_TYPE_IQ1_S>;
-        case GGML_TYPE_IQ2_XXS: return launchExpertProjection<GGML_TYPE_IQ2_XXS>;
-        case GGML_TYPE_IQ2_XS: return launchExpertProjection<GGML_TYPE_IQ2_XS>;
-        case GGML_TYPE_IQ2_S: return launchExpertProjection<GGML_TYPE_IQ2_S>;
-        case GGML_TYPE_IQ3_XXS: return launchExpertProjection<GGML_TYPE_IQ3_XXS>;
-        case GGML_TYPE_IQ3_S: return launchExpertProjection<GGML_TYPE_IQ3_S>;
-        case GGML_TYPE_IQ4_NL: return launchExpertProjection<GGML_TYPE_IQ4_NL>;
-        case GGML_TYPE_IQ4_XS: return launchExpertProjection<GGML_TYPE_IQ4_XS>;
-        case GGML_TYPE_Q2_0: return launchExpertProjection<GGML_TYPE_Q2_0>;
-        case GGML_TYPE_Q3_K: return launchExpertProjection<GGML_TYPE_Q3_K>;
-        case GGML_TYPE_Q4_K: return launchExpertProjection<GGML_TYPE_Q4_K>;
-        case GGML_TYPE_Q5_K: return launchExpertProjection<GGML_TYPE_Q5_K>;
-        case GGML_TYPE_Q8_0: return launchExpertProjection<GGML_TYPE_Q8_0>;
-        default: throw std::runtime_error("Unsupported GGUF expert projection type " + std::to_string(type));
-    }
+    return expertProjection<false>(type);
+}
+FastllmGGUFSlotProjection FastllmCudaGetGGUFSlotProjection(int type) {
+    return expertProjection<true>(type);
 }
