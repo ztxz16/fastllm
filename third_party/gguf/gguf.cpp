@@ -1112,7 +1112,7 @@ namespace fastllm {
                 const auto traits = type >= 0 && type < GGML_TYPE_COUNT
                     ? type_traits.find(static_cast<ggml_type>(type)) : type_traits.end();
                 if (traits == type_traits.end() || !traits->second.type_size || traits->second.blck_size <= 0 ||
-                    type == GGML_TYPE_NVFP4)
+                    (type == GGML_TYPE_NVFP4 && arch != "inkling2_loop"))
                     throw std::runtime_error("Unsupported GGUF tensor type " + std::to_string(type) +
                                              " for " + tensorName + " in " + fileName);
                 tensors[i].first.type = traits->first;
@@ -1140,14 +1140,14 @@ namespace fastllm {
         uint64_t baseOffset = ftell(ggufBuffer.f);
         uint64_t curPos = baseOffset;
 
-        if (arch == "hy_v4_flash") {
+        if (arch == "hy_v4_flash" || arch == "inkling2_loop") {
             const auto end = std::ifstream(fileName, std::ios::binary | std::ios::ate).tellg();
-            AssertInFastLLM(end >= 0, "Cannot read HY4 GGUF shard size: " + fileName);
+            AssertInFastLLM(end >= 0, "Cannot read GGUF shard size: " + fileName);
             const uint64_t size = static_cast<uint64_t>(end);
             for (auto &item : tensors) {
                 AssertInFastLLM(baseOffset <= size && item.second <= size - baseOffset &&
                                 ggml_nbytes(&item.first) <= size - baseOffset - item.second,
-                                "Invalid HY4 GGUF tensor range: " + item.first.name);
+                                "Invalid GGUF tensor range: " + item.first.name);
                 tasks.emplace_back(item.first.name, nullptr, item.first, fileName, baseOffset + item.second);
             }
             return;

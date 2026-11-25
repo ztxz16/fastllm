@@ -151,6 +151,7 @@ def read_gguf_tensor_names(path):
 
 
 _ARCHITECTURE_CONFIGS = {
+    "inkling2_loop": ("inkling2_loop", "Inkling2LoopForConditionalGeneration"),
     "llama": ("llama", "LlamaForCausalLM"),
     "qwen2": ("qwen2", "Qwen2ForCausalLM"),
     "qwen3": ("qwen3", "Qwen3ForCausalLM"),
@@ -319,6 +320,11 @@ def get_gguf_model_config(path):
 
 
 _GPT2_PRETOKENIZER_PATTERNS = {
+    "inkling2": (
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|"
+        r"\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+    ),
     "hy_v4": (
         r"\p{N}{1,3}",
         r"[一-龥぀-ゟ゠-ヿ]+",

@@ -1,3 +1,5 @@
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "gguf.h"
 // Expert packing and activation quantization follow the original Inkling 2 Mini checkpoint.
 // Reference for the NVFP4 reconstruction policy and the position of the routing weights:
 // https://github.com/vllm-project/vllm/tree/fc1443152c0eb655f5c2762f56b540bebe93b196/vllm/models/inkling2/nvidia
@@ -395,8 +397,8 @@ __global__ void quantizeGroupedSiTUBlocks(native::GroupedBuffers buffers, const 
 
 #endif
 
-template<bool Pdl = false>
-__global__ void sumNativeRoutes(const __nv_bfloat16 *routes, float *out, int rows, int width, int top) {
+template<bool Pdl = false, typename T = __nv_bfloat16>
+__global__ void sumNativeRoutes(const T *routes, float *out, int rows, int width, int top) {
     if constexpr (Pdl) cuda_launch::DependencyStart();
     size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(rows) * width) return;
@@ -703,14 +705,42 @@ struct Projection {
     native::Weights nativeView() const { return {nativeCodes.p, nativeScales.p, nativeOuter.p}; }
     std::vector<HostShard> shards;
     std::vector<Packed> host;
+    // Both file formats feed the same Tensor Core tile packer. Stage one expert at a time.
+    template <class Upload>
+    void packNative(const std::vector<float> &outer, bool interleaved, Upload upload) {
+        const size_t bytes = size_t(rows) * cols / 2, groups = size_t(rows) * cols / 16;
+        const int experts = outer.size();
+        nativeCodes = Buffer<uint4>(experts * bytes / 16);
+        nativeScales = Buffer<unsigned>(experts * groups / 4);
+        nativeOuter = Buffer<float>(experts);
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+        haveGroupedMaps = native::makeGroupedWeightMaps(groupedMaps, nativeView(), experts, rows, cols);
+#endif
+        check(cudaMemcpy(nativeOuter.p, outer.data(), experts * sizeof(float), cudaMemcpyHostToDevice));
+        Buffer<unsigned> staging((bytes + groups) / sizeof(unsigned));
+        for (int id = 0; id < experts; ++id) {
+            upload(id, staging.p);
+            native::pack<<<(bytes / 16 + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                staging.p, staging.p + bytes / 4, nativeCodes.p + id * (bytes / 16),
+                nativeScales.p + id * (groups / 4), rows, cols, interleaved);
+        }
+        check(cudaGetLastError());
+    }
+
+    void loadNativeGGUF(const std::map<std::string, TensorRange> &files, const std::string &name, int experts);
+
     Projection(const std::map<std::string, TensorRange> &files, const std::string &name, int e, int r, int c,
                ExpertDevice where, ExpertLoadContext &topology, bool gateUp)
         : rows(r), cols(c), device(where) {
         const auto &weight = files.at(name);
-        fp4 = weight.type == "U8";
+        fp4 = weight.type == "U8" || weight.ggmlType == GGML_TYPE_NVFP4;
         group = fp4 ? 16 : 32;
         if (c % group)
             throw std::runtime_error("Inkling expert columns are not group aligned");
+        if (weight.ggmlType == GGML_TYPE_NVFP4) {
+            loadNativeGGUF(files, name, e);
+            return;
+        }
         auto raw = readRange<uint8_t>(weight, {e, r, fp4 ? c / 2 : c}, fp4 ? "U8" : "F8_E4M3");
         auto scale = readRange<uint8_t>(files.at(name + "_scale"), {e, r, c / group}, fp4 ? "F8_E4M3" : "U8");
 #ifdef FASTLLM_INKLING_GROUPED_SM75
@@ -735,23 +765,10 @@ struct Projection {
         if (where == ExpertDevice::Cuda && fp4 && topology.nativeFp4) {
             if (std::any_of(scale.begin(), scale.end(), [](uint8_t v) { return (v & 127) == 127; }))
                 throw std::runtime_error("Invalid Inkling NVFP4 expert block scale");
-            nativeCodes = Buffer<uint4>(raw.size() / 16);
-            nativeScales = Buffer<unsigned>(scale.size() / 4);
-            nativeOuter = Buffer<float>(e);
-#ifdef FASTLLM_INKLING_GROUPED_SM120
-            haveGroupedMaps = native::makeGroupedWeightMaps(groupedMaps, nativeView(), e, r, c);
-#endif
-            check(cudaMemcpy(nativeOuter.p, outer.data(), e * sizeof(float), cudaMemcpyHostToDevice));
-            Buffer<unsigned> staging((bytes + groups) / sizeof(unsigned));
-            for (int id = 0; id < e; ++id) {
-                check(cudaMemcpy(staging.p, raw.data() + id * bytes, bytes, cudaMemcpyHostToDevice));
-                check(
-                    cudaMemcpy(staging.p + bytes / 4, scale.data() + id * groups, groups, cudaMemcpyHostToDevice));
-                native::pack<<<(bytes / 16 + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-                    staging.p, staging.p + bytes / 4, nativeCodes.p + id * (bytes / 16),
-                    nativeScales.p + id * (groups / 4), r, c, gateUp);
-            }
-            check(cudaGetLastError());
+            packNative(outer, gateUp, [&](int id, unsigned *staging) {
+                check(cudaMemcpy(staging, raw.data() + id * bytes, bytes, cudaMemcpyHostToDevice));
+                check(cudaMemcpy(staging + bytes / 4, scale.data() + id * groups, groups, cudaMemcpyHostToDevice));
+            });
             return;
         }
         const int nodes = where == ExpertDevice::Numa ? topology.nodes : 1;
@@ -846,6 +863,41 @@ struct Projection {
         }
     }
 };
+// A gate/up input is shared by all routes of a token. A down input belongs to one route.
+template <bool GateUp>
+void projectNativeRoutes(const Projection &w, const native::Block16 *input, const int *ids,
+                         int rows, int top, __nv_bfloat16 *out) {
+    using Edge = native::DecodeDependency;
+    const int routes = rows * top, tile = native::decodeRouteTileRows(rows, top), capacity = tile * top;
+    const dim3 grid(w.rows / 16, tile ? capacity : routes, tile ? (rows + tile - 1) / tile : 1);
+    auto launch = [&](auto grouped) {
+        constexpr bool match = decltype(grouped)::value;
+        constexpr Edge edge = GateUp || match ? Edge::Gate : Edge::Down;
+        return cuda_launch::Launch<native::decodeProject<4, match, edge>>(
+            grid, 128, 0, cudaStreamPerThread, w.nativeView(), input, ids, out, w.rows, w.cols,
+            GateUp ? top : 1, routes, capacity);
+    };
+    if (!(tile ? launch(std::true_type{}) : launch(std::false_type{})))
+        throw std::runtime_error("Inkling FP4 projection launch failed");
+}
+
+void finishNativeRoutes(const Config &c, Rows<__nv_bfloat16> &projected, float *dstRows,
+                        Rows<__nv_bfloat16> *unreduced) {
+    const int rows = projected.rows / c.topK;
+    if (unreduced) {
+        *unreduced = std::move(projected);
+        return;
+    }
+    if (rows == 1) {
+        if (!cuda_launch::Launch<sumNativeRoutes<true>>((c.hidden + 255) / 256, 256, 0, cudaStreamPerThread,
+                projected.p, dstRows, rows, c.hidden, c.topK))
+            throw std::runtime_error("Inkling FP4 route sum launch failed");
+        return;
+    }
+    sumNativeRoutes<><<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        projected.p, dstRows, rows, c.hidden, c.topK);
+}
+
 class RoutedExperts : public ExpertBackend, protected CudaMoeActivation {
 protected:
     const Data &routerWeight;
@@ -1061,25 +1113,9 @@ class GpuExperts final : public RoutedExperts {
         RoutedSiTU<__nv_bfloat16> act{pair.p, route.scores, gateCap, upCap};
         if (rows == 1 || decodeArithmetic) {
             Buffer<native::Block16> mid(size_t(routes) * c.intermediate / 16);
-            const int tileRows = native::decodeRouteTileRows(rows, c.topK);
-            auto project = [&](const Projection &w, const native::Block16 *x, int divisor, __nv_bfloat16 *y) {
-                using Edge = native::DecodeDependency;
-                auto launch = [&](auto grouped, auto edge) {
-                    const int capacity = tileRows * c.topK;
-                    const dim3 grid(w.rows / 16, tileRows ? capacity : routes, tileRows ? (rows + tileRows - 1) / tileRows : 1);
-                    return cuda_launch::Launch<native::decodeProject<4, decltype(grouped)::value, decltype(edge)::value>>(
-                        grid, 128, 0, cudaStreamPerThread, w.nativeView(), x, route.ids, y, w.rows, w.cols,
-                        divisor, routes, capacity);
-                };
-                constexpr auto gateEdge = std::integral_constant<Edge, Edge::Gate>{};
-                const bool ok = tileRows ? launch(std::true_type{}, gateEdge) :
-                    &w == &gate ? launch(std::false_type{}, gateEdge) :
-                    launch(std::false_type{}, std::integral_constant<Edge, Edge::Down>{});
-                if (!ok) throw std::runtime_error("Inkling FP4 projection launch failed");
-            };
-            project(gate, input.p, c.topK, pair.p);
+            projectNativeRoutes<true>(gate, input.p, route.ids, rows, c.topK, pair.p);
             quantizeFp4Into(act, mid.p, routes, c.intermediate, smCount, true);
-            project(down, mid.p, 1, projected.p);
+            projectNativeRoutes<false>(down, mid.p, route.ids, rows, c.topK, projected.p);
         } else if (routes / c.experts >= 64) {
             // At least one 64-row tile per expert on average amortizes the
             // larger tile and lets each warp reuse activations across columns.
@@ -1087,18 +1123,7 @@ class GpuExperts final : public RoutedExperts {
         } else {
             projectGrouped<32, 1>(c, routes, route, input.p, ranks.p, counts.p, source, pair.p, projected.p, act);
         }
-        if (unreduced) {
-            *unreduced = std::move(projected);
-            return;
-        }
-        if (rows == 1) {
-            if (!cuda_launch::Launch<sumNativeRoutes<true>>((c.hidden + 255) / 256, 256, 0, cudaStreamPerThread,
-                    projected.p, dstRows, rows, c.hidden, c.topK))
-                throw std::runtime_error("Inkling FP4 route sum launch failed");
-            return;
-        }
-        sumNativeRoutes<><<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-            projected.p, dstRows, rows, c.hidden, c.topK);
+        finishNativeRoutes(c, projected, dstRows, unreduced);
     }
 
 public:
@@ -1268,6 +1293,7 @@ public:
         return out;
     }
 };
+#include "gguf-experts.cuh"
 #include "hybrid-experts.cuh"
 } // namespace
 ExpertLayers loadExperts(const Config &c, const Placement &p, const std::map<std::string, TensorRange> &files,
@@ -1300,6 +1326,15 @@ ExpertLayers loadExperts(const Config &c, const Placement &p, const std::map<std
         if (router.dataType != FLOAT32 || router.dims != std::vector<int>{c.experts, c.hidden})
             throw std::runtime_error("Inkling router shape or dtype");
         auto prefix = mlp + "experts.";
+        const int gateType = files.at(prefix + "w13_weight").ggmlType;
+        if (gateType >= 0) {
+            const bool nativeDown = topology.nativeFp4 && files.at(prefix + "w2_weight").ggmlType == GGML_TYPE_NVFP4;
+            if (!nativeDown || gateType != GGML_TYPE_NVFP4) {
+                experts.layers.push_back(std::make_unique<GpuGGUFExperts>(c, files, prefix, router,
+                                                                          nativeDown ? &topology : nullptr));
+                continue;
+            }
+        }
         if (p.experts[i] == ExpertDevice::Cuda)
             experts.layers.push_back(std::make_unique<GpuExperts>(files, prefix, c, topology, router));
         else

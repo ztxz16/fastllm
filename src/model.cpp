@@ -3288,6 +3288,7 @@ namespace fastllm {
     std::string ConvertGGUFTypeToFastllmType(const std::string &type) {
         static std::map <std::string, std::string> ggufTypeToFastllmTypeDict = {
             {"deepseek41", "deepseek_v41"}, {"deepseek_v41_text", "deepseek_v41"},
+            {"inkling2_loop", "inkling2_loop"},
             {"qwen2", "qwen2"}, // llama
             {"qwen3moe", "qwen3_moe"}, {"qwen3_moe", "qwen3_moe"}, // qwen3_moe
             {"qwen35", "qwen3_5"}, {"qwen3_5", "qwen3_5"}, // qwen3.5
@@ -3718,6 +3719,7 @@ namespace fastllm {
         const json11::Json &params, const std::string &arch) {
         basellm *model = CreateModelWithType(ConvertGGUFTypeToFastllmType(arch));
         LoadGGUFModelConfig(params, arch, model);
+        if (auto *inkling = dynamic_cast<Inkling2Model *>(model)) inkling->ConfigureGGUF(params);
         LoadGGUFTokenizer(params, model);
 
         auto setInt = [&](const std::string &key, int &target) {
@@ -4368,6 +4370,7 @@ namespace fastllm {
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
         }
+        if (auto *inkling = dynamic_cast<Inkling2Model *>(model)) inkling->PrepareGGUF(readGGUFTasks);
         if (arch == "hy_v4_flash") {
             auto *hy = dynamic_cast<Hy4FlashModel *>(model);
             AssertInFastLLM(hy && hy->UsesHostExperts(), "HY4 GGUF requires hybrid expert placement.");

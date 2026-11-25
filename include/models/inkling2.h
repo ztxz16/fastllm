@@ -2,11 +2,13 @@
 #include "basellm.h"
 
 namespace fastllm {
+struct ReadGGUFTask;
 namespace inkling2 {
 struct TensorRange {
     std::string file, type;
     std::vector<int> shape;
     uint64_t start, end;
+    int ggmlType = -1;
 };
 struct DraftConfig {
     int steps = 0, block = 0, layers = 0, heads = 0, kvHeads = 0, dim = 0, rank = 0, intermediate = 0, window = 0;
@@ -62,6 +64,8 @@ public:
     Inkling2Model();
     ~Inkling2Model() override;
     void InitParams() override;
+    void ConfigureGGUF(const json11::Json &metadata);
+    void PrepareGGUF(std::vector<ReadGGUFTask> &tasks);
     void SetDataType(DataType type) override;
     void SetKVCacheDataType(DataType type) override;
     void OnModelWeightsLoaded() override;
