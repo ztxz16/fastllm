@@ -291,6 +291,29 @@ void FastllmCudaMimoEp8PrefillReduceScatter(FastllmCudaMimoEp8Mega &state, int r
             count, output.dataType, state.devices[rank])) throw std::runtime_error("SM120 EP ReduceScatter failed.");
 }
 
+bool FastllmCudaTryMimoEp8RoutedDecode(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+    const fastllm::Data &input, const fastllm::Data &probabilities, const fastllm::Data &bias,
+    fastllm::Data &output, const int *liveKeys, bool normalize, float scale, int capacity, bool logits) {
+#ifdef FASTLLM_ENABLE_DSV41_MXFP4_SM120
+    using namespace fastllm;
+    if (capacity < 1 || capacity > 128 || !state.useGrouped(capacity, 0) || state.builtin || input.dataType != BFLOAT16 || !input.cudaData ||
+        input.dims.empty() || input.dims.back() != 4096 || !input.Count(0) || input.Count(0) > size_t(capacity) * 4096 || !liveKeys ||
+        probabilities.dataType != FLOAT32 || probabilities.Count(0) != input.Count(0) / 16 || !probabilities.cudaData ||
+        bias.dataType != FLOAT32 || bias.dims != std::vector<int>{256} || !bias.cudaData ||
+        probabilities.dataDeviceIds != input.dataDeviceIds || bias.dataDeviceIds != input.dataDeviceIds ||
+        (uintptr_t(probabilities.cudaData) & 15)) return false;
+    const int rows = input.Count(0) / 4096;
+    Data row(BFLOAT16, {rows, 4096});
+    row.FakeFrom(input, 0);
+    MimoGraphOutput(output, row, state.devices.at(rank));
+    return FastllmTryGenericEpRoutedDecode(*state.generic, rank, layer, row.cudaData,
+        static_cast<const float *>(probabilities.cudaData), static_cast<const float *>(bias.cudaData),
+        output.cudaData, liveKeys, normalize, scale, rows, capacity, logits);
+#else
+    return false;
+#endif
+}
+
 void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
         fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch) {

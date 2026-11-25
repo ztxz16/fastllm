@@ -2,6 +2,7 @@
 // vendored DeepGEMM headers (MIT, third_party/deep_gemm). The P2P exchange,
 // routing and workspace layout below are independent of a particular GPU SKU.
 #include "devices/cuda/fastllm-mxfp4-ep-generic.h"
+#include "devices/cuda/fastllm-cuda-router-topk.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
@@ -301,14 +302,9 @@ struct QuantizedSwiGLU {
         }
     }
 };
-__device__ void packInputRow(uint8_t *p, const BF *input, const int *ids, const float *scores,
-                             int row, int hidden, int topk, bool active) {
-    int *routes = reinterpret_cast<int *>(p + hidden + hidden / 32);
-    for (int j = threadIdx.x; j < topk; j += blockDim.x) {
-        routes[j] = active ? ids[row * topk + j] : -1;
-        reinterpret_cast<float *>(routes + topk)[j] = active ? scores[row * topk + j] : 0.f;
-    }
-    for (int chunk = threadIdx.x; chunk < hidden / 4; chunk += blockDim.x) {
+__device__ void packInputValues(uint8_t *p, const BF *input, int row, int hidden,
+                                bool active, int first, int step) {
+    for (int chunk = first; chunk < hidden / 4; chunk += step) {
         const auto *chunks = active ? reinterpret_cast<const uint2 *>(input + size_t(row) * hidden) : nullptr;
         const uint2 raw = active ? chunks[chunk] : make_uint2(0, 0);
         const float4 values = make_float4(__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
@@ -317,6 +313,15 @@ __device__ void packInputRow(uint8_t *p, const BF *input, const int *ids, const 
         reinterpret_cast<uint32_t *>(p)[chunk] = quantizeFour(values, scale);
         if (chunk % 8 == 0) p[hidden + chunk / 8] = scale;
     }
+}
+__device__ void packInputRow(uint8_t *p, const BF *input, const int *ids, const float *scores,
+                             int row, int hidden, int topk, bool active) {
+    int *routes = reinterpret_cast<int *>(p + hidden + hidden / 32);
+    for (int j = threadIdx.x; j < topk; j += blockDim.x) {
+        routes[j] = active ? ids[row * topk + j] : -1;
+        reinterpret_cast<float *>(routes + topk)[j] = active ? scores[row * topk + j] : 0.f;
+    }
+    packInputValues(p, input, row, hidden, active, threadIdx.x, blockDim.x);
 }
 __global__ void publish(Mail mail, Shape s, const BF *input, const int *ids, const float *scores, int rows,
                         const int *live) {
@@ -377,6 +382,51 @@ __global__ void dispatchDecodeRows(Mail *peers, int rank, const BF *input, const
         const int owner = (rank + blockIdx.y * DispatchPeers + threadIdx.x) % ranks;
         forwardEp8Packet(packet, peers, owner, 1, rank, row, cap);
     }
+}
+struct DecodeSelection {
+    const float *probabilities = nullptr, *bias = nullptr;
+    int *ids = nullptr;
+    bool normalize = false;
+    float scale = 1.f;
+    bool logits = false;
+};
+
+// Warp zero selects the exact TopK while the other warps quantize the input.
+// Each peer group needs the whole packet; only group zero publishes IDs for combine.
+__global__ void dispatchRoutedRow(Mail *peers, int rank, const BF *input, DecodeSelection selection,
+                                  const int *live, int rows, int capacity) {
+    __shared__ __align__(16) uint8_t packet[Ep8PacketBytes];
+    __shared__ fastllm::cuda::RouterTopKScratch<8> scratch;
+    __shared__ __align__(16) float probabilities[256];
+    const int row = blockIdx.x;
+    const bool active = row < rows && live[row] > 0;
+    const int t = threadIdx.x;
+    auto *ids = reinterpret_cast<int *>(packet + Ep8MetadataOffset);
+    auto *scores = reinterpret_cast<float *>(ids + 8);
+    if (t < 32) {
+        if (active) {
+            const float *source = selection.probabilities + size_t(row) * 256;
+            if (selection.logits) {
+                for (int expert = t; expert < 256; expert += 32)
+                    probabilities[expert] = 1.0 / (1.0 + expf(-source[expert]));
+                __syncwarp();
+                source = probabilities;
+            }
+            fastllm::cuda::SelectRouterTopK<256, 8>(source, selection.bias,
+                ids, scores, 1, selection.normalize, selection.scale, scratch);
+        } else if (t < 8) {
+            ids[t] = -1;
+            scores[t] = 0.f;
+        }
+        __syncwarp();
+        if (!blockIdx.y && t < 8) selection.ids[row * 8 + t] = ids[t];
+    } else {
+        packInputValues(packet, input, row, 4096, active, t - 32, blockDim.x - 32);
+    }
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+    __syncthreads();
+    if (t < DispatchPeers)
+        forwardEp8Packet(packet, peers, (rank + blockIdx.y * DispatchPeers + t) % 8, 1, rank, row, capacity);
 }
 __global__ void dispatchEp8ToNumaPeers(Mail *peers, int rank, const BF *input, const int *ids,
                                        const float *scores, int rows, int cap, const int *live) {
@@ -1107,7 +1157,7 @@ void prefillGemm(Rank &r, const Shape &s, const Rank::Layer &l, const Buffers &b
 }
 void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF *rowsIn, const int *index,
               const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream,
-              bool dense, bool prefetched, PrefetchChunk next) {
+              bool dense, bool prefetched, PrefetchChunk next, DecodeSelection selection = {}) {
     auto buffers = r.b;
     if (prefetched) buffers.incoming = r.prefetched.receive[rank];
     const bool shortBatch = r.tunedEp8 && cap <= 32;
@@ -1119,7 +1169,9 @@ void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF 
     const bool crossSocketOnly = paired && ownerPartial && cap < PrefillChunk;
     const bool compact = r.compactPrefill && crossSocketOnly && cap < CompactPrefillLimit;
     const Mail *returnPeers = paired ? r.pairedReturnPeers : r.peers;
-    if (prefetched) {
+    if (selection.probabilities) {
+        dispatchRoutedRow<<<dim3(cap, 8 / DispatchPeers), 256, 0, stream>>>(r.peers, rank, rowsIn, selection, keys, n, cap);
+    } else if (prefetched) {
         check(cudaStreamWaitEvent(stream, r.copyDone, 0));
     } else if (paired) {
         dispatchDenseEp8(r.current, s, rank, rowsIn, index, weights, cap, stream);
@@ -1245,4 +1297,18 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
                  n && live ? live + first : nullptr, stream, start + cap <= densePrefixRows, prefetched, next);
         prefetched = next.capacity != 0;
     }
+}
+
+bool FastllmTryGenericEpRoutedDecode(FastllmGenericEp &ep, int rank, int layer, const void *input,
+    const float *probabilities, const float *bias, void *output, const int *live, bool normalize, float scale,
+    int rows, int capacity, bool logits) {
+    auto &r = *ep.ranks.at(rank);
+    if (!r.tunedEp8 || capacity > ep.s.cap) return false;
+    // Direct dispatch bypasses the local send packet. Its storage remains
+    // available to combine until this rank finishes the layer on the same stream.
+    int *ids = reinterpret_cast<int *>(r.mail.send);
+    runChunk(r, ep.s, r.layers.at(layer), rank, static_cast<const BF *>(input), ids, nullptr,
+        static_cast<BF *>(output), rows, capacity, live, cudaStreamPerThread, false, false, {},
+        {probabilities, bias, ids, normalize, scale, logits});
+    return true;
 }

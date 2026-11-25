@@ -24,3 +24,7 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
 void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *input, const int32_t *ids,
                          const float *scores, void *output, int rows, int commonRows, const int *liveKeys,
                          int densePrefixRows);
+
+bool FastllmTryGenericEpRoutedDecode(FastllmGenericEp &ep, int rank, int layer, const void *input,
+    const float *probabilities, const float *bias, void *output, const int *live, bool normalize, float scale,
+    int rows, int capacity, bool logits);

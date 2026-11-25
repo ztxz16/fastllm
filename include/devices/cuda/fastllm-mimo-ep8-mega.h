@@ -14,6 +14,9 @@ inline bool FastllmCudaMimoIsMxfp4Expert(const fastllm::Data &w) {
            w.dims.size() == 2 && w.dims[0] > 0 && w.dims[1] > 0 && w.dims[1] % 32 == 0 &&
            w.GetBytes() == fastllm::GetNVFP4StorageBytes(w.dims[0], w.dims[1], 1, 32);
 }
+bool FastllmCudaTryMimoEp8RoutedDecode(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+    const fastllm::Data &input, const fastllm::Data &probabilities, const fastllm::Data &bias,
+    fastllm::Data &output, const int *liveKeys, bool normalize, float scale, int capacity, bool logits);
 // Query only after group admission; preserves the calling CUDA device.
 bool FastllmCudaMimoEp8MegaOwnsPackedWeights(int device);
 // Required backing for an eligible eager prefill chunk, or zero for the
