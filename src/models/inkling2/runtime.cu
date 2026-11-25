@@ -2119,11 +2119,54 @@ class Decoder final : public Runtime {
         }
     }
 
+    int poolPages(int tokenLimit, bool draft, bool local) const {
+        const int len = GetPageLen();
+        const int batch = std::max(1, model.maxBatch);
+        int64_t pages = tokenLimit > 0 ? (int64_t(tokenLimit) + len - 1) / len : -1;
+        if (draft && pages > 0) pages += int64_t(batch) * ((c.draft.block + len - 2) / len);
+        if (local && model.maxBatch > 0) {
+            const int64_t window = draft ? c.draft.window + int64_t(c.draft.block)
+                                         : c.window + int64_t(std::max(0, c.draft.block - 1));
+            const int64_t bound = ((window + len - 2) / len + 1) * batch;
+            pages = pages > 0 ? std::min(pages, bound) : bound;
+        }
+        return int(std::min<int64_t>(pages, INT_MAX));
+    }
+
+    // Graphs are resident before the first user request materializes the KV pools.
+    // Validate their physical backing before the service reports ready.
+    void checkKVHeadroom() const {
+        const int tokens = model.tokensLimit > 0 ? model.tokensLimit : GetMaxTokens();
+        if (tokens <= 0) return;
+        size_t bytes = 0;
+        const int slots = c.visits.size(), len = GetPageLen();
+        for (int slot = 0; slot < slots + c.draft.layers; ++slot) {
+            const bool draft = slot >= slots;
+            const bool local = draft ? c.draft.local[slot - slots] : c.local[c.visits[slot]];
+            const int pages = poolPages(tokens, draft, local);
+            const int width = draft ? c.draft.kvHeads * c.draft.dim : c.kvHeads * attentionWidth(c.headDim);
+            for (int side = 0; side < 2; ++side) {
+                if (!GetPagedCacheManager(2 * placement.cacheSlot(slot) + side))
+                    bytes += GetDataBytes(draft ? FLOAT16 : kvType, size_t(pages) * len, width);
+            }
+        }
+        size_t free, total;
+        check(cudaMemGetInfo(&free, &total));
+        if (bytes > free)
+            throw CudaWorkspaceExhausted("Inkling KV pools need " + std::to_string(bytes >> 20) +
+                " MiB after warmup; " + std::to_string(free >> 20) +
+                " MiB available. Reduce --tokens or --max_batch.");
+    }
+
     void warmupDecodeGraph() override {
         std::lock_guard<std::mutex> lock(mutex);
         check(cudaSetDevice(placement.gpu));
         finishPublication();
         initializeKV();
+        if (!GetFastllmEnv().cudaGraph) {
+            checkKVHeadroom();
+            return;
+        }
         if (!c.draft.steps && model.maxBatch > 1 && placement.tensorDevices.empty() && placement.world == 1) {
             for (int b = model.maxBatch; b > 1; b = decodeCapacity(b / 2 + b % 2))
                 batchDecodePlan(b);
@@ -2154,6 +2197,7 @@ class Decoder final : public Runtime {
                     break;
                 }
             }
+            checkKVHeadroom();
         }
     }
     std::vector<int> forward(const Data &ids, const std::vector<Data *> &positions,
@@ -2303,19 +2347,11 @@ class Decoder final : public Runtime {
                         v.value = &owned->value;
                         const int pool = 2 * placement.cacheSlot(int(c.visits.size()) + l);
                         const int64_t extra = c.draft.block - 1;
-                        const int maxBatch = std::max(1, model.maxBatch);
-                        int64_t pages = tokenLimit > 0 ? (int64_t(tokenLimit) + len - 1) / len +
-                                                             maxBatch * ((extra + len - 1) / len)
-                                                       : -1;
                         int64_t perRequest =
                             (std::min<int64_t>(limit, c.draft.maxPositions) + extra + len - 1) / len + 1;
-                        if (c.draft.local[l]) {
-                            int64_t windowPages = (int64_t(c.draft.window) + c.draft.block + len - 2) / len + 1;
-                            perRequest = std::min(perRequest, windowPages);
-                            if (model.maxBatch > 0)
-                                pages = pages < 0 ? windowPages * maxBatch : std::min(pages, windowPages * maxBatch);
-                        }
-                        int count = int(std::min<int64_t>(pages, INT_MAX));
+                        if (c.draft.local[l])
+                            perRequest = std::min(perRequest, (int64_t(c.draft.window) + c.draft.block + len - 2) / len + 1);
+                        const int count = poolPages(tokenLimit, true, c.draft.local[l]);
                         if (!req.restored || c.draft.local[l]) {
                             v.attach(owned->key, pool, draftDesc, count);
                             v.attach(owned->value, pool + 1, draftDesc, count);
@@ -2331,11 +2367,7 @@ class Decoder final : public Runtime {
                 }
                 for (size_t slot = 0; slot < c.visits.size(); ++slot) {
                     auto &v = req.visits[slot];
-                    int pages = tokenLimit > 0 ? int((int64_t(tokenLimit) + len - 1) / len) : -1;
-                    if (c.local[c.visits[slot]] && model.maxBatch > 0) {
-                        const int64_t bounded = ((int64_t(c.window) + std::max(0, c.draft.block - 1) + len - 2) / len + 1) * model.maxBatch;
-                        pages = int(std::min<int64_t>(bounded, pages > 0 ? pages : std::numeric_limits<int>::max()));
-                    }
+                    const int pages = poolPages(tokenLimit, false, c.local[c.visits[slot]]);
                     if (!req.restored || c.local[c.visits[slot]]) {
                         v.attach(*v.key, 2 * placement.cacheSlot(slot), desc, pages);
                         v.attach(*v.value, 2 * placement.cacheSlot(slot) + 1, desc, pages);

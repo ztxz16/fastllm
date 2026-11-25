@@ -27,6 +27,7 @@ class Geometry:
     relative_extent: int
     residual_block: int
     vocab: int
+    conv: int
 
 
 def geometry(meta):
@@ -62,7 +63,7 @@ def geometry(meta):
                     field("head_dim", "attention.key_length"), field("model_max_length", "context_length"),
                     field("sliding_window_size", "attention.sliding_window"), local, visits - local,
                     field("rel_extent", "attention.relative_extent"), field("n_layers_per_attn_res_block", "attn_res.block_size"),
-                    field("unpadded_vocab_size", "vocab_size_unpadded"))
+                    field("unpadded_vocab_size", "vocab_size_unpadded"), field("sconv_kernel_size", "shortconv.l_cache"))
 
 
 @dataclass
@@ -162,12 +163,14 @@ def _layouts(tp, root, info, budgets, g, draft):
     return layouts
 
 
-def _kv_bytes(capacity, batch, page, heads, dim, unit, global_layers, local_layers, window):
-    local_tokens = min(capacity, batch * ((window + page - 1) // page + 2) * page)
+def _kv_bytes(capacity, batch, page, heads, dim, unit, global_layers, local_layers, window, extra=0):
+    # The draft reserves its uncommitted block on each request's global visits.
+    capacity += batch * ((extra + page - 1) // page) * page
+    local_tokens = min(capacity, batch * ((window + page - 2) // page + 1) * page)
     return 2 * unit * heads * dim * (global_layers * capacity + local_layers * local_tokens)
 
 
-def _workspace_bytes(g, rows, decode_rows, ranks, hybrid, draft_taps):
+def _workspace_bytes(g, rows, decode_rows, ranks, hybrid, draft_taps, steps=0):
     # target() keeps the live projections and one residual per block.
     residuals = (g.global_ + g.local) // g.residual_block
     backbone = rows * g.hidden * 4 * (12 + residuals + draft_taps)
@@ -177,7 +180,14 @@ def _workspace_bytes(g, rows, decode_rows, ranks, hybrid, draft_taps):
     if hybrid:
         # Eager host routing uses bounded chunks. Capture also retains its decode intermediates.
         moe = min(moe, 64 * MiB) + decode_rows * route_bytes
-    return backbone + relative_bias + moe + 4 * decode_rows * g.vocab + 512 * MiB
+    workspace = backbone + relative_bias + moe + 4 * decode_rows * g.vocab + 512 * MiB
+    if steps:
+        batch = decode_rows // (steps + 1)
+        # Both sampling workspaces (two FP32 matrices each), proposal q, and
+        # the verifier's convolution histories. Graph shapes reuse the largest buffers.
+        workspace += 4 * g.vocab * (2 * (batch + decode_rows) + batch * steps)
+        workspace += 8 * batch * (g.local + g.global_) * (g.conv + steps) * (g.hidden + g.kv * g.dim // ranks)
+    return workspace
 
 
 def _draft_budget(args, meta):
@@ -281,11 +291,13 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
     for context in contexts:
         tokens = args.tokens if args.tokens > 0 else context * batch
         capacity = (tokens + page - 1) // page * page
-        kv = _kv_bytes(capacity, batch, page, g.kv, g.dim, unit, g.global_, g.local, g.window)
+        extra = draft["block_size"] - 1 if draft else 0
+        kv = _kv_bytes(capacity, batch, page, g.kv, 64 if g.dim <= 64 else 128, unit,
+                       g.global_, g.local, g.window + extra)
         if draft:
             local = len(draft["local_layer_ids"])
             kv += _kv_bytes(capacity, batch, page, draft["num_key_value_heads"], draft["head_dim"], 2,
-                           draft["num_hidden_layers"] - local, local, draft["sliding_window_size"] + draft["block_size"])
+                           draft["num_hidden_layers"] - local, local, draft["sliding_window_size"] + draft["block_size"], extra)
         for hybrid in (False, True):
             if (hybrid and force_gpu) or (not hybrid and force_host):
                 continue
@@ -308,7 +320,7 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                     if not fixed_chunk:
                         chunk = min(chunk, context)
                     rows = max(chunk, args.prefill_batch_tokens or 0, decode_rows)
-                    scratch = _workspace_bytes(g, rows, decode_rows, world, hybrid, draft_taps)
+                    scratch = _workspace_bytes(g, rows, decode_rows, world, hybrid, draft_taps, args.dspark)
                     runtime = resident + rank_kv + scratch
                     spare = min(rank_budget - runtime, budgets[ids[0]] - load_peak)
                     cache_bytes = 0

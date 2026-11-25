@@ -18,7 +18,7 @@ class InklingAutoTest(unittest.TestCase):
                      num_experts_per_tok=8, num_attention_heads=24, num_key_value_heads=8, head_dim=128,
                      num_hidden_layers=24, loop_config=dict(core_start=6, core_end=18, num_passes=3),
                      local_layer_ids=[i for i in range(24) if i % 6 != 5], sliding_window_size=1024,
-                     model_max_length=1048576, rel_extent=1024, n_layers_per_attn_res_block=6, unpadded_vocab_size=200058)}
+                     model_max_length=1048576, rel_extent=1024, n_layers_per_attn_res_block=6, unpadded_vocab_size=200058, sconv_kernel_size=4)}
         self.weights = [mem.Tensor("token_embd.weight", (201024, 2304), 492103616, "gguf:8")]
         for i in range(24):
             for suffix, shape in (("gate_up", (128, 2304, 2304)), ("down", (128, 2304, 1152))):
@@ -79,6 +79,18 @@ class InklingAutoTest(unittest.TestCase):
             self.plan("--moe_device", "numa", "--auto_host_memory_limit", "1g")
         with self.assertRaisesRegex(ValueError, "--kv_cache_limit"):
             self.plan("--kv_cache_limit", "1g")
+
+    def test_speculative_pools_and_graph_workspace(self):
+        # A partial last page on each request may be filled by the draft before commit.
+        self.assertEqual(ink._kv_bytes(1024, 2, 64, 1, 1, 2, 1, 1, 65, 7),
+                         4 * (1024 + 2 * 64 + 2 * 2 * 64))
+        g = ink.geometry(self.meta)
+        def overhead(batch):
+            rows = batch * 8
+            return (ink._workspace_bytes(g, 1024, rows, 1, False, 0, 7) -
+                    ink._workspace_bytes(g, 1024, rows, 1, False, 0))
+        self.assertEqual(overhead(48), 2 * overhead(24))
+        self.assertGreater(overhead(48), 4 * 48 * 7 * g.vocab)
 
     def test_external_draft_budget(self):
         args = make_normal_parser("test").parse_args(["target.gguf", "--auto", "--dspark", "7",

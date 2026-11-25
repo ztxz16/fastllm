@@ -301,7 +301,7 @@ bool Inkling2Model::RestorePagedPrefixCacheExtra(ResponseContext *ctx, int lengt
     return length > 0 && saveHistoryChat && runtime && ctx && runtime->prefix(*ctx, length, true) == length;
 }
 void Inkling2Model::WarmUp() {
-    if (SupportsDecodePipeline())
+    if (runtime && (SupportsDecodePipeline() || (draftEnabled() && (tokensLimit > 0 || GetMaxTokens() > 0))))
         runtime->warmupDecodeGraph();
 }
 int Inkling2Model::GetPrefillBatchKey(const ResponseContext &ctx, int chunkSize) const {
