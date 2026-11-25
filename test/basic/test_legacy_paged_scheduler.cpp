@@ -155,13 +155,13 @@ private:
                       "scheduler oversubscribed the physical page pool");
             }
             while ((int)pages.size() < needed) pages.push_back(pool.GetUnusedPageIndex(true));
-            data.expansionDims = {1, (view == CacheView::Paged ? pool.maxPages : needed) * pool.pageLen, 1};
             if (view == CacheView::Paged) {
                 data.isPagedKVCache = true;
                 data.pagedKVCacheData = &pool;
                 data.pageLen = pool.pageLen;
                 data.lastPageLen = (length - 1) % pool.pageLen + 1;
             } else {
+                data.expansionDims = {1, needed * pool.pageLen, 1};
                 data.cudaDataBorrowed = true;
             }
         }
@@ -429,6 +429,21 @@ void ConcurrentConsumers() {
     std::cout << "CONCURRENT_CONSUMERS_PASS\n";
 }
 
+void PagedBatchLimit() {
+    SchedulerModel model(CacheView::Paged, 8192, 128, 2);
+    model.Pause();
+    model.PauseNextConcurrentDecode();
+    std::vector<int> handles;
+    for (int i = 0; i < 4; ++i) handles.push_back(Launch(model, 128, 16));
+    model.Resume();
+    model.WaitForConcurrentDecode();
+    const int firstCohort = model.peakActiveCaches;
+    model.Resume();
+    Check(firstCohort == 2, "paged requests without expansionDims bypassed maxBatch");
+    Check(Drain(model, handles) == std::vector<int>(4, 16), "queued paged requests did not finish");
+    Check(model.peakActiveCaches == 2, "an undrained request lost its KV slot");
+}
+
 void SharedPoolPressure() {
     SchedulerModel model(CacheView::Paged, 1024, 128, 4);
     model.EnableSharedPool(768);
@@ -465,6 +480,7 @@ int main() {
         OverlappingPageViews();
         for (int stopAt : {20, 100, 128}) for (int reserve : {0, 8}) ReplayPressure(stopAt, reserve);
         ReplayPressure(100, 8, true);
+        PagedBatchLimit();
         SharedPoolPressure();
         ConcurrentConsumers();
         for (auto view : {CacheView::Contiguous, CacheView::Paged, CacheView::TensorParallel}) {

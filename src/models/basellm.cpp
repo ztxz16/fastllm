@@ -3691,18 +3691,25 @@ namespace fastllm {
                         bool recoveryRequestsLive = false;
                         int activeDecode = 0, activeRequests = 0;
                         std::vector<PrefillGroupLoad> groupLoads(prefillGroups);
-                        if (batchPrefill || sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
+                        if (hasPrefillRequests || batchPrefill || sharedKvPool) for (auto &entry : model->responseContextDict.dicts) {
                             auto *ctx = entry.second;
                             if (recoveringKV && ctx->originalCachedInputTokens >= 0 && !ctx->isEnding)
                                 recoveryRequestsLive = true;
-                            if (!ctx->isEnding && (!ctx->NeedsPrefill() || ctx->prefillOffset > 0)) {
+                            if (ctx->isEnding) {
+                                // Finished output may still own a private sliding-window slot until drained.
+                                if (hasPrefillRequests && preallocatedPagedCache &&
+                                    allocatedTokens(ctx->pastKeyValues[model->kvCacheId].first) > 0)
+                                    ++activeRequests;
+                                continue;
+                            }
+                            if (!ctx->NeedsPrefill() || ctx->prefillOffset > 0) {
                                 // Rolling admission also checks for replay pressure during decode.
                                 if (sharedKvPool && (hasPrefillRequests || kvAdmissionWindow > 0))
                                     reservedPages[model->GetPagedKVCacheBudgetManager(ctx)] += remainingPages(ctx, reserveHorizon(ctx));
                                 ++activeRequests;
                                 if (!ctx->NeedsPrefill()) {
                                     ++activeDecode;
-                                    ++groupLoads.at(model->GetPrefillBatchGroup(ctx)).decoding;
+                                    if (batchPrefill) ++groupLoads.at(model->GetPrefillBatchGroup(ctx)).decoding;
                                 }
                             }
                         }
@@ -4028,18 +4035,8 @@ namespace fastllm {
                                             it.second->cacheLen + it.second->currentTokens.size() <= (size_t)maxPromptTokens)
                                             continue;
                                     }
-                                    int alive = 0;
-                                    if (batchPrefill || sharedKvPool) {
-                                        alive = activeRequests + admittedNew;
-                                    } else for (auto &it: model->responseContextDict.dicts) {
-                                        if (it.second->isEnding) {
-                                            continue;
-                                        }
-                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                                            alive++;
-                                        }
-                                    }
-                                    if (!it.second->prefillOffset && alive >= maxBatch) {
+                                    // A live request owns a slot even when its KV is paged or sharded.
+                                    if (!it.second->prefillOffset && activeRequests + admittedNew >= maxBatch) {
                                         continue;
                                     }
                                 }
@@ -4410,19 +4407,20 @@ namespace fastllm {
                                 }
                                 float spend = GetSpan(lastRecordTime, nowTime);
                                 if (spend > 1) {
-                                    int total = 0, alive = 0, aliveLen = 0, pending = 0;
+                                    int alive = 0, pending = 0;
+                                    long long aliveLen = 0;
                                     for (auto &it: model->responseContextDict.dicts) {
                                         if (it.second->isEnding) {
                                             continue;
                                         }
-                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
+                                        if (!it.second->NeedsPrefill() || it.second->prefillOffset > 0) {
                                             alive++;
-                                            aliveLen += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                                            aliveLen += allocatedTokens(it.second->pastKeyValues[model->kvCacheId].first);
                                         } else {
                                             pending++;
                                         }
                                     }
-                                    printf("[Decode] alive = %d, pending = %d, contextLen = %d, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
+                                    printf("[Decode] alive = %d, pending = %d, contextLen = %lld, Speed: %f tokens / s.\n", alive, pending, aliveLen, (float)genTokens / spend);
                                     lastRecordTime = nowTime;
                                     genTokens = 0;
                                 }
@@ -4486,17 +4484,14 @@ namespace fastllm {
                                 else model->dictCV.wait(dictLocker);
                                 continue;
                             }
-                            int maxLen = -1, select = -1;
+                            long long maxLen = 0;
+                            int select = -1;
                             for (auto &it: model->responseContextDict.dicts) {
-                                if (it.second->isEnding) {
-                                    continue;
-                                }
-                                if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                                    int curLen = it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
-                                    if (curLen > maxLen) {
-                                        maxLen = curLen;
-                                        select = it.first;
-                                    }
+                                if (it.second->isEnding) continue;
+                                const auto used = allocatedTokens(it.second->pastKeyValues[model->kvCacheId].first);
+                                if (used > maxLen) {
+                                    maxLen = used;
+                                    select = it.first;
                                 }
                             }
                             if (select != -1) {
