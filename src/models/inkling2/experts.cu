@@ -101,18 +101,7 @@ struct InputRow {
     __device__ float get(size_t row, int col, int d) const { return x[row * d + col]; }
 };
 
-template <typename T, bool Interleaved = false> struct RoutedSiTU {
-    const T *pair;
-    const float *scores;
-    float gateCap, upCap;
-    __device__ float get(size_t row, int col, int d) const { return get(row, row, col, d); }
-    __device__ float get(size_t row, size_t route, int col, int d) const {
-        const T *gate = pair + row * (2 * d) + (Interleaved ? 2 * col : col);
-        float g = float(__float2bfloat16_rn(float(gate[0])));
-        float u = float(__float2bfloat16_rn(float(gate[Interleaved ? 1 : d])));
-        return float(__float2bfloat16_rn(FastllmSiTUAndMul(g, u, gateCap, upCap) * scores[route]));
-    }
-};
+using cuda::RoutedSiTU;
 // Marlin consumes reconstructed BF16 rows. Eight lanes quantize one block
 // of 32 channels, sharing its scale across four adjacent values per lane.
 __global__ void reconstructMxfp8SiTU(RoutedSiTU<__nv_bfloat16> src, __nv_bfloat16 *out, int width) {
@@ -1200,6 +1189,7 @@ class GpuExperts final : public RoutedExperts {
         Buffer<native::PlanSize> used(1);
         Buffer<float> scales(routes);
         Buffer<native::InputTile> packed(size_t(tiles) * (TileRows / 8) * (std::max(gate.cols, down.cols) / 64));
+        const native::CompactRouteTiles<TileRows> plan{tasks.p, used.p};
         auto project = [&](const Projection &w, auto up, auto compact, const native::Block16 *x,
                            const float *rowScales, __nv_bfloat16 *dst, int divisor) {
             w.projectShards([&](native::Weights view, int first, int n, cudaStream_t stream, TensorRank *peer, size_t) {
@@ -1225,9 +1215,9 @@ class GpuExperts final : public RoutedExperts {
                     rankInput = peer->receive(x, ninput);
                     rankOutput = peer->allocate<__nv_bfloat16>(size_t(routes) * n);
                 }
-                native::groupedProject<warps, ColumnTiles, decltype(up)::value, TileRows, decltype(compact)::value>
+                native::groupedProject<warps, ColumnTiles, decltype(up)::value, decltype(compact)::value>
                     <<<dim3((n + ctaColumns - 1) / ctaColumns, tiles), threads, 0, stream>>>(
-                        view, rankInput, rankScales, rankPacked, rankTasks, rankUsed,
+                        view, rankInput, rankScales, rankPacked, native::CompactRouteTiles<TileRows>{rankTasks, rankUsed},
                         rankOutput, n, w.cols, divisor, peer ? n : w.rows);
                 if (combine) {
                     auto *out = peer ? peer->allocate<float>(size_t(rows) * n) : reduced + first;
@@ -1250,7 +1240,7 @@ class GpuExperts final : public RoutedExperts {
             check(cudaMemsetAsync(used.p, 0, sizeof(native::PlanSize), cudaStreamPerThread));
             native::groupRoutes<<<experts, 256, 0, cudaStreamPerThread>>>(route.ids, routes, tasks.p, used.p);
             native::packInput<<<dim3((gate.cols / 64 + 7) / 8, tiles, TileRows / 8), 256, 0, cudaStreamPerThread>>>(
-                tasks.p, used.p, input, packed.p, gate.cols, c.topK);
+                plan, input, packed.p, gate.cols, c.topK);
             project(gate, std::true_type{}, std::false_type{}, input, nullptr, pair, c.topK);
         }
         if (situFactors.p && routes >= c.experts) {

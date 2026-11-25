@@ -74,9 +74,37 @@ bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, con
 // Resident gate/up and optional down projection. The device pointer table has
 // two slots per expert (repeat the gate pointer when down runs on another backend).
 // The gate builds a route map that the down projection reuses in the same workspace.
+// With null output, raw products stay in expert order; the consumer applies outer scales.
 // The row limit bounds transient storage; longer requests can use consecutive slices.
 int FastllmCudaGGUFExpertMMQMaxRows(int gateType, int downType, int hidden, int inter, int experts, int topk);
 size_t FastllmCudaGGUFExpertMMQBytes(int rows, int hidden, int inter, int experts, int topk);
 void FastllmCudaGGUFExpertMMQ(bool gate, int type, const void *weights, const float *outer,
         const int *indices, const float *input, float *output, void *workspace,
         int rows, int hidden, int inter, int experts, int topk);
+
+// Consume the preceding sorted gate/up products, with BF16 SiTU and route scores
+// applied before Q8 activation packing. The quantized down stays in expert order.
+void FastllmCudaGGUFExpertSiTUDown(int type, const void *weights, const int *ids, const float *scores,
+        const float *gateScales, float gateCap, float upCap, void *workspace,
+        int rows, int hidden, int intermediate, int experts, int topk);
+
+// A second projection can reuse the gate's device route order and activation scratch.
+// Each expert is padded to tileRows. Offsets[experts] is the live padded row count.
+// Scratch can hold capacity rows of packed activations up to columns (Q8 or smaller).
+struct FastllmCudaGGUFExpertGroups {
+    static constexpr int tileRows = 16;
+    static constexpr int wideTileRows = 64;
+    static constexpr int wideBatchRows = 1024;
+    static int gridRowLimit(int experts, int topk) {
+        return (65535 / tileRows * tileRows - experts * (tileRows - 1)) / topk;
+    }
+    int capacity;
+    const int *counts, *offsets, *tileExperts, *routes, *routeGroups;
+    const float *products;
+    void *activationScratch;
+};
+FastllmCudaGGUFExpertGroups FastllmCudaGGUFExpertGroupsView(void *workspace, int rows,
+    int hidden, int intermediate, int experts, int topk);
+// Sum sorted down products in the original top-k order, applying per-expert outer scales.
+void FastllmCudaGGUFSumExpertGroups(const FastllmCudaGGUFExpertGroups &groups, const int *ids,
+    const float *outer, float *output, int rows, int width, int topk);

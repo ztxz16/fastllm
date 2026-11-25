@@ -92,7 +92,8 @@ __global__ void selectGGUFExperts(RouteSelection route) {
     else
         selectRow<0>(route);
 }
-__global__ void ggufRoutedActivation(RoutedSiTU<float> activation, float *out, int routes, int width) {
+template <class Activation>
+__global__ void ggufRoutedActivation(Activation activation, float *out, int routes, int width) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < size_t(routes) * width) out[i] = activation.get(i / width, i % width, width);
 }
@@ -103,6 +104,32 @@ class GpuGGUFExperts final : public ExpertBackend {
     std::unique_ptr<Projection> nativeDown;
     Buffer<const uint8_t *> expertPointers;
     int mmqMaxRows, smCount;
+
+    int prefillChunk(const Config &c, int rows) const {
+        // Amortize the last partially occupied 64-row MMQ tile of each expert.
+        // Use whole router groups so the router GEMM and top-k keep their original shapes.
+        const int target = (4 * FastllmCudaGGUFExpertGroups::wideTileRows * c.experts + c.topK - 1) / c.topK;
+        const int limit = std::min(rows, FastllmCudaGGUFExpertGroups::gridRowLimit(c.experts, c.topK));
+        int hi = std::min(limit / mmqMaxRows, (target + mmqMaxRows - 1) / mmqMaxRows);
+        if (hi < 2) return mmqMaxRows;
+        size_t freeBytes, totalBytes;
+        check(cudaMemGetInfo(&freeBytes, &totalBytes));
+        size_t staging = 0;
+        if (nativeDown)
+            staging = size_t(c.intermediate / 16) * sizeof(native::Block16) + size_t(c.hidden) * sizeof(__nv_bfloat16);
+        else if (ggufDown->type == GGML_TYPE_BF16)
+            staging = size_t(c.intermediate) * sizeof(float);
+        int lo = 1;
+        while (lo < hi) {
+            const int groups = (lo + hi + 1) / 2, n = groups * mmqMaxRows;
+            const size_t bytes = FastllmCudaGGUFExpertMMQBytes(n, c.hidden, c.intermediate, c.experts, c.topK)
+                + size_t(n) * c.topK * (staging + sizeof(int) + sizeof(float))
+                + size_t(mmqMaxRows) * c.experts * sizeof(float);
+            if (bytes <= freeBytes / 8) lo = groups;
+            else hi = groups - 1;
+        }
+        return lo * mmqMaxRows;
+    }
 
 public:
     GpuGGUFExperts(const Config &c, const std::map<std::string, TensorRange> &files, const std::string &prefix,
@@ -134,23 +161,31 @@ public:
     Matrix run(const Config &c, const Matrix &x, const float *bias, ExpertPhase phase,
                Rows<__nv_bfloat16> *, Rows<__nv_bfloat16> *unreduced, int) const override {
         // Bound both MMQ scratch and the one-route-per-grid-row fallback.
-        const int chunk = mmqMaxRows > 1 ? mmqMaxRows : 65535 / c.topK;
-        if (!nativeDown || x.rows > chunk ||
+        const int routeRows = mmqMaxRows > 1 ? mmqMaxRows : 65535 / c.topK;
+        if (!nativeDown || x.rows > routeRows ||
             !(phase == ExpertPhase::Verify || (phase == ExpertPhase::Decode && x.rows == 1)))
             unreduced = nullptr;
         Matrix out(unreduced ? 0 : x.rows, c.hidden);
-        for (int first = 0; first < x.rows; first += chunk) {
-            const int rows = std::min(chunk, x.rows - first), routes = rows * c.topK;
+        auto runChunk = [&](int first, int rows) {
+            const int routes = rows * c.topK;
             auto input = x.slice(first, rows);
-            Matrix logits = routeLogits(input, router), scores(rows, c.topK);
+            Matrix scores(rows, c.topK);
             Buffer<int> ids(routes);
-            selectGGUFExperts<<<rows, 64, 0, cudaStreamPerThread>>>(
-                {logits.p, bias, ids.p, scores.p, c.experts, c.topK, c.routeScale});
-            Matrix pair(routes, 2 * c.intermediate);
+            for (int start = 0; start < rows; start += routeRows) {
+                const int count = std::min(routeRows, rows - start);
+                Matrix logits = routeLogits(input.slice(start, count), router);
+                const size_t offset = size_t(start) * c.topK;
+                selectGGUFExperts<<<count, 64, 0, cudaStreamPerThread>>>(
+                    {logits.p, bias, ids.p + offset, scores.p + offset, c.experts, c.topK, c.routeScale});
+            }
             // A few routes do not fill even two 16-route MMQ tiles.
             const bool grouped = expertPointers.p && rows > 1 && routes >= 32;
             Buffer<uint8_t> workspace(
                 grouped ? FastllmCudaGGUFExpertMMQBytes(rows, c.hidden, c.intermediate, c.experts, c.topK) : 0);
+            const bool groupedPrefill = grouped && phase == ExpertPhase::Prefill;
+            const auto groups = groupedPrefill ? FastllmCudaGGUFExpertGroupsView(
+                workspace.p, rows, c.hidden, c.intermediate, c.experts, c.topK) : FastllmCudaGGUFExpertGroups{};
+            Matrix pair(groupedPrefill ? 0 : routes, 2 * c.intermediate);
             auto project = [&](const ResidentGGUFProjection &w, bool gateUp, const Matrix &in, Matrix &dst) {
                 if (grouped) {
                     FastllmCudaGGUFExpertMMQ(gateUp, w.type, expertPointers.p, w.scale.p, ids.p, in.p, dst.p,
@@ -166,20 +201,69 @@ public:
             };
             project(gate, true, input, pair);
             RoutedSiTU<float> activation{pair.p, scores.p, c.gateCap, c.upCap};
+            cuda::GroupedRoutedSiTU sorted{{groups.products, scores.p, c.gateCap, c.upCap},
+                                          groups.routeGroups, ids.p, gate.scale.p};
             if (nativeDown) {
                 Buffer<native::Block16> mid(size_t(routes) * c.intermediate / 16);
                 Rows<__nv_bfloat16> projected(routes, c.hidden);
-                quantizeFp4Into(activation, mid.p, routes, c.intermediate, smCount, true);
-                projectNativeRoutes<false>(*nativeDown, mid.p, ids.p, rows, c.topK, projected.p);
+                if (groupedPrefill) {
+                    quantizeFp4Into(sorted, mid.p, routes, c.intermediate, smCount);
+                    // The MMQ gate has finished reading its Q8 scratch. FP4 input tiles fit there,
+                    // and use exactly the same expert groups without a second sort.
+                    constexpr int tileRows = FastllmCudaGGUFExpertGroups::tileRows;
+                    const native::PaddedRouteTiles<tileRows> plan{groups.counts, groups.offsets, groups.tileExperts, groups.routes, c.experts};
+                    const int tiles = groups.capacity / tileRows;
+                    auto *packed = static_cast<native::InputTile *>(groups.activationScratch);
+                    static_assert(sizeof(native::InputTile) <= 8 * 64); // MMQ reserves at least one byte per value
+                    native::packInput<<<dim3((c.intermediate / 64 + 7) / 8, tiles, tileRows / 8), 256, 0, cudaStreamPerThread>>>(
+                        plan, mid.p, packed, c.intermediate, 1);
+                    native::groupedProject<4, 2, false><<<dim3((c.hidden + 127) / 128, tiles), 128, 0, cudaStreamPerThread>>>(
+                        nativeDown->nativeView(), mid.p, nullptr, packed, plan, projected.p, c.hidden, c.intermediate, 1);
+                } else {
+                    quantizeFp4Into(activation, mid.p, routes, c.intermediate, smCount, true);
+                    projectNativeRoutes<false>(*nativeDown, mid.p, ids.p, rows, c.topK, projected.p);
+                }
                 finishNativeRoutes(c, projected, unreduced ? nullptr : out.p + size_t(first) * c.hidden, unreduced);
-                continue;
+                return;
             }
-            Matrix mid(routes, c.intermediate), result(routes, c.hidden);
-            ggufRoutedActivation<<<(size_t(routes) * c.intermediate + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-                activation, mid.p, routes, c.intermediate);
-            project(*ggufDown, false, mid, result);
-            sumNativeRoutes<false, false, float, float><<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-                result.p, out.p + size_t(first) * c.hidden, rows, c.hidden, c.topK, c.hidden, c.hidden);
+            float *dst = out.p + size_t(first) * c.hidden;
+            if (groupedPrefill && ggufDown->type != GGML_TYPE_BF16) {
+                FastllmCudaGGUFExpertSiTUDown(ggufDown->type, expertPointers.p, ids.p, scores.p, gate.scale.p,
+                    c.gateCap, c.upCap, workspace.p, rows, c.hidden, c.intermediate, c.experts, c.topK);
+            } else {
+                Matrix mid(routes, c.intermediate), result(groupedPrefill ? 0 : routes, c.hidden);
+                const int blocks = (size_t(routes) * c.intermediate + 255) / 256;
+                if (groupedPrefill)
+                    ggufRoutedActivation<<<blocks, 256, 0, cudaStreamPerThread>>>(sorted, mid.p, routes, c.intermediate);
+                else ggufRoutedActivation<<<blocks, 256, 0, cudaStreamPerThread>>>(activation, mid.p, routes, c.intermediate);
+                project(*ggufDown, false, mid, result);
+                if (!groupedPrefill) {
+                    sumNativeRoutes<false, false, float, float><<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                        result.p, dst, rows, c.hidden, c.topK, c.hidden, c.hidden);
+                    return;
+                }
+            }
+            FastllmCudaGGUFSumExpertGroups(groups, ids.p, ggufDown->scale.p, dst, rows, c.hidden, c.topK);
+        };
+        int chunk = routeRows;
+        if (phase == ExpertPhase::Prefill && expertPointers.p && !DecodeGraphScratch::active)
+            chunk = prefillChunk(c, x.rows);
+        const int tail = x.rows % routeRows;
+        // A short final group keeps its original GEMV or narrow MMQ kernel.
+        const int joinableRows = tail < FastllmCudaGGUFExpertGroups::wideBatchRows ? x.rows - tail : x.rows;
+        for (int first = 0; first < x.rows;) {
+            const int rows = std::min(chunk, (first < joinableRows ? joinableRows : x.rows) - first);
+            try {
+                runChunk(first, rows);
+                first += rows;
+            } catch (const CudaWorkspaceExhausted &) {
+                if (rows <= routeRows) throw;
+                const auto status = cudaGetLastError();
+                if (status != cudaErrorMemoryAllocation) check(status);
+                // runChunk only reads routing inputs. A retry on this stream can
+                // safely replace the same output rows if another allocator won the race.
+                chunk = routeRows;
+            }
         }
         return out;
     }

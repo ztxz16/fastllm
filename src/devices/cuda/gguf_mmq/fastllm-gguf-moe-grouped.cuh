@@ -9,7 +9,7 @@
 #include "fastllm-gguf-mmq-q2.cuh"
 
 namespace grouped_moe {
-constexpr int kTile = 16;
+constexpr int kTile = FastllmCudaGGUFExpertGroups::tileRows;
 
 // MTP and TP shards can have a Q8_0 K dimension that ends inside a 256-value
 // MMA tile. The ordinary loader assumes complete tiles; zero the tail here.
@@ -140,8 +140,14 @@ __global__ void Scatter(const int *indices, const uint8_t *const *weights,
 
 // Use the same 32-value activation quantizer as the small-batch path. D4
 // stores its FP16-rounded scale in float; this avoids changing the Q8 oracle.
-template<class T>
-__global__ void Quantize(const T *input, block_q8_1_mmq *output,
+template<class T> struct RouteInput {
+    const T *input;
+    __device__ float get(int, int route, int col, int width) const {
+        return mmq_io<T>::to_float(input[size_t(route) * width + col]);
+    }
+};
+template<class Source>
+__global__ void Quantize(Source input, block_q8_1_mmq *output,
                          const int *groupRoutes, const int *activeRows,
                          int columns, int capacity) {
     if (blockIdx.y >= *activeRows) return;
@@ -149,7 +155,7 @@ __global__ void Quantize(const T *input, block_q8_1_mmq *output,
     const int padded = ((columns+255)/256)*256;
     if (col >= padded) return;
     const int row = blockIdx.y, route = groupRoutes ? groupRoutes[row] : row;
-    const float x = route >= 0 && col < columns ? mmq_io<T>::to_float(input[size_t(route)*columns+col]) : 0.0f;
+    const float x = route >= 0 && col < columns ? input.get(row, route, col, columns) : 0.0f;
     float maximum = fabsf(x);
 #pragma unroll
     for (int m = 16; m; m >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, m));
@@ -311,10 +317,10 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
                     int experts, int columns, int width, cudaStream_t stream, bool hybridStream = false) {
     // Short expert batches waste half of a 64-row tile on Turing. Use a
     // narrower tile based on the routed batch, independent of model dimensions.
-    const bool compactTuring = w.inputRows >= 1024 &&
+    const bool compactTuring = w.inputRows >= FastllmCudaGGUFExpertGroups::wideBatchRows &&
         int64_t(w.activeRows) <= int64_t(experts) * 48 &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING;
-    if (hybridStream && w.inputRows >= 1024 &&
+    if (hybridStream && w.inputRows >= FastllmCudaGGUFExpertGroups::wideBatchRows &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING) {
 #define HYBRID_MATRIX(T) case GGML_TYPE_##T: \
         LaunchMatrix<GGML_TYPE_##T, 16, true>(weights, part, w, experts, columns, width, stream); \
@@ -329,7 +335,7 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
     switch (type) {
 #define GROUPED_CASE(T) case GGML_TYPE_##T: \
         if (compactTuring) LaunchMatrix<GGML_TYPE_##T, 32>(weights, part, w, experts, columns, width, stream); \
-        else if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
+        else if (w.inputRows >= FastllmCudaGGUFExpertGroups::wideBatchRows) LaunchMatrix<GGML_TYPE_##T, 64>(weights, part, w, experts, columns, width, stream); \
         else LaunchMatrix<GGML_TYPE_##T>(weights, part, w, experts, columns, width, stream); break;
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
@@ -383,7 +389,7 @@ static bool Run(const T *input, T *gate, T *output, const uint8_t *const *weight
         Activate<<<(routes*inter+255)/256, 256, 0, stream>>>(w.products, gate, w.routeGroups, routes, inter);
     }
     Quantize<<<dim3((inter+255)/256, w.capacity), 256, 0, stream>>>(
-        gate, w.quantized, w.groupRoutes, w.offsets+experts, inter, w.capacity);
+        RouteInput<T>{gate}, w.quantized, w.groupRoutes, w.offsets+experts, inter, w.capacity);
     if (downWeightsReady) CUDA_CHECK(cudaStreamWaitEvent(stream, downWeightsReady, 0));
     Matrix(dt, weights, 1, w, experts, inter, hidden, stream);
     Reduce<<<(rows*hidden+255)/256, 256, 0, stream>>>(w.products, output,

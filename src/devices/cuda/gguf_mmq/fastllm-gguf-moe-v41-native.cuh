@@ -35,7 +35,7 @@ static bool NativeV41Matrix(int type, const uint8_t *const *weights, int part,
     if (type == GGML_TYPE_IQ1_S) ensure_iq1s_grid(stream);
     // Streaming groups mix small and busy experts. Select a tile from each
     // expert's actual rows, keeping native quantization/accumulation traits.
-    if (streamed && w.inputRows >= 1024 &&
+    if (streamed && w.inputRows >= FastllmCudaGGUFExpertGroups::wideBatchRows &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc == CC_TURING) {
 #define STREAM_MATRIX(T) case GGML_TYPE_##T: \
         LaunchMatrix<GGML_TYPE_##T, 16, true, true>(weights, part, w, experts, columns, width, stream); \
@@ -51,7 +51,7 @@ static bool NativeV41Matrix(int type, const uint8_t *const *weights, int part,
     }
     switch (type) {
 #define NATIVE_MATRIX(T) case GGML_TYPE_##T: \
-        if (w.inputRows >= 1024) LaunchMatrix<GGML_TYPE_##T, 64, false, true>( \
+        if (w.inputRows >= FastllmCudaGGUFExpertGroups::wideBatchRows) LaunchMatrix<GGML_TYPE_##T, 64, false, true>( \
             weights, part, w, experts, columns, width, stream); \
         else LaunchMatrix<GGML_TYPE_##T, 16, false, true>( \
             weights, part, w, experts, columns, width, stream); break;

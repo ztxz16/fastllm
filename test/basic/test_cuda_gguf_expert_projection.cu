@@ -1,5 +1,6 @@
 #include "cuda_gguf_data_test.cuh"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "devices/cuda/fastllm-cuda-activation.cuh"
 #include "devices/cuda/fastllm-moe.h"
 
 static void MakeNVFP4Weights(std::vector<uint8_t> &packed, std::vector<float> &reference, int rows, int cols) {
@@ -78,6 +79,11 @@ static void CheckRoutedGemv(ggml_type type, int cols, bool useOuter, int copies)
     if (!(norm > 0 && diff <= 1e-10 * norm))
         throw std::runtime_error(std::string("Routed GEMV mismatch for ") + ggml_type_name(type));
 }
+// Materialize the original route-order intermediate to check the fused Q8 handoff.
+__global__ void ReferenceSiTU(fastllm::cuda::RoutedSiTU<float> src, float *dst, int rows, int width) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * width) dst[i] = src.get(i / width, i % width, width);
+}
 // Compare routed MMQ with the original full-precision-activation dot. Reuse a
 // captured gate/down pair with new route IDs, including an empty expert.
 static void Grouped(ggml_type type, int rows, ggml_type downType = GGML_TYPE_IQ4_NL, int inter = 160) {
@@ -146,6 +152,24 @@ static void Grouped(ggml_type type, int rows, ggml_type downType = GGML_TYPE_IQ4
             Cuda(cudaMemcpy(expected.data(), ref.cudaData, expected.size() * sizeof(float), cudaMemcpyDeviceToHost));
             Cuda(cudaMemcpy(actual.data(), isGate ? pair.cudaData : projected.cudaData, actual.size() * sizeof(float),
                             cudaMemcpyDeviceToHost));
+            if (!isGate) {
+                const auto groups = FastllmCudaGGUFExpertGroupsView(scratch.cudaData, rows, hidden, inter, experts, top);
+                auto *sum = static_cast<float *>(ref.cudaData);
+                const bool scaled = iteration != 0;
+                FastllmCudaGGUFSumExpertGroups(groups, index, scaled ? static_cast<float *>(outer.cudaData) : nullptr,
+                                               sum, rows, hidden, top);
+                std::vector<float> reduced(size_t(rows) * hidden);
+                Cuda(cudaMemcpy(reduced.data(), sum, reduced.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < reduced.size(); ++i) {
+                    float reference = 0.f;
+                    for (int k = 0; k < top; ++k) {
+                        const size_t r = (i / hidden) * top + k;
+                        volatile float part = actual[r * hidden + i % hidden] * (scaled ? scales[route[r]] : 1.f);
+                        reference += part;
+                    }
+                    Check(reduced[i] == reference, "Sorted down changed the route reduction");
+                }
+            }
             double diff = 0, norm = 0;
             for (size_t i = 0; i < actual.size(); ++i) {
                 diff += std::pow(double(expected[i]) - actual[i], 2);
@@ -156,6 +180,35 @@ static void Grouped(ggml_type type, int rows, ggml_type downType = GGML_TYPE_IQ4
                 throw std::runtime_error(std::string("Grouped ") + (isGate ? "gate " : "down ") +
                     ggml_type_name(t) + " relative L2 " + std::to_string(l2));
         }
+    }
+    if (downType == GGML_TYPE_Q2_0) {
+        Data scores(FLOAT32, {routes});
+        Allocate(scores);
+        std::vector<float> routeScores(routes);
+        for (int r = 0; r < routes; ++r) routeScores[r] = (r % 13) / 12.f;
+        Upload(scores, routeScores);
+        auto *score = static_cast<float *>(scores.cudaData);
+        auto *scale = static_cast<float *>(outer.cudaData);
+        const auto groups = FastllmCudaGGUFExpertGroupsView(scratch.cudaData, rows, hidden, inter, experts, top);
+        std::vector<float> outputs[2];
+        for (int fused = 0; fused < 2; ++fused) {
+            FastllmCudaGGUFExpertMMQ(true, type, table.cudaData, scale, index, static_cast<float *>(input.cudaData),
+                fused ? nullptr : static_cast<float *>(pair.cudaData), scratch.cudaData, rows, hidden, inter, experts, top);
+            if (fused) {
+                FastllmCudaGGUFExpertSiTUDown(downType, table.cudaData, index, score, scale, 4.f, 6.f,
+                    scratch.cudaData, rows, hidden, inter, experts, top);
+            } else {
+                ReferenceSiTU<<<(routes * inter + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                    {static_cast<float *>(pair.cudaData), score, 4.f, 6.f},
+                    static_cast<float *>(middle.cudaData), routes, inter);
+                FastllmCudaGGUFExpertMMQ(false, downType, table.cudaData, nullptr, index,
+                    static_cast<float *>(middle.cudaData), nullptr, scratch.cudaData, rows, hidden, inter, experts, top);
+            }
+            FastllmCudaGGUFSumExpertGroups(groups, index, scale, static_cast<float *>(projected.cudaData), rows, hidden, top);
+            outputs[fused].resize(size_t(rows) * hidden);
+            Cuda(cudaMemcpy(outputs[fused].data(), projected.cudaData, outputs[fused].size() * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+        Check(outputs[0] == outputs[1], "Sorted SiTU/Q8 down changed the expert output");
     }
     Cuda(cudaGraphExecDestroy(exec));
     Cuda(cudaGraphDestroy(graph));

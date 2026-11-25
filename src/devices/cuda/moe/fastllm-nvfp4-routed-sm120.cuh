@@ -57,6 +57,26 @@ template <int Rows> struct RouteGroup {
 };
 // Expert rows are compact. Only the MMA input tiles include tail padding.
 struct PlanSize { int tiles, rows; };
+template <int Rows> struct CompactRouteTiles {
+    static constexpr int tileRows = Rows;
+    const RouteGroup<Rows> *tasks;
+    const PlanSize *used;
+    __device__ bool active(int tile) const { return tile < used->tiles; }
+    __device__ const RouteGroup<Rows> &operator[](int tile) const { return tasks[tile]; }
+};
+
+// Borrow a padded expert-major route table, e.g. from a preceding grouped GEMM.
+template <int Rows> struct PaddedRouteTiles {
+    static constexpr int tileRows = Rows;
+    const int *counts, *offsets, *tileExperts, *routes;
+    int experts;
+    struct Tile { int expert, count, first; const int *routes; };
+    __device__ bool active(int tile) const { return tile * Rows < offsets[experts]; }
+    __device__ Tile operator[](int tile) const {
+        const int first = tile * Rows, e = tileExperts[tile];
+        return {e, min(Rows, counts[e] - (first - offsets[e])), first, routes + first};
+    }
+};
 // One CTA per expert gives each route a deterministic slot without host reads.
 template <int TileRows>
 static __global__ void groupRoutes(const int *ids, int routes, RouteGroup<TileRows> *tiles, PlanSize *used) {
@@ -107,15 +127,16 @@ struct InputTile {
     uint2 words[32];
     uint32_t scales[8];
 };
-template <int TileRows>
-static __global__ void packInput(const RouteGroup<TileRows> *tasks, const PlanSize *used, const Block16 *input,
+template <class Plan>
+static __global__ void packInput(Plan plan, const Block16 *input,
                                  InputTile *packed, int k, int divisor) {
+    constexpr int TileRows = Plan::tileRows;
     const int tile = blockIdx.y;
-    if (tile >= used->tiles) return;
+    if (!plan.active(tile)) return;
     const int lane = threadIdx.x % 32;
     const int band = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (band >= k / 64) return;
-    const auto &task = tasks[tile];
+    const auto &task = plan[tile];
     const int group = blockIdx.z;
     if (8 * group >= task.count) return;
     const int route = task.routes[min(int(8 * group + lane / 4), task.count - 1)];
@@ -392,19 +413,20 @@ static __global__ void scatterInput(const float *x, int width, const int *ids, c
 constexpr int WarpTileRows = 64;
 // A warp reuses each activation fragment across ColumnTiles adjacent 16-column
 // weight tiles. Up writes compact expert rows; down restores the original routes.
-template <int Warps, int ColumnTiles, bool Up, int TileRows, bool Compact = false>
+template <int Warps, int ColumnTiles, bool Up, bool Compact = false, class Plan>
 static __global__ void groupedProject(Weights w, const Block16 *input, const float *rowScales,
-                                      const InputTile *packed, const RouteGroup<TileRows> *tasks, const PlanSize *used,
+                                      const InputTile *packed, Plan plan,
                                       __nv_bfloat16 *out, int n, int k, int divisor, int outputStride = 0) {
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
+    constexpr int TileRows = Plan::tileRows;
     static_assert(TileRows % 8 == 0 && (TileRows <= WarpTileRows || TileRows % WarpTileRows == 0));
     constexpr int groups = (TileRows < WarpTileRows ? TileRows : WarpTileRows) / 8;
     const int tile = blockIdx.y, lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int rowGroup = (warp / Warps) * groups;
     const int first = (blockIdx.x * Warps + warp % Warps) * ColumnTiles;
     const int columns = n / 16, bands = k / 64;
-    if (tile >= used->tiles) return;
-    const auto &task = tasks[tile];
+    if (!plan.active(tile)) return;
+    const auto &task = plan[tile];
     const int count = task.count;
     if (rowGroup * 8 >= count || first >= columns) return;
     const size_t base = (size_t(task.expert) * columns + first) * bands;
@@ -440,7 +462,7 @@ static __global__ void groupedProject(Weights w, const Block16 *input, const flo
             if (col >= count) continue;
             const int route = task.routes[col], row = task.first + col;
             float outer;
-            if constexpr (!Up) outer = rowScales[row];
+            if constexpr (!Up) outer = rowScales ? rowScales[row] : input[size_t(route) * (k / 16)].outer;
             else if constexpr (Compact) outer = rowScales[route / divisor];
             else outer = input[size_t(route / divisor) * (k / 16)].outer;
 #pragma unroll

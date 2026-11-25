@@ -1,4 +1,5 @@
 #include "devices/cuda/fastllm-moe.h"
+#include "devices/cuda/fastllm-cuda-activation.cuh"
 #include "fastllm-cuda-gguf-projections.h"
 #include "fastllm-cuda-v41-gguf.h"
 #include "fastllm-gguf-mmq-common.cuh"
@@ -209,9 +210,8 @@ int FastllmCudaGGUFExpertMMQMaxRows(int gateType, int downType, int hidden, int 
 
     // Pad each expert to an MMQ tile. Keep quantization grids within CUDA's Y
     // limit and bound the products and activation packing to one shared workspace.
-    constexpr int tile = grouped_moe::kTile;
     constexpr size_t budget = 128u << 20;
-    int lo = 0, hi = (65535 / tile * tile - experts * (tile - 1)) / topk;
+    int lo = 0, hi = FastllmCudaGGUFExpertGroups::gridRowLimit(experts, topk);
     while (lo < hi) {
         int rows = lo + (hi - lo + 1) / 2;
         if (FastllmCudaGGUFExpertMMQBytes(rows, hidden, inter, experts, topk) <= budget) lo = rows;
@@ -226,6 +226,13 @@ size_t FastllmCudaGGUFExpertMMQBytes(int rows, int hidden, int inter, int expert
     return fastllm_gguf_mmq::grouped_moe::Workspace(nullptr, rows, hidden, inter, experts, topk).bytes;
 }
 
+FastllmCudaGGUFExpertGroups FastllmCudaGGUFExpertGroupsView(void *workspace, int rows,
+        int hidden, int intermediate, int experts, int topk) {
+    using namespace fastllm_gguf_mmq::grouped_moe;
+    Workspace w(workspace, rows, hidden, intermediate, experts, topk);
+    return {w.capacity, w.counts, w.offsets, w.tileExperts, w.groupRoutes, w.routeGroups, w.products, w.quantized};
+}
+
 namespace {
 // Move products back into the original top-k order before SiTU or reduction.
 __global__ void scatterGGUFExperts(const float *products, const int *groups, const int *ids,
@@ -238,6 +245,20 @@ __global__ void scatterGGUFExperts(const float *products, const int *groups, con
     }
 }
 
+__global__ void sumGGUFExpertGroups(const float *products, const int *groups, const int *ids,
+        const float *outer, float *out, int width, int topk) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x, row = blockIdx.y;
+    if (col >= width) return;
+    float sum = 0.f;
+    for (int k = 0; k < topk; ++k) {
+        const int route = row * topk + k, group = groups[route];
+        if (group >= 0) {
+            const float value = products[size_t(group) * width + col];
+            sum += outer ? __fmul_rn(value, outer[ids[route]]) : value;
+        }
+    }
+    out[size_t(row) * width + col] = sum;
+}
 }
 
 void FastllmCudaGGUFExpertMMQ(bool gate, int type, const void *weightPointers, const float *outer,
@@ -267,11 +288,31 @@ void FastllmCudaGGUFExpertMMQ(bool gate, int type, const void *weightPointers, c
                 q, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity, topk);
         } else {
             grouped_moe::Quantize<<<dim3((columns + 255) / 256, w.capacity), 256, 0, stream>>>(
-                input, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity);
+                grouped_moe::RouteInput<float>{input}, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity);
         }
         grouped_moe::ResidentMatrix(type, weights, gate ? 0 : 1, w, experts, columns, width, stream);
     }
-    scatterGGUFExperts<<<dim3((width + 255) / 256, rows * topk), 256, 0, stream>>>(
+    if (output) scatterGGUFExperts<<<dim3((width + 255) / 256, rows * topk), 256, 0, stream>>>(
         w.products, w.routeGroups, indices, outer, output, width);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void FastllmCudaGGUFExpertSiTUDown(int type, const void *weightPointers, const int *ids, const float *scores,
+        const float *gateScales, float gateCap, float upCap, void *workspace,
+        int rows, int hidden, int inter, int experts, int topk) {
+    using namespace fastllm_gguf_mmq::grouped_moe;
+    Workspace w(workspace, rows, hidden, inter, experts, topk);
+    const auto stream = cudaStreamPerThread;
+    fastllm::cuda::GroupedRoutedSiTU source{{w.products, scores, gateCap, upCap}, w.routeGroups, ids, gateScales};
+    Quantize<<<dim3((inter + 255) / 256, w.capacity), 256, 0, stream>>>(
+        source, w.quantized, w.groupRoutes, w.offsets + experts, inter, w.capacity);
+    ResidentMatrix(type, static_cast<const uint8_t *const *>(weightPointers), 1, w, experts, inter, hidden, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void FastllmCudaGGUFSumExpertGroups(const FastllmCudaGGUFExpertGroups &groups, const int *ids,
+        const float *outer, float *output, int rows, int width, int topk) {
+    sumGGUFExpertGroups<<<dim3((width + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+        groups.products, groups.routeGroups, ids, outer, output, width, topk);
     CUDA_CHECK(cudaGetLastError());
 }

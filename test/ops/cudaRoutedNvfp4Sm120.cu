@@ -146,10 +146,37 @@ template <int TileRows> void test(int tokens, bool up, bool skew, bool verify = 
                 throw std::runtime_error("Grouped decode differs from the single-route projection");
         } else if (tokens == 1) {
             op::decodeProject<4><<<dim3(n / 16, routes), 128>>>(view, xi.p, di.p, y.p, n, k, div);
+        } else if constexpr (TileRows == 16) {
+            // Padded groups from a different gate backend. The down input and its
+            // scale stay in original route order, even for empty or partial tiles.
+            std::vector<int> counts(experts), offsets(experts + 1), tileExperts, sorted;
+            for (int e = 0; e < experts; ++e) {
+                for (int r = 0; r < routes; ++r) if (ids[r] == e) sorted.push_back(r);
+                counts[e] = int(sorted.size()) - offsets[e];
+                const int tiles = (counts[e] + TileRows - 1) / TileRows;
+                offsets[e + 1] = offsets[e] + tiles * TileRows;
+                sorted.resize(offsets[e + 1], -1);
+                tileExperts.insert(tileExperts.end(), tiles, e);
+            }
+            auto count = copy(counts), offset = copy(offsets), expert = copy(tileExperts), route = copy(sorted);
+            const op::PaddedRouteTiles<TileRows> padded{count.p, offset.p, expert.p, route.p, experts};
+            op::packInput<<<dim3((k / 64 + 7) / 8, capacity, TileRows / 8), 256>>>(
+                padded, xi.p, packed.p, k, 1);
+            op::groupedProject<4, 2, false><<<dim3((n + 127) / 128, capacity), 128>>>(
+                view, xi.p, nullptr, packed.p, padded, y.p, n, k, 1);
+            Buffer<__nv_bfloat16> ref(size_t(routes) * n);
+            op::decodeProject<4><<<dim3(n / 16, routes), 128>>>(view, xi.p, di.p, ref.p, n, k, 1);
+            std::vector<__nv_bfloat16> expected(got.size());
+            const size_t bytes = got.size() * sizeof(got[0]);
+            check(cudaMemcpy(expected.data(), ref.p, bytes, cudaMemcpyDeviceToHost));
+            check(cudaMemcpy(got.data(), y.p, bytes, cudaMemcpyDeviceToHost));
+            if (std::memcmp(expected.data(), got.data(), bytes))
+                throw std::runtime_error("Padded expert down differs from the single-route projection");
         } else {
             check(cudaMemsetAsync(used.p, 0, sizeof(op::PlanSize), cudaStreamPerThread));
             op::groupRoutes<<<experts, 256>>>(di.p, routes, plan.p, used.p);
-            op::packInput<<<dim3((k / 64 + 7) / 8, capacity, TileRows / 8), 256>>>(plan.p, used.p, xi.p,
+            const op::CompactRouteTiles<TileRows> compact{plan.p, used.p};
+            op::packInput<<<dim3((k / 64 + 7) / 8, capacity, TileRows / 8), 256>>>(compact, xi.p,
                                                                                         packed.p, k, div);
             op::PlanSize size;
             check(cudaMemcpy(&size, used.p, sizeof(size), cudaMemcpyDeviceToHost));
@@ -169,10 +196,10 @@ template <int TileRows> void test(int tokens, bool up, bool skew, bool verify = 
             dim3 grid((n + 127) / 128, capacity);
             if (up)
                 op::groupedProject<warps, columns, true><<<grid, threads>>>(
-                    view, xi.p, nullptr, packed.p, plan.p, used.p, y.p, n, k, div);
+                    view, xi.p, nullptr, packed.p, compact, y.p, n, k, div);
             else
                 op::groupedProject<warps, columns, false><<<grid, threads>>>(
-                    view, nullptr, scalesByRow.p, packed.p, plan.p, used.p, y.p, n, k, div);
+                    view, nullptr, scalesByRow.p, packed.p, compact, y.p, n, k, div);
         }
         if (!verify) check(cudaMemcpy(got.data(), y.p, got.size() * sizeof(got[0]), cudaMemcpyDeviceToHost));
         double error = 0, norm = 0;
@@ -353,6 +380,7 @@ int main() {
     if (cudaGetDeviceCount(&count) != cudaSuccess || !count) return 77;
     check(cudaMemcpyFromSymbol(&image, op::nativeImage, sizeof(image)));
     if (!image) return 77;
+    for (bool skew : {false, true}) test<16>(73, false, skew);
     for (bool up : {false, true})
         for (int rows : {1, 3, 31, 257})
             for (bool skew : {false, true}) {
