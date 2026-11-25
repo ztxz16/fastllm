@@ -20,7 +20,7 @@ struct NaiveVerifyAttentionPlan {
     Layer ForLayer(bool sliding, bool residual, bool localIndexer, bool packedCache,
                    bool ringCache, bool contextIndex) const;
 };
-NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, bool packed,
+NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, int tpRanks,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
         int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks = 0);
 using IndexerGather = std::function<void(const void *, void *, size_t)>;

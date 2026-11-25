@@ -1072,7 +1072,7 @@ Data NaiveN05FlashModel::RunTarget(
     useSwaLayer = !attentionParallel && tensorParallel && decodeWorkspace && !verifying && length == 1 &&
         tpSwaRingCache && !(capture && capture->collectHidden) && FastllmCudaSwaLayerSupported(gpu);
 #endif
-    const auto verifyPlan = FastllmCudaPlanVerifyAttention(gpu, length, verifyTpPacked,
+    const auto verifyPlan = FastllmCudaPlanVerifyAttention(gpu, length, tpDevices.size(),
         graphVerify && !attentionParallel && tensorParallel && batch && capture->ringVerify ? &batch->lengths : nullptr,
         tpSwaRingCache, !expertUpdatesResidual && (!tpEp8MegaState || experts),
         indexerCompute == NaiveIndexerCompute::Auto && !sparseKv && !HasSeparateIndexer() && !indexerLayerSharding && indexFp8,
@@ -1284,7 +1284,7 @@ Data NaiveN05FlashModel::RunTarget(
                             rms_norm_eps, cfg.theta, valueScale};
             input.qkvActivation = preparedQkv;
             input.afterExpertReduce = layerPlan.swa && handoff && handoff->HasVerifyReduce(tpRank, layer - 1, length);
-            input.deferPostNorm = denseFused || (layerPlan.packed && withRouter && moeLayers[layer] &&
+            input.deferPostNorm = denseFused || (layerPlan.packed && verifyTpPacked && withRouter && moeLayers[layer] &&
                 !shardRouter && !localMoe && num_experts_per_tok == 8);
             const auto result = FastllmCudaVerifyAttention(input, gpu, withRouter ? prepared : nullptr);
             projectedOnly = result == FastllmVerifyOutput::Projected;
@@ -2638,8 +2638,7 @@ Data NaiveN05FlashModel::RunTarget(
             mlpNormWeight = &localWeight(name);
             mlpNormOutput = lastLayer && !localMoe ? &buf.last : &normed;
         }
-        const bool deferSwaResidual = verifyTpPacked && decodeWorkspace && batch && batch->Size() == 1 &&
-            capture->ringVerify && tpSwaRingCache && layer + 1 < block_cnt && slidingLayers[layer + 1] &&
+        const bool deferSwaResidual = verifyPlan.packed && tpSwaRingCache && layer + 1 < block_cnt && slidingLayers[layer + 1] &&
             (!captureHidden || (!capture->packedOutput && !capture->peerFeatures));
         auto addMlpResidual = [&](Data &branch, bool needsReduce) {
             if (fusedHead && layer + 1 == block_cnt) {

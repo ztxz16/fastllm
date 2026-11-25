@@ -26,11 +26,13 @@ bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime) {
     return FastllmCudaStablePrefillReduction(archs);
 }
 
-NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, bool packed,
+NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, int tpRanks,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
         int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks) {
-    NaiveVerifyAttentionPlan plan{packed};
+    NaiveVerifyAttentionPlan plan{};
 #ifndef USE_ROCM
+    // TP attention consumes all verification rows even when EP distributes the experts.
+    plan.packed = requests && requests->size() == 1 && FastllmCudaPackedVerifySupported(rows, tpRanks);
     if (localAttentionRanks == 1) {
         const int arch = FastllmCudaRuntimeArch();
         plan.replica = arch == 100 || arch == 103;

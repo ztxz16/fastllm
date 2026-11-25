@@ -4278,7 +4278,13 @@ bool FastllmCudaVerifyLocalDsaIndexer(const fastllm::Data &query, const fastllm:
 
 bool FastllmCudaPackedVerifySupported(int rows, int ranks) {
 #ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
-    return rows == 8 && ranks == 8 && FastllmCudaRuntimeArch() == 120;
+    if (rows != 8 || ranks != 8) return false;
+    // Collective attention must take the same path on every TP rank.
+    auto &state = GetCustomArState();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.initialized && !state.resetting && state.sm120EightRanks &&
+           state.ncclGeneration == FastllmGetNcclGeneration() &&
+           CustomArPathEnabled(state, 8192, fastllm::BFLOAT16);
 #else
     return false;
 #endif

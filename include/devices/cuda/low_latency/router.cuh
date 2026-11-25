@@ -9,17 +9,26 @@
 // experts%Experts==0 and 16-byte aligned input/weights. Logical rows have tails.
 namespace fastllm::cuda::low_latency {
 using BF16 = __nv_bfloat16;
-template<int Hidden>
+template<int Hidden, bool WaitForSwa = false>
 __global__ void RouterSigmoidSingle(const BF16 *input, const float *weight,
                                   float *output) {
     static_assert(Hidden > 0 && Hidden % 256 == 0);
     int t = threadIdx.x, expert = blockIdx.x;
     __shared__ float sums[8];
     float values[Hidden/256], weights[Hidden/256], partial = 0;
+    if constexpr (WaitForSwa) {
+        // The SWA epilogue still owns the normalized row. Only weights are ready.
+        const float *row = weight + (size_t)expert * Hidden;
+        #pragma unroll
+        for (int i = 0; i < Hidden/256; ++i) weights[i] = row[t + i * 256];
+#if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        cudaGridDependencySynchronize();
+#endif
+    }
     #pragma unroll
     for (int i = 0; i < Hidden/256; ++i) {
         values[i] = (float)input[t + i * 256];
-        weights[i] = weight[(size_t)expert * Hidden + t + i * 256];
+        if constexpr (!WaitForSwa) weights[i] = weight[(size_t)expert * Hidden + t + i * 256];
     }
     #pragma unroll
     for (int i = 0; i < Hidden/256; ++i) partial += values[i] * weights[i];

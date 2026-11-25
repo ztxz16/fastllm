@@ -2,6 +2,7 @@
 #include "devices/cuda/naive-n05-swa-settings.h"
 #include "devices/cuda/naive-n05-swa-verify.cuh"
 #include "devices/cuda/low_latency/router.cuh"
+#include "devices/cuda/fastllm-cuda-pdl.cuh"
 #include "devices/cuda/low_latency/execution.h"
 #include "devices/cuda/fastllm-cuda-norm.cuh"
 #include "devices/cuda/fastllm-cuda-launch.cuh"
@@ -6000,7 +6001,7 @@ bool FastllmCudaNaiveRouterFP32(const fastllm::Data &input,
 }
 
 namespace {
-template<auto Kernel, int Threads, typename... Extra>
+template<auto Kernel, int Threads, decltype(Kernel) SwaConsumer = nullptr, typename... Extra>
 bool TryRouterKernel(const fastllm::Data &input, const fastllm::Data &weight, fastllm::Data &output,
                      dim3 grid, Extra... extra) {
     using namespace fastllm;
@@ -6025,7 +6026,12 @@ bool TryRouterKernel(const fastllm::Data &input, const fastllm::Data &weight, fa
     auto dims = input.dims;
     dims.back() = weight.dims[0];
     Output(output, FLOAT32, dims);
-    Kernel<<<grid, Threads>>>((const BF16 *)input.cudaData, (const float *)weight.cudaData,
+    auto kernel = Kernel;
+    if constexpr (SwaConsumer != nullptr) {
+        if (FastllmCudaRuntimeArch() == 120 && cuda_pdl::Prepare(cuda_pdl::Producer::SwaOutput))
+            kernel = SwaConsumer;
+    }
+    kernel<<<grid, Threads>>>((const BF16 *)input.cudaData, (const float *)weight.cudaData,
                               (float *)output.cudaData, extra...);
     CheckLaunch();
     return true;
@@ -6063,7 +6069,7 @@ bool FastllmCudaNaiveRouterSigmoid(const fastllm::Data &input,
         TryRouterKernel<RouterTile, 256>(input, weight, output,
             dim3(experts / kRouterTileExperts, rowTiles), rows, experts)) return true;
     if (rows == 1)
-        return TryRouterKernel<RouterSigmoidSingle<4096>, 256>(input, weight, output, dim3(experts));
+        return TryRouterKernel<RouterSigmoidSingle<4096>, 256, RouterSigmoidSingle<4096, true>>(input, weight, output, dim3(experts));
     if (rows >= 3 && arch == 90 &&
         (uintptr_t)input.cudaData % 4 == 0 && (uintptr_t)weight.cudaData % 8 == 0 &&
         TryRouterKernel<BatchRouterSigmoid4096Vector, 128>(input, weight, output,
