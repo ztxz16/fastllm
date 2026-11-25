@@ -3,6 +3,7 @@
 #include "fastllm-naive-flex-moe.h"
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <type_traits>
 
 namespace fastllm_norm_rows {
 using BF16 = __nv_bfloat16;
@@ -66,7 +67,7 @@ static __device__ __forceinline__ Vector ReadRouterTile(const Scalar *chunk, int
 // FP32 dot accumulation has a separate operator-L2 validation contract.
 // Four unprepared rows share the same weights without allocating an FP8 image.
 // With a residual branch, stage the rounded sum until every router tile has read the input.
-template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false, bool MarlinOrder = false>
+template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false, bool MarlinOrder = false, class Epilogue = void>
 static __device__ __forceinline__ void NormRowsRouterBody(
         const BF16 *input, const float *weight, float *output,
         const float *gamma, BF16 *normed, float eps, int rows,
@@ -106,7 +107,8 @@ static __device__ __forceinline__ void NormRowsRouterBody(
 #endif
     float partial[Experts][Rows]{};
     if constexpr (Prepare) if (blockIdx.x == 0 && blockIdx.y == 0) {
-        prepared.counters[t] = 0;
+        // A custom epilogue initializes its own scheduling counters.
+        if constexpr (std::is_void_v<Epilogue>) prepared.counters[t] = 0;
         if constexpr (!Residual) if (t == 0) ++*prepared.epoch;
         if constexpr (Capacity == 8 && !Residual) ClearGateBlock128Tail<Rows>(prepared.block128,rows);
     }
@@ -219,8 +221,12 @@ static __device__ __forceinline__ void NormRowsRouterBody(
                         __NV_SATFINITE, __NV_E4M3);
                 const size_t offset = size_t(first + row) * Width + col;
                 if constexpr (Capacity == 8) if (first + row < rows) {
-                    *reinterpret_cast<uint2 *>(prepared.values + offset) = q;
-                    if (t % 4 == 0) prepared.scales[offset / 32] = e;
+                    if constexpr (!std::is_void_v<Epilogue>) {
+                        Epilogue::store(prepared,first+row,col,q,e);
+                    } else {
+                        *reinterpret_cast<uint2 *>(prepared.values + offset) = q;
+                        if (t % 4 == 0) prepared.scales[offset / 32] = e;
+                    }
                 }
                 if constexpr (!Residual) if (prepared.block128) StoreGateBlock128<Capacity>(prepared.block128, first + row, col, q, e);
             }
@@ -244,14 +250,15 @@ static __device__ __forceinline__ void NormRowsRouterBody(
         if (t % 8 == 0 && first + task % Rows < rows)
             output[(first + task % Rows) * 256 + expert + task / Rows] = 1.0 / (1.0 + expf(-(value + 0.f)));
     }
+    if constexpr (!std::is_void_v<Epilogue>) Epilogue::complete(prepared,output);
 }
 
-template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false>
+template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false, class Epilogue = void>
 static __global__ void NormRowsRouterDirect(
         const BF16 *input, const float *weight, float *output,
         const float *gamma, BF16 *normed, float eps, int rows,
         FastllmMoePreparedInput prepared, const BF16 *branch = nullptr, BF16 *sumOutput = nullptr) {
-    NormRowsRouterBody<Experts, Rows, Prepare, Capacity, Residual, WaitForSwa>(
+    NormRowsRouterBody<Experts, Rows, Prepare, Capacity, Residual, WaitForSwa, false, Epilogue>(
         input, weight, output, gamma, normed, eps, rows, prepared, branch, sumOutput);
 }
 

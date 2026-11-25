@@ -32,13 +32,13 @@ if triton is not None:
     def fastllm_inkling_window_verify(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
                                      past_offset, chain, sink_stride, gate_stride,
                                      H: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
-                                     WINDOW: tl.constexpr, E: tl.constexpr):
+                                     WINDOW: tl.constexpr, E: tl.constexpr, DECODE: tl.constexpr = False):
         # Adapted from vLLM's Inkling _rel_attention_kernel, Apache-2.0.
         # Copyright contributors to the vLLM project.
         # https://github.com/vllm-project/vllm/blob/main/vllm/models/inkling2/nvidia/ops/attention_sm90.py
         # FastLLM has separate K/V page IDs and a padded verification chain per request.
-        BM: tl.constexpr = 32
-        BN: tl.constexpr = 64
+        BM: tl.constexpr = 16 if DECODE else 32
+        BN: tl.constexpr = 32 if DECODE else 64
         D: tl.constexpr = 128
         TOKENS: tl.constexpr = BM // G
         LOG2E: tl.constexpr = 1.4426950408889634
@@ -51,7 +51,11 @@ if triton is not None:
         page_info = (desc + 24).to(tl.pointer_type(tl.int32))
         first_page, page_len = tl.load(page_info), tl.load(page_info + 1)
         state = (desc + past_offset).to(tl.pointer_type(tl.int32))
-        past, live = tl.load(state), tl.minimum(chain, tl.maximum(0, tl.load(state + 1)))
+        past = tl.load(state)
+        if DECODE:
+            live = 1
+        else:
+            live = tl.minimum(chain, tl.maximum(0, tl.load(state + 1)))
         m, d = tl.arange(0, BM), tl.arange(0, D)
         local = tile * TOKENS + m // G
         head = kv * G + m % G
@@ -64,6 +68,10 @@ if triton is not None:
             tl.store(Out + output_offset, 0., dest[:, None])
             return
         q = tl.load(Q + output_offset, active[:, None], 0.)
+        if DECODE:
+            # Preserve the FP32 query and softmax weights with two FP16 products.
+            q_hi = q.to(tl.float16)
+            q_lo = (q - q_hi.to(tl.float32)).to(tl.float16)
         pos = past + local
         start = tl.maximum(0, past + tile * TOKENS - WINDOW + 1) // BN
         end = tl.cdiv(past + tl.minimum(live, (tile + 1) * TOKENS), BN)
@@ -85,19 +93,32 @@ if triton is not None:
             offset = (slot * (H // G) + kv) * D
             page_stride = page_len * (H // G) * D
             k = tl.load(key + (pk * page_stride + offset)[None, :] + d[:, None], valid[None, :], 0.)
-            score = tl.dot(q, k.to(tl.bfloat16)) * (LOG2E * 0.08838834764831845)
+            if DECODE:
+                score = (tl.dot(q_hi, k) + tl.dot(q_lo, k)) * 0.08838834764831845
+            else:
+                score = tl.dot(q, k.to(tl.bfloat16)) * (LOG2E * 0.08838834764831845)
             dist = pos[:, None] - t[None, :]
             visible = (dist >= 0) & (dist < WINDOW) & valid[None, :] & active[:, None]
-            bias = tl.load(Bias + (row * H + head)[:, None] * E + (t % E)[None, :],
+            bias_index = dist if DECODE else (t % E)[None, :]
+            bias = tl.load(Bias + (row * H + head)[:, None] * E + bias_index,
                            visible & (dist < E), 0.)
-            score = tl.where(visible, score + bias.to(tl.float32) * LOG2E, float("-inf"))
+            if DECODE:
+                score = (score + bias) * LOG2E
+            else:
+                score += bias.to(tl.float32) * LOG2E
+            score = tl.where(visible, score, float("-inf"))
             new_max = tl.maximum(mx, tl.max(score, 1))
             safe = tl.where(new_max == float("-inf"), 0., new_max)
             prob = tl.exp2(score - safe[:, None])
             scale = tl.exp2(mx - safe)
             denom = denom * scale + tl.sum(prob, 1)
             v = tl.load(value + (pv * page_stride + offset)[:, None] + d[None, :], valid[:, None], 0.)
-            acc = acc * scale[:, None] + tl.dot(prob.to(tl.bfloat16), v.to(tl.bfloat16))
+            if DECODE:
+                p_hi = prob.to(tl.float16)
+                p_lo = (prob - p_hi.to(tl.float32)).to(tl.float16)
+                acc = acc * scale[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v)
+            else:
+                acc = acc * scale[:, None] + tl.dot(prob.to(tl.bfloat16), v.to(tl.bfloat16))
             mx = new_max
         sink = tl.load(Sink + row * sink_stride + head, dest, 0.).to(tl.float32) * LOG2E
         upper = tl.maximum(mx, sink)
@@ -106,6 +127,66 @@ if triton is not None:
         gate = tl.load(Gate + row[:, None] * gate_stride + channels, dest[:, None], 0.).to(tl.float32)
         tl.store(Out + output_offset, tl.where(active[:, None], acc * norm[:, None] * tl.sigmoid(gate), 0.),
                  dest[:, None])
+
+    @triton.jit
+    def fastllm_inkling_window_decode(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
+                                     past_offset, chain, sink_stride, gate_stride,
+                                     H: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
+                                     WINDOW: tl.constexpr, E: tl.constexpr):
+        fastllm_inkling_window_verify(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
+                                     past_offset, 1, sink_stride, gate_stride, H, G, PAGE, WINDOW, E, True)
+
+    @triton.jit
+    def fastllm_inkling_window_split(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
+                                    past_offset, chain, sink_stride, gate_stride,
+                                    H: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
+                                    WINDOW: tl.constexpr, E: tl.constexpr, BN: tl.constexpr):
+        # One CTA per KV head and time partition. mergeRelativeWarp reads only
+        # active partitions and applies the learned sink and output gate once.
+        split, kv = tl.program_id(0), tl.program_id(1)
+        splits = tl.num_programs(0)
+        ptrs = Visit.to(tl.pointer_type(tl.uint64))
+        key = tl.multiple_of(tl.load(ptrs).to(tl.pointer_type(tl.float16)), 16)
+        value = tl.multiple_of(tl.load(ptrs + 1).to(tl.pointer_type(tl.float16)), 16)
+        ids = tl.load(ptrs + 2).to(tl.pointer_type(tl.int32))
+        page_info = (Visit + 24).to(tl.pointer_type(tl.int32))
+        first_page, page_len = tl.load(page_info), tl.load(page_info + 1)
+        past = tl.load((Visit + past_offset).to(tl.pointer_type(tl.int32)))
+        length = tl.minimum(past + 1, WINDOW)
+        chunk = tl.maximum(16, tl.cdiv(length, splits))
+        if split * chunk >= length:
+            return
+        n = tl.arange(0, BN)
+        pos = past + 1 - length + split * chunk + n
+        if page_len == PAGE:
+            page, slot = pos // PAGE, pos % PAGE
+        else:
+            page = pos // page_len
+            slot = pos - page * page_len
+        valid = (n < chunk) & (pos <= past) & (page >= first_page)
+        pk = tl.load(ids + 2 * (page - first_page), valid, 0).to(tl.int64)
+        pv = tl.load(ids + 2 * (page - first_page) + 1, valid, 0).to(tl.int64)
+        d, m = tl.arange(0, 128), tl.arange(0, 16)
+        head = kv * G + m
+        q = tl.load(Q + head[:, None] * 128 + d[None, :], m[:, None] < G, 0.)
+        offset = (slot * (H // G) + kv) * 128
+        stride = page_len * (H // G) * 128
+        k = tl.load(key + (pk * stride + offset)[:, None] + d[None, :], valid[:, None], 0.)
+        v = tl.load(value + (pv * stride + offset)[:, None] + d[None, :], valid[:, None], 0.)
+        q_hi = q.to(tl.float16)
+        qk = tl.dot(q_hi, tl.trans(k)) + tl.dot((q - q_hi.to(tl.float32)).to(tl.float16), tl.trans(k))
+        dist = past - pos
+        bias = tl.load(Bias + head[:, None] * E + dist[None, :],
+                       (m[:, None] < G) & valid[None, :] & (dist[None, :] < E), 0.)
+        scores = tl.where(valid[None, :], (qk * 0.08838834764831845 + bias) * 1.4426950408889634, -float("inf"))
+        maximum = tl.max(scores, 1)
+        prob = tl.exp2(scores - maximum[:, None])
+        denom = tl.sum(prob, 1)
+        p_hi = prob.to(tl.float16)
+        acc = tl.dot(p_hi, v) + tl.dot((prob - p_hi.to(tl.float32)).to(tl.float16), v)
+        row = split * H + head
+        tl.store(Out + row[:, None] * 128 + d[None, :], acc / denom[:, None], m[:, None] < G)
+        tl.store(Out + splits * H * 128 + row, maximum + tl.log2(denom), m < G)
 
     @triton.jit
     def fastllm_small_projection(X, W, S, Y, rows, groups, N: tl.constexpr, K: tl.constexpr,
@@ -5096,22 +5177,39 @@ def compile_mxfp4_grouped(payload):
     return meta
 
 
-def compile_inkling_window_verify(payload):
+def compile_inkling_window(payload):
+    split = payload["op"] == "inkling_window_split"
+    decode = split or payload["op"] == "inkling_window_decode"
     arch, heads, group, window, extent, page = (require_int(payload, k) for k in
         ("arch", "heads", "group", "window", "extent", "page"))
     if (arch not in (120, 121) or not 1 <= group <= 32 or heads < group or heads % group or
             page < 1 or window < 1 or extent < 16 or extent & (extent - 1)):
-        raise ValueError("unsupported Inkling verification geometry")
+        raise ValueError("unsupported Inkling window geometry")
+    if decode and group > 16:
+        raise ValueError("decode supports up to 16 grouped query heads")
     root = Path(payload["cache_dir"])
     root.mkdir(parents=True, exist_ok=True)
-    base = f"inkling_window_verify_v1_sm{arch}_h{heads}_g{group}_w{window}_e{extent}_p{page}"
+    base = f"{payload['op']}_v1_sm{arch}_h{heads}_g{group}_w{window}_e{extent}_p{page}"
+    if split:
+        splits = require_int(payload, "splits")
+        if splits not in (16, 32) or window > 1024:
+            raise ValueError("unsupported Inkling window partition size")
+        base += f"_s{splits}"
     cubin, meta = root / (base + ".cubin"), root / (base + ".json")
     if cubin.is_file() and meta.is_file():
         return json.loads(meta.read_text())
-    pointers = dict(Visit="*u8", Q="*bf16", Bias="*bf16", Sink="*bf16", Gate="*bf16", Out="*bf16")
+    source = "*fp32" if decode else "*bf16"
+    pointers = dict(Visit="*u8", Q=source, Bias=source, Sink=source, Gate=source, Out="*bf16")
     strides = dict.fromkeys(("visit_bytes", "past_offset", "chain", "sink_stride", "gate_stride"), "i32")
     constants = dict(H=heads, G=group, PAGE=page, WINDOW=window, E=extent)
-    kernel = _compile_cubin(fastllm_inkling_window_verify,
+    function = fastllm_inkling_window_decode if decode else fastllm_inkling_window_verify
+    if split:
+        function = fastllm_inkling_window_split
+        pointers.update(Sink="*bf16", Gate="*bf16", Out="*fp32")
+        constants["BN"] = max(16, triton.next_power_of_2(triton.cdiv(window, splits)))
+    elif not decode:
+        constants["DECODE"] = False
+    kernel = _compile_cubin(function,
                             {**pointers, **strides, **dict.fromkeys(constants, "constexpr")},
                             constants, arch, 4, 2, cubin)
     data = dict(ok=True, op=payload["op"], spec=base, cubin=str(cubin), kernel=kernel.metadata.name,
@@ -5163,8 +5261,8 @@ def compile_projection(payload):
 def handle_compile(payload):
     op = payload.get("op")
     with _compile_lock:
-        if op == "inkling_window_verify":
-            return compile_inkling_window_verify(payload)
+        if op in ("inkling_window_verify", "inkling_window_decode", "inkling_window_split"):
+            return compile_inkling_window(payload)
         if op in {"small_projection", "batched_projection"}:
             return compile_projection(payload)
         if op == "mxfp4_grouped_batch":

@@ -17,6 +17,13 @@ inline void check(cudaError_t status) {
     if (status != cudaSuccess)
         throw std::runtime_error(std::string("Inkling CUDA: ") + cudaGetErrorString(status));
 }
+// The general borrowed Data constructor defaults to cuda:0. Inkling constructs
+// these views on the worker that owns the storage and runs the consuming operator.
+struct CudaView : Data {
+    CudaView(DataType type, const std::vector<int> &dims, void *ptr) : Data(type, dims, CUDA, ptr) {
+        check(cudaGetDevice(&dataDeviceIds.front()));
+    }
+};
 // Captured branches join before their tensor views go out of scope. Reuse the
 // block only after that join and keep its backing address until graph teardown.
 class DecodeGraphScratch {
@@ -193,7 +200,8 @@ class ExpertBackend {
 public:
     virtual ~ExpertBackend() = default;
     virtual Matrix run(const Config &, const Matrix &input, const float *bias, ExpertPhase phase,
-                       Rows<__nv_bfloat16> *unreduced = nullptr) const = 0;
+                       Rows<__nv_bfloat16> *rankSum = nullptr, Rows<__nv_bfloat16> *routes = nullptr,
+                       int promptRows = 0) const = 0;
 };
 
 // A decode step spends one admission budget across all host layers and repeated visits.

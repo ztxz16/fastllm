@@ -1,6 +1,10 @@
 // Independent softmax reference for paged/grouped Inkling attention with a
 // learned sink, absolute-position temperature and an uncommitted prefill suffix.
 #include "../../src/models/inkling2/runtime.cuh"
+#include "devices/cuda/fastllm-cuda-launch.cuh"
+#include "devices/cuda/fastllm-cuda-attn-res.cuh"
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-bf16-warp-dot.cuh"
 #include "attention/variants.cuh"
 #include "attention/decode.cuh"
 #include "attention/default_prefill_params.cuh"
@@ -83,7 +87,7 @@ void compareVerifyChain(AttentionRow a, PageView pages, std::vector<int2> ids, i
     if (std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)))
         throw std::runtime_error("Verification attention differs from standalone decode");
     if constexpr (D == 128 && std::is_same_v<T, half>) {
-        if (!a.window && configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention)) {
+        if (!a.window && configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention<VerifyTraits>)) {
             int device, smCount;
             check(cudaGetDevice(&device));
             check(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
@@ -120,6 +124,16 @@ void compareVerifyChain(AttentionRow a, PageView pages, std::vector<int2> ids, i
                     norm += std::pow(double(baseline[j]), 2);
                 }
             }
+#if CUDART_VERSION >= 12080
+            if (supportsGlobalRelativeSm120(device)) {
+                // Force the full-batch dispatch on this small two-request fixture.
+                launchVerifyAttention(a, batchScratch, sink, gate, batched.p, rows, chain, splits,
+                                      1, VerifyPartition::minTiles, false, true);
+                std::vector<float> tiled(actual.size());
+                check(cudaMemcpy(tiled.data(), batched.p, tiled.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                if (tiled != actual) throw std::runtime_error("Tiled global verification differs from standard paged attention");
+            }
+#endif
             if (!(diff <= norm * 1e-8)) throw std::runtime_error("Paged attention differs from the decode reference");
         }
     }
@@ -331,6 +345,8 @@ int testRelative() {
     // Span different split grains and more than one query tile, including clipped padding.
     compare<128, half>(3, 28 * 128 - 4, 46, 0, 37, true, 28, true, sm120 ? 26 : 0, false, 23);
     if (sm120) {
+        // Force more than 32 active splits and replay split slots past the launch grid.
+        compare<128, half>(3, 6013, 16, 0, 16, true, 54, true, 26, false, 8);
         // Partial warp tiles, a partially filled last split, odd page sizes,
         // long contexts, and independently permuted K/V.
         for (int past : {0, 1, 14, 15, 16, 62, 63, 64, 1023, 4095, 4100, 8191, 8317})

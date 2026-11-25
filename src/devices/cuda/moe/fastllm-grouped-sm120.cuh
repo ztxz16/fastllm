@@ -106,7 +106,7 @@ cudaError_t packGroupedInput(const Block16 *input, const int *ids, const int *of
 // and rounds each projection to BF16 before activation or route summation.
 cudaError_t projectGroupedRows(const Weights &weights, const GroupedWeightMaps &maps, int *offsets,
                                const GroupedBuffers &buffers, int n, int k, int experts, int smCount, cudaStream_t stream);
-cudaError_t sumGroupedRows(const float *sorted, float *output, const int *ids, const int *offsets, const int *ranks,
+template<class Out> cudaError_t sumGroupedRows(const float *sorted, Out *output, const int *ids, const int *offsets, const int *ranks,
                            const float *weightScales, const float *rowScales, int rows, int n, int topK, cudaStream_t stream);
 }
 

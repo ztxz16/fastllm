@@ -6,9 +6,10 @@
 struct FastllmNaiveDSALayerInput {
     const fastllm::Data *branch = nullptr;
     fastllm::Data *hidden = nullptr, *feature = nullptr;
-    const fastllm::Data *inputNorm = nullptr, *qkvWeight = nullptr, *qkvBias = nullptr;
+    const fastllm::Data *inputNorm = nullptr, *qkvBias = nullptr;
+    fastllm::Data *qkvWeight = nullptr, *outputWeight = nullptr;
     const fastllm::Data *indexKeyWeight = nullptr, *indexQueryWeight = nullptr, *indexWeight = nullptr;
-    const fastllm::Data *indexNorm = nullptr, *indexBias = nullptr, *outputWeight = nullptr;
+    const fastllm::Data *indexNorm = nullptr, *indexBias = nullptr;
     const fastllm::Data *postNorm = nullptr, *sink = nullptr, *positions = nullptr, *live = nullptr;
     const fastllm::Data *routerWeight = nullptr;
     fastllm::Data *query = nullptr, *attention = nullptr, *projected = nullptr, *normed = nullptr;
@@ -21,13 +22,16 @@ struct FastllmNaiveDSALayerInput {
     float eps = 1e-5f, theta = 10000.f, valueScale = 1.f;
 };
 
-enum class FastllmVerifyOutput { Unsupported, Normalized, Router, DeferredNorm };
+enum class FastllmVerifyOutput { Unsupported, Projected, Normalized, Router, DeferredNorm };
 
 struct FastllmNaiveVerifyAttentionInput : FastllmNaiveDSALayerInput {
     FastllmSwaLayerConfig config{};
     FastllmMxfp8Activation qkvActivation{};
     fastllm::Data *indices = nullptr;
     int attentionRank = 0, topK = 0, indexHeads = 0, indexDim = 0;
+    fastllm::Data *qkv = nullptr;
+    const fastllm::Data *projectionScratch = nullptr;
+    bool replica = false, fp8IndexerCache = false;
     bool sliding = false, packedTp = false, afterExpertReduce = false, deferPostNorm = false;
 };
 

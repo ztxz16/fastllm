@@ -105,6 +105,16 @@ extern "C" int fastllm_ep8_mega_moe_run_masked(void *p, const void *x, void *y, 
 extern "C" int fastllm_ep8_mega_moe_run_batched(void *p, const void *x, void *y, const int32_t *i, const float *s, int rows, int capacity, const int *live) {
     auto *h = handle(p); return h ? h->api->run_batched(h->inner,x,y,i,s,rows,capacity,live) : 0;
 }
+extern "C" int fastllm_ep8_mega_moe_run_verify(void *p, const void *x, void *y,
+        const int32_t *i, const float *s, int rows, int capacity, const int *live) {
+    auto *h = handle(p);
+    if (!h) return 0;
+#ifdef FASTLLM_MIMO_MEGA_SM100
+    if (h->api == &blackwell)
+        return fastllm_sm100_mega_moe_run_verify(h->inner,x,y,i,s,rows,capacity,live);
+#endif
+    return h->api->run_batched(h->inner,x,y,i,s,rows,capacity,live);
+}
 extern "C" size_t fastllm_ep8_mega_moe_prefill_workspace_bytes(int rows, int ranks) {
     const auto *a = select(); return a ? a->prefill_workspace_bytes(rows,ranks) : 0;
 }

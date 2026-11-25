@@ -84,17 +84,8 @@ __global__ void pack(const uint8_t *src,const float *scales,uint8_t *dst,uint8_t
     dst[(size_t)row*k+col*32+lane]=__nv_fp8_e4m3(value*inverse).__x;
     if (lane==0) sf[fastllm_mxfp4::scaleOffset(row,col,n)]=exponent;
 }
-__global__ void prepare(const __nv_bfloat16 *x,const int32_t *idx,const float *score,
-    uint8_t *qx,uint8_t *sf,int64_t *qi,float *qs,int rows,const int *live,
-    uint64_t *combineReady,int ranks) {
-    // CUDA Graph replay reuses %gridid. The upstream combine protocol tags
-    // readiness with gridid+1, so clear our receive flags on every invocation.
-    // This kernel precedes MegaMoE on the same stream; its initial cross-rank
-    // barrier guarantees every clear finishes before any new ready signal.
-    // Zero-token ranks must execute this too. No extra launch is required.
-    if (blockIdx.x==0 && threadIdx.x<ranks) combineReady[threadIdx.x]=0;
-    int group=(blockIdx.x*blockDim.x+threadIdx.x)/32;
-    if (group>=rows*(H/32)) return;
+__device__ __forceinline__ void prepareGroup(const __nv_bfloat16 *x,const int32_t *idx,const float *score,
+    uint8_t *qx,uint8_t *sf,int64_t *qi,float *qs,const int *live,int group) {
     int lane=threadIdx.x%32,row=group/(H/32),col=group%(H/32);
     bool valid=!live || live[row]>0;
     float value=valid ? __bfloat162float(x[row*H+col*32+lane]) : 0.f;
@@ -108,6 +99,43 @@ __global__ void prepare(const __nv_bfloat16 *x,const int32_t *idx,const float *s
         qs[row*K+lane]=valid ? score[row*K+lane] : 0.f;
     }
 }
+__global__ void prepare(const __nv_bfloat16 *x,const int32_t *idx,const float *score,
+    uint8_t *qx,uint8_t *sf,int64_t *qi,float *qs,int rows,const int *live,
+    uint64_t *combineReady,int ranks) {
+    // CUDA Graph replay reuses %gridid. The upstream combine protocol tags
+    // readiness with gridid+1, so clear our receive flags on every invocation.
+    // This kernel precedes MegaMoE on the same stream; its initial cross-rank
+    // barrier guarantees every clear finishes before any new ready signal.
+    // Zero-token ranks must execute this too. No extra launch is required.
+    if (blockIdx.x==0 && threadIdx.x<ranks) combineReady[threadIdx.x]=0;
+    int group=(blockIdx.x*blockDim.x+threadIdx.x)/32;
+    if (group>=rows*(H/32)) return;
+    prepareGroup(x,idx,score,qx,sf,qi,qs,live,group);
+}
+
+// A single DS7 slot supplies eight padded rows on each graph participant.
+// Dispatch may inspect routes before other CTAs have published their payload.
+struct VerifyInput {
+    static constexpr unsigned maxRows = 8;
+    const __nv_bfloat16 *x;
+    const int32_t *index;
+    const float *score;
+    const int *live;
+
+    __device__ int route(unsigned slot) const { return live[slot/K] > 0 ? index[slot] : -1; }
+
+    __device__ void publish(const dg::layout::MegaMoEBuffer &b, unsigned rows,
+                            unsigned thread, unsigned threads) const {
+        if (blockIdx.x == 0 && thread < 8) b.workspace.signals->combine_ready_grid_idx[thread] = 0;
+        for (unsigned group = (blockIdx.x*threads + thread)/32; group < rows*(H/32);
+             group += gridDim.x*threads/32) {
+            prepareGroup(x,index,score,b.input_token_buffer.get_base_ptr<uint8_t>(),
+                b.input_sf_buffer.get_base_ptr<uint8_t>(),b.input_topk_idx_buffer.get_base_ptr<int64_t>(),
+                b.input_topk_weights_buffer.get_base_ptr<float>(),live,group);
+        }
+    }
+};
+
 // Each large prefill tile borrows the dead FP32 router tensor. Its capacity,
 // token-ring geometry and TMA descriptors must agree on all participants.
 template<int R, int Capacity, int BM> struct Geometry {
@@ -136,6 +164,12 @@ template<int R> struct Mega {
     template<int BM,int Capacity=CAP> static auto selectKernel(bool mxfp4) {
         return mxfp4 ? kernel<BM,cutlass::detail::float_e2m1_unpacksmem_t,Capacity>() : kernel<BM,cutlass::float_e4m3_t,Capacity>();
     }
+    static auto verifyKernel() {
+        using Weight = cutlass::detail::float_e2m1_unpacksmem_t;
+        return &dg::sm100_fp8_fp4_mega_moe_impl<CAP,H,I,E,0,K,16,BN,BK,
+            Tile<16>::STORE,Tile<16>::STORE_L2,Tile<16>::SF_M,128,RING,SFRING,Tile<16>::STAGES,H,
+            128,128,256,SMS,R,cute::numeric_limits<float>::infinity(),true,Weight,false,false,false,true,VerifyInput>;
+    }
     struct ActivationMaps {
         Desc a1, d1, a2;
         template<int BM>
@@ -149,7 +183,7 @@ template<int R> struct Mega {
     struct Layer:LayerBase {
         Layer():LayerBase{R} {}
         int device=-1,rank=-1;
-        bool mxfp4=false;
+        bool mxfp4=false, verifyReady=false;
         void *workspace=nullptr,*gate=nullptr,*down=nullptr,*gateSf=nullptr,*downSf=nullptr;
         uint8_t *domains=nullptr;
         std::array<int64_t,R> peers{};
@@ -228,6 +262,15 @@ template<int R> struct Mega {
             check(cudaFuncSetAttribute(selectKernel<128>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<128>::SMEM));
             check(cudaFuncSetAttribute(selectKernel<16>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<16>::SMEM));
             check(cudaFuncSetAttribute(selectKernel<32>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<32>::SMEM));
+            if constexpr (R == 8) {
+                if (mxfp4) {
+                    const auto status = cudaFuncSetAttribute(verifyKernel(),
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, Tile<16>::SMEM);
+                    if (status == cudaErrorInvalidValue || status == cudaErrorInvalidDeviceFunction ||
+                        status == cudaErrorNoKernelImageForDevice) cudaGetLastError();
+                    else { check(status); l->verifyReady = true; }
+                }
+            }
             return l.release();
         } catch (const std::exception &e) { error=e.what(); return nullptr; }
     }
@@ -296,7 +339,7 @@ template<int R> struct Mega {
             return plan->capacity;
         } catch (const std::exception &e) { error=e.what(); return -1; }
     }
-    template<int BM=16,int Capacity=CAP> static int run(void *p,const void *x,void *y,const int32_t *idx,const float *scores,int rows,const int *live,const void *const *peers=nullptr) {
+    template<int BM=16,int Capacity=CAP,bool SingleVerify=false> static int run(void *p,const void *x,void *y,const int32_t *idx,const float *scores,int rows,const int *live,const void *const *peers=nullptr) {
         try {
             if (!p || !x || !y || !idx || !scores || rows<0 || rows>Capacity)
                 throw std::runtime_error("Invalid Blackwell MegaMoE pointers/row count");
@@ -308,7 +351,7 @@ template<int R> struct Mega {
             auto addresses=l.peers;
             if (prefill) for (int r=0;r<R;++r) addresses[r]=reinterpret_cast<int64_t>(peers[r]);
             auto stream=cudaStreamPerThread;
-            prepare<<<rows ? (rows*H+127)/128 : 1,128,0,stream>>>((const __nv_bfloat16 *)x,idx,scores,
+            if constexpr (!SingleVerify) prepare<<<rows ? (rows*H+127)/128 : 1,128,0,stream>>>((const __nv_bfloat16 *)x,idx,scores,
                 b.input_token_buffer.template get_base_ptr<uint8_t>(),b.input_sf_buffer.template get_base_ptr<uint8_t>(),
                 b.input_topk_idx_buffer.template get_base_ptr<int64_t>(),b.input_topk_weights_buffer.template get_base_ptr<float>(),rows,live,
                 b.workspace.signals->combine_ready_grid_idx,R);
@@ -323,10 +366,17 @@ template<int R> struct Mega {
             }();
             const auto &s1=prefill ? l.preS1 : l.s1;
             const auto &s2=prefill ? l.preS2 : l.s2;
-            check(cudaLaunchKernelEx(&config,selectKernel<BM,Capacity>(l.mxfp4),y,(int *)nullptr,(uint32_t)rows,
-                dg::layout::SymBuffer<R>(addresses,l.rank),
-                maps.a1,s1,l.w1,l.ws1,maps.d1,maps.a2,s2,l.w2,l.ws2,
-                maps.a1,s1,l.w1,l.ws1,maps.d1,maps.a2,s2,l.w2,l.ws2,(const uint8_t *)l.domains));
+            auto launch = [&](auto kernel, auto input) {
+                return cudaLaunchKernelEx(&config,kernel,y,(int *)nullptr,(uint32_t)rows,
+                    dg::layout::SymBuffer<R>(addresses,l.rank),
+                    maps.a1,s1,l.w1,l.ws1,maps.d1,maps.a2,s2,l.w2,l.ws2,
+                    maps.a1,s1,l.w1,l.ws1,maps.d1,maps.a2,s2,l.w2,l.ws2,(const uint8_t *)l.domains,input);
+            };
+            if constexpr (SingleVerify) {
+                check(launch(verifyKernel(),VerifyInput{static_cast<const __nv_bfloat16 *>(x),idx,scores,live}));
+            } else {
+                check(launch(selectKernel<BM,Capacity>(l.mxfp4),dg::PackedTokenInput{}));
+            }
             check(cudaGetLastError()); return 1;
         } catch (const std::exception &e) { error=e.what(); return 0; }
     }
@@ -400,6 +450,13 @@ extern "C" int fastllm_sm100_mega_moe_run_batched(void *p,const void *x,void *y,
                                                    : Mega<8>::run<128>(p,x,y,i,s,rows,live);
     return static_cast<LayerBase *>(p)->ranks==4 ? Mega<4>::run<32>(p,x,y,i,s,rows,live)
                                                : Mega<8>::run<32>(p,x,y,i,s,rows,live);
+}
+extern "C" int fastllm_sm100_mega_moe_run_verify(void *p,const void *x,void *y,
+        const int32_t *i,const float *s,int rows,int capacity,const int *live) {
+    if (p && static_cast<LayerBase *>(p)->ranks == 8 && static_cast<Mega<8>::Layer *>(p)->verifyReady &&
+        rows == VerifyInput::maxRows && capacity == SMALL_CAP && live)
+        return Mega<8>::run<16,CAP,true>(p,x,y,i,s,rows,live);
+    return fastllm_sm100_mega_moe_run_batched(p,x,y,i,s,rows,capacity,live);
 }
 extern "C" size_t fastllm_sm100_mega_moe_prefill_workspace_bytes(int total,int ranks) {
     return ranks==8 ? Mega<8>::prefillBytes(total) : ranks==4 ? Mega<4>::prefillBytes(total) : 0;

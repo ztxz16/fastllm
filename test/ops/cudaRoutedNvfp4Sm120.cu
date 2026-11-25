@@ -111,6 +111,14 @@ template <int TileRows> void test(int tokens, bool up, bool skew, bool verify = 
                 check(op::sumGroupedRows(sorted.p, result.p, di.p, offsets.p, ranks.p, gi.p, rowScales.p,
                                          tokens, n, top, cudaStreamPerThread));
                 check(cudaMemcpy(sums.data(), result.p, sums.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                Buffer<__nv_bfloat16> reduced(sums.size());
+                check(op::sumGroupedRows(sorted.p, reduced.p, di.p, offsets.p, ranks.p, gi.p, rowScales.p,
+                                         tokens, n, top, cudaStreamPerThread));
+                std::vector<__nv_bfloat16> rounded(sums.size());
+                check(cudaMemcpy(rounded.data(), reduced.p, sums.size() * sizeof(rounded[0]), cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < sums.size(); ++i)
+                    if (float(rounded[i]) != float(__float2bfloat16_rn(sums[i])))
+                        throw std::runtime_error("Incorrect grouped BF16 top-k sum");
                 for (int i = 0; i < routes; ++i) {
                     int expert = ids[i], row = starts[expert] + rank[i];
                     for (int j = 0; j < n; ++j)
@@ -222,7 +230,7 @@ void checkBand(const op::InputTile &tile, int laneRow, int row, int route, int c
         throw std::runtime_error("Incorrect packed activation codes or scales");
 }
 
-template <int T> void testScatter(int width) {
+template <int T, bool Local = false> void testScatter(int width) {
     // Include empty experts, several tiles in the busiest expert, and padding.
     const int tokens = 97, experts = 43, top = 3, routes = tokens * top;
     const int capacity = (routes + (T - 1) * experts) / T;
@@ -230,7 +238,12 @@ template <int T> void testScatter(int width) {
     std::vector<float> data(size_t(tokens) * width);
     for (int r = routes - 1; r >= 0; --r) {
         ids[r] = (r % top) == 0 ? 42 : (r * 13) % 37;
-        ranks[r] = counts[ids[r]]++;
+        if (Local && (r / top % 5 == 0 || r % 4 == 0)) {
+            ids[r] = -1;
+            ranks[r] = -1;
+        } else {
+            ranks[r] = counts[ids[r]]++;
+        }
     }
     for (int row = 0; row < tokens; ++row)
         for (int col = 0; col < width; ++col)
@@ -242,19 +255,23 @@ template <int T> void testScatter(int width) {
     Buffer<op::RouteGroup<T>> tasks(capacity);
     std::vector<op::InputTile> tiles(size_t(capacity) * (T / 8) * (width / 64));
     Buffer<op::InputTile> packed(tiles.size());
-    Buffer<float> scales(tokens);
+    auto scales = copy(std::vector<float>(tokens, -1.f));
     op::expertOffsets<T><<<1, 32>>>(count.p, starts.p, experts, used.p);
-    op::scatterInput<T><<<tokens, op::QuantThreads>>>(x.p, width, index.p, rank.p, count.p, starts.p, top,
+    op::scatterInput<T, Local><<<tokens, op::QuantThreads>>>(x.p, width, index.p, rank.p, count.p, starts.p, top,
                                                   tasks.p, packed.p, scales.p);
     op::PlanSize size;
     check(cudaMemcpy(&size, used.p, sizeof(size), cudaMemcpyDeviceToHost));
     int expected = 0;
     for (int n : counts) expected += (n + T - 1) / T;
-    if (size.tiles != expected || size.rows != routes) throw std::runtime_error("Incorrect expert prefixes");
+    const int valid = routes - std::count(ids.begin(), ids.end(), -1);
+    if (size.tiles != expected || size.rows != valid) throw std::runtime_error("Incorrect expert prefixes");
     std::vector<float> outer(tokens);
     std::vector<op::RouteGroup<T>> plan(size.tiles);
     check(cudaMemcpy(plan.data(), tasks.p, plan.size() * sizeof(plan[0]), cudaMemcpyDeviceToHost));
     check(cudaMemcpy(outer.data(), scales.p, tokens * sizeof(float), cudaMemcpyDeviceToHost));
+    if (Local)
+        for (int row = 0; row < tokens; row += 5)
+            if (outer[row] != -1.f) throw std::runtime_error("Quantized a token with no local routes");
     check(cudaMemcpy(tiles.data(), packed.p, tiles.size() * sizeof(tiles[0]), cudaMemcpyDeviceToHost));
     int tile = 0, first = 0;
     for (int e = 0; e < experts; ++e) {
@@ -305,6 +322,31 @@ template <int T> void testPackedActivation(int width, bool useRegisters = false)
             checkBand(out[(col / 64) * (T / 8) + row / 8], row % 8, row, route, col);
     }
 }
+#ifdef FASTLLM_INKLING_GROUPED_SM120
+// Remote routes must occupy no rows, even when every route in a tile is remote.
+void testLocalRoutePlan(int routes, bool allRemote) {
+    constexpr int experts = 64;
+    std::vector<int> ids(routes, -1), expected(experts + 1), offsets(experts + 1), ranks(routes);
+    for (int i = 0; !allRemote && i < routes; i += 3) {
+        ids[i] = i % experts;
+        ++expected[ids[i] + 1];
+    }
+    for (int e = 0; e < experts; ++e) expected[e + 1] += expected[e];
+    auto deviceIds = copy(ids);
+    Buffer<int> starts(experts + 1), localRanks(routes);
+    check(op::planGroupedRows(deviceIds.p, starts.p, localRanks.p, experts, routes, cudaStreamPerThread));
+    check(cudaMemcpy(offsets.data(), starts.p, offsets.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    check(cudaMemcpy(ranks.data(), localRanks.p, ranks.size() * sizeof(int), cudaMemcpyDeviceToHost));
+    if (offsets != expected) throw std::runtime_error("Incorrect local expert offsets");
+    std::vector<bool> used(expected.back());
+    for (int i = 0; i < routes; ++i) if (ids[i] >= 0) {
+        const int row = offsets[ids[i]] + ranks[i];
+        if (row < offsets[ids[i]] || row >= offsets[ids[i] + 1] || used[row])
+            throw std::runtime_error("Overlapping or missing local expert rows");
+        used[row] = true;
+    }
+}
+#endif
 }
 int main() {
     int count = 0, image = 0;
@@ -322,6 +364,8 @@ int main() {
             for (bool skew : {false, true})
                 test<32>(rows, up, skew, true);
 #ifdef FASTLLM_INKLING_GROUPED_SM120
+    for (int routes : {64, 2048, 8192})
+        for (bool allRemote : {false, true}) testLocalRoutePlan(routes, allRemote);
     op::GroupedWeightMaps invalidMaps{};
     if (op::makeGroupedWeightMaps(invalidMaps, {}, 1, 48, 320) ||
         op::makeGroupedWeightMaps(invalidMaps, {}, 1, 256, 96))
@@ -335,6 +379,8 @@ int main() {
         throw std::runtime_error("Expected the small-route decode fallback");
     testScatter<32>(192);
     testScatter<64>(2304);
+    testScatter<32, true>(192);
+    testScatter<64, true>(2304);
     testPackedActivation<32>(192, true);
     testPackedActivation<64>(1152, true);
     testPackedActivation<64>(2048, true);

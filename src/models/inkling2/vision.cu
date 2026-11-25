@@ -144,9 +144,9 @@ template <class T> Rows<T> attend(Rows<T> &q, Rows<T> &k, Rows<T> &v, int heads,
     Matrix out(n, width);
     auto run = [&](int h, int count, int first, int length) {
         const size_t base = size_t(h) * n * dim, pos = base + size_t(first) * dim;
-        Data query(FLOAT32, {count, length, dim}, CUDA, qh.p + pos), key(FLOAT32, {count, n, dim}, CUDA, kh.p + base);
-        Data value(FLOAT32, {count, n, dim}, CUDA, vh.p + base),
-            result(FLOAT32, {count, length, dim}, CUDA, out.p + pos);
+        CudaView query(FLOAT32, {count, length, dim}, qh.p + pos), key(FLOAT32, {count, n, dim}, kh.p + base);
+        CudaView value(FLOAT32, {count, n, dim}, vh.p + base),
+            result(FLOAT32, {count, length, dim}, out.p + pos);
         if (!FastllmCudaAttention(query, key, value, *GetEmptyData(), result, 1, 1.f / std::sqrt(float(dim)), 2))
             throw std::runtime_error("Inkling vision attention failed");
     };
@@ -179,7 +179,7 @@ Matrix encodeImage(Data &image, const Config &config, WeightMap &weights, int gp
         auto &matrix = weight(key + ".weight", dtype<T>, {outWidth, in.cols});
         auto &b = bias ? weight(key + ".bias", FLOAT32, {outWidth}) : *GetEmptyData();
         Rows<T> result(in.rows, outWidth);
-        Data input(dtype<T>, {in.rows, in.cols}, CUDA, in.p), output(dtype<T>, {in.rows, outWidth}, CUDA, result.p);
+        CudaView input(dtype<T>, {in.rows, in.cols}, in.p), output(dtype<T>, {in.rows, outWidth}, result.p);
         DoCudaLinear(input, matrix, b, output);
         return result;
     };

@@ -132,7 +132,7 @@ public:
     }
 
     Matrix run(const Config &c, const Matrix &x, const float *bias, ExpertPhase phase,
-               Rows<__nv_bfloat16> *unreduced) const override {
+               Rows<__nv_bfloat16> *, Rows<__nv_bfloat16> *unreduced, int) const override {
         // Bound both MMQ scratch and the one-route-per-grid-row fallback.
         const int chunk = mmqMaxRows > 1 ? mmqMaxRows : 65535 / c.topK;
         if (!nativeDown || x.rows > chunk ||
@@ -178,8 +178,8 @@ public:
             ggufRoutedActivation<<<(size_t(routes) * c.intermediate + 255) / 256, 256, 0, cudaStreamPerThread>>>(
                 activation, mid.p, routes, c.intermediate);
             project(*ggufDown, false, mid, result);
-            sumNativeRoutes<false, float><<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-                result.p, out.p + size_t(first) * c.hidden, rows, c.hidden, c.topK);
+            sumNativeRoutes<false, false, float, float><<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                result.p, out.p + size_t(first) * c.hidden, rows, c.hidden, c.topK, c.hidden, c.hidden);
         }
         return out;
     }

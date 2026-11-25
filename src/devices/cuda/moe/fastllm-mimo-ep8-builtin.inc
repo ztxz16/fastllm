@@ -329,7 +329,7 @@ static int PrepareMimoEpPrefill(FastllmCudaMimoEp8BuiltinMega &state, int rank, 
 }
 void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch) {
+        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch, bool singleVerify) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
         input.dims[1] == 4096 && input.dims[0] >= 0 && input.dims[0] <= maxRows && maxRows > 0 &&
@@ -370,7 +370,7 @@ void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &state,
                 liveKeys ? liveKeys + start : nullptr)
             : prefillPeers[0]
             ? fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, count)
-            : fastllm_ep8_mega_moe_run_batched(handle, x, y, idx, scores, count, capacity,
+            : (singleVerify ? fastllm_ep8_mega_moe_run_verify : fastllm_ep8_mega_moe_run_batched)(handle, x, y, idx, scores, count, capacity,
                 liveKeys ? liveKeys + start : nullptr);
         if (!ok)
             throw std::runtime_error(std::string("Local MiMo EP launch failed: ") +
@@ -508,7 +508,7 @@ struct FastllmCudaMimoEp8BuiltinMega {};
 bool FastllmCudaMimoEp8BuiltinMegaWeights(FastllmCudaMimoEp8BuiltinMega &, int, int, const void **, bool *) { return false; }
 bool FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(int) { return false; }
 void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &, int, int, const fastllm::Data &,
-    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, const int *, fastllm::Data *) {
+    const fastllm::Data &, const fastllm::Data &, fastllm::Data &, int, const int *, fastllm::Data *, bool) {
     throw std::runtime_error("MiMo EP MegaMoE local rows require the SM90 backend.");
 }
 void FastllmCudaMimoEp8BuiltinPrefillReduceScatter(FastllmCudaMimoEp8BuiltinMega &, int, fastllm::Data &) {

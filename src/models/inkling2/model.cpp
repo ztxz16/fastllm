@@ -1,5 +1,6 @@
 #include "inkling2.h"
 #include "json11.hpp"
+#include "utils/utils.h"
 #include <algorithm>
 #include <climits>
 
@@ -19,28 +20,38 @@ Inkling2Model::Inkling2Model() {
     model_type = model_struct = "inkling2_loop";
     dataType = BFLOAT16;
     canDoBatchForward = true;
+    prefillBatchPolicy.targetTokens = 4096;
+    prefillBatchPolicy.maxRequests = 4;
     // K and V are normalized per head. FP16 gives these bounded values
     // more mantissa precision at the same bandwidth as BF16.
     SetKVCacheDataType(FLOAT16);
 }
 Inkling2Model::~Inkling2Model() { ShutdownRuntime(); }
+int Inkling2Model::draftKvHeadsOnDevice(int deviceId) const {
+    if (!cfg.draft.steps) return 0;
+    if (!runtime || !runtime->hasRankCaches()) return deviceId == placement.gpu ? cfg.draft.kvHeads : 0;
+    const auto &devices = placement.tensorDevices;
+    return std::find(devices.begin(), devices.end(), deviceId) == devices.end() ? 0 : cfg.draft.kvHeads / int(devices.size());
+}
 long long Inkling2Model::GetAutoWarmupCudaAdditionalCacheBytesPerToken(int deviceId) const {
     const auto &d = cfg.draft;
-    if (!d.steps || deviceId != placement.gpu) return 0;
+    const int heads = draftKvHeadsOnDevice(deviceId);
+    if (!heads) return 0;
     const auto layers = maxBatch > 0 ? std::count(d.local.begin(), d.local.end(), false) : d.layers;
-    return layers * 4LL * d.kvHeads * d.dim; // Separate FP16 K and V pools.
+    return layers * 4LL * heads * d.dim; // Separate FP16 K and V pools.
 }
 
 long long Inkling2Model::GetAutoWarmupCudaRuntimeReserveBytes(int deviceId, int batch) const {
     const auto &d = cfg.draft;
-    if (!d.steps || deviceId != placement.gpu) return 0;
+    const int heads = draftKvHeadsOnDevice(deviceId);
+    if (!heads) return 0;
     const int page = GetPageLen();
     const auto bounded = maxBatch > 0 ? std::count(d.local.begin(), d.local.end(), true) : 0;
     // Sliding histories can start inside a page. Global histories can cross
     // a page boundary while a speculative suffix is reserved for verification.
     const long long windowPages = (int64_t(d.window) + d.block + page - 2) / page + 1;
     const long long extraPages = (int64_t(d.block) - 1 + page - 1) / page;
-    return (bounded * windowPages + (d.layers - bounded) * extraPages) * page * std::max(1, batch) * 4LL * d.kvHeads *
+    return (bounded * windowPages + (d.layers - bounded) * extraPages) * page * std::max(1, batch) * 4LL * heads *
            d.dim;
 }
 
@@ -194,6 +205,16 @@ void Inkling2Model::InitParams() {
     placement.gpu = cudaId(SelectDeviceFromMap(deviceMap, 1, 1));
 #if defined(USE_CUDA) && !defined(USE_ROCM)
     placement.denseType = inkling2::projectionType(placement.gpu);
+    if (const char *spec = std::getenv("FASTLLM_TP")) {
+        std::map<int, int> ratios;
+        auto devices = ParseDeviceIds(spec, "cuda", ratios);
+        if (devices.size() > 1) {
+            if (devices.front() != placement.gpu || !ratios.empty() ||
+                std::set<int>(devices.begin(), devices.end()).size() != devices.size())
+                throw std::runtime_error("Inkling TP needs distinct equally weighted CUDA devices starting with the backbone GPU");
+            placement.tensorDevices = std::move(devices);
+        }
+    }
 #endif
     SetDataType(dataType);
     for (const auto &item : deviceMap)
@@ -283,12 +304,17 @@ void Inkling2Model::WarmUp() {
     if (SupportsDecodePipeline())
         runtime->warmupDecodeGraph();
 }
+int Inkling2Model::GetPrefillBatchKey(const ResponseContext &ctx, int chunkSize) const {
+    if (saveHistoryChat || ctx.prefillOffset || ctx.cacheLen || ctx.replayingKV || !ctx.multimodalInput.empty() ||
+        ctx.currentTokens.size() > size_t(chunkSize)) return -1;
+    return inkling2::pooledPromptKey(ctx.currentTokens.size(), ctx.generationConfig);
+}
 bool Inkling2Model::SupportsDecodePipeline() const {
     return runtime && GetFastllmEnv().cudaGraph;
 }
 std::unique_ptr<basellm::DecodePipeline> Inkling2Model::CreateDecodePipeline(
         const std::vector<ResponseContext *> &contexts) {
-    return contexts.size() == 1 && runtime ? runtime->pipeline(*contexts.front()) : nullptr;
+    return !contexts.empty() && runtime ? runtime->pipeline(contexts) : nullptr;
 }
 int Inkling2Model::Forward(const Data &ids, const Data &mask, const Data &pos,
                            std::vector<std::pair<Data, Data>> &cache, const GenerationConfig &sampling,

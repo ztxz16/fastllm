@@ -126,11 +126,46 @@ void plain_matmul(Rank a,const int*ids,const float*prob){
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.free(tm,BUFFERS<=3?32:BUFFERS<=7?64:128);}
 }
-template<bool G,int GS,int DS> __device__ __forceinline__
-void batched_matmul(Rank a,const int*ids,const float*prob){
+// Each cluster owns both K partitions of one expert/output tile. Exchange
+// the FP32 partials in distributed shared memory before rounding and K32
+// quantization. An even grid keeps both CTAs on the same tile on every pass.
+__device__ __forceinline__ void writePairedGate(Rank a,const float *prob,int expert,int job,int tile,
+                                               float *partial,const unsigned (&values)[8]) {
+ auto cluster=cooperative_groups::this_cluster();
+ int tid=threadIdx.x, half=cluster.block_rank();
+ #pragma unroll
+ for(int col=0;col<MAX_M;++col)partial[col*128+tid]=__uint_as_float(values[col]);
+ cluster.sync();
+ const float *peer=cluster.map_shared_rank(partial,half^1);
+ const int lane=tid%64,g=(lane/8)*16+lane%8;
+ #pragma unroll
+ for(int offset=0;offset<4;offset+=2){
+  int row=half*4+offset+tid/64,route=a.members[job*MAX_M+row];
+  if(route<0)continue;
+  int index=row*128+g;
+  float gate=__bfloat162float(__float2bfloat16_rn(__fadd_rn(partial[index],peer[index])));
+  float up=__bfloat162float(__float2bfloat16_rn(__fadd_rn(partial[index+8],peer[index+8])));
+  float v=__fmul_rn(__fmul_rn(gate/(1.f+__expf(-gate)),up),prob[route]),mx=fabsf(v);
+  for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,d));
+  unsigned e=exponent(mx);
+  VerifyOperand::write<I>(VerifyOperand::down(a,expert),row,tile*64+lane,__nv_fp8_e4m3(v*sf(254-e)).__x,e);
+ }
+ // Both CTAs' global stores must be visible to the Down TMA reader before
+ // publishing this tile. Even a CTA with no selected rows joins the barrier.
+ asm volatile("fence.proxy.async.global;":::"memory");
+ cluster.sync();
+ if(tid==0 && half==0){
+  [[maybe_unused]] unsigned old;
+  asm volatile("atom.acq_rel.gpu.global.or.b32 %0,[%1],%2;":"=r"(old):
+               "l"(a.gcount+VerifyOperand::ReadyOffset+job),"r"(1u<<tile):"memory");
+ }
+}
+template<bool G,int GS,int DS,bool Packed=false,bool PairedGate=false,bool StreamDown=false> __device__ __forceinline__
+void batched_matmul(Rank a,const float*prob){
   using E4=cutlass::float_e4m3_t;using UE=cutlass::float_ue8m0_t;
   using MMA=cute::SM100_MMA_MXF8F6F4_SS<E4,E4,float,UE,128,8,cute::UMMA::Major::K,cute::UMMA::Major::K>;
-  constexpr int NK=G?H:I,NN=G?2*I:H,SPLIT=G?GS:DS,PAGES=NK/128/SPLIT,BUFFERS=PAGES<4?PAGES:4;
+  constexpr int NK=G?H:I,NN=G?2*I:H,SPLIT=G?GS:DS,PAGES=NK/128/SPLIT,
+                STAGE_LIMIT=Packed?VerifyOperand::Stages:STAGES,BUFFERS=PAGES<STAGE_LIMIT?PAGES:STAGE_LIMIT;
   extern __shared__ __align__(1024) uint8_t arena[];
   auto wa=reinterpret_cast<uint8_t(*)[16384]>(arena);
   auto xb=reinterpret_cast<uint8_t(*)[1024]>(arena+BUFFERS*16384);
@@ -148,29 +183,52 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.allocate(BUFFERS<=3?32:BUFFERS<=7?64:128,&tm);al.release_allocation_lock();}
   __syncthreads();
-  auto idesc=fastllm_shared_flex::weight_instruction(a.mxfp4);
+  auto idesc=fastllm_shared_flex::weight_instruction(Packed || a.mxfp4);
   unsigned phase=0,load_phase[BUFFERS]={};
   for(int task=blockIdx.x;task<*a.nuniq*(NN/128)*SPLIT;task+=gridDim.x){
     int split=task%SPLIT,tile=task/SPLIT%(NN/128),job=task/((NN/128)*SPLIT);
-    int expert=a.uniq[job],member_count=a.rowcounts[job];
+    int expert=a.uniq[job],member_count=Packed?MAX_M:a.rowcounts[job];
     const uint8_t*x=G?a.xq:a.mid;
     const uint8_t*xs=G?a.xs:a.ms;
     const uint8_t*scales=G?a.gs:a.ds;
+    const int activationBytes = Packed ? VerifyOperand::Values + VerifyOperand::Scales : 0;
+    const int tileBytes = fastllm_shared_flex::weight_tile_bytes(Packed || a.mxfp4) + 512 + activationBytes;
+    const uint8_t *operand = G ? VerifyOperand::base(a) : VerifyOperand::down(a,expert);
     auto load_tile=[&](int kg,int b){
       if(tid==0){
         unsigned mb=(unsigned)__cvta_generic_to_shared(&loaded[b]);
-        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(fastllm_shared_flex::weight_tile_bytes(a.mxfp4)+512):"memory");
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _,[%0],%1;"::"r"(mb),"r"(tileBytes):"memory");
         tma3(wa[b],G?a.gmap:a.dmap,kg*128,tile*128,expert,&loaded[b]);
         bulk(sfa[b],scales+(size_t)expert*NN*(NK/32)+((size_t)kg*NN+tile*128)*4,512,&loaded[b]);
+        if constexpr (Packed) {
+          if constexpr(StreamDown){
+            static_assert(!G && Packed && DS==2 && I/64==32);
+            if(kg==split*PAGES){
+              // Weights are immutable and already in flight. Each Down split
+              // needs 16 consecutive 64-channel Gate tiles for this expert.
+              unsigned want=0xffffu<<(16*split),ready=0;
+              for(int spin=0;spin<128;++spin){
+                asm volatile("ld.acquire.gpu.global.u32 %0,[%1];":"=r"(ready):
+                             "l"(a.gcount+VerifyOperand::ReadyOffset+job):"memory");
+                if((ready&want)==want)break;
+              }
+              if((ready&want)!=want)cudaGridDependencySynchronize();
+            }
+          }
+          bulk(xb[b],operand + kg*VerifyOperand::Values,VerifyOperand::Values,&loaded[b]);
+          bulk(sfb[b],operand + NK/128*VerifyOperand::Values + kg*VerifyOperand::Scales,VerifyOperand::Scales,&loaded[b]);
+        }
       }
-      #pragma unroll
-      for(int j=tid;j<256;j+=128){int br=j/32,k=j%32*4;
-        int src=br<member_count?a.members[job*8+br]:0;
-        unsigned v=br<member_count?ld4(x+(G?(src/K)*H:src*I)+kg*128+k):0;
-        *reinterpret_cast<unsigned*>(xb[b]+br*128+(k^((br&7)*16)))=v;}
-      int br=tid%8,src=br<member_count?a.members[job*8+br]:0;
-      reinterpret_cast<unsigned*>(sfb[b])[(tid%32)*4+tid/32]=br<member_count?ld4(xs+(G?(src/K)*(H/32):src*(I/32))+kg*4):0x7f7f7f7fu;
-      asm volatile("fence.proxy.async.shared::cta;":::"memory");
+      if constexpr (!Packed) {
+        #pragma unroll
+        for(int j=tid;j<256;j+=128){int br=j/32,k=j%32*4;
+          int src=br<member_count?a.members[job*8+br]:0;
+          unsigned v=br<member_count?ld4(x+(G?(src/K)*H:src*I)+kg*128+k):0;
+          *reinterpret_cast<unsigned*>(xb[b]+br*128+(k^((br&7)*16)))=v;}
+        int br=tid%8,src=br<member_count?a.members[job*8+br]:0;
+        reinterpret_cast<unsigned*>(sfb[b])[(tid%32)*4+tid/32]=br<member_count?ld4(xs+(G?(src/K)*(H/32):src*(I/32))+kg*4):0x7f7f7f7fu;
+        asm volatile("fence.proxy.async.shared::cta;":::"memory");
+      }
     };
     for(int group=0;group<PAGES;group+=BUFFERS){
       for(int b=0;b<BUFFERS&&group+b<PAGES;++b)load_tile(split*PAGES+group+b,b);
@@ -201,8 +259,13 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
     float*out=G?a.gpartial:a.dpartial;
     unsigned values[8];cute::SM100_TMEM_LOAD_32dp32b8x::copy(tm+(unsigned(tid/32*32)<<16),values[0],values[1],values[2],values[3],values[4],values[5],values[6],values[7]);
     cutlass::arch::fence_view_async_tmem_load();
+    if constexpr(PairedGate){
+      static_assert(G && Packed && SPLIT==2);
+      asm volatile("tcgen05.fence::before_thread_sync;":::"memory");
+      writePairedGate(a,prob,expert,job,tile,reinterpret_cast<float*>(wa[0]),values);
+    }else{
     #pragma unroll
-    for(int col=0;col<8;++col)if(col<member_count){unsigned value=values[col];
+    for(int col=0;col<8;++col)if(Packed ? a.members[job*MAX_M+col]>=0 : col<member_count){unsigned value=values[col];
       size_t offset=((size_t)a.members[job*8+col]*SPLIT+split)*NN;
       __stcg(out+offset+tile*128+tid,__uint_as_float(value));
     }
@@ -212,8 +275,9 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
       __threadfence();__syncthreads();
       if(tid==0)last=atomicAdd(a.gcount+job*(2*I/128)+tile,1)==SPLIT-1;
       __syncthreads();
-      if(last && tid<64)for(int col=0;col<member_count;++col){
-        int source_job=a.members[job*8+col];
+      if(last && tid<64)for(int col=0;col<(Packed?MAX_M:member_count);++col){
+        int source_job=a.members[job*MAX_M+col];
+        if constexpr (Packed) { if (source_job < 0) continue; }
         int i=tile*64+tid,g=tile*128+(tid/8)*16+tid%8;
         float gv=0,uv=0;
         #pragma unroll
@@ -222,29 +286,48 @@ void batched_matmul(Rank a,const int*ids,const float*prob){
         gv=__bfloat162float(__float2bfloat16_rn(gv));uv=__bfloat162float(__float2bfloat16_rn(uv));
         float v=__fmul_rn(__fmul_rn(gv/(1.f+__expf(-gv)),uv),prob[source_job]),mx=fabsf(v);
         for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,d));
-        unsigned e=exponent(mx);a.mid[source_job*I+i]=__nv_fp8_e4m3(v*sf(254-e)).__x;
-        if(tid%32==0)a.ms[source_job*(I/32)+i/32]=e;
+        unsigned e=exponent(mx);
+        uint8_t q=__nv_fp8_e4m3(v*sf(254-e)).__x;
+        if constexpr (Packed) {
+          VerifyOperand::write<I>(VerifyOperand::down(a,expert),col,i,q,e);
+        } else {
+          a.mid[source_job*I+i]=q;
+          if(tid%32==0)a.ms[source_job*(I/32)+i/32]=e;
+        }
       }
+    }
     }
     __syncthreads();
   }
   if(tid<32){cute::TMEM::Allocator1Sm al;al.free(tm,BUFFERS<=3?32:BUFFERS<=7?64:128);}
 }
 __device__ __forceinline__ int split_for(Rank a){
- bool batch=USE_BATCH&&*a.nuniq*2<=*a.count;
+ bool batch=*a.nuniq*2<=*a.count;
  int work=batch?*a.nuniq:*a.count;
  return work<=1?8:4;
 }
 template<bool G> __global__ __launch_bounds__(128,2)
 void execute(Rank a,const int*ids,const float*prob){
  int split=split_for(a);
- if(USE_BATCH&&*a.nuniq*2<=*a.count){
-  if(split==8)batched_matmul<G,8,8>(a,ids,prob);
-  else batched_matmul<G,4,4>(a,ids,prob);
+ if(*a.nuniq*2<=*a.count){
+  if(split==8)batched_matmul<G,8,8>(a,prob);
+  else batched_matmul<G,4,4>(a,prob);
  }else{
   if(split==8)plain_matmul<G,8,8>(a,ids,prob);
   else plain_matmul<G,4,4>(a,ids,prob);
  }
+}
+// Process every distinct local expert once per output tile, even when only
+// two of the eight rows selected it.
+template<bool Gate,bool StreamDown=false> __global__ __launch_bounds__(128,1)
+void grouped_mxfp4_rows8(Rank a,const float *prob) {
+ if constexpr (!Gate) cudaTriggerProgrammaticLaunchCompletion();
+ batched_matmul<Gate,VerifyOperand::GateSplit,VerifyOperand::DownSplit,true,false,StreamDown>(a,prob);
+}
+__global__ __cluster_dims__(2,1,1) __launch_bounds__(128,1)
+void paired_gate_rows8(Rank a,const float *prob){
+ cudaTriggerProgrammaticLaunchCompletion();
+ batched_matmul<true,VerifyOperand::GateSplit,VerifyOperand::DownSplit,true,true>(a,prob);
 }
 template<int GS> __device__ __forceinline__
 void single_gate(Rank a,const int*ids,const float*prob){
@@ -403,24 +486,53 @@ __device__ __forceinline__ void publish_bf16(Rank a,int row,int pair,unsigned ge
   store_release(a.peers[peer]+bank+(size_t)(row*R+a.rank)*PH+pair,word);
 }
 
+template<int DS> __device__ __forceinline__ float2 roundedExpert(Rank a,int job,int pair) {
+  float2 expert=make_float2(0.f,0.f);
+  #pragma unroll
+  for(int sp=0;sp<DS;++sp){float2 v=reinterpret_cast<const float2*>(a.dpartial+((size_t)job*DS+sp)*H)[pair];
+   expert.x=__fadd_rn(expert.x,v.x);expert.y=__fadd_rn(expert.y,v.y);}
+  // Preserve the EP/Mega contract: round EACH full expert result to BF16.
+  __nv_bfloat162 ev=__floats2bfloat162_rn(expert.x,expert.y);return __bfloat1622float2(ev);
+}
 template<int DS> __device__ __forceinline__ void finish_impl(Rank a,__nv_bfloat16*y,const int*ids,int rows){
  if(blockIdx.y==0)a.gcount[blockIdx.x*128+threadIdx.x]=0;
  int pair=blockIdx.x*128+threadIdx.x,row=blockIdx.y;unsigned generation=(unsigned)*a.epoch;
- constexpr int ds=DS;
  float2 sum=make_float2(0.f,0.f);
  #pragma unroll
  for(int slot=0;slot<K;++slot){int job=row*K+slot;if(ids[job]/32!=a.rank)continue;
-  float2 expert=make_float2(0.f,0.f);
-  #pragma unroll
-  for(int sp=0;sp<ds;++sp){float2 v=reinterpret_cast<const float2*>(a.dpartial+((size_t)job*ds+sp)*H)[pair];
-   expert.x=__fadd_rn(expert.x,v.x);expert.y=__fadd_rn(expert.y,v.y);}
-  // Preserve the EP/Mega contract: round EACH full expert result to BF16.
-  __nv_bfloat162 ev=__floats2bfloat162_rn(expert.x,expert.y);expert=__bfloat1622float2(ev);
+  float2 expert=roundedExpert<DS>(a,job,pair);
   sum.x=__fadd_rn(sum.x,expert.x);sum.y=__fadd_rn(sum.y,expert.y);
  }
  unsigned payload=pack_bf16(sum.x,sum.y);publish_bf16(a,row,pair,generation,payload);
+ // The next SWA can stage immutable scales while the peers finish publishing.
+ if (rows == MAX_M) cudaTriggerProgrammaticLaunchCompletion();
  float2 total=collect_bf16(a,row,pair,generation,payload);
  reinterpret_cast<__nv_bfloat162*>(y+row*H)[pair]=__floats2bfloat162_rn(total.x,total.y);
+}
+// Rows with no local routes can send zero as soon as Down is launched.
+// The route IDs and epoch were published before the producer (Down).
+__global__ void finish_rows8(Rank a,__nv_bfloat16 *y,const int *ids) {
+ int pair=blockIdx.x*blockDim.x+threadIdx.x, row=blockIdx.y;
+ unsigned generation=unsigned(*a.epoch), mask=0;
+ #pragma unroll
+ for (int slot=0;slot<K;++slot)
+  if (ids[row*K+slot]/(E/R)==a.rank) mask|=1u<<slot;
+ bool empty=mask==0;
+ if (!empty) cudaGridDependencySynchronize();
+ float2 sum=make_float2(0.f,0.f);
+ while (mask) {
+  int slot=__ffs(mask)-1; mask&=mask-1;
+  float2 expert=roundedExpert<VerifyOperand::DownSplit>(a,row*K+slot,pair);
+  sum.x=__fadd_rn(sum.x,expert.x);sum.y=__fadd_rn(sum.y,expert.y);
+ }
+ unsigned payload=pack_bf16(sum.x,sum.y);
+ publish_bf16(a,row,pair,generation,payload);
+ cudaTriggerProgrammaticLaunchCompletion();
+ if (empty) cudaGridDependencySynchronize();
+ // Single-row Gate reuses these counters without a separate prepare.
+ if (row==0 && pair<K*(2*I/128)) a.gcount[pair]=0;
+ sum=collect_bf16(a,row,pair,generation,payload);
+ reinterpret_cast<__nv_bfloat162*>(y+row*H)[pair]=__floats2bfloat162_rn(sum.x,sum.y);
 }
 __global__ void finish(Rank a,__nv_bfloat16*y,const int*ids,int rows){
  if(split_for(a)==8)finish_impl<8>(a,y,ids,rows);else finish_impl<4>(a,y,ids,rows);

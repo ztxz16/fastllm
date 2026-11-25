@@ -1,7 +1,10 @@
+#include "devices/cuda/fastllm-cuda-graph-api.cuh"
 #include "devices/cuda/naive-n05-swa-settings.h"
+#include "devices/cuda/naive-n05-swa-verify.cuh"
 #include "devices/cuda/low_latency/router.cuh"
 #include "devices/cuda/low_latency/execution.h"
 #include "devices/cuda/fastllm-cuda-norm.cuh"
+#include "devices/cuda/fastllm-cuda-launch.cuh"
 #include "devices/cuda/fastllm-mxfp8-activation.cuh"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -1174,6 +1177,104 @@ __global__ void VerifyPackedSwaRope(const __grid_constant__ VerifyRopeBatch batc
     #pragma unroll
     for (int i = 0; i < 8; ++i) cache[dst * 8 + i] = elements[i];
 }
+// A CTA owns eight query heads of one candidate. Read earlier candidates
+// directly from QKV so KV publication never requires an inter-CTA barrier.
+__global__ __launch_bounds__(256) void PackedSwaVerify(const BF16 *qkv, const float *positions,
+        const int *live, const void *const *binding, const float *sink, float theta, BF16 scale,
+        FastllmMxfp8Activation packed, BF16 *out) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace naive_prefill_mma;
+    constexpr int heads = 64, kvHeads = 8, width = (heads + kvHeads) * 192 + kvHeads * 128;
+    const int row = blockIdx.x, kh = blockIdx.y, head = kh * 8;
+    const int t = threadIdx.x, warp = t / 32, lane = t % 32;
+    const int col = head * 128 + t * 8;
+    BF16 *result = out + size_t(row) * heads * 128;
+    // Live lengths, positions and committed KV precede the QKV projection.
+    // O can initialize its TMA descriptors while this CTA stages history.
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    const int length = live[row];
+    if (length <= 0) {
+#if __CUDA_ARCH__ >= 900
+        cudaGridDependencySynchronize();
+#endif
+        if (t < 128) {
+            *reinterpret_cast<uint4 *>(result + col) = make_uint4(0, 0, 0, 0);
+            fastllm_mxfp8::StoreZero8(packed, row, col);
+        }
+        return;
+    }
+    extern __shared__ __align__(16) unsigned char memory[];
+    auto &s = *reinterpret_cast<SwaQueryStorage<1> *>(memory);
+    __shared__ __align__(16) BF16 cosine[8][32], sine[8][32];
+    if (warp <= row) {
+        const float angle = positions[warp] * powf(theta, -2.f * lane / 64.f);
+        cosine[warp][lane] = __float2bfloat16_rn(cosf(angle));
+        sine[warp][lane] = __float2bfloat16_rn(sinf(angle));
+    }
+    const int keys = min(128, length), first = length - keys;
+    const int firstCandidate = max(0, row + 1 - keys), history = max(0, keys - row - 1);
+    auto *key = (BF16 *)binding[0];
+    auto *value = (BF16 *)binding[1];
+    for (int i = t; i < 128 * 24; i += 256) {
+        const int slot = i / 24, d = i % 24 * 8;
+        const BF16 *src = key + (((first + slot) & 127) * kvHeads + kh) * 192 + d;
+        naive_dsa_decode::Copy<true>(&s.tile.k[slot][d], src, slot < history);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    // K and V have independent shared tiles. Start both copies before scoring;
+    // only K must be resident for the QK MMA.
+    auto *valueTile = reinterpret_cast<BF16 (*)[136]>(memory + sizeof(s));
+    for (int i = t; i < 128 * 16; i += 256) {
+        const int slot = i / 16, d = i % 16 * 8;
+        const BF16 *src = value + (((first + slot) & 127) * kvHeads + kh) * 128 + d;
+        naive_dsa_decode::Copy<true>(&valueTile[slot][d], src, slot < history);
+    }
+    asm volatile("cp.async.commit_group; cp.async.wait_group 1;" ::: "memory");
+    if (t < 128) s.selected[t] = t < keys ? t : -1;
+    __syncthreads();
+#if __CUDA_ARCH__ >= 900
+    // The candidate vectors, and the borrowed QKV/O activation arena, are shared
+    // with the preceding projection. History loads above are independent.
+    cudaGridDependencySynchronize();
+#endif
+    if (lane < 24) {
+        uint4 q = reinterpret_cast<const uint4 *>(qkv + size_t(row) * width + (head + warp) * 192)[lane];
+        RotatePackedQK(q, lane, cosine[row], sine[row]);
+        *reinterpret_cast<uint4 *>(&s.q[0][warp][lane * 8]) = q;
+        if (warp >= firstCandidate && warp <= row) {
+            uint4 k = reinterpret_cast<const uint4 *>(qkv + size_t(warp) * width + (heads + kh) * 192)[lane];
+            RotatePackedQK(k, lane, cosine[warp], sine[warp]);
+            *reinterpret_cast<uint4 *>(&s.tile.k[history + warp - firstCandidate][lane * 8]) = k;
+            if (warp == row) reinterpret_cast<uint4 *>(key + ((128 + row) * kvHeads + kh) * 192)[lane] = k;
+        }
+    }
+    __syncthreads();
+    const int offsets[] = {0}, lengths[] = {keys};
+    SwaQueryScores(s, offsets, lengths, 1, sink, head, warp, lane);
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    if (warp >= firstCandidate && warp <= row && lane < 16) {
+        uint4 v = reinterpret_cast<const uint4 *>(qkv + size_t(warp) * width +
+            (heads + kvHeads) * 192 + kh * 128)[lane];
+        ScalePackedV(v, scale);
+        *reinterpret_cast<uint4 *>(&valueTile[history + warp - firstCandidate][lane * 8]) = v;
+        if (warp == row) reinterpret_cast<uint4 *>(value + ((128 + row) * kvHeads + kh) * 128)[lane] = v;
+    }
+    __syncthreads();
+    // Q is dead after the score MMA. Reuse its shared tile to emit BF16 and E4M3 together.
+    auto *tile = reinterpret_cast<BF16 *>(&s.q);
+    SwaQueryValues(s, offsets, tile, 0, 1, 8, 0, warp, lane, nullptr, {}, valueTile);
+    __syncthreads();
+    if (t < 128) {
+        const auto v = reinterpret_cast<const uint4 *>(tile)[t];
+        *reinterpret_cast<uint4 *>(result + col) = v;
+        fastllm_mxfp8::Store8(packed, row, col, v);
+    }
+#endif
+}
+
 #endif
 #endif
 
@@ -2772,6 +2873,11 @@ struct DeviceDraftBatch {
     const DraftBatchRow *rows;
     const uint64_t *cacheBindings = nullptr;
 };
+// In a singleton graph the descriptor fits in the kernel arguments. Only
+// the KV addresses change at replay and are read from the owner binding table.
+__device__ __forceinline__ DraftBatchRow DraftRow(const DraftBatchRow &row, int) {
+    return ResolveDraftRow(row);
+}
 __device__ __forceinline__ DraftBatchRow DraftRow(const DraftBatch &batch, int index) {
     return ResolveDraftRow(batch.rows[index]);
 }
@@ -2801,14 +2907,18 @@ using DraftFlashParams = flashinfer::SinglePrefillParams<BF16, BF16, BF16>;
 using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
     64, 1, 2, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone,
     BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
-__global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, DraftFlashParams p) {
+using DraftFlashSmallTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
+    16, 1, 1, 8, 8, 1, 4, flashinfer::PosEncodingMode::kNone,
+    BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
+template<class Batch, class Traits = DraftFlashTraits>
+__global__ __launch_bounds__(128) void BatchDraftFlash(Batch batch, DraftFlashParams p) {
     const auto r = DraftRow(batch, blockIdx.y);
     if (!r.key || !r.value) return; // Padding has no KV and no published output.
     p.q = const_cast<BF16 *>(r.input); p.k = r.key; p.v = r.value; p.o = r.output;
     p.kv_len = min(*r.live - 1, p.window_left) + p.qo_len;
     extern __shared__ uint8_t smem[];
-    auto &storage = *reinterpret_cast<DraftFlashTraits::SharedStorageSingle *>(smem);
-    flashinfer::SinglePrefillWithKVCacheDevice<DraftFlashTraits>(p, storage,
+    auto &storage = *reinterpret_cast<typename Traits::SharedStorageSingle *>(smem);
+    flashinfer::SinglePrefillWithKVCacheDevice<Traits>(p, storage,
         threadIdx, blockIdx.x, 0, blockIdx.z, 1, p.num_kv_heads);
 }
 #endif
@@ -3018,7 +3128,8 @@ bool FastllmCudaNaiveDraftCacheBindingsSupported(int count, int rows,
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
     return count > 0 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
         heads % kvHeads == 0 && heads / kvHeads <= 32 && dim == 128 && window >= rows &&
-        BulkKernelSupported(BatchDraftFlash, sizeof(DraftFlashTraits::SharedStorageSingle), 80);
+        (count == 1 ? BulkKernelSupported(BatchDraftFlash<DraftBatchRow>, sizeof(DraftFlashTraits::SharedStorageSingle), 80) :
+                      BulkKernelSupported(BatchDraftFlash<DeviceDraftBatch>, sizeof(DraftFlashTraits::SharedStorageSingle), 80));
 #else
     return false;
 #endif
@@ -3057,11 +3168,20 @@ bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
     Output(query, BFLOAT16, {1, raw.dims[1], heads * dim});
     for (int i = 0; i < count; ++i) descriptors[i].query = (BF16 *)query.cudaData + (size_t)i * rows * heads * dim;
     if (descriptorsWorkspace && (count > kDraftBatchLimit || cacheBindings)) {
-        DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace),
-            cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
-        BatchDraftQKV<<<dim3(heads + kvHeads, rows * count), 256, 0, cudaStreamPerThread>>>(batch,
-            (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
-            rows, heads, kvHeads, dim, window, eps, theta);
+        auto launch = [&](auto batch) {
+            BatchDraftQKV<<<dim3(heads + kvHeads, rows * count), 256, 0, cudaStreamPerThread>>>(batch,
+                (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
+                rows, heads, kvHeads, dim, window, eps, theta);
+        };
+        if (count == 1 && cacheBindings) {
+            auto row = descriptors.front();
+            row.cacheTable = static_cast<const void *const *>(cacheBindings->cudaData);
+            launch(row);
+        } else {
+            DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace),
+                cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
+            launch(batch);
+        }
         CheckLaunch();
         return true;
     }
@@ -3120,10 +3240,26 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
             dim, window - 1, 0.f, 1.f / sqrtf(float(dim)), 1.f, 10000.f);
         for (int i = 0; i < count; ++i)
             descriptors[i].output = (BF16 *)output.cudaData + (size_t)i * rows * heads * dim;
-        DeviceDraftBatch batch{DeviceDescriptors(descriptors, scores),
-            cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
-        BatchDraftFlash<<<dim3((rows * (heads / kvHeads) + 63) / 64, count, kvHeads),
-            dim3(32, 4, 1), shared, cudaStreamPerThread>>>(batch, params);
+        const dim3 grid((rows * (heads / kvHeads) + 63) / 64, count, kvHeads), block(32, 4, 1);
+        if (count == 1 && cacheBindings) {
+            auto row = descriptors.front();
+            row.cacheTable = static_cast<const void *const *>(cacheBindings->cudaData);
+            // Tile the packed query rows across CTAs for low-parallelism owner graphs.
+            constexpr size_t smallShared = sizeof(DraftFlashSmallTraits::SharedStorageSingle);
+            static_assert(!DraftFlashSmallTraits::IsInvalid());
+            const int packedRows = rows * (heads / kvHeads);
+            if (kvHeads <= 8 && packedRows > 16 && packedRows <= 64 && window >= 256 &&
+                BulkKernelSupported(BatchDraftFlash<DraftBatchRow, DraftFlashSmallTraits>, smallShared, 80)) {
+                BatchDraftFlash<DraftBatchRow, DraftFlashSmallTraits><<<dim3((packedRows + 15) / 16, 1, kvHeads),
+                    dim3(32, 1, 4), smallShared, cudaStreamPerThread>>>(row, params);
+            } else {
+                BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(row, params);
+            }
+        } else {
+            DeviceDraftBatch batch{DeviceDescriptors(descriptors, scores),
+                cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
+            BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(batch, params);
+        }
         CheckLaunch(); return true;
     }
 #endif
@@ -3208,8 +3344,49 @@ void FastllmCudaNaiveWriteAcceptedDraftKV(const fastllm::Data &raw, const void *
     CheckLaunch();
 }
 
-bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
-        int heads, int dim, int window, int reserve, float eps, float theta) {
+bool FastllmCudaNaivePrepareKVBody(void *child, int layers, FastllmNaiveKVBodyGraph &plan) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11010
+    if (!child || layers <= 0 || layers > kDraftKVLayersPerLaunch) return false;
+    cudaGraph_t graph = nullptr;
+    cudaGraphNode_t write = nullptr, record = nullptr;
+    cudaEvent_t kvReady = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    DraftKVDestinations dst{};
+    int rows = 1, heads = 1, dim = 128;
+    float eps = 1e-5f, theta = 10000.f;
+    void *args[]{&dst, &rows, &heads, &dim, &eps, &theta};
+    cudaKernelNodeParams params{};
+    params.func = reinterpret_cast<void *>(DraftNormRopeWrite);
+    params.gridDim = dim3(layers); params.blockDim = dim3(256); params.kernelParams = args;
+    size_t count = 0;
+    if (cudaGraphGetRootNodes(static_cast<cudaGraph_t>(child), nullptr, &count) != cudaSuccess || !count) {
+        cudaGetLastError(); return false;
+    }
+    // Both the body and the publication event depend on the completed KV write.
+    // The host can release the inputs independently of the body launch.
+    std::vector<cudaGraphNode_t> roots(count), dependencies(count);
+    if (cudaEventCreateWithFlags(&kvReady, cudaEventDisableTiming) == cudaSuccess &&
+        cudaGraphClone(&graph, static_cast<cudaGraph_t>(child)) == cudaSuccess &&
+        cudaGraphGetRootNodes(graph, roots.data(), &count) == cudaSuccess &&
+        cudaGraphAddKernelNode(&write, graph, nullptr, 0, &params) == cudaSuccess) {
+        std::fill(dependencies.begin(), dependencies.end(), write);
+        if (FastllmCudaGraphAddDependencies(graph, dependencies.data(), roots.data(), count) == cudaSuccess &&
+            cudaGraphAddEventRecordNode(&record, graph, &write, 1, kvReady) == cudaSuccess &&
+            cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess) {
+            plan = {graph, write, exec, kvReady};
+            return true;
+        }
+    }
+    if (exec) cudaGraphExecDestroy(exec);
+    if (graph) cudaGraphDestroy(graph);
+    if (kvReady) cudaEventDestroy(kvReady);
+    cudaGetLastError();
+#endif
+    return false;
+}
+
+static bool DraftKVImpl(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
+        int heads, int dim, int window, int reserve, float eps, float theta, const FastllmNaiveKVBodyGraph *plan, bool &submitted) {
     using namespace fastllm;
     if (updates.empty() || updates.size() > INT_MAX || heads <= 0 || dim <= 0 || dim > 256 || dim % 2 ||
         window <= 1 || reserve < 0 || (int64_t)heads * dim > INT_MAX / 2 ||
@@ -3291,23 +3468,52 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
             } else BatchDraftTrimColumns<<<dim3((2 * width + 255) / 256, count), 256>>>(trim);
             CheckLaunch();
         }
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11000
+        if (plan && plan->exec && count == updates.size()) {
+            void *args[]{&dst, &rows, &heads, &dim, &eps, &theta};
+            cudaKernelNodeParams params{};
+            params.func = reinterpret_cast<void *>(DraftNormRopeWrite);
+            params.gridDim = dim3(count * rows * heads); params.blockDim = dim3(256); params.kernelParams = args;
+            if (cudaGraphExecKernelNodeSetParams(static_cast<cudaGraphExec_t>(plan->exec),
+                    static_cast<cudaGraphNode_t>(plan->write), &params) == cudaSuccess) {
+                submitted = cudaGraphLaunch(static_cast<cudaGraphExec_t>(plan->exec), cudaStreamPerThread) == cudaSuccess;
+                return submitted;
+            }
+            cudaGetLastError();
+        }
+#endif
         DraftNormRopeWrite<<<count * rows * heads, 256, 0, cudaStreamPerThread>>>(dst, rows, heads, dim, eps, theta);
         CheckLaunch();
     }
     return true;
 }
 
+bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
+        int heads, int dim, int window, int reserve, float eps, float theta) {
+    bool submitted = false;
+    return DraftKVImpl(updates, heads, dim, window, reserve, eps, theta, nullptr, submitted);
+}
+
 bool FastllmCudaNaiveDraftKV(const std::vector<const fastllm::Data *> &raw,
         const std::vector<const fastllm::Data *> &norm, int start,
         std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
         int heads, int dim, int window, int reserve, float eps, float theta) {
+    bool submitted = false;
+    return FastllmCudaNaiveDraftKVWithBody(raw, norm, start, kv, heads, dim, window, reserve, eps, theta, nullptr, submitted);
+}
+
+bool FastllmCudaNaiveDraftKVWithBody(const std::vector<const fastllm::Data *> &raw,
+        const std::vector<const fastllm::Data *> &norm, int start,
+        std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+        int heads, int dim, int window, int reserve, float eps, float theta, const FastllmNaiveKVBodyGraph *plan, bool &submitted) {
+    submitted = false;
     if (raw.empty() || raw.size() != norm.size() || (!kv.empty() && kv.size() != raw.size())) return false;
     std::vector<std::pair<fastllm::Data, fastllm::Data>> empty;
     if (kv.empty()) empty.resize(raw.size());
     auto &target = kv.empty() ? empty : kv;
     std::vector<FastllmNaiveDraftKVUpdate> updates;
     for (size_t i = 0; i < raw.size(); ++i) updates.push_back({raw[i], norm[i], &target[i].first, &target[i].second, start});
-    if (!FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, reserve, eps, theta)) return false;
+    if (!DraftKVImpl(updates, heads, dim, window, reserve, eps, theta, plan, submitted)) return false;
     if (!empty.empty()) kv.swap(empty);
     return true;
 }
@@ -5935,6 +6141,10 @@ __global__ void AddRMSNormPackedRows(BF16 *hidden, const BF16 *branch, const flo
 }
 __global__ void AddRMSNormMxfp8(BF16 *hidden, const BF16 *branch, const float *gamma, BF16 *output,
                                 float eps, FastllmMxfp8Activation packed) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // A short-row QKV GEMM can initialize before the packed activations are ready.
+    if (packed.rows <= 8 && threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+#endif
     __shared__ __align__(16) BF16 normalized[4096];
     fastllm::cuda_norm::AddRMSNormBody<BF16, 4096, true, false>(
         hidden, branch, gamma, output, 4096, eps, false, SaveNormalized{normalized});
@@ -8066,6 +8276,58 @@ void FastllmCudaNaiveVerifyLengths(const fastllm::Data &positions, fastllm::Data
     VerifyPositionLengths<<<(count + 255) / 256, 256>>>(
         (const float *)positions.cudaData, (int *)lengths.cudaData, count);
     CheckLaunch();
+}
+
+bool FastllmCudaTryPackedSwaVerify(const fastllm::Data &qkv, const fastllm::Data &positions,
+        const fastllm::Data &live, const FastllmNaiveRopeCacheRow &binding, const fastllm::Data &sink,
+        int heads, int kvHeads, float theta, float valueScale, FastllmMxfp8Activation packed,
+        fastllm::Data &attention, bool overlapQkv) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+    using namespace fastllm;
+    const int arch = FastllmCudaRuntimeArch();
+    const int rows = packed.rows;
+    if ((arch != 100 && arch != 103) || heads != 64 || kvHeads != 8 || rows < 2 || rows > 8 ||
+        !packed.Matches(rows, heads * 128) || !binding.cache || binding.verifyOffset != 0 ||
+        binding.indexKey || !binding.key || !binding.value || !std::isfinite(theta) || theta <= 0 ||
+        !std::isfinite(valueScale)) return false;
+    const int device = FastllmCudaGetDevice();
+    auto resident = [&](const Data &d, DataType type) {
+        return d.dataDevice == CUDA && d.dataDeviceIds == std::vector<int>{device} && d.dataType == type &&
+               d.cudaData && (reinterpret_cast<uintptr_t>(d.cudaData) & 15) == 0;
+    };
+    auto ring = [&](const Data &d, int width) {
+        const auto &capacity = d.expansionDims.empty() ? d.dims : d.expansionDims;
+        return resident(d, BFLOAT16) && !d.isPagedKVCache && capacity.size() == 3 && capacity[0] == 1 &&
+            capacity[1] >= 128 + rows && capacity[2] == width && d.strides.size() == 3 &&
+            d.strides[1] == width && d.strides[2] == 1;
+    };
+    const int width = (heads + kvHeads) * 192 + kvHeads * 128;
+    if (!ring(*binding.key, kvHeads * 192) || !ring(*binding.value, kvHeads * 128) ||
+        !resident(qkv, BFLOAT16) || qkv.dims != std::vector<int>({1, rows, width}) ||
+        qkv.strides[1] != width || qkv.strides[2] != 1 ||
+        !resident(positions, FLOAT32) || positions.Count(0) != rows ||
+        !resident(live, INT32) || live.Count(0) != rows ||
+        (!sink.dims.empty() && (!resident(sink, FLOAT32) || sink.Count(0) != heads))) return false;
+    constexpr size_t shared = sizeof(naive_prefill_mma::SwaQueryStorage<1>) + 128 * 136 * sizeof(BF16);
+    if (!BulkKernelSupported(PackedSwaVerify, shared, 80)) return false;
+    Output(attention, BFLOAT16, {1, rows, heads * 128});
+    auto launch = [&](auto... args) {
+        if (overlapQkv) {
+            // The helper also checks the compiled PTX when a newer GPU uses a compatibility cubin.
+            return fastllm::cuda_launch::Launch<PackedSwaVerify>(
+                dim3(rows, kvHeads), dim3(256), shared, cudaStreamPerThread, args...);
+        }
+        PackedSwaVerify<<<dim3(rows, kvHeads), 256, shared, cudaStreamPerThread>>>(args...);
+        CheckLaunch();
+        return true;
+    };
+    return launch((const BF16 *)qkv.cudaData,
+        (const float *)positions.cudaData, (const int *)live.cudaData, binding.cache,
+        sink.dims.empty() ? nullptr : (const float *)sink.cudaData, theta, __float2bfloat16_rn(valueScale),
+        packed, (BF16 *)attention.cudaData);
+#else
+    return false;
+#endif
 }
 
 void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,

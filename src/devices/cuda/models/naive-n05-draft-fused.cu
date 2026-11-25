@@ -1,4 +1,5 @@
 #include "naive-n05-draft-fused.h"
+#include "naive-n05-draft-attention.cuh"
 #include "fastllm-cuda-graph-api.cuh"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -540,11 +541,16 @@ template<int Ctas> __device__ void DraftAttentionBody(SwaAttnArgs a,
         const_cast<B *>(a.kv_v)[offset] = a.v_blk[i];
     }
 }
-__global__ __launch_bounds__(kAttnThreads, 1) void FusedDraftAttention(
-        SwaAttnArgs a,const void *const *table,const int *live,int request,int requests) {
-    extern __shared__ __align__(128) unsigned char memory[];
-    DraftAttentionBody<128>(a,table,live,request,requests,memory);
-}
+struct ShardedAttention {
+    using Args = SwaAttnArgs;
+    static constexpr int Threads = kAttnThreads, MinBlocks = 1;
+    __device__ static void Run(const Args &a, unsigned char *memory, const void *const *table,
+            const int *live, int request, int requests) {
+        DraftAttentionBody<128>(a, table, live, request, requests, memory);
+    }
+};
+constexpr auto ShardedAttentionKernel =
+    FusedDraftAttention<ShardedAttention, const void *const *, const int *, int, int>;
 struct AttentionTileArgs { SwaAttnArgs requests[2]; };
 __global__ __launch_bounds__(kAttnThreads, 1) void FusedDraftAttentionTile(
         const __grid_constant__ AttentionTileArgs tile,const void *const *table,
@@ -573,10 +579,11 @@ __global__ __launch_bounds__(kAttnThreads,1) void FusedDraftAttentionRequests(
         }
     }
 }
-__global__ __launch_bounds__(kMlpThreads, 1) void FusedDraftMlp(const __grid_constant__ MlpArgs a) {
-    extern __shared__ __align__(128) unsigned char memory[];
-    MlpBody::run(a, memory);
-}
+struct ShardedMlp {
+    static constexpr int Threads = kMlpThreads, MinBlocks = 1;
+    using Args = MlpArgs;
+    __device__ static void Run(const Args &a, unsigned char *memory) { MlpBody::run(a, memory); }
+};
 struct MlpTileArgs { MlpArgs requests[2]; };
 __global__ __launch_bounds__(kMlpThreads, 1) void FusedDraftMlpTile(
         const __grid_constant__ MlpTileArgs tile) {
@@ -678,12 +685,12 @@ void LaunchDependent(bool enabled,Kernel kernel,dim3 grid,dim3 block,int shared,
 }
 void Configure(int device) {
     Check(cudaSetDevice(device));
-    Check(cudaFuncSetAttribute(FusedDraftAttention, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmem));
-    Check(cudaFuncSetAttribute(FusedDraftMlp, cudaFuncAttributeMaxDynamicSharedMemorySize, kMlpSmem));
+    Check(cudaFuncSetAttribute(ShardedAttentionKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kAttnSmem));
+    Check(cudaFuncSetAttribute(FusedDraftMlp<ShardedMlp>, cudaFuncAttributeMaxDynamicSharedMemorySize, kMlpSmem));
     int sms, attn, mlp;
     Check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
-    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&attn, FusedDraftAttention, kAttnThreads, kAttnSmem));
-    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mlp, FusedDraftMlp, kMlpThreads, kMlpSmem));
+    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&attn, ShardedAttentionKernel, kAttnThreads, kAttnSmem));
+    Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&mlp, FusedDraftMlp<ShardedMlp>, kMlpThreads, kMlpSmem));
     if (attn * sms < kAttnCtas || mlp * sms < kMlpCtas)
         throw std::runtime_error("fused draft requires a fully resident grid");
 }
@@ -732,7 +739,7 @@ SwaAttnArgs AttentionArguments(State &s,int rank,int request,int layer,const B *
 }
 void Attention(State &s,int rank,int request,int layer,const B *input,B *output,
         const int *live,const void *const *table,int requests,cudaStream_t stream) {
-    LaunchDependent(s.programmatic,FusedDraftAttention,kAttnCtas,kAttnThreads,kAttnSmem,stream,
+    LaunchDependent(s.programmatic,ShardedAttentionKernel,kAttnCtas,kAttnThreads,kAttnSmem,stream,
         AttentionArguments(s,rank,request,layer,input,output),table,live,request,requests);
 }
 template<int Requests>
@@ -765,7 +772,7 @@ MlpArgs MlpArguments(State &s, int rank, int request, int layer, const B *input,
     return a;
 }
 void Mlp(State &s, int rank, int request, int layer, const B *input, B *output, cudaStream_t stream) {
-    LaunchDependent(s.programmatic,FusedDraftMlp,kMlpCtas,kMlpThreads,kMlpSmem,stream,
+    LaunchDependent(s.programmatic,FusedDraftMlp<ShardedMlp>,kMlpCtas,kMlpThreads,kMlpSmem,stream,
         MlpArguments(s,rank,request,layer,input,output));
 }
 void MlpTile(State &s,int rank,int first,int layer,bool probe,cudaStream_t stream) {
@@ -827,6 +834,66 @@ void RunBody(State &s,int rank,int requests,B *hidden,const int *live,
 }
 }
 using namespace fastllm_draft_fused;
+extern "C" int FastllmDraftLocalAttentionPlan(int device, int rows, int heads, int kvHeads, int dim,
+        int window, int *partialFloats) {
+    using Op = ReplicaAttention;
+    if (rows < 7 || rows > 8 || heads != Op::Heads || kvHeads != Op::KVHeads || dim != Op::Dim ||
+        window < rows || window > 1024) return 0;
+    static thread_local int lastDevice = -1, blocks = 0;
+    if (device != lastDevice) {
+        cudaDeviceProp props{};
+        Check(cudaGetDeviceProperties(&props, device));
+        blocks = 0;
+        if (props.major == 10 && props.minor == 3 && props.cooperativeLaunch) {
+            int active = 0;
+            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,
+                FusedDraftAttention<ReplicaAttention>, Op::Threads, 0));
+            blocks = std::min(Op::Width / 8, active * props.multiProcessorCount);
+        }
+        lastDevice = device;
+    }
+    *partialFloats = ((window - 1 + rows + Op::Chunk - 1) / Op::Chunk) * heads * rows * Op::Stride;
+    return blocks;
+}
+
+extern "C" void FastllmDraftLocalAttentionRun(int blocks, const FastllmDraftLocalAttention &x, void *stream) {
+    using BF = ReplicaAttention::BF;
+    ReplicaAttention::Args a{static_cast<const BF *>(x.input), static_cast<const BF *>(x.qkvWeight),
+        static_cast<const BF *>(x.oWeight), x.qNorm, x.kNorm, x.postNorm, x.positions, x.live, x.binding,
+        static_cast<BF *>(x.raw), static_cast<BF *>(x.attention), static_cast<BF *>(x.residual),
+        static_cast<BF *>(x.output), x.partials, x.normScratch, x.rows, x.window, x.eps, x.theta};
+    void *params[] = {&a};
+    Check(cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(FusedDraftAttention<ReplicaAttention>),
+        blocks, ReplicaAttention::Threads, params, 0, stream ? static_cast<cudaStream_t>(stream) : cudaStreamPerThread));
+}
+extern "C" int FastllmDraftFusedLocalMlpBlocks(int device) {
+    // A cooperative grid must fit concurrently. Cache the check during warmup;
+    // launch geometry and weight addresses are independent of the request.
+    static thread_local int lastDevice = -1, blocks = 0;
+    if (device != lastDevice) {
+        cudaDeviceProp props{};
+        int active = 0;
+        Check(cudaGetDeviceProperties(&props, device));
+        blocks = 0;
+        if (props.major == 10 && props.minor == 3 && props.cooperativeLaunch) {
+            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active, FusedDraftMlp<ReplicaMlp>, ReplicaMlp::Threads, 0));
+            blocks = std::min(ReplicaMlp::Width / 8, active * props.multiProcessorCount);
+        }
+        lastDevice = device;
+    }
+    return blocks >= ReplicaMlp::Rows ? blocks : 0;
+}
+extern "C" void FastllmDraftFusedLocalMlpRun(int blocks, int rows, const void *normalized,
+        const void *gateUp, const void *down, void *middle, void *normScratch, void *residual,
+        const float *gamma, float eps, void *output, void *stream) {
+    ReplicaMlp::Args args{static_cast<const B *>(normalized), static_cast<const B *>(gateUp),
+        static_cast<const B *>(down), static_cast<B *>(middle), static_cast<float *>(normScratch),
+        static_cast<B *>(residual), static_cast<B *>(output), gamma, eps, rows};
+    void *params[] = {&args};
+    Check(cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(FusedDraftMlp<ReplicaMlp>),
+        blocks, ReplicaMlp::Threads, params, 0, stream ? static_cast<cudaStream_t>(stream) : cudaStreamPerThread));
+}
 extern "C" bool FastllmDraftFusedSupported(const int *devices, int ranks) {
     if (!devices || ranks != 8) return false;
     for (int i = 0; i < ranks; ++i) {
@@ -1558,7 +1625,7 @@ extern "C" void *FastllmDraftFusedAcceptedBodyCreate(void *opaque,int rank,void 
             if (type != cudaGraphNodeTypeKernel) continue;
             cudaKernelNodeParams p{};
             Check(cudaGraphKernelNodeGetParams(node,&p));
-            if (p.func == reinterpret_cast<void *>(FusedDraftAttention) && p.kernelParams &&
+            if (p.func == reinterpret_cast<void *>(ShardedAttentionKernel) && p.kernelParams &&
                 static_cast<SwaAttnArgs *>(p.kernelParams[0])->layer==0) firstAttention=node;
             if (p.func == reinterpret_cast<void *>(FinishNormalized)) {
                 if (norm || !p.kernelParams) throw std::runtime_error("Unsupported draft normalization");
@@ -1601,7 +1668,7 @@ extern "C" void *FastllmDraftFusedAcceptedBodyCreate(void *opaque,int rank,void 
         cudaKernelNodeParams mp{},np{};
         Check(cudaGraphKernelNodeGetParams(mlp,&mp));
         Check(cudaGraphKernelNodeGetParams(norm,&np));
-        if (mp.func!=reinterpret_cast<void *>(FusedDraftMlp))
+        if (mp.func!=reinterpret_cast<void *>(FusedDraftMlp<ShardedMlp>))
             throw std::runtime_error("Unsupported last draft MLP");
         size_t children=0;
         Check(FastllmCudaGraphNodeGetDependentNodes(norm,nullptr,&children));

@@ -96,12 +96,13 @@ template<class T> struct MarkovProposalScores {
     int baseStride, vocab;
     float cap;
     __device__ T raw(int row, int id) const {
+        if (!adjust) return base[size_t(row) * baseStride + id];
         if constexpr (std::is_same_v<T, float>)
             return (base[size_t(row) * baseStride + id] + adjust[size_t(row) * vocab + id]) + bias[id];
         const T correction = T(float(adjust[size_t(row) * vocab + id]) + float(bias[id]));
         return T(float(base[size_t(row) * baseStride + id]) + float(correction));
     }
-    __device__ T softcap(T value) const { return T(cap * tanhf(float(value) / cap)); }
+    __device__ T softcap(T value) const { return adjust ? T(cap * tanhf(float(value) / cap)) : value; }
     __device__ T operator()(int row, int id) const { return softcap(raw(row, id)); }
 };
 
@@ -269,39 +270,6 @@ __global__ void SampleGraphDrawSupport(const float *scratch, const int *counts, 
     }
     __syncthreads();
     if (prefix < draw && draw <= prefix + mass) tokens[size_t(row) * tokenStride] = int(key >> 32);
-}
-
-// Two radix digits identify a guaranteed lower bound on the kth FP32 score.
-// All scores in or above that bucket are collected. Only a complete candidate
-// set fits the compact draw; otherwise the original sampler resolves the tail.
-__global__ void CollectFoldSupport(const float *scores, int vocab, const int *topK, int *count, float2 *support,
-                                   flashinfer::sampling::RadixRowState *state, int chunk, const int *done, bool first) {
-    using namespace flashinfer::sampling;
-    using Traits = RadixTopKTraits<float>;
-    const int k = *topK;
-    if (k < 1 || k > kCompactGraphDraw || k >= vocab || (!first && !*done)) return;
-    const int begin = blockIdx.x * chunk, length = min(chunk, vocab - begin);
-    extern __shared__ unsigned ordered[];
-    __shared__ unsigned hist[256], suffix[256], scalars[2];
-    bool invalid = false;
-    for (int i = threadIdx.x; i < length; i += blockDim.x) {
-        const float v = scores[begin + i];
-        invalid |= !isfinite(v);
-        ordered[i] = Traits::ToOrdered(v == 0.f ? 0.f : v);
-    }
-    if (__syncthreads_or(invalid) && !threadIdx.x) atomicAdd(count, kCompactGraphDraw + 1);
-    unsigned prefix = 0, remaining = k;
-    int phase = 0;
-#pragma unroll
-    for (unsigned digit = 0; digit < 2; ++digit)
-        RadixSelectOneRound<kGraphRadixThreads, false>(ordered, length, hist, suffix, scalars, state,
-            prefix, remaining, digit, 0, phase, gridDim.x, blockIdx.x, threadIdx.x, &prefix, &remaining);
-    for (int i = threadIdx.x; i < length; i += blockDim.x) {
-        if (ordered[i] < prefix) continue;
-        const int at = atomicAdd(count, 1);
-        if (at < kCompactGraphDraw)
-            support[at] = make_float2(Traits::FromOrdered(ordered[i]), __int_as_float(begin + i));
-    }
 }
 
 template<class T>

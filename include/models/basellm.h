@@ -735,6 +735,8 @@ namespace fastllm {
         // target preserves the existing scheduler, and zero wait batches only
         // requests already queued. Unsupported models keep their old policy.
         virtual bool SupportsPrefillBatching() const { return false; }
+        // A negative key or unequal keys keep the ordinary scheduler for this pass.
+        virtual int GetPrefillBatchKey(const ResponseContext &, int chunkSize) const { return 0; }
         // Stable attention owner while queued; cache ownership is not migrated
         // by the scheduler. Models without DP keep the single FIFO group.
         virtual int GetPrefillBatchGroup(const ResponseContext *) const { return 0; }

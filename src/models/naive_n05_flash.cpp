@@ -967,6 +967,9 @@ Data NaiveN05FlashModel::RunTarget(
             minLocalRows = std::min(minLocalRows, (int)rows.size());
         }
     }
+    const bool singleSlotVerification = localMoeRows && graphVerify && minLocalRows == maxLocalRows &&
+        std::all_of(attentionParallel->groups.begin(), attentionParallel->groups.end(),
+            [](const auto &group) { return group.lengths.size() == 1; });
     // A TP worker keeps its device; layer-mapped execution can switch devices between calls.
     const auto rankCaps = tensorParallel ? FastllmCudaNaiveAttentionCapabilities() : NaiveAttentionCapabilities{};
     auto attentionCaps = [&] { return tensorParallel ? rankCaps : FastllmCudaNaiveAttentionCapabilities(); };
@@ -1073,7 +1076,8 @@ Data NaiveN05FlashModel::RunTarget(
         graphVerify && !attentionParallel && tensorParallel && batch && capture->ringVerify ? &batch->lengths : nullptr,
         tpSwaRingCache, !expertUpdatesResidual && (!tpEp8MegaState || experts),
         indexerCompute == NaiveIndexerCompute::Auto && !sparseKv && !HasSeparateIndexer() && !indexerLayerSharding && indexFp8,
-        buf.capacity, indexHeads, indexDim, indexTopK);
+        buf.capacity, indexHeads, indexDim, indexTopK,
+        graphVerify && attentionParallel && capture->ringVerify && buf.cacheTable ? AttentionTPSize() : 0);
     // Keep the previous FFN branch separate until every fused attention CTA has read the
     // old residual. The fused call adds it after all attention readers finish.
     Data *pendingMlp = nullptr, *pendingFeature = nullptr;
@@ -1155,7 +1159,7 @@ Data NaiveN05FlashModel::RunTarget(
                 localWeight(prefix+".mlp.gate_proj.weight"),localWeight(prefix+".mlp.up_proj.weight"),
                 localWeight(prefix+".mlp.down_proj.weight"),localWeight(prefix+".post_attention_layernorm.weight"),
                 rms_norm_eps,workspace?buf.denseGate:buf.w1,workspace?buf.denseDown:buf.w2);
-        bool attentionLayerReady = false, attentionRouterReady = false, routerNeedsNorm = false;
+        bool projectedOnly = false, attentionLayerReady = false, attentionRouterReady = false, routerNeedsNorm = false;
         FastllmMoePreparedInput preparedInput{};
         const FastllmMoePreparedInput *prepared = nullptr;
         bool attentionInputPrepared = false;
@@ -1198,7 +1202,7 @@ Data NaiveN05FlashModel::RunTarget(
         int rotaryDim = (int)(cfg.headDim * partialRotary);
 #ifndef USE_ROCM
         if (handoff && moeLayers[layer] &&
-            handoff->PreparedInput(tpRank, length, preparedInput, expertIndex, expertScore,
+            handoff->PreparedInput(tpRank, layer, length, preparedInput, expertIndex, expertScore,
                 localWeight(prefix + ".mlp.gate.e_score_correction_bias"), hidden,
                 norm_topk_prob, routed_scaling_factor) &&
             FastllmCudaSwaPreparedRouterSupported(gpu, false, length)) {
@@ -1206,13 +1210,13 @@ Data NaiveN05FlashModel::RunTarget(
             // selection is unavailable on any rank of this TP group.
             if (preparedInput.routed && !FastllmCudaSwaPreparedRouterSupported(gpu, true))
                 preparedInput.routed = false;
-            prepared = &preparedInput;
+            if (preparedInput.epRank<0 || preparedInput.routed) prepared = &preparedInput;
         }
 #endif
 #ifndef USE_ROCM
         const bool ring = slidingLayers[layer];
         const auto layerPlan = verifyPlan.ForLayer(ring, pendingMlp, localIndexer,
-            verifyPlan.packed && batch && batch->Size() == 1 && capture->ringVerify && buf.cacheTable &&
+            batch && batch->Size() == 1 && capture && capture->ringVerify && buf.cacheTable &&
                 !initialNormPending && weight.weight.count(ap + "mergeqkv.weight"),
             tpSwaRingCache, contextSharded && !sparseLayer && indexFp8 && indexerCompute == NaiveIndexerCompute::FP8);
         if (layerPlan) {
@@ -1235,7 +1239,8 @@ Data NaiveN05FlashModel::RunTarget(
                 input.topK = indexTopK;
                 input.indexHeads = indexHeads;
                 input.indexDim = indexDim;
-                input.fp8Query = fp8IndexerCache;
+                input.fp8Query = indexFp8;
+                input.fp8IndexerCache = fp8IndexerCache;
             }
             input.outputWeight = &localWeight(ap + "o_proj.weight");
             input.postNorm = &localWeight(prefix + ".post_attention_layernorm.weight");
@@ -1272,6 +1277,9 @@ Data NaiveN05FlashModel::RunTarget(
             }
             input.sliding = ring;
             input.packedTp = layerPlan.packed;
+            input.replica = layerPlan.replica;
+            input.qkv = &qkv;
+            input.projectionScratch = buf.verifyProjectionScratch;
             input.config = {cfg.heads, cfg.kvHeads, cfg.headDim, cfg.valueDim, rotaryDim, window,
                             rms_norm_eps, cfg.theta, valueScale};
             input.qkvActivation = preparedQkv;
@@ -1279,6 +1287,7 @@ Data NaiveN05FlashModel::RunTarget(
             input.deferPostNorm = denseFused || (layerPlan.packed && withRouter && moeLayers[layer] &&
                 !shardRouter && !localMoe && num_experts_per_tok == 8);
             const auto result = FastllmCudaVerifyAttention(input, gpu, withRouter ? prepared : nullptr);
+            projectedOnly = result == FastllmVerifyOutput::Projected;
             attentionLayerReady = result != FastllmVerifyOutput::Unsupported;
             attentionRouterReady = result == FastllmVerifyOutput::Router;
             routerNeedsNorm = result == FastllmVerifyOutput::DeferredNorm;
@@ -2569,6 +2578,7 @@ Data NaiveN05FlashModel::RunTarget(
         }
         } // Generic attention/projection.
         } // Local attention rows.
+        if (projectedOnly) attentionLayerReady = false; // The common residual/norm consumes the local projection.
         if (attentionParallel && !ownerRows) {
             projected.dataType = BFLOAT16; projected.UpdateUnitSize();
             projected.Resize({1, length, embed_dim}); projected.ToDevice(CUDA, {gpu}, false); projected.Allocate(false);
@@ -2847,7 +2857,8 @@ Data NaiveN05FlashModel::RunTarget(
                     expertIndex, expertScore, moeOutput, maxLocalRows,
                     decodeWorkspace ? (const int *)localDP->liveKeys.cudaData : nullptr,
                     decodeWorkspace ? nullptr : &routerInput,
-                    !decodeWorkspace && !verifying ? minLocalRows : 0);
+                    !decodeWorkspace && !verifying ? minLocalRows : 0,
+                    singleSlotVerification);
             } else if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, decodeWorkspace || shardMoe,

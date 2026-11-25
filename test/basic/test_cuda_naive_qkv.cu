@@ -2,7 +2,9 @@
 // workspace, mutable page tables, ring wrap, and rejection without side effects.
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-swa-verify.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cmath>
@@ -444,6 +446,98 @@ void VerifyBatch(int requests, int mode, DataType type) {
     Require(before == result(), "failed preflight changed earlier request");
 }
 
+void VerifyPackedSwa(int rows) {
+    constexpr int heads = 64, kv = 8, cols = heads * 128;
+    Data raw(BFLOAT16), q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), out(BFLOAT16), reference(BFLOAT16);
+    Data live(INT32), positions(FLOAT32), table(INT32), arena(INT32), sink(FLOAT32);
+    Init(raw, {1, rows, (heads + kv) * 192 + kv * 128});
+    std::mt19937 rng(29);
+    std::normal_distribution<float> normal;
+    std::vector<__nv_bfloat16> input(raw.Count(0));
+    for (auto &x : input) x = __float2bfloat16_rn(normal(rng));
+    Check(cudaMemcpy(raw.cudaData, input.data(), raw.GetBytes(), cudaMemcpyHostToDevice));
+    Init(q, {1, rows, heads * 192}); Init(k, {1, rows, kv * 192}); Init(v, {1, rows, kv * 128});
+    Init(live, {rows}); Init(positions, {1, rows}); Init(table, {8}); Init(sink, {heads});
+    std::vector<float> biases(heads);
+    for (int h = 0; h < heads; ++h) biases[h] = (h % 11 - 5) * .2f;
+    Check(cudaMemcpy(sink.cudaData, biases.data(), heads * sizeof(float), cudaMemcpyHostToDevice));
+    const int pitch = (rows + 3) / 4 * 4;
+    Init(arena, {pitch * cols * 33 / 128});
+    auto *values = static_cast<uint8_t *>(arena.cudaData);
+    FastllmMxfp8Activation pack{values, values + pitch * cols, rows, cols, pitch};
+    Data key[2] = {Data(BFLOAT16), Data(BFLOAT16)}, value[2] = {Data(BFLOAT16), Data(BFLOAT16)};
+    for (int i = 0; i < 2; ++i) {
+        Init(key[i], {1, 136, kv * 192}); Init(value[i], {1, 136, kv * 128});
+        Fill(key[i], 88 + i); Fill(value[i], 14 + i);
+    }
+    auto binding = reinterpret_cast<const void *const *>(table.cudaData);
+    std::vector<FastllmNaiveRopeCacheRow> caches(rows);
+    std::vector<FastllmNaiveSWARow> bindings(rows);
+    for (int i = 0; i < rows; ++i) {
+        caches[i] = {key, value, nullptr, binding}; caches[i].verifyOffset = i;
+        bindings[i] = {key->cudaData, value->cudaData, binding}; bindings[i].verifyOffset = i;
+    }
+    auto launch = [&] {
+        return FastllmCudaTryPackedSwaVerify(raw, positions, live, caches.front(), sink,
+            heads, kv, 10000, .707f, pack, out, true);
+    };
+    Check(cudaMemset(live.cudaData, 0, live.GetBytes())); Check(cudaMemset(table.cudaData, 0, table.GetBytes()));
+    Require(launch(), "packed SWA warmup declined");
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    Require(launch(), "packed SWA graph capture declined");
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &graph)); Check(cudaGraphInstantiate(&exec, graph, 0));
+    double worst = 0;
+    for (int past : {0, 126, 16384, -1}) {
+        const int owner = past == 0 || past == 16384 ? 0 : 1;
+        std::vector<float> pos(rows); std::vector<int> lengths(rows);
+        for (int i = 0; i < rows; ++i) {
+            pos[i] = past < 0 ? -1 : past + i;
+            lengths[i] = past < 0 || (past == 126 && i + 1 == rows) ? 0 : past + i + 1;
+        }
+        void *ptrs[] = {past < 0 ? nullptr : key[owner].cudaData, past < 0 ? nullptr : value[owner].cudaData};
+        Check(cudaMemcpy(table.cudaData, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(positions.cudaData, pos.data(), rows * sizeof(float), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(live.cudaData, lengths.data(), rows * sizeof(int), cudaMemcpyHostToDevice));
+        Fill(key[owner], 83 + owner); Fill(value[owner], 57 + owner);
+        Require(FastllmCudaNaiveBatchRopeAppendCache(q, k, v, positions, caches, live, heads,
+            kv, 192, 128, 64, 10000, .707f, 128, &raw), "packed SWA reference append declined");
+        FastllmCudaNaiveBatchSWADecode(q, sink, bindings, live, heads, kv, reference);
+        auto rk = Read(key[owner]), rv = Read(value[owner]), ref = Read(reference);
+        Fill(key[owner], 83 + owner); Fill(value[owner], 57 + owner);
+        Check(cudaMemset(arena.cudaData, 0xcd, arena.GetBytes()));
+        Check(cudaGraphLaunch(exec, cudaStreamPerThread)); Check(cudaStreamSynchronize(cudaStreamPerThread));
+        Require(Read(key[owner]) == rk && Read(value[owner]) == rv, "packed SWA candidate KV differs");
+        const auto result = Read(out), encoded = Read(arena);
+        const auto *actual = reinterpret_cast<const __nv_bfloat16 *>(result.data());
+        const auto *expected = reinterpret_cast<const __nv_bfloat16 *>(ref.data());
+        for (int row = 0; row < rows; ++row) {
+            double error = 0., norm = 0.;
+            for (int col = 0; col < cols; col += 32) {
+                const int offset = row * cols + col;
+                float mx = 0.f;
+                for (int j = 0; j < 32; ++j) {
+                    float a = float(actual[offset+j]), b = float(expected[offset+j]);
+                    mx = std::max(mx, std::abs(a)); error += double(a-b)*(a-b); norm += double(b)*b;
+                }
+                int exp = mx > 0 ? std::clamp(int(std::ceil(std::log2(mx / 448.f))) + 127, 1, 254) : 1;
+                Require(encoded[pitch*cols + (col/128*pitch+row)*4 + col/32%4] == exp, "packed SWA O scale differs");
+                for (int j = 0; j < 32; ++j)
+                    Require(encoded[offset+j] == __nv_fp8_e4m3(std::ldexp(float(actual[offset+j]), 127-exp)).__x,
+                            "packed SWA O value differs");
+            }
+            const double l2 = std::sqrt(error / std::max(norm, 1.e-30));
+            Require(l2 < .005, "packed SWA output exceeds relative L2 tolerance");
+            worst = std::max(worst, l2);
+        }
+    }
+    auto saved = Read(out);
+    Require(!FastllmCudaTryPackedSwaVerify(raw, positions, live, caches.front(), sink,
+        32, kv, 10000, .707f, pack, out) && Read(out) == saved, "unsupported SWA modified output");
+    Check(cudaGraphExecDestroy(exec)); Check(cudaGraphDestroy(graph));
+    printf("PACKED_SWA_PASS rows=%d max_row_l2=%.8g KV/pack exact, rebound graph\n", rows, worst);
+}
+
 }
 int main(int argc,char**argv) {
     try {
@@ -461,6 +555,12 @@ int main(int argc,char**argv) {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         Check(cudaSetDevice(0));
+        if (argc > 1 && std::strcmp(argv[1], "--packed-swa") == 0) {
+            const int arch = FastllmCudaRuntimeArch();
+            if (CUDART_VERSION < 12080 || (arch != 100 && arch != 103)) return 77;
+            for (int rows = 2; rows <= 8; ++rows) VerifyPackedSwa(rows);
+            return 0;
+        }
         if(attention){if(FastllmCudaRuntimeArch()!=103)return 77;VerifyQkvAttention(disabled);return 0;}
         for (auto type : {BFLOAT16, FP8_E4M3})
             for (int mode : {0, 1, 2}) for (int batch : {2, 8, 40}) VerifyBatch(batch, mode, type);

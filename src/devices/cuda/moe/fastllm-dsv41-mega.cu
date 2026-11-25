@@ -472,7 +472,7 @@ template <bool Shared, bool Local = false, bool Post = false, bool Draft = false
         r.a1, r.s1, r.w1, r.ws1, r.d1,
         r.a2, r.s2, r.w2, r.ws2,
         sh.a1, sh.s1, sh.w1, sh.ws1, sh.d1,
-        sh.a2, sh.s2, sh.w2, sh.ws2, (const uint8_t *)layer->domains));
+        sh.a2, sh.s2, sh.w2, sh.ws2, (const uint8_t *)layer->domains, dg::PackedTokenInput{}));
     if (ownerOutput) {
         if (!localRows) return;
         if constexpr (Local && Post) {

@@ -196,9 +196,9 @@ void DeviceFilterCase() {
     std::puts("DEVICE_FILTER_GRAPH_PASS 24 distributions, 49152 replays, saved q and RNG checked");
 }
 #ifndef USE_ROCM
-void IndexedBf16ProjectionCase() {
+void IndexedBf16ProjectionCase(int vocab) {
     using namespace fastllm;
-    constexpr int vocab = 131, width = 256;
+    constexpr int width = 256;
     std::vector<float> embed(vocab * width), projection(embed.size());
     for (int i = 0; i < vocab * width; ++i) {
         embed[i] = (i * 13 % 19 - 9) / 32.f;
@@ -891,7 +891,8 @@ int main() {
         FilterCase();
         DeviceFilterCase();
 #ifndef USE_ROCM
-        IndexedBf16ProjectionCase();
+        IndexedBf16ProjectionCase(131);
+        IndexedBf16ProjectionCase(65539);
 #endif
         MarkovGraphCase();
         MarkovDrawPlateauCase();

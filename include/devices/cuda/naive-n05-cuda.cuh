@@ -86,6 +86,15 @@ bool FastllmCudaNaiveDraftKV(const std::vector<const fastllm::Data *> &raw,
     const std::vector<const fastllm::Data *> &norm, int start,
     std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
     int heads, int dim, int window, int reserve, float eps, float theta);
+struct FastllmNaiveKVBodyGraph {
+    void *graph = nullptr, *write = nullptr, *exec = nullptr, *kvReady = nullptr;
+};
+bool FastllmCudaNaivePrepareKVBody(void *child, int layers, FastllmNaiveKVBodyGraph &plan);
+bool FastllmCudaNaiveDraftKVWithBody(const std::vector<const fastllm::Data *> &raw,
+    const std::vector<const fastllm::Data *> &norm, int start,
+    std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+    int heads, int dim, int window, int reserve, float eps, float theta, const FastllmNaiveKVBodyGraph *plan, bool &submitted);
+
 
 // Project a shared BF16 input [1, rows, inner] through per-layer K/V row
 // views [columns, inner]. Output [layers, rows, columns] and pointer scratch

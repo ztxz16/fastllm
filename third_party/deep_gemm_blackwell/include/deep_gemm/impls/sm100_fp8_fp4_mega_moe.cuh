@@ -18,6 +18,8 @@
 
 namespace fastllm_blackwell_mega {
 
+struct PackedTokenInput { static constexpr unsigned maxRows = 0; };
+
 template <
     uint32_t kNumMaxTokensPerRank,
     uint32_t kHidden, uint32_t kIntermediateHidden,
@@ -40,6 +42,7 @@ template <
     bool kHasShared = (kNumSharedExperts > 0),
     bool kRegisterPull = false,
     bool kSingleHistogram = false,
+    typename TokenInput = PackedTokenInput,
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
     uint32_t L2_SHAPE_N = kHidden,
@@ -79,7 +82,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_shared_l2_weights_sf,
-                            const uint8_t* sm_locality_domains) {
+                            const uint8_t* sm_locality_domains, TokenInput input) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
@@ -377,13 +380,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if constexpr (sparse_dispatch)
             if (thread_idx == 0) pull_counter = *workspace.get_nvl_barrier_counter_ptr();
 
+        // Publish the source payload before the existing grid and peer release.
+        // The histogram reads the original route directly, without a grid wait.
+        if constexpr (TokenInput::maxRows) input.publish(buffer, num_tokens, thread_idx, kNumDispatchThreads);
         if constexpr (kSingleHistogram) {
             // At the EP8 decode cap, at most 192 (token, expert) pairs originate
             // at this rank. One CTA assigns all source slots in its own histogram.
-            static_assert(kNumMaxTokensPerRank * kNumTopk <= 2 * kNumDispatchThreads);
+            static_assert(kNumMaxTokensPerRank * kNumTopk <= 2 * kNumDispatchThreads ||
+                (TokenInput::maxRows && TokenInput::maxRows * kNumTopk <= 2 * kNumDispatchThreads));
             if (sm_idx == 0) {
                 for (uint32_t slot = thread_idx; slot < num_tokens * kNumTopk; slot += kNumDispatchThreads) {
-                    const int expert = static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[slot]);
+                    int expert;
+                    if constexpr (TokenInput::maxRows) expert = input.route(slot);
+                    else expert = static_cast<int>(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[slot]);
                     if (expert < 0) continue;
                     const auto pos = atomicAdd_block(shared_storage.expert_token_count + expert, 1);
                     const auto addr = workspace.get_src_token_topk_idx_ptr(
@@ -1511,6 +1520,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
         const auto grid_idx = ptx::get_grid_idx() + 1;
+        if constexpr (TokenInput::maxRows) {
+            // One 16-byte vector per lane. Spread small outputs across CTAs so a
+            // single warp need not pipeline the entire row through shared memory.
+            constexpr unsigned tile = 32 * sizeof(uint4) / sizeof(nv_bfloat16);
+            static_assert(kHidden % tile == 0 && !kHasShared && kNumTopk <= 32);
+            constexpr unsigned tiles_per_row = kHidden / tile;
+            for (unsigned t = epilogue_warp_idx * kNumSMs + sm_idx; t < num_tokens * tiles_per_row;
+                 t += kNumSMs * kNumEpilogueWarps) {
+                const unsigned row = t / tiles_per_row;
+                const unsigned col = t % tiles_per_row * 32 + lane_idx;
+                const int expert = lane_idx < kNumTopk ?
+                    int(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>()[row * kNumTopk + lane_idx]) : -1;
+                const auto ready = workspace.get_combine_ready_grid_idx_ptr(expert >= 0 ? expert / int(kNumExpertsPerRank) : 0);
+                comm::wait_until([&]() { return __all_sync(0xffffffff, expert < 0 || ptx::ld_acq_sys(ready) == grid_idx); },
+                                 [&]() { printf("Verify combine peers timeout: rank=%u, row=%u\n", sym_buffer.rank_idx, row); });
+                unsigned mask = __ballot_sync(0xffffffff, expert >= 0);
+                float2 sum[4] = {};
+                while (mask) {
+                    const unsigned slot = __ffs(mask) - 1;
+                    mask &= mask - 1;
+                    const uint4 data = buffer.combine_token_buffer.get_rank_buffer(slot).get_data_buffer(row).get_base_ptr<uint4>()[col];
+                    const auto *values = reinterpret_cast<const nv_bfloat162*>(&data);
+                    #pragma unroll
+                    for (unsigned j = 0; j < 4; ++j) ptx::accumulate(sum[j], values[j]);
+                }
+                uint4 result;
+                auto *values = reinterpret_cast<nv_bfloat162*>(&result);
+                #pragma unroll
+                for (unsigned j = 0; j < 4; ++j) values[j] = __float22bfloat162_rn(sum[j]);
+                static_cast<uint4*>(y)[row * (kHidden / 8) + col] = result;
+            }
+        } else
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;

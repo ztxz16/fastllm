@@ -43,14 +43,15 @@ __device__ inline void Copy(void *dst, const void *src, bool valid) {
 constexpr int Heads = 8, Dim = 192, Values = 128, Splits = 16, Threads = 384;
 constexpr int Partial = Splits * Heads * Values;
 constexpr int Scratch = Partial + Splits * Heads * 2;
-template<int Tokens = 128> struct StorageFor {
-    BF16 query[Heads][Dim + 8];
+template<int Tokens = 128, int GroupHeads = Heads> struct StorageFor {
+    BF16 query[GroupHeads][Dim + 8];
     union {
         BF16 key[Tokens][Dim + 8];
-        BF16 probability[Heads][Tokens + 8];
+        BF16 probability[GroupHeads][Tokens + 8];
     };
     BF16 value[Tokens][136];
-    float scores[Tokens][Heads];
+    // Offset successive 16-head rows across banks in the warp softmax.
+    float scores[Tokens][GroupHeads + (GroupHeads == 16 ? 1 : 0)];
     int valid[Tokens];
 };
 
@@ -72,12 +73,14 @@ struct NoOutputEpilogue {
     __device__ __forceinline__ void operator()(int, int, BF16) const {}
 };
 template <bool Compact = false, Phase Mode = Phase::Fused, int MaxSplits = Splits, int CombineColumns = 64, int Tokens = 128,
-          bool CachePhysical = false, bool FullSelection = false, class OutputEpilogue = NoOutputEpilogue>
+          bool CachePhysical = false, bool FullSelection = false, class OutputEpilogue = NoOutputEpilogue, int GroupHeads = Heads>
 __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow descriptor, const float *sink,
                                        BF16 *output, float *scratch, unsigned *completion, int heads,
-                                       int kvHeads, int row, int group, int split, StorageFor<Tokens> &s,
+                                       int kvHeads, int row, int group, int split, StorageFor<Tokens, GroupHeads> &s,
                                        OutputEpilogue epilogue = {}) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    static_assert(GroupHeads == 8 || (GroupHeads == 16 && Compact && Mode != Phase::Fused));
+    constexpr int Heads = GroupHeads, Partial = Splits * Heads * Values, Scratch = Partial + Splits * Heads * 2;
     static_assert(Mode == Phase::Fused || Compact, "split production/fold uses compact arithmetic");
     const int t = threadIdx.x, warp = t / 32, lane = t % 32;
     const int h0 = group * Heads, kh = h0 / (heads / kvHeads);
@@ -147,21 +150,24 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
             for (int wave = 0; wave < (Tokens + 191) / 192; ++wave) {
               const int tile = warp + wave * (Threads / 32);
               if (tile < tokens / 16) {
-                float acc[4] = {};
+                float acc[Heads / 8][4] = {};
 #pragma unroll
                 for (int k = 0; k < Dim; k += 16) {
                     uint32_t a[4], b[2];
                     const int matrix = lane >> 3;
                     Load4(a, &s.key[tile * 16 + (lane & 7) + ((matrix & 1) << 3)][k + ((matrix >> 1) << 3)]);
-                    Load2(b, &s.query[lane & 7][k + (((lane >> 3) & 1) << 3)]);
-                    Mma(acc, a, b);
+                    for (int half = 0; half < Heads / 8; ++half) {
+                        Load2(b, &s.query[half * 8 + (lane & 7)][k + (((lane >> 3) & 1) << 3)]);
+                        Mma(acc[half], a, b);
+                    }
                 }
                 const int token = tile * 16 + (lane >> 2), head = (lane & 3) * 2;
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     int row = token + (j >= 2 ? 8 : 0);
-                    s.scores[row][head + (j & 1)] =
-                        s.valid[row] >= 0 ? acc[j] * rsqrtf(float(Dim)) : -INFINITY;
+                    for (int half = 0; half < Heads / 8; ++half)
+                        s.scores[row][half * 8 + head + (j & 1)] =
+                            s.valid[row] >= 0 ? acc[half][j] * rsqrtf(float(Dim)) : -INFINITY;
                 }
             }
             }
@@ -192,7 +198,7 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
             }
         }
         __syncthreads(); // key storage is now free for probabilities.
-        if (warp < 4) {
+        if (warp < Heads / 2) {
             const int h = warp * 2 + (lane & 1), token = lane / 2;
             float maximum = -INFINITY;
             for (int k = token; k < tokens; k += 16)
@@ -216,19 +222,22 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
         __syncthreads();
         if constexpr (Compact) {
             if (warp < 8) {
-                float acc[4] = {};
+                float acc[Heads / 8][4] = {};
                 for (int k = 0; k < tokens; k += 16) {
                     uint32_t a[4], b[2];
                     const int matrix = lane >> 3;
                     Load4Transpose(
                         a, &s.value[k + (lane & 7) + ((matrix >> 1) << 3)][warp * 16 + ((matrix & 1) << 3)]);
-                    Load2(b, &s.probability[lane & 7][k + (((lane >> 3) & 1) << 3)]);
-                    Mma(acc, a, b);
+                    for (int half = 0; half < Heads / 8; ++half) {
+                        Load2(b, &s.probability[half * 8 + (lane & 7)][k + (((lane >> 3) & 1) << 3)]);
+                        Mma(acc[half], a, b);
+                    }
                 }
                 const int dimension = warp * 16 + (lane >> 2), head = (lane & 3) * 2;
 #pragma unroll
                 for (int j = 0; j < 4; ++j)
-                    part[(split * Heads + head + (j & 1)) * Values + dimension + (j >= 2 ? 8 : 0)] = acc[j];
+                    for (int half = 0; half < Heads / 8; ++half)
+                        part[(split * Heads + half * 8 + head + (j & 1)) * Values + dimension + (j >= 2 ? 8 : 0)] = acc[half][j];
             }
         } else {
             if (warp < 8) {

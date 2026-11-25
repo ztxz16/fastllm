@@ -75,14 +75,73 @@ struct RankData {
     template<class T> T *allocate(size_t count) {
         T *ptr=nullptr; check(cudaMalloc(&ptr,count*sizeof(T))); buffers.push_back(ptr); return ptr;
     }
-    BF *x, *y[2]; int *ids; float *probs, *router, *bias;
+    BF *x, *y[2]; int *ids, *refIds; float *probs, *router, *bias, *refScores, *publishedRouter;
 };
 // Check the producer in isolation, including graph replay with different inputs.
-__global__ void referenceRouterSelection(const float *router, const float *bias, int *ids, float *prob) {
+__global__ void publishDelayedRouter(const float *src, float *dst) {
+    cudaTriggerProgrammaticLaunchCompletion();
+    auto start = clock64();
+    while (clock64() - start < 32000) __nanosleep(64);
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    dst[i] = src[i];
+}
+__global__ void referenceRouterSelection(const float *router, const float *bias, int *ids, float *prob,
+                                        int needNorm = 1, float scale = 1.f) {
     __shared__ fastllm::cuda::RouterTopKScratch<8> scratch;
     int row = blockIdx.x;
     fastllm::cuda::SelectRouterTopK<256,8>(router+row*256,bias,ids+row*8,prob+row*8,
-        bias!=nullptr,1,1.f,scratch);
+        bias!=nullptr,needNorm,scale,scratch);
+}
+// Capture the same EP producer and consumer used behind both SWA and DSA.
+void testEpPrepared(void *fp4,void *fp8,int rank,RankData &a) {
+    constexpr int rows=8;
+    FastllmMoePreparedInput p{};
+    require(!fastshared_ep_prepared_input(fp8,rank,0,rows,&p) &&
+            !fastshared_ep_prepared_input(fp4,rank,0,4,&p),"EP prepared fallback");
+    require(fastshared_ep_prepared_input(fp4,rank,0,rows,&p),"EP packed input");
+    p.indices=a.ids; p.scores=a.probs; p.bias=a.bias; p.routed=true; p.routeScale=1.375f;
+    require(p.Valid(rows),"EP descriptor");
+    auto *normed=a.allocate<BF>(rows*Hidden);
+    auto *weights=a.allocate<float>(256*Hidden),*gamma=a.allocate<float>(Hidden);
+    std::vector<float> w(256*Hidden),g(Hidden);
+    for(size_t i=0;i<w.size();++i)w[i]=std::sin(i*.037f)*.015f;
+    for(int i=0;i<Hidden;++i)g[i]=1.f+.2f*std::cos(i*.087f);
+    check(cudaMemcpy(weights,w.data(),w.size()*4,cudaMemcpyHostToDevice));
+    check(cudaMemcpy(gamma,g.data(),g.size()*4,cudaMemcpyHostToDevice));
+    std::vector<BF> x(rows*Hidden),ref(x.size()),got(x.size());
+    std::vector<int> ids(rows*TopK),refIds(ids.size());
+    std::vector<float> probs(ids.size()),refProbs(ids.size());
+    // Selection reads four FP32 values at once from each row of router logits.
+    require(fastshared_ep_prepared_norm(a.x,weights,a.router+1,gamma,normed,1.e-6f,p,false)==cudaErrorInvalidValue,
+            "Misaligned EP router logits");
+    for(bool afterSwa: {false,true}){
+        cudaGraph_t graph;cudaGraphExec_t exec;
+        check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+        require(fastshared_ep_prepared_norm(a.x,weights,a.router,gamma,normed,1.e-6f,p,afterSwa)==0,"EP norm/router");
+        require(fastshared_ep_run_prepared(fp4,rank,0,a.ids,a.probs,a.y[1])==0,"EP prepared MoE");
+        referenceRouterSelection<<<rows,32,0,cudaStreamPerThread>>>(a.router,a.bias,a.refIds,a.refScores,1,p.routeScale);
+        require(fastshared_ep_run(fp8,rank,0,rows,normed,a.refIds,a.refScores,a.y[0])==0,"EP reference MoE");
+        check(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+        check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));check(cudaGraphDestroy(graph));
+        for(int replay=0;replay<3;++replay){
+            for(size_t i=0;i<x.size();++i)x[i]=__float2bfloat16_rn(std::sin(float(i%Hidden)*(.019f+.007f*replay)+i/Hidden));
+            check(cudaMemcpy(a.x,x.data(),x.size()*sizeof(BF),cudaMemcpyHostToDevice));
+            check(cudaGraphLaunch(exec,cudaStreamPerThread));check(cudaStreamSynchronize(cudaStreamPerThread));
+            auto read=[&](auto &host,const auto *device){check(cudaMemcpy(host.data(),device,host.size()*sizeof(host[0]),cudaMemcpyDeviceToHost));};
+            read(ids,a.ids);read(probs,a.probs);read(refIds,a.refIds);read(refProbs,a.refScores);
+            require(ids==refIds && probs==refProbs,"EP prepared routes");
+            read(ref,a.y[0]);read(got,a.y[1]);
+            double peak=0;
+            for(int row=0;row<rows;++row){
+                double err=0,norm=0;
+                for(int i=row*Hidden;i<(row+1)*Hidden;++i){double u=float(ref[i]),v=float(got[i]);err+=(u-v)*(u-v);norm+=u*u;}
+                require(std::isfinite(err) && norm>0,"EP prepared invalid result");
+                peak=std::max(peak,std::sqrt(err/norm));
+            }
+            require(peak<.003,"EP routed input or schedule mismatch");
+        }
+        check(cudaGraphExecDestroy(exec));
+    }
 }
 void testResidualRouter(void *fp4, void *fp8, RankData &data) {
     check(cudaSetDevice(0));
@@ -203,24 +262,38 @@ void test(bool ep, bool verifyPages = false) {
                    :pack(states[1],r,0,pointers.data()))==0,"MXFP4 bind");
         a.x=a.allocate<BF>(MaxRows*Hidden); a.ids=a.allocate<int>(MaxRows*TopK);
         a.probs=a.allocate<float>(MaxRows*TopK);
-        if (!ep) {
-            a.router=a.allocate<float>(MaxRows*256);
-            a.bias=a.allocate<float>(256);
-            check(cudaMemset(a.bias,0,256*sizeof(float)));
+        a.router=a.allocate<float>(MaxRows*256);
+        a.bias=a.allocate<float>(256);
+        check(cudaMemset(a.bias,0,256*sizeof(float)));
+        if (ep) {
+            a.publishedRouter=a.allocate<float>(MaxRows*256);
+            a.refIds=a.allocate<int>(MaxRows*TopK);
+            a.refScores=a.allocate<float>(MaxRows*TopK);
         }
         for (auto &y:a.y) y=a.allocate<BF>(MaxRows*Hidden);
     }
     // Return to one row after a prepared batch to cover reused counters and mailbox generations.
     for (int variant:{1,2,8,9,17,-4,-8,1}) onRanks([&](int r) {
         const bool prepared=variant<0;
-        if (prepared && ep) return;
         const int rows=std::abs(variant);
         auto &a=data[r]; cudaGraphExec_t graphs[2]{};
         for (int j=0;j<2;++j) {
             cudaGraph_t graph;
             check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
             if (!prepared) require(run(states[j],r,0,rows,a.x,a.ids,a.probs,a.y[j])==0,"capture");
-            else if (!j) {
+            else if (ep) {
+                auto *bias = rows == 8 ? a.bias : nullptr;
+                const int needNorm = rows == 8;
+                const float scale = 1.875f;
+                if (j == 0) {
+                    referenceRouterSelection<<<rows,32,0,cudaStreamPerThread>>>(a.router,bias,a.refIds,a.refScores,needNorm,scale);
+                    require(run(states[j],r,0,rows,a.x,a.refIds,a.refScores,a.y[j])==0,"EP reference");
+                } else {
+                    publishDelayedRouter<<<rows,256,0,cudaStreamPerThread>>>(a.router,a.publishedRouter);
+                    require(fastshared_ep_run_router(states[j],r,0,rows,a.x,a.publishedRouter,bias,a.ids,
+                        a.probs,a.y[j],needNorm,scale)==0,"EP routed capture");
+                }
+            } else if (!j) {
                 require(fastshared_tp_run_router(states[j],r,0,rows,a.x,a.router,rows==8 ? a.bias : nullptr,
                     a.ids,a.probs,a.y[j],1,1.f)==0,"reference routing");
             } else {
@@ -247,6 +320,7 @@ void test(bool ep, bool verifyPages = false) {
             if (prepared) {
                 std::vector<float> router(rows*256,0.f);
                 for (int i=0;i<rows*TopK;++i) router[(i/TopK)*256+ids[i]]=probs[i];
+                if (ep && replay == 2) std::fill(router.begin(),router.end(),.5f);
                 check(cudaMemcpy(a.router,router.data(),router.size()*sizeof(float),cudaMemcpyHostToDevice));
             }
             check(cudaMemcpy(a.x,x.data(),x.size()*sizeof(BF),cudaMemcpyHostToDevice));
@@ -254,6 +328,15 @@ void test(bool ep, bool verifyPages = false) {
             check(cudaMemcpy(a.probs,probs.data(),probs.size()*sizeof(float),cudaMemcpyHostToDevice));
             for (auto graph:graphs) check(cudaGraphLaunch(graph,cudaStreamPerThread));
             check(cudaStreamSynchronize(cudaStreamPerThread));
+            if (ep && prepared) {
+                std::vector<int> expectedIds(ids.size());
+                std::vector<float> expectedScores(probs.size());
+                check(cudaMemcpy(expectedIds.data(),a.refIds,ids.size()*sizeof(int),cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(expectedScores.data(),a.refScores,probs.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(ids.data(),a.ids,ids.size()*sizeof(int),cudaMemcpyDeviceToHost));
+                check(cudaMemcpy(probs.data(),a.probs,probs.size()*sizeof(float),cudaMemcpyDeviceToHost));
+                require(ids == expectedIds && probs == expectedScores,"EP top-k differs from standalone selection");
+            }
             check(cudaMemcpy(ref.data(),a.y[0],ref.size()*sizeof(BF),cudaMemcpyDeviceToHost));
             check(cudaMemcpy(result.data(),a.y[1],ref.size()*sizeof(BF),cudaMemcpyDeviceToHost));
             double worst=0;
@@ -273,6 +356,7 @@ void test(bool ep, bool verifyPages = false) {
         for (auto graph:graphs) check(cudaGraphExecDestroy(graph));
     });
     printf("%s all_rank_max_row_l2=%.8g\n",ep?"EP":verifyPages?"TP-pages":"TP",*std::max_element(peak.begin(),peak.end()));
+    if (ep) onRanks([&](int r){testEpPrepared(states[1],states[0],r,data[r]);});
     if (!ep) testResidualRouter(states[1],states[0],data[0]);
     for (auto state:states) destroy(state);
     onRanks([&](int r) { for (auto p:data[r].buffers) check(cudaFree(p)); });

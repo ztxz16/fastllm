@@ -65,7 +65,8 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
 
     bool HasVerifyReduce(int rank, int layer, int rows) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
-        return !ep && rows == 8 && fastshared_tp_uses_verify_reduce(state, rank, layer);
+        return rows == 8 && (ep ? fastshared_ep_uses_verify_reduce(state, rank, layer, rows)
+                               : fastshared_tp_uses_verify_reduce(state, rank, layer));
 #else
         return false;
 #endif
@@ -81,7 +82,7 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
         destroy = ep ? fastshared_ep_destroy : fastshared_tp_destroy;
         AssertInFastLLM(create(devices.data(), weights[0].size(), &state) == 0,
                        "Shared Flex workspace initialization failed.");
-        routeSupported = !ep && fastshared_tp_router_supported(state);
+        routeSupported = ep ? fastshared_ep_router_supported(state) : fastshared_tp_router_supported(state);
         size_t released = 0;
         int layers = 0;
         try {
@@ -138,31 +139,32 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
         };
         // Every positive batch is tiled with independent row offsets; the backend
         // retains its small-row and unsupported-format fallbacks.
-        return routeSupported && rows > 1 && router.dataType == FLOAT32 &&
+        return routeSupported && Supports(rows) && rows > 1 && router.dataType == FLOAT32 &&
             router.dataDevice == DataDevice::CUDA && router.cudaData &&
             !router.dims.empty() && router.dims.back() == 256 && router.Count(0) == (size_t)rows * 256 &&
             (reinterpret_cast<uintptr_t>(router.cudaData) & 15) == 0 && dense(router) &&
             bias.dataType == FLOAT32 && bias.dataDevice == DataDevice::CUDA && bias.cudaData &&
             bias.Count(0) == 256 && bias.dataDeviceIds == router.dataDeviceIds && dense(bias);
     }
-    bool PreparedInput(int rank, int rows, FastllmMoePreparedInput &input,
+    bool PreparedInput(int rank, int layer, int rows, FastllmMoePreparedInput &input,
             Data &ids, Data &scores, const Data &bias, const Data &hidden,
             bool needNorm, float routeScale) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         // Keep small-row PDL and batches beyond the prepared tile on their existing paths.
-        if (ep || rows < 4 || rows > 16 ||
-            !fastshared_tp_prepared_input(state, rank, rows, &input)) return false;
+        if (ep) {
+            if (!fastshared_ep_prepared_input(state,rank,layer,rows,&input)) return false;
+        } else if (rows < 4 || rows > 16 || !fastshared_tp_prepared_input(state,rank,rows,&input)) return false;
         // A grouped consumer can select routes locally without a global
         // router barrier. Keep cooperative routing for the existing consumer.
         if (rows != 8 || input.preferFusedSelection) return true;
         if (bias.dataType != FLOAT32 || bias.dataDevice != DataDevice::CUDA ||
             !bias.cudaData || bias.Count(0) != 256 || bias.dataDeviceIds != hidden.dataDeviceIds)
-            return true; // Preserve the original prepared-activation path.
+            return !ep; // EP requires the router to produce the schedule.
         if (!bias.strides.empty()) {
-            if (bias.strides.size() != bias.dims.size()) return true;
+            if (bias.strides.size() != bias.dims.size()) return !ep;
             size_t stride = 1;
             for (int i = (int)bias.dims.size() - 1; i >= 0; --i) {
-                if (bias.dims[i] <= 0 || bias.strides[i] != stride) return true;
+                if (bias.dims[i] <= 0 || bias.strides[i] != stride) return !ep;
                 stride *= bias.dims[i];
             }
         }
@@ -175,7 +177,7 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
         input.scores = static_cast<float *>(scores.cudaData);
         input.bias = static_cast<const float *>(bias.cudaData);
         input.needNorm = needNorm; input.routeScale = routeScale; input.routed = true;
-        if (!input.Valid(rows)) input.routed = false;
+        if (!input.Valid(rows)) { input.routed=false;return !ep; }
         return true;
 #else
         return false;
@@ -291,6 +293,18 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
             p->dataType = p == &ids ? INT32 : p == &scores ? FLOAT32 : BFLOAT16;
             p->UpdateUnitSize(); p->Resize({rows, p == &out ? 4096 : 8});
             p->ToDevice(x.dataDevice, x.dataDeviceIds, false); p->Allocate(false);
+        }
+        if (ep && prepared && prepared->epRank==rank && prepared->routed) {
+            AssertInFastLLM(fastshared_ep_run_prepared(state,rank,layer,static_cast<const int*>(ids.cudaData),
+                static_cast<const float*>(scores.cudaData),out.cudaData)==0,"Shared Flex EP prepared launch failed.");
+            return;
+        }
+        if (ep) {
+            AssertInFastLLM(fastshared_ep_run_router(state, rank, layer, rows, x.cudaData,
+                static_cast<const float *>(router.cudaData), static_cast<const float *>(bias.cudaData),
+                static_cast<int *>(ids.cudaData), static_cast<float *>(scores.cudaData), out.cudaData,
+                needNorm, routeScale) == 0, "Shared Flex EP routed launch failed.");
+            return;
         }
         if (prepared && prepared->routed) {
             AssertInFastLLM(fastshared_tp_run_preselected(state, rank, layer, rows,

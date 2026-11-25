@@ -4,7 +4,7 @@
 #include "naive-n05-dsa-fused-attention.cuh"
 #include "naive-n05-mxfp8-projection.cuh"
 #include "naivert/attn_dsa/body.cuh"
-#include "naivert/attn_dsa/projection.cuh"
+#include "naive-n05-dsa-verify-primitives.cuh"
 #include "../../multicuda/fastllm-swa-output.cuh"
 #include <unordered_map>
 #include <cmath>
@@ -13,10 +13,6 @@ namespace fastllm_dsa_layer {
 using B = __nv_bfloat16;
 using Args = FastllmNaiveDSALayerArgs;
 using Layout = FastllmNaiveDSALayerLayout;
-constexpr int Threads = 384;
-__device__ __forceinline__ float Round(float x) {
-    return float(__float2bfloat16_rn(x));
-}
 __device__ __forceinline__ float WarpSum(float x) {
     for (int step = 16; step; step >>= 1)
         x += __shfl_down_sync(0xffffffff, x, step);
@@ -24,10 +20,6 @@ __device__ __forceinline__ float WarpSum(float x) {
 }
 // Vectorized global weight loads keep shared storage below the attention
 // workspace size, leaving more L1 capacity than staging a complete weight tile.
-template <int Rows> struct ProjectionStorage {
-    B input[Rows * 4096];
-    float partial[12 * 128 * (Rows / 8)];
-};
 template <int Rows> struct TailStorage {
     B input[Rows * 1024], local[Rows][32];
     float partial[12 * 128 * (Rows / 8)];
@@ -166,23 +158,6 @@ template <bool Pack> __device__ void NormalizeOwner(const Args &a, int row, B *s
         }
     }
 }
-template <int Rows, int Width> __device__ void LoadProjectionInput(const B *input, int rows, B *output) {
-    constexpr int vectorsPerRow = Width / 8;
-    for (int i = threadIdx.x; i < Rows * vectorsPerRow; i += Threads) {
-        int row = i / vectorsPerRow, col = (i % vectorsPerRow) * 8;
-        B *target = output + (row / 8) * 8 * Width + fastllm_dsa_projection::input_offset(row % 8, col);
-        if (row < rows) {
-            unsigned dst = unsigned(__cvta_generic_to_shared(target));
-            asm volatile("cp.async.cg.shared.global [%0],[%1],16;" : : "r"(dst), "l"(input + row * Width + col)
-                         : "memory");
-        } else {
-            *reinterpret_cast<uint4 *>(target) = make_uint4(0, 0, 0, 0);
-        }
-    }
-    asm volatile("cp.async.commit_group;cp.async.wait_group 0;" ::: "memory");
-    __syncthreads();
-}
-
 // A CTA owns two 16-output tiles with four K partitions per tile. The
 // Indexer uses its original BF16 weights; only the QKV/O tiles use MXFP8.
 template<int Width, bool Prepared = false, class Emit>
@@ -262,46 +237,6 @@ template <int Rows, bool Mx> __device__ void Project(const Args &a, int first, P
     } else project_rows_mma<Rows, 4096, 4, 2, 12>(0, 253, pointer, s.input, s.partial, emit);
 }
 
-__device__ void NormalizeIndex(const Args &a, int row) {
-    B *x = (B *)(a.workspace + Layout::IndexKey) + row * 128;
-    __shared__ float sums[64], squares[64], mean, inverseStd;
-    int t = threadIdx.x;
-    if (t < 64) {
-        float sum = 0, square = 0;
-        for (int j = t; j < 128; j += 64) {
-            float v = float(x[j]);
-            sum += v;
-            square += v * v;
-        }
-        sums[t] = sum;
-        squares[t] = square;
-    }
-    __syncthreads();
-    for (int step = 32; step; step >>= 1) {
-        if (t < step) {
-            sums[t] += sums[t + step];
-            squares[t] += squares[t + step];
-        }
-        __syncthreads();
-    }
-    if (!t) {
-        mean = sums[0] / 128;
-        float variance = squares[0] + mean * mean * 128 - 2 * mean * 128 * mean;
-        inverseStd = rsqrtf(variance / 128 + 1e-10f);
-    }
-    __syncthreads();
-    if (t < 128)
-        x[t] = __float2bfloat16_rn((float(x[t]) - mean) * inverseStd * a.indexNorm[t] + a.indexBias[t]);
-    __syncthreads();
-}
-__device__ __forceinline__ void RotateWarp(const B *source, B *output, int dim, float cs, float sn) {
-    int lane = threadIdx.x % 32;
-    float x = float(source[lane]), y = float(source[lane + 32]);
-    output[lane] = __float2bfloat16_rn(Round(x * cs) - Round(y * sn));
-    output[lane + 32] = __float2bfloat16_rn(Round(y * cs) + Round(x * sn));
-    for (int col = 64 + lane; col < dim; col += 32)
-        output[col] = source[col];
-}
 enum class PublishPart { Qkv, IndexKey, IndexQuery };
 template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPart part) {
     const int t = threadIdx.x;
@@ -318,7 +253,7 @@ template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPa
     B *iq = (B *)(a.workspace + Layout::IndexQuery) + row * 2048;
     const int lane = t % 32, warp = t / 32;
     if (part == PublishPart::IndexKey)
-        NormalizeIndex(a, row);
+        NormalizeIndex((B *)(a.workspace + Layout::IndexKey) + row * 128, a.indexNorm, a.indexBias);
     __shared__ float cosine[32], sine[32];
     __shared__ B index[128];
     if (t < 32) {

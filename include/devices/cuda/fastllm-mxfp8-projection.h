@@ -55,6 +55,9 @@ struct FastllmMxfp8ProjectionBackend {
     bool packOnlineDsaDecode = true;
     int minPrefillNormRows = 2048;
 
+    // A short-row projection may overlap independent work in adjacent PDL kernels.
+    bool (*projectPdl)(FastllmMxfp8Activation, const fastllm::Data &, void *) = nullptr;
+
     FastllmMxfp8Activation Bind(const fastllm::Data &weight, int rows, bool verifying,
                                 int maxWidth, fastllm::Data &storage) const;
     // Borrow existing storage only between the producer and its projection.
@@ -62,6 +65,8 @@ struct FastllmMxfp8ProjectionBackend {
                                   bool prefill = false) const;
     bool TryProject(FastllmMxfp8Activation prepared, const fastllm::Data &input,
                     const fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output) const;
+    bool TryProject(FastllmMxfp8Activation prepared, const fastllm::Data &input,
+                    const fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, bool pdl) const;
 };
 // Null when no compiled consumer supports the current device. Producers keep
 // their BF16 output so the existing Linear is always available.

@@ -137,7 +137,8 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
         Data arena(INT32, {pitch * (k + k / 32) / 4}), projected;
         arena.ToDevice(CUDA, {0}, false); arena.Allocate(false);
         auto view = backend->Borrow(w, m, arena);
-        Require(view.Matches(m, k), "verification projection view");
+        Require(view.Matches(m, k) && view.swizzledRowOffset < 0 && backend->projectPdl,
+                "Blackwell verification needs row-major K32 scales and its PDL projection");
         std::vector<uint8_t> codes(size_t(m) * k), scales(size_t(pitch) * k / 32);
         for (int row = 0; row < m; ++row) for (int col = 0; col < k; col += 32) {
             const size_t start = size_t(row) * k + col;
@@ -149,7 +150,7 @@ static void Run(int m, int n, int k, bool invalid = false, bool wideGemv = false
         }
         Check(cudaMemcpy(view.values, codes.data(), codes.size(), cudaMemcpyHostToDevice));
         Check(cudaMemcpy(view.scales, scales.data(), scales.size(), cudaMemcpyHostToDevice));
-        Require(backend->TryProject(view, x, w, bias, projected), "verification prepared GEMM admission");
+        Require(backend->TryProject(view, x, w, bias, projected, true), "verification prepared GEMM admission");
         std::vector<uint16_t> a(size_t(m) * n), b(a.size());
         Check(cudaMemcpy(a.data(), y.cudaData, y.GetBytes(), cudaMemcpyDeviceToHost));
         Check(cudaMemcpy(b.data(), projected.cudaData, projected.GetBytes(), cudaMemcpyDeviceToHost));

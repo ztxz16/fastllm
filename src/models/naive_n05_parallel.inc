@@ -747,15 +747,25 @@ Data NaiveN05FlashModel::ForwardAttentionParallel(const Data &inputIds, const Da
                 "Naive attention DP sampling admission changed after submission");
         });
     } else if (!gatherRows.empty()) {
+        const auto *events = state.servingPadded && batch && batch->proposals
+            ? &batch->proposals->logitsReady : nullptr;
+        bool deferred = events && events->size() == gatherRows.size();
+        for (size_t rank = 0; deferred && rank < gatherRows.size(); ++rank)
+            deferred = gatherRows[rank].empty() || (*events)[rank];
         state.runtime.Enqueue(forwardRank);
-        state.runtime.Run([&](int rank, int) {
+        auto gather = [&](int rank, int) {
             const auto &rows = gatherRows[rank];
             if (rows.empty()) return;
             for (const auto &producer : tpDecodeState->ranks)
                 FastllmCudaCurrentThreadStreamWaitEvent(producer->storage->gatherReady);
             AssertInFastLLM(FastllmCudaGatherBf16Logits(logitShards.data(), logitShards.size(),
                 rows.data(), rows.size(), vocab), "Naive verification logits gather failed");
-        });
+            if (deferred) FastllmCudaEventRecordCurrentThread((*events)[rank]);
+        };
+        if (deferred) {
+            state.runtime.Enqueue(gather);
+            capture->ownerLogitsReady = *events;
+        } else state.runtime.Run(gather);
     } else if (pdPrefillOnly && !graphDecode && !verifying && batch && !batch->Decode() &&
                AttentionTPSize() == 1 && !sparseKv && !hostPrefixCache && !tpPagedCaches.empty()) {
         auto run = [&] { state.runtime.Run(forwardRank); };

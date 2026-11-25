@@ -3,9 +3,14 @@
 #endif
 #include "fastllm.h"
 #include "executor.h"
+#include "devices/cuda/fastllm-cuda-mtp.cuh"
 #include "utils/utils.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-draft-backend.h"
+#ifdef FASTLLM_ENABLE_DRAFT_FUSED
+#include "devices/cuda/naive-n05-draft-fused.h"
+#endif
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <cmath>
@@ -17,13 +22,13 @@ static void Require(bool x, const char *msg) {
     if (!x)
         throw std::runtime_error(msg);
 }
-static Data BF(std::vector<int> dims, int seed) {
+static Data BF(std::vector<int> dims, int seed, float scale = 1.f) {
     Data x(BFLOAT16, dims);
     x.Allocate();
     unsigned state = seed;
     for (int i = 0; i < x.Count(0); ++i) {
         state = 1664525 * state + 1013904223;
-        ((uint16_t *)x.cpuData)[i] = Float32ToBFloat16RNEBits(((int)(state >> 16) - 32768) / 4096.f);
+        ((uint16_t *)x.cpuData)[i] = Float32ToBFloat16RNEBits(scale * ((int)(state >> 16) - 32768) / 4096.f);
     }
     x.ToDevice(DataDevice::CUDA, std::vector<int>{0});
     return x;
@@ -40,6 +45,66 @@ static float Float(uint16_t bits) {
     uint32_t word = uint32_t(bits) << 16; float value;
     std::memcpy(&value, &word, sizeof(value)); return value;
 }
+#ifndef USE_ROCM
+static void OwnerDraftHeadReplay() {
+    constexpr int V = 65568, S = 3; // Partial last vocabulary tile.
+    auto allocate = [](DataType type, std::vector<int> dims) {
+        Data value(type, dims);
+        value.ToDevice(CUDA, std::vector<int>{0}, false); value.Allocate(false);
+        return value;
+    };
+    Data base = BF({1,S,V}, 31, .2f), w1 = BF({V,256}, 91, .04f), w2 = BF({V,256}, 113, .04f);
+    Data ids = allocate(FLOAT32,{S+1,1}), refIds = allocate(FLOAT32,{S+1,1});
+    Data q = allocate(FLOAT32,{1,S,V}), ref = allocate(FLOAT32,{1,S,V});
+    Data mask = allocate(INT32,{1,V/32}), bias = allocate(BFLOAT16,{1,1,V}), logits;
+    Require(cudaMemset(mask.cudaData, 0xff, mask.GetBytes()) == cudaSuccess, "proposal mask");
+    float temperature = .4f, topP = 1.f, anchor = 19.f;
+    int topK = 0;
+    std::unique_ptr<void, decltype(&FastllmCudaMtpDestroyDraftSampler)> sampler(
+        FastllmCudaMtpCreateDraftSamplerBatch(1, V, &temperature, &topK, &topP), FastllmCudaMtpDestroyDraftSampler);
+    Require(bool(sampler), "create owner sampler");
+    DraftProjectedHead head{base,w1,w2,ids,q,sampler.get()};
+    auto prepare = [&] {
+        Require(FastllmCudaMtpPrepareDraftReplay(sampler.get(), (float *)ids.cudaData, 1, &anchor, &temperature),
+                "prepare owner replay");
+        Require(cudaMemcpyAsync(refIds.cudaData, ids.cudaData, sizeof(float), cudaMemcpyDeviceToDevice,
+                cudaStreamPerThread) == cudaSuccess, "reference anchor");
+    };
+    prepare();
+    Require(!TryCudaDraftHead(head,S-1), "mismatched head shape");
+    if (!TryCudaDraftHead(head,S)) return; // Device cannot keep this vocabulary grid resident.
+    void *graph = nullptr, *exec = nullptr;
+    Require(FastllmCudaGraphBeginCapture() && TryCudaDraftHead(head,S) && FastllmCudaGraphEndCapture(&graph) &&
+            FastllmCudaGraphInstantiate(graph,&exec), "owner head capture");
+    for (float t : {.4f, 1.f, 1.5f}) {
+        temperature = t; anchor += 31; prepare();
+        Require(FastllmCudaGraphLaunch(exec), "owner head replay");
+        for (int j = 0; j < S; ++j) {
+            Data token; token.FakeFrom(refIds, size_t(j)*sizeof(float)); token.Resize({1,1});
+            Require(FastllmCudaIndexedBf16Gemv(token,w1,w2,bias), "reference Markov projection");
+            FastllmCudaNaiveBatchDraftSamplingLogits(base,bias,mask,logits,j,S);
+            Require(FastllmCudaMtpDraftSamplerRunBatchStrided(sampler.get(),(float *)logits.cudaData,
+                    (float *)ref.cudaData + size_t(j)*V,(float *)refIds.cudaData + j + 1,4*j,S*V), "reference draw");
+        }
+        auto read = [](const Data &v) {
+            std::vector<float> out(v.Count(0));
+            Require(cudaMemcpy(out.data(), v.cudaData, v.GetBytes(), cudaMemcpyDeviceToHost) == cudaSuccess, "read head");
+            return out;
+        };
+        Require(read(ids) == read(refIds), "fused draw differs from seeded reference");
+        const auto got = read(q), want = read(ref);
+        for (int j = 0; j < S; ++j) {
+            double mass = 0., err = 0., norm = 0.;
+            for (int i = j*V; i < (j+1)*V; ++i) {
+                double delta = double(got[i])-want[i]; mass += got[i]; err += delta*delta; norm += double(want[i])*want[i];
+            }
+            Require(std::abs(mass-1.) < 2e-5 && std::sqrt(err/norm) < 1e-3, "owner head distribution");
+        }
+    }
+    FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+}
+#endif
+
 static void SamplingRows(int count, int steps) {
     const int vocab = 263, words = (vocab + 31) / 32;
     Data base = BF({1, count * steps, vocab}, 331), bias = BF({1, count, vocab}, 73);
@@ -230,6 +295,53 @@ static void BatchDraft(int count, int rows, int dim, int heads, int window, int 
         FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
         std::cout << "DRAFT FLASH PASS batch=" << count << " rows=" << rows << '\n';
     }
+    if (count == 1 && rows == 7 && FastllmCudaNaiveDraftCacheBindingsSupported(
+            count, rows, heads, kh, dim, window)) {
+        Data table(INT32, {1, 4});
+        table.ToDevice(DataDevice::CUDA, {0}, false); table.Allocate(false);
+        auto bind = [&](Data &key, Data &value) {
+            uint64_t addresses[] = {(uint64_t)key.cudaData, (uint64_t)value.cudaData};
+            Require(cudaMemcpy(table.cudaData, addresses, sizeof(addresses),
+                               cudaMemcpyHostToDevice) == cudaSuccess, "singleton KV binding");
+        };
+        auto run = [&](const std::vector<FastllmNaiveDraftRow> &inputs) {
+            Require(FastllmCudaNaiveBatchDraftQKV(raw, qn, kn, inputs, query, heads, kh,
+                dim, window, 1e-5, 10000, &qkvDescriptors, &table), "singleton bound QKV");
+            Require(FastllmCudaNaiveBatchDraftAttention(query, inputs, heads, kh,
+                dim, window, scores, output, &table), "singleton bound attention");
+        };
+        Require(FastllmCudaNaiveBatchDraftAttention(query, descriptors, heads, kh, dim, window,
+            scores, output), "singleton reference attention");
+        auto reference = Bits(output);
+        bind(keys[0], values[0]); run(descriptors);
+        auto bound = Bits(output);
+        double error = 0, norm = 0;
+        for (size_t i = 0; i < bound.size(); ++i) {
+            const double expected = Float(reference[i]);
+            const double delta = Float(bound[i]) - expected;
+            error += delta * delta;
+            norm += expected * expected;
+        }
+        Require(std::sqrt(error / std::max(norm, 1e-20)) < .01, "singleton bound attention relative error");
+        void *graph = nullptr, *exec = nullptr;
+        Require(FastllmCudaGraphBeginCapture(), "singleton capture");
+        run(descriptors);
+        Require(FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec),
+                "singleton instantiate");
+        const size_t elements = size_t(cap) * kw;
+        Require(cudaMemset(rk[0].cudaData, 0, elements * sizeof(uint16_t)) == cudaSuccess &&
+                cudaMemset(rv[0].cudaData, 0, elements * sizeof(uint16_t)) == cudaSuccess, "clear new KV");
+        bind(rk[0], rv[0]);
+        Require(FastllmCudaGraphLaunch(exec), "replay on new singleton KV");
+        auto k = Bits(rk[0], elements), v = Bits(rv[0], elements), attention = Bits(output);
+        Require(std::any_of(v.begin(), v.end(), [](uint16_t bits) { return bits != 0; }), "new KV not written");
+        auto rebound = descriptors;
+        rebound.front().key = &rk[0]; rebound.front().value = &rv[0];
+        run(rebound);
+        Require(k == Bits(rk[0], elements) && v == Bits(rv[0], elements) &&
+                attention == Bits(output), "singleton rebound differs from eager");
+        FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+    }
     auto before = Bits(keys[0], (size_t)cap * kw);
     descriptors.back().liveKeys = nullptr;
     Require(!FastllmCudaNaiveBatchDraftQKV(raw, qn, kn, descriptors, query, heads, kh, dim, window, 1e-5, 10000), "invalid batch accepted");
@@ -255,6 +367,178 @@ static void BatchInput(int count) {
         Require(std::equal(pr.begin(), pr.end(), pb.begin() + i * rows * 2), "batch positions differ");
     }
 }
+// Exercise the same entry used in both layer loops. A declined specialization
+// must leave the entire graph and its caller-owned buffers available for fallback.
+static void DraftMlpFallback() {
+    const std::vector<int> devices{0, 1};
+    Data x = BF({1, 7, 32}, 3), hidden = BF(x.dims, 11), scratch = BF(x.dims, 17);
+    Data gu = BF({64, 32}, 23), down = BF({32, 32}, 29), gamma(FLOAT32, {32}), middle, out;
+    const auto inputBefore = Bits(x), hiddenBefore = Bits(hidden);
+    cudaGraph_t graph;
+    Require(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+            "capture declined MLP");
+    const auto tryMlp = [&](int tp, int requests, Data *packed) {
+        return TryCudaDraftMlp({devices, 0, tp}, requests, x,
+            {packed, down}, hidden, gamma, 1e-5f, middle, scratch, out);
+    };
+    Require(!tryMlp(2, 1, &gu) && !tryMlp(1, 2, &gu) &&
+        !tryMlp(1, 1, nullptr) && !tryMlp(1, 1, &gu), "unexpected draft MLP dispatch");
+    std::vector<FastllmNaiveDraftRow> noRequests;
+    Require(!TryCudaDraftAttention({devices, 0, 1}, {32,4,128,1024,1e-5f,10000},
+        noRequests, nullptr, x, {nullptr,down,gamma,gamma,gamma},
+        hidden, middle, out, scratch, out), "unsupported attention must decline");
+    Require(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "end declined MLP capture");
+    size_t nodes = 1;
+    Require(cudaGraphGetNodes(graph, nullptr, &nodes) == cudaSuccess && nodes == 0, "declined MLP launched work");
+    cudaGraphDestroy(graph);
+    Require(out.dims.empty() && !out.cudaData && middle.dims.empty() && !middle.cudaData &&
+        Bits(x) == inputBefore && Bits(hidden) == hiddenBefore, "declined MLP changed inputs or workspace");
+}
+#ifdef FASTLLM_ENABLE_DRAFT_FUSED
+static void ReplicaAttentionReplay() {
+    const std::vector<int> devices{0};
+    int scratchSize;
+    if (!FastllmDraftLocalAttentionPlan(0, 7, 32, 4, 128, 1024, &scratchSize)) return;
+    Data qkvWeight = BF({5120,4096}, 113), wo = BF({4096,4096}, 191);
+    auto scale = [](int n) {
+        Data a(FLOAT32,{n}); a.Allocate();
+        for (int i=0;i<n;++i) ((float*)a.cpuData)[i]=0.7f+(i%93)/128.f;
+        a.ToDevice(CUDA,std::vector<int>{0}); return a;
+    };
+    Data qn=scale(128), kn=scale(128), gamma=scale(4096);
+    for (int rows : {7,8}) {
+        const std::vector<int> dims{1,rows,4096};
+        const int cap=1024+rows;
+        Data x=BF(dims,23), src=BF(dims,29), normed=BF(dims,1), hidden=BF(dims,2);
+        Data pos(FLOAT32,{1,rows}), live(INT32,{1}), bindings(INT32,{1,4}), refBindings(INT32,{1,4});
+        for(Data *v:{&pos,&live,&bindings,&refBindings}) {v->Allocate(); v->ToDevice(CUDA,devices);}
+        Data key[2], val[2], refK[2], refV[2];
+        for(int i=0;i<2;++i) {
+            for (auto *k:{&key[i],&refK[i]}) k->CopyFrom(BF({1,cap,512},31+i));
+            for (auto *v:{&val[i],&refV[i]}) v->CopyFrom(BF({1,cap,512},47+i));
+            for (auto *buf:{&key[i],&refK[i],&val[i],&refV[i]}) {
+                buf->expansionDims={1,cap,512}; buf->Resize({1,0,512});
+            }
+        }
+        auto bind=[&](Data &b,Data &k,Data &v) {
+            const void *p[]={k.cudaData,v.cudaData};
+            Require(cudaMemcpy(b.cudaData,p,sizeof(p),cudaMemcpyHostToDevice)==cudaSuccess,"bind attention KV");
+        };
+        auto reset=[&](int past,int owner) {
+            const int length=past+1; std::vector<float> positions(rows);
+            for (int j=0;j<rows;++j) positions[j]=float(past+j);
+            Require(cudaMemcpy(live.cudaData,&length,sizeof(int),cudaMemcpyHostToDevice)==cudaSuccess &&
+                cudaMemcpy(pos.cudaData,positions.data(),rows*sizeof(float),cudaMemcpyHostToDevice)==cudaSuccess,
+                "update attention length and positions");
+            bind(bindings,key[owner],val[owner]); bind(refBindings,refK[owner],refV[owner]);
+            for (auto pair:{std::make_pair(&normed,&x),std::make_pair(&hidden,&src)})
+                Require(cudaMemcpy(pair.first->cudaData,pair.second->cudaData,rows*4096*sizeof(uint16_t),
+                    cudaMemcpyDeviceToDevice)==cudaSuccess,"restore attention inputs");
+        };
+        std::vector<FastllmNaiveDraftRow> req{{&key[0],&val[0],&pos,&live}};
+        Data raw, att, branch, scratch;
+        auto run=[&](int tp) {return TryCudaDraftAttention({devices,0,tp},{32,4,128,1024,1e-5f,10000},
+            req,&bindings,normed,{&qkvWeight,wo,qn,kn,gamma},hidden,raw,att,branch,scratch);};
+        reset(0,0);
+        Require(!run(2) && raw.dims.empty() && scratch.dims.empty(),"declined attention changed workspace");
+        Require(run(1),"warmup replica attention");
+        cudaGraph_t graph; cudaGraphExec_t exec;
+        Require(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal)==cudaSuccess &&
+            run(1) && cudaStreamEndCapture(cudaStreamPerThread,&graph)==cudaSuccess,"capture replica attention");
+        size_t nodes=0;
+        Require(cudaGraphGetNodes(graph,nullptr,&nodes)==cudaSuccess && nodes==1 &&
+            cudaGraphInstantiateWithFlags(&exec,graph,0)==cudaSuccess,"single attention graph node");
+        for(int past:{0,16384,14}) {
+            const int owner=past==16384, base=std::min(1023,past);
+            reset(past,owner);
+            Require(cudaGraphLaunch(exec,cudaStreamPerThread)==cudaSuccess,"replay replica attention");
+            Data rq,query,ws,scores,ra,ro,rn,rh;
+            rh.CopyFrom(src); MatMulTransB(x,qkvWeight,rq);
+            std::vector<FastllmNaiveDraftRow> rr{{&refK[owner],&refV[owner],&pos,&live}};
+            Require(FastllmCudaNaiveBatchDraftQKV(rq,qn,kn,rr,query,32,4,128,1024,1e-5f,10000,&ws,&refBindings) &&
+                FastllmCudaNaiveBatchDraftAttention(query,rr,32,4,128,1024,scores,ra,&refBindings),"attention reference");
+            MatMulTransB(ra,wo,ro); FastllmCudaNaiveAddDecodeRMSNorm(rh,ro,gamma,1e-5f,rn);
+            auto compare=[&](const Data &a,const Data &b,int width,int offset=0) {
+                const auto av=Bits(a,(offset+rows)*size_t(width)),bv=Bits(b,(offset+rows)*size_t(width));
+                for(int row=offset;row<offset+rows;++row) {
+                    double err=0.,sum=0.;
+                    for(int c=0;c<width;++c) {
+                        const int i=row*width+c; double r=Float(bv[i]),diff=Float(av[i])-r;
+                        err+=diff*diff;sum+=r*r;
+                    }
+                    Require(std::sqrt(err/std::max(sum,1e-20))<0.012,"draft attention row relative L2");
+                }
+            };
+            compare(key[owner],refK[owner],512,base); compare(val[owner],refV[owner],512,base);
+            compare(att,ra,4096); compare(hidden,rh,4096); compare(normed,rn,4096);
+        }
+        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+    }
+}
+static void ReplicaMlpReplay() {
+    if (!FastllmDraftFusedLocalMlpBlocks(0)) return;
+    const std::vector<int> devices{0};
+    const DraftLayerParallel local{devices, 0, 1};
+    Data gu = BF({8192, 4096}, 211), down = BF({4096, 4096}, 271);
+    Data gamma(FLOAT32, {4096});
+    gamma.Allocate();
+    for (int i = 0; i < 4096; ++i) ((float *)gamma.cpuData)[i] = 0.5f + float(i % 127) / 128;
+    gamma.ToDevice(CUDA, std::vector<int>{0});
+    for (const int rows : {7, 8}) {
+        const std::vector<int> dims{1, rows, 4096};
+        Data input = BF(dims, 1), middle = BF(dims, 2), branch = BF(dims, 3);
+        Data hidden = BF(dims, 4), tail = BF(dims, 5);
+        Data &output = rows == 7 ? input : tail;
+        cudaGraph_t graph;
+        cudaGraphExec_t exec;
+        Require(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+                "capture replica MLP");
+        const DraftMlpWeights weights{&gu, down};
+        Require(!TryCudaDraftMlp({devices, 0, 2}, 1, input, weights, hidden, gamma,
+                    1e-5f, middle, branch, output) &&
+                !TryCudaDraftMlp(local, 2, input, weights, hidden, gamma, 1e-5f, middle, branch, output),
+                "replica MLP cannot take a partial TP result or multiple requests");
+        Require(TryCudaDraftMlp(local, 1, input, weights, hidden,
+            gamma, 1e-5f, middle, branch, output), "replica MLP dispatch");
+        Require(cudaStreamEndCapture(cudaStreamPerThread, &graph) == cudaSuccess, "end replica MLP capture");
+        size_t nodes = 0;
+        Require(cudaGraphGetNodes(graph, nullptr, &nodes) == cudaSuccess && nodes == 1, "replica MLP node count");
+        Require(cudaGraphInstantiateWithFlags(&exec, graph, 0) == cudaSuccess, "instantiate replica MLP");
+
+        for (int replay = 0; replay < 2; ++replay) {
+            Data x = BF(dims, 17 + replay), residual = BF(dims, 37 + replay), ref, gate, projected, norm;
+            const size_t bytes = size_t(rows) * 4096 * 2;
+            if (!replay)
+                Require(cudaMemsetAsync(residual.cudaData, 0, bytes, cudaStreamPerThread) == cudaSuccess, "zero residual");
+            Require(cudaMemcpyAsync(input.cudaData, x.cudaData, bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess &&
+                    cudaMemcpyAsync(hidden.cudaData, residual.cudaData, bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess,
+                    "refresh replica MLP inputs");
+            Require(cudaGraphLaunch(exec, cudaStreamPerThread) == cudaSuccess, "replay replica MLP");
+            Linear(x, gu, Data(), ref);
+            FastllmCudaNaiveDraftSwiGLU(ref, gate);
+            Linear(gate, down, Data(), projected);
+            FastllmCudaNaiveAddDecodeRMSNorm(residual, projected, gamma, 1e-5f, norm);
+            auto compare = [&](const Data &actual, const Data &expected) {
+                const auto a = Bits(actual), b = Bits(expected);
+                for (int row = 0; row < rows; ++row) {
+                    double error = 0., scale = 0.;
+                    for (int i = 0; i < 4096; ++i) {
+                        const int j = row * 4096 + i;
+                        const double v = Float(b[j]), diff = Float(a[j]) - v;
+                        error += diff * diff; scale += v * v;
+                    }
+                    Require(std::sqrt(error / scale) < 0.005, "replica MLP row relative L2");
+                }
+            };
+            compare(middle, gate);
+            if (!replay) compare(hidden, projected);
+            compare(hidden, residual); compare(output, norm);
+        }
+        cudaGraphExecDestroy(exec); cudaGraphDestroy(graph);
+    }
+}
+#endif
+
 int main() {
     try {
         int devices = 0;
@@ -262,6 +546,14 @@ int main() {
             return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
         SetCudaEmbedding(true);
+        DraftMlpFallback();
+#ifndef USE_ROCM
+        OwnerDraftHeadReplay();
+#endif
+#ifdef FASTLLM_ENABLE_DRAFT_FUSED
+        ReplicaMlpReplay();
+        ReplicaAttentionReplay();
+#endif
         for (int count : {1, 33, 129}) for (int steps : {1, 3, 5, 7}) SamplingRows(count, steps);
         for (int count : {2, 8, 40}) BatchInput(count);
         for (int count : {2, 8, 40}) for (int dim : {128, 192, 256})

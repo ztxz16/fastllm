@@ -173,7 +173,9 @@ bool attentionProjection(const void *input, const void *weight, void *output,
                          int rows, int width, int columns) {
     // One query-row tile uses the same reduction as single-row decode.
     constexpr int rowsPerTile = AttentionGemm<smallAttentionTileRows>::GemmKernel::Mma::Shape::kN;
-    if (rows > rowsPerTile && columns < width &&
+    // A packed attention shard can end on a partial eight-element
+    // vector. cuBLAS supports that row pitch for the larger verification batches.
+    if (((rows > rowsPerTile && columns < width) || (rows > 16 && columns % 8)) &&
         FastllmCudaBf16ProjectionGemm(input, weight, output, rows, width, columns, 1)) return true;
     if (attentionProjections<1>(&input, weight, output, rows, width, &columns)) return true;
     if (rows <= 0 || width <= 0 || columns <= 0 || width % 8 || columns % 8 ||

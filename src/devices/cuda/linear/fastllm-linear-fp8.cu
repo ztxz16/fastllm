@@ -3124,6 +3124,12 @@ FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Borrow(const fastllm::Data
 bool FastllmMxfp8ProjectionBackend::TryProject(FastllmMxfp8Activation prepared,
         const fastllm::Data &input, const fastllm::Data &weight, const fastllm::Data &bias,
         fastllm::Data &output) const {
+    return TryProject(prepared, input, weight, bias, output, false);
+}
+
+bool FastllmMxfp8ProjectionBackend::TryProject(FastllmMxfp8Activation prepared,
+        const fastllm::Data &input, const fastllm::Data &weight, const fastllm::Data &bias,
+        fastllm::Data &output, bool pdl) const {
     if (!prepared.values || !bias.dims.empty() || input.dataType != fastllm::BFLOAT16 ||
         input.dims.empty() || weight.dims.size() != 2 || input.dims.back() != weight.dims[1] ||
         !prepared.Matches(prepared.rows, weight.dims[1]) ||
@@ -3136,6 +3142,7 @@ bool FastllmMxfp8ProjectionBackend::TryProject(FastllmMxfp8Activation prepared,
     output.Resize(shape);
     output.ToDevice(fastllm::CUDA, weight.dataDeviceIds, false);
     output.Allocate(false);
+    if (pdl && projectPdl && projectPdl(prepared, weight, output.cudaData)) return true;
     return project(prepared, weight, output.cudaData);
 }
 

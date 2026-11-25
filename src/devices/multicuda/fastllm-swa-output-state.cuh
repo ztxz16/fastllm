@@ -22,7 +22,7 @@ class SwaOutputState {
     bool layerSupported = false, mxLayerSupported = false, mxOutputSupported = false, outputRouterSupported = false, rowsSupported = false;
     bool rowsRouterExpertsSupported = false, rowsMmaSupported = false;
     bool preparedRouterSupported = false, routedRouterSupported = false;
-    bool swaRouterPdlSupported = false;
+    bool swaRouterPdlSupported = false, unpreparedRouterPdlSupported = false;
     bool preparedVectorRouterSupported = false, rowsDirectRouterSupported = false;
     bool widePreparedRouterSupported = false;
     // A registered output tuple alone does not establish that the eight-row
@@ -112,6 +112,19 @@ public:
             float eps, const float *routerWeight, float *router, int rows,
             const FastllmMoePreparedInput *prepared = nullptr, bool afterSwa = false) {
         using namespace fastllm_swa_output;
+#if CUDART_VERSION >= 12000
+        if (afterSwa && !prepared)
+            return fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterExperts<8, false, true>>(
+                dim3(32, 4), 256, 0, cudaStreamPerThread, (const BF16 *)hidden, routerWeight,
+                router, normWeight, (BF16 *)normed, eps, rows, FastllmMoePreparedInput{});
+#endif
+        if (prepared && prepared->epRank>=0) {
+#ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
+            return static_cast<cudaError_t>(fastshared_ep_prepared_norm(hidden,routerWeight,router,normWeight,normed,eps,*prepared,afterSwa));
+#else
+            return cudaErrorNotSupported;
+#endif
+        }
         if (routerWeight && prepared && prepared->routed) {
             FastllmMoePreparedInput input = *prepared;
             void *params[] = {&hidden, &routerWeight, &router, &normWeight,
@@ -172,8 +185,9 @@ public:
             const float *normWeight, const float *routerWeight, float *router,
             const FastllmMoePreparedInput *prepared = nullptr) {
         args.peers = peers; args.epochs = epochs[rank]; args.rank = rank;
-        args.overlapRouter = swaRouterPdlSupported && args.rotary && args.rows == 8 && routerWeight &&
-                             prepared && prepared->overlapVerifyGate && !prepared->routed;
+        args.overlapRouter = args.rotary && args.rows == 8 && routerWeight &&
+            (prepared ? swaRouterPdlSupported && prepared->overlapVerifyGate && (!prepared->routed || prepared->epRank>=0)
+                      : unpreparedRouterPdlSupported);
         void *params[] = {&args};
         const bool wide = args.rows > 8 && verifySupported[2];
         const bool mx = args.outputScales != nullptr;
@@ -427,18 +441,29 @@ private:
             }
         }
 #if CUDART_VERSION >= 12000
-        swaRouterPdlSupported = preparedVectorRouterSupported && verifySupported[3];
+        // Each rank must have PDL instructions in both producer and consumer.
+        auto pdlKernel = [](const void *entry, int threads) {
+            cudaFuncAttributes attr{};
+            if (cudaFuncGetAttributes(&attr, entry) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            return attr.binaryVersion >= 90 && attr.ptxVersion >= 90 && attr.maxThreadsPerBlock >= threads;
+        };
+        swaRouterPdlSupported = verifySupported[3] && preparedVectorRouterSupported;
+        unpreparedRouterPdlSupported = verifySupported[3] && rowsRouterExpertsSupported;
         for (int device : requested) {
-            if (!swaRouterPdlSupported) break;
-            // Both ends must have been compiled with grid dependency instructions.
-            const void *producer = fastllm_swa_verify::Kernel(8, false, true);
-            const void *consumer = (const void *)fastllm_swa_output::NormRowsRouterDirect<8, 2, true, 8, false, true>;
-            cudaFuncAttributes src{}, dst{};
-            swaRouterPdlSupported = cudaSetDevice(device) == cudaSuccess &&
-                cudaFuncGetAttributes(&src, producer) == cudaSuccess && src.ptxVersion >= 90 && src.binaryVersion >= 90 &&
-                cudaFuncGetAttributes(&dst, consumer) == cudaSuccess && dst.ptxVersion >= 90 && dst.binaryVersion >= 90 &&
-                dst.maxThreadsPerBlock >= 256;
-            if (!swaRouterPdlSupported) cudaGetLastError();
+            if (!swaRouterPdlSupported && !unpreparedRouterPdlSupported) break;
+            if (cudaSetDevice(device) != cudaSuccess ||
+                !pdlKernel(fastllm_swa_verify::Kernel(8, false, true), fastllm_swa_verify::Threads(8))) {
+                swaRouterPdlSupported = unpreparedRouterPdlSupported = false;
+                cudaGetLastError();
+                break;
+            }
+            swaRouterPdlSupported = swaRouterPdlSupported &&
+                pdlKernel((const void *)fastllm_swa_output::NormRowsRouterDirect<8, 2, true, 8, false, true>, 256);
+            unpreparedRouterPdlSupported = unpreparedRouterPdlSupported &&
+                pdlKernel((const void *)fastllm_swa_output::NormRowsRouterExperts<8, false, true>, 256);
         }
 #endif
         devices = requested;

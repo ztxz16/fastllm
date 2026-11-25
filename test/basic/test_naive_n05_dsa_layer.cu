@@ -1,5 +1,6 @@
 #define CUDA_API_PER_THREAD_DEFAULT_STREAM 1
 #include "devices/cuda/naive-n05-dsa-layer.cuh"
+#include "devices/cuda/naive-n05-dp-dsa-verify.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "utils/utils.h"
@@ -89,10 +90,10 @@ struct Cache {
     PagedCacheManager keyPool, valuePool;
     int capacity, stride;
     bool paged, fp8;
-    Cache(int capacity, bool paged, bool fp8, int seed)
-        : capacity(capacity), stride(fp8 ? 264 : 320), paged(paged), fp8(fp8) {
+    Cache(int capacity, bool paged, bool fp8, int seed, int kvHeads = 1)
+        : capacity(capacity), stride(192 * kvHeads + (fp8 ? 72 : 128)), paged(paged), fp8(fp8) {
         Init(key, BFLOAT16, {1, capacity, stride});
-        Init(value, BFLOAT16, {1, capacity, 128});
+        Init(value, BFLOAT16, {1, capacity, kvHeads * 128});
         Fill(key, seed, .3f);
         Fill(value, seed + 2, .3f);
         key.kvCacheFp8Indexer = fp8;
@@ -477,7 +478,12 @@ void Tp(bool fp8, bool mx = false) {
             Cuda(cudaDeviceSynchronize());
         });
         Parallel([&](int r) {
-            Require(FastllmCudaNaiveDSALayer(cases[r]->input, r), "TP launch rejected");
+            FastllmNaiveVerifyAttentionInput verify;
+            static_cast<FastllmNaiveDSALayerInput &>(verify) = cases[r]->input;
+            verify.config = {8, 1, 192, 128, 64, 0, verify.eps, verify.theta, verify.valueScale};
+            verify.fp8IndexerCache = fp8;
+            Require(FastllmCudaVerifyAttention(verify, r, nullptr) == FastllmVerifyOutput::Normalized,
+                    "TP verification dispatch rejected the index query/cache combination");
             Cuda(cudaDeviceSynchronize());
         });
         Parallel([&](int r) {
@@ -731,12 +737,18 @@ void Local(bool fp8, bool mixed) {
         puts("64K page boundary PASS");
     }
 }
+#include "naive_n05_dp_dsa_test.cuh"
 } // namespace
 int main(int argc, char **argv) {
     try {
         FastllmCudaSetDevice(0);
         if (!FastllmCudaNaiveDSALayerSupported())
             return 77;
+        if (argc > 1 && std::strcmp(argv[1], "dp") == 0) {
+            DpDsaVerify(8, true);
+            DpDsaVerify(3, false);
+            return 0;
+        }
         if (argc > 2 && (std::strcmp(argv[2], "tp") == 0 || std::strcmp(argv[2], "router") == 0)) {
             int count = 0;
             Cuda(cudaGetDeviceCount(&count));

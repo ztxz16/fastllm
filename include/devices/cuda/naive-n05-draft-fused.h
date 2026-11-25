@@ -17,7 +17,26 @@ struct FastllmDraftHeadRequest {
     uint64_t seed;
     float temperature;
 };
+struct FastllmDraftLocalAttention {
+    const void *input, *qkvWeight, *oWeight;
+    const float *qNorm, *kNorm, *postNorm, *positions;
+    const int *live;
+    const void *const *binding;
+    void *raw, *attention, *residual, *output;
+    float *partials, *normScratch;
+    int rows, window;
+    float eps, theta;
+};
 extern "C" {
+int FastllmDraftLocalAttentionPlan(int device, int rows, int heads, int kvHeads, int dim, int window,
+    int *partialFloats);
+void FastllmDraftLocalAttentionRun(int blocks, const FastllmDraftLocalAttention &args, void *stream);
+// Full-width BF16 replica. One 7- or 8-row request, original row-major weights; the
+// graph owner supplies existing activation buffers. Query on the active device.
+int FastllmDraftFusedLocalMlpBlocks(int device);
+void FastllmDraftFusedLocalMlpRun(int blocks, int rows, const void *normalized, const void *gateUp,
+    const void *down, void *middle, void *normScratch, void *residual, const float *gamma,
+    float eps, void *output, void *stream);
 bool FastllmDraftFusedSupported(const int *devices, int ranks);
 void *FastllmDraftFusedCreate(const int *devices, int ranks, int layers,
     const FastllmDraftFusedWeight *weights, int rows, int window, float eps, float theta);

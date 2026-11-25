@@ -282,6 +282,14 @@ __global__ void tiledRelative(AttentionRow a, float *partial) {
 
 #include "attention-verify.cuh"
 
+template<bool BatchDecode, class Act>
+__device__ float mergeGate(Act gate) {
+    const float e = expf(-float(gate));
+    // Ordinary decode previously gated the FP32 result with FastllmSigmoidMulToProbability<float>.
+    if constexpr (BatchDecode) return float(1.0 / (1.0 + e));
+    return 1.f / (1.f + e);
+}
+
 // Merge normalized partial outputs using their base-2 log normalizers.
 // The learned sink is a zero-valued token and contributes to the denominator once.
 template<int D, class Act, bool HeadMajor = false, bool Batched = false>
@@ -327,7 +335,7 @@ __global__ void mergeRelative(AttentionRow a, const float *partial, int splits,
     for (int s = 0; s < active; ++s)
         out += weights[s] * partial[(firstRow + size_t(s) * splitStride) * D + lane];
     const int channel = head * D + lane;
-    if (gate) out *= 1.f / (1.f + expf(-float(gate[channel])));
+    if (gate) out *= mergeGate<Batched && !HeadMajor>(gate[channel]);
     output[channel] = Act(out);
 }
 
@@ -372,7 +380,7 @@ __global__ void mergeRelativeWarp(AttentionRow a, const float *partial, int spli
     float out = 0.f;
 #pragma unroll
     for (int s = 0; s < 32; ++s) out += values[s] * __shfl_sync(0xffffffffu, normalized, s);
-    if (gate) out *= 1.f / (1.f + expf(-float(gate[channel])));
+    if (gate) out *= mergeGate<Batched && !HeadMajor>(gate[channel]);
     output[channel] = Act(out);
 }
 
@@ -398,14 +406,14 @@ void launchRelativeMerge(AttentionRow a, const Matrix &scratch, const Act *sink,
     }
 }
 
-template<int D, class KV>
-void launchBatchDecodeAttention(AttentionRow a, int rows, int splits) {
+template<int D, class KV, class Act>
+void launchBatchDecodeAttention(AttentionRow a, int rows, int splits, const Act *sink, const Act *gate, Act *out) {
     Matrix scratch(splits, rows * splitChannels<D, true>(a.heads));
     if (a.heads == 3 * a.kvHeads)
         launchRelativeKernel<D,3,true,KV,true>(a, rows, scratch.p, scratch.rows);
     else
         launchRelativeKernel<D,1,true,KV,true>(a, rows, scratch.p, scratch.rows);
-    launchRelativeMerge<D,false>(a, scratch, a.sink, static_cast<const float *>(nullptr), a.output, rows);
+    launchRelativeMerge<D,false>(a, scratch, sink, gate, out, rows);
 }
 
 #include "attention-sm120.cuh"

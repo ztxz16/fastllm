@@ -1624,6 +1624,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_deepseek_v41_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
+    is_inkling_model = False
     is_naive_n05_model = False
     is_qwen35_model = False
     is_qwen38_flash_next_model = False
@@ -2100,7 +2101,7 @@ def make_normal_llm_model(args, startup_progress = None):
             if (atype_was_auto and not is_deepseek_v41_model):
                 # DeepSeek-V4.1 的 SetDataType 只接受 float32（推理精度由模型内部
                 # 自己按 BF16 走），--tp 不能像其它模型那样把 atype 改成 float16。
-                args.atype = "bfloat16" if (is_laguna_model or is_naive_n05_model) else "float16"
+                args.atype = "bfloat16" if (is_laguna_model or is_naive_n05_model or is_inkling_model) else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)
     if (args.moe_atype == "" and is_moe_model and args.dtype == "fp8_e4m3"):
@@ -2399,6 +2400,8 @@ def make_normal_llm_model(args, startup_progress = None):
                                           min_decode_requests=prefill_min_decode_requests)
             else:
                 model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+        elif is_inkling_model and not prefill_batch_auto:
+            model.set_prefill_batching(0)
         if kv_admission_reserve is not None:
             model.set_kv_admission_reserve(kv_admission_reserve)
         if any(prefill_scheduling.values()):

@@ -18,7 +18,7 @@ int prefix(ResponseContext &ctx, int limit, bool restore) override {
         if (c.draft.local[i]) continue;
         for (int side = 0; side < 2; ++side) {
             auto &[pool, pages] = chains[i][side];
-            pool = GetPagedCacheManager(2 * int(c.visits.size() + i) + side);
+            pool = GetPagedCacheManager(2 * placement.cacheSlot(int(c.visits.size() + i)) + side);
             if (!pool) return 0;
             // The scheduler may have evicted the draft before the target.
             // Intersect its current pages before choosing a recurrent checkpoint.
