@@ -1,6 +1,7 @@
 #pragma once
 #include <functional>
 #include <cstddef>
+#include <cstdint>
 
 namespace fastllm {
 class Data;
@@ -59,3 +60,23 @@ bool FastllmCudaGGUFGroupedGemv(const fastllm::Data &input, fastllm::Data &weigh
 // Internal MMQ bridge; caller validates tensor layout, aliases and device ownership.
 bool FastllmCudaGGUFMMQShared(const fastllm::Data &input, fastllm::Data *const *weights,
                               fastllm::Data *const *outputs, int count);
+
+// Project each GPU route against its expert's contiguous GGUF matrix. Consecutive
+// routes may share an input row. Outer scales, when present, are per expert.
+using FastllmGGUFExpertProjection = void (*)(const void *weights, const float *outer, const int *experts,
+        const float *input, float *output, int routes, int routesPerInput, int cols, int rows, size_t rowBytes);
+FastllmGGUFExpertProjection FastllmCudaGetGGUFExpertProjection(int type);
+
+// One input shared by all top-k routes. Uses caller-owned Q8_1 scratch.
+bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, const float *outer, const int *ids,
+        const float *input, float *output, void *scratch, int topk, int cols, int width, size_t rowBytes);
+
+// Resident gate/up and optional down projection. The device pointer table has
+// two slots per expert (repeat the gate pointer when down runs on another backend).
+// The gate builds a route map that the down projection reuses in the same workspace.
+// The row limit bounds transient storage; longer requests can use consecutive slices.
+int FastllmCudaGGUFExpertMMQMaxRows(int gateType, int downType, int hidden, int inter, int experts, int topk);
+size_t FastllmCudaGGUFExpertMMQBytes(int rows, int hidden, int inter, int experts, int topk);
+void FastllmCudaGGUFExpertMMQ(bool gate, int type, const void *weights, const float *outer,
+        const int *indices, const float *input, float *output, void *workspace,
+        int rows, int hidden, int inter, int experts, int topk);

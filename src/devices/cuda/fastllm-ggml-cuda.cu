@@ -28,6 +28,7 @@
 #include "fastllm-gguf-dequant.cuh"
 #if !defined(USE_ROCM)
 #include "fastllm-gguf-iq3-gemv.cuh"
+#include "moe/fastllm-moe-gguf-q8.cuh"
 #endif
 
 #define CUDA_QUANTIZE_BLOCK_SIZE     256
@@ -396,6 +397,54 @@ bool FastllmCudaGGUFPrefillSupported(fastllm::DataType inputType, int weightType
 std::size_t FastllmCudaQ8ProjectionScratchBytes(int rows, int columns) {
     return size_t(rows) * (columns / QK8_1) * sizeof(block_q8_1);
 }
+
+#if !defined(USE_ROCM)
+namespace {
+template <ggml_type Type>
+__global__ void indexedExpertGemv(const uint8_t *weights, const float *outer, const int *indices,
+                                  const block_q8_1 *input, float *output, int cols, int width, size_t rowBytes) {
+    constexpr int lanes = 16;
+    extern __shared__ uint64_t grid[];
+    if constexpr (Type != GGML_TYPE_Q3_K) {
+        gguf_cache_q8::StageGrid<Type>(grid);
+        __syncthreads();
+    }
+    const int row = blockIdx.x * (blockDim.x / lanes) + threadIdx.x / lanes;
+    if (row >= width) return;
+    const int expert = indices[blockIdx.y], lane = threadIdx.x % lanes;
+    const auto *w = weights + (size_t(expert) * width + row) * rowBytes;
+    float sum = 0;
+    if constexpr (Type == GGML_TYPE_Q3_K) {
+        for (int i = lane; i < (cols / QK_K) * QI3_K; i += lanes)
+            sum += vec_dot_q3_K_q8_1(w, input + 8 * (i / QI3_K), i / QI3_K, i % QI3_K);
+        for (int delta = lanes / 2; delta; delta /= 2)
+            sum += __shfl_xor_sync(__activemask(), sum, delta, lanes);
+    } else {
+        sum = gguf_cache_q8::RowDot<Type, lanes, false, true>(w, input, cols, grid);
+    }
+    if (lane == 0) output[size_t(blockIdx.y) * width + row] = sum * (outer ? outer[expert] : 1.f);
+}
+}
+bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, const float *outer, const int *ids,
+        const float *input, float *output, void *scratch, int topk, int cols, int width, size_t rowBytes) {
+    using Kernel = decltype(&indexedExpertGemv<GGML_TYPE_Q3_K>);
+    Kernel kernel;
+    size_t smem;
+    switch (type) {
+#define INDEXED_CASE(T) case GGML_TYPE_##T: kernel = indexedExpertGemv<GGML_TYPE_##T>; \
+        smem = gguf_cache_q8::Format<GGML_TYPE_##T>::gridSize * sizeof(uint64_t); break;
+        INDEXED_CASE(IQ2_XS) INDEXED_CASE(IQ2_S) INDEXED_CASE(IQ3_XXS)
+#undef INDEXED_CASE
+        case GGML_TYPE_Q3_K: kernel = indexedExpertGemv<GGML_TYPE_Q3_K>; smem = 0; break;
+        default: return false;
+    }
+    auto *q = static_cast<block_q8_1 *>(scratch);
+    quantize_row_q8_1_cuda(input, q, cols, 1, 1, cols, GGML_TYPE_Q8_1, cudaStreamPerThread);
+    kernel<<<dim3((width + 15) / 16, topk), 256, smem, cudaStreamPerThread>>>(
+        weights, outer, ids, q, output, cols, width, rowBytes);
+    return true;
+}
+#endif
 
 void FastllmCudaProjectQ8_0(const float *input, const void *weight, float *output, void *scratch,
                             int rows, int columns, int outputs) {

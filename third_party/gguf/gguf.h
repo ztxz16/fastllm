@@ -1801,6 +1801,7 @@ enum ggml_type {
         // GGML_TYPE_Q4_0_4_8 = 32,
         // GGML_TYPE_Q4_0_8_8 = 33,
         GGML_TYPE_MXFP4   = 39,
+        GGML_TYPE_NVFP4   = 40,
         GGML_TYPE_TQ1_0   = 34,
         GGML_TYPE_TQ2_0   = 35,
         // GGML_TYPE_IQ4_NL_4_4 = 36,

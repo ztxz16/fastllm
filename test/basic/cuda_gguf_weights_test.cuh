@@ -21,6 +21,12 @@ static std::vector<uint8_t> Weights(ggml_type type, int n, int k) {
                 sc[j] = (sc[j] & 0x0fff) | (((bits >> (4 * j)) & 15) << 12);
             break;
         }
+        case GGML_TYPE_Q3_K:
+            static_cast<block_q3_K *>(p)->d = d;
+            break;
+        case GGML_TYPE_IQ4_NL:
+            static_cast<block_iq4_nl *>(p)->d = d;
+            break;
         case GGML_TYPE_IQ3_S:
             static_cast<block_iq3_s *>(p)->d = d;
             break;

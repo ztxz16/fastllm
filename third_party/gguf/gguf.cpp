@@ -33,6 +33,7 @@ GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *bf16, float *fp32,
 std::map <ggml_type, ggml_type_traits> type_traits = {
         // Imported losslessly to native compact FP4 before execution.
         {GGML_TYPE_MXFP4, {"mxfp4", 32, 17, true, nullptr, GGML_TYPE_Q8_0}},
+        {GGML_TYPE_NVFP4, {"nvfp4", 64, 36, true, nullptr, GGML_TYPE_Q8_0}},
         {GGML_TYPE_MXFP8, {"mxfp8", QK_MXFP8, sizeof(block_mxfp8), true,
             nullptr, GGML_TYPE_Q8_0, (ggml_to_float_t) dequantize_row_mxfp8}},
         {GGML_TYPE_I8, {/* type_name */"i8", /* blck_size */1,
@@ -259,6 +260,7 @@ std::map <ggml_type, ggml_type_traits> type_traits = {
 #else
 std::map <ggml_type, ggml_type_traits> type_traits = {
         {GGML_TYPE_MXFP4, {"mxfp4", 32, 17, true, nullptr, GGML_TYPE_Q8_0}},
+        {GGML_TYPE_NVFP4, {"nvfp4", 64, 36, true, nullptr, GGML_TYPE_Q8_0}},
         {GGML_TYPE_MXFP8, {"mxfp8", QK_MXFP8, sizeof(block_mxfp8), true,
             nullptr, GGML_TYPE_Q8_0, (ggml_to_float_t) dequantize_row_mxfp8}},
         {GGML_TYPE_I8, {
@@ -1109,7 +1111,8 @@ namespace fastllm {
             {
                 const auto traits = type >= 0 && type < GGML_TYPE_COUNT
                     ? type_traits.find(static_cast<ggml_type>(type)) : type_traits.end();
-                if (traits == type_traits.end() || !traits->second.type_size || traits->second.blck_size <= 0)
+                if (traits == type_traits.end() || !traits->second.type_size || traits->second.blck_size <= 0 ||
+                    type == GGML_TYPE_NVFP4)
                     throw std::runtime_error("Unsupported GGUF tensor type " + std::to_string(type) +
                                              " for " + tensorName + " in " + fileName);
                 tensors[i].first.type = traits->first;

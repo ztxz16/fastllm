@@ -4634,6 +4634,12 @@ if (UNIT_TEST)
         fastllm_add_checked_test(cuda_gguf_t8_register cuda_gguf_t8_register_test "PASS T8 register projections" 600)
         set_tests_properties(cuda_gguf_t8_register PROPERTIES LABELS cuda RUN_SERIAL TRUE)
 
+        add_executable(cuda_gguf_expert_projection_test test/basic/test_cuda_gguf_expert_projection.cu)
+        target_link_libraries(cuda_gguf_expert_projection_test PRIVATE fastllm)
+        set_target_properties(cuda_gguf_expert_projection_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        fastllm_add_checked_test(cuda_gguf_expert_projection cuda_gguf_expert_projection_test "PASS GGUF expert projection" 120)
+        set_tests_properties(cuda_gguf_expert_projection PROPERTIES LABELS cuda RUN_SERIAL TRUE)
+
         add_executable(cuda_gguf_embedding_test test/basic/test_cuda_gguf_embedding.cu)
         target_link_libraries(cuda_gguf_embedding_test PRIVATE fastllm)
         set_target_properties(cuda_gguf_embedding_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

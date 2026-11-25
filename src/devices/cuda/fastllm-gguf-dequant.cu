@@ -2,6 +2,7 @@
 // with direct GEMV through fastllm-gguf-gemv.cuh.
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
+#include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include <cuda_bf16.h>
 #include <cassert>
 #include <set>
@@ -1380,4 +1381,58 @@ bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::D
     // Repeated rows use the identical packed-block decoder. Writing their
     // final layout directly avoids a temporary embedding and a Repeat kernel.
     return LaunchGGUFEmbedding<true>(input, weight, output, repeats);
+}
+
+namespace {
+// GGML NVFP4 stores four E4M3 block scales followed by four groups of eight
+// packed E2M1 pairs. Each pair spans the two halves of its 16-value group.
+__device__ float nvfp4Value(unsigned code) {
+    constexpr float magnitude[] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    return (code & 8) ? -magnitude[code & 7] : magnitude[code & 7];
+}
+template <ggml_type Type>
+__global__ void ggufExpertProjection(const uint8_t *weights, const float *outer, const int *experts, const float *input,
+                                     float *out, int copies, int cols, int rows, size_t rowBytes) {
+    const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (row >= rows) return;
+    const int route = blockIdx.y, expert = experts[route];
+    const uint8_t *w = weights + (size_t(expert) * rows + row) * rowBytes;
+    const float *x = input + size_t(route / copies) * cols;
+    float sum = 0;
+    if constexpr (Type == GGML_TYPE_NVFP4) {
+        for (int col = 0; col < cols; col += 64, w += 36) {
+            const int group = lane / 8, i = col + 16 * group + lane % 8;
+            const unsigned s = w[group] == 0x7f ? 0 : w[group], e = s >> 3, m = s & 7, q = w[4 + lane];
+            const float scale = e ? ldexpf(1.f + m * .125f, int(e) - 7) : float(m) / 512.f;
+            sum += scale * (x[i] * nvfp4Value(q) + x[i + 8] * nvfp4Value(q >> 4));
+        }
+    } else {
+        FastllmGgufGemvDotOutput<float> dot{x, &sum, 0};
+        for (int b = 0; b < (cols + QK_K - 1) / QK_K; ++b)
+            FastllmGgufGemvBlock<Type>(w, dot, b, lane, cols);
+    }
+    for (int delta = 16; delta; delta /= 2)
+        sum += __shfl_down_sync(0xffffffff, sum, delta);
+    if (!lane) out[size_t(route) * rows + row] = outer ? sum * outer[expert] : sum;
+}
+
+template <ggml_type Type>
+void launchExpertProjection(const void *weights, const float *outer, const int *experts, const float *input,
+                            float *output, int routes, int routesPerInput, int cols, int rows, size_t rowBytes) {
+    ggufExpertProjection<Type><<<dim3((rows + 3) / 4, routes), 128, 0, cudaStreamPerThread>>>(
+        static_cast<const uint8_t *>(weights), outer, experts, input, output, routesPerInput, cols, rows, rowBytes);
+}
+} // namespace
+
+FastllmGGUFExpertProjection FastllmCudaGetGGUFExpertProjection(int type) {
+    switch (type) {
+        case GGML_TYPE_NVFP4: return launchExpertProjection<GGML_TYPE_NVFP4>;
+        case GGML_TYPE_IQ2_XS: return launchExpertProjection<GGML_TYPE_IQ2_XS>;
+        case GGML_TYPE_IQ2_S: return launchExpertProjection<GGML_TYPE_IQ2_S>;
+        case GGML_TYPE_IQ3_XXS: return launchExpertProjection<GGML_TYPE_IQ3_XXS>;
+        case GGML_TYPE_IQ3_S: return launchExpertProjection<GGML_TYPE_IQ3_S>;
+        case GGML_TYPE_IQ4_NL: return launchExpertProjection<GGML_TYPE_IQ4_NL>;
+        case GGML_TYPE_Q3_K: return launchExpertProjection<GGML_TYPE_Q3_K>;
+        default: throw std::runtime_error("Unsupported GGUF expert projection type " + std::to_string(type));
+    }
 }
