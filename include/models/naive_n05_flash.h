@@ -13,12 +13,11 @@
 #include "utils/persistent_worker_group.h"
 
 struct FastllmCudaMimoEp8Mega;
+struct FastllmDraftHeadCall;
 namespace fastkv { class HostCache; }
 
 namespace fastllm {
-    struct Mxfp4MarlinRank;
-    struct NaiveFlexMoe;
-    struct NaiveSharedFlexMoe;
+    struct FastllmTpExperts;
     class CudaWorkspace;
     class PDStateWriter;
     class PDStateReader;
@@ -366,7 +365,11 @@ namespace fastllm {
         };
         struct DraftTPState;
         std::shared_ptr<DraftTPState> draftTP;
-        bool draftFusedContextFeatures = false;
+        struct DraftExecution;
+        const DraftExecution *draftExecution = nullptr;
+        const DraftExecution &DraftOps() const;
+        bool RankDraftFeatures() const;
+        bool DraftDeviceVerification() const;
         bool draftSingleDeviceLogged = false;
         struct DraftWorkspace;
         struct DraftMoeScratch;
@@ -382,6 +385,7 @@ namespace fastllm {
         std::map<int, std::shared_ptr<void>> draftLinearGraphWorkspaces;
         struct DraftContext {
             int committed = 0;
+            uint64_t continuationSerial = 0;
             int deviceRank = -1; // Stable draft DP owner; retained with reusable KV storage.
             Data prefixHidden; // Logical prefill tail; backing belongs to the request workspace.
             std::vector<std::pair<Data, Data>> kv;
@@ -441,7 +445,7 @@ namespace fastllm {
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         bool NeedsDraftPrefillHidden(const Data &key, int end, int promptLength) const;
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
-                                std::vector<std::pair<Data, Data>> &kv);
+                                std::vector<std::pair<Data, Data>> &kv, int nextAnchor = -1);
         void ProjectDraftContext(Data &combined, Data &projected, Data &hidden);
         std::shared_ptr<DraftContext> CreateDraftContext(const std::vector<int> &devices = {});
         bool PrepareDraftTP();
@@ -470,7 +474,10 @@ namespace fastllm {
         };
         bool RunDraftBatch(const std::vector<int> &anchors,
                            const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows = 0,
-                           DraftHeadShards *headShards = nullptr);
+                           DraftHeadShards *headShards = nullptr, const FastllmDraftHeadCall *headCall = nullptr);
+        bool RunLayerDraftBatch(const std::vector<int> &anchors,
+                           const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows,
+                           DraftHeadShards *headShards, const FastllmDraftHeadCall *headCall);
         void ApplyDraftDevice();
         Data &DraftWeight(const std::string &name);
         Data RunDraftHead(Data &hidden);
@@ -503,17 +510,27 @@ namespace fastllm {
             const std::vector<int> &counts, const std::vector<DraftContext *> &contexts,
             const std::vector<std::vector<std::pair<Data, Data>> *> &caches, const std::vector<int> &past,
             const std::vector<int> &nextAnchors = {});
-        bool CommitFusedDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
-            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
-        bool CommitFusedDraftContextsImpl(TargetCapture &capture, const std::vector<int> &lengths,
-            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts,
-            const std::function<void(int)> &enqueueTarget, const std::function<void(int)> &enqueueNext = {},
-            const int *deviceAccepted = nullptr);
+        bool TryCommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor = -1,
+            const int *accepted = nullptr, const std::function<void(int)> &enqueueTarget = {},
+            const std::function<void(int)> &enqueueNext = {});
+        bool CommitRootDraftRows(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor,
+            const int *accepted, const std::function<void(int)> &enqueueTarget,
+            const std::function<void(int)> &enqueueNext);
+        bool CommitRankDraftRows(TargetCapture &capture, const std::vector<int> &lengths,
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor,
+            const int *accepted, const std::function<void(int)> &enqueueTarget,
+            const std::function<void(int)> &enqueueNext);
         struct DraftContextFence;
         void DrainPendingDraftContext();
         bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
-            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts);
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor = -1);
         struct DraftRound;
+        bool TryDraftProposal(DraftRound &round);
+        bool TryDraftProposal(const std::vector<DraftRound *> &rounds, const Data &normalized);
+        bool TryDraftProposal(const std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &normalized);
+        bool TryDraftHeadProposal(DraftRound &round);
         void PrepareDraftRound(DraftRound &round, const Data *preparedLogits = nullptr, const Data *preparedHidden = nullptr);
         bool PrepareDraftBatch(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
                                int reserveRows = 0, bool *backboneReady = nullptr,
@@ -527,9 +544,11 @@ namespace fastllm {
         bool PrepareFusedDraftProposal(const std::vector<DraftRound *> &rounds, const Data &hidden);
         void JoinDraftVerification(TargetCapture &capture);
         bool BorrowDraftLookahead(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts, Data &hidden);
-        bool RunDraftLowLatencyBatch(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts, Data &normalized);
+        bool RunDraftLowLatencyBatch(const std::vector<int> &anchors, const std::vector<DraftContext *> &contexts,
+                                     Data &normalized, int, DraftHeadShards *, const FastllmDraftHeadCall *);
         bool PrepareLowLatencyProposalGraph(const std::vector<DraftRound *> &rounds, const Data &logits, const Data *hidden = nullptr, int rank = -1);
         void PrepareLowLatencyDraftServingMemory(bool history);
+        void PrepareLayerDraftServingMemory(bool history);
         void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth, int rank = -1);
         void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
             const std::vector<int> *verifyLengths = nullptr, TargetCapture *capture = nullptr);
@@ -552,6 +571,8 @@ namespace fastllm {
         bool preparingGraphs = false, draftCapturing = false;
         int draftPrepareCapacity = 0;
         void PrepareTensorParallelVerification();
+        static void UploadDraftVerifyInputs(const TargetCapture &capture, void *graph, Data &storage, int stride, int rows);
+        static void *DraftVerificationExec(void *graph, const TargetCapture *capture);
         void PrepareDraftVerificationGraphs(void *fused,const std::vector<const void *> &hidden,
                                             const std::vector<void *> &ready);
         bool draftEnabled = false;
@@ -707,8 +728,7 @@ namespace fastllm {
         NaiveMoeBackend tpMoeBackend = NaiveMoeBackend::LegacyTP;
         bool tpPackedMoeSources = false; // Hopper borrows its original layout.
         std::shared_ptr<FastllmCudaMimoEp8Mega> tpEp8MegaState;
-        std::shared_ptr<NaiveFlexMoe> tpFlexMoe;
-        std::shared_ptr<NaiveSharedFlexMoe> tpSharedFlex;
+        std::shared_ptr<FastllmTpExperts> tpExperts;
         std::vector<std::shared_ptr<TargetWorkspace>> tpVerifyWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpBatchWorkspaces;
         std::vector<std::shared_ptr<TargetWorkspace>> tpPrefillWorkspaces;
@@ -764,7 +784,6 @@ namespace fastllm {
             return !HasSeparateIndexer() && HasLocalIndexer(layer, rank) ? IndexerCacheWidth(AuxiliaryKVType()) : 0;
         }
         std::vector<std::vector<Data *>> moeWeights, moeBiases;
-        std::vector<std::shared_ptr<Mxfp4MarlinRank>> tpMarlinRanks;
     };
 }
 #endif

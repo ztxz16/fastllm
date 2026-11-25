@@ -64,9 +64,10 @@ __device__ __forceinline__ void SwaQueryScores(SwaQueryStorage<Queries> &s, cons
     __syncthreads();
 #endif
 }
-template <int Queries>
+template <bool Pack = false, int Queries>
 __device__ __forceinline__ void SwaQueryValues(SwaQueryStorage<Queries> &s, const int *offsets,
-        BF *out, int row, int count, int heads, int head, int w, int l, const int *lengths = nullptr) {
+        BF *out, int row, int count, int heads, int head, int w, int l, const int *lengths = nullptr,
+        FastllmMxfp8Activation packed = {}) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_attention_bulk;
     float acc[Queries][4] = {};
@@ -84,10 +85,25 @@ __device__ __forceinline__ void SwaQueryValues(SwaQueryStorage<Queries> &s, cons
     for (int r = 0; r < Queries; ++r)
         if (r < count) {
 #pragma unroll
-            for (int i = 0; i < 4; ++i)
-                out[((size_t)(row + r) * heads + head + (l % 4) * 2 + i % 2) * 128 + w * 16 + l / 4 + (i / 2) * 8] =
-                    __float2bfloat16(lengths && !lengths[r] ? 0.f : acc[r][i]);
+            for (int i = 0; i < 4; ++i) {
+                const int h = (l % 4) * 2 + i % 2, col = w * 16 + l / 4 + (i / 2) * 8;
+                const BF value = __float2bfloat16(lengths && !lengths[r] ? 0.f : acc[r][i]);
+                if constexpr (Pack) s.q[r][h][col] = value;
+                else out[((size_t)(row + r) * heads + head + h) * 128 + col] = value;
+            }
         }
+    if constexpr (Pack) {
+        // Q is dead after the score MMA. Transpose the PV fragments there so
+        // adjacent lanes can write BF16 and quantize the same rounded values.
+        __syncthreads();
+        for (int i = threadIdx.x; i < count * 128; i += 256) {
+            const int r = i / 128, h = i / 16 % 8, col = i % 16 * 8;
+            const uint4 value = *reinterpret_cast<const uint4 *>(&s.q[r][h][col]);
+            const int offset = (head + h) * 128 + col;
+            *reinterpret_cast<uint4 *>(out + size_t(row + r) * heads * 128 + offset) = value;
+            fastllm_mxfp8::Store8(packed, row + r, offset, value);
+        }
+    }
 #endif
 }
 template <int Queries>
@@ -542,7 +558,7 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
             prefix = past;
         }
     }
-    if constexpr (BlackwellFP8) {
+    if constexpr (BlackwellFP8 || Pack) {
         if (end == 0) {
             for (int i = threadIdx.x; i < group.count * 128; i += blockDim.x) {
                 BF *dst = out + (size_t(group.first + i / 128) * heads + blockIdx.y * 8) * 128;
@@ -598,7 +614,7 @@ __global__ __launch_bounds__(256) void SwaVerifyQueries(const BF *q,
         LoadSwaUnion<192, 200, 128 + Queries - 1>(s.tile.k, s.selected, key, first, end, row.keyStride, kh);
         SwaQueryScores(s, offsets, lengths, group.count, sink, head, w, l);
         LoadSwaUnion<128, 136, 128 + Queries - 1>(s.tile.v, s.selected, value, first, end, kvHeads * 128, kh);
-        SwaQueryValues(s, offsets, out, group.first, group.count, heads, head, w, l, lengths);
+        SwaQueryValues<Pack>(s, offsets, out, group.first, group.count, heads, head, w, l, lengths, packed);
     }
 #endif
 }

@@ -2433,11 +2433,11 @@ __global__ void FastllmGemvBf16Block32SplitLoad(const __nv_bfloat16 *__restrict_
 // Group output channels without serializing their two 32-thread partials.
 // The input traversal, FMA order and compensated 64-thread reduction match
 // Kernel1MultiRow. Callers guarantee four-element input/weight alignment.
-template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS>
+template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS, typename Scale = float>
 __device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
         const __nv_bfloat16 *__restrict__ A, const uint8_t *__restrict__ B,
         __nv_bfloat16 *__restrict__ C, const __nv_bfloat16 *__restrict__ bias,
-        const float *__restrict__ scales, int m, int k, int blockM, int blockK,
+        const Scale *__restrict__ scales, int m, int k, int blockM, int blockK,
         int outputBlock) {
     const int tid = threadIdx.x % 64;
     const int lane = tid % 32;
@@ -2449,7 +2449,7 @@ __device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
     const int shiftK = POWER_OF_TWO_BLOCKS ? __ffs(blockK) - 1 : 0;
     const int ms = POWER_OF_TWO_BLOCKS ? ((m - 1) >> shiftM) + 1
                                      : (m - 1) / blockM + 1;
-    const float *rowScales = scales + (POWER_OF_TWO_BLOCKS ? st >> shiftK : st / blockK) * ms;
+    const size_t scaleRow = size_t(POWER_OF_TWO_BLOCKS ? st >> shiftK : st / blockK) * ms;
     const uint8_t *baseB = B + (size_t)st * m;
     float partial[PART];
 #pragma unroll
@@ -2462,7 +2462,15 @@ __device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
 #pragma unroll (PART == 1 ? 4 : 1)
 #endif
     for (int i = tid * 4; i < m; i += 256) {
-        const float curScale = rowScales[POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM];
+        float curScale;
+        if constexpr (std::is_same_v<Scale, uint8_t>) {
+            // Native SM120 MXFP8 scales are tiled in 128 channels by four K32 groups.
+            const size_t tile = size_t(st / 128) * (m / 128) + i / 128;
+            const unsigned exponent = scales[tile * 512 + (st % 32) * 16 + (st % 128) / 32 * 4 + i / 32 % 4];
+            curScale = __uint_as_float(exponent ? exponent << 23 : 0x00400000u);
+        } else {
+            curScale = scales[scaleRow + (POWER_OF_TWO_BLOCKS ? i >> shiftM : i / blockM)];
+        }
         const uint32_t bb = *(const uint32_t*)(baseB + i);
         const uint16_t b0Bits =
             (((bb >> 0) & 0x80) << 8) | (((bb >> 0) & 0x7F) << 4);
@@ -2511,11 +2519,11 @@ __device__ __forceinline__ void FastllmGemvBF16FP8E4M3RegisterRowsBody(
     }
 }
 
-template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS>
+template <int ROWS, int PART, bool POWER_OF_TWO_BLOCKS, typename Scale = float>
 __global__ void FastllmGemvBF16FP8E4M3KernelRegisterRows(
         const __nv_bfloat16 *__restrict__ A, const uint8_t *__restrict__ B,
         __nv_bfloat16 *__restrict__ C, const __nv_bfloat16 *__restrict__ bias,
-        const float *__restrict__ scales, int m, int k, int blockM, int blockK) {
+        const Scale *__restrict__ scales, int m, int k, int blockM, int blockK) {
     FastllmGemvBF16FP8E4M3RegisterRowsBody<ROWS, PART, POWER_OF_TWO_BLOCKS>(
         A, B, C, bias, scales, m, k, blockM, blockK, blockIdx.x);
 }
@@ -3057,22 +3065,29 @@ static void LaunchSenseNovaFp8Verify(const __nv_bfloat16 *x, const uint8_t *w, c
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
 const FastllmMxfp8ProjectionBackend *FastllmCudaBlackwellMxfp8Projection();
 #endif
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
+const FastllmMxfp8ProjectionBackend *FastllmCudaSm120PackedProjection();
+#endif
 const FastllmMxfp8ProjectionBackend *FastllmCudaGetMxfp8ProjectionBackend() {
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
     if (FastllmCudaRuntimeArch() == 103) return FastllmCudaBlackwellMxfp8Projection();
+#endif
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
+    if (FastllmCudaRuntimeArch() == 120) return FastllmCudaSm120PackedProjection();
 #endif
     return nullptr;
 }
 
 FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Bind(const fastllm::Data &weight,
         int rows, bool verifying, int maxWidth, fastllm::Data &storage) const {
-    if (rows <= 0 || weight.dims.size() != 2) return {};
+    if (rows <= 0 || (sm120ScaleTiles && rows == 1) || weight.dims.size() != 2) return {};
     const int limit = maxRows(weight, verifying);
     const int width = weight.dims[1];
     if (rows > limit || width <= 0 || width % 128 || width > maxWidth || maxWidth % 128) return {};
     const size_t capacity = (size_t(limit) + 3) / 4 * 4;
     const size_t valueBytes = capacity * maxWidth;
-    const size_t bytes = valueBytes + valueBytes / 32;
+    const size_t scaleRows = sm120ScaleTiles ? (capacity + 127) / 128 * 128 : capacity;
+    const size_t bytes = valueBytes + scaleRows * (maxWidth / 32);
     // One address shared across layers. A later capture cannot grow an arena
     // already referenced by another graph.
     if (!storage.cudaData) {
@@ -3085,24 +3100,25 @@ FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Bind(const fastllm::Data &
     }
     if (bytes > storage.expansionBytes || storage.dataDeviceIds != weight.dataDeviceIds) return {};
     auto *values = static_cast<uint8_t *>(storage.cudaData);
-    return {values, values + valueBytes, rows, width, (rows + 3) / 4 * 4};
+    return {values, values + valueBytes, rows, width, (rows + 3) / 4 * 4, sm120ScaleTiles ? 0 : -1};
 }
 
 FastllmMxfp8Activation FastllmMxfp8ProjectionBackend::Borrow(const fastllm::Data &weight, int rows,
         const fastllm::Data &scratch, bool prefill) const {
-    if (weight.dims.size() != 2 || rows <= 0 || rows > INT_MAX - 3 ||
+    if (weight.dims.size() != 2 || rows <= 0 || (sm120ScaleTiles && rows == 1) || rows > INT_MAX - 127 ||
         scratch.dataDevice != fastllm::CUDA || scratch.dataDeviceIds != weight.dataDeviceIds ||
         !scratch.cudaData || (uintptr_t(scratch.cudaData) & 15)) return {};
     const int width = weight.dims[1];
     if (width <= 0 || width % 128) return {};
     const int pitch = (rows + 3) / 4 * 4;
     const size_t bytes = size_t(pitch) * width;
-    if (bytes + bytes / 32 > scratch.GetBytes()) return {};
+    const size_t scaleRows = sm120ScaleTiles ? (size_t(rows) + 127) / 128 * 128 : pitch;
+    if (bytes + scaleRows * (width / 32) > scratch.GetBytes()) return {};
     if (prefill) {
         if (!canPackPrefill || !canPackPrefill(weight, rows)) return {};
     } else if (rows > maxRows(weight, true)) return {};
     auto *values = static_cast<uint8_t *>(scratch.cudaData);
-    return {values, values + bytes, rows, width, pitch};
+    return {values, values + bytes, rows, width, pitch, sm120ScaleTiles ? 0 : -1};
 }
 
 bool FastllmMxfp8ProjectionBackend::TryProject(FastllmMxfp8Activation prepared,
@@ -3123,6 +3139,10 @@ bool FastllmMxfp8ProjectionBackend::TryProject(FastllmMxfp8Activation prepared,
     return project(prepared, weight, output.cudaData);
 }
 
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
+const uint8_t *FastllmCudaSm120GemvScales(const fastllm::Data &weight, int channels, int inner);
+#endif
+
 bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k) {
 #if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
     // Native row-wise MXFP8 projections use W8A8 for batched decode/prefill.
@@ -3135,6 +3155,23 @@ bool FastllmCudaBFloat16MatMulFP8E4M3(const fastllm::Data &input, fastllm::Data 
 #endif
     __nv_bfloat16 *cudaInput = (__nv_bfloat16*)FastllmCudaPrepareInput(input);
     __nv_bfloat16 *cudaOutput = (__nv_bfloat16*)FastllmCudaPrepareOutput(output);
+
+#if defined(FASTLLM_ENABLE_CUTLASS_FP8) && defined(FASTLLM_CUTLASS_FP8_ENABLE_SM120)
+    // Streaming large projections is bandwidth-bound at batch one. Reuse the
+    // exact UE8M0 table from prefill and retain the established W8A16 dot order.
+    if (n == 1 && (m == 4096 || m == 8192) && k >= 4096 && k % 128 == 0 &&
+        weight.blockM == 32 && weight.blockK == 1 && bias.dims.empty() &&
+        CanVectorizeBf16Fp8Rows(cudaInput, static_cast<const uint8_t *>(weight.cudaData), m, 32) &&
+        FastllmCudaRuntimeArch() == 120) {
+        if (const auto *compact = FastllmCudaSm120GemvScales(weight, k, m)) {
+            FastllmGemvBF16FP8E4M3KernelRegisterRows<2, 1, true, uint8_t><<<k / 2, 128>>>(
+                cudaInput, static_cast<const uint8_t *>(weight.cudaData), cudaOutput, nullptr, compact, m, k, 32, 1);
+            FastllmCudaFinishInput(input, cudaInput);
+            FastllmCudaFinishOutput(output, cudaOutput);
+            return true;
+        }
+    }
+#endif
 
 #ifdef FASTLLM_ENABLE_MXFP8_LINEAR_SM103
     const bool compact = FastllmCudaCompactMxfp8(weight) != nullptr;

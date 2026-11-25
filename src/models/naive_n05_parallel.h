@@ -197,10 +197,6 @@ struct NaiveN05FlashModel::AttentionParallelState {
     int servingLiveRows = 0;
     const std::vector<int> *verifyLengths = nullptr;
     struct UnsupportedServingLayout {};
-    static bool SupportsStablePrefillReduction(const std::vector<int> &architectures) {
-        return !architectures.empty() && std::all_of(architectures.begin(), architectures.end(),
-            [](int arch) { return arch == 120; });
-    }
     explicit AttentionParallelState(parallel::Topology topology)
         : runtime(topology), groups(topology.attentionDP), ranks(topology.Size()),
           rows(topology.attentionDP, {}), servingGroups(topology.attentionDP), servingRanks(topology.Size()),

@@ -45,14 +45,29 @@ static __device__ __forceinline__ void ClearGateBlock128Tail(uint8_t *dest, int 
     }
 }
 
+// Marlin's verification reference assigns strided columns to each dot
+// lane. The block-scaled path uses contiguous vectors for its packed output.
+template<bool Strided, typename Vector, typename Scalar>
+static __device__ __forceinline__ Vector ReadRouterTile(const Scalar *chunk, int thread, int element = 0) {
+    if constexpr (Strided) {
+        Vector result;
+#pragma unroll
+        for (int j = 0; j < sizeof(Vector) / sizeof(Scalar); ++j)
+            reinterpret_cast<Scalar *>(&result)[j] = chunk[thread + (element + j) * 256];
+        return result;
+    } else {
+        return *reinterpret_cast<const Vector *>(chunk + thread * 8 + element);
+    }
+}
+
 // Reuse router weights across a row tile while consuming each rounded normalization
 // vector in registers. Batch the independent norm reductions at one barrier.
 // The BF16 normalization and FP8 preparation remain bitwise unchanged;
 // FP32 dot accumulation has a separate operator-L2 validation contract.
 // Four unprepared rows share the same weights without allocating an FP8 image.
 // With a residual branch, stage the rounded sum until every router tile has read the input.
-template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false>
-static __global__ void NormRowsRouterDirect(
+template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false, bool MarlinOrder = false>
+static __device__ __forceinline__ void NormRowsRouterBody(
         const BF16 *input, const float *weight, float *output,
         const float *gamma, BF16 *normed, float eps, int rows,
         FastllmMoePreparedInput prepared, const BF16 *branch = nullptr, BF16 *sumOutput = nullptr) {
@@ -63,21 +78,23 @@ static __global__ void NormRowsRouterDirect(
     constexpr int Chunks = 2, Warps = 8;
     const int t = threadIdx.x, lane = t % 32, warp = t / 32;
     const int expert = blockIdx.x * Experts, first = blockIdx.y * Rows;
-    __shared__ float normSums[Rows][Warps], dotSums[Experts * Rows][Warps];
+    static_assert(!MarlinOrder || (!Prepare && !Residual));
+    constexpr int NormWarps = MarlinOrder ? 2 * Warps : Warps;
+    __shared__ float normSums[Rows][NormWarps], dotSums[Experts * Rows][Warps];
 
     float4 affine[Chunks * 2];
 #pragma unroll
     for (int i = 0; i < Chunks * 2; ++i) {
-        const int col = t * 8 + (i / 2) * 2048 + (i % 2) * 4;
-        affine[i] = *reinterpret_cast<const float4 *>(gamma + col);
+        const int chunk = (i / 2) * 2048;
+        affine[i] = ReadRouterTile<MarlinOrder, float4>(gamma + chunk, t, (i % 2) * 4);
     }
     float4 cached[Experts][Chunks * 2];
 #pragma unroll
     for (int e = 0; e < Experts; ++e) {
 #pragma unroll
         for (int i = 0; i < Chunks * 2; ++i) {
-            const int col = t * 8 + (i / 2) * 2048 + (i % 2) * 4;
-            cached[e][i] = *reinterpret_cast<const float4 *>(weight + size_t(expert + e) * Width + col);
+            const int chunk = (i / 2) * 2048;
+            cached[e][i] = ReadRouterTile<MarlinOrder, float4>(weight + size_t(expert + e) * Width + chunk, t, (i % 2) * 4);
         }
     }
 #if CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -97,26 +114,43 @@ static __global__ void NormRowsRouterDirect(
     float inv[Rows];
 #pragma unroll
     for (int row = 0; row < Rows; ++row) {
-        float square = 0.f;
+        if constexpr (MarlinOrder) {
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            const int index = (first + row) * Width + t + i * 256;
-            float v = 0.f;
-            if (first + row < rows) {
-                BF16 x = input[index];
-                if constexpr (Residual) x = __hadd(x, branch[index]);
-                v = float(x);
+            for (int c = 0; c < Chunks; ++c) {
+                uint4 packet{};
+                if (first + row < rows)
+                    packet = *reinterpret_cast<const uint4 *>(input + (first + row) * Width + c * 2048 + t * 8);
+                float square = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float v = float(reinterpret_cast<const BF16 *>(&packet)[j]);
+                    square += v * v;
+                }
+                square = fastllm::cuda::WarpSum(square);
+                if (!lane) normSums[row][c * Warps + warp] = square;
             }
-            square += v * v;
+        } else {
+            float square = 0.f;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int index = (first + row) * Width + t + i * 256;
+                float v = 0.f;
+                if (first + row < rows) {
+                    BF16 x = input[index];
+                    if constexpr (Residual) x = __hadd(x, branch[index]);
+                    v = float(x);
+                }
+                square += v * v;
+            }
+            square = fastllm::cuda::WarpSum(square);
+            if (lane == 0) normSums[row][warp] = square;
         }
-        square = fastllm::cuda::WarpSum(square);
-        if (lane == 0) normSums[row][warp] = square;
 #pragma unroll
         for (int c = 0; c < Chunks; ++c) {
             const int offset = (first + row) * Width + t * 8 + c * 2048;
             uint4 x{};
             if (first + row < rows) {
-                x = *reinterpret_cast<const uint4 *>(input + offset);
+                x = ReadRouterTile<MarlinOrder, uint4>(input + (first + row) * Width + c * 2048, t);
                 if constexpr (Residual) {
                     const uint4 y = *reinterpret_cast<const uint4 *>(branch + offset);
 #pragma unroll
@@ -133,7 +167,7 @@ static __global__ void NormRowsRouterDirect(
     __syncthreads();
 #pragma unroll
     for (int row = 0; row < Rows; ++row) {
-        const float sum = fastllm::cuda::WarpSum(lane < 8 ? normSums[row][lane] : 0.f);
+        const float sum = fastllm::cuda::WarpSum(lane < NormWarps ? normSums[row][lane] : 0.f);
         inv[row] = rsqrtf(sum / Width + eps);
     }
 #pragma unroll
@@ -162,8 +196,16 @@ static __global__ void NormRowsRouterDirect(
                 for (int j = 0; j < 8; ++j)
                     partial[e][row] = __fmaf_rn(v[j], w[j], partial[e][row]);
             }
-            if (expert == 0 && first + row < rows)
-                *reinterpret_cast<uint4 *>(normed + (first + row) * Width + col) = rounded;
+            if (expert == 0 && first + row < rows) {
+                BF16 *dst = normed + (first + row) * Width + c * 2048;
+                if constexpr (MarlinOrder) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        dst[t + j * 256] = reinterpret_cast<const BF16 *>(&rounded)[j];
+                } else {
+                    *reinterpret_cast<uint4 *>(dst + t * 8) = rounded;
+                }
+            }
             if constexpr (Prepare) if (blockIdx.x == warp + c * Warps) {
                 mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 1));
                 mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
@@ -202,6 +244,15 @@ static __global__ void NormRowsRouterDirect(
         if (t % 8 == 0 && first + task % Rows < rows)
             output[(first + task % Rows) * 256 + expert + task / Rows] = 1.0 / (1.0 + expf(-(value + 0.f)));
     }
+}
+
+template<int Experts, int Rows = 2, bool Prepare = true, int Capacity = 8, bool Residual = false, bool WaitForSwa = false>
+static __global__ void NormRowsRouterDirect(
+        const BF16 *input, const float *weight, float *output,
+        const float *gamma, BF16 *normed, float eps, int rows,
+        FastllmMoePreparedInput prepared, const BF16 *branch = nullptr, BF16 *sumOutput = nullptr) {
+    NormRowsRouterBody<Experts, Rows, Prepare, Capacity, Residual, WaitForSwa>(
+        input, weight, output, gamma, normed, eps, rows, prepared, branch, sumOutput);
 }
 
 } // namespace fastllm_norm_rows

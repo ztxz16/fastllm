@@ -58,6 +58,10 @@ bool FastllmCudaCustomScalarMaxUint64(void *value, int deviceId);
 bool FastllmCudaCustomAllReduceWithSpin(void* data, void* dest, int count,
                                       int dataType, int deviceId, int hostSpinMicroseconds);
 // Combine local BF16 expert slots and the rank-ordered TP sum, reusing consumed slot storage.
+struct FastllmMxfp8Activation;
+bool FastllmCudaCustomAllReduceExpertRowsNorm(void *partials, const int32_t *ids, void *output,
+        int rows, int hidden, int topk, int deviceId, void *residual, const float *weight, void *normed, float eps,
+        const FastllmMxfp8Activation &next, void *feature, int featureStride);
 bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, void *output,
         int rows, int hidden, int topk, int deviceId);
 // Reduce a block with the rank-ordered FP32 arithmetic selected for one row.
@@ -147,6 +151,8 @@ decltype(FastllmCudaSwaVerifyLayerPrepared) FastllmCudaSwaVerifyLayerAfterExpert
 // Reads data without materializing its full reduction, updates residual, and
 // writes output. The three tensors must not overlap. Unsupported inputs or a
 // disabled custom collective return false before launching any work.
+bool FastllmCudaDraftReduceAddNorm7(void *data, void *residual, const float *weight,
+    void *output, float eps, int deviceId);
 bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
     const float *weight, void *output, int count, int channels,
     float eps, int dataType, int deviceId);

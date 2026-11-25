@@ -2,8 +2,7 @@
 #include "models/naive_n05_flash.h"
 #include "naive_n05_tp.h"
 #ifdef USE_CUDA
-#include "naive_n05_flexmoe.h"
-#include "naive_n05_shared_flex.h"
+#include "devices/multicuda/fastllm-naive-experts.h"
 #endif
 #include "naive_n05_parallel.h"
 #include "models/mimo_tool_grammar.h"
@@ -20,19 +19,16 @@
 #include <stdexcept>
 #include <optional>
 #ifdef USE_CUDA
+#include "devices/multicuda/fastllm-naive-context-indexer.h"
 #include "devices/cuda/cudaworkspace.h"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
-#include "devices/cuda/naive-n05-draft-fused.h"
-#endif
 #include "devices/cuda/fastllm-fp8-auxiliary.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mxfp4-ep-graph.h"
 #include "devices/cuda/fastllm-mxfp4-ep-generic.h"
 #include "devices/cuda/fastllm-moe-weight-owner.h"
-#include "devices/cuda/fastllm-mxfp4-marlin-tp.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
@@ -233,16 +229,11 @@ bool NaiveN05FlashModel::InitTensorParallel() {
     const bool enabled = NaiveMoeFusionEnabled() && ResidentMoePlacement();
     const bool geometry = NaiveMoeGeometrySupported(embed_dim, num_experts,
         num_experts_per_tok, block_cnt, norm_topk_prob, routed_scaling_factor);
-    const bool shared = NaiveSharedFlexMoe::Requested(), old = NaiveFlexMoe::Requested();
     const bool mega = enabled && layout && norm_topk_prob && routed_scaling_factor == 1.0f && explicitEp &&
         (fixedGeometry ? FastllmCudaMimoEp8MegaSupported(tpDevices) : FastllmGenericEpSupported(tpDevices));
-    const bool flex = attentionDP == 1 && enabled && geometry && (shared ? NaiveSharedFlexMoe::DeviceSupported(tpDevices) :
-        old && NaiveFlexMoe::DeviceSupported(tpDevices));
-    tpMoeBackend = SelectNaiveMoeBackend(epRanks, shared, old, mega, flex, geometry || mega, true, enabled);
+    tpMoeBackend = FastllmTpExperts::Plan(tpDevices, epRanks, enabled, geometry, attentionDP == 1, mega,
+                                         tpPackedMoeSources);
     tpEp8Mega = NaiveMoeUsesEP(tpMoeBackend);
-    tpPackedMoeSources = tpMoeBackend == NaiveMoeBackend::FlexTP ||
-        tpMoeBackend == NaiveMoeBackend::LegacyFlexTP ||
-        (tpEp8Mega && FastllmCudaMimoEp8MegaOwnsPackedWeights(tpDevices.front()));
     fprintf(stderr, "[Naive MoE admission] requested_ep=%d actual_ep=%d backend=%s\n",
         epRanks, tpEp8Mega ? ranks : 1, NaiveMoeBackendName(tpMoeBackend));
     return true;
@@ -257,12 +248,13 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
     if (tpMoePreparationFailed)
         throw std::runtime_error("Packed MoE preparation previously failed; reload the model before retrying.");
     if (tpPrepared) {
-        AssertInFastLLM(!(tpSharedFlex || tpFlexMoe || tpEp8MegaState) ||
-            (dataType == BFLOAT16 && moeAtype == BFLOAT16 && norm_topk_prob && routed_scaling_factor == 1.0f &&
-             (tpEp8MegaState || NaiveMoeGeometrySupported(embed_dim, num_experts, num_experts_per_tok, block_cnt, norm_topk_prob, routed_scaling_factor))),
-            "Specialized MoE configuration changed after preparation; reload the model to change routing or activation type.");
-        AssertInFastLLM(tpMarlinRanks.empty() || (dataType == BFLOAT16 && moeAtype == BFLOAT16),
-                       "Prepared Marlin TP requires BF16 activations.");
+        const bool bf16 = dataType == BFLOAT16 && moeAtype == BFLOAT16;
+        const bool fixedRouting = norm_topk_prob && routed_scaling_factor == 1.0f &&
+            (tpEp8MegaState || NaiveMoeGeometrySupported(embed_dim, num_experts, num_experts_per_tok,
+                                                        block_cnt, norm_topk_prob, routed_scaling_factor));
+        if (tpExperts) tpExperts->Validate(bf16, fixedRouting);
+        AssertInFastLLM(!tpEp8MegaState || (bf16 && fixedRouting),
+                       "Prepared EP configuration changed; reload the model.");
         return;
     }
     const int ranks = tpDevices.size();
@@ -360,9 +352,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         auto state = std::make_shared<AttentionParallelState>(
             parallel::Topology(tpDevices, attentionDP, tpEp8Mega ? ranks : 1));
         // Dense TP spans the whole world, so every rank must select the same collective.
-        std::vector<int> architectures(ranks);
-        state->runtime.Run([&](int rank, int) { architectures[rank] = FastllmCudaRuntimeArch(); });
-        state->stablePrefillReduction = AttentionParallelState::SupportsStablePrefillReduction(architectures);
+        state->stablePrefillReduction = FastllmCudaStablePrefillReduction(state->runtime);
         attentionParallel = std::move(state);
     }
     const int attentionRanks = AttentionTPSize();
@@ -539,49 +529,12 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
             tpMoeBiases[r][layer].resize(weights.size(), nullptr);
         }
     }
-    if ((tpMoeBackend == NaiveMoeBackend::FlexTP || tpMoeBackend == NaiveMoeBackend::LegacyFlexTP) &&
-        !NaiveSharedFlexMoe::TPWeightsSupported(tpMoeWeights, tpDevices, tpMoeBackend == NaiveMoeBackend::FlexTP)) {
-        tpMoeBackend = NaiveMoeBackend::LegacyTP;
-        tpPackedMoeSources = false;
-        fprintf(stderr,"[Naive MoE fallback] unsupported TP shards; keep original weights and MoE.\n");
-    }
-    // Once packing starts, a failure may have retired part of the source.
-    // Keep retries closed until the complete prepared representation exists.
+    // Packed sources cannot be retried after a partial conversion.
     tpMoePreparationFailed = releaseSources || (native && mxfp4Only);
-#ifndef USE_ROCM
-    if (tpMoeBackend == NaiveMoeBackend::LegacyTP && dataType == BFLOAT16 && moeAtype == BFLOAT16 &&
-        attentionDP == 1 && NaiveMoeFusionEnabled() && ResidentMoePlacement()) {
-        std::vector<std::shared_ptr<Mxfp4MarlinRank>> prepared(ranks);
-        const int previous = FastllmCudaGetDevice();
-        for (int r = 0; r < ranks; ++r) {
-            FastllmCudaSetDevice(tpDevices[r]);
-            prepared[r] = PrepareMxfp4MarlinRank(tpDevices[r], tpMoeWeights[r], embed_dim, num_experts, num_experts_per_tok);
-            if (!prepared[r]) break;
-        }
-        FastllmCudaSetDevice(previous);
-        if (prepared.back()) {
-            tpMoePreparationFailed = true;
-            std::vector<std::exception_ptr> errors(ranks);
-            tpWorkers.Run(tpDevices, [&](int r) {
-                FastllmCudaSetDevice(tpDevices[r]);
-                PackMxfp4MarlinRank(*prepared[r], tpMoeWeights[r]);
-            }, errors);
-            for (auto error : errors) if (error) std::rethrow_exception(error);
-            tpMarlinRanks = std::move(prepared);
-        }
-    }
-#endif
-    if (tpMoeBackend == NaiveMoeBackend::LegacyFlexTP)
-        tpFlexMoe = std::make_shared<NaiveFlexMoe>(tpDevices, tpMoeWeights);
-    if (tpEp8Mega) tpEp8MegaState = FastllmCudaCreateMimoEp8Mega(tpDevices, tpMoeWeights, num_experts_per_tok);
-    if (tpMoeBackend == NaiveMoeBackend::FlexEP &&
-        !NaiveSharedFlexMoe::CanBorrowEpWeights(*tpEp8MegaState, tpMoeWeights)) {
-        tpMoeBackend = NaiveMoeBackend::MegaEP;
-        fprintf(stderr, "[Naive MoE fallback] Flex cannot use the packed EP layout; retaining MegaMoE.\n");
-    }
-    if (tpMoeBackend == NaiveMoeBackend::FlexTP || tpMoeBackend == NaiveMoeBackend::FlexEP)
-        tpSharedFlex = std::make_shared<NaiveSharedFlexMoe>(tpDevices, tpMoeWeights, tpEp8MegaState.get(),
-            draftEnabled && std::min(draftTokens, draftBlock) == 7);
+    tpExperts = FastllmTpExperts::Prepare(tpMoeBackend, tpPackedMoeSources, tpDevices, tpMoeWeights,
+        embed_dim, num_experts, num_experts_per_tok, dataType == BFLOAT16 && moeAtype == BFLOAT16 &&
+        attentionDP == 1 && NaiveMoeFusionEnabled() && ResidentMoePlacement(),
+        draftEnabled && std::min(draftTokens, draftBlock) == 7, tpWorkers, tpMoePreparationFailed, tpEp8MegaState);
     // Parents retain only names/shapes and ownership of their metadata views.
     // Retire CPU payload/scales after every local source has been consumed.
     size_t sourceBytes = 0, sourcePointers = 0;
@@ -598,7 +551,7 @@ void NaiveN05FlashModel::PrepareTensorParallel() {
         }
     }
     fprintf(stderr,"[Naive MoE prepared] backend=%s original_payload_pointers=%zu original_payload_bytes=%zu\n",
-        tpMarlinRanks.empty() ? NaiveMoeBackendName(tpMoeBackend) : "marlin-tp/mxfp4-w4a16", sourcePointers, sourceBytes);
+        tpExperts ? tpExperts->Name() : NaiveMoeBackendName(tpMoeBackend), sourcePointers, sourceBytes);
     tpIndexerPeerAccess = indexerLayerSharding && tpEp8MegaState && FastllmCudaPeerAccessInit(tpDevices);
     tpSwaRingCache = (GetFastllmEnv().cudaGraph || (attentionDP > 1 && !draftEnabled)) &&
         FastllmNaiveKVType(AuxiliaryKVType()) &&
@@ -1024,8 +977,8 @@ void NaiveN05FlashModel::PrepareTensorParallelVerification() {
     for (auto &graph : tpBatchVerifyGraphs) graph->ClearGraphs();
     tpBatchVerifyGraphs.clear(); tpBatchVerifyState.reset(); tpVerifyState.reset();
     const int steps = std::min(8, draftTokens + 1);
-    const int backendRequests = tpFlexMoe && !tpEp8MegaState
-        ? std::max(1, 8 / steps) : (tpEp8MegaState || tpSharedFlex) ? MaxTPDecodeBatch : 8;
+    const int backendRequests = tpExperts && tpExperts->UpdatesResidual()
+        ? std::max(1, 8 / steps) : (tpEp8MegaState || (tpExperts && tpExperts->AllowsLargeBatch())) ? MaxTPDecodeBatch : 8;
     const int requests = std::min(maxBatch > 0 ? maxBatch : 256, backendRequests);
     // Verification cannot invent inactive requests: prepare exact small
     // request counts, including the 5/6/7-request tails of an eight-way batch.
@@ -2231,7 +2184,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     // The verification kernels accept every block length up to eight, including
     // shortened rounds near an output limit. Key the graph by its actual shape.
     if (verifying && !batch && (rows < 1 || rows > 8)) return false;
-    const int maxBatchRows = (tpEp8MegaState || tpSharedFlex) ? (maxBatch > 0 ? maxBatch : 512) : 8;
+    const int maxBatchRows = (tpEp8MegaState || (tpExperts && tpExperts->AllowsLargeBatch())) ? (maxBatch > 0 ? maxBatch : 512) : 8;
     if (batch && ((!verifying && !batch->Decode()) || batch->Size() > maxBatchRows)) return false;
     const std::vector<int> sequenceRows = batch ? batch->lengths : std::vector<int>{rows};
     if (verifying && std::any_of(sequenceRows.begin(), sequenceRows.end(),
@@ -2670,7 +2623,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
     state->ncclGeneration = generation;
     // Shared Flex TP has an ordered eight-row adapter for larger inputs.
     // Only the original fixed-row Flex backend still requires this limit.
-    if (tpFlexMoe && !tpEp8MegaState && rows > 8) return false;
+    if (tpExperts && tpExperts->UpdatesResidual() && rows > 8) return false;
     // Decode and verification share the resident EP dispatch arena.
     // Its descriptors and barriers are prepared before capture, as for BS1.
     for (int rank = 0; rank < ranks; ++rank) {
@@ -2682,7 +2635,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
             it->second->dataType != BFLOAT16) return false;
         // EP8 weights/descriptors were validated when its state was created.
         // The remaining checks apply only to resident indexed TP experts.
-        for (int layer = 0; tpMarlinRanks.empty() && !tpEp8MegaState && !tpSharedFlex && !tpFlexMoe && layer < block_cnt; ++layer) {
+        for (int layer = 0; !tpExperts && !tpEp8MegaState && layer < block_cnt; ++layer) {
             if (!moeLayers[layer]) continue;
             auto &weights = tpMoeWeights[rank][layer];
             if (weights.size() < 4 || !weights[2] || !weights[3]) return false;
@@ -2759,7 +2712,7 @@ bool NaiveN05FlashModel::PrepareTensorParallelDecode(const Data &inputIds,
         state->ranks[rank]->features.verifying = verifying;
         state->ranks[rank]->features.collectHidden = collectHidden;
         if (verifying && batch && dynamicCache && collectHidden &&
-            (rank == 0 || (draftFusedContextFeatures && rank < (int)draftTargetLayers.size()))) {
+            (rank == 0 || (RankDraftFeatures() && rank < (int)draftTargetLayers.size()))) {
             for (int layer : draftTargetLayers) {
                 if (rank && layer != draftTargetLayers[rank]) continue;
                 auto &backing = storage.features[layer];
@@ -2835,42 +2788,10 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
             buf.liveKeys.Resize({state.rows});
         }
         const int inputSlot = tpServingState ? tpServingState->pipelineInputSlot : -1;
-        if (capture && capture->compositeDraft && state.mode == TPDecodeState::Replay) {
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
-            std::vector<FastllmDraftHeadRequest> requests;
-            for (const auto &input : capture->draftInputs)
-                requests.push_back({input.anchor,input.position,input.seed,input.temperature});
-            AssertInFastLLM(FastllmDraftFusedVerificationUpload(r.draftVerification.get(),requests.data(),requests.size(),nullptr),
-                           "Cannot upload composite draft verification inputs.");
-            // Parameters do not depend on the prefetched hidden state. Upload
-            // while the body runs, then fence its output before graph execution.
-            FastllmCudaCurrentThreadStreamWaitEvent(capture->draftInputs.front().inputReady);
+        if (capture && (capture->compositeDraft || !capture->draftInputs.empty()) && state.mode == TPDecodeState::Replay) {
+            UploadDraftVerifyInputs(*capture, r.draftVerification.get(), storage.inputStorage, strideBytes / sizeof(float),
+                                    state.verifying ? actualRows : -1);
             buf.inputIds.Resize({1,state.rows}); buf.positions.Resize({1,state.rows}); buf.liveKeys.Resize({state.rows});
-#else
-            AssertInFastLLM(false,"Composite verification requires the fused backend.");
-#endif
-        } else if (capture && !capture->draftInputs.empty() && state.mode == TPDecodeState::Replay) {
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
-            int inputRows = 0;
-            for (const auto &input : capture->draftInputs) {
-                AssertInFastLLM(input.rows >= 2 && input.rows <= 8, "Invalid draft verification prefix.");
-                inputRows += input.rows;
-            }
-            AssertInFastLLM(state.verifying && actualRows == inputRows &&
-                !storage.inputStorage.dims.empty(), "Invalid device draft verification inputs.");
-            buf.inputIds.Resize({1,state.rows}); buf.positions.Resize({1,state.rows}); buf.liveKeys.Resize({state.rows});
-            int offset = 0;
-            for (size_t row = 0; row < capture->draftInputs.size(); ++row) {
-                const auto &input = capture->draftInputs[row];
-                if (!row || input.ready != capture->draftInputs[row-1].ready)
-                    FastllmCudaCurrentThreadStreamWaitEvent(input.ready);
-                AssertInFastLLM(FastllmDraftFusedVerificationInput(input.tokens,storage.inputStorage.cudaData,
-                    strideBytes/sizeof(float),offset,input.position,input.rows,nullptr), "Cannot prepare device verification inputs.");
-                offset += input.rows;
-            }
-#else
-            AssertInFastLLM(false,"Device draft verification requires the fused backend.");
-#endif
         } else if (inputSlot >= 0 && state.mode == TPDecodeState::Replay) {
             if (attentionParallel) {
             // The input table gathers global token rows from all owners.
@@ -2982,11 +2903,8 @@ Data NaiveN05FlashModel::ForwardTensorParallelDecode(int rank, const Data &input
         const int inputSlot = tpServingState ? tpServingState->pipelineInputSlot : -1;
         void *exec = inputSlot >= 0 && !attentionParallel ? r.pipelineExec[inputSlot] :
             candidateResult && r.selectionExec ? r.selectionExec : r.exec;
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
         if (r.draftVerification && inputSlot < 0 && !(candidateResult && r.selectionExec))
-            exec=FastllmDraftFusedVerificationExecReady(r.draftVerification.get(),capture && capture->compositeDraft,
-                capture && !capture->draftInputs.empty() && capture->draftInputs.front().proposed);
-#endif
+            exec = DraftVerificationExec(r.draftVerification.get(), capture);
         AssertInFastLLM(FastllmCudaGraphLaunch(exec), "Naive TP decode graph launch failed.");
         // Startup can exercise a logits graph even if its optional greedy
         // child failed preparation. Real greedy requests reject that shape.
@@ -3847,7 +3765,7 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     });
     if (capture) {
         capture->hidden = std::move(captures[0].hidden);
-        if (draftFusedContextFeatures && verify) {
+        if (RankDraftFeatures() && verify) {
             capture->rankHidden.resize(tpDevices.size());
             for (size_t rank = 1; rank < captures.size(); ++rank)
                 capture->rankHidden[rank] = std::move(captures[rank].hidden);
@@ -3942,41 +3860,6 @@ Data NaiveN05FlashModel::ForwardTensorParallel(const Data &inputIds, const Data 
     return output;
 #else
     return Data();
-#endif
-}
-
-void NaiveN05FlashModel::PrepareDraftVerificationGraphs(void *fused,
-        const std::vector<const void *> &hidden,const std::vector<void *> &ready) {
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
-    if (!preparingGraphs || !draftCapturing || !fused || hidden.size()!=tpDevices.size() || ready.size()!=tpDevices.size()) return;
-    const int verifyRows = draftTokens+1;
-    if (verifyRows < 2 || verifyRows > draftBlock+1 || verifyRows > 8) return;
-    for (auto &state : tpBatchVerifyGraphs) {
-        const int count=state->sequenceRows.size();
-        if (!state->captured || state->disabled || count<1 || count>64 || state->rows!=count*verifyRows ||
-            !std::all_of(state->sequenceRows.begin(),state->sequenceRows.end(),[&](int rows) { return rows==verifyRows; })) continue;
-        bool complete=true;
-        std::vector<std::shared_ptr<void>> plans(tpDevices.size());
-        for (size_t rank=0; rank<tpDevices.size(); ++rank) {
-            auto &r=*state->ranks[rank]; auto &storage=*r.storage;
-            FastllmCudaSetDevice(tpDevices[rank]);
-            const int stride=storage.maxRows?storage.maxRows:state->rows;
-            void *plan=FastllmDraftFusedVerificationCreate(fused,rank,count,hidden[rank],
-                storage.inputStorage.cudaData,stride,ready[rank],r.graph,verifyRows);
-            plans[rank]=std::shared_ptr<void>(plan,FastllmDraftFusedVerificationDestroy);
-            complete=complete && plan;
-        }
-        if (complete) for (size_t rank=0;rank<tpDevices.size();++rank) {
-            auto &r=*state->ranks[rank];
-            FastllmCudaSetDevice(tpDevices[rank]);
-            r.draftVerification=std::move(plans[rank]);
-            r.draftFused=fused;r.draftHidden=hidden[rank];
-            // The prefix can be disabled on this same executable for fallback.
-            // Do not retain a second copy of the complete target execution plan.
-            FastllmCudaGraphExecDestroy(r.exec);r.exec=nullptr;
-        }
-    }
-    ApplyDraftDevice();
 #endif
 }
 

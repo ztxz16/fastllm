@@ -175,6 +175,10 @@ struct FastllmNaiveRopeCacheRow {
     int cacheOffset = -1; // Eager contiguous verification, independent of device length.
     int verifyOffset = -1; // Candidate slot after a retained 128-token SWA ring.
 };
+bool FastllmCudaNaiveVerifySwaRing8(const fastllm::Data &packed, fastllm::Data &q,
+        const fastllm::Data &k, const fastllm::Data &v, const fastllm::Data &positions,
+        const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
+        float theta, float valueScale, const fastllm::Data &sink, fastllm::Data &attention, FastllmMxfp8Activation output);
 bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data &k,
     const fastllm::Data &v, const fastllm::Data &positions,
     const std::vector<FastllmNaiveRopeCacheRow> &rows, const fastllm::Data &liveKeys,
@@ -452,14 +456,14 @@ bool FastllmCudaNaiveBatchVerifyIndexer(const fastllm::Data &query,
     const std::vector<FastllmNaiveVerifyIndexerItem> &items, bool fp8Query,
     FastllmNaiveDecodeScratch &scratch, fastllm::Data &liveKeys,
     int contextRank = 0, int contextRanks = 1, fastllm::Data *exchange = nullptr,
-    int contextPageLen = 0);
+    int contextPageLen = 0, int directWidth = 0);
 // Complete the same causal rows after exchanging their local TopK candidates.
 void FastllmCudaNaiveMergeVerifyIndexer(
     const std::vector<FastllmNaiveVerifyIndexerItem> &items,
     FastllmNaiveDecodeScratch &scratch, const fastllm::Data &liveKeys,
-    const fastllm::Data &exchange, int contextRanks, int contextPageLen);
+    const fastllm::Data &exchange, int contextRanks, int contextPageLen, int directWidth = 0);
 // Collective dispatch must agree across the entire TP group, including mixed GPUs.
-bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices);
+bool FastllmCudaNaiveIndexerContextSupported(const std::vector<int> &devices, bool requireSm120 = false);
 // Merge rank-major (score bits, logical position) pairs after an all-gather.
 void FastllmCudaNaiveMergeDecodeIndexer(const fastllm::Data &liveKeys,
     const std::vector<FastllmNaiveIndexerRow> &rows, const fastllm::Data &exchange,
@@ -574,3 +578,9 @@ bool FastllmCudaNaiveFusedDSAVerify(const fastllm::Data &query, const fastllm::D
                                     const std::vector<FastllmNaiveDSARow> &rows, bool fp8Query, int heads,
                                     int kvHeads, int dim, int valueDim, FastllmNaiveDecodeScratch &scratch,
                                     fastllm::Data &output);
+
+#ifndef USE_ROCM
+std::shared_ptr<void> FastllmCudaCreateDraftMarkovCache(const fastllm::Data &table, const fastllm::Data &projection);
+bool FastllmCudaDraftIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
+        const fastllm::Data &weight, fastllm::Data &output, void *cache);
+#endif

@@ -1,5 +1,6 @@
 // Host-only descriptor regression. Fake device addresses are never submitted
 // to CUDA; exercise the real validation, rebinding and request lifecycle code.
+#include "devices/multicuda/fastllm-naive-context-indexer.h"
 #include "naive_n05_tp.h"
 #include "naive_n05_parallel.h"
 #include "devices/multicuda/fastllm-multicuda.cuh"
@@ -16,13 +17,25 @@ static void Check(bool ok, const char *message) {
 namespace fastllm {
 struct NaiveN05PrefixCacheTestAccess : NaiveN05FlashModel {
     static void CheckAttentionPlan() {
-        Check(AttentionParallelState::SupportsStablePrefillReduction({120, 120}),
+        Check(FastllmCudaStablePrefillReduction({120, 120}),
               "SM120 ranks must share the stable prefill reduction");
         for (const std::vector<int> &archs : std::vector<std::vector<int>>{
                  {120, 90}, {90, 120}, {120, 121}, {120, 0}, {90, 90}, {}}) {
-            Check(!AttentionParallelState::SupportsStablePrefillReduction(archs),
+            Check(!FastllmCudaStablePrefillReduction(archs),
                   "unsupported rank must disable stable prefill for the whole group");
         }
+        const NaiveVerifyAttentionPlan packed{true, false, false}, whole{false, true, true};
+        Check(packed.ForLayer(true, false, false, true, true, false).packed &&
+              !packed.ForLayer(true, true, false, true, false, false),
+              "packed SWA requires the ring cache");
+        Check(packed.ForLayer(false, false, true, true, false, true).packed &&
+              !packed.ForLayer(false, true, true, true, false, true) &&
+              !packed.ForLayer(false, false, false, true, false, true),
+              "packed DSA requires local context indices and a materialized residual");
+        Check(whole.ForLayer(true, true, false, false, true, false).swa &&
+              !whole.ForLayer(true, false, false, false, true, false) &&
+              whole.ForLayer(false, false, true, false, false, false).dsa,
+              "whole-layer SWA and DSA accept their own producer state");
         // The plan must also track large batches and arbitrary request order.
         {
             AttentionParallelState::RequestPlan plan;

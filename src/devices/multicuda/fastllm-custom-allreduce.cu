@@ -5,9 +5,17 @@
 // peer-read shape; larger TP>=4 messages use reduce-scatter/all-gather. Fixed
 // graph workspaces let us register every pointer during warmup.
 
+#include "devices/cuda/fastllm-cuda-pdl.cuh"
+#include "devices/cuda/fastllm-cuda-norm.cuh"
+#include "devices/cuda/fastllm-mxfp8-activation.cuh"
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+#include "devices/cuda/fastllm-swa-prepare.cuh"
+#endif
 #include "fastllm-cuda.cuh"
 #include "fastllm-multicuda.cuh"
+#include "fastllm-draft-sm120.h"
 #include "naive-n05-cuda.cuh"
+#include "devices/multicuda/fastllm-naive-verify.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -34,6 +42,17 @@
 #include <vector>
 #include "fastllm-custom-allreduce-tagged.cuh"
 #include "fastllm-swa-output-state.cuh"
+
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+#include "../cuda/models/naive-n05-swa-mma.cuh"
+#include "devices/cuda/naive-n05-kv.cuh"
+#include "../cuda/models/naive-n05-verify-softmax.cuh"
+#include <cooperative_groups.h>
+#include <cub/block/block_radix_sort.cuh>
+#include <curand_kernel.h>
+#include <cub/block/block_scan.cuh>
+#include <cub/block/block_reduce.cuh>
+#endif
 
 namespace {
 
@@ -322,7 +341,7 @@ __device__ __forceinline__ void CustomArBarrierPublish(
 // Owned slices are never overwritten, so peers can copy them directly without
 // a staging buffer or arithmetic. Matching start/final barriers publish prior
 // writes and prevent the next operator from reusing a source before all reads.
-template <int Ranks, bool Flatten>
+template <int Ranks, bool Flatten, bool Push = false>
 __global__ __launch_bounds__(kCustomArThreads, 1)
 void FastllmCustomAllGatherInplaceKernel(CustomArPointers rankData,
         CustomArRankSignals allSignals, CustomArSignal *selfSignal,
@@ -331,7 +350,19 @@ void FastllmCustomAllGatherInplaceKernel(CustomArPointers rankData,
     CustomArBarrierStart<Ranks>(allSignals, selfSignal, rank);
     const int stride = gridDim.x * blockDim.x;
     const int thread = blockIdx.x * blockDim.x + threadIdx.x;
-    if constexpr (Flatten) {
+    if constexpr (Push) {
+        // The owned slice is ready on this stream. Send it to each peer's
+        // disjoint receive slot, rotating destinations to spread PCIe writes.
+        for (int offset = thread; offset < part; offset += stride) {
+            const int index = rank * part + offset;
+            const uint4 value = output[index];
+            #pragma unroll
+            for (int i = 1; i < Ranks; ++i) {
+                const int dest = (rank + i) % Ranks;
+                static_cast<uint4 *>(const_cast<void *>(pointers.ptrs[dest]))[index] = value;
+            }
+        }
+    } else if constexpr (Flatten) {
         // Small messages have fewer than one CTA of payload per peer.
         // Flattening (source, offset) pairs keeps every participating thread
         // on one remote copy instead of serializing all peers through the few
@@ -1069,18 +1100,153 @@ __device__ __forceinline__ CustomArNormPacketType CustomArReducePacket(CustomArR
 
 // Slot zero is no longer needed once this rank has summed the expert rows.
 // Each CTA publishes and consumes exactly its own packet range on every rank.
-template <int Ranks>
+struct ExpertNormPack {
+    FastllmMxfp8Activation target;
+    const CustomArNormBF16 *residual;
+    CustomArNormBF16 *feature;
+    int stride;
+    __device__ void operator()(int row, int col, CustomArNormBF16 x) const {
+        if (feature) feature[size_t(row) * stride + col] = residual[row * 4096 + col];
+        if (target.values) {
+            const CustomArNormBF16 one[] = {x};
+            fastllm_mxfp8::StoreGroup(target, row, col, one);
+        }
+    }
+};
+// Each row is split into eight contiguous 1 KiB slices. Write each slice to
+// its reduction owner, so all eight operands of the TP sum are local reads.
+template <bool Early>
+__global__ void CustomArExpertRowsPeerPush(CustomArRankScratch boxes, CustomArRankSignals signals,
+        CustomArNormPacketType *partials, const int32_t *ids, CustomArNormBF16 *out,
+        int rank, CustomArNormBF16 *residual, const float *weight, CustomArNormBF16 *normed,
+        float eps, FastllmMxfp8Activation next, CustomArNormBF16 *feature, int featureStride) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
+    const int row = blockIdx.x, t = threadIdx.x;
+    if (!residual || next.values) cudaTriggerProgrammaticLaunchCompletion();
+    unsigned mask = 0;
+#pragma unroll
+    for (int slot = 0; slot < 8; ++slot) {
+        int id;
+        asm volatile("ld.global.s32 %0, [%1];" : "=r"(id) : "l"(ids + row * 8 + slot) : "memory");
+        mask |= unsigned(id >= 0) << slot;
+    }
+    if constexpr (Early) {
+        if (residual) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(weight + t * 8) : "memory");
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(residual + row * 4096 + t * 8) : "memory");
+        }
+        fastllm::cuda_pdl::Wait();
+    }
+    auto box = [&](int peer) { return static_cast<CustomArNormPacketType *>(boxes.scratch[peer]); };
+    {
+        const int col = t;
+        auto reduce = [&](auto all) {
+            float2 sums[4]{};
+#pragma unroll
+            for (int slot = 0; slot < 8; ++slot) {
+                if (!all && !(mask & (1u << slot))) continue;
+                const auto value = partials[(row * 8 + slot) * 512 + col];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const auto f = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162 *>(&value)[i]);
+                    sums[i].x += f.x;
+                    sums[i].y += f.y;
+                }
+            }
+            CustomArNormPacketType result;
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                reinterpret_cast<__nv_bfloat162 *>(&result)[i] = __floats2bfloat162_rn(sums[i].x, sums[i].y);
+            return result;
+        };
+        const auto result = mask == 255 ? reduce(std::true_type{}) : reduce(std::false_type{});
+        CustomArStoreGlobal16(result, box(col / 64), (row * 8 + rank) * 64 + col % 64);
+    }
+    // The second rendezvous of the previous invocation protects the incoming
+    // slices. This first rendezvous also retires reads of its returned row.
+    __syncthreads();
+    CustomArBarrierStart<8>(signals, signals.signals[rank], rank);
+    __shared__ CustomArNormPacketType slice[64];
+    if (t < 64) {
+        float sum[8]{};
+#pragma unroll
+        for (int peer = 0; peer < 8; ++peer) {
+            const auto x = box(rank)[(row * 8 + peer) * 64 + t];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) sum[i] += float(x.data[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) slice[t].data[i] = __float2bfloat16_rn(sum[i]);
+    }
+    __syncthreads();
+    const auto reduced = slice[t % 64];
+    CustomArStoreGlobal16(reduced, box(t / 64), 4096 + row * 512 + rank * 64 + t % 64);
+    CustomArBarrierPublish<8>(signals, signals.signals[rank], rank);
+    const int offset = row * 512 + t;
+    const auto result = box(rank)[4096 + offset];
+    reinterpret_cast<CustomArNormPacketType *>(out)[offset] = result;
+    if (!residual) return;
+    auto h = reinterpret_cast<const CustomArNormPacketType *>(residual)[offset];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+        reinterpret_cast<__nv_bfloat162 *>(&h)[i] = __hadd2(
+            reinterpret_cast<const __nv_bfloat162 *>(&h)[i],
+            reinterpret_cast<const __nv_bfloat162 *>(&result)[i]);
+    reinterpret_cast<CustomArNormPacketType *>(residual)[offset] = h;
+    if (feature) {
+        auto *dst = feature + size_t(row) * featureStride + t * 8;
+        if (!(reinterpret_cast<uintptr_t>(dst) & 15))
+            *reinterpret_cast<CustomArNormPacketType *>(dst) = h;
+        else
+            for (int i = 0; i < 8; ++i) dst[i] = h.data[i];
+    }
+    __shared__ CustomArNormPacketType rowHidden[512];
+    __shared__ float partial[8];
+    rowHidden[t] = h;
+    __syncthreads();
+    // Preserve the 256-lane reference sum tree before packing eight BF16s per lane.
+    if (t < 256) {
+        const auto *values = reinterpret_cast<const CustomArNormBF16 *>(rowHidden);
+        float sum = 0.f;
+#pragma unroll
+        for (int i = t; i < 4096; i += 256) {
+            const float x = float(values[i]);
+            sum += x * x;
+        }
+        sum = fastllm::cuda::WarpSum(sum);
+        if (t % 32 == 0) partial[t / 32] = sum;
+    }
+    __syncthreads();
+    const int lane = t % 32;
+    const float inv = rsqrtf(fastllm::cuda::WarpSum(lane < 8 ? partial[lane] : 0.f) / 4096.f + eps);
+    CustomArNormPacketType normalized;
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        normalized.data[i] = __float2bfloat16_rn(float(__float2bfloat16_rn(float(h.data[i]) * inv)) * weight[t * 8 + i]);
+    reinterpret_cast<CustomArNormPacketType *>(normed)[offset] = normalized;
+    if (next.values) fastllm_mxfp8::Store8(next, row, t * 8, *reinterpret_cast<const uint4 *>(&normalized));
+#endif
+}
+
+template <int Ranks, bool Norm = false>
 __global__ void CustomArExpertRowsKernel(CustomArPointers registered, CustomArRankSignals signals,
         CustomArSignal *self, CustomArNormPacketType *local, const int32_t *ids, CustomArNormBF16 *out,
-        int rank, int packets, int rowPackets, int topk) {
+        int rank, int packets, int rowPackets, int topk, CustomArNormBF16 *residual = nullptr,
+        const float *weight = nullptr, CustomArNormBF16 *normed = nullptr, float eps = 0, FastllmMxfp8Activation next = {},
+        CustomArNormBF16 *feature = nullptr, int featureStride = 0) {
     const CustomArRankData peers = registered.Load();
-    const int packet = blockIdx.x * blockDim.x + threadIdx.x;
-    int first = 0;
-    if (packet < packets) {
+    const int base = blockIdx.x * (Norm ? 512 : blockDim.x) + threadIdx.x;
+    constexpr int parts = Norm ? 2 : 1;
+    int offsets[parts];
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int packet = base + part * blockDim.x;
+        if (packet >= packets) continue;
         const int row = packet / rowPackets;
-        first = row * topk * rowPackets + packet % rowPackets;
+        const int first = row * topk * rowPackets + packet % rowPackets;
+        offsets[part] = first;
         float sum[8] = {};
-        for (int slot = 0; slot < topk; ++slot) {
+        for (int slot = 0; slot < (Norm ? 8 : topk); ++slot) {
             if (ids[row * topk + slot] < 0) continue;
             const auto value = local[first + slot * rowPackets];
 #pragma unroll
@@ -1093,9 +1259,54 @@ __global__ void CustomArExpertRowsKernel(CustomArPointers registered, CustomArRa
     }
     __syncthreads();
     CustomArBarrierStart<Ranks>(signals, self, rank);
-    if (packet < packets)
-        reinterpret_cast<CustomArNormPacketType *>(out)[packet] = CustomArReducePacket<Ranks>(peers, first);
+    #pragma unroll
+    for (int part = 0; part < parts; ++part) {
+        const int packet = base + part * blockDim.x;
+        if (packet < packets)
+            reinterpret_cast<CustomArNormPacketType *>(out)[packet] = CustomArReducePacket<Ranks>(peers, offsets[part]);
+    }
     CustomArBarrierFinal<Ranks>(signals, self, rank);
+    if constexpr (Norm) {
+        __syncthreads();
+        fastllm::cuda_norm::AddRMSNormBody<CustomArNormBF16, 4096, true, false>(
+            residual, out, weight, normed, 4096, eps, false, ExpertNormPack{next, residual, feature, featureStride});
+    }
+}
+
+// Publish each rank's slice in row-major scratch. Both consumers retain their
+// own RMS reduction tree and BF16 rounding after gathering the same row.
+template <int Ranks>
+__device__ __forceinline__ void CustomArPublishRowSlice(CustomArRankData peers, CustomArRankScratch scratch,
+        CustomArRankSignals signals, CustomArSignal *self, int rank) {
+    constexpr int width = 512 / Ranks, pitch = width + 512 % Ranks;
+    if (threadIdx.x < (rank == Ranks - 1 ? pitch : width)) {
+        auto *local = static_cast<CustomArNormPacketType *>(scratch.scratch[rank]);
+        local[blockIdx.x * pitch + threadIdx.x] =
+            CustomArReducePacket<Ranks>(peers, blockIdx.x * 512 + rank * width + threadIdx.x);
+    }
+    CustomArBarrierPublish<Ranks>(signals, self, rank);
+}
+
+template <int Ranks>
+__device__ __forceinline__ CustomArNormPacketType CustomArGatherRowPacket(CustomArRankScratch scratch, int col) {
+    constexpr int width = 512 / Ranks, pitch = width + 512 % Ranks;
+    const int owner = min(col / width, Ranks - 1);
+    const auto *source = static_cast<const CustomArNormPacketType *>(scratch.scratch[owner]);
+    return source[blockIdx.x * pitch + col - owner * width];
+}
+
+// Match the draft's standalone 256-lane RMS reduction and BF16 affine boundary.
+__global__ void DraftReduceAddNorm7(CustomArPointers registered, CustomArRankSignals signals,
+        CustomArSignal *self, CustomArRankScratch scratch, CustomArNormBF16 *residual, const float *weight,
+        CustomArNormBF16 *output, float eps, int rank) {
+    CustomArBarrierStart<8>(signals, self, rank);
+    CustomArPublishRowSlice<8>(registered.Load(), scratch, signals, self, rank);
+    for (int i = threadIdx.x; i < 512; i += 256)
+        reinterpret_cast<CustomArNormPacketType *>(output)[blockIdx.x * 512 + i] =
+            CustomArGatherRowPacket<8>(scratch, i);
+    __syncthreads();
+    fastllm::cuda_norm::AddRMSNormBody<CustomArNormBF16, 4096, true, false>(residual, output,
+        weight, output, 4096, eps, false, fastllm::cuda_norm::NoNormSideOutput{});
 }
 
 template <int Ranks, bool Direct>
@@ -1107,24 +1318,16 @@ __global__ __launch_bounds__(512, 1) void FastllmCustomAllReduceRMSNormKernel(
     // number of available collective signal slots.
     int t = threadIdx.x, row = blockIdx.x;
     CustomArRankData p = data.Load();
-    constexpr int part = 512 / Ranks, pitch = part + 512 % Ranks;
     CustomArBarrierStart<Ranks>(signals, self, rank);
-    if constexpr (!Direct) {
-        if (t < (rank == Ranks - 1 ? pitch : part))
-            ((CustomArNormPacketType *)scratch.scratch[rank])[row * pitch + t] =
-                CustomArReducePacket<Ranks>(p, row * 512 + rank * part + t);
-        CustomArBarrierPublish<Ranks>(signals, self, rank);
-    }
+    if constexpr (!Direct) CustomArPublishRowSlice<Ranks>(p, scratch, signals, self, rank);
     // Publish completes all reads of the original input. Two-stage peers now
     // read only scratch; the next collective's start barrier cannot pass until
     // every peer has finished this kernel, so it also protects scratch reuse.
     CustomArNormPacketType v;
     if constexpr (Direct)
         v = CustomArReducePacket<Ranks>(p, row * 512 + t);
-    else {
-        int peer = min(t / part, Ranks - 1);
-        v = ((const CustomArNormPacketType *)scratch.scratch[peer])[row * pitch + t - peer * part];
-    }
+    else
+        v = CustomArGatherRowPacket<Ranks>(scratch, t);
     CustomArNormPacket(v, hidden + row * 4096, weight, output + row * 4096, eps, sums, t);
     if constexpr (Direct)
         CustomArBarrierFinal<Ranks>(signals, self, rank);
@@ -1312,11 +1515,15 @@ struct CustomArState {
     std::map<int, int> rankByDevice;
     CustomArRankSignals allSignals{};
     CustomArRankScratch allScratch{};
+    CustomArRankScratch expertBoxes{};
     CustomArPushWorkspaces allPushWorkspaces{};
     std::unique_ptr<CustomArTaggedPeer> taggedPeer;
     std::unique_ptr<SwaOutputState> swaOutput;
     void *inplaceScratch[kCustomArMaxRanks]{};
     int pushBlocks = 0;
+    bool sm120EightRanks = false, expertRowsPush = false;
+    bool fastSwaVerify = false, fastDsaVerify = false;
+    int splitDsaGrid = 0;
     bool pushAvailable = false;
     bool pushUsePdl = false;
     bool captureFallbackLogged = false;
@@ -1393,6 +1600,7 @@ std::vector<CustomArAllocation> DetachCustomArAllocationsLocked(
     }
     state.allSignals = CustomArRankSignals{};
     state.allScratch = CustomArRankScratch{};
+    state.expertBoxes = CustomArRankScratch{};
     state.allPushWorkspaces = CustomArPushWorkspaces{};
     for (void *&scratch : state.inplaceScratch) {
         scratch = nullptr;
@@ -2786,6 +2994,13 @@ uint32_t SelectCustomArPaths(CustomArState &state, bool benchmarkPerformance) {
     return enabledPaths;
 }
 
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+#include "fastllm-naive-sm120-verify.cuh"
+#include "fastllm-draft-attention-sm120.cuh"
+#include "fastllm-draft-mlp-sm120.cuh"
+#include "fastllm-draft-head-sm120.cuh"
+#include "fastllm-draft-context-sm120.cuh"
+#endif
 }  // namespace
 
 fastllm::TransientAllReduceInputs::TransientAllReduceInputs(bool enabled)
@@ -2796,6 +3011,225 @@ fastllm::TransientAllReduceInputs::TransientAllReduceInputs(bool enabled)
 fastllm::TransientAllReduceInputs::~TransientAllReduceInputs() {
     customArTransientInputs = previous;
 }
+
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+
+const uint8_t *FastllmCudaSm120GemvScales(const fastllm::Data &, int, int);
+
+struct FastllmNaiveVerifyIndexerSm120 {
+    const fastllm::Data *wq, *wk, *weights, *norm, *bias;
+    fastllm::Data *indices;
+    int rank;
+    bool scaled;
+};
+
+static bool RunPackedVerifyAttention(const fastllm::Data &input, const fastllm::Data &qkvWeight,
+                                       const fastllm::Data &bias, const fastllm::Data &outWeight,
+                                       const fastllm::Data &norm, const fastllm::Data &sink,
+                                       const fastllm::Data &positions, fastllm::Data &q, fastllm::Data &attn,
+                                       fastllm::Data &projected, fastllm::Data &hidden, fastllm::Data &normed,
+                                       fastllm::Data &scratch, const std::vector<FastllmNaiveDSARow> &rows,
+                                       int stride, bool ring, float theta, float valueScale, float eps, int gpu,
+                                       const FastllmNaiveVerifyIndexerSm120 *indexer, FastllmMxfp8Activation prepared,
+                                       const fastllm::Data *branch, const fastllm::Data *inputNorm,
+                                       fastllm::Data *feature, bool deferPostNorm) {
+    using namespace fastllm;
+    if (FastllmCudaRuntimeArch() != 120 || (ring == (indexer != nullptr)))
+        return false;
+    CustomArCallLease lease;
+    sm120_verify::Args a{};
+    auto &state = GetCustomArState();
+    if (!lease.Acquire(state, 8192, BFLOAT16, gpu, true, a.rank) || state.devices.size() != 8)
+        return false;
+    const int count = rows.size();
+    auto local = [&](const Data &x, int type) {
+        if (x.dims.empty() || x.strides.size() != x.dims.size())
+            return false;
+        size_t stride = 1;
+        for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+            if (x.dims[i] <= 0 || x.strides[i] != stride)
+                return false;
+            stride *= x.dims[i];
+        }
+        return x.dataDevice == CUDA && x.dataDeviceIds == std::vector<int>{gpu} && x.dataType == type &&
+               x.cudaData && !(reinterpret_cast<uintptr_t>(x.cudaData) & 15);
+    };
+    auto matrix = [&](const Data &w, int n, int k) {
+        return local(w, FP8_E4M3) && w.dims == std::vector<int>({n, k}) && !w.IsRepacked && w.blockM == 32 &&
+               w.blockK == 1 && !w.extraCudaData.empty() && w.extraCudaData[0];
+    };
+    bool eligible = std::isfinite(eps) && eps > 0 && std::isfinite(theta) && theta > 0 &&
+                    std::isfinite(valueScale) && count == 8 &&
+                    (ring ? stride == 128 : stride > 0 && stride <= 2048) && local(input, BFLOAT16) &&
+                    input.Count(0) == size_t(count) * 4096 && local(hidden, BFLOAT16) &&
+                    hidden.Count(0) == input.Count(0) && local(norm, FLOAT32) && norm.Count(0) == 4096 &&
+                    (sink.dims.empty() || (local(sink, FLOAT32) && sink.Count(0) == 8)) &&
+                    local(positions, FLOAT32) && positions.Count(0) >= count && bias.dims.empty() &&
+                    matrix(qkvWeight, 1856, 4096) && matrix(outWeight, 4096, 1024);
+    if (!(ring ? state.fastSwaVerify : state.fastDsaVerify)) return false;
+    for (const auto &r : rows)
+        eligible = eligible && r.fp8 && r.cache && r.liveKeys && r.capacity > 0 && r.keyStride == 192 && !r.fp4 &&
+                   r.key && r.value &&
+                   (ring ? !r.pageLen && r.verifyOffset >= 0 && r.verifyOffset < 8 : r.verifyOffset < 0);
+    int shardWidth = 1024;
+    if (indexer) {
+        eligible = eligible && indexer->wq && indexer->wk && indexer->weights && indexer->norm &&
+                   indexer->bias && indexer->indices;
+        auto indexWeight = [&](const Data &w, int n) {
+            return local(w, BFLOAT16) && w.dims == std::vector<int>({n, 4096});
+        };
+        eligible = eligible && !ring && indexer->rank == a.rank && stride == 2048 &&
+                   indexWeight(*indexer->wq, 2048) && indexWeight(*indexer->wk, 128) &&
+                   indexWeight(*indexer->weights, 16) && local(*indexer->norm, FLOAT32) &&
+                   indexer->norm->Count(0) == 128 && local(*indexer->bias, FLOAT32) &&
+                   indexer->bias->Count(0) == 128;
+        for (const auto &r : rows) {
+            if (!r.fp8 || r.capacity <= 2048 || r.pageLen < 8 || r.pageLen % 8) {
+                eligible = false;
+                break;
+            }
+            const int64_t pages = (int64_t(r.capacity) + r.pageLen - 1) / r.pageLen;
+            const int64_t localKeys = pages * (r.pageLen / 8);
+            if (localKeys > 1024)
+                shardWidth = std::max(shardWidth, int((localKeys + 2047) / 2048 * 2048));
+        }
+    }
+    // A cooperative grid must fit together, including the CTAs waiting for TP peers.
+    auto kernel = ring ? sm120_verify::SwaPackedLayer : sm120_verify::DsaLayer<>;
+    int sm = 0, coop = 0, active = 0;
+    if (cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, gpu) != cudaSuccess ||
+        cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, gpu) != cudaSuccess || !coop ||
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, sm120_verify::Threads, 0) !=
+            cudaSuccess ||
+        active * sm < (ring ? sm120_verify::SwaGrid : sm120_verify::IndexProjectionTiles))
+        eligible = false;
+    if (branch)
+        eligible = eligible && ring && inputNorm && local(*branch, BFLOAT16) && branch->Count(0) == input.Count(0) &&
+                   local(*inputNorm, FLOAT32) && inputNorm->Count(0) == 4096 &&
+                   (!feature || (local(*feature, BFLOAT16) && feature->Count(0) == input.Count(0)));
+    auto output = [&](Data &x, DataType type, std::vector<int> dims) {
+        x.dataType = type;
+        x.UpdateUnitSize();
+        x.Resize(dims);
+        x.ToDevice(CUDA, {gpu}, false);
+        x.Allocate(false);
+    };
+    if (eligible) {
+        a.swaScales = FastllmCudaSm120GemvScales(qkvWeight, 1856, 4096);
+        eligible = a.swaScales && FastllmCudaSm120GemvScales(outWeight, 4096, 1024);
+    }
+    if (eligible)
+        output(projected, BFLOAT16, {1, count, 4096});
+    CustomArPointers registered{};
+    if (!FindOrRegisterCustomArPointers(state, a.rank, projected.cudaData, count * 4096, BFLOAT16, eligible,
+                                        registered))
+        return false;
+    output(q, BFLOAT16, {1, count, 1536});
+    output(attn, BFLOAT16, {1, count, 1024});
+    output(normed, BFLOAT16, {1, count, 4096});
+    // The FP8 ring needs just the rotary pairs; DSA also materializes attention scores.
+    const int scoreFloats = ring ? count * 32 : count * 8 * stride, partialFloats = ring ? 0 : count * ((stride + 63) / 64) * 1024;
+    const int packedFloats = count * 4096 / 4, scaleFloats = 4096 / 128 * 512 / 4;
+    // Per row, Indexer projection, FP8 queries, scores and merge lists expire
+    // before the value partials are produced. Reuse the larger of those arenas.
+    const int64_t listWords = std::max<int64_t>(8192, int64_t(shardWidth) * (shardWidth > 2048 ? 2 : 1));
+    const int64_t indexFloats = indexer ? 2192 / 2 + 2048 / 4 + 16 + shardWidth + 2 * listWords : 0;
+    const int64_t scratchPerRow = (packedFloats + scaleFloats + scoreFloats) / count +
+                                  std::max<int64_t>(partialFloats / count, indexFloats);
+    output(scratch, FLOAT32, {count, static_cast<int>(scratchPerRow)});
+    auto *base = static_cast<uint8_t *>(scratch.cudaData);
+    a.quant = {base, base + packedFloats * 4, count, 4096, count, 0};
+    a.prepared = prepared.Matches(count,4096) && prepared.swizzledRowOffset >= 0 ? prepared : FastllmMxfp8Activation{};
+    a.scores = reinterpret_cast<float *>(base) + packedFloats + scaleFloats;
+    a.partials = a.scores + scoreFloats;
+    a.input = static_cast<const __nv_bfloat16 *>(input.cudaData);
+    a.qkvWeight = qkvWeight.cudaData;
+    a.outWeight = outWeight.cudaData;
+    a.qkvScales = static_cast<const float *>(qkvWeight.extraCudaData[0]);
+    a.outScales = static_cast<const float *>(outWeight.extraCudaData[0]);
+    a.query = static_cast<__nv_bfloat16 *>(q.cudaData);
+    a.attn = static_cast<__nv_bfloat16 *>(attn.cudaData);
+    a.projection = static_cast<__nv_bfloat16 *>(projected.cudaData);
+    a.hidden = static_cast<__nv_bfloat16 *>(hidden.cudaData);
+    a.normed = static_cast<__nv_bfloat16 *>(normed.cudaData);
+    a.gamma = deferPostNorm ? nullptr : static_cast<const float *>(norm.cudaData);
+    a.pos = static_cast<const float *>(positions.cudaData);
+    a.sink = sink.dims.empty() ? nullptr : static_cast<const float *>(sink.cudaData);
+    a.rows = count;
+    a.stride = stride;
+    a.theta = theta;
+    a.valueScale = float(__float2bfloat16_rn(valueScale));
+    a.eps = eps;
+    a.signals = state.allSignals;
+    for (int rank = 0; rank < 8; ++rank)
+        a.exchange.scratch[rank] = static_cast<char *>(state.allScratch.scratch[rank]) + CustomArMaxBytes();
+    std::copy(rows.begin(), rows.end(), a.batch.rows);
+    if (indexer) {
+        a.scaledIndex = indexer->scaled;
+        a.iqWeight = static_cast<const __nv_bfloat16 *>(indexer->wq->cudaData);
+        a.ikWeight = static_cast<const __nv_bfloat16 *>(indexer->wk->cudaData);
+        a.iwWeight = static_cast<const __nv_bfloat16 *>(indexer->weights->cudaData);
+        a.indexNorm = static_cast<const float *>(indexer->norm->cudaData);
+        a.indexBias = static_cast<const float *>(indexer->bias->cudaData);
+        // Index scratch expires before sparse attention starts using the value partials.
+        a.shardWidth = shardWidth;
+        a.indexRaw = reinterpret_cast<__nv_bfloat16 *>(a.partials);
+        a.iqBytes = reinterpret_cast<uint8_t *>(a.indexRaw + count * 2192);
+        a.iqScale = reinterpret_cast<float *>(a.iqBytes + count * 2048);
+        a.indexScores = reinterpret_cast<unsigned *>(a.iqScale + count * 16);
+        a.lists = reinterpret_cast<unsigned long long *>(a.indexScores + size_t(count) * shardWidth);
+        output(*indexer->indices, INT32, {count, stride});
+        a.selected = static_cast<int *>(indexer->indices->cudaData);
+        for (int i = 0; i < count; ++i) {
+            a.batch.rows[i].indices = a.selected + i * stride;
+            a.batch.rows[i].selectedCount = stride;
+        }
+    }
+    int grid = ring ? sm120_verify::SwaGrid : std::min(256, active * sm);
+    void *args[] = {&a};
+    if (ring) {
+        a.prepared = {};
+        auto *rotary = reinterpret_cast<__nv_bfloat162 *>(a.scores);
+        a.rotary = rotary;
+        const bool afterExpert = cuda_pdl::Prepare(cuda_pdl::Producer::VerifyExpertReduce);
+        auto prepare = afterExpert ? fastllm_swa_qkv::PrepareSwaQkv<true, true> :
+                                     fastllm_swa_qkv::PrepareSwaQkv<false, true>;
+        prepare<<<count + 1, 512, 0, cudaStreamPerThread>>>(
+            a.hidden, branch ? static_cast<const __nv_bfloat16 *>(branch->cudaData) : nullptr,
+            inputNorm ? static_cast<const float *>(inputNorm->cudaData) : nullptr, eps,
+            nullptr, nullptr, a.quant.values, a.quant.scales,
+            count, a.quant.pitch, a.pos, theta, rotary, branch ? nullptr : a.input,
+            feature ? static_cast<__nv_bfloat16 *>(feature->cudaData) : nullptr);
+        cuda_pdl::Mark(cuda_pdl::Producer::SwaPrepare);
+        cuda_pdl::Prepare(cuda_pdl::Producer::SwaPrepare);
+        sm120_verify::SwaQkvGemm<<<116, sm120_verify::Threads, 0, cudaStreamPerThread>>>(a);
+        if (cudaPeekAtLastError() != cudaSuccess)
+            throw std::runtime_error("SM120 SWA QKV launch failed");
+        cuda_pdl::Mark(cuda_pdl::Producer::SwaQkv);
+        cuda_pdl::Prepare(cuda_pdl::Producer::SwaQkv);
+    }
+    auto launch = [&](auto stage) {
+        auto status = cudaLaunchCooperativeKernel((const void *)stage, grid, sm120_verify::Threads, args, 0,
+                                                   cudaStreamPerThread);
+        if (status != cudaSuccess) {
+            FastllmCudaSetThreadError();
+            throw std::runtime_error(std::string("SM120 verify launch failed: ") + cudaGetErrorString(status));
+        }
+    };
+    if (!ring && state.splitDsaGrid) {
+        using namespace sm120_verify;
+        grid = state.splitDsaGrid;
+        if (a.prepared.values) fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::VerifyExpertReduce);
+        launch(DsaLayer<DsaStage::IndexScores>);
+        launch(DsaLayer<DsaStage::Select>);
+        kernel = DsaLayer<DsaStage::AttentionOutput>;
+    }
+    launch(kernel);
+    if (ring) cuda_pdl::Mark(cuda_pdl::Producer::SwaOutput);
+    return true;
+}
+
+#endif
 
 bool FastllmCudaCustomAllReduceEnabled() {
     CustomArState &state = GetCustomArState();
@@ -2911,6 +3345,10 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
     state.initAttempted = true;
     state.initializing = true;
     state.devices = devices;
+    state.sm120EightRanks = devices.size() == 8;
+    state.expertRowsPush = state.sm120EightRanks;
+    state.fastSwaVerify = state.fastDsaVerify = state.sm120EightRanks && SwaOutputState::Enabled();
+    state.splitDsaGrid = 256;
     state.ncclGeneration = ncclGeneration;
     state.rankByDevice.clear();
     state.pushBlocks = 0;
@@ -2923,6 +3361,50 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         int device = devices[rank];
         state.rankByDevice[device] = rank;
         FastllmCudaSetDevice(device);
+        state.sm120EightRanks = state.sm120EightRanks && FastllmCudaRuntimeArch() == 120;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
+        if (state.expertRowsPush) {
+            cudaFuncAttributes image{};
+            state.expertRowsPush = state.sm120EightRanks &&
+                cudaFuncGetAttributes(&image, CustomArExpertRowsPeerPush<true>) == cudaSuccess &&
+                image.ptxVersion >= 120 && image.maxThreadsPerBlock >= 512;
+            if (!state.expertRowsPush) cudaGetLastError();
+        }
+#else
+        state.expertRowsPush = false;
+#endif
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+        // Choose one transport and grid size for the entire peer group, including heterogeneous groups.
+        if (state.fastSwaVerify || state.fastDsaVerify) {
+            int sms = 0, coop = 0;
+            const bool cooperative = state.sm120EightRanks &&
+                cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) == cudaSuccess &&
+                cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, device) == cudaSuccess && coop;
+            auto fits = [&](auto kernel, int minimumBlocks) {
+                int blocks = 0;
+                if (cooperative && cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                        &blocks, kernel, sm120_verify::Threads, 0) == cudaSuccess)
+                    return blocks * sms >= minimumBlocks;
+                cudaGetLastError();
+                return false;
+            };
+            state.fastSwaVerify = state.fastSwaVerify && fits(sm120_verify::SwaPackedLayer, sm120_verify::SwaGrid);
+            state.fastDsaVerify = state.fastDsaVerify && fits(sm120_verify::DsaLayer<>, sm120_verify::IndexProjectionTiles);
+            if (state.fastDsaVerify && state.splitDsaGrid) {
+                using namespace sm120_verify;
+                for (auto stage : {DsaLayer<DsaStage::IndexScores>, DsaLayer<DsaStage::Select>,
+                                   DsaLayer<DsaStage::AttentionOutput>}) {
+                    int blocks = 0;
+                    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, stage, Threads, 0) != cudaSuccess) {
+                        cudaGetLastError();
+                        blocks = 0;
+                    }
+                    state.splitDsaGrid = std::min(state.splitDsaGrid, sms * blocks);
+                }
+                if (state.splitDsaGrid < IndexProjectionTiles) state.splitDsaGrid = 0;
+            }
+        }
+#endif
         for (int peer : devices) {
             if (peer == device) {
                 continue;
@@ -2965,12 +3447,23 @@ bool FastllmCudaCustomAllReduceInit(const std::vector<int> &devices) {
         // every peer has consumed it. FastLLM's TP reductions are normally
         // in-place, so reduce into a fixed per-rank scratch buffer and enqueue
         // the copy-back after the kernel's final cross-GPU barrier.
-        state.inplaceScratch[rank] = FastllmCudaMalloc(CustomArMaxBytes());
+        size_t scratchBytes = CustomArMaxBytes();
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+        // Projection and Indexer peer writes must not alias live buffers from adjacent collectives.
+        if (state.fastSwaVerify || state.fastDsaVerify) scratchBytes += sm120_verify::VerifyExchangeBytes;
+        if (state.fastDsaVerify) scratchBytes += sm120_verify::DsaListBytes;
+        if (state.fastDsaVerify && state.splitDsaGrid) scratchBytes += sm120_verify::DsaSelectionBytes;
+#endif
+        const size_t expertOffset = scratchBytes;
+        if (state.expertRowsPush) scratchBytes += 2 * 8 * 4096 * sizeof(uint16_t);
+        state.inplaceScratch[rank] = FastllmCudaMalloc(scratchBytes);
         if (state.inplaceScratch[rank] == nullptr) {
             ok = false;
             break;
         }
         state.allScratch.scratch[rank] = state.inplaceScratch[rank];
+        if (state.expertRowsPush)
+            state.expertBoxes.scratch[rank] = static_cast<char *>(state.inplaceScratch[rank]) + expertOffset;
     }
     const bool wantPush = ok && devices.size() == 2 &&
                           CustomArPushEnabledFromEnv();
@@ -3742,6 +4235,113 @@ static bool RunSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden
     return true;
 }
 
+static bool LocalDsaVerifyAvailable() {
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+    return FastllmCudaRuntimeArch() == 103;
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaLocalDsaLayerSupported(const std::vector<int> &requests, int rows, int capacity,
+                                      int heads, int dim, int topK) {
+    return LocalDsaVerifyAvailable() && rows <= 16 && capacity > 8192 && capacity <= 65536 &&
+        heads == 16 && dim == 128 && topK == 2048 &&
+        std::all_of(requests.begin(), requests.end(), [](int n) { return n >= 4 && n <= 8; });
+}
+
+bool FastllmCudaLocalDsaIndexerSupported(const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+                                        int heads, int kvHeads, int dim, int valueDim) {
+    return LocalDsaVerifyAvailable() && !items.empty() && heads == 8 && kvHeads == 1 && dim == 192 &&
+        valueDim == 128 && std::all_of(items.begin(), items.end(), [](const auto &item) {
+            return item.rows >= 4 && item.rows <= 8 && (item.capacity ? item.capacity : item.past + item.rows) > 8192;
+        });
+}
+
+bool FastllmCudaVerifyLocalDsaIndexer(const fastllm::Data &query, const fastllm::Data &indexQuery,
+                                    const fastllm::Data &weights, const fastllm::Data &sink,
+                                    const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+                                    const std::vector<FastllmNaiveDSARow> &rows, bool fp8Query, int heads,
+                                    int kvHeads, int dim, int valueDim, FastllmNaiveDecodeScratch &scratch,
+                                    fastllm::Data &output) {
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+    return FastllmCudaNaiveFusedDSAVerify(query, indexQuery, weights, sink, items, rows, fp8Query,
+                                          heads, kvHeads, dim, valueDim, scratch, output);
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaPackedVerifySupported(int rows, int ranks) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    return rows == 8 && ranks == 8 && FastllmCudaRuntimeArch() == 120;
+#else
+    return false;
+#endif
+}
+
+FastllmVerifyOutput FastllmCudaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x, int device,
+                                               const FastllmMoePreparedInput *prepared) {
+    using Result = FastllmVerifyOutput;
+    const auto &cfg = x.config;
+    const bool verifyShape = cfg.heads == 8 && cfg.kvHeads == 1 && cfg.headDim == 192 &&
+                             cfg.valueDim == 128 && cfg.rotaryDim == 64;
+    if (!x.sliding && !verifyShape) return Result::Unsupported;
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    if (FastllmCudaRuntimeArch() == 120) {
+        if (!x.packedTp || !verifyShape || x.requests.size() != 1 || x.requests.front() != 8 || x.caches.size() != 8 ||
+            x.hidden->dims.empty() || x.hidden->dims.back() != 4096 ||
+            (!x.sliding && (!x.indices || x.branch || x.indexHeads != 16 || x.indexDim != 128 ||
+                            x.topK != 2048 || x.capacity <= x.topK)) || (x.sliding && cfg.window != 128))
+            return Result::Unsupported;
+        std::vector<FastllmNaiveDSARow> bindings(8);
+        for (int i = 0; i < 8; ++i) {
+            const auto &cache = x.caches[i];
+            const auto &k = *cache.key, &v = *cache.value;
+            if (k.isPagedKVCache != v.isPagedKVCache || k.dataType != fastllm::FP8_E4M3 ||
+                v.dataType != k.dataType || k.dims.size() != 3 || v.dims.size() != 3 || v.dims.back() != 128 ||
+                (k.isPagedKVCache && (k.pageLen != v.pageLen || !k.pagedKVCacheData || !v.pagedKVCacheData)) ||
+                (x.sliding && (k.isPagedKVCache || k.expansionDims.size() != 3 || v.expansionDims.size() != 3 ||
+                               std::min(k.expansionDims[1], v.expansionDims[1]) < 136)))
+                continue; // All ranks still enter collective admission with their local eligibility.
+            auto &row = bindings[i];
+            row.key = k.isPagedKVCache ? k.pagedKVCacheData->cudaData : k.cudaData;
+            row.value = v.isPagedKVCache ? v.pagedKVCacheData->cudaData : v.cudaData;
+            row.pageLen = k.isPagedKVCache ? k.pageLen : 0;
+            row.keyStride = k.dims.back();
+            row.fp8 = true;
+            row.capacity = x.capacity;
+            row.cache = cache.cache;
+            row.verifyOffset = x.sliding ? i : -1;
+            row.liveKeys = static_cast<const int *>(x.live->cudaData) + i;
+        }
+        FastllmNaiveVerifyIndexerSm120 indexer{x.indexQueryWeight, x.indexKeyWeight, x.indexWeight,
+            x.indexNorm, x.indexBias, x.indices, x.attentionRank, x.fp8Query};
+        const bool deferNorm = x.sliding && x.deferPostNorm;
+        if (!RunPackedVerifyAttention(*x.normed, *x.qkvWeight, *x.qkvBias, *x.outputWeight,
+                *x.postNorm, *x.sink, *x.positions, *x.query, *x.attention, *x.projected, *x.hidden,
+                *x.normed, x.scratch->attentionPartial, bindings, x.sliding ? 128 : std::min(x.topK, x.capacity),
+                x.sliding, x.theta, x.valueScale, x.eps, device, x.sliding ? nullptr : &indexer,
+                x.qkvActivation, x.branch, x.branch ? x.inputNorm : nullptr, x.feature, deferNorm))
+            return Result::Unsupported;
+        return deferNorm ? Result::DeferredNorm : Result::Normalized;
+    }
+#endif
+    bool launched = false;
+    if (x.sliding && x.branch) {
+        launched = RunSwaVerifyLayer(*x.branch, *x.hidden, *x.inputNorm, *x.qkvWeight, *x.qkvBias,
+                *x.outputWeight, *x.postNorm, *x.sink, *x.positions, *x.live, x.caches, *x.query,
+                *x.attention, *x.projected, *x.normed, x.feature, x.routerWeight, x.router,
+                x.config, device, prepared, x.afterExpertReduce);
+    }
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+    else if (!x.sliding)
+        launched = FastllmCudaNaiveDSALayer(x, device, prepared, x.deferPostNorm);
+#endif
+    if (!launched) return Result::Unsupported;
+    return x.router ? Result::Router : Result::Normalized;
+}
+
 bool FastllmCudaSwaVerifyLayer(const fastllm::Data &branch, fastllm::Data &hidden,
         const fastllm::Data &inputNorm, const fastllm::Data &qkvWeight,
         const fastllm::Data &qkvBias, const fastllm::Data &oWeight,
@@ -3913,13 +4513,14 @@ bool FastllmCudaNaiveDSALayer(const FastllmNaiveDSALayerInput &input,int deviceI
 }
 #endif
 
-bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, void *output,
-        int rows, int hidden, int topk, int deviceId) {
+static bool ReduceExpertRows(void *partials, const int32_t *ids, void *output,
+        int rows, int hidden, int topk, int deviceId, bool norm, void *residual, const float *weight, void *normed, float eps,
+        const FastllmMxfp8Activation &next, void *feature, int featureStride) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
     constexpr int threads = 256;
     if (rows <= 0 || hidden <= 0 || hidden % 8 || topk <= 0 || topk > 16 ||
         (int64_t)rows * hidden > 8 * threads * kCustomArMaxBlocks) return false;
-    const int packets = rows * hidden / 8, blocks = (packets + threads - 1) / threads;
+    const int packets = rows * hidden / 8, blocks = norm ? rows : (packets + threads - 1) / threads;
     CustomArState &state = GetCustomArState();
     CustomArCallLease lease;
     int rank = -1;
@@ -3927,7 +4528,15 @@ bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, vo
     CustomArPointers peers{};
     const size_t outputBytes = size_t(packets) * sizeof(CustomArNormPacketType);
     const size_t partialBytes = outputBytes * topk, idBytes = size_t(rows) * topk * sizeof(*ids);
-    const bool eligible = partials && ids && output &&
+    const bool normEligible = !norm || (hidden == 4096 && rows == 8 && topk == 8 && state.devices.size() == 8 &&
+        residual && weight && normed && std::isfinite(eps) && eps > 0 &&
+        ((uintptr_t(residual) | uintptr_t(normed)) & 15) == 0 &&
+        CustomArBuffersDisjoint(output, outputBytes, residual, outputBytes) &&
+        CustomArBuffersDisjoint(output, outputBytes, normed, outputBytes) &&
+        CustomArBuffersDisjoint(residual, outputBytes, normed, outputBytes) &&
+        CustomArBuffersDisjoint(partials, partialBytes, residual, outputBytes) &&
+        CustomArBuffersDisjoint(partials, partialBytes, normed, outputBytes));
+    const bool eligible = normEligible && partials && ids && output &&
         ((uintptr_t(partials) | uintptr_t(output)) & 15) == 0 && uintptr_t(ids) % alignof(int32_t) == 0 &&
         CustomArBuffersDisjoint(partials, partialBytes, output, outputBytes) &&
         CustomArBuffersDisjoint(partials, partialBytes, ids, idBytes) &&
@@ -3940,7 +4549,21 @@ bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, vo
             static_cast<CustomArNormPacketType *>(partials), ids,
             static_cast<CustomArNormBF16 *>(output), rank, packets, hidden / 8, topk);
     };
-    switch (state.devices.size()) {
+    if (state.expertRowsPush && hidden == 4096 && rows == 8 && topk == 8) {
+        const bool early = fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::VerifyExperts);
+        auto kernel = early ? CustomArExpertRowsPeerPush<true> : CustomArExpertRowsPeerPush<false>;
+        kernel<<<rows, 512, 0, cudaStreamPerThread>>>(state.expertBoxes, state.allSignals,
+            static_cast<CustomArNormPacketType *>(partials), ids, static_cast<CustomArNormBF16 *>(output),
+            rank, static_cast<CustomArNormBF16 *>(residual), weight, static_cast<CustomArNormBF16 *>(normed),
+            eps, next, static_cast<CustomArNormBF16 *>(feature), featureStride);
+        if (!norm || next.values) fastllm::cuda_pdl::Mark(fastllm::cuda_pdl::Producer::VerifyExpertReduce);
+    } else if (norm) {
+        CustomArExpertRowsKernel<8, true><<<blocks, threads, 0, cudaStreamPerThread>>>(
+            peers, state.allSignals, state.allSignals.signals[rank], static_cast<CustomArNormPacketType *>(partials),
+            ids, static_cast<CustomArNormBF16 *>(output), rank, packets, hidden / 8, topk,
+            static_cast<CustomArNormBF16 *>(residual), weight, static_cast<CustomArNormBF16 *>(normed), eps, next,
+            static_cast<CustomArNormBF16 *>(feature), featureStride);
+    } else switch (state.devices.size()) {
         case 2: launch(std::integral_constant<int, 2>{}); break;
         case 4: launch(std::integral_constant<int, 4>{}); break;
         case 6: launch(std::integral_constant<int, 6>{}); break;
@@ -3955,9 +4578,19 @@ bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, vo
 #endif
 }
 
-bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
+bool FastllmCudaCustomAllReduceExpertRows(void *partials, const int32_t *ids, void *output,
+        int rows, int hidden, int topk, int deviceId) {
+    return ReduceExpertRows(partials, ids, output, rows, hidden, topk, deviceId, false, nullptr, nullptr, nullptr, 0, {}, nullptr, 0);
+}
+bool FastllmCudaCustomAllReduceExpertRowsNorm(void *partials, const int32_t *ids, void *output,
+        int rows, int hidden, int topk, int deviceId, void *residual, const float *weight, void *normed, float eps,
+        const FastllmMxfp8Activation &next, void *feature, int featureStride) {
+    return ReduceExpertRows(partials, ids, output, rows, hidden, topk, deviceId, true, residual, weight, normed, eps, next, feature, featureStride);
+}
+
+static bool CustomReduceAddNorm(void *data, void *residual,
         const float *weight, void *output, int count, int channels,
-        float eps, int dataType, int deviceId) {
+        float eps, int dataType, int deviceId, bool draft) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 12000
     if (dataType != fastllm::BFLOAT16 || channels != 4096 || count <= 0 ||
         count % channels || (size_t)count * 2 > CustomArMaxBytes() ||
@@ -3984,14 +4617,23 @@ bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
                                       eligible, pointers)) return false;
     auto *hidden = (CustomArNormBF16 *)residual;
     auto *normed = (CustomArNormBF16 *)output;
+    if (draft) {
+        if (!state.sm120EightRanks || rows != 7) return false;
+        DraftReduceAddNorm7<<<rows, 256, 0, cudaStreamPerThread>>>(pointers, state.allSignals,
+            state.allSignals.signals[rank], state.allScratch, hidden, weight, normed, eps, rank);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        fastllm::cuda_pdl::Mark(fastllm::cuda_pdl::Producer::DraftNorm);
+        return true;
+    }
     const bool twoStage = CustomArUseTwoStage(state.devices.size(), (size_t)count * 2);
     const int threads = twoStage && rows <= 128 ? 256 : 512;
     const int packed = count / 8, ranks = state.devices.size();
     const int work = twoStage ? packed / ranks + packed % ranks : packed;
     const int blocks = std::min(kCustomArMaxBlocks, (work + threads - 1) / threads);
+    const bool directRows = rows <= 8 && !(state.sm120EightRanks && rows == 8);
 #define CUSTOM_AR_NORM_RANK_CASE(RANKS)                                      \
     case RANKS:                                                             \
-        if (rows <= 8 || (RANKS == 2 && rows <= kCustomArMaxBlocks))          \
+        if (directRows || (RANKS == 2 && rows <= kCustomArMaxBlocks))            \
             FastllmCustomAllReduceRMSNormKernel<RANKS, true>                 \
                 <<<rows, 512, 0, cudaStreamPerThread>>>(                    \
                     pointers, state.allSignals, state.allSignals.signals[rank], \
@@ -4044,6 +4686,489 @@ bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual,
 #else
     return false;
 #endif
+}
+bool FastllmCudaCustomAllReduceAddRMSNorm(void *data, void *residual, const float *weight,
+        void *output, int count, int channels, float eps, int dataType, int deviceId) {
+    return CustomReduceAddNorm(data, residual, weight, output, count, channels, eps, dataType, deviceId, false);
+}
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+static bool DraftTensor(const fastllm::Data &x, fastllm::DataType type, size_t count, int gpu) {
+    if (x.dims.empty() || x.dataType != type || x.Count(0) != count || !x.cudaData ||
+        x.dataDevice != fastllm::CUDA || x.dataDeviceIds != std::vector<int>{gpu} ||
+        x.strides.size() != x.dims.size() || (reinterpret_cast<uintptr_t>(x.cudaData) & 3))
+        return false;
+    size_t stride = 1;
+    for (int i = int(x.dims.size()) - 1; i >= 0; --i) {
+        if (x.strides[i] != stride)
+            return false;
+        stride *= x.dims[i];
+    }
+    return true;
+}
+static void DraftBuffer(fastllm::Data &x, fastllm::DataType type, const std::vector<int> &dims, int gpu) {
+    x.dataType = type;
+    x.UpdateUnitSize();
+    x.Resize(dims);
+    x.ToDevice(fastllm::CUDA, {gpu}, false);
+    x.Allocate(false);
+}
+template <class Kernel> static bool DraftGridFits(Kernel kernel, int gpu, int grid = sm120_draft::Grid) {
+    int sm = 0, active = 0, coop = 0;
+    return cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, gpu) == cudaSuccess &&
+           cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, gpu) == cudaSuccess && coop &&
+           cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, sm120_draft::Threads, 0) ==
+               cudaSuccess &&
+           active * sm >= grid;
+}
+// All ranks must agree on their operand shapes before packing or entering a peer collective.
+static void PackDraftProjections(const fastllm::Data &first, const fastllm::Data &second, bool pairedGateUp,
+                                 fastllm::Data &packed, const void *(&sources)[2], int gpu) {
+    using namespace sm120_draft;
+    const int firstSize = first.Count(0), secondSize = second.Count(0);
+    DraftBuffer(packed, fastllm::BFLOAT16, {firstSize + secondSize}, gpu);
+    auto *dst = static_cast<uint4 *>(packed.cudaData);
+    if (pairedGateUp) {
+        PackMlpGateUp<<<firstSize / (4 * 256), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const B *>(first.cudaData), reinterpret_cast<uint2 *>(dst));
+    } else {
+        PackProjection<<<firstSize / (8 * 256), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const B *>(first.cudaData), dst, first.dims[1]);
+    }
+    PackProjection<<<secondSize / (8 * 256), 256, 0, cudaStreamPerThread>>>(
+        static_cast<const B *>(second.cudaData), dst + firstSize / 8, second.dims[1]);
+    if (cudaPeekAtLastError() != cudaSuccess)
+        throw std::runtime_error("SM120 draft weight packing failed");
+    sources[0] = first.cudaData;
+    sources[1] = second.cudaData;
+}
+#endif
+bool FastllmCudaDraftAttention7(fastllm::Data &activation, fastllm::Data &hidden, const fastllm::Data &qkv,
+                                const fastllm::Data &out, const fastllm::Data &qNorm,
+                                const fastllm::Data &kNorm, const fastllm::Data &gamma,
+                                const fastllm::Data &live, const fastllm::Data &bindings, int layer,
+                                float eps, float theta, int gpu, FastllmDraftLayerProjection &storage) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    auto &[packed, workspace, sources] = storage;
+    using namespace fastllm;
+    using namespace sm120_draft;
+    auto &state = GetCustomArState();
+    CustomArCallLease lease;
+    Args a{};
+    if (!lease.Acquire(state, 8192, BFLOAT16, gpu, true, a.rank) || !state.sm120EightRanks)
+        return false;
+    bool ok =
+        std::isfinite(eps) && eps > 0 && std::isfinite(theta) && theta > 0 &&
+        DraftTensor(activation, BFLOAT16, Rows * 4096, gpu) &&
+        DraftTensor(hidden, BFLOAT16, Rows * 4096, gpu) && DraftTensor(qkv, BFLOAT16, 768 * 4096, gpu) &&
+        qkv.dims == std::vector<int>{768, 4096} && DraftTensor(out, BFLOAT16, 4096 * 512, gpu) &&
+        out.dims == std::vector<int>{4096, 512} && !qkv.IsRepacked && !out.IsRepacked &&
+        DraftTensor(qNorm, FLOAT32, Dim, gpu) && DraftTensor(kNorm, FLOAT32, Dim, gpu) &&
+        DraftTensor(gamma, FLOAT32, 4096, gpu) && DraftTensor(live, INT32, 1, gpu) && layer >= 0 &&
+        bindings.cudaData && bindings.dataType == INT32 && bindings.dataDevice == CUDA &&
+        bindings.dataDeviceIds == std::vector<int>{gpu} &&
+        bindings.GetBytes() >= (layer + 1) * 2 * sizeof(void *) && activation.cudaData != hidden.cudaData;
+    ok = ok && DraftGridFits(FusedDraftAttentionSm120, gpu);
+    const bool pack = sources[0] != qkv.cudaData || sources[1] != out.cudaData || !packed.cudaData;
+    ok = ok && !(pack && FastllmCudaGraphIsCapturingFast());
+    if (ok)
+        DraftBuffer(workspace, INT32, {int((sizeof(Workspace) + 3) / 4)}, gpu);
+    if (!FindOrRegisterCustomArPointers(state, a.rank, workspace.cudaData, Rows * 4096, BFLOAT16, ok,
+                                        a.peers))
+        return false;
+    if (pack)
+        PackDraftProjections(qkv, out, false, packed, sources, gpu);
+    a.qkv = static_cast<uint4 *>(packed.cudaData);
+    a.out = a.qkv + 768 * 4096 / 8;
+    a.input = static_cast<const B *>(activation.cudaData);
+    a.normed = static_cast<B *>(activation.cudaData);
+    a.hidden = static_cast<B *>(hidden.cudaData);
+    a.qNorm = static_cast<const float *>(qNorm.cudaData);
+    a.kNorm = static_cast<const float *>(kNorm.cudaData);
+    a.gamma = static_cast<const float *>(gamma.cudaData);
+    a.live = static_cast<const int *>(live.cudaData);
+    a.cache = static_cast<B *const *>(bindings.cudaData) + layer * 2;
+    a.w = static_cast<Workspace *>(workspace.cudaData);
+    a.eps = eps;
+    a.theta = theta;
+    a.signals = state.allSignals;
+    void *args[] = {&a};
+    fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::DraftNorm);
+    auto err = cudaLaunchCooperativeKernel((const void *)FusedDraftAttentionSm120, Grid, Threads, args, 0,
+                                           cudaStreamPerThread);
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("SM120 draft attention launch failed: ") +
+                                 cudaGetErrorString(err));
+    fastllm::cuda_pdl::Mark(fastllm::cuda_pdl::Producer::DraftNorm);
+    return true;
+#else
+    return false;
+#endif
+}
+bool FastllmCudaDraftMlp7(const fastllm::Data &input, fastllm::Data &hidden, fastllm::Data &output,
+                          const fastllm::Data &gateUp, const fastllm::Data &down, const fastllm::Data &gamma,
+                          float eps, int gpu, FastllmDraftLayerProjection &storage) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    auto &[packed, workspace, sources] = storage;
+    using namespace fastllm;
+    using namespace sm120_draft;
+    auto &state = GetCustomArState();
+    CustomArCallLease lease;
+    MlpArgs a{};
+    if (!lease.Acquire(state, 8192, BFLOAT16, gpu, true, a.rank) || !state.sm120EightRanks)
+        return false;
+    auto kernel = FusedDraftMlpSm120;
+    bool ok = std::isfinite(eps) && eps > 0 && DraftTensor(input, BFLOAT16, Rows * 4096, gpu) &&
+              input.dims.back() == 4096 && input.dims == hidden.dims &&
+              DraftTensor(hidden, BFLOAT16, Rows * 4096, gpu) && hidden.cudaData != input.cudaData &&
+              DraftTensor(gamma, FLOAT32, 4096, gpu) && gateUp.dims == std::vector<int>{1024, 4096} &&
+              DraftTensor(gateUp, BFLOAT16, 1024 * 4096, gpu) && down.dims == std::vector<int>{4096, 512} &&
+              DraftTensor(down, BFLOAT16, 4096 * 512, gpu) && !gateUp.IsRepacked && !down.IsRepacked &&
+              DraftGridFits(kernel, gpu, MlpGrid);
+    const bool pack = !packed.cudaData || sources[0] != gateUp.cudaData || sources[1] != down.cudaData;
+    ok = ok && !(pack && FastllmCudaGraphIsCapturingFast());
+    if (ok)
+        DraftBuffer(workspace, INT32, {int((sizeof(MlpWorkspace) + 3) / 4)}, gpu);
+    if (!FindOrRegisterCustomArPointers(state, a.rank, workspace.cudaData, Rows * 4096, BFLOAT16, ok,
+                                        a.peers))
+        return false;
+    if (pack)
+        PackDraftProjections(gateUp, down, true, packed, sources, gpu);
+    if (&output != &input)
+        DraftBuffer(output, BFLOAT16, input.dims, gpu);
+    a.input = static_cast<const B *>(input.cudaData);
+    a.gateUp = static_cast<const uint2 *>(packed.cudaData);
+    a.down = static_cast<const uint4 *>(packed.cudaData) + 1024 * 4096 / 8;
+    a.hidden = static_cast<B *>(hidden.cudaData);
+    a.normed = static_cast<B *>(output.cudaData);
+    a.gamma = static_cast<const float *>(gamma.cudaData);
+    a.w = static_cast<MlpWorkspace *>(workspace.cudaData);
+    a.signals = state.allSignals;
+    a.eps = eps;
+    void *args[] = {&a};
+    fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::DraftNorm);
+    auto err =
+        cudaLaunchCooperativeKernel((const void *)kernel, MlpGrid, Threads, args, 0, cudaStreamPerThread);
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("SM120 draft MLP launch failed: ") + cudaGetErrorString(err));
+    fastllm::cuda_pdl::Mark(fastllm::cuda_pdl::Producer::DraftNorm);
+    return true;
+#else
+    return false;
+#endif
+}
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+namespace {
+struct DraftHead120State {
+    std::array<int, 8> devices{};
+    std::array<sm120_draft::HeadArgs120, 8> ranks{};
+    ~DraftHead120State() {
+        int old = 0;
+        cudaGetDevice(&old);
+        for (int rank = 0; rank < 8; ++rank) {
+            auto &a = ranks[rank];
+            cudaSetDevice(devices[rank]);
+            if (a.weight)
+                cudaFree(const_cast<uint4 *>(a.weight));
+            if (a.epoch)
+                cudaFree(a.epoch);
+            if (!rank && a.w2)
+                cudaFree(const_cast<uint4 *>(a.w2));
+            if (!rank && a.scratch)
+                cudaFree(a.scratch);
+        }
+        cudaSetDevice(old);
+    }
+};
+} // namespace
+#endif
+std::shared_ptr<void> FastllmCudaCreateDraftHead120(const std::vector<int> &devices,
+                                                    const std::vector<const fastllm::Data *> &weights,
+                                                    const fastllm::Data &w1, const fastllm::Data &w2) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    using namespace sm120_draft;
+    if (devices.size() != 8 || weights.size() != 8 || FastllmCudaGraphIsCapturingFast() ||
+        !DraftTensor(w1, fastllm::BFLOAT16, HeadVocab * 256, devices.front()) ||
+        !DraftTensor(w2, fastllm::BFLOAT16, HeadVocab * 256, devices.front()) || w1.IsRepacked ||
+        w2.IsRepacked)
+        return {};
+    for (int rank = 0; rank < 8; ++rank) {
+        const auto *w = weights[rank];
+        int major = 0, minor = 0;
+        if (!w || w->dims != std::vector<int>{HeadShard, 4096} || w->IsRepacked ||
+            !DraftTensor(*w, fastllm::BFLOAT16, HeadShard * 4096, devices[rank]) ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, devices[rank]) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, devices[rank]) != cudaSuccess ||
+            major != 12 || minor != 0)
+            return {};
+    }
+    if (!FastllmCudaPeerAccessInit(devices))
+        return {};
+    auto state = std::make_shared<DraftHead120State>();
+    std::copy(devices.begin(), devices.end(), state->devices.begin());
+    bool ok = true;
+    for (int rank = 0; rank < 8 && ok; ++rank) {
+        cudaSetDevice(devices[rank]);
+        auto kernel = rank ? FusedDraftHeadProposalSm120<false> : FusedDraftHeadProposalSm120<true>;
+        auto &a = state->ranks[rank];
+        uint4 *packed = nullptr;
+        ok = DraftGridFits(kernel, devices[rank], HeadGrid) &&
+             cudaMalloc(&packed, size_t(HeadShard) * 4096 * sizeof(B)) == cudaSuccess;
+        a.weight = packed;
+        if (!ok)
+            break;
+        if (!rank) {
+            ok = cudaMalloc(&a.scratch, sizeof(ProposalScratch)) == cudaSuccess &&
+                 cudaMemsetAsync(a.scratch->ready, 0, sizeof(a.scratch->ready), cudaStreamPerThread) ==
+                     cudaSuccess &&
+                 cudaMemsetAsync(a.scratch->selected, 0, sizeof(a.scratch->selected), cudaStreamPerThread) ==
+                     cudaSuccess &&
+                 cudaMemsetAsync(a.scratch->tags, 0, sizeof(a.scratch->tags), cudaStreamPerThread) ==
+                     cudaSuccess;
+        } else
+            a.scratch = state->ranks[0].scratch;
+        a.w1 = static_cast<const B *>(w1.cudaData);
+        if (!rank && ok) {
+            uint4 *biasWeights = nullptr;
+            ok = cudaMalloc(&biasWeights, size_t(HeadVocab) * 256 * sizeof(B)) == cudaSuccess;
+            a.w2 = biasWeights;
+            if (ok) {
+                PackProjection<<<HeadVocab / 8, 256, 0, cudaStreamPerThread>>>(
+                    static_cast<const B *>(w2.cudaData), biasWeights, 256);
+                ok = cudaGetLastError() == cudaSuccess;
+            }
+        }
+        a.rank = rank;
+        ok = ok && cudaMalloc(&a.epoch, sizeof(unsigned)) == cudaSuccess &&
+             cudaMemsetAsync(a.epoch, 0, sizeof(unsigned), cudaStreamPerThread) == cudaSuccess;
+        if (!ok)
+            break;
+        PackProjection<<<HeadShard * 4096 / (8 * 256), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const B *>(weights[rank]->cudaData), packed, 4096);
+        ok = cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+    }
+    cudaSetDevice(devices.front());
+    if (ok)
+        return state;
+    cudaGetLastError();
+#endif
+    return {};
+}
+void FastllmCudaLaunchDraftProposal(void *opaque, int rank, const fastllm::Data &normalized,
+                                   const fastllm::Data &bindings, int layers) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    using namespace sm120_draft;
+    auto a = static_cast<DraftHead120State *>(opaque)->ranks[rank];
+    // Single-request binding layout: a K/V pair per layer, one token/length word, then the request.
+    a.request = rank ? nullptr : reinterpret_cast<const FastllmDraftSamplingRequest *>(
+        static_cast<const uint64_t *>(bindings.cudaData) + 2 * layers + 1);
+    a.input = static_cast<const B *>(normalized.cudaData);
+    void *args[] = {&a};
+    auto kernel = rank ? FusedDraftHeadProposalSm120<false> : FusedDraftHeadProposalSm120<true>;
+    fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::DraftNorm);
+    auto error =
+        cudaLaunchCooperativeKernel((const void *)kernel, HeadGrid, Threads, args, 0, cudaStreamPerThread);
+    if (error != cudaSuccess)
+        throw std::runtime_error(std::string("SM120 draft head launch: ") + cudaGetErrorString(error));
+#endif
+}
+void FastllmCudaReadDraftProposal(void *opaque, int *tokens) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    auto &a = static_cast<DraftHead120State *>(opaque)->ranks[0];
+    if (cudaMemcpyAsync(tokens, a.scratch->ids, sizeof(a.scratch->ids), cudaMemcpyDeviceToHost,
+                        cudaStreamPerThread) != cudaSuccess ||
+        cudaStreamSynchronize(cudaStreamPerThread) != cudaSuccess)
+        throw std::runtime_error("SM120 draft token read failed");
+#endif
+}
+
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+namespace {
+struct DraftContext120State {
+    std::array<int, 8> devices{};
+    std::array<sm120_draft::ContextArgs, 8> args{};
+    ~DraftContext120State() {
+        int previous;
+        cudaGetDevice(&previous);
+        for (int r = 0; r < 8; ++r) {
+            cudaSetDevice(devices[r]);
+            const auto &a = args[r];
+            if (a.fc)
+                cudaFree(const_cast<uint4 *>(a.fc));
+            if (a.peers[r])
+                cudaFree(a.peers[r]);
+        }
+        cudaSetDevice(previous);
+    }
+};
+} // namespace
+#endif
+
+std::shared_ptr<void> FastllmCudaCreateDraftContext120(const std::vector<int> &devices,
+                                                       const FastllmDraftContextWeights120 (&weights)[8]) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    using namespace sm120_draft;
+    using fastllm::BFLOAT16;
+    using fastllm::FLOAT32;
+    if (devices.size() != 8 || FastllmCudaGraphIsCapturingFast())
+        return {};
+    for (int r = 0; r < 8; ++r) {
+        int gpu = devices[r], major = 0, minor = 0;
+        const auto &w = weights[r];
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gpu) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, gpu) != cudaSuccess ||
+            major != 12 || minor != 0 || !DraftGridFits(FusedDraftContextSm120, gpu, 256) || !w.fc ||
+            !w.gamma || w.fc->IsRepacked || w.fc->dims != std::vector<int>{4096, 32768} ||
+            !DraftTensor(*w.fc, BFLOAT16, 4096 * 32768, gpu) || !DraftTensor(*w.gamma, FLOAT32, 4096, gpu))
+            return {};
+        for (int l = 0; l < 5; ++l)
+            if (!w.qkv[l] || !w.kNorm[l] || w.qkv[l]->IsRepacked ||
+                w.qkv[l]->dims != std::vector<int>{768, 4096} ||
+                !DraftTensor(*w.qkv[l], BFLOAT16, 768 * 4096, gpu) ||
+                !DraftTensor(*w.kNorm[l], FLOAT32, 128, gpu))
+                return {};
+    }
+    if (!FastllmCudaPeerAccessInit(devices))
+        return {};
+    auto s = std::make_shared<DraftContext120State>();
+    std::copy(devices.begin(), devices.end(), s->devices.begin());
+    bool ok = true;
+    for (int r = 0; r < 8 && ok; ++r) {
+        cudaSetDevice(devices[r]);
+        const auto &w = weights[r];
+        auto &a = s->args[r];
+        uint4 *packed = nullptr;
+        ok = cudaMalloc(&packed, size_t(4096 + 1280) * 4096 * sizeof(B)) == cudaSuccess;
+        a.fc = packed;
+        if (!ok)
+            break;
+        a.kv = packed + 4096 * 4096 / 8;
+        ok = cudaMalloc(&a.peers[r], sizeof(ContextWork)) == cudaSuccess &&
+             cudaMemsetAsync(a.peers[r]->ready, 0, sizeof(a.peers[r]->ready), cudaStreamPerThread) ==
+                 cudaSuccess;
+        if (!ok)
+            break;
+        a.gamma = static_cast<const float *>(w.gamma->cudaData);
+        a.rank = r;
+        PackContextFc<<<4096 * 4096 / (8 * 256), 256, 0, cudaStreamPerThread>>>(
+            static_cast<const B *>(w.fc->cudaData), packed, r);
+        for (int l = 0; l < 5; ++l) {
+            a.kNorm[l] = static_cast<const float *>(w.kNorm[l]->cudaData);
+            PackProjection<<<256 * 4096 / (8 * 256), 256, 0, cudaStreamPerThread>>>(
+                static_cast<const B *>(w.qkv[l]->cudaData) + 512 * 4096,
+                packed + size_t(4096 + l * 256) * 4096 / 8, 4096);
+        }
+        ok = cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(cudaStreamPerThread) == cudaSuccess;
+    }
+    cudaSetDevice(devices.front());
+    if (ok) {
+        for (auto &a : s->args)
+            for (int r = 0; r < 8; ++r)
+                a.peers[r] = s->args[r].peers[r];
+        return s;
+    }
+    cudaGetLastError();
+#endif
+    return {};
+}
+
+void FastllmCudaCommitDraftContext120(void *state, int rank, const FastllmDraftContextInput120 &input,
+                                      int count, int old, int position, float eps, float theta) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    using namespace sm120_draft;
+    auto &a = static_cast<DraftContext120State *>(state)->args[rank];
+    a.feature = static_cast<const B *>(input.feature);
+    a.nextBindings = static_cast<uint64_t *>(input.nextBindings);
+    a.anchor = input.anchor;
+    a.request = input.request;
+    for (int i = 0; i < 10; ++i)
+        a.cache[i] = static_cast<B *>(input.cache[i]);
+    a.count = count;
+    a.old = old;
+    a.position = position;
+    a.eps = eps;
+    a.theta = theta;
+    ++a.epoch;
+    void *args[] = {&a};
+    auto err = cudaLaunchCooperativeKernel((const void *)FusedDraftContextSm120, 256, Threads, args, 0,
+                                           cudaStreamPerThread);
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("SM120 draft context: ") + cudaGetErrorString(err));
+#endif
+}
+
+// A completed producer stream has no outstanding feature writes for peers to wait on.
+bool FastllmCudaDraftFeaturesReady120() {
+    auto status = cudaStreamQuery(cudaStreamPerThread);
+    if (status == cudaSuccess)
+        return true;
+    if (status != cudaErrorNotReady)
+        throw std::runtime_error(std::string("SM120 draft feature readiness: ") + cudaGetErrorString(status));
+    return false;
+}
+
+// Only a captured embedding with packed bindings can consume device-published inputs.
+bool FastllmCudaCanContinueDraftGraph(void *opaque) {
+#if defined(FASTLLM_ENABLE_NAIVE_VERIFY_SM120) && CUDART_VERSION >= 12030
+    using namespace sm120_draft;
+    auto graph = static_cast<cudaGraph_t>(opaque);
+    size_t roots = 0, children = 0;
+    cudaGraphNode_t embedding = nullptr, attention = nullptr;
+#if CUDART_VERSION >= 13000
+    auto dependentNodes = cudaGraphNodeGetDependentNodes;
+#else
+    auto dependentNodes = cudaGraphNodeGetDependentNodes_v2;
+#endif
+    cudaGraphEdgeData edge{};
+    cudaKernelNodeParams kernel{};
+    if (cudaGraphGetRootNodes(graph, nullptr, &roots) != cudaSuccess || roots != 1 ||
+        cudaGraphGetRootNodes(graph, &embedding, &roots) != cudaSuccess ||
+        cudaGraphKernelNodeGetParams(embedding, &kernel) != cudaSuccess ||
+        kernel.func != (void *)PrepareDraftEmbeddingSm120 ||
+        dependentNodes(embedding, nullptr, nullptr, &children) != cudaSuccess || children != 1 ||
+        dependentNodes(embedding, &attention, &edge, &children) != cudaSuccess ||
+        cudaGraphKernelNodeGetParams(attention, &kernel) != cudaSuccess ||
+        kernel.func != (void *)FusedDraftAttentionSm120) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaPrepareDraftEmbedding(const fastllm::Data &id, const fastllm::Data &live,
+                                  const fastllm::Data &embedding, const fastllm::Data &mask,
+                                  const fastllm::Data &gamma, fastllm::Data &hidden, fastllm::Data &positions,
+                                  fastllm::Data &normed, float eps, int gpu) {
+#ifdef FASTLLM_ENABLE_NAIVE_VERIFY_SM120
+    using namespace sm120_draft;
+    using namespace fastllm;
+    if (!DraftTensor(id, FLOAT32, 1, gpu) || !DraftTensor(live, INT32, 1, gpu) ||
+        embedding.dims.size() != 2 || embedding.dims[1] != 4096 ||
+        !DraftTensor(embedding, BFLOAT16, embedding.Count(0), gpu) ||
+        !DraftTensor(mask, BFLOAT16, 4096, gpu) || !DraftTensor(gamma, FLOAT32, 4096, gpu))
+        return false;
+    DraftBuffer(hidden, BFLOAT16, {1, Rows, 4096}, gpu);
+    DraftBuffer(normed, BFLOAT16, {1, Rows, 4096}, gpu);
+    DraftBuffer(positions, FLOAT32, {1, Rows}, gpu);
+    PrepareDraftEmbeddingSm120<<<Rows, Threads, 0, cudaStreamPerThread>>>(
+        static_cast<const float *>(id.cudaData), static_cast<const int *>(live.cudaData),
+        static_cast<const B *>(embedding.cudaData), static_cast<const B *>(mask.cudaData),
+        static_cast<const float *>(gamma.cudaData), static_cast<B *>(hidden.cudaData),
+        static_cast<B *>(normed.cudaData), static_cast<float *>(positions.cudaData), eps);
+    if (cudaGetLastError() != cudaSuccess)
+        throw std::runtime_error("SM120 draft embedding launch failed");
+    fastllm::cuda_pdl::Mark(fastllm::cuda_pdl::Producer::DraftNorm);
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool FastllmCudaDraftReduceAddNorm7(void *data, void *residual, const float *weight,
+        void *output, float eps, int deviceId) {
+    return CustomReduceAddNorm(data, residual, weight, output, 7 * 4096, 4096, eps, fastllm::BFLOAT16, deviceId, true);
 }
 
 bool FastllmCudaCustomAllReduceAndGather(void *routed, void *dest,
@@ -4129,6 +5254,12 @@ bool FastllmCudaCustomAllGatherRows(void *data, int count, int rowElements,
     const int part = bytes / (ranks * 16);
     const int blocks = std::max(1, std::min(kCustomArMaxBlocks,
         (part + kCustomArThreads - 1) / kCustomArThreads));
+    if (state.sm120EightRanks && count / rowElements == 64 && dataType == fastllm::FLOAT32 &&
+        part >= kCustomArThreads) {
+        FastllmCustomAllGatherInplaceKernel<8, false, true><<<blocks, kCustomArThreads, 0, cudaStreamPerThread>>>(
+            rankData, state.allSignals, state.allSignals.signals[rank], static_cast<uint4 *>(data), rank, part);
+        return cudaGetLastError() == cudaSuccess;
+    }
 #define CUSTOM_AG_RANK_CASE(RANKS)                                           \
     case RANKS:                                                             \
         if (RANKS > 2 && part <= kCustomArThreads / 2)                       \

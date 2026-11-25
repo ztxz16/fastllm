@@ -272,6 +272,7 @@ set(FASTLLM_CXX_SOURCES src/exl3.cpp src/fastllm.cpp src/pd.cpp src/models/naive
         src/models/qwen4_exp_hybrid.cpp src/models/qwen4_exp_hybrid_parallel.cpp src/models/qwen4_exp_tp.cpp
         src/models/qwen4_exp_pp.cpp
         src/utils/hybrid_moe.cpp src/utils/hybrid_parallel.cpp src/models/kimi_k3.cpp src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_history.cpp src/models/naive_n05_draft.cpp src/models/naive_n05_kvmem.cpp
+        src/devices/multicuda/fastllm-naive-draft-execution.cpp
         src/models/minimax.cpp src/models/hunyuan.cpp
         src/models/ernie4_5.cpp src/models/pangu_moe.cpp src/models/glm4_moe.cpp src/models/glm5_moe_dsa.cpp src/models/glm5_next.cpp src/models/glm5_next_gpu.cpp src/models/glm5_next_hybrid.cpp src/models/gpt_oss.cpp
         src/models/clover.cpp src/models/clover_parallel.cpp src/models/clover_sampling.cpp src/models/clover_generation.cpp src/models/minimax_m2.cpp src/models/qwen2.cpp src/models/gemma4.cpp src/models/step3p5.cpp src/models/laguna.cpp
@@ -686,6 +687,10 @@ if (USE_CUDA)
             set_property(SOURCE src/devices/cuda/linear/fastllm-linear-bf16.cu APPEND PROPERTY
                 COMPILE_DEFINITIONS FASTLLM_HAS_BF16_MMA_SM120)
         endif()
+        if (";${FASTLLM_CUDA_ARCHITECTURES};" MATCHES ";120[af](-real)?;")
+            set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
+                APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_VERIFY_SM120)
+        endif()
         set_property(SOURCE src/fastllm.cpp src/models/deepseekv41.cpp src/models/deepseekv41_dspark.cpp
             src/devices/multicuda/multicudadevice.cpp
             APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_CUTLASS_MXFP8_SM120)
@@ -707,7 +712,8 @@ if (USE_CUDA)
     endif()
 
     # These C++ units include CUDA runtime/driver headers without going through nvcc.
-    set_property(SOURCE src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp src/models/clover_parallel.cpp
+    set_property(SOURCE src/devices/multicuda/fastllm-naive-experts.cpp
+        src/devices/cuda/models/glm5-next-dsa.cpp src/models/clover.cpp src/models/clover_parallel.cpp
         src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp src/models/naive_n05_kvmem.cpp src/models/naive_n05_pd.cpp
         APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}")
 
@@ -788,6 +794,9 @@ if (USE_CUDA)
     include_directories(include/devices/multicuda)
     set(FASTLLM_CUDA_SOURCES ${FASTLLM_CUDA_SOURCES}
         src/devices/multicuda/multicudadevice.cpp
+        src/devices/multicuda/fastllm-naive-context-indexer.cpp
+        src/devices/multicuda/fastllm-naive-experts.cpp
+        src/devices/multicuda/fastllm-draft-verify.cpp
         src/devices/multicuda/parallel_runtime.cu
         src/devices/multicuda/fastllm-multicuda.cu
         src/devices/multicuda/fastllm-custom-allreduce.cu)
@@ -847,6 +856,8 @@ if(USE_ROCM)
         src/devices/hip/fastllm-gguf-mmvq-q.hip
         src/devices/hip/fastllm-gguf-mmvq-k.hip
         src/devices/hip/fastllm-gguf-mmvq-iq.hip
+        src/devices/multicuda/fastllm-naive-context-indexer.cpp
+        src/devices/multicuda/fastllm-naive-experts.cpp
         src/devices/multicuda/multicudadevice.cpp src/devices/multihip/fastllm-multihip.hip)
     add_compile_definitions(USE_ROCM)
     add_compile_definitions(USE_CUDA)
@@ -1093,7 +1104,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         NAIVERT_EXPERT_DOWN_W8A8=1
         NAIVERT_DSA_INDEX_HEADS=16
         NAIVERT_MLA_ROWS_ENABLE_PHASE_TIMERS=0)
-    set_property(SOURCE src/models/naive_n05_flash.cpp src/models/naive_n05_tp.cpp
+    set_property(SOURCE src/devices/multicuda/fastllm-naive-experts.cpp
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_FLEX_SM103)
     set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
     add_library(fastllm_naive_dsa_fused OBJECT src/devices/cuda/models/naive-n05-dsa-fused.cu
@@ -1106,7 +1117,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_options(fastllm_naive_dsa_fused PRIVATE
         "--generate-code=arch=compute_103a,code=sm_103a" "--expt-relaxed-constexpr"
         "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
-    set_property(SOURCE src/models/naive_n05_flash.cpp src/devices/multicuda/fastllm-custom-allreduce.cu
+    set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DSA_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_dsa_fused>)
     add_library(fastllm_draft_fused OBJECT src/devices/cuda/models/naive-n05-draft-fused.cu)
@@ -1122,7 +1133,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_definitions(fastllm_draft_fused PRIVATE
         NAIVERT_SM_COUNT=148 NAIVERT_TP_RANKS=8 NAIVERT_HIDDEN=4096
         NAIVERT_VOCAB_SHARD=19072 NAIVERT_NORM_EPS=1e-05)
-    set_property(SOURCE src/models/naive_n05_draft.cpp src/models/naive_n05_tp.cpp
+    set_property(SOURCE src/devices/multicuda/fastllm-naive-draft-execution.cpp
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DRAFT_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_draft_fused>)
     add_library(fastllm_shared_flex_sm103 OBJECT

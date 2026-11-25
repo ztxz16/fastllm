@@ -11,6 +11,8 @@ namespace fastllm { class Data; }
 struct FastllmMxfp8Activation {
     uint8_t *values = nullptr, *scales = nullptr;
     int rows = 0, width = 0, pitch = 0;
+    // Nonnegative for SM120 128x4 scale tiles. Slices share the parent scale base.
+    int swizzledRowOffset = -1;
     bool Matches(int actualRows, int actualWidth) const {
         return values && scales && rows > 0 && rows == actualRows && width == actualWidth &&
                width > 0 && width % 128 == 0 && pitch == (rows + 3) / 4 * 4;
@@ -26,7 +28,8 @@ struct FastllmMxfp8PrefillOutput {
     static FastllmMxfp8PrefillOutput ForRows(FastllmMxfp8Activation matrix, int first, int count, int &completed) {
         if (!matrix.values || !matrix.scales || first < 0 || count <= 0 || first > matrix.rows - count) return {};
         matrix.values += std::size_t(first) * matrix.width;
-        matrix.scales += std::size_t(first) * 4;
+        if (matrix.swizzledRowOffset >= 0) matrix.swizzledRowOffset += first;
+        else matrix.scales += std::size_t(first) * 4;
         matrix.rows = count;
         return {matrix, &completed};
     }
@@ -48,6 +51,9 @@ struct FastllmMxfp8ProjectionBackend {
     // Prefill producers can outlive a single request and borrow a much larger
     // arena. A backend must admit its full matrix before any request packs rows.
     bool (*canPackPrefill)(const fastllm::Data &weight, int rows) = nullptr;
+    bool sm120ScaleTiles = false;
+    bool packOnlineDsaDecode = true;
+    int minPrefillNormRows = 2048;
 
     FastllmMxfp8Activation Bind(const fastllm::Data &weight, int rows, bool verifying,
                                 int maxWidth, fastllm::Data &storage) const;

@@ -42,12 +42,10 @@ __global__ void RouterSigmoidSingle(const BF16 *input, const float *weight,
 }
 
 template<int Rows, int Hidden>
-__global__ void RouterSigmoidRows(const BF16 *input, const float *weight,
-        float *output, int rows, int experts) {
+__device__ __forceinline__ void RouterRowsBody(const BF16 *input, const float *weight,
+        float *output, int rows, int experts, int t, int first, int expert, float (&sums)[Rows][8]) {
     static_assert(Hidden > 0 && Hidden % 256 == 0);
     static_assert(Rows > 0 && Rows <= 8);
-    const int t = threadIdx.x, first = blockIdx.y * Rows, expert = blockIdx.x;
-    __shared__ float sums[Rows][8];
     float weights[Hidden/256], values[Rows][Hidden/256], partial[Rows]{};
     #pragma unroll
     for (int i = 0; i < Hidden/256; ++i) {
@@ -82,6 +80,14 @@ __global__ void RouterSigmoidRows(const BF16 *input, const float *weight,
             output[(size_t)(first + row) * experts + expert] =
                 1.0 / (1.0 + expf(-(value + 0.0f)));
     }
+}
+
+template<int Rows, int Hidden>
+__global__ void RouterSigmoidRows(const BF16 *input, const float *weight,
+        float *output, int rows, int experts) {
+    __shared__ float sums[Rows][8];
+    RouterRowsBody<Rows, Hidden>(input, weight, output, rows, experts, threadIdx.x,
+                                blockIdx.y * Rows, blockIdx.x, sums);
 }
 
 template<int Experts, int Rows, int Hidden>

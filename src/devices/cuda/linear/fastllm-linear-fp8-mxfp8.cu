@@ -12,6 +12,7 @@
 #include "devices/cuda/fastllm-cuda-graph-workspace.h"
 #include "fastllm.h"
 #include "devices/cuda/fastllm-draft-head.cuh"
+#include "devices/cuda/fastllm-mxfp8-projection.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -364,6 +365,53 @@ extern "C" void FastllmCudaReleaseMxfp8CutlassCache(const fastllm::Data *weight)
             FastllmCudaSetDevice(previous);
         }
     }
+}
+
+const uint8_t *FastllmCudaSm120GemvScales(const fastllm::Data &weight, int channels, int inner) {
+    if (!Mxfp8EnvEnabled() || weight.dataType != fastllm::FP8_E4M3 || weight.dataDevice != fastllm::CUDA ||
+        weight.isFake || weight.IsRepacked || weight.multiDeviceData || !weight.cudaData ||
+        weight.dims.size() != 2 || weight.dims[0] != channels || weight.dims[1] != inner ||
+        !Mxfp8Dense(weight)) return nullptr;
+    const uint8_t *scales = nullptr;
+    return EnsureMxfp8WeightScales(weight, channels, inner, scales) ? scales : nullptr;
+}
+
+namespace {
+bool Sm120ProjectionWeight(const fastllm::Data &weight) {
+    return weight.dims.size() == 2 && weight.blockK == 1 && weight.blockM == 32 &&
+        ((weight.dims[0] >= 4096 && weight.dims[0] % 128 == 0 &&
+          (weight.dims[1] == 4096 || weight.dims[1] == 8192)) ||
+         (weight.dims[0] == 1856 && weight.dims[1] == 4096) ||
+         (weight.dims[0] == 4096 && weight.dims[1] == 1024)) &&
+        FastllmCudaSm120GemvScales(weight, weight.dims[0], weight.dims[1]);
+}
+bool Sm120ProjectPacked(FastllmMxfp8Activation input, const fastllm::Data &weight, void *output) {
+    if (input.swizzledRowOffset != 0 || input.rows < 2) return false;
+    const int n = weight.dims[0], k = weight.dims[1], device = FastllmCudaGetDevice();
+    const auto *scales = FastllmCudaSm120GemvScales(weight, n, k);
+    if (!scales) return false;
+    const bool capture = FastllmCudaGraphIsCapturingFast();
+    auto *lt = fastllm_mxfp8_lt::GetState(device, capture);
+    auto *plan = lt ? fastllm_mxfp8_lt::GetPlan(*lt, input.rows, n, k, scales, input.scales, capture) : nullptr;
+    if (!plan || plan->workspaceBytes > fastllm_bf16_lt::workspaceBytes) return false;
+    void *workspace = nullptr;
+    if (plan->workspaceBytes) {
+        auto *storage = fastllm_bf16_lt::GetState(device, capture);
+        if (!storage || (!capture && !storage->eager)) return false;
+        workspace = capture ? fastllm_bf16_lt::CaptureWorkspace(*storage) : storage->eager->data;
+        if (!workspace) return false;
+    }
+    return fastllm_mxfp8_lt::Run(*lt, *plan, weight.cudaData, input.values, output,
+        scales, input.scales, workspace, cudaStreamPerThread);
+}
+}
+const FastllmMxfp8ProjectionBackend *FastllmCudaSm120PackedProjection() {
+    static const FastllmMxfp8ProjectionBackend backend{
+        [](fastllm::Data &w) { Sm120ProjectionWeight(w); },
+        [](const fastllm::Data &w, bool verify) { return Sm120ProjectionWeight(w) ? (verify ? 16384 : 256) : 0; },
+        Sm120ProjectPacked,
+        [](const fastllm::Data &w, int rows) { return rows >= 32 && Sm120ProjectionWeight(w); }, true, false, 32};
+    return Mxfp8EnvEnabled() ? &backend : nullptr;
 }
 
 // Draft only: block-32 W8A8 with FP32 accumulation and FP32 logits.

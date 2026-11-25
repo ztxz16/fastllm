@@ -1,0 +1,102 @@
+#include "devices/cuda/naive-n05-swa-settings.h"
+#include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-naive-context-indexer.h"
+#include "devices/multicuda/fastllm-multicuda.cuh"
+#include "utils/utils.h"
+#include "devices/cuda/naive-n05-indexer-attention.cuh"
+#include "parallel/cuda_runtime.h"
+#ifndef USE_ROCM
+#include "devices/multicuda/fastllm-naive-verify.h"
+#endif
+
+namespace fastllm {
+NaiveAttentionCapabilities FastllmCudaNaiveAttentionCapabilities() {
+    const int arch = FastllmCudaRuntimeArch();
+    static const bool swaQkv = fastllm_swa_settings::QkvEnabled();
+    return {arch == 103, arch == 103 && swaQkv, arch == 90, arch == 100 || arch == 103,
+            FastllmCudaHasBlackwellIndexerAttention()};
+}
+
+bool FastllmCudaStablePrefillReduction(const std::vector<int> &archs) {
+    return !archs.empty() && std::all_of(archs.begin(), archs.end(), [](int arch) { return arch == 120; });
+}
+bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime) {
+    std::vector<int> archs(runtime.Layout().Size());
+    runtime.Run([&](int rank, int) { archs[rank] = FastllmCudaRuntimeArch(); });
+    return FastllmCudaStablePrefillReduction(archs);
+}
+
+NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, bool packed,
+        const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
+        int capacity, int indexHeads, int indexDim, int topK) {
+    NaiveVerifyAttentionPlan plan{packed};
+#ifndef USE_ROCM
+    if (requests && integratedExperts) {
+        plan.swa = ringCache && rows <= 16 && FastllmCudaSwaVerifyLayerSupported(device, rows);
+        plan.dsa = localDsa && FastllmCudaLocalDsaLayerSupported(*requests, rows, capacity, indexHeads, indexDim, topK);
+    }
+#endif
+    return plan;
+}
+NaiveVerifyAttentionPlan::Layer NaiveVerifyAttentionPlan::ForLayer(bool sliding, bool residual, bool localIndexer,
+        bool packedCache, bool ringCache, bool contextIndex) const {
+    return {packed && packedCache && (sliding ? ringCache : !residual && localIndexer && contextIndex),
+            sliding && residual && swa, !sliding && localIndexer && dsa};
+}
+
+static void GatherContextCandidates(Data &exchange, int part, int rank, int ranks, int gpu,
+        const IndexerGather &gather, int rowWords) {
+    if (gather) { gather((int *)exchange.cudaData + rank * part, exchange.cudaData, part); return; }
+    if (!FastllmCudaCustomAllGatherRows(exchange.cudaData, ranks * part, rowWords, FLOAT32, gpu))
+        AssertInFastLLM(FastllmNcclAllGather((int *)exchange.cudaData + rank * part,
+            exchange.cudaData, part, INT32, gpu), "Indexer context all-gather failed.");
+}
+static int ContextCandidateWidth(int capacity, int page, int ranks) {
+    const int pages = capacity / page + (capacity % page != 0);
+    return std::min(2048, pages * (page / ranks));
+}
+void RunContextVerifyIndexer(const Data &query, const Data &weights,
+        const std::vector<FastllmNaiveVerifyIndexerItem> &items,
+        FastllmNaiveDecodeScratch &scratch, Data &live, Data &exchange,
+        int rank, int ranks, int page, int gpu, bool fp8Query, const std::vector<int> &devices, const IndexerGather &gather) {
+    int rows = 0, capacity = 0;
+    for (const auto &item : items) {
+        rows += item.rows;
+        capacity = std::max(capacity, item.capacity ? item.capacity : item.past + item.rows);
+    }
+    // Every rank derives the same exchange width from the graph capacity,
+    // including ranks whose final page is empty during replay.
+    const int directWidth = rows == 8 && ranks == 8 && page > 0 && page % ranks == 0 &&
+        capacity <= 2048 * ranks && FastllmCudaNaiveIndexerContextSupported(devices, true)
+        ? ContextCandidateWidth(capacity, page, ranks) : 0;
+    const int rowWords = (directWidth ? directWidth : 2048) * 2, part = rows * rowWords;
+    exchange.dataType = INT32; exchange.Resize({ranks * part});
+    exchange.ToDevice(query.dataDevice, query.dataDeviceIds, false); exchange.Allocate(false);
+    AssertInFastLLM(FastllmCudaNaiveBatchVerifyIndexer(query, weights, items, fp8Query,
+        scratch, live, rank, ranks, &exchange, page, directWidth), "Unsupported context-sharded verification layout.");
+    GatherContextCandidates(exchange, part, rank, ranks, gpu, gather, rowWords);
+    FastllmCudaNaiveMergeVerifyIndexer(items, scratch, live, exchange, ranks, page, directWidth);
+}
+void RunContextDecodeIndexer(const Data &query, const Data &weights, const Data &live,
+        const std::vector<FastllmNaiveIndexerRow> &rows, Data &exchange,
+        int rank, int ranks, int page, int gpu, bool fp8Query, const IndexerGather &gather) {
+    // A graph replays different live lengths within this capacity. Size the
+    // dedicated exchange for the largest possible shard on any rank.
+    int directWidth = 0;
+    if (!rows.empty() && rows.size() < 16) {
+        int capacity = 0;
+        for (const auto &row : rows) capacity = std::max(capacity, row.capacity);
+        directWidth = ContextCandidateWidth(capacity, page, ranks);
+    }
+    const int rowWords = (directWidth ? directWidth : 2048) * 2;
+    const int part = rows.size() * rowWords;
+    exchange.dataType = INT32;
+    exchange.Resize({ranks * part});
+    exchange.ToDevice(query.dataDevice, query.dataDeviceIds, false);
+    exchange.Allocate(false);
+    AssertInFastLLM(FastllmCudaNaiveBatchDecodeIndexer(query, weights, live, rows, fp8Query,
+        rank, ranks, &exchange, page, directWidth), "Unsupported context-sharded decode Indexer layout.");
+    GatherContextCandidates(exchange, part, rank, ranks, gpu, gather, rowWords);
+    FastllmCudaNaiveMergeDecodeIndexer(live, rows, exchange, ranks, page, directWidth);
+}
+}

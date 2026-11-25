@@ -3,24 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
-// Caller-owned buffers and live descriptors; no packed weights or global request state.
-struct FastllmNaiveDSALayerInput {
-    const fastllm::Data *branch = nullptr;
-    fastllm::Data *hidden = nullptr, *feature = nullptr;
-    const fastllm::Data *inputNorm = nullptr, *qkvWeight = nullptr, *qkvBias = nullptr;
-    const fastllm::Data *indexKeyWeight = nullptr, *indexQueryWeight = nullptr, *indexWeight = nullptr;
-    const fastllm::Data *indexNorm = nullptr, *indexBias = nullptr, *outputWeight = nullptr;
-    const fastllm::Data *postNorm = nullptr, *sink = nullptr, *positions = nullptr, *live = nullptr;
-    const fastllm::Data *routerWeight = nullptr;
-    fastllm::Data *query = nullptr, *attention = nullptr, *projected = nullptr, *normed = nullptr;
-    fastllm::Data *router = nullptr;
-    FastllmNaiveDecodeScratch *scratch = nullptr;
-    std::vector<FastllmNaiveRopeCacheRow> caches;
-    std::vector<int> requests;
-    int capacity = 0;
-    bool fp8Query = true;
-    float eps = 1e-5f, theta = 10000.f, valueScale = 1.f;
-};
+#include "devices/multicuda/fastllm-naive-verify.h"
 
 // Internal launch ABI shared by the SM103 object and the TP rendezvous adapter.
 // No request pointers are retained by the adapter after it returns.

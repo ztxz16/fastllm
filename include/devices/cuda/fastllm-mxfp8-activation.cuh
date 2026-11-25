@@ -12,6 +12,13 @@ __device__ __forceinline__ uint32_t ScaleExponent(float maximum) {
     return min(254u, max(1u, (bits >> 23) + ((bits & 0x7fffffu) != 0)));
 }
 
+__device__ __forceinline__ size_t ScaleIndex(FastllmMxfp8Activation dst, int row, int col) {
+    if (dst.swizzledRowOffset < 0) return (size_t(col / 128) * dst.pitch + row) * 4 + col / 32 % 4;
+    row += dst.swizzledRowOffset;
+    return (size_t(row / 128) * (dst.width / 128) + col / 128) * 512 +
+        row % 32 * 16 + (row % 128) / 32 * 4 + col / 32 % 4;
+}
+
 // Each warp supplies contiguous, already rounded BF16 output to one or more
 // K32 groups. The scale address is identical to the standalone pack kernel.
 template <int N>
@@ -25,7 +32,7 @@ __device__ __forceinline__ void StoreGroup(FastllmMxfp8Activation dst, int row, 
 #pragma unroll
     for (int d = 16 / N; d; d >>= 1)
         maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, d, 32 / N));
-    const unsigned exponent = ScaleExponent(maximum);
+    const unsigned exponent = ScaleExponent(dst.swizzledRowOffset >= 0 ? fmaxf(maximum, 1.e-4f) : maximum);
     const float inv = __uint_as_float(exponent == 254 ? 0x00400000u : (254u - exponent) << 23);
     uint32_t packed = 0;
 #pragma unroll
@@ -35,11 +42,11 @@ __device__ __forceinline__ void StoreGroup(FastllmMxfp8Activation dst, int row, 
     if constexpr (N == 4) *reinterpret_cast<uint32_t *>(out) = packed;
     else *out = packed;
     if (col % 32 == 0)
-        dst.scales[(size_t(col / 128) * dst.pitch + row) * 4 + (col / 32) % 4] = exponent;
+        dst.scales[ScaleIndex(dst, row, col)] = exponent;
 }
 
 // Four consecutive lanes share one K32 exponent. Each lane packs eight BF16 values.
-__device__ __forceinline__ uint2 PackActivation(const __nv_bfloat162 *pairs, uint32_t &exponent, unsigned mask) {
+__device__ __forceinline__ uint2 PackActivation(const __nv_bfloat162 *pairs, uint32_t &exponent, unsigned mask, bool sm120 = false) {
     __nv_bfloat162 maxPair = __habs2(pairs[0]);
 #pragma unroll
     for (int i = 1; i < 4; ++i)
@@ -48,7 +55,7 @@ __device__ __forceinline__ uint2 PackActivation(const __nv_bfloat162 *pairs, uin
     float maximum = fmaxf(0.f, fmaxf(pair.x, pair.y));
     maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 1, 4));
     maximum = fmaxf(maximum, __shfl_xor_sync(mask, maximum, 2, 4));
-    exponent = ScaleExponent(maximum);
+    exponent = ScaleExponent(sm120 ? fmaxf(maximum, 1.e-4f) : maximum);
     const float inv = __uint_as_float(exponent == 254 ? 0x00400000u : (254u - exponent) << 23);
     union {
         uint2 word;
@@ -67,16 +74,16 @@ __device__ __forceinline__ uint2 PackActivation(const __nv_bfloat162 *pairs, uin
 // Four adjacent lanes own one K32 block of already rounded BF16 values.
 __device__ __forceinline__ void Store8(FastllmMxfp8Activation dst, int row, int col, uint4 values) {
     uint32_t exponent;
-    const auto bytes = PackActivation(reinterpret_cast<const __nv_bfloat162 *>(&values), exponent, 0xffffffffu);
+    const auto bytes = PackActivation(reinterpret_cast<const __nv_bfloat162 *>(&values), exponent, 0xffffffffu, dst.swizzledRowOffset >= 0);
     *reinterpret_cast<uint2 *>(dst.values + size_t(row) * dst.width + col) = bytes;
     if (col % 32 == 0)
-        dst.scales[(size_t(col / 128) * dst.pitch + row) * 4 + col / 32 % 4] = exponent;
+        dst.scales[ScaleIndex(dst, row, col)] = exponent;
 }
 
 __device__ __forceinline__ void StoreZero8(FastllmMxfp8Activation dst, int row, int col) {
     *reinterpret_cast<uint2 *>(dst.values + size_t(row) * dst.width + col) = make_uint2(0, 0);
     if (col % 32 == 0)
-        dst.scales[(size_t(col / 128) * dst.pitch + row) * 4 + col / 32 % 4] = 1;
+        dst.scales[ScaleIndex(dst, row, col)] = dst.swizzledRowOffset >= 0 ? ScaleExponent(1.e-4f) : 1;
 }
 
 } // namespace fastllm_mxfp8

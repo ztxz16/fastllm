@@ -75,7 +75,7 @@ struct NaiveFlexMoe {
         fprintf(stderr,"[FlexMoE] enabled: SM103, TP8 EP1, W8A8, rows tiled by 8, original_payload_retained=0, Graph compatible, backend=builtin\n");
     }
     ~NaiveFlexMoe() { if (state) destroy(state);  }
-    void Forward(int rank,int layer,int rows,Data& x,Data& probabilities,Data& bias,Data& hidden) {
+    void Forward(int rank,int layer,int rows,Data& x,Data& probabilities,const Data& bias,Data& hidden) {
         AssertInFastLLM(x.dataType == BFLOAT16 && hidden.dataType == BFLOAT16 &&
                        probabilities.dataType == FLOAT32 && bias.dataType == FLOAT32,
                        "FlexMoE input type mismatch.");

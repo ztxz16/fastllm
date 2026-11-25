@@ -3,6 +3,7 @@
 // BFloat16 Linear: 小规模时使用自定义 GEMV kernel，大规模时使用 cublas (仿照 fastllm-linear-fp16.cu)
 //
 
+#include "devices/cuda/fastllm-cuda-pdl.cuh"
 #include "fastllm-cuda.cuh"
 #include "fastllm.h"
 #include "devices/cuda/fastllm-cuda-linear-output.h"
@@ -108,22 +109,29 @@ __global__ void FastllmGemvBf16Bf16Kernel2MultiRow(__nv_bfloat16 *A, __nv_bfloat
     // Weight-first PDL scheduling follows Basalt v0.5.6 native_mmvq.cu (third_party/basalt/LICENSE).
     // A single decode row has at most two vector loads per lane in this variant.
     // Weights are immutable. Wait before reading the activation or writing output.
-    uint4 firstWeight, secondWeight;
+    uint4 weights[2];
     if constexpr (Pdl) {
-        static_assert(PART == 1 && !GRID_BATCH);
-        if (tid * 8 < m) firstWeight = *reinterpret_cast<const uint4 *>(baseB + tid * 8);
-        if ((tid + THREAD_PER_BLOCK) * 8 < m)
-            secondWeight = *reinterpret_cast<const uint4 *>(baseB + (tid + THREAD_PER_BLOCK) * 8);
+        static_assert(!GRID_BATCH && (PART == 1 || PART == 7));
+#pragma unroll
+        for (int tile = 0; tile < 2; ++tile) {
+            const int col = (tile * THREAD_PER_BLOCK + tid) * 8;
+            if (m % 8 == 0 && col < m) {
+                if constexpr (PART == 1) weights[tile] = *reinterpret_cast<const uint4 *>(baseB + col);
+                else weights[tile] = fastllm::cuda_pdl::ReadWeight(baseB + col);
+            }
+        }
 #ifndef USE_ROCM
-        fastllm::cuda_launch::DependencyStart();
+        if constexpr (PART == 1) fastllm::cuda_launch::DependencyStart();
+        else fastllm::cuda_pdl::Wait();
 #endif
     }
-
     if (m % 8 == 0) {
 #pragma unroll
         for (int i = tid * 8; i < m; i += THREAD_PER_BLOCK * 8) {
-            if constexpr (Pdl) regB.in = i < THREAD_PER_BLOCK * 8 ? firstWeight : secondWeight;
-            else regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
+            if constexpr (Pdl) {
+                const int tile = i / (THREAD_PER_BLOCK * 8);
+                regB.in = tile < 2 ? weights[tile] : *reinterpret_cast<const uint4 *>(baseB + i);
+            } else regB.in = *reinterpret_cast<const uint4 *>(baseB + i);
 #pragma unroll
             for (int x = 0; x < PART; x++) {
                 regA.in = *reinterpret_cast<const uint4 *>(A + x * m + i);
@@ -274,7 +282,7 @@ __device__ __forceinline__ void FastllmBf16ExactTile(const __nv_bfloat16 *__rest
     const __nv_bfloat16 *row = weight + size_t(column) * width;
     uint4 staged[Pdl ? 8 : 1];
 #ifndef USE_ROCM
-    if constexpr (Pdl) {
+    if constexpr (Pdl && batch == 1) {
         static_assert(batch == 1 && FixedWidth > 0 && FixedWidth <= 4096);
 #pragma unroll
         for (int slot = 0; slot < 8; ++slot) {
@@ -284,6 +292,11 @@ __device__ __forceinline__ void FastllmBf16ExactTile(const __nv_bfloat16 *__rest
         fastllm::cuda_launch::DependencyStart();
     }
 #endif
+    uint4 firstWeight;
+    if constexpr (Pdl && batch != 1) {
+        if (lane * 8 < width) firstWeight = fastllm::cuda_pdl::ReadWeight(row + lane * 8);
+        fastllm::cuda_pdl::Wait();
+    }
     float sums[4][batch], corrections[4][batch] = {};
     #pragma unroll
     for (int leaf = 0; leaf < 4; ++leaf) {
@@ -293,8 +306,10 @@ __device__ __forceinline__ void FastllmBf16ExactTile(const __nv_bfloat16 *__rest
             if constexpr (FixedWidth != 4096)
                 if (offset >= width) continue;
             union_bf16_8 w;
-            if constexpr (Pdl) w.in = staged[half * 4 + leaf];
-            else w.in = *reinterpret_cast<const uint4 *>(row + offset);
+            if constexpr (Pdl && batch == 1) w.in = staged[half * 4 + leaf];
+            else if constexpr (Pdl) {
+                w.in = (leaf == 0 && half == 0) ? firstWeight : *reinterpret_cast<const uint4 *>(row + offset);
+            } else w.in = *reinterpret_cast<const uint4 *>(row + offset);
             float wfp32[8];
             #pragma unroll
             for (int i = 0; i < 8; ++i) wfp32[i] = __bfloat162float(w.out[i]);
@@ -337,10 +352,10 @@ __device__ __forceinline__ void FastllmBf16ExactTile(const __nv_bfloat16 *__rest
     }
 }
 
-template <int FixedWidth, int batch, bool Tail = false>
+template <int FixedWidth, int batch, bool Tail = false, bool Early = false>
 __global__ void FastllmBf16ExactProjection(const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
         __nv_bfloat16 *output, int vocab, int width = FixedWidth, int live = batch) {
-    FastllmBf16ExactTile<FixedWidth, batch, Tail>(input + size_t(blockIdx.y) * batch * width, weight,
+    FastllmBf16ExactTile<FixedWidth, batch, Tail, Early>(input + size_t(blockIdx.y) * batch * width, weight,
         output + size_t(blockIdx.y) * batch * vocab, vocab, width, blockIdx.x * 2, live);
 }
 
@@ -453,6 +468,25 @@ bool FastllmCudaBf16ParallelProjection(const void *input, const void *weight, vo
 #endif
 }
 
+__device__ __forceinline__ float SmallKDot(const union_bf16_8 &a, const union_bf16_8 &b, int lane) {
+    float value = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+        value += __bfloat162float(a.out[i]) * __bfloat162float(b.out[i]);
+    float correction = 0.0f;
+    #pragma unroll
+    for (int step = 16; step; step >>= 1) {
+        float peer = __shfl_down_sync(0xffffffffu, value, step);
+        if (lane < step) {
+            float other = peer - correction;
+            float sum = value + other;
+            correction = (sum - value) - other;
+            value = sum;
+        }
+    }
+    return value;
+}
+
 // At K=256, one warp computes each dot with the original compensated
 // reduction. Tiling output rows reuses its input vector without changing
 // the per-lane products or BF16 rounding.
@@ -470,8 +504,88 @@ __global__ void FastllmGemvBf16SmallK(const __nv_bfloat16 *input,
     });
 }
 
-bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
-        const fastllm::Data &weight, fastllm::Data &output) {
+namespace {
+constexpr int MarkovSlotBits = 8;
+constexpr int MarkovSlots = 1 << MarkovSlotBits;
+constexpr int MarkovTile = 256;
+
+// One block owns each tile's tag and data. Launches use the same stream
+// and lifetime as the proposal graph's IDs and BF16 output workspace.
+struct MarkovCache {
+    int device, vocab, tiles;
+    const void *embedding, *projection;
+    int *tags = nullptr;
+    __nv_bfloat16 *values = nullptr;
+    ~MarkovCache() {
+        if (!tags) return;
+        int previous;
+        cudaGetDevice(&previous);
+        cudaSetDevice(device);
+        cudaFree(tags);
+        cudaSetDevice(previous);
+    }
+};
+
+__global__ void DraftMarkovCached(const __nv_bfloat16 *table, const __nv_bfloat16 *weight,
+        const float *ids, __nv_bfloat16 *out, int vocab, int tiles,
+        int *tags, __nv_bfloat16 *cached) {
+    int token = __float2int_rz(*ids);
+    if (token < 0 || token >= vocab) token = 0;
+    const unsigned slot = (unsigned(token) * 2654435761u) >> (32 - MarkovSlotBits);
+    const int tile = blockIdx.x, first = tile * MarkovTile;
+    auto *entry = cached + size_t(slot) * vocab;
+    __shared__ int hit;
+    if (threadIdx.x == 0) {
+        int &tag = tags[slot * tiles + tile];
+        hit = tag == token + 1;
+        tag = token + 1;
+    }
+    __syncthreads();
+    if (hit) {
+        const int i = first + threadIdx.x;
+        if (i < vocab) out[i] = entry[i];
+        return;
+    }
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    union_bf16_8 a;
+    a.in = *reinterpret_cast<const uint4 *>(table + size_t(token) * 256 + lane * 8);
+    #pragma unroll
+    for (int j = 0; j < MarkovTile; j += 8) {
+        const int i = first + j + warp;
+        if (i < vocab) {
+            union_bf16_8 b;
+            b.in = *reinterpret_cast<const uint4 *>(weight + size_t(i) * 256 + lane * 8);
+            const float v = SmallKDot(a, b, lane);
+            if (lane == 0) out[i] = entry[i] = __float2bfloat16_rn(v);
+        }
+    }
+}
+} // namespace
+
+std::shared_ptr<void> FastllmCudaCreateDraftMarkovCache(const fastllm::Data &table, const fastllm::Data &w) {
+    int device;
+    if (table.dataType != fastllm::BFLOAT16 || w.dataType != fastllm::BFLOAT16 ||
+        !table.cudaData || !w.cudaData || table.dims != w.dims || w.dims.size() != 2 || w.dims[1] != 256 ||
+        w.dims[0] <= 0 || w.dims[0] > 262144 || FastllmCudaRuntimeArch() != 120 ||
+        cudaGetDevice(&device) != cudaSuccess || FastllmCudaGraphIsCapturingFast()) return {};
+    auto c = std::make_shared<MarkovCache>();
+    c->device = device;
+    c->embedding = table.cudaData;
+    c->projection = w.cudaData;
+    c->vocab = w.dims[0];
+    c->tiles = (c->vocab + MarkovTile - 1) / MarkovTile;
+    size_t tagBytes = size_t(MarkovSlots) * c->tiles * sizeof(int);
+    size_t bytes = tagBytes + size_t(MarkovSlots) * c->vocab * sizeof(__nv_bfloat16);
+    if (cudaMalloc(&c->tags, bytes) != cudaSuccess ||
+        cudaMemsetAsync(c->tags, 0, tagBytes, cudaStreamPerThread) != cudaSuccess) {
+        cudaGetLastError();
+        return {};
+    }
+    c->values = reinterpret_cast<__nv_bfloat16 *>(reinterpret_cast<char *>(c->tags) + tagBytes);
+    return c;
+}
+bool FastllmCudaDraftIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
+        const fastllm::Data &weight, fastllm::Data &output, void *cache) {
     using namespace fastllm;
     if (ids.dataType != FLOAT32 || ids.dims != std::vector<int>{1, 1} ||
         table.dataType != BFLOAT16 || weight.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
@@ -486,10 +600,24 @@ bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &t
         !output.cudaData || ((uintptr_t(table.cudaData) | uintptr_t(weight.cudaData)) & 15)) return false;
 
     const int rows = table.dims[0];
+    auto *c = static_cast<MarkovCache *>(cache);
+    if (c && c->vocab == rows && c->embedding == table.cudaData && c->projection == weight.cudaData &&
+        c->device == table.dataDeviceIds.front()) {
+        DraftMarkovCached<<<c->tiles, 256, 0, cudaStreamPerThread>>>(
+            static_cast<const __nv_bfloat16 *>(table.cudaData), static_cast<const __nv_bfloat16 *>(weight.cudaData),
+            static_cast<const float *>(ids.cudaData), static_cast<__nv_bfloat16 *>(output.cudaData),
+            rows, c->tiles, c->tags, c->values);
+        return true;
+    }
     FastllmGemvBf16SmallK<1, true><<<(rows - 1) / 8 + 1, 256>>>(
         (const __nv_bfloat16 *)table.cudaData, (const __nv_bfloat16 *)weight.cudaData,
         (__nv_bfloat16 *)output.cudaData, nullptr, rows, (const float *)ids.cudaData);
     return true;
+}
+
+bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
+        const fastllm::Data &weight, fastllm::Data &output) {
+    return FastllmCudaDraftIndexedBf16Gemv(ids, table, weight, output, nullptr);
 }
 
 // FP16 input × BF16 weight -> FP16 output (用于 FastllmCudaHalfMatMulBFloat16)
@@ -1014,7 +1142,10 @@ static void LaunchFastllmGemmBf16Bf16SmallBatch(__nv_bfloat16 *input, __nv_bfloa
     } else if (n == 6) {
         FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 6> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 7) {
-        FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 7> <<<k, THREADS>>>(input, weight, output, bias, m, k);
+        if (THREADS == 256 && fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::DraftNorm))
+            FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 7, false, true><<<k, THREADS>>>(input, weight, output, bias, m, k);
+        else
+            FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 7><<<k, THREADS>>>(input, weight, output, bias, m, k);
     } else if (n == 8) {
         FastllmGemvBf16Bf16Kernel2MultiRow<THREADS, 8> <<<k, THREADS>>>(input, weight, output, bias, m, k);
     }
@@ -1442,7 +1573,10 @@ void LaunchFastllmGemmBf16Bf16(__nv_bfloat16 *input, __nv_bfloat16 *weight, __nv
         }
         if (n > 4) {
             // A partial tile shares each vocabulary weight across the live rows.
-            FastllmBf16ExactProjection<0, 8, true><<<k / 2, 128>>>(input, weight, output, k, m, n);
+            if (n == 7 && fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::DraftNorm))
+                FastllmBf16ExactProjection<0, 8, true, true><<<k / 2, 128>>>(input, weight, output, k, m, n);
+            else
+                FastllmBf16ExactProjection<0, 8, true><<<k / 2, 128>>>(input, weight, output, k, m, n);
             return;
         }
         if (n >= 4) {

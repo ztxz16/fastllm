@@ -29,6 +29,7 @@
 #include "dequant.cuh"
 #include "marlin_mma.cuh"
 #include "scalar_type.cuh"
+#include "verify_expert_tile.cuh"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -51,7 +52,7 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,
           const bool m_block_size_8, const int stages,
           const int group_blocks, const bool is_zp_float,
           const bool nvfp4_gate_up = false,
-          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false, const bool pdl = false>
+          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false, const bool pdl = false, int verify_n = 0>
 __global__ void Marlin(
     const int4 *__restrict__ A, const int4 *__restrict__ B,
     int4 *__restrict__ C, int4 *__restrict__ C_tmp,
@@ -244,9 +245,9 @@ template <const fastllm_marlin_moe_types::ScalarTypeId a_type_id,  // A ScalarTy
                                    // with a separate quantization scale
           const bool is_zp_float,  // is zero point of float16 type?
           const bool nvfp4_gate_up = false,  // independent gate/up global scales
-          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false, const bool pdl = false
+          const bool full_k = false, const bool fold_mxfp4_bias = false, const bool indexed_mxfp4 = false, int verify_n = 0, bool fused = false
           >
-__global__ void Marlin(
+__device__ __forceinline__ void MarlinBody(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
     int4* __restrict__ C,        // fp16 output buffer of shape mxn
@@ -277,9 +278,9 @@ __global__ void Marlin(
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce, unsigned cta, unsigned grid_width, unsigned group = 0,
+    fastllm_marlin_verify::ExpertTile verify_tile = {}
 ) {
-  if constexpr (pdl) fastllm::cuda_launch::DependencyStart();
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -309,6 +310,21 @@ __global__ void Marlin(
     return;
   #endif
 
+  // Eight verification rows and eight expert slots. Fix only dimensions and
+  // launch flags; the routing tiles and split-K schedule remain data dependent.
+  if constexpr (verify_n != 0) {
+    static_assert(indexed_mxfp4 && (verify_n == 512 || verify_n == 4096));
+    constexpr bool down = verify_n == 4096;
+    prob_n = verify_n;
+    prob_k = down ? 256 : 4096;
+    prob_m = down ? 64 : 8;
+    top_k = down ? 1 : 8;
+    num_groups = prob_k / 32;
+    mul_topk_weights = down;
+    has_bias = false;
+    use_atomic_add = false;
+    use_fp32_reduce = true;
+  }
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
@@ -402,21 +418,21 @@ __global__ void Marlin(
   // part1: DP
   // part2: two-tile SK
   // see https://github.com/vllm-project/vllm/pull/24722 for more details
-  if (global_mn_tiles > gridDim.x) {
-    part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  if (global_mn_tiles > grid_width) {
+    part2_mn_tiles = global_mn_tiles % grid_width;
+    if (part2_mn_tiles * 3 <= grid_width) part2_mn_tiles += grid_width;
+    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / grid_width;
   }
 
   if constexpr (full_k) {
     // Keep each output tile's entire K reduction in one CTA. Its arithmetic
     // must not depend on later tokens' expert choices during verification.
-    if (blockIdx.x >= global_mn_tiles) return;
-    part1_mn_iters = div_ceil(global_mn_tiles - blockIdx.x, gridDim.x);
+    if (cta >= global_mn_tiles) return;
+    part1_mn_iters = div_ceil(global_mn_tiles - cta, grid_width);
     part2_mn_tiles = 0;
   }
 
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+  int iters = div_ceil(k_tiles * part2_mn_tiles, grid_width);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -428,8 +444,18 @@ __global__ void Marlin(
     }
   }
 
+  constexpr bool divide_gate = fused && verify_n == 512;
+  bool prefix_only = false;
+  int skip_segments = 0;
+  if constexpr (divide_gate) {
+    // Keep the logical Marlin stripe and its FP32 split-K boundaries. Run its
+    // independent output tiles on separate resident blocks.
+    prefix_only = group == 0 && part1_mn_iters != 0;
+    skip_segments = int(group) - int(part1_mn_iters != 0);
+    if (!prefix_only) part1_mn_iters = 0;
+  }
   int slice_row = 0;
-  int slice_col_par = blockIdx.x;
+  int slice_col_par = cta;
   int slice_col;
   int slice_iters =
       k_tiles;  // number of threadblock tiles in the current slice
@@ -466,18 +492,33 @@ __global__ void Marlin(
 
   // We can easily implement parallel problem execution by just remapping
   // indices and advancing global pointers
-  if (part2_mn_tiles >= gridDim.x) {
+  if (part2_mn_tiles >= grid_width) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
-    locks_off = blockIdx.x;
+    locks_off = cta;
   } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
+    locks_off = (iters * cta) / k_tiles - 1;
   }
 
   int prob_m_top_k = prob_m * top_k;
   // read moe block data given block_id
   // block_sorted_ids / block_num_valid_tokens / block_topk_weights
   auto read_moe_block_data = [&](int block_id) {
+    if constexpr (fused) {
+      // Each warp sees all eight route slots, so it can count valid rows
+      // without a shared reduction or reusing the matmul staging buffer.
+      unsigned lane = threadIdx.x % 32;
+      int route = lane < 8 ? sorted_token_ids_ptr[block_id * 8 + lane] : prob_m_top_k;
+      block_num_valid_tokens = __popc(__ballot_sync(0xffffffff, route < prob_m_top_k));
+      if (threadIdx.x < 8) {
+        sh_block_sorted_ids[lane] = route;
+        sh_rd_block_sorted_ids[lane] = route / top_k;
+        if (mul_topk_weights)
+          sh_block_topk_weights[lane] = Cdtype::num2num2(Cdtype::float2num(topk_weights_ptr[route < prob_m_top_k ? route : 0]));
+      }
+      __syncthreads();
+      return;
+    }
     block_num_valid_tokens = moe_block_size;
 
     cp_async4_pred(sh_block_sorted_ids_int4 + threadIdx.x,
@@ -552,6 +593,7 @@ __global__ void Marlin(
   auto update_next_moe_block_data = [&]() {
     if (par_id >= parallel) return;
 
+
     old_expert_id = expert_id;
     block_id = par_id;
     expert_id = expert_ids_ptr[block_id];
@@ -586,7 +628,7 @@ __global__ void Marlin(
   bool first_init = true;
   auto init_part2_slice = [&]() {
     slice_iters =
-        iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
+        iters * (cta + 1) - (k_tiles * slice_col_par + slice_row);
     if (slice_iters < 0 || slice_col_par >= part2_mn_tiles) slice_iters = 0;
     if (slice_iters == 0) return;
     if (slice_row + slice_iters > k_tiles) slice_iters = k_tiles - slice_row;
@@ -597,7 +639,7 @@ __global__ void Marlin(
       int col_off = col_first - k_tiles * slice_col_par;
       slice_count = div_ceil(k_tiles - col_off, iters);
       if (col_off > 0) slice_count++;
-      int delta_first = iters * blockIdx.x - col_first;
+      int delta_first = iters * cta - col_first;
       if (delta_first < 0 || (col_off == 0 && delta_first == 0))
         slice_idx = slice_count - 1;
       else {
@@ -605,7 +647,7 @@ __global__ void Marlin(
         if (col_off > 0) slice_idx--;
       }
     }
-    if (part2_mn_tiles >= gridDim.x) {
+    if (part2_mn_tiles >= grid_width) {
       if (slice_count > 1 && slice_idx == slice_count - 1) {
         locks_off++;
       }
@@ -670,9 +712,12 @@ __global__ void Marlin(
       return;
     }
     if (!in_part2 && !part1_mn_iters) {
+      if constexpr (divide_gate) {
+        if (prefix_only) { slice_iters = 0; return; }
+      }
       in_part2 = true;
-      slice_col_par = (iters * blockIdx.x) / k_tiles;
-      slice_row = (iters * blockIdx.x) % k_tiles;
+      slice_col_par = (iters * cta) / k_tiles;
+      slice_row = (iters * cta) % k_tiles;
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       update_next_moe_block_data();
@@ -686,6 +731,16 @@ __global__ void Marlin(
   };
 
   init_slice();
+
+  if constexpr (divide_gate) {
+    while (skip_segments-- > 0 && slice_iters) {
+      slice_row = 0;
+      ++slice_col_par;
+      ++slice_col;
+      init_part2_slice();
+    }
+    if (!slice_iters) return;
+  }
 
   // A sizes/strides
 
@@ -992,21 +1047,23 @@ __global__ void Marlin(
   };
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
-  auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
+  auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true, bool first = false) {
     if (pred) {
-      int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe;
-  #pragma unroll
-      for (int i = 0; i < a_sh_wr_iters; i++) {
-        int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
-        int64_t sorted_row = 0;
-        if (!m_block_size_8 || row < 8)
-          sorted_row = sh_rd_block_sorted_ids[row];
-        int64_t true_idx =
-            sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
-        cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx],
-                       row < block_num_valid_tokens);
-      }
-
+      auto fetchA = [&]() {
+        int4* sh_a_stage = sh_a + moe_block_size * a_sh_stride * pipe;
+#pragma unroll
+        for (int i = 0; i < a_sh_wr_iters; i++) {
+          int row = a_gl_rd_delta_i / a_gl_stride * i + a_gl_rd_row;
+          int64_t sorted_row = 0;
+          if (!m_block_size_8 || row < 8)
+            sorted_row = sh_rd_block_sorted_ids[row];
+          int64_t true_idx =
+              sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
+          cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx],
+                         row < block_num_valid_tokens);
+        }
+      };
+      if constexpr (!(fused && verify_n == 4096)) fetchA();
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
   #pragma unroll
       for (int i = 0; i < (b_sh_wr_iters * b_thread_vecs); i++) {
@@ -1059,6 +1116,11 @@ __global__ void Marlin(
             zp_gl_rd += zp_gl_rd_delta * zp_tb_groups;
           }
         }
+      }
+      if constexpr (fused && verify_n == 4096) {
+        // Weights and scales are immutable. Only A needs the Gate/Up publication.
+        if (first) verify_tile.Wait(par_id);
+        fetchA();
       }
     }
     // Insert a fence even when we are winding down the pipeline to ensure that
@@ -1972,7 +2034,7 @@ __global__ void Marlin(
           }
         }
       }
-      fetch_to_shared(i, i, i < slice_iters);
+      fetch_to_shared(i, i, i < slice_iters, i == 0);
     }
 
     zero_accums();
@@ -2236,9 +2298,13 @@ __global__ void Marlin(
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
+      if constexpr (divide_gate) {
+        if (last) verify_tile.Publish(C, par_id, slice_col, sh_block_sorted_ids, block_num_valid_tokens);
+        if (in_part2 && group < 2) return;
+      }
       slice_row = 0;
       if (!in_part2) {
-        slice_col_par += gridDim.x;
+        slice_col_par += grid_width;
       } else {
         slice_col_par++;
         slice_col++;
@@ -2289,6 +2355,26 @@ __global__ void Marlin(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   }
 #endif
+}
+
+template <fastllm_marlin_moe_types::ScalarTypeId a_type_id, fastllm_marlin_moe_types::ScalarTypeId b_type_id,
+          fastllm_marlin_moe_types::ScalarTypeId c_type_id, fastllm_marlin_moe_types::ScalarTypeId s_type_id,
+          int threads, int thread_m_blocks, int thread_n_blocks, int thread_k_blocks,
+          bool m_block_size_8, int stages, int group_blocks, bool is_zp_float, bool nvfp4_gate_up = false,
+          bool full_k = false, bool fold_mxfp4_bias = false, bool indexed_mxfp4 = false, bool pdl = false, int verify_n = 0>
+__global__ void Marlin(
+    const int4 *A, const int4 *B, int4 *C, int4 *C_tmp,
+    const int4 *bias, const float *a_scales, const int4 *scales, const float *global_scale,
+    const int4 *zp, const int *g_idx, const int32_t *sorted, const int32_t *experts,
+    const int32_t *padded, const float *weights, int top_k, bool multiply, int groups,
+    int m, int n, int k, int *locks, bool has_bias, bool atomic, bool fp32_reduce) {
+  if constexpr (pdl) fastllm::cuda_launch::DependencyStart();
+  MarlinBody<a_type_id, b_type_id, c_type_id, s_type_id, threads, thread_m_blocks,
+             thread_n_blocks, thread_k_blocks, m_block_size_8, stages, group_blocks,
+             is_zp_float, nvfp4_gate_up, full_k, fold_mxfp4_bias, indexed_mxfp4, verify_n>(
+      A, B, C, C_tmp, bias, a_scales, scales, global_scale, zp, g_idx, sorted, experts,
+      padded, weights, top_k, multiply, groups, m, n, k, locks, has_bias, atomic,
+      fp32_reduce, blockIdx.x, gridDim.x);
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME

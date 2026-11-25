@@ -1,5 +1,5 @@
 #pragma once
-#include "fastllm.h"
+#include "devices/multicuda/fastllm-naive-experts.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-naive-flex-moe.h"
 #include "devices/cuda/fastllm-moe-weight-owner.h"
@@ -7,7 +7,7 @@
 #include <cstdio>
 
 namespace fastllm {
-struct NaiveSharedFlexMoe {
+struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
     using Weights = std::vector<std::vector<std::vector<Data *>>>;
     using Run = int (*)(void *, int, int, int, const void *, const void *, const void *, void *);
     void *state = nullptr;
@@ -63,7 +63,7 @@ struct NaiveSharedFlexMoe {
     // ordered eight-row adapter covers all positive row counts itself.
     bool Supports(int rows) const { return rows > 0 && (!ep || rows <= 8); }
 
-    bool HasVerifyReduce(int rank, int layer, int rows) const {
+    bool HasVerifyReduce(int rank, int layer, int rows) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         return !ep && rows == 8 && fastshared_tp_uses_verify_reduce(state, rank, layer);
 #else
@@ -125,7 +125,7 @@ struct NaiveSharedFlexMoe {
 #endif
     }
     ~NaiveSharedFlexMoe() { if (state) destroy(state); }
-    bool CanRoute(int rows, const Data &router, const Data &bias) const {
+    bool CanRoute(int rows, const Data &router, const Data &bias) const override {
         auto dense = [](const Data &x) {
             if (x.strides.empty()) return true;
             if (x.strides.size() != x.dims.size()) return false;
@@ -147,7 +147,7 @@ struct NaiveSharedFlexMoe {
     }
     bool PreparedInput(int rank, int rows, FastllmMoePreparedInput &input,
             Data &ids, Data &scores, const Data &bias, const Data &hidden,
-            bool needNorm, float routeScale) const {
+            bool needNorm, float routeScale) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         // Keep small-row PDL and batches beyond the prepared tile on their existing paths.
         if (ep || rows < 4 || rows > 16 ||
@@ -183,7 +183,7 @@ struct NaiveSharedFlexMoe {
     }
     bool PrepareResidualRouter(int rank, int layer, int rows, Data &hidden, const Data &branch,
             const Data &gamma, float eps, Data &normed, const Data &weight, Data &router,
-            const Data &bias, Data &ids, Data &scores, bool needNorm, float routeScale) const {
+            const Data &bias, Data &ids, Data &scores, bool needNorm, float routeScale) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         if (ep || !fastshared_tp_residual_router_supported(state, rank, layer, rows)) return false;
         auto tensor = [&](const Data &x, DataType type, size_t elements) {
@@ -231,7 +231,7 @@ struct NaiveSharedFlexMoe {
 #endif
     }
     bool PrepareDense(int rank,int rows,Data &input,Data &gate,Data &up,Data &down,
-                      Data &gamma,float eps,Data &silu,Data &out) {
+                      Data &gamma,float eps,Data &silu,Data &out) override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         if(ep)return false; // State belongs to the EP backend, not TP.
         bool eligible=rows>=1 && rows<=64 && fastshared_tp_dense_supported(state) &&
@@ -274,14 +274,14 @@ struct NaiveSharedFlexMoe {
 #endif
     }
     void Dense(int rank,int rows,Data &input,Data &gate,Data &up,Data &down,
-               Data &gamma,float eps,Data &silu,Data &out) {
+               Data &gamma,float eps,Data &silu,Data &out) override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         AssertInFastLLM(fastshared_tp_run_dense(state,rank,rows,input.cudaData,gate.cudaData,
             up.cudaData,down.cudaData,static_cast<const float*>(gamma.cudaData),eps,silu.cudaData,out.cudaData)==0,
             "Shared Flex dense launch failed.");
 #endif
     }
-    void ForwardRouted(int rank, int layer, int rows, Data &x, Data &router, Data &bias,
+    void ForwardRouted(int rank, int layer, int rows, Data &x, Data &router, const Data &bias,
                        Data &ids, Data &scores, Data &out, bool needNorm, float routeScale, const FastllmMoePreparedInput *prepared = nullptr) {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
         AssertInFastLLM(CanRoute(rows, router, bias) && x.dataType == BFLOAT16 &&

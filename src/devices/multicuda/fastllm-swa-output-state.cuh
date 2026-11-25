@@ -10,8 +10,7 @@
 #include <atomic>
 #include <memory>
 #include <vector>
-#include <cstdlib>
-#include <cstring>
+#include "devices/cuda/naive-n05-swa-settings.h"
 
 namespace {
 class SwaOutputState {
@@ -30,9 +29,11 @@ class SwaOutputState {
     // GEMM has warmed its process-lifetime BLAS handle outside capture.
     std::atomic<bool> rowsGemmPrepared[8]{};
 public:
+    static bool Enabled() {
+        return fastllm_swa_settings::Enabled("FASTLLM_NAIVE_SWA_FUSION");
+    }
     static std::unique_ptr<SwaOutputState> Create(const std::vector<int> &requested) {
-        const char *enabled = std::getenv("FASTLLM_NAIVE_SWA_FUSION");
-        if ((enabled && std::strcmp(enabled, "1") != 0) || requested.size() != 8) return {};
+        if (requested.size() != 8 || !Enabled()) return {};
         auto state = std::unique_ptr<SwaOutputState>(new SwaOutputState);
         if (!state->Initialize(requested)) { cudaGetLastError(); return {}; }
         return state;
@@ -257,11 +258,7 @@ private:
         }
         // This optional implementation reuses the output mailbox. A capability
         // miss must not disable the established output-only backend.
-        bool stagesEnabled = true;
-        for (const char *name : {"FASTLLM_NAIVE_SWA_QKV_FUSION", "FASTLLM_NAIVE_SWA_CORE"}) {
-            const char *value = std::getenv(name);
-            if (value && std::strcmp(value, "1") != 0) stagesEnabled = false;
-        }
+        const bool stagesEnabled = fastllm_swa_settings::QkvEnabled() && fastllm_swa_settings::CoreEnabled();
         auto canLaunchLayer = [&](const void *full, int shared, int minPtx) {
             using namespace fastllm_swa_layer;
             if (!stagesEnabled) return false;

@@ -2,6 +2,7 @@
 #include "naive-n05-dsa-mma.cuh"
 #include "naive-n05-dsa-decode.cuh"
 #include <cuda/atomic>
+#include "devices/cuda/fastllm-mxfp8-activation.cuh"
 
 // Split attention for BF16 GQA. No cooperative launch or resident-CTA spin:
 // the last split combines the partials, allowing arbitrary grid sizes.
@@ -22,9 +23,10 @@ struct Storage {
     int valid[128];
 };
 
+template<bool Pack = false>
 __device__ __forceinline__ void Attend(const BF16 *query,
         FastllmNaiveDSARow descriptor, const float *sink, BF16 *output,
-        float *scratch, unsigned *completion, int heads, int kvHeads, int row, int group, int split) {
+        float *scratch, unsigned *completion, int heads, int kvHeads, int row, int group, int split, FastllmMxfp8Activation packed = {}) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_dsa_mma;
     const int t = threadIdx.x, warp = t / 32, lane = t % 32;
@@ -34,8 +36,11 @@ __device__ __forceinline__ void Attend(const BF16 *query,
     const int length = naive_dsa_decode::Length(r);
     const int count = length ? (r.indices ? r.selectedCount : length) : 0;
     if (!count) {
-        if (!split) for (int i = t; i < Heads * Values; i += Threads)
-            output[(size_t)row * heads * Values + h0 * Values + i] = __float2bfloat16(0.f);
+        if (!split) for (int i = t; i < Heads * Values; i += Threads) {
+            const BF16 value[] = {__float2bfloat16(0.f)};
+            output[(size_t)row * heads * Values + h0 * Values + i] = value[0];
+            if constexpr (Pack) fastllm_mxfp8::StoreGroup(packed, row, h0 * Values + i, value);
+        }
         return;
     }
     const int tiles = (count + 15) / 16;
@@ -159,7 +164,9 @@ __device__ __forceinline__ void Attend(const BF16 *query,
         float v = 0;
         for (int k = 0; k < active; ++k)
             v = fmaf(part[(k * Heads + warp) * Values + d], correction[k], v);
-        output[((size_t)row * heads + h0 + warp) * Values + d] = __float2bfloat16(denominator > 0 ? v / denominator : 0.f);
+        const BF16 value[] = {__float2bfloat16(denominator > 0 ? v / denominator : 0.f)};
+        output[((size_t)row * heads + h0 + warp) * Values + d] = value[0];
+        if constexpr (Pack) fastllm_mxfp8::StoreGroup(packed, row, (h0 + warp) * Values + d, value);
     }
     __syncthreads();
     if (!t) {
@@ -168,10 +175,10 @@ __device__ __forceinline__ void Attend(const BF16 *query,
     }
 #endif
 }
-__global__ __launch_bounds__(Threads, 1) void Attention(const BF16 *query,
+template<bool Pack> __global__ __launch_bounds__(Threads, 1) void Attention(const BF16 *query,
         FastllmNaiveDSABatch batch, const float *sink, BF16 *output,
-        float *scratch, unsigned *completion, int heads, int kvHeads) {
-    Attend(query, batch.rows[blockIdx.y], sink, output, scratch, completion, heads, kvHeads,
-        blockIdx.y, blockIdx.z, blockIdx.x);
+        float *scratch, unsigned *completion, int heads, int kvHeads, FastllmMxfp8Activation packed) {
+    Attend<Pack>(query, batch.rows[blockIdx.y], sink, output, scratch, completion, heads, kvHeads,
+        blockIdx.y, blockIdx.z, blockIdx.x, packed);
 }
 } // namespace naive_dsa_split
