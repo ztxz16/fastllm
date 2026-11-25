@@ -830,10 +830,6 @@ struct ExpertLoadContext {
     }
 };
 
-struct HostShard {
-    std::shared_ptr<void> storage;
-    uint8_t *values = nullptr;
-};
 struct Projection {
     std::vector<WeightShard> tensorShards;
     int rows, cols, group;
@@ -872,7 +868,7 @@ struct Projection {
         for (size_t i = 1; i < tensorShards.size(); ++i)
             check(cudaStreamWaitEvent(cudaStreamPerThread, tensorShards[i].rank->done, 0));
     }
-    std::vector<HostShard> shards;
+    std::vector<std::shared_ptr<void>> hostStorage;
     std::vector<Packed> host;
     // Both file formats feed the same Tensor Core tile packer. Stage one expert at a time.
     template <class Upload>
@@ -896,16 +892,59 @@ struct Projection {
         check(cudaGetLastError());
     }
 
+    int ggufType = -1;
+    size_t rowBytes = 0;
+    ggml_type hostInputType = GGML_TYPE_BF16;
+    ggml_to_float_t unpackHostRow = nullptr;
+    FastllmGGUFSlotProjection ggufSlots = nullptr;
+    bool plainInput() const { return ggufType >= 0 && ggufType != GGML_TYPE_NVFP4; }
+    static size_t hostBytes(const TensorRange &w, int rows, int cols) {
+        const size_t n = size_t(rows) * cols;
+        if (w.type == "U8" || w.ggmlType == GGML_TYPE_NVFP4 || w.ggmlType == GGML_TYPE_MXFP4)
+            return n / 16 * 12;
+        if (w.ggmlType < 0) return n + n / 32 * sizeof(float);
+        const size_t payload = rows * ggml_row_size(ggml_type(w.ggmlType), cols);
+        const size_t scaleOffset = (payload + 3) & ~size_t(3);
+        return (scaleOffset + sizeof(float) + 255) & ~size_t(255);
+    }
+    size_t recordBytes = 0;
+    void allocateHost(int e, int nodes, size_t stride) {
+        recordBytes = stride;
+        hostStorage.resize(nodes);
+        host.resize(e);
+        for (int n = 0; n < std::min(nodes, e); ++n) {
+            const size_t per = (e + nodes - 1 - n) / nodes;
+            const size_t total = per * stride;
+            auto &storage = hostStorage[n];
+#ifdef USE_NUMAS
+            if (device == ExpertDevice::Numa) {
+                storage = {allocate_aligned_numa(total, n), [total](void *v) { free_aligned_numa(v, total); }};
+            } else
+#endif
+                storage = {::operator new(total), [](void *v) { ::operator delete(v); }};
+            if (!storage)
+                throw std::bad_alloc();
+            auto *base = static_cast<uint8_t *>(storage.get());
+            for (int id = n; id < e; id += nodes)
+                host[id] = {base + size_t(id / nodes) * stride, nullptr};
+        }
+    }
+    void loadHostGGUF(const std::map<std::string, TensorRange> &, const std::string &, int, int);
     void loadNativeGGUF(const std::map<std::string, TensorRange> &files, const std::string &name, int experts);
 
     Projection(const std::map<std::string, TensorRange> &files, const std::string &name, int e, int r, int c,
                ExpertDevice where, ExpertLoadContext &topology, bool gateUp)
         : rows(r), cols(c), device(where) {
         const auto &weight = files.at(name);
-        fp4 = weight.type == "U8" || weight.ggmlType == GGML_TYPE_NVFP4;
+        ggufType = weight.ggmlType;
+        fp4 = weight.type == "U8" || ggufType == GGML_TYPE_NVFP4 || ggufType == GGML_TYPE_MXFP4;
         group = fp4 ? 16 : 32;
         if (c % group)
             throw std::runtime_error("Inkling expert columns are not group aligned");
+        if (where != ExpertDevice::Cuda && ggufType >= 0) {
+            loadHostGGUF(files, name, e, where == ExpertDevice::Numa ? topology.nodes : 1);
+            return;
+        }
         if (weight.ggmlType == GGML_TYPE_NVFP4) {
             loadNativeGGUF(files, name, e);
             return;
@@ -967,27 +1006,7 @@ struct Projection {
             return;
         }
         const int nodes = where == ExpertDevice::Numa ? topology.nodes : 1;
-        if (where != ExpertDevice::Cuda) {
-            shards.resize(nodes);
-            host.resize(e);
-            for (int n = 0; n < nodes; ++n) {
-                size_t per = (e + nodes - 1 - n) / nodes;
-                if (!per)
-                    continue;
-                const size_t total = per * (bytes + groups * sizeof(float));
-                auto &s = shards[n];
-#ifdef USE_NUMAS
-                if (where == ExpertDevice::Numa) {
-                    s.storage = {allocate_aligned_numa(total, n),
-                                 [total](void *v) { free_aligned_numa(v, total); }};
-                } else
-#endif
-                    s.storage = {::operator new(total), [](void *v) { ::operator delete(v); }};
-                if (!s.storage)
-                    throw std::bad_alloc();
-                s.values = static_cast<uint8_t *>(s.storage.get());
-            }
-        }
+        if (where != ExpertDevice::Cuda) allocateHost(e, nodes, bytes + groups * sizeof(float));
         std::vector<float> decoded(groups);
         for (int id = 0; id < e; ++id) {
             for (size_t i = 0; i < groups; ++i) {
@@ -1033,9 +1052,8 @@ struct Projection {
                 check(cudaMemcpy(weight->cudaData, packed.data(), packed.size(), cudaMemcpyHostToDevice));
                 resident.push_back(std::move(weight));
             } else {
-                auto &s = shards[id % nodes];
                 // NUMA and CUDA consume the same immutable per-expert record.
-                auto *w = s.values + (id / nodes) * (bytes + groups * sizeof(float));
+                auto *w = host[id].data;
                 auto *a = fp4 ? nullptr : reinterpret_cast<float *>(w + bytes);
                 const int rowBytes = bytes / r, rowGroups = c / group;
                 for (int row = 0; row < r; ++row) {
@@ -1053,7 +1071,7 @@ struct Projection {
                         std::copy_n(scales, rowGroups, a + size_t(row) * rowGroups);
                     }
                 }
-                host[id] = {w, a};
+                host[id].scales = a;
             }
         }
     }
@@ -1131,7 +1149,7 @@ public:
         : routerWeight(routerWeight), gate(files, name + "w13_weight", topology.localExperts ? topology.localExperts : c.experts, 2 * c.intermediate, c.hidden, where, topology, true),
           down(files, name + "w2_weight", topology.localExperts ? topology.localExperts : c.experts, c.hidden, c.intermediate, where, topology, false),
           smCount(topology.smCount), gateCap(c.gateCap), upCap(c.upCap) {
-        if (gate.fp4 != down.fp4)
+        if (gate.ggufType < 0 && gate.fp4 != down.fp4)
             throw std::runtime_error("Inkling expert projection types disagree");
     }
 };
@@ -1752,7 +1770,7 @@ ExpertLayers loadExperts(const Config &c, const Placement &p, const std::map<std
             throw std::runtime_error("Inkling router shape or dtype");
         auto prefix = mlp + "experts.";
         const int gateType = files.at(prefix + "w13_weight").ggmlType;
-        if (gateType >= 0) {
+        if (gateType >= 0 && p.experts[i] == ExpertDevice::Cuda) {
             const bool nativeDown = topology.nativeFp4 && files.at(prefix + "w2_weight").ggmlType == GGML_TYPE_NVFP4;
             if (!nativeDown || gateType != GGML_TYPE_NVFP4) {
                 experts.layers.push_back(std::make_unique<GpuGGUFExperts>(c, files, prefix, router, topology, nativeDown));

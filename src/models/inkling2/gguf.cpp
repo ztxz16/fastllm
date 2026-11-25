@@ -79,8 +79,6 @@ void Inkling2Model::ConfigureGGUF(const json11::Json &meta) {
 }
 
 void Inkling2Model::PrepareGGUF(std::vector<ReadGGUFTask> &tasks) {
-    if (std::count(placement.experts.begin(), placement.experts.end(), inkling2::ExpertDevice::Cuda) != cfg.layers)
-        throw std::runtime_error("Inkling GGUF currently requires CUDA expert placement");
     using Rule = GGUFWeightReplaceRule;
     const std::string root = "model.llm.";
     const std::map<std::string, std::string> globals{{"token_embd.weight", "embed.weight"},

@@ -9,57 +9,88 @@ struct HybridHostRows final : MultiThreadBaseOp {
     const std::vector<CpuExpertGroup> &groups;
     float *output;
     const float *rowScales;
-    uint16_t *bf16;
+    uint8_t *input;
+    size_t inputStride;
     int node, nodes, worker, workers;
-    HybridHostRows(const Projection &w, const std::vector<CpuExpertGroup> &g, const float *scales, uint16_t *b, float *y,
+    HybridHostRows(const Projection &w, const std::vector<CpuExpertGroup> &g, const float *scales, uint8_t *x, size_t stride, float *y,
                    int n, int count, int t, int nt)
-        : weight(w), groups(g), output(y), rowScales(scales), bf16(b), node(n), nodes(count), worker(t), workers(nt) {}
+        : weight(w), groups(g), output(y), rowScales(scales), input(x), inputStride(stride), node(n), nodes(count), worker(t), workers(nt) {}
     void Run() override {
         const int begin = weight.rows * worker / workers, end = weight.rows * (worker + 1) / workers;
+        std::vector<float> decoded;
         for (const auto &g : groups) {
             if (g.expert % nodes != node) continue;
             const auto &p = weight.host[g.expert];
-            const size_t offset = size_t(g.first) * weight.cols;
+            auto *x = input + size_t(g.first) * inputStride;
+            auto *bf16 = reinterpret_cast<uint16_t *>(x);
             float *result = output + size_t(g.first) * weight.rows;
-            if (weight.fp4) {
-                FastllmGemm(g.rows, weight.cols, weight.rows, bf16 + offset, weight.cols * sizeof(uint16_t),
+            if (weight.unpackHostRow) {
+                decoded.resize(weight.cols);
+                const auto *in = reinterpret_cast<const float *>(x);
+                for (int j = begin; j < end; ++j) {
+                    weight.unpackHostRow(p.data + size_t(j) * weight.rowBytes, decoded.data(), weight.cols);
+                    for (int i = 0; i < g.rows; ++i)
+                        result[size_t(i) * weight.rows + j] = std::inner_product(decoded.begin(), decoded.end(),
+                                in + size_t(i) * weight.cols, 0.f);
+                }
+            } else if (weight.ggufSlots) {
+                const auto t = ggml_type(weight.ggufType);
+                const bool bf = t == GGML_TYPE_BF16;
+                const auto a = bf ? BFLOAT16 : DataType(DATA_GGUF_FORMAT + int(weight.hostInputType));
+                const auto b = bf ? BFLOAT16 : DataType(DATA_GGUF_FORMAT + int(t));
+                FastllmGemm(g.rows, weight.cols, weight.rows, x, inputStride, p.data, weight.rowBytes,
+                            result, weight.rows * sizeof(float), begin, end, a, b, FLOAT32);
+            } else if (weight.fp4) {
+                FastllmGemm(g.rows, weight.cols, weight.rows, bf16, inputStride,
                             p.data, weight.cols / 16 * 12, result, weight.rows * sizeof(float),
                             begin, end, BFLOAT16, NVFP4_BLOCK_16, FLOAT32);
-                for (int i = 0; i < g.rows; ++i) {
-                    float *out = result + size_t(i) * weight.rows;
-                    for (int j = begin; j < end; ++j) out[j] *= rowScales[g.first + i];
-                }
-            } else
-                MultiThreadLinearBFloat16FP8E4M3Op(bf16 + offset, p.data, nullptr, result, g.rows,
+            } else {
+                MultiThreadLinearBFloat16FP8E4M3Op(bf16, p.data, nullptr, result, g.rows,
                     weight.cols, weight.rows, begin, end, p.scales, 1, weight.group).Run();
+            }
+            if (rowScales || (weight.ggufSlots && *p.scales != 1.f)) {
+                for (int i = 0; i < g.rows; ++i) {
+                    const float scale = rowScales ? rowScales[g.first + i] : *p.scales;
+                    float *out = result + size_t(i) * weight.rows;
+                    for (int j = begin; j < end; ++j) out[j] *= scale;
+                }
+            }
         }
     }
 };
 
 struct HostProjectionInput {
-    std::vector<uint16_t> bf16;
+    std::vector<uint8_t> values;
+    size_t stride = 0;
     std::vector<float> scales;
     std::vector<int> firstRoute;
 
     void prepare(const Projection &w, const float *input, int count, const std::vector<int> *routes = nullptr,
                  int routesPerInput = 1, int inputRows = 0) {
-        bf16.resize(size_t(count) * w.cols);
-        if (w.fp4) scales.resize(count);
+        const auto a = w.hostInputType;
+        stride = ggml_row_size(a, w.cols);
+        values.resize(size_t(count) * stride);
+        scales.resize(w.fp4 && !w.plainInput() ? count : 0);
         if (routesPerInput > 1) firstRoute.assign(inputRows, -1);
         for (int i = 0; i < count; ++i) {
             const int row = routes ? (*routes)[i] / routesPerInput : i;
-            uint16_t *dst = bf16.data() + size_t(i) * w.cols;
+            uint8_t *packed = values.data() + size_t(i) * stride;
+            auto *dst = reinterpret_cast<uint16_t *>(packed);
             if (routesPerInput > 1) {
                 int &first = firstRoute[row];
                 if (first >= 0) {
-                    std::copy_n(bf16.data() + size_t(first) * w.cols, w.cols, dst);
-                    if (w.fp4) scales[i] = scales[first];
+                    std::memcpy(packed, values.data() + size_t(first) * stride, stride);
+                    if (!scales.empty()) scales[i] = scales[first];
                     continue;
                 }
                 first = i;
             }
             const float *x = input + size_t(row) * w.cols;
-            if (w.fp4) {
+            if (a == GGML_TYPE_F32) {
+                std::memcpy(packed, x, stride);
+            } else if (a != GGML_TYPE_BF16) {
+                iqk_quantize_row_q8_K(x, packed, w.cols, a, ggml_type(w.ggufType));
+            } else if (!scales.empty()) {
                 // Removing 512 * outer keeps reconstructed FP4 * E4M3 exact in BF16.
                 float peak = 0;
                 for (int j = 0; j < w.cols; ++j) peak = std::max(peak, std::abs(x[j]));
@@ -91,7 +122,7 @@ void hostProjection(const Projection &w, const std::vector<CpuExpertGroup> &grou
     for (const auto &v : workers) count += v.size();
     tasks.reserve(count);
     for (size_t n = 0; n < workers.size(); ++n) for (size_t t = 0; t < workers[n].size(); ++t) {
-        tasks.emplace_back(w, groups, input.scales.data(), input.bf16.data(), output.data(), n, workers.size(), t, workers[n].size());
+        tasks.emplace_back(w, groups, input.scales.empty() ? nullptr : input.scales.data(), input.values.data(), input.stride, output.data(), n, workers.size(), t, workers[n].size());
         pool->PushOp(workers[n][t], &tasks.back());
     }
     for (const auto &v : workers) for (int t : v) pool->Wait(t);
@@ -110,30 +141,32 @@ struct HybridExpertRecords {
     MoeDecodeOverlapScheduler timing;
     cudaEvent_t start = nullptr, middle = nullptr, done = nullptr;
     cuda::HybridMoeAdmissions::Publication publication;
-    static size_t bytes(size_t elements, bool fp4) {
-        return fp4 ? elements / 16 * 12 : elements + elements / 32 * sizeof(float);
-    }
     static int permanentSlots(int slots) { return slots - std::min(16, std::max(1, slots / 8)); }
     HybridExpertRecords(int slots, int experts, const Projection &gate, const Projection &down) : count(slots) {
         if (!slots) return;
         resident = slots == experts ? slots : permanentSlots(slots);
-        gateBytes = bytes(size_t(gate.rows) * gate.cols, gate.fp4);
-        stride = gateBytes + bytes(size_t(down.rows) * down.cols, down.fp4);
+        gateBytes = gate.recordBytes;
+        stride = gateBytes + down.recordBytes;
         data = Buffer<uint8_t>(size_t(slots) * stride);
-        weights = Buffer<uint8_t *>(2 * slots);
-        std::vector<uint8_t *> w(2 * slots);
-        for (int i = 0; i < slots; ++i) {
-            w[i] = data.p + size_t(i) * stride;
-            w[slots + i] = w[i] + gateBytes;
+        // Packed GGUF kernels address the slot buffer directly. Only native
+        // projections consume a table of weight pointers.
+        if (!gate.ggufSlots || !down.ggufSlots) {
+            weights = Buffer<uint8_t *>(2 * slots);
+            std::vector<uint8_t *> w(2 * slots);
+            for (int i = 0; i < slots; ++i) {
+                w[i] = data.p + size_t(i) * stride;
+                w[slots + i] = w[i] + gateBytes;
+            }
+            check(cudaMemcpy(weights.p, w.data(), w.size() * sizeof(w[0]), cudaMemcpyHostToDevice));
+            view = {weights.p, weights.p + slots, nullptr, nullptr, gate.group, 1, down.group, 1};
         }
-        check(cudaMemcpy(weights.p, w.data(), w.size() * sizeof(w[0]), cudaMemcpyHostToDevice));
-        view = {weights.p, weights.p + slots, nullptr, nullptr, gate.group, 1, down.group, 1};
-        if (!gate.fp4) {
+        if (!gate.fp4 && gate.ggufType < 0) {
             scales = Buffer<float *>(2 * slots);
             std::vector<float *> s(2 * slots);
             for (int i = 0; i < slots; ++i) {
-                s[i] = reinterpret_cast<float *>(w[i] + size_t(gate.rows) * gate.cols);
-                s[slots + i] = reinterpret_cast<float *>(w[slots + i] + size_t(down.rows) * down.cols);
+                auto *base = data.p + size_t(i) * stride;
+                s[i] = reinterpret_cast<float *>(base + size_t(gate.rows) * gate.cols);
+                s[slots + i] = reinterpret_cast<float *>(base + gateBytes + size_t(down.rows) * down.cols);
             }
             check(cudaMemcpy(scales.p, s.data(), s.size() * sizeof(s[0]), cudaMemcpyHostToDevice));
             view.gateScales = scales.p;
@@ -143,6 +176,14 @@ struct HybridExpertRecords {
         if (slots == experts) {
             for (int i = 0; i < experts; ++i) upload(i, i, gate, down);
         }
+    }
+    void project(const Projection &w, bool gateUp, float *input, const int *slots, float *out,
+                 int routes, int copies, cudaStream_t stream) const {
+        if (w.ggufSlots)
+            w.ggufSlots(data.p + (gateUp ? 0 : gateBytes), stride, slots, input, out, routes, copies,
+                        w.cols, w.rows, w.rowBytes, stream);
+        else if (gateUp) CudaMoeGraphSlotGate(view, input, slots, out, routes / copies, copies, w.cols, w.rows / 2, stream);
+        else CudaMoeGraphSlotDown(view, input, slots, out, routes, w.rows, w.cols, stream);
     }
     ~HybridExpertRecords() {
         for (auto event : {start, middle, done}) if (event) cudaEventDestroy(event);
@@ -254,8 +295,9 @@ std::unique_ptr<HybridCacheCycle> planHybridCache(const Config &c, const Placeme
     std::vector<uint64_t> recordBytes;
     for (int i = 0; i < c.layers; ++i) {
         if (p.experts[i] == ExpertDevice::Cuda) continue;
-        const auto &w = files.at("model.llm.layers." + std::to_string(i) + ".mlp.experts.w13_weight");
-        recordBytes.push_back(HybridExpertRecords::bytes(size_t(3) * c.hidden * c.intermediate, w.type == "U8"));
+        const auto prefix = "model.llm.layers." + std::to_string(i) + ".mlp.experts.";
+        recordBytes.push_back(Projection::hostBytes(files.at(prefix + "w13_weight"), 2 * c.intermediate, c.hidden)
+                            + Projection::hostBytes(files.at(prefix + "w2_weight"), c.hidden, c.intermediate));
     }
     const uint64_t bytes = std::accumulate(recordBytes.begin(), recordBytes.end(), uint64_t{0});
     slots = int(std::min<uint64_t>(c.experts, GetMoeCudaCacheDeviceBytes(p.gpu) / bytes));
@@ -308,9 +350,34 @@ class HostExperts final : public RoutedExperts {
         }
     }
 
+    Matrix prepareInput(const Matrix &x) const {
+        if (gate.plainInput()) return x;
+        Matrix result(x.rows, x.cols);
+        quantizeInto(InputRow{x.p}, result.p, x.rows, x.cols, gate.fp4, smCount);
+        return result;
+    }
+    void activate(float *pair, float *scores, float *mid, int routes) const {
+        RoutedSiTU<float> source{pair, scores, gateCap, upCap};
+        if (down.plainInput()) {
+            const size_t n = size_t(routes) * down.cols;
+            ggufRoutedActivation<<<(n + 255) / 256, 256, 0, cudaStreamPerThread>>>(source, mid, routes, down.cols);
+        } else quantizeInto(source, mid, routes, down.cols, down.fp4, smCount);
+    }
+
     void projectSlots(int rows, int top, float *input, int *ids, float *scores, float *output,
                       const Matrix &pair, const Matrix &mid) const {
         const int routes = rows * top, inter = down.cols;
+        if (gate.plainInput() || down.plainInput()) {
+            const auto stream = cudaStreamPerThread;
+            Matrix parts(top == 1 ? 0 : routes, down.rows);
+            cache.project(gate, true, input, ids, pair.p, routes, top, stream);
+            activate(pair.p, scores, mid.p, routes);
+            cache.project(down, false, mid.p, ids, top == 1 ? output : parts.p, routes, 1, stream);
+            if (top > 1)
+                reduceExpertRows<<<dim3((down.rows + 255) / 256, rows), 256, 0, stream>>>(
+                    parts.p, nullptr, output, top, down.rows);
+            return;
+        }
         Data in(FLOAT32, {rows, gate.cols}, CUDA, input), out(FLOAT32, in.dims, CUDA, output);
         Data ix(INT32, {rows, top}, CUDA, ids), score(FLOAT32, ix.dims, CUDA, scores);
         Data g(FLOAT32, {routes, 2 * inter}, CUDA, pair.p), m(FLOAT32, {routes, inter}, CUDA, mid.p);
@@ -324,14 +391,12 @@ class HostExperts final : public RoutedExperts {
         Matrix scores(rows, top);
         select(c, routeLogits(x, routerWeight), bias, ids, scores);
         if (cache.count == c.experts) {
-            Matrix input(rows, h), pair(routes, 2 * inter), mid(routes, inter);
-            quantizeInto(InputRow{x.p}, input.p, rows, h, gate.fp4, smCount);
+            Matrix input = prepareInput(x), pair(routes, 2 * inter), mid(routes, inter);
             projectSlots(rows, top, input.p, ids.p, scores.p, result, pair, mid);
             return;
         }
         if (auto *scratch = DecodeGraphScratch::active) {
-            Matrix input(rows, h);
-            quantizeInto(InputRow{x.p}, input.p, rows, h, gate.fp4, smCount);
+            Matrix input = prepareInput(x);
             graphStorage->run(*scratch, cache, cycle, layer, c, gate, down, input, ids, scores, result, smCount);
             return;
         }
@@ -377,8 +442,7 @@ class HostExperts final : public RoutedExperts {
         copyIds(positions.p, order);
         copyIds(reverse.p, inverse);
         copyIds(slots.p, gpuSlots);
-        Matrix input(rows, h), packed(routes, h), parts(routes, h), routeScore(routes, 1);
-        quantizeInto(InputRow{x.p}, input.p, rows, h, gate.fp4, smCount);
+        Matrix input = prepareInput(x), packed(routes, h), parts(routes, h), routeScore(routes, 1);
         gatherExpertRows<<<dim3((h + 255) / 256, routes), 256, 0, cudaStreamPerThread>>>(
             input.p, scores.p, positions.p, packed.p, routeScore.p, top, h);
         std::vector<float> hostIn(size_t(cpu) * h);
@@ -405,7 +469,7 @@ class HostExperts final : public RoutedExperts {
             double cpuUs = std::chrono::duration<double, std::micro>(Clock::now() - started).count();
             Matrix pair(cpu, 2 * inter), mid(cpu, inter);
             check(cudaMemcpy(pair.p, hostPair.data(), hostPair.size() * sizeof(float), cudaMemcpyHostToDevice));
-            quantizeInto(RoutedSiTU<float>{pair.p, routeScore.p + gpu, gateCap, upCap}, mid.p, cpu, inter, gate.fp4, smCount);
+            activate(pair.p, routeScore.p + gpu, mid.p, cpu);
             check(cudaMemcpy(hostMid.data(), mid.p, hostMid.size() * sizeof(float), cudaMemcpyDeviceToHost));
             started = Clock::now();
             input.prepare(down, hostMid.data(), cpu);

@@ -183,7 +183,10 @@ struct HybridGraphStorage {
         auto *mappedOut = reinterpret_cast<float *>(largest->mapped + metadata + inBytes);
         auto activate = [&](float *source, float *out, const int *mask, bool host, cudaStream_t stream) {
             RoutedSiTU<float> src{source, scores.p, c.gateCap, c.upCap};
-            if (gate.fp4) {
+            if (down.plainInput()) {
+                const size_t n = size_t(routes) * inter;
+                ggufRoutedActivation<<<(n + 255) / 256, 256, 0, stream>>>(src, out, routes, inter, mask, host);
+            } else if (down.fp4) {
                 const size_t bytes = size_t(inter) * sizeof(float);
                 const bool shared = bytes + 16 * sizeof(float) <= 48 * 1024;
                 // Each FP4 tile scans the whole row for its scale. Read the
@@ -224,9 +227,9 @@ struct HybridGraphStorage {
                 }
             }, [&](cudaStream_t stream, bool staged) {
                 const int *mask = slots + (staged ? 2 : 1) * routes;
-                CudaMoeGraphSlotGate(cache.view, input.p, mask, pair.p, rows, top, h, inter, stream);
+                cache.project(gate, true, input.p, mask, pair.p, routes, top, stream);
                 activate(pair.p, mid.p, mask, false, stream);
-                CudaMoeGraphSlotDown(cache.view, mid.p, mask, parts.p, routes, h, inter, stream);
+                cache.project(down, false, mid.p, mask, parts.p, routes, 1, stream);
             });
         } else {
             host(cudaStreamPerThread);

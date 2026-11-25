@@ -34,6 +34,72 @@ struct GGUFExpertReader {
     }
 };
 
+// Pair adjacent columns for the native FP4 kernels. GGUF stores matching
+// positions in the first and second halves of the group in the same byte.
+void unpackFP4Group(const uint8_t *q, uint8_t *lo, uint8_t *hi, int pairs) {
+    for (int j = 0; j < pairs; ++j) {
+        lo[j] = (q[2 * j] & 15) | (q[2 * j + 1] << 4);
+        hi[j] = (q[2 * j] >> 4) | (q[2 * j + 1] & 0xf0);
+    }
+}
+
+uint8_t ggufNVScale(uint8_t code) {
+    if (code & 0x80) throw std::runtime_error("Invalid GGUF NVFP4 block scale");
+    return code == 0x7f ? 0 : code;
+}
+
+void Projection::loadHostGGUF(const std::map<std::string, TensorRange> &files, const std::string &name,
+                              int experts, int nodes) {
+    GGUFExpertReader source(files, name, experts, rows, cols);
+    rowBytes = source.rowBytes;
+    if (!fp4) {
+        ggufSlots = FastllmCudaGetGGUFSlotProjection(ggufType);
+        const auto t = ggml_type(ggufType);
+        if (t != GGML_TYPE_BF16) {
+            hostInputType = ggml_type_vec_dot_type(t);
+            if (hostInputType == GGML_TYPE_F32 || (!ggml_type_vec_dot(t) && !GetMulMatFunction(t, 1))) {
+                hostInputType = GGML_TYPE_F32;
+                unpackHostRow = ggml_type_to_float(t);
+                if (!unpackHostRow)
+                    throw std::runtime_error("No CPU expert kernel for " + name + " (" + ggml_type_name(t) + ")");
+            }
+        }
+    }
+    allocateHost(experts, nodes, hostBytes(files.at(name), rows, cols));
+    for (int id = 0; id < experts; ++id) {
+        source.read();
+        const float outer = source.scales.empty() ? 1.f : source.scales[id];
+        auto &w = host[id];
+        if (!fp4) {
+            std::memcpy(w.data, source.record.data(), source.record.size());
+            const size_t scaleOffset = (source.record.size() + 3) & ~size_t(3);
+            std::memset(w.data + source.record.size(), 0, recordBytes - source.record.size());
+            w.scales = reinterpret_cast<float *>(w.data + scaleOffset);
+            *w.scales = outer;
+        } else if (ggufType == GGML_TYPE_NVFP4) {
+            for (size_t pos = 0; pos < source.record.size(); pos += 36) {
+                const uint8_t *block = source.record.data() + pos;
+                for (int g = 0; g < 4; ++g) {
+                    uint8_t *dst = w.data + (pos / 36 * 4 + g) * 12;
+                    unpackFP4Group(block + 4 + 8 * g, dst, dst + 4, 4);
+                    const float scale = fp8Value(ggufNVScale(block[g])) * outer;
+                    std::memcpy(dst + 8, &scale, sizeof(scale));
+                }
+            }
+        } else {
+            for (size_t pos = 0; pos < source.record.size(); pos += 17) {
+                const uint8_t *block = source.record.data() + pos;
+                uint8_t *dst = w.data + pos / 17 * 24;
+                if (block[0] == 255) throw std::runtime_error("Invalid GGUF MXFP4 block scale: " + name);
+                unpackFP4Group(block + 1, dst, dst + 12, 8);
+                const float scale = std::ldexp(outer, int(block[0]) - 127);
+                std::memcpy(dst + 8, &scale, sizeof(scale));
+                std::memcpy(dst + 20, &scale, sizeof(scale));
+            }
+        }
+    }
+}
+
 void Projection::loadNativeGGUF(const std::map<std::string, TensorRange> &files, const std::string &name, int experts) {
     GGUFExpertReader source(files, name, experts, rows, cols);
     const size_t blocks = size_t(rows) * cols / 64, bytes = blocks * 32;
@@ -45,16 +111,9 @@ void Projection::loadNativeGGUF(const std::map<std::string, TensorRange> &files,
         for (size_t b = 0; b < blocks; ++b) {
             const uint8_t *block = source.record.data() + 36 * b;
             for (int g = 0; g < 4; ++g) {
-                if (block[g] & 0x80) throw std::runtime_error("Invalid GGUF NVFP4 block scale: " + name);
-                // GGML decodes its reserved UE4M3 scale as zero.
-                planar[bytes + 4 * b + g] = block[g] == 0x7f ? 0 : block[g];
-                const uint8_t *q = block + 4 + 8 * g;
+                planar[bytes + 4 * b + g] = ggufNVScale(block[g]);
                 uint8_t *out = planar.data() + 32 * b + 8 * g;
-                // A GGUF byte pairs columns j and j+8. Native bytes pair adjacent columns.
-                for (int j = 0; j < 4; ++j) {
-                    out[j] = (q[2 * j] & 15) | (q[2 * j + 1] << 4);
-                    out[j + 4] = (q[2 * j] >> 4) | (q[2 * j + 1] & 0xf0);
-                }
+                unpackFP4Group(block + 4 + 8 * g, out, out + 4, 4);
             }
         }
         check(cudaMemcpy(staging, planar.data(), planar.size(), cudaMemcpyHostToDevice));
@@ -94,9 +153,11 @@ __global__ void selectGGUFExperts(RouteSelection route) {
     route.restrictToRank(blockIdx.x);
 }
 template <class Activation>
-__global__ void ggufRoutedActivation(Activation activation, float *out, int routes, int width) {
+__global__ void ggufRoutedActivation(Activation activation, float *out, int routes, int width,
+                                    const int *slots = nullptr, bool host = false) {
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < size_t(routes) * width) out[i] = activation.get(i / width, i % width, width);
+    if (i < size_t(routes) * width && (!slots || (slots[i / width] < 0) == host))
+        out[i] = activation.get(i / width, i % width, width);
 }
 class GpuGGUFExperts final : public ExpertBackend {
     const Data &router;
