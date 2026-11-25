@@ -3343,8 +3343,49 @@ void FastllmCudaNaiveWriteAcceptedDraftKV(const fastllm::Data &raw, const void *
     CheckLaunch();
 }
 
-bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
-        int heads, int dim, int window, int reserve, float eps, float theta) {
+bool FastllmCudaNaivePrepareKVBody(void *child, int layers, FastllmNaiveKVBodyGraph &plan) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11010
+    if (!child || layers <= 0 || layers > kDraftKVLayersPerLaunch) return false;
+    cudaGraph_t graph = nullptr;
+    cudaGraphNode_t write = nullptr, record = nullptr;
+    cudaEvent_t kvReady = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    DraftKVDestinations dst{};
+    int rows = 1, heads = 1, dim = 128;
+    float eps = 1e-5f, theta = 10000.f;
+    void *args[]{&dst, &rows, &heads, &dim, &eps, &theta};
+    cudaKernelNodeParams params{};
+    params.func = reinterpret_cast<void *>(DraftNormRopeWrite);
+    params.gridDim = dim3(layers); params.blockDim = dim3(256); params.kernelParams = args;
+    size_t count = 0;
+    if (cudaGraphGetRootNodes(static_cast<cudaGraph_t>(child), nullptr, &count) != cudaSuccess || !count) {
+        cudaGetLastError(); return false;
+    }
+    // Both the body and the publication event depend on the completed KV write.
+    // The host can release the inputs independently of the body launch.
+    std::vector<cudaGraphNode_t> roots(count), dependencies(count);
+    if (cudaEventCreateWithFlags(&kvReady, cudaEventDisableTiming) == cudaSuccess &&
+        cudaGraphClone(&graph, static_cast<cudaGraph_t>(child)) == cudaSuccess &&
+        cudaGraphGetRootNodes(graph, roots.data(), &count) == cudaSuccess &&
+        cudaGraphAddKernelNode(&write, graph, nullptr, 0, &params) == cudaSuccess) {
+        std::fill(dependencies.begin(), dependencies.end(), write);
+        if (cudaGraphAddDependencies(graph, dependencies.data(), roots.data(), count) == cudaSuccess &&
+            cudaGraphAddEventRecordNode(&record, graph, &write, 1, kvReady) == cudaSuccess &&
+            cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess) {
+            plan = {graph, write, exec, kvReady};
+            return true;
+        }
+    }
+    if (exec) cudaGraphExecDestroy(exec);
+    if (graph) cudaGraphDestroy(graph);
+    if (kvReady) cudaEventDestroy(kvReady);
+    cudaGetLastError();
+#endif
+    return false;
+}
+
+static bool DraftKVImpl(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
+        int heads, int dim, int window, int reserve, float eps, float theta, const FastllmNaiveKVBodyGraph *plan, bool &submitted) {
     using namespace fastllm;
     if (updates.empty() || updates.size() > INT_MAX || heads <= 0 || dim <= 0 || dim > 256 || dim % 2 ||
         window <= 1 || reserve < 0 || (int64_t)heads * dim > INT_MAX / 2 ||
@@ -3426,23 +3467,52 @@ bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &
             } else BatchDraftTrimColumns<<<dim3((2 * width + 255) / 256, count), 256>>>(trim);
             CheckLaunch();
         }
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11000
+        if (plan && plan->exec && count == updates.size()) {
+            void *args[]{&dst, &rows, &heads, &dim, &eps, &theta};
+            cudaKernelNodeParams params{};
+            params.func = reinterpret_cast<void *>(DraftNormRopeWrite);
+            params.gridDim = dim3(count * rows * heads); params.blockDim = dim3(256); params.kernelParams = args;
+            if (cudaGraphExecKernelNodeSetParams(static_cast<cudaGraphExec_t>(plan->exec),
+                    static_cast<cudaGraphNode_t>(plan->write), &params) == cudaSuccess) {
+                submitted = cudaGraphLaunch(static_cast<cudaGraphExec_t>(plan->exec), cudaStreamPerThread) == cudaSuccess;
+                return submitted;
+            }
+            cudaGetLastError();
+        }
+#endif
         DraftNormRopeWrite<<<count * rows * heads, 256, 0, cudaStreamPerThread>>>(dst, rows, heads, dim, eps, theta);
         CheckLaunch();
     }
     return true;
 }
 
+bool FastllmCudaNaiveBatchDraftKV(const std::vector<FastllmNaiveDraftKVUpdate> &updates,
+        int heads, int dim, int window, int reserve, float eps, float theta) {
+    bool submitted = false;
+    return DraftKVImpl(updates, heads, dim, window, reserve, eps, theta, nullptr, submitted);
+}
+
 bool FastllmCudaNaiveDraftKV(const std::vector<const fastllm::Data *> &raw,
         const std::vector<const fastllm::Data *> &norm, int start,
         std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
         int heads, int dim, int window, int reserve, float eps, float theta) {
+    bool submitted = false;
+    return FastllmCudaNaiveDraftKVWithBody(raw, norm, start, kv, heads, dim, window, reserve, eps, theta, nullptr, submitted);
+}
+
+bool FastllmCudaNaiveDraftKVWithBody(const std::vector<const fastllm::Data *> &raw,
+        const std::vector<const fastllm::Data *> &norm, int start,
+        std::vector<std::pair<fastllm::Data, fastllm::Data>> &kv,
+        int heads, int dim, int window, int reserve, float eps, float theta, const FastllmNaiveKVBodyGraph *plan, bool &submitted) {
+    submitted = false;
     if (raw.empty() || raw.size() != norm.size() || (!kv.empty() && kv.size() != raw.size())) return false;
     std::vector<std::pair<fastllm::Data, fastllm::Data>> empty;
     if (kv.empty()) empty.resize(raw.size());
     auto &target = kv.empty() ? empty : kv;
     std::vector<FastllmNaiveDraftKVUpdate> updates;
     for (size_t i = 0; i < raw.size(); ++i) updates.push_back({raw[i], norm[i], &target[i].first, &target[i].second, start});
-    if (!FastllmCudaNaiveBatchDraftKV(updates, heads, dim, window, reserve, eps, theta)) return false;
+    if (!DraftKVImpl(updates, heads, dim, window, reserve, eps, theta, plan, submitted)) return false;
     if (!empty.empty()) kv.swap(empty);
     return true;
 }

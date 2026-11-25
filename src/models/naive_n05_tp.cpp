@@ -1093,13 +1093,17 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
     if (attentionParallel) for (int &rows : serving->batchBuckets) rows *= attentionDP;
     const int maxRows = serving->batchBuckets.back();
     const int maxLocalRows = maxRows / attentionDP;
-    // Rank zero also holds the world rows for the small-batch rejection sampler.
+    const bool singleOwnerFeatures = draftEnabled && CanRunSingleOwnerProposal();
+    auto useLocalFeatures = [&](int localRequests) {
+        return (localRequests == 1 && singleOwnerFeatures) || localRequests > kFastllmMtpSmallRejectionMaxBatch;
+    };
+    // Reserve world rows only for buckets that gather their layer features on rank zero.
     int rootFeatureRows = maxLocalRows;
     for (int bucket : serving->batchBuckets) {
-        if (bucket / attentionDP <= kFastllmMtpSmallRejectionMaxBatch)
+        if (!useLocalFeatures(bucket / attentionDP))
             rootFeatureRows = std::max(rootFeatureRows, bucket);
     }
-    const bool localFeatures = draftEnabled && maxLocalRows > kFastllmMtpSmallRejectionMaxBatch &&
+    const bool localFeatures = draftEnabled && (singleOwnerFeatures || maxLocalRows > kFastllmMtpSmallRejectionMaxBatch) &&
         CanShardDraftHead() && AttentionTPSize() == 1 &&
         !draftTargetLayers.empty() &&
         std::set<int>(draftTargetLayers.begin(), draftTargetLayers.end()).size() == draftTargetLayers.size() &&
@@ -1214,7 +1218,8 @@ void NaiveN05FlashModel::PrepareTensorParallelServing() {
             r->features.verifying = r->features.collectHidden = draftEnabled;
             const int rows = entry.second->rows;
             // Both feature layouts share stable storage across serial graph replays.
-            if (localFeatures && rows / stride / attentionDP > kFastllmMtpSmallRejectionMaxBatch) {
+            const int localRequests = rows / stride / attentionDP;
+            if (localFeatures && useLocalFeatures(localRequests)) {
                 r->features.packedOutput = &packed;
             } else if (draftEnabled && rank == 0) for (size_t i = 0; i < draftTargetLayers.size(); ++i) {
                 const int layer = draftTargetLayers[i];

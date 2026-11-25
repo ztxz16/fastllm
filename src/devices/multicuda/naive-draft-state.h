@@ -18,6 +18,7 @@
 #include <unordered_map>
 #ifdef USE_CUDA
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-draft-backend.h"
 #include "devices/cuda/fastllm-mimo-ep8-mega.h"
 #include "devices/cuda/fastllm-mxfp4-ep-generic.h"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -92,10 +93,15 @@ struct NaiveN05FlashModel::DraftWorkspace {
         // The CUDA graph allocation pool has one capture session per process.
         // DP owners can replay independently after their captures finish.
         inline static std::mutex captureMutex;
+        FastllmNaiveKVBodyGraph kvBody;
         void *graph = nullptr, *exec = nullptr, *acceptedExec = nullptr;
         std::vector<void *> reserved;
         bool canContinue = false;
         void Clear() {
+            FastllmCudaGraphExecDestroy(kvBody.exec);
+            FastllmCudaGraphDestroy(kvBody.graph);
+            if (kvBody.kvReady) FastllmCudaEventDestroy(kvBody.kvReady);
+            kvBody = {};
             canContinue = false;
             FastllmCudaGraphExecDestroy(acceptedExec);
             acceptedExec = nullptr;
@@ -180,6 +186,10 @@ struct NaiveN05FlashModel::DraftWorkspace {
             DraftLinear(latent, projection, bias);
         }
 
+        bool TryProjectedHead(Data &embedding, Data &weight) {
+            return !constrained && TryCudaDraftHead(DraftProjectedHead{base, embedding, weight,
+                ids, probabilities, sampler}, steps);
+        }
         void SampleMarkovStep(int step) {
             const int vocab = base.dims.back();
             if (constrained) FastllmCudaTokenConstraintMask(constraints.get(), step, (uint32_t *)mask.cudaData);
@@ -281,6 +291,33 @@ struct NaiveN05FlashModel::DraftWorkspace {
         nextReady = nextInFlight = nextConsumed = false; nextRetained.clear();
     }
     std::vector<void *> inputs;
+    // The graph reads request KV and publishes into shared owner scratch. A different
+    // request or geometry must drain it before either allocation can be reused.
+    struct OwnerReplay {
+        std::mutex mutex;
+        std::shared_ptr<DraftContext> request;
+        std::shared_ptr<DraftWorkspace> bucket;
+        int anchor = -1, length = 0;
+        void Join() {
+            if (bucket) FastllmCudaEventSynchronize(bucket->done);
+            bucket.reset(); request.reset(); anchor = -1;
+        }
+    } ownerReplay;
+    void *ownerPacket = nullptr;
+    bool UploadOwner(const DraftContext &context, int anchor, int length, Data &table) {
+        const size_t slots = 2 * context.kv.size(), bytes = (slots + 1) * sizeof(uint64_t);
+        if (!ownerPacket || bytes > table.GetBytes()) return false;
+        auto *bindings = static_cast<uint64_t *>(ownerPacket);
+        for (size_t i = 0; i < context.kv.size(); ++i) {
+            bindings[2 * i] = reinterpret_cast<uintptr_t>(context.kv[i].first.cudaData);
+            bindings[2 * i + 1] = reinterpret_cast<uintptr_t>(context.kv[i].second.cudaData);
+        }
+        const float token = anchor;
+        auto *tail = reinterpret_cast<unsigned char *>(bindings + slots);
+        std::memcpy(tail, &token, sizeof(token));
+        std::memcpy(tail + sizeof(token), &length, sizeof(length));
+        return FastllmCudaCopyFromPinnedHostToDeviceAsyncCurrentThread(table.cudaData, ownerPacket, bytes);
+    }
     bool lowLatencyBody = false;
     std::vector<int> rankRows;
     Data id, live, positions, hidden, normalized, cacheTable, batchKV;
@@ -329,7 +366,7 @@ struct NaiveN05FlashModel::DraftWorkspace {
     Data samplingW1, samplingW2, samplingInput, samplingTarget;
     std::vector<Data> samplingTargetViews; // Host descriptors borrowing this sampling owner's target arena.
     std::vector<std::pair<Data, Data>> tpKV;
-    void *ready = nullptr, *done = nullptr;
+    void *ready = nullptr, *done = nullptr, *verifyLogitsReady = nullptr;
     void *readySource = nullptr, *readyStream = nullptr;
     // A different device may wait after the producer changes CPU threads.
     // Publish from a stable explicit stream on the owning device.
@@ -400,7 +437,8 @@ struct NaiveN05FlashModel::DraftRound {
     int anchor, limit, oldLength, vocab = 0;
     bool greedy = false;
     int sampledAccepted = -1, sampledNext = -1;
-    bool targetCommitted = false, draftCommitted = false;
+    std::vector<std::pair<Data, Data>> *ownerCommitKV = nullptr;
+    bool targetCommitted = false, draftCommitted = false, singleOwnerBody = false;
     bool collectiveDynamicKV = false;
     TargetCapture::FeatureRows feature;
     bool targetPayloadWritten = false;

@@ -91,6 +91,58 @@ class ProjectionFixture : public NaiveN05FlashModel {
         return CreateDraftContext();
     }
 };
+static void CheckOwnerKVBody() {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 11010
+    constexpr int heads = 2, dim = 64, width = heads * dim, window = 17;
+    std::vector<std::pair<Data, Data>> caches[2], reference[2];
+    Data norm(FLOAT32, {dim}, std::vector<float>(dim, 1.25f));
+    norm.ToDevice(DataDevice::CUDA, std::vector<int>{device});
+    Data prefix = BF({1, 13, 2 * width}, 17);
+    Data observed[2] = {BF({1, 16, width}, 0), BF({1, 16, width}, 0)};
+    for (int i = 0; i < 2; ++i) for (auto *kv : {&caches[i], &reference[i]})
+        Check(FastllmCudaNaiveDraftKV({&prefix}, {&norm}, 0, *kv, heads, dim, window, 24, 1e-5f, 10000.f),
+            "seed graph KV");
+    cudaGraph_t body = nullptr;
+    Check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal) == cudaSuccess,
+        "capture owner body");
+    for (int i = 0; i < 2; ++i)
+        Check(cudaMemcpyAsync(observed[i].cudaData, caches[i][0].first.cudaData, observed[i].GetBytes(),
+            cudaMemcpyDeviceToDevice, cudaStreamPerThread) == cudaSuccess, "capture KV consumer");
+    Check(cudaStreamEndCapture(cudaStreamPerThread, &body) == cudaSuccess, "end owner body capture");
+    FastllmNaiveKVBodyGraph plan;
+    Check(FastllmCudaNaivePrepareKVBody(body, 1, plan), "prepare KV/body graph");
+    cudaStream_t observer = nullptr;
+    Check(cudaStreamCreateWithFlags(&observer, cudaStreamNonBlocking) == cudaSuccess, "KV observer");
+    Data committed = BF({1, 16, width}, 0);
+    int pos[2] = {13, 13};
+    for (int turn = 0; turn < 4; ++turn) {
+        int owner = turn % 2, rows = turn == 1 ? 1 : 7;
+        Data raw = BF({1, rows, 2 * width}, 101 + turn);
+        bool submitted = false;
+        Check(FastllmCudaNaiveDraftKVWithBody({&raw}, {&norm}, pos[owner], caches[owner], heads, dim,
+            window, 24, 1e-5f, 10000.f, &plan, submitted) && submitted, "rebind KV/body graph");
+        Check(cudaEventSynchronize(static_cast<cudaEvent_t>(plan.kvReady)) == cudaSuccess &&
+            cudaMemcpyAsync(committed.cudaData, caches[owner][0].first.cudaData, committed.GetBytes(),
+                cudaMemcpyDeviceToDevice, observer) == cudaSuccess &&
+            cudaStreamSynchronize(observer) == cudaSuccess, "read published KV on another stream");
+        Check(FastllmCudaNaiveDraftKV({&raw}, {&norm}, pos[owner], reference[owner], heads, dim,
+            window, 24, 1e-5f, 10000.f), "reference append");
+        for (int i = 0; i < 2; ++i) {
+            const auto key = Bits(reference[i][0].first), copy = Bits(observed[i]);
+            Check(Bits(caches[i][0].first) == key && std::equal(key.begin(), key.end(), copy.begin()) &&
+                Bits(caches[i][0].second) == Bits(reference[i][0].second), "child saw stale KV");
+        }
+        const auto expected = Bits(reference[owner][0].first), published = Bits(committed);
+        Check(std::equal(expected.begin(), expected.end(), published.begin()), "published KV differs");
+        pos[owner] += rows;
+    }
+    cudaStreamDestroy(observer);
+    cudaGraphExecDestroy(static_cast<cudaGraphExec_t>(plan.exec));
+    cudaGraphDestroy(static_cast<cudaGraph_t>(plan.graph));
+    cudaGraphDestroy(body);
+    cudaEventDestroy(static_cast<cudaEvent_t>(plan.kvReady));
+#endif
+}
 static void CheckSlidingCommit() {
     ProjectionFixture model(81);
     auto actual = std::make_shared<ProjectionFixture::DraftContext>();
@@ -357,6 +409,7 @@ int main() {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices)
             return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
+        CheckOwnerKVBody();
         for (int n : {2, 8, 80, 81, 640}) for (int window : {17, 1024, 1152}) MixedBatch(n, window);
         for (int n : {81, 256, 380, 1280, 1900}) MixedBatch(n, 17, true);
         for (int window : {17, 1024, 1152})

@@ -60,93 +60,7 @@ void NaiveN05FlashModel::PrepareDraftContextTP(DraftContext &context) {
     context.kv.resize(draftLayers);
 }
 
-void NaiveN05FlashModel::AppendDraftKVOnRank(Data &input, int start, DraftContext &context, int rank) {
-    auto &r = *draftContextStorage->tpRanks.at(rank);
-    const int heads = DraftContextQueryHeads() / draftTP->attentionDivisor;
-    const int kvHeads = std::max(1, draftKvHeads / draftTP->attentionDivisor);
-    const int rows = input.dims[1], width = kvHeads * draftHeadDim;
-    std::vector<Data> views(draftLayers), parts(draftLayers);
-    std::vector<const Data *> raw, norms, weights;
-    for (int i = 0; i < draftLayers; ++i) {
-        const std::string p = "dspark.layers." + std::to_string(i) + ".self_attn.";
-        Data &qkv = *weight[p + DraftKVProjectionName()].multiDeviceDatas.at(r.device);
-        views[i].FakeFrom(qkv, (size_t)heads * draftHeadDim * embed_dim * sizeof(uint16_t));
-        views[i].Resize({2 * width, embed_dim});
-        weights.push_back(&views[i]);
-        norms.push_back(weight[p + "k_norm.weight"].multiDeviceDatas.at(r.device));
-    }
-    // Batch the K/V row views without packing or copying the weights.
-    bool batched = FastllmCudaNaiveDraftKVProject(input, weights, r.contextRaw, r.contextPointers);
-    for (int i = 0; i < draftLayers; ++i) {
-        if (batched) {
-            parts[i].FakeFrom(r.contextRaw, (size_t)i * rows * 2 * width * sizeof(uint16_t));
-            parts[i].Resize({1, rows, 2 * width});
-            raw.push_back(&parts[i]);
-        } else {
-            DraftLinear(input, views[i], r.contextLayers[i].raw);
-            raw.push_back(&r.contextLayers[i].raw);
-        }
-    }
-    auto &kv = rank && !draftTP->dataParallel ? context.workspace->tpRanks[rank]->tpKV : context.kv;
-    AssertInFastLLM(FastllmCudaNaiveDraftKV(raw, norms, start, kv, kvHeads,
-        draftHeadDim, draftWindow, draftWindow + draftBlock, draftEps, draftTheta), "Draft TP KV append failed.");
-}
 
-bool NaiveN05FlashModel::AppendDraftContextTP(Data &hidden, int start, DraftContext &context) {
-    if (!PrepareDraftTP()) return false;
-    auto &tp = *draftTP;
-    ApplyDraftDevice();
-    PrepareDraftContextTP(context);
-    if (!draftContextStorage) {
-        draftContextStorage = std::make_shared<DraftWorkspace>();
-        draftContextStorage->device = tp.devices.front();
-        draftContextStorage->done = FastllmCudaEventCreate();
-        for (int device : tp.devices) {
-            auto rank = std::make_shared<DraftWorkspace>(); rank->device = device;
-            rank->contextLayers.resize(draftLayers);
-            FastllmCudaSetDevice(device); rank->done = FastllmCudaEventCreate();
-            draftContextStorage->tpRanks.push_back(std::move(rank));
-        }
-        FastllmCudaSetDevice(tp.devices.front());
-    }
-    auto &ws = *draftContextStorage;
-    const int begin = std::max(0, hidden.dims[1] - draftWindow + 1);
-    // A peer must finish consuming the root input before its storage can be reused.
-    Data *selected = &hidden;
-    if (begin || hidden.dataDevice != DataDevice::CUDA ||
-        hidden.dataDeviceIds != std::vector<int>{tp.devices.front()} || hidden.multiDeviceData ||
-        hidden.strides != std::vector<uint64_t>{(uint64_t)hidden.dims[1] * hidden.dims[2], (uint64_t)hidden.dims[2], 1}) {
-        Split(hidden, 1, begin, hidden.dims[1], ws.contextSelected);
-        ws.contextSelected.ToDevice(DataDevice::CUDA, std::vector<int>{tp.devices.front()});
-        selected = &ws.contextSelected;
-    }
-    // Publish the root PTDS writes before another device reads the selected rows.
-    if (!tp.dataParallel || context.deviceRank != 0) ws.RecordPeerEvent(ws.ready);
-    tp.Run([&](int rank) {
-        if (tp.dataParallel && rank != context.deviceRank) return;
-        auto &r = *ws.tpRanks[rank];
-        Data *input = selected;
-        if (rank) {
-            FastllmCudaCurrentThreadStreamWaitEvent(ws.ready);
-            r.contextSelected.dataType = BFLOAT16;
-            r.contextSelected.UpdateUnitSize();
-            r.contextSelected.Resize(selected->dims);
-            r.contextSelected.ToDevice(DataDevice::CUDA, std::vector<int>{r.device}, false);
-            r.contextSelected.Allocate(false);
-            AssertInFastLLM(FastllmCudaMemcpyPeerAsyncCurrentThread(r.device, r.contextSelected.cudaData,
-                tp.devices.front(), selected->cudaData, selected->GetBytes()), "Draft TP context transfer failed.");
-            input = &r.contextSelected;
-        }
-        AppendDraftKVOnRank(*input, start + begin, context, rank);
-        if (!tp.dataParallel) FastllmCudaEventRecordCurrentThread(r.done);
-        else if (rank) FastllmCudaSyncCurrentThreadStream();
-    });
-    if (!tp.dataParallel)
-        for (size_t rank = 1; rank < tp.devices.size(); ++rank)
-            FastllmCudaCurrentThreadStreamWaitEvent(ws.tpRanks[rank]->done);
-    context.committed = start + hidden.dims[1];
-    return true;
-}
 
 #endif
 
@@ -1224,9 +1138,14 @@ bool NaiveN05FlashModel::NeedsDraftPrefillHidden(const Data &key, int end, int p
 }
 
 void NaiveN05FlashModel::CommitDraftContext(TargetCapture &capture, int tokens,
-        DraftContext &context, std::vector<std::pair<Data, Data>> &kv, int nextAnchor) {
-    ApplyDraftDevice();
-    if (TryCommitDraftContexts(capture,{tokens},{tokens},{&context},nextAnchor)) return;
+        DraftContext &context, std::vector<std::pair<Data, Data>> &kv, int nextAnchor, bool onOwner) {
+    if (!onOwner) {
+        ApplyDraftDevice();
+        if (TryCommitDraftContexts(capture,{tokens},{tokens},{&context},nextAnchor)) return;
+    }
+#ifdef USE_CUDA
+    if (CommitPackedDraftContext(capture, tokens, context, kv, nextAnchor, onOwner)) return;
+#endif
     Data localCombined, localProjected, localHidden;
 #ifdef USE_CUDA
     auto *buffers = draftContextStorage ? draftContextStorage.get() :
@@ -1570,13 +1489,15 @@ bool NaiveN05FlashModel::CommitPrefillDraftOwners(TargetCapture &capture,
 }
 
 bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
-        const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor) {
-    if (TryCommitDraftContexts(capture,lengths,counts,contexts,nextAnchor)) return true;
+        const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor, int ownerRank) {
+    if (ownerRank < 0 && TryCommitDraftContexts(capture,lengths,counts,contexts,nextAnchor)) return true;
 #ifdef USE_CUDA
     if (GetLowMemMode() || (draftTP && !draftContextStorage) ||
-        contexts.size() < 2 || contexts.size() != counts.size() ||
+        (contexts.size() < 2 && ownerRank < 0) || contexts.empty() || contexts.size() != counts.size() ||
         lengths.size() != counts.size() || draftHeadDim <= 0 || draftHeadDim > 256 || draftHeadDim % 2) return false;
-    ApplyDraftDevice();
+    if (ownerRank < 0) ApplyDraftDevice();
+    else if (!draftTP || !draftTP->dataParallel || ownerRank >= (int)draftTP->devices.size() ||
+             capture.packedRows.size() != contexts.size()) return false;
     const std::vector<int> devices{FastllmCudaGetDevice()};
     const int ranks = draftTP ? draftTP->devices.size() : 1;
     const bool dataParallel = draftTP && draftTP->dataParallel;
@@ -1596,6 +1517,8 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
             (dataParallel && (context->deviceRank < 0 || context->deviceRank >= ranks)) ||
             context->kv.size() != (size_t)draftLayers ||
             (draftTP && (!context->workspace || context->workspace->tpRanks.size() != (size_t)ranks))) return false;
+        if (ownerRank >= 0 && (context->deviceRank != ownerRank || !capture.packedRows[i].data ||
+            capture.packedRows[i].device != draftTP->devices[ownerRank])) return false;
         total += counts[i]; captured += lengths[i];
         for (int rank = 0; rank < ranks; ++rank) if (!dataParallel || rank == context->deviceRank)
         for (int layer = 0; layer < draftLayers; ++layer)
@@ -1605,7 +1528,8 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
                 cache->dataDeviceIds.front() != (draftTP ? draftTP->devices[rank] : devices.front()) ||
                 cache->dims.size() != 3 || cache->dims[0] != 1 || cache->dims[2] != width || !cache->cudaData) return false;
     }
-    for (int rank = 0; rank < ranks; ++rank) for (int i = 0; i < draftLayers; ++i) {
+    for (int rank = ownerRank < 0 ? 0 : ownerRank; rank < (ownerRank < 0 ? ranks : ownerRank + 1); ++rank)
+    for (int i = 0; i < draftLayers; ++i) {
         const auto name = "dspark.layers." + std::to_string(i) + ".self_attn.";
         auto merged = weight.weight.find(name + DraftKVProjectionName());
         if (merged != weight.weight.end()) {
@@ -1627,6 +1551,7 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
     Data &contextFC = weight["dspark.fc.weight"], &contextNorm = weight["dspark.hidden_norm.weight"];
     const bool localProjection = dataParallel && contextFC.IsTensorParallelReplicated() &&
         contextNorm.IsTensorParallelReplicated() && contextFC.dataType == BFLOAT16;
+    if (ownerRank >= 0 && !localProjection) return false;
     if (!localProjection) UnpackDraftFeatures(capture, lengths);
     if (capture.packedRows.empty()) {
         std::vector<const Data *> inputs;
@@ -1705,7 +1630,7 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
         // Peers read the root's packed features only on this fallback path.
         // Publish them from a stable stream even when the caller changes threads.
         if (waitForRoot) ws.RecordPeerEvent(ws.done);
-        draftTP->Run([&](int rank) {
+        auto commitRank = [&](int rank) {
             auto &r = *ws.tpRanks[rank];
             const auto &requests = rankRequests[rank];
             if (requests.empty()) { FastllmCudaEventRecordCurrentThread(r.done); return; }
@@ -1713,7 +1638,27 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
             Data &source = localProjection ? combined : hidden;
             const int width = capture.packedRows.empty() ? source.dims.back() : embed_dim * draftTargetLayers.size();
             Data *input = &source;
-            if (dataParallel || rank) {
+            Data view;
+            const uint16_t *first = nullptr;
+            int contiguousRows = 0;
+            if (localProjection && !capture.packedRows.empty()) {
+                first = capture.packedRows[requests.front()].data;
+                for (int i : requests) {
+                    const auto &feature = capture.packedRows[i];
+                    if (!first || feature.device != r.device ||
+                        uintptr_t(feature.data) != uintptr_t(first) + size_t(contiguousRows) * width * sizeof(uint16_t)) {
+                        first = nullptr;
+                        break;
+                    }
+                    contiguousRows += counts[i];
+                }
+            }
+            if (first) {
+                view.dataType = BFLOAT16; view.UpdateUnitSize(); view.Resize({1, contiguousRows, width});
+                view.cudaDataBorrowed = true; view.cudaData = const_cast<uint16_t *>(first);
+                view.dataDevice = CUDA; view.dataDeviceIds = {r.device};
+                input = &view;
+            } else if (dataParallel || rank) {
                 auto &local = localProjection ? r.combined : r.contextSelected;
                 int rows = 0; for (int i : requests) rows += counts[i];
                 local.dataType = BFLOAT16; local.UpdateUnitSize(); local.Resize({1, rows, width});
@@ -1743,12 +1688,14 @@ bool NaiveN05FlashModel::CommitDraftContexts(TargetCapture &capture, const std::
                 input = &r.committedHidden;
             }
             project(rank, *input);
-            FastllmCudaEventRecordCurrentThread(r.done);
-        });
-        // This commit already returns synchronously. Join each producer without
-        // publishing its per-thread stream event to a different device.
-        for (int rank = 1; rank < ranks; ++rank)
-            FastllmCudaEventSynchronize(ws.tpRanks[rank]->done);
+            if (ownerRank < 0) FastllmCudaEventRecordCurrentThread(r.done);
+        };
+        if (ownerRank >= 0) commitRank(ownerRank);
+        else {
+            draftTP->Run(commitRank);
+            for (int rank = 1; rank < ranks; ++rank)
+                FastllmCudaEventSynchronize(ws.tpRanks[rank]->done);
+        }
     } else project(0, hidden);
     for (size_t i = 0; i < contexts.size(); ++i) {
         contexts[i]->committed += counts[i];
@@ -2195,6 +2142,7 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
             count, anchors.data(), temperatures.data());
     };
     auto body = [&]() {
+        if (p.TryProjectedHead(w1, w2)) return;
         for (int step = 0; step < steps; ++step) {
             p.ProjectMarkovStep(step, w1, w2, false);
             p.SampleMarkovStep(step);
@@ -2216,9 +2164,10 @@ bool NaiveN05FlashModel::PrepareDraftBatchGraph(
     }
     // Proposal width is known before sampling finishes. Keep a host mirror
     // for publication and eager fallback without blocking target preparation.
-    if (rank >= 0 && rounds.front()->deferIds && FastllmCudaMtpReadDraftIdsAsync(
+    const bool deferred = rank >= 0 && rounds.front()->deferIds;
+    if (deferred) draftSamplingRanks[rank]->RecordPeerEvent(state->done);
+    if (deferred && FastllmCudaMtpReadDraftIdsAsync(
             (float *)p.ids.cudaData + count, size_t(steps) * count, p.hostIds, p.idsReady)) {
-        draftSamplingRanks[rank]->RecordPeerEvent(state->done);
         for (int row = 0; row < live; ++row) {
             rounds[row]->proposalRow = row;
             rounds[row]->proposed.resize(rounds[row]->limit);
@@ -2405,7 +2354,8 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
     }
     std::vector<int> anchors, limits;
     std::vector<DraftContext *> contexts;
-    bool distributed = draftTP && draftTP->dataParallel && rounds.size() > 1 &&
+    bool distributed = draftTP && draftTP->dataParallel &&
+        (rounds.size() > 1 || (rounds.size() == 1 && CanRunSingleOwnerProposal())) &&
         draftConfidenceThreshold == 0 && GetCudaEmbedding();
     int total = 0, steps = 0;
     for (const auto &round : rounds) {
@@ -2424,8 +2374,11 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
     const bool sharded = distributed && CanShardDraftHead();
     Data hidden;
     DraftHeadShards headShards{limits, tpDraftHeadInputs, tpDraftHeadLogits};
+    if (sharded && rounds.size() == 1) headShards.ownerLogits = DraftOwnerLogits(*rounds.front(), steps);
     const bool ready = (!distributed && BorrowDraftLookahead(anchors, contexts, hidden)) ||
         RunDraftBatch(anchors, contexts, hidden, reserveRows, sharded ? &headShards : nullptr);
+    if (ready && sharded && headShards.ownerBodies)
+        for (auto &round : rounds) round->singleOwnerBody = true;
     if (backboneReady) *backboneReady = ready;
     if (!ready) return false;
     if (!distributed && TryDraftProposal(rounds, hidden)) return true;
@@ -2470,15 +2423,25 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
         auto replicate = [&](Data &out, const Data &source) {
             if (out.cudaData) return;
             out.dataType = source.dataType; out.Resize(source.dims);
+            if (source.dataDeviceIds == std::vector<int>{draftTP->devices[rank]}) {
+                out.FakeFrom(source, 0);
+                return;
+            }
             out.ToDevice(CUDA, {draftTP->devices[rank]}, false); out.Allocate(false);
             const size_t bytes = source.GetBytes();
             AssertInFastLLM(FastllmCudaMemcpy2DDeviceToDeviceAsyncCurrentThread(
                 out.cudaData, bytes, source.cudaData, bytes, bytes, 1), "Cannot copy draft sampling weights.");
         };
+        const bool initializing = !storage.samplingW1.cudaData || !storage.samplingW2.cudaData;
         replicate(storage.samplingW1, w1); replicate(storage.samplingW2, w2);
+        // Only the sampling owner reads vocabulary shards. Other workers may
+        // return as soon as their producer event has been submitted.
+        if (groups[rank].empty()) {
+            if (initializing) FastllmCudaSyncCurrentThreadStream();
+            return;
+        }
         if (sharded) for (int peer = 0; peer < ranks; ++peer) if (peer != rank)
             FastllmCudaCurrentThreadStreamWaitEvent(draftBatchStorage->tpRanks[peer]->done);
-        if (groups[rank].empty()) { FastllmCudaSyncCurrentThreadStream(); return; }
         std::vector<int> sourceRows;
         if (sharded) sourceRows.reserve(groups[rank].size() * size_t(steps));
         int rows = 0;
@@ -2493,7 +2456,7 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
         Data &input = fixed ? storage.sampling.verifyProposal : storage.samplingInput;
         Data local;
         local.FakeFrom(input, 0); local.dataType = BFLOAT16; local.UpdateUnitSize(); local.Resize({1, rows, vocab});
-        if (sharded && !FastllmCudaNaiveGatherDraftLogits(shards, tpDevices, total, sourceRows, local)) {
+        if (sharded && !headShards.ownerLogits && !FastllmCudaNaiveGatherDraftLogits(shards, tpDevices, total, sourceRows, local)) {
             // Unequal vocabulary shards and wider topologies keep the pitched copies.
             std::vector<void *> dst;
             std::vector<const void *> src;
@@ -2533,6 +2496,8 @@ bool NaiveN05FlashModel::PrepareDraftBatch(std::vector<std::unique_ptr<DraftRoun
         // Allocate a fresh descriptor array on growth to avoid copying CUDA views.
         auto &views = storage.samplingTargetViews;
         if (views.size() < groups[rank].size()) views = std::vector<Data>(groups[rank].size());
+        if (groups[rank].front()->proposalRow >= 0 && !storage.verifyLogitsReady)
+            storage.verifyLogitsReady = FastllmCudaEventCreate();
         int targetRow = 0;
         for (size_t i = 0; i < groups[rank].size(); ++i) {
             auto *round = groups[rank][i];
@@ -2711,43 +2676,7 @@ bool NaiveN05FlashModel::ProjectVerifyDraftRows(const std::vector<DraftRound *> 
 
 void NaiveN05FlashModel::PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
         const std::vector<int> *verifyLengths, TargetCapture *capture) {
-#ifdef USE_CUDA
-    if (draftTP && draftTP->dataParallel && !rounds.empty() &&
-        std::all_of(rounds.begin(), rounds.end(), [](const auto &r) { return r->samplingRank >= 0; })) {
-        const int ranks = draftTP->devices.size(), vocab = rounds.front()->vocab;
-        std::vector<std::vector<DraftRound *>> groups(ranks);
-        std::vector<std::vector<int>> offsets(ranks);
-        int offset = 0;
-        for (auto &round : rounds) {
-            groups[round->samplingRank].push_back(round.get());
-            offsets[round->samplingRank].push_back(offset); offset += round->proposed.size() + 1;
-        }
-        // Attention DP writes directly to these destinations. Other target
-        // layouts retain their normal gather and redistribute only at this boundary.
-        if (!logits.dims.empty()) { ApplyDraftDevice(); FastllmCudaSyncCurrentThreadStream(); }
-        draftTP->Run([&](int rank) {
-            if (groups[rank].empty()) return;
-            int rows = 0;
-            std::vector<void *> dst; std::vector<const void *> src; std::vector<size_t> bytes;
-            for (size_t i = 0; i < groups[rank].size(); ++i) {
-                auto &r = *groups[rank][i]; rows += r.proposed.size() + 1;
-                if (!logits.dims.empty()) {
-                    dst.push_back(r.targetLogits->cudaData);
-                    src.push_back((const float *)logits.cudaData + (size_t)offsets[rank][i] * vocab);
-                    bytes.push_back(r.targetLogits->GetBytes());
-                }
-            }
-            AssertInFastLLM(dst.empty() || FastllmCudaBatchCopyFromDeviceToDeviceAsyncCurrentThread(
-                dst.data(), src.data(), bytes.data(), dst.size()), "Cannot distribute target verification logits.");
-            Data local;
-            local.FakeFrom(draftSamplingRanks[rank]->samplingTarget, 0); local.Resize({rows, vocab});
-            PrepareDraftAcceptanceLocal(groups[rank], local, rank);
-            for (auto *r : groups[rank]) AssertInFastLLM(r->sampledAccepted >= 0, "Local rejection sampling incomplete.");
-            FastllmCudaSyncCurrentThreadStream();
-        });
-        return;
-    }
-#endif
+    if (AcceptDraftOnOwners(rounds, logits, verifyLengths, capture)) return;
     std::vector<DraftRound *> all;
     for (auto &round : rounds) all.push_back(round.get());
     PrepareDraftAcceptanceLocal(all, logits, -1, verifyLengths, capture);
@@ -3242,7 +3171,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         LastTokensManager tokens;
         tokens.units.push_back(history(i));
         return ForwardDraft(input, *positionIds[i], *caches[i], configs[i], tokens,
-            retLogits && i < (int)retLogits->size() ? (*retLogits)[i] : nullptr);
+            retLogits && i < (int)retLogits->size() ? (*retLogits)[i] : nullptr, false);
     };
     const bool needRound = std::any_of(owners.begin(), owners.end(),
         [](const auto &owner) { return owner->pending.empty(); });
@@ -3276,7 +3205,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             if (limit > 0) { selected.push_back(i); limits.push_back(limit); }
         }
     }
-    if (selected.size() < 2) {
+    if (selected.empty() || (selected.size() == 1 && !CanRunSingleOwnerProposal())) {
         for (int i = 0; i < batch; ++i) result[i] = single(i);
         return result;
     }
@@ -3421,7 +3350,8 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     if (!proposals.ready.empty()) {
         proposals.materialize = [&] {
             if (materialized) return;
-            for (auto event : proposals.ready) FastllmCudaEventSynchronize(event);
+            for (const auto &r : rounds)
+                if (r->proposalRow == 0) FastllmCudaEventSynchronize(r->proposalOwner->sampling.idsReady);
             size_t offset = 0;
             auto *ids = (float *)input.cpuData;
             for (auto &r : rounds) {
@@ -3447,6 +3377,32 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
     if (attentionDP > 1 && std::all_of(rounds.begin(), rounds.end(),
             [](const auto &r) { return r->samplingRank >= 0; }))
         for (auto &round : rounds) capture.logitsDestinations.push_back(round->targetLogits);
+#ifdef USE_CUDA
+    if (!earlyVerified && requests.proposals && CanShardDraftHead() &&
+        capture.logitsDestinations.size() == rounds.size() && proposals.rows.size() == rounds.size()) {
+        proposals.logitsReady.resize(tpDevices.size(), nullptr);
+        for (const auto &round : rounds) {
+            const int rank = round->samplingRank;
+            auto *event = draftSamplingRanks.at(rank)->verifyLogitsReady;
+            if (!event || round->targetLogits->dataDeviceIds != std::vector<int>{tpDevices.at(rank)}) {
+                proposals.logitsReady.clear();
+                break;
+            }
+            proposals.logitsReady[rank] = event;
+        }
+    }
+    struct DeferredVerifyGuard {
+        const std::vector<int> &devices;
+        bool armed;
+        ~DeferredVerifyGuard() {
+            if (armed) {
+                const int device = FastllmCudaGetDevice();
+                for (int rankDevice : devices) { FastllmCudaSetDevice(rankDevice); ForceDeviceSync(); }
+                FastllmCudaSetDevice(device);
+            }
+        }
+    } verifyGuard{tpDevices, !proposals.logitsReady.empty()};
+#endif
     std::vector<std::pair<Data, Data>> unused;
     Data logits;
     if (earlyVerified) {
@@ -3470,9 +3426,25 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
                 r.feature = feature;
         }
     }
+    if (capture.packedRows.size() == rounds.size() && draftContextStorage && draftTP && draftTP->dataParallel &&
+        weight["dspark.fc.weight"].IsTensorParallelReplicated() && weight["dspark.hidden_norm.weight"].IsTensorParallelReplicated()) {
+        for (size_t i = 0; i < rounds.size(); ++i) {
+            auto &r = *rounds[i];
+            const auto &feature = capture.packedRows[i];
+            if (r.singleOwnerBody && feature.data && r.samplingRank >= 0 && r.samplingRank == r.context.deviceRank &&
+                feature.device == draftTP->devices.at(r.samplingRank) && lengths[i] < draftWindow) {
+                r.feature = feature;
+                r.ownerCommitKV = caches[selected[i]];
+            }
+        }
+    }
 #endif
     DraftContextFence contextFence{*this};
     PrepareDraftAcceptance(rounds, logits, &lengths, &capture);
+#ifdef USE_CUDA
+    verifyGuard.armed = false;
+#endif
+    const bool singlePacked = rounds.size() == 1 && capture.packedRows.size() == 1;
     if (std::all_of(rounds.begin(), rounds.end(), [](const auto &r) { return r->sampledAccepted >= 0; })) {
         std::vector<int> past, counts;
         std::vector<char> written;
@@ -3491,6 +3463,14 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
         if (!draftContexts.empty() && CommitSpeculativeCaches(capture, lengths, counts, draftContexts, commitCaches, past, nextAnchors)) {
             for (auto &round : rounds) { round->targetCommitted = true; round->draftCommitted = true; }
         } else {
+            // Target ring bookkeeping and the next draft backbone consume disjoint caches.
+            // Submit the owner body while the packed features still belong to this replay.
+            if (singlePacked && rounds.front()->singleOwnerBody && !rounds.front()->draftCommitted) {
+                auto &round = *rounds.front();
+                CommitDraftContext(capture, counts.front(), round.context, *commitCaches.front(),
+                    round.NextBackboneAnchor(round.sampledAccepted, round.sampledNext));
+                round.draftCommitted = true;
+            }
             CommitTargetCaches(commitCaches, past, counts, capture.ringVerify, &written);
             std::vector<DraftContext *> contexts;
             for (auto &round : rounds) {
@@ -3502,7 +3482,7 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
                 for (auto &round : rounds) round->draftCommitted = true;
         }
     }
-    if (std::any_of(rounds.begin(), rounds.end(), [](const auto &r) { return !r->draftCommitted; }))
+    if (!singlePacked && std::any_of(rounds.begin(), rounds.end(), [](const auto &r) { return !r->draftCommitted; }))
         UnpackDraftFeatures(capture, lengths);
     std::vector<bool> handled(batch, false);
     for (size_t row = 0; row < selected.size(); ++row) {
@@ -3519,7 +3499,8 @@ std::vector<int> NaiveN05FlashModel::ForwardDraftBatch(int batch, const Data &in
             TargetCapture features;
             features.verifying = true;
             features.ringVerify = capture.ringVerify;
-            if (!rounds[row]->draftCommitted) for (int layer : draftTargetLayers)
+            if (singlePacked) features.packedRows = capture.packedRows;
+            else if (!rounds[row]->draftCommitted) for (int layer : draftTargetLayers)
                 Split(capture.hidden.at(layer), 1, offset, offset + count, features.hidden[layer]);
             token = FinishDraftRound(*rounds[row], rows, features, *caches[i]);
         }
@@ -3555,7 +3536,7 @@ bool NaiveN05FlashModel::PopPendingResponseToken(ResponseContext *response,
 int NaiveN05FlashModel::ForwardDraft(
         const Data &inputIds, const Data &positions, std::vector<std::pair<Data, Data>> &kv,
         const GenerationConfig &config, const LastTokensManager &lastTokens,
-        std::vector<float> *retLogits) {
+        std::vector<float> *retLogits, bool allowOwnerProposal) {
     std::shared_ptr<DraftContext> owner;
     {
         std::lock_guard<std::mutex> guard(historyMutex);
@@ -3603,6 +3584,16 @@ int NaiveN05FlashModel::ForwardDraft(
         }
         if (isIntermediateChunkedPrefill || config.prefill_chunk_remaining > 0) return 0;
         return SampleTarget(logits, kv, config, lastTokens, retLogits, &selection);
+    }
+    // The scalar serving entry also uses the request owner's proposal and
+    // acceptance graphs. ForwardDraftBatch owns eligibility and scalar fallback.
+    if (allowOwnerProposal && CanRunSingleOwnerProposal()) {
+        std::vector<std::pair<Data *,Data *>> bindings;
+        for (auto &layer : kv) bindings.emplace_back(&layer.first, &layer.second);
+        Data positionView; positionView.FakeFrom(positions, 0); positionView.Resize(positions.dims);
+        std::vector<std::vector<float> *> outputs{retLogits};
+        return ForwardDraftBatch(1, inputIds, {&positionView}, {1}, bindings, {config}, lastTokens,
+                                 retLogits ? &outputs : nullptr).front();
     }
     DraftRound round(*this, context, config, anchor, limit);
     if (config.NeedsTokenHistory() && !lastTokens.units.empty())

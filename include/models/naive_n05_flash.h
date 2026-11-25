@@ -148,6 +148,8 @@ namespace fastllm {
             std::vector<const float *> rows;
             std::vector<int> strides;
             std::vector<void *> ready;
+            // One reusable event per sampling device; inactive ranks leave a null slot.
+            std::vector<void *> logitsReady;
         };
         // Batch-major request descriptors, borrowed only for one forward. KV
         // storage remains owned by each response; weights are shared by all rows.
@@ -345,6 +347,7 @@ namespace fastllm {
             std::vector<DraftInput> draftInputs;
             bool deferOutputWait = false;
             std::vector<void *> outputReady;
+            std::vector<void *> ownerLogitsReady; // Published only after the rank-local gathers have been enqueued.
             void *draftFused = nullptr;
             bool compositeDraft = false;
             // Synchronous fallback only; cleared before target submission.
@@ -445,7 +448,9 @@ namespace fastllm {
         bool AppendDraftContextFused(Data &hidden, int start, DraftContext &context);
         bool NeedsDraftPrefillHidden(const Data &key, int end, int promptLength) const;
         void CommitDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
-                                std::vector<std::pair<Data, Data>> &kv, int nextAnchor = -1);
+                                std::vector<std::pair<Data, Data>> &kv, int nextAnchor = -1, bool onOwner = false);
+        bool CommitPackedDraftContext(TargetCapture &capture, int tokens, DraftContext &context,
+                                      std::vector<std::pair<Data, Data>> &kv, int anchor, bool onOwner);
         void ProjectDraftContext(Data &combined, Data &projected, Data &hidden);
         std::shared_ptr<DraftContext> CreateDraftContext(const std::vector<int> &devices = {});
         bool PrepareDraftTP();
@@ -458,8 +463,8 @@ namespace fastllm {
         void ExportDraftPDState(PDStateWriter &writer, const DraftContext &context, int length, bool planning = false);
         std::shared_ptr<DraftContext> ImportDraftPDState(PDStateReader &reader, int length, int device = -1);
         std::shared_ptr<DraftContext> ReservePDDraft(int length, int device, bool keepTail);
-        void AppendDraftKVOnRank(Data &input, int start, DraftContext &context, int rank);
-        bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context);
+        bool AppendDraftKVOnRank(Data &input, int start, DraftContext &context, int rank, DraftWorkspace *body = nullptr);
+        bool AppendDraftContextTP(Data &hidden, int start, DraftContext &context, int nextAnchor = -1, bool projectFeatures = false, bool onOwner = false);
         bool RunDraftGraph(int anchor, DraftContext &context, Data &output);
         bool RunDraftSamplingStep(int previous, int step, const Data &baseLogits,
             DraftContext &context, const GenerationConfig &config, int &token);
@@ -470,8 +475,11 @@ namespace fastllm {
         struct DraftHeadShards {
             const std::vector<int> &limits;
             std::vector<Data> &inputs, &logits;
-            bool collectiveDynamicKV = false;
+            bool collectiveDynamicKV = false, ownerBodies = false;
+            Data *ownerLogits = nullptr;
         };
+        void RunDraftShardedHead(DraftHeadShards &head, const std::vector<std::vector<int>> &requests,
+                                 const std::vector<void *> &done, bool waitForOwner);
         bool RunDraftBatch(const std::vector<int> &anchors,
                            const std::vector<DraftContext *> &contexts, Data &normalized, int reserveRows = 0,
                            DraftHeadShards *headShards = nullptr, const FastllmDraftHeadCall *headCall = nullptr);
@@ -483,6 +491,7 @@ namespace fastllm {
         Data RunDraftHead(Data &hidden);
         void RunDraftHead(Data &hidden, Data &output);
         bool CanShardDraftHead() const;
+        bool CanRunSingleOwnerProposal() const;
         bool CanSlideDraftKV() const;
         void UnpackDraftFeatures(TargetCapture &capture, const std::vector<int> &lengths);
         Data RunDraftTarget(const Data &inputIds, const Data &positions,
@@ -525,8 +534,9 @@ namespace fastllm {
         struct DraftContextFence;
         void DrainPendingDraftContext();
         bool CommitDraftContexts(TargetCapture &capture, const std::vector<int> &lengths,
-            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor = -1);
+            const std::vector<int> &counts, const std::vector<DraftContext *> &contexts, int nextAnchor = -1, int ownerRank = -1);
         struct DraftRound;
+        Data *DraftOwnerLogits(const DraftRound &round, int steps);
         bool TryDraftProposal(DraftRound &round);
         bool TryDraftProposal(const std::vector<DraftRound *> &rounds, const Data &normalized);
         bool TryDraftProposal(const std::vector<std::unique_ptr<DraftRound>> &rounds, const Data &normalized);
@@ -550,6 +560,8 @@ namespace fastllm {
         void PrepareLowLatencyDraftServingMemory(bool history);
         void PrepareLayerDraftServingMemory(bool history);
         void PrepareDraftSamplingMemory(int rows, int steps, int vocab, int latentWidth, int rank = -1);
+        bool AcceptDraftOnOwners(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
+            const std::vector<int> *verifyLengths, TargetCapture *capture);
         void PrepareDraftAcceptance(std::vector<std::unique_ptr<DraftRound>> &rounds, Data &logits,
             const std::vector<int> *verifyLengths = nullptr, TargetCapture *capture = nullptr);
         void PrepareDraftAcceptanceLocal(const std::vector<DraftRound *> &rounds, Data &logits, int rank,
@@ -564,7 +576,7 @@ namespace fastllm {
         int ForwardDraft(const Data &inputIds, const Data &positions,
                          std::vector<std::pair<Data, Data>> &kv,
                          const GenerationConfig &config, const LastTokensManager &lastTokens,
-                         std::vector<float> *retLogits);
+                         std::vector<float> *retLogits, bool allowOwnerProposal = true);
         std::string draftParallelLayout;
         // Set only by WarmUp. Serving may replay these graphs or execute eagerly,
         // but never captures a graph in response to a request or shape change.
