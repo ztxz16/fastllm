@@ -2400,6 +2400,8 @@ def make_normal_llm_model(args, startup_progress = None):
                                           min_decode_requests=prefill_min_decode_requests)
             else:
                 model.set_prefill_batching(prefill_batch_tokens, prefill_max_wait_ms)
+        elif is_inkling_model and not prefill_batch_auto:
+            model.set_prefill_batching(0)
         if kv_admission_reserve is not None:
             model.set_kv_admission_reserve(kv_admission_reserve)
         if any(prefill_scheduling.values()):

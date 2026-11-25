@@ -20,6 +20,8 @@ Inkling2Model::Inkling2Model() {
     model_type = model_struct = "inkling2_loop";
     dataType = BFLOAT16;
     canDoBatchForward = true;
+    prefillBatchPolicy.targetTokens = 4096;
+    prefillBatchPolicy.maxRequests = 4;
     // K and V are normalized per head. FP16 gives these bounded values
     // more mantissa precision at the same bandwidth as BF16.
     SetKVCacheDataType(FLOAT16);
@@ -301,6 +303,11 @@ bool Inkling2Model::RestorePagedPrefixCacheExtra(ResponseContext *ctx, int lengt
 void Inkling2Model::WarmUp() {
     if (SupportsDecodePipeline())
         runtime->warmupDecodeGraph();
+}
+int Inkling2Model::GetPrefillBatchKey(const ResponseContext &ctx, int chunkSize) const {
+    if (saveHistoryChat || ctx.prefillOffset || ctx.cacheLen || ctx.replayingKV || !ctx.multimodalInput.empty() ||
+        ctx.currentTokens.size() > size_t(chunkSize)) return -1;
+    return inkling2::pooledPromptKey(ctx.currentTokens.size(), ctx.generationConfig);
 }
 bool Inkling2Model::SupportsDecodePipeline() const {
     return runtime && GetFastllmEnv().cudaGraph;

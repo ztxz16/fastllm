@@ -240,6 +240,26 @@ int main() {
             Drain(model, {pending}, 2);
             model.AbortResponse(active);
         }
+        // Incompatible ready prompts keep ordinary single-request admission.
+        for (const auto &lengths : {std::vector<int>{128, 128}, {128, 256}, {16, 16}}) {
+            struct EqualShapeModel : SchedulerModel {
+                int GetPrefillBatchKey(const ResponseContext &ctx, int) const override {
+                    return ctx.currentTokens.size() < 64 ? -1 : int(ctx.currentTokens.size());
+                }
+            } model;
+            Check(model.SetPrefillBatching(4096, 0), "shape policy rejected");
+            Seed(model); Hold(model);
+            const auto start = model.Events().size();
+            auto a = Launch(model, lengths[0]), b = Launch(model, lengths[1]);
+            model.holdDecode = false;
+            Drain(model, {a, b});
+            auto events = Prefills(model, start);
+            if (lengths.front() == 128 && lengths.back() == 128)
+                Check(events.size() == 1 && events[0].lengths == lengths, "compatible prompts split");
+            else
+                Check(events.size() == 2 && events[0].lengths.size() == 1 && events[1].lengths.size() == 1,
+                      "incompatible prompts pooled");
+        }
         // Pure release policy: targets are OR conditions and deadlines belong
         // to requests; capacity and idle decode release without waiting.
         {

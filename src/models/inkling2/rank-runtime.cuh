@@ -8,6 +8,7 @@ class TensorRuntime final : public Runtime {
         bool visionReady = false;
     };
     basellm &owner;
+    bool pooledPrefill;
     std::vector<int> devices;
     std::vector<std::unique_ptr<Rank>> ranks;
     PersistentWorkerGroup workers;
@@ -141,7 +142,7 @@ class TensorRuntime final : public Runtime {
 
 public:
     TensorRuntime(const Config &c, const Placement &p, basellm &model, const std::map<std::string, TensorRange> &files)
-        : owner(model), devices(p.tensorDevices) {
+        : owner(model), pooledPrefill(p.tensorDevices.size() == 2 && !c.draft.steps), devices(p.tensorDevices) {
         const int world = devices.size();
         if (c.kvHeads % world || c.heads % world || c.experts % world ||
             (c.draft.steps && (c.draft.heads % world || c.draft.kvHeads % world || c.draft.intermediate % world)) ||
@@ -181,6 +182,7 @@ public:
             placement.gpu = devices[i]; placement.rank = i; placement.world = world;
             placement.tensorDevices.clear(); placement.vocabRows = vocabRows;
             check(cudaSetDevice(placement.gpu));
+            pooledPrefill &= FastllmCudaRuntimeArch() == 120;
             for (const auto &[name, weight] : model.weight.weight)
                 if (name.compare(0, 10, "model.llm.") == 0) weightShard(ranks[i]->weights, name, weight, c, placement);
             check(cudaStreamSynchronize(cudaStreamPerThread));
@@ -204,6 +206,7 @@ public:
         run([&](int i) { ranks[i]->decoder.reset(); ranks[i]->weights.weight.clear(); });
     }
     bool hasRankCaches() const override { return true; }
+    bool supportsPooledPrefill() const override { return pooledPrefill; }
     void warmupDecodeGraph() override {
         const auto seed = newSamplingSeed();
         run([&](int i) {
@@ -268,7 +271,23 @@ public:
         if (images) for (const auto &entry : *images)
             for (auto *tensor : entry.second) if (tensor) tensor->ToDevice(CPU);
         for (auto [k, v] : cache) { ensureCache(*k); ensureCache(*v); }
+        bool pool = owner.SupportsPrefillBatching() && !images && lengths.size() > 1 && lengths.front() > 1;
+        if (pool) {
+            const int key = pooledPromptKey(lengths.front(), sampling.front());
+            for (size_t b = 0; pool && b < lengths.size(); ++b) {
+                const auto *pos = positions[b];
+                pool = key >= 0 && key == pooledPromptKey(lengths[b], sampling[b]) &&
+                       pos->dataType == FLOAT32 && pos->Count(0) == lengths[b] &&
+                       *reinterpret_cast<const float *>(pos->cpuData) == 0;
+            }
+        }
         const auto seed = newSamplingSeed();
+        std::vector<uint64_t> seeds;
+        if (pool) {
+            seeds.resize(lengths.size());
+            seeds.front() = seed;
+            std::generate(seeds.begin() + 1, seeds.end(), newSamplingSeed);
+        }
         std::vector<int> result;
         run([&](int i) {
             auto &rank = *ranks[i];
@@ -282,7 +301,7 @@ public:
             local.reserve(cache.size());
             for (auto [k, v] : cache)
                 local.emplace_back(k->multiDeviceDatas.at(devices[i]), v->multiDeviceDatas.at(devices[i]));
-            rank.decoder->setRequestSeed(seed);
+            rank.decoder->setRequestSeed(seed, seeds);
             auto tokens = rank.decoder->forward(ids, positions, lengths, local, sampling, history, logits, images);
             if (!i) result = std::move(tokens);
         });

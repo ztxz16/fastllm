@@ -8,6 +8,13 @@ inline bool ordinarySampling(const GenerationConfig &cfg) {
            !cfg.tool_call_token_mask && cfg.top_k > 0 && cfg.temperature > 0.f && cfg.top_p > 0.f &&
            cfg.top_p <= 1.f;
 }
+// Pool tile-aligned short prompts. Preserve the projection algorithm and each
+// request's sampling mode across the scheduler and direct packed forwards.
+inline int pooledPromptKey(size_t rows, const GenerationConfig &cfg) {
+    if (rows < 64 || rows >= 4096 || rows % 64 || cfg.prefill_chunk_remaining > 0 ||
+        (!cfg.IsSimpleGreedy() && !ordinarySampling(cfg))) return -1;
+    return int(2 * rows) + int(cfg.IsSimpleGreedy());
+}
 struct TensorRange {
     std::string file, type;
     std::vector<int> shape;
@@ -49,6 +56,7 @@ struct Placement {
 class Runtime {
 public:
     virtual ~Runtime() = default;
+    virtual bool supportsPooledPrefill() const { return false; }
     virtual bool hasRankCaches() const { return false; }
     virtual int prefix(ResponseContext &, int limit, bool restore) = 0;
     virtual void setPrefixCache(bool enabled) = 0;
@@ -119,6 +127,10 @@ public:
         return draftEnabled() && ctx && !ctx->pastKeyValues.empty() &&
                runtime->popPending(ctx->pastKeyValues[0].first, previous, token);
     }
+    bool SupportsPrefillBatching() const override {
+        return runtime && runtime->supportsPooledPrefill() && dataType == BFLOAT16 && !saveHistoryChat;
+    }
+    int GetPrefillBatchKey(const ResponseContext &, int chunkSize) const override;
     bool SupportsDecodePipeline() const override;
     bool SupportsDecodePipelineHistory() const override { return true; }
     std::unique_ptr<DecodePipeline> CreateDecodePipeline(const std::vector<ResponseContext *> &contexts) override;

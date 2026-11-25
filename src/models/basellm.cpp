@@ -3503,7 +3503,7 @@ namespace fastllm {
                     std::vector<float> decodePositions(scalarPosition ? maxBatch : 0);
                     std::vector<Data> decodePositionIds;
                     if (scalarPosition) decodePositionIds.reserve(maxBatch);
-                    const bool batchPrefill = (maxBatch > 1 || model->prefillScheduling.chunked) && model->SupportsPrefillBatching() &&
+                    const bool allowBatchPrefill = (maxBatch > 1 || model->prefillScheduling.chunked) && model->SupportsPrefillBatching() &&
                                               model->prefillBatchPolicy.targetTokens > 0;
                     const bool fixedKvSlots = model->kvMemConfig.enabled && model->SupportsKvMemBatch();
                     const bool sharedKvPool = model->SupportsSharedPagedKVPool();
@@ -3581,12 +3581,20 @@ namespace fastllm {
                         model->FlushPDAnnouncements();
                         std::set<int> waitingPD;
                         bool hasPrefillRequests = false;
+                        bool batchPrefill = allowBatchPrefill;
+                        int batchKey = 0;
                         for (auto &entry : model->responseContextDict.dicts) {
                             if (entry.second->isEnding) continue;
                             if (!model->PollPendingPD(entry.second, maxTotalLens) && entry.second->pdPending)
                                 waitingPD.insert(entry.first);
-                            else if (entry.second->NeedsPrefill())
+                            else if (entry.second->NeedsPrefill()) {
+                                if (batchPrefill) {
+                                    const int key = model->GetPrefillBatchKey(*entry.second, prefillChunk);
+                                    batchPrefill = key >= 0 && (!hasPrefillRequests || key == batchKey);
+                                    batchKey = key;
+                                }
                                 hasPrefillRequests = true;
+                            }
                         }
                         for (auto &entry : model->responseContextDict.dicts)
                             if (entry.second->isEnding) {
