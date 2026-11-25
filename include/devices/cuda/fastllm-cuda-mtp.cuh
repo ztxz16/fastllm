@@ -24,6 +24,9 @@ bool FastllmCudaMtpGatherVerifyIds(float *output, int width, const float *const 
 // Reuse the host mirror and event only for sampler graphs of the same shape.
 bool FastllmCudaMtpReadDraftIdsAsync(const float *ids, std::size_t count, float *&host, void *&ready);
 
+uint64_t FastllmCudaNextDraftSamplingSeed();
+uint64_t FastllmCudaPeekDraftSamplingSeed();
+
 // Publish the anchors, temperatures and a fresh seed on the proposal graph's stream.
 // Draft q is the full temperature-softmax; top-k/top-p are applied by the verifier.
 bool FastllmCudaMtpPrepareDraftReplay(void *sampler, float *deviceAnchors, int rows,

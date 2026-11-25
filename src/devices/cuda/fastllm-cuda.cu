@@ -25,6 +25,7 @@
 #include "devices/cuda/cudaworkspace.h"
 #include "fastllm-cuda-mtp.cuh"
 #ifndef USE_ROCM
+#include <cooperative_groups.h>
 #include "fastllm-cuda-ordered-reduce.cuh"
 #include "fastllm-cuda-router-topk.cuh"
 #include "fastllm-rmsnorm-decode.cuh"
@@ -16280,15 +16281,14 @@ __global__ void FastllmTemperatureSoftmaxNormalizeKernel(const float *logits, fl
 // Split long vocabulary rows across CTAs. Each tile contributes a stable
 // (maximum, exponential sum); the second pass combines them and normalizes.
 // This is portable CUDA. Short rows and large batches keep the single-CTA path.
-__global__ void FastllmMtpSoftmaxPartialKernel(const float *logits, const float *temperatures,
-                                              float2 *partials, int vocab, int tiles) {
-    const float *input = logits + (long long)blockIdx.y * vocab;
+template <class Input>
+__device__ __forceinline__ void MtpTileStats(Input input, const float *temperatures,
+                                              float2 *partials, int vocab, int tiles, float (&values)[16]) {
     float invTemp = (temperatures ? 1.0f / temperatures[blockIdx.y] : 1.0f), maximum = -1e30f;
-    float values[16];
     #pragma unroll
     for (int j = 0; j < 16; ++j) {
         int i = blockIdx.x * 4096 + threadIdx.x + j * 256;
-        values[j] = i < vocab ? input[i] * invTemp : -INFINITY;
+        values[j] = i < vocab ? __fmul_rn(input(blockIdx.y, i, vocab), invTemp) : -INFINITY;
         maximum = fmaxf(maximum, values[j]);
     }
     using Reduce = cub::BlockReduce<float, 256>;
@@ -16305,17 +16305,11 @@ __global__ void FastllmMtpSoftmaxPartialKernel(const float *logits, const float 
     if (threadIdx.x == 0) partials[blockIdx.y * tiles + blockIdx.x] = make_float2(tileMax, sum);
 }
 
-__global__ void FastllmMtpSoftmaxNormalizeKernel(const float *logits, const float *temperatures,
-                                                const float2 *partials, float *probs,
-                                                int vocab, int tiles) {
-    const float *input = logits + (long long)blockIdx.y * vocab;
-    float *output = probs + (long long)blockIdx.y * vocab;
-    partials += blockIdx.y * tiles;
+__device__ __forceinline__ void MtpRowStats(const float2 *partials, int tiles, float &rowMax, float &invSum) {
     float maximum = -1e30f;
     for (int i = threadIdx.x; i < tiles; i += 256) maximum = fmaxf(maximum, partials[i].x);
     using Reduce = cub::BlockReduce<float, 256>;
     __shared__ typename Reduce::TempStorage storage;
-    __shared__ float rowMax, invSum;
     maximum = Reduce(storage).Reduce(maximum, MaxReduceOp{});
     if (threadIdx.x == 0) rowMax = maximum;
     __syncthreads();
@@ -16326,11 +16320,38 @@ __global__ void FastllmMtpSoftmaxNormalizeKernel(const float *logits, const floa
     sum = Reduce(storage).Sum(sum);
     if (threadIdx.x == 0) invSum = 1.0f / sum;
     __syncthreads();
-    float invTemp = (temperatures ? 1.0f / temperatures[blockIdx.y] : 1.0f);
-    for (int i = blockIdx.x * 4096 + threadIdx.x; i < min((int)(blockIdx.x + 1) * 4096, vocab); i += 256)
-        // Match the rounded scaled logits used to compute the tile maxima and sums.
-        output[i] = expf(__fmul_rn(input[i], invTemp) - rowMax) * invSum;
 }
+
+__global__ void FastllmMtpSoftmaxPartialKernel(const float *input, const float *temperatures,
+                                               float2 *partials, int vocab, int tiles) {
+    float values[16];
+    MtpTileStats(FastllmFloatSoftmaxInput{input}, temperatures, partials, vocab, tiles, values);
+}
+__global__ void FastllmMtpSoftmaxNormalizeKernel(const float *input, const float *temperatures,
+                                                 const float2 *partials, float *probs, int vocab, int tiles) {
+    __shared__ float rowMax, invSum;
+    MtpRowStats(partials + blockIdx.y * tiles, tiles, rowMax, invSum);
+    const float invTemp = temperatures ? 1.0f / temperatures[blockIdx.y] : 1.0f;
+    const auto row = (long long)blockIdx.y * vocab;
+    for (int i = blockIdx.x * 4096 + threadIdx.x; i < min((int)(blockIdx.x + 1) * 4096, vocab); i += 256)
+        probs[row + i] = expf(__fmul_rn(input[row + i], invTemp) - rowMax) * invSum;
+}
+
+#ifndef USE_ROCM
+__global__ __launch_bounds__(256) void DraftProposalSoftmax(FastllmBF16BiasSoftmaxInput input,
+        const float *temperatures, float2 *partials, float *probs, int vocab, int tiles) {
+    float values[16];
+    MtpTileStats(input, temperatures, partials, vocab, tiles, values);
+    cooperative_groups::this_grid().sync();
+    __shared__ float rowMax, invSum;
+    MtpRowStats(partials, tiles, rowMax, invSum);
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        int i = blockIdx.x * 4096 + threadIdx.x + 256 * j;
+        if (i < vocab) probs[i] = expf(values[j] - rowMax) * invSum;
+    }
+}
+#endif
 
 template <int BLOCK_THREADS>
 __global__ void FastllmTypicalAcceptanceKernel(
@@ -18231,6 +18252,7 @@ struct FastllmMtpSamplingWorkspace {
     flashinfer::sampling::RadixRowState *rowStates;
     float2 *softmaxPartials;
     int softmaxTiles;
+    bool cooperativeProposal = false;
     FastllmMtpTopPState *topPState = nullptr;
     float2 *topPCuts = nullptr;
     explicit FastllmMtpSamplingWorkspace(int rows, int vocab, bool dedicated = false, bool resident = false)
@@ -18251,6 +18273,16 @@ struct FastllmMtpSamplingWorkspace {
         size_t va = reserve(rows * sizeof(bool));
         size_t rs = reserve(rows * sizeof(flashinfer::sampling::RadixRowState));
         softmaxTiles = vocab >= 65536 ? (vocab + 4095) / 4096 : 0;
+#ifndef USE_ROCM
+        if (dedicated && rows == 1 && softmaxTiles && FastllmCudaRuntimeArch() == 120) {
+            cudaDeviceProp prop{};
+            int resident = 0;
+            cooperativeProposal = cudaGetDeviceProperties(&prop, FastllmCudaGetDevice()) == cudaSuccess &&
+                prop.cooperativeLaunch && cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &resident, DraftProposalSoftmax, 256, 0) == cudaSuccess &&
+                softmaxTiles <= prop.multiProcessorCount * resident;
+        }
+#endif
         size_t sm = reserve((size_t)rows * softmaxTiles * sizeof(float2));
         size_t so = dedicated ? reserve(sizeof(uint64_t)) : 0;
         // The exact sparse shortcut is independent of workspace ownership and
@@ -18422,11 +18454,21 @@ __global__ void FastllmMtpWriteDraftReplay(FastllmDraftReplayRows values, int fi
     topPs[row] = 1.0f;
     if (row == 0) *deviceSeed = seed;
 }
-uint64_t FastllmMtpSamplingSeed() {
+std::mt19937_64 &FastllmMtpSamplingRng() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
-    return rng();
+    return rng;
+}
+uint64_t FastllmMtpSamplingSeed() {
+    return FastllmMtpSamplingRng()();
 }
 }
+
+uint64_t FastllmCudaPeekDraftSamplingSeed() {
+    auto copy = FastllmMtpSamplingRng();
+    return copy();
+}
+
+uint64_t FastllmCudaNextDraftSamplingSeed() { return FastllmMtpSamplingSeed(); }
 
 // These buffers are owned by the request, never borrowed from transient dequant
 // scratch. Update the device seed before each replay; the graph must not capture
@@ -18497,6 +18539,11 @@ bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *pro
 static bool FastllmMtpSampleProposal(FastllmMtpSamplingWorkspace &ws, float *probs,
         int *sampleRows, float *deviceToken, uint64_t offset) {
     const cudaStream_t stream = cudaStreamPerThread;
+    // One proposal row uses no index array. FlashInfer can write the sampled
+    // vocabulary ID directly in the representation consumed by the next step.
+    if (ws.cooperativeProposal && ws.rows == 1 && !sampleRows)
+        return flashinfer::sampling::SamplingFromProb<float, float, 1>(probs, deviceToken, ws.valid,
+            nullptr, 1, ws.vocab, true, ws.seed, 0, nullptr, offset, stream) == cudaSuccess;
     if (flashinfer::sampling::SamplingFromProb<float, int, 1>(probs, ws.output, ws.valid,
             sampleRows, ws.rows, ws.vocab, true, ws.seed, 0, nullptr, offset, stream) != cudaSuccess) return false;
     FastllmMtpSampleIdToFloat<<<(ws.rows + 127) / 128, 128, 0, stream>>>(ws.output, deviceToken, ws.rows);
@@ -18523,12 +18570,24 @@ bool FastllmCudaMtpDraftSamplerRunBF16BiasBatch(void *sampler, const void *base,
     if (!sampler || !base || !bias || !mask || !proposalProbs || !deviceToken ||
         steps <= 0 || step < 0 || step >= steps) return false;
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
-    // Keep the existing small-batch/tiled and filtered-distribution fallbacks.
-    if (ws.rows <= 32 || ws.needTopK || ws.needTopP) return false;
+    if (ws.needTopK || ws.needTopP) return false;
     if (!probabilityStride) probabilityStride = ws.vocab;
     if (probabilityStride < ws.vocab) return false;
     const FastllmBF16BiasSoftmaxInput input{
         (const __nv_bfloat16 *)base, (const __nv_bfloat16 *)bias, mask, step, steps};
+    if (ws.rows <= 32) {
+#ifndef USE_ROCM
+        if (ws.rows == 1 && ws.cooperativeProposal) {
+            auto params = input;
+            int vocab = ws.vocab;
+            void *args[] = {&params, &ws.temperatures, &ws.softmaxPartials, &proposalProbs, &vocab, &ws.softmaxTiles};
+            return cudaLaunchCooperativeKernel((void *)DraftProposalSoftmax, ws.softmaxTiles, 256,
+                    args, 0, cudaStreamPerThread) == cudaSuccess &&
+                FastllmMtpSampleProposal(ws, proposalProbs, nullptr, deviceToken, offset);
+        }
+#endif
+        return false;
+    }
     if (ws.vocab >= 65536 && ws.rows <= 65535 && probabilityStride % ws.vocab == 0 &&
         size_t(ws.rows - 1) * probabilityStride + ws.vocab <= UINT32_MAX) {
         const int tiles = (ws.vocab - 1) / kProposalTile + 1;
