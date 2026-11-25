@@ -34,7 +34,8 @@ struct HybridGraphStorage {
         size_t capacity;
         std::vector<int> expertIds, cpuRoutes, uploadIds;
         std::vector<CpuExpertGroup> groups;
-        std::vector<float> input, output;
+        HostProjectionInput input;
+        std::vector<float> output;
         std::atomic<unsigned> &ready() const { return *reinterpret_cast<std::atomic<unsigned> *>(host); }
         explicit Arena(size_t bytes) : capacity(bytes) {
             check(cudaHostAlloc(&host, bytes, cudaHostAllocMapped));
@@ -64,11 +65,8 @@ struct HybridGraphStorage {
             if (!count) return;
             auto &input = arena->input;
             auto &output = arena->output;
-            input.resize(size_t(count) * weight.cols);
+            input.prepare(weight, hostInput, count, &arena->cpuRoutes, divisor, rows);
             output.resize(size_t(count) * weight.rows);
-            for (int i = 0; i < count; ++i)
-                std::copy_n(hostInput + size_t(arena->cpuRoutes[i] / divisor) * weight.cols,
-                            weight.cols, input.data() + size_t(i) * weight.cols);
             hostProjection(weight, arena->groups, input, output);
             for (int i = 0; i < count; ++i)
                 std::copy_n(output.data() + size_t(i) * weight.rows, weight.rows,
@@ -176,7 +174,10 @@ struct HybridGraphStorage {
             if (gate.fp4) {
                 const size_t bytes = size_t(inter) * sizeof(float);
                 const bool shared = bytes + 16 * sizeof(float) <= 48 * 1024;
-                reconstructHybridRows<true><<<dim3(routes, quantTiles<true>(routes, inter, smCount)), 512,
+                // Each FP4 tile scans the whole row for its scale. Read the
+                // mapped NUMA gate/up result once across PCIe when it fits in shared memory.
+                const int tiles = host && shared ? 1 : quantTiles<true>(routes, inter, smCount);
+                reconstructHybridRows<true><<<dim3(routes, tiles), 512,
                     shared ? bytes : 0, stream>>>(src, out, mask, host, inter, shared);
             } else {
                 reconstructHybridRows<false><<<dim3(routes, quantTiles<false>(routes, inter, smCount)), 256,

@@ -36,27 +36,45 @@ struct HybridHostRows final : MultiThreadBaseOp {
     }
 };
 
-void hostProjection(const Projection &w, const std::vector<CpuExpertGroup> &groups,
-                    std::vector<float> &input, std::vector<float> &output) {
-    std::vector<uint16_t> bf16(input.size());
+struct HostProjectionInput {
+    std::vector<uint16_t> bf16;
     std::vector<float> scales;
-    if (w.fp4) {
-        // Reconstructed FP4 activations share one outer scale per row. The
-        // largest block represents its peak as either 6*256 or 4*384 times
-        // outer. Removing that factor keeps FP4 * E4M3 exact in BF16.
-        scales.resize(input.size() / w.cols);
-        for (size_t row = 0; row < scales.size(); ++row) {
-            const float *x = input.data() + row * w.cols;
-            float peak = 0;
-            for (int i = 0; i < w.cols; ++i) peak = std::max(peak, std::abs(x[i]));
-            scales[row] = peak / 3.f; // 512 * outer
-            const double inverse = scales[row] ? 1. / scales[row] : 0.;
-            auto *dst = bf16.data() + row * w.cols;
-            for (int i = 0; i < w.cols; ++i) dst[i] = Float32ToBFloat16RNEBits(float(x[i] * inverse));
+    std::vector<int> firstRoute;
+
+    void prepare(const Projection &w, const float *input, int count, const std::vector<int> *routes = nullptr,
+                 int routesPerInput = 1, int inputRows = 0) {
+        bf16.resize(size_t(count) * w.cols);
+        if (w.fp4) scales.resize(count);
+        if (routesPerInput > 1) firstRoute.assign(inputRows, -1);
+        for (int i = 0; i < count; ++i) {
+            const int row = routes ? (*routes)[i] / routesPerInput : i;
+            uint16_t *dst = bf16.data() + size_t(i) * w.cols;
+            if (routesPerInput > 1) {
+                int &first = firstRoute[row];
+                if (first >= 0) {
+                    std::copy_n(bf16.data() + size_t(first) * w.cols, w.cols, dst);
+                    if (w.fp4) scales[i] = scales[first];
+                    continue;
+                }
+                first = i;
+            }
+            const float *x = input + size_t(row) * w.cols;
+            if (w.fp4) {
+                // Removing 512 * outer keeps reconstructed FP4 * E4M3 exact in BF16.
+                float peak = 0;
+                for (int j = 0; j < w.cols; ++j) peak = std::max(peak, std::abs(x[j]));
+                scales[i] = peak / 3.f;
+                const double inverse = scales[i] ? 1. / scales[i] : 0.;
+                for (int j = 0; j < w.cols; ++j) dst[j] = Float32ToBFloat16RNEBits(float(x[j] * inverse));
+            } else {
+                std::transform(x, x + w.cols, dst, Float32ToBFloat16RNEBits);
+            }
         }
-    } else {
-        std::transform(input.begin(), input.end(), bf16.begin(), Float32ToBFloat16RNEBits);
     }
+};
+
+void hostProjection(const Projection &w, const std::vector<CpuExpertGroup> &groups,
+                    HostProjectionInput &input, std::vector<float> &output) {
     auto *pool = GetAlivePool();
     const auto interval = pool->curActivateThreadInterval;
     std::vector<std::vector<int>> workers;
@@ -73,7 +91,7 @@ void hostProjection(const Projection &w, const std::vector<CpuExpertGroup> &grou
     for (const auto &v : workers) count += v.size();
     tasks.reserve(count);
     for (size_t n = 0; n < workers.size(); ++n) for (size_t t = 0; t < workers[n].size(); ++t) {
-        tasks.emplace_back(w, groups, scales.data(), bf16.data(), output.data(), n, workers.size(), t, workers[n].size());
+        tasks.emplace_back(w, groups, input.scales.data(), input.bf16.data(), output.data(), n, workers.size(), t, workers[n].size());
         pool->PushOp(workers[n][t], &tasks.back());
     }
     for (const auto &v : workers) for (int t : v) pool->Wait(t);
@@ -385,14 +403,17 @@ class HostExperts final : public RoutedExperts {
         if (cpu) {
             std::vector<float> hostPair(size_t(cpu) * 2 * inter), hostMid(size_t(cpu) * inter), hostOut(size_t(cpu) * h);
             auto started = Clock::now();
-            hostProjection(gate, cpuGroups, hostIn, hostPair);
+            HostProjectionInput input;
+            input.prepare(gate, hostIn.data(), cpu);
+            hostProjection(gate, cpuGroups, input, hostPair);
             double cpuUs = std::chrono::duration<double, std::micro>(Clock::now() - started).count();
             Matrix pair(cpu, 2 * inter), mid(cpu, inter);
             check(cudaMemcpy(pair.p, hostPair.data(), hostPair.size() * sizeof(float), cudaMemcpyHostToDevice));
             quantizeInto(RoutedSiTU<float>{pair.p, routeScore.p + gpu, gateCap, upCap}, mid.p, cpu, inter, gate.fp4, smCount);
             check(cudaMemcpy(hostMid.data(), mid.p, hostMid.size() * sizeof(float), cudaMemcpyDeviceToHost));
             started = Clock::now();
-            hostProjection(down, cpuGroups, hostMid, hostOut);
+            input.prepare(down, hostMid.data(), cpu);
+            hostProjection(down, cpuGroups, input, hostOut);
             cpuUs += std::chrono::duration<double, std::micro>(Clock::now() - started).count();
             HybridMoeRoutes::ObserveCpu(timing, rows, cpu, cpuUs);
             check(cudaMemcpy(parts.p + size_t(gpu) * h, hostOut.data(), hostOut.size() * sizeof(float), cudaMemcpyHostToDevice));
