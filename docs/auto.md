@@ -19,7 +19,7 @@ ftllm server /path/to/model --auto
 | Qwen4 / Qwen3.8-Flash-Next | 优先 `--auto`，见 [Flash-Next 指南](qwen3.8-flash-next/README.md) |
 | GLM-5.3-Flash | 优先 `--auto`，见 [GLM 指南](glm5.md) |
 | DeepSeek-V4.1 | 优先 `--auto`，见 [V4.1 指南](deepseek_v41.md) |
-| Inkling-2-Mini 原版及 GGUF | 使用 `--auto`。显存充足时优先多卡 TP，只有一张合适的卡时使用单卡。全 GPU 放不下时，使用单卡加主存专家，并自动分配显存专家缓存。 |
+| Inkling-2-Mini 原版及 GGUF | 使用 `--auto`。显存充足时优先多卡 TP，只有一张合适的卡时使用单卡。全 GPU 放不下时，使用单卡加主存专家，并自动分配显存专家缓存。主模型 KV 默认 FP16，可用 `--kv_cache_dtype fp8_e4m3` 将全局和滑窗 KV 页的占用减半。DSpark 草稿 KV 仍按 FP16 规划。 |
 | Clover-35B-A3B-Preview | 原版 BF16、单张 SM80+ GPU、串行请求，见 [Clover 指南](clover.md) |
 | DeepSeek-V4、Kimi-K3、Dots3-Note、Laguna、GLM-5/5.2 | 尚未接入运行时自动规划，使用各自指南的手动命令 |
 

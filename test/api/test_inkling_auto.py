@@ -65,6 +65,22 @@ class InklingAutoTest(unittest.TestCase):
         self.assertLessEqual(max(plan["weight_bytes_per_rank"] + plan["kv_bytes_per_rank"] +
                                  plan["workspace_bytes_per_rank"], plan["root_load_peak_bytes"]) + args.moe_cuda_cache, 10 * mem.GiB)
 
+    def test_fp8_target_kv_budget(self):
+        options = ("--max_context_length", "8192", "--max_batch", "2")
+        def kv(dtype, *extra):
+            return self.plan(*options, "--kv_cache_dtype", dtype, *extra, n=1)[1]["kv_bytes_per_rank"]
+        half = kv("float16")
+        for dtype in ("fp8", "float8", "fp8_e4m3"):
+            self.assertEqual(2 * kv(dtype), half)
+        draft = dict(num_hidden_layers=3, local_layer_ids=[0, 2], num_attention_heads=24,
+                     num_key_value_heads=8, head_dim=128, intermediate_size=9216,
+                     sliding_window_size=1024, block_size=8, target_layer_ids=[5, 23, 41, 48])
+        with patch.object(ink, "_draft_budget", return_value=(draft, 0)):
+            half = kv("float16", "--dspark", "7")
+            fp8 = kv("fp8_e4m3", "--dspark", "7")
+        draft_bytes = ink._kv_bytes(16384, 2, 128, 8, 128, 2, 1, 2, 1032, 7)
+        self.assertEqual(2 * fp8 - half, draft_bytes)
+
     def test_explicit_settings_and_failure(self):
         args, plan = self.plan("--device", "cuda:1", "--moe_device", "cpu", "--moe_cuda_cache", "2g",
                                "--max_batch", "2", "--tokens", "32768", "--max_context_length", "8192",

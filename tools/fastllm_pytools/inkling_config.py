@@ -276,9 +276,10 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
         while contexts[-1] > 8192:
             contexts.append(max(8192, contexts[-1] // 2))
     page = args.page_size if args.page_size > 0 else 128
-    unit = {"auto": 2, "float16": 2, "bfloat16": 2, "float32": 4}.get(args.kv_cache_dtype)
+    unit = {"auto": 2, "float16": 2, "bfloat16": 2, "float32": 4,
+            "fp8": 1, "float8": 1, "fp8_e4m3": 1}.get(args.kv_cache_dtype)
     if not unit:
-        raise ValueError("Inkling KV requires float16, bfloat16 or float32")
+        raise ValueError("Inkling KV requires float16, bfloat16, float32 or fp8_e4m3")
     graph = cuda_graph_enabled()
     dense = w.replicated + w.sharded
     decode_rows = batch * (args.dspark + 1)

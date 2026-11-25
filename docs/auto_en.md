@@ -19,7 +19,7 @@ The runtime planner currently targets Linux with NVIDIA CUDA. It reads model met
 | Qwen4 / Qwen3.8-Flash-Next | Prefer `--auto`; see the [Flash-Next guide](qwen3.8-flash-next/README_EN.md) |
 | GLM-5.3-Flash | Prefer `--auto`; see the [GLM guide](glm5_en.md) |
 | DeepSeek-V4.1 | Prefer `--auto`; see the [V4.1 guide](deepseek_v41_en.md) |
-| Inkling-2-Mini native and GGUF | Use `--auto`. It prefers tensor parallelism across compatible GPUs, uses one GPU if only one fits, and falls back to a single GPU with host experts and a GPU expert cache when the full model does not fit. |
+| Inkling-2-Mini native and GGUF | Use `--auto`. It prefers tensor parallelism across compatible GPUs, uses one GPU if only one fits, and falls back to a single GPU with host experts and a GPU expert cache when the full model does not fit. The target defaults to FP16 KV. Use `--kv_cache_dtype fp8_e4m3` to halve global and sliding-window KV page storage. DSpark draft KV uses FP16. |
 | DeepSeek-V4, Kimi-K3, Dots3-Note, Laguna, GLM-5/5.2 | Not integrated with the runtime planner; use their manual deployment guides |
 
 Inference support does not imply `--auto` support. CPU-only, Windows, and ROCm deployments use the corresponding manual configuration.
