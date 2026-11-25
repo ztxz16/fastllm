@@ -2130,7 +2130,8 @@ class Decoder final : public Runtime {
         }
         if (c.draft.steps) {
             const bool bf16 = placement.denseType == BFLOAT16;
-            // Each draft plan retains a batch-specific vocabulary distribution.
+            proposalBatch = 0;
+            // Descending shapes reuse the largest plan's sampling storage.
             // TP and memory-limited warmups prepare other sizes on demand.
             const int warmBatch = !limitRoundPlans && placement.world == 1 && placement.tensorDevices.empty()
                                   ? std::max(1, model.maxBatch) : 1;

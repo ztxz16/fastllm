@@ -129,6 +129,8 @@ bool FastllmCudaMtpVerifierResolve(void *plan, int *output, int *accepted);
 
 // Shared implementation between the normalization and rejection CUDA units.
 void *FastllmCudaMtpCreateTargetDistribution(int rows, int vocab);
+// Independent graph arguments over serially reused sampling scratch.
+void *FastllmCudaMtpCreateGraphDistribution(int rows, int vocab, void *reuse);
 void FastllmCudaMtpBindProposalSupport(void *workspace, float *probs, int *ids, int steps);
 void FastllmCudaMtpDestroyTargetDistribution(void *distribution);
 bool FastllmCudaMtpPrepareTargetDistribution(void *distribution,

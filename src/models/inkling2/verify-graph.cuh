@@ -22,8 +22,9 @@ void rejectDraft(RoundPlan &p, float *logits, const int *tokenMap = nullptr) {
 template <class T> void verifyBody(RoundPlan &p) {
     const int b = p.batch, chain = p.chain, rows = b * chain, slots = c.visits.size();
     const int kv = c.kvHeads * c.headDim, h = c.hidden, depth = c.conv - 1;
+    Buffer<float> panels(size_t(b) * slots * (depth + chain) * 2 * (kv + h));
     int *accepted = p.result.p + rows;
-    verifyHistories<false><<<dim3(slots * b, 4), 256, 0, cudaStreamPerThread>>>(p.source.p, p.visits.p, p.panels.p,
+    verifyHistories<false><<<dim3(slots * b, 4), 256, 0, cudaStreamPerThread>>>(p.source.p, p.visits.p, panels.p,
                                                                                 nullptr, b, chain, depth, kv, h);
     std::vector<Segment> segments(b);
     for (int i = 0; i < b; ++i) segments[i] = {nullptr, i * chain, chain, nullptr, nullptr, p.visits.p};
@@ -32,7 +33,7 @@ template <class T> void verifyBody(RoundPlan &p) {
     std::vector<Matrix> features;
     target(p.ids.p, rows, segments, logits, &features, {}, tokenMap.p ? p.temperature.p + b : nullptr, tokenMap.p);
     rejectDraft(p, logits.p, tokenMap.p);
-    verifyHistories<true><<<dim3(slots * b, 4), 256, 0, cudaStreamPerThread>>>(p.source.p, p.visits.p, p.panels.p,
+    verifyHistories<true><<<dim3(slots * b, 4), 256, 0, cudaStreamPerThread>>>(p.source.p, p.visits.p, panels.p,
                                                                                accepted, b, chain, depth, kv, h);
 
     const auto &d = c.draft;
@@ -175,7 +176,7 @@ void prepareWindowVerification(int batch) {
 
 template <class T> RoundPlan &roundPlan(int batch, bool bounded = false) {
     const bool tp = placement.world > 1 || !placement.tensorDevices.empty();
-    const bool limited = tp || limitRoundPlans;
+    const bool limited = tp || limitRoundPlans || !GetFastllmEnv().cudaGraph;
     const bool persistent = !limited || batch == 1 || batch == model.maxBatch;
     if (limited && roundPlans.find(batch) == roundPlans.end()) {
         // Each shape owns full-vocabulary draft and rejection workspaces. A
@@ -203,6 +204,7 @@ template <class T> RoundPlan &roundPlan(int batch, bool bounded = false) {
         plan.reset();
     }
     if (!plan) {
+        proposalBatch = 0; // Warmup can write the shared q before capture completes.
         if (timelineCompatible(batch)) prepareWindowVerification(batch);
         const bool nativeProjections = batch == 1 && !quantizedFold && decodePdlSupported &&
             std::is_same_v<T, __nv_bfloat16> && GetFastllmEnv().cudaGraph;
@@ -211,7 +213,9 @@ template <class T> RoundPlan &roundPlan(int batch, bool bounded = false) {
                           std::none_of(c.draft.local.begin(), c.draft.local.end(), [](bool v) { return v; })) &&
             std::all_of(placement.experts.begin(), placement.experts.end(), [](auto d) { return d == ExpertDevice::Cuda; });
         if (!previousCounter) seed = placement.world > 1 ? requestSeed ^ uint64_t(batch) : newSamplingSeed();
-        auto entry = std::make_unique<RoundPlan>(batch, c, nativeProjections, earlyPublication, seed, targetVocab);
+        auto larger = roundPlans.upper_bound(batch);
+        auto entry = std::make_unique<RoundPlan>(batch, c, nativeProjections, earlyPublication, seed, targetVocab,
+                                                larger == roundPlans.end() ? nullptr : larger->second.get());
         entry->draftPool.ShareStorage(roundScratch);
         entry->verifyPool.ShareStorage(roundScratch);
         if (persistent && GetFastllmEnv().cudaGraph && timelineCompatible(batch)) {
@@ -286,6 +290,10 @@ std::vector<int> verifyRound(const std::vector<Segment> &batch, const float *anc
             return s.top_k > 0 && s.top_k <= shardCandidates && std::isfinite(s.temperature) && s.temperature > 0.f;
         });
     auto &p = roundPlan<T>(b, bounded);
+    // A different shape may have written the same q matrix. Its sparse support
+    // cannot be used to clear this plan's previous nonzero probabilities.
+    if (proposalBatch != b) p.resetProposalSupport();
+    proposalBatch = b;
     const bool sameBatch = publishedPlan == &p && int(publicationOwners.size()) == b &&
         std::equal(batch.begin(), batch.end(), publicationOwners.begin(),
                    [](const Segment &s, const auto &owner) { return s.request == owner.lock().get(); });

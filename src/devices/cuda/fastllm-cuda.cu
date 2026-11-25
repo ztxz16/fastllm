@@ -18245,6 +18245,8 @@ struct FastllmMtpSamplingWorkspace {
     bool uniformTemperature = true, uniformTopP = true, uniformTopK = true;
     float scalarTemperature = 1.0f, scalarTopP = 1.0f;
     int scalarTopK = 0;
+    std::shared_ptr<uint8_t> graphStorage;
+    size_t graphBytes = 0;
     uint32_t *pinnedParameters = nullptr;
     std::vector<uint32_t> savedParameters;
     uint64_t parameterVersion = 0;
@@ -18258,7 +18260,8 @@ struct FastllmMtpSamplingWorkspace {
     bool cooperativeProposal = false;
     FastllmMtpTopPState *topPState = nullptr;
     float2 *topPCuts = nullptr;
-    explicit FastllmMtpSamplingWorkspace(int rows, int vocab, bool dedicated = false, bool resident = false)
+    explicit FastllmMtpSamplingWorkspace(int rows, int vocab, bool dedicated = false, bool resident = false,
+                                        const FastllmMtpSamplingWorkspace *reuse = nullptr)
         : vocab(vocab), capacity(rows), rows(rows), dedicated(dedicated), resident(resident) {
         size_t need = 0;
         auto reserve = [&](size_t bytes) {
@@ -18294,8 +18297,18 @@ struct FastllmMtpSamplingWorkspace {
         size_t tp = compactTopP ? reserve(rows * sizeof(FastllmMtpTopPState)) : 0;
         size_t tc = compactTopP ? reserve(rows * sizeof(float2)) : 0;
         size_t bytes = 0;
-        if (dedicated || resident) {
-            if (cudaMalloc(&scratch, need) == cudaSuccess) bytes = need;
+        if (reuse && reuse->graphBytes >= need) {
+            graphStorage = reuse->graphStorage;
+            scratch = graphStorage.get();
+            bytes = graphBytes = reuse->graphBytes;
+        } else if (dedicated || resident) {
+            if (cudaMalloc(&scratch, need) == cudaSuccess) {
+                bytes = need;
+                if (resident) {
+                    graphStorage.reset(scratch, [](uint8_t *p) { FastllmCudaCheckedFree(p); });
+                    graphBytes = bytes;
+                }
+            }
         } else {
             scratch = (uint8_t*)FastllmBorrowDequantScratch(need, &bytes, &own);
         }
@@ -18318,8 +18331,8 @@ struct FastllmMtpSamplingWorkspace {
         }
     }
     ~FastllmMtpSamplingWorkspace() {
-        if (dedicated || resident) FastllmCudaCheckedFree(scratch);
-        else FastllmReleaseDequantScratch(scratch, own);
+        if (dedicated) FastllmCudaCheckedFree(scratch);
+        else if (!resident) FastllmReleaseDequantScratch(scratch, own);
         cudaFreeHost(pinnedParameters);
     }
     bool UploadParameters(const float *hostTemperatures,
@@ -18970,8 +18983,12 @@ bool FastllmCudaMtpRejectionSamplingTopKFirst(float *logits, float *proposalProb
 }
 
 void *FastllmCudaMtpCreateTargetDistribution(int rows, int vocab) {
+    return FastllmCudaMtpCreateGraphDistribution(rows, vocab, nullptr);
+}
+void *FastllmCudaMtpCreateGraphDistribution(int rows, int vocab, void *reuse) {
     if (rows <= 0 || vocab <= 0) return nullptr;
-    auto *ws = new FastllmMtpSamplingWorkspace(rows, vocab, false, true);
+    auto *ws = new FastllmMtpSamplingWorkspace(rows, vocab, false, true,
+                                               static_cast<FastllmMtpSamplingWorkspace *>(reuse));
     if (!ws->scratch) { delete ws; return nullptr; }
     return ws;
 }

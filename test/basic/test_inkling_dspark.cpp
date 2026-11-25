@@ -309,7 +309,9 @@ static void checkDraftBatch(basellm &model, GenerationConfig sample) {
     const int vocab = testVocab;
     std::vector<float> reference[2];
     double maxError = 0, maxProbabilityError = 0;
-    for (const auto indices : {std::vector<int>{0, 1}, std::vector<int>{0}, std::vector<int>{1}}) {
+    // Return to the previously captured batch after singleton graphs reused its q storage.
+    for (const auto indices : {std::vector<int>{0, 1}, std::vector<int>{0}, std::vector<int>{1},
+                               std::vector<int>{0, 1}}) {
         const int count = indices.size();
         std::vector<ResponseContext> ctx(count);
         std::vector<int> past(count), token(count);
@@ -389,7 +391,7 @@ static void checkDraftBatch(basellm &model, GenerationConfig sample) {
                             std::max(maxProbabilityError,
                                      std::abs(q[ids[j]] - (weights[j] >= minWeight ? weights[j] / kept : 0.)));
                     auto &saved = reference[indices[b]];
-                    if (count == 2)
+                    if (saved.size() == size_t(round * 7 + i) * vocab)
                         saved.insert(saved.end(), scores, scores + vocab);
                     else {
                         auto first = saved.begin() + size_t(round * 7 + i) * vocab;

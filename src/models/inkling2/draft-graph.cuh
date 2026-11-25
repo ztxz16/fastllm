@@ -37,21 +37,19 @@ struct RoundPlan {
     cudaGraphExec_t draftExec = nullptr, verifyExec = nullptr;
     DecodeGraphScratch draftPool, verifyPool;
     Buffer<DecodeVisit> source, visits;
-    Buffer<float> panels;
     std::vector<int> nextAnchor, nextPast;
     RoundHostVector<DraftInput> hostInputs;
     RoundHostVector<uint64_t> hostSeeds;
     RoundHostVector<DraftView> draftViews;
     RoundHostVector<DecodeVisit> descriptors;
-    RoundPlan(int b, const Config &c, bool nativeProjections, bool earlyPublication, uint64_t seed, int targetWidth)
+    RoundPlan(int b, const Config &c, bool nativeProjections, bool earlyPublication, uint64_t seed, int targetWidth, RoundPlan *larger)
         : batch(b), steps(c.draft.steps), chain(steps + 1), targetVocab(targetWidth), views(b * c.draft.layers), inputs(b),
           temperature(b * chain + b), topP(b * chain + b), ids(b * chain), topK(b * chain + b), tokens(b * chain),
           draftIds(b * steps), live(b), result(b * (chain + 1)), seeds(steps), counter(1),
-          partials(FastllmCudaMtpGraphRejectBytes(b, c.vocab)), probs(b * steps, c.vocab),
+          partials(FastllmCudaMtpGraphRejectBytes(b, c.vocab)), probs(larger ? larger->probs.slice(0, b * steps) : Matrix(b * steps, c.vocab)),
           proposalSupport(b > 1 ? size_t(b) * steps * FastllmFoldSelection::maxCandidates : 0),
           groupPointers(nativeProjections ? 6 * c.draft.layers : 0), groups(nativeProjections ? c.draft.layers : 0), rejectSeed(seed), source(b * c.visits.size()),
           visits(b * chain * c.visits.size()),
-          panels(size_t(b) * c.visits.size() * (c.conv - 1 + chain) * 2 * (c.kvHeads * c.headDim + c.hidden)),
           nextAnchor(earlyPublication ? b : 0), nextPast(earlyPublication ? b : 0), hostInputs(b), hostSeeds(steps),
           draftViews(b * c.draft.layers), descriptors(b * c.visits.size()) {
         check(cudaMemsetAsync(counter.p, 0, sizeof(*counter.p), cudaStreamPerThread));
@@ -59,16 +57,20 @@ struct RoundPlan {
             groups[i].device = groupPointers.p + 6 * i;
         }
         if (earlyPublication) publication.allocate(size_t(b) * (chain + 1), steps);
-        if (proposalSupport.p) check(cudaMemsetAsync(proposalSupport.p, 0xfe, size_t(b) * steps *
-                FastllmFoldSelection::maxCandidates * sizeof(int), cudaStreamPerThread));
-        sampler = FastllmCudaMtpCreateTargetDistribution(b, c.vocab);
-        targetSampler = FastllmCudaMtpCreateTargetDistribution(b * chain, targetVocab);
+        resetProposalSupport();
+        sampler = FastllmCudaMtpCreateGraphDistribution(b, c.vocab, larger ? larger->sampler : nullptr);
+        targetSampler = FastllmCudaMtpCreateGraphDistribution(b * chain, targetVocab,
+                                                              larger ? larger->targetSampler : nullptr);
         if (!sampler || !targetSampler) {
             FastllmCudaMtpDestroyTargetDistribution(sampler);
             FastllmCudaMtpDestroyTargetDistribution(targetSampler);
             throw CudaWorkspaceExhausted("Insufficient sampling workspace for Inkling DSpark");
         }
         if (proposalSupport.p) FastllmCudaMtpBindProposalSupport(sampler, probs.p, proposalSupport.p, steps);
+    }
+    void resetProposalSupport() {
+        if (proposalSupport.p) check(cudaMemsetAsync(proposalSupport.p, 0xfe, size_t(batch) * steps *
+                FastllmFoldSelection::maxCandidates * sizeof(int), cudaStreamPerThread));
     }
     ~RoundPlan() {
         if (draftExec) cudaGraphExecDestroy(draftExec);
@@ -79,6 +81,7 @@ struct RoundPlan {
 };
 DecodeGraphScratch roundScratch;
 bool limitRoundPlans = false;
+int proposalBatch = 0;
 std::map<int, std::unique_ptr<RoundPlan>> roundPlans;
 RoundPlan *publishedPlan = nullptr;
 bool draftQueued = false;
