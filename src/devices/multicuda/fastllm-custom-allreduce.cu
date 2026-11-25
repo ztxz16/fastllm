@@ -16,6 +16,10 @@
 #include "fastllm-draft-sm120.h"
 #include "naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-naive-verify.h"
+#include "devices/cuda/naive-n05-swa-verify.cuh"
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+#include "devices/cuda/naive-n05-dp-dsa-verify.cuh"
+#endif
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -4280,10 +4284,54 @@ bool FastllmCudaPackedVerifySupported(int rows, int ranks) {
 #endif
 }
 
+// A replicated attention rank owns the entire output projection. The caller still
+// performs its ordinary residual and norm after any required DP row exchange.
+static bool RunReplicaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x) {
+    const auto &c = x.config;
+    if (x.branch || !x.projectionScratch || !x.qkv || x.requests.size() != 1 ||
+        x.requests.front() < 2 || x.requests.front() > 8 || x.caches.size() != x.requests.front() ||
+        c.heads != 64 || c.headDim != 192 || c.valueDim != 128 || c.rotaryDim != 64) return false;
+    const auto &cache = x.caches.front();
+    if (!cache.key || !cache.value || !cache.cache) return false;
+    if (x.sliding) {
+        if (c.kvHeads != 8 || c.window != 128) return false;
+    } else {
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+        if (c.kvHeads != 4 || x.indexHeads != 16 || x.indexDim != 128 || x.topK != 2048 ||
+            !x.fp8Query || x.fp8IndexerCache || x.capacity <= 8192 || x.capacity > 65536) return false;
+#else
+        return false;
+#endif
+    }
+    const auto *projection = FastllmCudaGetMxfp8ProjectionBackend();
+    if (!projection) return false;
+    const int rows = x.requests.front();
+    auto packed = projection->Borrow(*x.outputWeight, rows, *x.projectionScratch);
+    if (!packed.Matches(rows, c.heads * c.valueDim)) return false;
+    if (!projection->TryProject(x.qkvActivation, *x.normed, *x.qkvWeight, *x.qkvBias, *x.qkv, true))
+        fastllm::Linear(*x.normed, *x.qkvWeight, *x.qkvBias, *x.qkv);
+    bool ready = false;
+    if (x.sliding)
+        ready = FastllmCudaTryPackedSwaVerify(*x.qkv, *x.positions, *x.live, cache, *x.sink,
+            c.heads, c.kvHeads, x.theta, x.valueScale, packed, *x.attention, projection->projectPdl != nullptr);
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+    else
+        ready = FastllmCudaTryDpDSAVerify(*x.normed, *x.qkv, *x.indexKeyWeight, *x.indexQueryWeight,
+            *x.indexWeight, *x.indexNorm, *x.indexBias, *x.sink, *x.positions, *x.live,
+            *cache.key, *cache.value, cache.cache, x.capacity, x.theta, x.valueScale,
+            packed, *x.scratch, *x.attention, true);
+#endif
+    if (!ready) return false;
+    if (!projection->TryProject(packed, *x.attention, *x.outputWeight, fastllm::Data(), *x.projected, true))
+        fastllm::Linear(*x.attention, *x.outputWeight, fastllm::Data(), *x.projected);
+    return true;
+}
+
 FastllmVerifyOutput FastllmCudaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x, int device,
                                                const FastllmMoePreparedInput *prepared) {
     using Result = FastllmVerifyOutput;
     const auto &cfg = x.config;
+    if (x.replica) return RunReplicaVerifyAttention(x) ? Result::Projected : Result::Unsupported;
     const bool verifyShape = cfg.heads == 8 && cfg.kvHeads == 1 && cfg.headDim == 192 &&
                              cfg.valueDim == 128 && cfg.rotaryDim == 64;
     if (!x.sliding && !verifyShape) return Result::Unsupported;
@@ -4316,7 +4364,7 @@ FastllmVerifyOutput FastllmCudaVerifyAttention(const FastllmNaiveVerifyAttention
             row.liveKeys = static_cast<const int *>(x.live->cudaData) + i;
         }
         FastllmNaiveVerifyIndexerSm120 indexer{x.indexQueryWeight, x.indexKeyWeight, x.indexWeight,
-            x.indexNorm, x.indexBias, x.indices, x.attentionRank, x.fp8Query};
+            x.indexNorm, x.indexBias, x.indices, x.attentionRank, x.fp8IndexerCache};
         const bool deferNorm = x.sliding && x.deferPostNorm;
         if (!RunPackedVerifyAttention(*x.normed, *x.qkvWeight, *x.qkvBias, *x.outputWeight,
                 *x.postNorm, *x.sink, *x.positions, *x.query, *x.attention, *x.projected, *x.hidden,

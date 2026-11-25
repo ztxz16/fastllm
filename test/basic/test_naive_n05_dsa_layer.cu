@@ -478,7 +478,12 @@ void Tp(bool fp8, bool mx = false) {
             Cuda(cudaDeviceSynchronize());
         });
         Parallel([&](int r) {
-            Require(FastllmCudaNaiveDSALayer(cases[r]->input, r), "TP launch rejected");
+            FastllmNaiveVerifyAttentionInput verify;
+            static_cast<FastllmNaiveDSALayerInput &>(verify) = cases[r]->input;
+            verify.config = {8, 1, 192, 128, 64, 0, verify.eps, verify.theta, verify.valueScale};
+            verify.fp8IndexerCache = fp8;
+            Require(FastllmCudaVerifyAttention(verify, r, nullptr) == FastllmVerifyOutput::Normalized,
+                    "TP verification dispatch rejected the index query/cache combination");
             Cuda(cudaDeviceSynchronize());
         });
         Parallel([&](int r) {

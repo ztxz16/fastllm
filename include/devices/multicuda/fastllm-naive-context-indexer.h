@@ -12,17 +12,17 @@ bool FastllmCudaStablePrefillReduction(const std::vector<int> &architectures);
 bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime);
 
 struct NaiveVerifyAttentionPlan {
-    bool packed = false, swa = false, dsa = false;
+    bool packed = false, swa = false, dsa = false, replica = false, replicaDsa = false;
     struct Layer {
-        bool packed, swa, dsa;
-        explicit operator bool() const { return packed || swa || dsa; }
+        bool packed, swa, dsa, replica;
+        explicit operator bool() const { return packed || swa || dsa || replica; }
     };
     Layer ForLayer(bool sliding, bool residual, bool localIndexer, bool packedCache,
                    bool ringCache, bool contextIndex) const;
 };
 NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, bool packed,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
-        int capacity, int indexHeads, int indexDim, int topK);
+        int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks = 0);
 using IndexerGather = std::function<void(const void *, void *, size_t)>;
 void RunContextVerifyIndexer(const Data &query, const Data &weights,
         const std::vector<FastllmNaiveVerifyIndexerItem> &items,

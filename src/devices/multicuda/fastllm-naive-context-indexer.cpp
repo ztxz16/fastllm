@@ -28,9 +28,14 @@ bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime) {
 
 NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, bool packed,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
-        int capacity, int indexHeads, int indexDim, int topK) {
+        int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks) {
     NaiveVerifyAttentionPlan plan{packed};
 #ifndef USE_ROCM
+    if (localAttentionRanks == 1) {
+        const int arch = FastllmCudaRuntimeArch();
+        plan.replica = arch == 100 || arch == 103;
+        plan.replicaDsa = arch == 103 && localDsa;
+    }
     if (requests && integratedExperts) {
         plan.swa = ringCache && rows <= 16 && FastllmCudaSwaVerifyLayerSupported(device, rows);
         plan.dsa = localDsa && FastllmCudaLocalDsaLayerSupported(*requests, rows, capacity, indexHeads, indexDim, topK);
@@ -41,7 +46,8 @@ NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, bo
 NaiveVerifyAttentionPlan::Layer NaiveVerifyAttentionPlan::ForLayer(bool sliding, bool residual, bool localIndexer,
         bool packedCache, bool ringCache, bool contextIndex) const {
     return {packed && packedCache && (sliding ? ringCache : !residual && localIndexer && contextIndex),
-            sliding && residual && swa, !sliding && localIndexer && dsa};
+            sliding && residual && swa, !sliding && localIndexer && dsa,
+            replica && packedCache && !residual && (sliding ? ringCache : replicaDsa && localIndexer)};
 }
 
 static void GatherContextCandidates(Data &exchange, int part, int rank, int ranks, int gpu,
