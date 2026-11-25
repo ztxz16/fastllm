@@ -60,6 +60,9 @@
 #include "sampling.cuh"
 #include "devices/cuda/fastllm-fold-sampling.cuh"
 #include "sampling/fastllm-markov-proposal.cuh"
+#ifndef USE_ROCM
+#include "sampling/fastllm-draft-owner-head.cuh"
+#endif
 
 const float *FastllmCudaBFloat16SiluTable() {
     const int device = FastllmCudaGetDevice();
@@ -18382,9 +18385,8 @@ struct FastllmMtpSamplingWorkspace {
         return flashinfer::sampling::TopPRenormProb<float>(input, output, thresholds, rows, scalar, vocab, stream,
                                                            topPCuts);
     }
-    bool Normalize(float *logits, int rows, int vocab) {
-        // A captured graph must always bind the same input/output scratch buffers.
-        a = bufferA;
+    bool Normalize(float *logits, int rows, int vocab, float *output = nullptr) {
+        a = output ? output : bufferA;
         float *b = bufferB;
         cudaStream_t stream = cudaStreamPerThread;
         if (topKFirst && needTopK) {
@@ -18521,6 +18523,52 @@ bool FastllmCudaMtpPrepareDraftReplay(void *sampler, float *deviceAnchors, int r
     }
     return true;
 }
+bool FastllmCudaMtpTryOwnerHead(void *sampler, const void *base, const void *embedding,
+        const void *weight, float *ids, float *probabilities, int vocab, int steps) {
+#ifndef USE_ROCM
+    using namespace fastllm_draft_owner;
+    if (!sampler || !base || !embedding || !weight || !ids || !probabilities || steps < 1 ||
+        vocab < 65536 || vocab % 32) return false;
+    auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
+    if (!ws.dedicated || ws.rows != 1 || ws.vocab != vocab || ws.needTopK || ws.needTopP)
+        return false;
+    const int device = FastllmCudaGetDevice();
+    static thread_local int cachedDevice = -1, capacity = 0;
+    if (cachedDevice != device) {
+        cudaDeviceProp props{};
+        checkCudaErrors("Draft head device properties", cudaGetDeviceProperties(&props, device));
+        capacity = 0;
+        if (props.major >= 8 && props.cooperativeLaunch) {
+            cudaFuncAttributes image{};
+            const auto status = cudaFuncGetAttributes(&image, FusedDraftHeadProposal);
+            if (status == cudaErrorInvalidDeviceFunction || status == cudaErrorNoKernelImageForDevice) {
+                cudaGetLastError();
+            } else {
+                checkCudaErrors("Draft head image", status);
+                if (image.ptxVersion >= 80) {
+                    int active = 0;
+                    checkCudaErrors("Draft head occupancy", cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                        &active, FusedDraftHeadProposal, Threads, 0));
+                    capacity = active * props.multiProcessorCount;
+                }
+            }
+        }
+        cachedDevice = device;
+    }
+    // Keep a contiguous vocabulary span per CTA; grid-wide barriers require residency.
+    const int blocks = (vocab - 1) / Tile + 1;
+    if (blocks > capacity) return false;
+    Proposal args{static_cast<const B *>(base), static_cast<const B *>(embedding),
+        static_cast<const B *>(weight), ws.temperatures, ws.seed, ids, probabilities,
+        reinterpret_cast<float2 *>(ws.bufferB), vocab, steps};
+    void *params[]{&args};
+    checkCudaErrors("Fused draft head launch", cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(FusedDraftHeadProposal),
+        blocks, Threads, params, 0, cudaStreamPerThread));
+    return true;
+#else
+    return false;
+#endif
+}
 bool FastllmCudaMtpDraftSamplerSetSeed(void *sampler) {
     if (!sampler) return false;
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
@@ -18539,11 +18587,10 @@ bool FastllmCudaMtpDraftSamplerRunBatch(void *sampler, float *logits, float *pro
 static bool FastllmMtpSampleProposal(FastllmMtpSamplingWorkspace &ws, float *probs,
         int *sampleRows, float *deviceToken, uint64_t offset) {
     const cudaStream_t stream = cudaStreamPerThread;
-    // One proposal row uses no index array. FlashInfer can write the sampled
-    // vocabulary ID directly in the representation consumed by the next step.
-    if (ws.cooperativeProposal && ws.rows == 1 && !sampleRows)
+    if (!sampleRows) {
         return flashinfer::sampling::SamplingFromProb<float, float, 1>(probs, deviceToken, ws.valid,
-            nullptr, 1, ws.vocab, true, ws.seed, 0, nullptr, offset, stream) == cudaSuccess;
+            nullptr, ws.rows, ws.vocab, true, ws.seed, 0, nullptr, offset, stream) == cudaSuccess;
+    }
     if (flashinfer::sampling::SamplingFromProb<float, int, 1>(probs, ws.output, ws.valid,
             sampleRows, ws.rows, ws.vocab, true, ws.seed, 0, nullptr, offset, stream) != cudaSuccess) return false;
     FastllmMtpSampleIdToFloat<<<(ws.rows + 127) / 128, 128, 0, stream>>>(ws.output, deviceToken, ws.rows);
@@ -18561,7 +18608,14 @@ bool FastllmCudaMtpDraftSamplerRunBatchStrided(void *sampler, float *logits, flo
     if (!sampler || !logits || !proposalProbs || !deviceToken) return false;
     auto &ws = *static_cast<FastllmMtpSamplingWorkspace *>(sampler);
     if (!probabilityStride) probabilityStride = ws.vocab;
-    if (probabilityStride < ws.vocab || !ws.Normalize(logits, ws.rows, ws.vocab)) return false;
+    if (probabilityStride < ws.vocab) return false;
+    // An unfiltered contiguous proposal can be normalized directly into the
+    // rejection sampler's retained q. Preserve staging for overlapping views.
+    const uintptr_t x = reinterpret_cast<uintptr_t>(logits), q = reinterpret_cast<uintptr_t>(proposalProbs);
+    const bool direct = !ws.needTopK && !ws.needTopP && (ws.rows == 1 || probabilityStride == ws.vocab) &&
+        (x < q ? q - x : x - q) >= size_t(ws.rows) * ws.vocab * sizeof(float);
+    if (!ws.Normalize(logits, ws.rows, ws.vocab, direct ? proposalProbs : nullptr)) return false;
+    if (direct) return FastllmMtpSampleProposal(ws, proposalProbs, nullptr, deviceToken, offset);
     return FastllmMtpRetainAndSample(ws, proposalProbs, deviceToken, offset, probabilityStride);
 }
 bool FastllmCudaMtpDraftSamplerRunBF16BiasBatch(void *sampler, const void *base, const void *bias,

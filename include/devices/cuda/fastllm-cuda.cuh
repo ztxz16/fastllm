@@ -2525,6 +2525,9 @@ bool FastllmCudaHalfMergeMOEGGUFBatch1(const fastllm::Data &input, fastllm::Data
                                        bool scoresOnCuda, int topk, int hidden, int inter);
 
 // Gather a single K=256 embedding row and multiply directly into a preallocated BF16 output.
+// Write a BF16 projection into a column range of an already peer-accessible device buffer.
+bool FastllmCudaTryBf16ColumnProjection(const fastllm::Data &input, const fastllm::Data &weight,
+        uint16_t *firstColumn, int rowPitch);
 bool FastllmCudaIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Data &table,
         const fastllm::Data &weight, fastllm::Data &output);
 bool FastllmCudaBFloat16MatMulBFloat16(const fastllm::Data &input, fastllm::Data &weight, const fastllm::Data &bias, fastllm::Data &output, int n, int m, int k);

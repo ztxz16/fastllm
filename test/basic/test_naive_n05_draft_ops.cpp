@@ -26,6 +26,29 @@ static std::vector<uint16_t> Bits(const Data &x) {
     return std::vector<uint16_t>((uint16_t *)host.cpuData, (uint16_t *)host.cpuData + host.Count(0));
 }
 
+#ifndef USE_ROCM
+static void ShardedProjection() {
+    constexpr int rows = 7, width = 128, columns = 96, offset = 32, pitch = 160;
+    auto input = BF({1, rows, width}, 9), weight = BF({columns, width}, 51);
+    Data packed = BF({1, rows, pitch}, 29), expected;
+    const auto before = Bits(packed);
+    MatMulTransB(input, weight, expected);
+    auto projection = Bits(expected);
+    auto *first = static_cast<uint16_t *>(packed.cudaData) + offset;
+    Require(!FastllmCudaTryBf16ColumnProjection(input, weight, first, columns - 1), "bad output pitch accepted");
+    Require(Bits(packed) == before, "invalid projection wrote output");
+    Require(FastllmCudaTryBf16ColumnProjection(input, weight, first, pitch), "column projection rejected");
+    auto result = Bits(packed);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < pitch; ++col) {
+            uint16_t value = col >= offset && col < offset + columns
+                ? projection[row * columns + col - offset] : before[row * pitch + col];
+            Require(result[row * pitch + col] == value, "sharded projection or adjacent columns changed");
+        }
+    }
+}
+#endif
+
 static void BatchSampling(int count, int vocab) {
     const int words = (vocab + 31) / 32;
     Data base = BF({1, count, vocab}, 51), bias = BF({1, count, vocab}, 103);
@@ -226,6 +249,51 @@ static void FusedBatchSampling(int count, int vocab, int steps) {
     cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); FastllmCudaMtpDestroyDraftSampler(sampler);
     std::cout << "FUSED PROPOSAL PASS rows=" << count << " vocab=" << vocab << " steps=" << steps << std::endl;
 }
+static void DirectDraftProbabilities(int rows, int vocab, int stride) {
+    Data logits = BF({rows, vocab}, 127);
+    ToDataType(logits, FLOAT32);
+    auto allocate = [](Data &v, const std::vector<int> &shape) {
+        v.dataType = FLOAT32; v.Resize(shape); v.ToDevice(DataDevice::CUDA, {0}, false); v.Allocate(true);
+    };
+    Data reference, direct, refIds, ids;
+    allocate(reference, {rows, vocab}); allocate(direct, {rows, stride});
+    allocate(refIds, {rows}); allocate(ids, {rows});
+    std::vector<float> temperatures(rows, 1.f), ps(rows, 1.f);
+    std::vector<int> ks(rows, 0);
+    auto *sampler = FastllmCudaMtpCreateDraftSamplerBatch(rows, vocab, temperatures.data(), ks.data(), ps.data());
+    Require(sampler != nullptr, "direct probability sampler");
+    auto run = [&]() {
+        // Overlapping input/output exercises the original staged normalization.
+        Require(cudaMemcpyAsync(reference.cudaData, logits.cudaData, logits.GetBytes(), cudaMemcpyDeviceToDevice,
+                cudaStreamPerThread) == cudaSuccess, "restore reference logits");
+        Require(FastllmCudaMtpDraftSamplerRunBatchStrided(sampler, (float *)reference.cudaData,
+                (float *)reference.cudaData, (float *)refIds.cudaData, 4, vocab), "staged probabilities");
+        Require(FastllmCudaMtpDraftSamplerRunBatchStrided(sampler, (float *)logits.cudaData,
+                (float *)direct.cudaData, (float *)ids.cudaData, 4, stride), "direct probabilities");
+    };
+    run();
+    void *graph = nullptr, *exec = nullptr;
+    Require(FastllmCudaGraphBeginCapture(), "direct probability capture"); run();
+    Require(FastllmCudaGraphEndCapture(&graph) && FastllmCudaGraphInstantiate(graph, &exec), "direct probability graph");
+    for (int replay = 0; replay < 3; ++replay) {
+        for (int row = 0; row < rows; ++row) temperatures[row] = .4f + .1f * (row + replay);
+        Require(FastllmCudaMtpDraftSamplerSetParameters(sampler, rows, temperatures.data(), ks.data(), ps.data()) &&
+                FastllmCudaMtpDraftSamplerSetSeed(sampler) && FastllmCudaGraphLaunch(exec), "direct probability replay");
+        Data actual(direct), expected(reference), a(ids), e(refIds);
+        for (auto *v : {&actual, &expected, &a, &e}) v->ToDevice(DataDevice::CPU);
+        Require(!std::memcmp(a.cpuData, e.cpuData, a.GetBytes()), "direct sampling changed RNG draws");
+        for (int row = 0; row < rows; ++row) {
+            const float *q = (const float *)actual.cpuData + size_t(row) * stride;
+            Require(!std::memcmp(q, (float *)expected.cpuData + size_t(row) * vocab, vocab * sizeof(float)),
+                    "direct probabilities differ");
+            double sum = 0; for (int i = 0; i < vocab; ++i) sum += q[i];
+            Require(std::abs(sum - 1.) < 1e-5, "invalid direct probability mass");
+            for (int i = vocab; i < stride; ++i) Require(q[i] == 0, "direct probability padding overwritten");
+        }
+    }
+    FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph); FastllmCudaMtpDestroyDraftSampler(sampler);
+}
+
 static void DraftReplayInputs() {
     const int capacity = 259, vocab = 17;
     std::vector<float> anchors(capacity), temperatures(capacity, 1), ps(capacity, 1);
@@ -268,10 +336,15 @@ int main() {
         int devices = 0;
         if (cudaGetDeviceCount(&devices) != cudaSuccess || !devices) return 77;
         ApplyDeviceMap({{"cuda:0", 1}}, 1, 1);
+#ifndef USE_ROCM
+        if (FastllmCudaRuntimeArch() >= 80) ShardedProjection();
+#endif
         for (int count : {1, 3, 8, 40, 65}) LargeBatchTopP(count, 65536);
         LargeBatchTopP(8, 152576);
         for (int count : {2, 8, 40}) for (int vocab : {7, 257, 16385}) BatchSampling(count, vocab);
         DraftReplayInputs();
+        DirectDraftProbabilities(1, 152576, 7 * 152576);
+        DirectDraftProbabilities(3, 65537, 65537);
         for (int steps : {1, 3, 5, 7}) FusedBatchSampling(33, 257, steps);
         FusedBatchSampling(65, 16385, 3);
         FusedBatchSampling(256, 152576, 3);

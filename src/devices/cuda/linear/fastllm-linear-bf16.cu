@@ -562,6 +562,26 @@ __global__ void DraftMarkovCached(const __nv_bfloat16 *table, const __nv_bfloat1
 }
 } // namespace
 
+
+extern "C" bool FastllmCudaTryBf16ColumnProjection(const fastllm::Data &input, const fastllm::Data &weight,
+        uint16_t *firstColumn, int rowPitch) {
+    using namespace fastllm;
+    if (!firstColumn || !input.cudaData || !weight.cudaData || input.dataType != BFLOAT16 ||
+        weight.dataType != BFLOAT16 || input.dataDevice != CUDA || weight.dataDevice != CUDA ||
+        input.dataDeviceIds != weight.dataDeviceIds || input.dims.size() != 3 || input.dims[0] != 1 ||
+        weight.dims.size() != 2 || input.strides.size() != 3 || weight.strides.size() != 2 || input.dims[2] != weight.dims[1]) return false;
+    const int rows = input.dims[1], width = input.dims[2], columns = weight.dims[0];
+    if (rows <= 1 || width <= 0 || columns <= 0 || rowPitch < columns ||
+        input.strides[1] != width || input.strides[2] != 1 ||
+        weight.strides[0] != width || weight.strides[1] != 1) return false;
+    const float alpha = 1.f, beta = 0.f;
+    return cublasGemmStridedBatchedEx(getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N,
+        columns, rows, width, &alpha, weight.cudaData, CUDA_R_16BF, width, int64_t(columns) * width,
+        input.cudaData, CUDA_R_16BF, width, int64_t(rows) * width, &beta,
+        firstColumn, CUDA_R_16BF, rowPitch, int64_t(rows) * rowPitch, 1,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+}
+
 std::shared_ptr<void> FastllmCudaCreateDraftMarkovCache(const fastllm::Data &table, const fastllm::Data &w) {
     int device;
     if (table.dataType != fastllm::BFLOAT16 || w.dataType != fastllm::BFLOAT16 ||
@@ -609,9 +629,15 @@ bool FastllmCudaDraftIndexedBf16Gemv(const fastllm::Data &ids, const fastllm::Da
             rows, c->tiles, c->tags, c->values);
         return true;
     }
-    FastllmGemvBf16SmallK<1, true><<<(rows - 1) / 8 + 1, 256>>>(
-        (const __nv_bfloat16 *)table.cudaData, (const __nv_bfloat16 *)weight.cudaData,
-        (__nv_bfloat16 *)output.cudaData, nullptr, rows, (const float *)ids.cudaData);
+    const auto *embedding = static_cast<const __nv_bfloat16 *>(table.cudaData);
+    const auto *weights = static_cast<const __nv_bfloat16 *>(weight.cudaData);
+    auto *result = static_cast<__nv_bfloat16 *>(output.cudaData);
+    const auto *tokens = static_cast<const float *>(ids.cudaData);
+    if (rows >= 65536 && FastllmCudaRuntimeArch() / 10 == 10) {
+        FastllmGemvBf16SmallK<4, true><<<(rows - 1) / 16 + 1, 128>>>(embedding, weights, result, nullptr, rows, tokens);
+    } else {
+        FastllmGemvBf16SmallK<1, true><<<(rows - 1) / 8 + 1, 256>>>(embedding, weights, result, nullptr, rows, tokens);
+    }
     return true;
 }
 
