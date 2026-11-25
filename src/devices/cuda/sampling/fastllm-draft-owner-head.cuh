@@ -23,6 +23,7 @@ struct Proposal {
 // The already allocated sampler buffer holds tile statistics.
 // Each step publishes the same normalized distribution from which it draws the next ID.
 __global__ __launch_bounds__(Threads) void FusedDraftHeadProposal(Proposal a) {
+    const auto maximumOf = [](auto a, auto b) { return max(a, b); };
     auto grid = cooperative_groups::this_grid();
     __shared__ union { Reduce::TempStorage reduce; Scan::TempStorage scan; } scratch;
     __shared__ float logits[Tile], tileMax, globalMax;
@@ -64,7 +65,7 @@ __global__ __launch_bounds__(Threads) void FusedDraftHeadProposal(Proposal a) {
         const int col = begin + 2 * tid;
         float x = col < end ? logits[2 * tid] : -INFINITY;
         float y = col < end ? logits[2 * tid + 1] : -INFINITY;
-        float maximum = Reduce(scratch.reduce).Reduce(fmaxf(x, y), cub::Max());
+        float maximum = Reduce(scratch.reduce).Reduce(fmaxf(x, y), maximumOf);
         if (!tid) tileMax = maximum;
         __syncthreads();
         x = tileMax == -INFINITY ? 0.f : expf(x - tileMax);
@@ -77,7 +78,7 @@ __global__ __launch_bounds__(Threads) void FusedDraftHeadProposal(Proposal a) {
         // keeps its vocabulary tile in registers until both export and draw.
         maximum = -INFINITY;
         for (int i = tid; i < gridDim.x; i += Threads) maximum = fmaxf(maximum, a.stats[i].x);
-        maximum = Reduce(scratch.reduce).Reduce(maximum, cub::Max());
+        maximum = Reduce(scratch.reduce).Reduce(maximum, maximumOf);
         if (!tid) globalMax = maximum;
         __syncthreads();
         const int perLane = (gridDim.x + Threads - 1) / Threads;
@@ -121,7 +122,7 @@ __global__ __launch_bounds__(Threads) void FusedDraftHeadProposal(Proposal a) {
                 atomicMin(&picked, col + int(selectedOffset >= prefix + x));
             using Last = cub::BlockReduce<int, Threads>;
             __shared__ typename Last::TempStorage lastStorage;
-            int lastPositive = Last(lastStorage).Reduce(y > 0.f ? col + 1 : x > 0.f ? col : -1, cub::Max());
+            int lastPositive = Last(lastStorage).Reduce(y > 0.f ? col + 1 : x > 0.f ? col : -1, maximumOf);
             __syncthreads();
             if (!tid) a.ids[step + 1] = float(picked == INT_MAX ? max(0, lastPositive) : picked);
         }

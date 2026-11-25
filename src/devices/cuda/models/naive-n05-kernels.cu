@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-cuda-graph-api.cuh"
 #include "devices/cuda/naive-n05-swa-settings.h"
 #include "devices/cuda/naive-n05-swa-verify.cuh"
 #include "devices/cuda/low_latency/router.cuh"
@@ -3369,7 +3370,7 @@ bool FastllmCudaNaivePrepareKVBody(void *child, int layers, FastllmNaiveKVBodyGr
         cudaGraphGetRootNodes(graph, roots.data(), &count) == cudaSuccess &&
         cudaGraphAddKernelNode(&write, graph, nullptr, 0, &params) == cudaSuccess) {
         std::fill(dependencies.begin(), dependencies.end(), write);
-        if (cudaGraphAddDependencies(graph, dependencies.data(), roots.data(), count) == cudaSuccess &&
+        if (FastllmCudaGraphAddDependencies(graph, dependencies.data(), roots.data(), count) == cudaSuccess &&
             cudaGraphAddEventRecordNode(&record, graph, &write, 1, kvReady) == cudaSuccess &&
             cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess) {
             plan = {graph, write, exec, kvReady};
