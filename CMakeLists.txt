@@ -1109,7 +1109,8 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_FLEX_SM103)
     set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
     add_library(fastllm_naive_dsa_fused OBJECT src/devices/cuda/models/naive-n05-dsa-fused.cu
-        src/devices/cuda/models/naive-n05-dsa-layer.cu)
+        src/devices/cuda/models/naive-n05-dsa-layer.cu
+        src/devices/cuda/models/naive-n05-dp-dsa-verify.cu)
     set_target_properties(fastllm_naive_dsa_fused PROPERTIES
         CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_naive_dsa_fused BEFORE PRIVATE
@@ -3866,6 +3867,8 @@ if (UNIT_TEST)
                 PASS_REGULAR_EXPRESSION "DSA TOPK PASS")
             add_executable(naive_n05_dsa_layer_test test/basic/test_naive_n05_dsa_layer.cu)
             target_link_libraries(naive_n05_dsa_layer_test PRIVATE fastllm Threads::Threads)
+            add_test(NAME naive_n05_dp_dsa_verify COMMAND naive_n05_dsa_layer_test dp)
+            set_tests_properties(naive_n05_dp_dsa_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
             set_target_properties(naive_n05_dsa_layer_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
             foreach(format bf16 fp8)
                 if (TARGET fastllm_mxfp8_linear_sm103)
