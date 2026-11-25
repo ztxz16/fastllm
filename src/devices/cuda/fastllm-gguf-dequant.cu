@@ -1384,12 +1384,6 @@ bool FastllmCudaGGUFEmbeddingRepeat(const fastllm::Data &input, const fastllm::D
 }
 
 namespace {
-// GGML NVFP4 stores four E4M3 block scales followed by four groups of eight
-// packed E2M1 pairs. Each pair spans the two halves of its 16-value group.
-__device__ float nvfp4Value(unsigned code) {
-    constexpr float magnitude[] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
-    return (code & 8) ? -magnitude[code & 7] : magnitude[code & 7];
-}
 template <ggml_type Type>
 __global__ void ggufExpertProjection(const uint8_t *weights, const float *outer, const int *experts, const float *input,
                                      float *out, int copies, int cols, int rows, size_t rowBytes) {
@@ -1399,12 +1393,17 @@ __global__ void ggufExpertProjection(const uint8_t *weights, const float *outer,
     const uint8_t *w = weights + (size_t(expert) * rows + row) * rowBytes;
     const float *x = input + size_t(route / copies) * cols;
     float sum = 0;
-    if constexpr (Type == GGML_TYPE_NVFP4) {
+    if constexpr (Type == GGML_TYPE_BF16) {
+        const auto *values = reinterpret_cast<const __nv_bfloat16 *>(w);
+        for (int col = lane; col < cols; col += 32)
+            sum = fmaf(x[col], __bfloat162float(values[col]), sum);
+    } else if constexpr (Type == GGML_TYPE_NVFP4) {
+        // Each E2M1 pair spans the two halves of its 16-value scale group.
         for (int col = 0; col < cols; col += 64, w += 36) {
             const int group = lane / 8, i = col + 16 * group + lane % 8;
             const unsigned s = w[group] == 0x7f ? 0 : w[group], e = s >> 3, m = s & 7, q = w[4 + lane];
             const float scale = e ? ldexpf(1.f + m * .125f, int(e) - 7) : float(m) / 512.f;
-            sum += scale * (x[i] * nvfp4Value(q) + x[i + 8] * nvfp4Value(q >> 4));
+            sum += scale * (x[i] * FastllmGgufE2M1Value(q) + x[i + 8] * FastllmGgufE2M1Value(q >> 4));
         }
     } else {
         FastllmGgufGemvDotOutput<float> dot{x, &sum, 0};
@@ -1426,13 +1425,23 @@ void launchExpertProjection(const void *weights, const float *outer, const int *
 
 FastllmGGUFExpertProjection FastllmCudaGetGGUFExpertProjection(int type) {
     switch (type) {
+        case GGML_TYPE_BF16: return launchExpertProjection<GGML_TYPE_BF16>;
+        case GGML_TYPE_Q5_0: return launchExpertProjection<GGML_TYPE_Q5_0>;
+        case GGML_TYPE_MXFP4: return launchExpertProjection<GGML_TYPE_MXFP4>;
         case GGML_TYPE_NVFP4: return launchExpertProjection<GGML_TYPE_NVFP4>;
+        case GGML_TYPE_IQ1_S: return launchExpertProjection<GGML_TYPE_IQ1_S>;
+        case GGML_TYPE_IQ2_XXS: return launchExpertProjection<GGML_TYPE_IQ2_XXS>;
         case GGML_TYPE_IQ2_XS: return launchExpertProjection<GGML_TYPE_IQ2_XS>;
         case GGML_TYPE_IQ2_S: return launchExpertProjection<GGML_TYPE_IQ2_S>;
         case GGML_TYPE_IQ3_XXS: return launchExpertProjection<GGML_TYPE_IQ3_XXS>;
         case GGML_TYPE_IQ3_S: return launchExpertProjection<GGML_TYPE_IQ3_S>;
         case GGML_TYPE_IQ4_NL: return launchExpertProjection<GGML_TYPE_IQ4_NL>;
+        case GGML_TYPE_IQ4_XS: return launchExpertProjection<GGML_TYPE_IQ4_XS>;
+        case GGML_TYPE_Q2_0: return launchExpertProjection<GGML_TYPE_Q2_0>;
         case GGML_TYPE_Q3_K: return launchExpertProjection<GGML_TYPE_Q3_K>;
+        case GGML_TYPE_Q4_K: return launchExpertProjection<GGML_TYPE_Q4_K>;
+        case GGML_TYPE_Q5_K: return launchExpertProjection<GGML_TYPE_Q5_K>;
+        case GGML_TYPE_Q8_0: return launchExpertProjection<GGML_TYPE_Q8_0>;
         default: throw std::runtime_error("Unsupported GGUF expert projection type " + std::to_string(type));
     }
 }

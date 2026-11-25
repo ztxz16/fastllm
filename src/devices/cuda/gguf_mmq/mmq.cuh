@@ -576,7 +576,7 @@ static __device__ __forceinline__ void vec_dot_q4_1_q8_1_dp4a(
     }
 }
 
-template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_q5_0(
+template <int mmq_y, int nwarps, bool need_check, bool check_k = false> static __device__ __forceinline__ void load_tiles_q5_0(
     const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
 
 #ifdef INT8_MMA_AVAILABLE
@@ -601,8 +601,9 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
         const block_q5_0 * bxi = (const block_q5_0 *)(x + i*stride) + kbx0 + kbx;
 
-        const int ql = get_int_b2(bxi->qs, kqsx);
-        const int qh = get_int_b2(bxi->qh, 0) >> (4 * (threadIdx.x % QI5_0));
+        const bool valid = !check_k || kbx0 + kbx < stride / int(sizeof(block_q5_0));
+        const int ql = valid ? get_int_b2(bxi->qs, kqsx) : 0;
+        const int qh = valid ? get_int_b2(bxi->qh, 0) >> (4 * (threadIdx.x % QI5_0)) : 0;
 
         int qs0 = (ql >>  0)   & 0x0F0F0F0F;
         qs0    |= (qh <<  4)   & 0x00000010;  // 0 ->  4
@@ -638,12 +639,13 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
             i = min(i, i_max);
         }
 
+        const bool valid = !check_k || kbx0 + kbxd < stride / int(sizeof(block_q5_0));
         const block_q5_0 * bxi = (const block_q5_0 *)(x + i*stride) + kbx0 + kbxd;
 
 #ifdef INT8_MMA_AVAILABLE
-        x_df[i*MMQ_MMA_TILE_X_K_Q8_0       + kbxd] = bxi->d;
+        x_df[i*MMQ_MMA_TILE_X_K_Q8_0       + kbxd] = valid ? __half2float(bxi->d) : 0.f;
 #else
-        x_df[i*(WARP_SIZE/QI5_0) + i/QI5_0 + kbxd] = bxi->d;
+        x_df[i*(WARP_SIZE/QI5_0) + i/QI5_0 + kbxd] = valid ? __half2float(bxi->d) : 0.f;
 #endif // INT8_MMA_AVAILABLE
     }
 }
@@ -2103,7 +2105,7 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
-template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinline__ void load_tiles_mxfp4(
+template <int mmq_y, int nwarps, bool need_check, bool check_k = false> static __device__ __forceinline__ void load_tiles_mxfp4(
     const char * __restrict__ x, int * __restrict__ x_tile, const int & kbx0, const int & i_max, const int & stride) {
 
 #ifdef INT8_MMA_AVAILABLE
@@ -2128,7 +2130,8 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
 
         const block_mxfp4 * bxi = (const block_mxfp4 *)(x + i*stride) + kbx0 + kbx;
 
-        const int aux_q4 = get_int_b1(bxi->qs, kqsx);
+        const bool valid = !check_k || kbx0 + kbx < stride / int(sizeof(block_mxfp4));
+        const int aux_q4 = valid ? get_int_b1(bxi->qs, kqsx) : 0;
         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
         const int k0 = 8 * (threadIdx.x / 4) + threadIdx.x % 4;
 #ifdef INT8_MMA_AVAILABLE
@@ -2153,8 +2156,9 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
             i = min(i, i_max);
         }
 
+        const bool valid = !check_k || kbx0 + kbxd < stride / int(sizeof(block_mxfp4));
         const block_mxfp4 * bxi = (const block_mxfp4 *)(x + i*stride) + kbx0 + kbxd;
-        helper.u = bxi->e ? uint32_t(bxi->e) << 23u : 0x00400000;
+        helper.u = valid ? (bxi->e ? uint32_t(bxi->e) << 23u : 0x00400000u) : 0u;
 
 #ifdef INT8_MMA_AVAILABLE
         x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + kbxd] = 0.5f * helper.f;
@@ -3994,6 +3998,9 @@ static __device__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+        if constexpr (type == GGML_TYPE_Q2_0) {
+            if (kb0 + blocks_per_iter / 2 >= kb0_stop) break;
+        }
         {
             const int * by0 = y + stride11*(kb0*(qk*sizeof(block_q8_1_mmq) / (4*QK8_1*sizeof(int))) + 1*sizeof(block_q8_1_mmq)/sizeof(int));
 #pragma unroll

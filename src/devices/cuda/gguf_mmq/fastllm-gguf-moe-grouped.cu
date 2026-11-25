@@ -1,3 +1,4 @@
+#include "devices/cuda/fastllm-moe.h"
 #include "fastllm-cuda-gguf-projections.h"
 #include "fastllm-cuda-v41-gguf.h"
 #include "fastllm-gguf-mmq-common.cuh"
@@ -17,6 +18,15 @@ namespace fastllm_gguf_mmq {
 #include "../moe/fastllm-moe-gguf-q8.cuh"
 #include "fastllm-gguf-mmq-io.cuh"
 #include "fastllm-gguf-moe-grouped.cuh"
+
+namespace grouped_moe {
+static void ResidentMatrix(int type, const uint8_t *const *weights, int part, Workspace &w,
+        int experts, int columns, int width, cudaStream_t stream) {
+    if (type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ1_S)
+        NativeV41Matrix(type, weights, part, w, experts, columns, width, stream);
+    else Matrix(type, weights, part, w, experts, columns, width, stream);
+}
+} // namespace grouped_moe
 } // namespace fastllm_gguf_mmq
 
 size_t fastllm_gguf_mmq::Glm5GroupedWorkspaceBytes(int gateType, int downType,
@@ -185,12 +195,16 @@ bool FastllmCudaV41GGUFGroupedProjection(bool gate, int type, const void *inputQ
 
 int FastllmCudaGGUFExpertMMQMaxRows(int gateType, int downType, int hidden, int inter, int experts, int topk) {
     using namespace fastllm_gguf_mmq;
-    const auto supported = [](int type, int cols) {
-        return grouped_moe::MatrixType(type, cols) || (type == GGML_TYPE_Q3_K && cols % 256 == 0);
+    const auto supported = [](int type, int cols, bool gate) {
+        if (type == GGML_TYPE_BF16) return FastllmCudaRoutedBF16GemmSupported();
+        if (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q5_0) return cols % 32 == 0;
+        if (type == GGML_TYPE_Q3_K || (gate && (type == GGML_TYPE_IQ1_S || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)))
+            return cols % 256 == 0;
+        return grouped_moe::MatrixType(type, cols);
     };
     if (hidden <= 0 || inter <= 0 || hidden > 24576 || inter > 24576 || experts <= 0 || experts > 1024 ||
-        topk <= 0 || topk > experts || !supported(gateType, hidden) ||
-        (downType >= 0 && !supported(downType, inter)) ||
+        topk <= 0 || topk > experts || !supported(gateType, hidden, true) ||
+        (downType >= 0 && !supported(downType, inter, false)) ||
         !int8_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) return 0;
 
     // Pad each expert to an MMQ tile. Keep quantization grids within CUDA's Y
@@ -203,6 +217,8 @@ int FastllmCudaGGUFExpertMMQMaxRows(int gateType, int downType, int hidden, int 
         if (FastllmCudaGGUFExpertMMQBytes(rows, hidden, inter, experts, topk) <= budget) lo = rows;
         else hi = rows - 1;
     }
+    // Prepare IQ1's device table during resident weight setup, before graph capture.
+    if (lo > 1 && gateType == GGML_TYPE_IQ1_S) ensure_iq1s_grid(cudaStreamPerThread);
     return lo;
 }
 
@@ -221,6 +237,7 @@ __global__ void scatterGGUFExperts(const float *products, const int *groups, con
             products[size_t(group) * width + col] * (outer ? outer[ids[row]] : 1.f);
     }
 }
+
 }
 
 void FastllmCudaGGUFExpertMMQ(bool gate, int type, const void *weightPointers, const float *outer,
@@ -231,19 +248,29 @@ void FastllmCudaGGUFExpertMMQ(bool gate, int type, const void *weightPointers, c
     const auto *weights = static_cast<const uint8_t *const *>(weightPointers);
     const auto stream = cudaStreamPerThread;
     grouped_moe::Workspace w(workspace, rows, hidden, inter, experts, topk);
-    if (gate) {
-        grouped_moe::PrepareRoutes(weights, indices, w, rows * topk, experts, stream);
-        // Reuse the product buffer until the first MMA launch. Quantize each
-        // token once even when it is selected by several experts.
-        auto *q = reinterpret_cast<block_q8_1 *>(w.products);
-        quantize_mmvq_q8_1<<<dim3((columns + 255) / 256, rows), 256, 0, stream>>>(input, q, columns);
-        grouped_moe::GatherQuantized<<<dim3((w.capacity + 7) / 8, ((columns + 255) / 256) * 2), 256, 0, stream>>>(
-            q, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity, topk);
+    if (gate) grouped_moe::PrepareRoutes(weights, indices, w, rows * topk, experts, stream);
+    if (type == GGML_TYPE_BF16) {
+        FastllmCudaRoutedBF16Gemm(static_cast<const void *const *>(weightPointers) + (gate ? 0 : 1), 2,
+            w.groupRoutes, w.tileExperts, w.offsets + experts, w.capacity, input, w.products,
+            gate ? topk : 1, columns, width);
     } else {
-        grouped_moe::Quantize<<<dim3((columns + 255) / 256, w.capacity), 256, 0, stream>>>(
-            input, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity);
+        if (gate) {
+            // Reuse the product buffer until the first MMA launch. Quantize each
+            // token once even when it is selected by several experts.
+            auto *q = reinterpret_cast<block_q8_1 *>(w.products);
+            quantize_mmvq_q8_1<<<dim3((columns + 255) / 256, rows), 256, 0, stream>>>(input, q, columns);
+            const dim3 grid((w.capacity + 7) / 8, ((columns + 255) / 256) * 2);
+            if (type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ1_S) // DS4: scale and partial sum
+                grouped_moe::GatherNativeV41<true><<<grid, 256, 0, stream>>>(
+                    q, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity, topk);
+            else grouped_moe::GatherQuantized<<<grid, 256, 0, stream>>>(
+                q, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity, topk);
+        } else {
+            grouped_moe::Quantize<<<dim3((columns + 255) / 256, w.capacity), 256, 0, stream>>>(
+                input, w.quantized, w.groupRoutes, w.offsets + experts, columns, w.capacity);
+        }
+        grouped_moe::ResidentMatrix(type, weights, gate ? 0 : 1, w, experts, columns, width, stream);
     }
-    grouped_moe::Matrix(type, weights, gate ? 0 : 1, w, experts, columns, width, stream);
     scatterGGUFExperts<<<dim3((width + 255) / 256, rows * topk), 256, 0, stream>>>(
         w.products, w.routeGroups, indices, outer, output, width);
     CUDA_CHECK(cudaGetLastError());

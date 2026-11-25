@@ -1,17 +1,11 @@
 #include "cuda_gguf_data_test.cuh"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
+#include "devices/cuda/fastllm-moe.h"
 
-// Exercise both halves of each packed pair, the four independent block scales,
-// non-consecutive expert IDs and shared input rows.
-static void Run(bool useOuter, int copies) {
-    constexpr int experts = 3, rows = 5, cols = 192, routes = 6;
+static void MakeNVFP4Weights(std::vector<uint8_t> &packed, std::vector<float> &reference, int rows, int cols) {
     const size_t stride = ggml_row_size(GGML_TYPE_NVFP4, cols);
-    std::vector<uint8_t> packed(experts * rows * stride);
-    std::vector<float> reference(experts * rows * cols), input(routes / copies * cols);
-    const std::vector<int> ids{2, 0, 2, 1, 0, 1};
-    const std::vector<float> outer{.015625f, .25f, .0625f};
     const float magnitudes[]{0, .5f, 1, 1.5f, 2, 3, 4, 6};
-    for (int row = 0; row < experts * rows; ++row) {
+    for (int row = 0; row < rows; ++row) {
         for (int col = 0; col < cols; ++col) {
             const int group = (col % 64) / 16, index = col % 16;
             auto *block = packed.data() + row * stride + (col / 64) * 36;
@@ -23,28 +17,71 @@ static void Run(bool useOuter, int copies) {
             reference[row * cols + col] = zeroScale ? 0.f : std::ldexp(magnitudes[code & 7] * ((code & 8) ? -1 : 1), exponent);
         }
     }
+}
+
+// Check gate/up (one input shared by several routes) and down (one input per route).
+static void CheckRoutedGemv(ggml_type type, int cols, bool useOuter, int copies) {
+    constexpr int experts = 3, rows = 5, routes = 6;
+    const size_t stride = ggml_row_size(type, cols);
+    std::vector<uint8_t> packed;
+    std::vector<float> reference(experts * rows * cols), input(routes / copies * cols);
+    if (type == GGML_TYPE_NVFP4) {
+        packed.resize(experts * rows * stride);
+        MakeNVFP4Weights(packed, reference, experts * rows, cols);
+    } else {
+        packed = Weights(type, experts * rows, cols);
+        if (type == GGML_TYPE_MXFP4) {
+            constexpr float values[]{0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
+            for (size_t i = 0; i < reference.size(); ++i) {
+                const uint8_t *block = packed.data() + (i / 32) * 17;
+                const uint8_t byte = block[1 + i % 16];
+                reference[i] = std::ldexp(values[i % 32 < 16 ? byte & 15 : byte >> 4], int(block[0]) - 127);
+            }
+        } else if (type == GGML_TYPE_BF16) {
+            for (size_t i = 0; i < reference.size(); ++i) {
+                uint16_t word;
+                std::memcpy(&word, packed.data() + 2 * i, sizeof(word));
+                uint32_t bits = uint32_t(word) << 16;
+                std::memcpy(&reference[i], &bits, sizeof(bits));
+            }
+        } else {
+            const auto unpack = ggml_type_to_float(type);
+            Check(unpack != nullptr, "Missing GGUF reference decoder");
+            for (int row = 0; row < experts * rows; ++row)
+                unpack(packed.data() + row * stride, reference.data() + row * cols, cols);
+        }
+    }
+    const std::vector<int> ids{2, 0, 2, 1, 0, 1};
+    const std::vector<float> outer{.015625f, .25f, .0625f};
     for (size_t i = 0; i < input.size(); ++i) input[i] = float(int(i * 23 % 59) - 29) / 32;
     Data w(INT8, {int(packed.size())}), s(FLOAT32, {experts}), indices(INT32, {routes});
     Data x(FLOAT32, {routes / copies, cols}), y(FLOAT32, {routes, rows});
     for (Data *d : {&w, &s, &indices, &x, &y}) Allocate(*d);
     Upload(w, packed); Upload(s, outer); Upload(indices, ids); Upload(x, input);
-    FastllmCudaGetGGUFExpertProjection(GGML_TYPE_NVFP4)(w.cudaData,
+    FastllmCudaGetGGUFExpertProjection(type)(w.cudaData,
         useOuter ? static_cast<float *>(s.cudaData) : nullptr, static_cast<int *>(indices.cudaData),
         static_cast<float *>(x.cudaData), static_cast<float *>(y.cudaData), routes, copies, cols, rows, stride);
     Cuda(cudaDeviceSynchronize());
     std::vector<float> actual(routes * rows);
     Cuda(cudaMemcpy(actual.data(), y.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    double diff = 0, norm = 0;
     for (int r = 0; r < routes; ++r) for (int j = 0; j < rows; ++j) {
-        float sum = 0;
-        for (int i = 0; i < cols; ++i) sum += reference[(ids[r] * rows + j) * cols + i] * input[r / copies * cols + i];
-        Check(actual[r * rows + j] == sum * (useOuter ? outer[ids[r]] : 1.f), "NVFP4 routed projection mismatch");
+        double expected = 0;
+        for (int i = 0; i < cols; ++i)
+            expected += double(reference[(ids[r] * rows + j) * cols + i]) * input[r / copies * cols + i];
+        if (useOuter) expected *= outer[ids[r]];
+        const double error = actual[r * rows + j] - expected;
+        if (type == GGML_TYPE_NVFP4) Check(error == 0, "NVFP4 routed projection mismatch");
+        diff += error * error;
+        norm += expected * expected;
     }
+    if (!(norm > 0 && diff <= 1e-10 * norm))
+        throw std::runtime_error(std::string("Routed GEMV mismatch for ") + ggml_type_name(type));
 }
 // Compare routed MMQ with the original full-precision-activation dot. Reuse a
 // captured gate/down pair with new route IDs, including an empty expert.
-static void Grouped(ggml_type type, int rows) {
-    constexpr int experts = 5, top = 3, hidden = 256, inter = 160;
-    constexpr auto downType = GGML_TYPE_IQ4_NL;
+static void Grouped(ggml_type type, int rows, ggml_type downType = GGML_TYPE_IQ4_NL, int inter = 160) {
+    constexpr int experts = 5, top = 3, hidden = 256;
     const int routes = rows * top;
     Check(FastllmCudaGGUFExpertMMQMaxRows(type, downType, hidden, inter, experts, top) >= rows,
           "Expected grouped expert MMQ for supported shape");
@@ -115,23 +152,45 @@ static void Grouped(ggml_type type, int rows) {
                 norm += double(expected[i]) * expected[i];
             }
             const double l2 = std::sqrt(diff / norm);
-            Check(l2 < .015, "GGUF expert MMQ mismatch");
+            if (!(l2 < .015))
+                throw std::runtime_error(std::string("Grouped ") + (isGate ? "gate " : "down ") +
+                    ggml_type_name(t) + " relative L2 " + std::to_string(l2));
         }
     }
     Cuda(cudaGraphExecDestroy(exec));
     Cuda(cudaGraphDestroy(graph));
 }
 int main() {
-    Run(false, 1);
-    Run(true, 3);
+    CheckRoutedGemv(GGML_TYPE_NVFP4, 192, false, 1);
+    CheckRoutedGemv(GGML_TYPE_NVFP4, 192, true, 3);
+    for (auto type : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, GGML_TYPE_IQ4_XS,
+                      GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_MXFP4, GGML_TYPE_BF16}) {
+        CheckRoutedGemv(type, 2304, true, 3);
+        // The real down dimension has a partial 256-column tile for short-block formats.
+        CheckRoutedGemv(type, ggml_blck_size(type) < 256 ? 1152 : 2304, false, 1);
+    }
     int device;
     cudaDeviceProp props;
     Cuda(cudaGetDevice(&device));
     Cuda(cudaGetDeviceProperties(&props, device));
     if (10 * props.major + props.minor >= 75) {
-        for (auto type : {GGML_TYPE_Q3_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
-                          GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL})
+        for (auto type : {GGML_TYPE_Q2_0, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+                          GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0})
             Grouped(type, 37);
+        Grouped(GGML_TYPE_IQ1_S, 37, GGML_TYPE_Q2_0, 1152);
+        Grouped(GGML_TYPE_IQ1_S, 1031, GGML_TYPE_Q2_0, 192);
+        Grouped(GGML_TYPE_IQ2_XXS, 37, GGML_TYPE_Q2_0, 192);
+        Grouped(GGML_TYPE_Q8_0, 37, GGML_TYPE_Q8_0);
+        Grouped(GGML_TYPE_Q5_K, 37, GGML_TYPE_Q5_0, 1152);
+        Grouped(GGML_TYPE_Q4_K, 37, GGML_TYPE_Q5_0);
+        Grouped(GGML_TYPE_IQ2_S, 37, GGML_TYPE_MXFP4, 1152);
+        if (FastllmCudaRoutedBF16GemmSupported()) {
+            Grouped(GGML_TYPE_BF16, 37, GGML_TYPE_BF16, 179);
+            Grouped(GGML_TYPE_BF16, 37, GGML_TYPE_BF16, 1152);
+        } else {
+            Check(FastllmCudaGGUFExpertMMQMaxRows(GGML_TYPE_BF16, GGML_TYPE_BF16, 256, 160, 5, 3) == 0,
+                  "BF16 Tensor Core unavailable: expected routed GEMV");
+        }
         Grouped(GGML_TYPE_IQ3_XXS, 1031);
     }
     std::cout << "PASS GGUF expert projection\n";

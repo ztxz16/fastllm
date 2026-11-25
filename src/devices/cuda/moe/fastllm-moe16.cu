@@ -276,27 +276,25 @@ __device__ __forceinline__ void Moe16CopyAsync16(void *destination, const void *
 // sparse GEMVs that reread weights for each token. Tensor Core products
 // accumulate in FP32; gate/up and routed-down boundaries round to storage
 // precision. WMMA requires SM70+ for FP16 and SM80+ for BF16.
-template<typename T, bool Gate, int N, int K>
-__global__ void Moe16ExpertGemm(const T *input, const T *weight,
-        const float *scores, const int *workspace, T *output,
-        int rows, int hidden, int intermediate, int experts, int topk) {
+template<typename T, bool Gate, int N, int K, typename IO>
+__device__ __forceinline__ void Moe16ExpertTile(const IO *input, const T *weight,
+        const float *scores, const int *routes, int routeCount, IO *output,
+        int hidden, int intermediate, int topk) {
 #if __CUDA_ARCH__ >= 700
     if constexpr (std::is_same_v<T, __half> || __CUDA_ARCH__ >= 800) {
     using namespace nvcuda;
     constexpr int M = 16, LD = K + 8;
-    const int *tiles = workspace + (size_t)experts * (rows + 1);
-    if (blockIdx.y >= tiles[0]) return;
-    const int index = tiles[1 + blockIdx.y], expert = index / (rows + 1);
-    const int start = index % (rows + 1), count = workspace[expert * (rows + 1) + rows];
+    constexpr bool plain = std::is_same_v<IO, float>;
+    static_assert(!plain || !Gate, "plain projections have no fused activation");
     const int inputWidth = Gate ? hidden : intermediate;
     const int outputWidth = Gate ? intermediate : hidden;
     const int column = blockIdx.x * N, tid = threadIdx.x, warp = tid / 32;
     __shared__ __align__(32) T a[2 * M * LD], b[2 * N * LD], u[Gate ? 2 * N * LD : 1];
     __shared__ int tasks[M], inputRows[M];
     if (tid < M) {
-        int task = start + tid < count ? workspace[index + tid] : -1;
+        int task = tid < routeCount ? routes[tid] : -1;
         tasks[tid] = task;
-        inputRows[tid] = Gate && task >= 0 ? task / topk : task;
+        inputRows[tid] = (plain || Gate) && task >= 0 ? task / topk : task;
     }
     __syncthreads();
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc, up;
@@ -311,12 +309,16 @@ __global__ void Moe16ExpertGemm(const T *input, const T *weight,
             for (int i = tid * 8; i < M * K; i += N * 2 * 8) {
                 int row = inputRows[i / K], d = k + i % K;
                 bool valid = row >= 0 && d < inputWidth;
-                Moe16CopyAsync16(pa + (i / K) * LD + i % K,
-                    input + (valid ? (size_t)row * inputWidth + d : 0), valid);
+                T *dst = pa + (i / K) * LD + i % K;
+                if constexpr (plain) {
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        dst[j] = Moe16Cast<T>(valid ? input[(size_t)row * inputWidth + d + j] : 0.f);
+                } else Moe16CopyAsync16(dst, input + (valid ? (size_t)row * inputWidth + d : 0), valid);
             }
             for (int i = tid * 8; i < N * K; i += N * 2 * 8) {
                 int n = column + i / K, d = k + i % K;
-                size_t offset = ((size_t)expert * outputWidth * (Gate ? 2 : 1) + n) * inputWidth + d;
+                size_t offset = (size_t)n * inputWidth + d;
                 bool valid = n < outputWidth && d < inputWidth;
                 Moe16CopyAsync16(pb + (i / K) * LD + i % K, weight + (valid ? offset : 0), valid);
                 if (Gate) Moe16CopyAsync16(pu + (i / K) * LD + i % K,
@@ -326,11 +328,11 @@ __global__ void Moe16ExpertGemm(const T *input, const T *weight,
             for (int i = tid; i < M * K; i += N * 2) {
                 int row = inputRows[i / K], d = k + i % K;
                 pa[(i / K) * LD + i % K] = row >= 0 && d < inputWidth
-                    ? input[(size_t)row * inputWidth + d] : Moe16Cast<T>(0.f);
+                    ? T(input[(size_t)row * inputWidth + d]) : Moe16Cast<T>(0.f);
             }
             for (int i = tid; i < N * K; i += N * 2) {
                 int n = column + i / K, d = k + i % K;
-                size_t offset = ((size_t)expert * outputWidth * (Gate ? 2 : 1) + n) * inputWidth + d;
+                size_t offset = (size_t)n * inputWidth + d;
                 pb[(i / K) * LD + i % K] = n < outputWidth && d < inputWidth ? weight[offset] : Moe16Cast<T>(0.f);
                 if (Gate) pu[(i / K) * LD + i % K] = n < outputWidth && d < inputWidth
                     ? weight[offset + (size_t)outputWidth * inputWidth] : Moe16Cast<T>(0.f);
@@ -373,15 +375,41 @@ __global__ void Moe16ExpertGemm(const T *input, const T *weight,
         int task = tasks[i / N], n = column + i % N;
         if (task < 0 || n >= outputWidth) continue;
         float v = result[i];
-        if (Gate) {
-            v = Moe16Float(Moe16Cast<T>(v));
-            float uv = Moe16Float(Moe16Cast<T>(upResult[i]));
-            v = v / (1.f + expf(-v)) * uv;
-        } else v *= scores[task];
-        output[(size_t)task * outputWidth + n] = Moe16Cast<T>(v);
+        if constexpr (plain) {
+            output[(size_t)(i / N) * outputWidth + n] = v;
+        } else {
+            if (Gate) {
+                v = Moe16Float(Moe16Cast<T>(v));
+                float uv = Moe16Float(Moe16Cast<T>(upResult[i]));
+                v = v / (1.f + expf(-v)) * uv;
+            } else v *= scores[task];
+            output[(size_t)task * outputWidth + n] = Moe16Cast<T>(v);
+        }
     }
     }
 #endif
+}
+
+template<typename T, bool Gate, int N, int K>
+__global__ void Moe16ExpertGemm(const T *input, const T *weight, const float *scores,
+        const int *workspace, T *output, int rows, int hidden, int intermediate, int experts, int topk) {
+    const int *tiles = workspace + size_t(experts) * (rows + 1);
+    if (blockIdx.y >= tiles[0]) return;
+    const int index = tiles[1 + blockIdx.y], expert = index / (rows + 1);
+    const int remaining = workspace[size_t(expert) * (rows + 1) + rows] - index % (rows + 1);
+    weight += size_t(expert) * hidden * intermediate * (Gate ? 2 : 1);
+    Moe16ExpertTile<T, Gate, N, K>(input, weight, scores, workspace + index, remaining,
+        output, hidden, intermediate, topk);
+}
+
+__global__ void MoeBF16ProjectionGemm(const void *const *weights, int pointerStride,
+        const int *sortedRoutes, const int *tileExperts, const int *activeRows,
+        const float *input, float *products, int copies, int columns, int width) {
+    const int start = blockIdx.y * 16;
+    if (start >= *activeRows) return;
+    const auto *weight = static_cast<const __nv_bfloat16 *>(weights[tileExperts[blockIdx.y] * pointerStride]);
+    Moe16ExpertTile<__nv_bfloat16, false, 64, 64>(input, weight, nullptr, sortedRoutes + start, 16,
+        products + size_t(start) * width, width, columns, copies);
 }
 
 int Moe16CompiledArch() {
@@ -560,6 +588,15 @@ void Moe16SumExperts(const T *parts, const int *indices, T *output, int rows,
         Moe16ExpertSum<T, Shared><<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(
             parts, indices, output, hidden, topk, shared, sharedGate, sharedGateStride);
 }
+}
+
+bool FastllmCudaRoutedBF16GemmSupported() { return Moe16TensorCores<__nv_bfloat16>(); }
+
+void FastllmCudaRoutedBF16Gemm(const void *const *tileWeights, int pointerStride,
+        const int *sortedRoutes, const int *tileExperts, const int *activeRows, int capacity,
+        const float *input, float *products, int copies, int columns, int width) {
+    MoeBF16ProjectionGemm<<<dim3((width + 63) / 64, capacity / 16), 128, 0, cudaStreamPerThread>>>(
+        tileWeights, pointerStride, sortedRoutes, tileExperts, activeRows, input, products, copies, columns, width);
 }
 
 #include "fastllm-moe16-sm90.cuh"

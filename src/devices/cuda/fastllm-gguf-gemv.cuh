@@ -8,6 +8,11 @@
 #include <cuda_bf16.h>
 #include "gguf.h"
 
+static __device__ __forceinline__ float FastllmGgufE2M1Value(unsigned code) {
+    constexpr float magnitude[]{0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    return (code & 8) ? -magnitude[code & 7] : magnitude[code & 7];
+}
+
 static constexpr __device__ int8_t kvalues_iq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 template<typename dst_t>
 struct DequantizeCast;
@@ -576,6 +581,27 @@ static __device__ __forceinline__ void FastllmGgufGemvBlock(
     }
     else if constexpr (type == GGML_TYPE_IQ3_S) {
         dequantize_block_iq3_s_impl<T>(weight, output, block, lane);
+    }
+    else if constexpr (type == GGML_TYPE_Q5_0 || type == GGML_TYPE_MXFP4) {
+#pragma unroll
+        for (int j = 0; j < QK_K / 32; ++j) {
+            const int b = block * (QK_K / 32) + j;
+            if (b >= columns / 32) break;
+            float value;
+            if constexpr (type == GGML_TYPE_Q5_0) {
+                const auto &q = static_cast<const block_q5_0 *>(weight)[b];
+                const int low = (q.qs[lane % 16] >> (4 * (lane / 16))) & 15;
+                const int high = (q.qh[lane / 8] >> (lane % 8)) & 1;
+                value = __half2float(q.d) * (low + 16 * high - 16);
+            } else {
+                // One E8M0 scale, followed by 16 bytes pairing columns j and j+16.
+                const auto *q = static_cast<const uint8_t *>(weight) + b * 17;
+                const int code = (q[1 + lane % 16] >> (4 * (lane / 16))) & 15;
+                const float scale = __uint_as_float(q[0] ? unsigned(q[0]) << 23 : 0x00400000u);
+                value = scale * FastllmGgufE2M1Value(code);
+            }
+            output[b * 32 + lane] = DequantizeCast<T>::cast(value);
+        }
     }
     else if constexpr (type == GGML_TYPE_Q8_0) {
         const auto *blocks = static_cast<const block_q8_0 *>(weight);

@@ -13,6 +13,27 @@ static std::vector<uint8_t> Weights(ggml_type type, int n, int k) {
         void *p = bytes.data() + i;
         const half d = __float2half_rn(float(1 + (i / blockSize) % 4) / 16384.0f);
         switch (type) {
+        case GGML_TYPE_BF16: {
+            // Finite signed values spanning several powers of two.
+            auto *v = static_cast<uint16_t *>(p);
+            *v = (*v & 0x807f) | ((120 + (i / blockSize) % 7) << 7);
+            break;
+        }
+        case GGML_TYPE_MXFP4:
+            *static_cast<uint8_t *>(p) = 118 + (i / blockSize) % 7;
+            break;
+        case GGML_TYPE_Q5_0:
+            static_cast<block_q5_0 *>(p)->d = d;
+            break;
+        case GGML_TYPE_Q2_0:
+            static_cast<block_q2_0 *>(p)->d = d;
+            break;
+        case GGML_TYPE_Q8_0:
+            static_cast<block_q8_0 *>(p)->d = d;
+            break;
+        case GGML_TYPE_IQ1_S:
+            static_cast<block_iq1_s *>(p)->d = d;
+            break;
         case GGML_TYPE_IQ1_M: {
             auto *sc = reinterpret_cast<uint16_t *>(static_cast<block_iq1_m *>(p)->scales);
             uint16_t bits;

@@ -44,6 +44,18 @@ struct StreamTraits<X, Y, Warps, Check, GGML_TYPE_Q8_0>
     static constexpr load_tiles_mmq_t load_tiles = LoadQ8<Y, Warps, Check>;
 };
 
+// Resident rows can end inside the last 256-column MMA tile.
+template<int X, int Y, int Warps, bool Check>
+struct StreamTraits<X, Y, Warps, Check, GGML_TYPE_Q5_0>
+        : mmq_type_traits<X, Y, Warps, Check, GGML_TYPE_Q5_0> {
+    static constexpr load_tiles_mmq_t load_tiles = load_tiles_q5_0<Y, Warps, Check, true>;
+};
+template<int X, int Y, int Warps, bool Check>
+struct StreamTraits<X, Y, Warps, Check, GGML_TYPE_MXFP4>
+        : mmq_type_traits<X, Y, Warps, Check, GGML_TYPE_MXFP4> {
+    static constexpr load_tiles_mmq_t load_tiles = load_tiles_mxfp4<Y, Warps, Check, true>;
+};
+
 static bool MatrixType(int type, int columns) {
     if (columns <= 0) return false;
     if (type == GGML_TYPE_Q2_0) return columns%64 == 0;
@@ -194,7 +206,7 @@ __global__ void Matmul(const uint8_t *const *weights, int part,
         reinterpret_cast<const char *>(weights[2*e+part]),
         reinterpret_cast<const char *>(input+begin), output+size_t(begin)*width,
         nullptr, padded, width, stride, padded, counts[e], capacity, width,
-        blockIdx.x, localTile, 0, padded/ggml_cuda_type_traits<Type>::qk);
+        blockIdx.x, localTile, 0, (Type == GGML_TYPE_Q2_0 ? columns : padded)/ggml_cuda_type_traits<Type>::qk);
 }
 
 template<class T>
@@ -322,6 +334,7 @@ static void Matrix(int type, const uint8_t *const *weights, int part, Workspace 
         GROUPED_CASE(Q2_0) GROUPED_CASE(IQ2_XXS) GROUPED_CASE(IQ2_XS) GROUPED_CASE(IQ2_S)
         GROUPED_CASE(IQ3_XXS) GROUPED_CASE(IQ3_S) GROUPED_CASE(IQ4_NL) GROUPED_CASE(IQ4_XS)
         GROUPED_CASE(Q8_0) GROUPED_CASE(Q2_K) GROUPED_CASE(Q3_K) GROUPED_CASE(Q4_K)
+        GROUPED_CASE(Q5_0) GROUPED_CASE(MXFP4) GROUPED_CASE(Q5_K)
 #undef GROUPED_CASE
     }
 }

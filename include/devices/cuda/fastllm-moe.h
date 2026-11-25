@@ -1,6 +1,15 @@
 #pragma once
 #include <cstddef>
 
+// Bias-free projection of resident BF16 experts with FP32 inputs and outputs.
+// The grouped Tensor Core path rounds inputs to BF16 and writes FP32 products in sorted 16-route tiles.
+// A negative sorted route denotes padding. tileWeights selects one matrix per
+// expert with the given pointer stride; activeRows lives on the GPU.
+bool FastllmCudaRoutedBF16GemmSupported();
+void FastllmCudaRoutedBF16Gemm(const void *const *tileWeights, int pointerStride,
+    const int *sortedRoutes, const int *tileExperts, const int *activeRows, int capacity,
+    const float *input, float *products, int copies, int columns, int width);
+
 // Resident packed 16-bit [E,2I,H] / [E,H,I] experts. Scratch uses the same type,
 // [M,K,I] and [M,K,H]. Each down contribution rounds AFTER route weighting.
 // Optional workspace is sized by WorkspaceBytes below (256-byte alignment).
