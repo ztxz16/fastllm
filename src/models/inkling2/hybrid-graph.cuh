@@ -11,11 +11,11 @@ __global__ void waitForExpertSource(const unsigned *ready, const int *control) {
 #endif
 }
 
-__global__ void refillGraphSlots(const uint4 *packed, uint4 *slots, const int *control, size_t words) {
+__global__ void refillGraphSlots(const uint4 *packed, uint4 *slots, const int *control, size_t stride, size_t words) {
     const int slot = blockIdx.y;
     if (!(unsigned(control[0]) & (1u << slot))) return;
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < words; i += gridDim.x * blockDim.x)
-        slots[slot * words + i] = packed[slot * words + i];
+        slots[slot * stride + i] = packed[slot * stride + i];
 }
 // Host and device routes use the same activation and quantization, including
 // BF16 rounding. The host branch can finish without waiting for resident GEMVs.
@@ -33,16 +33,19 @@ struct HybridGraphStorage {
         uint8_t *host = nullptr, *mapped = nullptr;
         size_t capacity;
         HybridMoeRoutes plan;
-        std::vector<int> cpuRoutes, uploadIds;
+        std::vector<int> cpuRoutes;
         std::vector<CpuExpertGroup> groups;
         HostProjectionInput input;
         std::vector<float> output;
-        std::atomic<unsigned> &ready() const { return *reinterpret_cast<std::atomic<unsigned> *>(host); }
+        struct UploadSignals { std::atomic<unsigned> ready[2]{{1}, {1}}; };
+        std::atomic<unsigned> &ready(int part) const {
+            return reinterpret_cast<UploadSignals *>(host)->ready[part];
+        }
         explicit Arena(size_t bytes) : capacity(bytes) {
             check(cudaHostAlloc(&host, bytes, cudaHostAllocMapped));
             static_assert(std::atomic<unsigned>::is_always_lock_free && sizeof(std::atomic<unsigned>) == sizeof(unsigned),
                           "mapped completion flag must be a native word");
-            new (host) std::atomic<unsigned>{1};
+            new (host) UploadSignals{};
             auto error = cudaHostGetDevicePointer(&mapped, host, 0);
             if (error != cudaSuccess) { cudaFreeHost(host); check(error); }
         }
@@ -80,7 +83,6 @@ struct HybridGraphStorage {
             // Original ownership for the reduction, then one masked slot table
             // per GPU branch. A masked projection never writes its route.
             std::fill_n(slots, 3 * routes, -1);
-            arena->uploadIds.clear();
             control[0] = 0;
             auto *policy = cycle ? &cycle->policy : nullptr;
             const int experts = gate.host.size(), base = layer * experts;
@@ -96,9 +98,6 @@ struct HybridGraphStorage {
                 if (int(i) < plan.staged) {
                     const int slot = cache.staging.selected[i];
                     if (cache.staging.keys[slot] != expert) {
-                        if (arena->uploadIds.empty())
-                            arena->uploadIds.assign(std::min<int>(routes, cache.staging.keys.size()), -1);
-                        arena->uploadIds[slot] = expert;
                         ++sample->uploads;
                         control[0] |= 1u << slot;
                         cache.staging.keys[slot] = expert;
@@ -110,14 +109,25 @@ struct HybridGraphStorage {
                 }
             }
             if (control[0]) {
-                arena->ready().store(0, std::memory_order_relaxed);
+                arena->ready(0).store(0, std::memory_order_relaxed);
+                arena->ready(1).store(0, std::memory_order_relaxed);
                 copies->Submit([](const void *argument) noexcept {
                     const auto &v = *static_cast<const Visit *>(argument);
-                    for (size_t i = 0; i < v.arena->uploadIds.size(); ++i) {
-                        const int expert = v.arena->uploadIds[i];
-                        if (expert >= 0) v.cache.copyRecord(expert, v.uploads + i * v.cache.stride, v.gate, v.down);
+                    // Release gate/up as soon as it is packed. Its PCIe transfer
+                    // overlaps the host copy of the down projection.
+                    for (int part = 0; part < 2; ++part) {
+                        const size_t offset = part ? v.cache.gateBytes : 0;
+                        const size_t bytes = part ? v.cache.stride - offset : v.cache.gateBytes;
+                        const auto &weight = part ? v.down : v.gate;
+                        // The masks and slot owners are stable until both GPU branches join.
+                        unsigned mask = unsigned(v.control[0]);
+                        for (size_t slot = 0; mask; ++slot, mask >>= 1) {
+                            if (!(mask & 1)) continue;
+                            const int expert = v.cache.staging.keys[slot];
+                            std::memcpy(v.uploads + slot * v.cache.stride + offset, weight.host[expert].data, bytes);
+                        }
+                        v.arena->ready(part).store(1, std::memory_order_release);
                     }
-                    v.arena->ready().store(1, std::memory_order_release);
                 }, this);
             }
             ++cache.timing.calls;
@@ -165,7 +175,6 @@ struct HybridGraphStorage {
                 std::fill_n(v.control + 1, 3 * v.routes, -1);
                 std::fill(v.cache.staging.keys.begin(), v.cache.staging.keys.end(), -1);
                 v.arena->cpuRoutes.clear();
-                v.arena->uploadIds.clear();
                 throw;
             }
         });
@@ -201,11 +210,17 @@ struct HybridGraphStorage {
         if (sample) {
             scratch.hybrid->parallel(cudaStreamPerThread, *sample, host, [&] { cache.publication.wait(cudaStreamPerThread, true); }, [&](cudaStream_t stream) {
                 if (staging) {
-                    waitForExpertSource<<<1, 1, 0, stream>>>(reinterpret_cast<const unsigned *>(largest->mapped), devicePlan.p);
-                    const size_t words = cache.stride / sizeof(uint4);
-                    refillGraphSlots<<<dim3(std::min<size_t>((words + 255) / 256, 256), staging), 256, 0, stream>>>(
-                        reinterpret_cast<const uint4 *>(largest->mapped + uploadOffset),
-                        reinterpret_cast<uint4 *>(cache.data.p + cache.resident * cache.stride), devicePlan.p, words);
+                    const size_t stride = cache.stride / sizeof(uint4);
+                    for (int part = 0; part < 2; ++part) {
+                        const size_t offset = part ? cache.gateBytes : 0;
+                        const size_t words = (part ? cache.stride - offset : cache.gateBytes) / sizeof(uint4);
+                        auto *ready = reinterpret_cast<const unsigned *>(largest->mapped) + part;
+                        waitForExpertSource<<<1, 1, 0, stream>>>(ready, devicePlan.p);
+                        refillGraphSlots<<<dim3(std::min<size_t>((words + 255) / 256, 256), staging), 256, 0, stream>>>(
+                            reinterpret_cast<const uint4 *>(largest->mapped + uploadOffset + offset),
+                            reinterpret_cast<uint4 *>(cache.data.p + cache.resident * cache.stride + offset),
+                            devicePlan.p, stride, words);
+                    }
                 }
             }, [&](cudaStream_t stream, bool staged) {
                 const int *mask = slots + (staged ? 2 : 1) * routes;

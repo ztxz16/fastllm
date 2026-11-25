@@ -147,10 +147,6 @@ struct HybridExpertRecords {
     ~HybridExpertRecords() {
         for (auto event : {start, middle, done}) if (event) cudaEventDestroy(event);
     }
-    void copyRecord(int expert, uint8_t *dst, const Projection &gate, const Projection &down) const {
-        std::memcpy(dst, gate.host[expert].data, gateBytes);
-        std::memcpy(dst + gateBytes, down.host[expert].data, stride - gateBytes);
-    }
     void upload(int expert, int slot, const Projection &gate, const Projection &down) {
         auto *dst = data.p + size_t(slot) * stride;
         check(cudaMemcpy(dst, gate.host[expert].data, gateBytes, cudaMemcpyHostToDevice));
