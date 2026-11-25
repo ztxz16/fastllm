@@ -1018,7 +1018,8 @@ class AutoConfigTest(unittest.TestCase):
                     raise Planned
 
                 with patch('fastllm_pytools.util.read_gguf_metadata',
-                           return_value={'general.architecture': 'dflash'}), \
+                           return_value={'general.architecture': 'dflash', 'dflash.block_size': 5}), \
+                        patch('fastllm_pytools.util.read_gguf_tensor_names', return_value=set()), \
                         patch('fastllm_pytools.util.get_gguf_model_config', return_value=config), \
                         patch('fastllm_pytools.deepseek_v41_gguf.dspark_config', return_value=draft_config), \
                         patch.object(auto, 'resolve', side_effect=resolve), \
