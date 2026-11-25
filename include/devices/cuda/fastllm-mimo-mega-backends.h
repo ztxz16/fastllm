@@ -30,6 +30,7 @@ extern "C" decltype(fastllm_ep8_mega_moe_run) fastllm_sm100_mega_moe_run;
 extern "C" decltype(fastllm_ep8_mega_moe_run_masked) fastllm_sm100_mega_moe_run_masked;
 extern "C" decltype(fastllm_ep8_mega_moe_decode_capacity) fastllm_sm100_mega_moe_decode_capacity;
 extern "C" decltype(fastllm_ep8_mega_moe_run_batched) fastllm_sm100_mega_moe_run_batched;
+extern "C" decltype(fastllm_ep8_mega_moe_run_verify) fastllm_sm100_mega_moe_run_verify;
 extern "C" decltype(fastllm_ep8_mega_moe_prefill_workspace_bytes) fastllm_sm100_mega_moe_prefill_workspace_bytes;
 extern "C" decltype(fastllm_ep8_mega_moe_prepare_prefill) fastllm_sm100_mega_moe_prepare_prefill;
 extern "C" decltype(fastllm_ep8_mega_moe_run_prefill) fastllm_sm100_mega_moe_run_prefill;

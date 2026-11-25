@@ -69,6 +69,7 @@ def main():
     weights = bind("weights", [ptr, P])
     capacity = bind("decode_capacity", [ctypes.c_int, ctypes.c_int])
     batched = bind("run_batched", [ptr] * 5 + [ctypes.c_int, ctypes.c_int, ptr])
+    single_verify = bind("run_verify", batched.argtypes)
     assert capacity(32 * R, R) == 32 and capacity(32 * R + 1, R) == 128
     assert capacity(128 * R - 1, R) == 128
     assert capacity(128 * R, R) == (256 if R == 8 else 128)
@@ -284,6 +285,8 @@ def main():
             v["score"].copy_(torch.softmax(torch.randn(2 * C + 2, K, device=r), -1))
             if scenario == "masked":
                 v["live"][::3] = 0
+            if scenario == "verify_owner" and r != seed_offset % R:
+                v["live"].zero_()
             if scenario == "all_masked":
                 v["live"].zero_()
             v["rows"] = 0 if scenario == "idle" and r % 2 else n
@@ -409,7 +412,10 @@ def main():
         (64, "all_masked"),
         (64, "all_idle"),
     ]
+    if R == 8 and a.mxfp4:
+        scenarios[:0] = [(8, "verify_owner"), (8, "masked"), (8, "all_masked")]
     for n, scenario in scenarios:
+        candidate = single_verify if n == 8 else batched
         fill(n, scenario)
         launch(n)
         rel = (
@@ -421,7 +427,7 @@ def main():
         sync()
         for r, v in enumerate(ranks):
             torch.cuda.set_device(r)
-            assert batched(
+            assert candidate(
                 v["handle"],
                 v["x"].data_ptr(),
                 v["y"].data_ptr(),
@@ -452,7 +458,7 @@ def main():
             for repeat in range(3):
                 for start in range(0, n, C):
                     reference_chunk(v, v["old_y"], start)
-                assert batched(
+                assert candidate(
                     v["handle"],
                     v["x"].data_ptr(),
                     v["y"].data_ptr(),

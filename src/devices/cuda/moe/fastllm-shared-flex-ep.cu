@@ -357,6 +357,13 @@ static int runEp(void*state,int rank,int layer,int rows,const void*x,const void*
   finish<<<dim3(16,n),128,0,stream>>>(a,yy,ii,n);
  }return cudaGetLastError();
 }
+extern "C" int fastshared_ep_uses_verify_reduce(void *state, int rank, int layer, int rows) {
+    using namespace fastllm_shared_flex_ep;
+    const auto *s = static_cast<const State *>(state);
+    if (!s || rank < 0 || rank >= R || layer < 0 || size_t(layer) >= s->layers.size()) return 0;
+    const auto &weights = s->layers[layer][rank];
+    return weights.gate && VerifyOperand::supports(weights.mxfp4, rows);
+}
 extern "C" int fastshared_ep_prepared_input(void *state,int rank,int layer,int rows,FastllmMoePreparedInput *p) {
  using namespace fastllm_shared_flex_ep;
  auto *s=static_cast<State*>(state);

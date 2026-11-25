@@ -1,11 +1,11 @@
 {
   "repository": "https://github.com/deepseek-ai/DeepGEMM",
   "commit": "5081f8513af57e61696de4f4f04b0e707ffb503e",
-  "changes": "FastLLM namespace and workspace layout, graph barriers, batched projection and accumulation, and local MegaMoE dispatch.",
+  "changes": "FastLLM namespace and workspace layout, graph barriers, batched projection and accumulation, and small verification dispatch/combine.",
   "headers": {
     "deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh": {
       "original_sha256": "9d577f200e482fb2deed3e9d8a8b6ec0f71d15df2782d4b8f0a5321102ccc970",
-      "installed_sha256": "3f277e2c5267002e53a43cbf6a6ddf35fbffbf4da5321e46a2f34f0e445b8ed9",
+      "installed_sha256": "b5667518b2f62b21bbd75407405f92a49b43646db5618dbd32fbb51243d0c580",
       "adapted": true
     },
     "deep_gemm/ptx/utils.cuh": {

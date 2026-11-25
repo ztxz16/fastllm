@@ -128,6 +128,7 @@ int fastshared_tp_run_dense(void *state,int rank,int rows,const void *input,
 
 // EP routing supports 2..8 rows. The prepared-input path requires an eight-row MXFP4 layer.
 int fastshared_ep_router_supported(void *state);
+int fastshared_ep_uses_verify_reduce(void *state, int rank, int layer, int rows);
 int fastshared_ep_prepared_input(void *state,int rank,int layer,int rows,FastllmMoePreparedInput *out);
 int fastshared_ep_prepared_norm(const void *x,const float *weight,float *router,const float *gamma,
     void *normed,float eps,FastllmMoePreparedInput input,bool afterSwa);

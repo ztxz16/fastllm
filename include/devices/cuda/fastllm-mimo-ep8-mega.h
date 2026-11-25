@@ -65,3 +65,8 @@ void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int
     const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
     fastllm::Data &output, int maxRows, const int *liveKeys,
     fastllm::Data *prefillScratch, int densePrefixRows);
+// Single-slot verification is selected from the common capture geometry on all ranks.
+void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
+    const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
+    fastllm::Data &output, int maxRows, const int *liveKeys,
+    fastllm::Data *prefillScratch, int densePrefixRows, bool singleVerify);
