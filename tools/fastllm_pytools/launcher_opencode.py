@@ -46,7 +46,7 @@ class OpenCodeRuntime(AgentRuntime):
                                        "variants": {effort: ({"reasoningEffort": effort} if effort in efforts
                                                               else {"disabled": True})
                                                     for effort in REASONING_EFFORTS},
-                                       "limit": {"context": context, "output": min(8192, context // 2)}}}}}}
+                                       "limit": {"context": context, "output": min(32768, context // 2)}}}}}}
 
     def _serve(self, command, service, api_key, bind_host, browser_origin, cancelled):
         environment = self._environment(command, api_key)
