@@ -43,6 +43,15 @@ def _memory_limit_bytes(value, label):
     return result
 
 
+def gpu_budget(card, ratio, limit):
+    available = card["free"] - math.ceil(card["total"] * (1 - ratio))
+    return min(available, limit) if limit is not None else available
+
+
+def interactive_moe_priority(chunk, cache, prompt_target=1024):
+    return min(chunk, prompt_target), min(cache, 3 * GiB)
+
+
 def host_budget(args, ram):
     """Return the effective host budget and normalized cap/override options."""
     limit = _memory_limit_bytes(getattr(args, "auto_host_memory_limit", None), "auto_host_memory_limit")
@@ -178,8 +187,8 @@ def inventory(path):
         if weight_map is not None and set(weight_map) != {t.name for t in tensors}:
             raise ValueError("Hybrid auto: incomplete safetensors checkpoint")
     tensors = normalize_checkpoint(metadata, tensors)
-    # HY4 stores its Engram tables inside the indexed checkpoint under its own tensor names.
-    if not path.is_file() and metadata.get("model_type") != "hy_v4_flash":
+    # HY4 has indexed Engram weights; Inkling has no external Engram tables.
+    if not path.is_file() and metadata.get("model_type") not in ("hy_v4_flash", "inkling2_loop"):
         engram_path = os.environ.get("FASTLLM_DSV41_ENGRAM_PATH") or metadata.get("engram_table_dir")
         if engram_path:
             external_path = Path(engram_path)
@@ -1672,9 +1681,7 @@ def plan(args, model, costs, mode, mapping, gpu, ram, *, rank=None, allow_full_g
             # Only host-backed V4.1 candidates get the higher automatic ratio.
             # Full GPU plans and explicit ratios retain their existing budget.
             candidate_ratio = hybrid_ratio if host_experts else ratio
-            gpu_limit = {d: gpu[d]["free"] - math.ceil(gpu[d]["total"] * (1 - candidate_ratio)) for d in mapping}
-            if gpu_memory_limit is not None:
-                gpu_limit = {d: min(limit, gpu_memory_limit) for d, limit in gpu_limit.items()}
+            gpu_limit = {d: gpu_budget(gpu[d], candidate_ratio, gpu_memory_limit) for d in mapping}
             workspace_before_loan = workspace
             workspace_loan, shared_workspace = _prefill_cache_workspace(
                 args, model, rows, mode, mapping, resident)

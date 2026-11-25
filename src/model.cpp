@@ -5430,6 +5430,8 @@ namespace fastllm {
         }
 
         // 4.0 更新模型信息
+        if (model->model_struct == "inkling2_loop" && !config["text_config"]["model_max_length"].is_null())
+            model->weight.AddDict("text_config.max_position_embeddings", config["text_config"]["model_max_length"].dump());
         model->ConfigureContext(contextOptions);
         if (model->YarnConfig() && !dsparkPath.empty()) {
             throw std::invalid_argument("Context extension with an external DSpark draft is not implemented; disable the external draft.");

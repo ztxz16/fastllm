@@ -288,7 +288,7 @@ def _deepseek_priority(candidate, model, backend=None):
     # Once these targets are met, compare predicted latency. An unbounded
     # chunk preference otherwise discards a faster fully resident GPU plan
     # before its decode cost is considered.
-    return min(chunk, 4096 if streamed_disk else 1024), min(cache, 3 * memory.GiB)
+    return memory.interactive_moe_priority(chunk, cache, 4096 if streamed_disk else 1024)
 
 
 def kv_residencies(args, model):
@@ -598,6 +598,11 @@ def resolve(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
         raise
 
 
+def cuda_graph_enabled():
+    from .util import _fastllm_env_flag_enabled
+    return "FASTLLM_CUDA_GRAPH" not in os.environ or _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH")
+
+
 def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
     """Resolve one --auto invocation transactionally, before model allocation."""
     path = Path(args.path)
@@ -615,13 +620,14 @@ def _resolve_impl(args, query_gpu, *, hardware=None, ram=None, use_numa=None):
             return result
     elif path.suffix.lower() == ".gguf" and path.is_file():
         family = memory.gguf.read_gguf_metadata(path, {"general.architecture"}).get("general.architecture")
+    if family == "inkling2_loop":
+        from .inkling_config import resolve as resolve_inkling
+        return resolve_inkling(args, query_gpu, hardware, ram, use_numa)
     if family == "hy_v4_flash":
         from .hy4_config import resolve as resolve_hy4
         return resolve_hy4(args, query_gpu, hardware, ram, use_numa)
     from .env import env
-    from .util import _fastllm_env_flag_enabled
-    graph_enabled = ("FASTLLM_CUDA_GRAPH" not in os.environ or
-                     _fastllm_env_flag_enabled("FASTLLM_CUDA_GRAPH"))
+    graph_enabled = cuda_graph_enabled()
     explicit = set(getattr(args, "_auto_explicit", ()))
     ratio = getattr(args, "auto_disk_cache_ratio", 0.5)
     if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not math.isfinite(ratio) or not 0 <= ratio <= 1:

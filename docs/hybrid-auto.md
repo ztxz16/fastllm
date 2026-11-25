@@ -8,7 +8,13 @@
 ftllm server /path/to/model.gguf --auto
 ```
 
-支持 Linux NVIDIA CUDA 上的 dense Qwen3、Qwen3.5 架构的稠密 HF 模型，以及 Qwen4、GLM-5.3、DeepSeek-V4.1 混推模型。未启用 `--auto` 时，原有数值和默认行为保持不变。
+支持 Linux NVIDIA CUDA 上的 dense Qwen3、Qwen3.5 架构的稠密 HF 模型，以及 Qwen4、GLM-5.3、DeepSeek-V4.1 和 Inkling-2-Mini 混推模型。未启用 `--auto` 时，原有数值和默认行为保持不变。
+
+Inkling-2-Mini 可以直接指定原版目录或 GGUF 文件。规划器优先选择能容纳模型的最大兼容 TP 卡组，按卡估算分片权重、复制权重、KV、工作区和主卡加载峰值。全 GPU 放不下时改用单卡混推，优先使用 NUMA 专家。专家缓存按物理层和实际量化格式计算，KV 则按循环访问次数、全局层和滑窗层分别计算。默认按单请求 128K 上下文规划。启动日志中的 `cache_slots_per_layer` 是每个主存专家层可在显卡缓存的专家数。
+
+GGUF 主模型使用外置草稿时，追加 `--draft /path/to/dspark-Inkling-2-Mini-Q8_0.gguf`。规划器读取草稿的层数、滑窗和 KV 头数，将草稿展开后的权重和 KV 一并计入预算。
+
+要调整 Inkling 的 KV 容量，可用 `--tokens` 指定所有请求共享的 token 数，用 `--max_context_length` 限制单请求长度。`--kv_cache_limit` 使用手动部署入口。
 
 Qwen3.8-27B-FP8 已验证 `--auto`：优先选择纯 GPU TP，默认并发 4、模型原生上下文和内置 MTP5，显存不足时降低上下文。并发 MTP 验证默认采用 eager CUDA 路径，以避开批量验证 CUDA Graph 的非法内存访问；可用 `FASTLLM_QWEN35_MTP_VERIFY_CUDA_GRAPH=1` 显式覆盖。其他 Qwen3.5 架构 checkpoint 的量化格式和 MTP 权重仍需分别验证。
 
