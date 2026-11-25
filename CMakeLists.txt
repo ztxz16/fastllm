@@ -897,6 +897,10 @@ if(USE_ROCM)
     endif()
 endif()
 
+if (USE_CUDA OR USE_ROCM)
+    list(APPEND FASTLLM_CUDA_SOURCES src/devices/cuda/models/naive-n05-draft-backend.cpp)
+endif()
+
 if (USE_IVCOREX)
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cudart)
     set(CMAKE_CUDA_ARCHITECTURES ${IVCOREX_ARCH})
@@ -1136,6 +1140,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         NAIVERT_SM_COUNT=148 NAIVERT_TP_RANKS=8 NAIVERT_HIDDEN=4096
         NAIVERT_VOCAB_SHARD=19072 NAIVERT_NORM_EPS=1e-05)
     set_property(SOURCE src/devices/multicuda/fastllm-naive-draft-execution.cpp
+        src/devices/cuda/models/naive-n05-draft-backend.cpp
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_DRAFT_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_draft_fused>)
     add_library(fastllm_shared_flex_sm103 OBJECT
@@ -2832,6 +2837,9 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_draft_ops PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 150)
         add_executable(naive_n05_draft_fusion_test test/basic/test_naive_n05_draft_fusion.cpp)
         target_link_libraries(naive_n05_draft_fusion_test PRIVATE fastllm)
+        if (TARGET fastllm_draft_fused)
+            target_compile_definitions(naive_n05_draft_fusion_test PRIVATE FASTLLM_ENABLE_DRAFT_FUSED)
+        endif()
         target_include_directories(naive_n05_draft_fusion_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         add_test(NAME naive_n05_draft_fusion COMMAND naive_n05_draft_fusion_test)
         set_tests_properties(naive_n05_draft_fusion PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)

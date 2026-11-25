@@ -2872,6 +2872,11 @@ struct DeviceDraftBatch {
     const DraftBatchRow *rows;
     const uint64_t *cacheBindings = nullptr;
 };
+// In a singleton graph the descriptor fits in the kernel arguments. Only
+// the KV addresses change at replay and are read from the owner binding table.
+__device__ __forceinline__ DraftBatchRow DraftRow(const DraftBatchRow &row, int) {
+    return ResolveDraftRow(row);
+}
 __device__ __forceinline__ DraftBatchRow DraftRow(const DraftBatch &batch, int index) {
     return ResolveDraftRow(batch.rows[index]);
 }
@@ -2901,14 +2906,18 @@ using DraftFlashParams = flashinfer::SinglePrefillParams<BF16, BF16, BF16>;
 using DraftFlashTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
     64, 1, 2, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone,
     BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
-__global__ __launch_bounds__(128) void BatchDraftFlash(DeviceDraftBatch batch, DraftFlashParams p) {
+using DraftFlashSmallTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kNone,
+    16, 1, 1, 8, 8, 1, 4, flashinfer::PosEncodingMode::kNone,
+    BF16, BF16, BF16, float, int, DraftFlashAttention, false>;
+template<class Batch, class Traits = DraftFlashTraits>
+__global__ __launch_bounds__(128) void BatchDraftFlash(Batch batch, DraftFlashParams p) {
     const auto r = DraftRow(batch, blockIdx.y);
     if (!r.key || !r.value) return; // Padding has no KV and no published output.
     p.q = const_cast<BF16 *>(r.input); p.k = r.key; p.v = r.value; p.o = r.output;
     p.kv_len = min(*r.live - 1, p.window_left) + p.qo_len;
     extern __shared__ uint8_t smem[];
-    auto &storage = *reinterpret_cast<DraftFlashTraits::SharedStorageSingle *>(smem);
-    flashinfer::SinglePrefillWithKVCacheDevice<DraftFlashTraits>(p, storage,
+    auto &storage = *reinterpret_cast<typename Traits::SharedStorageSingle *>(smem);
+    flashinfer::SinglePrefillWithKVCacheDevice<Traits>(p, storage,
         threadIdx, blockIdx.x, 0, blockIdx.z, 1, p.num_kv_heads);
 }
 #endif
@@ -3118,7 +3127,8 @@ bool FastllmCudaNaiveDraftCacheBindingsSupported(int count, int rows,
 #ifdef FASTLLM_NAIVE_SWA_FLASHINFER
     return count > 0 && rows > 1 && rows < 32 && heads > 0 && kvHeads > 0 &&
         heads % kvHeads == 0 && heads / kvHeads <= 32 && dim == 128 && window >= rows &&
-        BulkKernelSupported(BatchDraftFlash, sizeof(DraftFlashTraits::SharedStorageSingle), 80);
+        (count == 1 ? BulkKernelSupported(BatchDraftFlash<DraftBatchRow>, sizeof(DraftFlashTraits::SharedStorageSingle), 80) :
+                      BulkKernelSupported(BatchDraftFlash<DeviceDraftBatch>, sizeof(DraftFlashTraits::SharedStorageSingle), 80));
 #else
     return false;
 #endif
@@ -3157,11 +3167,20 @@ bool FastllmCudaNaiveBatchDraftQKV(const fastllm::Data &raw,
     Output(query, BFLOAT16, {1, raw.dims[1], heads * dim});
     for (int i = 0; i < count; ++i) descriptors[i].query = (BF16 *)query.cudaData + (size_t)i * rows * heads * dim;
     if (descriptorsWorkspace && (count > kDraftBatchLimit || cacheBindings)) {
-        DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace),
-            cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
-        BatchDraftQKV<<<dim3(heads + kvHeads, rows * count), 256, 0, cudaStreamPerThread>>>(batch,
-            (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
-            rows, heads, kvHeads, dim, window, eps, theta);
+        auto launch = [&](auto batch) {
+            BatchDraftQKV<<<dim3(heads + kvHeads, rows * count), 256, 0, cudaStreamPerThread>>>(batch,
+                (const float *)qNorm.cudaData, (const float *)kNorm.cudaData,
+                rows, heads, kvHeads, dim, window, eps, theta);
+        };
+        if (count == 1 && cacheBindings) {
+            auto row = descriptors.front();
+            row.cacheTable = static_cast<const void *const *>(cacheBindings->cudaData);
+            launch(row);
+        } else {
+            DeviceDraftBatch batch{DeviceDescriptors(descriptors, *descriptorsWorkspace),
+                cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
+            launch(batch);
+        }
         CheckLaunch();
         return true;
     }
@@ -3220,10 +3239,26 @@ bool FastllmCudaNaiveBatchDraftAttention(const fastllm::Data &query,
             dim, window - 1, 0.f, 1.f / sqrtf(float(dim)), 1.f, 10000.f);
         for (int i = 0; i < count; ++i)
             descriptors[i].output = (BF16 *)output.cudaData + (size_t)i * rows * heads * dim;
-        DeviceDraftBatch batch{DeviceDescriptors(descriptors, scores),
-            cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
-        BatchDraftFlash<<<dim3((rows * (heads / kvHeads) + 63) / 64, count, kvHeads),
-            dim3(32, 4, 1), shared, cudaStreamPerThread>>>(batch, params);
+        const dim3 grid((rows * (heads / kvHeads) + 63) / 64, count, kvHeads), block(32, 4, 1);
+        if (count == 1 && cacheBindings) {
+            auto row = descriptors.front();
+            row.cacheTable = static_cast<const void *const *>(cacheBindings->cudaData);
+            // Tile the packed query rows across CTAs for low-parallelism owner graphs.
+            constexpr size_t smallShared = sizeof(DraftFlashSmallTraits::SharedStorageSingle);
+            static_assert(!DraftFlashSmallTraits::IsInvalid());
+            const int packedRows = rows * (heads / kvHeads);
+            if (kvHeads <= 8 && packedRows > 16 && packedRows <= 64 && window >= 256 &&
+                BulkKernelSupported(BatchDraftFlash<DraftBatchRow, DraftFlashSmallTraits>, smallShared, 80)) {
+                BatchDraftFlash<DraftBatchRow, DraftFlashSmallTraits><<<dim3((packedRows + 15) / 16, 1, kvHeads),
+                    dim3(32, 1, 4), smallShared, cudaStreamPerThread>>>(row, params);
+            } else {
+                BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(row, params);
+            }
+        } else {
+            DeviceDraftBatch batch{DeviceDescriptors(descriptors, scores),
+                cacheBindings ? (const uint64_t *)cacheBindings->cudaData : nullptr};
+            BatchDraftFlash<<<grid, block, shared, cudaStreamPerThread>>>(batch, params);
+        }
         CheckLaunch(); return true;
     }
 #endif
