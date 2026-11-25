@@ -49,6 +49,44 @@ static void TestHybridRouteGrouping() {
     Require(idle.selectPrefill(sparse, 0, 6).slot == 0, "prefill failed to reuse the inactive slot");
 }
 
+static void TestGraphStagingReuse() {
+    using namespace fastllm;
+    MoeFrequencyPolicy frequency(std::vector<int>(8), {0}, 1);
+    int resident = 7;
+    frequency.SetResidents(&resident);
+    frequency.BeginStep();
+    MoeDecodeOverlapScheduler timing;
+    timing.cpuExpert.Observe(100);
+    timing.stagedExpert.Observe(1);
+    timing.copiedExpert.Observe(1000);
+    HybridMoeRoutes plan;
+    HybridMoeGraphSlots slots;
+    slots.keys = {3, 5, 2, 0};
+    auto build = [&](std::vector<int> ids, bool probe) {
+        plan.BuildGraph(ids.data(), ids.size(), 8, 2, 0, &frequency, timing, slots, probe);
+    };
+    // A smaller graph can read any existing slot, but its upload arena only
+    // covers the first two slots. A probe must protect the non-prefix hit.
+    build({0, 1}, false);
+    Require(plan.staged == 1 && plan.misses[0] == 0 && slots.selected == std::vector<int>{3},
+            "reordered cached expert incurred another upload");
+    build({0, 1}, true);
+    Require(plan.staged == 2 && slots.selected[0] == 3 && slots.selected[1] < 2,
+            "small graph refill reused a protected slot or exceeded the upload arena");
+    build({3, 1, 3, 7}, true);
+    Require(slots.selected == std::vector<int>({0, 1}) && plan.stagedRows == 3 &&
+            plan.grouped[3] == std::vector<int>({0, 2}) && plan.residentRows == 1,
+            "refill overwrote an active hit or lost repeated routes");
+    build({7}, false);
+    Require(slots.selected.empty() && plan.staged == 0 && plan.misses.empty() && plan.grouped[3].empty(),
+            "graph replay retained routes from the previous visit");
+    build({3}, false);
+    const int hostOnly[] = {3, 3};
+    plan.BuildGraph(hostOnly, 2, 8, 2, 0, nullptr, timing, slots, true);
+    Require(slots.selected.empty() && plan.staged == 0 && plan.misses == std::vector<int>{3} &&
+            plan.grouped[3].size() == 2, "host-only replay retained a GPU slot");
+}
+
 static void TestFrequencyAdmission() {
     using fastllm::MoeCacheConfig;
     using fastllm::MoeFrequencyPolicy;
@@ -749,6 +787,7 @@ static void TestPrefillCpuFeedback() {
 
 int main() {
     TestHybridRouteGrouping();
+    TestGraphStagingReuse();
     TestPrefillCpuFeedback();
     TestPrefillThresholdSearch();
     TestWorkspaceSlots();

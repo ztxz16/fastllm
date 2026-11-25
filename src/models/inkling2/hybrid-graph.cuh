@@ -32,7 +32,8 @@ struct HybridGraphStorage {
     struct Arena {
         uint8_t *host = nullptr, *mapped = nullptr;
         size_t capacity;
-        std::vector<int> expertIds, cpuRoutes, uploadIds;
+        HybridMoeRoutes plan;
+        std::vector<int> cpuRoutes, uploadIds;
         std::vector<CpuExpertGroup> groups;
         HostProjectionInput input;
         std::vector<float> output;
@@ -81,11 +82,11 @@ struct HybridGraphStorage {
             std::fill_n(slots, 3 * routes, -1);
             arena->uploadIds.clear();
             control[0] = 0;
-            arena->expertIds.assign(expertIds, expertIds + routes);
             auto *policy = cycle ? &cycle->policy : nullptr;
             const int experts = gate.host.size(), base = layer * experts;
-            HybridMoeRoutes plan(arena->expertIds, experts, rows, base, false, policy, cache.timing,
-                                 cache.count - cache.resident, sample && sample->probeUpload());
+            auto &plan = arena->plan;
+            plan.BuildGraph(expertIds, routes, experts, rows, base, policy, cache.timing, cache.staging,
+                            sample && sample->probeUpload());
             if (sample) sample->routes(plan);
             for (int e : plan.hits)
                 for (int r : plan.grouped[e]) slots[routes + r] = slots[r] = policy->Slot(base + e) - layer * cache.resident;
@@ -93,14 +94,16 @@ struct HybridGraphStorage {
                 const int expert = plan.misses[i];
                 const auto &group = plan.grouped[expert];
                 if (int(i) < plan.staged) {
-                    if (cache.stagedKeys[i] != expert) {
-                        arena->uploadIds.resize(i + 1, -1);
-                        arena->uploadIds[i] = expert;
+                    const int slot = cache.staging.selected[i];
+                    if (cache.staging.keys[slot] != expert) {
+                        if (arena->uploadIds.empty())
+                            arena->uploadIds.assign(std::min<int>(routes, cache.staging.keys.size()), -1);
+                        arena->uploadIds[slot] = expert;
                         ++sample->uploads;
-                        control[0] |= 1u << i;
-                        cache.stagedKeys[i] = expert;
+                        control[0] |= 1u << slot;
+                        cache.staging.keys[slot] = expert;
                     }
-                    for (int r : group) slots[2 * routes + r] = slots[r] = cache.resident + i;
+                    for (int r : group) slots[2 * routes + r] = slots[r] = cache.resident + slot;
                 } else {
                     arena->groups.push_back({expert, int(arena->cpuRoutes.size()), int(group.size())});
                     arena->cpuRoutes.insert(arena->cpuRoutes.end(), group.begin(), group.end());
@@ -160,7 +163,7 @@ struct HybridGraphStorage {
             } catch (...) {
                 v.control[0] = 0;
                 std::fill_n(v.control + 1, 3 * v.routes, -1);
-                std::fill(v.cache.stagedKeys.begin(), v.cache.stagedKeys.end(), -1);
+                std::fill(v.cache.staging.keys.begin(), v.cache.staging.keys.end(), -1);
                 v.arena->cpuRoutes.clear();
                 v.arena->uploadIds.clear();
                 throw;

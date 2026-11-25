@@ -106,7 +106,7 @@ struct HybridExpertRecords {
     Buffer<uint8_t *> weights;
     Buffer<float *> scales;
     CudaIndexedMoeSlots view{};
-    std::vector<int> stagedKeys;
+    HybridMoeGraphSlots staging;
     MoeDecodeOverlapScheduler timing;
     cudaEvent_t start = nullptr, middle = nullptr, done = nullptr;
     cuda::HybridMoeAdmissions::Publication publication;
@@ -139,7 +139,7 @@ struct HybridExpertRecords {
             view.gateScales = scales.p;
             view.downScales = scales.p + slots;
         }
-        stagedKeys.assign(count - resident, -1);
+        staging.keys.assign(count - resident, -1);
         if (slots == experts) {
             for (int i = 0; i < experts; ++i) upload(i, i, gate, down);
         }
@@ -158,10 +158,10 @@ struct HybridExpertRecords {
     }
     void admit(int expert, int slot, const Projection &gate, const Projection &down,
                cudaStream_t stream, cuda::ImmutableHostUploadRing *ring = nullptr) {
-        auto it = std::find(stagedKeys.begin(), stagedKeys.end(), expert);
+        const int staged = staging.Find(expert);
         auto *dst = data.p + size_t(slot) * stride;
-        if (it != stagedKeys.end()) {
-            auto *src = data.p + size_t(resident + (it - stagedKeys.begin())) * stride;
+        if (staged >= 0) {
+            auto *src = data.p + size_t(resident + staged) * stride;
             check(cudaMemcpyAsync(dst, src, stride, cudaMemcpyDeviceToDevice, stream));
             return;
         }
@@ -361,9 +361,9 @@ class HostExperts final : public RoutedExperts {
         using Clock = std::chrono::steady_clock;
         const auto uploadStart = Clock::now();
         for (int i = 0; i < staged; ++i) {
-            cache.stagedKeys[i] = -1;
+            cache.staging.keys[i] = -1;
             cache.upload(misses[i], cache.resident + i, gate, down);
-            cache.stagedKeys[i] = misses[i];
+            cache.staging.keys[i] = misses[i];
             append(misses[i], cache.resident + i);
         }
         if (staged) timing.copiedExpert.Observe(std::chrono::duration<double, std::micro>(Clock::now() - uploadStart).count() / staged);
