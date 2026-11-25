@@ -1,11 +1,11 @@
 {
   "repository": "https://github.com/deepseek-ai/DeepGEMM",
   "commit": "5081f8513af57e61696de4f4f04b0e707ffb503e",
-  "changes": "C++ namespace isolation for FastLLM, bounded ring signal storage and trailing whitespace cleanup; numerical kernel is unmodified.",
+  "changes": "FastLLM namespace and workspace layout, graph barriers, batched projection and accumulation, and local MegaMoE dispatch.",
   "headers": {
     "deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh": {
       "original_sha256": "9d577f200e482fb2deed3e9d8a8b6ec0f71d15df2782d4b8f0a5321102ccc970",
-      "installed_sha256": "4eb3dcd342da0619a8c9c10f174dd83a05de1c122bc6bf07d84ee50780cd3616",
+      "installed_sha256": "3f277e2c5267002e53a43cbf6a6ddf35fbffbf4da5321e46a2f34f0e445b8ed9",
       "adapted": true
     },
     "deep_gemm/ptx/utils.cuh": {
@@ -55,7 +55,7 @@
     },
     "deep_gemm/common/types.cuh": {
       "original_sha256": "0382bf27efb6deea5dc21a4f8ae21296494e513166c2682c63e498c70cefa6b2",
-      "installed_sha256": "39f4484c538b25f10be507c498bf55940e43f69058a0cb393cbefdefbffa46d9",
+      "installed_sha256": "dd4051d6219cd063988519d37db578646af96b4af8eaf49aac0c1a9febd32b66",
       "adapted": true
     },
     "deep_gemm/common/math.cuh": {
@@ -85,7 +85,7 @@
     },
     "deep_gemm/comm/barrier.cuh": {
       "original_sha256": "ef2906925dc5ab5178df4ba6a9a41da74270cebecd892d5a7a01dbdeab5dfd69",
-      "installed_sha256": "193061777e29d19c2c815d727721fa9a976270b7186568faeffd972dd80b9bfa",
+      "installed_sha256": "d8cfb63f2b6bdc38a4b3b24f91342d51ff08203ccd80f8d2b81a1d25d63785d4",
       "adapted": true
     },
     "deep_gemm/common/utils.cuh": {
@@ -110,7 +110,7 @@
     },
     "deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh": {
       "original_sha256": "f567031e4f6e2b86b0ee99560c3eaff0160623a82e01aff0559fbeb3c2ec17b4",
-      "installed_sha256": "22b48f7b20d024615cb27898821467ab48ab8b60ee79e10c0a984f4d4577c70b",
+      "installed_sha256": "889445ea126e565957946b4f4ca319d80c5abb78055cc642a2a66a00e7b5e925",
       "adapted": true
     },
     "deep_gemm/layout/gemm.cuh": {
