@@ -163,16 +163,32 @@ __device__ void Scores(const Args &a, BF *keys) {
         for (int j = 0; j < 6; ++j)
             q[j] = float(a.query[(row * Heads + head) * 192 + lane + j * 32]);
         __syncthreads();
-        for (int off = warp / 8 * 16; off < (warp / 8 + 1) * 16; ++off) {
-            float dot = 0;
+        // Give each lane pair one score. At each shuffle distance the lower
+        // and upper lanes reduce different keys, preserving the original FP32 tree.
+        constexpr int Keys = 16;
+        const int base = warp / 8 * Keys;
+        float dots[Keys]{};
+#pragma unroll
+        for (int k = 0; k < Keys; ++k) {
 #pragma unroll
             for (int j = 0; j < 6; ++j)
-                dot = fmaf(q[j], float(keys[off * 200 + lane + j * 32]), dot);
-            dot = CustomArNormWarpSum(dot);
-            if (!lane)
-                a.scores[(row * Heads + head) * a.stride + first + off] =
-                    tokens[off] < 0 ? -INFINITY : CustomArNormRound(CustomArNormRound(dot) * rsqrtf(192.f));
+                dots[k] = fmaf(q[j], float(keys[(base + k) * 200 + lane + j * 32]), dots[k]);
         }
+#pragma unroll
+        for (int half = Keys / 2; half; half /= 2) {
+            const bool upper = lane & (2 * half);
+#pragma unroll
+            for (int k = 0; k < half; ++k) {
+                const float lo = dots[k], hi = dots[k + half];
+                const float peer = __shfl_xor_sync(0xffffffffu, upper ? lo : hi, 2 * half);
+                dots[k] = upper ? peer + hi : lo + peer;
+            }
+        }
+        const float dot = dots[0] + __shfl_down_sync(0xffffffffu, dots[0], 1);
+        const int off = base + lane / 2;
+        if (!(lane & 1))
+            a.scores[(row * Heads + head) * a.stride + first + off] =
+                tokens[off] < 0 ? -INFINITY : CustomArNormRound(CustomArNormRound(dot) * rsqrtf(192.f));
         __syncthreads();
     }
 }

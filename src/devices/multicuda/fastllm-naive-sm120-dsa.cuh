@@ -146,7 +146,9 @@ __device__ unsigned long long *ShardTopK(const Args &a, IndexSortStorage &sort, 
         for (int row = 0; row < a.rows; ++row)
             count = max(count, nkeys(row));
         liveTiles = max(1, (count + K - 1) / K);
-        if (liveTiles == 1) return source;
+        // An extra item per thread lets the owner sort a short second tile
+        // directly to its peer mailbox, without a grid-wide merge.
+        if (count <= 5 * Threads) return source;
     }
     for (int task = blockIdx.x; task < a.rows * liveTiles; task += gridDim.x) {
         const int row = task / liveTiles, first = (task % liveTiles) * K;
@@ -231,8 +233,10 @@ __device__ void SendSelectionRoot(const Args &a, IndexSortStorage &sort,
             SortIndexTile<1, true>(a, row, n, 0, dest, sort.shortList);
         else if (n <= 2 * Threads)
             SortIndexTile<2, true>(a, row, n, 0, dest, sort.fullList);
-        else
+        else if (n <= 2048)
             SortIndexTile<4, true>(a, row, n, 0, dest, sort.topK);
+        else
+            SortIndexTile<5, true>(a, row, n, 0, dest, sort.overflow);
     } else if (n > 0) {
         const auto *left = roots + size_t(row) * a.shardWidth;
         const int na = min(2048, n), nb = min(2048, max(0, n - span * 2048));
@@ -359,7 +363,11 @@ __global__ __launch_bounds__(Threads, 2) void DsaLayer(
         // Overlap the O-weight prefetch with the ordered 64-key PV partial reduction.
         if (cta < OutputBlocks)
             StageVerifyOutputWeight(a, panel);
-        for (int i = cta * Threads + t; i < 8 * 1024; i += gridDim.x * Threads) {
+        // Distribute the 32-part reduction over the output CTAs instead of
+        // concentrating all 8192 channels on the first 16 blocks.
+        constexpr int ChannelsPerBlock = 8 * 1024 / OutputBlocks;
+        if (cta < OutputBlocks && t < ChannelsPerBlock) {
+            const int i = cta * ChannelsPerBlock + t;
             float sum = 0;
             for (int p = 0; p < 32; ++p)
                 sum += a.partials[(i / 1024 * 32 + p) * 1024 + i % 1024];

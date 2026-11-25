@@ -168,7 +168,7 @@ __device__ void SortIndexTile(const Args &a, int row, int n, int first, unsigned
     ShardSort<Items>(storage).SortDescendingBlockedToStriped(keys, positions);
 #pragma unroll
     for (int j = 0; j < Items; ++j)
-        if (!LimitStores || first + int(threadIdx.x) + j * Threads < n)
+        if (!LimitStores || first + int(threadIdx.x) + j * Threads < min(n, 2048))
             output[threadIdx.x + j * Threads] =
                 (static_cast<unsigned long long>(keys[j]) << 32) | ~unsigned(positions[j]);
 }
@@ -179,6 +179,7 @@ union IndexSortStorage {
     ShardSort<1>::TempStorage shortList;
     ShardSort<2>::TempStorage fullList;
     ShardSort<4>::TempStorage topK;
+    ShardSort<5>::TempStorage overflow;
 };
 __device__ void PublishIndexRow(const Args &a, int row, int n, IndexSortStorage &sort) {
     auto *dst = reinterpret_cast<unsigned long long *>(a.projection) + row * 1024;
