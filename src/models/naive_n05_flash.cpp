@@ -1218,7 +1218,7 @@ Data NaiveN05FlashModel::RunTarget(
         const auto layerPlan = verifyPlan.ForLayer(ring, pendingMlp, localIndexer,
             batch && batch->Size() == 1 && capture && capture->ringVerify && buf.cacheTable &&
                 !initialNormPending && weight.weight.count(ap + "mergeqkv.weight"),
-            tpSwaRingCache, contextSharded && !sparseLayer && indexFp8 && indexerCompute == NaiveIndexerCompute::FP8);
+            tpSwaRingCache, indexerContextSharding && separateIndex && !sparseLayer && indexFp8 && indexerCompute == NaiveIndexerCompute::FP8);
         if (layerPlan) {
             FastllmNaiveVerifyAttentionInput input;
             input.branch = pendingMlp;

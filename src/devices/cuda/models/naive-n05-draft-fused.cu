@@ -834,66 +834,6 @@ void RunBody(State &s,int rank,int requests,B *hidden,const int *live,
 }
 }
 using namespace fastllm_draft_fused;
-extern "C" int FastllmDraftLocalAttentionPlan(int device, int rows, int heads, int kvHeads, int dim,
-        int window, int *partialFloats) {
-    using Op = ReplicaAttention;
-    if (rows < 7 || rows > 8 || heads != Op::Heads || kvHeads != Op::KVHeads || dim != Op::Dim ||
-        window < rows || window > 1024) return 0;
-    static thread_local int lastDevice = -1, blocks = 0;
-    if (device != lastDevice) {
-        cudaDeviceProp props{};
-        Check(cudaGetDeviceProperties(&props, device));
-        blocks = 0;
-        if (props.major == 10 && props.minor == 3 && props.cooperativeLaunch) {
-            int active = 0;
-            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,
-                FusedDraftAttention<ReplicaAttention>, Op::Threads, 0));
-            blocks = std::min(Op::Width / 8, active * props.multiProcessorCount);
-        }
-        lastDevice = device;
-    }
-    *partialFloats = ((window - 1 + rows + Op::Chunk - 1) / Op::Chunk) * heads * rows * Op::Stride;
-    return blocks;
-}
-
-extern "C" void FastllmDraftLocalAttentionRun(int blocks, const FastllmDraftLocalAttention &x, void *stream) {
-    using BF = ReplicaAttention::BF;
-    ReplicaAttention::Args a{static_cast<const BF *>(x.input), static_cast<const BF *>(x.qkvWeight),
-        static_cast<const BF *>(x.oWeight), x.qNorm, x.kNorm, x.postNorm, x.positions, x.live, x.binding,
-        static_cast<BF *>(x.raw), static_cast<BF *>(x.attention), static_cast<BF *>(x.residual),
-        static_cast<BF *>(x.output), x.partials, x.normScratch, x.rows, x.window, x.eps, x.theta};
-    void *params[] = {&a};
-    Check(cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(FusedDraftAttention<ReplicaAttention>),
-        blocks, ReplicaAttention::Threads, params, 0, stream ? static_cast<cudaStream_t>(stream) : cudaStreamPerThread));
-}
-extern "C" int FastllmDraftFusedLocalMlpBlocks(int device) {
-    // A cooperative grid must fit concurrently. Cache the check during warmup;
-    // launch geometry and weight addresses are independent of the request.
-    static thread_local int lastDevice = -1, blocks = 0;
-    if (device != lastDevice) {
-        cudaDeviceProp props{};
-        int active = 0;
-        Check(cudaGetDeviceProperties(&props, device));
-        blocks = 0;
-        if (props.major == 10 && props.minor == 3 && props.cooperativeLaunch) {
-            Check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &active, FusedDraftMlp<ReplicaMlp>, ReplicaMlp::Threads, 0));
-            blocks = std::min(ReplicaMlp::Width / 8, active * props.multiProcessorCount);
-        }
-        lastDevice = device;
-    }
-    return blocks >= ReplicaMlp::Rows ? blocks : 0;
-}
-extern "C" void FastllmDraftFusedLocalMlpRun(int blocks, int rows, const void *normalized,
-        const void *gateUp, const void *down, void *middle, void *normScratch, void *residual,
-        const float *gamma, float eps, void *output, void *stream) {
-    ReplicaMlp::Args args{static_cast<const B *>(normalized), static_cast<const B *>(gateUp),
-        static_cast<const B *>(down), static_cast<B *>(middle), static_cast<float *>(normScratch),
-        static_cast<B *>(residual), static_cast<B *>(output), gamma, eps, rows};
-    void *params[] = {&args};
-    Check(cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(FusedDraftMlp<ReplicaMlp>),
-        blocks, ReplicaMlp::Threads, params, 0, stream ? static_cast<cudaStream_t>(stream) : cudaStreamPerThread));
-}
 extern "C" bool FastllmDraftFusedSupported(const int *devices, int ranks) {
     if (!devices || ranks != 8) return false;
     for (int i = 0; i < ranks; ++i) {

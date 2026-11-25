@@ -58,7 +58,7 @@ __device__ inline void NormalizeIndex(B *x, const float *norm, const float *bias
         x[t] = __float2bfloat16_rn((float(x[t]) - mean) * inverseStd * norm[t] + bias[t]);
     __syncthreads();
 }
-__device__ __forceinline__ void RotateWarp(const B *source, B *output, int dim, float cs, float sn) {
+template<class Output> __device__ __forceinline__ void RotateWarp(const B *source, Output output, int dim, float cs, float sn) {
     int lane = threadIdx.x % 32;
     float x = float(source[lane]), y = float(source[lane + 32]);
     output[lane] = __float2bfloat16_rn(Round(x * cs) - Round(y * sn));

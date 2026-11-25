@@ -963,6 +963,21 @@ if (FASTLLM_CUDA_SM120_SOURCES)
     target_include_directories(fastllm_cuda_sm120 BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
         "${FASTLLM_CUTLASS_DIR}/include")
+    set(dp_dsa_source src/devices/cuda/models/naive-n05-dp-dsa-verify.cu)
+    set(dp_draft_source src/devices/cuda/models/naive-n05-draft-replica.cu)
+    if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+        # Both architectures share one host launcher and one graph node.
+        set_property(SOURCE ${dp_dsa_source} ${dp_draft_source} APPEND PROPERTY COMPILE_OPTIONS
+            "--generate-code=arch=compute_120f,code=sm_120f")
+    else()
+        target_sources(fastllm_cuda_sm120 PRIVATE ${dp_dsa_source} ${dp_draft_source})
+        set_property(SOURCE ${dp_dsa_source} ${dp_draft_source} APPEND PROPERTY COMPILE_OPTIONS
+            "--ftz=false" "--prec-div=true" "--prec-sqrt=true")
+        set_property(SOURCE ${dp_dsa_source} APPEND PROPERTY INCLUDE_DIRECTORIES
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/naivert_dsa/include")
+        set_property(SOURCE ${dp_dsa_source} APPEND PROPERTY COMPILE_OPTIONS
+            "--expt-relaxed-constexpr")
+    endif()
     set(FASTLLM_CUDA_SM120_OBJECTS $<TARGET_OBJECTS:fastllm_cuda_sm120>)
 endif()
 
@@ -1126,7 +1141,8 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     set_property(SOURCE src/devices/multicuda/fastllm-custom-allreduce.cu
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DSA_FUSED)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_dsa_fused>)
-    add_library(fastllm_draft_fused OBJECT src/devices/cuda/models/naive-n05-draft-fused.cu)
+    add_library(fastllm_draft_fused OBJECT src/devices/cuda/models/naive-n05-draft-fused.cu
+        src/devices/cuda/models/naive-n05-draft-replica.cu)
     set_target_properties(fastllm_draft_fused PROPERTIES
         CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
     target_include_directories(fastllm_draft_fused BEFORE PRIVATE
@@ -1161,6 +1177,12 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
     target_compile_definitions(fastllm_shared_flex_sm103 PRIVATE FM_RELAXED_MAILBOX=1)
     list(APPEND FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_shared_flex_sm103>)
     message(STATUS "Naive FlexMoE SM103 TP8: built-in, opt-in at runtime")
+endif()
+
+if (TARGET fastllm_draft_fused OR FASTLLM_CUDA_SM120_SOURCES)
+    set_property(SOURCE src/devices/cuda/models/naive-n05-draft-backend.cpp
+        src/devices/multicuda/fastllm-custom-allreduce.cu
+        APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_DP_VERIFY)
 endif()
 
 if (FASTLLM_GLM53_FLASHINFER_SM120_ENABLED)
@@ -2837,7 +2859,7 @@ if (UNIT_TEST)
         set_tests_properties(naive_n05_draft_ops PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 150)
         add_executable(naive_n05_draft_fusion_test test/basic/test_naive_n05_draft_fusion.cpp)
         target_link_libraries(naive_n05_draft_fusion_test PRIVATE fastllm)
-        if (TARGET fastllm_draft_fused)
+        if (TARGET fastllm_draft_fused OR FASTLLM_CUDA_SM120_SOURCES)
             target_compile_definitions(naive_n05_draft_fusion_test PRIVATE FASTLLM_ENABLE_DRAFT_FUSED)
         endif()
         target_include_directories(naive_n05_draft_fusion_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -2955,7 +2977,7 @@ if (UNIT_TEST)
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
         endif()
         if ("src/devices/cuda/models/naive-n05-qkv.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES OR
-            "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
+            "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR FASTLLM_CUDA_SM120_SOURCES)
             add_executable(naive_n05_qkv_test test/basic/test_cuda_naive_qkv.cu)
             target_link_libraries(naive_n05_qkv_test PRIVATE fastllm)
             add_test(NAME naive_n05_qkv COMMAND naive_n05_qkv_test)

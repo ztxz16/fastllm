@@ -12,7 +12,8 @@ bool FastllmCudaStablePrefillReduction(const std::vector<int> &architectures);
 bool FastllmCudaStablePrefillReduction(parallel::CudaRuntime &runtime);
 
 struct NaiveVerifyAttentionPlan {
-    bool packed = false, swa = false, dsa = false, replica = false, replicaDsa = false;
+    bool packed = false, swa = false, dsa = false, replicaLocalDsa = false;
+    int replicaArch = 0;
     struct Layer {
         bool packed, swa, dsa, replica;
         explicit operator bool() const { return packed || swa || dsa || replica; }

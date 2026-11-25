@@ -3,10 +3,10 @@
 // for QK. Recompute ambiguous BF16 roundings in the existing scalar order.
 // Sparse PV retains the original 64-token FMA groups and ordered merge.
 #include "naive-n05-attention-bulk.cuh"
+#include "naive-n05-exact-qk.cuh"
 namespace naive_attention_small {
 using namespace naive_attention_bulk;
 using naive_dsa_decode::Round;
-using naive_dsa_decode::WarpSum;
 template <int Groups> struct ScoreStorage {
     BF query[Groups][200], keys[128][200];
     int selected[128];
@@ -17,16 +17,6 @@ template <int Groups> struct SparseScoreStorage : ScoreStorage<Groups> {
     int workCount, work[Groups * 128];
 };
 
-// BF16 operands have exact FP32 products for normal finite model values.
-// Check both ends of a conservative FP32 reduction error interval. Borderline
-// roundings are recomputed using the original six-FMA / warp-tree order.
-constexpr float Error16 = 0x1.1p-20f;
-__device__ inline bool UncertainBound(float sum, float error) {
-    error += 0x1p-112f;
-    return !isfinite(sum) || !isfinite(error) ||
-           __bfloat16_as_ushort(__float2bfloat16_rn(sum - error)) !=
-               __bfloat16_as_ushort(__float2bfloat16_rn(sum + error));
-}
 template <int Groups>
 __global__ __launch_bounds__(Groups * 32) void Scores(const BF *query, FastllmNaiveDSABatch batch,
                                                       float *scores, int heads, int kvHeads, int stride) {
@@ -57,40 +47,14 @@ __global__ __launch_bounds__(Groups * 32) void Scores(const BF *query, FastllmNa
                                       k >= 0);
     }
     __syncthreads();
-    float sums[4] = {}, absolute[4] = {}, errors[4] = {};
-    const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
-#pragma unroll
-    for (int d = 0; d < 192; d += 16) {
-        uint32_t a[4], b[2];
-        ld4(a, &s.keys[w * 16 + ar][d + ac]);
-        ld2(b, &s.query[g * 8 + (l & 7)][d + ((l >> 3) & 1) * 8]);
-        float previous[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            previous[j] = sums[j];
-        mma(sums, a, b);
-        {
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                a[j] &= 0x7fff7fffU;
-            b[0] &= 0x7fff7fffU;
-            b[1] &= 0x7fff7fffU;
-            float segment[4] = {};
-            mma(segment, a, b);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                absolute[j] += segment[j];
-                errors[j] += fabsf(previous[j]) + segment[j];
-            }
-        }
-    }
+    const auto tile = naive_exact_qk::DotTile<ld4, ld2, mma>(s.query + g * 8, s.keys, w, l);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int h = g * 8 + (l % 4) * 2 + i % 2, k = w * 16 + l / 4 + (i / 2) * 8;
         if (first + k < n)
             scores[((size_t)row * heads + head + h) * stride + first + k] =
-                s.selected[k] >= 0 ? Round(Round(sums[i]) * rsqrtf(192.f)) : -INFINITY;
-        bool bad = s.selected[k] >= 0 && UncertainBound(sums[i], (errors[i] + absolute[i]) * Error16);
+                s.selected[k] >= 0 ? Round(Round(tile.values[i]) * rsqrtf(192.f)) : -INFINITY;
+        bool bad = s.selected[k] >= 0 && naive_exact_qk::UncertainBound(tile.values[i], tile.bounds[i]);
         unsigned active = __ballot_sync(0xffffffff, bad);
         if (active) {
             int start = 0;
@@ -104,11 +68,7 @@ __global__ __launch_bounds__(Groups * 32) void Scores(const BF *query, FastllmNa
     __syncthreads();
     for (int task = t / 32; task < s.workCount; task += Groups) {
         const int item = s.work[task], h = item / 128, k = item % 128;
-        float dot = 0;
-#pragma unroll
-        for (int d = 0; d < 6; ++d)
-            dot = fmaf(float(s.query[h][l + d * 32]), float(s.keys[k][l + d * 32]), dot);
-        dot = WarpSum(dot);
+        const float dot = naive_exact_qk::WarpDot(s.query[h], s.keys[k], l);
         if (l == 0)
             scores[((size_t)row * heads + head + h) * stride + first + k] = Round(Round(dot) * rsqrtf(192.f));
     }
@@ -178,6 +138,74 @@ __global__ void MergeValues(const float *parts, FastllmNaiveDSABatch batch, BF *
 struct SwaStorage : ScoreStorage<8> {
     BF values[128][136], prob[8][136];
 };
+// Use the same rounding rule for independent and packed candidate rows.
+__device__ __forceinline__ void SwaScores(const BF (*query)[200], const BF (*keys)[200], BF (*prob)[136],
+                                          const float *sink, int head, int n, int w, int l) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    naive_exact_qk::Scores<ld4, ld2, mma>(query, keys, w, l,
+        [=](int k) { return k < n; },
+        [&](int h, int k, float value) { prob[h][k] = __float2bfloat16(value); });
+    __syncthreads();
+    Normalize<128, false>(&prob[0][0], sink, head, n, w, l);
+    __syncthreads();
+#endif
+}
+__device__ __forceinline__ void SwaValues(const BF (*values)[136], const BF (*prob)[136], BF *out,
+                                          int n, int w, int l) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    float sums[4] = {}, errors[4] = {};
+#pragma unroll
+    for (int k = 0; k < 128; k += 16) {
+        uint32_t a[4], b[2];
+        ldt4(a, &values[k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
+        ld2(b, &prob[l & 7][k + ((l >> 3) & 1) * 8]);
+        float previous[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+            previous[j] = sums[j];
+        mma(sums, a, b);
+        {
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                a[j] &= 0x7fff7fffU;
+            b[0] &= 0x7fff7fffU;
+            b[1] &= 0x7fff7fffU;
+            float segment[4] = {};
+            mma(segment, a, b);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                errors[j] = errors[j] * (1.f + naive_exact_qk::Error16) + 2.f * naive_exact_qk::Error16 * (fabsf(previous[j]) + segment[j]);
+        }
+    }
+    {
+        bool repair = false;
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            repair = repair || naive_exact_qk::UncertainBound(sums[i], errors[i]);
+        if (repair) {
+            float exact[4] = {};
+            int h = (l % 4) * 2, c = w * 16 + l / 4;
+            for (int k = 0; k < n; ++k) {
+                float p0 = float(prob[h][k]), p1 = float(prob[h + 1][k]), v0 = float(values[k][c]),
+                      v1 = float(values[k][c + 8]);
+                exact[0] = fmaf(p0, v0, exact[0]);
+                exact[1] = fmaf(p1, v0, exact[1]);
+                exact[2] = fmaf(p0, v1, exact[2]);
+                exact[3] = fmaf(p1, v1, exact[3]);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i)
+                sums[i] = exact[i];
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        int h = (l % 4) * 2 + i % 2, c = w * 16 + l / 4 + (i / 2) * 8;
+        out[h * 128 + c] = __float2bfloat16(sums[i]);
+    }
+
+#endif
+}
 __global__ __launch_bounds__(256) void Swa(const BF *query, FastllmNaiveDSABatch batch, const float *sink,
                                            BF *out, int heads, int kvHeads) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -211,108 +239,8 @@ __global__ __launch_bounds__(256) void Swa(const BF *query, FastllmNaiveDSABatch
                                       value.Row(max(k, 0), kvHeads * 128) + kh * 128 + d, k >= 0);
     }
     __syncthreads();
-    float scores[4] = {}, magnitudes[4] = {}, qerror[4] = {};
-    const int ar = (l & 7) + ((l >> 3) & 1) * 8, ac = (l >> 4) * 8;
-#pragma unroll
-    for (int d = 0; d < 192; d += 16) {
-        uint32_t a[4], b[2];
-        ld4(a, &s.keys[w * 16 + ar][d + ac]);
-        ld2(b, &s.query[l & 7][d + ((l >> 3) & 1) * 8]);
-        float previous[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            previous[j] = scores[j];
-        mma(scores, a, b);
-        {
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                a[j] &= 0x7fff7fffU;
-            b[0] &= 0x7fff7fffU;
-            b[1] &= 0x7fff7fffU;
-            float segment[4] = {};
-            mma(segment, a, b);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                magnitudes[j] += segment[j];
-                qerror[j] += fabsf(previous[j]) + segment[j];
-            }
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int h = (l % 4) * 2 + i % 2, k = w * 16 + l / 4 + (i / 2) * 8;
-        {
-            unsigned active = __ballot_sync(
-                0xffffffff, k < n && UncertainBound(scores[i], (qerror[i] + magnitudes[i]) * Error16));
-            while (active) {
-                int owner = __ffs(active) - 1;
-                active &= active - 1;
-                int hh = __shfl_sync(0xffffffff, h, owner), kk = __shfl_sync(0xffffffff, k, owner);
-                float dot = 0;
-#pragma unroll
-                for (int d = 0; d < 6; ++d)
-                    dot = fmaf(float(s.query[hh][l + d * 32]), float(s.keys[kk][l + d * 32]), dot);
-                dot = WarpSum(dot);
-                dot = __shfl_sync(0xffffffff, dot, 0);
-                if (l == owner)
-                    scores[i] = dot;
-            }
-        }
-        s.prob[h][k] = __float2bfloat16(k < n ? Round(Round(scores[i]) * rsqrtf(192.f)) : -INFINITY);
-    }
-    __syncthreads();
-    Normalize<128, false>(&s.prob[0][0], sink, head, n, w, l);
-    __syncthreads();
-    float sums[4] = {}, errors[4] = {};
-#pragma unroll
-    for (int k = 0; k < 128; k += 16) {
-        uint32_t a[4], b[2];
-        ldt4(a, &s.values[k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
-        ld2(b, &s.prob[l & 7][k + ((l >> 3) & 1) * 8]);
-        float previous[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j)
-            previous[j] = sums[j];
-        mma(sums, a, b);
-        {
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                a[j] &= 0x7fff7fffU;
-            b[0] &= 0x7fff7fffU;
-            b[1] &= 0x7fff7fffU;
-            float segment[4] = {};
-            mma(segment, a, b);
-#pragma unroll
-            for (int j = 0; j < 4; ++j)
-                errors[j] = errors[j] * (1.f + Error16) + 2.f * Error16 * (fabsf(previous[j]) + segment[j]);
-        }
-    }
-    {
-        bool repair = false;
-#pragma unroll
-        for (int i = 0; i < 4; ++i)
-            repair = repair || UncertainBound(sums[i], errors[i]);
-        if (repair) {
-            float exact[4] = {};
-            int h = (l % 4) * 2, c = w * 16 + l / 4;
-            for (int k = 0; k < n; ++k) {
-                float p0 = float(s.prob[h][k]), p1 = float(s.prob[h + 1][k]), v0 = float(s.values[k][c]),
-                      v1 = float(s.values[k][c + 8]);
-                exact[0] = fmaf(p0, v0, exact[0]);
-                exact[1] = fmaf(p1, v0, exact[1]);
-                exact[2] = fmaf(p0, v1, exact[2]);
-                exact[3] = fmaf(p1, v1, exact[3]);
-            }
-#pragma unroll
-            for (int i = 0; i < 4; ++i)
-                sums[i] = exact[i];
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        int h = (l % 4) * 2 + i % 2, c = w * 16 + l / 4 + (i / 2) * 8;
-        out[((size_t)row * heads + head + h) * 128 + c] = __float2bfloat16(sums[i]);
-    }
+    SwaScores(s.query, s.keys, s.prob, sink, head, n, w, l);
+    SwaValues(s.values, s.prob, out + (size_t(row) * heads + head) * 128, n, w, l);
 
 #endif
 }

@@ -17,7 +17,7 @@
 #include "naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-naive-verify.h"
 #include "devices/cuda/naive-n05-swa-verify.cuh"
-#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+#ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
 #include "devices/cuda/naive-n05-dp-dsa-verify.cuh"
 #endif
 
@@ -4302,7 +4302,7 @@ static bool RunReplicaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x)
     if (x.sliding) {
         if (c.kvHeads != 8 || c.window != 128) return false;
     } else {
-#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+#ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
         if (c.kvHeads != 4 || x.indexHeads != 16 || x.indexDim != 128 || x.topK != 2048 ||
             !x.fp8Query || x.fp8IndexerCache || x.capacity <= 8192 || x.capacity > 65536) return false;
 #else
@@ -4320,12 +4320,12 @@ static bool RunReplicaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x)
     if (x.sliding)
         ready = FastllmCudaTryPackedSwaVerify(*x.qkv, *x.positions, *x.live, cache, *x.sink,
             c.heads, c.kvHeads, x.theta, x.valueScale, packed, *x.attention, projection->projectPdl != nullptr);
-#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+#ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
     else
         ready = FastllmCudaTryDpDSAVerify(*x.normed, *x.qkv, *x.indexKeyWeight, *x.indexQueryWeight,
             *x.indexWeight, *x.indexNorm, *x.indexBias, *x.sink, *x.positions, *x.live,
             *cache.key, *cache.value, cache.cache, x.capacity, x.theta, x.valueScale,
-            packed, *x.scratch, *x.attention, true);
+            packed, *x.scratch, *x.attention, projection->projectPdl != nullptr);
 #endif
     if (!ready) return false;
     if (!projection->TryProject(packed, *x.attention, *x.outputWeight, fastllm::Data(), *x.projected, true))

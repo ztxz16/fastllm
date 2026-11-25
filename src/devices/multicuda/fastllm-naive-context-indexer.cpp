@@ -34,9 +34,8 @@ NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, in
     // TP attention consumes all verification rows even when EP distributes the experts.
     plan.packed = requests && requests->size() == 1 && FastllmCudaPackedVerifySupported(rows, tpRanks);
     if (localAttentionRanks == 1) {
-        const int arch = FastllmCudaRuntimeArch();
-        plan.replica = arch == 100 || arch == 103;
-        plan.replicaDsa = arch == 103 && localDsa;
+        plan.replicaArch = FastllmCudaRuntimeArch();
+        plan.replicaLocalDsa = localDsa && (plan.replicaArch == 103 || plan.replicaArch == 120);
     }
     if (requests && integratedExperts) {
         plan.swa = ringCache && rows <= 16 && FastllmCudaSwaVerifyLayerSupported(device, rows);
@@ -47,9 +46,11 @@ NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, in
 }
 NaiveVerifyAttentionPlan::Layer NaiveVerifyAttentionPlan::ForLayer(bool sliding, bool residual, bool localIndexer,
         bool packedCache, bool ringCache, bool contextIndex) const {
+    const bool replicaSwa = replicaArch == 100 || replicaArch == 103 || replicaArch == 120;
+    const bool replicaDsa = replicaLocalDsa || (replicaArch == 120 && contextIndex);
     return {packed && packedCache && (sliding ? ringCache : !residual && localIndexer && contextIndex),
             sliding && residual && swa, !sliding && localIndexer && dsa,
-            replica && packedCache && !residual && (sliding ? ringCache : replicaDsa && localIndexer)};
+            packedCache && !residual && (sliding ? ringCache && replicaSwa : localIndexer && replicaDsa)};
 }
 
 static void GatherContextCandidates(Data &exchange, int part, int rank, int ranks, int gpu,

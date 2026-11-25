@@ -6,7 +6,7 @@
 #endif
 #include "utils/utils.h"
 #include "devices/cuda/fastllm-cuda-mtp.cuh"
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
+#ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
 #include "devices/cuda/naive-n05-draft-fused.h"
 #include "devices/cuda/naive-n05-cuda.cuh"
 #include <algorithm>
@@ -35,7 +35,7 @@ bool Resident(const Data &x, int device, DataType type, const std::vector<int> &
 }
 
 #endif
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
+#ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
 bool CanWrite(const Data &x, int device, const std::vector<int> &shape, DataType type = BFLOAT16) {
     return (!x.cudaData && (x.dims.empty() || x.dims == shape) && x.expansionDims.empty() &&
             !x.multiDeviceData && !x.isFake) ||
@@ -51,7 +51,6 @@ void AllocateOutput(Data &x, int device, const std::vector<int> &shape, DataType
     x.Allocate(false);
 }
 
-constexpr int MaxBodyRequests = 64;
 #endif
 } // namespace
 
@@ -130,7 +129,7 @@ bool TryCudaDraftMlp(const DraftLayerParallel &p, int requests, const Data &norm
         return FastllmCudaDraftMlp7(normalized, residual, output, *w.gateUp, w.down, gamma,
                                     eps, p.devices.at(p.rank), *collective->storage);
 #endif
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
+#ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
     if (p.tpSize != 1 || requests != 1 || p.rank < 0 || size_t(p.rank) >= p.devices.size() ||
         !w.gateUp || normalized.dims.size() != 3 || normalized.dims[1] < 7 || normalized.dims[1] > 8)
         return false;
@@ -142,7 +141,6 @@ bool TryCudaDraftMlp(const DraftLayerParallel &p, int requests, const Data &norm
         !Resident(residual, device, BFLOAT16, shape, 16) || !Resident(scratch, device, BFLOAT16, shape, 16) ||
         !Resident(gamma, device, FLOAT32, {4096}, 16) || !CanWrite(middle, device, shape) ||
         !CanWrite(output, device, shape)) return false;
-    if (FastllmCudaRuntimeArch() != 103) return false;
     const int blocks = FastllmDraftFusedLocalMlpBlocks(device);
     if (!blocks) return false;
     AllocateOutput(middle, device, shape);
@@ -166,10 +164,10 @@ bool TryCudaDraftAttention(const DraftLayerParallel &p, const DraftAttentionGeom
             *collective->live, *collective->bindings, collective->layer, g.eps, g.theta, p.devices.at(p.rank),
             *collective->storage);
 #endif
-#ifdef FASTLLM_ENABLE_DRAFT_FUSED
+#ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
     if (p.tpSize != 1 || requests.size() != 1 || p.rank < 0 || size_t(p.rank) >= p.devices.size() ||
         !w.qkv || normalized.dims.size() != 3 || !std::isfinite(g.eps) || g.eps <= 0 ||
-        !std::isfinite(g.theta) || g.theta <= 0 || FastllmCudaRuntimeArch() != 103) return false;
+        !std::isfinite(g.theta) || g.theta <= 0) return false;
     const int device = p.devices[p.rank], rows = normalized.dims[1];
     int floats = 0;
     const int blocks = FastllmDraftLocalAttentionPlan(device, rows, g.heads, g.kvHeads, g.headDim, g.window, &floats);
@@ -213,6 +211,8 @@ bool TryCudaDraftAttention(const DraftLayerParallel &p, const DraftAttentionGeom
 }
 
 #ifdef FASTLLM_ENABLE_DRAFT_FUSED
+static constexpr int MaxBodyRequests = 64;
+
 bool CudaDraftHeadSupportsShard(const Data &normalized, int device, int ranks, int requests,
         int steps, int hidden, int vocab) {
     return ranks == 8 && requests > 0 && requests <= MaxBodyRequests && steps == 7 && hidden == 4096 &&

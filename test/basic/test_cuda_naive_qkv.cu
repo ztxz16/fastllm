@@ -29,6 +29,15 @@ void Init(Data &x, const std::vector<int> &dims) {
     x.Allocate(false);
 }
 void Fill(Data &x, unsigned seed) {
+    if (x.dataType == FP8_E4M3) {
+        // Vary exponent and mantissa to exercise near-boundary BF16 QK/PV rounding.
+        std::mt19937 generator(seed);
+        std::normal_distribution<float> normal;
+        std::vector<__nv_fp8_e4m3> values(x.Count(0));
+        for (auto &v : values) v = __nv_fp8_e4m3(normal(generator));
+        Check(cudaMemcpy(x.cudaData, values.data(), values.size(), cudaMemcpyHostToDevice));
+        return;
+    }
     std::vector<__nv_bfloat16> values(x.Count(0));
     // Every product and FP32 partial sum is exactly representable. This tests
     // the fused epilogue bitwise without hiding errors behind a GEMM tolerance.
@@ -446,7 +455,7 @@ void VerifyBatch(int requests, int mode, DataType type) {
     Require(before == result(), "failed preflight changed earlier request");
 }
 
-void VerifyPackedSwa(int rows) {
+void VerifyPackedSwa(int rows, DataType cacheType) {
     constexpr int heads = 64, kv = 8, cols = heads * 128;
     Data raw(BFLOAT16), q(BFLOAT16), k(BFLOAT16), v(BFLOAT16), out(BFLOAT16), reference(BFLOAT16);
     Data live(INT32), positions(FLOAT32), table(INT32), arena(INT32), sink(FLOAT32);
@@ -465,7 +474,7 @@ void VerifyPackedSwa(int rows) {
     Init(arena, {pitch * cols * 33 / 128});
     auto *values = static_cast<uint8_t *>(arena.cudaData);
     FastllmMxfp8Activation pack{values, values + pitch * cols, rows, cols, pitch};
-    Data key[2] = {Data(BFLOAT16), Data(BFLOAT16)}, value[2] = {Data(BFLOAT16), Data(BFLOAT16)};
+    Data key[2] = {Data(cacheType), Data(cacheType)}, value[2] = {Data(cacheType), Data(cacheType)};
     for (int i = 0; i < 2; ++i) {
         Init(key[i], {1, 136, kv * 192}); Init(value[i], {1, 136, kv * 128});
         Fill(key[i], 88 + i); Fill(value[i], 14 + i);
@@ -475,7 +484,7 @@ void VerifyPackedSwa(int rows) {
     std::vector<FastllmNaiveSWARow> bindings(rows);
     for (int i = 0; i < rows; ++i) {
         caches[i] = {key, value, nullptr, binding}; caches[i].verifyOffset = i;
-        bindings[i] = {key->cudaData, value->cudaData, binding}; bindings[i].verifyOffset = i;
+        bindings[i] = {key->cudaData, value->cudaData, binding, cacheType == FP8_E4M3}; bindings[i].verifyOffset = i;
     }
     auto launch = [&] {
         return FastllmCudaTryPackedSwaVerify(raw, positions, live, caches.front(), sink,
@@ -509,6 +518,8 @@ void VerifyPackedSwa(int rows) {
         Check(cudaGraphLaunch(exec, cudaStreamPerThread)); Check(cudaStreamSynchronize(cudaStreamPerThread));
         Require(Read(key[owner]) == rk && Read(value[owner]) == rv, "packed SWA candidate KV differs");
         const auto result = Read(out), encoded = Read(arena);
+        if (FastllmCudaRuntimeArch() == 120)
+            Require(result == ref, "packed SWA disagrees with native SM120 rounding");
         const auto *actual = reinterpret_cast<const __nv_bfloat16 *>(result.data());
         const auto *expected = reinterpret_cast<const __nv_bfloat16 *>(ref.data());
         for (int row = 0; row < rows; ++row) {
@@ -557,8 +568,11 @@ int main(int argc,char**argv) {
         Check(cudaSetDevice(0));
         if (argc > 1 && std::strcmp(argv[1], "--packed-swa") == 0) {
             const int arch = FastllmCudaRuntimeArch();
-            if (CUDART_VERSION < 12080 || (arch != 100 && arch != 103)) return 77;
-            for (int rows = 2; rows <= 8; ++rows) VerifyPackedSwa(rows);
+            if (CUDART_VERSION < 12080 || (arch != 100 && arch != 103 && arch != 120)) return 77;
+            for (int rows = 2; rows <= 8; ++rows) {
+                VerifyPackedSwa(rows, BFLOAT16);
+                if (arch == 120) VerifyPackedSwa(rows, FP8_E4M3);
+            }
             return 0;
         }
         if(attention){if(FastllmCudaRuntimeArch()!=103)return 77;VerifyQkvAttention(disabled);return 0;}
