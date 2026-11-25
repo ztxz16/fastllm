@@ -222,8 +222,32 @@ FT 的 PD Router 采用以下命令行配置项与默认值：
 
 ## KV 回传与多轮复用
 
-- 支持 D 产生的 KV 在后续会话轮次中供 P 复用，减少历史 Token 的重复 Prefill。
-- 记录两种可选路径：D→P 直接回传，或 D→共享 KV 缓存→P；具体采用方式后续确定。
+- 回传机制对齐 vLLM NIXL 的双向拉取路径：下一轮请求到来时，由 P 主动从上一轮 D
+  拉取可复用的历史 KV，减少历史 Token 的重复 Prefill；采用 D→P 直接传输。
+  本项 D→P 回传仅要求拉取，不要求 D 主动推送；P→D 推送与拉取仍按对应章节分别实现。
+- 支持显式开启回传，`bidirectional_kv_xfer` 默认 `false`，开启时 P/D 两端启用对应能力。
+  关闭回传仍支持多轮对话，由 P 计算本地未缓存的历史部分和新增输入。
+- 统一 Router/Proxy 按会话记录上一轮 D 返回的 KV 来源信息，包括源实例、请求与交接身份、
+  KV 块、实际有效 Token 范围、布局及有效期；下一轮将这些信息随请求交给选定的 P。
+  P 确认历史 Token 前缀匹配及数据兼容性后，复用已有本地缓存，仅拉取需要的远端历史 KV。
+  未实际计算出 KV 的输出 Token 不得算入可复用范围。
+- P 的调度器先申请本地 KV 接收空间，容量不足时在 P 的调度等待队列等待，不提前提交读取。
+  独立 KV 交接模块按 D 为源、P 为目标复用分片映射、布局对齐及完成判断；所需历史 KV
+  就绪后，P 继续计算未缓存部分和新增输入。
+- **D 在本轮解码完成后，为下一轮复用额外保留 KV，默认 480 秒（8 分钟），允许配置。**
+  配置项 `decoder_kv_blocks_ttl` 与 vLLM 一致；从本轮请求解码完成时开始计时，不因心跳续期。
+  该时限不限制当前请求的解码时长：即使解码持续 1 小时，也在解码结束后才开始这 480 秒。
+- 回传读取完成后可解除相应保留；未被读取而到期时，停止接受基于旧来源信息的新读取。
+  **等待在途传输结束再回收**：到期、取消或失败不能提前回收仍被访问的 D 源 KV 或 P 接收空间；
+  实际读写结束后解除对应占用，再按其他引用及缓存策略决定回收或保留。
+  过期或失效的 KV 不得用于计算；未能复用时的重算或报错策略后续补充。
+
+参考：[vLLM NIXL 多轮回传流程，nixl_connector_usage.md:168](https://github.com/vllm-project/vllm/blob/main/docs/features/nixl_connector_usage.md#L168)、
+[回传开关与默认保留时间，nixl_connector_usage.md:269](https://github.com/vllm-project/vllm/blob/main/docs/features/nixl_connector_usage.md#L269)、
+[请求结束后设置保留期限，pull_scheduler.py:197](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L197)。
+
+更新日期：2026-11-25。状态：直接拉取及默认 480 秒保留要求已确认，待实现，尚无验收结果。
+具体配置接入、会话元数据协议及异常处理方案后续补充。
 
 ## P→D 请求状态交接
 
@@ -250,7 +274,7 @@ FT 的 PD Router 采用以下命令行配置项与默认值：
 
 ## KV 推送与拉取
 
-- 支持可配置的推送（push）和拉取（pull）两种模式；请求分发、D 接收空间分配与
+- P→D 交接支持可配置的推送（push）和拉取（pull）两种模式；请求分发、D 接收空间分配与
   基础交接时序对齐本次讨论的 vLLM NIXL 拉取、推送流程。
 - 拉取：Router 先将请求交给 P；P 完成全部 Prefill 后保留源 KV，返回 KV 来源和续跑信息。
   Router 再把请求及 KV 来源信息交给 D；D 分配接收空间后，主动发起读取（READ）。
