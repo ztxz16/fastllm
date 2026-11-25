@@ -2976,6 +2976,13 @@ if (UNIT_TEST)
             set_tests_properties(naive_n05_swa_layer naive_n05_swa_layer_disabled PROPERTIES
                 LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
         endif()
+        if (FASTLLM_CUDA_SM120_SOURCES)
+            add_executable(sm120_ep8_verify_test test/basic/test_sm120_ep8_verify.cpp)
+            target_link_libraries(sm120_ep8_verify_test PRIVATE fastllm)
+            target_include_directories(sm120_ep8_verify_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME sm120_ep8_verify COMMAND sm120_ep8_verify_test)
+            set_tests_properties(sm120_ep8_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+        endif()
         if ("src/devices/cuda/models/naive-n05-qkv.cu" IN_LIST FASTLLM_CUDA_SM90_SOURCES OR
             "103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS OR FASTLLM_CUDA_SM120_SOURCES)
             add_executable(naive_n05_qkv_test test/basic/test_cuda_naive_qkv.cu)

@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <cuda/atomic>
+#include <cooperative_groups.h>
 #include <deep_gemm/impls/sm120_fp8_fp4_gemm_1d1d.cuh>
 #include <algorithm>
 #include <cstdlib>
@@ -191,7 +192,7 @@ struct Rank {
 
 // Publish the preceding stream work and await all peers. Only the owner writes
 // its epoch; each sender has an independent mailbox on every receiver.
-__global__ void rendezvous(Mail *peers, int rank, int ranks) {
+__device__ void joinPeers(Mail *peers, int rank, int ranks) {
     __shared__ unsigned long long next;
     if (threadIdx.x == 0)
         next = ++peers[rank].flags[ranks];
@@ -221,6 +222,8 @@ __global__ void rendezvous(Mail *peers, int rank, int ranks) {
         } while (seen < next);
     }
 }
+__global__ void rendezvous(Mail *peers, int rank, int ranks) { joinPeers(peers, rank, ranks); }
+
 
 // Eight adjacent lanes quantize one E8M0-scaled block of 32 FP8 values.
 template <bool Fc1Output = false>
@@ -244,7 +247,7 @@ template <bool Notify>
 struct QuantizedSwiGLU {
     uint8_t *data;
     uint8_t *scales;
-    const float *scores;
+    float *scores;
     int pool;
 
     PrefillTile *tiles = nullptr;
@@ -551,13 +554,19 @@ __global__ void makeTasks(Buffers b, Shape s, int rank, int routes, const Mail *
     b.tasks[b.bases[s.localE + e] + offset] = make_int2(t, row);
 }
 // The complete routing table for four rows/rank fits in a single CTA (8 ranks x top-8).
-__global__ void planTinyRoutes(Buffers b, Shape s, int rank, int cap, const Mail *peers, float *rowScores) {
+template<int Slots> __device__ void planRoutes(Buffers b, Shape s, int rank, int cap, const Mail *peers, float *rowScores) {
     __shared__ int counts[32], bases[32], compact[32];
     int t = threadIdx.x;
     if (t < 32) counts[t] = 0;
     __syncthreads();
-    const int e = t < cap * 64 ? expert(b, s, t) - rank * 32 : -1;
-    const int offset = static_cast<unsigned>(e) < 32 ? atomicAdd(counts + e, 1) : -1;
+    int owners[Slots], offsets[Slots];
+#pragma unroll
+    for (int i = 0; i < Slots; ++i) {
+        const int slot = t + i * blockDim.x;
+        const int e = slot < cap * 64 ? expert(b, s, slot) - rank * 32 : -1;
+        owners[i] = e;
+        offsets[i] = unsigned(e) < 32 ? atomicAdd(counts + e, 1) : -1;
+    }
     __syncthreads();
     if (t < 32) {
         const int count = counts[t];
@@ -581,14 +590,22 @@ __global__ void planTinyRoutes(Buffers b, Shape s, int rank, int cap, const Mail
             rowScores[base + count + lane] = 0.f;
         }
     }
-    if (offset < 0) return;
-    const int row = bases[e] + offset, slots = cap * 8;
-    b.returnRows[row] = reinterpret_cast<cutlass::bfloat16_t *>(peers[t / slots].returned + size_t(t % slots) * s.h);
-    const auto *packet = b.incoming + size_t(t / 8) * s.stride;
-    rowScores[row] = reinterpret_cast<const float *>(packet + s.h + s.h / 32 + 8 * sizeof(int))[t % 8];
-    b.tasks[compact[e] + offset] = make_int2(t, row);
+#pragma unroll
+    for (int i = 0; i < Slots; ++i) {
+        const int offset = offsets[i], e = owners[i], slot = t + i * blockDim.x;
+        if (offset < 0) continue;
+        const int row = bases[e] + offset, slots = cap * 8;
+        b.returnRows[row] = reinterpret_cast<cutlass::bfloat16_t *>(peers[slot / slots].returned + size_t(slot % slots) * s.h);
+        const auto *packet = b.incoming + size_t(slot / 8) * s.stride;
+        rowScores[row] = reinterpret_cast<const float *>(packet + s.h + s.h / 32 + 8 * sizeof(int))[slot % 8];
+        b.tasks[compact[e] + offset] = make_int2(slot, row);
+    }
 }
-__global__ void gather(Buffers b, Shape s) {
+__global__ void planTinyRoutes(Buffers b, Shape s, int rank, int cap, const Mail *peers, float *rowScores) {
+    planRoutes<1>(b, s, rank, cap, peers, rowScores);
+}
+
+__device__ void gatherRows(Buffers b, Shape s) {
     int count = b.counts[s.localE];
     for (int job = blockIdx.x; job < count; job += gridDim.x) {
         int2 task = b.tasks[job];
@@ -599,6 +616,8 @@ __global__ void gather(Buffers b, Shape s) {
             b.sa[size_t(j) * s.pool + task.y] = reinterpret_cast<const uint32_t *>(p + s.h)[j];
     }
 }
+__global__ void gather(Buffers b, Shape s) { gatherRows(b, s); }
+
 __global__ void activate(Buffers b, Shape s) {
     int count = b.counts[s.localE];
     for (int job = blockIdx.x; job < count; job += gridDim.x) {
@@ -717,13 +736,12 @@ __global__ void combineDenseEp8Rows(Mail mail, const int *ids, BF *out, int rank
     }
 }
 template <int FixedTopK = 0, bool OwnerPartial = false>
-__global__ void combine(Mail local, Shape s, const int *ids, BF *out, const int *live) {
-    const int row = blockIdx.x;
+__device__ void combineRows(Mail local, Shape s, const int *ids, BF *out, const int *live, int row, int x, int groups) {
     const bool active = !live || live[row] > 0;
     const int topk = FixedTopK ? FixedTopK : s.k;
     constexpr int width = sizeof(uint4) / sizeof(BF);
-    const int start = FixedTopK ? blockIdx.y * blockDim.x + threadIdx.x : threadIdx.x;
-    const int step = FixedTopK ? gridDim.y * blockDim.x : blockDim.x;
+    const int start = FixedTopK ? x * blockDim.x + threadIdx.x : threadIdx.x;
+    const int step = FixedTopK ? groups * blockDim.x : blockDim.x;
     unsigned firstSlots = 0;
     if constexpr (OwnerPartial) {
         static_assert(FixedTopK == 8);
@@ -765,6 +783,11 @@ __global__ void combine(Mail local, Shape s, const int *ids, BF *out, const int 
         dest[chunk] = make_uint4(pairs[0], pairs[1], pairs[2], pairs[3]);
     }
 }
+template <int FixedTopK = 0, bool OwnerPartial = false>
+__global__ void combine(Mail local, Shape s, const int *ids, BF *out, const int *live) {
+    combineRows<FixedTopK, OwnerPartial>(local, s, ids, out, live, blockIdx.x, blockIdx.y, gridDim.y);
+}
+
 __global__ void packGatePairs(const uint8_t *src, uint8_t *dst, uint32_t *scales, int n, int k) {
     const int row = blockIdx.x;
     // Interleave eight gate rows and eight up rows so one warp owns both MMA fragments.
@@ -866,9 +889,66 @@ void multiply(const Rank &rank, const Rank::Projection &p, Output output, int n,
         nullptr, workspace, 0, n, k, n, 0, 0, a, wideDown ? p.wideB : p.b, sa, wideDown ? p.wideSb : p.sb,
         small ? p.decodeD : p.d);
 }
+
+struct VerifyMaps {
+    cute::TmaDescriptor a, b, sa, sb;
+    explicit VerifyMaps(const Rank::Projection &p) : a(p.decodeA), b(p.b), sa(p.decodeSa), sb(p.sb) {}
+};
+template<class T, class Output>
+__device__ __forceinline__ void verifyProjection(const VerifyMaps &m, Buffers b, Output output, int n, int k) {
+    constexpr bool gate = std::is_same_v<T, float>;
+    deep_gemm::sm120_fp8_fp4_gemm_1d1d_body<0, 0, 0, 32, 32, 1, 16, 128, 128, 128, 128, 128,
+        4, 32, 128, 0, deep_gemm::GemmType::MGroupedContiguous, false, T,
+        deep_gemm::epilogue::transform::EpilogueIdentity, false, true, false, true, false, 16, 1,
+        true, !gate, std::conditional_t<gate, Output, void>, void, true>(
+        output, nullptr, nullptr, nullptr, b.layout, nullptr, nullptr, 0, n, k, n, 0, 0,
+        m.a, m.b, m.sa, m.sb, m.a);
+}
+
+// One resident grid per rank. Peer rendezvous publish both quantized input and
+// completed expert rows. All ranks must enter, including padded DP owners.
+__global__ __launch_bounds__(160, 1) void VerifyMegaMoE(Mail *peers, int rank, Buffers b, Shape s,
+        const BF *input, const int *ids, const float *scores, BF *output, const int *live, int rows,
+        const __grid_constant__ VerifyMaps gate, const __grid_constant__ VerifyMaps down,
+        QuantizedSwiGLU<false> activated) {
+    constexpr int cap = 8;
+    auto grid = cooperative_groups::this_grid();
+    extern __shared__ __align__(1024) uint8_t storage[];
+    if (blockIdx.x < cap * 2) {
+        const int row = blockIdx.x / 2;
+        packInputRow(storage, input, ids, scores, row, 4096, 8, row < rows && (!live || live[row] > 0));
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+        if (threadIdx.x < DispatchPeers)
+            forwardEp8Packet(storage, peers, (rank + (blockIdx.x % 2) * DispatchPeers + threadIdx.x) % 8,
+                             1, rank, row, cap);
+    }
+    grid.sync();
+    if (!blockIdx.x) {
+        joinPeers(peers, rank, 8);
+        __syncthreads();
+        planRoutes<4>(b, s, rank, cap, peers, activated.scores);
+    }
+    grid.sync();
+    gatherRows(b, s);
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    grid.sync();
+    verifyProjection<float>(gate, b, activated, 4096, 4096);
+    asm volatile("fence.proxy.async.global;" ::: "memory");
+    grid.sync();
+    verifyProjection<cutlass::bfloat16_t>(down, b, b.returnRows, 4096, 2048);
+    // The grid join publishes FC2 stores to the signaling CTA. Its system-scope
+    // release is cumulative, exactly as for the dispatch rendezvous above.
+    grid.sync();
+    if (!blockIdx.x) joinPeers(peers, rank, 8);
+    grid.sync();
+    const int row = blockIdx.x / 4;
+    if (row < rows) combineRows<8>(peers[rank], s, ids, output, live, row, blockIdx.x % 4, 4);
+}
 } // namespace
 
 struct FastllmGenericEp {
+    bool fusedVerify = true;
     Shape s;
     std::vector<std::unique_ptr<Rank>> ranks;
 };
@@ -962,6 +1042,17 @@ std::unique_ptr<FastllmGenericEp> createWorkspace(const std::vector<int> &device
         check(cudaDeviceGetAttribute(&maxShared, cudaDevAttrMaxSharedMemoryPerBlockOptin, d));
         rank->tunedEp8 = s.ranks == 8 && h == 4096 && i == 2048 && experts == 256 && topk == 8 &&
                               rank->sms == 110 && maxShared >= Smem<float, DecodeTile>;
+        // Every rank must enter the same peer rendezvous, including empty local slices.
+        ep->fusedVerify = ep->fusedVerify && rank->tunedEp8;
+        if (ep->fusedVerify) {
+            int cooperative = 0, resident = 0;
+            check(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, d));
+            ep->fusedVerify = cooperative && cudaFuncSetAttribute(VerifyMegaMoE,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, Smem<float, DecodeTile>) == cudaSuccess &&
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&resident, VerifyMegaMoE, 160,
+                    Smem<float, DecodeTile>) == cudaSuccess && resident > 0;
+            if (!ep->fusedVerify) cudaGetLastError();
+        }
         if (capacity > 128) {
             rank->compactPrefill = compactPrefill && rank->tunedEp8;
             if (rank->compactPrefill) {
@@ -1155,9 +1246,26 @@ void prefillGemm(Rank &r, const Shape &s, const Rank::Layer &l, const Buffers &b
         multiply<cutlass::bfloat16_t, WideTile>(r, l.down, buffers.returnRows, s.h, s.i, stream, r.sms,
                                                 {r.tiles, columns, true});
 }
-void runChunk(Rank &r, const Shape &s, const Rank::Layer &l, int rank, const BF *rowsIn, const int *index,
+void runChunk(Rank &r, const FastllmGenericEp &ep, const Rank::Layer &l, int rank, const BF *rowsIn, const int *index,
               const float *weights, BF *out, int n, int cap, const int *keys, cudaStream_t stream,
               bool dense, bool prefetched, PrefetchChunk next, DecodeSelection selection = {}) {
+    const auto &s = ep.s;
+    if (ep.fusedVerify && cap == 8) {
+        cudaLaunchAttribute cooperative{};
+        cooperative.id = cudaLaunchAttributeCooperative;
+        cooperative.val.cooperative = 1;
+        cudaLaunchConfig_t cfg{};
+        cfg.gridDim = r.sms;
+        cfg.blockDim = 160;
+        cfg.dynamicSmemBytes = Smem<float, DecodeTile>;
+        cfg.stream = stream;
+        cfg.attrs = &cooperative;
+        cfg.numAttrs = 1;
+        QuantizedSwiGLU<false> activated{r.downInput, reinterpret_cast<uint8_t *>(r.downScales), r.rowScores, s.pool};
+        check(cudaLaunchKernelEx(&cfg, VerifyMegaMoE, r.peers, rank, r.b, s, rowsIn, index, weights, out,
+                                 keys, n, VerifyMaps(l.gate), VerifyMaps(l.down), activated));
+        return;
+    }
     auto buffers = r.b;
     if (prefetched) buffers.incoming = r.prefetched.receive[rank];
     const bool shortBatch = r.tunedEp8 && cap <= 32;
@@ -1290,7 +1398,7 @@ void FastllmRunGenericEp(FastllmGenericEp &ep, int rank, int layer, const void *
             next.rows = std::min<int64_t>(nextCap, std::max<int64_t>(0, int64_t(rows) - start - cap));
             next.dense = nextDense;
         }
-        runChunk(r, s, primaryLayer, rank,
+        runChunk(r, ep, primaryLayer, rank,
                  n ? static_cast<const BF *>(input) + size_t(first) * s.h : nullptr,
                  n ? ids + size_t(first) * s.k : nullptr, n ? scores + size_t(first) * s.k : nullptr,
                  n ? static_cast<BF *>(out) + size_t(first) * s.h : nullptr, n, cap,
@@ -1303,11 +1411,11 @@ bool FastllmTryGenericEpRoutedDecode(FastllmGenericEp &ep, int rank, int layer, 
     const float *probabilities, const float *bias, void *output, const int *live, bool normalize, float scale,
     int rows, int capacity, bool logits) {
     auto &r = *ep.ranks.at(rank);
-    if (!r.tunedEp8 || capacity > ep.s.cap) return false;
+    if (!r.tunedEp8 || capacity > ep.s.cap || (ep.fusedVerify && capacity == 8)) return false;
     // Direct dispatch bypasses the local send packet. Its storage remains
     // available to combine until this rank finishes the layer on the same stream.
     int *ids = reinterpret_cast<int *>(r.mail.send);
-    runChunk(r, ep.s, r.layers.at(layer), rank, static_cast<const BF *>(input), ids, nullptr,
+    runChunk(r, ep, r.layers.at(layer), rank, static_cast<const BF *>(input), ids, nullptr,
         static_cast<BF *>(output), rows, capacity, live, cudaStreamPerThread, false, false, {},
         {probabilities, bias, ids, normalize, scale, logits});
     return true;

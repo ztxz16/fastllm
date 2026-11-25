@@ -45,9 +45,9 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           bool kKGroupedConstantStride = false,
           uint32_t kEpiSubM = BLOCK_M,
           uint32_t kSplitKFactor = 1, bool kDeviceGroupedRows = false, bool kScatterRows = false,
-          typename GroupedOutput = void, typename RowSelection = void>
-CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
-sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, void>,
+          typename GroupedOutput = void, typename RowSelection = void, bool ReuseStorage = false>
+__device__ __forceinline__ void
+sm120_fp8_fp4_gemm_1d1d_body(cute::conditional_t<cute::is_same_v<GroupedOutput, void>,
                                                   cute::conditional_t<kScatterRows, cd_dtype_t* const*, cd_dtype_t*>,
                                                   GroupedOutput> gmem_d,
                              const cd_dtype_t* gmem_c,
@@ -57,11 +57,11 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, 
                              cute::conditional_t<cute::is_same_v<RowSelection, void>, float*, RowSelection> gmem_workspace,
                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                              uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                             const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                             const cute::TmaDescriptor& tensor_map_a_base,
+                             const cute::TmaDescriptor& tensor_map_b_base,
+                             const cute::TmaDescriptor& tensor_map_sfa,
+                             const cute::TmaDescriptor& tensor_map_sfb,
+                             const cute::TmaDescriptor& tensor_map_cd) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1200)) or defined(__CLION_IDE__)
     namespace sm120_mma = mma::sm120;
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -149,7 +149,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, 
     // EP routing produces the padded row count on-device immediately before GEMM.
     if constexpr (kDeviceGroupedRows) {
         static_assert(kGemmType == GemmType::MGroupedContiguous && SHAPE_M == 0);
-        shape_m = __ldg(grouped_layout - 1);
+        shape_m = ReuseStorage ? grouped_layout[-1] : __ldg(grouped_layout - 1);
         if constexpr (!cute::is_same_v<RowSelection, void>) {
             if (shape_m == 0) return;
         }
@@ -259,7 +259,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, 
                 // Producer and consumer apply the identical check, so no barrier ops are
                 // issued for skipped blocks and the pipeline stays in sync.
                 if constexpr (kGemmType == GemmType::MGroupedContiguous) {
-                    if (__ldg(grouped_layout + m_block_idx * BLOCK_M) < 0)
+                    if ((ReuseStorage ? grouped_layout[m_block_idx * BLOCK_M] : __ldg(grouped_layout + m_block_idx * BLOCK_M)) < 0)
                         continue;
                 }
                 if constexpr (kGemmType == GemmType::KGroupedContiguous) {
@@ -384,7 +384,7 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, 
             // Skip empty/padding tiles (m_indices == -1); see the matching check in the
             // producer loop. Both warp groups skip identically, so barriers stay in sync.
             if constexpr (kGemmType == GemmType::MGroupedContiguous) {
-                if (__ldg(grouped_layout + m_block_idx * BLOCK_M) < 0)
+                if ((ReuseStorage ? grouped_layout[m_block_idx * BLOCK_M] : __ldg(grouped_layout + m_block_idx * BLOCK_M)) < 0)
                     continue;
             }
             const uint32_t current_shape_k = (kGemmType == GemmType::KGroupedContiguous ? scheduler.current_shape_k : shape_k);
@@ -1419,6 +1419,17 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, 
         }
     }
 
+    if constexpr (ReuseStorage) {
+        // The producer may finish before the last math-only BAR0 epilogue.
+        // Join it on a distinct named barrier before recycling this pipeline.
+        cutlass::arch::NamedBarrier::sync(kNumTMAThreads + kNumMathThreads, 1);
+        if (threadIdx.x < kNumStages) {
+            asm volatile("mbarrier.inval.shared.b64 [%0];" :: "r"(unsigned(__cvta_generic_to_shared(full_barriers[threadIdx.x]))) : "memory");
+            asm volatile("mbarrier.inval.shared.b64 [%0];" :: "r"(unsigned(__cvta_generic_to_shared(empty_barriers[threadIdx.x]))) : "memory");
+        }
+        __syncthreads();
+    }
+
     // Signal completion for PDL (allows dependent reduce kernel to start)
     if constexpr (kSplitKFactor > 1) {
         cudaTriggerProgrammaticLaunchCompletion();
@@ -1428,6 +1439,52 @@ sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, 
     if (blockIdx.x == 0 and threadIdx.x == 0)
         DG_DEVICE_ASSERT(false and "This kernel only supports sm_120a");
 #endif
+}
+
+template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
+          uint32_t kGranKA, uint32_t kGranKB,
+          uint32_t kNumGroups,
+          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
+          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
+          uint32_t kSwizzleCDMode,
+          uint32_t kNumStages,
+          uint32_t kNumTMAThreads, uint32_t kNumMathThreads,
+          uint32_t kNumSMs,
+          GemmType kGemmType, bool kWithAccumulation,
+          typename cd_dtype_t,
+          typename epilogue_type_t = epilogue::transform::EpilogueIdentity,
+          bool kIsFP4 = false,
+          bool kBIsFP4 = false,
+          bool kAIsFP4 = false,
+          bool kBKMajor = true,
+          bool kKGroupedConstantStride = false,
+          uint32_t kEpiSubM = BLOCK_M,
+          uint32_t kSplitKFactor = 1, bool kDeviceGroupedRows = false, bool kScatterRows = false,
+          typename GroupedOutput = void, typename RowSelection = void>
+CUTLASS_GLOBAL __launch_bounds__(kNumTMAThreads + kNumMathThreads, 1) void
+sm120_fp8_fp4_gemm_1d1d_impl(cute::conditional_t<cute::is_same_v<GroupedOutput, void>,
+                                                  cute::conditional_t<kScatterRows, cd_dtype_t* const*, cd_dtype_t*>,
+                                                  GroupedOutput> gmem_d,
+                             const cd_dtype_t* gmem_c,
+                             __nv_fp8_e4m3* gmem_a_ptr, __nv_fp8_e4m3* gmem_b_ptr,
+                             int* grouped_layout,
+                             cute::TmaDescriptor* tensor_map_buffer,
+                             cute::conditional_t<cute::is_same_v<RowSelection, void>, float*, RowSelection> gmem_workspace,
+                             uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+                             uint32_t stride_cd_m, uint32_t stride_cd_n, uint32_t stride_cd_batch,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_a_base,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_b_base,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
+                             const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+    sm120_fp8_fp4_gemm_1d1d_body<SHAPE_M, SHAPE_N, SHAPE_K, kGranKA, kGranKB, kNumGroups,
+        BLOCK_M, BLOCK_N, BLOCK_K, kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode, kNumStages,
+        kNumTMAThreads, kNumMathThreads, kNumSMs, kGemmType, kWithAccumulation, cd_dtype_t,
+        epilogue_type_t, kIsFP4, kBIsFP4, kAIsFP4, kBKMajor, kKGroupedConstantStride, kEpiSubM,
+        kSplitKFactor, kDeviceGroupedRows, kScatterRows, GroupedOutput, RowSelection>(
+        gmem_d, gmem_c, gmem_a_ptr, gmem_b_ptr, grouped_layout, tensor_map_buffer, gmem_workspace,
+        shape_m, shape_n, shape_k, stride_cd_m, stride_cd_n, stride_cd_batch, tensor_map_a_base,
+        tensor_map_b_base, tensor_map_sfa, tensor_map_sfb, tensor_map_cd);
 }
 
 } // namespace deep_gemm
