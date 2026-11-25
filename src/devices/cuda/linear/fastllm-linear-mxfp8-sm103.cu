@@ -466,10 +466,23 @@ bool ProjectPrepared(FastllmMxfp8Activation input, const fastllm::Data &w, void 
     return run(input.values, w.cudaData, input.scales, scales, output,
                input.rows, w.dims[0], input.width, input.pitch);
 }
+bool ProjectPreparedPdl(FastllmMxfp8Activation input, const fastllm::Data &weight, void *output) {
+    auto *scales = const_cast<void *>(FastllmCudaCompactMxfp8(weight));
+    if (!scales || input.rows < 2 || input.rows > 8 ||
+        !GetProjectionSupport(FastllmCudaGetDevice(), FastllmCudaGraphIsCapturing()).swaSignal)
+        return false;
+    return Projection<16, 1>::RunPrepared<true>(input.values, weight.cudaData, input.scales, scales,
+        output, input.rows, weight.dims[0], input.width, input.pitch, [] {});
+}
+
 } // namespace
 
 const FastllmMxfp8ProjectionBackend *FastllmCudaBlackwellMxfp8Projection() {
-    static const FastllmMxfp8ProjectionBackend backend{PrepareCompactScales, PreparedProjectionRows, ProjectPrepared, CanPackPrefill};
+    static const auto backend = [] {
+        FastllmMxfp8ProjectionBackend ops{PrepareCompactScales, PreparedProjectionRows, ProjectPrepared, CanPackPrefill};
+        ops.projectPdl = ProjectPreparedPdl;
+        return ops;
+    }();
     return GetProjectionSupport(FastllmCudaGetDevice(), FastllmCudaGraphIsCapturing()).smallRows
         ? &backend : nullptr;
 }

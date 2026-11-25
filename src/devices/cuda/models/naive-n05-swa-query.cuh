@@ -67,16 +67,17 @@ __device__ __forceinline__ void SwaQueryScores(SwaQueryStorage<Queries> &s, cons
 template <bool Pack = false, int Queries>
 __device__ __forceinline__ void SwaQueryValues(SwaQueryStorage<Queries> &s, const int *offsets,
         BF *out, int row, int count, int heads, int head, int w, int l, const int *lengths = nullptr,
-        FastllmMxfp8Activation packed = {}) {
+        FastllmMxfp8Activation packed = {}, BF (*valueTile)[136] = nullptr) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     using namespace naive_attention_bulk;
+    const auto values = valueTile ? valueTile : s.tile.v;
     float acc[Queries][4] = {};
 #pragma unroll
     for (int k = 0; k < 128; k += 16) {
 #pragma unroll
         for (int r = 0; r < Queries; ++r) if (r < count) {
             uint32_t a[4], b[2];
-            ldt4(a, &s.tile.v[offsets[r] + k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
+            ldt4(a, &values[offsets[r] + k + (l & 7) + (l >> 4) * 8][w * 16 + ((l >> 3) & 1) * 8]);
             ld2(b, &s.prob[r][l & 7][k + ((l >> 3) & 1) * 8]);
             mma(acc[r], a, b);
         }

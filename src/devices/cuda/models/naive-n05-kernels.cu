@@ -1,7 +1,9 @@
 #include "devices/cuda/naive-n05-swa-settings.h"
+#include "devices/cuda/naive-n05-swa-verify.cuh"
 #include "devices/cuda/low_latency/router.cuh"
 #include "devices/cuda/low_latency/execution.h"
 #include "devices/cuda/fastllm-cuda-norm.cuh"
+#include "devices/cuda/fastllm-cuda-launch.cuh"
 #include "devices/cuda/fastllm-mxfp8-activation.cuh"
 #include "devices/cuda/naive-n05-indexer-attention.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
@@ -1174,6 +1176,104 @@ __global__ void VerifyPackedSwaRope(const __grid_constant__ VerifyRopeBatch batc
     #pragma unroll
     for (int i = 0; i < 8; ++i) cache[dst * 8 + i] = elements[i];
 }
+// A CTA owns eight query heads of one candidate. Read earlier candidates
+// directly from QKV so KV publication never requires an inter-CTA barrier.
+__global__ __launch_bounds__(256) void PackedSwaVerify(const BF16 *qkv, const float *positions,
+        const int *live, const void *const *binding, const float *sink, float theta, BF16 scale,
+        FastllmMxfp8Activation packed, BF16 *out) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using namespace naive_prefill_mma;
+    constexpr int heads = 64, kvHeads = 8, width = (heads + kvHeads) * 192 + kvHeads * 128;
+    const int row = blockIdx.x, kh = blockIdx.y, head = kh * 8;
+    const int t = threadIdx.x, warp = t / 32, lane = t % 32;
+    const int col = head * 128 + t * 8;
+    BF16 *result = out + size_t(row) * heads * 128;
+    // Live lengths, positions and committed KV precede the QKV projection.
+    // O can initialize its TMA descriptors while this CTA stages history.
+#if __CUDA_ARCH__ >= 900
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+    const int length = live[row];
+    if (length <= 0) {
+#if __CUDA_ARCH__ >= 900
+        cudaGridDependencySynchronize();
+#endif
+        if (t < 128) {
+            *reinterpret_cast<uint4 *>(result + col) = make_uint4(0, 0, 0, 0);
+            fastllm_mxfp8::StoreZero8(packed, row, col);
+        }
+        return;
+    }
+    extern __shared__ __align__(16) unsigned char memory[];
+    auto &s = *reinterpret_cast<SwaQueryStorage<1> *>(memory);
+    __shared__ __align__(16) BF16 cosine[8][32], sine[8][32];
+    if (warp <= row) {
+        const float angle = positions[warp] * powf(theta, -2.f * lane / 64.f);
+        cosine[warp][lane] = __float2bfloat16_rn(cosf(angle));
+        sine[warp][lane] = __float2bfloat16_rn(sinf(angle));
+    }
+    const int keys = min(128, length), first = length - keys;
+    const int firstCandidate = max(0, row + 1 - keys), history = max(0, keys - row - 1);
+    auto *key = (BF16 *)binding[0];
+    auto *value = (BF16 *)binding[1];
+    for (int i = t; i < 128 * 24; i += 256) {
+        const int slot = i / 24, d = i % 24 * 8;
+        const BF16 *src = key + (((first + slot) & 127) * kvHeads + kh) * 192 + d;
+        naive_dsa_decode::Copy<true>(&s.tile.k[slot][d], src, slot < history);
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    // K and V have independent shared tiles. Start both copies before scoring;
+    // only K must be resident for the QK MMA.
+    auto *valueTile = reinterpret_cast<BF16 (*)[136]>(memory + sizeof(s));
+    for (int i = t; i < 128 * 16; i += 256) {
+        const int slot = i / 16, d = i % 16 * 8;
+        const BF16 *src = value + (((first + slot) & 127) * kvHeads + kh) * 128 + d;
+        naive_dsa_decode::Copy<true>(&valueTile[slot][d], src, slot < history);
+    }
+    asm volatile("cp.async.commit_group; cp.async.wait_group 1;" ::: "memory");
+    if (t < 128) s.selected[t] = t < keys ? t : -1;
+    __syncthreads();
+#if __CUDA_ARCH__ >= 900
+    // The candidate vectors, and the borrowed QKV/O activation arena, are shared
+    // with the preceding projection. History loads above are independent.
+    cudaGridDependencySynchronize();
+#endif
+    if (lane < 24) {
+        uint4 q = reinterpret_cast<const uint4 *>(qkv + size_t(row) * width + (head + warp) * 192)[lane];
+        RotatePackedQK(q, lane, cosine[row], sine[row]);
+        *reinterpret_cast<uint4 *>(&s.q[0][warp][lane * 8]) = q;
+        if (warp >= firstCandidate && warp <= row) {
+            uint4 k = reinterpret_cast<const uint4 *>(qkv + size_t(warp) * width + (heads + kh) * 192)[lane];
+            RotatePackedQK(k, lane, cosine[warp], sine[warp]);
+            *reinterpret_cast<uint4 *>(&s.tile.k[history + warp - firstCandidate][lane * 8]) = k;
+            if (warp == row) reinterpret_cast<uint4 *>(key + ((128 + row) * kvHeads + kh) * 192)[lane] = k;
+        }
+    }
+    __syncthreads();
+    const int offsets[] = {0}, lengths[] = {keys};
+    SwaQueryScores(s, offsets, lengths, 1, sink, head, warp, lane);
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    __syncthreads();
+    if (warp >= firstCandidate && warp <= row && lane < 16) {
+        uint4 v = reinterpret_cast<const uint4 *>(qkv + size_t(warp) * width +
+            (heads + kvHeads) * 192 + kh * 128)[lane];
+        ScalePackedV(v, scale);
+        *reinterpret_cast<uint4 *>(&valueTile[history + warp - firstCandidate][lane * 8]) = v;
+        if (warp == row) reinterpret_cast<uint4 *>(value + ((128 + row) * kvHeads + kh) * 128)[lane] = v;
+    }
+    __syncthreads();
+    // Q is dead after the score MMA. Reuse its shared tile to emit BF16 and E4M3 together.
+    auto *tile = reinterpret_cast<BF16 *>(&s.q);
+    SwaQueryValues(s, offsets, tile, 0, 1, 8, 0, warp, lane, nullptr, {}, valueTile);
+    __syncthreads();
+    if (t < 128) {
+        const auto v = reinterpret_cast<const uint4 *>(tile)[t];
+        *reinterpret_cast<uint4 *>(result + col) = v;
+        fastllm_mxfp8::Store8(packed, row, col, v);
+    }
+#endif
+}
+
 #endif
 #endif
 
@@ -5935,6 +6035,10 @@ __global__ void AddRMSNormPackedRows(BF16 *hidden, const BF16 *branch, const flo
 }
 __global__ void AddRMSNormMxfp8(BF16 *hidden, const BF16 *branch, const float *gamma, BF16 *output,
                                 float eps, FastllmMxfp8Activation packed) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12000 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // A short-row QKV GEMM can initialize before the packed activations are ready.
+    if (packed.rows <= 8 && threadIdx.x == 0) cudaTriggerProgrammaticLaunchCompletion();
+#endif
     __shared__ __align__(16) BF16 normalized[4096];
     fastllm::cuda_norm::AddRMSNormBody<BF16, 4096, true, false>(
         hidden, branch, gamma, output, 4096, eps, false, SaveNormalized{normalized});
@@ -8066,6 +8170,58 @@ void FastllmCudaNaiveVerifyLengths(const fastllm::Data &positions, fastllm::Data
     VerifyPositionLengths<<<(count + 255) / 256, 256>>>(
         (const float *)positions.cudaData, (int *)lengths.cudaData, count);
     CheckLaunch();
+}
+
+bool FastllmCudaTryPackedSwaVerify(const fastllm::Data &qkv, const fastllm::Data &positions,
+        const fastllm::Data &live, const FastllmNaiveRopeCacheRow &binding, const fastllm::Data &sink,
+        int heads, int kvHeads, float theta, float valueScale, FastllmMxfp8Activation packed,
+        fastllm::Data &attention, bool overlapQkv) {
+#if !defined(USE_ROCM) && CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+    using namespace fastllm;
+    const int arch = FastllmCudaRuntimeArch();
+    const int rows = packed.rows;
+    if ((arch != 100 && arch != 103) || heads != 64 || kvHeads != 8 || rows < 2 || rows > 8 ||
+        !packed.Matches(rows, heads * 128) || !binding.cache || binding.verifyOffset != 0 ||
+        binding.indexKey || !binding.key || !binding.value || !std::isfinite(theta) || theta <= 0 ||
+        !std::isfinite(valueScale)) return false;
+    const int device = FastllmCudaGetDevice();
+    auto resident = [&](const Data &d, DataType type) {
+        return d.dataDevice == CUDA && d.dataDeviceIds == std::vector<int>{device} && d.dataType == type &&
+               d.cudaData && (reinterpret_cast<uintptr_t>(d.cudaData) & 15) == 0;
+    };
+    auto ring = [&](const Data &d, int width) {
+        const auto &capacity = d.expansionDims.empty() ? d.dims : d.expansionDims;
+        return resident(d, BFLOAT16) && !d.isPagedKVCache && capacity.size() == 3 && capacity[0] == 1 &&
+            capacity[1] >= 128 + rows && capacity[2] == width && d.strides.size() == 3 &&
+            d.strides[1] == width && d.strides[2] == 1;
+    };
+    const int width = (heads + kvHeads) * 192 + kvHeads * 128;
+    if (!ring(*binding.key, kvHeads * 192) || !ring(*binding.value, kvHeads * 128) ||
+        !resident(qkv, BFLOAT16) || qkv.dims != std::vector<int>({1, rows, width}) ||
+        qkv.strides[1] != width || qkv.strides[2] != 1 ||
+        !resident(positions, FLOAT32) || positions.Count(0) != rows ||
+        !resident(live, INT32) || live.Count(0) != rows ||
+        (!sink.dims.empty() && (!resident(sink, FLOAT32) || sink.Count(0) != heads))) return false;
+    constexpr size_t shared = sizeof(naive_prefill_mma::SwaQueryStorage<1>) + 128 * 136 * sizeof(BF16);
+    if (!BulkKernelSupported(PackedSwaVerify, shared, 80)) return false;
+    Output(attention, BFLOAT16, {1, rows, heads * 128});
+    auto launch = [&](auto... args) {
+        if (overlapQkv) {
+            // The helper also checks the compiled PTX when a newer GPU uses a compatibility cubin.
+            return fastllm::cuda_launch::Launch<PackedSwaVerify>(
+                dim3(rows, kvHeads), dim3(256), shared, cudaStreamPerThread, args...);
+        }
+        PackedSwaVerify<<<dim3(rows, kvHeads), 256, shared, cudaStreamPerThread>>>(args...);
+        CheckLaunch();
+        return true;
+    };
+    return launch((const BF16 *)qkv.cudaData,
+        (const float *)positions.cudaData, (const int *)live.cudaData, binding.cache,
+        sink.dims.empty() ? nullptr : (const float *)sink.cudaData, theta, __float2bfloat16_rn(valueScale),
+        packed, (BF16 *)attention.cudaData);
+#else
+    return false;
+#endif
 }
 
 void FastllmCudaNaiveBatchSWADecode(const fastllm::Data &query,

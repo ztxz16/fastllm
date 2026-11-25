@@ -2950,10 +2950,11 @@ if (UNIT_TEST)
             add_executable(naive_n05_qkv_test test/basic/test_cuda_naive_qkv.cu)
             target_link_libraries(naive_n05_qkv_test PRIVATE fastllm)
             add_test(NAME naive_n05_qkv COMMAND naive_n05_qkv_test)
+            add_test(NAME naive_n05_packed_swa_verify COMMAND naive_n05_qkv_test --packed-swa)
             add_test(NAME naive_n05_swa_qkv_attention COMMAND naive_n05_qkv_test --attention)
             add_test(NAME naive_n05_swa_qkv_attention_disabled COMMAND naive_n05_qkv_test --attention-disabled)
             add_test(NAME naive_n05_swa_qkv_attention_core_disabled COMMAND naive_n05_qkv_test --attention-core-disabled)
-            set_tests_properties(naive_n05_qkv naive_n05_swa_qkv_attention
+            set_tests_properties(naive_n05_qkv naive_n05_packed_swa_verify naive_n05_swa_qkv_attention
                 naive_n05_swa_qkv_attention_disabled naive_n05_swa_qkv_attention_core_disabled
                 PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         endif()
