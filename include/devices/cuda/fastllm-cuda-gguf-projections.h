@@ -62,7 +62,8 @@ bool FastllmCudaGGUFMMQShared(const fastllm::Data &input, fastllm::Data *const *
                               fastllm::Data *const *outputs, int count);
 
 // Project each GPU route against its expert's contiguous GGUF matrix. Consecutive
-// routes may share an input row. Outer scales, when present, are per expert.
+// routes may share an input row. Negative expert IDs produce zero rows.
+// Outer scales, when present, are per expert.
 using FastllmGGUFExpertProjection = void (*)(const void *weights, const float *outer, const int *experts,
         const float *input, float *output, int routes, int routesPerInput, int cols, int rows, size_t rowBytes);
 FastllmGGUFExpertProjection FastllmCudaGetGGUFExpertProjection(int type);

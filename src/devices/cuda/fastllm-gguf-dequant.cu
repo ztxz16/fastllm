@@ -1390,6 +1390,10 @@ __global__ void ggufExpertProjection(const uint8_t *weights, const float *outer,
     const int row = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (row >= rows) return;
     const int route = blockIdx.y, expert = experts[route];
+    if (expert < 0) {
+        if (!lane) out[size_t(route) * rows + row] = 0.f;
+        return;
+    }
     const uint8_t *w = weights + (size_t(expert) * rows + row) * rowBytes;
     const float *x = input + size_t(route / copies) * cols;
     float sum = 0;

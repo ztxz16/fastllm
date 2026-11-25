@@ -412,6 +412,10 @@ __global__ void indexedExpertGemv(const uint8_t *weights, const float *outer, co
     const int row = blockIdx.x * (blockDim.x / lanes) + threadIdx.x / lanes;
     if (row >= width) return;
     const int expert = indices[blockIdx.y], lane = threadIdx.x % lanes;
+    if (expert < 0) {
+        if (lane == 0) output[size_t(blockIdx.y) * width + row] = 0.f;
+        return;
+    }
     const auto *w = weights + (size_t(expert) * width + row) * rowBytes;
     float sum = 0;
     if constexpr (Type == GGML_TYPE_Q3_K) {

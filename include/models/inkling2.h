@@ -141,18 +141,27 @@ public:
     bool SetSaveHistoryChat(bool save) override;
     int QueryPagedPrefixCacheExtra(ResponseContext *ctx, int limit) const override;
     bool RestorePagedPrefixCacheExtra(ResponseContext *ctx, int length) const override;
-    std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
-        int layer, bool key, const ResponseContext *ctx) const override {
-        // Sliding windows rotate in-place and must have private writable pages.
-        if (GetKVCacheRetainedTokens(layer) >= 0) return {};
+    PagedCacheManager *GetPagedKVCacheManager(int layer, bool key) const override {
+        // Admission uses rank zero's pool for the requested layer.
+        const int world = runtime && runtime->hasRankCaches() ? int(placement.tensorDevices.size()) : 1;
+        return basellm::GetPagedKVCacheManager(layer * world, key);
+    }
+    std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override {
         if (runtime && runtime->hasRankCaches()) {
             std::vector<std::pair<int, PagedCacheManager *>> managers;
-            for (size_t i = 0; i < placement.tensorDevices.size(); ++i)
+            const int world = placement.tensorDevices.size();
+            for (int i = 0; i < world; ++i)
                 managers.emplace_back(placement.tensorDevices[i],
-                    GetPagedCacheManager(2 * (layer * placement.tensorDevices.size() + i) + (key ? 0 : 1)));
+                    basellm::GetPagedKVCacheManager(layer * world + i, key));
             return managers;
         }
-        return basellm::GetPagedKVCacheManagersForRequest(layer, key, ctx);
+        return basellm::GetPagedKVCacheManagers(layer, key);
+    }
+    std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagersForRequest(
+        int layer, bool key, const ResponseContext *) const override {
+        // Sliding windows rotate in-place and must have private writable pages.
+        if (GetKVCacheRetainedTokens(layer) >= 0) return {};
+        return GetPagedKVCacheManagers(layer, key);
     }
     bool DeferHistoryCacheRestore() const override { return saveHistoryChat; }
     bool UseGenericHistoryCache() const override { return false; }

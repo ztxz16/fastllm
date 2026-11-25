@@ -52,7 +52,7 @@ static void CheckRoutedGemv(ggml_type type, int cols, bool useOuter, int copies)
                 unpack(packed.data() + row * stride, reference.data() + row * cols, cols);
         }
     }
-    const std::vector<int> ids{2, 0, 2, 1, 0, 1};
+    const std::vector<int> ids{2, -1, 2, 1, 0, -1};
     const std::vector<float> outer{.015625f, .25f, .0625f};
     for (size_t i = 0; i < input.size(); ++i) input[i] = float(int(i * 23 % 59) - 29) / 32;
     Data w(INT8, {int(packed.size())}), s(FLOAT32, {experts}), indices(INT32, {routes});
@@ -67,6 +67,10 @@ static void CheckRoutedGemv(ggml_type type, int cols, bool useOuter, int copies)
     Cuda(cudaMemcpy(actual.data(), y.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
     double diff = 0, norm = 0;
     for (int r = 0; r < routes; ++r) for (int j = 0; j < rows; ++j) {
+        if (ids[r] < 0) {
+            Check(actual[r * rows + j] == 0.f, "Nonlocal expert route must produce zero");
+            continue;
+        }
         double expected = 0;
         for (int i = 0; i < cols; ++i)
             expected += double(reference[(ids[r] * rows + j) * cols + i]) * input[r / copies * cols + i];
@@ -139,6 +143,7 @@ static void Grouped(ggml_type type, int rows, ggml_type downType = GGML_TYPE_IQ4
     for (int iteration = 0; iteration < 2; ++iteration) {
         for (int r = 0; r < routes; ++r)
             route[r] = (iteration + r % top + r / top) % 4;
+        if (iteration) std::fill_n(route.begin(), top + 1, -1);
         Upload(ids, route);
         Cuda(cudaGraphLaunch(exec, cudaStreamPerThread));
         for (bool isGate : {true, false}) {
@@ -164,6 +169,7 @@ static void Grouped(ggml_type type, int rows, ggml_type downType = GGML_TYPE_IQ4
                     float reference = 0.f;
                     for (int k = 0; k < top; ++k) {
                         const size_t r = (i / hidden) * top + k;
+                        if (route[r] < 0) continue;
                         volatile float part = actual[r * hidden + i % hidden] * (scaled ? scales[route[r]] : 1.f);
                         reference += part;
                     }

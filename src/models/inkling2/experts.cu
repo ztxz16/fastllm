@@ -1068,7 +1068,7 @@ void projectNativeRoutes(const Projection &w, const native::Block16 *input, cons
     auto launch = [&](auto grouped) {
         constexpr bool match = decltype(grouped)::value;
         constexpr Edge edge = GateUp || match ? Edge::Gate : Edge::Down;
-        return cuda_launch::Launch<native::decodeProject<4, match, edge>>(
+        return cuda_launch::Launch<native::decodeProject<4, match, edge, true>>(
             grid, 128, 0, cudaStreamPerThread, w.nativeView(), input, ids, out, w.rows, w.cols,
             GateUp ? top : 1, routes, capacity, w.rows);
     };
@@ -1077,7 +1077,7 @@ void projectNativeRoutes(const Projection &w, const native::Block16 *input, cons
 }
 
 void finishNativeRoutes(const Config &c, Rows<__nv_bfloat16> &projected, float *dstRows,
-                        Rows<__nv_bfloat16> *unreduced) {
+                        Rows<__nv_bfloat16> *unreduced, const int *groupedLocalIds) {
     const int rows = projected.rows / c.topK;
     if (unreduced) {
         *unreduced = std::move(projected);
@@ -1089,8 +1089,10 @@ void finishNativeRoutes(const Config &c, Rows<__nv_bfloat16> &projected, float *
             throw std::runtime_error("Inkling FP4 route sum launch failed");
         return;
     }
-    sumNativeRoutes<><<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
-        projected.p, dstRows, rows, c.hidden, c.topK, c.hidden, c.hidden);
+    // A grouped projection writes only the routes owned by this rank.
+    const auto sum = groupedLocalIds ? sumNativeRoutes<false, true> : sumNativeRoutes<>;
+    sum<<<(size_t(rows) * c.hidden + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+        projected.p, dstRows, rows, c.hidden, c.topK, c.hidden, c.hidden, groupedLocalIds);
 }
 
 class RoutedExperts : public ExpertBackend, protected CudaMoeActivation {
@@ -1753,8 +1755,7 @@ ExpertLayers loadExperts(const Config &c, const Placement &p, const std::map<std
         if (gateType >= 0) {
             const bool nativeDown = topology.nativeFp4 && files.at(prefix + "w2_weight").ggmlType == GGML_TYPE_NVFP4;
             if (!nativeDown || gateType != GGML_TYPE_NVFP4) {
-                experts.layers.push_back(std::make_unique<GpuGGUFExperts>(c, files, prefix, router,
-                                                                          nativeDown ? &topology : nullptr));
+                experts.layers.push_back(std::make_unique<GpuGGUFExperts>(c, files, prefix, router, topology, nativeDown));
                 continue;
             }
         }
