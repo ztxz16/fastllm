@@ -175,8 +175,9 @@ void prepareWindowVerification(int batch) {
 
 template <class T> RoundPlan &roundPlan(int batch, bool bounded = false) {
     const bool tp = placement.world > 1 || !placement.tensorDevices.empty();
-    const bool persistent = !tp || batch == 1 || batch == model.maxBatch;
-    if (tp && roundPlans.find(batch) == roundPlans.end()) {
+    const bool limited = tp || limitRoundPlans;
+    const bool persistent = !limited || batch == 1 || batch == model.maxBatch;
+    if (limited && roundPlans.find(batch) == roundPlans.end()) {
         // Each shape owns full-vocabulary draft and rejection workspaces. A
         // shrinking cohort can visit every size before the next request arrives.
         // TP verify rounds have joined both streams before changing cohorts.

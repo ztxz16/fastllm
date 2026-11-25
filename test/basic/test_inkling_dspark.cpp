@@ -520,18 +520,20 @@ static int checkBatchDecode(const char *path, int capacity) {
 int main(int argc, char **argv) {
     if (argc == 4 && std::string(argv[2]) == "--batch-decode") return checkBatchDecode(argv[1], std::stoi(argv[3]));
     if (argc == 3 && std::string(argv[2]) == "--hybrid-decode") return checkHybridDecode(argv[1]);
-    if (argc != 2 && (argc != 3 || std::string(argv[2]) != "--graph"))
-        return 77;
+    const bool gguf = argc >= 4 && std::string(argv[2]) == "--draft";
+    const int required = gguf ? 4 : 2;
+    const bool graph = argc == required + 1 && std::string(argv[required]) == "--graph";
+    if (argc != required && !graph) return 77;
     setenv("FASTLLM_DSPARK_TOKENS", "7", 1);
     SetDeviceMap({{"cuda:0", 1}});
     SetMoeDeviceMap({{"cuda:0", 1}});
     SetMaxTokens(16384);
     SetThreads(4);
-    const bool graph = argc == 3;
     SetCudaGraph(graph);
     if (cudaMalloc(&control, 8 * sizeof(int)) != cudaSuccess) return 1;
     configure(0);
-    auto model = CreateLLMModelFromHF(argv[1], BFLOAT16);
+    auto model = gguf ? CreateLLMModelFromGGUFFile(argv[1], "", argv[3], "")
+                      : CreateLLMModelFromHF(argv[1], BFLOAT16);
     int major = 0;
     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) return 1;
     if (model->dataType != (major >= 8 ? BFLOAT16 : FLOAT32))

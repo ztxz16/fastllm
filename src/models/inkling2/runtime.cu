@@ -2131,13 +2131,27 @@ class Decoder final : public Runtime {
         if (c.draft.steps) {
             const bool bf16 = placement.denseType == BFLOAT16;
             // Each draft plan retains a batch-specific vocabulary distribution.
-            // Under TP, prepare additional batch sizes as they are admitted.
-            const int warmBatch = placement.world == 1 && placement.tensorDevices.empty() ? std::max(1, model.maxBatch) : 1;
+            // TP and memory-limited warmups prepare other sizes on demand.
+            const int warmBatch = !limitRoundPlans && placement.world == 1 && placement.tensorDevices.empty()
+                                  ? std::max(1, model.maxBatch) : 1;
+            const auto prepare = [&](int b) {
+                if (bf16) roundPlan<__nv_bfloat16>(b);
+                else roundPlan<half>(b);
+            };
             for (int b = warmBatch; b >= 1; --b) {
-                if (bf16)
-                    roundPlan<__nv_bfloat16>(b);
-                else
-                    roundPlan<half>(b);
+                try {
+                    prepare(b);
+                } catch (const CudaWorkspaceExhausted &) {
+                    if (b == warmBatch) throw;
+                    const auto status = cudaGetLastError();
+                    if (status != cudaErrorMemoryAllocation) check(status);
+                    // Keep the largest plan, then admit shrinking batches on demand as in TP.
+                    limitRoundPlans = true;
+                    roundPlans.erase(roundPlans.begin(), roundPlans.find(warmBatch));
+                    check(cudaStreamSynchronize(cudaStreamPerThread));
+                    prepare(1);
+                    break;
+                }
             }
         }
     }

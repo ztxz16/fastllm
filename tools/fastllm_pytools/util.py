@@ -1356,19 +1356,28 @@ def make_normal_llm_model(args, startup_progress = None):
     draft_has_mtp_weights = False
     draft_is_mtp_gguf = False
     draft_is_dspark_gguf = False
+    draft_is_inkling_gguf = False
     if speculative_draft_path:
         speculative_draft_path = os.path.abspath(
             os.path.expanduser(speculative_draft_path))
         draft_is_file = os.path.isfile(speculative_draft_path)
         draft_is_mtp_gguf = draft_is_file and speculative_draft_path.lower().endswith(".gguf")
         if draft_is_mtp_gguf:
-            metadata = read_gguf_metadata(speculative_draft_path, {"general.architecture"})
+            metadata = read_gguf_metadata(speculative_draft_path, {"general.architecture", "dflash.block_size"})
             draft_is_dspark_gguf = metadata.get("general.architecture") == "dflash"
             if draft_is_dspark_gguf:
-                from .deepseek_v41_gguf import dspark_config
-                draft_config = dspark_config(speculative_draft_path)
+                gguf_draft_block = int(metadata.get("dflash.block_size", 0))
+                if gguf_draft_block < 1:
+                    raise ValueError("DSpark GGUF requires a positive block size")
+                draft_is_inkling_gguf = "joint_proj.weight" in read_gguf_tensor_names(speculative_draft_path)
+                if draft_is_inkling_gguf:
+                    if gguf_draft_block < 2:
+                        raise ValueError("Inkling DSpark GGUF requires an anchor and at least one proposal")
+                    requested = int(getattr(args, "speculative_dspark_block_size", -1))
+                    if requested > 0 and requested != gguf_draft_block:
+                        raise ValueError("Inkling DSpark block size must match its GGUF draft")
                 if speculative_algorithm and speculative_algorithm != "dspark":
-                    raise ValueError("DeepSeek DSpark GGUF requires the dspark algorithm")
+                    raise ValueError("DSpark GGUF requires the dspark algorithm")
                 speculative_algorithm = "dspark"
                 draft_is_mtp_gguf = False
         if draft_is_mtp_gguf:
@@ -1534,7 +1543,8 @@ def make_normal_llm_model(args, startup_progress = None):
     elif draft_is_dspark_gguf:
         if draft_tokens > 0 and dspark_tokens > 0 and draft_tokens != dspark_tokens:
             raise ValueError("--draft_tokens and --dspark specify different token counts")
-        dspark_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or draft_config["dspark_block_size"]
+        default_tokens = gguf_draft_block - 1 if draft_is_inkling_gguf else gguf_draft_block
+        dspark_tokens = draft_tokens if draft_tokens > 0 else dspark_tokens or default_tokens
         args.dspark = dspark_tokens
         args.speculative_draft_model_path = speculative_draft_path
         _configure_dspark(args, dspark_tokens)
@@ -1615,9 +1625,18 @@ def make_normal_llm_model(args, startup_progress = None):
     if os.path.isfile(args.path) and args.path.lower().endswith(".gguf"):
         # --ori may describe HF DSpark weights that are absent from the GGUF.
         # V4.1 startup defaults must follow the actual backbone metadata.
-        if (not os.path.exists(config_path) or
+        if (draft_is_dspark_gguf or not os.path.exists(config_path) or
                 read_gguf_metadata(args.path, {"general.architecture"}).get("general.architecture") == "deepseek41"):
             gguf_config = get_gguf_model_config(args.path)
+    if draft_is_dspark_gguf:
+        if gguf_config is None:
+            raise ValueError("DSpark GGUF requires a GGUF target")
+        if draft_is_inkling_gguf:
+            if gguf_config.get("gguf_architecture") != "inkling2_loop":
+                raise ValueError("Inkling DSpark GGUF requires an Inkling GGUF target")
+        else:
+            from .deepseek_v41_gguf import dspark_config as read_dspark_config
+            gguf_config.update(read_dspark_config(speculative_draft_path, gguf_config))
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
@@ -1640,8 +1659,6 @@ def make_normal_llm_model(args, startup_progress = None):
                     config = json.load(file)
             else:
                 config = gguf_config
-            if draft_is_dspark_gguf:
-                config.update(dspark_config(speculative_draft_path, config))
             if getattr(args, "mmproj", "") and config.get("gguf_architecture") == "deepseek41":
                 from .deepseek_v41_gguf import vision_config
                 config.update(vision_config(args.mmproj, config))
@@ -1721,9 +1738,9 @@ def make_normal_llm_model(args, startup_progress = None):
                     _configure_dspark(args, dspark_tokens)
             if speculative_algorithm == "dspark":
                 if is_inkling_model:
-                    if speculative_draft_path:
-                        raise ValueError("Inkling DSpark uses the checkpoint's embedded mtp.safetensors")
-                    block = int(config.get("mtp_config", {}).get("block_size", 0))
+                    if speculative_draft_path and not draft_is_inkling_gguf:
+                        raise ValueError("Inkling DSpark requires its embedded draft or a matching GGUF draft")
+                    block = gguf_draft_block if draft_is_inkling_gguf else int(config.get("mtp_config", {}).get("block_size", 0))
                     if not 1 <= dspark_tokens < block:
                         raise ValueError(f"Inkling DSpark accepts 1 to {block - 1} proposals")
                 elif speculative_draft_path and not draft_is_dspark_gguf:

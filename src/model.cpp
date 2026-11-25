@@ -4215,7 +4215,11 @@ namespace fastllm {
         const bool externalMtpGGUF = !externalMtpPath.empty() &&
             StringEndWith(externalMtpPath, ".gguf");
         const bool externalDsparkGGUF = externalMtpGGUF && model->model_struct == "deepseek_v41";
-        if (externalDsparkGGUF) {
+        std::vector<ReadGGUFTask> inklingDraftTasks;
+        auto *inkling = dynamic_cast<Inkling2Model *>(model);
+        if (externalMtpGGUF && inkling) {
+            inkling->ConfigureDraftGGUF(externalMtpPath, inklingDraftTasks);
+        } else if (externalDsparkGGUF) {
             AppendDeepSeekV41GGUFAux(model, params, externalMtpPath, false, readGGUFTasks);
         } else if (externalMtpGGUF) {
             AssertInFastLLM(model->model_struct == "qwen4_exp",
@@ -4370,7 +4374,10 @@ namespace fastllm {
         for (auto &s : ggufFileNames) {
             AppendGGUFTasks(arch, s, readGGUFTasks);
         }
-        if (auto *inkling = dynamic_cast<Inkling2Model *>(model)) inkling->PrepareGGUF(readGGUFTasks);
+        if (inkling) {
+            inkling->PrepareGGUF(readGGUFTasks);
+            if (!inklingDraftTasks.empty()) inkling->LoadDraftGGUF(inklingDraftTasks);
+        }
         if (arch == "hy_v4_flash") {
             auto *hy = dynamic_cast<Hy4FlashModel *>(model);
             AssertInFastLLM(hy && hy->UsesHostExperts(), "HY4 GGUF requires hybrid expert placement.");

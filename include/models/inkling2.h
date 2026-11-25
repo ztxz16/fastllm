@@ -82,6 +82,8 @@ public:
     ~Inkling2Model() override;
     void InitParams() override;
     void ConfigureGGUF(const json11::Json &metadata);
+    void ConfigureDraftGGUF(const std::string &file, std::vector<ReadGGUFTask> &tasks);
+    void LoadDraftGGUF(std::vector<ReadGGUFTask> &tasks);
     void PrepareGGUF(std::vector<ReadGGUFTask> &tasks);
     void SetDataType(DataType type) override;
     void SetKVCacheDataType(DataType type) override;

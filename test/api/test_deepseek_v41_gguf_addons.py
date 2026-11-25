@@ -91,7 +91,8 @@ class AddonTest(unittest.TestCase):
 
     def test_cli_selects_embedded_dspark_engine_for_gguf(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf") as file, patch.dict(os.environ, {}, clear=True), \
-                patch("fastllm_pytools.util.read_gguf_metadata", return_value={"general.architecture": "dflash"}):
+                patch("fastllm_pytools.util.read_gguf_metadata", return_value=self.meta), \
+                patch("fastllm_pytools.util.read_gguf_tensor_names", return_value=set(self.tensors)):
             args = make_normal_parser("test").parse_args(["--draft", file.name, "--draft_tokens", "3"])
             with self.assertRaises(SystemExit):
                 make_normal_llm_model(args)
@@ -99,6 +100,26 @@ class AddonTest(unittest.TestCase):
             self.assertEqual(args.dspark, 3)
             self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], "3")
             self.assertNotIn("FASTLLM_DSPARK_MODEL_PATH", os.environ)
+
+    def test_inkling_gguf_default_reserves_one_anchor(self):
+        meta = {"general.architecture": "dflash", "dflash.block_size": 8}
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as file, patch.dict(os.environ, {}, clear=True), \
+                patch("fastllm_pytools.util.read_gguf_metadata", return_value=meta), \
+                patch("fastllm_pytools.util.read_gguf_tensor_names", return_value={"joint_proj.weight"}):
+            args = make_normal_parser("test").parse_args(["--draft", file.name])
+            with self.assertRaises(SystemExit):  # No target supplied.
+                make_normal_llm_model(args)
+            self.assertEqual(args.dspark, 7)
+            self.assertEqual(os.environ["FASTLLM_DSPARK_TOKENS"], "7")
+            mismatch = make_normal_parser("test").parse_args(
+                ["--draft", file.name, "--speculative_dspark_block_size", "4"])
+            with self.assertRaisesRegex(ValueError, "block size"):
+                make_normal_llm_model(mismatch)
+
+            with tempfile.TemporaryDirectory() as target:
+                args = make_normal_parser("test").parse_args([target, "--draft", file.name])
+                with self.assertRaisesRegex(ValueError, "GGUF target"):
+                    make_normal_llm_model(args)
 
 
 if __name__ == "__main__":

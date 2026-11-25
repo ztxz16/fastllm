@@ -78,6 +78,7 @@ struct RoundPlan {
     }
 };
 DecodeGraphScratch roundScratch;
+bool limitRoundPlans = false;
 std::map<int, std::unique_ptr<RoundPlan>> roundPlans;
 RoundPlan *publishedPlan = nullptr;
 bool draftQueued = false;
@@ -141,7 +142,7 @@ template <class T> void draftBody(RoundPlan &p) {
     stageDraftInputs<<<b, 128, 0, cudaStreamPerThread>>>(p.inputs.p, anchors.p, p.tokens.p, p.temperature.p, p.topK.p,
                                                          p.topP.p, p.live.p, b, p.chain, c.vocab);
     auto emb = tokenEmbedding(anchors.p, b);
-    auto first = castRows<T>(norm(emb, param("embed_norm.weight", h), c.eps));
+    auto first = castRows<T>(norm(emb, draftEmbeddingNorm, c.eps));
     Rows<T> x(n, h);
     draftBlockInput<<<dim3((h + 255) / 256, n), 256, 0, cudaStreamPerThread>>>(first.p, param("draft.mask_embed", h),
                                                                                x.p, d.block, h);

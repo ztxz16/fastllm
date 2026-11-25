@@ -71,6 +71,8 @@ FastllmGGUFExpertProjection FastllmCudaGetGGUFExpertProjection(int type);
 // One input shared by all top-k routes. Uses caller-owned Q8_1 scratch.
 bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, const float *outer, const int *ids,
         const float *input, float *output, void *scratch, int topk, int cols, int width, size_t rowBytes);
+bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, const float *outer, const int *ids,
+        const float *input, float *output, void *scratch, int topk, int cols, int width, size_t rowBytes, int rows);
 
 // Resident gate/up and optional down projection. The device pointer table has
 // two slots per expert (repeat the gate pointer when down runs on another backend).

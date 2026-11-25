@@ -6,6 +6,25 @@
 #include <set>
 
 namespace fastllm {
+namespace {
+json11::Json::array localLayerIds(const json11::Json &pattern, int layers) {
+    const auto &flags = pattern.array_items();
+    if (int(flags.size()) != layers) throw std::runtime_error("Invalid Inkling GGUF sliding-window pattern");
+    json11::Json::array local;
+    for (int i = 0; i < layers; ++i) {
+        if (!flags[i].is_bool()) throw std::runtime_error("Invalid Inkling GGUF sliding-window flag");
+        if (flags[i].bool_value()) local.emplace_back(i);
+    }
+    return local;
+}
+
+GGUFWeightReplaceRule::GGUFWeightReplaceType denseImportType(DataType type) {
+    using Rule = GGUFWeightReplaceRule;
+    return type == BFLOAT16 ? Rule::GGUFWeightReplaceForceBF16
+         : type == FLOAT16 ? Rule::GGUFWeightReplaceForceFP16 : Rule::GGUFWeightReplaceForceFP32;
+}
+} // namespace
+
 void Inkling2Model::ConfigureGGUF(const json11::Json &meta) {
     auto get = [&](const std::string &key) -> const json11::Json & {
         const auto &v = meta["inkling2_loop." + key];
@@ -56,14 +75,7 @@ void Inkling2Model::ConfigureGGUF(const json11::Json &meta) {
             throw std::runtime_error("Inkling GGUF needs uniform " + source);
         put(key, a.front());
     }
-    const auto &pattern = get("attention.sliding_window_pattern").array_items();
-    if (int(pattern.size()) != layers) throw std::runtime_error("Invalid Inkling GGUF sliding-window pattern");
-    json11::Json::array local;
-    for (int i = 0; i < layers; ++i) {
-        if (!pattern[i].is_bool()) throw std::runtime_error("Invalid Inkling GGUF sliding-window flag");
-        if (pattern[i].bool_value()) local.emplace_back(i);
-    }
-    put("local_layer_ids", local);
+    put("local_layer_ids", localLayerIds(get("attention.sliding_window_pattern"), layers));
 }
 
 void Inkling2Model::PrepareGGUF(std::vector<ReadGGUFTask> &tasks) {
@@ -193,12 +205,110 @@ void Inkling2Model::PrepareGGUF(std::vector<ReadGGUFTask> &tasks) {
     }
     if (messages != cfg.end - cfg.start) throw std::runtime_error("Incomplete Inkling GGUF cross-pass queries");
     const auto map = GetTensorMap(names);
-    for (auto &t : dense) {
-        auto type = map.at(t.name).at(0).second;
-        t.replaceType = type == BFLOAT16  ? Rule::GGUFWeightReplaceForceBF16
-                        : type == FLOAT16 ? Rule::GGUFWeightReplaceForceFP16
-                                          : Rule::GGUFWeightReplaceForceFP32;
-    }
+    for (auto &t : dense) t.replaceType = denseImportType(map.at(t.name).at(0).second);
     tasks = std::move(dense);
+}
+
+void Inkling2Model::ConfigureDraftGGUF(const std::string &file, std::vector<ReadGGUFTask> &tasks) {
+    json11::Json metadata;
+    ReadGGUFMetaData(file, metadata);
+    const auto &params = metadata["params"];
+    if (params["general.architecture"].string_value() != "dflash")
+        throw std::runtime_error("Inkling DSpark requires a dflash GGUF");
+    auto get = [&](const std::string &key) -> const json11::Json & {
+        const auto &v = params["dflash." + key];
+        if (v.is_null()) throw std::runtime_error("Missing Inkling draft GGUF metadata: " + key);
+        return v;
+    };
+    auto put = [&](const std::string &key, const json11::Json &v) { weight.AddDict("mtp_config." + key, v.dump()); };
+    AppendGGUFTasks("inkling2_loop", file, tasks);
+    auto head = std::find_if(tasks.begin(), tasks.end(), [](const auto &t) { return t.name == "markov_w2.weight"; });
+    if (head == tasks.end() || head->tensor.dims.size() != 2)
+        throw std::runtime_error("Missing Inkling folded draft projection");
+    for (const auto &[key, source] : std::map<std::string, std::string>{
+             {"hidden_size", "embedding_length"}, {"num_hidden_layers", "block_count"},
+             {"num_attention_heads", "attention.head_count"}, {"num_key_value_heads", "attention.head_count_kv"},
+             {"head_dim", "attention.key_length"}, {"intermediate_size", "feed_forward_length"},
+             {"max_position_embeddings", "context_length"}, {"rms_norm_eps", "attention.layer_norm_rms_epsilon"},
+             {"rope_theta", "rope.freq_base"}, {"block_size", "block_size"}, {"target_layer_ids", "target_layers"}})
+        put(key, get(source));
+    if (get("attention.key_length") != get("attention.value_length"))
+        throw std::runtime_error("Invalid Inkling draft attention geometry");
+    put("local_layer_ids", localLayerIds(get("attention.sliding_window_pattern"), get("block_count").int_value()));
+    // GGUF counts the current position; the draft KV cache stores preceding tokens.
+    put("sliding_window_size", get("attention.sliding_window").int_value() - 1);
+    put("markov_rank", head->tensor.dims[1]);
+    put("q_bias", false);
+    put("o_bias", false);
+    weight.AddDict("mtp_config.markov_head_type", "rnn_hidden");
+}
+
+void Inkling2Model::LoadDraftGGUF(std::vector<ReadGGUFTask> &tasks) {
+    if (!draftEnabled()) throw std::runtime_error("Inkling GGUF draft requires DSpark proposals");
+    const auto &d = cfg.draft;
+    const int h = cfg.hidden, rank = d.rank, taps = d.taps.size();
+    std::map<std::string, ReadGGUFTask *> byName;
+    for (auto &task : tasks)
+        if (!byName.emplace(task.name, &task).second) throw std::runtime_error("Duplicate draft tensor: " + task.name);
+    auto read = [&](Data &dst, const std::string &name, const std::vector<int> &shape, DataType type = FLOAT32) {
+        auto it = byName.find(name);
+        if (it == byName.end() || it->second->tensor.dims != shape)
+            throw std::runtime_error("Missing or incompatible Inkling draft tensor: " + name);
+        auto &task = *it->second;
+        WeightImportGGUFTensor(&dst, &task.tensor, task.fileName, task.offset, denseImportType(type));
+        byName.erase(it);
+    };
+    const std::string root = "model.llm.draft.";
+    auto load = [&](const std::string &gguf, const std::string &key, const std::vector<int> &shape) {
+        read(weight[root + key], gguf, shape, shape.size() == 2 ? placement.denseType : FLOAT32);
+    };
+    load("token_embd_norm.weight", "embed_norm.weight", {h});
+    load("output_norm.weight", "norm.weight", {h});
+    load("markov_ctx_norm.weight", "markov_head.dflare_norm.weight", {h});
+    load("joint_proj.weight", "markov_head.rnn_proj.weight", {3 * rank, 2 * rank + 2 * h});
+    load("joint_proj.bias", "markov_head.rnn_proj.bias", {3 * rank});
+    load("markov_w1.weight", "markov_head.markov_w1.weight", {cfg.vocab, rank});
+    load("markov_w2.weight", "markov_head.folded.weight", {cfg.vocab, rank});
+    load("markov_w2.bias", "markov_head.folded.bias", {cfg.vocab});
+
+    Data masks;
+    read(masks, "mask_embd.weight", {d.block - 1, h});
+    const size_t rowBytes = size_t(h) * sizeof(float);
+    for (int i = 1; i < d.block - 1; ++i)
+        if (std::memcmp(masks.cpuData, masks.cpuData + i * rowBytes, rowBytes) != 0)
+            throw std::runtime_error("Inkling requires a shared embedding for draft mask positions");
+    auto &mask = weight[root + "mask_embed"];
+    mask.dataType = FLOAT32; mask.Resize({h}); mask.Allocate();
+    std::memcpy(mask.cpuData, masks.cpuData, rowBytes);
+
+    auto &mix = weight[root + "fuse_prob"];
+    mix.dataType = FLOAT32; mix.Resize({d.layers + 1, taps}); mix.Allocate();
+    for (int i = 0; i <= d.layers; ++i) {
+        const std::string blk = "blk." + std::to_string(i) + ".";
+        Data row;
+        read(row, i == d.layers ? "markov_ctx_mix.weight" : blk + "ctx_mix.weight", {taps});
+        std::memcpy(mix.cpuData + size_t(i) * taps * sizeof(float), row.cpuData, size_t(taps) * sizeof(float));
+        if (i == d.layers) break;
+        const std::string layer = "layers." + std::to_string(i) + ".";
+        auto proj = [&](const char *gguf, const char *key, std::vector<int> dims) {
+            load(blk + gguf + ".weight", layer + key + ".weight", dims);
+        };
+        proj("ctx_norm", "dflare_norm", {h});
+        proj("attn_norm", "input_layernorm", {h});
+        proj("ffn_norm", "post_attention_layernorm", {h});
+        proj("attn_q_norm", "self_attn.q_norm", {d.dim});
+        proj("attn_k_norm", "self_attn.k_norm", {d.dim});
+        proj("attn_k_ctx_norm", "self_attn.k_norm_ctx", {d.dim});
+        proj("attn_q", "self_attn.q_proj", {d.heads * d.dim, h});
+        proj("attn_k", "self_attn.k_proj", {d.kvHeads * d.dim, h});
+        proj("attn_v", "self_attn.v_proj", {d.kvHeads * d.dim, h});
+        proj("attn_k_ctx", "self_attn.k_proj_ctx", {d.kvHeads * d.dim, h});
+        proj("attn_v_ctx", "self_attn.v_proj_ctx", {d.kvHeads * d.dim, h});
+        proj("attn_output", "self_attn.o_proj", {h, d.heads * d.dim});
+        proj("ffn_gate", "mlp.gate_proj", {d.intermediate, h});
+        proj("ffn_up", "mlp.up_proj", {d.intermediate, h});
+        proj("ffn_down", "mlp.down_proj", {h, d.intermediate});
+    }
+    if (!byName.empty()) throw std::runtime_error("Unknown Inkling draft tensor: " + byName.begin()->first);
 }
 } // namespace fastllm

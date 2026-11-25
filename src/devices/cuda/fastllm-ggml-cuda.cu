@@ -402,7 +402,7 @@ std::size_t FastllmCudaQ8ProjectionScratchBytes(int rows, int columns) {
 namespace {
 template <ggml_type Type>
 __global__ void indexedExpertGemv(const uint8_t *weights, const float *outer, const int *indices,
-                                  const block_q8_1 *input, float *output, int cols, int width, size_t rowBytes) {
+                                  const block_q8_1 *input, float *output, int cols, int width, size_t rowBytes, int topk) {
     constexpr int lanes = 16;
     extern __shared__ uint64_t grid[];
     if constexpr (Type != GGML_TYPE_Q3_K) {
@@ -416,6 +416,7 @@ __global__ void indexedExpertGemv(const uint8_t *weights, const float *outer, co
         if (lane == 0) output[size_t(blockIdx.y) * width + row] = 0.f;
         return;
     }
+    input += size_t(blockIdx.y / topk) * (cols / QK8_1);
     const auto *w = weights + (size_t(expert) * width + row) * rowBytes;
     float sum = 0;
     if constexpr (Type == GGML_TYPE_Q3_K) {
@@ -431,6 +432,10 @@ __global__ void indexedExpertGemv(const uint8_t *weights, const float *outer, co
 }
 bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, const float *outer, const int *ids,
         const float *input, float *output, void *scratch, int topk, int cols, int width, size_t rowBytes) {
+    return FastllmCudaGGUFSingleExpertProjection(type, weights, outer, ids, input, output, scratch, topk, cols, width, rowBytes, 1);
+}
+bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, const float *outer, const int *ids,
+        const float *input, float *output, void *scratch, int topk, int cols, int width, size_t rowBytes, int rows) {
     using Kernel = decltype(&indexedExpertGemv<GGML_TYPE_Q3_K>);
     Kernel kernel;
     size_t smem;
@@ -443,9 +448,9 @@ bool FastllmCudaGGUFSingleExpertProjection(int type, const uint8_t *weights, con
         default: return false;
     }
     auto *q = static_cast<block_q8_1 *>(scratch);
-    quantize_row_q8_1_cuda(input, q, cols, 1, 1, cols, GGML_TYPE_Q8_1, cudaStreamPerThread);
-    kernel<<<dim3((width + 15) / 16, topk), 256, smem, cudaStreamPerThread>>>(
-        weights, outer, ids, q, output, cols, width, rowBytes);
+    quantize_row_q8_1_cuda(input, q, cols, rows, 1, cols, GGML_TYPE_Q8_1, cudaStreamPerThread);
+    kernel<<<dim3((width + 15) / 16, rows * topk), 256, smem, cudaStreamPerThread>>>(
+        weights, outer, ids, q, output, cols, width, rowBytes, topk);
     return true;
 }
 #endif

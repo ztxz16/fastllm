@@ -38,7 +38,9 @@ class TensorRuntime final : public Runtime {
         const bool packed = ends(".attn.packed.weight");
         const bool columns = ends(".attn.wo_ud.weight") || ends(".attn.k_sconv.static_w") ||
                              ends(".attn.v_sconv.static_w") || ends(".self_attn.o_proj.weight") || ends(".mlp.down_proj.weight");
-        const bool vocab = name == "model.llm.embed.weight" || name == "model.llm.unembed.weight";
+        const bool vocab = name == "model.llm.embed.weight" || name == "model.llm.unembed.weight" ||
+                           name == "model.llm.draft.markov_head.folded.weight" ||
+                           name == "model.llm.draft.markov_head.folded.bias";
         const bool heads = ends(".attn.q_l2_clip.scale") || ends(".attn.rel_l2_clip.scale") ||
             ends(".attn.k_sconv.weight") || ends(".attn.v_sconv.weight") ||
             ends(".self_attn.q_proj.weight") || ends(".self_attn.k_proj.weight") || ends(".self_attn.v_proj.weight") ||

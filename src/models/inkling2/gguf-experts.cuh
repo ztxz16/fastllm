@@ -175,16 +175,19 @@ public:
             auto input = x.slice(first, rows);
             Matrix scores(rows, c.topK);
             Buffer<int> ids(routes);
+            // Candidate rows must reproduce incremental target logits. MMQ quantizes
+            // the activations, and cuBLAS also chooses a different dot product for a matrix.
+            const bool verify = phase == ExpertPhase::Verify;
             for (int start = 0; start < rows; start += routeRows) {
                 const int count = std::min(routeRows, rows - start);
-                Matrix logits = routeLogits(input.slice(start, count), router);
+                Matrix logits = routeLogits(input.slice(start, count), router, verify ? 1 : 0);
                 const size_t offset = size_t(start) * c.topK;
                 selectGGUFExperts<<<count, 64, 0, cudaStreamPerThread>>>(
                     {logits.p, bias, ids.p + offset, scores.p + offset, c.experts, c.topK, c.routeScale,
                      firstExpert, sharded ? residentExperts : 0, -1});
             }
             // A few routes do not fill even two 16-route MMQ tiles.
-            const bool grouped = expertPointers.p && rows > 1 && routes >= 32;
+            const bool grouped = !verify && expertPointers.p && rows > 1 && routes >= 32;
             Buffer<uint8_t> workspace(
                 grouped ? FastllmCudaGGUFExpertMMQBytes(rows, c.hidden, c.intermediate, residentExperts, c.topK) : 0);
             const bool groupedPrefill = grouped && phase == ExpertPhase::Prefill;
@@ -197,10 +200,10 @@ public:
                                              workspace.p, rows, c.hidden, c.intermediate, residentExperts, c.topK);
                     return;
                 }
-                if (gateUp && rows == 1 && nativeDown) {
-                    Buffer<uint8_t> q(FastllmCudaQ8ProjectionScratchBytes(1, w.cols));
+                if (gateUp && (verify || rows == 1) && nativeDown) {
+                    Buffer<uint8_t> q(FastllmCudaQ8ProjectionScratchBytes(rows, w.cols));
                     if (FastllmCudaGGUFSingleExpertProjection(w.type, w.blocks.p, w.scale.p, ids.p, in.p, dst.p,
-                                                              q.p, c.topK, w.cols, w.rows, w.rowBytes)) return;
+                                                              q.p, c.topK, w.cols, w.rows, w.rowBytes, rows)) return;
                 }
                 w.gemv(w.blocks.p, w.scale.p, ids.p, in.p, dst.p, routes, gateUp ? c.topK : 1, w.cols, w.rows, w.rowBytes);
             };

@@ -82,6 +82,29 @@ static void CheckRoutedGemv(ggml_type type, int cols, bool useOuter, int copies)
     }
     if (!(norm > 0 && diff <= 1e-10 * norm))
         throw std::runtime_error(std::string("Routed GEMV mismatch for ") + ggml_type_name(type));
+    if (copies > 1 && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_IQ3_XXS)) {
+        const int tokens = routes / copies;
+        Data scratch(INT8, {int(FastllmCudaQ8ProjectionScratchBytes(tokens, cols))});
+        Allocate(scratch);
+        auto *weights = static_cast<const uint8_t *>(w.cudaData);
+        auto *scales = static_cast<const float *>(s.cudaData);
+        auto *routeIds = static_cast<const int *>(indices.cudaData);
+        auto *inputs = static_cast<const float *>(x.cudaData);
+        auto *outputs = static_cast<float *>(y.cudaData);
+        Check(FastllmCudaGGUFSingleExpertProjection(type, weights, scales, routeIds, inputs, outputs,
+                  scratch.cudaData, copies, cols, rows, stride, tokens), "Missing indexed GGUF projection");
+        Cuda(cudaMemcpy(actual.data(), outputs, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        Cuda(cudaMemset(outputs, 0xff, actual.size() * sizeof(float)));
+        for (int t = 0; t < tokens; ++t)
+            Check(FastllmCudaGGUFSingleExpertProjection(type, weights, scales, routeIds + t * copies,
+                      inputs + t * cols, outputs + t * copies * rows, scratch.cudaData, copies, cols, rows, stride),
+                  "Missing single-token GGUF projection");
+        std::vector<float> single(actual.size());
+        Cuda(cudaMemcpy(single.data(), outputs, single.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        Check(actual == single, "Indexed verifier projection differs from single-token decode");
+        for (size_t i = 0; i < actual.size(); ++i)
+            if (ids[i / rows] < 0) Check(actual[i] == 0.f, "Indexed nonlocal route must produce zero");
+    }
 }
 // Materialize the original route-order intermediate to check the fused Q8 handoff.
 __global__ void ReferenceSiTU(fastllm::cuda::RoutedSiTU<float> src, float *dst, int rows, int width) {
@@ -222,6 +245,8 @@ static void Grouped(ggml_type type, int rows, ggml_type downType = GGML_TYPE_IQ4
 int main() {
     CheckRoutedGemv(GGML_TYPE_NVFP4, 192, false, 1);
     CheckRoutedGemv(GGML_TYPE_NVFP4, 192, true, 3);
+    CheckRoutedGemv(GGML_TYPE_Q3_K, 2304, true, 3);
+    CheckRoutedGemv(GGML_TYPE_IQ3_XXS, 2304, true, 3);
     for (auto type : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, GGML_TYPE_IQ4_XS,
                       GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_MXFP4, GGML_TYPE_BF16}) {
         CheckRoutedGemv(type, 2304, true, 3);

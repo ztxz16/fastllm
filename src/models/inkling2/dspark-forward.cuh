@@ -1,6 +1,7 @@
 // Member functions of the Inkling decoder. Projections use the same native
 // Linear as the target. Draft and target use request-owned handles into the common page manager.
 Matrix draftAlpha;
+const float *draftEmbeddingNorm = nullptr;
 Buffer<uint16_t> foldedHead, foldedBias;
 const Data *quantizedFold = nullptr;
 const float *quantizedFoldBias = nullptr;
@@ -11,15 +12,27 @@ template <class T> void foldDraftHead() {
     const int h = c.hidden, rank = c.draft.rank, vocab = draftVocabRows();
     const auto type = std::is_same_v<T, half> ? FLOAT16 : BFLOAT16;
     auto &head = weights.weight.at("model.llm.unembed.weight");
-    auto &project = weights.weight.at("model.llm.draft.markov_head.hidden_out.weight");
     auto saved = weights.weight.find("model.llm.draft.markov_head.folded.weight");
     if (saved != weights.weight.end()) {
-        if (!q8Projection(saved->second) || saved->second.dims != std::vector<int>{vocab, rank} ||
-            !q8Projection(head)) throw std::runtime_error("Invalid quantized Inkling draft head");
-        quantizedFold = &saved->second;
+        auto &matrix = saved->second;
+        if (matrix.dims != std::vector<int>{vocab, rank})
+            throw std::runtime_error("Invalid Inkling folded draft head dimensions");
+        if (matrix.dataType == type && matrix.cudaData && !matrix.IsRepacked) {
+            // The checkpoint already owns this rank's folded projection.
+            foldedHead.p = static_cast<uint16_t *>(matrix.cudaData);
+            foldedBias = Buffer<uint16_t>(vocab);
+            castProjection<<<(vocab + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                param("draft.markov_head.folded.bias", vocab), reinterpret_cast<T *>(foldedBias.p), vocab);
+            check(cudaGetLastError());
+            return;
+        }
+        if (!q8Projection(matrix) || !q8Projection(head))
+            throw std::runtime_error("Invalid quantized Inkling draft head");
+        quantizedFold = &matrix;
         quantizedFoldBias = param("draft.markov_head.folded.bias", vocab);
         return;
     }
+    auto &project = weights.weight.at("model.llm.draft.markov_head.hidden_out.weight");
     if (head.dims.size() != 2 || head.dims[0] < vocab || head.dims[1] != h ||
         project.dims != std::vector<int>{h, rank} || head.dataType != type || project.dataType != type)
         throw std::runtime_error("Invalid Inkling draft output projection");
@@ -39,6 +52,8 @@ template <class T> void foldDraftHead() {
 }
 
 void initDraft() {
+    draftEmbeddingNorm = param(weights.weight.count("model.llm.draft.embed_norm.weight") ?
+                               "draft.embed_norm.weight" : "embed_norm.weight", c.hidden);
     if (placement.denseType == BFLOAT16)
         foldDraftHead<__nv_bfloat16>();
     else
