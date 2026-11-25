@@ -156,7 +156,7 @@ bool launchCompactWindow(RelativeInputs<__nv_bfloat16> in, const DecodeVisit *vi
 // Resolve the optional kernel and pack each physical layer's table before
 // warming the first sufficiently large plan. All subsequent captures share them.
 void prepareWindowVerification(int batch) {
-    if (compactWindow || !backboneBf16 || !pagedDecodePdl || c.relative != 16 || c.headDim != 128 ||
+    if (compactWindow || kvType != FLOAT16 || !backboneBf16 || !pagedDecodePdl || c.relative != 16 || c.headDim != 128 ||
         c.conv != 4 || c.kvHeads <= 0 || c.heads % c.kvHeads || int64_t(batch) * c.kvHeads < smCount)
         return;
     auto kernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen());

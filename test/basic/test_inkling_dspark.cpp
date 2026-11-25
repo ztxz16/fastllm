@@ -524,8 +524,14 @@ int main(int argc, char **argv) {
     if (argc == 3 && std::string(argv[2]) == "--hybrid-decode") return checkHybridDecode(argv[1]);
     const bool gguf = argc >= 4 && std::string(argv[2]) == "--draft";
     const int required = gguf ? 4 : 2;
-    const bool graph = argc == required + 1 && std::string(argv[required]) == "--graph";
-    if (argc != required && !graph) return 77;
+    if (argc < required) return 77;
+    bool graph = false, fp8KV = false;
+    for (int i = required; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "--graph") graph = true;
+        else if (option == "--fp8-kv") fp8KV = true;
+        else return 77;
+    }
     setenv("FASTLLM_DSPARK_TOKENS", "7", 1);
     SetDeviceMap({{"cuda:0", 1}});
     SetMoeDeviceMap({{"cuda:0", 1}});
@@ -536,6 +542,7 @@ int main(int argc, char **argv) {
     configure(0);
     auto model = gguf ? CreateLLMModelFromGGUFFile(argv[1], "", argv[3], "")
                       : CreateLLMModelFromHF(argv[1], BFLOAT16);
+    if (fp8KV) model->SetKVCacheDataType(FP8_E4M3);
     int major = 0;
     if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) != cudaSuccess) return 1;
     if (model->dataType != (major >= 8 ? BFLOAT16 : FLOAT32))
@@ -597,6 +604,10 @@ int main(int argc, char **argv) {
                 acceptedKV = committedKV(ctx, expectedPosition, prompt.size(), committed.size());
             for (const auto &kv : ctx.pastKeyValues) {
                 for (auto *side : {&kv.first, &kv.second}) {
+                    const auto *pool = side->pagedKVCacheData;
+                    if (pool->dataType != model->kvCacheDataType ||
+                        (fp8KV && pool->GetBytes() != pool->Count(0)))
+                        throw std::runtime_error("Incorrect target KV page format");
                     if (side->lastPageLen != (expectedPosition - 1) % side->pageLen + 1)
                         throw std::runtime_error("Rejected suffix advanced KV");
                 }

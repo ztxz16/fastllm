@@ -1065,8 +1065,9 @@ class Decoder final : public Runtime {
             return attended;
         }
         const int rows = projection.storage.rows;
-        const bool queryFits = !std::is_same_v<KV, half> || (c.qClip > 0 && c.qClip <= 65504.f);
-        const bool canFuseGate = std::is_same_v<KV, half> && (window ? gatedWindowPrefill : gatedGlobalPrefill);
+        using Query = PrefillQuery<KV>;
+        const bool queryFits = !std::is_same_v<Query, half> || (c.qClip > 0 && c.qClip <= 65504.f);
+        const bool canFuseGate = std::is_same_v<Query, half> && (window ? gatedWindowPrefill : gatedGlobalPrefill);
         if (batch.front().timeline && batch.front().length == 1 && d == 128 && c.relative == 16 &&
             c.extent % 4 == 0 && c.qClip > 0 && c.rClip > 0 && inputs[0].rows <= 65535) {
             const int rows = inputs[0].rows;
@@ -1104,7 +1105,8 @@ class Decoder final : public Runtime {
             launchBatchDecodeAttention<128, KV>(args, rows, splitScratch.rows, s.data, g.data, output.p);
             return output;
         }
-        const bool multi = (tensorPrefill || canFuseGate) && queryFits && !std::is_same_v<KV, float> &&
+        const bool compensated = tensorPrefill && !std::is_same_v<KV, __nv_fp8_e4m3>;
+        const bool multi = (compensated || canFuseGate) && queryFits && !std::is_same_v<KV, float> &&
                            rows > 1 && !batch.front().decode &&
                            std::all_of(batch.begin(), batch.end(), [](const Segment &s) { return s.length > 1; });
         const bool compact = multi && canFuseGate;
@@ -1117,15 +1119,16 @@ class Decoder final : public Runtime {
         __nv_bfloat16 *table16 = nullptr;
         Matrix q, r, sink, gates, attended(compact ? 0 : rows, c.heads * aligned);
         Rows<T> gatedOutput(compact ? rows : 0, c.heads * d);
-        Rows<KV> typedQuery, typedKey, typedValue;
+        Rows<Query> typedQuery;
+        Rows<KV> typedKey, typedValue;
         auto parts = projection.views();
         if (multi) {
             if (compact) {
                 typedQuery.owner = gatedOutput.owner;
-                typedQuery.p = reinterpret_cast<KV *>(gatedOutput.p);
+                typedQuery.p = reinterpret_cast<Query *>(gatedOutput.p);
                 typedQuery.rows = rows;
                 typedQuery.cols = gatedOutput.cols;
-            } else typedQuery = Rows<KV>(rows, c.heads * (2 * d));
+            } else typedQuery = Rows<Query>(rows, c.heads * (2 * d));
             typedKey = Rows<KV>(rows, k);
             typedValue = Rows<KV>(rows, k);
             if (narrowBias) {
@@ -1277,7 +1280,7 @@ class Decoder final : public Runtime {
                 if constexpr (!std::is_same_v<KV, float>) {
                     if (typedQuery.p) {
                         auto *query = typedQuery.slice(seq.offset + first, count).p;
-                        if constexpr (std::is_same_v<KV, half>) {
+                        if constexpr (std::is_same_v<Query, half>) {
                             if (compact) {
                                 const auto gate = parts.items[2];
                                 const int row = seq.offset + first;
@@ -1286,16 +1289,18 @@ class Decoder final : public Runtime {
                                            gate.data + size_t(row) * gate.stride, gate.stride, count, relativeBias);
                                 };
                                 if (narrowBias) {
-                                    launch(launchGatedPrefill<true,T,__nv_bfloat16>, reinterpret_cast<__nv_bfloat16 *>(bias.p));
+                                    launch(launchGatedPrefill<true,T,KV,__nv_bfloat16>, reinterpret_cast<__nv_bfloat16 *>(bias.p));
                                 } else {
-                                    launch(window ? launchGatedPrefill<true,T> : launchGatedPrefill<false,T>, args.relative);
+                                    launch(window ? launchGatedPrefill<true,T,KV> : launchGatedPrefill<false,T,KV>, args.relative);
                                 }
                                 continue;
                             }
                         }
-                        if (d == 128) launchPrefill<128, KV>(args, query, count);
-                        else launchPrefill<64, KV>(args, query, count);
-                        continue;
+                        if constexpr (!std::is_same_v<KV, __nv_fp8_e4m3>) {
+                            if (d == 128) launchPrefill<128, KV>(args, query, count);
+                            else launchPrefill<64, KV>(args, query, count);
+                            continue;
+                        }
                     }
                 }
                 if (aligned == 128) launchRelative<128, KV>(args, count, seq.length == 1, splitScratch);
@@ -1432,6 +1437,7 @@ class Decoder final : public Runtime {
         Rows<T> attended;
         if (kvType == FLOAT16) attended = attend<half, T>(inputs, att, local, batch, slot, promptRows);
         else if (kvType == BFLOAT16) attended = attend<__nv_bfloat16, T>(inputs, att, local, batch, slot, promptRows);
+        else if (kvType == FP8_E4M3) attended = attend<__nv_fp8_e4m3, T>(inputs, att, local, batch, slot, promptRows);
         else attended = attend<float, T>(inputs, att, local, batch, slot, promptRows);
         const bool newBlock = physical % c.residualBlock == 0;
         const bool overlapProjection = decodeBf16Gemv && kvType == FLOAT16 && singleDecode;
@@ -1749,6 +1755,20 @@ class Decoder final : public Runtime {
         printf("[Inkling] captured full single-request decode graph (%zu nodes, %zu visits, %zu scratch bytes)\n",
                nodes, c.visits.size(), graphScratch.Bytes());
     }
+    template<class KV> void configureGatedAttention() {
+#ifndef CUDA_NO_TENSOR_CORE
+        const int arch = FastllmCudaRuntimeArch();
+        if (arch < 75 || c.headDim != 128 || c.relative > threads) return;
+        if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16) {
+            gatedGlobalPrefill = configureGatedPrefill<false, half, KV>();
+            gatedWindowPrefill = configureGatedPrefill<true, half, KV>();
+        } else if (arch >= 80) {
+            gatedGlobalPrefill = configureGatedPrefill<false, __nv_bfloat16, KV>();
+            gatedWindowPrefill = configureGatedPrefill<true, __nv_bfloat16, KV>();
+            bf16WindowBias = gatedWindowPrefill && configureGatedPrefill<true, __nv_bfloat16, KV, __nv_bfloat16>();
+        }
+#endif
+    }
     void initializeKV() {
         if (kvType != DATA_AUTO_NONE) {
             if (kvType != model.kvCacheDataType)
@@ -1759,6 +1779,8 @@ class Decoder final : public Runtime {
         }
         kvType = model.kvCacheDataType;
         residualType = model.dataType;
+        if (kvType == FP8_E4M3) configureGatedAttention<__nv_fp8_e4m3>();
+        else if (kvType == FLOAT16) configureGatedAttention<half>();
         if (!c.draft.steps && backboneBf16 && kvType == FLOAT16 && verifyAttentionSplits > 0 &&
             splitScratch.rows >= 16 && c.window <= 1024) {
             singleWindowKernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window,
@@ -2040,16 +2062,6 @@ class Decoder final : public Runtime {
         if (arch >= 80 && (c.headDim == 64 || c.headDim == 128) && c.relative <= threads) {
             tensorPrefill = c.headDim == 128 ? configurePrefill<128, half>() && configurePrefill<128, __nv_bfloat16>()
                                              : configurePrefill<64, half>() && configurePrefill<64, __nv_bfloat16>();
-        }
-        if (arch >= 75 && c.headDim == 128 && c.relative <= threads) {
-            if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16) {
-                gatedGlobalPrefill = configureGatedPrefill<false, half>();
-                gatedWindowPrefill = configureGatedPrefill<true, half>();
-            } else if (arch >= 80) {
-                gatedGlobalPrefill = configureGatedPrefill<false, __nv_bfloat16>();
-                gatedWindowPrefill = configureGatedPrefill<true, __nv_bfloat16>();
-                bf16WindowBias = gatedWindowPrefill && configureGatedPrefill<true, __nv_bfloat16, __nv_bfloat16>();
-            }
         }
 #endif
         check(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, p.gpu));

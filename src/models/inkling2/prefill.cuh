@@ -2,6 +2,9 @@
 // K/V pages and uncommitted suffix. No historical KV is copied or repacked.
 // Q = high + low. The QK operand addresses the same K head twice, so
 // retaining the residual costs no additional cache storage or page commits.
+// Quantizing persistent K/V must not narrow the query or its compensation term.
+template<class KV> using PrefillQuery = std::conditional_t<std::is_same_v<KV, __nv_fp8_e4m3>, half, KV>;
+
 template<class KV> struct PrefillSegment : KVSegment<KV> {
     __device__ const KV *operator+(size_t address) const {
         return this->at(int(address >> 32), unsigned(address));
@@ -29,7 +32,7 @@ template<class KV, int D> struct PrefillPages {
     }
 };
 
-template<class KV, int D, class Out = float, class Bias = float> struct PrefillParams : flashinfer::BatchPrefillPagedParams<KV, KV, Out, int> {
+template<class KV, int D, class Out = float, class Bias = float> struct PrefillParams : flashinfer::BatchPrefillPagedParams<PrefillQuery<KV>, KV, Out, int> {
     PrefillPages<KV,D> paged_kv;
     int rows, past, distances, floor;
     float alpha, qkScale;
@@ -100,8 +103,9 @@ template<int D, class KV> bool configurePrefill() {
     return configurePrefillKernel<PrefillTraits<D, KV>, PrefillParams<KV, D>>();
 }
 
-template<class Traits, int D, class KV, class Params>
-void runPrefill(Params &p, const AttentionRow &a, KV *query, int rows) {
+template<class Traits, int D, class Params>
+void runPrefill(Params &p, const AttentionRow &a, typename Traits::DTypeQ *query, int rows) {
+    using KV = typename Traits::DTypeKV;
     p.q = query;
     p.q_stride_n = a.heads * Traits::HEAD_DIM_QK;
     p.q_stride_h = Traits::HEAD_DIM_QK;
@@ -125,7 +129,7 @@ void runPrefill(Params &p, const AttentionRow &a, KV *query, int rows) {
     pagedRelativePrefill<Traits><<<blocks, dim3(32, Traits::NUM_WARPS_Q), shared, cudaStreamPerThread>>>(p);
 }
 
-template<int D, class KV> void launchPrefill(const AttentionRow &a, KV *query, int rows) {
+template<int D, class KV> void launchPrefill(const AttentionRow &a, PrefillQuery<KV> *query, int rows) {
     PrefillParams<KV, D> p;
     p.relative = a.relative;
     p.o = a.output + size_t(a.first) * a.heads * D;
@@ -198,7 +202,7 @@ template<bool Windowed, class Bias> struct GatedPrefillRelative : PrefillRelativ
         : PrefillRelative(p, batch, smem), RelativeScoreTile<Windowed, Bias>(p, blockIdx.x) {}
 };
 
-template<class T, class Bias> struct GatedPrefillParams : PrefillParams<half,128,T,Bias> {
+template<class T, class KV, class Bias> struct GatedPrefillParams : PrefillParams<KV,128,T,Bias> {
     const T *output_gate;
     int gateStride;
     __device__ float GateOutput(unsigned row, unsigned head, unsigned col, float value) const {
@@ -210,7 +214,7 @@ template<class T, class Bias> struct GatedPrefillParams : PrefillParams<half,128
 
 // Each MMA lane owns pairs of adjacent channels in two rows. Normalize once
 // per row, apply the gate in FP32 and store each rounded pair directly.
-template<class T, class Bias> struct WindowPrefillParams : GatedPrefillParams<T,Bias> {
+template<class T, class KV, class Bias> struct WindowPrefillParams : GatedPrefillParams<T,KV,Bias> {
     static constexpr bool custom_output_store = true;
     template<class Traits>
     __device__ void StoreOutputTile(float (*output)[Traits::NUM_MMA_D_VO_TILE][8],
@@ -247,26 +251,26 @@ template<class T, class Bias> struct WindowPrefillParams : GatedPrefillParams<T,
     }
 };
 
-template<bool Windowed, class T, class Bias = float>
-using GatedParams = std::conditional_t<Windowed, WindowPrefillParams<T,Bias>, GatedPrefillParams<T,Bias>>;
+template<bool Windowed, class T, class KV, class Bias>
+using GatedParams = std::conditional_t<Windowed, WindowPrefillParams<T,KV,Bias>, GatedPrefillParams<T,KV,Bias>>;
 
-template<bool Windowed, class T, class Bias = float> using GatedPrefillTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal,
-    64, 1, 4, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone, half, half, T, float, int, GatedPrefillRelative<Windowed,Bias>>;
+template<bool Windowed, class T, class KV, class Bias> using GatedPrefillTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal,
+    64, 1, 4, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone, half, KV, T, float, int, GatedPrefillRelative<Windowed,Bias>>;
 
-template<bool Windowed, class T, class Bias = float> bool configureGatedPrefill() {
+template<bool Windowed, class T, class KV, class Bias = float> bool configureGatedPrefill() {
     // Both masks use FP16 MMA. The BF16 bias projection needs SM80.
     constexpr int minArch = std::is_same_v<Bias, float> ? 75 : 80;
-    return configurePrefillKernel<GatedPrefillTraits<Windowed, T, Bias>, GatedParams<Windowed, T, Bias>, minArch>();
+    return configurePrefillKernel<GatedPrefillTraits<Windowed, T, KV, Bias>, GatedParams<Windowed, T, KV, Bias>, minArch>();
 }
 
-template<bool Windowed, class T, class Bias = float>
+template<bool Windowed, class T, class KV, class Bias = float>
 void launchGatedPrefill(const AttentionRow &a, half *query, T *out, const T *gate,
                         int gateStride, int rows, const Bias *bias) {
-    using Traits = GatedPrefillTraits<Windowed, T, Bias>;
+    using Traits = GatedPrefillTraits<Windowed, T, KV, Bias>;
     // Each CTA owns disjoint output heads, stages its entire Q tile before
     // scanning KV and writes it once. This permits Q and output to alias.
     static_assert(Traits::NUM_D_VO_TILES == 1 && Traits::NUM_MMA_Q == 1 && sizeof(T) == sizeof(half));
-    GatedParams<Windowed, T, Bias> p;
+    GatedParams<Windowed, T, KV, Bias> p;
     p.relative = bias;
     p.o = out;
     p.output_gate = gate;

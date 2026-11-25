@@ -63,8 +63,8 @@ void Inkling2Model::SetDataType(DataType type) {
 }
 
 void Inkling2Model::SetKVCacheDataType(DataType type) {
-    if (type != FLOAT16 && type != BFLOAT16 && type != FLOAT32)
-        throw std::runtime_error("Inkling KV cache supports float16, bfloat16 and float32");
+    if (type != FLOAT16 && type != BFLOAT16 && type != FLOAT32 && type != FP8_E4M3)
+        throw std::runtime_error("Inkling KV cache supports float16, bfloat16, float32 and fp8_e4m3");
     basellm::SetKVCacheDataType(type);
 }
 void Inkling2Model::InitParams() {

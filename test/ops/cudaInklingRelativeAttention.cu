@@ -148,7 +148,7 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
     const int pageCount = (end - 1) / pageLen - firstPage + 1;
     std::mt19937 rng(923 + past);
     std::uniform_real_distribution<float> uniform(-1.f, 1.f);
-    auto fill = [&](auto &v) { for (auto &x : v) x = uniform(rng); };
+    auto fill = [&](auto &v) { for (auto &x : v) x = std::decay_t<decltype(x)>(uniform(rng)); };
     std::vector<T> k(end * stride), v(end * stride), kp(pageCount * pageLen * stride), vp(kp.size());
     std::vector<int2> ids(pageCount);
     fill(k); fill(v);
@@ -182,8 +182,8 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
     std::vector<float> compactGate;
     const int gateStride = heads * D + 13;
     if constexpr (!std::is_void_v<Gate>) {
-        static_assert(D == 128 && std::is_same_v<T, half>);
-        if (!(window ? configureGatedPrefill<true, Gate, Bias>() : configureGatedPrefill<false, Gate, Bias>())) return;
+        static_assert(D == 128 && std::is_same_v<PrefillQuery<T>, half>);
+        if (!(window ? configureGatedPrefill<true, Gate, T, Bias>() : configureGatedPrefill<false, Gate, T, Bias>())) return;
         std::vector<half> query(q.begin(), q.end());
         compactGate.resize(rows * gateStride);
         fill(compactGate);
@@ -196,7 +196,7 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
         for (int first = 0; first < rows; first += 137) {
             a.first = first;
             half *input = fused.p + size_t(first) * heads * D;
-            auto launch = window ? launchGatedPrefill<true, Gate, Bias> : launchGatedPrefill<false, Gate, Bias>;
+            auto launch = window ? launchGatedPrefill<true, Gate, T, Bias> : launchGatedPrefill<false, Gate, T, Bias>;
             launch(a, input, reinterpret_cast<Gate *>(input), gating.p + size_t(first) * gateStride,
                    gateStride, std::min(137, rows - first), typedBias.p + size_t(first) * heads * extent);
         }
@@ -204,7 +204,7 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
         check(cudaMemcpy(values.data(), fused.p, values.size() * sizeof(Gate), cudaMemcpyDeviceToHost));
         std::copy(values.begin(), values.end(), result.begin());
     } else if (prefill) {
-        if constexpr (!std::is_same_v<T, float>) {
+        if constexpr (std::is_same_v<T, half> || std::is_same_v<T, nv_bfloat16>) {
             if (!configurePrefill<D,T>()) throw std::runtime_error("Insufficient prefill shared memory");
             std::vector<T> packed(q.size() * 2);
             for (size_t i = 0; i < q.size(); ++i) {
@@ -309,6 +309,13 @@ int testRelative() {
     check(cudaGetDevice(&gpu));
     int major;
     check(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, gpu));
+    // FP8 pages and suffixes share the same reference, including window wrap and clipped verification.
+    for (int window : {0, 1024}) {
+        compare<128, __nv_fp8_e4m3>(3, 1153, 1, window, 37, true);
+        compare<128, __nv_fp8_e4m3>(3, 1019, 16, window, 37, true, 28, true, 0, false, 8);
+        compare<128, __nv_fp8_e4m3, half>(3, 1017, 159, window, 31, false);
+    }
+    compare<64, __nv_fp8_e4m3>(2, 137, 9, 0, 31, false);
     // Each gated case checks its own compiled kernel and shared-memory limit.
     compare<128, half, half>(3, 0, 513, 0, 128, false);
     compare<128, half, half>(5, 8190, 39, 0, 127, false);

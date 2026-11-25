@@ -257,7 +257,7 @@ struct PrefillPreparation {
 
 template<bool Compact, class T, class KV, class R = float> __global__ void preparePrefill(PrefillParts<T> p, PrefillPreparation cfg,
         int offset, int length, const float *kh, const float *vh, float *nextK, float *nextV,
-        KV *q, R *r, float *sink, KV *k, KV *v) {
+        PrefillQuery<KV> *q, R *r, float *sink, KV *k, KV *v) {
     const unsigned rowIndex = Compact ? blockIdx.y + blockIdx.z * gridDim.y : blockIdx.x;
     if (rowIndex >= unsigned(length)) return;
     const int row = rowIndex, token = offset + row, lane = threadIdx.x % 32;
@@ -286,11 +286,11 @@ template<bool Compact, class T, class KV, class R = float> __global__ void prepa
             if (col < width) {
                 const float value = x[j] * factor * weight[j];
                 if (rel) r[base + col] = R(value);
-                else if constexpr (Compact) q[base + col] = KV(value);
+                else if constexpr (Compact) q[base + col] = PrefillQuery<KV>(value);
                 else {
-                    const KV high(value);
+                    const PrefillQuery<KV> high(value);
                     q[2 * base + col] = high;
-                    q[2 * base + width + col] = KV(value - float(high));
+                    q[2 * base + width + col] = PrefillQuery<KV>(value - float(high));
                 }
             }
         }
