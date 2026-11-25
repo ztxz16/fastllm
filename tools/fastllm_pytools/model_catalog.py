@@ -263,7 +263,25 @@ def hy4_versions():
     return versions
 
 
+def inkling_versions():
+    versions = [{"preset": "inkling-2-mini-original", "id": "thinkingmachines/Inkling-2-Mini",
+                 "label": "官方权重", "meta": "MXFP8 / NVFP4 · Safetensors", "include": "", "downloadGB": 20.19}]
+    draft = "dspark-Inkling-2-Mini-Q8_0.gguf"
+    # Download sizes include the shared draft. The main GGUF is the launch entry.
+    for quant, gb in (
+        ("IQ1_S", 8.27), ("IQ1_M", 8.53), ("IQ2_XXS", 8.99), ("Q2_K_XL", 9.64),
+        ("IQ3_XXS", 12.17), ("Q3_K_XL", 14.14), ("IQ4_XS", 16.24), ("Q4_K_M", 17.11),
+        ("Q4_K_XL", 18.13), ("Q8_K_XL", 23.37),
+    ):
+        weight = f"Inkling-2-Mini-UD-{quant}.gguf"
+        versions.append(bundle("inkling-2-mini-ud-" + quant.lower(), "Unsloth GGUF · UD-" + quant,
+                               [source("unsloth/Inkling-2-Mini-GGUF", f"{weight} {draft}")],
+                               entry=weight, gb=gb, note="含 DSpark Q8_0 草稿"))
+    return versions
+
+
 MODELSCOPE_DOWNLOAD_GROUPS += (
+    {"category": "language", "id": "inkling-2-mini", "label": "Inkling-2-Mini", "models": inkling_versions()},
     {"category": "language", "id": "sensenova-loop", "label": "SenseNova Loop · 9B", "models": sensenova_versions()},
     {"category": "language", "id": "hy4-flash", "label": "HY4 Flash", "models": hy4_versions()},
     {"category": "image", "id": "qwen-image", "label": "Qwen-Image-2.1", "models": qwen_image_versions()},

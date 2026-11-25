@@ -624,6 +624,8 @@
     "快速验证": "Quick check",
     "小模型和自定义入口，用于先验证环境、权限与下载链路。": "Small models for checking the environment, permissions and downloads.",
     "原始质量": "Original weights",
+    "官方权重": "Official weights",
+    "含 DSpark Q8_0 草稿": "Includes the DSpark Q8_0 draft",
     "约 31 GB": "About 31 GB",
     "显存友好": "Lower GPU memory use",
     "推测解码草稿": "Speculative decoding draft",
