@@ -106,12 +106,16 @@ struct VisitCache {
             reserveTable(std::max(size_t(count), 2 * capacity));
         }
 
-        for (Data *side : {key, value}) side->pageIndex.reserve(count);
         try {
             for (Data *side : {key, value}) {
                 auto &pages = side->pageIndex;
-                while (int(pages.size()) < count)
-                    pages.push_back(side->pagedKVCacheData->GetUnusedPageIndex(true));
+                try {
+                    side->pagedKVCacheData->ExtendPageIndices(pages, count);
+                } catch (const std::length_error &) {
+                    throw CudaWorkspaceExhausted("Inkling KV pool exhausted at token " + std::to_string(end) +
+                        " (window " + std::to_string(window) + ", pool " +
+                        std::to_string(side->pagedKVCacheData->maxPages) + " pages)");
+                }
             }
         } catch (...) {
             for (Data *side : {key, value}) {

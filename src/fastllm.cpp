@@ -6305,7 +6305,8 @@ namespace fastllm {
         if (total <= int(pages.size())) return;
         pages.reserve(total);
         std::lock_guard<std::mutex> guard(pageIndexLocker);
-        AssertInFastLLM(total - int(pages.size()) <= FreePageCount(), "Insufficient free KV pages.");
+        if (total - int(pages.size()) > FreePageCount())
+            throw std::length_error("Insufficient free KV pages.");
         // Evict only when the next scalar allocation would. Pre-evicting the
         // entire suffix would reverse the order of recycled physical pages.
         while (int(pages.size()) < total) {

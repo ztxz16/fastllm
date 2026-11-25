@@ -104,6 +104,12 @@ static void LookaheadPages() {
     pool.pageLen = 4; pool.SetMaxPages(8);
     std::vector<int> active;
     Require(pool.TryExtendFreePages(active, 3, 5), "free suffix unavailable");
+    try {
+        pool.ExtendPageIndices(active, pool.maxPages + 1);
+        throw std::runtime_error("admitted an oversized KV extension");
+    } catch (const std::length_error &) {
+        Require(active.size() == 3 && pool.FreePageCount() == 5, "failed extension changed page ownership");
+    }
     pool.RecordPrefix({1,2,3}, active);
     const auto generation = pool.pageTimestamp[active.back()];
     Require(pool.MatchesPinnedPrefix(active, 3, generation), "fresh binding rejected");
