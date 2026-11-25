@@ -116,6 +116,34 @@ static void TestVectorQuantization() {
     }
 }
 
+// The FP32 result is normal even when exponent-biased intermediate products
+// would flush to zero. Include a partial block and a non-vectorized column tail.
+static void TestSmallActivationBF16FP8() {
+    FP8E4M3ToFP32Manager fp8;
+    constexpr int outputs = 9;
+    const uint8_t codes[] = {1, 0x81, 7, 0xb8, 0x38, 0x42};
+    for (int cols : {64, 37}) for (int rows : {1, 3, 6}) {
+        const int block = cols == 64 ? 32 : 13, blocks = (cols + block - 1) / block;
+        std::vector<uint16_t> x(rows * cols);
+        std::vector<uint8_t> w(outputs * cols);
+        std::vector<float> y(rows * outputs), scales(outputs * blocks);
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = Float32ToBFloat16RNEBits(std::ldexp(float(1 + i % 3), -18));
+        for (size_t i = 0; i < w.size(); ++i) w[i] = codes[i % 6];
+        for (size_t i = 0; i < scales.size(); ++i) scales[i] = std::ldexp(1.f, -int(i % 3) - 5);
+        MultiThreadLinearBFloat16FP8E4M3Op(x.data(), w.data(), nullptr, y.data(), rows, cols,
+                                          outputs, 0, outputs, scales.data(), 1, block).Run();
+        for (int r = 0; r < rows; ++r) for (int j = 0; j < outputs; ++j) {
+            float ref = 0;
+            for (int i = 0; i < cols; ++i)
+                ref += BFloat16BitsToFloat32(x[r * cols + i]) * fp8.dict[w[j * cols + i]] *
+                       scales[j * blocks + i / block];
+            if (y[r * outputs + j] != ref)
+                throw std::runtime_error("small BF16 x FP8 projection differs from scalar reference");
+        }
+    }
+}
+
 static void TestTiledGemm() {
     if (!GetCPUInstructInfo()->hasAVX512BF16) return;
     std::mt19937 rng(9271);
@@ -179,6 +207,7 @@ int main(int argc, char **argv) {
             info->hasAVX512F = info->hasAVX512BF16 = info->hasAVX512VNNI = false;
             info->hasAMX = false;
         }
+        TestSmallActivationBF16FP8();
         TestVectorQuantization();
         TestTiledGemm();
         constexpr int hidden = 256, inter = 128, experts = 3, topk = 2;

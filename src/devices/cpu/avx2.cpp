@@ -12,6 +12,7 @@
 #include "immintrin.h"
 #endif
 
+#include "fp8-convert.h"
 #include "utils.h"
 #include "fastllm.h"
 
@@ -367,20 +368,6 @@ namespace fastllm {
         AddBiasAVX2(outputData, biasData, n, k, st, end);
         return true;
     }
-
-#ifdef __AVX2__
-    static inline __m256 FP8E4M3ToFloat_AVX2(__m128i bytes) {
-        const __m256i words = _mm256_cvtepu8_epi32(bytes);
-        const __m256i magnitude = _mm256_and_si256(words, _mm256_set1_epi32(0x7f));
-        const __m256i sign = _mm256_slli_epi32(
-            _mm256_and_si256(words, _mm256_set1_epi32(0x80)), 24);
-        const __m256 normal = _mm256_castsi256_ps(_mm256_add_epi32(
-            _mm256_slli_epi32(magnitude, 20), _mm256_set1_epi32(120 << 23)));
-        const __m256 subnormal = _mm256_mul_ps(_mm256_cvtepi32_ps(magnitude), _mm256_set1_ps(1.0f / 512));
-        const __m256 tiny = _mm256_castsi256_ps(_mm256_cmpgt_epi32(_mm256_set1_epi32(8), magnitude));
-        return _mm256_or_ps(_mm256_blendv_ps(normal, subnormal, tiny), _mm256_castsi256_ps(sign));
-    }
-#endif
 
     bool FastllmGemmFP8Block128_AVX2(
             const void *A, long lda, const void *B, long ldb, void *C, long ldc,

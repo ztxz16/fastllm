@@ -3,6 +3,7 @@
 //
 
 #include "devices/cpu/computeutils.h"
+#include "fp8-convert.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
 #include "devices/cpu/cpudevice.h"
 
@@ -739,80 +740,8 @@ namespace fastllm {
         }
     }
 
-#ifdef __AVX2__
-    // 2. Vectorized FP8 E4M3 to FP32 conversion (AVX2)
-    //    Input: 8 uint8_t values packed into the lower 64 bits of an __m128i
-    //    Output: 8 float values in an __m256 vector
-    //    This is the most complex part to implement correctly and efficiently.
-    inline __m256 _mm256_fp8e4m3_to_fp32_ps(__m128i v_u8) {
-        // --- Implementation Sketch ---
-        // a. Unpack 8 uint8_t values into 8 32-bit integers (__m256i)
-        __m256i v_u32 = _mm256_cvtepu8_epi32(v_u8); // Zero-extends uint8 -> int32
-        // b. Define masks and constants for AVX2 registers
-        const __m256i sign_mask = _mm256_set1_epi32(0x80);
-        const __m256i exp_mask  = _mm256_set1_epi32(0x78); // E4
-        const __m256i mant_mask = _mm256_set1_epi32(0x07); // M3
-        const __m256i exp_shift = _mm256_set1_epi32(3);
-        const __m256i mant_shift = _mm256_set1_epi32(23 - 3); // Shift M3 to FP32 mantissa position
-        const __m256i fp32_sign_shift = _mm256_set1_epi32(24); // Shift sign bit
-        const __m256i fp32_exp_shift = _mm256_set1_epi32(23); // Shift exponent bits
-        const __m256i bias_delta = _mm256_set1_epi32(127 - 7); // FP32 bias - FP8 bias
-        const __m256i zero = _mm256_setzero_si256();
-        // Mask for checking if exp and mantissa are both zero (value is zero)
-        const __m256i non_sign_mask = _mm256_set1_epi32(0x7F);
-        // c. Extract components using bitwise operations
-        __m256i signs = _mm256_and_si256(v_u32, sign_mask);
-        __m256i exp8  = _mm256_srli_epi32(_mm256_and_si256(v_u32, exp_mask), 3);
-        __m256i mant8 = _mm256_and_si256(v_u32, mant_mask);
-        // d. Convert exponent bias
-        __m256i exp32 = _mm256_add_epi32(exp8, bias_delta);
-        // e. Shift components to their FP32 positions
-        __m256i fp32_sign = _mm256_sllv_epi32(signs, fp32_sign_shift); // Shift sign bit
-        __m256i fp32_exp  = _mm256_sllv_epi32(exp32, fp32_exp_shift); // Shift exponent
-        __m256i fp32_mant = _mm256_sllv_epi32(mant8, mant_shift);  // Shift mantissa
-        // f. Combine components (assuming normal numbers for now)
-        __m256i fp32_bits = _mm256_or_si256(fp32_sign, _mm256_or_si256(fp32_exp, fp32_mant));
-        // g. Handle zeros (where exponent and mantissa bits are 0)
-        //    Check if bits 0-6 are zero
-        __m256i is_zero_mask = _mm256_cmpeq_epi32(_mm256_and_si256(v_u32, non_sign_mask), zero);
-        //    Select 0.0f where the input was zero, otherwise keep calculated bits
-        fp32_bits = _mm256_andnot_si256(is_zero_mask, fp32_bits); // Bitwise SELECT(mask, 0, fp32_bits)
-        // h. Handle other special cases (NaN, Inf, subnormals) based on E4M3 spec - SKIPPED IN THIS SKETCH
-        // i. Cast the integer bits representation to float vector
-        return _mm256_castsi256_ps(fp32_bits);
-        // --- End Implementation Sketch ---
-    }
-
-    // 2. Vectorized FP8 E4M3 to FP32 conversion (AVX2)
-    //    Input: 8 uint8_t values packed into the lower 64 bits of an __m128i
-    //    Output: 8 float values in an __m256 vector
-    //    This is the most complex part to implement correctly and efficiently.
-    inline __m256 _mm256_fp8e4m3_to_fp32_fast_ps(__m128i v_u8) {
-        // --- Implementation Sketch ---
-        // a. Unpack 8 uint8_t values into 8 32-bit integers (__m256i)
-        __m256i v_u32 = _mm256_cvtepu8_epi32(v_u8); // Zero-extends uint8 -> int32
-        // b. Define masks and constants for AVX2 registers
-        const __m256i sign_mask = _mm256_set1_epi32(0x80);
-        const __m256i last_mask  = _mm256_set1_epi32(0x7F); // last
-        const __m256i fp32_sign_shift = _mm256_set1_epi32(24); // Shift sign bit
-        const __m256i fp32_last_shift = _mm256_set1_epi32(20); // Shift last bits
-        // c. Extract components using bitwise operations
-        __m256i signs = _mm256_and_si256(v_u32, sign_mask);
-        __m256i lasts = _mm256_and_si256(v_u32, last_mask);
-
-        __m256i fp32_sign = _mm256_sllv_epi32(signs, fp32_sign_shift); // Shift sign bit
-        __m256i fp32_last  = _mm256_sllv_epi32(lasts, fp32_last_shift); // Shift last
-
-        // f. Combine components (assuming normal numbers for now)
-        __m256i fp32_bits = _mm256_or_si256(fp32_sign, fp32_last);
-        return _mm256_castsi256_ps(fp32_bits);
-        // --- End Implementation Sketch ---
-    }
-#endif
-
     extern bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
-        int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, 
-        int ks, int ms, float magicScale);
+        int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, int ms);
     extern bool LinearFloat32NVFP4_AVX512BF16_Kernel(float *inputData, uint8_t *weightData, float *biasData, float *outputData,
         int n, int m, int k, int st, int end, int blockK, int blockM, float *scales,
         int ks, int ms);
@@ -857,8 +786,6 @@ namespace fastllm {
 
     void MultiThreadLinearBFloat16FP8E4M3Op::Run() {
         static struct FP8E4M3ToFP32Manager fp8e4m3tofp32;
-        static float magicScale = pow(2, 120);
-        int ks = (k - 1) / blockK + 1;
         int ms = (m - 1) / blockM + 1;
         if (V41ReferenceMathEnabled() && blockM == 32 && m % 32 == 0) {
             if (cpuInstructInfo.hasAVX512F && V41ReferenceLinear_AVX512F(inputData, weightData,
@@ -885,7 +812,7 @@ namespace fastllm {
         if (cpuInstructInfo.hasAVX512BF16) {
             if (LinearBFloat16FP8E4M3_AVX512BF16_Kernel(
                 inputData, weightData, biasData, outputData, n, m, k, st, end,
-                blockK, blockM, scales, ks, ms, magicScale
+                blockK, blockM, scales, ms
             )) {
                 return;
             }
@@ -902,20 +829,18 @@ namespace fastllm {
 
                         __m256 vsum = _mm256_setzero_ps();
                         for (; l + 7 < (midx + 1) * blockM; l += 8) {
-                            // __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
                             __m128i bf16_vec_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inputData + i * m + l));
                             __m256i bf16_extended_to_32 = _mm256_cvtepu16_epi32(bf16_vec_128);
                             __m256i fp32_bits_int = _mm256_slli_epi32(bf16_extended_to_32, 16);
                             __m256 vi = _mm256_castsi256_ps(fp32_bits_int);
                             
                             __m128i vw_u8 = _mm_loadl_epi64((const __m128i*)(weightData + j * m + l));
-                            __m256 vw = _mm256_fp8e4m3_to_fp32_fast_ps(vw_u8);
+                            __m256 vw = FP8E4M3ToFloat_AVX2(vw_u8);
                             vsum = _mm256_fmadd_ps(vi, vw, vsum);
                         }
-                        // now += Floatsum(vsum) * curScale;
-                        lastSum = _mm256_fmadd_ps(vsum, _mm256_set1_ps(curScale), lastSum);                        
+                        lastSum = _mm256_fmadd_ps(vsum, _mm256_set1_ps(curScale), lastSum);
                     }
-                    now += Floatsum(lastSum) * pow(2, 120);
+                    now += Floatsum(lastSum);
                     outputData[i * k + j] = now;
                 }
             }
@@ -924,23 +849,22 @@ namespace fastllm {
                 for (int j = st; j < end; j++) {
                     float now = biasData ? biasData[j] : 0.0f;
                     for (int midx = 0; midx < ms; midx++) {
-                        float curScale = scales[j / blockK * ms + midx] * magicScale;
+                        float curScale = scales[j / blockK * ms + midx];
                         int l = midx * blockM;
                         __m256 vsum = _mm256_setzero_ps();
                         for (; l + 7 < m && l + 7 < (midx + 1) * blockM; l += 8) {
-                            // __m256 vi = _mm256_loadu_ps(inputData + i * m + l);
                             __m128i bf16_vec_128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(inputData + i * m + l));
                             __m256i bf16_extended_to_32 = _mm256_cvtepu16_epi32(bf16_vec_128);
                             __m256i fp32_bits_int = _mm256_slli_epi32(bf16_extended_to_32, 16);
                             __m256 vi = _mm256_castsi256_ps(fp32_bits_int);
 
                             __m128i vw_u8 = _mm_loadl_epi64((const __m128i*)(weightData + j * m + l));
-                            __m256 vw = _mm256_fp8e4m3_to_fp32_fast_ps(vw_u8);
+                            __m256 vw = FP8E4M3ToFloat_AVX2(vw_u8);
                             vsum = _mm256_fmadd_ps(vi, vw, vsum);
                         }
                         now += Floatsum(vsum) * curScale;
                         for (; l < m && l < (midx + 1) * blockM; l++) {
-                            now += curScale * inputData[i * m + l] * fp8e4m3tofp32.dict[weightData[j * m + l]];
+                            now += curScale * BFloat16BitsToFloat32(inputData[i * m + l]) * fp8e4m3tofp32.dict[weightData[j * m + l]];
                         }
                     }
                     outputData[i * k + j] = now;
@@ -948,14 +872,6 @@ namespace fastllm {
             }
         }
 #elif defined(__aarch64__)
-        // E4M3 values can be represented as tiny FP32 values by moving their
-        // sign/body bits to the corresponding FP32 positions. Multiplication
-        // by 2^120 restores the real magnitude. This avoids a lookup per
-        // element and, unlike the old dormant ARM path, correctly treats the
-        // input as BF16 rather than FP16.
-        const uint32x4_t signMask = vdupq_n_u32(0x80);
-        const uint32x4_t bodyMask = vdupq_n_u32(0x7f);
-
         for (int i = 0; i < n; i++) {
             const uint16_t *inputRow = inputData + (size_t)i * m;
             for (int j = st; j < end; j++) {
@@ -980,22 +896,15 @@ namespace fastllm {
                         uint16x8_t weight16 = vmovl_u8(vld1_u8(weightRow + l));
                         uint32x4_t weightBits0 = vmovl_u16(vget_low_u16(weight16));
                         uint32x4_t weightBits1 = vmovl_u16(vget_high_u16(weight16));
-                        float32x4_t weight0 = vreinterpretq_f32_u32(vorrq_u32(
-                            vshlq_n_u32(vandq_u32(weightBits0, signMask), 24),
-                            vshlq_n_u32(vandq_u32(weightBits0, bodyMask), 20)));
-                        float32x4_t weight1 = vreinterpretq_f32_u32(vorrq_u32(
-                            vshlq_n_u32(vandq_u32(weightBits1, signMask), 24),
-                            vshlq_n_u32(vandq_u32(weightBits1, bodyMask), 20)));
+                        float32x4_t weight0 = FP8E4M3ToFloat_NEON(weightBits0);
+                        float32x4_t weight1 = FP8E4M3ToFloat_NEON(weightBits1);
                         sum0 = vfmaq_f32(sum0, input0, weight0);
                         sum1 = vfmaq_f32(sum1, input1, weight1);
                     }
 
-                    float blockSum = (vaddvq_f32(sum0) + vaddvq_f32(sum1)) * magicScale;
+                    float blockSum = vaddvq_f32(sum0) + vaddvq_f32(sum1);
                     for (; l < lEnd; l++) {
-                        uint32_t inputBits = (uint32_t)inputRow[l] << 16;
-                        float inputValue;
-                        memcpy(&inputValue, &inputBits, sizeof(inputValue));
-                        blockSum += inputValue * fp8e4m3tofp32.dict[weightRow[l]];
+                        blockSum += BFloat16BitsToFloat32(inputRow[l]) * fp8e4m3tofp32.dict[weightRow[l]];
                     }
                     now += blockSum * curScale;
                 }
@@ -1003,7 +912,6 @@ namespace fastllm {
             }
         }
 #else
-        // ErrorInFastLLM("Unsupport MultiThreadLinearBFloat16FP8E4M3Op");
         // 朴素 CPU 实现 (无 AVX2 支持时的回退路径)
         for (int i = 0; i < n; i++) {
             for (int j = st; j < end; j++) {
@@ -1011,7 +919,6 @@ namespace fastllm {
                 int currentBlockK = j / blockK;
 
                 for (int midx = 0; midx < ms; midx++) {
-                    // 计算当前 Block 的 Scale，同时乘上 magicScale (pow(2, 120))
                     float curScale = scales[currentBlockK * ms + midx];
                     
                     int l = midx * blockM;
@@ -1020,17 +927,8 @@ namespace fastllm {
                     
                     float blockSum = 0.0f;
                     for (; l < l_end; l++) {
-                        // 1. 将 BFloat16 (uint16_t) 转换为 Float
-                        // 方法：左移16位填充到 float 的高位
-                        uint16_t bf16_val = (uint16_t)inputData[i * m + l];
-                        uint32_t fp32_bits = (uint32_t)bf16_val << 16;
-                        float inp = *reinterpret_cast<float*>(&fp32_bits);
-
-                        // 2. 将 FP8E4M3 (uint8_t) 转换为 Float
-                        // 方法：查表
-                        float w = fp8e4m3tofp32.dict[weightData[j * m + l]];
-
-                        blockSum += inp * w;
+                        blockSum += BFloat16BitsToFloat32(inputData[i * m + l]) *
+                                    fp8e4m3tofp32.dict[weightData[j * m + l]];
                     }
                     now += blockSum * curScale;
                 }

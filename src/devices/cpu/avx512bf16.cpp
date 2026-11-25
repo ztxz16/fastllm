@@ -110,80 +110,6 @@ namespace fastllm {
 #endif
     }
     
-	template <int BROW, int AROW>
-    void mul_mat_fp8e4m3_bf16_direct_avx512(
-        int n,
-        const uint8_t* A,
-        size_t stride_a,
-        const uint16_t* B,
-        size_t stride_b,
-        float* C,
-        size_t stride_c,
-        float *scales, 
-        int stx, int blockK, int ms, int blockM, 
-        float magicScale
-    ) {
-#ifdef __AVX512BF16__
-        constexpr int SIMD_WIDTH = 32;  // AVX512 一次处理 16 个 float
-        int nb = n / SIMD_WIDTH;
-        int remainder = n % SIMD_WIDTH;
-
-        // 累加器 - 注意这里的顺序
-        __m512 acc[AROW * BROW];
-        
-        // 初始化
-        for (int i = 0; i < AROW * BROW; ++i) {
-            acc[i] = _mm512_setzero_ps();
-        }
-
-        __m256i v_a_mask_byte = _mm256_set1_epi8(0x80); 
-        __m256i v_b_mask_byte = _mm256_set1_epi8(0x7F); 
-        
-        // 主循环
-        for (int i = 0; i < nb; ++i) {
-            for (int ix = 0; ix < AROW; ++ix) {
-                float curScale = scales[(stx + ix) / blockK * ms + (i * SIMD_WIDTH) / blockM];
-                __m512 vScale = _mm512_set1_ps(curScale);
-                const uint8_t* a_row = (const uint8_t*)((const char*)A + ix * stride_a);
-                
-                // 从 fp8e4m3 转换到 bf16 (AVX512)
-                __m256i va_bytes = _mm256_loadu_si256((const __m256i*)(a_row + i * SIMD_WIDTH));
-                __m256i va_masked_bytes = _mm256_and_si256(va_bytes, v_a_mask_byte);
-                __m512i va_promoted_words = _mm512_cvtepu8_epi16(va_masked_bytes);
-                __m512i v_a_term_shifted = _mm512_slli_epi16(va_promoted_words, 8);
-
-                __m256i vb_masked_bytes = _mm256_and_si256(va_bytes, v_b_mask_byte);
-                __m512i vb_promoted_words = _mm512_cvtepu8_epi16(vb_masked_bytes);
-                __m512i v_b_term_shifted = _mm512_slli_epi16(vb_promoted_words, 4);
-
-                __m512i v_result = _mm512_or_si512(v_a_term_shifted, v_b_term_shifted);
-                __m512bh v_weights_bf16 = (__m512bh)v_result;
-                
-                for (int iy = 0; iy < BROW; ++iy) {
-                    const uint16_t* b_row = (const uint16_t*)((const char*)B + iy * stride_b);
-                    __m512bh v_input_bf16 = (__m512bh)_mm512_loadu_si512((__m512i const*)(b_row + i * SIMD_WIDTH));
-
-                    // Compute dot product: v_sum += v_input_bf16 * v_weights_bf16
-                    __m512 v_sum = _mm512_setzero_ps();
-                    v_sum = _mm512_dpbf16_ps(v_sum, v_input_bf16, v_weights_bf16);
-                    int acc_idx = ix * BROW + iy;
-                    acc[acc_idx] = _mm512_fmadd_ps(v_sum, vScale, acc[acc_idx]);
-                }
-            }
-        }
-
-        // 水平求和并存储
-        for (int ix = 0; ix < AROW; ++ix) {
-            for (int iy = 0; iy < BROW; ++iy) {
-                int acc_idx = ix * BROW + iy;
-                float result = _mm512_reduce_add_ps(acc[acc_idx]);
-                float* c_row = (float*)((char*)C + iy * stride_c);
-                c_row[ix] = result * magicScale;
-            }
-        }
-#endif
-    }
-
     template <int BROW, int AROW>
     void mul_mat_bf16_f32_direct_avx512(
         int n,
@@ -355,22 +281,22 @@ namespace fastllm {
     }
 
 #ifdef __AVX512BF16__
-    static inline __m512bh FP8E4M3ToMagicBFloat16_AVX512BF16(
-            const uint8_t *weightData) {
-        const __m256i bytes = _mm256_loadu_si256(
-            (const __m256i*)weightData);
+    static inline __m512bh FP8E4M3ToBFloat16_AVX512BF16(__m256i bytes) {
         const __m512i words = _mm512_cvtepu8_epi16(bytes);
-        const __m512i shifted = _mm512_slli_epi16(words, 4);
-        // Shifting the raw byte by four puts the FP8 sign in bit 11.
-        // For negative values, xor bits 11 and 15 to move that sign to
-        // the BF16 sign position.  The remaining bits are the same magic-
-        // exponent representation used by the scalar-row fallback below.
-        const __mmask32 negative = _mm512_test_epi16_mask(
-            words, _mm512_set1_epi16(0x80));
-        const __m512i signFixed = _mm512_xor_si512(
-            shifted, _mm512_set1_epi16((short)0x8800));
-        return (__m512bh)_mm512_mask_blend_epi16(
-            negative, shifted, signFixed);
+        const __m512i magnitude = _mm512_and_si512(words, _mm512_set1_epi16(0x7f));
+        const __m512i sign = _mm512_slli_epi16(
+            _mm512_and_si512(words, _mm512_set1_epi16(0x80)), 8);
+        // Convert to actual BF16 values before the dot product. Scaling an
+        // exponent-biased dot product by 2^120 afterwards loses small products
+        // because VDPBF16PS flushes subnormal FP32 intermediates to zero.
+        const __m512i normal = _mm512_add_epi16(
+            _mm512_slli_epi16(magnitude, 4), _mm512_set1_epi16(0x3c00));
+        const __m512i subnormalTable = _mm512_setr_epi32(
+            0x3b000000, 0x3bc03b80, 0x3c203c00, 0x3c603c40,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        const __m512i subnormal = _mm512_permutexvar_epi16(magnitude, subnormalTable);
+        const __mmask32 tiny = _mm512_cmplt_epi16_mask(magnitude, _mm512_set1_epi16(8));
+        return (__m512bh)_mm512_or_si512(sign, _mm512_mask_mov_epi16(normal, tiny, subnormal));
     }
 
     template <int rows>
@@ -381,7 +307,7 @@ namespace fastllm {
             float *outputData,
             int m, int k, int rowStart,
             int blockK, int blockM, const float *scales,
-            int ms, float magicScale) {
+            int ms) {
         __m512 sums[rows];
         for (int row = 0; row < rows; row++) {
             sums[row] = _mm512_setzero_ps();
@@ -400,8 +326,8 @@ namespace fastllm {
                     (const __m512i*)(inputData + l));
                 for (int row = 0; row < rows; row++) {
                     const __m512bh weight =
-                        FP8E4M3ToMagicBFloat16_AVX512BF16(
-                            weightData + (size_t)(rowStart + row) * m + l);
+                        FP8E4M3ToBFloat16_AVX512BF16(_mm256_loadu_si256((const __m256i *)(
+                            weightData + (size_t)(rowStart + row) * m + l)));
                     blockSums[row] = _mm512_dpbf16_ps(
                         blockSums[row], input, weight);
                 }
@@ -419,7 +345,7 @@ namespace fastllm {
             const int outputRow = rowStart + row;
             const float bias = biasData == nullptr ? 0.0f : biasData[outputRow];
             outputData[outputRow] =
-                bias + _mm512_reduce_add_ps(sums[row]) * magicScale;
+                bias + _mm512_reduce_add_ps(sums[row]);
         }
         (void)k;
     }
@@ -432,7 +358,7 @@ namespace fastllm {
             float *outputData,
             int m, int k, int rowStart,
             int blockK, int blockM, const float *scales,
-            int ms, float magicScale) {
+            int ms) {
         __m512 sums[inputRows][weightRows];
         for (int inputRow = 0; inputRow < inputRows; inputRow++) {
             for (int weightRow = 0; weightRow < weightRows; weightRow++) {
@@ -461,9 +387,8 @@ namespace fastllm {
                 for (int weightRow = 0; weightRow < weightRows;
                      weightRow++) {
                     const __m512bh weight =
-                        FP8E4M3ToMagicBFloat16_AVX512BF16(
-                            weightData +
-                            (size_t)(rowStart + weightRow) * m + l);
+                        FP8E4M3ToBFloat16_AVX512BF16(_mm256_loadu_si256((const __m256i *)(
+                            weightData + (size_t)(rowStart + weightRow) * m + l)));
                     for (int inputRow = 0; inputRow < inputRows;
                          inputRow++) {
                         blockSums[inputRow][weightRow] =
@@ -496,7 +421,7 @@ namespace fastllm {
                     0.0f : biasData[outputRow];
                 outputData[(size_t)inputRow * k + outputRow] =
                     bias + _mm512_reduce_add_ps(
-                        sums[inputRow][weightRow]) * magicScale;
+                        sums[inputRow][weightRow]);
             }
         }
     }
@@ -533,8 +458,7 @@ namespace fastllm {
 #endif
 
     bool LinearBFloat16FP8E4M3_AVX512BF16_Kernel(uint16_t *inputData, uint8_t *weightData, float *biasData, float *outputData,
-                        int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, 
-                        int ks, int ms, float magicScale) {
+                        int n, int m, int k, int st, int end, int blockK, int blockM, float *scales, int ms) {
         if (!(m % blockM == 0 && blockM % 32 == 0)) {
             return false;
         }
@@ -564,25 +488,25 @@ namespace fastllm {
                 for (; row + 4 <= end; row += 4) {
                     LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<2, 4>(
                         inputData, weightData, biasData, outputData,
-                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                        m, k, row, blockK, blockM, scales, ms);
                 }
             } else if (n == 3) {
                 for (; row + 2 <= end; row += 2) {
                     LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<3, 2>(
                         inputData, weightData, biasData, outputData,
-                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                        m, k, row, blockK, blockM, scales, ms);
                 }
             } else if (n == 4) {
                 for (; row + 2 <= end; row += 2) {
                     LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<4, 2>(
                         inputData, weightData, biasData, outputData,
-                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                        m, k, row, blockK, blockM, scales, ms);
                 }
             } else {
                 for (; row + 2 <= end; row += 2) {
                     LinearBFloat16FP8E4M3SmallBatchRows_AVX512BF16<5, 2>(
                         inputData, weightData, biasData, outputData,
-                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                        m, k, row, blockK, blockM, scales, ms);
                 }
             }
             if (row == end) {
@@ -598,21 +522,21 @@ namespace fastllm {
                 for (; row + 8 <= end; row += 8) {
                     LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<8>(
                         inputData, weightData, biasData, outputData,
-                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                        m, k, row, blockK, blockM, scales, ms);
                 }
             }
             if (tile >= 4) {
                 for (; row + 4 <= end; row += 4) {
                     LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<4>(
                         inputData, weightData, biasData, outputData,
-                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                        m, k, row, blockK, blockM, scales, ms);
                 }
             }
             if (tile >= 2) {
                 for (; row + 2 <= end; row += 2) {
                     LinearBFloat16FP8E4M3DecodeRows_AVX512BF16<2>(
                         inputData, weightData, biasData, outputData,
-                        m, k, row, blockK, blockM, scales, ms, magicScale);
+                        m, k, row, blockK, blockM, scales, ms);
                 }
             }
             if (row == end) {
@@ -623,8 +547,6 @@ namespace fastllm {
 
         for (int i = 0; i < n; i++) {
             int j = st;
-            __m256i v_a_mask_byte = _mm256_set1_epi8(0x80); 
-            __m256i v_b_mask_byte = _mm256_set1_epi8(0x7F); 
             for (; j < end; j++) {
                 float now = biasData ? biasData[j] : 0.0f;
                 __m512 last_sum = _mm512_setzero_ps(); // Accumulator for 16 parallel sums
@@ -642,23 +564,13 @@ namespace fastllm {
                         // 2. Load 32 FP8 weights
                         __m256i va_bytes = _mm256_loadu_si256((__m256i*)&weightData[j * m + l]);
 
-                        __m256i va_masked_bytes = _mm256_and_si256(va_bytes, v_a_mask_byte);
-                        __m512i va_promoted_words = _mm512_cvtepu8_epi16(va_masked_bytes);
-                        __m512i v_a_term_shifted = _mm512_slli_epi16(va_promoted_words, 8);
-
-                        __m256i vb_masked_bytes = _mm256_and_si256(va_bytes, v_b_mask_byte);
-                        __m512i vb_promoted_words = _mm512_cvtepu8_epi16(vb_masked_bytes);
-                        __m512i v_b_term_shifted = _mm512_slli_epi16(vb_promoted_words, 4);
-
-                        __m512i v_result = _mm512_or_si512(v_a_term_shifted, v_b_term_shifted);
-                        __m512bh v_weights_bf16 = (__m512bh)v_result;
-                        
+                        __m512bh v_weights_bf16 = FP8E4M3ToBFloat16_AVX512BF16(va_bytes);
                         // 3. Compute dot product: v_sum += v_input_bf16 * v_weights_bf16
                         v_sum = _mm512_dpbf16_ps(v_sum, v_input_bf16, v_weights_bf16);
                     }
                     last_sum = _mm512_fmadd_ps(v_sum, vScale, last_sum);
                 }
-                now += _mm512_reduce_add_ps(last_sum) * magicScale;
+                now += _mm512_reduce_add_ps(last_sum);
                 outputData[i * k + j] = now;
             }
         }
@@ -668,24 +580,6 @@ namespace fastllm {
     }
 
 #ifdef __AVX512BF16__
-    static inline __m512bh FP8E4M3ToBFloat16_AVX512BF16(__m256i bytes) {
-        const __m512i words = _mm512_cvtepu8_epi16(bytes);
-        const __m512i magnitude = _mm512_and_si512(words, _mm512_set1_epi16(0x7f));
-        const __m512i sign = _mm512_slli_epi16(
-            _mm512_and_si512(words, _mm512_set1_epi16(0x80)), 8);
-        // Convert to actual BF16 values before the dot product. Scaling an
-        // exponent-biased dot product by 2^120 afterwards loses small products
-        // because VDPBF16PS flushes subnormal FP32 intermediates to zero.
-        const __m512i normal = _mm512_add_epi16(
-            _mm512_slli_epi16(magnitude, 4), _mm512_set1_epi16(0x3c00));
-        const __m512i subnormalTable = _mm512_setr_epi32(
-            0x3b000000, 0x3bc03b80, 0x3c203c00, 0x3c603c40,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        const __m512i subnormal = _mm512_permutexvar_epi16(magnitude, subnormalTable);
-        const __mmask32 tiny = _mm512_cmplt_epi16_mask(magnitude, _mm512_set1_epi16(8));
-        return (__m512bh)_mm512_or_si512(sign, _mm512_mask_mov_epi16(normal, tiny, subnormal));
-    }
-
     static inline void
     LinearBFloat16FP8E4M3Block128TwoRows_AVX512BF16(
             const uint16_t *inputData, const uint8_t *weightData,
