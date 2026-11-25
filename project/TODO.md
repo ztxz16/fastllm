@@ -388,6 +388,21 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   记录日期：2026-11-24。实现：要求已确认，尚未实现。验证：无该功能的验收结果。
   下一步：补充入口接口、P/D 配对和交接协调方案。功能定义见
   [Router/Proxy 与现有调度复用](PD_DISAGGREGATION.md#routerproxy-与现有调度复用)。
+- [ ] **PD 分离：Router 服务健康检查对齐 vLLM Router。** 对已注册 P、D 服务分别维护健康状态，
+  默认每 60 秒向 `/health` 发送 HTTP GET，单次探测超时 5 秒；HTTP 2xx 为成功，
+  非 2xx、连接错误或超时为失败。连续失败 3 次标记不健康，停止分配新请求；仍保留注册记录
+  并继续周期探测，连续成功 2 次恢复健康候选资格。成功清零连续失败计数，失败清零连续成功计数。
+  对齐配置项 `--health-check-endpoint`、`--health-check-interval-secs`、
+  `--health-check-timeout-secs`、`--health-failure-threshold`、`--health-success-threshold`，
+  默认值分别为 `/health`、60、5、3、2，均可显式覆盖。
+  所有服务级策略及会话绑定都排除不健康目标；忙碌与健康分开判断，健康检查暂时停止分流
+  与显式注销分开。已在途请求及传输遵循既定收尾规则，不因健康标记变化直接回收资源。
+  健康恢复不强制迁回已改绑会话，会话闲置超时另按策略管理。
+  记录日期：2026-11-25。实现：规则已确认，尚未实现。
+  验证：无默认配置、配置覆盖、探测结果分类、连续计数重置、P/D 状态隔离、
+  不健康期间持续探测、停止分流及恢复的验收结果。
+  下一步：接入服务健康端点、周期探测和路由候选池更新。功能定义及参考见
+  [Router 服务健康检查](PD_DISAGGREGATION.md#router-服务健康检查)。
 - [ ] **PD 分离：支持八种服务级 Router 策略，允许 P/D 分别配置。**
   支持 `round_robin`、`random`、`power_of_two`、`cache_aware`、`kv_aware`、
   `consistent_hash`、`sticky_least_loaded`、`rendezvous_hash`；P、D 可使用相同或不同策略。

@@ -80,6 +80,37 @@ D 副本 2 所需的 KV 和原始请求就绪后，从首个输出 Token 开始�
 
 记录日期：2026-11-24。状态：需求已确认，待实现。具体接口与复用方案后续补充。
 
+## Router 服务健康检查
+
+FT 的服务级 Router 健康检查对齐 vLLM Router，对已注册的 P、D 服务分别维护健康状态。
+采用以下命令行配置项与默认值，均支持显式配置：
+
+| 配置项 | 默认值 | 含义 |
+|---|---|---|
+| `--health-check-endpoint` | `/health` | Router 向服务发送 HTTP GET 探测的路径。 |
+| `--health-check-interval-secs` | `60` | 周期性健康探测的间隔，单位为秒。 |
+| `--health-check-timeout-secs` | `5` | 单次健康探测的超时时间，单位为秒，不是推理请求超时。 |
+| `--health-failure-threshold` | `3` | 连续探测失败达到该次数，标记为不健康并停止分配新请求。 |
+| `--health-success-threshold` | `2` | 不健康后连续探测成功达到该次数，恢复健康候选资格。 |
+
+- 探测返回 HTTP 2xx 视为成功；非 2xx、连接错误或超时视为失败。
+  每次成功清零连续失败计数，每次失败清零连续成功计数；P、D 各服务独立计数。
+- 不健康服务仍保留在注册表中，继续按相同周期探测，直到连续成功达到恢复阈值。
+  健康恢复后重新参与路由选择；显式注销服务与健康检查暂时停止分流分别处理。
+- 所有服务级路由策略均排除不健康服务，会话绑定也不能绕过该检查。
+  健康状态用于判断服务可用性，负载和 KV 容量另行判断，忙碌本身不等于不健康。
+- 停止分流只限制新请求的目标选择；已在途请求与 KV 传输继续按各自的完成、超时、取消
+  和异常收尾规则处理，不因健康标记变化直接回收仍被使用的资源。
+- 健康恢复不强制把已改绑的会话迁回原服务；会话闲置超时仍由对应策略单独管理。
+
+参考：[vLLM Router 健康检查默认配置，main.rs:402](https://github.com/vllm-project/router/blob/main/src/main.rs#L402)、
+[探测结果与连续计数，worker.rs:432](https://github.com/vllm-project/router/blob/main/src/core/worker.rs#L432)、
+[持续探测已注册服务，worker_registry.rs:403](https://github.com/vllm-project/router/blob/main/src/core/worker_registry.rs#L403)。
+
+记录日期：2026-11-25。状态：健康探测、停止分流与恢复规则已确认，待实现，尚无验收结果。
+下一步：接入健康端点、周期探测与候选池更新，验证默认值、配置覆盖、连续计数重置、
+不健康期间继续探测及恢复后重新参与路由。
+
 ## Router 策略支持
 
 PD 分离的服务级 Router 拟支持以下八种策略，借鉴 vLLM Router 的策略能力：
