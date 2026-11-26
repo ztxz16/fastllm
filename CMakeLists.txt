@@ -803,6 +803,16 @@ if (USE_CUDA)
 
     add_compile_definitions(FASTLLM_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     set(FASTLLM_LINKED_LIBS ${FASTLLM_LINKED_LIBS} cublasLt cublas nccl cuda)
+    if (MAKE_WHL_X86 AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.9)
+        find_library(FASTLLM_WHEEL_LZMA NAMES liblzma.a)
+        if (NOT FASTLLM_WHEEL_LZMA)
+            message(FATAL_ERROR "The Linux wheel build needs liblzma-dev")
+        endif()
+        set_property(SOURCE src/devices/cuda/moe/fastllm-mxfp4-ep-graph.cu APPEND PROPERTY
+            COMPILE_DEFINITIONS FASTLLM_PACKED_EP_CUBINS)
+        list(APPEND FASTLLM_LINKED_LIBS "${FASTLLM_WHEEL_LZMA}")
+        set(BUILD_INFO_PACKED_EP_CUBINS true)
+    endif()
     set(CMAKE_CUDA_ARCHITECTURES ${FASTLLM_CUDA_ARCHITECTURES})
 endif()
 
@@ -5045,6 +5055,9 @@ if(FASTLLM_MERGE_MEDIA)
 endif()
 
 set(BUILD_INFO_MERGED_MEDIA "false")
+if (NOT BUILD_INFO_PACKED_EP_CUBINS)
+    set(BUILD_INFO_PACKED_EP_CUBINS false)
+endif()
 if(FASTLLM_MERGE_MEDIA)
     set(BUILD_INFO_MERGED_MEDIA "true")
 endif()
@@ -5073,7 +5086,7 @@ if (USE_IVCOREX)
     set(BUILD_INFO_USE_IVCOREX "true")
 endif()
 file(WRITE ${CMAKE_BINARY_DIR}/build_info.json
-"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX},\n  \"merged_media\": ${BUILD_INFO_MERGED_MEDIA}\n}\n")
+"{\n  \"USE_CUDA\": ${BUILD_INFO_USE_CUDA},\n  \"USE_ROCM\": ${BUILD_INFO_USE_ROCM},\n  \"USE_NUMAS\": ${BUILD_INFO_USE_NUMAS},\n  \"USE_TFACC\": ${BUILD_INFO_USE_TFACC},\n  \"USE_TOPS\": ${BUILD_INFO_USE_TOPS},\n  \"USE_IVCOREX\": ${BUILD_INFO_USE_IVCOREX},\n  \"packed_ep_cubins\": ${BUILD_INFO_PACKED_EP_CUBINS},\n  \"merged_media\": ${BUILD_INFO_MERGED_MEDIA}\n}\n")
 
 # copy_directory overlays existing files. Replace each shipped EP package so
 # incremental builds cannot bundle CUBINs retired from its manifest.

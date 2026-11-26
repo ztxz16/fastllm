@@ -25,6 +25,11 @@ When changing the architecture list, check native coverage with cuobjdump
 --list-elf and test on the intended hardware. GLIBC auditing and CUDA runtime
 dependencies remain handled by package_wheel.py and the normal release process.
 
+The Linux CUDA 12.9 wheel stores each SM120 expert-parallel kernel set in
+cubins.xz alongside its original manifest. The native loader expands only
+the selected set in host memory when that EP configuration initializes.
+Install liblzma-dev in the build environment for the statically linked decoder.
+
 The release wheel also builds and checks the Qwen-Image-2.1 native library,
 server, generator and web/API assets. Run ftllm qwen-image server --help or
 ftllm qwen-image generate --help after installation; no Torch/Diffusers runtime

@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import lzma
 import os
 from pathlib import Path
 import re
@@ -68,6 +69,29 @@ def stage_demo_assets(source, package):
     return demo_files
 
 
+def pack_ep_cubins(package):
+    manifests = sorted((package / 'kernels/mxfp4_ep').glob('*/manifest.json'))
+    if not manifests:
+        raise ValueError('No SM120 EP kernel manifests found')
+    members = set()
+    for manifest in manifests:
+        sizes = json.loads(manifest.read_bytes())['binaries']
+        cubins = sorted(manifest.parent.glob('*.cubin'))
+        if not cubins or {path.stem for path in cubins} != set(sizes):
+            raise ValueError('CUBIN inventory differs from %s' % manifest)
+        archive = manifest.with_name('cubins.xz')
+        with lzma.open(archive, 'wb', preset=6) as packed:
+            for path in cubins:
+                data = path.read_bytes()
+                if len(data) != sizes[path.stem] or hashlib.sha256(data).hexdigest() != path.stem:
+                    raise ValueError('Invalid CUBIN %s' % path)
+                packed.write(data)
+        for path in cubins:
+            path.unlink()
+        members.update(path.relative_to(package.parent).as_posix() for path in (manifest, archive))
+    return members
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ['source-dir', 'build-dir', 'output-dir', 'max-glibc', 'cxx', 'strip', 'do-strip']:
@@ -90,7 +114,14 @@ def main():
         shutil.copy2(source / 'tools/scripts/setup.py', stage / 'setup.py')
         build_info = build / 'cuda/build_info.json'
         shutil.copy2(build_info, package / 'build_info.json')
-        merged = json.loads(build_info.read_text()).get('merged_media', False)
+        features = json.loads(build_info.read_text())
+        merged = features.get('merged_media', False)
+        kernel_files = set()
+        if features.get('packed_ep_cubins', False):
+            kernel_files = pack_ep_cubins(package)
+            license_dir = package / 'licenses/xz-utils'
+            license_dir.mkdir()
+            shutil.copy2('/usr/share/doc/liblzma-dev/copyright', license_dir / 'copyright')
         shutil.copy2(build / 'cuda/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools.so')
         shutil.copy2(build / 'cpu/tools/ftllm/libfastllm_tools.so', package / 'libfastllm_tools-cpu.so')
         for name in ('minimax_h3_server', 'minimax_h3_generate', 'minimax_h3_image_server', 'minimax_h3_image_generate'):
@@ -144,7 +175,7 @@ def main():
                 expected.add('ftllm/duo_live')
             else:
                 expected.update(('ftllm/libfastllm_minimax_h3.so', 'ftllm/libfastllm_qwen_image.so'))
-            missing = (expected | demo_files | license_files) - set(archive.namelist())
+            missing = (expected | demo_files | license_files | kernel_files) - set(archive.namelist())
             if missing:
                 raise RuntimeError('Wheel is missing: ' + ', '.join(sorted(missing)))
         target = dest / wheel.name

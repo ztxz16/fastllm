@@ -14,6 +14,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef FASTLLM_PACKED_EP_CUBINS
+#include <lzma.h>
+#endif
 
 namespace {
 using J = json11::Json;
@@ -41,6 +44,39 @@ static size_t number(const J &v) {
         throw std::runtime_error("Invalid nonnegative integer");
     return (size_t)x;
 }
+#ifdef FASTLLM_PACKED_EP_CUBINS
+// The wheel concatenates CUBINs in digest order before XZ compression.
+// Source builds and unpacked kernel directories retain the individual files.
+struct EpCubins {
+    std::map<std::string, size_t> offsets;
+    std::string data;
+
+    void load(const std::string &directory, const J &sizes) {
+        std::ifstream file(directory + "/cubins.xz", std::ios::binary);
+        if (!file)
+            return;
+        size_t total = 0;
+        for (const auto &item : sizes.object_items()) {
+            size_t bytes = number(item.second);
+            if (!bytes || bytes > data.max_size() - total)
+                throw std::runtime_error("Invalid packed EP CUBIN size");
+            offsets.emplace(item.first, total);
+            total += bytes;
+        }
+        if (!total)
+            throw std::runtime_error("Empty packed EP CUBIN manifest");
+        std::string compressed{std::istreambuf_iterator<char>(file), {}};
+        data.resize(total);
+        uint64_t memoryLimit = 128ULL << 20;
+        size_t consumed = 0, produced = 0;
+        auto status = lzma_stream_buffer_decode(&memoryLimit, 0, nullptr,
+                reinterpret_cast<const uint8_t *>(compressed.data()), &consumed, compressed.size(),
+                reinterpret_cast<uint8_t *>(&data[0]), &produced, data.size());
+        if (status != LZMA_OK || consumed != compressed.size() || produced != total)
+            throw std::runtime_error("Invalid packed EP CUBIN archive in " + directory);
+    }
+};
+#endif
 static std::vector<unsigned char> unhex(const std::string &s) {
     if (s.size() % 2)
         throw std::runtime_error("Invalid hex argument");
@@ -261,6 +297,9 @@ struct NativeEp {
         }
     };
     std::string directory;
+#ifdef FASTLLM_PACKED_EP_CUBINS
+    EpCubins cubins;
+#endif
     J manifest;
     std::vector<std::unique_ptr<Rank>> ranks;
     std::map<int, J> specs;
@@ -272,6 +311,9 @@ struct NativeEp {
         if (!error.empty() || manifest["version"].int_value() != 1 ||
             manifest["ep"].int_value() != (int)devices.size())
             throw std::runtime_error("Incompatible native EP manifest: " + error);
+#ifdef FASTLLM_PACKED_EP_CUBINS
+        cubins.load(path, manifest["binaries"]);
+#endif
         for (int dev : devices) {
             rt(cudaSetDevice(dev));
             cudaDeviceProp prop{};
@@ -418,10 +460,17 @@ struct NativeEp {
             throw std::runtime_error("Invalid cubin identifier");
         auto it = r.modules.find(key);
         if (it == r.modules.end()) {
-            auto bytes = read(directory + "/" + key + ".cubin");
-            if (bytes.size() != number(manifest["binaries"][key]) || bytes.compare(0, 4,
-                                                                                   "\x7f"
-                                                                                   "ELF"))
+            size_t size = number(manifest["binaries"][key]);
+            std::string bytes;
+#ifdef FASTLLM_PACKED_EP_CUBINS
+            if (!cubins.data.empty()) {
+                bytes = cubins.data.substr(cubins.offsets.at(key), size);
+            } else
+#endif
+            {
+                bytes = read(directory + "/" + key + ".cubin");
+            }
+            if (bytes.size() != size || bytes.compare(0, 4, "\x7f" "ELF") != 0)
                 throw std::runtime_error("Invalid cubin artifact");
             CUmodule m;
             ck(cuModuleLoadData(&m, bytes.data()));
