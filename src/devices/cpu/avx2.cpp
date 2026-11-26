@@ -10,11 +10,15 @@
 
 #ifdef __AVX2__
 #include "immintrin.h"
+#if defined(__GNUC__) && defined(__F16C__) && defined(__FMA__)
+#include <cpuid.h>
+#endif
 #endif
 
 #include "fp8-convert.h"
 #include "utils.h"
 #include "fastllm.h"
+#include "mxfp4gemv.h"
 
 namespace fastllm {
 #ifdef __AVX2__
@@ -1989,6 +1993,85 @@ namespace fastllm {
         }
     }
 
+#endif
+
+#if defined(__GNUC__) && defined(__AVX2__) && defined(__F16C__) && defined(__FMA__)
+    // With these exponents every scaled E2M1 value is exactly representable
+    // by the upper byte of a normal binary16 or a signed zero.
+    struct Block32HalfHighBytes {
+        alignas(16) uint8_t table[256][16]{};
+        Block32HalfHighBytes() {
+            const int high[8] = {0, 0x38, 0x3c, 0x3e, 0x40, 0x42, 0x44, 0x46};
+            for (int s = 114; s <= 140; ++s) {
+                for (int i = 0; i < 16; ++i) {
+                    table[s][i] = ((i & 7) ? high[i & 7] + (s - 127) * 4 : 0) | ((i & 8) << 4);
+                }
+            }
+        }
+    };
+    static const Block32HalfHighBytes block32HalfBytes;
+
+    bool Mxfp4Avx2GemvAvailable() {
+        unsigned eax, ebx, ecx, edx;
+        return __get_cpuid(1, &eax, &ebx, &ecx, &edx) &&
+               (ecx & (bit_F16C | bit_FMA)) == (bit_F16C | bit_FMA);
+    }
+
+    void PrepareMxfp4GemvInput(const uint16_t *A, int m, Mxfp4GemvInput &row) {
+        auto &input = row.values;
+        input.resize(m);
+        for (int i = 0; i < m; i += 32) {
+            for (int half = 0; half < 2; half++) {
+                auto x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(A + i + half * 16));
+                _mm256_store_ps(input.data() + i + half * 8, _mm256_castsi256_ps(_mm256_slli_epi32(x, 16)));
+                _mm256_store_ps(input.data() + i + 16 + half * 8, _mm256_castsi256_ps(_mm256_and_si256(x,_mm256_set1_epi32(0xffff0000))));
+            }
+        }
+    }
+
+    void RunMxfp4Avx2Gemv(const uint16_t *A, const Mxfp4GemvInput &rowInput,
+                         const uint8_t *B, float *C, int m, int end) {
+        const auto &input = rowInput.values;
+        const int ldb = m / 32 * 17;
+        for (int row = 0; row < end; row++) {
+            const uint8_t *w = B + size_t(row) * ldb;
+            __m256 acc[4] = {};
+            int i = 0;
+            for (; i < m; i += 32, w += 17) {
+                if ((i & 127) == 0 && i + 1024 < m) _mm_prefetch((const char*)(w + 544),_MM_HINT_T0);
+                unsigned s = w[16];
+                if (s < 114 || s > 140) break;
+                __m128i lut = _mm_load_si128((const __m128i *)block32HalfBytes.table[s]);
+                __m128i bits = _mm_loadu_si128((const __m128i *)w);
+                __m128i mask = _mm_set1_epi8(15);
+                __m128i even = _mm_shuffle_epi8(lut,_mm_and_si128(bits,mask));
+                __m128i odd = _mm_shuffle_epi8(lut,_mm_and_si128(_mm_srli_epi16(bits,4),mask));
+                __m128i zero = _mm_setzero_si128();
+                const float *x = input.data() + i;
+                acc[0] = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_unpacklo_epi8(zero,even)),_mm256_load_ps(x),acc[0]);
+                acc[1] = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_unpackhi_epi8(zero,even)),_mm256_load_ps(x+8),acc[1]);
+                acc[2] = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_unpacklo_epi8(zero,odd)),_mm256_load_ps(x+16),acc[2]);
+                acc[3] = _mm256_fmadd_ps(_mm256_cvtph_ps(_mm_unpackhi_epi8(zero,odd)),_mm256_load_ps(x+24),acc[3]);
+            }
+            if (i != m) {
+                FastllmGemmBFloat16NVFP4Block32E8M0_AVX2_Run<1>(A,m*2,B,ldb,C,end*4,m,row,row+1);
+            } else {
+                // Reconstruct the four accumulator vectors in the original
+                // GEMV's reduction order after processing all 32-value blocks.
+                __m256 ac = _mm256_add_ps(_mm256_unpacklo_ps(acc[0], acc[2]),
+                                          _mm256_unpackhi_ps(acc[0], acc[2]));
+                __m256 bd = _mm256_add_ps(_mm256_unpacklo_ps(acc[1], acc[3]),
+                                          _mm256_unpackhi_ps(acc[1], acc[3]));
+                __m256 lo = _mm256_permute2f128_ps(ac, bd, 0x20);
+                __m256 hi = _mm256_permute2f128_ps(ac, bd, 0x31);
+                C[row] = NVFP4HorizontalSum_AVX2(_mm256_add_ps(lo, hi));
+            }
+        }
+    }
+#else
+    bool Mxfp4Avx2GemvAvailable() { return false; }
+    void PrepareMxfp4GemvInput(const uint16_t *, int, Mxfp4GemvInput &) {}
+    void RunMxfp4Avx2Gemv(const uint16_t *, const Mxfp4GemvInput &, const uint8_t *, float *, int, int) {}
 #endif
 
     bool FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(

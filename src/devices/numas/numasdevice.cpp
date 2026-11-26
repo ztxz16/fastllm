@@ -53,6 +53,7 @@
 #include "utils.h"
 #include "computeutils.h"
 #include "numas.h"
+#include "mxfp4gemv.h"
 #include "gguf.h"
 #include "ggml-iq-batch.h"
 
@@ -9589,6 +9590,148 @@ namespace fastllm {
         );
     }
 
+    // Keep gate and down projections in the model's block-32 E4M3 arithmetic.
+    // Each worker owns the same output channels for every routed expert.
+    struct Mxfp4DecodeWorker : MultiThreadBaseOp {
+        Data **weights;
+        const std::vector<std::pair<int, float>> *routes;
+        const uint16_t *input;
+        const Mxfp4GemvInput *expandedInput;
+        Mxfp4GemvInput *expandedDown;
+        uint16_t *middle, *output;
+        int node, localWorker, localWorkers, worker, threads, hidden, intermediate, nodes;
+        enum Phase { Gate, PrepareDown, Down } phase;
+        float limit;
+        std::vector<float> projection, sums;
+
+        void Run() override {
+            if (phase == PrepareDown) {
+                for (size_t r = worker; r < routes->size(); r += threads) {
+                    uint16_t *row = middle + r * intermediate;
+                    QuantizeDeepSeekV4FP8ActivationBFloat16(row, intermediate, 32);
+                    PrepareMxfp4GemvInput(row, intermediate, expandedDown[r]);
+                }
+                return;
+            }
+            bool gate = phase == Gate;
+            int width = (gate ? intermediate : hidden) / nodes;
+            int first = width * localWorker / localWorkers;
+            int last = width * (localWorker + 1) / localWorkers;
+            int count = last - first;
+            if (count == 0) return;
+            if (!gate) std::fill_n(sums.data(), count, 0.0f);
+            for (size_t r = 0; r < routes->size(); ++r) {
+                const auto &route = (*routes)[r];
+                const Data &weight = *weights[2 * route.first + (gate ? 0 : 1)];
+                int columns = gate ? hidden : intermediate;
+                int rowOffset = first * (gate ? 2 : 1);
+                auto *src = gate ? input : middle + r * intermediate;
+                RunMxfp4Avx2Gemv(src, gate ? *expandedInput : expandedDown[r],
+                    weight.numasData[node] + size_t(rowOffset) * (columns / 32 * 17),
+                    projection.data(), columns, count * (gate ? 2 : 1));
+                if (gate) {
+                    auto *dst = middle + r * intermediate + node * width + first;
+                    const auto &silu = GetBFloat16SiluLookup();
+                    for (int j = 0; j < count; ++j) {
+                        uint16_t g = Float32ToBFloat16RNEBits(projection[2 * j]);
+                        float up = RoundFloat32ToBFloat16RNE(projection[2 * j + 1]);
+                        if (limit > 0.0f) {
+                            if (BFloat16BitsToFloat32(g) > limit) g = Float32ToBFloat16RNEBits(limit);
+                            up = std::clamp(up, -limit, limit);
+                        }
+                        dst[j] = Float32ToBFloat16RNEBits(silu[g] * up * route.second);
+                    }
+                } else {
+                    for (int j = 0; j < count; ++j) sums[j] += RoundFloat32ToBFloat16RNE(projection[j]);
+                }
+            }
+            if (!gate) {
+                for (int j = 0; j < count; ++j)
+                    output[node * width + first + j] = Float32ToBFloat16RNEBits(sums[j]);
+            }
+        }
+    };
+
+    static bool TryMxfp4Avx2Decode(Data &input, Data &output, Data **weights, Data **biases,
+            const std::vector<std::pair<int, float>> &routes, float limit) {
+        static const bool supported = GetCPUInstructInfo()->hasAVX2 &&
+            !GetCPUInstructInfo()->hasAVX512F && Mxfp4Avx2GemvAvailable() &&
+            NumasDeepSeekV4FastPathAvailable();
+        if (!supported || HostMoeIsUnbound() || input.dataType != BFLOAT16 || output.dataType != BFLOAT16 ||
+            input.dims.size() != 2 || input.dims[0] != 1 || routes.empty() || !input.cpuData || !output.cpuData ||
+            (limit > 0.0f && RoundFloat32ToBFloat16RNE(limit) != limit)) return false;
+        auto *config = GetNumaConfig();
+        auto *pool = GetHostMoePool();
+        int nodes = config->numaCnt, threads = config->threads, hidden = input.dims[1];
+        if (pool->curActivateThreadInterval.first != 0 || pool->curActivateThreadInterval.second < threads ||
+            nodes <= 0 || threads <= 0 || hidden <= 0 || hidden % 32 || hidden > 32768 || hidden % nodes || output.dims != input.dims) return false;
+        if (!weights[2] || weights[2]->dims.size() != 2) return false;
+        int intermediate = weights[2]->dims[0] / 2;
+        if (intermediate <= 0 || intermediate % 32 || intermediate > 32768 || intermediate % nodes) return false;
+        for (const auto &route : routes) {
+            if (route.first <= 0) return false;
+            for (int p = 0; p < 2; ++p) {
+                int index = 2 * route.first + p;
+                const Data *w = weights[index];
+                if (!w || (biases && biases[index] && !biases[index]->dims.empty()) || w->dataType != NVFP4_BLOCK_32_E8M0 ||
+                    int(w->numasData.size()) != nodes || w->dims.size() != 2 ||
+                    std::find(w->numasData.begin(), w->numasData.end(), nullptr) != w->numasData.end() ||
+                    w->dims[0] != (p ? hidden : 2 * intermediate) ||
+                    w->dims[1] != (p ? intermediate : hidden)) return false;
+            }
+        }
+        thread_local Mxfp4GemvInput expandedInput;
+        thread_local std::vector<Mxfp4GemvInput> expandedDown;
+        thread_local std::vector<Mxfp4DecodeWorker> jobs;
+        thread_local std::vector<uint16_t> middle;
+        thread_local std::vector<uint16_t> quantizedInput;
+        const auto *raw = reinterpret_cast<const uint16_t *>(input.cpuData);
+        quantizedInput.assign(raw, raw + hidden);
+        QuantizeDeepSeekV4FP8ActivationBFloat16(quantizedInput.data(), hidden, 32);
+        const auto *src = quantizedInput.data();
+        PrepareMxfp4GemvInput(src, hidden, expandedInput);
+        expandedDown.resize(routes.size());
+        jobs.resize(threads);
+        middle.resize(routes.size() * intermediate);
+        for (int node = 0; node < nodes; ++node) {
+            const auto &ids = config->numaToCpuDict[node];
+            if (ids.empty()) return false;
+            for (int w = 0; w < int(ids.size()); ++w) {
+                const int id = ids[w].first;
+                auto &job = jobs[id];
+                job.node = node;
+                job.worker = id;
+                job.threads = threads;
+                job.localWorker = w;
+                job.localWorkers = ids.size();
+                job.nodes = nodes;
+                job.hidden = hidden;
+                job.intermediate = intermediate;
+                job.limit = limit;
+                job.weights = weights;
+                job.routes = &routes;
+                job.input = src;
+                job.expandedInput = &expandedInput;
+                job.expandedDown = expandedDown.data();
+                job.middle = middle.data();
+                job.output = reinterpret_cast<uint16_t *>(output.cpuData);
+                int gateRows = (intermediate / nodes + job.localWorkers - 1) / job.localWorkers;
+                int downRows = (hidden / nodes + job.localWorkers - 1) / job.localWorkers;
+                job.projection.resize(std::max(2 * gateRows, downRows));
+                job.sums.resize(downRows);
+            }
+        }
+        for (auto phase : {Mxfp4DecodeWorker::Gate, Mxfp4DecodeWorker::PrepareDown, Mxfp4DecodeWorker::Down}) {
+            int active = phase == Mxfp4DecodeWorker::PrepareDown ? std::min(threads, int(routes.size())) : threads;
+            for (int id = 0; id < active; ++id) {
+                jobs[id].phase = phase;
+                pool->PushOp(id, &jobs[id]);
+            }
+            for (int id = 0; id < active; ++id) pool->Wait(id);
+        }
+        return true;
+    }
+
     void NumasMergeMOE::Run(const std::string &opType, const fastllm::DataDict &datas,
                     const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         HostMoePlacementScope placement(datas.at("weights") ? ((Data **)datas.at("weights"))[2] : nullptr);
@@ -9873,6 +10016,7 @@ namespace fastllm {
                               std::getenv("FASTLLM_PROFILE_DEEPSEEKV4") != nullptr ||
                               std::getenv("FASTLLM_PROFILE_NUMAS_MOE") != nullptr);
         double profileLast = NumasProfileNowMs();
+        double profileAvx2Ms = 0.0;
         double profileRegisterMs = 0.0, profileResizeMs = 0.0, profileInputMs = 0.0;
         double profileGatePrepMs = 0.0, profileGateMs = 0.0, profileSwigluConvertMs = 0.0;
         double profileDownPrepMs = 0.0, profileDownMs = 0.0, profileReduceMs = 0.0, profileOutputMs = 0.0;
@@ -10071,6 +10215,16 @@ namespace fastllm {
                     DataType startDataType = GetNumasLinearActDataType(weights[2], 1);
                     DataType downInputDataType = GetNumasLinearActDataType(weights[3], 1);
 
+                    const bool enableDeepSeekV4MoeFast = deepSeekV4Mode &&
+                        std::getenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;
+                    const bool directGemmEnabled = enableDeepSeekV4MoeFast &&
+                        std::getenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_DIRECT_GEMM") == nullptr;
+                    if (directGemmEnabled && activationQuantBlock == 32 &&
+                        TryMxfp4Avx2Decode(input, *cpuOutput, weights, biass, v, swigluLimit)) {
+                        profileLap(profileAvx2Ms);
+                        continue;
+                    }
+
                     // 从 fastllmMoeDataManagerNumas 获取缓存的 vector，并根据需要调整大小
                     auto& realInput = fastllmMoeDataManagerNumas.realInput;
                     auto& inputFloat32 = fastllmMoeDataManagerNumas.inputFloat32;
@@ -10148,8 +10302,6 @@ namespace fastllm {
                     // 1. gateUp + swiglu
                     auto *numaConfig = GetNumaConfig();
 
-                    const bool enableDeepSeekV4MoeFast = deepSeekV4Mode &&
-                        std::getenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;
                     const bool useDeepSeekV4MoeFast =
                         enableDeepSeekV4MoeFast &&
                         downInputDataType < DataType::DATA_GGUF_FORMAT &&
@@ -10161,9 +10313,7 @@ namespace fastllm {
                     const bool useParallelPrepare = useDeepSeekV4MoeFast || quantizedPrepareBlock;
                     bool useDirectGemmQueue =
                         useDeepSeekV4MoeFast && originalSharedInput.empty() &&
-                        std::getenv(
-                            "FASTLLM_DSV4_DISABLE_NUMAS_MOE_DIRECT_GEMM") ==
-                            nullptr;
+                        directGemmEnabled;
                     // The direct queue adjusts these preferred widths using
                     // the actual expert count and workers on each NUMA node.
                     int gateRowsPerTask = 208;
@@ -10707,11 +10857,11 @@ namespace fastllm {
                 if (profileDetail) {
                     double total = profileRegisterMs + profileResizeMs + profileInputMs + profileGatePrepMs +
                                    profileGateMs + profileSwigluConvertMs + profileDownPrepMs + profileDownMs +
-                                   profileReduceMs + profileOutputMs;
-                    printf("[fastllm-profile-numas-moe] small_batch bs=%d topk=%d experts=%d register=%.3f resize=%.3f input=%.3f gate_prep=%.3f gate_swiglu=%.3f swiglu_convert=%.3f down_prep=%.3f down=%.3f reduce=%.3f output=%.3f total=%.3f\n",
+                                   profileReduceMs + profileOutputMs + profileAvx2Ms;
+                    printf("[fastllm-profile-numas-moe] small_batch bs=%d topk=%d experts=%d register=%.3f resize=%.3f input=%.3f gate_prep=%.3f gate_swiglu=%.3f swiglu_convert=%.3f down_prep=%.3f down=%.3f reduce=%.3f output=%.3f avx2=%.3f total=%.3f\n",
                            bs, topk, profileExpertCalls, profileRegisterMs, profileResizeMs, profileInputMs,
                            profileGatePrepMs, profileGateMs, profileSwigluConvertMs, profileDownPrepMs,
-                           profileDownMs, profileReduceMs, profileOutputMs, total);
+                           profileDownMs, profileReduceMs, profileOutputMs, profileAvx2Ms, total);
                     fflush(stdout);
                 }
             }
