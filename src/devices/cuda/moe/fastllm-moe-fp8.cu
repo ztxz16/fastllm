@@ -6375,6 +6375,11 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, f
 
 #ifndef USE_ROCM
 #include "fastllm-moe-legacy-experts.cuh"
+#include "fastllm-moe-legacy-decode-common.cuh"
+#include "fastllm-moe-pascal-decode.cuh"
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && !defined(CUDA_NO_TENSOR_CORE)
+#include "fastllm-moe-volta-decode.cuh"
+#endif
 #endif
 
 namespace fastllm {
@@ -6490,6 +6495,15 @@ bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data
     if (arch == 60 || arch == 70) {
         if (legacy_experts::run(input, output, indices, scores, gateUp, middle, weights, count, slots,
                                 activation, exactHalfScales, arch)) return true;
+        if (weights[2]->dataType == NVFP4_BLOCK_16) {
+            const int experts = count / 2 - 1, inter = weights[2]->dims[0] / 2;
+            if (arch == 60 && pascal_decode::run(input, output, indices, scores, gateUp, middle,
+                                                 experts, inter, slots, activation)) return true;
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && !defined(CUDA_NO_TENSOR_CORE)
+            if (arch == 70 && volta_decode::run(input, output, indices, scores, gateUp, middle,
+                                                experts, inter, slots, activation)) return true;
+#endif
+        }
     }
 #endif
     return RunCudaIndexedMoeSlots(slots, input, indices, scores, gateUp, middle, output,
