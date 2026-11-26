@@ -121,7 +121,11 @@ __device__ __forceinline__ void WriteContextKV(const ContextArgs &a, ContextWork
     }
 }
 #endif
-__global__ __launch_bounds__(Threads, 3) void FusedDraftContextSm120(const __grid_constant__ ContextArgs a) {
+__global__ __launch_bounds__(Threads, 3) void FusedDraftContextSm120(
+#if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+    __grid_constant__
+#endif
+        const ContextArgs a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200
     auto grid = cooperative_groups::this_grid();
     auto &w = *a.peers[a.rank];
