@@ -1123,6 +1123,31 @@ static inline float hmax_f32_8(__m256 x) {
     max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
     return  _mm_cvtss_f32(max4);
 }
+#endif
+
+#if defined(__AVX__) || defined(__AVX2__)
+/**
+ * 使用 SSE2 整数加法归约四个 int32 通道，供 AVX 非 AVX2 的量化路径使用。
+ * @param x 按通道排列的四个 int32 部分和；量化块保证总和在 int32 范围内。
+ * @return 四个通道的整数总和，不执行浮点转换。
+ */
+static inline int hsum_i32_4(const __m128i x) {
+    const __m128i sum64 = _mm_add_epi32(x, _mm_unpackhi_epi64(x, x));
+    const __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+}
+
+/**
+ * 使用 SSSE3 计算十六个有符号字节的相邻乘积和，保持 AVX2 路径的饱和语义。
+ * @param x 十六个 int8 量化值，逻辑形状为 [16]。
+ * @param y 十六个 int8 Q8 值；现有量化路径限定在 [-127, 127]，可安全取反。
+ * @return 八个 int16 通道，每个为 x[2*i]*y[2*i]+x[2*i+1]*y[2*i+1] 的饱和值。
+ */
+static inline __m128i mul_add_epi8_sse(const __m128i x, const __m128i y) {
+    const __m128i ax = _mm_sign_epi8(x, x);
+    const __m128i sy = _mm_sign_epi8(y, x);
+    return _mm_maddubs_epi16(ax, sy);
+}
 
 // horizontally add 8 floats
 static inline float hsum_float_8(const __m256 x) {
@@ -1134,10 +1159,12 @@ static inline float hsum_float_8(const __m256 x) {
 }
 #endif
 
+#if defined(__AVX__) || defined(__AVX2__)
 // spread 32 bits to 32 bytes { 0x00, 0xFF }
 static inline __m256i bytes_from_bits_32(const uint8_t * x) {
     uint32_t x32;
     memcpy(&x32, x, sizeof(uint32_t));
+#if defined(__AVX2__)
     const __m256i shuf_mask = _mm256_set_epi64x(
             0x0303030303030303, 0x0202020202020202,
             0x0101010101010101, 0x0000000000000000);
@@ -1145,6 +1172,17 @@ static inline __m256i bytes_from_bits_32(const uint8_t * x) {
     const __m256i bit_mask = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfe);
     bytes = _mm256_or_si256(bytes, bit_mask);
     return _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
+#else
+    const __m128i bits = _mm_set1_epi32(x32);
+    const __m128i bit_mask = _mm_set1_epi64x(0x7fbfdfeff7fbfdfe);
+    const __m128i ones = _mm_set1_epi8(-1);
+    const __m128i low = _mm_shuffle_epi8(bits,
+            _mm_set_epi64x(0x0101010101010101, 0x0000000000000000));
+    const __m128i high = _mm_shuffle_epi8(bits,
+            _mm_set_epi64x(0x0303030303030303, 0x0202020202020202));
+    return MM256_SET_M128I(_mm_cmpeq_epi8(_mm_or_si128(high, bit_mask), ones),
+                          _mm_cmpeq_epi8(_mm_or_si128(low, bit_mask), ones));
+#endif
 }
 
 // Unpack 32 4-bit fields into 32 bytes
@@ -1152,32 +1190,58 @@ static inline __m256i bytes_from_bits_32(const uint8_t * x) {
 static inline __m256i bytes_from_nibbles_32(const uint8_t * rsi)
 {
     const __m128i tmp = _mm_loadu_si128((const __m128i *)rsi);
+#if defined(__AVX2__)
     const __m256i bytes = MM256_SET_M128I(_mm_srli_epi16(tmp, 4), tmp);
     const __m256i lowMask = _mm256_set1_epi8( 0xF );
     return _mm256_and_si256(lowMask, bytes);
+#else
+    const __m128i lowMask = _mm_set1_epi8(0xF);
+    return MM256_SET_M128I(_mm_and_si128(lowMask, _mm_srli_epi16(tmp, 4)),
+                          _mm_and_si128(lowMask, tmp));
+#endif
 }
 
 // add int16_t pairwise and return as float vector
 static inline __m256 sum_i16_pairs_float(const __m256i x) {
+#if defined(__AVX2__)
     const __m256i ones = _mm256_set1_epi16(1);
     const __m256i summed_pairs = _mm256_madd_epi16(ones, x);
+#else
+    const __m128i ones = _mm_set1_epi16(1);
+    const __m128i low = _mm_madd_epi16(ones, _mm256_castsi256_si128(x));
+    const __m128i high = _mm_madd_epi16(ones, _mm256_extractf128_si256(x, 1));
+    const __m256i summed_pairs = MM256_SET_M128I(high, low);
+#endif
     return _mm256_cvtepi32_ps(summed_pairs);
 }
 
 static inline __m256 mul_sum_us8_pairs_float(const __m256i ax, const __m256i sy) {
     // Perform multiplication and create 16-bit values
+#if defined(__AVX2__)
     const __m256i dot = _mm256_maddubs_epi16(ax, sy);
+#else
+    const __m128i low = _mm_maddubs_epi16(_mm256_castsi256_si128(ax), _mm256_castsi256_si128(sy));
+    const __m128i high = _mm_maddubs_epi16(_mm256_extractf128_si256(ax, 1), _mm256_extractf128_si256(sy, 1));
+    const __m256i dot = MM256_SET_M128I(high, low);
+#endif
     return sum_i16_pairs_float(dot);
 }
 
 // multiply int8_t, add results pairwise twice and return as float vector
 static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
+#if defined(__AVX2__)
     // Get absolute values of x vectors
     const __m256i ax = _mm256_sign_epi8(x, x);
     // Sign the values of the y vectors
     const __m256i sy = _mm256_sign_epi8(y, x);
     return mul_sum_us8_pairs_float(ax, sy);
+#else
+    const __m128i low = mul_add_epi8_sse(_mm256_castsi256_si128(x), _mm256_castsi256_si128(y));
+    const __m128i high = mul_add_epi8_sse(_mm256_extractf128_si256(x, 1), _mm256_extractf128_si256(y, 1));
+    return sum_i16_pairs_float(MM256_SET_M128I(high, low));
+#endif
 }
+#endif
 
 #define MAX(a, b) (a) > (b) ? (a) : (b)
 #define MIN(a, b) (a) < (b) ? (a) : (b)
