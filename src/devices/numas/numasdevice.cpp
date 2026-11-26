@@ -1,3 +1,4 @@
+#include <linux/mempolicy.h>
 #include "exl3.h"
 #include "utils/bfloat16_silu.h"
 //
@@ -1839,48 +1840,40 @@ namespace fastllm {
         }
     }
 
-    void Nvfp4ToFastllmNVFP4_BLOCK32_E8M0_Rows(
-        int k, int m, uint8_t *nvfp4, uint8_t *scaleBytes,
-        int blockK, int blockM, uint8_t *dst, int dstRowStart,
-        int dstRows, bool isCrossSwiglu,
-        bool *allScalesFuseMagic = nullptr
-    ) {
-        AssertInFastLLM(blockM == 32,
-                        "NVFP4 block32 packing requires blockM = 32.\n");
-        const int packBlockM = 32;
-        const int fp4BytesPerBlock = packBlockM / 2;
-        const int scaleMs = (m - 1) / blockM + 1;
-        const int packedBlocks = (m - 1) / packBlockM + 1;
-        const size_t rawBytesPerRow =
-            GetDataBytes(DataType::NVFP4, 1, m);
-        const size_t packedBytesPerRow =
-            GetDataBytes(DataType::NVFP4_BLOCK_32_E8M0, 1, m);
-
-        for (int localRow = 0; localRow < dstRows; localRow++) {
-            const int dstRow = dstRowStart + localRow;
-            const int srcRow = isCrossSwiglu ?
-                GetCrossSwigluSourceRow(dstRow, k) : dstRow;
-            uint8_t *rowDst =
-                dst + (size_t)localRow * packedBytesPerRow;
-            const uint8_t *src =
-                nvfp4 + (size_t)srcRow * rawBytesPerRow;
-            for (int block = 0; block < packedBlocks; block++) {
-                const int blockStart = block * packBlockM;
-                const int blockElems = std::min(packBlockM, m - blockStart);
-                const int blockBytes = (blockElems + 1) / 2;
-                memset(rowDst, 0, fp4BytesPerBlock);
-                memcpy(rowDst, src + blockStart / 2, blockBytes);
-                rowDst += fp4BytesPerBlock;
-
-                const size_t scaleIdx =
-                    (size_t)(srcRow / blockK) * scaleMs + block;
-                const uint8_t scaleByte = scaleBytes[scaleIdx];
-                *rowDst++ = scaleByte;
-                if (allScalesFuseMagic != nullptr && scaleByte > 190) {
-                    *allScalesFuseMagic = false;
-                }
-            }
+    // Each complete 32-element block stores 16 weight bytes followed by its scale.
+    static inline uint8_t PackHostBlock32Row(int columns, const uint8_t *src,
+                                             const uint8_t *scales, uint8_t *dst) {
+        const int blocks = columns / 32;
+        uint8_t maxScale = 0;
+        for (int block = 0; block < blocks; ++block) {
+            memcpy(dst, src + size_t(block) * 16, 16);
+            dst[16] = scales[block];
+            maxScale = std::max(maxScale, scales[block]);
+            dst += 17;
         }
+        if (columns % 32) {
+            memset(dst, 0, 16);
+            memcpy(dst, src + size_t(blocks) * 16, (columns % 32 + 1) / 2);
+            dst[16] = scales[blocks];
+            maxScale = std::max(maxScale, scales[blocks]);
+        }
+        return maxScale;
+    }
+
+    void Nvfp4ToFastllmNVFP4_BLOCK32_E8M0_Rows(int k, int m, uint8_t *nvfp4, uint8_t *scaleBytes,
+        int blockK, int blockM, uint8_t *dst, int dstRowStart, int dstRows, bool isCrossSwiglu,
+        bool *allScalesFuseMagic = nullptr) {
+        AssertInFastLLM(blockM == 32, "NVFP4 block32 packing requires blockM = 32.\n");
+        const size_t rawRowBytes = GetDataBytes(NVFP4, 1, m);
+        const size_t scaleCols = (m - 1) / 32 + 1;
+        uint8_t maxScale = 0;
+        for (int r = dstRowStart; r < dstRowStart + dstRows; ++r) {
+            const int srcRow = isCrossSwiglu ? GetCrossSwigluSourceRow(r, k) : r;
+            maxScale = std::max(maxScale, PackHostBlock32Row(m, nvfp4 + srcRow * rawRowBytes,
+                scaleBytes + (srcRow / blockK) * scaleCols, dst));
+            dst += scaleCols * 17;
+        }
+        if (allScalesFuseMagic && maxScale > 190) *allScalesFuseMagic = false;
     }
 
     static bool NumasNVFP4Block32AllScalesFuseMagic(
@@ -3148,6 +3141,135 @@ namespace fastllm {
         }
     }
 
+    namespace {
+        struct NumasMoeWeightArena {
+            size_t bytes;
+            std::vector<uint8_t*> nodes;
+            std::vector<bool> pinned;
+
+            NumasMoeWeightArena(size_t bytes, int count)
+                : bytes(bytes), nodes(count, nullptr), pinned(count, false) {}
+
+            ~NumasMoeWeightArena() {
+                for (size_t node = 0; node < nodes.size(); ++node) {
+                    if (nodes[node] == nullptr) continue;
+#ifdef USE_CUDA
+                    if (pinned[node]) FastllmCudaHostUnregister(nodes[node]);
+#endif
+                    // allocate_aligned_numa reserves 63 extra bytes for alignment.
+                    free_aligned_numa(nodes[node], bytes + 63);
+                }
+            }
+        };
+
+        struct NumasMoeWeightArenaOwners {
+            std::mutex mutex;
+            std::unordered_map<const Data*, std::shared_ptr<NumasMoeWeightArena>> weights;
+        };
+
+        NumasMoeWeightArenaOwners &GetNumasMoeWeightArenaOwners() {
+            // Data can be destroyed during static teardown. Keep the registry
+            // alive; each arena is released when its last owning Data retires.
+            static auto *owners = new NumasMoeWeightArenaOwners;
+            return *owners;
+        }
+
+        using NumaMask = std::unique_ptr<bitmask, decltype(&numa_bitmask_free)>;
+
+        class ScopedMoeThreadPolicy {
+            NumaMask saved{numa_allocate_nodemask(), numa_bitmask_free};
+            int mode = MPOL_DEFAULT;
+            bool changed = false;
+            bool available;
+        public:
+            ScopedMoeThreadPolicy()
+                : available(saved && get_mempolicy(&mode, saved->maskp, saved->size, nullptr, 0) == 0 &&
+                            (mode == MPOL_DEFAULT || mode == MPOL_BIND || mode == MPOL_PREFERRED ||
+                             mode == MPOL_LOCAL)) {}
+
+            bool bind(const bitmask &node) {
+                if (!available || set_mempolicy(MPOL_BIND, node.maskp, node.size) != 0) return false;
+                changed = true;
+                return true;
+            }
+            bool restore() {
+                if (!changed) return true;
+                const bool empty = mode == MPOL_DEFAULT || mode == MPOL_LOCAL;
+                if (set_mempolicy(mode, empty ? nullptr : saved->maskp, empty ? 0 : saved->size) != 0)
+                    return false;
+                changed = false;
+                return true;
+            }
+            ~ScopedMoeThreadPolicy() {
+                if (!restore()) perror("FastLLM: cannot restore MoE loader thread memory policy");
+            }
+        };
+
+        // The CPU packer first-touches each page on its target node. A common policy
+        // on the populated mapping keeps one VMA per matrix and one CUDA registration.
+        template<class WriteShard>
+        bool StoreHostMoeMatrix(Data &weight, size_t shardBytes, int numaShards, bool pin,
+                                const WriteShard &write, bool retryPinByShard = false) {
+            if (shardBytes == 0 || numaShards < 0) return false;
+            const int count = std::max(numaShards, 1);
+            const size_t page = getpagesize();
+            if (shardBytes > SIZE_MAX - page) return false;
+            const size_t stride = (shardBytes + page - 1) / page * page;
+            if (size_t(count - 1) > (SIZE_MAX - 63 - shardBytes) / stride) return false;
+            const size_t bytes = (count - 1) * stride + shardBytes;
+            auto arena = std::make_shared<NumasMoeWeightArena>(bytes, 1);
+            {
+                HostMoePlacementScope unbound(true);
+                arena->nodes[0] = static_cast<uint8_t*>(allocate_aligned_numa(bytes, 0));
+            }
+            if (!arena->nodes[0]) return false;
+#ifdef MADV_NOHUGEPAGE
+            // A transparent huge page must not take in the next node's shard
+            // on its first page fault, even on machines using THP=always.
+            if (count > 1 && madvise(arena->nodes[0], bytes, MADV_NOHUGEPAGE) != 0) return false;
+#endif
+            std::vector<uint8_t*> shards(count);
+            for (int i = 0; i < count; ++i) shards[i] = arena->nodes[0] + i * stride;
+
+            if (numaShards == 0) {
+                write(0, shards[0]);
+            } else {
+                NumaMask nodes(numa_allocate_nodemask(), numa_bitmask_free);
+                NumaMask single(numa_allocate_nodemask(), numa_bitmask_free);
+                if (!nodes || !single) return false;
+                ScopedMoeThreadPolicy policy;
+                for (int i = 0; i < count; ++i) {
+                    int physical = GetNumasPhysicalNode(i);
+                    if (physical < 0 || static_cast<unsigned>(physical) >= nodes->size) return false;
+                    numa_bitmask_setbit(nodes.get(), physical);
+                    numa_bitmask_clearall(single.get());
+                    numa_bitmask_setbit(single.get(), physical);
+                    // Retain explicit shard binding when task policies are restricted.
+                    if (!policy.bind(*single) &&
+                        mbind(shards[i], shardBytes, MPOL_BIND, single->maskp, single->size, 0) != 0)
+                        return false;
+                    write(i, shards[i]);
+                }
+                if (!policy.restore()) return false;
+                if (mbind(arena->nodes[0], bytes, MPOL_BIND, nodes->maskp, nodes->size, 0) != 0)
+                    return false;
+            }
+#ifdef USE_CUDA
+            if (pin) {
+                arena->pinned[0] = FastllmCudaHostRegister(arena->nodes[0], bytes);
+                if (!arena->pinned[0] && retryPinByShard) return false;
+            }
+#endif
+            auto &owners = GetNumasMoeWeightArenaOwners();
+            std::lock_guard<std::mutex> lock(owners.mutex);
+            AssertInFastLLM(owners.weights.emplace(&weight, arena).second,
+                            "Host MoE matrix already owns registered storage.");
+            weight.numasData.swap(shards);
+            weight.isPinned = arena->pinned[0];
+            return true;
+        }
+    }
+
     static void RegisterNumasImpl(fastllm::Data *data,
                                   const std::string &weightType,
                                   bool allowPinned) {
@@ -3185,6 +3307,18 @@ namespace fastllm {
                 return ptr;
             };
 
+            auto writeShards = [&](size_t size, const auto &write) {
+                if (allowPinned && !HostMoeIsUnbound() && numaConfig->numaCnt > 1 &&
+                    StoreHostMoeMatrix(*data, size, numaConfig->numaCnt, usePinned, write, true)) {
+                    allPinned = data->isPinned;
+                    return;
+                }
+                for (int node = 0; node < numaConfig->numaCnt; ++node) {
+                    data->numasData[node] = static_cast<uint8_t*>(allocFunc(size, node));
+                    write(node, data->numasData[node]);
+                }
+            };
+
             if (data->dataType == DataType::DATA_GGUF_FORMAT) {
                 // GGUF格式需要先交错存储，然后再repack
                 // 因为repack会将多行打包在一起，打包后行之间的数据互相依赖，无法再做行交错
@@ -3199,10 +3333,9 @@ namespace fastllm {
                 // repack后bytesPerRow可能变化，重新获取
                 bytesPerRow = GetDataBytes((DataType)((int)data->dataType + data->ggmlType), 1, m);
                 uint8_t *srcData = data->cpuData;
-                for (int i = 0; i < numaConfig->numaCnt; i++) {
-                    data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                    memcpy(data->numasData[i], srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                }
+                writeShards(kPerNuma * bytesPerRow, [&](int i, uint8_t *dst) {
+                    memcpy(dst, srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                });
             } else {
                 data->Repack();
 
@@ -3232,10 +3365,9 @@ namespace fastllm {
                             NumasNVFP4Block32AllScalesFuseMagic(
                                 srcData, k, m);
                     }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    writeShards(kPerNuma * bytesPerRow, [&](int i, uint8_t *dst) {
+                        memcpy(dst, srcData + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    });
                 } else if (data->dataType == DataType::FP8_E4M3) {
                     std::vector <uint8_t> fp8Packed;
                     if (data->blockM == 128) {
@@ -3254,10 +3386,9 @@ namespace fastllm {
                         CrossSwigluReorder(fp8Packed.data(), k, bytesPerRow, reordered);
                         fp8Packed.swap(reordered);
                     }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    writeShards(kPerNuma * bytesPerRow, [&](int i, uint8_t *dst) {
+                        memcpy(dst, fp8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    });
                 } else if (data->dataType ==
                            DataType::NVFP4_BLOCK_16_E4M3) {
                     uint8_t *scaleBytes = GetNVFP4ScaleData(*data);
@@ -3270,15 +3401,13 @@ namespace fastllm {
                     data->dataType = DataType::NVFP4_BLOCK_16_E4M3_PACKED;
                     const size_t packedBytesPerRow =
                         GetDataBytes(data->dataType, 1, m);
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(
-                            kPerNuma * packedBytesPerRow, i);
+                    writeShards(kPerNuma * packedBytesPerRow, [&](int i, uint8_t *dst) {
                         PackCompactE4M3NVFP4Block16Rows(
                             k, m, data->cpuData, scaleBytes, data->scales,
                             sourceBlockK, sourceBlockM,
-                            data->numasData[i], i * kPerNuma, kPerNuma,
+                            dst, i * kPerNuma, kPerNuma,
                             isCrossSwiglu, false, true);
-                    }
+                    });
                     data->blockK = 1;
                     data->blockM = 16;
                 } else if (data->dataType == DataType::NVFP4) {
@@ -3298,24 +3427,22 @@ namespace fastllm {
                         data->numasNVFP4AllScalesFuseMagic = useBlock32;
                         const size_t packedBytesPerRow =
                             GetDataBytes(data->dataType, 1, m);
-                        for (int i = 0; i < numaConfig->numaCnt; i++) {
-                            data->numasData[i] = (uint8_t*)allocFunc(
-                                kPerNuma * packedBytesPerRow, i);
+                        writeShards(kPerNuma * packedBytesPerRow, [&](int i, uint8_t *dst) {
                             if (useBlock32) {
                                 Nvfp4ToFastllmNVFP4_BLOCK32_E8M0_Rows(
                                     k, m, (uint8_t*)data->cpuData,
                                     scaleBytes, data->blockK, data->blockM,
-                                    data->numasData[i], i * kPerNuma,
+                                    dst, i * kPerNuma,
                                     kPerNuma, isCrossSwiglu,
                                     &data->numasNVFP4AllScalesFuseMagic);
                             } else {
                                 Nvfp4ToFastllmNVFP4_BLOCK16_E8M0_Rows(
                                     k, m, (uint8_t*)data->cpuData,
                                     scaleBytes, data->blockK, data->blockM,
-                                    data->numasData[i], i * kPerNuma,
+                                    dst, i * kPerNuma,
                                     kPerNuma, isCrossSwiglu);
                             }
-                        }
+                        });
                     } else {
                         std::vector<uint8_t> nvfp4Packed;
                         Nvfp4ToFastllmNVFP4_BLOCK16(1, k, m, (uint8_t*)data->cpuData, scaleFloats, scaleBytes, data->blockK, data->blockM, nvfp4Packed);
@@ -3326,10 +3453,9 @@ namespace fastllm {
                             CrossSwigluReorder(nvfp4Packed.data(), k, packedBytesPerRow, reordered);
                             nvfp4Packed.swap(reordered);
                         }
-                        for (int i = 0; i < numaConfig->numaCnt; i++) {
-                            data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * packedBytesPerRow, i);
-                            memcpy(data->numasData[i], nvfp4Packed.data() + (size_t)i * kPerNuma * packedBytesPerRow, kPerNuma * packedBytesPerRow);
-                        }
+                        writeShards(kPerNuma * packedBytesPerRow, [&](int i, uint8_t *dst) {
+                            memcpy(dst, nvfp4Packed.data() + (size_t)i * kPerNuma * packedBytesPerRow, kPerNuma * packedBytesPerRow);
+                        });
                     }
                 } else if (data->dataType == DataType::INT8) {
                     std::vector <uint8_t> int8Packed;
@@ -3342,10 +3468,9 @@ namespace fastllm {
                         CrossSwigluReorder(int8Packed.data(), k, bytesPerRow, reordered);
                         int8Packed.swap(reordered);
                     }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], int8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    writeShards(kPerNuma * bytesPerRow, [&](int i, uint8_t *dst) {
+                        memcpy(dst, int8Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    });
                 } else if (data->dataType == DataType::INT4_NOZERO) {
                     std::vector <uint8_t> int4Packed;
                     Int4ToFastllmInt4PerchannelPacked(1, k, m, (uint8_t*)data->cpuData, data->mins.data(), data->scales.data(), int4Packed);
@@ -3357,10 +3482,9 @@ namespace fastllm {
                         CrossSwigluReorder(int4Packed.data(), k, bytesPerRow, reordered);
                         int4Packed.swap(reordered);
                     }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    writeShards(kPerNuma * bytesPerRow, [&](int i, uint8_t *dst) {
+                        memcpy(dst, int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    });
                 } else if (data->dataType == DataType::INT4_GROUP) {
                     if (m % data->groupCnt > 0) {
                         ErrorInFastLLM("RegisterNumas can't support data type int4g when m % groupCnt > 0.");
@@ -3389,10 +3513,9 @@ namespace fastllm {
                         CrossSwigluReorder(int4Packed.data(), k, bytesPerRow, reordered);
                         int4Packed.swap(reordered);
                     }
-                    for (int i = 0; i < numaConfig->numaCnt; i++) {
-                        data->numasData[i] = (uint8_t*)allocFunc(kPerNuma * bytesPerRow, i);
-                        memcpy(data->numasData[i], int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
-                    }
+                    writeShards(kPerNuma * bytesPerRow, [&](int i, uint8_t *dst) {
+                        memcpy(dst, int4Packed.data() + (size_t)i * kPerNuma * bytesPerRow, kPerNuma * bytesPerRow);
+                    });
                 } else {
                     ErrorInFastLLM("RegisterNumas can't support data type " + GetDataTypeName(data->dataType));
                 }
@@ -3449,37 +3572,7 @@ namespace fastllm {
             }
         };
 
-        struct NumasMoeWeightArena {
-            size_t bytes;
-            std::vector<uint8_t*> nodes;
-            std::vector<bool> pinned;
 
-            NumasMoeWeightArena(size_t bytes, int count)
-                : bytes(bytes), nodes(count, nullptr), pinned(count, false) {}
-
-            ~NumasMoeWeightArena() {
-                for (size_t node = 0; node < nodes.size(); ++node) {
-                    if (nodes[node] == nullptr) continue;
-#ifdef USE_CUDA
-                    if (pinned[node]) FastllmCudaHostUnregister(nodes[node]);
-#endif
-                    // allocate_aligned_numa reserves 63 extra bytes for alignment.
-                    free_aligned_numa(nodes[node], bytes + 63);
-                }
-            }
-        };
-
-        struct NumasMoeWeightArenaOwners {
-            std::mutex mutex;
-            std::unordered_map<const Data*, std::shared_ptr<NumasMoeWeightArena>> weights;
-        };
-
-        NumasMoeWeightArenaOwners &GetNumasMoeWeightArenaOwners() {
-            // Data can be destroyed during static teardown. Keep the registry
-            // alive; each arena is released when its last owning Data retires.
-            static auto *owners = new NumasMoeWeightArenaOwners;
-            return *owners;
-        }
     }
 
     void ReleaseNumasMoeWeightArena(Data *weight) {
@@ -3521,6 +3614,24 @@ namespace fastllm {
             Data *weight;
             size_t offset, shardBytes;
             bool interleave;
+            uint8_t *block32Scales;
+            std::vector<uint8_t> tileScalesSafe;
+        };
+        struct PackBlock32RowsOp : MultiThreadBaseOp {
+            const Entry &entry;
+            uint8_t *dst;
+            int firstRow, rows;
+            uint8_t &scalesSafe;
+
+            PackBlock32RowsOp(const Entry &entry, uint8_t *dst, int firstRow, int rows, uint8_t &scalesSafe)
+                : entry(entry), dst(dst), firstRow(firstRow), rows(rows), scalesSafe(scalesSafe) {}
+            void Run() override {
+                const Data &w = *entry.weight;
+                bool safe = true;
+                Nvfp4ToFastllmNVFP4_BLOCK32_E8M0_Rows(w.dims[0], w.dims[1], w.cpuData,
+                    entry.block32Scales, w.blockK, w.blockM, dst, firstRow, rows, entry.interleave, &safe);
+                scalesSafe = safe;
+            }
         };
         struct PrepareWeightOp : MultiThreadBaseOp {
             Data *weight;
@@ -3574,7 +3685,7 @@ namespace fastllm {
                 std::vector<std::vector<MultiThreadBaseOp*>> ops(config->numaCnt);
                 size_t task = 0;
                 for (const Entry &entry : entries) {
-                    if (interleave && !entry.interleave) continue;
+                    if (entry.block32Scales || (interleave && !entry.interleave)) continue;
                     storage.emplace_back(entry.weight, interleave);
                     ops[task++ % config->numaCnt].push_back(&storage.back());
                 }
@@ -3588,8 +3699,32 @@ namespace fastllm {
                 arenaBytes = (arenaBytes + 63) & ~(size_t)63;
                 entry.offset = arenaBytes;
                 entry.shardBytes = entry.weight->dataType == EXL3 ? entry.weight->GetBytes() / config->numaCnt :
-                    (entry.weight->dims[0] / config->numaCnt) * GetDataBytes(entry.weight->GetDataType(), 1, entry.weight->dims[1]);
+                    (entry.weight->dims[0] / config->numaCnt) * GetDataBytes(entry.block32Scales ? NVFP4_BLOCK_32_E8M0 : entry.weight->GetDataType(), 1, entry.weight->dims[1]);
                 arenaBytes += entry.shardBytes;
+            }
+            // Lazy registration can present just one GGUF or EXL3 matrix. Keep
+            // multi-matrix batches in their existing per-node arenas.
+            if (entries.size() == 1 && config->numaCnt > 1 && !HostMoeIsUnbound() &&
+                (!usePinned || arenaBytes <= batchBytes / config->numaCnt)) {
+                const Entry &entry = entries.front();
+                Data &weight = *entry.weight;
+                auto write = [&](int node, uint8_t *dst) {
+                    if (weight.dataType == EXL3)
+                        Exl3CopyRowShard(weight, dst, node, config->numaCnt);
+                    else
+                        memcpy(dst, weight.cpuData + node * entry.shardBytes, entry.shardBytes);
+                };
+                if (StoreHostMoeMatrix(weight, entry.shardBytes, config->numaCnt, usePinned, write, true)) {
+                    ReleaseSourceOp release(entries, 0, 1);
+                    release.Run();
+                    retainedReleaseBytes += release.retainedBytes;
+                    trimReleasedBuffers(false);
+                    weight.expansionBytes = weight.GetBytes();
+                    registered = true;
+                    entries.clear();
+                    arenaBytes = 0;
+                    return;
+                }
             }
             auto arena = std::make_shared<NumasMoeWeightArena>(arenaBytes, config->numaCnt);
             for (int node = 0; node < config->numaCnt; ++node) {
@@ -3612,7 +3747,21 @@ namespace fastllm {
                 {
                     std::vector<std::vector<MultiThreadBaseOp*>> copyOps(config->numaCnt);
                     for (size_t i = begin; i < end; ++i) {
-                        const Entry &entry = entries[i];
+                        Entry &entry = entries[i];
+                        if (entry.block32Scales) {
+                            // Unbound host weights have one shard. Tile whole rows so that even
+                            // a single tensor can use the decode pool, without a staging buffer.
+                            const int rows = entry.weight->dims[0];
+                            const size_t rowBytes = entry.shardBytes / rows;
+                            const int tileRows = std::max<size_t>(1, (512 * 1024) / rowBytes);
+                            entry.tileScalesSafe.resize((rows + tileRows - 1) / tileRows);
+                            uint8_t *dst = arena->nodes[0] + entry.offset;
+                            for (int row = 0; row < rows; row += tileRows) {
+                                copyOps[0].push_back(new PackBlock32RowsOp(entry, dst + row * rowBytes,
+                                    row, std::min(tileRows, rows - row), entry.tileScalesSafe[row / tileRows]));
+                            }
+                            continue;
+                        }
                         for (int node = 0; node < config->numaCnt; ++node) {
                             if (entry.weight->dataType == EXL3)
                                 copyOps[node].push_back(new NumasBatchRowShardOp(entry.weight,
@@ -3726,7 +3875,10 @@ namespace fastllm {
                     for (int node = 0; node < config->numaCnt; ++node) {
                         weight->numasData[node] = owner->nodes[node] + entryOffsets[i];
                     }
-                    weight->numasNVFP4AllScalesFuseMagic = false;
+                    if (!entry.tileScalesSafe.empty()) weight->dataType = NVFP4_BLOCK_32_E8M0;
+                    weight->numasNVFP4AllScalesFuseMagic = !entry.tileScalesSafe.empty() &&
+                        std::find(entry.tileScalesSafe.begin(), entry.tileScalesSafe.end(), 0) ==
+                        entry.tileScalesSafe.end();
                     weight->expansionBytes = weight->GetBytes();
                     weight->isPinned = allPinned(owner);
                 }
@@ -3742,7 +3894,13 @@ namespace fastllm {
                 continue;
             }
             const std::string &type = weights[i].second;
-            if ((weight->dataType != DATA_GGUF_FORMAT && weight->dataType != EXL3) ||
+            uint8_t *block32Scales = nullptr;
+            if (HostMoeIsUnbound() && weight->dataType == NVFP4 && weight->blockM == 32 &&
+                weight->dims.size() == 2 && weight->dims[0] > 0 && weight->dims[1] > 0 &&
+                !weight->isDiskWeight && NumasNvfp4Block32Available()) {
+                block32Scales = GetNVFP4ScaleData(*weight);
+            }
+            if ((!block32Scales && weight->dataType != DATA_GGUF_FORMAT && weight->dataType != EXL3) ||
                 (type != "linearSwiglu" && type != "linearColumn" && type != "linear")) {
                 flush();
                 RegisterNumas(weight, type);
@@ -3761,14 +3919,15 @@ namespace fastllm {
                     weight->dims[1] % (16 * config->numaCnt) == 0,
                     "EXL3 NUMA requires complete trellis tiles in each row shard.");
             }
-            const size_t sourceBytes = weight->GetBytes();
-            if (!entries.empty() && arenaBytes * config->numaCnt + sourceBytes > batchBytes) {
+            const size_t entryBytes = block32Scales ?
+                weight->dims[0] * GetDataBytes(NVFP4_BLOCK_32_E8M0, 1, weight->dims[1]) : weight->GetBytes();
+            if (!entries.empty() && arenaBytes * config->numaCnt + entryBytes > batchBytes) {
                 flush();
                 if (onProgress) onProgress(i);
             }
             arenaBytes = (arenaBytes + 63) & ~(size_t)63;
-            entries.push_back({weight, 0, 0, type == "linearSwiglu" && weight->dataType != EXL3});
-            arenaBytes += sourceBytes / config->numaCnt;
+            entries.push_back({weight, 0, 0, type == "linearSwiglu" && weight->dataType != EXL3, block32Scales, {}});
+            arenaBytes += entryBytes / config->numaCnt;
         }
         flush();
         if (registered) trimReleasedBuffers(true);
