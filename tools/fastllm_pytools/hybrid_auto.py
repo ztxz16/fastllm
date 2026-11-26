@@ -1216,6 +1216,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     if disk and not disk_graphs:
         graphs = False
     host = args.moe_device == "numa" or (args.moe_device == "cpu" and getattr(args, "_host_moe_shared", False))
+    pure_gpu = mode == "pp" and os.environ.get("FASTLLM_DSV41_MOE_CACHE_MODE") == "gpu"
     drafts = max(0, getattr(args, "dspark", 0))
     topk = max(model.topk, args.moe_experts)
     # Graph caches retain geometric warm capacities and one transient layout.
@@ -1223,10 +1224,10 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
     warm_batches = list(dict.fromkeys([1 << i for i in range(batch.bit_length())] + [batch]))
     shapes = list(warm_batches)
     pipeline = mode == "pp" and len(mapping) > 1
-    if hybrid and pipeline and drafts:
-        shapes = []  # PP DSpark captures independent verifier stages.
+    if hybrid and pipeline and drafts and not pure_gpu:
+        shapes = []  # Legacy PP DSpark captures independent verifier stages.
     if drafts:
-        shapes.extend(range(1, drafts + 2) if pipeline else
+        shapes.extend(range(1, drafts + 2) if pipeline and not pure_gpu else
                       [(b * (drafts + 1)) for b in warm_batches + [batch]])
     page_bytes = 64 * 1024
 
@@ -1271,6 +1272,29 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
 
         has_target = record_bytes(host_layers) and any(i in host_layers for i in layers)
         has_draft = record_bytes(draft_layers) and any(i in draft_layers for i in owners)
+        if pure_gpu and args.moe_cuda_cache != 0:
+            # RunPureV41Batch retains one bounded 8-row workspace per cache
+            # group/device, independently of request count and graph capture.
+            # Include the non-planar MXFP4 scratch upper bound; GGUF reuses
+            # the cache's existing fixed-capacity quantization workspace.
+            def pure_batch_bytes(k):
+                routes = 8 * k
+                return (page(8 * model.hidden * 2) + page(routes * model.intermediate * 2) +
+                        page(routes * model.hidden * 4) + 2 * page(routes * 4) +
+                        page(routes * model.intermediate * 4))
+            if host and has_target:
+                result["staging"][d] += pure_batch_bytes(topk)
+                if graphs:
+                    # Captured buffers cannot alias resizable eager storage.
+                    # Serial layers/lengths share each (layout, capacity, topk)
+                    # profile; at most eight physical capacities can coexist.
+                    profiles = min(8, sum(i in host_layers for i in layers))
+                    result["graphs"][d] += profiles * pure_batch_bytes(topk)
+            if has_draft:
+                result["staging"][d] += pure_batch_bytes(r["draft_topk"])
+                if draft_graphs:
+                    profiles = min(8, sum(i in draft_layers for i in owners))
+                    result["graphs"][d] += profiles * pure_batch_bytes(r["draft_topk"])
         if (host and has_target) or has_draft:
             # Eager one-row, eager multi-row and full-graph mailbox rings
             # coexist. Warmup/prefill tails can retain the eight-row eager
@@ -1280,14 +1304,14 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                 capacities = [16, min(model.experts, eager_rows * topk)]
                 if not drafts:
                     capacities.append(topk)  # ordinary decode mailbox
-                if graphs:
+                if graphs and not pure_gpu:
                     capacities.append(16)
                 result["staging"][d] += upload_bytes(host_layers, capacities)
             if has_draft:
                 capacities = [min(r["draft_experts"], min(32, model.dspark_block_size * (batch if len(mapping) == 1 else 1)) * r["draft_topk"])]
                 if model.dspark_block_size == 1:
                     capacities += [16, r["draft_topk"]]
-                if draft_graphs:
+                if draft_graphs and not pure_gpu:
                     capacities.append(16)
                 result["staging"][d] += upload_bytes(draft_layers, capacities)
             if chunk > r["window"]:
@@ -1317,7 +1341,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                     # Pinned route payload and CPU output live for every slot;
                     # charge RAM separately instead of hiding it in GPU reserve.
                     result["host_graphs"][d] += disk_mailbox_bytes(rows, model.experts, topk)
-                if i >= resident and i in r.get("gguf_layers", ()):
+                if not pure_gpu and i >= resident and i in r.get("gguf_layers", ()):
                     # NativeMoeMailbox::Layer owns two independent GGUF
                     # branches. Their scratch is bounded at 8 rows * 16
                     # routes even for a smaller verification slot.
@@ -1345,6 +1369,10 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
             # Same bounded shape policy as target verification. Other topologies
             # retain their request-local draft graphs.
             draft_batches = warm_batches + [batch] if len(mapping) == 1 else [1] * batch
+            if pure_gpu and len(mapping) > 1:
+                # GPU-cache full graphs enable batched drafts on the final PP
+                # device. Request-local fallback slots can remain alive too.
+                draft_batches += warm_batches + [batch]
             for requests in draft_batches:
                 rows = requests * model.dspark_block_size
                 result["graphs"][d] += small_q5_workspace(rows, [i for i in owners if i >= model.layers], d)
@@ -1364,7 +1392,7 @@ def _v41_runtime_bytes(args, model, mode, mapping, resident, context, batch, chu
                     if disk_graphs and (mode != "tp" or d == next(iter(mapping))):
                         result["host_graphs"][d] += disk_mailbox_bytes(rows, r["draft_experts"], r["draft_topk"])
                     result["graphs"][d] += page(routes * (4*model.hidden + 4*model.intermediate) + rows*model.hidden*2)
-                    if i in r.get("gguf_layers", ()):
+                    if not pure_gpu and i in r.get("gguf_layers", ()):
                         result["graphs"][d] += 2 * gguf_scratch
             if len(mapping) == 1:
                 # Every request retains its own q through target verification,

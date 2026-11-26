@@ -1122,6 +1122,24 @@ class HybridAutoTest(unittest.TestCase):
             b = auto._v41_runtime_bytes(a, g, 'pp', {0:1, 1:1}, 0, 8192, 1, 1024)
         self.assertEqual(b['staging'][1]-b['staging'][0], (16+7*3)*24*MiB + 2*64*1024)
 
+    def test_v41_pure_gpu_verifier_workspace_is_bounded_and_counts_draft(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime['expert_records'] = {0: 8*MiB, 2: 8*MiB, 4: 24*MiB, 5: 24*MiB}
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        def reserve(batch):
+            return auto._v41_runtime_bytes(a, g, 'pp', {0:1, 1:1}, 0, 8192, batch, 1024)['staging']
+        with patch.dict(os.environ, {'FASTLLM_CUDA_GRAPH':'0'}, clear=True):
+            hybrid = {b: reserve(b) for b in [1, 4]}
+            os.environ['FASTLLM_DSV41_MOE_CACHE_MODE'] = 'gpu'
+            extra = {b: {d: reserve(b)[d]-hybrid[b][d] for d in (0,1)} for b in [1,4]}
+            self.assertEqual(extra[1], extra[4])
+            self.assertGreaterEqual(extra[1][0], 8*g.hidden*2 + 8*g.topk*(g.intermediate*2+g.hidden*4))
+            self.assertGreater(extra[1][1], extra[1][0])  # independent draft cache group
+            a.moe_cuda_cache = 0
+            pure = reserve(1)
+            del os.environ['FASTLLM_DSV41_MOE_CACHE_MODE']
+            self.assertEqual(pure, reserve(1))
+
     def test_v41_pp_upload_uses_global_record_and_coexisting_batch_rings(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
         g.runtime["expert_records"] = {0: 8*MiB, 2: 24*MiB}
@@ -1133,6 +1151,21 @@ class HybridAutoTest(unittest.TestCase):
         # restore record. Both PP devices use the group's largest record.
         expected = (16 + 8*g.topk + 16 + 3)*24*MiB + 3*64*1024
         self.assertEqual(b["staging"], {0: expected, 1: expected})
+
+    def test_v41_pure_full_graph_has_no_hybrid_upload_ring(self):
+        g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)
+        g.runtime['expert_records'] = {0: 8*MiB, 2: 8*MiB, 4: 24*MiB, 5: 24*MiB}
+        a = args(auto=True, dspark=7, moe_device_layers=-1)
+        with patch.dict(os.environ, {'FASTLLM_DSV41_MOE_CACHE_MODE':'gpu',
+                                     'FASTLLM_CUDA_GRAPH':'0'}, clear=True):
+            eager = auto._v41_runtime_bytes(a, g, 'pp', {0:1, 1:1}, 0, 8192, 2, 1024)
+            os.environ['FASTLLM_CUDA_GRAPH'] = '1'
+            captured = auto._v41_runtime_bytes(a, g, 'pp', {0:1, 1:1}, 0, 8192, 2, 1024)
+        # Pure graph replay uses cache records directly. It retains its own
+        # arithmetic buffers, but never allocates a CPU-miss upload ring.
+        self.assertEqual(captured['staging'], eager['staging'])
+        self.assertGreater(captured['graphs'][0], eager['graphs'][0])
+        self.assertGreater(captured['graphs'][1], captured['graphs'][0])
 
     def test_v41_auto_preserves_a_usable_draft_cache_when_shrinking_chunk(self):
         g = auto.geometry(self.dspark_metadata(), "fp4", 0, 7)

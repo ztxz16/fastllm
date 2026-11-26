@@ -1377,6 +1377,13 @@ if (UNIT_TEST)
         add_executable(exl3_moe_test test/basic/test_exl3_moe.cpp)
         target_link_libraries(exl3_moe_test PRIVATE fastllm)
         target_include_directories(exl3_moe_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        if (USE_NUMAS AND NOT USE_ROCM AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 11.7)
+            add_executable(exl3_pure_cache_test test/basic/test_exl3_pure_cache.cpp)
+            target_link_libraries(exl3_pure_cache_test PRIVATE fastllm)
+            target_include_directories(exl3_pure_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+            add_test(NAME exl3_pure_cache COMMAND exl3_pure_cache_test)
+            set_tests_properties(exl3_pure_cache PROPERTIES LABELS "cuda;moe" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        endif()
         if (NOT USE_ROCM AND NOT CUDA_NO_TENSOR_CORE)
             add_executable(exl3_maya_streams_test test/basic/test_exl3_maya_streams.cpp)
             target_include_directories(exl3_maya_streams_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
@@ -1802,6 +1809,7 @@ if (UNIT_TEST)
             endif()
             add_executable(disk_v41_gguf_cache_test test/basic/test_disk_v41_gguf_cache.cpp)
             target_link_libraries(disk_v41_gguf_cache_test PRIVATE fastllm)
+            target_include_directories(disk_v41_gguf_cache_test PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
             fastllm_add_checked_test(cuda_v41_gguf_large_prefill disk_v41_gguf_cache_test
                 "PASS: large V4.1 streamed prefill" 300 --large-prefill)
             set_tests_properties(cuda_v41_gguf_large_prefill PROPERTIES LABELS "cuda;gguf" RUN_SERIAL TRUE
@@ -4409,7 +4417,9 @@ if (UNIT_TEST)
                     "FULL_GRAPH_CHAIN_PASS" 180 --fullgraph)
                 fastllm_add_checked_test(cuda_dsv41_moe_pp_fullgraph cuda_dsv41_moe_cache_test
                     "PP_MAILBOX_GRAPH_PASS" 180 --pp-fullgraph)
-                set_tests_properties(cuda_dsv41_moe_pp_fullgraph PROPERTIES
+                fastllm_add_checked_test(cuda_dsv41_moe_pure_fullgraph cuda_dsv41_moe_cache_test
+                    "PP_MAILBOX_GRAPH_PASS" 180 --dual --pure-fullgraph)
+                set_tests_properties(cuda_dsv41_moe_pp_fullgraph cuda_dsv41_moe_pure_fullgraph PROPERTIES
                     LABELS "cuda;moe;numa;multigpu" RUN_SERIAL TRUE
                     ENVIRONMENT "OMP_NUM_THREADS=1;FT_NUMAS=1;FT_THREADS=8")
                 fastllm_add_checked_test(cuda_dsv41_moe_pageable_fullgraph cuda_dsv41_moe_cache_test

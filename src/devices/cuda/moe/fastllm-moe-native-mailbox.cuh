@@ -322,6 +322,7 @@ struct NativeMoeMailbox {
         NativeMoeControl *host = nullptr, *mapped = nullptr;
         float *hostData = nullptr, *mappedData = nullptr;
         std::shared_ptr<ComputeScratch> compute;
+        std::shared_ptr<PureBatchWorkspace> pure;
         int32_t *slots = nullptr; // resident, staged, GPU route IDs
         int32_t *routeMap = nullptr;
         cudaGraphExec_t exec = nullptr, finishExec = nullptr;
@@ -381,6 +382,9 @@ struct NativeMoeMailbox {
     std::vector<std::unique_ptr<Layer>> fullLayers;
     using ScratchKey = std::array<int, 7>;
     std::map<ScratchKey, std::weak_ptr<ComputeScratch>> fullScratch;
+    std::map<ScratchKey, std::weak_ptr<PureBatchWorkspace>> pureFullScratch;
+    Layer *CreatePureFull(int table, const fastllm::Data &input, const fastllm::Data &index,
+        const fastllm::Data &score, fastllm::Data &output, int layer, cudaGraph_t sharedGraph);
     std::thread dispatcher;
     std::vector<int> dispatcherCpus;
     // Request cleanup may release a draft graph on a consumer thread while
@@ -1084,7 +1088,7 @@ struct NativeMoeMailbox {
         std::vector<cudaEvent_t> events;
         for (const auto &entry : groups) for (auto *w : entry.second) {
             for (auto e : {w->begin, w->residentDone, w->uploadBegin, w->uploadDone, w->done})
-                events.push_back(e);
+                if (e) events.push_back(e);
             // Each backend retires its own CPU results and cache admissions.
             // Retain its last completion even when another backend ends the graph.
             if (w != entry.second.back()) events.push_back(w->completed);
@@ -1104,7 +1108,8 @@ struct NativeMoeMailbox {
         for (const auto &entry : groups) locks.emplace_back(entry.first->lifecycleMutex);
         for (const auto &entry : groups) {
             entry.first->Finish(true);
-            if (!entry.first->cache.frequencyActive) return false;
+            if (!entry.first->cache.frequencyActive &&
+                std::any_of(entry.second.begin(), entry.second.end(), [](Layer *w) { return !w->pure; })) return false;
         }
         // Complete allocations and thread creation before publishing any queue.
         // If preparation throws, no dispatcher is left waiting for an unlaunched graph.
@@ -1113,17 +1118,25 @@ struct NativeMoeMailbox {
         for (const auto &entry : groups) {
             auto &owner = *entry.first;
             pending.emplace_back();
-            for (auto *w : entry.second)
+            for (auto *w : entry.second) if (!w->pure)
                 pending.back().push_back({w, routePhase != FastllmMoeRoutePhase::Unspecified ? routePhase :
                     (w->rows > 1 ? FastllmMoeRoutePhase::Verify : FastllmMoeRoutePhase::Decode)});
-            if (!owner.dispatcher.joinable()) owner.dispatcher = std::thread([p = &owner] { p->Run(); });
+            if (!pending.back().empty() && !owner.dispatcher.joinable()) owner.dispatcher = std::thread([p = &owner] { p->Run(); });
         }
         size_t groupIndex = 0;
         for (const auto &entry : groups) {
             auto &owner = *entry.first;
             std::lock_guard<std::mutex> lock(owner.mutex);
+            if (std::any_of(entry.second.begin(), entry.second.end(), [](Layer *w) { return bool(w->pure); })) {
+                owner.cache.frequencyResidencyDirty = true;
+                ResetEpResidency(owner.cache);
+                if (owner.cache.pureBatch && owner.cache.pureBatch->done)
+                    checkCudaErrors("Pure full replay dependency",
+                        cudaStreamWaitEvent(cudaStreamPerThread, owner.cache.pureBatch->done, 0));
+            }
             for (auto *layer : entry.second) {
                 auto &w = *layer;
+                if (w.pure) continue;
                 __atomic_store_n(&w.host->published, 0u, __ATOMIC_RELEASE);
                 __atomic_store_n(&w.host->computed, 0u, __ATOMIC_RELEASE);
                 if (w.rows > 1) {
@@ -1136,7 +1149,9 @@ struct NativeMoeMailbox {
             owner.launchCanceled.store(false, std::memory_order_release);
             owner.queue.swap(pending[groupIndex++]);
         }
-        for (const auto &entry : groups) entry.first->wake.notify_one();
+        for (const auto &entry : groups)
+            if (std::any_of(entry.second.begin(), entry.second.end(), [](Layer *w) { return !w->pure; }))
+                entry.first->wake.notify_one();
         if (!FastllmCudaGraphLaunch(exec)) {
             // Cancel all waiters before draining any one backend.
             for (const auto &entry : groups)
@@ -1151,7 +1166,7 @@ struct NativeMoeMailbox {
             return false;
         }
         for (const auto &entry : groups) {
-            for (auto *w : entry.second) { w->pending = true; w->timed = timed; }
+            for (auto *w : entry.second) { w->pending = true; w->timed = timed && !w->pure; }
             entry.first->fullLast = entry.second.back();
         }
         return true;

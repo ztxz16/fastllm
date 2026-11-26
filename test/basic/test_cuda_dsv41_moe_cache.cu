@@ -459,16 +459,17 @@ static void CheckCompleteNativeGraphs(std::vector<Data *> &weights, int layer) {
     std::printf("COMPLETE_NATIVE_GRAPH_PASS %d replays, rows 1..4097, topk 1/3/6/16\n", checks);
 }
 
-static void CheckVerifierMailbox(std::vector<Data *> *weights) {
+static void CheckVerifierMailbox(std::vector<Data *> *weights, bool pure = false) {
+    if (pure) setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
     const int hidden=weights[0][2]->dims[1], experts=weights[0].size()/2-1, topk=6;
-    const bool prepare = weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0;
+    const bool prepare = !pure && weights[0][2]->dataType == NVFP4_BLOCK_32_E8M0;
     if (prepare) {
         std::string error;
         Require(kernels::Configure(R"({"mode":"quick","families":["moe.nvfp4.gate_swiglu_down"]})", error),
             "verifier kernel policy configuration");
     }
     int checks=0;
-    for (int rows : {2,3,5,6,8,9,12,16,17,24,32,48,65}) {
+    for (int rows : {1,2,3,5,6,8,9,10,12,16,17,24,32,48,65}) {
         Data input(BFLOAT16,{rows,hidden}), ids[2], scores[2], output[2]; Gpu(input);
         for(int l=0;l<2;++l){ids[l].dataType=INT32;ids[l].Resize({rows,topk});Gpu(ids[l]);
             scores[l].dataType=FLOAT32;scores[l].Resize({rows,topk});Gpu(scores[l]);
@@ -478,6 +479,28 @@ static void CheckVerifierMailbox(std::vector<Data *> *weights) {
         Check(cudaGraphAddEmptyNode(&empty,shared,nullptr,0));
         void *scope=FastllmCudaBeginMoeDecode(weights[0].data(),weights[0].size(),topk);
         Require(scope,"verifier mailbox initial scope");FastllmCudaEndMoeDecode(scope);
+        if (pure && rows == 1) {
+            // Full-model promotion can pass an address from a parent graph's
+            // allocation node before that parent has ever run. Child creation
+            // must warm kernels on private storage, not dereference this input.
+            cudaGraph_t parent;
+            cudaGraphNode_t allocation;
+            cudaMemAllocNodeParams params{};
+            params.poolProps.allocType = cudaMemAllocationTypePinned;
+            params.poolProps.location.type = cudaMemLocationTypeDevice;
+            params.poolProps.location.id = FastllmCudaGetDevice();
+            params.bytesize = input.GetBytes();
+            Check(cudaGraphCreate(&parent, 0));
+            Check(cudaGraphAddMemAllocNode(&allocation, parent, nullptr, 0, &params));
+            Data deferred, destination;
+            deferred.FakeFrom(input, 0); deferred.Resize(input.dims); deferred.cudaData = params.dptr;
+            void *child = nullptr;
+            void *handle = FastllmCudaCreateNativeMoeFullGraph(deferred, ids[0], scores[0],
+                destination, weights[0].data(), weights[0].size(), 0, nullptr, &child);
+            Require(handle && child, "pure graph read deferred parent allocation during warmup");
+            FastllmCudaReleaseNativeMoeFullGraph(handle);
+            Check(cudaGraphDestroy(parent));
+        }
         // Invalid views must be rejected before capturing a device access.
         auto rejected = [&](Data &destination) {
             void *child = nullptr;
@@ -486,7 +509,8 @@ static void CheckVerifierMailbox(std::vector<Data *> *weights) {
                 "invalid verifier mailbox view accepted");
         };
         for (Data *view : {&input, &ids[0], &scores[0]}) {
-            ++view->strides[0]; rejected(output[0]); --view->strides[0];
+            const int stride = rows == 1 ? 1 : 0;
+            ++view->strides[stride]; rejected(output[0]); --view->strides[stride];
             const auto devices = view->dataDeviceIds;
             view->dataDeviceIds = {1}; rejected(output[0]); view->dataDeviceIds = devices;
             view->multiDeviceData = true; rejected(output[0]); view->multiDeviceData = false;
@@ -546,6 +570,7 @@ static void CheckVerifierMailbox(std::vector<Data *> *weights) {
         FastllmCudaGraphMemoryPoolRelease(reserved);
     }
     if (prepare) { std::string error; Require(kernels::Configure(R"({"mode":"off"})", error), "reset kernel policy"); }
+    if (pure) unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
     std::printf("VERIFY_MAILBOX_GRAPH_PASS %d dependent layer checks; rows 2/3/5/6/8/9/12/16/17/24/32/48/65\n",checks);
 }
 
@@ -696,6 +721,7 @@ static void CheckPipelineMailbox(std::vector<Data *> *weights) {
             Compare(a, b, "PP mailbox / NUMA oracle mismatch"); ++checks;
         }
         FastllmCudaGraphExecDestroy(untimed); FastllmCudaGraphExecDestroy(exec); FastllmCudaGraphDestroy(graph);
+        FastllmCudaReleaseNativeMoeFullGraph(handle);
     }
     Check(cudaSetDevice(0));
     std::printf("PP_MAILBOX_GRAPH_PASS %d checks; rows 1/2/6/9/32, devices 0/1/0\n", checks);
@@ -953,6 +979,23 @@ int main(int argc, char **argv) {
         // Pure GPU execution cannot use hybrid's zero-resident streaming
         // fallback. Invalid overrides must reject that mode on this device.
         setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
+        // A partial draft cache can pin a complete top-3 row even when its
+        // total budget is below the maximum top-k accepted by the backend.
+        setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", std::to_string(record * 12).c_str(), 1);
+        Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "small pure cache registration");
+        Data draftInput(BFLOAT16, {6, hidden}), draftOutput;
+        Gpu(draftInput);
+        for (int routes : {3, 13}) {
+            Data ids(INT32, {6, routes}), scores(FLOAT32, {6, routes});
+            Gpu(ids); Gpu(scores);
+            void *graph = nullptr;
+            void *handle = FastllmCudaCreateNativeMoeFullGraph(draftInput, ids, scores, draftOutput,
+                weights[0].data(), weights[0].size(), 0, nullptr, &graph);
+            Require((handle != nullptr) == (routes == 3) && (graph != nullptr) == (routes == 3),
+                    "small pure cache did not honor its actual top-k");
+            if (handle) FastllmCudaReleaseNativeMoeFullGraph(handle);
+        }
+        FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
         for (const char *value : {"0", "1", "-1", "1g", "bad", "18446744073709551616"}) {
             setenv("FASTLLM_MOE_CUDA_CACHE_BYTES_0", value, 1);
             Require(FastllmCudaPrepareMoeCache(layers, tables, [] {}), "host preparation rejected device override");
@@ -1411,6 +1454,19 @@ int main(int argc, char **argv) {
                     Compare(actual, expected, "verify mixed CPU/GPU/oracle mismatch");
                     ++verifyChecks;
                 };
+                // A GPU-only verifier must match the independent quantized
+                // oracle without assigning any routes to the NUMA scheduler.
+                // The 16/24-slot caches cannot hold rows*topk, so this also
+                // covers bounded chunks, duplicate experts and alternating GPUs.
+                uint64_t beforePure[8]{}, afterPure[8]{};
+                Require(fastllm_moe_cuda_cache_route_stats(device, beforePure), "pure verify stats before");
+                setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    Require(runVerify(repeat == 0), "pure GPU verifier rejected");
+                    checkResult();
+                }
+                Require(fastllm_moe_cuda_cache_route_stats(device, afterPure), "pure verify stats after");
+                Require(afterPure[5] == beforePure[5], "pure GPU verifier executed CPU experts");
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "hybrid", 1);
                 unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");
                 Require(runVerify(), "cold verifier rejected");
@@ -1500,9 +1556,10 @@ int main(int argc, char **argv) {
                 Check(cudaGraphAddEmptyNode(&empty, shared, nullptr, 0));
                 setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
                 void *rejectedGraph = nullptr;
-                Require(!FastllmCudaCreateNativeMoeFullGraph(chainInput, chainIds[0], chainScores[0],
-                    chainOut[0], weights[0].data(), weights[0].size(), 0, shared, &rejectedGraph) && !rejectedGraph,
-                    "pure GPU mode silently entered the CPU mailbox");
+                void *pureHandle = FastllmCudaCreateNativeMoeFullGraph(chainInput, chainIds[0], chainScores[0],
+                    chainOut[0], weights[0].data(), weights[0].size(), 0, shared, &rejectedGraph);
+                Require(pureHandle && rejectedGraph, "pure GPU full graph rejected");
+                FastllmCudaReleaseNativeMoeFullGraph(pureHandle);
                 unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
                 for (int l = 0; l < 2; ++l) {
                     handles[l] = FastllmCudaCreateNativeMoeFullGraph(l ? chainOut[0] : chainInput,
@@ -1594,6 +1651,17 @@ int main(int argc, char **argv) {
         }
 
         if (option("--verify-mailbox") && !dual) CheckVerifierMailbox(weights);
+        if (option("--pure-fullgraph")) {
+            FastllmCudaReleaseMoeCache(weights[0].data(), weights[0].size());
+            FastllmCudaMoeCacheLayer pureLayers[2];
+            for (int l = 0; l < 2; ++l)
+                pureLayers[l] = {weights[l].data(), int(weights[l].size()), true, 10.f};
+            Require(FastllmCudaPrepareMoeCache(pureLayers, 2, [] {}), "pure graph cache preparation");
+            CheckVerifierMailbox(weights, true);
+            setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
+            CheckPipelineMailbox(weights);
+            unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+        }
         if (option("--pp-fullgraph")) CheckPipelineMailbox(weights);
         unsetenv("FASTLLM_DSV41_MOE_CACHE_PREFETCH");
         unsetenv("FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS");

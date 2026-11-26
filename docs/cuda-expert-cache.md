@@ -558,8 +558,8 @@ Optional diagnostics and tuning (the defaults require no environment flags):
 
 | Variable | Meaning |
 | --- | --- |
-| `FASTLLM_DSV41_MOE_CACHE_MODE=gpu` | Pure GPU cache for single-token decode; misses refill from NUMA. Default `hybrid`. Verify retains its NUMA fallback in pure mode. |
-| `FASTLLM_DSV41_MOE_CACHE_PREFETCH=N` | Single-token admission interval, default 31; adjusted to be coprime with the layer count. Zero disables admission for both decode and verify. Positive values enable cost-controlled verify admission each call. |
+| `FASTLLM_DSV41_MOE_CACHE_MODE=gpu` | Pure GPU expert execution for single-token decode and DSpark verification/draft batches on CUDA/PP, including native MXFP4, block-128 FP8, GGUF and EXL3 experts. Misses refill from host weights; batch routes are deduplicated and grouped on GPU. Verification chunks are bounded by eight rows and the current layer's cache partition; the partition must fit at least one row's top-k. Full decode/verify graphs and batched DSpark draft graphs retain device-side routing, refill, grouped compute and reduction; replay starts no CPU expert dispatcher. Captured scratch is shared by compatible bounded shapes and kept separate from resizable eager scratch. Default `hybrid`; this option does not select TP/EP. |
+| `FASTLLM_DSV41_MOE_CACHE_PREFETCH=N` | Hybrid-mode single-token admission interval, default 31; adjusted to be coprime with the layer count. Zero disables hybrid admission for both decode and verify. Positive values enable cost-controlled verify admission each call. Pure GPU mode always demand-refills missing experts. |
 | `FASTLLM_DSV41_MOE_CACHE_GPU_EXPERTS=N` | Override the measured split for diagnostics: 0–top-k decode routes, or up to 15 resident verify groups. Unset uses the scheduler. |
 | `FASTLLM_DSV41_MOE_CACHE_TRACE=1` | Per-device route, residency and admission counters every 1024 calls, for decode and verify. |
 

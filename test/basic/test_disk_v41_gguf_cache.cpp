@@ -1,3 +1,4 @@
+#include "pure_moe_graph_test.h"
 #include "fastllm.h"
 #if defined(USE_CUDA) && !defined(USE_ROCM)
 #include "disk_moe_graph_test.h"
@@ -21,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -581,7 +583,7 @@ static void TestSharedResident(Fixture &f, int device) {
 // Exercise cached decode on both GPUs without admitting every miss.
 // Check admitted bytes independently: a staged interleaved record must never
 // be published as canonical, even when its first execution was correct.
-static void TestCooperativeDecode(Fixture &f, bool residentOracle = false) {
+static void TestCooperativeDecode(Fixture &f, bool residentOracle = false, bool pureOnly = false, int selected = 3) {
     if (FastllmCudaGetDeviceCount() < 2) return;
     HostMoePlacementScope placement(true);
     constexpr int experts=24;
@@ -625,10 +627,11 @@ static void TestCooperativeDecode(Fixture &f, bool residentOracle = false) {
             d->dataDevice=CUDA; d->dataDeviceIds={0}; d->Allocate(false);
         }
     }
+    std::map<std::pair<int,int>, std::unique_ptr<PureMoeGraphTest>> pureGraphs;
     bool dual=false, resident=false, checkedPayload=false;
     uint64_t totalGpu=0, totalCpu=0, totalHits=0, totalAdmissions=0;
     for (int pass=0; pass<64; ++pass) {
-        const int rows=pass%5==4 ? 2+(pass/5)%7 : 1, topk=3, device=pass%2, offset=3*(pass/8);
+        const int rows=pass%5==4 ? 2+(pass/5)%7 : 1, topk=selected, device=pass%2, offset=3*(pass/8);
         FastllmCudaSetDevice(device);
         Data x(BFLOAT16,{rows,f.hidden}),ids(INT32,{rows,topk}),scores(FLOAT32,{rows,topk}),out;
         x.Allocate(false);ids.Allocate(false);scores.Allocate(false);
@@ -671,66 +674,106 @@ static void TestCooperativeDecode(Fixture &f, bool residentOracle = false) {
         x.ToDevice(CUDA,{device},true);ids.ToDevice(CUDA,{device},true);scores.ToDevice(CUDA,{device},true);
         uint64_t before[2][8]{},after[2][8]{};
         for (int d : {0,1}) Check(fastllm_moe_cuda_cache_route_stats(d,before[d]),"decode stats before");
-        int submitted=0;
-        Check(FastllmCudaMergeMOEHybridOnDevices(x,ids,scores,out,weights.data(),weights.size(),0,
-            {0,1},[&] { ++submitted; }),"cooperative decode rejected");
-        Check(submitted==1 && FastllmCudaGetDevice()==device,"decode callback or device restore");
-        out.ToDevice(CPU);
-        for (int r=0; r<rows; ++r) {
-            std::vector<int> order(topk);
-            for (int k=0; k<topk; ++k) order[k]=k;
-            std::stable_sort(order.begin(),order.end(),[&](int a,int b) { return hostIds[r*topk+a]<hostIds[r*topk+b]; });
-            bool matched=false;
-            for (int mask=0; mask<(1<<topk) && !matched; ++mask) {
-                matched=true;
-                for (int c=0; c<f.hidden && matched; ++c) {
-                    float sum=0;
-                    for (int k : order) sum+=(mask&(1<<k) ? gpuOracle : cpuOracle)[size_t(r*topk+k)*f.hidden+c];
-                    matched=Float32ToBFloat16RNEBits(sum)==((uint16_t*)out.cpuData)[r*f.hidden+c];
-                }
-            }
-            Check(matched,"cooperative decode differs from every CPU/GPU route combination");
-        }
         uint64_t routes=0,computed=0,hits=0;
-        std::vector<bool> cached(experts,false);
-        for (int d : {0,1}) {
-            Check(fastllm_moe_cuda_cache_route_stats(d,after[d]),"decode stats after");
-            routes+=after[d][1]-before[d][1];
-            computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
-            hits+=after[d][6]-before[d][6];
-            totalGpu+=after[d][4]-before[d][4];
-            totalCpu+=after[d][5]-before[d][5];
-            totalHits+=after[d][6]-before[d][6];
-            totalAdmissions+=after[d][7]-before[d][7];
-            FastllmCudaSetDevice(d);
-            FastllmCudaMoePrefillResidents view;
-            Check(FastllmCudaGetMoePrefillResidents(weights.data(),experts,view,false),"decode residents unavailable");
-            for (size_t i=0; i<view.weights.size(); ++i) if (view.weights[i]) {
-                if (i%2==0) {
-                    Check(!cached[i/2],"cooperative admission duplicated a peer-resident expert");
-                    cached[i/2]=true;
+        if (!pureOnly) {
+            int submitted=0;
+            Check(FastllmCudaMergeMOEHybridOnDevices(x,ids,scores,out,weights.data(),weights.size(),0,
+                {0,1},[&] { ++submitted; }),"cooperative decode rejected");
+            Check(submitted==1 && FastllmCudaGetDevice()==device,"decode callback or device restore");
+            out.ToDevice(CPU);
+            for (int r=0; r<rows; ++r) {
+                std::vector<int> order(topk);
+                for (int k=0; k<topk; ++k) order[k]=k;
+                std::stable_sort(order.begin(),order.end(),[&](int a,int b) { return hostIds[r*topk+a]<hostIds[r*topk+b]; });
+                bool matched=false;
+                for (int mask=0; mask<(1<<topk) && !matched; ++mask) {
+                    matched=true;
+                    for (int c=0; c<f.hidden && matched; ++c) {
+                        float sum=0;
+                        for (int k : order) sum+=(mask&(1<<k) ? gpuOracle : cpuOracle)[size_t(r*topk+k)*f.hidden+c];
+                        matched=Float32ToBFloat16RNEBits(sum)==((uint16_t*)out.cpuData)[r*f.hidden+c];
+                    }
                 }
-                std::vector<uint8_t> actual(canonical[i+2].size());
-                FastllmCudaCopyFromDeviceToHost(actual.data(),const_cast<void *>(view.weights[i]),actual.size());
-                Check(actual==canonical[i+2],"cooperative admission published noncanonical bytes");
-                checkedPayload=true;
+                Check(matched,"cooperative decode differs from every CPU/GPU route combination");
             }
+            std::vector<bool> cached(experts,false);
+            for (int d : {0,1}) {
+                Check(fastllm_moe_cuda_cache_route_stats(d,after[d]),"decode stats after");
+                routes+=after[d][1]-before[d][1];
+                computed+=after[d][4]-before[d][4]+after[d][5]-before[d][5];
+                hits+=after[d][6]-before[d][6];
+                totalGpu+=after[d][4]-before[d][4];
+                totalCpu+=after[d][5]-before[d][5];
+                totalHits+=after[d][6]-before[d][6];
+                totalAdmissions+=after[d][7]-before[d][7];
+                FastllmCudaSetDevice(d);
+                FastllmCudaMoePrefillResidents view;
+                Check(FastllmCudaGetMoePrefillResidents(weights.data(),experts,view,false),"decode residents unavailable");
+                for (size_t i=0; i<view.weights.size(); ++i) if (view.weights[i]) {
+                    if (i%2==0) {
+                        Check(!cached[i/2],"cooperative admission duplicated a peer-resident expert");
+                        cached[i/2]=true;
+                    }
+                    std::vector<uint8_t> actual(canonical[i+2].size());
+                    FastllmCudaCopyFromDeviceToHost(actual.data(),const_cast<void *>(view.weights[i]),actual.size());
+                    Check(actual==canonical[i+2],"cooperative admission published noncanonical bytes");
+                    checkedPayload=true;
+                }
+            }
+            Check(routes==uint64_t(rows*topk) && computed==routes,"decode lost or duplicated routes");
         }
-        Check(routes==uint64_t(rows*topk) && computed==routes,"decode lost or duplicated routes");
+        if (pureOnly) {
+            // Demand-refill every verifier route on GPU, including a route
+            // set larger than the 16-slot cache. The established independent
+            // per-expert GPU oracle preserves V4.1's quantization boundaries.
+            setenv("FASTLLM_DSV41_MOE_CACHE_MODE", "gpu", 1);
+            FastllmCudaSetDevice(device);
+            Data pure;
+            Check(FastllmCudaMergeMOEHybrid(x,ids,scores,pure,weights.data(),weights.size(),0),
+                "pure GGUF verifier rejected");
+#if CUDART_VERSION >= 11070
+            auto &graph = pureGraphs[{device,rows}];
+            if (!graph) graph = std::make_unique<PureMoeGraphTest>();
+            pure.CopyFrom(graph->Run(x,ids,scores,weights.data(),weights.size(),0));
+#endif
+            pure.ToDevice(CPU);
+            for (int r=0; r<rows; ++r) {
+                std::vector<int> order(topk);
+                std::iota(order.begin(),order.end(),0);
+                std::stable_sort(order.begin(),order.end(),[&](int a,int b) { return hostIds[r*topk+a]<hostIds[r*topk+b]; });
+                for (int c=0; c<f.hidden; ++c) {
+                    float sum=0;
+                    for (int k : order) sum+=gpuOracle[size_t(r*topk+k)*f.hidden+c];
+                    Check(Float32ToBFloat16RNEBits(sum)==((uint16_t*)pure.cpuData)[r*f.hidden+c],
+                        "pure GGUF verifier differs from GPU quantization oracle");
+                }
+            }
+            for (int d : {0,1}) {
+                uint64_t pureStats[8]{};
+                Check(fastllm_moe_cuda_cache_route_stats(d,pureStats),"pure GGUF stats");
+                Check(pureStats[5]==before[d][5],"pure GGUF verifier executed CPU experts");
+            }
+            unsetenv("FASTLLM_DSV41_MOE_CACHE_MODE");
+        }
         if (rows==1) {
             dual|=after[0][4]>before[0][4] && after[1][4]>before[1][4];
             resident|=hits>0;
         }
     }
-    Check(dual && resident && checkedPayload,"decode missed dual-GPU execution or cache hits");
-    Check(!residentOracle || totalCpu>0,"tuned hybrid never executed CPU experts");
+    Check(pureOnly || (dual && resident && checkedPayload),"decode missed dual-GPU execution or cache hits");
+    Check(pureOnly || !residentOracle || totalCpu>0,"tuned hybrid never executed CPU experts");
     printf("HYBRID_STATS gate=%d down=%d hidden=%d inter=%d gpu_routes=%llu cpu_routes=%llu hits=%llu admissions=%llu\n",
         f.gpu[2]->ggmlType,f.gpu[3]->ggmlType,f.hidden,f.inter,
         (unsigned long long)totalGpu,(unsigned long long)totalCpu,
         (unsigned long long)totalHits,(unsigned long long)totalAdmissions);
+    pureGraphs.clear();
     FastllmCudaReleaseMoeCache(weights.data(),weights.size());
     SetMoeCudaCacheBytes(0);
-    std::puts("PASS: V4.1 cached decode, dual GPU, canonical admissions and mixed CPU/GPU output");
+    std::puts(pureOnly ? "PASS: V4.1 pure GPU verifier, bounded chunks and zero CPU experts" :
+        "PASS: V4.1 cached decode, dual GPU, canonical admissions and mixed CPU/GPU output");
+    // Pure demand-refill and cooperative placement have different residency
+    // policies. Run each from its own cache so neither contaminates the other.
+    if (!pureOnly) TestCooperativeDecode(f, residentOracle, true);
 }
 #endif
 
@@ -926,6 +969,12 @@ int main(int argc, char **argv) { try {
     if(argc>1 && !strcmp(argv[1],"--full-graph-large")){TestDiskFullGraph(true);return 0;}
     if (argc > 1 && !strcmp(argv[1], "--disk-decode-handoff")) { TestDiskDecodeHandoff(); return 0; }
 #ifdef USE_NUMAS
+    if (argc > 1 && !strcmp(argv[1], "--pure-graph-large")) {
+        Fixture f(GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XXS, 0, 5120, 2304);
+        TestCooperativeDecode(f, true, true, 6);
+        puts("PASS: real V4.1 expert dimensions, top-6, dual-GPU pure full graphs");
+        return 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "--iq2-batch")) {
         for (int type : {GGML_TYPE_IQ2_XXS,GGML_TYPE_IQ2_XS}) {
             Fixture f(type,type,0);
