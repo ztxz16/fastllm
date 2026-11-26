@@ -7,6 +7,8 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace fastllm {
@@ -162,6 +164,34 @@ public:
         snapshot->timestamp = ++timestamp;
         items.push_back(snapshot);
         held = std::move(snapshot);
+        return true;
+    }
+
+    // Make room in a bounded payload pool without invalidating active restores.
+    // Reclaim this request's checkpoints before displacing other conversations.
+    template<class Eligible>
+    bool EvictIdle(const Snapshot &incoming, Eligible eligible) {
+        std::unordered_map<long long, int> longest;
+        for (const auto &e : items)
+            longest[e->requestId] = std::max(longest[e->requestId], e->cachedLen);
+        auto victim = items.end();
+        std::pair<bool, long long> best;
+        for (auto it = items.begin(); it != items.end(); ++it) {
+            const auto &e = *it;
+            if (e.use_count() != 1 || !eligible(*e)) continue;
+            bool continuation = e->requestId == incoming.requestId ||
+                (e->tokens.size() <= incoming.tokens.size() &&
+                 std::equal(e->tokens.begin(), e->tokens.end(), incoming.tokens.begin()));
+            // Keep the latest boundary for unrelated agents waiting on tools.
+            if (!continuation && e->cachedLen == longest.at(e->requestId)) continue;
+            auto order = std::make_pair(!continuation, e->timestamp);
+            if (victim == items.end() || order < best) {
+                victim = it;
+                best = order;
+            }
+        }
+        if (victim == items.end()) return false;
+        items.erase(victim);
         return true;
     }
 

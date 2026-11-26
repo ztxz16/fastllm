@@ -85,6 +85,31 @@ static void RollingConversations() {
     }
 }
 
+static void PayloadPressure() {
+    RecurrentPrefixStore<Snapshot> store;
+    std::shared_ptr<Snapshot> held, pinned;
+    auto admit = [&](int token, int owner, bool gpu) {
+        Check(store.Publish(Make({token}, owner, gpu), held, 4, 8));
+        held.reset();
+    };
+    admit(1, 1, true);
+    admit(2, 2, true);
+    admit(3, 2, true);
+    admit(4, 2, false);
+    auto gpu = [](const Snapshot &s) { return s.draft; };
+    pinned = store.Find({2}, 1, 1, gpu);
+    auto incoming = Make({5}, 2);
+    Check(store.EvictIdle(*incoming, gpu));
+    Check(!store.Find({3}, 1, 1, gpu) && store.Find({1}, 1, 1, gpu));
+    Check(!store.EvictIdle(*incoming, gpu) && store.Size() == 3 && pinned);
+    // Preserve the only continuation of a different agent. Its older boundary
+    // becomes reclaimable as soon as a longer checkpoint exists.
+    Check(store.Publish(Make({1, 5}, 1, true), held, 4, 8));
+    held.reset();
+    Check(store.EvictIdle(*incoming, gpu));
+    Check(!store.Find({1}, 1, 1, gpu) && store.Find({1, 5}, 2, 2, gpu));
+}
+
 static void RetainSpareHistory() {
     RecurrentPrefixStore<Snapshot> store;
     RecurrentPrefixStore<Snapshot>::Entry held;
@@ -147,6 +172,7 @@ int main() {
     Check(RecurrentPrefixMaxRecords() == 8 && RecurrentPrefixMaxRecords(13) == 78);
     setenv("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", "3", 1);
     Check(RecurrentPrefixMaxRecords(13) == 3);
+    PayloadPressure();
     SharedOwnership();
     RollingConversations();
     RetainSpareHistory();
