@@ -149,10 +149,7 @@ __device__ __forceinline__ void SwaAttentionBf16Body(const BF16 *q, const BF16 *
             // can supply QK and V while the producer CTAs publish the suffix.
             if (t < writers) {
                 auto *flag = reinterpret_cast<const unsigned *>(epochs + 1 + t) + 1;
-                unsigned ready;
-                do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0,[%1];" : "=r"(ready) : "l"(flag) : "memory");
-                } while (!ready);
+                fastllm_swa::WaitReady(flag);
             }
             __syncthreads();
             loadValues(committed, 128);
@@ -280,9 +277,9 @@ __global__ __launch_bounds__(Threads) void NaiveSwaAttentionBf16(const BF16 *q, 
                                                                  const float *sink, BF16 *out,
                                                                  const int *live, int heads, int kvHeads,
 #if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
-                                                                 const __grid_constant__
+                                                                 __grid_constant__
 #endif
-                                                                     Binding cache = {}) {
+                                                                     const Binding cache = {}) {
     constexpr bool Descriptors = std::is_same<Binding, BatchSwaKeys>::value;
     SwaAttentionBf16Body<Threads, Tile, Dynamic, Binding, MmaPV>(
         q, k, v, sink, out, live, heads, kvHeads, cache, Dynamic || Descriptors ? blockIdx.y : 0, blockIdx.x,

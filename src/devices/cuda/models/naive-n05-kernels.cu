@@ -27,6 +27,7 @@
 #include "naive-n05-prefill-split.cuh"
 #include "naive-n05-swa-query.cuh"
 #include "naive-n05-swa-mma.cuh"
+#include "naive-n05-swa-ready.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_QKV_SM90
 #include "naive-n05-qkv.cuh"
 #endif
@@ -63,7 +64,7 @@
 
 // Scalar batching and TopK do not require Tensor Cores. Keep them in legacy
 // builds as well; the descriptor kernels use the portable SM70 argument ABI.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
 #define FASTLLM_NAIVE_BATCH_INDEXER
 #include "naive-n05-indexer-batch.cuh"
 #endif
@@ -1123,7 +1124,7 @@ __global__ void RopeAppendCache(RopeCacheRow row, int heads, int kvHeads, int di
         heads, kvHeads, dim, valueDim, indexDim, rotaryDim, theta, valueScale, window, ring);
 }
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
 template <bool Packed>
 __global__ void BatchRopeAppendCache(RopeCacheBatch batch, int heads, int kvHeads, int dim,
         int valueDim, int indexDim, int rotaryDim, float theta, BF16 valueScale,
@@ -3966,7 +3967,7 @@ bool FastllmCudaNaiveBatchRopeAppendCache(fastllm::Data &q, const fastllm::Data 
         CheckLaunch();
         return true;
     }
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
     constexpr int queryHeadsPerTile = 8;
     auto canTileQueryHeads = [&](const RopeCacheRow *first, int size) {
         return heads >= 32 && dim == 192 && valueDim == 128 && rotaryDim == 64 &&
@@ -8321,7 +8322,7 @@ bool FastllmCudaTryPackedSwaVerify(const fastllm::Data &qkv, const fastllm::Data
         const fastllm::Data &live, const FastllmNaiveRopeCacheRow &binding, const fastllm::Data &sink,
         int heads, int kvHeads, float theta, float valueScale, FastllmMxfp8Activation packed,
         fastllm::Data &attention, bool overlapQkv) {
-#if !defined(USE_ROCM) && CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && !defined(USE_ROCM) && CUDART_VERSION >= 12080 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
     using namespace fastllm;
     const int arch = FastllmCudaRuntimeArch();
     const int rows = packed.rows;

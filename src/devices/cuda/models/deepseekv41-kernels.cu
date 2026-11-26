@@ -56,7 +56,7 @@ SOFTWARE.
 #include "deepseekv41-flashmla.cuh"
 #endif
 // FlashInfer synchronization primitives require SM70 or newer.
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if !defined(FASTLLM_CUDA_LEGACY_ONLY) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
 #define FASTLLM_V41_FP16_ATTENTION
 #include "attention/default_prefill_params.cuh"
 #include "attention/prefill.cuh"

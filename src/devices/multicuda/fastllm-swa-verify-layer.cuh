@@ -7,6 +7,7 @@
 #include "../cuda/models/naive-n05-mxfp8-projection.cuh"
 #include "fastllm-swa-output.cuh"
 #include "../cuda/models/naive-n05-swa-mma.cuh"
+#include "../cuda/models/naive-n05-swa-ready.cuh"
 namespace fastllm_swa_verify {
 using namespace fastllm_swa_output;
 using fastllm_swa_mma::InputOffset;
@@ -144,7 +145,7 @@ __device__ __forceinline__ void NormalizeOwner(const Args &a) {
     __syncthreads();
     if (t == 0) {
         auto *p = reinterpret_cast<unsigned *>(a.epochs + 128 + row) + 1;
-        asm volatile("st.release.gpu.global.u32 [%0],1;" ::"l"(p) : "memory");
+        fastllm_swa::PublishReady(p);
     }
 }
 // Vector loads/stores shorten the normalization dependency before direct QKV reads.
@@ -218,7 +219,7 @@ __device__ __forceinline__ void NormalizeOwnerVector(const Args &a) {
     __syncthreads();
     if (t == 0) {
         auto *p = reinterpret_cast<unsigned *>(a.epochs + 128 + row) + 1;
-        asm volatile("st.release.gpu.global.u32 [%0],1;" ::"l"(p) : "memory");
+        fastllm_swa::PublishReady(p);
     }
 }
 // Borrow original row-major weights. Reuse each weight fragment across N8
@@ -239,10 +240,7 @@ __device__ __forceinline__ void Project(const Args &a, int first, unsigned char 
     if constexpr (Ordered) {
         if (t < Chunks * 8 && first + t < rows) {
             auto *p = reinterpret_cast<unsigned *>(a.epochs + 128 + first + t) + 1;
-            unsigned flag;
-            do {
-                asm volatile("ld.acquire.gpu.global.u32 %0,[%1];" : "=r"(flag) : "l"(p) : "memory");
-            } while (!flag);
+            fastllm_swa::WaitReady(p);
         }
         __syncthreads();
         if constexpr (!DirectInput) {
@@ -487,9 +485,9 @@ __device__ __forceinline__ void Tail(const Args &a, int first, const fastllm_mxf
 template <int Threads, int Group, bool Small, int Chunks = 1, bool TensorQK = Small, bool DirectInput = false>
 __global__ __launch_bounds__(Threads, 1) void Layer(
 #if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
-    const __grid_constant__
+    __grid_constant__
 #endif
-        Args a) {
+        const Args a) {
     static_assert(!DirectInput || !Small, "direct QKV reads require normalized row owners");
     static_assert(Chunks == 1 || (!Small && Chunks == 2), "unsupported projection tile");
     extern __shared__ __align__(1024) unsigned char tile[];
@@ -508,7 +506,7 @@ __global__ __launch_bounds__(Threads, 1) void Layer(
         }
         if (threadIdx.x == 0) {
             auto *p = reinterpret_cast<unsigned *>(a.epochs + blockIdx.x + 1) + 1;
-            asm volatile("st.release.gpu.global.u32 [%0],1;" ::"l"(p) : "memory");
+            fastllm_swa::PublishReady(p);
         }
     }
     for (int task = blockIdx.x; task < (Small ? 8 : a.rows) * 8; task += 128)
@@ -524,10 +522,7 @@ __global__ __launch_bounds__(Threads, 1) void Layer(
                 dependency = 100 + t - 16;
             if (dependency >= 0) {
                 auto *p = reinterpret_cast<unsigned *>(a.epochs + dependency + 1) + 1;
-                unsigned flag;
-                do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0,[%1];" : "=r"(flag) : "l"(p) : "memory");
-                } while (!flag);
+                fastllm_swa::WaitReady(p);
             }
             __syncthreads();
             SwaAttentionBf16Body<Threads, 128, true, BatchSwaKeys, true, true, TensorQK>(
@@ -607,9 +602,9 @@ __device__ __forceinline__ void StageHistory(const Args &a, int row, int valueTi
 template<int Threads>
 __global__ __launch_bounds__(Threads, 1) void PackedLayer(
 #if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
-    const __grid_constant__
+    __grid_constant__
 #endif
-        Args a) {
+        const Args a) {
     const int t = threadIdx.x, task = blockIdx.x;
     const int row = task / 16, head = task / 2 % 8, valueTile = task % 2;
     StageHistory<64>(a, row, valueTile);
@@ -658,7 +653,7 @@ __global__ __launch_bounds__(Threads, 1) void PackedLayer(
 #endif
         __syncthreads();
         if (writesKV && t == 0)
-            asm volatile("st.release.gpu.global.u32 [%0],1;" :: "l"(flag(row)) : "memory");
+            fastllm_swa::PublishReady(flag(row));
         if (!valueTile && t < 24)
             reinterpret_cast<uint4 *>(a.q + (row * 8 + head) * 192)[t] = reinterpret_cast<const uint4 *>(query)[t];
         SwaAttentionBf16Body<Threads, 64, true, BatchSwaKeys, true, true, false, true>(

@@ -344,6 +344,12 @@
     __VA_ARGS__                                                                             \
   }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+#define FLASHINFER_GRID_CONSTANT
+#else
+#define FLASHINFER_GRID_CONSTANT __grid_constant__
+#endif
+
 namespace flashinfer {
 
 // -1 preserves runtime dispatch; 0/1 instantiate only the caller's fixed policy.

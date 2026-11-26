@@ -1003,7 +1003,7 @@ struct Projection {
                     const int first = (tiles * i / nranks) * 16;
                     const int nr = (tiles * (i + 1) / nranks) * 16 - first;
                     const auto &rank = topology.ranks[i];
-                    WeightShard shard{rank, first, nr};
+                    WeightShard shard{rank, first, nr, {}, {}, {}};
                     const size_t codeRow = c / 32, scaleRow = c / 64;
                     shard.codes = copyWeightShard(nativeCodes.p, r * codeRow, first * codeRow, nr * codeRow, e, *rank);
                     shard.scales = copyWeightShard(nativeScales.p, r * scaleRow, first * scaleRow, nr * scaleRow, e, *rank);

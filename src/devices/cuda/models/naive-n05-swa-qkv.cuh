@@ -176,9 +176,9 @@ template<bool StageWeights>
 __global__ __launch_bounds__(Threads) void QkvRope(
         const BF16 *input, const BF16 *weight, BF16 *q,
         #if CUDART_VERSION >= 12010 && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
-        const __grid_constant__
+        __grid_constant__
 #endif
-        SwaQkvBatch batch,
+        const SwaQkvBatch batch,
         const float *position, const int *live, int rows, float theta, float valueScale) {
     ProjectRope<StageWeights, Threads>(input, weight, q, batch, position, live, rows, theta, valueScale);
 }

@@ -2606,7 +2606,7 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
 template <typename KTraits, typename Params, bool STRIDED_BATCH = false>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCacheKernel(
-    const __grid_constant__ Params params) {
+    const FLASHINFER_GRID_CONSTANT Params params) {
   extern __shared__ uint8_t smem[];
   using SmemStorage = typename KTraits::SharedStorageSingle;
   auto& smem_storage = reinterpret_cast<SmemStorage&>(smem);
@@ -2888,7 +2888,7 @@ __device__ __forceinline__ void vosplit_write_o(
 
 template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKVCacheKernel(
-    const __grid_constant__ Params params) {
+    const FLASHINFER_GRID_CONSTANT Params params) {
   using DTypeQ = typename Params::DTypeQ;
 #if (__CUDA_ARCH__ < 800)
   if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
@@ -4267,7 +4267,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
 template <typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
-    const __grid_constant__ Params params) {
+    const FLASHINFER_GRID_CONSTANT Params params) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStoragePaged&>(smem);
   BatchPrefillWithPagedKVCacheDevice<KTraits>(params, smem_storage);
