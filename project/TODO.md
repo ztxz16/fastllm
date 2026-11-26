@@ -376,9 +376,19 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
 
 ## PD 分离实现清单
 
+设计说明、功能清单和四张框架图统一放在
+[PD 分离设计与实现清单](../docs/pd_disaggregation/README.md)，本节继续维护待办内容与状态。
+
 讨论边界（2026-11-25 已确认）：KV 重分片算法、meta/API 字段、内部结果流协议、
 逐层传输与 CUDA Graph 的配合不再作为架构讨论待定项，具体细节留到编码阶段落实。
 相关条目中的“后续补充”指实现阶段细化；保留既定功能要求及实际实现、验收状态。
+
+- [x] **PD 文档整理：统一设计、功能清单与框架图入口。**
+  记录日期：2026-11-26。状态：验收成功（仅文档整理）。主文档迁移至
+  [PD 分离设计与实现清单](../docs/pd_disaggregation/README.md)，四张最终版图片在其
+  `images/` 子目录按章节引用；图 4 采用简化重绘版，旧版图片与生成记录归档保存。
+  验证：22 个原有功能章节的要求保留，文件、图片与章节锚点链接检查通过；
+  未编译、未运行推理测试，不改变各项 PD 功能的待实现与验收状态。
 
 - [ ] **PD 分离：遵循全项目准确性比对优先级，仅数值性比对不通过记 WARNING。**
   优先 `exact`，其次 `top5`、`top5_near_tie`，数值性比对放最后；前三种不通过仍判 FAIL，
@@ -389,7 +399,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   记录日期：2026-11-26。实现：范围与优先级已更新，PD 验收脚本及汇总尚未接入。
   验证：未运行测试，尚无 numeric 不通过仅 WARNING、其余比较及功能故障仍 FAIL 的验收结果。
   下一步：按[全项目准确性比对规则](#全项目准确性比对规则)落实。功能定义见
-  [准确性比对与验收原则](PD_DISAGGREGATION.md#准确性比对与验收原则)。
+  [准确性比对与验收原则](../docs/pd_disaggregation/README.md#准确性比对与验收原则)。
 
 - [ ] **PD 分离：支持普通 DP×TP 与 Attention DP/EP 的四种 P/D 组合。**
   实现：仅记录功能范围，尚未实现。验证：无该功能的验收结果。
@@ -400,7 +410,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   复用已有加载、算子、KV 管理和调度能力，不能仅放开模型类型检查；模型执行与 PD 交接分别验收。
   记录日期：2026-11-24。实现：要求已确认，尚未实现。验证：无该普通 DP×TP 路径及混合 PD 的验收结果。
   下一步：补充模型接入与并行执行方案。功能定义见
-  [Qwen2 MoE 普通进程 DP×TP 支持](PD_DISAGGREGATION.md#qwen2-moe-普通进程-dptp-支持)。
+  [Qwen2 MoE 普通进程 DP×TP 支持](../docs/pd_disaggregation/README.md#qwen2-moe-普通进程-dptp-支持)。
 - [ ] **PD 分离：支持 KV 重分片、分片映射与布局对齐。** P/D 两端 KV 分布不同时，支持不同 TP 规模间的
   切分、合并和必要的复制；仅改变普通 DP 副本数量时，不要求按头重新切分。
   Router 选择 P、D 服务，路由或服务内部 DP 调度确定目标副本；独立 KV 交接模块负责
@@ -412,7 +422,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   记录日期：2026-11-24。实现：职责分工及对齐要求已确认，尚未实现。
   验证：无 KV 重分片、目标副本隔离、内容与位置一致性的正确性和性能验收结果。
   下一步：补充源/目标布局适配、映射接口及传输方案。功能定义与示例见
-  [分片映射与职责分工](PD_DISAGGREGATION.md#分片映射与职责分工)。
+  [分片映射与职责分工](../docs/pd_disaggregation/README.md#分片映射与职责分工)。
 - [ ] **PD 分离：建立 Router/Proxy 服务级路由，支持 P/D 配对与交接协调。**
   统一入口管理多个独立推理服务；非 PD 场景选择一个完整推理服务，PD 场景分别选择 P、D
   并协调 Prefill→Decode 交接。Router 的八种服务级策略按下项要求推进，默认 `cache_aware`
@@ -422,7 +432,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   路由与结果输出共用统一入口，KV 数据由独立交接模块在 P/D 之间直接传输。
   记录日期：2026-11-24。实现：要求已确认，尚未实现。验证：无该功能的验收结果。
   下一步：补充入口接口、P/D 配对和交接协调方案。功能定义见
-  [Router/Proxy 与现有调度复用](PD_DISAGGREGATION.md#routerproxy-与现有调度复用)。
+  [Router/Proxy 与现有调度复用](../docs/pd_disaggregation/README.md#routerproxy-与现有调度复用)。
 - [ ] **PD 分离：Router 服务健康检查对齐 vLLM Router。** 对已注册 P、D 服务分别维护健康状态，
   默认每 60 秒向 `/health` 发送 HTTP GET，单次探测超时 5 秒；HTTP 2xx 为成功，
   非 2xx、连接错误或超时为失败。连续失败 3 次标记不健康，停止分配新请求；仍保留注册记录
@@ -437,7 +447,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无默认配置、配置覆盖、探测结果分类、连续计数重置、P/D 状态隔离、
   不健康期间持续探测、停止分流及恢复的验收结果。
   下一步：接入服务健康端点、周期探测和路由候选池更新。功能定义及参考见
-  [Router 服务健康检查](PD_DISAGGREGATION.md#router-服务健康检查)。
+  [Router 服务健康检查](../docs/pd_disaggregation/README.md#router-服务健康检查)。
 - [ ] **PD 分离：支持八种服务级 Router 策略，允许 P/D 分别配置。**
   支持 `round_robin`、`random`、`power_of_two`、`cache_aware`、`kv_aware`、
   `consistent_hash`、`sticky_least_loaded`、`rendezvous_hash`；P、D 可使用相同或不同策略。
@@ -455,12 +465,12 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   ③负载明显失衡，不论前缀匹配比例多高，优先选择最低负载服务。
   先判断明显失衡，再判断前缀匹配；默认最高匹配比例恰好为 30% 时属于匹配不足，
   用户修改阈值后按配置值判断。规则表见
-  [cache_aware 三种情况的选择规则](PD_DISAGGREGATION.md#cache_aware-三种情况的选择规则)。
+  [cache_aware 三种情况的选择规则](../docs/pd_disaggregation/README.md#cache_aware-三种情况的选择规则)。
   服务级默认策略与实例内部默认 `load` 分开。
   更新日期：2026-11-24。实现：八种策略、默认配置及三种情况的处理要求已确认，尚未实现。
   验证：无策略、默认值、P/D 显式覆盖、三种情况及阈值边界的验收结果。
   下一步：补充配置接入、负载统计、其他策略评分及会话生命周期方案。功能定义见
-  [Router 策略支持](PD_DISAGGREGATION.md#router-策略支持)。
+  [Router 策略支持](../docs/pd_disaggregation/README.md#router-策略支持)。
 - [ ] **PD 分离：对齐 SGLang Router，支持有条件的请求级重试。**
   最大尝试次数可配置且包含首次执行，默认 1（关闭自动重试）；允许连接/传输错误、超时、
   熔断拒绝、HTTP 5xx 和 429 触发重试，其余 4xx、成功响应及已取消/断连请求不重试。
@@ -471,7 +481,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   旧交接消息不得更新新尝试。不承诺 KV 分块或实例重启后的断点续传；旧在途传输结束后才回收。
   记录日期：2026-11-24。实现：要求已确认，尚未实现。验证：无请求重试及停止边界的验收结果。
   下一步：补充配置、错误上报、实例排除与交接状态接口。功能定义和参考见
-  [Router/Proxy 有条件请求重试](PD_DISAGGREGATION.md#routerproxy-有条件请求重试)。
+  [Router/Proxy 有条件请求重试](../docs/pd_disaggregation/README.md#routerproxy-有条件请求重试)。
 - [ ] **PD 分离：支持 P/D 路由与背压。** 综合 P 端计算压力、前缀命中、D 端 KV
   承接能力和传输积压选择实例；P 端采用本地 KV 容量背压：待交接及在途仍被访问的 KV
   按生命周期计入 P 的占用，新请求当前计算所需 KV 块申请失败时，在 P 内部调度等待队列排队。
@@ -488,7 +498,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无待交接 KV 占用、P 容量不足时等待、空间可用后推进及在途占用保护的验收结果；
   普通 DP 的现有负载路由不能代替此项。下一步：接入 P 占用统计与调度队列，补充路由负载指标、
   排队限额与超时配置。功能定义见
-  [P 端 KV 容量背压与排队](PD_DISAGGREGATION.md#p-端-kv-容量背压与排队)。
+  [P 端 KV 容量背压与排队](../docs/pd_disaggregation/README.md#p-端-kv-容量背压与排队)。
 - [ ] **PD 分离：D 端保留 512 Token 准入预算，运行时恢复对齐 vLLM V1。**
   接收新 KV 前先扣除已接纳请求的增长预算，再判断新请求完整接收空间及其自身增长额度
   是否能容纳。支持 `--num-reserved-decode-tokens`，默认每个活跃请求 512 Token，可配置。
@@ -506,7 +516,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无默认值与配置覆盖、并发准入、增长保护、容量不足时统一排队、容量恢复后推进
   及抢占重算恢复的验收结果。
   下一步：补充预算与页面换算、队列衔接、本地重算与状态保持方案；功能定义和参考见
-  [D 端容量准入与 Decode 增长预算](PD_DISAGGREGATION.md#d-端容量准入与-decode-增长预算)。
+  [D 端容量准入与 Decode 增长预算](../docs/pd_disaggregation/README.md#d-端容量准入与-decode-增长预算)。
 - [ ] **PD 分离：历史随请求发送，KV 尽量复用。** 客户端或业务后端保存会话历史，每轮请求
   携带本轮需要的历史消息和新问题；P 根据完整的本轮输入处理，不依赖曾处理过前一轮。
   Router 保持默认 `cache_aware`，按前缀匹配和负载选择服务，允许各轮落到不同 P。
@@ -519,7 +529,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   记录日期：2026-11-25。实现：规则已确认，尚未实现。
   验证：无跨 P 多轮上下文、本地复用、回传开关、缓存缺失/过期重算及会话隔离的验收结果。
   下一步：细化会话字段与来源记录管理，接入历史输入、复用及重算路径，验证各轮请求的独立关联。
-  功能定义见 [多轮历史与会话路由](PD_DISAGGREGATION.md#多轮历史与会话路由)。
+  功能定义见 [多轮历史与会话路由](../docs/pd_disaggregation/README.md#多轮历史与会话路由)。
 - [ ] **PD 分离：KV 回传对齐 vLLM NIXL，D 解码完成后默认保留 480 秒。**
   采用下一轮 P 从上一轮 D 直接拉取历史 KV 的机制；Router/Proxy 按会话记录并转交来源信息。
   `bidirectional_kv_xfer` 默认 `false`，支持显式开启；本项 D→P 仅要求拉取，P→D 推送与拉取
@@ -535,7 +545,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无多轮复用、空间不足等待、分片对齐、解码结束计时、配置覆盖、到期回收及重算的验收结果。
   下一步：补充配置、会话元数据及异常处理接入，验证长时间解码不受该 TTL 影响、
   期限内拉取、到期重算和在途传输的安全回收。功能定义见
-  [KV 回传与多轮复用](PD_DISAGGREGATION.md#kv-回传与多轮复用)。
+  [KV 回传与多轮复用](../docs/pd_disaggregation/README.md#kv-回传与多轮复用)。
 - [ ] **PD 分离：P 只交接 KV，D 从首 Token 开始生成。** P 负责 Prompt Prefill 与 KV
   交接，不采样输出 Token；Router 向 D 提供原始 Prompt Token ID、生成规则和交接关联信息。
   D 从已生成 Token 数为 0 初始化采样与停止状态，所需 KV 全部可用后，重算 Prompt 末 Token
@@ -547,7 +557,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   协议和正式执行路径尚未实现。验证：无 P 不采样、D 首 Token、位置与生成计数、停止条件、
   异常恢复及输出无重复/遗漏的验收结果。
   下一步：落实 KV-only Prefill 入口、D 生成初始化及末 Token 重算，补充协议与异常处理。
-  功能定义见 [P→D 请求状态交接](PD_DISAGGREGATION.md#pd-请求状态交接)。
+  功能定义见 [P→D 请求状态交接](../docs/pd_disaggregation/README.md#pd-请求状态交接)。
 - [ ] **PD 分离：采用统一 JSON meta 与握手布局复用的数据结构。**
   模型、TP 拓扑、KV 精度、分页或连续布局及层/头分布在握手时协商，以 `layout_id` 引用；
   每次交接只携带本次请求及 KV 位置等变化信息，meta 不包含 KV 数据本体。
@@ -561,7 +571,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   记录日期：2026-11-25。实现：数据结构模式已确认，尚未实现。
   验证：无序列化、身份与布局校验、位置范围校验及三种交接路径的验收结果。
   下一步：细化字段类型、必填/可选规则、枚举及子结构，并接入交接 API。功能定义见
-  [KV 交接 meta 数据结构](PD_DISAGGREGATION.md#kv-交接-meta-数据结构)。
+  [KV 交接 meta 数据结构](../docs/pd_disaggregation/README.md#kv-交接-meta-数据结构)。
 - [ ] **PD 分离：建立独立 KV 交接模块与统一 API。** 对外统一接口，内部按职责拆分文件，
   P、D 计算流程通过接口完成导出、接收与导入、完成与取消，复用现有并行计算流程。
   导出提供 KV 引用、布局与就绪依赖并保护传输数据；导入负责校验、目标空间准备、接收、
@@ -577,7 +587,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无该模块的验收结果。
   下一步：审阅接口草案，细化类型、正式调用位置、通知队列接入、逐层接入、文件拆分、
   布局适配与单机传输后端接入细节。草案见
-  [交接接口与接入点草案](PD_DISAGGREGATION.md#交接接口与接入点草案)。
+  [交接接口与接入点草案](../docs/pd_disaggregation/README.md#交接接口与接入点草案)。
 - [ ] **PD 分离：由独立 CPU 后台线程管理异步传输任务。**
   P、D 的 KV 交接模块通过后台线程跟踪本地传输状态、汇总相关 rank 的完成结果，
   推进失败处理与取消收尾；进度检查和收尾不依赖调度线程处理其他请求的进度。
@@ -588,7 +598,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   记录日期：2026-11-25。实现：线程方案、通知队列及职责分工已确认，尚未实现。
   验证：无异步进度推进、多 rank 完成汇总、通知交付及取消收尾的验收结果。
   下一步：结合单机传输后端细化线程数量、检查频率、队列实现、唤醒方式和正式接入点。
-  功能定义见 [异步传输任务管理](PD_DISAGGREGATION.md#异步传输任务管理)。
+  功能定义见 [异步传输任务管理](../docs/pd_disaggregation/README.md#异步传输任务管理)。
 - [ ] **PD 分离：单机采用 CUDA IPC＋异步 GPU 间拷贝，跨机后续讨论。**
   P、D 部署在同一台服务器，覆盖 P→D 推送、P→D 拉取及按需开启的 D→P 拉取回传；
   继续遵循既定分片映射、完成判断和在途传输结束后回收的要求。
@@ -601,7 +611,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无跨进程推送、拉取、分片对齐、完成通知及不支持条件拒绝路径的验收结果。
   下一步：细化显存登记、IPC 映射生命周期、拷贝 stream、计算就绪依赖及完成事件的接入。
   功能定义见
-  [传输后端实施范围](PD_DISAGGREGATION.md#传输后端实施范围)。
+  [传输后端实施范围](../docs/pd_disaggregation/README.md#传输后端实施范围)。
 - [ ] **PD 分离：CPU 内存中转兜底列为后续功能点。**
   面向 GPU 间无法直接传输的场景，保留源 GPU → CPU 中转缓冲区 → 目标 GPU 的后续路径，
   复用统一交接 API、分片映射和异步任务管理；在实际传输结束后才允许复用相关缓冲区。
@@ -609,7 +619,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   记录日期：2026-11-25。实现：后续功能点已登记，具体策略待讨论，尚未实现。
   验证：无 CPU 中转正确性、容量管理、取消收尾及性能验收结果。
   下一步：明确启用策略及中转方案，再实现和验证。功能定义见
-  [CPU 内存中转兜底（后续功能）](PD_DISAGGREGATION.md#cpu-内存中转兜底后续功能)。
+  [CPU 内存中转兜底（后续功能）](../docs/pd_disaggregation/README.md#cpu-内存中转兜底后续功能)。
 - [ ] **PD 分离：短 Prompt 推送与拉取的基础交接时序对齐 vLLM NIXL。**
   拉取：Router 先交给 P；P 完成全部 Prefill 并返回来源信息后，Router 再将请求和来源
   信息交给 D；D 实际分配接收空间后主动读取。P 开算不等待 D 预留。
@@ -624,7 +634,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无分发与分配顺序、推送两种就绪先后、容量不足等待及实际传输的验收结果。
   下一步：补充模式配置、交接接口及传输后端接入细节；长 Prompt 按下项已确认的逐层流程处理。
   功能定义与参考见
-  [KV 推送与拉取](PD_DISAGGREGATION.md#kv-推送与拉取)。
+  [KV 推送与拉取](../docs/pd_disaggregation/README.md#kv-推送与拉取)。
 - [ ] **PD 分离：按 Prompt 长度选择 KV 传输时机。** 短 Prompt 完成全部 Prefill 后再传
   KV，允许分块传输；长 Prompt 在各层 KV 就绪后逐层传输，与后续层的 Prefill 计算重叠。
   按单次请求的 Prompt Token 总数判断，参考 Splitwise 的 H100 实验结果，初始默认阈值为
@@ -644,7 +654,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无阈值边界、配置覆盖、逐层就绪与传输、容量等待、Decode 准入及性能验收结果。
   下一步：细化逐层事件、增量提交及完整范围确认接口，落实同步与 CUDA Graph 配合方案，
   实测校准阈值。功能定义见
-  [按 Prompt 长度选择 KV 传输时机](PD_DISAGGREGATION.md#按-prompt-长度选择-kv-传输时机)。
+  [按 Prompt 长度选择 KV 传输时机](../docs/pd_disaggregation/README.md#按-prompt-长度选择-kv-传输时机)。
 - [ ] **PD 分离：参考 vLLM 的推送与拉取完成判断。** 拉取由 D 确认所需读取任务全部
   实际成功完成；推送由 D 收齐预期 P 来源 rank 的实际写入完成通知，重复通知不重复计数。
   逐层、分块完成只计局部进度；须覆盖整个交接所需 KV，并汇总相关 D rank 的就绪状态，
@@ -652,7 +662,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   及后续生成；失败、超时、取消按状态机处理，不等待 P 提供首 Token。
   更新日期：2026-11-25。实现：需求已确认，尚未实现。验证：无该完成判断机制的验收结果。
   下一步：补充完成通知、任务状态接口与按请求汇总方式。功能定义见
-  [KV 交接完成判断](PD_DISAGGREGATION.md#kv-交接完成判断)。
+  [KV 交接完成判断](../docs/pd_disaggregation/README.md#kv-交接完成判断)。
 - [ ] **PD 分离：支持统一入口与结果输出。** 统一入口持有客户端连接，负责输出顺序、
   流式发送和断连处理；P、D 复用同一套内部事件上报机制，不直接向调用方发送。
   P 只上报 KV 准备、Prefill 完成或失败等状态；D 上报首个及后续全部输出 Token、生成结束或失败，
@@ -677,7 +687,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   下一步：补充具体通知、超时、重试和异常状态转换方案。
 
 记录日期：2026-11-21。状态：待补充具体方案、待实现。不支持 PP。
-功能范围见 [PD 分离实现清单](PD_DISAGGREGATION.md)。本次仅记录需求。
+功能范围见 [PD 分离实现清单](../docs/pd_disaggregation/README.md)。本次仅记录需求。
 
 ## 通用 KV 容量管理
 
@@ -696,7 +706,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   验证：无 LRU 淘汰、受保护缓存排除、新请求等待、运行请求抢占、本地重算后输出连续、
   共享 KV 与在途保护的跨 PD/非 PD 验收结果。
   下一步：补充引用判定、抢占选择及队列顺序、重算入口与状态保持方案。功能定义和参考见
-  [通用 KV 淘汰、抢占与重算恢复](PD_DISAGGREGATION.md#通用-kv-淘汰抢占与重算恢复)。
+  [通用 KV 淘汰、抢占与重算恢复](../docs/pd_disaggregation/README.md#通用-kv-淘汰抢占与重算恢复)。
 
 ## KV 存储布局与管理统一
 
@@ -714,7 +724,7 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
 - [ ] **统一普通 DP 与 Attention DP/EP 的请求分配接口和路由策略。**
   更新日期：2026-11-24。状态：待实现。
   仅规定单个 FT 推理服务内部的 DP 副本选择；完整推理服务以及 P、D 服务内部共同适用。
-  跨服务 Router 的八种策略见 [Router 策略支持](PD_DISAGGREGATION.md#router-策略支持)，不由本条决定。
+  跨服务 Router 的八种策略见 [Router 策略支持](../docs/pd_disaggregation/README.md#router-策略支持)，不由本条决定。
   统一实例内部请求分配入口，复用轮询、前缀匹配和 `load` 的目标选择逻辑，
   由两种后端分别提供候选目标、前缀命中和负载信息；补齐 Attention DP/EP 的 `load` 路由。
   `load` 按排队请求数、运行请求数和 KV 占用率计算负载分数，优先选择分数低的目标；
