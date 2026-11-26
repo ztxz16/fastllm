@@ -36,6 +36,9 @@ struct VisionConfig {
     std::pair<int, int> tokenGrid(int height, int width) const;
 };
 using ImageInputs = std::map<std::string, std::vector<Data *>>;
+struct MappedPageCounts {
+    int logical, resident, host;
+};
 struct Config {
     VisionConfig vision;
     DraftConfig draft;
@@ -45,6 +48,20 @@ struct Config {
     bool normValues = true;
     std::vector<bool> local;
     std::vector<int> visits;
+
+    MappedPageCounts mappedKvPages(const KvMemConfig &kv, int tokenLimit, int pageLen, bool isDraft, bool local) const {
+        const auto pages = [pageLen](int64_t tokens) { return (tokens + pageLen - 1) / pageLen; };
+        const int64_t tokens = isDraft ? int64_t(std::min(tokenLimit, draft.maxPositions)) + draft.block - 1 : tokenLimit;
+        const int logical = int(pages(tokens));
+        const int resident = std::min(logical, kv.residentTokens / pageLen);
+        if (!local) return {logical, resident, logical};
+
+        const int windowTokens = isDraft ? draft.window : window;
+        // A live window can start inside a page. Preserve speculative writes until acceptance is known.
+        const int64_t retained = int64_t(std::max(windowTokens, kv.slidingHostTokens)) + std::max(0, draft.block - 1);
+        return {logical, std::min(resident, int(pages(windowTokens))),
+                int(std::min<int64_t>(logical, pages(retained + pageLen - 1)))};
+    }
 };
 enum class ExpertDevice { Cuda, Cpu, Numa };
 struct Placement {

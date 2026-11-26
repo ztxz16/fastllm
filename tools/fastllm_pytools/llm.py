@@ -566,6 +566,9 @@ fastllm_lib.supports_kvmem_prefix_cache_llm_model.restype = ctypes.c_bool
 fastllm_lib.set_kvmem_llm_model.argtypes = (
     [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 6 + [ctypes.c_uint64, ctypes.c_int])
 fastllm_lib.set_kvmem_llm_model.restype = ctypes.c_char_p
+if hasattr(fastllm_lib, "set_kvmem_llm_model_v2"):
+    fastllm_lib.set_kvmem_llm_model_v2.argtypes = fastllm_lib.set_kvmem_llm_model.argtypes + [ctypes.c_int]
+    fastllm_lib.set_kvmem_llm_model_v2.restype = ctypes.c_char_p
 
 fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
 
@@ -3671,14 +3674,15 @@ class model:
 
     def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
                   sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
-                  prefill_tokens=512, host_mib=8192, retrieval_interval=64):
+                  prefill_tokens=512, host_mib=8192, retrieval_interval=64, sliding_host_tokens=0):
         """Opt into host-backed KV before warmup.
 
-        Inkling keeps all target/draft pages in mapped host memory and caches
+        Inkling keeps full global KV and bounded sliding KV in mapped host memory and caches
         resident_tokens per request and layer on CUDA, sharded under TP. Target
         KV can be FP16/BF16/FP32/FP8, draft KV is FP16. host_mib budgets all
         requests and ranks. Target global layers retrieve scored history pages,
         keeping their original positions. Local attention keeps its window.
+        sliding_host_tokens sets the requested retained history for sliding layers (0 uses their native window).
         Draft attention follows its native rules.
         Qwen3/3.5 use sparse retrieval on one GPU, changing attention once the
         resident budget is exceeded. Qwen3.5 also supports DFlash/MTP.
@@ -3707,14 +3711,22 @@ class model:
                   retrieval_tokens, prefill_tokens)
         if not isinstance(enabled, bool):
             raise TypeError("enabled must be bool")
-        if any(type(value) is not int or not 0 <= value <= 2147483647 for value in values):
+        if any(type(value) is not int or not 0 <= value <= 2147483647 for value in (*values, sliding_host_tokens)):
             raise ValueError("KVMem token budgets must be nonnegative 32-bit integers")
         if type(host_mib) is not int or not 0 < host_mib < (1 << 44):
             raise ValueError("host_mib must be a positive integer below 2**44")
         if type(retrieval_interval) is not int or not 1 <= retrieval_interval <= 2147483647:
             raise ValueError("retrieval_interval must be a positive 32-bit integer")
-        error = fastllm_lib.set_kvmem_llm_model(
-            self.model, enabled, *values, host_mib << 20, retrieval_interval)
+        params = (self.model, enabled, *values, host_mib << 20, retrieval_interval)
+        if hasattr(fastllm_lib, "set_kvmem_llm_model_v2"):
+            error = fastllm_lib.set_kvmem_llm_model_v2(*params, sliding_host_tokens)
+        else:
+            if self.get_type() == "inkling2_loop":
+                if enabled and sliding_host_tokens < max_tokens:
+                    raise ValueError("Bounded Inkling host KV requires an updated FastLLM library")
+            elif sliding_host_tokens:
+                raise ValueError("sliding_host_tokens is supported for Inkling KVMem")
+            error = fastllm_lib.set_kvmem_llm_model(*params)
         if error:
             raise ValueError(error.decode("utf-8", errors="replace"))
         self.kvmem_enabled = enabled

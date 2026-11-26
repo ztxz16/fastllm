@@ -91,11 +91,11 @@ class InklingAutoTest(unittest.TestCase):
             half = kv("float16", "--dspark", "7")
             fp8 = kv("fp8_e4m3", "--dspark", "7")
             _, with_draft = self.plan(*mapped, "--dspark", "7")
-        # Two TP ranks share FP16 draft KV. Each request reserves 13 pages
-        # (1536 tokens + 7 provisional rows) and caches at most two local windows.
+        # The global draft backs 13 pages, each draft window backs 10. A target
+        # window needs one more page than without speculation for tentative rows.
         pair_bytes = 2 * 2 * 8 * 128
         self.assertEqual(with_draft["kvmem_host_bytes"] - target_only["kvmem_host_bytes"],
-                         2 * 3 * 13 * 128 * pair_bytes)
+                         2 * (13 + 2 * 10) * 128 * pair_bytes + 2 * 40 * 128 * 2048)
         self.assertEqual(with_draft["kvmem_hot_bytes_per_rank"] - target_only["kvmem_hot_bytes_per_rank"],
                          (2 * 1024 + 13 * 128) * pair_bytes)
         self.assertEqual(with_draft["kvmem_page_table_bytes_per_rank"] - target_only["kvmem_page_table_bytes_per_rank"],
@@ -110,7 +110,7 @@ class InklingAutoTest(unittest.TestCase):
             for ranks, batch in ((1, 1), (1, 2), (2, 2)):
                 args, plan = self.plan(*options, "--kv_cache_dtype", dtype, "--max_batch", str(batch), n=ranks)
                 self.assertEqual((args.max_context_length, args.chunked_prefill_size), (2048, 256))
-                self.assertEqual(plan["kvmem_host_bytes"], batch * 2048 * row)
+                self.assertEqual(plan["kvmem_host_bytes"], batch * (8 * 2048 + 40 * 1152) * (row // 48))
                 self.assertEqual(plan["kvmem_hot_bytes_per_rank"], batch * 128 * row // ranks)
                 index = batch * 8 * (152 + 16 * 4 * ((8 * 128 + 24) // ranks + 2) + 16)
                 self.assertEqual(plan["kvmem_selection_bytes_per_rank"], index)
@@ -126,6 +126,29 @@ class InklingAutoTest(unittest.TestCase):
         self.assertEqual(args.chunked_prefill_size, 1024)
         with self.assertRaisesRegex(ValueError, "host KV"):
             self.plan("--kvmem", '{"max_tokens":2048,"resident_tokens":128,"host_mib":1}')
+
+    def test_sliding_host_retention(self):
+        def plan(retention, host_mib=100352):
+            cfg = dict(max_tokens=1048576, resident_tokens=2048, host_mib=host_mib, prefill_tokens=2048)
+            if retention is not None:
+                cfg["sliding_host_tokens"] = retention
+            return self.plan("--kv_cache_dtype", "fp8_e4m3", "--kvmem", json.dumps(cfg), n=1)[1]
+        small = plan(None)
+        for retention in (0, 256, 1024):
+            self.assertEqual(plan(retention)["kvmem_host_bytes"], small["kvmem_host_bytes"])
+        for retained, backing in ((None, 1152), (4097, 4224), (1048576, 1048576)):
+            result = plan(retained)
+            self.assertEqual(result["kvmem_host_bytes"], 2048 * (8 * 1048576 + 40 * backing))
+            self.assertEqual(result["kv_bytes_per_rank"], small["kv_bytes_per_rank"])
+        budget = small["kvmem_host_bytes"] // 1024**2
+        self.assertEqual(plan(None, budget)["kvmem_host_bytes"], small["kvmem_host_bytes"])
+        with self.assertRaisesRegex(ValueError, "host KV"):
+            plan(None, budget - 1)
+        with self.assertRaisesRegex(ValueError, "host KV"):
+            plan(1048576, budget)
+        for invalid in (-1, True, 2147483648):
+            with self.assertRaisesRegex(ValueError, "sliding_host_tokens"):
+                plan(invalid)
 
     def test_explicit_settings_and_failure(self):
         args, plan = self.plan("--device", "cuda:1", "--moe_device", "cpu", "--moe_cuda_cache", "2g",

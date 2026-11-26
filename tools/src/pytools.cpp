@@ -1525,9 +1525,9 @@ extern "C" {
         return models.GetModel(modelId)->SupportsKvMemPrefixCache();
     }
 
-    DLL_EXPORT const char *set_kvmem_llm_model(int modelId, bool enabled, int maxTokens,
+    DLL_EXPORT const char *set_kvmem_llm_model_v2(int modelId, bool enabled, int maxTokens,
             int residentTokens, int sinkTokens, int recentTokens, int retrievalTokens,
-            int prefillTokens, unsigned long long hostBytes, int retrievalInterval) {
+            int prefillTokens, unsigned long long hostBytes, int retrievalInterval, int slidingHostTokens) {
         fastllmPytoolsContextResult.clear();
         try {
             fastllm::KvMemConfig config;
@@ -1540,11 +1540,22 @@ extern "C" {
             config.prefillTokens = prefillTokens;
             config.retrievalInterval = retrievalInterval;
             config.hostBytes = hostBytes;
-            models.GetModel(modelId)->ConfigureKvMem(config);
+            config.slidingHostTokens = slidingHostTokens;
+            auto *model = models.GetModel(modelId);
+            if (slidingHostTokens && model->model_type != "inkling2_loop")
+                throw std::invalid_argument("sliding_host_tokens is supported for Inkling KVMem");
+            model->ConfigureKvMem(config);
         } catch (const std::exception &error) {
             fastllmPytoolsContextResult = error.what();
         }
         return fastllmPytoolsContextResult.c_str();
+    }
+
+    DLL_EXPORT const char *set_kvmem_llm_model(int modelId, bool enabled, int maxTokens,
+            int residentTokens, int sinkTokens, int recentTokens, int retrievalTokens,
+            int prefillTokens, unsigned long long hostBytes, int retrievalInterval) {
+        return set_kvmem_llm_model_v2(modelId, enabled, maxTokens, residentTokens, sinkTokens, recentTokens,
+                                      retrievalTokens, prefillTokens, hostBytes, retrievalInterval, 0);
     }
 
     DLL_EXPORT void set_kv_cache_limit_llm_model(int modelId, long long bytes) {

@@ -1,16 +1,17 @@
 // Publish contiguous K/V page pairs without changing a captured graph's table address.
-__global__ void mapKvPages(int2 *table, int count, uint8_t *base, size_t pairBytes) {
+__global__ void mapKvPages(int2 *table, int count, uint8_t *base, size_t pairBytes, int offset, int slots) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) {
-        const uintptr_t ptr = reinterpret_cast<uintptr_t>(base + i * pairBytes);
+        const int slot = offset + i;
+        const uintptr_t ptr = reinterpret_cast<uintptr_t>(base + size_t(slot < slots ? slot : slot % slots) * pairBytes);
         table[i] = make_int2(uint32_t(ptr), uint32_t(ptr >> 32));
     }
 }
 
-// Host pages own every byte. Only sealed (immutable) pages enter the device ring.
+// Host pages own the retained KV. Only sealed (immutable) pages enter the device ring.
 // A speculative write therefore always targets the host, even after a rejection.
 class MappedKvPages {
-    const int limit, resident;
+    const int limit, resident, hostPages;
     const size_t pairBytes;
     Buffer<int2> table;
     Buffer<uint8_t> hot;
@@ -31,18 +32,25 @@ class MappedKvPages {
         }
     }
 
-    void map(int first, int count, uint8_t *base) {
-        mapKvPages<<<(count + 127) / 128, 128, 0, cudaStreamPerThread>>>(table.p + first, count, base, pairBytes);
+    void map(int first, int count, uint8_t *base, int offset, int slots) {
+        mapKvPages<<<1 + (count - 1) / 128, 128, 0, cudaStreamPerThread>>>(
+            table.p + first, count, base, pairBytes, offset, slots);
         check(cudaGetLastError());
     }
 public:
-    MappedKvPages(int pages, int hotPages, size_t bytes)
-        : limit(pages), resident(std::min(pages, hotPages)), pairBytes(bytes), table(pages), hot(resident * bytes) {
+    MappedKvPages(MappedPageCounts pages, size_t bytes)
+        : limit(pages.logical), resident(pages.resident), hostPages(pages.host),
+          pairBytes(bytes), table(limit), hot(resident * bytes) {
         uint8_t *ptr = nullptr;
-        check(cudaHostAlloc(&ptr, size_t(limit) * pairBytes, cudaHostAllocMapped | cudaHostAllocPortable));
+        check(cudaHostAlloc(&ptr, size_t(hostPages) * pairBytes, cudaHostAllocMapped | cudaHostAllocPortable));
         host.reset(ptr);
         check(cudaHostGetDevicePointer(&mapped, ptr, 0));
-        map(0, limit, mapped);
+        map(0, limit, mapped, 0, hostPages);
+    }
+    // Prefill attends to its entire current chunk before appending the KV.
+    // Discard the expired prefix of a long write so two CTAs never write the same host slot.
+    int appendRows(int rows, int pageLen) const {
+        return hostPages == limit ? rows : int(std::min<int64_t>(rows, int64_t(hostPages - 1) * pageLen + 1));
     }
     const int2 *addresses() const { return table.p; }
 
@@ -71,14 +79,15 @@ public:
         const int firstEvicted = std::max(0, sealed - resident);
         const int endEvicted = std::min(sealed, begin);
         if (endEvicted > firstEvicted)
-            map(firstEvicted, endEvicted - firstEvicted, mapped + size_t(firstEvicted) * pairBytes);
+            map(firstEvicted, endEvicted - firstEvicted, mapped, firstEvicted % hostPages, hostPages);
         for (int p = std::max(begin, sealed); p < committedPages;) {
             const int slot = p % resident;
-            const int n = std::min(committedPages - p, resident - slot);
+            const int source = p % hostPages;
+            const int n = std::min({committedPages - p, resident - slot, hostPages - source});
             auto *dst = hot.p + slot * pairBytes;
-            check(cudaMemcpyAsync(dst, host.get() + size_t(p) * pairBytes, n * pairBytes,
+            check(cudaMemcpyAsync(dst, host.get() + size_t(source) * pairBytes, n * pairBytes,
                                   cudaMemcpyHostToDevice, cudaStreamPerThread));
-            map(p, n, dst);
+            map(p, n, dst, 0, n);
             p += n;
         }
         sealed = committedPages;

@@ -307,7 +307,8 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
 template<class T> void checkMappedPages() {
     constexpr int len = 16, width = 8, count = 10, hot = 2, span = len * width;
     const size_t sideBytes = span * sizeof(T);
-    MappedKvPages a(count, hot, 2 * sideBytes), b(count, hot, 2 * sideBytes);
+    const MappedPageCounts capacity{count, hot, count};
+    MappedKvPages a(capacity, 2 * sideBytes), b(capacity, 2 * sideBytes);
     int request = 0;
     for (auto *storage : {&a, &b}) {
         PageView view{nullptr, nullptr, storage->addresses(), 0, len, pageShift(len)};
@@ -360,12 +361,72 @@ template<class T> void checkMappedPages() {
     }
 }
 
+// Absolute positions keep working across host and device ring wraps, including
+// an unaligned prefill larger than the ring and overwrites after rejection.
+__global__ void readMappedWindow(PageView view, const int *end, int window, int2 *out) {
+    const int t = *end - window + threadIdx.x;
+    if (t >= 0) out[threadIdx.x] = make_int2(*view.row<int>(t, false, 1), *view.row<int>(t, true, 1));
+}
+
+void checkSlidingHostPages() {
+    constexpr int len = 16, window = 32, block = 8, pages = 32;
+    Config model{};
+    model.window = window;
+    model.draft.block = block;
+    KvMemConfig kv;
+    kv.residentTokens = len;
+    const auto capacity = model.mappedKvPages(kv, pages * len, len, false, true);
+    MappedKvPages storage(capacity, 2 * len * sizeof(int));
+    PageView view{nullptr, nullptr, storage.addresses(), 0, len, pageShift(len)};
+    std::vector<int2> initial(pages);
+    check(cudaMemcpyAsync(initial.data(), view.ids, pages * sizeof(int2), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    check(cudaStreamSynchronize(cudaStreamPerThread));
+    if (capacity.host != 4 || memcmp(&initial[0], &initial[capacity.host], sizeof(int2)))
+        throw std::runtime_error("Sliding window did not reuse its host backing");
+    Buffer<int> end(1);
+    Buffer<int2> actual(window);
+    cudaGraph_t graph;
+    cudaGraphExec_t exec;
+    check(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal));
+    readMappedWindow<<<1,window,0,cudaStreamPerThread>>>(view, end.p, window, actual.p);
+    check(cudaStreamEndCapture(cudaStreamPerThread, &graph));
+    check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    std::vector<int> reference;
+    int serial = 0;
+    constexpr std::pair<int, int> steps[] = {{47, 47}, {8, 1}, {8, 0}, {8, 8}, {103, 103},
+                                             {8, 3}, {8, 1}, {8, 8}, {127, 127}, {8, 2}};
+    for (auto [rows, accepted] : steps) {
+        const int past = int(reference.size());
+        storage.prepare((past + rows + len - 1) / len, past / len);
+        std::vector<int> key(rows), value(rows);
+        for (int i = 0; i < rows; ++i) { key[i] = ++serial; value[i] = -serial; }
+        auto k = upload(key), v = upload(value);
+        int keep = storage.appendRows(rows, len);
+        appendKv<<<1,128,0,cudaStreamPerThread>>>(view, k.p, v.p, past, rows - keep, 1, keep);
+        reference.insert(reference.end(), key.begin(), key.begin() + accepted);
+        const int length = int(reference.size());
+        storage.prepare((length + len - 1) / len, length / len);
+        check(cudaMemcpyAsync(end.p, &length, sizeof(int), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        check(cudaGraphLaunch(exec, cudaStreamPerThread));
+        std::vector<int2> observed(window);
+        check(cudaMemcpyAsync(observed.data(), actual.p, window * sizeof(int2), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        check(cudaStreamSynchronize(cudaStreamPerThread));
+        for (int i = 0; i < window; ++i) {
+            int expected = reference[length - window + i];
+            if (observed[i].x != expected || observed[i].y != -expected)
+                throw std::runtime_error("Sliding host ring lost a committed token");
+        }
+    }
+    check(cudaGraphExecDestroy(exec));
+    check(cudaGraphDestroy(graph));
+}
+
 // Two queries reverse the ranking, while replay uses identical graph addresses.
 // Check selected logical IDs, chronological order and the absolute bias/sink/tau
 // arithmetic against an independent scalar attention over those IDs.
 template<class T> void checkSelectedPages(DataType type) {
     constexpr int D = 128, len = 16, pages = 11, hot = 4, past = 10 * len + 3, span = D * len;
-    MappedKvPages storage(pages, hot, 2 * span * sizeof(T));
+    MappedKvPages storage({pages, hot, pages}, 2 * span * sizeof(T));
     KvMemConfig cfg;
     cfg.sinkTokens = len; cfg.recentTokens = len; cfg.retrievalTokens = 2 * len;
     storage.selectPages(cfg, type, len, 1, 1, D);
@@ -459,6 +520,7 @@ int testRelative() {
     checkSelectedPages<half>(FLOAT16);
     checkSelectedPages<__nv_bfloat16>(BFLOAT16);
     checkSelectedPages<__nv_fp8_e4m3>(FP8_E4M3);
+    checkSlidingHostPages();
     checkMappedPages<float>();
     checkMappedPages<half>();
     checkMappedPages<nv_bfloat16>();

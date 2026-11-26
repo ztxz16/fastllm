@@ -112,13 +112,15 @@ template <class T> void storeFeatures(Request &req, const std::vector<Matrix> &f
         int past = req.length + skip, end = past + count, begin = local ? std::max(0, end - d.window) : 0;
         auto &cache = state.kv[i]->cache;
         cache.prepare(end, local ? d.window : 0);
-        DraftView view{cache.view(), nullptr, past, begin};
-        dim3 grid(count, d.kvHeads);
-        draftHead<T, 1>
-            <<<grid, d.dim, 0, cudaStreamPerThread>>>(k.p, nullptr, param(pre + "self_attn.k_norm_ctx.weight", d.dim),
-                                                      d.kvHeads, d.dim, d.eps, d.theta, count, view, nullptr);
-        draftHead<T, 2><<<grid, d.dim, 0, cudaStreamPerThread>>>(v.p, nullptr, nullptr, d.kvHeads, d.dim, d.eps,
-                                                                 d.theta, count, view, nullptr);
+        const int written = cache.mapped ? cache.mapped->appendRows(count, cache.key->pageLen) : count;
+        const int skipped = count - written;
+        DraftView view{cache.view(), nullptr, past + skipped, begin};
+        dim3 grid(written, d.kvHeads);
+        draftHead<T, 1><<<grid, d.dim, 0, cudaStreamPerThread>>>(
+            k.p + size_t(skipped) * k.cols, nullptr, param(pre + "self_attn.k_norm_ctx.weight", d.dim),
+            d.kvHeads, d.dim, d.eps, d.theta, written, view, nullptr);
+        draftHead<T, 2><<<grid, d.dim, 0, cudaStreamPerThread>>>(
+            v.p + size_t(skipped) * v.cols, nullptr, nullptr, d.kvHeads, d.dim, d.eps, d.theta, written, view, nullptr);
     }
 }
 

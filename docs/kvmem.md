@@ -13,7 +13,7 @@ ftllm server MODEL --auto --max_batch 2 --kv_cache_dtype fp8_e4m3 \
   --kvmem '{"max_tokens":32768,"resident_tokens":2048,"host_mib":8192}'
 ```
 
-全量 K/V 按指定 dtype 写入 CUDA 映射的页锁定主存。主模型的全局 Attention 为每个已提交的完整页建立 mean-K 索引。完整历史页超过显存热缓存后，通用 CUDA 选页后端使用本次首行的归一化 query 对每个 query head 独立评分并归一化，再合并各 head 的分数。它保留开头的 `sink_tokens`、末尾的 `recent_tokens` 和得分最高的 `retrieval_tokens`，分数相同时优先更早的页。选中的完整页按需换入显存，仍然命中的页沿用原槽位。Attention 继续按绝对位置计算距离偏置和温度。稀疏选页可能改变生成结果。
+全局层的完整 K/V 按指定 dtype 写入 CUDA 映射的页锁定主存，滑窗层循环复用主存页。主模型的全局 Attention 为每个已提交的完整页建立 mean-K 索引。完整历史页超过显存热缓存后，通用 CUDA 选页后端使用本次首行的归一化 query 对每个 query head 独立评分并归一化，再合并各 head 的分数。它保留开头的 `sink_tokens`、末尾的 `recent_tokens` 和得分最高的 `retrieval_tokens`，分数相同时优先更早的页。选中的完整页按需换入显存，仍然命中的页沿用原槽位。Attention 继续按绝对位置计算距离偏置和温度。稀疏选页可能改变生成结果。
 
 一组分块 prefill 或同一请求的一轮验证共享首行的选页。当前分块、未满页以及待验证尾部按因果顺序直接可见；只有已提交的完整页能进入检索索引。普通 decode 可在页内复用检索，验证由 `retrieval_interval` 控制刷新，新增完整页会刷新。每个请求和 TP rank 独立管理相应的 KV head 与页表。主模型滑窗层和草稿沿用各自的注意力规则，滑窗热缓存至多按窗口长度向上对齐到页。
 
@@ -22,12 +22,14 @@ ftllm server MODEL --auto --max_batch 2 --kv_cache_dtype fp8_e4m3 \
 ```bash
 ftllm server MODEL --auto --max_batch 1 --dspark 0 --kv_cache_dtype fp8_e4m3 \
   --max_context_length 1048576 \
-  --kvmem '{"max_tokens":1048576,"resident_tokens":32768,"sink_tokens":128,"recent_tokens":2048,"retrieval_tokens":30592,"prefill_tokens":2048,"host_mib":100352}'
+  --kvmem '{"max_tokens":1048576,"resident_tokens":32768,"sink_tokens":128,"recent_tokens":2048,"retrieval_tokens":30592,"prefill_tokens":2048,"host_mib":17408}'
 ```
 
-`host_mib` 为所有并发、层和 TP rank 合计的 KV 主存预算，启动时按配置容量校验。每个请求在首次 prefill 时按输入长度加最大输出长度预留页锁定主存，并建立 GPU 页表，最大为请求的上下文上限。未指定输出上限时按请求的上下文上限预留。草稿另留验证所需的尾部空间。此后跨页只更新索引和热缓存，请求结束时释放预留空间。
+`host_mib` 为所有并发、层和 TP rank 合计的 KV 主存预算，启动时按配置容量校验。每个请求在首次 prefill 时按输入长度加最大输出长度为全局层预留页锁定主存，并建立 GPU 页表，最大为请求的上下文上限。未指定输出上限时按请求的上下文上限预留。草稿另留验证所需的尾部空间。此后跨页只更新索引和热缓存，请求结束时释放预留空间。
 
-Mini 的主模型每步有 8 次全局、40 次滑窗访问。FP8 KV、无草稿、上下文长于热缓存时，每请求 2K 热预算占 112 MiB 显存，32K 占 592 MiB。GPU 页表、选页索引、计算工作区和草稿缓存另计。`--auto` 分别报告这些 KV 项目。此模式使用请求私有页，当前用于文本输入，关闭跨请求前缀复用。
+Inkling 的 `sliding_host_tokens` 控制主模型和草稿每个滑窗层在主存中保留的历史 token 数。默认 0，采用模型自身的窗口；更大的值扩大主存环形缓冲区。实现另留未对齐页和推测尾部空间。设置为逻辑上下文上限可保留完整滑窗历史。这项设置不会改变注意力窗口、GPU 热缓存或选页结果。
+
+Mini 的主模型每步有 8 次全局、40 次滑窗访问。FP8 KV、无草稿、上下文长于热缓存时，每请求 2K 热预算占 112 MiB 显存，其中滑窗占 80 MiB。32K 热预算合计占 592 MiB，滑窗仍占 80 MiB。GPU 页表、选页索引、计算工作区和草稿缓存另计。`--auto` 分别报告这些 KV 项目。此模式使用请求私有页，当前用于文本输入，关闭跨请求前缀复用。
 
 ## 参考来源
 

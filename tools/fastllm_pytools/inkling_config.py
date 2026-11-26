@@ -304,12 +304,22 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
         hot = kvmem.get("resident_tokens", 8192)
         if type(hot) is not int or not 0 < hot <= logical or hot % page:
             raise ValueError("KVMem resident_tokens must fit max_tokens and align to a KV page")
+        retained = kvmem.get("sliding_host_tokens", 0)
+        if type(retained) is not int or not 0 <= retained <= 2147483647:
+            raise ValueError("KVMem sliding_host_tokens must be a nonnegative 32-bit integer")
         def aligned(n):
             return (n + page - 1) // page * page
-        pages = aligned(logical) // page
+
+        def host_slots(tokens, num_global, num_local, window):
+            provisional = draft["block_size"] - 1 if draft else 0
+            sliding = min(tokens, aligned(max(window, retained) + provisional + page - 1))
+            return num_global * tokens + num_local * sliding
+
+        target_tokens = aligned(logical)
+        pages = target_tokens // page
         target_visits = g.local + g.global_
         target_pair = 2 * unit * g.kv * head_width
-        host_kv = batch * pages * page * target_visits * target_pair
+        host_kv = batch * host_slots(target_tokens, g.global_, g.local, g.window) * target_pair
         target_slots = g.global_ * hot + g.local * min(hot, aligned(g.window))
         hot_kv = batch * target_slots * target_pair
         tables = batch * target_visits * pages * 8
@@ -317,9 +327,11 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
             draft_layers = draft["num_hidden_layers"]
             draft_pair = 4 * draft["num_key_value_heads"] * draft["head_dim"]
             draft_tokens = aligned(min(logical, draft.get("max_position_embeddings", logical)) + draft["block_size"] - 1)
-            host_kv += batch * draft_tokens * draft_layers * draft_pair
             draft_hot = min(hot, draft_tokens)
             local_layers = len(draft["local_layer_ids"])
+            draft_host_slots = host_slots(draft_tokens, draft_layers - local_layers, local_layers,
+                                          draft["sliding_window_size"])
+            host_kv += batch * draft_host_slots * draft_pair
             draft_slots = ((draft_layers - local_layers) * draft_hot
                            + local_layers * min(draft_hot, aligned(draft["sliding_window_size"])))
             hot_kv += batch * draft_slots * draft_pair

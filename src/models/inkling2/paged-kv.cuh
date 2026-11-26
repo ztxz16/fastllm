@@ -48,10 +48,11 @@ struct VisitCache {
                 pageTable(), first, key->pageLen, shift};
     }
 
-    void attachMapped(const Data &desc, int limitPages, int residentPages, const int &length, const KvMemConfig *selection = nullptr, int qHeads = 0) {
+    void attachMapped(const Data &desc, MappedPageCounts pages, const int &length,
+                      const KvMemConfig *selection = nullptr, int qHeads = 0) {
         const int len = GetPageLen();
         const size_t sideBytes = GetDataBytes(desc.dataType, size_t(len) * desc.dims[0], desc.dims[2]);
-        mapped = std::make_unique<MappedKvPages>(limitPages, residentPages, 2 * sideBytes);
+        mapped = std::make_unique<MappedKvPages>(pages, 2 * sideBytes);
         if (selection) mapped->selectPages(*selection, desc.dataType, len, qHeads, desc.dims[0], desc.dims[2]);
         committed = &length;
         shift = pageShift(len);

@@ -314,16 +314,23 @@ void Inkling2Model::ConfigureKvMem(const KvMemConfig &config) {
         config.prefillTokens < 1 || !config.hostBytes || config.maxTokens > INT_MAX - cfg.draft.block ||
         (GetMaxTokens() > 0 && GetMaxTokens() < config.maxTokens))
         throw std::invalid_argument("Inkling KVMem requires a CUDA backbone, a page-aligned resident_tokens within max_tokens, and valid context and prefill limits");
+    if (config.slidingHostTokens < 0) throw std::invalid_argument("KVMem sliding_host_tokens must be nonnegative");
     if (config.retrievalInterval < 1 || config.sinkTokens < 0 || config.recentTokens < 0 || config.retrievalTokens < 0 ||
         config.sinkTokens % page || config.recentTokens % page || config.retrievalTokens % page)
         throw std::invalid_argument("Inkling KVMem requires page-aligned nonnegative selection budgets and a positive retrieval interval");
-    const auto aligned = [page](int64_t n) { return (n + page - 1) / page * page; };
-    const size_t targetRow = GetDataBytes(kvCacheDataType, cfg.kvHeads, cfg.headDim <= 64 ? 64 : 128);
-    const auto &d = cfg.draft;
-    const uint64_t target = 2 * cfg.visits.size() * targetRow * aligned(config.maxTokens);
-    const uint64_t draft = d.steps ? 4ULL * d.layers * d.kvHeads * d.dim *
-        aligned(std::min(config.maxTokens, d.maxPositions) + int64_t(d.block - 1)) : 0;
-    if ((target + draft) > config.hostBytes / batch)
+    const auto hostBytes = [&](bool draft, bool local, size_t pairBytes) {
+        const auto pages = cfg.mappedKvPages(config, config.maxTokens, page, draft, local);
+        return uint64_t(pages.host) * page * pairBytes;
+    };
+    const size_t targetPair = 2 * GetDataBytes(kvCacheDataType, cfg.kvHeads, cfg.headDim <= 64 ? 64 : 128);
+    uint64_t perRequest = 0;
+    for (int layer : cfg.visits)
+        perRequest += hostBytes(false, cfg.local[layer], targetPair);
+    if (cfg.draft.steps) {
+        for (bool local : cfg.draft.local)
+            perRequest += hostBytes(true, local, 4ULL * cfg.draft.kvHeads * cfg.draft.dim);
+    }
+    if (perRequest > config.hostBytes / batch)
         throw std::invalid_argument("Inkling KVMem host_mib cannot back the target and draft KV for max_batch requests");
     if (!beforeKvMem) beforeKvMem.reset(new ServingLimits{max_positions, maxBatch, tokensLimit, promptLimit, saveHistoryChat});
     SetSaveHistoryChat(false);

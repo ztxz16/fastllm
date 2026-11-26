@@ -1357,7 +1357,8 @@ class Decoder final : public Runtime {
             else {
                 auto store = [cache, past, window, currentKey, currentValue, kvWidth](int length) {
                     cache->prepare(past + length, window);
-                    int rows = window && !cache->mapped ? std::min(length, window) : length;
+                    int rows = cache->mapped ? cache->mapped->appendRows(length, cache->key->pageLen) :
+                               window ? std::min(length, window) : length;
                     appendKv<<<(size_t(rows)*kvWidth+255)/256,256,0,cudaStreamPerThread>>>(
                         cache->view(), currentKey.p, currentValue.p, past, length-rows, kvWidth, rows);
                 };
@@ -2237,20 +2238,6 @@ class Decoder final : public Runtime {
         }
     }
 
-    int hostPagesPerVisit(bool draft, int tokenLimit) const {
-        const int64_t tokens = draft ? int64_t(std::min(tokenLimit, c.draft.maxPositions)) + c.draft.block - 1
-                                     : tokenLimit;
-        return int((tokens - 1) / GetPageLen() + 1);
-    }
-
-    int hotPages(bool draft, bool local) const {
-        const int len = GetPageLen();
-        const int limit = model.kvMemConfig.residentTokens / len;
-        if (!local) return limit;
-        const int window = draft ? c.draft.window : c.window;
-        return std::min(limit, (window - 1) / len + 1);
-    }
-
     int poolPages(int tokenLimit, bool draft, bool local) const {
         const int len = GetPageLen();
         const int batch = std::max(1, model.maxBatch);
@@ -2277,11 +2264,11 @@ class Decoder final : public Runtime {
             const bool local = draft ? c.draft.local[slot - slots] : c.local[c.visits[slot]];
             const int width = draft ? c.draft.kvHeads * c.draft.dim : c.kvHeads * attentionWidth(c.headDim);
             if (model.kvMemConfig.enabled) {
-                const int logical = hostPagesPerVisit(draft, model.kvMemConfig.maxTokens);
-                const int hot = std::min(logical, hotPages(draft, local));
+                const auto &kv = model.kvMemConfig;
+                const auto pages = c.mappedKvPages(kv, kv.maxTokens, len, draft, local);
                 const size_t pair = 2 * GetDataBytes(draft ? FLOAT16 : kvType, len, width);
-                bytes += size_t(model.maxBatch) * (size_t(logical) * sizeof(int2) + hot * pair);
-                if (!draft && !local) bytes += size_t(model.maxBatch) * kv_selection::Bytes(logical, hot, width, c.heads);
+                bytes += size_t(model.maxBatch) * (size_t(pages.logical) * sizeof(int2) + pages.resident * pair);
+                if (!draft && !local) bytes += size_t(model.maxBatch) * kv_selection::Bytes(pages.logical, pages.resident, width, c.heads);
                 continue;
             }
             const int pages = poolPages(tokens, draft, local);
@@ -2487,7 +2474,8 @@ class Decoder final : public Runtime {
                         v.key = &owned->key;
                         v.value = &owned->value;
                         if (model.kvMemConfig.enabled) {
-                            v.attachMapped(draftDesc, hostPagesPerVisit(true, req.limit), hotPages(true, c.draft.local[l]), req.length);
+                            const auto pages = c.mappedKvPages(model.kvMemConfig, req.limit, len, true, c.draft.local[l]);
+                            v.attachMapped(draftDesc, pages, req.length);
                             continue;
                         }
                         const int pool = 2 * placement.cacheSlot(int(c.visits.size()) + l);
@@ -2513,8 +2501,10 @@ class Decoder final : public Runtime {
                 for (size_t slot = 0; slot < c.visits.size(); ++slot) {
                     auto &v = req.visits[slot];
                     if (model.kvMemConfig.enabled) {
-                        v.attachMapped(desc, hostPagesPerVisit(false, req.limit), hotPages(false, c.local[c.visits[slot]]), req.length,
-                                       c.local[c.visits[slot]] ? nullptr : &model.kvMemConfig, c.heads);
+                        const bool local = c.local[c.visits[slot]];
+                        const auto &kv = model.kvMemConfig;
+                        v.attachMapped(desc, c.mappedKvPages(kv, req.limit, len, false, local), req.length,
+                                       local ? nullptr : &kv, c.heads);
                         continue;
                     }
                     const int pages = poolPages(tokenLimit, false, c.local[c.visits[slot]]);

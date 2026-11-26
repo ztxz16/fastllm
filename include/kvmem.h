@@ -7,7 +7,7 @@
 #include <vector>
 
 namespace fastllm {
-    // Model-local and opt-in. All token budgets except maxTokens are page aligned.
+    // Model-local, opt-in KV storage policy.
     struct KvMemConfig {
         bool enabled = false;
         int maxTokens = 32768;
@@ -20,6 +20,8 @@ namespace fastllm {
         // every round. Independent of physical page size and token budgets.
         int retrievalInterval = 64;
         uint64_t hostBytes = 8ULL << 30;
+        // Inkling sliding layers retain at least their attention window in host memory.
+        int slidingHostTokens = 0;
 
         void Validate(int pageLen) const;
     };
