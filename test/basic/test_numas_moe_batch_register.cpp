@@ -4,6 +4,8 @@
 #include "devices/numas/numas.h"
 #include "utils/hostbufferreclaim.h"
 #include <cstring>
+#include <fstream>
+#include <numaif.h>
 #include <memory>
 #include <stdexcept>
 #include <cstdio>
@@ -117,8 +119,55 @@ static void TestChunkBoundaries() {
         weight->numasData.clear();
     }
 }
+// This check requires a host that permits mbind and move_pages queries.
+static void CheckMoeMapping(const std::vector<Data*> &weights, int nodes) {
+    const auto base = uintptr_t(weights.front()->numasData.front());
+    std::ifstream maps("/proc/self/maps");
+    uintptr_t first = 0, last = 0;
+    for (std::string line; std::getline(maps, line);) {
+        if (std::sscanf(line.c_str(), "%lx-%lx", &first, &last) == 2 && first <= base && base < last) break;
+    }
+    for (const auto *w : weights) {
+        for (int node = 0; node < nodes; ++node) {
+            auto start = uintptr_t(w->numasData[node]);
+            Check(start >= first && start + w->GetBytes() / nodes <= last, "MoE batch spans multiple VMAs");
+            void *page = reinterpret_cast<void*>(start - start % sysconf(_SC_PAGESIZE));
+            int actual = -1;
+            Check(move_pages(0, 1, &page, nullptr, &actual, 0) == 0 &&
+                  actual == GetNumasPhysicalNode(node), "MoE pages on wrong node");
+        }
+    }
+}
+
+static void TestBatchMapping() {
+    SetThreads(4);
+    const int nodes = GetNumasMoeShardCount();
+    Check(nodes > 1, "layout test requires multiple NUMA nodes");
+    std::vector<std::unique_ptr<Data>> owners;
+    std::vector<std::pair<Data*, std::string>> pending;
+    for (int i = 0; i < 4; ++i) {
+        owners.push_back(MakeWeight(i));
+        pending.emplace_back(owners.back().get(), "linearColumn");
+    }
+    RegisterNumasMoeWeightBatch(pending);
+    std::vector<Data*> batch;
+    for (const auto &w : owners) batch.push_back(w.get());
+    CheckMoeMapping(batch, nodes);
+
+    // At two nodes the matrix is 128 KiB, with two 64 KiB registrations on retry.
+    Data matrix(BFLOAT16, {256, 256});
+    matrix.Allocate();
+    std::memset(matrix.cpuData, 0x35, matrix.GetBytes());
+    RegisterNumas(&matrix, "linearColumn");
+    CheckMoeMapping({&matrix}, nodes);
+}
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--vma") {
+            TestBatchMapping();
+            std::puts("PASS: shared MoE VMA and physical NUMA placement");
+            return 0;
+        }
         TestSourcePageReclaim();
 #ifdef USE_CUDA
         int devices = 0;
@@ -210,6 +259,7 @@ int main(int argc, char **argv) {
         }
 #endif
         for (auto &weight : reference) {
+            ReleaseNumasMoeWeightArena(weight.get());
             for (auto *ptr : weight->numasData) {
                 if (weight->isPinned) free_pinned_numa(ptr, weight->GetBytes() / nodes + 63);
                 else free_aligned_numa(ptr, weight->GetBytes() / nodes + 63);

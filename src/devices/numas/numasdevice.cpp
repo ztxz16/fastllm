@@ -3143,8 +3143,22 @@ namespace fastllm {
     }
 
     namespace {
+        using NumaMask = std::unique_ptr<bitmask, decltype(&numa_bitmask_free)>;
+
+        // Each NUMA shard starts on a new page, including when the last row is partial.
+        bool MoeMatrixSpan(size_t shardBytes, int count, size_t &stride, size_t &bytes) {
+            const size_t page = getpagesize();
+            if (count <= 0 || !shardBytes || shardBytes > SIZE_MAX - page) return false;
+            stride = (shardBytes + page - 1) / page * page;
+            if (size_t(count - 1) > (SIZE_MAX - 63 - shardBytes) / stride) return false;
+            bytes = (count - 1) * stride + shardBytes;
+            return true;
+        }
+
         struct NumasMoeWeightArena {
             size_t bytes;
+            size_t mappingBytes = 0;
+            NumaMask placement{nullptr, numa_bitmask_free};
             std::vector<uint8_t*> nodes;
             std::vector<bool> pinned;
 
@@ -3158,10 +3172,64 @@ namespace fastllm {
                     if (pinned[node]) FastllmCudaHostUnregister(nodes[node]);
 #endif
                     // allocate_aligned_numa reserves 63 extra bytes for alignment.
-                    free_aligned_numa(nodes[node], bytes + 63);
+                    if (!mappingBytes) free_aligned_numa(nodes[node], bytes + 63);
+                }
+                if (mappingBytes) free_aligned_numa(nodes[0], mappingBytes + 63);
+            }
+
+            // All copy workers have joined. Changing policy without MPOL_MF_MOVE
+            // coalesces shard VMAs while leaving their resident pages in place.
+            void FinishPlacement() {
+                if (placement) {
+                    mbind(nodes[0], mappingBytes, MPOL_BIND, placement->maskp, placement->size, 0);
+                    placement.reset(); // On failure the per-node bindings remain valid.
                 }
             }
         };
+
+        std::shared_ptr<NumasMoeWeightArena> AllocateMoeBatchArena(size_t shardBytes, int count) {
+            size_t stride, span;
+            if (count > 1 && !HostMoeIsUnbound() && MoeMatrixSpan(shardBytes, count, stride, span)) {
+                auto arena = std::make_shared<NumasMoeWeightArena>(shardBytes, count);
+                {
+                    HostMoePlacementScope unbound(true);
+                    arena->nodes[0] = static_cast<uint8_t*>(allocate_aligned_numa(span, 0));
+                }
+                if (arena->nodes[0]) {
+                    arena->mappingBytes = span;
+                    arena->placement.reset(numa_allocate_nodemask());
+                    NumaMask single(numa_allocate_nodemask(), numa_bitmask_free);
+                    bool bound = arena->placement && single;
+#ifdef MADV_NOHUGEPAGE
+                    bound = bound && madvise(arena->nodes[0], span, MADV_NOHUGEPAGE) == 0;
+#endif
+                    for (int i = 0; bound && i < count; ++i) {
+                        const int node = GetNumasPhysicalNode(i);
+                        if (node < 0 || static_cast<unsigned>(node) >= single->size) {
+                            bound = false;
+                            break;
+                        }
+                        arena->nodes[i] = arena->nodes[0] + i * stride;
+                        numa_bitmask_clearall(single.get());
+                        numa_bitmask_setbit(single.get(), node);
+                        numa_bitmask_setbit(arena->placement.get(), node);
+                        const size_t bindBytes = i == 0 ? span : shardBytes;
+                        bound = mbind(arena->nodes[i], bindBytes, MPOL_BIND, single->maskp, single->size, 0) == 0;
+                        // Fault the first page on node zero before splitting policies.
+                        // The split VMAs then inherit one anonymous-memory identity
+                        // and can merge again after parallel workers fault their rows.
+                        if (bound && i == 0) *static_cast<volatile uint8_t*>(arena->nodes[0]) = 0;
+                    }
+                    if (bound) return arena;
+                }
+            }
+            auto arena = std::make_shared<NumasMoeWeightArena>(shardBytes, count);
+            for (int i = 0; i < count; ++i) {
+                arena->nodes[i] = static_cast<uint8_t*>(allocate_aligned_numa(shardBytes, i));
+                if (!arena->nodes[i]) return nullptr;
+            }
+            return arena;
+        }
 
         struct NumasMoeWeightArenaOwners {
             std::mutex mutex;
@@ -3174,8 +3242,6 @@ namespace fastllm {
             static auto *owners = new NumasMoeWeightArenaOwners;
             return *owners;
         }
-
-        using NumaMask = std::unique_ptr<bitmask, decltype(&numa_bitmask_free)>;
 
         class ScopedMoeThreadPolicy {
             NumaMask saved{numa_allocate_nodemask(), numa_bitmask_free};
@@ -3210,14 +3276,11 @@ namespace fastllm {
         // on the populated mapping keeps one VMA per matrix and one CUDA registration.
         template<class WriteShard>
         bool StoreHostMoeMatrix(Data &weight, size_t shardBytes, int numaShards, bool pin,
-                                const WriteShard &write, bool retryPinByShard = false) {
+                                const WriteShard &write) {
             if (shardBytes == 0 || numaShards < 0) return false;
             const int count = std::max(numaShards, 1);
-            const size_t page = getpagesize();
-            if (shardBytes > SIZE_MAX - page) return false;
-            const size_t stride = (shardBytes + page - 1) / page * page;
-            if (size_t(count - 1) > (SIZE_MAX - 63 - shardBytes) / stride) return false;
-            const size_t bytes = (count - 1) * stride + shardBytes;
+            size_t stride, bytes;
+            if (!MoeMatrixSpan(shardBytes, count, stride, bytes)) return false;
             auto arena = std::make_shared<NumasMoeWeightArena>(bytes, 1);
             {
                 HostMoePlacementScope unbound(true);
@@ -3247,7 +3310,7 @@ namespace fastllm {
                     numa_bitmask_setbit(single.get(), physical);
                     // Retain explicit shard binding when task policies are restricted.
                     if (!policy.bind(*single) &&
-                        mbind(shards[i], shardBytes, MPOL_BIND, single->maskp, single->size, 0) != 0)
+                        mbind(shards[i], i == 0 ? bytes : shardBytes, MPOL_BIND, single->maskp, single->size, 0) != 0)
                         return false;
                     write(i, shards[i]);
                 }
@@ -3258,7 +3321,24 @@ namespace fastllm {
 #ifdef USE_CUDA
             if (pin) {
                 arena->pinned[0] = FastllmCudaHostRegister(arena->nodes[0], bytes);
-                if (!arena->pinned[0] && retryPinByShard) return false;
+                if (!arena->pinned[0] && count > 1) {
+                    // Retry in place. A registration limit must not multiply mappings
+                    // or force another copy of an already placed expert matrix.
+                    arena->pinned.resize(count, false);
+                    arena->nodes = shards;
+                    arena->mappingBytes = bytes;
+                    for (int i = 0; i < count; ++i) {
+                        if (FastllmCudaHostRegister(shards[i], shardBytes)) {
+                            arena->pinned[i] = true;
+                            continue;
+                        }
+                        for (int j = 0; j < i; ++j) {
+                            FastllmCudaHostUnregister(shards[j]);
+                            arena->pinned[j] = false;
+                        }
+                        break;
+                    }
+                }
             }
 #endif
             auto &owners = GetNumasMoeWeightArenaOwners();
@@ -3266,7 +3346,7 @@ namespace fastllm {
             AssertInFastLLM(owners.weights.emplace(&weight, arena).second,
                             "Host MoE matrix already owns registered storage.");
             weight.numasData.swap(shards);
-            weight.isPinned = arena->pinned[0];
+            weight.isPinned = arena->pinned.back();
             return true;
         }
     }
@@ -3310,7 +3390,7 @@ namespace fastllm {
 
             auto writeShards = [&](size_t size, const auto &write) {
                 if (allowPinned && !HostMoeIsUnbound() && numaConfig->numaCnt > 1 &&
-                    StoreHostMoeMatrix(*data, size, numaConfig->numaCnt, usePinned, write, true)) {
+                    StoreHostMoeMatrix(*data, size, numaConfig->numaCnt, usePinned, write)) {
                     allPinned = data->isPinned;
                     return;
                 }
@@ -3704,7 +3784,7 @@ namespace fastllm {
                 arenaBytes += entry.shardBytes;
             }
             // Lazy registration can present just one GGUF or EXL3 matrix. Keep
-            // multi-matrix batches in their existing per-node arenas.
+            // the single-registration shortcut for eligible individual matrices.
             if (entries.size() == 1 && config->numaCnt > 1 && !HostMoeIsUnbound() &&
                 (!usePinned || arenaBytes <= batchBytes / config->numaCnt)) {
                 const Entry &entry = entries.front();
@@ -3715,7 +3795,7 @@ namespace fastllm {
                     else
                         memcpy(dst, weight.cpuData + node * entry.shardBytes, entry.shardBytes);
                 };
-                if (StoreHostMoeMatrix(weight, entry.shardBytes, config->numaCnt, usePinned, write, true)) {
+                if (StoreHostMoeMatrix(weight, entry.shardBytes, config->numaCnt, usePinned, write)) {
                     ReleaseSourceOp release(entries, 0, 1);
                     release.Run();
                     retainedReleaseBytes += release.retainedBytes;
@@ -3727,12 +3807,8 @@ namespace fastllm {
                     return;
                 }
             }
-            auto arena = std::make_shared<NumasMoeWeightArena>(arenaBytes, config->numaCnt);
-            for (int node = 0; node < config->numaCnt; ++node) {
-                arena->nodes[node] = (uint8_t*)allocate_aligned_numa(arenaBytes, node);
-                AssertInFastLLM(arena->nodes[node] != nullptr,
-                               "NUMA MoE weight arena allocation failed.\n");
-            }
+            auto arena = AllocateMoeBatchArena(arenaBytes, config->numaCnt);
+            AssertInFastLLM(arena != nullptr, "NUMA MoE weight arena allocation failed.\n");
             // Copy and retire sources in smaller waves. An entire arena still
             // gets one CUDA registration, but no longer needs to coexist with
             // all of its source pages. This leaves headroom for unreleased edge
@@ -3799,6 +3875,7 @@ namespace fastllm {
                 }
                 begin = end;
             }
+            arena->FinishPlacement();
             // Populate pages before pinning the complete arena, as before.
 #ifdef USE_CUDA
             if (usePinned) {
@@ -3827,15 +3904,15 @@ namespace fastllm {
                     const size_t offset = entries[begin].offset;
                     const size_t bytes = entries[end - 1].offset +
                         entries[end - 1].shardBytes - offset;
-                    auto smaller = std::make_shared<NumasMoeWeightArena>(bytes, config->numaCnt);
-                    bool allocated = true;
-                    for (int node = 0; node < config->numaCnt; ++node) {
-                        smaller->nodes[node] = (uint8_t*)allocate_aligned_numa(bytes, node);
-                        if (smaller->nodes[node] == nullptr) { allocated = false; break; }
-                        memcpy(smaller->nodes[node], arena->nodes[node] + offset, bytes);
-                        smaller->pinned[node] = FastllmCudaHostRegister(smaller->nodes[node], bytes);
+                    auto smaller = AllocateMoeBatchArena(bytes, config->numaCnt);
+                    if (smaller) {
+                        for (int node = 0; node < config->numaCnt; ++node)
+                            memcpy(smaller->nodes[node], arena->nodes[node] + offset, bytes);
+                        smaller->FinishPlacement();
+                        for (int node = 0; node < config->numaCnt; ++node)
+                            smaller->pinned[node] = FastllmCudaHostRegister(smaller->nodes[node], bytes);
                     }
-                    if (allocated && allPinned(smaller)) {
+                    if (smaller && allPinned(smaller)) {
                         for (size_t i = begin; i < end; ++i) {
                             entryArenas[i] = smaller;
                             entryOffsets[i] = entries[i].offset - offset;
