@@ -27,9 +27,9 @@ class InklingAutoTest(unittest.TestCase):
                 kind, size = ("gguf:40", n // 64 * 36) if i < 20 else ("gguf:8", n // 32 * 34)
                 self.weights.append(mem.Tensor(f"blk.{i}.ffn_{suffix}_exps.weight", shape, size, kind))
 
-    def plan(self, *options, n=2, free_gib=None, numa=True):
+    def plan(self, *options, n=2, free_gib=None, numa=True, compact=False):
         args = make_normal_parser("test").parse_args(["model.gguf", "--auto", *options])
-        info = {i: {"capability": 120} for i in range(n)}
+        info = {i: {"capability": 120, "compact_nvfp4_moe": compact} for i in range(n)}
         with patch.dict(os.environ, {}, clear=True), patch.object(mem, "inventory", return_value=(self.meta, self.weights)), redirect_stdout(io.StringIO()):
             result = ink.resolve(args, lambda d: dict(total=72*mem.GiB, free=(free_gib[d] if free_gib else 71)*mem.GiB),
                                  (info, {}), dict(total=128*mem.GiB, available=125*mem.GiB), numa)
@@ -65,6 +65,61 @@ class InklingAutoTest(unittest.TestCase):
         self.assertEqual(args.moe_cuda_cache, plan["cache_slots_per_layer"] * stride)
         self.assertLessEqual(max(plan["weight_bytes_per_rank"] + plan["kv_bytes_per_rank"] +
                                  plan["workspace_bytes_per_rank"] + plan["prefix_cache_bytes_per_rank"], plan["root_load_peak_bytes"]) + args.moe_cuda_cache, 10 * mem.GiB)
+
+    def native_expert_weights(self, kinds):
+        g = ink.geometry(self.meta)
+        tensors = []
+        for layer, kind in enumerate(kinds):
+            for name, rows, cols in (("w13_weight", 2 * g.inter, g.hidden), ("w2_weight", g.hidden, g.inter)):
+                width = cols // 2 if kind == "U8" else cols
+                shape = (g.experts, rows, width)
+                tensors.append(mem.Tensor(f"model.llm.layers.{layer}.mlp.experts.{name}", shape,
+                                          g.experts * rows * width, kind))
+        return [self.weights[0], *tensors]
+
+    def test_native_expert_storage_and_repack_peak(self):
+        g = ink.geometry(self.meta)
+        tensors = self.native_expert_weights(["U8", "F8_E4M3", "F8_E4M3"])
+        fp4_bytes = sum(t.bytes for t in tensors if t.kind == "U8")
+        fp8_bytes = sum(t.bytes for t in tensors if t.kind == "F8_E4M3")
+        w = ink.weight_sizes(tensors, g)
+        self.assertEqual(w.compact_fp4_savings, fp4_bytes * 3 // 8)
+        self.assertEqual(w.repack_source, fp8_bytes // 2)
+        self.assertEqual(w.slot_bytes * g.experts, fp4_bytes * 3 // 2 + fp8_bytes * 9 // 8)
+        aux = (2 * 16 + 2 * ((2 * g.inter + g.hidden) * 4 + 2 * 24)) * g.experts
+        self.assertEqual(w.cuda_experts, w.slot_bytes * g.experts + aux)
+
+        self.weights = tensors
+        expanded = self.plan(n=1)[1]
+        compact = self.plan(n=1, compact=True)[1]
+        self.assertEqual(expanded["weight_bytes_per_rank"] - compact["weight_bytes_per_rank"],
+                         w.compact_fp4_savings)
+        self.assertEqual(compact["root_load_peak_bytes"] - compact["weight_bytes_per_rank"],
+                         max(w.largest, w.repack_source) + 512 * mem.MiB)
+        self.assertEqual(self.plan("--moe_device", "cpu", n=1)[1]["weight_bytes_per_rank"],
+                         self.plan("--moe_device", "cpu", n=1, compact=True)[1]["weight_bytes_per_rank"])
+
+    def test_recurrent_cuda_core(self):
+        self.weights = self.native_expert_weights(["U8"] * 20 + ["F8_E4M3"] * 4)
+        options = ("--auto_gpu_memory_limit", "18g")
+        for numa, host in ((False, "cpu"), (True, "numa")):
+            _, plan = self.plan(*options, n=1, compact=True, numa=numa)
+            self.assertEqual(plan["gpu_expert_layers"], list(range(6, 18)))
+            m = plan["recurrent_expert_placement"]
+            # Reproduce native SelectDeviceFromMap's sorted contiguous ranges.
+            def expand(device_map, count):
+                if isinstance(device_map, str):
+                    return [device_map] * count
+                return [name for name, n in sorted(device_map.items()) for _ in range(n)]
+            devices = expand(m["front"], 24 - m["tail_layers"]) + expand(m["tail"], m["tail_layers"])
+            self.assertEqual(devices, [host] * 6 + ["cuda:0"] * 12 + [host] * 6)
+            use = sum(plan[key] for key in ("weight_bytes_per_rank", "workspace_bytes_per_rank",
+                                            "prefix_cache_bytes_per_rank", "kv_bytes_per_rank"))
+            self.assertLessEqual(max(use, plan["root_load_peak_bytes"]) + plan["moe_cuda_cache"], 18 * mem.GiB)
+        for flags in (("--moe_device", "cpu"), ("--moe_cuda_cache", "1g")):
+            self.assertNotIn("gpu_expert_layers", self.plan(*options, *flags, n=1, compact=True)[1])
+        self.assertNotIn("gpu_expert_layers", self.plan(*options, n=1, compact=False)[1])
+        self.assertNotIn("gpu_expert_layers", self.plan(n=1, compact=True)[1])
 
     def test_prefix_pool_budget(self):
         options = ("--max_batch", "2", "--max_context_length", "8192")

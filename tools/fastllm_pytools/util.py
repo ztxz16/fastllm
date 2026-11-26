@@ -2221,7 +2221,15 @@ def make_normal_llm_model(args, startup_progress = None):
                 llm.set_device_map(args.device)
         except:
             llm.set_device_map(args.device)
-    if (args.moe_device and args.device != ""):
+    placement = (automatic_plan or {}).get("recurrent_expert_placement")
+    if automatic_plan and "autotune_placement" in automatic_plan:
+        disk = automatic_plan["autotune_placement"]
+        placement = dict(front=disk["front"], tail="disk", tail_layers=disk["disk_layers"])
+    if placement:
+        llm.set_device_map(placement["front"], True)
+        llm.set_layered_moe_device_map(placement["tail"])
+        llm.set_moe_device_layers(placement["tail_layers"])
+    elif args.moe_device and args.device:
         front_moe_device = device_map if isinstance(device_map, (list, dict)) else args.device
         if (_uses_thread_tp(tp_arg) and is_thread_tp_moe_model):
             front_moe_device = _thread_tp_cuda_device_spec(tp_arg) or args.device
@@ -2246,11 +2254,6 @@ def make_normal_llm_model(args, startup_progress = None):
                 llm.set_moe_device_layers(args.moe_device_layers)
             else:
                 llm.set_device_map(args.moe_device, True)
-    if automatic_plan and "autotune_placement" in automatic_plan:
-        placement = automatic_plan["autotune_placement"]
-        llm.set_device_map(placement["front"], True)
-        llm.set_layered_moe_device_map("disk")
-        llm.set_moe_device_layers(placement["disk_layers"])
     llm.set_cpu_threads(args.threads)
     llm.set_cpu_low_mem(args.low)
     if (args.cuda_embedding or getattr(args, "low_gpu_mem", False)):

@@ -787,6 +787,14 @@ def get_cuda_memory_info(device: int):
         raise RuntimeError("Cannot measure memory on CUDA device %d" % device)
     return {"free": int(values[0]), "total": int(values[1])}
 
+def cuda_supports_compact_nvfp4_moe(device: int):
+    query = getattr(fastllm_lib, "cuda_supports_compact_nvfp4_moe", None)
+    if query is None:
+        return False
+    query.argtypes = [ctypes.c_int]
+    query.restype = ctypes.c_bool
+    return bool(query(device))
+
 def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
                          max_bytes=0, min_heat=1., margin=1., factor=1.,
                          min_residence=0, prefill_prior=0., rank_by_bytes=False):

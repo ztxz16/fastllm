@@ -195,6 +195,14 @@ extern "C" {
 #endif
     }
 
+    DLL_EXPORT bool cuda_supports_compact_nvfp4_moe(int device) {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        return FastllmCudaNVFP4E4M3GroupedMoeSupported(device);
+#else
+        return false;
+#endif
+    }
+
     DLL_EXPORT bool set_moe_cache_policy(float halfLife, int updateInterval,
             int maxReplacements, uint64_t maxBytes, float minHeat, float margin,
             float factor, int minimumResidence, float prefillPrior, bool rankByBytes) {

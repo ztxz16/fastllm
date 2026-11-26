@@ -3,7 +3,7 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import hybrid_auto as memory
@@ -67,12 +67,19 @@ def geometry(meta):
 
 
 @dataclass
-class Weights:
+class ExpertStorage:
+    cuda_experts: int = 0
+    compact_fp4_savings: int = 0
+    repack_source: int = 0
+    slot_bytes: int = 0
+
+
+@dataclass
+class Weights(ExpertStorage):
     replicated: int = 0
     sharded: int = 0
-    cuda_experts: int = 0
-    slot_bytes: int = 0  # One complete gate/up + down record on every host layer.
     largest: int = 0
+    native_layers: dict = field(default_factory=dict)
 
 
 def weight_sizes(tensors, g):
@@ -85,12 +92,20 @@ def weight_sizes(tensors, g):
                 continue  # The record sizes below already include scales and outer factors.
             if t.shape[0] != g.experts:
                 raise ValueError("Inkling expert count disagrees with " + name)
+            savings = 0
             if t.kind == "U8":
                 host = 3 * t.bytes // (2 * g.experts)
-                gpu = host * g.experts  # Also covers the expanded block scales outside native FP4.
+                gpu = host * g.experts
+                # The compact GPU record uses one E4M3 byte per 8 packed code bytes.
+                if g.hidden % 128 == 0 and g.inter % 128 == 0 and g.top <= 16:
+                    savings = gpu - (t.bytes + t.bytes // 8)
+                    w.compact_fp4_savings += savings
+                gpu += g.experts * (8 + 2 * 4)  # Pointers and outer scales.
             elif t.kind == "F8_E4M3":
                 host = (n + n // 32 * 4) // g.experts
-                gpu = 2 * host * g.experts  # Indexed weights and grouped/persistent representation.
+                # Grouped packing releases the source. Budget the larger indexed
+                # fallback with one FP32 scale per block and its optional bias.
+                gpu = host * g.experts + g.experts * (t.shape[1] * 4 + 3 * 8)
             elif t.kind.startswith("gguf:"):
                 if t.kind in ("gguf:39", "gguf:40"):  # MXFP4 / NVFP4 -> 12 bytes per 16 elements on host.
                     host = n // (16 * g.experts) * 12
@@ -100,6 +115,15 @@ def weight_sizes(tensors, g):
                 gpu = t.bytes + 2 * g.experts * 8
             else:
                 raise ValueError("Unsupported Inkling expert encoding " + t.kind)
+            if t.kind in ("U8", "F8_E4M3"):
+                layer = w.native_layers.setdefault(name.rsplit(".", 1)[0], ExpertStorage())
+                layer.cuda_experts += gpu
+                layer.slot_bytes += host
+                layer.compact_fp4_savings += savings
+                # Indexed FP8 scales are host vectors during repack. FP4
+                # repacking takes the compact 9-byte source blocks as input.
+                source = t.bytes if t.kind == "F8_E4M3" else t.bytes + t.bytes // 8
+                layer.repack_source += source
             w.slot_bytes += host
             w.cuda_experts += gpu
             continue
@@ -118,9 +142,38 @@ def weight_sizes(tensors, g):
             w.sharded += size
         else:
             w.replicated += size
+    w.repack_source = max((layer.repack_source for layer in w.native_layers.values()), default=0)
     if not w.slot_bytes or not w.sharded:
         raise ValueError("Inkling --auto needs expert matrices and backbone projections")
     return w
+
+
+def _recurrent_experts(meta, weights):
+    text = meta.get("text_config", {})
+    loop = text.get("loop_config", {})
+    if loop.get("num_passes", 0) <= 1:
+        return None
+    start, end = loop["core_start"], loop["core_end"]
+    layers = text["num_hidden_layers"]
+    names = [f"model.llm.layers.{i}.mlp.experts" for i in range(layers)]
+    if end - start == layers or not all(name in weights.native_layers for name in names):
+        return None
+    core = [weights.native_layers[name] for name in names[start:end]]
+    storage = ExpertStorage(cuda_experts=sum(w.cuda_experts for w in core),
+                            compact_fp4_savings=sum(w.compact_fp4_savings for w in core),
+                            repack_source=max(w.repack_source for w in core),
+                            slot_bytes=sum(w.slot_bytes for w in core))
+    return start, end, layers, storage
+
+
+def _recurrent_device_map(start, end, layers, host, gpu):
+    # SelectDeviceFromMap traverses keys in lexical order. Use two consecutive
+    # maps to represent host / GPU / host for either spelling of the host device.
+    if host < gpu:
+        front = {host: start, gpu: end - start} if start else gpu
+        return dict(front=front, tail=host, tail_layers=layers - end)
+    tail = {gpu: end - start, host: layers - end} if end < layers else gpu
+    return dict(front=host, tail=tail, tail_layers=layers - start)
 
 
 def _device_id(spec, info):
@@ -244,6 +297,14 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
     limit = memory._memory_limit_bytes(args.auto_gpu_memory_limit, "auto_gpu_memory_limit")
     budgets = {d: memory.gpu_budget(query_gpu(d), args.gpu_mem_ratio, limit) for d in info}
 
+    compact = set()
+    if w.compact_fp4_savings:
+        if hardware is None:
+            from .llm import cuda_supports_compact_nvfp4_moe
+            compact = {d for d in info if cuda_supports_compact_nvfp4_moe(d)}
+        else:
+            compact = {d for d, card in info.items() if card.get("compact_nvfp4_moe", False)}
+
     root = _device_id(args.device, info) if "device" in explicit else None
     numa = env.use_numas if use_numa is None else use_numa
     host = "numa" if numa else "cpu"
@@ -260,7 +321,8 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
             raise ValueError("Inkling expert placement conflicts with the backbone or expert cache")
         root = requested
     if args.moe_cpu_cache not in (0, "auto") or args.moe_device_layers not in (-1, 0, "auto"):
-        raise ValueError("Inkling --auto supports all GPU experts or all host layers with a GPU cache")
+        raise ValueError("Inkling --auto requires automatic expert layer placement or --moe_device_layers 0, "
+                         "and does not support a separate CPU expert cache")
     force_gpu = bool(moe and not force_host) or args.moe_device_layers == 0
     tp = args.tp or os.environ.get("FASTLLM_TP", "")
     layouts = _layouts(tp, root, info, budgets, g, draft)
@@ -351,6 +413,9 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
     chunks = [args.chunked_prefill_size] if fixed_chunk else [8192, 4096, 2048, 1024, 512, 256]
     if fixed_chunk and chunks[0] < 1:
         raise ValueError("Inkling prefill chunk must be positive")
+    recurrent = None
+    if not ({"moe_device", "moe_device_layers", "moe_cuda_cache"} & explicit):
+        recurrent = _recurrent_experts(meta, w)
     failures = []
     for context in contexts:
         tokens = args.tokens if args.tokens > 0 else context * batch
@@ -368,17 +433,16 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
             if (hybrid and force_gpu) or (not hybrid and force_host):
                 continue
             host_bytes = host_kv + dense + 2 * w.largest + (w.slot_bytes * g.experts if hybrid else 0)
-            if host_bytes > host_limit:
-                failures.append(f"host needs {host_bytes // MiB} MiB, budget {host_limit // MiB} MiB")
-                continue
             for ids in layouts:
                 world = len(ids)
                 if hybrid and world > 1:
                     continue
-                expert_gpu = 0 if hybrid else math.ceil(w.cuda_experts / world)
+                expert_total = w.cuda_experts - (w.compact_fp4_savings if compact.issuperset(ids) else 0)
+                expert_gpu = 0 if hybrid else math.ceil(expert_total / world)
                 resident = w.replicated + math.ceil(w.sharded / world) + expert_gpu
                 # Rank zero can still own the loaded dense checkpoint while shards are created.
-                load_peak = resident + (dense if world > 1 else 0) + w.largest // world + 512 * MiB
+                source = max(w.largest, 0 if hybrid else w.repack_source)
+                load_peak = resident + (dense if world > 1 else 0) + math.ceil(source / world) + 512 * MiB
                 rank_kv = (kv + world - 1) // world
                 if offload:
                     width = g.kv * head_width // world
@@ -387,26 +451,42 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                     rank_kv += tables + selection_bytes
                 rank_prefix = prefix_budget // world
                 rank_budget = min(budgets[d] for d in ids)
+                # Prefer putting the repeated core on CUDA when it fits with
+                # both prefill workspaces and staging for the remaining host layers.
+                tiers = [None]
+                if hybrid and recurrent and ids[0] in compact:
+                    tiers.append(recurrent[3])
                 candidates = []
-                for chunk in chunks:
-                    if not fixed_chunk:
-                        chunk = min(chunk, context)
-                    rows = max(chunk, args.prefill_batch_tokens or 0, decode_rows)
-                    scratch = _workspace_bytes(g, rows, decode_rows, world, hybrid, draft_taps, args.dspark)
-                    runtime = resident + rank_kv + rank_prefix + scratch
-                    spare = min(rank_budget - runtime, budgets[ids[0]] - load_peak)
-                    cache_bytes = 0
-                    if hybrid:
-                        slots = min(g.experts, max(0, spare) // w.slot_bytes)
-                        cache_bytes = slots * w.slot_bytes if cache is None else cache
-                    if spare < cache_bytes:
-                        failures.append(f"{'hybrid' if hybrid else 'CUDA'} {ids} needs {max(runtime, load_peak) // MiB} MiB before cache")
+                for core in tiers:
+                    slot_bytes = w.slot_bytes - (core.slot_bytes if core else 0)
+                    gpu_core = core.cuda_experts - core.compact_fp4_savings if core else 0
+                    host_used = host_bytes - (w.slot_bytes - slot_bytes) * g.experts
+                    if host_used > host_limit:
+                        failures.append(f"host needs {host_used // MiB} MiB, budget {host_limit // MiB} MiB")
                         continue
-                    priority = memory.interactive_moe_priority(chunk, cache_bytes) if hybrid else ()
-                    candidates.append((priority, chunk, cache_bytes, scratch))
+                    peak = load_peak + gpu_core
+                    if core:
+                        peak += max(0, core.repack_source - source)
+                    for chunk in chunks:
+                        if not fixed_chunk:
+                            chunk = min(chunk, context)
+                        rows = max(chunk, args.prefill_batch_tokens or 0, decode_rows)
+                        scratch = _workspace_bytes(g, rows, decode_rows, world, hybrid, draft_taps, args.dspark)
+                        if core:
+                            scratch = max(scratch, _workspace_bytes(g, rows, decode_rows, world, False, draft_taps, args.dspark))
+                        runtime = resident + gpu_core + rank_kv + rank_prefix + scratch
+                        spare = min(rank_budget - runtime, budgets[ids[0]] - peak)
+                        slots = min(g.experts, max(0, spare) // slot_bytes) if hybrid else 0
+                        cache_bytes = (slots * slot_bytes if cache is None else cache) if hybrid else 0
+                        if spare < cache_bytes or (core and slots < g.top):
+                            failures.append(f"{'hybrid' if hybrid else 'CUDA'} {ids} needs {max(runtime, peak) // MiB} MiB before cache")
+                            continue
+                        chunk_rank, cache_rank = memory.interactive_moe_priority(chunk, cache_bytes)
+                        priority = (chunk_rank, bool(core), cache_rank) if hybrid else ()
+                        candidates.append((priority, chunk, cache_bytes, scratch, gpu_core, peak, host_used, slot_bytes))
                 if not candidates:
                     continue
-                _, chunk, cache_bytes, scratch = max(candidates)
+                _, chunk, cache_bytes, scratch, gpu_core, load_peak, host_used, slot_bytes = max(candidates)
                 args.device = f"cuda:{ids[0]}"
                 args.tp = "cuda:" + ",".join(map(str, ids)) if world > 1 else "off"
                 args.moe_device = host if hybrid else args.device
@@ -419,12 +499,16 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                 result = dict(model="inkling2_loop", mode="hybrid" if hybrid else "tp" if world > 1 else "cuda",
                               device=args.device, tp=args.tp, moe_device=args.moe_device, max_batch=batch,
                               tokens=tokens, max_context_length=context, chunked_prefill_size=chunk,
-                              moe_cuda_cache=cache_bytes, cache_slots_per_layer=min(g.experts, cache_bytes // w.slot_bytes),
+                              moe_cuda_cache=cache_bytes, cache_slots_per_layer=min(g.experts, cache_bytes // slot_bytes),
                               gpu_budget_bytes={d: budgets[d] for d in ids}, kv_bytes_per_rank=rank_kv,
                               prefix_cache_bytes_per_rank=rank_prefix, workspace_bytes_per_rank=scratch,
-                              weight_bytes_per_rank=resident, root_load_peak_bytes=load_peak,
-                              host_estimated_bytes=host_bytes, host_budget_bytes=host_limit,
+                              weight_bytes_per_rank=resident + gpu_core, root_load_peak_bytes=load_peak,
+                              host_estimated_bytes=host_used, host_budget_bytes=host_limit,
                               automatic={"policy": "inkling-tp-or-single-hybrid", "cuda_graph": graph})
+                if gpu_core:
+                    start, end, layers = recurrent[:3]
+                    result.update(gpu_expert_layers=list(range(start, end)),
+                                  recurrent_expert_placement=_recurrent_device_map(start, end, layers, host, args.device))
                 if offload:
                     result.update(kvmem_host_bytes=host_kv, kvmem_resident_tokens=hot,
                                   kvmem_hot_bytes_per_rank=hot_kv // world, kvmem_page_table_bytes_per_rank=tables,
