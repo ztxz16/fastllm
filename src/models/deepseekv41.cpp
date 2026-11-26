@@ -2959,16 +2959,16 @@ namespace fastllm {
         std::set<std::string> tensorNameSet(tensorNames.begin(), tensorNames.end());
         // Hybrid single-GPU and serial PP keep complete projections on their
         // layer owner. TP/full-GPU and reference math retain their current layouts.
-        bool compactProjections = false;
+        int compactProjectionArch = 0;
 #if defined(USE_CUDA) && !defined(USE_ROCM)
-        compactProjections = executionMode == ExecutionMode::Hybrid &&
+        if (executionMode == ExecutionMode::Hybrid &&
             V41DeviceMapUsesCuda(deviceMap) && !V41DeviceMapUsesMultiCuda(deviceMap) &&
-            FastllmCudaRuntimeArch() >= 80 &&
-            !V41ReferenceMathEnabled() && std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr;
+            !V41ReferenceMathEnabled() && std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr)
+            compactProjectionArch = FastllmCudaRuntimeArch();
 #endif
         auto compactCheckpoint = [&](const std::string &name, bool head) {
             auto dir = weight.dicts.find("model_directory");
-            if (!compactProjections || dir == weight.dicts.end()) return false;
+            if (compactProjectionArch < (head ? 80 : 75) || dir == weight.dicts.end()) return false;
             V41SafeTensorInfo source, scale;
             if (!V41FindSafeTensor(dir->second, name, source) || source.shape.size() != 2) return false;
             if (head) return source.dtype == "BF16";

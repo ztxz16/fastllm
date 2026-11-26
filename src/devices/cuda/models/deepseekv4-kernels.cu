@@ -6,6 +6,9 @@
 #include "../fastllm-hybrid-prefill.cuh"
 #include "fastllm.h"
 #include "deepseekv41-compact-woa.cuh"
+#ifndef USE_ROCM
+#include "deepseekv4-woa-small.cuh"
+#endif
 
 #include <algorithm>
 #include <cfloat>
@@ -6319,10 +6322,9 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
             if (rowTile != nullptr) {
                 rowsPerBlock = std::atoi(rowTile);
             }
+            const bool tokenTileEnabled = std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE") == nullptr;
             const bool useTokenTile =
-                totalTokens >= 2 &&
-                std::getenv("FASTLLM_DSV4_DISABLE_CUDA_WOA_TOKEN_TILE") ==
-                    nullptr && rowsPerBlock > 0 &&
+                totalTokens >= 2 && tokenTileEnabled && rowsPerBlock > 0 &&
                 oRank % rowsPerBlock == 0 &&
                 woA.blockK % rowsPerBlock == 0;
             bool launched = false;
@@ -6337,6 +6339,16 @@ bool DeepSeekV4LaunchWoAByWeight(const fastllm::Data &o, const fastllm::Data &wo
                     weightData, scaleData, outData);
                 return true;
             }
+#ifndef USE_ROCM
+            if (o.dataType == fastllm::DataType::BFLOAT16 && woA.blockK == 32 && woA.blockM == 32 &&
+                tokenTileEnabled && tokenTile == nullptr && rowTile == nullptr &&
+                fastllm::cuda::woa_small::CanLaunch(oData, weightData, totalTokens, groups, oRank, groupDim,
+                                                    FastllmCudaRuntimeArch())) {
+                return fastllm::cuda::woa_small::Launch<false>(
+                    reinterpret_cast<const __nv_bfloat16 *>(oData), weightData, scaleData, outData,
+                    totalTokens, groups, oRank, groupDim, FastllmCudaRuntimeArch(), nullptr);
+            }
+#endif
             if (useTokenTile && tokensPerBlock == 2 &&
                 rowsPerBlock == 4) {
                 launched = DeepSeekV4LaunchWoAFp8TokenRowsBlockReduce<
@@ -10282,7 +10294,7 @@ extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
         (output.cudaData && (output.cudaData == input.cudaData || output.cudaData == weight.cudaData)) ||
         input.dims.size() != 4 || weight.dims.size() != 2 ||
         groups <= 0 || rank <= 0 || input.dims[2] % groups || weight.blockK != 32 || weight.blockM != 32 ||
-        FastllmCudaRuntimeArch() < 80) return false;
+        FastllmCudaRuntimeArch() < 75) return false;
     const int64_t tokens64 = int64_t(input.dims[0]) * input.dims[1];
     const int64_t hidden64 = int64_t(input.dims[2] / groups) * input.dims[3];
     if (tokens64 <= 0 || tokens64 > INT_MAX || hidden64 <= 0 || hidden64 > INT_MAX ||
@@ -10297,23 +10309,20 @@ extern "C" bool FastllmCudaDeepSeekV41CompactWoA(const fastllm::Data &input,
     const float *scales = static_cast<const float *>(weight.extraCudaData[0]);
     if (!DeepSeekV4PrepareCudaOutput(output, BFLOAT16, {input.dims[0], input.dims[1], groups * rank})) return false;
     if(TryRegisteredGroupedProjection(input,weight,groups,rank,output,true))return true;
+    if (tokens > 1 && fastllm::TryCudaTritonSmallProjection(input, mutableWeight, output, groups)) return true;
+#ifndef USE_ROCM
+    if (fastllm::cuda::woa_small::CanLaunch(input.cudaData, weight.cudaData, tokens, groups, rank, hidden,
+                                           FastllmCudaRuntimeArch())) {
+        return fastllm::cuda::woa_small::Launch<true>(
+            static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const uint8_t *>(weight.cudaData),
+            scales, static_cast<__nv_bfloat16 *>(output.cudaData), tokens, groups, rank, hidden,
+            FastllmCudaRuntimeArch(), cudaStreamPerThread);
+    }
+#else
     if (tokens == 1) {
         fastllm::cuda::v41_compact::Decode<<<dim3((rank + 7) / 8, groups, tokens), 256, 0, cudaStreamPerThread>>>(
             static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const uint8_t *>(weight.cudaData),
             scales, static_cast<__nv_bfloat16 *>(output.cudaData), groups, rank, hidden);
-        return cudaGetLastError() == cudaSuccess;
-    }
-    if (fastllm::TryCudaTritonSmallProjection(input, mutableWeight, output, groups)) return true;
-    // Runtime SM alone is insufficient: a lower-architecture PTX build can
-    // run on newer GPUs while its WMMA kernel body was compiled out.
-#if !defined(USE_ROCM) && !defined(CUDA_NO_TENSOR_CORE)
-    cudaFuncAttributes multiRowAttributes = {};
-    if (tokens <= 16 &&
-        cudaFuncGetAttributes(&multiRowAttributes, fastllm::cuda::v41_compact::MultiRows) == cudaSuccess &&
-        multiRowAttributes.ptxVersion >= 80) {
-        fastllm::cuda::v41_compact::MultiRows<<<dim3((rank + 15) / 16, groups), 128, 0, cudaStreamPerThread>>>(
-            static_cast<const __nv_bfloat16 *>(input.cudaData), static_cast<const uint8_t *>(weight.cudaData),
-            scales, static_cast<__nv_bfloat16 *>(output.cudaData), tokens, groups, rank, hidden);
         return cudaGetLastError() == cudaSuccess;
     }
 #endif
