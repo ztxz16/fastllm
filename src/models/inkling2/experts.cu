@@ -104,7 +104,7 @@ struct InputRow {
 using cuda::RoutedSiTU;
 // Marlin consumes reconstructed BF16 rows. Eight lanes quantize one block
 // of 32 channels, sharing its scale across four adjacent values per lane.
-__global__ void reconstructMxfp8SiTU(RoutedSiTU<__nv_bfloat16> src, __nv_bfloat16 *out, int width) {
+__global__ void reconstructMxfp8SiTU(RoutedSiTU<__nv_bfloat16> src, __nv_bfloat16 *out, int width, const float *factors) {
     struct alignas(8) Four { __nv_bfloat16 v[4]; };
     cuda_launch::DependencyStart();
     const size_t vectors = width / 4, row = blockIdx.x;
@@ -118,15 +118,30 @@ __global__ void reconstructMxfp8SiTU(RoutedSiTU<__nv_bfloat16> src, __nv_bfloat1
             float v[4], peak = 0.f;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                v[j] = float(__float2bfloat16_rn(FastllmSiTUAndMul(float(g.v[j]), float(u.v[j]),
-                                                                  src.gateCap, src.upCap) * score));
+                const float activated = factors ? factors[__bfloat16_as_ushort(g.v[j])] * factors[65536 + __bfloat16_as_ushort(u.v[j])]
+                    : FastllmSiTUAndMul(float(g.v[j]), float(u.v[j]), src.gateCap, src.upCap);
+                v[j] = float(__float2bfloat16_rn(activated * score));
                 peak = fmaxf(peak, fabsf(v[j]));
             }
             const unsigned mask = __activemask();
 #pragma unroll
             for (int step = 4; step; step /= 2) peak = fmaxf(peak, __shfl_xor_sync(mask, peak, step, 8));
+#if CUDART_VERSION >= 11080 && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+            if (peak >= 0x1p-110f && isfinite(peak)) {
+                const float scale = exp2f(ceilf(log2f(peak / 448.f))), inv = 1.f / scale;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) result.v[j] = __float2bfloat16_rn(reconstructMxfp8(v[j], peak));
+                for (int j = 0; j < 4; j += 2) {
+                    auto codes = __nv_cvt_float2_to_fp8x2(make_float2(v[j] * inv, v[j+1] * inv), __NV_SATFINITE, __NV_E4M3);
+                    const float2 pair = __half22float2(__nv_cvt_fp8x2_to_halfraw2(codes, __NV_E4M3));
+                    result.v[j] = __float2bfloat16_rn(pair.x * scale);
+                    result.v[j+1] = __float2bfloat16_rn(pair.y * scale);
+                }
+            } else
+#endif
+            {
+#pragma unroll
+                for (int j = 0; j < 4; ++j) result.v[j] = __float2bfloat16_rn(reconstructMxfp8(v[j], peak));
+            }
         }
         dest[i] = result;
     }
@@ -1117,6 +1132,7 @@ class RoutedExperts : public ExpertBackend, protected CudaMoeActivation {
 protected:
     const Data &routerWeight;
     Projection gate, down;
+    Buffer<float> situFactors;
     const int smCount;
     float gateCap, upCap;
 
@@ -1126,7 +1142,7 @@ protected:
             RoutedSiTU<T> source{pairData, static_cast<const float *>(scores.cudaData), gateCap, upCap};
             if constexpr (std::is_same_v<T, __nv_bfloat16>) {
                 if (!gate.fp4 && rows >= smCount && width % 32 == 0) {
-                    if (!cuda_launch::Launch<reconstructMxfp8SiTU>(rows, 128, 0, cudaStreamPerThread, source, out, width))
+                    if (!cuda_launch::Launch<reconstructMxfp8SiTU>(rows, 128, 0, cudaStreamPerThread, source, out, width, situFactors.p))
                         throw std::runtime_error("Inkling MXFP8 SiTU launch failed");
                     return;
                 }
@@ -1155,7 +1171,6 @@ public:
 };
 class GpuExperts final : public RoutedExperts {
     int firstExpert, localExperts;
-    Buffer<float> situFactors;
     Buffer<DecodeRouter> decodeRouter;
     Buffer<uint4> packedRouter;
     std::vector<Data *> weights;
@@ -1450,7 +1465,12 @@ class GpuExperts final : public RoutedExperts {
             return;
         }
 #endif
-        Rows<__nv_bfloat16> pair(routes, 2 * c.intermediate), projected(routes, c.hidden);
+        Rows<__nv_bfloat16> pair(routes, 2 * c.intermediate);
+        // Local grouped prefill has packed SiTU before the down kernel starts.
+        // Both projections can use the same dense output storage on this stream.
+        const bool reuse = phase == ExpertPhase::Prefill && rows > 1 && pair.cols == c.hidden &&
+                           gate.tensorShards.empty() && down.tensorShards.empty();
+        auto projected = reuse ? pair : Rows<__nv_bfloat16>(routes, c.hidden);
         RoutedSiTU<__nv_bfloat16> act{pair.p, route.scores, gateCap, upCap};
         float *reduced = !localExperts && !gate.tensorShards.empty() && rows > 1 && !decodeArithmetic ? dstRows : nullptr;
         if (rows == 1 || decodeArithmetic) {
@@ -1548,17 +1568,16 @@ public:
             if (lossy) { packedRouter = {}; decodeRouter = {}; }
         }
 #endif
-        if (gate.nativeCodes.p) {
-            if (down.cols <= native::QuantThreads * 16) {
-                if (!topology.situFactors.p) {
-                    topology.situFactors = Buffer<float>(2 * 65536);
-                    makeSiTUFactors<<<256, 256, 0, cudaStreamPerThread>>>(topology.situFactors.p, gateCap, upCap);
-                    check(cudaGetLastError());
-                }
-                situFactors = topology.situFactors;
+        if ((gate.nativeCodes.p && down.cols <= native::QuantThreads * 16) ||
+            (!gate.fp4 && FastllmCudaRuntimeArch() == 120)) {
+            if (!topology.situFactors.p) {
+                topology.situFactors = Buffer<float>(2 * 65536);
+                makeSiTUFactors<<<256, 256, 0, cudaStreamPerThread>>>(topology.situFactors.p, gateCap, upCap);
+                check(cudaGetLastError());
             }
-            return;
+            situFactors = topology.situFactors;
         }
+        if (gate.nativeCodes.p) return;
         for (int e = 0; e < (localExperts ? localExperts : c.experts); ++e) {
             weights[2 + 2 * e] = gate.resident[e].get();
             weights[3 + 2 * e] = down.resident[e].get();
