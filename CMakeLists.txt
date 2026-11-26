@@ -697,6 +697,35 @@ if (BUILD_PROCESS_TP)
         message(FATAL_ERROR "Process TP currently requires Linux with NVIDIA CUDA or a CPU control-only build")
     endif()
     find_package(Threads REQUIRED)
+    # PD 控制核心独立构建，不依赖模型对象或 CPU SIMD 算子。
+    if(CMAKE_VERSION VERSION_LESS 3.18)
+        message(FATAL_ERROR "The PD Python extension requires CMake 3.18 or newer")
+    endif()
+    find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
+    set(FASTLLM_PD_PYBIND_INCLUDE "${PROJECT_SOURCE_DIR}/third_party/pybind11/include")
+    if(NOT EXISTS "${FASTLLM_PD_PYBIND_INCLUDE}/pybind11/pybind11.h")
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c
+            "import pybind11; print(pybind11.get_include())"
+            OUTPUT_VARIABLE FASTLLM_PD_PYBIND_INCLUDE OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE FASTLLM_PD_PYBIND_STATUS)
+        if(NOT FASTLLM_PD_PYBIND_STATUS EQUAL 0)
+            message(FATAL_ERROR "PD requires pybind11 headers from the existing submodule or selected Python environment")
+        endif()
+    endif()
+    add_library(fastllm_pd_core MODULE
+        src/distributed/pd_bindings.cpp src/distributed/pd_metadata.cpp
+        src/distributed/pd_routing.cpp src/distributed/pd_resources.cpp
+        src/distributed/pd_tasks.cpp src/distributed/pd_cuda.cpp
+        src/distributed/pd_execution.cpp src/distributed/pd_moe.cpp
+        src/distributed/pd_service.cpp src/distributed/pd_service_transfer.cpp
+        src/distributed/pd_service_output.cpp src/distributed/pd_router.cpp)
+    target_include_directories(fastllm_pd_core PRIVATE ${FASTLLM_PD_PYBIND_INCLUDE})
+    target_link_libraries(fastllm_pd_core PRIVATE Python3::Module Threads::Threads)
+    target_compile_features(fastllm_pd_core PRIVATE cxx_std_17)
+    set_target_properties(fastllm_pd_core PROPERTIES PREFIX "" OUTPUT_NAME "_pd_core"
+        LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+        CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+    install(TARGETS fastllm_pd_core LIBRARY DESTINATION ftllm/pd)
     add_library(fastllm_process_tp STATIC src/distributed/process_group.cpp
         src/distributed/qwen3_generation.cpp)
     set_target_properties(fastllm_process_tp PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -720,6 +749,11 @@ if (BUILD_PROCESS_TP)
         if(NOT FASTLLM_PROCESS_CUDART)
             message(FATAL_ERROR "Process TP worker requires the CUDA runtime library (cudart)")
         endif()
+        set_target_properties(fastllm_pd_core PROPERTIES
+            INSTALL_RPATH "$ORIGIN/../../nvidia/cuda_runtime/lib")
+        target_compile_definitions(fastllm_pd_core PRIVATE FASTLLM_PD_CUDA)
+        target_include_directories(fastllm_pd_core PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        target_link_libraries(fastllm_pd_core PRIVATE ${FASTLLM_PROCESS_CUDART})
         target_compile_definitions(fastllm_tp_worker PRIVATE FASTLLM_PROCESS_TP_CUDA)
         target_include_directories(fastllm_tp_worker PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
         target_link_libraries(fastllm_tp_worker PRIVATE ${FASTLLM_PROCESS_CUDART} nccl)
@@ -788,7 +822,9 @@ if (BUILD_PROCESS_TP)
             ${CMAKE_BINARY_DIR}/process-tp-python/ftllm
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_generate> $<TARGET_FILE:fastllm_moe_generate>
             $<TARGET_FILE:fastllm_tp_worker> ${CMAKE_BINARY_DIR}/process-tp-python/ftllm/
-        DEPENDS fastllm_tp_generate fastllm_moe_generate fastllm_tp_worker
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_pd_core>
+            ${CMAKE_BINARY_DIR}/process-tp-python/ftllm/pd/
+        DEPENDS fastllm_tp_generate fastllm_moe_generate fastllm_tp_worker fastllm_pd_core
         VERBATIM
         COMMENT "Stage the process TP Python package and native executables")
 endif()
@@ -897,10 +933,12 @@ add_library(fastllm_tools SHARED ${FASTLLM_CXX_SOURCES} ${FASTLLM_CUDA_SOURCES} 
 target_link_libraries(fastllm_tools PUBLIC ${FASTLLM_LINKED_LIBS})
 
 if (BUILD_PROCESS_TP)
-    add_dependencies(fastllm_tools fastllm_tp_worker fastllm_tp_check fastllm_tp_generate fastllm_moe_generate)
+    add_dependencies(fastllm_tools fastllm_tp_worker fastllm_tp_check fastllm_tp_generate fastllm_moe_generate fastllm_pd_core)
     add_custom_command(TARGET fastllm_tools POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_worker> ${CMAKE_BINARY_DIR}/tools/ftllm/
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/tools/ftllm/pd
+        COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_pd_core> ${CMAKE_BINARY_DIR}/tools/ftllm/pd/
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_check> ${CMAKE_BINARY_DIR}/tools/ftllm/
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:fastllm_tp_generate> $<TARGET_FILE:fastllm_moe_generate> ${CMAKE_BINARY_DIR}/tools/ftllm/)
 endif()

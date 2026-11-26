@@ -3,6 +3,11 @@
 八阶段的首版代码已接入工作区，**尚未通过服务器编译或 GPU 验收，不能视为计划已交付**。
 设计范围保持不变；本页记录目前能接入的代码路径和验证方法，不替代实现清单。
 
+2026-11-26：PD 核心决策已迁移到 C++ 扩展，GPU 搬运由 C++ 直接调用 CUDA Runtime。
+Python 保留 CLI、HTTP/Tokenizer、数据对象和原生接口适配。详细模块边界与验证状态见
+[核心逻辑原生迁移](NATIVE_MIGRATION.md)。本次原生迁移尚未编译或执行功能回归，
+迁移前的协议、Router、IPC PASS 记录不能直接作为迁移后验收结果。
+
 ## 当前接入范围
 
 | 部分 | 当前代码状态 |
@@ -37,8 +42,14 @@
 
 ```bash
 cmake -S . -B build-process-tp -DUSE_CUDA=ON -DBUILD_PROCESS_TP=ON -DCUDA_ARCH=native
-cmake --build build-process-tp --target fastllm_tp_generate fastllm_moe_generate fastllm_tp_worker -j 4
+cmake --build build-process-tp --target fastllm_pd_core fastllm_tp_generate fastllm_moe_generate fastllm_tp_worker -j 4
 ```
+
+构建还需要 CMake ≥ 3.18、与运行服务相同 Python 的开发头文件，以及 pybind11 头文件；
+优先使用已有子模块，也可使用所选 Python 环境中安装的 pybind11。
+`fastllm_pd_core` 生成 `build-process-tp/_pd_core.so`，源码入口会自动查找该产物。
+其他构建目录通过 `FT_PD_CORE_LIBRARY=/绝对路径/_pd_core.so` 指定。
+原生模块缺失时明确报错，不会运行旧 Python 核心实现。
 
 要求 Linux、同一主机上的 NVIDIA GPU、CUDA IPC，以及所选 GPU 对的 P2P 能力。
 服务进程需要能看到传输涉及的源与目标 GPU；通过 `--tp` 指定本服务的计算卡，

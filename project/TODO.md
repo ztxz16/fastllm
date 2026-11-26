@@ -376,6 +376,18 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
 
 ## PD 分离实现清单
 
+- [ ] **PD 核心逻辑迁移到 C++/CUDA。** 按 2026-11-26 确认的范围，将服务内调度、
+  Attention DP/EP 联合轮次、Router 八种策略与服务管理、PD 协议与流程、KV 映射、
+  交接状态及资源管理、历史 KV、生成与输出控制迁入 C++。CUDA IPC、异步拷贝和
+  完成事件由 C++ 直接调用 CUDA Runtime；复用现有模型和算子。
+  Python 保留 CLI、HTTP/Tokenizer、数据对象、原生接口及结果迭代器适配，测试与报告保留 Python。
+  新增 `fastllm_pd_core` 构建/打包入口，旧 Python 核心实现不作为回退。
+  实现：迁移代码已接入；静态 review 与接口检查已执行，尚未本地或服务器编译。
+  验证：尚未执行迁移后的协议、Router、GPU IPC、模型生成及生命周期回归，不标记验收成功。
+  下一步：服务器构建原生扩展和执行器，按原有测试矩阵重新验收。
+  模块、语言边界及命令见[原生迁移记录](../docs/pd_disaggregation/NATIVE_MIGRATION.md)。
+
+
 - [ ] **按八阶段计划实施单机 PD 分离。** 2026-11-26 用户授权开始全量代码实现。
   实施计划见 [IMPLEMENTATION_PLAN.md](../docs/pd_disaggregation/IMPLEMENTATION_PLAN.md)。
   当前为八阶段首版代码接入（未验收）：JSON 身份与布局握手、KV 映射、CUDA IPC、异步管理、分页 KV、

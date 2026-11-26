@@ -1,6 +1,7 @@
 """PD 验证报告：保留每个 case、执行异常和原始精度，不触发编译。"""
 
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -21,9 +22,21 @@ def run(cases, output, *, backend, metadata_extra=None, scope="控制与映射�
     output.mkdir(parents=True, exist_ok=True)
     if (output / "summary.json").exists():
         raise ValueError("refusing to overwrite a historical test run")
+    from fastllm_pytools.pd import _core
+    native = _core.load()
+    if native.implementation != "cpp" or native.abi_version != 1:
+        raise RuntimeError("PD verification requires the production C++ core")
+    native_path = Path(native.__file__).resolve()
+    native_metadata = dict(path=str(native_path), sha256=hashlib.sha256(native_path.read_bytes()).hexdigest(),
+        implementation=native.implementation, abi=native.abi_version, entries=len(native.entries()),
+        compiler=native.compiler, cpp_standard=native.cpp_standard, host_arch=native.host_arch,
+        cuda_enabled=native.cuda_enabled, cuda_runtime_headers=native.cuda_runtime_headers)
     metadata = dict(command=shlex.join([sys.executable, *sys.argv]), pid=os.getpid(), backend=backend,
         git=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        python=sys.version, gpu="not used by protocol checks", cuda="not used", architecture="not compiled",
+        python=sys.version, gpu="not used by protocol checks",
+        cuda="runtime headers " + str(native.cuda_runtime_headers) if native.cuda_enabled else "disabled",
+        architecture=native.host_arch + "; CUDA Runtime copies only; no new device kernel",
+        native_core=native_metadata,
         seed=20261126, warmup=0, iterations=1, repeats=1)
     metadata.update(metadata_extra or {})
     rows = []
