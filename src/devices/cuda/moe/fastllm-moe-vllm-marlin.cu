@@ -1132,10 +1132,10 @@ __global__ void SumAwqMoeRowsKernel(const T *__restrict__ rows,
     output[offset + 1] = FromFloat<T>(sum.y);
 }
 
-template <class T>
+template <class T, bool SkipAbsent = false>
 __global__ void SumAwqMoeRowsFloatKernel(const T *__restrict__ rows,
                                          float *__restrict__ output,
-                                         int batch, int topk, int hidden) {
+                                         int batch, int topk, int hidden, const int32_t *ids = nullptr) {
     int column = blockIdx.x * blockDim.x + threadIdx.x;
     int count = batch * hidden;
     if (column >= count) {
@@ -1145,6 +1145,9 @@ __global__ void SumAwqMoeRowsFloatKernel(const T *__restrict__ rows,
     int hiddenColumn = column - token * hidden;
     float sum = 0.0f;
     for (int slot = 0; slot < topk; ++slot) {
+        if constexpr (SkipAbsent) {
+            if (ids[token * topk + slot] < 0) continue;
+        }
         sum += ToFloat(rows[
             ((size_t)token * topk + slot) * hidden + hiddenColumn]);
     }
@@ -3059,7 +3062,7 @@ static bool RunAwqMarlinMoe(
 // routing. Marlin masks every row index >= routes. Share the immutable row
 // map across layers and concurrent graphs on this CUDA device.
 struct DirectMarlinRows {
-    static constexpr int MaxRows = 9, MaxTopK = 16, Capacity = MaxRows * MaxTopK;
+    static constexpr int MaxRows = fastllm::CudaMarlinDirectMaxRows, MaxTopK = 16, Capacity = MaxRows * MaxTopK;
     int32_t tokens[Capacity * 8]{}, padded[Capacity + 1]{};
     constexpr DirectMarlinRows() {
         for (int r = 0; r < Capacity; ++r)
@@ -3867,7 +3870,7 @@ static bool RunNvfp4E4M3MarlinMoe(
         fastllm::Data **weights, int weightsBatch,
         const int32_t *indices, const float *scores,
         int batch, int topk, float swigluLimit, bool groupedRows = false,
-        const fastllm::CudaMoeActivation *customActivation = nullptr) {
+        const fastllm::CudaMoeActivation *customActivation = nullptr, bool skipAbsent = false) {
     if (input.dataDevice != fastllm::DataDevice::CUDA ||
         (input.dataType != fastllm::DataType::FLOAT16 &&
          input.dataType != fastllm::DataType::FLOAT32 &&
@@ -3987,7 +3990,7 @@ static bool RunNvfp4E4M3MarlinMoe(
             indices, routeStorage->sortedTokenIds, routeStorage->gateExpertIds,
             routeStorage->downExpertIds, routeStorage->numTokensPadded, routes, cache->experts);
     } else if (smallBatch && batch <= DirectMarlinRows::MaxRows &&
-               topk <= DirectMarlinRows::MaxTopK && !groupedDecode) {
+               topk <= DirectMarlinRows::MaxTopK && !groupedDecode && !skipAbsent) {
         sorted = cache->directRows->tokens;
         padded = cache->directRows->padded + routes;
         gateExperts = downExperts = indices;
@@ -4004,6 +4007,11 @@ static bool RunNvfp4E4M3MarlinMoe(
             "route-metadata launch", cache.get());
     }
 
+    // The activation visits every route. Define the gate rows omitted by
+    // the local expert GEMM before it reads them.
+    if (skipAbsent && cudaMemsetAsync(gateOutput.cudaData, 0,
+            size_t(routes) * 2 * cache->intermediate * sizeof(half), stream) != cudaSuccess)
+        FailNvfp4E4M3MarlinAfterRepack("local gate initialization", cache.get());
     if (!LaunchNvfp4E4M3MarlinMoe(
             true, smallBatch, marlinInput, cache->gateWeight,
             gateOutput.cudaData, cache->temporaryOutput,
@@ -4048,11 +4056,12 @@ static bool RunNvfp4E4M3MarlinMoe(
     }
     if (output.dataType == fastllm::DataType::FLOAT32) {
         const int outputElements = batch * cache->hidden;
-        SumAwqMoeRowsFloatKernel<<<
+        auto sum = skipAbsent ? SumAwqMoeRowsFloatKernel<half, true> : SumAwqMoeRowsFloatKernel<half>;
+        sum<<<
             (outputElements + threads - 1) / threads,
             threads, 0, stream>>>(
             (const half *)gateOutput.cudaData,
-            (float *)output.cudaData, batch, topk, cache->hidden);
+            (float *)output.cudaData, batch, topk, cache->hidden, indices);
     } else if (bf16) {
         const int outputPairs = batch * (cache->hidden / 2);
         // Round the down GEMM once, then apply the FP32 router scores in slot order.
@@ -4972,8 +4981,15 @@ void ReleaseCudaMergeMOE(Data **weights, int count) {
 bool RunCudaMarlinMoeWithActivation(const Data &input, Data &output, const Data &indices,
         const Data &scores, Data &gateUp, Data &middle, Data **weights, int count,
         const CudaMoeActivation &activation) {
+    return RunCudaMarlinMoeWithActivation(input, output, indices, scores, gateUp, middle, weights, count,
+                                          activation, false);
+}
+
+bool RunCudaMarlinMoeWithActivation(const Data &input, Data &output, const Data &indices,
+        const Data &scores, Data &gateUp, Data &middle, Data **weights, int count,
+        const CudaMoeActivation &activation, bool skipAbsent) {
     return fastllm_marlin_moe::RunNvfp4E4M3MarlinMoe(input, gateUp, middle, output, weights, count,
         static_cast<const int32_t *>(indices.cudaData), static_cast<const float *>(scores.cudaData),
-        input.dims[0], indices.dims[1], 0.f, false, &activation);
+        input.dims[0], indices.dims[1], 0.f, false, &activation, skipAbsent);
 }
 }

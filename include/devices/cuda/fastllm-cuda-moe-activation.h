@@ -49,6 +49,12 @@ void DoCudaMergeMOE(const Data &input, Data &output, const Data &indices, const 
 bool RunCudaMarlinMoeWithActivation(const Data &input, Data &output, const Data &indices, const Data &scores,
                                    Data &gateUp, Data &middle, Data **weights, int weightsBatch,
                                    const CudaMoeActivation &activation);
+// The direct row table covers small batches. Grouped local prefill uses
+// negative expert IDs for routes owned by another rank.
+inline constexpr int CudaMarlinDirectMaxRows = 9;
+bool RunCudaMarlinMoeWithActivation(const Data &input, Data &output, const Data &indices, const Data &scores,
+                                   Data &gateUp, Data &middle, Data **weights, int weightsBatch,
+                                   const CudaMoeActivation &activation, bool skipAbsent);
 // Stable slot tables for indexed FP32 projection. Owners may refill the payload
 // between calls. NVFP4 uses block-16 records; FP8 uses separate block scales.
 struct CudaIndexedMoeSlots {

@@ -4,6 +4,7 @@
 #include "fastllm.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
+#include "devices/cuda/fastllm-cuda-moe-activation.h"
 #include <algorithm>
 #include "devices/cuda/fastllm-cuda.cuh"
 #include <cuda_bf16.h>
@@ -353,6 +354,63 @@ static void CheckGroupedRows(Fixture &f, int rows, int topk, bool foreignScratch
                 f.intermediate, rows, topk, largestRelative);
 }
 
+__global__ void WeightGateRows(const half *pair, const float *scores, half *mid, int elements, int width) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < elements) {
+        const int row = i / width;
+        mid[i] = __float2half_rn(__half2float(pair[2 * width * row + i % width]) * scores[row]);
+    }
+}
+
+static void CheckLocalPrefill(int rows) {
+    struct Activation : CudaMoeActivation {
+        void Run(const Data &g, const Data &scores, Data &mid, int rows, int width) const override {
+            const int elements = rows * width;
+            WeightGateRows<<<(elements + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                (const half *)g.cudaData, (const float *)scores.cudaData, (half *)mid.cudaData, elements, width);
+        }
+    } activation;
+    Fixture fixture(43, false, true);
+    const int top = 4, hidden = fixture.hidden;
+    Data x(FLOAT16, {rows, hidden}), ids(INT32, {rows, top}), scores(FLOAT32, {rows, top});
+    x.Allocate(false);
+    for (int i = 0; i < rows * hidden; ++i)
+        ((half *)x.cpuData)[i] = __float2half_rn(.1f * std::sin(i * .07f));
+    Move(x);
+    ids.Allocate(false);
+    scores.Allocate(false);
+    Move(ids);
+    Move(scores);
+    Data pair(FLOAT16), mid(FLOAT16), out(FLOAT32);
+    for (auto *d : {&pair, &mid, &out}) {
+        d->dataDevice = CUDA;
+        d->dataDeviceIds = {0};
+    }
+    std::vector<int> routes(rows * top), dense(rows * top);
+    std::vector<float> factors(rows * top), expected(rows * hidden), actual(rows * hidden);
+    for (bool empty : {false, true}) {
+        for (int i = 0; i < rows * top; ++i) {
+            const bool owned = !empty && i % 3 != 0 && (i / top) % 5 != 0;
+            routes[i] = owned ? i % fixture.experts : -1;
+            dense[i] = owned ? routes[i] : 0;
+            factors[i] = owned ? .25f : 0.f;
+        }
+        Cuda(cudaMemcpy(scores.cudaData, factors.data(), factors.size() * sizeof(float), cudaMemcpyHostToDevice));
+        Cuda(cudaMemcpy(ids.cudaData, dense.data(), dense.size() * sizeof(int), cudaMemcpyHostToDevice));
+        Check(RunCudaMarlinMoeWithActivation(x, out, ids, scores, pair, mid, fixture.weights.data(),
+                                             fixture.weights.size(), activation), "dense Marlin reference");
+        Cuda(cudaMemcpy(expected.data(), out.cudaData, expected.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        Cuda(cudaMemcpy(ids.cudaData, routes.data(), routes.size() * sizeof(int), cudaMemcpyHostToDevice));
+        Check(RunCudaMarlinMoeWithActivation(x, out, ids, scores, pair, mid, fixture.weights.data(),
+                                             fixture.weights.size(), activation, true), "local Marlin prefill");
+        Cuda(cudaMemcpy(actual.data(), out.cudaData, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < actual.size(); ++i)
+            Check(std::isfinite(actual[i]) && std::abs(actual[i] - expected[i]) <= .001f * (1.f + std::abs(expected[i])),
+                  "local expert reduction mismatch");
+    }
+    ReleaseCudaMergeMOE(fixture.weights.data(), fixture.weights.size());
+}
+
 int main(int argc, char **argv) { try {
     int devices = 0; cudaDeviceProp prop{};
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
@@ -360,6 +418,10 @@ int main(int argc, char **argv) { try {
         prop.sharedMemPerBlockOptin < 71680) return 77;
     FastllmCudaSetDevice(0); SetThreads(4);
     CheckActivation();
+    if (argc == 1 || (argc == 2 && std::strcmp(argv[1], "--local-prefill") == 0)) {
+        for (int rows : {CudaMarlinDirectMaxRows + 1, 256}) CheckLocalPrefill(rows);
+        if (argc == 2) { std::puts("Local prefill PASS"); return 0; }
+    }
     if (argc == 2 && std::strcmp(argv[1], "--grouped-decode") == 0) {
         Fixture f(17);
         // CPU FP64 reference, clipping and graph replay with changing routes

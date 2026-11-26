@@ -1699,9 +1699,11 @@ public:
             Buffer<int> indices(routes);
             Matrix scores(rows, c.topK);
             InputRow source{x.p + size_t(start) * c.hidden};
+            const bool localMarlin = marlin && localExperts && phase == ExpertPhase::Prefill &&
+                                     rows > CudaMarlinDirectMaxRows;
             RouteSelection route{scratch ? nullptr : router.p + size_t(start) * c.experts, bias, indices.p, scores.p,
                                  c.experts, c.topK, c.routeScale, firstExpert, localExperts,
-                                 gate.nativeCodes.p || localMx ? -1 : 0};
+                                 gate.nativeCodes.p || localMx || localMarlin ? -1 : 0};
             if (gate.nativeCodes.p) {
                 runNative(c, source, rows, route, scratch ? scratch + start : nullptr,
                           out.p ? out.p + size_t(start) * c.hidden : nullptr, phase,
@@ -1741,6 +1743,12 @@ public:
             }
             CudaView output(FLOAT32, input.dims, out.p + size_t(start) * c.hidden);
             output.dataDeviceIds = input.dataDeviceIds;
+            if (localMarlin) {
+                if (!RunCudaMarlinMoeWithActivation(input, output, ids, score, gateOut, middle,
+                        const_cast<Data **>(weights.data()), weights.size(), *this, true))
+                    throw std::runtime_error("Inkling local Marlin prefill failed");
+                continue;
+            }
             DoCudaMergeMOE(input, output, ids, score, gateOut, middle,
                            const_cast<Data **>(weights.data()), weights.size(), *this, groupedFp8.get(), workspace.p);
         }
