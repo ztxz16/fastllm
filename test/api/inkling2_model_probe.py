@@ -37,6 +37,26 @@ def generate(model, prompts, steps, vocab, sample=False, hits=None):
     return results
 
 
+def check_page_aligned_forks(model, vocab, tokens):
+    # 2,176 ends one page after the regular 2,048-token checkpoint. A longer
+    # cold prompt does not execute the 128-row GEMM used by the shorter prompt.
+    model.set_chunked_prefill_size(8192)
+    tokens = (tokens * (3200 // len(tokens) + 1))[:3200]
+    lengths = (2176, 2700, 3200)
+    reference = {}
+    for length in lengths:
+        model.set_save_history(False)
+        model.set_save_history(True)
+        reference[length] = generate(model, [tokens[:length]], 1, vocab)[0][1][0]
+    model.set_save_history(False)
+    model.set_save_history(True)
+    hits = []
+    for length in (2176, 2700, 2176, 3200, 2700):
+        actual = generate(model, [tokens[:length]], 1, vocab, hits=hits)[0][1][0]
+        np.testing.assert_array_equal(actual, reference[length])
+    assert hits[0] == 0 and max(hits[1:]) > 0, hits
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model")
@@ -108,6 +128,8 @@ def main():
                     relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
                     print("cached fork", cached, "relative L2", float(relative_l2))
                     assert relative_l2 < 0.01, relative_l2
+        if args.experts == "cuda:0":
+            check_page_aligned_forks(model, vocab, prompts[0] + prompts[1])
         model.set_save_history(False)
         hits = []
         generate(model, [forks[0]], 1, vocab, hits=hits)

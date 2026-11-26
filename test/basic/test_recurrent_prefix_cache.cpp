@@ -110,6 +110,25 @@ static void PayloadPressure() {
     Check(!store.Find({1}, 1, 1, gpu) && store.Find({1, 5}, 2, 2, gpu));
 }
 
+static void KeepExtendableCheckpoint() {
+    RecurrentPrefixStore<Snapshot> store;
+    RecurrentPrefixStore<Snapshot>::Entry held;
+    auto any = [](const Snapshot &) { return true; };
+    auto regular = [](const Snapshot &s) { return s.cachedLen % 2 == 0; };
+    for (int owner : {1, 2}) {
+        Check(store.Publish(Make({owner, 0}, owner), held, 4, 8));
+        Check(store.Publish(Make({owner, 0, 1}, owner), held, 4, 8));
+    }
+    held.reset();
+    auto tail = Make({1, 0, 9}, 1);
+    Check(store.EvictIdle(*tail, any, regular));
+    Check(store.EvictIdle(*tail, any, regular));
+    Check(!store.EvictIdle(*tail, any, regular));
+    Check(store.Find({1, 0}, 2, 2, any) && store.Find({2, 0}, 2, 2, any));
+    Check(store.EvictIdle(*Make({1, 0, 1, 2}, 1), any, regular));
+    Check(!store.Find({1, 0}, 2, 2, any) && store.Find({2, 0}, 2, 2, any));
+}
+
 static void RetainSpareHistory() {
     RecurrentPrefixStore<Snapshot> store;
     RecurrentPrefixStore<Snapshot>::Entry held;
@@ -172,6 +191,7 @@ int main() {
     Check(RecurrentPrefixMaxRecords() == 8 && RecurrentPrefixMaxRecords(13) == 78);
     setenv("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", "3", 1);
     Check(RecurrentPrefixMaxRecords(13) == 3);
+    KeepExtendableCheckpoint();
     PayloadPressure();
     SharedOwnership();
     RollingConversations();

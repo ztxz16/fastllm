@@ -171,9 +171,16 @@ public:
     // Reclaim this request's checkpoints before displacing other conversations.
     template<class Eligible>
     bool EvictIdle(const Snapshot &incoming, Eligible eligible) {
-        std::unordered_map<long long, int> longest;
+        return EvictIdle(incoming, eligible, [](const Snapshot &) { return true; });
+    }
+
+    template<class Eligible, class Reusable>
+    bool EvictIdle(const Snapshot &incoming, Eligible eligible, Reusable reusable) {
+        using Rank = std::pair<bool, int>;
+        auto rank = [&](const Snapshot &s) { return Rank(reusable(s), s.cachedLen); };
+        std::unordered_map<long long, Rank> keep;
         for (const auto &e : items)
-            longest[e->requestId] = std::max(longest[e->requestId], e->cachedLen);
+            keep[e->requestId] = std::max(keep[e->requestId], rank(*e));
         auto victim = items.end();
         std::pair<bool, long long> best;
         for (auto it = items.begin(); it != items.end(); ++it) {
@@ -182,8 +189,10 @@ public:
             bool continuation = e->requestId == incoming.requestId ||
                 (e->tokens.size() <= incoming.tokens.size() &&
                  std::equal(e->tokens.begin(), e->tokens.end(), incoming.tokens.begin()));
-            // Keep the latest boundary for unrelated agents waiting on tools.
-            if (!continuation && e->cachedLen == longest.at(e->requestId)) continue;
+            // Preserve a boundary that can also resume a longer tool call.
+            // A tail-only entry cannot supersede the last such boundary.
+            if (rank(*e) == keep.at(e->requestId) &&
+                (!continuation || (reusable(*e) && !reusable(incoming)))) continue;
             auto order = std::make_pair(!continuation, e->timestamp);
             if (victim == items.end() || order < best) {
                 victim = it;
