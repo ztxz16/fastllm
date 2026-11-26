@@ -215,6 +215,42 @@ struct HybridExpertRecords {
     }
 };
 
+// Two staging slots let the copy engine fill the next expert while the
+// compute stream is consuming the current one. All layers share the host ring.
+struct PrefillExpertUploads {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ready[2]{}, consumed[2]{};
+    std::unique_ptr<cuda::HostUploadRing> ring;
+    ~PrefillExpertUploads() {
+        if (stream) cudaStreamSynchronize(stream);
+        for (auto e : ready) if (e) cudaEventDestroy(e);
+        for (auto e : consumed) if (e) cudaEventDestroy(e);
+        if (stream) cudaStreamDestroy(stream);
+    }
+    void begin() {
+        if (!stream) {
+            int device;
+            check(cudaGetDevice(&device));
+            ring = std::make_unique<cuda::HostUploadRing>(device);
+            check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (!ready[i]) check(cudaEventCreateWithFlags(&ready[i], cudaEventDisableTiming));
+            if (!consumed[i]) check(cudaEventCreateWithFlags(&consumed[i], cudaEventDisableTiming));
+            check(cudaEventRecord(consumed[i], cudaStreamPerThread));
+        }
+    }
+    void load(int lane, int e, HybridExpertRecords &cache, const Projection &gate, const Projection &down) {
+        check(cudaStreamWaitEvent(stream, consumed[lane], 0));
+        cache.staging.keys[lane] = -1;
+        auto *dst = cache.data.p + size_t(cache.resident + lane) * cache.stride;
+        check(ring->Copy(dst, gate.host[e].data, cache.gateBytes, stream));
+        check(ring->Copy(dst + cache.gateBytes, down.host[e].data, cache.stride - cache.gateBytes, stream));
+        check(cudaEventRecord(ready[lane], stream));
+        cache.staging.keys[lane] = e;
+    }
+};
+
 // One admission budget covers the entire target forward, including repeated visits
 // to a physical layer. Each partition owns stable local CUDA slot tables.
 struct HybridCacheCycle final : ExpertCacheCycle {
@@ -223,6 +259,7 @@ struct HybridCacheCycle final : ExpertCacheCycle {
     const int experts, resident;
     MoeFrequencyPolicy policy;
     cuda::HybridMoeAdmissions admissions;
+    PrefillExpertUploads prefillUploads;
     template<class T> static std::vector<T> repeat(const std::vector<T> &values, int each) {
         std::vector<T> result;
         result.reserve(values.size() * each);
@@ -315,6 +352,66 @@ __global__ void gatherExpertRows(const float *input, const float *scores, const 
     if (!col) packedScores[row] = scores[route];
 }
 
+// For native NVFP4 the block scale divided by the expert's outer scale
+// is E4M3. Its product with an E2M1 code is exactly representable in FP16.
+template<bool Fp4, class T>
+__global__ void unpackPrefillExpert(const uint8_t *record, T *out, int elements, float outer) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= elements) return;
+    if constexpr (Fp4) {
+        const uint8_t *block = record + size_t(i / 16) * 12;
+        const int nibble = (block[(i % 16) / 2] >> (4 * (i & 1))) & 15;
+        float scale = *reinterpret_cast<const float *>(block + 8);
+        if constexpr (std::is_same_v<T, half>) scale = outer ? scale / outer : 0.f;
+        out[i] = T(fp4Value(nibble) * scale);
+    } else {
+        const float *scales = reinterpret_cast<const float *>(record + elements);
+        out[i] = fp8Value(record[i]) * scales[i / 32];
+    }
+}
+
+__global__ void normalizePrefillFp4(const float *input, half *out, float *scales, int cols) {
+    const int row = blockIdx.x;
+    const size_t base = size_t(row) * cols;
+    float peak = 0.f;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x) peak = fmaxf(peak, fabsf(input[base + j]));
+    __shared__ float maxima[8];
+    for (int d = 16; d; d /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, d));
+    if (!(threadIdx.x & 31)) maxima[threadIdx.x / 32] = peak;
+    __syncthreads();
+    peak = maxima[threadIdx.x % 8];
+    for (int d = 4; d; d /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, d));
+    const float scale = peak / 3.f;
+    if (!threadIdx.x) scales[row] = scale;
+    for (int j = threadIdx.x; j < cols; j += blockDim.x)
+        out[base + j] = __float2half_rn(scale ? input[base + j] / scale : 0.f);
+}
+
+__global__ void restorePrefillScale(float *dots, const float *scales, int cols) {
+    const int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < cols) dots[size_t(row) * cols + col] *= scales[row];
+}
+
+template<class T>
+void projectPrefillExpert(const T *weight, float outer, const float *input, float *output,
+                          half *normalized, float *scales, int rows, int cols, int tokens) {
+    constexpr bool factored = std::is_same_v<T, half>;
+    constexpr auto dtype = factored ? CUDA_R_16F : CUDA_R_32F;
+    constexpr auto compute = factored ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_PEDANTIC;
+    const void *activations = input;
+    if constexpr (factored) {
+        normalizePrefillFp4<<<tokens, 256, 0, cudaStreamPerThread>>>(input, normalized, scales, cols);
+        activations = normalized;
+    }
+    const float zero = 0.f;
+    if (cublasGemmEx(getFastllmCublasHandle(), CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, cols,
+                    &outer, weight, dtype, cols, activations, dtype, cols, &zero, output, CUDA_R_32F,
+                    rows, compute, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("Inkling grouped prefill GEMM failed");
+    if constexpr (factored)
+        restorePrefillScale<<<dim3((rows + 255) / 256, tokens), 256, 0, cudaStreamPerThread>>>(output, scales, rows);
+}
+
 __global__ void reduceExpertRows(const float *parts, const int *inverse, float *out, int top, int hidden,
                                  const int *slots = nullptr, const float *host = nullptr) {
     const int row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -383,6 +480,107 @@ class HostExperts final : public RoutedExperts {
         Data g(FLOAT32, {routes, 2 * inter}, CUDA, pair.p), m(FLOAT32, {routes, inter}, CUDA, mid.p);
         if (!RunCudaIndexedMoeSlots(cache.view, in, ix, score, g, m, out, inter, *this))
             throw std::runtime_error("Inkling cached expert projection failed");
+    }
+
+    // Route once per prompt window. Process hits before changing residency, and
+    // reuse each uploaded expert for all its routes before recycling the slot.
+    template<class T>
+    void runGroupedPrefill(const Config &c, const Matrix &x, float *result, const float *bias) const {
+        const int rows = x.rows, top = c.topK, routes = rows * top, h = c.hidden, inter = c.intermediate;
+        Buffer<int> ids(routes);
+        Matrix scores(rows, top);
+        select(c, routeLogits(x, routerWeight), bias, ids, scores);
+        std::vector<int> hostIds(routes);
+        check(cudaMemcpy(hostIds.data(), ids.p, routes * sizeof(int), cudaMemcpyDeviceToHost));
+        auto *policy = cycle ? &cycle->policy : nullptr;
+        const int keyBase = layer * c.experts;
+        HybridMoeRoutes plan(hostIds, c.experts, rows, keyBase, true, policy, cache.timing, 0);
+        std::vector<int> experts(plan.hits), order, inverse(routes);
+        experts.insert(experts.end(), plan.misses.begin(), plan.misses.end());
+        order.reserve(routes);
+        int maxGroup = 0;
+        for (int e : experts) {
+            const auto &group = plan.grouped[e];
+            maxGroup = std::max(maxGroup, int(group.size()));
+            for (int route : group) {
+                inverse[route] = int(order.size());
+                order.push_back(route);
+            }
+        }
+        Buffer<int> positions(routes), reverse(routes);
+        check(cudaMemcpy(positions.p, order.data(), routes * sizeof(int), cudaMemcpyHostToDevice));
+        check(cudaMemcpy(reverse.p, inverse.data(), routes * sizeof(int), cudaMemcpyHostToDevice));
+        constexpr bool factored = std::is_same_v<T, half>;
+        const size_t routeBytes = sizeof(float) * size_t(h + 3 * inter + 1) +
+            (factored ? sizeof(half) * std::max(h, inter) + sizeof(float) : 0);
+        const int tile = std::min(maxGroup, std::max(1, int(std::min<size_t>(65535, (64ULL << 20) / routeBytes))));
+        Matrix input = prepareInput(x), parts(routes, h), packed(tile, h), pair(tile, 2 * inter), mid(tile, inter), scale(tile, 1);
+        Rows<T> gateWeight(2 * inter, h), downWeight(h, inter);
+        Rows<half> normalized(factored ? tile : 0, std::max(h, inter));
+        Buffer<float> rowScales(factored ? tile : 0);
+        auto unpack = unpackPrefillExpert<true, T>;
+        if constexpr (!factored) {
+            if (!gate.fp4) unpack = unpackPrefillExpert<false, T>;
+        }
+        cache.publication.wait(cudaStreamPerThread, false);
+        auto *uploads = cycle && cache.staging.keys.size() >= 2 && !plan.misses.empty() ? &cycle->prefillUploads : nullptr;
+        auto prefetch = [&](size_t i) {
+            if (i < plan.misses.size()) uploads->load(i % 2, plan.misses[i], cache, gate, down);
+        };
+        if (uploads) {
+            uploads->begin();
+            prefetch(0);
+            prefetch(1);
+        }
+        int offset = 0, seenMisses = 0;
+        for (int e : experts) {
+            int slot = policy ? policy->Slot(keyBase + e) : e;
+            const bool miss = slot < 0;
+            if (miss && uploads) {
+                slot = cache.resident + seenMisses % 2;
+                check(cudaStreamWaitEvent(cudaStreamPerThread, uploads->ready[seenMisses % 2], 0));
+            } else if (miss) {
+                const int staged = cache.staging.Find(e);
+                slot = cache.resident + std::max(0, staged);
+                if (staged < 0) {
+                    cache.admit(e, slot, gate, down, cudaStreamPerThread);
+                    cache.staging.keys[0] = e;
+                }
+            } else if (policy) slot -= layer * cache.resident;
+            const int group = int(plan.grouped[e].size());
+            const uint8_t *record = cache.data.p + size_t(slot) * cache.stride;
+            const float gateScale = factored ? gate.hostOuter[e] : 1.f;
+            const float downScale = factored ? down.hostOuter[e] : 1.f;
+            unpack<<<(2 * inter * h + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                record, gateWeight.p, 2 * inter * h, gateScale);
+            unpack<<<(inter * h + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+                record + cache.gateBytes, downWeight.p, inter * h, downScale);
+            for (int i = 0; i < group; i += tile) {
+                const int n = std::min(tile, group - i);
+                gatherExpertRows<<<dim3((h + 255) / 256, n), 256, 0, cudaStreamPerThread>>>(
+                    input.p, scores.p, positions.p + offset + i, packed.p, scale.p, top, h);
+                projectPrefillExpert(gateWeight.p, gateScale, packed.p, pair.p, normalized.p, rowScales.p, 2 * inter, h, n);
+                activate(pair.p, scale.p, mid.p, n);
+                float *dst = parts.p + size_t(offset + i) * h;
+                projectPrefillExpert(downWeight.p, downScale, mid.p, dst, normalized.p, rowScales.p, h, inter, n);
+            }
+            if (miss) {
+                auto a = plan.selectPrefill(*policy, keyBase, e);
+                if (a.slot >= 0) {
+                    cycle->uploadAdmission(a, cudaStreamPerThread);
+                    policy->Admit(layer, a);
+                }
+                if (uploads) {
+                    check(cudaEventRecord(uploads->consumed[seenMisses % 2], cudaStreamPerThread));
+                    prefetch(seenMisses + 2);
+                    ++seenMisses;
+                }
+            }
+            offset += group;
+        }
+        reduceExpertRows<<<dim3((h + 255) / 256, rows), 256, 0, cudaStreamPerThread>>>(
+            parts.p, reverse.p, result, top, h);
+        check(cudaGetLastError());
     }
 
     void runChunk(const Config &c, const Matrix &x, float *result, const float *bias, bool prefill) const {
@@ -512,6 +710,17 @@ public:
     }
     Matrix run(const Config &c, const Matrix &x, const float *bias, ExpertPhase phase, Rows<__nv_bfloat16> *, Rows<__nv_bfloat16> *, int) const override {
         Matrix out(x.rows, c.hidden);
+        if (phase == ExpertPhase::Prefill && cache.count && gate.ggufType < 0 &&
+            size_t(x.rows) * c.topK >= size_t(32) * c.experts) {
+            // Keep ordered contributions so the final top-k sum preserves its arithmetic order.
+            const int window = std::max(1, int(std::min<size_t>(65535,
+                (256ULL << 20) / (sizeof(float) * size_t(c.topK) * c.hidden))));
+            const auto project = gate.fp4 && FastllmCudaRuntimeArch() >= 75
+                ? &HostExperts::runGroupedPrefill<half> : &HostExperts::runGroupedPrefill<float>;
+            for (int i = 0; i < x.rows; i += window)
+                (this->*project)(c, x.slice(i, std::min(window, x.rows - i)), out.p + size_t(i) * c.hidden, bias);
+            return out;
+        }
         // The gather and indexed GEMVs use a grid.y entry per route. Keep the
         // packed CPU/GPU scratch bounded independently of total prompt length.
         const size_t perRoute = sizeof(float) * size_t(5 * c.hidden + 6 * c.intermediate);

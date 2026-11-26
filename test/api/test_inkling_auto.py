@@ -121,6 +121,15 @@ class InklingAutoTest(unittest.TestCase):
         self.assertNotIn("gpu_expert_layers", self.plan(*options, n=1, compact=False)[1])
         self.assertNotIn("gpu_expert_layers", self.plan(n=1, compact=True)[1])
 
+    def test_hybrid_workspace_covers_grouped_prefill(self):
+        g = ink.geometry(self.meta)
+        def workspace(rows, native):
+            return ink._workspace_bytes(g, rows, 1, 1, True, 0, native_prefill=native)
+        self.assertEqual(workspace(511, True), workspace(511, False))
+        extra = workspace(8192, True) - workspace(8192, False)
+        self.assertGreater(extra, 256 * mem.MiB)
+        self.assertEqual(extra, workspace(16384, True) - workspace(16384, False))
+
     def test_prefix_pool_budget(self):
         options = ("--max_batch", "2", "--max_context_length", "8192")
         for ranks in (1, 2):

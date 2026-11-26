@@ -851,6 +851,7 @@ struct Projection {
     std::vector<WeightShard> tensorShards;
     int rows, cols, group;
     bool fp4;
+    std::vector<float> hostOuter;
 #ifdef FASTLLM_INKLING_GROUPED_SM75
     bool exactHalfWeights = false;
 #endif
@@ -1091,6 +1092,7 @@ struct Projection {
                 host[id].scales = a;
             }
         }
+        if (fp4 && where != ExpertDevice::Cuda) hostOuter = std::move(outer);
     }
 };
 // A gate/up input is shared by all routes of a token. A down input belongs to one route.

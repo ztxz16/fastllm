@@ -223,7 +223,7 @@ def _kv_bytes(capacity, batch, page, heads, dim, unit, global_layers, local_laye
     return 2 * unit * heads * dim * (global_layers * capacity + local_layers * local_tokens)
 
 
-def _workspace_bytes(g, rows, decode_rows, ranks, hybrid, draft_taps, steps=0):
+def _workspace_bytes(g, rows, decode_rows, ranks, hybrid, draft_taps, steps=0, native_prefill=False):
     # target() keeps the live projections and one residual per block.
     residuals = (g.global_ + g.local) // g.residual_block
     backbone = rows * g.hidden * 4 * (12 + residuals + draft_taps)
@@ -232,7 +232,14 @@ def _workspace_bytes(g, rows, decode_rows, ranks, hybrid, draft_taps, steps=0):
     moe = rows * route_bytes
     if hybrid:
         # Eager host routing uses bounded chunks. Capture also retains its decode intermediates.
-        moe = min(moe, 64 * MiB) + decode_rows * route_bytes
+        moe = min(moe, 64 * MiB)
+        if native_prefill and rows * g.top >= 32 * g.experts:
+            window = min(rows, 65535, max(1, 256 * MiB // (4 * g.top * g.hidden)))
+            per_route = 4 * (g.hidden + 3 * g.inter + 1)
+            grouped = (window * (4 * g.hidden + g.top * (4 * g.hidden + 16))
+                       + min(64 * MiB, window * per_route) + 12 * g.hidden * g.inter)
+            moe = max(moe, grouped)
+        moe += decode_rows * route_bytes
     workspace = backbone + relative_bias + moe + 4 * decode_rows * g.vocab + 512 * MiB
     if steps:
         batch = decode_rows // (steps + 1)
@@ -471,7 +478,8 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                         if not fixed_chunk:
                             chunk = min(chunk, context)
                         rows = max(chunk, args.prefill_batch_tokens or 0, decode_rows)
-                        scratch = _workspace_bytes(g, rows, decode_rows, world, hybrid, draft_taps, args.dspark)
+                        scratch = _workspace_bytes(g, rows, decode_rows, world, hybrid, draft_taps, args.dspark,
+                                                   native_prefill=bool(w.native_layers) and cache != 0)
                         if core:
                             scratch = max(scratch, _workspace_bytes(g, rows, decode_rows, world, False, draft_taps, args.dspark))
                         runtime = resident + gpu_core + rank_kv + rank_prefix + scratch
