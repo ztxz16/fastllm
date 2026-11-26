@@ -95,7 +95,7 @@ template <class T> void storeFeatures(Request &req, const std::vector<Matrix> &f
     for (int i = 0; i <= d.layers; ++i) {
         const bool last = i == d.layers;
         const bool local = !last && d.local[i];
-        int count = last ? 1 : local ? std::min(rows, d.window) : rows;
+        int count = last ? 1 : local && !state.kv[i]->cache.mapped ? std::min(rows, d.window) : rows;
         int skip = rows - count;
         Matrix mixed(count, c.hidden);
         draftMix<T><<<dim3(count, (c.hidden + 255) / 256), 256, 0, cudaStreamPerThread>>>(

@@ -159,7 +159,7 @@ void prepareWindowVerification(int batch) {
     if (compactWindow || kvType != FLOAT16 || !backboneBf16 || !pagedDecodePdl || c.relative != 16 || c.headDim != 128 ||
         c.conv != 4 || c.kvHeads <= 0 || c.heads % c.kvHeads || int64_t(batch) * c.kvHeads < smCount)
         return;
-    auto kernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen());
+    auto kernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen(), false, 1, model.kvMemConfig.enabled);
     if (kernel.handle) {
         std::vector<Buffer<__nv_bfloat16>> tables(c.layers);
         for (int layer = 0; layer < c.layers; ++layer) {

@@ -86,8 +86,8 @@ __device__ __forceinline__ void relativeMmaTile(AttentionRow a, float *partial, 
             const int page = pages.shift < 0 ? pageToken / pages.pageLen : pageToken >> pages.shift;
             const int2 ids = pages.ids[page - pages.first];
             const size_t offset = size_t(token - page * pages.pageLen) * stride + kvHead * width + pair * 8;
-            key[halfTile] = static_cast<const half *>(pages.key) + ids.x * pageStride + offset;
-            value[halfTile] = static_cast<const half *>(pages.value) + ids.y * pageStride + offset;
+            key[halfTile] = pages.pageBase<half>(ids, false, pageStride) + offset;
+            value[halfTile] = pages.pageBase<half>(ids, true, pageStride) + offset;
         }
         float score[4]{};
 #pragma unroll

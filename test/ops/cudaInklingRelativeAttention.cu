@@ -2,6 +2,7 @@
 // learned sink, absolute-position temperature and an uncommitted prefill suffix.
 #include "../../src/models/inkling2/runtime.cuh"
 #include "devices/cuda/fastllm-cuda-launch.cuh"
+#include "devices/cuda/fastllm-kvmem-page-selection.cuh"
 #include "devices/cuda/fastllm-cuda-attn-res.cuh"
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/fastllm-bf16-warp-dot.cuh"
@@ -276,7 +277,167 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
     if (!(error < l2Tolerance && maxAbs < absTolerance)) throw std::runtime_error("Relative attention mismatch");
 }
 } // namespace
+// Two live requests cycle through independent device rings. Re-read every byte
+// after eviction and after overwriting a rejected proposal on the next page.
+template<class T> void checkMappedPages() {
+    constexpr int len = 16, width = 8, count = 10, hot = 2, span = len * width;
+    const size_t sideBytes = span * sizeof(T);
+    MappedKvPages a(count, hot, 2 * sideBytes), b(count, hot, 2 * sideBytes);
+    int request = 0;
+    for (auto *storage : {&a, &b}) {
+        PageView view{nullptr, nullptr, storage->addresses(), 0, len, pageShift(len)};
+        std::vector<int2> initial(count);
+        check(cudaMemcpyAsync(initial.data(), view.ids, count * sizeof(int2), cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        check(cudaStreamSynchronize(cudaStreamPerThread));
+        for (int2 id : initial) {
+            auto address = (uintptr_t(uint32_t(id.y)) << 32) | uint32_t(id.x);
+            cudaPointerAttributes attr{};
+            check(cudaPointerGetAttributes(&attr, reinterpret_cast<void *>(address)));
+            if (attr.type != cudaMemoryTypeHost)
+                throw std::runtime_error("KVMem host page missing at request admission");
+        }
+        std::vector<T> keys(count * span), values(keys.size());
+        for (int i = 0; i < int(keys.size()); ++i) {
+            keys[i] = T(float((i + request) % 19));
+            values[i] = T(float((i + 3 * request) % 31));
+        }
+        auto key = upload(keys), value = upload(values);
+        auto write = [&](int start, int rows) {
+            appendKv<<<(rows * width + 127) / 128, 128, 0, cudaStreamPerThread>>>(
+                view, key.p + start * width, value.p + start * width, start, 0, width, rows);
+        };
+        write(0, 2 * len + 3);
+        storage->prepare(3, 1); // Reject the tail; only the first page is immutable.
+        keys[2 * span] = T(77.f);
+        check(cudaMemcpyAsync(key.p + 2 * span, &keys[2 * span], sizeof(T), cudaMemcpyHostToDevice, cudaStreamPerThread));
+        write(2 * len, (count - 2) * len);
+        for (int sealed : {2, 5, count - 1}) {
+            storage->prepare(count, sealed);
+            check(cudaStreamSynchronize(cudaStreamPerThread));
+            std::vector<int2> table(count);
+            check(cudaMemcpy(table.data(), view.ids, count * sizeof(int2), cudaMemcpyDeviceToHost));
+            for (int i = 0; i < count; ++i) {
+                const auto bits = uintptr_t(uint32_t(table[i].y)) << 32 | uint32_t(table[i].x);
+                auto *ptr = reinterpret_cast<const T *>(bits);
+                cudaPointerAttributes attr{};
+                check(cudaPointerGetAttributes(&attr, ptr));
+                const bool resident = i >= sealed - hot && i < sealed;
+                if (attr.type != (resident ? cudaMemoryTypeDevice : cudaMemoryTypeHost))
+                    throw std::runtime_error("KVMem exceeded the per-request device ring or lost a host page");
+                std::vector<T> pair(2 * span);
+                check(cudaMemcpy(pair.data(), ptr, 2 * sideBytes, cudaMemcpyDefault));
+                if (memcmp(pair.data(), keys.data() + i * span, sideBytes) ||
+                    memcmp(pair.data() + span, values.data() + i * span, sideBytes))
+                    throw std::runtime_error("KVMem cold/hot page bytes differ from committed KV");
+            }
+        }
+        ++request;
+    }
+}
+
+// Two queries reverse the ranking, while replay uses identical graph addresses.
+// Check selected logical IDs, chronological order and the absolute bias/sink/tau
+// arithmetic against an independent scalar attention over those IDs.
+template<class T> void checkSelectedPages(DataType type) {
+    constexpr int D = 128, len = 16, pages = 11, hot = 4, past = 10 * len + 3, span = D * len;
+    MappedKvPages storage(pages, hot, 2 * span * sizeof(T));
+    KvMemConfig cfg;
+    cfg.sinkTokens = len; cfg.recentTokens = len; cfg.retrievalTokens = 2 * len;
+    storage.selectPages(cfg, type, len, 1, 1, D);
+    storage.prepare(pages, 0);
+    PageView view{nullptr, nullptr, storage.addresses(), 0, len, pageShift(len), storage.selector()};
+    std::vector<T> keys(pages * span), values(keys.size());
+    for (int p = 0; p < pages; ++p) {
+        for (int t = 0; t < len; ++t) {
+            keys[p * span + t * D] = T(float(p / 2));
+            for (int c = 0; c < D; ++c) values[p * span + t * D + c] = T(float(p));
+        }
+    }
+    auto key = upload(keys), value = upload(values);
+    appendKv<<<(keys.size() + 255) / 256,256,0,cudaStreamPerThread>>>(view, key.p, value.p, 0, 0, D, pages * len);
+    storage.prepare(pages, past / len);
+    DecodeVisit visit{}; visit.pages = view; visit.past = past;
+    auto visits = upload(std::vector<DecodeVisit>{visit});
+    std::vector<float> bias(past + 1), q(D);
+    for (size_t i = 0; i < bias.size(); ++i) bias[i] = float((i / 16) % 3) * 0.5f;
+    auto b = upload(bias), query = upload(q), sink = upload(std::vector<float>{1.f});
+    Matrix out(1, D);
+    AttentionRow a{query.p,nullptr,nullptr,{},b.p,sink.p,out.p,visits.p,0,0,1,1,D,past+1,0,32,0.45f};
+    cudaGraph_t graph; cudaGraphExec_t exec;
+    check(cudaStreamSynchronize(cudaStreamPerThread));
+    check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
+    selectAttentionPages(a,1,1);
+    launchRelativeKernel<D,1,false,T>(a,1,nullptr,1);
+    check(cudaStreamEndCapture(cudaStreamPerThread,&graph));
+    check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+    for (float sign : {1.f, -1.f}) {
+        q[0] = sign;
+        check(cudaMemcpyAsync(query.p,q.data(),D*sizeof(float),cudaMemcpyHostToDevice,cudaStreamPerThread));
+        check(cudaGraphLaunch(exec,cudaStreamPerThread));
+        check(cudaStreamSynchronize(cudaStreamPerThread));
+        kv_selection::State state;
+        check(cudaMemcpy(&state,storage.selector(),sizeof(state),cudaMemcpyDeviceToHost));
+        const std::vector<int> expected = sign > 0 ? std::vector<int>{0,6,8,9} : std::vector<int>{0,1,2,9};
+        std::vector<int> selected(state.kept);
+        check(cudaMemcpy(selected.data(),state.selected,selected.size()*sizeof(int),cudaMemcpyDeviceToHost));
+        if (selected != expected) throw std::runtime_error("KVMem query ranking/tie or hot page budget");
+        const double tau = 1. + a.alpha * std::log(double(past + 1) / a.floor);
+        double sum = std::exp(1.), numerator = 0.;
+        for (int t = 0; t <= past; ++t) {
+            int page = t / len;
+            if (page < state.sealed && std::find(expected.begin(),expected.end(),page) == expected.end()) continue;
+            double w = std::exp(tau * (sign * float(keys[t * D]) / std::sqrt(double(D)) + bias[past - t]));
+            sum += w; numerator += w * float(values[t * D]);
+        }
+        float actual;
+        check(cudaMemcpy(&actual,out.p,sizeof(float),cudaMemcpyDeviceToHost));
+        if (!(std::abs(actual - numerator / sum) < 2.e-4))
+            throw std::runtime_error("KVMem selected attention differs from absolute-position reference");
+        if constexpr (std::is_same_v<T, half> || std::is_same_v<T, __nv_fp8_e4m3>) {
+            if (!configureGatedPrefill<false,half,T>()) continue;
+            std::vector<half> packed(2 * D), gates(2 * D, half(0.f));
+            packed[0] = packed[D] = half(sign);
+            auto pq = upload(packed), pg = upload(gates);
+            auto sinks = upload(std::vector<float>{1.f, 1.f});
+            auto biases = bias;
+            biases.insert(biases.end(), bias.begin(), bias.end());
+            auto pb = upload(biases);
+            Buffer<half> po(2 * D);
+            auto pre = a;
+            pre.visit = nullptr; pre.pages = view; pre.past = past;
+            pre.key = key.p + size_t(past) * D; pre.value = value.p + size_t(past) * D;
+            pre.sink = sinks.p; pre.relative = pb.p;
+            launchGatedPrefill<false,half,T>(pre,pq.p,po.p,pg.p,D,2,pb.p);
+            std::vector<half> actual(2 * D);
+            check(cudaMemcpy(actual.data(),po.p,actual.size()*sizeof(half),cudaMemcpyDeviceToHost));
+            for (int row = 0; row < 2; ++row) {
+                double den = std::exp(1.), acc = 0.;
+                const int pos = past + row;
+                const double scale = 1. + a.alpha * std::log(double(pos + 1) / a.floor);
+                for (int t = 0; t <= pos; ++t) {
+                    const int page = t / len, distance = pos - t;
+                    if (page < state.sealed && std::find(expected.begin(),expected.end(),page) == expected.end()) continue;
+                    const double add = distance < int(bias.size()) ? bias[distance] : 0.;
+                    const double mass = std::exp(scale * (sign * float(keys[t * D]) / std::sqrt(double(D)) + add));
+                    den += mass; acc += mass * float(values[t * D]);
+                }
+                if (!(std::abs(float(actual[row * D]) - .5 * acc / den) < .008))
+                    throw std::runtime_error("KVMem selected tiled prefill differs from causal sparse reference");
+            }
+        }
+    }
+    check(cudaGraphExecDestroy(exec)); check(cudaGraphDestroy(graph));
+}
+
 int testRelative() {
+    checkSelectedPages<float>(FLOAT32);
+    checkSelectedPages<half>(FLOAT16);
+    checkSelectedPages<__nv_bfloat16>(BFLOAT16);
+    checkSelectedPages<__nv_fp8_e4m3>(FP8_E4M3);
+    checkMappedPages<float>();
+    checkMappedPages<half>();
+    checkMappedPages<nv_bfloat16>();
+    checkMappedPages<__nv_fp8_e4m3>();
     for (int past : {0, 16, 1023, 1024, 1025, 4096}) {
         compare<128, nv_bfloat16>(3, past, 1, 1024, 128, true);
         compare<128, nv_bfloat16>(3, past, 1, 0, 128, true);

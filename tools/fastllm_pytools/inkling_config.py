@@ -205,6 +205,8 @@ def _draft_budget(args, meta):
             ("intermediate_size", "feed_forward_length"), ("block_size", "block_size"),
             ("target_layer_ids", "target_layers"))}
         draft["local_layer_ids"] = [i for i, local in enumerate(pattern) if local]
+        if "dflash.context_length" in md:
+            draft["max_position_embeddings"] = md["dflash.context_length"]
         draft["sliding_window_size"] = md["dflash.attention.sliding_window"] - 1
         if (len(pattern) != draft["num_hidden_layers"] or any(type(local) is not bool for local in pattern)
                 or draft["head_dim"] != md["dflash.attention.value_length"] or draft["sliding_window_size"] < 1
@@ -269,10 +271,22 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
 
     batch = max(1, args.max_batch)
     context = args.max_context_length if args.max_context_length > 0 else min(g.context, args.tokens if args.tokens > 0 else 131072)
+    kvmem = json.loads(args.kvmem) if args.kvmem is not None else {}
+    if not isinstance(kvmem, dict):
+        raise ValueError("--kvmem must be a JSON object")
+    offload = args.kvmem is not None and kvmem.get("enabled", True)
+    if offload:
+        if "max_tokens" not in kvmem:
+            kvmem["max_tokens"] = context if args.max_context_length > 0 else min(context, 32768)
+            args.kvmem = json.dumps(kvmem)
+        logical = kvmem["max_tokens"]
+        if type(logical) is not int or logical <= 0 or logical > g.context or (args.max_context_length > 0 and logical > context):
+            raise ValueError("KVMem max_tokens exceeds the configured Inkling context")
+        context = logical
     if context > g.context or (args.tokens > 0 and args.tokens < context):
         raise ValueError("Inkling context exceeds the checkpoint or shared token budget")
     contexts = [context]
-    if args.tokens <= 0 and args.max_context_length <= 0:
+    if not offload and args.tokens <= 0 and args.max_context_length <= 0:
         while contexts[-1] > 8192:
             contexts.append(max(8192, contexts[-1] // 2))
     page = args.page_size if args.page_size > 0 else 128
@@ -282,8 +296,40 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
         raise ValueError("Inkling KV requires float16, bfloat16, float32 or fp8_e4m3")
     graph = cuda_graph_enabled()
     dense = w.replicated + w.sharded
+    head_width = 64 if g.dim <= 64 else 128
     decode_rows = batch * (args.dspark + 1)
     draft_taps = len(draft.get("target_layer_ids", ()))
+    host_kv = 0
+    if offload:
+        hot = kvmem.get("resident_tokens", 8192)
+        if type(hot) is not int or not 0 < hot <= logical or hot % page:
+            raise ValueError("KVMem resident_tokens must fit max_tokens and align to a KV page")
+        def aligned(n):
+            return (n + page - 1) // page * page
+        pages = aligned(logical) // page
+        target_visits = g.local + g.global_
+        target_pair = 2 * unit * g.kv * head_width
+        host_kv = batch * pages * page * target_visits * target_pair
+        target_slots = g.global_ * hot + g.local * min(hot, aligned(g.window))
+        hot_kv = batch * target_slots * target_pair
+        tables = batch * target_visits * pages * 8
+        if draft:
+            draft_layers = draft["num_hidden_layers"]
+            draft_pair = 4 * draft["num_key_value_heads"] * draft["head_dim"]
+            draft_tokens = aligned(min(logical, draft.get("max_position_embeddings", logical)) + draft["block_size"] - 1)
+            host_kv += batch * draft_tokens * draft_layers * draft_pair
+            draft_hot = min(hot, draft_tokens)
+            local_layers = len(draft["local_layer_ids"])
+            draft_slots = ((draft_layers - local_layers) * draft_hot
+                           + local_layers * min(draft_hot, aligned(draft["sliding_window_size"])))
+            hot_kv += batch * draft_slots * draft_pair
+            tables += batch * draft_layers * (draft_tokens // page) * 8
+        if host_kv > kvmem.get("host_mib", 8192) * MiB:
+            raise ValueError(f"KVMem needs {math.ceil(host_kv / MiB)} MiB of host KV for max_batch={batch}")
+        if "prefill_tokens" in kvmem:
+            if type(kvmem["prefill_tokens"]) is not int or kvmem["prefill_tokens"] < 1:
+                raise ValueError("KVMem prefill_tokens must be a positive integer")
+            args.chunked_prefill_size = kvmem["prefill_tokens"]
     fixed_chunk = args.chunked_prefill_size not in (-1, "auto")
     chunks = [args.chunked_prefill_size] if fixed_chunk else [8192, 4096, 2048, 1024, 512, 256]
     if fixed_chunk and chunks[0] < 1:
@@ -291,18 +337,20 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
     failures = []
     for context in contexts:
         tokens = args.tokens if args.tokens > 0 else context * batch
-        capacity = (tokens + page - 1) // page * page
-        extra = draft["block_size"] - 1 if draft else 0
-        kv = _kv_bytes(capacity, batch, page, g.kv, 64 if g.dim <= 64 else 128, unit,
-                       g.global_, g.local, g.window + extra)
-        if draft:
-            local = len(draft["local_layer_ids"])
-            kv += _kv_bytes(capacity, batch, page, draft["num_key_value_heads"], draft["head_dim"], 2,
-                           draft["num_hidden_layers"] - local, local, draft["sliding_window_size"] + draft["block_size"], extra)
+        if offload:
+            kv = hot_kv
+        else:
+            capacity = (tokens + page - 1) // page * page
+            extra = draft["block_size"] - 1 if draft else 0
+            kv = _kv_bytes(capacity, batch, page, g.kv, head_width, unit, g.global_, g.local, g.window + extra)
+            if draft:
+                local = len(draft["local_layer_ids"])
+                kv += _kv_bytes(capacity, batch, page, draft["num_key_value_heads"], draft["head_dim"], 2,
+                                draft["num_hidden_layers"] - local, local, draft["sliding_window_size"] + draft["block_size"], extra)
         for hybrid in (False, True):
             if (hybrid and force_gpu) or (not hybrid and force_host):
                 continue
-            host_bytes = dense + 2 * w.largest + (w.slot_bytes * g.experts if hybrid else 0)
+            host_bytes = host_kv + dense + 2 * w.largest + (w.slot_bytes * g.experts if hybrid else 0)
             if host_bytes > host_limit:
                 failures.append(f"host needs {host_bytes // MiB} MiB, budget {host_limit // MiB} MiB")
                 continue
@@ -314,7 +362,12 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                 resident = w.replicated + math.ceil(w.sharded / world) + expert_gpu
                 # Rank zero can still own the loaded dense checkpoint while shards are created.
                 load_peak = resident + (dense if world > 1 else 0) + w.largest // world + 512 * MiB
-                rank_kv = math.ceil(kv / world)
+                rank_kv = (kv + world - 1) // world
+                if offload:
+                    width = g.kv * head_width // world
+                    selection_bytes = batch * g.global_ * (152 + 4 * pages * (width + g.heads // world + 2)
+                                                           + 16 * (hot // page))
+                    rank_kv += tables + selection_bytes
                 rank_budget = min(budgets[d] for d in ids)
                 candidates = []
                 for chunk in chunks:
@@ -353,6 +406,10 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                               workspace_bytes_per_rank=scratch, weight_bytes_per_rank=resident, root_load_peak_bytes=load_peak,
                               host_estimated_bytes=host_bytes, host_budget_bytes=host_limit,
                               automatic={"policy": "inkling-tp-or-single-hybrid", "cuda_graph": graph})
+                if offload:
+                    result.update(kvmem_host_bytes=host_kv, kvmem_resident_tokens=hot,
+                                  kvmem_hot_bytes_per_rank=hot_kv // world, kvmem_page_table_bytes_per_rank=tables,
+                                  kvmem_selection_bytes_per_rank=selection_bytes)
                 print("[auto] " + json.dumps(result, sort_keys=True), flush=True)
                 return result
     raise ValueError("Inkling --auto: no feasible layout. " + "; ".join(dict.fromkeys(failures[-3:])))

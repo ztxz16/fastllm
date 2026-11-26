@@ -29,10 +29,29 @@ except Exception as exc:  # pragma: no cover - this is reported through /compile
 
 if triton is not None:
     @triton.jit
+    def _inkling_page_rows(key, value, ids, page, valid, stride, offset, MAPPED: tl.constexpr):
+        if MAPPED:
+            # Graph padding uses ordinary pool IDs; live host-backed requests
+            # publish one address per K/V pair with K immediately before V.
+            pair = tl.load(ids.to(tl.pointer_type(tl.uint64)) + page, valid, 0)
+            base = pair.to(key.dtype)
+            pooled = key.to(tl.uint64) != 0
+            pk = (pair & 0xffffffff).to(tl.int64)
+            pv = (pair >> 32).to(tl.int64)
+            k = tl.where(pooled, key + pk * stride, base)
+            v = tl.where(pooled, value + pv * stride, base + stride)
+        else:
+            pk = tl.load(ids + 2 * page, valid, 0).to(tl.int64)
+            pv = tl.load(ids + 2 * page + 1, valid, 0).to(tl.int64)
+            k, v = key + pk * stride, value + pv * stride
+        return k + offset, v + offset
+
+    @triton.jit
     def fastllm_inkling_window_verify(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
                                      past_offset, chain, sink_stride, gate_stride,
                                      H: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
-                                     WINDOW: tl.constexpr, E: tl.constexpr, DECODE: tl.constexpr = False):
+                                     WINDOW: tl.constexpr, E: tl.constexpr, DECODE: tl.constexpr = False,
+                                     MAPPED: tl.constexpr = False):
         # Adapted from vLLM's Inkling _rel_attention_kernel, Apache-2.0.
         # Copyright contributors to the vLLM project.
         # https://github.com/vllm-project/vllm/blob/main/vllm/models/inkling2/nvidia/ops/attention_sm90.py
@@ -88,11 +107,10 @@ if triton is not None:
                 slot = t - page * page_len
             page -= first_page
             valid = (page >= 0) & (t < past + live)
-            pk = tl.load(ids + 2 * page, valid, 0).to(tl.int64)
-            pv = tl.load(ids + 2 * page + 1, valid, 0).to(tl.int64)
             offset = (slot * (H // G) + kv) * D
             page_stride = page_len * (H // G) * D
-            k = tl.load(key + (pk * page_stride + offset)[None, :] + d[:, None], valid[None, :], 0.)
+            krow, vrow = _inkling_page_rows(key, value, ids, page, valid, page_stride, offset, MAPPED)
+            k = tl.load(krow[None, :] + d[:, None], valid[None, :], 0.)
             if DECODE:
                 score = (tl.dot(q_hi, k) + tl.dot(q_lo, k)) * 0.08838834764831845
             else:
@@ -112,7 +130,7 @@ if triton is not None:
             prob = tl.exp2(score - safe[:, None])
             scale = tl.exp2(mx - safe)
             denom = denom * scale + tl.sum(prob, 1)
-            v = tl.load(value + (pv * page_stride + offset)[:, None] + d[None, :], valid[:, None], 0.)
+            v = tl.load(vrow[:, None] + d[None, :], valid[:, None], 0.)
             if DECODE:
                 p_hi = prob.to(tl.float16)
                 p_lo = (prob - p_hi.to(tl.float32)).to(tl.float16)
@@ -132,15 +150,15 @@ if triton is not None:
     def fastllm_inkling_window_decode(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
                                      past_offset, chain, sink_stride, gate_stride,
                                      H: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
-                                     WINDOW: tl.constexpr, E: tl.constexpr):
+                                     WINDOW: tl.constexpr, E: tl.constexpr, MAPPED: tl.constexpr = False):
         fastllm_inkling_window_verify(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
-                                     past_offset, 1, sink_stride, gate_stride, H, G, PAGE, WINDOW, E, True)
+                                     past_offset, 1, sink_stride, gate_stride, H, G, PAGE, WINDOW, E, True, MAPPED)
 
     @triton.jit
     def fastllm_inkling_window_split(Visit, Q, Bias, Sink, Gate, Out, visit_bytes,
                                     past_offset, chain, sink_stride, gate_stride,
                                     H: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
-                                    WINDOW: tl.constexpr, E: tl.constexpr, BN: tl.constexpr):
+                                    WINDOW: tl.constexpr, E: tl.constexpr, BN: tl.constexpr, MAPPED: tl.constexpr = False):
         # One CTA per KV head and time partition. mergeRelativeWarp reads only
         # active partitions and applies the learned sink and output gate once.
         split, kv = tl.program_id(0), tl.program_id(1)
@@ -164,15 +182,14 @@ if triton is not None:
             page = pos // page_len
             slot = pos - page * page_len
         valid = (n < chunk) & (pos <= past) & (page >= first_page)
-        pk = tl.load(ids + 2 * (page - first_page), valid, 0).to(tl.int64)
-        pv = tl.load(ids + 2 * (page - first_page) + 1, valid, 0).to(tl.int64)
         d, m = tl.arange(0, 128), tl.arange(0, 16)
         head = kv * G + m
         q = tl.load(Q + head[:, None] * 128 + d[None, :], m[:, None] < G, 0.)
         offset = (slot * (H // G) + kv) * 128
         stride = page_len * (H // G) * 128
-        k = tl.load(key + (pk * stride + offset)[:, None] + d[None, :], valid[:, None], 0.)
-        v = tl.load(value + (pv * stride + offset)[:, None] + d[None, :], valid[:, None], 0.)
+        krow, vrow = _inkling_page_rows(key, value, ids, page - first_page, valid, stride, offset, MAPPED)
+        k = tl.load(krow[:, None] + d[None, :], valid[:, None], 0.)
+        v = tl.load(vrow[:, None] + d[None, :], valid[:, None], 0.)
         q_hi = q.to(tl.float16)
         qk = tl.dot(q_hi, tl.trans(k)) + tl.dot((q - q_hi.to(tl.float32)).to(tl.float16), tl.trans(k))
         dist = past - pos
@@ -5195,13 +5212,16 @@ def compile_inkling_window(payload):
         if splits not in (16, 32) or window > 1024:
             raise ValueError("unsupported Inkling window partition size")
         base += f"_s{splits}"
+    mapped = payload.get("mapped_pages", False)
+    if mapped:
+        base += "_mapped"
     cubin, meta = root / (base + ".cubin"), root / (base + ".json")
     if cubin.is_file() and meta.is_file():
         return json.loads(meta.read_text())
     source = "*fp32" if decode else "*bf16"
     pointers = dict(Visit="*u8", Q=source, Bias=source, Sink=source, Gate=source, Out="*bf16")
     strides = dict.fromkeys(("visit_bytes", "past_offset", "chain", "sink_stride", "gate_stride"), "i32")
-    constants = dict(H=heads, G=group, PAGE=page, WINDOW=window, E=extent)
+    constants = dict(H=heads, G=group, PAGE=page, WINDOW=window, E=extent, MAPPED=mapped)
     function = fastllm_inkling_window_decode if decode else fastllm_inkling_window_verify
     if split:
         function = fastllm_inkling_window_split

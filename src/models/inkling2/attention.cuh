@@ -11,6 +11,8 @@ struct AttentionRow {
     int past, first, heads, kvHeads, width, distances, window, floor;
     float alpha;
     int sinkStride = heads, gateStride = heads * width;
+    bool sparse = false;
+    __device__ kv_selection::State *selection() const { return sparse ? (visit ? visit->pages : pages).selection : nullptr; }
 };
 
 // FlashInfer stores float4 partials. Its split-major layout needs an aligned
@@ -36,13 +38,21 @@ template<class T> struct KVSegment {
     const T *suffix;
     int first, past, stride;
     bool valueSide;
+    const kv_selection::State *selection = nullptr;
     __device__ const T *operator+(size_t element) const {
         return at(first + int(element / stride), element % stride);
     }
     __device__ const T *at(int token, unsigned channel) const {
+        if (selection) {
+            const int page = token / pages.pageLen;
+            if (page < selection->kept) {
+                const T *pair = reinterpret_cast<const T *>(selection->hot + size_t(selection->viewSlots[page]) * selection->pairBytes);
+                return pair + (size_t(valueSide) * pages.pageLen + token % pages.pageLen) * stride + channel;
+            }
+            token += selection->omitted();
+        }
         if (suffix && token >= past) return suffix + size_t(token - past) * stride + channel;
-        const T *base = static_cast<const T *>(valueSide ? pages.value : pages.key);
-        return base + pages.offset(token, valueSide, stride) + channel;
+        return pages.row<T>(token, valueSide, stride) + channel;
     }
 };
 
@@ -83,7 +93,9 @@ struct RelativeAttention : flashinfer::AttentionVariantBase {
     template<class P> __device__ RelativeAttention(const P &, unsigned, void *) {}
     template<class P, class T>
     __device__ T LogitsTransform(const P &p, T qk, unsigned, unsigned, unsigned t, unsigned h, unsigned) const {
-        unsigned distance = p.paged_kv.length - 1u - t;
+        const auto *sel = p.paged_kv.k_data.selection;
+        unsigned distance = sel ? p.paged_kv.length + sel->omitted() - 1u - sel->absolute(t)
+                                : p.paged_kv.length - 1u - t;
         float bias = distance < p.distances ? p.relative[size_t(h) * p.distances + distance] : 0.f;
         return (qk * p.scale + bias) * p.tau;
     }
@@ -103,7 +115,8 @@ __global__ void relativeAttention(AttentionRow a, float *partial) {
     const int past = a.visit ? a.visit->past : a.past;
     const int row = Batched ? 0 : a.first + blockIdx.x, pos = past + row;
     const int begin = a.window ? max(0, pos + 1 - a.window) : 0;
-    const int length = pos - begin + 1;
+    const auto *selection = a.selection();
+    const int length = pos - begin + 1 - (selection ? selection->omitted() : 0);
     const int split = Split ? blockIdx.z : 0;
     const int chunk = Split ? max(16, (length + int(gridDim.z) - 1) / int(gridDim.z)) : length;
     if (Split && split >= (length + chunk - 1) / chunk) return;
@@ -131,8 +144,8 @@ __global__ void relativeAttention(AttentionRow a, float *partial) {
     kv.length = pointers[1];
     kv.group = a.heads / (a.kvHeads * G);
     kv.width = D;
-    kv.k_data = {a.visit ? a.visit->pages : a.pages, static_cast<const T *>(a.key), begin, past, a.kvHeads * D, false};
-    kv.v_data = {a.visit ? a.visit->pages : a.pages, static_cast<const T *>(a.value), begin, past, a.kvHeads * D, true};
+    kv.k_data = {a.visit ? a.visit->pages : a.pages, static_cast<const T *>(a.key), begin, past, a.kvHeads * D, false, selection};
+    kv.v_data = {a.visit ? a.visit->pages : a.pages, static_cast<const T *>(a.value), begin, past, a.kvHeads * D, true, selection};
     extern __shared__ uint8_t attentionStorage[];
     flashinfer::BatchDecodeWithPagedKVCacheDevice<flashinfer::PosEncodingMode::kNone,
         2, 2, vector, lanes, G, groups, RelativeAttention>(p, attentionStorage, 0, blockIdx.y);
@@ -144,8 +157,8 @@ __device__ void loadRelativeKV(PageView pages, int token, int stride, int channe
     const int2 ids = pages.ids[page - pages.first];
     const size_t offset = size_t(token - page * pages.pageLen) * stride + channel;
     const size_t pageStride = size_t(pages.pageLen) * stride;
-    const auto *key = reinterpret_cast<const uint4 *>(static_cast<const T *>(pages.key) + ids.x * pageStride + offset);
-    const auto *value = reinterpret_cast<const uint4 *>(static_cast<const T *>(pages.value) + ids.y * pageStride + offset);
+    const auto *key = reinterpret_cast<const uint4 *>(pages.pageBase<T>(ids, false, pageStride) + offset);
+    const auto *value = reinterpret_cast<const uint4 *>(pages.pageBase<T>(ids, true, pageStride) + offset);
     if constexpr (ToShared) {
         using namespace flashinfer::cp_async;
         load_128b<PrefetchMode::kNoPrefetch>(&k, key);
@@ -305,7 +318,8 @@ __global__ void mergeRelative(AttentionRow a, const float *partial, int splits,
     }
 
     const int past = a.visit ? a.visit->past : a.past;
-    const int length = a.window ? min(past + 1, a.window) : past + 1;
+    const auto *selection = a.selection();
+    const int length = a.window ? min(past + 1, a.window) : past + 1 - (selection ? selection->omitted() : 0);
     const int chunk = max(16, (length + splits - 1) / splits);
     const int active = (length + chunk - 1) / chunk;
     extern __shared__ float weights[];
@@ -356,7 +370,8 @@ __global__ void mergeRelativeWarp(AttentionRow a, const float *partial, int spli
     const int head = blockIdx.x, lane = threadIdx.x % 32;
     const int channel = head * D + blockIdx.y * blockDim.x + threadIdx.x;
     const int past = a.visit ? a.visit->past : a.past;
-    const int length = a.window ? min(past + 1, a.window) : past + 1;
+    const auto *selection = a.selection();
+    const int length = a.window ? min(past + 1, a.window) : past + 1 - (selection ? selection->omitted() : 0);
     const int chunk = max(16, (length + splits - 1) / splits);
     const int active = (length + chunk - 1) / chunk;
     const size_t stride = size_t(a.heads) * D;
@@ -404,6 +419,30 @@ void launchRelativeMerge(AttentionRow a, const Matrix &scratch, const Act *sink,
         auto kernel = rows > 1 ? mergeRelative<D,Act,HeadMajor,true> : mergeRelative<D,Act,HeadMajor>;
         kernel<<<dim3(a.heads,1,rows),D,splits*sizeof(float),cudaStreamPerThread>>>(a, scratch.p, splits, sink, gate, out);
     }
+}
+
+template<class T> __global__ void unpackSelectionQuery(const T *q, float *out, int dim, int heads, bool compact) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < heads * dim) {
+        const int base = 2 * (i / dim) * dim + i % dim;
+        out[i] = compact ? float(q[i]) : float(q[base]) + float(q[base + dim]);
+    }
+}
+struct SelectionBindings {
+    const DecodeVisit *visits;
+    kv_selection::State *selection;
+    int past, chain;
+    __device__ kv_selection::Query operator()(int request) const {
+        if (!visits) return {selection, past};
+        const auto &v = visits[request * chain];
+        return {v.pages.selection, v.past};
+    }
+};
+inline void selectAttentionPages(AttentionRow &a, int rows, int chain, bool prefill = false) {
+    a.sparse = true;
+    kv_selection::Resolve(SelectionBindings{a.visit, a.pages.selection, a.past, chain},
+                          a.q, rows / chain, chain, a.heads, prefill, cudaStreamPerThread);
+    check(cudaGetLastError());
 }
 
 template<int D, class KV, class Act>

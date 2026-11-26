@@ -24,6 +24,23 @@ namespace fastllm {
         void Validate(int pageLen) const;
     };
 
+    // Complete middle pages compete by relevance; pages outside [sink, recent)
+    // are mandatory. Shared by the CPU page store and graph-resident selectors.
+    struct KvMemPagePolicy {
+        int capacity, sink, recentTokens, retrieve, pageLen;
+        struct Range { int sink, recent, take; };
+#ifdef __CUDACC__
+        __host__ __device__
+#endif
+        Range RangeFor(int past, int pages) const {
+            if (pages <= capacity) return {0, 0, 0};
+            int first = past > recentTokens ? (past - recentTokens) / pageLen : 0;
+            if (first > pages) first = pages;
+            const int prefix = first < sink ? first : sink;
+            return {prefix, first, retrieve < first - prefix ? retrieve : first - prefix};
+        }
+    };
+
     struct KvMemStats {
         uint64_t hostBytes = 0, evictedPages = 0, restoredPages = 0;
         // Includes cached pages outside the current attention view.

@@ -3674,6 +3674,12 @@ class model:
                   prefill_tokens=512, host_mib=8192, retrieval_interval=64):
         """Opt into host-backed KV before warmup.
 
+        Inkling keeps all target/draft pages in mapped host memory and caches
+        resident_tokens per request and layer on CUDA, sharded under TP. Target
+        KV can be FP16/BF16/FP32/FP8, draft KV is FP16. host_mib budgets all
+        requests and ranks. Target global layers retrieve scored history pages,
+        keeping their original positions. Local attention keeps its window.
+        Draft attention follows its native rules.
         Qwen3/3.5 use sparse retrieval on one GPU, changing attention once the
         resident budget is exceeded. Qwen3.5 also supports DFlash/MTP.
         Qwen4/QSA in Hybrid execution mode keeps the original selection and stores

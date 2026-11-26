@@ -76,7 +76,7 @@ BatchDecodePlan &batchDecodePlan(int rows, bool bounded = false) {
     if (!decodeWindow && useWindowDecodeTile(rows) && backboneBf16 && kvType == FLOAT16 &&
         c.headDim == 128 && c.qClip > 0.f &&
         c.qClip <= 65504.f && c.kvHeads > 0 && c.heads % c.kvHeads == 0) {
-        decodeWindow = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen(), true);
+        decodeWindow = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen(), true, 1, model.kvMemConfig.enabled);
     }
     // Warmup visits the largest capacity first. Serial replays can write
     // into the same logits allocation without changing any captured address.

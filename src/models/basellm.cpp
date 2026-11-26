@@ -4090,7 +4090,9 @@ namespace fastllm {
                                             }
                                             lenSum += predictLen;
                                         }
-                                    } else {
+                                    } else if (!fixedKvSlots) {
+                                        // Fixed host-backed slots are already admitted. Their logical KV
+                                        // views have no growable contiguous allocation.
                                         if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[model->kvCacheId].first.dims[1]) {
                                             int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;
                                             int predictLen = 256;

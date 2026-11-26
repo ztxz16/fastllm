@@ -3,6 +3,7 @@
 // https://vllm-project.github.io/2026/11/20/inkling2-mini.html
 #include "devices/cuda/fastllm-inkling-window.h"
 #include "runtime.cuh"
+#include "devices/cuda/fastllm-kvmem-page-selection.cuh"
 #include "devices/multicuda/fastllm-multicuda.cuh"
 #include "utils/persistent_worker_group.h"
 #include "executor.h"
@@ -267,8 +268,8 @@ template<class T> __global__ void storeDecodeKv(const DecodeVisit *visit, const 
         key += size_t(row) * width;
         value += size_t(row) * width;
         const auto &p = visit->pages;
-        static_cast<T *>(p.key)[p.offset(visit->past, false, width) + c] = key[c];
-        static_cast<T *>(p.value)[p.offset(visit->past, true, width) + c] = value[c];
+        p.row<T>(visit->past, false, width)[c] = key[c];
+        p.row<T>(visit->past, true, width)[c] = value[c];
     }
 }
 #include "attention-input.cuh"
@@ -913,6 +914,7 @@ class Decoder final : public Runtime {
         const int d = c.headDim, k = c.kvHeads * d;
         const int aligned = attentionWidth(d), kvWidth = c.kvHeads * aligned;
         const int window = local ? c.window : 0;
+        const bool sparse = !local && model.kvMemConfig.enabled;
         const Data &table = weight(att + "rel_logits_proj.proj");
         if (table.Count(0) != c.relative * c.extent)
             throw std::runtime_error("Inkling relative bias table shape");
@@ -924,7 +926,7 @@ class Decoder final : public Runtime {
             const auto projected = projection.views();
             Rows<T> attended(projection.storage.rows, c.heads * d);
             const int queries = batch.front().timeline ? attended.rows : 1;
-            const bool usePagedVerify = verifyAttentionSplits > 0 && std::is_same_v<KV, half>;
+            const bool usePagedVerify = !sparse && verifyAttentionSplits > 0 && std::is_same_v<KV, half>;
             // One window query can spread its KV tiles across more SMs. A speculative
             // target keeps the same partitions for both singleton and chain evaluation.
             const int minTiles = window && !usesVerifyArithmetic(batch) ? 1 : VerifyPartition::minTiles;
@@ -944,7 +946,8 @@ class Decoder final : public Runtime {
                    reinterpret_cast<uintptr_t>(projected.items[3].data)) & 15);
             Matrix q(compact ? 0 : queries, c.heads * d);
             Matrix bias(compact ? 0 : queries * c.heads, c.extent);
-            Matrix scratch = queries == 1 || compact ? splitScratch : Matrix(splits, splitScratch.cols * queries);
+            // The sparse kernel allocates its own split-major workspace with aligned rows.
+            Matrix scratch = queries == 1 || compact || sparse ? splitScratch : Matrix(splits, splitScratch.cols * queries);
             auto evaluate = [&](int row, const DecodeVisit *visit) {
                 auto sources = projected;
                 for (auto &item : sources.items)
@@ -1004,7 +1007,13 @@ class Decoder final : public Runtime {
                 AttentionRow args{q.p, nullptr, nullptr, {}, bias.p, nullptr, nullptr,
                                   visit, 0, 0, c.heads, c.kvHeads, d, c.extent,
                                   window, c.logFloor, c.logAlpha, sink.stride, gate.stride};
-                if (splitWindow) {
+                if (sparse) {
+                    selectAttentionPages(args, queries, batch.front().timeline ? batch.front().length : 1);
+                    if (d == 128) launchBatchDecodeAttention<128, KV>(args, queries, splits, sink.data, gate.data,
+                                                                     attended.p + size_t(row) * attended.cols);
+                    else launchBatchDecodeAttention<64, KV>(args, queries, splits, sink.data, gate.data,
+                                                           attended.p + size_t(row) * attended.cols);
+                } else if (splitWindow) {
                     auto partial = scratch.slice(0, singleWindowParts());
                     if (FastllmCudaLaunchWindowVerify(singleWindowKernel, partial.rows, c.kvHeads, 1, visit,
                             q.p, bias.p, sink.data, gate.data, partial.p, sizeof(DecodeVisit),
@@ -1102,10 +1111,14 @@ class Decoder final : public Runtime {
                 return output;
             AttentionRow args{q.p, nullptr, nullptr, {}, bias.p, nullptr, nullptr, visits, 0, 0,
                               c.heads, c.kvHeads, d, c.extent, window, c.logFloor, c.logAlpha, s.stride, g.stride};
+            if (sparse) selectAttentionPages(args, rows, 1);
             launchBatchDecodeAttention<128, KV>(args, rows, splitScratch.rows, s.data, g.data, output.p);
             return output;
         }
         const bool compensated = tensorPrefill && !std::is_same_v<KV, __nv_fp8_e4m3>;
+        const bool sparsePrefill = sparse && std::any_of(batch.begin(), batch.end(), [&](const Segment &s) {
+            return s.decode || (s.request && s.request->length > 0);
+        });
         const bool multi = (compensated || canFuseGate) && queryFits && !std::is_same_v<KV, float> &&
                            rows > 1 && !batch.front().decode &&
                            std::all_of(batch.begin(), batch.end(), [](const Segment &s) { return s.length > 1; });
@@ -1228,6 +1241,7 @@ class Decoder final : public Runtime {
             }
             AttentionRow args{q.p, nullptr, nullptr, {}, bias.p, sink.p, attended.p, visits, 0, 0,
                               c.heads, c.kvHeads, d, c.extent, window, c.logFloor, c.logAlpha};
+            if (sparse) selectAttentionPages(args, rows, 1);
             if (aligned == 128) launchBatchDecodeAttention<128, KV>(args, rows, splitScratch.rows, sink.p, static_cast<float *>(nullptr), attended.p);
             else launchBatchDecodeAttention<64, KV>(args, rows, splitScratch.rows, sink.p, static_cast<float *>(nullptr), attended.p);
             return applyGate();
@@ -1263,6 +1277,7 @@ class Decoder final : public Runtime {
                 tile = baseTile;
                 bias = allocateBias(tile);
             }
+            if (sparsePrefill && cache) cache->reservePages(past + seq.length, 0);
             for (int first = 0; first < seq.length; first += tile) {
                 int count = std::min(tile, seq.length - first);
                 const int rows = count * c.heads;
@@ -1277,6 +1292,25 @@ class Decoder final : public Runtime {
                     sink.slice(seq.offset, seq.length).p, compact ? nullptr : attended.slice(seq.offset, seq.length).p,
                     decode, past, first, c.heads, c.kvHeads, d, distances,
                     window, c.logFloor, c.logAlpha};
+                if (sparsePrefill) {
+                    args.sparse = true;
+                    if (!first) {
+                        auto selectionArgs = args;
+                        Matrix query;
+                        if (typedQuery.p) {
+                            query = Matrix(1, c.heads * d);
+                            unpackSelectionQuery<<<(query.cols+127)/128,128,0,cudaStreamPerThread>>>(
+                                typedQuery.slice(seq.offset, 1).p, query.p, d, c.heads, compact);
+                            selectionArgs.q = query.p;
+                        }
+                        selectAttentionPages(selectionArgs, seq.length, seq.length, true);
+                    }
+                    if (!typedQuery.p) {
+                        if (aligned == 128) launchRelativeKernel<128,1,false,KV>(args, count, nullptr, 1);
+                        else launchRelativeKernel<64,1,false,KV>(args, count, nullptr, 1);
+                        continue;
+                    }
+                }
                 if constexpr (!std::is_same_v<KV, float>) {
                     if (typedQuery.p) {
                         auto *query = typedQuery.slice(seq.offset + first, count).p;
@@ -1312,7 +1346,7 @@ class Decoder final : public Runtime {
             else {
                 auto store = [cache, past, window, currentKey, currentValue, kvWidth](int length) {
                     cache->prepare(past + length, window);
-                    int rows = window ? std::min(length, window) : length;
+                    int rows = window && !cache->mapped ? std::min(length, window) : length;
                     appendKv<<<(size_t(rows)*kvWidth+255)/256,256,0,cudaStreamPerThread>>>(
                         cache->view(), currentKey.p, currentValue.p, past, length-rows, kvWidth, rows);
                 };
@@ -1784,7 +1818,7 @@ class Decoder final : public Runtime {
         if (!c.draft.steps && backboneBf16 && kvType == FLOAT16 && verifyAttentionSplits > 0 &&
             splitScratch.rows >= 16 && c.window <= 1024) {
             singleWindowKernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window,
-                                                            c.extent, GetPageLen(), true, singleWindowParts());
+                                                            c.extent, GetPageLen(), true, singleWindowParts(), model.kvMemConfig.enabled);
         }
         if (GetFastllmEnv().cudaGraph) graphSample = Buffer<int>(1);
         if (model.SupportsDecodePipeline()) {
@@ -1799,6 +1833,14 @@ class Decoder final : public Runtime {
         auto &v = req.visits[slot];
         v.prepare(req.length + 1, c.local[c.visits[slot]] ? c.window : 0);
         return {v.view(), {v.convState[0].p, v.convState[1].p, v.convState[2].p, v.convState[3].p}, req.length, 1};
+    }
+    bool needsDecodePageRebind(const Request &req) const {
+        const auto &v = req.visits.front();
+        // Mapped visits retain their table and backing addresses. Page updates
+        // run on the replay stream after its last reader.
+        if (v.mapped) return false;
+        const int len = v.key->pageLen, begin = req.length + 1 - c.window;
+        return req.length % len == 0 || (begin > 0 && begin % len == 0);
     }
     DecodeInput decodeInput(const Request &req, float token, const GenerationConfig &sampling, bool sampled) const {
         return {token, sampled ? std::min(sampling.top_k, c.vocab) : 1,
@@ -1890,12 +1932,7 @@ class Decoder final : public Runtime {
                     req->visits[i].key = &decoder.localCache(cache[i].first);
                     req->visits[i].value = &decoder.localCache(cache[i].second);
                 }
-            } else {
-                // A page append or sliding-window rotation may reclaim storage
-                // still read by the previous replay. Rebind at a drained boundary.
-                const int len = decoder.localCache(cache.front().first).pageLen, begin = req->length + 1 - decoder.c.window;
-                if (req->length % len == 0 || (begin > 0 && begin % len == 0)) return false;
-            }
+            } else if (decoder.needsDecodePageRebind(*req)) return false;
             auto &t = decoder.tickets[out];
             t.init(cache.size());
             incomplete = true;
@@ -1980,10 +2017,8 @@ class Decoder final : public Runtime {
                 }
                 plan->upload();
             } else {
-                for (auto *req : requests) {
-                    const int len = req->visits.front().key->pageLen, begin = req->length + 1 - d.c.window;
-                    if (req->length % len == 0 || (begin > 0 && begin % len == 0)) return false;
-                }
+                for (auto *req : requests)
+                    if (d.needsDecodePageRebind(*req)) return false;
                 const int count = plan->rows * d.c.visits.size();
                 advanceBatchDecode<<<(count + 255) / 256, 256, 0, cudaStreamPerThread>>>(
                     plan->inputs.p, plan->visits.p, plan->sampled.p, plan->rows, requests.size(), d.c.visits.size());
@@ -2131,6 +2166,20 @@ class Decoder final : public Runtime {
         }
     }
 
+    int hostPagesPerVisit(bool draft, int tokenLimit) const {
+        const int64_t tokens = draft ? int64_t(std::min(tokenLimit, c.draft.maxPositions)) + c.draft.block - 1
+                                     : tokenLimit;
+        return int((tokens - 1) / GetPageLen() + 1);
+    }
+
+    int hotPages(bool draft, bool local) const {
+        const int len = GetPageLen();
+        const int limit = model.kvMemConfig.residentTokens / len;
+        if (!local) return limit;
+        const int window = draft ? c.draft.window : c.window;
+        return std::min(limit, (window - 1) / len + 1);
+    }
+
     int poolPages(int tokenLimit, bool draft, bool local) const {
         const int len = GetPageLen();
         const int batch = std::max(1, model.maxBatch);
@@ -2155,8 +2204,16 @@ class Decoder final : public Runtime {
         for (int slot = 0; slot < slots + c.draft.layers; ++slot) {
             const bool draft = slot >= slots;
             const bool local = draft ? c.draft.local[slot - slots] : c.local[c.visits[slot]];
-            const int pages = poolPages(tokens, draft, local);
             const int width = draft ? c.draft.kvHeads * c.draft.dim : c.kvHeads * attentionWidth(c.headDim);
+            if (model.kvMemConfig.enabled) {
+                const int logical = hostPagesPerVisit(draft, model.kvMemConfig.maxTokens);
+                const int hot = std::min(logical, hotPages(draft, local));
+                const size_t pair = 2 * GetDataBytes(draft ? FLOAT16 : kvType, len, width);
+                bytes += size_t(model.maxBatch) * (size_t(logical) * sizeof(int2) + hot * pair);
+                if (!draft && !local) bytes += size_t(model.maxBatch) * kv_selection::Bytes(logical, hot, width, c.heads);
+                continue;
+            }
+            const int pages = poolPages(tokens, draft, local);
             for (int side = 0; side < 2; ++side) {
                 if (!GetPagedCacheManager(2 * placement.cacheSlot(slot) + side))
                     bytes += GetDataBytes(draft ? FLOAT16 : kvType, size_t(pages) * len, width);
@@ -2209,8 +2266,8 @@ class Decoder final : public Runtime {
                     break;
                 }
             }
-            checkKVHeadroom();
         }
+        if (c.draft.steps || model.kvMemConfig.enabled) checkKVHeadroom();
     }
     std::vector<int> forward(const Data &ids, const std::vector<Data *> &positions,
                              const std::vector<int> &lengths,
@@ -2357,6 +2414,10 @@ class Decoder final : public Runtime {
                         auto &v = owned->cache;
                         v.key = &owned->key;
                         v.value = &owned->value;
+                        if (model.kvMemConfig.enabled) {
+                            v.attachMapped(draftDesc, hostPagesPerVisit(true, req.limit), hotPages(true, c.draft.local[l]), req.length);
+                            continue;
+                        }
                         const int pool = 2 * placement.cacheSlot(int(c.visits.size()) + l);
                         const int64_t extra = c.draft.block - 1;
                         int64_t perRequest =
@@ -2379,6 +2440,11 @@ class Decoder final : public Runtime {
                 }
                 for (size_t slot = 0; slot < c.visits.size(); ++slot) {
                     auto &v = req.visits[slot];
+                    if (model.kvMemConfig.enabled) {
+                        v.attachMapped(desc, hostPagesPerVisit(false, req.limit), hotPages(false, c.local[c.visits[slot]]), req.length,
+                                       c.local[c.visits[slot]] ? nullptr : &model.kvMemConfig, c.heads);
+                        continue;
+                    }
                     const int pages = poolPages(tokenLimit, false, c.local[c.visits[slot]]);
                     if (!req.restored || c.local[c.visits[slot]]) {
                         v.attach(*v.key, 2 * placement.cacheSlot(slot), desc, pages);

@@ -27,7 +27,8 @@ template<class KV, int D> struct PrefillPages {
     __device__ size_t protective_get_kv_offset(unsigned token, unsigned head, unsigned, unsigned col, int) const {
         // Masked prefetch lanes still form a pointer. Use the first suffix row,
         // which is valid even after the sliding prefix has been evicted.
-        token = token < length ? token + origin : k_data.past;
+        token = token < length ? token + origin :
+            k_data.past - (k_data.selection ? k_data.selection->omitted() : 0);
         return (size_t(token) << 32) | (head * D + col);
     }
 };
@@ -46,7 +47,8 @@ struct PrefillRelative : flashinfer::DefaultAttention<false, true, false, false>
     using DefaultAttention::DefaultAttention;
     static constexpr bool use_fp32_softmax_sum = true, use_pv_residual = true;
     REGISTER_LOGITS_TRANSFORM(p, score, batch, row, key, head, kvHead, {
-        const unsigned pos = p.past + row, distance = pos - key;
+        const auto *selection = p.paged_kv.k_data.selection;
+        const unsigned pos = p.past + row, distance = pos - (selection ? selection->absolute(key) : key);
         const float bias = row < p.rows && distance < p.distances
             ? float(p.relative[(size_t(row) * p.num_qo_heads + head) * p.distances + distance]) : 0.f;
         const float tau = p.window_left >= 0 ? 1.f : 1.f + p.alpha * logf(fmaxf(1.f, (pos + 1.f) / p.floor));
@@ -63,6 +65,7 @@ struct PrefillRelative : flashinfer::DefaultAttention<false, true, false, false>
 template<class Traits, class Params>
 __global__ __launch_bounds__(Traits::NUM_THREADS) void pagedRelativePrefill(Params p) {
     extern __shared__ uint8_t smem[];
+    if (auto *selection = p.paged_kv.k_data.selection) p.paged_kv.length -= selection->omitted();
     int zero = 0, tile = blockIdx.x, keys[] = {0, p.paged_kv.length};
     p.request_indices = p.kv_tile_indices = p.q_indptr = p.o_indptr = &zero;
     p.qo_tile_indices = &tile;
@@ -122,8 +125,8 @@ void runPrefill(Params &p, const AttentionRow &a, typename Traits::DTypeQ *query
     p.alpha = a.alpha;
     auto &kv = p.paged_kv;
     kv.length = p.past + rows;
-    kv.k_data = {a.pages, static_cast<const KV *>(a.key), 0, a.past, a.kvHeads * D, false};
-    kv.v_data = {a.pages, static_cast<const KV *>(a.value), 0, a.past, a.kvHeads * D, true};
+    kv.k_data = {a.pages, static_cast<const KV *>(a.key), 0, a.past, a.kvHeads * D, false, a.sparse ? a.pages.selection : nullptr};
+    kv.v_data = {a.pages, static_cast<const KV *>(a.value), 0, a.past, a.kvHeads * D, true, a.sparse ? a.pages.selection : nullptr};
     constexpr size_t shared = sizeof(typename Traits::SharedStoragePaged);
     dim3 blocks((rows * (a.heads / a.kvHeads) + Traits::CTA_TILE_Q - 1) / Traits::CTA_TILE_Q, 1, a.kvHeads);
     pagedRelativePrefill<Traits><<<blocks, dim3(32, Traits::NUM_WARPS_Q), shared, cudaStreamPerThread>>>(p);
@@ -163,8 +166,9 @@ template<bool Windowed, class Bias, bool MaskWindow = false, bool FoldScale = tr
     __device__ void TransformScoreTile(const Params &p, unsigned keyBase, float (*score)[Traits::NUM_MMA_KV][8]) const {
         // Beyond the learned bias extent, the whole score tile only needs a row scale.
         if constexpr (!Windowed) {
-            if (pos[0] >= keyBase + Traits::CTA_TILE_KV - 1u &&
-                pos[0] - (keyBase + Traits::CTA_TILE_KV - 1u) >= unsigned(p.distances)) {
+            unsigned last = keyBase + Traits::CTA_TILE_KV - 1u;
+            if (const auto *selection = p.paged_kv.k_data.selection) last = selection->absolute(last);
+            if (pos[0] >= last && pos[0] - last >= unsigned(p.distances)) {
 #pragma unroll
                 for (int k = 0; k < Traits::NUM_MMA_KV; ++k) {
 #pragma unroll
@@ -182,7 +186,10 @@ template<bool Windowed, class Bias, bool MaskWindow = false, bool FoldScale = tr
             for (int i = 0; i < 8; ++i) {
                 const int j = (i >> 1) & 1;
                 const unsigned key = keyBase + 16 * k + 2 * (threadIdx.x % 4) + 8 * (i / 4) + i % 2;
-                const unsigned distance = pos[j] - key;
+                unsigned absolute = key;
+                if constexpr (!Windowed) if (const auto *selection = p.paged_kv.k_data.selection)
+                    absolute = selection->absolute(key);
+                const unsigned distance = pos[j] - absolute;
                 const float relative = distance < p.distances && bias[j] ? float(bias[j][distance]) : 0.f;
                 float value = score[0][k][i] * p.qkScale + relative;
                 if constexpr (!Windowed) value *= tau[j];

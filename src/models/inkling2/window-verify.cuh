@@ -11,9 +11,9 @@ __device__ __forceinline__ void stageVerifyKV(const PageView &pages, int begin, 
     auto issue = [&](int row, int2 id, size_t column) {
         const unsigned offset = VerifyTileMemory::get_permuted_offset<16>(row, col);
         key.load_128b_async<flashinfer::SharedMemFillMode::kNoFill>(offset,
-            static_cast<const half *>(pages.key) + id.x * pageStride + column, begin + row < end);
+            pages.pageBase<half>(id, false, pageStride) + column, begin + row < end);
         value.load_128b_async<flashinfer::SharedMemFillMode::kFillZero>(offset,
-            static_cast<const half *>(pages.value) + id.y * pageStride + column, begin + row < end);
+            pages.pageBase<half>(id, true, pageStride) + column, begin + row < end);
     };
     // Canonical 32-key tiles begin on a page boundary with 16-token pages.
     // Fetch the two page IDs once for all eight transfers issued by each lane.

@@ -1284,7 +1284,7 @@ namespace fastllm {
         return false;
     }
 
-    InklingWindowKernel PrepareInklingWindowKernel(int heads, int group, int window, int extent, int page, bool decode, int splits) {
+    InklingWindowKernel PrepareInklingWindowKernel(int heads, int group, int window, int extent, int page, bool decode, int splits, bool mappedPages) {
         if (FastllmCudaGraphIsCapturing()) return {};
         const int arch = CudaTritonRuntimeArch();
         if (!CudaEnvFlagDefaultEnabled("FASTLLM_CUDA_TRITON", arch == 120) || (arch != 120 && arch != 121) ||
@@ -1297,13 +1297,13 @@ namespace fastllm {
         const std::string name = "fastllm_" + op;
         const std::string spec = op + "_v1_sm" + std::to_string(arch) + "_h" + std::to_string(heads) +
             "_g" + std::to_string(group) + "_w" + std::to_string(window) + "_e" + std::to_string(extent) +
-            "_p" + std::to_string(page) + (split ? "_s" + std::to_string(splits) : "");
+            "_p" + std::to_string(page) + (split ? "_s" + std::to_string(splits) : "") + (mappedPages ? "_mapped" : "");
         const std::string cubin = CudaTritonJoinPath(dir, spec + ".cubin");
         std::string body, error;
         if (!CudaTritonReadTextFile(CudaTritonJoinPath(dir, spec + ".json"), body) || !CudaTritonFileExists(cubin)) {
             if (!CudaTritonEnsureServer()) return {};
             json11::Json request = json11::Json::object{{"op", op}, {"cache_dir", dir}, {"arch", arch},
-                {"heads", heads}, {"group", group}, {"window", window}, {"extent", extent}, {"page", page}, {"splits", splits}};
+                {"heads", heads}, {"group", group}, {"window", window}, {"extent", extent}, {"page", page}, {"splits", splits}, {"mapped_pages", mappedPages}};
             int status = 0;
             if (!CudaTritonHttpRequest("POST", "/compile", request.dump(), &status, body) || status != 200) return {};
         }
@@ -4667,7 +4667,7 @@ namespace fastllm {
             batch, topk, hidden, inter, experts);
     }
 #else
-    InklingWindowKernel PrepareInklingWindowKernel(int, int, int, int, int, bool, int) { return {}; }
+    InklingWindowKernel PrepareInklingWindowKernel(int, int, int, int, int, bool, int, bool) { return {}; }
     bool CanUseCudaTritonSwigluLinear(int, bool, bool) {
         return false;
     }

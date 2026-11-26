@@ -87,6 +87,10 @@ public:
     void PrepareGGUF(std::vector<ReadGGUFTask> &tasks);
     void SetDataType(DataType type) override;
     void SetKVCacheDataType(DataType type) override;
+    void ConfigureKvMem(const KvMemConfig &config) override;
+    bool SupportsKvMem() const override { return true; }
+    bool SupportsKvMemBatch() const override { return true; }
+    void OnResponseContextFinished(ResponseContext *ctx) override;
     void OnModelWeightsLoaded() override;
     void WarmUp() override;
     std::map<std::string, std::vector<std::pair<std::string, DataType>>>
@@ -144,11 +148,13 @@ public:
     int QueryPagedPrefixCacheExtra(ResponseContext *ctx, int limit) const override;
     bool RestorePagedPrefixCacheExtra(ResponseContext *ctx, int length) const override;
     PagedCacheManager *GetPagedKVCacheManager(int layer, bool key) const override {
+        if (kvMemConfig.enabled) return nullptr;
         // Admission uses rank zero's pool for the requested layer.
         const int world = runtime && runtime->hasRankCaches() ? int(placement.tensorDevices.size()) : 1;
         return basellm::GetPagedKVCacheManager(layer * world, key);
     }
     std::vector<std::pair<int, PagedCacheManager *>> GetPagedKVCacheManagers(int layer, bool key) const override {
+        if (kvMemConfig.enabled) return {};
         if (runtime && runtime->hasRankCaches()) {
             std::vector<std::pair<int, PagedCacheManager *>> managers;
             const int world = placement.tensorDevices.size();
@@ -169,6 +175,8 @@ public:
     bool UseGenericHistoryCache() const override { return false; }
 
 private:
+    struct ServingLimits { int context, batch, tokens, prompt; bool history; };
+    std::unique_ptr<ServingLimits> beforeKvMem;
     int draftKvHeadsOnDevice(int deviceId) const;
     inkling2::Config cfg{};
     inkling2::Placement placement{};

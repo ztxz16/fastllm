@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 from fastllm_triton_server import fastllm_inkling_window_split
 
 
-def check_scan(past, page_len, heads, group, window, extent, splits):
+def check_scan(past, page_len, heads, group, window, extent, splits, mapped=False):
     dim = 128
     length = min(past + 1, window)
     start = past + 1 - length
@@ -23,7 +23,13 @@ def check_scan(past, page_len, heads, group, window, extent, splits):
     query = torch.randn(heads, dim, device="cuda")
     bias = torch.randn(heads, extent, device="cuda")
     visit = torch.zeros(80, dtype=torch.uint8)
-    visit.view(torch.int64)[:3] = torch.tensor([key.data_ptr(), value.data_ptr(), ids.data_ptr()])
+    if mapped:
+        # The native page table stores one CUDA-visible address per contiguous K/V pair.
+        pairs = torch.stack([key[ids[:, 0].long()], value[ids[:, 1].long()]], dim=1)
+        addresses = pairs.data_ptr() + torch.arange(pages, device="cuda", dtype=torch.int64) * pairs.stride(0) * 2
+        visit.view(torch.int64)[2] = addresses.data_ptr()
+    else:
+        visit.view(torch.int64)[:3] = torch.tensor([key.data_ptr(), value.data_ptr(), ids.data_ptr()])
     visit.view(torch.int32)[6:8] = torch.tensor([first_page, page_len])
     visit.view(torch.int32)[18] = past
     visit = visit.cuda()
@@ -32,7 +38,7 @@ def check_scan(past, page_len, heads, group, window, extent, splits):
     fastllm_inkling_window_split[(splits, kv_heads, 1)](
         visit, query, bias, unused, unused, partial, 80, 72, 1, heads, heads * dim,
         heads, group, 128, window, extent, max(16, triton.next_power_of_2(triton.cdiv(window, splits))),
-        num_warps=4, num_stages=2)
+        MAPPED=mapped, num_warps=4, num_stages=2)
 
     pos = torch.arange(start, past + 1, device="cuda")
     logical = pos // page_len - first_page
@@ -56,5 +62,6 @@ if __name__ == "__main__":
     torch.manual_seed(257)
     for splits, heads in ((16, 24), (32, 12)):
         for past, page_len in ((0, 1), (16, 16), (127, 128), (513, 37), (1023, 128), (8317, 37)):
-            check_scan(past, page_len, heads, 3, 1024, 512, splits)
+            for mapped in (False, True):
+                check_scan(past, page_len, heads, 3, 1024, 512, splits, mapped)
     print("Inkling split window scan passed")

@@ -1,8 +1,33 @@
 # KVMem（实验性，默认关闭）
 
-KVMem 用固定大小的 GPU KV 池和按需分配的主机备份保存长上下文。超过 GPU 常驻预算后，注意力只访问 sink、最近上下文和检索到的旧页。这会改变模型输出；KV 字节的无损换页不代表稀疏注意力与完整注意力等价。
+KVMem 用有界 GPU 热缓存和主机 KV 保存长上下文。Qwen3/3.5 超过 GPU 常驻预算后，注意力只访问 sink、最近上下文和检索到的旧页。这会改变模型输出；KV 字节的无损换页不代表稀疏注意力与完整注意力等价。
 
-当前接入 Qwen3 和 Qwen3.5 的单卡 CUDA 普通解码，以及 Qwen3.5 的 DFlash/MTP 推测解码。支持 head_dim 为 128/256 的 FP16/BF16 MHA/GQA，计算与 KV 类型须一致。启用后目标模型使用单请求 eager 路径并关闭历史/prefix 缓存；尚不支持 TP、多模态、滑窗注意力或带位置偏置的目标注意力。未传入配置时，原有缓存、CUDA Graph、融合算子和推测解码路径保持原样。
+Qwen3/3.5 适配支持单卡 CUDA 普通解码，以及 Qwen3.5 的 DFlash/MTP 推测解码。支持 head_dim 为 128/256 的 FP16/BF16 MHA/GQA，计算与 KV 类型须一致。启用后目标模型使用单请求 eager 路径并关闭历史/prefix 缓存；尚不支持 TP、多模态、滑窗注意力或带位置偏置的目标注意力。未传入配置时，原有缓存、CUDA Graph、融合算子和推测解码路径保持原样。
+
+## Inkling-2-Mini
+
+每个活跃请求有独立的 `resident_tokens` 配额，按 KV 页对齐。主模型的 FP16、BF16、FP32、FP8 E4M3 KV 共用同一存储路径。DSpark 草稿按自身的 FP16 精度使用同样的热缓存上限。原版和 GGUF、单 CUDA、纯 GPU 张量并行、单卡 CPU/NUMA 专家混推均使用此布局。
+
+```bash
+ftllm server MODEL --auto --max_batch 2 --kv_cache_dtype fp8_e4m3 \
+  --kvmem '{"max_tokens":32768,"resident_tokens":2048,"host_mib":8192}'
+```
+
+全量 K/V 按指定 dtype 写入 CUDA 映射的页锁定主存。主模型的全局 Attention 为每个已提交的完整页建立 mean-K 索引。完整历史页超过显存热缓存后，通用 CUDA 选页后端使用本次首行的归一化 query 对每个 query head 独立评分并归一化，再合并各 head 的分数。它保留开头的 `sink_tokens`、末尾的 `recent_tokens` 和得分最高的 `retrieval_tokens`，分数相同时优先更早的页。选中的完整页按需换入显存，仍然命中的页沿用原槽位。Attention 继续按绝对位置计算距离偏置和温度。稀疏选页可能改变生成结果。
+
+一组分块 prefill 或同一请求的一轮验证共享首行的选页。当前分块、未满页以及待验证尾部按因果顺序直接可见；只有已提交的完整页能进入检索索引。普通 decode 可在页内复用检索，验证由 `retrieval_interval` 控制刷新，新增完整页会刷新。每个请求和 TP rank 独立管理相应的 KV head 与页表。主模型滑窗层和草稿沿用各自的注意力规则，滑窗热缓存至多按窗口长度向上对齐到页。
+
+`max_tokens` 是请求长度上限。`resident_tokens` 是单请求每次全局层访问可以缓存的历史 token 上限。三个选页子预算按页对齐；若合计超出热缓存，先保留前缀，再按最近页和检索页配置的比例分配余量。只设置 `resident_tokens=32768` 时，超限后的三个默认子预算合计 6272 token。以下配置在 1M 逻辑长度下将三项合计设为完整 32K：
+
+```bash
+ftllm server MODEL --auto --max_batch 1 --dspark 0 --kv_cache_dtype fp8_e4m3 \
+  --max_context_length 1048576 \
+  --kvmem '{"max_tokens":1048576,"resident_tokens":32768,"sink_tokens":128,"recent_tokens":2048,"retrieval_tokens":30592,"prefill_tokens":2048,"host_mib":100352}'
+```
+
+`host_mib` 为所有并发、层和 TP rank 合计的 KV 主存预算，启动时按配置容量校验。每个请求在首次 prefill 时按输入长度加最大输出长度预留页锁定主存，并建立 GPU 页表，最大为请求的上下文上限。未指定输出上限时按请求的上下文上限预留。草稿另留验证所需的尾部空间。此后跨页只更新索引和热缓存，请求结束时释放预留空间。
+
+Mini 的主模型每步有 8 次全局、40 次滑窗访问。FP8 KV、无草稿、上下文长于热缓存时，每请求 2K 热预算占 112 MiB 显存，32K 占 592 MiB。GPU 页表、选页索引、计算工作区和草稿缓存另计。`--auto` 分别报告这些 KV 项目。此模式使用请求私有页，当前用于文本输入，关闭跨请求前缀复用。
 
 ## 参考来源
 
@@ -82,7 +107,7 @@ Qwen3.5 目标也可与全部采用滑窗注意力、原生 default RoPE 的 DFl
 - 推测验证在每层 `KvMemCache` 上调用 `BeginTransaction(tokens)`，执行一次指定行数的前向，再调用 `FinishTransaction(acceptedTokens, keyCache, valueCache)`。参数是保留的输入前缀行数，包含验证首 token；传 0 表示完全回滚，也可在尚未执行 Append 时取消。禁止嵌套事务、多次 Append 和越界提交。模型还须恢复其他循环状态：Qwen3.5 验证使用独立 GDN 状态，提交相应前缀快照；无可用快照时回滚 KV，再重放已接受输入。
 - 调度器释放缓存时调用 `ReleaseKvMemCache()`，不能将借用的 `pageIndex` 返还给全局分页池。禁止隐式 `Data::CopyFrom` 克隆 KVMem 缓存。事务不提供任意历史快照或 prefix 共享；其他模型必须显式接入状态提交与异常清理。
 
-## 检索与边界
+## Qwen3/3.5 的检索与边界
 
 索引保存每个逻辑页、每个 KV head 的 FP32 key sum，查询时除以实际 token 数得到 mean-K。对每个 Q head 计算缩放点积，对所有已提交页做 softmax 后平均各 head 的概率。当前按层独立选页，与 NInfer 的跨层聚合策略不同。
 

@@ -164,11 +164,11 @@ __global__ void draftAttentionPartial(DraftFlashParams p, const DraftView *views
     float m = -INFINITY, sum = 0.f, out = 0.f;
     for (int i = first; i < min(len, first + chunk); ++i) {
         auto token = v.begin + i;
-        float key = float(static_cast<half *>(v.pages.key)[v.pages.offset(token, false, stride) + kv * 128 + col]);
+        float key = float(v.pages.row<half>(token, false, stride)[kv * 128 + col]);
         float score = blockSum(q * key, temp) * p.sm_scale, next = fmaxf(score, m);
         float a = expf(m - next), w = expf(score - next);
         out = out * a +
-              w * float(static_cast<half *>(v.pages.value)[v.pages.offset(token, true, stride) + kv * 128 + col]);
+              w * float(v.pages.row<half>(token, true, stride)[kv * 128 + col]);
         sum = sum * a + w;
         m = next;
     }
@@ -223,8 +223,7 @@ __device__ __forceinline__ void draftHeadBody(const T *src, half *query, const f
             suffix[(size_t(row) * heads + head) * dim + col] = half(x);
             return;
         }
-        auto *dst = static_cast<half *>(Side == 1 ? view.pages.key : view.pages.value);
-        dst[view.pages.offset(token, Side == 2, heads * dim) + head * dim + col] = half(x);
+        view.pages.row<half>(token, Side == 2, heads * dim)[head * dim + col] = half(x);
     }
 }
 

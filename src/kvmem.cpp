@@ -96,21 +96,22 @@ namespace fastllm {
         if (pages <= capacity) {
             for (int p = 0; p < pages; ++p) keep.insert(p);
         } else {
-            for (int p = 0; p < std::min(pages, config.sinkTokens / pageLen); ++p) keep.insert(p);
+            const KvMemPagePolicy policy{capacity, config.sinkTokens / pageLen, config.recentTokens,
+                                         config.retrievalTokens / pageLen, pageLen};
+            const auto range = policy.RangeFor(oldTokens, pages);
+            for (int p = 0; p < range.sink; ++p) keep.insert(p);
             // Use the start of the query, not its end: all rows keep their
             // preceding recent history, even when a prefill straddles pages.
-            int first = std::max(0, oldTokens - config.recentTokens) / pageLen;
-            for (int p = first; p < pages; ++p) keep.insert(p);
+            for (int p = range.recent; p < pages; ++p) keep.insert(p);
             std::vector<int> candidates;
-            for (int p = 0; p < first; ++p) if (!keep.count(p)) candidates.push_back(p);
+            for (int p = range.sink; p < range.recent; ++p) candidates.push_back(p);
             auto score = [&](int p) {
                 return p < (int)scores.size() && std::isfinite(scores[p]) ? scores[p] : 0.0f;
             };
             std::stable_sort(candidates.begin(), candidates.end(), [&](int a, int b) {
                 return score(a) > score(b);
             });
-            int take = std::min((int)candidates.size(), config.retrievalTokens / pageLen);
-            for (int i = 0; i < take; ++i) keep.insert(candidates[i]);
+            for (int i = 0; i < range.take; ++i) keep.insert(candidates[i]);
         }
         if ((int)keep.size() > capacity) throw std::logic_error("KVMem: mandatory pages exceed resident budget");
 

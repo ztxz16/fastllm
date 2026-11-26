@@ -1,5 +1,6 @@
 """Inkling planning tests with header-only weights and synthetic device capacities."""
 import io
+import json
 import os
 import sys
 import unittest
@@ -74,12 +75,49 @@ class InklingAutoTest(unittest.TestCase):
             self.assertEqual(2 * kv(dtype), half)
         draft = dict(num_hidden_layers=3, local_layer_ids=[0, 2], num_attention_heads=24,
                      num_key_value_heads=8, head_dim=128, intermediate_size=9216,
-                     sliding_window_size=1024, block_size=8, target_layer_ids=[5, 23, 41, 48])
+                     sliding_window_size=1024, block_size=8, target_layer_ids=[5, 23, 41, 48],
+                     max_position_embeddings=1536)
+        mapped = (*options, "--kv_cache_dtype", "fp8_e4m3", "--kvmem", '{"resident_tokens":2048}')
+        _, target_only = self.plan(*mapped)
         with patch.object(ink, "_draft_budget", return_value=(draft, 0)):
             half = kv("float16", "--dspark", "7")
             fp8 = kv("fp8_e4m3", "--dspark", "7")
+            _, with_draft = self.plan(*mapped, "--dspark", "7")
+        # Two TP ranks share FP16 draft KV. Each request reserves 13 pages
+        # (1536 tokens + 7 provisional rows) and caches at most two local windows.
+        pair_bytes = 2 * 2 * 8 * 128
+        self.assertEqual(with_draft["kvmem_host_bytes"] - target_only["kvmem_host_bytes"],
+                         2 * 3 * 13 * 128 * pair_bytes)
+        self.assertEqual(with_draft["kvmem_hot_bytes_per_rank"] - target_only["kvmem_hot_bytes_per_rank"],
+                         (2 * 1024 + 13 * 128) * pair_bytes)
+        self.assertEqual(with_draft["kvmem_page_table_bytes_per_rank"] - target_only["kvmem_page_table_bytes_per_rank"],
+                         2 * 3 * 13 * 8)
         draft_bytes = ink._kv_bytes(16384, 2, 128, 8, 128, 2, 1, 2, 1032, 7)
         self.assertEqual(2 * fp8 - half, draft_bytes)
+
+    def test_private_kvmem_budgets(self):
+        options = ("--kvmem", '{"max_tokens":2048,"resident_tokens":128,"prefill_tokens":256,"host_mib":2048}')
+        for dtype, unit in (("float16", 2), ("bfloat16", 2), ("float32", 4), ("fp8_e4m3", 1)):
+            row = 2 * unit * 8 * 128 * 48
+            for ranks, batch in ((1, 1), (1, 2), (2, 2)):
+                args, plan = self.plan(*options, "--kv_cache_dtype", dtype, "--max_batch", str(batch), n=ranks)
+                self.assertEqual((args.max_context_length, args.chunked_prefill_size), (2048, 256))
+                self.assertEqual(plan["kvmem_host_bytes"], batch * 2048 * row)
+                self.assertEqual(plan["kvmem_hot_bytes_per_rank"], batch * 128 * row // ranks)
+                index = batch * 8 * (152 + 16 * 4 * ((8 * 128 + 24) // ranks + 2) + 16)
+                self.assertEqual(plan["kvmem_selection_bytes_per_rank"], index)
+                self.assertEqual(plan["kv_bytes_per_rank"], plan["kvmem_hot_bytes_per_rank"] + batch * 48 * 16 * 8 + index)
+        self.assertEqual(self.plan(*options, "--moe_device", "numa")[1]["mode"], "hybrid")
+        self.assertEqual(self.plan(*options, "--chunked_prefill_size", "1024")[0].chunked_prefill_size, 256)
+        _, large = self.plan("--kvmem", '{"max_tokens":1048576,"resident_tokens":32768,"host_mib":100352}',
+                             "--kv_cache_dtype", "fp8_e4m3", "--max_batch", "1", n=1)
+        self.assertEqual(large["kvmem_hot_bytes_per_rank"], 592 * 1024**2)
+        args, _ = self.plan("--kvmem", '{"resident_tokens":128}', "--max_context_length", "4096")
+        self.assertEqual(json.loads(args.kvmem)["max_tokens"], 4096)
+        args, _ = self.plan("--kvmem", '{"resident_tokens":128}', "--chunked_prefill_size", "1024")
+        self.assertEqual(args.chunked_prefill_size, 1024)
+        with self.assertRaisesRegex(ValueError, "host KV"):
+            self.plan("--kvmem", '{"max_tokens":2048,"resident_tokens":128,"host_mib":1}')
 
     def test_explicit_settings_and_failure(self):
         args, plan = self.plan("--device", "cuda:1", "--moe_device", "cpu", "--moe_cuda_cache", "2g",

@@ -242,7 +242,7 @@ __global__ void prepareRelative(const DecodeVisit *visit, RelativeInputs<Act> in
         } else scale = prefillScale(values, in.qClip, 128, in.eps, false);
     } else scale = normalize(values, which ? 0.f : in.qClip);
     if (!Timeline || visit->verifyRemaining > 0) {
-        auto dst = static_cast<T *>(which ? visit->pages.value : visit->pages.key) + visit->pages.offset(visit->past, which, width);
+        auto dst = visit->pages.row<T>(visit->past, which, width);
 #pragma unroll
         for (int j = 0; j < channels; ++j)
             if (lane + 32*j < in.dim) dst[base + lane + 32*j] = T(values[j] * scale);

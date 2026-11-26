@@ -11,15 +11,24 @@ struct PageView {
     void *key{}, *value{};
     const int2 *ids{};
     int first{}, pageLen{}, shift{};
+    kv_selection::State *selection{};
 
-    __device__ size_t offset(int token, bool valueSide, int stride) const {
-        int page = shift >= 0 ? token >> shift : token / pageLen;
-        int2 id = ids[page - first];
-        return (size_t(valueSide ? id.y : id.x) * pageLen + (token - page * pageLen)) * stride;
+    template<class T> __device__ T *pageBase(int2 id, bool v, size_t pageStride) const {
+        if (key) return static_cast<T *>(v ? value : key) + size_t(v ? id.y : id.x) * pageStride;
+        const uintptr_t address = uint32_t(id.x) | (uintptr_t(uint32_t(id.y)) << 32);
+        return reinterpret_cast<T *>(address) + (v ? pageStride : 0);
+    }
+    template<class T> __device__ T *row(int token, bool v, int stride) const {
+        const int page = shift >= 0 ? token >> shift : token / pageLen;
+        return pageBase<T>(ids[page - first], v, size_t(pageLen) * stride) + size_t(token - page * pageLen) * stride;
     }
 };
 
+#include "mapped-kv.cuh"
+
 struct VisitCache {
+    std::unique_ptr<MappedKvPages> mapped;
+    const int *committed = nullptr;
     std::array<Matrix, 4> convState;
     Data *key{}, *value{};
     Buffer<int2> table;
@@ -30,12 +39,29 @@ struct VisitCache {
     int2 *pageTable() const { return table.p ? table.p + tableOffset : nullptr; }
 
     PageView view(std::vector<VisitCache *> *pending = nullptr) {
+        if (mapped) return {nullptr, nullptr, mapped->addresses(), 0, key->pageLen, shift, mapped->selector()};
         if (syncedPages < int(key->pageIndex.size())) {
             if (pending) pending->push_back(this);
             else syncTable();
         }
         return {key->pagedKVCacheData->cudaData, value->pagedKVCacheData->cudaData,
                 pageTable(), first, key->pageLen, shift};
+    }
+
+    void attachMapped(const Data &desc, int limitPages, int residentPages, const int &length, const KvMemConfig *selection = nullptr, int qHeads = 0) {
+        const int len = GetPageLen();
+        const size_t sideBytes = GetDataBytes(desc.dataType, size_t(len) * desc.dims[0], desc.dims[2]);
+        mapped = std::make_unique<MappedKvPages>(limitPages, residentPages, 2 * sideBytes);
+        if (selection) mapped->selectPages(*selection, desc.dataType, len, qHeads, desc.dims[0], desc.dims[2]);
+        committed = &length;
+        shift = pageShift(len);
+        for (auto *side : {key, value}) {
+            side->dataType = desc.dataType;
+            side->UpdateUnitSize();
+            side->isKVCache = true;
+            side->pageLen = len;
+            side->Resize({desc.dims[0], 0, desc.dims[2]});
+        }
     }
 
     void attach(Data &dst, int poolId, const Data &desc, int maxPages) {
@@ -95,6 +121,10 @@ struct VisitCache {
 
     void reservePages(int end, int window) {
         const int len = key->pageLen;
+        if (mapped) {
+            mapped->prepare((end - 1) / len + 1, *committed / len);
+            return;
+        }
         const int begin = window ? std::max(0, end - window) : 0;
         const int next = begin / len, count = (end - 1) / len - next + 1;
         const int old = key->pageIndex.size();
@@ -147,7 +177,9 @@ struct VisitCache {
     }
 
     void prepare(int end, int window) {
-        reservePages(end, window);
+        // The verifier already reserved its writes. At commit only publish the
+        // accepted length; leave promotion to the next forward, before its reads.
+        if (!mapped || end > *committed) reservePages(end, window);
         const int length = window ? std::min(end, window) : end;
         const int last = (end - 1) % key->pageLen + 1;
         for (Data *side : {key, value}) {
@@ -234,6 +266,6 @@ __global__ void appendKv(PageView pages, const T *key, const T *value, int past,
     const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= size_t(rows) * width) return;
     const int row = skip + i / width, token = past + row, channel = i % width;
-    static_cast<T *>(pages.key)[pages.offset(token, false, width) + channel] = key[size_t(row) * width + channel];
-    static_cast<T *>(pages.value)[pages.offset(token, true, width) + channel] = value[size_t(row) * width + channel];
+    pages.row<T>(token, false, width)[channel] = key[size_t(row) * width + channel];
+    pages.row<T>(token, true, width)[channel] = value[size_t(row) * width + channel];
 }

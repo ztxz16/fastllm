@@ -103,8 +103,7 @@ __device__ void prepareWindowKV(const DecodeVisit *visits, const RelativeInputs<
         const auto &visit = visits[first + r];
         if (visit.verifyRemaining <= 0) continue;
         const float scale = prefillScale(convolved[r], value ? 0.f : in.qClip, 128, in.eps, false);
-        auto dst = static_cast<KV *>(value ? visit.pages.value : visit.pages.key) +
-                   visit.pages.offset(visit.past, value, width) + base;
+        auto dst = visit.pages.row<KV>(visit.past, value, width) + base;
 #pragma unroll
         for (int j = 0; j < 4; ++j) dst[lane + 32 * j] = KV(convolved[r][j] * scale);
     }

@@ -63,6 +63,7 @@ void Inkling2Model::SetDataType(DataType type) {
 }
 
 void Inkling2Model::SetKVCacheDataType(DataType type) {
+    if (kvMemConfig.enabled && type != kvCacheDataType) throw std::invalid_argument("Set KV dtype before KVMem");
     if (type != FLOAT16 && type != BFLOAT16 && type != FLOAT32 && type != FP8_E4M3)
         throw std::runtime_error("Inkling KV cache supports float16, bfloat16, float32 and fp8_e4m3");
     basellm::SetKVCacheDataType(type);
@@ -289,7 +290,56 @@ void Inkling2Model::OnModelWeightsLoaded() {
     throw std::runtime_error("Inkling 2 Mini requires a CUDA build");
 #endif
 }
+void Inkling2Model::ConfigureKvMem(const KvMemConfig &config) {
+    if (mainLoop || kvMemLocked || autoWarmupRunning.load())
+        throw std::invalid_argument("Configure Inkling KVMem before warmup or inference");
+    if (!config.enabled) {
+        kvMemConfig = config;
+        if (beforeKvMem) {
+            max_positions = beforeKvMem->context;
+            maxBatch = beforeKvMem->batch;
+            tokensLimit = beforeKvMem->tokens;
+            promptLimit = beforeKvMem->prompt;
+            SetSaveHistoryChat(beforeKvMem->history);
+            beforeKvMem.reset();
+        }
+        return;
+    }
+    const int page = GetPageLen(), batch = std::max(1, maxBatch);
+    const int context = beforeKvMem ? beforeKvMem->context : max_positions;
+    if (!runtime || GetKVCacheInCPU() || config.maxTokens < 1 || config.maxTokens > context ||
+        config.residentTokens <= 0 || config.residentTokens > config.maxTokens || config.residentTokens % page ||
+        config.prefillTokens < 1 || !config.hostBytes || config.maxTokens > INT_MAX - cfg.draft.block ||
+        (GetMaxTokens() > 0 && GetMaxTokens() < config.maxTokens))
+        throw std::invalid_argument("Inkling KVMem requires a CUDA backbone, a page-aligned resident_tokens within max_tokens, and valid context and prefill limits");
+    if (config.retrievalInterval < 1 || config.sinkTokens < 0 || config.recentTokens < 0 || config.retrievalTokens < 0 ||
+        config.sinkTokens % page || config.recentTokens % page || config.retrievalTokens % page)
+        throw std::invalid_argument("Inkling KVMem requires page-aligned nonnegative selection budgets and a positive retrieval interval");
+    const auto aligned = [page](int64_t n) { return (n + page - 1) / page * page; };
+    const size_t targetRow = GetDataBytes(kvCacheDataType, cfg.kvHeads, cfg.headDim <= 64 ? 64 : 128);
+    const auto &d = cfg.draft;
+    const uint64_t target = 2 * cfg.visits.size() * targetRow * aligned(config.maxTokens);
+    const uint64_t draft = d.steps ? 4ULL * d.layers * d.kvHeads * d.dim *
+        aligned(std::min(config.maxTokens, d.maxPositions) + int64_t(d.block - 1)) : 0;
+    if ((target + draft) > config.hostBytes / batch)
+        throw std::invalid_argument("Inkling KVMem host_mib cannot back the target and draft KV for max_batch requests");
+    if (!beforeKvMem) beforeKvMem.reset(new ServingLimits{max_positions, maxBatch, tokensLimit, promptLimit, saveHistoryChat});
+    SetSaveHistoryChat(false);
+    kvMemConfig = config;
+    maxBatch = batch;
+    max_positions = promptLimit = config.maxTokens;
+    tokensLimit = std::min<int64_t>(GetMaxTokens() > 0 ? GetMaxTokens() : INT_MAX, int64_t(batch) * config.maxTokens);
+}
+
+void Inkling2Model::OnResponseContextFinished(ResponseContext *ctx) {
+    if (!kvMemConfig.enabled || !ctx->isEnding || ctx->pastKeyValues.empty()) return;
+    auto &root = ctx->pastKeyValues.front().first;
+    root.kvStorageOwner.reset();
+    for (auto &it : root.multiDeviceDatas) it.second->kvStorageOwner.reset();
+}
+
 bool Inkling2Model::SetSaveHistoryChat(bool save) {
+    if (save && kvMemConfig.enabled) return false;
     std::lock_guard<std::mutex> lock(dictLocker);
     if (runtime) runtime->setPrefixCache(save);
     return basellm::SetSaveHistoryChat(save);
@@ -301,7 +351,8 @@ bool Inkling2Model::RestorePagedPrefixCacheExtra(ResponseContext *ctx, int lengt
     return length > 0 && saveHistoryChat && runtime && ctx && runtime->prefix(*ctx, length, true) == length;
 }
 void Inkling2Model::WarmUp() {
-    if (runtime && (SupportsDecodePipeline() || (draftEnabled() && (tokensLimit > 0 || GetMaxTokens() > 0))))
+    kvMemLocked = true;
+    if (runtime && (kvMemConfig.enabled || SupportsDecodePipeline() || (draftEnabled() && (tokensLimit > 0 || GetMaxTokens() > 0))))
         runtime->warmupDecodeGraph();
 }
 int Inkling2Model::GetPrefillBatchKey(const ResponseContext &ctx, int chunkSize) const {
@@ -427,6 +478,7 @@ std::vector<int> Inkling2Model::ForwardMultimodal(const Data &ids, const Data &,
         const GenerationConfig &sampling, const LastTokensManager &history, std::vector<std::vector<float> *> *logits) {
     if (!runtime || cache.size() != size_t(block_cnt))
         throw std::runtime_error("Invalid Inkling image request cache");
+    kvMemLocked = true;
     std::vector<std::pair<Data *, Data *>> slots;
     for (auto &kv : cache) slots.emplace_back(&kv.first, &kv.second);
     return runtime->forward(ids, {const_cast<Data *>(&pos)}, {int(ids.Count(0))}, slots,
@@ -441,6 +493,7 @@ std::vector<int> Inkling2Model::ForwardV2(int batch, const Data &ids, const std:
     if (!runtime || batch <= 0 || pos.size() != size_t(batch) || sampling.size() != size_t(batch) ||
         lengths.size() != size_t(batch) || cache.size() != size_t(batch) * cfg.visits.size())
         throw std::runtime_error("Inkling forward received an invalid cache layout");
+    kvMemLocked = true;
     return runtime->forward(ids, pos, lengths, cache, sampling, history, logits);
 }
 } // namespace fastllm
