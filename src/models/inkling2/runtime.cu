@@ -11,6 +11,7 @@
 #include "devices/cuda/fastllm-cuda-launch.cuh"
 #include "devices/cuda/fastllm-cuda-gguf-projections.h"
 #include "utils/recurrent_prefix_cache.h"
+#include "fastkv/fastkv.h"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda-attn-res.cuh"
@@ -510,6 +511,7 @@ class Decoder final : public Runtime {
     std::mutex mutex;
     std::mutex prefixMutex;
     std::atomic<bool> prefixEnabled;
+    std::unique_ptr<fastkv::BufferPool> prefixBuffers;
     RecurrentPrefixStore<InklingPrefix> prefixes;
     long long prefixSerial = 0;
     cudaGraphExec_t decodeGraph = nullptr;
@@ -2392,6 +2394,7 @@ class Decoder final : public Runtime {
                 desc.dataDevice = CUDA;
                 desc.dataDeviceIds = {placement.gpu};
                 const int len = GetPageLen();
+                PrefixCopies restoreCopies;
                 const auto &gen = sampling[b];
                 const int64_t prompt = std::max<int64_t>(gen.input_token_length,
                         int64_t(past) + lengths[b] + std::max(0, gen.prefill_chunk_remaining));
@@ -2438,7 +2441,7 @@ class Decoder final : public Runtime {
                         if (req.restored) {
                             if (c.draft.local[l]) {
                                 v.prepare(past, c.draft.window);
-                                req.restored->draftWindows[l].transfer(v, true);
+                                req.restored->draftWindows[l].transfer(v, restoreCopies, true);
                             } else v.syncTable();
                         }
                     }
@@ -2461,16 +2464,16 @@ class Decoder final : public Runtime {
                         slots = std::min(slots, (int64_t(c.window) + std::max(0, c.draft.block - 1) + len - 2) / len + 1);
                     v.reserveTable(std::min<int64_t>(slots, v.key->pagedKVCacheData->maxPages), c.local[c.visits[slot]]);
                     if (req.restored) {
-                        for (int j = 0; j < 4; ++j) v.convState[j] = req.restored->conv[slot][j].load();
+                        for (int j = 0; j < 4; ++j) v.convState[j] = req.restored->conv[slot][j].load(restoreCopies);
                         if (c.local[c.visits[slot]]) {
                             v.prepare(past, c.window);
-                            req.restored->windows[slot].transfer(v, true);
+                            req.restored->windows[slot].transfer(v, restoreCopies, true);
                         } else v.syncTable();
                     }
                 }
                 if (req.restored) {
-                    if (req.draft) req.draft->recurrentContext = req.restored->draftContext.load();
-                    check(cudaStreamSynchronize(cudaStreamPerThread));
+                    if (req.draft) req.draft->recurrentContext = req.restored->draftContext.load(restoreCopies);
+                    restoreCopies.submit(req.restored->storage, true);
                     req.restored.reset();
                 }
             }

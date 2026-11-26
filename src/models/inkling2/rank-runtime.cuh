@@ -236,14 +236,22 @@ public:
         std::lock_guard<std::mutex> lock(mutex);
         std::vector<int> lengths(devices.size());
         std::vector<std::shared_ptr<void>> owners(devices.size());
-        run([&](int i) {
-            ResponseContext local;
-            local.currentTokens = ctx.currentTokens; local.generationConfig = ctx.generationConfig;
-            local.pastKeyValues.resize(1);
-            lengths[i] = ranks[i]->decoder->prefix(local, limit, restore);
-            if (restore) owners[i] = std::move(local.pastKeyValues.front().first.kvStorageOwner);
-        });
-        const int common = *std::min_element(lengths.begin(), lengths.end());
+        int common;
+        for (;;) {
+            run([&](int i) {
+                ResponseContext local;
+                local.currentTokens = ctx.currentTokens; local.generationConfig = ctx.generationConfig;
+                local.pastKeyValues.resize(1);
+                lengths[i] = ranks[i]->decoder->prefix(local, limit, restore);
+                if (restore) owners[i] = std::move(local.pastKeyValues.front().first.kvStorageOwner);
+            });
+            auto bounds = std::minmax_element(lengths.begin(), lengths.end());
+            common = *bounds.first;
+            if (restore || !common || common == *bounds.second) break;
+            // Device pressure may evict different recurrent boundaries on each
+            // rank. Narrow the preview until every rank holds the same one.
+            limit = common;
+        }
         if (restore && common == limit) {
             auto &root = ctx.pastKeyValues.front().first;
             ensureCache(root);

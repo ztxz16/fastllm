@@ -225,7 +225,7 @@ def _draft_budget(args, meta):
 def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
     from .auto_config import cpu_threads, cuda_hardware, cuda_graph_enabled
     from .env import env
-    from .util import _memory_size_bytes
+    from .util import _arg_enabled, _memory_size_bytes
 
     # A planned token count takes precedence over the runtime's byte limit.
     if args.kv_cache_limit not in ("", "auto"):
@@ -330,6 +330,11 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
             if type(kvmem["prefill_tokens"]) is not int or kvmem["prefill_tokens"] < 1:
                 raise ValueError("KVMem prefill_tokens must be a positive integer")
             args.chunked_prefill_size = kvmem["prefill_tokens"]
+    prefix_flag = args.prefix_cache or os.environ.get("FASTLLM_PREFIX_CACHE") or "true"
+    prefix_enabled = (not offload and _arg_enabled(args.cache_history or "true") and
+                      prefix_flag.lower() in ("true", "on", "yes", "1"))
+    # Match the rank-local lazy BufferPool ceiling, including in simulated VRAM.
+    prefix_budget = 256 * MiB * max(4, min(16, batch)) if prefix_enabled else 0
     fixed_chunk = args.chunked_prefill_size not in (-1, "auto")
     chunks = [args.chunked_prefill_size] if fixed_chunk else [8192, 4096, 2048, 1024, 512, 256]
     if fixed_chunk and chunks[0] < 1:
@@ -368,6 +373,7 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                     selection_bytes = batch * g.global_ * (152 + 4 * pages * (width + g.heads // world + 2)
                                                            + 16 * (hot // page))
                     rank_kv += tables + selection_bytes
+                rank_prefix = prefix_budget // world
                 rank_budget = min(budgets[d] for d in ids)
                 candidates = []
                 for chunk in chunks:
@@ -375,7 +381,7 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                         chunk = min(chunk, context)
                     rows = max(chunk, args.prefill_batch_tokens or 0, decode_rows)
                     scratch = _workspace_bytes(g, rows, decode_rows, world, hybrid, draft_taps, args.dspark)
-                    runtime = resident + rank_kv + scratch
+                    runtime = resident + rank_kv + rank_prefix + scratch
                     spare = min(rank_budget - runtime, budgets[ids[0]] - load_peak)
                     cache_bytes = 0
                     if hybrid:
@@ -403,7 +409,8 @@ def resolve(args, query_gpu, hardware=None, ram=None, use_numa=None):
                               tokens=tokens, max_context_length=context, chunked_prefill_size=chunk,
                               moe_cuda_cache=cache_bytes, cache_slots_per_layer=min(g.experts, cache_bytes // w.slot_bytes),
                               gpu_budget_bytes={d: budgets[d] for d in ids}, kv_bytes_per_rank=rank_kv,
-                              workspace_bytes_per_rank=scratch, weight_bytes_per_rank=resident, root_load_peak_bytes=load_peak,
+                              prefix_cache_bytes_per_rank=rank_prefix, workspace_bytes_per_rank=scratch,
+                              weight_bytes_per_rank=resident, root_load_peak_bytes=load_peak,
                               host_estimated_bytes=host_bytes, host_budget_bytes=host_limit,
                               automatic={"policy": "inkling-tp-or-single-hybrid", "cuda_graph": graph})
                 if offload:

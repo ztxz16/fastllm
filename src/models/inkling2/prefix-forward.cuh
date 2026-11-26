@@ -2,7 +2,10 @@
 void setPrefixCache(bool enabled) override {
     std::lock_guard<std::mutex> lock(prefixMutex);
     prefixEnabled = enabled && RecurrentPrefixCacheEnabled();
-    if (!prefixEnabled) prefixes = {};
+    if (!prefixEnabled) {
+        prefixes = {};
+        prefixBuffers.reset();
+    }
 }
 
 int prefix(ResponseContext &ctx, int limit, bool restore) override {
@@ -32,7 +35,7 @@ int prefix(ResponseContext &ctx, int limit, bool restore) override {
         }
     }
     auto found = prefixes.Find(ctx.currentTokens, available, restore ? limit : -1,
-        [&](const InklingPrefix &p) { return !draft || !p.draftContext.values.empty(); });
+        [&](const InklingPrefix &p) { return !draft || p.hasDraft(); });
     if (!found) return 0;
     if (restore) {
         auto req = std::make_shared<Request>(placement.gpu);
@@ -110,11 +113,40 @@ void checkpointDecode(Request &req) {
     req.nextDecodeCheckpoint = int64_t(req.length) + RecurrentPrefixInterval(GetPageLen());
 }
 
+fastkv::Buffer acquirePrefixBuffer(size_t bytes, const InklingPrefix &entry) {
+    // Keep the same per-rank ceiling in the auto planner. Allocate lazily so a
+    // short conversation only pays for the window pages it actually retains.
+    const size_t limit = (size_t(256) << 20) * std::clamp(model.maxBatch, 4, 16) / placement.world;
+    if (bytes <= limit) {
+        if (!prefixBuffers) {
+            auto allocate = [](size_t size, int gpu) {
+                size_t free, total;
+                check(cudaMemGetInfo(&free, &total));
+                const size_t reserve = size_t(total * (1.0 - std::clamp(double(GetGpuMemRatio()), 0.0, 1.0)));
+                if (size > free || free - size < reserve)
+                    throw fastkv::CapacityBusy("Inkling prefix would consume GPU headroom");
+                return fastkv::Buffer::Allocate(size, gpu);
+            };
+            prefixBuffers = std::make_unique<fastkv::BufferPool>(limit, std::map<int, size_t>{}, allocate);
+        }
+        for (;;) {
+            try {
+                return prefixBuffers->Acquire(bytes, placement.gpu);
+            } catch (const fastkv::CapacityBusy &) {
+                if (!prefixes.EvictIdle(entry, [](const InklingPrefix &p) { return p.storage.Device() >= 0; })) break;
+            }
+        }
+    }
+    // Oversized checkpoints or pressure from active readers must still allow
+    // an exact cache hit on memory-constrained deployments.
+    return fastkv::Buffer::Allocate(bytes);
+}
+
 void savePrefix(Request &req) {
     std::lock_guard<std::mutex> lock(prefixMutex);
     if (!prefixEnabled) return;
     if (!req.draft && prefixes.Find(req.prefixTokens, req.length, req.length,
-            [](const InklingPrefix &p) { return !p.draftContext.values.empty(); })) return;
+            [](const InklingPrefix &p) { return p.hasDraft(); })) return;
     auto entry = std::make_shared<InklingPrefix>();
     entry->cachedLen = req.length;
     entry->tokens = req.prefixTokens;
@@ -125,22 +157,24 @@ void savePrefix(Request &req) {
     const int page = GetPageLen();
     for (int pos = 0; pos < req.length; pos += page)
         hashes.push_back(PagedCacheManager::HashTokenPage(entry->tokens.data() + pos, page));
+    PrefixCopies copies;
     auto record = [&](VisitCache &v, bool local, PrefixWindow &window) {
-        if (local) window.transfer(v, false);
+        if (local) window.transfer(v, copies, false);
         else for (auto *side : {v.key, v.value}) side->pagedKVCacheData->RecordPrefix(hashes, side->pageIndex);
     };
     for (size_t i = 0; i < req.visits.size(); ++i) {
         auto &v = req.visits[i];
         record(v, c.local[c.visits[i]], entry->windows[i]);
-        for (int j = 0; j < 4; ++j) entry->conv[i][j].save(v.convState[j]);
+        for (int j = 0; j < 4; ++j) entry->conv[i][j].save(v.convState[j], copies);
     }
     if (req.draft) {
-        entry->draftContext.save(req.draft->recurrentContext);
+        entry->draftContext.save(req.draft->recurrentContext, copies);
         entry->draftWindows.resize(c.draft.layers);
         for (int i = 0; i < c.draft.layers; ++i)
             record(req.draft->kv[i]->cache, c.draft.local[i], entry->draftWindows[i]);
     }
-    check(cudaStreamSynchronize(cudaStreamPerThread));
+    entry->storage = acquirePrefixBuffer(copies.bytes, *entry);
+    copies.submit(entry->storage, false);
     std::shared_ptr<InklingPrefix> held;
     prefixes.Publish(std::move(entry), held, RecurrentPrefixMaxPerRequest(), RecurrentPrefixMaxRecords(model.maxBatch));
 }

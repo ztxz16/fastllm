@@ -64,7 +64,15 @@ class InklingAutoTest(unittest.TestCase):
         self.assertGreater(plan["cache_slots_per_layer"], 0)
         self.assertEqual(args.moe_cuda_cache, plan["cache_slots_per_layer"] * stride)
         self.assertLessEqual(max(plan["weight_bytes_per_rank"] + plan["kv_bytes_per_rank"] +
-                                 plan["workspace_bytes_per_rank"], plan["root_load_peak_bytes"]) + args.moe_cuda_cache, 10 * mem.GiB)
+                                 plan["workspace_bytes_per_rank"] + plan["prefix_cache_bytes_per_rank"], plan["root_load_peak_bytes"]) + args.moe_cuda_cache, 10 * mem.GiB)
+
+    def test_prefix_pool_budget(self):
+        options = ("--max_batch", "2", "--max_context_length", "8192")
+        for ranks in (1, 2):
+            self.assertEqual(self.plan(*options, n=ranks)[1]["prefix_cache_bytes_per_rank"], mem.GiB // ranks)
+        for flag in ("--cache_history", "--prefix_cache"):
+            self.assertEqual(self.plan(*options, flag, "false")[1]["prefix_cache_bytes_per_rank"], 0)
+        self.assertEqual(self.plan(*options, "--kvmem", '{"resident_tokens":1024}')[1]["prefix_cache_bytes_per_rank"], 0)
 
     def test_fp8_target_kv_budget(self):
         options = ("--max_context_length", "8192", "--max_batch", "2")
