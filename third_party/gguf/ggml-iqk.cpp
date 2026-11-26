@@ -502,13 +502,6 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
     }
 }
 #else
-// R4 内核同时依赖 AVX2、FMA 和 F16C；MSVC 的 /arch:AVX2 一并允许这些指令。
-// 重排与计算必须使用同一能力条件，避免生成当前目标无法执行的 R4 权重布局。
-#if defined(__AVX2__) && ((defined(__FMA__) && defined(__F16C__)) || defined(_MSC_VER))
-#define FASTLLM_GGUF_IQK_R4
-#endif
-
-#ifdef FASTLLM_GGUF_IQK_R4
 // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
 #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
 
@@ -1911,23 +1904,7 @@ static void mul_mat_q6_k_r4_q8_k(int n, const void * vx, size_t bx, const DataIn
     }
 }
 
-#else
-/**
- * 在目标指令集不足时保留原始 GGUF 权重布局，供普通点积路径计算。
- *
- * R4 重排依赖对应的矩阵乘内核；缺少 AVX2、FMA 或 F16C 时不提供重排入口，
- * 由调用方保留原始权重数据及类型，不产生只能由未编译内核消费的布局。
- *
- * @param type 原始 GGUF 权重类型；此分支对所有类型均禁用 R4 重排。
- * @return nullptr 表示当前目标不提供重排，调用方继续使用原始布局。
- */
-const Repack * get_repack_info(ggml_type type) {
-    GGML_UNUSED(type);
-    return nullptr;
-}
-#endif
-
-#if defined(FASTLLM_GGUF_IQK_R4) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
 static inline float q8_0_scale(const block_q8_0 &block) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)block.d)));
 }
@@ -1957,7 +1934,7 @@ static void mul_mat_q8_0_q8_0_fast(int n, const void * vx, size_t bx,
                                     const DataInfo& info, int nrc_x) {
     const int blocks = n / QK8_0;
     assert(n % QK8_0 == 0);
-#if defined(FASTLLM_GGUF_IQK_R4) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
     for (int ix = 0; ix < nrc_x; ++ix) {
         const auto * x = (const block_q8_0 *)((const char *)vx + ix * bx);
         for (int iy = 0; iy < nrc_y; ++iy) {
@@ -2001,10 +1978,7 @@ static void mul_mat_empty(int n, const void * vx, size_t bx, const DataInfo& inf
 mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
     if (type == GGML_TYPE_Q8_0) {
         RETURN_MATMUL_FUNCTION(mul_mat_q8_0_q8_0_fast, nrc_y)
-    }
-
-#ifdef FASTLLM_GGUF_IQK_R4
-    if (type == GGML_TYPE_IQ2_XXS_R4) {
+    } else if (type == GGML_TYPE_IQ2_XXS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xxs_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_IQ2_XS_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_iq2_xs_r4_q8_k, nrc_y)
@@ -2022,9 +1996,9 @@ mul_mat_t GetMulMatFunction(ggml_type type, int nrc_y) {
         RETURN_MATMUL_FUNCTION(mul_mat_q5_k_r4_q8_k, nrc_y)
     } else if (type == GGML_TYPE_Q6_K_R4) {
         RETURN_MATMUL_FUNCTION(mul_mat_q6_k_r4_q8_k, nrc_y)
+    } else {
+        return nullptr;
     }
-#endif
-    return nullptr;
 }
 
 #endif // #ifdef __aarch64__ else ...
