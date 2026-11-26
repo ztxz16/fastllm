@@ -208,9 +208,9 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
     std::vector<float> compactGate;
     const int gateStride = heads * D + 13;
     if constexpr (!std::is_void_v<Gate>) {
-        static_assert(D == 128 && std::is_same_v<PrefillQuery<T>, half>);
+        static_assert(D == 128 && sizeof(PrefillQuery<T>) == 2);
         if (!(window ? configureGatedPrefill<true, Gate, T, Bias>() : configureGatedPrefill<false, Gate, T, Bias>())) return;
-        std::vector<half> query(q.begin(), q.end());
+        std::vector<PrefillQuery<T>> query(q.begin(), q.end());
         compactGate.resize(rows * gateStride);
         fill(compactGate);
         std::vector<Gate> typedGate(compactGate.begin(), compactGate.end());
@@ -221,7 +221,7 @@ void compare(int group, int past, int rows, int window, int pageLen, bool commit
         auto gating = upload(typedGate);
         for (int first = 0; first < rows; first += 137) {
             a.first = first;
-            half *input = fused.p + size_t(first) * heads * D;
+            auto *input = fused.p + size_t(first) * heads * D;
             auto launch = window ? launchGatedPrefill<true, Gate, T, Bias> : launchGatedPrefill<false, Gate, T, Bias>;
             launch(a, input, reinterpret_cast<Gate *>(input), gating.p + size_t(first) * gateStride,
                    gateStride, std::min(137, rows - first), typedBias.p + size_t(first) * heads * extent);
@@ -511,6 +511,10 @@ int testRelative() {
     if (major >= 8) {
         compare<128, half, nv_bfloat16>(3, 8190, 39, 0, 127, false);
         compare<128, half, nv_bfloat16>(3, 1017, 159, 1024, 31, false);
+        for (int past : {0, 1025, 8190})
+            compare<128, nv_bfloat16, nv_bfloat16, nv_bfloat16>(3, past, 159, 1024, 127, false);
+        // Short prompt chunks use FP32 relative bias.
+        compare<128, nv_bfloat16, nv_bfloat16>(3, 1017, 9, 1024, 31, false);
     }
     if (major >= 8 && configurePrefill<128, half>() && configurePrefill<128, nv_bfloat16>()) {
         for (int group : {1, 3, 5}) {

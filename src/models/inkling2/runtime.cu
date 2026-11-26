@@ -1083,7 +1083,9 @@ class Decoder final : public Runtime {
         const int rows = projection.storage.rows;
         using Query = PrefillQuery<KV>;
         const bool queryFits = !std::is_same_v<Query, half> || (c.qClip > 0 && c.qClip <= 65504.f);
-        const bool canFuseGate = std::is_same_v<Query, half> && (window ? gatedWindowPrefill : gatedGlobalPrefill);
+        constexpr bool gatedTypes = std::is_same_v<Query, half> ||
+                                    (std::is_same_v<KV, __nv_bfloat16> && std::is_same_v<T, __nv_bfloat16>);
+        const bool canFuseGate = gatedTypes && (window ? gatedWindowPrefill : gatedGlobalPrefill);
         if (batch.front().timeline && batch.front().length == 1 && d == 128 && c.relative == 16 &&
             c.extent % 4 == 0 && c.qClip > 0 && c.rClip > 0 && inputs[0].rows <= 65535) {
             const int rows = inputs[0].rows;
@@ -1321,7 +1323,7 @@ class Decoder final : public Runtime {
                 if constexpr (!std::is_same_v<KV, float>) {
                     if (typedQuery.p) {
                         auto *query = typedQuery.slice(seq.offset + first, count).p;
-                        if constexpr (std::is_same_v<Query, half>) {
+                        if constexpr (gatedTypes) {
                             if (compact) {
                                 const auto gate = parts.items[2];
                                 const int row = seq.offset + first;
@@ -1331,6 +1333,8 @@ class Decoder final : public Runtime {
                                 };
                                 if (narrowBias) {
                                     launch(launchGatedPrefill<true,T,KV,__nv_bfloat16>, reinterpret_cast<__nv_bfloat16 *>(bias.p));
+                                } else if constexpr (std::is_same_v<KV, __nv_bfloat16>) {
+                                    launch(launchGatedPrefill<true,T,KV>, args.relative);
                                 } else {
                                     launch(window ? launchGatedPrefill<true,T,KV> : launchGatedPrefill<false,T,KV>, args.relative);
                                 }
@@ -1801,10 +1805,14 @@ class Decoder final : public Runtime {
         const int arch = FastllmCudaRuntimeArch();
         if (arch < 75 || c.headDim != 128 || c.relative > threads) return;
         if (weights.weight.at("model.llm.unembed.weight").dataType == FLOAT16) {
-            gatedGlobalPrefill = configureGatedPrefill<false, half, KV>();
-            gatedWindowPrefill = configureGatedPrefill<true, half, KV>();
+            if constexpr (!std::is_same_v<KV, __nv_bfloat16>) {
+                gatedGlobalPrefill = configureGatedPrefill<false, half, KV>();
+                gatedWindowPrefill = configureGatedPrefill<true, half, KV>();
+            }
         } else if (arch >= 80) {
-            gatedGlobalPrefill = configureGatedPrefill<false, __nv_bfloat16, KV>();
+            // Global BF16 attention still needs the compensated QK path.
+            if constexpr (!std::is_same_v<KV, __nv_bfloat16>)
+                gatedGlobalPrefill = configureGatedPrefill<false, __nv_bfloat16, KV>();
             gatedWindowPrefill = configureGatedPrefill<true, __nv_bfloat16, KV>();
             bf16WindowBias = gatedWindowPrefill && configureGatedPrefill<true, __nv_bfloat16, KV, __nv_bfloat16>();
         }
@@ -1822,6 +1830,7 @@ class Decoder final : public Runtime {
         residualType = model.dataType;
         if (kvType == FP8_E4M3) configureGatedAttention<__nv_fp8_e4m3>();
         else if (kvType == FLOAT16) configureGatedAttention<half>();
+        else if (kvType == BFLOAT16) configureGatedAttention<__nv_bfloat16>();
         if (!c.draft.steps && backboneBf16 && kvType == FLOAT16 && verifyAttentionSplits > 0 &&
             splitScratch.rows >= 16 && c.window <= 1024) {
             singleWindowKernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window,

@@ -202,8 +202,9 @@ template<bool Windowed, class Bias, bool MaskWindow = false, bool FoldScale = tr
     }
 };
 
-template<bool Windowed, class Bias> struct GatedPrefillRelative : PrefillRelative, RelativeScoreTile<Windowed, Bias> {
-    static constexpr bool use_pv_residual = false;
+template<bool Windowed, class Bias, class KV> struct GatedPrefillRelative : PrefillRelative, RelativeScoreTile<Windowed, Bias> {
+    // BF16 probabilities need their rounding residual in the PV product.
+    static constexpr bool use_pv_residual = std::is_same_v<KV, __nv_bfloat16>;
     static constexpr bool defer_softmax_rescale = true;
     template<class P> __device__ GatedPrefillRelative(const P &p, unsigned batch, uint8_t *smem)
         : PrefillRelative(p, batch, smem), RelativeScoreTile<Windowed, Bias>(p, blockIdx.x) {}
@@ -262,16 +263,16 @@ template<bool Windowed, class T, class KV, class Bias>
 using GatedParams = std::conditional_t<Windowed, WindowPrefillParams<T,KV,Bias>, GatedPrefillParams<T,KV,Bias>>;
 
 template<bool Windowed, class T, class KV, class Bias> using GatedPrefillTraits = flashinfer::KernelTraits<flashinfer::MaskMode::kCausal,
-    64, 1, 4, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone, half, KV, T, float, int, GatedPrefillRelative<Windowed,Bias>>;
+    64, 1, 4, 8, 8, 4, 1, flashinfer::PosEncodingMode::kNone, PrefillQuery<KV>, KV, T, float, int, GatedPrefillRelative<Windowed,Bias,KV>>;
 
 template<bool Windowed, class T, class KV, class Bias = float> bool configureGatedPrefill() {
-    // Both masks use FP16 MMA. The BF16 bias projection needs SM80.
-    constexpr int minArch = std::is_same_v<Bias, float> ? 75 : 80;
+    // BF16 MMA and the BF16 relative-bias projection require SM80.
+    constexpr int minArch = std::is_same_v<KV, __nv_bfloat16> || std::is_same_v<Bias, __nv_bfloat16> ? 80 : 75;
     return configurePrefillKernel<GatedPrefillTraits<Windowed, T, KV, Bias>, GatedParams<Windowed, T, KV, Bias>, minArch>();
 }
 
 template<bool Windowed, class T, class KV, class Bias = float>
-void launchGatedPrefill(const AttentionRow &a, half *query, T *out, const T *gate,
+void launchGatedPrefill(const AttentionRow &a, PrefillQuery<KV> *query, T *out, const T *gate,
                         int gateStride, int rows, const Bias *bias) {
     using Traits = GatedPrefillTraits<Windowed, T, KV, Bias>;
     // Each CTA owns disjoint output heads, stages its entire Q tile before
