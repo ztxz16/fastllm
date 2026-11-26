@@ -18,6 +18,7 @@
 #include "devices/cuda/low_latency/bf16_projection.cuh"
 #include <cuda_runtime.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/block/block_reduce.cuh>
 #include "attention/variants.cuh"
 #include "attention/decode.cuh"
 #include "attention/default_prefill_params.cuh"
@@ -173,6 +174,7 @@ template <class T, class Residual> __global__ void conv(const T *x, const float 
 }
 #include "paged-kv.cuh"
 #include "attention.cuh"
+#include "legacy-prefill.cuh"
 #include "prefill.cuh"
 #include "paged-verify-attention.cuh"
 template <bool Timeline = false, typename T, typename U> __device__ float updateConvChannel(const T *input, const DecodeVisit *visit, int index,
@@ -554,7 +556,7 @@ class Decoder final : public Runtime {
     FastllmBf16MmaProjections::Project rankOutputGemv = nullptr;
     bool backboneBf16 = false;
     int smCount = 0, sm120GlobalSplits = 0, verifyAttentionSplits = 0;
-    bool tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
+    bool legacyGemmPrefill = false, tensorPrefill = false, gatedGlobalPrefill = false, gatedWindowPrefill = false;
     bool bf16WindowBias = false, batchedController = false, fusedPrefillController = false, decodePdlSupported = false;
 
     Data &weight(const std::string &key) const {
@@ -1268,7 +1270,18 @@ class Decoder final : public Runtime {
             const int distances = decode ? c.extent : std::min(c.extent, past + seq.length);
             // Bound temporary relative logits for long prefills. Each row
             // addresses the original complete suffix, including earlier tiles.
-            const int baseTile = typedQuery.p ? 512 : 64;
+            std::optional<legacy_prefill::Workspace> legacy;
+            if (legacyGemmPrefill && std::is_same_v<KV, half> && !typedQuery.p && !decode && !seq.verify &&
+                !sparsePrefill && !DecodeGraphScratch::active && seq.length >= 64 && d == aligned &&
+                c.heads % c.kvHeads == 0 && queryFits) {
+                const int queries = std::min(seq.length, legacy_prefill::queryTile);
+                const int keys = std::min(legacy_prefill::keyTile, window ? std::min(past + seq.length, window + queries - 1)
+                                                                          : past + seq.length);
+                try {
+                    legacy.emplace(queries, (keys + 7) & ~7, c.heads, c.kvHeads, d, past > 0);
+                } catch (const CudaWorkspaceExhausted &) { cudaGetLastError(); }
+            }
+            const int baseTile = typedQuery.p ? 512 : legacy ? legacy_prefill::queryTile : 64;
             // Head sharding reduces the number of CTAs per window tile. Batch
             // more queries for the narrow bias GEMM and its attention consumer.
             int tile = narrowBias && placement.world > 1 ? 2048 : baseTile;
@@ -1281,9 +1294,14 @@ class Decoder final : public Runtime {
             try {
                 bias = allocateBias(tile);
             } catch (const CudaWorkspaceExhausted &) {
-                if (tile == baseTile || seq.length <= baseTile) throw;
+                if (legacy) {
+                    legacy.reset();
+                    tile = 64;
+                } else {
+                    if (tile == baseTile || seq.length <= baseTile) throw;
+                    tile = baseTile;
+                }
                 cudaGetLastError();
-                tile = baseTile;
                 bias = allocateBias(tile);
             }
             if (sparsePrefill && cache) cache->reservePages(past + seq.length, 0);
@@ -1301,6 +1319,7 @@ class Decoder final : public Runtime {
                     sink.slice(seq.offset, seq.length).p, compact ? nullptr : attended.slice(seq.offset, seq.length).p,
                     decode, past, first, c.heads, c.kvHeads, d, distances,
                     window, c.logFloor, c.logAlpha};
+                if (legacy && legacy->run(args, count)) continue;
                 if (sparsePrefill) {
                     args.sparse = true;
                     if (!first) {
@@ -2151,8 +2170,9 @@ class Decoder final : public Runtime {
         graphInput = Buffer<DecodeInput>(1);
         hostVisits.resize(c.visits.size());
         graphVisits = Buffer<DecodeVisit>(hostVisits.size());
-#ifndef CUDA_NO_TENSOR_CORE
         const int arch = FastllmCudaRuntimeArch();
+        legacyGemmPrefill = arch == 60 || arch == 70;
+#ifndef CUDA_NO_TENSOR_CORE
 #if CUDART_VERSION >= 12000
         if (arch >= 90 && c.hidden == 2304 && c.rank == 64) {
             cudaFuncAttributes attr{};
