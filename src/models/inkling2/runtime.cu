@@ -911,7 +911,7 @@ class Decoder final : public Runtime {
         return result;
     }
 
-    template<class KV, class T> Rows<T> attend(const std::array<Rows<T>, 3> &inputs, const std::string &att,
+    template<class KV, class T> Rows<T> attend(std::array<Rows<T>, 3> &inputs, const std::string &att,
                                       bool local, const std::vector<Segment> &batch, size_t slot, int promptRows) {
         const int d = c.headDim, k = c.kvHeads * d;
         const int aligned = attentionWidth(d), kvWidth = c.kvHeads * aligned;
@@ -924,6 +924,7 @@ class Decoder final : public Runtime {
             !batch.front().timeline && !usesVerifyArithmetic(batch);
         auto projection = projectAttention(inputs, att, local,
             singleDecodePdl ? Projection::PdlDecode : attentionProjection(batch), inputs[0].rows, promptRows);
+        if (!batch.front().decode && !batch.front().timeline && !decodeArithmetic) inputs = {};
         if ((batch.front().decode || decodeArithmetic) && aligned == d && c.relative <= threads) {
             const auto projected = projection.views();
             Rows<T> attended(projection.storage.rows, c.heads * d);
@@ -1087,8 +1088,7 @@ class Decoder final : public Runtime {
                                     (std::is_same_v<KV, __nv_bfloat16> && std::is_same_v<T, __nv_bfloat16>);
         const bool canFuseGate = gatedTypes && (window ? gatedWindowPrefill : gatedGlobalPrefill);
         if (batch.front().timeline && batch.front().length == 1 && d == 128 && c.relative == 16 &&
-            c.extent % 4 == 0 && c.qClip > 0 && c.rClip > 0 && inputs[0].rows <= 65535) {
-            const int rows = inputs[0].rows;
+            c.extent % 4 == 0 && c.qClip > 0 && c.rClip > 0 && rows <= 65535) {
             const bool splitBias = sm120GlobalSplits > 0 && rows * c.heads == 768 && c.extent == 1024;
             const int tiles = splitBias ? (c.extent + threads * 4 - 1) / (threads * 4) : 1;
             const auto parts = projection.views();
@@ -1135,7 +1135,7 @@ class Decoder final : public Runtime {
         // Select the bias precision using the unsharded shape so a prompt
         // follows the same arithmetic when its attention heads are partitioned.
         const bool narrowBias = compact && window && bf16WindowBias && std::is_same_v<T, __nv_bfloat16> &&
-                                size_t(rows) * c.heads * placement.world >= size_t(c.extent);
+                                size_t(promptRows ? promptRows : rows) * c.heads * placement.world >= size_t(c.extent);
         const int relativeWidth = c.heads * c.relative;
         Buffer<__nv_bfloat16> narrowRelative;
         __nv_bfloat16 *table16 = nullptr;
@@ -1440,7 +1440,7 @@ class Decoder final : public Runtime {
         return convolutions(projected, conv, {}, 1, c.conv, batch, slot, 2, skip, decodePdl);
     }
 
-    template <typename T, class R> Rows<R> layer(const Rows<R> &x, std::vector<Rows<R>> &blocks, const Matrix &messages,
+    template <typename T, class R> Rows<R> layer(const Rows<R> &x, std::vector<Rows<R>> &blocks, Matrix messages,
                  int physical, const std::vector<Segment> &batch, size_t slot, ExpertPhase phase, int promptRows) {
         const std::string pre = "layers." + std::to_string(physical) + ".", att = pre + "attn.";
         bool local = c.local[physical];
@@ -1493,10 +1493,13 @@ class Decoder final : public Runtime {
         Query mlpQuery{param("attn_res.mlp_queries." + std::to_string(physical), h), messages.p ? nullptr : mlpNorm};
         auto residual = projectAttentionResidual(attended, att + "wo_ud.weight", attnConv, newBlock ? Rows<R>{} : x,
                                                  batch, slot, overlapProjection, decodePdl, promptRows);
+        if (phase == ExpertPhase::Prefill) attended = {};
         auto ffn = messages.p ? mixLayerInputs<float>(blocks, residual, &mlpQuery, 1, decodePdl)
                               : mixLayerInputs<T>(blocks, residual, &mlpQuery, 1, decodePdl);
-        if (messages.p)
+        if (messages.p) {
             ffn = control<T, float>(&ffn, messages.slice(3 * x.rows, x.rows), &mlpNorm, 1, pre, decodePdl, promptRows);
+            if (phase == ExpertPhase::Prefill) messages = {};
+        }
         Rows<__nv_bfloat16> rankSum, routes;
         auto m = experts.layers[physical]->run(c, ffn, param(pre + "mlp.gate.bias", c.experts), phase,
                                                placement.world > 1 && std::is_same_v<R, __nv_bfloat16> ? &rankSum : nullptr,
@@ -1646,8 +1649,8 @@ class Decoder final : public Runtime {
         else if (batch.front().timeline || batch.front().decode || std::all_of(batch.begin(), batch.end(), [](const Segment &s) {
             return s.length == 1 && s.request && s.request->length >= s.request->promptLength;
         })) phase = ExpertPhase::Decode;
-        const int promptRows = phase == ExpertPhase::Prefill && batch.size() > 1 && !promptSeeds.empty()
-                             ? batch.front().length : 0;
+        const int promptRows = phase == ExpertPhase::Prefill && batch.size() > 1 &&
+            (!promptSeeds.empty() || batchedPrefixPrompt(batch)) ? batch.front().length : 0;
         auto *cacheCycle = phase == ExpertPhase::Prefill || DecodeGraphScratch::active ? nullptr : experts.cache.get();
         if (cacheCycle) cacheCycle->beginStep();
         int h = c.hidden;
@@ -1699,10 +1702,17 @@ class Decoder final : public Runtime {
                     messageTile = crossPassMessages(bank, previous, i, layers, pipeline);
                 }
                 messages = messageTile.slice(4 * (i - firstMessage) * n, 4 * n);
+                if (phase == ExpertPhase::Prefill && i + 1 == endMessage) {
+                    messageTile = {};
+                    if (endMessage == c.end) {
+                        bank.clear();
+                        previous = {};
+                    }
+                }
             }
             if (features && std::binary_search(c.draft.taps.begin(), c.draft.taps.end(), int(slot)))
                 features->push_back(castRows<float>(x));
-            x = layer<T>(x, blocks, messages, i, batch, slot, phase, promptRows);
+            x = layer<T>(x, blocks, std::move(messages), i, batch, slot, phase, promptRows);
         }
         if (cacheCycle) cacheCycle->endStep();
         if (!features && !logits.p) return;
@@ -1712,7 +1722,7 @@ class Decoder final : public Runtime {
             for (auto &block : blocks) block = block.slice(n - 1, 1);
         }
         Query outputQuery{param("attn_res.output_query", h), param("norm.weight", h)};
-        if (promptRows) {
+        if (promptRows && !features) {
             std::vector<Rows<R>> tails(blocks.size());
             for (size_t b = 0; b < batch.size(); ++b) {
                 const int last = batch[b].offset + batch[b].length - 1;
@@ -1736,6 +1746,11 @@ class Decoder final : public Runtime {
         auto output = mixLayerInputs<float>(blocks, x, &outputQuery, 1, pipeline && blocks.size() < 8);
         if (features) features->push_back(output);
         if (!logits.p) return;
+        if (promptRows) {
+            for (size_t b = 0; b < batch.size(); ++b)
+                projectLogits<T>(output.slice(batch[b].offset + batch[b].length - 1, 1), logits.slice(b, 1), false, false);
+            return;
+        }
         Matrix last;
         if (batch.front().verify || batch.front().timeline) last = output;
         else if (batch.size() == 1)
@@ -1878,11 +1893,51 @@ class Decoder final : public Runtime {
         check(cudaMemcpyAsync(graphVisits.p, visits, c.visits.size() * sizeof(DecodeVisit),
                               cudaMemcpyHostToDevice, cudaStreamPerThread));
     }
+    bool batchedPrefixPrompt(const std::vector<Segment> &batch) const {
+        return batch.size() > 1 && prefixEnabled && model.SupportsChunkedPrefillScheduling() &&
+               std::all_of(batch.begin(), batch.end(), [](const Segment &s) {
+                   return s.request && !s.decode && !s.verify && !s.timeline && s.request->length < s.request->promptLength;
+               });
+    }
+
     Matrix runTarget(const float *tokens, int count, const std::vector<Segment> &batch,
-                     const GenerationConfig &sampling, bool &sampledOnDevice, std::vector<Matrix> *features = nullptr, bool needLogits = true) {
+                     const GenerationConfig &sampling, bool &sampledOnDevice, std::vector<Matrix> *features = nullptr,
+                     bool needLogits = true, bool allowDeviceSample = true) {
+        // Coalesce equal, page-aligned segments. Partial pages and singleton
+        // decode must use the same arithmetic as a standalone prefix restore.
+        auto canShare = [](const Segment &a, const Segment &b) {
+            return a.length == b.length && a.length > 1 && a.length % GetPageLen() == 0;
+        };
+        if (batchedPrefixPrompt(batch) && !std::all_of(batch.begin() + 1, batch.end(),
+                [&](const Segment &s) { return canShare(batch.front(), s); })) {
+            Matrix result(needLogits ? batch.size() : 0, c.vocab);
+            for (size_t first = 0; first < batch.size();) {
+                const int offset = batch[first].offset, length = batch[first].length;
+                size_t end = first + 1;
+                while (end < batch.size() && canShare(batch[first], batch[end])) ++end;
+                std::vector<Segment> part(batch.begin() + first, batch.begin() + end);
+                for (auto &s : part) s.offset -= offset;
+                const int rows = int(part.size()) * length;
+                std::vector<Matrix> taps;
+                bool sampled = false;
+                // Sample once after reassembling the batch, in its original order.
+                auto logit = runTarget(tokens + offset, rows, part, sampling, sampled, features ? &taps : nullptr,
+                                       needLogits, false);
+                if (needLogits) check(cudaMemcpyAsync(result.p + first * c.vocab, logit.p, part.size() * c.vocab * sizeof(float),
+                                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                if (features) {
+                    if (!first) for (auto &tap : taps) features->emplace_back(count, tap.cols);
+                    for (size_t i = 0; i < taps.size(); ++i)
+                        check(cudaMemcpyAsync((*features)[i].p + size_t(offset) * taps[i].cols, taps[i].p,
+                                              size_t(rows) * taps[i].cols * sizeof(float), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                }
+                first = end;
+            }
+            return result;
+        }
         if (needLogits && !features && batch.size() == 1 && count == 1 && batch[0].request->length > 0 && batch[0].request->images.empty()) {
             auto &req = *batch[0].request;
-            sampledOnDevice = graphSample.p && ordinarySampling(sampling) && !sampling.IsSimpleGreedy();
+            sampledOnDevice = allowDeviceSample && graphSample.p && ordinarySampling(sampling) && !sampling.IsSimpleGreedy();
             stageDecode(req, tokens[0], sampling, sampledOnDevice, hostInput, hostVisits.data(), false);
             if (!decodeGraph) {
                 Matrix logits(1, c.vocab);
@@ -2528,6 +2583,9 @@ class Decoder final : public Runtime {
         std::vector<Matrix> features;
         Matrix out;
         const int *deviceSamples = nullptr;
+        const bool intermediate = std::all_of(sampling.begin(), sampling.end(), [](const GenerationConfig &cfg) {
+            return cfg.prefill_chunk_remaining > 0;
+        });
         if ((GetFastllmEnv().cudaGraph || !placement.tensorDevices.empty()) && batch.size() > 1 &&
             offset == int(batch.size()) && !collect &&
             std::all_of(batch.begin(), batch.end(), [](const Segment &s) {
@@ -2541,22 +2599,23 @@ class Decoder final : public Runtime {
                 deviceSamples = plan.sampled.p;
         } else {
             bool sampledOnDevice = false;
-            out = runTarget(values, offset, batch, sampling.front(), sampledOnDevice, collect ? &features : nullptr);
+            out = runTarget(values, offset, batch, sampling.front(), sampledOnDevice, collect ? &features : nullptr, !intermediate);
             if (sampledOnDevice) deviceSamples = graphSample.p;
         }
         storeDraftFeatures(batch, features, bf16);
+        features.clear();
         std::vector<int> result(batch.size());
         bool greedy = std::all_of(sampling.begin(), sampling.end(),
                                   [](const GenerationConfig &cfg) { return cfg.IsSimpleGreedy(); });
-        bool sampled = deviceSamples || greedy;
+        bool sampled = intermediate || deviceSamples || greedy;
         if (deviceSamples) {
             check(cudaMemcpy(result.data(), deviceSamples, result.size() * sizeof(int), cudaMemcpyDeviceToHost));
-        } else if (greedy) {
+        } else if (!intermediate && greedy) {
             Buffer<int> selected(batch.size());
             if (!FastllmCudaGreedySampling(out.p, selected.p, batch.size(), out.cols))
                 throw std::runtime_error("Inkling GPU token selection failed");
             check(cudaMemcpy(result.data(), selected.p, result.size() * sizeof(int), cudaMemcpyDeviceToHost));
-        } else if (std::all_of(sampling.begin(), sampling.end(), ordinarySampling)) {
+        } else if (!intermediate && std::all_of(sampling.begin(), sampling.end(), ordinarySampling)) {
             std::vector<int> k;
             std::vector<float> p, temperature;
             for (const auto &cfg : sampling) {
@@ -2574,7 +2633,7 @@ class Decoder final : public Runtime {
         }
         for (size_t b = 0; b < batch.size(); ++b) {
             auto &req = *batch[b].request;
-            bool wantLogits = placement.rank == 0 && logits && b < logits->size() && (*logits)[b];
+            bool wantLogits = !intermediate && placement.rank == 0 && logits && b < logits->size() && (*logits)[b];
             if (wantLogits || !sampled) {
                 Data scores(FLOAT32, {1, c.vocab});
                 scores.Allocate(false);

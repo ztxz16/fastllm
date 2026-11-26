@@ -137,10 +137,14 @@ public:
         return draftEnabled() && ctx && !ctx->pastKeyValues.empty() &&
                runtime->popPending(ctx->pastKeyValues[0].first, previous, token);
     }
+    bool SupportsChunkedPrefillScheduling() const override;
     bool SupportsPrefillBatching() const override {
-        return runtime && runtime->supportsPooledPrefill() && dataType == BFLOAT16 && !saveHistoryChat;
+        return (prefillScheduling.chunked && SupportsChunkedPrefillScheduling()) ||
+               (runtime && runtime->supportsPooledPrefill() && dataType == BFLOAT16 && !saveHistoryChat);
     }
     int GetPrefillBatchKey(const ResponseContext &, int chunkSize) const override;
+    int GetChunkedPrefillSize() override;
+    int GetBatchedPrefillTokenLimit() override;
     bool SupportsDecodePipeline() const override;
     bool SupportsDecodePipelineHistory() const override { return true; }
     std::unique_ptr<DecodePipeline> CreateDecodePipeline(const std::vector<ResponseContext *> &contexts) override;

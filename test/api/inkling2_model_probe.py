@@ -37,12 +37,12 @@ def generate(model, prompts, steps, vocab, sample=False, hits=None):
     return results
 
 
-def check_page_aligned_forks(model, vocab, tokens):
+def check_page_aligned_forks(model, vocab, tokens, batched):
     # 2,176 ends one page after the regular 2,048-token checkpoint. A longer
     # cold prompt does not execute the 128-row GEMM used by the shorter prompt.
     model.set_chunked_prefill_size(8192)
     tokens = (tokens * (3200 // len(tokens) + 1))[:3200]
-    lengths = (2176, 2700, 3200)
+    lengths = (2176, 2700, 3200) + ((2177, 2208) if batched else ())
     reference = {}
     for length in lengths:
         model.set_save_history(False)
@@ -55,6 +55,20 @@ def check_page_aligned_forks(model, vocab, tokens):
         actual = generate(model, [tokens[:length]], 1, vocab, hits=hits)[0][1][0]
         np.testing.assert_array_equal(actual, reference[length])
     assert hits[0] == 0 and max(hits[1:]) > 0, hits
+    if batched:
+        # Resume partial pages after changing the batch shape. One token also
+        # exercises the singleton decode kernel used to finish a prompt.
+        for length in (2177, 2208):
+            primary = tokens[:length]
+            peers = [[(primary[0] + i) % vocab] + primary[1:] for i in (1, 2)]
+            model.set_save_history(False)
+            model.set_save_history(True)
+            cold = generate(model, [peers[0], primary, peers[1]], 1, vocab)
+            np.testing.assert_array_equal(cold[1][1][0], reference[length])
+            hits = []
+            restored = generate(model, [primary], 1, vocab, hits=hits)[0][1][0]
+            assert hits == [2176], hits
+            np.testing.assert_array_equal(restored, reference[length])
 
 
 def main():
@@ -75,11 +89,13 @@ def main():
     llm.set_cuda_graph(args.graph)
     llm.set_device_map({"cuda:0": 1})
     llm.set_device_map({args.experts: 1}, is_moe=True)
-    llm.set_max_tokens(4096)
+    batched_prefix = (args.prefix_cache and args.experts == "cuda:0" and
+                      args.kv_cache_dtype in ("auto", "float16") and args.atype != "float32")
+    llm.set_max_tokens(8192 if batched_prefix else 4096)
     model = llm.model(args.model, dtype="bfloat16", tokenizer_type="fastllm", kv_cache_dtype=args.kv_cache_dtype)
     if args.atype is not None:
         model.set_atype(args.atype)
-    model.set_max_batch(2)
+    model.set_max_batch(4 if batched_prefix else 2)
     tokenizer = Tokenizer.from_file(args.model + "/tokenizer.json")
     vocab = model.config["text_config"]["unpadded_vocab_size"]
     texts = ["The capital of France is", "1 + 1 ="]
@@ -129,7 +145,7 @@ def main():
                     print("cached fork", cached, "relative L2", float(relative_l2))
                     assert relative_l2 < 0.01, relative_l2
         if args.experts == "cuda:0":
-            check_page_aligned_forks(model, vocab, prompts[0] + prompts[1])
+            check_page_aligned_forks(model, vocab, prompts[0] + prompts[1], batched_prefix)
         model.set_save_history(False)
         hits = []
         generate(model, [forks[0]], 1, vocab, hits=hits)

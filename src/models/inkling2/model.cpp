@@ -1,6 +1,7 @@
 #include "inkling2.h"
 #include "json11.hpp"
 #include "utils/utils.h"
+#include "utils/recurrent_prefix_cache.h"
 #include <algorithm>
 #include <climits>
 
@@ -286,6 +287,7 @@ Inkling2Model::GetTensorMap(const std::vector<std::string> &names) {
 void Inkling2Model::OnModelWeightsLoaded() {
 #if defined(USE_CUDA) && !defined(USE_ROCM)
     runtime = inkling2::create(cfg, placement, *this, expertTensors);
+    prefillScheduling.chunked = SupportsChunkedPrefillScheduling();
 #else
     throw std::runtime_error("Inkling 2 Mini requires a CUDA build");
 #endif
@@ -355,7 +357,26 @@ void Inkling2Model::WarmUp() {
     if (runtime && (kvMemConfig.enabled || SupportsDecodePipeline() || (draftEnabled() && (tokensLimit > 0 || GetMaxTokens() > 0))))
         runtime->warmupDecodeGraph();
 }
+bool Inkling2Model::SupportsChunkedPrefillScheduling() const {
+    return runtime && placement.tensorDevices.size() <= 1 && dataType == BFLOAT16 && kvCacheDataType == FLOAT16 &&
+           !kvMemConfig.enabled && !expertTensors.empty() && expertTensors.begin()->second.ggmlType < 0 &&
+           std::all_of(placement.experts.begin(), placement.experts.end(),
+                       [](auto device) { return device == inkling2::ExpertDevice::Cuda; });
+}
+int Inkling2Model::GetChunkedPrefillSize() {
+    const int chunk = basellm::GetChunkedPrefillSize();
+    if (maxBatch <= 1 || !prefillScheduling.chunked || !saveHistoryChat || !SupportsChunkedPrefillScheduling()) return chunk;
+    const int interval = RecurrentPrefixInterval(GetPageLen());
+    // Yield at a boundary the recurrent model must already materialize. Keep
+    // the user's original grid when the chunk and checkpoint lengths differ in phase.
+    return chunk > interval && chunk % interval == 0 ? interval : chunk;
+}
+int Inkling2Model::GetBatchedPrefillTokenLimit() {
+    return std::max(basellm::GetChunkedPrefillSize(), basellm::GetBatchedPrefillTokenLimit());
+}
 int Inkling2Model::GetPrefillBatchKey(const ResponseContext &ctx, int chunkSize) const {
+    // The chunk scheduler accounts for restored pages and admits image prompts alone.
+    if (prefillScheduling.chunked && SupportsChunkedPrefillScheduling()) return saveHistoryChat ? 0 : -1;
     if (saveHistoryChat || ctx.prefillOffset || ctx.cacheLen || ctx.replayingKV || !ctx.multimodalInput.empty() ||
         ctx.currentTokens.size() > size_t(chunkSize)) return -1;
     return inkling2::pooledPromptKey(ctx.currentTokens.size(), ctx.generationConfig);

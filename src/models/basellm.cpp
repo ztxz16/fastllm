@@ -4125,7 +4125,7 @@ namespace fastllm {
                                     currentActivate++;
                                 }
 
-                                const bool scheduledPrefill = isPrompt && scheduling.chunked && it.second->multimodalInput.empty();
+                                const bool scheduledPrefill = isPrompt && batchPrefill && scheduling.chunked && it.second->multimodalInput.empty();
                                 const int chunkTokens = scheduledPrefill ? plannedTokens.at(it.first) : 0;
                                 generationConfigs.push_back(it.second->generationConfig);
                                 if (scheduledPrefill)
