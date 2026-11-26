@@ -46,8 +46,15 @@ Json::array MoePDExecute(ProcessGroup &group, const Json::array &requests, bool 
             initialize.targetRank = rank;
             group.PDStorage(initialize);
             auto usage = group.Qwen3KVUsages().at(rank);
-            output[rank] = Json::object{{"kv_cache_usage", usage.totalPages ? 1.0-double(usage.freePages)/usage.totalPages : 0.0},
-                {"workers", Json::array{Json::object{{"rank", 0}, {"total_pages", int(usage.totalPages)}, {"free_pages", int(usage.freePages)}}}};
+            const Json::object worker{
+                {"rank", 0},
+                {"total_pages", int(usage.totalPages)},
+                {"free_pages", int(usage.freePages)}
+            };
+            output[rank] = Json::object{
+                {"kv_cache_usage", usage.totalPages ? 1.0 - double(usage.freePages) / usage.totalPages : 0.0},
+                {"workers", Json::array{worker}}
+            };
         } else if (op == "cache") {
             output[rank] = Json::array{States(group).at(rank)};
         } else if (op == "sampling_end") {
