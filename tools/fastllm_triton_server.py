@@ -51,7 +51,7 @@ if triton is not None:
                                      past_offset, chain, sink_stride, gate_stride,
                                      H: tl.constexpr, G: tl.constexpr, PAGE: tl.constexpr,
                                      WINDOW: tl.constexpr, E: tl.constexpr, DECODE: tl.constexpr = False,
-                                     MAPPED: tl.constexpr = False):
+                                     MAPPED: tl.constexpr = False, FP8_KV: tl.constexpr = False):
         # Adapted from vLLM's Inkling _rel_attention_kernel, Apache-2.0.
         # Copyright contributors to the vLLM project.
         # https://github.com/vllm-project/vllm/blob/main/vllm/models/inkling2/nvidia/ops/attention_sm90.py
@@ -64,8 +64,9 @@ if triton is not None:
         tile, kv, req = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         desc = Visit + req.to(tl.int64) * chain * visit_bytes
         ptrs = desc.to(tl.pointer_type(tl.uint64))
-        key = tl.multiple_of(tl.load(ptrs).to(tl.pointer_type(tl.float16)), 16)
-        value = tl.multiple_of(tl.load(ptrs + 1).to(tl.pointer_type(tl.float16)), 16)
+        kv_type: tl.constexpr = tl.float8e4nv if FP8_KV else tl.float16
+        key = tl.multiple_of(tl.load(ptrs).to(tl.pointer_type(kv_type)), 16)
+        value = tl.multiple_of(tl.load(ptrs + 1).to(tl.pointer_type(kv_type)), 16)
         ids = tl.load(ptrs + 2).to(tl.pointer_type(tl.int32))
         page_info = (desc + 24).to(tl.pointer_type(tl.int32))
         first_page, page_len = tl.load(page_info), tl.load(page_info + 1)
@@ -5215,6 +5216,11 @@ def compile_inkling_window(payload):
     mapped = payload.get("mapped_pages", False)
     if mapped:
         base += "_mapped"
+    fp8_kv = payload.get("fp8_kv", False)
+    if fp8_kv:
+        if decode:
+            raise ValueError("FP8 KV requires the verification kernel")
+        base += "_fp8"
     cubin, meta = root / (base + ".cubin"), root / (base + ".json")
     if cubin.is_file() and meta.is_file():
         return json.loads(meta.read_text())
@@ -5228,7 +5234,7 @@ def compile_inkling_window(payload):
         pointers.update(Sink="*bf16", Gate="*bf16", Out="*fp32")
         constants["BN"] = max(16, triton.next_power_of_2(triton.cdiv(window, splits)))
     elif not decode:
-        constants["DECODE"] = False
+        constants.update(DECODE=False, FP8_KV=fp8_kv)
     kernel = _compile_cubin(function,
                             {**pointers, **strides, **dict.fromkeys(constants, "constexpr")},
                             constants, arch, 4, 2, cubin)

@@ -96,7 +96,7 @@ __device__ __forceinline__ void verifySegment(VerifyPrefillParams p, const Decod
 
 #include "window-verify.cuh"
 
-template<class Traits, bool RegisterQuery = false>
+template<class Traits, bool RegisterQuery = false, bool Fp8KV = false>
 __global__ __launch_bounds__(Traits::NUM_THREADS) void pagedVerifyAttention(VerifyPrefillParams p) {
     cuda_launch::DependencyStart();
     const int group = p.group_size;
@@ -125,7 +125,7 @@ __global__ __launch_bounds__(Traits::NUM_THREADS) void pagedVerifyAttention(Veri
             // every canonical partition in the same order within each partial.
             const int length = visit.past - part.origin + part.end;
             for (int s = split; s * int64_t(part.chunk) < length; s += gridDim.y) {
-                scanVerifyTile<Traits>(p, p.visits[first + row], first + row, part.end - row, tile, s, part, blockIdx.z, gridDim.z);
+                scanVerifyTile<Traits, Fp8KV>(p, p.visits[first + row], first + row, part.end - row, tile, s, part, blockIdx.z, gridDim.z);
                 if (s + gridDim.y <= (length - 1) / part.chunk) __syncthreads();
             }
         }
@@ -252,7 +252,7 @@ void captureWindowRanges(int requests, int minRequests, Launch launch) {
 }
 #endif
 
-template<class Act>
+template<bool Fp8KV = false, class Act>
 void launchVerifyAttention(const AttentionRow &a, const Matrix &scratch, const Act *sink, const Act *gate,
                         Act *out, int rows, int chain, int maxSplits, int smCount, int minTiles, bool pipelineDecode = false, bool verifyPipeline = false) {
     VerifyPrefillParams p{};
@@ -277,13 +277,13 @@ void launchVerifyAttention(const AttentionRow &a, const Matrix &scratch, const A
     p.window_left = a.window ? a.window - 1 : -1;
     p.partition_kv = true;
 #if CUDART_VERSION >= 12080
-    if (verifyPipeline) {
+    if (verifyPipeline || Fp8KV) {
         const int tiles = (chain * group + VerifyTraits::CTA_TILE_Q - 1) / VerifyTraits::CTA_TILE_Q;
         const int requests = rows / chain;
         const dim3 block(32, VerifyTraits::NUM_WARPS_Q);
         const int warpBlocks = (a.heads + 3) / 4;
         const bool warpMerge = int64_t(warpBlocks) * rows >= smCount;
-        const bool registerQuery = chain > 1 && int64_t(requests) * tiles * a.kvHeads >= smCount;
+        const bool registerQuery = Fp8KV || (chain > 1 && int64_t(requests) * tiles * a.kvHeads >= smCount);
         auto launch = [&](int first, int count) {
             const size_t row = size_t(first) * chain;
             auto range = p;
@@ -296,10 +296,10 @@ void launchVerifyAttention(const AttentionRow &a, const Matrix &scratch, const A
             bool launched;
             if (registerQuery && !a.window) {
                 grid.y = std::min(maxSplits, 16);
-                launched = cuda_launch::Launch<pagedVerifyAttention<GlobalVerifyTraits, true>>(grid, block,
+                launched = cuda_launch::Launch<pagedVerifyAttention<GlobalVerifyTraits, true, Fp8KV>>(grid, block,
                     2 * verifyTileVectors * sizeof(uint4), cudaStreamPerThread, range);
             } else if (registerQuery) {
-                launched = cuda_launch::Launch<pagedVerifyAttention<WindowVerifyTraits, true>>(grid, block,
+                launched = cuda_launch::Launch<pagedVerifyAttention<WindowVerifyTraits, true, Fp8KV>>(grid, block,
                     2 * verifyTileVectors * sizeof(uint4), cudaStreamPerThread, range);
             } else if (a.window) {
                 if (chain > 1 && uint64_t(grid.x) * grid.y * grid.z <= smCount) grid.y *= 2;

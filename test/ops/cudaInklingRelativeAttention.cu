@@ -87,8 +87,9 @@ void compareVerifyChain(AttentionRow a, PageView pages, std::vector<int2> ids, i
     check(cudaMemcpy(expected.data(), single.p, expected.size() * sizeof(float), cudaMemcpyDeviceToHost));
     if (std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)))
         throw std::runtime_error("Verification attention differs from standalone decode");
-    if constexpr (D == 128 && std::is_same_v<T, half>) {
-        if (!a.window && configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention<VerifyTraits>)) {
+    constexpr bool fp8KV = std::is_same_v<T, __nv_fp8_e4m3>;
+    if constexpr (D == 128 && (std::is_same_v<T, half> || fp8KV)) {
+        if ((fp8KV || !a.window) && configurePrefillKernel<VerifyTraits, VerifyPrefillParams>(pagedVerifyAttention<VerifyTraits>)) {
             int device, smCount;
             check(cudaGetDevice(&device));
             check(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
@@ -103,6 +104,30 @@ void compareVerifyChain(AttentionRow a, PageView pages, std::vector<int2> ids, i
             }
             auto q = upload(packed);
             a.q = reinterpret_cast<const float *>(q.p);
+            if constexpr (fp8KV) {
+#if CUDART_VERSION >= 12080
+                if (supportsGlobalRelativeSm120(device)) {
+                    launchVerifyAttention<true>(a, batchScratch, sink, gate, batched.p, rows, chain, splits,
+                                                smCount, VerifyPartition::minTiles, false, true);
+                    check(cudaMemcpy(actual.data(), batched.p, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                    double diff = 0., norm = 0.;
+                    for (size_t j = 0; j < actual.size(); ++j) {
+                        if (descriptors[j / width].verifyRemaining <= 0) {
+                            if (actual[j] != 0.f) throw std::runtime_error("FP8 padded verification row is nonzero");
+                            continue;
+                        }
+                        diff += std::pow(double(actual[j]) - expected[j], 2);
+                        norm += std::pow(double(expected[j]), 2);
+                    }
+                    if (!(diff <= norm * 1e-8)) {
+                        fprintf(stderr, "FP8 tiled verification: window=%d past=%d chain=%d relL2=%.4g\n",
+                                a.window, past, chain, std::sqrt(diff / norm));
+                        throw std::runtime_error("FP8 tiled verification differs from decode");
+                    }
+                }
+#endif
+                return;
+            }
             launchVerifyAttention(a, batchScratch, sink, gate, batched.p, rows, chain, splits, smCount, VerifyPartition::minTiles);
             for (int r = 0; r < rows; ++r) {
                 auto one = a;
@@ -513,6 +538,8 @@ int testRelative() {
     // Span different split grains and more than one query tile, including clipped padding.
     compare<128, half>(3, 28 * 128 - 4, 46, 0, 37, true, 28, true, sm120 ? 26 : 0, false, 23);
     if (sm120) {
+        compare<128, __nv_fp8_e4m3>(3, 6013, 16, 0, 16, true, 54, true, 0, false, 8);
+        compare<128, __nv_fp8_e4m3>(3, 1039, 46, 1024, 16, true, 28, true, 0, false, 23);
         // Force more than 32 active splits and replay split slots past the launch grid.
         compare<128, half>(3, 6013, 16, 0, 16, true, 54, true, 26, false, 8);
         // Partial warp tiles, a partially filled last split, odd page sizes,

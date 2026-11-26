@@ -926,7 +926,12 @@ class Decoder final : public Runtime {
             const auto projected = projection.views();
             Rows<T> attended(projection.storage.rows, c.heads * d);
             const int queries = batch.front().timeline ? attended.rows : 1;
-            const bool usePagedVerify = !sparse && verifyAttentionSplits > 0 && std::is_same_v<KV, half>;
+            // FP8 shares the register-tiled verification scan when request/KV-head
+            // parallelism fills the device. Single-row decode keeps its own dispatch.
+            constexpr bool fp8KV = std::is_same_v<KV, __nv_fp8_e4m3>;
+            const bool fullFp8Verify = fp8KV && pagedDecodePdl && batch.front().timeline &&
+                batch.front().length > 1 && int64_t(batch.size()) * c.kvHeads >= smCount;
+            const bool usePagedVerify = !sparse && verifyAttentionSplits > 0 && (std::is_same_v<KV, half> || fullFp8Verify);
             // One window query can spread its KV tiles across more SMs. A speculative
             // target keeps the same partitions for both singleton and chain evaluation.
             const int minTiles = window && !usesVerifyArithmetic(batch) ? 1 : VerifyPartition::minTiles;
@@ -959,11 +964,11 @@ class Decoder final : public Runtime {
                                   param(att + (local ? "v_sconv.weight" : "v_sconv.static_w"), k * c.conv),
                                   static_cast<const float *>(table.cudaData), c.heads, c.kvHeads, d, c.relative,
                                   c.extent, c.conv, c.qClip, c.rClip, c.eps};
-                if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<KV, half>) {
+                if constexpr (std::is_same_v<T, __nv_bfloat16> && (std::is_same_v<KV, half> || fp8KV)) {
                     if (compact) {
                         // The prologue writes BF16 query and key-ordered biases. Each CTA in the
                         // consumer owns its complete window, including sink and output gating.
-                        if (launchCompactWindow(in, visit, slot, queries, chain, attended.p)) return;
+                        if (launchCompactWindow<KV>(in, visit, slot, queries, chain, attended.p)) return;
                         q = Matrix(queries, c.heads * d);
                         bias = Matrix(queries * c.heads, c.extent);
                         scratch = Matrix(splits, splitScratch.cols * queries);
@@ -1022,7 +1027,7 @@ class Decoder final : public Runtime {
                     else
                         launchSplitRelative<128, KV>(args, partial, sink.data, gate.data, attended.p);
                 } else if (usePagedVerify) {
-                    launchVerifyAttention(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
+                    launchVerifyAttention<fp8KV>(args, scratch, sink.data, gate.data, attended.p + size_t(row) * attended.cols,
                                        queries, batch.front().timeline ? batch.front().length : 1, splits, smCount, minTiles, pipelineAttention, batch.front().timeline && pagedDecodePdl);
                 } else if (d == 128) launchSplitRelative<128, KV>(args, scratch, sink.data, gate.data,
                                                           attended.p + size_t(row) * attended.cols, sm120GlobalSplits,

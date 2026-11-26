@@ -6,7 +6,7 @@ struct InklingWindowKernel {
     int shared = 0;
 };
 InklingWindowKernel PrepareInklingWindowKernel(int heads, int group, int window, int extent, int page,
-                                              bool decode = false, int splits = 1, bool mappedPages = false);
+                                              bool decode = false, int splits = 1, bool mappedPages = false, bool fp8KV = false);
 }
 
 extern "C" void *FastllmCudaLoadWindowVerify(const char *cubin, const char *name, int shared);

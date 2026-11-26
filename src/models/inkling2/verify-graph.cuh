@@ -132,7 +132,7 @@ bool timelineCompatible(int batch) const {
            int64_t(batch) * (c.draft.steps + 1) <= 65535;
 }
 
-bool launchCompactWindow(RelativeInputs<__nv_bfloat16> in, const DecodeVisit *visit, size_t slot,
+template<class KV> bool launchCompactWindow(RelativeInputs<__nv_bfloat16> in, const DecodeVisit *visit, size_t slot,
                          int queries, int chain, __nv_bfloat16 *out) {
     const auto &sink = in.sources.items[3], &gate = in.sources.items[2];
     in.windowTable = windowTables[c.visits[slot]].p;
@@ -146,7 +146,7 @@ bool launchCompactWindow(RelativeInputs<__nv_bfloat16> in, const DecodeVisit *vi
         offsetof(PageView, value) == 8 && offsetof(PageView, ids) == 16 &&
         offsetof(PageView, first) == 24 && offsetof(PageView, pageLen) == 28 &&
         offsetof(DecodeVisit, verifyRemaining) == offsetof(DecodeVisit, past) + sizeof(int));
-    return cuda_launch::Launch<prepareRelative<half, true, true, __nv_bfloat16, true, 16, true>>(
+    return cuda_launch::Launch<prepareRelative<KV, true, true, __nv_bfloat16, true, 16, true>>(
             grid, threads, 0, cudaStreamPerThread, visit, in, tiles, narrowQ.p, narrowBias.p, chain) &&
         FastllmCudaLaunchWindowVerify(*compactWindow, (chain + tokensPerTile - 1) / tokensPerTile,
             c.kvHeads, queries / chain, visit, narrowQ.p, narrowBias.p, sink.data, gate.data,
@@ -156,10 +156,10 @@ bool launchCompactWindow(RelativeInputs<__nv_bfloat16> in, const DecodeVisit *vi
 // Resolve the optional kernel and pack each physical layer's table before
 // warming the first sufficiently large plan. All subsequent captures share them.
 void prepareWindowVerification(int batch) {
-    if (compactWindow || kvType != FLOAT16 || !backboneBf16 || !pagedDecodePdl || c.relative != 16 || c.headDim != 128 ||
+    if (compactWindow || (kvType != FLOAT16 && kvType != FP8_E4M3) || !backboneBf16 || !pagedDecodePdl || c.relative != 16 || c.headDim != 128 ||
         c.conv != 4 || c.kvHeads <= 0 || c.heads % c.kvHeads || int64_t(batch) * c.kvHeads < smCount)
         return;
-    auto kernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen(), false, 1, model.kvMemConfig.enabled);
+    auto kernel = PrepareInklingWindowKernel(c.heads, c.heads / c.kvHeads, c.window, c.extent, GetPageLen(), false, 1, model.kvMemConfig.enabled, kvType == FP8_E4M3);
     if (kernel.handle) {
         std::vector<Buffer<__nv_bfloat16>> tables(c.layers);
         for (int layer = 0; layer < c.layers; ++layer) {

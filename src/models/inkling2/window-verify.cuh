@@ -4,16 +4,30 @@
 using VerifyTileMemory = flashinfer::smem_t<flashinfer::SwizzleMode::k128B>;
 constexpr int verifyTileVectors = 32 * 128 / 8;
 
+template<bool Fp8KV>
 __device__ __forceinline__ void stageVerifyKV(const PageView &pages, int begin, int end,
         int kvHead, int kvHeads, VerifyTileMemory key, VerifyTileMemory value) {
     const int thread = threadIdx.y * 32 + threadIdx.x, col = thread % 16;
     const size_t pageStride = size_t(pages.pageLen) * kvHeads * 128;
     auto issue = [&](int row, int2 id, size_t column) {
         const unsigned offset = VerifyTileMemory::get_permuted_offset<16>(row, col);
-        key.load_128b_async<flashinfer::SharedMemFillMode::kNoFill>(offset,
-            pages.pageBase<half>(id, false, pageStride) + column, begin + row < end);
-        value.load_128b_async<flashinfer::SharedMemFillMode::kFillZero>(offset,
-            pages.pageBase<half>(id, true, pageStride) + column, begin + row < end);
+        if constexpr (Fp8KV) {
+            // Expand eight cached E4M3 channels directly into the MMA tile.
+            auto stage = [&](VerifyTileMemory tile, bool isValue) {
+                flashinfer::vec_t<half, 8> v;
+                if (begin + row < end)
+                    v.cast_load(pages.pageBase<__nv_fp8_e4m3>(id, isValue, pageStride) + column);
+                else v.fill(half(0.f));
+                v.store(reinterpret_cast<half *>(tile.base + offset));
+            };
+            stage(key, false);
+            stage(value, true);
+        } else {
+            key.load_128b_async<flashinfer::SharedMemFillMode::kNoFill>(offset,
+                pages.pageBase<half>(id, false, pageStride) + column, begin + row < end);
+            value.load_128b_async<flashinfer::SharedMemFillMode::kFillZero>(offset,
+                pages.pageBase<half>(id, true, pageStride) + column, begin + row < end);
+        }
     };
     // Canonical 32-key tiles begin on a page boundary with 16-token pages.
     // Fetch the two page IDs once for all eight transfers issued by each lane.
@@ -36,10 +50,10 @@ __device__ __forceinline__ void stageVerifyKV(const PageView &pages, int begin, 
             issue(row, id, column);
         }
     }
-    flashinfer::cp_async::commit_group();
+    if constexpr (!Fp8KV) flashinfer::cp_async::commit_group();
 }
 
-template<class Traits>
+template<class Traits, bool Fp8KV>
 __device__ __forceinline__ void scanVerifyTile(VerifyPrefillParams p, const DecodeVisit &visit,
         int first, int rows, int tile, int split, const VerifyPartition &part, int kvHead, int kvHeads) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -75,8 +89,8 @@ __device__ __forceinline__ void scanVerifyTile(VerifyPrefillParams p, const Deco
     float output[1][8][8], maximum[1][2], denominator[1][2];
     flashinfer::init_states<Traits>(relative, output, maximum, denominator);
     for (int token = begin; token < end; token += 32) {
-        stageVerifyKV(visit.pages, part.origin + token, part.origin + end, kvHead, kvHeads, key, value);
-        flashinfer::cp_async::wait_group<0>();
+        stageVerifyKV<Fp8KV>(visit.pages, part.origin + token, part.origin + end, kvHead, kvHeads, key, value);
+        if constexpr (!Fp8KV) flashinfer::cp_async::wait_group<0>();
         __syncthreads();
         float score[1][2][8]{};
 #pragma unroll
