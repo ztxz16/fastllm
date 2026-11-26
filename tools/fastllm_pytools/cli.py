@@ -87,6 +87,10 @@ def args_parser():
     add_server_args(server_parser)
     server_parser_ = subparsers.add_parser('serve', parents = [server_parser], help = 'api模式')
     serve_parser_ = subparsers.add_parser('server', parents = [server_parser], help = 'api模式')
+    from .pd.cli import add_router, add_service_args
+    add_service_args(server_parser_)
+    add_service_args(serve_parser_)
+    add_router(subparsers)
 
     config_parser_ = subparsers.add_parser('config', help = '创建配置文件')
     config_parser_.add_argument('file', nargs='?', help = '配置文件的路径')
@@ -102,6 +106,12 @@ def args_parser():
 
 def main():
     args = args_parser().parse_args()
+    if args.command == 'router':
+        from .pd.cli import run_router
+        return run_router(args)
+    if args.command in ('serve', 'server') and (args.role != 'full' or args.router_managed):
+        from .pd.cli import run_service
+        return run_service(args)
     if (args.version):
         from . import __version__
         print("ftllm version: " + __version__)

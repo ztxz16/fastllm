@@ -91,6 +91,11 @@ public:
     /** 同步销毁请求 Graph 并释放固定工作区及 KV；保留累计执行计数，允许重复调用。 */
     void EndRequest();
 
+    /** 准备、导出、提交或解除 KV 占用；调用者必须先验证交接身份，并等待在途访问结束。 */
+    std::vector<PDRegion> PDStorage(const PDCommand &command);
+    /** 在预先分配的页中生成 KV；层完成通知只携带 key/rank/layer，不承载 KV。 */
+    void PDPrefill(const std::vector<uint32_t> &tokens, uint64_t key, const std::string &notifyPath);
+
     /** 同步清空前缀索引；保留命中计数及活动请求页引用，不破坏正在使用的KV或Graph。 */
     void ClearPrefixCache(int layer = -1);
 

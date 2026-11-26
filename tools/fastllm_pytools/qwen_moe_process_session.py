@@ -13,6 +13,7 @@ import threading
 import time
 
 from .qwen3_process_chat import validate_request
+from .qwen3_limits import MAX_CONTEXT_TOKENS
 from .qwen3_process_session import (Qwen3ProcessSession, GenerationCancelled,
                                     GenerationObserverError)
 from .tp_process_utils import isolated_process, wait_case
@@ -99,7 +100,7 @@ class QwenMoeProcessSession:
     """/** 每 rank 一个请求，所有专家协同执行；队列、回调及取消不阻塞其他 rank。 */"""
 
     def __init__(self, binary, worker, model, devices, output, *, timeout=1800, trace=False,
-                 cuda_graph=False, prefix_cache=False, routing='round_robin', queue_size=8,
+                 cuda_graph=False, prefix_cache=False, routing='load', queue_size=8,
                  request_log=True, environment=None, trace_token_positions=None, batch_invariant=False):
         if trace_token_positions is not None:
             if (not trace or not isinstance(trace_token_positions, (list, tuple)) or
@@ -107,7 +108,7 @@ class QwenMoeProcessSession:
                     len(set(trace_token_positions)) != len(trace_token_positions)):
                 raise ValueError('trace_token_positions requires trace and unique positive 1-based positions')
             trace_token_positions = frozenset(trace_token_positions)
-        if routing not in ('round_robin', 'prefix') or (routing == 'prefix' and not prefix_cache):
+        if routing not in ('round_robin', 'prefix', 'load') or (routing == 'prefix' and not prefix_cache):
             raise ValueError('prefix routing requires prefix cache')
         if type(queue_size) is not int or queue_size < 1:
             raise ValueError('queue_size must be positive')
@@ -175,6 +176,16 @@ class QwenMoeProcessSession:
                 raise ValueError('Attention DP/EP request queue is full')
             self._job_id += 1
             job['id'] = self._job_id
+            if self.routing == 'load':
+                order = sorted(range(self.concurrency), key=lambda rank: (rank - self._cursor) % self.concurrency)
+                def score(rank):
+                    waiting = sum(item.get('assigned_rank') == rank for item in self._pending)
+                    active = self._slots[rank]
+                    used = len(active['request']['token_ids']) + max(0, len(active['tokens']) - 1) if active else 0
+                    usage = used / float(MAX_CONTEXT_TOKENS)
+                    return waiting + int(active is not None) + waiting * 6 * max(0.0, usage - 0.5)
+                job['assigned_rank'] = min(order, key=score)
+                self._cursor = (job['assigned_rank'] + 1) % self.concurrency
             self._pending.append(job)
             self._condition.notify_all()
         try:
@@ -269,8 +280,15 @@ class QwenMoeProcessSession:
                     self._finish(job)
             free = [i for i, job in enumerate(self._slots) if job is None]
             while free and self._pending and not self._clear and not self._stopping:
-                job = self._pending.popleft()
-                rank = self._rank(free, job['request'])
+                if self.routing == 'load':
+                    job = next((item for item in self._pending if item['assigned_rank'] in free), None)
+                    if job is None:
+                        break
+                    self._pending.remove(job)
+                    rank = job['assigned_rank']
+                else:
+                    job = self._pending.popleft()
+                    rank = self._rank(free, job['request'])
                 free.remove(rank)
                 self._slots[rank] = job
                 job['rank'], job['queue_ms'] = rank, (time.monotonic() - job['start']) * 1000

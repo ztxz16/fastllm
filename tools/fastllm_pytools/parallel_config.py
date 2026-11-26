@@ -18,8 +18,19 @@ def is_attention_ep(args):
      * 识别共享设备的 Attention DP/EP；1/1 由本地模型类型消除与旧模式的歧义。
      * 只读 config.json，不导入模型库、读取权重或建立 CUDA context。
      * @param args 已完成整数类型检查的并行参数。
-     * @return 新轴大于 1 或进程后端的本地模型为 qwen2_moe 时返回 True。
+     * @return 显式 ep 或原有自动识别选择 EP 时返回 True；显式 tp 保留普通副本路径。
      */"""
+    mode = getattr(args, 'moe_parallel_mode', 'auto')
+    if mode not in ('auto', 'tp', 'ep'):
+        raise ValueError('--moe-parallel-mode must be auto, tp or ep')
+    if mode == 'tp':
+        if getattr(args, 'attention_dp', 1) != 1 or getattr(args, 'ep', 1) != 1:
+            raise ValueError('--moe-parallel-mode tp cannot combine with Attention DP/EP > 1')
+        if getattr(args, 'tp_backend', 'thread') != 'process':
+            raise ValueError('--moe-parallel-mode tp requires process backend')
+        return False
+    if mode == 'ep':
+        return True
     if getattr(args, 'attention_dp', 1) > 1 or getattr(args, 'ep', 1) > 1:
         return True
     if getattr(args, 'tp_backend', 'thread') != 'process':
@@ -37,12 +48,12 @@ def is_attention_ep(args):
 
 
 def resolve_dp_routing(args):
-    """/** 未指定策略时仅普通进程DP使用load；保留单副本和Attention DP/EP默认行为。 */"""
+    """/** 普通进程 DP 和 Attention DP/EP 默认按负载评分；显式配置优先。 */"""
     value = getattr(args, 'dp_routing', None)
     if value is not None:
         return value
-    return 'load' if (getattr(args, 'dp', 1) > 1 and getattr(args, 'tp_backend', 'thread') == 'process'
-                      and not is_attention_ep(args)) else 'round_robin'
+    return 'load' if (getattr(args, 'tp_backend', 'thread') == 'process' and
+                      (getattr(args, 'dp', 1) > 1 or is_attention_ep(args))) else 'round_robin'
 
 
 def cuda_inventory():
@@ -125,8 +136,8 @@ def validate_parallel_options(args, *, planning=False):
     routing = resolve_dp_routing(args)
     if type(routing) is not str or routing not in ('round_robin', 'prefix', 'load'):
         raise ValueError('--dp-routing must be round_robin, prefix or load')
-    if routing == 'load' and (dp <= 1 or attention_ep or backend != 'process'):
-        raise ValueError('--dp-routing load requires ordinary DP>1 and --tp-backend process')
+    if routing == 'load' and (backend != 'process' or (dp <= 1 and not attention_ep)):
+        raise ValueError('--dp-routing load requires DP>1 or Attention DP/EP with process backend')
     if routing == 'prefix' and ((dp <= 1 and not attention_ep) or backend != 'process' or getattr(args, 'prefix_cache', '') != 'true'):
         raise ValueError('--dp-routing prefix requires DP>1 or Attention DP/EP, --tp-backend process and --prefix-cache true')
     request_log = getattr(args, 'tp_request_log', 'on')

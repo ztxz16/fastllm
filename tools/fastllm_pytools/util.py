@@ -505,6 +505,8 @@ def make_normal_parser(des: str, add_help = True) -> argparse.ArgumentParser:
                         help='Attention请求rank数；Qwen MoE进程模式要求与ep相等，支持1/2/4')
     parser.add_argument('--ep', type=_positive_int, default=1,
                         help='专家分片数；与attention-dp共用GPU，要求dp=tp=1')
+    parser.add_argument('--moe-parallel-mode', choices=['auto', 'tp', 'ep'], default='auto',
+                        help='Qwen2 MoE执行方式；tp选择普通DP×TP，ep选择Attention DP/EP；auto保留原有识别')
     parser.add_argument('--dp-routing', choices=['round_robin', 'prefix', 'load'], default=None,
                         help='普通进程DP默认load：按请求数和KV压力排队；其它模式默认round_robin；prefix要求前缀缓存')
     parser.add_argument('--parallel-plan', action='store_true',
@@ -627,7 +629,7 @@ def load_model_args(args):
                     raise ValueError('model options must be a JSON object without private keys')
                 if set(args_config) & {'command', 'version'}:
                     raise ValueError('model options cannot override the CLI command or version flag')
-                for alias in ('parallel-plan', 'attention-dp'):
+                for alias in ('parallel-plan', 'attention-dp', 'moe-parallel-mode'):
                     canonical = alias.replace('-', '_')
                     if alias in args_config:
                         if canonical in args_config:

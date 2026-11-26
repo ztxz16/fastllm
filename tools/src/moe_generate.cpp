@@ -99,6 +99,8 @@ Json::array States(ProcessGroup &group) {
     return graph;
 }
 
+#include "pd_moe.h"
+
 /**
  * 串行处理联合轮次；准入选择由 Python 队列负责，前向、通信及采样在原生进程执行。
  * @param group 已加载完整 MoE 权重的进程组。
@@ -110,12 +112,20 @@ Json::array States(ProcessGroup &group) {
 void Serve(ProcessGroup &group, Channel &channel, size_t world, bool graph, int timeout) {
     std::vector<Qwen3GenerationOptions> sampling(world);
     std::vector<std::mt19937> random(world);
+    std::map<std::string, std::mt19937> pdRandom;
     Json message;
     uint32_t expected = 1;
     while (channel.Read(message)) {
         const auto id = Integer(message["id"]);
         if (id != expected++) throw std::runtime_error("MoE round ID mismatch");
         auto op = message["op"].string_value();
+        if (op == "pd") {
+            if (!message["requests"].is_array() || message["requests"].array_items().size() != world)
+                throw std::runtime_error("MoE PD requires one command slot per rank");
+            auto results = MoePDExecute(group, message["requests"].array_items(), graph, timeout, pdRandom);
+            channel.Write(Json::object{{"id", static_cast<long long>(id)}, {"status", "PASS"}, {"results", results}});
+            continue;
+        }
         if (op == "shutdown") {
             group.EndQwen3Request();
             group.UnloadQwen3();
@@ -236,7 +246,7 @@ int main(int argc, char **argv) {
         channel.Write(Json::object{{"event", "ready"}, {"status", "PASS"}, {"protocol", 1},
             {"backend", "qwen_moe_attention_dp_ep"}, {"model_load_count", 1}, {"workers", workers},
             {"batch_invariant", mode},
-            {"cancellation", "round_boundary"}, {"token_events", true}, {"states", States(group)}});
+            {"cancellation", "round_boundary"}, {"token_events", true}, {"pd_storage_protocol", 1}, {"states", States(group)}});
         Serve(group, channel, options.devices.size(), options.cudaGraph, timeout);
         return 0;
     } catch (const std::exception &error) {

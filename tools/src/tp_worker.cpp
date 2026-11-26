@@ -1,6 +1,7 @@
 #include "distributed/qwen3_limits.h"
 #include "distributed/batch_invariant.h"
 #include "distributed/process_protocol.h"
+#include "distributed/pd_protocol.h"
 
 #include <algorithm>
 #include <climits>
@@ -332,11 +333,18 @@ struct DeviceRuntime {
             step.positionBegin = Get32(payload, offset + 8);
             const uint32_t count = Get32(payload, offset + 12);
             offset += 16;
-            if (uint32_t(step.action) > 3 || count > 2048 || offset > payload.size() ||
+            if (uint32_t(step.action) > 5 || count > 2048 || offset > payload.size() ||
                 count > (payload.size() - offset)/4 || (graph && step.action == QwenMoeAction::Begin)) {
                 throw std::runtime_error("invalid joint MoE rank payload");
             }
             for (uint32_t i = 0; i < count; ++i, offset += 4) step.tokenIds.push_back(Get32(payload, offset));
+            step.transferKey = Get64(payload, offset);
+            const auto pathLength = Get32(payload, offset + 8);
+            offset += 12;
+            if (pathLength > 107 || offset > payload.size() || pathLength > payload.size() - offset)
+                throw std::runtime_error("invalid prepared MoE notification path");
+            step.notifyPath.assign(payload.begin() + offset, payload.begin() + offset + pathLength);
+            offset += pathLength;
             if (peer == rank) local = std::move(step);
         }
         if (offset != payload.size()) throw std::runtime_error("trailing joint MoE payload");
@@ -432,6 +440,42 @@ struct DeviceRuntime {
         return result;
 #else
         throw std::runtime_error("worker built without CUDA");
+#endif
+    }
+
+    /** 执行服务已授权的 PD 存储调用；与 TP/EP 的计算消息保持明确的命令边界。 */
+    std::vector<uint8_t> PDStorage(const std::vector<uint8_t> &payload) {
+        auto command = DecodePD(payload);
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (!weights || controlOnly) throw std::runtime_error("PD storage requires loaded CUDA workers");
+        if (command.targetRank < -1 || command.targetRank >= weights->Plan().worldSize)
+            throw std::runtime_error("invalid PD target rank");
+        if (command.targetRank >= 0 && command.targetRank != weights->Plan().rank) return EncodePDRegions({});
+        if (!layerExecutor) layerExecutor = std::make_unique<fastllm::distributed::Qwen3LayerExecutor>(
+            *weights, stream, comm, *allReduce, cudaGraph, prefixCache, batchInvariant);
+        return EncodePDRegions(layerExecutor->PDStorage(command));
+#else
+        throw std::runtime_error("PD storage requires CUDA");
+#endif
+    }
+
+    /** Prefill 的逐层控制通知使用独立本地数据报；KV 仍通过 CUDA IPC 传输。 */
+    void PDPrefill(const std::vector<uint8_t> &payload) {
+        if (payload.size() < 16) throw std::runtime_error("invalid PD Prefill header");
+        auto key = Get64(payload, 0);
+        auto length = Get32(payload, 8), count = Get32(payload, 12);
+        if (!key || !length || length > 107 || !count || count > fastllm::distributed::kQwen3MaxPromptTokens ||
+            payload.size() != 16ULL + length + 4ULL * count)
+            throw std::runtime_error("invalid PD Prefill payload");
+        std::string path(payload.begin() + 16, payload.begin() + 16 + length);
+        if (path.find('\0') != std::string::npos) throw std::runtime_error("invalid PD notification path");
+        std::vector<uint32_t> tokens;
+        for (size_t i = 0; i < count; ++i) tokens.push_back(Get32(payload, 16 + length + 4 * i));
+#ifdef FASTLLM_PROCESS_TP_CUDA
+        if (!layerExecutor || controlOnly) throw std::runtime_error("PD Prefill requires prepared executor");
+        layerExecutor->PDPrefill(tokens, key, path);
+#else
+        throw std::runtime_error("PD Prefill requires CUDA");
 #endif
     }
 
@@ -648,13 +692,23 @@ int main(int argc, char **argv) {
             std::vector<uint8_t> payload;
             if (message.kind != Kind::Initialize && message.kind != Kind::LoadQwen3 &&
                 message.kind != Kind::LoadQwenMoe && message.kind != Kind::ForwardMoeLayer &&
-                message.kind != Kind::StepMoe &&
+                message.kind != Kind::StepMoe && message.kind != Kind::PDStorage && message.kind != Kind::PDPrefill &&
                 message.kind != Kind::ReadWeight && message.kind != Kind::ForwardLayer &&
                 message.kind != Kind::PrefillQwen3 && message.kind != Kind::BeginQwen3Request &&
                 message.kind != Kind::DecodeQwen3 && message.kind != Kind::AllReduce && !message.payload.empty()) {
                 throw std::runtime_error("unexpected worker command payload");
             }
             switch (message.kind) {
+                case Kind::PDPrefill:
+                    if (!initialized) throw std::runtime_error("PD Prefill before Initialize");
+                    runtime.PDPrefill(message.payload);
+                    response = Kind::PDPrefillDone;
+                    break;
+                case Kind::PDStorage:
+                    if (!initialized) throw std::runtime_error("PD storage before Initialize");
+                    payload = runtime.PDStorage(message.payload);
+                    response = Kind::PDStorageResult;
+                    break;
                 case Kind::StepMoe:
                     if (!initialized) throw std::runtime_error("MoE round before Initialize");
                     payload = runtime.StepMoe(rank, world, message.payload);

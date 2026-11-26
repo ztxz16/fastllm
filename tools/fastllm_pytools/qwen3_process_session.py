@@ -380,6 +380,20 @@ class Qwen3ProcessSession:
             self._observer_error = None
             self._lock.release()
 
+    def pd_command(self, request):
+        """/** 调用原生 PD 存储或计算入口；只供持有副本调度权的本地交接服务使用。 */"""
+        with self._lock:
+            if self.state != "ready" or self.ready.get("pd_storage_protocol") != 1:
+                raise RuntimeError("native worker does not support PD storage protocol 1")
+            try:
+                result = self._exchange({"id": self._next_id, "op": "pd", "request": request})
+                if result.get("event") != "pd_result" or result.get("status") != "PASS":
+                    raise RuntimeError("invalid native PD response")
+                return result["result"]
+            except BaseException:
+                self._dispose("failed")
+                raise
+
     def prefix_directory(self):
         """/** 返回最近一次已校验的原生目录副本；调用方独占副本时使用，不查询GPU或推测缓存。 */"""
         if self.state != 'ready' or not self.prefix_cache or not self._graph_state:
