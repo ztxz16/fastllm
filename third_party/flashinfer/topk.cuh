@@ -69,7 +69,7 @@ __device__ __forceinline__ int ld_acquire(int* ptr) {
   // Acquire pattern using acquire modifier
   asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
 #else
-  asm volatile("ld.cg.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
+  asm volatile("ld.volatile.global.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr) : "memory");
 #endif
 
   return state;
@@ -129,6 +129,11 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val, int thread_idx
 #pragma unroll 1
     while (ld_acquire(ptr) < target_val) {
     }
+#if __CUDA_ARCH__ < 700
+    // Pair the observed arrival with the publisher's device fence before the
+    // other warps consume this round's histogram.
+    __threadfence();
+#endif
   }
   __syncthreads();
 }
@@ -173,6 +178,10 @@ inline RadixDeterministicCollectScratch* MaybeGetRadixDeterministicCollectScratc
  */
 __device__ __forceinline__ void AdvanceRadixGroupBarrier(RadixRowState* state, int& barrier_phase,
                                                          uint32_t ctas_per_group, uint32_t tx) {
+#if __CUDA_ARCH__ < 700
+  // All warps contribute bins before thread zero announces the CTA's arrival.
+  __syncthreads();
+#endif
   if (tx == 0) {
     red_release(&state->arrival_counter, 1);
   }

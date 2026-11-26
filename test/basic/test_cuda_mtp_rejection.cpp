@@ -806,13 +806,18 @@ void MixedTargetMaskCase() {
     std::vector<int> topK(rows), peaks(rows), support(rows);
     for (int row = 0; row < rows; ++row) {
         const int kind = (row + row / 5) % 3;
-        peaks[row] = (row * 977) % (vocab - 4);
+        peaks[row] = (row * 977) % (vocab / 4);
         support[row] = kind == 0 ? 1 : kind == 1 ? 2 : 4;
         topK[row] = kind == 0 ? 40 : kind == 1 ? 2 : vocab;
         topP[row] = kind == 0 ? .95f : 1.f;
-        auto *peak = logits.data() + size_t(row) * vocab + peaks[row];
-        std::fill_n(peak, 4, 0.f);
-        if (kind == 0) *peak = 24.f;
+        auto *values = logits.data() + size_t(row) * vocab;
+        // Competing bins in different CTA chunks must agree on the same pivot.
+        if (kind == 1) {
+            for (int id = 0; id < vocab; ++id)
+                values[id] = -1.f - ((id * 73 + row) % 997) / 997.f;
+        }
+        for (int i = 0; i < 4; ++i) values[peaks[row] + i * (vocab / 4)] = 0.f;
+        if (kind == 0) values[peaks[row]] = 24.f;
     }
     Buffer input(logits), temperature(std::vector<float>(rows, 1.f)), p(topP), k(rows);
     Check(cudaMemcpy(k.p, topK.data(), rows * sizeof(int), cudaMemcpyHostToDevice));
@@ -824,7 +829,8 @@ void MixedTargetMaskCase() {
     Check(cudaMemcpy(logits.data(), out, logits.size() * sizeof(float), cudaMemcpyDeviceToHost));
     for (int row = 0; row < rows; ++row) {
         for (int id = 0; id < vocab; ++id) {
-            float expected = id >= peaks[row] && id < peaks[row] + support[row] ? 1.f / support[row] : 0.f;
+            bool kept = id % (vocab / 4) == peaks[row] && id / (vocab / 4) < support[row];
+            float expected = kept ? 1.f / support[row] : 0.f;
             Require(std::abs(logits[size_t(row) * vocab + id] - expected) < 1e-6f,
                     "mixed radix bypass changed target distribution");
         }
