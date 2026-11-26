@@ -2,6 +2,16 @@
 
 [English](version_en.md)
 
+## V1.9.3
+
+- 新增 Inkling-2-Mini 模型支持，支持原版和 GGUF 量化权重、图文对话、工具调用及 DSpark 推测解码，可通过 `--auto` 自动选择多卡张量并行或单卡混合推理
+- 新增 SenseNova-Loop-9B 模型支持，支持 MTP 推测解码
+- 新增混元 HY4-Flash 模型支持，支持 DFly2 推测解码
+- 优化 DeepSeek-V4.1-Flash 混合推理，缩短专家权重加载时间，提升解码速度
+- 优化部分模型的多卡预填充与推测解码，完善 Attention DP、专家并行和 FP4/FP8 MoE 算子
+- 完善 PD 分离部署，支持同机 FastIPC 传输和按前缀缓存命中情况调度请求，FastKV 新增可选的主存二级前缀缓存
+- 新增 Duo 原生音视频交互后端（需单独编译），完善 HY-Nomas 和 LingBot 的交互视频播放，启动器支持从多个来源下载并校验模型组件
+
 ## V1.9.2
 
 - 新增 DeepSeek-V4.1-Flash 的 Unsloth 系列量化模型支持，新增 EXL3 格式模型支持

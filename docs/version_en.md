@@ -2,6 +2,16 @@
 
 [中文](version.md)
 
+## V1.9.3
+
+- Added Inkling-2-Mini support for original and GGUF-quantized weights, image-text chat, tool calling, and DSpark speculative decoding. `--auto` selects multi-GPU tensor parallelism or single-GPU hybrid inference.
+- Added support for SenseNova-Loop-9B with MTP speculative decoding.
+- Added support for Hunyuan HY4-Flash with DFly2 speculative decoding.
+- Reduced expert weight loading time and improved decoding speed for DeepSeek-V4.1-Flash hybrid inference.
+- Optimized multi-GPU prefill and speculative decoding for selected models, and improved Attention DP, expert parallelism, and FP4/FP8 MoE kernels.
+- Improved disaggregated prefill and decode with same-host FastIPC transfers and request routing based on prefix cache hits. FastKV now supports an optional second-level prefix cache in host memory.
+- Added a native Duo backend for audio and video interaction that requires a separate build. Improved interactive video playback for HY-Nomas and LingBot. The launcher can download and verify model components from multiple sources.
+
 ## V1.9.2
 
 - Added support for Unsloth quantized DeepSeek-V4.1-Flash models and EXL3-format models.
