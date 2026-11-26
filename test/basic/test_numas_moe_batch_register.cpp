@@ -161,8 +161,74 @@ static void TestBatchMapping() {
     RegisterNumas(&matrix, "linearColumn");
     CheckMoeMapping({&matrix}, nodes);
 }
+static void TestDirectImportLayouts() {
+    constexpr int rows = 256, columns = 256;
+    struct Layout { DataType type; int blockK, blockM; };
+    for (const Layout &layout : std::vector<Layout>{
+            {FLOAT32, -1, -1}, {FLOAT16, -1, -1}, {BFLOAT16, -1, -1},
+            {NVFP4, 2, 32}, {NVFP4_BLOCK_16_E4M3, 2, 16}, {FP8_E4M3, 128, 128},
+            {FP8_E4M3, 1, columns}, {EXL3, 4, 1}}) {
+        auto initialize = [&](Data &weight, int projections, int seed) {
+            weight.blockK = layout.blockK;
+            weight.blockM = layout.type == EXL3 ? projections : layout.blockM;
+            weight.Resize({rows * projections, columns});
+            if (layout.type == NVFP4_BLOCK_16_E4M3) weight.scales = {0.25f * seed, 0.75f * seed};
+            if (layout.type == FP8_E4M3) {
+                weight.scales.resize((rows * projections / layout.blockK) * (columns / layout.blockM));
+                for (size_t i = 0; i < weight.scales.size(); ++i) weight.scales[i] = float(seed + i % 97) / 11;
+            }
+            weight.Allocate();
+            for (size_t i = 0; i < weight.expansionBytes; ++i) weight.cpuData[i] = (seed + i * 13 + i / 29) % 239;
+        };
+        const int nodes = GetNumasMoeShardCount();
+        for (int shards : {0, nodes}) for (bool pair : {false, true}) {
+            Data gate(layout.type), up(layout.type), canonical(layout.type), merged(layout.type);
+            initialize(gate, 1, 11);
+            if (layout.type == NVFP4 && !CanImportHostMoeBlock32(gate)) continue;
+            initialize(up, 1, 23);
+            initialize(canonical, pair ? 2 : 1, 37);
+            const uint8_t *scaleBytes = GetNVFP4ScaleData(gate);
+            const size_t payload = scaleBytes ? size_t(scaleBytes - gate.cpuData) : gate.GetBytes();
+            std::memcpy(canonical.cpuData, gate.cpuData, payload);
+            if (pair) std::memcpy(canonical.cpuData + payload, up.cpuData, payload);
+            if (scaleBytes) {
+                const size_t size = GetNVFP4ScaleBytes(rows, columns, layout.blockK, layout.blockM);
+                auto *scales = GetNVFP4ScaleData(canonical);
+                std::memcpy(scales, scaleBytes, size);
+                if (pair) std::memcpy(scales + size, GetNVFP4ScaleData(up), size);
+            }
+            canonical.scales = gate.scales;
+            if (pair) canonical.scales.insert(canonical.scales.end(), up.scales.begin(), up.scales.end());
+            merged.Resize({2 * rows, columns});
+            Data &out = pair ? merged : gate;
+            ++gate.strides[0];
+            Check(!CanImportHostMoe(gate), "strided source accepted as a contiguous matrix");
+            --gate.strides[0];
+            Check(!TryImportHostMoe(out, gate, pair ? &up : nullptr, 3) && gate.cpuData && out.numasData.empty(),
+                  "incompatible shard count modified the source");
+            Check(TryImportHostMoe(out, gate, pair ? &up : nullptr, shards), "compatible direct import failed");
+            RegisterHostMoeWeightBatch({{&canonical, pair ? "linearSwiglu" : "linearColumn"}}, shards == 0);
+            Check(out.numasData.size() == canonical.numasData.size() && out.dataType == canonical.dataType &&
+                  out.blockK == canonical.blockK && out.blockM == canonical.blockM && out.dims == canonical.dims &&
+                  out.expansionSize == canonical.expansionSize && out.GetBytes() == canonical.GetBytes() &&
+                  out.scales == canonical.scales &&
+                  out.numasNVFP4AllScalesFuseMagic == canonical.numasNVFP4AllScalesFuseMagic,
+                  "direct import changed expert metadata");
+            for (size_t i = 0; i < out.numasData.size(); ++i)
+                Check(std::memcmp(out.numasData[i], canonical.numasData[i], out.GetBytes() / out.numasData.size()) == 0,
+                      "direct import changed registered expert bytes");
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--direct-layouts") {
+            SetThreads(4);
+            TestDirectImportLayouts();
+            std::puts("PASS: direct host expert layouts match registration");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--vma") {
             TestBatchMapping();
             std::puts("PASS: shared MoE VMA and physical NUMA placement");

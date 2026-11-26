@@ -17,6 +17,7 @@ namespace fastllm {
     public:
         Glm4MOEModel (); // 构造函数
 
+        bool SupportsDirectHostMoeImport(bool unbound) const override { return !unbound && GetFastllmEnv().activateNuma; }
         virtual void InitParams(); // 初始化参数信息
 
         // 推理

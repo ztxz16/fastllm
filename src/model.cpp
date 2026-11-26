@@ -2815,18 +2815,35 @@ namespace fastllm {
     }
 
 #ifdef USE_NUMAS
+    static bool HostMoeServingImport(const basellm &model) {
+        const char *serving = std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
+        return serving && std::strcmp(serving, "1") == 0 &&
+               (model.SupportsDirectHostMoeImport(false) || model.SupportsDirectHostMoeImport(true));
+    }
+
+    static std::string DirectHostMoeDevice(const basellm &model, const std::string &name) {
+        if (name.find(".experts.") == std::string::npos) return {};
+        const auto device = GetSpecialWeightSelectedDevice(&model, name);
+        if (device == "cpu" && model.SupportsDirectHostMoeImport(true)) return device;
+        if (DeviceNameMatchesType(device, "numa") && model.SupportsDirectHostMoeImport(false) &&
+            !model.ShouldDelaySpecialWeightNumaRegistration(name)) return device;
+        return {};
+    }
+
     // The caller has verified that these are single-writer, exclusive leaf inputs.
     static bool TryImportHostGateUp(WeightMap &weights, const WeightMergeRuleSingle &rule,
                                     std::unique_lock<std::mutex> &publicationLock, int numaShards) {
         auto &map = weights.weight;
         const Data &gate = map.at(rule.inputs[0]), &up = map.at(rule.inputs[1]);
-        if (!CanImportHostMoeBlock32(gate) || !CanImportHostMoeBlock32(up) ||
-            gate.dims != up.dims || gate.blockK != up.blockK || gate.dims[0] % gate.blockK ||
+        if (!CanImportHostMoe(gate) || !CanImportHostMoe(up) || gate.dataType != up.dataType ||
+            gate.dims != up.dims || gate.blockK != up.blockK || gate.blockM != up.blockM ||
+            (gate.dataType != EXL3 && gate.blockK > 0 && gate.dims[0] % gate.blockK) ||
             gate.dims[0] > INT_MAX / 2 || map.count(rule.output)) return false;
 
         // unordered_map node transfer preserves Data addresses used by the arena registry.
         decltype(weights.weight) result;
-        Data &out = result.try_emplace(rule.output, NVFP4, std::vector<int>{2 * gate.dims[0], gate.dims[1]}).first->second;
+        const std::vector<int> mergedDims{2 * gate.dims[0], gate.dims[1]};
+        Data &out = result.try_emplace(rule.output, gate.dataType, mergedDims).first->second;
         out.name = rule.output;
         out.isModelWeight = true;
         out.perChannelAxis = gate.perChannelAxis;
@@ -2837,7 +2854,7 @@ namespace fastllm {
         publicationLock.unlock();
         bool imported;
         try {
-            imported = TryImportHostMoeBlock32(out, gateOwner.mapped(), &upOwner.mapped(), numaShards);
+            imported = TryImportHostMoe(out, gateOwner.mapped(), &upOwner.mapped(), numaShards);
         } catch (...) {
             publicationLock.lock();
             map.insert(std::move(gateOwner));
@@ -4659,7 +4676,7 @@ namespace fastllm {
 #endif
 #if defined(USE_NUMAS)
                 try {
-                    if (model->ShouldRegisterSpecialWeightForDeviceType(rule.output, "numa")) {
+                    if (mergeData.numasData.empty() && model->ShouldRegisterSpecialWeightForDeviceType(rule.output, "numa")) {
                         mergeData.weightSum.resize(1);
                         RegisterNumas(&mergeData, rule.type);
                     }
@@ -4675,6 +4692,16 @@ namespace fastllm {
         std::unordered_map<std::string, size_t> mergeOutputUses;
         for (const auto &group : model->weightMergeRules)
             for (const auto &rule : group.rules) ++mergeOutputUses[rule.output];
+#ifdef USE_NUMAS
+        const bool planHostImport = HostMoeServingImport(*model);
+        auto prepareGgufHostWeight = [](Data &weight, const std::string &type) {
+            if (!weight.cpuData || weight.isFake || weight.isDiskWeight || weight.mapFile ||
+                weight.dims.size() != 2 || weight.dims[0] % GetNumasMoeShardCount() != 0 ||
+                weight.dataType != DATA_GGUF_FORMAT) return;
+            weight.weightSum.resize(1);
+            RegisterNumas(&weight, type);
+        };
+#endif
         auto loadGGUFWeights = [&](const std::vector<std::string> &loadTensors) {
             if (loadTensors.empty()) {
                 return;
@@ -4690,6 +4717,9 @@ namespace fastllm {
                 std::vector<const ReadGGUFTask*> inputs;
                 std::vector<int> dims;
                 uint64_t bytes = 0;
+#ifdef USE_NUMAS
+                bool registerHost = false;
+#endif
             };
             std::unordered_map<std::string, size_t> positions;
             for (size_t i = 0; i < loadTensors.size(); ++i) positions.emplace(loadTensors[i], i);
@@ -4744,6 +4774,20 @@ namespace fastllm {
                     }
                 }
                 if (job.merge == nullptr) job.inputs.clear();
+#ifdef USE_NUMAS
+                if (planHostImport) {
+                    const std::string &name = job.merge ? job.merge->output : loadTensors[i];
+                    const auto special = model->specialWeights.find(name);
+                    const bool routed = job.merge ? job.merge->type == "linearSwiglu" &&
+                        job.merge->inputs.size() == 2 && model->moeLinears.count(job.merge->inputs[0]) &&
+                        model->moeLinears.count(job.merge->inputs[1]) :
+                        matches.empty() && !mergeOutputUses.count(name) && model->moeLinears.count(name);
+                    job.registerHost = routed && special != model->specialWeights.end() &&
+                        (job.merge || special->second == "linearColumn") &&
+                        DeviceNameMatchesType(DirectHostMoeDevice(*model, name), "numa") &&
+                        model->ShouldRegisterSpecialWeightForDeviceType(name, "numa");
+                }
+#endif
                 claimed[i] = true;
                 jobs.push_back(std::move(job));
             }
@@ -4820,12 +4864,11 @@ namespace fastllm {
                                 nullptr, nullptr, -1, -1, -1);
                             tensor->ClearBuffer();
                         }
-                        // Map publication, callbacks and erasure remain serialized;
-                        // only private buffer allocation and reads run outside the lock.
+                        // The private map node keeps the Data address stable for arena owners.
                         if (job.merge != nullptr) {
-                            std::lock_guard<std::mutex> weightGuard(locker);
+                            decltype(model->weight.weight) ready;
                             const auto type = job.inputs.front()->tensor.type;
-                            Data &merged = model->weight[job.merge->output];
+                            Data &merged = ready[job.merge->output];
                             merged.dataType = type == GGML_TYPE_F32 ? DataType::FLOAT32 :
                                 type == GGML_TYPE_F16 ? DataType::FLOAT16 : DataType::DATA_GGUF_FORMAT;
                             if (merged.dataType == DataType::DATA_GGUF_FORMAT) merged.ggmlType = type;
@@ -4836,13 +4879,22 @@ namespace fastllm {
                             merged.expansionSize = merged.Count(0);
                             merged.expansionBytes = job.bytes;
                             merged.cpuData = mergedBuffer.release();
+                            if (merged.dims.size() == 2) merged.CalcWeightSum();
+#ifdef USE_NUMAS
+                            if (job.registerHost) prepareGgufHostWeight(merged, job.merge->type);
+#endif
+                            std::lock_guard<std::mutex> weightGuard(locker);
+                            auto inserted = model->weight.weight.insert(ready.extract(job.merge->output));
+                            AssertInFastLLM(inserted.inserted, "Duplicate exclusive GGUF merge output.");
                             for (const auto *input : job.inputs) {
                                 allFinishNames.insert(input->name);
-                                merged.forceGGUFFp32Dequant |= input->weight->forceGGUFFp32Dequant;
+                                inserted.position->second.forceGGUFFp32Dequant |= input->weight->forceGGUFFp32Dequant;
                             }
-                            if (merged.dims.size() == 2) merged.CalcWeightSum();
-                            finishMergedWeight(*job.merge, merged);
+                            finishMergedWeight(*job.merge, inserted.position->second);
                         } else {
+#ifdef USE_NUMAS
+                            if (job.registerHost) prepareGgufHostWeight(*loadWeights[i], "linearColumn");
+#endif
                             std::lock_guard<std::mutex> weightGuard(locker);
                             allFinishNames.insert(weightName);
                             // 检查是否需要合并权重
@@ -4983,7 +5035,7 @@ namespace fastllm {
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "numa")) {
                                     auto weightIt = model->weight.weight.find(weightName);
-                                    if (weightIt != model->weight.weight.end()) {
+                                    if (weightIt != model->weight.weight.end() && weightIt->second.numasData.empty()) {
                                         weightIt->second.weightSum.resize(1);
                                         RegisterNumas(&weightIt->second, model->specialWeights[weightName]);
                                     }
@@ -5781,20 +5833,18 @@ namespace fastllm {
         // Only an inference server may retire checkpoint buffers eagerly. Other HF
         // consumers (including exporters) keep their canonical CPU tensors.
         std::map<std::string, int> directHostGateUps, directHostDown;
-        const auto *v41 = dynamic_cast<const DeepSeekV41Model *>(model);
-        const char *serving = std::getenv("FASTLLM_CUDA_SERVING_WARMUP");
-        if (v41 && v41->GetExecutionMode() == ExecutionMode::Hybrid && serving &&
-            std::string(serving) == "1") {
-            std::unordered_map<std::string, int> writers;
+        if (HostMoeServingImport(*model)) {
+            std::unordered_map<std::string, int> writers, mergeWriters;
+            for (const auto &group : model->weightMergeRules)
+                for (const auto &rule : group.rules) ++mergeWriters[rule.output];
             for (const auto &source : tensorMap)
                 for (const auto &target : source.second) ++writers[target.first];
             int numaShards = 0;
             auto planHost = [&](const std::string &name, std::map<std::string, int> &destinations) {
-                if (name.find(".ffn.experts.") == std::string::npos) return;
-                const auto placement = GetSpecialWeightSelectedDevice(model, name);
+                const auto placement = DirectHostMoeDevice(*model, name);
                 if (placement == "cpu") {
                     destinations.emplace(name, 0);
-                } else if (DeviceNameMatchesType(placement, "numa")) {
+                } else if (!placement.empty()) {
                     if (!numaShards) {
                         HostMoePlacementScope bound(false);
                         numaShards = GetNumasMoeShardCount();
@@ -5803,14 +5853,16 @@ namespace fastllm {
                 }
             };
             for (const auto &special : model->specialWeights)
-                if (special.second == "linearColumn" && writers[special.first] == 1 &&
-                    mergeIndex.Find(special.first).empty())
+                if (special.second == "linearColumn" && writers[special.first] == 1 && !mergeWriters.count(special.first) &&
+                    model->moeLinears.count(special.first) && mergeIndex.Find(special.first).empty())
                     planHost(special.first, directHostDown);
             for (const auto &group : model->weightMergeRules) {
                 if (group.rules.size() != 1) continue;
                 const auto &rule = group.rules.front();
                 if (rule.type == "linearSwiglu" && rule.inputs.size() == 2 &&
-                    rule.inputs[0] != rule.inputs[1] && writers[rule.output] == 0 &&
+                    group.allInputs.size() == 2 && rule.inputs[0] != rule.inputs[1] && writers[rule.output] == 0 &&
+                    mergeWriters.at(rule.output) == 1 && !mergeWriters.count(rule.inputs[0]) && !mergeWriters.count(rule.inputs[1]) &&
+                    model->moeLinears.count(rule.inputs[0]) && model->moeLinears.count(rule.inputs[1]) &&
                     writers[rule.inputs[0]] == 1 && writers[rule.inputs[1]] == 1 &&
                     mergeIndex.Find(rule.inputs[0]).size() == 1 && mergeIndex.Find(rule.inputs[1]).size() == 1 &&
                     mergeIndex.Find(rule.output).empty())
@@ -6156,7 +6208,7 @@ namespace fastllm {
 #ifdef USE_NUMAS
                             auto down = directHostDown.find(weightName);
                             if (down != directHostDown.end())
-                                TryImportHostMoeBlock32(*destinationWeight, *destinationWeight, nullptr, down->second);
+                                TryImportHostMoe(*destinationWeight, *destinationWeight, nullptr, down->second);
 #endif
                             // Publish only complete tensors. Exclusive host gate/up pairs transfer
                             // both source nodes to the winning worker while it owns this lock.
@@ -6322,7 +6374,7 @@ namespace fastllm {
                             try {
                                 if (!needMerge && model->ShouldRegisterSpecialWeightForDeviceType(weightName, "numa")) {
                                     auto weightIt = model->weight.weight.find(weightName);
-                                    if (weightIt != model->weight.weight.end()) {
+                                    if (weightIt != model->weight.weight.end() && weightIt->second.numasData.empty()) {
                                         weightIt->second.weightSum.resize(1);
                                         RegisterNumas(&weightIt->second, model->specialWeights[weightName]);
                                     }

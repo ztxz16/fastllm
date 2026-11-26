@@ -1702,76 +1702,23 @@ namespace fastllm {
         }
     }
 
-    void Fp8ToFastllmFP8_E4M3_BLOCK128(int experts, int k, int m, uint8_t *fp8, float *scales, int blockK, int blockM, std::vector <uint8_t> &fp8Packed) {
-        int ks = (k - 1) / blockK + 1;
-        int ms = (m - 1) / blockM + 1;
-        
-        // 计算每行需要的总字节数
-        // 每128个fp8需要1个float的scale，所以需要 (m + 127) / 128 个scale
-        int numScalesPerRow = (m + 127) / 128;
-        int rowSize = m + numScalesPerRow * sizeof(float);
-        fp8Packed.resize((size_t)experts * k * rowSize);
-        for (size_t i = 0; i < experts; i++) {
-            for (size_t j = 0; j < k; j++) {
-                size_t rowIdx = i * k + j;
-                size_t packedOffset = rowIdx * rowSize;
-                
-                // 按照每128个fp8后接一个scale的格式打包
-                size_t currentPos = packedOffset;
-                
-                for (int blockIdx = 0; blockIdx < numScalesPerRow; blockIdx++) {
-                    size_t blockStart = blockIdx * 128;
-                    size_t blockEnd = std::min(blockStart + 128, (size_t)m);
-                    size_t blockSize = blockEnd - blockStart;
-                    
-                    // 复制当前block的fp8数据
-                    for (size_t l = blockStart; l < blockEnd; l++) {
-                        size_t srcIdx = i * k * m + j * m + l;
-                        fp8Packed[currentPos++] = fp8[srcIdx];
-                    }
-                    
-                    // 在这个block后面添加对应的scale
-                    // scale的索引计算：需要根据当前block在整个矩阵中的位置
-                    size_t scaleRow = j / blockK;  // 当前行属于哪个scale行块
-                    size_t scaleCol = blockStart / blockM;  // 当前block属于哪个scale列块
-                    size_t scaleIdx = i * ks * ms + scaleRow * ms + scaleCol;
-                    
-                    float* scalePtr = (float*)(&fp8Packed[currentPos]);
-                    *scalePtr = scales[scaleIdx];
-                    currentPos += sizeof(float);
-                }
-            }
+    static void PackHostFp8Row(int columns, int block, const uint8_t *src, const float *scales, uint8_t *dst) {
+        for (size_t offset = 0; offset < size_t(columns); offset += block) {
+            const size_t length = std::min(size_t(block), size_t(columns) - offset);
+            memcpy(dst, src + offset, length);
+            memcpy(dst + length, scales++, sizeof(float));
+            dst += length + sizeof(float);
         }
     }
 
-    void Fp8PerchannelToFastllmFP8_E4M3_PERCHANNEL(int experts, int k, int m, uint8_t *fp8, float *scales, int blockK, int blockM, std::vector <uint8_t> &fp8Packed) {
-        int ks = (k - 1) / blockK + 1;
-        int ms = (m - 1) / blockM + 1;
-        int rowSize = m + sizeof(float);
-        fp8Packed.resize((size_t)experts * k * rowSize);
-        for (size_t i = 0; i < experts; i++) {
-            for (size_t j = 0; j < k; j++) {
-                size_t rowIdx = i * k + j;
-                size_t packedOffset = rowIdx * rowSize;
-                size_t currentPos = packedOffset;
-                    
-                // 复制当前block的fp8数据
-                for (size_t l = 0; l < m; l++) {
-                    size_t srcIdx = i * k * m + j * m + l;
-                    fp8Packed[currentPos++] = fp8[srcIdx];
-                }
-                    
-                // 在这个block后面添加对应的scale
-                // scale的索引计算：需要根据当前block在整个矩阵中的位置
-                size_t scaleRow = j / blockK;  // 当前行属于哪个scale行块
-                size_t scaleCol = 0;
-                size_t scaleIdx = i * ks * ms + scaleRow * ms + scaleCol;
-                    
-                float* scalePtr = (float*)(&fp8Packed[currentPos]);
-                *scalePtr = scales[scaleIdx];
-                currentPos += sizeof(float);
-            }
-        }
+    static void PackHostFp8Matrix(const Data &weight, std::vector<uint8_t> &packed) {
+        const int rows = weight.dims[0], columns = weight.dims[1];
+        const size_t scaleCols = (columns - 1) / weight.blockM + 1;
+        const size_t rowBytes = columns + scaleCols * sizeof(float);
+        packed.resize(rows * rowBytes);
+        for (int row = 0; row < rows; ++row)
+            PackHostFp8Row(columns, weight.blockM, weight.cpuData + size_t(row) * columns,
+                           weight.scales.data() + (row / weight.blockK) * scaleCols, packed.data() + row * rowBytes);
     }
 
     void Nvfp4ToFastllmNVFP4_BLOCK16(int experts, int k, int m, uint8_t *nvfp4, float *scales, uint8_t *scaleBytes,
@@ -3453,14 +3400,13 @@ namespace fastllm {
                     std::vector <uint8_t> fp8Packed;
                     if (data->blockM == 128) {
                         data->dataType = DataType::FP8_E4M3_BLOCK_128;
-                        Fp8ToFastllmFP8_E4M3_BLOCK128(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
                     } else if (data->blockM == m) {
                         data->dataType = DataType::FP8_E4M3_PERCHANNEL;
-                        Fp8PerchannelToFastllmFP8_E4M3_PERCHANNEL(1, k, m, (uint8_t*)data->cpuData, data->scales.data(), data->blockK, data->blockM, fp8Packed);
                     } else {
                         ErrorInFastLLM("RegisterNumas can't support fp8 with blockM = " + std::to_string(data->blockM));    
                     }
 
+                    PackHostFp8Matrix(*data, fp8Packed);
                     size_t bytesPerRow = GetDataBytes(data->dataType, 1, m);
                     if (isCrossSwiglu) {
                         std::vector<uint8_t> reordered;
@@ -4540,60 +4486,124 @@ namespace fastllm {
         if (!pending.empty()) RegisterHostMoeWeightBatch(pending, true);
     }
 
-    bool CanImportHostMoeBlock32(const Data &source) {
-        return source.dataType == NVFP4 && source.blockM == 32 && source.dims.size() == 2 &&
-               source.dims[0] > 0 && source.dims[1] > 0 && !source.isDiskWeight && !source.isFake && !source.mapFile &&
-               source.dataDevice == DataDevice::CPU && source.numasData.empty() &&
-               NumasNvfp4Block32Available() && GetNVFP4ScaleData(source) != nullptr;
+    static DataType DirectHostMoeLayout(const Data &src) {
+        if (src.dims.size() != 2 || src.dims[0] <= 0 || src.dims[1] <= 0 || !src.cpuData ||
+            src.strides.size() != 2 || src.strides[0] != uint64_t(src.dims[1]) || src.strides[1] != 1 ||
+            src.dataDevice != CPU || src.isDiskWeight || src.isFake || src.mapFile ||
+            src.multiDeviceData || !src.numasData.empty()) return DATA_AUTO_SOURCE;
+        const int rows = src.dims[0], columns = src.dims[1];
+        switch (src.dataType) {
+            case NVFP4:
+                if (src.blockM == 32 && NumasNvfp4Block32Available() && GetNVFP4ScaleData(src))
+                    return NVFP4_BLOCK_32_E8M0;
+                break;
+            case NVFP4_BLOCK_16_E4M3:
+                if (src.blockM == 16 && !src.scales.empty() && GetNVFP4ScaleData(src))
+                    return NVFP4_BLOCK_16_E4M3_PACKED;
+                break;
+            case FP8_E4M3:
+                if (src.blockK > 0 && (src.blockM == 128 || src.blockM == columns) &&
+                    src.expansionBytes >= uint64_t(rows) * columns &&
+                    src.scales.size() == size_t((rows - 1) / src.blockK + 1) * ((columns - 1) / src.blockM + 1))
+                    return src.blockM == 128 ? FP8_E4M3_BLOCK_128 : FP8_E4M3_PERCHANNEL;
+                break;
+            case EXL3:
+                if (src.blockM == 1 && rows % 128 == 0 && columns % 128 == 0 &&
+                    Exl3BitRateSupported(src.blockK) && src.expansionBytes >= Exl3StorageBytes(src))
+                    return EXL3;
+                break;
+            case FLOAT32: case BFLOAT16: case FLOAT16:
+                if (src.expansionBytes >= src.GetBytes()) return src.dataType;
+                break;
+            default:
+                break;
+        }
+        return DATA_AUTO_SOURCE;
     }
 
-    bool TryImportHostMoeBlock32(Data &destination, const Data &first, const Data *up, int numaShards) {
-        if (!CanImportHostMoeBlock32(first) || !destination.numasData.empty()) return false;
+    bool CanImportHostMoe(const Data &source) { return DirectHostMoeLayout(source) != DATA_AUTO_SOURCE; }
+    bool CanImportHostMoeBlock32(const Data &source) { return DirectHostMoeLayout(source) == NVFP4_BLOCK_32_E8M0; }
+
+    bool TryImportHostMoe(Data &destination, const Data &first, const Data *up, int numaShards) {
+        const auto layout = DirectHostMoeLayout(first);
+        if (layout == DATA_AUTO_SOURCE || !destination.numasData.empty() || numaShards < 0) return false;
+        const int rows = first.dims[0], columns = first.dims[1], nodes = std::max(1, numaShards);
+        if (rows % nodes) return false;
         if (up) {
-            if (&destination == &first || &destination == up || destination.cpuData ||
-                !CanImportHostMoeBlock32(*up) || up->dims != first.dims ||
-                up->blockK != first.blockK || first.dims[0] > INT_MAX / 2 ||
-                destination.dims != std::vector<int>{2 * first.dims[0], first.dims[1]}) return false;
+            if (&first == up || &destination == &first || &destination == up || destination.cpuData ||
+                DirectHostMoeLayout(*up) != layout || up->dims != first.dims || up->blockK != first.blockK ||
+                up->blockM != first.blockM || up->scales.size() != first.scales.size() ||
+                rows > INT_MAX / 2 || destination.dims != std::vector<int>{2 * rows, columns}) return false;
         } else if (&destination != &first) {
             return false;
         }
-        const int rows = first.dims[0], columns = first.dims[1];
-        const int nodeCount = std::max(1, numaShards);
-        if (numaShards < 0 || rows % nodeCount != 0) return false;
-        const int rowsPerNode = rows / nodeCount;
-        const size_t rowBytes = GetDataBytes(NVFP4_BLOCK_32_E8M0, 1, columns);
-        const size_t shardBytes = size_t(rowsPerNode) * (up ? 2 : 1) * rowBytes;
-        const size_t rawRowBytes = GetDataBytes(NVFP4, 1, columns);
-        const size_t scaleCols = (columns - 1) / 32 + 1;
-        const uint8_t *firstScales = GetNVFP4ScaleData(first);
+
+        const int rowsPerNode = rows / nodes;
+        const bool exl = layout == EXL3;
+        if (exl && ((rowsPerNode % first.blockM) || (rowsPerNode / first.blockM) % 16 ||
+                    columns % nodes || (columns / nodes) % 16)) return false;
+        const size_t rowBytes = exl ? 0 : GetDataBytes(layout, 1, columns);
+        const size_t oneShard = exl ? Exl3StorageBytes(first) / nodes : rowsPerNode * rowBytes;
+        const uint8_t *gateScales = GetNVFP4ScaleData(first);
         const uint8_t *upScales = up ? GetNVFP4ScaleData(*up) : nullptr;
         uint8_t maxScale = 0;
+        const size_t rawFp4RowBytes = GetNVFP4WeightBytes(1, columns);
+        auto writeRow = [&](const Data &src, const uint8_t *scales, int row, uint8_t *dst) {
+            if (layout == NVFP4_BLOCK_32_E8M0) {
+                maxScale = std::max(maxScale, PackHostBlock32Row(columns,
+                    src.cpuData + size_t(row) * rawFp4RowBytes,
+                    scales + size_t(row / src.blockK) * ((columns - 1) / 32 + 1), dst));
+            } else if (layout == NVFP4_BLOCK_16_E4M3_PACKED) {
+                PackCompactE4M3NVFP4Block16Rows(rows, columns, src.cpuData, scales, src.scales,
+                    src.blockK, src.blockM, dst, row, 1, false, false, true);
+            } else if (src.dataType == FP8_E4M3) {
+                const size_t scaleCols = (columns - 1) / src.blockM + 1;
+                PackHostFp8Row(columns, src.blockM, src.cpuData + size_t(row) * columns,
+                    src.scales.data() + (row / src.blockK) * scaleCols, dst);
+            } else {
+                memcpy(dst, src.cpuData + row * rowBytes, rowBytes);
+            }
+        };
         auto pack = [&](int node, uint8_t *dst) {
+            if (exl) {
+                // EXL3 concatenates complete projections, each with its own trellis and scales.
+                Exl3CopyRowShard(first, dst, node, nodes);
+                if (up) Exl3CopyRowShard(*up, dst + oneShard, node, nodes);
+                return;
+            }
             for (int row = node * rowsPerNode; row < (node + 1) * rowsPerNode; ++row) {
-                const size_t srcOffset = row * rawRowBytes;
-                const size_t scaleOffset = (row / first.blockK) * scaleCols;
-                maxScale = std::max(maxScale, PackHostBlock32Row(columns, first.cpuData + srcOffset,
-                                                                firstScales + scaleOffset, dst));
+                writeRow(first, gateScales, row, dst);
                 dst += rowBytes;
                 if (up) {
-                    maxScale = std::max(maxScale, PackHostBlock32Row(columns, up->cpuData + srcOffset,
-                                                                    upScales + scaleOffset, dst));
+                    writeRow(*up, upScales, row, dst);
                     dst += rowBytes;
                 }
             }
         };
+        std::vector<float> mergedScales;
+        if (up) {
+            mergedScales = first.scales;
+            mergedScales.insert(mergedScales.end(), up->scales.begin(), up->scales.end());
+        }
+        const size_t shardBytes = oneShard * (up ? 2 : 1);
         if (!StoreHostMoeMatrix(destination, shardBytes, numaShards,
                                 MoeEnvConfig::GetInstance().GetPinnedWeight(), pack)) return false;
+        if (up) destination.scales.swap(mergedScales);
         destination.hostMoeUnbound = numaShards == 0;
-        destination.numasNVFP4AllScalesFuseMagic = maxScale <= 190;
-        destination.dataType = NVFP4_BLOCK_32_E8M0;
-        destination.blockK = first.blockK;
-        destination.blockM = first.blockM;
-        destination.expansionBytes = shardBytes * nodeCount;
-        // A down projection owns the source payload in the same Data object.
+        destination.numasNVFP4AllScalesFuseMagic = layout == NVFP4_BLOCK_32_E8M0 && maxScale <= 190;
+        destination.dataType = layout;
+        destination.blockK = layout == NVFP4_BLOCK_16_E4M3_PACKED ? 1 : first.blockK;
+        destination.blockM = exl && up ? first.blockM + up->blockM : first.blockM;
+        destination.expansionSize = destination.Count(0);
+        destination.UpdateUnitSize();
+        destination.expansionBytes = shardBytes * nodes;
         delete[] destination.cpuData;
         destination.cpuData = nullptr;
         return true;
+    }
+
+    bool TryImportHostMoeBlock32(Data &destination, const Data &first, const Data *up, int numaShards) {
+        return CanImportHostMoeBlock32(first) && TryImportHostMoe(destination, first, up, numaShards);
     }
 
     void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data*, std::string>> &weights,

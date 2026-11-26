@@ -74,7 +74,7 @@ static void CheckPrefillDraftLoad(const fs::path &target) {
             throw std::runtime_error("prefill draft KV projection row order changed");
 }
 
-int main() {
+int main(int argc, char **argv) {
 #ifdef _WIN32
     _putenv_s("FASTLLM_TP", "false");
     _putenv_s("FASTLLM_EP", "1");
@@ -128,6 +128,43 @@ int main() {
         file.write(reinterpret_cast<const char *>(payload.data()), payload.size() * 2);
         if (!file) throw std::runtime_error("failed to write merge fixture");
     }
+#if defined(USE_NUMAS) && !defined(_WIN32)
+    if (argc == 2 && std::string(argv[1]) == "--host-moe") {
+        std::ofstream(directory.path / "config.json") << R"({
+            "model_type":"glm4_moe","eos_token_id":2,"vocab_size":16,
+            "num_hidden_layers":1,"hidden_size":8,"head_dim":4,"num_attention_heads":2,
+            "num_key_value_heads":2,"n_routed_experts":512,"num_experts_per_tok":2,
+            "n_shared_experts":1,"max_position_embeddings":16,"rope_theta":10000
+        })";
+        SetMoeDeviceMap({{"numa", 1}});
+        setenv("FASTLLM_CUDA_SERVING_WARMUP", "1", 1);
+        auto model = CreateLLMModelFromHF(directory.path.string(), BFLOAT16, -1, true);
+        const auto &weights = model->weight.weight;
+        for (int expert = 0; expert < experts; ++expert) {
+            const auto prefix = "model.layers.0.mlp.experts." + std::to_string(expert) + ".";
+            const auto &merged = weights.at(prefix + "gateup_proj.weight");
+            const auto &down = weights.at(prefix + "down_proj.weight");
+            const int nodes = merged.numasData.size();
+            if (!nodes || width % nodes || down.numasData.size() != size_t(nodes) ||
+                merged.cpuData || down.cpuData || merged.dataType != BFLOAT16 || down.dataType != BFLOAT16 ||
+                merged.dims != std::vector<int>{2 * width, width} || down.dims != std::vector<int>{width, width} ||
+                weights.count(prefix + "gate_proj.weight") || weights.count(prefix + "up_proj.weight"))
+                throw std::runtime_error("incorrect host expert publication: " + prefix);
+            for (int node = 0; node < nodes; ++node) {
+                auto *gateUp = reinterpret_cast<const uint16_t *>(merged.numasData[node]);
+                auto *downRows = reinterpret_cast<const uint16_t *>(down.numasData[node]);
+                for (int i = 0; i < 2 * elements / nodes; ++i)
+                    if (gateUp[i] != ((i / width) % 2 ? 0x4000 : 0x3f00) + expert % 64)
+                        throw std::runtime_error("incorrect host gate/up row: " + prefix);
+                for (int i = 0; i < elements / nodes; ++i)
+                    if (downRows[i] != 0x3e00 + expert % 64)
+                        throw std::runtime_error("incorrect host down row: " + prefix);
+            }
+        }
+        std::cout << "PASS parallel host import of 512 routed experts" << std::endl;
+        return 0;
+    }
+#endif
     // Thousands of independent gate/up merges race at the same time. Check
     // every payload, not just whether model loading returns successfully.
     for (int repeat = 0; repeat < 12; ++repeat) {

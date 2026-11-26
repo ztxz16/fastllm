@@ -347,6 +347,7 @@ namespace fastllm {
         bool UseGenericHistoryCache() const override { return false; }
         bool UseModelSpecificScheduler() const override { return false; }
 
+        bool SupportsDirectHostMoeImport(bool) const override { return executionMode == ExecutionMode::Hybrid; }
         ExecutionMode GetExecutionMode() const { return executionMode; }
         bool UseGpuToolCallConstraints() const override { return executionMode == ExecutionMode::Gpu; }
 

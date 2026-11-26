@@ -992,6 +992,10 @@ namespace fastllm {
 
         // Paged models may try resident pages before restoring a host archive.
         virtual bool DeferHistoryCacheRestore() const { return false; }
+
+        // Opt in only if routed gate/up/down sources can retire before a load
+        // callback, and execution consumes the registered host layout.
+        virtual bool SupportsDirectHostMoeImport(bool /*unbound*/) const { return false; }
     };
 }
 

@@ -1976,8 +1976,16 @@ if (UNIT_TEST)
     set_tests_properties(reduce_batch PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
 
     if (USE_NUMAS)
+        fastllm_add_checked_test(hf_parallel_host_moe hf_parallel_merge_test
+            "PASS parallel host import" 120 --host-moe)
+        set_tests_properties(hf_parallel_host_moe PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=0;FASTLLM_ACTIVATE_NUMA=ON" RUN_SERIAL TRUE)
         add_executable(numas_moe_batch_register_test test/basic/test_numas_moe_batch_register.cpp)
         target_link_libraries(numas_moe_batch_register_test PRIVATE fastllm)
+        fastllm_add_checked_test(host_moe_direct_layouts numas_moe_batch_register_test
+            "PASS: direct host expert layouts" 120 --direct-layouts)
+        set_tests_properties(host_moe_direct_layouts PROPERTIES
+            ENVIRONMENT "FT_NUMAS=1;FT_THREADS=4;FT_PINNED_WEIGHT=0" RUN_SERIAL TRUE)
         fastllm_add_checked_test(numas_moe_batch_register numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
         fastllm_add_checked_test(numas_moe_batch_register_boundaries numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120 --chunk-boundary)
         fastllm_add_checked_test(numas_moe_batch_register_unpinned numas_moe_batch_register_test "PASS: bounded NUMA arenas" 120)
