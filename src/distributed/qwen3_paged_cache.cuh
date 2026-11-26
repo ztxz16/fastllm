@@ -7,6 +7,8 @@
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/attention/fastllm-attention-backend.h"
 #include <set>
+#include <map>
+#include <cstring>
 
 namespace fastllm { namespace distributed { namespace detail {
 
@@ -49,6 +51,8 @@ class ProcessPagedKV {
     CudaAppendPagedCacheOp append;
     CudaAppendPagedCacheBatchOp appendBatch;
     std::string backend;
+    std::map<uint64_t, std::vector<std::vector<int>>> pdPins;
+    bool pdPrepared = false;
 
     /** 在当前设备分配持久张量；不得在Graph捕获期间调用。 */
     void Allocate(Data &data, const std::vector<int> &shape) {
@@ -117,6 +121,103 @@ public:
     int PageLen() const { return layers.front()->km->pageLen; }
     int MaxPages() const { return layers.front()->km->maxPages; }
 
+    /**
+     * 为接收分配独占页；只分配收到的 Prompt 范围，不提前分配增长预算。
+     * @param tokens 接收 Token 数，必须由服务准入预算批准。
+     * @return false 表示页池暂时不足，保持原状态；true 表示全部层空间已准备。
+     */
+    bool PrepareReceive(int tokens) {
+        const int pages = (tokens + PageLen() - 1) / PageLen();
+        if (tokens <= 0 || pages > MaxPages()) throw std::runtime_error("invalid PD receive length");
+        for (const auto &layer : layers) {
+            if (!layer->k.pageIndex.empty() || !layer->v.pageIndex.empty())
+                throw std::runtime_error("PD receive requires no active pages");
+            if (layer->km->FreePageCount() < pages || layer->vm->FreePageCount() < pages) return false;
+        }
+        for (auto &layer : layers) for (bool key : {true, false}) {
+            auto &cache = key ? layer->k : layer->v;
+            auto &manager = key ? *layer->km : *layer->vm;
+            for (int i = 0; i < pages; ++i) cache.pageIndex.push_back(manager.GetUnusedPageIndex(true));
+            cache.lastPageLen = (tokens - 1) % PageLen() + 1;
+            cache.Resize({kvHeads, tokens, dim});
+        }
+        return true;
+    }
+
+    /** 接收完成后缩短有效长度；丢弃的页解除请求引用，传输 pin 由调用者单独解除。 */
+    void CommitReceive(int tokens) {
+        const size_t count = (tokens + PageLen() - 1) / PageLen();
+        for (const auto &layer : layers) for (auto *cache : {&layer->k, &layer->v})
+            if (tokens < 0 || count > cache->pageIndex.size()) throw std::runtime_error("invalid PD commit length");
+        for (auto &layer : layers) for (auto *cache : {&layer->k, &layer->v}) {
+            while (cache->pageIndex.size() > count) {
+                cache->pagedKVCacheData->ReleasePageIndex(cache->pageIndex.back());
+                cache->pageIndex.pop_back();
+            }
+            cache->lastPageLen = tokens ? (tokens - 1) % PageLen() + 1 : 0;
+            cache->Resize({kvHeads, tokens, dim});
+        }
+    }
+
+    /**
+     * 从真实页池生成 IPC 描述，并持有额外页引用；不复制 KV。
+     * @param key 本地唯一交接 key；重复导出同 key 必须由服务层复用原描述。
+     * @param tokens 有效 Token 数，必须覆盖已有页面范围。
+     * @param headBegin 本 rank 第一个全局 KV head。
+     * @return 独立 K/V、逐物理页的 region，最后一维为连续 FP16 head_dim。
+     */
+    std::vector<PDRegion> Export(uint64_t key, int tokens, int headBegin) {
+        if (!key || tokens <= 0 || pdPins.count(key)) throw std::runtime_error("invalid or reused PD export key");
+        cudaDeviceProp property{};
+        CheckPagedCuda(cudaGetDeviceProperties(&property, device));
+        std::vector<PDRegion> result;
+        std::vector<std::vector<int>> pages;
+        const uint64_t stride = uint64_t(kvHeads) * dim * sizeof(half);
+        for (size_t index = 0; index < layers.size(); ++index) for (bool keyPart : {true, false}) {
+            auto &layer = *layers[index];
+            auto &manager = keyPart ? *layer.km : *layer.vm;
+            auto &cache = keyPart ? layer.k : layer.v;
+            if (cache.dims.size() != 3 || cache.dims[1] < tokens)
+                throw std::runtime_error("PD export exceeds valid KV length");
+            cudaIpcMemHandle_t handle{};
+            CheckPagedCuda(cudaIpcGetMemHandle(&handle, manager.cudaData));
+            const size_t count = (tokens + PageLen() - 1) / PageLen();
+            pages.emplace_back(cache.pageIndex.begin(), cache.pageIndex.begin() + count);
+            for (size_t page = 0; page < count; ++page) {
+                PDRegion region;
+                region.layer = index; region.component = keyPart ? 0 : 1;
+                region.tokenBegin = page * PageLen(); region.tokenEnd = std::min(tokens, int((page + 1) * PageLen()));
+                region.headBegin = headBegin; region.headEnd = headBegin + kvHeads;
+                region.headDim = dim; region.pageSize = PageLen();
+                region.allocationBytes = uint64_t(MaxPages()) * PageLen() * stride;
+                region.offset = uint64_t(cache.pageIndex[page]) * PageLen() * stride;
+                region.tokenStride = stride; region.headStride = dim * sizeof(half);
+                std::memcpy(region.memory.data(), &handle, sizeof(handle));
+                std::memcpy(region.device.data(), property.uuid.bytes, 16);
+                result.push_back(region);
+            }
+        }
+        for (size_t i = 0; i < layers.size(); ++i) {
+            layers[i]->km->Pick(pages[2 * i]); layers[i]->vm->Pick(pages[2 * i + 1]);
+        }
+        pdPins.emplace(key, std::move(pages));
+        return result;
+    }
+
+    /** 传输结束后幂等解除额外 pin；不会释放整个 KV 池或活动请求引用。 */
+    void ReleaseExport(uint64_t key) {
+        auto it = pdPins.find(key);
+        if (it == pdPins.end()) return;
+        for (size_t i = 0; i < layers.size(); ++i) {
+            layers[i]->km->ReleasePageIndices(it->second[2 * i]);
+            layers[i]->vm->ReleasePageIndices(it->second[2 * i + 1]);
+        }
+        pdPins.erase(it);
+    }
+
+    bool HasExports() const { return !pdPins.empty(); }
+    void SetPreparedPrefill(bool enabled) { pdPrepared = enabled; }
+
     /** 读取各层K/V池可用页计数，返回占用率最高者；可淘汰前缀页仍可分配。 */
     Qwen3KVUsage Usage() const {
         Qwen3KVUsage result;
@@ -146,6 +247,23 @@ public:
             layer->km->Query(ids, kp, position); layer->vm->Query(ids, vp, position);
             RestorePagedCachePages(layer->k, *layer->km, kp, tokens / PageLen());
             RestorePagedCachePages(layer->v, *layer->vm, vp, tokens / PageLen());
+        }
+    }
+
+    /** 把本地完整前缀页复制到已登记的接收页；保持导出地址不变，调用方同步后再发布就绪。 */
+    void RestorePrepared(const std::vector<int> &ids, uint32_t position, uint32_t tokens) {
+        const uint64_t bytes = uint64_t(PageLen()) * kvHeads * dim * sizeof(half);
+        for (auto &layer : layers) for (bool key : {true, false}) {
+            auto &manager = key ? *layer->km : *layer->vm;
+            auto &cache = key ? layer->k : layer->v;
+            std::vector<int> source;
+            manager.Query(ids, source, position);
+            if (source.size() < tokens / PageLen() || cache.pageIndex.size() < tokens / PageLen())
+                throw std::runtime_error("prepared local prefix lost source or target pages");
+            auto memory = static_cast<uint8_t*>(manager.cudaData);
+            for (size_t page = 0; page < tokens / PageLen(); ++page)
+                CheckPagedCuda(cudaMemcpyAsync(memory + uint64_t(cache.pageIndex[page]) * bytes,
+                    memory + uint64_t(source[page]) * bytes, bytes, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         }
     }
 
@@ -227,7 +345,26 @@ public:
                        DataDevice::CUDA, key ? scratch.k.cudaData : scratch.v.cudaData);
             input.dataDeviceIds = {device};
             Data *cache = key ? &layer.k : &layer.v;
-            if (prepared) {
+            if (pdPrepared) {
+                if (!cached || prepared || cache->dims.size() != 3 || cache->dims[1] < tokens)
+                    throw std::runtime_error("invalid PD prepared Prefill append");
+                auto &manager = key ? *layer.km : *layer.vm;
+                const int past = cache->dims[1] - tokens;
+                auto *source = static_cast<const half*>(key ? scratch.k.cudaData : scratch.v.cudaData);
+                auto *destination = static_cast<half*>(manager.cudaData);
+                for (int begin = past; begin < past + tokens;) {
+                    const int page = begin / PageLen(), offset = begin % PageLen();
+                    const int count = std::min(PageLen() - offset, past + tokens - begin);
+                    for (int head = 0; head < kvHeads; ++head) {
+                        CheckPagedCuda(cudaMemcpy2DAsync(
+                            destination + (size_t(cache->pageIndex.at(page)) * PageLen() + offset) * kvHeads * dim + head * dim,
+                            size_t(kvHeads) * dim * sizeof(half), source + (size_t(head) * tokens + begin - past) * dim,
+                            size_t(dim) * sizeof(half), size_t(dim) * sizeof(half), count,
+                            cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                    }
+                    begin += count;
+                }
+            } else if (prepared) {
                 auto args = AppendArgs(layer, input, key, &cache);
                 appendBatch.Run("AppendPagedCacheBatch", args, {}, {});
             } else {

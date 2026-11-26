@@ -2,6 +2,7 @@
 #include "distributed/process_group.h"
 #include "distributed/batch_invariant.h"
 #include "process_protocol.h"
+#include "pd_protocol.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -585,9 +586,9 @@ struct ProcessGroup::Impl {
                 const auto &ar = info.allReduce;
                 const auto &g = info.graph;
                 bool invalid = info.active ?
-                    (end || !info.tokens || info.tokens > info.capacity || info.capacity > kQwen3MaxContextTokens ||
+                    (end || !info.capacity || info.tokens > info.capacity || info.capacity > kQwen3MaxContextTokens ||
                      info.positionBegin > 1048576 || info.capacity - 1 > 1048576 - info.positionBegin ||
-                     !info.deviceBytes || (!paged && info.deviceBytes > (moeModel ? 512ULL : 256ULL) * 1024 * 1024)) :
+                     (info.tokens && !info.deviceBytes) || (!paged && info.deviceBytes > (moeModel ? 512ULL : 256ULL) * 1024 * 1024)) :
                     (info.tokens || info.capacity || info.positionBegin || info.deviceBytes);
                 invalid = invalid || ar.enabled != options.customAllReduce || ar.active != ar.enabled ||
                     !ar.workspaceBytes || ar.workspaceBytes > 3ULL * 1024 * 1024 ||
@@ -1208,16 +1209,22 @@ std::vector<std::vector<float>> ProcessGroup::StepQwenMoe(const std::vector<Qwen
     Put32(payload, timeoutMs);
     for (const auto &step : steps) {
         const bool begin = step.action == QwenMoeAction::Begin, decode = step.action == QwenMoeAction::Decode;
-        if (uint32_t(step.action) > 3 || step.tokenIds.size() > kQwen3MaxPromptTokens ||
+        const bool prepared = step.action == QwenMoeAction::Prepared;
+        if (uint32_t(step.action) > 5 || step.tokenIds.size() > kQwen3MaxPromptTokens ||
             (begin && (graph || step.tokenIds.empty() || !step.capacity || step.capacity > kQwen3MaxContextTokens ||
                        step.tokenIds.size() > step.capacity || step.positionBegin > 1048576 ||
                        step.capacity - 1 > 1048576 - step.positionBegin)) ||
-            (decode && step.tokenIds.size() != 1) || (!begin && !decode && !step.tokenIds.empty()) ||
-            (!begin && (step.capacity || step.positionBegin))) {
+            (decode && step.tokenIds.size() != 1) || (!begin && !decode && !prepared && !step.tokenIds.empty()) ||
+            (!begin && (step.capacity || step.positionBegin)) ||
+            (prepared && (graph || step.tokenIds.empty() || !step.transferKey || step.notifyPath.empty() || step.notifyPath.size() > 107)) ||
+            (!prepared && (step.transferKey || !step.notifyPath.empty()))) {
             throw std::invalid_argument("invalid joint MoE rank operation");
         }
         for (uint32_t value : {uint32_t(step.action), step.capacity, step.positionBegin, uint32_t(step.tokenIds.size())}) Put32(payload, value);
         for (auto id : step.tokenIds) Put32(payload, id);
+        Put64(payload, step.transferKey);
+        Put32(payload, step.notifyPath.size());
+        payload.insert(payload.end(), step.notifyPath.begin(), step.notifyPath.end());
     }
     if (payload.size() > kMaxPayload) throw std::invalid_argument("MoE round exceeds protocol limit");
     try {
@@ -1228,7 +1235,8 @@ std::vector<std::vector<float>> ProcessGroup::StepQwenMoe(const std::vector<Qwen
         for (size_t rank = 0; rank < replies.size(); ++rank) {
             const auto &bytes = replies[rank].payload;
             const uint32_t count = Get32(bytes, 0);
-            const bool active = steps[rank].action == QwenMoeAction::Begin || steps[rank].action == QwenMoeAction::Decode;
+            const bool active = steps[rank].action == QwenMoeAction::Begin || steps[rank].action == QwenMoeAction::Decode ||
+                                steps[rank].action == QwenMoeAction::Prepared;
             if (bool(count) != active || count > (kMaxPayload - 4)/4 || bytes.size() != 4ULL + count*4ULL ||
                 (count && vocabulary && vocabulary != count)) throw std::runtime_error("invalid MoE logits response");
             if (count) vocabulary = count;
@@ -1289,6 +1297,47 @@ std::vector<float> ProcessGroup::DecodeQwen3(uint32_t tokenId, int timeoutMs) {
     return impl->Logits(Kind::DecodeQwen3, payload, timeoutMs);
 }
 
+std::vector<std::vector<PDRegion>> ProcessGroup::PDStorage(const PDCommand &command) {
+    const auto payload = EncodePD(command);
+    DecodePD(payload);
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly)
+        throw std::runtime_error("PD storage requires ready CUDA process group");
+    if (command.targetRank < -1 || command.targetRank >= int(impl->options.devices.size()) ||
+        (!impl->moeModel && command.targetRank != -1))
+        throw std::invalid_argument("PD target rank must address an Attention rank or the whole TP group");
+    try {
+        auto replies = impl->Exchange(Kind::PDStorage, Kind::PDStorageResult, payload,
+            Clock::now() + std::chrono::seconds(300));
+        std::vector<std::vector<PDRegion>> result;
+        for (const auto &reply : replies) result.push_back(DecodePDRegions(reply.payload));
+        return result;
+    } catch (const std::exception &error) {
+        impl->Fail(error.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
+void ProcessGroup::PDPrefill(const std::vector<uint32_t> &tokens, uint64_t key, const std::string &path) {
+    if (!key || path.empty() || path.size() > 107 || tokens.empty() || tokens.size() > kQwen3MaxPromptTokens)
+        throw std::invalid_argument("invalid PD prepared Prefill");
+    std::vector<uint8_t> payload;
+    Put64(payload, key); Put32(payload, path.size()); Put32(payload, tokens.size());
+    payload.insert(payload.end(), path.begin(), path.end());
+    for (auto id : tokens) Put32(payload, id);
+    std::lock_guard<std::mutex> lock(impl->mutex);
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly)
+        throw std::runtime_error("PD Prefill requires ready CUDA workers");
+    try {
+        auto replies = impl->Exchange(Kind::PDPrefill, Kind::PDPrefillDone, payload,
+            Clock::now() + std::chrono::seconds(300));
+        for (const auto &reply : replies) if (!reply.payload.empty()) throw std::runtime_error("invalid PD Prefill reply");
+    } catch (const std::exception &error) {
+        impl->Fail(error.what());
+        throw std::runtime_error(impl->error);
+    }
+}
+
 void ProcessGroup::EndQwen3Request() {
     impl->RequestStates(true);
 }
@@ -1303,7 +1352,7 @@ std::vector<Qwen3RequestInfo> ProcessGroup::Qwen3Requests() {
 
 std::vector<Qwen3KVUsage> ProcessGroup::Qwen3KVUsages() {
     std::lock_guard<std::mutex> lock(impl->mutex);
-    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly || impl->moeModel)
+    if (impl->state != ProcessGroupState::Ready || impl->options.controlOnly)
         throw std::runtime_error("KV pressure requires a ready dense CUDA group");
     try {
         auto replies = impl->Exchange(Kind::QueryQwen3KVUsage, Kind::Qwen3KVUsageState, {},

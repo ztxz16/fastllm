@@ -152,7 +152,10 @@ class ChatService:
         self.failure = None
         self._threads = []
         self._remaining = 0
-        self._load_routing = getattr(session, 'routing', None) == 'load'
+        # 普通 DP 提供 HTTP 预预约；Attention DP/EP 在联合轮次队列内执行 load。
+        # 策略同名不代表两类执行器都实现了普通 DP 的预约接口。
+        self._load_routing = (getattr(session, 'routing', None) == 'load' and
+                              callable(getattr(session, '_reserve', None)))
         self._deadline_thread = None
         try:
             with self._condition:

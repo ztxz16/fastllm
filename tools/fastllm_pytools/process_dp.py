@@ -21,7 +21,7 @@ from .qwen3_process_session import BACKEND, GenerationCancelled
 class ProcessDPModel:
     """/**
      * 管理互斥 GPU 上的完整模型副本；每个副本有独立协调器、TP worker 和 KV。
-     * 全部副本就绪后才接受请求；默认按负载固定归属并排队，旧策略仍只选空闲副本。
+     * 全部副本就绪后才接受请求；三种策略都固定请求归属并在健康副本上排队。
      * 启动失败回收已启动副本；运行故障停止整个池的新分配，不自动重试。
      * 调用者须使用上下文管理器或 close；Token 回调不得重入生成或关闭模型。
      */"""
@@ -165,11 +165,11 @@ class ProcessDPModel:
                     score=waiting + running + waiting * 6 * max(0.0, usage - 0.5)))
             return result
 
-    def _reserve(self, cancel_event=None, deadline=None):
+    def _reserve(self, cancel_event=None, deadline=None, request=None):
         """/** 原子选择并登记固定副本；HTTP可先预约再分词，取消和超时沿用同一截止时间。 */"""
         with self._condition:
-            if self.routing != 'load' or self.state != 'ready':
-                raise RuntimeError(f'DP pool is {self.state}; load routing unavailable')
+            if self.state != 'ready':
+                raise RuntimeError(f'DP pool is {self.state}; routing unavailable')
             started = time.monotonic()
             deadline = started + self.timeout if deadline is None else deadline
             if cancel_event is not None and cancel_event.is_set():
@@ -178,14 +178,23 @@ class ProcessDPModel:
                 raise TimeoutError('DP admission deadline exceeded')
             snapshot = self.load_snapshot()
             candidates = [(self._next_rank + offset) % self.dp_size for offset in range(self.dp_size)]
-            rank = min(candidates, key=lambda item: snapshot[item]['score'])
+            scores = {}
+            if self.routing == 'load':
+                rank = min(candidates, key=lambda item: snapshot[item]['score'])
+            elif self.routing == 'prefix':
+                if request is None:
+                    raise ValueError('prefix routing requires tokenized request')
+                scores = {rank: self._prefix_score(rank, request['token_ids']) for rank in candidates}
+                rank = max(candidates, key=lambda item: scores[item])
+            else:
+                rank = candidates[0]
             self._next_rank = (self._next_rank + 1) % self.dp_size
             request_id, self._next_id = self._next_id, self._next_id + 1
             ticket = dict(owner=self, rank=rank, id=request_id, state='queued', started=started,
                           deadline=deadline, cancel=cancel_event, error=None, logged=False,
-                          decision=dict(policy='load', replicas=snapshot, selected_score=snapshot[rank]['score'],
+                          decision=dict(policy=self.routing, replicas=snapshot, selected_score=snapshot[rank]['score'],
                                         idle_ranks=[r for r in candidates if r not in self._busy],
-                                        estimated_reused_tokens=None, wait_ms=0.0))
+                                        estimated_reused_tokens=scores.get(rank), wait_ms=0.0))
             self._queues[rank].append(ticket)
             self._reservations[request_id] = ticket
             self._condition.notify_all()
@@ -224,9 +233,9 @@ class ProcessDPModel:
             self._withdraw(ticket, error)
 
     @contextmanager
-    def _load_lease(self, cancel_event=None, reservation=None):
+    def _load_lease(self, cancel_event=None, reservation=None, request=None):
         """/** 按固定FIFO获取执行位，异常或取消只释放一次；运行位保持到原生清理/流关闭。 */"""
-        ticket = reservation if reservation is not None else self._reserve(cancel_event)
+        ticket = reservation if reservation is not None else self._reserve(cancel_event, request=request)
         if not isinstance(ticket, dict) or ticket.get('owner') is not self:
             raise ValueError('foreign DP reservation')
         rank, request_id = ticket['rank'], ticket['id']
@@ -265,6 +274,8 @@ class ProcessDPModel:
                 try:
                     if acquired and self._status == 'ready' and self.replicas[rank].state != 'ready':
                         self._failure = f'replica {rank} is {self.replicas[rank].state}'
+                    elif acquired and self._status == 'ready' and self.routing == 'prefix':
+                        self._refresh_prefixes(rank)
                     self._write_dispatch(ticket, record)
                 except Exception as error:
                     self._failure = f'cannot finalize DP dispatch: {error}'
@@ -282,13 +293,9 @@ class ProcessDPModel:
 
     @contextmanager
     def _lease(self, cancel_event=None, request=None, reservation=None):
-        """/** load使用固定队列；旧策略保持空闲副本分配语义。 */"""
-        if self.routing == 'load':
-            with self._load_lease(cancel_event, reservation) as lease:
-                yield lease
-        else:
-            with self._idle_lease(cancel_event, request) as lease:
-                yield lease
+        """/** 三种策略统一预约健康副本并在其本地排队，忙碌不等于不可用。 */"""
+        with self._load_lease(cancel_event, reservation, request) as lease:
+            yield lease
 
     @contextmanager
     def _idle_lease(self, cancel_event=None, request=None):
@@ -441,11 +448,10 @@ class ProcessDPModel:
                             errors.append(f'{type(error).__name__}: {error}')
             with self._condition:
                 # 原生工作已回收；暂停在 yield 的调用者可稍后关闭迭代器，不能阻塞停服。
-                if self.routing == 'load':
-                    self._busy.clear()
-                    for ticket in self._reservations.values():
-                        ticket['state'] = 'finished'
-                    self._reservations.clear()
+                self._busy.clear()
+                for ticket in self._reservations.values():
+                    ticket['state'] = 'finished'
+                self._reservations.clear()
                 self._status = 'failed' if errors else 'closed'
                 self._condition.notify_all()
             (self.output / 'replicas.shutdown.json').write_text(json.dumps(

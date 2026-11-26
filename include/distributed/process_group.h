@@ -1,5 +1,6 @@
 #ifndef FASTLLM_DISTRIBUTED_PROCESS_GROUP_H
 #define FASTLLM_DISTRIBUTED_PROCESS_GROUP_H
+#include "distributed/pd_native.h"
 
 #include <cstdint>
 #include <memory>
@@ -89,12 +90,14 @@ struct Qwen3RequestInfo {
 };
 
 /** 一轮联合调度的本地操作；Idle 仍参加专家通信，End 在轮次边界释放活动状态。 */
-enum class QwenMoeAction : uint32_t { Idle = 0, Begin = 1, Decode = 2, End = 3 };
+enum class QwenMoeAction : uint32_t { Idle = 0, Begin = 1, Decode = 2, End = 3, Prepared = 4, Hold = 5 };
 
 struct QwenMoeStep {
     QwenMoeAction action = QwenMoeAction::Idle;
     uint32_t capacity = 0, positionBegin = 0;
     std::vector<uint32_t> tokenIds;
+    uint64_t transferKey = 0;
+    std::string notifyPath;
 };
 
 enum class Qwen3LayerStage : uint32_t { Full = 0, Attention = 1, Mlp = 2 };
@@ -269,6 +272,11 @@ public:
 
     /** 同步释放活动请求的全部 KV，允许重复调用；失败终止整组。 */
     void EndQwen3Request();
+
+    /** 同组调用已授权的 PD 本地存储接口；返回每个 rank 的真实 IPC 描述，失败终止整组。 */
+    std::vector<std::vector<PDRegion>> PDStorage(const PDCommand &command);
+    /** 在已准备的 KV 位置执行 Prefill，逐层就绪通过独立本地数据报通知服务。 */
+    void PDPrefill(const std::vector<uint32_t> &tokens, uint64_t key, const std::string &notifyPath);
 
     /**
      * 同步清空前缀索引，保留累计计数及活动请求KV；worker失败时终止整组。

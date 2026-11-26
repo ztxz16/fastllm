@@ -223,7 +223,10 @@ struct Qwen3ShardLoader::Impl {
 
     /** 根据配置构造所有目标权重，先验证完整模型再允许任何 payload 读取。 */
     void Build(const Json &config, int rank, int world, ShardModel model) {
-        const bool moe = model == ShardModel::Qwen2Moe;
+        if (model == ShardModel::DenseQwen3 && config["model_type"].string_value() == "qwen2_moe")
+            model = ShardModel::Qwen2MoeTP;
+        const bool moe = model != ShardModel::DenseQwen3;
+        const bool ep = model == ShardModel::Qwen2Moe;
         Require(config["model_type"].string_value() == (moe ? "qwen2_moe" : "qwen3"),
                 moe ? "expected model_type=qwen2_moe" : "only dense model_type=qwen3 is supported");
         plan.model = model;
@@ -238,7 +241,7 @@ struct Qwen3ShardLoader::Impl {
         uint64_t intermediate = positive(moe ? "moe_intermediate_size" : "intermediate_size");
         uint64_t vocab = positive("vocab_size");
         if (moe) {
-            Require(world == 1 || world == 2 || world == 4, "EP size must be 1, 2 or 4");
+            Require(!ep || world == 1 || world == 2 || world == 4, "EP size must be 1, 2 or 4");
             plan.expertCount = positive("num_experts");
             plan.expertsPerToken = positive("num_experts_per_tok");
             plan.sharedIntermediateSize = positive("shared_expert_intermediate_size");
@@ -303,12 +306,17 @@ struct Qwen3ShardLoader::Impl {
                 }
             }
         }
-        auto mlp = Partition(intermediate, moe ? 0 : rank, moe ? 1 : world);
-        auto vocabulary = Partition(vocab, moe ? 0 : rank, moe ? 1 : world);
-        Partition(qHeads, moe ? 0 : rank, moe ? 1 : world);
+        auto mlp = Partition(intermediate, ep ? 0 : rank, ep ? 1 : world);
+        auto vocabulary = Partition(vocab, ep ? 0 : rank, ep ? 1 : world);
+        Partition(qHeads, ep ? 0 : rank, ep ? 1 : world);
+        if (moe) {
+            auto shared = Partition(plan.sharedIntermediateSize, ep ? 0 : rank, ep ? 1 : world);
+            plan.sharedIntermediateBegin = shared.first;
+            plan.sharedIntermediateCount = shared.second - shared.first;
+        }
         uint64_t group = qHeads / kvHeads;
         std::pair<uint64_t, uint64_t> q, kv;
-        if (moe) {
+        if (ep) {
             q = {0, qHeads};
             kv = {0, kvHeads};
         } else if (static_cast<uint64_t>(world) <= kvHeads) {
@@ -430,15 +438,20 @@ struct Qwen3ShardLoader::Impl {
                     check(name + "gate_proj.weight", {width, hidden});
                     check(name + "up_proj.weight", {width, hidden});
                     check(name + "down_proj.weight", {hidden, width});
-                    if (shared || expert % world == uint64_t(rank)) {
-                        add(name + "gateup_proj.weight", {2 * width, hidden}, {
-                            {name + "gate_proj.weight", 0, width, 0, hidden},
-                            {name + "up_proj.weight", 0, width, 0, hidden}});
-                        replicate(name + "down_proj.weight", {hidden, width});
+                    if (!ep || shared || expert % world == uint64_t(rank)) {
+                        auto channels = Partition(width, ep ? 0 : rank, ep ? 1 : world);
+                        const auto count = channels.second - channels.first;
+                        add(name + "gateup_proj.weight", {2 * count, hidden}, {
+                            {name + "gate_proj.weight", channels.first, channels.second, 0, hidden},
+                            {name + "up_proj.weight", channels.first, channels.second, 0, hidden}});
+                        add(name + "down_proj.weight", {hidden, count}, {
+                            {name + "down_proj.weight", 0, hidden, channels.first, channels.second}});
                     }
                 }
                 if (sources.count(attn + "o_proj.bias")) {
-                    replicate(attn + "o_proj.bias", {hidden});
+                    check(attn + "o_proj.bias", {hidden});
+                    add(attn + "o_proj.bias", {hidden}, {{attn + "o_proj.bias", 0, hidden, 0, 1}},
+                        !ep && rank != 0);
                 }
                 continue;
             }

@@ -24,11 +24,12 @@ struct ShardTensorPlan {
     bool zeroFill = false; // 行并行输出偏置仅 rank 0 读取，其他 rank 为零。
 };
 
-enum class ShardModel { DenseQwen3, Qwen2Moe };
+enum class ShardModel { DenseQwen3, Qwen2Moe, Qwen2MoeTP };
 
 struct Qwen3ShardPlan {
     ShardModel model = ShardModel::DenseQwen3;
     uint64_t expertCount = 0, expertsPerToken = 0, sharedIntermediateSize = 0;
+    uint64_t sharedIntermediateBegin = 0, sharedIntermediateCount = 0;
     bool normTopkProb = false;
     int rank = 0, worldSize = 1;
     uint64_t hiddenSize = 0, layerCount = 0, headDim = 0;
@@ -63,8 +64,8 @@ public:
      * @param directory 包含 config.json 和 safetensors 文件/索引的本地目录。
      * @param rank 当前进程 rank，范围 [0, worldSize)。
      * @param worldSize 稠密模式为 TP 数；MoE 模式为 1/2/4 个 EP rank，Attention TP=1。
-     * @param model 显式选择模型语义；Qwen2Moe 复制非专家权重，按 expert_id % worldSize
-     *              读取本 rank 专家，验证其他专家元数据但不读取其 payload。
+     * @param model Qwen2Moe 使用 EP；Qwen2MoeTP 使用 Attention/专家通道 TP。
+     *              默认 TP 入口根据 model_type 区分稠密 Qwen3 和 Qwen2 MoE。
      */
     Qwen3ShardLoader(const std::string &directory, int rank, int worldSize,
                      ShardModel model = ShardModel::DenseQwen3);

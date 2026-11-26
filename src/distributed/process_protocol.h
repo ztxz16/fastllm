@@ -15,7 +15,7 @@ namespace protocol {
 using Clock = std::chrono::steady_clock;
 using Deadline = Clock::time_point;
 constexpr int kWorkerFd = 3;
-constexpr uint32_t kVersion = 6;
+constexpr uint32_t kVersion = 7;
 constexpr uint32_t kMaxPayload = 1024 * 1024;
 enum class Kind : uint32_t {
     Hello = 1, CreateId, UniqueId, Initialize, Ready,
@@ -25,7 +25,7 @@ enum class Kind : uint32_t {
     BeginQwen3Request, DecodeQwen3, EndQwen3Request, Qwen3RequestEnded,
     QueryQwen3Request, Qwen3RequestState, ClearQwen3Prefix, Qwen3PrefixCleared,
     LoadQwenMoe, ForwardMoeLayer, MoeLayerOutput, StepMoe, MoeLogits,
-    QueryQwen3KVUsage, Qwen3KVUsageState
+    QueryQwen3KVUsage, Qwen3KVUsageState, PDStorage, PDStorageResult, PDPrefill, PDPrefillDone
 };
 struct Message {
     Kind kind;

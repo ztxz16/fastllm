@@ -63,7 +63,7 @@ def native_binary(value, name):
     return path
 
 
-def validate_options(args, *, allow_dp=False):
+def validate_options(args, *, allow_dp=False, allow_pd=False):
     """进程后端仅接受已实现的参数；拒绝线程后端专用配置，绝不静默忽略。"""
     from .util import make_normal_parser, add_server_args
     from .parallel_config import prepare_parallel_entry, is_attention_ep
@@ -74,9 +74,14 @@ def validate_options(args, *, allow_dp=False):
 
     parser = make_normal_parser('process validation')
     add_server_args(parser)
+    from .pd.cli import add_service_args
+    add_service_args(parser)
     defaults = vars(parser.parse_args([]))
-    allowed = {'model', 'path', 'dp', 'attention_dp', 'ep', 'dp_routing', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
+    allowed = {'model', 'path', 'dp', 'attention_dp', 'ep', 'moe_parallel_mode', 'dp_routing', 'tp', 'tp_backend', 'tp_binary', 'tp_worker', 'tp_output', 'tp_timeout',
                'tp_request_timeout', 'tp_queue_size', 'tp_request_log', 'host', 'port', 'model_name', 'cuda_graph', 'custom_allreduce', 'tokens', 'page_size', 'batch_invariant'}
+    if allow_pd:
+        allowed.update({'role', 'router_managed', 'instance', 'pd_token', 'pd_growth_budget', 'pd_long_threshold',
+                        'pd_model_id', 'pd_return_kv', 'pd_retention'})
     compatible = {'dtype': ('auto', 'float16'), 'atype': ('auto', 'float16'),
                   'kv_cache_dtype': ('auto', 'float16'), 'kv_cache_layout': ('auto', 'continuous') if is_attention_ep(args) else ('auto', 'paged'),
                   'device': (None, ''), 'FASTLLM_ACTIVATE_NUMA': ('OFF',), 'FASTLLM_NUMA_THREADS': (27,),
@@ -166,10 +171,10 @@ class ProcessTPModel:
         if not self.model_path.is_dir() or not (self.model_path / 'config.json').is_file():
             raise ValueError('process TP requires a local HF Qwen3 model directory; no automatic download')
         self.config = json.loads((self.model_path / 'config.json').read_text())
-        expected_type = 'qwen2_moe' if moe else 'qwen3'
-        if self.config.get('model_type') != expected_type or self.config.get('quantization_config'):
+        expected_types = ('qwen2_moe',) if moe else ('qwen3', 'qwen2_moe')
+        if self.config.get('model_type') not in expected_types or self.config.get('quantization_config'):
             raise ValueError('process backend requires unquantized Qwen2 MoE' if moe else
-                             'process TP only supports unquantized dense Qwen3')
+                             'process TP requires unquantized Qwen3 or Qwen2 MoE')
         binary = native_binary(getattr(args, 'tp_binary', ''), 'fastllm_moe_generate' if moe else 'fastllm_tp_generate')
         worker = native_binary(getattr(args, 'tp_worker', ''), 'fastllm_tp_worker')
         os.environ.setdefault('USE_TORCH', '0')
@@ -191,7 +196,7 @@ class ProcessTPModel:
             from contextlib import nullcontext
             from .qwen_moe_process_session import QwenMoeProcessSession
             session_class = QwenMoeProcessSession
-            session_options = dict(routing=getattr(args, 'dp_routing', None) or 'round_robin',
+            session_options = dict(routing=getattr(args, 'dp_routing', None) or 'load',
                                    queue_size=getattr(args, 'tp_queue_size', 8),
                                    batch_invariant=getattr(args, 'batch_invariant', False))
             self._stream_lock = nullcontext()

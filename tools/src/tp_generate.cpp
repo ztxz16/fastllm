@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -276,6 +277,103 @@ Json::object LoadState(ProcessGroup &group) {
  * @param cancellation 可选取消通道；不与控制帧混用，迟到取消按请求 ID 隔离。
  * @return 正常返回表示 EOF 或 shutdown 已完成清理；致命错误抛异常并交由 main 回收。
  */
+/** 将实际 IPC 字节编码为十六进制；仅在内部 JSON 控制流使用。 */
+std::string PDHex(const uint8_t *bytes, size_t count) {
+    static const char alphabet[] = "0123456789abcdef";
+    std::string result;
+    for (size_t i = 0; i < count; ++i) {
+        result += alphabet[bytes[i] >> 4]; result += alphabet[bytes[i] & 15];
+    }
+    return result;
+}
+
+/**
+ * 处理独立 PD 控制请求；计算仍使用正式 Begin/Decode 和同一采样函数。
+ * @param request 本地服务已校验的操作；key 使用字符串避免 JSON double 截断。
+ * @param generators 每次交接独立的 D 随机状态；本地抢占重算不会重置。
+ * @return 存储 region 或单个实际输出 Token；协议或执行失败交由外层终止会话。
+ */
+Json PDOperation(ProcessGroup &group, const Json &request, std::map<std::string, std::mt19937_64> &generators) {
+    const auto op = request["action"].string_value();
+    if (op == "usage") {
+        PDCommand initialize;
+        initialize.action = PDAction::Initialize;
+        initialize.key = 1;
+        group.PDStorage(initialize);
+        return LoadState(group);
+    }
+    if (op == "cache") return GraphState(group);
+    if (op == "prepared_prefill") {
+        const auto key = request["key"].string_value();
+        if (key.empty() || key.size() > 16 || key.find_first_not_of("0123456789abcdef") != std::string::npos)
+            throw std::runtime_error("invalid PD Prefill key");
+        group.PDPrefill(Ids(request["token_ids"]), std::stoull(key, nullptr, 16), request["notify_path"].string_value());
+        return Json::object{{"prefill_done", true}};
+    }
+    if (op == "prefill") {
+        group.BeginQwen3Request(Ids(request["token_ids"]), Integer(request["capacity"]));
+        return Json::object{{"prefill_done", true}};
+    }
+    if (op == "end") {
+        group.EndQwen3Request();
+        return Json::object{{"ended", true}};
+    }
+    if (op == "step" || op == "sampling_end") {
+        const auto context = request["context"].string_value();
+        if (context.size() != 32 || context.find_first_not_of("0123456789abcdef") != std::string::npos)
+            throw std::runtime_error("invalid PD sampling context");
+        if (op == "sampling_end") {
+            generators.erase(context);
+            return Json::object{{"released", true}};
+        }
+        const auto &options = request["sampling"];
+        Qwen3GenerationOptions sampling;
+        sampling.temperature = Number(options["temperature"]);
+        sampling.topK = Integer(options["top_k"]);
+        sampling.topP = Number(options["top_p"]);
+        if (!request["first"].is_bool()) throw std::runtime_error("PD first must be boolean");
+        if (request["first"].bool_value()) {
+            if (generators.count(context)) throw std::runtime_error("PD sampling context already started");
+            generators.emplace(context, std::mt19937_64(Integer(options["seed"])));
+        }
+        auto found = generators.find(context);
+        if (found == generators.end()) throw std::runtime_error("PD sampling context is missing");
+        auto logits = group.DecodeQwen3(Integer(request["input"]));
+        const double uniform = double(found->second() >> 11) * (1.0 / 9007199254740992.0);
+        return Json::object{{"token", static_cast<long long>(SampleQwen3(logits, sampling, uniform))}};
+    }
+    PDCommand command;
+    if (op == "prepare") command.action = PDAction::Prepare;
+    else if (op == "export") command.action = PDAction::Export;
+    else if (op == "commit") command.action = PDAction::Commit;
+    else if (op == "release") command.action = PDAction::Release;
+    else if (op == "restore_prefix") command.action = PDAction::RestorePrefix;
+    else if (op == "restore_local") {
+        command.action = PDAction::RestoreLocal;
+        command.tokenIds = Ids(request["token_ids"]);
+    }
+    else throw std::runtime_error("unknown PD operation");
+    const auto key = request["key"].string_value();
+    if (key.empty() || key.size() > 16 || key.find_first_not_of("0123456789abcdef") != std::string::npos)
+        throw std::runtime_error("invalid PD key");
+    command.key = std::stoull(key, nullptr, 16);
+    command.tokens = Integer(request["tokens"]);
+    command.capacity = Integer(request["capacity"]);
+    command.position = Integer(request["position"]);
+    auto results = group.PDStorage(command);
+    if (op == "restore_local") return Json::object{{"restored_tokens", int(group.Qwen3Requests().front().tokens)}};
+    Json::array regions;
+    for (size_t rank = 0; rank < results.size(); ++rank) for (const auto &r : results[rank]) {
+        regions.push_back(Json::object{{"rank", int(rank)}, {"layer", int(r.layer)},
+            {"component", r.component ? "v" : "k"}, {"token_begin", int(r.tokenBegin)}, {"token_end", int(r.tokenEnd)},
+            {"head_begin", int(r.headBegin)}, {"head_end", int(r.headEnd)}, {"head_dim", int(r.headDim)},
+            {"page_size", int(r.pageSize)}, {"memory_hex", PDHex(r.memory.data(), r.memory.size())},
+            {"device", PDHex(r.device.data(), r.device.size())}, {"allocation_bytes", double(r.allocationBytes)},
+            {"offset", double(r.offset)}, {"token_stride", double(r.tokenStride)}, {"head_stride", double(r.headStride)}});
+    }
+    return Json::object{{"regions", regions}};
+}
+
 void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object &report,
            SessionCancellation *cancellation) {
     auto ready = report;
@@ -288,21 +386,30 @@ void Serve(ProcessGroup &group, SessionSocket &socket, bool trace, Json::object 
     ready["cancellation"] = cancellation ? "request_id_datagram" : "none";
     ready["token_events"] = true;
     ready["load_stats"] = 1;
+    ready["pd_storage_protocol"] = 1;
     ready["load"] = LoadState(group);
     socket.Write(ready);
     uint64_t expected = 1;
     bool shutdown = false;
     Json message;
+    std::map<std::string, std::mt19937_64> pdRandom;
     while (socket.Read(message)) {
         uint32_t id = Integer(message["id"]);
         if (id != expected++) throw std::runtime_error("out-of-order session request id");
         const auto op = message["op"].string_value();
         const std::set<std::string> fields = op == "generate" ?
-            std::set<std::string>{"id", "op", "request", "stream_tokens", "stream_load"} : std::set<std::string>{"id", "op"};
+            std::set<std::string>{"id", "op", "request", "stream_tokens", "stream_load"} :
+            op == "pd" ? std::set<std::string>{"id", "op", "request"} : std::set<std::string>{"id", "op"};
         for (const auto &item : message.object_items()) {
             if (!fields.count(item.first)) throw std::runtime_error("unknown session field");
         }
         if (op == "shutdown") { shutdown = true; break; }
+        if (op == "pd") {
+            auto response = PDOperation(group, message["request"], pdRandom);
+            socket.Write(Json::object{{"event", "pd_result"}, {"id", static_cast<long long>(id)},
+                {"status", "PASS"}, {"result", response}});
+            continue;
+        }
         if (op == "clear_prefix_cache") {
             group.ClearQwen3PrefixCache();
             socket.Write(Json::object{{"event", "prefix_cache_cleared"}, {"id", static_cast<long long>(id)},
