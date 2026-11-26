@@ -4736,6 +4736,7 @@ static FastllmMoeFp8Batch1Scratch &FastllmGetMoeFp8Batch1Scratch(int topk) {
 
 struct FastllmMoeFp8ExpertTable {
     bool inited = false;
+    bool exactHalfScales = false;
     int experts = 0;
     int hidden = 0;
     int inter = 0;
@@ -4822,6 +4823,7 @@ bool FastllmCudaRegisterMoeFp8ExpertTableFromPacked(fastllm::Data **weights, int
     state = cudaMemcpyAsync(cached.downScales, hDownScales.data(), ptrBytes, cudaMemcpyHostToDevice);
     checkCudaErrors("Error: CUDA error when registering packed MoE down scale table!", state);
 
+    cached.exactHalfScales = false;
     cached.inited = true;
     cached.experts = experts;
     cached.hidden = hidden;
@@ -4855,6 +4857,22 @@ static bool FastllmGetMoeFp8ExpertTable(fastllm::Data **weights, int weightsBatc
         return true;
     }
 
+    // Scaling finite E4M3 by 2^e is exact in FP16 for -15 <= e <= 7.
+    // These endpoints cover both the smallest subnormal and the largest finite value.
+    // Check host scales once at registration, never on graph replay.
+    bool exactHalf = false;
+#ifndef USE_ROCM
+    const int arch = FastllmCudaRuntimeArch();
+    exactHalf = arch == 60 || arch == 70;
+#endif
+    auto fitsHalf = [](const fastllm::Data &w) {
+        const size_t count = size_t((w.dims[0] - 1) / w.blockK + 1) * ((w.dims[1] - 1) / w.blockM + 1);
+        return w.scales.size() == count && std::all_of(w.scales.begin(), w.scales.end(), [](float s) {
+            uint32_t bits;
+            std::memcpy(&bits, &s, sizeof(bits));
+            return bits >= (112u << 23) && bits <= (134u << 23) && !(bits & 0x7fffffu);
+        });
+    };
     fastllm::Data emptyBias;
     std::vector<uint8_t*> hGateWeights(experts), hDownWeights(experts);
     std::vector<float*> hGateScales(experts), hDownScales(experts);
@@ -4884,6 +4902,7 @@ static bool FastllmGetMoeFp8ExpertTable(fastllm::Data **weights, int weightsBatc
             return false;
         }
 
+        exactHalf = exactHalf && fitsHalf(*gateup) && fitsHalf(*down);
         FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(*gateup, emptyBias, inter);
         FastllmCudaFP8E4M3EnsureScalesAndBiasOnDevice(*down, emptyBias, hidden);
         if (gateup->extraCudaData.size() == 0 || down->extraCudaData.size() == 0) {
@@ -4911,6 +4930,7 @@ static bool FastllmGetMoeFp8ExpertTable(fastllm::Data **weights, int weightsBatc
     state = cudaMemcpyAsync(cached.downScales, hDownScales.data(), ptrBytes, cudaMemcpyHostToDevice);
     checkCudaErrors("Error: CUDA error when caching MoE down scale table!", state);
 
+    cached.exactHalfScales = exactHalf;
     cached.inited = true;
     cached.experts = experts;
     cached.hidden = hidden;
@@ -6353,13 +6373,18 @@ bool FastllmCudaBFloat16MatMulFP8E4M3Block128AddTo(const fastllm::Data &input, f
     return FastllmCudaTypedMatMulFP8E4M3Block128AddTo<__nv_bfloat16>(input, weight, output, alpha, overwrite, n, m, k);
 }
 
+#ifndef USE_ROCM
+#include "fastllm-moe-legacy-experts.cuh"
+#endif
+
 namespace fastllm {
-bool GetCudaIndexedMoeSlots(Data **weights, int count, CudaIndexedMoeSlots &slots) {
+static bool getIndexedSlots(Data **weights, int count, CudaIndexedMoeSlots &slots, bool &exactHalfScales) {
     if (!weights || count < 4 || !weights[2] || weights[2]->dims.size() != 2) return false;
     const int hidden = weights[2]->dims[1], inter = weights[2]->dims[0] / 2;
     if (weights[2]->dataType == FP8_E4M3) {
         FastllmMoeFp8ExpertTable *table = nullptr;
         if (!FastllmGetMoeFp8ExpertTable(weights, count, hidden, inter, table)) return false;
+        exactHalfScales = table->exactHalfScales;
         slots = {table->gateWeights, table->downWeights, table->gateScales, table->downScales,
                  table->gateBlockM, table->gateBlockK, table->downBlockM, table->downBlockK};
     } else if (weights[2]->dataType == NVFP4_BLOCK_16) {
@@ -6368,6 +6393,11 @@ bool GetCudaIndexedMoeSlots(Data **weights, int count, CudaIndexedMoeSlots &slot
         slots = {table->gateWeights, table->downWeights};
     } else return false;
     return true;
+}
+
+bool GetCudaIndexedMoeSlots(Data **weights, int count, CudaIndexedMoeSlots &slots) {
+    bool exactHalf = false;
+    return getIndexedSlots(weights, count, slots, exactHalf);
 }
 
 bool PrepareCudaIndexedMoeWeights(Data **weights, int count) {
@@ -6453,7 +6483,15 @@ bool RunCudaIndexedMoeWithActivation(const Data &input, Data &output, const Data
     if (input.dims.size() != 2 || !weights || count < 4 || !weights[2] ||
         weights[2]->dims.size() != 2 || input.dims[1] != weights[2]->dims[1]) return false;
     CudaIndexedMoeSlots slots{};
-    if (!GetCudaIndexedMoeSlots(weights, count, slots)) return false;
+    bool exactHalfScales = false;
+    if (!getIndexedSlots(weights, count, slots, exactHalfScales)) return false;
+#ifndef USE_ROCM
+    const int arch = FastllmCudaRuntimeArch();
+    if (arch == 60 || arch == 70) {
+        if (legacy_experts::run(input, output, indices, scores, gateUp, middle, weights, count, slots,
+                                activation, exactHalfScales, arch)) return true;
+    }
+#endif
     return RunCudaIndexedMoeSlots(slots, input, indices, scores, gateUp, middle, output,
                                   weights[2]->dims[0] / 2, activation);
 }

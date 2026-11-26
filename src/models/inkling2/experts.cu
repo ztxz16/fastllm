@@ -353,7 +353,9 @@ __device__ void reconstructRow(Source src, Out out, int d, bool cacheValues, uns
 #endif
         } else {
             const float q = fp4 ? chooseFp4(v, peak, outer).reconstructed : reconstructMxfp8(v, peak);
-            if constexpr (std::is_same_v<Out, half *>)
+            if constexpr (std::is_same_v<Out, half *> && std::is_same_v<Source, RoutedSiTU<float>>)
+                out[size_t(row) * d + col] = __float2half_rn(q); // folded FP32-to-FP16 expert gather
+            else if constexpr (std::is_same_v<Out, half *>)
                 out[size_t(row) * d + col] = __float2half_rz(q);
             else
                 out[size_t(row) * d + col] = q;
@@ -1128,7 +1130,7 @@ void finishNativeRoutes(const Config &c, Rows<__nv_bfloat16> &projected, float *
         projected.p, dstRows, rows, c.hidden, c.topK, c.hidden, c.hidden, groupedLocalIds);
 }
 
-class RoutedExperts : public ExpertBackend, protected CudaMoeActivation {
+class RoutedExperts : public ExpertBackend, public CudaExpertOrderedFp16Activation {
 protected:
     const Data &routerWeight;
     Projection gate, down;
@@ -1139,7 +1141,8 @@ protected:
     void Run(const Data &pair, const Data &scores, Data &mid, int rows, int width) const override {
         auto launch = [&](const auto *pairData, auto *out) {
             using T = std::remove_pointer_t<decltype(out)>;
-            RoutedSiTU<T> source{pairData, static_cast<const float *>(scores.cudaData), gateCap, upCap};
+            using Src = std::remove_cv_t<std::remove_pointer_t<decltype(pairData)>>;
+            RoutedSiTU<Src> source{pairData, static_cast<const float *>(scores.cudaData), gateCap, upCap};
             if constexpr (std::is_same_v<T, __nv_bfloat16>) {
                 if (!gate.fp4 && rows >= smCount && width % 32 == 0) {
                     if (!cuda_launch::Launch<reconstructMxfp8SiTU>(rows, 128, 0, cudaStreamPerThread, source, out, width, situFactors.p))
@@ -1153,6 +1156,8 @@ protected:
             launch(static_cast<const half *>(pair.cudaData), static_cast<half *>(mid.cudaData));
         else if (pair.dataType == BFLOAT16 && mid.dataType == BFLOAT16)
             launch(static_cast<const __nv_bfloat16 *>(pair.cudaData), static_cast<__nv_bfloat16 *>(mid.cudaData));
+        else if (pair.dataType == FLOAT32 && mid.dataType == FLOAT16)
+            launch(static_cast<const float *>(pair.cudaData), static_cast<half *>(mid.cudaData));
         else if (pair.dataType == FLOAT32 && mid.dataType == FLOAT32)
             launch(static_cast<const float *>(pair.cudaData), static_cast<float *>(mid.cudaData));
         else

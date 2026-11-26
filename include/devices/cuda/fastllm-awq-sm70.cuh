@@ -63,5 +63,12 @@ bool PrepareNvfp4InPlace(uint8_t *storage, size_t storageBytes,
 bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
                int tokens, int K, int N, cudaStream_t stream);
 
+// Transient packing preserves the canonical indexed-decode weights. Expert
+// offsets and the weight pointer table live on the GPU; rows start at firstRow.
+size_t GroupedNvfp4WorkspaceBytes(int K, int N, int experts);
+bool GroupedNvfp4(const uint8_t *const *weights, int experts, const int *offsets,
+                  int firstRow, int rows, int K, int N, const half *input,
+                  half *output, void *workspace, cudaStream_t stream, bool measureTiles = false);
+
 }  // namespace awq_sm70
 }  // namespace fastllm

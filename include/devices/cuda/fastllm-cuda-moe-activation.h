@@ -14,6 +14,10 @@ struct CudaMoeActivation {
     virtual ~CudaMoeActivation() = default;
 };
 
+// Run accepts FP32 gate/up in expert order with equally permuted scores.
+// Writing the result to FP16 matches a later round-to-nearest gather.
+struct CudaExpertOrderedFp16Activation : public CudaMoeActivation {};
+
 struct CudaMarlinMxfp8Weights {
     const uint32_t *codes;
     const uint8_t *scales;

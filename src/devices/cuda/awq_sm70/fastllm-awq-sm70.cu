@@ -23,6 +23,7 @@
 #include "src/turbomind/kernels/gemm/cast.h"
 #include "src/turbomind/kernels/gemm/convert.h"
 #include "src/turbomind/kernels/gemm/gemm.h"
+#include "src/turbomind/kernels/gemm/matrix_ptr.h"
 #include "src/turbomind/kernels/gemm/types.h"
 #include "src/turbomind/kernels/gemm/utils.h"
 #include "fastllm-cuda.cuh"
@@ -1051,6 +1052,94 @@ bool GemmNvfp4(const uint8_t *storage, const half *in, half *out,
     }
     releaseTemporary();
     return true;
+}
+
+size_t GroupedNvfp4WorkspaceBytes(int K, int N, int experts) {
+    const size_t elements = size_t(K) * N;
+    const size_t scales = elements / kNvfp4GroupSize * sizeof(half);
+    return experts * (elements / 2 + scales)
+           + 2 * experts * sizeof(tm::StridedPtr) + (experts + 1) * sizeof(int);
+}
+
+// TurboMind HMMA_884 B stores a 32-channel stripe for every eight K
+// values. V is [K/16,N]. Match Converter<uint16_t,uint4_t>'s nibble order.
+__device__ __forceinline__ uint32_t s884Nibbles(uint32_t word) {
+    const uint32_t even = word & 0x0f0f0f0fu, odd = (word >> 4) & 0x0f0f0f0fu;
+    return __byte_perm(even | (even >> 4), odd | (odd >> 4), 0x6420);
+}
+
+static __global__ void packNvfp4S884Group(const uint8_t *const *weights, const int *offsets,
+                                           uint8_t *dst, size_t expertStride, int groups, int N) {
+    const int expert = blockIdx.z;
+    if (offsets[expert] == offsets[expert + 1]) return;
+    constexpr int tile = 16;
+    __shared__ uint3 blocks[32][tile + 1];
+    const int rowBase = blockIdx.y * 32, groupBase = blockIdx.x * tile;
+    const auto *src = reinterpret_cast<const uint3 *>(weights[expert]);
+    // Load block-16 records in their canonical order, then transpose the
+    // tile in shared memory so both weight and scale stores are contiguous.
+    for (int i = threadIdx.x; i < 32 * tile; i += blockDim.x) {
+        const int row = i / tile, g = i % tile;
+        if (groupBase + g < groups)
+            blocks[row][g] = src[size_t(rowBase + row) * groups + groupBase + g];
+    }
+    __syncthreads();
+    dst += expert * expertStride;
+    auto *codes = reinterpret_cast<uint32_t *>(dst) + size_t(rowBase) * groups * 2;
+    auto *scales = reinterpret_cast<half *>(dst + size_t(groups) * N * 8);
+    const int row = threadIdx.x % 32;
+    for (int g = threadIdx.x / 32; g < tile && groupBase + g < groups; g += blockDim.x / 32) {
+        const uint3 block = blocks[row][g];
+        auto *out = codes + size_t(groupBase + g) * 64 + row;
+        out[0] = s884Nibbles(block.x);
+        out[32] = s884Nibbles(block.y);
+        scales[size_t(groupBase + g) * N + rowBase + row] = __float2half_rn(__uint_as_float(block.z));
+    }
+}
+
+static __global__ void groupedOperands(tm::StridedPtr *weights, tm::StridedPtr *scales,
+                                       int *local, const int *offsets, int firstRow, int experts,
+                                       uint8_t *base, size_t payload, size_t stride, int ldw, int lds) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e <= experts) local[e] = offsets[e] - firstRow;
+    if (e < experts) {
+        weights[e] = {base + e * stride, ldw};
+        scales[e] = {base + e * stride + payload, lds};
+    }
+}
+
+bool GroupedNvfp4(const uint8_t *const *weights, int experts, const int *offsets,
+                  int firstRow, int rows, int K, int N, const half *input,
+                  half *output, void *workspace, cudaStream_t stream, bool measureTiles) {
+    PackedLayouts layouts;
+    if (experts <= 0 || experts > 65535 || N / 32 > 65535 || !MakeNvfp4Layouts(K, N, layouts) ||
+        layouts.packedWeight.pack != (tm::HMMA_884 | tm::OPERAND_B | 1) ||
+        layouts.packedScale.pack != (tm::HMMA_884 | tm::OPERAND_V | 1)) return false;
+    const size_t elements = size_t(K) * N, payload = elements / 2;
+    const size_t stride = payload + elements / kNvfp4GroupSize * sizeof(half);
+    auto *packed = static_cast<uint8_t *>(workspace);
+    const int groups = K / kNvfp4GroupSize;
+    packNvfp4S884Group<<<dim3((groups + 15)/16, N/32, experts),256,0,stream>>>(
+        weights, offsets, packed, stride, groups, N);
+    auto *w = reinterpret_cast<tm::StridedPtr *>(packed + experts * stride);
+    auto *v = w + experts;
+    auto *local = reinterpret_cast<int *>(v + experts);
+    groupedOperands<<<(experts + 256) / 256, 256, 0, stream>>>(
+            w, v, local, offsets, firstRow, experts, packed, payload, stride,
+            layouts.packedWeight.ld, layouts.packedScale.ld);
+    tm::MatrixLayout a{turbomind::kHalf, tm::kRowMajor, rows, K, K};
+    tm::MatrixLayout d{turbomind::kHalf, tm::kRowMajor, rows, N, N};
+    a.num = d.num = layouts.packedWeight.num = layouts.packedScale.num = experts;
+    a.offsets = d.offsets = local;
+    layouts.packedWeight.ld = layouts.packedScale.ld = 0;
+    tm::Operation op{};
+    op.quant_b = {tm::QuantType::kK, kNvfp4GroupSize};
+    op.dispatch = measureTiles ? tm::DispatchPolicy::kMeasure : tm::DispatchPolicy::kReuse;
+    DeviceRuntime &runtime = GetRuntime(CurrentDevice());
+    std::lock_guard<std::mutex> lock(runtime.runMutex);
+    // A no-split launch needs no shared reduction workspace across streams.
+    return runtime.gemm->Run(op, 1.f, input, a, nullptr, {}, w, layouts.packedWeight,
+                             v, layouts.packedScale, 0.f, output, d, output, d, {}, stream) == 0;
 }
 
 }  // namespace awq_sm70
