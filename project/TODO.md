@@ -376,6 +376,21 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
 
 ## PD 分离实现清单
 
+- [ ] **按八阶段计划实施单机 PD 分离。** 2026-11-26 用户授权开始全量代码实现。
+  实施计划见 [IMPLEMENTATION_PLAN.md](../docs/pd_disaggregation/IMPLEMENTATION_PLAN.md)。
+  当前为八阶段首版代码接入（未验收）：JSON 身份与布局握手、KV 映射、CUDA IPC、异步管理、分页 KV、
+  P/D 推送与拉取、逐层通知、D→P 保留/拉取、D 本地重算及独立采样状态、八种 Router 策略、
+  健康/注册/注销/重试/统一输出、完整服务 Router 入口；Qwen2 MoE 普通 TP、Attention DP/EP
+  联合轮次与连续 KV GPU 交接缓冲、内部 `load`、P 本地缓存优先与远端缺失部分拉取已添加源代码。
+  尚未完成：服务器编译、四种混合部署验收、完整并发/抢占压力与原生 rank 故障矩阵、
+  原有完整推理回归、性能结果和真实重叠证据；已有 Attention DP/EP 问题保持原状态。
+  已添加 41 个 CPU 协议用例、20 个 HTTP Router 故障用例、24 个实际 GPU IPC 用例、
+  每部署组合 15 个正式生成场景、7 个真实服务生命周期场景及 6 个性能用例（每项 5 轮）、后台启动器和四格式报告，
+  均未执行。运行范围、部署矩阵与验证步骤见 [RUNNING.md](../docs/pd_disaggregation/RUNNING.md)。
+  验证：本地仅执行 Python AST 解析和差异空白检查；未执行功能测试或编译。
+  以上代码尚未完成端到端验证，服务器编译及 GPU 验收未执行，不标记验收成功。
+  下方条目的既有日期记录保留作为历史设计状态；2026-11-26 的实现进度以本条及运行说明为准。
+
 设计说明、功能清单和四张框架图统一放在
 [PD 分离设计与实现清单](../docs/pd_disaggregation/README.md)，本节继续维护待办内容与状态。
 
