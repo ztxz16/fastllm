@@ -25,6 +25,9 @@ namespace fastllm {
     bool HostMoeIsUnbound();
     bool CanRunHostMoe(const DataDict &datas, const IntDict &params);
     void RegisterUnboundHostMoe(Data *const *weights, int count);
+    bool CanImportHostMoeBlock32(const Data &source);
+    // A zero shard count selects unbound CPU placement. A positive count uses NUMA row shards.
+    bool TryImportHostMoeBlock32(Data &destination, const Data &first, const Data *up, int numaShards);
     void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data*, std::string>> &weights,
         bool unbound, const std::function<void(size_t)> &onProgress = {});
     int GetNumasMoeShardCount();

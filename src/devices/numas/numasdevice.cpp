@@ -4462,6 +4462,62 @@ namespace fastllm {
         if (!pending.empty()) RegisterHostMoeWeightBatch(pending, true);
     }
 
+    bool CanImportHostMoeBlock32(const Data &source) {
+        return source.dataType == NVFP4 && source.blockM == 32 && source.dims.size() == 2 &&
+               source.dims[0] > 0 && source.dims[1] > 0 && !source.isDiskWeight && !source.isFake && !source.mapFile &&
+               source.dataDevice == DataDevice::CPU && source.numasData.empty() &&
+               NumasNvfp4Block32Available() && GetNVFP4ScaleData(source) != nullptr;
+    }
+
+    bool TryImportHostMoeBlock32(Data &destination, const Data &first, const Data *up, int numaShards) {
+        if (!CanImportHostMoeBlock32(first) || !destination.numasData.empty()) return false;
+        if (up) {
+            if (&destination == &first || &destination == up || destination.cpuData ||
+                !CanImportHostMoeBlock32(*up) || up->dims != first.dims ||
+                up->blockK != first.blockK || first.dims[0] > INT_MAX / 2 ||
+                destination.dims != std::vector<int>{2 * first.dims[0], first.dims[1]}) return false;
+        } else if (&destination != &first) {
+            return false;
+        }
+        const int rows = first.dims[0], columns = first.dims[1];
+        const int nodeCount = std::max(1, numaShards);
+        if (numaShards < 0 || rows % nodeCount != 0) return false;
+        const int rowsPerNode = rows / nodeCount;
+        const size_t rowBytes = GetDataBytes(NVFP4_BLOCK_32_E8M0, 1, columns);
+        const size_t shardBytes = size_t(rowsPerNode) * (up ? 2 : 1) * rowBytes;
+        const size_t rawRowBytes = GetDataBytes(NVFP4, 1, columns);
+        const size_t scaleCols = (columns - 1) / 32 + 1;
+        const uint8_t *firstScales = GetNVFP4ScaleData(first);
+        const uint8_t *upScales = up ? GetNVFP4ScaleData(*up) : nullptr;
+        uint8_t maxScale = 0;
+        auto pack = [&](int node, uint8_t *dst) {
+            for (int row = node * rowsPerNode; row < (node + 1) * rowsPerNode; ++row) {
+                const size_t srcOffset = row * rawRowBytes;
+                const size_t scaleOffset = (row / first.blockK) * scaleCols;
+                maxScale = std::max(maxScale, PackHostBlock32Row(columns, first.cpuData + srcOffset,
+                                                                firstScales + scaleOffset, dst));
+                dst += rowBytes;
+                if (up) {
+                    maxScale = std::max(maxScale, PackHostBlock32Row(columns, up->cpuData + srcOffset,
+                                                                    upScales + scaleOffset, dst));
+                    dst += rowBytes;
+                }
+            }
+        };
+        if (!StoreHostMoeMatrix(destination, shardBytes, numaShards,
+                                MoeEnvConfig::GetInstance().GetPinnedWeight(), pack)) return false;
+        destination.hostMoeUnbound = numaShards == 0;
+        destination.numasNVFP4AllScalesFuseMagic = maxScale <= 190;
+        destination.dataType = NVFP4_BLOCK_32_E8M0;
+        destination.blockK = first.blockK;
+        destination.blockM = first.blockM;
+        destination.expansionBytes = shardBytes * nodeCount;
+        // A down projection owns the source payload in the same Data object.
+        delete[] destination.cpuData;
+        destination.cpuData = nullptr;
+        return true;
+    }
+
     void RegisterHostMoeWeightBatch(const std::vector<std::pair<Data*, std::string>> &weights,
             bool unbound, const std::function<void(size_t)> &onProgress) {
         HostMoePlacementScope placement(unbound);
