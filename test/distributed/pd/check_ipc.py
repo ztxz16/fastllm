@@ -16,7 +16,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools"))
 from fastllm_pytools.pd.protocol import Peer, Identity, Layout, Region, Manifest, ProtocolError, token_digest
 from fastllm_pytools.pd.mapping import plan_transfer
-from fastllm_pytools.pd.cuda_ipc import CudaIPC, _Handle
+from fastllm_pytools.pd.cuda_ipc import CudaIPC
+from cuda_fixture import CudaFixture, _Handle
 from fastllm_pytools.pd.tasks import TransferManager, State
 from report import run
 
@@ -29,7 +30,7 @@ def owner(pipe, source, tp, paged, devices, mode):
     """/** 子进程持有真实 GPU 分配；父进程仅收到 IPC 元数据，结束通知后才释放。 */"""
     allocations = []
     try:
-        backend = CudaIPC()
+        backend = CudaFixture()
         backend._start()
         cuda = backend._cuda
         cuda.cudaMalloc.argtypes = [C.POINTER(C.c_void_p), C.c_size_t]
@@ -223,7 +224,7 @@ def main():
     cases += [(f"ipc_{mode}_{fault}", lambda m=mode, f=fault: ipc_case(devices, 2, 1, m, f))
               for mode in ("pull", "push") for fault in ("reject_request", "reject_boot", "reject_digest",
                   "reject_overlap", "cancel_before", "cancel_after_layer")]
-    return run(cases, args.output, backend="production TransferManager + CudaIPC", metadata_extra=dict(gpu=gpu),
+    return run(cases, args.output, backend="production C++ TransferManager + CUDA Runtime IPC", metadata_extra=dict(gpu=gpu),
         scope="24 个跨进程 GPU 内容、拒绝后无写入、取消及迟到通知用例；逻辑分片复用物理 GPU，不代表模型 TP4 部署验收")
 
 

@@ -282,7 +282,7 @@ def main():
                   replace(manifest(D, 1), identity=replace(IDENTITY, request="other"))))),
               ("reject_model_mismatch", lambda: rejects(lambda: plan_transfer(manifest(P, 1),
                   replace(manifest(D, 1), layout=replace(manifest(D, 1).layout, model="other")))))]
-    return run(cases, args.output, backend="CPU protocol simulation; no CUDA execution")
+    return run(cases, args.output, backend="production C++ protocol/mapping/scheduling; simulated transfer completion")
 
 
 if __name__ == "__main__":

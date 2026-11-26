@@ -134,7 +134,7 @@ def main():
             cases.append((f"{'pd' if pd else 'full'}_{failure}",
                           lambda p=pd, f=failure: case(p, f)))
         cases.append((f"{'pd' if pd else 'full'}_after_response", lambda p=pd: case(p, "partial", True)))
-    return run(cases, args.output, backend="production Router + real HTTP fault stub",
+    return run(cases, args.output, backend="production C++ Router + real HTTP fault stub",
                scope="20 个完整服务/PD Router 重试边界用例；不替代 CUDA 故障和模型集成验收")
 
 
