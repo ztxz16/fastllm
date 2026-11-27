@@ -1,0 +1,77 @@
+{
+  "created_utc_date": "2026-11-26",
+  "generator": "built-in image_gen",
+  "scope": "当前工作区的 Attention DP/EP；四卡示例；非 PD 分离方案",
+  "images": [
+    {
+      "file": "01_overview.png",
+      "title": "图 1｜Attention DP/EP：四张卡怎样分工",
+      "prompt": "Use case: infographic-diagram. Draw a precise Chinese engineering architecture diagram for FastLLM's CURRENT Attention DP/EP implementation, not a proposed generic architecture. This is one of a coordinated series of THREE standalone progressively detailed images. High resolution, landscape 16:10, white background, navy typography, large sharp readable Simplified Chinese labels, rounded rectangular modules with thin outlines, clear orthogonal arrowheads, generous whitespace, no photos, no mascot, no decoration. Consistent palette across this series: pale blue for replicated/local model computation, orange for sharded routed experts, teal for rank-local KV/cache, purple for EP communication and CUDA Graph execution, green for output Tokens, gray dashed arrows for CPU control. Keep identical terms and colors. Draw all text exactly and legibly. Prioritize correct connectivity over symmetry. No unrequested extra features, no All-to-All, no hidden extra GPUs, no remote shared KV pool, no TP shard across attention heads, no claim that batch invariance is fully validated. Footer date “当前代码视图 · 2026-11-26”.\nThis is figure 1, a clear physical deployment and model-weight placement overview.\nTitle “图 1｜Attention DP/EP：四张卡怎样分工”\nSubtitle “四卡示例 · Attention DP = 4 · EP = 4 · TP = 1 · 单个 EP 组”\nTop left short conceptual takeaway in bold: “Attention 按请求分工，MoE 按专家分工”.\nAt top a compact CPU control chain with three boxes: “调用方 / HTTP / CLI” → “Python 会话调度器” → “原生协调器（CPU）”. Scheduler small labels “等待队列 · 选择空闲 rank”; coordinator small labels “统一下发轮次 · 接收 logits 并采样”. Add an explicit green return arrow from coordinator through scheduler toward caller labelled “输出 Token”; do not show GPU sampling.\nUnder the CPU chain place one large boundary labelled “同一个 EP 通信组：rank 0–3” containing exactly FOUR equally wide GPU columns, left to right “GPU 0 / rank 0”, “GPU 1 / rank 1”, “GPU 2 / rank 2”, “GPU 3 / rank 3”. A gray dashed control bus connects coordinator to all four columns. A separate sparse green return connection labelled “各 rank 的 logits” goes from GPUs back toward the CPU coordinator.\nIn each column put a small request tag, respectively “请求 A”, “请求 B”, “请求 C”, “请求 D”. Each request belongs to ONLY its local column. Each column contains exactly these ownership bands, not a strict execution pipeline:\nBLUE “完整 Attention 权重” with smaller “Q/K/V · O 投影”; TEAL “本 rank 的 KV / 前缀缓存”; BLUE “其他复制权重” with smaller “Embedding · Norm · Router” and “共享专家 · LM Head”; ORANGE “本 rank 的路由专家” with respectively “E0、E4、E8 …”, “E1、E5、E9 …”, “E2、E6、E10 …”, “E3、E7、E11 …”.\nMake it unmistakable that every GPU has the same non-routed-expert weights, but each has distinct KV belonging to different requests. Do not connect KV boxes across GPUs.\nAt bottom within the EP boundary draw a PURPLE communication bus connecting all four orange expert bands, labelled “每层协同：汇集 Token 与路由 → 本地专家计算 → 返回专家贡献”, add “详细数据流见图 2”.\nBelow the group put two concise explanatory callouts: “专家归属：expert_id % 4” and “每 rank 最多 1 个活动请求；其余请求排队”.\nA final two-line caption: “请求的 Attention 和 KV 留在所属 rank” / “同一请求的 MoE 可以使用其他 rank 上的专家”.\nSmall source footer above date: “依据：parallel_config.py:234；qwen3_shard_loader.cpp:311、421”.\nDo not add individual expert-count numbers or a complete-layer execution arrow between ownership bands. No claim all four GPUs are independent full-model replicas: they cooperate in EP."
+    },
+    {
+      "file": "02_layer_flow.png",
+      "title": "图 2｜展开一层：Token 怎样经过 MoE",
+      "prompt": "Use case: infographic-diagram. Draw a precise Chinese engineering architecture diagram for FastLLM's CURRENT Attention DP/EP implementation, not a proposed generic architecture. This is one of a coordinated series of THREE standalone progressively detailed images. High resolution, landscape 16:10, white background, navy typography, large sharp readable Simplified Chinese labels, rounded rectangular modules with thin outlines, clear orthogonal arrowheads, generous whitespace, no photos, no mascot, no decoration. Consistent palette across this series: pale blue for replicated/local model computation, orange for sharded routed experts, teal for rank-local KV/cache, purple for EP communication and CUDA Graph execution, green for output Tokens, gray dashed arrows for CPU control. Keep identical terms and colors. Draw all text exactly and legibly. Prioritize correct connectivity over symmetry. No unrequested extra features, no All-to-All, no hidden extra GPUs, no remote shared KV pool, no TP shard across attention heads, no claim that batch invariance is fully validated. Footer date “当前代码视图 · 2026-11-26”.\nThis is figure 2, the deeper data-flow explanation of a single Transformer layer across the SAME four ranks. Layout as five horizontal levels; top and bottom local rank lanes align left to right as rank 0/1/2/3. All communication is GPU NCCL data, not CPU routing.\nTitle “图 2｜展开一层：Token 怎样经过 MoE”\nSubtitle “Attention 本地完成；路由专家跨四卡协作；结果回到请求所属 rank”\nLevel 1: four aligned blue cards labelled rank 0, rank 1, rank 2, rank 3. Each has two stacked lines “本地 Attention + 残差” then “Norm → Router / Top-K”. A small teal “本地 KV” attached to Attention in each card. Label the outputs as h0 / h1 / h2 / h3. Add a short top note “每个 Token 单独选专家；同一专家可接收多个请求的 Token”.\nLevel 2: Four data arrows go DOWN from rank-local Router outputs into one full-width PURPLE bar: “① AllGather：隐藏状态 + 专家 ID + 路由权重”. Immediately under it centered small text: “每个 rank 得到全组数据；按专家整理 Token 行”. This bar fans DOWN to all four expert-owner boxes below, not just a single owner. Do not show all-to-all.\nLevel 3: Four ORANGE expert-owner cards with headings “rank 0”, “rank 1”, “rank 2”, “rank 3”; expert sets respectively “E0、E4 …”, “E1、E5 …”, “E2、E6 …”, “E3、E7 …”. In each show “按专家合批” → “Gate/Up → SwiGLU → Down” → “乘路由权重”. Use compact downward layout inside each card; all each expert matrices have Token rows. Put a shared thin label under the row “各 rank 只计算自己持有的路由专家”.\nA small orange callout aligned to this row, outside the main arrows: “可选批次不变后端：替换专家 Gate/Up、Down GEMM”. Do not describe all model layers as batch invariant.\nLevel 4: Four DOWN arrows from expert-owner cards into a full-width PURPLE bar “② ReduceScatter：按请求所属 rank 返回各 Top-K 槽的贡献”. Small text inside or just under: “每槽仅一个专家 owner 写入；其他 rank 对应槽为 0”. This is NOT a complete cross-expert sum inside NCCL.\nLevel 5: Downward arrows to four matching local output cards rank 0/1/2/3. Each card shows “按专家 ID 升序求和” then “+ 本地共享专家结果” then “+ 残差 → 下一层”. First line small precision note “FP16 逐次累加”. Shared expert is a LOCAL branch using this rank's Norm output and its local gating. To make this branch explicit WITHOUT spaghetti draw ONE prominent teal-blue side explanation strip below the four output cards: “本地分支：Norm 输出 → 共享专家 × sigmoid(门控) → 加入本 rank 输出”. This represents the same local branch on all four ranks; it is NOT an extra communication step and NOT automatically concurrent execution.\nBottom takeaway “跨卡移动激活、路由和专家贡献；KV 留在本 rank”.\nSmall footnote “箭头表示数据依赖，不表示共享专家与路由专家并发执行”.\nSmall source footer “依据：qwen3_layer.cu:698、707、737、777、780、782”.\nExact ordering is AllGather THEN four owned-expert computations THEN ReduceScatter THEN ordered expert sum THEN add local shared expert and residual. No extra AllReduce. Do not skip the shared expert."
+    },
+    {
+      "file": "03_scheduler_cache_graph.png",
+      "title": "图 3｜运行起来：调度、缓存与 Graph",
+      "prompt": "Use case: infographic-diagram. Draw a precise Chinese engineering architecture diagram for FastLLM's CURRENT Attention DP/EP implementation, not a proposed generic architecture. This is one of a coordinated series of THREE standalone progressively detailed images. High resolution, landscape 16:10, white background, navy typography, large sharp readable Simplified Chinese labels, rounded rectangular modules with thin outlines, clear orthogonal arrowheads, generous whitespace, no photos, no mascot, no decoration. Consistent palette across this series: pale blue for replicated/local model computation, orange for sharded routed experts, teal for rank-local KV/cache, purple for EP communication and CUDA Graph execution, green for output Tokens, gray dashed arrows for CPU control. Keep identical terms and colors. Draw all text exactly and legibly. Prioritize correct connectivity over symmetry. No unrequested extra features, no All-to-All, no hidden extra GPUs, no remote shared KV pool, no TP shard across attention heads, no claim that batch invariance is fully validated. Footer date “当前代码视图 · 2026-11-26”.\nThis is figure 3, runtime behavior zoomed in from figure 1, using the same four ranks and no additional GPUs. Large readable Chinese, restrained details.\nTitle “图 3｜运行起来：调度、缓存与 Graph”\nSubtitle “一个调度线程组织联合轮次；所有 rank 按相同顺序参与 EP 通信”\nTop third show a left-to-right control pipeline:\n“等待队列 A、B、C、D、E …” → “选择空闲 rank” → “4 个活动槽位” → “原生协调器下发联合轮次”.\nUnder selection put two implemented labels “round_robin” and “prefix：优先匹配空闲 rank 的前缀”. A small gray dashed tag beside selection “load：待实现”. Under slots “每 rank 最多 1 个活动请求”. This clearly distinguishes incoming concurrency (e.g. 8) from only 4 simultaneously active requests.\nMiddle half is a crisp 5-row table headed “示例时序（已开启 CUDA Graph）”. Columns: “轮次”, “rank 0”, “rank 1”, “rank 2”, “rank 3”, “整组执行”.\nExactly these rows:\n“1” | “Begin A” | “Begin B” | “Idle” | “Idle” | “Eager”\n“2” | “Decode A” | “Decode B” | “Begin C” | “Begin D” | “Eager”\n“3” | “Decode A” | “Decode B” | “Decode C” | “Decode D” | “Graph”\n“4” | “End A” | “Decode B” | “Decode C” | “Decode D” | “Graph”\n“5” | “Begin E” | “Decode B” | “Decode C” | “Decode D” | “Eager”\nUse blue fill for Begin, light neutral for Decode, gray for Idle/End, purple for Graph execution. Show only a left vertical arrow “时间向下”. Tiny legend “Begin：新请求 / Prefill；End：结束并释放槽位”. Bold explanation directly underneath table “本轮有新 Prefill → Eager；无新 Prefill 且有 Decode → 可用 Graph”. Small second note “Idle / End rank 仍参与有计算的联合轮次中的专家通信”.\nBottom third has TWO equal information panels:\nLEFT teal “KV 与前缀缓存（每 rank 独立）”, with flow “本地查找 → 恢复命中 KV → 计算剩余 Prompt”. Three short labels: “请求持续绑定该 rank”, “End 清活动状态；前缀快照可保留”, “清缓存：暂停准入，等待活动请求结束”.\nRIGHT purple “CUDA Graph（每 rank 本地）”, flow “首次准备 / 捕获 → 后续重放”. Three short labels: “固定缓冲地址跨请求复用”, “每轮更新 Token、位置、历史长度与活动掩码”, “模型关闭时释放 Graph 与 KV 预留”.\nFinal banner “请求分开管理；专家计算按联合轮次推进”.\nSmall source footer “依据：qwen_moe_process_session.py:232、251、297、382；qwen3_layer.cu:1407”.\nDo not imply requests migrate between ranks during generation, no global KV pool, no claim load routing is enabled, no claim Graph changes model semantics or guarantees batch invariance."
+    }
+  ],
+  "source_files": [
+    {
+      "path": "tools/fastllm_pytools/parallel_config.py",
+      "lines": [
+        234,
+        236,
+        242,
+        243
+      ]
+    },
+    {
+      "path": "src/distributed/qwen3_shard_loader.cpp",
+      "lines": [
+        306,
+        311,
+        376,
+        421,
+        433
+      ]
+    },
+    {
+      "path": "tools/fastllm_pytools/qwen_moe_process_session.py",
+      "lines": [
+        98,
+        232,
+        251,
+        297,
+        382
+      ]
+    },
+    {
+      "path": "tools/src/moe_generate.cpp",
+      "lines": [
+        135,
+        143,
+        163,
+        169
+      ]
+    },
+    {
+      "path": "src/distributed/qwen3_layer.cu",
+      "lines": [
+        698,
+        707,
+        737,
+        741,
+        777,
+        780,
+        782,
+        889,
+        1371,
+        1407
+      ]
+    }
+  ]
+}

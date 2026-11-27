@@ -1,0 +1,91 @@
+{
+  "captured_at_utc": "2026-11-26T09:15:06.957748+00:00",
+  "git_head": "272d4c23ccc98f9f6f9317b2f2e90e5097bdc079",
+  "basis": "Current local workspace, including uncommitted edits; code inspection only. Routing load is newly connected and awaits validation.",
+  "source_files": [
+    {
+      "path": "tools/fastllm_pytools/parallel_config.py",
+      "lines": [
+        234,
+        236,
+        242,
+        243
+      ],
+      "sha256": "59b341e6764212001b5016c3d91ae2a4fc4f520c98cbb7daa2802c5318a305c0",
+      "modified_in_worktree": true
+    },
+    {
+      "path": "src/distributed/qwen3_shard_loader.cpp",
+      "lines": [
+        306,
+        311,
+        376,
+        421,
+        433
+      ],
+      "sha256": "d7bfd763b363c3d2d2e5ced4f5d6dee061954b75e73398e32645f3c7a16b38ea",
+      "modified_in_worktree": false
+    },
+    {
+      "path": "tools/fastllm_pytools/qwen_moe_process_session.py",
+      "lines": [
+        98,
+        179,
+        243,
+        262,
+        315,
+        400
+      ],
+      "sha256": "afe4b4ec0102fd548b50c6e99106cefbe7c4e8ffed6c02cd46eccd36f3b36476",
+      "modified_in_worktree": true
+    },
+    {
+      "path": "tools/src/moe_generate.cpp",
+      "lines": [
+        135,
+        143,
+        163,
+        169
+      ],
+      "sha256": "d998cb89343b4fddcb210b9f08ddc14d5dff8ba7c318799bd6ba4d3711b89638",
+      "modified_in_worktree": false
+    },
+    {
+      "path": "src/distributed/qwen3_layer.cu",
+      "lines": [
+        698,
+        707,
+        737,
+        741,
+        777,
+        780,
+        782,
+        889,
+        1371,
+        1407
+      ],
+      "sha256": "31be87eaecc0cda61c4d4b735c77b2ae3d2393bfb77e2569c2bd5920e49f1e64",
+      "modified_in_worktree": true
+    }
+  ],
+  "artifacts": [
+    {
+      "file": "01_overview.png",
+      "width": 1585,
+      "height": 992,
+      "sha256": "6fa21b1ff28bf1c151a9f29710bcec1ddb553bb68a6cf41ed1d0ac56e74bbc3b"
+    },
+    {
+      "file": "02_layer_flow.png",
+      "width": 1586,
+      "height": 992,
+      "sha256": "698ab3155eeca26e6615a3ab4596ada61056ef2a4cb1c517cffc9ab13947e169"
+    },
+    {
+      "file": "03_scheduler_cache_graph.png",
+      "width": 1585,
+      "height": 992,
+      "sha256": "d80bc07885ecbad1b1e3243d295d1b823361e1fee461a35019bca34da2be481a"
+    }
+  ]
+}

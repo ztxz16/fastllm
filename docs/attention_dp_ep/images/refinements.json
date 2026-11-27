@@ -1,0 +1,35 @@
+{
+  "generator": "built-in image_gen",
+  "edits": [
+    {
+      "image": 0,
+      "source": "/root/.codex/generated_images/01a1d50e-6ef3-7d72-a35f-30c61b68757f/exec-240e1a1c-6ddc-48a4-a7d9-666d8974c2fb.png",
+      "file": "01_overview.png",
+      "prompt": "Edit this technical diagram with one precise change only. Preserve all Chinese text, layout, colors, GPU columns, expert labels, communication bus, footer, and every other part exactly.\nCorrect the GREEN output Token return path across the TOP THREE CPU boxes. Currently a single continuous green bus runs from the native coordinator to both Python session and caller; replace it with TWO SEPARATE green return arrow segments:\nSegment 1 originates at the bottom of “原生协调器（CPU）”, bends left in the whitespace below the boxes, and has its arrowhead pointing UP INTO the bottom-right part of “Python 会话调度器”.\nSegment 2 originates at the bottom-left part of “Python 会话调度器”, bends left in that whitespace, and has its arrowhead pointing UP INTO the bottom of “调用方 / HTTP / CLI”.\nThere must be a visible gap between the two segments below the Python box; they connect ONLY THROUGH the Python session box, not a shared continuous line.\nKeep “输出 Token” label above or beside this return path. Keep the independent green “各 rank 的 logits” arrow into the coordinator on the upper right unchanged. Keep gray forward request arrows caller→Python→native unchanged. Do not move other modules. No other changes."
+    },
+    {
+      "image": 2,
+      "source": "/root/.codex/generated_images/01a1d50e-6ef3-7d72-a35f-30c61b68757f/exec-dd1ef768-f9c5-471a-b708-d1f8f8460385.png",
+      "file": "03_scheduler_cache_graph.png",
+      "prompt": "Edit this technical diagram with only the following two related text corrections to clarify its staggered-admission example. Preserve all other elements, timing table cells, arrows, colors, typography, panels, footer and Graph/Eager choices exactly.\n1. In the TOP LEFT queue box, replace the two existing lines “等待队列 A、B、C、D、E…” and “并发请求：8（示例）” with THREE large readable lines:\n“请求到达 / 等待队列”\n“A/B 先到，C/D 次轮到”\n“E 等待空闲槽位”\nKeep the same box and its arrow into “选择空闲 rank”. No “并发请求：8” text should remain.\n2. Change the timing table title from “示例时序（已开启 CUDA Graph）” to “分批到达示例（已开启 CUDA Graph）”.\nDo not change ANY table row. Rows must remain:\n1 Begin A | Begin B | Idle | Idle | Eager\n2 Decode A | Decode B | Begin C | Begin D | Eager\n3 Decode A | Decode B | Decode C | Decode D | Graph\n4 End A | Decode B | Decode C | Decode D | Graph\n5 Begin E | Decode B | Decode C | Decode D | Eager.\nAll other diagram content remains unchanged."
+    },
+    {
+      "image": 0,
+      "file": "01_overview.png",
+      "source": "/root/.codex/generated_images/01a1d50e-6ef3-7d72-a35f-30c61b68757f/exec-dcc411c5-501d-4236-aa0a-2ebe697e5581.png",
+      "prompt": "Make exactly ONE tiny correction to this diagram; leave the entire rest of the image unchanged. Remove the green triangular arrowhead at pixel approximately (640, 200), immediately under the LEFT HALF of the Python 会话调度器 box. Preserve its thin green vertical line connected to the bottom of the Python box: this is the START of the outgoing return segment, so it has NO arrowhead there. The left U-shaped green line must have ONLY ONE arrowhead, pointing UP into 调用方 / HTTP / CLI at x=248. Keep the separate right U-shaped green line and its UP arrowhead at x=752 into Python unchanged. Do not add new arrows. Keep all text, all boxes, all other lines, all colors, footer and layout identical."
+    },
+    {
+      "image": 0,
+      "file": "01_overview.png",
+      "source": "/root/.codex/generated_images/01a1d50e-6ef3-7d72-a35f-30c61b68757f/exec-dcc411c5-501d-4236-aa0a-2ebe697e5581.png",
+      "prompt": "Edit ONLY the CPU communication arrows in the top portion of this technical diagram; preserve all boxes, words, GPU columns, footer, and the rest of the drawing. Replace BOTH green U-shaped paths beneath the three CPU boxes with TWO SIMPLE STRAIGHT HORIZONTAL GREEN ARROWS BETWEEN the CPU boxes. DELETE every green U-shaped line and its upward arrowheads underneath the caller and Python boxes. Keep the label 输出 Token centered below the CPU row. In the gap between Python and caller, draw one GREEN horizontal arrow pointing LEFT: start at Python left edge, end with arrowhead at caller right edge. In the gap between native coordinator and Python, draw one GREEN horizontal arrow pointing LEFT: start at native coordinator left edge, end with arrowhead at Python right edge. Each gap now contains two vertically separated horizontal arrows: GRAY rightward request arrow above and GREEN leftward response arrow below. Move the existing GRAY rightward arrow up slightly within each gap so the green return arrow fits below it. Every return arrow points left, never upward. The result must clearly read caller → Python → native coordinator for requests, native coordinator → Python → caller for Token responses. Preserve the green logits arrow on the right into native coordinator, and preserve the gray dashed control line from native coordinator to all GPU workers. Keep everything else unchanged."
+    },
+    {
+      "image": 2,
+      "file": "03_scheduler_cache_graph.png",
+      "source": "/root/.codex/generated_images/01a1d50e-6ef3-7d72-a35f-30c61b68757f/exec-b2b38eef-2cb5-4743-a489-ed625e7c9acb.png",
+      "prompt": "Update only the routing labels and source footer in this engineering diagram, reflecting current local code edits. Preserve every timing table cell, cache/Graph panel, arrows, colors and overall layout. 1. Replace the top-middle heading 选择空闲 rank with 路由与准入. Keep round_robin and prefix labels unchanged. 2. Replace the dashed load box text with three centered lines: load / 已接入 / 待验证. This means code is newly connected but runtime validation is still pending. 3. Replace the timing table title with: 轮转分配 / 分批到达示例（已开启 CUDA Graph）. Keep its rows exactly as before. 4. Replace the source footer at bottom left with this exact text: 依据：qwen_moe_process_session.py:179、243、262、315、400；qwen3_layer.cu:1407. Retain date 2026-11-26 at bottom right. Nothing else should change."
+    }
+  ]
+}
