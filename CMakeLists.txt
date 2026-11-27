@@ -244,6 +244,7 @@ endif()
 
 if (USE_CUDA)
     enable_language(CUDA)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/fastllm_cccl.cmake")
     if (CMAKE_BUILD_TYPE STREQUAL "Release" AND CMAKE_CUDA_FLAGS_RELEASE STREQUAL "")
         set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "CUDA release flags" FORCE)
     endif()

@@ -62,6 +62,7 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-26](#pd-26) | 推送与拉取的完成判断 | 已接入 | 已通过（缺层/完成用例） | 部分验收 | 补多 rank 通知与首 Token 联动验收 |
 | [PD-27](#pd-27) | 统一入口、输出顺序与断连 | 已接入 | 已通过（Router 20/20） | 部分验收 | 验真实模型流式输出、去重及断连 |
 | [PD-28](#pd-28) | 交接状态机与 KV 占用管理 | 已接入 | 已通过（取消/释放用例） | 部分验收 | 补真实服务超时、故障与资源释放矩阵 |
+| [PD-29](#pd-29) | FlashInfer/CCCL 在 CUDA 12.6 的依赖构建 | 已接入（固定完整依赖） | 待验证（仅静态检查） | 未验收 | V100 服务器前台重新配置并构建四个目标 |
 
 ### Attention DP/EP
 
@@ -835,6 +836,29 @@ Attention DP/EP 的 `load` 路由与保持不变性的 Split-K 属于已记录�
   GGUF 各 `.cpp` 在 AVX+F16C 配置下的 AVX2/FMA 专用指令名称检查、差异空白检查通过。
   未在本地编译，未执行模型或量化输出验证，不标记验收成功。
   下一步：服务器前台重新构建三个原生程序，验证普通 GGUF 点积回退及正式模型 PD/非 PD 推理。
+
+</details>
+
+<a id="pd-29"></a>
+
+<details>
+<summary>PD-29｜FlashInfer/CCCL 在 CUDA 12.6 的依赖构建</summary>
+
+**验收对象**：CUDA 12.6、V100 上配置成功，依赖版本与头文件来源明确，
+`fastllm_pd_core`、`fastllm_tp_generate`、`fastllm_moe_generate`、`fastllm_tp_worker` 四个目标编译通过。
+正式模型、采样和注意力输出继续由既有模型验收事项覆盖，不以编译通过代替推理验收。
+
+2026-11-27 服务器证据：FlashInfer `sampling.cuh` 报 `cuda::maximum`、`cuda::minimum` 不存在。
+CUDA 12.6 默认配套 CCCL 2.5，当前 FlashInfer 的采样和快速除法路径要求更新接口。
+FT 在 `cmake/fastllm_cccl.cmake`（CMake/Git）接入 CCCL v3.3.2 完整固定提交
+`876867684f7fac130e0f5911236e0a92a970d4fd`，同时配置 CUB、Thrust、libcudacxx（CUDA C++），
+保持第三方源码与 FT 推理调用原样。现有 Toolkit 已满足接口时复用，否则自动获取到构建目录；
+支持离线指定同版本完整 checkout，拒绝版本不符、源码改动与降级。
+
+本地仅完成固定版本、接口头文件与构建接入的静态 Review；未运行 CMake、编译或 GPU 测试。
+CCCL 3.x 的 SM70 不在上游常规 CI 中，实际构建与推理结果须由服务器确认。
+此前四项基础验收记录保持原有范围，不表示本次依赖升级已通过。
+说明见 [CCCL 构建依赖](../tools/third_party/README.md#flashinfer-的-cccl-构建依赖2026-11-27)。
 
 </details>
 

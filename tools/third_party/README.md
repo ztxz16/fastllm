@@ -66,3 +66,44 @@ python3 tools/third_party/verify_gguf.py
   无 AVX2 路径下 IQ2_XS、IQ2_S、IQ3_XXS 的点积仍未提供，不能宣称支持所有格式。
 - CPU FP16/BF16 条件修正仍需实际输出验证；按项目规则分别记录 exact/Top-K 的 FAIL
   与仅 numeric 的 WARNING，保留所有差异证据。
+
+## FlashInfer 的 CCCL 构建依赖（2026-11-27）
+
+CUDA 12.6 配套 CCCL 2.5，缺少当前 FlashInfer 使用的 `cuda::maximum`、`cuda::minimum`。
+现有快速除法封装还使用 `cuda::fast_mod_div`，仅补齐前两个接口不够。
+FT 构建层按当前 FlashInfer 上游锁定的 CCCL **v3.3.2** 完整提交接入：
+`876867684f7fac130e0f5911236e0a92a970d4fd`，仓库为 <https://github.com/NVIDIA/cccl>。
+不改写 FlashInfer/CCCL 源码，也不向 CUDA 命名空间补造同名类型。
+
+来源依据：
+
+- [当前 FlashInfer 的 CCCL 子模块](https://github.com/flashinfer-ai/flashinfer/tree/5f3d1b3fc6e1ed8a79429986b3637802f1bd2b57/3rdparty/cccl)。
+- [CCCL v3.3.2 的版本与兼容说明](https://github.com/NVIDIA/cccl/blob/876867684f7fac130e0f5911236e0a92a970d4fd/README.md)。
+
+| 模块 | 实现语言/技术 | 职责 |
+| --- | --- | --- |
+| FT 依赖选择与固定版本校验 | CMake、Git | `cmake/fastllm_cccl.cmake` 检查 Toolkit 头文件，必要时获取完整固定版本，校验提交和干净工作区 |
+| CCCL | CUDA C++ 头文件库 | 同一版本的 CUB、Thrust、libcudacxx 同时接入现有 CUDA 编译目标 |
+| FlashInfer 与 FT 推理调用 | CUDA C++ | 保持现有采样、注意力和调用入口；本次不修改算子或采样规则 |
+
+默认先检查当前 NVCC 对应 Toolkit 的归约与快速除法头文件。满足要求时继续使用 Toolkit 自带版本；
+缺少接口时，CMake 通过 Git 获取完整固定版本到构建目录的 `_deps/fastllm_cccl-src`。
+只使用其头文件，不配置或编译 CCCL 自身的项目；不覆盖系统 CUDA 安装。
+三个组件以普通 `-I` 统一置于 Toolkit 隐式头文件之前，避免只替换 libcudacxx 导致混用版本。
+配置时打印所选版本和来源；显式固定版本低于 Toolkit 自带版本时拒绝降级。
+
+首次自动获取需要 Git、网络和 CMake 3.18 以上。可在有网络的环境准备完整离线 checkout：
+
+```bash
+git clone --branch v3.3.2 --depth 1 https://github.com/NVIDIA/cccl.git /home/deps/cccl-3.3.2
+git -C /home/deps/cccl-3.3.2 rev-parse HEAD
+```
+
+提交号应为上述固定值；保留 `.git`，整个目录不要改写或添加本地文件。
+服务器配置命令可增加 `-DFASTLLM_CCCL_ROOT=/home/deps/cccl-3.3.2`；
+`-DFASTLLM_FETCH_CCCL=OFF` 关闭自动获取，缺少接口且未指定目录时明确报错。
+默认配置不必增加参数，原有 `CUDA_ARCH=70` 与 CPU 指令集配置保持不变。
+
+本地仅核对了上游固定提交、三个组件版本、所需头文件及 FT 构建接入，并完成源码 Review 和静态检查。
+未执行本地 CMake、NVCC 或 GPU 测试。CCCL 3.x 支持 CUDA 12.x，但官方不将 SM70 列入常规 CI；
+本次是否通过 V100 构建和实际推理仍需服务器验证，不能仅凭头文件存在宣称验收成功。
