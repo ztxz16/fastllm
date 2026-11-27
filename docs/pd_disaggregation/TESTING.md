@@ -12,7 +12,7 @@
 | 原步骤 | 测试项目 | 入口或范围 |
 | --- | --- | --- |
 | 1 | 编译与加载 | 原生扩展、模型执行器与实际加载产物 |
-| 2 | 协议与逻辑映射 | `protocol`，41 个 case |
+| 2 | 协议与逻辑映射 | `protocol`，41 个 case；独立 `pairing`，35 个副本配对 case |
 | 3 | Router 重试边界 | `router`，20 个 case |
 | 4 | 真实 GPU 传输 | `ipc`，24 个 case |
 | 5 | 非 PD 对照基线 | 完整推理服务；保存输入、输出和配置 |
@@ -24,6 +24,31 @@
 | 11 | 满载、背压与恢复 | 容量不足、排队、抢占、重算；需补压力用例 |
 | 12 | 真实故障隔离 | rank 退出、服务重启、迟到消息和传输异常；需补故障注入 |
 | 13 | 性能与重叠 | `performance`，6 个 case、每项 5 轮；重叠另采 GPU 时间线 |
+
+## 普通 DP 配对修复后的回归顺序
+
+先完成原步骤 1 的扩展构建，再运行原步骤 2 的独立 `pairing`（PD-V30）。此脚本注入
+GPU 拓扑和控制 RPC，调用正式 C++ 的筛选、负载预留、双端绑定与拒绝逻辑，共 35 个
+case；不执行真实 GPU 拷贝或模型计算，不能替代第 7 步普通 DP 生成验收。
+
+更新后的服务器工作区执行（不在本地代编译）：
+
+```bash
+cd /home/project/vllm_fastllm
+cmake --build build-process-tp --target fastllm_pd_core -j 4
+FT_PD_CORE_LIBRARY="$PWD/build-process-tp/_pd_core.so" \
+  python3 test/distributed/pd/launch.py pairing
+```
+
+启动器自动后台运行，独立目录保留 PID、完整命令、日志、退出码和 Markdown/CSV/JSON/XLSX
+报告。构建失败时不要执行测试；控制用例的退出码应为 0 且全部 PASS。还需回归已有
+`protocol` 与 `router`，确认原协议和重试边界保持不变。
+
+随后更新并重启 P、D、PD Router，再继续原步骤 7 的 PD-V29：P 为 GPU 0、2 上的
+两个 TP1 副本，D 为 GPU 1、3 上的两个 TP1 副本，`load`、Graph/Prefix/回传关闭。
+使用 PD-V28 保存的离线基线做 15 个生成用例 exact 对照；额外核对请求证据中的 `pair`、
+各副本实际计算和传输增量，确认并发时只产生可达配对。不得以固定测试副本代替正式调度。
+短 Prompt pull 仍是 P 算完后 D 分配 KV；提前配对不等于提前占用接收显存。
 
 ## 四卡机器的第 7 步：先录制基线，再执行 PD
 
