@@ -166,7 +166,7 @@ void BindTasks(Handlers &h) {
                     statistics["copied_bytes"] =
                         num(at(statistics, "copied_bytes")) + num(py::getattr(handle, "bytes", py::int_(0)));
                     statistics["gpu_copy_ms"] = real(at(statistics, "gpu_copy_ms")) +
-                                                real(py::getattr(handle, "gpu_ms", py::float_(0)));
+                                                real(py::getattr(handle, "gpu_ms", py::float_(0.0)));
                 }
             }
         }

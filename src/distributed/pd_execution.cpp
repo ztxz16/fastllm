@@ -117,7 +117,7 @@ void BindNative(Handlers &h) {
         put(s, "closed", false);
         put(s, "cached", D());
         put(s, "preemptions", I(0));
-        put(s, "kv_usage", py::float_(0));
+        put(s, "kv_usage", py::float_(0.0));
         return none();
     };
 
