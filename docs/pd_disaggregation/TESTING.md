@@ -34,13 +34,15 @@
 | --- | --- | --- |
 | 准备基线 | 完整服务使用 GPU 1、3；普通 TP2，Graph/Prefix 关闭 | 完整服务的跨 NUMA TP 通信和实际生成；录制 15 个用例的输出 |
 | PD pull | P 的 rank 0/1 使用 GPU 0、2；D 的 rank 0/1 使用 GPU 1、3 | 对应分片分别走 0→1、2→3；实际生成与 TP2 离线基线 exact 对照 |
-| 后续组合 | 当前组合通过后再单列 push、其他执行配置及并行模式 | 不由某个小规模组合通过推断全部组合通过 |
+| PD push | 复用上述 P/D，通过配置为 push 的 Router 发起请求 | 与同一 TP2 离线基线 exact 对照；P 端本轮传输增量及两端各 rank 的 NCCL 增量分别核查 |
+| 后续组合 | 其他执行配置及并行模式分别列项 | 不由某个小规模组合通过推断全部组合通过 |
 
 上述 GPU 编号均为物理 GPU；服务内逻辑编号取决于 `CUDA_VISIBLE_DEVICES` 顺序。
 基线阶段先停止旧 TP1 模型服务，保留独立 Router。基线录制成功后再停止完整服务，
 把四张卡交给 P、D；不能同时保留一个额外模型实例，也不能拿已有 TP1 基线代替 TP2。
 同一 TP 组内的 GPU 跨 NUMA，必须通过实际完整推理确认其通信路径，不能仅根据
-两条 P→D 的 P2P 连通关系宣称 TP 通信可用。此部署尚未验收。
+两条 P→D 的 P2P 连通关系宣称 TP 通信可用。各部署的验收结果统一记录在 TODO 主表，
+基线、pull、push 分别列项，不由一种传输模式通过推断另一种也通过。
 
 `generation` 增加两个互斥的对照来源，原有在线 `--reference` 行为保留：
 
@@ -76,7 +78,7 @@ python3 test/distributed/pd/launch.py generation -- \
 
 本次仅补充 Python 测试组织与证据保存，不修改 C++/CUDA 的路由、KV 传输或推理逻辑。
 实现位置为 `check_generation.py` 和 `generation_reference.py`；本地不编译，服务器基线
-录制及 PD exact 对照分别验收，当前状态见 TODO 的 PD-V16、PD-V17。
+录制及 PD exact 对照分别验收，当前状态见 TODO 的 PD-V16、PD-V17、PD-V18。
 
 ## 基础测试命令
 
