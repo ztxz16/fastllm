@@ -7,8 +7,10 @@
 后续用户回传非 PD 基线 1/1，以及 TP1→TP1、Graph/Prefix 关闭的 pull、push 生成对照各 15/15 exact PASS。
 同配置的 push、pull 取消与资源释放用例也分别回传 7/7 PASS、退出码 0。
 随后 TP1→TP1、Graph 开启 / Prefix 关闭的 pull、push 也分别回传 15/15 exact PASS，D/对照服务实际 Graph 回放核查均通过，总退出码均为 0。
+本次 TP1→TP1、Graph/Prefix 均开启的 pull、push 分别回传 15/15 exact PASS；D/对照 Graph 回放、P/对照前缀复用核查均通过，总退出码均为 0。
+随后 Graph 关闭 / Prefix 开启的 pull、push 分别回传 15/15 exact PASS；实际 Eager 执行、P/对照前缀复用核查均通过，总退出码均为 0。
 以上各自约定范围均标记“验收成功”，直接列在 [PD 分离状态表](#pd-分离) 最前面；依据为用户服务器结果，本地未代跑。
-当前重点：**原计划第 6 步中，TP1→TP1、Prefix 关闭的 Graph 关闭/开启 × pull/push 四种组合均已通过（PD-V06/V07/V10/V11）。下一步仍为第 6 步：保持 Graph 开启，验证 Prefix 开启的 pull，再验证 push。第 8 步 Graph/Prefix 关闭的 push、pull 各 7/7 已通过；第 7 步其他并行组合及其余范围仍待验。Attention DP/EP 前缀缓存一致性仍失败。**
+当前重点：**原计划第 6 步的普通 TP1→TP1 基础矩阵已完成：Graph 关闭/开启 × Prefix 关闭/开启 × pull/push 共 8 种组合，各 15/15 exact PASS（PD-V06/V07/V10/V11/V12/V13/V14/V15）。下一步进入原计划第 7 步：验证其他 TP/DP 规模及 Attention DP/EP 并行组合，部署前核对 GPU P2P 拓扑。第 8 步 Graph/Prefix 关闭的 push、pull 各 7/7 已通过；其他组合、回传、压力、故障及性能仍待验。Attention DP/EP 前缀缓存一致性仍失败。**
 迁移前的 PASS 与构建失败记录保留为历史证据；当前基础验证和生成验收状态以本次 C++/CUDA 版本确认结果为准。
 GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为当前已实现。
 2026-11-27 曾尝试按上游提交替换两个 GGUF 文件，因不构成完整依赖版本升级已撤销；
@@ -28,9 +30,9 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 
 ### PD 分离
 
-**PD-V01～PD-V11 的各自约定范围已验收成功。** PD- 编号行是功能事项；已有通过范围的标记“部分验收”，剩余范围列在“下一步”。
+**PD-V01～PD-V15 的各自约定范围已验收成功。** PD- 编号行是功能事项；已有通过范围的标记“部分验收”，剩余范围列在“下一步”。
 “验证状态”的通过结论只适用于括号中列明的检查或用例。
-**测试步骤号沿用[原 13 步计划](../docs/pd_disaggregation/TESTING.md#测试步骤编号)**：第 6 步为生成正确性，第 7 步为并行模式组合，第 8 步为取消与资源释放。`PD-Vxx` 是验收对象编号，不是步骤号；PD-V06/V07 和 PD-V10/V11 对应第 6 步的不同配置，PD-V08/V09 对应第 8 步的两个组合。提前执行第 8 步不代表第 6、7 步的其余范围已经完成。
+**测试步骤号沿用[原 13 步计划](../docs/pd_disaggregation/TESTING.md#测试步骤编号)**：第 6 步为生成正确性，第 7 步为并行模式组合，第 8 步为取消与资源释放。`PD-Vxx` 是验收对象编号，不是步骤号；PD-V06/V07、PD-V10/V11、PD-V12/V13 和 PD-V14/V15 对应第 6 步的不同配置，PD-V08/V09 对应第 8 步的两个组合。提前执行第 8 步不代表第 6、7 步的其余范围已经完成。
 
 | 编号 | 事项 | 实现状态 | 验证状态 | 验收状态 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
@@ -44,17 +46,19 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-V08](#pd-v08) | 第 8 步取消与资源释放：push、TP1→TP1、Graph/Prefix 关闭 | 已接入 | 已通过（用户回传 7/7 PASS，退出码 0） | 验收成功 | 本组合完成；pull 单列 PD-V09，其他配置及完整故障矩阵独立验收 |
 | [PD-V09](#pd-v09) | 第 8 步取消与资源释放：pull、TP1→TP1、Graph/Prefix 关闭 | 已接入 | 已通过（用户回传 7/7 PASS，退出码 0） | 验收成功 | 本组合完成；其他配置及完整故障矩阵独立验收 |
 | [PD-V10](#pd-v10) | 第 6 步生成正确性：pull、TP1→TP1、Graph 开启 / Prefix 关闭 | 已接入 | 已通过（用户回传 15/15 exact PASS；D/对照 Graph 回放核查通过；总退出码 0） | 验收成功 | 本组合完成；同配置 push 单列 PD-V11，Prefix 开启、其他并行组合及性能独立验收 |
-| [PD-V11](#pd-v11) | 第 6 步生成正确性：push、TP1→TP1、Graph 开启 / Prefix 关闭 | 已接入 | 已通过（用户回传 15/15 exact PASS；D/对照 Graph 回放核查通过；总退出码 0） | 验收成功 | 本组合完成；继续 Prefix 开启配置，其他并行组合及性能独立验收 |
-| [PD-V12](#pd-v12) | 第 6 步生成正确性：pull、TP1→TP1、Graph/Prefix 开启 | 已接入 | 待验证 | 未验收 | 15 个 generation 用例；核对 D/对照 Graph 回放与 P/对照实际前缀复用 |
-| [PD-V13](#pd-v13) | 第 6 步生成正确性：push、TP1→TP1、Graph/Prefix 开启 | 已接入 | 待验证 | 未验收 | PD-V12 后保持模型配置，独立运行 push 并另采执行证据 |
-| [PD-01](#pd-01) | C++/CUDA 核心迁移 | 已接入 | 已通过（构建、三组回归及 PD-V06/V07/V10/V11 生成） | 部分验收 | 补其他生成组合、生命周期与压力验收 |
-| [PD-02](#pd-02) | 单机 PD 八阶段整体交付 | 部分实现 | 已通过（四项基础验证、非 PD 基线及 PD-V06/V07/V10/V11） | 部分验收 | 补其余部署/配置、压力与性能验收 |
+| [PD-V11](#pd-v11) | 第 6 步生成正确性：push、TP1→TP1、Graph 开启 / Prefix 关闭 | 已接入 | 已通过（用户回传 15/15 exact PASS；D/对照 Graph 回放核查通过；总退出码 0） | 验收成功 | 本组合完成；Prefix 开启配置见 PD-V12～V15；其他并行组合及性能独立验收 |
+| [PD-V12](#pd-v12) | 第 6 步生成正确性：pull、TP1→TP1、Graph/Prefix 开启 | 已接入 | 已通过（用户回传 15/15 exact PASS；Graph 回放与前缀复用核查通过；总退出码 0） | 验收成功 | 本组合完成；同配置 push 单列 PD-V13，其他组合、回传与性能独立验收 |
+| [PD-V13](#pd-v13) | 第 6 步生成正确性：push、TP1→TP1、Graph/Prefix 开启 | 已接入 | 已通过（用户回传 15/15 exact PASS；Graph 回放与前缀复用核查通过；总退出码 0） | 验收成功 | 本组合完成；Graph 关闭 / Prefix 开启配置见 PD-V14/V15；其他组合、回传与性能独立验收 |
+| [PD-V14](#pd-v14) | 第 6 步生成正确性：pull、TP1→TP1、Graph 关闭 / Prefix 开启 | 已接入 | 已通过（用户回传 15/15 exact PASS；Eager 执行与前缀复用核查通过；总退出码 0） | 验收成功 | 本组合完成；同配置 push 单列 PD-V15，其他并行组合、回传与性能独立验收 |
+| [PD-V15](#pd-v15) | 第 6 步生成正确性：push、TP1→TP1、Graph 关闭 / Prefix 开启 | 已接入 | 已通过（用户回传 15/15 exact PASS；Eager 执行与前缀复用核查通过；总退出码 0） | 验收成功 | 本组合完成；进入第 7 步其他并行组合，回传与性能独立验收 |
+| [PD-01](#pd-01) | C++/CUDA 核心迁移 | 已接入 | 已通过（构建、三组回归及 PD-V06/V07/V10/V11/V12/V13/V14/V15 生成） | 部分验收 | 补其他生成组合、生命周期与压力验收 |
+| [PD-02](#pd-02) | 单机 PD 八阶段整体交付 | 部分实现 | 已通过（四项基础验证、非 PD 基线及 PD-V06/V07/V10/V11/V12/V13/V14/V15） | 部分验收 | 补其余部署/配置、压力与性能验收 |
 | [PD-03](#pd-03) | MoE KV 使用量 JSON 构建修复 | 已实现 | 已通过（构建检查） | 部分验收 | 核对 KV 使用量响应及真实模型对照 |
 | [PD-04](#pd-04) | GGUF 完整版本升级与 AVX 兼容 | 已接入（上游完整组件） | 部分通过（静态完整性） | 未验收 | 服务器构建，复验元数据、量化及正式模型 |
 | [PD-05](#pd-05) | GGUF IQK R4 指令集兼容 | 已接入（随完整版本升级） | 部分通过（静态 Review） | 未验收 | 与 PD-04 一并验证 CPU 能力选择及普通点积 |
 | [PD-06](#pd-06) | PD 准确性判定规则 | 部分实现（规范已定） | 待验证 | 未验收 | 适配比较、报告和退出码 |
-| [PD-07](#pd-07) | 普通 DP×TP / Attention DP/EP 四种组合 | 已接入 | 部分通过（普通 TP1→TP1，含 Graph pull/push；见 PD-V06/V07/V10/V11） | 部分验收 | 补其他 Graph/Prefix 配置、并行规模及 Attention DP/EP 组合 |
-| [PD-08](#pd-08) | Qwen2 MoE 普通进程 DP×TP | 已接入 | 已通过（构建、普通 TP1 基线及 PD-V06/V07/V10/V11） | 部分验收 | 补其他 DP/TP 规模与混合部署 |
+| [PD-07](#pd-07) | 普通 DP×TP / Attention DP/EP 四种组合 | 已接入 | 部分通过（普通 TP1→TP1，含 Graph pull/push；见 PD-V06/V07/V10/V11/V12/V13/V14/V15） | 部分验收 | 补其他并行规模、Attention DP/EP 及对应 Graph/Prefix 组合 |
+| [PD-08](#pd-08) | Qwen2 MoE 普通进程 DP×TP | 已接入 | 已通过（构建、普通 TP1 基线及 PD-V06/V07/V10/V11/V12/V13/V14/V15） | 部分验收 | 补其他 DP/TP 规模与混合部署 |
 | [PD-09](#pd-09) | KV 重分片、映射与布局对齐 | 已接入 | 已通过（protocol / IPC 用例） | 部分验收 | 补真实模型、布局复用与副本隔离验收 |
 | [PD-10](#pd-10) | Router 服务路由、P/D 配对 | 已接入 | 已通过（Router 20/20） | 部分验收 | 正式模型服务 P/D 配对联调 |
 | [PD-11](#pd-11) | 服务注册与健康检查 | 已接入 | 已通过（健康/重启用例；用户确认 full0 实服务就绪） | 部分验收 | 补周期探测、配置覆盖与服务恢复验收 |
@@ -64,7 +68,7 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-15](#pd-15) | D 端增长预算、抢占与恢复 | 部分实现 | 已通过（增长预算单元用例） | 部分验收 | 验证默认 512、配置覆盖与本地重算 |
 | [PD-16](#pd-16) | 多轮历史、本地 KV 优先复用 | 已接入 | 待验证 | 未验收 | 验跨 P 会话、缺失重算和隔离 |
 | [PD-17](#pd-17) | D→P 回传与 480 秒保留 | 已接入 | 已通过（保留期/在途用例） | 部分验收 | 补真实多轮 D→P 回传与重算验收 |
-| [PD-18](#pd-18) | P 只交 KV，D 生成首 Token | 已接入 | 部分通过（TP1 首 Token / 输出 exact，含 Graph pull/push；见 PD-V06/V07/V10/V11） | 部分验收 | 补其他组合、EOS 停止及异常恢复输出 |
+| [PD-18](#pd-18) | P 只交 KV，D 生成首 Token | 已接入 | 部分通过（TP1 首 Token / 输出 exact，含 Graph pull/push；见 PD-V06/V07/V10/V11/V12/V13/V14/V15） | 部分验收 | 补其他组合、EOS 停止及异常恢复输出 |
 | [PD-19](#pd-19) | JSON 元数据、身份及布局握手 | 已接入 | 已通过（身份/元数据用例） | 部分验收 | 核对正式三条交接路径与布局复用 |
 | [PD-20](#pd-20) | 独立 KV 交接模块与统一 API | 已接入 | 已通过（protocol / IPC 用例） | 部分验收 | 补两类执行后端的正式模型交接 |
 | [PD-21](#pd-21) | 异步传输任务与通知 | 已接入 | 已通过（protocol / IPC 用例） | 部分验收 | 补真实服务多 rank 汇总与异常收尾 |
@@ -73,7 +77,7 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-24](#pd-24) | 短 Prompt 推送与拉取时序 | 已接入 | 已通过（IPC push / pull 用例） | 部分验收 | 验服务级就绪顺序及容量等待 |
 | [PD-25](#pd-25) | 长 Prompt 逐层传输 | 已接入 | 待验证 | 未验收 | 验阈值、Graph 同步及真实重叠 |
 | [PD-26](#pd-26) | 推送与拉取的完成判断 | 已接入 | 已通过（缺层/完成用例） | 部分验收 | 补多 rank 通知与首 Token 联动验收 |
-| [PD-27](#pd-27) | 统一入口、输出顺序与断连 | 已接入 | 已通过（Router 20/20；PD-V06/V07/V10/V11 输出 exact；PD-V08/V09 push/pull 首输出后断连） | 部分验收 | 补其他组合及重复消息 |
+| [PD-27](#pd-27) | 统一入口、输出顺序与断连 | 已接入 | 已通过（Router 20/20；PD-V06/V07/V10/V11/V12/V13/V14/V15 输出 exact；PD-V08/V09 push/pull 首输出后断连） | 部分验收 | 补其他组合及重复消息 |
 | [PD-28](#pd-28) | 交接状态机与 KV 占用管理 | 已接入 | 已通过（原取消/释放用例；PD-V08/V09 push/pull 实服务各 7/7） | 部分验收 | 补其他配置、真实服务超时、故障与其余资源释放矩阵 |
 | [PD-29](#pd-29) | FlashInfer/CCCL 在 CUDA 12.6 的依赖构建 | 已接入（固定完整依赖） | 待验证（仅静态检查） | 未验收 | V100 服务器前台重新配置并构建四个目标 |
 | [PD-30](#pd-30) | FT Marlin MoE 的 SM70 编译保护 | 已接入（调用处架构保护） | 待验证（仅静态检查） | 未验收 | V100 服务器继续构建四个原生目标 |
@@ -975,7 +979,24 @@ D 接收外部 KV 后进行 Decode，不要求它产生本地前缀命中。
 
 结果保存新目录，不覆盖关闭缓存的证据；上述核查失败时总流程返回非零状态。
 该范围不代表所有缓存淘汰/容量场景、Attention DP/EP 前缀一致性、回传复用或性能验收。
-当前尚无服务器结果，本地未代跑、未编译。
+
+**通过证据（用户回传，2026-11-27）**：流程目录为
+`test/distributed/results/20261127T095024Z_pd_prefix_pull_8202d2ce`，生成测试目录为
+`test/distributed/results/20261127T095458Z_pd_generation_34dceace`。
+用户回传生成退出码 0、15/15 exact PASS，以及包含执行核查的总退出码 0。
+`runtime_check.json` 的 `generation_passed`、full/p/d 的 `passed` 均为 true：
+
+- full：`captures=20`，`replay_increase=140`，`prefix_hits_increase=9`，
+  `reused_tokens_increase=3456`，`new_request_local_reused=0`。
+- P：`captures=0`，`replay_increase=0`，`prefix_hits_increase=2`，
+  `reused_tokens_increase=512`，`new_request_local_reused=2944`。
+- D：`captures=21`，`replay_increase=161`；三个前缀复用相关指标均为 0。
+
+P 仅执行 Prefill，本项不要求 Decode Graph 回放；D 导入外部 KV，本项不要求本地
+前缀命中。两个零值均符合事先约定的验收范围。P 的统计计数与请求级复用记录分别
+保留，不把它们误记为同一项计数。15 个用例覆盖既定长度边界、流式/非流式、首 Token、
+固定种子采样、并发和完整历史多轮；未开启 D→P 回传，不代表回传复用验收。
+证据来自用户服务器，本地未代跑、未编译；实际 Git 提交与完整报告留在服务器，待归档。
 
 </details>
 
@@ -987,7 +1008,93 @@ D 接收外部 KV 后进行 Decode，不要求它产生本地前缀命中。
 **计划对应关系与验收对象**：原计划第 6 步。PD-V12 后保持模型服务配置，使用现有
 push Router；独立运行相同 15 个 generation 用例，另采本轮 Graph 与前缀复用证据。
 通过标准及范围边界同 PD-V12，不把 pull 的报告或计数增量当作 push 验收。
-当前尚无服务器结果，本地未代跑、未编译。
+
+**通过证据（用户回传，2026-11-27）**：流程目录为
+`test/distributed/results/20261127T100456Z_pd_prefix_push_4922f5ca`，生成测试目录为
+`test/distributed/results/20261127T100456Z_pd_generation_dcb378fa`。
+用户回传生成退出码 0、15/15 exact PASS，以及包含执行核查的总退出码 0。
+`runtime_check.json` 的 `generation_passed`、full/p/d 的 `passed` 均为 true：
+
+- full：`captures=40`，`replay_increase=140`，`prefix_hits_increase=12`，
+  `reused_tokens_increase=4864`，`new_request_local_reused=0`。
+- P：`captures=0`，`replay_increase=0`，`prefix_hits_increase=2`，
+  `reused_tokens_increase=768`，`new_request_local_reused=3456`。
+- D：`captures=42`，`replay_increase=161`；三个前缀复用相关指标均为 0。
+
+本轮复用 PD-V12 的模型服务与现有 8002 push Router，另采测试前后增量及新请求记录；
+`captures` 是累计计数，回放/前缀增量为本轮证据，不复用上一轮 pull 的统计作为通过依据。
+P 的 Graph 回放为 0、D 的本地前缀命中为 0 均符合本项约定。
+覆盖既定 15 个长度边界、流式/非流式、首 Token、固定种子、并发和完整历史多轮用例。
+回传未开启；本项不扩展到 Graph 关闭 / Prefix 开启、其他并行组合、回传复用或性能。
+结果来自用户服务器，本地未代跑、未编译；实际 Git 提交与完整报告留在服务器，待归档。
+
+</details>
+
+<a id="pd-v14"></a>
+
+<details>
+<summary>PD-V14｜生成正确性：pull、TP1→TP1、Graph 关闭 / Prefix 开启</summary>
+
+**计划对应关系与验收对象**：原计划第 6 步，补齐既有
+Eager/Graph × Prefix off/on × pull/push 矩阵中尚未验证的 Eager + Prefix 组合。
+沿用同一模型、Prompt Token ID、采样设置及 P=GPU 3、D=GPU 2、对照=GPU 0，
+均为普通 DP1×TP1；三个模型服务关闭 CUDA Graph，保持 Prefix Cache 开启，回传关闭。
+
+**通过标准**：15 个 generation 用例全部实际输出 Token ID exact PASS、退出码 0；
+保存服务配置及本轮执行证据，确认 Eager 路径、P/对照实际前缀复用。D 不要求本地前缀命中。
+使用新的运行目录，不以已通过的 Graph 配置报告代替本项。
+
+**通过证据（用户回传，2026-11-27）**：流程目录为
+`test/distributed/results/20261127T101405Z_pd_eager_prefix_pull_54fffc35`，生成测试目录为
+`test/distributed/results/20261127T101859Z_pd_generation_52018cc1`。
+用户回传生成退出码 0、15/15 exact PASS，以及包含执行核查的总退出码 0。
+`runtime_check.json` 的 `generation_passed`、full/p/d 的 `passed` 均为 true；
+三个服务均为 `graph_enabled=false`、`captures=0`、`replay_increase=0`：
+
+- full：`eager_decode_increase=140`，`prefix_hits_increase=9`，
+  `reused_tokens_increase=3456`，`new_request_local_reused=0`。
+- P：`eager_decode_increase=0`，`prefix_hits_increase=2`，
+  `reused_tokens_increase=512`，`new_request_local_reused=2944`。
+- D：`eager_decode_increase=161`；三个前缀复用相关指标均为 0。
+
+P 仅执行 Prefill，不要求 Decode 计数增加；D 导入外部 KV，不要求本地前缀命中。
+P 的原生前缀统计与请求级复用记录分别保留，不合并成同一计数。
+本轮重启三个模型服务以关闭 Graph，保留原 GPU 映射及现有 Router；执行证据单独采集。
+15 个用例覆盖既定长度边界、流式/非流式、首 Token、固定种子、并发和完整历史多轮。
+回传未开启，本项不代表 D→P 复用、其他并行组合、缓存压力或性能验收。
+证据来自用户服务器，本地未代跑、未编译；服务器实际 Git 提交待补充，完整报告待归档。
+
+</details>
+
+<a id="pd-v15"></a>
+
+<details>
+<summary>PD-V15｜生成正确性：push、TP1→TP1、Graph 关闭 / Prefix 开启</summary>
+
+**计划对应关系与验收对象**：原计划第 6 步，PD-V14 后保持模型服务配置，使用现有
+push Router；独立运行 15 个 generation 用例，另采 Eager 配置和前缀复用证据。
+通过标准与范围边界同 PD-V14，pull/push 分别验收。
+
+**通过证据（用户回传，2026-11-27）**：流程目录为
+`test/distributed/results/20261127T102733Z_pd_eager_prefix_push_45ab68f6`，生成测试目录为
+`test/distributed/results/20261127T102733Z_pd_generation_d53f2af8`。
+用户回传生成退出码 0、15/15 exact PASS，以及包含执行核查的总退出码 0。
+`runtime_check.json` 的 `generation_passed`、full/p/d 的 `passed` 均为 true；
+三个服务均为 `graph_enabled=false`、`captures=0`、`replay_increase=0`：
+
+- full：`eager_decode_increase=140`，`prefix_hits_increase=12`，
+  `reused_tokens_increase=4736`，`new_request_local_reused=0`。
+- P：`eager_decode_increase=0`，`prefix_hits_increase=2`，
+  `reused_tokens_increase=768`，`new_request_local_reused=3584`。
+- D：`eager_decode_increase=161`；三个前缀复用相关指标均为 0。
+
+本轮复用 PD-V14 的模型服务和现有 8002 push Router，保持普通 DP1×TP1、P=GPU 3、
+D=GPU 2、对照=GPU 0；独立采集本轮计数增量和新请求记录，不复用 pull 结果作为通过依据。
+P 只执行 Prefill，Decode 计数不增加；D 导入外部 KV，不要求本地前缀命中。
+P 的原生前缀统计与请求级复用记录分别保留，不合并成同一计数。
+15 个用例覆盖既定长度边界、流式/非流式、首 Token、固定种子、并发和完整历史多轮。
+回传未开启；本项不代表 D→P 复用、其他并行组合、缓存压力或性能验收。
+证据来自用户服务器，本地未代跑、未编译；服务器实际 Git 提交待补充，完整报告待归档。
 
 </details>
 
