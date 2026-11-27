@@ -64,6 +64,7 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-28](#pd-28) | 交接状态机与 KV 占用管理 | 已接入 | 已通过（取消/释放用例） | 部分验收 | 补真实服务超时、故障与资源释放矩阵 |
 | [PD-29](#pd-29) | FlashInfer/CCCL 在 CUDA 12.6 的依赖构建 | 已接入（固定完整依赖） | 待验证（仅静态检查） | 未验收 | V100 服务器前台重新配置并构建四个目标 |
 | [PD-30](#pd-30) | FT Marlin MoE 的 SM70 编译保护 | 已接入（调用处架构保护） | 待验证（仅静态检查） | 未验收 | V100 服务器继续构建四个原生目标 |
+| [PD-31](#pd-31) | 连续 KV 的 CUDA 设备 UUID 查询兼容 | 已接入（复用设备属性查询） | 待验证（仅静态检查） | 未验收 | CUDA 12.6 服务器继续构建四个原生目标 |
 
 ### Attention DP/EP
 
@@ -878,6 +879,24 @@ CCCL 3.x 的 SM70 不在上游常规 CI 中，实际构建与推理结果须由�
 主机侧 SM80 及以上的准入条件保持不变，受支持架构的原有计算体保持不变。
 Marlin 头文件与 `third_party/` 未改；只做静态 Review、架构条件文本检查和差异检查，
 未运行本地编译或 GPU 验收。此前 protocol、Router、IPC 的验收范围保持原样。
+
+</details>
+
+<a id="pd-31"></a>
+
+<details>
+<summary>PD-31｜连续 KV 的 CUDA 设备 UUID 查询兼容</summary>
+
+**验收对象**：CUDA 12.6 下不再出现 `cudaDeviceGetUuid` 未声明错误，
+并完成 `fastllm_pd_core`、`fastllm_tp_generate`、`fastllm_moe_generate`、`fastllm_tp_worker` 构建。
+连续 KV 的实际设备对应关系和内容传输继续由 PD-09、PD-20、PD-22 的模型交接验收覆盖。
+
+2026-11-27 用户提供服务器证据：`qwen3_layer.cu` 包含的 `pd_contiguous.cuh` 使用了未声明的 UUID 查询接口。
+FT 连续 KV 适配层（CUDA C++）改用现有分页 KV 与 IPC 后端使用的 `cudaGetDeviceProperties`，
+将设备属性中的 UUID 原始字节写入交接描述；16 字节设备标识格式保持不变。
+设备查询先于登记和显存分配，查询失败不留下交接记录；无需新增 Driver API 或链接依赖。
+已核对 CUDA 12.6 官方接口、对应设备标识格式及调用顺序，并完成静态 Review 与差异检查。
+第三方源码未改；未在本地编译或运行 GPU 测试，不能据此宣称构建或连续 KV 验收成功。
 
 </details>
 

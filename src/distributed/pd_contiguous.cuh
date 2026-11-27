@@ -40,6 +40,10 @@ public:
 
     /**
      * 分配请求独占的连续 FP16 [token,2,head,dim] 交接缓冲。
+     *
+     * 容量检查通过后先读取设备属性中的 UUID，再登记交接和分配显存；
+     * 设备查询失败时不留下交接记录。UUID 沿用分页 KV 的 16 字节表示。
+     *
      * @param key 本地唯一交接编号。
      * @param tokens 有效 Token 数，调用方检查模型容量。
      * @return IPC 描述；不足时返回空，不修改既有交接。CUDA 失败终止 worker。
@@ -51,11 +55,13 @@ public:
         size_t available, total;
         Check(cudaMemGetInfo(&available, &total));
         if (bytes * layerCount > available) return {};
-        auto &entry = entries.emplace(key, Entry{tokens, bytes, std::vector<void*>(layerCount, nullptr)}).first->second;
-        int device;
-        cudaUUID_t uuid;
+
+        int device = 0;
+        cudaDeviceProp property{};
         Check(cudaGetDevice(&device));
-        Check(cudaDeviceGetUuid(&uuid, device));
+        Check(cudaGetDeviceProperties(&property, device));
+
+        auto &entry = entries.emplace(key, Entry{tokens, bytes, std::vector<void*>(layerCount, nullptr)}).first->second;
         std::vector<PDRegion> result;
         for (uint32_t layer = 0; layer < layerCount; ++layer) {
             const auto status = cudaMalloc(&entry.layers[layer], bytes);
@@ -75,7 +81,7 @@ public:
                 r.allocationBytes = bytes; r.offset = uint64_t(component) * heads * dim * 2;
                 r.tokenStride = uint64_t(2) * heads * dim * 2; r.headStride = dim * 2;
                 std::memcpy(r.memory.data(), &handle, 64);
-                std::memcpy(r.device.data(), &uuid, 16);
+                std::memcpy(r.device.data(), property.uuid.bytes, r.device.size());
                 result.push_back(r);
             }
         }
