@@ -6,6 +6,7 @@ namespace pd {
 void BindService(Handlers &h) {
     BindServiceTransfer(h);
     BindServiceOutput(h);
+    BindPairing(h);
     h["service.identity_from"] = [](D a) {
         D value(module("builtins").attr("dict")(at(a, "value")));
         for (auto key : {"source", "target"})
@@ -209,11 +210,16 @@ void BindService(Handlers &h) {
 
     h["service.Service._select_replica"] = [](D a) {
         O s = self(a), r = at(a, "record"), replicas = get(s, "replicas"), best;
+        O candidates = optional(a, "candidates");
+        if (!get(r, "replica").is_none())
+            return get(r, "replica");
         I count = py::len(replicas), cursor = num(get(s, "cursor")), chosen = cursor;
         double scoreBest = 0;
         auto policy = str(get(s, "routing"));
         for (I i = 0; i < count; ++i) {
             I ix = (cursor + i) % count;
+            if (!candidates.is_none() && !truth(candidates.attr("__contains__")(ix)))
+                continue;
             O replica = item(replicas, py::int_(ix));
             double score = 0;
             if (policy == "prefix")
@@ -228,7 +234,7 @@ void BindService(Handlers &h) {
                         ++waiting;
                 score = real(replica.attr("score")(waiting));
             }
-            if (i == 0 || score < scoreBest) {
+            if (!best || score < scoreBest) {
                 best = replica;
                 chosen = ix;
                 scoreBest = score;
@@ -236,6 +242,7 @@ void BindService(Handlers &h) {
             if (policy == "round_robin")
                 break;
         }
+        protocol(bool(best), "no reachable replica pair; CPU fallback disabled");
         put(s, "cursor", (chosen + 1) % count);
         put(r, "replica", best);
         return best;
@@ -246,6 +253,13 @@ void BindService(Handlers &h) {
         bool fresh;
         {
             Lock lock(get(s, "lock"));
+            protocol(!cancelled(r) && !flag(r, "released") && real(get(r, "expires_at")) > wall(),
+                     "preparation after cancellation or expiry");
+            O pair = get(r, "pair");
+            protocol((pair.is_none() && py::len(get(s, "replicas")) == 1 &&
+                      !flag(r, "pair_source_url") && !D(at(a, "body")).contains("pair")) ||
+                         (!pair.is_none() && equal(pair, optional(D(at(a, "body")), "pair"))),
+                     "PD replica pair missing or changed");
             fresh = !flag(r, "preparing");
             put(r, "preparing", true);
         }
@@ -291,6 +305,7 @@ void BindService(Handlers &h) {
             {
                 Lock lock(get(s, "lock"));
                 put(r, "manifest", manifest);
+                ValidatePairManifest(r, manifest, producer ? "source" : "target");
                 get(r, "prepared").attr("set")();
             }
             if (producer && flag(r, "history"))

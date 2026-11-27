@@ -68,7 +68,10 @@ static void Generate(O s, D a, bool full) {
                     if (!history.is_none() && real(at(history, "expires_at")) > wall())
                         pBody["history"] = history;
                 }
-                rpc(s, get(p, "url"), "/internal/announce", pBody, real(remaining()));
+                pBody["source_url"] = get(p, "url");
+                O paired = rpc(s, get(p, "url"), "/internal/pair", pBody, real(remaining()));
+                pBody["pair"] = at(paired, "pair");
+                dBody["pair"] = at(paired, "pair");
                 bool pull = str(get(s, "mode")) == "pull";
                 if (pull && I(py::len(at(request, "token_ids"))) < num(get(s, "long_threshold"))) {
                     O meta = rpc(s, get(p, "url"), "/internal/prefill", pBody, real(remaining()));

@@ -68,6 +68,43 @@ class CudaBackend {
     }
 #endif
   public:
+    /**
+     * 查询本进程可见的 UUID 和有向 P2P 能力，不打开 IPC 或绑定传输线程。
+     *
+     * access 中每项为 [源 UUID, 目标 UUID]。当前 pull/push 都在目标 GPU
+     * 提交拷贝，因此检查目标访问源的能力；设备编号仅在此进程内使用。
+     * @return devices 按本地 CUDA 编号排列；access 仅包含可执行的传输边。
+     */
+    D Topology() const {
+#ifdef FASTLLM_PD_CUDA
+        int count = 0;
+        Check(cudaGetDeviceCount(&count));
+        L visible, access;
+        for (int device = 0; device < count; ++device) {
+            cudaDeviceProp property{};
+            Check(cudaGetDeviceProperties(&property, device));
+            std::string uuid;
+            const char hex[] = "0123456789abcdef";
+            for (unsigned char byte : property.uuid.bytes) {
+                uuid += hex[byte >> 4];
+                uuid += hex[byte & 15];
+            }
+            visible.append(uuid);
+        }
+        for (int source = 0; source < count; ++source)
+            for (int target = 0; target < count; ++target) {
+                int supported = source == target;
+                if (!supported)
+                    Check(cudaDeviceCanAccessPeer(&supported, target, source));
+                if (supported)
+                    access.append(list(py::make_tuple(visible[source], visible[target])));
+            }
+        return D("devices"_a = visible, "access"_a = access);
+#else
+        throw std::runtime_error("CUDA topology requires USE_CUDA=ON");
+#endif
+    }
+
     void Start() {
         if (started) {
             if (owner != std::this_thread::get_id())
@@ -261,6 +298,7 @@ void BindCuda(py::module_ &m) {
         .def_readonly("gpu_ms", &PendingCopy::gpuMs);
     py::class_<CudaBackend, std::shared_ptr<CudaBackend>>(m, "CudaIPC")
         .def(py::init<>())
+        .def("topology", &CudaBackend::Topology)
         .def("submit", &CudaBackend::Submit)
         .def("query", &CudaBackend::Query)
         .def("retire", &CudaBackend::Retire)

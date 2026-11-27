@@ -719,7 +719,8 @@ if (BUILD_PROCESS_TP)
         src/distributed/pd_tasks.cpp src/distributed/pd_cuda.cpp
         src/distributed/pd_execution.cpp src/distributed/pd_moe.cpp
         src/distributed/pd_service.cpp src/distributed/pd_service_transfer.cpp
-        src/distributed/pd_service_output.cpp src/distributed/pd_router.cpp)
+        src/distributed/pd_service_output.cpp src/distributed/pd_router.cpp
+        src/distributed/pd_pairing.cpp)
     target_include_directories(fastllm_pd_core PRIVATE ${FASTLLM_PD_PYBIND_INCLUDE})
     target_link_libraries(fastllm_pd_core PRIVATE Python3::Module Threads::Threads)
     target_compile_features(fastllm_pd_core PRIVATE cxx_std_17)

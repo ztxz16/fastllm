@@ -34,5 +34,7 @@ inline void start(O callback, const char *name, T args = py::tuple()) {
 }
 void BindServiceTransfer(Handlers &h);
 void BindServiceOutput(Handlers &h);
+void BindPairing(Handlers &h);
+void ValidatePairManifest(O record, O manifest, const char *side);
 } // namespace pd
 } // namespace fastllm

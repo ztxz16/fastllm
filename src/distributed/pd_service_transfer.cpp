@@ -174,6 +174,7 @@ void BindServiceTransfer(Handlers &h) {
             Lock lock(get(s, "lock"));
             r = s.attr("_record")(id);
             protocol(!cancelled(r), "request cancelled");
+            ValidatePairManifest(r, manifest, "target");
             protocol(get(r, "remote").is_none() || equal(get(r, "remote"), manifest),
                      "target registration changed");
             put(r, "remote", manifest);
@@ -224,6 +225,7 @@ void BindServiceTransfer(Handlers &h) {
             return D("submitted"_a = true);
         }
         protocol(!get(r, "manifest").is_none() && !cancelled(r), "receiver unavailable");
+        ValidatePairManifest(r, source, "source");
         put(r, "remote", source);
         try {
             rpc(s, get(r, "peer_url"), "/internal/lease", D("identity"_a = asdict(id), "acquire"_a = true));
@@ -242,6 +244,8 @@ void BindServiceTransfer(Handlers &h) {
 
     h["service.Service._submit"] = [](D a) {
         O s = self(a), r = at(a, "record");
+        ValidatePairManifest(r, at(a, "source"), "source");
+        ValidatePairManifest(r, at(a, "target"), "target");
         py::set expected;
         for (auto c : plan(at(a, "source"), at(a, "target")))
             expected.add(py::make_tuple(get(get(c, "source"), "rank"), get(get(c, "source"), "layer")));
