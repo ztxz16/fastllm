@@ -102,6 +102,18 @@ Marlin 解包辅助函数仅在 SM75 及以上架构中声明，FT 的调用此�
 仅做源码 Review、架构条件文本检查和差异检查，未本地编译或运行 GPU 测试。
 服务器需继续完成四个原生目标构建；本条不代表模型或数值验收通过。
 
+### 2026-11-27：连续 KV 的设备 UUID 查询
+
+服务器编译 `qwen3_layer.cu` 时，连续 KV 交接头文件中的 `cudaDeviceGetUuid` 未声明。
+FT 连续 KV 适配层（CUDA C++）改用 `cudaGetDeviceProperties` 读取 `property.uuid.bytes`，
+与现有分页 KV 导出和原生 IPC 后端的设备识别方式一致；交接描述仍保存 16 字节 UUID。
+设备查询放在登记交接和分配显存之前，失败时不留下空交接记录。
+
+接口依据：[CUDA 12.6 设备管理](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/group__CUDART__DEVICE.html)
+与 [设备属性中的 UUID](https://docs.nvidia.com/cuda/archive/12.6.3/cuda-runtime-api/structcudaDeviceProp.html)。
+未增加 Driver API 或链接依赖，未修改第三方源码。
+已做静态 Review 和差异检查；未本地编译或运行 GPU 测试，服务器构建及连续 KV 交接待验证。
+
 构建后逐阶段后台验收，每次检查运行目录的 `exit_code` 和汇总报告：
 
 ```bash
