@@ -26,7 +26,8 @@ public:
      * @param loader 已验证的本 rank 分片读取器，构造完成后可释放。
      * @param stream worker 的非空 CUDA stream，不取得其所有权。
      * @param maxTensorBytes 单个源张量 CPU 分配上限，必须为正。
-     * @param maxDeviceBytes FP16 权重总字节上限，不含上下文、KV、分配器开销。
+     * @param maxDeviceBytes FP16 权重总字节上限，必须为正；UINT64_MAX 表示不另设固定配额。
+     *                       始终另查本卡空闲显存，不含上下文、KV、分配器开销预算。
      */
     Qwen3DeviceWeights(const Qwen3ShardLoader &loader, cudaStream_t stream,
                       uint64_t maxTensorBytes, uint64_t maxDeviceBytes);

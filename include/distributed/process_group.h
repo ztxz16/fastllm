@@ -3,6 +3,7 @@
 #include "distributed/pd_native.h"
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -151,30 +152,35 @@ public:
     std::vector<float> CheckAllReduce(uint32_t count = 1, uint32_t salt = 0);
 
     /**
-     * 让各 worker 独立读取本 rank 的 Qwen3 权重并以 FP16 驻留 GPU。
+     * 让各 worker 独立读取本 rank 的普通 TP 权重并以 FP16 驻留 GPU。
      *
      * 只加载权重，不执行前向、不创建 KV。重复加载必须先卸载；任一 worker
-     * 失败会终止整组，不能继续使用其他 rank 的部分结果。
+     * 失败会终止整组，不能继续使用其他 rank 的部分结果。支持 Qwen3 与 Qwen2 MoE；
+     * 默认不设固定 GiB 配额，由各 worker 在读取权重前检查本卡实际空闲显存。
      * @param directory 本机各 worker 可访问的 HF 模型目录，调用时固定为绝对路径。
      * @param maxTensorBytes 单个源分片的 CPU 缓冲上限，必须大于零。
-     * @param maxDeviceBytes 每个 rank 的 FP16 权重总字节上限，不包含 KV 或 CUDA 上下文。
+     * @param maxDeviceBytes 每个 rank 的 FP16 权重总字节上限，必须大于零；默认 UINT64_MAX
+     *                       表示不另设固定配额，实际显存检查始终生效，不包含 KV 或工作区预算。
      * @param timeoutMs 整组加载截止时间；与短控制消息超时独立。
      * @return 按 rank 排列的权重计数与实际读取字节；失败抛异常。
      */
     std::vector<ProcessModelInfo> LoadQwen3(const std::string &directory,
-        uint64_t maxTensorBytes = 1073741824ULL, uint64_t maxDeviceBytes = 8589934592ULL,
+        uint64_t maxTensorBytes = 1073741824ULL,
+        uint64_t maxDeviceBytes = std::numeric_limits<uint64_t>::max(),
         int timeoutMs = 300000);
 
     /**
      * 加载 Attention TP=1 的 Qwen2 MoE，复用有界读取与 FP16 上传路径。
      * @param directory 本地 HF 目录；非专家权重复制，路由专家按 ID 取模分配。
      * @param maxTensorBytes 单个源张量 CPU 上限。
-     * @param maxDeviceBytes 每 rank GPU 权重上限，默认 12 GiB，不含工作区/KV。
+     * @param maxDeviceBytes 每 rank GPU 权重上限，必须大于零；默认 UINT64_MAX 表示
+     *                       不另设固定配额，仍检查本卡空闲显存，不含工作区/KV 预算。
      * @param timeoutMs 整组截止时间；任一失败终止全部 worker。
      * @return 各 rank 的实际张量数和读取/驻留字节；卸载和读回复用现有接口。
      */
     std::vector<ProcessModelInfo> LoadQwenMoe(const std::string &directory,
-        uint64_t maxTensorBytes = 1073741824ULL, uint64_t maxDeviceBytes = 12884901888ULL,
+        uint64_t maxTensorBytes = 1073741824ULL,
+        uint64_t maxDeviceBytes = std::numeric_limits<uint64_t>::max(),
         int timeoutMs = 300000);
 
     /**
