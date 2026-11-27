@@ -63,6 +63,7 @@ GGUF 的两项兼容补丁已随 `986b9685` 回退；表格不再将它们列为
 | [PD-27](#pd-27) | 统一入口、输出顺序与断连 | 已接入 | 已通过（Router 20/20） | 部分验收 | 验真实模型流式输出、去重及断连 |
 | [PD-28](#pd-28) | 交接状态机与 KV 占用管理 | 已接入 | 已通过（取消/释放用例） | 部分验收 | 补真实服务超时、故障与资源释放矩阵 |
 | [PD-29](#pd-29) | FlashInfer/CCCL 在 CUDA 12.6 的依赖构建 | 已接入（固定完整依赖） | 待验证（仅静态检查） | 未验收 | V100 服务器前台重新配置并构建四个目标 |
+| [PD-30](#pd-30) | FT Marlin MoE 的 SM70 编译保护 | 已接入（调用处架构保护） | 待验证（仅静态检查） | 未验收 | V100 服务器继续构建四个原生目标 |
 
 ### Attention DP/EP
 
@@ -859,6 +860,24 @@ FT 在 `cmake/fastllm_cccl.cmake`（CMake/Git）接入 CCCL v3.3.2 完整固定�
 CCCL 3.x 的 SM70 不在上游常规 CI 中，实际构建与推理结果须由服务器确认。
 此前四项基础验收记录保持原有范围，不表示本次依赖升级已通过。
 说明见 [CCCL 构建依赖](../tools/third_party/README.md#flashinfer-的-cccl-构建依赖2026-11-27)。
+
+</details>
+
+<a id="pd-30"></a>
+
+<details>
+<summary>PD-30｜FT Marlin MoE 的 SM70 编译保护</summary>
+
+**验收对象**：CUDA 12.6、V100 上不再因 Marlin `dequant` 未声明而失败，
+并完成 `fastllm_pd_core`、`fastllm_tp_generate`、`fastllm_moe_generate`、`fastllm_tp_worker` 构建。
+该项只验构建兼容，不表示 V100 支持 Marlin MoE 或正式模型已通过验收。
+
+2026-11-27 用户提供服务器证据：FT 的 `fastllm-moe-vllm-marlin.cu` 调用 `dequant` 时报未声明。
+根因是解包接口仅在 SM75 及以上架构中声明，FT 累加辅助函数缺少对应编译条件。
+修复位于 FT Marlin MoE 适配层（CUDA C++）：低架构编译不引用不可用接口，误入时触发设备异常；
+主机侧 SM80 及以上的准入条件保持不变，受支持架构的原有计算体保持不变。
+Marlin 头文件与 `third_party/` 未改；只做静态 Review、架构条件文本检查和差异检查，
+未运行本地编译或 GPU 验收。此前 protocol、Router、IPC 的验收范围保持原样。
 
 </details>
 
