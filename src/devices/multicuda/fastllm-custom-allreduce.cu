@@ -18,6 +18,7 @@
 #include "fastllm-draft-sm120.h"
 #include "naive-n05-cuda.cuh"
 #include "devices/multicuda/fastllm-naive-verify.h"
+#include "devices/cuda/naive-n05-verify-groups.cuh"
 #include "devices/cuda/naive-n05-swa-verify.cuh"
 #ifdef FASTLLM_ENABLE_NAIVE_DP_VERIFY
 #include "devices/cuda/naive-n05-dp-dsa-verify.cuh"
@@ -4759,9 +4760,98 @@ bool FastllmCudaPackedVerifySupported(int rows, int ranks) {
 #endif
 }
 
-// A replicated attention rank owns the entire output projection. The caller still
-// performs its ordinary residual and norm after any required DP row exchange.
-static bool RunReplicaVerifyAttention(const FastllmNaiveVerifyAttentionInput &x) {
+// Return the local O projection. The caller owns the TP reduction and residual.
+static bool RunBlackwellProjectedVerifyAttention(const FastllmNaiveVerifyAttentionInput &x) {
+    const auto &c = x.config;
+    const bool tpSwa = !x.replica && x.sliding && c.heads == 8 && c.kvHeads == 1;
+    const int width = x.requests.empty() ? 0 : x.requests.front(), rows = x.caches.size();
+    const FastllmNaiveRopeCacheRow empty{};
+    const auto &cache = rows ? x.caches.front() : empty;
+    const auto *projection = FastllmCudaGetMxfp8ProjectionBackend();
+    const auto groups = FastllmNaiveVerifyGroups::Plan(rows, width, &x.requests);
+    int bindingStride = 0;
+    auto supported = [&] {
+        if (x.branch || !x.normed || !x.attention || !x.projected || !x.positions || !x.live || !x.sink ||
+            (tpSwa ? !x.query : !x.projectionScratch) || !x.qkv || !groups.count ||
+            (!tpSwa && c.heads != 64) || c.headDim != 192 || c.valueDim != 128 || c.rotaryDim != 64) return false;
+        if (!cache.key || !cache.value || !cache.cache) return false;
+        if (x.sliding) {
+            if (c.window != 128 || (!tpSwa && rows > 128)) return false;
+            if (x.requests.size() > 1) bindingStride = x.caches[width].cache == cache.cache + 4 ? 4 : 8;
+            for (size_t request = 0; request < x.requests.size(); ++request) {
+                const int start = groups.First(request), count = groups.Size(request);
+                const auto &first = x.caches[start];
+                if (first.cache != cache.cache + request * bindingStride || !first.key ||
+                    first.key->dataType != cache.key->dataType ||
+                    !FastllmCudaCanPackedSwaVerify(first, count, c.heads, c.kvHeads, groups.count, groups.maxWidth)) return false;
+                for (int i = 1; i < count; ++i) {
+                    const auto &r = x.caches[start + i];
+                    if (r.cache != first.cache || r.key != first.key || r.value != first.value ||
+                        r.verifyOffset != i) return false;
+                }
+            }
+        } else {
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+            if (c.kvHeads != 4 || x.indexHeads != 16 || x.indexDim != 128 || x.topK != 2048 ||
+                !x.fp8Query || x.fp8IndexerCache || x.capacity <= 8192 || x.capacity > 65536) return false;
+            if ((x.requests.size() > 1 || cache.key->dataType == fastllm::FP4_E2M1) &&
+                !FastllmCudaCanBatchDpDSAVerify(x.caches, width, x.capacity, *x.projectionScratch, x.query, x.indexPool, &x.requests))
+                return false;
+#else
+            return false;
+#endif
+        }
+        if (tpSwa) {
+            const int gpu = FastllmCudaGetDevice();
+            auto vector = [&](const fastllm::Data &d, fastllm::DataType type, int count) {
+                return d.dataType == type && d.dataDevice == fastllm::CUDA &&
+                       d.dataDeviceIds == std::vector<int>{gpu} && d.cudaData &&
+                       !(uintptr_t(d.cudaData) & 15) && d.Count(0) == count;
+            };
+            if (x.normed->dims != std::vector<int>{1, rows, 4096} ||
+                !vector(*x.positions, fastllm::FLOAT32, rows) || !vector(*x.live, fastllm::INT32, rows) ||
+                (!x.sink->dims.empty() && !vector(*x.sink, fastllm::FLOAT32, c.heads)) ||
+                !std::isfinite(x.theta) || x.theta <= 0 || !std::isfinite(x.valueScale)) return false;
+        }
+        return projection != nullptr;
+    };
+    const bool eligible = supported();
+    if (tpSwa) {
+        auto &state = GetCustomArState();
+        CustomArCallLease lease;
+        CustomArPointers peers;
+        int rank = -1;
+        if (!lease.Acquire(state, 8192, fastllm::BFLOAT16, FastllmCudaGetDevice(), true, rank) ||
+            !FindOrRegisterCustomArPointers(state, rank, x.normed ? x.normed->cudaData : nullptr, rows * 4096,
+                                             fastllm::BFLOAT16, eligible, peers)) return false;
+    } else if (!eligible) return false;
+    auto packed = projection->Borrow(*x.outputWeight, rows, tpSwa ? *x.query : *x.projectionScratch);
+    if (!tpSwa && !packed.Matches(rows, c.heads * c.valueDim)) return false;
+    if (!projection->TryProject(x.qkvActivation, *x.normed, *x.qkvWeight, *x.qkvBias, *x.qkv, true))
+        fastllm::Linear(*x.normed, *x.qkvWeight, *x.qkvBias, *x.qkv);
+    bool ready = false;
+    if (x.sliding)
+        ready = FastllmCudaTryPackedSwaVerify(*x.qkv, *x.positions, *x.live, cache, *x.sink,
+            c.heads, c.kvHeads, x.theta, x.valueScale, packed, *x.attention, projection->projectPdl != nullptr, width, bindingStride, &x.requests);
+#ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
+    else
+        ready = FastllmCudaTryDpDSAVerify(*x.normed, *x.qkv, *x.indexKeyWeight, *x.indexQueryWeight,
+            *x.indexWeight, *x.indexNorm, *x.indexBias, *x.sink, *x.positions, *x.live,
+            *cache.key, *cache.value, cache.cache, x.capacity, x.theta, x.valueScale,
+            packed, *x.scratch, *x.attention, true, width, x.projectionScratch, x.query, x.indexPool, &x.requests);
+#endif
+    if (!ready) {
+        if (tpSwa) throw std::runtime_error("Failed to launch admitted TP sliding attention.");
+        return false;
+    }
+    if (!projection->TryProject(packed, *x.attention, *x.outputWeight, fastllm::Data(), *x.projected, true))
+        fastllm::Linear(*x.attention, *x.outputWeight, fastllm::Data(), *x.projected);
+    return true;
+}
+
+static bool RunProjectedVerifyAttention(const FastllmNaiveVerifyAttentionInput &x) {
+    const int arch = FastllmCudaRuntimeArch();
+    if (arch == 100 || arch == 103) return RunBlackwellProjectedVerifyAttention(x);
     const auto &c = x.config;
     const int owners = x.requests.size();
     const int rows = x.caches.size();
@@ -4826,7 +4916,9 @@ FastllmVerifyOutput FastllmCudaVerifyAttention(const FastllmNaiveVerifyAttention
                                                const FastllmMoePreparedInput *prepared) {
     using Result = FastllmVerifyOutput;
     const auto &cfg = x.config;
-    if (x.replica) return RunReplicaVerifyAttention(x) ? Result::Projected : Result::Unsupported;
+    if (x.replica || ((FastllmCudaRuntimeArch() == 100 || FastllmCudaRuntimeArch() == 103) && x.sliding && !x.branch && !x.packedTp && x.requests.size() >= 3 &&
+                      cfg.heads == 8 && cfg.kvHeads == 1))
+        return RunProjectedVerifyAttention(x) ? Result::Projected : Result::Unsupported;
     const bool verifyShape = cfg.heads == 8 && cfg.kvHeads == 1 && cfg.headDim == 192 &&
                              cfg.valueDim == 128 && cfg.rotaryDim == 64;
     if (!x.sliding && !verifyShape) return Result::Unsupported;

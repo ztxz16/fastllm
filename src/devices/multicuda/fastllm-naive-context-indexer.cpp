@@ -37,7 +37,7 @@ bool FastllmCudaVerifyReduceNormSupported(int rows, const std::vector<int> &devi
 
 NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, int tpRanks,
         const std::vector<int> *requests, bool ringCache, bool integratedExperts, bool localDsa,
-        int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks) {
+        int capacity, int indexHeads, int indexDim, int topK, int localAttentionRanks, bool fp8KV) {
     NaiveVerifyAttentionPlan plan{};
 #ifndef USE_ROCM
     // TP attention consumes all verification rows even when EP distributes the experts.
@@ -68,9 +68,21 @@ NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, in
         return plan;
     }
 #endif
-    if (requests && integratedExperts) {
-        plan.swa = ringCache && rows <= 16 && FastllmCudaSwaVerifyLayerSupported(device, rows);
-        plan.dsa = localDsa && FastllmCudaLocalDsaLayerSupported(*requests, rows, capacity, indexHeads, indexDim, topK);
+    if (requests && (integratedExperts || fp8KV || arch == 103)) {
+        const bool blackwell = arch == 100 || arch == 103;
+        fp8KV = fp8KV && blackwell;
+        const bool swa = ringCache && FastllmCudaSwaVerifyLayerSupported(device, rows);
+        const bool dsa = localDsa && FastllmCudaLocalDsaLayerSupported(*requests, rows, capacity, indexHeads, indexDim, topK);
+        if (integratedExperts) {
+            plan.swa = rows <= 16 && swa;
+            plan.dsa = (!blackwell || rows <= 16 || (fp8KV && rows <= 32)) && dsa;
+        }
+        // Above the residual-fused range the caller already owns a normalized
+        // activation, both with expert parallelism and with TP-sharded experts.
+        if ((fp8KV || arch == 103) && (!integratedExperts || rows > 16)) {
+            plan.normalizedSwa = ringCache && (swa || (requests->size() >= 3 && arch == 103));
+            plan.normalizedDsa = dsa;
+        }
     }
 #endif
     return plan;
@@ -83,8 +95,8 @@ NaiveVerifyAttentionPlan::Layer NaiveVerifyAttentionPlan::ForLayer(bool sliding,
     if (!residual && (sliding ? hopperRing && ringCache :
         localIndexer && (hopperReplicated || (hopperContext && contextIndex)))) return {true, false, false, false};
     return {packed && packedCache && (sliding ? ringCache : !residual && localIndexer && contextIndex),
-            sliding && residual && swa, !sliding && localIndexer && dsa,
-            packedCache && !residual && (sliding ? ringCache && replicaSwa : localIndexer && replicaDsa)};
+            sliding && ((residual && swa) || (!residual && normalizedSwa)), !sliding && localIndexer && (dsa || normalizedDsa),
+            (packedCache || (cacheRequests > 1 && (replicaArch == 100 || replicaArch == 103))) && !residual && (sliding ? ringCache && replicaSwa : localIndexer && replicaDsa)};
 }
 
 static void GatherContextCandidates(Data &exchange, int part, int rank, int ranks, int gpu,

@@ -1073,9 +1073,12 @@ Data NaiveN05FlashModel::RunTarget(
     const auto verifyPlan = FastllmCudaPlanVerifyAttention(gpu, length, tpDevices.size(),
         graphVerify && !attentionParallel && tensorParallel && batch && capture->ringVerify ? &batch->lengths : nullptr,
         tpSwaRingCache, !expertUpdatesResidual && (!tpEp8MegaState || experts),
-        indexerCompute == NaiveIndexerCompute::Auto && !sparseKv && !HasSeparateIndexer() && !indexerLayerSharding && indexFp8,
+        indexerCompute == NaiveIndexerCompute::Auto && !sparseKv && !indexerLayerSharding && indexFp8 &&
+            (!HasSeparateIndexer() || (attentionParallel && AttentionTPSize() == 1 &&
+                                       kvCacheDataType == FP4_E2M1 && !indexerContextSharding)),
         buf.capacity, indexHeads, indexDim, indexTopK,
-        graphVerify && attentionParallel && capture->ringVerify && buf.cacheTable ? AttentionTPSize() : 0);
+        graphVerify && attentionParallel && capture->ringVerify && buf.cacheTable ? AttentionTPSize() : 0,
+        kvCacheDataType == FP8_E4M3);
     // Keep the previous FFN branch separate until every fused attention CTA has read the
     // old residual. The fused call adds it after all attention readers finish.
     Data *pendingMlp = nullptr, *pendingFeature = nullptr;
@@ -1239,6 +1242,7 @@ Data NaiveN05FlashModel::RunTarget(
                 input.indexDim = indexDim;
                 input.fp8Query = indexFp8;
                 input.fp8IndexerCache = fp8IndexerCache;
+                if (layerPlan.replica && separateIndex) input.indexPool = &IndexerStorage(layer, tpRank);
             }
             input.outputWeight = &localWeight(ap + "o_proj.weight");
             input.postNorm = &localWeight(prefix + ".post_attention_layernorm.weight");
@@ -1256,7 +1260,7 @@ Data NaiveN05FlashModel::RunTarget(
             input.theta = cfg.theta;
             input.valueScale = valueScale;
             const bool withRouter =
-                (ring || moeLayers[layer]) && (length == 1 || length < FastllmCudaGetLinearExactBatchThreshold());
+                !shardRouter && (ring || moeLayers[layer]) && (length == 1 || length < FastllmCudaGetLinearExactBatchThreshold());
             if (withRouter) {
                 input.routerWeight = &localWeight(prefix + ".mlp.gate.weight");
                 input.router = &router;
@@ -1269,7 +1273,7 @@ Data NaiveN05FlashModel::RunTarget(
                 Data &value = *batch->Value(sequence, layer).multiDeviceDatas.at(gpu);
                 if (!ring && verifyPlan.dsa) key.kvCacheFp8Indexer = fp8IndexerCache;
                 for (int row = 0; row < batch->lengths[sequence]; ++row) {
-                    input.caches.push_back({&key, &value, nullptr, cache ? cache + sequence * 4 : nullptr});
+                    input.caches.push_back({&key, &value, nullptr, cache ? cache + sequence * (separateIndex ? 8 : 4) : nullptr});
                     if (ring) input.caches.back().verifyOffset = row;
                 }
             }

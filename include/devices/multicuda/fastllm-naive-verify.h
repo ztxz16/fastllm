@@ -30,7 +30,7 @@ struct FastllmNaiveVerifyAttentionInput : FastllmNaiveDSALayerInput {
     fastllm::Data *indices = nullptr;
     int attentionRank = 0, topK = 0, indexHeads = 0, indexDim = 0;
     fastllm::Data *qkv = nullptr;
-    const fastllm::Data *projectionScratch = nullptr;
+    const fastllm::Data *projectionScratch = nullptr, *indexPool = nullptr;
     bool replica = false, fp8IndexerCache = false;
     bool sliding = false, packedTp = false, afterExpertReduce = false, deferPostNorm = false;
 };
