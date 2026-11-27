@@ -81,7 +81,8 @@ int main(){try{
  }
  Data gate,up,down;Init(gate,BFLOAT16,{256,1024});Init(up,BFLOAT16,gate.dims);Init(down,BFLOAT16,{1024,256});
  Fill(gate,13);Fill(up,23);Fill(down,33);
- for(int rows:{1,2,3,8}){
+ for(int rows:{1,2,3,8,9,15,17,65,127,128}){
+  if (rows>8 && (properties.major!=10 || properties.minor!=3)) continue;
   Data x,mid,out;Init(x,BFLOAT16,{1,rows,1024});Fill(x,17);
   if(!mma){Check(!FastllmCudaDecodeDense(x,gate,up,down,mid,out),"unsupported MMA did not fall back");Check(!out.cudaData&&!mid.cudaData,"fallback allocated outputs");continue;}
   Check(FastllmCudaDecodeDense(x,gate,up,down,mid,out),"portable Dense not admitted");C(cudaStreamSynchronize(cudaStreamPerThread));
@@ -90,7 +91,7 @@ int main(){try{
   C(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
   Check(FastllmCudaDecodeDense(x,gate,up,down,mid,out),"warm Dense rejected inside capture");
   C(cudaStreamEndCapture(cudaStreamPerThread,&graph));size_t nodes=0;C(cudaGraphGetNodes(graph,nullptr,&nodes));
-  Check(nodes==2,"Data adapter did not capture two fused kernels");C(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
+  Check(rows <= 16 ? nodes == 2 : nodes >= 4, "Dense graph omitted a stage");C(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0));
   for(int replay=0;replay<4;++replay)C(cudaGraphLaunch(exec,cudaStreamPerThread));
   C(cudaStreamSynchronize(cudaStreamPerThread));Check(out.cudaData==address&&Read(out)==expected,"graph replay changed result or allocation");
   x.dataType=FLOAT16;Check(!FastllmCudaDecodeDense(x,gate,up,down,mid,out),"wrong precision accepted");x.dataType=BFLOAT16;
