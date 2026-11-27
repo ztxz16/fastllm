@@ -12,6 +12,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 from report import run
+from generation_reference import ReferenceArchive
 
 
 def request(url, token, payload):
@@ -51,7 +52,13 @@ def compare(args, output, name, tokens, *, generated=8, streaming=False, samplin
         return_token_ids=True, stream=streaming)
     if session:
         payload["session_id"] = session
-    reference = request(args.reference, args.token, payload)
+    reference = (args.archive.obtain(name, payload, request) if args.archive is not None
+                 else request(args.reference, args.token, payload))
+    if args.record_reference:
+        (output / (name + ".evidence.json")).write_text(json.dumps(
+            dict(request=payload, reference=reference, comparison="reference recording only"), indent=2))
+        return dict(prompt_tokens=len(tokens), output_tokens=len(reference["token_ids"]),
+                    scope="reference recording; no PD comparison")
     actual = request(args.router, args.token, payload)
     expected_ids, actual_ids = reference["token_ids"], actual["token_ids"]
     first = next((i for i, (a, b) in enumerate(zip(expected_ids, actual_ids)) if a != b),
@@ -70,12 +77,19 @@ def compare(args, output, name, tokens, *, generated=8, streaming=False, samplin
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--router", required=True)
-    parser.add_argument("--reference", required=True, help="同模型同配置完整服务的 Router URL")
+    parser.add_argument("--router", help="待比较的 PD Router URL；仅录制基线时不需要")
+    reference = parser.add_mutually_exclusive_group(required=True)
+    reference.add_argument("--reference", help="同模型同配置完整服务的 Router URL")
+    reference.add_argument("--reference-record", type=Path, help="已完成录制的 reference.json")
+    parser.add_argument("--record-reference", action="store_true", help="仅运行完整服务并录制离线基线")
     parser.add_argument("--profile", required=True, help="如 pull_p_tp2_d_tp1_graph0_cache0")
     parser.add_argument("--prompt-token-ids", required=True, type=Path, help="固定 Token ID 数组 JSON")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    if args.record_reference and (not args.reference or args.router):
+        parser.error("recording requires --reference and must not specify --router")
+    if not args.record_reference and not args.router:
+        parser.error("comparison requires --router")
     args.token = os.environ.get("FT_PD_TOKEN", "")
     if not args.token:
         parser.error("FT_PD_TOKEN must be set")
@@ -85,6 +99,13 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     gpu = subprocess.check_output(["nvidia-smi", "--query-gpu=name,uuid,driver_version,compute_cap",
         "--format=csv,noheader"], text=True).strip()
+    args.archive, setup_error = None, None
+    if args.record_reference or args.reference_record:
+        try:
+            args.archive = ReferenceArchive(args)
+        except Exception as error:
+            setup_error = f"{type(error).__name__}: {error}"
+            (args.output / "reference.setup_error.txt").write_text(setup_error + "\n")
     cases = []
     for length in (1, 128, 511, 512, 513):
         tokens = (ids * ((length + len(ids) - 1) // len(ids)))[:length]
@@ -103,7 +124,8 @@ def main():
                     (ids * (514 // len(ids) + 1))[i:i + 512], streaming=True) for i in range(count)]
                 for future in futures:
                     future.result()
-            return dict(concurrency=count, exact="PASS")
+            return (dict(concurrency=count, scope="reference recording; no PD comparison")
+                    if args.record_reference else dict(concurrency=count, exact="PASS"))
         cases.append((name, concurrent_case))
     name = args.profile + "_multi_turn"
     def multi_turn():
@@ -112,19 +134,42 @@ def main():
         for turn in range(3):
             payload = dict(token_ids=tokens, max_new_tokens=8, temperature=0.0, top_k=0, top_p=1.0,
                 seed=20261126, eos_token_ids=[], return_token_ids=True, stream=True, session_id=session)
-            reference = request(args.reference, args.token, payload)
-            actual = request(args.router, args.token, payload)
-            (args.output / (name + f"_turn{turn}.evidence.json")).write_text(json.dumps(
-                dict(request=payload, actual=actual, reference=reference), indent=2))
-            if actual["token_ids"] != reference["token_ids"] or len(actual["token_ids"]) != 8:
+            turn_name = name + f"_turn{turn}"
+            reference = (args.archive.obtain(turn_name, payload, request) if args.archive is not None
+                         else request(args.reference, args.token, payload))
+            actual = None if args.record_reference else request(args.router, args.token, payload)
+            (args.output / (turn_name + ".evidence.json")).write_text(json.dumps(
+                dict(request=payload, actual=actual, reference=reference,
+                     comparison="reference recording only" if args.record_reference else "exact"), indent=2))
+            if actual is not None and (actual["token_ids"] != reference["token_ids"] or len(actual["token_ids"]) != 8):
                 raise AssertionError(f"multi-turn exact FAIL: turn {turn}")
-            tokens = tokens + actual["token_ids"] + ids[:4]
+            tokens = tokens + (reference if actual is None else actual)["token_ids"] + ids[:4]
+        if args.record_reference:
+            return dict(turns=3, scope="complete history reference recording; no PD comparison")
         return dict(turns=3, exact="PASS", scope="complete history supplied; enable return-KV to exercise reuse")
     cases.append((name, multi_turn))
-    return run(cases, args.output, backend="formal HTTP Router -> native workers",
+
+    if args.record_reference or args.reference_record:
+        def guarded(name, case):
+            def execute():
+                if setup_error is not None:
+                    raise RuntimeError("offline reference preflight failed: " + setup_error)
+                result = case()
+                args.archive.check_deployment(name)
+                return result
+            return execute
+        cases = [(name, guarded(name, case)) for name, case in cases]
+    code = run(cases, args.output, backend="formal HTTP Router -> native workers",
         metadata_extra=dict(gpu=gpu, cuda="recorded by deployed worker command and build logs", profile=args.profile,
-                            reference=args.reference, router=args.router, architecture="see GPU compute_cap above"),
-        scope="单个部署组合的 15 个正式入口 exact 用例，含并发与多轮；不含故障注入或性能验收")
+                            reference=args.reference, router=args.router,
+                            reference_record=str(args.reference_record) if args.reference_record else None,
+                            recording=args.record_reference, architecture="see GPU compute_cap above"),
+        scope=("15 个正式完整服务用例的离线基线录制，含并发与多轮；不是 PD exact 验收"
+               if args.record_reference else
+               "单个部署组合的 15 个正式入口 exact 用例，含并发与多轮；不含故障注入或性能验收"))
+    if args.archive is not None:
+        args.archive.finalize(code)
+    return code
 
 
 if __name__ == "__main__":
