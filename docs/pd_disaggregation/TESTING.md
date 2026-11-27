@@ -25,6 +25,59 @@
 | 12 | 真实故障隔离 | rank 退出、服务重启、迟到消息和传输异常；需补故障注入 |
 | 13 | 性能与重叠 | `performance`，6 个 case、每项 5 轮；重叠另采 GPU 时间线 |
 
+## 四卡机器的第 7 步：先录制基线，再执行 PD
+
+2026-11-27 用户提供的服务器拓扑仅支持 GPU 0↔1、2↔3 的 P2P；两组之间不支持。
+当前 PD 后端没有 CPU 中转。第 7 步先尝试普通 `DP1×TP2 → DP1×TP2`：
+
+| 阶段 | 部署 | 检查范围 |
+| --- | --- | --- |
+| 准备基线 | 完整服务使用 GPU 1、3；普通 TP2，Graph/Prefix 关闭 | 完整服务的跨 NUMA TP 通信和实际生成；录制 15 个用例的输出 |
+| PD pull | P 的 rank 0/1 使用 GPU 0、2；D 的 rank 0/1 使用 GPU 1、3 | 对应分片分别走 0→1、2→3；实际生成与 TP2 离线基线 exact 对照 |
+| 后续组合 | 当前组合通过后再单列 push、其他执行配置及并行模式 | 不由某个小规模组合通过推断全部组合通过 |
+
+上述 GPU 编号均为物理 GPU；服务内逻辑编号取决于 `CUDA_VISIBLE_DEVICES` 顺序。
+基线阶段先停止旧 TP1 模型服务，保留独立 Router。基线录制成功后再停止完整服务，
+把四张卡交给 P、D；不能同时保留一个额外模型实例，也不能拿已有 TP1 基线代替 TP2。
+同一 TP 组内的 GPU 跨 NUMA，必须通过实际完整推理确认其通信路径，不能仅根据
+两条 P→D 的 P2P 连通关系宣称 TP 通信可用。此部署尚未验收。
+
+`generation` 增加两个互斥的对照来源，原有在线 `--reference` 行为保留：
+
+- 录制：`--record-reference --reference <完整服务 Router>`，不指定 `--router`。
+  仍运行 15 个原有 case，共保存 21 次实际请求与响应（并发、三轮对话分别展开记录）。
+  仅在完整录制通过后生成 `reference.json`；失败时的 `reference.incomplete.json` 不可用于对照。
+  录制 PASS 只表示输出长度、执行完整性和服务状态符合要求，不报告 PD exact PASS。
+- 离线比较：`--router <PD Router> --reference-record <录制目录/reference.json>`。
+  保持相同 15 个 case；只省去在线完整服务调用，PD 仍通过正式 Router 和原生执行器运行。
+  校验模型标识、服务/副本数量、TP、存储布局、分页大小、Graph、Prefix 和自定义 AllReduce
+  配置；逐请求校验 Prompt ID、生成长度、采样及 EOS 参数。只有每次运行新建的会话编号
+  不要求与录制时相同，多轮历史与本轮会话连续性仍由原用例保留。
+- 记录本次部署证据和基线文件摘要，拒绝不完整或报告不匹配的基线；运行中服务重启或
+  配置变化判 FAIL。离线基线模式只比较正确性，不能把两个时间段的延迟直接作为性能对比。
+
+以下是测试入口模板，必须先完成对应部署；启动器仍自动后台运行并记录退出码：
+
+```bash
+# 阶段一：完整 TP2 服务已就绪，保存基线。
+python3 test/distributed/pd/launch.py generation -- \
+  --reference http://127.0.0.1:8001 --record-reference \
+  --profile full_tp2_graph0_cache0 \
+  --prompt-token-ids "$PD_STEP6_DIR/prompt_token_ids.json"
+
+# 阶段二：基线通过并停止完整服务、启动 TP2 P/D 后执行。
+# PD_TP2_REFERENCE 指向上一条命令实际输出目录中的 reference.json。
+python3 test/distributed/pd/launch.py generation -- \
+  --router http://127.0.0.1:8000 \
+  --reference-record "$PD_TP2_REFERENCE" \
+  --profile pull_p_tp2_d_tp2_graph0_cache0 \
+  --prompt-token-ids "$PD_STEP6_DIR/prompt_token_ids.json"
+```
+
+本次仅补充 Python 测试组织与证据保存，不修改 C++/CUDA 的路由、KV 传输或推理逻辑。
+实现位置为 `check_generation.py` 和 `generation_reference.py`；本地不编译，服务器基线
+录制及 PD exact 对照分别验收，当前状态见 TODO 的 PD-V16、PD-V17。
+
 ## 基础测试命令
 
 ```bash
