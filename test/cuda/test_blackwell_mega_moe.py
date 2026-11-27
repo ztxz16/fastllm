@@ -74,7 +74,8 @@ def main():
     assert capacity(128 * R - 1, R) == 128
     assert capacity(128 * R, R) == (256 if R == 8 else 128)
     assert capacity(128 * R + 1, R) == 256
-    assert capacity(256 * R + 1, R) == 256
+    assert capacity(256 * R, R) == 256
+    assert capacity(256 * R + 1, R) == (512 if R == 8 else 256)
     assert capacity(0, 3) == 0
     for runtime in ("libcudart.so.12", "libcudart.so.13"):
         try:
@@ -149,7 +150,7 @@ def main():
             ).reshape(n, k)
         return q.contiguous().view(torch.uint8)
 
-    assert 0 < size <= {4: 45220224, 8: 45174144}[R], ("decode workspace grew", size)
+    assert 0 < size <= {4: 45220224, 8: 51740544}[R], ("decode workspace grew", size)
     print("WORKSPACE", size, flush=True)
     # Three distinct native experts per owner, aliased across its expert IDs.
     # Reference copies stay on GPU0 and the tested packed representation stays local.
@@ -238,6 +239,7 @@ def main():
             )
         )
     peers = (ptr * R)(*[v["allocation"].data_ptr() for v in ranks])
+    test_rows = 512 if R == 8 else 256
     for r, v in enumerate(ranks):
         torch.cuda.set_device(r)
         arrays = [
@@ -263,11 +265,11 @@ def main():
                     i,
                     int((actual != expected).sum()),
                 )
-        v["x"] = torch.empty(2 * C + 2, H, dtype=torch.bfloat16, device=r)
-        v["idx"] = torch.empty(2 * C + 2, K, dtype=torch.int32, device=r)
-        v["score"] = torch.empty(2 * C + 2, K, dtype=torch.float32, device=r)
-        v["live"] = torch.ones(2 * C + 2, dtype=torch.int32, device=r)
-        v["y"] = torch.full((2 * C + 2, H), -123, dtype=torch.bfloat16, device=r)
+        v["x"] = torch.empty(test_rows + 2, H, dtype=torch.bfloat16, device=r)
+        v["idx"] = torch.empty(test_rows + 2, K, dtype=torch.int32, device=r)
+        v["score"] = torch.empty(test_rows + 2, K, dtype=torch.float32, device=r)
+        v["live"] = torch.ones(test_rows + 2, dtype=torch.int32, device=r)
+        v["y"] = torch.full((test_rows + 2, H), -123, dtype=torch.bfloat16, device=r)
         print("LAYER_CREATE_PASS", r, flush=True)
     sync()
 
@@ -278,11 +280,11 @@ def main():
             v["x"].normal_(0, 0.25)
             v["y"].fill_(-123)
             v["live"].fill_(1)
-            ids = torch.argsort(torch.rand(2 * C + 2, E, device=r), dim=-1)[:, :K]
+            ids = torch.argsort(torch.rand(test_rows + 2, E, device=r), dim=-1)[:, :K]
             if scenario == "one_owner":
-                ids = torch.arange(K, device=r).expand(2 * C + 2, K)
+                ids = torch.arange(K, device=r).expand(test_rows + 2, K)
             v["idx"].copy_(ids.int())
-            v["score"].copy_(torch.softmax(torch.randn(2 * C + 2, K, device=r), -1))
+            v["score"].copy_(torch.softmax(torch.randn(test_rows + 2, K, device=r), -1))
             if scenario == "masked":
                 v["live"][::3] = 0
             if scenario == "verify_owner" and r != seed_offset % R:
@@ -412,15 +414,17 @@ def main():
         (64, "all_masked"),
         (64, "all_idle"),
     ]
+    if R == 8:
+        scenarios.extend([(257, "uneven"), (512, "spread"), (512, "one_owner"), (512, "masked")])
     if R == 8 and a.mxfp4:
-        scenarios[:0] = [(8, "verify_owner"), (8, "masked"), (8, "all_masked")]
+        scenarios[:0] = [(n, "verify_owner") for n in range(1, 9)] + [(4, "masked"), (8, "masked"), (8, "all_masked"), (8, "uneven"), (8, "all_idle")]
     for n, scenario in scenarios:
-        candidate = single_verify if n == 8 else batched
+        candidate = single_verify if n == 8 or (R == 8 and a.mxfp4 and n < 8) else batched
         fill(n, scenario)
         launch(n)
         rel = (
             verify(n, scenario)
-            if (n, scenario) in [(1, "spread"), (64, "spread"), (64, "masked"), (256, "masked")]
+            if scenario == "verify_owner" or (n, scenario) in [(1, "spread"), (64, "spread"), (64, "masked"), (256, "masked")]
             else None
         )
         expected = [v["y"].clone() for v in ranks]

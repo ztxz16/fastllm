@@ -83,6 +83,7 @@ struct FastllmTpExperts {
             bool allowPackedTp, int maxBatch, bool fixedRouting, bool preferVerifyPages, PersistentWorkerGroup &workers, bool &packing,
             std::shared_ptr<FastllmCudaMimoEp8Mega> &mega);
     const char *Name() const;
+    bool HasLocalMega() const { return bool(localMega); }
     bool UpdatesResidual() const { return bool(legacy); }
     bool AllowsLargeBatch() const { return bool(shared) || wideMarlin; }
     void Validate(bool bf16, bool fixedRouting) const;
@@ -96,6 +97,7 @@ private:
     friend struct FastllmExpertRouter;
     bool wideMarlin = false;
     std::shared_ptr<HopperTpExperts> hopper;
+    std::shared_ptr<FastllmCudaMimoEp8Mega> localMega;
     std::shared_ptr<NaiveFlexMoe> legacy;
     std::shared_ptr<NaiveSharedFlexMoe> shared;
     std::vector<std::shared_ptr<Mxfp4MarlinRank>> ranks;

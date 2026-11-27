@@ -147,7 +147,16 @@ extern "C" int fastllm_ep8_mega_moe_owns_packed_weights() {
 #endif
 }
 extern "C" int fastllm_ep8_mega_moe_group_supported(const int*devices,int ranks) {
-    if(!devices||(ranks!=4&&ranks!=8))return 0;
+    if (!devices) return 0;
+    if (ranks == 1) {
+        int previous = -1;
+        if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(devices[0]) != cudaSuccess) return 0;
+        const auto *api = select();
+        const bool supported = api && api->workspace_bytes(1) > 0 && api->supported();
+        cudaSetDevice(previous);
+        return supported;
+    }
+    if (ranks != 4 && ranks != 8) return 0;
     for(int r=0;r<ranks;++r)for(int q=0;q<ranks;++q)if(q!=r){
         int access=0;
         if(devices[r]==devices[q]||cudaDeviceCanAccessPeer(&access,devices[r],devices[q])!=cudaSuccess||!access){

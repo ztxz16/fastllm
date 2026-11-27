@@ -1915,8 +1915,8 @@ bool PlaceMultiCudaWeightOnDevice(fastllm::Data &weight, std::vector <int> &mult
     // allocations with an equally-sized repacked buffer during warmup.  Keep
     // those source allocations out of the model-weight slab so they can be
     // returned to CUDA immediately instead of leaving an unreclaimable slab
-    // hole for every expert.
-    if (weight.dataType == fastllm::DataType::NVFP4 &&
+    // hole for every expert. An existing allocation keeps its original allocator.
+    if (!weight.cudaData && weight.dataType == fastllm::DataType::NVFP4 &&
         weight.name.find(".experts.") != std::string::npos) {
         weight.directMemory = true;
     }

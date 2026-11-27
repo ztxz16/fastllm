@@ -7,15 +7,15 @@ namespace fastllm {
 // Called only after a synchronous successful pack, before workers/graphs can
 // see the model. The Data object remains metadata; the backend is now the sole
 // owner of its payload. No CPU mirror is retained as a hidden fallback cache.
-inline size_t ReleasePackedMoeSource(Data &source) {
+inline size_t ReleasePackedMoeSource(Data &source, bool allowPooledSource = false) {
     AssertInFastLLM(!source.isFake && !source.cudaDataBorrowed &&
         source.extraCudaData.empty() && source.extraCudaHalfData.empty(),
         "Packed MoE source must have exclusive ownership and no live auxiliary cache.");
     const size_t bytes = source.cudaData ? source.GetBytes() : 0;
     if (source.cudaData) {
         AssertInFastLLM(source.dataDeviceIds.size() == 1 && (source.directMemory ||
-            (source.cudaRepackSource && FastllmCudaIsWeightSlabPointer(source.cudaData))),
-            "Packed MoE source must use direct storage or a releasable source slab.");
+            (source.cudaRepackSource && (allowPooledSource || FastllmCudaIsWeightSlabPointer(source.cudaData)))),
+            "Packed MoE source must use direct storage or a releasable repack allocation.");
         FastllmCudaSetDevice(source.dataDeviceIds[0]);
     }
     source.FreeSpace();

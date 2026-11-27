@@ -60,9 +60,31 @@ NaiveMoeBackend FastllmTpExperts::Plan(const std::vector<int> &devices, int ep, 
     const auto layout = SelectNaiveMoeBackend(ep, shared, old, megaAvailable, flex,
                                               flexGeometry || megaAvailable, true, enabled);
     packsSources = layout == NaiveMoeBackend::FlexTP || layout == NaiveMoeBackend::LegacyFlexTP ||
-        (NaiveMoeUsesEP(layout) && FastllmCudaMimoEp8MegaOwnsPackedWeights(devices.front()));
+        (NaiveMoeUsesEP(layout) && FastllmCudaMimoEp8MegaOwnsPackedWeights(devices.front())) ||
+        (enabled && flexGeometry && devices.size() == 1 && FastllmCudaMimoEp8MegaSupported(devices));
     return layout;
 }
+
+#ifndef USE_ROCM
+static bool CanUseLocalMega(const FastllmTpExperts::Weights &weights, int device) {
+    if (weights.size() != 1 || weights[0].empty() || weights[0].size() > 48) return false;
+    bool hasExperts = false;
+    for (const auto &layer : weights[0]) {
+        if (layer.empty()) continue;
+        if (layer.size() != 514 || layer[0] || layer[1]) return false;
+        for (size_t i = 2; i < layer.size(); ++i) {
+            const auto *w = layer[i];
+            if (!w || !FastllmCudaMimoIsMxfp4Expert(*w) || w->dims.size() != 2 ||
+                w->dims[0] != 4096 || w->dims[1] != (i % 2 ? 2048 : 4096) ||
+                w->dataDeviceIds.size() != 1 || w->dataDeviceIds[0] != device || !w->cudaData ||
+                w->isFake || w->cudaDataBorrowed || !w->extraCudaData.empty() || !w->extraCudaHalfData.empty() ||
+                !(w->directMemory || w->cudaRepackSource)) return false;
+        }
+        hasExperts = true;
+    }
+    return hasExperts;
+}
+#endif
 
 std::shared_ptr<FastllmTpExperts> FastllmTpExperts::Prepare(NaiveMoeBackend &layout, bool &packsSources,
         const std::vector<int> &devices, const Weights &weights, int hidden, int experts, int topk,
@@ -88,6 +110,12 @@ std::shared_ptr<FastllmTpExperts> FastllmTpExperts::Prepare(NaiveMoeBackend &lay
     } else if (layout == NaiveMoeBackend::LegacyTP && allowPackedTp) {
         const FusionMode fusion = ReadFusionMode();
         if (fusion == FusionMode::Disabled) return nullptr;
+        if (devices.size() == 1 && hidden == 4096 && experts == 256 && topk == 8 &&
+            FastllmCudaMimoEp8MegaSupported(devices) && CanUseLocalMega(weights, devices.front())) {
+            packing = true;
+            state->localMega = FastllmCudaCreateMimoEp8Mega(devices, weights, topk);
+            return state;
+        }
         struct RestoreDevice {
             int device = FastllmCudaGetDevice();
             ~RestoreDevice() { FastllmCudaSetDevice(device); }
@@ -124,6 +152,7 @@ std::shared_ptr<FastllmTpExperts> FastllmTpExperts::Prepare(NaiveMoeBackend &lay
 
 const char *FastllmTpExperts::Name() const {
     if (hopper) return "mega-tp/packed-stage";
+    if (localMega) return "local-mega/mxfp4-w4a8";
     if (shared) return NaiveMoeBackendName(shared->ep ? NaiveMoeBackend::FlexEP : NaiveMoeBackend::FlexTP);
     return legacy ? NaiveMoeBackendName(NaiveMoeBackend::LegacyFlexTP) : "marlin-tp/mxfp4-w4a16";
 }
@@ -221,6 +250,11 @@ FastllmExpertResult FastllmTpExperts::Forward(int layer, int rows, Data &input, 
         return result;
     }
 #endif
+    if (localMega) {
+        FastllmCudaRunMimoEp8MegaLocal(*localMega, 0, layer, input, router.ids, router.scores,
+            output, rows, nullptr, nullptr, 0, rows <= 8);
+        return result;
+    }
     if (legacy) {
         legacy->Forward(router.rank, layer, rows, input, router.probabilities, router.bias, hidden);
         result.residualUpdated = true;

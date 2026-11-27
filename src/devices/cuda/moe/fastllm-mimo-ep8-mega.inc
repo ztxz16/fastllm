@@ -329,9 +329,9 @@ void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int
 
 void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch, int densePrefixRows, bool singleVerify) {
+        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch, int densePrefixRows, bool graphVerify) {
     if (state.builtin) return FastllmCudaRunMimoEp8BuiltinMegaLocal(*state.builtin, rank, layer,
-        input, index, score, output, maxRows, liveKeys, prefillScratch, singleVerify);
+        input, index, score, output, maxRows, liveKeys, prefillScratch, graphVerify);
     if (input.dataType != fastllm::BFLOAT16 || input.dims.size() != 2 || input.dims[1] != state.hidden ||
         input.dims[0] < 0 || input.dims[0] > maxRows || maxRows <= 0 ||
         index.dims != std::vector<int>({input.dims[0], state.topk}) || score.dims != index.dims)

@@ -69,4 +69,4 @@ void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int
 void FastllmCudaRunMimoEp8MegaLocal(FastllmCudaMimoEp8Mega &state, int rank, int layer,
     const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
     fastllm::Data &output, int maxRows, const int *liveKeys,
-    fastllm::Data *prefillScratch, int densePrefixRows, bool singleVerify);
+    fastllm::Data *prefillScratch, int densePrefixRows, bool graphVerify);

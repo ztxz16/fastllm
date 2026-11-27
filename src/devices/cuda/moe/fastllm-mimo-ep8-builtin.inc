@@ -69,8 +69,7 @@ bool FastllmCudaMimoEp8BuiltinMegaOwnsPackedWeights(int device) {
     return packed;
 }
 bool FastllmCudaMimoEp8BuiltinMegaSupported(const std::vector<int> &devices) {
-    if ((devices.size() != 4 && devices.size() != 8) ||
-        !fastllm_ep8_mega_moe_group_supported(devices.data(), devices.size())) return false;
+    if (!fastllm_ep8_mega_moe_group_supported(devices.data(), devices.size())) return false;
     int previous = FastllmCudaGetDevice();
     bool ok = true;
     std::string backend;
@@ -180,7 +179,7 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
         auto rank = std::make_unique<FastllmCudaMimoEp8BuiltinMega::Rank>();
         rank->hopperMxfp4 = hopperMxfp4;
         // The builtin MegaMoE prefill path borrows scratch from peer ranks.
-        if (!hopperMxfp4) rank->prefillReady = FastllmCudaEventCreate();
+        if (!hopperMxfp4 && devices.size() > 1) rank->prefillReady = FastllmCudaEventCreate();
         rank->workspace.Resize({(int)bytes});
         rank->workspace.ToDevice(DataDevice::CUDA, {devices[r]}, false);
         rank->workspace.Allocate(false);
@@ -247,10 +246,12 @@ std::shared_ptr<FastllmCudaMimoEp8BuiltinMega> FastllmCudaCreateMimoEp8BuiltinMe
                     const int src = placement.empty() ? e : placement[l].physicalToLogical[e];
                     const int owner = src / localExperts;
                     if (owner != r) FastllmCudaSetDevice(devices[owner]);
-                    released += ReleasePackedMoeSource(*weights[owner][l][2 + src * 2]);
-                    released += ReleasePackedMoeSource(*weights[owner][l][3 + src * 2]);
+                    released += ReleasePackedMoeSource(*weights[owner][l][2 + src * 2], devices.size() == 1);
+                    released += ReleasePackedMoeSource(*weights[owner][l][3 + src * 2], devices.size() == 1);
                     if (owner != r) FastllmCudaSetDevice(devices[r]);
                 }
+                // Local model weights may come from the CUDA allocation pool.
+                if (devices.size() == 1) FastllmCudaReleaseIdleCachedBuffers(devices[r]);
                 rank.scales.clear();
             }
         }
@@ -379,7 +380,7 @@ static int PrepareMimoEpPrefill(FastllmCudaMimoEp8BuiltinMega &state, int rank, 
 }
 void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &state, int rank, int layer,
         const fastllm::Data &input, const fastllm::Data &index, const fastllm::Data &score,
-        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch, bool singleVerify) {
+        fastllm::Data &output, int maxRows, const int *liveKeys, fastllm::Data *prefillScratch, bool graphVerify) {
     using namespace fastllm;
     AssertInFastLLM(input.dataType == BFLOAT16 && input.dims.size() == 2 &&
         input.dims[1] == 4096 && input.dims[0] >= 0 && input.dims[0] <= maxRows && maxRows > 0 &&
@@ -401,6 +402,7 @@ void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &state,
     int capacity = local.hopperMxfp4 ? (maxRows > fastllm_mxfp4_ep_capacity()
         ? state.mxfp4PrefillCapacity : fastllm_mxfp4_ep_capacity())
         : fastllm_ep8_mega_moe_decode_capacity(maxRows * state.devices.size(), state.devices.size());
+    const bool fusedVerify = graphVerify && maxRows <= FastllmMegaVerifyRows;
     const void *prefillPeers[8]{};
     if (prefillScratch && local.prefillReady) {
         // Use a common maximum, including idle sources and unequal DP loads.
@@ -420,7 +422,7 @@ void FastllmCudaRunMimoEp8BuiltinMegaLocal(FastllmCudaMimoEp8BuiltinMega &state,
                 liveKeys ? liveKeys + start : nullptr)
             : prefillPeers[0]
             ? fastllm_ep8_mega_moe_run_prefill(handle, prefillPeers, x, y, idx, scores, count)
-            : (singleVerify ? fastllm_ep8_mega_moe_run_verify : fastllm_ep8_mega_moe_run_batched)(handle, x, y, idx, scores, count, capacity,
+            : (fusedVerify ? fastllm_ep8_mega_moe_run_verify : fastllm_ep8_mega_moe_run_batched)(handle, x, y, idx, scores, count, capacity,
                 liveKeys ? liveKeys + start : nullptr);
         if (!ok)
             throw std::runtime_error(std::string("Local MiMo EP launch failed: ") +

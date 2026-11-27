@@ -25,6 +25,7 @@ constexpr int H=4096, I=2048, E=256, K=8, CAP=256;
 constexpr int BN=128, BK=128, SMS=148, SMALL_CAP=32, MID_CAP=128;
 // Keep every buffer address identical when switching tiles, including the
 // scale-ring stride. All decode tiles share one arena and the same packed weights.
+constexpr int EP8_CAP=512;
 constexpr int RING=1920, SFRING=RING/16*128;
 template<int BM> struct Tile {
     static constexpr int STORE = BM <= 16 ? 8 : BM <= 64 ? 16 : BM <= 192 ? 32 : 24;
@@ -113,20 +114,20 @@ __global__ void prepare(const __nv_bfloat16 *x,const int32_t *idx,const float *s
     prepareGroup(x,idx,score,qx,sf,qi,qs,live,group);
 }
 
-// A single DS7 slot supplies eight padded rows on each graph participant.
+// Masked verification rows share one histogram tile per source rank.
 // Dispatch may inspect routes before other CTAs have published their payload.
-struct VerifyInput {
-    static constexpr unsigned maxRows = 8;
+template<int R> struct VerifyInput {
+    static constexpr unsigned maxRows = FastllmMegaVerifyRows;
     const __nv_bfloat16 *x;
     const int32_t *index;
     const float *score;
     const int *live;
 
-    __device__ int route(unsigned slot) const { return live[slot/K] > 0 ? index[slot] : -1; }
+    __device__ int route(unsigned slot) const { return !live || live[slot/K] > 0 ? index[slot] : -1; }
 
     __device__ void publish(const dg::layout::MegaMoEBuffer &b, unsigned rows,
                             unsigned thread, unsigned threads) const {
-        if (blockIdx.x == 0 && thread < 8) b.workspace.signals->combine_ready_grid_idx[thread] = 0;
+        if (blockIdx.x == 0 && thread < R) b.workspace.signals->combine_ready_grid_idx[thread] = 0;
         for (unsigned group = (blockIdx.x*threads + thread)/32; group < rows*(H/32);
              group += gridDim.x*threads/32) {
             prepareGroup(x,index,score,b.input_token_buffer.get_base_ptr<uint8_t>(),
@@ -139,7 +140,9 @@ struct VerifyInput {
 // Each large prefill tile borrows the dead FP32 router tensor. Its capacity,
 // token-ring geometry and TMA descriptors must agree on all participants.
 template<int R, int Capacity, int BM> struct Geometry {
-    static constexpr int maxBlocks = (Capacity*R*K+BM-1)/BM + E/R;
+    // All decode tiles use one layout so small and large graphs can alternate.
+    static constexpr int rows = Capacity == CAP && R == 8 ? EP8_CAP : Capacity;
+    static constexpr int maxBlocks = (rows*R*K+BM-1)/BM + E/R;
     static constexpr int ring = Capacity == CAP ? RING :
         BM * dg::sched::get_num_max_live_pool_blocks(maxBlocks, SMS, H, I);
     static constexpr int sfRing = Capacity == CAP ? SFRING :
@@ -147,17 +150,17 @@ template<int R, int Capacity, int BM> struct Geometry {
     static_assert(ring % BM == 0 && ring / BM >= dg::sched::get_num_max_live_pool_blocks(maxBlocks, SMS, H, I));
     static_assert(sfRing >= dg::layout::get_num_sf_ring_tokens(ring, BM));
     static_assert(ring <= dg::layout::MegaMoESignals::kNumMaxRingBlocks * dg::layout::kMinCandidateBlockM);
-    static dg::layout::MegaMoEBuffer buffer(void *p) { return {p,H,I,R,E,Capacity,K,ring,sfRing,true,0}; }
+    static dg::layout::MegaMoEBuffer buffer(void *p) { return {p,H,I,R,E,rows,K,ring,sfRing,true,0}; }
 };
 struct LayerBase { int ranks; };
 template<int R> struct Mega {
-    static_assert(R==4 || R==8);
+    static_assert(R==1 || R==4 || R==8);
     static constexpr int LE=E/R;
-    static dg::layout::MegaMoEBuffer buffer(void *p) { return {p,H,I,R,E,CAP,K,RING,SFRING,true,0}; }
+    static dg::layout::MegaMoEBuffer buffer(void *p) { return Geometry<R,CAP,16>::buffer(p); }
     static size_t bytes() { return buffer(nullptr).get_num_bytes(); }
     template<int BM=16,typename Weight=cutlass::float_e4m3_t,int Capacity=CAP> static auto kernel() {
         using G = Geometry<R,Capacity,BM>;
-        return &dg::sm100_fp8_fp4_mega_moe_impl<Capacity,H,I,E,0,K,BM,BN,BK,
+        return &dg::sm100_fp8_fp4_mega_moe_impl<G::rows,H,I,E,0,K,BM,BN,BK,
             Tile<BM>::STORE,Tile<BM>::STORE_L2,Tile<BM>::SF_M,128,G::ring,G::sfRing,Tile<BM>::STAGES,H,128,128,256,SMS,R,
             cute::numeric_limits<float>::infinity(),true,Weight>;
     }
@@ -166,9 +169,9 @@ template<int R> struct Mega {
     }
     static auto verifyKernel() {
         using Weight = cutlass::detail::float_e2m1_unpacksmem_t;
-        return &dg::sm100_fp8_fp4_mega_moe_impl<CAP,H,I,E,0,K,16,BN,BK,
+        return &dg::sm100_fp8_fp4_mega_moe_impl<Geometry<R,CAP,16>::rows,H,I,E,0,K,16,BN,BK,
             Tile<16>::STORE,Tile<16>::STORE_L2,Tile<16>::SF_M,128,RING,SFRING,Tile<16>::STAGES,H,
-            128,128,256,SMS,R,cute::numeric_limits<float>::infinity(),true,Weight,false,false,false,true,VerifyInput>;
+            128,128,256,SMS,R,cute::numeric_limits<float>::infinity(),true,Weight,false,false,false,true,VerifyInput<R>>;
     }
     struct ActivationMaps {
         Desc a1, d1, a2;
@@ -262,7 +265,7 @@ template<int R> struct Mega {
             check(cudaFuncSetAttribute(selectKernel<128>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<128>::SMEM));
             check(cudaFuncSetAttribute(selectKernel<16>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<16>::SMEM));
             check(cudaFuncSetAttribute(selectKernel<32>(mxfp4),cudaFuncAttributeMaxDynamicSharedMemorySize,Tile<32>::SMEM));
-            if constexpr (R == 8) {
+            if constexpr (R == 1 || R == 8) {
                 if (mxfp4) {
                     const auto status = cudaFuncSetAttribute(verifyKernel(),
                         cudaFuncAttributeMaxDynamicSharedMemorySize, Tile<16>::SMEM);
@@ -341,7 +344,7 @@ template<int R> struct Mega {
     }
     template<int BM=16,int Capacity=CAP,bool SingleVerify=false> static int run(void *p,const void *x,void *y,const int32_t *idx,const float *scores,int rows,const int *live,const void *const *peers=nullptr) {
         try {
-            if (!p || !x || !y || !idx || !scores || rows<0 || rows>Capacity)
+            if (!p || !x || !y || !idx || !scores || rows<0 || rows>Geometry<R,Capacity,BM>::rows)
                 throw std::runtime_error("Invalid Blackwell MegaMoE pointers/row count");
             auto &l=*static_cast<Layer *>(p); int device=-1; check(cudaGetDevice(&device));
             if (device!=l.device) throw std::runtime_error("MegaMoE device mismatch");
@@ -355,9 +358,15 @@ template<int R> struct Mega {
                 b.input_token_buffer.template get_base_ptr<uint8_t>(),b.input_sf_buffer.template get_base_ptr<uint8_t>(),
                 b.input_topk_idx_buffer.template get_base_ptr<int64_t>(),b.input_topk_weights_buffer.template get_base_ptr<float>(),rows,live,
                 b.workspace.signals->combine_ready_grid_idx,R);
-            cudaLaunchAttribute attr{}; attr.id=cudaLaunchAttributeClusterDimension; attr.val.clusterDim={2,1,1};
+            cudaLaunchAttribute attrs[2]{};
+            attrs[0].id=cudaLaunchAttributeClusterDimension; attrs[0].val.clusterDim={2,1,1};
             cudaLaunchConfig_t config{}; config.gridDim=dim3(SMS); config.blockDim=dim3(512);
-            config.dynamicSmemBytes=Tile<BM>::SMEM; config.stream=stream; config.attrs=&attr; config.numAttrs=1;
+            config.dynamicSmemBytes=Tile<BM>::SMEM; config.stream=stream; config.attrs=attrs; config.numAttrs=1;
+            if constexpr (SingleVerify && R == 8) {
+                attrs[1].id=cudaLaunchAttributeProgrammaticStreamSerialization;
+                attrs[1].val.programmaticStreamSerializationAllowed=1;
+                config.numAttrs=2;
+            }
             const auto &maps = [&]() -> const ActivationMaps & {
                 if constexpr (prefill) return l.prefillMaps;
                 if constexpr (BM == 128) return l.wideMaps;
@@ -373,7 +382,7 @@ template<int R> struct Mega {
                     maps.a1,s1,l.w1,l.ws1,maps.d1,maps.a2,s2,l.w2,l.ws2,(const uint8_t *)l.domains,input);
             };
             if constexpr (SingleVerify) {
-                check(launch(verifyKernel(),VerifyInput{static_cast<const __nv_bfloat16 *>(x),idx,scores,live}));
+                check(launch(verifyKernel(),VerifyInput<R>{static_cast<const __nv_bfloat16 *>(x),idx,scores,live}));
             } else {
                 check(launch(selectKernel<BM,Capacity>(l.mxfp4),dg::PackedTokenInput{}));
             }
@@ -406,19 +415,22 @@ extern "C" int fastllm_sm100_mega_moe_supported() {
 extern "C" const char *fastllm_sm100_mega_moe_error() { return error.c_str(); }
 extern "C" int fastllm_sm100_mega_moe_max_rows() { return CAP; }
 extern "C" int fastllm_sm100_mega_moe_decode_capacity(int inputRows,int ranks) {
-    if (ranks!=4 && ranks!=8) return 0;
+    if (ranks!=1 && ranks!=4 && ranks!=8) return 0;
     // The common batch/Graph shape selects both the bound and the tile. Never
     // select from local rows: idle and uneven ranks must launch the same tile.
     if (inputRows <= ranks * SMALL_CAP) return SMALL_CAP;
     // A full EP8 128-row shard amortizes BM128; EP4 still favors BM32 there.
+    if (ranks == 8 && inputRows > ranks * CAP) return EP8_CAP;
     return inputRows < ranks * MID_CAP || (ranks == 4 && inputRows == ranks * MID_CAP) ? MID_CAP : CAP;
 }
 extern "C" size_t fastllm_sm100_mega_moe_workspace_bytes(int ranks) {
-    return ranks==4 ? Mega<4>::bytes() : ranks==8 ? Mega<8>::bytes() : 0;
+    return ranks==1 ? Mega<1>::bytes() : ranks==4 ? Mega<4>::bytes() : ranks==8 ? Mega<8>::bytes() : 0;
 }
 extern "C" int fastllm_sm100_mega_moe_init_workspace(void *w,size_t b,const int *d,int r,int n) {
-    if (n==4) return Mega<4>::init(w,b,d,r); if (n==8) return Mega<8>::init(w,b,d,r);
-    error="MegaMoE requires 4 or 8 ranks"; return 0;
+    if (n==1) return Mega<1>::init(w,b,d,r);
+    if (n==4) return Mega<4>::init(w,b,d,r);
+    if (n==8) return Mega<8>::init(w,b,d,r);
+    error="MegaMoE workspace requires 1, 4 or 8 ranks"; return 0;
 }
 extern "C" void *fastllm_sm100_mega_moe_create(const void *const *g,const void *const *d,
     const void *const *gs,const void *const *ds,void *w,size_t b,const void *const *p,int r,int s,int n) {
@@ -428,23 +440,29 @@ extern "C" void *fastllm_sm100_mega_moe_create(const void *const *g,const void *
 }
 extern "C" void *fastllm_sm100_mega_moe_create_mxfp4(const void *const *g,const void *const *d,
     void *w,size_t b,const void *const *p,int r,int s,int n) {
+    if (n==1) return Mega<1>::create(g,d,nullptr,nullptr,w,b,p,r,s,true);
     if (n==4) return Mega<4>::create(g,d,nullptr,nullptr,w,b,p,r,s,true);
     if (n==8) return Mega<8>::create(g,d,nullptr,nullptr,w,b,p,r,s,true);
-    error="MegaMoE requires 4 or 8 ranks"; return nullptr;
+    error="MXFP4 MegaMoE requires 1, 4 or 8 ranks"; return nullptr;
 }
 extern "C" int fastllm_sm100_mega_moe_run_masked(void *p,const void *x,void *y,const int32_t *i,const float *s,int rows,const int *live) {
     if (!p) { error="Missing MegaMoE handle"; return 0; }
+    if (static_cast<LayerBase *>(p)->ranks==1) return Mega<1>::run(p,x,y,i,s,rows,live);
     return static_cast<LayerBase *>(p)->ranks==4 ? Mega<4>::run(p,x,y,i,s,rows,live) : Mega<8>::run(p,x,y,i,s,rows,live);
 }
 extern "C" int fastllm_sm100_mega_moe_run(void *p,const void *x,void *y,const int32_t *i,const float *s,int rows) {
     return fastllm_sm100_mega_moe_run_masked(p,x,y,i,s,rows,nullptr);
 }
 extern "C" int fastllm_sm100_mega_moe_run_batched(void *p,const void *x,void *y,const int32_t *i,const float *s,int rows,int capacity,const int *live) {
+    if (p && capacity == EP8_CAP && rows >= 0 && rows <= capacity && static_cast<LayerBase *>(p)->ranks == 8)
+        return Mega<8>::run<128>(p,x,y,i,s,rows,live);
     if ((capacity!=SMALL_CAP && capacity!=MID_CAP && capacity!=CAP) || rows<0 || rows>capacity || !p) {
         error="Invalid Blackwell MegaMoE capacity/row count/handle"; return 0;
     }
     if (capacity==SMALL_CAP)
         return fastllm_sm100_mega_moe_run_masked(p,x,y,i,s,rows,live);
+    if (static_cast<LayerBase *>(p)->ranks==1)
+        return capacity==CAP ? Mega<1>::run<128>(p,x,y,i,s,rows,live) : Mega<1>::run<32>(p,x,y,i,s,rows,live);
     if (capacity==CAP)
         return static_cast<LayerBase *>(p)->ranks==4 ? Mega<4>::run<128>(p,x,y,i,s,rows,live)
                                                    : Mega<8>::run<128>(p,x,y,i,s,rows,live);
@@ -453,8 +471,11 @@ extern "C" int fastllm_sm100_mega_moe_run_batched(void *p,const void *x,void *y,
 }
 extern "C" int fastllm_sm100_mega_moe_run_verify(void *p,const void *x,void *y,
         const int32_t *i,const float *s,int rows,int capacity,const int *live) {
+    if (p && static_cast<LayerBase *>(p)->ranks == 1 && static_cast<Mega<1>::Layer *>(p)->verifyReady &&
+        rows > 0 && rows <= int(VerifyInput<1>::maxRows) && capacity == SMALL_CAP)
+        return Mega<1>::run<16,CAP,true>(p,x,y,i,s,rows,live);
     if (p && static_cast<LayerBase *>(p)->ranks == 8 && static_cast<Mega<8>::Layer *>(p)->verifyReady &&
-        rows == VerifyInput::maxRows && capacity == SMALL_CAP && live)
+        rows >= 0 && rows <= int(VerifyInput<8>::maxRows) && capacity == SMALL_CAP)
         return Mega<8>::run<16,CAP,true>(p,x,y,i,s,rows,live);
     return fastllm_sm100_mega_moe_run_batched(p,x,y,i,s,rows,capacity,live);
 }
@@ -463,18 +484,21 @@ extern "C" size_t fastllm_sm100_mega_moe_prefill_workspace_bytes(int total,int r
 }
 extern "C" int fastllm_sm100_mega_moe_prepare_prefill(void *p,void *w,size_t bytes,int total) {
     if (!p) return 0;
+    if (static_cast<LayerBase *>(p)->ranks==1) return 0;
     return static_cast<LayerBase *>(p)->ranks==8 ? Mega<8>::preparePrefill(p,w,bytes,total) :
             Mega<4>::preparePrefill(p,w,bytes,total);
 }
 extern "C" int fastllm_sm100_mega_moe_run_prefill(void *p,const void *const *peers,const void *x,
         void *y,const int32_t *idx,const float *scores,int rows) {
     if (!p || !peers) { error="Invalid Blackwell MegaMoE prefill handle or peers"; return 0; }
+    if (static_cast<LayerBase *>(p)->ranks==1) return 0;
     return static_cast<LayerBase *>(p)->ranks==8 ? Mega<8>::runPrefill(p,peers,x,y,idx,scores,rows) :
             Mega<4>::runPrefill(p,peers,x,y,idx,scores,rows);
 }
 extern "C" void fastllm_sm100_mega_moe_destroy(void *p) {
     if (!p) return;
-    if (static_cast<LayerBase *>(p)->ranks==4) delete static_cast<Mega<4>::Layer *>(p);
+    if (static_cast<LayerBase *>(p)->ranks==1) delete static_cast<Mega<1>::Layer *>(p);
+    else if (static_cast<LayerBase *>(p)->ranks==4) delete static_cast<Mega<4>::Layer *>(p);
     else delete static_cast<Mega<8>::Layer *>(p);
 }
 

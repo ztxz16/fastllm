@@ -967,9 +967,6 @@ Data NaiveN05FlashModel::RunTarget(
             minLocalRows = std::min(minLocalRows, (int)rows.size());
         }
     }
-    const bool singleSlotVerification = localMoeRows && graphVerify && minLocalRows == maxLocalRows &&
-        std::all_of(attentionParallel->groups.begin(), attentionParallel->groups.end(),
-            [](const auto &group) { return group.lengths.size() == 1; });
     // A TP worker keeps its device; layer-mapped execution can switch devices between calls.
     const auto rankCaps = tensorParallel ? FastllmCudaNaiveAttentionCapabilities() : NaiveAttentionCapabilities{};
     auto attentionCaps = [&] { return tensorParallel ? rankCaps : FastllmCudaNaiveAttentionCapabilities(); };
@@ -2863,7 +2860,7 @@ Data NaiveN05FlashModel::RunTarget(
                     decodeWorkspace ? (const int *)localDP->liveKeys.cudaData : nullptr,
                     decodeWorkspace ? nullptr : &routerInput,
                     !decodeWorkspace && !verifying ? minLocalRows : 0,
-                    singleSlotVerification);
+                    graphVerify);
             } else if (tensorParallel && tpEp8MegaState) {
                 moeNormReady = FastllmCudaRunMimoEp8Mega(*tpEp8MegaState, tpRank, layer, normed,
                     expertIndex, expertScore, moeOutput, decodeWorkspace || shardMoe,
