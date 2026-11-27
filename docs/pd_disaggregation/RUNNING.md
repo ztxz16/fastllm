@@ -101,7 +101,8 @@ nohup python3 -m fastllm_pytools.cli router "$MODEL_PATH" \
 echo "$!" >"$PD_RUN_DIR/router.pid"
 ```
 
-推送验证使用独立 Router 端口和 `--kv-mode push`。P/D 传输模式随交接身份指定。
+顺序验证推送时，待拉取测试结束，将原 Router 改为 `--kv-mode push` 并重启，端口可以复用；
+P/D 服务无需重启，传输模式随交接身份指定。需要同时保留两种入口时，也可以另起独立端口的 Router。
 多轮回传要求 Router、P、D 都设置 `--pd-return-kv`；D 可用 `--pd-retention` 调整 480 秒保留期。
 `--pd-long-threshold` 默认 512，`--pd-growth-budget` 默认 512，两者互相独立。
 两端 `--cuda-graph`、前缀缓存状态、模型精度及采样设置应与对照组一致。
