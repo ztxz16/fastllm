@@ -26,7 +26,7 @@ def main():
             (directory / "exit_code").write_text(str(code) + "\n")
         return code
     parser = argparse.ArgumentParser()
-    parser.add_argument("phase", choices=("protocol", "router", "generation", "lifecycle", "ipc", "performance"))
+    parser.add_argument("phase", choices=("protocol", "pairing", "router", "generation", "lifecycle", "ipc", "performance"))
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_pd_" + args.phase + "_" + uuid.uuid4().hex[:8]

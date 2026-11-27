@@ -45,6 +45,9 @@ def worker(role, failure):
             if self.path == "/internal/cancel":
                 cancels.append(body)
                 return self.reply(dict(cancelled=True, drained=True))
+            if self.path == "/internal/pair":
+                # 此脚本仅注入 HTTP 重试边界；副本配对在 check_pairing 单独验证。
+                return self.reply(dict(pair=dict(source={}, target={})))
             if self.path not in ("/internal/generate", "/internal/full"):
                 return self.reply(dict(manifest={}))
             identity = body["identity"]
