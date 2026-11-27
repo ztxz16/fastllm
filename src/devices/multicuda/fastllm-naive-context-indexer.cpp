@@ -32,7 +32,7 @@ int FastllmCudaOwnerDraftFeatureLimit(const std::vector<int> &devices) {
 }
 
 bool FastllmCudaVerifyReduceNormSupported(int rows, const std::vector<int> &devices) {
-    return rows <= 8 || (rows > 16 && rows <= 128) || FastllmCudaNaiveHopperGroup(devices);
+    return rows > 0 && (rows <= 128 || FastllmCudaNaiveHopperGroup(devices));
 }
 
 NaiveVerifyAttentionPlan FastllmCudaPlanVerifyAttention(int device, int rows, int tpRanks,

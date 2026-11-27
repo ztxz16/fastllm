@@ -152,7 +152,7 @@ template<bool Pipeline>
 __global__ void SelectPreparedRoutes(Rank a, const float *router, const float *bias,
         int *ids, float *prob, int needNorm, float routeScale) {
     if constexpr (Pipeline) cudaTriggerProgrammaticLaunchCompletion();
-    PrepareRoutes<true,true,false>(a, ids, Pipeline ? 8 : a.rows, router, bias, ids, prob, needNorm, routeScale);
+    PrepareRoutes<true,true,false>(a, ids, a.rows, router, bias, ids, prob, needNorm, routeScale);
 }
 
 template<bool Select = false>
@@ -752,7 +752,7 @@ extern "C" int fastshared_tp_prepared_input(void *state,int rank,int rows,Fastll
   *input={a.xq,a.xs,a.gcount,a.epoch,rows};
   if(s->gate128Supported && rows>=4)input->block128=reinterpret_cast<uint8_t*>(a.gpartial);
   input->preferFusedSelection=a.xmap!=nullptr;
-  input->overlapVerifyGate=rows==8 && s->ownsVerifyPages[rank];
+  input->overlapVerifyGate=rows<=8 && s->ownsVerifyPages[rank];
   input->jobs=a.jobs;input->count=a.count;input->unique=a.nuniq;
   input->experts=a.uniq;input->members=a.members;input->rowCounts=a.rowcounts;return 1;
 }
@@ -762,7 +762,7 @@ static cudaError_t launch_prepared_down(const fastllm_shared_flex_tp::Rank &a,
     bool pipeline){
   using namespace fastllm_shared_flex_tp;
   const int rows=a.rows;
-  if (state.packedOwnerDownSupported && a.mxfp4 && rows == 8) {
+  if (state.packedOwnerDownSupported && a.mxfp4 && rows >= 4 && rows <= 8) {
     if (pipeline && state.preparedDownPdl) {
       auto err = fastllm::cuda_launch::LaunchProgrammatic<owner_down<true, true>>(
           dim3(444), dim3(160), OwnerDownBytes, stream, a, ids, prob);
@@ -788,7 +788,7 @@ extern "C" int fastshared_tp_residual_router_supported(void *state, int rank, in
     using namespace fastllm_shared_flex_tp;
     auto *s = static_cast<State *>(state);
     return s && rank >= 0 && rank < R && layer >= 0 && size_t(layer) < s->layers.size() &&
-        rows >= 4 && rows <= MAX_M && s->preparedSupported &&
+        rows >= 2 && rows <= MAX_M && s->preparedSupported &&
         s->routerSupported && s->layers[layer][rank].mxfp4 && s->layers[layer][rank].xmap;
 }
 
@@ -827,7 +827,7 @@ extern "C" int fastshared_tp_run_prepared(void *state,int rank,int layer,int row
     launch_wide(args,(__nv_bfloat16*)output,stream);
     return cudaGetLastError();
   }
-  const bool direct = rows==8 && bias && needNorm && routeScale==1.f &&
+  const bool direct = bias && needNorm && routeScale==1.f &&
       (reinterpret_cast<uintptr_t>(bias)&15)==0 && (reinterpret_cast<uintptr_t>(router)&15)==0;
   if (a.verifyPages) {
     if (!direct)
@@ -839,7 +839,7 @@ extern "C" int fastshared_tp_run_prepared(void *state,int rank,int layer,int row
     for (const auto &peer:s->verifyMaps[layer]) eligible=eligible && peer.valid;
     if (eligible) return run_verify8(*s,a,layer,router,bias,ids,prob,output,stream);
   }
-  const bool pipeline = s->routePipelineSupported && a.mxfp4 && a.xmap && rows == 8;
+  const bool pipeline = s->routePipelineSupported && a.mxfp4 && a.xmap && rows >= 4;
   if (pipeline) {
     SelectPreparedRoutes<true><<<1,256,0,stream>>>(a,router,bias,ids,prob,needNorm,routeScale);
     cudaError_t err = s->clusterGateSupported
@@ -853,7 +853,7 @@ extern "C" int fastshared_tp_run_prepared(void *state,int rank,int layer,int row
     grouped_tma_gate<<<444,128,GroupedGateBytes,stream>>>(a,ids,prob);
   } else if(input.block128 && a.gate128map) {
     Block128GateArgs args{a,router,bias,ids,prob,needNorm,routeScale,a.gate128map,a.gs,input.block128};
-    if (!a.mxfp4 && rows == 8 && s->block128DownPdl) {
+    if (!a.mxfp4 && s->block128DownPdl) {
       block128_gate_primary<<<a.gate128ctas, 384, Block128GateBytes, stream>>>(args);
       const auto err = fastllm::cuda_launch::LaunchProgrammatic<block128_owner_down>(
           dim3(444), dim3(160), OwnerDownBytes, stream, a, ids, prob);

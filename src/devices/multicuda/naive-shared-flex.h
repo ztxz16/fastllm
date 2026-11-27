@@ -11,7 +11,7 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
     using Weights = std::vector<std::vector<std::vector<Data *>>>;
     using Run = int (*)(void *, int, int, int, const void *, const void *, const void *, void *);
     void *state = nullptr;
-    bool ep = false, routeSupported = false;
+    bool ep = false, routeSupported = false, epMxfp4 = true;
     Run run = nullptr;
     void (*destroy)(void *) = nullptr;
 
@@ -59,14 +59,18 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
             }
         return true;
     }
-    // EP uses MegaMoE's same packed allocation for larger row counts. TP's
-    // ordered eight-row adapter covers all positive row counts itself.
-    bool Supports(int rows) const { return rows > 0 && (!ep || rows <= 8); }
+    bool Supports(int rows) const {
+#ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
+        return ep ? fastshared_ep_supports_rows(state, epMxfp4, rows) : rows > 0;
+#else
+        return false;
+#endif
+    }
 
     bool HasVerifyReduce(int rank, int layer, int rows) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
-        return rows == 8 && (ep ? fastshared_ep_uses_verify_reduce(state, rank, layer, rows)
-                               : fastshared_tp_uses_verify_reduce(state, rank, layer));
+        return ep ? fastshared_ep_uses_verify_reduce(state, rank, layer, rows)
+                  : rows > 0 && rows <= 8 && fastshared_tp_uses_verify_reduce(state, rank, layer);
 #else
         return false;
 #endif
@@ -95,6 +99,7 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
                         AssertInFastLLM(FastllmCudaMimoEp8MegaWeights(*mega, rank, layer, p, &mxfp4) &&
                             fastshared_ep_bind_format(state, rank, layer, p[0], p[1], p[2], p[3], mxfp4) == 0,
                             "Shared Flex cannot borrow Mega packed weights.");
+                        epMxfp4 &= mxfp4;
                     } else {
                         const auto &ws = weights[rank][layer];
                         const bool mxfp4 = FastllmCudaMimoIsMxfp4Expert(*ws[2]);
@@ -150,13 +155,12 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
             Data &ids, Data &scores, const Data &bias, const Data &hidden,
             bool needNorm, float routeScale) const override {
 #ifdef FASTLLM_ENABLE_NAIVE_FLEX_SM103
-        // Keep small-row PDL and batches beyond the prepared tile on their existing paths.
         if (ep) {
             if (!fastshared_ep_prepared_input(state,rank,layer,rows,&input)) return false;
-        } else if (rows < 4 || rows > 16 || !fastshared_tp_prepared_input(state,rank,rows,&input)) return false;
+        } else if (!fastshared_tp_prepared_input(state,rank,rows,&input)) return false;
         // A grouped consumer can select routes locally without a global
         // router barrier. Keep cooperative routing for the existing consumer.
-        if (rows != 8 || input.preferFusedSelection) return true;
+        if (!ep && (rows > 8 || input.preferFusedSelection)) return true;
         if (bias.dataType != FLOAT32 || bias.dataDevice != DataDevice::CUDA ||
             !bias.cudaData || bias.Count(0) != 256 || bias.dataDeviceIds != hidden.dataDeviceIds)
             return !ep; // EP requires the router to produce the schedule.
@@ -295,7 +299,7 @@ struct NaiveSharedFlexMoe final : FastllmExpertHandoff {
             p->ToDevice(x.dataDevice, x.dataDeviceIds, false); p->Allocate(false);
         }
         if (ep && prepared && prepared->epRank==rank && prepared->routed) {
-            AssertInFastLLM(fastshared_ep_run_prepared(state,rank,layer,static_cast<const int*>(ids.cudaData),
+            AssertInFastLLM(fastshared_ep_run_prepared_rows(state,rank,layer,rows,static_cast<const int*>(ids.cudaData),
                 static_cast<const float*>(scores.cudaData),out.cudaData)==0,"Shared Flex EP prepared launch failed.");
             return;
         }

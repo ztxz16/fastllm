@@ -5116,7 +5116,7 @@ static bool ReduceExpertRows(void *partials, const int32_t *ids, void *output,
     CustomArPointers peers{};
     const size_t outputBytes = size_t(packets) * sizeof(CustomArNormPacketType);
     const size_t partialBytes = outputBytes * topk, idBytes = size_t(rows) * topk * sizeof(*ids);
-    const bool normEligible = !norm || (hidden == 4096 && rows == 8 && topk == 8 && state.devices.size() == 8 &&
+    const bool normEligible = !norm || (hidden == 4096 && topk == 8 && state.devices.size() == 8 &&
         residual && weight && normed && std::isfinite(eps) && eps > 0 &&
         ((uintptr_t(residual) | uintptr_t(normed)) & 15) == 0 &&
         CustomArBuffersDisjoint(output, outputBytes, residual, outputBytes) &&

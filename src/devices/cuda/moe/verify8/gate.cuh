@@ -177,7 +177,7 @@ template <bool Pages, bool Preselected> struct SelectGateUpBody {
 
     // Helper 0 stages the sigmoid scores, the bias and the prepared FP8 activation packet.
     __device__ static void stage_inputs(const Args &args, unsigned char *shared, const unsigned char *prepared) {
-        constexpr std::uint32_t kScoresBytes = std::uint32_t(kRows8Rows * kRows8Experts * 4);
+        const std::uint32_t kScoresBytes = std::uint32_t(args.rows * kRows8Experts * sizeof(float));
         constexpr std::uint32_t kBiasBytes = std::uint32_t(kRows8Experts * 4);
         const int tid = int(threadIdx.x);
         if (tid >= kRows8HelperBaseThread) {
@@ -198,7 +198,7 @@ template <bool Pages, bool Preselected> struct SelectGateUpBody {
                 }
                 auto *ready = activation_barriers(shared);
                 // The existing router writes dense K32 E4M3 rows and one UE8M0 byte per group.
-                const int rows = Preselected ? args.rows : 8;
+                const int rows = args.rows;
                 Trans64::arrive_and_expect_tx(ready, rows * (4096 + 128));
 #pragma unroll
                 for (int row = 0; row < rows; ++row)
@@ -464,13 +464,11 @@ template <bool Pages, bool Preselected> struct SelectGateUpBody {
         // Helpers issue the input copies while consumers expand their register budget.
         if (tid < kRows8ConsumerThreads)
             cutlass::arch::warpgroup_reg_alloc<96>();
-        if constexpr (Preselected) {
-            if (args.rows < 8 && tid < kRows8ConsumerThreads) {
-                for (int row = args.rows; row < 8; ++row) {
-                    reinterpret_cast<uint4 *>(activation(shared, row))[tid] = {};
-                    if (tid < 32)
-                        reinterpret_cast<unsigned *>(shared + naivert::prepared_mlp::kScaleScratch)[row * 32 + tid] = 0;
-                }
+        if (args.rows < 8 && tid < kRows8ConsumerThreads) {
+            for (int row = args.rows; row < 8; ++row) {
+                reinterpret_cast<uint4 *>(activation(shared, row))[tid] = {};
+                if (tid < 32)
+                    reinterpret_cast<unsigned *>(shared + naivert::prepared_mlp::kScaleScratch)[row * 32 + tid] = 0;
             }
         }
         stage_inputs(args, shared, prepared);
@@ -497,7 +495,7 @@ template <bool Pages, bool Preselected> struct SelectGateUpBody {
         static_assert(lastScratch + sizeof(Scratch) <= 2 * 44032 + 8192);
         const int row = tid >> 5;
         auto &ws = row < 7 ? sort[row] : *reinterpret_cast<Scratch *>(shared + lastScratch);
-        const float *scores = sigmoid(shared, row);
+        const float *scores = sigmoid(shared, min(row, args.rows - 1));
         int *ids = selected(shared) + 8 * row;
         float *out = prob + 8 * row;
         if constexpr (Preselected) {
@@ -532,7 +530,7 @@ template <bool Pages, bool Preselected> struct SelectGateUpBody {
                 const int *chosen = selected(shared) + token * kRows8Selected;
                 routes->selected[tid] = chosen[slot];
                 const float p = bias_scratch(shared)[tid];
-                if (!Preselected && int(blockIdx.x) == 0) {
+                if (!Preselected && token < args.rows && int(blockIdx.x) == 0) {
                     args.ids[token * kRows8Selected + slot] = chosen[slot];
                     args.prob[token * kRows8Selected + slot] = p;
                 }

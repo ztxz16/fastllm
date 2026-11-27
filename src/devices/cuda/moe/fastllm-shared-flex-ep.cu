@@ -34,7 +34,7 @@ struct Rank {
 struct VerifyOperand {
  static_assert(MAX_M == 8 && K == 8);
  __host__ __device__ static bool supports(bool mxfp4,int rows) {
-  return mxfp4 && rows == MAX_M;
+  return mxfp4 && rows >= 2 && rows <= MAX_M;
  }
  static constexpr int Width = 128, Values = MAX_M * Width, Scales = 512;
  static constexpr int GateSplit = 2, DownSplit = 2, Stages = 2;
@@ -64,8 +64,28 @@ struct VerifyOperand {
   }
  }
 };
+// Round up the active memberships of each local expert to complete N8 jobs.
+struct WideOperand {
+ static constexpr int Rows = 32, Groups = 2 * (E/R);
+ static_assert((Rows*K + (E/R)*(MAX_M-1))/MAX_M <= Groups);
+ __host__ __device__ static int tiles(int rows) { return (rows + MAX_M - 1) / MAX_M; }
+ static_assert(VerifyOperand::ReadyOffset + Groups <= VerifyOperand::RouterArrival);
+ static_assert((Groups + Groups * MAX_M) * sizeof(int) <= MAX_M * K * I);
+ static_assert(Groups * (VerifyOperand::GateBytes + VerifyOperand::DownBytes)
+               <= MAX_M*K*G_SPLIT*(2*I)*sizeof(float));
+ static_assert(Rows*K*VerifyOperand::DownSplit*H <= MAX_M*K*D_SPLIT*H);
+ __device__ static uint8_t *gate(Rank a, int job) {
+  return reinterpret_cast<uint8_t *>(a.gpartial) + job * VerifyOperand::GateBytes;
+ }
+ __device__ static uint8_t *down(Rank a, int job) {
+  return gate(a, Groups) + job * VerifyOperand::DownBytes;
+ }
+};
 struct State {
  bool pairedGateSupported = true, routerSupported = true, preparedRouterSupported = true;
+ bool supportsWide(bool mxfp4, int rows) const {
+  return pairedGateSupported && mxfp4 && rows > MAX_M && rows <= WideOperand::Rows;
+ }
  Rank r[R];
  std::vector<std::array<Rank,R>> layers;
 };
@@ -105,12 +125,14 @@ struct EpVerifyRoutes {
   }
   __syncthreads();if(!last)return;
   int *ids=selected+row*K;
-  selectRoutes(router+row*E,p.bias,ids,p.scores+row*K,p.needNorm,p.routeScale,scratch[row]);
-  __syncwarp();
-  if(lane<K)p.indices[row*K+lane]=ids[lane];
   int route=-1;
-  #pragma unroll
-  for(int slot=0;slot<K;++slot)if(ids[slot]==p.epRank*32+lane)route=row*K+slot;
+  if (row < p.rows) {
+   selectRoutes(router+row*E,p.bias,ids,p.scores+row*K,p.needNorm,p.routeScale,scratch[row]);
+   __syncwarp();
+   if(lane<K)p.indices[row*K+lane]=ids[lane];
+   #pragma unroll
+   for(int slot=0;slot<K;++slot)if(ids[slot]==p.epRank*32+lane)route=row*K+slot;
+  }
   unsigned present=__ballot_sync(0xffffffffu,route>=0);
   if(lane==0)owners[row]=present;
   for(int i=t;i<VerifyOperand::ReadyEnd;i+=256)p.counters[i]=0;
@@ -133,6 +155,58 @@ struct RouteSelection {
  int needNorm;
  float scale;
 };
+// Each warp selects every eighth row. One lane per local expert builds N8 jobs
+// across the whole verification batch, preserving token and slot order.
+template<bool Select>
+__global__ void wideRoutes(Rank a, const int *ids, RouteSelection selection, int rows) {
+ __shared__ fastllm::cuda::RouterTopKScratch<K> scratch[MAX_M];
+ __shared__ int chosen[MAX_M*K], member[E/R][WideOperand::Rows];
+ int t=threadIdx.x, warp=t/32, lane=t%32;
+ if constexpr (Select) cudaGridDependencySynchronize();
+ for (int row=warp;row<rows;row+=MAX_M) {
+  const int *routes=ids+row*K;
+  if constexpr (Select) {
+   selectRoutes(selection.router+row*E,selection.bias,chosen+warp*K,selection.scores+row*K,
+                selection.needNorm,selection.scale,scratch[warp]);
+   __syncwarp();
+   if(lane<K) selection.ids[row*K+lane]=chosen[warp*K+lane];
+   routes=chosen+warp*K;
+  }
+  int route=-1;
+  for(int slot=0;slot<K;++slot) if(routes[slot]==a.rank*(E/R)+lane) route=row*K+slot;
+  member[lane][row]=route;
+  __syncwarp();
+ }
+ if(t<WideOperand::Groups) a.gcount[VerifyOperand::ReadyOffset+t]=0;
+ if(t==0) *a.epoch+=WideOperand::tiles(rows);
+ __syncthreads();
+ if(warp!=0) return;
+ unsigned mask=0;
+ for(int i=0;i<rows;++i) if(member[lane][i]>=0) mask|=1u<<i;
+ int jobs=(__popc(mask)+MAX_M-1)/MAX_M, end=jobs;
+ for(int d=1;d<32;d*=2){int v=__shfl_up_sync(0xffffffff,end,d);if(lane>=d)end+=v;}
+ if(lane==31) *a.nuniq=end;
+ for(int job=end-jobs;job<end;++job) {
+  a.uniq[job]=lane;
+  for(int col=0;col<MAX_M;++col) {
+   a.members[job*MAX_M+col]=mask?member[lane][__ffs(mask)-1]:-1;
+   mask&=mask-1;
+  }
+ }
+}
+__global__ void packWideGate(Rank a,const __nv_bfloat16 *x) {
+ const int job=blockIdx.x;
+ if(job>=*a.nuniq)return;
+ const int row=threadIdx.x/32, route=a.members[job*MAX_M+row];
+ if(route<0)return;
+ const int lane=threadIdx.x%32;
+ for(int k=blockIdx.y*VerifyOperand::Width+lane;k<(blockIdx.y+1)*VerifyOperand::Width;k+=32) {
+  float v=__bfloat162float(x[(route/K)*H+k]), m=fabsf(v);
+  for(int d=16;d;d/=2)m=fmaxf(m,__shfl_xor_sync(0xffffffffu,m,d));
+  const unsigned e=exponent(m);
+  VerifyOperand::write<H>(WideOperand::gate(a,job),row,k,__nv_fp8_e4m3(v*sf(254-e)).__x,e);
+ }
+}
 template<bool Select = false>
 __global__ void prepare(Rank a,const __nv_bfloat16*x,const int*ids,int rows, RouteSelection selection = {}){
  // Only CTA zero builds the EP schedule. Its warps select independent rows
@@ -173,7 +247,8 @@ __global__ void prepare(Rank a,const __nv_bfloat16*x,const int*ids,int rows, Rou
   if(j==0)*a.count=totals[0]+totals[1];
   if(mine)a.jobs[prefix-1+(j>=32?totals[0]:0)]=j;
  }
- if(t<rows*K*32)a.gcount[t]=0;
+ const int counters = VerifyOperand::supports(a.mxfp4,rows) ? VerifyOperand::ReadyEnd : rows*K*32;
+ if(t<counters)a.gcount[t]=0;
  if(blockIdx.x==0){
   __shared__ unsigned long long masks[32];int j=threadIdx.x;
   if(j<32)masks[j]=0;__syncthreads();
@@ -317,15 +392,37 @@ static int runEp(void*state,int rank,int layer,int rows,const void*x,const void*
  if(layer<0||layer>=int(s->layers.size())||(!prepared&&!x)||!ids||!prob||!y)return 1;
  const auto &a=s->layers[layer][rank];
  if(!a.gate||!a.down)return 1;
+ if(selection.router && rows>MAX_M && !s->supportsWide(a.mxfp4,rows))return 1;
  if(prepared && !(s->routerSupported && s->preparedRouterSupported && VerifyOperand::supports(a.mxfp4,rows)))return 1;
  auto stream=cudaStreamPerThread;
+ if(s->supportsWide(a.mxfp4,rows) && !prepared) {
+  // Non-packed kernels use mid/ms for activations; the wide kernel stores
+  // both operands in the otherwise unused Gate partial buffer.
+  auto wide=a;
+  wide.uniq=reinterpret_cast<int*>(a.mid);
+  wide.members=wide.uniq+WideOperand::Groups;
+  if(selection.router) {
+   auto rc=fastllm::cuda_launch::LaunchProgrammatic<wideRoutes<true>>(dim3(1),dim3(256),0,stream,wide,
+       static_cast<const int*>(ids),selection,rows);
+   if(rc!=cudaSuccess)return rc;
+  } else wideRoutes<false><<<1,256,0,stream>>>(wide,static_cast<const int*>(ids),selection,rows);
+  packWideGate<<<dim3(WideOperand::Groups,H/VerifyOperand::Width),256,0,stream>>>(wide,static_cast<const __nv_bfloat16*>(x));
+  constexpr int blocks=8*EP_SMS, smem=VerifyOperand::Stages*18432;
+  wideGate<<<blocks,128,smem,stream>>>(wide,static_cast<const float*>(prob));
+  auto rc=fastllm::cuda_launch::LaunchProgrammatic<wideDown>(dim3(blocks),dim3(128),smem,stream,wide,static_cast<const float*>(prob));
+  if(rc!=cudaSuccess)return rc;
+  return fastllm::cuda_launch::LaunchProgrammatic<wideFinish>(dim3(16,MAX_M),dim3(128),0,stream,wide,
+       static_cast<__nv_bfloat16*>(y),static_cast<const int*>(ids),rows);
+ }
  constexpr int gb=STAGES,db=STAGES;
  for(size_t off=0;off<(size_t)rows;off+=8){int n=rows-off<8?rows-off:8;
   auto xx=x?(const __nv_bfloat16*)x+off*H:nullptr;auto ii=(const int*)ids+off*K;auto pp=(const float*)prob+off*K;auto yy=(__nv_bfloat16*)y+off*H;
   if (n > 1 && !prepared) {
    if (selection.router) {
+    RouteSelection tile{selection.router + off*E, selection.bias, selection.ids + off*K,
+                        selection.scores + off*K, selection.needNorm, selection.scale};
     auto rc = fastllm::cuda_launch::LaunchProgrammatic<prepare<true>>(
-        dim3(n*16), dim3(256), 0, stream, a, xx, ii, n, selection);
+        dim3(n*16), dim3(256), 0, stream, a, xx, ii, n, tile);
     if (rc != cudaSuccess) return rc;
    } else {
     prepare<false><<<n*16,256,0,stream>>>(a,xx,ii,n);
@@ -357,12 +454,17 @@ static int runEp(void*state,int rank,int layer,int rows,const void*x,const void*
   finish<<<dim3(16,n),128,0,stream>>>(a,yy,ii,n);
  }return cudaGetLastError();
 }
+extern "C" int fastshared_ep_supports_rows(void *state, bool mxfp4, int rows) {
+    using namespace fastllm_shared_flex_ep;
+    const auto *s = static_cast<const State *>(state);
+    return s && rows > 0 && (rows <= MAX_M || s->supportsWide(mxfp4, rows));
+}
 extern "C" int fastshared_ep_uses_verify_reduce(void *state, int rank, int layer, int rows) {
     using namespace fastllm_shared_flex_ep;
     const auto *s = static_cast<const State *>(state);
     if (!s || rank < 0 || rank >= R || layer < 0 || size_t(layer) >= s->layers.size()) return 0;
     const auto &weights = s->layers[layer][rank];
-    return weights.gate && VerifyOperand::supports(weights.mxfp4, rows);
+    return weights.gate && weights.mxfp4 && (VerifyOperand::supports(weights.mxfp4,rows) || s->supportsWide(weights.mxfp4,rows));
 }
 extern "C" int fastshared_ep_prepared_input(void *state,int rank,int layer,int rows,FastllmMoePreparedInput *p) {
  using namespace fastllm_shared_flex_ep;
@@ -380,18 +482,21 @@ extern "C" int fastshared_ep_prepared_norm(const void *x,const float *weight,flo
         void *normed,float eps,FastllmMoePreparedInput p,bool afterSwa) {
  using namespace fastllm_shared_flex_ep;
  using namespace fastllm_norm_rows;
- if(!p.Valid(8)||p.epRank<0||!x||!weight||!router||!gamma||!normed||!std::isfinite(eps)||eps<=0||
+ if(!p.Valid(p.rows)||p.epRank<0||!x||!weight||!router||!gamma||!normed||!std::isfinite(eps)||eps<=0||
     ((uintptr_t(x)|uintptr_t(weight)|uintptr_t(gamma)|uintptr_t(normed)|uintptr_t(router))&15u))
   return cudaErrorInvalidValue;
  if(afterSwa)return fastllm::cuda_launch::LaunchProgrammatic<NormRowsRouterDirect<8,2,true,8,false,true,EpVerifyRoutes>>(
     dim3(32,4),dim3(256),0,cudaStreamPerThread,static_cast<const BF16*>(x),weight,router,gamma,
-    static_cast<BF16*>(normed),eps,8,p,(const BF16*)nullptr,(BF16*)nullptr);
+    static_cast<BF16*>(normed),eps,p.rows,p,(const BF16*)nullptr,(BF16*)nullptr);
  NormRowsRouterDirect<8,2,true,8,false,false,EpVerifyRoutes><<<dim3(32,4),256,0,cudaStreamPerThread>>>(
-    static_cast<const BF16*>(x),weight,router,gamma,static_cast<BF16*>(normed),eps,8,p);
+    static_cast<const BF16*>(x),weight,router,gamma,static_cast<BF16*>(normed),eps,p.rows,p);
  return cudaGetLastError();
 }
+extern "C" int fastshared_ep_run_prepared_rows(void *state,int rank,int layer,int rows,const int *ids,const float *prob,void *y) {
+ return runEp(state,rank,layer,rows,nullptr,ids,prob,y,{},true);
+}
 extern "C" int fastshared_ep_run_prepared(void *state,int rank,int layer,const int *ids,const float *prob,void *y) {
- return runEp(state,rank,layer,8,nullptr,ids,prob,y,{},true);
+ return fastshared_ep_run_prepared_rows(state,rank,layer,8,ids,prob,y);
 }
 extern "C" int fastshared_ep_run(void*state,int rank,int layer,int rows,const void*x,const void*ids,const void*prob,void*y) {
  return runEp(state,rank,layer,rows,x,ids,prob,y,{});
@@ -401,7 +506,7 @@ extern "C" int fastshared_ep_router_supported(void *state) {
 }
 extern "C" int fastshared_ep_run_router(void *state, int rank, int layer, int rows, const void *x,
         const float *router, const float *bias, int *ids, float *scores, void *out, int needNorm, float scale) {
- if (!fastshared_ep_router_supported(state) || rows < 2 || rows > fastllm_shared_flex_ep::MAX_M ||
+ if (!fastshared_ep_router_supported(state) || rows < 2 ||
      !router || reinterpret_cast<uintptr_t>(router) % 16) return 1;
  return runEp(state, rank, layer, rows, x, ids, scores, out, {router, bias, ids, scores, needNorm, scale});
 }

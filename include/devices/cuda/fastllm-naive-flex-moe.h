@@ -30,8 +30,8 @@ struct FastllmMoePreparedInput {
     size_t Block128Size() const { return Block128Bytes * (rows > 8 ? 2 : 1); }
     struct Range { const void *data; size_t bytes; };
     void Ranges(Range (&ranges)[4]) const {
-        ranges[0] = {values, size_t(values && rows > 0 ? rows : 0) * 4096};
-        ranges[1] = {scales, size_t(scales && rows > 0 ? rows : 0) * (epRank >= 0 ? 2048 : 128)};
+        ranges[0] = {values, size_t(values && rows > 0 ? (epRank >= 0 ? 8 : rows) : 0) * 4096};
+        ranges[1] = {scales, size_t(scales && rows > 0 ? (epRank >= 0 ? 8 : rows) : 0) * (epRank >= 0 ? 2048 : 128)};
         ranges[2] = {counters, size_t(epRank >= 0 ? 2048 : 256) * sizeof(int)};
         ranges[3] = {epoch, sizeof(uint64_t)};
     }
@@ -63,7 +63,7 @@ struct FastllmMoePreparedInput {
         return true;
     }
     bool Valid(int count) const {
-        if (epRank < -1 || (epRank >= 0 && (epRank >= 8 || count != 8 || !routed || block128))) return false;
+        if (epRank < -1 || (epRank >= 0 && (epRank >= 8 || count > 8 || !routed || block128))) return false;
         if (count < 2 || count > 16 || rows != count || !counters || !epoch ||
             (uintptr_t(values) & 15) || (uintptr_t(scales) & 3) ||
             (uintptr_t(counters) & 3) || (uintptr_t(epoch) & 7)) return false;
@@ -126,12 +126,14 @@ int fastshared_tp_dense_admit(void *state,int rank,int rows,int eligible);
 int fastshared_tp_run_dense(void *state,int rank,int rows,const void *input,
     const void *gate,const void *up,const void *down,const float *gamma,float eps,void *silu,void *output);
 
-// EP routing supports 2..8 rows. The prepared-input path requires an eight-row MXFP4 layer.
+// Prepared EP routing uses a masked N8 MXFP4 operand.
 int fastshared_ep_router_supported(void *state);
+int fastshared_ep_supports_rows(void *state, bool mxfp4, int rows);
 int fastshared_ep_uses_verify_reduce(void *state, int rank, int layer, int rows);
 int fastshared_ep_prepared_input(void *state,int rank,int layer,int rows,FastllmMoePreparedInput *out);
 int fastshared_ep_prepared_norm(const void *x,const float *weight,float *router,const float *gamma,
     void *normed,float eps,FastllmMoePreparedInput input,bool afterSwa);
+int fastshared_ep_run_prepared_rows(void *state,int rank,int layer,int rows,const int *ids,const float *scores,void *out);
 int fastshared_ep_run_prepared(void *state,int rank,int layer,const int *ids,const float *scores,void *out);
 int fastshared_ep_run_router(void *state, int rank, int layer, int rows, const void *x,
     const float *routerProbabilities, const float *bias, int *ids, float *scores,

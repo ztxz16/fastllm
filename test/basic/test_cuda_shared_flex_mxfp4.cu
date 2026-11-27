@@ -14,7 +14,7 @@
 #include <vector>
 
 namespace {
-constexpr int Ranks=8, Hidden=4096, TopK=8, MaxRows=17;
+constexpr int Ranks=8, Hidden=4096, TopK=8, MaxRows=32;
 using BF = __nv_bfloat16;
 void check(cudaError_t rc) {
     if (rc != cudaSuccess) throw std::runtime_error(cudaGetErrorString(rc));
@@ -93,11 +93,10 @@ __global__ void referenceRouterSelection(const float *router, const float *bias,
         bias!=nullptr,needNorm,scale,scratch);
 }
 // Capture the same EP producer and consumer used behind both SWA and DSA.
-void testEpPrepared(void *fp4,void *fp8,int rank,RankData &a) {
-    constexpr int rows=8;
+void testEpPrepared(void *fp4,void *fp8,int rank,RankData &a,int rows) {
     FastllmMoePreparedInput p{};
     require(!fastshared_ep_prepared_input(fp8,rank,0,rows,&p) &&
-            !fastshared_ep_prepared_input(fp4,rank,0,4,&p),"EP prepared fallback");
+            !fastshared_ep_prepared_input(fp4,rank,0,9,&p),"EP prepared fallback");
     require(fastshared_ep_prepared_input(fp4,rank,0,rows,&p),"EP packed input");
     p.indices=a.ids; p.scores=a.probs; p.bias=a.bias; p.routed=true; p.routeScale=1.375f;
     require(p.Valid(rows),"EP descriptor");
@@ -118,7 +117,7 @@ void testEpPrepared(void *fp4,void *fp8,int rank,RankData &a) {
         cudaGraph_t graph;cudaGraphExec_t exec;
         check(cudaStreamBeginCapture(cudaStreamPerThread,cudaStreamCaptureModeThreadLocal));
         require(fastshared_ep_prepared_norm(a.x,weights,a.router,gamma,normed,1.e-6f,p,afterSwa)==0,"EP norm/router");
-        require(fastshared_ep_run_prepared(fp4,rank,0,a.ids,a.probs,a.y[1])==0,"EP prepared MoE");
+        require(fastshared_ep_run_prepared_rows(fp4,rank,0,rows,a.ids,a.probs,a.y[1])==0,"EP prepared MoE");
         referenceRouterSelection<<<rows,32,0,cudaStreamPerThread>>>(a.router,a.bias,a.refIds,a.refScores,1,p.routeScale);
         require(fastshared_ep_run(fp8,rank,0,rows,normed,a.refIds,a.refScores,a.y[0])==0,"EP reference MoE");
         check(cudaStreamEndCapture(cudaStreamPerThread,&graph));
@@ -169,7 +168,7 @@ void testResidualRouter(void *fp4, void *fp8, RankData &data) {
         std::vector<T> v(count);check(cudaMemcpy(v.data(),src,count*sizeof(T),cudaMemcpyDeviceToHost));return v;
     };
     copy(gamma,g);copy(weight,w);
-    for (int rows : {4,5,7,8}) {
+    for (int rows : {2,3,4,5,7,8}) {
         // Exercise the scalar bias fallback with the same graph-replay reference.
         auto *bias = biasStorage + (rows == 7);
         require(fastshared_tp_residual_router_supported(fp4,0,0,rows),"residual router admission");
@@ -273,7 +272,7 @@ void test(bool ep, bool verifyPages = false) {
         for (auto &y:a.y) y=a.allocate<BF>(MaxRows*Hidden);
     }
     // Return to one row after a prepared batch to cover reused counters and mailbox generations.
-    for (int variant:{1,2,8,9,17,-4,-8,1}) onRanks([&](int r) {
+    for (int variant : ep ? std::vector<int>{1,2,8,9,16,17,24,31,32,-4,-8,-9,-15,-16,-17,-24,-25,-31,-32,1} : std::vector<int>{1,2,8,9,17,-2,-3,-4,-5,-7,-8,1}) onRanks([&](int r) {
         const bool prepared=variant<0;
         const int rows=std::abs(variant);
         auto &a=data[r]; cudaGraphExec_t graphs[2]{};
@@ -294,14 +293,14 @@ void test(bool ep, bool verifyPages = false) {
                         a.probs,a.y[j],needNorm,scale)==0,"EP routed capture");
                 }
             } else if (!j) {
-                require(fastshared_tp_run_router(states[j],r,0,rows,a.x,a.router,rows==8 ? a.bias : nullptr,
+                require(fastshared_tp_run_router(states[j],r,0,rows,a.x,a.router,rows>=5 ? a.bias : nullptr,
                     a.ids,a.probs,a.y[j],1,1.f)==0,"reference routing");
             } else {
                 FastllmMoePreparedInput input{};
                 require(fastshared_tp_prepared_input(states[j],r,rows,&input) && !input.block128,
                     "native K32 prepared input");
                 prepareInput<<<rows*Hidden/256,256,0,cudaStreamPerThread>>>(a.x,input);
-                require(fastshared_tp_run_prepared(states[j],r,0,rows,a.router,rows==8 ? a.bias : nullptr,
+                require(fastshared_tp_run_prepared(states[j],r,0,rows,a.router,rows>=5 ? a.bias : nullptr,
                     a.ids,a.probs,a.y[j],1,1.f)==0,"prepared routing");
             }
             check(cudaStreamEndCapture(cudaStreamPerThread,&graph));
@@ -356,7 +355,7 @@ void test(bool ep, bool verifyPages = false) {
         for (auto graph:graphs) check(cudaGraphExecDestroy(graph));
     });
     printf("%s all_rank_max_row_l2=%.8g\n",ep?"EP":verifyPages?"TP-pages":"TP",*std::max_element(peak.begin(),peak.end()));
-    if (ep) onRanks([&](int r){testEpPrepared(states[1],states[0],r,data[r]);});
+    if (ep) for (int rows : {2,3,5,7,8}) onRanks([&](int r){testEpPrepared(states[1],states[0],r,data[r],rows);});
     if (!ep) testResidualRouter(states[1],states[0],data[0]);
     for (auto state:states) destroy(state);
     onRanks([&](int r) { for (auto p:data[r].buffers) check(cudaFree(p)); });

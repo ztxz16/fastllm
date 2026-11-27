@@ -129,7 +129,7 @@ void plain_matmul(Rank a,const int*ids,const float*prob){
 // Each cluster owns both K partitions of one expert/output tile. Exchange
 // the FP32 partials in distributed shared memory before rounding and K32
 // quantization. An even grid keeps both CTAs on the same tile on every pass.
-__device__ __forceinline__ void writePairedGate(Rank a,const float *prob,int expert,int job,int tile,
+template<bool Wide> __device__ __forceinline__ void writePairedGate(Rank a,const float *prob,int expert,int job,int tile,
                                                float *partial,const unsigned (&values)[8]) {
  auto cluster=cooperative_groups::this_cluster();
  int tid=threadIdx.x, half=cluster.block_rank();
@@ -148,7 +148,7 @@ __device__ __forceinline__ void writePairedGate(Rank a,const float *prob,int exp
   float v=__fmul_rn(__fmul_rn(gate/(1.f+__expf(-gate)),up),prob[route]),mx=fabsf(v);
   for(int d=16;d;d>>=1)mx=fmaxf(mx,__shfl_xor_sync(0xffffffffu,mx,d));
   unsigned e=exponent(mx);
-  VerifyOperand::write<I>(VerifyOperand::down(a,expert),row,tile*64+lane,__nv_fp8_e4m3(v*sf(254-e)).__x,e);
+  VerifyOperand::write<I>(Wide ? WideOperand::down(a,job) : VerifyOperand::down(a,expert),row,tile*64+lane,__nv_fp8_e4m3(v*sf(254-e)).__x,e);
  }
  // Both CTAs' global stores must be visible to the Down TMA reader before
  // publishing this tile. Even a CTA with no selected rows joins the barrier.
@@ -160,7 +160,7 @@ __device__ __forceinline__ void writePairedGate(Rank a,const float *prob,int exp
                "l"(a.gcount+VerifyOperand::ReadyOffset+job),"r"(1u<<tile):"memory");
  }
 }
-template<bool G,int GS,int DS,bool Packed=false,bool PairedGate=false,bool StreamDown=false> __device__ __forceinline__
+template<bool G,int GS,int DS,bool Packed=false,bool PairedGate=false,bool StreamDown=false,bool Wide=false> __device__ __forceinline__
 void batched_matmul(Rank a,const float*prob){
   using E4=cutlass::float_e4m3_t;using UE=cutlass::float_ue8m0_t;
   using MMA=cute::SM100_MMA_MXF8F6F4_SS<E4,E4,float,UE,128,8,cute::UMMA::Major::K,cute::UMMA::Major::K>;
@@ -193,7 +193,8 @@ void batched_matmul(Rank a,const float*prob){
     const uint8_t*scales=G?a.gs:a.ds;
     const int activationBytes = Packed ? VerifyOperand::Values + VerifyOperand::Scales : 0;
     const int tileBytes = fastllm_shared_flex::weight_tile_bytes(Packed || a.mxfp4) + 512 + activationBytes;
-    const uint8_t *operand = G ? VerifyOperand::base(a) : VerifyOperand::down(a,expert);
+    const uint8_t *operand = Wide ? (G ? WideOperand::gate(a,job) : WideOperand::down(a,job)) :
+                             (G ? VerifyOperand::base(a) : VerifyOperand::down(a,expert));
     auto load_tile=[&](int kg,int b){
       if(tid==0){
         unsigned mb=(unsigned)__cvta_generic_to_shared(&loaded[b]);
@@ -262,7 +263,7 @@ void batched_matmul(Rank a,const float*prob){
     if constexpr(PairedGate){
       static_assert(G && Packed && SPLIT==2);
       asm volatile("tcgen05.fence::before_thread_sync;":::"memory");
-      writePairedGate(a,prob,expert,job,tile,reinterpret_cast<float*>(wa[0]),values);
+      writePairedGate<Wide>(a,prob,expert,job,tile,reinterpret_cast<float*>(wa[0]),values);
     }else{
     #pragma unroll
     for(int col=0;col<8;++col)if(Packed ? a.members[job*MAX_M+col]>=0 : col<member_count){unsigned value=values[col];
@@ -323,6 +324,14 @@ template<bool Gate,bool StreamDown=false> __global__ __launch_bounds__(128,1)
 void grouped_mxfp4_rows8(Rank a,const float *prob) {
  if constexpr (!Gate) cudaTriggerProgrammaticLaunchCompletion();
  batched_matmul<Gate,VerifyOperand::GateSplit,VerifyOperand::DownSplit,true,false,StreamDown>(a,prob);
+}
+__global__ __cluster_dims__(2,1,1) __launch_bounds__(128,1) void wideGate(Rank a,const float *prob) {
+ cudaTriggerProgrammaticLaunchCompletion();
+ batched_matmul<true,2,2,true,true,false,true>(a,prob);
+}
+__global__ __launch_bounds__(128,1) void wideDown(Rank a,const float *prob) {
+ cudaTriggerProgrammaticLaunchCompletion();
+ batched_matmul<false,2,2,true,false,true,true>(a,prob);
 }
 __global__ __cluster_dims__(2,1,1) __launch_bounds__(128,1)
 void paired_gate_rows8(Rank a,const float *prob){
@@ -533,6 +542,30 @@ __global__ void finish_rows8(Rank a,__nv_bfloat16 *y,const int *ids) {
  if (row==0 && pair<K*(2*I/128)) a.gcount[pair]=0;
  sum=collect_bf16(a,row,pair,generation,payload);
  reinterpret_cast<__nv_bfloat162*>(y+row*H)[pair]=__floats2bfloat162_rn(sum.x,sum.y);
+}
+__global__ void wideFinish(Rank a,__nv_bfloat16 *y,const int *ids,int rows) {
+ const int tiles=WideOperand::tiles(rows);
+ const int pair=blockIdx.x*blockDim.x+threadIdx.x;
+ const unsigned last=unsigned(*a.epoch);
+ // The same CTA consumes the preceding tag before advancing this word.
+ // Consecutive N8 sets reuse the existing two mailbox banks.
+ cudaTriggerProgrammaticLaunchCompletion();
+ cudaGridDependencySynchronize();
+ if (blockIdx.y==0 && pair<K*(2*I/128)) a.gcount[pair]=0;
+ const int localRow=blockIdx.y;
+ // Empty lanes still exchange the generation tag on every rank.
+ for (int tile=0;tile<tiles;++tile) {
+  const int row=tile*MAX_M+localRow;
+  float2 sum=make_float2(0.f,0.f);
+  for (int i=0;row<rows && i<K;++i) if(ids[row*K+i]/(E/R)==a.rank) {
+   float2 v=roundedExpert<VerifyOperand::DownSplit>(a,row*K+i,pair);
+   sum.x=__fadd_rn(sum.x,v.x);sum.y=__fadd_rn(sum.y,v.y);
+  }
+  const unsigned generation=last-(tiles-1)+tile,payload=pack_bf16(sum.x,sum.y);
+  publish_bf16(a,localRow,pair,generation,payload);
+  sum=collect_bf16(a,localRow,pair,generation,payload);
+  if (row<rows) reinterpret_cast<__nv_bfloat162*>(y+row*H)[pair]=__floats2bfloat162_rn(sum.x,sum.y);
+ }
 }
 __global__ void finish(Rank a,__nv_bfloat16*y,const int*ids,int rows){
  if(split_for(a)==8)finish_impl<8>(a,y,ids,rows);else finish_impl<4>(a,y,ids,rows);
