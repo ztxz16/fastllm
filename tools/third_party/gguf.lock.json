@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "component": "FastLLM GGUF integration (complete upstream subtree)",
+  "source": {
+    "repository": "https://github.com/ztxz16/fastllm.git",
+    "revision": "e33b3cb795119e9d0b00d65b9c9991c4ca054483",
+    "path": "third_party/gguf",
+    "git_tree": "15451516e39d050823f8791f79c83b39ac85fade"
+  },
+  "destination": "third_party/gguf",
+  "files": {
+    "README.md": {
+      "mode": "100644",
+      "git_blob": "88f7ecabad68bf951079cab7ac0b37f211a9ff64",
+      "sha256": "ebd84f29de0bee992bc5a436dc54101a7438cb87a9267ca9b2006d195c2395e5"
+    },
+    "ggml-dequantize.cpp": {
+      "mode": "100644",
+      "git_blob": "cf9fa830e1bed41aeb1ddce4e9aa3ed573af1221",
+      "sha256": "0a36adbcef5f05e4cdabd4ed20cec98bd506c2b26080ff2e19a0e6fff3dd7c45"
+    },
+    "ggml-iqk.cpp": {
+      "mode": "100644",
+      "git_blob": "edc4445ab6bd91698e78f4c57bd2344631e1dd6c",
+      "sha256": "b2e638c0c6ba6898fcf2f702666e07bc1680593f74908110b241ae61bc7ab0fe"
+    },
+    "ggml-quant.cpp": {
+      "mode": "100644",
+      "git_blob": "e4125d1d072eb373bd277625ef8eb54f6e780c0a",
+      "sha256": "e3a21812f8312d3ef64fedb0166d5d2bd96bd20276a8e42c2dfa506f1de3e2f6"
+    },
+    "gguf-adapter.cpp": {
+      "mode": "100644",
+      "git_blob": "a704c6ad17e56f491c92037763105427f6688996",
+      "sha256": "724f25e95f81fa1ac5dc3bda12645904e3662e7c74354bee4c18f86b8509b1ea"
+    },
+    "gguf.cpp": {
+      "mode": "100644",
+      "git_blob": "9054d4da6ecf6fcc4cfada53e0199d9149d12c00",
+      "sha256": "88712e249332ca8d67103429c96f1d8e9a9a016b72d4b9780aad43e1faa2afa8"
+    },
+    "gguf.h": {
+      "mode": "100644",
+      "git_blob": "3940b0094b3ed2844157debbdab27fb0f6b4df2c",
+      "sha256": "0120f85cba1ea2c3b62940a5b91e05423ef207709e316c967de7d68516bfbc65"
+    }
+  }
+}
