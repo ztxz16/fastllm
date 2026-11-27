@@ -146,7 +146,7 @@ template <bool Fp8Key, bool PreserveScoreOrder = true,
     }
     zero_topk_grid(topk);
   }
-  template <bool ComputeAttention = true, class ArgsLike>
+  template <bool ComputeAttention = true, int KVBits = 16, class ArgsLike>
   __device__ static void run(const ArgsLike &args, SharedStorage &shared, bool releaseAllocationPermit = true,
                              bool inputsReady = false) {
     auto grid = make_grid(args.workspace);
@@ -289,7 +289,8 @@ template <bool Fp8Key, bool PreserveScoreOrder = true,
       auto descriptor = args.rows[row];
       if (descriptor.indices)
         descriptor.indices = selections + row * 2048;
-      native_attention::Attend<!PreserveScoreOrder>(args.query, descriptor, args.sink, args.output, temp,
+      native_attention::Attend<!PreserveScoreOrder, native_attention::Phase::Fused, 16, 64, 128, KVBits == 8, false,
+                               native_attention::NoOutputEpilogue, 8, false, KVBits>(args.query, descriptor, args.sink, args.output, temp,
                                                     flags, 8, 1, row, 0, cta_index() % 16, shared.native);
     }
   }

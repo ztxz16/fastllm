@@ -66,4 +66,16 @@ template<class Output> __device__ __forceinline__ void RotateWarp(const B *sourc
     for (int col = 64 + lane; col < dim; col += 32)
         output[col] = source[col];
 }
+template<class T> __device__ __forceinline__ void RotateWarp(const B *source, T *output, int dim, float cs, float sn) {
+    int lane = threadIdx.x % 32;
+    float x = float(source[lane]), y = float(source[lane + 32]);
+    auto encode = [](B b) -> T {
+        if constexpr (std::is_same_v<T, B>) return b;
+        else return T(float(b));
+    };
+    output[lane] = encode(__float2bfloat16_rn(Round(x * cs) - Round(y * sn)));
+    output[lane + 32] = encode(__float2bfloat16_rn(Round(y * cs) + Round(x * sn)));
+    for (int col = 64 + lane; col < dim; col += 32)
+        output[col] = encode(source[col]);
+}
 } // namespace fastllm_dsa_layer

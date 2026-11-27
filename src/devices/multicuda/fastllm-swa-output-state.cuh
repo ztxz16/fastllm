@@ -216,14 +216,18 @@ public:
     }
 #ifdef FASTLLM_ENABLE_NAIVE_DSA_FUSED
     cudaError_t LaunchDsa(FastllmNaiveDSALayerArgs args, int rank, const float *postNorm,
-                          const float *routerWeight, float *router, const FastllmMoePreparedInput *prepared, bool deferPostNorm = false) {
-        args.rank = rank;
-        args.epochs = epochs[rank];
-        for (int i = 0; i < 8; ++i)
-            args.peers[i] = peers.data[i];
-        auto status = FastllmCudaNaiveDSALayerLaunch(args);
-        if (status != cudaSuccess)
-            return status;
+                          const float *routerWeight, float *router, const FastllmMoePreparedInput *prepared, bool deferPostNorm, const std::vector<FastllmNaiveDSALayerArgs> &tiles) {
+        auto launch = [&](FastllmNaiveDSALayerArgs tile) {
+            tile.rank = rank;
+            tile.epochs = epochs[rank];
+            for (int i = 0; i < 8; ++i) tile.peers[i] = peers.data[i];
+            return FastllmCudaNaiveDSALayerLaunch(tile);
+        };
+        if (tiles.empty()) {
+            if (auto status = launch(args); status != cudaSuccess) return status;
+        } else for (const auto &tile : tiles) {
+            if (auto status = launch(tile); status != cudaSuccess) return status;
+        }
         if(deferPostNorm)return cudaSuccess;
         return LaunchRowsNorm(args.hidden, postNorm, args.normed, args.eps, routerWeight, router, args.rows,
                               prepared);

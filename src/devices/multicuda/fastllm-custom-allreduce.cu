@@ -4714,16 +4714,16 @@ static bool LocalDsaVerifyAvailable() {
 
 bool FastllmCudaLocalDsaLayerSupported(const std::vector<int> &requests, int rows, int capacity,
                                       int heads, int dim, int topK) {
-    return LocalDsaVerifyAvailable() && rows <= 16 && capacity > 8192 && capacity <= 65536 &&
+    return LocalDsaVerifyAvailable() && rows > 0 && rows <= 64 && capacity > 8192 && capacity <= 65536 &&
         heads == 16 && dim == 128 && topK == 2048 &&
-        std::all_of(requests.begin(), requests.end(), [](int n) { return n >= 4 && n <= 8; });
+        std::all_of(requests.begin(), requests.end(), [](int n) { return n > 0 && n <= 8; });
 }
 
 bool FastllmCudaLocalDsaIndexerSupported(const std::vector<FastllmNaiveVerifyIndexerItem> &items,
                                         int heads, int kvHeads, int dim, int valueDim) {
     return LocalDsaVerifyAvailable() && !items.empty() && heads == 8 && kvHeads == 1 && dim == 192 &&
         valueDim == 128 && std::all_of(items.begin(), items.end(), [](const auto &item) {
-            return item.rows >= 4 && item.rows <= 8 && (item.capacity ? item.capacity : item.past + item.rows) > 8192;
+            return item.rows >= 1 && item.rows <= 8 && (item.capacity ? item.capacity : item.past + item.rows) > 8192;
         });
 }
 
@@ -4993,6 +4993,7 @@ bool FastllmCudaNaiveDSALayer(const FastllmNaiveDSALayerInput &input,int deviceI
     const int rows = input.caches.size();
     const bool withRouter = input.routerWeight && input.router;
     FastllmNaiveDSALayerArgs args{};
+    std::vector<FastllmNaiveDSALayerArgs> tiles;
     const Data *const routerSources[] = {
         input.branch,
         input.inputNorm,
@@ -5024,7 +5025,7 @@ bool FastllmCudaNaiveDSALayer(const FastllmNaiveDSALayerInput &input,int deviceI
         for (const auto &cache : input.caches)
             routerDisjoint = routerDisjoint && input.router != cache.key && input.router != cache.value;
     }
-    bool eligible = routerDisjoint && FastllmCudaNaiveDSALayerPrepare(input, deviceId, args) &&
+    bool eligible = routerDisjoint && FastllmCudaNaiveDSALayerPrepare(input, deviceId, args, &tiles) &&
                     bool(input.routerWeight) == bool(input.router) &&
                     (!prepared || (withRouter && state.swaOutput->PreparedRouterSupported(prepared->routed, rows) &&
                                    prepared->Valid(rows)));
@@ -5086,13 +5087,13 @@ bool FastllmCudaNaiveDSALayer(const FastllmNaiveDSALayerInput &input,int deviceI
     // The all-rank decision is complete before the fused writer is launched.
     CustomArPointers registered{};
     if (!FindOrRegisterCustomArPointers(state, rank, input.projected ? input.projected->cudaData : nullptr,
-                                        rows >= 1 && rows <= 16 ? rows * 4096 : 0, BFLOAT16, eligible,
+                                        rows >= 1 && rows <= INT_MAX / 4096 ? rows * 4096 : 0, BFLOAT16, eligible,
                                         registered))
         return false;
     auto status =
         state.swaOutput->LaunchDsa(args, rank, (const float *)input.postNorm->cudaData,
                                    withRouter ? (const float *)input.routerWeight->cudaData : nullptr,
-                                   withRouter ? (float *)input.router->cudaData : nullptr, prepared, deferPostNorm && !withRouter);
+                                   withRouter ? (float *)input.router->cudaData : nullptr, prepared, deferPostNorm && !withRouter, tiles);
     if (status != cudaSuccess) {
         FastllmCudaSetThreadError();
         throw std::runtime_error(std::string("DSA layer launch failed: ") + cudaGetErrorString(status));

@@ -1146,6 +1146,7 @@ if ("103" IN_LIST FASTLLM_MIMO_MEGA_ARCHS)
         APPEND PROPERTY COMPILE_DEFINITIONS FASTLLM_ENABLE_NAIVE_FLEX_SM103)
     set(FASTLLM_NAIVE_FLEX_OBJECTS $<TARGET_OBJECTS:fastllm_naive_flex_sm103>)
     add_library(fastllm_naive_dsa_fused OBJECT src/devices/cuda/models/naive-n05-dsa-fused.cu
+        src/devices/cuda/models/naive-n05-dp-dsa-blackwell.cu
         src/devices/cuda/models/naive-n05-dsa-layer.cu)
     set_target_properties(fastllm_naive_dsa_fused PROPERTIES
         CUDA_ARCHITECTURES OFF CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
@@ -3984,6 +3985,10 @@ if (UNIT_TEST)
             add_test(NAME naive_n05_dp_dsa_verify COMMAND naive_n05_dsa_layer_test dp)
             set_tests_properties(naive_n05_dp_dsa_verify PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
             set_target_properties(naive_n05_dsa_layer_test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+            if (TARGET fastllm_mxfp8_linear_sm103)
+                add_test(NAME naive_n05_dsa_verify_fp8_kv COMMAND naive_n05_dsa_layer_test fp8-kv tp --mxfp8)
+                set_tests_properties(naive_n05_dsa_verify_fp8_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 240)
+            endif()
             foreach(format bf16 fp8)
                 if (TARGET fastllm_mxfp8_linear_sm103)
                     add_test(NAME naive_n05_dsa_mxfp8_${format} COMMAND naive_n05_dsa_layer_test ${format} tp --mxfp8)
@@ -4045,6 +4050,8 @@ if (UNIT_TEST)
         add_test(NAME naive_n05_fp8_kv COMMAND naive_n05_fp8_kv_test)
         set_tests_properties(naive_n05_fp8_kv PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "ALL FP8 CHECKS PASSED")
+        add_test(NAME naive_n05_fp8_dsa_tp_online COMMAND naive_n05_fp8_kv_test tp_online)
+        set_tests_properties(naive_n05_fp8_dsa_tp_online PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
         add_test(NAME naive_n05_fp8_dsa_wide_heads COMMAND naive_n05_fp8_kv_test wide_heads)
         set_tests_properties(naive_n05_fp8_dsa_wide_heads PROPERTIES LABELS cuda SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180
             PASS_REGULAR_EXPRESSION "WIDE HEAD FP8 DSA PASS")

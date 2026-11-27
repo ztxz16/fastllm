@@ -171,7 +171,7 @@ struct Select {
         return __uint_as_float((key & 0x80000000u) ? key & 0x7fffffffu : ~key);
     }
 
-    static __device__ void run(const float *scores, int *ids, unsigned *flags, const int *lengths, Shared &s) {
+    template<int Stride = Scratch::kMaxSeqLen> static __device__ void run(const float *scores, int *ids, unsigned *flags, const int *lengths, Shared &s) {
         const unsigned q = blockIdx.x, rank = blockIdx.y, tx = threadIdx.x, lane = tx & 31u, warp = tx >> 5;
         const unsigned visible = unsigned(lengths[q]);
 
@@ -215,7 +215,7 @@ struct Select {
         const unsigned span = (visible + 32u * kRanks - 1u) / (32u * kRanks) * 32u;
         const unsigned lo = rank * span, len = min(span, visible - lo), words = (len + 31u) / 32u,
                        blocks = (len + 127u) / 128u;
-        const float *row = scores + std::size_t(q) * Scratch::kMaxSeqLen + lo;
+        const float *row = scores + std::size_t(q) * Stride + lo;
         // Lane l's scores of block g: tokens 128 g + 32 j + l (j < 4); -inf past the range.
         const float kNegInf = __uint_as_float(0xff800000u);
         auto load = [&](unsigned g) {
@@ -687,9 +687,10 @@ inline bool Supported(int device) {
                cudaSuccess &&
            cudaOccupancyMaxActiveClusters(&active, select, &cfg) == cudaSuccess && active > 0;
 }
-inline cudaError_t Launch(const float *scores, int *ids, unsigned *retry, const int *lengths, cudaStream_t stream) {
+inline cudaError_t Launch(const float *scores, int *ids, unsigned *retry, const int *lengths, cudaStream_t stream, int rows = Scratch::kQueryRows) {
     cudaLaunchAttribute attr{};
     auto cfg = Config(attr, stream);
+    cfg.gridDim.x = rows;
     return cudaLaunchKernelEx(&cfg, select, scores, ids, retry, lengths);
 }
 } // namespace cluster_sel

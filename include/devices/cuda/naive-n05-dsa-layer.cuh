@@ -18,7 +18,7 @@ struct FastllmNaiveDSALayerArgs {
     char *peers[8];
     uint64_t *epochs;
     float eps, theta, valueScale;
-    bool fp8Key;
+    bool fp8Key, mxfp8Gemv;
     // Internal publication-only diagnostic; production Prepare always clears it.
     // Retain this launch ABI/control flow: removing it changes SM103 code generation.
     int phaseStop;
@@ -32,6 +32,8 @@ struct FastllmNaiveDSALayerLayout {
 };
 bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &input, int device,
                                      FastllmNaiveDSALayerArgs &args);
+bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &input, int device,
+                                     FastllmNaiveDSALayerArgs &args, std::vector<FastllmNaiveDSALayerArgs> *tiles);
 cudaError_t FastllmCudaNaiveDSALayerLaunch(FastllmNaiveDSALayerArgs args);
 bool FastllmCudaNaiveDSALayerSupported();
 struct FastllmMoePreparedInput;

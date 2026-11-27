@@ -688,5 +688,10 @@ bool FastllmCudaTryBlackwellScoreAttention(const FastllmNaivePrefillAttentionIte
 }
 
 namespace blackwell_decode {
-DecodeKernel PairedDecodeKernel(bool pack) { return pack ? &Decode<false, 2, true> : &Decode<false, 2>; }
+template<class Batch> DecodeKernel<Batch> GroupedDecodeKernel(bool pack, bool fp4) {
+    if (fp4) return pack ? &Decode<false, 4, true, Batch> : &Decode<false, 4, false, Batch>;
+    return pack ? &Decode<false, 2, true, Batch> : &Decode<false, 2, false, Batch>;
+}
+template DecodeKernel<naive_attention_bulk::Batch> GroupedDecodeKernel<naive_attention_bulk::Batch>(bool, bool);
+template DecodeKernel<naive_attention_bulk::CompactBatch> GroupedDecodeKernel<naive_attention_bulk::CompactBatch>(bool, bool);
 }

@@ -1,6 +1,7 @@
 #pragma once
-// Full E4M3 K/V decode. Adapted from NaiveSGLang's B300 mixed DSA kernel
-// (28cfec6fbb). A CTA owns one request and one or two adjacent groups of 16 query heads.
+// E4M3 and block-scaled E2M1 K/V decode. Adapted from NaiveSGLang's B300 mixed DSA kernel
+// (28cfec6fbb). Each CTA owns a token partition and an 8- or 16-head group.
+// Wider GQA can combine two or four adjacent 16-head groups.
 // Producers gather independent K/V pages; two MMA warps reduce disjoint
 // halves of each tile. The final normalization includes the attention sink.
 #include "naive-n05-attention-batch.cuh"
@@ -12,11 +13,15 @@ namespace blackwell_decode {
 #define FASTLLM_NAIVE_BLACKWELL_DECODE
 constexpr int TILE = 32, NSTAGE = 4, NCW = 2, NP = 4;
 template<int Groups> struct Layout {
-    static constexpr int KeyStride = Groups * 192 + 16, ValueStride = Groups * 128 + 16;
+    // A four-head FP4 CTA copies a complete physical row, including E4M3 scales.
+    static constexpr bool FP4 = Groups == 4;
+    static constexpr int KeyBytes = FP4 ? Groups * (192 / 16 * 9) : Groups * 192;
+    static constexpr int ValueBytes = FP4 ? Groups * (128 / 16 * 9) : Groups * 128;
+    static constexpr int KeyStride = KeyBytes + 16, ValueStride = ValueBytes + 16;
     static constexpr int ValueOffset = TILE * KeyStride, ValidOffset = ValueOffset + TILE * ValueStride;
     static constexpr int StageBytes = ValidOffset + 16;
     static constexpr int Bytes = NSTAGE * StageBytes + 2 * NSTAGE * sizeof(uint64_t) +
-                                 (Groups == 2 ? 2048 * sizeof(int2) : 0);
+                                 (Groups > 1 ? 2048 * sizeof(int2) : 0);
 };
 constexpr float RESCALE_TH = 8.f;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
@@ -82,14 +87,38 @@ __device__ __forceinline__ void mma_bf16(float (&d)[4], const unsigned (&a)[4], 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ uint4 MakeFP4Palette(unsigned sf) {
+    __nv_fp8_e4m3 scale;
+    scale.__x = sf;
+    constexpr float magnitude[] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    uint4 entry{};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const unsigned bits = __bfloat16_as_ushort(__float2bfloat16_rn(float(scale) * magnitude[i]));
+        (i < 4 ? entry.x : entry.y) |= (bits & 255) << (8 * (i % 4));
+        (i < 4 ? entry.z : entry.w) |= (bits >> 8) << (8 * (i % 4));
+    }
+    return entry;
+}
+
+__device__ __forceinline__ uint2 DecodeFour(unsigned n, uint4 entry) {
+    const unsigned selectors = n & 0x7777;
+    const unsigned lo = prmt(entry.x, entry.y, selectors);
+    const unsigned hi = prmt(entry.z, entry.w, selectors) ^
+                        (prmt(0, ~0u, (n >> 1) & 0x4444) & 0x80808080);
+    return make_uint2(prmt(lo, hi, 0x5140), prmt(lo, hi, 0x7362));
+}
+
 #endif
-template <bool Split, int Groups, bool Prefill = false, bool Pack = false>
+template <bool Split, int Groups, bool Prefill = false, bool Pack = false, int QueryHeads = 16>
 __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmNaiveDSARow &row,
         const float *sink, __nv_bfloat16 *out, int q_heads, float *parts, float2 *stats, FastllmMxfp8Activation packed, int firstRow) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
-    static_assert(Groups == 1 || (Groups == 2 && !Split));
+    static_assert(Groups == 1 || ((Groups == 2 || Groups == 4) && !Split));
+    static_assert(QueryHeads == 16 || (QueryHeads == 8 && Groups == 1));
     using L = Layout<Groups>;
-    constexpr int Ahead = Groups == 2 ? NSTAGE : 1;
+    constexpr bool FP4 = L::FP4;
+    constexpr int Ahead = Groups > 1 ? NSTAGE : 1;
     const int b = blockIdx.x, firstHead = blockIdx.y * Groups;
     const int group = (threadIdx.x / 32) / NCW;
     const int hg = firstHead + group;
@@ -97,15 +126,15 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
     if (length == 0) {
         if constexpr (Split) {
             // Merge skips empty partitions, so their PV storage is never read.
-            if (threadIdx.x < 16)
-                stats[((size_t)b * q_heads + firstHead * 16 + threadIdx.x) * gridDim.z + blockIdx.z] =
+            if (threadIdx.x < QueryHeads)
+                stats[((size_t)b * q_heads + firstHead * QueryHeads + threadIdx.x) * gridDim.z + blockIdx.z] =
                     make_float2(-INFINITY, 0.f);
         } else {
-            for (int i = threadIdx.x; i < Groups * 16 * 128; i += blockDim.x)
-                out[((size_t)b * q_heads + firstHead * 16) * 128 + i] = __float2bfloat16(0.f);
+            for (int i = threadIdx.x; i < Groups * QueryHeads * 128; i += blockDim.x)
+                out[((size_t)b * q_heads + firstHead * QueryHeads) * 128 + i] = __float2bfloat16(0.f);
             if constexpr (Pack) {
-                for (int col = threadIdx.x * 8; col < Groups * 16 * 128; col += blockDim.x * 8)
-                    fastllm_mxfp8::StoreZero8(packed, firstRow + b, firstHead * 16 * 128 + col);
+                for (int col = threadIdx.x * 8; col < Groups * QueryHeads * 128; col += blockDim.x * 8)
+                    fastllm_mxfp8::StoreZero8(packed, firstRow + b, firstHead * QueryHeads * 128 + col);
             }
         }
         return;
@@ -120,7 +149,7 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
     uint64_t *empty = full + NSTAGE;
     __shared__ float s_ml[Groups][16][2];
     int2 *mapped = reinterpret_cast<int2 *>(empty + NSTAGE);
-    if constexpr (Groups == 2) {
+    if constexpr (Groups > 1) {
         // Translate once per selected token. A complemented K marks a masked
         // slot while still loading the original logical row zero for K and V.
         for (int slot = tid; slot < row.selectedCount; slot += blockDim.x) {
@@ -130,6 +159,10 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
             const int key = FastllmNaivePhysicalRow(row, logical);
             mapped[slot] = make_int2(valid ? key : ~key, FastllmNaivePhysicalRow(row, logical, true));
         }
+    }
+    __shared__ uint4 palette[FP4 ? 256 : 1];
+    if constexpr (FP4) {
+        if (tid < 256) palette[tid] = MakeFP4Palette(tid);
     }
     if (tid == 0) {
 #pragma unroll
@@ -141,7 +174,7 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
     }
     __syncthreads();
     if (warp >= NCW * Groups) {
-        if constexpr (Groups == 2) asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
+        if constexpr (Groups > 1) asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
         constexpr int TPW = TILE / NP;
         const int pw = warp - NCW * Groups, tok = pw * TPW + lane;
         for (int base = 0; base < n_tiles; base += Ahead) {
@@ -149,7 +182,7 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
 #pragma unroll
             for (int u = 0; u < Ahead; ++u) {
                 const int slot = (begin + base + u) * TILE + tok;
-                if constexpr (Groups == 2) {
+                if constexpr (Groups > 1) {
                     // This variant is dispatched only for a full 2048-slot selection.
                     const int2 pair = lane < TPW ? mapped[slot] : make_int2(-1, 0);
                     valid[u] = pair.x >= 0;
@@ -172,29 +205,33 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
                 const unsigned mask = __ballot_sync(0xffffffffu, valid[u]);
                 if (lane == 0) {
                     st[L::ValidOffset + pw] = static_cast<uint8_t>(mask);
-                    mbar_arrive_expect_tx(&full[s], TPW * Groups * (192 + 128));
+                    mbar_arrive_expect_tx(&full[s], TPW * (L::KeyBytes + L::ValueBytes));
                 }
                 __syncwarp();
                 if (lane < TPW) {
-                    bulk_g2s(st + tok * L::KeyStride, (const uint8_t *)row.key + size_t(k[u]) * row.keyStride + firstHead * 192,
-                             Groups * 192, &full[s]);
+                    const size_t ks = FP4 ? L::KeyBytes : row.keyStride;
+                    const size_t vs = FP4 ? L::ValueBytes : (q_heads / QueryHeads) * 128;
+                    bulk_g2s(st + tok * L::KeyStride,
+                             (const uint8_t *)row.key + size_t(k[u]) * ks + (FP4 ? 0 : firstHead * 192),
+                             L::KeyBytes, &full[s]);
                     bulk_g2s(st + L::ValueOffset + tok * L::ValueStride,
-                             (const uint8_t *)row.value + (size_t(v[u]) * (q_heads / 16) + firstHead) * 128,
-                             Groups * 128, &full[s]);
+                             (const uint8_t *)row.value + size_t(v[u]) * vs + (FP4 ? 0 : firstHead * 128),
+                             L::ValueBytes, &full[s]);
                 }
             }
         }
         return;
     }
-    if constexpr (Groups == 2) asm volatile("setmaxnreg.inc.sync.aligned.u32 216;");
+    if constexpr (Groups > 1) asm volatile("setmaxnreg.inc.sync.aligned.u32 216;");
     const int g = warp % NCW, r = lane >> 2, c = lane & 3;
     unsigned query[6][2][4];
-    const auto *qh = q + ((size_t)b * q_heads + hg * 16) * 192;
+    const auto *qh = q + ((size_t)b * q_heads + hg * QueryHeads) * 192;
+    // Eight-head TP shards duplicate the lower MMA rows. Only real heads are exported.
 #pragma unroll
     for (int rr = 0; rr < 2; ++rr) {
 #pragma unroll
         for (int ch = 0; ch < 6; ++ch) {
-            uint4 v = *reinterpret_cast<const uint4 *>(qh + (r + rr * 8) * 192 + ch * 32 + c * 8);
+            uint4 v = *reinterpret_cast<const uint4 *>(qh + (r + (QueryHeads == 16 ? rr * 8 : 0)) * 192 + ch * 32 + c * 8);
             query[ch][rr][0] = v.x;
             query[ch][rr][1] = v.y;
             query[ch][rr][2] = v.z;
@@ -215,16 +252,24 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
         float sc[2][4]{};
 #pragma unroll
         for (int nt = 0; nt < 2; ++nt) {
-            const uint8_t *key = st + (g * 16 + nt * 8 + r) * L::KeyStride + group * 192;
+            const uint8_t *key = st + (g * 16 + nt * 8 + r) * L::KeyStride;
 #pragma unroll
             for (int ch = 0; ch < 6; ++ch) {
-                uint2 v = *reinterpret_cast<const uint2 *>(key + ch * 32 + c * 8);
+                uint4 decoded;
+                if constexpr (FP4) {
+                    const unsigned codes = *reinterpret_cast<const unsigned *>(key + group * 96 + ch * 16 + c * 4);
+                    const uint4 entry = palette[key[Groups * 96 + group * 12 + ch * 2 + c / 2]];
+                    const uint2 x = DecodeFour(codes, entry), y = DecodeFour(codes >> 16, entry);
+                    decoded = make_uint4(x.x, x.y, y.x, y.y);
+                } else {
+                    const uint2 v = *reinterpret_cast<const uint2 *>(key + group * 192 + ch * 32 + c * 8);
+                    decoded = make_uint4(lo16_bf16x2(v.x), hi16_bf16x2(v.x), lo16_bf16x2(v.y), hi16_bf16x2(v.y));
+                }
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
                     const unsigned a[4] = {query[ch][0][2 * e], query[ch][1][2 * e], query[ch][0][2 * e + 1],
                                            query[ch][1][2 * e + 1]};
-                    unsigned packed = e == 0 ? v.x : v.y;
-                    mma_bf16(sc[nt], a, lo16_bf16x2(packed), hi16_bf16x2(packed));
+                    mma_bf16(sc[nt], a, e ? decoded.z : decoded.x, e ? decoded.w : decoded.y);
                 }
             }
 #pragma unroll
@@ -284,23 +329,42 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
             pa[2 * nt] = pack_bf16(sc[nt][0], sc[nt][1]);
             pa[2 * nt + 1] = pack_bf16(sc[nt][2], sc[nt][3]);
         }
-        // Accumulate PV with B fragments unpacked directly from FP8 values.
+        // Unpack V into the BF16 fragments consumed by PV.
         {
-            const uint8_t *vb = st + L::ValueOffset + group * 128 + 4 * r;
             const int t0 = g * 16 + 2 * c;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const unsigned w0 = *reinterpret_cast<const unsigned *>(vb + t0 * L::ValueStride + 32 * j);
-                const unsigned w1 = *reinterpret_cast<const unsigned *>(vb + (t0 + 1) * L::ValueStride + 32 * j);
-                const unsigned w2 = *reinterpret_cast<const unsigned *>(vb + (t0 + 8) * L::ValueStride + 32 * j);
-                const unsigned w3 = *reinterpret_cast<const unsigned *>(vb + (t0 + 9) * L::ValueStride + 32 * j);
-                const unsigned x01 = prmt(w0, w1, 0x5140u), y01 = prmt(w0, w1, 0x7362u);
-                const unsigned x23 = prmt(w2, w3, 0x5140u), y23 = prmt(w2, w3, 0x7362u);
-                const unsigned(&a)[4] = pa;
-                mma_bf16(o_acc[4 * j + 0], a, lo16_bf16x2(x01), lo16_bf16x2(x23));
-                mma_bf16(o_acc[4 * j + 1], a, hi16_bf16x2(x01), hi16_bf16x2(x23));
-                mma_bf16(o_acc[4 * j + 2], a, lo16_bf16x2(y01), lo16_bf16x2(y23));
-                mma_bf16(o_acc[4 * j + 3], a, hi16_bf16x2(y01), hi16_bf16x2(y23));
+                if constexpr (FP4) {
+                    uint2 v[4];
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        const int token = t0 + (k / 2) * 8 + k % 2;
+                        const uint8_t *value = st + L::ValueOffset + token * L::ValueStride;
+                        const unsigned code = *reinterpret_cast<const unsigned short *>(value + group * 64 + 2 * r + j * 16);
+                        const uint4 entry = palette[value[Groups * 64 + group * 8 + j * 2 + r / 4]];
+                        v[k] = DecodeFour(code, entry);
+                    }
+#pragma unroll
+                    for (int k = 0; k < 2; ++k) {
+                        const unsigned w0 = k ? v[0].y : v[0].x, w1 = k ? v[1].y : v[1].x;
+                        const unsigned w2 = k ? v[2].y : v[2].x, w3 = k ? v[3].y : v[3].x;
+                        mma_bf16(o_acc[4 * j + 2 * k], pa, prmt(w0, w1, 0x5410), prmt(w2, w3, 0x5410));
+                        mma_bf16(o_acc[4 * j + 2 * k + 1], pa, prmt(w0, w1, 0x7632), prmt(w2, w3, 0x7632));
+                    }
+                } else {
+                    const uint8_t *vb = st + L::ValueOffset + group * 128 + 4 * r;
+                    const unsigned w0 = *reinterpret_cast<const unsigned *>(vb + t0 * L::ValueStride + 32 * j);
+                    const unsigned w1 = *reinterpret_cast<const unsigned *>(vb + (t0 + 1) * L::ValueStride + 32 * j);
+                    const unsigned w2 = *reinterpret_cast<const unsigned *>(vb + (t0 + 8) * L::ValueStride + 32 * j);
+                    const unsigned w3 = *reinterpret_cast<const unsigned *>(vb + (t0 + 9) * L::ValueStride + 32 * j);
+                    const unsigned x01 = prmt(w0, w1, 0x5140u), y01 = prmt(w0, w1, 0x7362u);
+                    const unsigned x23 = prmt(w2, w3, 0x5140u), y23 = prmt(w2, w3, 0x7362u);
+                    const unsigned(&a)[4] = pa;
+                    mma_bf16(o_acc[4 * j + 0], a, lo16_bf16x2(x01), lo16_bf16x2(x23));
+                    mma_bf16(o_acc[4 * j + 1], a, hi16_bf16x2(x01), hi16_bf16x2(x23));
+                    mma_bf16(o_acc[4 * j + 2], a, lo16_bf16x2(y01), lo16_bf16x2(y23));
+                    mma_bf16(o_acc[4 * j + 3], a, hi16_bf16x2(y01), hi16_bf16x2(y23));
+                }
             }
         }
         // generic-proxy reads of the stage must be ordered before the async-proxy
@@ -346,10 +410,10 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
         }
         float inv[2];
 #pragma unroll
-        for (int rr = 0; rr < 2; ++rr) {
+        for (int rr = 0; rr < QueryHeads / 8; ++rr) {
             float lt = lsum[rr];
             if (!Split && sink != nullptr) {
-                const float sk = sink[hg * 16 + r + rr * 8] * 1.4426950408889634f;
+                const float sk = sink[hg * QueryHeads + r + rr * 8] * 1.4426950408889634f;
                 const float mm = fmaxf(mmax[rr], sk);
                 const float mu = (mm == -INFINITY) ? 0.f : mm;
                 const float f = exp2f(mmax[rr] - mu);
@@ -360,15 +424,15 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
             inv[rr] = Split ? 1.f : (lt > 0.f ? 1.f / lt : 0.f);
             if constexpr (Split) {
                 if (c == 0)
-                    stats[((size_t)b * q_heads + hg * 16 + r + rr * 8) * gridDim.z + blockIdx.z] =
+                    stats[((size_t)b * q_heads + hg * QueryHeads + r + rr * 8) * gridDim.z + blockIdx.z] =
                         make_float2(mmax[rr], lt);
             }
         }
         // lane holds, per row and 32-dim block j, dims 32j + 8c + {0..7}: q < 4 ->
         // o_acc[4j+q][2rr], else [4j+q-4][2rr+1]
 #pragma unroll
-        for (int rr = 0; rr < 2; ++rr) {
-            const int head = hg * 16 + r + rr * 8;
+        for (int rr = 0; rr < QueryHeads / 8; ++rr) {
+            const int head = hg * QueryHeads + r + rr * 8;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 float v[8];
@@ -399,11 +463,11 @@ __device__ __forceinline__ void AttendRow(const __nv_bfloat16 *q, const FastllmN
 #endif
 }
 
-template <bool Split = false, int Groups = 1, bool Pack = false>
-__global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
-    Decode(const __nv_bfloat16 *q, const __grid_constant__ naive_attention_bulk::Batch batch, const float *sink,
+template <bool Split = false, int Groups = 1, bool Pack = false, class Batch = naive_attention_bulk::Batch, int QueryHeads = 16>
+__global__ void __launch_bounds__((NCW * Groups + NP) * 32, (Groups == 4 ? 1 : Groups))
+    Decode(const __nv_bfloat16 *q, const __grid_constant__ Batch batch, const float *sink,
            __nv_bfloat16 *out, int q_heads, float *parts, float2 *stats, FastllmMxfp8Activation packed, int firstRow) {
-    AttendRow<Split, Groups, false, Pack>(q, FastllmNaiveResolveDSARow(batch.rows[blockIdx.x]),
+    AttendRow<Split, Groups, false, Pack, QueryHeads>(q, FastllmNaiveResolveDSARow(naive_attention_bulk::BatchRow(batch, blockIdx.x)),
                              sink, out, q_heads, parts, stats, packed, firstRow);
 }
 
@@ -412,7 +476,7 @@ __global__ void __launch_bounds__((NCW * Groups + NP) * 32, Groups)
 // One warp reduces four adjacent output channels per lane.
 template<bool Packed>
 static __global__ void Merge(const float *parts, const float2 *stats, const float *sink, __nv_bfloat16 *out, int heads,
-                      int splits, FastllmMxfp8Activation packed) {
+                      int splits, FastllmMxfp8Activation packed, int firstRow = 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
     const int lane = threadIdx.x, head = blockIdx.x;
     const size_t row = size_t(blockIdx.y) * heads + head;
@@ -442,12 +506,12 @@ static __global__ void Merge(const float *parts, const float2 *stats, const floa
         values[i] = __float2bfloat16(acc[i] * inv);
         out[row * 128 + 4 * lane + i] = values[i];
     }
-    if constexpr (Packed) fastllm_mxfp8::StoreGroup(packed, blockIdx.y, head * 128 + 4 * lane, values);
+    if constexpr (Packed) fastllm_mxfp8::StoreGroup(packed, firstRow + blockIdx.y, head * 128 + 4 * lane, values);
 #endif
 }
 // The paired producer/consumer warp groups require the architecture-specific cubin.
-using DecodeKernel = void (*)(const __nv_bfloat16 *, naive_attention_bulk::Batch, const float *,
+template<class Batch> using DecodeKernel = void (*)(const __nv_bfloat16 *, Batch, const float *,
                               __nv_bfloat16 *, int, float *, float2 *, FastllmMxfp8Activation, int);
-DecodeKernel PairedDecodeKernel(bool pack);
+template<class Batch = naive_attention_bulk::Batch> DecodeKernel<Batch> GroupedDecodeKernel(bool pack, bool fp4);
 } // namespace blackwell_decode
 #endif

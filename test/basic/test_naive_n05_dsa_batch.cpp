@@ -3,6 +3,7 @@
 #endif
 #include "devices/cuda/fastllm-cuda.cuh"
 #include "devices/cuda/naive-n05-cuda.cuh"
+#include "devices/cuda/naive-n05-dp-dsa-verify.cuh"
 #include "fastllm.h"
 #include "utils/utils.h"
 #include <algorithm>
@@ -269,10 +270,10 @@ static void Test(int batch, int heads, int kvHeads, int dim, int vd, int capacit
 // Replace and reorder KV behind one captured graph. The original addresses
 // remain valid but contain different values, so stale kernel parameters cannot
 // pass this test accidentally.
-static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false, bool contiguousSelection = false, bool fp8 = false, int sharedQueries = 1, int heads = 8, int kvHeads = 1) {
-    const int dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = kvHeads * dim + 128;
+static void TestRebinding(int batch, int capacity, bool sparse, bool generic = false, bool contiguousSelection = false, bool fp8 = false, int sharedQueries = 1, int heads = 8, int kvHeads = 1, bool fp4 = false, int expectedKernels = 0) {
+    const int dim = generic ? 128 : 192, vd = generic ? 256 : 128, stride = kvHeads * dim + (fp4 ? 0 : 128);
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), table(INT32), maps(INT32), actual, expected;
-    const bool useMaps = !generic && !contiguousSelection && !fp8 && sharedQueries == 1 && FastllmCudaNaiveDSAMapsSupported();
+    const bool useMaps = !generic && !contiguousSelection && !fp8 && !fp4 && sharedQueries == 1 && FastllmCudaNaiveDSAMapsSupported();
     std::vector<unsigned char> hostMaps(batch * FastllmNaiveDSAMapBytes);
     maps.Resize({(int)hostMaps.size() / (int)sizeof(int)});
     maps.ToDevice(DataDevice::CUDA, {0}, false); maps.Allocate();
@@ -281,12 +282,29 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
     live.Resize({batch}); live.Allocate(); live.ToDevice(DataDevice::CUDA, {0}, false); live.Allocate();
     table.Resize({batch * 2 * (int)(sizeof(void *) / sizeof(int))});
     table.ToDevice(DataDevice::CUDA, {0}, false); table.Allocate();
-    std::vector<Data> keys(batch * 2, Data(fp8 ? FP8_E4M3 : BFLOAT16)), values(batch * 2, Data(fp8 ? FP8_E4M3 : BFLOAT16));
+    const auto type = fp4 ? FP4_E2M1 : fp8 ? FP8_E4M3 : BFLOAT16;
+    std::vector<Data> keys(batch * 2, Data(type)), values(batch * 2, Data(type));
     std::vector<Data> indices(batch, Data(INT32));
     std::vector<void *> pointers(batch * 2);
     std::vector<FastllmNaiveDSARow> rows(batch), direct(batch);
     std::vector<int> lengths(batch, capacity);
     auto uploadCache = [&](Data &data, std::vector<int> dims, unsigned state) {
+        if (fp4) {
+            data.Resize(dims); data.Allocate();
+            const int width = dims.back();
+            auto *dst = (uint8_t *)data.cpuData;
+            for (int row = 0; row < capacity; ++row) {
+                for (int i = 0; i < width / 2; ++i) {
+                    state = state * 1664525u + 1013904223u;
+                    dst[i] = state >> 24;
+                }
+                for (int block = 0; block < width / 16; ++block)
+                    dst[width / 2 + block] = (row + block) % 56;
+                dst += width / 16 * 9;
+            }
+            data.ToDevice(CUDA, {0}, true);
+            return;
+        }
         if (!fp8) { Upload(data, dims, state); return; }
         data.Resize(dims); data.Allocate();
         for (size_t i = 0; i < data.Count(0); ++i) {
@@ -308,7 +326,7 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
     }
     for (int i = 0; i < batch; ++i) {
         auto &r = rows[i];
-        r.key = keys[i].cudaData; r.value = values[i].cudaData; r.fp8 = fp8;
+        r.key = keys[i].cudaData; r.value = values[i].cudaData; r.fp8 = fp8; r.fp4 = fp4;
         r.liveKeys = (const int *)live.cudaData + i;
         r.capacity = capacity; r.keyStride = stride;
         r.cache = (const void *const *)table.cudaData + (i / sharedQueries) * 2;
@@ -336,7 +354,25 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
     Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
     FastllmNaiveDecodeScratch scratch, referenceScratch;
     Graph graph;
-    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(q, sink, rows, heads, kvHeads, dim, vd, scratch, actual); });
+    graph.Capture([&] {
+        if (fp4 || expectedKernels) Require(FastllmCudaNaiveOnlineDSADecode(q, sink, rows, heads, kvHeads, dim, vd,
+                                                         scratch, actual), "online DSA decode not admitted");
+        else FastllmCudaNaiveBatchDSADecode(q, sink, rows, heads, kvHeads, dim, vd, scratch, actual);
+    });
+    if (expectedKernels) {
+        size_t count = 0;
+        auto captured = static_cast<cudaGraph_t>(graph.graph);
+        Cuda(cudaGraphGetNodes(captured, nullptr, &count));
+        std::vector<cudaGraphNode_t> nodes(count);
+        Cuda(cudaGraphGetNodes(captured, nodes.data(), &count));
+        int kernels = 0;
+        for (auto node : nodes) {
+            cudaGraphNodeType type;
+            Cuda(cudaGraphNodeGetType(node, &type));
+            kernels += type == cudaGraphNodeTypeKernel;
+        }
+        Require(kernels == expectedKernels, "unexpected number of paged decode launches");
+    }
     for (int pass = 0; pass < 3; ++pass) {
         for (int i = 0; i < batch; ++i) {
             int source = pass == 0 ? batch - i - 1 : batch + (i + pass) % batch;
@@ -354,7 +390,13 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
         graph.Run();
         std::vector<uint16_t> b;
         const bool sharedHeads = heads == 16 || kvHeads > 1;
-        if (sharedHeads) {
+        if (expectedKernels) {
+            // Direct bindings select the original per-row descriptor ABI. Both
+            // grids use identical attention arithmetic, including inactive rows.
+            Require(FastllmCudaNaiveOnlineDSADecode(q, sink, direct, heads, kvHeads, dim, vd,
+                                                     referenceScratch, expected), "direct decode reference unavailable");
+            b = Read<uint16_t>(expected);
+        } else if (sharedHeads) {
             b.reserve((size_t)batch * heads * vd);
             // Multiple KV groups use the independent small-batch fallback.
             // Its reduction differs from the bulk path; keep the original
@@ -377,6 +419,7 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
             b = Read<uint16_t>(expected);
         }
         auto a = Read<uint16_t>(actual);
+        if (expectedKernels) Require(a == b, "compact decode changed output bits after KV rebinding");
         if (heads == 16 && kvHeads == 1) Require(a == b, "shared-head chunking changed fallback output bits");
         if (kvHeads == 1 && (contiguousSelection || sharedQueries > 1))
             Require(a == b, "compact attention changed output bits after rebinding");
@@ -388,7 +431,7 @@ static void TestRebinding(int batch, int capacity, bool sparse, bool generic = f
             Require(delta <= tolerance, "indirect DSA element error");
             error += delta * delta; norm += (double)Float(b[i]) * Float(b[i]);
         }
-        Require(std::sqrt(error / std::max(norm, 1e-30)) <= .003, "indirect DSA relative error");
+        Require(std::sqrt(error / std::max(norm, 1e-30)) <= (fp4 ? .006 : .003), "indirect DSA relative error");
         ++checks;
     }
     std::printf("KV REBIND PASS batch=%d capacity=%d sparse=%d generic=%d\n", batch, capacity, sparse, generic);
@@ -500,8 +543,8 @@ static void TestSharedIndexerQueries(int requests, int width) {
     }
 }
 
-static void TestVerifySwa(int requests, int width, bool fp8) {
-    const int heads = 8, batch = requests * width, capacity = 128 + width;
+static void TestVerifySwa(int requests, int width, bool fp8, int kvHeads = 1) {
+    const int heads = kvHeads * 8, batch = requests * width, capacity = 128 + width;
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), actual, none;
     Upload(q, {1, batch, heads * 192}, 791); Upload(sink, {heads}, 357);
     live.Resize({batch}); live.ToDevice(DataDevice::CUDA, {0}, false); live.Allocate();
@@ -520,7 +563,7 @@ static void TestVerifySwa(int requests, int width, bool fp8) {
     std::vector<FastllmNaiveSWARow> rows(batch);
     std::vector<int> lengths(batch);
     for (int r = 0; r < requests; ++r) {
-        upload(keys[r], 192, 451 + r); upload(values[r], 128, 717 + r);
+        upload(keys[r], kvHeads * 192, 451 + r); upload(values[r], kvHeads * 128, 717 + r);
         for (int j = 0; j < width; ++j) {
             auto &row = rows[r * width + j];
             row.key = keys[r].cudaData; row.value = values[r].cudaData;
@@ -530,11 +573,13 @@ static void TestVerifySwa(int requests, int width, bool fp8) {
     }
     Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
     Graph graph;
-    graph.Capture([&] { FastllmCudaNaiveBatchSWADecode(q, sink, rows, live, heads, 1, actual); });
+    graph.Capture([&] { FastllmCudaNaiveBatchSWADecode(q, sink, rows, live, heads, kvHeads, actual); });
     for (int prefix : {0, 123, 127, 128, 707}) {
         for (int r = 0; r < requests; ++r) for (int j = 0; j < width; ++j) {
             const int i = r * width + j;
             lengths[i] = prefix + r % 5 + j + 1;
+            if (fp8 && width == 8 && prefix == 707 && r % 4 == 0)
+                lengths[i] = j % 3 == 0 ? 0 : (j % 2 ? 2 : 136);
             rows[i].length = lengths[i];
         }
         Cuda(cudaMemcpy(live.cudaData, lengths.data(), batch * sizeof(int), cudaMemcpyHostToDevice));
@@ -545,7 +590,7 @@ static void TestVerifySwa(int requests, int width, bool fp8) {
             query.Resize({1, 1, heads * 192}); query.FakeFrom(q, (size_t)i * heads * 192 * 2);
             // One-row calls select the unchanged scalar kernel, independent of
             // the bulk ring addressing. Check all candidates around wrap.
-            FastllmCudaNaiveBatchSWADecode(query, sink, {rows[i]}, none, heads, 1, expected);
+            FastllmCudaNaiveBatchSWADecode(query, sink, {rows[i]}, none, heads, kvHeads, expected);
             auto reference = Read<uint16_t>(expected);
             for (size_t j = 0; j < reference.size(); ++j) {
                 double ref = Float(reference[j]), delta = Float(result[(size_t)i * heads * 128 + j]) - ref;
@@ -556,7 +601,7 @@ static void TestVerifySwa(int requests, int width, bool fp8) {
         Require(std::sqrt(error / std::max(norm, 1e-20)) < .004, "verification SWA relative error");
         // Eager boundary forwards use host lengths; their output must agree
         // with the captured dynamic-length path bit for bit.
-        FastllmCudaNaiveBatchSWADecode(q, sink, rows, none, heads, 1, actual);
+        FastllmCudaNaiveBatchSWADecode(q, sink, rows, none, heads, kvHeads, actual);
         Require(result == Read<uint16_t>(actual), "verification SWA eager/graph differs");
         ++checks;
     }
@@ -640,7 +685,23 @@ int main(int argc, char **argv) {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        if (argc > 1 && std::strcmp(argv[1], "swa_verify8") == 0) {
+            TestVerifySwa(32, 8, true, 8);
+            return 0;
+        }
+        if (argc > 1 && std::strcmp(argv[1], "fp8_bound_decode") == 0) {
+            for (int rows : {512, 1025})
+                TestRebinding(rows, 129, true, false, true, true, 8, 64, 4, false, rows == 512 ? 1 : 2);
+            return 0;
+        }
+        if (argc > 1 && std::strcmp(argv[1], "fp4_decode") == 0) {
+            if (!FastllmCudaHasGroupedFP4DSADecode()) return 77;
+            TestRebinding(65, 257, true, false, true, false, 8, 64, 4, true);
+            return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "wide_heads") == 0) {
+            if (FastllmCudaHasGroupedFP4DSADecode())
+                TestRebinding(65, 257, true, false, true, false, 8, 64, 4, true);
             for (int heads : {32, 64})
                 for (int batch : {31, 32, 63, 64, 128, 256, 513})
                     TestRebinding(batch, 257, true, false, false, true, 1, heads, heads / 16);

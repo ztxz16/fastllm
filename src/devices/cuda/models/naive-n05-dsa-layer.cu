@@ -98,7 +98,7 @@ struct PackOutputGroup {
             g.scales[row] = __uint_as_float(exponent << 23);
     }
 };
-template <bool Pack> __device__ void NormalizeOwner(const Args &a, int row, B *scratch) {
+template <bool Pack, int FirstRow = 0> __device__ void NormalizeOwner(const Args &a, int row, B *scratch) {
     const int t = threadIdx.x;
     const int lane = t % 32;
     __shared__ float sums[8];
@@ -152,11 +152,27 @@ template <bool Pack> __device__ void NormalizeOwner(const Args &a, int row, B *s
         *reinterpret_cast<uint4 *>(a.normed + row * 4096 + k) = norm;
         if constexpr (Pack) {
             const auto packed = fastllm_mxfp8_projection::Quantize(norm);
-            auto &group = ActivationGroups(a)[k / 32];
+            auto &group = ActivationGroups(a)[FirstRow / 8 * 128 + k / 32];
             group.values[row][t % 4] = packed.values;
             if (!(t % 4)) group.scales[row] = packed.scale;
         }
     }
+}
+// Narrow one-row Linear consumes BF16 activations. Preserve that quantization
+// boundary for both projections, including when the attention KV is FP8.
+template<int Width, class Emit>
+__device__ void ProjectGemv(const B *input, const void *weight, const float *scales, int column, Emit emit) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    for (int out = warp; out < 32; out += blockDim.x / 32) {
+        const size_t start = size_t(column + out) * Width;
+        const auto *w = static_cast<const __nv_fp8_e4m3 *>(weight) + start;
+        float acc = 0.f;
+        for (int k = lane; k < Width; k += 32)
+            acc = fmaf(float(input[k]), float(w[k]) * scales[(start+k)/32], acc);
+        acc = WarpSum(acc);
+        if (!lane) emit(out, 0, acc);
+    }
+    __syncthreads();
 }
 // A CTA owns two 16-output tiles with four K partitions per tile. The
 // Indexer uses its original BF16 weights; only the QKV/O tiles use MXFP8.
@@ -229,7 +245,9 @@ template <int Rows, bool Mx> __device__ void Project(const Args &a, int first, P
         if (blockIdx.x < 58) {
             const int column = blockIdx.x*32;
             auto output = [&](int col, int row, float value) { emit(column+col,row,value); };
-            ProjectMx<4096, true>(a.qkvWeight, a.qkvScales, column, s.input, s.partial, output,
+            if (a.mxfp8Gemv)
+                ProjectGemv<4096>(a.normed, a.qkvWeight, a.qkvScales, column, output);
+            else ProjectMx<4096, true>(a.qkvWeight, a.qkvScales, column, s.input, s.partial, output,
                                   ActivationGroups(a), a.rows);
         } else {
             project_rows_mma<Rows,4096,4,2,12>(1856,137,pointer,s.input,s.partial,emit,int(blockIdx.x)-58);
@@ -238,7 +256,7 @@ template <int Rows, bool Mx> __device__ void Project(const Args &a, int first, P
 }
 
 enum class PublishPart { Qkv, IndexKey, IndexQuery };
-template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPart part) {
+template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPart part, int firstRow = 0) {
     const int t = threadIdx.x;
     auto r = FastllmNaiveResolveDSARow(a.bindings[row]);
     int length = r.liveKeys ? *r.liveKeys : r.length;
@@ -249,11 +267,11 @@ template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPa
         }
         return;
     }
-    const B *raw = (const B *)(a.workspace + Layout::Qkv) + row * 1856;
-    B *iq = (B *)(a.workspace + Layout::IndexQuery) + row * 2048;
+    const B *raw = (const B *)(a.workspace + Layout::Qkv) + (firstRow + row) * 1856;
+    B *iq = (B *)(a.workspace + Layout::IndexQuery) + (firstRow + row) * 2048;
     const int lane = t % 32, warp = t / 32;
     if (part == PublishPart::IndexKey)
-        NormalizeIndex((B *)(a.workspace + Layout::IndexKey) + row * 128, a.indexNorm, a.indexBias);
+        NormalizeIndex((B *)(a.workspace + Layout::IndexKey) + (firstRow + row) * 128, a.indexNorm, a.indexBias);
     __shared__ float cosine[32], sine[32];
     __shared__ B index[128];
     if (t < 32) {
@@ -272,23 +290,29 @@ template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPa
         __syncthreads();
         return;
     }
-    B *k = (B *)r.key + size_t(FastllmNaivePhysicalRow(r, length - 1)) * r.keyStride;
+    const auto keyOffset = size_t(FastllmNaivePhysicalRow(r, length - 1)) * r.keyStride;
+    B *k = (B *)r.key + keyOffset;
     if (part == PublishPart::Qkv) {
         if (warp < 8)
             RotateWarp(raw + warp * 192, a.query + row * 1536 + warp * 192, 192, cs, sn);
-        else if (warp == 8)
-            RotateWarp(raw + 1536, k, 192, cs, sn);
+        else if (warp == 8) {
+            if (r.fp8) RotateWarp(raw + 1536, (__nv_fp8_e4m3 *)r.key + keyOffset, 192, cs, sn);
+            else RotateWarp(raw + 1536, k, 192, cs, sn);
+        }
         else if (warp == 9) {
-            B *v = (B *)r.value + size_t(FastllmNaivePhysicalRow(r, length - 1, true)) * 128;
+            auto v = FastllmNaiveKVWriteRow{const_cast<void *>(r.value), r.fp8} + size_t(FastllmNaivePhysicalRow(r, length - 1, true)) * 128;
             for (int col = lane; col < 128; col += 32)
                 v[col] = __float2bfloat16_rn(float(raw[1728 + col]) * Round(a.valueScale));
         }
         return;
     }
     if (warp == 0)
-        RotateWarp((B *)(a.workspace + Layout::IndexKey) + row * 128, index, 128, cs, sn);
+        RotateWarp((B *)(a.workspace + Layout::IndexKey) + (firstRow + row) * 128, index, 128, cs, sn);
     __syncthreads();
-    if constexpr (Fp8Key) {
+    if (r.fp8) {
+        auto *out = (__nv_fp8_e4m3 *)r.key + keyOffset + 192;
+        if (t < 128) out[t] = __nv_fp8_e4m3(float(index[t]));
+    } else if constexpr (Fp8Key) {
         // Reduce the 128 Indexer values, then publish the per-row FP8 scale.
         __shared__ float maxima[12];
         float x = t < 128 ? float(index[t]) : 0.f, maximum = fabsf(x);
@@ -314,33 +338,14 @@ template <bool Fp8Key> __device__ void Publish(const Args &a, int row, PublishPa
     __syncthreads();
 }
 
-template <int Rows, bool Mx, bool SplitOutput = false>
-__device__ void Tail(const Args &a, int first, TailStorage<Rows> &s) {
-    using namespace fastllm_dsa_projection;
+template <int Rows, bool SplitOutput>
+__device__ void ReduceTail(const Args &a, int first, TailStorage<Rows> &s, int totalRows) {
     using namespace fastllm_swa_output;
     const int t = threadIdx.x, col = blockIdx.x * 32;
-    if (blockIdx.x >= 128)
-        return;
-    if constexpr (!SplitOutput) {
-        if (Rows == 8 && (reinterpret_cast<uintptr_t>(a.attention) & 15) == 0) {
-            LoadProjectionInput<Rows, 1024>(a.attention + size_t(first) * 1024, a.rows - first, s.input);
-        } else {
-            for (int i = t; i < Rows * 1024; i += Threads)
-                s.input[(i / (8 * 1024)) * 8 * 1024 + fastllm_dsa_projection::input_offset((i / 1024) % 8, i % 1024)] =
-                    first + i / 1024 < a.rows ? a.attention[first * 1024 + i] : __float2bfloat16_rn(0.f);
-            __syncthreads();
-        }
-    }
-    auto pointer = [&](int column) { return a.outputWeight + size_t(col + column) * 1024; };
-    auto emit = [&](int column, int row, float value) { s.local[row][column] = __float2bfloat16_rn(value); };
-    // Two tiles share each attention load. Four K splits retain FP32 accumulation.
-    if constexpr (SplitOutput) ProjectMx<1024, true>(a.outputWeight, a.outputScales, col, s.input, s.partial, emit, OutputGroups(a), 8);
-    else if constexpr (Mx) ProjectMx<1024>(a.outputWeight,a.outputScales,col,s.input,s.partial,emit);
-    else project_rows_mma<Rows, 1024, 4, 2, 12>(0, 2, pointer, s.input, s.partial, emit, 0);
     // Reuse the established eight-row mailbox generations. Projection weights
     // are shared across sixteen rows; collective storage does not grow.
-    for (int base = 0; base < Rows && first + base < a.rows; base += 8) {
-      const int rows = min(8, a.rows - first - base);
+    for (int base = 0; base < Rows && first + base < totalRows; base += 8) {
+      const int rows = min(8, totalRows - first - base);
         if constexpr (SplitOutput) {
             if (a.rank >= 0) {
                 if (t < rows) {
@@ -449,6 +454,35 @@ __device__ void Tail(const Args &a, int first, TailStorage<Rows> &s) {
     }
 }
 
+template <int Rows, bool Mx, bool SplitOutput = false>
+__device__ void Tail(const Args &a, int first, TailStorage<Rows> &s) {
+    using namespace fastllm_dsa_projection;
+    using namespace fastllm_swa_output;
+    const int t = threadIdx.x, col = blockIdx.x * 32;
+    if (blockIdx.x >= 128)
+        return;
+    if constexpr (!SplitOutput) {
+        if (Rows == 8 && (reinterpret_cast<uintptr_t>(a.attention) & 15) == 0) {
+            LoadProjectionInput<Rows, 1024>(a.attention + size_t(first) * 1024, a.rows - first, s.input);
+        } else {
+            for (int i = t; i < Rows * 1024; i += Threads)
+                s.input[(i / (8 * 1024)) * 8 * 1024 + fastllm_dsa_projection::input_offset((i / 1024) % 8, i % 1024)] =
+                    first + i / 1024 < a.rows ? a.attention[first * 1024 + i] : __float2bfloat16_rn(0.f);
+            __syncthreads();
+        }
+    }
+    auto pointer = [&](int column) { return a.outputWeight + size_t(col + column) * 1024; };
+    auto emit = [&](int column, int row, float value) { s.local[row][column] = __float2bfloat16_rn(value); };
+    // Two tiles share each attention load. Four K splits retain FP32 accumulation.
+    if constexpr (SplitOutput) ProjectMx<1024, true>(a.outputWeight, a.outputScales, col, s.input, s.partial, emit, OutputGroups(a), a.rows);
+    else if constexpr (Mx) {
+        if (a.mxfp8Gemv) ProjectGemv<1024>(a.attention, a.outputWeight, a.outputScales, col, emit);
+        else ProjectMx<1024>(a.outputWeight,a.outputScales,col,s.input,s.partial,emit);
+    }
+    else project_rows_mma<Rows, 1024, 4, 2, 12>(0, 2, pointer, s.input, s.partial, emit, 0);
+    ReduceTail<Rows, SplitOutput>(a, first, s, a.rows);
+}
+
 struct CoreView {
     const B *query, *indexQuery, *weights;
     const float *sink;
@@ -470,7 +504,7 @@ __device__ CoreView CoreArguments(const Args &a, int offset, int request) {
     core.indexStride = a.bindings[offset].keyStride;
     core.indexCache = a.bindings[offset].cache;
     core.indexKey =
-        FastllmNaiveKV(a.bindings[offset].key, a.bindings[offset].keyPages, a.bindings[offset].pageLen);
+        FastllmNaiveKV(a.bindings[offset].key, a.bindings[offset].keyPages, a.bindings[offset].pageLen, a.bindings[offset].fp8);
     core.indexKey.scaledIndexer = a.fp8Key;
     core.output = a.attention + offset * 1024;
     core.workspace = a.coreWorkspace;
@@ -615,8 +649,11 @@ template <bool Fp8Key, int Rows = 8, bool PairedAttention = false, bool Mx = fal
         int offset = 0;
         for (int request = 0; request < a.requestCount; ++request) {
             CoreView core = CoreArguments(a, offset, request);
-            fastllm_dsa_fused::Body<Fp8Key, false>::run(core, s.core, request + 1 == a.requestCount,
-                                                        a.requestCount == 1);
+            using Body = fastllm_dsa_fused::Body<Fp8Key, false>;
+            if constexpr (Fp8Key && Mx) {
+                if (a.bindings[offset].fp8) Body::template run<true,8>(core, s.core, request + 1 == a.requestCount, a.requestCount == 1);
+                else Body::run(core, s.core, request + 1 == a.requestCount, a.requestCount == 1);
+            } else Body::run(core, s.core, request + 1 == a.requestCount, a.requestCount == 1);
             grid.sync();
             offset += a.requests[request];
         }
@@ -633,7 +670,7 @@ using SplitLayout = SplitBody::Scratch;
 constexpr int FallbackOffset = SplitLayout::kRadixControlOffset + 9 * sizeof(int);
 static_assert(FallbackOffset + 8 * sizeof(unsigned) <= SplitLayout::kAttentionTempOffset);
 // Each warp owns a complete head; rotating and packing use the same BF16 rounding as Publish.
-__device__ void RotateAndPack(const Args &a, int row) {
+template<bool FP8> __device__ void RotateAndPack(const Args &a, int row, int firstRow = 0) {
     using S = SplitBody::Scratch;
     auto r = FastllmNaiveResolveDSARow(a.bindings[row]);
     const int length = r.liveKeys ? *r.liveKeys : r.length;
@@ -644,7 +681,7 @@ __device__ void RotateAndPack(const Args &a, int row) {
     sincosf(angle, &sn, &cs);
     cs = Round(cs);
     sn = Round(sn);
-    auto *base = (B *)(a.workspace + Layout::IndexQuery) + row * 2048;
+    auto *base = (B *)(a.workspace + Layout::IndexQuery) + (firstRow + row) * 2048;
     auto *packed = (B *)(a.coreWorkspace + S::kIqPackedOffset);
     auto *scales = (float *)(a.coreWorkspace + S::kIndexWeightsScaledOffset);
     for (int h = warp; h < 16; h += Threads / 32) {
@@ -666,13 +703,14 @@ __device__ void RotateAndPack(const Args &a, int row) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             __nv_fp8_e4m3 q(fmaxf(-448.f, fminf(448.f, vals[i] / scale)));
-            packed[SplitBody::ImageOffset(v, 32 * i + lane, 128) / 2] = __float2bfloat16(float(q));
+            if constexpr (FP8) reinterpret_cast<uint8_t *>(packed)[fastllm_dsa_fused::Body<true,false>::ImageOffset(v,32*i+lane,128)] = q.__x;
+            else packed[SplitBody::ImageOffset(v, 32 * i + lane, 128) / 2] = __float2bfloat16(float(q));
         }
         if (!lane)
             scales[v] = scale;
     }
 }
-__device__ void WriteIndexKeyWarp(const Args &a, int row) {
+__device__ void WriteIndexKeyWarp(const Args &a, int row, int firstRow = 0) {
     if (threadIdx.x >= 32)
         return;
     const int lane = threadIdx.x;
@@ -680,7 +718,7 @@ __device__ void WriteIndexKeyWarp(const Args &a, int row) {
     const int n = r.liveKeys ? *r.liveKeys : r.length;
     if (n <= 0 || n > r.capacity)
         return;
-    B *p = (B *)(a.workspace + Layout::IndexKey) + row * 128;
+    B *p = (B *)(a.workspace + Layout::IndexKey) + (firstRow + row) * 128;
     float v[4], sq[2], sum[2];
 #pragma unroll
     for (int i = 0; i < 4; i++)
@@ -707,7 +745,7 @@ __device__ void WriteIndexKeyWarp(const Args &a, int row) {
     sincosf(a.positions[row] * powf(a.theta, -2.f * lane / 64.f), &sn, &cs);
     cs = Round(cs);
     sn = Round(sn);
-    B *out = (B *)r.key + size_t(FastllmNaivePhysicalRow(r, n - 1)) * r.keyStride + 192;
+    auto out = FastllmNaiveKVWriteRow{const_cast<void *>(r.key), r.fp8} + (size_t(FastllmNaivePhysicalRow(r, n - 1)) * r.keyStride + 192);
     out[lane] = __float2bfloat16(Round(v[0] * cs) - Round(v[1] * sn));
     out[32 + lane] = __float2bfloat16(Round(v[1] * cs) + Round(v[0] * sn));
     out[64 + lane] = __float2bfloat16(v[2]);
@@ -735,9 +773,9 @@ __device__ __forceinline__ void FrontWait(const unsigned *p, unsigned n) {
     }
     __syncthreads();
 }
-__device__ void ProjectPair(const Args &a, float *partial) {
+template <int Tiles = 1> __device__ void ProjectPair(const Args &a, float *partial, const Args *next = nullptr) {
     const int t = threadIdx.x, warp = t / 32, lane = t % 32, g = lane / 4, q = lane % 4, c = blockIdx.x;
-    float acc[4]{};
+    float acc[Tiles][4]{};
     if (warp < 4 && c < 116) {
         const int col = c * 16, first = warp * 1024;
 #pragma unroll 8
@@ -745,7 +783,8 @@ __device__ void ProjectPair(const Args &a, float *partial) {
             int k = kk + q * 8;
             fastllm_mxfp8_projection::WeightFragment w;
             w = fastllm_mxfp8_projection::LoadWeights(a.qkvWeight, a.qkvScales, 4096, col + g, col + g + 8, k);
-            PreparedStep(acc, w, ActivationGroups(a)[kk / 32], 8);
+            PreparedStep(acc[0], w, ActivationGroups(a)[kk / 32], a.rows);
+            if constexpr (Tiles == 2) PreparedStep(acc[1], w, ActivationGroups(*next)[128 + kk / 32], next->rows);
         }
     } else if (warp >= 4 && c < 137) {
 
@@ -759,53 +798,62 @@ __device__ void ProjectPair(const Args &a, float *partial) {
                 const int k = kk + q * 8;
                 uint4 a0 = __ldg((const uint4 *)(w + g * 4096 + k)),
                       a1 = __ldg((const uint4 *)(w + (g + 8) * 4096 + k));
-                uint4 x = __ldg((const uint4 *)(a.normed + g * 4096 + k));
-                fastllm_dsa_projection::mma_bf16_16816(acc, a0.x, a1.x, a0.y, a1.y, x.x, x.y);
-                fastllm_dsa_projection::mma_bf16_16816(acc, a0.z, a1.z, a0.w, a1.w, x.z, x.w);
+                #pragma unroll
+                for (int j = 0; j < Tiles; ++j) {
+                    const auto &tile = j == 0 ? a : *next;
+                    uint4 x = g < tile.rows ? __ldg((const uint4 *)(tile.normed + g * 4096 + k)) : make_uint4(0,0,0,0);
+                    fastllm_dsa_projection::mma_bf16_16816(acc[j], a0.x, a1.x, a0.y, a1.y, x.x, x.y);
+                    fastllm_dsa_projection::mma_bf16_16816(acc[j], a0.z, a1.z, a0.w, a1.w, x.z, x.w);
+                }
             }
         }
     }
-    if (warp < 8) {
-        float *p = partial + warp * 128 + g * 8 + q * 2;
-        p[0] = acc[0];
-        p[1] = acc[1];
-        p[64] = acc[2];
-        p[65] = acc[3];
-    }
-    __syncthreads();
-    if (t < 256) {
-        int tile = t / 128, out = t % 128 / 8, row = t % 8;
-        float v = 0;
-#pragma unroll
-        for (int k = 0; k < 4; k++)
-            v += partial[(tile * 4 + k) * 128 + out * 8 + row];
-        int col = c * 16 + out;
-        if (!tile && c < 116)
-            ((B *)(a.workspace + Layout::Qkv))[row * 1856 + col] = __float2bfloat16(v);
-        if (tile && c < 137) {
-            if (c < 8)
-                ((B *)(a.workspace + Layout::IndexKey))[row * 128 + col] = __float2bfloat16(v);
-            else if (c < 136)
-                ((B *)(a.workspace + Layout::IndexQuery))[row * 2048 + col - 128] = __float2bfloat16(v);
-            else
-                ((B *)(a.workspace + Layout::IndexWeight))[row * 16 + out] = __float2bfloat16(Round(v) * .25f);
+    #pragma unroll
+    for (int j = 0; j < Tiles; ++j) {
+        const auto &tileArgs = j == 0 ? a : *next;
+        if (warp < 8) {
+            float *p = partial + warp * 128 + g * 8 + q * 2;
+            p[0] = acc[j][0];
+            p[1] = acc[j][1];
+            p[64] = acc[j][2];
+            p[65] = acc[j][3];
         }
+        __syncthreads();
+        if (t < 256 && t % 8 < tileArgs.rows) {
+            int tile = t / 128, out = t % 128 / 8, row = (j ? a.rows : 0) + t % 8;
+            float v = 0;
+    #pragma unroll
+            for (int k = 0; k < 4; k++)
+                v += partial[(tile * 4 + k) * 128 + out * 8 + (t % 8)];
+            int col = c * 16 + out;
+            if (!tile && c < 116)
+                ((B *)(tileArgs.workspace + Layout::Qkv))[row * 1856 + col] = __float2bfloat16(v);
+            if (tile && c < 137) {
+                if (c < 8)
+                    ((B *)(tileArgs.workspace + Layout::IndexKey))[row * 128 + col] = __float2bfloat16(v);
+                else if (c < 136)
+                    ((B *)(tileArgs.workspace + Layout::IndexQuery))[row * 2048 + col - 128] = __float2bfloat16(v);
+                else
+                    ((B *)(tileArgs.workspace + Layout::IndexWeight))[row * 16 + out] = __float2bfloat16(Round(v) * .25f);
+            }
+        }
+        __syncthreads();
     }
-    __syncthreads();
 }
 
 // One query block covers at most four key tiles per CTA on the admitted grid.
 // The first three use the sweep ring. Only shared memory is needed for the fourth.
 constexpr int ScoreTileRows = SplitBody::SweepStorage::kTileM;
 constexpr int MaxScoreTiles = 4;
-constexpr int SplitScoreBytes = sizeof(Storage<false>) + SplitBody::SweepStorage::kTileBytes;
+template<bool FP8> constexpr int SplitScoreBytes = sizeof(Storage<FP8>) + fastllm_dsa_fused::Body<FP8,false>::SweepStorage::kTileBytes;
 static_assert(SplitLayout::kMaxSeqLen <= (143 - 2) * ScoreTileRows * MaxScoreTiles);
 
-__global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant__ Args a) {
+template<bool FP8> __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant__ Args a) {
     extern __shared__ __align__(1024) unsigned char bytes[];
-    auto &s = *reinterpret_cast<Storage<false> *>(bytes);
-    auto *fourth = bytes + sizeof(Storage<false>);
-    using Sweep = SplitBody::SweepStorage;
+    using Body = fastllm_dsa_fused::Body<FP8,false>;
+    auto &s = *reinterpret_cast<Storage<FP8> *>(bytes);
+    auto *fourth = bytes + sizeof(Storage<FP8>);
+    using Sweep = typename Body::SweepStorage;
     // The RMS row and projection partials use the beginning of B storage before
     // the packed query arrives. Historical key loads can fill all A slots.
     static_assert(offsetof(Sweep, a_ring) >= 4096 * sizeof(B));
@@ -814,7 +862,8 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
 #pragma unroll
     for (int row = 0; row < 8; ++row) {
         const auto &binding = a.bindings[row];
-        const int length = max(0, min(binding.capacity, binding.liveKeys ? *binding.liveKeys : binding.length));
+        const int length = row < a.rows ? max(0, min(binding.capacity, binding.liveKeys ? *binding.liveKeys : binding.length)) : 0;
+        if (row >= a.rows) continue;
         earliest = min(earliest, length);
         latest = max(latest, length);
     }
@@ -835,14 +884,16 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
         key.Bind(view.indexCache);
         for (int j = 0; j < prepared; ++j) {
             const int token = (first + j * stride) * ScoreTileRows;
-            auto *dest = SplitBody::score_tile_image(s.core.sweep, fourth, j);
-            const B *base = static_cast<const B *>(key.IndexRow(token, view.indexStride).data);
+            auto *dest = Body::score_tile_image(s.core.sweep, fourth, j);
+            using Element = std::conditional_t<FP8, uint8_t, B>;
+            const Element *base = static_cast<const Element *>(key.IndexRow(token, view.indexStride).data);
             const bool singlePage = !key.pages || key.pageLen % ScoreTileRows == 0;
-            for (int i = threadIdx.x; i < ScoreTileRows * 16; i += Threads) {
-                const int row = i / 16, dim = i % 16 * 8;
-                const B *src = singlePage ? base + row * view.indexStride
-                    : static_cast<const B *>(key.IndexRow(token + row, view.indexStride).data);
-                SplitBody::cp_async_16(dest + SplitBody::ImageOffset(row, dim, ScoreTileRows), src + dim, 16);
+            constexpr int chunks = 128 * sizeof(Element) / 16;
+            for (int i = threadIdx.x; i < ScoreTileRows * chunks; i += Threads) {
+                const int row = i / chunks, dim = i % chunks * (16 / sizeof(Element));
+                const Element *src = singlePage ? base + row * view.indexStride
+                    : static_cast<const Element *>(key.IndexRow(token + row, view.indexStride).data);
+                Body::cp_async_16(dest + Body::ImageOffset(row, dim, ScoreTileRows), src + dim, 16);
             }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
@@ -859,7 +910,7 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
     if (c == 0 && threadIdx.x < 8) {
         int row = threadIdx.x;
         const auto &binding = a.bindings[row];
-        const int visible = max(0, min(binding.capacity, binding.liveKeys ? *binding.liveKeys : binding.length));
+        const int visible = row < a.rows ? max(0, min(binding.capacity, binding.liveKeys ? *binding.liveKeys : binding.length)) : 0;
         auto *lengths = reinterpret_cast<int *>(a.coreWorkspace + SplitLayout::kRadixControlOffset);
         lengths[row] = visible;
         int longest = __reduce_max_sync(0xffu, visible);
@@ -885,24 +936,24 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
         FrontSignal(ready);
     if (c < 137)
         FrontSignal(c < 8 ? ready + 1 : ready + 2);
-    if (c < 8) {
+    if (c < a.rows) {
         FrontWait(ready, 116);
         Publish<false>(a, c, PublishPart::Qkv);
     }
-    if (c >= 127 && c < 135) {
+    if (c >= 127 && c < 127 + a.rows) {
         FrontWait(ready + 2, 129);
-        RotateAndPack(a, c - 127);
+        RotateAndPack<FP8>(a, c - 127);
         FrontSignal(ready + 3);
     }
-    if (c >= 135 && c < 143) {
+    if (c >= 135 && c < 135 + a.rows) {
         FrontWait(ready + 1, 8);
         WriteIndexKeyWarp(a, c - 135);
         FrontSignal(ready + 4);
     }
     // A CTA reading only historical keys can start as soon as its query is ready.
-    FrontWait(ready + 3, 8);
+    FrontWait(ready + 3, a.rows);
     if (prepared < tiles) {
-        FrontWait(ready + 4, 8);
+        FrontWait(ready + 4, a.rows);
     }
     if (prepared) {
         asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -914,12 +965,27 @@ __global__ __launch_bounds__(Threads, 1) void SplitScores(const __grid_constant_
     const int *lengths = (const int *)(ws + SplitLayout::kRadixControlOffset);
 
     if (tiles)
-        SplitBody::score_tiles(core, lengths, s.core.sweep, prepared, fourth, first, stride, tiles);
+        Body::score_tiles(core, lengths, s.core.sweep, prepared, fourth, first, stride, tiles);
 }
-template <bool DirectSelection>
+template <bool DirectSelection, bool FP8>
 __global__ __launch_bounds__(Threads, 1) void SplitAttentionOutput(const __grid_constant__ Args a) {
     extern __shared__ __align__(1024) unsigned char bytes[];
     auto &s = *reinterpret_cast<Storage<false> *>(bytes);
+    if constexpr (FP8) {
+        // The sparse stage occupies 8 rows x 16 partitions. The remaining
+        // resident CTAs can fetch the following O tiles before the grid joins.
+        if (blockIdx.x >= 128) {
+            const auto *w = reinterpret_cast<const uint8_t *>(a.outputWeight);
+            const auto *scales = reinterpret_cast<const uint8_t *>(a.outputScales);
+            const int first = (blockIdx.x - 128) * Threads + threadIdx.x;
+            const int stride = (gridDim.x - 128) * Threads;
+            for (int line = first; line < 4096 * 1024 / 128; line += stride) {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(w + line * 128));
+                if (line < 4096 * 1024 / 32 * sizeof(float) / 128)
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"(scales + line * 128));
+            }
+        }
+    }
     auto core = CoreArguments(a, 0, 0);
     unsigned char *ws = a.coreWorkspace;
     int *selections = DirectSelection ? const_cast<int *>(a.bindings[0].indices)
@@ -928,19 +994,19 @@ __global__ __launch_bounds__(Threads, 1) void SplitAttentionOutput(const __grid_
     unsigned *flags = (unsigned *)(temp + SplitLayout::kAttentionControlFloatOffset);
     const int t = threadIdx.x;
     if constexpr (!DirectSelection) {
-        for (int i = blockIdx.x * Threads + t; i < 8 * 2048; i += gridDim.x * Threads) {
+        for (int i = blockIdx.x * Threads + t; i < a.rows * 2048; i += gridDim.x * Threads) {
             const auto &r = core.rows[i / 2048];
             if (r.indices)
                 const_cast<int *>(r.indices)[i % 2048] = (r.liveKeys ? *r.liveKeys : r.length) > 0 ? selections[i] : -1;
         }
     }
-    if (blockIdx.x < 8 * 16) {
+    if (blockIdx.x < a.rows * 16) {
         const int row = blockIdx.x / 16;
         auto descriptor = core.rows[row];
         if (descriptor.indices)
             descriptor.indices = selections + row * 2048;
         fastllm_dsa_fused::native_attention::Attend<true, fastllm_dsa_fused::native_attention::Phase::Fused, 16, 64,
-                                                    128, true, DirectSelection>(
+                                                    128, true, DirectSelection, PackOutputGroup, 8, false, FP8 ? 8 : 16>(
             core.query, descriptor, core.sink, core.output, temp, flags, 8, 1, row, 0, blockIdx.x % 16, s.core.native,
             PackOutputGroup{OutputGroups(a)});
     }
@@ -949,7 +1015,9 @@ __global__ __launch_bounds__(Threads, 1) void SplitAttentionOutput(const __grid_
 }
 // Cache launch eligibility before capture. The pointer table and lengths remain
 // device inputs, so changing requests never changes the captured graph.
-static bool SplitAvailable(int device, bool directSelection = false) {
+#include "naive-n05-dsa-layer-pair.cuh"
+
+template<bool FP8 = false> static bool SplitAvailable(int device, bool directSelection = false) {
     struct Support {
         bool split, direct;
     };
@@ -960,15 +1028,15 @@ static bool SplitAvailable(int device, bool directSelection = false) {
             return false;
         constexpr int shared = sizeof(Storage<false>);
         auto resident = [=](const void *kernel) {
-            const int bytes = kernel == (const void *)SplitScores ? SplitScoreBytes : shared;
+            const int bytes = kernel == (const void *)SplitScores<FP8> ? SplitScoreBytes<FP8> : shared;
             int blocks = 0;
             return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) == cudaSuccess &&
                    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, Threads, bytes) == cudaSuccess &&
                    blocks >= 1;
         };
-        const bool admitted = resident((const void *)SplitScores) && resident((const void *)SplitAttentionOutput<false>) &&
+        const bool admitted = resident((const void *)SplitScores<FP8>) && resident((const void *)SplitAttentionOutput<false,FP8>) &&
                               cluster_sel::Supported(device);
-        const bool direct = admitted && resident((const void *)SplitAttentionOutput<true>);
+        const bool direct = admitted && resident((const void *)SplitAttentionOutput<true,FP8>);
         if (!direct)
             cudaGetLastError();
         found = cache.emplace(device, Support{admitted, direct}).first;
@@ -980,10 +1048,10 @@ static bool SplitAvailable(int device, bool directSelection = false) {
 static bool DirectSelections(const Args &a) {
     const uintptr_t base = reinterpret_cast<uintptr_t>(a.bindings[0].indices);
     const uintptr_t scratch = reinterpret_cast<uintptr_t>(a.coreWorkspace);
-    constexpr size_t bytes = 8 * 2048 * sizeof(int);
+    const size_t bytes = a.rows * 2048 * sizeof(int);
     if (!base || (base < scratch + SplitLayout::kBytes && scratch < base + bytes))
         return false;
-    for (int row = 0; row < 8; ++row) {
+    for (int row = 0; row < a.rows; ++row) {
         if (a.bindings[row].selectedCount != 2048 ||
             reinterpret_cast<uintptr_t>(a.bindings[row].indices) != base + row * 2048 * sizeof(int))
             return false;
@@ -991,24 +1059,24 @@ static bool DirectSelections(const Args &a) {
     return true;
 }
 
-static cudaError_t RunSplit(Args &args, int grid) {
+template<bool FP8 = false> static cudaError_t RunSplit(Args &args, int grid) {
     void *params[] = {&args};
     constexpr size_t shared = sizeof(Storage<false>);
     auto stream = cudaStreamPerThread;
-    const void *scores = (const void *)SplitScores;
-    cudaError_t error = cudaLaunchCooperativeKernel(scores, grid, Threads, params, SplitScoreBytes, stream);
+    const void *scores = (const void *)SplitScores<FP8>;
+    cudaError_t error = cudaLaunchCooperativeKernel(scores, grid, Threads, params, SplitScoreBytes<FP8>, stream);
     if (error != cudaSuccess)
         return error;
-    const bool direct = DirectSelections(args) && SplitAvailable(FastllmCudaGetDevice(), true);
+    const bool direct = DirectSelections(args) && SplitAvailable<FP8>(FastllmCudaGetDevice(), true);
     int *selected = direct ? const_cast<int *>(args.bindings[0].indices)
                            : reinterpret_cast<int *>(args.coreWorkspace + SplitLayout::kIndexSelectsOffset);
     error = cluster_sel::Launch(
                                (const float *)(args.coreWorkspace + SplitLayout::kIndexLogitsOffset), selected,
                                (unsigned *)(args.coreWorkspace + FallbackOffset),
-                               (const int *)(args.coreWorkspace + SplitLayout::kRadixControlOffset), stream);
+                               (const int *)(args.coreWorkspace + SplitLayout::kRadixControlOffset), stream, args.rows);
     if (error != cudaSuccess)
         return error;
-    const void *out = direct ? (const void *)SplitAttentionOutput<true> : (const void *)SplitAttentionOutput<false>;
+    const void *out = direct ? (const void *)SplitAttentionOutput<true,FP8> : (const void *)SplitAttentionOutput<false,FP8>;
     return cudaLaunchCooperativeKernel(out, grid, Threads, params, shared, stream);
 }
 
@@ -1034,9 +1102,9 @@ template <bool Fp8Key, int Rows = 8, bool PairedAttention = false, bool Mx = fal
         cudaGetLastError();
         return grids[device] = 0;
     }
-    if constexpr (Mx && !Fp8Key && Rows == 8) {
+    if constexpr (Mx && Rows == 8) {
         if (p.multiProcessorCount >= 143)
-            SplitAvailable(device);
+            SplitAvailable<Fp8Key>(device);
     }
     return grids[device] = p.multiProcessorCount;
 }
@@ -1051,14 +1119,18 @@ bool FastllmCudaNaiveDSALayerSupported() {
 }
 cudaError_t FastllmCudaNaiveDSALayerLaunch(FastllmNaiveDSALayerArgs args) {
     using namespace fastllm_dsa_layer;
+    if (args.qkvScales && args.rows > 8) return RunPairedSplit(args);
     if (args.qkvScales) {
-        int grid = args.fp8Key ? GridSize<true,8,false,true>() : GridSize<false,8,false,true>();
+        const bool fp8 = args.bindings[0].fp8;
+        int grid = args.fp8Key || fp8 ? GridSize<true,8,false,true>() : GridSize<false,8,false,true>();
         if (!grid || args.rows > 8) return cudaErrorNotSupported;
-        if (grid >= 143 && !args.fp8Key && args.phaseStop == 0 && args.rows == 8 && args.requestCount == 1 &&
-            args.bindings[0].capacity >= 16384 && SplitAvailable(FastllmCudaGetDevice()))
-            return RunSplit(args, grid);
-        const void *kernel = args.fp8Key ? (const void *)Layer<true,8,false,true> : (const void *)Layer<false,8,false,true>;
-        size_t bytes = args.fp8Key ? sizeof(Storage<true>) : sizeof(Storage<false>);
+        if (grid >= 143 && !args.mxfp8Gemv && !args.fp8Key && args.phaseStop == 0 && args.requestCount == 1 &&
+            args.bindings[0].capacity >= 16384) {
+            if (fp8 && SplitAvailable<true>(FastllmCudaGetDevice())) return RunSplit<true>(args, grid);
+            if (!fp8 && SplitAvailable(FastllmCudaGetDevice())) return RunSplit(args, grid);
+        }
+        const void *kernel = args.fp8Key || fp8 ? (const void *)Layer<true,8,false,true> : (const void *)Layer<false,8,false,true>;
+        size_t bytes = args.fp8Key || fp8 ? sizeof(Storage<true>) : sizeof(Storage<false>);
         void *params[] = {&args};
         return cudaLaunchCooperativeKernel(kernel,grid,Threads,params,bytes,cudaStreamPerThread);
     }
@@ -1070,10 +1142,8 @@ cudaError_t FastllmCudaNaiveDSALayerLaunch(FastllmNaiveDSALayerArgs args) {
                               : (args.fp8Key ? (const void *)Layer<true> : (const void *)Layer<false>);
     size_t bytes = wide ? (args.fp8Key ? sizeof(Storage<true, 16>) : sizeof(Storage<false, 16>))
                         : (args.fp8Key ? sizeof(Storage<true>) : sizeof(Storage<false>));
-    // Two full requests benefit from one 128-task production/fold wave.
-    // Ragged tiles retain the measured sixteen-split schedule; optional shared
-    // resource misses also use that path without changing global workspace.
-    if (wide && args.rows == 16 && args.requestCount == 2) {
+    // The eight-split schedule covers two requests in one wave, including a partial tile.
+    if (wide && args.requestCount == 2) {
         const int pairedGrid = args.fp8Key ? GridSize<true,16,true>() : GridSize<false,16,true>();
         if (pairedGrid) {
             grid=pairedGrid;

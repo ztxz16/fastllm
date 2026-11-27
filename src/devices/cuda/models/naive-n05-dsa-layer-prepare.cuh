@@ -1,11 +1,19 @@
 #pragma once
 bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int device,
-                                     FastllmNaiveDSALayerArgs &a) {
+                                     FastllmNaiveDSALayerArgs &a, std::vector<FastllmNaiveDSALayerArgs> *tiles) {
     using namespace fastllm;
     using B = __nv_bfloat16;
     using L = FastllmNaiveDSALayerLayout;
     const int rows = int(x.caches.size());
-    if (rows < 1 || rows > 16 || x.requests.empty() || !x.fp8Query || x.capacity < 1 || x.capacity > 65536 ||
+    const bool tileCandidate = tiles && rows > 8 && !x.caches.empty() && x.caches.front().key &&
+                       (x.caches.front().key->dataType == FP8_E4M3 || x.caches.front().key->dataType == BFLOAT16) &&
+                       x.qkvWeight && x.qkvWeight->dataType == FP8_E4M3;
+    const bool pairEligible = rows > 8 && x.capacity >= 16384 && x.capacity <= fastllm_dsa_layer::PairedScratch::kMaxSeqLen &&
+        x.qkvWeight && x.qkvWeight->dataType == FP8_E4M3 && x.caches.front().key &&
+        x.caches.front().key->dataType == FP8_E4M3 && fastllm_dsa_layer::PairedGrid(device);
+    const bool paired = pairEligible && x.requests.size() == 2;
+    const bool tiled = tileCandidate && !paired;
+    if (rows < 1 || (rows > 16 && !tiled) || x.requests.empty() || !x.fp8Query || x.capacity < 1 || x.capacity > 65536 ||
         !x.scratch || !std::isfinite(x.eps) || x.eps <= 0 || !std::isfinite(x.theta) || x.theta <= 0 ||
         !std::isfinite(x.valueScale))
         return false;
@@ -25,7 +33,7 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
     const bool mx = x.qkvWeight && x.qkvWeight->dataType == FP8_E4M3;
     const float *qkvScales = nullptr, *outputScales = nullptr;
     if (mx) {
-        if (rows < 2 || rows > 8 || !x.outputWeight) return false;
+        if ((rows > 8 && !tiled && !paired) || !x.outputWeight) return false;
         qkvScales = FastllmCudaVerifyMxfp8Scales(*x.qkvWeight,1856,4096,device);
         outputScales = FastllmCudaVerifyMxfp8Scales(*x.outputWeight,4096,1024,device);
         if (!qkvScales || !outputScales) return false;
@@ -57,9 +65,15 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
     if (sum != rows)
         return false;
     a = {};
+    a.mxfp8Gemv = mx && rows == 1; // Preserve the original W8A16 projection on a single logical row.
     bool fp8Key = x.caches.front().key && x.caches.front().key->kvCacheFp8Indexer;
-    if (mx && !(fp8Key ? fastllm_dsa_layer::GridSize<true,8,false,true>() :
+    const bool fp8 = x.caches.front().key && x.caches.front().key->dataType == FP8_E4M3;
+    if (fp8 && (!mx || fp8Key)) return false;
+    const auto cacheType = fp8 ? FP8_E4M3 : BFLOAT16;
+    if (mx && !((fp8Key || fp8) ? fastllm_dsa_layer::GridSize<true,8,false,true>() :
                         fastllm_dsa_layer::GridSize<false,8,false,true>())) return false;
+    std::vector<FastllmNaiveDSARow> batchBindings(tiled ? rows : 0);
+    auto *bindings = tiled ? batchBindings.data() : a.bindings;
     int stride = fp8Key ? 264 : 320;
     std::vector<const Data *> sources{x.hidden,      x.branch,    x.feature,        x.inputNorm,
                                       x.postNorm,    x.qkvWeight, x.indexKeyWeight, x.indexQueryWeight,
@@ -71,7 +85,7 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
             c.cacheOffset >= 0 || (c.cache && uintptr_t(c.cache) % alignof(void *)))
             return false;
         const Data &k = *c.key, &v = *c.value;
-        if (k.dataType != BFLOAT16 || v.dataType != BFLOAT16 || k.dataDevice != CUDA ||
+        if (k.dataType != cacheType || v.dataType != cacheType || k.dataDevice != CUDA ||
             v.dataDevice != CUDA || k.dataDeviceIds != std::vector<int>{device} ||
             v.dataDeviceIds != std::vector<int>{device} || k.dims.size() != 3 || v.dims.size() != 3 ||
             k.dims[0] != 1 || v.dims[0] != 1 || k.dims[2] != stride || v.dims[2] != 128 ||
@@ -93,35 +107,36 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
             r.poolTokens = k.pagedKVCacheData->maxPages * k.pageLen;
             sources.push_back(k.pagedKVCacheData);
             sources.push_back(v.pagedKVCacheData);
-        } else if (k.expansionSize * k.unitSize < size_t(x.capacity) * stride * 2 ||
-                   v.expansionSize * v.unitSize < size_t(x.capacity) * 128 * 2)
+        } else if (k.expansionSize < size_t(x.capacity) * stride ||
+                   v.expansionSize < size_t(x.capacity) * 128)
             return false;
         r.cache = c.cache;
         r.capacity = x.capacity;
         r.keyStride = stride;
+        r.fp8 = fp8;
         r.liveKeys = (const int *)x.live->cudaData + row;
         r.selectedCount = 2048;
-        a.bindings[row] = r;
+        bindings[row] = r;
         sources.push_back(&k);
         sources.push_back(&v);
     }
     int offset = 0;
     for (int count : x.requests) {
-        const auto &first = a.bindings[offset];
+        const auto &first = bindings[offset];
         for (int i = offset; i < offset + count; ++i) {
-            const auto &r = a.bindings[i];
+            const auto &r = bindings[i];
             if (r.key != first.key || r.value != first.value || r.cache != first.cache ||
                 r.keyPages != first.keyPages || r.valuePages != first.valuePages)
                 return false;
         }
         // Each live request must own independent storage/binding; duplicate requests could race their append.
         for (int i = 0; i < offset; ++i)
-            if (first.key == a.bindings[i].key || first.value == a.bindings[i].value ||
-                (first.cache && first.cache == a.bindings[i].cache)) {
+            if (first.key == bindings[i].key || first.value == bindings[i].value ||
+                (first.cache && first.cache == bindings[i].cache)) {
                 // A paged pool is shared, while its page table/binding is per request.
-                if (!first.pageLen || first.keyPages == a.bindings[i].keyPages ||
-                    first.valuePages == a.bindings[i].valuePages ||
-                    (first.cache && first.cache == a.bindings[i].cache))
+                if (!first.pageLen || first.keyPages == bindings[i].keyPages ||
+                    first.valuePages == bindings[i].valuePages ||
+                    (first.cache && first.cache == bindings[i].cache))
                     return false;
             }
         offset += count;
@@ -196,8 +211,7 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
     a.requestCount = x.requests.size();
     a.rank = -1;
     a.fp8Key = fp8Key;
-    for (size_t i = 0; i < x.requests.size(); ++i)
-        a.requests[i] = x.requests[i];
+    if (!tiled) std::copy(x.requests.begin(), x.requests.end(), a.requests);
     a.branch = x.branch ? (const B *)x.branch->cudaData : nullptr;
     a.hidden = (B *)x.hidden->cudaData;
     a.feature = x.feature ? (B *)x.feature->cudaData : nullptr;
@@ -221,7 +235,42 @@ bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int dev
     a.eps = x.eps;
     a.theta = x.theta;
     a.valueScale = x.valueScale;
-    for (int i = 0; i < rows; ++i)
-        a.bindings[i].indices = (const int *)(a.workspace + L::Indices) + i * 2048;
+    const auto *indices = reinterpret_cast<const int *>(a.workspace + L::Indices);
+    if (!tiled) {
+        for (int i = 0; i < rows; ++i) a.bindings[i].indices = indices + i * 2048;
+        return true;
+    }
+    // Capture uses graph-owned row views. Sequential requests reuse the same
+    // score, shortlist and mailbox storage, including after a replay rebind.
+    tiles->clear();
+    tiles->reserve(x.requests.size());
+    int first = 0;
+    for (size_t request = 0; request < x.requests.size();) {
+        auto &tile = tiles->emplace_back(a);
+        tile.requests[0] = x.requests[request++];
+        tile.rows = tile.requests[0];
+        tile.requestCount = 1;
+        if (pairEligible && request < x.requests.size() && tile.rows + x.requests[request] > 8) {
+            tile.requests[tile.requestCount++] = x.requests[request++];
+            tile.rows += tile.requests[1];
+        }
+        const int n = tile.rows;
+        tile.positions += first;
+        if (tile.branch) tile.branch += size_t(first) * 4096;
+        if (tile.feature) tile.feature += size_t(first) * 4096;
+        tile.hidden += size_t(first) * 4096;
+        tile.normed += size_t(first) * 4096;
+        tile.projected += size_t(first) * 4096;
+        tile.query += size_t(first) * 1536;
+        tile.attention += size_t(first) * 1024;
+        for (int i = 0; i < n; ++i) {
+            tile.bindings[i] = bindings[first + i];
+            tile.bindings[i].indices = indices + i * 2048;
+        }
+        first += n;
+    }
     return true;
+}
+bool FastllmCudaNaiveDSALayerPrepare(const FastllmNaiveDSALayerInput &x, int device, FastllmNaiveDSALayerArgs &a) {
+    return FastllmCudaNaiveDSALayerPrepare(x, device, a, nullptr);
 }

@@ -287,10 +287,10 @@ template <class A>
 __device__ static void score_tiles(const A &args, const int *lengths, SweepStorage &sw, int prepared,
                                    unsigned char *fourth, int firstTile, int tileStride, int numTiles) {
     using S = SweepStorage;
-    using Element = cutlass::bfloat16_t;
+    using Element = std::conditional_t<Fp8Key, cutlass::float_e4m3_t, cutlass::bfloat16_t>;
     constexpr int bytes = sizeof(Element) * S::kTileM * Scratch::kIndexDim;
-    constexpr int kStep = 16, tmemSize = 4 * S::kPassN;
-    static_assert(!Fp8Key && S::kPasses == 1 && S::kPassN == 128 && S::kTileM == 128 && S::kStages == 3);
+    constexpr int kStep = Fp8Key ? 32 : 16, tmemSize = 4 * S::kPassN;
+    static_assert(S::kPasses == 1 && S::kPassN == 128 && S::kTileM == 128 && S::kStages == 3);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int max_visible = lengths[8];
     auto *iq = args.workspace + Scratch::kIqPackedOffset;
@@ -311,16 +311,17 @@ __device__ static void score_tiles(const A &args, const int *lengths, SweepStora
         alloc.release_allocation_lock();
     }
     if (tid < 128) {
-        sw.weights[tid] = float(args.weights[tid]);
-        sw.scales[tid] = sc[tid];
+        sw.weights[tid] = tid < args.activeRows * 16 ? float(args.weights[tid]) : 0.f;
+        sw.scales[tid] = tid < args.activeRows * 16 ? sc[tid] : 0.f;
     }
     for (int j = prepared; j < numTiles; ++j) {
         const int tile = firstTile + j * tileStride;
         auto key = args.indexKey;
         key.Bind(args.indexCache);
-        for (int i = tid; i < 128 * 16; i += kThreads) {
-            const int row = i / 16, d = i % 16 * 8, tok = tile * 128 + row;
-            auto src = (const __nv_bfloat16 *)key.IndexRow(min(tok, max_visible - 1), args.indexStride).data;
+        constexpr int chunks = Scratch::kIndexDim * sizeof(Element) / 16;
+        for (int i = tid; i < 128 * chunks; i += kThreads) {
+            const int row = i / chunks, d = i % chunks * (16 / sizeof(Element)), tok = tile * 128 + row;
+            auto src = (const Element *)key.IndexRow(min(tok, max_visible - 1), args.indexStride).data;
             cp_async_16(score_tile_image(sw, fourth, j) + ImageOffset(row, d, 128), src + d,
                         tok < max_visible ? 16 : 0);
         }
@@ -329,14 +330,14 @@ __device__ static void score_tiles(const A &args, const int *lengths, SweepStora
     __syncthreads();
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     const unsigned tmem_base = sw.tmem_slot;
-    using AtomK = cute::UMMA::Layout_K_SW128_Atom<Element>; // BF16, 128-byte shared-memory swizzle
-    auto a_layout = cute::tile_to_shape(AtomK{}, cute::Shape<cute::Int<S::kTileM>, cute::Int<64>>{});
-    auto b_layout = cute::tile_to_shape(AtomK{}, cute::Shape<cute::Int<S::kPassN>, cute::Int<64>>{});
+    using AtomK = cute::UMMA::Layout_K_SW128_Atom<Element>;
+    auto a_layout = cute::tile_to_shape(AtomK{}, cute::Shape<cute::Int<S::kTileM>, cute::Int<128 / sizeof(Element)>>{});
+    auto b_layout = cute::tile_to_shape(AtomK{}, cute::Shape<cute::Int<S::kPassN>, cute::Int<128 / sizeof(Element)>>{});
     const cute::UMMA::InstrDescriptor idesc = cute::UMMA::make_instr_desc<Element, Element, float, S::kTileM, S::kPassN,
                                                                           cute::UMMA::Major::K, cute::UMMA::Major::K>();
     const unsigned long long idescE = static_cast<unsigned long long>(static_cast<unsigned>(idesc)) << 32;
-    using Mma = cute::SM100_MMA_F16BF16_SS<Element, Element, float, S::kTileM, S::kPassN, cute::UMMA::Major::K,
-                                           cute::UMMA::Major::K>;
+    using Mma = std::conditional_t<Fp8Key, cute::SM100_MMA_F8F6F4_SS,
+        cute::SM100_MMA_F16BF16_SS<Element, Element, float, S::kTileM, S::kPassN, cute::UMMA::Major::K, cute::UMMA::Major::K>>;
 
     if (warp == 0) {
         tc_mbar_wait(&sw.b_full, 0);

@@ -145,7 +145,7 @@ static void Near(const Data &a, const Data &b, const char *name) {
 }
 enum class Selection { Dense, TopK, Mixed };
 static void FP8DSA(int batch, int length, Selection selection, bool paged, int heads = 8, int dim = 192,
-                   int vd = 128, int padding = 0, int kvHeads = 1) {
+                   int vd = 128, int padding = 0, int kvHeads = 1, bool online = false) {
     const int width = kvHeads * dim + 128 + padding;
     Data q(BFLOAT16), sink(FLOAT32), live(INT32), a, b;
     Upload(q, {1, batch, heads * dim}, 31);
@@ -192,16 +192,49 @@ static void FP8DSA(int batch, int length, Selection selection, bool paged, int h
         bf[i].pageLen = bf[i].poolTokens = 0;
     }
     FastllmNaiveDecodeScratch sa, sb;
+    const int cols = heads * vd, pitch = (batch + 3) / 4 * 4;
+    Data storage(FP8_E4M3);
+    FastllmMxfp8Activation packed{};
+    if (online) {
+        storage.Resize({pitch * (cols + cols / 32)});
+        storage.ToDevice(DataDevice::CUDA, {0}, false);
+        storage.Allocate(false);
+        auto *bytes = static_cast<uint8_t *>(storage.cudaData);
+        packed = {bytes, bytes + pitch * cols, batch, cols, pitch};
+    }
     Graph graph;
-    graph.Capture([&] { FastllmCudaNaiveBatchDSADecode(q, sink, fp, heads, kvHeads, dim, vd, sa, a); });
+    graph.Capture([&] {
+        if (online) {
+            auto target = packed;
+            Require(FastllmCudaNaiveOnlineDSADecode(q, sink, fp, heads, kvHeads, dim, vd, sa, a, &target)
+                    && target.Matches(batch, cols), "online FP8 DSA declined its packed O input");
+        } else
+            FastllmCudaNaiveBatchDSADecode(q, sink, fp, heads, kvHeads, dim, vd, sa, a);
+    });
     for (int pass = 0; pass < 2; ++pass) {
         for (int i = 0; i < batch; ++i)
             ((int *)live.cpuData)[i] = pass ? std::max(0, fp[i].capacity / 2 - i % 7) : fp[i].capacity - i % 7;
-        if (pass && selection == Selection::Mixed) ((int *)live.cpuData)[batch - 1] = 0;
+        if (pass && (online || selection == Selection::Mixed)) ((int *)live.cpuData)[batch - 1] = 0;
         Cuda(cudaMemcpy(live.cudaData, live.cpuData, batch * 4, cudaMemcpyHostToDevice));
         graph.Run();
         FastllmCudaNaiveBatchDSADecode(q, sink, bf, heads, kvHeads, dim, vd, sb, b);
         Near(a, b, "DSA");
+        if (online) {
+            const auto result = Read<uint16_t>(a);
+            const auto bytes = Read<uint8_t>(storage);
+            for (int row = 0; row < batch; ++row) {
+                for (int col = 0; col < cols; col += 32) {
+                    const int first = row * cols + col;
+                    float maximum = 0.f;
+                    for (int j = 0; j < 32; ++j) maximum = std::max(maximum, std::abs(Float(result[first+j])));
+                    const int exp = maximum > 0 ? std::clamp(int(std::ceil(std::log2(maximum / 448.f))) + 127, 1, 254) : 1;
+                    Require(bytes[pitch * cols + (col / 128 * pitch + row) * 4 + col / 32 % 4] == exp, "online O scale");
+                    for (int j = 0; j < 32; ++j)
+                        Require(bytes[first+j] == __nv_fp8_e4m3(std::ldexp(Float(result[first+j]), 127-exp)).__x,
+                                "online O activation");
+                }
+            }
+        }
     }
     printf("FP8 DSA PASS batch=%d length=%d selection=%d paged=%d stride=%d\n", batch, length, int(selection), paged, width);
     fflush(stdout);
@@ -754,6 +787,15 @@ int main(int argc, char **argv) {
         if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
             return 77;
         FastllmCudaSetDevice(0);
+        if (argc > 1 && std::strcmp(argv[1], "tp_online") == 0) {
+            const int arch = FastllmCudaRuntimeArch();
+            if (arch != 100 && arch != 103) return 77;
+            for (bool paged : {false, true})
+                for (int rows : {8, 31, 64, 193, 257})
+                    FP8DSA(rows, 2057, Selection::TopK, paged, 8, 192, 128, 0, 1, true);
+            puts("TP ONLINE FP8 DSA PASS");
+            return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "wide_heads") == 0) {
             for (bool paged : {false, true})
                 for (int heads : {16, 32, 64})

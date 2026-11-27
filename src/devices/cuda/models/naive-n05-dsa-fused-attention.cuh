@@ -1,4 +1,5 @@
 #pragma once
+#include "devices/cuda/naive-n05-kv.cuh"
 // Split attention for native cache bindings. The default path retains FastLLM's
 // established operand orientation and reduction order. Compact mode adapts
 // NaiveRT's eight-head QK/PV fragments and distributed combine; see NOTICE.
@@ -72,8 +73,26 @@ enum class Phase { Fused, Produce, Combine };
 struct NoOutputEpilogue {
     __device__ __forceinline__ void operator()(int, int, BF16) const {}
 };
+// Expand one stored KV block directly into the MMA operand tile. FP4 payload
+// and its E4M3 scale belong to the same physical row.
+template<int Bits> __device__ __forceinline__ void LoadStoredKV(
+        BF16 *dst, const void *base, int physical, int stride, int column) {
+    uint4 values[2]{};
+    if (physical >= 0) {
+        if constexpr (Bits == 4) {
+            const auto *row = (const uint8_t *)base + size_t(physical) * (stride / 16 * 9);
+            FastllmNaiveKVRow(row, false, row + stride / 2, column).LoadFP4Pairs<8>((unsigned *)values);
+        } else {
+            auto src = FastllmNaiveKVRow((const uint8_t *)base + size_t(physical) * stride + column, true);
+            values[0] = src.Load8();
+            values[1] = (src + 8).Load8();
+        }
+    }
+    reinterpret_cast<uint4 *>(dst)[0] = values[0];
+    reinterpret_cast<uint4 *>(dst)[1] = values[1];
+}
 template <bool Compact = false, Phase Mode = Phase::Fused, int MaxSplits = Splits, int CombineColumns = 64, int Tokens = 128,
-          bool CachePhysical = false, bool FullSelection = false, class OutputEpilogue = NoOutputEpilogue, int GroupHeads = Heads>
+          bool CachePhysical = false, bool FullSelection = false, class OutputEpilogue = NoOutputEpilogue, int GroupHeads = Heads, bool LocalPartial = false, int KVBits = 16>
 __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow descriptor, const float *sink,
                                        BF16 *output, float *scratch, unsigned *completion, int heads,
                                        int kvHeads, int row, int group, int split, StorageFor<Tokens, GroupHeads> &s,
@@ -100,8 +119,10 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
     }
     const int tiles = (count + 15) / 16;
     const int active = min(tiles, count <= 512 ? min(8, MaxSplits) : MaxSplits);
-    auto *part = scratch + (size_t)work * Scratch;
-    auto *stats = part + Partial;
+    static_assert(!LocalPartial || Mode == Phase::Produce);
+    const int destSplit = LocalPartial ? 0 : split;
+    auto *part = LocalPartial ? scratch : scratch + (size_t)work * Scratch;
+    auto *stats = part + (LocalPartial ? Heads * Values : Partial);
     if constexpr (!Compact) {
         if (split >= active)
             return;
@@ -126,24 +147,61 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
             }
         }
         __syncthreads();
-        for (int i = t; i < tokens * 24; i += Threads) {
-            const int k = s.valid[i / 24], d = i % 24 * 8;
-            const auto *src = static_cast<const BF16 *>(r.key);
-            if (k >= 0)
-                src += size_t(CachePhysical ? k : FastllmNaivePhysicalRow(r, k)) * r.keyStride + kh * Dim + d;
-            Copy(&s.key[i / 24][d], src, k >= 0);
-        }
-        for (int i = t; i < tokens * 16; i += Threads) {
-            const int k = CachePhysical ? physicalValue[i / 16] : s.valid[i / 16], d = i % 16 * 8;
-            const auto *src = static_cast<const BF16 *>(r.value);
-            if (k >= 0)
-                src += size_t(CachePhysical ? k : FastllmNaivePhysicalRow(r, k, true)) * kvHeads * Values + kh * Values + d;
-            Copy(&s.value[i / 16][d], src, k >= 0);
+        if constexpr (KVBits == 8) {
+            static_assert(CachePhysical);
+            for (int i = t; i < tokens * 12; i += Threads) {
+                const int row = i / 12, d = i % 12 * 16, physical = s.valid[row];
+                const auto *src = (const uint8_t *)r.key + size_t(max(0, physical)) * r.keyStride + kh * Dim + d;
+                Copy(&s.key[row][d], src, physical >= 0);
+            }
+            for (int i = t; i < tokens * 8; i += Threads) {
+                const int row = i / 8, d = i % 8 * 16, physical = physicalValue[row];
+                const auto *src = (const uint8_t *)r.value + (size_t(max(0, physical)) * kvHeads + kh) * Values + d;
+                Copy(&s.value[row][d], src, physical >= 0);
+            }
+        } else if constexpr (KVBits == 4) {
+            static_assert(CachePhysical && (KVBits == 4 || KVBits == 8));
+            for (int i = t; i < tokens * 12; i += Threads) {
+                int row = i / 12, d = i % 12 * 16;
+                LoadStoredKV<KVBits>(&s.key[row][d], r.key, s.valid[row], r.keyStride, kh * Dim + d);
+            }
+            for (int i = t; i < tokens * 8; i += Threads) {
+                int row = i / 8, d = i % 8 * 16;
+                LoadStoredKV<KVBits>(&s.value[row][d], r.value, physicalValue[row], kvHeads * Values, kh * Values + d);
+            }
+        } else {
+            for (int i = t; i < tokens * 24; i += Threads) {
+                const int k = s.valid[i / 24], d = i % 24 * 8;
+                const auto *src = static_cast<const BF16 *>(r.key);
+                if (k >= 0)
+                    src += size_t(CachePhysical ? k : FastllmNaivePhysicalRow(r, k)) * r.keyStride + kh * Dim + d;
+                Copy(&s.key[i / 24][d], src, k >= 0);
+            }
+            for (int i = t; i < tokens * 16; i += Threads) {
+                const int k = CachePhysical ? physicalValue[i / 16] : s.valid[i / 16], d = i % 16 * 8;
+                const auto *src = static_cast<const BF16 *>(r.value);
+                if (k >= 0)
+                    src += size_t(CachePhysical ? k : FastllmNaivePhysicalRow(r, k, true)) * kvHeads * Values + kh * Values + d;
+                Copy(&s.value[i / 16][d], src, k >= 0);
+            }
         }
         for (int i = t; i < Heads * 24; i += Threads)
             Copy(&s.query[i / 24][i % 24 * 8], query + ((size_t)row * heads + h0 + i / 24) * Dim + i % 24 * 8,
                  true);
         asm volatile("cp.async.commit_group;\ncp.async.wait_group 0;" ::: "memory");
+        if constexpr (KVBits == 8) {
+            auto expand = [](BF16 *dst) {
+                const uint4 raw = *reinterpret_cast<uint4 *>(dst);
+                reinterpret_cast<uint4 *>(dst)[0] = make_uint4(
+                    FastllmNaiveKVRow::ConvertPair(raw.x), FastllmNaiveKVRow::ConvertPair(raw.x >> 16),
+                    FastllmNaiveKVRow::ConvertPair(raw.y), FastllmNaiveKVRow::ConvertPair(raw.y >> 16));
+                reinterpret_cast<uint4 *>(dst)[1] = make_uint4(
+                    FastllmNaiveKVRow::ConvertPair(raw.z), FastllmNaiveKVRow::ConvertPair(raw.z >> 16),
+                    FastllmNaiveKVRow::ConvertPair(raw.w), FastllmNaiveKVRow::ConvertPair(raw.w >> 16));
+            };
+            for (int i = t; i < tokens * 12; i += Threads) expand(&s.key[i / 12][i % 12 * 16]);
+            for (int i = t; i < tokens * 8; i += Threads) expand(&s.value[i / 8][i % 8 * 16]);
+        }
         __syncthreads();
         if constexpr (Compact) {
 #pragma unroll
@@ -215,8 +273,8 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
             for (int d = 16; d >= 2; d /= 2)
                 sum += __shfl_xor_sync(0xffffffff, sum, d);
             if (lane < 2) {
-                stats[(split * Heads + h) * 2] = maximum;
-                stats[(split * Heads + h) * 2 + 1] = sum;
+                stats[(destSplit * Heads + h) * 2] = maximum;
+                stats[(destSplit * Heads + h) * 2 + 1] = sum;
             }
         }
         __syncthreads();
@@ -237,7 +295,7 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
 #pragma unroll
                 for (int j = 0; j < 4; ++j)
                     for (int half = 0; half < Heads / 8; ++half)
-                        part[(split * Heads + half * 8 + head + (j & 1)) * Values + dimension + (j >= 2 ? 8 : 0)] = acc[half][j];
+                        part[(destSplit * Heads + half * 8 + head + (j & 1)) * Values + dimension + (j >= 2 ? 8 : 0)] = acc[half][j];
             }
         } else {
             if (warp < 8) {
@@ -255,7 +313,7 @@ __device__ __forceinline__ void Attend(const BF16 *query, FastllmNaiveDSARow des
 #pragma unroll
                 for (int n = 0; n < 2; ++n)
                     for (int j = 0; j < 2; ++j)
-                        part[(split * Heads + (lane >> 2)) * Values + warp * 16 + n * 8 + (lane & 3) * 2 +
+                        part[(destSplit * Heads + (lane >> 2)) * Values + warp * 16 + n * 8 + (lane & 3) * 2 +
                              j] = acc[n][j];
             }
         }

@@ -20,13 +20,13 @@
     "index_sweep_tcgen05.cuh": {
       "source": "attn_dsa/index_sweep_tcgen05.cuh",
       "original_sha256": "1a6f9386f036b5f454d4c5aacea0c332a7a4cb4101a5d395cd9f93d05c3e4616",
-      "installed_sha256": "f914ad27e7a10109a0cf3c158904532510e646c80e9c602e16025d9de39c321c",
-      "changes": "Prefetches historical tiles of the paged Indexer cache and assigns the newest tiles separately."
+      "installed_sha256": "ce0d3eed738b8bde45027ed5564978d6ddd6f66d8adf8ae855bd6b62a7cfcc2a",
+      "changes": "Prefetches historical tiles of the paged Indexer cache and assigns the newest tiles separately. Masks inactive verification rows when loading score weights and scales."
     },
     "body.cuh": {
       "source": "attn_dsa/attn_dsa_body.cuh",
       "original_sha256": "af3dc1a1bca3d96071333371169798de4bed310533b31d6ccc020ce862d56933",
-      "installed_sha256": "1e89a50580ab4f0d756c8a2d127063bcbac94aa6e08b1065eea0e105c9e22941"
+      "installed_sha256": "45eb6107e966c908114ec800d8d10f1ce11085bce395926e47f2da1559f23283"
     },
     "projection.cuh": {
       "source": "attn_common/rows_gemv_mma.cuh",
@@ -39,7 +39,7 @@
     "src/devices/cuda/models/naive-n05-dsa-fused-attention.cuh": {
       "source": "attn_dsa/attn_dsa_body.cuh",
       "original_sha256": "af3dc1a1bca3d96071333371169798de4bed310533b31d6ccc020ce862d56933",
-      "installed_sha256": "a2ece31d29314f4bff9cdce5d925aa1273a5e9d9f550892c144510386b86a308",
+      "installed_sha256": "447a5addb81b09d24298da6d2f5fe2c934bc9fa7f20b0f80573937479376f208",
       "fragments": [
         "qk_eight_heads",
         "pv_eight_heads",

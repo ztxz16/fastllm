@@ -634,6 +634,11 @@ bool FastllmCudaTryDpDSAVerify(const fastllm::Data &normalized, const fastllm::D
                                const fastllm::Data &value, const void *const *binding, int capacity,
                                float theta, float valueScale, FastllmMxfp8Activation packed,
                                FastllmNaiveDecodeScratch &scratch, fastllm::Data &attention, bool overlapQkv) {
+#ifdef FASTLLM_DP_DSA_SM103
+    if (FastllmCudaRuntimeArch() == 103)
+        return FastllmCudaTryDpDSAVerify(normalized, qkv, wk, wq, weights, keyNorm, keyBias, sink,
+            positions, live, key, value, binding, capacity, theta, valueScale, packed, scratch, attention, overlapQkv, packed.rows);
+#endif
     return FastllmCudaTryDpDSAVerify(normalized, qkv, wk, wq, weights, keyNorm, keyBias, sink,
         positions, live, key, value, binding, capacity, theta, valueScale, packed, scratch, attention, overlapQkv, nullptr, packed.rows);
 }

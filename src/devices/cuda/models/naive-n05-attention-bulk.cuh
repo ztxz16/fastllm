@@ -11,29 +11,6 @@
 #include <cuda_runtime.h>
 namespace naive_attention_bulk {
 using BF = __nv_bfloat16;
-__device__ inline FastllmNaiveDSARow BatchRow(const Batch &batch, int i) { return batch.rows[i]; }
-#if CUDART_VERSION >= 12010
-// Verification queries may share KV bindings while using independent lengths
-// and selection lists. Common geometry leaves room for larger argument batches.
-struct CompactRow {
-    const void *const *cache;
-    const int *liveKeys, *indices;
-};
-constexpr int CompactLimit = 1024;
-struct CompactBatch {
-    FastllmNaiveDSARow geometry;
-    CompactRow rows[CompactLimit];
-};
-static_assert(sizeof(CompactBatch) + 128 <= 32764);
-__device__ inline FastllmNaiveDSARow BatchRow(const CompactBatch &batch, int i) {
-    auto row = batch.geometry;
-    row.cache = batch.rows[i].cache;
-    row.liveKeys = batch.rows[i].liveKeys;
-    row.indices = batch.rows[i].indices;
-    return row;
-}
-#endif
-
 __device__ inline int index(const FastllmNaiveDSARow &r, int i, int length, bool ring) {
     if (ring) {
         if (i >= min(length, 128)) return -1;

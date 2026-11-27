@@ -45,6 +45,28 @@ double Compare(const Data &a, const Data &b, int rows, const char *name) {
     }
     return worst;
 }
+bool testFp8KV = false;
+// Decode the actual FP8 bytes into the BF16 reference's logical token order.
+// This keeps both attention paths on identical Q/K/V, including independent page tables.
+__global__ void ExpandCache(FastllmNaiveDSARow binding, B *keys, B *values) {
+    const auto r = FastllmNaiveResolveDSARow(binding);
+    const int token = blockIdx.x, d = threadIdx.x;
+    if (d < 320) keys[token * 320 + d] = __float2bfloat16(float(
+        static_cast<const __nv_fp8_e4m3 *>(r.key)[size_t(FastllmNaivePhysicalRow(r, token)) * 320 + d]));
+    if (d < 128) values[token * 128 + d] = __float2bfloat16(float(
+        static_cast<const __nv_fp8_e4m3 *>(r.value)[size_t(FastllmNaivePhysicalRow(r, token, true)) * 128 + d]));
+}
+// Read only the newly published physical K/Indexer and V rows. The two
+// page tables are independent and may change when the graph is replayed.
+__global__ void ReadFp8Candidate(FastllmNaiveDSARow binding, uint8_t *bytes) {
+    const auto r = FastllmNaiveResolveDSARow(binding);
+    const int length = r.liveKeys ? *r.liveKeys : r.length, col = threadIdx.x;
+    if (length <= 0 || length > r.capacity) { bytes[col] = 0; return; }
+    if (col < 320)
+        bytes[col] = static_cast<const uint8_t *>(r.key)[size_t(FastllmNaivePhysicalRow(r, length - 1)) * r.keyStride + col];
+    else
+        bytes[col] = static_cast<const uint8_t *>(r.value)[size_t(FastllmNaivePhysicalRow(r, length - 1, true)) * 128 + col - 320];
+}
 struct Case {
     int rows, capacity, device;
     bool fp8, paged;
@@ -62,6 +84,7 @@ struct Case {
     std::vector<FastllmNaiveRopeCacheRow> referenceBindings;
     std::vector<FastllmNaiveVerifyIndexerItem> items;
     std::vector<Data> indexRequests;
+    int finalTileRows = 0;
     std::vector<FastllmNaiveDSARow> referenceRows;
     Case(std::vector<int> requests, int capacity, bool paged, bool fp8, int device = 0, bool mx = false)
         : rows(0), capacity(capacity), device(device), fp8(fp8), paged(paged), requests(requests) {
@@ -104,11 +127,12 @@ struct Case {
                                                                {&rv, 128},
                                                                {&rprojected, 4096}})
             Init(*d, BFLOAT16, {1, rows, w});
+        const int bits = testFp8KV ? 8 : 16;
         for (size_t i = 0; i < requests.size(); ++i) {
-            caches.emplace_back(new Cache(capacity, paged, fp8, 43 + i * 10));
-            referenceCaches.emplace_back(new Cache(capacity, paged, fp8, 43 + i * 10));
-            alternates.emplace_back(new Cache(capacity, paged, fp8, 83 + i * 10));
-            referenceAlternates.emplace_back(new Cache(capacity, paged, fp8, 83 + i * 10));
+            caches.emplace_back(new Cache(capacity, paged, fp8, 43 + i * 10, 1, bits));
+            referenceCaches.emplace_back(new Cache(capacity, paged, fp8, 43 + i * 10, 1, bits));
+            alternates.emplace_back(new Cache(capacity, paged, fp8, 83 + i * 10, 1, bits));
+            referenceAlternates.emplace_back(new Cache(capacity, paged, fp8, 83 + i * 10, 1, bits));
         }
         input.branch = &branch;
         input.hidden = &hidden;
@@ -154,8 +178,23 @@ struct Case {
         }
         Lengths(16384, false);
         Reset();
-        Require(FastllmCudaNaiveDSALayerPrepare(input, device, args), "valid DSA layer rejected");
-        referenceRows.assign(args.bindings, args.bindings + rows);
+        if (rows <= 16 && !(mx && !testFp8KV && rows > 8)) {
+            Require(FastllmCudaNaiveDSALayerPrepare(input, device, args), "valid DSA layer rejected");
+            referenceRows.assign(args.bindings, args.bindings + rows);
+        } else {
+            std::vector<FastllmNaiveDSALayerArgs> tiles;
+            Require(FastllmCudaNaiveDSALayerPrepare(input, device, args, &tiles), "tiled DSA rejected");
+            if (testFp8KV)
+                Require(tiles.size() == 2 && tiles[0].rows == 16 && tiles[1].rows == rows - 16, "DSA pair partition");
+            else {
+                Require(tiles.size() == requests.size(), "BF16 DSA request partition");
+                for (size_t i = 0; i < tiles.size(); ++i)
+                    Require(tiles[i].rows == requests[i], "BF16 DSA tail length");
+            }
+            finalTileRows = tiles.back().rows;
+            for (const auto &tile : tiles)
+                referenceRows.insert(referenceRows.end(), tile.bindings, tile.bindings + tile.rows);
+        }
         offset = 0;
         for (size_t req = 0; req < requests.size(); ++req) {
             auto &b = *referenceCaches[req];
@@ -196,6 +235,34 @@ struct Case {
             referenceCaches[i]->Bind(alternate ? *referenceAlternates[i] : *referenceCaches[i]);
         }
     }
+    void ReferenceCore(const Data &query, const Data &indexQuery, const Data &weights,
+                       const std::vector<FastllmNaiveVerifyIndexerItem> &indexItems,
+                       const std::vector<FastllmNaiveDSARow> &descriptors, FastllmNaiveDecodeScratch &workspace, Data &out) {
+        if (testFp8KV) {
+            auto items = indexItems;
+            auto rows = descriptors;
+            std::vector<Data> key(items.size()), value(items.size());
+            for (size_t i = 0; i < items.size(); ++i) {
+                auto &item = items[i];
+                Init(key[i], BFLOAT16, {1, capacity, 320});
+                Init(value[i], BFLOAT16, {1, capacity, 128});
+                ExpandCache<<<capacity, 320, 0, cudaStreamPerThread>>>(rows[item.offset], (B *)key[i].cudaData, (B *)value[i].cudaData);
+                Cuda(cudaGetLastError());
+                item.key = &key[i]; item.cache = nullptr;
+                for (int j = 0; j < item.rows; ++j) {
+                    auto &r = rows[item.offset+j];
+                    r.key = key[i].cudaData; r.value = value[i].cudaData; r.cache = nullptr;
+                    r.keyPages = r.valuePages = nullptr; r.pageLen = 0; r.fp8 = false;
+                }
+            }
+            Require(FastllmCudaNaiveFusedDSAVerify(query, indexQuery, weights, sink, items, rows, true,
+                        8, 1, 192, 128, workspace, out), "expanded FP8 reference");
+            Cuda(cudaStreamSynchronize(cudaStreamPerThread));
+        } else {
+            Require(FastllmCudaNaiveFusedDSAVerify(query, indexQuery, weights, sink, indexItems, descriptors, true,
+                                                   8, 1, 192, 128, workspace, out), "core reference");
+        }
+    }
     void Legacy(bool tp = false) {
         FastllmCudaNaiveAddDecodeRMSNorm(referenceHidden, branch, gamma, input.eps, rnorm);
         CopyDevice(referenceFeature, referenceHidden);
@@ -214,9 +281,22 @@ struct Case {
                                                      192, 128, 64, input.theta, input.valueScale, 0, &raw,
                                                      false),
                 "append reference");
-        Require(FastllmCudaNaiveFusedDSAVerify(rq, iq, iw, sink, items, referenceRows, true, 8, 1, 192, 128,
-                                               referenceScratch, rattn),
-                "core reference");
+        if (rows <= 16) {
+            ReferenceCore(rq, iq, iw, items, referenceRows, referenceScratch, rattn);
+        } else {
+            Init(rattn, BFLOAT16, {1,rows,1024});
+            for (auto item : items) {
+                const int n = item.rows, first = item.offset;
+                Data q1, iq1, iw1, attn1;
+                View(q1, rq, {1,n,1536}, size_t(first)*1536*2);
+                View(iq1, iq, {1,n,2048}, size_t(first)*2048*2);
+                View(iw1, iw, {1,n,16}, size_t(first)*16*2);
+                View(attn1, rattn, {1,n,1024}, size_t(first)*1024*2);
+                std::vector<FastllmNaiveDSARow> desc(referenceRows.begin()+first, referenceRows.begin()+first+n);
+                item.offset = 0;
+                ReferenceCore(q1, iq1, iw1, {item}, desc, referenceScratch, attn1);
+            }
+        }
         Require((oWeight.dataType == FP8_E4M3 ? VerifyMxLinearReference : FastllmCudaBFloat16MatMulBFloat16)(rattn, oWeight, empty, rprojected, rows, 1024, 4096),
                 "O reference");
         if (tp)
@@ -229,6 +309,27 @@ struct Case {
         // Projection rounding can change sparse Top-K membership. Verify the
         // attention body with identical projected operands/cache, then compare
         // the complete residual against the independent unfused implementation.
+        if (finalTileRows) {
+            // Only the last tile is retained in scratch; queries, residuals and
+            // normalized output are published into distinct rows for every tile.
+            Data actual, reference;
+            View(actual, scratch.dsaLayer, {1, finalTileRows, 1856}, FastllmNaiveDSALayerLayout::Qkv);
+            View(reference, raw, {1, finalTileRows, 1856}, size_t(rows - finalTileRows) * 1856 * 2);
+            Compare(actual, reference, finalTileRows, "final tile QKV");
+            const auto lengths = Read(live);
+            for (int row = 0; row < rows; ++row) {
+                int visible;
+                std::memcpy(&visible, lengths.data() + row * sizeof(int), sizeof(int));
+                if (visible <= 0) continue;
+                Data actualQuery, referenceQuery;
+                View(actualQuery, q, {1, 1, 1536}, size_t(row)*1536*2);
+                View(referenceQuery, rq, {1, 1, 1536}, size_t(row)*1536*2);
+                Compare(actualQuery, referenceQuery, 1, "tiled query/RoPE");
+            }
+            Require(Read(feature) == Read(referenceFeature), "tiled feature differs");
+            Compare(normed, rnorm, rows, "tiled post norm");
+            return Compare(hidden, referenceHidden, rows, "tiled hidden");
+        }
         Data rawView, ikView, iqView, iwView;
         View(rawView, scratch.dsaLayer, {1, rows, 1856}, FastllmNaiveDSALayerLayout::Qkv);
         View(ikView, scratch.dsaLayer, {1, rows, 128}, FastllmNaiveDSALayerLayout::IndexKey);
@@ -251,6 +352,25 @@ struct Case {
                 Compare(actual, reference, 1, "active projection/RoPE");
             }
         }
+        if (testFp8KV) {
+            auto expectedBindings = referenceBindings;
+            std::vector<Data> indexKeys(rows);
+            for (int row = 0; row < rows; ++row) {
+                View(indexKeys[row], ikView, {1, 1, 128}, size_t(row) * 128 * 2);
+                expectedBindings[row].indexKey = &indexKeys[row];
+            }
+            Require(FastllmCudaNaiveBatchRopeAppendCache(rq, rk, rv, positions, expectedBindings, live,
+                8, 1, 192, 128, 64, input.theta, input.valueScale, 0, &rawView, false), "same-input FP8 append");
+            Data actual, expected;
+            Init(actual, FP8_E4M3, {rows, 448});
+            Init(expected, FP8_E4M3, {rows, 448});
+            for (int row = 0; row < rows; ++row) {
+                ReadFp8Candidate<<<1, 448, 0, cudaStreamPerThread>>>(args.bindings[row], static_cast<uint8_t *>(actual.cudaData) + row * 448);
+                ReadFp8Candidate<<<1, 448, 0, cudaStreamPerThread>>>(referenceRows[row], static_cast<uint8_t *>(expected.cudaData) + row * 448);
+            }
+            Cuda(cudaGetLastError());
+            Require(Read(actual) == Read(expected), "same-input FP8 K/Indexer/V bytes differ");
+        }
         auto exactItems = items;
         auto exactRows = referenceRows;
         int offset = 0;
@@ -263,9 +383,7 @@ struct Case {
             }
             offset += requests[req];
         }
-        Require(FastllmCudaNaiveFusedDSAVerify(q, iqView, iwView, sink, exactItems, exactRows, true, 8, 1,
-                                               192, 128, exactScratch, exactAttention),
-                "identical core reference");
+        ReferenceCore(q, iqView, iwView, exactItems, exactRows, exactScratch, exactAttention);
         // The selected set is exact; token ordering and QK/PV accumulation may
         // change BF16 rounding, so validate attention numerically on identical inputs.
         double attentionError = Compare(attention, exactAttention, rows, "identical-input attention");
@@ -351,10 +469,10 @@ template <class F> void Parallel(F f) {
 void Tp(bool fp8, bool mx = false) {
     const std::vector<int> devices{0, 1, 2, 3, 4, 5, 6, 7};
     Require(FastllmInitNccl(devices) && FastllmCudaCustomAllReduceInit(devices), "TP init");
-    for (auto shape : mx ? std::vector<std::vector<int>>{{4},{8},{4,4}} : std::vector<std::vector<int>>{{8}, {4, 4}, {8, 8}, {1, 8}, {7, 8}, {1, 2, 5, 8}}) {
+    for (auto shape : testFp8KV && mx ? std::vector<std::vector<int>>{{1},{2},{3},{8},{4,4},{8,1},{3,7},{8,7},{7,8},{8,8},{8,8,4},{8,8,8,8}} : mx ? std::vector<std::vector<int>>{{1},{3},{4},{8},{4,4},{8,1},{3,7},{8,8,4}} : std::vector<std::vector<int>>{{8}, {4, 4}, {8, 8}, {1, 8}, {7, 8}, {1, 2, 5, 8}}) {
         std::array<std::unique_ptr<Case>, 8> cases;
         const bool fullMx = mx && shape == std::vector<int>{8};
-        Parallel([&](int r) { cases[r] = std::make_unique<Case>(shape, fullMx ? 65536 : 32768, false, fp8, r, mx); });
+        Parallel([&](int r) { cases[r] = std::make_unique<Case>(shape, fullMx ? 65536 : 32768, testFp8KV, fp8, r, mx); });
         Parallel([&](int r) {
             auto &c = *cases[r];
             auto h = Read(c.hidden), k = Read(c.caches[0]->key), v = Read(c.caches[0]->value);
@@ -396,9 +514,9 @@ void Tp(bool fp8, bool mx = false) {
             // Replay the same MX verification graph across short, boundary and long contexts.
             const std::vector<int> lengths = fullMx
                 ? std::vector<int>{121, 2045, 8192, 16384, 18940, 24576, 32760, 49152, 65528}
-                : std::vector<int>{8192, 9216, 10240};
+                : testFp8KV && shape == std::vector<int>{8,8} ? std::vector<int>{121,2045,8192,16384,24576,32760} : std::vector<int>{8192, 9216, 10240};
             for (size_t replay = 0; replay < lengths.size(); ++replay) {
-                c.Lengths(lengths[replay], false);
+                c.Lengths(lengths[replay], testFp8KV && shape == std::vector<int>{8,8} && replay == 2);
                 c.Rebind(replay % 2);
                 c.Reset();
                 c.Legacy(true);
@@ -636,9 +754,28 @@ int main(int argc, char **argv) {
         FastllmCudaSetDevice(0);
         if (!FastllmCudaNaiveDSALayerSupported())
             return 77;
+        if (argc > 1 && std::strcmp(argv[1], "dp-kv") == 0) {
+            const int bits = argc > 2 ? std::stoi(argv[2]) : 8;
+            DpDsaVerify(8, true, bits);
+            BatchedDpDsa(bits == 8 ? 2 : 5, false, bits);
+            if (bits == 8) BatchedDpDsa(3, false, bits);
+            BatchedDpDsa(2, false, bits, {4,4});
+            BatchedDpDsa(4, false, bits, {1,3,7,5});
+            return 0;
+        }
+        if (argc > 1 && std::strcmp(argv[1], "dp-batch") == 0) {
+            BatchedDpDsa(argc > 2 ? std::stoi(argv[2]) : 5, argc == 3);
+            return 0;
+        }
         if (argc > 1 && std::strcmp(argv[1], "dp") == 0) {
             DpDsaVerify(8, true);
+            DpDsaVerify(8, true, 8);
+            DpDsaVerify(8, true, 4);
             DpDsaVerify(3, false);
+            BatchedDpDsa(5, false);
+            BatchedDpDsa(5, false, 4);
+            BatchedDpDsa(3, false, 16, {2,6,8});
+            BatchedDpDsa(3, false, 4, {5,1,3});
             return 0;
         }
         if (argc > 2 && (std::strcmp(argv[2], "tp") == 0 || std::strcmp(argv[2], "router") == 0)) {
@@ -654,6 +791,7 @@ int main(int argc, char **argv) {
             FastllmCudaSetDevice(0);
         }
         testMxProjection = argc > 3 && std::strcmp(argv[3],"--mxfp8")==0;
+        testFp8KV = argc > 1 && std::strcmp(argv[1], "fp8-kv") == 0;
         bool fp8 = argc > 1 && std::strcmp(argv[1], "fp8") == 0;
         if (argc > 2 && std::strcmp(argv[2], "tp") == 0)
             Tp(fp8, testMxProjection);

@@ -1,6 +1,7 @@
 #include <numeric>
 #include "devices/cuda/fastllm-cuda-graph-api.cuh"
 #include "devices/cuda/naive-n05-swa-settings.h"
+#include "devices/cuda/naive-n05-verify-groups.cuh"
 #include "devices/cuda/naive-n05-swa-verify.cuh"
 #include "devices/cuda/naive-n05-dp-dsa-verify.cuh"
 #include "devices/multicuda/fastllm-naive-verify.h"
@@ -7941,11 +7942,7 @@ bool BulkAttention(const fastllm::Data &query, const float *bias,
             for (int first = 0; first < (int)rows.size(); first += bulk::CompactLimit) {
                 const int n = std::min(bulk::CompactLimit, int(rows.size()) - first);
                 bulk::CompactBatch batch{};
-                batch.geometry = rows[first];
-                for (int i = 0; i < n; ++i) {
-                    const auto &r = rows[first + i];
-                    batch.rows[i] = {r.cache, r.liveKeys, r.indices};
-                }
+                bulk::FillCompactBatch(batch, rows.data() + first, n);
                 compact<<<dim3(n, heads / 8), 256, shared>>>(
                     (const BF16 *)query.cudaData + (size_t)first * heads * 192, batch, bias,
                     (BF16 *)output.cudaData + (size_t)first * heads * 128, heads, kvHeads);
@@ -8204,6 +8201,18 @@ static int SparseVerifyResidentBlocks() {
 }
 #endif
 
+bool FastllmCudaHasGroupedFP4DSADecode() {
+#if defined(FASTLLM_ENABLE_BLACKWELL_DSA) && defined(FASTLLM_NAIVE_BLACKWELL_DECODE)
+    using namespace blackwell_decode;
+    const int arch = FastllmCudaRuntimeArch();
+    return (arch == 100 || arch == 103) &&
+        BulkKernelSupported(GroupedDecodeKernel(false, true), Layout<4>::Bytes, 100) &&
+        BulkKernelSupported(GroupedDecodeKernel(true, true), Layout<4>::Bytes, 100);
+#else
+    return false;
+#endif
+}
+
 bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::Data &sink,
         const std::vector<FastllmNaiveDSARow> &rows, int heads, int kvHeads, int dim, int valueDim,
         FastllmNaiveDecodeScratch &scratch, fastllm::Data &output) {
@@ -8258,57 +8267,104 @@ bool FastllmCudaNaiveOnlineDSADecode(const fastllm::Data &query, const fastllm::
     namespace bw = blackwell_decode;
     const int arch = FastllmCudaRuntimeArch();
     if ((arch != 100 && arch != 103) || rows.empty() || kvHeads <= 0 ||
-        heads != kvHeads * 16 || dim != 192 || valueDim != 128 || query.dataType != BFLOAT16)
+        (heads != kvHeads * 16 && heads != kvHeads * 8) || dim != 192 || valueDim != 128 || query.dataType != BFLOAT16)
         return false;
+    const bool fp4 = rows.front().fp4;
+    const bool eightHeads = heads == kvHeads * 8;
+    if (fp4 && (eightHeads || rows.size() < 64 || kvHeads != 4)) return false;
     for (const auto &row : rows) {
-        if (!row.fp8 || row.fp4 || !row.indices || row.selectedCount != 2048 ||
+        if (row.fp4 != fp4 || row.fp8 == fp4 || (fp4 && row.keyStride != kvHeads * dim) || !row.indices || row.selectedCount != 2048 ||
             !row.key || !row.value || row.capacity < 0 || row.keyStride < kvHeads * dim ||
             row.keyStride % 16 || ((uintptr_t(row.key) | uintptr_t(row.value)) & 15))
             return false;
     }
     const auto *bias = sink.dims.empty() ? nullptr : static_cast<const float *>(sink.cudaData);
     const int total = static_cast<int>(rows.size());
-    const bool split = total < 32;
+    // Select parallelism from the rows in one launch. A large TP batch can
+    // end in just a few rows after the last full descriptor.
+    constexpr int limit = naive_attention_bulk::BatchLimit;
+    const auto splitCount = [&](int count) {
+        if (eightHeads ? count >= 192 : total >= 32) return 1;
+        const int groups = count * kvHeads;
+        return groups <= 16 ? 16 : groups <= 32 ? 8 : 4;
+    };
+    const int firstCount = std::min(total, limit);
+    const int splits = splitCount(firstCount);
+    const bool split = splits > 1;
     const bool pack = target.Matches(total, heads * valueDim);
     auto kernel = split ? bw::Decode<true> : pack ? bw::Decode<false, 1, true> : bw::Decode<false>;
+    if (eightHeads) {
+        using Batch = naive_attention_bulk::Batch;
+        kernel = split ? bw::Decode<true, 1, false, Batch, 8> :
+                 pack ? bw::Decode<false, 1, true, Batch, 8> : bw::Decode<false, 1, false, Batch, 8>;
+    }
     int groupsPerBlock = 1, sharedBytes = bw::Layout<1>::Bytes;
 #ifdef FASTLLM_ENABLE_BLACKWELL_DSA
-    if (total >= 64 && kvHeads % 2 == 0) {
-        auto paired = bw::PairedDecodeKernel(pack);
-        if (BulkKernelSupported(paired, bw::Layout<2>::Bytes, 100)) {
+    if (!eightHeads && total >= 64 && kvHeads % 2 == 0) {
+        auto paired = bw::GroupedDecodeKernel(pack, fp4);
+        const int pairedBytes = fp4 ? bw::Layout<4>::Bytes : bw::Layout<2>::Bytes;
+        if (BulkKernelSupported(paired, pairedBytes, 100)) {
             kernel = paired;
-            groupsPerBlock = 2;
-            sharedBytes = bw::Layout<2>::Bytes;
+            groupsPerBlock = fp4 ? 4 : 2;
+            sharedBytes = pairedBytes;
         }
     }
 #endif
-    if (groupsPerBlock == 1 && !BulkKernelSupported(kernel, sharedBytes, 100)) return false;
+    if (groupsPerBlock == 1 && (fp4 || !BulkKernelSupported(kernel, sharedBytes, 100))) return false;
+    const int tailRows = eightHeads && total > limit ? total % limit : 0;
+    const int tailSplits = tailRows ? splitCount(tailRows) : 1;
+    using Batch = naive_attention_bulk::Batch;
+    auto tailKernel = bw::Decode<true, 1, false, Batch, 8>;
+    if (tailSplits > 1 && !BulkKernelSupported(tailKernel, sharedBytes, 100)) return false;
     Output(output, BFLOAT16, {1, total, heads * 128});
-    const int groups = total * kvHeads;
-    const int splits = split ? (groups <= 16 ? 16 : groups <= 32 ? 8 : 4) : 1;
     float *parts = nullptr;
     float2 *stats = nullptr;
-    if (split) {
-        Output(scratch.attentionPartial, FLOAT32, {total, heads, splits, 128});
-        Output(scratch.attentionScores, FLOAT32, {total, heads, splits, 2});
+    if (split || tailSplits > 1) {
+        const int partRows = split ? firstCount : tailRows;
+        const int partSplits = split ? splits : tailSplits;
+        Output(scratch.attentionPartial, FLOAT32, {partRows, heads, partSplits, 128});
+        Output(scratch.attentionScores, FLOAT32, {partRows, heads, partSplits, 2});
         parts = static_cast<float *>(scratch.attentionPartial.cudaData);
         stats = static_cast<float2 *>(scratch.attentionScores.cudaData);
     }
-    for (int first = 0; first < total; first += naive_attention_bulk::BatchLimit) {
-        const int count = std::min(total - first, int(naive_attention_bulk::BatchLimit));
-        naive_attention_bulk::Batch batch{};
-        std::copy_n(rows.begin() + first, count, batch.rows);
-        auto *out = static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128;
-        kernel<<<dim3(count, kvHeads / groupsPerBlock, splits), (bw::NCW * groupsPerBlock + bw::NP) * 32, sharedBytes>>>(
-            static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, bias,
-            out, heads, parts, stats, target, first);
-        // All split rows fit a single descriptor batch.
-        if (split) {
-            if (pack)
-                bw::Merge<true><<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, splits, target);
+    auto launch = [&](auto decode, auto &batch, int begin, int end, int partitions) {
+        const int capacity = std::size(batch.rows);
+        for (int first = begin; first < end; first += capacity) {
+            const int count = std::min(end - first, capacity);
+            if constexpr (std::is_same_v<std::decay_t<decltype(batch)>, naive_attention_bulk::CompactBatch>)
+                naive_attention_bulk::FillCompactBatch(batch, rows.data() + first, count);
             else
-                bw::Merge<false><<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, splits, {});
+                std::copy_n(rows.data() + first, count, batch.rows);
+            auto *out = static_cast<BF16 *>(output.cudaData) + size_t(first) * heads * 128;
+            decode<<<dim3(count, kvHeads / groupsPerBlock, partitions), (bw::NCW * groupsPerBlock + bw::NP) * 32, sharedBytes>>>(
+                static_cast<const BF16 *>(query.cudaData) + size_t(first) * heads * 192, batch, bias,
+                out, heads, parts, stats, target, first);
+            // Consume this descriptor batch before reusing its split workspace.
+            if (partitions > 1) {
+                if (pack)
+                    bw::Merge<true><<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, partitions, target, first);
+                else
+                    bw::Merge<false><<<dim3(heads, count), 32>>>(parts, stats, bias, out, heads, partitions, {});
+            }
         }
+    };
+#ifdef FASTLLM_ENABLE_BLACKWELL_DSA
+    bool launched = false;
+    if (groupsPerBlock > 1 && total > naive_attention_bulk::BatchLimit && CompactAttentionSupported(rows)) {
+        auto compact = bw::GroupedDecodeKernel<naive_attention_bulk::CompactBatch>(pack, fp4);
+        if (BulkKernelSupported(compact, sharedBytes, 100)) {
+            naive_attention_bulk::CompactBatch batch{};
+            launch(compact, batch, 0, total, splits);
+            launched = true;
+        }
+    }
+    if (!launched)
+#endif
+    {
+        naive_attention_bulk::Batch batch{};
+        const int mainEnd = tailSplits > 1 ? total - tailRows : total;
+        launch(kernel, batch, 0, mainEnd, splits);
+        if (tailSplits > 1) launch(tailKernel, batch, mainEnd, total, tailSplits);
     }
     CheckLaunch();
     if (pack) *packed = target;

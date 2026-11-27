@@ -156,7 +156,7 @@ __global__ void GroupedScores(const BF16 *query, Batch batch, float *scores,
     }
 }
 
-__global__ void Softmax(float *scores, const float *sink, FastllmNaiveDSABatch batch, int heads, int stride) {
+static __global__ void Softmax(float *scores, const float *sink, FastllmNaiveDSABatch batch, int heads, int stride) {
     const int row = blockIdx.x;
     auto r = batch.rows[row / heads];
     if (Length(r) == 0) return;

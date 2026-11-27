@@ -43,16 +43,32 @@ void View(Data &d, const Data &source, std::vector<int> shape, size_t offset = 0
     d.UpdateUnitSize();
 }
 struct Cache {
-    Data key, value, kp, vp, keyView, valueView, table;
-    PagedCacheManager keyPool, valuePool;
+    Data key, value, kp, vp, keyView, valueView, table, indexView;
+    PagedCacheManager keyPool, valuePool, indexPool;
     int capacity, stride;
     bool paged, fp8;
-    Cache(int capacity, bool paged, bool fp8, int seed, int kvHeads = 1, DataType storage = BFLOAT16)
-        : capacity(capacity), stride(192 * kvHeads + (fp8 ? 72 : 128)), paged(paged), fp8(fp8) {
-        Init(key, storage, {1, capacity, stride});
-        Init(value, storage, {1, capacity, kvHeads * 128});
-        Fill(key, seed, .3f);
-        Fill(value, seed + 2, .3f);
+    Cache(int capacity, bool paged, bool fp8, int seed, int kvHeads = 1, int bits = 16)
+        : capacity(capacity), stride(192 * kvHeads + (bits == 4 ? 0 : fp8 ? 72 : 128)), paged(paged), fp8(fp8) {
+        const auto type = bits == 4 ? FP4_E2M1 : bits == 8 ? FP8_E4M3 : BFLOAT16;
+        Init(key, type, {1, capacity, stride});
+        Init(value, type, {1, capacity, kvHeads * 128});
+        auto fillCache = [&](Data &d, unsigned rng) {
+            if (d.dataType == BFLOAT16) { Fill(d, rng, .3f); return; }
+            std::vector<uint8_t> bytes(d.GetBytes());
+            for (auto &v : bytes) {
+                rng = 1664525u * rng + 1013904223u;
+                v = d.dataType == FP4_E2M1 ? uint8_t(rng >> 24) :
+                    __nv_fp8_e4m3(float(int(rng >> 22) - 512) / 1024.f).__x;
+            }
+            if (d.dataType == FP4_E2M1) {
+                const int cols = d.dims.back(), stride = cols / 16 * 9;
+                for (int row = 0; row < capacity; ++row)
+                    for (int k = 0; k < cols / 16; ++k)
+                        bytes[size_t(row) * stride + cols / 2 + k] = 10 + ((k + row) % 24);
+            }
+            Cuda(cudaMemcpy(d.cudaData, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+        };
+        fillCache(key, seed); fillCache(value, seed + 2);
         key.kvCacheFp8Indexer = fp8;
         if (fp8) {
             auto bytes = Read(key);
@@ -91,8 +107,19 @@ struct Cache {
             valuePool.maxPages = pages;
             View(keyView, kp, key.dims);
             View(valueView, vp, value.dims);
-            keyView.dataType = valueView.dataType = storage;
+            keyView.dataType = valueView.dataType = type;
             keyView.UpdateUnitSize(); valueView.UpdateUnitSize();
+            if (bits == 4) {
+                Init(indexPool, FP8_E4M3, {pages, 128, 1, 128});
+                indexPool.pageLen = 128; indexPool.maxPages = pages;
+                fillCache(indexPool, seed + 3);
+                // The serving Indexer pool shares K's page IDs.
+                View(indexView, kp, {1, capacity, 128});
+                indexView.dataType = FP8_E4M3; indexView.UpdateUnitSize();
+                indexView.isPagedKVCache = true; indexView.pageLen = 128;
+                indexView.expansionDims = indexView.dims;
+                indexView.pagedKVCacheData = &indexPool;
+            }
             keyView.isPagedKVCache = valueView.isPagedKVCache = true;
             keyView.pageLen = valueView.pageLen = 128;
             keyView.pagedKVCacheData = &keyPool;
@@ -101,13 +128,16 @@ struct Cache {
             keyView.expansionDims = key.dims;
             valueView.expansionDims = value.dims;
         }
-        Init(table, INT32, {8});
+        Init(table, INT32, {bits == 4 ? 16 : 8});
         Bind(*this);
     }
+    Cache(int capacity, bool paged, bool fp8, int seed, int kvHeads, DataType storage)
+        : Cache(capacity, paged, fp8, seed, kvHeads, storage == FP8_E4M3 ? 8 : storage == FP4_E2M1 ? 4 : 16) {}
     void Bind(Cache &payload) {
-        const void *ptrs[4] = {payload.key.cudaData, payload.value.cudaData,
-                               paged ? payload.kp.cudaData : nullptr, paged ? payload.vp.cudaData : nullptr};
-        Cuda(cudaMemcpy(table.cudaData, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice));
+        const void *ptrs[8] = {payload.key.cudaData, payload.value.cudaData,
+                               paged ? payload.kp.cudaData : nullptr, paged ? payload.vp.cudaData : nullptr,
+                               payload.indexPool.cudaData, nullptr, paged ? payload.kp.cudaData : nullptr, nullptr};
+        Cuda(cudaMemcpy(table.cudaData, ptrs, table.GetBytes(), cudaMemcpyHostToDevice));
     }
     Data *K() { return paged ? &keyView : &key; }
     Data *V() { return paged ? &valueView : &value; }
