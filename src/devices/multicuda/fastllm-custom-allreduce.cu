@@ -5234,7 +5234,7 @@ static bool ReduceExpertRows(void *partials, const int32_t *ids, void *output,
             static_cast<CustomArNormPacketType *>(partials), ids,
             static_cast<CustomArNormBF16 *>(output), rank, packets, hidden / 8, topk);
     };
-    if (state.expertRowsPush && hidden == 4096 && rows == 8 && topk == 8) {
+    if (state.expertRowsPush && hidden == 4096 && rows <= 8 && topk == 8) {
         const bool early = fastllm::cuda_pdl::Prepare(fastllm::cuda_pdl::Producer::VerifyExperts);
         auto kernel = early ? CustomArExpertRowsPeerPush<true> : CustomArExpertRowsPeerPush<false>;
         kernel<<<rows, 512, 0, cudaStreamPerThread>>>(state.expertBoxes, state.allSignals,
